@@ -2,4 +2,5 @@
 
 pub mod resource;
 pub mod runtime;
+pub mod storage;
 pub mod vm;
