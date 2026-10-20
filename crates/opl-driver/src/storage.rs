@@ -31,6 +31,8 @@ pub struct Capacity {
 /// 볼륨 파일의 생성, 가져오기, 삭제. 볼륨은 풀 안에서 id로 식별한다.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// 이미 있으면 `VolumeExists`. qemu-img는 크기를 512바이트 단위로 올림하므로
+    /// 실제 크기는 `VolumeInfo::virtual_bytes`로 확인한다.
     async fn create_volume(
         &self,
         pool: &StoragePoolSpec,
@@ -40,6 +42,10 @@ pub trait Storage: Send + Sync {
     ) -> Result<PathBuf, DriverError>;
 
     /// 외부 이미지(VMDK 등)를 변환해 새 볼륨으로 만든다. 실패하면 만들다 만 파일을 남기지 않는다.
+    ///
+    /// `src`와 그것이 참조하는 VMDK extent 파일은 믿을 수 있는 경로여야 한다.
+    /// monolithicFlat VMDK 디스크립터는 호스트의 임의 파일을 extent로 가리킬 수 있다.
+    /// 사용자가 올린 파일을 검증하는 것은 API(계획 5)의 책임이다.
     async fn import_volume(
         &self,
         pool: &StoragePoolSpec,
@@ -88,6 +94,8 @@ impl DirStorage {
         let out = tokio::process::Command::new(&self.qemu_img)
             .args(args)
             .stdin(std::process::Stdio::null())
+            // 호출자가 취소하면 qemu-img도 끝낸다.
+            .kill_on_drop(true)
             .output()
             .await?;
         if !out.status.success() {
@@ -98,6 +106,59 @@ impl DirStorage {
         }
         Ok(out.stdout)
     }
+
+    /// 풀 안의 임시 파일에 이미지를 만든 뒤 `path`로 하드 링크한다. qemu-img는 기존 파일을
+    /// 경고 없이 덮어쓰므로, 같은 볼륨을 동시에 만들어도 먼저 생긴 파일을 덮어쓰지 않게 한다.
+    /// 출력 경로는 `before`와 `after` 인자 사이에 들어간다.
+    async fn write_new(
+        &self,
+        id: Uuid,
+        path: &Path,
+        before: &[&str],
+        after: &[&str],
+    ) -> Result<(), DriverError> {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let tmp = TempFile(path.with_file_name(format!(".{name}.part")));
+        let mut args = before.to_vec();
+        args.push(path_str(&tmp.0)?);
+        args.extend_from_slice(after);
+        self.qemu_img(&args).await?;
+        match std::fs::hard_link(&tmp.0, path) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(DriverError::VolumeExists(id))
+            }
+            other => Ok(other?),
+        }
+    }
+}
+
+/// drop되면 파일을 지운다. 실패하거나 취소돼도 임시 파일이 남지 않게 한다.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// qemu-img는 상대 경로를 `json:{...}`, `nbd:` 같은 프로토콜로 해석할 수 있으므로 절대 경로만 받는다.
+fn require_absolute(p: &Path) -> Result<(), DriverError> {
+    if p.is_absolute() {
+        Ok(())
+    } else {
+        Err(DriverError::InvalidSpec(format!(
+            "path must be absolute: {p:?}"
+        )))
+    }
+}
+
+fn pool_dir(pool: &StoragePoolSpec) -> Result<&Path, DriverError> {
+    let PoolBackend::Dir { path } = &pool.backend;
+    require_absolute(path)?;
+    Ok(path)
 }
 
 fn fmt_name(format: ImageFormat) -> &'static str {
@@ -129,19 +190,18 @@ impl Storage for DirStorage {
         size_bytes: u64,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
+        pool_dir(pool)?;
         let path = Self::volume_path(pool, id, format);
         if path.exists() {
             return Err(DriverError::VolumeExists(id));
         }
         let size = size_bytes.to_string();
-        self.qemu_img(&[
-            "create",
-            "-q",
-            "-f",
-            fmt_name(format),
-            path_str(&path)?,
-            &size,
-        ])
+        self.write_new(
+            id,
+            &path,
+            &["create", "-q", "-f", fmt_name(format)],
+            &[&size],
+        )
         .await?;
         Ok(path)
     }
@@ -154,11 +214,13 @@ impl Storage for DirStorage {
         src_format: SourceFormat,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
+        pool_dir(pool)?;
+        require_absolute(src)?;
         let path = Self::volume_path(pool, id, format);
         if path.exists() {
             return Err(DriverError::VolumeExists(id));
         }
-        let args = [
+        let before = [
             "convert",
             "-q",
             "-f",
@@ -166,12 +228,8 @@ impl Storage for DirStorage {
             "-O",
             fmt_name(format),
             path_str(src)?,
-            path_str(&path)?,
         ];
-        if let Err(e) = self.qemu_img(&args).await {
-            let _ = std::fs::remove_file(&path);
-            return Err(e);
-        }
+        self.write_new(id, &path, &before, &[]).await?;
         Ok(path)
     }
 
@@ -181,6 +239,7 @@ impl Storage for DirStorage {
         id: Uuid,
         format: ImageFormat,
     ) -> Result<(), DriverError> {
+        pool_dir(pool)?;
         match std::fs::remove_file(Self::volume_path(pool, id, format)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(DriverError::VolumeNotFound(id))
@@ -195,6 +254,7 @@ impl Storage for DirStorage {
         id: Uuid,
         format: ImageFormat,
     ) -> Result<VolumeInfo, DriverError> {
+        pool_dir(pool)?;
         let path = Self::volume_path(pool, id, format);
         if !path.exists() {
             return Err(DriverError::VolumeNotFound(id));
@@ -214,15 +274,22 @@ impl Storage for DirStorage {
             tool: "qemu-img",
             stderr: format!("unparseable info output: {e}"),
         })?;
-        let field = |k: &str| json.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let field = |k: &str| {
+            json.get(k)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| DriverError::ToolFailed {
+                    tool: "qemu-img",
+                    stderr: format!("info output has no {k}: {json}"),
+                })
+        };
         Ok(VolumeInfo {
-            virtual_bytes: field("virtual-size"),
-            allocated_bytes: field("actual-size"),
+            virtual_bytes: field("virtual-size")?,
+            allocated_bytes: field("actual-size")?,
         })
     }
 
     async fn capacity(&self, pool: &StoragePoolSpec) -> Result<Capacity, DriverError> {
-        let PoolBackend::Dir { path } = &pool.backend;
+        let path = pool_dir(pool)?;
         Ok(Capacity {
             total_bytes: fs4::total_space(path)?,
             available_bytes: fs4::available_space(path)?,
@@ -272,6 +339,163 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    /// 실행 파일 셸 스크립트를 만든다. `"$last"`에 마지막 인자가 들어 있다.
+    fn fake_tool(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-qemu-img");
+        std::fs::write(&path, format!("#!/bin/sh\nfor last; do :; done\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn pool_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn existing_volume_is_never_overwritten() {
+        let tools = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let id = Uuid::now_v7();
+        let fin = DirStorage::volume_path(&p, id, ImageFormat::Raw);
+        std::fs::write(&fin, b"precious").unwrap();
+        let storage = DirStorage::new(fake_tool(tools.path(), "echo new > \"$last\""));
+
+        let err = storage
+            .create_volume(&p, id, 1 << 20, ImageFormat::Raw)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::VolumeExists(_)), "{err:?}");
+        assert_eq!(std::fs::read(&fin).unwrap(), b"precious");
+    }
+
+    #[tokio::test]
+    async fn volume_created_concurrently_wins_over_ours() {
+        let tools = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let id = Uuid::now_v7();
+        let fin = DirStorage::volume_path(&p, id, ImageFormat::Qcow2);
+        // 도구가 도는 사이에 다른 누군가가 같은 볼륨을 만든다.
+        let storage = DirStorage::new(fake_tool(
+            tools.path(),
+            &format!("echo other > {fin:?}\necho ours > \"$last\""),
+        ));
+        let src = tools.path().join("src.vmdk");
+        std::fs::write(&src, b"x").unwrap();
+
+        let err = storage
+            .import_volume(&p, id, &src, SourceFormat::Vmdk, ImageFormat::Qcow2)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::VolumeExists(_)), "{err:?}");
+        assert_eq!(std::fs::read(&fin).unwrap(), b"other\n");
+        assert_eq!(pool_files(tmp.path()), vec![format!("{id}.qcow2")]);
+    }
+
+    #[tokio::test]
+    async fn failed_import_leaves_no_files() {
+        let tools = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        // 출력 파일을 반쯤 쓰고 실패한다.
+        let storage = DirStorage::new(fake_tool(
+            tools.path(),
+            "echo partial > \"$last\"\necho broken >&2\nexit 1",
+        ));
+        let src = tools.path().join("src.vmdk");
+        std::fs::write(&src, b"x").unwrap();
+
+        let err = storage
+            .import_volume(
+                &p,
+                Uuid::now_v7(),
+                &src,
+                SourceFormat::Vmdk,
+                ImageFormat::Qcow2,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+        assert!(pool_files(tmp.path()).is_empty());
+
+        let storage = DirStorage::new("/usr/bin/false");
+        storage
+            .import_volume(
+                &p,
+                Uuid::now_v7(),
+                &src,
+                SourceFormat::Vmdk,
+                ImageFormat::Qcow2,
+            )
+            .await
+            .unwrap_err();
+        assert!(pool_files(tmp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn relative_paths_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        // qemu-img는 상대 경로를 `json:{...}`, `nbd:` 같은 프로토콜로 해석할 수 있다.
+        let storage = DirStorage::new("/usr/bin/true");
+        let rel = pool("pools/local");
+        let id = Uuid::nil();
+        let raw = ImageFormat::Raw;
+        assert!(matches!(
+            storage.create_volume(&rel, id, 1 << 20, raw).await,
+            Err(DriverError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            storage
+                .import_volume(&rel, id, Path::new("/a.vmdk"), SourceFormat::Vmdk, raw)
+                .await,
+            Err(DriverError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            storage.delete_volume(&rel, id, raw).await,
+            Err(DriverError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            storage.volume_info(&rel, id, raw).await,
+            Err(DriverError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            storage.capacity(&rel).await,
+            Err(DriverError::InvalidSpec(_))
+        ));
+
+        let abs = pool(tmp.path().to_str().unwrap());
+        assert!(matches!(
+            storage
+                .import_volume(&abs, id, Path::new("json:{}"), SourceFormat::Vmdk, raw)
+                .await,
+            Err(DriverError::InvalidSpec(_))
+        ));
+        assert!(pool_files(tmp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn volume_info_without_sizes_is_tool_failure() {
+        let tools = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let id = Uuid::nil();
+        std::fs::write(DirStorage::volume_path(&p, id, ImageFormat::Raw), b"").unwrap();
+        let storage = DirStorage::new(fake_tool(tools.path(), "echo '{\"virtual-size\": 5}'"));
+
+        let err = storage
+            .volume_info(&p, id, ImageFormat::Raw)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
     }
 
     #[tokio::test]
