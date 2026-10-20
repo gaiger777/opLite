@@ -51,6 +51,15 @@ impl VmSpec {
                 return Err(ValidationError::DuplicateBootOrder(order));
             }
         }
+        let mut macs = BTreeSet::new();
+        for mac in self.nics.iter().filter_map(|n| n.mac) {
+            if mac.0[0] & 1 == 1 {
+                return Err(ValidationError::MulticastMac(mac));
+            }
+            if !macs.insert(mac) {
+                return Err(ValidationError::DuplicateMac(mac));
+            }
+        }
         Ok(())
     }
 }
@@ -65,6 +74,10 @@ pub enum ValidationError {
     TooLittleMemory,
     #[error("boot_order {0} is used by more than one disk")]
     DuplicateBootOrder(u8),
+    #[error("MAC address {0} is a multicast address")]
+    MulticastMac(MacAddr),
+    #[error("MAC address {0} is used by more than one NIC")]
+    DuplicateMac(MacAddr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +174,7 @@ pub enum RestartPolicy {
 
 /// VM의 실제 상태. reconciler만 기록한다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct VmStatus {
     pub phase: VmPhase,
     pub node: Option<Uuid>,
@@ -180,7 +194,7 @@ pub enum VmPhase {
 }
 
 /// `52:54:00:12:34:56` 형식의 MAC 주소.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct MacAddr(pub [u8; 6]);
 
@@ -197,7 +211,7 @@ impl FromStr for MacAddr {
         let mut parts = s.split(':');
         for b in &mut bytes {
             let part = parts.next().ok_or_else(err)?;
-            if part.len() != 2 {
+            if part.len() != 2 || !part.bytes().all(|c| c.is_ascii_hexdigit()) {
                 return Err(err());
             }
             *b = u8::from_str_radix(part, 16).map_err(|_| err())?;
@@ -305,6 +319,25 @@ mod tests {
         second.volume = "data".into();
         s.disks.push(second);
         assert_eq!(s.validate(), Err(ValidationError::DuplicateBootOrder(1)));
+
+        let mut s = sample();
+        let mac: MacAddr = "01:00:5e:00:00:01".parse().unwrap();
+        s.nics[0].mac = Some(mac);
+        assert_eq!(s.validate(), Err(ValidationError::MulticastMac(mac)));
+
+        let mut s = sample();
+        let mac: MacAddr = "52:54:00:12:34:56".parse().unwrap();
+        s.nics[0].mac = Some(mac);
+        let mut second = s.nics[0].clone();
+        second.network = "wan".into();
+        s.nics.push(second);
+        assert_eq!(s.validate(), Err(ValidationError::DuplicateMac(mac)));
+    }
+
+    #[test]
+    fn status_missing_fields_default() {
+        let st: VmStatus = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(st, VmStatus::default());
     }
 
     #[test]
@@ -323,6 +356,7 @@ mod tests {
             "52:54:00:ab:cd:0f:11",
             "5:54:00:ab:cd:0f",
             "zz:54:00:ab:cd:0f",
+            "+2:54:00:ab:cd:0f",
         ] {
             assert!(bad.parse::<MacAddr>().is_err(), "{bad} should be rejected");
         }
