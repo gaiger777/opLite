@@ -30,12 +30,14 @@ impl DriverError {
     pub fn is_transient(&self) -> bool {
         match self {
             DriverError::Qmp(QmpError::Command { .. }) => false,
-            // 바이너리나 풀 디렉터리가 없거나 권한이 없으면 다시 해도 실패한다.
+            // 바이너리나 풀 디렉터리가 없거나, 권한이 없거나, 파일시스템이 기능(hard link 등)을
+            // 지원하지 않으면 다시 해도 실패한다.
             DriverError::Io(e) => !matches!(
                 e.kind(),
                 std::io::ErrorKind::NotFound
                     | std::io::ErrorKind::PermissionDenied
                     | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::Unsupported
             ),
             DriverError::Qmp(_) | DriverError::Timeout(_) => true,
             DriverError::NotRunning(_)
@@ -62,6 +64,8 @@ mod tests {
             std::io::ErrorKind::NotFound,
             std::io::ErrorKind::PermissionDenied,
             std::io::ErrorKind::InvalidInput,
+            // 하드 링크를 지원하지 않는 파일시스템(exFAT 등)
+            std::io::ErrorKind::Unsupported,
         ] {
             assert!(!DriverError::Io(kind.into()).is_transient(), "{kind:?}");
         }

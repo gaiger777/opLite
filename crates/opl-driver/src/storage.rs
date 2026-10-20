@@ -29,6 +29,7 @@ pub struct Capacity {
 }
 
 /// 볼륨 파일의 생성, 가져오기, 삭제. 볼륨은 풀 안에서 id로 식별한다.
+/// 같은 볼륨 id에 대한 호출은 호출자가 직렬화한다.
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// 이미 있으면 `VolumeExists`. qemu-img는 크기를 512바이트 단위로 올림하므로
@@ -74,6 +75,7 @@ pub trait Storage: Send + Sync {
 }
 
 /// `dir` 풀: 디렉터리 안에 `{id}.qcow2` / `{id}.raw` 파일을 두고 `qemu-img`로 다룬다.
+/// 풀 디렉터리는 hard link를 지원하는 파일시스템이어야 한다.
 pub struct DirStorage {
     qemu_img: PathBuf,
 }
@@ -107,7 +109,7 @@ impl DirStorage {
         Ok(out.stdout)
     }
 
-    /// 풀 안의 임시 파일에 이미지를 만든 뒤 `path`로 하드 링크한다. qemu-img는 기존 파일을
+    /// 풀 안의 임시 파일(`.{id}.{fmt}.{난수}.part`)에 이미지를 만든 뒤 `path`로 하드 링크한다. qemu-img는 기존 파일을
     /// 경고 없이 덮어쓰므로, 같은 볼륨을 동시에 만들어도 먼저 생긴 파일을 덮어쓰지 않게 한다.
     /// 출력 경로는 `before`와 `after` 인자 사이에 들어간다.
     async fn write_new(
@@ -121,7 +123,10 @@ impl DirStorage {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        let tmp = TempFile(path.with_file_name(format!(".{name}.part")));
+        // 호출마다 고유한 이름을 쓴다. opld가 죽은 뒤에도 이전 시도의 qemu-img가 같은 이름의
+        // 파일을 쓰고 있을 수 있고, qemu-img는 기존 파일을 잘라 덮어쓰므로 이름을 공유하면
+        // 손상된 볼륨이 성공으로 게시될 수 있다. 크래시로 남은 .part는 용량만 차지한다.
+        let tmp = TempFile(path.with_file_name(format!(".{name}.{}.part", Uuid::new_v4())));
         let mut args = before.to_vec();
         args.push(path_str(&tmp.0)?);
         args.extend_from_slice(after);
@@ -399,6 +404,30 @@ mod tests {
         assert!(matches!(err, DriverError::VolumeExists(_)), "{err:?}");
         assert_eq!(std::fs::read(&fin).unwrap(), b"other\n");
         assert_eq!(pool_files(tmp.path()), vec![format!("{id}.qcow2")]);
+    }
+
+    #[tokio::test]
+    async fn temp_file_of_an_earlier_attempt_is_not_reused() {
+        let tools = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let id = Uuid::now_v7();
+        // opld가 죽은 뒤에도 고아 qemu-img가 이전 시도의 임시 파일을 계속 쓰고 있을 수 있다.
+        let orphan = tmp.path().join(format!(".{id}.raw.part"));
+        std::fs::write(&orphan, b"orphan").unwrap();
+        // create는 크기가 마지막 인자이므로 .part로 끝나는 출력 인자를 찾는다.
+        let storage = DirStorage::new(fake_tool(
+            tools.path(),
+            "for a; do case \"$a\" in *.part) out=\"$a\";; esac; done\necho ours > \"$out\"",
+        ));
+
+        let path = storage
+            .create_volume(&p, id, 1 << 20, ImageFormat::Raw)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ours\n");
+        assert_eq!(std::fs::read(&orphan).unwrap(), b"orphan");
+        assert_eq!(pool_files(tmp.path()).len(), 2);
     }
 
     #[tokio::test]
