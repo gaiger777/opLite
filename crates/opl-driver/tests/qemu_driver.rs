@@ -6,7 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use opl_driver::{
-    EventKind, Hypervisor, HypervisorEvent, QemuConfig, QemuHypervisor, RuntimeStatus, StopMode,
+    ActualState, EventKind, Hypervisor, HypervisorEvent, QemuConfig, QemuHypervisor, RuntimeStatus,
+    StopMode,
 };
 use opl_qemu::HostProfile;
 use opl_types::runtime::VmRuntimeSpec;
@@ -154,11 +155,34 @@ fn process_exists(pid: u32) -> bool {
 }
 
 /// 테스트가 중간에 실패해도 멈춰 둔 QEMU가 남지 않게 drop에서 SIGKILL을 보낸다.
+/// 이미 끝났으면 pid가 재사용됐을 수 있으므로 아무것도 하지 않는다.
 struct KillOnDrop(u32);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        signal("-KILL", self.0);
+        if process_exists(self.0) {
+            signal("-KILL", self.0);
+        }
+    }
+}
+
+/// 드라이버 A로 VM을 띄우고 A를 내린 뒤 QEMU를 SIGSTOP한다. 재시작한 opld가 멈춘 VM을 만나는 상황이다.
+async fn start_then_stop_process(root: &Path, vm: &VmRuntimeSpec) -> (u32, KillOnDrop) {
+    let pid = {
+        let a = QemuHypervisor::new(config(root)).await.unwrap();
+        a.start(vm).await.unwrap();
+        a.inspect(vm.id).await.unwrap().unwrap().pid
+    };
+    let guard = KillOnDrop(pid);
+    assert!(signal("-STOP", pid));
+    (pid, guard)
+}
+
+fn unresponsive(id: Uuid, pid: u32) -> ActualState {
+    ActualState {
+        id,
+        pid,
+        status: RuntimeStatus::Other("unresponsive".into()),
     }
 }
 
@@ -167,18 +191,16 @@ async fn start_does_not_destroy_unresponsive_running_vm() {
     let tmp = short_tempdir();
     let vm = spec();
     let run_dir = tmp.path().join("run/vm").join(vm.id.to_string());
-    let pid = {
-        let a = QemuHypervisor::new(config(tmp.path())).await.unwrap();
-        a.start(&vm).await.unwrap();
-        a.inspect(vm.id).await.unwrap().unwrap().pid
-    };
-    let _guard = KillOnDrop(pid);
-    assert!(signal("-STOP", pid));
+    let (pid, _guard) = start_then_stop_process(tmp.path(), &vm).await;
 
-    // 멈춘 QEMU는 QMP에 답하지 않는다. 살아 있으므로 파일을 지우지 않고 등록만 하지 않는다.
+    // 멈춘 QEMU는 QMP에 답하지 않는다. 살아 있으므로 파일을 지우지 않고 등록하지 않지만,
+    // 조회에는 pidfile 잠금 소유자(= QEMU) pid와 함께 드러난다.
     let b = QemuHypervisor::new(config(tmp.path())).await.unwrap();
     assert!(run_dir.exists());
-    assert_eq!(b.inspect(vm.id).await.unwrap(), None);
+    assert_eq!(
+        b.inspect(vm.id).await.unwrap(),
+        Some(unresponsive(vm.id, pid))
+    );
 
     // 새로 띄우거나 파일을 지우지 않고, 다시 시도할 수 있는 오류로 끝난다.
     let err = b.start(&vm).await.unwrap_err();
@@ -227,4 +249,39 @@ async fn force_stop_kills_unresponsive_qemu() {
     assert!(gone, "QEMU {pid} is still alive");
     assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
     assert!(!tmp.path().join("run/vm").join(vm.id.to_string()).exists());
+}
+
+#[tokio::test]
+async fn force_stop_after_restart_kills_stopped_qemu() {
+    let tmp = short_tempdir();
+    let vm = spec();
+    let run_dir = tmp.path().join("run/vm").join(vm.id.to_string());
+    let (pid, _guard) = start_then_stop_process(tmp.path(), &vm).await;
+
+    let b = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    assert_eq!(b.list().await.unwrap(), vec![unresponsive(vm.id, pid)]);
+    // QMP 없이는 ACPI 요청을 보낼 수 없다.
+    assert!(
+        b.stop(vm.id, StopMode::Acpi)
+            .await
+            .unwrap_err()
+            .is_transient()
+    );
+
+    tokio::time::timeout(Duration::from_secs(30), b.stop(vm.id, StopMode::Force))
+        .await
+        .expect("force stop took longer than 30s")
+        .unwrap();
+    let mut gone = false;
+    for _ in 0..100 {
+        if !process_exists(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "QEMU {pid} is still alive");
+    assert!(!run_dir.exists());
+    assert_eq!(b.inspect(vm.id).await.unwrap(), None);
+    assert!(b.list().await.unwrap().is_empty());
 }

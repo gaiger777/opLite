@@ -8,8 +8,7 @@ use async_trait::async_trait;
 use opl_qemu::{HostProfile, QmpClient, QmpError, QmpEvent, RunState, RuntimePaths, build_cmdline};
 use opl_types::runtime::VmRuntimeSpec;
 use opl_types::vm::Firmware;
-use rustix::fs::{FlockOperation, fcntl_lock};
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::process::{Flock, FlockOffsetType, FlockType, Pid, Signal, fcntl_getlk, kill_process};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
@@ -27,8 +26,12 @@ const QMP_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// SIGKILL을 보낸 뒤 프로세스가 사라지기를 기다리는 한도
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
-/// QMP 연결이 끊긴 뒤 프로세스가 끝나기를 기다리는 한도. QEMU는 종료 중에 소켓을 먼저 닫는다.
+/// SHUTDOWN 없이 QMP 연결이 끊긴 뒤 프로세스가 끝나기를 기다리는 한도.
+/// 넘기면 QMP만 끊긴 것으로 본다.
 const EXIT_GRACE: Duration = Duration::from_secs(5);
+/// SHUTDOWN 뒤 연결이 끊겼을 때 런타임 디렉터리를 지우려고 프로세스 종료를 잠깐 기다리는 한도.
+/// QEMU는 소켓을 닫고 곧 끝나지만, 플러시가 길면 디렉터리는 다음 launch/new()에 맡기고 종료를 바로 알린다.
+const SHUTDOWN_EXIT_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct QemuConfig {
@@ -41,8 +44,9 @@ pub struct QemuConfig {
 
 /// QEMU 프로세스를 `-daemonize`로 띄워 opld와 분리한다. opld가 재시작해도 VM은 계속 돈다.
 ///
-/// QEMU의 생존 여부는 QMP 응답이 아니라 pidfile의 fcntl 잠금으로 판정한다([`qemu_alive`]).
-/// 잠금이 걸린 런타임 디렉터리는 절대 지우지 않는다.
+/// QEMU의 생존 여부는 QMP 응답이 아니라 pidfile의 fcntl 잠금으로 판정한다([`liveness`]).
+/// 잠금이 걸렸거나 판정할 수 없는 런타임 디렉터리는 절대 지우지 않고, 잠금 소유자로 확인한
+/// pid만 죽인다.
 pub struct QemuHypervisor {
     config: QemuConfig,
     vms: Arc<Mutex<HashMap<Uuid, Arc<VmHandle>>>>,
@@ -84,12 +88,19 @@ impl QemuHypervisor {
                 continue;
             };
             let paths = hv.paths(id)?;
-            if !qemu_alive(&paths.pidfile) {
-                tracing::warn!(%id, "removing stale runtime dir");
-                if let Err(e) = std::fs::remove_dir_all(&paths.dir) {
-                    tracing::error!(%id, error = %e, "failed to remove stale runtime dir");
+            match liveness(&paths.pidfile) {
+                Liveness::Alive(_) => {}
+                Liveness::Dead => {
+                    tracing::warn!(%id, "removing stale runtime dir");
+                    if let Err(e) = std::fs::remove_dir_all(&paths.dir) {
+                        tracing::error!(%id, error = %e, "failed to remove stale runtime dir");
+                    }
+                    continue;
                 }
-                continue;
+                Liveness::Unknown => {
+                    tracing::error!(%id, "cannot tell whether QEMU is running; leaving runtime dir");
+                    continue;
+                }
             }
             // 살아 있는 VM이므로 붙지 못해도 아무것도 지우지 않는다. 이후 start()가 다시 시도한다.
             match tokio::time::timeout(ATTACH_TIMEOUT, hv.attach(id, paths, false)).await {
@@ -162,6 +173,7 @@ impl QemuHypervisor {
             std::fs::copy(&self.config.host.uefi_vars_template, &paths.uefi_vars)?;
         }
         // 호출자가 pidfile 잠금이 풀린 것(= QEMU 없음)을 확인했으므로 남은 소켓은 지워도 된다.
+        // 이전 인스턴스가 남긴 pidfile은 새 QEMU가 잠그고 다시 쓴다.
         for sock in [&paths.qmp_socket, &paths.vnc_socket] {
             remove_if_exists(sock)?;
         }
@@ -173,7 +185,7 @@ impl QemuHypervisor {
         cmd.args(&args)
             .stdin(Stdio::null())
             // 타임아웃으로 기다림을 그만두면 부모 프로세스도 끝낸다. 이미 분리된 자식은
-            // 실패 정리(cleanup_failed_launch)가 pidfile로 찾아 끝낸다.
+            // 실패 정리(kill_and_cleanup)가 pidfile 잠금으로 찾아 끝낸다.
             .kill_on_drop(true);
         if cfg!(target_os = "macos") {
             // macOS에서는 -daemonize의 fork 뒤 자식이 Objective-C 런타임을 초기화하다
@@ -204,20 +216,22 @@ impl QemuHypervisor {
         Ok(())
     }
 
-    /// 실패한 기동의 흔적을 지운다. `-daemonize`로 분리된 QEMU가 남아 있으면 먼저 끝낸다.
-    /// 끝내지 못하면 살아 있는 VM의 파일이므로 아무것도 지우지 않는다.
-    async fn cleanup_failed_launch(&self, id: Uuid, paths: &RuntimePaths) {
-        if qemu_alive(&paths.pidfile) {
-            match read_pid(&paths.pidfile) {
-                Ok(pid) => kill_qemu(pid),
+    /// 등록되지 않은 QEMU(기동 실패로 남은 데몬, 붙지 못한 VM)를 SIGKILL로 끝내고 런타임
+    /// 디렉터리를 지운다. 끝냈음을 확인하지 못하면 살아 있는 VM의 파일이므로 아무것도 지우지
+    /// 않고 false를 돌려준다.
+    async fn kill_and_cleanup(&self, id: Uuid, paths: &RuntimePaths) -> bool {
+        if liveness(&paths.pidfile) != Liveness::Dead {
+            let pid = match read_pid(&paths.pidfile) {
+                Ok(pid) => pid,
                 Err(e) => {
-                    tracing::error!(%id, error = %e, "orphan QEMU has no readable pid; keeping runtime dir");
-                    return;
+                    tracing::error!(%id, error = %e, "QEMU has no readable pid; keeping runtime dir");
+                    return false;
                 }
-            }
-            if !wait_until(KILL_TIMEOUT, || !qemu_alive(&paths.pidfile)).await {
-                tracing::error!(%id, "orphan QEMU did not exit; keeping runtime dir");
-                return;
+            };
+            kill_if_owner(&paths.pidfile, pid);
+            if !wait_until(KILL_TIMEOUT, || liveness(&paths.pidfile) == Liveness::Dead).await {
+                tracing::error!(%id, pid, "QEMU did not exit; keeping runtime dir");
+                return false;
             }
         }
         if let Err(e) = std::fs::remove_dir_all(&paths.dir)
@@ -225,6 +239,7 @@ impl QemuHypervisor {
         {
             tracing::warn!(%id, error = %e, "failed to remove runtime dir");
         }
+        true
     }
 
     /// opld가 `-daemonize`와 `cont` 사이에 죽으면 VM이 `-S`(prelaunch) 상태로 남는다. 이어서 실행한다.
@@ -243,7 +258,18 @@ impl QemuHypervisor {
 
     async fn query_state(&self, id: Uuid) -> Result<Option<ActualState>, DriverError> {
         let Some(handle) = self.handle(id) else {
-            return Ok(None);
+            // 살아 있지만 QMP에 붙지 못한 VM도 드러내야 reconciler가 놓치지 않는다.
+            return match liveness(&self.paths(id)?.pidfile) {
+                Liveness::Dead => Ok(None),
+                Liveness::Alive(pid) => Ok(Some(ActualState {
+                    id,
+                    pid,
+                    status: RuntimeStatus::Other("unresponsive".into()),
+                })),
+                Liveness::Unknown => Err(DriverError::Io(std::io::Error::other(format!(
+                    "cannot tell whether QEMU of VM {id} is running"
+                )))),
+            };
         };
         let status = match tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_status()).await {
             Err(_) => return Err(DriverError::Timeout("QMP query-status")),
@@ -270,9 +296,10 @@ impl Hypervisor for QemuHypervisor {
             return self.resume_if_prelaunch(vm.id).await;
         }
         let paths = self.paths(vm.id)?;
-        if qemu_alive(&paths.pidfile) {
+        if liveness(&paths.pidfile) != Liveness::Dead {
             // 살아 있지만 등록되지 않은 VM(재시작 때 붙지 못함, QMP 연결 유실). 새로 띄우면
             // pidfile 잠금에 걸려 실패하고 살아 있는 VM의 파일을 지우게 되므로 다시 붙기만 한다.
+            // 생존을 판정할 수 없을 때도 같은 이유로 새로 띄우지 않는다.
             match tokio::time::timeout(ATTACH_TIMEOUT, self.attach(vm.id, paths, false)).await {
                 Ok(Ok(())) => {
                     tracing::info!(id = %vm.id, "reattached to running VM");
@@ -287,7 +314,7 @@ impl Hypervisor for QemuHypervisor {
         }
         if let Err(e) = self.launch(vm, &paths).await {
             if self.handle(vm.id).is_none() {
-                self.cleanup_failed_launch(vm.id, &paths).await;
+                self.kill_and_cleanup(vm.id, &paths).await;
             }
             return Err(e);
         }
@@ -296,7 +323,16 @@ impl Hypervisor for QemuHypervisor {
 
     async fn stop(&self, id: Uuid, mode: StopMode) -> Result<(), DriverError> {
         let Some(handle) = self.handle(id) else {
-            return Ok(());
+            let paths = self.paths(id)?;
+            if liveness(&paths.pidfile) == Liveness::Dead {
+                return Ok(());
+            }
+            // 살아 있지만 QMP로 다룰 수 없는 VM
+            return match mode {
+                StopMode::Acpi => Err(DriverError::Timeout("reattach to running QEMU")),
+                StopMode::Force if self.kill_and_cleanup(id, &paths).await => Ok(()),
+                StopMode::Force => Err(DriverError::Timeout("QEMU to exit")),
+            };
         };
         match mode {
             StopMode::Acpi => {
@@ -313,12 +349,10 @@ impl Hypervisor for QemuHypervisor {
                 }
                 drop(handle);
                 // 등록이 풀렸어도 QMP만 끊기고 프로세스는 살아 있을 수 있으므로 pidfile도 확인한다.
-                let gone = || self.handle(id).is_none() && !qemu_alive(&pidfile);
+                let gone = || self.handle(id).is_none() && liveness(&pidfile) == Liveness::Dead;
                 if !wait_until(FORCE_STOP_TIMEOUT, gone).await {
                     tracing::warn!(%id, pid, "QEMU did not quit; sending SIGKILL");
-                    if qemu_alive(&pidfile) {
-                        kill_qemu(pid);
-                    }
+                    kill_if_owner(&pidfile, pid);
                     if !wait_until(KILL_TIMEOUT, gone).await {
                         return Err(DriverError::Timeout("QEMU to exit"));
                     }
@@ -333,12 +367,26 @@ impl Hypervisor for QemuHypervisor {
     }
 
     async fn list(&self) -> Result<Vec<ActualState>, DriverError> {
-        let ids: Vec<Uuid> = self.vms.lock().unwrap().keys().copied().collect();
+        let mut ids: Vec<Uuid> = self.vms.lock().unwrap().keys().copied().collect();
+        // 등록되지 않았지만 살아 있는 VM도 포함하도록 런타임 디렉터리를 함께 훑는다.
+        for entry in std::fs::read_dir(self.config.run_dir.join("vm"))? {
+            if let Some(id) = entry?
+                .file_name()
+                .to_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             match self.query_state(id).await {
                 Ok(Some(st)) => out.push(st),
                 Ok(None) => {}
+                Err(DriverError::Io(e)) if self.handle(id).is_none() => {
+                    tracing::error!(%id, error = %e, "skipping VM whose state is unknown");
+                }
                 // VM 하나가 응답하지 않는다고 전체 조회가 실패하면 안 된다.
                 Err(DriverError::Timeout(_)) => {
                     if let Some(handle) = self.handle(id) {
@@ -392,68 +440,108 @@ async fn monitor(
             drop(handle);
         }
     };
-    // QEMU는 종료 중에 소켓을 먼저 닫으므로 프로세스가 끝나기를 잠시 기다린다.
-    if !wait_until(EXIT_GRACE, || !qemu_alive(&paths.pidfile)).await {
-        // QMP만 끊기고 QEMU는 살아 있다. 파일을 지우거나 종료로 알리지 않고 등록만 푼다.
-        // 이후 start()가 pidfile 잠금을 보고 다시 붙는다.
-        tracing::error!(%id, "lost QMP connection to running QEMU");
-        unregister();
-        return;
-    }
+    let dead = || liveness(&paths.pidfile) == Liveness::Dead;
     let kind = match guest_initiated {
-        Some(guest_initiated) => EventKind::Stopped { guest_initiated },
-        None => EventKind::Crashed,
+        // SHUTDOWN을 받았으면 종료는 확정이다. QEMU는 소켓을 닫고 곧 끝나므로 잠깐 기다려
+        // 디렉터리를 지우되, 플러시 등으로 늦어지면 잠금이 걸린 디렉터리는 남겨 두고
+        // (다음 launch/new()가 잠금 해제를 확인하고 정리한다) 종료는 바로 알린다.
+        Some(guest_initiated) => {
+            if !wait_until(SHUTDOWN_EXIT_WAIT, dead).await {
+                tracing::info!(%id, "QEMU is still exiting; leaving runtime dir");
+            } else if let Err(e) = std::fs::remove_dir_all(&paths.dir) {
+                tracing::warn!(%id, error = %e, "failed to remove runtime dir");
+            }
+            EventKind::Stopped { guest_initiated }
+        }
+        None => {
+            if !wait_until(EXIT_GRACE, dead).await {
+                // SHUTDOWN 없이 QMP만 끊기고 QEMU는 살아 있다. 파일을 지우거나 종료로 알리지
+                // 않고 등록만 푼다. inspect/list에 "unresponsive"로 드러나고, 이후 start()가
+                // 다시 붙거나 stop(Force)가 끝낸다.
+                tracing::error!(%id, "lost QMP connection to running QEMU");
+                unregister();
+                return;
+            }
+            if let Err(e) = std::fs::remove_dir_all(&paths.dir) {
+                tracing::warn!(%id, error = %e, "failed to remove runtime dir");
+            }
+            EventKind::Crashed
+        }
     };
-    if let Err(e) = std::fs::remove_dir_all(&paths.dir) {
-        tracing::warn!(%id, error = %e, "failed to remove runtime dir");
-    }
     // 이벤트를 받은 쪽이 곧바로 start를 불러도 "이미 실행 중"으로 오판하지 않도록 등록부터 해제한다.
     // 핸들이 drop되면서 이 태스크에 abort가 걸리지만, 아래에는 await가 없으므로 끝까지 실행된다.
     unregister();
     let _ = events.send(HypervisorEvent { id, kind });
 }
 
-/// QEMU는 수명 내내 `-pidfile`에 fcntl 잠금을 쥐고 있다(SIGSTOP 상태에서도). 잠금을 잡을 수
-/// 있으면 QEMU는 없다. 판단할 수 없으면 살아 있는 것으로 본다(파일을 지우지 않는 쪽).
-fn qemu_alive(pidfile: &Path) -> bool {
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pidfile)
-    {
+/// pidfile로 본 QEMU의 생존 여부
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// 이 pid가 pidfile 잠금을 쥐고 있다.
+    Alive(u32),
+    Dead,
+    /// 판정할 수 없다. 살아 있을 수 있으므로 파일을 지우거나 프로세스를 죽이지 않는다.
+    Unknown,
+}
+
+/// QEMU는 수명 내내 `-pidfile`에 POSIX 잠금(lockf)을 쥐고 있다(SIGSTOP 상태에서도).
+/// `F_GETLK`로 잠금을 잡지 않고 소유자를 조회한다. 잠금이 없으면 QEMU는 없다.
+/// 같은 프로세스가 쥔 잠금은 보이지 않지만, opld는 pidfile을 잠그지 않는다.
+fn liveness(pidfile: &Path) -> Liveness {
+    let file = match std::fs::File::open(pidfile) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Liveness::Dead,
         Err(e) => {
-            tracing::warn!(?pidfile, error = %e, "cannot open pidfile; assuming QEMU is alive");
-            return true;
+            tracing::warn!(?pidfile, error = %e, "cannot open pidfile");
+            return Liveness::Unknown;
         }
     };
-    match fcntl_lock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => {
-            // 잡은 잠금은 바로 놓는다. 이 프로세스가 쥐고 있으면 새 QEMU가 pidfile을 잠그지 못한다.
-            let _ = fcntl_lock(&file, FlockOperation::Unlock);
-            false
-        }
-        Err(e) => {
-            if e != rustix::io::Errno::WOULDBLOCK && e != rustix::io::Errno::ACCESS {
-                tracing::warn!(?pidfile, error = %e, "cannot test pidfile lock; assuming QEMU is alive");
+    // 파일 전체(길이 0 = 끝까지)에 대한 쓰기 잠금을 막는 잠금이 있는지 묻는다.
+    let probe = Flock {
+        start: 0,
+        length: 0,
+        pid: None,
+        typ: FlockType::WriteLock,
+        offset_type: FlockOffsetType::Set,
+    };
+    match fcntl_getlk(&file, &probe) {
+        Ok(None) => Liveness::Dead,
+        Ok(Some(lock)) => match lock.pid {
+            Some(pid) => Liveness::Alive(pid.as_raw_nonzero().get() as u32),
+            None => {
+                tracing::warn!(?pidfile, "pidfile lock has no owner pid");
+                Liveness::Unknown
             }
-            true
+        },
+        Err(e) => {
+            tracing::warn!(?pidfile, error = %e, "cannot query pidfile lock");
+            Liveness::Unknown
         }
     }
 }
 
-/// SIGKILL을 보낸다. 이미 없는 프로세스는 무시한다. pidfile 잠금으로 QEMU임을 확인한 pid에만 쓴다.
-fn kill_qemu(pid: u32) {
-    let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
-        tracing::warn!(pid, "invalid pid");
+/// `pid`가 지금 pidfile 잠금의 소유자일 때만 SIGKILL을 보낸다. pid 재사용이나 잘못된 pidfile로
+/// 엉뚱한 프로세스를 죽이지 않기 위해서다.
+fn kill_if_owner(pidfile: &Path, pid: u32) {
+    match liveness(pidfile) {
+        Liveness::Alive(owner) if owner == pid => {}
+        Liveness::Dead => return,
+        other => {
+            tracing::error!(
+                ?pidfile,
+                pid,
+                ?other,
+                "pid does not own the pidfile lock; not killing"
+            );
+            return;
+        }
+    }
+    let Some(target) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
         return;
     };
-    match kill_process(pid, Signal::KILL) {
+    match kill_process(target, Signal::KILL) {
         Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-        Err(e) => {
-            tracing::warn!(pid = pid.as_raw_nonzero().get(), error = %e, "failed to kill QEMU")
-        }
+        Err(e) => tracing::warn!(pid, error = %e, "failed to kill QEMU"),
     }
 }
 
@@ -633,8 +721,8 @@ time.sleep(60)
         closed: tokio::sync::oneshot::Receiver<()>,
         /// 받은 명령 이름
         commands: Arc<Mutex<Vec<String>>>,
-        /// 보내면 서버가 연결을 끊는다.
-        hangup: tokio::sync::oneshot::Sender<()>,
+        /// 보내면 서버가 (주어진 이벤트를 먼저 보낸 뒤) 연결을 끊는다.
+        hangup: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
     }
 
     /// QEMU 대신 QMP 소켓을 여는 가짜 서버. greeting과 capabilities 협상까지 처리하고,
@@ -645,7 +733,7 @@ time.sleep(60)
         std::fs::create_dir_all(dir).unwrap();
         let listener = tokio::net::UnixListener::bind(dir.join("qmp.sock")).unwrap();
         let (closed_tx, closed) = tokio::sync::oneshot::channel();
-        let (hangup, mut hangup_rx) = tokio::sync::oneshot::channel::<()>();
+        let (hangup, mut hangup_rx) = tokio::sync::oneshot::channel::<Option<serde_json::Value>>();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let recorded = commands.clone();
         tokio::spawn(async move {
@@ -658,7 +746,12 @@ time.sleep(60)
                 .unwrap();
             loop {
                 let line = tokio::select! {
-                    _ = &mut hangup_rx => break,
+                    ev = &mut hangup_rx => {
+                        if let Ok(Some(ev)) = ev {
+                            let _ = write.write_all(format!("{ev}\n").as_bytes()).await;
+                        }
+                        break;
+                    }
                     line = lines.next_line() => match line {
                         Ok(Some(line)) => line,
                         _ => break,
@@ -717,7 +810,8 @@ time.sleep(60)
 
         let tmp = short_tempdir();
         let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
-        let dir = cfg.run_dir.join("vm").join(Uuid::now_v7().to_string());
+        let id = Uuid::now_v7();
+        let dir = cfg.run_dir.join("vm").join(id.to_string());
         // pidfile이 잠겨 있으니 QEMU는 살아 있다. 소켓은 QMP가 아니어서 붙을 수 없지만 지우면 안 된다.
         let _qemu = hold_pidfile(&dir).await;
         let listener = tokio::net::UnixListener::bind(dir.join("qmp.sock")).unwrap();
@@ -728,7 +822,14 @@ time.sleep(60)
         });
 
         let hv = QemuHypervisor::new(cfg).await.unwrap();
-        assert!(hv.list().await.unwrap().is_empty());
+        assert!(hv.handle(id).is_none());
+        // 등록하지 않지만 살아 있는 VM으로 드러난다.
+        let listed = hv.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].status,
+            RuntimeStatus::Other("unresponsive".into())
+        );
         assert!(dir.exists());
     }
 
@@ -760,18 +861,134 @@ time.sleep(60)
         let vm = spec();
         let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
         // QEMU는 살아 있지만(SIGSTOP 등) QMP에 답하지 않는다.
-        let _qemu = hold_pidfile(&dir).await;
-        let listener = tokio::net::UnixListener::bind(dir.join("qmp.sock")).unwrap();
-        tokio::spawn(async move {
-            let _conn = listener.accept().await;
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        });
+        let qemu = unresponsive_vm(&dir).await;
 
         let err = hv.start(&vm).await.unwrap_err();
         assert!(err.is_transient(), "{err:?}");
         assert!(dir.join("qemu.pid").exists());
         assert!(dir.join("qmp.sock").exists());
+        // 등록되지 않았어도 살아 있는 VM은 조회에 드러나야 reconciler가 놓치지 않는다.
+        let expected = ActualState {
+            id: vm.id,
+            pid: qemu.id().unwrap(),
+            status: RuntimeStatus::Other("unresponsive".into()),
+        };
+        assert_eq!(hv.inspect(vm.id).await.unwrap(), Some(expected.clone()));
+        assert_eq!(hv.list().await.unwrap(), vec![expected]);
+    }
+
+    /// QEMU는 살아 있지만(SIGSTOP 등) QMP에 답하지 않는 런타임 디렉터리를 만든다.
+    async fn unresponsive_vm(dir: &Path) -> tokio::process::Child {
+        let qemu = hold_pidfile(dir).await;
+        let listener = tokio::net::UnixListener::bind(dir.join("qmp.sock")).unwrap();
+        tokio::spawn(async move {
+            let _conn = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        qemu
+    }
+
+    #[tokio::test]
+    async fn liveness_reports_lock_owner() {
+        let tmp = short_tempdir();
+        let dir = tmp.path().join("vm");
+        assert_eq!(liveness(&dir.join("qemu.pid")), Liveness::Dead);
+        let mut qemu = hold_pidfile(&dir).await;
+        assert_eq!(
+            liveness(&dir.join("qemu.pid")),
+            Liveness::Alive(qemu.id().unwrap())
+        );
+        qemu.kill().await.unwrap();
+        // kill -9 뒤에도 pidfile은 남지만 잠금은 풀린다.
+        assert!(dir.join("qemu.pid").exists());
+        assert_eq!(liveness(&dir.join("qemu.pid")), Liveness::Dead);
+    }
+
+    #[tokio::test]
+    async fn force_stop_kills_live_unregistered_vm() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let mut qemu = unresponsive_vm(&dir).await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        assert!(hv.inspect(vm.id).await.unwrap().is_some());
+
+        // ACPI 요청은 QMP 없이 보낼 수 없다. 다시 시도할 수 있는 오류다.
+        let err = hv.stop(vm.id, StopMode::Acpi).await.unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        assert!(dir.exists());
+
+        hv.stop(vm.id, StopMode::Force).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(2), qemu.wait())
+            .await
+            .expect("QEMU was not killed")
+            .unwrap();
+        assert!(!status.success());
+        assert!(!dir.exists());
         assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn force_stop_never_kills_a_pid_that_does_not_own_the_lock() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = unresponsive_vm(&dir).await;
+        // pidfile에 적힌 pid가 잠금 소유자와 다르다(pid 재사용, 다른 프로세스가 덮어씀 등).
+        let mut bystander = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let bystander_pid = bystander.id().unwrap();
+        std::fs::write(dir.join("qemu.pid"), format!("{bystander_pid}\n")).unwrap();
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+
+        let err = hv.stop(vm.id, StopMode::Force).await.unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        assert!(
+            bystander.try_wait().unwrap().is_none(),
+            "bystander was killed"
+        );
+        assert!(dir.join("qemu.pid").exists());
+    }
+
+    #[tokio::test]
+    async fn guest_shutdown_is_reported_even_if_qemu_exits_slowly() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        // QEMU가 SHUTDOWN을 보내고 QMP를 닫았지만 아직 플러시 중이라 잠금을 쥐고 있다.
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "running").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let mut rx = hv.subscribe();
+
+        let shutdown = serde_json::json!({
+            "event": "SHUTDOWN",
+            "data": { "guest": true, "reason": "guest-shutdown" },
+            "timestamp": { "seconds": 0, "microseconds": 0 }
+        });
+        fake.hangup.send(Some(shutdown)).unwrap();
+        let ev = tokio::time::timeout(EXIT_GRACE - Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Stopped was not reported promptly")
+            .unwrap();
+        assert_eq!(
+            ev,
+            HypervisorEvent {
+                id: vm.id,
+                kind: EventKind::Stopped {
+                    guest_initiated: true
+                }
+            }
+        );
+        assert!(hv.handle(vm.id).is_none());
+        // 잠금이 남아 있으니 파일은 지우지 않는다. 다음 launch/new()가 정리한다.
+        assert!(dir.join("qemu.pid").exists());
     }
 
     #[tokio::test]
@@ -785,7 +1002,7 @@ time.sleep(60)
         let hv = QemuHypervisor::new(cfg).await.unwrap();
         let mut rx = hv.subscribe();
 
-        fake.hangup.send(()).unwrap();
+        fake.hangup.send(None).unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             while hv.handle(vm.id).is_some() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
