@@ -198,6 +198,14 @@ pub enum VmPhase {
 #[serde(try_from = "String", into = "String")]
 pub struct MacAddr(pub [u8; 6]);
 
+impl MacAddr {
+    /// QEMU/KVM 관례 접두사 `52:54:00`에 난수 3바이트를 붙인 주소를 만든다.
+    pub fn generate() -> Self {
+        let r = Uuid::new_v4().into_bytes();
+        MacAddr([0x52, 0x54, 0x00, r[0], r[1], r[2]])
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("invalid MAC address: {0}")]
 pub struct MacParseError(String);
@@ -346,6 +354,15 @@ mod tests {
         assert_eq!(mac.0, [0x52, 0x54, 0x00, 0xab, 0xcd, 0x0f]);
         assert_eq!(mac.to_string(), "52:54:00:ab:cd:0f");
         assert_eq!(serde_json::to_value(mac).unwrap(), "52:54:00:ab:cd:0f");
+    }
+
+    #[test]
+    fn generated_mac_is_unicast_with_qemu_prefix() {
+        let a = MacAddr::generate();
+        let b = MacAddr::generate();
+        assert_eq!(&a.0[..3], &[0x52, 0x54, 0x00]);
+        assert_eq!(a.0[0] & 1, 0);
+        assert_ne!(a, b);
     }
 
     #[test]
