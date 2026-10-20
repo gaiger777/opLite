@@ -38,12 +38,12 @@ impl Default for MockHypervisor {
 }
 
 impl MockHypervisor {
-    /// 다음 `start` 한 번을 이 오류로 실패시킨다.
+    /// 다음 `start` 한 번을 이 오류로 실패시킨다. 이미 실행 중인 VM에 대한 `start`에는 쓰이지 않는다.
     pub fn fail_next_start(&self, err: DriverError) {
         self.state.lock().unwrap().fail_next_start = Some(err);
     }
 
-    /// 게스트 OS 안에서 전원을 끈 것처럼 만든다.
+    /// 게스트 OS 안에서 전원을 끈 것처럼 만든다. `stop(Acpi)` 요청에 게스트가 응한 경우도 이것으로 흉내 낸다.
     pub fn guest_shutdown(&self, id: Uuid) {
         self.remove(
             id,
@@ -78,11 +78,12 @@ impl Hypervisor for MockHypervisor {
     async fn start(&self, vm: &VmRuntimeSpec) -> Result<(), DriverError> {
         {
             let mut st = self.state.lock().unwrap();
-            if let Some(err) = st.fail_next_start.take() {
-                return Err(err);
-            }
+            // 실제 드라이버처럼 이미 실행 중이면 기동을 시도하지 않으므로 주입한 오류도 쓰지 않는다.
             if st.vms.contains_key(&vm.id) {
                 return Ok(());
+            }
+            if let Some(err) = st.fail_next_start.take() {
+                return Err(err);
             }
             let pid = st.next_pid;
             st.next_pid += 1;
@@ -96,9 +97,17 @@ impl Hypervisor for MockHypervisor {
     }
 
     async fn stop(&self, id: Uuid, mode: StopMode) -> Result<(), DriverError> {
-        // 실제 QEMU에서도 ACPI 종료는 게스트가 스스로 꺼진 것(guest: true)으로 보고된다.
-        let guest_initiated = mode == StopMode::Acpi;
-        self.remove(id, EventKind::Stopped { guest_initiated });
+        match mode {
+            // 실제 QEMU처럼 요청만 보낸다. 게스트는 무시할 수 있으므로 실제 종료는
+            // 테스트가 `guest_shutdown`으로 일으킨다.
+            StopMode::Acpi => {}
+            StopMode::Force => self.remove(
+                id,
+                EventKind::Stopped {
+                    guest_initiated: false,
+                },
+            ),
+        }
         Ok(())
     }
 
@@ -204,6 +213,44 @@ mod tests {
             Err(DriverError::StartFailed(_))
         ));
         hv.start(&vm).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn injected_failure_does_not_apply_to_running_vm() {
+        let hv = MockHypervisor::default();
+        let vm = spec();
+        hv.start(&vm).await.unwrap();
+        hv.fail_next_start(DriverError::StartFailed("boom".into()));
+        // 실제 드라이버처럼 이미 실행 중이면 기동을 시도하지 않으므로 실패하지 않는다.
+        hv.start(&vm).await.unwrap();
+        // 주입한 오류는 소비되지 않고 다음 실제 기동에 적용된다.
+        hv.crash(vm.id);
+        assert!(matches!(
+            hv.start(&vm).await,
+            Err(DriverError::StartFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn acpi_stop_only_requests_shutdown() {
+        let hv = MockHypervisor::default();
+        let vm = spec();
+        hv.start(&vm).await.unwrap();
+        let mut rx = hv.subscribe();
+        hv.stop(vm.id, StopMode::Acpi).await.unwrap();
+        // 게스트가 요청을 무시할 수 있으므로 VM은 그대로 돌고 이벤트도 없다.
+        assert!(rx.try_recv().is_err());
+        let st = hv.inspect(vm.id).await.unwrap().unwrap();
+        assert_eq!(st.status, RuntimeStatus::Running);
+        assert_eq!(hv.list().await.unwrap().len(), 1);
+
+        hv.guest_shutdown(vm.id);
+        assert_eq!(
+            rx.recv().await.unwrap().kind,
+            EventKind::Stopped {
+                guest_initiated: true
+            }
+        );
     }
 
     #[tokio::test]

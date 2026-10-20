@@ -30,7 +30,14 @@ impl DriverError {
     pub fn is_transient(&self) -> bool {
         match self {
             DriverError::Qmp(QmpError::Command { .. }) => false,
-            DriverError::Qmp(_) | DriverError::Timeout(_) | DriverError::Io(_) => true,
+            // 바이너리나 풀 디렉터리가 없거나 권한이 없으면 다시 해도 실패한다.
+            DriverError::Io(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+            ),
+            DriverError::Qmp(_) | DriverError::Timeout(_) => true,
             DriverError::NotRunning(_)
             | DriverError::InvalidSpec(_)
             | DriverError::StartFailed(_)
@@ -50,6 +57,14 @@ mod tests {
         assert!(DriverError::Timeout("qmp").is_transient());
         assert!(DriverError::Qmp(QmpError::Disconnected).is_transient());
         assert!(DriverError::Io(std::io::Error::other("x")).is_transient());
+        // 바이너리나 풀 디렉터리가 없거나 권한이 없으면 다시 해도 실패한다.
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidInput,
+        ] {
+            assert!(!DriverError::Io(kind.into()).is_transient(), "{kind:?}");
+        }
 
         let cmd = QmpError::Command {
             class: "GenericError".into(),

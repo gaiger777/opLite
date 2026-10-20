@@ -200,6 +200,7 @@ pub struct MacAddr(pub [u8; 6]);
 
 impl MacAddr {
     /// QEMU/KVM 관례 접두사 `52:54:00`에 난수 3바이트를 붙인 주소를 만든다.
+    /// 난수가 24비트라 VM이 많으면 충돌할 수 있다. 호출자(API)는 클러스터 안에서 중복을 확인하고 다시 뽑는다.
     pub fn generate() -> Self {
         let r = Uuid::new_v4().into_bytes();
         MacAddr([0x52, 0x54, 0x00, r[0], r[1], r[2]])

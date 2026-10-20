@@ -40,8 +40,10 @@ pub struct HypervisorEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     Started,
-    /// 정상 종료. `guest_initiated`는 게스트 OS 안에서 끈 경우 true다.
+    /// 정상 종료
     Stopped {
+        /// 게스트가 스스로 꺼진 경우 true다. opld가 요청한 ACPI 종료도 게스트가 수행하므로
+        /// true로 보고된다. 이 값만 보고 spec을 바꾸지 말고 현재 원하는 상태와 비교해야 한다.
         guest_initiated: bool,
     },
     /// 종료 이벤트 없이 프로세스가 사라졌다.
@@ -56,6 +58,8 @@ pub trait Hypervisor: Send + Sync {
 
     /// `Acpi`는 요청만 보내고 바로 돌아온다. `Force`는 프로세스가 끝날 때까지 기다린다.
     /// 실행 중이 아니면 아무것도 하지 않고 성공한다.
+    /// `Force`에서 프로세스가 응답하지 않아 강제로 죽여야 했다면 종료 이벤트가 없으므로
+    /// `Stopped` 대신 `Crashed`로 보고된다.
     async fn stop(&self, id: Uuid, mode: StopMode) -> Result<(), DriverError>;
 
     /// 실행 중이 아니면 `None`
@@ -66,6 +70,6 @@ pub trait Hypervisor: Send + Sync {
     /// VNC 유닉스 소켓 경로
     async fn console_endpoint(&self, id: Uuid) -> Result<PathBuf, DriverError>;
 
-    /// 이 시점 이후의 VM 수명 이벤트를 받는다.
+    /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;
 }
