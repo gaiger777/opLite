@@ -8,7 +8,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Error)]
@@ -59,11 +59,13 @@ type Pending = Arc<Mutex<Option<HashMap<u64, oneshot::Sender<Reply>>>>>;
 
 /// QMP 유닉스 소켓 클라이언트. 명령은 동시에 여러 개 보낼 수 있고, 응답은 `id`로 짝을 맞춘다.
 pub struct QmpClient {
-    writer: tokio::sync::Mutex<OwnedWriteHalf>,
+    writer: mpsc::UnboundedSender<Vec<u8>>,
     pending: Pending,
     next_id: AtomicU64,
-    events: broadcast::Sender<QmpEvent>,
+    /// 강한 Sender는 리더 태스크만 가진다. 연결이 끊기면 구독자가 `Closed`를 받게 하기 위해서다.
+    events: broadcast::WeakSender<QmpEvent>,
     reader: JoinHandle<()>,
+    writer_task: JoinHandle<()>,
 }
 
 impl QmpClient {
@@ -84,13 +86,17 @@ impl QmpClient {
 
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         let (events, _) = broadcast::channel(64);
-        let reader = tokio::spawn(read_loop(lines, pending.clone(), events.clone()));
+        let weak_events = events.downgrade();
+        let reader = tokio::spawn(read_loop(lines, pending.clone(), events));
+        let (writer, rx) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(write_loop(write, rx, pending.clone()));
         let client = Self {
-            writer: tokio::sync::Mutex::new(write),
+            writer,
             pending,
             next_id: AtomicU64::new(1),
-            events,
+            events: weak_events,
             reader,
+            writer_task,
         };
         client.execute("qmp_capabilities", None).await?;
         Ok(client)
@@ -109,6 +115,11 @@ impl QmpClient {
             }
             None => return Err(QmpError::Disconnected),
         }
+        // 취소(drop)되거나 실패해도 pending 항목이 남지 않게 한다.
+        let _guard = PendingGuard {
+            pending: &self.pending,
+            id,
+        };
 
         let mut msg = json!({ "execute": command, "id": id });
         if let Some(args) = arguments {
@@ -116,18 +127,21 @@ impl QmpClient {
         }
         let mut line = serde_json::to_vec(&msg).expect("json! value always serializes");
         line.push(b'\n');
-        if let Err(e) = self.writer.lock().await.write_all(&line).await {
-            if let Some(map) = self.pending.lock().unwrap().as_mut() {
-                map.remove(&id);
-            }
-            return Err(e.into());
-        }
+        // 줄 전체를 writer 태스크가 끝까지 쓰므로, 호출자가 취소해도 반쪽 JSON이 남지 않는다.
+        self.writer.send(line).map_err(|_| QmpError::Disconnected)?;
         rx.await.unwrap_or(Err(QmpError::Disconnected))
     }
 
     /// 이 시점 이후에 도착하는 이벤트를 받는다.
+    ///
+    /// 구독 전에 도착한 이벤트는 받을 수 없고, 느린 구독자는 `Lagged`를 받는다.
+    /// 재접속 직후나 `Lagged`를 받았을 때는 `query_status`로 상태를 다시 맞춘다.
+    /// 연결이 끊기면 `Closed`를 받는다.
     pub fn subscribe(&self) -> broadcast::Receiver<QmpEvent> {
-        self.events.subscribe()
+        match self.events.upgrade() {
+            Some(s) => s.subscribe(),
+            None => broadcast::channel(1).1,
+        }
     }
 
     pub async fn query_status(&self) -> Result<RunState, QmpError> {
@@ -160,6 +174,43 @@ impl QmpClient {
 impl Drop for QmpClient {
     fn drop(&mut self) {
         self.reader.abort();
+        self.writer_task.abort();
+    }
+}
+
+/// drop되면 `pending`에서 id를 제거한다. 응답이 이미 처리됐다면 아무 일도 하지 않는다.
+struct PendingGuard<'a> {
+    pending: &'a Pending,
+    id: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(map) = self.pending.lock().unwrap().as_mut() {
+            map.remove(&self.id);
+        }
+    }
+}
+
+/// 연결이 끊겼음을 알리고 대기 중인 모든 호출을 `Disconnected`로 끝낸다.
+fn fail_all(pending: &Pending) {
+    if let Some(map) = pending.lock().unwrap().take() {
+        for (_, tx) in map {
+            let _ = tx.send(Err(QmpError::Disconnected));
+        }
+    }
+}
+
+async fn write_loop(
+    mut write: OwnedWriteHalf,
+    mut lines: mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: Pending,
+) {
+    while let Some(line) = lines.recv().await {
+        if write.write_all(&line).await.is_err() {
+            fail_all(&pending);
+            return;
+        }
     }
 }
 
@@ -171,11 +222,7 @@ async fn read_loop(
     while let Ok(Some(line)) = lines.next_line().await {
         dispatch(&line, &pending, &events);
     }
-    if let Some(map) = pending.lock().unwrap().take() {
-        for (_, tx) in map {
-            let _ = tx.send(Err(QmpError::Disconnected));
-        }
-    }
+    fail_all(&pending);
 }
 
 fn dispatch(line: &str, pending: &Pending, events: &broadcast::Sender<QmpEvent>) {
@@ -221,7 +268,10 @@ fn dispatch(line: &str, pending: &Pending, events: &broadcast::Sender<QmpEvent>)
 mod tests {
     use std::path::PathBuf;
 
+    use std::time::Duration;
+
     use tokio::net::UnixListener;
+    use tokio::sync::broadcast::error::RecvError;
 
     use super::*;
 
@@ -358,5 +408,73 @@ mod tests {
             QmpClient::connect(&path).await,
             Err(QmpError::Protocol(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_command_does_not_corrupt_the_stream() {
+        let (client, mut fake, _dir) = setup().await;
+        // fake가 읽지 않으므로 소켓 버퍼가 차서 쓰기가 막힌 채 타임아웃으로 취소된다.
+        let big = json!({ "pad": "x".repeat(8 << 20) });
+        let res =
+            tokio::time::timeout(Duration::from_millis(50), client.execute("x", Some(big))).await;
+        assert!(res.is_err(), "execute should have been cancelled");
+
+        let test = async {
+            let (status, ()) = tokio::join!(client.query_status(), async {
+                let first = fake.recv().await;
+                assert_eq!(first["execute"], "x");
+                fake.answer(
+                    "query-status",
+                    json!({ "return": { "running": true, "status": "running" } }),
+                )
+                .await;
+            });
+            assert_eq!(status.unwrap(), RunState::Running);
+        };
+        tokio::time::timeout(Duration::from_secs(10), test)
+            .await
+            .expect("stream was corrupted by the cancelled command");
+        assert_eq!(client.pending.lock().unwrap().as_ref().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn subscribers_see_closed_after_disconnect() {
+        let (client, fake, _dir) = setup().await;
+        let mut rx = client.subscribe();
+        drop(fake);
+        let res = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("subscriber was never told the connection closed");
+        assert!(matches!(res, Err(RecvError::Closed)));
+        let mut late = client.subscribe();
+        assert!(matches!(late.recv().await, Err(RecvError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn concurrent_commands_are_matched_by_id() {
+        let (client, mut fake, _dir) = setup().await;
+        let mut rx = client.subscribe();
+        let (status, name, ()) = tokio::join!(
+            client.query_status(),
+            client.execute("query-name", None),
+            async {
+                let a = fake.recv().await;
+                let b = fake.recv().await;
+                let reply = |cmd: &Value| match cmd["execute"].as_str().unwrap() {
+                    "query-status" => {
+                        json!({ "return": { "running": true, "status": "running" }, "id": cmd["id"] })
+                    }
+                    "query-name" => json!({ "return": { "name": "vm1" }, "id": cmd["id"] }),
+                    other => panic!("unexpected command {other}"),
+                };
+                fake.send(reply(&b)).await;
+                fake.send(json!({ "event": "RESUME", "data": {}, "timestamp": {} }))
+                    .await;
+                fake.send(reply(&a)).await;
+            }
+        );
+        assert_eq!(status.unwrap(), RunState::Running);
+        assert_eq!(name.unwrap()["name"], "vm1");
+        assert_eq!(rx.recv().await.unwrap().event, "RESUME");
     }
 }
