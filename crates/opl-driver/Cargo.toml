@@ -1,0 +1,28 @@
+[package]
+name = "opl-driver"
+description = "Hypervisor and storage drivers for opLite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# qemu-img만 있으면 되는 스토리지 통합 테스트 (macOS: brew install qemu, Debian/Ubuntu: apt install qemu-utils)
+storage-it = []
+# 실제 VM을 띄우는 통합 테스트. Apple Silicon Mac + brew install qemu가 필요하다.
+qemu-it = []
+
+[dependencies]
+async-trait.workspace = true
+fs4.workspace = true
+opl-qemu.workspace = true
+opl-types.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
