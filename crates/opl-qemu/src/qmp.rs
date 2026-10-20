@@ -102,6 +102,8 @@ impl QmpClient {
         Ok(client)
     }
 
+    /// 명령을 보내고 응답을 기다린다. 타임아웃 등으로 취소해도 이미 보낸 명령은 나중에
+    /// 실행될 수 있으므로, 결과는 알 수 없는 것으로 보고 `query_status`로 다시 확인한다.
     pub async fn execute(
         &self,
         command: &str,

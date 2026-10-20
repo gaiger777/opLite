@@ -2209,3 +2209,16 @@ GitHub Actions의 `CI` 워크플로에서 `check (ubuntu-latest)`, `check (macos
 - MAC 자동 할당(`52:54:00` 접두사 + 난수)과 VmSpec → VmRuntimeSpec 변환은 계획 2(`opl-driver`)에서 구현한다.
 - QEMU 프로세스 분리 실행(macOS `setsid`, Linux `systemd-run --scope`)과 pidfile 기반 재부착도 계획 2에서 구현한다.
 - UEFI 변수 파일은 이 계획에서는 테스트가 직접 복사한다. 계획 2에서는 VM 생성 시 드라이버가 원본을 복사하고, VM과 같은 스토리지에 보관한다.
+
+## 실행 후 기록 (2026-10-20)
+
+코드 리뷰를 거치며 계획의 코드에서 아래가 바뀌었다. 저장소의 코드가 기준이다.
+
+- `opl-types`: MAC 파싱이 `+` 부호를 받아들이던 버그 수정, `validate()`에 멀티캐스트 MAC·중복 MAC 검사 추가, `VmStatus`에 `#[serde(default)]` 추가 (테스트 10개)
+- `opl-qemu` `QmpClient`: 쓰기를 전용 writer 태스크로 분리해 명령 취소 시 스트림이 손상되던 버그 수정, 취소된 명령의 pending 항목 제거, 연결이 끊기면 이벤트 구독자가 `Closed`를 받도록 수정, 동시 명령 id 매칭 테스트 추가 (테스트 17개)
+- 설계 문서: 저장 형식 호환성 규칙(새 필드는 `#[serde(default)]` + 클러스터 기능 레벨 이후 기록), 런타임 파일 이름 갱신
+
+다음 계획에 넘기는 사항:
+- `QmpClient::execute`를 타임아웃으로 취소해도 명령은 나중에 실행될 수 있다. reconciler는 결과를 `query_status`로 다시 확인해야 한다.
+- QMP writer 큐에는 상한이 없다. 재시도는 반드시 백오프를 거친다.
+- Sata+virt, Bios+virt처럼 spec만으로 판정할 수 있는 조합은 API 단계(계획 5)에서 미리 거부하는 것을 검토한다.
