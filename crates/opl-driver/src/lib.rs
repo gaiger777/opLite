@@ -3,7 +3,11 @@
 pub mod error;
 pub mod hypervisor;
 pub mod mock;
+pub mod storage;
 
 pub use error::DriverError;
-pub use hypervisor::{ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode};
+pub use hypervisor::{
+    ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
+};
 pub use mock::MockHypervisor;
+pub use storage::{Capacity, DirStorage, SourceFormat, Storage, VolumeInfo};
