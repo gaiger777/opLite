@@ -1,0 +1,23 @@
+[package]
+name = "opl-qemu"
+description = "QEMU command line builder and QMP client for opLite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# 실제 QEMU를 실행하는 통합 테스트. macOS(hvf)에서는 `brew install qemu`가 필요하다.
+qemu-it = []
+
+[dependencies]
+opl-types.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true
