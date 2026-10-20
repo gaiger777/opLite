@@ -22,3 +22,4 @@ tempfile = "3.27.0"
 async-trait = "0.1.92"
 fs4 = "1.1.0"
 tracing = "0.1.44"
+rustix = { version = "1.1.5", features = ["fs", "process"] }

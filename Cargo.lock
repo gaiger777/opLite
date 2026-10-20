@@ -187,6 +187,7 @@ dependencies = [
  "fs4",
  "opl-qemu",
  "opl-types",
+ "rustix",
  "serde_json",
  "tempfile",
  "thiserror",

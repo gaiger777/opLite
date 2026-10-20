@@ -199,7 +199,8 @@ QEMU 커맨드라인 생성은 순수 함수 `fn build_cmdline(&VmRuntimeSpec, &
 - 런타임 파일은 `/run/opl/vm/{uuid}/`(macOS는 설정한 run_dir) 아래에 `qmp.sock`, `vnc.sock`, `qemu.pid`로 둔다. UEFI 변수처럼 재부팅 후에도 남아야 하는 파일은 `/var/lib/opl/vm/{uuid}/uefi-vars.fd`에 둔다. 라이브 마이그레이션(하위 프로젝트 4)에서 공유 스토리지로 옮기는 것을 다시 검토한다.
 - VM마다 모니터 태스크가 QMP 이벤트를 지켜본다. `SHUTDOWN` 이벤트 뒤에 연결이 끊기면 정상 종료(`Stopped`), 이벤트 없이 끊기면 `Crashed`로 판정하고 런타임 디렉터리를 정리한다.
 - `opld`가 시작되면 런타임 디렉터리를 훑어 살아 있는 QEMU에 QMP로 다시 연결한다. 그 뒤 Raft의 원하는 상태와 비교해 조정한다.
-- 소켓 연결 자체가 거부될 때만 죽은 VM으로 보고 런타임 디렉터리를 지운다. 그 밖의 오류나 타임아웃에서는 살아 있는 VM일 수 있으므로 아무것도 지우지 않고 오류를 기록한다.
+- QEMU의 생존 여부는 QEMU가 수명 내내 잡고 있는 pidfile의 fcntl 잠금으로 판정한다(QMP 응답 여부와 무관하며, SIGSTOP 상태에서도 정확하다). 잠금이 풀린 런타임 디렉터리만 지운다. 살아 있지만 QMP에 붙지 못한 VM은 등록하지 않고 오류를 기록하며, 이후 `start()`가 재부착을 시도한다.
+- macOS에서는 `-daemonize`의 fork가 Objective-C 런타임 검사에 걸려 크래시할 수 있으므로 `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`로 실행한다.
 - 이 설계 덕분에 `opld`를 업그레이드하거나 재시작해도 실행 중인 VM은 중단되지 않는다.
 
 ### 5.5 오류 처리

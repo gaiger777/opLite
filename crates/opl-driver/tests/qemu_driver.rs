@@ -139,3 +139,92 @@ async fn reports_crash_when_qemu_is_killed() {
     assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
     assert!(!tmp.path().join("run/vm").join(vm.id.to_string()).exists());
 }
+
+fn signal(sig: &str, pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+fn process_exists(pid: u32) -> bool {
+    signal("-0", pid)
+}
+
+/// 테스트가 중간에 실패해도 멈춰 둔 QEMU가 남지 않게 drop에서 SIGKILL을 보낸다.
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        signal("-KILL", self.0);
+    }
+}
+
+#[tokio::test]
+async fn start_does_not_destroy_unresponsive_running_vm() {
+    let tmp = short_tempdir();
+    let vm = spec();
+    let run_dir = tmp.path().join("run/vm").join(vm.id.to_string());
+    let pid = {
+        let a = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+        a.start(&vm).await.unwrap();
+        a.inspect(vm.id).await.unwrap().unwrap().pid
+    };
+    let _guard = KillOnDrop(pid);
+    assert!(signal("-STOP", pid));
+
+    // 멈춘 QEMU는 QMP에 답하지 않는다. 살아 있으므로 파일을 지우지 않고 등록만 하지 않는다.
+    let b = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    assert!(run_dir.exists());
+    assert_eq!(b.inspect(vm.id).await.unwrap(), None);
+
+    // 새로 띄우거나 파일을 지우지 않고, 다시 시도할 수 있는 오류로 끝난다.
+    let err = b.start(&vm).await.unwrap_err();
+    assert!(err.is_transient(), "{err:?}");
+    assert!(run_dir.join("qemu.pid").exists());
+    assert!(run_dir.join("qmp.sock").exists());
+    assert!(process_exists(pid));
+
+    assert!(signal("-CONT", pid));
+    b.start(&vm).await.unwrap();
+    let st = b.inspect(vm.id).await.unwrap().expect("reattached");
+    assert_eq!(st.pid, pid);
+    assert_eq!(st.status, RuntimeStatus::Running);
+
+    b.stop(vm.id, StopMode::Force).await.unwrap();
+    assert_eq!(b.inspect(vm.id).await.unwrap(), None);
+    assert!(!run_dir.exists());
+}
+
+#[tokio::test]
+async fn force_stop_kills_unresponsive_qemu() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let vm = spec();
+    hv.start(&vm).await.unwrap();
+    let pid = hv.inspect(vm.id).await.unwrap().unwrap().pid;
+    let _guard = KillOnDrop(pid);
+    let mut rx = hv.subscribe();
+    assert!(signal("-STOP", pid));
+
+    tokio::time::timeout(Duration::from_secs(30), hv.stop(vm.id, StopMode::Force))
+        .await
+        .expect("force stop took longer than 30s")
+        .unwrap();
+    // SHUTDOWN 이벤트 없이 죽였으므로 Crashed로 보고된다.
+    assert_eq!(next_event_for(&mut rx, vm.id).await, EventKind::Crashed);
+    // launchd/init이 회수할 때까지 잠시 걸릴 수 있다.
+    let mut gone = false;
+    for _ in 0..100 {
+        if !process_exists(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "QEMU {pid} is still alive");
+    assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
+    assert!(!tmp.path().join("run/vm").join(vm.id.to_string()).exists());
+}
