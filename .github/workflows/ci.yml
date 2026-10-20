@@ -24,6 +24,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      - name: Storage integration tests (qemu-img)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+          cargo test -p opl-driver --features storage-it --test dir_storage
 
   deny:
     runs-on: ubuntu-latest
