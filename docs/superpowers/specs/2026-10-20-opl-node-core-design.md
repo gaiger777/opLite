@@ -123,7 +123,7 @@ spec:
   disks:
     - { volume: web-01-root, bus: virtio-blk, boot_order: 1 }
   nics:
-    - { network: lan, model: virtio, mac: auto }
+    - { network: lan, model: virtio }   # mac을 생략하면 자동 할당
   power: running          # running | stopped
   restart: on-failure     # never | on-failure
   node: null              # null이면 스케줄러가 배치
@@ -299,4 +299,4 @@ M0부터 M6까지는 macOS에서 진행한다. M7은 Linux/KVM 환경이 필요�
 | 비밀번호 해시 | `argon2` |
 | 테스트 | `insta`, `proptest` |
 
-라이선스 정책: 공개 크레이트는 Apache-2.0 또는 MIT와 호환되는 의존성만 사용한다. QEMU(GPL)는 별도 프로세스로 실행하므로 링크하지 않는다. CI에서 `cargo-deny`로 라이선스를 검사한다. 공개 코어의 라이선스(AGPL-3.0 또는 Apache-2.0)는 M0 전에 결정한다.
+라이선스 정책: 공개 코어는 **Apache-2.0**으로 배포한다(2026-10-20 결정). 의존성은 Apache-2.0과 호환되는 라이선스(MIT, BSD, ISC 등)만 허용하고, CI에서 `cargo-deny`로 검사한다. QEMU(GPL)는 별도 프로세스로 실행하므로 링크하지 않는다.
