@@ -197,7 +197,7 @@ QEMU 커맨드라인 생성은 순수 함수 `fn build_cmdline(&VmRuntimeSpec, &
 ### 5.4 opld 재시작과 크래시 복구
 
 - QEMU는 `opld`의 자식 프로세스가 아니다. Linux에서는 `systemd-run --scope`, macOS에서는 `setsid`로 분리해 실행한다.
-- 런타임 파일은 `/run/opl/vm/{uuid}/`(macOS는 `$OPL_RUN_DIR/vm/{uuid}/`) 아래에 `qmp.sock`, `vnc.sock`, `pid`, `spec.json`으로 둔다.
+- 런타임 파일은 `/run/opl/vm/{uuid}/`(macOS는 `$OPL_RUN_DIR/vm/{uuid}/`) 아래에 `qmp.sock`, `vnc.sock`, `qemu.pid`, `uefi-vars.fd`, `spec.json`으로 둔다.
 - `opld`가 시작되면 런타임 디렉터리를 훑어 살아 있는 QEMU에 QMP로 다시 연결한다. 그 뒤 Raft의 원하는 상태와 비교해 조정한다.
 - 이 설계 덕분에 `opld`를 업그레이드하거나 재시작해도 실행 중인 VM은 중단되지 않는다.
 
