@@ -2232,3 +2232,43 @@ git commit -m "docs: 드라이버 설계를 구현에 맞추고 CI에 Linux 스�
 
 - 저장 형식 호환성 규칙(설계 3.1)과 `schema_version` 위치를 결정한다.
 - 계획 4(reconciler)가 쓸 수 있도록, 리소스 변경 watch 스트림이 "변경된 리소스 + revision"을 내보내야 한다.
+
+## 실행 후 기록 (2026-10-20)
+
+코드 리뷰(실제 QEMU 11.1.2와 qemu-img로 재현)를 거쳐 계획의 코드에서 아래가 바뀌었다. 저장소의 코드가 기준이다.
+
+**QemuHypervisor**
+- QEMU 생존 판정을 pidfile의 fcntl 잠금(`F_GETLK`, 잠금 소유자 pid 확인)으로 바꿨다. 계획의 "QMP 연결 거부 = 죽은 VM" 판정은 틀렸다. QEMU가 잠시 멈추거나(SIGSTOP, I/O 정지) macOS의 QMP 대기열이 차면 살아 있는 VM의 런타임 디렉터리를 지워 영영 제어할 수 없게 만들었다.
+- `Liveness::{Alive(owner), Dead, Unknown}`. 잠금 소유자가 맞을 때만 SIGKILL하고, 판정 불가면 아무것도 지우거나 죽이지 않는다.
+- 살아 있지만 등록되지 않은 VM은 `inspect`/`list`에 `Other("unresponsive")`로 드러나고, `start()`는 재부착을 시도하며, `stop(Force)`는 SIGKILL 후 정리한다.
+- `start()`는 `-S` 상태로 남은 VM에 `cont`를 보낸다. 모니터 등록과 `Started` 이벤트는 맵 잠금 안에서 처리한다(등록 전에 모니터가 끝나 죽은 핸들이 남던 경합 제거).
+- 모든 QMP 호출에 타임아웃을 두었다. `stop(Force)`는 `quit`이 듣지 않으면 SIGKILL한다. 이렇게 죽은 VM은 `Crashed`로 보고된다.
+- SHUTDOWN 이벤트를 받은 뒤 QEMU가 늦게 끝나도 `Stopped` 이벤트는 바로 보낸다.
+- macOS: `-daemonize`의 fork가 Objective-C 런타임 검사로 크래시한다(VNC 장치가 없으면 40회 중 40회). `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`로 실행한다.
+
+**MockHypervisor / DriverError**
+- Mock의 `stop(Acpi)`는 아무것도 하지 않는다(실제 QEMU처럼 요청만 보냄). 실제 종료는 `guest_shutdown()`으로 일으킨다.
+- `fail_next_start`는 이미 실행 중인 VM에는 적용되지 않는다.
+- `Io`의 `NotFound`/`PermissionDenied`/`InvalidInput`/`Unsupported`는 영구 오류다.
+
+**DirStorage**
+- `qemu-img create`는 기존 파일을 경고 없이 덮어쓴다. 고유한 임시 파일(`.{name}.{uuid}.part`)에 만든 뒤 `hard_link`로 게시하므로, 이미 있는 볼륨은 절대 덮어쓰지 않는다(풀은 hard link를 지원하는 파일시스템이어야 한다).
+- `kill_on_drop`을 쓴다. 상대 경로(`json:`, `nbd:` 같은 프로토콜 문법)는 거부한다. `qemu-img info` 출력에 필드가 없으면 `ToolFailed`를 돌려준다.
+
+테스트: `opl-driver` 단위 30개(python3 필요), storage-it 3개, qemu-it 6개.
+
+## 다음 계획으로 넘기는 사항
+
+계획 4 (reconciler):
+- `Stopped{guest_initiated: true}`는 opld가 요청한 ACPI 종료에서도 나온다. 이벤트만 보고 spec을 바꾸지 말고 현재 원하는 상태와 비교한다.
+- 원하는 상태가 `stopped`일 때 오는 `Crashed`(강제 종료의 결과)는 크래시 백오프 집계에서 뺀다.
+- `Stopped` 직후 잠시 `unresponsive`로 보이는 VM(종료 중인 QEMU)을 바로 `stop(Force)`하지 않는다. 유예한 뒤 VM별 큐 안에서 `inspect`로 다시 확인하고 행동한다.
+- `list()`는 VM을 순서대로 조회하므로 응답 없는 VM마다 최대 5초씩 늘어난다. 필요하면 병렬화한다.
+- ACPI 종료 타임아웃 후 `Force`로 승격하는 규칙을 구현한다.
+
+계획 5 (API):
+- 업로드 이미지는 단일 파일 형식인지 검증한다(VMDK descriptor가 임의의 호스트 파일을 참조할 수 있다).
+- `MacAddr::generate()`의 충돌을 클러스터 안에서 확인한다. 볼륨 크기 0은 거부한다. 가져온 볼륨의 `size_bytes`를 정의한다.
+
+나중에 처리:
+- opld가 크래시하면 남는 `.part` 임시 파일과, 늦게 종료된 VM의 런타임 디렉터리를 시작할 때 정리한다.
