@@ -30,6 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-utils
           cargo test -p opl-driver --features storage-it --test dir_storage
+          cargo test -p opl-api --features storage-it --test volumes
 
   deny:
     runs-on: ubuntu-latest

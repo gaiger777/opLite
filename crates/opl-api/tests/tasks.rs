@@ -4,6 +4,8 @@ mod common;
 
 use common::Env;
 use opl_types::resource::Resource;
+use opl_types::runtime::ImageFormat;
+use opl_types::storage::VolumeSpec;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use uuid::Uuid;
 
@@ -44,6 +46,35 @@ async fn tasks_left_running_by_a_previous_opld_are_failed() {
         task["status"]["error"],
         "interrupted: opld restarted while the task was running"
     );
+}
+
+#[tokio::test]
+async fn orphans_of_a_previous_opld_are_removed() {
+    let env = Env::start_with(
+        |_| {},
+        |cluster| async move {
+            // 볼륨을 만든 뒤 Task를 만들기 전에(또는 업로드 도중) opld가 죽었다.
+            let volume = Resource::new(
+                "half",
+                VolumeSpec {
+                    pool: "local".into(),
+                    size_bytes: 1,
+                    format: ImageFormat::Raw,
+                },
+            );
+            cluster.create(&volume).await.unwrap();
+        },
+    )
+    .await;
+    let admin = env.admin().await;
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while admin.get("/volumes/half").await.0 != reqwest::StatusCode::NOT_FOUND {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "orphan volume was kept"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
