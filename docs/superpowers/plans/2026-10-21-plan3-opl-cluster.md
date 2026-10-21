@@ -2555,18 +2555,45 @@ git commit -m "docs: schema_version 위치와 Raft 노드 id 결정을 설계에
 - [ ] 성공을 돌려주지 않은 쓰기(고립된 리더)는 어느 노드에도 적용되지 않는다.
 - [ ] 재시작해도 리소스와 revision이 유지된다.
 
+## 실행 후 기록 (2026-10-21)
+
+코드 리뷰를 거쳐 계획의 코드에서 아래가 바뀌었다. 저장소의 코드가 기준이다.
+
+**저장소 (`state_machine.rs`)**
+- openraft 0.9.25는 스냅샷 빌드를 별도 태스크에서 돌린다(`core/sm/worker.rs`). 느린 빌드가 그 사이 설치된 더 새 스냅샷을 덮어쓰면, 로그가 지워진 뒤 뒤처진 팔로워가 영영 따라잡지 못한다. `save_snapshot`은 저장된 스냅샷이 같거나 더 새로우면 쓰지 않는다.
+- 스냅샷 설치는 본문 전체를 읽기 전에 `schema_version`만 먼저 확인한다. 미래 형식은 JSON 오류가 아니라 `UnsupportedSchema`로 거부된다.
+
+**`Cluster` API**
+- `add_learner`, `change_membership`에도 `write_timeout`을 적용한다. openraft는 learner가 따라잡거나 커밋될 때까지 제한 없이 기다린다.
+- `read_barrier`는 리더에서만 동작한다. 팔로워와 learner에서는 `NotLeader`를 돌려준다(문서 주석만 바로잡음).
+- `Rejection` 메시지는 종류를 직렬화 이름(`storage-pool`)으로 쓴다. `Create`, `UpdateSpec`의 저장 형식도 테스트로 고정했다.
+
+**테스트 하네스**
+- 계획대로면 3노드 테스트가 부하가 있을 때 자주 실패했다(테스트 바이너리 10개 동시 실행에서 30회 중 15회). 리더를 처음 본 순간 팔로워가 아직 리더를 모르거나, 하트비트가 늦어 재선거가 일어났기 때문이다.
+  - `leader_among`은 모든 노드가 같은 리더를 알고, 그 리더가 자기 로그를 다 적용할 때까지 기다린다.
+  - 선거 제한 시간을 1000~2000ms로 늘렸다(하트비트 50ms). 3노드 테스트는 약 3초에서 5초로 늘었다.
+  - 고친 뒤 같은 조건에서 60회 모두 통과했다.
+- openraft의 `shutdown`은 상태 머신 태스크를 기다리지 않아, 바로 다시 열면 redb가 `DatabaseAlreadyOpen`을 낼 수 있다. 하네스는 이 오류일 때만 최대 5초 다시 시도한다.
+- watch 테스트의 `next()`에 제한 시간을 걸었다. 3노드 테스트는 고립된 리더의 로그가 실제로 늘었는지, n4의 스냅샷이 리더가 지운 위치를 덮는지, 20개 id가 모두 있는지 확인한다.
+
+테스트: `opl-cluster` 단위 15개, `single_node` 5개, `storage_suite` 1개, `three_nodes` 4개.
+
 ## 다음 계획으로 넘길 사항
 
 계획 4 (reconciler):
 - 시작할 때 `list()`로 읽고 그 revision부터 `watch()`한다. `Expired`, `Lagged`, `Reset`을 받으면 목록을 다시 읽는다.
 - status는 `update_status`로 쓴다. 과반수가 없으면 `Timeout`이 나므로 로컬에 버퍼링했다가 다시 쓴다(설계 5.3).
 - 팔로워의 로컬 읽기는 최신 커밋보다 늦을 수 있다. 조정은 watch로 받은 변경 기준으로 하면 충분하다.
+- 저장된 리소스 하나가 디코딩되지 않으면(예: spec 필드 변경) `list::<S>()` 전체가 `Encoding`으로 실패해 reconciler가 멈춘다. 레코드 단위로 건너뛰고 기록하거나, 마이그레이션으로 막는다.
+- `Cluster`는 아직 `Clone`이 아니다. 필드가 모두 `Clone`이므로 필요하면 derive한다.
 
 계획 5 (API):
 - 팔로워가 받은 쓰기는 `NotLeader`의 `leader_addr`로 전달한다.
 - status 쓰기도 revision을 올린다. spec `If-Match`가 reconciler 쓰기와 부딪치지 않게 하려면 spec 전용 revision을 둘지 검토한다.
 - 리소스 이름 형식 검증(빈 이름, 길이, 문자)은 API에서 한다. 저장소는 유일성만 본다.
 - `Timeout`은 503(`cluster_no_quorum`)으로, `Rejected(RevisionMismatch)`는 412로, `NameTaken`/`AlreadyExists`는 409로 옮긴다.
+- `read_barrier`는 리더 전용이다. 선형화 읽기가 필요한 요청은 리더로 전달하거나, 팔로워 읽기(리더의 read index를 받아 로컬에서 기다림)를 구현한다.
+- `ClusterError::Encoding`은 잘못된 입력(400)과 손상된 저장 데이터(500)를 구분하지 않고, `Raft(String)`은 `ChangeMembershipError` 종류를 잃는다. API에서 구분이 필요하면 오류 타입을 나눈다.
 
 계획 6 (클러스터 부트스트랩):
 - `memnet`을 gRPC + mTLS 네트워크로 바꾼다. `Cluster::open`은 `RaftNetworkFactory`만 받으므로 그대로 쓴다.
