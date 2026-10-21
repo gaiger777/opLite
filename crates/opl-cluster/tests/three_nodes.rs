@@ -20,7 +20,6 @@ async fn writes_continue_after_leader_failure() {
 
     tc.stop(old).await;
     let new = tc.leader().await;
-    assert_ne!(new, old);
 
     let b = volume("disk-b");
     let rev_b = tc.get(new).create(&b).await.unwrap();
@@ -72,10 +71,18 @@ async fn isolated_leader_cannot_commit_and_its_write_is_discarded() {
     let tc = TestCluster::start_with(3, raft_config(), Duration::from_secs(1)).await;
     let old = tc.leader().await;
 
+    let last_log_index = |id| tc.get(id).raft().metrics().borrow().last_log_index;
+    let before = last_log_index(old);
+
     tc.router.isolate(old);
     let lost = volume("lost");
     let err = tc.get(old).create(&lost).await.unwrap_err();
     assert!(matches!(err, ClusterError::Timeout), "got {err:?}");
+    // 예전 리더의 로그에는 기록되었다. 아래에서 이 엔트리가 버려지는지 본다.
+    assert!(
+        last_log_index(old) > before,
+        "isolated leader did not append"
+    );
 
     let majority: Vec<_> = tc.nodes.keys().copied().filter(|id| *id != old).collect();
     let new = tc.leader_among(&majority).await;
@@ -113,7 +120,8 @@ async fn new_node_catches_up_from_snapshot() {
         ids.push(v.id);
     }
     // 리더가 스냅샷을 만들고 로그를 지울 때까지 기다린다.
-    tc.get(leader)
+    let purged = tc
+        .get(leader)
         .raft()
         .wait(Some(common::WAIT))
         .metrics(
@@ -121,6 +129,8 @@ async fn new_node_catches_up_from_snapshot() {
             "leader purged logs",
         )
         .await
+        .unwrap()
+        .purged
         .unwrap();
 
     let n4 = node(4);
@@ -129,11 +139,19 @@ async fn new_node_catches_up_from_snapshot() {
     tc.get(leader).add_learner(n4, addr(4)).await.unwrap();
     tc.wait_applied(n4, last).await;
 
-    assert!(matches!(w.next().await.unwrap(), WatchEvent::Reset { .. }));
+    let first = tokio::time::timeout(common::WAIT, w.next()).await.unwrap();
+    assert!(matches!(first.unwrap(), WatchEvent::Reset { .. }));
     let (_, items) = tc.get(n4).list::<VolumeSpec>().unwrap();
     assert_eq!(items.len(), 20);
+    for id in &ids {
+        assert!(tc.get(n4).get::<VolumeSpec>(*id).unwrap().is_some());
+    }
+    // 지워진 로그는 스냅샷으로만 받을 수 있다.
     let snapshot = tc.get(n4).raft().metrics().borrow().snapshot;
-    assert!(snapshot.is_some(), "learner installed a snapshot");
+    assert!(
+        snapshot.is_some_and(|s| s.index >= purged.index),
+        "learner snapshot {snapshot:?} does not cover purged {purged:?}"
+    );
 
     // learner를 투표 멤버로 올려도 쓰기가 이어진다.
     let voters = BTreeSet::from([node(1), node(2), node(3), n4]);

@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use openraft::{BasicNode, ServerState};
 use opl_cluster::memnet::MemRouter;
+use opl_cluster::store::StoreError;
 use opl_cluster::types::NodeId;
-use opl_cluster::{Cluster, ClusterConfig};
+use opl_cluster::{Cluster, ClusterConfig, ClusterError};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{Volume, VolumeSpec};
@@ -19,11 +20,13 @@ pub fn node(n: u64) -> NodeId {
     NodeId::from(n)
 }
 
+/// 테스트 바이너리 여러 개가 동시에 돌아 CPU가 바빠도 하트비트가 늦어 재선거가
+/// 일어나지 않도록 선거 제한 시간을 하트비트 간격보다 넉넉히 길게 둔다.
 pub fn raft_config() -> openraft::Config {
     openraft::Config {
         heartbeat_interval: 50,
-        election_timeout_min: 200,
-        election_timeout_max: 400,
+        election_timeout_min: 1000,
+        election_timeout_max: 2000,
         ..Default::default()
     }
 }
@@ -71,13 +74,24 @@ impl TestCluster {
     }
 
     /// 노드를 (다시) 연다. 데이터 디렉터리는 노드마다 고정이라 재시작하면 이전 상태를 이어받는다.
+    ///
+    /// openraft의 `shutdown`은 상태 머신 태스크가 끝나기를 기다리지 않는다. 그 태스크가
+    /// 아직 redb 파일을 쥐고 있으면 `DatabaseAlreadyOpen`이 나므로 잠시 뒤 다시 연다.
     pub async fn open(&mut self, id: NodeId) {
         let mut config = ClusterConfig::new(id, self.root.path().join(id.to_string()));
         config.raft = self.raft.clone();
         config.write_timeout = self.write_timeout;
-        let cluster = Cluster::open(config, self.router.network(id))
-            .await
-            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let cluster = loop {
+            match Cluster::open(config.clone(), self.router.network(id)).await {
+                Err(ClusterError::Store(StoreError::Db(redb::Error::DatabaseAlreadyOpen)))
+                    if Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => break other.unwrap(),
+            }
+        };
         self.router.register(id, cluster.raft().clone());
         self.nodes.insert(id, cluster);
     }
@@ -99,18 +113,38 @@ impl TestCluster {
             .await
     }
 
+    /// `ids`의 모든 노드가 같은 리더를 알고, 그 리더가 자기 임기의 빈 엔트리까지
+    /// 적용했을 때 그 리더를 돌려준다. 그래야 바로 이어지는 쓰기가 리더 변경이나
+    /// 팔로워의 `leader_id: None`에 걸리지 않는다.
     pub async fn leader_among(&self, ids: &[NodeId]) -> NodeId {
         let deadline = Instant::now() + WAIT;
         loop {
-            for id in ids {
-                let m = self.nodes[id].raft().metrics().borrow().clone();
-                if m.state == ServerState::Leader {
-                    return *id;
-                }
+            if let Some(leader) = self.settled_leader(ids) {
+                return leader;
             }
             assert!(Instant::now() < deadline, "no leader elected among {ids:?}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    fn settled_leader(&self, ids: &[NodeId]) -> Option<NodeId> {
+        let leader = self.nodes[&ids[0]]
+            .raft()
+            .metrics()
+            .borrow()
+            .current_leader?;
+        if !ids.contains(&leader) {
+            return None;
+        }
+        for id in ids {
+            if self.nodes[id].raft().metrics().borrow().current_leader != Some(leader) {
+                return None;
+            }
+        }
+        let m = self.nodes[&leader].raft().metrics().borrow().clone();
+        let applied = m.last_applied.map(|l| l.index);
+        (m.state == ServerState::Leader && applied.is_some() && applied >= m.last_log_index)
+            .then_some(leader)
     }
 
     /// 노드가 `index`까지 적용하기를 기다린다.

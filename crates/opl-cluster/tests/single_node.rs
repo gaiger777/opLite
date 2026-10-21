@@ -2,10 +2,10 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{TestCluster, node, volume};
+use common::{TestCluster, WAIT, node, volume};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
-use opl_cluster::watch::{WatchError, WatchEvent};
+use opl_cluster::watch::{Watch, WatchError, WatchEvent};
 use opl_types::resource::Kind;
 use opl_types::storage::{VolumeSpec, VolumeStatus};
 
@@ -123,6 +123,14 @@ async fn data_survives_restart() {
     assert!(rev2 > rev, "revisions keep increasing after restart");
 }
 
+/// 다음 이벤트를 기다린다. 이벤트가 오지 않으면 멈추지 않고 실패한다.
+async fn next(w: &mut Watch) -> WatchEvent {
+    tokio::time::timeout(WAIT, w.next())
+        .await
+        .expect("no watch event")
+        .unwrap()
+}
+
 #[tokio::test]
 async fn watch_follows_list_without_gaps_or_duplicates() {
     let tc = TestCluster::start(1).await;
@@ -138,7 +146,7 @@ async fn watch_follows_list_without_gaps_or_duplicates() {
     let rev_b = c.create(&b).await.unwrap();
     let rev_del = c.delete::<VolumeSpec>(a.id, None).await.unwrap();
 
-    match w.next().await.unwrap() {
+    match next(&mut w).await {
         WatchEvent::Put { kind, resource } => {
             assert_eq!(kind, Kind::Volume);
             assert_eq!(resource.id, b.id);
@@ -146,7 +154,7 @@ async fn watch_follows_list_without_gaps_or_duplicates() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    match w.next().await.unwrap() {
+    match next(&mut w).await {
         WatchEvent::Deleted {
             revision, resource, ..
         } => {
@@ -158,7 +166,7 @@ async fn watch_follows_list_without_gaps_or_duplicates() {
 
     // 지난 revision부터 다시 구독하면 보관한 변경을 다시 받는다.
     let mut again = c.watch(rev).unwrap();
-    assert_eq!(again.next().await.unwrap().revision(), rev_b);
+    assert_eq!(next(&mut again).await.revision(), rev_b);
 }
 
 #[tokio::test]
