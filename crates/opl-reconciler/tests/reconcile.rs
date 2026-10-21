@@ -115,6 +115,35 @@ async fn cancelled_stop_restarts_vm_when_guest_finishes_shutdown() {
 }
 
 #[tokio::test]
+async fn new_stop_after_cancelled_stop_sends_acpi_again() {
+    let env = Env::start_with(|c| c.acpi_timeout = Duration::from_secs(2)).await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    // 종료를 요청했다가 취소했다. 게스트는 ACPI 요청을 무시한다.
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopping", |v| v.status.phase == VmPhase::Stopping)
+        .await;
+    env.set_power(vm.id, PowerState::Running).await;
+    env.wait(vm.id, "running", running).await;
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+
+    // acpi_timeout이 지난 뒤의 새 종료 요청은 앞선 요청을 이어받지 않고 다시 ACPI부터 보낸다.
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopping", |v| v.status.phase == VmPhase::Stopping)
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(env.pid(vm.id).await.is_some(), "VM was force-stopped");
+
+    env.hv.guest_shutdown(vm.id);
+    let got = env
+        .wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    assert_eq!(got.status.last_error, None);
+}
+
+#[tokio::test]
 async fn guest_shutdown_turns_power_off() {
     let env = Env::start().await;
     let vm = vm("web", env.node);

@@ -44,10 +44,13 @@ pub(crate) struct Worker {
     cluster: Arc<Cluster>,
     hv: Arc<dyn Hypervisor>,
     config: Arc<ReconcilerConfig>,
-    /// 이 작업자가 ACPI 종료를 요청한 시각. 뒤이은 종료 이벤트가 우리 요청의 결과인지 가리고,
-    /// 강제 종료로 넘어갈 시점을 정한다. 요청 뒤 원하는 상태가 다시 running으로 바뀌어도
-    /// 게스트는 요청대로 꺼질 수 있으므로 `acpi_timeout` 동안은 지우지 않는다.
+    /// 진행 중인 ACPI 종료 요청을 보낸 시각. 강제 종료로 넘어갈 시점을 정한다.
+    /// 원하는 상태가 다시 running으로 바뀌면 취소하므로, 새 종료는 늘 ACPI부터 다시 시작한다.
     stop_requested: Option<Instant>,
+    /// 이 작업자가 마지막으로 종료를 요청한(ACPI 또는 강제) 시각. 뒤이은 종료 이벤트가 우리
+    /// 요청의 결과인지 가린다. 요청을 취소했거나 원하는 상태가 다시 running으로 바뀌어도
+    /// 게스트(또는 강제 종료)는 요청대로 꺼질 수 있으므로 `acpi_timeout` 동안 유효하다.
+    stopped_by_us: Option<Instant>,
     failures: FailureTracker,
     /// 백오프 중이면 이 시각까지 시작하지 않는다. status에 보일 이유를 함께 둔다.
     backoff: Option<(Instant, String)>,
@@ -74,6 +77,7 @@ impl Worker {
             hv,
             config,
             stop_requested: None,
+            stopped_by_us: None,
             failures: FailureTracker::default(),
             backoff: None,
             power_off: None,
@@ -146,11 +150,12 @@ impl Worker {
         if kind != EventKind::Started {
             self.was_running = false;
             self.awaiting_event = None;
+            self.stop_requested = None;
         }
         let requested = match kind {
             EventKind::Started => return,
             EventKind::Stopped { .. } | EventKind::Crashed => self
-                .stop_requested
+                .stopped_by_us
                 .take()
                 .is_some_and(|at| now < at + self.config.acpi_timeout),
         };
@@ -160,7 +165,8 @@ impl Worker {
         }
         match kind {
             // 우리가 요청한 종료가, 원하는 상태가 다시 running으로 바뀐 뒤에 끝났다. 다시 시작한다.
-            EventKind::Stopped { .. } if requested => {}
+            // 강제 종료의 결과로 Crashed가 와도 크래시로 보지 않는다.
+            _ if requested => {}
             // 게스트가 스스로 꺼졌다(설계 5.3). `guest_initiated`는 opld가 요청한 ACPI 종료에서도
             // true이므로 보지 않고, 우리가 요청했는지로 가린다.
             EventKind::Stopped { .. } => self.power_off = Some(None),
@@ -196,9 +202,16 @@ impl Worker {
         }
         match (vm.spec.power, actual) {
             (PowerState::Running, Some(state)) => {
+                // 진행 중인 종료 요청을 취소한다. 게스트가 이미 받은 요청대로 꺼지면
+                // `stopped_by_us`로 가려 다시 시작한다.
+                self.stop_requested = None;
                 if state.status == RuntimeStatus::Paused {
                     // opld가 기동 도중(cont 전)에 죽었다. start()가 cont를 보낸다.
-                    self.start(vm).await?;
+                    if !self.start(vm).await?
+                        && let Some((at, _)) = self.backoff
+                    {
+                        self.wake(at);
+                    }
                 }
                 status.phase = VmPhase::Running;
                 status.pid = Some(state.pid);
@@ -216,6 +229,9 @@ impl Worker {
                     self.backoff = None;
                 }
                 if self.backoff.is_none() && self.start(vm).await? {
+                    // 이제 돌고 있다. 곧바로 꺼져도 이벤트보다 먼저 온 재동기화가 다시 시작하지
+                    // 않고 이벤트를 기다리게 한다.
+                    self.was_running = true;
                     match self.hv.inspect(self.id).await? {
                         Some(state) => {
                             status.phase = VmPhase::Running;
@@ -224,6 +240,10 @@ impl Worker {
                         }
                         // 시작하자마자 꺼졌다. 뒤따르는 이벤트에서 다시 맞춘다.
                         None => {
+                            self.was_running = false;
+                            let deadline = Instant::now() + EVENT_GRACE;
+                            self.awaiting_event = Some(deadline);
+                            self.wake(deadline);
                             status.phase = VmPhase::Starting;
                             status.pid = None;
                         }
@@ -242,12 +262,14 @@ impl Worker {
                     None => {
                         self.hv.stop(self.id, StopMode::Acpi).await?;
                         self.stop_requested = Some(now);
+                        self.stopped_by_us = Some(now);
                         self.wake(now + self.config.acpi_timeout);
                     }
                     Some(at) if now >= at + self.config.acpi_timeout => {
                         tracing::warn!(vm = %self.id, "guest ignored ACPI shutdown; forcing");
                         self.hv.stop(self.id, StopMode::Force).await?;
                         self.stop_requested = None;
+                        self.stopped_by_us = Some(Instant::now());
                         status.phase = VmPhase::Stopped;
                         status.pid = None;
                         return Ok(status);
@@ -302,7 +324,8 @@ impl Worker {
         if vm.spec.power == PowerState::Running {
             let mut spec = vm.spec.clone();
             spec.power = PowerState::Stopped;
-            // 그 사이 spec이 바뀌었으면 RevisionMismatch로 거부된다. 다음 단계에서 다시 읽어 쓴다.
+            // 이 단계에서 읽은 뒤 spec이 바뀌었으면 RevisionMismatch로 거부된다. 다음 단계에서
+            // 다시 읽은 revision으로 쓰므로, 그 사이 사용자가 바꾼 spec.power도 stopped로 덮어쓴다.
             self.cluster
                 .update_spec(self.id, Some(vm.revision), vm.labels.clone(), &spec)
                 .await?;
