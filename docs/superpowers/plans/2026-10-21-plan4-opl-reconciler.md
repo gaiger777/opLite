@@ -2023,6 +2023,37 @@ git commit -m "docs: reconciler 규칙(포기, 배정되지 않은 VM, 이벤트
 - [ ] 과반수가 없어도 VM은 계속 돌고(다시 시작도 하고), status는 회복 뒤 기록된다.
 - [ ] 실제 QEMU에서 reconciler·드라이버·저장소를 다시 띄워도 VM은 같은 pid로 계속 돌고 다시 제어된다.
 
+## 실행 후 기록 (2026-10-21)
+
+코드 리뷰를 거쳐 `worker.rs`가 계획의 코드에서 아래와 같이 바뀌었다. 저장소의 코드가 기준이다.
+
+- **종료 요청 시각을 둘로 나눴다.**
+  - `stop_requested`는 진행 중인 ACPI 요청이고, 강제 종료로 넘어갈 시점만 정한다. 원하는 상태가 다시 running이 되거나 종료 이벤트가 오면 지운다.
+  - 계획대로면 종료를 요청했다가 취소한 뒤 몇 시간 지나 다시 끌 때, 남아 있던 옛 요청 시각 때문에 ACPI 없이 곧바로 강제 종료했다.
+  - 새 필드 `stopped_by_us`는 우리가 마지막으로 종료를 요청한(ACPI 또는 강제) 시각이다. `acpi_timeout` 동안 종료 이벤트가 우리 요청의 결과인지 가리는 데만 쓴다.
+  - 강제 종료의 이벤트(`Crashed`로 올 수 있다)도 우리 것으로 가려, 그 사이 사용자가 다시 켠 것을 무르지 않는다.
+  - 회귀 테스트: `new_stop_after_cancelled_stop_sends_acpi_again`.
+- **시작 직후 꺼진 VM도 종료 이벤트를 기다린다.** 시작에 성공하면 `was_running`을 세운다. 시작 직후 조회에서 이미 없으면 `EVENT_GRACE`만큼 이벤트를 기다린다. 계획대로면 재동기화가 이벤트보다 먼저 올 때 `restart: never`인 VM을 다시 켰다가 껐다. Mock으로는 순서를 고정할 수 없어 테스트는 없다.
+- **일시정지 복구에도 깨우기를 건다.** 일시정지 상태에서 `start`가 일시적 오류로 실패하면 백오프 시각에 다시 깨어난다.
+
+최종 리뷰에서 나온 수정:
+- **응답 없는 VM을 다룬다.** 계획대로면 QMP 연결을 잃었거나 멈춘 QEMU는 끌 수도, 다시 붙을 수도 없었다.
+  - 원하는 상태가 stopped면 ACPI 요청이 실패해도 요청 시각을 기록해, `acpi_timeout` 뒤 강제 종료한다.
+  - 돌고 있지만 `Running`이 아닌 VM(일시정지, 응답 없음)은 `start()`로 다시 붙거나 `cont`를 보낸다. 실패는 백오프에 세지 않고 VM을 끄지도 않는다. status `last_error`에 "VM is unresponsive: …"를 남기고 `retry_interval`마다 다시 시도한다.
+  - 드라이버의 `inspect`는 QMP 시간 초과를 `list()`처럼 `Other("unresponsive")`로 돌려준다(`opl-driver`).
+  - Mock에 `set_unresponsive`를 더했다.
+- **우리가 요청하지 않은 `guest_initiated: false` 종료는 원하는 상태를 바꾸지 않는다.** 호스트의 SIGTERM 같은 외부 종료는 게스트의 결정이 아니므로, 실패로 세지 않고 다시 켠다.
+- **`EVENT_GRACE`를 6초로 늘렸다.** 드라이버가 종료 이벤트를 보내기 전 최대 5초(`EXIT_GRACE`)를 기다리므로, 그보다 짧으면 느리게 끝나는 크래시를 두 번 셌다.
+- **전체 동기화는 `hv.list()` 오류에 멈추지 않는다.** 이 호출은 배정되지 않은 VM 경고에만 쓴다.
+- 회귀 테스트: `unresponsive_vm_is_forced_off_after_acpi_timeout`, `unresponsive_vm_is_reattached_and_reported`, `host_kill_does_not_turn_power_off`, 드라이버 qemu-it `force_stop_kills_unresponsive_qemu`의 `inspect` 확인.
+
+알고 받아들인 동작:
+- 응답 없는 VM에 다시 붙는 시도는 한 번에 최대 5초(`ATTACH_TIMEOUT`) 동안 그 VM의 작업자를 붙잡고, `retry_interval`마다 되풀이된다.
+- 우리가 종료를 요청한 뒤 `acpi_timeout` 안에 사용자가 다시 켜고, 그 안에 게스트가 스스로 꺼지면 우리 요청의 결과로 보고 다시 켠다.
+- 사용자가 취소한 ACPI 종료 도중 게스트가 크래시하면 크래시로 세지 않고 다시 켠다.
+
+테스트: `opl-reconciler` 단위 2개, `reconcile` 17개, `resolve` 2개, `no_quorum` 1개, `qemu_restart` 1개(qemu-it). `reconcile`과 `no_quorum`은 테스트 바이너리 10개 동시 실행으로 각 60회 실패 없음.
+
 ## 다음 계획으로 넘길 사항
 
 계획 5 (API, opld):
