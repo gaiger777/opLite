@@ -8090,3 +8090,55 @@ git commit -m "docs: API·Task·인증·E2E를 설계에 반영, README에 실�
 - 볼륨을 붙이는 검사(API)와 볼륨을 지우는 검사(Task 실행기)는 저장소 트랜잭션이 아니다. 아주 짧은 사이에 겹치면 지울 수 있다.
 - 끝난 Task는 지우지 않는다(보존 기간은 나중에).
 - 가져오기 원본 검사는 `qemu-img info`가 보고하는 파일 이름에 기댄다. 오래된 QEMU는 qcow2 외부 데이터 파일을 `data-file`로만 보고하므로 그 키도 확인한다.
+
+## 실행 후 기록 (2026-10-21)
+
+Task 리뷰와 최종 리뷰를 거쳐 계획의 코드에서 아래가 바뀌었다. 저장소의 코드가 기준이다.
+
+Task 1~3 리뷰(`6279ee2`):
+- **가져올 이미지는 헤더부터 본다.** `qemu-img info`는 보고하려고 VMDK extent와 qcow2 외부 데이터 파일을 실제로 연다. FIFO나 `nbd://`를 가리키는 업로드가 검사를 멈추게 하거나 연결을 열 수 있었다. 이제 텍스트 VMDK 디스크립터, backing file이 있는 qcow2, 외부 데이터 파일 비트가 켜진 qcow2를 qemu-img를 부르기 전에 거부한다. `qemu-img info`에는 60초 제한을 둔다(`INFO_TIMEOUT`).
+- 강제 종료 플래그는 원하는 상태가 stopped일 때만 세운다. `UserStatus`, `ApiTokenStatus`에 `#[serde(default)]`.
+
+Task 4~6 리뷰(`6efd71a`):
+- **`TaskRunner::spawn`은 async다.** 고아 정리(Task 없는 Pending 볼륨, 업로드 파일)를 마친 뒤에 돌아오므로, opld는 그것을 기다린 뒤 API를 연다. 계획대로면 API가 막 만든 볼륨이나 받는 중인 파일을 정리가 지울 수 있었다. 정리는 Task 목록보다 나중 revision의 볼륨을 건드리지 않는다.
+- **reboot은 끄기 전에도 나중 요청을 확인한다.** reboot 직후 start를 보내면 start는 성공으로 끝나고 VM은 꺼진 채 남았다. 회귀 테스트: `start_right_after_reboot_leaves_the_vm_running`.
+- 관리자가 아닌 사용자의 `PUT /users/{key}`는 자기 자신이 아니면 조회 전에 403이다(사용자 존재 여부를 알리지 않는다). 내부 오류는 응답에 "internal error"만 담고 자세한 내용은 로그에 남긴다.
+
+Task 7~9 리뷰(`a986bd8`):
+- **실행 중인 VM의 디스크는 바꿀 수 없다(409 `vm_running`).** 계획대로면 실행 중에 디스크를 빼서 그 볼륨을 지우거나 다른 VM에 붙일 수 있었다.
+- **VM 검증과 쓰기를 노드 안에서 직렬화한다(`AppState::vm_lock`).** 동시에 만든 VM이 같은 볼륨이나 MAC을 쓸 수 있었다. 노드 사이의 직렬화는 계획 6에서 다시 본다.
+- **`PUT /vms`는 읽은 revision으로 쓴다.** `If-Match`가 없으면 충돌 시 다시 읽어 검증하고, 있으면 다를 때 곧바로 412다.
+- OpenAPI에 `servers: /api/v1`, 업로드 본문은 binary 스키마. 볼륨 이름 `import`는 예약어. 아직 만드는 중인 볼륨의 삭제는 409 `volume_not_ready`.
+- OpenAPI 테스트에 남아 있던 디버깅용 파일 쓰기를 지웠다(`929a62d`).
+
+최종 리뷰(`a0217a4`):
+- **opld는 루프백 주소에서만 연다.** 설정의 `listen`이 루프백이 아니면 시작하지 않는다(TLS가 생기는 계획 6까지).
+- 포트를 reconciler·실행기보다 먼저 연다. `node-id`와 oplctl 설정 파일은 임시 파일 + rename으로 쓴다. 다시 로그인하면 새 설정을 먼저 저장한 뒤 이전 토큰을 지우고, 서버 주소는 끝의 `/`를 무시하고 비교한다.
+- README 실행 절차에 풀 디렉터리 만들기를 더했다(`dir` 풀은 디렉터리를 만들지 않는다).
+
+알고 받아들인 동작(위 제한 목록에 더해):
+- start 동작은 `power = running`을 쓴 뒤에 Task를 만든다. 그 사이에 reboot이 나중 요청을 확인하면 놓쳐 VM을 끌 수 있다. 이때 start Task가 "VM was stopped"로 실패해 드러난다.
+- 두 관리자가 동시에 스스로 역할을 내리면 관리자가 없어질 수 있다(마지막 관리자 검사가 트랜잭션이 아니다).
+- 이전 opld가 실행하다 멈춘 Task는 실패로 기록하고 만들던 볼륨을 지운다. 실제로는 끝났던 생성도 지워지고, 중단된 reboot은 VM을 꺼진 채 둔다.
+- 이미 열린 watch·콘솔 WebSocket은 사용자를 지우거나 역할을 바꿔도 끊지 않는다. watch에는 keepalive가 없다.
+- 업로드 전 남은 공간 확인은 예약이 아니다. 동시에 큰 업로드 둘이 모두 통과할 수 있다. 느린 업로드에 제한 시간이 없다.
+- 볼륨의 옛 저장값(`phase` 없음)은 Pending으로 읽힌다. 아직 저장된 클러스터가 없어 문제되지 않는다.
+- `PUT /vms`로 `power`를 바꾸면 Task 없이 바뀐다. 명시한 `node`는 스케줄러의 조건(온라인, 유지보수, 풀)을 거치지 않는다.
+
+테스트: `opl-api` 단위 9개, `auth` 9개, `vms` 15개, `tasks` 3개, `streams` 3개, `openapi` 1개, `volumes` 5개(storage-it). `oplctl` 6개. `opld` 단위 5개, `smoke` 2개, `e2e` 1개(qemu-it). `opl-types` 20개, `opl-driver` 단위 33개, `reconcile` 19개. 테스트 바이너리 8개를 16개씩 동시에 각 24회 돌려 실패 없음. 실제 QEMU E2E 통과, 남은 QEMU 프로세스 없음.
+
+## 다음 계획으로 넘길 사항
+
+계획 6 (클러스터 부트스트랩, 노드 간 통신):
+- `memnet`을 gRPC + mTLS로 바꾸고 HTTPS를 연다. 그 뒤 opld의 루프백 제한을 풀고 세션 쿠키에 `Secure`를 붙인다.
+- 팔로워가 받은 API 쓰기를 리더로 전달한다(지금은 503 `not_leader`, `details`에 리더). 다른 노드에서 도는 VM의 콘솔은 노드 간 중계가 필요하다.
+- 노드 heartbeat로 `NodeStatus.online`을 판정한다. 스케줄러가 쓴다.
+- Task 실행기의 고아 정리는 지금 클러스터 전체의 볼륨을 본다. 노드가 여럿이면 자기 노드에서 실행할 볼륨만 보게 한다.
+- VM 검증·쓰기 직렬화(`vm_lock`)는 노드 안에서만 유효하다. 볼륨·MAC 중복을 클러스터 수준에서 막으려면 상태 머신에서 검사하거나 리더로 모은다.
+- `opld`의 첫 관리자 비밀번호 파일과 1인 클러스터 초기화를 `oplctl cluster init`/`join`으로 옮긴다.
+- `oplctl`의 Task 기다리기에는 제한 시간이 없다. 다른 노드의 실행기가 없으면 Pending에 머문다.
+
+나중에:
+- 로그인 시도 제한, 감사 로그, 끝난 Task의 보존 기간, 비밀번호 변경 시 토큰 처리, 사용자별 토큰 이름.
+- 열린 WebSocket의 권한 재확인과 keepalive.
+- `dir` 풀 디렉터리 만들기(풀 생성 Task)와 풀 용량 status.
