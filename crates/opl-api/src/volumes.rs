@@ -10,17 +10,32 @@ use axum::http::{HeaderMap, StatusCode};
 use futures_util::StreamExt;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
+use opl_types::storage::{
+    SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
+};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::VmSpec;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
-use utoipa::IntoParams;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, check_name, lookup};
+
+/// `/volumes/import` 경로와 겹치므로 볼륨 이름으로 쓸 수 없다.
+const RESERVED_NAME: &str = "import";
+
+fn check_volume_name(name: &str) -> Result<(), ApiError> {
+    check_name(name)?;
+    if name == RESERVED_NAME {
+        return Err(ApiError::bad_request(format!(
+            "the name {RESERVED_NAME} is reserved"
+        )));
+    }
+    Ok(())
+}
 use crate::state::AppState;
 use crate::tasks::create_task;
 
@@ -51,7 +66,7 @@ pub async fn create_volume(
     Json(req): Json<CreateRequest<VolumeSpec>>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
-    check_name(&req.name)?;
+    check_volume_name(&req.name)?;
     if req.spec.size_bytes == 0 {
         return Err(ApiError::bad_request("size_bytes must be greater than 0"));
     }
@@ -87,11 +102,16 @@ fn qcow2() -> ImageFormat {
     ImageFormat::Qcow2
 }
 
+/// 업로드 본문의 문서용 스키마: 바이너리 파일
+#[derive(ToSchema)]
+#[schema(value_type = String, format = Binary)]
+pub struct ImageFile(#[allow(dead_code)] Vec<u8>);
+
 /// 요청 본문(이미지 파일)을 이 노드에 받아 두고, 그것을 변환해 볼륨을 채울 Task를 돌려준다(202).
 /// 풀은 이 노드에서 쓸 수 있어야 한다.
 #[utoipa::path(post, path = "/volumes/import", tag = "storage",
     params(ImportQuery),
-    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    request_body(content = ImageFile, content_type = "application/octet-stream"),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn import_volume(
     State(state): State<Arc<AppState>>,
@@ -101,7 +121,7 @@ pub async fn import_volume(
     body: Body,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
-    check_name(&q.name)?;
+    check_volume_name(&q.name)?;
     let pool = find_pool(&state, &q.pool)?;
     if pool_node(&state, &pool) != state.node {
         return Err(ApiError::conflict(
@@ -215,7 +235,7 @@ async fn receive(path: &FsPath, body: Body, length: u64) -> Result<(), ApiError>
     Ok(())
 }
 
-/// VM이 쓰지 않는 볼륨을 지울 Task를 돌려준다(202).
+/// VM이 쓰지 않는 볼륨을 지울 Task를 돌려준다(202). 아직 만들고 있는 볼륨은 지울 수 없다.
 #[utoipa::path(delete, path = "/volumes/{key}", tag = "storage",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -226,6 +246,12 @@ pub async fn delete_volume(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
     let volume = lookup::<VolumeSpec>(&state.cluster, &key)?;
+    if volume.status.phase != VolumePhase::Ready {
+        return Err(ApiError::conflict(
+            "volume_not_ready",
+            format!("volume {:?} is still being created", volume.name),
+        ));
+    }
     let (_, vms) = state.cluster.list::<VmSpec>()?;
     if let Some(vm) = vms
         .iter()

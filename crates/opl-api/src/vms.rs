@@ -23,7 +23,7 @@ use crate::scheduler::{Inventory, schedule};
 use crate::state::AppState;
 use crate::tasks::create_task;
 
-/// 원하는 상태도 실제 상태도 꺼져 있다. 삭제와 노드 변경은 이때만 할 수 있다.
+/// 원하는 상태도 실제 상태도 꺼져 있다. 삭제와 노드·디스크 변경은 이때만 할 수 있다.
 fn is_stopped(vm: &Vm) -> bool {
     vm.spec.power == PowerState::Stopped
         && matches!(vm.status.phase, VmPhase::Stopped | VmPhase::Failed)
@@ -134,12 +134,14 @@ pub async fn create_vm(
     check_name(&req.name)?;
     let mut vm: Vm = Resource::new(req.name, req.spec);
     vm.labels = req.labels;
+    let _lock = state.vm_lock.lock().await;
     prepare(&state, vm.id, &mut vm.spec)?;
     vm.revision = state.cluster.create(&vm).await?;
     Ok((StatusCode::CREATED, Json(vm)))
 }
 
-/// spec 전체를 바꾼다. 실행 중인 VM의 `node`는 바꿀 수 없다. 다른 변경은 다음 시작부터 적용된다.
+/// spec 전체를 바꾼다. 실행 중인 VM의 `node`와 `disks`는 바꿀 수 없다. 다른 변경은 다음 시작부터
+/// 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 검증한다.
 #[utoipa::path(put, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<VmSpec>,
@@ -152,20 +154,54 @@ pub async fn update_vm(
     Json(req): Json<UpdateRequest<VmSpec>>,
 ) -> Result<Json<Vm>, ApiError> {
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
-    let current = lookup::<VmSpec>(&state.cluster, &key)?;
-    let mut spec = req.spec;
-    prepare(&state, current.id, &mut spec)?;
-    if spec.node != current.spec.node && !is_stopped(&current) {
-        return Err(vm_running(&current, "move"));
+    let expected = if_match(&headers)?;
+    for _ in 0..10 {
+        let _lock = state.vm_lock.lock().await;
+        let current = lookup::<VmSpec>(&state.cluster, &key)?;
+        if let Some(expected) = expected
+            && expected != current.revision
+        {
+            return Err(ClusterError::Rejected(Rejection::RevisionMismatch {
+                expected,
+                actual: current.revision,
+            })
+            .into());
+        }
+        let mut spec = req.spec.clone();
+        prepare(&state, current.id, &mut spec)?;
+        if spec.node != current.spec.node && !is_stopped(&current) {
+            return Err(vm_running(&current, "move"));
+        }
+        if spec.disks != current.spec.disks && !is_stopped(&current) {
+            return Err(vm_running(&current, "change the disks of"));
+        }
+        match state
+            .cluster
+            .update_spec(
+                current.id,
+                Some(current.revision),
+                req.labels.clone(),
+                &spec,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. }))
+                if expected.is_none() =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        return Ok(Json(lookup::<VmSpec>(
+            &state.cluster,
+            &current.id.to_string(),
+        )?));
     }
-    state
-        .cluster
-        .update_spec(current.id, if_match(&headers)?, req.labels, &spec)
-        .await?;
-    Ok(Json(lookup::<VmSpec>(
-        &state.cluster,
-        &current.id.to_string(),
-    )?))
+    Err(ApiError::conflict(
+        "busy",
+        "the VM kept changing while being updated; try again",
+    ))
 }
 
 /// 꺼진 VM만 지울 수 있다.
@@ -225,6 +261,7 @@ pub async fn vm_action(
     let id = lookup::<VmSpec>(&state.cluster, &key)?.id;
     let (op, vm) = match action.as_str() {
         "start" => {
+            let _lock = state.vm_lock.lock().await;
             let vm = modify_spec(&state, id, |spec| {
                 if spec.node.is_none() {
                     let inv = Inventory::load(&state.cluster)?;

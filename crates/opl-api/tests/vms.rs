@@ -114,6 +114,97 @@ async fn disks_must_exist_and_belong_to_one_vm() {
     assert_eq!(body["code"], "volume_in_use");
 }
 
+/// 바로 Ready인 볼륨을 클러스터에 직접 만든다(파일은 만들지 않는다).
+async fn ready_volume(env: &Env, admin: &common::Client, name: &str) {
+    let (status, body) = admin
+        .post(
+            "/storage-pools",
+            json!({
+                "name": "local",
+                "spec": { "backend": { "kind": "dir", "path": env.dir.path().join("pool") } }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut volume = Resource::new(
+        name,
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    volume.status.phase = VolumePhase::Ready;
+    env.cluster
+        .update_status::<VolumeSpec>(volume.id, &volume.status)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn disks_of_a_running_vm_cannot_change() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    ready_volume(&env, &admin, "root").await;
+    let mut req = vm_request("web");
+    req["spec"]["disks"] = json!([{ "volume": "root", "bus": "virtio-blk" }]);
+    assert_eq!(admin.post("/vms", req).await.0, StatusCode::CREATED);
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["disks"] = json!([]);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_running");
+}
+
+#[tokio::test]
+async fn volume_named_import_is_reserved() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    ready_volume(&env, &admin, "root").await;
+    let (status, body) = admin
+        .post(
+            "/volumes",
+            json!({
+                "name": "import",
+                "spec": { "pool": "local", "size_bytes": 1 << 20, "format": "qcow2" }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    let (status, body) = admin
+        .upload(
+            "/volumes/import?name=import&pool=local&source_format=raw",
+            vec![0; 512],
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn volume_being_created_cannot_be_deleted() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let volume = Resource::new(
+        "root",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    let (status, body) = admin.delete("/volumes/root").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "volume_not_ready");
+}
+
 #[tokio::test]
 async fn start_schedules_and_stop_completes() {
     let env = Env::start().await;
@@ -136,8 +227,9 @@ async fn start_schedules_and_stop_completes() {
     let mut spec = vm["spec"].clone();
     spec["node"] = Value::Null;
     spec["power"] = json!("stopped");
-    let (status, _) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
     assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "vm_running");
 
     // Mock 게스트는 ACPI를 무시하므로 acpi_timeout(300ms) 뒤 강제로 꺼진다.
     let task = admin.act("web", "stop").await;
@@ -300,6 +392,13 @@ async fn update_checks_if_match_revision() {
         .await;
     assert_eq!(status, StatusCode::PRECONDITION_FAILED);
     assert_eq!(body["code"], "revision_mismatch");
+    // revision은 spec 검증보다 먼저 확인한다.
+    let mut bad = spec.clone();
+    bad["memory_mib"] = json!(1);
+    let (status, body) = admin
+        .put("/vms/web", json!({ "spec": bad }), Some(revision + 100))
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
 
     let (status, updated) = admin
         .put(

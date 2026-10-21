@@ -33,6 +33,7 @@ use crate::resources as r;
 #[derive(OpenApi)]
 #[openapi(
     info(title = "opLite API", description = "opLite REST API (`/api/v1`)"),
+    servers((url = "/api/v1")),
     modifiers(&Security),
     security(("token" = []), ("session" = [])),
 )]

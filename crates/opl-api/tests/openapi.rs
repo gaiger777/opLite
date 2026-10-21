@@ -31,6 +31,16 @@ async fn openapi_document_is_served_without_login() {
     let schemes = &doc["components"]["securitySchemes"];
     assert_eq!(schemes["token"]["scheme"], "bearer");
     assert_eq!(schemes["session"]["name"], "opl_session");
+    // 경로는 /api/v1 아래에 있다.
+    assert_eq!(doc["servers"][0]["url"], "/api/v1");
+    // 업로드 본문은 바이트 배열이 아니라 바이너리 파일이다.
+    let body = &doc["paths"]["/volumes/import"]["post"]["requestBody"]["content"]["application/octet-stream"]
+        ["schema"];
+    let schema = match body["$ref"].as_str() {
+        Some(r) => &doc["components"]["schemas"][r.trim_start_matches("#/components/schemas/")],
+        None => body,
+    };
+    assert_eq!(schema["format"], "binary", "{body}");
     // 로그인은 인증 없이 부른다.
     assert_eq!(
         doc["paths"]["/auth/login"]["post"]["security"],
