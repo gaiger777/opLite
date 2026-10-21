@@ -10,6 +10,7 @@ pub mod scheduler;
 mod state;
 mod tasks;
 pub mod users;
+mod vms;
 
 use std::sync::Arc;
 
@@ -66,6 +67,9 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::get_pool, r::delete_pool))
         .routes(routes!(r::list_tasks))
         .routes(routes!(r::get_task))
+        .routes(routes!(r::list_vms, vms::create_vm))
+        .routes(routes!(r::get_vm, vms::update_vm, vms::delete_vm))
+        .routes(routes!(vms::vm_action))
 }
 
 /// API 문서. 라우터와 같은 정의에서 만들므로 경로가 어긋나지 않는다.
