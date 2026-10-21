@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -29,6 +30,31 @@ impl<S, T: Default> Resource<S, T> {
     }
 }
 
+/// 클러스터 저장소가 구분하는 리소스 종류.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Kind {
+    Vm,
+    StoragePool,
+    Volume,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Vm => "vm",
+            Kind::StoragePool => "storage-pool",
+            Kind::Volume => "volume",
+        }
+    }
+}
+
+/// spec 타입과 리소스 종류, status 타입을 묶는다. 클러스터 저장소의 타입 있는 API가 쓴다.
+pub trait ResourceSpec: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {
+    const KIND: Kind;
+    type Status: Serialize + DeserializeOwned + Clone + Default + Send + Sync + 'static;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,6 +73,13 @@ mod tests {
         assert!(r.labels.is_empty());
         assert_eq!(r.spec, 7);
         assert_eq!(r.status, DummyStatus::default());
+    }
+
+    #[test]
+    fn kind_serializes_as_its_str() {
+        for kind in [Kind::Vm, Kind::StoragePool, Kind::Volume] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+        }
     }
 
     #[test]

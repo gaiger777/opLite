@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::resource::Resource;
+use crate::resource::{Kind, Resource, ResourceSpec};
 
 pub type Vm = Resource<VmSpec, VmStatus>;
 
@@ -32,6 +32,11 @@ pub struct VmSpec {
     /// 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
     #[serde(default)]
     pub node: Option<Uuid>,
+}
+
+impl ResourceSpec for VmSpec {
+    const KIND: Kind = Kind::Vm;
+    type Status = VmStatus;
 }
 
 impl VmSpec {

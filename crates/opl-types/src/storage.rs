@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::resource::Resource;
+use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::runtime::ImageFormat;
 
 pub type StoragePool = Resource<StoragePoolSpec, StoragePoolStatus>;
@@ -19,6 +19,11 @@ pub struct StoragePoolSpec {
     /// 모든 노드가 같은 데이터를 보는 공유 스토리지인지. 라이브 마이그레이션에서 쓴다.
     #[serde(default)]
     pub shared: bool,
+}
+
+impl ResourceSpec for StoragePoolSpec {
+    const KIND: Kind = Kind::StoragePool;
+    type Status = StoragePoolStatus;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +47,11 @@ pub struct VolumeSpec {
     pub pool: String,
     pub size_bytes: u64,
     pub format: ImageFormat,
+}
+
+impl ResourceSpec for VolumeSpec {
+    const KIND: Kind = Kind::Volume;
+    type Status = VolumeStatus;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
