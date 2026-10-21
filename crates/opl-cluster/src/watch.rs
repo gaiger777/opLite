@@ -15,7 +15,7 @@ pub const HISTORY: usize = 1024;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum WatchEvent {
-    /// 리소스가 생성되거나 바뀌었다. `resource.revision == revision`.
+    /// 리소스가 생성되거나 바뀌었다. 이 이벤트의 revision은 `resource.revision`이다.
     Put { kind: Kind, resource: RawResource },
     /// 리소스가 삭제되었다. 삭제 직전의 리소스를 담는다.
     Deleted {

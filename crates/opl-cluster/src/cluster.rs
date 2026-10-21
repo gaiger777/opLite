@@ -139,14 +139,24 @@ impl Cluster {
     }
 
     /// 노드를 learner로 추가하고 로그를 따라잡을 때까지 기다린다. 리더에서 부른다.
+    /// `write_timeout` 안에 끝나지 않으면 `Timeout`이다. 이때도 learner 추가는 나중에
+    /// 커밋될 수 있고, 커밋되면 리더는 계속 따라잡게 한다.
     pub async fn add_learner(&self, id: NodeId, node: BasicNode) -> Result<(), ClusterError> {
-        self.raft.add_learner(id, node, true).await?;
+        tokio::time::timeout(self.write_timeout, self.raft.add_learner(id, node, true))
+            .await
+            .map_err(|_| ClusterError::Timeout)??;
         Ok(())
     }
 
     /// 투표 멤버를 `voters`로 바꾼다. 빠진 노드는 learner로 남는다. 리더에서 부른다.
+    /// `write_timeout` 안에 커밋되지 않으면 `Timeout`이다. 변경은 나중에 커밋될 수도 있다.
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<(), ClusterError> {
-        self.raft.change_membership(voters, true).await?;
+        tokio::time::timeout(
+            self.write_timeout,
+            self.raft.change_membership(voters, true),
+        )
+        .await
+        .map_err(|_| ClusterError::Timeout)??;
         Ok(())
     }
 
@@ -232,7 +242,9 @@ impl Cluster {
         Ok((revision, items))
     }
 
-    /// 리더에게 확인한 최신 커밋까지 로컬에 적용될 때까지 기다린다(선형화 읽기).
+    /// 이 노드가 아직 리더인지 과반수에게 확인하고, 그 시점의 커밋까지 로컬에 적용될 때까지
+    /// 기다린다(선형화 읽기). 리더에서만 쓸 수 있다. 팔로워와 learner에서는 리더 정보를 담은
+    /// `NotLeader`를 돌려준다.
     pub async fn read_barrier(&self) -> Result<(), ClusterError> {
         match self.raft.ensure_linearizable().await {
             Ok(_) => Ok(()),

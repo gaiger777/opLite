@@ -59,11 +59,11 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "reason", rename_all = "kebab-case")]
 pub enum Rejection {
-    #[error("{kind:?} {id} already exists")]
+    #[error("{} {id} already exists", kind.as_str())]
     AlreadyExists { kind: Kind, id: Uuid },
-    #[error("{kind:?} name {name:?} is already taken")]
+    #[error("{} name {name:?} is already taken", kind.as_str())]
     NameTaken { kind: Kind, name: String },
-    #[error("{kind:?} {id} not found")]
+    #[error("{} {id} not found", kind.as_str())]
     NotFound { kind: Kind, id: Uuid },
     #[error("revision mismatch: expected {expected}, actual {actual}")]
     RevisionMismatch { expected: u64, actual: u64 },
@@ -115,6 +115,72 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<Command>(value).unwrap(), cmd);
+    }
+
+    #[test]
+    fn create_and_update_spec_storage_format_is_stable() {
+        let id = Uuid::from_u128(1);
+        let cmd = Command::Create {
+            kind: Kind::Volume,
+            resource: Resource {
+                id,
+                name: "disk-a".into(),
+                revision: 0,
+                labels: BTreeMap::from([("tier".into(), "gold".into())]),
+                spec: json!({"size_bytes": 1}),
+                status: json!(null),
+            },
+        };
+        let value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "op": "create",
+                "kind": "volume",
+                "resource": {
+                    "id": id.to_string(),
+                    "name": "disk-a",
+                    "revision": 0,
+                    "labels": {"tier": "gold"},
+                    "spec": {"size_bytes": 1},
+                    "status": null
+                }
+            })
+        );
+        assert_eq!(serde_json::from_value::<Command>(value).unwrap(), cmd);
+
+        let cmd = Command::UpdateSpec {
+            kind: Kind::Vm,
+            id,
+            expected_revision: None,
+            labels: BTreeMap::new(),
+            spec: json!({"cpus": 2}),
+        };
+        let value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "op": "update-spec",
+                "kind": "vm",
+                "id": id.to_string(),
+                "expected_revision": null,
+                "labels": {},
+                "spec": {"cpus": 2}
+            })
+        );
+        assert_eq!(serde_json::from_value::<Command>(value).unwrap(), cmd);
+    }
+
+    #[test]
+    fn rejection_message_uses_wire_kind_name() {
+        let r = Rejection::NotFound {
+            kind: Kind::StoragePool,
+            id: Uuid::from_u128(1),
+        };
+        assert_eq!(
+            r.to_string(),
+            "storage-pool 00000000-0000-0000-0000-000000000001 not found"
+        );
     }
 
     #[test]
