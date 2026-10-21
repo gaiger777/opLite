@@ -26,6 +26,8 @@ pub(crate) enum Trigger {
     Sync,
     /// 하이퍼바이저가 알린 수명 이벤트
     Event(EventKind),
+    /// 원하는 상태가 stopped인 VM을 ACPI 응답을 기다리지 않고 곧바로 끈다.
+    ForceStop,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +55,8 @@ pub(crate) struct Worker {
     /// 요청의 결과인지 가린다. 요청을 취소했거나 원하는 상태가 다시 running으로 바뀌어도
     /// 게스트(또는 강제 종료)는 요청대로 꺼질 수 있으므로 `acpi_timeout` 동안 유효하다.
     stopped_by_us: Option<Instant>,
+    /// 다음 단계에서 ACPI 응답을 기다리지 않고 강제 종료한다. 원하는 상태가 stopped일 때만 쓴다.
+    force_requested: bool,
     failures: FailureTracker,
     /// 백오프 중이면 이 시각까지 시작하지 않는다. status에 보일 이유를 함께 둔다.
     backoff: Option<(Instant, String)>,
@@ -80,6 +84,7 @@ impl Worker {
             config,
             stop_requested: None,
             stopped_by_us: None,
+            force_requested: false,
             failures: FailureTracker::default(),
             backoff: None,
             power_off: None,
@@ -130,8 +135,10 @@ impl Worker {
             }
             return Ok(());
         };
-        if let Trigger::Event(kind) = trigger {
-            self.on_event(&vm, kind);
+        match trigger {
+            Trigger::Event(kind) => self.on_event(&vm, kind),
+            Trigger::ForceStop => self.force_requested = true,
+            Trigger::Sync => {}
         }
         if self.power_off.is_none() {
             let status = self.reconcile(&vm).await?;
@@ -214,6 +221,7 @@ impl Worker {
                 // 진행 중인 종료 요청을 취소한다. 게스트가 이미 받은 요청대로 꺼지면
                 // `stopped_by_us`로 가려 다시 시작한다.
                 self.stop_requested = None;
+                self.force_requested = false;
                 status.phase = VmPhase::Running;
                 status.pid = Some(state.pid);
                 status.last_error = None;
@@ -236,6 +244,7 @@ impl Worker {
             }
             (PowerState::Running, None) => {
                 self.awaiting_event = None;
+                self.force_requested = false;
                 if self.backoff.as_ref().is_some_and(|(at, _)| *at <= now) {
                     self.backoff = None;
                 }
@@ -270,6 +279,15 @@ impl Worker {
             (PowerState::Stopped, Some(state)) => {
                 self.backoff = None;
                 match self.stop_requested {
+                    _ if self.force_requested => {
+                        self.hv.stop(self.id, StopMode::Force).await?;
+                        self.force_requested = false;
+                        self.stop_requested = None;
+                        self.stopped_by_us = Some(Instant::now());
+                        status.phase = VmPhase::Stopped;
+                        status.pid = None;
+                        return Ok(status);
+                    }
                     None => {
                         // 요청이 실패해도(QMP로 다룰 수 없는 VM) acpi_timeout 뒤 강제 종료한다.
                         self.stop_requested = Some(now);
@@ -295,6 +313,7 @@ impl Worker {
             }
             (PowerState::Stopped, None) => {
                 self.stop_requested = None;
+                self.force_requested = false;
                 self.awaiting_event = None;
                 self.backoff = None;
                 self.failures.clear();

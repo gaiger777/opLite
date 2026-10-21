@@ -221,6 +221,10 @@ impl Env {
         set_power(&self.cluster, id, power).await
     }
 
+    pub fn force_stop(&self, id: Uuid) {
+        self.reconciler.as_ref().unwrap().handle().force_stop(id);
+    }
+
     /// Mock 하이퍼바이저에서 실행 중인 VM의 pid
     pub async fn pid(&self, id: Uuid) -> Option<u32> {
         self.hv.inspect(id).await.unwrap().map(|s| s.pid)

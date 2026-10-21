@@ -10,4 +10,4 @@ pub mod resolve;
 mod worker;
 
 pub use config::{ReconcilerConfig, RestartBackoff};
-pub use reconciler::Reconciler;
+pub use reconciler::{Reconciler, ReconcilerHandle};

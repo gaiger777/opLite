@@ -212,6 +212,41 @@ async fn host_kill_does_not_turn_power_off() {
 }
 
 #[tokio::test]
+async fn force_stop_does_not_wait_for_acpi() {
+    let env = Env::start_with(|c| c.acpi_timeout = Duration::from_secs(60)).await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopping", |v| v.status.phase == VmPhase::Stopping)
+        .await;
+    // Mock 게스트는 ACPI를 무시한다. 강제 종료가 없으면 60초 뒤에야 꺼진다.
+    env.force_stop(vm.id);
+
+    let got = env
+        .wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    assert_eq!(got.status.last_error, None);
+    assert_eq!(env.pid(vm.id).await, None);
+}
+
+#[tokio::test]
+async fn force_stop_is_ignored_while_power_is_running() {
+    let env = Env::start().await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    let before = env.wait(vm.id, "running", running).await.status.pid;
+
+    env.force_stop(vm.id);
+    // 명령이 처리될 시간을 준다.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(env.pid(vm.id).await, before);
+    assert_eq!(env.get(vm.id).status.phase, VmPhase::Running);
+}
+
+#[tokio::test]
 async fn guest_shutdown_turns_power_off() {
     let env = Env::start().await;
     let vm = vm("web", env.node);

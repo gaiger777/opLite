@@ -20,11 +20,29 @@ use crate::worker::{Trigger, Worker};
 pub struct Reconciler {
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<()>,
+    commands: mpsc::UnboundedSender<Uuid>,
+}
+
+/// 실행 중인 reconciler에 VM별 일회성 명령을 보낸다. 명령은 그 VM의 작업자 큐를 거치므로
+/// 같은 VM에 대한 드라이버 호출이 겹치지 않는다.
+#[derive(Clone)]
+pub struct ReconcilerHandle {
+    commands: mpsc::UnboundedSender<Uuid>,
+}
+
+impl ReconcilerHandle {
+    /// 원하는 상태가 stopped인 VM을 ACPI 응답을 기다리지 않고 곧바로 끈다. 원하는 상태를 먼저
+    /// stopped로 기록한 뒤에 부른다. 이 노드에 배정되지 않은 VM이거나 원하는 상태가 running이면
+    /// 아무것도 하지 않는다. 결과는 VM status로 확인한다.
+    pub fn force_stop(&self, id: Uuid) {
+        let _ = self.commands.send(id);
+    }
 }
 
 impl Reconciler {
     pub fn spawn(cluster: Arc<Cluster>, hv: Arc<dyn Hypervisor>, config: ReconcilerConfig) -> Self {
         let (shutdown, rx) = oneshot::channel();
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let dispatcher = Dispatcher {
             cluster,
             hv,
@@ -34,7 +52,14 @@ impl Reconciler {
         };
         Self {
             shutdown,
-            task: tokio::spawn(dispatcher.run(rx)),
+            task: tokio::spawn(dispatcher.run(rx, command_rx)),
+            commands,
+        }
+    }
+
+    pub fn handle(&self) -> ReconcilerHandle {
+        ReconcilerHandle {
+            commands: self.commands.clone(),
         }
     }
 
@@ -70,7 +95,11 @@ struct Dispatcher {
 }
 
 impl Dispatcher {
-    async fn run(mut self, mut shutdown: oneshot::Receiver<()>) {
+    async fn run(
+        mut self,
+        mut shutdown: oneshot::Receiver<()>,
+        mut commands: mpsc::UnboundedReceiver<Uuid>,
+    ) {
         // 목록을 읽기 전에 구독해야 그 사이에 난 이벤트를 놓치지 않는다.
         let mut events = self.hv.subscribe();
         'sync: loop {
@@ -108,6 +137,11 @@ impl Dispatcher {
                         Err(broadcast::error::RecvError::Lagged(_)) => continue 'sync,
                         Err(broadcast::error::RecvError::Closed) => break 'sync,
                     },
+                    Some(id) = commands.recv() => {
+                        if !self.notify(id, Trigger::ForceStop) {
+                            tracing::warn!(vm = %id, "force stop for a VM not assigned to this node");
+                        }
+                    }
                 }
             }
         }
