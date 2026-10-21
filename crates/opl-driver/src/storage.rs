@@ -48,6 +48,14 @@ pub trait Storage: Send + Sync {
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError>;
 
+    /// `src`가 다른 파일을 참조하지 않는 이미지 하나인지 확인한다(VMDK extent, backing file).
+    /// 사용자가 올린 파일을 `import_volume`에 넘기기 전에 부른다.
+    async fn check_import_source(
+        &self,
+        src: &Path,
+        src_format: SourceFormat,
+    ) -> Result<(), DriverError>;
+
     async fn delete_volume(
         &self,
         pool: &StoragePoolSpec,
@@ -173,6 +181,25 @@ fn src_fmt_name(format: SourceFormat) -> &'static str {
     }
 }
 
+/// `qemu-img info` 출력에서 이미지가 여는(열 수 있는) 파일 이름을 모두 모은다.
+fn referenced_files(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            for (k, v) in map {
+                match (k.as_str(), v) {
+                    (
+                        "filename" | "backing-filename" | "full-backing-filename" | "data-file",
+                        Value::String(f),
+                    ) => out.push(f.clone()),
+                    _ => referenced_files(v, out),
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| referenced_files(v, out)),
+        _ => {}
+    }
+}
+
 fn path_str(p: &Path) -> Result<&str, DriverError> {
     p.to_str()
         .ok_or_else(|| DriverError::InvalidSpec(format!("path is not UTF-8: {p:?}")))
@@ -228,6 +255,31 @@ impl Storage for DirStorage {
         ];
         self.write_new(id, &path, &before, &[]).await?;
         Ok(path)
+    }
+
+    async fn check_import_source(
+        &self,
+        src: &Path,
+        src_format: SourceFormat,
+    ) -> Result<(), DriverError> {
+        require_absolute(src)?;
+        let src = path_str(src)?;
+        let out = self
+            .qemu_img(&["info", "--output=json", "-f", src_fmt_name(src_format), src])
+            .await?;
+        let json: Value = serde_json::from_slice(&out).map_err(|e| DriverError::ToolFailed {
+            tool: "qemu-img",
+            stderr: format!("unparseable info output: {e}"),
+        })?;
+        // 이미지 자신과 그 하위 노드(extent 등)가 가리키는 파일이 모두 src여야 한다.
+        let mut files = Vec::new();
+        referenced_files(&json, &mut files);
+        match files.into_iter().find(|f| f != src) {
+            None => Ok(()),
+            Some(other) => Err(DriverError::InvalidSpec(format!(
+                "image refers to another file: {other}"
+            ))),
+        }
     }
 
     async fn delete_volume(

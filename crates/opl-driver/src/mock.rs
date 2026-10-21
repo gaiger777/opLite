@@ -25,6 +25,7 @@ struct MockState {
     fail_next_start: Option<DriverError>,
     /// 살아 있지만 QMP로 다룰 수 없는 VM
     unresponsive: HashSet<Uuid>,
+    console_dir: Option<PathBuf>,
 }
 
 impl Default for MockHypervisor {
@@ -70,6 +71,11 @@ impl MockHypervisor {
         } else {
             st.unresponsive.remove(&id);
         }
+    }
+
+    /// `console_endpoint`가 `{dir}/{id}.vnc`를 돌려주게 한다. 테스트가 그 경로에 가짜 VNC 서버를 띄운다.
+    pub fn set_console_dir(&self, dir: impl Into<PathBuf>) {
+        self.state.lock().unwrap().console_dir = Some(dir.into());
     }
 
     fn remove(&self, id: Uuid, kind: EventKind) {
@@ -162,8 +168,12 @@ impl Hypervisor for MockHypervisor {
     }
 
     async fn console_endpoint(&self, id: Uuid) -> Result<PathBuf, DriverError> {
-        if self.state.lock().unwrap().vms.contains_key(&id) {
-            Ok(PathBuf::from(format!("/mock/{id}/vnc.sock")))
+        let st = self.state.lock().unwrap();
+        if st.vms.contains_key(&id) {
+            Ok(match &st.console_dir {
+                Some(dir) => dir.join(format!("{id}.vnc")),
+                None => PathBuf::from(format!("/mock/{id}/vnc.sock")),
+            })
         } else {
             Err(DriverError::NotRunning(id))
         }
@@ -237,6 +247,18 @@ mod tests {
             hv.console_endpoint(vm.id).await,
             Err(DriverError::NotRunning(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn console_dir_sets_endpoint() {
+        let hv = MockHypervisor::default();
+        let vm = spec();
+        hv.set_console_dir("/tmp/consoles");
+        hv.start(&vm).await.unwrap();
+        assert_eq!(
+            hv.console_endpoint(vm.id).await.unwrap(),
+            PathBuf::from(format!("/tmp/consoles/{}.vnc", vm.id))
+        );
     }
 
     #[tokio::test]
