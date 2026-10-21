@@ -188,3 +188,85 @@ async fn weak_passwords_and_bad_names_are_rejected() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
     }
 }
+
+#[tokio::test]
+async fn token_with_wrong_secret_is_rejected() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let token = admin.token.clone().unwrap();
+    let (id, _) = token.rsplit_once('_').unwrap();
+    let mut forged = admin.clone();
+    forged.token = Some(format!("{id}_{}", "0123456789abcdef".repeat(4)));
+    let (status, body) = forged.get("/nodes").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "unauthorized");
+    assert_eq!(admin.get("/nodes").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn changing_own_password_ends_existing_sessions() {
+    let env = Env::start().await;
+    env.user("alice", "viewer").await;
+    let http = reqwest::Client::new();
+    let url = |p: &str| format!("{}/api/v1{p}", env.base);
+    let resp = http
+        .post(url("/auth/login"))
+        .json(&json!({ "username": "alice", "password": "password-1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = resp.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let resp = http
+        .put(url("/users/alice"))
+        .header("cookie", &cookie)
+        .json(&json!({ "password": "new-password", "current_password": "password-1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = http
+        .get(url("/auth/whoami"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    env.login("alice", "new-password").await;
+}
+
+#[tokio::test]
+async fn admin_resets_password_without_current_password() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    env.user("alice", "viewer").await;
+    let (status, body) = admin
+        .put(
+            "/users/alice",
+            json!({ "password": "reset-password" }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    env.login("alice", "reset-password").await;
+}
+
+#[tokio::test]
+async fn viewers_cannot_probe_other_users() {
+    let env = Env::start().await;
+    let viewer = env.user("viewer", "viewer").await;
+    for key in ["/users/nobody", "/users/admin"] {
+        let (status, body) = viewer
+            .put(key, json!({ "password": "new-password" }), None)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{key}");
+        assert_eq!(body["code"], "forbidden", "{key}");
+    }
+}

@@ -190,6 +190,42 @@ async fn force_stop_during_reboot_wins() {
 }
 
 #[tokio::test]
+async fn start_right_after_reboot_leaves_the_vm_running() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    admin.post("/vms", vm_request("web")).await;
+    admin.act("web", "start").await;
+    // 실행기를 멈춰 두 Task가 함께 시작되게 한다.
+    env.stop_runner().await;
+    let (_, reboot) = admin.post("/vms/web/actions/reboot", Value::Null).await;
+    let (_, start) = admin.post("/vms/web/actions/start", Value::Null).await;
+    env.start_runner().await;
+
+    // 켜진 VM의 start는 곧바로 끝난다. 앞의 reboot이 그 뒤에 VM을 끄고 놔두면 안 된다.
+    let task = admin.wait_task(&start).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let reboot = admin.wait_task(&reboot).await;
+    if reboot["status"]["state"] == "failed" {
+        assert_eq!(
+            reboot["status"]["error"],
+            "superseded by a later request for this VM"
+        );
+    } else {
+        assert_eq!(reboot["status"]["state"], "succeeded", "{reboot}");
+    }
+    let deadline = std::time::Instant::now() + common::WAIT;
+    loop {
+        let (_, vm) = admin.get("/vms/web").await;
+        assert_eq!(vm["spec"]["power"], "running", "{vm}");
+        if vm["status"]["phase"] == "running" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "VM did not run: {vm}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
 async fn reboot_restarts_the_vm() {
     let env = Env::start().await;
     let admin = env.admin().await;

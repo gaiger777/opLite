@@ -52,9 +52,14 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, "forbidden", "permission denied")
     }
 
+    /// 자세한 내용은 로그에만 남기고 클라이언트에는 드러내지 않는다.
     pub fn internal(e: impl std::fmt::Display) -> Self {
         tracing::error!(error = %e, "internal error");
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "internal error",
+        )
     }
 }
 
@@ -155,3 +160,15 @@ impl<T: Serialize> IntoResponse for Json<T> {
 #[derive(FromRequestParts)]
 #[from_request(via(axum::extract::Query), rejection(ApiError))]
 pub struct Query<T>(pub T);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_error_hides_details() {
+        let e = ApiError::internal("disk /var/lib/opl is full");
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.message, "internal error");
+    }
+}

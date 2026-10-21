@@ -132,7 +132,8 @@ impl Env {
             storage,
             reconciler.handle(),
             runner_config(node, dir.path()),
-        );
+        )
+        .await;
         let state = Arc::new(AppState::new(
             cluster.clone(),
             node,
@@ -223,14 +224,17 @@ impl Env {
         self.runner.take().unwrap().shutdown().await;
     }
 
-    pub fn start_runner(&mut self) {
+    pub async fn start_runner(&mut self) {
         let storage: Arc<dyn Storage> = Arc::new(DirStorage::new("qemu-img"));
-        self.runner = Some(TaskRunner::spawn(
-            self.cluster.clone(),
-            storage,
-            self.reconciler.as_ref().unwrap().handle(),
-            runner_config(self.node, self.dir.path()),
-        ));
+        self.runner = Some(
+            TaskRunner::spawn(
+                self.cluster.clone(),
+                storage,
+                self.reconciler.as_ref().unwrap().handle(),
+                runner_config(self.node, self.dir.path()),
+            )
+            .await,
+        );
     }
 
     pub async fn pid(&self, id: Uuid) -> Option<u32> {

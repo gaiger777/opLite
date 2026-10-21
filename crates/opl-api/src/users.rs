@@ -194,6 +194,13 @@ pub async fn update_user(
     Path(key): Path<String>,
     Json(req): Json<UpdateUserRequest>,
 ) -> Result<Json<UserView>, ApiError> {
+    // 관리 권한이 없으면 다른 사용자가 있는지조차 알려 주지 않는다.
+    let may_write = state
+        .authorizer
+        .check(&principal, Action::Write, UserSpec::KIND);
+    if !may_write && key != principal.name && key != principal.user.to_string() {
+        return Err(ApiError::forbidden());
+    }
     let user = lookup::<UserSpec>(&state.cluster, &key)?;
     let is_self = user.id == principal.user;
     if !is_self || req.role.is_some() {

@@ -88,7 +88,7 @@ async fn tasks_created_while_runner_is_down_run_when_it_starts() {
         .post("/vms/web/actions/start", serde_json::Value::Null)
         .await;
     assert_eq!(task["status"]["state"], "pending");
-    env.start_runner();
+    env.start_runner().await;
 
     let task = admin.wait_task(&task).await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");

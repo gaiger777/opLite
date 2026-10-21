@@ -73,19 +73,31 @@ struct Ctx {
 }
 
 impl TaskRunner {
-    pub fn spawn(
+    /// 고아(Task 없는 Pending 볼륨, 올린 파일)를 지운 뒤 실행 루프를 띄우고 돌아온다.
+    /// API가 막 만든 볼륨이나 올린 파일을 고아로 지우지 않도록 API 서버는 이것을 기다린 뒤 띄운다.
+    pub async fn spawn(
         cluster: Arc<Cluster>,
         storage: Arc<dyn Storage>,
         reconciler: ReconcilerHandle,
         config: TaskRunnerConfig,
     ) -> Self {
-        let (shutdown, rx) = oneshot::channel();
         let ctx = Arc::new(Ctx {
             cluster,
             storage,
             reconciler,
             config,
         });
+        let (revision, tasks) = loop {
+            match ctx.cluster.list::<TaskSpec>() {
+                Ok(list) => break list,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot list tasks; will retry");
+                    tokio::time::sleep(ctx.config.poll_interval).await;
+                }
+            }
+        };
+        sweep_orphans(&ctx, revision, &tasks).await;
+        let (shutdown, rx) = oneshot::channel();
         Self {
             shutdown,
             task: tokio::spawn(run(ctx, rx)),
@@ -93,7 +105,6 @@ impl TaskRunner {
     }
 
     /// 실행 중인 Task를 멈추고 돌아온다. 멈춘 Task는 다음에 시작할 때 실패로 기록한다.
-    /// 시작할 때 고아(Task 없는 Pending 볼륨, 올린 파일)를 지우므로 API 서버보다 먼저 띄운다.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
         let _ = self.task.await;
@@ -126,9 +137,6 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>) {
                 .iter()
                 .any(|t| t.id == *id && !t.status.state.is_finished())
         });
-        if first {
-            sweep_orphans(&ctx, &tasks).await;
-        }
         for task in tasks {
             if task.spec.node != ctx.config.node || started.contains(&task.id) {
                 continue;
@@ -362,6 +370,10 @@ async fn set_power(ctx: &Ctx, id: Uuid, power: PowerState) -> Result<(), String>
 /// 그 사이 같은 VM에 대한 요청(시작, 정지, 강제 종료)이 새로 들어오면 그 요청을 따르고 다시 켜지 않는다.
 async fn reboot(ctx: &Ctx, task: &Task) -> Result<(), String> {
     let id = task.spec.target;
+    // 뒤의 요청이 이미 끝났을 수 있다(켜진 VM의 start는 곧바로 끝난다). 그 뒤에 끄면 안 된다.
+    if superseded(ctx, task)? {
+        return Err("superseded by a later request for this VM".into());
+    }
     set_power(ctx, id, PowerState::Stopped).await?;
     wait_vm(ctx, id, |vm| match (vm.spec.power, vm.status.phase) {
         (PowerState::Running, _) | (_, VmPhase::Stopped | VmPhase::Failed) => Some(Ok(())),
@@ -518,8 +530,9 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 }
 
 /// 이전 opld가 남긴 고아를 지운다: 실행할 Task가 없는 Pending 볼륨(볼륨을 만든 뒤 Task를 만들기
-/// 전에, 또는 업로드 도중 opld가 죽었다)과, 가져오기 Task가 없는 올린 파일.
-async fn sweep_orphans(ctx: &Ctx, tasks: &[Task]) {
+/// 전에, 또는 업로드 도중 opld가 죽었다)과, 가져오기 Task가 없는 올린 파일. `tasks`는
+/// `revision`에서 읽은 Task 목록이다.
+async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) {
     let unfinished: Vec<&Task> = tasks
         .iter()
         .filter(|t| !t.status.state.is_finished())
@@ -527,6 +540,11 @@ async fn sweep_orphans(ctx: &Ctx, tasks: &[Task]) {
     match ctx.cluster.list::<VolumeSpec>() {
         Ok((_, volumes)) => {
             for volume in volumes {
+                // Task 목록보다 나중에 만든 볼륨은 그 목록으로 판단할 수 없다(다른 노드의 API가
+                // 방금 만들었을 수 있다).
+                if volume.revision > revision {
+                    continue;
+                }
                 let has_task = unfinished.iter().any(|t| t.spec.target == volume.id);
                 if volume.status.phase == VolumePhase::Pending && !has_task {
                     tracing::warn!(volume = %volume.name, "removing a volume left unfinished");
