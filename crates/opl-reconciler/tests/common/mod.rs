@@ -11,9 +11,11 @@ use opl_cluster::memnet::MemRouter;
 use opl_cluster::store::StoreError;
 use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig, ClusterError};
-use opl_reconciler::{ReconcilerConfig, RestartBackoff};
+use opl_driver::{Hypervisor, MockHypervisor};
+use opl_reconciler::{Reconciler, ReconcilerConfig, RestartBackoff};
 use opl_types::resource::Resource;
 use opl_types::vm::{CpuModel, CpuSpec, Firmware, MachineType, PowerState, Vm, VmSpec};
+use tempfile::TempDir;
 use uuid::Uuid;
 
 pub const WAIT: Duration = Duration::from_secs(10);
@@ -151,5 +153,76 @@ pub async fn set_power(cluster: &Cluster, id: Uuid, power: PowerState) {
             Err(ClusterError::Rejected(_)) => continue,
             Err(e) => panic!("{e}"),
         }
+    }
+}
+
+/// 노드 하나짜리 클러스터 + Mock 하이퍼바이저 + reconciler.
+pub struct Env {
+    pub router: MemRouter,
+    pub cluster: Arc<Cluster>,
+    pub hv: Arc<MockHypervisor>,
+    pub node: Uuid,
+    pub config: ReconcilerConfig,
+    reconciler: Option<Reconciler>,
+    _dir: TempDir,
+}
+
+impl Env {
+    pub async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    pub async fn start_with(tweak: impl FnOnce(&mut ReconcilerConfig)) -> Self {
+        let dir = TempDir::new().unwrap();
+        let router = MemRouter::default();
+        let cluster = single_node(&router, dir.path()).await;
+        let node = cluster.id().0;
+        let mut config = config(node);
+        tweak(&mut config);
+        let mut env = Env {
+            router,
+            cluster,
+            hv: Arc::new(MockHypervisor::default()),
+            node,
+            config,
+            reconciler: None,
+            _dir: dir,
+        };
+        env.start_reconciler();
+        env
+    }
+
+    pub fn start_reconciler(&mut self) {
+        let hv: Arc<dyn Hypervisor> = self.hv.clone();
+        self.reconciler = Some(Reconciler::spawn(
+            self.cluster.clone(),
+            hv,
+            self.config.clone(),
+        ));
+    }
+
+    pub async fn stop_reconciler(&mut self) {
+        self.reconciler.take().unwrap().shutdown().await;
+    }
+
+    pub async fn create(&self, vm: &Vm) {
+        self.cluster.create(vm).await.unwrap();
+    }
+
+    pub fn get(&self, id: Uuid) -> Vm {
+        self.cluster.get::<VmSpec>(id).unwrap().unwrap()
+    }
+
+    pub async fn wait(&self, id: Uuid, what: &str, pred: impl Fn(&Vm) -> bool) -> Vm {
+        wait_vm(&self.cluster, id, what, pred).await
+    }
+
+    pub async fn set_power(&self, id: Uuid, power: PowerState) {
+        set_power(&self.cluster, id, power).await
+    }
+
+    /// Mock 하이퍼바이저에서 실행 중인 VM의 pid
+    pub async fn pid(&self, id: Uuid) -> Option<u32> {
+        self.hv.inspect(id).await.unwrap().map(|s| s.pid)
     }
 }
