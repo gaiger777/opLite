@@ -32,15 +32,21 @@ impl CliConfig {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // 임시 파일에 다 쓴 뒤 바꿔 넣어, 도중에 죽어도 이전 설정이 그대로 남게 한다.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?;
-        // `mode`는 새 파일에만 쓰인다. 이미 있던 파일도 주인만 읽게 한다.
+            .open(&tmp)?;
+        // `mode`는 새 파일에만 쓰인다. 남아 있던 임시 파일도 주인만 읽게 한다.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(&serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 }

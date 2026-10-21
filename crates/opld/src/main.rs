@@ -64,6 +64,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
     bootstrap::start_cluster(&cluster, &config.listen).await?;
     bootstrap::ensure_admin(&cluster, &config.data_dir).await?;
     bootstrap::register_node(&cluster, &config).await?;
+    // 포트가 이미 쓰이고 있으면 작업자를 띄우기 전에 실패한다.
+    let listener = tokio::net::TcpListener::bind(&config.listen).await?;
 
     let hv: Arc<dyn Hypervisor> = Arc::new(
         QemuHypervisor::new(QemuConfig {
@@ -89,7 +91,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
         config.data_dir.join("uploads"),
     ));
 
-    let listener = tokio::net::TcpListener::bind(&config.listen).await?;
     tracing::info!(node = %node, addr = %listener.local_addr()?, "opld is ready");
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let mut server = tokio::spawn(async move {

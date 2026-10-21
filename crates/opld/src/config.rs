@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -9,7 +10,8 @@ use serde::Deserialize;
 pub struct Config {
     /// 노드 이름. 클러스터 안에서 유일해야 한다.
     pub name: String,
-    /// API를 받을 주소. TLS는 클러스터 부트스트랩(계획 6)에서 더하므로 그때까지는 루프백에만 연다.
+    /// API를 받을 소켓 주소(`127.0.0.1:8006`, `[::1]:8006`). TLS는 클러스터 부트스트랩(계획 6)에서
+    /// 더하므로 그때까지는 루프백 주소만 받는다. 호스트 이름은 받지 않는다.
     #[serde(default = "default_listen")]
     pub listen: String,
     /// 클러스터 저장소, VM별 영구 파일, 올린 이미지를 둔다.
@@ -72,7 +74,19 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
-        Ok(toml::from_str(&text)?)
+        let config: Self = toml::from_str(&text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        let listen = &self.listen;
+        match listen.parse::<SocketAddr>() {
+            Ok(addr) if addr.ip().is_loopback() => Ok(()),
+            _ => anyhow::bail!(
+                "listen must be a loopback address until TLS is supported (got {listen})"
+            ),
+        }
     }
 }
 
@@ -94,5 +108,18 @@ mod tests {
         let c: Config =
             toml::from_str("name = \"n\"\n[reconciler]\nacpi_timeout_secs = 5").unwrap();
         assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn listen_must_be_loopback() {
+        let with = |listen: &str| Config {
+            listen: listen.into(),
+            ..toml::from_str(r#"name = "n""#).unwrap()
+        };
+        assert!(with("127.0.0.1:8006").validate().is_ok());
+        assert!(with("[::1]:8006").validate().is_ok());
+        for bad in ["0.0.0.0:8006", "10.0.0.1:8006", "localhost:8006"] {
+            assert!(with(bad).validate().is_err(), "{bad}");
+        }
     }
 }

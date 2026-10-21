@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::config::Config;
 
 pub const NODE_ID_FILE: &str = "node-id";
+const NODE_ID_TMP_FILE: &str = "node-id.tmp";
 pub const ADMIN_PASSWORD_FILE: &str = "initial-admin-password";
 
 /// 처음 시작할 때 만든 노드 id를 계속 쓴다. Raft 노드 id이자 Node 리소스 id다.
@@ -27,7 +28,12 @@ pub fn node_id(data_dir: &Path) -> anyhow::Result<Uuid> {
         Ok(s) => Uuid::try_parse(s.trim()).with_context(|| format!("bad {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let id = Uuid::now_v7();
-            std::fs::write(&path, format!("{id}\n"))?;
+            // 임시 파일에 쓰고 바꿔 넣어, 도중에 죽어도 반쯤 쓴 id가 남지 않게 한다.
+            let tmp = data_dir.join(NODE_ID_TMP_FILE);
+            let mut file = std::fs::File::create(&tmp)?;
+            writeln!(file, "{id}")?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
             Ok(id)
         }
         Err(e) => Err(e.into()),

@@ -18,6 +18,7 @@ TOML
 cargo run -p opld -- --config opld.toml          # API: http://127.0.0.1:8006
 cargo run -p oplctl -- login --server http://127.0.0.1:8006 \
     --password-file /tmp/opl/data/initial-admin-password
+mkdir -p /tmp/opl/pool
 cargo run -p oplctl -- pool create local --path /tmp/opl/pool
 cargo run -p oplctl -- volume create root --pool local --size 1G
 cargo run -p oplctl -- vm create web --memory 512 --disk root --nic user --start

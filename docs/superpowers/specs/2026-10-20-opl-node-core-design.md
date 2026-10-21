@@ -146,7 +146,7 @@ spec:
 - 감시: `GET /api/v1/watch?kinds=vm,task&since=<revision>` (WebSocket). 목록의 revision 다음 변경부터 받는다. 이어 받을 수 없으면 오류 메시지를 보내고 닫으며, 클라이언트는 목록을 다시 읽는다. 사용자와 토큰은 감시할 수 없다.
 - 콘솔: `GET /api/v1/vms/{id}/console` (WebSocket). 실행 노드의 QEMU VNC로 프록시한다. 다른 노드에서 요청하면 노드 간 gRPC로 중계한다(M6).
 - OpenAPI 스펙은 `utoipa`로 코드에서 생성해 `GET /api/v1/openapi.json`으로 내보낸다. 라우터와 같은 정의에서 만든다.
-- 인증: 로컬 사용자(세션 쿠키, 웹 UI용)와 API 토큰(Bearer, CLI용)을 지원한다. 토큰은 `opl_<id>_<비밀 값>`이고 비밀 값의 SHA-256만 저장한다. 쿠키로 인증한 요청은 `Origin`이 서버와 같아야 한다. 자기 비밀번호를 바꿀 때는 현재 비밀번호가 필요하고, 바꾸면 그 사용자의 세션이 끝난다. 모든 핸들러는 `Authorizer::check(principal, action, resource)`를 거친다. 1차 구현은 `admin`/`operator`/`viewer` 고정 역할이다.
+- 인증: 로컬 사용자(세션 쿠키, 웹 UI용)와 API 토큰(Bearer, CLI용)을 지원한다. 토큰은 `opl_<id>_<비밀 값>`이고 비밀 값의 SHA-256만 저장한다. 쿠키로 인증한 요청에 `Origin`이 있으면 서버와 같아야 한다. 자기 비밀번호를 바꿀 때는 현재 비밀번호가 필요하고, 바꾸면 그 사용자의 세션이 끝난다. 모든 핸들러는 `Authorizer::check(principal, action, resource)`를 거친다. 1차 구현은 `admin`/`operator`/`viewer` 고정 역할이다.
 - 오류 응답은 `{ "code": "...", "message": "...", "details": {...} }` 형식으로 통일한다. Raft 과반수가 없으면 `503 cluster_no_quorum`, revision이 다르면 `412 revision_mismatch`, 이름이 겹치면 `409 name_taken`을 반환한다.
 
 ## 5. VM 라이프사이클
@@ -156,9 +156,9 @@ spec:
 ```
 클라이언트 ──POST /vms/web-01/actions/start──▶ opl-api (임의의 노드)
   1. 인증·권한 확인 → spec.power = running, node가 비어 있으면 스케줄러가 선택
-  2. Raft에 제안 → 과반수 커밋 → Task(Pending, node = 대상 노드) 생성 → 202 + task
-                                  │ 커밋 스트림
-                                  ▼
+  2. spec 변경을 Raft에 커밋 → Task(Pending, node = 대상 노드)를 따로 커밋 → 202 + task
+                                │ 커밋 스트림
+                                ▼
 대상 노드의 reconciler
   3. desired(running) ≠ actual(stopped) → Hypervisor::start
   4. 커맨드라인 생성 → QEMU 실행(-S, -daemonize) → QMP 연결 → qmp_capabilities → cont

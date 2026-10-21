@@ -324,17 +324,18 @@ where
     if let Cmd::Login(args) = &cli.cmd {
         let server = server.context("--server is required for the first login")?;
         let token = login(&server, args).await?;
-        // 같은 서버에 다시 로그인하면 이전 토큰은 서버에서도 지운다.
-        if let (Some(old), Some(old_server)) = (&config.token, &config.server)
-            && old_server == &server
-            && let Some(id) = token_id(old)
+        let previous = config.token.take().zip(config.server.take());
+        config.server = Some(server.clone());
+        config.token = Some(token.clone());
+        config.save(&config_path)?;
+        // 새 토큰을 저장한 뒤, 같은 서버에 다시 로그인했으면 이전 토큰은 서버에서도 지운다(실패해도 무시).
+        if let Some((old, old_server)) = previous
+            && old_server.trim_end_matches('/') == server.trim_end_matches('/')
+            && let Some(id) = token_id(&old)
         {
-            let client = Client::new(&server, Some(token.clone()));
+            let client = Client::new(&server, Some(token));
             let _ = client.delete(&format!("/tokens/{id}")).await;
         }
-        config.server = Some(server.clone());
-        config.token = Some(token);
-        config.save(&config_path)?;
         writeln!(out, "logged in to {server} as {}", args.user)?;
         return Ok(());
     }

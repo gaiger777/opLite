@@ -15,6 +15,14 @@ async fn opld_serves_cli_and_keeps_state_across_restarts() {
     );
     assert_eq!(mode & 0o777, 0o600);
     d.login().await;
+    // 같은 서버에 다시 로그인하면(끝의 `/`는 무시) 이전 토큰은 지워진다.
+    let password = password_file.to_str().unwrap();
+    let server = format!("{}/", d.server());
+    d.ctl(&["login", "--server", &server, "--password-file", password])
+        .await
+        .unwrap();
+    let tokens = d.ctl_json(&["token", "list"]).await;
+    assert_eq!(tokens.as_array().unwrap().len(), 1, "{tokens}");
 
     let nodes = d.ctl_json(&["node", "list"]).await;
     assert_eq!(nodes[0]["name"], "node1");
@@ -49,4 +57,20 @@ async fn opld_serves_cli_and_keeps_state_across_restarts() {
     let err = d.ctl(&["vm", "list"]).await.unwrap_err();
     assert!(err.to_string().contains("oplctl login"), "{err}");
     d.stop();
+}
+
+#[tokio::test]
+async fn opld_fails_on_taken_port_before_starting_workers() {
+    let d = Daemon::new("");
+    let _taken = std::net::TcpListener::bind(("127.0.0.1", d.port)).unwrap();
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_opld"))
+        .arg("--config")
+        .arg(d.path("opld.toml"))
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    // 하이퍼바이저 드라이버는 run_dir를 만든다. 포트를 먼저 열면 거기까지 가지 않는다.
+    assert!(!d.path("run").exists());
 }
