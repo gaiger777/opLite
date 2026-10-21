@@ -4,6 +4,7 @@
 //! 각 노드의 reconciler이고, Task의 진행은 대상 노드의 [`TaskRunner`]가 기록한다.
 
 pub mod auth;
+mod console;
 pub mod error;
 pub mod resources;
 pub mod scheduler;
@@ -12,6 +13,7 @@ mod tasks;
 pub mod users;
 mod vms;
 mod volumes;
+mod watch;
 
 use std::sync::Arc;
 
@@ -74,6 +76,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::list_volumes, volumes::create_volume))
         .routes(routes!(volumes::import_volume))
         .routes(routes!(r::get_volume, volumes::delete_volume))
+        .routes(routes!(console::console))
+        .routes(routes!(watch::watch))
 }
 
 /// API 문서. 라우터와 같은 정의에서 만들므로 경로가 어긋나지 않는다.
