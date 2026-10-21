@@ -1,0 +1,133 @@
+//! VM spec의 이름 참조를 드라이버용 경로와 백엔드로 푸는 규칙.
+
+mod common;
+
+use opl_cluster::memnet::MemRouter;
+use opl_reconciler::resolve::{ResolveError, runtime_spec};
+use opl_types::resource::Resource;
+use opl_types::runtime::{ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
+use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
+use opl_types::vm::{DiskBus, DiskSpec, MacAddr, NicModel, NicSpec};
+use tempfile::TempDir;
+use uuid::Uuid;
+
+fn pool(name: &str, nodes: Vec<Uuid>) -> StoragePool {
+    Resource::new(
+        name,
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: format!("/pools/{name}").into(),
+            },
+            nodes,
+            shared: false,
+        },
+    )
+}
+
+fn volume(name: &str, pool: &str) -> Volume {
+    Resource::new(
+        name,
+        VolumeSpec {
+            pool: pool.into(),
+            size_bytes: 1 << 30,
+            format: ImageFormat::Qcow2,
+        },
+    )
+}
+
+fn disk(volume: &str) -> DiskSpec {
+    DiskSpec {
+        volume: volume.into(),
+        bus: DiskBus::VirtioBlk,
+        boot_order: Some(1),
+    }
+}
+
+fn nic(network: &str, mac: Option<MacAddr>) -> NicSpec {
+    NicSpec {
+        network: network.into(),
+        model: NicModel::Virtio,
+        mac,
+    }
+}
+
+#[tokio::test]
+async fn resolves_volumes_to_pool_paths_and_user_network() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    let root = volume("root", "local");
+    cluster.create(&root).await.unwrap();
+
+    let mac: MacAddr = "52:54:00:00:00:01".parse().unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    vm.spec.nics.push(nic("user", Some(mac)));
+
+    let spec = runtime_spec(&cluster, &vm, node).unwrap();
+    assert_eq!(spec.id, vm.id);
+    assert_eq!(
+        spec.disks,
+        vec![RuntimeDisk {
+            path: format!("/pools/local/{}.qcow2", root.id).into(),
+            format: ImageFormat::Qcow2,
+            bus: DiskBus::VirtioBlk,
+            boot_order: Some(1),
+        }]
+    );
+    assert_eq!(
+        spec.nics,
+        vec![RuntimeNic {
+            mac,
+            model: NicModel::Virtio,
+            backend: NicBackend::User,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn reports_unresolvable_references() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster
+        .create(&pool("elsewhere", vec![Uuid::now_v7()]))
+        .await
+        .unwrap();
+    cluster
+        .create(&volume("remote", "elsewhere"))
+        .await
+        .unwrap();
+    cluster
+        .create(&volume("orphan", "deleted-pool"))
+        .await
+        .unwrap();
+
+    let check = |disks: Vec<DiskSpec>, nics: Vec<NicSpec>| {
+        let mut vm = common::vm("web", node);
+        vm.spec.disks = disks;
+        vm.spec.nics = nics;
+        runtime_spec(&cluster, &vm, node).unwrap_err()
+    };
+    assert!(matches!(
+        check(vec![disk("nope")], vec![]),
+        ResolveError::VolumeNotFound(n) if n == "nope"
+    ));
+    assert!(matches!(
+        check(vec![disk("orphan")], vec![]),
+        ResolveError::PoolNotFound(n) if n == "deleted-pool"
+    ));
+    assert!(matches!(
+        check(vec![disk("remote")], vec![]),
+        ResolveError::PoolNotOnNode(n) if n == "elsewhere"
+    ));
+    assert!(matches!(
+        check(vec![], vec![nic("lan", Some(MacAddr::generate()))]),
+        ResolveError::NetworkNotFound(n) if n == "lan"
+    ));
+    assert!(matches!(
+        check(vec![], vec![nic("user", None)]),
+        ResolveError::MissingMac(0)
+    ));
+}

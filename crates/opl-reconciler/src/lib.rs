@@ -5,5 +5,6 @@
 
 mod backoff;
 mod config;
+pub mod resolve;
 
 pub use config::{ReconcilerConfig, RestartBackoff};
