@@ -2592,9 +2592,11 @@ git commit -m "docs: schema_version 위치와 Raft 노드 id 결정을 설계에
 - status 쓰기도 revision을 올린다. spec `If-Match`가 reconciler 쓰기와 부딪치지 않게 하려면 spec 전용 revision을 둘지 검토한다.
 - 리소스 이름 형식 검증(빈 이름, 길이, 문자)은 API에서 한다. 저장소는 유일성만 본다.
 - `Timeout`은 503(`cluster_no_quorum`)으로, `Rejected(RevisionMismatch)`는 412로, `NameTaken`/`AlreadyExists`는 409로 옮긴다.
+- 과반수를 잃은 리더에서 `read_barrier`는 `Timeout`이 아니라 `Raft(String)`(`CheckIsLeaderError::QuorumNotEnough`)로 실패한다. 503으로 옮기려면 이 경우를 따로 매핑한다.
 - `read_barrier`는 리더 전용이다. 선형화 읽기가 필요한 요청은 리더로 전달하거나, 팔로워 읽기(리더의 read index를 받아 로컬에서 기다림)를 구현한다.
 - `ClusterError::Encoding`은 잘못된 입력(400)과 손상된 저장 데이터(500)를 구분하지 않고, `Raft(String)`은 `ChangeMembershipError` 종류를 잃는다. API에서 구분이 필요하면 오류 타입을 나눈다.
 
 계획 6 (클러스터 부트스트랩):
 - `memnet`을 gRPC + mTLS 네트워크로 바꾼다. `Cluster::open`은 `RaftNetworkFactory`만 받으므로 그대로 쓴다.
 - `initialize`는 첫 노드에서 한 번만 부른다. 이미 초기화된 노드에서 부르면 오류가 난다.
+- `Cluster::shutdown`은 openraft 상태 머신 태스크가 redb 파일을 놓기 전에 돌아온다. 같은 프로세스에서 다시 열면(탈퇴 후 재가입 등) `DatabaseAlreadyOpen`이 날 수 있으니, 파일이 풀릴 때까지 기다리거나 다시 시도한다.

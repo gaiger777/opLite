@@ -212,7 +212,8 @@ impl Cluster {
     }
 
     /// 명령을 리더에 제안하고 커밋·적용될 때까지 기다린다. 성공하면 새 revision을 돌려준다.
-    pub async fn write(&self, command: Command) -> Result<u64, ClusterError> {
+    /// 상태 머신은 spec/status JSON이 `kind`와 맞는지 보지 않으므로 타입 있는 메서드로만 부른다.
+    pub(crate) async fn write(&self, command: Command) -> Result<u64, ClusterError> {
         let resp = tokio::time::timeout(self.write_timeout, self.raft.client_write(command))
             .await
             .map_err(|_| ClusterError::Timeout)??;

@@ -67,7 +67,7 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 
 | 크레이트 | 역할 | 공개 여부 |
 |---|---|---|
-| `opl-types` | 리소스 모델(VmSpec, NodeId 등), serde 스키마 | 공개 |
+| `opl-types` | 리소스 모델(VmSpec, VolumeSpec 등), serde 스키마 | 공개 |
 | `opl-qemu` | QMP 클라이언트 + QEMU 커맨드라인 생성기 | 공개 |
 | `opl-driver` | `Hypervisor`/`Storage`/`Network` 트레이트, Mock·QemuHvf·QemuKvm 구현 | 공개 |
 | `opl-cluster` | openraft 상태 머신, 리소스 저장소, watch 스트림 | 공개 |
