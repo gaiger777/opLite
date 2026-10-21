@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -23,6 +23,8 @@ struct MockState {
     vms: HashMap<Uuid, u32>,
     next_pid: u32,
     fail_next_start: Option<DriverError>,
+    /// 살아 있지만 QMP로 다룰 수 없는 VM
+    unresponsive: HashSet<Uuid>,
 }
 
 impl Default for MockHypervisor {
@@ -58,18 +60,34 @@ impl MockHypervisor {
         self.remove(id, EventKind::Crashed);
     }
 
+    /// 실행 중인 VM을 살아 있지만 QMP로 다룰 수 없는 VM으로 만들거나(true) 되돌린다(false).
+    /// 실제 드라이버처럼 조회에는 `unresponsive`로 드러나고, `start`와 `stop(Acpi)`는 다시 붙지
+    /// 못해 실패하며, `stop(Force)`는 프로세스를 죽이므로 종료 이벤트 없이 사라진다.
+    pub fn set_unresponsive(&self, id: Uuid, unresponsive: bool) {
+        let mut st = self.state.lock().unwrap();
+        if unresponsive {
+            st.unresponsive.insert(id);
+        } else {
+            st.unresponsive.remove(&id);
+        }
+    }
+
     fn remove(&self, id: Uuid, kind: EventKind) {
-        if self.state.lock().unwrap().vms.remove(&id).is_some() {
+        let mut st = self.state.lock().unwrap();
+        st.unresponsive.remove(&id);
+        if st.vms.remove(&id).is_some() {
+            drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
         }
     }
 
-    fn state_of(id: Uuid, pid: u32) -> ActualState {
-        ActualState {
-            id,
-            pid,
-            status: RuntimeStatus::Running,
-        }
+    fn state_of(st: &MockState, id: Uuid, pid: u32) -> ActualState {
+        let status = if st.unresponsive.contains(&id) {
+            RuntimeStatus::Other("unresponsive".into())
+        } else {
+            RuntimeStatus::Running
+        };
+        ActualState { id, pid, status }
     }
 }
 
@@ -80,6 +98,9 @@ impl Hypervisor for MockHypervisor {
             let mut st = self.state.lock().unwrap();
             // 실제 드라이버처럼 이미 실행 중이면 기동을 시도하지 않으므로 주입한 오류도 쓰지 않는다.
             if st.vms.contains_key(&vm.id) {
+                if st.unresponsive.contains(&vm.id) {
+                    return Err(DriverError::Timeout("reattach to running QEMU"));
+                }
                 return Ok(());
             }
             if let Some(err) = st.fail_next_start.take() {
@@ -97,6 +118,21 @@ impl Hypervisor for MockHypervisor {
     }
 
     async fn stop(&self, id: Uuid, mode: StopMode) -> Result<(), DriverError> {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.vms.contains_key(&id) && st.unresponsive.contains(&id) {
+                // 실제 드라이버는 다시 붙지 못한 VM에 ACPI 요청을 보낼 수 없고, 강제 종료는
+                // 프로세스를 죽이므로 종료 이벤트가 없다.
+                return match mode {
+                    StopMode::Acpi => Err(DriverError::Timeout("reattach to running QEMU")),
+                    StopMode::Force => {
+                        st.unresponsive.remove(&id);
+                        st.vms.remove(&id);
+                        Ok(())
+                    }
+                };
+            }
+        }
         match mode {
             // 실제 QEMU처럼 요청만 보낸다. 게스트는 무시할 수 있으므로 실제 종료는
             // 테스트가 `guest_shutdown`으로 일으킨다.
@@ -113,7 +149,7 @@ impl Hypervisor for MockHypervisor {
 
     async fn inspect(&self, id: Uuid) -> Result<Option<ActualState>, DriverError> {
         let st = self.state.lock().unwrap();
-        Ok(st.vms.get(&id).map(|&pid| Self::state_of(id, pid)))
+        Ok(st.vms.get(&id).map(|&pid| Self::state_of(&st, id, pid)))
     }
 
     async fn list(&self) -> Result<Vec<ActualState>, DriverError> {
@@ -121,7 +157,7 @@ impl Hypervisor for MockHypervisor {
         Ok(st
             .vms
             .iter()
-            .map(|(&id, &pid)| Self::state_of(id, pid))
+            .map(|(&id, &pid)| Self::state_of(&st, id, pid))
             .collect())
     }
 
@@ -251,6 +287,41 @@ mod tests {
                 guest_initiated: true
             }
         );
+    }
+
+    #[tokio::test]
+    async fn unresponsive_vm_cannot_be_controlled_but_can_be_killed() {
+        let hv = MockHypervisor::default();
+        let vm = spec();
+        hv.start(&vm).await.unwrap();
+        let pid = hv.inspect(vm.id).await.unwrap().unwrap().pid;
+        let mut rx = hv.subscribe();
+        hv.set_unresponsive(vm.id, true);
+
+        let unresponsive = ActualState {
+            id: vm.id,
+            pid,
+            status: RuntimeStatus::Other("unresponsive".into()),
+        };
+        assert_eq!(hv.inspect(vm.id).await.unwrap(), Some(unresponsive.clone()));
+        assert_eq!(hv.list().await.unwrap(), vec![unresponsive]);
+        assert!(matches!(hv.start(&vm).await, Err(DriverError::Timeout(_))));
+        assert!(matches!(
+            hv.stop(vm.id, StopMode::Acpi).await,
+            Err(DriverError::Timeout(_))
+        ));
+
+        // 다시 붙을 수 있게 되면 그대로 돌고 있다.
+        hv.set_unresponsive(vm.id, false);
+        hv.start(&vm).await.unwrap();
+        let st = hv.inspect(vm.id).await.unwrap().unwrap();
+        assert_eq!((st.pid, st.status), (pid, RuntimeStatus::Running));
+
+        // 강제 종료는 프로세스를 죽이므로 종료 이벤트가 없다.
+        hv.set_unresponsive(vm.id, true);
+        hv.stop(vm.id, StopMode::Force).await.unwrap();
+        assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
