@@ -21,6 +21,12 @@ use crate::watch::{WatchEvent, WatchHub};
 type Membership = StoredMembership<NodeId, openraft::BasicNode>;
 type Meta = SnapshotMeta<NodeId, openraft::BasicNode>;
 
+/// 스냅샷 본문의 머리. 본문 전체를 읽기 전에 형식 버전부터 확인한다.
+#[derive(Deserialize)]
+struct SnapshotHeader {
+    schema_version: u32,
+}
+
 /// 스냅샷 본문. 상태 머신의 리소스 전체를 담는다.
 #[derive(Serialize, Deserialize)]
 struct SnapshotData {
@@ -123,10 +129,18 @@ impl StateMachine {
         })
     }
 
+    /// 스냅샷을 저장한다. 이미 저장된 스냅샷이 같거나 더 새로우면 그대로 둔다.
+    /// openraft는 스냅샷 빌드를 별도 태스크에서 돌리므로, 느린 빌드가 끝나기 전에
+    /// 더 새 스냅샷이 설치될 수 있다.
     fn save_snapshot(&self, meta: &Meta, data: &[u8]) -> Result<(), StoreError> {
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(META)?;
+            if let Some(existing) = get_json::<Meta>(&table, KEY_SNAPSHOT_META)?
+                && existing.last_log_id >= meta.last_log_id
+            {
+                return Ok(());
+            }
             put_json(&mut table, KEY_SNAPSHOT_META, meta)?;
             table.insert(KEY_SNAPSHOT_DATA, data)?;
         }
@@ -152,12 +166,13 @@ impl StateMachine {
 
     /// 리소스 전체를 스냅샷 내용으로 바꾼다. 리소스, 적용 위치, 스냅샷을 한 트랜잭션에 기록한다.
     fn install(&self, meta: &Meta, data: Vec<u8>) -> Result<(), StoreError> {
-        let snapshot: SnapshotData = serde_json::from_slice(&data)?;
-        if snapshot.schema_version != SCHEMA_VERSION {
+        let header: SnapshotHeader = serde_json::from_slice(&data)?;
+        if header.schema_version != SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema {
-                found: snapshot.schema_version,
+                found: header.schema_version,
             });
         }
+        let snapshot: SnapshotData = serde_json::from_slice(&data)?;
         let txn = self.db.begin_write()?;
         {
             let mut objects = txn.open_table(OBJECTS)?;
@@ -341,5 +356,49 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
         self.current_snapshot()
             .map_err(|e| StorageIOError::read_snapshot(None, &e).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use openraft::CommittedLeaderId;
+
+    fn meta_at(index: u64) -> Meta {
+        Meta {
+            last_log_id: Some(LogId::new(
+                CommittedLeaderId::new(1, NodeId::from(1)),
+                index,
+            )),
+            last_membership: Membership::default(),
+            snapshot_id: format!("{index}"),
+        }
+    }
+
+    /// openraft는 스냅샷을 다른 태스크에서 만들므로, 느린 빌드가 그 사이 설치된
+    /// 더 새 스냅샷을 덮어쓰면 안 된다.
+    #[test]
+    fn older_snapshot_does_not_replace_newer_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sm = Store::open(&dir.path().join("db")).unwrap().state_machine();
+        sm.save_snapshot(&meta_at(10), b"new").unwrap();
+        sm.save_snapshot(&meta_at(5), b"old").unwrap();
+
+        let snap = sm.current_snapshot().unwrap().unwrap();
+        assert_eq!(snap.meta, meta_at(10));
+        assert_eq!(snap.snapshot.into_inner(), b"new");
+    }
+
+    #[test]
+    fn snapshot_with_newer_schema_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sm = Store::open(&dir.path().join("db")).unwrap().state_machine();
+        // 미래 형식은 본문 구조도 다를 수 있다. 헤더만 보고 거부해야 한다.
+        let data = br#"{"schema_version": 99, "objects": {"format": "v99"}}"#.to_vec();
+        assert!(matches!(
+            sm.install(&meta_at(3), data),
+            Err(StoreError::UnsupportedSchema { found: 99 })
+        ));
     }
 }
