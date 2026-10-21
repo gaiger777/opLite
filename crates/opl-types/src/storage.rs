@@ -10,6 +10,7 @@ pub type StoragePool = Resource<StoragePoolSpec, StoragePoolStatus>;
 pub type Volume = Resource<VolumeSpec, VolumeStatus>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct StoragePoolSpec {
     pub backend: PoolBackend,
@@ -27,13 +28,18 @@ impl ResourceSpec for StoragePoolSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case", tag = "kind", deny_unknown_fields)]
 pub enum PoolBackend {
     /// 로컬 디렉터리에 이미지 파일을 둔다.
-    Dir { path: PathBuf },
+    Dir {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(default)]
 pub struct StoragePoolStatus {
     pub total_bytes: Option<u64>,
@@ -41,6 +47,7 @@ pub struct StoragePoolStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct VolumeSpec {
     /// StoragePool 리소스 이름
@@ -54,12 +61,35 @@ impl ResourceSpec for VolumeSpec {
     type Status = VolumeStatus;
 }
 
+/// 가져올 원본 이미지 형식
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceFormat {
+    Vmdk,
+    Qcow2,
+    Raw,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(default)]
 pub struct VolumeStatus {
+    pub phase: VolumePhase,
     /// 실제로 디스크에 할당된 크기
     pub allocated_bytes: Option<u64>,
     pub attached_to: Option<Uuid>,
+}
+
+/// 볼륨 파일이 준비됐는지. VM은 준비된 볼륨만 붙일 수 있다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum VolumePhase {
+    /// 파일을 만들거나 가져오는 중
+    #[default]
+    Pending,
+    Ready,
 }
 
 #[cfg(test)]

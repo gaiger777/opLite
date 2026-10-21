@@ -2,19 +2,11 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{PoolBackend, StoragePoolSpec};
+use opl_types::storage::{PoolBackend, SourceFormat, StoragePoolSpec};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::DriverError;
-
-/// 가져올 원본 이미지 형식
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceFormat {
-    Vmdk,
-    Qcow2,
-    Raw,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VolumeInfo {

@@ -34,7 +34,7 @@ async fn create_get_update_delete_round_trip() {
 
     let status = VolumeStatus {
         allocated_bytes: Some(4096),
-        attached_to: None,
+        ..Default::default()
     };
     let rev3 = c.update_status::<VolumeSpec>(v.id, &status).await.unwrap();
     let got = c.get::<VolumeSpec>(v.id).unwrap().unwrap();

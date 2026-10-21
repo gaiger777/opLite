@@ -14,6 +14,7 @@ pub const MIN_MEMORY_MIB: u32 = 64;
 
 /// VM의 원하는 상태.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct VmSpec {
     pub cpu: CpuSpec,
@@ -86,6 +87,7 @@ pub enum ValidationError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CpuSpec {
     #[serde(default = "one")]
@@ -100,6 +102,7 @@ fn one() -> u16 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum CpuModel {
     /// 호스트 CPU를 그대로 노출한다. TCG에서는 max로 대체된다.
@@ -109,6 +112,7 @@ pub enum CpuModel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum Firmware {
     Bios,
@@ -117,6 +121,7 @@ pub enum Firmware {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum MachineType {
     /// x86_64 전용
@@ -126,6 +131,7 @@ pub enum MachineType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DiskSpec {
     /// Volume 리소스 이름
@@ -136,6 +142,7 @@ pub struct DiskSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum DiskBus {
     VirtioBlk,
@@ -144,6 +151,7 @@ pub enum DiskBus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct NicSpec {
     /// Network 리소스 이름
@@ -155,6 +163,7 @@ pub struct NicSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum NicModel {
     Virtio,
@@ -162,6 +171,7 @@ pub enum NicModel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum PowerState {
     Running,
@@ -170,6 +180,7 @@ pub enum PowerState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
     #[default]
@@ -179,6 +190,7 @@ pub enum RestartPolicy {
 
 /// VM의 실제 상태. reconciler만 기록한다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(default)]
 pub struct VmStatus {
     pub phase: VmPhase,
@@ -188,6 +200,7 @@ pub struct VmStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum VmPhase {
     #[default]
@@ -200,6 +213,7 @@ pub enum VmPhase {
 
 /// `52:54:00:12:34:56` 형식의 MAC 주소.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
 #[serde(try_from = "String", into = "String")]
 pub struct MacAddr(pub [u8; 6]);
 

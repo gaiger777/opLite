@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 /// 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Resource<S, T> {
     pub id: Uuid,
     pub name: String,
@@ -32,11 +33,16 @@ impl<S, T: Default> Resource<S, T> {
 
 /// 클러스터 저장소가 구분하는 리소스 종류.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
     Vm,
     StoragePool,
     Volume,
+    Node,
+    Task,
+    User,
+    ApiToken,
 }
 
 impl Kind {
@@ -45,9 +51,35 @@ impl Kind {
             Kind::Vm => "vm",
             Kind::StoragePool => "storage-pool",
             Kind::Volume => "volume",
+            Kind::Node => "node",
+            Kind::Task => "task",
+            Kind::User => "user",
+            Kind::ApiToken => "api-token",
         }
     }
 }
+
+/// 리소스 이름 규칙: DNS 레이블처럼 1~63자의 영문 소문자, 숫자, `-`이고 `-`로 시작하거나 끝나지 않는다.
+/// 저장소는 이름의 유일성만 보므로 API가 생성할 때 확인한다.
+pub fn validate_name(name: &str) -> Result<(), NameError> {
+    let ok = (1..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if ok {
+        Ok(())
+    } else {
+        Err(NameError(name.to_string()))
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "invalid name {0:?}: use 1-63 lowercase letters, digits and '-', not starting or ending with '-'"
+)]
+pub struct NameError(String);
 
 /// spec 타입과 리소스 종류, status 타입을 묶는다. 클러스터 저장소의 타입 있는 API가 쓴다.
 pub trait ResourceSpec: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {
@@ -77,8 +109,26 @@ mod tests {
 
     #[test]
     fn kind_serializes_as_its_str() {
-        for kind in [Kind::Vm, Kind::StoragePool, Kind::Volume] {
+        for kind in [
+            Kind::Vm,
+            Kind::StoragePool,
+            Kind::Volume,
+            Kind::Node,
+            Kind::Task,
+            Kind::User,
+            Kind::ApiToken,
+        ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+        }
+    }
+
+    #[test]
+    fn validates_names() {
+        for ok in ["a", "web-01", "0", &"a".repeat(63)] {
+            assert_eq!(validate_name(ok), Ok(()), "{ok}");
+        }
+        for bad in ["", "-a", "a-", "Web", "a_b", "a.b", "a b", &"a".repeat(64)] {
+            assert!(validate_name(bad).is_err(), "{bad}");
         }
     }
 

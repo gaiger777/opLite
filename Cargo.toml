@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/gaiger777/opLite"
 
@@ -27,3 +27,4 @@ tracing = "0.1.44"
 openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
 redb = "4.4.0"
 rustix = { version = "1.1.5", features = ["fs", "process"] }
+utoipa = { version = "6.0.0", features = ["uuid"] }

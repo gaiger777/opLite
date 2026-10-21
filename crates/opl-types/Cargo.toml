@@ -7,9 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# API 문서(OpenAPI) 스키마. opl-api가 켠다.
+openapi = ["dep:utoipa"]
+
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+utoipa = { workspace = true, optional = true }
 uuid.workspace = true
 
 [dev-dependencies]
