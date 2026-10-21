@@ -664,6 +664,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "opl-reconciler"
+version = "0.1.0"
+dependencies = [
+ "openraft",
+ "opl-cluster",
+ "opl-driver",
+ "opl-qemu",
+ "opl-types",
+ "redb",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "opl-types"
 version = "0.1.0"
 dependencies = [

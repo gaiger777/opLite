@@ -1,0 +1,27 @@
+[package]
+name = "opl-reconciler"
+description = "Reconciliation loop that drives VMs on a node toward their desired state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# 실제 QEMU로 opld 재시작 후 재연결을 확인하는 테스트. Apple Silicon Mac + brew install qemu가 필요하다.
+qemu-it = []
+
+[dependencies]
+opl-cluster.workspace = true
+opl-driver.workspace = true
+opl-types.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+openraft.workspace = true
+opl-qemu.workspace = true
+redb.workspace = true
+tempfile.workspace = true
