@@ -1,0 +1,37 @@
+[package]
+name = "opld"
+description = "opLite node daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# 실제 QEMU로 CLI부터 콘솔, kill -9 뒤 재연결까지 확인하는 E2E 테스트. Apple Silicon Mac + brew install qemu가 필요하다.
+qemu-it = []
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+openraft.workspace = true
+opl-api.workspace = true
+opl-cluster.workspace = true
+opl-driver.workspace = true
+opl-qemu.workspace = true
+opl-reconciler.workspace = true
+opl-types.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+oplctl.workspace = true
+reqwest.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
