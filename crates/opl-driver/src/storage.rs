@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_types::runtime::ImageFormat;
@@ -7,6 +8,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::DriverError;
+
+/// 올린 이미지를 검사하는 `qemu-img info`가 멈추면(이상한 extent 등) 무한정 기다리지 않는다.
+const INFO_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VolumeInfo {
@@ -181,6 +185,47 @@ fn src_fmt_name(format: SourceFormat) -> &'static str {
     }
 }
 
+/// `qemu-img info`가 다른 파일이나 연결을 열기 전에 헤더만 보고 거부한다.
+/// info는 보고하려고 VMDK extent와 qcow2 외부 데이터 파일을 실제로 연다.
+async fn check_source_header(src: &Path, src_format: SourceFormat) -> Result<(), DriverError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut header = Vec::with_capacity(80);
+    tokio::fs::File::open(src)
+        .await?
+        .take(80)
+        .read_to_end(&mut header)
+        .await?;
+    match src_format {
+        // 텍스트 디스크립터는 다른 파일만 가리킬 수 있다.
+        SourceFormat::Vmdk if header.starts_with(b"# Disk DescriptorFile") => {
+            Err(DriverError::InvalidSpec(
+                "descriptor-only VMDK cannot be imported; \
+                 upload a monolithicSparse or streamOptimized VMDK"
+                    .into(),
+            ))
+        }
+        // 헤더는 빅엔디언이다. 매직이 틀리면 qemu-img가 거부한다.
+        SourceFormat::Qcow2 if header.len() >= 16 && header.starts_with(b"QFI\xfb") => {
+            let be32 = |at: usize| u32::from_be_bytes(header[at..at + 4].try_into().unwrap());
+            let be64 = |at: usize| u64::from_be_bytes(header[at..at + 8].try_into().unwrap());
+            if be64(8) != 0 {
+                return Err(DriverError::InvalidSpec(
+                    "qcow2 image has a backing file".into(),
+                ));
+            }
+            // incompatible_features bit 2: 외부 데이터 파일 (version 3부터)
+            if be32(4) >= 3 && header.len() >= 80 && be64(72) & 4 != 0 {
+                return Err(DriverError::InvalidSpec(
+                    "qcow2 image has an external data file".into(),
+                ));
+            }
+            Ok(())
+        }
+        SourceFormat::Vmdk | SourceFormat::Qcow2 | SourceFormat::Raw => Ok(()),
+    }
+}
+
 /// `qemu-img info` 출력에서 이미지가 여는(열 수 있는) 파일 이름을 모두 모은다.
 fn referenced_files(v: &Value, out: &mut Vec<String>) {
     match v {
@@ -263,10 +308,13 @@ impl Storage for DirStorage {
         src_format: SourceFormat,
     ) -> Result<(), DriverError> {
         require_absolute(src)?;
+        check_source_header(src, src_format).await?;
         let src = path_str(src)?;
-        let out = self
-            .qemu_img(&["info", "--output=json", "-f", src_fmt_name(src_format), src])
-            .await?;
+        let args = ["info", "--output=json", "-f", src_fmt_name(src_format), src];
+        // 시간이 지나 future가 버려지면 kill_on_drop이 qemu-img를 끝낸다.
+        let out = tokio::time::timeout(INFO_TIMEOUT, self.qemu_img(&args))
+            .await
+            .map_err(|_| DriverError::Timeout("qemu-img info"))??;
         let json: Value = serde_json::from_slice(&out).map_err(|e| DriverError::ToolFailed {
             tool: "qemu-img",
             stderr: format!("unparseable info output: {e}"),
@@ -553,6 +601,48 @@ mod tests {
             Err(DriverError::InvalidSpec(_))
         ));
         assert!(pool_files(tmp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_source_header_is_rejected_before_running_tool() {
+        // 도구까지 가면 다른 오류(Io NotFound)가 난다.
+        let storage = DirStorage::new("/nonexistent/qemu-img");
+        let tmp = tempfile::tempdir().unwrap();
+        let file = |name: &str, mut bytes: Vec<u8>| {
+            bytes.resize(bytes.len().max(80), 0);
+            let path = tmp.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let qcow2 = |version: u32, backing: u64, incompatible: u64| {
+            let mut h = vec![0u8; 80];
+            h[..4].copy_from_slice(b"QFI\xfb");
+            h[4..8].copy_from_slice(&version.to_be_bytes());
+            h[8..16].copy_from_slice(&backing.to_be_bytes());
+            h[72..80].copy_from_slice(&incompatible.to_be_bytes());
+            h
+        };
+
+        let desc = file(
+            "desc.vmdk",
+            b"# Disk DescriptorFile\nversion=1\nRW 2048 FLAT \"/dev/zero\" 0\n".to_vec(),
+        );
+        let backing = file("backing.qcow2", qcow2(3, 512, 0));
+        let external = file("external.qcow2", qcow2(3, 0, 4));
+        for (path, format, reason) in [
+            (desc, SourceFormat::Vmdk, "descriptor"),
+            (backing, SourceFormat::Qcow2, "backing file"),
+            (external, SourceFormat::Qcow2, "external data file"),
+        ] {
+            let err = storage
+                .check_import_source(&path, format)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, DriverError::InvalidSpec(ref m) if m.contains(reason)),
+                "{reason}: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -150,7 +150,7 @@ async fn import_source_must_be_a_single_file() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, DriverError::InvalidSpec(ref m) if m.contains(raw_s)),
+        matches!(err, DriverError::InvalidSpec(ref m) if m.contains("descriptor")),
         "{err:?}"
     );
 

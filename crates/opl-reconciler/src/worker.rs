@@ -55,7 +55,8 @@ pub(crate) struct Worker {
     /// 요청의 결과인지 가린다. 요청을 취소했거나 원하는 상태가 다시 running으로 바뀌어도
     /// 게스트(또는 강제 종료)는 요청대로 꺼질 수 있으므로 `acpi_timeout` 동안 유효하다.
     stopped_by_us: Option<Instant>,
-    /// 다음 단계에서 ACPI 응답을 기다리지 않고 강제 종료한다. 원하는 상태가 stopped일 때만 쓴다.
+    /// 다음 단계에서 ACPI 응답을 기다리지 않고 강제 종료한다. 원하는 상태가 stopped일 때만 켜고,
+    /// 그 뒤 running으로 바뀌면 reconcile이 끈다.
     force_requested: bool,
     failures: FailureTracker,
     /// 백오프 중이면 이 시각까지 시작하지 않는다. status에 보일 이유를 함께 둔다.
@@ -137,7 +138,11 @@ impl Worker {
         };
         match trigger {
             Trigger::Event(kind) => self.on_event(&vm, kind),
-            Trigger::ForceStop => self.force_requested = true,
+            // running을 원할 때 온 명령은 버린다. 남겨 두면 나중의 종료가 ACPI 없이 강제 종료된다.
+            Trigger::ForceStop if vm.spec.power == PowerState::Stopped => {
+                self.force_requested = true
+            }
+            Trigger::ForceStop => {}
             Trigger::Sync => {}
         }
         if self.power_off.is_none() {

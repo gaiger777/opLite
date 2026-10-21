@@ -233,7 +233,7 @@ async fn force_stop_does_not_wait_for_acpi() {
 
 #[tokio::test]
 async fn force_stop_is_ignored_while_power_is_running() {
-    let env = Env::start().await;
+    let env = Env::start_with(|c| c.acpi_timeout = Duration::from_secs(60)).await;
     let vm = vm("web", env.node);
     env.create(&vm).await;
     let before = env.wait(vm.id, "running", running).await.status.pid;
@@ -244,6 +244,14 @@ async fn force_stop_is_ignored_while_power_is_running() {
 
     assert_eq!(env.pid(vm.id).await, before);
     assert_eq!(env.get(vm.id).status.phase, VmPhase::Running);
+
+    // 무시한 명령이 남아 있다가 뒤이은 종료를 강제 종료로 바꾸지 않는다.
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopping", |v| v.status.phase == VmPhase::Stopping)
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(env.get(vm.id).status.phase, VmPhase::Stopping);
+    assert_eq!(env.pid(vm.id).await, before, "VM was force-stopped");
 }
 
 #[tokio::test]

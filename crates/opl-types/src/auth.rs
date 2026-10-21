@@ -34,6 +34,7 @@ impl ResourceSpec for UserSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct UserStatus {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,4 +52,5 @@ impl ResourceSpec for ApiTokenSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ApiTokenStatus {}
