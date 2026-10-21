@@ -14,6 +14,7 @@ brew install qemu                                                   # macOS 통�
 cargo test -p opl-driver --features storage-it --test dir_storage   # qemu-img 스토리지 테스트
 cargo test -p opl-qemu --features qemu-it --test qemu_boot          # 실제 QEMU 기동 (Apple Silicon)
 cargo test -p opl-driver --features qemu-it --test qemu_driver      # 드라이버: 기동, 재부착, 크래시 감지
+cargo test -p opl-reconciler --features qemu-it --test qemu_restart # reconciler: opld 재시작 후 재연결
 ```
 
 ## 문서
