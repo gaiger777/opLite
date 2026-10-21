@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Env, vm};
-use opl_driver::DriverError;
+use opl_driver::{DriverError, Hypervisor, StopMode};
 use opl_types::vm::{DiskBus, DiskSpec, PowerState, RestartPolicy, VmPhase, VmStatus};
 use uuid::Uuid;
 
@@ -141,6 +141,74 @@ async fn new_stop_after_cancelled_stop_sends_acpi_again() {
         .wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
         .await;
     assert_eq!(got.status.last_error, None);
+}
+
+#[tokio::test]
+async fn unresponsive_vm_is_forced_off_after_acpi_timeout() {
+    let env = Env::start().await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    // QMP로 다룰 수 없으니 ACPI 요청은 실패한다. 그래도 acpi_timeout 뒤 강제 종료한다.
+    env.hv.set_unresponsive(vm.id, true);
+    env.set_power(vm.id, PowerState::Stopped).await;
+    let got = env
+        .wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    assert_eq!(got.status.pid, None);
+    assert_eq!(env.pid(vm.id).await, None);
+}
+
+#[tokio::test]
+async fn unresponsive_vm_is_reattached_and_reported() {
+    // 응답하지 않게 되어도 이벤트는 없으므로 재동기화로 알아챈다.
+    let env = Env::start_with(|c| c.resync_interval = Duration::from_millis(200)).await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    let pid = env.wait(vm.id, "running", running).await.status.pid;
+
+    env.hv.set_unresponsive(vm.id, true);
+    let got = env
+        .wait(vm.id, "reported unresponsive", |v| {
+            v.status
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("unresponsive"))
+        })
+        .await;
+    // 끄거나 다시 띄우지 않는다.
+    assert_eq!(got.status.phase, VmPhase::Running);
+    assert_eq!(got.status.pid, pid);
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(env.pid(vm.id).await, pid);
+
+    // 다시 붙으면 오류를 지운다.
+    env.hv.set_unresponsive(vm.id, false);
+    let got = env
+        .wait(vm.id, "recovered", |v| v.status.last_error.is_none())
+        .await;
+    assert_eq!(got.status.phase, VmPhase::Running);
+    assert_eq!(got.status.pid, pid);
+    assert_eq!(env.pid(vm.id).await, pid);
+}
+
+#[tokio::test]
+async fn host_kill_does_not_turn_power_off() {
+    let env = Env::start().await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    let before = env.wait(vm.id, "running", running).await.status.pid;
+
+    // 호스트의 SIGTERM처럼 우리가 요청하지 않은, 게스트 밖에서 일어난 종료
+    env.hv.stop(vm.id, StopMode::Force).await.unwrap();
+
+    let got = env
+        .wait(vm.id, "restarted", |v| running(v) && v.status.pid != before)
+        .await;
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(got.status.last_error, None);
+    assert_eq!(env.pid(vm.id).await, got.status.pid);
 }
 
 #[tokio::test]

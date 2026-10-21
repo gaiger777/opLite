@@ -15,7 +15,9 @@ use crate::resolve::{ResolveError, runtime_spec};
 
 /// 실행 중이던 VM이 사라졌을 때 그 이유를 알리는 종료 이벤트를 기다리는 시간.
 /// 이벤트보다 재동기화가 먼저 오면, 게스트가 스스로 끈 VM을 다시 켰다가 끄게 된다.
-const EVENT_GRACE: Duration = Duration::from_secs(1);
+/// QEMU 드라이버는 QMP 연결이 끊긴 뒤 프로세스가 끝나기를 최대 5초(`EXIT_GRACE`) 기다린 다음에
+/// 크래시를 알리므로 그보다 길게 잡는다. 짧으면 느리게 끝난 크래시를 두 번 세게 된다.
+const EVENT_GRACE: Duration = Duration::from_secs(6);
 
 /// 작업자를 깨우는 이유.
 #[derive(Debug, Clone, Copy)]
@@ -168,8 +170,15 @@ impl Worker {
             // 강제 종료의 결과로 Crashed가 와도 크래시로 보지 않는다.
             _ if requested => {}
             // 게스트가 스스로 꺼졌다(설계 5.3). `guest_initiated`는 opld가 요청한 ACPI 종료에서도
-            // true이므로 보지 않고, 우리가 요청했는지로 가린다.
-            EventKind::Stopped { .. } => self.power_off = Some(None),
+            // true이므로 우리가 요청했는지로 먼저 가린다.
+            EventKind::Stopped {
+                guest_initiated: true,
+            } => self.power_off = Some(None),
+            // 우리가 요청하지 않았고 게스트의 결정도 아니다(호스트의 SIGTERM 등). 원하는 상태는
+            // 그대로 두므로 실패로 세지 않고 다시 시작한다.
+            EventKind::Stopped {
+                guest_initiated: false,
+            } => {}
             EventKind::Crashed => match vm.spec.restart {
                 RestartPolicy::Never => self.power_off = Some(Some("VM crashed".into())),
                 RestartPolicy::OnFailure => self.record_failure("VM crashed".into()),
@@ -205,16 +214,18 @@ impl Worker {
                 // 진행 중인 종료 요청을 취소한다. 게스트가 이미 받은 요청대로 꺼지면
                 // `stopped_by_us`로 가려 다시 시작한다.
                 self.stop_requested = None;
-                if state.status == RuntimeStatus::Paused {
-                    // opld가 기동 도중(cont 전)에 죽었다. start()가 cont를 보낸다.
-                    if !self.start(vm).await?
-                        && let Some((at, _)) = self.backoff
-                    {
-                        self.wake(at);
-                    }
-                }
                 status.phase = VmPhase::Running;
                 status.pid = Some(state.pid);
+                status.last_error = None;
+                if state.status != RuntimeStatus::Running {
+                    // opld가 기동 도중(cont 전)에 죽었거나 QMP로 다룰 수 없다. start()가 cont를
+                    // 보내거나 다시 붙는다. 실패해도 돌고 있는 VM이므로 끄거나 실패로 세지 않는다.
+                    if let Err(e) = self.reattach(vm).await {
+                        tracing::warn!(vm = %self.id, error = %e, "VM is unresponsive; will retry");
+                        status.last_error = Some(format!("VM is unresponsive: {e}"));
+                        self.wake(now + self.config.retry_interval);
+                    }
+                }
             }
             // 방금까지 돌던 VM이 사라졌다. 왜 꺼졌는지(게스트 종료, 크래시) 이벤트로 안 뒤에 움직인다.
             // 기다려도 오지 않으면(이벤트 유실) 원하는 상태대로 다시 시작한다.
@@ -260,10 +271,13 @@ impl Worker {
                 self.backoff = None;
                 match self.stop_requested {
                     None => {
-                        self.hv.stop(self.id, StopMode::Acpi).await?;
+                        // 요청이 실패해도(QMP로 다룰 수 없는 VM) acpi_timeout 뒤 강제 종료한다.
                         self.stop_requested = Some(now);
                         self.stopped_by_us = Some(now);
                         self.wake(now + self.config.acpi_timeout);
+                        if let Err(e) = self.hv.stop(self.id, StopMode::Acpi).await {
+                            tracing::warn!(vm = %self.id, error = %e, "ACPI shutdown request failed; will force after timeout");
+                        }
                     }
                     Some(at) if now >= at + self.config.acpi_timeout => {
                         tracing::warn!(vm = %self.id, "guest ignored ACPI shutdown; forcing");
@@ -316,6 +330,12 @@ impl Worker {
                 Ok(false)
             }
         }
+    }
+
+    /// 살아 있는 VM에 다시 붙거나 이어서 실행한다(`start`는 멱등이다). 참조 해석 오류도 돌려준다.
+    async fn reattach(&self, vm: &Vm) -> Result<(), String> {
+        let spec = runtime_spec(&self.cluster, vm, self.config.node).map_err(|e| e.to_string())?;
+        self.hv.start(&spec).await.map_err(|e| e.to_string())
     }
 
     /// spec.power를 stopped로 바꾸고 status를 기록한다. 둘 다 성공해야 끝난다.

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use opl_cluster::watch::{Watch, WatchError, WatchEvent};
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::{DriverError, Hypervisor};
+use opl_driver::Hypervisor;
 use opl_types::resource::Kind;
 use opl_types::vm::VmSpec;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -51,8 +51,6 @@ enum SyncError {
     Cluster(#[from] ClusterError),
     #[error(transparent)]
     Watch(#[from] WatchError),
-    #[error(transparent)]
-    Driver(#[from] DriverError),
 }
 
 struct WorkerHandle {
@@ -143,10 +141,16 @@ impl Dispatcher {
         for &id in &mine {
             self.sync(id);
         }
-        for state in self.hv.list().await? {
-            if !mine.contains(&state.id) {
-                tracing::warn!(vm = %state.id, "VM is running on this node but not assigned to it; leaving it alone");
+        // 경고를 남기려는 것뿐이므로 실패해도 동기화는 이어 간다.
+        match self.hv.list().await {
+            Ok(states) => {
+                for state in states {
+                    if !mine.contains(&state.id) {
+                        tracing::warn!(vm = %state.id, "VM is running on this node but not assigned to it; leaving it alone");
+                    }
+                }
             }
+            Err(e) => tracing::warn!(error = %e, "cannot list VMs on this node"),
         }
         Ok(self.cluster.watch(revision)?)
     }
