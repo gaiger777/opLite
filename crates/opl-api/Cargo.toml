@@ -1,0 +1,39 @@
+[package]
+name = "opl-api"
+description = "REST API, tasks and authentication for opLite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# qemu-img로 볼륨을 만드는 API 테스트 (macOS: brew install qemu, Debian/Ubuntu: apt install qemu-utils)
+storage-it = []
+
+[dependencies]
+argon2.workspace = true
+axum.workspace = true
+fs4.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+opl-cluster.workspace = true
+opl-driver.workspace = true
+opl-reconciler.workspace = true
+opl-types = { workspace = true, features = ["openapi"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
+utoipa-axum.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+openraft.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+tokio-tungstenite.workspace = true

@@ -14,10 +14,12 @@ opl-types = { path = "crates/opl-types" }
 opl-qemu = { path = "crates/opl-qemu" }
 opl-cluster = { path = "crates/opl-cluster" }
 opl-driver = { path = "crates/opl-driver" }
+opl-reconciler = { path = "crates/opl-reconciler" }
+opl-api = { path = "crates/opl-api" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "fs", "signal"] }
 uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 insta = "1.49.0"
 tempfile = "3.27.0"
@@ -28,3 +30,12 @@ openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
 redb = "4.4.0"
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 utoipa = { version = "6.0.0", features = ["uuid"] }
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+argon2 = "0.6.0"
+sha2 = "0.11.1"
+getrandom = "0.4.3"
+hex = "0.4.3"
+futures-util = "0.3.34"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "query"] }
+tokio-tungstenite = "0.29.0"
+utoipa-axum = "0.3.0"
