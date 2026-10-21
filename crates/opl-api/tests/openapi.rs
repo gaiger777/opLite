@@ -10,11 +10,6 @@ async fn openapi_document_is_served_without_login() {
     let env = Env::start().await;
     let (status, doc) = env.anonymous().get("/openapi.json").await;
     assert_eq!(status, StatusCode::OK);
-    std::fs::write(
-        "/tmp/opl-openapi.json",
-        serde_json::to_string_pretty(&doc).unwrap(),
-    )
-    .unwrap();
     let paths = doc["paths"].as_object().unwrap();
     for path in [
         "/auth/login",
