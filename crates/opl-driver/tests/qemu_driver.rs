@@ -230,6 +230,11 @@ async fn force_stop_kills_unresponsive_qemu() {
     let _guard = KillOnDrop(pid);
     let mut rx = hv.subscribe();
     assert!(signal("-STOP", pid));
+    // QMP에 답하지 않아도 살아 있는 VM으로 드러난다.
+    assert_eq!(
+        hv.inspect(vm.id).await.unwrap(),
+        Some(unresponsive(vm.id, pid))
+    );
 
     tokio::time::timeout(Duration::from_secs(30), hv.stop(vm.id, StopMode::Force))
         .await

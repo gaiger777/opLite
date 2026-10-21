@@ -363,7 +363,18 @@ impl Hypervisor for QemuHypervisor {
     }
 
     async fn inspect(&self, id: Uuid) -> Result<Option<ActualState>, DriverError> {
-        self.query_state(id).await
+        match self.query_state(id).await {
+            // 멈춘 QEMU도 list()처럼 살아 있는 VM으로 드러내야 reconciler가 강제 종료로 넘어갈 수 있다.
+            Err(DriverError::Timeout(what)) => match self.handle(id) {
+                Some(handle) => Ok(Some(ActualState {
+                    id,
+                    pid: handle.pid,
+                    status: RuntimeStatus::Other("unresponsive".into()),
+                })),
+                None => Err(DriverError::Timeout(what)),
+            },
+            other => other,
+        }
     }
 
     async fn list(&self) -> Result<Vec<ActualState>, DriverError> {
