@@ -109,10 +109,10 @@ struct Resource<S, T> {
 | `Node` | 이름, 주소, 유지보수 모드 | 온라인 여부, CPU/메모리 용량, 하이퍼바이저 종류와 기능 |
 | `Vm` | vCPU, 메모리, 펌웨어(bios/uefi), 머신 타입, 디스크·NIC, `power`, `node`(선택), `restart` 정책 | 실제 전원 상태, 실행 노드, QEMU PID, 오류 조건 |
 | `StoragePool` | 종류(`dir`), 경로, 사용할 노드, `shared: bool` | 용량, 사용량 |
-| `Volume` | 소속 풀, 크기, 형식(qcow2/raw) | 할당 크기, 연결된 VM |
+| `Volume` | 소속 풀, 크기, 형식(qcow2/raw) | 준비 상태(Pending/Ready), 할당 크기 |
 | `Network` | 종류(`user`/`bridge`), 브리지 이름, VLAN 태그 | — |
-| `Task` | 종류, 대상 리소스 | 상태(Pending/Running/Succeeded/Failed), 진행률, 로그 위치 |
-| `User`, `ApiToken` | 사용자 이름, 비밀번호 해시(argon2), 토큰 해시, 역할 | 마지막 사용 시각 |
+| `Task` | 작업 종류, 대상 리소스, 실행 노드 | 상태(Pending/Running/Succeeded/Failed), 오류 |
+| `User`, `ApiToken` | 사용자 이름, 비밀번호 해시(argon2), 역할 / 주인, 토큰 비밀 값의 SHA-256 | — |
 
 `Vm` spec 예시:
 
@@ -138,15 +138,16 @@ spec:
 
 ## 4. API
 
-- 경로는 `/api/v1/{resource}`이며, 목록·조회·생성·수정·삭제를 제공한다.
+- 경로는 `/api/v1/{resource}`이며, 목록·조회·생성·수정·삭제를 제공한다. 경로의 `{id}` 자리에는 id나 이름을 쓸 수 있다(UUID 모양의 이름은 받지 않는다). 목록은 `{revision, items}`를 돌려준다.
 - 동작은 `POST /api/v1/vms/{id}/actions/{start|stop|reboot}`이다. 응답은 `202 Accepted`와 `Task`다.
-  - `start`/`stop`은 `spec.power`를 바꾸는 것뿐이다.
-  - `stop?mode=force`와 `reboot`은 일회성 명령이다. Task로 대상 노드에 전달한다.
-- 감시: `GET /api/v1/watch?kinds=vm,task` (WebSocket). Raft 커밋 스트림을 구독한다. 연결이 끊긴 뒤에는 `since=<revision>`으로 이어 받는다.
-- 콘솔: `GET /api/v1/vms/{id}/console` (WebSocket). 실행 노드의 QEMU VNC로 프록시한다. 다른 노드에서 요청하면 노드 간 gRPC로 중계한다.
-- OpenAPI 스펙은 `utoipa`로 코드에서 생성한다.
-- 인증: 로컬 사용자(세션 쿠키)와 API 토큰(Bearer)을 지원한다. 모든 핸들러는 `Authorizer::check(principal, action, resource)`를 거친다. 1차 구현은 `admin`/`operator`/`viewer` 고정 역할이다.
-- 오류 응답은 `{ "code": "...", "message": "...", "details": {...} }` 형식으로 통일한다. Raft 과반수가 없으면 `503 cluster_no_quorum`을 반환한다.
+  - `start`/`stop`은 `spec.power`를 바꾸고, 그 결과를 지켜볼 Task를 만든다. 대상 노드의 Task 실행기가 VM이 원하는 상태에 도달하면 Task를 끝낸다.
+  - `stop?mode=force`는 reconciler의 VM별 작업자 큐로 강제 종료를 보낸다. `reboot`은 원하는 상태를 stopped로 바꿨다가 꺼지면 running으로 되돌린다. 그 사이 같은 VM에 새 요청이 오면 그것을 따른다.
+- 볼륨 생성·삭제와 이미지 가져오기(`POST /api/v1/volumes/import`, 본문이 이미지)도 Task다. 파일이 준비되기 전의 볼륨은 VM에 붙일 수 없다.
+- 감시: `GET /api/v1/watch?kinds=vm,task&since=<revision>` (WebSocket). 목록의 revision 다음 변경부터 받는다. 이어 받을 수 없으면 오류 메시지를 보내고 닫으며, 클라이언트는 목록을 다시 읽는다. 사용자와 토큰은 감시할 수 없다.
+- 콘솔: `GET /api/v1/vms/{id}/console` (WebSocket). 실행 노드의 QEMU VNC로 프록시한다. 다른 노드에서 요청하면 노드 간 gRPC로 중계한다(M6).
+- OpenAPI 스펙은 `utoipa`로 코드에서 생성해 `GET /api/v1/openapi.json`으로 내보낸다. 라우터와 같은 정의에서 만든다.
+- 인증: 로컬 사용자(세션 쿠키, 웹 UI용)와 API 토큰(Bearer, CLI용)을 지원한다. 토큰은 `opl_<id>_<비밀 값>`이고 비밀 값의 SHA-256만 저장한다. 쿠키로 인증한 요청은 `Origin`이 서버와 같아야 한다. 자기 비밀번호를 바꿀 때는 현재 비밀번호가 필요하고, 바꾸면 그 사용자의 세션이 끝난다. 모든 핸들러는 `Authorizer::check(principal, action, resource)`를 거친다. 1차 구현은 `admin`/`operator`/`viewer` 고정 역할이다.
+- 오류 응답은 `{ "code": "...", "message": "...", "details": {...} }` 형식으로 통일한다. Raft 과반수가 없으면 `503 cluster_no_quorum`, revision이 다르면 `412 revision_mismatch`, 이름이 겹치면 `409 name_taken`을 반환한다.
 
 ## 5. VM 라이프사이클
 
@@ -155,13 +156,15 @@ spec:
 ```
 클라이언트 ──POST /vms/web-01/actions/start──▶ opl-api (임의의 노드)
   1. 인증·권한 확인 → spec.power = running, node가 비어 있으면 스케줄러가 선택
-  2. Raft에 제안 → 과반수 커밋 → Task(Pending) 생성 → 202 + task_id
+  2. Raft에 제안 → 과반수 커밋 → Task(Pending, node = 대상 노드) 생성 → 202 + task
                                   │ 커밋 스트림
                                   ▼
 대상 노드의 reconciler
   3. desired(running) ≠ actual(stopped) → Hypervisor::start
-  4. 커맨드라인 생성 → systemd scope로 QEMU 실행(-S) → QMP 연결 → qmp_capabilities → cont
-  5. status(running, pid)를 Raft에 기록 → Task Succeeded
+  4. 커맨드라인 생성 → QEMU 실행(-S, -daemonize) → QMP 연결 → qmp_capabilities → cont
+  5. status(running, pid)를 Raft에 기록
+대상 노드의 Task 실행기
+  6. VM의 power와 phase가 모두 running이 되면 Task Succeeded (reconciler가 포기하면 Failed)
 ```
 
 ### 5.2 드라이버 트레이트
@@ -252,6 +255,7 @@ node2$ oplctl cluster join 'opl-join://…'
 - 노드 간 통신은 모두 mTLS(rustls)를 쓴다. 외부 API(8006)는 기본적으로 클러스터 CA 인증서를 쓰고, 사용자 인증서로 교체할 수 있다.
 - `oplctl cluster leave`(정상 탈퇴)와 `oplctl cluster remove-node --force`(죽은 노드 제거)를 지원한다. 멤버십 변경은 openraft의 joint consensus로 처리한다.
 - 2노드 클러스터는 생성할 수 있지만 경고를 표시한다. 위트니스는 하위 프로젝트 5에서 다룬다.
+- M5까지는 `opld`가 첫 시작에서 1인 클러스터를 만들고, 사용자가 없으면 `admin`을 만들어 비밀번호를 `{data_dir}/initial-admin-password`(0600)에 남긴다. API는 루프백 HTTP로만 연다. `cluster init`과 HTTPS가 생기면(M6) 그쪽으로 옮긴다.
 
 ## 9. 범위 밖 (1차)
 
@@ -265,6 +269,7 @@ HA와 펜싱, 라이브 마이그레이션, 스냅샷과 백업, 공유 스토�
 | 컴포넌트 | reconciler + Mock 드라이버: 이벤트 누락·중복·순서 바뀜 | tokio 테스트, 짧게 줄인 시간 설정 | macOS, CI |
 | 클러스터 | 한 프로세스 안의 3노드(인메모리 네트워크), 리더 장애, 네트워크 분할 | openraft 테스트 하네스 | macOS, CI |
 | 통합 | 실제 QEMU: 기동, QMP, 종료, opld 재시작 후 재연결 | `--features qemu-it` | macOS(hvf), Linux |
+| E2E | oplctl로 VM 생성 → 콘솔 → opld kill -9 → 재연결 (opld 프로세스 + oplctl 라이브러리) | `--features qemu-it` | macOS(hvf) (M5) |
 | E2E | oplctl로 클러스터 구성 → VM 생성 → 콘솔 → 노드 제거 | 셸 스크립트 + 소형 게스트 이미지 | Linux (M7) |
 
 반드시 회귀 테스트로 고정할 불변식:
