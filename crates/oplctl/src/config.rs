@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 pub struct CliConfig {
     pub server: Option<String>,
     pub token: Option<String>,
+    /// 서버의 클러스터 CA 인증서(PEM). HTTPS 서버는 이 CA로만 확인한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem: Option<String>,
 }
 
 pub fn default_path() -> PathBuf {
@@ -63,6 +66,7 @@ mod tests {
         let config = CliConfig {
             server: Some("http://127.0.0.1:8006".into()),
             token: Some("opl_x_y".into()),
+            ca_pem: Some("CA".into()),
         };
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{}").unwrap();

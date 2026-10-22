@@ -11,12 +11,16 @@ repository.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 reqwest.workspace = true
 rpassword.workspace = true
+native-tls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
+tokio-tungstenite = { workspace = true, features = ["native-tls"] }
 tokio-util.workspace = true
 uuid.workspace = true
 

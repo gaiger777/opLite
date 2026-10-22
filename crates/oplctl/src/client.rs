@@ -1,26 +1,36 @@
 //! opLite REST API 클라이언트.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde_json::Value;
 
+/// Task가 이보다 오래 끝나지 않으면 기다리기를 그만둔다. Task 실행기의 제한 시간(10분)보다 길다.
+const TASK_WAIT: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Clone)]
 pub struct Client {
     pub base: String,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     pub token: Option<String>,
+    /// 서버의 클러스터 CA(PEM). 있으면 서버 인증서를 이 CA로만 확인한다(콘솔 WebSocket도).
+    pub ca_pem: Option<String>,
 }
 
 impl Client {
-    pub fn new(base: &str, token: Option<String>) -> Self {
-        Self {
-            base: base.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
-            token,
+    pub fn new(base: &str, token: Option<String>, ca_pem: Option<String>) -> anyhow::Result<Self> {
+        let mut http = reqwest::Client::builder();
+        if let Some(pem) = &ca_pem {
+            http = http.tls_certs_only([reqwest::Certificate::from_pem(pem.as_bytes())?]);
         }
+        Ok(Self {
+            base: base.trim_end_matches('/').to_string(),
+            http: http.build()?,
+            token,
+            ca_pem,
+        })
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -99,6 +109,7 @@ impl Client {
     /// Task가 끝날 때까지 기다린다. 실패했으면 그 오류를 돌려준다.
     pub async fn wait_task(&self, task: &Value) -> anyhow::Result<Value> {
         let id = task["id"].as_str().context("response has no task id")?;
+        let deadline = Instant::now() + TASK_WAIT;
         loop {
             let task = self.get(&format!("/tasks/{id}")).await?;
             match task["status"]["state"].as_str() {
@@ -107,8 +118,61 @@ impl Client {
                     "task {id} failed: {}",
                     task["status"]["error"].as_str().unwrap_or("unknown error")
                 ),
+                state if Instant::now() > deadline => bail!(
+                    "task {id} did not finish in {} minutes (state: {}); is opld running on node {}?",
+                    TASK_WAIT.as_secs() / 60,
+                    state.unwrap_or("unknown"),
+                    task["spec"]["node"].as_str().unwrap_or("?")
+                ),
                 _ => tokio::time::sleep(Duration::from_millis(200)).await,
             }
         }
     }
+}
+
+/// 서버의 CA 인증서(PEM)를 인증서 검증 없이 받는다. 받는 쪽은 지문을 확인해야 한다.
+pub async fn fetch_ca(server: &str) -> anyhow::Result<String> {
+    let http = reqwest::Client::builder()
+        .tls_danger_accept_invalid_certs(true)
+        .build()?;
+    let url = format!("{}/api/v1/cluster/ca", server.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("cannot reach {server}"))?;
+    if !resp.status().is_success() {
+        bail!(
+            "cannot read the cluster CA from {server}: {}",
+            resp.status()
+        );
+    }
+    Ok(resp.text().await?)
+}
+
+/// 인증서(PEM)의 SHA-256 지문(`sha256:<16진수>`)
+pub fn fingerprint(pem: &str) -> anyhow::Result<String> {
+    use rustls_pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
+    use sha2::{Digest, Sha256};
+    let der = CertificateDer::from_pem_slice(pem.as_bytes())
+        .map_err(|e| anyhow::anyhow!("invalid certificate: {e}"))?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(&der))))
+}
+
+/// 이 기계의 opld 제어 소켓으로 보내는 요청(`oplctl cluster init|join|leave`)
+pub async fn local(socket: &Path, path: &str, body: &Value) -> anyhow::Result<Value> {
+    let http = reqwest::Client::builder().unix_socket(socket).build()?;
+    let resp = http
+        .post(format!("http://opld/v1{path}"))
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("cannot reach opld at {}; is it running?", socket.display()))?;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("{}", body["message"].as_str().unwrap_or("request failed"));
+    }
+    Ok(body)
 }

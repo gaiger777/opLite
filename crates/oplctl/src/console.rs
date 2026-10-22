@@ -4,6 +4,7 @@ use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -23,7 +24,12 @@ pub async fn serve(client: Client, vm: String, listener: TcpListener) -> anyhow:
     }
 }
 
-async fn bridge(client: &Client, vm: &str, mut tcp: TcpStream) -> anyhow::Result<()> {
+/// API의 콘솔 WebSocket을 연다. 저장한 클러스터 CA가 있으면 서버를 그 CA로만 확인한다.
+async fn open(
+    client: &Client,
+    vm: &str,
+) -> anyhow::Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>>
+{
     let url = client
         .url(&format!("/vms/{vm}/console"))
         .replacen("http", "ws", 1);
@@ -32,9 +38,23 @@ async fn bridge(client: &Client, vm: &str, mut tcp: TcpStream) -> anyhow::Result
         req.headers_mut()
             .insert("authorization", format!("Bearer {token}").parse()?);
     }
-    let (ws, _) = tokio_tungstenite::connect_async(req)
+    let connector = match &client.ca_pem {
+        Some(pem) => Some(Connector::NativeTls(
+            native_tls::TlsConnector::builder()
+                .add_root_certificate(native_tls::Certificate::from_pem(pem.as_bytes())?)
+                .disable_built_in_roots(true)
+                .build()?,
+        )),
+        None => None,
+    };
+    let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(req, None, false, connector)
         .await
         .context("cannot open console")?;
+    Ok(ws)
+}
+
+async fn bridge(client: &Client, vm: &str, mut tcp: TcpStream) -> anyhow::Result<()> {
+    let ws = open(client, vm).await?;
     let (mut sink, mut stream) = ws.split();
     let mut buf = vec![0u8; 64 * 1024];
     loop {

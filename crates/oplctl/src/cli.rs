@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use crate::client::Client;
+use crate::client::{Client, fetch_ca, fingerprint, local};
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
 
@@ -40,6 +40,11 @@ enum Cmd {
     Login(LoginArgs),
     /// 저장한 API 토큰을 지운다(서버에서도).
     Logout,
+    /// 클러스터 만들기, 노드 합류와 탈퇴, 상태
+    Cluster {
+        #[command(subcommand)]
+        cmd: ClusterCmd,
+    },
     Node {
         #[command(subcommand)]
         cmd: NodeCmd,
@@ -77,6 +82,56 @@ struct LoginArgs {
     /// 비밀번호가 든 파일. 없으면 터미널에서 묻는다.
     #[arg(long)]
     password_file: Option<PathBuf>,
+    /// HTTPS 서버의 클러스터 CA 지문(`sha256:...`). 처음 로그인할 때 필요하다.
+    /// `oplctl cluster init`의 출력이나 다른 노드의 `oplctl cluster status`에서 확인한다.
+    #[arg(long)]
+    ca_fingerprint: Option<String>,
+}
+
+/// 이 기계의 opld에 제어 소켓으로 보내는 명령의 공통 인자
+#[derive(Args)]
+struct LocalArgs {
+    /// opld 제어 소켓
+    #[arg(long, env = "OPL_SOCKET", default_value = "/run/opl/opld.sock")]
+    socket: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum ClusterCmd {
+    /// 이 노드 하나로 새 클러스터를 만든다. 관리자 비밀번호와 다음 노드의 조인 URL을 출력한다.
+    Init {
+        /// 클러스터 이름
+        #[arg(long)]
+        name: String,
+        #[command(flatten)]
+        local: LocalArgs,
+    },
+    /// 이 노드를 조인 URL의 클러스터에 더한다.
+    Join {
+        url: String,
+        #[command(flatten)]
+        local: LocalArgs,
+    },
+    /// 이 노드를 클러스터에서 뺀다. 이 노드에 배정된 VM이 없어야 한다.
+    Leave {
+        #[command(flatten)]
+        local: LocalArgs,
+    },
+    /// 클러스터 이름, CA 지문, 멤버
+    Status,
+    /// 새 노드를 더할 조인 URL을 만든다. 한 번만 쓸 수 있다.
+    JoinToken {
+        /// 유효 시간(초)
+        #[arg(long, default_value_t = 3600)]
+        ttl: u64,
+    },
+    /// 죽은 노드를 클러스터에서 뺀다. 되돌릴 수 없다.
+    RemoveNode {
+        node: String,
+        /// 확인
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -323,28 +378,44 @@ where
 
     if let Cmd::Login(args) = &cli.cmd {
         let server = server.context("--server is required for the first login")?;
-        let token = login(&server, args).await?;
+        let same_server = config.server.as_deref().map(|s| s.trim_end_matches('/'))
+            == Some(server.trim_end_matches('/'));
+        let ca_pem = server_ca(
+            &server,
+            args,
+            same_server.then(|| config.ca_pem.clone()).flatten(),
+        )
+        .await?;
+        let token = login(&server, args, ca_pem.clone()).await?;
         let previous = config.token.take().zip(config.server.take());
         config.server = Some(server.clone());
         config.token = Some(token.clone());
+        config.ca_pem = ca_pem.clone();
         config.save(&config_path)?;
         // 새 토큰을 저장한 뒤, 같은 서버에 다시 로그인했으면 이전 토큰은 서버에서도 지운다(실패해도 무시).
         if let Some((old, old_server)) = previous
             && old_server.trim_end_matches('/') == server.trim_end_matches('/')
             && let Some(id) = token_id(&old)
         {
-            let client = Client::new(&server, Some(token));
+            let client = Client::new(&server, Some(token), ca_pem)?;
             let _ = client.delete(&format!("/tokens/{id}")).await;
         }
         writeln!(out, "logged in to {server} as {}", args.user)?;
         return Ok(());
     }
 
+    if let Cmd::Cluster { cmd } = &cli.cmd
+        && let Some(done) = cluster_local(cmd, out).await
+    {
+        return done;
+    }
+
     let server = server.context("not logged in; run `oplctl login --server <url>`")?;
-    let client = Client::new(&server, config.token.clone());
+    let client = Client::new(&server, config.token.clone(), config.ca_pem.clone())?;
     let json_out = cli.output == Output::Json;
     match cli.cmd {
         Cmd::Login(_) => unreachable!(),
+        Cmd::Cluster { cmd } => cluster(&client, cmd, json_out, out).await?,
         Cmd::Logout => {
             if let Some(id) = config.token.as_deref().and_then(token_id) {
                 // 이미 지워진 토큰이어도 로컬에서는 지운다.
@@ -564,6 +635,132 @@ where
     Ok(())
 }
 
+/// 이 기계의 opld에 보내는 클러스터 명령. 로그인이 필요 없다. 다른 명령이면 `None`이다.
+async fn cluster_local(
+    cmd: &ClusterCmd,
+    out: &mut (dyn Write + Send),
+) -> Option<anyhow::Result<()>> {
+    let run = async {
+        match cmd {
+            ClusterCmd::Init { name, local: l } => {
+                let r = local(&l.socket, "/init", &json!({ "cluster_name": name })).await?;
+                writeln!(out, "cluster {name} created")?;
+                writeln!(
+                    out,
+                    "admin password (shown only once): {}",
+                    cell(&r["admin_password"])
+                )?;
+                writeln!(out, "CA fingerprint: {}", cell(&r["ca_fingerprint"]))?;
+                writeln!(
+                    out,
+                    "join URL for the next node (single use, valid for 1 hour):"
+                )?;
+                writeln!(out, "  {}", cell(&r["join_url"]))?;
+                writeln!(out, "log in with:")?;
+                writeln!(
+                    out,
+                    "  oplctl login --server https://{} --ca-fingerprint {}",
+                    cell(&r["api_address"]),
+                    cell(&r["ca_fingerprint"])
+                )?;
+            }
+            ClusterCmd::Join { url, local: l } => {
+                let r = local(&l.socket, "/join", &json!({ "url": url })).await?;
+                writeln!(
+                    out,
+                    "node {} joined cluster {}",
+                    cell(&r["node"]),
+                    cell(&r["cluster"])
+                )?;
+            }
+            ClusterCmd::Leave { local: l } => {
+                local(&l.socket, "/leave", &json!({})).await?;
+                writeln!(out, "this node left the cluster")?;
+            }
+            _ => return Ok(false),
+        }
+        anyhow::Ok(true)
+    };
+    match run.await {
+        Ok(false) => None,
+        Ok(true) => Some(Ok(())),
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// 로그인한 서버의 API로 보내는 클러스터 명령
+async fn cluster(
+    client: &Client,
+    cmd: ClusterCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        ClusterCmd::Init { .. } | ClusterCmd::Join { .. } | ClusterCmd::Leave { .. } => {
+            unreachable!("handled by cluster_local")
+        }
+        ClusterCmd::Status => {
+            let view = client.get("/cluster").await?;
+            if json_out {
+                print_json(out, &view)?;
+                return Ok(());
+            }
+            writeln!(out, "cluster: {}", cell(&view["name"]))?;
+            writeln!(out, "CA fingerprint: {}", cell(&view["ca_fingerprint"]))?;
+            let leader = view["leader"].clone();
+            let rows: Vec<Vec<String>> = view["members"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|m| {
+                    vec![
+                        cell(&m["name"]),
+                        cell(&m["id"]),
+                        cell(&m["address"]),
+                        if m["voter"] == true {
+                            "voter"
+                        } else {
+                            "learner"
+                        }
+                        .into(),
+                        cell(&m["online"]),
+                        (m["id"] == leader).to_string(),
+                    ]
+                })
+                .collect();
+            table(
+                out,
+                &["NAME", "ID", "ADDRESS", "ROLE", "ONLINE", "LEADER"],
+                &rows,
+            )?;
+            let voters = view["members"]
+                .as_array()
+                .map_or(0, |m| m.iter().filter(|m| m["voter"] == true).count());
+            if voters == 2 {
+                writeln!(
+                    out,
+                    "warning: a two-node cluster stops accepting changes when either node fails; add a third node"
+                )?;
+            }
+        }
+        ClusterCmd::JoinToken { ttl } => {
+            let created = client
+                .post("/cluster/join-tokens", &json!({ "ttl_secs": ttl }))
+                .await?;
+            writeln!(out, "{}", cell(&created["url"]))?;
+        }
+        ClusterCmd::RemoveNode { node, force } => {
+            if !force {
+                bail!("removing a node cannot be undone; pass --force to confirm");
+            }
+            client.delete(&format!("/nodes/{node}")).await?;
+            writeln!(out, "node {node} removed from the cluster")?;
+        }
+    }
+    Ok(())
+}
+
 async fn vm(
     client: &Client,
     cmd: VmCmd,
@@ -709,12 +906,41 @@ fn token_id(token: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::try_parse(rest.split_once('_')?.0).ok()
 }
 
+/// HTTPS 서버의 클러스터 CA. 처음이면 받아서 `--ca-fingerprint`와 맞는지 확인한다. 같은 서버에
+/// 다시 로그인하면 저장한 CA를 그대로 쓴다. HTTP 서버면 없다.
+async fn server_ca(
+    server: &str,
+    args: &LoginArgs,
+    saved: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    if !server.starts_with("https://") {
+        return Ok(None);
+    }
+    if args.ca_fingerprint.is_none()
+        && let Some(saved) = saved
+    {
+        return Ok(Some(saved));
+    }
+    let pem = fetch_ca(server).await?;
+    let actual = fingerprint(&pem)?;
+    match &args.ca_fingerprint {
+        Some(expected) if expected.eq_ignore_ascii_case(&actual) => Ok(Some(pem)),
+        Some(expected) => {
+            bail!("the server's cluster CA does not match: expected {expected}, got {actual}")
+        }
+        None => bail!(
+            "the server's cluster CA fingerprint is {actual}; check it (from `oplctl cluster init` \
+             or `oplctl cluster status` on a node you trust) and log in again with --ca-fingerprint {actual}"
+        ),
+    }
+}
+
 /// 세션으로 로그인해 이 CLI가 쓸 API 토큰을 만든다. 세션은 바로 닫는다.
-async fn login(server: &str, args: &LoginArgs) -> anyhow::Result<String> {
+async fn login(server: &str, args: &LoginArgs, ca_pem: Option<String>) -> anyhow::Result<String> {
     let password = read_password(args.password_file.as_ref(), "Password: ")?;
-    let anon = Client::new(server, None);
-    let http = reqwest::Client::new();
-    let resp = http
+    let anon = Client::new(server, None, ca_pem)?;
+    let resp = anon
+        .http
         .post(anon.url("/auth/login"))
         .json(&json!({ "username": args.user, "password": password }))
         .send()
