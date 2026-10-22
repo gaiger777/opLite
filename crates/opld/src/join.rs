@@ -11,8 +11,9 @@ use crate::config::Config;
 
 /// 받아 줄 노드에 연결하기를 기다리는 시간
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// 요청 하나의 제한 시간. 받는 노드는 learner로 더하기만 하므로 금방 답한다(승격은 따로 기다린다).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// 요청 하나의 제한 시간. 받는 노드는 토큰 삭제, Node 기록, learner 추가 등 쓰기를 여러 번 하고
+/// 쓰기마다 최대 10초를 기다릴 수 있으므로 넉넉히 둔다(승격은 따로 기다린다).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// 검증 없이 받는 CA 본문의 최대 크기
 const CA_MAX_BYTES: usize = 64 * 1024;
 
