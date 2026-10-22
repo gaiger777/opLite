@@ -25,3 +25,9 @@ pub const VM_METADATA: &str = "opl-vm";
 
 /// 한 메시지의 최대 크기. Raft 로그 묶음과 스냅샷 조각을 JSON으로 보내므로 기본값(4MiB)보다 크게 둔다.
 pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
+
+/// HTTP/2 keepalive ping 간격(TCP keepalive도 같은 값). 반쯤 끊긴 연결을 알아채려고 쓴다.
+pub(crate) const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// keepalive ping 응답을 기다리는 최대 시간. 넘으면 연결을 끊는다.
+pub(crate) const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);

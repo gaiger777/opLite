@@ -21,7 +21,7 @@ use crate::wire::{
     AppendEntriesReply, AppendEntriesRequest, InstallSnapshotReply, InstallSnapshotRequest,
     LeaderReply, VoteReply, VoteRequest,
 };
-use crate::{MAX_MESSAGE_BYTES, VM_METADATA};
+use crate::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, VM_METADATA};
 
 /// 다른 노드가 부르는 서비스. 상대 인증서의 노드 id가 이 노드가 아는 멤버여야 한다. 아직 멤버십을
 /// 받지 못한 노드(막 합류하는 중)는 클러스터 CA가 서명한 인증서면 받는다.
@@ -130,31 +130,40 @@ impl Peer for PeerService {
 }
 
 /// 요청 스트림을 VNC 소켓으로, VNC 소켓을 응답 스트림으로 잇는다. 어느 쪽이든 끝나면 모두 닫는다.
+/// 두 방향은 따로 돈다. 한쪽 쓰기가 막혀도 다른 쪽은 계속 흐른다.
 async fn bridge(
     mut inbound: Streaming<Bytes>,
-    mut vnc: UnixStream,
+    vnc: UnixStream,
     tx: mpsc::Sender<Result<Bytes, Status>>,
 ) {
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        tokio::select! {
-            msg = inbound.message() => match msg {
-                Ok(Some(data)) => {
-                    if vnc.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) | Err(_) => break,
-            },
-            n = vnc.read(&mut buf) => match n {
+    let (mut vnc_read, mut vnc_write) = vnc.into_split();
+    let to_vnc = async {
+        while let Ok(Some(data)) = inbound.message().await {
+            if vnc_write.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+    };
+    let from_vnc = async {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match vnc_read.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if tx.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
+                    if tx
+                        .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
-            },
+            }
         }
+    };
+    tokio::select! {
+        _ = to_vnc => {}
+        _ = from_vnc => {}
     }
 }
 
@@ -176,6 +185,9 @@ pub async fn serve(
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     Server::builder()
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+        .tcp_keepalive(Some(KEEPALIVE_INTERVAL))
         .tls_config(tls)?
         .add_service(service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)

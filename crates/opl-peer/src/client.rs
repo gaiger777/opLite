@@ -25,10 +25,14 @@ use uuid::Uuid;
 
 use crate::pki::NodeTls;
 use crate::proto::peer_client::PeerClient;
-use crate::{MAX_MESSAGE_BYTES, VM_METADATA};
+use crate::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, VM_METADATA};
 
 /// 연결을 맺기까지 기다리는 최대 시간
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 리더 요청 하나를 기다리는 최대 시간. 리더가 AddVoter에서 새 노드를 따라잡게 기다리는 시간
+/// (`opl_cluster::CATCH_UP_TIMEOUT`, 60초)에 쓰기 시간을 더한 것보다 길어야 한다.
+const LEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// 다른 노드로 가는 연결. 주소마다 채널 하나를 만들어 다시 쓴다(끊기면 tonic이 다시 잇는다).
 /// 연결할 때 이 노드의 인증서를 내밀고, 상대 인증서는 클러스터 CA로 확인한다.
@@ -56,6 +60,10 @@ impl Peers {
                     .and_then(|e| e.tls_config(self.tls.clone()))
                     .map_err(|e| Status::invalid_argument(format!("bad address {addr}: {e}")))?
                     .connect_timeout(CONNECT_TIMEOUT)
+                    .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+                    .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+                    .keep_alive_while_idle(true)
+                    .tcp_keepalive(Some(KEEPALIVE_INTERVAL))
                     .connect_lazy();
                 channels.insert(addr.to_string(), channel.clone());
                 channel
@@ -79,14 +87,21 @@ impl Peers {
         addr: &str,
         req: LeaderRequest,
     ) -> Result<u64, ClusterError> {
+        let mut req = Request::new(req);
+        req.set_timeout(LEADER_REQUEST_TIMEOUT);
+        // 서버는 처리 결과를 늘 응답 본문에 담아 보내므로, `Status`는 전송 문제다. 새로 연결하지
+        // 못하면 `Unavailable`이지만 요청 중에 끊기면 `Cancelled`, `Unknown`, `Internal` 등이 오므로
+        // 권한·요청 오류가 아니면 모두 `Unreachable`로 돌려 다시 시도하게 한다.
         let reply = self
             .client(addr)
             .map_err(|s| ClusterError::Raft(s.to_string()))?
             .leader(req)
             .await
             .map_err(|s| match s.code() {
-                Code::Unavailable => ClusterError::Unreachable(s.message().to_string()),
-                _ => ClusterError::Raft(s.to_string()),
+                Code::PermissionDenied | Code::Unauthenticated | Code::InvalidArgument => {
+                    ClusterError::Raft(s.to_string())
+                }
+                _ => ClusterError::Unreachable(s.message().to_string()),
             })?;
         reply.into_inner().map_err(ClusterError::from)
     }
@@ -184,9 +199,13 @@ pub struct GrpcConnection {
 type RpcResult<T, E = openraft::error::Infallible> =
     Result<T, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>;
 
-/// 연결하지 못한 것은 `Unreachable`로 돌려 openraft가 잠시 쉬었다가 다시 시도하게 한다.
+/// 연결하지 못한 것과 권한이 없는 것(멤버에서 빠진 노드)은 `Unreachable`로 돌려 openraft가 잠시
+/// 쉬었다가 다시 시도하게 한다.
 fn rpc_error<E: std::error::Error>(s: Status) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>> {
-    if s.code() == Code::Unavailable {
+    if matches!(
+        s.code(),
+        Code::Unavailable | Code::PermissionDenied | Code::Unauthenticated
+    ) {
         RPCError::Unreachable(Unreachable::new(&s))
     } else {
         RPCError::Network(NetworkError::new(&s))

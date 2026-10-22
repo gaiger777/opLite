@@ -53,7 +53,7 @@ impl<U: DeserializeOwned> Decoder for JsonDecoder<U> {
     type Error = Status;
 
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<U>, Status> {
-        serde_json::from_reader(src.reader())
+        serde_json::from_slice(&src.copy_to_bytes(src.remaining()))
             .map(Some)
             .map_err(|e| Status::invalid_argument(e.to_string()))
     }
