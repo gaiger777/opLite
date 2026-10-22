@@ -20,6 +20,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
@@ -95,12 +96,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     }
                 }
             };
-            let cluster_name = member
-                .cluster()
-                .list::<opl_types::cluster::ClusterSpec>()
-                .ok()
-                .and_then(|(_, l)| l.into_iter().next())
-                .map(|c| c.name);
+            let mut cluster_name = read_cluster_name(&member);
             {
                 let mut s = status.lock().unwrap();
                 s.state = "member";
@@ -117,6 +113,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     e = member.failed() => {
                         let _ = member.close(false).await;
                         return Err(e);
+                    }
+                    // learner로 다시 시작하면 저장소가 비어 있어 리더에게서 받을 때까지 이름을 모른다.
+                    () = tokio::time::sleep(Duration::from_secs(1)), if cluster_name.is_none() => {
+                        cluster_name = read_cluster_name(&member);
+                        status.lock().unwrap().cluster = cluster_name.clone();
                     }
                     req = control.recv() => match req {
                         Some(Request::Leave { reply }) => match member.leave().await {
@@ -160,6 +161,16 @@ async fn run(config: Config) -> anyhow::Result<()> {
     control_task.abort();
     let _ = std::fs::remove_file(config.control_socket());
     result
+}
+
+/// 클러스터 저장소에 기록된 클러스터 이름
+fn read_cluster_name(member: &Member) -> Option<String> {
+    member
+        .cluster()
+        .list::<opl_types::cluster::ClusterSpec>()
+        .ok()
+        .and_then(|(_, l)| l.into_iter().next())
+        .map(|c| c.name)
 }
 
 /// 미초기화 노드가 받은 요청을 처리한다. 멤버가 되면 그 멤버를 돌려준다.

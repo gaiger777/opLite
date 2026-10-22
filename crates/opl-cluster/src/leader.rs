@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openraft::{BasicNode, ChangeMembers, Raft, RaftMetrics};
+use opl_types::resource::Kind;
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::ClusterError;
@@ -109,6 +110,13 @@ pub(crate) async fn execute(
             let membership = m.membership_config.membership();
             if membership.voter_ids().any(|v| v == id) {
                 return Ok(m.last_applied.map_or(0, |l| l.index));
+            }
+            // learner가 아니면(빠졌거나 더한 적이 없으면) 따라잡기를 기다리지 않고 바로 거부한다.
+            if membership.get_node(&id).is_none() {
+                return Err(ClusterError::Rejected(Rejection::NotFound {
+                    kind: Kind::Node,
+                    id: id.0,
+                }));
             }
             // learner가 지금 리더의 마지막 로그까지 받으면 올린다.
             let target = m.last_log_index;

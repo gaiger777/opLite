@@ -236,4 +236,16 @@ async fn membership_changes_go_through_any_member() {
     let members = tc.get(leader).members();
     assert!(!members.contains(n4));
     assert_eq!(members.voters.len(), 3);
+    // 멤버십에 없는 노드는 따라잡기를 기다리지 않고 바로 거부한다.
+    let started = std::time::Instant::now();
+    let err = tc
+        .get(follower)
+        .request(LeaderRequest::AddVoter { id: n4 })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ClusterError::Rejected(Rejection::NotFound { .. })),
+        "{err:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
 }

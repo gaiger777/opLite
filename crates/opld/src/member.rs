@@ -37,6 +37,9 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 다시 시작한 노드가 Node 리소스를 다시 기록하는 간격(과반수가 없으면 될 때까지)
 const REGISTER_RETRY: Duration = Duration::from_secs(2);
+/// 다시 시작한 learner가 승격을 다시 요청하는 간격. 실패할 때마다 두 배로 늘려 최대 시간까지 둔다.
+const PROMOTE_RETRY_MIN: Duration = Duration::from_secs(5);
+const PROMOTE_RETRY_MAX: Duration = Duration::from_secs(60);
 
 pub fn pki_dir(config: &Config) -> PathBuf {
     config.data_dir.join(PKI_DIR)
@@ -93,6 +96,7 @@ pub struct Member {
     runner: TaskRunner,
     monitor: NodeMonitor,
     register: JoinHandle<()>,
+    promotion: JoinHandle<()>,
     /// 서버 태스크가 끝나면 그 이유가 온다.
     exited: mpsc::Receiver<String>,
 }
@@ -219,19 +223,20 @@ impl Member {
         };
 
         // 다시 시작한 노드는 과반수가 없어도 VM을 계속 다스려야 하므로, Node 리소스는 뒤에서 기록한다.
-        let register = if first_time {
-            tokio::spawn(async {})
+        let (register, promotion) = if first_time {
+            (tokio::spawn(async {}), tokio::spawn(async {}))
         } else {
-            let (cluster, config, peers) = (cluster.clone(), config.clone(), peers.clone());
-            tokio::spawn(async move {
-                if let Err(e) = promote_if_learner(&cluster, &peers).await {
-                    tracing::warn!(error = format!("{e:#}"), "cannot become a voting member");
-                }
+            let (cluster2, peers) = (cluster.clone(), peers.clone());
+            let promotion =
+                tokio::spawn(async move { promote_until_voter(&cluster2, &peers).await });
+            let (cluster, config) = (cluster.clone(), config.clone());
+            let register = tokio::spawn(async move {
                 while let Err(e) = bootstrap::register_node(&cluster, &config).await {
                     tracing::warn!(error = %e, "cannot register this node; will retry");
                     tokio::time::sleep(REGISTER_RETRY).await;
                 }
-            })
+            });
+            (register, promotion)
         };
         let mut reconciler_config = ReconcilerConfig::new(node);
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
@@ -271,6 +276,7 @@ impl Member {
             runner,
             monitor,
             register,
+            promotion,
             exited,
         };
         Ok((member, created))
@@ -333,6 +339,7 @@ impl Member {
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
         self.register.abort();
+        self.promotion.abort();
         if !left {
             bootstrap::mark_offline(&self.cluster).await;
         }
@@ -370,11 +377,12 @@ pub fn remove_cluster_data(config: &Config) -> std::io::Result<()> {
     }
 }
 
-/// 합류하다 투표 멤버가 되기 전에 멈춘 노드는 learner로 남아 있다. 다시 시작하면 승격을 다시 요청한다.
-async fn promote_if_learner(cluster: &Cluster, peers: &Peers) -> anyhow::Result<()> {
+/// 합류하다 투표 멤버가 되기 전에 멈춘 노드는 learner로 남아 있다. 다시 시작하면 투표 멤버가 될
+/// 때까지, 또는 클러스터에서 빠진 것을 알 때까지 승격을 다시 요청한다.
+async fn promote_until_voter(cluster: &Cluster, peers: &Peers) {
     let id = cluster.id();
-    // 저장한 멤버십이 지표에 반영되기를 잠깐 기다린다. 멤버십에 없으면(빠진 노드) 할 일이 없다.
-    let known = cluster
+    // 저장한 멤버십이 지표에 반영되기를 기다린다. 합류 직후 죽었으면 리더가 보내 줄 때까지 모른다.
+    while cluster
         .raft()
         .wait(Some(Duration::from_secs(10)))
         .metrics(
@@ -386,12 +394,48 @@ async fn promote_if_learner(cluster: &Cluster, peers: &Peers) -> anyhow::Result<
             },
             "this node is in the membership",
         )
-        .await;
-    if known.is_ok() && cluster.members().learners.contains_key(&id) {
-        tracing::info!("this node is not a voting member yet; asking to be promoted");
-        promote(cluster, peers, None).await?;
+        .await
+        .is_err()
+    {
+        tracing::info!("this node is not in the cluster membership it knows yet; still waiting");
     }
-    Ok(())
+    let mut retry = PROMOTE_RETRY_MIN;
+    let mut asked = false;
+    loop {
+        let members = cluster.members();
+        if members.voters.contains_key(&id) {
+            if asked {
+                tracing::info!("this node became a voting member");
+            } else {
+                tracing::info!("this node is a voting member");
+            }
+            return;
+        }
+        if !members.learners.contains_key(&id) {
+            tracing::info!("this node was removed from the cluster; not asking to be promoted");
+            return;
+        }
+        tracing::info!("this node is not a voting member yet; asking to be promoted");
+        asked = true;
+        match promote(cluster, peers, None).await {
+            Ok(()) => {}
+            Err(e) if matches!(e.downcast_ref(), Some(ClusterError::Rejected(_))) => {
+                tracing::info!(
+                    error = format!("{e:#}"),
+                    "this node was removed from the cluster; not asking to be promoted"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "cannot become a voting member; will retry"
+                );
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(PROMOTE_RETRY_MAX);
+            }
+        }
+    }
 }
 
 /// 합류한 노드가 로그를 따라잡으면 투표 멤버로 올려 달라고 리더에게 요청하고, 이 노드도 그것을
@@ -423,6 +467,10 @@ async fn promote(cluster: &Cluster, peers: &Peers, via: Option<&str>) -> anyhow:
                 leader_addr: Some(leader),
                 ..
             }) => redirect = Some(leader),
+            // 리더의 멤버십에 learner로 없다(클러스터에서 빠졌다). 다시 시도해도 소용없다.
+            Err(e @ ClusterError::Rejected(_)) => {
+                return Err(e).context("this node is not in the cluster membership");
+            }
             Err(e) if tokio::time::Instant::now() < deadline => {
                 tracing::info!(error = %e, "waiting to become a voting member");
                 tokio::time::sleep(Duration::from_millis(500)).await;

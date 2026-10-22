@@ -200,6 +200,13 @@ async fn a_node_killed_right_after_joining_becomes_a_voter_when_restarted() {
         } => {}
     }
     d2.kill();
+    // 죽이기 전에 승격이 끝났을 수도 있다. 그때는 다시 승격을 요청할 일이 없다.
+    let view = d1.ctl_json(&["cluster", "status"]).await;
+    let was_learner = view["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["voter"] == false);
 
     // 다시 띄우면 멤버로 뜨고, 승격을 다시 요청해 투표 멤버가 된다.
     d2.start().await;
@@ -209,7 +216,8 @@ async fn a_node_killed_right_after_joining_becomes_a_voter_when_restarted() {
         members.len() == 2 && members.iter().all(|m| m["voter"] == true)
     })
     .await;
-    // 승격 요청은 노드 2의 응답이 있어야 끝나므로, 위에서 죽인 노드는 learner로 다시 떴다.
-    assert!(d2.log().contains("asking to be promoted"), "{}", d2.log());
+    if was_learner {
+        assert!(d2.log().contains("asking to be promoted"), "{}", d2.log());
+    }
     d2.stop();
 }
