@@ -906,6 +906,11 @@ fn token_id(token: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::try_parse(rest.split_once('_')?.0).ok()
 }
 
+/// `--server`가 HTTPS인가. 스킴은 대소문자를 가리지 않으므로 URL로 해석해 확인한다.
+fn is_https(server: &str) -> bool {
+    reqwest::Url::parse(server).is_ok_and(|u| u.scheme() == "https")
+}
+
 /// HTTPS 서버의 클러스터 CA. 처음이면 받아서 `--ca-fingerprint`와 맞는지 확인한다. 같은 서버에
 /// 다시 로그인하면 저장한 CA를 그대로 쓴다. HTTP 서버면 없다.
 async fn server_ca(
@@ -913,7 +918,7 @@ async fn server_ca(
     args: &LoginArgs,
     saved: Option<String>,
 ) -> anyhow::Result<Option<String>> {
-    if !server.starts_with("https://") {
+    if !is_https(server) {
         return Ok(None);
     }
     if args.ca_fingerprint.is_none()
@@ -989,6 +994,14 @@ mod tests {
         let id = uuid::Uuid::now_v7();
         assert_eq!(token_id(&format!("opl_{}_abc", id.simple())), Some(id));
         assert_eq!(token_id("garbage"), None);
+    }
+
+    #[test]
+    fn https_scheme_is_case_insensitive() {
+        assert!(is_https("https://host:8443"));
+        assert!(is_https("HTTPS://host"));
+        assert!(!is_https("http://host"));
+        assert!(!is_https("HTTP://host"));
     }
 
     #[test]

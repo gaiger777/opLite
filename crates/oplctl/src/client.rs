@@ -10,6 +10,12 @@ use serde_json::Value;
 /// Task가 이보다 오래 끝나지 않으면 기다리기를 그만둔다. Task 실행기의 제한 시간(10분)보다 길다.
 const TASK_WAIT: Duration = Duration::from_secs(15 * 60);
 
+/// Task 조회 요청 하나의 제한 시간. 서버가 응답하지 않아도 전체 기다리기 제한(`TASK_WAIT`)이 지켜지게 한다.
+const TASK_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 검증 없이 받는 CA 인증서 본문의 최대 크기
+const CA_MAX_BYTES: usize = 64 * 1024;
+
 #[derive(Clone)]
 pub struct Client {
     pub base: String,
@@ -111,7 +117,10 @@ impl Client {
         let id = task["id"].as_str().context("response has no task id")?;
         let deadline = Instant::now() + TASK_WAIT;
         loop {
-            let task = self.get(&format!("/tasks/{id}")).await?;
+            let poll = self
+                .request(Method::GET, &format!("/tasks/{id}"))
+                .timeout(TASK_POLL_TIMEOUT);
+            let task = self.send(poll).await?;
             match task["status"]["state"].as_str() {
                 Some("succeeded") => return Ok(task),
                 Some("failed") => bail!(
@@ -134,9 +143,10 @@ impl Client {
 pub async fn fetch_ca(server: &str) -> anyhow::Result<String> {
     let http = reqwest::Client::builder()
         .tls_danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let url = format!("{}/api/v1/cluster/ca", server.trim_end_matches('/'));
-    let resp = http
+    let mut resp = http
         .get(&url)
         .send()
         .await
@@ -147,7 +157,22 @@ pub async fn fetch_ca(server: &str) -> anyhow::Result<String> {
             resp.status()
         );
     }
-    Ok(resp.text().await?)
+    // 검증 없이 받는 본문이므로 크기를 제한한다.
+    let too_big = || anyhow::anyhow!("the cluster CA from {server} is larger than 64 KiB");
+    if resp
+        .content_length()
+        .is_some_and(|n| n > CA_MAX_BYTES as u64)
+    {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() + chunk.len() > CA_MAX_BYTES {
+            return Err(too_big());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("the cluster CA is not valid UTF-8")
 }
 
 /// 인증서(PEM)의 SHA-256 지문(`sha256:<16진수>`)
@@ -170,9 +195,44 @@ pub async fn local(socket: &Path, path: &str, body: &Value) -> anyhow::Result<Va
         .await
         .with_context(|| format!("cannot reach opld at {}; is it running?", socket.display()))?;
     let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("{}", body["message"].as_str().unwrap_or("request failed"));
+    if status.is_success() {
+        // 일회용 비밀번호 등이 들어 있을 수 있으니 해석 오류를 숨기지 않는다.
+        return resp
+            .json()
+            .await
+            .context("cannot parse the response from opld");
     }
-    Ok(body)
+    let body: Value = resp.json().await.unwrap_or_default();
+    match body["message"].as_str() {
+        Some(message) => bail!("{message}"),
+        None => bail!("request failed: {status}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cert_pem(name: &str) -> String {
+        rcgen::generate_simple_self_signed(vec![name.to_string()])
+            .unwrap()
+            .cert
+            .pem()
+    }
+
+    #[test]
+    fn fingerprint_format_and_determinism() {
+        let a = cert_pem("a.example");
+        let fp = fingerprint(&a).unwrap();
+        let hex = fp.strip_prefix("sha256:").unwrap();
+        assert_eq!(hex.len(), 64);
+        assert!(hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert_eq!(fp, fingerprint(&a).unwrap());
+        assert_ne!(fp, fingerprint(&cert_pem("b.example")).unwrap());
+    }
+
+    #[test]
+    fn fingerprint_rejects_garbage() {
+        assert!(fingerprint("not a pem").is_err());
+    }
 }

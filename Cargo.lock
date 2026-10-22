@@ -1542,6 +1542,7 @@ dependencies = [
  "futures-util",
  "hex",
  "native-tls",
+ "rcgen",
  "reqwest",
  "rpassword",
  "rustls-pki-types",
