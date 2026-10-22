@@ -52,7 +52,8 @@ pub enum Bootstrap {
     Restart,
     /// 이 노드 하나로 새 클러스터를 만든다.
     Init { name: String, ca: ClusterCa },
-    /// 합류가 받아들여졌다. `via`(받아 준 노드의 노드 간 주소)로 투표 멤버 승격을 요청한다.
+    /// 합류가 받아들여졌다(이 노드는 이미 learner다). 인증서를 저장한 뒤 `via`(받아 준 노드의
+    /// 노드 간 주소)로 투표 멤버 승격을 요청한다.
     Join { via: String },
 }
 
@@ -97,8 +98,10 @@ pub struct Member {
 }
 
 impl Member {
-    /// 멤버로서 시작한다. 처음 멤버가 되는 경우(`Init`, `Join`)는 마지막에 노드 인증서를 저장한다.
-    /// 인증서가 있으면 멤버로 보므로, 도중에 실패하면 이 노드는 계속 미초기화 상태다.
+    /// 멤버로서 시작한다. 인증서가 있으면 멤버로 보므로, 처음 멤버가 되는 경우 `Init`은 마지막에
+    /// 노드 인증서를 저장해 도중에 실패하면 이 노드는 계속 미초기화 상태다. `Join`은 이미 learner로
+    /// 더해졌으므로 승격을 요청하기 전에 저장한다. 그 뒤에 실패하거나 죽어도 클러스터가 투표 멤버로
+    /// 세는 노드가 미초기화로 남지 않고, 다시 시작하면(`Restart`) 승격을 다시 요청한다.
     pub async fn start(
         config: &Config,
         node: Uuid,
@@ -162,6 +165,7 @@ impl Member {
 
         // 여기서 실패하면 노드 간 서버와 저장소를 닫는다.
         let first_time = !matches!(bootstrap, Bootstrap::Restart);
+        let init = matches!(bootstrap, Bootstrap::Init { .. });
         let prepared = async {
             let mut password = None;
             match bootstrap {
@@ -172,7 +176,8 @@ impl Member {
                     password = Some(bootstrap::create_cluster(&cluster, config, &name, &ca).await?);
                 }
                 Bootstrap::Join { via } => {
-                    promote(&cluster, &peers, &via).await?;
+                    tls.save(&pki_dir(config))?;
+                    promote(&cluster, &peers, Some(&via)).await?;
                     bootstrap::register_node(&cluster, config).await?;
                 }
             }
@@ -198,7 +203,7 @@ impl Member {
                 None => None,
             };
             let api_tls = api_server_config(&tls)?;
-            if first_time {
+            if init {
                 tls.save(&pki_dir(config))?;
             }
             anyhow::Ok((state, created, api_tls))
@@ -217,8 +222,11 @@ impl Member {
         let register = if first_time {
             tokio::spawn(async {})
         } else {
-            let (cluster, config) = (cluster.clone(), config.clone());
+            let (cluster, config, peers) = (cluster.clone(), config.clone(), peers.clone());
             tokio::spawn(async move {
+                if let Err(e) = promote_if_learner(&cluster, &peers).await {
+                    tracing::warn!(error = format!("{e:#}"), "cannot become a voting member");
+                }
                 while let Err(e) = bootstrap::register_node(&cluster, &config).await {
                     tracing::warn!(error = %e, "cannot register this node; will retry");
                     tokio::time::sleep(REGISTER_RETRY).await;
@@ -329,12 +337,26 @@ impl Member {
             bootstrap::mark_offline(&self.cluster).await;
         }
         let _ = self.peer.stop.send(());
-        let _ = self.peer.task.await;
-        self.cluster.shutdown().await?;
+        // 오래 가는 콘솔 중계 스트림이 있으면 서버가 끝나지 않으므로 기다리는 시간을 제한한다.
+        if tokio::time::timeout(DRAIN_TIMEOUT, &mut self.peer.task)
+            .await
+            .is_err()
+        {
+            self.peer.task.abort();
+        }
+        let shutdown = self.cluster.shutdown().await;
         if left {
-            std::fs::remove_dir_all(pki_dir(&self.config))?;
+            // 이미 클러스터에서 빠졌으므로 저장소를 닫지 못했어도 지운다. 남기면 빠진 멤버로 다시 뜬다.
+            if let Err(e) = &shutdown {
+                tracing::warn!(error = %e, "cannot shut down the cluster store; removing it anyway");
+            }
+            match std::fs::remove_dir_all(pki_dir(&self.config)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                other => other?,
+            }
             remove_cluster_data(&self.config)?;
         }
+        shutdown?;
         Ok(())
     }
 }
@@ -348,13 +370,50 @@ pub fn remove_cluster_data(config: &Config) -> std::io::Result<()> {
     }
 }
 
+/// 합류하다 투표 멤버가 되기 전에 멈춘 노드는 learner로 남아 있다. 다시 시작하면 승격을 다시 요청한다.
+async fn promote_if_learner(cluster: &Cluster, peers: &Peers) -> anyhow::Result<()> {
+    let id = cluster.id();
+    // 저장한 멤버십이 지표에 반영되기를 잠깐 기다린다. 멤버십에 없으면(빠진 노드) 할 일이 없다.
+    let known = cluster
+        .raft()
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |m| {
+                m.membership_config
+                    .membership()
+                    .nodes()
+                    .any(|(n, _)| *n == id)
+            },
+            "this node is in the membership",
+        )
+        .await;
+    if known.is_ok() && cluster.members().learners.contains_key(&id) {
+        tracing::info!("this node is not a voting member yet; asking to be promoted");
+        promote(cluster, peers, None).await?;
+    }
+    Ok(())
+}
+
 /// 합류한 노드가 로그를 따라잡으면 투표 멤버로 올려 달라고 리더에게 요청하고, 이 노드도 그것을
-/// 적용할 때까지 기다린다. 요청을 받은 노드가 리더가 아니면 알려 준 리더로 다시 보낸다.
-async fn promote(cluster: &Cluster, peers: &Peers, via: &str) -> anyhow::Result<()> {
+/// 적용할 때까지 기다린다. 요청을 받은 노드가 리더가 아니면 알려 준 리더로 다시 보낸다. `via`가
+/// 없으면(다시 시작한 노드) 이 노드가 아는 리더나 투표 멤버에게 보낸다.
+async fn promote(cluster: &Cluster, peers: &Peers, via: Option<&str>) -> anyhow::Result<()> {
     let id = cluster.id();
     let deadline = tokio::time::Instant::now() + CATCH_UP_TIMEOUT + Duration::from_secs(30);
-    let mut addr = via.to_string();
+    let mut redirect: Option<String> = None;
     loop {
+        // 다시 시작한 직후에는 리더를 아직 모를 수 있다. 알 때까지 기다린다.
+        let Some(addr) = redirect
+            .take()
+            .or_else(|| via.map(str::to_string))
+            .or_else(|| voter_addr(cluster))
+        else {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("cannot become a voting member: no voting member is known");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        };
         match peers
             .leader_request(&addr, LeaderRequest::AddVoter { id })
             .await
@@ -363,7 +422,7 @@ async fn promote(cluster: &Cluster, peers: &Peers, via: &str) -> anyhow::Result<
             Err(ClusterError::NotLeader {
                 leader_addr: Some(leader),
                 ..
-            }) => addr = leader,
+            }) => redirect = Some(leader),
             Err(e) if tokio::time::Instant::now() < deadline => {
                 tracing::info!(error = %e, "waiting to become a voting member");
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -385,4 +444,14 @@ async fn promote(cluster: &Cluster, peers: &Peers, via: &str) -> anyhow::Result<
         )
         .await?;
     Ok(())
+}
+
+/// 이 노드가 아는 리더의 주소, 모르면 아무 투표 멤버의 주소
+fn voter_addr(cluster: &Cluster) -> Option<String> {
+    let members = cluster.members();
+    members
+        .leader
+        .and_then(|leader| members.voters.get(&leader))
+        .or_else(|| members.voters.values().next())
+        .cloned()
 }

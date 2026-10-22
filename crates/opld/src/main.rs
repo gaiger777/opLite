@@ -15,10 +15,13 @@ mod host;
 mod join;
 mod member;
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
 use clap::Parser;
 use opl_api::cluster::JoinUrl;
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
@@ -52,7 +55,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&config.data_dir)?;
+    prepare_data_dir(&config.data_dir)?;
+    // 끝날 때까지 쥐고 있는다.
+    let _lock = lock_data_dir(&config.data_dir)?;
     let node = bootstrap::node_id(&config.data_dir)?;
     let status = Arc::new(Mutex::new(Status {
         node,
@@ -65,7 +70,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let mut shutdown = pin!(shutdown_signal());
 
     let result = async {
-        loop {
+        'node: loop {
             // 멤버가 아니면 init이나 join을 기다린다.
             let mut member = match NodeTls::load(&member::pki_dir(&config))? {
                 Some(tls) => Member::start(&config, node, tls, Bootstrap::Restart).await?.0,
@@ -82,6 +87,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
                         let Some(req) = req else { return Ok(()) };
                         if let Some(member) = become_member(&config, node, req).await {
                             break member;
+                        }
+                        // 인증서를 저장한 뒤 실패했으면 이미 멤버(learner)다. 멤버로 다시 띄워 승격을 이어 간다.
+                        if member::pki_dir(&config).exists() {
+                            continue 'node;
                         }
                     }
                 }
@@ -165,24 +174,28 @@ async fn become_member(config: &Config, node: Uuid, req: Request) -> Option<Memb
         Request::Init {
             cluster_name,
             reply,
-        } => match new_cluster_tls(config, node, &cluster_name) {
-            Ok((ca, tls)) => (
-                Bootstrap::Init {
-                    name: cluster_name.clone(),
-                    ca,
-                },
-                tls,
-                reply,
-                cluster_name,
-            ),
-            Err(e) => {
-                let _ = reply.send(Err(ControlError::failed(e)));
-                return None;
+        } => {
+            match check_ports(config).and_then(|()| new_cluster_tls(config, node, &cluster_name)) {
+                Ok((ca, tls)) => (
+                    Bootstrap::Init {
+                        name: cluster_name.clone(),
+                        ca,
+                    },
+                    tls,
+                    reply,
+                    cluster_name,
+                ),
+                Err(e) => {
+                    let _ = reply.send(Err(ControlError::failed(e)));
+                    return None;
+                }
             }
-        },
+        }
         Request::Join { url, reply } => {
             let joined = async {
                 let url: JoinUrl = url.parse().map_err(anyhow::Error::msg)?;
+                // 포트가 쓰이고 있으면 조인 토큰을 쓰기 전에 실패한다.
+                check_ports(config)?;
                 join::request(config, node, &url).await
             };
             match joined.await {
@@ -221,11 +234,61 @@ async fn become_member(config: &Config, node: Uuid, req: Request) -> Option<Memb
         }
         Err(e) => {
             tracing::error!(error = format!("{e:#}"), "cannot become a cluster member");
-            let _ = member::remove_cluster_data(config);
+            // 인증서를 저장한 뒤의 실패면(합류해 learner가 된 뒤 승격 실패) 이미 멤버이므로 저장소를
+            // 지우지 않는다. main 루프가 멤버로 다시 띄워 승격을 다시 요청한다.
+            let e = if member::pki_dir(config).exists() {
+                e.context("this node joined as a non-voting member and keeps asking to become a voting member")
+            } else {
+                let _ = member::remove_cluster_data(config);
+                e
+            };
             let _ = reply.send(Err(ControlError::failed(e)));
             None
         }
     }
+}
+
+/// 데이터 디렉터리를 만들고 주인만 들어갈 수 있게(0700) 한다. 클러스터 저장소에 CA 개인 키와
+/// 비밀번호 해시가 있다. 다른 사용자가 가진 디렉터리는 그대로 둔다.
+fn prepare_data_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
+    let meta = std::fs::metadata(dir)?;
+    if meta.uid() == rustix::process::geteuid().as_raw() && meta.mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// `{data_dir}/opld.lock`을 배타적으로 잠근다. 같은 데이터 디렉터리로 opld를 둘 띄우지 못하게 한다.
+fn lock_data_dir(dir: &Path) -> anyhow::Result<File> {
+    let path = dir.join("opld.lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(rustix::io::Errno::WOULDBLOCK) => anyhow::bail!(
+            "{} is locked; is another opld running with this data directory?",
+            path.display()
+        ),
+        Err(e) => Err(e).with_context(|| format!("cannot lock {}", path.display())),
+    }
+}
+
+/// API와 노드 간 포트를 잠깐 묶어 본다. 쓰이고 있으면 init/join을 시작하기 전에 실패한다.
+fn check_ports(config: &Config) -> anyhow::Result<()> {
+    for addr in [config.listen, config.cluster_listen] {
+        std::net::TcpListener::bind(addr).with_context(|| format!("cannot listen on {addr}"))?;
+    }
+    Ok(())
 }
 
 /// 새 클러스터의 CA와 이 노드의 인증서

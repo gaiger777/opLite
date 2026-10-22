@@ -1,7 +1,7 @@
 //! 로컬 제어 소켓. `oplctl cluster init|join|leave`가 이 노드의 opld에 요청한다. 소켓은 opld를
 //! 실행한 사용자만 쓸 수 있으므로(0600) 따로 인증하지 않는다.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -130,6 +130,8 @@ fn router(ctx: Ctx) -> Router {
 }
 
 /// 제어 소켓을 연다. 다른 opld가 이미 쓰고 있으면 실패한다. 이전 opld가 남긴 소켓 파일은 지운다.
+/// 권한을 바꾸기 전에 다른 사용자가 연결하지 못하도록, 옆에 만든 주인만 들어갈 수 있는(0700) 임시
+/// 디렉터리에서 소켓을 묶고 0600으로 바꾼 뒤 제자리로 옮긴다.
 pub async fn serve(
     path: &Path,
     requests: mpsc::Sender<Request>,
@@ -144,8 +146,22 @@ pub async fn serve(
         }
         std::fs::remove_file(path)?;
     }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    // 유닉스 소켓 경로 길이 제한(104바이트) 때문에 임시 경로를 짧게 둔다.
+    let tmp = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!(".opl{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::DirBuilder::new().mode(0o700).create(&tmp)?;
+    let bound = (|| {
+        let sock = tmp.join("s");
+        let listener = UnixListener::bind(&sock)?;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&sock, path)?;
+        std::io::Result::Ok(listener)
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    let listener = bound?;
     let app = router(Ctx { requests, status });
     Ok(tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {

@@ -24,6 +24,7 @@ opl-qemu.workspace = true
 opl-reconciler.workspace = true
 opl-types.workspace = true
 reqwest.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -35,6 +36,5 @@ uuid.workspace = true
 [dev-dependencies]
 oplctl.workspace = true
 reqwest.workspace = true
-rustix.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

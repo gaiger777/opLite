@@ -111,6 +111,28 @@ impl Config {
                 "address must be an IP address or a host name without a port (got {address:?})"
             );
         }
+        // 다른 노드가 닿을 주소이므로 0.0.0.0이나 ::은 안 된다.
+        if address
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified())
+        {
+            anyhow::bail!("address must not be an unspecified address (got {address:?})");
+        }
+        for (key, addr) in [
+            ("listen", self.listen),
+            ("cluster_listen", self.cluster_listen),
+        ] {
+            if addr.port() == 0 {
+                anyhow::bail!("{key} must have a port other than 0 (got {addr})");
+            }
+        }
+        // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
+        if self.listen.port() == self.cluster_listen.port() {
+            anyhow::bail!(
+                "listen and cluster_listen must use different ports (got {} for both)",
+                self.listen.port()
+            );
+        }
         Ok(())
     }
 
@@ -190,5 +212,29 @@ mod tests {
             assert!(with("node1", bad).validate().is_err(), "{bad}");
         }
         assert_eq!(with("n", "::1").api_address(), "[::1]:8006");
+        for bad in ["0.0.0.0", "::"] {
+            assert!(with("node1", bad).validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validates_ports() {
+        let ok = parse("name = \"n\"\naddress = \"h\"");
+        assert!(ok.validate().is_ok());
+        let same = Config {
+            cluster_listen: "127.0.0.1:8006".parse().unwrap(),
+            ..ok.clone()
+        };
+        assert!(same.validate().is_err());
+        let zero = Config {
+            listen: "0.0.0.0:0".parse().unwrap(),
+            ..ok.clone()
+        };
+        assert!(zero.validate().is_err());
+        let zero = Config {
+            cluster_listen: "0.0.0.0:0".parse().unwrap(),
+            ..ok
+        };
+        assert!(zero.validate().is_err());
     }
 }
