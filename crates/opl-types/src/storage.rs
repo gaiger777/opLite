@@ -79,6 +79,8 @@ pub struct VolumeStatus {
     /// 실제로 디스크에 할당된 크기
     pub allocated_bytes: Option<u64>,
     pub attached_to: Option<Uuid>,
+    /// 볼륨을 만든 Task를 실행하는 노드. 그 노드만 시작할 때 남은 고아 볼륨을 정리한다.
+    pub node: Option<Uuid>,
 }
 
 /// 볼륨 파일이 준비됐는지. VM은 준비된 볼륨만 붙일 수 있다.

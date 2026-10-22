@@ -43,6 +43,8 @@ pub enum Kind {
     Task,
     User,
     ApiToken,
+    Cluster,
+    JoinToken,
 }
 
 impl Kind {
@@ -55,6 +57,8 @@ impl Kind {
             Kind::Task => "task",
             Kind::User => "user",
             Kind::ApiToken => "api-token",
+            Kind::Cluster => "cluster",
+            Kind::JoinToken => "join-token",
         }
     }
 }
@@ -117,6 +121,8 @@ mod tests {
             Kind::Task,
             Kind::User,
             Kind::ApiToken,
+            Kind::Cluster,
+            Kind::JoinToken,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }
