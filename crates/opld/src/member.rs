@@ -71,6 +71,9 @@ fn raft_config() -> openraft::Config {
         election_timeout_min: 1000,
         election_timeout_max: 2000,
         snapshot_max_chunk_size: 1 << 20,
+        // 스냅샷 조각마다 걸리는 제한 시간(밀리초). 기본 200ms로는 JSON으로 부푼 1MiB 조각(3.5MiB쯤)이
+        // 바쁜 노드에서 끝나지 못할 수 있다.
+        install_snapshot_timeout: 10_000,
         ..Default::default()
     }
 }
