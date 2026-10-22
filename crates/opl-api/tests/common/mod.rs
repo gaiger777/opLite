@@ -119,6 +119,7 @@ impl Env {
             },
         );
         cluster.create(&admin).await.unwrap();
+        seed_cluster_info(&cluster).await;
         before_runner(cluster.clone()).await;
 
         let hv = Arc::new(MockHypervisor::default());
@@ -333,6 +334,19 @@ pub async fn login_at(base: &str, user: &str, password: &str) -> Client {
         http,
         token: Some(body["secret"].as_str().unwrap().to_string()),
     }
+}
+
+/// 클러스터 정보(이름 `test`, 새 CA)를 저장소에 만든다. 클러스터를 만들 때 opld가 하는 일이다.
+pub async fn seed_cluster_info(cluster: &Cluster) {
+    let ca = opl_peer::pki::ClusterCa::generate("test").unwrap();
+    let info = Resource::new(
+        "test",
+        opl_types::cluster::ClusterSpec {
+            ca_cert_pem: ca.cert_pem,
+            ca_key_pem: ca.key_pem,
+        },
+    );
+    cluster.create(&info).await.unwrap();
 }
 
 /// 디스크 없는 작은 VM 생성 요청

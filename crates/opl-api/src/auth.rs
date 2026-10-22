@@ -51,7 +51,7 @@ pub struct RoleAuthorizer;
 
 impl Authorizer for RoleAuthorizer {
     fn check(&self, principal: &Principal, action: Action, kind: Kind) -> bool {
-        let account = matches!(kind, Kind::User | Kind::ApiToken);
+        let account = matches!(kind, Kind::User | Kind::ApiToken | Kind::JoinToken);
         match principal.role {
             Role::Admin => true,
             Role::Operator => match action {
@@ -125,7 +125,7 @@ fn parse_token(token: &str) -> Option<(Uuid, &str)> {
 }
 
 /// 길이가 같은 두 문자열을 내용과 관계없이 같은 시간에 비교한다.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())
