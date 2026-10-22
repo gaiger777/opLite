@@ -1,9 +1,12 @@
 //! 리더가 처리하는 요청(쓰기, 멤버십 변경)과, 팔로워가 그것을 리더에 전달하는 통로.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
+use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, ChangeMembers, Raft, RaftMetrics};
 use opl_types::resource::Kind;
 use serde::{Deserialize, Serialize};
@@ -13,6 +16,9 @@ use crate::types::{LeaderRequest, NodeId, Rejection, Response, TypeConfig};
 
 /// learner가 로그를 따라잡기를 기다리는 최대 시간. 스냅샷을 받아야 하면 오래 걸린다.
 pub const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 앞선 멤버십 변경이 아직 커밋 중일 때 다시 시도하는 간격
+const IN_PROGRESS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// 팔로워가 받은 요청을 리더에게 보낸다. 노드 간 네트워크가 구현한다.
 #[async_trait]
@@ -95,11 +101,10 @@ pub(crate) async fn execute(
             Ok(result?)
         }
         LeaderRequest::AddLearner { id, addr } => {
-            let resp =
-                tokio::time::timeout(timeout, raft.add_learner(id, BasicNode::new(addr), false))
-                    .await
-                    .map_err(|_| ClusterError::Timeout)??;
-            Ok(resp.log_id.index)
+            retry_in_progress(timeout, || {
+                raft.add_learner(id, BasicNode::new(addr.clone()), false)
+            })
+            .await
         }
         LeaderRequest::AddVoter { id } => {
             let m = raft.metrics().borrow().clone();
@@ -133,10 +138,7 @@ pub(crate) async fn execute(
                 .await
                 .map_err(|_| ClusterError::Timeout)?;
             let change = ChangeMembers::AddVoterIds(BTreeSet::from([id]));
-            let resp = tokio::time::timeout(timeout, raft.change_membership(change, false))
-                .await
-                .map_err(|_| ClusterError::Timeout)??;
-            Ok(resp.log_id.index)
+            retry_in_progress(timeout, || raft.change_membership(change.clone(), false)).await
         }
         LeaderRequest::Remove { id } => {
             let m = raft.metrics().borrow().clone();
@@ -151,10 +153,39 @@ pub(crate) async fn execute(
             } else {
                 return Ok(m.last_applied.map_or(0, |l| l.index));
             };
-            let resp = tokio::time::timeout(timeout, raft.change_membership(change, false))
-                .await
-                .map_err(|_| ClusterError::Timeout)??;
-            Ok(resp.log_id.index)
+            retry_in_progress(timeout, || raft.change_membership(change.clone(), false)).await
+        }
+    }
+}
+
+/// 멤버십을 바꾼다. 앞선 멤버십 변경이 아직 커밋 중이면(`InProgress`, 예: 다른 노드의 승격이
+/// 두 단계 중 하나를 커밋하는 중) `timeout`까지 다시 시도하고, 그래도 안 되면 `Timeout`이다.
+async fn retry_in_progress<F, Fut>(timeout: Duration, mut change: F) -> Result<u64, ClusterError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<
+        Output = Result<
+            ClientWriteResponse<TypeConfig>,
+            RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>,
+        >,
+    >,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, change())
+            .await
+            .map_err(|_| ClusterError::Timeout)?
+        {
+            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::InProgress(_),
+            ))) => {
+                if tokio::time::Instant::now() + IN_PROGRESS_RETRY_INTERVAL >= deadline {
+                    return Err(ClusterError::Timeout);
+                }
+                tokio::time::sleep(IN_PROGRESS_RETRY_INTERVAL).await;
+            }
+            other => return Ok(other?.log_id.index),
         }
     }
 }

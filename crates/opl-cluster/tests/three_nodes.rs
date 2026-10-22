@@ -3,13 +3,17 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use common::{TestCluster, addr, node, raft_config, volume};
 use openraft::SnapshotPolicy;
-use opl_cluster::ClusterError;
-use opl_cluster::types::{LeaderRequest, Rejection};
+use opl_cluster::memnet::MemForwarder;
+use opl_cluster::types::{LeaderRequest, NodeId, Rejection};
 use opl_cluster::watch::WatchEvent;
+use opl_cluster::{ClusterError, Forwarder};
 use opl_types::storage::VolumeSpec;
 
 #[tokio::test]
@@ -248,4 +252,66 @@ async fn membership_changes_go_through_any_member() {
         "{err:?}"
     );
     assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+/// 첫 전달은 영영 돌아오지 않는다(연결을 끊지 않고 죽은 리더 호스트).
+struct HangOnce {
+    hung: AtomicBool,
+    inner: Arc<MemForwarder>,
+}
+
+#[async_trait]
+impl Forwarder for HangOnce {
+    async fn forward(
+        &self,
+        leader: NodeId,
+        addr: &str,
+        req: LeaderRequest,
+    ) -> Result<u64, ClusterError> {
+        if !self.hung.swap(true, Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        self.inner.forward(leader, addr, req).await
+    }
+}
+
+#[tokio::test]
+async fn hung_forward_is_retried_before_the_write_timeout() {
+    let mut tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let follower = *tc.nodes.keys().find(|id| **id != leader).unwrap();
+    let cluster = tc.nodes.remove(&follower).unwrap();
+    let cluster = cluster.with_forwarder(Arc::new(HangOnce {
+        hung: AtomicBool::new(false),
+        inner: tc.router.forwarder(follower),
+    }));
+    tc.nodes.insert(follower, cluster);
+
+    let started = std::time::Instant::now();
+    let v = volume("disk-a");
+    tc.get(follower).create(&v).await.unwrap();
+    let took = started.elapsed();
+    assert!(took < tc.write_timeout, "forward took {took:?}");
+    assert!(tc.get(follower).get::<VolumeSpec>(v.id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn concurrent_membership_changes_wait_for_each_other() {
+    let mut tc = TestCluster::start(3).await;
+    let leader = tc.leader().await;
+    let (n4, n5) = (node(4), node(5));
+    for (n, i) in [(n4, 4), (n5, 5)] {
+        tc.open(n).await;
+        tc.get(leader).add_learner(n, addr(i)).await.unwrap();
+    }
+    // 한쪽 승격의 두 단계가 커밋되는 동안 다른 쪽은 `InProgress`를 받고 다시 시도한다.
+    let c = tc.get(leader);
+    let (a, b) = tokio::join!(
+        c.request(LeaderRequest::AddVoter { id: n4 }),
+        c.request(LeaderRequest::AddVoter { id: n5 }),
+    );
+    a.unwrap();
+    b.unwrap();
+    let members = c.members();
+    assert!(members.voters.contains_key(&n4) && members.voters.contains_key(&n5));
 }

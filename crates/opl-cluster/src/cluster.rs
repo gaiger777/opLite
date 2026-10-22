@@ -20,6 +20,11 @@ pub type Typed<S> = Resource<S, <S as ResourceSpec>::Status>;
 /// 리더가 없거나 닿지 않을 때 다시 시도하는 간격
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
+/// 리더에게 한 번 전달할 때 기다리는 최대 시간(`AddVoter`는 따라잡기를 기다리므로 제외).
+/// 연결을 끊지 않고 죽은 리더 호스트가 `write_timeout` 전체를 잡아 두면 안 된다.
+/// keepalive가 알아채기까지는 이보다 오래 걸린다.
+const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// 저장 파일 이름. `data_dir` 아래에 둔다.
 pub const DB_FILE: &str = "cluster.redb";
 
@@ -268,13 +273,24 @@ impl Cluster {
                 }) if leader != self.id
                     && let Some(forwarder) = &self.forwarder =>
                 {
+                    let attempt = if matches!(req, LeaderRequest::AddVoter { .. }) {
+                        remaining
+                    } else {
+                        remaining.min(FORWARD_ATTEMPT_TIMEOUT)
+                    };
                     match tokio::time::timeout(
-                        remaining,
+                        attempt,
                         forwarder.forward(leader, &addr, req.clone()),
                     )
                     .await
                     {
-                        Err(_) => Err(ClusterError::Timeout),
+                        Err(_) if tokio::time::Instant::now() >= deadline => {
+                            Err(ClusterError::Timeout)
+                        }
+                        // 이번 시도만 제한에 걸렸다. 리더를 다시 읽고 다시 보낸다.
+                        Err(_) => Err(ClusterError::Unreachable(
+                            "forward attempt timed out".into(),
+                        )),
                         // 자기 자신을 뺀 요청이면 리더가 더는 이 노드에 복제하지 않으므로
                         // 적용을 기다리면 제한 시간까지 멈춘다.
                         Ok(Ok(index)) if matches!(req, LeaderRequest::Remove { id } if id == self.id) => {
