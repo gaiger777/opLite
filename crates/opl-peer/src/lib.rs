@@ -6,12 +6,14 @@
 
 mod client;
 mod codec;
+pub mod monitor;
 pub mod pki;
 mod server;
 pub mod tls;
 mod wire;
 
 pub use client::{ConsoleError, ConsoleStream, GrpcNetwork, Peers};
+pub use monitor::{NodeMonitor, NodeMonitorConfig};
 pub use server::{PeerService, ServeError, serve};
 
 /// 생성된 gRPC 클라이언트와 서버. 생성 코드가 단위 구조체 코덱을 `default()`로 만든다.

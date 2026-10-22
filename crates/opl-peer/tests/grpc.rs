@@ -9,7 +9,8 @@ use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::{Hypervisor, MockHypervisor};
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
-use opl_peer::{GrpcNetwork, PeerService, Peers};
+use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers};
+use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::storage::{Volume, VolumeSpec};
@@ -269,4 +270,67 @@ async fn console_is_relayed_to_the_node_running_the_vm() {
         .err()
         .unwrap();
     assert!(matches!(err, opl_peer::ConsoleError::NotRunning), "{err}");
+}
+
+#[tokio::test]
+async fn leader_records_when_nodes_go_offline_and_come_back() {
+    let (_ca, _root, mut nodes) = start(3).await;
+    let leader = wait_leader(&nodes).await;
+    for (i, node) in nodes.iter().enumerate() {
+        let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
+            format!("node-{i}"),
+            NodeSpec {
+                address: node.addr.clone(),
+                maintenance: false,
+            },
+        );
+        r.id = node.id().0;
+        // 하나는 오프라인으로 시작해, 응답하면 온라인이 되는지 본다.
+        r.status.online = node.id() == leader;
+        nodes[0].cluster.create(&r).await.unwrap();
+    }
+    let config = NodeMonitorConfig {
+        interval: Duration::from_millis(300),
+        offline_after: Duration::from_secs(3),
+    };
+    let monitors: Vec<NodeMonitor> = nodes
+        .iter()
+        .map(|n| NodeMonitor::spawn(n.cluster.clone(), n.peers.clone(), config.clone()))
+        .collect();
+    let leader_cluster = nodes
+        .iter()
+        .find(|n| n.id() == leader)
+        .unwrap()
+        .cluster
+        .clone();
+    let online = |id: NodeId| {
+        leader_cluster
+            .get::<NodeSpec>(id.0)
+            .unwrap()
+            .unwrap()
+            .status
+            .online
+    };
+    let wait_for = |want: bool, id: NodeId| {
+        let online = &online;
+        async move {
+            let deadline = Instant::now() + WAIT;
+            while online(id) != want {
+                assert!(
+                    Instant::now() < deadline,
+                    "node {id} never became online={want}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    let follower = nodes.iter().position(|n| n.id() != leader).unwrap();
+    let follower_id = nodes[follower].id();
+    wait_for(true, follower_id).await;
+    nodes[follower].stop().await;
+    wait_for(false, follower_id).await;
+    assert!(online(leader));
+    for m in monitors {
+        m.shutdown().await;
+    }
 }
