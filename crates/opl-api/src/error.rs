@@ -110,7 +110,7 @@ impl From<ClusterError> for ApiError {
                     ),
                 }
             }
-            ClusterError::Timeout => ApiError::new(
+            ClusterError::Timeout | ClusterError::Unreachable(_) => ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "cluster_no_quorum",
                 "the cluster has no quorum; the change may still be applied later",

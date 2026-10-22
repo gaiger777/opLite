@@ -9,12 +9,16 @@ use opl_types::resource::{Resource, ResourceSpec};
 use redb::Database;
 use uuid::Uuid;
 
+use crate::leader::{self, Forwarder};
 use crate::store::{Store, StoreError, get_object, get_object_by_name, list_objects};
-use crate::types::{Command, NodeId, RawResource, Rejection, Response, TypeConfig};
+use crate::types::{Command, LeaderRequest, NodeId, RawResource, Rejection, TypeConfig};
 use crate::watch::{Watch, WatchError, WatchHub};
 
 /// spec 타입 `S`의 리소스.
 pub type Typed<S> = Resource<S, <S as ResourceSpec>::Status>;
+
+/// 리더가 없거나 닿지 않을 때 다시 시도하는 간격
+const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// 저장 파일 이름. `data_dir` 아래에 둔다.
 pub const DB_FILE: &str = "cluster.redb";
@@ -54,6 +58,9 @@ pub enum ClusterError {
     /// 명령은 나중에 커밋될 수도 있다.
     #[error("write was not committed within the timeout")]
     Timeout,
+    /// 리더에게 요청을 전달하지 못했다.
+    #[error("cannot reach the leader: {0}")]
+    Unreachable(String),
     #[error("raft: {0}")]
     Raft(String),
     #[error("store: {0}")]
@@ -83,6 +90,28 @@ pub struct Cluster {
     db: Arc<Database>,
     watch: Arc<WatchHub>,
     write_timeout: Duration,
+    forwarder: Option<Arc<dyn Forwarder>>,
+}
+
+/// 지금 알고 있는 멤버십. 값은 노드의 Raft 주소다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Members {
+    pub leader: Option<NodeId>,
+    pub voters: BTreeMap<NodeId, String>,
+    pub learners: BTreeMap<NodeId, String>,
+}
+
+impl Members {
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.voters.contains_key(&id) || self.learners.contains_key(&id)
+    }
+
+    pub fn addr(&self, id: NodeId) -> Option<&str> {
+        self.voters
+            .get(&id)
+            .or_else(|| self.learners.get(&id))
+            .map(String::as_str)
+    }
 }
 
 impl Cluster {
@@ -115,7 +144,14 @@ impl Cluster {
             db: store.db().clone(),
             watch: store.watch_hub().clone(),
             write_timeout: config.write_timeout,
+            forwarder: None,
         })
+    }
+
+    /// 팔로워가 받은 쓰기와 멤버십 변경을 이것으로 리더에 전달한다. 없으면 `NotLeader`를 돌려준다.
+    pub fn with_forwarder(mut self, forwarder: Arc<dyn Forwarder>) -> Self {
+        self.forwarder = Some(forwarder);
+        self
     }
 
     pub fn id(&self) -> NodeId {
@@ -214,11 +250,89 @@ impl Cluster {
     /// 명령을 리더에 제안하고 커밋·적용될 때까지 기다린다. 성공하면 새 revision을 돌려준다.
     /// 상태 머신은 spec/status JSON이 `kind`와 맞는지 보지 않으므로 타입 있는 메서드로만 부른다.
     pub(crate) async fn write(&self, command: Command) -> Result<u64, ClusterError> {
-        let resp = tokio::time::timeout(self.write_timeout, self.raft.client_write(command))
-            .await
-            .map_err(|_| ClusterError::Timeout)??;
-        let Response(result) = resp.data;
-        Ok(result?)
+        self.request(LeaderRequest::Write { command }).await
+    }
+
+    /// 요청을 리더에서 처리한다. 이 노드가 리더가 아니면 전달자로 리더에 보내고, 리더가 커밋한
+    /// 인덱스까지 이 노드에도 적용되기를 기다린다(이 노드에서 곧바로 읽어도 결과가 보인다).
+    /// 리더가 없거나(선거 중) 닿지 않으면 `write_timeout`까지 다시 시도하고, 그래도 안 되면
+    /// `Timeout`이다. 전달이 실패해 다시 보낸 요청이 이미 적용된 것이었다면 두 번째는 거부될 수 있다.
+    pub async fn request(&self, req: LeaderRequest) -> Result<u64, ClusterError> {
+        let deadline = tokio::time::Instant::now() + self.write_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let result = match leader::execute(&self.raft, req.clone(), remaining).await {
+                Err(ClusterError::NotLeader {
+                    leader_id: Some(leader),
+                    leader_addr: Some(addr),
+                }) if leader != self.id
+                    && let Some(forwarder) = &self.forwarder =>
+                {
+                    match tokio::time::timeout(
+                        remaining,
+                        forwarder.forward(leader, &addr, req.clone()),
+                    )
+                    .await
+                    {
+                        Err(_) => Err(ClusterError::Timeout),
+                        Ok(Ok(index)) => {
+                            let _ = self
+                                .raft
+                                .wait(Some(
+                                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                ))
+                                .applied_index_at_least(Some(index), "forwarded request")
+                                .await;
+                            Ok(index)
+                        }
+                        Ok(Err(e)) => Err(e),
+                    }
+                }
+                other => other,
+            };
+            let retry = match &result {
+                Err(ClusterError::NotLeader {
+                    leader_id: None, ..
+                })
+                | Err(ClusterError::Unreachable(_)) => true,
+                Err(ClusterError::NotLeader { .. }) => self.forwarder.is_some(),
+                _ => false,
+            };
+            if !retry {
+                return result;
+            }
+            if tokio::time::Instant::now() + RETRY_INTERVAL >= deadline {
+                return Err(ClusterError::Timeout);
+            }
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        }
+    }
+
+    /// 이 노드가 리더로서 요청을 처리한다. 노드 간 네트워크가 다른 노드에서 전달받은 요청을 넘긴다.
+    /// 리더가 아니면 `NotLeader`다(다시 전달하지 않는다).
+    pub async fn execute_as_leader(&self, req: LeaderRequest) -> Result<u64, ClusterError> {
+        leader::execute(&self.raft, req, self.write_timeout).await
+    }
+
+    /// 이 노드가 아는 멤버십과 리더
+    pub fn members(&self) -> Members {
+        let m = self.raft.metrics().borrow().clone();
+        let membership = m.membership_config.membership();
+        let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
+        let mut out = Members {
+            leader: m.current_leader,
+            voters: BTreeMap::new(),
+            learners: BTreeMap::new(),
+        };
+        for (id, node) in membership.nodes() {
+            let list = if voters.contains(id) {
+                &mut out.voters
+            } else {
+                &mut out.learners
+            };
+            list.insert(*id, node.addr.clone());
+        }
+        out
     }
 
     /// 로컬 상태 머신에서 읽는다. 팔로워에서는 최신 커밋이 아직 반영되지 않았을 수 있다.

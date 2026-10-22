@@ -1,4 +1,4 @@
-//! 한 프로세스 안의 3노드 클러스터: 리더 장애, 네트워크 분할, 스냅샷으로 따라잡기.
+//! 한 프로세스 안의 3노드 클러스터: 리더 장애, 네트워크 분할, 스냅샷으로 따라잡기, 리더로 전달.
 
 mod common;
 
@@ -8,6 +8,7 @@ use std::time::Duration;
 use common::{TestCluster, addr, node, raft_config, volume};
 use openraft::SnapshotPolicy;
 use opl_cluster::ClusterError;
+use opl_cluster::types::{LeaderRequest, Rejection};
 use opl_cluster::watch::WatchEvent;
 use opl_types::storage::VolumeSpec;
 
@@ -158,4 +159,77 @@ async fn new_node_catches_up_from_snapshot() {
     tc.get(leader).change_membership(voters).await.unwrap();
     let rev = tc.get(leader).create(&volume("after")).await.unwrap();
     tc.wait_applied(n4, rev).await;
+}
+
+#[tokio::test]
+async fn follower_forwards_writes_and_sees_them_at_once() {
+    let tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let follower = *tc.nodes.keys().find(|id| **id != leader).unwrap();
+
+    let v = volume("disk-a");
+    let rev = tc.get(follower).create(&v).await.unwrap();
+    // 전달한 쓰기는 이 노드에도 적용된 뒤에 돌아온다.
+    let got = tc.get(follower).get::<VolumeSpec>(v.id).unwrap().unwrap();
+    assert_eq!(got.revision, rev);
+    // 리더의 거부도 그대로 돌아온다.
+    let err = tc.get(follower).create(&v).await.unwrap_err();
+    assert!(matches!(
+        err,
+        ClusterError::Rejected(Rejection::AlreadyExists { .. })
+    ));
+}
+
+#[tokio::test]
+async fn forwarded_writes_wait_for_a_new_leader() {
+    let mut tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let follower = *tc.nodes.keys().find(|id| **id != leader).unwrap();
+    tc.stop(leader).await;
+    // 남은 두 노드가 새 리더를 뽑는 동안 쓰기는 기다렸다가 성공한다.
+    let v = volume("disk-b");
+    tc.get(follower).create(&v).await.unwrap();
+    assert!(tc.get(follower).get::<VolumeSpec>(v.id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn membership_changes_go_through_any_member() {
+    let mut tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let follower = *tc.nodes.keys().find(|id| **id != leader).unwrap();
+    let rev = tc.get(leader).create(&volume("before")).await.unwrap();
+
+    let n4 = node(4);
+    tc.open(n4).await;
+    tc.get(follower)
+        .request(LeaderRequest::AddLearner {
+            id: n4,
+            addr: addr(4).addr,
+        })
+        .await
+        .unwrap();
+    assert!(tc.get(follower).members().learners.contains_key(&n4));
+    tc.get(follower)
+        .request(LeaderRequest::AddVoter { id: n4 })
+        .await
+        .unwrap();
+    tc.wait_applied(n4, rev).await;
+    let members = tc.get(follower).members();
+    assert_eq!(members.voters.len(), 4);
+    assert!(members.voters.contains_key(&n4));
+    // 바쁘면 그 사이 리더가 바뀔 수 있다.
+    assert!(members.leader.is_some());
+    // 이미 투표 멤버면 그대로 성공한다.
+    tc.get(n4)
+        .request(LeaderRequest::AddVoter { id: n4 })
+        .await
+        .unwrap();
+
+    tc.get(n4)
+        .request(LeaderRequest::Remove { id: n4 })
+        .await
+        .unwrap();
+    let members = tc.get(leader).members();
+    assert!(!members.contains(n4));
+    assert_eq!(members.voters.len(), 3);
 }

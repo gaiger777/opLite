@@ -77,6 +77,28 @@ pub enum Rejection {
     },
 }
 
+/// 리더가 처리하는 요청. 팔로워는 받은 쓰기와 멤버십 변경을 이것으로 리더에 전달한다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum LeaderRequest {
+    Write {
+        command: Command,
+    },
+    /// 노드를 learner로 더한다. 따라잡기를 기다리지 않는다.
+    AddLearner {
+        id: NodeId,
+        addr: String,
+    },
+    /// learner가 로그를 따라잡으면 투표 멤버로 올린다.
+    AddVoter {
+        id: NodeId,
+    },
+    /// 노드를 멤버십에서 뺀다(투표 멤버이든 learner이든).
+    Remove {
+        id: NodeId,
+    },
+}
+
 /// 명령 적용 결과. 성공하면 새 revision(커밋된 로그 인덱스)을 담는다.
 /// 명령이 아닌 엔트리(빈 엔트리, 멤버십 변경)도 `Ok(인덱스)`를 돌려준다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -47,6 +47,8 @@ pub struct TestCluster {
     pub nodes: BTreeMap<NodeId, Cluster>,
     pub raft: openraft::Config,
     pub write_timeout: Duration,
+    /// 팔로워가 받은 요청을 리더로 전달한다.
+    pub forward: bool,
     root: TempDir,
 }
 
@@ -57,11 +59,21 @@ impl TestCluster {
     }
 
     pub async fn start_with(n: u64, raft: openraft::Config, write_timeout: Duration) -> Self {
+        Self::build(n, raft, write_timeout, false).await
+    }
+
+    /// 팔로워가 요청을 리더로 전달하는 클러스터
+    pub async fn start_forwarding(n: u64) -> Self {
+        Self::build(n, raft_config(), Duration::from_secs(5), true).await
+    }
+
+    async fn build(n: u64, raft: openraft::Config, write_timeout: Duration, forward: bool) -> Self {
         let mut tc = TestCluster {
             router: MemRouter::default(),
             nodes: BTreeMap::new(),
             raft,
             write_timeout,
+            forward,
             root: TempDir::new().unwrap(),
         };
         for i in 1..=n {
@@ -91,6 +103,11 @@ impl TestCluster {
                 }
                 other => break other.unwrap(),
             }
+        };
+        let cluster = if self.forward {
+            cluster.with_forwarder(self.router.forwarder(id))
+        } else {
+            cluster
         };
         self.router.register(id, cluster.raft().clone());
         self.nodes.insert(id, cluster);

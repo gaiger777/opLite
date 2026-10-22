@@ -1,8 +1,11 @@
-//! 한 프로세스 안의 노드들을 잇는 Raft 네트워크. 클러스터 테스트에 쓴다.
-//! 노드 간 실제 통신(gRPC + mTLS)은 계획 6에서 만든다.
+//! 한 프로세스 안의 노드들을 잇는 Raft 네트워크와 리더 전달자. 클러스터 테스트에 쓴다.
+//! 노드 간 실제 통신(gRPC + mTLS)은 `opl-peer`에 있다.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
 
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -12,7 +15,12 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Raft};
 
-use crate::types::{NodeId, TypeConfig};
+use crate::cluster::ClusterError;
+use crate::leader::{self, Forwarder};
+use crate::types::{LeaderRequest, NodeId, TypeConfig};
+
+/// 전달받은 요청을 리더가 처리하는 최대 시간
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct Routes {
@@ -33,6 +41,14 @@ impl MemRouter {
             from,
             router: self.clone(),
         }
+    }
+
+    /// `from` 노드가 쓸 리더 전달자. `Cluster::with_forwarder`에 넘긴다.
+    pub fn forwarder(&self, from: NodeId) -> Arc<MemForwarder> {
+        Arc::new(MemForwarder {
+            from,
+            router: self.clone(),
+        })
     }
 
     pub fn register(&self, id: NodeId, raft: Raft<TypeConfig>) {
@@ -67,6 +83,27 @@ impl MemRouter {
 
 fn unreachable(why: &str) -> Unreachable {
     Unreachable::new(&std::io::Error::other(why.to_string()))
+}
+
+pub struct MemForwarder {
+    from: NodeId,
+    router: MemRouter,
+}
+
+#[async_trait]
+impl Forwarder for MemForwarder {
+    async fn forward(
+        &self,
+        leader: NodeId,
+        _addr: &str,
+        req: LeaderRequest,
+    ) -> Result<u64, ClusterError> {
+        let raft = self
+            .router
+            .route(self.from, leader)
+            .map_err(|e| ClusterError::Unreachable(e.to_string()))?;
+        leader::execute(&raft, req, FORWARD_TIMEOUT).await
+    }
 }
 
 pub struct MemNetwork {

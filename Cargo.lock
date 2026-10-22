@@ -1169,6 +1169,7 @@ dependencies = [
 name = "opl-cluster"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "openraft",
  "opl-types",
  "redb",

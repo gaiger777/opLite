@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 openraft.workspace = true
 opl-types.workspace = true
 redb.workspace = true
