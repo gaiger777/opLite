@@ -1567,6 +1567,7 @@ dependencies = [
  "opl-api",
  "opl-cluster",
  "opl-driver",
+ "opl-peer",
  "opl-qemu",
  "opl-reconciler",
  "opl-types",

@@ -1,4 +1,5 @@
 //! M5 완료 기준: CLI로 VM을 만들어 콘솔에 붙고, opld를 kill -9 해도 VM이 계속 돌다가 다시 제어된다.
+//! API는 HTTPS, 콘솔은 WSS다.
 //! `cargo test -p opld --features qemu-it --test e2e`
 //! Apple Silicon Mac + `brew install qemu`가 필요하다.
 #![cfg(feature = "qemu-it")]
@@ -18,8 +19,9 @@ fn alive(pid: u64) -> bool {
 #[tokio::test]
 async fn cli_creates_vm_opens_console_and_survives_kill_9() {
     // 디스크에 OS가 없는 UEFI 게스트는 ACPI 종료에 응하지 않을 수 있다.
-    let mut d = Daemon::new("[reconciler]\nacpi_timeout_secs = 5\n");
+    let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
     d.start().await;
+    d.init("e2e").await;
     d.login().await;
 
     let pool = d.path("pool");

@@ -1,30 +1,35 @@
-//! opLite 노드 데몬. 클러스터 저장소, reconciler, Task 실행기, REST API를 한 프로세스로 묶는다.
+//! opLite 노드 데몬. 클러스터 저장소, 노드 간 통신, reconciler, Task 실행기, REST API를 한 프로세스로
+//! 묶는다.
+//!
+//! 노드 인증서(`{data_dir}/pki`)가 없으면 아직 클러스터에 속하지 않은 노드다. 이때는 제어 소켓만 열고
+//! `oplctl cluster init`(새 클러스터)이나 `oplctl cluster join`(합류)을 기다린다. 멤버가 되면 모든
+//! 것을 띄우고, `oplctl cluster leave`로 빠지면 다시 기다린다.
 //!
 //! QEMU는 `-daemonize`로 떠 있으므로 opld가 멈추거나 죽어도 VM은 계속 돈다. 다시 시작하면
 //! 하이퍼바이저 드라이버가 살아 있는 VM에 다시 붙고 reconciler가 이어서 맞춘다.
 
 mod bootstrap;
 mod config;
+mod control;
 mod host;
+mod join;
+mod member;
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::pin::pin;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
-use opl_api::{AppState, TaskRunner, TaskRunnerConfig};
-use opl_cluster::memnet::MemRouter;
-use opl_cluster::types::NodeId;
-use opl_cluster::{Cluster, ClusterConfig};
-use opl_driver::{DirStorage, Hypervisor, QemuConfig, QemuHypervisor, Storage};
-use opl_qemu::HostProfile;
-use opl_reconciler::{Reconciler, ReconcilerConfig};
+use opl_api::cluster::JoinUrl;
+use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
+use serde_json::json;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 use crate::config::Config;
-
-/// 종료 신호를 받은 뒤 열린 연결(watch, 콘솔)이 끝나기를 기다리는 시간
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+use crate::control::{ControlError, Request, Status};
+use crate::member::{Bootstrap, Member};
 
 #[derive(Parser)]
 #[command(version, about = "opLite node daemon")]
@@ -49,78 +54,196 @@ async fn main() -> anyhow::Result<()> {
 async fn run(config: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
     let node = bootstrap::node_id(&config.data_dir)?;
-    let id = NodeId(node);
-
-    // 노드 간 네트워크(gRPC + mTLS)는 계획 6에서 만든다. 그때까지는 1인 클러스터다.
-    let router = MemRouter::default();
-    let cluster = Arc::new(
-        Cluster::open(
-            ClusterConfig::new(id, config.data_dir.join("cluster")),
-            router.network(id),
-        )
-        .await?,
-    );
-    router.register(id, cluster.raft().clone());
-    bootstrap::start_cluster(&cluster, &config.listen).await?;
-    bootstrap::ensure_admin(&cluster, &config.data_dir).await?;
-    bootstrap::register_node(&cluster, &config).await?;
-    // 포트가 이미 쓰이고 있으면 작업자를 띄우기 전에 실패한다.
-    let listener = tokio::net::TcpListener::bind(&config.listen).await?;
-
-    let hv: Arc<dyn Hypervisor> = Arc::new(
-        QemuHypervisor::new(QemuConfig {
-            host: HostProfile::homebrew_hvf(&config.qemu_share_dir),
-            run_dir: config.run_dir.clone(),
-            state_dir: config.data_dir.clone(),
-        })
-        .await?,
-    );
-    let storage: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img));
-    let mut reconciler_config = ReconcilerConfig::new(node);
-    reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
-    let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
-    // Task 실행기는 시작할 때 Task 없는 업로드와 볼륨을 지운다. 그것이 끝난 뒤에 API를 연다.
-    let mut runner_config = TaskRunnerConfig::new(node);
-    runner_config.upload_dir = Some(config.data_dir.join("uploads"));
-    let runner =
-        TaskRunner::spawn(cluster.clone(), storage, reconciler.handle(), runner_config).await;
-    let state = Arc::new(AppState::new(
-        cluster.clone(),
+    let status = Arc::new(Mutex::new(Status {
         node,
-        hv,
-        config.data_dir.join("uploads"),
-    ));
+        name: config.name.clone(),
+        state: "uninitialized",
+        cluster: None,
+    }));
+    let (requests, mut control) = mpsc::channel(4);
+    let control_task = control::serve(&config.control_socket(), requests, status.clone()).await?;
+    let mut shutdown = pin!(shutdown_signal());
 
-    tracing::info!(node = %node, addr = %listener.local_addr()?, "opld is ready");
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let mut server = tokio::spawn(async move {
-        axum::serve(listener, opl_api::router(state))
-            .with_graceful_shutdown(async {
-                let _ = stop_rx.await;
-            })
-            .await
-    });
-
-    tokio::select! {
-        () = shutdown_signal() => {}
-        result = &mut server => {
-            // 서버가 스스로 멈췄다(포트 오류 등).
-            result??;
+    let result = async {
+        loop {
+            // 멤버가 아니면 init이나 join을 기다린다.
+            let mut member = match NodeTls::load(&member::pki_dir(&config))? {
+                Some(tls) => Member::start(&config, node, tls, Bootstrap::Restart).await?.0,
+                None => {
+                    tracing::info!(
+                        socket = %config.control_socket().display(),
+                        "this node is not in a cluster; waiting for `oplctl cluster init` or `oplctl cluster join`"
+                    );
+                    loop {
+                        let req = tokio::select! {
+                            () = &mut shutdown => return anyhow::Ok(()),
+                            req = control.recv() => req,
+                        };
+                        let Some(req) = req else { return Ok(()) };
+                        if let Some(member) = become_member(&config, node, req).await {
+                            break member;
+                        }
+                    }
+                }
+            };
+            let cluster_name = member
+                .cluster()
+                .list::<opl_types::cluster::ClusterSpec>()
+                .ok()
+                .and_then(|(_, l)| l.into_iter().next())
+                .map(|c| c.name);
+            {
+                let mut s = status.lock().unwrap();
+                s.state = "member";
+                s.cluster = cluster_name.clone();
+            }
+            // 멤버로 돈다.
+            let left = loop {
+                tokio::select! {
+                    () = &mut shutdown => {
+                        tracing::info!("shutting down; running VMs keep running");
+                        member.close(false).await?;
+                        return Ok(());
+                    }
+                    e = member.failed() => {
+                        let _ = member.close(false).await;
+                        return Err(e);
+                    }
+                    req = control.recv() => match req {
+                        Some(Request::Leave { reply }) => match member.leave().await {
+                            Ok(()) => break reply,
+                            Err(e) => {
+                                let _ = reply.send(Err(ControlError::failed(e)));
+                            }
+                        },
+                        Some(Request::Init { reply, .. } | Request::Join { reply, .. }) => {
+                            let message = format!(
+                                "this node is already a member of cluster {:?}",
+                                cluster_name.as_deref().unwrap_or("?")
+                            );
+                            let _ = reply.send(Err(ControlError::conflict(message)));
+                        }
+                        None => {
+                            member.close(false).await?;
+                            return Ok(());
+                        }
+                    },
+                }
+            };
+            let closed = member.close(true).await;
+            {
+                let mut s = status.lock().unwrap();
+                s.state = "uninitialized";
+                s.cluster = None;
+            }
+            match closed {
+                Ok(()) => {
+                    tracing::info!("left the cluster");
+                    let _ = left.send(Ok(json!({})));
+                }
+                Err(e) => {
+                    let _ = left.send(Err(ControlError::failed(e)));
+                }
+            }
         }
     }
-    tracing::info!("shutting down; running VMs keep running");
-    let _ = stop_tx.send(());
-    if tokio::time::timeout(DRAIN_TIMEOUT, &mut server)
-        .await
-        .is_err()
-    {
-        server.abort();
+    .await;
+    control_task.abort();
+    let _ = std::fs::remove_file(config.control_socket());
+    result
+}
+
+/// 미초기화 노드가 받은 요청을 처리한다. 멤버가 되면 그 멤버를 돌려준다.
+async fn become_member(config: &Config, node: Uuid, req: Request) -> Option<Member> {
+    let (bootstrap, tls, reply, cluster) = match req {
+        Request::Leave { reply } => {
+            let _ = reply.send(Err(ControlError::conflict(
+                "this node is not a member of a cluster",
+            )));
+            return None;
+        }
+        Request::Init {
+            cluster_name,
+            reply,
+        } => match new_cluster_tls(config, node, &cluster_name) {
+            Ok((ca, tls)) => (
+                Bootstrap::Init {
+                    name: cluster_name.clone(),
+                    ca,
+                },
+                tls,
+                reply,
+                cluster_name,
+            ),
+            Err(e) => {
+                let _ = reply.send(Err(ControlError::failed(e)));
+                return None;
+            }
+        },
+        Request::Join { url, reply } => {
+            let joined = async {
+                let url: JoinUrl = url.parse().map_err(anyhow::Error::msg)?;
+                join::request(config, node, &url).await
+            };
+            match joined.await {
+                Ok(joined) => (
+                    Bootstrap::Join { via: joined.via },
+                    joined.tls,
+                    reply,
+                    joined.cluster,
+                ),
+                Err(e) => {
+                    let _ = reply.send(Err(ControlError::failed(e)));
+                    return None;
+                }
+            }
+        }
+    };
+    // 인증서가 없는데 클러스터 저장소가 있으면 끝나지 않은 init/join이 남긴 것이다.
+    if member::cluster_dir(config).exists() {
+        tracing::warn!("removing cluster data left by an unfinished init or join");
+        if let Err(e) = member::remove_cluster_data(config) {
+            let _ = reply.send(Err(ControlError::failed(e.into())));
+            return None;
+        }
     }
-    runner.shutdown().await;
-    reconciler.shutdown().await;
-    bootstrap::mark_offline(&cluster).await;
-    cluster.shutdown().await?;
-    Ok(())
+    match Member::start(config, node, tls, bootstrap).await {
+        Ok((member, created)) => {
+            let mut answer = json!({ "cluster": cluster, "node": config.name });
+            if let Some(c) = created {
+                answer["admin_password"] = json!(c.admin_password);
+                answer["ca_fingerprint"] = json!(c.ca_fingerprint);
+                answer["join_url"] = json!(c.join_url);
+                answer["api_address"] = json!(config.api_address());
+            }
+            let _ = reply.send(Ok(answer));
+            Some(member)
+        }
+        Err(e) => {
+            tracing::error!(error = format!("{e:#}"), "cannot become a cluster member");
+            let _ = member::remove_cluster_data(config);
+            let _ = reply.send(Err(ControlError::failed(e)));
+            None
+        }
+    }
+}
+
+/// 새 클러스터의 CA와 이 노드의 인증서
+fn new_cluster_tls(
+    config: &Config,
+    node: Uuid,
+    name: &str,
+) -> anyhow::Result<(ClusterCa, NodeTls)> {
+    opl_types::resource::validate_name(name)?;
+    let ca = ClusterCa::generate(name)?;
+    let (key_pem, csr) = node_key_and_csr()?;
+    let cert_pem = ca.sign_node(&csr, node, &config.cert_names())?;
+    let tls = NodeTls {
+        ca_pem: ca.cert_pem.clone(),
+        cert_pem,
+        key_pem,
+    };
+    Ok((ca, tls))
 }
 
 async fn shutdown_signal() {

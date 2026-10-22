@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,11 +10,19 @@ use serde::Deserialize;
 pub struct Config {
     /// 노드 이름. 클러스터 안에서 유일해야 한다.
     pub name: String,
-    /// API를 받을 소켓 주소(`127.0.0.1:8006`, `[::1]:8006`). TLS는 클러스터 부트스트랩(계획 6)에서
-    /// 더하므로 그때까지는 루프백 주소만 받는다. 호스트 이름은 받지 않는다.
+    /// 다른 노드와 클라이언트가 이 노드에 닿는 호스트(IP나 DNS 이름). 노드 인증서에 들어가고,
+    /// 클러스터에 알리는 주소(`address:포트`)가 된다. 나중에 바꿀 수 없다.
+    pub address: String,
+    /// API(HTTPS)를 받을 소켓 주소
     #[serde(default = "default_listen")]
-    pub listen: String,
-    /// 클러스터 저장소, VM별 영구 파일, 올린 이미지를 둔다.
+    pub listen: SocketAddr,
+    /// 노드 간 통신(gRPC over mTLS)을 받을 소켓 주소
+    #[serde(default = "default_cluster_listen")]
+    pub cluster_listen: SocketAddr,
+    /// `oplctl cluster init|join|leave`를 받는 유닉스 소켓. 기본은 `{run_dir}/opld.sock`이다.
+    /// opld를 실행한 사용자만 쓸 수 있다(0600).
+    pub control_socket: Option<PathBuf>,
+    /// 클러스터 저장소, 노드 인증서, VM별 영구 파일, 올린 이미지를 둔다.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
     /// QEMU 소켓과 pidfile을 두는 휘발성 디렉터리. 유닉스 소켓 경로 길이 제한(104바이트) 때문에 짧아야 한다.
@@ -51,8 +59,11 @@ impl ReconcilerSection {
     }
 }
 
-fn default_listen() -> String {
-    "127.0.0.1:8006".into()
+fn default_listen() -> SocketAddr {
+    "0.0.0.0:8006".parse().unwrap()
+}
+fn default_cluster_listen() -> SocketAddr {
+    "0.0.0.0:8007".parse().unwrap()
 }
 fn default_data_dir() -> PathBuf {
     "/var/lib/opl".into()
@@ -70,6 +81,14 @@ fn default_acpi_timeout() -> u64 {
     60
 }
 
+/// `host:port`. IPv6 주소는 대괄호로 감싼다.
+fn with_port(host: &str, port: u16) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -80,13 +99,46 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        let listen = &self.listen;
-        match listen.parse::<SocketAddr>() {
-            Ok(addr) if addr.ip().is_loopback() => Ok(()),
-            _ => anyhow::bail!(
-                "listen must be a loopback address until TLS is supported (got {listen})"
-            ),
+        opl_types::resource::validate_name(&self.name)?;
+        let address = &self.address;
+        let ok = !address.is_empty()
+            && (address.parse::<IpAddr>().is_ok()
+                || address
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.'));
+        if !ok {
+            anyhow::bail!(
+                "address must be an IP address or a host name without a port (got {address:?})"
+            );
         }
+        Ok(())
+    }
+
+    /// 클러스터에 알리는 API 주소
+    pub fn api_address(&self) -> String {
+        with_port(&self.address, self.listen.port())
+    }
+
+    /// 클러스터에 알리는 노드 간 통신 주소(Raft 멤버십의 노드 주소)
+    pub fn cluster_address(&self) -> String {
+        with_port(&self.address, self.cluster_listen.port())
+    }
+
+    /// 노드 인증서의 이름: 알리는 호스트와 같은 기계에서 쓰는 이름
+    pub fn cert_names(&self) -> Vec<String> {
+        let mut names = vec![self.address.clone()];
+        for local in ["localhost", "127.0.0.1", "::1"] {
+            if self.address != local {
+                names.push(local.into());
+            }
+        }
+        names
+    }
+
+    pub fn control_socket(&self) -> PathBuf {
+        self.control_socket
+            .clone()
+            .unwrap_or_else(|| self.run_dir.join("opld.sock"))
     }
 }
 
@@ -94,32 +146,49 @@ impl Config {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fills_defaults() {
-        let c: Config = toml::from_str(r#"name = "node1""#).unwrap();
-        assert_eq!(c.listen, "127.0.0.1:8006");
-        assert_eq!(c.data_dir, Path::new("/var/lib/opl"));
-        assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(60));
+    fn parse(s: &str) -> Config {
+        toml::from_str(s).unwrap()
     }
 
     #[test]
-    fn rejects_unknown_keys() {
-        assert!(toml::from_str::<Config>("name = \"n\"\nlisten_addr = \"x\"").is_err());
-        let c: Config =
-            toml::from_str("name = \"n\"\n[reconciler]\nacpi_timeout_secs = 5").unwrap();
+    fn fills_defaults() {
+        let c = parse("name = \"node1\"\naddress = \"10.0.0.5\"");
+        assert_eq!(c.listen, "0.0.0.0:8006".parse().unwrap());
+        assert_eq!(c.api_address(), "10.0.0.5:8006");
+        assert_eq!(c.cluster_address(), "10.0.0.5:8007");
+        assert_eq!(c.data_dir, Path::new("/var/lib/opl"));
+        assert_eq!(c.control_socket(), Path::new("/run/opl/opld.sock"));
+        assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(60));
+        assert_eq!(
+            c.cert_names(),
+            ["10.0.0.5", "localhost", "127.0.0.1", "::1"]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_keys_and_missing_address() {
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\nlisten_addr = \"x\"").is_err()
+        );
+        assert!(toml::from_str::<Config>("name = \"n\"").is_err());
+        let c = parse("name = \"n\"\naddress = \"h\"\n[reconciler]\nacpi_timeout_secs = 5");
         assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(5));
     }
 
     #[test]
-    fn listen_must_be_loopback() {
-        let with = |listen: &str| Config {
-            listen: listen.into(),
-            ..toml::from_str(r#"name = "n""#).unwrap()
+    fn validates_name_and_address() {
+        let with = |name: &str, address: &str| Config {
+            name: name.into(),
+            address: address.into(),
+            ..parse("name = \"n\"\naddress = \"h\"")
         };
-        assert!(with("127.0.0.1:8006").validate().is_ok());
-        assert!(with("[::1]:8006").validate().is_ok());
-        for bad in ["0.0.0.0:8006", "10.0.0.1:8006", "localhost:8006"] {
-            assert!(with(bad).validate().is_err(), "{bad}");
+        assert!(with("node1", "10.0.0.5").validate().is_ok());
+        assert!(with("node1", "node1.lan").validate().is_ok());
+        assert!(with("node1", "::1").validate().is_ok());
+        assert!(with("Node_1", "10.0.0.5").validate().is_err());
+        for bad in ["", "10.0.0.5:8006", "a b", "[::1]"] {
+            assert!(with("node1", bad).validate().is_err(), "{bad}");
         }
+        assert_eq!(with("n", "::1").api_address(), "[::1]:8006");
     }
 }
