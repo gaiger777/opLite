@@ -20,6 +20,7 @@ getrandom.workspace = true
 hex.workspace = true
 opl-cluster.workspace = true
 opl-driver.workspace = true
+opl-peer.workspace = true
 opl-reconciler.workspace = true
 opl-types = { workspace = true, features = ["openapi"] }
 serde.workspace = true

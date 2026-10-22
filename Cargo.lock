@@ -1307,6 +1307,7 @@ dependencies = [
  "openraft",
  "opl-cluster",
  "opl-driver",
+ "opl-peer",
  "opl-reconciler",
  "opl-types",
  "reqwest",

@@ -99,10 +99,13 @@ pub async fn login(
         ));
     };
     let session = state.sessions.create(user.id);
-    let cookie = format!(
+    let mut cookie = format!(
         "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
         SESSION_TTL.as_secs()
     );
+    if state.secure_cookies {
+        cookie.push_str("; Secure");
+    }
     let mut response = Json(UserView::from(user)).into_response();
     response.headers_mut().insert(
         SET_COOKIE,

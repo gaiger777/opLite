@@ -169,38 +169,7 @@ impl Env {
 
     /// 로그인해 API 토큰을 만들고, 그 토큰을 쓰는 클라이언트를 돌려준다.
     pub async fn login(&self, user: &str, password: &str) -> Client {
-        let http = reqwest::Client::new();
-        let resp = http
-            .post(format!("{}/api/v1/auth/login", self.base))
-            .json(&json!({ "username": user, "password": password }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "login as {user}");
-        let cookie = resp
-            .headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string();
-        let resp = http
-            .post(format!("{}/api/v1/tokens", self.base))
-            .header("cookie", cookie)
-            .json(&json!({ "name": format!("{user}-{}", Uuid::new_v4().simple()) }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let body: Value = resp.json().await.unwrap();
-        Client {
-            base: self.base.clone(),
-            http,
-            token: Some(body["secret"].as_str().unwrap().to_string()),
-        }
+        login_at(&self.base, user, password).await
     }
 
     pub async fn admin(&self) -> Client {
@@ -327,6 +296,42 @@ impl Client {
             .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{task}");
         self.wait_task(&task).await
+    }
+}
+
+/// `base`의 API에 로그인해 API 토큰을 만들고, 그 토큰을 쓰는 클라이언트를 돌려준다.
+pub async fn login_at(base: &str, user: &str, password: &str) -> Client {
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&json!({ "username": user, "password": password }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "login as {user}");
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let resp = http
+        .post(format!("{base}/api/v1/tokens"))
+        .header("cookie", cookie)
+        .json(&json!({ "name": format!("{user}-{}", Uuid::new_v4().simple()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: Value = resp.json().await.unwrap();
+    Client {
+        base: base.to_string(),
+        http,
+        token: Some(body["secret"].as_str().unwrap().to_string()),
     }
 }
 

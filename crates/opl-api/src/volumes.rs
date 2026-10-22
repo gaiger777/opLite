@@ -71,16 +71,12 @@ pub async fn create_volume(
         return Err(ApiError::bad_request("size_bytes must be greater than 0"));
     }
     let pool = find_pool(&state, &req.spec.pool)?;
+    let node = pool_node(&state, &pool);
     let mut volume: Volume = Resource::new(req.name, req.spec);
     volume.labels = req.labels;
+    volume.status.node = Some(node);
     state.cluster.create(&volume).await?;
-    let task = create_task(
-        &state.cluster,
-        TaskOp::VolumeCreate,
-        volume.id,
-        pool_node(&state, &pool),
-    )
-    .await?;
+    let task = create_task(&state.cluster, TaskOp::VolumeCreate, volume.id, node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
@@ -133,7 +129,7 @@ pub async fn import_volume(
         ));
     }
     // 크기는 가져온 뒤 실제 이미지 크기로 바뀐다.
-    let volume: Volume = Resource::new(
+    let mut volume: Volume = Resource::new(
         q.name,
         VolumeSpec {
             pool: pool.name.clone(),
@@ -141,6 +137,7 @@ pub async fn import_volume(
             format: q.format,
         },
     );
+    volume.status.node = Some(state.node);
     let length = content_length(&headers)?;
     tokio::fs::create_dir_all(&state.upload_dir)
         .await

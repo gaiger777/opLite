@@ -529,9 +529,9 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
     }
 }
 
-/// 이전 opld가 남긴 고아를 지운다: 실행할 Task가 없는 Pending 볼륨(볼륨을 만든 뒤 Task를 만들기
-/// 전에, 또는 업로드 도중 opld가 죽었다)과, 가져오기 Task가 없는 올린 파일. `tasks`는
-/// `revision`에서 읽은 Task 목록이다.
+/// 이전 opld가 남긴 고아를 지운다: 이 노드가 만들던, 실행할 Task가 없는 Pending 볼륨(볼륨을 만든
+/// 뒤 Task를 만들기 전에, 또는 업로드 도중 opld가 죽었다)과, 가져오기 Task가 없는 올린 파일.
+/// `tasks`는 `revision`에서 읽은 Task 목록이다. 다른 노드가 만드는 볼륨은 그 노드가 정리한다.
 async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) {
     let unfinished: Vec<&Task> = tasks
         .iter()
@@ -542,7 +542,9 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) {
             for volume in volumes {
                 // Task 목록보다 나중에 만든 볼륨은 그 목록으로 판단할 수 없다(다른 노드의 API가
                 // 방금 만들었을 수 있다).
-                if volume.revision > revision {
+                if volume.revision > revision
+                    || volume.status.node.is_some_and(|n| n != ctx.config.node)
+                {
                     continue;
                 }
                 let has_task = unfinished.iter().any(|t| t.spec.target == volume.id);

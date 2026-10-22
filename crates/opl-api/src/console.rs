@@ -1,12 +1,16 @@
 //! `GET /api/v1/vms/{id}/console`: WebSocket 바이너리 메시지를 VM의 VNC 유닉스 소켓으로 잇는다.
+//! VM이 다른 노드에서 돌면 노드 간 gRPC로 그 노드에 중계한다.
 
 use std::sync::Arc;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::Response;
+use opl_cluster::types::NodeId;
 use opl_driver::DriverError;
+use opl_peer::{ConsoleError, ConsoleStream};
 use opl_types::resource::ResourceSpec;
 use opl_types::vm::VmSpec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,7 +21,6 @@ use crate::error::ApiError;
 use crate::resources::lookup;
 use crate::state::AppState;
 
-/// VM이 이 노드에서 돌고 있어야 한다. 다른 노드로 중계하는 것은 노드 간 통신이 생긴 뒤에 한다.
 #[utoipa::path(get, path = "/vms/{key}/console", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 101, description = "WebSocket carrying the VNC (RFB) stream"), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -35,8 +38,31 @@ pub async fn console(
             format!("VM {:?} is not running on this node", vm.name),
         )
     };
-    if vm.status.node != Some(state.node) {
+    let Some(node) = vm.status.node else {
         return Err(not_running());
+    };
+    if node != state.node {
+        let Some(peers) = &state.peers else {
+            return Err(not_running());
+        };
+        let Some(addr) = state
+            .cluster
+            .members()
+            .addr(NodeId(node))
+            .map(str::to_string)
+        else {
+            return Err(not_running());
+        };
+        let ws = ws?;
+        let stream = peers.console(&addr, vm.id).await.map_err(|e| match e {
+            ConsoleError::NotRunning => not_running(),
+            ConsoleError::Unavailable(_) => ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "console_unavailable",
+                format!("cannot reach the node running VM {:?}", vm.name),
+            ),
+        })?;
+        return Ok(ws.on_upgrade(move |socket| relay(socket, stream)));
     }
     let path = match state.hv.console_endpoint(vm.id).await {
         Ok(path) => path,
@@ -48,6 +74,32 @@ pub async fn console(
         .await
         .map_err(|_| not_running())?;
     Ok(ws.on_upgrade(move |socket| bridge(socket, vnc)))
+}
+
+/// WebSocket과 다른 노드의 콘솔 스트림을 잇는다.
+async fn relay(mut socket: WebSocket, mut stream: ConsoleStream) {
+    loop {
+        tokio::select! {
+            data = stream.recv() => match data {
+                Some(data) => {
+                    if socket.send(Message::binary(data)).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Binary(data))) => {
+                    if !stream.send(data).await {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    let _ = socket.send(Message::Close(None)).await;
 }
 
 async fn bridge(mut socket: WebSocket, mut vnc: UnixStream) {
