@@ -49,6 +49,8 @@ API 문서(OpenAPI)는 `https://127.0.0.1:8006/api/v1/openapi.json`에 있다.
 
 ## 개발
 
+Linux에서 빌드하려면 `libssl-dev`와 `pkg-config`가 필요하다(클라이언트 TLS가 native-tls다).
+
 ```bash
 cargo test --workspace                                              # 단위 테스트
 brew install qemu                                                   # macOS 통합 테스트용 (Linux: apt install qemu-utils)
