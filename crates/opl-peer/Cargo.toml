@@ -8,20 +8,34 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+openraft.workspace = true
+opl-cluster.workspace = true
+opl-driver.workspace = true
+opl-types.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 x509-parser.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
