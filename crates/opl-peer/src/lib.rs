@@ -12,7 +12,7 @@ mod server;
 pub mod tls;
 mod wire;
 
-pub use client::{ConsoleError, ConsoleStream, GrpcNetwork, Peers};
+pub use client::{ConsoleError, ConsoleReceiver, ConsoleSender, ConsoleStream, GrpcNetwork, Peers};
 pub use monitor::{NodeMonitor, NodeMonitorConfig};
 pub use server::{PeerService, ServeError, serve};
 

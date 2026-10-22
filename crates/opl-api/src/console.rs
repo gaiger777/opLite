@@ -8,6 +8,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use futures_util::{SinkExt, StreamExt};
 use opl_cluster::types::NodeId;
 use opl_driver::DriverError;
 use opl_peer::{ConsoleError, ConsoleStream};
@@ -76,30 +77,36 @@ pub async fn console(
     Ok(ws.on_upgrade(move |socket| bridge(socket, vnc)))
 }
 
-/// WebSocket과 다른 노드의 콘솔 스트림을 잇는다.
-async fn relay(mut socket: WebSocket, mut stream: ConsoleStream) {
-    loop {
-        tokio::select! {
-            data = stream.recv() => match data {
-                Some(data) => {
-                    if socket.send(Message::binary(data)).await.is_err() {
+/// WebSocket과 다른 노드의 콘솔 스트림을 잇는다. 한쪽이 막혀도 다른 쪽이 멈추지 않게 두 방향을
+/// 따로 돌리고, 어느 한 방향이 끝나면 끝낸다.
+async fn relay(socket: WebSocket, stream: ConsoleStream) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (sender, mut receiver) = stream.into_split();
+    let to_vm = async {
+        while let Some(msg) = ws_rx.next().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    if !sender.send(data).await {
                         break;
                     }
                 }
-                None => break,
-            },
-            msg = socket.recv() => match msg {
-                Some(Ok(Message::Binary(data))) => {
-                    if !stream.send(data).await {
-                        break;
-                    }
-                }
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                Some(Ok(_)) => {}
-            },
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
         }
+    };
+    let from_vm = async {
+        while let Some(data) = receiver.recv().await {
+            if ws_tx.send(Message::binary(data)).await.is_err() {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        _ = to_vm => {}
+        _ = from_vm => {}
     }
-    let _ = socket.send(Message::Close(None)).await;
+    let _ = ws_tx.send(Message::Close(None)).await;
 }
 
 async fn bridge(mut socket: WebSocket, mut vnc: UnixStream) {

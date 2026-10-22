@@ -124,7 +124,10 @@ impl Peers {
             .await
             .map_err(unavailable)?
             .into_inner();
-        Ok(ConsoleStream { tx, inbound })
+        Ok(ConsoleStream {
+            sender: ConsoleSender { tx },
+            receiver: ConsoleReceiver { inbound },
+        })
     }
 }
 
@@ -138,16 +141,45 @@ pub enum ConsoleError {
 
 /// 다른 노드의 VM 콘솔 연결
 pub struct ConsoleStream {
-    tx: tokio::sync::mpsc::Sender<Bytes>,
-    inbound: Streaming<Bytes>,
+    sender: ConsoleSender,
+    receiver: ConsoleReceiver,
 }
 
 impl ConsoleStream {
     /// VNC로 보낸다. 연결이 끝났으면 false다.
     pub async fn send(&self, data: Bytes) -> bool {
-        self.tx.send(data).await.is_ok()
+        self.sender.send(data).await
     }
 
+    /// VNC가 보낸 다음 바이트. 연결이 끝났으면 `None`이다.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.receiver.recv().await
+    }
+
+    /// 보내는 쪽과 받는 쪽으로 나눈다(두 방향을 따로 돌릴 때).
+    pub fn into_split(self) -> (ConsoleSender, ConsoleReceiver) {
+        (self.sender, self.receiver)
+    }
+}
+
+/// 콘솔 연결의 보내는 쪽
+pub struct ConsoleSender {
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+}
+
+impl ConsoleSender {
+    /// VNC로 보낸다. 연결이 끝났으면 false다.
+    pub async fn send(&self, data: Bytes) -> bool {
+        self.tx.send(data).await.is_ok()
+    }
+}
+
+/// 콘솔 연결의 받는 쪽
+pub struct ConsoleReceiver {
+    inbound: Streaming<Bytes>,
+}
+
+impl ConsoleReceiver {
     /// VNC가 보낸 다음 바이트. 연결이 끝났으면 `None`이다.
     pub async fn recv(&mut self) -> Option<Bytes> {
         self.inbound.message().await.ok().flatten()
