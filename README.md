@@ -4,20 +4,23 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 개발 초기 (M5)
+- 상태: 개발 초기 (M6)
 
 ## 실행 (macOS, Apple Silicon)
 
 ```bash
 brew install qemu
-cat > opld.toml <<'TOML'
+mkdir -p /tmp/opl
+cat > /tmp/opl/node1.toml <<'TOML'
 name = "node1"
-data_dir = "/tmp/opl/data"
-run_dir = "/tmp/opl/run"
+address = "127.0.0.1"          # 다른 노드와 클라이언트가 이 노드에 닿는 호스트
+data_dir = "/tmp/opl/node1"
+run_dir = "/tmp/opl/run1"
 TOML
-cargo run -p opld -- --config opld.toml          # API: http://127.0.0.1:8006
-cargo run -p oplctl -- login --server http://127.0.0.1:8006 \
-    --password-file /tmp/opl/data/initial-admin-password
+cargo run -p opld -- --config /tmp/opl/node1.toml &       # 제어 소켓: /tmp/opl/run1/opld.sock
+cargo run -p oplctl -- cluster init --name dev --socket /tmp/opl/run1/opld.sock
+# 출력된 admin 비밀번호와 CA 지문으로 로그인한다(API: https://127.0.0.1:8006).
+cargo run -p oplctl -- login --server https://127.0.0.1:8006 --ca-fingerprint sha256:...
 mkdir -p /tmp/opl/pool
 cargo run -p oplctl -- pool create local --path /tmp/opl/pool
 cargo run -p oplctl -- volume create root --pool local --size 1G
@@ -25,7 +28,24 @@ cargo run -p oplctl -- vm create web --memory 512 --disk root --nic user --start
 cargo run -p oplctl -- vm console web            # 출력된 vnc:// 주소를 VNC 뷰어로 연다
 ```
 
-API 문서(OpenAPI)는 `http://127.0.0.1:8006/api/v1/openapi.json`에 있다.
+같은 Mac에 노드를 더하려면 포트와 디렉터리를 바꿔 opld를 하나 더 띄우고, 조인 URL로 합류한다.
+
+```bash
+cat > /tmp/opl/node2.toml <<'TOML'
+name = "node2"
+address = "127.0.0.1"
+listen = "127.0.0.1:8016"
+cluster_listen = "127.0.0.1:8017"
+data_dir = "/tmp/opl/node2"
+run_dir = "/tmp/opl/run2"
+TOML
+cargo run -p opld -- --config /tmp/opl/node2.toml &
+cargo run -p oplctl -- cluster join "$(cargo run -q -p oplctl -- cluster join-token)" \
+    --socket /tmp/opl/run2/opld.sock
+cargo run -p oplctl -- cluster status
+```
+
+API 문서(OpenAPI)는 `https://127.0.0.1:8006/api/v1/openapi.json`에 있다.
 
 ## 개발
 
@@ -38,6 +58,7 @@ cargo test -p opl-driver --features qemu-it --test qemu_driver      # 드라이�
 cargo test -p opl-reconciler --features qemu-it --test qemu_restart # reconciler: opld 재시작 후 재연결
 cargo test -p opl-api --features storage-it --test volumes          # API: 볼륨 생성·가져오기 (qemu-img)
 cargo test -p opld --features qemu-it --test e2e                    # E2E: CLI → VM → 콘솔 → kill -9 → 재연결
+cargo test -p opld --test cluster                                   # E2E: opld 프로세스 3개로 클러스터 구성
 ```
 
 ## 문서
@@ -48,3 +69,4 @@ cargo test -p opld --features qemu-it --test e2e                    # E2E: CLI �
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)
 - [계획 4: reconciler](docs/superpowers/plans/2026-10-21-plan4-opl-reconciler.md)
 - [계획 5: API, opld, oplctl](docs/superpowers/plans/2026-10-21-plan5-api-opld-oplctl.md)
+- [계획 6: 클러스터 부트스트랩, 노드 간 통신](docs/superpowers/plans/2026-10-22-plan6-cluster-bootstrap.md)

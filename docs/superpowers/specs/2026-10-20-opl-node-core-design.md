@@ -70,7 +70,8 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 | `opl-types` | 리소스 모델(VmSpec, VolumeSpec 등), serde 스키마 | 공개 |
 | `opl-qemu` | QMP 클라이언트 + QEMU 커맨드라인 생성기 | 공개 |
 | `opl-driver` | `Hypervisor`/`Storage`/`Network` 트레이트, Mock·QemuHvf·QemuKvm 구현 | 공개 |
-| `opl-cluster` | openraft 상태 머신, 리소스 저장소, watch 스트림 | 공개 |
+| `opl-cluster` | openraft 상태 머신, 리소스 저장소, watch 스트림, 리더 전달 | 공개 |
+| `opl-peer` | 노드 간 통신(gRPC over mTLS: Raft RPC, 리더 전달, 생존 확인, 콘솔 중계), 클러스터 PKI | 공개 |
 | `opl-reconciler` | 조정 루프, VM별 작업 큐 | 공개 |
 | `opl-api` | REST/WebSocket, 인증, `Authorizer` 훅 | 공개 |
 | `opld` | 데몬 바이너리 조립 | 공개 |
@@ -109,10 +110,14 @@ struct Resource<S, T> {
 | `Node` | 이름, 주소, 유지보수 모드 | 온라인 여부, CPU/메모리 용량, 하이퍼바이저 종류와 기능 |
 | `Vm` | vCPU, 메모리, 펌웨어(bios/uefi), 머신 타입, 디스크·NIC, `power`, `node`(선택), `restart` 정책 | 실제 전원 상태, 실행 노드, QEMU PID, 오류 조건 |
 | `StoragePool` | 종류(`dir`), 경로, 사용할 노드, `shared: bool` | 용량, 사용량 |
-| `Volume` | 소속 풀, 크기, 형식(qcow2/raw) | 준비 상태(Pending/Ready), 할당 크기 |
+| `Volume` | 소속 풀, 크기, 형식(qcow2/raw) | 준비 상태(Pending/Ready), 할당 크기, 파일을 만드는 노드 |
 | `Network` | 종류(`user`/`bridge`), 브리지 이름, VLAN 태그 | — |
 | `Task` | 작업 종류, 대상 리소스, 실행 노드 | 상태(Pending/Running/Succeeded/Failed), 오류 |
 | `User`, `ApiToken` | 사용자 이름, 비밀번호 해시(argon2), 역할 / 주인, 토큰 비밀 값의 SHA-256 | — |
+| `Cluster` | 클러스터 이름(리소스 이름), CA 인증서와 개인키(API로 내보내지 않는다) | — |
+| `JoinToken` | 비밀 값의 SHA-256, 만료 시각 | — |
+
+VM이 붙인 볼륨과 NIC의 MAC 주소는 클러스터 안에서 VM 하나만 쓸 수 있다. 여러 노드의 API가 동시에 써도 겹치지 않도록 상태 머신이 커밋 순서대로 확인한다(`Rejection::InUse`, API는 409).
 
 `Vm` spec 예시:
 
@@ -144,7 +149,9 @@ spec:
   - `stop?mode=force`는 reconciler의 VM별 작업자 큐로 강제 종료를 보낸다. `reboot`은 원하는 상태를 stopped로 바꿨다가 꺼지면 running으로 되돌린다. 그 사이 같은 VM에 새 요청이 오면 그것을 따른다.
 - 볼륨 생성·삭제와 이미지 가져오기(`POST /api/v1/volumes/import`, 본문이 이미지)도 Task다. 파일이 준비되기 전의 볼륨은 VM에 붙일 수 없다.
 - 감시: `GET /api/v1/watch?kinds=vm,task&since=<revision>` (WebSocket). 목록의 revision 다음 변경부터 받는다. 이어 받을 수 없으면 오류 메시지를 보내고 닫으며, 클라이언트는 목록을 다시 읽는다. 사용자와 토큰은 감시할 수 없다.
-- 콘솔: `GET /api/v1/vms/{id}/console` (WebSocket). 실행 노드의 QEMU VNC로 프록시한다. 다른 노드에서 요청하면 노드 간 gRPC로 중계한다(M6).
+- 콘솔: `GET /api/v1/vms/{id}/console` (WebSocket). 실행 노드의 QEMU VNC로 프록시한다. 다른 노드에서 요청하면 노드 간 gRPC로 중계한다.
+- 클러스터: `GET /api/v1/cluster`(이름, CA 지문, 리더, 멤버), `GET /api/v1/cluster/ca`(인증 없음), `POST /api/v1/cluster/join-tokens`(관리자), `POST /api/v1/cluster/join`(조인 토큰으로 인증), `DELETE /api/v1/nodes/{id}`(오프라인 노드만).
+- 팔로워가 받은 쓰기는 리더로 전달된다. 응답은 그 쓰기가 이 노드에도 적용된 뒤에 오므로, 같은 노드에서 곧바로 읽으면 결과가 보인다.
 - OpenAPI 스펙은 `utoipa`로 코드에서 생성해 `GET /api/v1/openapi.json`으로 내보낸다. 라우터와 같은 정의에서 만든다.
 - 인증: 로컬 사용자(세션 쿠키, 웹 UI용)와 API 토큰(Bearer, CLI용)을 지원한다. 토큰은 `opl_<id>_<비밀 값>`이고 비밀 값의 SHA-256만 저장한다. 쿠키로 인증한 요청에 `Origin`이 있으면 서버와 같아야 한다. 자기 비밀번호를 바꿀 때는 현재 비밀번호가 필요하고, 바꾸면 그 사용자의 세션이 끝난다. 모든 핸들러는 `Authorizer::check(principal, action, resource)`를 거친다. 1차 구현은 `admin`/`operator`/`viewer` 고정 역할이다.
 - 오류 응답은 `{ "code": "...", "message": "...", "details": {...} }` 형식으로 통일한다. Raft 과반수가 없으면 `503 cluster_no_quorum`, revision이 다르면 `412 revision_mismatch`, 이름이 겹치면 `409 name_taken`을 반환한다.
@@ -243,19 +250,22 @@ trait Storage: Send + Sync {
 ## 8. 클러스터 부트스트랩과 보안
 
 ```
-node1$ oplctl cluster init --name prod
+node1$ oplctl cluster init --name prod          # 이 노드의 opld에 제어 소켓으로 요청한다
        → 클러스터 CA 생성, node1 인증서 발급, 1인 Raft 클러스터 시작, admin 계정 생성
-       → 조인 토큰 출력: opl-join://node1:8006?token=…&ca_fp=sha256:…
+       → admin 비밀번호(한 번만), CA 지문, 조인 URL 출력: opl-join://node1:8006?token=…&ca=sha256:…
 
 node2$ oplctl cluster join 'opl-join://…'
        → CA 지문 검증 → 토큰으로 CSR 서명 받기 → learner로 합류 → 로그 따라잡은 뒤 voter로 승격
 ```
 
-- 조인 토큰은 일회용이고 유효 시간이 정해져 있다(기본 1시간). Raft에는 해시만 저장한다.
-- 노드 간 통신은 모두 mTLS(rustls)를 쓴다. 외부 API(8006)는 기본적으로 클러스터 CA 인증서를 쓰고, 사용자 인증서로 교체할 수 있다.
-- `oplctl cluster leave`(정상 탈퇴)와 `oplctl cluster remove-node --force`(죽은 노드 제거)를 지원한다. 멤버십 변경은 openraft의 joint consensus로 처리한다.
-- 2노드 클러스터는 생성할 수 있지만 경고를 표시한다. 위트니스는 하위 프로젝트 5에서 다룬다.
-- M5까지는 `opld`가 첫 시작에서 1인 클러스터를 만들고, 사용자가 없으면 `admin`을 만들어 비밀번호를 `{data_dir}/initial-admin-password`(0600)에 남긴다. API는 루프백 HTTP로만 연다. `cluster init`과 HTTPS가 생기면(M6) 그쪽으로 옮긴다.
+- 노드 인증서(`{data_dir}/pki`)가 없는 opld는 클러스터에 속하지 않은 노드다. 제어 소켓(`{run_dir}/opld.sock`, 0600)만 열고 `init`이나 `join`을 기다린다. 인증서는 init/join의 마지막에 저장하므로, 도중에 실패하면 노드는 미초기화로 남고 남은 클러스터 저장소는 다음 시도에서 지운다.
+- 조인 토큰은 일회용이고 유효 시간이 정해져 있다(기본 1시간, 최대 7일). Raft에는 해시만 저장한다. 더 필요하면 관리자가 `oplctl cluster join-token`으로 만든다. 합류를 받는 노드는 토큰을 지워 한 번만 쓰게 하고, CSR에서 공개키만 써서 서명한다(이름, 용도, 기간은 서명하는 쪽이 정한다). 노드 인증서의 CN은 노드 id다.
+- CA 개인키는 Raft에 복제한다(`Cluster` 리소스). 어느 노드든 합류를 받을 수 있고, 첫 노드가 죽어도 노드를 더할 수 있다. Proxmox(pmxcfs)와 같은 방식이다.
+- 노드 간 통신(기본 8007)은 gRPC(tonic) over mTLS(rustls)다. `.proto` 대신 Rust 타입을 serde JSON으로 보내므로 `protoc`가 필요 없다. 서비스는 Raft RPC, 리더 전달, 생존 확인(Ping), 콘솔 중계다. 서버는 상대 인증서의 노드 id가 지금 멤버인지 확인해 제거된 노드를 막는다.
+- 외부 API(기본 8006)는 클러스터 CA가 서명한 노드 인증서로 HTTPS를 연다. `oplctl`은 처음 로그인할 때 CA 지문(`--ca-fingerprint`)으로 서버를 확인하고 CA를 저장한다. 클라이언트 쪽 TLS는 OS 구현(native-tls)이다. macOS는 유효 기간이 825일을 넘는 서버 인증서를 거부하므로 노드 인증서는 824일짜리이고, 만료 전에 갱신해야 한다. 사용자 인증서로 교체하는 것은 나중에 한다. 세션 쿠키에는 `Secure`를 붙인다.
+- 리더는 2초마다 다른 노드에 Ping을 보내 10초 동안 응답이 없으면 `NodeStatus.online`을 false로 기록한다(바뀔 때만 기록한다). 스케줄러가 이 값을 본다.
+- `oplctl cluster leave`(정상 탈퇴)는 이 노드에 배정된 VM이 있거나 이 노드가 유일한 투표 멤버면 거부한다. Node 리소스를 지우고 멤버십에서 빠진 뒤, 클러스터 저장소와 노드 인증서를 지우고 미초기화 상태로 돌아간다. `oplctl cluster remove-node --force`(죽은 노드 제거)는 오프라인 노드만 뺀다. 멤버십 변경은 openraft의 joint consensus로 처리한다.
+- 2노드 클러스터는 만들 수 있지만 `oplctl cluster status`가 경고를 표시한다. 위트니스는 하위 프로젝트 5에서 다룬다.
 
 ## 9. 범위 밖 (1차)
 
@@ -270,6 +280,7 @@ HA와 펜싱, 라이브 마이그레이션, 스냅샷과 백업, 공유 스토�
 | 클러스터 | 한 프로세스 안의 3노드(인메모리 네트워크), 리더 장애, 네트워크 분할 | openraft 테스트 하네스 | macOS, CI |
 | 통합 | 실제 QEMU: 기동, QMP, 종료, opld 재시작 후 재연결 | `--features qemu-it` | macOS(hvf), Linux |
 | E2E | oplctl로 VM 생성 → 콘솔 → opld kill -9 → 재연결 (opld 프로세스 + oplctl 라이브러리) | `--features qemu-it` | macOS(hvf) (M5) |
+| E2E | oplctl로 클러스터 구성 → 아무 노드로 쓰기 → 리더 kill -9 → 노드 제거·탈퇴·재합류 (opld 프로세스 3개) | `cargo test` | macOS, CI (M6) |
 | E2E | oplctl로 클러스터 구성 → VM 생성 → 콘솔 → 노드 제거 | 셸 스크립트 + 소형 게스트 이미지 | Linux (M7) |
 
 반드시 회귀 테스트로 고정할 불변식:
@@ -300,10 +311,10 @@ M0부터 M6까지는 macOS에서 진행한다. M7은 Linux/KVM 환경이 필요�
 |---|---|
 | 비동기 런타임 | `tokio` |
 | HTTP/WebSocket | `axum`, `tower` |
-| 노드 간 RPC | `tonic`, `prost` |
+| 노드 간 RPC | `tonic`(수동 서비스 정의, serde JSON 메시지) |
 | 합의 | `openraft` |
 | 내장 저장소 | `redb` |
-| TLS/PKI | `rustls`, `rcgen` |
+| TLS/PKI | `rustls`(ring), `rcgen`, 클라이언트는 `native-tls` |
 | 직렬화 | `serde`, `serde_json`, `serde_yaml` |
 | OpenAPI | `utoipa` |
 | 오류 | `thiserror`(라이브러리), `anyhow`(바이너리) |
