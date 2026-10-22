@@ -2,6 +2,7 @@
 //! VM이 다른 노드에서 돌면 노드 간 gRPC로 그 노드에 중계한다.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -21,6 +22,10 @@ use crate::auth::{Action, Principal};
 use crate::error::ApiError;
 use crate::resources::lookup;
 use crate::state::AppState;
+
+/// 다른 노드에 콘솔 스트림을 여는 데 허용하는 시간. TCP 연결 뒤 TLS/HTTP2/헤더 단계에서 멈추는
+/// 노드 때문에 요청이 매달리지 않게 한다. 열린 뒤의 스트림에는 적용하지 않는다.
+const CONSOLE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[utoipa::path(get, path = "/vms/{key}/console", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
@@ -55,14 +60,22 @@ pub async fn console(
             return Err(not_running());
         };
         let ws = ws?;
-        let stream = peers.console(&addr, vm.id).await.map_err(|e| match e {
-            ConsoleError::NotRunning => not_running(),
-            ConsoleError::Unavailable(_) => ApiError::new(
+        let unavailable = || {
+            ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "console_unavailable",
                 format!("cannot reach the node running VM {:?}", vm.name),
-            ),
-        })?;
+            )
+        };
+        let stream = tokio::time::timeout(CONSOLE_OPEN_TIMEOUT, peers.console(&addr, vm.id))
+            .await
+            .map_err(|_| unavailable())?
+            .map_err(|e| match e {
+                ConsoleError::NotRunning => {
+                    ApiError::conflict("vm_not_running", format!("VM {:?} is not running", vm.name))
+                }
+                ConsoleError::Unavailable(_) => unavailable(),
+            })?;
         return Ok(ws.on_upgrade(move |socket| relay(socket, stream)));
     }
     let path = match state.hv.console_endpoint(vm.id).await {

@@ -205,12 +205,14 @@ async fn console_of_a_vm_on_another_node_is_relayed() {
         .unwrap();
     assert_eq!(greeting, Message::binary(b"RFB 003.008\n".to_vec()));
     ws.send(Message::binary(b"ping".to_vec())).await.unwrap();
-    assert_eq!(
-        ws.next().await.unwrap().unwrap(),
-        Message::binary(b"ping".to_vec())
-    );
+    let echo = tokio::time::timeout(WAIT, ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo, Message::binary(b"ping".to_vec()));
 
-    // B에서 만든 것은 A에서도 곧 보인다(같은 저장소).
+    // A의 API로 만든 VM은 B에서도 곧 보인다(같은 저장소).
     let admin_b = login_at(&b.base, "admin", ADMIN_PASSWORD).await;
     let deadline = Instant::now() + WAIT;
     while admin_b.get("/vms/web").await.0 != StatusCode::OK {
