@@ -88,6 +88,10 @@ async fn tick(
         last_seen.clear();
         return;
     }
+    // 새 리더는 이전 커밋을 아직 적용하지 않았을 수 있으므로 장벽 뒤에 목록을 읽는다.
+    if cluster.read_barrier().await.is_err() {
+        return;
+    }
     let Ok((_, nodes)) = cluster.list::<NodeSpec>() else {
         return;
     };
