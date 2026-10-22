@@ -64,7 +64,7 @@ impl TestCluster {
 
     /// 팔로워가 요청을 리더로 전달하는 클러스터
     pub async fn start_forwarding(n: u64) -> Self {
-        Self::build(n, raft_config(), Duration::from_secs(5), true).await
+        Self::build(n, raft_config(), Duration::from_secs(10), true).await
     }
 
     async fn build(n: u64, raft: openraft::Config, write_timeout: Duration, forward: bool) -> Self {

@@ -275,6 +275,11 @@ impl Cluster {
                     .await
                     {
                         Err(_) => Err(ClusterError::Timeout),
+                        // 자기 자신을 뺀 요청이면 리더가 더는 이 노드에 복제하지 않으므로
+                        // 적용을 기다리면 제한 시간까지 멈춘다.
+                        Ok(Ok(index)) if matches!(req, LeaderRequest::Remove { id } if id == self.id) => {
+                            Ok(index)
+                        }
                         Ok(Ok(index)) => {
                             let _ = self
                                 .raft

@@ -225,10 +225,14 @@ async fn membership_changes_go_through_any_member() {
         .await
         .unwrap();
 
+    // 자기 자신을 빼면 이 노드에 적용되기를 기다리지 않고 곧바로 돌아온다.
+    let started = std::time::Instant::now();
     tc.get(n4)
         .request(LeaderRequest::Remove { id: n4 })
         .await
         .unwrap();
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "self-removal took {took:?}");
     let members = tc.get(leader).members();
     assert!(!members.contains(n4));
     assert_eq!(members.voters.len(), 3);

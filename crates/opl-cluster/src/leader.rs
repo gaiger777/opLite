@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use openraft::{BasicNode, ChangeMembers, Raft};
+use openraft::{BasicNode, ChangeMembers, Raft, RaftMetrics};
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::ClusterError;
@@ -102,6 +102,10 @@ pub(crate) async fn execute(
         }
         LeaderRequest::AddVoter { id } => {
             let m = raft.metrics().borrow().clone();
+            // 아래 지름길은 리더의 멤버십으로만 판단한다. 뒤처진 팔로워가 답하면 안 된다.
+            if m.state != openraft::ServerState::Leader {
+                return Err(not_leader(&m));
+            }
             let membership = m.membership_config.membership();
             if membership.voter_ids().any(|v| v == id) {
                 return Ok(m.last_applied.map_or(0, |l| l.index));
@@ -128,6 +132,9 @@ pub(crate) async fn execute(
         }
         LeaderRequest::Remove { id } => {
             let m = raft.metrics().borrow().clone();
+            if m.state != openraft::ServerState::Leader {
+                return Err(not_leader(&m));
+            }
             let membership = m.membership_config.membership();
             let change = if membership.voter_ids().any(|v| v == id) {
                 ChangeMembers::RemoveVoters(BTreeSet::from([id]))
@@ -141,5 +148,20 @@ pub(crate) async fn execute(
                 .map_err(|_| ClusterError::Timeout)??;
             Ok(resp.log_id.index)
         }
+    }
+}
+
+/// 이 노드가 아는 리더와 그 주소로 `NotLeader`를 만든다. openraft의 `change_membership`은
+/// 리더인지 보기 전에 변경을 검사하므로, 팔로워에서는 `ForwardToLeader` 대신 검사 오류가 날 수 있다.
+fn not_leader(m: &RaftMetrics<NodeId, BasicNode>) -> ClusterError {
+    let leader_addr = m.current_leader.and_then(|l| {
+        m.membership_config
+            .membership()
+            .get_node(&l)
+            .map(|n| n.addr.clone())
+    });
+    ClusterError::NotLeader {
+        leader_id: m.current_leader,
+        leader_addr,
     }
 }
