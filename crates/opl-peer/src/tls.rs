@@ -9,7 +9,7 @@ use rustls::ServerConfig;
 use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::pem::PemObject;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
@@ -18,6 +18,9 @@ use crate::pki::{NodeTls, PkiError, first_cert};
 
 /// TLS 핸드셰이크를 기다리는 최대 시간. 느린 클라이언트가 연결을 붙잡고 있지 못하게 한다.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 동시에 진행하는 TLS 핸드셰이크의 최대 수. 다 차면 새 연결을 받지 않고 기다려, 끝나지 않는
+/// 연결이 몰려도 파일 디스크립터를 다 쓰지 않는다.
+const MAX_HANDSHAKES: usize = 256;
 
 /// 외부 API용 서버 설정. 클라이언트 인증서는 요구하지 않는다(사용자 인증은 API가 한다).
 pub fn api_server_config(tls: &NodeTls) -> Result<ServerConfig, PkiError> {
@@ -48,8 +51,13 @@ impl TlsListener {
         let local = tcp.local_addr()?;
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let (tx, rx) = mpsc::channel(64);
+        let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
         let accept = tokio::spawn(async move {
             loop {
+                let permit = match handshakes.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
                 let (stream, addr) = match tcp.accept().await {
                     Ok(conn) => conn,
                     Err(e) => {
@@ -61,6 +69,7 @@ impl TlsListener {
                 let acceptor = acceptor.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                         Ok(Ok(tls)) => {
                             let _ = tx.send((tls, addr)).await;

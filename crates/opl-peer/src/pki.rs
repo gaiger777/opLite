@@ -10,7 +10,7 @@ use std::path::Path;
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SerialNumber,
 };
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
@@ -67,6 +67,7 @@ impl ClusterCa {
             KeyUsagePurpose::DigitalSignature,
         ];
         set_validity(&mut params, CA_DAYS);
+        params.serial_number = Some(random_serial());
         let cert = params.self_signed(&key)?;
         Ok(Self {
             cert_pem: cert.pem(),
@@ -92,6 +93,7 @@ impl ClusterCa {
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
         set_validity(&mut params, NODE_DAYS);
+        params.serial_number = Some(random_serial());
         let issuer = Issuer::from_ca_cert_pem(&self.cert_pem, KeyPair::from_pem(&self.key_pem)?)?;
         let cert = CertificateSigningRequestParams {
             params,
@@ -107,6 +109,15 @@ fn set_validity(params: &mut CertificateParams, days: i64) {
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::days(1);
     params.not_after = now + time::Duration::days(days);
+}
+
+/// 무작위 128비트 일련번호. 같은 키에 두 번 서명해도 일련번호가 겹치지 않는다. 맨 윗비트를 지워 양수로
+/// 만든다(RFC 5280).
+fn random_serial() -> SerialNumber {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("system random source");
+    bytes[0] &= 0x7f;
+    SerialNumber::from_slice(&bytes)
 }
 
 /// 노드 키와 CSR(PEM)을 만든다. 이름은 서명하는 쪽이 정하므로 CSR에는 넣지 않는다.
@@ -151,7 +162,7 @@ impl fmt::Debug for NodeTls {
 impl NodeTls {
     /// `dir`이 없으면 `None`이다(아직 클러스터에 속하지 않은 노드).
     pub fn load(dir: &Path) -> Result<Option<Self>, PkiError> {
-        if !dir.exists() {
+        if !dir.try_exists()? {
             return Ok(None);
         }
         let read = |name: &str| std::fs::read_to_string(dir.join(name));
@@ -186,7 +197,14 @@ impl NodeTls {
             file.write_all(content.as_bytes())?;
             file.sync_all()?;
         }
+        // 이름을 바꾼 뒤 전원이 나가도 `dir`이 남도록 임시 디렉터리와 부모 디렉터리를 디스크에 쓴다.
+        std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, dir)?;
+        let parent = match dir.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 }
@@ -229,6 +247,21 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("evil"), "{shown}");
+    }
+
+    #[test]
+    fn same_csr_signed_twice_gets_different_serials() {
+        let ca = ClusterCa::generate("prod").unwrap();
+        let (_, csr) = node_key_and_csr().unwrap();
+        let node = Uuid::now_v7();
+        let serial = |pem: &str| {
+            let der = first_cert(pem).unwrap();
+            let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+            cert.raw_serial().to_vec()
+        };
+        let a = serial(&ca.sign_node(&csr, node, &["127.0.0.1".into()]).unwrap());
+        let b = serial(&ca.sign_node(&csr, node, &["127.0.0.1".into()]).unwrap());
+        assert_ne!(a, b);
     }
 
     #[test]
