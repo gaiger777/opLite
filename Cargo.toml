@@ -13,6 +13,7 @@ repository = "https://github.com/gaiger777/opLite"
 opl-types = { path = "crates/opl-types" }
 opl-qemu = { path = "crates/opl-qemu" }
 opl-cluster = { path = "crates/opl-cluster" }
+opl-peer = { path = "crates/opl-peer" }
 opl-driver = { path = "crates/opl-driver" }
 opl-reconciler = { path = "crates/opl-reconciler" }
 opl-api = { path = "crates/opl-api" }
@@ -46,3 +47,13 @@ rpassword = "7.5.4"
 tokio-util = { version = "0.7.20", features = ["io"] }
 toml = "1.1.8"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tonic = { version = "0.14.6", default-features = false, features = ["transport", "codegen", "router", "tls-ring"] }
+tonic-build = { version = "0.14.6", default-features = false }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+bytes = "1.12.1"
+rcgen = { version = "0.14.10", features = ["x509-parser"] }
+x509-parser = "0.18.1"
+time = "0.3"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging"] }
+rustls-pki-types = "1.15.1"
