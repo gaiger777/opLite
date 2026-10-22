@@ -11,6 +11,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, Table};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::exclusive::exclusive_values;
 use crate::store::{
     KEY_LAST_APPLIED, KEY_LAST_MEMBERSHIP, KEY_SNAPSHOT_DATA, KEY_SNAPSHOT_META, META, NAMES,
     OBJECTS, SCHEMA_VERSION, StoreError, get_json, put_json,
@@ -241,6 +242,9 @@ fn apply_command(
                     name: resource.name,
                 }));
             }
+            if let Err(r) = check_exclusive(objects, kind, resource.id, &resource.spec)? {
+                return Ok(Err(r));
+            }
             names.insert(
                 (kind.as_str(), resource.name.as_str()),
                 resource.id.as_u128(),
@@ -259,6 +263,9 @@ fn apply_command(
                 return Ok(Err(Rejection::NotFound { kind, id }));
             };
             if let Err(r) = check(expected_revision, resource.revision) {
+                return Ok(Err(r));
+            }
+            if let Err(r) = check_exclusive(objects, kind, id, &spec)? {
                 return Ok(Err(r));
             }
             resource.labels = labels;
@@ -299,6 +306,44 @@ fn apply_command(
         serde_json::to_vec(&resource)?.as_slice(),
     )?;
     Ok(Ok(WatchEvent::Put { kind, resource }))
+}
+
+/// `spec`의 독점 값이 같은 종류의 다른 리소스나 같은 spec 안에서 겹치면 거부한다.
+fn check_exclusive(
+    objects: &Table<(&'static str, u128), &'static [u8]>,
+    kind: Kind,
+    id: Uuid,
+    spec: &serde_json::Value,
+) -> Result<Result<(), Rejection>, StoreError> {
+    let wanted = exclusive_values(kind, spec);
+    if wanted.is_empty() {
+        return Ok(Ok(()));
+    }
+    let in_use = |field: &str, value: &str, holder: Uuid| Rejection::InUse {
+        kind,
+        field: field.to_string(),
+        value: value.to_string(),
+        holder,
+    };
+    for (i, (field, value)) in wanted.iter().enumerate() {
+        if wanted[..i].contains(&(field, value.clone())) {
+            return Ok(Err(in_use(field, value, id)));
+        }
+    }
+    for item in objects.range((kind.as_str(), 0u128)..=(kind.as_str(), u128::MAX))? {
+        let (key, v) = item?;
+        let other = Uuid::from_u128(key.value().1);
+        if other == id {
+            continue;
+        }
+        let other_spec: RawResource = serde_json::from_slice(v.value())?;
+        for (field, value) in exclusive_values(kind, &other_spec.spec) {
+            if wanted.iter().any(|(f, v)| *f == field && *v == value) {
+                return Ok(Err(in_use(field, &value, other)));
+            }
+        }
+    }
+    Ok(Ok(()))
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachine {

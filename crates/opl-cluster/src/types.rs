@@ -67,6 +67,14 @@ pub enum Rejection {
     NotFound { kind: Kind, id: Uuid },
     #[error("revision mismatch: expected {expected}, actual {actual}")]
     RevisionMismatch { expected: u64, actual: u64 },
+    /// 클러스터 안에서 하나만 쓸 수 있는 값(VM에 붙인 볼륨, MAC 주소)이 이미 쓰이고 있다.
+    #[error("{field} {value} is already used by {} {holder}", kind.as_str())]
+    InUse {
+        kind: Kind,
+        field: String,
+        value: String,
+        holder: Uuid,
+    },
 }
 
 /// 명령 적용 결과. 성공하면 새 revision(커밋된 로그 인덱스)을 담는다.

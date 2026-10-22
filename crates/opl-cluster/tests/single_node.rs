@@ -182,3 +182,63 @@ async fn watch_history_does_not_survive_restart() {
     let (list_rev, _) = c.list::<VolumeSpec>().unwrap();
     assert!(c.watch(list_rev).is_ok());
 }
+
+fn vm(name: &str, volumes: &[&str], macs: &[&str]) -> opl_types::vm::Vm {
+    let spec = serde_json::json!({
+        "cpu": {"sockets": 1, "cores": 1},
+        "memory_mib": 256,
+        "machine": "virt",
+        "disks": volumes.iter().map(|v| serde_json::json!({"volume": v, "bus": "virtio-blk"})).collect::<Vec<_>>(),
+        "nics": macs.iter().map(|m| serde_json::json!({"network": "user", "model": "virtio", "mac": m})).collect::<Vec<_>>(),
+    });
+    opl_types::resource::Resource::new(name, serde_json::from_value(spec).unwrap())
+}
+
+#[tokio::test]
+async fn a_volume_or_mac_belongs_to_one_vm() {
+    use opl_types::vm::VmSpec;
+    let tc = TestCluster::start(1).await;
+    let c = tc.get(node(1));
+    let mac = "52:54:00:00:00:01";
+    let a = vm("a", &["root-a"], &[mac]);
+    c.create(&a).await.unwrap();
+
+    let in_use = |e: ClusterError, field: &str| match e {
+        ClusterError::Rejected(Rejection::InUse {
+            kind: Kind::Vm,
+            field: f,
+            holder,
+            ..
+        }) => f == field && holder == a.id,
+        _ => false,
+    };
+    let err = c.create(&vm("b", &["root-a"], &[])).await.unwrap_err();
+    assert!(in_use(err, "volume"));
+    let err = c.create(&vm("b", &["root-b"], &[mac])).await.unwrap_err();
+    assert!(in_use(err, "mac"));
+
+    // 다른 VM을 바꿔 겹치게 해도 거부한다. 자기 spec을 다시 쓰는 것은 된다.
+    let b = vm("b", &["root-b"], &[]);
+    let rev = c.create(&b).await.unwrap();
+    let err = c
+        .update_spec(
+            b.id,
+            Some(rev),
+            BTreeMap::new(),
+            &vm("b", &["root-a"], &[]).spec,
+        )
+        .await
+        .unwrap_err();
+    assert!(in_use(err, "volume"));
+    c.update_spec::<VmSpec>(a.id, None, BTreeMap::new(), &a.spec)
+        .await
+        .unwrap();
+
+    // 한 VM 안에서 같은 볼륨을 두 번 붙일 수도 없다.
+    let c2 = vm("c", &["root-c", "root-c"], &[]);
+    let err = c.create(&c2).await.unwrap_err();
+    assert!(matches!(
+        err,
+        ClusterError::Rejected(Rejection::InUse { holder, .. }) if holder == c2.id
+    ));
+}

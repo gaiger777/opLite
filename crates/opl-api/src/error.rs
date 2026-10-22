@@ -100,6 +100,14 @@ impl From<ClusterError> for ApiError {
                         "revision_mismatch",
                         message,
                     ),
+                    Rejection::InUse { field, .. } => ApiError::conflict(
+                        if field == "mac" {
+                            "mac_in_use"
+                        } else {
+                            "volume_in_use"
+                        },
+                        message,
+                    ),
                 }
             }
             ClusterError::Timeout => ApiError::new(
@@ -164,6 +172,19 @@ pub struct Query<T>(pub T);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn values_used_by_another_vm_are_conflicts() {
+        let e = ApiError::from(ClusterError::Rejected(Rejection::InUse {
+            kind: opl_types::resource::Kind::Vm,
+            field: "mac".into(),
+            value: "52:54:00:00:00:01".into(),
+            holder: uuid::Uuid::nil(),
+        }));
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(e.code, "mac_in_use");
+        assert!(e.message.contains("52:54:00:00:00:01"));
+    }
 
     #[test]
     fn internal_error_hides_details() {
