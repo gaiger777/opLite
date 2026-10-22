@@ -5,6 +5,7 @@
 //! 받은 인증서로 노드 간 서버를 띄우고 로그를 따라잡은 뒤 스스로 투표 멤버 승격을 요청한다.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -94,6 +95,24 @@ pub fn host_of(address: &str) -> Option<&str> {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     (!host.is_empty()).then_some(host)
+}
+
+/// 인증서 SAN에 넣을 수 있는 호스트인지. 특수 주소가 아닌 IP나 RFC 1123 호스트 이름(와일드카드, 끝의 점 없이)
+fn valid_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
+        return !ip.is_unspecified() && !ip.is_multicast() && !broadcast;
+    }
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 fn now_secs() -> u64 {
@@ -330,23 +349,28 @@ pub async fn join(
     }
 
     check_name(&req.name)?;
-    let (Some(api_host), Some(cluster_host)) =
-        (host_of(&req.address), host_of(&req.cluster_address))
-    else {
+    let (Some(api_host), Some(cluster_host)) = (
+        host_of(&req.address).filter(|h| valid_host(h)),
+        host_of(&req.cluster_address).filter(|h| valid_host(h)),
+    ) else {
         return Err(ApiError::bad_request(
-            "address and cluster_address must be host:port",
+            "address and cluster_address must be host:port with an IP address or a host name",
         ));
     };
     if req.node.is_nil() {
         return Err(ApiError::bad_request("node id must not be nil"));
     }
-    // learner이면 합류하다 멈춘 노드다. 새 토큰으로 다시 합류할 수 있다.
-    if state
-        .cluster
-        .members()
-        .voters
-        .contains_key(&NodeId(req.node))
-    {
+    // learner이면 합류하다 멈춘 노드다. 같은 이름의 오프라인 노드만 새 토큰으로 다시 합류할 수 있다.
+    // 그래야 토큰을 가진 쪽이 승격을 기다리는 살아 있는 노드의 id를 가로채지 못한다.
+    let members = state.cluster.members();
+    let learner_addr = members.learners.get(&NodeId(req.node)).cloned();
+    let rejoin_ok = || -> Result<bool, ApiError> {
+        Ok(state
+            .cluster
+            .get::<NodeSpec>(req.node)?
+            .is_some_and(|n| n.name == req.name && !n.status.online))
+    };
+    if members.voters.contains_key(&NodeId(req.node)) || (learner_addr.is_some() && !rejoin_ok()?) {
         return Err(ApiError::conflict(
             "already_member",
             format!("node {} is already a cluster member", req.node),
@@ -393,6 +417,7 @@ pub async fn join(
     }
 
     // 앞서 합류하다 실패한 같은 노드면 Node 리소스를 다시 쓴다.
+    // 온라인으로 기록해 첫 핑 전에 노드가 제거되지 않게 한다. 핑이 계속 실패하면 리더가 오프라인으로 바꾼다.
     let spec = NodeSpec {
         address: req.address.clone(),
         maintenance: false,
@@ -403,12 +428,30 @@ pub async fn join(
                 .cluster
                 .update_spec(node.id, None, node.labels, &spec)
                 .await?;
+            let status = NodeStatus {
+                online: true,
+                ..node.status
+            };
+            state
+                .cluster
+                .update_status::<NodeSpec>(node.id, &status)
+                .await?;
         }
         None => {
             let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(req.name.clone(), spec);
             node.id = req.node;
+            node.status.online = true;
             state.cluster.create(&node).await?;
         }
+    }
+    // add_learner는 이미 있는 노드의 주소를 바꾸지 않으므로, 주소가 바뀐 learner는 먼저 뺀다.
+    if learner_addr.is_some_and(|addr| addr != req.cluster_address) {
+        state
+            .cluster
+            .request(LeaderRequest::Remove {
+                id: NodeId(req.node),
+            })
+            .await?;
     }
     state
         .cluster
@@ -494,5 +537,33 @@ mod tests {
         assert_eq!(host_of("node1.lan"), None);
         assert_eq!(host_of(":8006"), None);
         assert_eq!(host_of("h:port"), None);
+    }
+
+    #[test]
+    fn valid_host_accepts_ips_and_host_names_only() {
+        for good in ["node1.example", "localhost", "10.0.0.5", "::1", "a-b.c1"] {
+            assert!(valid_host(good), "{good}");
+        }
+        let long_label = format!("{}.example", "a".repeat(64));
+        let long_name = vec!["a".repeat(63); 4].join(".");
+        for bad in [
+            "*.corp.example",
+            "evil host/x",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+            &long_label,
+            &long_name,
+            "-a.example",
+            "a-.example",
+            "node1.example.",
+            "a..b",
+            "노드.example",
+        ] {
+            assert!(!valid_host(bad), "{bad}");
+        }
+        assert_eq!(host_of("[::1]:8006").filter(|h| valid_host(h)), Some("::1"));
     }
 }

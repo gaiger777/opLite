@@ -122,13 +122,19 @@ async fn a_node_joins_once_per_token() {
     let joined = env.cluster.get::<NodeSpec>(node).unwrap().unwrap();
     assert_eq!(joined.name, "node2");
     assert_eq!(joined.spec.address, "10.0.0.7:8006");
+    // 첫 핑 전에 제거되지 않도록 온라인으로 기록한다.
+    assert!(joined.status.online);
 
     // 같은 토큰은 다시 쓸 수 없다.
     let (req, _) = join_request(&token, "node3");
     let (status, body) = anon.post("/cluster/join", json!(req)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["code"], "invalid_token");
-    // 합류하다 멈춘 노드(learner)는 새 토큰으로 다시 합류할 수 있다.
+    // 합류하다 멈춘 노드(오프라인 learner)는 새 토큰으로 다시 합류할 수 있다.
+    env.cluster
+        .update_status::<NodeSpec>(node, &NodeStatus::default())
+        .await
+        .unwrap();
     let mut req = join_request(&new_token(&env).await, "node2").0;
     req.node = node;
     let (status, body) = anon.post("/cluster/join", json!(req)).await;
@@ -140,6 +146,100 @@ async fn a_node_joins_once_per_token() {
     let (status, body) = anon.post("/cluster/join", json!(req)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "already_member");
+}
+
+/// 오프라인으로 기록한다(합류하다 멈춘 노드)
+async fn mark_offline(env: &Env, node: Uuid) {
+    env.cluster
+        .update_status::<NodeSpec>(node, &NodeStatus::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_rejoining_learner_gets_its_new_cluster_address() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    let (req, node) = join_request(&new_token(&env).await, "node2");
+    assert_eq!(
+        anon.post("/cluster/join", json!(req)).await.0,
+        StatusCode::OK
+    );
+    mark_offline(&env, node).await;
+
+    let mut req = join_request(&new_token(&env).await, "node2").0;
+    req.node = node;
+    req.address = "10.0.0.8:8006".into();
+    req.cluster_address = "10.0.0.8:8007".into();
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let members = env.cluster.members();
+    assert_eq!(members.learners.len(), 1);
+    assert_eq!(members.addr(NodeId(node)), Some("10.0.0.8:8007"));
+    let joined = env.cluster.get::<NodeSpec>(node).unwrap().unwrap();
+    assert_eq!(joined.spec.address, "10.0.0.8:8006");
+    assert!(joined.status.online);
+}
+
+#[tokio::test]
+async fn only_the_same_offline_node_rejoins() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    let (req, node) = join_request(&new_token(&env).await, "node2");
+    assert_eq!(
+        anon.post("/cluster/join", json!(req)).await.0,
+        StatusCode::OK
+    );
+
+    // 온라인 learner(승격을 기다리는 노드)의 id는 같은 이름으로도 가로챌 수 없다.
+    let token = new_token(&env).await;
+    let mut req = join_request(&token, "node2").0;
+    req.node = node;
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "already_member");
+    // 오프라인이어도 이름이 다르면 거부하고, 토큰은 쓰지 않는다.
+    mark_offline(&env, node).await;
+    let mut req = join_request(&token, "node3").0;
+    req.node = node;
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "already_member");
+    assert_eq!(
+        env.cluster.get::<NodeSpec>(node).unwrap().unwrap().name,
+        "node2"
+    );
+    let (req, _) = join_request(&token, "node3");
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn hosts_must_be_ips_or_host_names() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    let token = new_token(&env).await;
+    for (address, cluster_address) in [
+        ("*.corp.example:8006", "10.0.0.7:8007"),
+        ("10.0.0.7:8006", "evil host/x:8007"),
+        ("0.0.0.0:8006", "10.0.0.7:8007"),
+    ] {
+        let (mut req, _) = join_request(&token, "node2");
+        req.address = address.into();
+        req.cluster_address = cluster_address.into();
+        let (status, body) = anon.post("/cluster/join", json!(req)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{address} {cluster_address}: {body}"
+        );
+        assert_eq!(body["code"], "invalid_request");
+    }
+    let (req, _) = join_request(&token, "node2");
+    assert_eq!(
+        anon.post("/cluster/join", json!(req)).await.0,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
