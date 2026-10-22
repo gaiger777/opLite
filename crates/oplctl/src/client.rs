@@ -16,6 +16,12 @@ const TASK_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 검증 없이 받는 CA 인증서 본문의 최대 크기
 const CA_MAX_BYTES: usize = 64 * 1024;
 
+/// CA를 받을 때 서버에 연결하는 제한 시간
+const CA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// CA를 받는 요청 전체의 제한 시간. 응답하지 않는 서버에서 `login`이 멈추지 않게 한다.
+const CA_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct Client {
     pub base: String,
@@ -144,6 +150,8 @@ pub async fn fetch_ca(server: &str) -> anyhow::Result<String> {
     let http = reqwest::Client::builder()
         .tls_danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CA_CONNECT_TIMEOUT)
+        .timeout(CA_TIMEOUT)
         .build()?;
     let url = format!("{}/api/v1/cluster/ca", server.trim_end_matches('/'));
     let mut resp = http
