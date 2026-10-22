@@ -334,3 +334,72 @@ async fn leader_records_when_nodes_go_offline_and_come_back() {
         m.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn new_leader_does_not_revive_nodes_recorded_offline() {
+    let (_ca, _root, mut nodes) = start(5).await;
+    let leader = wait_leader(&nodes).await;
+    for (i, node) in nodes.iter().enumerate() {
+        let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
+            format!("node-{i}"),
+            NodeSpec {
+                address: node.addr.clone(),
+                maintenance: false,
+            },
+        );
+        r.id = node.id().0;
+        r.status.online = true;
+        nodes[0].cluster.create(&r).await.unwrap();
+    }
+    let config = NodeMonitorConfig {
+        interval: Duration::from_millis(300),
+        offline_after: Duration::from_secs(3),
+    };
+    let monitors: Vec<NodeMonitor> = nodes
+        .iter()
+        .map(|n| NodeMonitor::spawn(n.cluster.clone(), n.peers.clone(), config.clone()))
+        .collect();
+    let online = |cluster: &Cluster, id: NodeId| {
+        cluster
+            .get::<NodeSpec>(id.0)
+            .unwrap()
+            .unwrap()
+            .status
+            .online
+    };
+
+    // 팔로워 하나를 멈추고 리더가 오프라인으로 기록할 때까지 기다린다.
+    let follower = nodes.iter().position(|n| n.id() != leader).unwrap();
+    let mut dead = nodes.remove(follower);
+    let dead_id = dead.id();
+    dead.stop().await;
+    let old = nodes.iter().position(|n| n.id() == leader).unwrap();
+    let deadline = Instant::now() + WAIT;
+    while online(&nodes[old].cluster, dead_id) {
+        assert!(
+            Instant::now() < deadline,
+            "dead follower never went offline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 리더도 멈추면 새 리더가 그 기록을 다시 온라인으로 바꾸지 않아야 한다.
+    let mut old = nodes.remove(old);
+    old.stop().await;
+    let new_leader = wait_leader(&nodes).await;
+    let new_leader = nodes.iter().find(|n| n.id() == new_leader).unwrap();
+    // 새 리더가 이전 커밋을 모두 적용한 뒤부터 본다.
+    new_leader.cluster.read_barrier().await.unwrap();
+    // 감시 간격보다 길고 `offline_after`보다 짧게 지켜본다.
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        assert!(
+            !online(&new_leader.cluster, dead_id),
+            "new leader revived a node recorded offline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for m in monitors {
+        m.shutdown().await;
+    }
+}

@@ -58,8 +58,9 @@ async fn run(
     config: NodeMonitorConfig,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    // 노드별 마지막 응답 시각. 리더가 된 시점에 비우고, 처음에는 그 시점을 응답으로 쳐서
-    // 새 리더가 다른 노드를 곧바로 오프라인으로 만들지 않게 한다.
+    // 노드별 마지막 응답 시각. 리더가 된 시점에 비우고, 온라인으로 기록된 노드는 처음에 그 시점을
+    // 응답으로 쳐서 새 리더가 곧바로 오프라인으로 만들지 않게 한다. 오프라인으로 기록된 노드에는
+    // 유예가 없다(응답해야 온라인이 된다).
     let mut last_seen: HashMap<Uuid, Instant> = HashMap::new();
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -68,51 +69,87 @@ async fn run(
             _ = &mut shutdown => return,
             _ = interval.tick() => {}
         }
-        let members = cluster.members();
-        if members.leader != Some(cluster.id()) {
-            last_seen.clear();
+        // 선거 중에는 기록이 오래 걸릴 수 있으므로 종료 요청과 겨룬다.
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tick(&cluster, &peers, &config, &mut last_seen) => {}
+        }
+    }
+}
+
+async fn tick(
+    cluster: &Cluster,
+    peers: &Arc<Peers>,
+    config: &NodeMonitorConfig,
+    last_seen: &mut HashMap<Uuid, Instant>,
+) {
+    let members = cluster.members();
+    if members.leader != Some(cluster.id()) {
+        last_seen.clear();
+        return;
+    }
+    let Ok((_, nodes)) = cluster.list::<NodeSpec>() else {
+        return;
+    };
+    let now = Instant::now();
+    let pings = nodes.iter().map(|node| {
+        let addr = members.addr(NodeId(node.id)).map(str::to_string);
+        let peers = peers.clone();
+        let target = NodeId(node.id);
+        let me = target == cluster.id();
+        let timeout = config.interval;
+        async move {
+            match addr {
+                _ if me => Some(true),
+                // 그 주소에 이제 다른 노드가 있을 수 있으므로 응답한 노드가 대상인지 본다.
+                Some(addr) => Some(
+                    peers
+                        .ping(&addr, timeout)
+                        .await
+                        .is_ok_and(|id| id == target),
+                ),
+                // 멤버가 아니다(제거되는 중).
+                None => None,
+            }
+        }
+    });
+    let results = futures_util::future::join_all(pings).await;
+    for (node, result) in nodes.iter().zip(results) {
+        let online = match result {
+            None => false,
+            Some(ok) => {
+                if ok {
+                    last_seen.insert(node.id, now);
+                } else if node.status.online {
+                    last_seen.entry(node.id).or_insert(now);
+                }
+                last_seen
+                    .get(&node.id)
+                    .is_some_and(|seen| now.duration_since(*seen) < config.offline_after)
+            }
+        };
+        if node.status.online == online {
             continue;
         }
-        let Ok((_, nodes)) = cluster.list::<NodeSpec>() else {
+        // 핑을 기다리는 동안 리더가 바뀌었으면 기록하지 않는다.
+        if cluster.members().leader != Some(cluster.id()) {
+            last_seen.clear();
+            return;
+        }
+        // 목록을 읽은 뒤 노드가 스스로 등록한 상태를 덮어쓰지 않도록 쓰기 직전에 다시 읽는다.
+        let Ok(Some(fresh)) = cluster.get::<NodeSpec>(node.id) else {
             continue;
         };
-        let now = Instant::now();
-        let pings = nodes.iter().map(|node| {
-            let addr = members.addr(NodeId(node.id)).map(str::to_string);
-            let peers = peers.clone();
-            let me = node.id == cluster.id().0;
-            let timeout = config.interval;
-            async move {
-                match addr {
-                    _ if me => Some(true),
-                    Some(addr) => Some(peers.ping(&addr, timeout).await.is_ok()),
-                    // 멤버가 아니다(제거되는 중).
-                    None => None,
-                }
-            }
-        });
-        let results = futures_util::future::join_all(pings).await;
-        for (node, result) in nodes.iter().zip(results) {
-            let online = match result {
-                None => false,
-                Some(ok) => {
-                    let seen = last_seen.entry(node.id).or_insert(now);
-                    if ok {
-                        *seen = now;
-                    }
-                    now.duration_since(*seen) < config.offline_after
-                }
-            };
-            if node.status.online != online {
-                tracing::info!(node = %node.name, online, "node availability changed");
-                let status = NodeStatus {
-                    online,
-                    ..node.status.clone()
-                };
-                if let Err(e) = cluster.update_status::<NodeSpec>(node.id, &status).await {
-                    tracing::warn!(node = %node.name, error = %e, "cannot record node availability");
-                }
-            }
+        if fresh.status.online == online {
+            continue;
+        }
+        tracing::info!(node = %node.name, online, "node availability changed");
+        let status = NodeStatus {
+            online,
+            ..fresh.status
+        };
+        if let Err(e) = cluster.update_status::<NodeSpec>(node.id, &status).await {
+            tracing::warn!(node = %node.name, error = %e, "cannot record node availability");
         }
     }
 }
