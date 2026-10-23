@@ -53,5 +53,31 @@
     "live": "Live",
     "connecting": "Connecting…",
     "offline": "Disconnected · reconnecting"
+  },
+  "tasks": {
+    "time": "Time",
+    "operation": "Operation",
+    "node": "Node",
+    "stateColumn": "State",
+    "error": "Error",
+    "empty": "No tasks.",
+    "failedOnly": "Failed only",
+    "done": "{{label}}: done",
+    "failed": "{{label}}: failed. {{error}}",
+    "state": {
+      "pending": "Pending",
+      "running": "Running",
+      "succeeded": "Succeeded",
+      "failed": "Failed"
+    },
+    "op": {
+      "vm-start": "Start {{target}}",
+      "vm-stop": "Stop {{target}}",
+      "vm-force-stop": "Force stop {{target}}",
+      "vm-reboot": "Reboot {{target}}",
+      "volume-create": "Create volume {{target}}",
+      "volume-import": "Import volume {{target}}",
+      "volume-delete": "Delete volume {{target}}"
+    }
   }
 }

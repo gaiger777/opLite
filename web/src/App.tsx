@@ -12,6 +12,8 @@ import { ThemeProvider } from "@/lib/theme";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
+import { TasksPage } from "@/tasks/TasksPage";
+import { TaskToasts } from "@/tasks/TaskToasts";
 
 function routes() {
   return createBrowserRouter([
@@ -22,11 +24,13 @@ function routes() {
         {
           element: (
             <LiveProvider>
+              <TaskToasts />
               <AppLayout />
             </LiveProvider>
           ),
           children: [
             { index: true, element: <DashboardPage /> },
+            { path: "tasks", element: <TasksPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],
         },
