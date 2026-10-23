@@ -98,7 +98,7 @@ impl QemuHypervisor {
             match liveness(&paths.pidfile) {
                 Liveness::Alive(_) => {}
                 Liveness::Dead => {
-                    tracing::warn!(%id, "removing stale runtime dir");
+                    tracing::warn!(%id, "cleaning up stale runtime dir");
                     // 런타임 디렉터리가 정리할 것이 남았다는 유일한 기록이므로 tap부터 지운다.
                     // 지우지 못하면 디렉터리를 남겨 다음 new()가 다시 시도한다.
                     if delete_taps(hv.config.net.as_deref(), id).await
@@ -562,8 +562,8 @@ async fn monitor(
     let _ = events.send(HypervisorEvent { id, kind });
 }
 
-/// VM의 tap을 지운다. 지웠거나 지울 것이 없으면 true. 실패는 기록만 한다(다음 시작이 같은
-/// 이름을 다시 만든다).
+/// VM의 tap을 지운다. 지웠거나 지울 것이 없으면 true. 실패하면 기록하고 false를 돌려주며,
+/// 호출자는 런타임 디렉터리를 남겨 다음 new()가 다시 지우게 한다.
 async fn delete_taps(net: Option<&dyn HostNet>, id: Uuid) -> bool {
     if let Some(net) = net
         && let Err(e) = net.delete_vm_taps(id).await
