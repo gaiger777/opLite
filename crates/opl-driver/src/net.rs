@@ -69,10 +69,14 @@ impl HostNet for IpRoute {
         let out = run("ip", &["-j", "link", "show"]).await?;
         let links: Vec<Link> = serde_json::from_str(&out).map_err(bad_output)?;
         let prefix = tap_prefix(vm);
+        // 하나가 실패해도 나머지 tap은 지운다.
+        let mut result = Ok(());
         for link in links.iter().filter(|l| l.ifname.starts_with(&prefix)) {
-            delete_link(&link.ifname).await?;
+            if let Err(e) = delete_link(&link.ifname).await {
+                result = result.and(Err(e));
+            }
         }
-        Ok(())
+        result
     }
 }
 
@@ -146,8 +150,9 @@ struct LinkInfo {
 struct BridgeData {
     #[serde(default)]
     vlan_filtering: u8,
+    /// 없으면 커널 기본값 1로 본다(0으로 보면 tap에 VLAN 1이 남는다).
     #[serde(default)]
-    vlan_default_pvid: u16,
+    vlan_default_pvid: Option<u16>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -168,7 +173,7 @@ fn parse_bridges(json: &str) -> Result<Vec<Bridge>, DriverError> {
                     name: l.ifname,
                     vlan_filtering: data.as_ref().is_some_and(|d| d.vlan_filtering == 1),
                 },
-                default_pvid: data.map_or(1, |d| d.vlan_default_pvid),
+                default_pvid: data.and_then(|d| d.vlan_default_pvid).unwrap_or(1),
             }
         })
         .collect())
@@ -234,7 +239,8 @@ mod tests {
     fn parses_bridges() {
         let json = r#"[
             {"ifindex":2,"ifname":"vmbr0","linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":1,"vlan_default_pvid":1}}},
-            {"ifindex":3,"ifname":"br-plain","linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":0,"vlan_default_pvid":1}}}
+            {"ifindex":3,"ifname":"br-plain","linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":0,"vlan_default_pvid":1}}},
+            {"ifindex":4,"ifname":"br-nopvid","linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":1}}}
         ]"#;
         assert_eq!(
             parse_bridges(json).unwrap(),
@@ -250,6 +256,13 @@ mod tests {
                     info: BridgeInfo {
                         name: "br-plain".into(),
                         vlan_filtering: false
+                    },
+                    default_pvid: 1
+                },
+                Bridge {
+                    info: BridgeInfo {
+                        name: "br-nopvid".into(),
+                        vlan_filtering: true
                     },
                     default_pvid: 1
                 },
