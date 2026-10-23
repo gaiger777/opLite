@@ -14,7 +14,7 @@ use opl_cluster::{Cluster, ClusterConfig, ClusterError};
 use opl_driver::{Hypervisor, MockHypervisor};
 use opl_reconciler::{Reconciler, ReconcilerConfig, RestartBackoff};
 use opl_types::resource::Resource;
-use opl_types::vm::{CpuModel, CpuSpec, Firmware, MachineType, PowerState, Vm, VmSpec};
+use opl_types::vm::{CpuModel, CpuSpec, Firmware, PowerState, Vm, VmSpec};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -96,7 +96,7 @@ pub async fn single_node(router: &MemRouter, dir: &Path) -> Arc<Cluster> {
     cluster
 }
 
-/// 디스크와 NIC 없이 UEFI로 뜨는 작은 aarch64 VM.
+/// 디스크와 NIC 없이 UEFI로 뜨는 작은 VM(이 호스트의 머신 타입).
 pub fn vm(name: &str, node: Uuid) -> Vm {
     Resource::new(
         name,
@@ -108,7 +108,7 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
             },
             memory_mib: 256,
             firmware: Firmware::Uefi,
-            machine: MachineType::Virt,
+            machine: opl_qemu::Arch::native().machine(),
             disks: vec![],
             nics: vec![],
             power: PowerState::Running,

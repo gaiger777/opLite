@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# 실제 QEMU로 opld 재시작 후 재연결을 확인하는 테스트. Apple Silicon Mac + brew install qemu가 필요하다.
+# 실제 QEMU로 opld 재시작 후 재연결을 확인하는 테스트. macOS는 brew install qemu, Linux는 apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils가 필요하다(KVM이 없으면 TCG).
 qemu-it = []
 
 [dependencies]

@@ -1,19 +1,19 @@
 //! 실제 QEMU를 띄우는 통합 테스트. `cargo test -p opl-qemu --features qemu-it`
-//! Apple Silicon Mac + `brew install qemu`가 필요하다.
+//! macOS(Apple Silicon)는 `brew install qemu`, Linux는 `apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils`가 필요하다.
 #![cfg(feature = "qemu-it")]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use opl_qemu::{HostProfile, QmpClient, RunState, RuntimePaths, build_cmdline};
+use opl_qemu::{Arch, HostProfile, QmpClient, RunState, RuntimePaths, build_cmdline};
 use opl_types::runtime::{ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
-use opl_types::vm::{CpuModel, CpuSpec, DiskBus, Firmware, MachineType, NicModel};
+use opl_types::vm::{CpuModel, CpuSpec, DiskBus, Firmware, NicModel};
 use uuid::Uuid;
 
 fn host() -> HostProfile {
     let share =
         std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
-    HostProfile::homebrew_hvf(Path::new(&share))
+    HostProfile::native(Path::new(&share))
 }
 
 fn spec(id: Uuid, disk: PathBuf) -> VmRuntimeSpec {
@@ -27,7 +27,7 @@ fn spec(id: Uuid, disk: PathBuf) -> VmRuntimeSpec {
         },
         memory_mib: 256,
         firmware: Firmware::Uefi,
-        machine: MachineType::Virt,
+        machine: Arch::native().machine(),
         disks: vec![RuntimeDisk {
             path: disk,
             format: ImageFormat::Qcow2,

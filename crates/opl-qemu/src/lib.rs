@@ -6,6 +6,6 @@ pub mod paths;
 pub mod qmp;
 
 pub use cmdline::{CmdlineError, build_cmdline};
-pub use host::{Accel, Arch, HostProfile};
+pub use host::{Accel, Arch, HostProfile, kvm_available};
 pub use paths::{PathError, RuntimePaths};
 pub use qmp::{QmpClient, QmpError, QmpEvent, RunState};

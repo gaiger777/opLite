@@ -10,7 +10,7 @@ repository.workspace = true
 [features]
 # qemu-img만 있으면 되는 스토리지 통합 테스트 (macOS: brew install qemu, Debian/Ubuntu: apt install qemu-utils)
 storage-it = []
-# 실제 VM을 띄우는 통합 테스트. Apple Silicon Mac + brew install qemu가 필요하다.
+# 실제 VM을 띄우는 통합 테스트. macOS는 brew install qemu, Linux는 apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils가 필요하다(KVM이 없으면 TCG).
 qemu-it = []
 
 [dependencies]

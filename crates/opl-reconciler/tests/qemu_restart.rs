@@ -1,6 +1,6 @@
 //! M4 완료 기준: opld가 죽었다 다시 떠도 VM은 계속 돌고, 새 opld가 다시 붙어 제어한다.
 //! `cargo test -p opl-reconciler --features qemu-it --test qemu_restart`
-//! Apple Silicon Mac + `brew install qemu`가 필요하다.
+//! macOS(Apple Silicon)는 `brew install qemu`, Linux는 `apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils`가 필요하다.
 #![cfg(feature = "qemu-it")]
 
 mod common;
@@ -20,7 +20,7 @@ fn qemu_config(root: &Path) -> QemuConfig {
     let share =
         std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
     QemuConfig {
-        host: HostProfile::homebrew_hvf(Path::new(&share)),
+        host: HostProfile::native(Path::new(&share)),
         run_dir: root.join("run"),
         state_dir: root.join("state"),
     }
