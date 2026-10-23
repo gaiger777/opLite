@@ -60,12 +60,13 @@ crates/opld/src/web.rs   정적 파일 서빙 (feature "web-ui")
 - 캐시: `/assets/*`(파일 이름에 해시)는 `max-age=31536000, immutable`, `index.html`은 `no-cache`.
 - 보안 헤더(§6)를 비 API 응답에 붙인다.
 - `web-ui` 기능이 없으면 비 API 경로는 "웹 UI가 포함되지 않은 빌드입니다"라는 짧은 HTML이다.
-- `web-ui`는 `rust-embed`로 `web/dist`를 넣는다. `web/dist`가 없으면 컴파일 오류다.
+- `web-ui`는 `rust-embed`로 `web/dist`를 넣는다. 릴리스 빌드는 `web/dist`가 없으면 컴파일 오류다. 디버그
+  빌드(테스트, clippy)는 없어도 되고 안내 페이지를 주며, 파일을 실행 중에 디스크에서 읽는다.
 
 **빌드 흐름:**
 - 개발: `pnpm -C web dev`(5173)가 `/api`(WebSocket 포함)를 `https://localhost:8006`으로 프록시한다. 인증서는 검증하지 않고, `changeOrigin`으로 Origin 검사를 통과한다.
 - 릴리스: `pnpm -C web build` 다음 `cargo build -p opld --release --features web-ui`.
-- Rust CI(check 2개, deny, linux-kvm): `--all-features`에 `web-ui`가 켜지므로 `web/dist/index.html` 자리표시를 만드는 단계만 더한다. linux-kvm은 E2E를 위해 실제 UI를 빌드한다.
+- Rust CI(check 2개, deny): 바꾸지 않는다(디버그 빌드는 `web/dist` 없이 된다). linux-kvm은 E2E를 위해 실제 UI를 빌드하고 Chromium을 설치한다.
 - 새 CI 작업 `web`: `pnpm install --frozen-lockfile`, 타입 검사, ESLint, Vitest, OpenAPI 타입 동기화 검사, `pnpm audit --prod`, 빌드.
 
 검토했지만 채택하지 않은 대안: `build.rs`가 매번 `pnpm build`를 실행(모든 cargo 명령에 Node가 필요하고 느리다), `dist`를 git에 커밋(압축된 JS diff, 소스와 어긋남).
@@ -88,13 +89,13 @@ crates/opld/src/web.rs   정적 파일 서빙 (feature "web-ui")
 
 **로그인 상태:** 시작할 때 `/auth/whoami`. 401이면 로그인 화면으로 가고, 로그인 뒤 원래 주소로 돌아온다. 어느 요청이든 401이면(세션 12시간 만료, opld 재시작, 비밀번호 변경) 캐시를 비우고 로그인 화면으로 간다. 역할(admin·operator·viewer)에 따라 메뉴와 버튼을 숨기지만 권한 검사는 서버가 한다.
 
-**오류 표시:** API 오류 `code`를 번역 키로 쓴다(`errors.vm_not_running`). 번역이 없으면 서버의 `message`를 보여 준다. 400은 해당 폼 필드 아래에 보여 준다.
+**오류 표시:** API 오류 `code`를 번역 키로 쓴다(`errors.vm_not_running`). 번역이 없으면 서버의 `message`를 보여 준다. 서버의 400 메시지는 필드를 가리키지 않으므로 폼 위에 보여 주고, 흔한 입력 오류(이름 규칙, 최소 메모리, 부팅 순서, MAC 형식)는 보내기 전에 해당 필드 아래에 보여 준다.
 
 ## 5. 주요 화면 결정
 
-- **VM 만들기:** 한 페이지 폼(마법사 아님). 이름, vCPU, 메모리, 펌웨어, 머신(노드 아키텍처 기본값), 디스크, NIC, 노드(자동 또는 지정), 재시작 정책, "만든 뒤 시작". 디스크는 기존 볼륨을 고르거나 새 빈 볼륨(풀·크기)을 만든다. 새 볼륨이면 볼륨 Task가 끝난 뒤 VM을 만든다. "만든 뒤 시작"은 `power: running`이다.
+- **VM 만들기:** 한 페이지 폼(마법사 아님). 이름, vCPU, 메모리, 펌웨어, 머신, 디스크, NIC, 노드(자동 또는 지정), 재시작 정책, "만든 뒤 시작". API가 노드의 아키텍처를 알려 주지 않으므로 머신 기본값은 모든 노드가 hvf(Apple Silicon)면 `virt`, 아니면 `q35`다. 디스크는 기존 볼륨을 고르거나 새 빈 볼륨(풀·크기)을 만든다. 새 볼륨이면 볼륨 Task가 끝난 뒤 VM을 만든다. "만든 뒤 시작"은 `power: running`이다.
 - **VM 편집:** 같은 폼. `If-Match: revision`으로 보내고, 충돌하면 "다시 불러오기"를 안내한다. 실행 중이면 노드와 디스크 칸을 잠그고 "다음 시작부터 적용"을 안내한다.
-- **콘솔:** noVNC. 상세 페이지 탭과 새 탭(전체 화면). Ctrl+Alt+Del 보내기, 클립보드 붙여넣기.
+- **콘솔:** noVNC. 상세 페이지 탭과 새 탭(전체 화면). Ctrl+Alt+Del 보내기, 클립보드 입력(브라우저 클립보드의 글자를 키 입력으로 보낸다. QEMU VNC의 클립보드 공유는 게스트 에이전트가 필요하다).
 - **볼륨 업로드:** API는 받은 노드에서 쓸 수 있는 풀로만 가져온다. 그래서 지금 접속한 노드의 풀만 고르게 한다(§8의 `GET /cluster`의 `node`). `XMLHttpRequest`로 보내 진행률과 취소를 지원하고, 업로드 중 페이지를 떠나면 확인한다.
 - **되돌릴 수 없는 동작:** VM·볼륨 삭제, 노드 제거, 강제 정지는 확인 대화상자. 삭제와 노드 제거는 이름을 입력해야 한다.
 - **API 토큰:** 만든 직후 한 번만 보여 주고 복사 버튼을 둔다.
@@ -145,7 +146,7 @@ E2E 흐름: opld 하나를 `init` → 로그인 → 테스트 이미지를 볼�
 - 세션은 노드의 메모리에 있다. 접속한 노드의 opld가 다시 시작하면 다시 로그인한다.
 - API에 페이지 나누기가 없다. 작업 목록은 모두 받아 화면에서 최근 순으로 자른다.
 - 볼륨 업로드는 지금 접속한 노드에서 쓸 수 있는 풀로만 된다.
-- noVNC가 하위 프로토콜 없는 RFB WebSocket에 그대로 붙는지는 계획 8의 첫 작업에서 확인한다. 안 되면 콘솔 핸들러가 noVNC가 요청하는 하위 프로토콜(`binary`)을 받아들이게 고친다.
+- noVNC 1.7은 기본으로 하위 프로토콜을 요청하지 않아 지금의 콘솔 WebSocket에 그대로 붙는다(계획 8 E2E로 확인).
 
 ## 11. 계획 분할
 

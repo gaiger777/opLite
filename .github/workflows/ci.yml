@@ -37,11 +37,47 @@ jobs:
           cargo test -p opl-driver --features storage-it --test dir_storage
           cargo test -p opl-api --features storage-it --test volumes
 
+  # 웹 UI: 타입 검사, 린트, 단위 테스트, API 타입이 Rust 정의와 같은지, 알려진 취약점, 빌드
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: OpenSSL headers (native-tls)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - name: API types match the Rust API
+        run: |
+          pnpm gen:api
+          git diff --exit-code src/api/schema.d.ts
+      - run: pnpm audit --prod
+      - run: pnpm build
+
   # M7: 실제 KVM으로 VM을 띄우고 NIC를 브리지에 잇는다. tap과 브리지를 만들려면 root가 필요하고,
-  # QEMU는 systemd 스코프로 감싼다(OPL_TEST_SYSTEMD).
+  # QEMU는 systemd 스코프로 감싼다(OPL_TEST_SYSTEMD). 웹 UI E2E는 브라우저로 같은 opld를 다룬다.
   linux-kvm:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # root로 도는 테스트도 runner가 설치한 브라우저를 쓴다.
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -54,13 +90,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils iproute2
           ls -l /dev/kvm
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Web UI and browser
+        run: |
+          pnpm -C web install --frozen-lockfile
+          pnpm -C web build
+          pnpm -C web exec playwright install --with-deps chromium
       # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다.
       - name: QEMU, bridge and E2E tests as root
         run: |
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it
 
   deny:
     runs-on: ubuntu-latest
