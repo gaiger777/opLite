@@ -4,6 +4,7 @@ mod common;
 
 use opl_cluster::memnet::MemRouter;
 use opl_reconciler::resolve::{ResolveError, runtime_spec};
+use opl_types::network::{Network, NetworkSpec, tap_name};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
@@ -83,6 +84,36 @@ async fn resolves_volumes_to_pool_paths_and_user_network() {
             model: NicModel::Virtio,
             backend: NicBackend::User,
         }]
+    );
+}
+
+#[tokio::test]
+async fn resolves_bridge_networks_to_taps() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let lan: Network = Resource::new(
+        "lan",
+        NetworkSpec {
+            bridge: "vmbr0".into(),
+            vlan: Some(10),
+        },
+    );
+    cluster.create(&lan).await.unwrap();
+
+    let mut vm = common::vm("web", node);
+    vm.spec.nics.push(nic("user", Some(MacAddr::generate())));
+    vm.spec.nics.push(nic("lan", Some(MacAddr::generate())));
+    let spec = runtime_spec(&cluster, &vm, node).unwrap();
+    assert_eq!(spec.nics[0].backend, NicBackend::User);
+    // tap 이름은 NIC 순번으로 정한다.
+    assert_eq!(
+        spec.nics[1].backend,
+        NicBackend::Tap {
+            ifname: tap_name(vm.id, 1),
+            bridge: "vmbr0".into(),
+            vlan: Some(10),
+        }
     );
 }
 

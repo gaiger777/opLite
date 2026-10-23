@@ -7,7 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
-use opl_reconciler::resolve::USER_NETWORK;
+use opl_types::network::USER_NETWORK;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::storage::VolumePhase;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};

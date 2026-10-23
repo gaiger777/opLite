@@ -2,13 +2,11 @@
 
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::DirStorage;
+use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
 use opl_types::runtime::{NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::vm::Vm;
 use uuid::Uuid;
-
-/// `Network` 리소스가 생기기 전까지 쓸 수 있는 유일한 네트워크 이름. QEMU user-mode NAT다.
-pub const USER_NETWORK: &str = "user";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
@@ -18,7 +16,7 @@ pub enum ResolveError {
     PoolNotFound(String),
     #[error("storage pool {0:?} is not available on this node")]
     PoolNotOnNode(String),
-    #[error("network {0:?} not found (only {USER_NETWORK:?} is supported for now)")]
+    #[error("network {0:?} not found")]
     NetworkNotFound(String),
     #[error("nic {0} has no MAC address")]
     MissingMac(usize),
@@ -49,13 +47,22 @@ pub fn runtime_spec(cluster: &Cluster, vm: &Vm, node: Uuid) -> Result<VmRuntimeS
     }
     let mut nics = Vec::with_capacity(vm.spec.nics.len());
     for (i, nic) in vm.spec.nics.iter().enumerate() {
-        if nic.network != USER_NETWORK {
-            return Err(ResolveError::NetworkNotFound(nic.network.clone()));
-        }
+        let backend = if nic.network == USER_NETWORK {
+            NicBackend::User
+        } else {
+            let network = cluster
+                .get_by_name::<NetworkSpec>(&nic.network)?
+                .ok_or_else(|| ResolveError::NetworkNotFound(nic.network.clone()))?;
+            NicBackend::Tap {
+                ifname: tap_name(vm.id, i),
+                bridge: network.spec.bridge,
+                vlan: network.spec.vlan,
+            }
+        };
         nics.push(RuntimeNic {
             mac: nic.mac.ok_or(ResolveError::MissingMac(i))?,
             model: nic.model,
-            backend: NicBackend::User,
+            backend,
         });
     }
     Ok(VmRuntimeSpec {
