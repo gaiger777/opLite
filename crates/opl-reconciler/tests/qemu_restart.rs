@@ -23,6 +23,9 @@ fn qemu_config(root: &Path) -> QemuConfig {
         host: HostProfile::native(Path::new(&share)),
         run_dir: root.join("run"),
         state_dir: root.join("state"),
+        net: None,
+        // systemd가 있는 Linux(CI)에서 `OPL_TEST_SYSTEMD=1`로 스코프 실행까지 확인한다.
+        systemd_scope: std::env::var_os("OPL_TEST_SYSTEMD").is_some(),
     }
 }
 

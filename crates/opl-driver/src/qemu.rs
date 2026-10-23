@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_qemu::{HostProfile, QmpClient, QmpError, QmpEvent, RunState, RuntimePaths, build_cmdline};
-use opl_types::runtime::VmRuntimeSpec;
+use opl_types::runtime::{NicBackend, VmRuntimeSpec};
 use opl_types::vm::Firmware;
 use rustix::process::{Flock, FlockOffsetType, FlockType, Pid, Signal, fcntl_getlk, kill_process};
 use tokio::sync::broadcast;
@@ -18,6 +18,7 @@ use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
 };
+use crate::net::{HostNet, Tap};
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +41,11 @@ pub struct QemuConfig {
     pub run_dir: PathBuf,
     /// UEFI 변수처럼 재부팅 후에도 남아야 하는 VM별 파일 (Linux: `/var/lib/opl`)
     pub state_dir: PathBuf,
+    /// 브리지 NIC의 tap을 만들고 지운다. 없으면(macOS) 브리지 NIC를 가진 VM은 시작하지 않는다.
+    pub net: Option<Arc<dyn HostNet>>,
+    /// QEMU를 `systemd-run --scope`로 감싸 VM마다 cgroup(`opl-vm-<id>.scope`)으로 분리한다.
+    /// systemd가 있는 Linux에서만 켠다.
+    pub systemd_scope: bool,
 }
 
 /// QEMU 프로세스를 `-daemonize`로 띄워 opld와 분리한다. opld가 재시작해도 VM은 계속 돈다.
@@ -95,6 +101,7 @@ impl QemuHypervisor {
                     if let Err(e) = std::fs::remove_dir_all(&paths.dir) {
                         tracing::error!(%id, error = %e, "failed to remove stale runtime dir");
                     }
+                    delete_taps(hv.config.net.as_deref(), id).await;
                     continue;
                 }
                 Liveness::Unknown => {
@@ -147,6 +154,7 @@ impl QemuHypervisor {
             Arc::downgrade(&self.vms),
             self.events.clone(),
             paths.clone(),
+            self.config.net.clone(),
         ));
         vms.insert(
             id,
@@ -181,7 +189,18 @@ impl QemuHypervisor {
         let mut args = build_cmdline(vm, &self.config.host, paths)
             .map_err(|e| DriverError::InvalidSpec(e.to_string()))?;
         args.push("-daemonize".into());
-        let mut cmd = tokio::process::Command::new(&self.config.host.qemu_binary);
+        self.create_taps(vm).await?;
+        let mut cmd = if self.config.systemd_scope {
+            // 스코프는 QEMU가 끝날 때까지 남는다. --collect: 실패로 끝나도 남기지 않는다.
+            let mut cmd = tokio::process::Command::new("systemd-run");
+            cmd.args(["--scope", "--quiet", "--collect"])
+                .arg(format!("--unit=opl-vm-{}", vm.id))
+                .arg("--")
+                .arg(&self.config.host.qemu_binary);
+            cmd
+        } else {
+            tokio::process::Command::new(&self.config.host.qemu_binary)
+        };
         cmd.args(&args)
             .stdin(Stdio::null())
             // 타임아웃으로 기다림을 그만두면 부모 프로세스도 끝낸다. 이미 분리된 자식은
@@ -216,6 +235,41 @@ impl QemuHypervisor {
         Ok(())
     }
 
+    /// 브리지 NIC마다 tap을 만들어 브리지에 붙인다. 하나라도 실패하면 만든 것을 지운다.
+    async fn create_taps(&self, vm: &VmRuntimeSpec) -> Result<(), DriverError> {
+        let taps: Vec<Tap> = vm
+            .nics
+            .iter()
+            .filter_map(|nic| match &nic.backend {
+                NicBackend::Tap {
+                    ifname,
+                    bridge,
+                    vlan,
+                } => Some(Tap {
+                    ifname: ifname.clone(),
+                    bridge: bridge.clone(),
+                    vlan: *vlan,
+                }),
+                NicBackend::User => None,
+            })
+            .collect();
+        if taps.is_empty() {
+            return Ok(());
+        }
+        let Some(net) = &self.config.net else {
+            return Err(DriverError::InvalidSpec(
+                "bridge networks are not supported on this node".into(),
+            ));
+        };
+        for tap in &taps {
+            if let Err(e) = net.create_tap(tap).await {
+                delete_taps(Some(net.as_ref()), vm.id).await;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// 등록되지 않은 QEMU(기동 실패로 남은 데몬, 붙지 못한 VM)를 SIGKILL로 끝내고 런타임
     /// 디렉터리를 지운다. 끝냈음을 확인하지 못하면 살아 있는 VM의 파일이므로 아무것도 지우지
     /// 않고 false를 돌려준다.
@@ -239,6 +293,7 @@ impl QemuHypervisor {
         {
             tracing::warn!(%id, error = %e, "failed to remove runtime dir");
         }
+        delete_taps(self.config.net.as_deref(), id).await;
         true
     }
 
@@ -434,6 +489,7 @@ async fn monitor(
     vms: Weak<Mutex<HashMap<Uuid, Arc<VmHandle>>>>,
     events: broadcast::Sender<HypervisorEvent>,
     paths: RuntimePaths,
+    net: Option<Arc<dyn HostNet>>,
 ) {
     let mut guest_initiated = None;
     loop {
@@ -479,10 +535,21 @@ async fn monitor(
             EventKind::Crashed
         }
     };
+    // QEMU가 끝났으므로 tap을 지운다(아직 끝나는 중이어도 마지막 fd가 닫히면 사라진다).
+    delete_taps(net.as_deref(), id).await;
     // 이벤트를 받은 쪽이 곧바로 start를 불러도 "이미 실행 중"으로 오판하지 않도록 등록부터 해제한다.
     // 핸들이 drop되면서 이 태스크에 abort가 걸리지만, 아래에는 await가 없으므로 끝까지 실행된다.
     unregister();
     let _ = events.send(HypervisorEvent { id, kind });
+}
+
+/// VM의 tap을 지운다. 실패는 기록만 한다(다음 시작이 같은 이름을 다시 만든다).
+async fn delete_taps(net: Option<&dyn HostNet>, id: Uuid) {
+    if let Some(net) = net
+        && let Err(e) = net.delete_vm_taps(id).await
+    {
+        tracing::warn!(%id, error = %e, "failed to delete tap devices");
+    }
 }
 
 /// pidfile로 본 QEMU의 생존 여부
@@ -597,7 +664,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use opl_qemu::{Accel, Arch};
-    use opl_types::vm::{CpuModel, CpuSpec, MachineType};
+    use opl_types::runtime::RuntimeNic;
+    use opl_types::vm::{CpuModel, CpuSpec, MachineType, NicModel};
 
     use super::*;
 
@@ -614,6 +682,8 @@ mod tests {
             },
             run_dir: root.join("run"),
             state_dir: root.join("state"),
+            net: None,
+            systemd_scope: false,
         }
     }
 
@@ -1039,6 +1109,26 @@ time.sleep(60)
             hv.console_endpoint(id).await,
             Err(DriverError::NotRunning(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn bridge_nic_without_host_net_is_invalid() {
+        let tmp = short_tempdir();
+        let hv = QemuHypervisor::new(config(tmp.path(), PathBuf::from("/nonexistent/qemu")))
+            .await
+            .unwrap();
+        let mut vm = spec();
+        vm.nics.push(RuntimeNic {
+            mac: "52:54:00:12:34:56".parse().unwrap(),
+            model: NicModel::Virtio,
+            backend: NicBackend::Tap {
+                ifname: "op0123456789n0".into(),
+                bridge: "vmbr0".into(),
+                vlan: None,
+            },
+        });
+        let err = hv.start(&vm).await.unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
     }
 
     #[tokio::test]

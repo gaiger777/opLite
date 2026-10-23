@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -68,10 +69,28 @@ pub struct QmpClient {
     writer_task: JoinHandle<()>,
 }
 
+/// QEMU의 QMP 소켓은 대기열(backlog)이 1이다. Linux에서는 대기열이 차 있으면(앞선 클라이언트가
+/// 아직 받아들여지지 않았으면, 예: 멈췄다 깨어난 QEMU) 연결이 곧바로 `EAGAIN`으로 실패하므로
+/// 잠시 뒤 다시 시도한다. macOS는 이때 기다려 준다.
+async fn connect_socket(path: &Path) -> std::io::Result<UnixStream> {
+    const RETRY: Duration = Duration::from_millis(50);
+    const ATTEMPTS: u32 = 100;
+    let mut attempt = 1;
+    loop {
+        match UnixStream::connect(path).await {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempt < ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(RETRY).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 impl QmpClient {
     /// 소켓에 연결하고 greeting을 확인한 뒤 `qmp_capabilities`로 명령 모드에 진입한다.
     pub async fn connect(path: &Path) -> Result<Self, QmpError> {
-        let stream = UnixStream::connect(path).await?;
+        let stream = connect_socket(path).await?;
         let (read, write) = stream.into_split();
         let mut lines = BufReader::new(read).lines();
 

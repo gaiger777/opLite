@@ -143,6 +143,8 @@ impl Member {
             host: HostProfile::homebrew_hvf(&config.qemu_share_dir),
             run_dir: config.run_dir.clone(),
             state_dir: config.data_dir.clone(),
+            net: None,
+            systemd_scope: false,
         })
         .await
         {
