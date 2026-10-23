@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { NODE, task, vm } from "@/test/fixtures";
-import { mockLists, renderPage } from "@/test/render";
+import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
 
@@ -130,4 +130,18 @@ it("keeps the delete dialog open while the request runs", async () => {
   expect(screen.getByRole("alertdialog")).toBeInTheDocument();
   finish();
   expect(await screen.findByText("moved")).toBeInTheDocument();
+});
+
+it("hides the console from users who cannot operate VMs", async () => {
+  mockLists({ vm: [web], node: [NODE] });
+  renderPage(<VmDetailPage />, {
+    path: "/vms/:name",
+    url: "/vms/web?tab=console",
+    as: { ...ADMIN, role: "viewer" },
+  });
+  expect(await screen.findByRole("tab", { name: "Summary" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  expect(screen.queryByRole("tab", { name: "Console" })).not.toBeInTheDocument();
 });

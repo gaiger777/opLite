@@ -48,10 +48,10 @@ const unauthorized: Middleware = {
   },
 };
 
-// 취소(AbortError)는 그대로 둔다.
+// 취소한 요청은 그대로 둔다. 취소 이유(`abort(reason)`)가 AbortError가 아닐 수도 있어 신호로 본다.
 const network: Middleware = {
-  onError({ error }) {
-    if (error instanceof Error && error.name === "AbortError") {
+  onError({ request, error }) {
+    if (request.signal.aborted) {
       return;
     }
     return new NetworkError(error);
@@ -90,7 +90,14 @@ export function toApiError(status: number, body: unknown): ApiError {
 export async function call<T>(
   request: Promise<{ data?: T; error?: unknown; response: Response }>,
 ): Promise<T> {
-  const { data, error, response } = await request;
+  let result;
+  try {
+    result = await request;
+  } catch (error) {
+    // 본문을 읽다 연결이 끊기면 fetch가 `onError` 밖에서 TypeError를 던진다.
+    throw error instanceof TypeError ? new NetworkError(error) : error;
+  }
+  const { data, error, response } = result;
   if (!response.ok) {
     throw toApiError(response.status, error);
   }

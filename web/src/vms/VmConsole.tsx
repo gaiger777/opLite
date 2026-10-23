@@ -5,9 +5,12 @@ import { toast } from "sonner";
 
 import type { Vm } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { keysym } from "@/vms/keysyms";
+import { keyEvents } from "@/vms/keysyms";
 
 type State = "connecting" | "connected" | "failed";
+
+/** 한 번에 입력할 최대 글자 수 */
+export const PASTE_LIMIT = 4096;
 
 export function consoleUrl(vm: Vm) {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
@@ -33,8 +36,14 @@ export default function VmConsole({ vm }: { vm: Vm }) {
     setState("connecting");
     const client = new RFB(screen.current, consoleUrl(vm));
     client.scaleViewport = true;
-    client.addEventListener("connect", () => setState("connected"));
-    client.addEventListener("disconnect", () => setState("failed"));
+    // disconnect()의 이벤트는 나중에 온다. 다시 연결한 뒤 앞 연결의 이벤트는 무시한다.
+    const set = (next: State) => () => {
+      if (rfb.current === client) {
+        setState(next);
+      }
+    };
+    client.addEventListener("connect", set("connected"));
+    client.addEventListener("disconnect", set("failed"));
     rfb.current = client;
     return () => {
       rfb.current = null;
@@ -46,17 +55,25 @@ export default function VmConsole({ vm }: { vm: Vm }) {
 
   async function paste() {
     try {
-      const text = await navigator.clipboard.readText();
-      for (const char of text) {
-        rfb.current?.sendKey(keysym(char), null);
+      const chars = Array.from(await navigator.clipboard.readText());
+      for (const [sym, code, down] of keyEvents(chars.slice(0, PASTE_LIMIT).join(""))) {
+        rfb.current?.sendKey(sym, code, down);
       }
+      if (chars.length > PASTE_LIMIT) {
+        toast.warning(t("console.pasteTruncated", { count: PASTE_LIMIT }));
+      }
+      rfb.current?.focus();
     } catch {
       toast.error(t("console.pasteDenied"));
     }
   }
 
   if (!running) {
-    return <p className="text-sm text-muted-foreground">{t("errors.vm_not_running")}</p>;
+    return (
+      <p role="status" className="text-sm text-muted-foreground">
+        {t("errors.vm_not_running")}
+      </p>
+    );
   }
   return (
     <div className="flex flex-col gap-2">
@@ -85,18 +102,23 @@ export default function VmConsole({ vm }: { vm: Vm }) {
         >
           {t("console.paste")}
         </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => void screen.current?.requestFullscreen()}
-        >
-          {t("console.fullscreen")}
-        </Button>
+        {document.fullscreenEnabled && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void screen.current?.requestFullscreen().catch(() => {})}
+          >
+            {t("console.fullscreen")}
+          </Button>
+        )}
+        <span className="text-xs text-muted-foreground">{t("console.hint")}</span>
       </div>
       <div
         ref={screen}
+        role="region"
+        aria-label={t("console.screen")}
         data-testid="console-screen"
-        className="aspect-[4/3] w-full overflow-hidden rounded-md bg-black"
+        className="aspect-[4/3] max-h-[80vh] w-full overflow-hidden rounded-md bg-black"
       />
     </div>
   );

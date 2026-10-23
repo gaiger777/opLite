@@ -50,6 +50,11 @@ async fn browser_creates_vm_opens_console_and_deletes_it() {
     })
     .await
     .unwrap();
+    if !out.status.success() {
+        // 브라우저가 VM을 지우지 못했으면 QEMU가 남지 않게 끈다(실패는 무시한다).
+        let _ = d.ctl(&["vm", "stop", "web", "--force"]).await;
+        let _ = d.ctl(&["vm", "delete", "web"]).await;
+    }
     assert!(
         out.status.success(),
         "playwright failed:\n{}\n{}\nopld log:\n{}",

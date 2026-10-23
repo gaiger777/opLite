@@ -40,7 +40,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       queryClient.clear();
       resetTasks();
       toast.dismiss();
-      setSignedOut(explicit);
+      // 로그아웃하는 중에 받은 401은 직접 로그아웃한 것으로 둔다(로그인이 다시 false로 바꾼다).
+      setSignedOut((was) => explicit || was);
       setPrincipal(null);
     },
     [queryClient],
@@ -78,6 +79,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = useCallback(async () => {
+    // 보내기 전에 로그아웃으로 표시하고 세대를 늘린다. 그 사이 도착한 401이 돌아올 주소(`?next=`)를
+    // 남기지 못하게 한다.
+    epoch.current += 1;
+    setSignedOut(true);
     await call(api.POST("/auth/logout")).catch(() => {});
     clear(true);
   }, [clear]);

@@ -212,7 +212,11 @@
     "reconnect": "다시 연결",
     "paste": "클립보드 입력",
     "pasteDenied": "브라우저가 클립보드 읽기를 허락하지 않았습니다.",
-    "fullscreen": "전체 화면"
+    "fullscreen": "전체 화면",
+    "pasteTruncated": "앞의 {{count}}자만 입력했습니다.",
+    "screen": "VM 화면",
+    "hint": "화면을 누르면 VM에 입력합니다. 화면 밖을 누르면 키보드를 돌려받습니다.",
+    "forbidden": "콘솔을 쓸 권한이 없습니다."
   },
   "dashboard": {
     "nodes": "노드",
@@ -223,12 +227,14 @@
     "perNode": "노드",
     "state": "상태",
     "hypervisor": "하이퍼바이저",
-    "runningVms": "실행 중인 VM",
+    "activeVms": "활성 VM",
     "nodeOnline": "온라인",
     "nodeOffline": "오프라인",
     "maintenance": "유지보수",
     "failedVms": "실패한 가상 머신",
     "recentTasks": "최근 작업",
-    "allTasks": "모든 작업"
+    "allTasks": "모든 작업",
+    "noLeader": "리더 없음",
+    "noNodes": "노드가 없습니다."
   }
 }

@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
+import { api, call } from "@/api/client";
 import { createQueryClient } from "@/api/queryClient";
 import type { Task } from "@/api/types";
 import { AuthProvider, useAuth } from "@/auth/AuthProvider";
@@ -17,10 +18,11 @@ import { apiUrl, server } from "@/test/server";
 const denied = () => HttpResponse.json({ code: "unauthorized", message: "login" }, { status: 401 });
 
 function Probe() {
-  const { principal, login, logout } = useAuth();
+  const { principal, signedOut, login, logout } = useAuth();
   return (
     <>
       <p>{principal === undefined ? "checking" : (principal?.name ?? "signed out")}</p>
+      <p>{signedOut ? "explicit" : "implicit"}</p>
       <button onClick={() => void login("admin", "admin-password")}>login</button>
       <button onClick={() => void logout()}>logout</button>
     </>
@@ -93,4 +95,60 @@ it("forgets toasts and tracked tasks when signing out", async () => {
   settleTasks([{ ...task, status: { state: "succeeded", error: null } }], i18n.t);
   expect(success).not.toHaveBeenCalled();
   success.mockRestore();
+});
+
+it("forgets toasts and tracked tasks when the session ends", async () => {
+  server.use(
+    http.get(apiUrl("/auth/whoami"), () => HttpResponse.json(ADMIN)),
+    http.get(apiUrl("/vms"), denied),
+  );
+  renderAuth();
+  expect(await screen.findByText("admin")).toBeInTheDocument();
+  const task = {
+    id: "019a0f3c-8a10-7000-8000-0000000000a2",
+    spec: { op: { kind: "vm-start" }, target: "x", node: "n" },
+    status: { state: "pending", error: null },
+  } as Task;
+  trackTask(task, "Start db");
+  toast("other");
+  expect(await screen.findByText("Start db")).toBeInTheDocument();
+
+  await act(() => call(api.GET("/vms")).catch(() => {}));
+  expect(await screen.findByText("signed out")).toBeInTheDocument();
+  // 세션이 끝났으면 돌아올 주소를 남긴다.
+  expect(screen.getByText("implicit")).toBeInTheDocument();
+  await vi.waitFor(() => {
+    expect(screen.queryByText("Start db")).not.toBeInTheDocument();
+    expect(screen.queryByText("other")).not.toBeInTheDocument();
+  });
+  const success = vi.spyOn(toast, "success");
+  settleTasks([{ ...task, status: { state: "succeeded", error: null } }], i18n.t);
+  expect(success).not.toHaveBeenCalled();
+  success.mockRestore();
+});
+
+it("stays signed out explicitly when requests get 401 during sign out", async () => {
+  let answer = () => {};
+  server.use(
+    http.get(apiUrl("/auth/whoami"), () => HttpResponse.json(ADMIN)),
+    http.get(apiUrl("/vms"), denied),
+    // 세션이 이미 끝나 로그아웃도 401을 받는다.
+    http.post(
+      apiUrl("/auth/logout"),
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = () => resolve(denied());
+        }),
+    ),
+  );
+  renderAuth();
+  expect(await screen.findByText("admin")).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "logout" }));
+  // 로그아웃을 보낸 뒤 다른 요청이 401을 받는다.
+  await act(() => call(api.GET("/vms")).catch(() => {}));
+  expect(await screen.findByText("signed out")).toBeInTheDocument();
+  expect(screen.getByText("explicit")).toBeInTheDocument();
+  answer();
+  await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+  expect(screen.getByText("explicit")).toBeInTheDocument();
 });

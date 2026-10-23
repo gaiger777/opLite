@@ -212,7 +212,11 @@
     "reconnect": "Reconnect",
     "paste": "Type clipboard",
     "pasteDenied": "The browser did not allow reading the clipboard.",
-    "fullscreen": "Full screen"
+    "fullscreen": "Full screen",
+    "pasteTruncated": "Only the first {{count}} characters were typed.",
+    "screen": "VM screen",
+    "hint": "Click the screen to type into the VM. Click outside it to release the keyboard.",
+    "forbidden": "You do not have permission to use the console."
   },
   "dashboard": {
     "nodes": "Nodes",
@@ -223,12 +227,14 @@
     "perNode": "Nodes",
     "state": "State",
     "hypervisor": "Hypervisor",
-    "runningVms": "Running VMs",
+    "activeVms": "Active VMs",
     "nodeOnline": "Online",
     "nodeOffline": "Offline",
     "maintenance": "Maintenance",
     "failedVms": "Failed virtual machines",
     "recentTasks": "Recent tasks",
-    "allTasks": "All tasks"
+    "allTasks": "All tasks",
+    "noLeader": "No leader",
+    "noNodes": "No nodes."
   }
 }

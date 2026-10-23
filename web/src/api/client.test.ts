@@ -76,3 +76,35 @@ it("leaves aborted requests alone", async () => {
   expect(error).not.toBeInstanceOf(NetworkError);
   expect(error).toMatchObject({ name: "AbortError" });
 });
+
+it("leaves requests aborted with a custom reason alone", async () => {
+  server.use(http.get(apiUrl("/vms"), () => new Promise<never>(() => {})));
+  const controller = new AbortController();
+  const request = call(api.GET("/vms", { signal: controller.signal })).catch((e: unknown) => e);
+  // 이유가 AbortError가 아니어도 취소다.
+  controller.abort(new Error("left the page"));
+  const error = await request;
+  expect(error).not.toBeInstanceOf(NetworkError);
+  expect(error).toMatchObject({ message: "left the page" });
+});
+
+it("wraps a connection dropped while reading the body in NetworkError", async () => {
+  server.use(
+    http.get(
+      apiUrl("/vms"),
+      () =>
+        new HttpResponse(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"revision":'));
+              controller.error(new TypeError("terminated"));
+            },
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        ),
+    ),
+  );
+  const error = await call(api.GET("/vms")).catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(NetworkError);
+  expect(error).toMatchObject({ message: "terminated" });
+});

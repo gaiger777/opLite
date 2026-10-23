@@ -13,5 +13,9 @@ const VARIANT = {
 
 export function VmPhaseBadge({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
-  return <Badge variant={VARIANT[vm.status.phase]}>{t(`vms.phase.${vm.status.phase}`)}</Badge>;
+  return (
+    <Badge variant={VARIANT[vm.status.phase]} data-testid="vm-phase">
+      {t(`vms.phase.${vm.status.phase}`)}
+    </Badge>
+  );
 }

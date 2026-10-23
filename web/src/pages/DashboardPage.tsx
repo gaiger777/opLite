@@ -1,4 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
+import type { TFunction } from "i18next";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -15,13 +17,17 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { formatMib } from "@/lib/format";
+import { errorMessage } from "@/i18n/errors";
+import { formatCapacity } from "@/lib/format";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
 import { vcpus } from "@/vms/VmListPage";
 
-/** 노드에서 돌고 있는 VM이 쓰는 vCPU와 메모리 */
+/** QEMU가 떠 있는 단계. 실패한 VM도 `status.node`가 남으므로 단계로 거른다. */
+const ACTIVE: Vm["status"]["phase"][] = ["starting", "running", "stopping"];
+
+/** 노드에서 시작 중·실행 중·정지 중인 VM이 쓰는 vCPU와 메모리 */
 export function usage(node: Node, vms: Vm[]) {
-  const here = vms.filter((vm) => vm.status.node === node.id && vm.status.phase !== "stopped");
+  const here = vms.filter((vm) => vm.status.node === node.id && ACTIVE.includes(vm.status.phase));
   return {
     vms: here.length,
     vcpus: here.reduce((sum, vm) => sum + vcpus(vm), 0),
@@ -29,11 +35,20 @@ export function usage(node: Node, vms: Vm[]) {
   };
 }
 
+/** 아직 받지 못한 데이터: 실패했으면 그 이유, 아니면 불러오는 중 */
+function waiting(t: TFunction, ...queries: { isError: boolean; error: unknown }[]) {
+  const failed = queries.find((q) => q.isError);
+  return failed ? errorMessage(t, failed.error) : t("common.loading");
+}
+
 function Stat({ title, value, detail }: { title: string; value: string; detail?: string }) {
+  const id = useId();
   return (
-    <Card>
+    <Card role="group" aria-labelledby={id}>
       <CardHeader>
-        <CardTitle className="text-sm font-normal text-muted-foreground">{title}</CardTitle>
+        <CardTitle id={id} className="text-sm font-normal text-muted-foreground">
+          {title}
+        </CardTitle>
       </CardHeader>
       <CardContent>
         <div className="text-2xl font-semibold">{value}</div>
@@ -53,8 +68,18 @@ export function DashboardPage() {
   const allVms = vms.data ?? [];
   const count = (phase: Vm["status"]["phase"]) =>
     allVms.filter((vm) => vm.status.phase === phase).length;
-  const leader = allNodes.find((n) => n.id === cluster.data?.leader);
   const failed = allVms.filter((vm) => vm.status.phase === "failed");
+
+  // 리더 이름: Node 리소스, 클러스터 멤버, 그래도 없으면(합류 중) id 끝 8자
+  let leader = waiting(t, cluster);
+  if (cluster.data) {
+    const id = cluster.data.leader;
+    leader = id
+      ? (allNodes.find((n) => n.id === id)?.name ??
+        cluster.data.members.find((m) => m.id === id)?.name ??
+        id.slice(-8))
+      : t("dashboard.noLeader");
+  }
 
   return (
     <div className="flex flex-col gap-6">
@@ -62,40 +87,52 @@ export function DashboardPage() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Stat
           title={t("dashboard.nodes")}
-          value={`${allNodes.filter((n) => n.status.online).length} / ${allNodes.length}`}
-          detail={t("dashboard.online")}
+          value={
+            nodes.data
+              ? `${allNodes.filter((n) => n.status.online).length} / ${allNodes.length}`
+              : waiting(t, nodes)
+          }
+          detail={nodes.data && t("dashboard.online")}
         />
         <Stat
           title={t("dashboard.vms")}
-          value={String(allVms.length)}
-          detail={t("dashboard.vmCounts", {
-            running: count("running"),
-            stopped: count("stopped"),
-            failed: count("failed"),
-          })}
+          value={vms.data ? String(allVms.length) : waiting(t, vms)}
+          detail={
+            vms.data &&
+            t("dashboard.vmCounts", {
+              running: count("running"),
+              stopped: count("stopped"),
+              failed: count("failed"),
+            })
+          }
         />
-        <Stat
-          title={t("dashboard.leader")}
-          value={leader?.name ?? "—"}
-          detail={cluster.data?.name}
-        />
+        <Stat title={t("dashboard.leader")} value={leader} detail={cluster.data?.name} />
       </div>
 
       <section className="flex flex-col gap-2">
-        <h2 className="font-medium">{t("dashboard.perNode")}</h2>
-        <Table>
+        <h2 id="dashboard-nodes" className="font-medium">
+          {t("dashboard.perNode")}
+        </h2>
+        <Table aria-labelledby="dashboard-nodes">
           <TableHeader>
             <TableRow>
               <TableHead>{t("vms.node")}</TableHead>
               <TableHead>{t("dashboard.state")}</TableHead>
               <TableHead>{t("dashboard.hypervisor")}</TableHead>
-              <TableHead>{t("dashboard.runningVms")}</TableHead>
+              <TableHead>{t("dashboard.activeVms")}</TableHead>
               <TableHead>{t("vms.vcpus")}</TableHead>
               <TableHead>{t("vms.memory")}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {allNodes.map((node) => {
+            {(!nodes.data || !vms.data || allNodes.length === 0) && (
+              <TableRow>
+                <TableCell colSpan={6} className="text-center text-muted-foreground">
+                  {nodes.data && vms.data ? t("dashboard.noNodes") : waiting(t, nodes, vms)}
+                </TableCell>
+              </TableRow>
+            )}
+            {(vms.data ? allNodes : []).map((node) => {
               const used = usage(node, allVms);
               return (
                 <TableRow key={node.id}>
@@ -118,7 +155,7 @@ export function DashboardPage() {
                     {used.vcpus} / {node.status.cpus}
                   </TableCell>
                   <TableCell>
-                    {formatMib(used.memoryMib)} / {formatMib(node.status.memory_mib)}
+                    {formatCapacity(used.memoryMib)} / {formatCapacity(node.status.memory_mib)}
                   </TableCell>
                 </TableRow>
               );
@@ -145,12 +182,14 @@ export function DashboardPage() {
 
       <section className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
-          <h2 className="font-medium">{t("dashboard.recentTasks")}</h2>
+          <h2 id="dashboard-tasks" className="font-medium">
+            {t("dashboard.recentTasks")}
+          </h2>
           <Link to="/tasks" className="text-sm underline-offset-4 hover:underline">
             {t("dashboard.allTasks")}
           </Link>
         </div>
-        <TaskTable tasks={newestFirst(tasks.data ?? []).slice(0, 5)} />
+        <TaskTable tasks={newestFirst(tasks.data ?? []).slice(0, 5)} labelledBy="dashboard-tasks" />
       </section>
     </div>
   );

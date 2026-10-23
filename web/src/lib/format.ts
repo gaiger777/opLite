@@ -12,3 +12,8 @@ export function formatTime(date: Date, language: string): string {
 export function formatMib(mib: number): string {
   return mib >= 1024 && mib % 1024 === 0 ? `${mib / 1024} GiB` : `${mib} MiB`;
 }
+
+/** 노드 용량처럼 GiB로 나누어떨어지지 않는 크기: 1.5 GiB, 15.5 GiB */
+export function formatCapacity(mib: number): string {
+  return mib >= 1024 ? `${+(mib / 1024).toFixed(1)} GiB` : `${mib} MiB`;
+}

@@ -20,7 +20,7 @@ import { errorMessage } from "@/i18n/errors";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
 import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
-import { VmConsole } from "@/vms/ConsolePage";
+import { VmConsole } from "@/vms/lazyConsole";
 import { VmConfirm } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
@@ -40,8 +40,11 @@ export function VmDetailPage() {
   const { name = "" } = useParams();
   const vms = useList("vm");
   const vm = useVmByName(name);
+  const me = usePrincipal();
   const [params, setParams] = useSearchParams();
-  const tab = TABS.find((id) => id === params.get("tab")) ?? "summary";
+  // 콘솔 탭은 VM 동작 권한이 있을 때만 보인다.
+  const tabs = TABS.filter((id) => id !== "console" || can(me.role, "operate", "vm"));
+  const tab = tabs.find((id) => id === params.get("tab")) ?? "summary";
 
   if (vm === undefined) {
     return vms.isError ? (
@@ -81,7 +84,7 @@ export function VmDetailPage() {
         }
       >
         <TabsList>
-          {TABS.map((id) => (
+          {tabs.map((id) => (
             <TabsTrigger key={id} value={id}>
               {t(`vms.tab.${id}`)}
             </TabsTrigger>
