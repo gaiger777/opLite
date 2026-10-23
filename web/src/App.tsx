@@ -15,6 +15,7 @@ import { NotFoundPage } from "@/pages/NotFoundPage";
 import { TasksPage } from "@/tasks/TasksPage";
 import { TaskToasts } from "@/tasks/TaskToasts";
 import { VmDetailPage } from "@/vms/VmDetailPage";
+import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
 import { VmListPage } from "@/vms/VmListPage";
 
 function routes() {
@@ -33,7 +34,9 @@ function routes() {
           children: [
             { index: true, element: <DashboardPage /> },
             { path: "vms", element: <VmListPage /> },
+            { path: "vms/new", element: <VmCreatePage /> },
             { path: "vms/:name", element: <VmDetailPage /> },
+            { path: "vms/:name/edit", element: <VmEditPage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],

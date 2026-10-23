@@ -19,6 +19,13 @@ window.matchMedia ??= (query: string) =>
     dispatchEvent: () => false,
   }) as MediaQueryList;
 
+// jsdom에는 ResizeObserver가 없다(Radix 컴포넌트가 크기를 잰다).
+globalThis.ResizeObserver ??= class {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+};
+
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 beforeEach(() => i18n.changeLanguage("en"));
 afterEach(() => {

@@ -120,7 +120,8 @@
       "force-stop": "강제 정지",
       "reboot": "재시작",
       "console": "콘솔",
-      "delete": "삭제"
+      "delete": "삭제",
+      "edit": "편집"
     },
     "notFound": "{{name}} VM이 없습니다",
     "backToList": "가상 머신 목록으로",
@@ -155,5 +156,40 @@
     "network": "네트워크",
     "model": "모델",
     "mac": "MAC 주소"
+  },
+  "vmForm": {
+    "createTitle": "가상 머신 만들기",
+    "editTitle": "{{name}} 편집",
+    "runningNote": "VM이 실행 중이라 노드와 디스크는 바꿀 수 없습니다. 다른 변경은 다음 시작부터 적용됩니다.",
+    "general": "일반",
+    "cores": "vCPU 코어",
+    "memory": "메모리 (MiB)",
+    "cpuModel": "CPU 모델",
+    "nodeAuto": "자동",
+    "diskN": "디스크 {{n}}",
+    "newVolume": "새 볼륨",
+    "pool": "스토리지 풀",
+    "sizeGib": "크기 (GiB)",
+    "removeDisk": "디스크 {{n}} 빼기",
+    "addExisting": "볼륨 붙이기",
+    "addNew": "새 빈 볼륨",
+    "nicN": "네트워크 인터페이스 {{n}}",
+    "userNetwork": "user (NAT)",
+    "macAuto": "자동",
+    "removeNic": "인터페이스 {{n}} 빼기",
+    "addNic": "인터페이스 추가",
+    "startAfter": "만든 뒤 시작",
+    "reload": "다시 불러오기",
+    "save": "저장",
+    "errors": {
+      "name": "소문자·숫자·-로 1~63자, -로 시작하거나 끝날 수 없습니다.",
+      "cores": "1 이상이어야 합니다.",
+      "memory": "64 MiB 이상이어야 합니다.",
+      "volume": "볼륨을 고르거나 이름을 정하세요.",
+      "pool": "스토리지 풀을 고르세요.",
+      "size": "크기를 입력하세요.",
+      "bootOrder": "부팅 순서는 1부터 겹치지 않는 숫자여야 합니다.",
+      "mac": "52:54:00:12:34:56 형식으로 입력하세요."
+    }
   }
 }

@@ -120,7 +120,8 @@
       "force-stop": "Force stop",
       "reboot": "Reboot",
       "console": "Console",
-      "delete": "Delete"
+      "delete": "Delete",
+      "edit": "Edit"
     },
     "notFound": "There is no VM {{name}}",
     "backToList": "Back to virtual machines",
@@ -155,5 +156,40 @@
     "network": "Network",
     "model": "Model",
     "mac": "MAC address"
+  },
+  "vmForm": {
+    "createTitle": "Create a virtual machine",
+    "editTitle": "Edit {{name}}",
+    "runningNote": "The VM is running: its node and disks cannot change. Other changes apply from the next start.",
+    "general": "General",
+    "cores": "vCPU cores",
+    "memory": "Memory (MiB)",
+    "cpuModel": "CPU model",
+    "nodeAuto": "Automatic",
+    "diskN": "Disk {{n}}",
+    "newVolume": "New volume",
+    "pool": "Storage pool",
+    "sizeGib": "Size (GiB)",
+    "removeDisk": "Remove disk {{n}}",
+    "addExisting": "Attach a volume",
+    "addNew": "New empty volume",
+    "nicN": "Network interface {{n}}",
+    "userNetwork": "user (NAT)",
+    "macAuto": "Automatic",
+    "removeNic": "Remove interface {{n}}",
+    "addNic": "Add an interface",
+    "startAfter": "Start after creating",
+    "reload": "Reload",
+    "save": "Save",
+    "errors": {
+      "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -.",
+      "cores": "At least 1.",
+      "memory": "At least 64 MiB.",
+      "volume": "Choose or name a volume.",
+      "pool": "Choose a storage pool.",
+      "size": "Enter a size.",
+      "bootOrder": "Boot orders must be unique numbers from 1.",
+      "mac": "Use the form 52:54:00:12:34:56."
+    }
   }
 }

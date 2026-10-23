@@ -114,6 +114,11 @@ function VmHeader({ vm }: { vm: Vm }) {
         {can(me.role, "operate", "vm") &&
           (["start", "stop", "force-stop", "reboot"] as const).map(button)}
         {can(me.role, "write", "vm") && (
+          <Button variant="outline" size="sm" asChild>
+            <Link to={`/vms/${encodeURIComponent(vm.name)}/edit`}>{t("vms.action.edit")}</Link>
+          </Button>
+        )}
+        {can(me.role, "write", "vm") && (
           <Button
             variant="destructive"
             size="sm"
