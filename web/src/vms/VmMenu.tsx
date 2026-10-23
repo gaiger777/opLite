@@ -15,9 +15,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
-
-const ACTIONS: VmAction[] = ["start", "stop", "force-stop", "reboot"];
+import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
 
 /** 목록 행의 동작 메뉴 */
 export function VmMenu({ vm }: { vm: Vm }) {

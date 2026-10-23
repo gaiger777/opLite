@@ -158,7 +158,11 @@
     "network": "Network",
     "model": "Model",
     "mac": "MAC address",
-    "openConsole": "Open console"
+    "openConsole": "Open console",
+    "actionFailed": "{{name}}: {{error}}",
+    "bulkSummary": "{{action}}: {{done}} requested, {{failed}} failed, {{skipped}} skipped.",
+    "noDisks": "No disks.",
+    "noNics": "No network interfaces."
   },
   "vmForm": {
     "createTitle": "Create a virtual machine",
@@ -186,14 +190,20 @@
     "save": "Save",
     "errors": {
       "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -.",
-      "cores": "At least 1.",
+      "cores": "From 1 to 65535.",
       "memory": "At least 64 MiB.",
       "volume": "Choose or name a volume.",
       "pool": "Choose a storage pool.",
       "size": "Enter a size.",
-      "bootOrder": "Boot orders must be unique numbers from 1.",
-      "mac": "Use the form 52:54:00:12:34:56."
-    }
+      "bootOrder": "Boot orders must be unique numbers from 1 to 255.",
+      "mac": "Use the form 52:54:00:12:34:56.",
+      "volumeChoose": "Choose a volume.",
+      "volumeDuplicate": "Each disk needs a different volume.",
+      "volumeExists": "A volume with this name already exists.",
+      "macMulticast": "A multicast address (odd first byte) cannot be used.",
+      "macDuplicate": "Each interface needs a different MAC address."
+    },
+    "volumesCreated": "Volumes {{names}} were created; {{error}}"
   },
   "console": {
     "connecting": "Connecting…",

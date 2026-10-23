@@ -5,6 +5,11 @@ type Schemas = components["schemas"];
 
 /** 서버의 `MIN_MEMORY_MIB` */
 export const MIN_MEMORY_MIB = 64;
+/** 서버의 `MAX_NICS` */
+export const MAX_NICS = 16;
+/** 서버의 `cores`(u16)와 `boot_order`(u8)의 최댓값 */
+const MAX_CORES = 65535;
+const MAX_BOOT_ORDER = 255;
 /** 서버의 리소스 이름 규칙: 소문자·숫자·`-`, 63자까지, `-`로 시작하거나 끝나지 않는다. */
 const NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -106,24 +111,45 @@ export function fromVm(vm: Vm): VmFormValues {
   };
 }
 
-/** 입력 오류: 필드 → 번역 키. 서버도 검증하지만 흔한 실수는 보내기 전에 알린다. */
-export function validate(v: VmFormValues, creating: boolean): Record<string, string> {
+/** `min`부터 `max`까지의 정수인지 */
+function intIn(value: string, min: number, max: number): boolean {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= min && n <= max;
+}
+
+/**
+ * 입력 오류: 필드 → 번역 키. 서버도 검증하지만 흔한 실수는 보내기 전에 알린다. `volumes`는 이미 있는
+ * 볼륨의 이름이다(새 볼륨이 겹치지 않게).
+ */
+export function validate(
+  v: VmFormValues,
+  creating: boolean,
+  volumes: readonly string[] = [],
+): Record<string, string> {
   const errors: Record<string, string> = {};
   const nameOk = (name: string) => NAME.test(name) && !UUID.test(name);
   if (creating && !nameOk(v.name)) {
     errors.name = "vmForm.errors.name";
   }
-  if (!(Number.isInteger(Number(v.cores)) && Number(v.cores) >= 1)) {
+  if (!intIn(v.cores, 1, MAX_CORES)) {
     errors.cores = "vmForm.errors.cores";
   }
   if (!(Number.isInteger(Number(v.memory)) && Number(v.memory) >= MIN_MEMORY_MIB)) {
     errors.memory = "vmForm.errors.memory";
   }
-  const boots = new Set<string>();
+  const boots = new Set<number>();
+  const names = new Set<string>();
   v.disks.forEach((d, i) => {
-    if (!nameOk(d.volume)) {
+    if (d.kind === "existing" && d.volume === "") {
+      errors[`disks.${i}.volume`] = "vmForm.errors.volumeChoose";
+    } else if (!nameOk(d.volume)) {
       errors[`disks.${i}.volume`] = "vmForm.errors.volume";
+    } else if (names.has(d.volume)) {
+      errors[`disks.${i}.volume`] = "vmForm.errors.volumeDuplicate";
+    } else if (d.kind === "new" && volumes.includes(d.volume)) {
+      errors[`disks.${i}.volume`] = "vmForm.errors.volumeExists";
     }
+    names.add(d.volume);
     if (d.kind === "new" && !d.pool) {
       errors[`disks.${i}.pool`] = "vmForm.errors.pool";
     }
@@ -131,19 +157,29 @@ export function validate(v: VmFormValues, creating: boolean): Record<string, str
       errors[`disks.${i}.size`] = "vmForm.errors.size";
     }
     if (d.bootOrder !== "") {
-      if (
-        !(Number.isInteger(Number(d.bootOrder)) && Number(d.bootOrder) >= 1) ||
-        boots.has(d.bootOrder)
-      ) {
+      // "01"과 "1"은 같은 순서다.
+      const order = Number(d.bootOrder);
+      if (!intIn(d.bootOrder, 1, MAX_BOOT_ORDER) || boots.has(order)) {
         errors[`disks.${i}.bootOrder`] = "vmForm.errors.bootOrder";
       }
-      boots.add(d.bootOrder);
+      boots.add(order);
     }
   });
+  const macs = new Set<string>();
   v.nics.forEach((n, i) => {
-    if (n.mac !== "" && !MAC.test(n.mac)) {
-      errors[`nics.${i}.mac`] = "vmForm.errors.mac";
+    if (n.mac === "") {
+      return;
     }
+    const mac = n.mac.toLowerCase();
+    if (!MAC.test(mac)) {
+      errors[`nics.${i}.mac`] = "vmForm.errors.mac";
+    } else if (parseInt(mac.slice(0, 2), 16) & 1) {
+      // 첫 바이트의 가장 낮은 비트가 멀티캐스트 표시다.
+      errors[`nics.${i}.mac`] = "vmForm.errors.macMulticast";
+    } else if (macs.has(mac)) {
+      errors[`nics.${i}.mac`] = "vmForm.errors.macDuplicate";
+    }
+    macs.add(mac);
   });
   return errors;
 }

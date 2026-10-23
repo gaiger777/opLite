@@ -8,8 +8,8 @@ import {
   type SortingState,
   useReactTable,
 } from "@tanstack/react-table";
-import { ArrowUpDown, Plus } from "lucide-react";
-import { useMemo, useState } from "react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Plus } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -31,13 +31,30 @@ import {
 import { errorMessage } from "@/i18n/errors";
 import { formatMib } from "@/lib/format";
 import { readPref, writePref } from "@/lib/prefs";
-import { canRun, useVmActions } from "@/vms/actions";
+import { useVmActions } from "@/vms/actions";
 import { VmMenu } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
+/** 정렬할 수 있는 열 */
+const SORTABLE = new Set(["name", "phase", "node", "cpu", "memory"]);
+
+/** 저장해 둔 정렬. 모양이 다르면(손으로 고쳤거나 열이 바뀌었으면) 버린다. */
 function savedSorting(): SortingState {
   try {
-    return JSON.parse(readPref("vms.sort") ?? "[]") as SortingState;
+    const value: unknown = JSON.parse(readPref("vms.sort") ?? "[]");
+    const valid =
+      Array.isArray(value) &&
+      value.every(
+        (s: unknown) =>
+          typeof s === "object" &&
+          s !== null &&
+          "id" in s &&
+          typeof s.id === "string" &&
+          SORTABLE.has(s.id) &&
+          "desc" in s &&
+          typeof s.desc === "boolean",
+      );
+    return valid ? (value as SortingState) : [];
   } catch {
     return [];
   }
@@ -52,14 +69,16 @@ export function VmListPage() {
   const me = usePrincipal();
   const vms = useList("vm");
   const nodes = useList("node");
-  const { run } = useVmActions();
+  const { runMany } = useVmActions();
   const [filter, setFilter] = useState("");
   const [sorting, setSorting] = useState<SortingState>(savedSorting);
   const [selection, setSelection] = useState<RowSelectionState>({});
 
+  useEffect(() => writePref("vms.sort", JSON.stringify(sorting)), [sorting]);
+
   const nodeName = useMemo(() => {
     const names = new Map(nodes.data?.map((n) => [n.id, n.name]));
-    return (id: string | null | undefined) => (id ? (names.get(id) ?? id.slice(0, 8)) : "");
+    return (id: string | null | undefined) => (id ? (names.get(id) ?? id.slice(0, 8)) : "—");
   }, [nodes.data]);
 
   const columns = useMemo<ColumnDef<Vm>[]>(
@@ -130,13 +149,7 @@ export function VmListPage() {
     columns,
     state: { sorting, rowSelection: selection, globalFilter: filter },
     getRowId: (vm) => vm.id,
-    onSortingChange: (updater) => {
-      setSorting((old) => {
-        const next = typeof updater === "function" ? updater(old) : updater;
-        writePref("vms.sort", JSON.stringify(next));
-        return next;
-      });
-    },
+    onSortingChange: setSorting,
     onRowSelectionChange: setSelection,
     globalFilterFn: (row, _column, value: string) =>
       row.original.name.toLowerCase().includes(value.toLowerCase()),
@@ -145,11 +158,10 @@ export function VmListPage() {
     getFilteredRowModel: getFilteredRowModel(),
   });
 
-  const selected = table.getSelectedRowModel().rows.map((r) => r.original);
+  // 검색으로 가려진 행은 선택돼 있어도 일괄 동작에 넣지 않는다.
+  const selected = table.getFilteredSelectedRowModel().rows.map((r) => r.original);
   const bulk = (action: "start" | "stop") => {
-    for (const vm of selected.filter((vm) => canRun(vm, action))) {
-      void run(vm, action);
-    }
+    void runMany(selected, action);
     setSelection({});
   };
 
@@ -167,7 +179,7 @@ export function VmListPage() {
           />
           {can(me.role, "write", "vm") && (
             <Button asChild>
-              <Link to="/vms/new">
+              <Link to="/vms/-new">
                 <Plus />
                 {t("vms.create")}
               </Link>
@@ -190,22 +202,38 @@ export function VmListPage() {
         <TableHeader>
           {table.getHeaderGroups().map((group) => (
             <TableRow key={group.id}>
-              {group.headers.map((header) => (
-                <TableHead key={header.id}>
-                  {header.column.getCanSort() ? (
-                    <button
-                      type="button"
-                      className="inline-flex items-center gap-1"
-                      onClick={header.column.getToggleSortingHandler()}
-                    >
-                      {flexRender(header.column.columnDef.header, header.getContext())}
-                      <ArrowUpDown className="size-3 opacity-50" />
-                    </button>
-                  ) : (
-                    flexRender(header.column.columnDef.header, header.getContext())
-                  )}
-                </TableHead>
-              ))}
+              {group.headers.map((header) => {
+                const sorted = header.column.getIsSorted();
+                const SortIcon =
+                  sorted === "asc" ? ArrowUp : sorted === "desc" ? ArrowDown : ArrowUpDown;
+                return (
+                  <TableHead
+                    key={header.id}
+                    aria-sort={
+                      !header.column.getCanSort()
+                        ? undefined
+                        : sorted === "asc"
+                          ? "ascending"
+                          : sorted === "desc"
+                            ? "descending"
+                            : "none"
+                    }
+                  >
+                    {header.column.getCanSort() ? (
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1"
+                        onClick={header.column.getToggleSortingHandler()}
+                      >
+                        {flexRender(header.column.columnDef.header, header.getContext())}
+                        <SortIcon aria-hidden className={sorted ? "size-3" : "size-3 opacity-50"} />
+                      </button>
+                    ) : (
+                      flexRender(header.column.columnDef.header, header.getContext())
+                    )}
+                  </TableHead>
+                );
+              })}
             </TableRow>
           ))}
         </TableHeader>

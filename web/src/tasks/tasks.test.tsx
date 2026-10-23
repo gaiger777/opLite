@@ -7,7 +7,15 @@ import type { Task } from "@/api/types";
 import { Toaster } from "@/components/ui/sonner";
 import i18n from "@/i18n";
 import { ThemeProvider } from "@/lib/theme";
-import { describeTask, onTrack, resetTasks, settleTasks, trackTask } from "@/tasks/tasks";
+import {
+  describeTask,
+  onTrack,
+  resetTasks,
+  settleTasks,
+  TASK_TIMEOUT_MS,
+  trackTask,
+  waitForTask,
+} from "@/tasks/tasks";
 import { TaskToasts } from "@/tasks/TaskToasts";
 
 // 알림과 지켜보는 Task는 모듈 전역이므로 테스트마다 비우고, Task id도 테스트마다 다르게 쓴다.
@@ -75,4 +83,36 @@ it("describes unknown operations by their kind", () => {
   const unknown = { ...task("4", "pending"), spec: { op: { kind: "vm-migrate" }, target: "x" } };
   expect(describeTask(unknown as unknown as Task, i18n.t, "web")).toBe("vm-migrate web");
   expect(describeTask(task("4", "pending"), i18n.t, "web")).toBe("Start web");
+});
+
+it("waits for a task and rejects with its error when it fails", async () => {
+  const queryClient = createQueryClient();
+  const id = task("5", "pending").id;
+  const done = waitForTask(queryClient, id);
+  queryClient.setQueryData(["list", "task"], { revision: 2, items: [task("5", "running")] });
+  queryClient.setQueryData(["list", "task"], {
+    revision: 3,
+    items: [task("5", "failed", "pool is full")],
+  });
+  await expect(done).rejects.toThrow("pool is full");
+});
+
+it("stops waiting when aborted or after the timeout", async () => {
+  const queryClient = createQueryClient();
+  const controller = new AbortController();
+  const aborted = waitForTask(queryClient, task("6", "pending").id, controller.signal);
+  controller.abort(new Error("left the page"));
+  await expect(aborted).rejects.toThrow("left the page");
+  // 중단한 뒤에는 Task가 끝나도 아무 일이 없다(구독을 풀었다).
+  expect(queryClient.getQueryCache().hasListeners()).toBe(false);
+
+  vi.useFakeTimers();
+  try {
+    const late = waitForTask(queryClient, task("7", "pending").id);
+    vi.advanceTimersByTime(TASK_TIMEOUT_MS);
+    await expect(late).rejects.toThrow("did not finish in time");
+    expect(queryClient.getQueryCache().hasListeners()).toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
 });

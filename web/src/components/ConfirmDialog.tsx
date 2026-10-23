@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -33,9 +33,14 @@ export function ConfirmDialog(props: Props) {
   const [typed, setTyped] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const inputId = useId();
   const ready = props.typeToConfirm === undefined || typed === props.typeToConfirm;
 
   function openChange(open: boolean) {
+    // 요청 중에는 닫지 않는다(결과와 오류를 보여 줄 곳이 사라진다).
+    if (!open && busy) {
+      return;
+    }
     if (!open) {
       setTyped("");
       setError(null);
@@ -48,7 +53,8 @@ export function ConfirmDialog(props: Props) {
     setError(null);
     try {
       await props.onConfirm();
-      openChange(false);
+      setTyped("");
+      props.onOpenChange(false);
     } catch (err) {
       setError(errorMessage(t, err));
     } finally {
@@ -65,11 +71,9 @@ export function ConfirmDialog(props: Props) {
         </AlertDialogHeader>
         {props.typeToConfirm !== undefined && (
           <div className="flex flex-col gap-2">
-            <Label htmlFor="confirm-name">
-              {t("confirm.typeName", { name: props.typeToConfirm })}
-            </Label>
+            <Label htmlFor={inputId}>{t("confirm.typeName", { name: props.typeToConfirm })}</Label>
             <Input
-              id="confirm-name"
+              id={inputId}
               autoComplete="off"
               value={typed}
               onChange={(e) => setTyped(e.target.value)}
@@ -82,7 +86,7 @@ export function ConfirmDialog(props: Props) {
           </p>
         )}
         <AlertDialogFooter>
-          <AlertDialogCancel>{t("confirm.cancel")}</AlertDialogCancel>
+          <AlertDialogCancel disabled={busy}>{t("confirm.cancel")}</AlertDialogCancel>
           <Button variant="destructive" disabled={!ready || busy} onClick={() => void confirm()}>
             {props.confirmLabel}
           </Button>

@@ -16,9 +16,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { errorMessage } from "@/i18n/errors";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
-import { canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
+import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
 import { VmConsole } from "@/vms/ConsolePage";
 import { VmConfirm } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -37,12 +38,21 @@ export function useVmByName(name: string): Vm | null | undefined {
 export function VmDetailPage() {
   const { t } = useTranslation();
   const { name = "" } = useParams();
+  const vms = useList("vm");
   const vm = useVmByName(name);
   const [params, setParams] = useSearchParams();
-  const tab = TABS.find((t) => t === params.get("tab")) ?? "summary";
+  const tab = TABS.find((id) => id === params.get("tab")) ?? "summary";
 
   if (vm === undefined) {
-    return <p className="text-muted-foreground">{t("common.loading")}</p>;
+    return vms.isError ? (
+      <p role="alert" className="text-destructive">
+        {errorMessage(t, vms.error)}
+      </p>
+    ) : (
+      <p role="status" className="text-muted-foreground">
+        {t("common.loading")}
+      </p>
+    );
   }
   if (vm === null) {
     return (
@@ -57,7 +67,19 @@ export function VmDetailPage() {
   return (
     <div className="flex flex-col gap-4">
       <VmHeader vm={vm} />
-      <Tabs value={tab} onValueChange={(value) => setParams({ tab: value }, { replace: true })}>
+      <Tabs
+        value={tab}
+        onValueChange={(value) =>
+          // 다른 쿼리 값은 그대로 둔다.
+          setParams(
+            (p) => {
+              p.set("tab", value);
+              return p;
+            },
+            { replace: true },
+          )
+        }
+      >
         <TabsList>
           {TABS.map((id) => (
             <TabsTrigger key={id} value={id}>
@@ -99,7 +121,8 @@ function VmHeader({ vm }: { vm: Vm }) {
   const nodes = useList("node");
   const { run, remove } = useVmActions();
   const [confirm, setConfirm] = useState<"force-stop" | "delete" | null>(null);
-  const nodeId = vm.status.node ?? vm.spec.node;
+  // 고정한 노드가 있으면 그 노드, 아니면 스케줄러가 놓은 노드
+  const nodeId = vm.spec.node ?? vm.status.node;
   const node = nodes.data?.find((n) => n.id === nodeId);
   const button = (action: VmAction) => (
     <Button
@@ -120,8 +143,7 @@ function VmHeader({ vm }: { vm: Vm }) {
         {node && <span className="text-sm text-muted-foreground">{node.name}</span>}
       </div>
       <div className="flex flex-wrap gap-2">
-        {can(me.role, "operate", "vm") &&
-          (["start", "stop", "force-stop", "reboot"] as const).map(button)}
+        {can(me.role, "operate", "vm") && ACTIONS.map(button)}
         {can(me.role, "operate", "vm") && vm.status.phase === "running" && (
           <Button variant="outline" size="sm" asChild>
             <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
@@ -195,8 +217,10 @@ function Hardware({ vm }: { vm: Vm }) {
   return (
     <div className="flex flex-col gap-6 pt-2">
       <section className="flex flex-col gap-2">
-        <h2 className="font-medium">{t("vms.disks")}</h2>
-        <Table>
+        <h2 id="vm-disks" className="font-medium">
+          {t("vms.disks")}
+        </h2>
+        <Table aria-labelledby="vm-disks">
           <TableHeader>
             <TableRow>
               <TableHead>{t("vms.volume")}</TableHead>
@@ -205,6 +229,13 @@ function Hardware({ vm }: { vm: Vm }) {
             </TableRow>
           </TableHeader>
           <TableBody>
+            {(vm.spec.disks ?? []).length === 0 && (
+              <TableRow>
+                <TableCell colSpan={3} className="text-center text-muted-foreground">
+                  {t("vms.noDisks")}
+                </TableCell>
+              </TableRow>
+            )}
             {(vm.spec.disks ?? []).map((disk) => (
               <TableRow key={disk.volume}>
                 <TableCell>{disk.volume}</TableCell>
@@ -216,8 +247,10 @@ function Hardware({ vm }: { vm: Vm }) {
         </Table>
       </section>
       <section className="flex flex-col gap-2">
-        <h2 className="font-medium">{t("vms.nics")}</h2>
-        <Table>
+        <h2 id="vm-nics" className="font-medium">
+          {t("vms.nics")}
+        </h2>
+        <Table aria-labelledby="vm-nics">
           <TableHeader>
             <TableRow>
               <TableHead>{t("vms.network")}</TableHead>
@@ -226,6 +259,13 @@ function Hardware({ vm }: { vm: Vm }) {
             </TableRow>
           </TableHeader>
           <TableBody>
+            {(vm.spec.nics ?? []).length === 0 && (
+              <TableRow>
+                <TableCell colSpan={3} className="text-center text-muted-foreground">
+                  {t("vms.noNics")}
+                </TableCell>
+              </TableRow>
+            )}
             {(vm.spec.nics ?? []).map((nic, i) => (
               <TableRow key={i}>
                 <TableCell>{nic.network}</TableCell>
@@ -241,7 +281,15 @@ function Hardware({ vm }: { vm: Vm }) {
 }
 
 function VmTasks({ vm }: { vm: Vm }) {
+  const { t } = useTranslation();
   const tasks = useList("task");
   const mine = newestFirst((tasks.data ?? []).filter((task) => task.spec.target === vm.id));
-  return <TaskTable tasks={mine.slice(0, 50)} />;
+  return (
+    <section>
+      <h2 id="vm-tasks" className="sr-only">
+        {t("vms.tab.tasks")}
+      </h2>
+      <TaskTable tasks={mine.slice(0, 50)} labelledBy="vm-tasks" />
+    </section>
+  );
 }

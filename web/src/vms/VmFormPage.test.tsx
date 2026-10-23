@@ -22,7 +22,7 @@ it("creates a new volume first, then the VM", async () => {
       return HttpResponse.json(vm("web", "stopped"), { status: 201 });
     }),
   );
-  const { queryClient } = renderPage(<VmCreatePage />, { path: "/vms/new" });
+  const { queryClient } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "web");
   await user.click(screen.getByRole("button", { name: "New empty volume" }));
@@ -58,7 +58,7 @@ it("creates a new volume first, then the VM", async () => {
 
 it("shows input errors without calling the API", async () => {
   mockLists({ node: [NODE] });
-  renderPage(<VmCreatePage />, { path: "/vms/new" });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "Bad Name");
   await user.clear(screen.getByLabelText("Memory (MiB)"));
@@ -99,4 +99,130 @@ it("saves with the revision it read and offers to reload on a conflict", async (
   await user.click(screen.getByRole("button", { name: "Reload" }));
   expect(screen.getByLabelText("Memory (MiB)")).toHaveValue(8192);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("locks the node of a VM that should run even if it has failed", async () => {
+  const web = vm("web", "failed", { spec: { ...vm("web", "failed").spec, power: "running" } });
+  mockLists({ vm: [web], node: [NODE] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  expect(await screen.findByLabelText("Node")).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Attach a volume" })).not.toBeInTheDocument();
+});
+
+it("keeps created volumes when the VM cannot be created, and does not recreate them", async () => {
+  mockLists({ node: [NODE], "storage-pool": [{ id: "p1", name: "local" }] });
+  const volumes: string[] = [];
+  let vmPosts = 0;
+  server.use(
+    http.post(apiUrl("/volumes"), async ({ request }) => {
+      volumes.push(((await request.json()) as { name: string }).name);
+      return HttpResponse.json(task("t-vol2", "volume-create", "v1"), { status: 202 });
+    }),
+    http.post(apiUrl("/vms"), () => {
+      vmPosts += 1;
+      return HttpResponse.json({ code: "conflict", message: "name is taken" }, { status: 409 });
+    }),
+  );
+  const { queryClient } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("button", { name: "New empty volume" }));
+  await user.selectOptions(screen.getByLabelText("Storage pool"), "local");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  await waitFor(() => expect(volumes).toEqual(["web-disk0"]));
+  // 보내는 동안에는 입력을 고칠 수 없다.
+  expect(screen.getByLabelText("Name")).toBeDisabled();
+  const done = { ...task("t-vol2", "volume-create", "v1"), status: { state: "succeeded" } };
+  queryClient.setQueryData(["list", "task"], { revision: 2, items: [done] });
+  // watch가 만든 볼륨도 알려 준다.
+  queryClient.setQueryData(["list", "volume"], {
+    revision: 3,
+    items: [{ id: "v1", name: "web-disk0", status: { phase: "ready", attached_to: null } }],
+  });
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    /^Volumes web-disk0 were created; .*name is taken/,
+  );
+
+  // 다시 보내면 볼륨은 있는 것으로 붙이고 VM만 만든다.
+  expect(
+    within(screen.getByRole("group", { name: "Disk 1" })).getByLabelText("Volume"),
+  ).toHaveValue("web-disk0");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  await waitFor(() => expect(vmPosts).toBe(2));
+  expect(volumes).toEqual(["web-disk0"]);
+});
+
+it("stops waiting for the volume and does not create the VM after leaving", async () => {
+  mockLists({ node: [NODE], "storage-pool": [{ id: "p1", name: "local" }] });
+  let posted = false;
+  let vmPosted = false;
+  server.use(
+    http.post(apiUrl("/volumes"), () => {
+      posted = true;
+      return HttpResponse.json(task("t-vol3", "volume-create", "v1"), { status: 202 });
+    }),
+    http.post(apiUrl("/vms"), () => {
+      vmPosted = true;
+      return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+    }),
+  );
+  const { queryClient, unmount } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("button", { name: "New empty volume" }));
+  await user.selectOptions(screen.getByLabelText("Storage pool"), "local");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  await waitFor(() => expect(posted).toBe(true));
+  await waitFor(() => expect(queryClient.getQueryCache().hasListeners()).toBe(true));
+  unmount();
+  // 떠난 뒤 Task가 끝나도 VM을 만들지 않는다.
+  const done = { ...task("t-vol3", "volume-create", "v1"), status: { state: "succeeded" } };
+  queryClient.setQueryData(["list", "task"], { revision: 2, items: [done] });
+  await new Promise((r) => setTimeout(r, 50));
+  expect(vmPosted).toBe(false);
+});
+
+it("ties errors to their inputs and clears them when rows change", async () => {
+  mockLists({ node: [NODE] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("button", { name: "Attach a volume" }));
+  await user.clear(screen.getByLabelText("MAC address"));
+  await user.type(screen.getByLabelText("MAC address"), "01:00:5e:00:00:01");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+
+  const volume = within(screen.getByRole("group", { name: "Disk 1" })).getByLabelText("Volume");
+  expect(volume).toHaveAttribute("aria-invalid", "true");
+  expect(volume).toHaveAccessibleDescription("Choose a volume.");
+  expect(screen.getByLabelText("MAC address")).toHaveAccessibleDescription(/multicast address/);
+  expect(screen.getByLabelText("Name")).not.toHaveAttribute("aria-invalid");
+
+  await user.click(screen.getByRole("button", { name: "Remove disk 1" }));
+  expect(screen.getByLabelText("MAC address")).not.toHaveAttribute("aria-invalid");
+});
+
+it("allows at most 16 network interfaces", async () => {
+  mockLists({ node: [NODE] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  const add = await screen.findByRole("button", { name: "Add an interface" });
+  for (let i = 1; i < 16; i++) {
+    await user.click(add);
+  }
+  expect(screen.getAllByRole("group", { name: /^Network interface/ })).toHaveLength(16);
+  expect(screen.queryByRole("button", { name: "Add an interface" })).not.toBeInTheDocument();
+});
+
+it("says why the create page cannot load", async () => {
+  mockLists({});
+  server.use(
+    http.get(apiUrl("/nodes"), () =>
+      HttpResponse.json({ code: "forbidden", message: "permission denied" }, { status: 403 }),
+    ),
+  );
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "You do not have permission to do this.",
+  );
 });

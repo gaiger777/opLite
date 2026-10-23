@@ -67,23 +67,47 @@ export function describeTask(task: Task, t: TFunction, target: string): string {
   return t(`tasks.op.${kind}`, { target, defaultValue: `${kind} ${target}` });
 }
 
-/** watch로 들어온 Task 목록에서 그 Task가 끝나기를 기다린다. 실패하면 Task의 오류로 거부한다. */
-export function waitForTask(queryClient: QueryClient, id: string): Promise<Task> {
+/** `waitForTask`가 기다리는 가장 긴 시간. 볼륨 만들기는 보통 몇 초 안에 끝난다. */
+export const TASK_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * watch로 들어온 Task 목록에서 그 Task가 끝나기를 기다린다. 실패하면 Task의 오류로, `signal`이
+ * 중단되면 그 이유로, `TASK_TIMEOUT_MS`가 지나면 시간 초과로 거부한다.
+ */
+export function waitForTask(
+  queryClient: QueryClient,
+  id: string,
+  signal?: AbortSignal,
+): Promise<Task> {
   const key = hashKey(listKey("task"));
   return new Promise((resolve, reject) => {
     let unsubscribe = () => {};
+    const onAbort = () => finish(() => reject(signal?.reason));
+    const finish = (settle: () => void) => {
+      unsubscribe();
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      settle();
+    };
     const check = () => {
       const task = queryClient
         .getQueryData<List<Task>>(listKey("task"))
         ?.items.find((t) => t.id === id);
       if (task?.status.state === "succeeded") {
-        unsubscribe();
-        resolve(task);
+        finish(() => resolve(task));
       } else if (task?.status.state === "failed") {
-        unsubscribe();
-        reject(new Error(task.status.error ?? "task failed"));
+        finish(() => reject(new Error(task.status.error ?? "task failed")));
       }
     };
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    signal?.addEventListener("abort", onAbort);
+    const timer = setTimeout(
+      () => finish(() => reject(new Error(`task ${id} did not finish in time`))),
+      TASK_TIMEOUT_MS,
+    );
     unsubscribe = queryClient.getQueryCache().subscribe((event) => {
       if (event.query.queryHash === key) {
         check();

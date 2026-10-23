@@ -158,7 +158,11 @@
     "network": "네트워크",
     "model": "모델",
     "mac": "MAC 주소",
-    "openConsole": "콘솔 열기"
+    "openConsole": "콘솔 열기",
+    "actionFailed": "{{name}}: {{error}}",
+    "bulkSummary": "{{action}}: {{done}}개 요청, {{failed}}개 실패, {{skipped}}개 건너뜀.",
+    "noDisks": "디스크가 없습니다.",
+    "noNics": "네트워크 인터페이스가 없습니다."
   },
   "vmForm": {
     "createTitle": "가상 머신 만들기",
@@ -186,14 +190,20 @@
     "save": "저장",
     "errors": {
       "name": "소문자·숫자·-로 1~63자, -로 시작하거나 끝날 수 없습니다.",
-      "cores": "1 이상이어야 합니다.",
+      "cores": "1에서 65535 사이여야 합니다.",
       "memory": "64 MiB 이상이어야 합니다.",
       "volume": "볼륨을 고르거나 이름을 정하세요.",
       "pool": "스토리지 풀을 고르세요.",
       "size": "크기를 입력하세요.",
-      "bootOrder": "부팅 순서는 1부터 겹치지 않는 숫자여야 합니다.",
-      "mac": "52:54:00:12:34:56 형식으로 입력하세요."
-    }
+      "bootOrder": "부팅 순서는 1부터 255까지 겹치지 않는 숫자여야 합니다.",
+      "mac": "52:54:00:12:34:56 형식으로 입력하세요.",
+      "volumeChoose": "볼륨을 고르세요.",
+      "volumeDuplicate": "디스크마다 다른 볼륨이어야 합니다.",
+      "volumeExists": "같은 이름의 볼륨이 이미 있습니다.",
+      "macMulticast": "멀티캐스트 주소(첫 바이트가 홀수)는 쓸 수 없습니다.",
+      "macDuplicate": "인터페이스마다 다른 MAC 주소여야 합니다."
+    },
+    "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}"
   },
   "console": {
     "connecting": "연결 중…",

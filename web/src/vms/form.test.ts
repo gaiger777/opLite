@@ -42,3 +42,48 @@ it("picks virt only when every node is Apple Silicon", () => {
   expect(defaultMachine([hvf, kvm])).toBe("q35");
   expect(defaultMachine([])).toBe("q35");
 });
+
+it("matches the server's limits on cores, boot order and MACs", () => {
+  const v = {
+    ...emptyForm("q35"),
+    name: "web",
+    cores: "65536",
+    disks: [
+      { ...emptyDisk("web", 0), pool: "local", bootOrder: "256" },
+      { ...emptyDisk("web", 1), pool: "local", bootOrder: "2" },
+      { ...emptyDisk("web", 2), pool: "local", bootOrder: "02" },
+    ],
+    nics: [
+      { network: "user", model: "virtio" as const, mac: "01:00:5e:00:00:01" },
+      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34:56" },
+      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34:56" },
+    ],
+  };
+  expect(validate(v, true)).toEqual({
+    cores: "vmForm.errors.cores",
+    "disks.0.bootOrder": "vmForm.errors.bootOrder",
+    // "02"와 "2"는 같은 순서다.
+    "disks.2.bootOrder": "vmForm.errors.bootOrder",
+    "nics.0.mac": "vmForm.errors.macMulticast",
+    "nics.2.mac": "vmForm.errors.macDuplicate",
+  });
+  expect(validate({ ...v, cores: "65535", disks: [], nics: [] }, true)).toEqual({});
+});
+
+it("checks volume names across disks and against existing volumes", () => {
+  const v = {
+    ...emptyForm("q35"),
+    name: "web",
+    disks: [
+      { ...emptyDisk("", 0), kind: "existing" as const },
+      { ...emptyDisk("web", 0), pool: "local", bootOrder: "" },
+      { ...emptyDisk("web", 0), pool: "local", bootOrder: "" },
+      { ...emptyDisk("web", 3), pool: "local" },
+    ],
+  };
+  expect(validate(v, true, ["web-disk3"])).toEqual({
+    "disks.0.volume": "vmForm.errors.volumeChoose",
+    "disks.2.volume": "vmForm.errors.volumeDuplicate",
+    "disks.3.volume": "vmForm.errors.volumeExists",
+  });
+});

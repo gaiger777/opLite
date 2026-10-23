@@ -20,7 +20,7 @@ export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm
     },
     status: { phase, node: phase === "running" ? "n1" : null, pid: null, last_error: null },
     ...extra,
-  } as Vm;
+  } satisfies Vm;
 }
 
 export const NODE: Node = {

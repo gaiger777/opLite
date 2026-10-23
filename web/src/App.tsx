@@ -35,7 +35,8 @@ function routes() {
           children: [
             { index: true, element: <DashboardPage /> },
             { path: "vms", element: <VmListPage /> },
-            { path: "vms/new", element: <VmCreatePage /> },
+            // VM 이름은 `-`로 시작할 수 없으므로 "new"라는 VM과 겹치지 않는다.
+            { path: "vms/-new", element: <VmCreatePage /> },
             { path: "vms/:name", element: <VmDetailPage /> },
             { path: "vms/:name/edit", element: <VmEditPage /> },
             { path: "vms/:name/console", element: <ConsolePage /> },
