@@ -202,5 +202,22 @@
     "paste": "Type clipboard",
     "pasteDenied": "The browser did not allow reading the clipboard.",
     "fullscreen": "Full screen"
+  },
+  "dashboard": {
+    "nodes": "Nodes",
+    "online": "online",
+    "vms": "Virtual machines",
+    "vmCounts": "{{running}} running · {{stopped}} stopped · {{failed}} failed",
+    "leader": "Leader",
+    "perNode": "Nodes",
+    "state": "State",
+    "hypervisor": "Hypervisor",
+    "runningVms": "Running VMs",
+    "nodeOnline": "Online",
+    "nodeOffline": "Offline",
+    "maintenance": "Maintenance",
+    "failedVms": "Failed virtual machines",
+    "recentTasks": "Recent tasks",
+    "allTasks": "All tasks"
   }
 }
