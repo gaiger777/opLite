@@ -23,17 +23,27 @@ export class NetworkError extends Error {
   }
 }
 
-let onUnauthorized = () => {};
+let onUnauthorized: (sentAt: number) => void = () => {};
+let authEpoch = () => 0;
 
-/** 로그인 밖의 요청이 401을 받으면(세션 만료, opld 재시작, 비밀번호 변경) 부른다. */
-export function setUnauthorizedHandler(handler: () => void) {
+/**
+ * 로그인 밖의 요청이 401을 받으면(세션 만료, opld 재시작, 비밀번호 변경) 부른다. 요청을 보낼 때의
+ * 인증 세대(`epoch`)를 넘기므로, 그 뒤에 다시 로그인했으면 오래된 요청의 401을 무시할 수 있다.
+ */
+export function setUnauthorizedHandler(handler: (sentAt: number) => void, epoch: () => number) {
   onUnauthorized = handler;
+  authEpoch = epoch;
 }
 
+const sentAt = new WeakMap<Request, number>();
+
 const unauthorized: Middleware = {
+  onRequest({ request }) {
+    sentAt.set(request, authEpoch());
+  },
   onResponse({ request, response }) {
     if (response.status === 401 && !new URL(request.url).pathname.endsWith("/auth/login")) {
-      onUnauthorized();
+      onUnauthorized(sentAt.get(request) ?? authEpoch());
     }
   },
 };

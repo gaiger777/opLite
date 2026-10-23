@@ -36,7 +36,12 @@ export default tseslint.config(
     },
   },
   // 앱은 브라우저에서 돈다. E2E는 Node(Playwright)에서 돌며 환경 변수를 읽고, 브라우저 안의 코드도 담는다.
-  { files: ["src/**"], languageOptions: { globals: globals.browser } },
+  // typescript-eslint가 TS 파일의 no-undef를 끄므로 브라우저 전역만으로는 `process`를 막지 못한다.
+  {
+    files: ["src/**"],
+    languageOptions: { globals: globals.browser },
+    rules: { "no-restricted-globals": ["error", "process"] },
+  },
   { files: ["e2e/**"], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
   { files: ["*.config.{js,ts}", "scripts/**"], languageOptions: { globals: globals.node } },
 );

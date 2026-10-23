@@ -112,8 +112,12 @@ function LanguageMenu() {
           value={i18n.language}
           onValueChange={(v) => setLanguage(v as Language)}
         >
-          <DropdownMenuRadioItem value="ko">한국어</DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="en">English</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="ko" lang="ko">
+            한국어
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="en" lang="en">
+            English
+          </DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -149,7 +153,7 @@ function UserMenu() {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" aria-label={t("header.account")}>
+        <Button variant="ghost" aria-label={`${t("header.account")} (${me.name})`}>
           <User />
           <span className="hidden sm:inline">{me.name}</span>
         </Button>

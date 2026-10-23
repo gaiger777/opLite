@@ -61,6 +61,7 @@
     "stateColumn": "State",
     "error": "Error",
     "empty": "No tasks.",
+    "emptyFailed": "No failed tasks.",
     "failedOnly": "Failed only",
     "done": "{{label}}: done",
     "failed": "{{label}}: failed. {{error}}",

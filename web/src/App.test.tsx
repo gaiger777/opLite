@@ -49,10 +49,15 @@ it("signs in, returns to the requested page and signs out", async () => {
 
   await screen.findByRole("button", { name: "Sign in" });
   expect(window.location.pathname).toBe("/login");
+  expect(screen.getByRole("heading", { level: 1, name: "opLite" })).toBeInTheDocument();
   await user.type(screen.getByLabelText("Username"), "admin");
   await user.type(screen.getByLabelText("Password"), "nope");
   await user.click(screen.getByRole("button", { name: "Sign in" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("Wrong username or password.");
+  expect(screen.getByLabelText("Password")).toHaveAttribute("aria-invalid", "true");
+  expect(screen.getByLabelText("Password")).toHaveAccessibleDescription(
+    "Wrong username or password.",
+  );
 
   await user.clear(screen.getByLabelText("Password"));
   await user.type(screen.getByLabelText("Password"), "admin-password");
@@ -62,8 +67,32 @@ it("signs in, returns to the requested page and signs out", async () => {
   expect(await screen.findByText("lab")).toBeInTheDocument();
   expect(await screen.findByRole("status")).toHaveTextContent("Live");
 
-  await user.click(screen.getByRole("button", { name: "Account" }));
+  await user.click(screen.getByRole("button", { name: "Account (admin)" }));
   await user.click(await screen.findByRole("menuitem", { name: "Sign out" }));
+  expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+  // 직접 로그아웃하면 다음 사용자를 앞 사용자의 화면으로 보내지 않는다.
+  expect(window.location.pathname).toBe("/login");
+  expect(window.location.search).toBe("");
+});
+
+it("does not show the sign-in form while checking the session", async () => {
+  signedOut();
+  let answer = () => {};
+  server.use(
+    http.get(
+      apiUrl("/auth/whoami"),
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = () =>
+            resolve(HttpResponse.json({ code: "unauthorized", message: "login" }, { status: 401 }));
+        }),
+    ),
+  );
+  window.history.pushState({}, "", "/login");
+  render(<App />);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
+  answer();
   expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
 });
 
@@ -72,4 +101,10 @@ it("only returns to pages on this site", () => {
   expect(safeNext("//evil.example")).toBe("/");
   expect(safeNext("https://evil.example")).toBe("/");
   expect(safeNext(null)).toBe("/");
+  // 브라우저는 `\`를 `/`로 읽고 탭·줄바꿈을 지워 `//evil.example`로 만든다.
+  expect(safeNext("/\\evil.example")).toBe("/");
+  expect(safeNext("/\t/evil.example")).toBe("/");
+  expect(safeNext("/\n/evil.example")).toBe("/");
+  expect(safeNext("vms")).toBe("/");
+  expect(safeNext("/vms#console")).toBe("/vms#console");
 });

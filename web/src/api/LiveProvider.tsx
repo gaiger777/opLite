@@ -9,6 +9,8 @@ const LiveContext = createContext<LiveStatus>("connecting");
 
 const FIRST_RETRY_MS = 1000;
 const MAX_RETRY_MS = 30_000;
+/** 이만큼 이어져 있다 끊기면 다시 1초부터 기다린다. 곧바로 끊기면(lagged 등) 계속 늘린다. */
+const STABLE_MS = 30_000;
 
 function watchUrl(since: number) {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
@@ -43,7 +45,12 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       try {
         const lists = await Promise.all(
           KINDS.map((kind) =>
-            queryClient.fetchQuery({ queryKey: listKey(kind), queryFn: () => fetchList(kind) }),
+            // 다시 시도는 여기의 backoff만 한다.
+            queryClient.fetchQuery({
+              queryKey: listKey(kind),
+              queryFn: () => fetchList(kind),
+              retry: false,
+            }),
           ),
         );
         since = Math.min(...lists.map((list) => list.revision));
@@ -56,25 +63,44 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       }
       const ws = new WebSocket(watchUrl(since));
       socket = ws;
+      let openedAt: number | undefined;
       ws.onopen = () => {
-        delay = FIRST_RETRY_MS;
+        openedAt = Date.now();
         setStatus("live");
       };
       ws.onmessage = (message) => {
-        const event = JSON.parse(String(message.data)) as WatchEvent;
-        if (event.type === "put" || event.type === "deleted") {
-          queryClient.setQueryData<List<{ id: string; revision: number }>>(
-            listKey(event.kind),
-            (list) => list && applyEvent(list, event),
-          );
-        } else {
-          // reset이나 오류면 이어 받을 수 없다. 닫히면 다시 읽는다.
+        let event: WatchEvent | null;
+        try {
+          event = JSON.parse(String(message.data)) as WatchEvent | null;
+        } catch {
+          // 읽을 수 없는 프레임이면 무엇을 놓쳤는지 모른다. 닫히면 다시 읽는다.
           ws.close();
+          return;
+        }
+        switch (event?.type) {
+          case "put":
+          case "deleted":
+            queryClient.setQueryData<List<{ id: string; revision: number }>>(
+              listKey(event.kind),
+              (list) => list && applyEvent(list, event),
+            );
+            break;
+          case "reset":
+          case "error":
+            // 이어 받을 수 없다. 닫히면 다시 읽는다.
+            ws.close();
+            break;
+          // 모르는 종류는 무시한다(서버가 새 종류를 더해도 끊지 않는다).
+          default:
+            break;
         }
       };
       ws.onclose = () => {
         if (socket === ws) {
           socket = null;
+          if (openedAt !== undefined && Date.now() - openedAt > STABLE_MS) {
+            delay = FIRST_RETRY_MS;
+          }
           retry();
         }
       };

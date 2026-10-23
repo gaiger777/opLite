@@ -3,7 +3,12 @@ import { http, HttpResponse } from "msw";
 import { ApiError, NetworkError, api, call, setUnauthorizedHandler } from "@/api/client";
 import { apiUrl, server } from "@/test/server";
 
-afterEach(() => setUnauthorizedHandler(() => {}));
+afterEach(() =>
+  setUnauthorizedHandler(
+    () => {},
+    () => 0,
+  ),
+);
 
 it("turns error bodies into ApiError", async () => {
   server.use(
@@ -20,7 +25,7 @@ it("turns error bodies into ApiError", async () => {
 
 it("reports 401 except for the login request itself", async () => {
   const handler = vi.fn();
-  setUnauthorizedHandler(handler);
+  setUnauthorizedHandler(handler, () => 3);
   const denied = HttpResponse.json({ code: "unauthorized", message: "login" }, { status: 401 });
   server.use(
     http.get(apiUrl("/vms"), () => denied.clone()),
@@ -29,7 +34,8 @@ it("reports 401 except for the login request itself", async () => {
   await call(api.POST("/auth/login", { body: { username: "a", password: "b" } })).catch(() => {});
   expect(handler).not.toHaveBeenCalled();
   await call(api.GET("/vms")).catch(() => {});
-  expect(handler).toHaveBeenCalledOnce();
+  // 요청을 보낼 때의 인증 세대를 넘긴다.
+  expect(handler).toHaveBeenCalledExactlyOnceWith(3);
 });
 
 it("treats proxy error pages as network errors", async () => {

@@ -67,7 +67,7 @@ test("create a VM, open its console, stop and delete it", async ({ page }) => {
   await expect(page.getByRole("link", { name: "web", exact: true })).toHaveCount(0);
 
   // 로그아웃하면 보호된 화면은 로그인으로 보낸다.
-  await page.getByRole("button", { name: "Account" }).click();
+  await page.getByRole("button", { name: /^Account/ }).click();
   await page.getByRole("menuitem", { name: "Sign out" }).click();
   await page.goto("/vms");
   await expect(page).toHaveURL(/\/login\?next=%2Fvms/);

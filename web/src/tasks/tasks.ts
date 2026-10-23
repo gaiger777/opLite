@@ -14,8 +14,19 @@ let tracked = () => {};
 export function onTrack(listener: () => void) {
   tracked = listener;
   return () => {
-    tracked = () => {};
+    // 그 사이 다른 리스너로 바뀌었으면 그대로 둔다.
+    if (tracked === listener) {
+      tracked = () => {};
+    }
   };
+}
+
+/** 지켜보던 Task를 모두 잊고 그 알림을 닫는다. 로그아웃하거나 세션이 끝나면 부른다. */
+export function resetTasks() {
+  for (const id of pending.keys()) {
+    toast.dismiss(id);
+  }
+  pending.clear();
 }
 
 /**
@@ -51,7 +62,9 @@ export function settleTasks(tasks: Task[], t: TFunction) {
 
 /** Task를 사람이 읽을 문장으로: "web-01 시작" */
 export function describeTask(task: Task, t: TFunction, target: string): string {
-  return t(`tasks.op.${task.spec.op.kind}`, { target });
+  const kind = task.spec.op.kind;
+  // 모르는 작업(새 서버)은 번역 키 대신 종류를 그대로 보여 준다.
+  return t(`tasks.op.${kind}`, { target, defaultValue: `${kind} ${target}` });
 }
 
 /** watch로 들어온 Task 목록에서 그 Task가 끝나기를 기다린다. 실패하면 Task의 오류로 거부한다. */

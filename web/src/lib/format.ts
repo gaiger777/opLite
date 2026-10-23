@@ -3,8 +3,9 @@ export function uuidTime(id: string): Date {
   return new Date(parseInt(id.replace(/-/g, "").slice(0, 12), 16));
 }
 
+/** 날짜와 시각. 연도는 늘 네 자리다(`short`는 두 자리). */
 export function formatTime(date: Date, language: string): string {
-  return date.toLocaleString(language, { dateStyle: "short", timeStyle: "medium" });
+  return date.toLocaleString(language, { dateStyle: "medium", timeStyle: "medium" });
 }
 
 /** MiB를 읽기 좋게: 512 MiB, 4 GiB */

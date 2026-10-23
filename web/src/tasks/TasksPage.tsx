@@ -47,17 +47,29 @@ export function useTaskTarget() {
       return { name: vm.name, href: `/vms/${encodeURIComponent(vm.name)}` };
     }
     const volume = volumes.data?.find((v) => v.id === task.spec.target);
-    return { name: volume?.name ?? task.spec.target.slice(0, 8), href: undefined };
+    // 지워진 대상은 id의 끝(UUIDv7의 무작위 부분)으로 구분한다. 앞부분은 시각이라 서로 비슷하다.
+    return { name: volume?.name ?? task.spec.target.slice(-8), href: undefined };
   };
 }
 
-/** Task 표. VM 화면의 작업 탭도 쓴다. */
-export function TaskTable({ tasks }: { tasks: Task[] }) {
+/**
+ * Task 표. VM 화면의 작업 탭도 쓴다. `labelledBy`는 표의 이름이 될 제목의 id, `empty`는 보일 Task가
+ * 없을 때의 문장이다.
+ */
+export function TaskTable({
+  tasks,
+  labelledBy,
+  empty,
+}: {
+  tasks: Task[];
+  labelledBy?: string;
+  empty?: string;
+}) {
   const { t, i18n } = useTranslation();
   const target = useTaskTarget();
   const nodes = useList("node");
   return (
-    <Table>
+    <Table aria-labelledby={labelledBy}>
       <TableHeader>
         <TableRow>
           <TableHead>{t("tasks.time")}</TableHead>
@@ -71,17 +83,18 @@ export function TaskTable({ tasks }: { tasks: Task[] }) {
         {tasks.length === 0 && (
           <TableRow>
             <TableCell colSpan={5} className="text-center text-muted-foreground">
-              {t("tasks.empty")}
+              {empty ?? t("tasks.empty")}
             </TableCell>
           </TableRow>
         )}
         {tasks.map((task) => {
           const { name, href } = target(task);
           const node = nodes.data?.find((n) => n.id === task.spec.node);
+          const time = uuidTime(task.id);
           return (
             <TableRow key={task.id}>
               <TableCell className="whitespace-nowrap">
-                {formatTime(uuidTime(task.id), i18n.language)}
+                <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>
               </TableCell>
               <TableCell>
                 {href ? (
@@ -96,8 +109,10 @@ export function TaskTable({ tasks }: { tasks: Task[] }) {
               <TableCell>
                 <TaskStateBadge task={task} />
               </TableCell>
-              <TableCell className="max-w-md truncate" title={task.status.error ?? undefined}>
-                {task.status.error ?? ""}
+              <TableCell>
+                <div className="max-w-md truncate" title={task.status.error ?? undefined}>
+                  {task.status.error ?? ""}
+                </div>
               </TableCell>
             </TableRow>
           );
@@ -126,7 +141,9 @@ export function TasksPage() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between gap-4">
-        <h1 className="text-2xl font-semibold">{t("nav.tasks")}</h1>
+        <h1 id="tasks-title" className="text-2xl font-semibold">
+          {t("nav.tasks")}
+        </h1>
         <div className="flex items-center gap-2">
           <Checkbox
             id="failed-only"
@@ -136,7 +153,11 @@ export function TasksPage() {
           <Label htmlFor="failed-only">{t("tasks.failedOnly")}</Label>
         </div>
       </div>
-      <TaskTable tasks={shown} />
+      <TaskTable
+        tasks={shown}
+        labelledBy="tasks-title"
+        empty={failedOnly ? t("tasks.emptyFailed") : undefined}
+      />
     </div>
   );
 }

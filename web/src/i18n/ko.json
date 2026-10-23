@@ -61,6 +61,7 @@
     "stateColumn": "상태",
     "error": "오류",
     "empty": "작업이 없습니다.",
+    "emptyFailed": "실패한 작업이 없습니다.",
     "failedOnly": "실패만",
     "done": "{{label}}: 완료",
     "failed": "{{label}}: 실패. {{error}}",

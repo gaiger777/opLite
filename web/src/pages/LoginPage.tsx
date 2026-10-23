@@ -19,6 +19,10 @@ export function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // 세션을 확인하는 동안에는 폼을 그리지 않는다(로그인돼 있으면 잠깐 보였다 사라진다).
+  if (principal === undefined) {
+    return null;
+  }
   if (principal) {
     return <Navigate to={safeNext(params.get("next"))} replace />;
   }
@@ -40,7 +44,9 @@ export function LoginPage() {
     <div className="flex min-h-svh items-center justify-center p-4">
       <Card className="w-full max-w-sm">
         <CardHeader>
-          <CardTitle className="text-xl">opLite</CardTitle>
+          <CardTitle className="text-xl">
+            <h1>opLite</h1>
+          </CardTitle>
         </CardHeader>
         <CardContent>
           <form onSubmit={submit} className="flex flex-col gap-4">
@@ -61,12 +67,14 @@ export function LoginPage() {
                 type="password"
                 autoComplete="current-password"
                 required
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? "login-error" : undefined}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
               />
             </div>
             {error && (
-              <p role="alert" className="text-sm text-destructive">
+              <p id="login-error" role="alert" className="text-sm text-destructive">
                 {error}
               </p>
             )}
