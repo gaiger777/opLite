@@ -41,10 +41,13 @@ impl Daemon {
         let cluster_port = free_port();
         let share =
             std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
+        // systemd가 있는 Linux(CI)에서만 `OPL_TEST_SYSTEMD=1`로 QEMU를 스코프로 감싼다.
+        let systemd_scope = std::env::var_os("OPL_TEST_SYSTEMD").is_some();
         let config = format!(
             "name = \"{name}\"\naddress = \"127.0.0.1\"\nlisten = \"127.0.0.1:{port}\"\n\
              cluster_listen = \"127.0.0.1:{cluster_port}\"\ncontrol_socket = \"{sock}\"\n\
-             data_dir = \"{data}\"\nrun_dir = \"{run}\"\nqemu_share_dir = \"{share}\"\n{extra_config}",
+             data_dir = \"{data}\"\nrun_dir = \"{run}\"\nqemu_share_dir = \"{share}\"\n{extra_config}\n\
+             [hypervisor]\nsystemd_scope = {systemd_scope}\n",
             sock = dir.path().join("opld.sock").display(),
             data = dir.path().join("data").display(),
             run = dir.path().join("run").display(),

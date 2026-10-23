@@ -2,6 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use opl_qemu::{Accel, HostProfile, kvm_available};
 use serde::Deserialize;
 
 /// `opld --config <path>`로 읽는 TOML 설정.
@@ -28,13 +29,53 @@ pub struct Config {
     /// QEMU 소켓과 pidfile을 두는 휘발성 디렉터리. 유닉스 소켓 경로 길이 제한(104바이트) 때문에 짧아야 한다.
     #[serde(default = "default_run_dir")]
     pub run_dir: PathBuf,
-    /// Homebrew QEMU의 펌웨어 디렉터리. 지금은 Apple Silicon(hvf)만 지원한다(Linux/KVM은 M7).
+    /// Homebrew QEMU의 펌웨어 디렉터리(macOS). Linux는 Debian 경로를 쓴다(`[hypervisor]`로 바꾼다).
     #[serde(default = "default_qemu_share_dir")]
     pub qemu_share_dir: PathBuf,
     #[serde(default = "default_qemu_img")]
     pub qemu_img: PathBuf,
     #[serde(default)]
+    pub hypervisor: HypervisorSection,
+    #[serde(default)]
     pub reconciler: ReconcilerSection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HypervisorSection {
+    /// `auto`(macOS는 hvf, Linux는 KVM이 있으면 kvm, 없으면 tcg), `kvm`, `tcg`, `hvf`
+    #[serde(default)]
+    pub accel: AccelSetting,
+    /// QEMU 실행 파일. 기본은 호스트에 맞는 `qemu-system-*`이다.
+    pub qemu_binary: Option<PathBuf>,
+    /// UEFI 펌웨어 코드와 VM마다 복사하는 변수 저장소 원본
+    pub uefi_code: Option<PathBuf>,
+    pub uefi_vars: Option<PathBuf>,
+    /// QEMU를 `systemd-run --scope`로 감싼다(VM마다 cgroup). Linux에서 기본으로 켠다.
+    #[serde(default = "default_systemd_scope")]
+    pub systemd_scope: bool,
+}
+
+impl Default for HypervisorSection {
+    fn default() -> Self {
+        Self {
+            accel: AccelSetting::default(),
+            qemu_binary: None,
+            uefi_code: None,
+            uefi_vars: None,
+            systemd_scope: default_systemd_scope(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccelSetting {
+    #[default]
+    Auto,
+    Kvm,
+    Tcg,
+    Hvf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -73,6 +114,9 @@ fn default_run_dir() -> PathBuf {
 }
 fn default_qemu_share_dir() -> PathBuf {
     "/opt/homebrew/share/qemu".into()
+}
+fn default_systemd_scope() -> bool {
+    cfg!(target_os = "linux")
 }
 fn default_qemu_img() -> PathBuf {
     "qemu-img".into()
@@ -126,6 +170,15 @@ impl Config {
                 anyhow::bail!("{key} must have a port other than 0 (got {addr})");
             }
         }
+        let linux = cfg!(target_os = "linux");
+        match self.hypervisor.accel {
+            AccelSetting::Kvm if !linux => anyhow::bail!("accel = \"kvm\" needs Linux"),
+            AccelSetting::Hvf if linux => anyhow::bail!("accel = \"hvf\" needs macOS"),
+            _ => {}
+        }
+        if self.hypervisor.systemd_scope && !linux {
+            anyhow::bail!("systemd_scope needs Linux; set it to false");
+        }
         // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
         if self.listen.port() == self.cluster_listen.port() {
             anyhow::bail!(
@@ -134,6 +187,31 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    /// 이 호스트에서 QEMU를 실행하는 방법. `accel = "kvm"`인데 `/dev/kvm`을 열 수 없으면 오류다.
+    pub fn host_profile(&self) -> anyhow::Result<HostProfile> {
+        let h = &self.hypervisor;
+        let mut profile = HostProfile::native(&self.qemu_share_dir);
+        match h.accel {
+            AccelSetting::Auto => {}
+            AccelSetting::Kvm if !kvm_available() => {
+                anyhow::bail!("accel = \"kvm\" but /dev/kvm cannot be opened")
+            }
+            AccelSetting::Kvm => profile.accel = Accel::Kvm,
+            AccelSetting::Tcg => profile.accel = Accel::Tcg,
+            AccelSetting::Hvf => profile.accel = Accel::Hvf,
+        }
+        if let Some(binary) = &h.qemu_binary {
+            profile.qemu_binary = binary.clone();
+        }
+        if let Some(code) = &h.uefi_code {
+            profile.uefi_code = code.clone();
+        }
+        if let Some(vars) = &h.uefi_vars {
+            profile.uefi_vars_template = vars.clone();
+        }
+        Ok(profile)
     }
 
     /// 클러스터에 알리는 API 주소
@@ -181,6 +259,8 @@ mod tests {
         assert_eq!(c.data_dir, Path::new("/var/lib/opl"));
         assert_eq!(c.control_socket(), Path::new("/run/opl/opld.sock"));
         assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(60));
+        assert_eq!(c.hypervisor.accel, AccelSetting::Auto);
+        assert_eq!(c.hypervisor.systemd_scope, cfg!(target_os = "linux"));
         assert_eq!(
             c.cert_names(),
             ["10.0.0.5", "localhost", "127.0.0.1", "::1"]
@@ -236,5 +316,38 @@ mod tests {
             ..ok
         };
         assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn hypervisor_section_picks_and_overrides_the_profile() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"tcg\"\n\
+             qemu_binary = \"/opt/qemu/bin/qemu-system-x86_64\"\nsystemd_scope = false",
+        );
+        assert!(c.validate().is_ok());
+        let p = c.host_profile().unwrap();
+        assert_eq!(p.accel, Accel::Tcg);
+        assert_eq!(p.qemu_binary, Path::new("/opt/qemu/bin/qemu-system-x86_64"));
+
+        // 다른 OS의 가속기와 macOS의 systemd 스코프는 거부한다.
+        let other = if cfg!(target_os = "linux") {
+            "hvf"
+        } else {
+            "kvm"
+        };
+        let c = parse(&format!(
+            "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"{other}\"\nsystemd_scope = false"
+        ));
+        assert!(c.validate().is_err());
+        if !cfg!(target_os = "linux") {
+            let c = parse("name = \"n\"\naddress = \"h\"\n[hypervisor]\nsystemd_scope = true");
+            assert!(c.validate().is_err());
+        }
+        assert!(
+            toml::from_str::<Config>(
+                "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"xen\""
+            )
+            .is_err()
+        );
     }
 }

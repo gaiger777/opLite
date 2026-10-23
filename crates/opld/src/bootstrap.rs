@@ -14,6 +14,7 @@ use opl_types::resource::Resource;
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::host::Host;
 
 pub const NODE_ID_FILE: &str = "node-id";
 const NODE_ID_TMP_FILE: &str = "node-id.tmp";
@@ -42,6 +43,7 @@ pub fn node_id(data_dir: &Path) -> anyhow::Result<Uuid> {
 pub async fn create_cluster(
     cluster: &Cluster,
     config: &Config,
+    host: &Host,
     name: &str,
     ca: &ClusterCa,
 ) -> anyhow::Result<String> {
@@ -53,7 +55,7 @@ pub async fn create_cluster(
         },
     );
     cluster.create(&info).await?;
-    register_node(cluster, config).await?;
+    register_node(cluster, config, host).await?;
     let password = Uuid::new_v4().simple().to_string();
     let admin = Resource::new(
         "admin",
@@ -68,8 +70,8 @@ pub async fn create_cluster(
     Ok(password)
 }
 
-/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량을 기록한다.
-pub async fn register_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
+/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지를 기록한다.
+pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> anyhow::Result<()> {
     let NodeId(id) = cluster.id();
     let address = config.api_address();
     match cluster.get::<NodeSpec>(id)? {
@@ -97,10 +99,28 @@ pub async fn register_node(cluster: &Cluster, config: &Config) -> anyhow::Result
         online: true,
         cpus: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
         memory_mib: crate::host::memory_mib(),
-        hypervisor: "qemu-hvf".into(),
-        bridges: vec![],
+        hypervisor: host.hypervisor_name(),
+        bridges: host.bridges().await,
     };
     cluster.update_status::<NodeSpec>(id, &status).await?;
+    Ok(())
+}
+
+/// 브리지가 바뀌었으면(관리자가 만들거나 지움) 기록한다. 바뀌지 않았으면 쓰지 않는다.
+pub async fn refresh_bridges(cluster: &Cluster, host: &Host) -> anyhow::Result<()> {
+    let NodeId(id) = cluster.id();
+    let Some(node) = cluster.get::<NodeSpec>(id)? else {
+        return Ok(());
+    };
+    let bridges = host.bridges().await;
+    if node.status.bridges != bridges {
+        tracing::info!(?bridges, "bridges changed");
+        let status = NodeStatus {
+            bridges,
+            ..node.status
+        };
+        cluster.update_status::<NodeSpec>(id, &status).await?;
+    }
     Ok(())
 }
 

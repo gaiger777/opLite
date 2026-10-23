@@ -12,11 +12,10 @@ use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{AppState, TaskRunner, TaskRunnerConfig};
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError};
-use opl_driver::{DirStorage, Hypervisor, QemuConfig, QemuHypervisor, Storage};
+use opl_driver::{DirStorage, Hypervisor, QemuHypervisor, Storage};
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{TlsListener, api_server_config};
 use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers};
-use opl_qemu::HostProfile;
 use opl_reconciler::{Reconciler, ReconcilerConfig};
 use opl_types::node::NodeSpec;
 use opl_types::vm::VmSpec;
@@ -27,6 +26,7 @@ use uuid::Uuid;
 
 use crate::bootstrap;
 use crate::config::Config;
+use crate::host::Host;
 
 /// 데이터 디렉터리 아래 클러스터 저장소(Raft 로그와 상태)를 두는 디렉터리
 pub const CLUSTER_DIR: &str = "cluster";
@@ -37,6 +37,8 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 다시 시작한 노드가 Node 리소스를 다시 기록하는 간격(과반수가 없으면 될 때까지)
 const REGISTER_RETRY: Duration = Duration::from_secs(2);
+/// 노드의 브리지 목록을 다시 확인하는 간격. 관리자가 브리지를 만들면 이만큼 뒤에 스케줄러가 안다.
+const BRIDGE_REFRESH: Duration = Duration::from_secs(60);
 /// 다시 시작한 learner가 승격을 다시 요청하는 간격. 실패할 때마다 두 배로 늘려 최대 시간까지 둔다.
 const PROMOTE_RETRY_MIN: Duration = Duration::from_secs(5);
 const PROMOTE_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -139,15 +141,14 @@ impl Member {
                 return Err(e);
             }
         };
-        let hv: Arc<dyn Hypervisor> = match QemuHypervisor::new(QemuConfig {
-            host: HostProfile::homebrew_hvf(&config.qemu_share_dir),
-            run_dir: config.run_dir.clone(),
-            state_dir: config.data_dir.clone(),
-            net: None,
-            systemd_scope: false,
-        })
-        .await
-        {
+        let host = match Host::from_config(config) {
+            Ok(host) => host,
+            Err(e) => {
+                let _ = cluster.shutdown().await;
+                return Err(e);
+            }
+        };
+        let hv: Arc<dyn Hypervisor> = match QemuHypervisor::new(host.qemu_config(config)).await {
             Ok(hv) => Arc::new(hv),
             Err(e) => {
                 let _ = cluster.shutdown().await;
@@ -179,12 +180,13 @@ impl Member {
                 Bootstrap::Init { name, ca } => {
                     let me = BasicNode::new(config.cluster_address());
                     cluster.initialize(BTreeMap::from([(id, me)])).await?;
-                    password = Some(bootstrap::create_cluster(&cluster, config, &name, &ca).await?);
+                    password =
+                        Some(bootstrap::create_cluster(&cluster, config, &host, &name, &ca).await?);
                 }
                 Bootstrap::Join { via } => {
                     tls.save(&pki_dir(config))?;
                     promote(&cluster, &peers, Some(&via)).await?;
-                    bootstrap::register_node(&cluster, config).await?;
+                    bootstrap::register_node(&cluster, config, &host).await?;
                 }
             }
             let mut state = AppState::new(
@@ -225,20 +227,28 @@ impl Member {
         };
 
         // 다시 시작한 노드는 과반수가 없어도 VM을 계속 다스려야 하므로, Node 리소스는 뒤에서 기록한다.
-        let (register, promotion) = if first_time {
-            (tokio::spawn(async {}), tokio::spawn(async {}))
+        let promotion = if first_time {
+            tokio::spawn(async {})
         } else {
-            let (cluster2, peers) = (cluster.clone(), peers.clone());
-            let promotion =
-                tokio::spawn(async move { promote_until_voter(&cluster2, &peers).await });
+            let (cluster, peers) = (cluster.clone(), peers.clone());
+            tokio::spawn(async move { promote_until_voter(&cluster, &peers).await })
+        };
+        let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
-            let register = tokio::spawn(async move {
-                while let Err(e) = bootstrap::register_node(&cluster, &config).await {
-                    tracing::warn!(error = %e, "cannot register this node; will retry");
-                    tokio::time::sleep(REGISTER_RETRY).await;
+            tokio::spawn(async move {
+                if !first_time {
+                    while let Err(e) = bootstrap::register_node(&cluster, &config, &host).await {
+                        tracing::warn!(error = %e, "cannot register this node; will retry");
+                        tokio::time::sleep(REGISTER_RETRY).await;
+                    }
                 }
-            });
-            (register, promotion)
+                loop {
+                    tokio::time::sleep(BRIDGE_REFRESH).await;
+                    if let Err(e) = bootstrap::refresh_bridges(&cluster, &host).await {
+                        tracing::warn!(error = %e, "cannot record bridges");
+                    }
+                }
+            })
         };
         let mut reconciler_config = ReconcilerConfig::new(node);
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
