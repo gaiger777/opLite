@@ -53,6 +53,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PoolCmd,
     },
+    /// VM NIC가 연결하는 네트워크(노드에 미리 만든 Linux 브리지)
+    Network {
+        #[command(subcommand)]
+        cmd: NetworkCmd,
+    },
     Volume {
         #[command(subcommand)]
         cmd: VolumeCmd,
@@ -158,6 +163,27 @@ enum PoolCmd {
     },
     Delete {
         pool: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkCmd {
+    List,
+    Get {
+        network: String,
+    },
+    /// 노드에 있는 Linux 브리지를 가리키는 네트워크를 만든다.
+    Create {
+        name: String,
+        /// 브리지 이름(예: vmbr0). 이 네트워크를 쓰는 VM은 이 브리지가 있는 노드에서만 돈다.
+        #[arg(long)]
+        bridge: String,
+        /// VLAN 태그(1-4094). 브리지가 VLAN-aware(vlan_filtering 1)여야 한다.
+        #[arg(long)]
+        vlan: Option<u16>,
+    },
+    Delete {
+        network: String,
     },
 }
 
@@ -274,7 +300,7 @@ struct VmCreate {
     /// 붙일 볼륨 이름. 여러 번 줄 수 있고 첫 디스크로 부팅한다.
     #[arg(long = "disk")]
     disks: Vec<String>,
-    /// 연결할 네트워크 이름(지금은 user만). 여러 번 줄 수 있다.
+    /// 연결할 네트워크 이름(`user`는 QEMU NAT). 여러 번 줄 수 있다.
     #[arg(long = "nic")]
     nics: Vec<String>,
     #[arg(long, value_enum, default_value = "never")]
@@ -488,6 +514,30 @@ where
             PoolCmd::Delete { pool } => {
                 client.delete(&format!("/storage-pools/{pool}")).await?;
                 writeln!(out, "storage pool {pool} deleted")?;
+            }
+        },
+        Cmd::Network { cmd } => match cmd {
+            NetworkCmd::List => {
+                let list = client.get("/networks").await?;
+                print_list(out, json_out, &list, &["NAME", "BRIDGE", "VLAN"], |n| {
+                    vec![
+                        cell(&n["name"]),
+                        cell(&n["spec"]["bridge"]),
+                        cell(&n["spec"]["vlan"]),
+                    ]
+                })?;
+            }
+            NetworkCmd::Get { network } => {
+                print_json(out, &client.get(&format!("/networks/{network}")).await?)?
+            }
+            NetworkCmd::Create { name, bridge, vlan } => {
+                let body = json!({ "name": name, "spec": { "bridge": bridge, "vlan": vlan } });
+                client.post("/networks", &body).await?;
+                writeln!(out, "network {name} created")?;
+            }
+            NetworkCmd::Delete { network } => {
+                client.delete(&format!("/networks/{network}")).await?;
+                writeln!(out, "network {network} deleted")?;
             }
         },
         Cmd::Volume { cmd } => match cmd {
