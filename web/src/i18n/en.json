@@ -20,5 +20,33 @@
     "cluster_no_quorum": "The cluster has no quorum. The change may still be applied later.",
     "not_leader": "The cluster leader is changing. Try again shortly.",
     "internal": "The server failed: {{message}}"
+  },
+  "nav": {
+    "dashboard": "Dashboard",
+    "vms": "Virtual machines",
+    "tasks": "Tasks"
+  },
+  "header": {
+    "language": "Language",
+    "theme": "Theme",
+    "themeSystem": "System",
+    "themeLight": "Light",
+    "themeDark": "Dark",
+    "account": "Account",
+    "logout": "Sign out"
+  },
+  "roles": {
+    "admin": "Administrator",
+    "operator": "Operator",
+    "viewer": "Viewer"
+  },
+  "login": {
+    "username": "Username",
+    "password": "Password",
+    "submit": "Sign in"
+  },
+  "notFound": {
+    "title": "Page not found",
+    "home": "Go to the dashboard"
   }
 }
