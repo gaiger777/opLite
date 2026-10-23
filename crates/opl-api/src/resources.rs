@@ -1,4 +1,4 @@
-//! 종류에 상관없는 조회 핸들러와 공통 요청 형식, 풀과 노드 핸들러.
+//! 종류에 상관없는 조회 핸들러와 공통 요청 형식, 풀·네트워크·노드 핸들러.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::header::IF_MATCH;
 use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::{Cluster, Typed};
+use opl_types::network::{Network, NetworkSpec, NetworkStatus, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec, NodeStatus};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::storage::{
@@ -164,6 +165,15 @@ list_and_get!(
     "vms"
 );
 list_and_get!(
+    list_networks,
+    get_network,
+    NetworkSpec,
+    NetworkStatus,
+    "/networks",
+    "/networks/{key}",
+    "networks"
+);
+list_and_get!(
     list_tasks,
     get_task,
     TaskSpec,
@@ -220,6 +230,60 @@ pub async fn delete_pool(
     state
         .cluster
         .delete::<StoragePoolSpec>(pool.id, if_match(&headers)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 노드에 미리 만든 Linux 브리지를 가리키는 네트워크. 이름 `user`는 예약되어 있다.
+#[utoipa::path(post, path = "/networks", tag = "networks",
+    request_body = CreateRequest<NetworkSpec>,
+    responses((status = 201, body = Resource<NetworkSpec, NetworkStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn create_network(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Json(req): Json<CreateRequest<NetworkSpec>>,
+) -> Result<(StatusCode, Json<Network>), ApiError> {
+    state.authorize(&principal, Action::Write, NetworkSpec::KIND)?;
+    check_name(&req.name)?;
+    if req.name == USER_NETWORK {
+        return Err(ApiError::bad_request(format!(
+            "network name {USER_NETWORK:?} is reserved for user-mode NAT"
+        )));
+    }
+    req.spec
+        .validate()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let mut network = Resource::new(req.name, req.spec);
+    network.labels = req.labels;
+    network.revision = state.cluster.create(&network).await?;
+    Ok((StatusCode::CREATED, Json(network)))
+}
+
+/// VM이 쓰고 있으면 409
+#[utoipa::path(delete, path = "/networks/{key}", tag = "networks",
+    params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
+    responses((status = 204), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn delete_network(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    state.authorize(&principal, Action::Write, NetworkSpec::KIND)?;
+    let network = lookup::<NetworkSpec>(&state.cluster, &key)?;
+    let (_, vms) = state.cluster.list::<VmSpec>()?;
+    if let Some(vm) = vms
+        .iter()
+        .find(|vm| vm.spec.nics.iter().any(|n| n.network == network.name))
+    {
+        return Err(ApiError::conflict(
+            "network_in_use",
+            format!("network {:?} is used by VM {:?}", network.name, vm.name),
+        ));
+    }
+    state
+        .cluster
+        .delete::<NetworkSpec>(network.id, if_match(&headers)?)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

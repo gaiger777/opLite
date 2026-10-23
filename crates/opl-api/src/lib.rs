@@ -74,6 +74,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(cluster::join))
         .routes(routes!(r::list_pools, r::create_pool))
         .routes(routes!(r::get_pool, r::delete_pool))
+        .routes(routes!(r::list_networks, r::create_network))
+        .routes(routes!(r::get_network, r::delete_network))
         .routes(routes!(r::list_tasks))
         .routes(routes!(r::get_task))
         .routes(routes!(r::list_vms, vms::create_vm))

@@ -1,6 +1,7 @@
 //! `spec.node`가 비어 있는 VM을 시작할 때 노드를 고른다(설계 3.3).
 
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::storage::{StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::vm::{PowerState, Vm, VmSpec};
@@ -8,7 +9,7 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
-    "no node can run this VM (needs an online node that is not in maintenance and can reach its storage pools)"
+    "no node can run this VM (needs an online node that is not in maintenance, can reach its storage pools and has the bridges of its networks)"
 )]
 pub struct NoNode;
 
@@ -19,6 +20,7 @@ pub struct Inventory {
     pub vms: Vec<Vm>,
     pub volumes: Vec<Volume>,
     pub pools: Vec<StoragePool>,
+    pub networks: Vec<Network>,
 }
 
 impl Inventory {
@@ -28,7 +30,24 @@ impl Inventory {
             vms: cluster.list::<VmSpec>()?.1,
             volumes: cluster.list::<VolumeSpec>()?.1,
             pools: cluster.list::<StoragePoolSpec>()?.1,
+            networks: cluster.list::<NetworkSpec>()?.1,
         })
+    }
+
+    /// 이 VM의 브리지 네트워크가 쓰는 브리지가 모두 이 노드에 있는지. VLAN을 쓰면 VLAN-aware여야 한다.
+    fn has_bridges(&self, spec: &VmSpec, node: &Node) -> bool {
+        spec.nics
+            .iter()
+            .filter(|nic| nic.network != USER_NETWORK)
+            .all(|nic| {
+                let Some(network) = self.networks.iter().find(|n| n.name == nic.network) else {
+                    return false;
+                };
+                node.status.bridges.iter().any(|b| {
+                    b.name == network.spec.bridge
+                        && (network.spec.vlan.is_none() || b.vlan_filtering)
+                })
+            })
     }
 
     /// 이 VM의 디스크가 있는 풀을 모두 쓸 수 있는 노드인지
@@ -56,13 +75,14 @@ impl Inventory {
     }
 }
 
-/// 온라인이고 유지보수 중이 아니며 디스크의 풀을 쓸 수 있는 노드 가운데 미할당 메모리가 가장
+/// 온라인이고 유지보수 중이 아니며 디스크의 풀을 쓸 수 있고 네트워크의 브리지가 있는 노드 가운데 미할당 메모리가 가장
 /// 많은 노드를 고른다. 같으면 id가 작은 노드다. 메모리가 모자라도 고른다(오버커밋 정책은 범위 밖).
 pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode> {
     inv.nodes
         .iter()
         .filter(|n| n.status.online && !n.spec.maintenance)
         .filter(|n| inv.reaches_disks(spec, n.id))
+        .filter(|n| inv.has_bridges(spec, n))
         .map(|n| (inv.free_memory_mib(n, vm), n.id))
         .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
         .map(|(_, id)| id)
@@ -71,11 +91,11 @@ pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode
 
 #[cfg(test)]
 mod tests {
-    use opl_types::node::NodeStatus;
+    use opl_types::node::{BridgeInfo, NodeStatus};
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
     use opl_types::storage::PoolBackend;
-    use opl_types::vm::{CpuSpec, DiskBus, DiskSpec, MachineType};
+    use opl_types::vm::{CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec};
 
     use super::*;
 
@@ -168,6 +188,7 @@ mod tests {
             vms: vec![],
             volumes: vec![volume],
             pools: vec![pool],
+            networks: vec![],
         };
         let mut me = spec(512, None, PowerState::Running);
         me.disks.push(DiskSpec {
@@ -179,5 +200,47 @@ mod tests {
 
         let empty = Inventory::default();
         assert_eq!(schedule(Uuid::now_v7(), &me, &empty), Err(NoNode));
+    }
+
+    #[test]
+    fn needs_the_bridges_of_its_networks() {
+        let bridge = |name: &str, vlan_filtering| BridgeInfo {
+            name: name.into(),
+            vlan_filtering,
+        };
+        let mut none = node(64000);
+        none.status.bridges = vec![bridge("vmbr1", true)];
+        let mut plain = node(32000);
+        plain.status.bridges = vec![bridge("vmbr0", false)];
+        let mut aware = node(1024);
+        aware.status.bridges = vec![bridge("vmbr0", true)];
+        let network = |name: &str, vlan| -> Network {
+            Resource::new(
+                name,
+                NetworkSpec {
+                    bridge: "vmbr0".into(),
+                    vlan,
+                },
+            )
+        };
+        let inv = Inventory {
+            nodes: vec![none, plain.clone(), aware.clone()],
+            networks: vec![network("lan", None), network("dmz", Some(20))],
+            ..Default::default()
+        };
+        let nic = |network: &str| NicSpec {
+            network: network.into(),
+            model: NicModel::Virtio,
+            mac: None,
+        };
+        let mut me = spec(512, None, PowerState::Running);
+        me.nics = vec![nic("user"), nic("lan")];
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(plain.id));
+        // VLAN을 쓰려면 VLAN-aware 브리지가 있어야 한다.
+        me.nics.push(nic("dmz"));
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(aware.id));
+        // 없는 네트워크는 어디서도 돌 수 없다.
+        me.nics.push(nic("gone"));
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
     }
 }

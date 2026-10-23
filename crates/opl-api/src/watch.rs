@@ -17,12 +17,13 @@ use crate::error::{ApiError, Query};
 use crate::state::AppState;
 
 /// 구독할 수 있는 종류. 사용자와 토큰은 해시를 담고 있어 내보내지 않는다.
-const WATCHABLE: [Kind; 5] = [
+const WATCHABLE: [Kind; 6] = [
     Kind::Vm,
     Kind::Volume,
     Kind::StoragePool,
     Kind::Node,
     Kind::Task,
+    Kind::Network,
 ];
 
 #[derive(Debug, Deserialize, IntoParams)]

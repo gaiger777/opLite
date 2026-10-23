@@ -69,11 +69,13 @@ fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(), ApiError
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
-    if let Some(nic) = spec.nics.iter().find(|n| n.network != USER_NETWORK) {
-        return Err(ApiError::bad_request(format!(
-            "network {:?} not found (only {USER_NETWORK:?} is supported for now)",
-            nic.network
-        )));
+    for nic in spec.nics.iter().filter(|n| n.network != USER_NETWORK) {
+        if !inv.networks.iter().any(|n| n.name == nic.network) {
+            return Err(ApiError::bad_request(format!(
+                "network {:?} not found",
+                nic.network
+            )));
+        }
     }
     let mut disks = BTreeSet::new();
     for disk in &spec.disks {
