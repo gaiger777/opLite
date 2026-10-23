@@ -12,6 +12,8 @@ const opld = process.env.OPLD_URL ?? "https://localhost:8006";
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: { alias: { "@": path.resolve(import.meta.dirname, "src") } },
+  // 관리 화면은 사내망에서 한 번 받아 캐시한다. noVNC는 따로 나눠 콘솔을 열 때만 받는다.
+  build: { chunkSizeWarningLimit: 1024 },
   server: {
     proxy: { "/api": { target: opld, secure: false, ws: true } },
   },

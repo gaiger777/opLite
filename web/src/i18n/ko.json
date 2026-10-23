@@ -128,6 +128,7 @@
     "tab": {
       "summary": "요약",
       "hardware": "하드웨어",
+      "console": "콘솔",
       "tasks": "작업",
       "json": "JSON"
     },
@@ -155,7 +156,8 @@
     "nics": "네트워크 인터페이스",
     "network": "네트워크",
     "model": "모델",
-    "mac": "MAC 주소"
+    "mac": "MAC 주소",
+    "openConsole": "콘솔 열기"
   },
   "vmForm": {
     "createTitle": "가상 머신 만들기",
@@ -191,5 +193,14 @@
       "bootOrder": "부팅 순서는 1부터 겹치지 않는 숫자여야 합니다.",
       "mac": "52:54:00:12:34:56 형식으로 입력하세요."
     }
+  },
+  "console": {
+    "connecting": "연결 중…",
+    "connected": "연결됨",
+    "failed": "연결이 끊겼습니다. VM이 정지했거나 콘솔을 열 수 없습니다.",
+    "reconnect": "다시 연결",
+    "paste": "클립보드 입력",
+    "pasteDenied": "브라우저가 클립보드 읽기를 허락하지 않았습니다.",
+    "fullscreen": "전체 화면"
   }
 }

@@ -14,6 +14,7 @@ import { LoginPage } from "@/pages/LoginPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { TasksPage } from "@/tasks/TasksPage";
 import { TaskToasts } from "@/tasks/TaskToasts";
+import { ConsolePage } from "@/vms/ConsolePage";
 import { VmDetailPage } from "@/vms/VmDetailPage";
 import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
 import { VmListPage } from "@/vms/VmListPage";
@@ -37,6 +38,7 @@ function routes() {
             { path: "vms/new", element: <VmCreatePage /> },
             { path: "vms/:name", element: <VmDetailPage /> },
             { path: "vms/:name/edit", element: <VmEditPage /> },
+            { path: "vms/:name/console", element: <ConsolePage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],

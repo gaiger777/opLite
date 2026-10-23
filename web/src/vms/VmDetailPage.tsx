@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
@@ -19,10 +19,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
 import { canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
+import { VmConsole } from "@/vms/ConsolePage";
 import { VmConfirm } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
-const TABS = ["summary", "hardware", "tasks", "json"] as const;
+const TABS = ["summary", "hardware", "console", "tasks", "json"] as const;
 
 /** 이름으로 VM을 찾는다. 목록이 아직 없으면 undefined, 없는 VM이면 null */
 export function useVmByName(name: string): Vm | null | undefined {
@@ -70,6 +71,14 @@ export function VmDetailPage() {
         <TabsContent value="hardware">
           <Hardware vm={vm} />
         </TabsContent>
+        <TabsContent value="console">
+          {/* 탭을 열 때만 연결한다. */}
+          {tab === "console" && (
+            <Suspense fallback={null}>
+              <VmConsole vm={vm} />
+            </Suspense>
+          )}
+        </TabsContent>
         <TabsContent value="tasks">
           <VmTasks vm={vm} />
         </TabsContent>
@@ -113,6 +122,13 @@ function VmHeader({ vm }: { vm: Vm }) {
       <div className="flex flex-wrap gap-2">
         {can(me.role, "operate", "vm") &&
           (["start", "stop", "force-stop", "reboot"] as const).map(button)}
+        {can(me.role, "operate", "vm") && vm.status.phase === "running" && (
+          <Button variant="outline" size="sm" asChild>
+            <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
+              {t("vms.openConsole")}
+            </Link>
+          </Button>
+        )}
         {can(me.role, "write", "vm") && (
           <Button variant="outline" size="sm" asChild>
             <Link to={`/vms/${encodeURIComponent(vm.name)}/edit`}>{t("vms.action.edit")}</Link>

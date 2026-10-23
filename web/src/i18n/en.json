@@ -128,6 +128,7 @@
     "tab": {
       "summary": "Summary",
       "hardware": "Hardware",
+      "console": "Console",
       "tasks": "Tasks",
       "json": "JSON"
     },
@@ -155,7 +156,8 @@
     "nics": "Network interfaces",
     "network": "Network",
     "model": "Model",
-    "mac": "MAC address"
+    "mac": "MAC address",
+    "openConsole": "Open console"
   },
   "vmForm": {
     "createTitle": "Create a virtual machine",
@@ -191,5 +193,14 @@
       "bootOrder": "Boot orders must be unique numbers from 1.",
       "mac": "Use the form 52:54:00:12:34:56."
     }
+  },
+  "console": {
+    "connecting": "Connecting…",
+    "connected": "Connected",
+    "failed": "Disconnected. The VM may have stopped or the console is not available.",
+    "reconnect": "Reconnect",
+    "paste": "Type clipboard",
+    "pasteDenied": "The browser did not allow reading the clipboard.",
+    "fullscreen": "Full screen"
   }
 }
