@@ -1,0 +1,24 @@
+{
+  "errors": {
+    "network": "서버에 연결할 수 없습니다.",
+    "unauthorized": "세션이 끝났습니다. 다시 로그인하세요.",
+    "invalid_credentials": "사용자 이름이나 비밀번호가 틀렸습니다.",
+    "forbidden": "이 작업을 할 권한이 없습니다.",
+    "cross_origin": "다른 사이트에서 온 요청이라 거부했습니다.",
+    "not_found": "더 이상 존재하지 않습니다.",
+    "already_exists": "이미 있습니다.",
+    "name_taken": "이미 쓰는 이름입니다.",
+    "revision_mismatch": "다른 사람이 먼저 바꿨습니다. 다시 불러온 뒤 시도하세요.",
+    "mac_in_use": "다른 VM이 쓰는 MAC 주소입니다.",
+    "volume_in_use": "다른 VM에 붙어 있는 볼륨입니다.",
+    "volume_not_ready": "아직 준비되지 않은 볼륨입니다.",
+    "vm_running": "먼저 VM을 정지하세요.",
+    "vm_not_running": "VM이 실행 중이 아닙니다.",
+    "busy": "이 VM에 다른 작업이 진행 중입니다. 잠시 뒤 다시 시도하세요.",
+    "no_node": "이 VM을 실행할 노드가 없습니다: {{message}}",
+    "console_unavailable": "지금은 콘솔을 열 수 없습니다.",
+    "cluster_no_quorum": "클러스터 과반수가 없습니다. 변경은 나중에 적용될 수 있습니다.",
+    "not_leader": "클러스터 리더가 바뀌는 중입니다. 잠시 뒤 다시 시도하세요.",
+    "internal": "서버 오류: {{message}}"
+  }
+}

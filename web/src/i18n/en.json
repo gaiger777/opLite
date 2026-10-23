@@ -1,0 +1,24 @@
+{
+  "errors": {
+    "network": "Cannot reach the server.",
+    "unauthorized": "Your session has ended. Sign in again.",
+    "invalid_credentials": "Wrong username or password.",
+    "forbidden": "You do not have permission to do this.",
+    "cross_origin": "The request came from another site and was rejected.",
+    "not_found": "It no longer exists.",
+    "already_exists": "It already exists.",
+    "name_taken": "That name is already in use.",
+    "revision_mismatch": "Someone else changed it first. Reload and try again.",
+    "mac_in_use": "That MAC address is used by another VM.",
+    "volume_in_use": "A volume is attached to another VM.",
+    "volume_not_ready": "A volume is not ready yet.",
+    "vm_running": "Stop the VM first.",
+    "vm_not_running": "The VM is not running.",
+    "busy": "Another operation on this VM is in progress. Try again shortly.",
+    "no_node": "No node can run this VM: {{message}}",
+    "console_unavailable": "The console is not available right now.",
+    "cluster_no_quorum": "The cluster has no quorum. The change may still be applied later.",
+    "not_leader": "The cluster leader is changing. Try again shortly.",
+    "internal": "The server failed: {{message}}"
+  }
+}
