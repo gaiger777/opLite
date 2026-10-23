@@ -8,8 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# 실제 QEMU로 CLI부터 콘솔, kill -9 뒤 재연결까지 확인하는 E2E 테스트. Apple Silicon Mac + brew install qemu가 필요하다.
+# 실제 QEMU로 CLI부터 콘솔, kill -9 뒤 재연결까지 확인하는 E2E 테스트.
+# macOS는 brew install qemu, Linux는 apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils가 필요하다.
 qemu-it = []
+# VM NIC를 Linux 브리지에 잇는 E2E 테스트(qemu-it와 함께). Linux에서 root와 iproute2가 필요하다.
+net-it = []
 
 [dependencies]
 anyhow.workspace = true
