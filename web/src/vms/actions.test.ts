@@ -32,3 +32,9 @@ it("lets a VM that is shutting down be forced off", () => {
   expect(allowed(stopping)).toEqual(["force-stop"]);
   expect(canDelete(stopping)).toBe(false);
 });
+
+it("does not reboot a VM whose ACPI stop is pending", () => {
+  // 정지를 요청했지만 게스트가 아직 꺼지지 않았다.
+  const pending = vm("e", "running", { spec: { ...vm("e", "running").spec, power: "stopped" } });
+  expect(allowed(pending)).toEqual(["stop", "force-stop"]);
+});

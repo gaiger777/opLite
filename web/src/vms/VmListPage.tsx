@@ -124,7 +124,7 @@ export function VmListPage() {
       },
       {
         id: "node",
-        accessorFn: (vm) => nodeName(vm.status.node ?? vm.spec.node),
+        accessorFn: (vm) => nodeName(vm.spec.node ?? vm.status.node),
         header: t("vms.node"),
       },
       { id: "cpu", accessorFn: vcpus, header: t("vms.vcpus") },

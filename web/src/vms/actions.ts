@@ -33,7 +33,8 @@ export function canRun(vm: Vm, action: VmAction): boolean {
       // 서버는 어느 상태의 정지든 받는다. 끄려는 중이거나 켜려는 VM에만 보인다.
       return powerOn || phase === "running" || phase === "starting" || phase === "stopping";
     case "reboot":
-      return phase === "running";
+      // 서버는 원하는 전원 상태가 켜짐인 실행 중 VM만 재시작한다.
+      return powerOn && phase === "running";
   }
 }
 
