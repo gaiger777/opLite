@@ -2,3 +2,4 @@
 .DS_Store
 *.pending-snap
 *.snap.new
+.superpowers/
