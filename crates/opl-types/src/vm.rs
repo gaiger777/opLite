@@ -40,6 +40,9 @@ impl ResourceSpec for VmSpec {
     type Status = VmStatus;
 }
 
+/// VM 하나의 최대 NIC 수. tap 장치 이름(15자)에 순번 두 자리를 넣는다.
+pub const MAX_NICS: usize = 16;
+
 impl VmSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.cpu.sockets == 0 {
@@ -56,6 +59,9 @@ impl VmSpec {
             if !seen.insert(order) {
                 return Err(ValidationError::DuplicateBootOrder(order));
             }
+        }
+        if self.nics.len() > MAX_NICS {
+            return Err(ValidationError::TooManyNics);
         }
         let mut macs = BTreeSet::new();
         for mac in self.nics.iter().filter_map(|n| n.mac) {
@@ -84,6 +90,8 @@ pub enum ValidationError {
     MulticastMac(MacAddr),
     #[error("MAC address {0} is used by more than one NIC")]
     DuplicateMac(MacAddr),
+    #[error("a VM can have at most {MAX_NICS} NICs")]
+    TooManyNics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +368,13 @@ mod tests {
         second.network = "wan".into();
         s.nics.push(second);
         assert_eq!(s.validate(), Err(ValidationError::DuplicateMac(mac)));
+
+        let mut s = sample();
+        s.nics = vec![s.nics[0].clone(); MAX_NICS + 1];
+        for nic in &mut s.nics {
+            nic.mac = None;
+        }
+        assert_eq!(s.validate(), Err(ValidationError::TooManyNics));
     }
 
     #[test]

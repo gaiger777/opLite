@@ -12,6 +12,8 @@ repository.workspace = true
 storage-it = []
 # 실제 VM을 띄우는 통합 테스트. macOS는 brew install qemu, Linux는 apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils가 필요하다(KVM이 없으면 TCG).
 qemu-it = []
+# 실제 tap과 브리지를 만드는 통합 테스트. Linux에서 root(CAP_NET_ADMIN)와 iproute2가 필요하다.
+net-it = []
 
 [dependencies]
 async-trait.workspace = true
@@ -19,6 +21,7 @@ fs4.workspace = true
 opl-qemu.workspace = true
 opl-types.workspace = true
 rustix.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

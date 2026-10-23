@@ -1,6 +1,7 @@
 //! VM NIC가 연결하는 네트워크. 지금은 관리자가 미리 만든 Linux 브리지만 있다.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::resource::{Kind, Resource, ResourceSpec};
 
@@ -42,6 +43,18 @@ impl NetworkSpec {
         }
         Ok(())
     }
+}
+
+/// VM의 `index`번째 NIC가 쓰는 tap 장치 이름. 노드 안에서 VM마다 겹치지 않고 15자를 넘지 않는다.
+/// UUIDv7의 앞부분은 생성 시각이므로 무작위인 뒷부분 10자리를 쓴다.
+pub fn tap_name(vm: Uuid, index: usize) -> String {
+    format!("{}{index}", tap_prefix(vm))
+}
+
+/// 한 VM의 tap 장치 이름이 모두 이것으로 시작한다(`op<10자리>n`).
+pub fn tap_prefix(vm: Uuid) -> String {
+    let hex = vm.simple().to_string();
+    format!("op{}n", &hex[hex.len() - 10..])
 }
 
 /// Linux 인터페이스 이름 규칙: 1~15바이트, `/`·공백·`:` 없음, `.`·`..`가 아님.
@@ -91,6 +104,18 @@ mod tests {
             spec("vmbr0", Some(4095)).validate(),
             Err(NetworkError::BadVlan(4095))
         );
+    }
+
+    #[test]
+    fn tap_names_fit_and_share_the_vm_prefix() {
+        let vm = Uuid::now_v7();
+        let last = tap_name(vm, crate::vm::MAX_NICS - 1);
+        assert!(valid_ifname(&last), "{last}");
+        assert_eq!(last.len(), 15);
+        assert!(tap_name(vm, 0).starts_with(&tap_prefix(vm)));
+        assert_ne!(tap_prefix(vm), tap_prefix(Uuid::now_v7()));
+        // 같은 VM의 1번과 10번 NIC가 접두사로 겹치지 않는다(`...n1`과 `...n10`은 다른 이름).
+        assert_ne!(tap_name(vm, 1), tap_name(vm, 10));
     }
 
     #[test]
