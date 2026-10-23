@@ -1562,6 +1562,7 @@ name = "opld"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "openraft",

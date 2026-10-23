@@ -74,7 +74,13 @@ pub async fn create_cluster(
 pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> anyhow::Result<()> {
     let NodeId(id) = cluster.id();
     let address = config.api_address();
-    match cluster.get::<NodeSpec>(id)? {
+    let existing = cluster.get::<NodeSpec>(id)?;
+    // 브리지 목록을 얻지 못하면 기록된 목록을 그대로 둔다.
+    let recorded = existing
+        .as_ref()
+        .map(|node| node.status.bridges.clone())
+        .unwrap_or_default();
+    match existing {
         None => {
             let mut node = Resource::new(
                 config.name.clone(),
@@ -100,19 +106,22 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
         cpus: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
         memory_mib: crate::host::memory_mib(),
         hypervisor: host.hypervisor_name(),
-        bridges: host.bridges().await,
+        bridges: host.bridges().await.unwrap_or(recorded),
     };
     cluster.update_status::<NodeSpec>(id, &status).await?;
     Ok(())
 }
 
-/// 브리지가 바뀌었으면(관리자가 만들거나 지움) 기록한다. 바뀌지 않았으면 쓰지 않는다.
+/// 브리지가 바뀌었으면(관리자가 만들거나 지움) 기록한다. 바뀌지 않았거나 목록을 얻지 못하면
+/// 쓰지 않는다.
 pub async fn refresh_bridges(cluster: &Cluster, host: &Host) -> anyhow::Result<()> {
     let NodeId(id) = cluster.id();
     let Some(node) = cluster.get::<NodeSpec>(id)? else {
         return Ok(());
     };
-    let bridges = host.bridges().await;
+    let Some(bridges) = host.bridges().await else {
+        return Ok(());
+    };
     if node.status.bridges != bridges {
         tracing::info!(?bridges, "bridges changed");
         let status = NodeStatus {
@@ -141,7 +150,38 @@ pub async fn mark_offline(cluster: &Cluster) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use openraft::{BasicNode, ServerState};
+    use opl_cluster::ClusterConfig;
+    use opl_cluster::memnet::MemRouter;
+    use opl_driver::{DriverError, HostNet, Tap};
+    use opl_types::node::BridgeInfo;
+
     use super::*;
+
+    /// 정해 둔 브리지를 돌려준다. `None`이면 `ip`가 실패한 것처럼 오류를 낸다.
+    #[derive(Debug)]
+    struct FakeNet(Option<Vec<BridgeInfo>>);
+
+    #[async_trait]
+    impl HostNet for FakeNet {
+        async fn bridges(&self) -> Result<Vec<BridgeInfo>, DriverError> {
+            self.0.clone().ok_or(DriverError::ToolFailed {
+                tool: "ip",
+                stderr: "boom".into(),
+            })
+        }
+        async fn create_tap(&self, _: &Tap) -> Result<(), DriverError> {
+            unimplemented!()
+        }
+        async fn delete_vm_taps(&self, _: Uuid) -> Result<(), DriverError> {
+            unimplemented!()
+        }
+    }
 
     #[test]
     fn node_id_is_created_once() {
@@ -150,5 +190,62 @@ mod tests {
         assert_eq!(node_id(dir.path()).unwrap(), id);
         std::fs::write(dir.path().join(NODE_ID_FILE), "garbage").unwrap();
         assert!(node_id(dir.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_bridge_listing_keeps_the_recorded_bridges() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = MemRouter::default();
+        let id = NodeId(Uuid::now_v7());
+        let cluster = Cluster::open(ClusterConfig::new(id, dir.path()), router.network(id))
+            .await
+            .unwrap();
+        router.register(id, cluster.raft().clone());
+        let members = BTreeMap::from([(id, BasicNode::new(id.to_string()))]);
+        cluster.initialize(members).await.unwrap();
+        cluster
+            .raft()
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(|m| m.state == ServerState::Leader, "leader")
+            .await
+            .unwrap();
+
+        let config: Config = toml::from_str(
+            "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"tcg\"\nsystemd_scope = false",
+        )
+        .unwrap();
+        let host = |bridges: Option<Vec<BridgeInfo>>| Host {
+            net: Some(Arc::new(FakeNet(bridges))),
+            ..Host::from_config(&config).unwrap()
+        };
+        let br0 = vec![BridgeInfo {
+            name: "br0".into(),
+            vlan_filtering: false,
+        }];
+        let (ok, failing) = (host(Some(br0.clone())), host(None));
+        let recorded = || {
+            cluster
+                .get::<NodeSpec>(id.0)
+                .unwrap()
+                .unwrap()
+                .status
+                .bridges
+        };
+
+        // 새 노드는 목록을 얻지 못하면 브리지가 없다.
+        register_node(&cluster, &config, &failing).await.unwrap();
+        assert_eq!(recorded(), vec![]);
+        register_node(&cluster, &config, &ok).await.unwrap();
+        assert_eq!(recorded(), br0);
+        // 이미 기록된 브리지는 목록을 얻지 못해도 지우지 않는다.
+        refresh_bridges(&cluster, &failing).await.unwrap();
+        assert_eq!(recorded(), br0);
+        register_node(&cluster, &config, &failing).await.unwrap();
+        assert_eq!(recorded(), br0);
+        refresh_bridges(&cluster, &host(Some(vec![])))
+            .await
+            .unwrap();
+        assert_eq!(recorded(), vec![]);
+        cluster.shutdown().await.unwrap();
     }
 }

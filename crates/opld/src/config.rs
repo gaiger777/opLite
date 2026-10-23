@@ -350,4 +350,28 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn rejects_unknown_keys_in_hypervisor_section() {
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[hypervisor]\nacel = \"kvm\"")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_kvm_needs_dev_kvm() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"kvm\"");
+        // `/dev/kvm`이 있는 호스트(Linux CI)에서는 KVM을 쓰고, 없으면 오류다.
+        match c.host_profile() {
+            Ok(p) => {
+                assert!(kvm_available());
+                assert_eq!(p.accel, Accel::Kvm);
+            }
+            Err(e) => {
+                assert!(!kvm_available());
+                assert!(e.to_string().contains("/dev/kvm"), "{e}");
+            }
+        }
+    }
 }

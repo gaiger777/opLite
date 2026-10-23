@@ -6,7 +6,7 @@ use opl_driver::{HostNet, IpRoute, QemuConfig};
 use opl_qemu::{Accel, HostProfile};
 use opl_types::node::BridgeInfo;
 
-use crate::config::Config;
+use crate::config::{AccelSetting, Config};
 
 /// 이 노드가 VM을 실행하는 방법
 #[derive(Debug, Clone)]
@@ -20,7 +20,11 @@ pub struct Host {
 impl Host {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         let profile = config.host_profile()?;
-        if cfg!(target_os = "linux") && profile.accel == Accel::Tcg {
+        // 관리자가 `accel = "tcg"`를 고른 때는 알리지 않는다.
+        if cfg!(target_os = "linux")
+            && config.hypervisor.accel == AccelSetting::Auto
+            && profile.accel == Accel::Tcg
+        {
             tracing::warn!("KVM is not available; VMs run with TCG emulation (slow)");
         }
         let net: Option<Arc<dyn HostNet>> = if cfg!(target_os = "linux") {
@@ -50,16 +54,16 @@ impl Host {
         format!("qemu-{}", self.profile.accel.as_str())
     }
 
-    /// 이 노드의 Linux 브리지. 알 수 없으면 비어 있다.
-    pub async fn bridges(&self) -> Vec<BridgeInfo> {
+    /// 이 노드의 Linux 브리지. 목록을 얻지 못하면 `None`이다(기록된 목록을 지우지 않게).
+    pub async fn bridges(&self) -> Option<Vec<BridgeInfo>> {
         let Some(net) = &self.net else {
-            return vec![];
+            return Some(vec![]);
         };
         match net.bridges().await {
-            Ok(bridges) => bridges,
+            Ok(bridges) => Some(bridges),
             Err(e) => {
-                tracing::warn!(error = %e, "cannot list bridges");
-                vec![]
+                tracing::warn!(error = %e, "cannot list bridges; keeping the recorded ones");
+                None
             }
         }
     }
