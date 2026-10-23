@@ -115,7 +115,9 @@ pub async fn login(
 }
 
 /// 세션을 끝내고 브라우저의 세션 쿠키를 지운다.
-#[utoipa::path(post, path = "/auth/logout", tag = "auth", responses((status = 204)))]
+#[utoipa::path(post, path = "/auth/logout", tag = "auth", security(()),
+    responses((status = 204, description = "Logged out; the session cookie is cleared",
+        headers(("set-cookie" = String)))))]
 pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(id) = session_cookie(&headers) {
         state.sessions.remove(id);
@@ -265,7 +267,7 @@ pub async fn update_user(
 /// 사용자와 그 사용자의 토큰을 지운다. 자기 자신은 지울 수 없다(마지막 관리자를 잃지 않게).
 #[utoipa::path(delete, path = "/users/{key}", tag = "auth",
     params(("key" = String, Path, description = "id or name")),
-    responses((status = 204), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_user(
     State(state): State<Arc<AppState>>,
     principal: Principal,
@@ -355,7 +357,7 @@ pub async fn list_tokens(
 
 #[utoipa::path(delete, path = "/tokens/{key}", tag = "auth",
     params(("key" = String, Path, description = "id or name")),
-    responses((status = 204), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_token(
     State(state): State<Arc<AppState>>,
     principal: Principal,

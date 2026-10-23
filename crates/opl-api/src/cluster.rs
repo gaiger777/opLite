@@ -476,7 +476,7 @@ pub async fn join(
 /// 그 노드에 배정된 VM은 그대로 남는다.
 #[utoipa::path(delete, path = "/nodes/{key}", tag = "nodes",
     params(("key" = String, Path, description = "id or name")),
-    responses((status = 204), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 204, description = "Removed"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_node(
     State(state): State<Arc<AppState>>,
     principal: Principal,

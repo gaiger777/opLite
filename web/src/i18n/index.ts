@@ -17,6 +17,11 @@ function initialLanguage(): Language {
   return navigator.language.toLowerCase().startsWith("ko") ? "ko" : "en";
 }
 
+// 화면 언어를 `<html lang>`에 맞춘다. 초기화도 이 이벤트를 낸다.
+i18n.on("languageChanged", (language) => {
+  document.documentElement.lang = language;
+});
+
 void i18n.use(initReactI18next).init({
   resources: { ko: { translation: ko }, en: { translation: en } },
   lng: initialLanguage(),
@@ -24,11 +29,9 @@ void i18n.use(initReactI18next).init({
   // React가 이스케이프한다.
   interpolation: { escapeValue: false },
 });
-document.documentElement.lang = i18n.language;
 
 export function setLanguage(language: Language) {
   void i18n.changeLanguage(language);
-  document.documentElement.lang = language;
   writePref("language", language);
 }
 

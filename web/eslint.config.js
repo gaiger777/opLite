@@ -8,7 +8,6 @@ export default tseslint.config(
   {
     files: ["**/*.{ts,tsx,js,mjs}"],
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
-    languageOptions: { globals: { ...globals.browser, ...globals.node } },
     plugins: { "react-hooks": reactHooks },
     rules: {
       ...reactHooks.configs.recommended.rules,
@@ -21,7 +20,23 @@ export default tseslint.config(
           selector: "JSXAttribute[name.name='dangerouslySetInnerHTML']",
           message: "Do not inject raw HTML.",
         },
+        {
+          selector: "Property[key.name='dangerouslySetInnerHTML']",
+          message: "Do not inject raw HTML.",
+        },
+        {
+          selector: "AssignmentExpression[left.property.name=/^(innerHTML|outerHTML)$/]",
+          message: "Do not inject raw HTML.",
+        },
+        {
+          selector: "CallExpression[callee.property.name='insertAdjacentHTML']",
+          message: "Do not inject raw HTML.",
+        },
       ],
     },
   },
+  // 앱은 브라우저에서 돈다. E2E는 Node(Playwright)에서 돌며 환경 변수를 읽고, 브라우저 안의 코드도 담는다.
+  { files: ["src/**"], languageOptions: { globals: globals.browser } },
+  { files: ["e2e/**"], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
+  { files: ["*.config.{js,ts}", "scripts/**"], languageOptions: { globals: globals.node } },
 );

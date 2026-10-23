@@ -209,7 +209,7 @@ pub async fn update_vm(
 /// 꺼진 VM만 지울 수 있다.
 #[utoipa::path(delete, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
-    responses((status = 204), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_vm(
     State(state): State<Arc<AppState>>,
     principal: Principal,

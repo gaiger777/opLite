@@ -1482,8 +1482,10 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Logged out; the session cookie is cleared */
             204: {
                 headers: {
+                    "set-cookie"?: string;
                     [name: string]: unknown;
                 };
                 content?: never;
@@ -1736,6 +1738,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Deleted */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -1857,6 +1860,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Removed */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -1975,6 +1979,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Deleted */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -2118,6 +2123,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Deleted */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -2238,6 +2244,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Deleted */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -2392,6 +2399,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Deleted */
             204: {
                 headers: {
                     [name: string]: unknown;

@@ -46,15 +46,35 @@ async fn openapi_document_is_served_without_login() {
         doc["paths"]["/auth/login"]["post"]["security"],
         serde_json::json!([{}])
     );
-    // 모든 스키마 참조가 문서 안에 있다(웹 UI의 타입 생성이 실패하지 않게).
-    let text = doc.to_string();
-    for rest in text.split("\"#/components/schemas/").skip(1) {
-        let name = &rest[..rest.find('"').unwrap()];
-        assert!(
-            doc["components"]["schemas"][name].is_object(),
-            "missing schema {name}"
-        );
+    // 로그아웃도 인증 없이 부를 수 있고, 쿠키를 지우는 헤더를 알린다.
+    let logout = &doc["paths"]["/auth/logout"]["post"];
+    assert_eq!(logout["security"], serde_json::json!([{}]));
+    assert!(logout["responses"]["204"]["headers"]["set-cookie"].is_object());
+    // 모든 참조(`$ref`)가 문서 안에 있다(웹 UI의 타입 생성이 실패하지 않게).
+    let mut refs = Vec::new();
+    collect_refs(&doc, &mut refs);
+    assert!(!refs.is_empty());
+    for r in refs {
+        let target = r
+            .strip_prefix('#')
+            .unwrap_or_else(|| panic!("external ref {r}"));
+        assert!(doc.pointer(target).is_some(), "dangling ref {r}");
     }
     // 웹 UI가 타입을 만드는 문서(`opl-api-openapi`)와 서버가 주는 문서가 같다.
     assert_eq!(doc, serde_json::to_value(opl_api::openapi()).unwrap());
+}
+
+fn collect_refs<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map {
+                match (key.as_str(), v.as_str()) {
+                    ("$ref", Some(r)) => out.push(r),
+                    _ => collect_refs(v, out),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|v| collect_refs(v, out)),
+        _ => {}
+    }
 }

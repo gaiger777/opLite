@@ -211,7 +211,7 @@ pub async fn create_pool(
 /// 볼륨이 남아 있으면 409
 #[utoipa::path(delete, path = "/storage-pools/{key}", tag = "storage",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
-    responses((status = 204), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_pool(
     State(state): State<Arc<AppState>>,
     principal: Principal,
@@ -262,7 +262,7 @@ pub async fn create_network(
 /// VM이 쓰고 있으면 409
 #[utoipa::path(delete, path = "/networks/{key}", tag = "networks",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
-    responses((status = 204), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_network(
     State(state): State<Arc<AppState>>,
     principal: Principal,
