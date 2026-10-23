@@ -475,7 +475,7 @@ Expected: PASS (`validates_bridge_and_vlan`, `vlan_is_optional`, `kind_serialize
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add crates
+git add crates Cargo.lock
 git commit -m "feat(types): Network 리소스, 노드 브리지 목록, tap 백엔드의 브리지·VLAN"
 ```
 
@@ -926,7 +926,7 @@ Expected: macOS(hvf)와 Linux 컨테이너(아래 '실행 환경')에서 PASS. �
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add crates
+git add crates Cargo.lock
 git commit -m "feat(qemu): Debian/Ubuntu 호스트 프로필과 KVM 감지, 통합 테스트를 호스트에 맞게"
 ```
 
@@ -1605,7 +1605,7 @@ Expected: Linux 컨테이너(아래 '실행 환경')에서 root로 PASS(2개)
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add crates
+git add crates Cargo.lock
 git commit -m "feat(driver): iproute2로 tap을 만들어 브리지에 잇기(VLAN-aware)"
 ```
 
@@ -3060,7 +3060,7 @@ Expected: Linux 컨테이너(아래 '실행 환경')에서 root로 PASS(`qemu_br
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add crates
+git add crates Cargo.lock
 git commit -m "feat(driver): VM NIC의 tap을 QEMU 앞뒤로 만들고 지우기, systemd 스코프, QMP 연결 EAGAIN 재시도"
 ```
 
@@ -3245,7 +3245,7 @@ Expected: PASS (`resolves_bridge_networks_to_taps` 포함)
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add crates
+git add crates Cargo.lock
 git commit -m "feat(reconciler): 브리지 네트워크를 tap 백엔드로 풀기"
 ```
 
@@ -3829,7 +3829,7 @@ Expected: PASS (`needs_the_bridges_of_its_networks`, `tests/networks.rs` 3개 �
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add crates
+git add crates Cargo.lock
 git commit -m "feat(api): 네트워크 API와 브리지를 보는 스케줄러"
 ```
 
@@ -3966,7 +3966,7 @@ Expected: PASS (`cli_definition_is_valid` 포함)
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add crates
+git add crates Cargo.lock
 git commit -m "feat(oplctl): network 명령"
 ```
 
@@ -5106,7 +5106,7 @@ Expected: macOS와 Linux 컨테이너(아래 '실행 환경')에서 PASS (실제
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add crates
+git add crates Cargo.lock
 git commit -m "feat(opld): [hypervisor] 설정(KVM/TCG, systemd 스코프), 노드 브리지 알리기"
 ```
 
@@ -5277,7 +5277,7 @@ Expected: Linux 컨테이너(아래 '실행 환경')에서 root로 PASS
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add crates
+git add crates Cargo.lock
 git commit -m "test(opld): 브리지 네트워크 E2E (M7)"
 ```
 
@@ -5851,6 +5851,48 @@ git commit -m "ci, docs: Linux KVM 작업과 M7 문서"
 - **노드를 직접 정한 VM:** `spec.node`를 준 VM은 브리지를 확인하지 않고 배치된다. 그 노드에 브리지가 없으면 시작이 영구 오류(`InvalidSpec`)로 실패한다.
 - **머신 타입 기본값:** `oplctl vm create`는 `--machine`이 없으면 oplctl이 도는 머신의 아키텍처로 정한다. Mac에서 x86_64 노드용 VM을 만들 때는 `--machine q35`를 준다.
 - **Linux aarch64 KVM:** CI는 x86_64만 돌린다. aarch64 Linux는 TCG(컨테이너)로만 확인했다.
-- **systemd 스코프:** 자원 제한을 걸지 않는다. 같은 이름의 스코프가 남아 있으면(QEMU 프로세스가 남은 경우) 시작이 실패한다.
-- **tap 정리:** 지우기 실패는 기록만 한다. VM을 끌 때마다 `ip -j link show`로 그 VM의 tap을 찾는다.
+- **systemd 스코프:** 자원 제한을 걸지 않는다. 시작 전에 같은 이름의 남은 스코프를 멈추고 지운다(실행 후 기록 참고).
+- **tap 정리:** 지우기에 실패하면 기록하고 런타임 디렉터리를 남겨, 드라이버가 다시 시작할 때 다시 지운다. VM을 끌 때마다 `ip -j link show`로 그 VM의 tap을 찾는다.
 - **로컬 검증:** 개발 Mac에서는 KVM을 쓸 수 없어 Linux 테스트를 Docker 컨테이너의 TCG로 돌린다.
+
+## 실행 후 기록 (2026-10-23)
+
+Task 리뷰와 최종 리뷰를 거쳐 계획의 코드에서 아래가 바뀌었다. 저장소의 코드가 기준이다.
+
+계획 버그(`2e9c91c`):
+- **Task 2~10의 커밋 단계가 `Cargo.lock`을 빠뜨렸다.** opl-driver에 serde를 더한 Task 5 뒤 lock 파일이 커밋되지 않았다. 따로 커밋했고, 이 문서의 커밋 단계를 `git add crates Cargo.lock`으로 고쳤다.
+
+Task 4 리뷰(`28f1a16`):
+- **브리지에 `vlan_default_pvid`가 없으면 1로 본다.** 계획대로면 필드가 없는 `ip -d -j link` 출력에서 브리지 목록 전체가 실패했다. 회귀 테스트 `br-nopvid`.
+- VM의 tap 지우기는 하나가 실패해도 나머지를 계속 지우고 첫 오류를 돌려준다.
+
+Task 5 리뷰(`bdafd5f`, `55f21cc`):
+- **시작 전에 남은 systemd 스코프를 정리한다**(`systemctl stop`, `reset-failed`, 각 5초 제한). 계획대로면 실패한 스코프가 남아 같은 VM을 다시 시작할 수 없었다.
+- **tap을 런타임 디렉터리보다 먼저 지운다**(`new()`, 강제 종료, 모니터). 지우기에 실패하면 디렉터리를 남겨 드라이버가 다시 시작할 때 다시 지운다. 계획대로면 디렉터리를 먼저 지워 tap이 영영 남을 수 있었다.
+- tap 이름은 `tap_prefix(vm.id)`로 시작해야 한다(아니면 `InvalidSpec`). 테스트: NIC 2개 롤백, `tap_stays_on_the_bridge_across_driver_restart`.
+
+Task 9 리뷰(`fa71887`):
+- **브리지 목록을 얻지 못하면(`ip` 실패) 기록된 브리지를 지우지 않는다.** 계획대로면 한 번의 실패로 노드의 브리지가 비어 VM이 배치되지 않았다. `Host::bridges`는 `Option`을 돌려준다. 회귀 테스트 `failed_bridge_listing_keeps_the_recorded_bridges`.
+- TCG 경고는 `auto`일 때만 낸다. 설정 테스트: `[hypervisor]`의 모르는 키 거부, `kvm`을 지정했는데 `/dev/kvm`이 없으면 오류.
+
+Task 10 리뷰(`16c1377`):
+- E2E가 VM을 끈 뒤 tap이 사라지는지, tap의 PVID와 Egress Untagged 플래그까지 확인한다.
+
+최종 리뷰(`4fd6a85`):
+- README에 `--node`로 노드를 직접 정하면 브리지를 확인하지 않는다는 예외, root 테스트는 별도 빌드 디렉터리를 쓴다. CI `linux-kvm` 작업에 40분 제한. 위 제한 목록의 systemd 스코프와 tap 정리 항목을 고친 동작에 맞췄다.
+
+알고 받아들인 동작(위 제한 목록에 더해):
+- **스케줄러가 정한 노드는 NIC나 디스크를 바꿀 때 다시 확인하지 않는다.** 배치된 뒤 그 노드에 없는 브리지의 네트워크를 붙이면 다음 시작이 드라이버의 영구 오류로 끝난다.
+- 실행 중인 VM의 네트워크가 지워지면 reattach가 `NetworkNotFound`로 계속 다시 시도한다(볼륨과 같다).
+- 노드 모니터와 브리지 갱신이 노드 status를 서로 덮어쓸 수 있다(다음 갱신에서 회복). 테스트가 패닉하면 QEMU와 tap이 남는다(`e2e.rs`와 같다).
+- 아키텍처별 기본 머신 타입을 정하는 코드가 opl-qemu와 oplctl 두 곳에 있다.
+
+테스트: 모두 통과. macOS `cargo test --workspace --all-features` 252개, Linux aarch64 컨테이너(TCG, root) 258개, `fmt`·`clippy -D warnings`·`cargo deny`. CI(확인용 브랜치)에서 `linux-kvm`(실제 KVM, systemd 스코프) 포함 모든 작업 통과.
+
+## 다음 계획으로 넘길 사항
+
+- 배치된 VM의 NIC·디스크 변경 시 노드 다시 확인, 노드를 직접 정한 VM의 브리지 확인.
+- QEMU 권한 낮추기, systemd 스코프 자원 제한, tap MTU 맞추기.
+- 네트워크 수정, 네트워크 삭제와 VM 생성 사이 경합.
+- aarch64 Linux KVM 확인.
+- 남은 Minor: `--vlan` 범위를 clap에서 검증, tap 삭제 실패 시 디렉터리 유지 단위 테스트, 거부 경로 E2E, `ip link` 결과의 `tun` 종류 필터.
