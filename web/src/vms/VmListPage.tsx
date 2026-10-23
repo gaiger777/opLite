@@ -78,7 +78,7 @@ export function VmListPage() {
 
   const nodeName = useMemo(() => {
     const names = new Map(nodes.data?.map((n) => [n.id, n.name]));
-    return (id: string | null | undefined) => (id ? (names.get(id) ?? id.slice(0, 8)) : "—");
+    return (id: string | null | undefined) => (id ? (names.get(id) ?? id.slice(-8)) : "—");
   }, [nodes.data]);
 
   const columns = useMemo<ColumnDef<Vm>[]>(

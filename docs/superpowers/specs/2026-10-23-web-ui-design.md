@@ -64,7 +64,7 @@ crates/opld/src/web.rs   정적 파일 서빙 (feature "web-ui")
   빌드(테스트, clippy)는 없어도 되고 안내 페이지를 주며, 파일을 실행 중에 디스크에서 읽는다.
 
 **빌드 흐름:**
-- 개발: `pnpm -C web dev`(5173)가 `/api`(WebSocket 포함)를 `https://localhost:8006`으로 프록시한다. 인증서는 검증하지 않고, `changeOrigin`으로 Origin 검사를 통과한다.
+- 개발: `pnpm -C web dev`(5173)가 `/api`(WebSocket 포함)를 `https://localhost:8006`으로 프록시한다. 인증서는 검증하지 않는다. Host를 바꾸지 않아야(`changeOrigin` 없음) 쿠키 요청의 Origin 검사를 통과한다. Chrome은 `http://localhost`에서도 `Secure` 쿠키를 저장한다.
 - 릴리스: `pnpm -C web build` 다음 `cargo build -p opld --release --features web-ui`.
 - Rust CI(check 2개, deny): 바꾸지 않는다(디버그 빌드는 `web/dist` 없이 된다). linux-kvm은 E2E를 위해 실제 UI를 빌드하고 Chromium을 설치한다.
 - 새 CI 작업 `web`: `pnpm install --frozen-lockfile`, 타입 검사, ESLint, Vitest, OpenAPI 타입 동기화 검사, `pnpm audit --prod`, 빌드.
@@ -75,7 +75,7 @@ crates/opld/src/web.rs   정적 파일 서빙 (feature "web-ui")
 
 **API 타입:** opl-api에 OpenAPI 문서를 표준 출력으로 내는 바이너리(`opl-api-openapi`)를 둔다. `pnpm -C web gen:api`가 이것으로 `web/src/api/schema.d.ts`를 만들고, 그 파일은 커밋한다. CI는 다시 만든 결과가 커밋된 파일과 다르면 실패한다.
 
-**요청:** `openapi-fetch`로 경로·본문·응답을 타입 검사한다. 쿠키는 같은 출처라 자동으로 실린다. 서버 상태는 TanStack Query 캐시에 둔다(키: `['vm']` 목록, `['vm', id]` 하나).
+**요청:** `openapi-fetch`로 경로·본문·응답을 타입 검사한다. 쿠키는 같은 출처라 자동으로 실린다. 서버 상태는 TanStack Query 캐시에 둔다(키: `["list", kind]`). 상세 화면도 목록에서 찾는다.
 
 **실시간 갱신:**
 1. 로그인 직후 그 역할이 읽을 수 있는 6종 목록(vm, volume, storage-pool, node, task, network)을 함께 읽는다.
@@ -103,7 +103,7 @@ crates/opld/src/web.rs   정적 파일 서빙 (feature "web-ui")
 ## 6. 보안
 
 - **XSS:** React 이스케이프만 쓴다. `dangerouslySetInnerHTML`은 ESLint로 막는다.
-- **CSP:** `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'`. 같이 붙이는 헤더: `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
+- **CSP:** `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`. 같이 붙이는 헤더: `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
 - **CSRF:** 지금의 `SameSite=Strict` 쿠키와 Origin 검사를 그대로 쓴다.
 - **브라우저 저장소:** 비밀값을 두지 않는다. `localStorage`에는 언어, 테마, 표 정렬만 둔다.
 - **의존성:** `pnpm-lock.yaml` 커밋, 버전 정확히 고정, CI에서 `pnpm audit --prod`.
@@ -118,7 +118,7 @@ crates/opld/src/web.rs   정적 파일 서빙 (feature "web-ui")
 | 5xx·네트워크 끊김 | 알림. 읽기는 2번까지 다시 시도, 쓰기는 다시 시도하지 않음 |
 | watch 끊김 | 상단 표시, 재연결 뒤 목록 새로 읽기 |
 | 업로드 중 이탈 | 브라우저 확인창. 끊기면 서버가 볼륨을 정리한다 |
-| 콘솔 실패 | `vm_not_running`·`console_unavailable` 이유와 다시 연결 버튼 |
+| 콘솔 실패 | 연결 끊김 표시와 다시 연결 버튼(§10) |
 
 ## 8. API 변경
 
@@ -144,6 +144,7 @@ E2E 흐름: opld 하나를 `init` → 로그인 → 테스트 이미지를 볼�
 
 - 클러스터 CA를 브라우저에 가져오기 전까지 인증서 경고가 뜬다. README에 `/api/v1/cluster/ca`로 가져오는 방법을 적는다.
 - 세션은 노드의 메모리에 있다. 접속한 노드의 opld가 다시 시작하면 다시 로그인한다.
+- 콘솔 WebSocket 업그레이드 전의 API 오류(`vm_not_running`, `console_unavailable`)는 브라우저가 본문을 주지 않아 "연결이 끊겼다"로만 보인다.
 - API에 페이지 나누기가 없다. 작업 목록은 모두 받아 화면에서 최근 순으로 자른다.
 - 볼륨 업로드는 지금 접속한 노드에서 쓸 수 있는 풀로만 된다.
 - noVNC 1.7은 기본으로 하위 프로토콜을 요청하지 않아 지금의 콘솔 WebSocket에 그대로 붙는다(계획 8 E2E로 확인).

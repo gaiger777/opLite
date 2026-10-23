@@ -79,7 +79,7 @@ oplctl vm create web --memory 1024 --disk root --nic lan --start
 ## 웹 UI
 
 opld를 `web-ui` 기능으로 빌드하면 API와 같은 주소(`https://<노드>:8006/`)에서 웹 UI가 열린다.
-Node.js 22와 pnpm이 필요하다.
+Node.js 22.12 이상과 pnpm이 필요하다.
 
 ```bash
 pnpm -C web install
