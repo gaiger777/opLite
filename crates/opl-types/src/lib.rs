@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod cluster;
+pub mod network;
 pub mod node;
 pub mod resource;
 pub mod runtime;

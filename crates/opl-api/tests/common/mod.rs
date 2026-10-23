@@ -109,6 +109,7 @@ impl Env {
             cpus: 4,
             memory_mib: 8192,
             hypervisor: "mock".into(),
+            bridges: vec![],
         };
         cluster.create(&me).await.unwrap();
         let admin = Resource::new(

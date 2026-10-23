@@ -140,6 +140,7 @@ async fn two_nodes() -> (TempDir, Node, Node) {
             cpus: 4,
             memory_mib: 8192,
             hypervisor: "mock".into(),
+            bridges: vec![],
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();

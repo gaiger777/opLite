@@ -98,6 +98,7 @@ pub async fn register_node(cluster: &Cluster, config: &Config) -> anyhow::Result
         cpus: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
         memory_mib: crate::host::memory_mib(),
         hypervisor: "qemu-hvf".into(),
+        bridges: vec![],
     };
     cluster.update_status::<NodeSpec>(id, &status).await?;
     Ok(())

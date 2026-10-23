@@ -29,8 +29,18 @@ pub struct NodeStatus {
     pub online: bool,
     pub cpus: u32,
     pub memory_mib: u64,
-    /// 예: `qemu-hvf`, `qemu-kvm`
+    /// 예: `qemu-hvf`, `qemu-kvm`, `qemu-tcg`
     pub hypervisor: String,
+    /// 이 노드에 있는 Linux 브리지. 스케줄러가 브리지 네트워크를 쓰는 VM을 배치할 때 본다.
+    pub bridges: Vec<BridgeInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BridgeInfo {
+    pub name: String,
+    /// VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다.
+    pub vlan_filtering: bool,
 }
 
 #[cfg(test)]

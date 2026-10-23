@@ -47,6 +47,10 @@ pub struct RuntimeNic {
 pub enum NicBackend {
     /// QEMU user-mode NAT
     User,
-    /// 미리 만들어 둔 tap 장치
-    Tap { ifname: String },
+    /// 드라이버가 만들어 브리지에 붙이는 tap 장치
+    Tap {
+        ifname: String,
+        bridge: String,
+        vlan: Option<u16>,
+    },
 }

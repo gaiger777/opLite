@@ -92,6 +92,7 @@ mod tests {
             cpus: 4,
             memory_mib,
             hypervisor: "mock".into(),
+            bridges: vec![],
         };
         n
     }

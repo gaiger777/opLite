@@ -123,7 +123,7 @@ pub fn build_cmdline(
     for (i, nic) in spec.nics.iter().enumerate() {
         let netdev = match &nic.backend {
             NicBackend::User => format!("user,id=net{i}"),
-            NicBackend::Tap { ifname } => format!(
+            NicBackend::Tap { ifname, .. } => format!(
                 "tap,id=net{i},ifname={},script=no,downscript=no",
                 esc(ifname)
             ),
@@ -249,6 +249,8 @@ mod tests {
                     model: NicModel::Virtio,
                     backend: NicBackend::Tap {
                         ifname: "tap0i0".into(),
+                        bridge: "vmbr0".into(),
+                        vlan: Some(10),
                     },
                 },
                 RuntimeNic {
