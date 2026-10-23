@@ -269,7 +269,7 @@ impl Member {
             "opld is ready"
         );
         let (stop, rx) = oneshot::channel::<()>();
-        let app = opl_api::router(Arc::new(state));
+        let app = opl_api::router(Arc::new(state)).merge(crate::web::router());
         let task = tokio::spawn(async move {
             let r = axum::serve(listener, app)
                 .with_graceful_shutdown(async {

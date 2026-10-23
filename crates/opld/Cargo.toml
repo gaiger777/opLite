@@ -13,6 +13,9 @@ repository.workspace = true
 qemu-it = []
 # VM NIC를 Linux 브리지에 잇는 E2E 테스트(qemu-it와 함께). Linux에서 root와 iproute2가 필요하다.
 net-it = []
+# 웹 UI(web/dist)를 바이너리에 넣는다. 먼저 `pnpm -C web build`로 만든다. 디버그 빌드는 없어도 되고
+# 안내 페이지를 준다.
+web-ui = []
 
 [dependencies]
 anyhow.workspace = true
@@ -27,6 +30,7 @@ opl-qemu.workspace = true
 opl-reconciler.workspace = true
 opl-types.workspace = true
 reqwest.workspace = true
+rust-embed.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

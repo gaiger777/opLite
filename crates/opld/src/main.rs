@@ -14,6 +14,7 @@ mod control;
 mod host;
 mod join;
 mod member;
+mod web;
 
 use std::fs::File;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
