@@ -6,6 +6,7 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 import { createQueryClient } from "@/api/queryClient";
 import type { Principal, Resources, WatchKind } from "@/api/types";
 import { AuthProvider } from "@/auth/AuthProvider";
+import { RequireAuth } from "@/auth/RequireAuth";
 import { Toaster } from "@/components/ui/sonner";
 import { ThemeProvider } from "@/lib/theme";
 import { apiUrl, server } from "@/test/server";
@@ -44,7 +45,7 @@ export function renderPage(
   server.use(http.get(apiUrl("/auth/whoami"), () => HttpResponse.json(as)));
   const router = createMemoryRouter(
     [
-      { path, element },
+      { element: <RequireAuth />, children: [{ path, element }] },
       { path: "*", element: <p>moved</p> },
     ],
     { initialEntries: [url] },

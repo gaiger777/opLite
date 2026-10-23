@@ -79,5 +79,48 @@
       "volume-import": "볼륨 {{target}} 가져오기",
       "volume-delete": "볼륨 {{target}} 삭제"
     }
+  },
+  "common": {
+    "loading": "불러오는 중…"
+  },
+  "confirm": {
+    "cancel": "취소",
+    "typeName": "확인하려면 {{name}}을(를) 입력하세요"
+  },
+  "vms": {
+    "name": "이름",
+    "state": "상태",
+    "node": "노드",
+    "vcpus": "vCPU",
+    "memory": "메모리",
+    "actions": "동작",
+    "actionsFor": "{{name}} 동작",
+    "search": "이름 검색",
+    "create": "만들기",
+    "empty": "가상 머신이 없습니다.",
+    "selectAll": "모두 선택",
+    "select": "{{name}} 선택",
+    "selected_one": "{{count}}개 선택",
+    "selected_other": "{{count}}개 선택",
+    "deleted": "{{name}}을(를) 삭제했습니다.",
+    "forceStopTitle": "{{name}}을(를) 강제 정지할까요?",
+    "forceStopDescription": "게스트 OS를 종료하지 않고 VM을 끕니다. 저장하지 않은 게스트의 데이터를 잃습니다.",
+    "deleteTitle": "{{name}}을(를) 삭제할까요?",
+    "deleteDescription": "VM을 삭제합니다. 볼륨은 남습니다.",
+    "phase": {
+      "stopped": "정지",
+      "starting": "시작 중",
+      "running": "실행 중",
+      "stopping": "정지 중",
+      "failed": "실패"
+    },
+    "action": {
+      "start": "시작",
+      "stop": "정지",
+      "force-stop": "강제 정지",
+      "reboot": "재시작",
+      "console": "콘솔",
+      "delete": "삭제"
+    }
   }
 }

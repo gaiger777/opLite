@@ -12,6 +12,8 @@ export default tseslint.config(
     plugins: { "react-hooks": reactHooks },
     rules: {
       ...reactHooks.configs.recommended.rules,
+      // React Compiler를 쓰지 않는다(TanStack Table의 훅은 컴파일러가 건너뛴다는 경고).
+      "react-hooks/incompatible-library": "off",
       // 화면에 HTML을 직접 넣지 않는다(XSS). React의 이스케이프만 쓴다.
       "no-restricted-syntax": [
         "error",

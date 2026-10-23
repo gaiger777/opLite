@@ -79,5 +79,48 @@
       "volume-import": "Import volume {{target}}",
       "volume-delete": "Delete volume {{target}}"
     }
+  },
+  "common": {
+    "loading": "Loading…"
+  },
+  "confirm": {
+    "cancel": "Cancel",
+    "typeName": "Type {{name}} to confirm"
+  },
+  "vms": {
+    "name": "Name",
+    "state": "State",
+    "node": "Node",
+    "vcpus": "vCPUs",
+    "memory": "Memory",
+    "actions": "Actions",
+    "actionsFor": "Actions for {{name}}",
+    "search": "Search by name",
+    "create": "Create",
+    "empty": "No virtual machines.",
+    "selectAll": "Select all",
+    "select": "Select {{name}}",
+    "selected_one": "{{count}} selected",
+    "selected_other": "{{count}} selected",
+    "deleted": "Deleted {{name}}.",
+    "forceStopTitle": "Force stop {{name}}?",
+    "forceStopDescription": "The VM is turned off without shutting down its OS. Unsaved data in the guest is lost.",
+    "deleteTitle": "Delete {{name}}?",
+    "deleteDescription": "The VM is deleted. Its volumes are kept.",
+    "phase": {
+      "stopped": "Stopped",
+      "starting": "Starting",
+      "running": "Running",
+      "stopping": "Stopping",
+      "failed": "Failed"
+    },
+    "action": {
+      "start": "Start",
+      "stop": "Stop",
+      "force-stop": "Force stop",
+      "reboot": "Reboot",
+      "console": "Console",
+      "delete": "Delete"
+    }
   }
 }

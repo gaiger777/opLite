@@ -14,6 +14,7 @@ import { LoginPage } from "@/pages/LoginPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { TasksPage } from "@/tasks/TasksPage";
 import { TaskToasts } from "@/tasks/TaskToasts";
+import { VmListPage } from "@/vms/VmListPage";
 
 function routes() {
   return createBrowserRouter([
@@ -30,6 +31,7 @@ function routes() {
           ),
           children: [
             { index: true, element: <DashboardPage /> },
+            { path: "vms", element: <VmListPage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],
