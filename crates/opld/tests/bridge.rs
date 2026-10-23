@@ -1,5 +1,5 @@
 //! M7 완료 기준: Linux에서 브리지 네트워크를 만들고, 그 네트워크를 쓰는 VM의 NIC가 VLAN 태그와
-//! 함께 브리지에 붙었다가 VM을 끄면 떨어진다.
+//! 함께 브리지에 붙었다가 VM을 끄면 사라진다.
 //! `cargo test -p opld --features qemu-it,net-it --test bridge`
 //! Linux에서 root, iproute2, QEMU가 필요하다(KVM이 없으면 TCG).
 #![cfg(all(feature = "qemu-it", feature = "net-it", target_os = "linux"))]
@@ -76,7 +76,8 @@ async fn vm_nics_join_the_bridge_with_their_vlan() {
     assert!(
         node["status"]["hypervisor"]
             .as_str()
-            .is_some_and(|h| h == "qemu-kvm" || h == "qemu-tcg")
+            .is_some_and(|h| h == "qemu-kvm" || h == "qemu-tcg"),
+        "{node}"
     );
 
     d.ctl(&[
@@ -100,6 +101,11 @@ async fn vm_nics_join_the_bridge_with_their_vlan() {
     let vlans = &vlans[0]["vlans"];
     assert_eq!(vlans.as_array().unwrap().len(), 1, "{vlans}");
     assert_eq!(vlans[0]["vlan"], 30);
+    let flags = vlans[0]["flags"].to_string();
+    assert!(
+        flags.contains("PVID") && flags.contains("Egress Untagged"),
+        "{vlans}"
+    );
 
     // 쓰고 있는 네트워크는 지울 수 없다.
     let err = d.ctl(&["network", "delete", "lan"]).await.unwrap_err();
@@ -108,7 +114,7 @@ async fn vm_nics_join_the_bridge_with_their_vlan() {
     let out = d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
     assert!(out.contains("vm web: stop done"), "{out}");
     let deadline = tokio::time::Instant::now() + WAIT;
-    while master_of(&tap).is_some() {
+    while json("ip", &["-j", "link", "show", "dev", &tap]).is_some() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "tap {tap} is still there"
