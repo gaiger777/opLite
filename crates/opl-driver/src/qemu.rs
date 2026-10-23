@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_qemu::{HostProfile, QmpClient, QmpError, QmpEvent, RunState, RuntimePaths, build_cmdline};
+use opl_types::network::tap_prefix;
 use opl_types::runtime::{NicBackend, VmRuntimeSpec};
 use opl_types::vm::Firmware;
 use rustix::process::{Flock, FlockOffsetType, FlockType, Pid, Signal, fcntl_getlk, kill_process};
@@ -98,10 +99,13 @@ impl QemuHypervisor {
                 Liveness::Alive(_) => {}
                 Liveness::Dead => {
                     tracing::warn!(%id, "removing stale runtime dir");
-                    if let Err(e) = std::fs::remove_dir_all(&paths.dir) {
+                    // 런타임 디렉터리가 정리할 것이 남았다는 유일한 기록이므로 tap부터 지운다.
+                    // 지우지 못하면 디렉터리를 남겨 다음 new()가 다시 시도한다.
+                    if delete_taps(hv.config.net.as_deref(), id).await
+                        && let Err(e) = std::fs::remove_dir_all(&paths.dir)
+                    {
                         tracing::error!(%id, error = %e, "failed to remove stale runtime dir");
                     }
-                    delete_taps(hv.config.net.as_deref(), id).await;
                     continue;
                 }
                 Liveness::Unknown => {
@@ -191,6 +195,7 @@ impl QemuHypervisor {
         args.push("-daemonize".into());
         self.create_taps(vm).await?;
         let mut cmd = if self.config.systemd_scope {
+            clear_stale_scope(vm.id).await;
             // 스코프는 QEMU가 끝날 때까지 남는다. --collect: 실패로 끝나도 남기지 않는다.
             let mut cmd = tokio::process::Command::new("systemd-run");
             cmd.args(["--scope", "--quiet", "--collect"])
@@ -256,6 +261,14 @@ impl QemuHypervisor {
         if taps.is_empty() {
             return Ok(());
         }
+        // create_tap은 같은 이름의 장치를 먼저 지우므로, 이 VM의 이름이 아니면 호스트 인터페이스를 지울 수 있다.
+        let prefix = tap_prefix(vm.id);
+        if let Some(tap) = taps.iter().find(|t| !t.ifname.starts_with(&prefix)) {
+            return Err(DriverError::InvalidSpec(format!(
+                "tap name {:?} does not start with {prefix:?}",
+                tap.ifname
+            )));
+        }
         let Some(net) = &self.config.net else {
             return Err(DriverError::InvalidSpec(
                 "bridge networks are not supported on this node".into(),
@@ -288,12 +301,13 @@ impl QemuHypervisor {
                 return false;
             }
         }
-        if let Err(e) = std::fs::remove_dir_all(&paths.dir)
+        // tap부터 지운다. 지우지 못하면 런타임 디렉터리를 남겨 다음 new()가 다시 시도한다.
+        if delete_taps(self.config.net.as_deref(), id).await
+            && let Err(e) = std::fs::remove_dir_all(&paths.dir)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(%id, error = %e, "failed to remove runtime dir");
         }
-        delete_taps(self.config.net.as_deref(), id).await;
         true
     }
 
@@ -508,17 +522,17 @@ async fn monitor(
         }
     };
     let dead = || liveness(&paths.pidfile) == Liveness::Dead;
-    let kind = match guest_initiated {
+    // (종료 종류, 프로세스가 끝나 런타임 디렉터리를 지워도 되는지)
+    let (kind, exited) = match guest_initiated {
         // SHUTDOWN을 받았으면 종료는 확정이다. QEMU는 소켓을 닫고 곧 끝나므로 잠깐 기다려
         // 디렉터리를 지우되, 플러시 등으로 늦어지면 잠금이 걸린 디렉터리는 남겨 두고
         // (다음 launch/new()가 잠금 해제를 확인하고 정리한다) 종료는 바로 알린다.
         Some(guest_initiated) => {
-            if !wait_until(SHUTDOWN_EXIT_WAIT, dead).await {
+            let exited = wait_until(SHUTDOWN_EXIT_WAIT, dead).await;
+            if !exited {
                 tracing::info!(%id, "QEMU is still exiting; leaving runtime dir");
-            } else if let Err(e) = std::fs::remove_dir_all(&paths.dir) {
-                tracing::warn!(%id, error = %e, "failed to remove runtime dir");
             }
-            EventKind::Stopped { guest_initiated }
+            (EventKind::Stopped { guest_initiated }, exited)
         }
         None => {
             if !wait_until(EXIT_GRACE, dead).await {
@@ -529,26 +543,51 @@ async fn monitor(
                 unregister();
                 return;
             }
-            if let Err(e) = std::fs::remove_dir_all(&paths.dir) {
-                tracing::warn!(%id, error = %e, "failed to remove runtime dir");
-            }
-            EventKind::Crashed
+            (EventKind::Crashed, true)
         }
     };
-    // QEMU가 끝났으므로 tap을 지운다(아직 끝나는 중이어도 마지막 fd가 닫히면 사라진다).
-    delete_taps(net.as_deref(), id).await;
+    // 등록을 풀기 전에 tap을 지운다. QEMU가 아직 끝나는 중이어도 tap은 곧바로 지워진다(남은 fd는
+    // 오류를 받는다). 게스트는 이미 꺼졌으므로 괜찮다. 런타임 디렉터리는 정리할 것이 남았다는
+    // 유일한 기록이므로 tap을 지운 뒤에 지운다. 그 전에 끊기거나(드라이버가 내려가 이 태스크가
+    // abort됨) tap을 지우지 못하면 디렉터리가 남아 다음 launch/new()가 다시 정리한다.
+    if delete_taps(net.as_deref(), id).await
+        && exited
+        && let Err(e) = std::fs::remove_dir_all(&paths.dir)
+    {
+        tracing::warn!(%id, error = %e, "failed to remove runtime dir");
+    }
     // 이벤트를 받은 쪽이 곧바로 start를 불러도 "이미 실행 중"으로 오판하지 않도록 등록부터 해제한다.
     // 핸들이 drop되면서 이 태스크에 abort가 걸리지만, 아래에는 await가 없으므로 끝까지 실행된다.
     unregister();
     let _ = events.send(HypervisorEvent { id, kind });
 }
 
-/// VM의 tap을 지운다. 실패는 기록만 한다(다음 시작이 같은 이름을 다시 만든다).
-async fn delete_taps(net: Option<&dyn HostNet>, id: Uuid) {
+/// VM의 tap을 지운다. 지웠거나 지울 것이 없으면 true. 실패는 기록만 한다(다음 시작이 같은
+/// 이름을 다시 만든다).
+async fn delete_taps(net: Option<&dyn HostNet>, id: Uuid) -> bool {
     if let Some(net) = net
         && let Err(e) = net.delete_vm_taps(id).await
     {
         tracing::warn!(%id, error = %e, "failed to delete tap devices");
+        return false;
+    }
+    true
+}
+
+/// 끝난 QEMU의 `--collect` 스코프는 systemd가 비동기로 회수하므로, 곧바로 다시 띄우면
+/// systemd-run이 "Unit ... already exists"로 실패한다. 호출자가 이전 QEMU가 없음을 확인했으므로
+/// 남은 스코프를 멈추고 실패 기록을 지운다. 오류와 출력은 무시한다.
+async fn clear_stale_scope(id: Uuid) {
+    let unit = format!("opl-vm-{id}.scope");
+    for verb in ["stop", "reset-failed"] {
+        let status = tokio::process::Command::new("systemctl")
+            .args([verb, "--quiet", &unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status();
+        let _ = tokio::time::timeout(KILL_TIMEOUT, status).await;
     }
 }
 
@@ -1122,13 +1161,36 @@ time.sleep(60)
             mac: "52:54:00:12:34:56".parse().unwrap(),
             model: NicModel::Virtio,
             backend: NicBackend::Tap {
-                ifname: "op0123456789n0".into(),
+                ifname: opl_types::network::tap_name(vm.id, 0),
                 bridge: "vmbr0".into(),
                 vlan: None,
             },
         });
         let err = hv.start(&vm).await.unwrap_err();
         assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn tap_name_of_another_vm_or_host_is_invalid() {
+        let tmp = short_tempdir();
+        let hv = QemuHypervisor::new(config(tmp.path(), PathBuf::from("/nonexistent/qemu")))
+            .await
+            .unwrap();
+        let mut vm = spec();
+        // create_tap이 같은 이름을 먼저 지우므로 호스트 인터페이스 이름은 받으면 안 된다.
+        vm.nics.push(RuntimeNic {
+            mac: "52:54:00:12:34:56".parse().unwrap(),
+            model: NicModel::Virtio,
+            backend: NicBackend::Tap {
+                ifname: "eth0".into(),
+                bridge: "vmbr0".into(),
+                vlan: None,
+            },
+        });
+        match hv.start(&vm).await.unwrap_err() {
+            DriverError::InvalidSpec(msg) => assert!(msg.contains("eth0"), "{msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[tokio::test]

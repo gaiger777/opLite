@@ -4,7 +4,7 @@
 #![cfg(all(feature = "qemu-it", feature = "net-it", target_os = "linux"))]
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +54,16 @@ fn master_of(ifname: &str) -> Option<String> {
     v[0]["master"].as_str().map(str::to_string)
 }
 
+fn exists(ifname: &str) -> bool {
+    Command::new("ip")
+        .args(["link", "show", "dev", ifname])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
 fn config(root: &Path) -> QemuConfig {
     QemuConfig {
         host: HostProfile::native(Path::new("/opt/homebrew/share/qemu")),
@@ -92,7 +102,7 @@ fn spec(bridge: &str) -> VmRuntimeSpec {
 
 async fn wait_gone(ifname: &str) {
     for _ in 0..100 {
-        if master_of(ifname).is_none() {
+        if !exists(ifname) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -142,14 +152,49 @@ async fn vm_nic_is_on_the_bridge_while_qemu_runs() {
 
 #[tokio::test]
 async fn missing_bridge_fails_the_start_without_leftovers() {
+    let br = bridge();
     let tmp = tempfile::Builder::new()
         .prefix("opl")
         .tempdir_in("/tmp")
         .unwrap();
     let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
-    let vm = spec("oplq-missing");
+    // NIC 0의 tap은 만들어진 뒤 NIC 1에서 실패하므로 지워져야 한다.
+    let mut vm = spec(&br.0);
+    vm.nics.push(RuntimeNic {
+        mac: "52:54:00:12:34:57".parse().unwrap(),
+        model: NicModel::Virtio,
+        backend: NicBackend::Tap {
+            ifname: tap_name(vm.id, 1),
+            bridge: "oplq-missing".into(),
+            vlan: None,
+        },
+    });
     let err = hv.start(&vm).await.unwrap_err();
     assert!(!err.is_transient(), "{err:?}");
     assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
-    assert_eq!(master_of(&tap_name(vm.id, 0)), None);
+    assert!(!exists(&tap_name(vm.id, 0)));
+    assert!(!exists(&tap_name(vm.id, 1)));
+}
+
+#[tokio::test]
+async fn tap_stays_on_the_bridge_across_driver_restart() {
+    let br = bridge();
+    let tmp = tempfile::Builder::new()
+        .prefix("opl")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let vm = spec(&br.0);
+    let tap = tap_name(vm.id, 0);
+    {
+        let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+        hv.start(&vm).await.unwrap();
+        assert_eq!(master_of(&tap), Some(br.0.clone()));
+        // 드라이버(= opld)가 내려간다. QEMU는 분리되어 있으므로 tap도 그대로여야 한다.
+    }
+
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    assert!(hv.inspect(vm.id).await.unwrap().is_some());
+    assert_eq!(master_of(&tap), Some(br.0.clone()));
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+    wait_gone(&tap).await;
 }
