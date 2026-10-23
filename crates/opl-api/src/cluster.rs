@@ -163,6 +163,8 @@ pub struct ClusterView {
     /// 클러스터 CA 인증서의 지문. `oplctl login --ca-fingerprint`에 쓴다.
     pub ca_fingerprint: String,
     pub leader: Option<Uuid>,
+    /// 이 응답을 보낸 노드의 id. 볼륨 업로드처럼 받은 노드에서 처리하는 요청에 쓴다.
+    pub node: Uuid,
     pub members: Vec<MemberView>,
 }
 
@@ -203,6 +205,7 @@ pub async fn get_cluster(
         name: info.name.clone(),
         ca_fingerprint: ca_fingerprint(&info)?,
         leader: members.leader.map(|id| id.0),
+        node: state.node,
         members: list,
     }))
 }

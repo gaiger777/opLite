@@ -74,6 +74,10 @@ async fn login_checks_password_and_session_cookie_works() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // 브라우저의 쿠키도 지운다.
+    let cleared = resp.headers()["set-cookie"].to_str().unwrap();
+    assert!(cleared.starts_with("opl_session=;"), "{cleared}");
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
     let resp = http
         .get(url("/auth/whoami"))
         .header("cookie", &cookie)

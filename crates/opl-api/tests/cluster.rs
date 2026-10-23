@@ -20,6 +20,7 @@ async fn cluster_view_and_ca() {
     assert_eq!(status, StatusCode::OK, "{view}");
     assert_eq!(view["name"], "test");
     assert_eq!(view["leader"], env.node.to_string());
+    assert_eq!(view["node"], env.node.to_string());
     assert_eq!(view["members"].as_array().unwrap().len(), 1);
     assert_eq!(view["members"][0]["name"], "node1");
     assert_eq!(view["members"][0]["voter"], true);

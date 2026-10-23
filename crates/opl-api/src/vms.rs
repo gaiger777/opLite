@@ -234,6 +234,7 @@ pub async fn delete_vm(
 pub struct ActionQuery {
     /// `stop`에만 쓴다. `force`면 ACPI 응답을 기다리지 않는다.
     #[serde(default)]
+    #[param(inline)]
     pub mode: StopMode,
 }
 

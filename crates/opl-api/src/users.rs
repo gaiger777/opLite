@@ -114,12 +114,24 @@ pub async fn login(
     Ok(response)
 }
 
+/// 세션을 끝내고 브라우저의 세션 쿠키를 지운다.
 #[utoipa::path(post, path = "/auth/logout", tag = "auth", responses((status = 204)))]
-pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> StatusCode {
+pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(id) = session_cookie(&headers) {
         state.sessions.remove(id);
     }
-    StatusCode::NO_CONTENT
+    let mut cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    if state.secure_cookies {
+        cookie.push_str("; Secure");
+    }
+    (
+        StatusCode::NO_CONTENT,
+        [(
+            SET_COOKIE,
+            HeaderValue::from_str(&cookie).expect("ASCII cookie"),
+        )],
+    )
+        .into_response()
 }
 
 #[utoipa::path(get, path = "/auth/whoami", tag = "auth",

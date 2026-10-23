@@ -46,4 +46,15 @@ async fn openapi_document_is_served_without_login() {
         doc["paths"]["/auth/login"]["post"]["security"],
         serde_json::json!([{}])
     );
+    // 모든 스키마 참조가 문서 안에 있다(웹 UI의 타입 생성이 실패하지 않게).
+    let text = doc.to_string();
+    for rest in text.split("\"#/components/schemas/").skip(1) {
+        let name = &rest[..rest.find('"').unwrap()];
+        assert!(
+            doc["components"]["schemas"][name].is_object(),
+            "missing schema {name}"
+        );
+    }
+    // 웹 UI가 타입을 만드는 문서(`opl-api-openapi`)와 서버가 주는 문서가 같다.
+    assert_eq!(doc, serde_json::to_value(opl_api::openapi()).unwrap());
 }
