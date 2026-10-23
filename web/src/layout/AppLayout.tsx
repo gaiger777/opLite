@@ -14,6 +14,7 @@ import { useTranslation } from "react-i18next";
 import { NavLink, Outlet } from "react-router";
 
 import { api, call } from "@/api/client";
+import { useLiveStatus } from "@/api/LiveProvider";
 import { useAuth, usePrincipal } from "@/auth/AuthProvider";
 import { Button } from "@/components/ui/button";
 import {
@@ -67,6 +68,7 @@ export function AppLayout() {
         <header className="flex h-14 items-center justify-between gap-2 border-b px-4">
           <span className="truncate text-sm text-muted-foreground">{cluster.data?.name}</span>
           <div className="flex items-center gap-1">
+            <LiveBadge />
             <LanguageMenu />
             <ThemeMenu />
             <UserMenu />
@@ -77,6 +79,22 @@ export function AppLayout() {
         </main>
       </div>
     </div>
+  );
+}
+
+/** 실시간 연결이 끊겼으면 화면의 내용이 오래됐을 수 있다고 알린다. */
+function LiveBadge() {
+  const { t } = useTranslation();
+  const status = useLiveStatus();
+  const color =
+    status === "live" ? "bg-emerald-500" : status === "offline" ? "bg-destructive" : "bg-amber-500";
+  return (
+    <span role="status" className="flex items-center gap-2 px-2 text-xs text-muted-foreground">
+      <span className={`size-2 rounded-full ${color}`} />
+      <span className={status === "live" ? "sr-only sm:not-sr-only" : ""}>
+        {t(`live.${status}`)}
+      </span>
+    </span>
   );
 }
 

@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { http, HttpResponse } from "msw";
+import { http, HttpResponse, ws } from "msw";
 
 import { App } from "@/App";
 import { safeNext } from "@/auth/RequireAuth";
@@ -31,6 +31,10 @@ function signedOut() {
       signedIn = false;
       return new HttpResponse(null, { status: 204 });
     }),
+    ...["/vms", "/volumes", "/storage-pools", "/nodes", "/tasks", "/networks"].map((path) =>
+      http.get(apiUrl(path), () => HttpResponse.json({ revision: 1, items: [] })),
+    ),
+    ws.link(`ws://${window.location.host}/api/v1/watch`).addEventListener("connection", () => {}),
     http.get(apiUrl("/cluster"), () =>
       HttpResponse.json({ name: "lab", ca_fingerprint: "x", node: admin.user, members: [] }),
     ),
@@ -56,6 +60,7 @@ it("signs in, returns to the requested page and signs out", async () => {
   expect(await screen.findByRole("heading", { name: "Page not found" })).toBeInTheDocument();
   expect(window.location.pathname).toBe("/somewhere");
   expect(await screen.findByText("lab")).toBeInTheDocument();
+  expect(await screen.findByRole("status")).toHaveTextContent("Live");
 
   await user.click(screen.getByRole("button", { name: "Account" }));
   await user.click(await screen.findByRole("menuitem", { name: "Sign out" }));

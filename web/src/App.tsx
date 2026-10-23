@@ -2,6 +2,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import { createBrowserRouter, RouterProvider } from "react-router";
 
+import { LiveProvider } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { RequireAuth } from "@/auth/RequireAuth";
@@ -19,7 +20,11 @@ function routes() {
       element: <RequireAuth />,
       children: [
         {
-          element: <AppLayout />,
+          element: (
+            <LiveProvider>
+              <AppLayout />
+            </LiveProvider>
+          ),
           children: [
             { index: true, element: <DashboardPage /> },
             { path: "*", element: <NotFoundPage /> },

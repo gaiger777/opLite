@@ -48,5 +48,10 @@
   "notFound": {
     "title": "Page not found",
     "home": "Go to the dashboard"
+  },
+  "live": {
+    "live": "Live",
+    "connecting": "Connecting…",
+    "offline": "Disconnected · reconnecting"
   }
 }
