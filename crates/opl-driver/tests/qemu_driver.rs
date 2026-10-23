@@ -293,3 +293,25 @@ async fn force_stop_after_restart_kills_stopped_qemu() {
     assert_eq!(b.inspect(vm.id).await.unwrap(), None);
     assert!(b.list().await.unwrap().is_empty());
 }
+
+/// `OPL_TEST_SYSTEMD=1`(systemd가 있는 Linux)일 때만 확인한다: QEMU가 VM 전용 스코프에서 돈다.
+#[tokio::test]
+async fn qemu_runs_in_its_own_systemd_scope() {
+    if std::env::var_os("OPL_TEST_SYSTEMD").is_none() {
+        return;
+    }
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let vm = spec();
+    hv.start(&vm).await.unwrap();
+    let pid = hv.inspect(vm.id).await.unwrap().unwrap().pid;
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    assert!(
+        cgroup.contains(&format!("opl-vm-{}.scope", vm.id)),
+        "{cgroup}"
+    );
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+    // 스코프는 QEMU가 끝나면 사라지므로 같은 VM을 다시 시작할 수 있다.
+    hv.start(&vm).await.unwrap();
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+}

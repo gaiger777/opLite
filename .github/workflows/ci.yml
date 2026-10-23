@@ -37,6 +37,30 @@ jobs:
           cargo test -p opl-driver --features storage-it --test dir_storage
           cargo test -p opl-api --features storage-it --test volumes
 
+  # M7: 실제 KVM으로 VM을 띄우고 NIC를 브리지에 잇는다. tap과 브리지를 만들려면 root가 필요하고,
+  # QEMU는 systemd 스코프로 감싼다(OPL_TEST_SYSTEMD).
+  linux-kvm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: KVM, QEMU, UEFI firmware, iproute2
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils iproute2
+          ls -l /dev/kvm
+      # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다.
+      - name: QEMU, bridge and E2E tests as root
+        run: |
+          sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+            cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
+        env:
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it
+
   deny:
     runs-on: ubuntu-latest
     steps:

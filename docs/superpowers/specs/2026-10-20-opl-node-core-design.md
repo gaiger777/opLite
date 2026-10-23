@@ -69,7 +69,7 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 |---|---|---|
 | `opl-types` | 리소스 모델(VmSpec, VolumeSpec 등), serde 스키마 | 공개 |
 | `opl-qemu` | QMP 클라이언트 + QEMU 커맨드라인 생성기 | 공개 |
-| `opl-driver` | `Hypervisor`/`Storage`/`Network` 트레이트, Mock·QemuHvf·QemuKvm 구현 | 공개 |
+| `opl-driver` | `Hypervisor`/`Storage`/`HostNet`(tap·브리지) 트레이트, Mock·QEMU(hvf/KVM/TCG)·iproute2 구현 | 공개 |
 | `opl-cluster` | openraft 상태 머신, 리소스 저장소, watch 스트림, 리더 전달 | 공개 |
 | `opl-peer` | 노드 간 통신(gRPC over mTLS: Raft RPC, 리더 전달, 생존 확인, 콘솔 중계), 클러스터 PKI | 공개 |
 | `opl-reconciler` | 조정 루프, VM별 작업 큐 | 공개 |
@@ -107,11 +107,11 @@ struct Resource<S, T> {
 
 | 리소스 | spec | status |
 |---|---|---|
-| `Node` | 이름, 주소, 유지보수 모드 | 온라인 여부, CPU/메모리 용량, 하이퍼바이저 종류와 기능 |
+| `Node` | 이름, 주소, 유지보수 모드 | 온라인 여부, CPU/메모리 용량, 하이퍼바이저 종류(`qemu-kvm`/`qemu-tcg`/`qemu-hvf`), Linux 브리지 목록(VLAN-aware 여부) |
 | `Vm` | vCPU, 메모리, 펌웨어(bios/uefi), 머신 타입, 디스크·NIC, `power`, `node`(선택), `restart` 정책 | 실제 전원 상태, 실행 노드, QEMU PID, 오류 조건 |
 | `StoragePool` | 종류(`dir`), 경로, 사용할 노드, `shared: bool` | 용량, 사용량 |
 | `Volume` | 소속 풀, 크기, 형식(qcow2/raw) | 준비 상태(Pending/Ready), 할당 크기, 파일을 만드는 노드 |
-| `Network` | 종류(`user`/`bridge`), 브리지 이름, VLAN 태그 | — |
+| `Network` | 브리지 이름, VLAN 태그(선택). 이름 `user`는 예약(QEMU NAT, 리소스 없음) | — |
 | `Task` | 작업 종류, 대상 리소스, 실행 노드 | 상태(Pending/Running/Succeeded/Failed), 오류 |
 | `User`, `ApiToken` | 사용자 이름, 비밀번호 해시(argon2), 역할 / 주인, 토큰 비밀 값의 SHA-256 | — |
 | `Cluster` | 클러스터 이름(리소스 이름), CA 인증서와 개인키(API로 내보내지 않는다) | — |
@@ -139,7 +139,7 @@ spec:
 
 ### 3.3 스케줄러 (1차)
 
-`node`가 비어 있는 VM을 시작하면 스케줄러가 노드를 고른다. 대상은 온라인 상태이고, 유지보수 모드가 아니며, 디스크가 있는 풀에 접근할 수 있는 노드다. 이 중 미할당 메모리가 가장 많은 노드를 선택한다. 선택 결과는 `spec.node`에 기록한다. 리소스 오버커밋 정책과 DRS급 재배치는 범위 밖이다.
+`node`가 비어 있는 VM을 시작하면 스케줄러가 노드를 고른다. 대상은 온라인 상태이고, 유지보수 모드가 아니며, 디스크가 있는 풀에 접근할 수 있고, NIC가 쓰는 네트워크의 브리지가 있는(VLAN을 쓰면 VLAN-aware인) 노드다. 이 중 미할당 메모리가 가장 많은 노드를 선택한다. 선택 결과는 `spec.node`에 기록한다. 리소스 오버커밋 정책과 DRS급 재배치는 범위 밖이다.
 
 ## 4. API
 
@@ -190,7 +190,7 @@ trait Hypervisor: Send + Sync {
 
 | 구현 | 플랫폼 | 용도 |
 |---|---|---|
-| `QemuHypervisor` | Linux(KVM), macOS(hvf) — `HostProfile`로 구분 | 제품, 개발·통합 테스트 |
+| `QemuHypervisor` | Linux(KVM, 없으면 TCG), macOS(hvf) — `HostProfile`로 구분 | 제품, 개발·통합 테스트 |
 | `MockHypervisor` | 전체 | 단위·컴포넌트 테스트, 장애 주입(`fail_next_start`, `crash`, `guest_shutdown`) |
 
 QEMU 커맨드라인 생성은 순수 함수 `fn build_cmdline(&VmRuntimeSpec, &HostProfile, &RuntimePaths) -> Result<Vec<String>, CmdlineError>`로 만들고, `insta` 스냅샷으로 검증한다.
@@ -209,7 +209,7 @@ QEMU 커맨드라인 생성은 순수 함수 `fn build_cmdline(&VmRuntimeSpec, &
 
 ### 5.4 opld 재시작과 크래시 복구
 
-- QEMU는 `-daemonize`로 실행해 `opld`와 세션을 분리한다(Proxmox와 같은 방식). 초기화에 실패하면 부모 프로세스의 종료 코드와 stderr로 바로 알 수 있다. Linux에서 cgroup 자원 제어를 위해 `systemd-run --scope`로 감싸는 것은 M7에서 추가한다.
+- QEMU는 `-daemonize`로 실행해 `opld`와 세션을 분리한다(Proxmox와 같은 방식). 초기화에 실패하면 부모 프로세스의 종료 코드와 stderr로 바로 알 수 있다. Linux에서는 `systemd-run --scope --unit=opl-vm-<id>`로 감싸 VM마다 cgroup을 나눈다(`[hypervisor] systemd_scope`, systemd가 없는 환경에서는 끈다). cgroup 자원 제한은 아직 걸지 않는다.
 - 런타임 파일은 `/run/opl/vm/{uuid}/`(macOS는 설정한 run_dir) 아래에 `qmp.sock`, `vnc.sock`, `qemu.pid`로 둔다. UEFI 변수처럼 재부팅 후에도 남아야 하는 파일은 `/var/lib/opl/vm/{uuid}/uefi-vars.fd`에 둔다. 라이브 마이그레이션(하위 프로젝트 4)에서 공유 스토리지로 옮기는 것을 다시 검토한다.
 - VM마다 모니터 태스크가 QMP 이벤트를 지켜본다. `SHUTDOWN` 이벤트 뒤에 연결이 끊기면 정상 종료(`Stopped`), 이벤트 없이 끊기면 `Crashed`로 판정하고 런타임 디렉터리를 정리한다.
 - `opld`가 시작되면 런타임 디렉터리를 훑어 살아 있는 QEMU에 QMP로 다시 연결한다. 그 뒤 Raft의 원하는 상태와 비교해 조정한다.
@@ -243,8 +243,10 @@ trait Storage: Send + Sync {
 
 ## 7. 네트워크 (1차)
 
-- `user`: QEMU user-mode NAT. macOS 개발과 데모용이다.
-- `bridge`: 관리자가 미리 만든 Linux 브리지에 tap 장치를 연결한다. VLAN 태그는 선택 사항이다.
+- `user`: QEMU user-mode NAT. macOS 개발과 데모용이다. 리소스 없이 예약된 이름으로 쓴다.
+- 브리지 네트워크(`Network` 리소스): 관리자가 미리 만든 Linux 브리지에 tap 장치를 연결한다. VLAN 태그는 선택 사항이고, 쓰려면 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다. tap은 그 VLAN만 태그 없이 주고받는다(pvid untagged, 브리지 기본 VLAN 제거).
+- tap은 opld가 QEMU를 띄우기 전에 iproute2(`ip`, `bridge`)로 만들고, QEMU가 끝나면(정상 종료, 크래시, 강제 종료, 기동 실패) 지운다. 이름은 VM id의 뒷부분과 NIC 순번(`op<10자리>n<순번>`, 15자 이하)이라 opld가 다시 시작해도 VM의 tap을 찾을 수 있다. 그래서 Linux의 opld는 root(CAP_NET_ADMIN)로 돈다. VM 하나의 NIC는 16개까지다.
+- 노드는 브리지 목록을 시작할 때와 1분마다 알리고(바뀔 때만 기록), 스케줄러가 쓴다.
 - 브리지 생성과 관리, SDN, 방화벽은 하위 프로젝트 6에서 다룬다.
 
 ## 8. 클러스터 부트스트랩과 보안
@@ -278,10 +280,11 @@ HA와 펜싱, 라이브 마이그레이션, 스냅샷과 백업, 공유 스토�
 | 단위 | 커맨드라인 생성, QMP 파싱, 스케줄러, 상태 머신 적용 | `cargo test`, `insta` | macOS, CI |
 | 컴포넌트 | reconciler + Mock 드라이버: 이벤트 누락·중복·순서 바뀜 | tokio 테스트, 짧게 줄인 시간 설정 | macOS, CI |
 | 클러스터 | 한 프로세스 안의 3노드(인메모리 네트워크), 리더 장애, 네트워크 분할 | openraft 테스트 하네스 | macOS, CI |
-| 통합 | 실제 QEMU: 기동, QMP, 종료, opld 재시작 후 재연결 | `--features qemu-it` | macOS(hvf), Linux |
+| 통합 | 실제 QEMU: 기동, QMP, 종료, opld 재시작 후 재연결 | `--features qemu-it` | macOS(hvf), Linux(KVM/TCG) |
+| 통합 | 실제 tap·브리지·VLAN, QEMU NIC 연결과 정리, systemd 스코프 | `--features qemu-it,net-it`(root), `OPL_TEST_SYSTEMD=1` | Linux |
 | E2E | oplctl로 VM 생성 → 콘솔 → opld kill -9 → 재연결 (opld 프로세스 + oplctl 라이브러리) | `--features qemu-it` | macOS(hvf) (M5) |
 | E2E | oplctl로 클러스터 구성 → 아무 노드로 쓰기 → 리더 kill -9 → 노드 제거·탈퇴·재합류 (opld 프로세스 3개) | `cargo test` | macOS, CI (M6) |
-| E2E | oplctl로 클러스터 구성 → VM 생성 → 콘솔 → 노드 제거 | 셸 스크립트 + 소형 게스트 이미지 | Linux (M7) |
+| E2E | oplctl로 네트워크 생성 → 브리지 NIC VM 시작 → tap·VLAN 확인 → 끄면 tap 제거, 위 E2E를 Linux에서 | `--features qemu-it,net-it`(root) | Linux: Docker 컨테이너(TCG), CI(KVM) (M7) |
 
 반드시 회귀 테스트로 고정할 불변식:
 
@@ -303,7 +306,7 @@ HA와 펜싱, 라이브 마이그레이션, 스냅샷과 백업, 공유 스토�
 | M6 | 클러스터 부트스트랩: CA, join, leave, mTLS | macOS에서 프로세스 3개로 클러스터 구성 |
 | M7 | `QemuKvm` + bridge 네트워크 | Linux에서 E2E 통과 |
 
-M0부터 M6까지는 macOS에서 진행한다. M7은 Linux/KVM 환경이 필요하다.
+M0부터 M6까지는 macOS에서 진행한다. M7은 Linux에서 확인한다. 개발 Mac(M1)은 중첩 가상화가 없어 로컬은 privileged Docker 컨테이너에서 TCG로, KVM은 CI(GitHub Linux 러너)에서 확인한다.
 
 ## 12. 주요 의존성
 
