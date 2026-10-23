@@ -1,4 +1,4 @@
-import type { Vm } from "@/api/types";
+import type { Task, Vm } from "@/api/types";
 
 /** 테스트용 VM. 필요한 필드만 바꿔 쓴다. */
 export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm> = {}): Vm {
@@ -25,12 +25,12 @@ export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm
 
 export const NODE = { id: "n1", name: "node-a" };
 
-export function task(id: string, kind: string, target: string) {
+export function task(id: string, kind: Task["spec"]["op"]["kind"], target: string): Task {
   return {
     id,
     name: id,
     revision: 1,
     spec: { op: { kind }, target, node: "n1" },
     status: { state: "pending", error: null },
-  };
+  } as Task;
 }

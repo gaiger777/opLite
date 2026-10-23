@@ -14,6 +14,7 @@ import { LoginPage } from "@/pages/LoginPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { TasksPage } from "@/tasks/TasksPage";
 import { TaskToasts } from "@/tasks/TaskToasts";
+import { VmDetailPage } from "@/vms/VmDetailPage";
 import { VmListPage } from "@/vms/VmListPage";
 
 function routes() {
@@ -32,6 +33,7 @@ function routes() {
           children: [
             { index: true, element: <DashboardPage /> },
             { path: "vms", element: <VmListPage /> },
+            { path: "vms/:name", element: <VmDetailPage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],

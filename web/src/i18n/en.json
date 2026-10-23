@@ -121,6 +121,39 @@
       "reboot": "Reboot",
       "console": "Console",
       "delete": "Delete"
-    }
+    },
+    "notFound": "There is no VM {{name}}",
+    "backToList": "Back to virtual machines",
+    "tab": {
+      "summary": "Summary",
+      "hardware": "Hardware",
+      "tasks": "Tasks",
+      "json": "JSON"
+    },
+    "cpu": "CPU",
+    "cpuValue": "{{sockets}} × {{cores}} cores ({{model}})",
+    "firmware": "Firmware",
+    "machine": "Machine type",
+    "restart": "Restart policy",
+    "power": "Desired power",
+    "pid": "QEMU PID",
+    "created": "Created",
+    "lastError": "Last error",
+    "restartPolicy": {
+      "never": "Never",
+      "on-failure": "On failure"
+    },
+    "powerState": {
+      "running": "Running",
+      "stopped": "Stopped"
+    },
+    "disks": "Disks",
+    "volume": "Volume",
+    "bus": "Bus",
+    "bootOrder": "Boot order",
+    "nics": "Network interfaces",
+    "network": "Network",
+    "model": "Model",
+    "mac": "MAC address"
   }
 }

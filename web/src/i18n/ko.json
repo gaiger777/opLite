@@ -121,6 +121,39 @@
       "reboot": "재시작",
       "console": "콘솔",
       "delete": "삭제"
-    }
+    },
+    "notFound": "{{name}} VM이 없습니다",
+    "backToList": "가상 머신 목록으로",
+    "tab": {
+      "summary": "요약",
+      "hardware": "하드웨어",
+      "tasks": "작업",
+      "json": "JSON"
+    },
+    "cpu": "CPU",
+    "cpuValue": "{{sockets}} × {{cores}}코어 ({{model}})",
+    "firmware": "펌웨어",
+    "machine": "머신 타입",
+    "restart": "재시작 정책",
+    "power": "원하는 전원 상태",
+    "pid": "QEMU PID",
+    "created": "만든 시각",
+    "lastError": "마지막 오류",
+    "restartPolicy": {
+      "never": "하지 않음",
+      "on-failure": "실패하면"
+    },
+    "powerState": {
+      "running": "켜짐",
+      "stopped": "꺼짐"
+    },
+    "disks": "디스크",
+    "volume": "볼륨",
+    "bus": "버스",
+    "bootOrder": "부팅 순서",
+    "nics": "네트워크 인터페이스",
+    "network": "네트워크",
+    "model": "모델",
+    "mac": "MAC 주소"
   }
 }
