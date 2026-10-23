@@ -73,8 +73,8 @@ oplctl network create lan --bridge vmbr0 --vlan 10   # VLAN 10을 태그 없이 
 oplctl vm create web --memory 1024 --disk root --nic lan --start
 ```
 
-브리지를 쓰는 VM은 그 브리지가 있는 노드에만 배치된다. 노드는 브리지 목록을 시작할 때와
-1분마다 알린다.
+브리지를 쓰는 VM은 그 브리지가 있는 노드에만 배치된다(`--node`로 노드를 직접 정하면 확인하지 않는다).
+노드는 브리지 목록을 시작할 때와 1분마다 알린다.
 
 ## 개발
 
@@ -91,8 +91,9 @@ cargo test -p opl-api --features storage-it --test volumes          # API: 볼�
 cargo test -p opld --features qemu-it --test e2e                    # E2E: CLI → VM → 콘솔 → kill -9 → 재연결
 cargo test -p opld --test cluster                                   # E2E: opld 프로세스 3개로 클러스터 구성
 # Linux, root: 실제 tap과 브리지
-sudo -E env "PATH=$PATH" cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN
-sudo -E env "PATH=$PATH" cargo test -p opld --features qemu-it,net-it --test bridge  # E2E: 브리지 네트워크
+# root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opld --features qemu-it,net-it --test bridge  # E2E: 브리지 네트워크
 ```
 
 systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트가 systemd 스코프로 돈다(CI의

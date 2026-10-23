@@ -41,6 +41,7 @@ jobs:
   # QEMU는 systemd 스코프로 감싼다(OPL_TEST_SYSTEMD).
   linux-kvm:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

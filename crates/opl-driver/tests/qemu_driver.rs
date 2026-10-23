@@ -311,7 +311,7 @@ async fn qemu_runs_in_its_own_systemd_scope() {
         "{cgroup}"
     );
     hv.stop(vm.id, StopMode::Force).await.unwrap();
-    // 스코프는 QEMU가 끝나면 사라지므로 같은 VM을 다시 시작할 수 있다.
+    // 끝난 스코프가 아직 남아 있어도 시작 전에 지우므로 곧바로 다시 시작할 수 있다.
     hv.start(&vm).await.unwrap();
     hv.stop(vm.id, StopMode::Force).await.unwrap();
 }
