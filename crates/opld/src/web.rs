@@ -14,16 +14,18 @@ use rust_embed::RustEmbed;
 /// 웹 UI가 붙는 응답의 보안 헤더. 스크립트와 연결은 같은 출처로만, 다른 사이트의 frame 안에는 뜨지 않는다.
 /// 일부 UI 컴포넌트가 style 속성을 쓰므로 인라인 스타일은 허용하고, noVNC 커서는 `data:` 이미지다.
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-                   img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'";
+                   img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; \
+                   base-uri 'none'; form-action 'self'";
 
 /// 파일 이름에 내용 해시가 들어간 Vite 빌드 결과
 const ASSETS: &str = "assets/";
 
 #[cfg(feature = "web-ui")]
 #[derive(RustEmbed)]
-#[folder = "../../web/dist"]
+#[folder = "$OPL_WEB_DIST"]
 // 디버그 빌드(테스트, clippy)는 UI를 빌드하지 않아도 되고 안내 페이지를 준다. 릴리스 빌드에서
-// 빠뜨리면 컴파일 오류다. 디버그 빌드는 파일을 실행 중에 디스크에서 읽는다.
+// 빠뜨리면 컴파일 오류다. 디버그 빌드는 파일을 실행 중에 디스크에서 읽으므로, 나중에 만든 dist도
+// 보인다. 경로는 build.rs가 `..` 없이 넘긴다.
 #[cfg_attr(debug_assertions, allow_missing = true)]
 struct Dist;
 
@@ -79,7 +81,13 @@ fn reject(method: &Method, uri: &Uri) -> Option<Response> {
         return Some(ApiError::not_found(format!("no API at {path}")).into_response());
     }
     if method != Method::GET && method != Method::HEAD {
-        return Some(StatusCode::METHOD_NOT_ALLOWED.into_response());
+        return Some(
+            (
+                StatusCode::METHOD_NOT_ALLOWED,
+                [(header::ALLOW, "GET, HEAD")],
+            )
+                .into_response(),
+        );
     }
     None
 }
@@ -90,7 +98,10 @@ fn file_response(path: &str, file: EmbeddedFile) -> Response {
     } else {
         "no-cache"
     };
-    let mime = file.metadata.mimetype().to_string();
+    let mime = match file.metadata.mimetype() {
+        "text/html" => "text/html; charset=utf-8".to_string(),
+        other => other.to_string(),
+    };
     let mut r = Response::new(Body::from(file.data.into_owned()));
     let h = r.headers_mut();
     h.insert(
@@ -150,7 +161,7 @@ mod tests {
         let (status, h, body) = get(serve(Fixture::get), "GET", "/").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("fixture index"), "{body}");
-        assert_eq!(h["content-type"], "text/html");
+        assert_eq!(h["content-type"], "text/html; charset=utf-8");
         assert_eq!(h["cache-control"], "no-cache");
         assert_eq!(h["content-security-policy"], CSP);
         assert_eq!(h["x-content-type-options"], "nosniff");
@@ -184,8 +195,12 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["code"], "not_found");
         }
-        let (status, _, _) = get(serve(Fixture::get), "POST", "/vms").await;
+        let (status, h, _) = get(serve(Fixture::get), "POST", "/vms").await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(h["allow"], "GET, HEAD");
+        let (status, h, _) = get(serve(Fixture::get), "HEAD", "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h["content-security-policy"], CSP);
     }
 
     #[tokio::test]

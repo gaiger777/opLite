@@ -11,6 +11,8 @@ allow = [
     "Unicode-3.0",
 ]
 confidence-threshold = 0.9
+# rust-embed의 폴더 경로 치환(빌드할 때만 쓰는 proc-macro)이 끌어온다. 바이너리에는 들어가지 않는다.
+exceptions = [{ allow = ["MPL-2.0"], crate = "option-ext" }]
 
 [bans]
 multiple-versions = "warn"
