@@ -14,6 +14,9 @@ const MAX_BOOT_ORDER = 255;
 const NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAC = /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/i;
+/** `/volumes/import` 경로와 겹쳐 서버가 볼륨 이름으로 받지 않는다. */
+export const RESERVED_VOLUME = "import";
+const GIB = 1024 ** 3;
 
 export interface DiskRow {
   /** 있는 볼륨을 붙이거나, 만들기 전에 새 빈 볼륨을 만든다. */
@@ -116,6 +119,15 @@ export function validName(name: string): boolean {
   return NAME.test(name) && !UUID.test(name);
 }
 
+/** GiB 입력을 바이트로. 숫자가 아니거나 양의 안전한 정수가 되지 않으면 undefined */
+export function gibToBytes(text: string): number | undefined {
+  if (!/^\d+(\.\d+)?$/.test(text)) {
+    return undefined;
+  }
+  const bytes = Math.round(Number(text) * GIB);
+  return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : undefined;
+}
+
 /** `min`부터 `max`까지의 정수인지 */
 function intIn(value: string, min: number, max: number): boolean {
   const n = Number(value);
@@ -150,6 +162,8 @@ export function validate(
       errors[`disks.${i}.volume`] = "vmForm.errors.volume";
     } else if (names.has(d.volume)) {
       errors[`disks.${i}.volume`] = "vmForm.errors.volumeDuplicate";
+    } else if (d.kind === "new" && d.volume === RESERVED_VOLUME) {
+      errors[`disks.${i}.volume`] = "volumes.errors.reserved";
     } else if (d.kind === "new" && volumes.includes(d.volume)) {
       errors[`disks.${i}.volume`] = "vmForm.errors.volumeExists";
     }
@@ -157,7 +171,7 @@ export function validate(
     if (d.kind === "new" && !d.pool) {
       errors[`disks.${i}.pool`] = "vmForm.errors.pool";
     }
-    if (d.kind === "new" && !(Number(d.sizeGib) > 0)) {
+    if (d.kind === "new" && gibToBytes(d.sizeGib) === undefined) {
       errors[`disks.${i}.size`] = "vmForm.errors.size";
     }
     if (d.bootOrder !== "") {

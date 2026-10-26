@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
@@ -99,6 +99,24 @@ it("changes a role and shows why the server refused", async () => {
     "The last administrator cannot give up the administrator role.",
   );
   expect(sent).toEqual([{ role: "viewer" }]);
+});
+
+it("returns focus to the row menu after cancelling a dialog", async () => {
+  users([ME, KIM]);
+  renderPage(<UsersPage />);
+  const trigger = await screen.findByRole("button", { name: "Actions for kim" });
+  await userEvent.click(trigger);
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Change role" }));
+  const dialog = await screen.findByRole("dialog", { name: "Change the role of kim" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(trigger).toHaveFocus());
+
+  await userEvent.click(trigger);
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Delete" }));
+  await userEvent.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Cancel" }),
+  );
+  await waitFor(() => expect(trigger).toHaveFocus());
 });
 
 it("resets another user's password", async () => {

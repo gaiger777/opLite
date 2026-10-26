@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
@@ -21,6 +21,7 @@ export function FormDialog({
   description,
   submitLabel,
   destructive = false,
+  returnFocus,
   onClose,
   onSubmit,
   children,
@@ -29,6 +30,8 @@ export function FormDialog({
   description?: string;
   submitLabel: string;
   destructive?: boolean;
+  /** 닫으면 포커스를 돌려줄 곳. 메뉴에서 열면 메뉴 항목이 사라지므로 메뉴 버튼을 준다. */
+  returnFocus?: RefObject<HTMLElement | null>;
   onClose(): void;
   /** 보낸다. 입력 오류로 보내지 않았으면 false를 돌려준다(열어 둔다). 실패하면 던진다. */
   onSubmit(): Promise<boolean | void>;
@@ -37,9 +40,15 @@ export function FormDialog({
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // busy는 다음 그리기 뒤에야 버튼을 막으므로 같은 틱의 두 번째 제출은 이것으로 막는다.
+  const inFlight = useRef(false);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -49,13 +58,17 @@ export function FormDialog({
     } catch (err) {
       setError(errorMessage(t, err));
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   }
 
   return (
     <Dialog open onOpenChange={(open) => !open && !busy && onClose()}>
-      <DialogContent {...(description ? {} : { "aria-describedby": undefined })}>
+      <DialogContent
+        {...(description ? {} : { "aria-describedby": undefined })}
+        onCloseAutoFocus={(e) => focusBack(e, returnFocus)}
+      >
         <form noValidate onSubmit={(e) => void submit(e)} className="flex flex-col gap-4">
           <DialogHeader>
             <DialogTitle>{title}</DialogTitle>
@@ -81,4 +94,13 @@ export function FormDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+/** 닫힐 때 `returnFocus`가 아직 화면에 있으면 그리로 포커스를 돌린다. */
+export function focusBack(e: Event, returnFocus?: RefObject<HTMLElement | null>) {
+  const target = returnFocus?.current;
+  if (target?.isConnected) {
+    e.preventDefault();
+    target.focus();
+  }
 }

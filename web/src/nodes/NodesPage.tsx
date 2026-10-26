@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { MoreHorizontal } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -43,6 +43,11 @@ export function NodesPage() {
   const vms = useList("vm");
   const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
   const [removing, setRemoving] = useState<Node | null>(null);
+  // 메뉴에서 연 대화상자를 닫으면 메뉴 항목이 사라지므로, 메뉴를 연 버튼으로 포커스를 돌린다.
+  const trigger = useRef<HTMLButtonElement | null>(null);
+  const rememberTrigger = (e: React.SyntheticEvent<HTMLButtonElement>) => {
+    trigger.current = e.currentTarget;
+  };
   const write = can(me.role, "write", "node");
 
   async function setMaintenance(node: Node, maintenance: boolean) {
@@ -123,6 +128,8 @@ export function NodesPage() {
                         variant="ghost"
                         size="icon-sm"
                         aria-label={t("vms.actionsFor", { name: node.name })}
+                        onPointerDown={rememberTrigger}
+                        onKeyDown={rememberTrigger}
                       >
                         <MoreHorizontal />
                       </Button>
@@ -160,6 +167,7 @@ export function NodesPage() {
         description={t("nodes.removeDescription")}
         confirmLabel={t("nodes.remove")}
         typeToConfirm={removing?.name}
+        returnFocus={trigger}
         onConfirm={async () => {
           const node = removing!;
           await call(api.DELETE("/nodes/{key}", { params: { path: { key: node.id } } }));

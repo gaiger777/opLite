@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { MoreHorizontal, Plus } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -10,7 +10,7 @@ import { api, call } from "@/api/client";
 import type { components } from "@/api/schema";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { Field } from "@/components/Field";
+import { Field, type FieldA11y } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
@@ -60,6 +60,11 @@ export function UsersPage() {
   const queryClient = useQueryClient();
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const close = () => setDialog(null);
+  // 메뉴에서 연 대화상자를 닫으면 메뉴 항목이 사라지므로, 메뉴를 연 버튼으로 포커스를 돌린다.
+  const trigger = useRef<HTMLButtonElement | null>(null);
+  const rememberTrigger = (e: React.SyntheticEvent<HTMLButtonElement>) => {
+    trigger.current = e.currentTarget;
+  };
   const changed = () => queryClient.invalidateQueries({ queryKey: ["users"] });
 
   return (
@@ -106,6 +111,8 @@ export function UsersPage() {
                         variant="ghost"
                         size="icon-sm"
                         aria-label={t("vms.actionsFor", { name: user.name })}
+                        onPointerDown={rememberTrigger}
+                        onKeyDown={rememberTrigger}
                       >
                         <MoreHorizontal />
                       </Button>
@@ -138,15 +145,18 @@ export function UsersPage() {
       </Table>
       {dialog?.kind === "create" && <CreateUserDialog onClose={close} onDone={changed} />}
       {dialog?.kind === "role" && (
-        <RoleDialog user={dialog.user} onClose={close} onDone={changed} />
+        <RoleDialog user={dialog.user} returnFocus={trigger} onClose={close} onDone={changed} />
       )}
-      {dialog?.kind === "password" && <ResetPasswordDialog user={dialog.user} onClose={close} />}
+      {dialog?.kind === "password" && (
+        <ResetPasswordDialog user={dialog.user} returnFocus={trigger} onClose={close} />
+      )}
       <ConfirmDialog
         open={dialog?.kind === "delete"}
         onOpenChange={(open) => !open && close()}
         title={t("users.deleteTitle", { name: dialog?.kind === "delete" ? dialog.user.name : "" })}
         description={t("users.deleteDescription")}
         confirmLabel={t("users.delete")}
+        returnFocus={trigger}
         onConfirm={async () => {
           if (dialog?.kind !== "delete") {
             return;
@@ -161,7 +171,15 @@ export function UsersPage() {
   );
 }
 
-function RoleSelect({ value, onChange }: { value: Role; onChange(role: Role): void }) {
+function RoleSelect({
+  value,
+  onChange,
+  a11y,
+}: {
+  value: Role;
+  onChange(role: Role): void;
+  a11y: FieldA11y;
+}) {
   const { t } = useTranslation();
   return (
     <NativeSelect
@@ -169,6 +187,7 @@ function RoleSelect({ value, onChange }: { value: Role; onChange(role: Role): vo
       className="w-full"
       value={value}
       onChange={(e) => onChange(e.target.value as Role)}
+      {...a11y}
     >
       {ROLES.map((role) => (
         <NativeSelectOption key={role} value={role}>
@@ -220,7 +239,7 @@ function CreateUserDialog({ onClose, onDone }: { onClose(): void; onDone(): Prom
         )}
       </Field>
       <Field id="user-role" label={t("users.role")} hint={t("users.roleHint")}>
-        <RoleSelect value={role} onChange={setRole} />
+        {(a11y) => <RoleSelect value={role} onChange={setRole} a11y={a11y} />}
       </Field>
       <PasswordFields
         id="user"
@@ -236,10 +255,12 @@ function CreateUserDialog({ onClose, onDone }: { onClose(): void; onDone(): Prom
 
 function RoleDialog({
   user,
+  returnFocus,
   onClose,
   onDone,
 }: {
   user: User;
+  returnFocus: RefObject<HTMLElement | null>;
   onClose(): void;
   onDone(): Promise<void>;
 }) {
@@ -256,17 +277,26 @@ function RoleDialog({
     <FormDialog
       title={t("users.roleTitle", { name: user.name })}
       submitLabel={t("users.save")}
+      returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}
     >
       <Field id="user-role" label={t("users.role")} hint={t("users.roleHint")}>
-        <RoleSelect value={role} onChange={setRole} />
+        {(a11y) => <RoleSelect value={role} onChange={setRole} a11y={a11y} />}
       </Field>
     </FormDialog>
   );
 }
 
-function ResetPasswordDialog({ user, onClose }: { user: User; onClose(): void }) {
+function ResetPasswordDialog({
+  user,
+  returnFocus,
+  onClose,
+}: {
+  user: User;
+  returnFocus: RefObject<HTMLElement | null>;
+  onClose(): void;
+}) {
   const { t } = useTranslation();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -287,6 +317,7 @@ function ResetPasswordDialog({ user, onClose }: { user: User; onClose(): void })
       title={t("users.passwordTitle", { name: user.name })}
       description={t("users.passwordDescription")}
       submitLabel={t("users.save")}
+      returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}
     >

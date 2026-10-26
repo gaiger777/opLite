@@ -31,3 +31,9 @@ it("formats byte counts", () => {
   expect(formatBytes(1.5 * 1024 ** 3)).toBe("1.5 GiB");
   expect(formatBytes(64 * 1024 ** 4)).toBe("64 TiB");
 });
+
+it("moves to the next unit when rounding reaches 1024", () => {
+  expect(formatBytes(1048570)).toBe("1 MiB");
+  expect(formatBytes(1024 ** 3 - 1)).toBe("1 GiB");
+  expect(formatBytes(1023)).toBe("1023 B");
+});

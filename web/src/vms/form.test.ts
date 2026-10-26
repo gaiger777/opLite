@@ -1,5 +1,13 @@
 import { NODE, vm } from "@/test/fixtures";
-import { defaultMachine, emptyDisk, emptyForm, fromVm, toSpec, validate } from "@/vms/form";
+import {
+  defaultMachine,
+  emptyDisk,
+  emptyForm,
+  fromVm,
+  gibToBytes,
+  toSpec,
+  validate,
+} from "@/vms/form";
 
 it("checks values the server would reject", () => {
   const v = {
@@ -85,5 +93,41 @@ it("checks volume names across disks and against existing volumes", () => {
     "disks.0.volume": "vmForm.errors.volumeChoose",
     "disks.2.volume": "vmForm.errors.volumeDuplicate",
     "disks.3.volume": "vmForm.errors.volumeExists",
+  });
+});
+
+it("rejects the reserved volume name for new disks", () => {
+  const v = {
+    ...emptyForm("q35"),
+    name: "web",
+    disks: [{ ...emptyDisk("web", 0), volume: "import", pool: "local" }],
+  };
+  expect(validate(v, true)).toEqual({ "disks.0.volume": "volumes.errors.reserved" });
+});
+
+it("turns GiB into a whole number of bytes", () => {
+  expect(gibToBytes("16")).toBe(16 * 1024 ** 3);
+  expect(gibToBytes("1.5")).toBe(1.5 * 1024 ** 3);
+  for (const bad of [
+    "",
+    "0",
+    "-1",
+    "1e-10",
+    "0.0000000001",
+    "1e3",
+    "0x10",
+    "Infinity",
+    " 1",
+    "99999999",
+  ]) {
+    expect(gibToBytes(bad)).toBeUndefined();
+  }
+  const v = {
+    ...emptyForm("q35"),
+    name: "web",
+    disks: [{ ...emptyDisk("web", 0), pool: "local" }],
+  };
+  expect(validate({ ...v, disks: [{ ...v.disks[0]!, sizeGib: "1e3" }] }, true)).toEqual({
+    "disks.0.size": "vmForm.errors.size",
   });
 });

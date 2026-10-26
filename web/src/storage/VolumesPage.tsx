@@ -29,8 +29,7 @@ import { formatBytes } from "@/lib/format";
 import { UploadDialog } from "@/storage/UploadDialog";
 import { volumeNameError } from "@/storage/volumes";
 import { trackTask } from "@/tasks/tasks";
-
-const GIB = 1024 ** 3;
+import { gibToBytes } from "@/vms/form";
 
 export function VolumesPage() {
   const { t } = useTranslation();
@@ -183,7 +182,8 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
     if (!pool) {
       found.pool = "vmForm.errors.pool";
     }
-    if (!(Number(sizeGib) > 0)) {
+    const size = gibToBytes(sizeGib);
+    if (size === undefined) {
       found.size = "vmForm.errors.size";
     }
     setErrors(found);
@@ -192,7 +192,7 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
     }
     const task = await call(
       api.POST("/volumes", {
-        body: { name, spec: { pool, size_bytes: Math.round(Number(sizeGib) * GIB), format } },
+        body: { name, spec: { pool, size_bytes: size!, format } },
       }),
     );
     trackTask(task, t("tasks.op.volume-create", { target: name }));

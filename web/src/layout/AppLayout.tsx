@@ -19,7 +19,7 @@ import {
   Users,
   type LucideIcon,
 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NavLink, Outlet } from "react-router";
 
@@ -173,12 +173,13 @@ function UserMenu() {
   const { logout } = useAuth();
   const me = usePrincipal();
   const [changing, setChanging] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
   return (
     <>
       {/* 메뉴에서 대화상자를 열므로 모달로 두지 않는다(닫힌 메뉴가 화면 클릭을 막지 않게). */}
       <DropdownMenu modal={false}>
         <DropdownMenuTrigger asChild>
-          <Button variant="ghost" aria-label={`${t("header.account")} (${me.name})`}>
+          <Button ref={trigger} variant="ghost" aria-label={`${t("header.account")} (${me.name})`}>
             <User />
             <span className="hidden sm:inline">{me.name}</span>
           </Button>
@@ -198,7 +199,9 @@ function UserMenu() {
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      {changing && <ChangePasswordDialog onClose={() => setChanging(false)} />}
+      {changing && (
+        <ChangePasswordDialog returnFocus={trigger} onClose={() => setChanging(false)} />
+      )}
     </>
   );
 }

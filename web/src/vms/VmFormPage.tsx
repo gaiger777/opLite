@@ -24,6 +24,7 @@ import {
   emptyDisk,
   emptyForm,
   fromVm,
+  gibToBytes,
   MAX_NICS,
   type NicRow,
   toSpec,
@@ -31,8 +32,6 @@ import {
   type VmFormValues,
 } from "@/vms/form";
 import { useVmByName } from "@/vms/VmDetailPage";
-
-const GIB = 1024 ** 3;
 
 export function VmCreatePage() {
   const nodes = useList("node");
@@ -138,7 +137,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
                 name: disk.volume,
                 spec: {
                   pool: disk.pool,
-                  size_bytes: Math.round(Number(disk.sizeGib) * GIB),
+                  size_bytes: gibToBytes(disk.sizeGib)!,
                   format: "qcow2",
                 },
               },

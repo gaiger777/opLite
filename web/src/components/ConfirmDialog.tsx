@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useId, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -10,6 +10,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { focusBack } from "@/components/FormDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -23,6 +24,8 @@ interface Props {
   confirmLabel: string;
   /** 주면 이 이름을 그대로 입력해야 진행한다(되돌릴 수 없는 삭제). */
   typeToConfirm?: string;
+  /** 닫으면 포커스를 돌려줄 곳(메뉴에서 열었으면 메뉴 버튼) */
+  returnFocus?: RefObject<HTMLElement | null>;
   /** 실패하면 던진다. 대화상자가 오류를 보여 준다. */
   onConfirm(): Promise<void>;
 }
@@ -64,7 +67,7 @@ export function ConfirmDialog(props: Props) {
 
   return (
     <AlertDialog open={props.open} onOpenChange={openChange}>
-      <AlertDialogContent>
+      <AlertDialogContent onCloseAutoFocus={(e) => focusBack(e, props.returnFocus)}>
         <AlertDialogHeader>
           <AlertDialogTitle>{props.title}</AlertDialogTitle>
           <AlertDialogDescription>{props.description}</AlertDialogDescription>

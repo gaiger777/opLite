@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -14,7 +14,13 @@ import { Input } from "@/components/ui/input";
  * 내 비밀번호를 바꾼다. 서버는 현재 비밀번호를 확인하고(훔친 세션으로 계정을 빼앗지 못하게), 바꾸면 내
  * 세션을 모두 끝낸다. 그래서 바꾼 뒤에는 로그아웃하고 새 비밀번호로 다시 로그인하게 한다.
  */
-export function ChangePasswordDialog({ onClose }: { onClose(): void }) {
+export function ChangePasswordDialog({
+  returnFocus,
+  onClose,
+}: {
+  returnFocus?: RefObject<HTMLElement | null>;
+  onClose(): void;
+}) {
   const { t } = useTranslation();
   const me = usePrincipal();
   const { logout } = useAuth();
@@ -56,6 +62,7 @@ export function ChangePasswordDialog({ onClose }: { onClose(): void }) {
       title={t("accounts.changePassword")}
       description={t("accounts.changePasswordDescription")}
       submitLabel={t("users.save")}
+      returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}
     >

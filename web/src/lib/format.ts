@@ -18,7 +18,8 @@ export function formatBytes(bytes: number): string {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let value = bytes;
   let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
+  // 반올림해서 1024가 되어도 다음 단위로 넘긴다(1024 KiB가 아니라 1 MiB).
+  while (+value.toFixed(1) >= 1024 && unit < units.length - 1) {
     value /= 1024;
     unit += 1;
   }

@@ -1,5 +1,5 @@
 import { MoreHorizontal } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 
@@ -24,6 +24,7 @@ export function VmMenu({ vm }: { vm: Vm }) {
   const navigate = useNavigate();
   const { run, remove } = useVmActions();
   const [confirm, setConfirm] = useState<"force-stop" | "delete" | null>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
   if (!operate && !write) {
@@ -35,6 +36,7 @@ export function VmMenu({ vm }: { vm: Vm }) {
       <DropdownMenu modal={false}>
         <DropdownMenuTrigger asChild>
           <Button
+            ref={trigger}
             variant="ghost"
             size="icon-sm"
             aria-label={t("vms.actionsFor", { name: vm.name })}
@@ -83,6 +85,7 @@ export function VmMenu({ vm }: { vm: Vm }) {
         onClose={() => setConfirm(null)}
         onRun={run}
         onRemove={remove}
+        returnFocus={trigger}
       />
     </>
   );
@@ -96,6 +99,7 @@ export function VmConfirm({
   onRun,
   onRemove,
   afterRemove,
+  returnFocus,
 }: {
   vm: Vm;
   which: "force-stop" | "delete" | null;
@@ -103,6 +107,7 @@ export function VmConfirm({
   onRun(vm: Vm, action: VmAction): Promise<void>;
   onRemove(vm: Vm): Promise<void>;
   afterRemove?(): void;
+  returnFocus?: RefObject<HTMLElement | null>;
 }) {
   const { t } = useTranslation();
   return (
@@ -113,6 +118,7 @@ export function VmConfirm({
         title={t("vms.forceStopTitle", { name: vm.name })}
         description={t("vms.forceStopDescription")}
         confirmLabel={t("vms.action.force-stop")}
+        returnFocus={returnFocus}
         onConfirm={() => onRun(vm, "force-stop")}
       />
       <ConfirmDialog
@@ -122,6 +128,7 @@ export function VmConfirm({
         description={t("vms.deleteDescription")}
         confirmLabel={t("vms.action.delete")}
         typeToConfirm={vm.name}
+        returnFocus={returnFocus}
         onConfirm={async () => {
           await onRemove(vm);
           afterRemove?.();
