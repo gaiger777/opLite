@@ -298,12 +298,18 @@
     "removed": "Removed {{name}} from the cluster."
   },
   "accounts": {
+    "currentPassword": "Current password",
+    "changePassword": "Change my password",
+    "changePasswordDescription": "All your sessions end. Sign in again with the new password.",
+    "passwordChanged": "Your password was changed. Sign in with the new password.",
     "newPassword": "New password",
     "confirmPassword": "Confirm the new password",
     "passwordHint": "At least 8 characters.",
     "errors": {
       "password": "Use at least 8 characters.",
-      "mismatch": "The passwords do not match."
+      "mismatch": "The passwords do not match.",
+      "current": "Enter your current password.",
+      "wrongCurrent": "The current password is wrong."
     }
   },
   "users": {

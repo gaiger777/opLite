@@ -7,6 +7,7 @@ import {
   Languages,
   LayoutDashboard,
   ListChecks,
+  Lock,
   LogOut,
   Monitor,
   Moon,
@@ -17,9 +18,11 @@ import {
   Users,
   type LucideIcon,
 } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NavLink, Outlet } from "react-router";
 
+import { ChangePasswordDialog } from "@/accounts/ChangePasswordDialog";
 import { api, call } from "@/api/client";
 import { useLiveStatus } from "@/api/LiveProvider";
 import { useAuth, usePrincipal } from "@/auth/AuthProvider";
@@ -167,24 +170,33 @@ function UserMenu() {
   const { t } = useTranslation();
   const { logout } = useAuth();
   const me = usePrincipal();
+  const [changing, setChanging] = useState(false);
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" aria-label={`${t("header.account")} (${me.name})`}>
-          <User />
-          <span className="hidden sm:inline">{me.name}</span>
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuLabel>
-          {me.name} · {t(`roles.${me.role}`)}
-        </DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void logout()}>
-          <LogOut />
-          {t("header.logout")}
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <>
+      {/* 메뉴에서 대화상자를 열므로 모달로 두지 않는다(닫힌 메뉴가 화면 클릭을 막지 않게). */}
+      <DropdownMenu modal={false}>
+        <DropdownMenuTrigger asChild>
+          <Button variant="ghost" aria-label={`${t("header.account")} (${me.name})`}>
+            <User />
+            <span className="hidden sm:inline">{me.name}</span>
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuLabel>
+            {me.name} · {t(`roles.${me.role}`)}
+          </DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => setChanging(true)}>
+            <Lock />
+            {t("accounts.changePassword")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void logout()}>
+            <LogOut />
+            {t("header.logout")}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {changing && <ChangePasswordDialog onClose={() => setChanging(false)} />}
+    </>
   );
 }

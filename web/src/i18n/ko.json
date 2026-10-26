@@ -298,12 +298,18 @@
     "removed": "{{name}}을(를) 클러스터에서 제거했습니다."
   },
   "accounts": {
+    "currentPassword": "현재 비밀번호",
+    "changePassword": "내 비밀번호 변경",
+    "changePasswordDescription": "내 세션이 모두 끝납니다. 새 비밀번호로 다시 로그인하세요.",
+    "passwordChanged": "비밀번호를 바꿨습니다. 새 비밀번호로 로그인하세요.",
     "newPassword": "새 비밀번호",
     "confirmPassword": "새 비밀번호 확인",
     "passwordHint": "8자 이상입니다.",
     "errors": {
       "password": "8자 이상으로 쓰세요.",
-      "mismatch": "두 비밀번호가 다릅니다."
+      "mismatch": "두 비밀번호가 다릅니다.",
+      "current": "현재 비밀번호를 입력하세요.",
+      "wrongCurrent": "현재 비밀번호가 틀렸습니다."
     }
   },
   "users": {
