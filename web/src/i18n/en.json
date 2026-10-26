@@ -204,7 +204,7 @@
     "deleteNamed": "Delete {{name}}",
     "deleteTitle": "Delete volume {{name}}?",
     "deleteDescription": "The disk image and all data on it are deleted.",
-    "inUse": "Attached to {{vm}}.",
+    "inUse": "Remove it from the VM first.",
     "errors": {
       "reserved": "The name import is reserved.",
       "exists": "A volume with this name already exists."
@@ -270,7 +270,7 @@
     "deleteTitle": "Delete network {{name}}?",
     "deleteDescription": "Only the network is removed. The bridges on the nodes are not changed.",
     "deleted": "Deleted network {{name}}.",
-    "inUse": "VMs use this network.",
+    "inUse": "Remove the VM interfaces first.",
     "errors": {
       "reserved": "The name user is reserved for NAT.",
       "bridge": "Use 1–15 characters without /, : or spaces.",
@@ -296,6 +296,7 @@
     "remove": "Remove from cluster",
     "removeTitle": "Remove {{name}} from the cluster?",
     "removeDescription": "Only for a node that is dead for good. It cannot rejoin with its current data, and VMs assigned to it stay assigned.",
+    "removeNote": "Only offline nodes can be removed here. To remove a live node, run oplctl cluster leave on it.",
     "removed": "Removed {{name}} from the cluster."
   },
   "accounts": {

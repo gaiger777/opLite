@@ -1,11 +1,11 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { MoreHorizontal } from "lucide-react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
-import { useList } from "@/api/live";
+import { applyEvent, listKey, useList, type List } from "@/api/live";
 import type { Node, Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
@@ -39,6 +39,7 @@ function vmCount(node: Node, vms: Vm[]): number {
 export function NodesPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
+  const queryClient = useQueryClient();
   const nodes = useList("node");
   const vms = useList("vm");
   const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
@@ -52,11 +53,16 @@ export function NodesPage() {
 
   async function setMaintenance(node: Node, maintenance: boolean) {
     try {
-      await call(
+      const updated = await call(
         api.PUT("/nodes/{key}", {
           params: { path: { key: node.id }, header: { "If-Match": node.revision } },
           body: { labels: node.labels, spec: { ...node.spec, maintenance } },
         }),
+      );
+      // watch 이벤트보다 먼저 반영한다(곧바로 다시 바꿔도 새 revision으로 보낸다).
+      queryClient.setQueryData<List<Node>>(
+        listKey("node"),
+        (list) => list && applyEvent(list, { type: "put", kind: "node", resource: updated }),
       );
       toast.success(
         t(maintenance ? "nodes.maintenanceOn" : "nodes.maintenanceOff", { name: node.name }),
@@ -160,6 +166,7 @@ export function NodesPage() {
         </TableBody>
       </Table>
       <p className="text-sm text-muted-foreground">{t("nodes.maintenanceNote")}</p>
+      <p className="text-sm text-muted-foreground">{t("nodes.removeNote")}</p>
       <ConfirmDialog
         open={removing !== null}
         onOpenChange={(open) => !open && setRemoving(null)}

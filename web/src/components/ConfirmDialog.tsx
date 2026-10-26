@@ -37,6 +37,11 @@ export function ConfirmDialog(props: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const inputId = useId();
+  // 닫히는 애니메이션 동안 부모가 대상을 비워도 마지막 제목과 이름을 그대로 보인다.
+  const [shown, setShown] = useState({ title: props.title, name: props.typeToConfirm });
+  if (props.open && (shown.title !== props.title || shown.name !== props.typeToConfirm)) {
+    setShown({ title: props.title, name: props.typeToConfirm });
+  }
   const ready = props.typeToConfirm === undefined || typed === props.typeToConfirm;
 
   function openChange(open: boolean) {
@@ -69,12 +74,12 @@ export function ConfirmDialog(props: Props) {
     <AlertDialog open={props.open} onOpenChange={openChange}>
       <AlertDialogContent onCloseAutoFocus={(e) => focusBack(e, props.returnFocus)}>
         <AlertDialogHeader>
-          <AlertDialogTitle>{props.title}</AlertDialogTitle>
+          <AlertDialogTitle>{shown.title}</AlertDialogTitle>
           <AlertDialogDescription>{props.description}</AlertDialogDescription>
         </AlertDialogHeader>
-        {props.typeToConfirm !== undefined && (
+        {shown.name !== undefined && (
           <div className="flex flex-col gap-2">
-            <Label htmlFor={inputId}>{t("confirm.typeName", { name: props.typeToConfirm })}</Label>
+            <Label htmlFor={inputId}>{t("confirm.typeName", { name: shown.name })}</Label>
             <Input
               id={inputId}
               autoComplete="off"

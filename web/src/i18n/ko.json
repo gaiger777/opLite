@@ -204,7 +204,7 @@
     "deleteNamed": "{{name}} 삭제",
     "deleteTitle": "볼륨 {{name}}을(를) 삭제할까요?",
     "deleteDescription": "디스크 이미지와 그 안의 데이터가 모두 지워집니다.",
-    "inUse": "{{vm}}에 붙어 있습니다.",
+    "inUse": "먼저 VM에서 빼세요.",
     "errors": {
       "reserved": "import는 예약된 이름입니다.",
       "exists": "같은 이름의 볼륨이 이미 있습니다."
@@ -270,7 +270,7 @@
     "deleteTitle": "네트워크 {{name}}을(를) 삭제할까요?",
     "deleteDescription": "네트워크만 지웁니다. 노드의 브리지는 바꾸지 않습니다.",
     "deleted": "네트워크 {{name}}을(를) 삭제했습니다.",
-    "inUse": "이 네트워크를 쓰는 VM이 있습니다.",
+    "inUse": "먼저 VM 인터페이스를 빼세요.",
     "errors": {
       "reserved": "user는 NAT에 예약된 이름입니다.",
       "bridge": "/, :, 공백 없이 1–15자로 쓰세요.",
@@ -295,7 +295,8 @@
     "maintenanceOff": "{{name}}의 유지보수를 끝냈습니다.",
     "remove": "클러스터에서 제거",
     "removeTitle": "{{name}}을(를) 클러스터에서 제거할까요?",
-    "removeDescription": "아주 죽은 노드에만 쓰세요. 지금 데이터로는 다시 합류할 수 없고, 이 노드에 배정된 VM은 그대로 남습니다.",
+    "removeDescription": "완전히 멈춘 노드에만 쓰세요. 지금 데이터로는 다시 합류할 수 없고, 이 노드에 배정된 VM은 그대로 남습니다.",
+    "removeNote": "오프라인 노드만 여기서 제거할 수 있습니다. 살아 있는 노드는 그 노드에서 oplctl cluster leave를 실행하세요.",
     "removed": "{{name}}을(를) 클러스터에서 제거했습니다."
   },
   "accounts": {

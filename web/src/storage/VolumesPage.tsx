@@ -109,15 +109,20 @@ export function VolumesPage() {
                     {t(`volumes.phase.${volume.status.phase}`)}
                   </Badge>
                 </TableCell>
-                <TableCell>{node?.name ?? "—"}</TableCell>
+                <TableCell>{node?.name ?? volume.status.node?.slice(-8) ?? "—"}</TableCell>
                 <TableCell>
                   {vm ? (
-                    <Link
-                      to={`/vms/${encodeURIComponent(vm.name)}`}
-                      className="underline-offset-4 hover:underline"
-                    >
-                      {vm.name}
-                    </Link>
+                    <>
+                      <Link
+                        to={`/vms/${encodeURIComponent(vm.name)}`}
+                        className="underline-offset-4 hover:underline"
+                      >
+                        {vm.name}
+                      </Link>
+                      {write && (
+                        <div className="text-xs text-muted-foreground">{t("volumes.inUse")}</div>
+                      )}
+                    </>
                   ) : (
                     "—"
                   )}
@@ -128,9 +133,8 @@ export function VolumesPage() {
                       variant="ghost"
                       size="icon-sm"
                       aria-label={t("volumes.deleteNamed", { name: volume.name })}
-                      // 서버는 VM이 쓰거나 아직 만드는 볼륨을 지우지 않는다.
-                      disabled={vm !== undefined || !ready}
-                      title={vm ? t("volumes.inUse", { vm: vm.name }) : undefined}
+                      // 서버는 VM이 쓰거나 아직 만드는 볼륨을 지우지 않는다. VM 목록을 다 읽어야 안다.
+                      disabled={!vms.isSuccess || vm !== undefined || !ready}
                       onClick={() => setDeleting(volume)}
                     >
                       <Trash2 />

@@ -39,30 +39,65 @@ it("lists nodes with their state, capacity and VMs", async () => {
   expect(a).toHaveTextContent("16 GiB");
   expect(await within(a).findByText("(this node)")).toBeInTheDocument();
   // 두 VM 모두 node-a에 고정돼 있다.
-  expect(within(a).getAllByRole("cell").at(-2)).toHaveTextContent("2");
+  const vmsColumn = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "VMs");
+  expect(within(a).getAllByRole("cell")[vmsColumn]).toHaveTextContent("2");
   const b = within(table).getByText("node-b").closest("tr")!;
   expect(b).toHaveTextContent("Offline");
   expect(b).toHaveTextContent("vmbr0");
 });
 
-it("turns maintenance on with the revision it read", async () => {
+it("turns maintenance on and off with the revision it read", async () => {
   cluster();
   mockLists({ node: [DOWN] });
-  let sent: { ifMatch: string | null; body: unknown } | undefined;
+  const sent: { ifMatch: string | null; body: unknown }[] = [];
   server.use(
     http.put(apiUrl("/nodes/n2"), async ({ request }) => {
-      sent = { ifMatch: request.headers.get("If-Match"), body: await request.json() };
-      return HttpResponse.json(DOWN);
+      const body = (await request.json()) as { spec: typeof DOWN.spec };
+      sent.push({ ifMatch: request.headers.get("If-Match"), body });
+      return HttpResponse.json({ ...DOWN, revision: DOWN.revision + sent.length, spec: body.spec });
     }),
   );
   renderPage(<NodesPage />);
   await userEvent.click(await screen.findByRole("button", { name: "Actions for node-b" }));
   await userEvent.click(await screen.findByRole("menuitem", { name: "Enter maintenance" }));
   expect(await screen.findByText("node-b is in maintenance.")).toBeInTheDocument();
-  expect(sent).toEqual({
-    ifMatch: "7",
-    body: { labels: {}, spec: { address: "10.0.0.1", maintenance: true } },
-  });
+  // 응답을 바로 목록에 반영하므로 watch 이벤트를 기다리지 않고 다시 바꿀 수 있다.
+  await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "End maintenance" }));
+  expect(await screen.findByText("node-b is out of maintenance.")).toBeInTheDocument();
+  expect(sent).toEqual([
+    { ifMatch: "7", body: { labels: {}, spec: { address: "10.0.0.1", maintenance: true } } },
+    { ifMatch: "8", body: { labels: {}, spec: { address: "10.0.0.1", maintenance: false } } },
+  ]);
+});
+
+it("says why maintenance could not change", async () => {
+  cluster();
+  mockLists({ node: [DOWN] });
+  server.use(
+    http.put(apiUrl("/nodes/n2"), () =>
+      HttpResponse.json({ code: "revision_mismatch", message: "stale" }, { status: 412 }),
+    ),
+  );
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-b" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Enter maintenance" }));
+  expect(
+    await screen.findByText("node-b: Someone else changed it first. Reload and try again."),
+  ).toBeInTheDocument();
+});
+
+it("does not remove this node even when it shows offline", async () => {
+  cluster();
+  mockLists({ node: [{ ...NODE, status: { ...NODE.status, online: false } }] });
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  expect(await screen.findByRole("menuitem", { name: "Remove from cluster" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
 });
 
 it("removes only offline nodes, after typing the name", async () => {
@@ -92,6 +127,13 @@ it("removes only offline nodes, after typing the name", async () => {
   await userEvent.click(confirm);
   expect(await screen.findByText("Removed node-b from the cluster.")).toBeInTheDocument();
   expect(removed).toBe(true);
+});
+
+it("tells how to remove a live node", async () => {
+  cluster();
+  mockLists({ node: [NODE] });
+  renderPage(<NodesPage />);
+  expect(await screen.findByText(/oplctl cluster leave/)).toBeInTheDocument();
 });
 
 it("hides node changes from operators", async () => {

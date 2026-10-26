@@ -53,8 +53,11 @@ export function NetworksPage() {
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<Network | null>(null);
   const write = can(me.role, "write", "network");
+  // VM 목록을 다 읽기 전에는 모른다(undefined).
   const users = (network: Network) =>
-    vms.data?.filter((vm) => vm.spec.nics?.some((nic) => nic.network === network.name)).length ?? 0;
+    vms.isSuccess
+      ? vms.data.filter((vm) => vm.spec.nics?.some((nic) => nic.network === network.name)).length
+      : undefined;
 
   return (
     <div className="flex flex-col gap-4">
@@ -98,7 +101,9 @@ export function NetworksPage() {
                 <TableCell className="font-mono text-xs">{network.spec.bridge}</TableCell>
                 <TableCell>{network.spec.vlan ?? "—"}</TableCell>
                 <TableCell>
-                  {having.length === 0 ? (
+                  {!nodes.isSuccess ? (
+                    "—"
+                  ) : having.length === 0 ? (
                     <span className="text-destructive">{t("networks.noNode")}</span>
                   ) : (
                     having.map((n) => n.name).join(", ")
@@ -111,7 +116,12 @@ export function NetworksPage() {
                     </div>
                   )}
                 </TableCell>
-                <TableCell>{used}</TableCell>
+                <TableCell>
+                  {used ?? "—"}
+                  {write && used !== undefined && used > 0 && (
+                    <div className="text-xs text-muted-foreground">{t("networks.inUse")}</div>
+                  )}
+                </TableCell>
                 {write && (
                   <TableCell className="text-right">
                     <Button
@@ -119,8 +129,7 @@ export function NetworksPage() {
                       size="icon-sm"
                       aria-label={t("networks.deleteNamed", { name: network.name })}
                       // VM이 쓰는 네트워크는 서버가 지우지 않는다.
-                      disabled={used > 0}
-                      title={used > 0 ? t("networks.inUse") : undefined}
+                      disabled={used !== 0}
                       onClick={() => setDeleting(network)}
                     >
                       <Trash2 />
@@ -172,8 +181,9 @@ function CreateNetworkDialog({ onClose }: { onClose(): void }) {
     if (!validBridge(bridge)) {
       found.bridge = "networks.errors.bridge";
     }
+    // 숫자만 받는다(`Number`는 "0x10"·"1e3"도 읽는다).
     const tag = Number(vlan);
-    if (vlan !== "" && !(Number.isInteger(tag) && tag >= 1 && tag <= 4094)) {
+    if (vlan !== "" && !(/^\d+$/.test(vlan) && tag >= 1 && tag <= 4094)) {
       found.vlan = "networks.errors.vlan";
     }
     setErrors(found);

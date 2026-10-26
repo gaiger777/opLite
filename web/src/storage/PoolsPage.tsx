@@ -11,6 +11,7 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { ListPending } from "@/components/ListPending";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -44,8 +45,9 @@ export function PoolsPage() {
       ? t("pools.allNodes")
       : ids.map((id) => nodes.data?.find((n) => n.id === id)?.name ?? id.slice(-8)).join(", ");
   };
+  // 볼륨 목록을 다 읽기 전에는 모른다(undefined).
   const volumeCount = (pool: StoragePool) =>
-    volumes.data?.filter((v) => v.spec.pool === pool.name).length ?? 0;
+    volumes.isSuccess ? volumes.data.filter((v) => v.spec.pool === pool.name).length : undefined;
 
   return (
     <div className="flex flex-col gap-4">
@@ -92,7 +94,12 @@ export function PoolsPage() {
                     ? `${formatBytes(free)} / ${formatBytes(total)}`
                     : "—"}
                 </TableCell>
-                <TableCell>{used}</TableCell>
+                <TableCell>
+                  {used ?? "—"}
+                  {write && used !== undefined && used > 0 && (
+                    <div className="text-xs text-muted-foreground">{t("pools.inUse")}</div>
+                  )}
+                </TableCell>
                 {write && (
                   <TableCell className="text-right">
                     <Button
@@ -100,8 +107,7 @@ export function PoolsPage() {
                       size="icon-sm"
                       aria-label={t("pools.deleteNamed", { name: pool.name })}
                       // 볼륨이 남은 풀은 서버가 지우지 않는다.
-                      disabled={used > 0}
-                      title={used > 0 ? t("pools.inUse") : undefined}
+                      disabled={used !== 0}
                       onClick={() => setDeleting(pool)}
                     >
                       <Trash2 />
@@ -150,9 +156,11 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
     if (Object.keys(found).length > 0) {
       return false;
     }
+    // 고른 뒤에 목록에서 빠진 노드는 보내지 않는다.
+    const known = chosen.filter((id) => nodes.data?.some((n) => n.id === id));
     await call(
       api.POST("/storage-pools", {
-        body: { name, spec: { backend: { kind: "dir", path }, nodes: chosen } },
+        body: { name, spec: { backend: { kind: "dir", path }, nodes: known } },
       }),
     );
     toast.success(t("pools.created", { name }));
@@ -184,6 +192,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       </Field>
       <fieldset className="flex flex-col gap-2">
         <legend className="mb-2 text-sm font-medium">{t("pools.nodes")}</legend>
+        {!nodes.isSuccess && <ListPending error={nodes.error} />}
         {(nodes.data ?? []).map((node) => (
           <div key={node.id} className="flex items-center gap-2">
             <Checkbox

@@ -48,11 +48,44 @@ it("shows which nodes have each bridge and which VMs use it", async () => {
   const lan = (await within(table).findByText("lan")).closest("tr")!;
   expect(lan).toHaveTextContent("node-a");
   expect(within(lan).getByRole("button", { name: "Delete lan" })).toBeDisabled();
+  expect(lan).toHaveTextContent("Remove the VM interfaces first.");
   const dmz = within(table).getByText("dmz").closest("tr")!;
   expect(dmz).toHaveTextContent("VLAN filtering is off on node-a");
   const lab = within(table).getByText("lab").closest("tr")!;
   expect(lab).toHaveTextContent("No node has this bridge");
   expect(within(lab).getByRole("button", { name: "Delete lab" })).toBeEnabled();
+});
+
+it("warns nothing when the bridge filters VLANs", async () => {
+  const aware = {
+    ...NODE,
+    status: { ...NODE.status, bridges: [{ name: "vmbr0", vlan_filtering: true }] },
+  };
+  mockLists({ network: [network("dmz", "vmbr0", 20)], node: [aware] });
+  renderPage(<NetworksPage />);
+  const dmz = (await screen.findByText("dmz")).closest("tr")!;
+  expect(dmz).toHaveTextContent("node-a");
+  expect(dmz).not.toHaveTextContent("VLAN filtering is off");
+});
+
+// 노드와 VM 목록을 읽지 못하면 브리지가 없다고도, 지워도 된다고도 말하지 않는다.
+it("judges nothing without the nodes and VMs", async () => {
+  mockLists({ network: [network("lab", "br9")] });
+  server.use(
+    http.get(apiUrl("/nodes"), () =>
+      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+    ),
+    http.get(apiUrl("/vms"), () =>
+      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+    ),
+  );
+  renderPage(<NetworksPage />);
+  const lab = (await screen.findByText("lab")).closest("tr")!;
+  expect(within(lab).getByRole("button", { name: "Delete lab" })).toBeDisabled();
+  expect(lab).not.toHaveTextContent("No node has this bridge");
+  const cells = within(lab).getAllByRole("cell");
+  expect(cells.at(-3)).toHaveTextContent("—");
+  expect(cells.at(-2)).toHaveTextContent("—");
 });
 
 it("creates a network after checking its fields", async () => {
@@ -68,7 +101,7 @@ it("creates a network after checking its fields", async () => {
   await userEvent.click(await screen.findByRole("button", { name: "Create" }));
   const dialog = await screen.findByRole("dialog", { name: "Create a network" });
   await userEvent.type(within(dialog).getByLabelText("Name"), "user");
-  await userEvent.type(within(dialog).getByLabelText("VLAN tag (optional)"), "5000");
+  await userEvent.type(within(dialog).getByLabelText("VLAN tag (optional)"), "0x10");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByText("The name user is reserved for NAT.")).toBeVisible();
   expect(within(dialog).getByText("Use 1–15 characters without /, : or spaces.")).toBeVisible();
@@ -82,6 +115,31 @@ it("creates a network after checking its fields", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(await screen.findByText("Created network lan.")).toBeInTheDocument();
   expect(body).toEqual({ name: "lan", spec: { bridge: "vmbr0", vlan: 10 } });
+});
+
+it("rejects VLAN tags out of range and sends no tag when empty", async () => {
+  mockLists({ node: [bridged] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/networks"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(network("wan", "vmbr0"), { status: 201 });
+    }),
+  );
+  renderPage(<NetworksPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a network" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "wan");
+  await userEvent.type(within(dialog).getByLabelText("Bridge"), "vmbr0");
+  await userEvent.type(within(dialog).getByLabelText("VLAN tag (optional)"), "5000");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByText("Use a number from 1 to 4094.")).toBeVisible();
+  expect(body).toBeUndefined();
+
+  await userEvent.clear(within(dialog).getByLabelText("VLAN tag (optional)"));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await screen.findByText("Created network wan.")).toBeInTheDocument();
+  expect(body).toEqual({ name: "wan", spec: { bridge: "vmbr0", vlan: null } });
 });
 
 it("deletes an unused network and shows why a delete failed", async () => {
