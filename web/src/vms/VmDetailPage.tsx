@@ -6,6 +6,7 @@ import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
+import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -16,7 +17,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { errorMessage } from "@/i18n/errors";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
 import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
@@ -47,15 +47,7 @@ export function VmDetailPage() {
   const tab = tabs.find((id) => id === params.get("tab")) ?? "summary";
 
   if (vm === undefined) {
-    return vms.isError ? (
-      <p role="alert" className="text-destructive">
-        {errorMessage(t, vms.error)}
-      </p>
-    ) : (
-      <p role="status" className="text-muted-foreground">
-        {t("common.loading")}
-      </p>
-    );
+    return <ListPending error={vms.error} />;
   }
   if (vm === null) {
     return (

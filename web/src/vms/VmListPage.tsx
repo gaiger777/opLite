@@ -19,6 +19,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { TableMessage } from "@/components/TableMessage";
 import { Input } from "@/components/ui/input";
 import {
   Table,
@@ -28,7 +29,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { errorMessage } from "@/i18n/errors";
 import { formatMib } from "@/lib/format";
 import { readPref, writePref } from "@/lib/prefs";
 import { useVmActions } from "@/vms/actions";
@@ -239,15 +239,7 @@ export function VmListPage() {
         </TableHeader>
         <TableBody>
           {table.getRowModel().rows.length === 0 && (
-            <TableRow>
-              <TableCell colSpan={columns.length} className="text-center text-muted-foreground">
-                {vms.isPending
-                  ? t("common.loading")
-                  : vms.isError
-                    ? errorMessage(t, vms.error)
-                    : t("vms.empty")}
-              </TableCell>
-            </TableRow>
+            <TableMessage colSpan={columns.length} query={vms} empty={t("vms.empty")} />
           )}
           {table.getRowModel().rows.map((row) => (
             <TableRow key={row.id} data-state={row.getIsSelected() ? "selected" : undefined}>

@@ -111,6 +111,11 @@ export function fromVm(vm: Vm): VmFormValues {
   };
 }
 
+/** 서버의 리소스 이름 규칙에 맞는지. id(UUID)처럼 보이는 이름은 id와 헷갈리므로 받지 않는다. */
+export function validName(name: string): boolean {
+  return NAME.test(name) && !UUID.test(name);
+}
+
 /** `min`부터 `max`까지의 정수인지 */
 function intIn(value: string, min: number, max: number): boolean {
   const n = Number(value);
@@ -127,8 +132,7 @@ export function validate(
   volumes: readonly string[] = [],
 ): Record<string, string> {
   const errors: Record<string, string> = {};
-  const nameOk = (name: string) => NAME.test(name) && !UUID.test(name);
-  if (creating && !nameOk(v.name)) {
+  if (creating && !validName(v.name)) {
     errors.name = "vmForm.errors.name";
   }
   if (!intIn(v.cores, 1, MAX_CORES)) {
@@ -142,7 +146,7 @@ export function validate(
   v.disks.forEach((d, i) => {
     if (d.kind === "existing" && d.volume === "") {
       errors[`disks.${i}.volume`] = "vmForm.errors.volumeChoose";
-    } else if (!nameOk(d.volume)) {
+    } else if (!validName(d.volume)) {
       errors[`disks.${i}.volume`] = "vmForm.errors.volume";
     } else if (names.has(d.volume)) {
       errors[`disks.${i}.volume`] = "vmForm.errors.volumeDuplicate";

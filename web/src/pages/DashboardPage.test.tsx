@@ -76,7 +76,7 @@ it("shows node capacity in GiB with one decimal", async () => {
 });
 
 it("shows loading instead of zeros, then errors", async () => {
-  let fail = () => {};
+  let fail: (() => void) | undefined;
   server.use(
     http.get(
       apiUrl("/nodes"),
@@ -99,7 +99,9 @@ it("shows loading instead of zeros, then errors", async () => {
   const table = screen.getByRole("table", { name: "Nodes" });
   expect(table).toHaveTextContent("Loading…");
 
-  fail();
+  // 요청이 핸들러에 닿은 뒤에 실패시킨다(부하가 크면 화면이 먼저 그려진다).
+  await vi.waitFor(() => expect(fail).toBeDefined());
+  fail!();
   expect(await within(nodes).findByText("You do not have permission to do this.")).toBeVisible();
   expect(within(table).getByText("You do not have permission to do this.")).toBeVisible();
 });

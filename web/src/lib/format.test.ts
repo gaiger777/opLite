@@ -1,4 +1,4 @@
-import { formatCapacity, formatMib, formatTime, uuidTime } from "@/lib/format";
+import { formatBytes, formatCapacity, formatMib, formatTime, uuidTime } from "@/lib/format";
 
 it("reads the time from a UUIDv7", () => {
   expect(uuidTime("019a0f3c-8a10-7000-8000-000000000000").toISOString()).toBe(
@@ -23,4 +23,11 @@ it("shows the full year", () => {
   const time = new Date("2025-10-23T04:03:37.104Z");
   expect(formatTime(time, "en")).toContain("2025");
   expect(formatTime(time, "ko")).toContain("2025");
+});
+
+it("formats byte counts", () => {
+  expect(formatBytes(0)).toBe("0 B");
+  expect(formatBytes(512 * 1024 ** 2)).toBe("512 MiB");
+  expect(formatBytes(1.5 * 1024 ** 3)).toBe("1.5 GiB");
+  expect(formatBytes(64 * 1024 ** 4)).toBe("64 TiB");
 });

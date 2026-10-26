@@ -13,6 +13,18 @@ export function formatMib(mib: number): string {
   return mib >= 1024 && mib % 1024 === 0 ? `${mib / 1024} GiB` : `${mib} MiB`;
 }
 
+/** 바이트 수를 1024 단위로 소수 한 자리까지: 512 MiB, 1.5 GiB */
+export function formatBytes(bytes: number): string {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${+value.toFixed(1)} ${units[unit]}`;
+}
+
 /** 노드 용량처럼 GiB로 나누어떨어지지 않는 크기: 1.5 GiB, 15.5 GiB */
 export function formatCapacity(mib: number): string {
   return mib >= 1024 ? `${+(mib / 1024).toFixed(1)} GiB` : `${mib} MiB`;

@@ -7,6 +7,8 @@ import { Link, useNavigate, useParams } from "react-router";
 import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
+import { Field } from "@/components/Field";
+import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -32,20 +34,6 @@ import { useVmByName } from "@/vms/VmDetailPage";
 
 const GIB = 1024 ** 3;
 
-/** 목록을 읽는 중이거나 읽지 못했을 때 */
-function ListPending({ error }: { error: unknown }) {
-  const { t } = useTranslation();
-  return error ? (
-    <p role="alert" className="text-destructive">
-      {errorMessage(t, error)}
-    </p>
-  ) : (
-    <p role="status" className="text-muted-foreground">
-      {t("common.loading")}
-    </p>
-  );
-}
-
 export function VmCreatePage() {
   const nodes = useList("node");
   if (!nodes.data) {
@@ -66,40 +54,6 @@ export function VmEditPage() {
     return <h1 className="text-2xl font-semibold">{t("vms.notFound", { name })}</h1>;
   }
   return <VmForm key={vm.id} vm={vm} initial={fromVm(vm)} />;
-}
-
-/** 입력에 붙일 접근성 속성. 오류가 있을 때만 값이 있다. */
-interface FieldA11y {
-  "aria-invalid"?: true;
-  "aria-describedby"?: string;
-}
-
-/** 이름표와 입력, 그 아래의 오류. 오류가 있는 입력은 `children`에 함수를 주어 `FieldA11y`를 받는다. */
-function Field({
-  id,
-  label,
-  error,
-  children,
-}: {
-  id: string;
-  label: string;
-  error?: string;
-  children: React.ReactNode | ((a11y: FieldA11y) => React.ReactNode);
-}) {
-  const { t } = useTranslation();
-  const errorId = `${id}-error`;
-  const a11y: FieldA11y = error ? { "aria-invalid": true, "aria-describedby": errorId } : {};
-  return (
-    <div className="flex flex-col gap-1.5">
-      <Label htmlFor={id}>{label}</Label>
-      {typeof children === "function" ? children(a11y) : children}
-      {error && (
-        <p id={errorId} className="text-xs text-destructive">
-          {t(error)}
-        </p>
-      )}
-    </div>
-  );
 }
 
 /** VM 만들기(`vm` 없음)와 고치기 */

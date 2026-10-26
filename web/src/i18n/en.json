@@ -82,7 +82,9 @@
     }
   },
   "common": {
-    "loading": "Loading…"
+    "loading": "Loading…",
+    "copied": "Copied.",
+    "copyFailed": "Could not copy. Select the text and copy it yourself."
   },
   "confirm": {
     "cancel": "Cancel",

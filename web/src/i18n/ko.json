@@ -82,7 +82,9 @@
     }
   },
   "common": {
-    "loading": "불러오는 중…"
+    "loading": "불러오는 중…",
+    "copied": "복사했습니다.",
+    "copyFailed": "복사하지 못했습니다. 글을 선택해 직접 복사하세요."
   },
   "confirm": {
     "cancel": "취소",
