@@ -36,7 +36,8 @@
     "networks": "Networks",
     "nodes": "Nodes",
     "tasks": "Tasks",
-    "users": "Users"
+    "users": "Users",
+    "tokens": "API tokens"
   },
   "header": {
     "language": "Language",
@@ -326,6 +327,27 @@
     "deleteTitle": "Delete user {{name}}?",
     "deleteDescription": "The user and their API tokens are deleted.",
     "deleted": "Deleted user {{name}}."
+  },
+  "tokens": {
+    "name": "Name",
+    "owner": "Owner",
+    "created": "Created",
+    "empty": "No API tokens.",
+    "note": "Scripts and tools use API tokens. A token has the role of its owner. oplctl login makes one for the CLI.",
+    "create": "Create",
+    "createTitle": "Create an API token",
+    "createDescription": "The token acts as you, with your role.",
+    "secretTitle": "Token {{name}} was created",
+    "secretDescription": "Copy the token now. It cannot be shown again.",
+    "secret": "Token",
+    "copySecret": "Copy the token",
+    "usage": "Send it in the header",
+    "done": "Done",
+    "delete": "Delete",
+    "deleteNamed": "Delete {{name}}",
+    "deleteTitle": "Delete API token {{name}}?",
+    "deleteDescription": "Anything using the token stops working right away.",
+    "deleted": "Deleted API token {{name}}."
   },
   "vmForm": {
     "createTitle": "Create a virtual machine",

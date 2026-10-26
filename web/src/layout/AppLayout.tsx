@@ -3,6 +3,7 @@ import {
   Cpu,
   Database,
   HardDrive,
+  KeyRound,
   Languages,
   LayoutDashboard,
   ListChecks,
@@ -47,6 +48,7 @@ const NAV: { to: string; key: string; icon: LucideIcon; end: boolean; kind?: Kin
   { to: "/nodes", key: "nav.nodes", icon: Cpu, end: false },
   { to: "/tasks", key: "nav.tasks", icon: ListChecks, end: false },
   { to: "/users", key: "nav.users", icon: Users, end: false, kind: "user" },
+  { to: "/tokens", key: "nav.tokens", icon: KeyRound, end: false },
 ];
 
 export function AppLayout() {

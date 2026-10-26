@@ -36,7 +36,8 @@
     "networks": "네트워크",
     "nodes": "노드",
     "tasks": "작업",
-    "users": "사용자"
+    "users": "사용자",
+    "tokens": "API 토큰"
   },
   "header": {
     "language": "언어",
@@ -326,6 +327,27 @@
     "deleteTitle": "사용자 {{name}}을(를) 삭제할까요?",
     "deleteDescription": "사용자와 그 사용자의 API 토큰이 지워집니다.",
     "deleted": "사용자 {{name}}을(를) 삭제했습니다."
+  },
+  "tokens": {
+    "name": "이름",
+    "owner": "주인",
+    "created": "만든 시각",
+    "empty": "API 토큰이 없습니다.",
+    "note": "스크립트와 도구는 API 토큰을 씁니다. 토큰의 권한은 주인의 역할을 따릅니다. oplctl login은 CLI용 토큰을 만듭니다.",
+    "create": "만들기",
+    "createTitle": "API 토큰 만들기",
+    "createDescription": "토큰은 내 역할로 나 대신 요청합니다.",
+    "secretTitle": "토큰 {{name}}을(를) 만들었습니다",
+    "secretDescription": "지금 토큰을 복사하세요. 다시 볼 수 없습니다.",
+    "secret": "토큰",
+    "copySecret": "토큰 복사",
+    "usage": "요청 헤더에 넣어 보냅니다",
+    "done": "완료",
+    "delete": "삭제",
+    "deleteNamed": "{{name}} 삭제",
+    "deleteTitle": "API 토큰 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "이 토큰을 쓰는 곳은 곧바로 동작하지 않습니다.",
+    "deleted": "API 토큰 {{name}}을(를) 삭제했습니다."
   },
   "vmForm": {
     "createTitle": "가상 머신 만들기",

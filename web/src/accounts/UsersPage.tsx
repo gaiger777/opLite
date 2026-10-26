@@ -38,12 +38,16 @@ type Role = components["schemas"]["Role"];
 
 const ROLES: readonly Role[] = ["admin", "operator", "viewer"];
 
-/** 사용자 목록. 감시할 수 없으므로 화면을 열 때와 바꾼 뒤에 다시 읽는다. */
-export function useUsers() {
+/**
+ * 사용자 목록. 감시할 수 없으므로 화면을 열 때와 바꾼 뒤에 다시 읽는다. 관리자가 아니면 읽을 수 없으므로
+ * `enabled`를 내린다.
+ */
+export function useUsers(enabled = true) {
   return useQuery({
     queryKey: ["users"],
     queryFn: () => call(api.GET("/users")),
     select: (list) => list.items,
+    enabled,
   });
 }
 
