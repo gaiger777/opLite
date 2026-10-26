@@ -15,6 +15,7 @@ import { NetworksPage } from "@/networks/NetworksPage";
 import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { PoolsPage } from "@/storage/PoolsPage";
+import { VolumesPage } from "@/storage/VolumesPage";
 import { TasksPage } from "@/tasks/TasksPage";
 import { TaskToasts } from "@/tasks/TaskToasts";
 import { ConsolePage } from "@/vms/ConsolePage";
@@ -43,6 +44,7 @@ function routes() {
             { path: "vms/:name", element: <VmDetailPage /> },
             { path: "vms/:name/edit", element: <VmEditPage /> },
             { path: "vms/:name/console", element: <ConsolePage /> },
+            { path: "volumes", element: <VolumesPage /> },
             { path: "storage-pools", element: <PoolsPage /> },
             { path: "networks", element: <NetworksPage /> },
             { path: "nodes", element: <NodesPage /> },

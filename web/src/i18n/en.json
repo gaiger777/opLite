@@ -27,6 +27,7 @@
   "nav": {
     "dashboard": "Dashboard",
     "vms": "Virtual machines",
+    "volumes": "Volumes",
     "pools": "Storage pools",
     "networks": "Networks",
     "nodes": "Nodes",
@@ -174,6 +175,33 @@
   },
   "forms": {
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."
+  },
+  "volumes": {
+    "name": "Name",
+    "pool": "Storage pool",
+    "size": "Size",
+    "allocated": "Allocated",
+    "format": "Format",
+    "state": "State",
+    "node": "Node",
+    "vm": "Used by",
+    "empty": "No volumes.",
+    "phase": {
+      "pending": "Creating",
+      "ready": "Ready"
+    },
+    "create": "Create",
+    "createTitle": "Create an empty volume",
+    "createDescription": "A new disk image in a storage pool. A qcow2 volume takes space only as it is written.",
+    "delete": "Delete",
+    "deleteNamed": "Delete {{name}}",
+    "deleteTitle": "Delete volume {{name}}?",
+    "deleteDescription": "The disk image and all data on it are deleted.",
+    "inUse": "Attached to {{vm}}.",
+    "errors": {
+      "reserved": "The name import is reserved.",
+      "exists": "A volume with this name already exists."
+    }
   },
   "pools": {
     "name": "Name",

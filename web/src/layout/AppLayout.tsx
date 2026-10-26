@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Cpu,
   Database,
+  HardDrive,
   Languages,
   LayoutDashboard,
   ListChecks,
@@ -36,6 +37,7 @@ import { type Theme, useTheme } from "@/lib/theme";
 const NAV = [
   { to: "/", key: "nav.dashboard", icon: LayoutDashboard, end: true },
   { to: "/vms", key: "nav.vms", icon: Server, end: false },
+  { to: "/volumes", key: "nav.volumes", icon: HardDrive, end: false },
   { to: "/storage-pools", key: "nav.pools", icon: Database, end: false },
   { to: "/networks", key: "nav.networks", icon: Network, end: false },
   { to: "/nodes", key: "nav.nodes", icon: Cpu, end: false },

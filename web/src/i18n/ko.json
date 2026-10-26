@@ -27,6 +27,7 @@
   "nav": {
     "dashboard": "대시보드",
     "vms": "가상 머신",
+    "volumes": "볼륨",
     "pools": "스토리지 풀",
     "networks": "네트워크",
     "nodes": "노드",
@@ -174,6 +175,33 @@
   },
   "forms": {
     "name": "소문자·숫자·-로 1–63자, -로 시작하거나 끝날 수 없습니다."
+  },
+  "volumes": {
+    "name": "이름",
+    "pool": "스토리지 풀",
+    "size": "크기",
+    "allocated": "사용량",
+    "format": "형식",
+    "state": "상태",
+    "node": "노드",
+    "vm": "사용하는 VM",
+    "empty": "볼륨이 없습니다.",
+    "phase": {
+      "pending": "만드는 중",
+      "ready": "준비됨"
+    },
+    "create": "만들기",
+    "createTitle": "빈 볼륨 만들기",
+    "createDescription": "스토리지 풀에 새 디스크 이미지를 만듭니다. qcow2 볼륨은 쓴 만큼만 공간을 차지합니다.",
+    "delete": "삭제",
+    "deleteNamed": "{{name}} 삭제",
+    "deleteTitle": "볼륨 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "디스크 이미지와 그 안의 데이터가 모두 지워집니다.",
+    "inUse": "{{vm}}에 붙어 있습니다.",
+    "errors": {
+      "reserved": "import는 예약된 이름입니다.",
+      "exists": "같은 이름의 볼륨이 이미 있습니다."
+    }
   },
   "pools": {
     "name": "이름",
