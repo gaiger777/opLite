@@ -125,7 +125,8 @@ export function NodesPage() {
               <TableCell className="font-mono text-xs">
                 {node.status.bridges.map((b) => b.name).join(", ") || "—"}
               </TableCell>
-              <TableCell>{vmCount(node, vms.data ?? [])}</TableCell>
+              {/* VM 목록을 다 읽기 전에는 모른다. */}
+              <TableCell>{vms.isSuccess ? vmCount(node, vms.data) : "—"}</TableCell>
               {write && (
                 <TableCell className="text-right">
                   <DropdownMenu modal={false}>
@@ -165,8 +166,12 @@ export function NodesPage() {
           ))}
         </TableBody>
       </Table>
-      <p className="text-sm text-muted-foreground">{t("nodes.maintenanceNote")}</p>
-      <p className="text-sm text-muted-foreground">{t("nodes.removeNote")}</p>
+      {write && (
+        <>
+          <p className="text-sm text-muted-foreground">{t("nodes.maintenanceNote")}</p>
+          <p className="text-sm text-muted-foreground">{t("nodes.removeNote")}</p>
+        </>
+      )}
       <ConfirmDialog
         open={removing !== null}
         onOpenChange={(open) => !open && setRemoving(null)}

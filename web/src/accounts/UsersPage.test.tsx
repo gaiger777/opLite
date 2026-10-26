@@ -56,6 +56,12 @@ it("lists users and keeps admins from changing themselves", async () => {
     "true",
   );
   expect(within(table).getByText("kim").closest("tr")).toHaveTextContent("Viewer");
+  // 막은 까닭은 표 아래에 적는다.
+  expect(
+    screen.getByText(
+      "Change your own password from the account menu. Only another administrator can change your role or delete your account.",
+    ),
+  ).toBeInTheDocument();
 });
 
 it("creates a user and reads the list again", async () => {

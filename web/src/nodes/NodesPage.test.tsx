@@ -142,4 +142,24 @@ it("hides node changes from operators", async () => {
   renderPage(<NodesPage />, { as: { ...ADMIN, role: "operator" } });
   expect(await screen.findByText("node-a")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Actions for node-a" })).not.toBeInTheDocument();
+  // 바꿀 수 없는 사람에게는 유지보수·제거 안내도 보이지 않는다.
+  expect(screen.queryByText(/oplctl cluster leave/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/No new VMs are placed/)).not.toBeInTheDocument();
+});
+
+it("does not count VMs it could not read", async () => {
+  cluster();
+  mockLists({ node: [NODE] });
+  server.use(
+    http.get(apiUrl("/vms"), () =>
+      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+    ),
+  );
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const a = (await within(table).findByText("node-a")).closest("tr")!;
+  const vmsColumn = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "VMs");
+  await vi.waitFor(() => expect(within(a).getAllByRole("cell")[vmsColumn]).toHaveTextContent("—"));
 });

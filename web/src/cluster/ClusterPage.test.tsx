@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { act, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
@@ -86,6 +86,14 @@ it("issues a join token and shows the command once", async () => {
   expect(within(dialog).getByText(/2030/)).toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "Copy the command" }));
   expect(await navigator.clipboard.readText()).toBe(command);
+  // 명령을 놓치지 않게 Esc나 바깥 클릭으로는 닫히지 않는다.
+  expect(within(dialog).queryByRole("button", { name: "Close" })).not.toBeInTheDocument();
+  await user.keyboard("{Escape}");
+  expect(dialog).toBeInTheDocument();
+  await user.click(document.querySelector<HTMLElement>("[data-slot=dialog-overlay]")!);
+  expect(dialog).toBeInTheDocument();
+  await user.click(within(dialog).getByRole("button", { name: "Done" }));
+  await vi.waitFor(() => expect(dialog).not.toBeInTheDocument());
 });
 
 it("shows no leader while there is none and shortens unnamed ids", async () => {
@@ -123,4 +131,20 @@ it("keeps the form open when issuing fails", async () => {
     "You do not have permission to do this.",
   );
   expect(screen.queryByRole("dialog", { name: "Join a new node" })).not.toBeInTheDocument();
+});
+
+it("keeps the members and says when it cannot read the cluster again", async () => {
+  const { queryClient } = renderPage(<ClusterPage />);
+  expect(await screen.findByRole("table", { name: "Members" })).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  server.use(
+    http.get(apiUrl("/cluster"), () =>
+      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+    ),
+  );
+  await act(() => queryClient.refetchQueries({ queryKey: ["cluster"] }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Could not refresh the cluster. You do not have permission to do this.",
+  );
+  expect(screen.getByRole("table", { name: "Members" })).toBeInTheDocument();
 });

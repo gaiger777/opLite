@@ -99,6 +99,14 @@ it("does not create a pool when the chosen nodes are gone", async () => {
     "The chosen nodes are no longer in the cluster. Choose again.",
   );
   expect(body).toBeUndefined();
+  // 빠진 노드는 고른 목록에서도 지웠으므로 다시 보내면 모든 노드의 풀이 된다.
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  await vi.waitFor(() =>
+    expect(body).toEqual({
+      name: "fast",
+      spec: { backend: { kind: "dir", path: "/srv/fast" }, nodes: [] },
+    }),
+  );
 });
 
 it("says when the nodes cannot be read", async () => {

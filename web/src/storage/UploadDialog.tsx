@@ -8,6 +8,7 @@ import type { components } from "@/api/schema";
 import type { StoragePool } from "@/api/types";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { ListPending } from "@/components/ListPending";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { errorMessage } from "@/i18n/errors";
@@ -105,11 +106,14 @@ export function UploadDialog({ onClose }: { onClose(): void }) {
           />
         )}
       </Field>
+      {!pools.isSuccess && <ListPending error={pools.error} />}
       <Field
         id="upload-pool"
         label={t("volumes.pool")}
         error={errors.pool}
-        hint={usable.length === 0 && cluster.data ? t("uploads.noPool") : undefined}
+        hint={
+          usable.length === 0 && cluster.data && pools.isSuccess ? t("uploads.noPool") : undefined
+        }
       >
         {(a11y) => (
           <NativeSelect

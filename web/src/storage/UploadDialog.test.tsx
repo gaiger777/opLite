@@ -74,3 +74,31 @@ it("says when it cannot tell the node it is connected to", async () => {
     "Cannot tell which node you are connected to. You do not have permission to do this.",
   );
 });
+
+it("says when the pools cannot be read instead of saying there are none", async () => {
+  mockLists({ node: [NODE] });
+  server.use(
+    http.get(apiUrl("/storage-pools"), () =>
+      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+    ),
+    http.get(apiUrl("/cluster"), () =>
+      HttpResponse.json({
+        name: "lab",
+        ca_fingerprint: "x",
+        leader: "n1",
+        node: "n1",
+        members: [],
+      }),
+    ),
+  );
+  renderPage(<VolumesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Upload image" }));
+  const dialog = await screen.findByRole("dialog", { name: "Upload a disk image" });
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "You do not have permission to do this.",
+  );
+  expect(await within(dialog).findByText(/connected to \(node-a\)/)).toBeInTheDocument();
+  expect(
+    within(dialog).queryByText("No storage pool is available on this node."),
+  ).not.toBeInTheDocument();
+});

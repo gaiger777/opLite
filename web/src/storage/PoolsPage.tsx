@@ -155,8 +155,10 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
     // 고른 뒤에 목록에서 빠진 노드는 보내지 않는다.
     const known = chosen.filter((id) => nodes.data?.some((n) => n.id === id));
     // 고른 노드가 모두 빠졌으면 빈 목록(모든 노드)으로 보내지 않는다.
+    // 빠진 노드는 고른 목록에서도 지워, 다시 보내면 모든 노드로 만들 수 있게 한다.
     if (chosen.length > 0 && known.length === 0) {
       found.nodes = "pools.errors.nodesGone";
+      setChosen(known);
     }
     setErrors(found);
     if (Object.keys(found).length > 0) {

@@ -339,7 +339,8 @@
     "deleteTitle": "Delete user {{name}}?",
     "deleteDescription": "The user and their API tokens are deleted.",
     "deleted": "Deleted user {{name}}.",
-    "adminOnly": "Only administrators can manage users."
+    "adminOnly": "Only administrators can manage users.",
+    "selfNote": "Change your own password from the account menu. Only another administrator can change your role or delete your account."
   },
   "tokens": {
     "name": "Name",
@@ -370,6 +371,7 @@
     "downloadCa": "Download the CA",
     "members": "Members",
     "membersNote": "Voters keep the cluster state. A learner is a node that is still joining.",
+    "refreshFailed": "Could not refresh the cluster. {{error}}",
     "role": "Role",
     "leader": "Leader",
     "voter": "Voter",

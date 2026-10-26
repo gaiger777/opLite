@@ -159,6 +159,7 @@ export function UsersPage() {
           })}
         </TableBody>
       </Table>
+      <p className="text-sm text-muted-foreground">{t("users.selfNote")}</p>
       {dialog?.kind === "create" && <CreateUserDialog onClose={close} onDone={changed} />}
       {dialog?.kind === "role" && (
         <RoleDialog user={dialog.user} returnFocus={trigger} onClose={close} onDone={changed} />

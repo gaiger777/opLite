@@ -12,6 +12,7 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { ListPending } from "@/components/ListPending";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -220,6 +221,7 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
           />
         )}
       </Field>
+      {!pools.isSuccess && <ListPending error={pools.error} />}
       <Field id="volume-pool" label={t("volumes.pool")} error={errors.pool}>
         {(a11y) => (
           <NativeSelect

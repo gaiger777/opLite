@@ -76,6 +76,21 @@ it("creates an empty volume and follows its task", async () => {
   });
 });
 
+it("says when the pools cannot be read", async () => {
+  mockLists({});
+  server.use(
+    http.get(apiUrl("/storage-pools"), () =>
+      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+    ),
+  );
+  renderPage(<VolumesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create an empty volume" });
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "You do not have permission to do this.",
+  );
+});
+
 // VM 목록을 읽지 못하면 쓰는 VM이 없는지 모른다. 모르는 노드는 id 끝으로 보인다.
 it("does not offer a delete without the VMs", async () => {
   mockLists({

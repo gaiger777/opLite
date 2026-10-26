@@ -339,7 +339,8 @@
     "deleteTitle": "사용자 {{name}}을(를) 삭제할까요?",
     "deleteDescription": "사용자와 그 사용자의 API 토큰이 지워집니다.",
     "deleted": "사용자 {{name}}을(를) 삭제했습니다.",
-    "adminOnly": "사용자는 관리자만 관리할 수 있습니다."
+    "adminOnly": "사용자는 관리자만 관리할 수 있습니다.",
+    "selfNote": "내 비밀번호는 계정 메뉴에서 바꿉니다. 내 역할 변경과 삭제는 다른 관리자가 합니다."
   },
   "tokens": {
     "name": "이름",
@@ -370,6 +371,7 @@
     "downloadCa": "CA 내려받기",
     "members": "멤버",
     "membersNote": "투표 멤버가 클러스터 상태를 지킵니다. 학습자는 아직 합류 중인 노드입니다.",
+    "refreshFailed": "클러스터를 다시 읽지 못했습니다. {{error}}",
     "role": "역할",
     "leader": "리더",
     "voter": "투표 멤버",

@@ -169,6 +169,7 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
       trackTask(task, t("tasks.op.volume-import", { target: params.name }));
     })
     // 넘기다 던져도 알림이 "올리는 중"에 남지 않게 여기서 함께 받는다.
+    // `trackTask`에서 던졌다면 서버의 가져오기 Task는 이미 돌고 있을 수 있다.
     .catch((err: unknown) => {
       // 같은 id로 바꾸는 알림은 이전 옵션을 물려받으므로 취소 버튼을 지운다.
       if (upload.silent) {

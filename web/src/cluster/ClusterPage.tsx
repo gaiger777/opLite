@@ -31,6 +31,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { errorMessage } from "@/i18n/errors";
 import { formatTime } from "@/lib/format";
 
 type JoinToken = components["schemas"]["CreatedJoinToken"];
@@ -70,6 +71,12 @@ export function ClusterPage() {
           </Button>
         )}
       </div>
+      {/* 다시 읽지 못하면 마지막으로 읽은 내용을 그대로 보이고 오류를 알린다. */}
+      {cluster.isError && (
+        <p role="alert" className="text-sm text-destructive">
+          {t("cluster.refreshFailed", { error: errorMessage(t, cluster.error) })}
+        </p>
+      )}
       <section className="flex flex-col gap-2">
         <h2 className="font-medium">{t("cluster.ca")}</h2>
         <p className="text-sm text-muted-foreground">{t("cluster.caNote")}</p>
@@ -169,13 +176,17 @@ function IssueDialog({ onClose, onIssued }: { onClose(): void; onIssued(token: J
   );
 }
 
-/** 발급한 조인 URL. 서버는 다시 보여 주지 않는다. */
+/** 발급한 조인 URL. 서버는 다시 보여 주지 않으므로 "완료"로만 닫는다. */
 function JoinTokenDialog({ token, onClose }: { token: JoinToken; onClose(): void }) {
   const { t, i18n } = useTranslation();
   const command = joinCommand(token.url);
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent>
+      <DialogContent
+        showCloseButton={false}
+        onEscapeKeyDown={(e) => e.preventDefault()}
+        onInteractOutside={(e) => e.preventDefault()}
+      >
         <DialogHeader>
           <DialogTitle>{t("cluster.issuedTitle")}</DialogTitle>
           <DialogDescription>
