@@ -20,6 +20,7 @@
     "cluster_no_quorum": "The cluster has no quorum. The change may still be applied later.",
     "not_leader": "The cluster leader is changing. Try again shortly.",
     "network_in_use": "A VM uses this network. Remove its interface first.",
+    "node_online": "The node is online. Run oplctl cluster leave on it instead.",
     "pool_in_use": "The pool still has volumes. Delete them first.",
     "internal": "The server failed: {{message}}"
   },
@@ -28,6 +29,7 @@
     "vms": "Virtual machines",
     "pools": "Storage pools",
     "networks": "Networks",
+    "nodes": "Nodes",
     "tasks": "Tasks"
   },
   "header": {
@@ -224,6 +226,27 @@
       "bridge": "Use 1–15 characters without /, : or spaces.",
       "vlan": "Use a number from 1 to 4094."
     }
+  },
+  "nodes": {
+    "name": "Name",
+    "state": "State",
+    "address": "API address",
+    "hypervisor": "Hypervisor",
+    "cpus": "CPUs",
+    "memory": "Memory",
+    "bridges": "Bridges",
+    "vms": "VMs",
+    "thisNode": "(this node)",
+    "joinNote": "To add a node, issue a join token on the Cluster page and run oplctl cluster join on the new node.",
+    "maintenanceNote": "No new VMs are placed on a node in maintenance. VMs already running there keep running.",
+    "startMaintenance": "Enter maintenance",
+    "endMaintenance": "End maintenance",
+    "maintenanceOn": "{{name}} is in maintenance.",
+    "maintenanceOff": "{{name}} is out of maintenance.",
+    "remove": "Remove from cluster",
+    "removeTitle": "Remove {{name}} from the cluster?",
+    "removeDescription": "Only for a node that is dead for good. It cannot rejoin with its current data, and VMs assigned to it stay assigned.",
+    "removed": "Removed {{name}} from the cluster."
   },
   "vmForm": {
     "createTitle": "Create a virtual machine",

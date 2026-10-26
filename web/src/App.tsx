@@ -12,6 +12,7 @@ import { ThemeProvider } from "@/lib/theme";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { NetworksPage } from "@/networks/NetworksPage";
+import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { PoolsPage } from "@/storage/PoolsPage";
 import { TasksPage } from "@/tasks/TasksPage";
@@ -44,6 +45,7 @@ function routes() {
             { path: "vms/:name/console", element: <ConsolePage /> },
             { path: "storage-pools", element: <PoolsPage /> },
             { path: "networks", element: <NetworksPage /> },
+            { path: "nodes", element: <NodesPage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],

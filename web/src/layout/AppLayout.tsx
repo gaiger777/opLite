@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import {
+  Cpu,
   Database,
   Languages,
   LayoutDashboard,
@@ -37,6 +38,7 @@ const NAV = [
   { to: "/vms", key: "nav.vms", icon: Server, end: false },
   { to: "/storage-pools", key: "nav.pools", icon: Database, end: false },
   { to: "/networks", key: "nav.networks", icon: Network, end: false },
+  { to: "/nodes", key: "nav.nodes", icon: Cpu, end: false },
   { to: "/tasks", key: "nav.tasks", icon: ListChecks, end: false },
 ] as const;
 
