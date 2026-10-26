@@ -152,12 +152,16 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
     if (!path.startsWith("/")) {
       found.path = "pools.errors.path";
     }
+    // 고른 뒤에 목록에서 빠진 노드는 보내지 않는다.
+    const known = chosen.filter((id) => nodes.data?.some((n) => n.id === id));
+    // 고른 노드가 모두 빠졌으면 빈 목록(모든 노드)으로 보내지 않는다.
+    if (chosen.length > 0 && known.length === 0) {
+      found.nodes = "pools.errors.nodesGone";
+    }
     setErrors(found);
     if (Object.keys(found).length > 0) {
       return false;
     }
-    // 고른 뒤에 목록에서 빠진 노드는 보내지 않는다.
-    const known = chosen.filter((id) => nodes.data?.some((n) => n.id === id));
     await call(
       api.POST("/storage-pools", {
         body: { name, spec: { backend: { kind: "dir", path }, nodes: known } },
@@ -190,7 +194,10 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
           />
         )}
       </Field>
-      <fieldset className="flex flex-col gap-2">
+      <fieldset
+        className="flex flex-col gap-2"
+        aria-describedby={errors.nodes ? "pool-nodes-error" : undefined}
+      >
         <legend className="mb-2 text-sm font-medium">{t("pools.nodes")}</legend>
         {!nodes.isSuccess && <ListPending error={nodes.error} />}
         {(nodes.data ?? []).map((node) => (
@@ -206,6 +213,11 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
           </div>
         ))}
         <p className="text-xs text-muted-foreground">{t("pools.nodesHint")}</p>
+        {errors.nodes && (
+          <p id="pool-nodes-error" className="text-xs text-destructive">
+            {t(errors.nodes)}
+          </p>
+        )}
       </fieldset>
     </FormDialog>
   );

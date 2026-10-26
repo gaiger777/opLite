@@ -1,6 +1,7 @@
 import { useId, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 
+import { focusBack } from "@/components/focusBack";
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -10,7 +11,6 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { focusBack } from "@/components/FormDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -38,11 +38,12 @@ export function ConfirmDialog(props: Props) {
   const [busy, setBusy] = useState(false);
   const inputId = useId();
   // 닫히는 애니메이션 동안 부모가 대상을 비워도 마지막 제목과 이름을 그대로 보인다.
+  // jsdom엔 닫힘 애니메이션이 없어 테스트하지 않는다.
   const [shown, setShown] = useState({ title: props.title, name: props.typeToConfirm });
   if (props.open && (shown.title !== props.title || shown.name !== props.typeToConfirm)) {
     setShown({ title: props.title, name: props.typeToConfirm });
   }
-  const ready = props.typeToConfirm === undefined || typed === props.typeToConfirm;
+  const ready = shown.name === undefined || typed === shown.name;
 
   function openChange(open: boolean) {
     // 요청 중에는 닫지 않는다(결과와 오류를 보여 줄 곳이 사라진다).

@@ -83,9 +83,11 @@ it("judges nothing without the nodes and VMs", async () => {
   const lab = (await screen.findByText("lab")).closest("tr")!;
   expect(within(lab).getByRole("button", { name: "Delete lab" })).toBeDisabled();
   expect(lab).not.toHaveTextContent("No node has this bridge");
-  const cells = within(lab).getAllByRole("cell");
-  expect(cells.at(-3)).toHaveTextContent("—");
-  expect(cells.at(-2)).toHaveTextContent("—");
+  const headers = within(lab.closest("table")!).getAllByRole("columnheader");
+  const cell = (name: string) =>
+    within(lab).getAllByRole("cell")[headers.findIndex((h) => h.textContent === name)];
+  expect(cell("Nodes with the bridge")).toHaveTextContent("—");
+  expect(cell("VMs")).toHaveTextContent("—");
 });
 
 it("creates a network after checking its fields", async () => {

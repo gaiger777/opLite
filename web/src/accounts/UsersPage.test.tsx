@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
@@ -144,7 +144,7 @@ it("shows why the server refused a role change", async () => {
 });
 
 it("returns focus to the row menu after cancelling a dialog", async () => {
-  users([ME, KIM]);
+  users([ME, KIM, { ...KIM, id: "00000000-0000-0000-0000-0000000000l1", name: "lee" }]);
   renderPage(<UsersPage />);
   const trigger = await screen.findByRole("button", { name: "Actions for kim" });
   await userEvent.click(trigger);
@@ -159,6 +159,15 @@ it("returns focus to the row menu after cancelling a dialog", async () => {
     within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Cancel" }),
   );
   await waitFor(() => expect(trigger).toHaveFocus());
+
+  // 다른 행의 메뉴를 키보드로 열면 그 행의 버튼으로 돌아간다.
+  const lee = screen.getByRole("button", { name: "Actions for lee" });
+  act(() => lee.focus());
+  await userEvent.keyboard("{Enter}");
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Change role" }));
+  const leeDialog = await screen.findByRole("dialog", { name: "Change the role of lee" });
+  await userEvent.click(within(leeDialog).getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(lee).toHaveFocus());
 });
 
 it("resets another user's password", async () => {

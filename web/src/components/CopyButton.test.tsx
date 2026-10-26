@@ -14,13 +14,24 @@ function setup() {
   fireEvent.click(screen.getByRole("button", { name: "Copy the token" }));
 }
 
+// navigator 전체를 바꾸지 않고 clipboard만 바꾼 뒤 되돌린다.
+const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+
+function setClipboard(value: unknown) {
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value });
+}
+
 afterEach(() => {
-  vi.unstubAllGlobals();
+  if (original) {
+    Object.defineProperty(navigator, "clipboard", original);
+  } else {
+    Reflect.deleteProperty(navigator, "clipboard");
+  }
 });
 
 it("says it copied", async () => {
   const writeText = vi.fn(() => Promise.resolve());
-  vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+  setClipboard({ writeText });
   setup();
   expect(await screen.findByText("Copied.")).toBeInTheDocument();
   expect(writeText).toHaveBeenCalledWith("secret");
@@ -28,7 +39,7 @@ it("says it copied", async () => {
 
 it("says it could not copy without a clipboard", async () => {
   // 보안 맥락(HTTPS)이 아니면 navigator.clipboard가 없다.
-  vi.stubGlobal("navigator", { ...navigator, clipboard: undefined });
+  setClipboard(undefined);
   setup();
   expect(
     await screen.findByText("Could not copy. Select the text and copy it yourself."),

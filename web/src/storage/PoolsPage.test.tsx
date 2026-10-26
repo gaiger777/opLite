@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { act, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
@@ -73,6 +73,32 @@ it("creates a pool on the chosen nodes", async () => {
     spec: { backend: { kind: "dir", path: "/srv/fast" }, nodes: ["n2"] },
   });
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+});
+
+// 고른 노드가 모두 빠진 채로 보내면 빈 목록이 되어 모든 노드의 풀이 된다.
+it("does not create a pool when the chosen nodes are gone", async () => {
+  mockLists({ node: [NODE, { ...NODE, id: "n2", name: "node-b" }] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/storage-pools"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("fast"), { status: 201 });
+    }),
+  );
+  const { queryClient } = renderPage(<PoolsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "fast");
+  await userEvent.type(within(dialog).getByLabelText("Directory"), "/srv/fast");
+  await userEvent.click(await within(dialog).findByRole("checkbox", { name: "node-b" }));
+  act(() => {
+    queryClient.setQueryData(["list", "node"], { revision: 2, items: [NODE] });
+  });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByRole("group", { name: "Nodes" })).toHaveAccessibleDescription(
+    "The chosen nodes are no longer in the cluster. Choose again.",
+  );
+  expect(body).toBeUndefined();
 });
 
 it("says when the nodes cannot be read", async () => {

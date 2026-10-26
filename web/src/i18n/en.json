@@ -249,7 +249,8 @@
     "deleted": "Deleted storage pool {{name}}.",
     "inUse": "Delete its volumes first.",
     "errors": {
-      "path": "Enter an absolute path (starting with /)."
+      "path": "Enter an absolute path (starting with /).",
+      "nodesGone": "The chosen nodes are no longer in the cluster. Choose again."
     }
   },
   "networks": {
@@ -364,7 +365,7 @@
   "cluster": {
     "title": "Cluster {{name}}",
     "ca": "Certificate authority",
-    "caNote": "Every node's HTTPS certificate is signed by the cluster CA. Import the CA into your browser to stop the certificate warning, and check that its fingerprint matches. Browsers show the SHA-256 fingerprint in uppercase hex, in pairs separated by colons or spaces; compare it with the digits after sha256:.",
+    "caNote": "Every node's HTTPS certificate is signed by the cluster CA. Import the CA into your browser to stop the certificate warning, and check that its fingerprint matches. Browsers show the SHA-256 fingerprint in uppercase hex, in pairs separated by colons or spaces; compare it with the hex after sha256: (letter case does not matter).",
     "copyFingerprint": "Copy the CA fingerprint",
     "downloadCa": "Download the CA",
     "members": "Members",

@@ -12,6 +12,7 @@ import {
   startUpload,
   uploadImage,
 } from "@/storage/upload";
+import * as tasks from "@/tasks/tasks";
 import { resetTasks } from "@/tasks/tasks";
 import { FakeXhr } from "@/test/fakeXhr";
 import { task } from "@/test/fixtures";
@@ -106,9 +107,9 @@ it("shows progress in a toast, guards the page and hands the task over", async (
 
   act(() => FakeXhr.last!.progress(1024, 2048));
   expect(await screen.findByText("Uploading img: 50% (1 KiB / 2 KiB)")).toBeInTheDocument();
-  // 5% 단위로만 바꾼다.
-  act(() => FakeXhr.last!.progress(1100, 2048));
-  expect(screen.getByText("Uploading img: 50% (1 KiB / 2 KiB)")).toBeInTheDocument();
+  // 5% 단위로 내림한다(56%가 아니라 55%). sonner는 나중에 바꾸므로 기다린다.
+  act(() => FakeXhr.last!.progress(1150, 2048));
+  expect(await screen.findByText("Uploading img: 55% (1.1 KiB / 2 KiB)")).toBeInTheDocument();
   // 다 보내면 서버가 처리하는 동안 취소할 수 없다.
   act(() => FakeXhr.last!.progress(2048, 2048));
   expect(await screen.findByText("Processing img…")).toBeInTheDocument();
@@ -164,6 +165,21 @@ it("fails instead of hanging when the answer is not a task", async () => {
   toasts();
   act(() => startUpload(new File(["x"], "img.raw"), PARAMS, i18n.t));
   act(() => FakeXhr.last!.respond(202, "<html>"));
+  expect(await screen.findByText(/^Upload of img failed\./)).toBeInTheDocument();
+  expect(screen.queryByText(/^Uploading img/)).not.toBeInTheDocument();
+});
+
+// 넘기다 던져도 "올리는 중" 알림에 남지 않고 실패를 알린다.
+it("says the upload failed when handing over the task throws", async () => {
+  vi.spyOn(tasks, "trackTask").mockImplementation(() => {
+    throw new Error("boom");
+  });
+  onTestFinished(() => {
+    vi.restoreAllMocks();
+  });
+  toasts();
+  act(() => startUpload(new File(["x"], "img.raw"), PARAMS, i18n.t));
+  act(() => FakeXhr.last!.respond(202, task("t9", "volume-import", "v1")));
   expect(await screen.findByText(/^Upload of img failed\./)).toBeInTheDocument();
   expect(screen.queryByText(/^Uploading img/)).not.toBeInTheDocument();
 });

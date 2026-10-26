@@ -88,6 +88,8 @@ it("shows a new token's secret once, with a copy button", async () => {
   expect(within(dialog).queryByRole("button", { name: "Close" })).not.toBeInTheDocument();
   await user.keyboard("{Escape}");
   expect(dialog).toBeInTheDocument();
+  await user.click(document.querySelector<HTMLElement>("[data-slot=dialog-overlay]")!);
+  expect(dialog).toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "Done" }));
   await vi.waitFor(() => expect(dialog).not.toBeInTheDocument());
   expect(screen.queryByDisplayValue("opl_abc_secret")).not.toBeInTheDocument();
