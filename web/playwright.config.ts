@@ -11,7 +11,7 @@ if (!process.env.OPL_URL) {
 export default defineConfig({
   testDir: "e2e",
   // VM 시작과 강제 정지가 각각 1분까지 걸릴 수 있다.
-  timeout: 240_000,
+  timeout: 300_000,
   expect: { timeout: 30_000 },
   retries: 0,
   workers: 1,

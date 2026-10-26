@@ -51,6 +51,7 @@ test("upload an image, run a VM from it, then delete everything", async ({ page 
   await dialog.getByLabel("Name").fill("local");
   await dialog.getByLabel("Directory").fill(poolPath);
   await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(dialog).toBeHidden();
   await expect(page.getByRole("cell", { name: "local", exact: true })).toBeVisible();
 
   await page.getByRole("link", { name: "Volumes" }).click();
@@ -61,9 +62,13 @@ test("upload an image, run a VM from it, then delete everything", async ({ page 
   await dialog.getByLabel("Name").fill("root");
   await dialog.getByLabel("Storage pool").selectOption("local");
   await dialog.getByRole("button", { name: "Upload" }).click();
-  const root = page.getByRole("row").filter({ has: page.getByRole("cell", { name: "root" }) });
+  const root = page
+    .getByRole("row")
+    .filter({ has: page.getByRole("cell", { name: "root", exact: true }) });
   await expect(root).toContainText("Ready", { timeout: 60_000 });
   await expect(root).toContainText("16 MiB");
+  // raw 파일을 기본 형식 qcow2로 바꿔 가져왔다.
+  await expect(root.getByRole("cell", { name: "qcow2", exact: true })).toBeVisible();
 
   await page.getByRole("link", { name: "Virtual machines" }).click();
   await page.getByRole("link", { name: "Create" }).click();
@@ -102,7 +107,9 @@ test("upload an image, run a VM from it, then delete everything", async ({ page 
   confirm = page.getByRole("alertdialog");
   await confirm.getByLabel("Type root to confirm").fill("root");
   await confirm.getByRole("button", { name: "Delete" }).click();
-  await expect(page.getByRole("cell", { name: "root" })).toHaveCount(0, { timeout: 60_000 });
+  await expect(page.getByRole("cell", { name: "root", exact: true })).toHaveCount(0, {
+    timeout: 60_000,
+  });
 
   await page.getByRole("link", { name: "Storage pools" }).click();
   await page.getByRole("button", { name: "Delete local" }).click();

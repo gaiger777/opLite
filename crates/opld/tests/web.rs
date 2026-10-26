@@ -8,6 +8,7 @@ mod common;
 
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use common::Daemon;
 
@@ -53,10 +54,15 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
     .await
     .unwrap();
     if !out.status.success() {
-        // 브라우저가 지우지 못한 것을 지운다(QEMU가 남지 않게). 실패는 무시한다.
+        // 브라우저가 지우지 못한 VM을 끄고 지운다(QEMU가 남지 않게). 볼륨 삭제는 Task를 오래 기다릴 수
+        // 있어 잠깐만 기다리고, 풀과 남은 파일은 데몬의 임시 디렉터리와 함께 사라진다. 실패는 무시한다.
         let _ = d.ctl(&["vm", "stop", "web", "--force"]).await;
         let _ = d.ctl(&["vm", "delete", "web"]).await;
-        let _ = d.ctl(&["volume", "delete", "root"]).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            d.ctl(&["volume", "delete", "root"]),
+        )
+        .await;
     }
     assert!(
         out.status.success(),
@@ -70,5 +76,15 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
         let list = d.ctl_json(&[kind, "list"]).await;
         assert_eq!(list.as_array().map(Vec::len), Some(0), "{kind}: {list}");
     }
+    // 볼륨 파일도 지웠다. dir 풀의 디렉터리에는 볼륨 파일과 만드는 동안의 임시 파일만 생긴다.
+    let left: Vec<_> = std::fs::read_dir(&pool)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "pool directory {}: {left:?}",
+        pool.display()
+    );
     d.stop();
 }
