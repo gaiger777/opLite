@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 개발 초기 (M7, 웹 UI 진행 중)
+- 상태: 개발 초기 (노드 코어 M7, 웹 UI)
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -90,10 +90,13 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 브라우저는 클러스터 CA를 모르므로 처음 접속하면 인증서 경고가 뜬다. CA를 내려받아
 (`curl -k https://<노드>:8006/api/v1/cluster/ca -o opl-ca.pem`, `openssl x509 -in opl-ca.pem -noout
 -fingerprint -sha256`의 지문을 `cluster init` 출력과 비교) 운영체제나 브라우저의 신뢰할 인증서로
-가져오면 경고가 사라진다.
+가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
-지금 웹 UI는 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔), 작업을 다룬다. 볼륨·스토리지 풀·
-네트워크·노드·사용자·클러스터 화면은 계획 9에서 더한다.
+웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔),
+볼륨(빈 볼륨, 이미지 업로드), 스토리지 풀, 네트워크, 노드(유지보수 모드, 죽은 노드 제거), 작업,
+사용자(admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
+`oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
+그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
 
 ## 개발
 
@@ -124,7 +127,7 @@ pnpm -C web test             # 단위·컴포넌트 테스트 (Vitest)
 pnpm -C web typecheck && pnpm -C web lint
 pnpm -C web gen:api          # API를 바꾼 뒤 src/api/schema.d.ts를 다시 만든다(CI가 확인한다)
 pnpm -C web exec playwright install chromium
-pnpm -C web build && cargo test -p opld --features web-it --test web   # E2E: 브라우저 → VM → 콘솔
+pnpm -C web build && cargo test -p opld --features web-it --test web   # E2E: 브라우저 → 업로드 → VM → 콘솔 → 정리
 ```
 
 `cargo test --workspace --all-features`는 `web-it`도 켜므로 위 준비(빌드한 `web/dist`, pnpm, Chromium)가
@@ -146,3 +149,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 6: 클러스터 부트스트랩, 노드 간 통신](docs/superpowers/plans/2026-10-22-plan6-cluster-bootstrap.md)
 - [계획 7: Linux/KVM, 브리지 네트워크](docs/superpowers/plans/2026-10-22-plan7-kvm-bridge.md)
 - [계획 8: 웹 UI 기반과 가상 머신 화면](docs/superpowers/plans/2026-10-23-plan8-web-ui.md)
+- [계획 9: 웹 UI 관리 화면](docs/superpowers/plans/2026-10-26-plan9-web-ui-admin.md)
