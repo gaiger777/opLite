@@ -24,6 +24,7 @@
   "nav": {
     "dashboard": "Dashboard",
     "vms": "Virtual machines",
+    "pools": "Storage pools",
     "tasks": "Tasks"
   },
   "header": {
@@ -165,6 +166,33 @@
     "bulkSummary": "{{action}}: {{done}} requested, {{failed}} failed, {{skipped}} skipped.",
     "noDisks": "No disks.",
     "noNics": "No network interfaces."
+  },
+  "forms": {
+    "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."
+  },
+  "pools": {
+    "name": "Name",
+    "path": "Directory",
+    "nodes": "Nodes",
+    "free": "Free / total",
+    "volumes": "Volumes",
+    "empty": "No storage pools.",
+    "allNodes": "All nodes",
+    "create": "Create",
+    "createTitle": "Create a storage pool",
+    "createDescription": "A directory on the nodes that holds volume files. Create the directory on each node first.",
+    "pathHint": "An absolute path on the nodes.",
+    "nodesHint": "Leave all unchecked to use it on every node.",
+    "created": "Created storage pool {{name}}.",
+    "delete": "Delete",
+    "deleteNamed": "Delete {{name}}",
+    "deleteTitle": "Delete storage pool {{name}}?",
+    "deleteDescription": "Only the pool is removed. Files in its directory stay on the nodes.",
+    "deleted": "Deleted storage pool {{name}}.",
+    "inUse": "Delete its volumes first.",
+    "errors": {
+      "path": "Enter an absolute path (starting with /)."
+    }
   },
   "vmForm": {
     "createTitle": "Create a virtual machine",

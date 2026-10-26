@@ -1,4 +1,4 @@
-import type { Node, Task, Vm } from "@/api/types";
+import type { Node, StoragePool, Task, Vm, Volume } from "@/api/types";
 
 /** 테스트용 VM. 필요한 필드만 바꿔 쓴다. */
 export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm> = {}): Vm {
@@ -40,4 +40,26 @@ export function task(id: string, kind: Task["spec"]["op"]["kind"], target: strin
     spec: { op: { kind }, target, node: "n1" },
     status: { state: "pending", error: null },
   } as Task;
+}
+
+export function pool(name: string, extra: Partial<StoragePool["spec"]> = {}): StoragePool {
+  return {
+    id: `019a0f3c-0000-7000-8001-${name.padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: { backend: { kind: "dir", path: `/srv/${name}` }, nodes: [], ...extra },
+    status: { available_bytes: 64 * 1024 ** 3, total_bytes: 128 * 1024 ** 3 },
+  };
+}
+
+export function volume(name: string, pool: string, extra: Partial<Volume["status"]> = {}): Volume {
+  return {
+    id: `019a0f3c-0000-7000-8002-${name.padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: { pool, size_bytes: 16 * 1024 ** 3, format: "qcow2" },
+    status: { phase: "ready", node: "n1", allocated_bytes: 1024 ** 3, attached_to: null, ...extra },
+  };
 }

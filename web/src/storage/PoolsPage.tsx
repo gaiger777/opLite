@@ -1,0 +1,203 @@
+import { Plus, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
+
+import { api, call } from "@/api/client";
+import { useList } from "@/api/live";
+import type { StoragePool } from "@/api/types";
+import { usePrincipal } from "@/auth/AuthProvider";
+import { can } from "@/auth/permissions";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { Field } from "@/components/Field";
+import { FormDialog } from "@/components/FormDialog";
+import { TableMessage } from "@/components/TableMessage";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { formatBytes } from "@/lib/format";
+import { validName } from "@/vms/form";
+
+export function PoolsPage() {
+  const { t } = useTranslation();
+  const me = usePrincipal();
+  const pools = useList("storage-pool");
+  const volumes = useList("volume");
+  const nodes = useList("node");
+  const [creating, setCreating] = useState(false);
+  const [deleting, setDeleting] = useState<StoragePool | null>(null);
+  const write = can(me.role, "write", "storage-pool");
+
+  const nodeNames = (pool: StoragePool) => {
+    const ids = pool.spec.nodes ?? [];
+    // 노드를 정하지 않은 풀은 모든 노드에서 쓴다.
+    return ids.length === 0
+      ? t("pools.allNodes")
+      : ids.map((id) => nodes.data?.find((n) => n.id === id)?.name ?? id.slice(-8)).join(", ");
+  };
+  const volumeCount = (pool: StoragePool) =>
+    volumes.data?.filter((v) => v.spec.pool === pool.name).length ?? 0;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h1 id="pools-title" className="text-2xl font-semibold">
+          {t("nav.pools")}
+        </h1>
+        {write && (
+          <Button onClick={() => setCreating(true)}>
+            <Plus />
+            {t("pools.create")}
+          </Button>
+        )}
+      </div>
+      <Table aria-labelledby="pools-title">
+        <TableHeader>
+          <TableRow>
+            <TableHead>{t("pools.name")}</TableHead>
+            <TableHead>{t("pools.path")}</TableHead>
+            <TableHead>{t("pools.nodes")}</TableHead>
+            <TableHead>{t("pools.free")}</TableHead>
+            <TableHead>{t("pools.volumes")}</TableHead>
+            {write && (
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
+            )}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {(pools.data ?? []).length === 0 && (
+            <TableMessage colSpan={write ? 6 : 5} query={pools} empty={t("pools.empty")} />
+          )}
+          {(pools.data ?? []).map((pool) => {
+            const { available_bytes: free, total_bytes: total } = pool.status;
+            const used = volumeCount(pool);
+            return (
+              <TableRow key={pool.id}>
+                <TableCell className="font-medium">{pool.name}</TableCell>
+                <TableCell className="font-mono text-xs">{pool.spec.backend.path}</TableCell>
+                <TableCell>{nodeNames(pool)}</TableCell>
+                <TableCell>
+                  {free !== null && total !== null
+                    ? `${formatBytes(free)} / ${formatBytes(total)}`
+                    : "—"}
+                </TableCell>
+                <TableCell>{used}</TableCell>
+                {write && (
+                  <TableCell className="text-right">
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={t("pools.deleteNamed", { name: pool.name })}
+                      // 볼륨이 남은 풀은 서버가 지우지 않는다.
+                      disabled={used > 0}
+                      title={used > 0 ? t("pools.inUse") : undefined}
+                      onClick={() => setDeleting(pool)}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </TableCell>
+                )}
+              </TableRow>
+            );
+          })}
+        </TableBody>
+      </Table>
+      {creating && <CreatePoolDialog onClose={() => setCreating(false)} />}
+      <ConfirmDialog
+        open={deleting !== null}
+        onOpenChange={(open) => !open && setDeleting(null)}
+        title={t("pools.deleteTitle", { name: deleting?.name })}
+        description={t("pools.deleteDescription")}
+        confirmLabel={t("pools.delete")}
+        onConfirm={async () => {
+          const pool = deleting!;
+          await call(api.DELETE("/storage-pools/{key}", { params: { path: { key: pool.id } } }));
+          toast.success(t("pools.deleted", { name: pool.name }));
+        }}
+      />
+    </div>
+  );
+}
+
+function CreatePoolDialog({ onClose }: { onClose(): void }) {
+  const { t } = useTranslation();
+  const nodes = useList("node");
+  const [name, setName] = useState("");
+  const [path, setPath] = useState("");
+  const [chosen, setChosen] = useState<string[]>([]);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+
+  async function submit() {
+    const found: Record<string, string> = {};
+    if (!validName(name)) {
+      found.name = "forms.name";
+    }
+    if (!path.startsWith("/")) {
+      found.path = "pools.errors.path";
+    }
+    setErrors(found);
+    if (Object.keys(found).length > 0) {
+      return false;
+    }
+    await call(
+      api.POST("/storage-pools", {
+        body: { name, spec: { backend: { kind: "dir", path }, nodes: chosen } },
+      }),
+    );
+    toast.success(t("pools.created", { name }));
+  }
+
+  return (
+    <FormDialog
+      title={t("pools.createTitle")}
+      description={t("pools.createDescription")}
+      submitLabel={t("pools.create")}
+      onClose={onClose}
+      onSubmit={submit}
+    >
+      <Field id="pool-name" label={t("pools.name")} error={errors.name}>
+        {(a11y) => (
+          <Input id="pool-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />
+        )}
+      </Field>
+      <Field id="pool-path" label={t("pools.path")} error={errors.path} hint={t("pools.pathHint")}>
+        {(a11y) => (
+          <Input
+            id="pool-path"
+            placeholder="/var/lib/opl/pool"
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
+            {...a11y}
+          />
+        )}
+      </Field>
+      <fieldset className="flex flex-col gap-2">
+        <legend className="mb-2 text-sm font-medium">{t("pools.nodes")}</legend>
+        {(nodes.data ?? []).map((node) => (
+          <div key={node.id} className="flex items-center gap-2">
+            <Checkbox
+              id={`pool-node-${node.id}`}
+              checked={chosen.includes(node.id)}
+              onCheckedChange={(v) =>
+                setChosen((c) => (v === true ? [...c, node.id] : c.filter((id) => id !== node.id)))
+              }
+            />
+            <Label htmlFor={`pool-node-${node.id}`}>{node.name}</Label>
+          </div>
+        ))}
+        <p className="text-xs text-muted-foreground">{t("pools.nodesHint")}</p>
+      </fieldset>
+    </FormDialog>
+  );
+}
