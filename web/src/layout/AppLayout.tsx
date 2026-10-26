@@ -7,6 +7,7 @@ import {
   LogOut,
   Monitor,
   Moon,
+  Network,
   Server,
   Sun,
   User,
@@ -35,6 +36,7 @@ const NAV = [
   { to: "/", key: "nav.dashboard", icon: LayoutDashboard, end: true },
   { to: "/vms", key: "nav.vms", icon: Server, end: false },
   { to: "/storage-pools", key: "nav.pools", icon: Database, end: false },
+  { to: "/networks", key: "nav.networks", icon: Network, end: false },
   { to: "/tasks", key: "nav.tasks", icon: ListChecks, end: false },
 ] as const;
 

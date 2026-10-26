@@ -11,6 +11,7 @@ import { AppLayout } from "@/layout/AppLayout";
 import { ThemeProvider } from "@/lib/theme";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { LoginPage } from "@/pages/LoginPage";
+import { NetworksPage } from "@/networks/NetworksPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { PoolsPage } from "@/storage/PoolsPage";
 import { TasksPage } from "@/tasks/TasksPage";
@@ -42,6 +43,7 @@ function routes() {
             { path: "vms/:name/edit", element: <VmEditPage /> },
             { path: "vms/:name/console", element: <ConsolePage /> },
             { path: "storage-pools", element: <PoolsPage /> },
+            { path: "networks", element: <NetworksPage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],

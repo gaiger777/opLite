@@ -19,12 +19,15 @@
     "console_unavailable": "지금은 콘솔을 열 수 없습니다.",
     "cluster_no_quorum": "클러스터 과반수가 없습니다. 변경은 나중에 적용될 수 있습니다.",
     "not_leader": "클러스터 리더가 바뀌는 중입니다. 잠시 뒤 다시 시도하세요.",
+    "network_in_use": "이 네트워크를 쓰는 VM이 있습니다. 먼저 그 인터페이스를 빼세요.",
+    "pool_in_use": "풀에 볼륨이 남아 있습니다. 먼저 볼륨을 지우세요.",
     "internal": "서버 오류: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
     "vms": "가상 머신",
     "pools": "스토리지 풀",
+    "networks": "네트워크",
     "tasks": "작업"
   },
   "header": {
@@ -192,6 +195,34 @@
     "inUse": "먼저 볼륨을 지우세요.",
     "errors": {
       "path": "절대 경로(/로 시작)를 입력하세요."
+    }
+  },
+  "networks": {
+    "name": "이름",
+    "bridge": "브리지",
+    "vlan": "VLAN",
+    "vlanOptional": "VLAN 태그(선택)",
+    "vlanHint": "1–4094. 브리지가 VLAN을 알아야 합니다(vlan_filtering 1).",
+    "nodes": "브리지가 있는 노드",
+    "vms": "VM",
+    "empty": "네트워크가 없습니다.",
+    "userNote": "user 네트워크(QEMU NAT)는 늘 쓸 수 있으며 목록에 나오지 않습니다.",
+    "noNode": "이 브리지가 있는 노드가 없습니다",
+    "noVlanFiltering": "{{nodes}}에서 VLAN 필터링이 꺼져 있습니다",
+    "create": "만들기",
+    "createTitle": "네트워크 만들기",
+    "createDescription": "노드에 이미 있는 Linux 브리지에 VM 인터페이스를 연결합니다. 이 네트워크의 VM은 그 브리지가 있는 노드에서만 실행됩니다.",
+    "created": "네트워크 {{name}}을(를) 만들었습니다.",
+    "delete": "삭제",
+    "deleteNamed": "{{name}} 삭제",
+    "deleteTitle": "네트워크 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "네트워크만 지웁니다. 노드의 브리지는 바꾸지 않습니다.",
+    "deleted": "네트워크 {{name}}을(를) 삭제했습니다.",
+    "inUse": "이 네트워크를 쓰는 VM이 있습니다.",
+    "errors": {
+      "reserved": "user는 NAT에 예약된 이름입니다.",
+      "bridge": "/, :, 공백 없이 1–15자로 쓰세요.",
+      "vlan": "1부터 4094까지의 숫자를 쓰세요."
     }
   },
   "vmForm": {

@@ -19,12 +19,15 @@
     "console_unavailable": "The console is not available right now.",
     "cluster_no_quorum": "The cluster has no quorum. The change may still be applied later.",
     "not_leader": "The cluster leader is changing. Try again shortly.",
+    "network_in_use": "A VM uses this network. Remove its interface first.",
+    "pool_in_use": "The pool still has volumes. Delete them first.",
     "internal": "The server failed: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
     "vms": "Virtual machines",
     "pools": "Storage pools",
+    "networks": "Networks",
     "tasks": "Tasks"
   },
   "header": {
@@ -192,6 +195,34 @@
     "inUse": "Delete its volumes first.",
     "errors": {
       "path": "Enter an absolute path (starting with /)."
+    }
+  },
+  "networks": {
+    "name": "Name",
+    "bridge": "Bridge",
+    "vlan": "VLAN",
+    "vlanOptional": "VLAN tag (optional)",
+    "vlanHint": "1–4094. The bridge must be VLAN-aware (vlan_filtering 1).",
+    "nodes": "Nodes with the bridge",
+    "vms": "VMs",
+    "empty": "No networks.",
+    "userNote": "The user network (QEMU NAT) is always available and is not listed.",
+    "noNode": "No node has this bridge",
+    "noVlanFiltering": "VLAN filtering is off on {{nodes}}",
+    "create": "Create",
+    "createTitle": "Create a network",
+    "createDescription": "Points VM interfaces at a Linux bridge that already exists on the nodes. VMs on this network run only on nodes with the bridge.",
+    "created": "Created network {{name}}.",
+    "delete": "Delete",
+    "deleteNamed": "Delete {{name}}",
+    "deleteTitle": "Delete network {{name}}?",
+    "deleteDescription": "Only the network is removed. The bridges on the nodes are not changed.",
+    "deleted": "Deleted network {{name}}.",
+    "inUse": "VMs use this network.",
+    "errors": {
+      "reserved": "The name user is reserved for NAT.",
+      "bridge": "Use 1–15 characters without /, : or spaces.",
+      "vlan": "Use a number from 1 to 4094."
     }
   },
   "vmForm": {
