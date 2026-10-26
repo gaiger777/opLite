@@ -31,7 +31,7 @@ export function nameFromFile(file: string): string {
 /** 확장자로 원본 형식을 짐작한다. 모르면 raw다(`.img`, `.raw`, `.iso`). */
 export function sourceFormatOf(file: string): Schemas["SourceFormat"] {
   const ext = file.toLowerCase().split(".").pop();
-  return ext === "vmdk" ? "vmdk" : ext === "qcow2" || ext === "qcow" ? "qcow2" : "raw";
+  return ext === "vmdk" ? "vmdk" : ext === "qcow2" ? "qcow2" : "raw";
 }
 
 /**
@@ -75,7 +75,12 @@ export function uploadImage(
         // 프록시의 HTML 오류 페이지 따위
       }
       if (xhr.status === 202) {
-        resolve(body as Task);
+        // Task가 아닌 본문(프록시 따위)은 실패로 본다.
+        if (typeof (body as Partial<Task> | null)?.id === "string") {
+          resolve(body as Task);
+        } else {
+          reject(toApiError(xhr.status, body));
+        }
         return;
       }
       if (xhr.status === 401) {
@@ -101,6 +106,8 @@ const active = new Map<string, { controller: AbortController; silent: boolean }>
 /** 올리는 중에 페이지를 떠나려 하면 브라우저가 확인한다. */
 function guard(e: BeforeUnloadEvent) {
   e.preventDefault();
+  // 옛 브라우저
+  e.returnValue = "";
 }
 
 /** 업로드를 모두 취소한다. 로그아웃하거나 세션이 끝나면 부른다(다음 사용자에게 이어지지 않게). */
@@ -126,7 +133,21 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
   active.set(id, upload);
   let shown = -1;
   const show = (loaded: number, total: number) => {
-    const percent = total > 0 ? Math.floor((loaded / total) * 100) : 0;
+    if (shown === 100) {
+      return;
+    }
+    if (total > 0 && loaded >= total) {
+      // 다 보냈다. 서버가 파일을 쓰고 Task를 만드는 동안은 취소하지 않는다.
+      shown = 100;
+      toast.loading(t("uploads.processing", { name: params.name }), {
+        id,
+        action: undefined,
+        duration: Infinity,
+      });
+      return;
+    }
+    // 화면 낭독기가 덜 읽도록 5% 단위로만 바꾼다.
+    const percent = total > 0 ? Math.floor((loaded / total) * 20) * 5 : 0;
     if (percent === shown) {
       return;
     }
@@ -143,31 +164,32 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
   };
   show(0, file.size);
   void uploadImage(file, params, { onProgress: show, signal: controller.signal })
-    .then(
-      (task) => {
+    .then((task) => {
+      toast.dismiss(id);
+      trackTask(task, t("tasks.op.volume-import", { target: params.name }));
+    })
+    // 넘기다 던져도 알림이 "올리는 중"에 남지 않게 여기서 함께 받는다.
+    .catch((err: unknown) => {
+      // 같은 id로 바꾸는 알림은 이전 옵션을 물려받으므로 취소 버튼을 지운다.
+      if (upload.silent) {
         toast.dismiss(id);
-        trackTask(task, t("tasks.op.volume-import", { target: params.name }));
-      },
-      (err: unknown) => {
-        // 같은 id로 바꾸는 알림은 이전 옵션을 물려받으므로 취소 버튼을 지운다.
-        if (upload.silent) {
-          toast.dismiss(id);
-        } else if (controller.signal.aborted) {
-          toast.info(t("uploads.cancelled", { name: params.name }), {
-            id,
-            action: undefined,
-            duration: 4000,
-          });
-        } else {
-          toast.error(t("uploads.failed", { name: params.name, error: errorMessage(t, err) }), {
-            id,
-            action: undefined,
-            duration: Infinity,
-            closeButton: true,
-          });
-        }
-      },
-    )
+      } else if (controller.signal.aborted) {
+        toast.info(t("uploads.cancelled", { name: params.name }), {
+          id,
+          action: undefined,
+          duration: 4000,
+        });
+      } else {
+        // 서버가 본문을 다 받기 전에 거절해도(401·409·507 따위) 브라우저는 연결 끊김으로만 알린다.
+        const error = err instanceof NetworkError ? t("uploads.dropped") : errorMessage(t, err);
+        toast.error(t("uploads.failed", { name: params.name, error }), {
+          id,
+          action: undefined,
+          duration: Infinity,
+          closeButton: true,
+        });
+      }
+    })
     .finally(() => {
       active.delete(id);
       if (active.size === 0) {

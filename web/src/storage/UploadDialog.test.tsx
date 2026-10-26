@@ -59,3 +59,18 @@ it("uploads a chosen file into a new volume", async () => {
   );
   expect(await screen.findByText(/^Uploading ubuntu-24-04: 0%/)).toBeInTheDocument();
 });
+
+it("says when it cannot tell the node it is connected to", async () => {
+  mockLists({ "storage-pool": [pool("local")], node: [NODE] });
+  server.use(
+    http.get(apiUrl("/cluster"), () =>
+      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+    ),
+  );
+  renderPage(<VolumesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Upload image" }));
+  const dialog = await screen.findByRole("dialog", { name: "Upload a disk image" });
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "Cannot tell which node you are connected to. You do not have permission to do this.",
+  );
+});

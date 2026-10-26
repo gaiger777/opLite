@@ -11,7 +11,7 @@ import { AuthProvider, useAuth } from "@/auth/AuthProvider";
 import { Toaster } from "@/components/ui/sonner";
 import i18n from "@/i18n";
 import { ThemeProvider } from "@/lib/theme";
-import { startUpload } from "@/storage/upload";
+import { resetUploads, startUpload } from "@/storage/upload";
 import { settleTasks, trackTask } from "@/tasks/tasks";
 import { FakeXhr } from "@/test/fakeXhr";
 import { ADMIN } from "@/test/render";
@@ -157,6 +157,9 @@ it("stays signed out explicitly when requests get 401 during sign out", async ()
 
 it("stops uploads when signing out", async () => {
   vi.stubGlobal("XMLHttpRequest", FakeXhr);
+  onTestFinished(() => {
+    vi.unstubAllGlobals();
+  });
   server.use(
     http.get(apiUrl("/auth/whoami"), () => HttpResponse.json(ADMIN)),
     http.post(apiUrl("/auth/logout"), () => new HttpResponse(null, { status: 204 })),
@@ -171,5 +174,32 @@ it("stops uploads when signing out", async () => {
   expect(await screen.findByText("signed out")).toBeInTheDocument();
   expect(FakeXhr.last!.aborted).toBe(true);
   await vi.waitFor(() => expect(screen.queryByText(/img/)).not.toBeInTheDocument());
-  vi.unstubAllGlobals();
+});
+
+it("does not sign out for an upload's 401 from before signing in again", async () => {
+  vi.stubGlobal("XMLHttpRequest", FakeXhr);
+  onTestFinished(() => {
+    vi.unstubAllGlobals();
+    resetUploads();
+  });
+  let checks = 0;
+  server.use(
+    http.get(apiUrl("/auth/whoami"), () => {
+      checks += 1;
+      return HttpResponse.json(ADMIN);
+    }),
+    http.post(apiUrl("/auth/login"), () => HttpResponse.json(ADMIN)),
+  );
+  renderAuth();
+  expect(await screen.findByText("admin")).toBeInTheDocument();
+  const params = { name: "img", pool: "local", format: "qcow2", sourceFormat: "raw" } as const;
+  act(() => startUpload(new File(["x"], "img.raw"), params, i18n.t));
+  // 다시 로그인해 세대가 바뀐 뒤에 앞 세대의 업로드가 401을 받는다.
+  await userEvent.click(screen.getByRole("button", { name: "login" }));
+  await vi.waitFor(() => expect(checks).toBe(2));
+  act(() => FakeXhr.last!.respond(401, { code: "unauthorized", message: "no session" }));
+  expect(
+    await screen.findByText("Upload of img failed. Your session has ended. Sign in again."),
+  ).toBeInTheDocument();
+  expect(screen.getByText("admin")).toBeInTheDocument();
 });

@@ -221,6 +221,9 @@
     "progress": "{{name}} 올리는 중: {{percent}}% ({{loaded}} / {{total}})",
     "cancelled": "{{name}} 업로드를 취소했습니다.",
     "failed": "{{name}} 업로드에 실패했습니다. {{error}}",
+    "processing": "{{name}} 처리 중…",
+    "dropped": "서버가 업로드를 거절했거나 연결이 끊겼습니다.",
+    "noNode": "접속한 노드를 알 수 없습니다. {{error}}",
     "errors": {
       "file": "파일을 고르세요."
     }

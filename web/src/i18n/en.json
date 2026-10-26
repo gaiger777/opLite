@@ -221,6 +221,9 @@
     "progress": "Uploading {{name}}: {{percent}}% ({{loaded}} / {{total}})",
     "cancelled": "Cancelled the upload of {{name}}.",
     "failed": "Upload of {{name}} failed. {{error}}",
+    "processing": "Processing {{name}}…",
+    "dropped": "The server rejected the upload or the connection was lost.",
+    "noNode": "Cannot tell which node you are connected to. {{error}}",
     "errors": {
       "file": "Choose a file."
     }

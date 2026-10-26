@@ -10,6 +10,7 @@ import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { errorMessage } from "@/i18n/errors";
 import { formatBytes } from "@/lib/format";
 import { nameFromFile, sourceFormatOf, startUpload } from "@/storage/upload";
 import { volumeNameError } from "@/storage/volumes";
@@ -74,6 +75,11 @@ export function UploadDialog({ onClose }: { onClose(): void }) {
       onClose={onClose}
       onSubmit={submit}
     >
+      {cluster.isError && (
+        <p role="alert" className="text-sm text-destructive">
+          {t("uploads.noNode", { error: errorMessage(t, cluster.error) })}
+        </p>
+      )}
       <Field
         id="upload-file"
         label={t("uploads.file")}
