@@ -12,6 +12,7 @@ import { toast } from "sonner";
 
 import { api, call, setUnauthorizedHandler } from "@/api/client";
 import type { Principal } from "@/api/types";
+import { resetUploads } from "@/storage/upload";
 import { resetTasks } from "@/tasks/tasks";
 
 interface Auth {
@@ -39,6 +40,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       epoch.current += 1;
       queryClient.clear();
       resetTasks();
+      resetUploads();
       toast.dismiss();
       // 로그아웃하는 중에 받은 401은 직접 로그아웃한 것으로 둔다(로그인이 다시 false로 바꾼다).
       setSignedOut((was) => explicit || was);

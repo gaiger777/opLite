@@ -21,6 +21,8 @@
     "not_leader": "The cluster leader is changing. Try again shortly.",
     "network_in_use": "A VM uses this network. Remove its interface first.",
     "node_online": "The node is online. Run oplctl cluster leave on it instead.",
+    "pool_not_on_node": "That storage pool is not available on the node you are connected to.",
+    "insufficient_storage": "The node does not have enough free space for this upload.",
     "pool_in_use": "The pool still has volumes. Delete them first.",
     "internal": "The server failed: {{message}}"
   },
@@ -201,6 +203,21 @@
     "errors": {
       "reserved": "The name import is reserved.",
       "exists": "A volume with this name already exists."
+    }
+  },
+  "uploads": {
+    "open": "Upload image",
+    "title": "Upload a disk image",
+    "description": "The file goes to the node you are connected to ({{node}}), so only storage pools on that node can be chosen. The image is converted into a new volume.",
+    "file": "Image file",
+    "sourceFormat": "File format",
+    "submit": "Upload",
+    "noPool": "No storage pool is available on this node.",
+    "progress": "Uploading {{name}}: {{percent}}% ({{loaded}} / {{total}})",
+    "cancelled": "Cancelled the upload of {{name}}.",
+    "failed": "Upload of {{name}} failed. {{error}}",
+    "errors": {
+      "file": "Choose a file."
     }
   },
   "pools": {

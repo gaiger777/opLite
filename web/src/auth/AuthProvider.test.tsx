@@ -11,7 +11,9 @@ import { AuthProvider, useAuth } from "@/auth/AuthProvider";
 import { Toaster } from "@/components/ui/sonner";
 import i18n from "@/i18n";
 import { ThemeProvider } from "@/lib/theme";
+import { startUpload } from "@/storage/upload";
 import { settleTasks, trackTask } from "@/tasks/tasks";
+import { FakeXhr } from "@/test/fakeXhr";
 import { ADMIN } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -151,4 +153,23 @@ it("stays signed out explicitly when requests get 401 during sign out", async ()
   answer();
   await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
   expect(screen.getByText("explicit")).toBeInTheDocument();
+});
+
+it("stops uploads when signing out", async () => {
+  vi.stubGlobal("XMLHttpRequest", FakeXhr);
+  server.use(
+    http.get(apiUrl("/auth/whoami"), () => HttpResponse.json(ADMIN)),
+    http.post(apiUrl("/auth/logout"), () => new HttpResponse(null, { status: 204 })),
+  );
+  renderAuth();
+  expect(await screen.findByText("admin")).toBeInTheDocument();
+  const params = { name: "img", pool: "local", format: "qcow2", sourceFormat: "raw" } as const;
+  act(() => startUpload(new File(["x"], "img.raw"), params, i18n.t));
+  expect(await screen.findByText(/^Uploading img/)).toBeInTheDocument();
+
+  await userEvent.click(screen.getByRole("button", { name: "logout" }));
+  expect(await screen.findByText("signed out")).toBeInTheDocument();
+  expect(FakeXhr.last!.aborted).toBe(true);
+  await vi.waitFor(() => expect(screen.queryByText(/img/)).not.toBeInTheDocument());
+  vi.unstubAllGlobals();
 });

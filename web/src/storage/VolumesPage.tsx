@@ -1,4 +1,4 @@
-import { Plus, Trash2 } from "lucide-react";
+import { Plus, Trash2, Upload } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -26,6 +26,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatBytes } from "@/lib/format";
+import { UploadDialog } from "@/storage/UploadDialog";
 import { volumeNameError } from "@/storage/volumes";
 import { trackTask } from "@/tasks/tasks";
 
@@ -38,6 +39,7 @@ export function VolumesPage() {
   const vms = useList("vm");
   const nodes = useList("node");
   const [creating, setCreating] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [deleting, setDeleting] = useState<Volume | null>(null);
   const write = can(me.role, "write", "volume");
   // 서버는 VM spec의 디스크로 사용 중인지 판단한다(`attached_to`는 마지막으로 실행한 VM이다).
@@ -52,6 +54,10 @@ export function VolumesPage() {
         </h1>
         {write && (
           <div className="flex gap-2">
+            <Button variant="outline" onClick={() => setUploading(true)}>
+              <Upload />
+              {t("uploads.open")}
+            </Button>
             <Button onClick={() => setCreating(true)}>
               <Plus />
               {t("volumes.create")}
@@ -138,6 +144,7 @@ export function VolumesPage() {
         </TableBody>
       </Table>
       {creating && <CreateVolumeDialog onClose={() => setCreating(false)} />}
+      {uploading && <UploadDialog onClose={() => setUploading(false)} />}
       <ConfirmDialog
         open={deleting !== null}
         onOpenChange={(open) => !open && setDeleting(null)}

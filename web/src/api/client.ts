@@ -35,6 +35,16 @@ export function setUnauthorizedHandler(handler: (sentAt: number) => void, epoch:
   authEpoch = epoch;
 }
 
+/** 지금의 인증 세대. fetch를 거치지 않는 요청(업로드)이 보낼 때 기록한다. */
+export function currentAuthEpoch(): number {
+  return authEpoch();
+}
+
+/** fetch를 거치지 않는 요청이 401을 받았다. `sentAt`은 보낼 때의 `currentAuthEpoch()`다. */
+export function reportUnauthorized(sentAt: number) {
+  onUnauthorized(sentAt);
+}
+
 const sentAt = new WeakMap<Request, number>();
 
 const unauthorized: Middleware = {
