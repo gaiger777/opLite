@@ -1,4 +1,4 @@
-import { useState, type RefObject } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -28,6 +28,13 @@ export function ChangePasswordDialog({
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const currentInput = useRef<HTMLInputElement>(null);
+  // 현재 비밀번호가 틀리면 다시 입력하도록 그 칸으로 간다. 보내는 동안은 칸이 막혀 있으므로 그린 뒤에 한다.
+  useEffect(() => {
+    if (errors.current === "accounts.errors.wrongCurrent") {
+      currentInput.current?.focus();
+    }
+  }, [errors]);
 
   async function submit() {
     const found = passwordErrors(password, confirm);
@@ -69,6 +76,7 @@ export function ChangePasswordDialog({
       <Field id="current-password" label={t("accounts.currentPassword")} error={errors.current}>
         {(a11y) => (
           <Input
+            ref={currentInput}
             id="current-password"
             type="password"
             autoComplete="current-password"

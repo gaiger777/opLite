@@ -337,7 +337,8 @@
     "delete": "Delete",
     "deleteTitle": "Delete user {{name}}?",
     "deleteDescription": "The user and their API tokens are deleted.",
-    "deleted": "Deleted user {{name}}."
+    "deleted": "Deleted user {{name}}.",
+    "adminOnly": "Only administrators can manage users."
   },
   "tokens": {
     "name": "Name",
@@ -363,7 +364,7 @@
   "cluster": {
     "title": "Cluster {{name}}",
     "ca": "Certificate authority",
-    "caNote": "Every node's HTTPS certificate is signed by the cluster CA. Import the CA into your browser to stop the certificate warning, and check that its fingerprint matches.",
+    "caNote": "Every node's HTTPS certificate is signed by the cluster CA. Import the CA into your browser to stop the certificate warning, and check that its fingerprint matches. Browsers show the SHA-256 fingerprint in uppercase hex, in pairs separated by colons or spaces; compare it with the digits after sha256:.",
     "copyFingerprint": "Copy the CA fingerprint",
     "downloadCa": "Download the CA",
     "members": "Members",

@@ -9,6 +9,7 @@ import { PasswordFields } from "@/accounts/PasswordFields";
 import { api, call } from "@/api/client";
 import type { components } from "@/api/schema";
 import { usePrincipal } from "@/auth/AuthProvider";
+import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field, type FieldA11y } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -56,7 +57,8 @@ type Dialog = { kind: "create" } | { kind: "role" | "password" | "delete"; user:
 export function UsersPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
-  const users = useUsers();
+  const admin = can(me.role, "write", "user");
+  const users = useUsers(admin);
   const queryClient = useQueryClient();
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const close = () => setDialog(null);
@@ -66,6 +68,16 @@ export function UsersPage() {
     trigger.current = e.currentTarget;
   };
   const changed = () => queryClient.invalidateQueries({ queryKey: ["users"] });
+
+  // 메뉴에 없지만 주소로 직접 들어올 수 있다. 관리자가 아니면 읽지 않고 안내한다.
+  if (!admin) {
+    return (
+      <div className="flex flex-col gap-4">
+        <h1 className="text-2xl font-semibold">{t("nav.users")}</h1>
+        <p className="text-sm text-muted-foreground">{t("users.adminOnly")}</p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -94,6 +106,7 @@ export function UsersPage() {
           )}
           {(users.data ?? []).map((user) => {
             // 자기 비밀번호는 현재 비밀번호가 필요하므로 계정 메뉴에서 바꾼다. 자기 자신은 지울 수 없다.
+            // 자기 역할도 바꾸지 않는다(낮추면 이 화면의 권한이 옛 역할로 남는다).
             const self = user.id === me.user;
             return (
               <TableRow key={user.id}>
@@ -118,7 +131,10 @@ export function UsersPage() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      <DropdownMenuItem onSelect={() => setDialog({ kind: "role", user })}>
+                      <DropdownMenuItem
+                        disabled={self}
+                        onSelect={() => setDialog({ kind: "role", user })}
+                      >
                         {t("users.changeRole")}
                       </DropdownMenuItem>
                       <DropdownMenuItem
@@ -277,6 +293,7 @@ function RoleDialog({
     <FormDialog
       title={t("users.roleTitle", { name: user.name })}
       submitLabel={t("users.save")}
+      submitDisabled={role === user.role}
       returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}

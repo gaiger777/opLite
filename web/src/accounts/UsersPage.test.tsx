@@ -30,9 +30,13 @@ it("checks new passwords like the server", () => {
   });
   // 서버는 바이트가 아니라 글자를 센다.
   expect(passwordErrors("비밀번호여덟글자", "비밀번호여덟글자")).toEqual({});
+  // UTF-16 길이(8)나 바이트(12)가 아니라 글자(4)로 거부한다.
+  expect(passwordErrors("😀😀😀😀", "😀😀😀😀")).toEqual({ password: "accounts.errors.password" });
+  expect(passwordErrors("비밀번호", "비밀번호")).toEqual({ password: "accounts.errors.password" });
+  expect(passwordErrors("😀".repeat(8), "😀".repeat(8))).toEqual({});
 });
 
-it("lists users and keeps admins from deleting themselves", async () => {
+it("lists users and keeps admins from changing themselves", async () => {
   users([ME, KIM]);
   renderPage(<UsersPage />);
   const table = await screen.findByRole("table", { name: "Users" });
@@ -44,6 +48,10 @@ it("lists users and keeps admins from deleting themselves", async () => {
     "true",
   );
   expect(screen.getByRole("menuitem", { name: "Reset password" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  expect(screen.getByRole("menuitem", { name: "Change role" })).toHaveAttribute(
     "aria-disabled",
     "true",
   );
@@ -77,28 +85,62 @@ it("creates a user and reads the list again", async () => {
   expect(await screen.findByText("kim")).toBeInTheDocument();
 });
 
-it("changes a role and shows why the server refused", async () => {
-  users([ME, KIM]);
-  const sent: unknown[] = [];
+it("tells other roles that only admins manage users", async () => {
+  let reads = 0;
   server.use(
-    http.put(apiUrl(`/users/${ME.id}`), async ({ request }) => {
-      sent.push(await request.json());
-      return HttpResponse.json(
-        { code: "last_admin", message: "the last admin cannot give up the admin role" },
-        { status: 409 },
-      );
+    http.get(apiUrl("/users"), () => {
+      reads += 1;
+      return HttpResponse.json({ revision: 1, items: [ME, KIM] });
+    }),
+  );
+  renderPage(<UsersPage />, { as: { ...ADMIN, role: "operator" } });
+  expect(await screen.findByText("Only administrators can manage users.")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(reads).toBe(0);
+});
+
+it("changes a role and reads the list again", async () => {
+  const change = users([ME, KIM]);
+  let body: unknown;
+  server.use(
+    http.put(apiUrl(`/users/${KIM.id}`), async ({ request }) => {
+      body = await request.json();
+      change([ME, { ...KIM, role: "operator" }]);
+      return HttpResponse.json({ ...KIM, role: "operator" });
     }),
   );
   renderPage(<UsersPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Actions for admin" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for kim" }));
   await userEvent.click(await screen.findByRole("menuitem", { name: "Change role" }));
-  const dialog = await screen.findByRole("dialog", { name: "Change the role of admin" });
-  await userEvent.selectOptions(within(dialog).getByLabelText("Role"), "viewer");
+  const dialog = await screen.findByRole("dialog", { name: "Change the role of kim" });
+  // 같은 역할로는 저장하지 않는다.
+  expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
+  await userEvent.selectOptions(within(dialog).getByLabelText("Role"), "operator");
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
-  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "The last administrator cannot give up the administrator role.",
+  expect(await screen.findByText("kim is now Operator.")).toBeInTheDocument();
+  expect(body).toEqual({ role: "operator" });
+  await waitFor(() => expect(dialog).not.toBeInTheDocument());
+  const table = screen.getByRole("table", { name: "Users" });
+  await waitFor(() =>
+    expect(within(table).getByText("kim").closest("tr")).toHaveTextContent("Operator"),
   );
-  expect(sent).toEqual([{ role: "viewer" }]);
+});
+
+it("shows why the server refused a role change", async () => {
+  users([ME, KIM]);
+  server.use(
+    http.put(apiUrl(`/users/${KIM.id}`), () =>
+      HttpResponse.json({ code: "not_found", message: "user not found" }, { status: 404 }),
+    ),
+  );
+  renderPage(<UsersPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for kim" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Change role" }));
+  const dialog = await screen.findByRole("dialog", { name: "Change the role of kim" });
+  await userEvent.selectOptions(within(dialog).getByLabelText("Role"), "admin");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent("It no longer exists.");
 });
 
 it("returns focus to the row menu after cancelling a dialog", async () => {

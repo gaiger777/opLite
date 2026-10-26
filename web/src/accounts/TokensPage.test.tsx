@@ -46,20 +46,28 @@ it("shows owners to admins", async () => {
 
 it("does not read users for other roles", async () => {
   tokens([MINE]);
-  // /users 응답을 정하지 않았으므로 읽으면 테스트가 실패한다.
+  let reads = 0;
+  server.use(
+    http.get(apiUrl("/users"), () => {
+      reads += 1;
+      return HttpResponse.json({ revision: 1, items: [] });
+    }),
+  );
   renderPage(<TokensPage />, { as: { ...ADMIN, role: "viewer" } });
   const table = await screen.findByRole("table", { name: "API tokens" });
   expect(await within(table).findByText("cli")).toBeInTheDocument();
   expect(within(table).queryByRole("columnheader", { name: "Owner" })).not.toBeInTheDocument();
+  expect(reads).toBe(0);
 });
 
 it("shows a new token's secret once, with a copy button", async () => {
   const user = userEvent.setup();
   const change = tokens([]);
   const created = { ...MINE, id: "019a0f3c-8a10-7000-8000-0000000000c3", name: "backup" };
+  let body: unknown;
   server.use(
     http.post(apiUrl("/tokens"), async ({ request }) => {
-      expect(await request.json()).toEqual({ name: "backup" });
+      body = await request.json();
       change([created]);
       return HttpResponse.json({ token: created, secret: "opl_abc_secret" }, { status: 201 });
     }),
@@ -71,16 +79,23 @@ it("shows a new token's secret once, with a copy button", async () => {
   await user.click(within(form).getByRole("button", { name: "Create" }));
 
   const dialog = await screen.findByRole("dialog", { name: "Token backup was created" });
+  expect(body).toEqual({ name: "backup" });
   expect(within(dialog).getByLabelText("Token")).toHaveValue("opl_abc_secret");
   await user.click(within(dialog).getByRole("button", { name: "Copy the token" }));
   expect(await navigator.clipboard.readText()).toBe("opl_abc_secret");
   expect(await screen.findByText("Copied.")).toBeInTheDocument();
+  // 비밀값을 놓치지 않게 Esc나 바깥 클릭으로는 닫히지 않는다.
+  expect(within(dialog).queryByRole("button", { name: "Close" })).not.toBeInTheDocument();
+  await user.keyboard("{Escape}");
+  expect(dialog).toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "Done" }));
-  expect(screen.queryByText("opl_abc_secret")).not.toBeInTheDocument();
+  await vi.waitFor(() => expect(dialog).not.toBeInTheDocument());
+  expect(screen.queryByDisplayValue("opl_abc_secret")).not.toBeInTheDocument();
   expect(await screen.findByRole("cell", { name: "backup" })).toBeInTheDocument();
 });
 
 it("deletes a token after confirming", async () => {
+  const user = userEvent.setup();
   const change = tokens([MINE]);
   server.use(
     http.delete(apiUrl(`/tokens/${MINE.id}`), () => {
@@ -89,8 +104,8 @@ it("deletes a token after confirming", async () => {
     }),
   );
   renderPage(<TokensPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Delete cli" }));
-  await userEvent.click(
+  await user.click(await screen.findByRole("button", { name: "Delete cli" }));
+  await user.click(
     within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Delete" }),
   );
   expect(await screen.findByText("Deleted API token cli.")).toBeInTheDocument();

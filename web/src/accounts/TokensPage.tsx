@@ -51,7 +51,8 @@ export function TokensPage() {
     queryFn: () => call(api.GET("/tokens")),
     select: (list) => list.items,
   });
-  const admin = can(me.role, "read", "user");
+  // 남의 토큰을 다루는 것은 관리자뿐이다(서버의 may_manage와 같은 규칙).
+  const admin = can(me.role, "write", "api-token");
   const users = useUsers(admin);
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<CreatedToken | null>(null);
@@ -183,12 +184,16 @@ function CreateTokenDialog({
   );
 }
 
-/** 만든 토큰의 비밀값. 서버는 다시 보여 주지 않는다. */
+/** 만든 토큰의 비밀값. 서버는 다시 보여 주지 않으므로 "완료"로만 닫는다. */
 function SecretDialog({ created, onClose }: { created: CreatedToken; onClose(): void }) {
   const { t } = useTranslation();
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent>
+      <DialogContent
+        showCloseButton={false}
+        onEscapeKeyDown={(e) => e.preventDefault()}
+        onInteractOutside={(e) => e.preventDefault()}
+      >
         <DialogHeader>
           <DialogTitle>{t("tokens.secretTitle", { name: created.token.name })}</DialogTitle>
           <DialogDescription>{t("tokens.secretDescription")}</DialogDescription>

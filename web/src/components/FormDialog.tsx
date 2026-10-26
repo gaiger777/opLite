@@ -21,6 +21,7 @@ export function FormDialog({
   description,
   submitLabel,
   destructive = false,
+  submitDisabled = false,
   returnFocus,
   onClose,
   onSubmit,
@@ -30,6 +31,8 @@ export function FormDialog({
   description?: string;
   submitLabel: string;
   destructive?: boolean;
+  /** 보낼 것이 없으면(바뀐 것이 없으면) 보내기 버튼을 막는다. */
+  submitDisabled?: boolean;
   /** 닫으면 포커스를 돌려줄 곳. 메뉴에서 열면 메뉴 항목이 사라지므로 메뉴 버튼을 준다. */
   returnFocus?: RefObject<HTMLElement | null>;
   onClose(): void;
@@ -86,7 +89,11 @@ export function FormDialog({
             <Button type="button" variant="outline" disabled={busy} onClick={onClose}>
               {t("confirm.cancel")}
             </Button>
-            <Button type="submit" variant={destructive ? "destructive" : "default"} disabled={busy}>
+            <Button
+              type="submit"
+              variant={destructive ? "destructive" : "default"}
+              disabled={busy || submitDisabled}
+            >
               {submitLabel}
             </Button>
           </DialogFooter>

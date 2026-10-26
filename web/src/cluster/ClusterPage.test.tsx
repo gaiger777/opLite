@@ -38,6 +38,10 @@ it("quotes the join URL in the command", () => {
   expect(joinCommand("opl-join://h:8006?token=a&ca=sha256:00")).toBe(
     "oplctl cluster join 'opl-join://h:8006?token=a&ca=sha256:00'",
   );
+  // 작은따옴표는 닫고 이스케이프한 뒤 다시 연다.
+  expect(joinCommand("opl-join://h:8006?token=a'b")).toBe(
+    "oplctl cluster join 'opl-join://h:8006?token=a'\\''b'",
+  );
 });
 
 it("shows the CA and the members", async () => {
@@ -82,4 +86,41 @@ it("issues a join token and shows the command once", async () => {
   expect(within(dialog).getByText(/2030/)).toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "Copy the command" }));
   expect(await navigator.clipboard.readText()).toBe(command);
+});
+
+it("shows no leader while there is none and shortens unnamed ids", async () => {
+  const id = "019a0f3c-8a10-7000-8000-00000000abcd";
+  server.use(
+    http.get(apiUrl("/cluster"), () =>
+      HttpResponse.json({
+        name: "lab",
+        ca_fingerprint: "sha256:00ff",
+        leader: null,
+        node: "n1",
+        members: [member("n1", "node-a"), member(id, null)],
+      }),
+    ),
+  );
+  renderPage(<ClusterPage />);
+  const table = await screen.findByRole("table", { name: "Members" });
+  expect(within(table).getByText("node-a").closest("tr")).toHaveTextContent("Voter");
+  expect(within(table).getByText("0000abcd")).toBeInTheDocument();
+  expect(within(table).queryByText("Leader")).not.toBeInTheDocument();
+});
+
+it("keeps the form open when issuing fails", async () => {
+  const user = userEvent.setup();
+  server.use(
+    http.post(apiUrl("/cluster/join-tokens"), () =>
+      HttpResponse.json({ code: "forbidden", message: "forbidden" }, { status: 403 }),
+    ),
+  );
+  renderPage(<ClusterPage />);
+  await user.click(await screen.findByRole("button", { name: "Issue a join token" }));
+  const form = await screen.findByRole("dialog", { name: "Issue a join token" });
+  await user.click(within(form).getByRole("button", { name: "Issue a join token" }));
+  expect(await within(form).findByRole("alert")).toHaveTextContent(
+    "You do not have permission to do this.",
+  );
+  expect(screen.queryByRole("dialog", { name: "Join a new node" })).not.toBeInTheDocument();
 });

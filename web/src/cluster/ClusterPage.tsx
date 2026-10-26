@@ -38,15 +38,20 @@ type JoinToken = components["schemas"]["CreatedJoinToken"];
 /** 조인 토큰의 유효 시간(초). 서버의 기본은 1시간, 최대는 7일이다. */
 const TTLS = [3600, 86400, 604800] as const;
 
-/** 새 노드에서 실행할 명령. URL에 `?`와 `&`가 있어 따옴표로 감싼다. */
+/** 새 노드에서 실행할 명령. URL에 `?`와 `&`가 있어 작은따옴표로 감싸고, 안의 `'`는 `'\''`로 바꾼다. */
 export function joinCommand(url: string): string {
-  return `oplctl cluster join '${url}'`;
+  return `oplctl cluster join '${url.replaceAll("'", "'\\''")}'`;
 }
 
 export function ClusterPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
-  const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
+  // 멤버·리더·온라인은 감시할 수 없으므로 이 화면에서만 주기적으로 다시 읽는다.
+  const cluster = useQuery({
+    queryKey: ["cluster"],
+    queryFn: () => call(api.GET("/cluster")),
+    refetchInterval: 10_000,
+  });
   const [issuing, setIssuing] = useState(false);
   const [issued, setIssued] = useState<JoinToken | null>(null);
 
