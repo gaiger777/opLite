@@ -1,5 +1,5 @@
-//! 웹 UI E2E: 실제 opld(QEMU)에 브라우저(Playwright)로 로그인해 VM을 만들고 콘솔을 본 뒤 지운다.
-//! 클러스터와 볼륨은 여기서 oplctl로 준비한다.
+//! 웹 UI E2E: 실제 opld(QEMU)에 브라우저(Playwright)로 로그인해 풀을 만들고 이미지를 올린 뒤, 그 볼륨으로
+//! VM을 만들어 콘솔을 보고, VM·볼륨·풀을 모두 지운다. 클러스터와 로그인 정보는 여기서 준비한다.
 //! `pnpm -C web build && cargo test -p opld --features web-it --test web`
 //! QEMU(`qemu-it`와 같다), pnpm, `pnpm -C web exec playwright install chromium`이 필요하다.
 #![cfg(feature = "web-it")]
@@ -11,8 +11,11 @@ use std::process::Command;
 
 use common::Daemon;
 
+/// 브라우저가 올릴 디스크 이미지(raw, 0으로 채운 sparse 파일)의 크기
+const IMAGE_BYTES: u64 = 16 << 20;
+
 #[tokio::test]
-async fn browser_creates_vm_opens_console_and_deletes_it() {
+async fn browser_uploads_image_runs_vm_and_cleans_up() {
     let web = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
     assert!(
         web.join("dist/index.html").exists(),
@@ -25,17 +28,15 @@ async fn browser_creates_vm_opens_console_and_deletes_it() {
     d.login().await;
     let pool = d.path("pool");
     std::fs::create_dir(&pool).unwrap();
-    d.ctl(&["pool", "create", "local", "--path", pool.to_str().unwrap()])
-        .await
+    let image = d.path("image.raw");
+    std::fs::File::create(&image)
+        .unwrap()
+        .set_len(IMAGE_BYTES)
         .unwrap();
-    d.ctl(&[
-        "volume", "create", "root", "--pool", "local", "--size", "64M",
-    ])
-    .await
-    .unwrap();
 
     let out = tokio::task::spawn_blocking({
         let (url, password) = (d.server(), d.admin_password.clone().unwrap());
+        let (pool, image) = (pool.clone(), image.clone());
         move || {
             Command::new("pnpm")
                 .args(["exec", "playwright", "test"])
@@ -43,7 +44,8 @@ async fn browser_creates_vm_opens_console_and_deletes_it() {
                 .env("OPL_URL", url)
                 .env("OPL_USER", "admin")
                 .env("OPL_PASSWORD", password)
-                .env("OPL_VOLUME", "root")
+                .env("OPL_POOL_PATH", pool)
+                .env("OPL_IMAGE", image)
                 .output()
                 .expect("run pnpm (is it installed?)")
         }
@@ -51,9 +53,10 @@ async fn browser_creates_vm_opens_console_and_deletes_it() {
     .await
     .unwrap();
     if !out.status.success() {
-        // 브라우저가 VM을 지우지 못했으면 QEMU가 남지 않게 끈다(실패는 무시한다).
+        // 브라우저가 지우지 못한 것을 지운다(QEMU가 남지 않게). 실패는 무시한다.
         let _ = d.ctl(&["vm", "stop", "web", "--force"]).await;
         let _ = d.ctl(&["vm", "delete", "web"]).await;
+        let _ = d.ctl(&["volume", "delete", "root"]).await;
     }
     assert!(
         out.status.success(),
@@ -62,9 +65,10 @@ async fn browser_creates_vm_opens_console_and_deletes_it() {
         String::from_utf8_lossy(&out.stderr),
         d.log()
     );
-    // 브라우저가 지운 VM은 없고, 볼륨은 남는다.
-    let vms = d.ctl_json(&["vm", "list"]).await;
-    assert_eq!(vms.as_array().map(Vec::len), Some(0), "{vms}");
-    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    // 브라우저가 만든 것은 모두 지웠다.
+    for kind in ["vm", "volume", "pool"] {
+        let list = d.ctl_json(&[kind, "list"]).await;
+        assert_eq!(list.as_array().map(Vec::len), Some(0), "{kind}: {list}");
+    }
     d.stop();
 }
