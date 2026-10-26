@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import {
+  Boxes,
   Cpu,
   Database,
   HardDrive,
@@ -52,6 +53,7 @@ const NAV: { to: string; key: string; icon: LucideIcon; end: boolean; kind?: Kin
   { to: "/tasks", key: "nav.tasks", icon: ListChecks, end: false },
   { to: "/users", key: "nav.users", icon: Users, end: false, kind: "user" },
   { to: "/tokens", key: "nav.tokens", icon: KeyRound, end: false },
+  { to: "/cluster", key: "nav.cluster", icon: Boxes, end: false },
 ];
 
 export function AppLayout() {

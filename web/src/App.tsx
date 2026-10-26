@@ -8,6 +8,7 @@ import { LiveProvider } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { RequireAuth } from "@/auth/RequireAuth";
+import { ClusterPage } from "@/cluster/ClusterPage";
 import { Toaster } from "@/components/ui/sonner";
 import { AppLayout } from "@/layout/AppLayout";
 import { ThemeProvider } from "@/lib/theme";
@@ -53,6 +54,7 @@ function routes() {
             { path: "tasks", element: <TasksPage /> },
             { path: "users", element: <UsersPage /> },
             { path: "tokens", element: <TokensPage /> },
+            { path: "cluster", element: <ClusterPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],
         },

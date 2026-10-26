@@ -37,7 +37,8 @@
     "nodes": "Nodes",
     "tasks": "Tasks",
     "users": "Users",
-    "tokens": "API tokens"
+    "tokens": "API tokens",
+    "cluster": "Cluster"
   },
   "header": {
     "language": "Language",
@@ -354,6 +355,34 @@
     "deleteTitle": "Delete API token {{name}}?",
     "deleteDescription": "Anything using the token stops working right away.",
     "deleted": "Deleted API token {{name}}."
+  },
+  "cluster": {
+    "title": "Cluster {{name}}",
+    "ca": "Certificate authority",
+    "caNote": "Every node's HTTPS certificate is signed by the cluster CA. Import the CA into your browser to stop the certificate warning, and check that its fingerprint matches.",
+    "copyFingerprint": "Copy the CA fingerprint",
+    "downloadCa": "Download the CA",
+    "members": "Members",
+    "membersNote": "Voters keep the cluster state. A learner is a node that is still joining.",
+    "role": "Role",
+    "leader": "Leader",
+    "voter": "Voter",
+    "learner": "Learner",
+    "clusterAddress": "Cluster address",
+    "issue": "Issue a join token",
+    "issueTitle": "Issue a join token",
+    "issueDescription": "A new node joins with the token once. Start opld on the new node first.",
+    "ttl": "Valid for",
+    "ttlOption": {
+      "3600": "1 hour",
+      "86400": "1 day",
+      "604800": "7 days"
+    },
+    "issuedTitle": "Join a new node",
+    "issuedDescription": "Run this on the new node before {{time}}. It cannot be shown again.",
+    "command": "Command",
+    "copyCommand": "Copy the command",
+    "commandNote": "Add --socket if opld on the new node does not use /run/opl/opld.sock."
   },
   "vmForm": {
     "createTitle": "Create a virtual machine",

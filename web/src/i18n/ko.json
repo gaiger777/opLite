@@ -37,7 +37,8 @@
     "nodes": "노드",
     "tasks": "작업",
     "users": "사용자",
-    "tokens": "API 토큰"
+    "tokens": "API 토큰",
+    "cluster": "클러스터"
   },
   "header": {
     "language": "언어",
@@ -354,6 +355,34 @@
     "deleteTitle": "API 토큰 {{name}}을(를) 삭제할까요?",
     "deleteDescription": "이 토큰을 쓰는 곳은 곧바로 동작하지 않습니다.",
     "deleted": "API 토큰 {{name}}을(를) 삭제했습니다."
+  },
+  "cluster": {
+    "title": "클러스터 {{name}}",
+    "ca": "인증 기관(CA)",
+    "caNote": "모든 노드의 HTTPS 인증서는 클러스터 CA가 서명합니다. 인증서 경고를 없애려면 CA를 브라우저에 가져오고, 지문이 같은지 확인하세요.",
+    "copyFingerprint": "CA 지문 복사",
+    "downloadCa": "CA 내려받기",
+    "members": "멤버",
+    "membersNote": "투표 멤버가 클러스터 상태를 지킵니다. 학습자는 아직 합류 중인 노드입니다.",
+    "role": "역할",
+    "leader": "리더",
+    "voter": "투표 멤버",
+    "learner": "학습자",
+    "clusterAddress": "클러스터 주소",
+    "issue": "조인 토큰 발급",
+    "issueTitle": "조인 토큰 발급",
+    "issueDescription": "새 노드가 이 토큰으로 한 번 합류합니다. 먼저 새 노드에서 opld를 시작하세요.",
+    "ttl": "유효 기간",
+    "ttlOption": {
+      "3600": "1시간",
+      "86400": "1일",
+      "604800": "7일"
+    },
+    "issuedTitle": "새 노드 합류",
+    "issuedDescription": "{{time}} 전에 새 노드에서 실행하세요. 다시 볼 수 없습니다.",
+    "command": "명령",
+    "copyCommand": "명령 복사",
+    "commandNote": "새 노드의 opld가 /run/opl/opld.sock을 쓰지 않으면 --socket을 붙이세요."
   },
   "vmForm": {
     "createTitle": "가상 머신 만들기",
