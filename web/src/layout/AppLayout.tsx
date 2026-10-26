@@ -13,6 +13,8 @@ import {
   Server,
   Sun,
   User,
+  Users,
+  type LucideIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { NavLink, Outlet } from "react-router";
@@ -20,6 +22,7 @@ import { NavLink, Outlet } from "react-router";
 import { api, call } from "@/api/client";
 import { useLiveStatus } from "@/api/LiveProvider";
 import { useAuth, usePrincipal } from "@/auth/AuthProvider";
+import { can, type Kind } from "@/auth/permissions";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -34,7 +37,8 @@ import {
 import { type Language, setLanguage } from "@/i18n";
 import { type Theme, useTheme } from "@/lib/theme";
 
-const NAV = [
+/** 왼쪽 메뉴. `kind`가 있으면 그 종류를 읽을 수 있는 역할에만 보인다. */
+const NAV: { to: string; key: string; icon: LucideIcon; end: boolean; kind?: Kind }[] = [
   { to: "/", key: "nav.dashboard", icon: LayoutDashboard, end: true },
   { to: "/vms", key: "nav.vms", icon: Server, end: false },
   { to: "/volumes", key: "nav.volumes", icon: HardDrive, end: false },
@@ -42,20 +46,23 @@ const NAV = [
   { to: "/networks", key: "nav.networks", icon: Network, end: false },
   { to: "/nodes", key: "nav.nodes", icon: Cpu, end: false },
   { to: "/tasks", key: "nav.tasks", icon: ListChecks, end: false },
-] as const;
+  { to: "/users", key: "nav.users", icon: Users, end: false, kind: "user" },
+];
 
 export function AppLayout() {
   const { t } = useTranslation();
+  const me = usePrincipal();
   const cluster = useQuery({
     queryKey: ["cluster"],
     queryFn: () => call(api.GET("/cluster")),
   });
+  const nav = NAV.filter((item) => !item.kind || can(me.role, "read", item.kind));
   return (
     <div className="flex min-h-svh flex-col md:flex-row">
       <aside className="border-b bg-sidebar text-sidebar-foreground md:w-56 md:border-r md:border-b-0">
         <div className="px-4 py-3 text-lg font-semibold">opLite</div>
         <nav className="flex gap-1 overflow-x-auto px-2 pb-2 md:flex-col">
-          {NAV.map(({ to, key, icon: Icon, end }) => (
+          {nav.map(({ to, key, icon: Icon, end }) => (
             <NavLink
               key={to}
               to={to}

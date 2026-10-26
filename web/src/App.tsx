@@ -2,6 +2,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import { createBrowserRouter, RouterProvider } from "react-router";
 
+import { UsersPage } from "@/accounts/UsersPage";
 import { LiveProvider } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
 import { AuthProvider } from "@/auth/AuthProvider";
@@ -49,6 +50,7 @@ function routes() {
             { path: "networks", element: <NetworksPage /> },
             { path: "nodes", element: <NodesPage /> },
             { path: "tasks", element: <TasksPage /> },
+            { path: "users", element: <UsersPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],
         },

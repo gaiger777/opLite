@@ -23,6 +23,8 @@
     "node_online": "The node is online. Run oplctl cluster leave on it instead.",
     "pool_not_on_node": "That storage pool is not available on the node you are connected to.",
     "insufficient_storage": "The node does not have enough free space for this upload.",
+    "last_admin": "The last administrator cannot give up the administrator role.",
+    "cannot_delete_self": "You cannot delete your own account.",
     "pool_in_use": "The pool still has volumes. Delete them first.",
     "internal": "The server failed: {{message}}"
   },
@@ -33,7 +35,8 @@
     "pools": "Storage pools",
     "networks": "Networks",
     "nodes": "Nodes",
-    "tasks": "Tasks"
+    "tasks": "Tasks",
+    "users": "Users"
   },
   "header": {
     "language": "Language",
@@ -292,6 +295,37 @@
     "removeTitle": "Remove {{name}} from the cluster?",
     "removeDescription": "Only for a node that is dead for good. It cannot rejoin with its current data, and VMs assigned to it stay assigned.",
     "removed": "Removed {{name}} from the cluster."
+  },
+  "accounts": {
+    "newPassword": "New password",
+    "confirmPassword": "Confirm the new password",
+    "passwordHint": "At least 8 characters.",
+    "errors": {
+      "password": "Use at least 8 characters.",
+      "mismatch": "The passwords do not match."
+    }
+  },
+  "users": {
+    "name": "Name",
+    "role": "Role",
+    "you": "(you)",
+    "empty": "No users.",
+    "roleHint": "Operators change VMs and volumes. Viewers only read. Neither can see accounts.",
+    "create": "Create",
+    "createTitle": "Create a user",
+    "created": "Created user {{name}}.",
+    "changeRole": "Change role",
+    "roleTitle": "Change the role of {{name}}",
+    "roleChanged": "{{name}} is now {{role}}.",
+    "resetPassword": "Reset password",
+    "passwordTitle": "Reset the password of {{name}}",
+    "passwordDescription": "The user's sessions end and they sign in with the new password.",
+    "passwordReset": "Reset the password of {{name}}.",
+    "save": "Save",
+    "delete": "Delete",
+    "deleteTitle": "Delete user {{name}}?",
+    "deleteDescription": "The user and their API tokens are deleted.",
+    "deleted": "Deleted user {{name}}."
   },
   "vmForm": {
     "createTitle": "Create a virtual machine",
