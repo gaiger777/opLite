@@ -9,11 +9,11 @@ use opl_cluster::types::Rejection;
 use opl_driver::{DriverError, uefi_vars_path, vm_state_dir};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
-use opl_types::task::{Task, TaskOp};
+use opl_types::task::Task;
 use opl_types::vm::{PowerState, ScheduleError, Vm, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
 
-use crate::schedule::set_schedule_error;
+use crate::schedule::{recorded_vm, set_schedule_error};
 
 use super::{Ctx, set_power, set_volume_size, started, stopped, superseded, wait_vm};
 
@@ -291,18 +291,9 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     set_position(ctx, vm_id, |_| Some(id)).await
 }
 
-/// 예약으로 만든 스냅샷의 만들기·삭제 Task면 그 VM
+/// 예약 스냅샷의 만들기나 예약 정리의 삭제 Task면 그 VM([`recorded_vm`])
 pub(super) fn scheduled_vm(ctx: &Ctx, task: &Task) -> Option<Uuid> {
-    let (TaskOp::SnapshotCreate { snapshot } | TaskOp::SnapshotDelete { snapshot, .. }) =
-        task.spec.op
-    else {
-        return None;
-    };
-    get_snapshot(ctx, snapshot)
-        .ok()
-        .flatten()
-        .filter(|s| s.spec.scheduled)
-        .map(|s| s.spec.vm)
+    recorded_vm(&task.spec, |id| get_snapshot(ctx, id).ok().flatten())
 }
 
 /// 예약 스냅샷 만들기·삭제의 결과를 VM의 `schedule_error`에 남긴다. 성공(`None`)이면 지운다.

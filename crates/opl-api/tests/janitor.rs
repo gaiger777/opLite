@@ -1,6 +1,6 @@
 //! 클러스터 정리 작업: 오프라인 노드의 `pending` 스냅샷 Task가 유예 뒤 실패해 VM 조작이 풀리고
 //! `running` Task는 남는지, 제거된 노드의 Task가 곧바로 실패하는지, 만들 Task 없이 남은 `pending`
-//! 스냅샷을 지우는지.
+//! 스냅샷을 지우는지, 끝낸 예약 스냅샷 만들기를 `schedule_error`에 남기는지.
 
 mod common;
 
@@ -12,7 +12,7 @@ use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::VmSpec;
+use opl_types::vm::{ScheduleError, VmSpec};
 use reqwest::StatusCode;
 use serde_json::Value;
 use uuid::Uuid;
@@ -54,6 +54,18 @@ async fn other_node(env: &Env, name: &str, online: bool) -> Uuid {
 
 /// VM `vm`의 `pending` 스냅샷과 노드 `node`에 배정된 만들기 Task를 직접 만든다.
 async fn snapshot_task(env: &Env, vm: Uuid, name: &str, node: Uuid, state: TaskState) -> Task {
+    snapshot_task_of(env, vm, name, false, node, state).await
+}
+
+/// [`snapshot_task`]에 예약 스냅샷인지(`scheduled`)를 더한 것
+async fn snapshot_task_of(
+    env: &Env,
+    vm: Uuid,
+    name: &str,
+    scheduled: bool,
+    node: Uuid,
+    state: TaskState,
+) -> Task {
     let spec = env.cluster.get::<VmSpec>(vm).unwrap().unwrap().spec;
     let mut snapshot: Snapshot = Resource::new(
         "",
@@ -63,7 +75,7 @@ async fn snapshot_task(env: &Env, vm: Uuid, name: &str, node: Uuid, state: TaskS
             parent: None,
             memory: false,
             description: String::new(),
-            scheduled: false,
+            scheduled,
             vm_spec: spec,
         },
     );
@@ -200,4 +212,34 @@ async fn pending_snapshots_with_a_live_task_stay() {
     janitor.shutdown().await;
     assert_eq!(snapshot_ids(&env).len(), 1);
     assert_eq!(get_task(&env, live.id).status.state, TaskState::Pending);
+}
+
+#[tokio::test]
+async fn failed_scheduled_snapshot_creation_is_recorded() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (status, vm) = admin.post("/vms", vm_request("web")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let vm: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let away = other_node(&env, "node2", false).await;
+    let pending = snapshot_task_of(&env, vm, "auto", true, away, TaskState::Pending).await;
+    let janitor = fast_janitor(&env);
+    // 실행기가 실패로 끝낸 예약 만들기처럼 Task 실패로 남긴다.
+    let expected = ScheduleError {
+        code: "task_failed".into(),
+        message: format!("node {away} is offline"),
+    };
+    until("schedule error", || {
+        env.cluster
+            .get::<VmSpec>(vm)
+            .unwrap()
+            .unwrap()
+            .status
+            .schedule_error
+            .as_ref()
+            == Some(&expected)
+    })
+    .await;
+    janitor.shutdown().await;
+    assert_eq!(get_task(&env, pending.id).status.state, TaskState::Failed);
 }

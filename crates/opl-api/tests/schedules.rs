@@ -164,7 +164,7 @@ async fn refused_requests_and_failed_tasks_are_recorded_until_a_success() {
         get_vm(&env, raw)
             .status
             .schedule_error
-            .is_some_and(|e| e.message.contains("non-qcow2"))
+            .is_some_and(|e| e.code == "snapshot_unsupported" && e.message.contains("non-qcow2"))
     })
     .await;
     assert!(snapshots(&env, raw).is_empty());
@@ -174,7 +174,7 @@ async fn refused_requests_and_failed_tasks_are_recorded_until_a_success() {
         get_vm(&env, web)
             .status
             .schedule_error
-            .is_some_and(|e| e.message.contains("no space"))
+            .is_some_and(|e| e.code == "task_failed" && e.message.contains("no space"))
     })
     .await;
     until("success", || {
@@ -240,19 +240,67 @@ async fn a_failed_delete_is_recorded_and_not_retried_every_tick() {
         get_vm(&env, vm)
             .status
             .schedule_error
-            .is_some_and(|e| e.message.contains("no space"))
+            .is_some_and(|e| e.code == "task_failed" && e.message.contains("no space"))
     })
     .await;
     // 실패한 삭제를 tick마다 다시 하지 않는다(한 시간 뒤에 한다).
     tokio::time::sleep(Duration::from_millis(500)).await;
     scheduler.shutdown().await;
     let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
-    let deletes = tasks
+    // 예약 정리의 삭제로 표시한다.
+    let deletes: Vec<_> = tasks
         .iter()
         .filter(|t| matches!(t.spec.op, TaskOp::SnapshotDelete { .. }))
-        .count();
-    assert_eq!(deletes, 1);
+        .collect();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(
+        deletes[0].spec.op,
+        TaskOp::SnapshotDelete {
+            snapshot: ids[0],
+            scheduled: true
+        }
+    );
     assert!(snapshots(&env, vm).iter().any(|s| s.id == ids[0]));
+}
+
+#[tokio::test]
+async fn a_failed_user_delete_of_a_scheduled_snapshot_is_not_recorded() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = running_vm(&admin, "web", &[], Value::Null).await;
+    let mut s: Snapshot = Resource::new(
+        "",
+        SnapshotSpec {
+            vm,
+            name: "auto".into(),
+            parent: None,
+            memory: false,
+            description: String::new(),
+            scheduled: true,
+            vm_spec: get_vm(&env, vm).spec,
+        },
+    );
+    s.name = s.id.to_string();
+    env.cluster.create(&s).await.unwrap();
+    s.status.phase = SnapshotPhase::Ready;
+    s.status.created_at = Some(1);
+    env.cluster
+        .update_status::<SnapshotSpec>(s.id, &s.status)
+        .await
+        .unwrap();
+
+    // 사용자가 지운 예약 스냅샷의 삭제가 실패해도 예약 오류로 남기지 않는다.
+    env.hv
+        .fail_next_snapshot(DriverError::Qmp(QmpError::JobFailed {
+            id: "j".into(),
+            error: "no space".into(),
+        }));
+    let (status, task) = admin.delete("/vms/web/snapshots/auto").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["op"]["scheduled"], false, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(get_vm(&env, vm).status.schedule_error, None);
 }
 
 #[tokio::test]
@@ -272,7 +320,7 @@ async fn offline_task_node_is_recorded_without_a_request() {
         get_vm(&env, vm)
             .status
             .schedule_error
-            .is_some_and(|e| e.message.contains("offline"))
+            .is_some_and(|e| e.code == "node_offline" && e.message.contains("offline"))
     })
     .await;
     assert!(snapshots(&env, vm).is_empty());

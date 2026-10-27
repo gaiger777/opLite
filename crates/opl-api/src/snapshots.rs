@@ -386,18 +386,24 @@ pub async fn delete_snapshot(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    let task = start_delete(&state, &vm, &name).await?;
+    let task = start_delete(&state, &vm, &name, false).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
-/// [`delete_snapshot`]의 본문: VM의 스냅샷 `key`(이름이나 id)를 지울 Task를 만든다. 예약 작업도 쓴다.
-pub(crate) async fn start_delete(state: &AppState, vm: &Vm, key: &str) -> Result<Task, ApiError> {
+/// [`delete_snapshot`]의 본문: VM의 스냅샷 `key`(이름이나 id)를 지울 Task를 만든다. 예약 작업도
+/// 쓴다(`scheduled`).
+pub(crate) async fn start_delete(
+    state: &AppState,
+    vm: &Vm,
+    key: &str,
+    scheduled: bool,
+) -> Result<Task, ApiError> {
     check_not_busy(state, vm)?;
     let snapshot = find_snapshot(state, vm, key)?;
     check_ready(&snapshot)?;
     let op = TaskOp::SnapshotDelete {
         snapshot: snapshot.id,
-        scheduled: false,
+        scheduled,
     };
     create_task(&state.cluster, op, vm.id, vm_node(state, vm)).await
 }

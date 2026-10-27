@@ -1222,8 +1222,9 @@ fn describe_schedule(vm: &Value) -> String {
             cell(&s["keep"])
         )
     };
-    if let Some(e) = vm["status"]["schedule_error"]["message"].as_str() {
-        text.push_str(&format!("last error: {e}\n"));
+    let e = &vm["status"]["schedule_error"];
+    if let Some(message) = e["message"].as_str() {
+        text.push_str(&format!("last error: {}: {message}\n", cell(&e["code"])));
     }
     text
 }
@@ -1604,7 +1605,7 @@ mod tests {
                 json!({ "every": "hourly", "keep": 1, "memory": false }),
                 json!({ "code": "vm_busy", "message": "VM web is busy" })
             )),
-            "schedule: hourly, keep 1\nlast error: VM web is busy\n"
+            "schedule: hourly, keep 1\nlast error: vm_busy: VM web is busy\n"
         );
     }
 

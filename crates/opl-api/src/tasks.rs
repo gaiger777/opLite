@@ -22,12 +22,13 @@ use opl_types::storage::{
     SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, VolumeStatus,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{PowerState, ScheduleError, Vm, VmPhase, VmSpec};
+use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::schedule::task_failed;
 use crate::snapshots::vm_placement;
 
 /// 새 Task를 저장소에 만든다. 이름은 id 문자열이다.
@@ -305,18 +306,15 @@ async fn execute(ctx: &Ctx, task: Task) {
     }
 }
 
-/// 실패로 기록한다. 만들다 만 볼륨·스냅샷은 지운다. 예약 스냅샷의 만들기·삭제였으면 VM에 이유를 남긴다.
+/// 실패로 기록한다. 만들다 만 볼륨·스냅샷은 지운다. 예약 스냅샷의 만들기나 예약 정리의 삭제였으면
+/// VM에 이유를 남긴다.
 async fn fail(ctx: &Ctx, task: &Task, error: String) {
     tracing::warn!(task = %task.id, error = %error, "task failed");
     // 정리가 스냅샷 리소스를 지우므로 먼저 본다.
     let scheduled = snapshot::scheduled_vm(ctx, task);
     cleanup(ctx, task).await;
     if let Some(vm) = scheduled {
-        let failure = ScheduleError {
-            code: "task_failed".into(),
-            message: error.clone(),
-        };
-        snapshot::record_schedule(ctx, vm, Some(failure)).await;
+        snapshot::record_schedule(ctx, vm, Some(task_failed(error.clone()))).await;
     }
     set_status(ctx, task.id, TaskState::Failed, Some(error)).await;
 }

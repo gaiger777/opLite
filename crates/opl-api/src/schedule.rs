@@ -1,7 +1,8 @@
 //! 예약 스냅샷(설계 §5). 리더만 `tick`마다 예약이 있는 VM을 보고, 보관 개수를 넘은 예약 스냅샷을
 //! 하나 지우거나 주기가 지났으면 새 예약 스냅샷을 요청한다. 요청은 API 핸들러와 같은 함수로 하므로
-//! 같은 검사를 받는다. 거절되면 그 이유를 `status.schedule_error`에 남긴다. 만들기 Task의 결과와
-//! 삭제 Task의 실패는 Task 실행기가 남긴다.
+//! 같은 검사를 받는다. 거절되면 그 이유(API 오류 code·메시지)를 `status.schedule_error`에 남긴다.
+//! 만들기 Task의 결과와 예약 정리 삭제(`scheduled: true`) Task의 실패는 Task 실행기(노드가 끝내기
+//! 전에 정리 작업이 끝냈으면 정리 작업)가 `task_failed`로 남긴다.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -254,7 +255,7 @@ async fn tick(
         let result = match check_node(state, vm) {
             Err(e) => Err(e),
             Ok(()) => match &plan {
-                Plan::Delete(id) => start_delete(state, vm, &id.to_string()).await,
+                Plan::Delete(id) => start_delete(state, vm, &id.to_string(), true).await,
                 Plan::Create { name, memory } => {
                     start_create(state, vm, name.clone(), String::new(), Some(*memory), true).await
                 }
@@ -308,6 +309,32 @@ fn check_node(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
                 vm.name
             ),
         )),
+    }
+}
+
+/// 실패를 VM의 `schedule_error`에 남길 Task면 그 VM: 예약 스냅샷의 만들기와 예약 정리의 삭제.
+/// 사용자가 지운 예약 스냅샷의 삭제는 남기지 않는다. `find`는 id로 스냅샷을 찾는다. 예약 정리의
+/// 삭제는 스냅샷이 이미 지워졌어도 남기도록 Task의 대상(VM)으로 정한다.
+pub(crate) fn recorded_vm(
+    task: &TaskSpec,
+    find: impl FnOnce(Uuid) -> Option<Snapshot>,
+) -> Option<Uuid> {
+    match task.op {
+        TaskOp::SnapshotCreate { snapshot } => find(snapshot)
+            .filter(|s| s.spec.scheduled)
+            .map(|s| s.spec.vm),
+        TaskOp::SnapshotDelete {
+            scheduled: true, ..
+        } => Some(task.target),
+        _ => None,
+    }
+}
+
+/// 실패한 Task의 예약 오류
+pub(crate) fn task_failed(message: String) -> ScheduleError {
+    ScheduleError {
+        code: "task_failed".into(),
+        message,
     }
 }
 
@@ -678,5 +705,35 @@ mod tests {
         // 전원 Task는 만들기 요청의 검사(vm_busy)가 거절한다.
         let start = task(TaskOp::VmStart, v.id, TaskState::Running);
         assert!(plan(NOW, HOUR, &v, &[], &[start]).is_some());
+    }
+
+    #[test]
+    fn records_scheduled_creation_and_scheduled_deletion() {
+        let v = vm(ScheduleEvery::Hourly, 3, false);
+        let (auto, manual) = (snap(&v, "a", true, None), snap(&v, "m", false, None));
+        let find = |s: &Snapshot| {
+            let s = s.clone();
+            move |_| Some(s)
+        };
+        let create = |s: &Snapshot| {
+            task(
+                TaskOp::SnapshotCreate { snapshot: s.id },
+                v.id,
+                TaskState::Failed,
+            )
+        };
+        assert_eq!(recorded_vm(&create(&auto).spec, find(&auto)), Some(v.id));
+        assert_eq!(recorded_vm(&create(&manual).spec, find(&manual)), None);
+        let delete = |scheduled| {
+            let op = TaskOp::SnapshotDelete {
+                snapshot: auto.id,
+                scheduled,
+            };
+            task(op, v.id, TaskState::Failed)
+        };
+        // 예약 정리의 삭제는 스냅샷이 이미 지워졌어도 대상 VM으로 남긴다.
+        assert_eq!(recorded_vm(&delete(true).spec, |_| None), Some(v.id));
+        // 사용자가 지운 예약 스냅샷의 삭제는 남기지 않는다.
+        assert_eq!(recorded_vm(&delete(false).spec, find(&auto)), None);
     }
 }

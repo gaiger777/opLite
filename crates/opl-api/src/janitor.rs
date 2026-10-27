@@ -1,11 +1,13 @@
 //! 클러스터 정리 작업(견고성 설계 §3). 리더만 `tick`마다 노드·Task·스냅샷 목록을 보고, 오프라인이
 //! 유예보다 오래 간 노드의 `pending` Task와 제거된 노드의 끝나지 않은 Task를 실패로 끝내고, 만들
 //! Task 없이 남은 `pending` 스냅샷을 지운다. 실패로 끝낸 Task의 정리(볼륨·태그)는 하지 않는다.
+//! 예약 스냅샷의 만들기·예약 정리의 삭제를 끝냈으면 실행기처럼 `task_failed`로 VM에 남긴다.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
@@ -14,6 +16,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::schedule::{recorded_vm, set_schedule_error, task_failed};
 use crate::state::AppState;
 
 #[derive(Debug, Clone)]
@@ -211,7 +214,16 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
         // 그사이 바뀌었으면(실행기가 시작했다 등) 다음 tick에 다시 본다.
         match result {
             Ok(_) => tracing::info!(?action, "janitor"),
-            Err(e) => tracing::info!(?action, error = %e, "janitor action not applied"),
+            Err(e) if written_anyway(cluster, &action, &e) => {
+                tracing::info!(?action, "janitor (reply lost)")
+            }
+            Err(e) => {
+                tracing::info!(?action, error = %e, "janitor action not applied");
+                continue;
+            }
+        }
+        if let Action::FailTask { id, error, .. } = action {
+            record_schedule(state, &tasks, &snapshots, id, error).await;
         }
     }
 }
@@ -235,6 +247,45 @@ async fn apply(cluster: &Cluster, action: &Action) -> Result<u64, ClusterError> 
         Action::DeleteSnapshot { id, revision } => {
             cluster.delete::<SnapshotSpec>(*id, Some(*revision)).await
         }
+    }
+}
+
+/// 실패 쓰기가 `RevisionMismatch`로 거부됐어도 앞선 시도의 응답만 잃은 자기 쓰기일 수 있다(전달
+/// 재시도). Task를 다시 읽어 이 오류로 실패해 있으면 쓰인 것으로 본다.
+fn written_anyway(cluster: &Cluster, action: &Action, err: &ClusterError) -> bool {
+    let (
+        Action::FailTask { id, error, .. },
+        ClusterError::Rejected(Rejection::RevisionMismatch { .. }),
+    ) = (action, err)
+    else {
+        return false;
+    };
+    cluster
+        .get::<TaskSpec>(*id)
+        .ok()
+        .flatten()
+        .is_some_and(|t| {
+            t.status.state == TaskState::Failed && t.status.error.as_deref() == Some(error)
+        })
+}
+
+/// 실패로 끝낸 Task가 예약 스냅샷의 만들기나 예약 정리의 삭제면 실행기처럼 VM에 남긴다.
+async fn record_schedule(
+    state: &AppState,
+    tasks: &[Task],
+    snapshots: &[Snapshot],
+    id: Uuid,
+    error: String,
+) {
+    let Some(task) = tasks.iter().find(|t| t.id == id) else {
+        return;
+    };
+    let find = |s: Uuid| snapshots.iter().find(|x| x.id == s).cloned();
+    let Some(vm) = recorded_vm(&task.spec, find) else {
+        return;
+    };
+    if let Err(e) = set_schedule_error(&state.cluster, vm, Some(task_failed(error))).await {
+        tracing::warn!(vm = %vm, error = %e, "cannot record schedule error");
     }
 }
 
@@ -539,11 +590,28 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ClusterError::Rejected(opl_cluster::types::Rejection::RevisionMismatch { .. })
+                ClusterError::Rejected(Rejection::RevisionMismatch { .. })
             ),
             "{err:?}"
         );
         let got = cluster.get::<TaskSpec>(t.id).unwrap().unwrap();
         assert_eq!(got.status, running);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_failure_that_was_already_written_counts_as_written() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = one_node_cluster(dir.path()).await;
+        let mut t = task(TaskOp::VmStart, Uuid::now_v7(), TaskState::Pending);
+        t.revision = cluster.create(&t).await.unwrap();
+        let action = fail(&t, "node x is offline".into());
+        apply(&cluster, &action).await.unwrap();
+        // 응답만 잃고 다시 보낸 쓰기는 거부되지만 Task는 이 오류로 실패해 있다.
+        let err = apply(&cluster, &action).await.unwrap_err();
+        assert!(written_anyway(&cluster, &action, &err), "{err:?}");
+        // 다른 오류로 실패해 있으면 다른 쪽이 쓴 것이다.
+        let other = fail(&t, "node x was removed".into());
+        let err = apply(&cluster, &other).await.unwrap_err();
+        assert!(!written_anyway(&cluster, &other, &err), "{err:?}");
     }
 }
