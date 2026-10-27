@@ -213,3 +213,112 @@ async fn failed_import_leaves_no_partial_volume() {
     assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
     assert!(!DirStorage::volume_path(&pool, id, ImageFormat::Qcow2).exists());
 }
+
+/// `qemu-io` 명령 하나를 실행하고 성공했는지 돌려준다. `read -P`는 패턴이 다르면 실패한다.
+fn qemu_io(path: &Path, cmd: &str) -> bool {
+    std::process::Command::new("qemu-io")
+        .args(["-f", "qcow2", "-c", cmd, path.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[tokio::test]
+async fn snapshot_revert_restores_contents_and_delete_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = pool(tmp.path());
+    let storage = DirStorage::new("qemu-img");
+    let id = Uuid::now_v7();
+    let qcow2 = ImageFormat::Qcow2;
+    let path = storage
+        .create_volume(&pool, id, 64 * MIB, qcow2)
+        .await
+        .unwrap();
+    assert!(storage.supports_snapshots(qcow2));
+    assert!(!storage.supports_snapshots(ImageFormat::Raw));
+
+    assert!(qemu_io(&path, "write -P 0xab 0 64k"));
+    let tag = Uuid::now_v7().to_string();
+    storage
+        .snapshot_create(&pool, id, qcow2, &tag)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.snapshot_tags(&pool, id, qcow2).await.unwrap(),
+        vec![tag.clone()]
+    );
+    // 같은 태그를 또 만들지 않는다(qemu-img는 이름이 겹치는 스냅샷을 허용한다).
+    let dup = storage.snapshot_create(&pool, id, qcow2, &tag).await;
+    assert!(matches!(dup, Err(DriverError::InvalidSpec(_))), "{dup:?}");
+
+    assert!(qemu_io(&path, "write -P 0xcd 0 64k"));
+    storage
+        .snapshot_revert(&pool, id, qcow2, &tag)
+        .await
+        .unwrap();
+    assert!(qemu_io(&path, "read -P 0xab 0 64k"));
+
+    let missing = Uuid::now_v7().to_string();
+    let err = storage
+        .snapshot_revert(&pool, id, qcow2, &missing)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+
+    storage
+        .snapshot_delete(&pool, id, qcow2, &tag)
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .snapshot_tags(&pool, id, qcow2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // 태그가 이미 없어도 성공한다(다시 시도해도 된다).
+    storage
+        .snapshot_delete(&pool, id, qcow2, &tag)
+        .await
+        .unwrap();
+    // 스냅샷을 지워도 현재 내용은 그대로다.
+    assert!(qemu_io(&path, "read -P 0xab 0 64k"));
+}
+
+#[tokio::test]
+async fn resize_grows_volume_with_snapshots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = pool(tmp.path());
+    let storage = DirStorage::new("qemu-img");
+
+    for format in [ImageFormat::Qcow2, ImageFormat::Raw] {
+        let id = Uuid::now_v7();
+        storage
+            .create_volume(&pool, id, 64 * MIB, format)
+            .await
+            .unwrap();
+        if format == ImageFormat::Qcow2 {
+            // 내부 스냅샷이 있어도 크기를 늘릴 수 있다.
+            storage
+                .snapshot_create(&pool, id, format, "s")
+                .await
+                .unwrap();
+        }
+        storage
+            .resize_volume(&pool, id, format, 128 * MIB)
+            .await
+            .unwrap();
+        let info = storage.volume_info(&pool, id, format).await.unwrap();
+        assert_eq!(info.virtual_bytes, 128 * MIB, "{format:?}");
+
+        // 줄이기는 하지 않는다.
+        let err = storage
+            .resize_volume(&pool, id, format, 32 * MIB)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+        let info = storage.volume_info(&pool, id, format).await.unwrap();
+        assert_eq!(info.virtual_bytes, 128 * MIB, "{format:?}");
+    }
+}

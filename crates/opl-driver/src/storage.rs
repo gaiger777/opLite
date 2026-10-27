@@ -76,6 +76,55 @@ pub trait Storage: Send + Sync {
     ) -> Result<VolumeInfo, DriverError>;
 
     async fn capacity(&self, pool: &StoragePoolSpec) -> Result<Capacity, DriverError>;
+
+    /// 이 백엔드가 `format` 볼륨의 스냅샷을 지원하는지. 지원하지 않는 형식에 스냅샷 메서드를
+    /// 부르면 `InvalidSpec`.
+    fn supports_snapshots(&self, format: ImageFormat) -> bool;
+
+    /// 정지한 볼륨에 스냅샷 `tag`를 만든다. 같은 태그가 이미 있으면 `InvalidSpec`.
+    async fn snapshot_create(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError>;
+
+    /// 정지한 볼륨의 내용을 스냅샷 `tag` 때로 되돌린다.
+    async fn snapshot_revert(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError>;
+
+    /// 정지한 볼륨에서 스냅샷 `tag`를 지운다. 태그가 없으면 성공(다시 시도해도 된다).
+    async fn snapshot_delete(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError>;
+
+    /// 볼륨에 있는 스냅샷 태그들. VM이 실행 중이어도 조회할 수 있다.
+    async fn snapshot_tags(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<Vec<String>, DriverError>;
+
+    /// 정지한 볼륨의 크기를 `size_bytes`로 늘린다. 줄이지는 않는다(실패한다).
+    /// 실제 크기는 `volume_info`로 확인한다.
+    async fn resize_volume(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+        size_bytes: u64,
+    ) -> Result<(), DriverError>;
 }
 
 /// `dir` 풀: 디렉터리 안에 `{id}.qcow2` / `{id}.raw` 파일을 두고 `qemu-img`로 다룬다.
@@ -111,6 +160,77 @@ impl DirStorage {
             });
         }
         Ok(out.stdout)
+    }
+
+    /// 있는 볼륨의 경로. 없으면 `VolumeNotFound`.
+    fn existing_path(
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        pool_dir(pool)?;
+        let path = Self::volume_path(pool, id, format);
+        if !path.exists() {
+            return Err(DriverError::VolumeNotFound(id));
+        }
+        Ok(path)
+    }
+
+    /// 스냅샷을 다룰 볼륨의 경로. 형식이 스냅샷을 지원해야 한다.
+    fn snapshot_path(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        if !self.supports_snapshots(format) {
+            return Err(DriverError::InvalidSpec(format!(
+                "{} volumes do not support snapshots",
+                fmt_name(format)
+            )));
+        }
+        Self::existing_path(pool, id, format)
+    }
+
+    /// `qemu-img info`의 JSON 출력.
+    async fn info_json(&self, path: &Path, format: ImageFormat) -> Result<Value, DriverError> {
+        // -U: 실행 중인 VM이 잡고 있는 이미지 잠금을 무시하고 읽기만 한다.
+        let out = self
+            .qemu_img(&[
+                "info",
+                "-U",
+                "--output=json",
+                "-f",
+                fmt_name(format),
+                path_str(path)?,
+            ])
+            .await?;
+        serde_json::from_slice(&out).map_err(|e| DriverError::ToolFailed {
+            tool: "qemu-img",
+            stderr: format!("unparseable info output: {e}"),
+        })
+    }
+
+    async fn tags_at(&self, path: &Path, format: ImageFormat) -> Result<Vec<String>, DriverError> {
+        let json = self.info_json(path, format).await?;
+        // 스냅샷이 없으면 snapshots 항목이 없다.
+        let Some(snapshots) = json.get("snapshots") else {
+            return Ok(Vec::new());
+        };
+        snapshots
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|s| {
+                s.get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| DriverError::ToolFailed {
+                        tool: "qemu-img",
+                        stderr: format!("info output has a snapshot without name: {s}"),
+                    })
+            })
+            .collect()
     }
 
     /// 풀 안의 임시 파일(`.{id}.{fmt}.{난수}.part`)에 이미지를 만든 뒤 `path`로 하드 링크한다. qemu-img는 기존 파일을
@@ -351,26 +471,8 @@ impl Storage for DirStorage {
         id: Uuid,
         format: ImageFormat,
     ) -> Result<VolumeInfo, DriverError> {
-        pool_dir(pool)?;
-        let path = Self::volume_path(pool, id, format);
-        if !path.exists() {
-            return Err(DriverError::VolumeNotFound(id));
-        }
-        // -U: 실행 중인 VM이 잡고 있는 이미지 잠금을 무시하고 읽기만 한다.
-        let out = self
-            .qemu_img(&[
-                "info",
-                "-U",
-                "--output=json",
-                "-f",
-                fmt_name(format),
-                path_str(&path)?,
-            ])
-            .await?;
-        let json: Value = serde_json::from_slice(&out).map_err(|e| DriverError::ToolFailed {
-            tool: "qemu-img",
-            stderr: format!("unparseable info output: {e}"),
-        })?;
+        let path = Self::existing_path(pool, id, format)?;
+        let json = self.info_json(&path, format).await?;
         let field = |k: &str| {
             json.get(k)
                 .and_then(Value::as_u64)
@@ -391,6 +493,100 @@ impl Storage for DirStorage {
             total_bytes: fs4::total_space(path)?,
             available_bytes: fs4::available_space(path)?,
         })
+    }
+
+    /// 내부 스냅샷은 qcow2만 담을 수 있다.
+    fn supports_snapshots(&self, format: ImageFormat) -> bool {
+        format == ImageFormat::Qcow2
+    }
+
+    async fn snapshot_create(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError> {
+        let path = self.snapshot_path(pool, id, format)?;
+        // qemu-img는 이름이 겹치는 스냅샷도 만든다.
+        if self.tags_at(&path, format).await?.iter().any(|t| t == tag) {
+            return Err(DriverError::InvalidSpec(format!(
+                "snapshot {tag} already exists on volume {id}"
+            )));
+        }
+        let path = path_str(&path)?;
+        self.qemu_img(&["snapshot", "-q", "-f", fmt_name(format), "-c", tag, path])
+            .await?;
+        Ok(())
+    }
+
+    async fn snapshot_revert(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError> {
+        let path = self.snapshot_path(pool, id, format)?;
+        let path = path_str(&path)?;
+        self.qemu_img(&["snapshot", "-q", "-f", fmt_name(format), "-a", tag, path])
+            .await?;
+        Ok(())
+    }
+
+    async fn snapshot_delete(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError> {
+        let path = self.snapshot_path(pool, id, format)?;
+        // `-d`는 태그가 없으면 실패하므로 먼저 확인한다. 겹친 태그가 있으면 모두 지운다.
+        let count = self
+            .tags_at(&path, format)
+            .await?
+            .iter()
+            .filter(|t| *t == tag)
+            .count();
+        let path = path_str(&path)?;
+        for _ in 0..count {
+            self.qemu_img(&["snapshot", "-q", "-f", fmt_name(format), "-d", tag, path])
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn snapshot_tags(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<Vec<String>, DriverError> {
+        let path = self.snapshot_path(pool, id, format)?;
+        self.tags_at(&path, format).await
+    }
+
+    async fn resize_volume(
+        &self,
+        pool: &StoragePoolSpec,
+        id: Uuid,
+        format: ImageFormat,
+        size_bytes: u64,
+    ) -> Result<(), DriverError> {
+        let path = Self::existing_path(pool, id, format)?;
+        let size = size_bytes.to_string();
+        // --shrink 없이는 qemu-img가 줄이기를 거부한다.
+        self.qemu_img(&[
+            "resize",
+            "-q",
+            "-f",
+            fmt_name(format),
+            path_str(&path)?,
+            &size,
+        ])
+        .await?;
+        Ok(())
     }
 }
 
@@ -592,6 +788,19 @@ mod tests {
             storage.capacity(&rel).await,
             Err(DriverError::InvalidSpec(_))
         ));
+        assert!(matches!(
+            storage.resize_volume(&rel, id, raw, 2 << 20).await,
+            Err(DriverError::InvalidSpec(_))
+        ));
+        let qcow2 = ImageFormat::Qcow2;
+        assert!(matches!(
+            storage.snapshot_create(&rel, id, qcow2, "t").await,
+            Err(DriverError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            storage.snapshot_tags(&rel, id, qcow2).await,
+            Err(DriverError::InvalidSpec(_))
+        ));
 
         let abs = pool(tmp.path().to_str().unwrap());
         assert!(matches!(
@@ -659,6 +868,91 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn snapshots_need_qcow2_and_existing_volume() {
+        // 도구까지 가면 다른 오류(Io NotFound)가 난다.
+        let storage = DirStorage::new("/nonexistent/qemu-img");
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let id = Uuid::nil();
+        let (raw, qcow2) = (ImageFormat::Raw, ImageFormat::Qcow2);
+        assert!(storage.supports_snapshots(qcow2));
+        assert!(!storage.supports_snapshots(raw));
+
+        std::fs::write(DirStorage::volume_path(&p, id, raw), b"").unwrap();
+        for res in [
+            storage.snapshot_create(&p, id, raw, "t").await,
+            storage.snapshot_revert(&p, id, raw, "t").await,
+            storage.snapshot_delete(&p, id, raw, "t").await,
+            storage.snapshot_tags(&p, id, raw).await.map(|_| ()),
+        ] {
+            assert!(matches!(res, Err(DriverError::InvalidSpec(_))), "{res:?}");
+        }
+
+        for res in [
+            storage.snapshot_create(&p, id, qcow2, "t").await,
+            storage.snapshot_revert(&p, id, qcow2, "t").await,
+            storage.snapshot_delete(&p, id, qcow2, "t").await,
+            storage.snapshot_tags(&p, id, qcow2).await.map(|_| ()),
+            storage.resize_volume(&p, id, qcow2, 1 << 20).await,
+        ] {
+            assert!(
+                matches!(res, Err(DriverError::VolumeNotFound(_))),
+                "{res:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_delete_skips_missing_tag() {
+        let tools = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let id = Uuid::nil();
+        std::fs::write(DirStorage::volume_path(&p, id, ImageFormat::Qcow2), b"").unwrap();
+        // info만 답하고 다른 명령(snapshot -d)은 실패한다.
+        let storage = DirStorage::new(fake_tool(
+            tools.path(),
+            "case \"$1\" in info) echo '{\"snapshots\": [{\"name\": \"other\"}]}';; \
+             *) echo unexpected >&2; exit 1;; esac",
+        ));
+
+        assert_eq!(
+            storage
+                .snapshot_tags(&p, id, ImageFormat::Qcow2)
+                .await
+                .unwrap(),
+            vec!["other".to_string()]
+        );
+        storage
+            .snapshot_delete(&p, id, ImageFormat::Qcow2, "gone")
+            .await
+            .unwrap();
+        let err = storage
+            .snapshot_delete(&p, id, ImageFormat::Qcow2, "other")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn volume_without_snapshots_has_no_tags() {
+        let tools = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let id = Uuid::nil();
+        std::fs::write(DirStorage::volume_path(&p, id, ImageFormat::Qcow2), b"").unwrap();
+        // 스냅샷이 없으면 qemu-img info는 snapshots 항목을 내지 않는다.
+        let storage = DirStorage::new(fake_tool(tools.path(), "echo '{\"virtual-size\": 5}'"));
+        assert!(
+            storage
+                .snapshot_tags(&p, id, ImageFormat::Qcow2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
