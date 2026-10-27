@@ -1,5 +1,5 @@
 //! 클러스터 멤버로 도는 노드: 노드 간 서버, 클러스터 저장소, reconciler, Task 실행기, HTTPS API,
-//! 노드 감시.
+//! 노드 감시, 예약 스냅샷.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Context;
 use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
-use opl_api::{AppState, TaskRunner, TaskRunnerConfig};
+use opl_api::{AppState, SnapshotScheduler, TaskRunner, TaskRunnerConfig};
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError};
 use opl_driver::{DirStorage, Hypervisor, QemuHypervisor, Storage};
@@ -97,6 +97,7 @@ pub struct Member {
     reconciler: Reconciler,
     runner: TaskRunner,
     monitor: NodeMonitor,
+    schedule: SnapshotScheduler,
     register: JoinHandle<()>,
     promotion: JoinHandle<()>,
     /// 서버 태스크가 끝나면 그 이유가 온다.
@@ -277,7 +278,9 @@ impl Member {
             "opld is ready"
         );
         let (stop, rx) = oneshot::channel::<()>();
-        let app = opl_api::router(Arc::new(state)).merge(crate::web::router());
+        let state = Arc::new(state);
+        let schedule = SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config());
+        let app = opl_api::router(state).merge(crate::web::router());
         let task = tokio::spawn(async move {
             let r = axum::serve(listener, app)
                 .with_graceful_shutdown(async {
@@ -295,6 +298,7 @@ impl Member {
             reconciler,
             runner,
             monitor,
+            schedule,
             register,
             promotion,
             exited,
@@ -356,6 +360,7 @@ impl Member {
             self.api.task.abort();
         }
         self.monitor.shutdown().await;
+        self.schedule.shutdown().await;
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
         self.register.abort();

@@ -9,9 +9,11 @@ use opl_cluster::types::Rejection;
 use opl_driver::{DriverError, uefi_vars_path, vm_state_dir};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
-use opl_types::task::Task;
+use opl_types::task::{Task, TaskOp};
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
+
+use crate::schedule::set_schedule_error;
 
 use super::{Ctx, set_power, set_volume_size, started, stopped, superseded, wait_vm};
 
@@ -285,6 +287,26 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     set_position(ctx, vm_id, |_| Some(id)).await
 }
 
+/// 예약으로 만든 스냅샷의 만들기·삭제 Task면 그 VM
+pub(super) fn scheduled_vm(ctx: &Ctx, task: &Task) -> Option<Uuid> {
+    let (TaskOp::SnapshotCreate { snapshot } | TaskOp::SnapshotDelete { snapshot }) = task.spec.op
+    else {
+        return None;
+    };
+    get_snapshot(ctx, snapshot)
+        .ok()
+        .flatten()
+        .filter(|s| s.spec.scheduled)
+        .map(|s| s.spec.vm)
+}
+
+/// 예약 스냅샷 만들기·삭제의 결과를 VM의 `schedule_error`에 남긴다. 성공(`None`)이면 지운다.
+pub(super) async fn record_schedule(ctx: &Ctx, vm: Uuid, error: Option<String>) {
+    if let Err(e) = set_schedule_error(&ctx.cluster, vm, error).await {
+        tracing::warn!(vm = %vm, error = %e, "cannot record schedule error");
+    }
+}
+
 /// 실패한 만들기의 `pending` 리소스를 지운다. 이미 `ready`면 그대로 둔다.
 pub(super) async fn discard_pending(ctx: &Ctx, id: Uuid) -> Result<(), String> {
     match get_snapshot(ctx, id)? {
@@ -404,7 +426,7 @@ pub(super) fn is_down(vm: &Vm) -> bool {
     matches!(vm.status.phase, VmPhase::Stopped | VmPhase::Failed)
 }
 
-/// VM 스펙을 스냅샷의 것으로 바꾼다. 노드는 지금 것을 두되, 메모리 스냅샷이면 이 노드에서 디스크를
+/// VM 스펙을 스냅샷의 것으로 바꾼다. 노드와 예약은 지금 것을 두되, 메모리 스냅샷이면 이 노드에서 디스크를
 /// 되돌리고 시작하므로 배치되지 않은 VM은 이 노드로 정한다. 끈 뒤 누가 다시 켰으면 디스크를
 /// 건드리기 전에 그만둔다.
 async fn write_reverted_spec(ctx: &Ctx, vm_id: Uuid, snapshot: &Snapshot) -> Result<(), String> {
@@ -415,6 +437,8 @@ async fn write_reverted_spec(ctx: &Ctx, vm_id: Uuid, snapshot: &Snapshot) -> Res
         }
         let mut spec = snapshot.spec.vm_spec.clone();
         spec.node = vm.spec.node;
+        // 예약은 스냅샷 때의 것이 아니라 지금 것을 지킨다.
+        spec.snapshot_schedule = vm.spec.snapshot_schedule;
         if snapshot.spec.memory && spec.node.is_none() {
             spec.node = Some(ctx.config.node);
         }

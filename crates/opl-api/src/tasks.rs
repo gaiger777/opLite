@@ -291,15 +291,27 @@ async fn execute(ctx: &Ctx, task: Task) {
         Err(_) => Err(format!("timed out after {:?}", ctx.config.timeout)),
     };
     match result {
-        Ok(()) => set_status(ctx, task.id, TaskState::Succeeded, None).await,
+        Ok(()) => {
+            // 예약 오류는 만들기가 성공해야 지운다(보관 삭제의 성공은 만들기 실패를 풀지 않는다).
+            let create = matches!(task.spec.op, TaskOp::SnapshotCreate { .. });
+            if let Some(vm) = snapshot::scheduled_vm(ctx, &task).filter(|_| create) {
+                snapshot::record_schedule(ctx, vm, None).await;
+            }
+            set_status(ctx, task.id, TaskState::Succeeded, None).await
+        }
         Err(e) => fail(ctx, &task, e).await,
     }
 }
 
-/// 실패로 기록한다. 만들다 만 볼륨·스냅샷은 지운다.
+/// 실패로 기록한다. 만들다 만 볼륨·스냅샷은 지운다. 예약 스냅샷의 만들기·삭제였으면 VM에 이유를 남긴다.
 async fn fail(ctx: &Ctx, task: &Task, error: String) {
     tracing::warn!(task = %task.id, error = %error, "task failed");
+    // 정리가 스냅샷 리소스를 지우므로 먼저 본다.
+    let scheduled = snapshot::scheduled_vm(ctx, task);
     cleanup(ctx, task).await;
+    if let Some(vm) = scheduled {
+        snapshot::record_schedule(ctx, vm, Some(error.clone())).await;
+    }
     set_status(ctx, task.id, TaskState::Failed, Some(error)).await;
 }
 

@@ -2,6 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use opl_api::SnapshotSchedulerConfig;
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use serde::Deserialize;
 
@@ -38,6 +39,8 @@ pub struct Config {
     pub hypervisor: HypervisorSection,
     #[serde(default)]
     pub reconciler: ReconcilerSection,
+    #[serde(default)]
+    pub schedule: ScheduleSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -100,6 +103,36 @@ impl ReconcilerSection {
     }
 }
 
+/// 예약 스냅샷 작업. 테스트만 줄인다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleSection {
+    /// 예약을 확인하는 간격(초)
+    #[serde(default = "default_tick_secs")]
+    pub tick_secs: u64,
+    /// 주기의 한 시간(초). 매일은 24배, 매주는 168배다.
+    #[serde(default = "default_hour_secs")]
+    pub hour_secs: u64,
+}
+
+impl Default for ScheduleSection {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_tick_secs(),
+            hour_secs: default_hour_secs(),
+        }
+    }
+}
+
+impl ScheduleSection {
+    pub fn scheduler_config(&self) -> SnapshotSchedulerConfig {
+        SnapshotSchedulerConfig {
+            tick: Duration::from_secs(self.tick_secs),
+            hour: Duration::from_secs(self.hour_secs),
+        }
+    }
+}
+
 fn default_listen() -> SocketAddr {
     "0.0.0.0:8006".parse().unwrap()
 }
@@ -123,6 +156,12 @@ fn default_qemu_img() -> PathBuf {
 }
 fn default_acpi_timeout() -> u64 {
     60
+}
+fn default_tick_secs() -> u64 {
+    60
+}
+fn default_hour_secs() -> u64 {
+    3600
 }
 
 /// `host:port`. IPv6 주소는 대괄호로 감싼다.
@@ -178,6 +217,9 @@ impl Config {
         }
         if self.hypervisor.systemd_scope && !linux {
             anyhow::bail!("systemd_scope needs Linux; set it to false");
+        }
+        if self.schedule.tick_secs == 0 || self.schedule.hour_secs == 0 {
+            anyhow::bail!("schedule.tick_secs and schedule.hour_secs must be at least 1");
         }
         // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
         if self.listen.port() == self.cluster_listen.port() {
@@ -259,6 +301,9 @@ mod tests {
         assert_eq!(c.data_dir, Path::new("/var/lib/opl"));
         assert_eq!(c.control_socket(), Path::new("/run/opl/opld.sock"));
         assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(60));
+        let schedule = c.schedule.scheduler_config();
+        assert_eq!(schedule.tick, Duration::from_secs(60));
+        assert_eq!(schedule.hour, Duration::from_secs(3600));
         assert_eq!(c.hypervisor.accel, AccelSetting::Auto);
         assert_eq!(c.hypervisor.systemd_scope, cfg!(target_os = "linux"));
         assert_eq!(
@@ -316,6 +361,23 @@ mod tests {
             ..ok
         };
         assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn schedule_section_shortens_periods_but_not_to_zero() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[schedule]\ntick_secs = 1\nhour_secs = 2");
+        assert!(c.validate().is_ok());
+        let schedule = c.schedule.scheduler_config();
+        assert_eq!(schedule.tick, Duration::from_secs(1));
+        assert_eq!(schedule.hour, Duration::from_secs(2));
+        for bad in ["tick_secs = 0", "hour_secs = 0"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[schedule]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[schedule]\ntick = 1")
+                .is_err()
+        );
     }
 
     #[test]

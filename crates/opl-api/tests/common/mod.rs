@@ -34,6 +34,8 @@ pub struct Env {
     pub node: Uuid,
     pub base: String,
     pub dir: TempDir,
+    /// API 서버의 상태. 예약 작업처럼 상태를 받는 반복 작업을 띄울 때 쓴다.
+    pub state: Arc<AppState>,
     reconciler: Option<Reconciler>,
     runner: Option<TaskRunner>,
     server: tokio::task::JoinHandle<()>,
@@ -150,7 +152,7 @@ impl Env {
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = opl_api::router(state);
+        let app = opl_api::router(state.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -160,6 +162,7 @@ impl Env {
             node,
             base,
             dir,
+            state,
             reconciler: Some(reconciler),
             runner: Some(runner),
             server,

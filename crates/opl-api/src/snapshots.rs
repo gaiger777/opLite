@@ -266,11 +266,25 @@ pub async fn create_snapshot(
         )));
     }
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    check_not_busy(&state, &vm)?;
-    check_disks(&state, &vm)?;
+    let task = start_create(&state, &vm, req.name, req.description, req.memory, false).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// [`create_snapshot`]의 본문: `pending` 스냅샷과 그것을 채울 Task를 만든다. 예약 작업도 쓴다
+/// (`scheduled`). 이름과 설명은 부르는 쪽이 확인한다.
+pub(crate) async fn start_create(
+    state: &AppState,
+    vm: &Vm,
+    name: String,
+    description: String,
+    memory: Option<bool>,
+    scheduled: bool,
+) -> Result<Task, ApiError> {
+    check_not_busy(state, vm)?;
+    check_disks(state, vm)?;
     let running = vm.status.phase == VmPhase::Running;
     let has_disk = !vm.spec.disks.is_empty();
-    let memory = req.memory.unwrap_or(running && has_disk);
+    let memory = memory.unwrap_or(running && has_disk);
     if memory && !running {
         return Err(ApiError::bad_request(format!(
             "VM {:?} is not running; only its disks can be snapshotted",
@@ -287,11 +301,11 @@ pub async fn create_snapshot(
         "",
         SnapshotSpec {
             vm: vm.id,
-            name: req.name,
+            name,
             parent: vm.status.snapshot,
             memory,
-            description: req.description,
-            scheduled: false,
+            description,
+            scheduled,
             vm_spec: vm.spec.clone(),
         },
     );
@@ -301,8 +315,8 @@ pub async fn create_snapshot(
     let op = TaskOp::SnapshotCreate {
         snapshot: snapshot.id,
     };
-    match create_task(&state.cluster, op, vm.id, vm_node(&state, &vm)).await {
-        Ok(task) => Ok((StatusCode::ACCEPTED, Json(task))),
+    match create_task(&state.cluster, op, vm.id, vm_node(state, vm)).await {
+        Ok(task) => Ok(task),
         Err(e) => {
             // 채울 Task가 없는 pending 스냅샷은 이름만 차지한다. 지우지 못하면 주인 노드의
             // Task 실행기가 다음 시작에 고아로 지운다.
@@ -356,14 +370,19 @@ pub async fn delete_snapshot(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    check_not_busy(&state, &vm)?;
-    let snapshot = find_snapshot(&state, &vm, &name)?;
+    let task = start_delete(&state, &vm, &name).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// [`delete_snapshot`]의 본문: VM의 스냅샷 `key`(이름이나 id)를 지울 Task를 만든다. 예약 작업도 쓴다.
+pub(crate) async fn start_delete(state: &AppState, vm: &Vm, key: &str) -> Result<Task, ApiError> {
+    check_not_busy(state, vm)?;
+    let snapshot = find_snapshot(state, vm, key)?;
     check_ready(&snapshot)?;
     let op = TaskOp::SnapshotDelete {
         snapshot: snapshot.id,
     };
-    let task = create_task(&state.cluster, op, vm.id, vm_node(&state, &vm)).await?;
-    Ok((StatusCode::ACCEPTED, Json(task)))
+    create_task(&state.cluster, op, vm.id, vm_node(state, vm)).await
 }
 
 /// VM을 `name`으로 복제할 Task를 돌려준다(202). 원본은 `ready` 스냅샷이나 꺼진 VM의 지금 상태다

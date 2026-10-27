@@ -8,6 +8,7 @@ pub mod cluster;
 mod console;
 pub mod error;
 pub mod resources;
+mod schedule;
 pub mod scheduler;
 mod snapshots;
 mod state;
@@ -27,6 +28,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
+pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
 
