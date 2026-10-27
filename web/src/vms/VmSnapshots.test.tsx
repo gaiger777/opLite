@@ -197,6 +197,26 @@ it("says why snapshots wait while the VM is starting", async () => {
   expect(await screen.findByRole("button", { name: "Revert to base" })).toBeDisabled();
 });
 
+it("waits like the server while the VM has yet to start", async () => {
+  // 켜려는데 아직 멈춰 있다(노드가 막 받았거나 내려갔다). 서버는 vm_busy로 거절한다.
+  const pending = withDisk(vm("web", "stopped"));
+  pending.spec.power = "running";
+  mockLists({
+    vm: [pending],
+    node: [NODE],
+    volume: [volume("web-root", "local")],
+    snapshot: [snapshot("base", pending, 1)],
+  });
+  open(pending);
+  expect(
+    await screen.findByText(
+      "The VM is starting or stopping. Snapshots can be taken, reverted and deleted once it settles.",
+    ),
+  ).toBeVisible();
+  expect(screen.getByRole("button", { name: "Take snapshot" })).toBeDisabled();
+  expect(await screen.findByRole("button", { name: "Revert to base" })).toBeDisabled();
+});
+
 it("reverts after warning that the current state is lost", async () => {
   mockLists({
     vm: [web],
@@ -241,7 +261,7 @@ it("deletes a snapshot after confirming and shows why it could not", async () =>
   const dialog = await screen.findByRole("alertdialog", { name: "Delete snapshot base?" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "The VM is starting or stopping. Try again when it has settled.",
+    "Another operation on this VM (start, stop, snapshot, revert or clone) is in progress. Try again when it has finished.",
   );
 
   server.use(

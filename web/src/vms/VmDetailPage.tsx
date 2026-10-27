@@ -21,7 +21,7 @@ import { formatMib, formatTime, uuidTime } from "@/lib/format";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
 import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
 import { VmConsole } from "@/vms/lazyConsole";
-import { VmConfirm } from "@/vms/VmMenu";
+import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 import { VmSnapshots } from "@/vms/VmSnapshots";
 
@@ -119,7 +119,7 @@ function VmHeader({ vm }: { vm: Vm }) {
   const navigate = useNavigate();
   const nodes = useList("node");
   const { run, remove } = useVmActions();
-  const [confirm, setConfirm] = useState<"force-stop" | "delete" | null>(null);
+  const [confirm, setConfirm] = useState<VmDialog | null>(null);
   // 고정한 노드가 있으면 그 노드, 아니면 스케줄러가 놓은 노드
   const nodeId = vm.spec.node ?? vm.status.node;
   const node = nodes.data?.find((n) => n.id === nodeId);
@@ -153,6 +153,11 @@ function VmHeader({ vm }: { vm: Vm }) {
         {can(me.role, "write", "vm") && (
           <Button variant="outline" size="sm" asChild>
             <Link to={`/vms/${encodeURIComponent(vm.name)}/edit`}>{t("vms.action.edit")}</Link>
+          </Button>
+        )}
+        {can(me.role, "write", "vm") && can(me.role, "write", "volume") && (
+          <Button variant="outline" size="sm" onClick={() => setConfirm("clone")}>
+            {t("vms.action.clone")}
           </Button>
         )}
         {can(me.role, "write", "vm") && (

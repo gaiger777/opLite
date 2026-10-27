@@ -26,7 +26,7 @@
     "last_admin": "마지막 관리자는 관리자 역할을 내려놓을 수 없습니다.",
     "cannot_delete_self": "자기 계정은 지울 수 없습니다.",
     "pool_in_use": "풀에 볼륨이 남아 있습니다. 먼저 볼륨을 지우세요.",
-    "vm_busy": "VM이 시작하거나 정지하는 중입니다. 끝난 뒤 다시 시도하세요.",
+    "vm_busy": "이 VM에 다른 작업(시작·정지, 스냅샷, 되돌리기, 복제)이 진행 중입니다. 끝나면 다시 시도하세요.",
     "snapshot_unsupported": "디스크가 모두 qcow2인 VM만 스냅샷을 만들 수 있습니다.",
     "vm_has_snapshots": "VM에 스냅샷이 있습니다. 먼저 스냅샷을 지우세요.",
     "volume_in_snapshot": "VM 스냅샷이 아직 이 볼륨을 씁니다. 먼저 그 스냅샷을 지우세요.",
@@ -101,7 +101,8 @@
       "snapshot-create": "{{target}} 스냅샷 만들기",
       "snapshot-revert": "{{target}} 스냅샷으로 되돌리기",
       "snapshot-delete": "{{target}} 스냅샷 삭제",
-      "volume-resize": "볼륨 {{target}} 크기 늘리기"
+      "volume-resize": "볼륨 {{target}} 크기 늘리기",
+      "vm-clone": "{{target}} 복제"
     }
   },
   "common": {
@@ -152,7 +153,8 @@
       "reboot": "재시작",
       "console": "콘솔",
       "delete": "삭제",
-      "edit": "편집"
+      "edit": "편집",
+      "clone": "복제"
     },
     "notFound": "{{name}} VM이 없습니다",
     "backToList": "가상 머신 목록으로",
@@ -231,6 +233,26 @@
     "errors": {
       "exists": "이 VM에 같은 이름의 스냅샷이 이미 있습니다.",
       "description": "1024자까지 쓰세요."
+    }
+  },
+  "clone": {
+    "title": "{{name}} 복제",
+    "description": "디스크를 모두 복사해 꺼진 새 VM을 만듭니다. MAC 주소는 새로 정하고 예약 스냅샷은 없습니다.",
+    "name": "새 VM 이름",
+    "source": "원본",
+    "current": "지금 상태(꺼진 VM만)",
+    "snapshot": "스냅샷 {{name}}",
+    "running": "VM이 꺼져 있지 않습니다. 먼저 정지하거나 스냅샷을 고르세요.",
+    "busy": "VM이 시작하거나 정지하는 중입니다. 끝난 뒤 다시 시도하세요.",
+    "gone": "고른 스냅샷이 없어졌거나 준비된 상태가 아닙니다. 원본을 다시 고르세요.",
+    "goneOption": "고른 스냅샷(이제 없음)",
+    "pool": "디스크를 둘 스토리지 풀",
+    "samePool": "원본 디스크와 같은 풀",
+    "submit": "복제",
+    "op": "{{vm}}을(를) {{name}}(으)로 복제",
+    "errors": {
+      "exists": "같은 이름의 VM이 이미 있습니다.",
+      "poolNotOnNode": "VM이 있는 노드에서 쓸 수 없는 스토리지 풀입니다."
     }
   },
   "forms": {

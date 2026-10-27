@@ -26,7 +26,7 @@
     "last_admin": "The last administrator cannot give up the administrator role.",
     "cannot_delete_self": "You cannot delete your own account.",
     "pool_in_use": "The pool still has volumes. Delete them first.",
-    "vm_busy": "The VM is starting or stopping. Try again when it has settled.",
+    "vm_busy": "Another operation on this VM (start, stop, snapshot, revert or clone) is in progress. Try again when it has finished.",
     "snapshot_unsupported": "Only VMs whose disks are all qcow2 can take snapshots.",
     "vm_has_snapshots": "The VM has snapshots. Delete them first.",
     "volume_in_snapshot": "A VM snapshot still uses this volume. Delete that snapshot first.",
@@ -101,7 +101,8 @@
       "snapshot-create": "Take snapshot of {{target}}",
       "snapshot-revert": "Revert {{target}} to a snapshot",
       "snapshot-delete": "Delete snapshot of {{target}}",
-      "volume-resize": "Resize volume {{target}}"
+      "volume-resize": "Resize volume {{target}}",
+      "vm-clone": "Clone {{target}}"
     }
   },
   "common": {
@@ -152,7 +153,8 @@
       "reboot": "Reboot",
       "console": "Console",
       "delete": "Delete",
-      "edit": "Edit"
+      "edit": "Edit",
+      "clone": "Clone"
     },
     "notFound": "There is no VM {{name}}",
     "backToList": "Back to virtual machines",
@@ -231,6 +233,26 @@
     "errors": {
       "exists": "This VM already has a snapshot with this name.",
       "description": "Use at most 1024 characters."
+    }
+  },
+  "clone": {
+    "title": "Clone {{name}}",
+    "description": "A new stopped VM is made with full copies of the disks. It gets new MAC addresses and no snapshot schedule.",
+    "name": "New VM name",
+    "source": "Source",
+    "current": "Current state (stopped VM only)",
+    "snapshot": "Snapshot {{name}}",
+    "running": "The VM is not stopped. Stop it first or choose a snapshot.",
+    "busy": "The VM is starting or stopping. Try again when it has settled.",
+    "gone": "The chosen snapshot no longer exists or is not ready. Choose another source.",
+    "goneOption": "Chosen snapshot (no longer available)",
+    "pool": "Storage pool for the disks",
+    "samePool": "Same pool as each source disk",
+    "submit": "Clone",
+    "op": "Clone {{vm}} to {{name}}",
+    "errors": {
+      "exists": "A VM with this name already exists.",
+      "poolNotOnNode": "That storage pool is not available on the node holding the VM."
     }
   },
   "forms": {

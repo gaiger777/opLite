@@ -16,6 +16,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
+import { VmCloneDialog } from "@/vms/VmCloneDialog";
 import { VmDeleteDialog } from "@/vms/VmDeleteDialog";
 
 /** 목록 행의 동작 메뉴 */
@@ -24,10 +25,12 @@ export function VmMenu({ vm }: { vm: Vm }) {
   const me = usePrincipal();
   const navigate = useNavigate();
   const { run, remove } = useVmActions();
-  const [confirm, setConfirm] = useState<"force-stop" | "delete" | null>(null);
+  const [confirm, setConfirm] = useState<VmDialog | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
+  // 복제는 새 VM과 새 볼륨을 만든다.
+  const clone = write && can(me.role, "write", "volume");
   if (!operate && !write) {
     return null;
   }
@@ -66,6 +69,11 @@ export function VmMenu({ vm }: { vm: Vm }) {
               {t("vms.action.console")}
             </DropdownMenuItem>
           )}
+          {clone && (
+            <DropdownMenuItem onSelect={() => setConfirm("clone")}>
+              {t("vms.action.clone")}
+            </DropdownMenuItem>
+          )}
           {write && (
             <>
               <DropdownMenuSeparator />
@@ -92,7 +100,10 @@ export function VmMenu({ vm }: { vm: Vm }) {
   );
 }
 
-/** 강제 정지와 삭제의 확인 대화상자 */
+/** 메뉴·상세 버튼이 여는 대화상자 */
+export type VmDialog = "force-stop" | "delete" | "clone";
+
+/** 강제 정지·삭제의 확인과 복제 대화상자 */
 export function VmConfirm({
   vm,
   which,
@@ -103,7 +114,7 @@ export function VmConfirm({
   returnFocus,
 }: {
   vm: Vm;
-  which: "force-stop" | "delete" | null;
+  which: VmDialog | null;
   onClose(): void;
   onRun(vm: Vm, action: VmAction): Promise<void>;
   onRemove(vm: Vm): Promise<void>;
@@ -131,6 +142,7 @@ export function VmConfirm({
           returnFocus={returnFocus}
         />
       )}
+      {which === "clone" && <VmCloneDialog vm={vm} onClose={onClose} returnFocus={returnFocus} />}
     </>
   );
 }

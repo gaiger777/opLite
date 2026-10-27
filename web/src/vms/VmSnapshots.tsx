@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/table";
 import { formatBytes, formatTime } from "@/lib/format";
 import { trackTask } from "@/tasks/tasks";
+import { isBusy } from "@/vms/actions";
 import { descriptionError, snapshotNameError, snapshotTree } from "@/vms/snapshots";
 
 /** VM 상세의 스냅샷 탭: 나무 목록과 만들기·되돌리기·삭제 */
@@ -49,7 +50,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
   const rows = snapshotTree(mine);
   const names = new Map(mine.map((s) => [s.id, s.spec.name]));
   // 서버는 시작·정지 중인 VM의 스냅샷 작업을 받지 않는다(vm_busy).
-  const busy = vm.status.phase === "starting" || vm.status.phase === "stopping";
+  const busy = isBusy(vm);
   // qcow2가 아닌 디스크가 있으면 만들 수 없다(snapshot_unsupported). 볼륨 목록을 다 읽어야 안다.
   const unsupported = volumes.isSuccess
     ? (vm.spec.disks ?? [])

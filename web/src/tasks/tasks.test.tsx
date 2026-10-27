@@ -83,6 +83,8 @@ it("describes unknown operations by their kind", () => {
   const unknown = { ...task("4", "pending"), spec: { op: { kind: "vm-migrate" }, target: "x" } };
   expect(describeTask(unknown as unknown as Task, i18n.t, "web")).toBe("vm-migrate web");
   expect(describeTask(task("4", "pending"), i18n.t, "web")).toBe("Start web");
+  const clone = { ...task("4", "pending"), spec: { op: { kind: "vm-clone" }, target: "x" } };
+  expect(describeTask(clone as unknown as Task, i18n.t, "web")).toBe("Clone web");
 });
 
 it("waits for a task and rejects with its error when it fails", async () => {

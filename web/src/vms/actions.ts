@@ -20,6 +20,18 @@ export function isStopped(vm: Vm): boolean {
   return (vm.spec.power ?? "stopped") === "stopped" && (phase === "stopped" || phase === "failed");
 }
 
+/**
+ * 서버의 `check_not_busy`: 시작·정지 중이거나 원하는 전원 상태에 아직 닿지 않았다. 이때 서버는 스냅샷·복제
+ * 요청을 받지 않는다(vm_busy).
+ */
+export function isBusy(vm: Vm): boolean {
+  const phase = vm.status.phase;
+  if (phase === "starting" || phase === "stopping") {
+    return true;
+  }
+  return vm.spec.power === "running" ? phase !== "running" : !isStopped(vm);
+}
+
 /** 지금 상태에서 할 수 있는 동작인지. 서버도 확인하지만 할 수 없는 버튼은 막아 둔다. */
 export function canRun(vm: Vm, action: VmAction): boolean {
   const phase = vm.status.phase;
