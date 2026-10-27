@@ -38,8 +38,10 @@ it("round-trips a VM through the form", () => {
       ...vm("web", "running").spec,
       disks: [{ volume: "web-root", bus: "sata", boot_order: 1 }],
       nics: [{ network: "lan", model: "e1000e", mac: "52:54:00:12:34:56" }],
+      snapshot_schedule: { every: "daily", keep: 7, memory: true },
     },
   });
+  // 폼에 없는 예약 스냅샷도 고칠 때 잃지 않는다.
   expect(toSpec(fromVm(web), "running")).toEqual(web.spec);
 });
 

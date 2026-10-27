@@ -132,6 +132,7 @@ mod tests {
             power,
             restart: Default::default(),
             node,
+            snapshot_schedule: None,
         }
     }
 

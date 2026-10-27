@@ -654,6 +654,7 @@ export interface components {
                 node?: string | null;
                 power?: components["schemas"]["PowerState"];
                 restart?: components["schemas"]["RestartPolicy"];
+                snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
             };
         };
         CreateRequest_VolumeSpec: {
@@ -948,7 +949,7 @@ export interface components {
                     op: components["schemas"]["TaskOp"];
                     /**
                      * Format: uuid
-                     * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷 Task는 VM이다.
+                     * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제 Task는 (원본) VM이다.
                      */
                     target: string;
                 };
@@ -992,6 +993,7 @@ export interface components {
                     node?: string | null;
                     power?: components["schemas"]["PowerState"];
                     restart?: components["schemas"]["RestartPolicy"];
+                    snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
                 };
                 /** @description VM의 실제 상태. reconciler만 기록한다. */
                 status: {
@@ -1009,6 +1011,11 @@ export interface components {
                      * @default null
                      */
                     pid: number | null;
+                    /**
+                     * @description 마지막 예약 스냅샷이 실패한 이유. 성공하면 지운다.
+                     * @default null
+                     */
+                    schedule_error: string | null;
                     /**
                      * Format: uuid
                      * @description 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
@@ -1360,7 +1367,7 @@ export interface components {
                 op: components["schemas"]["TaskOp"];
                 /**
                  * Format: uuid
-                 * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷 Task는 VM이다.
+                 * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제 Task는 (원본) VM이다.
                  */
                 target: string;
             };
@@ -1400,6 +1407,7 @@ export interface components {
                 node?: string | null;
                 power?: components["schemas"]["PowerState"];
                 restart?: components["schemas"]["RestartPolicy"];
+                snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
             };
             /** @description VM의 실제 상태. reconciler만 기록한다. */
             status: {
@@ -1417,6 +1425,11 @@ export interface components {
                  * @default null
                  */
                 pid: number | null;
+                /**
+                 * @description 마지막 예약 스냅샷이 실패한 이유. 성공하면 지운다.
+                 * @default null
+                 */
+                schedule_error: string | null;
                 /**
                  * Format: uuid
                  * @description 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
@@ -1472,7 +1485,20 @@ export interface components {
         /** @enum {string} */
         Role: "admin" | "operator" | "viewer";
         /** @enum {string} */
+        ScheduleEvery: "hourly" | "daily" | "weekly";
+        /** @enum {string} */
         SnapshotPhase: "pending" | "ready";
+        /** @description 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다. */
+        SnapshotSchedule: {
+            every: components["schemas"]["ScheduleEvery"];
+            /**
+             * Format: int32
+             * @description 1부터 `MAX_SCHEDULE_KEEP`까지
+             */
+            keep: number;
+            /** @description 실행 중이면 메모리도 저장한다. */
+            memory?: boolean;
+        };
         SnapshotSpec: {
             description?: string;
             /** @description 메모리 상태를 담았는지. 담았으면 VM의 첫 디스크에 있다. */
@@ -1577,6 +1603,13 @@ export interface components {
             kind: "volume-resize";
             /** Format: int64 */
             size_bytes: number;
+        } | {
+            /** @enum {string} */
+            kind: "vm-clone";
+            name: string;
+            pool?: string | null;
+            /** Format: uuid */
+            snapshot?: string | null;
         };
         TaskSpec: {
             /**
@@ -1587,7 +1620,7 @@ export interface components {
             op: components["schemas"]["TaskOp"];
             /**
              * Format: uuid
-             * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷 Task는 VM이다.
+             * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제 Task는 (원본) VM이다.
              */
             target: string;
         };
@@ -1639,6 +1672,7 @@ export interface components {
                 node?: string | null;
                 power?: components["schemas"]["PowerState"];
                 restart?: components["schemas"]["RestartPolicy"];
+                snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
             };
         };
         UpdateUserRequest: {
@@ -1673,6 +1707,7 @@ export interface components {
             node?: string | null;
             power?: components["schemas"]["PowerState"];
             restart?: components["schemas"]["RestartPolicy"];
+            snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
         };
         /** @description VM의 실제 상태. reconciler만 기록한다. */
         VmStatus: {
@@ -1690,6 +1725,11 @@ export interface components {
              * @default null
              */
             pid: number | null;
+            /**
+             * @description 마지막 예약 스냅샷이 실패한 이유. 성공하면 지운다.
+             * @default null
+             */
+            schedule_error: string | null;
             /**
              * Format: uuid
              * @description 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.

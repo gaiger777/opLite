@@ -114,6 +114,7 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
             power: PowerState::Running,
             restart: Default::default(),
             node: Some(node),
+            snapshot_schedule: None,
         },
     )
 }

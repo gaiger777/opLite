@@ -9,7 +9,14 @@ import { apiUrl, server } from "@/test/server";
 it("summarizes nodes, VMs and failures", async () => {
   const down = { ...NODE, id: "n2", name: "node-b", status: { ...NODE.status, online: false } };
   const broken = vm("db", "failed", {
-    status: { phase: "failed", node: null, pid: null, last_error: "no firmware", snapshot: null },
+    status: {
+      phase: "failed",
+      node: null,
+      pid: null,
+      last_error: "no firmware",
+      snapshot: null,
+      schedule_error: null,
+    },
   });
   mockLists({ node: [NODE, down], vm: [vm("web", "running"), vm("app", "running"), broken] });
   server.use(
@@ -52,13 +59,34 @@ const cluster = (leader: string | null, members: { id: string; name?: string | n
 it("counts only VMs whose QEMU runs on the node", () => {
   // 실패한 VM도 status.node가 남는다.
   const failed = vm("db", "failed", {
-    status: { phase: "failed", node: "n1", pid: null, last_error: "boom", snapshot: null },
+    status: {
+      phase: "failed",
+      node: "n1",
+      pid: null,
+      last_error: "boom",
+      snapshot: null,
+      schedule_error: null,
+    },
   });
   const stopping = vm("app", "stopping", {
-    status: { phase: "stopping", node: "n1", pid: 7, last_error: null, snapshot: null },
+    status: {
+      phase: "stopping",
+      node: "n1",
+      pid: 7,
+      last_error: null,
+      snapshot: null,
+      schedule_error: null,
+    },
   });
   const elsewhere = vm("far", "running", {
-    status: { phase: "running", node: "n2", pid: 8, last_error: null, snapshot: null },
+    status: {
+      phase: "running",
+      node: "n2",
+      pid: 8,
+      last_error: null,
+      snapshot: null,
+      schedule_error: null,
+    },
   });
   expect(usage(NODE, [vm("web", "running"), failed, stopping, elsewhere])).toEqual({
     vms: 2,

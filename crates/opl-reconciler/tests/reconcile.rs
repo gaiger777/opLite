@@ -29,6 +29,7 @@ async fn starts_assigned_vm_and_records_status() {
             pid: Some(pid),
             last_error: None,
             snapshot: None,
+            schedule_error: None,
         }
     );
 }
@@ -280,18 +281,20 @@ async fn power_off_keeps_current_snapshot() {
     let mut vm = vm("web", env.node);
     let snapshot = Uuid::now_v7();
     vm.status.snapshot = Some(snapshot);
+    vm.status.schedule_error = Some("vm busy".into());
     env.create(&vm).await;
     env.wait(vm.id, "running", running).await;
 
     env.hv.guest_shutdown(vm.id);
 
-    // 상태를 새로 써도 스냅샷 위치는 reconciler가 지우지 않는다.
+    // 상태를 새로 써도 스냅샷 위치와 예약 오류는 reconciler가 지우지 않는다.
     let got = env
         .wait(vm.id, "powered off", |v| {
             v.spec.power == PowerState::Stopped && v.status.phase == VmPhase::Stopped
         })
         .await;
     assert_eq!(got.status.snapshot, Some(snapshot));
+    assert_eq!(got.status.schedule_error.as_deref(), Some("vm busy"));
 }
 
 #[tokio::test]
@@ -503,7 +506,7 @@ async fn status_writes_keep_snapshot_position_written_meanwhile() {
     let env = Env::start().await;
     let vm = stopped_vm(&env).await;
 
-    // 작업자가 VM을 읽고 시작하는 사이에 Task 실행기가 현재 스냅샷 위치를 쓴다.
+    // 작업자가 VM을 읽고 시작하는 사이에 Task 실행기가 현재 스냅샷 위치를, 예약 작업이 예약 오류를 쓴다.
     env.hv.delay_starts(Duration::from_millis(300));
     env.set_power(vm.id, PowerState::Running).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -512,6 +515,7 @@ async fn status_writes_keep_snapshot_position_written_meanwhile() {
     let snapshot = Uuid::now_v7();
     let status = VmStatus {
         snapshot: Some(snapshot),
+        schedule_error: Some("vm busy".into()),
         ..current.status.clone()
     };
     env.cluster
@@ -522,4 +526,8 @@ async fn status_writes_keep_snapshot_position_written_meanwhile() {
     // 작업자가 쓴 Running status가 그 값을 덮지 않는다.
     env.wait(vm.id, "running", running).await;
     assert_eq!(env.get(vm.id).status.snapshot, Some(snapshot));
+    assert_eq!(
+        env.get(vm.id).status.schedule_error.as_deref(),
+        Some("vm busy")
+    );
 }

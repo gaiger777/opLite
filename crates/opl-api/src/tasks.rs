@@ -351,6 +351,8 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
         TaskOp::SnapshotRevert { snapshot } => snapshot::revert(ctx, task, *snapshot).await,
         TaskOp::SnapshotDelete { snapshot } => snapshot::delete(ctx, id, *snapshot).await,
         TaskOp::VolumeResize { size_bytes } => resize_volume(ctx, id, *size_bytes).await,
+        // 복제 실행은 아직 없다.
+        TaskOp::VmClone { .. } => Err("vm clone is not implemented yet".into()),
     }
 }
 

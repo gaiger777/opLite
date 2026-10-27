@@ -47,6 +47,8 @@ export interface VmFormValues {
   /** 빈 문자열이면 스케줄러가 고른다. */
   node: string;
   restart: Schemas["RestartPolicy"];
+  /** 예약 스냅샷. null이면 없다. */
+  snapshotSchedule: Schemas["SnapshotSchedule"] | null;
   /** 만든 뒤 곧바로 시작한다(만들 때만). */
   start: boolean;
 }
@@ -85,6 +87,7 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     nics: [{ network: "user", model: "virtio", mac: "" }],
     node: "",
     restart: "never",
+    snapshotSchedule: null,
     start: true,
   };
 }
@@ -110,6 +113,7 @@ export function fromVm(vm: Vm): VmFormValues {
     nics: (s.nics ?? []).map((n) => ({ network: n.network, model: n.model, mac: n.mac ?? "" })),
     node: s.node ?? "",
     restart: s.restart ?? "never",
+    snapshotSchedule: s.snapshot_schedule ?? null,
     start: false,
   };
 }
@@ -222,5 +226,6 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
     node: v.node === "" ? null : v.node,
     power,
     restart: v.restart,
+    snapshot_schedule: v.snapshotSchedule,
   };
 }

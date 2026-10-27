@@ -15,7 +15,7 @@ pub type Task = Resource<TaskSpec, TaskStatus>;
 #[serde(deny_unknown_fields)]
 pub struct TaskSpec {
     pub op: TaskOp,
-    /// 대상 리소스(VM 또는 Volume)의 id. 스냅샷 Task는 VM이다.
+    /// 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제 Task는 (원본) VM이다.
     pub target: Uuid,
     /// 작업을 실행할 노드
     pub node: Uuid,
@@ -57,6 +57,13 @@ pub enum TaskOp {
     /// 볼륨 크기를 늘린다(줄이지 않는다).
     VolumeResize {
         size_bytes: u64,
+    },
+    /// 대상 VM을 `name`으로 복제한다. `snapshot`이 없으면 지금 상태(꺼진 VM)에서,
+    /// `pool`이 없으면 원본 볼륨의 풀에 디스크를 복사한다.
+    VmClone {
+        name: String,
+        snapshot: Option<Uuid>,
+        pool: Option<String>,
     },
 }
 
@@ -134,6 +141,34 @@ mod tests {
             json,
             serde_json::json!({ "kind": "volume-resize", "size_bytes": 20u64 << 30 })
         );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+    }
+
+    #[test]
+    fn clone_op_is_tagged_by_kind() {
+        let snapshot = Uuid::now_v7();
+        let op = TaskOp::VmClone {
+            name: "web-02".into(),
+            snapshot: Some(snapshot),
+            pool: Some("fast".into()),
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "vm-clone",
+                "name": "web-02",
+                "snapshot": snapshot,
+                "pool": "fast"
+            })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        let op = TaskOp::VmClone {
+            name: "web-02".into(),
+            snapshot: None,
+            pool: None,
+        };
+        let json = serde_json::to_value(&op).unwrap();
         assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
     }
 

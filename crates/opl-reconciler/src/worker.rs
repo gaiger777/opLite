@@ -374,12 +374,13 @@ impl Worker {
         self.hv.start(&spec, None).await.map_err(|e| e.to_string())
     }
 
-    /// `vm`을 읽은 뒤 계산한 status를 기록한다. `snapshot`(현재 스냅샷 위치)은 Task 실행기가 쓰는
-    /// 값이므로 저장소의 것을 지킨다: revision을 확인하며 쓰고, 그 사이 누가 썼으면 다시 읽어
-    /// 그 `snapshot`으로 다시 쓴다. 나머지 필드는 전처럼 이 작업자가 계산한 값으로 덮는다.
+    /// `vm`을 읽은 뒤 계산한 status를 기록한다. `snapshot`(현재 스냅샷 위치)과 `schedule_error`는
+    /// Task 실행기·예약 작업이 쓰는 값이므로 저장소의 것을 지킨다: revision을 확인하며 쓰고, 그 사이
+    /// 누가 썼으면 다시 읽어 그 값으로 다시 쓴다. 나머지 필드는 전처럼 이 작업자가 계산한 값으로 덮는다.
     async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
         loop {
             status.snapshot = vm.status.snapshot;
+            status.schedule_error = vm.status.schedule_error.clone();
             match self
                 .cluster
                 .update_status_checked::<VmSpec>(self.id, vm.revision, &status)
@@ -420,6 +421,7 @@ impl Worker {
             pid: None,
             last_error: error,
             snapshot: vm.status.snapshot,
+            schedule_error: vm.status.schedule_error.clone(),
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

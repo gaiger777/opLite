@@ -33,6 +33,9 @@ pub struct VmSpec {
     /// 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
     #[serde(default)]
     pub node: Option<Uuid>,
+    /// 예약 스냅샷. None이면 예약하지 않는다.
+    #[serde(default)]
+    pub snapshot_schedule: Option<SnapshotSchedule>,
 }
 
 impl ResourceSpec for VmSpec {
@@ -42,6 +45,9 @@ impl ResourceSpec for VmSpec {
 
 /// VM 하나의 최대 NIC 수. tap 장치 이름(15자)에 순번 두 자리를 넣는다.
 pub const MAX_NICS: usize = 16;
+
+/// 예약 스냅샷 보관 개수의 최댓값.
+pub const MAX_SCHEDULE_KEEP: u32 = 100;
 
 impl VmSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -72,6 +78,11 @@ impl VmSpec {
                 return Err(ValidationError::DuplicateMac(mac));
             }
         }
+        if let Some(schedule) = &self.snapshot_schedule
+            && !(1..=MAX_SCHEDULE_KEEP).contains(&schedule.keep)
+        {
+            return Err(ValidationError::ScheduleKeep);
+        }
         Ok(())
     }
 }
@@ -92,6 +103,30 @@ pub enum ValidationError {
     DuplicateMac(MacAddr),
     #[error("a VM can have at most {MAX_NICS} NICs")]
     TooManyNics,
+    #[error("snapshot_schedule.keep must be between 1 and {MAX_SCHEDULE_KEEP}")]
+    ScheduleKeep,
+}
+
+/// 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotSchedule {
+    pub every: ScheduleEvery,
+    /// 1부터 `MAX_SCHEDULE_KEEP`까지
+    pub keep: u32,
+    /// 실행 중이면 메모리도 저장한다.
+    #[serde(default)]
+    pub memory: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ScheduleEvery {
+    Hourly,
+    Daily,
+    Weekly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +242,8 @@ pub struct VmStatus {
     pub last_error: Option<String>,
     /// 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
     pub snapshot: Option<Uuid>,
+    /// 마지막 예약 스냅샷이 실패한 이유. 성공하면 지운다.
+    pub schedule_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -317,6 +354,7 @@ mod tests {
         assert_eq!(spec.power, PowerState::Running);
         assert_eq!(spec.restart, RestartPolicy::OnFailure);
         assert_eq!(spec.node, None);
+        assert_eq!(spec.snapshot_schedule, None);
     }
 
     #[test]
@@ -384,6 +422,63 @@ mod tests {
         let st: VmStatus = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(st, VmStatus::default());
         assert_eq!(st.snapshot, None);
+        assert_eq!(st.schedule_error, None);
+    }
+
+    #[test]
+    fn snapshot_schedule_defaults_to_none() {
+        assert_eq!(sample().snapshot_schedule, None);
+    }
+
+    #[test]
+    fn snapshot_schedule_round_trips() {
+        let mut json = sample_json();
+        json["snapshot_schedule"] = serde_json::json!({ "every": "daily", "keep": 7 });
+        let spec: VmSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            spec.snapshot_schedule,
+            Some(SnapshotSchedule {
+                every: ScheduleEvery::Daily,
+                keep: 7,
+                memory: false,
+            })
+        );
+        let back = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            back["snapshot_schedule"],
+            serde_json::json!({ "every": "daily", "keep": 7, "memory": false })
+        );
+        for (every, text) in [
+            (ScheduleEvery::Hourly, "hourly"),
+            (ScheduleEvery::Daily, "daily"),
+            (ScheduleEvery::Weekly, "weekly"),
+        ] {
+            assert_eq!(serde_json::to_value(every).unwrap(), text);
+        }
+
+        let mut json = sample_json();
+        json["snapshot_schedule"] = serde_json::json!({ "every": "monthly", "keep": 7 });
+        assert!(serde_json::from_value::<VmSpec>(json).is_err());
+    }
+
+    #[test]
+    fn validate_checks_schedule_keep() {
+        let with_keep = |keep| {
+            let mut s = sample();
+            s.snapshot_schedule = Some(SnapshotSchedule {
+                every: ScheduleEvery::Hourly,
+                keep,
+                memory: true,
+            });
+            s.validate()
+        };
+        assert_eq!(with_keep(1), Ok(()));
+        assert_eq!(with_keep(MAX_SCHEDULE_KEEP), Ok(()));
+        assert_eq!(with_keep(0), Err(ValidationError::ScheduleKeep));
+        assert_eq!(
+            with_keep(MAX_SCHEDULE_KEEP + 1),
+            Err(ValidationError::ScheduleKeep)
+        );
     }
 
     #[test]

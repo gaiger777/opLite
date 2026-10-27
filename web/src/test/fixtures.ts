@@ -24,6 +24,7 @@ export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm
       pid: null,
       last_error: null,
       snapshot: null,
+      schedule_error: null,
     },
     ...extra,
   } satisfies Vm;
