@@ -346,7 +346,8 @@ async fn stopped_vm_clone_copies_disk_content() {
     assert!(qemu_io(&file, "write -P 0xab 0 64k"));
 
     // 꺼진 VM은 지금 디스크 내용을 복사한다.
-    run(&c, "/vms/web/clone", json!({ "name": "copy" })).await;
+    let out = d.ctl(&["vm", "clone", "web", "copy"]).await.unwrap();
+    assert!(out.contains("vm copy cloned from web"), "{out}");
     let web = vm(&c).await;
     let copy = c.get("/vms/copy").await.unwrap();
     assert_eq!(copy["spec"]["disks"][0]["volume"], "copy-root", "{copy}");
@@ -396,12 +397,9 @@ async fn running_vm_snapshot_clone_starts() {
     let pid = web["status"]["pid"].as_u64().unwrap();
 
     // 실행 중인 VM의 스냅샷에서 복제한다. QEMU가 디스크를 쥔 채로 복사하고 VM은 계속 돈다.
-    run(
-        &c,
-        "/vms/web/clone",
-        json!({ "name": "copy", "snapshot": "base" }),
-    )
-    .await;
+    d.ctl(&["vm", "clone", "web", "copy", "--snapshot", "base"])
+        .await
+        .unwrap();
     let v = vm(&c).await;
     assert_eq!(v["status"]["phase"], "running", "{v}");
     assert_eq!(v["status"]["pid"].as_u64(), Some(pid), "{v}");
@@ -443,21 +441,12 @@ async fn running_vm_snapshot_clone_starts() {
     d.stop();
 }
 
-/// VM `web`의 예약을 바꾼다. 스냅샷 Task가 도는 동안은 수정이 `vm_busy`라 다시 한다.
-async fn set_schedule(c: &Client, schedule: Value) {
-    eventually("schedule update", || {
-        let schedule = schedule.clone();
-        async move {
-            let mut spec = vm(c).await["spec"].clone();
-            spec["snapshot_schedule"] = schedule;
-            match c.put("/vms/web", &json!({ "spec": spec })).await {
-                Ok(_) => true,
-                Err(e) if e.to_string().contains("vm_busy") => false,
-                Err(e) => panic!("{e}"),
-            }
-        }
-    })
-    .await;
+/// `oplctl vm snapshot schedule web …`로 예약을 바꾼다. 스냅샷 Task가 도는 동안은 수정이
+/// `vm_busy`지만 oplctl이 기다렸다 다시 한다.
+async fn set_schedule(d: &Daemon, args: &[&str]) {
+    let mut argv = vec!["vm", "snapshot", "schedule", "web"];
+    argv.extend_from_slice(args);
+    d.ctl(&argv).await.unwrap();
 }
 
 #[tokio::test]
@@ -481,7 +470,9 @@ async fn schedule_creates_and_prunes_snapshots() {
         json!({ "name": "mine", "memory": false }),
     )
     .await;
-    set_schedule(&c, json!({ "every": "hourly", "keep": 2 })).await;
+    set_schedule(&d, &["--every", "hourly", "--keep", "2"]).await;
+    let out = d.ctl(&["vm", "snapshot", "schedule", "web"]).await.unwrap();
+    assert!(out.starts_with("schedule: hourly, keep 2\n"), "{out}");
 
     // 넷 이상 만들어질 때까지 본다. 넘친 것은 다음 tick에 지우고 그동안 새로 만들지 않으므로
     // 예약 스냅샷은 많아야 keep+1개다.
@@ -514,7 +505,7 @@ async fn schedule_creates_and_prunes_snapshots() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    set_schedule(&c, Value::Null).await;
+    set_schedule(&d, &["--off"]).await;
 
     // 예약을 끄고 도는 Task가 끝나면, 디스크의 태그와 스냅샷 리소스가 같다. 가장 먼저 만든 것은 지웠다.
     let (c, file) = (&c, file.as_path());
@@ -542,11 +533,26 @@ async fn schedule_creates_and_prunes_snapshots() {
     let v = vm(c).await;
     assert_eq!(v["status"]["schedule_error"], Value::Null, "{v}");
     assert_eq!(v["status"]["phase"], "running", "{v}");
+    let out = d.ctl(&["vm", "snapshot", "schedule", "web"]).await.unwrap();
+    assert_eq!(out, "schedule: off\n");
+    // 목록의 SCHEDULED 열(설명이 비어 마지막 칸)이 예약 스냅샷을 가린다.
+    let out = d.ctl(&["vm", "snapshot", "list", "web"]).await.unwrap();
+    for line in out.lines().skip(1) {
+        assert_eq!(line.ends_with("true"), line.contains("auto-"), "{out}");
+    }
 
     d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
-    d.ctl(&["vm", "delete", "web", "--with-snapshots"])
+    // 예약이 켜져 있으면 스냅샷과 함께 지울 때 먼저 끈다(마지막 예약 스냅샷에서 한 주가 지나지 않았고
+    // 보관 개수 안이라 그새 할 일은 없다).
+    set_schedule(&d, &["--every", "weekly", "--keep", "5"]).await;
+    let out = d
+        .ctl(&["vm", "delete", "web", "--with-snapshots"])
         .await
         .unwrap();
+    assert!(
+        out.starts_with("snapshot schedule of vm web turned off\n"),
+        "{out}"
+    );
     assert!(tags(file).is_empty());
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     d.stop();

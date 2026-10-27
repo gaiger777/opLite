@@ -283,6 +283,18 @@ enum VmCmd {
         #[arg(long)]
         with_snapshots: bool,
     },
+    /// VM을 복제해 새 VM(꺼짐)을 만든다. 디스크는 새 볼륨에 복사하고 NIC는 새 MAC을 받는다.
+    Clone {
+        vm: String,
+        /// 새 VM 이름
+        name: String,
+        /// 이 스냅샷(이름이나 id)의 상태에서 복제한다. 생략하면 꺼진 VM의 지금 상태에서 복제한다.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// 새 디스크를 둘 풀. 생략하면 원본 볼륨과 같은 풀이다.
+        #[arg(long)]
+        pool: Option<String>,
+    },
     /// VM 스냅샷(디스크, 실행 중이면 메모리, VM 설정)
     Snapshot {
         #[command(subcommand)]
@@ -353,6 +365,38 @@ enum SnapshotCmd {
         vm: String,
         name: String,
     },
+    /// 예약 스냅샷을 설정하거나 끈다. 옵션이 없으면 지금 예약과 마지막 예약 오류를 보여 준다.
+    Schedule(ScheduleArgs),
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Every {
+    Hourly,
+    Daily,
+    Weekly,
+}
+
+#[derive(Args)]
+struct ScheduleArgs {
+    vm: String,
+    /// 스냅샷을 만드는 주기
+    #[arg(long, value_enum, requires = "keep")]
+    every: Option<Every>,
+    /// 남길 예약 스냅샷 수(1-100). 넘으면 오래된 것부터 지운다.
+    #[arg(long, requires = "every")]
+    keep: Option<u32>,
+    /// 실행 중이면 메모리 상태도 담는다.
+    #[arg(long, requires = "every")]
+    memory: bool,
+    /// 예약을 끈다. 이미 만든 스냅샷은 남는다.
+    #[arg(long, conflicts_with_all = ["every", "keep", "memory"])]
+    off: bool,
+}
+
+/// 설정할 예약(`snapshot_schedule` 값). 주기를 주지 않았으면 `None`이다.
+fn schedule_value(args: &ScheduleArgs) -> Option<Value> {
+    let (every, keep) = args.every.zip(args.keep)?;
+    Some(json!({ "every": value_name(every), "keep": keep, "memory": args.memory }))
 }
 
 #[derive(Subcommand)]
@@ -948,8 +992,17 @@ async fn vm(
                 // 지우지 않도록 먼저 모두 확인한다.
                 let current = client.get(&format!("/vms/{vm}")).await?;
                 let list = client.get(&format!("/vms/{vm}/snapshots")).await?;
-                let items = list["items"].as_array().cloned().unwrap_or_default();
+                let mut items = list["items"].as_array().cloned().unwrap_or_default();
                 check_deletable(&vm, &current, &items)?;
+                // 지우는 사이 예약 스냅샷이 새로 생기지 않게 예약을 먼저 끄고 다시 확인한다.
+                if schedule_is_on(&current) {
+                    put_schedule(client, &vm, None).await?;
+                    writeln!(out, "snapshot schedule of vm {vm} turned off")?;
+                    let current = client.get(&format!("/vms/{vm}")).await?;
+                    let list = client.get(&format!("/vms/{vm}/snapshots")).await?;
+                    items = list["items"].as_array().cloned().unwrap_or_default();
+                    check_deletable(&vm, &current, &items)?;
+                }
                 for s in items {
                     let name = cell(&s["spec"]["name"]);
                     let path = format!("/vms/{vm}/snapshots/{}", cell(&s["id"]));
@@ -959,6 +1012,17 @@ async fn vm(
             }
             client.delete(&format!("/vms/{vm}")).await?;
             writeln!(out, "vm {vm} deleted")?;
+        }
+        VmCmd::Clone {
+            vm,
+            name,
+            snapshot,
+            pool,
+        } => {
+            let body = json!({ "name": name, "snapshot": snapshot, "pool": pool });
+            let task = client.post(&format!("/vms/{vm}/clone"), &body).await?;
+            client.wait_task(&task).await?;
+            writeln!(out, "vm {name} cloned from {vm}")?;
         }
         VmCmd::Snapshot { cmd } => snapshot(client, cmd, json_out, out).await?,
         VmCmd::Console { vm, port } => {
@@ -1033,11 +1097,7 @@ async fn snapshot(
             let current = client.get(&format!("/vms/{vm}")).await?["status"]["snapshot"].clone();
             let items = list["items"].as_array().cloned().unwrap_or_default();
             let rows = snapshot_rows(&items, current.as_str());
-            table(
-                out,
-                &["", "NAME", "CREATED", "MEMORY", "DESCRIPTION"],
-                &rows,
-            )?;
+            table(out, SNAPSHOT_HEADERS, &rows)?;
         }
         SnapshotCmd::Revert { vm, name } => {
             let path = format!("/vms/{vm}/snapshots/{name}/revert");
@@ -1052,9 +1112,124 @@ async fn snapshot(
             client.wait_task(&task).await?;
             writeln!(out, "snapshot {name} of vm {vm} deleted")?;
         }
+        SnapshotCmd::Schedule(args) => schedule(client, args, json_out, out).await?,
     }
     Ok(())
 }
+
+/// 예약을 보거나 바꾼다([`put_schedule`]).
+async fn schedule(
+    client: &Client,
+    args: ScheduleArgs,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let path = format!("/vms/{}", args.vm);
+    let schedule = schedule_value(&args);
+    if schedule.is_none() && !args.off {
+        let current = client.get(&path).await?;
+        if json_out {
+            let view = json!({
+                "snapshot_schedule": current["spec"]["snapshot_schedule"],
+                "schedule_error": current["status"]["schedule_error"],
+            });
+            print_json(out, &view)?;
+        } else {
+            write!(out, "{}", describe_schedule(&current))?;
+        }
+        return Ok(());
+    }
+    put_schedule(client, &args.vm, schedule.clone()).await?;
+    match schedule {
+        Some(_) => writeln!(out, "vm {}: snapshot schedule set", args.vm)?,
+        None => writeln!(out, "vm {}: snapshot schedule off", args.vm)?,
+    }
+    Ok(())
+}
+
+/// VM `vm`의 예약을 `schedule`로 바꾼다(`None`이면 끈다). VM을 읽어 그 revision으로(`If-Match`)
+/// spec 전체를 다시 쓴다.
+async fn put_schedule(client: &Client, vm: &str, schedule: Option<Value>) -> anyhow::Result<()> {
+    let path = format!("/vms/{vm}");
+    let mut retries = ScheduleRetries::default();
+    loop {
+        let current = client.get(&path).await?;
+        let r = client
+            .request(Method::PUT, &path)
+            .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
+            .json(&schedule_update(&current, schedule.clone()));
+        match client.send(r).await {
+            Err(e) => match retries.next(&e.to_string()) {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => return Err(e),
+            },
+            Ok(_) => return Ok(()),
+        }
+    }
+}
+
+/// VM에 예약이 있는지
+fn schedule_is_on(vm: &Value) -> bool {
+    !vm["spec"]["snapshot_schedule"].is_null()
+}
+
+/// 예약 PUT을 다시 할 횟수
+#[derive(Default)]
+struct ScheduleRetries {
+    mismatch: u32,
+    busy: u32,
+}
+
+impl ScheduleRetries {
+    /// 오류 `error`면 얼마 뒤에 다시 할지. 읽은 뒤 status만 바뀌어도 revision이 달라지므로
+    /// `revision_mismatch`는 바로 세 번까지, 스냅샷·복제 Task 중이면(`vm_busy`) 1초마다 30번까지.
+    fn next(&mut self, error: &str) -> Option<std::time::Duration> {
+        if error.ends_with("(revision_mismatch)") && self.mismatch < 3 {
+            self.mismatch += 1;
+            return Some(std::time::Duration::ZERO);
+        }
+        if error.ends_with("(vm_busy)") && self.busy < 30 {
+            self.busy += 1;
+            return Some(std::time::Duration::from_secs(1));
+        }
+        None
+    }
+}
+
+/// VM 수정 본문: 라벨과 spec은 그대로 두고 예약만 바꾼다(`None`이면 끈다).
+fn schedule_update(vm: &Value, schedule: Option<Value>) -> Value {
+    let mut spec = vm["spec"].clone();
+    spec["snapshot_schedule"] = schedule.unwrap_or(Value::Null);
+    // 라벨이 없으면 응답에 `labels`가 없다.
+    let labels = vm.get("labels").cloned().unwrap_or_else(|| json!({}));
+    json!({ "labels": labels, "spec": spec })
+}
+
+/// `schedule: daily, keep 7, with memory`와 마지막 예약 오류가 있으면 그 줄
+fn describe_schedule(vm: &Value) -> String {
+    let s = &vm["spec"]["snapshot_schedule"];
+    let mut text = if s.is_null() {
+        "schedule: off\n".to_string()
+    } else {
+        let memory = if s["memory"] == true {
+            ", with memory"
+        } else {
+            ""
+        };
+        format!(
+            "schedule: {}, keep {}{memory}\n",
+            cell(&s["every"]),
+            cell(&s["keep"])
+        )
+    };
+    if let Some(e) = vm["status"]["schedule_error"].as_str() {
+        text.push_str(&format!("last error: {e}\n"));
+    }
+    text
+}
+
+/// `vm snapshot list`의 열
+const SNAPSHOT_HEADERS: &[&str] = &["", "NAME", "CREATED", "MEMORY", "SCHEDULED", "DESCRIPTION"];
 
 /// 스냅샷 목록을 나무 모양의 표 행으로. 첫 칸은 현재 위치 표시(`*`), 형제는 만든 차례(id가 UUIDv7)다.
 fn snapshot_rows(items: &[Value], current: Option<&str>) -> Vec<Vec<String>> {
@@ -1101,6 +1276,7 @@ fn snapshot_subtree(
             format!("{prefix}{branch}{}", cell(&s["spec"]["name"])),
             created,
             cell(&s["spec"]["memory"]),
+            (s["spec"]["scheduled"] == true).to_string(),
             cell(&s["spec"]["description"]),
         ]);
         snapshot_subtree(items, id, &format!("{prefix}{next}"), current, rows);
@@ -1291,6 +1467,148 @@ mod tests {
     }
 
     #[test]
+    fn parses_clone_and_schedule_commands() {
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "clone",
+            "web",
+            "copy",
+            "--snapshot",
+            "base",
+            "--pool",
+            "fast",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Clone { vm, name, snapshot: Some(s), pool: Some(p) } }
+                if vm == "web" && name == "copy" && s == "base" && p == "fast"
+        ));
+        let schedule = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "vm", "snapshot", "schedule", "web"];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv).map(|c| c.cmd) {
+                Ok(Cmd::Vm {
+                    cmd:
+                        VmCmd::Snapshot {
+                            cmd: SnapshotCmd::Schedule(s),
+                        },
+                }) => Ok(s),
+                Ok(_) => panic!("not a schedule command"),
+                Err(e) => Err(e),
+            }
+        };
+        let s = schedule(&["--every", "daily", "--keep", "7", "--memory"]).unwrap();
+        assert_eq!(
+            schedule_value(&s),
+            Some(json!({ "every": "daily", "keep": 7, "memory": true }))
+        );
+        let s = schedule(&["--every", "hourly", "--keep", "3"]).unwrap();
+        assert_eq!(
+            schedule_value(&s),
+            Some(json!({ "every": "hourly", "keep": 3, "memory": false }))
+        );
+        // 옵션이 없으면 보기만 한다.
+        let s = schedule(&[]).unwrap();
+        assert!(!s.off && schedule_value(&s).is_none());
+        assert!(schedule(&["--off"]).unwrap().off);
+        // 주기와 보관 개수는 함께 준다. 끄기는 다른 옵션과 함께 쓸 수 없다.
+        for bad in [
+            &["--every", "daily"][..],
+            &["--keep", "7"],
+            &["--memory"],
+            &["--off", "--every", "daily", "--keep", "7"],
+            &["--every", "monthly", "--keep", "7"],
+        ] {
+            assert!(schedule(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn schedule_update_keeps_the_rest_of_the_vm() {
+        let vm = json!({
+            "name": "web",
+            "revision": 9,
+            "labels": { "team": "a" },
+            "spec": { "memory_mib": 256, "snapshot_schedule": null },
+            "status": { "phase": "running" },
+        });
+        let schedule = json!({ "every": "weekly", "keep": 2, "memory": false });
+        assert_eq!(
+            schedule_update(&vm, Some(schedule.clone())),
+            json!({
+                "labels": { "team": "a" },
+                "spec": { "memory_mib": 256, "snapshot_schedule": schedule },
+            })
+        );
+        // 라벨이 없는 VM은 응답에 `labels`가 없다. 끄면 null이다.
+        let mut vm = vm;
+        vm.as_object_mut().unwrap().remove("labels");
+        vm["spec"]["snapshot_schedule"] = schedule;
+        assert_eq!(
+            schedule_update(&vm, None),
+            json!({ "labels": {}, "spec": { "memory_mib": 256, "snapshot_schedule": null } })
+        );
+    }
+
+    #[test]
+    fn delete_with_snapshots_turns_a_schedule_off() {
+        let on = json!({ "spec": { "snapshot_schedule": { "every": "daily", "keep": 7, "memory": false } } });
+        assert!(schedule_is_on(&on));
+        assert!(!schedule_is_on(
+            &json!({ "spec": { "snapshot_schedule": null } })
+        ));
+        // 예약 필드가 없는(예약을 모르는) 서버
+        assert!(!schedule_is_on(&json!({ "spec": {} })));
+    }
+
+    #[test]
+    fn schedule_update_retries_mismatch_and_busy() {
+        use std::time::Duration;
+        let mut r = ScheduleRetries::default();
+        for _ in 0..3 {
+            assert_eq!(r.next("changed (revision_mismatch)"), Some(Duration::ZERO));
+        }
+        assert_eq!(r.next("changed (revision_mismatch)"), None);
+        // 바쁘면 1초마다 30번(30초)까지 기다린다.
+        for _ in 0..30 {
+            assert_eq!(
+                r.next("VM web is busy (vm_busy)"),
+                Some(Duration::from_secs(1))
+            );
+        }
+        assert_eq!(r.next("VM web is busy (vm_busy)"), None);
+        // 다른 오류는 다시 하지 않는다.
+        let mut r = ScheduleRetries::default();
+        assert_eq!(r.next("VM web not found (not_found)"), None);
+    }
+
+    #[test]
+    fn describes_the_schedule_and_its_last_error() {
+        let vm = |schedule: Value, error: Value| json!({ "spec": { "snapshot_schedule": schedule }, "status": { "schedule_error": error } });
+        assert_eq!(
+            describe_schedule(&vm(Value::Null, Value::Null)),
+            "schedule: off\n"
+        );
+        assert_eq!(
+            describe_schedule(&vm(
+                json!({ "every": "daily", "keep": 7, "memory": true }),
+                Value::Null
+            )),
+            "schedule: daily, keep 7, with memory\n"
+        );
+        // 마지막 예약 오류가 있으면 한 줄 더
+        assert_eq!(
+            describe_schedule(&vm(
+                json!({ "every": "hourly", "keep": 1, "memory": false }),
+                json!("VM web is busy")
+            )),
+            "schedule: hourly, keep 1\nlast error: VM web is busy\n"
+        );
+    }
+
+    #[test]
     fn delete_with_snapshots_checks_everything_first() {
         let vm = |power: &str, phase: &str| json!({ "spec": { "power": power }, "status": { "phase": phase } });
         let snap = |name: &str, phase: &str| json!({ "spec": { "name": name }, "status": { "phase": phase } });
@@ -1334,32 +1652,30 @@ mod tests {
         };
         let mut pending = snap(6, "new", Some(5), false, "");
         pending["status"] = json!({ "phase": "pending" });
+        let mut auto = snap(7, "auto-20261026-0740", Some(2), false, "");
+        auto["spec"]["scheduled"] = json!(true);
         // 순서를 섞어도 만든 차례로 놓는다. 목록에 없는 부모(4)는 뿌리로 본다.
         let items = [
             snap(3, "c", Some(1), false, ""),
             snap(2, "b", Some(1), true, ""),
             snap(1, "base", None, false, "clean install"),
             snap(5, "orphan", Some(4), true, ""),
-            snap(7, "b2", Some(2), false, ""),
+            auto,
             pending,
         ];
         let rows = snapshot_rows(&items, Some(&id(2)));
         let mut out = Vec::new();
-        table(
-            &mut out,
-            &["", "NAME", "CREATED", "MEMORY", "DESCRIPTION"],
-            &rows,
-        )
-        .unwrap();
+        table(&mut out, SNAPSHOT_HEADERS, &rows).unwrap();
+        // 예약으로 만든 스냅샷은 SCHEDULED가 true다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "   NAME      CREATED               MEMORY  DESCRIPTION\n\
-             \x20  base      2026-10-26 07:34 UTC  false   clean install\n\
-             *  ├─ b      2026-10-26 07:35 UTC  true\n\
-             \x20  │  └─ b2  2026-10-26 07:40 UTC  false\n\
-             \x20  └─ c      2026-10-26 07:36 UTC  false\n\
-             \x20  orphan    2026-10-26 07:38 UTC  true\n\
-             \x20  └─ new    pending               false\n"
+            "   NAME                      CREATED               MEMORY  SCHEDULED  DESCRIPTION\n\
+             \x20  base                      2026-10-26 07:34 UTC  false   false      clean install\n\
+             *  ├─ b                      2026-10-26 07:35 UTC  true    false\n\
+             \x20  │  └─ auto-20261026-0740  2026-10-26 07:40 UTC  false   true\n\
+             \x20  └─ c                      2026-10-26 07:36 UTC  false   false\n\
+             \x20  orphan                    2026-10-26 07:38 UTC  true    false\n\
+             \x20  └─ new                    pending               false   false\n"
         );
     }
 
