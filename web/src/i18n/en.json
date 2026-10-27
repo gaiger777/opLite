@@ -133,6 +133,11 @@
     "forceStopDescription": "The VM is turned off without shutting down its OS. Unsaved data in the guest is lost.",
     "deleteTitle": "Delete {{name}}?",
     "deleteDescription": "The VM is deleted. Its volumes are kept.",
+    "deleteSnapshots_one": "Also delete its snapshot",
+    "deleteSnapshots_other": "Also delete all {{count}} of its snapshots",
+    "hasSnapshots": "A VM with snapshots cannot be deleted. Delete its snapshots first, or check the box to delete them along with the VM.",
+    "snapshotsPending": "A snapshot of this VM is still being taken. Delete the VM once it is done.",
+    "deletingSnapshots": "Deleting the snapshots one at a time. This cannot be cancelled once started.",
     "phase": {
       "stopped": "Stopped",
       "starting": "Starting",
@@ -253,9 +258,17 @@
     "deleteTitle": "Delete volume {{name}}?",
     "deleteDescription": "The disk image and all data on it are deleted.",
     "inUse": "Remove it from the VM first.",
+    "resize": "Resize",
+    "resizeNamed": "Resize {{name}}",
+    "resizeTitle": "Resize volume {{name}}",
+    "resizeDescription": "Volumes can only grow. A running VM sees the new size right away; grow the partition and file system inside the guest yourself.",
+    "currentSize": "Current size: {{size}}",
+    "newSize": "New size (GiB)",
+    "notReady": "Available once ready.",
     "errors": {
       "reserved": "The name import is reserved.",
-      "exists": "A volume with this name already exists."
+      "exists": "A volume with this name already exists.",
+      "grow": "Enter a size larger than the current size."
     }
   },
   "uploads": {

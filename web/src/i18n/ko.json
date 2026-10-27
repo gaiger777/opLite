@@ -133,6 +133,11 @@
     "forceStopDescription": "게스트 OS를 종료하지 않고 VM을 끕니다. 저장하지 않은 게스트의 데이터를 잃습니다.",
     "deleteTitle": "{{name}}을(를) 삭제할까요?",
     "deleteDescription": "VM을 삭제합니다. 볼륨은 남습니다.",
+    "deleteSnapshots_one": "스냅샷 {{count}}개도 모두 지우기",
+    "deleteSnapshots_other": "스냅샷 {{count}}개도 모두 지우기",
+    "hasSnapshots": "스냅샷이 있는 VM은 지울 수 없습니다. 먼저 스냅샷을 지우거나, 위 칸을 골라 VM과 함께 지우세요.",
+    "snapshotsPending": "이 VM의 스냅샷을 만드는 중입니다. 다 만든 뒤 VM을 지우세요.",
+    "deletingSnapshots": "스냅샷을 하나씩 지우는 중입니다. 시작한 뒤에는 취소할 수 없습니다.",
     "phase": {
       "stopped": "정지",
       "starting": "시작 중",
@@ -253,9 +258,17 @@
     "deleteTitle": "볼륨 {{name}}을(를) 삭제할까요?",
     "deleteDescription": "디스크 이미지와 그 안의 데이터가 모두 지워집니다.",
     "inUse": "먼저 VM에서 빼세요.",
+    "resize": "크기 늘리기",
+    "resizeNamed": "{{name}} 크기 늘리기",
+    "resizeTitle": "볼륨 {{name}} 크기 늘리기",
+    "resizeDescription": "볼륨은 늘리기만 할 수 있습니다. 실행 중인 VM은 바로 새 크기를 봅니다. 게스트 안의 파티션과 파일 시스템은 직접 늘리세요.",
+    "currentSize": "지금 크기: {{size}}",
+    "newSize": "새 크기(GiB)",
+    "notReady": "준비되면 쓸 수 있습니다.",
     "errors": {
       "reserved": "import는 예약된 이름입니다.",
-      "exists": "같은 이름의 볼륨이 이미 있습니다."
+      "exists": "같은 이름의 볼륨이 이미 있습니다.",
+      "grow": "지금 크기보다 큰 값을 넣으세요."
     }
   },
   "uploads": {

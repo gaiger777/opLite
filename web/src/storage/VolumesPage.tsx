@@ -1,5 +1,5 @@
-import { Plus, Trash2, Upload } from "lucide-react";
-import { useState } from "react";
+import { Maximize2, Plus, Trash2, Upload } from "lucide-react";
+import { type RefObject, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -32,6 +32,8 @@ import { volumeNameError } from "@/storage/volumes";
 import { trackTask } from "@/tasks/tasks";
 import { gibToBytes } from "@/vms/form";
 
+const MIB = 1024 ** 2;
+
 export function VolumesPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
@@ -41,6 +43,11 @@ export function VolumesPage() {
   const [creating, setCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [deleting, setDeleting] = useState<Volume | null>(null);
+  // 볼륨 id. 대화상자는 살아 있는 목록에서 찾아 지금 크기를 최신으로 보인다.
+  const [resizing, setResizing] = useState<string | null>(null);
+  const resizingVolume = volumes.data?.find((v) => v.id === resizing);
+  // 트리거 없이 연 대화상자는 닫힐 때 포커스를 돌려줄 곳을 모르므로 연 버튼을 기억한다.
+  const opener = useRef<HTMLElement | null>(null);
   const write = can(me.role, "write", "volume");
   // 서버는 VM spec의 디스크로 사용 중인지 판단한다(`attached_to`는 마지막으로 실행한 VM이다).
   const userOf = (volume: Volume) =>
@@ -133,6 +140,19 @@ export function VolumesPage() {
                     <Button
                       variant="ghost"
                       size="icon-sm"
+                      aria-label={t("volumes.resizeNamed", { name: volume.name })}
+                      // 만드는 중인 볼륨은 서버가 크기를 바꾸지 않는다(volume_not_ready).
+                      disabled={!ready}
+                      onClick={(e) => {
+                        opener.current = e.currentTarget;
+                        setResizing(volume.id);
+                      }}
+                    >
+                      <Maximize2 />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
                       aria-label={t("volumes.deleteNamed", { name: volume.name })}
                       // 서버는 VM이 쓰거나 아직 만드는 볼륨을 지우지 않는다. VM 목록을 다 읽어야 안다.
                       disabled={!vms.isSuccess || vm !== undefined || !ready}
@@ -140,6 +160,9 @@ export function VolumesPage() {
                     >
                       <Trash2 />
                     </Button>
+                    {!ready && (
+                      <div className="text-xs text-muted-foreground">{t("volumes.notReady")}</div>
+                    )}
                   </TableCell>
                 )}
               </TableRow>
@@ -149,6 +172,13 @@ export function VolumesPage() {
       </Table>
       {creating && <CreateVolumeDialog onClose={() => setCreating(false)} />}
       {uploading && <UploadDialog onClose={() => setUploading(false)} />}
+      {resizingVolume && (
+        <ResizeVolumeDialog
+          volume={resizingVolume}
+          returnFocus={opener}
+          onClose={() => setResizing(null)}
+        />
+      )}
       <ConfirmDialog
         open={deleting !== null}
         onOpenChange={(open) => !open && setDeleting(null)}
@@ -264,6 +294,70 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
           </NativeSelect>
         </Field>
       </div>
+    </FormDialog>
+  );
+}
+
+/** 볼륨 크기 늘리기. 서버는 지금보다 크고 512 바이트 배수인 크기만 받는다. */
+function ResizeVolumeDialog({
+  volume,
+  returnFocus,
+  onClose,
+}: {
+  volume: Volume;
+  returnFocus: RefObject<HTMLElement | null>;
+  onClose(): void;
+}) {
+  const { t } = useTranslation();
+  const [sizeGib, setSizeGib] = useState("");
+  const [error, setError] = useState<string>();
+
+  async function submit() {
+    // qcow2는 512 배수가 아닌 크기로 늘리지 못하므로 1 MiB 단위로 올린 값을 비교하고 보낸다.
+    const bytes = gibToBytes(sizeGib);
+    const size = bytes === undefined ? undefined : Math.ceil(bytes / MIB) * MIB;
+    const found =
+      size === undefined
+        ? "vmForm.errors.size"
+        : size <= volume.spec.size_bytes
+          ? "volumes.errors.grow"
+          : undefined;
+    setError(found);
+    if (found) {
+      return false;
+    }
+    const task = await call(
+      api.POST("/volumes/{key}/resize", {
+        params: { path: { key: volume.id } },
+        body: { size_bytes: size! },
+      }),
+    );
+    trackTask(task, t("tasks.op.volume-resize", { target: volume.name }));
+  }
+
+  return (
+    <FormDialog
+      title={t("volumes.resizeTitle", { name: volume.name })}
+      description={t("volumes.resizeDescription")}
+      submitLabel={t("volumes.resize")}
+      returnFocus={returnFocus}
+      onClose={onClose}
+      onSubmit={submit}
+    >
+      <p className="text-sm">
+        {t("volumes.currentSize", { size: formatBytes(volume.spec.size_bytes) })}
+      </p>
+      <Field id="volume-new-size" label={t("volumes.newSize")} error={error}>
+        {(a11y) => (
+          <Input
+            id="volume-new-size"
+            inputMode="decimal"
+            value={sizeGib}
+            onChange={(e) => setSizeGib(e.target.value)}
+            {...a11y}
+          />
+        )}
+      </Field>
     </FormDialog>
   );
 }

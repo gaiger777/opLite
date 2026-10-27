@@ -1,7 +1,9 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
+import type { List } from "@/api/live";
+import type { Volume } from "@/api/types";
 import { volumeNameError } from "@/storage/volumes";
 import { VolumesPage } from "@/storage/VolumesPage";
 import { resetTasks } from "@/tasks/tasks";
@@ -43,6 +45,10 @@ it("lists volumes with their size, state and VM", async () => {
     .findIndex((h) => h.textContent === "Size");
   expect(within(img).getAllByRole("cell")[sizeColumn]).toHaveTextContent("—");
   expect(within(img).getByRole("button", { name: "Delete img" })).toBeDisabled();
+  expect(within(img).getByRole("button", { name: "Resize img" })).toBeDisabled();
+  expect(img).toHaveTextContent("Available once ready.");
+  expect(within(root).getByRole("button", { name: "Resize root" })).toBeEnabled();
+  expect(root).not.toHaveTextContent("Available once ready.");
 });
 
 it("creates an empty volume and follows its task", async () => {
@@ -148,4 +154,81 @@ it("lets viewers only read", async () => {
   expect(await screen.findByText("data")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Delete data" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Resize data" })).not.toBeInTheDocument();
+});
+
+it("grows a volume and follows its task", async () => {
+  const data = volume("data", "local");
+  mockLists({ volume: [data] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl(`/volumes/${data.id}/resize`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t3", "volume-resize", data.id), { status: 202 });
+    }),
+  );
+  renderPage(<VolumesPage />);
+  const trigger = await screen.findByRole("button", { name: "Resize data" });
+  await userEvent.click(trigger);
+  const dialog = await screen.findByRole("dialog", { name: "Resize volume data" });
+  expect(dialog).toHaveTextContent("Current size: 16 GiB");
+  // 지금 크기와 같거나 작으면 보내지 않는다.
+  await userEvent.type(within(dialog).getByLabelText("New size (GiB)"), "16");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Resize" }));
+  expect(within(dialog).getByLabelText("New size (GiB)")).toHaveAccessibleDescription(
+    "Enter a size larger than the current size.",
+  );
+  expect(body).toBeUndefined();
+
+  await userEvent.clear(within(dialog).getByLabelText("New size (GiB)"));
+  await userEvent.type(within(dialog).getByLabelText("New size (GiB)"), "20.5");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Resize" }));
+  expect(await screen.findByText("Resize volume data")).toBeInTheDocument();
+  expect(body).toEqual({ size_bytes: 20.5 * 1024 ** 3 });
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  await waitFor(() => expect(trigger).toHaveFocus());
+});
+
+it("grows to the latest size rounded up to a whole MiB", async () => {
+  const GIB = 1024 ** 3;
+  const data = volume("data", "local");
+  mockLists({ volume: [data] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl(`/volumes/${data.id}/resize`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t3", "volume-resize", data.id), { status: 202 });
+    }),
+  );
+  const { queryClient } = renderPage(<VolumesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Resize data" }));
+  const dialog = await screen.findByRole("dialog", { name: "Resize volume data" });
+  expect(dialog).toHaveTextContent("Current size: 16 GiB");
+  // 열어 둔 사이 크기가 바뀌면 지금 크기를 새로 보이고 그것과 비교한다.
+  const grown = { ...data, spec: { ...data.spec, size_bytes: 20 * GIB + 512 } };
+  queryClient.setQueryData<List<Volume>>(["list", "volume"], { revision: 2, items: [grown] });
+  expect(await within(dialog).findByText("Current size: 20 GiB")).toBeVisible();
+  // 20 GiB + 107 바이트는 지금보다 작지만 1 MiB 단위로 올리면 크다(qcow2는 512 배수만 받는다).
+  await userEvent.type(within(dialog).getByLabelText("New size (GiB)"), "20.0000001");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Resize" }));
+  expect(await screen.findByText("Resize volume data")).toBeInTheDocument();
+  expect(body).toEqual({ size_bytes: 20 * GIB + 1024 ** 2 });
+});
+
+it("keeps the resize dialog open when the server refuses", async () => {
+  const data = volume("data", "local");
+  mockLists({ volume: [data] });
+  server.use(
+    http.post(apiUrl(`/volumes/${data.id}/resize`), () =>
+      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+    ),
+  );
+  renderPage(<VolumesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Resize data" }));
+  const dialog = await screen.findByRole("dialog", { name: "Resize volume data" });
+  await userEvent.type(within(dialog).getByLabelText("New size (GiB)"), "32");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Resize" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "You do not have permission to do this.",
+  );
 });

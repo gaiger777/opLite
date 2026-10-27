@@ -16,6 +16,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
+import { VmDeleteDialog } from "@/vms/VmDeleteDialog";
 
 /** 목록 행의 동작 메뉴 */
 export function VmMenu({ vm }: { vm: Vm }) {
@@ -121,19 +122,15 @@ export function VmConfirm({
         returnFocus={returnFocus}
         onConfirm={() => onRun(vm, "force-stop")}
       />
-      <ConfirmDialog
-        open={which === "delete"}
-        onOpenChange={(open) => !open && onClose()}
-        title={t("vms.deleteTitle", { name: vm.name })}
-        description={t("vms.deleteDescription")}
-        confirmLabel={t("vms.action.delete")}
-        typeToConfirm={vm.name}
-        returnFocus={returnFocus}
-        onConfirm={async () => {
-          await onRemove(vm);
-          afterRemove?.();
-        }}
-      />
+      {which === "delete" && (
+        <VmDeleteDialog
+          vm={vm}
+          onClose={onClose}
+          onRemove={onRemove}
+          afterRemove={afterRemove}
+          returnFocus={returnFocus}
+        />
+      )}
     </>
   );
 }

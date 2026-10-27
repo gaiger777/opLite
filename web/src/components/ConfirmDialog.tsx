@@ -24,6 +24,10 @@ interface Props {
   confirmLabel: string;
   /** 주면 이 이름을 그대로 입력해야 진행한다(되돌릴 수 없는 삭제). */
   typeToConfirm?: string;
+  /** 확인 버튼을 막는다. 까닭은 `children`에 글로 보여 준다. */
+  confirmDisabled?: boolean;
+  /** 확인 전에 고를 것이나 알릴 것(요청 중에는 막는다) */
+  children?: React.ReactNode;
   /** 닫으면 포커스를 돌려줄 곳(메뉴에서 열었으면 메뉴 버튼) */
   returnFocus?: RefObject<HTMLElement | null>;
   /** 실패하면 던진다. 대화상자가 오류를 보여 준다. */
@@ -89,6 +93,11 @@ export function ConfirmDialog(props: Props) {
             />
           </div>
         )}
+        {props.children && (
+          <fieldset disabled={busy} className="flex min-w-0 flex-col gap-2">
+            {props.children}
+          </fieldset>
+        )}
         {error && (
           <p role="alert" className="text-sm text-destructive">
             {error}
@@ -96,7 +105,11 @@ export function ConfirmDialog(props: Props) {
         )}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={busy}>{t("confirm.cancel")}</AlertDialogCancel>
-          <Button variant="destructive" disabled={!ready || busy} onClick={() => void confirm()}>
+          <Button
+            variant="destructive"
+            disabled={!ready || busy || props.confirmDisabled}
+            onClick={() => void confirm()}
+          >
             {props.confirmLabel}
           </Button>
         </AlertDialogFooter>

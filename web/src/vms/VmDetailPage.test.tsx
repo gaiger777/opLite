@@ -1,8 +1,8 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
-import { NODE, task, vm } from "@/test/fixtures";
+import { NODE, snapshot, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -130,6 +130,45 @@ it("keeps the delete dialog open while the request runs", async () => {
   expect(screen.getByRole("alertdialog")).toBeInTheDocument();
   finish();
   expect(await screen.findByText("moved")).toBeInTheDocument();
+});
+
+it("stops deleting snapshots when the page goes away", async () => {
+  const db = vm("db", "stopped");
+  mockLists({ vm: [db], node: [NODE], snapshot: [snapshot("a", db, 1), snapshot("b", db, 2)] });
+  const removed: string[] = [];
+  let deleted = false;
+  server.use(
+    http.delete(apiUrl(`/vms/${db.id}/snapshots/:name`), ({ params }) => {
+      removed.push(String(params.name));
+      return HttpResponse.json(task(`t-${removed.length}`, "snapshot-delete", db.id), {
+        status: 202,
+      });
+    }),
+    http.delete(apiUrl(`/vms/${db.id}`), () => {
+      deleted = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const { queryClient, unmount } = renderPage(<VmDetailPage />, {
+    path: "/vms/:name",
+    url: "/vms/db",
+  });
+  await userEvent.click(await screen.findByRole("button", { name: "Delete" }));
+  const dialog = await screen.findByRole("alertdialog");
+  await userEvent.type(within(dialog).getByLabelText("Type db to confirm"), "db");
+  await userEvent.click(
+    within(dialog).getByRole("checkbox", { name: "Also delete all 2 of its snapshots" }),
+  );
+  await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
+  await waitFor(() => expect(removed).toHaveLength(1));
+  await waitFor(() => expect(queryClient.getQueryCache().hasListeners()).toBe(true));
+  unmount();
+  // 떠난 뒤 Task가 끝나도 다음 스냅샷과 VM을 지우지 않는다.
+  const done = { ...task("t-1", "snapshot-delete", db.id), status: { state: "succeeded" } };
+  queryClient.setQueryData(["list", "task"], { revision: 2, items: [done] });
+  await new Promise((r) => setTimeout(r, 50));
+  expect(removed).toHaveLength(1);
+  expect(deleted).toBe(false);
 });
 
 it("hides the console from users who cannot operate VMs", async () => {
