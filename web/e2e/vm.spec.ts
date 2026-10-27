@@ -38,9 +38,23 @@ async function consoleShowsSomething(page: Page) {
   });
 }
 
+/** 스냅샷 탭의 예약 스냅샷 행: 이름(뒤 배지 글은 뺀다)과 만든 시각(만드는 중이면 null). */
+async function scheduledSnapshots(page: Page) {
+  const rows = page.getByRole("row").filter({ has: page.getByText("Scheduled", { exact: true }) });
+  const cells = await rows.evaluateAll((trs) =>
+    trs.map((tr) => [...(tr as HTMLTableRowElement).cells].map((c) => c.textContent ?? "")),
+  );
+  return cells.map(([name, created]) => ({
+    name: /^auto-[0-9-]+/.exec(name ?? "")?.[0] ?? name ?? "",
+    created: created === "Creating" ? null : (created ?? null),
+  }));
+}
+
 test.use({ locale: "en-US" });
 
-test("upload an image, run a VM from it, then delete everything", async ({ page }) => {
+test("upload an image, run a VM from it, clone and snapshot it, then delete everything", async ({
+  page,
+}) => {
   await signIn(page);
   await expect(page.getByRole("status").filter({ hasText: "Live" })).toBeVisible();
 
@@ -109,6 +123,39 @@ test("upload an image, run a VM from it, then delete everything", async ({ page 
   await expect(page.getByTestId("vm-phase")).toHaveText("Running");
   await expect(before.getByText("Current", { exact: true })).toBeVisible();
 
+  // 실행 중인 VM은 지금 상태를 복사하지 않으므로 복제 대화상자는 최근 스냅샷을 원본으로 고른다.
+  // 디스크를 QEMU가 쥐고 있어도 스냅샷에서는 복사할 수 있다.
+  await page.getByRole("button", { name: "Clone", exact: true }).click();
+  dialog = page.getByRole("dialog", { name: "Clone web" });
+  await expect(dialog.getByLabel("Source").locator("option:checked")).toHaveText("Snapshot before");
+  await dialog.getByLabel("New VM name").fill("copy");
+  await dialog.getByRole("button", { name: "Clone", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("Clone web to copy: done")).toBeVisible({ timeout: 60_000 });
+
+  // 복제한 VM은 꺼진 채로 생기고, 새 볼륨으로 시작한다.
+  await page.getByRole("link", { name: "Virtual machines" }).click();
+  await page.getByRole("link", { name: "copy", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "copy" })).toBeVisible();
+  await expect(page.getByTestId("vm-phase")).toHaveText("Stopped");
+  await page.getByRole("tab", { name: "Hardware" }).click();
+  await expect(page.getByRole("cell", { name: "copy-root", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Start", exact: true }).click();
+  await expect(page.getByTestId("vm-phase")).toHaveText("Running", { timeout: 60_000 });
+  await page.getByRole("button", { name: "Force stop" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Force stop" }).click();
+  await expect(page.getByTestId("vm-phase")).toHaveText("Stopped", { timeout: 60_000 });
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  let confirm = page.getByRole("alertdialog");
+  await confirm.getByLabel("Type copy to confirm").fill("copy");
+  await confirm.getByRole("button", { name: "Delete" }).click();
+  await expect(page).toHaveURL(/\/vms$/);
+  await expect(page.getByRole("link", { name: "copy", exact: true })).toHaveCount(0, {
+    timeout: 60_000,
+  });
+
+  await page.getByRole("link", { name: "web", exact: true }).click();
+  await page.getByRole("tab", { name: "Snapshots" }).click();
   await page.getByRole("button", { name: "Delete snapshot before" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Delete" }).click();
   await expect(page.getByText("No snapshots.")).toBeVisible({ timeout: 60_000 });
@@ -146,12 +193,68 @@ test("upload an image, run a VM from it, then delete everything", async ({ page 
   await expect(off.getByText("Current", { exact: true })).toBeVisible({ timeout: 60_000 });
   await expect(off.getByRole("cell", { name: "No", exact: true })).toBeVisible();
 
+  // 예약 스냅샷을 켠다. 하네스가 한 시간을 2초로 줄였다.
+  await expect(page.getByText("No snapshot schedule.")).toBeVisible();
+  await page.getByRole("link", { name: "Change schedule" }).click();
+  await expect(page.getByRole("heading", { name: "Edit web" })).toBeVisible();
+  await page.getByLabel("Take snapshots").selectOption("hourly");
+  await page.getByLabel("Snapshots to keep").fill("2");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("heading", { name: "web" })).toBeVisible();
+  await page.getByRole("tab", { name: "Snapshots" }).click();
+  await expect(page.getByText("Snapshot schedule: Hourly, keep 2")).toBeVisible();
+
+  // 넷 이상 만들어질 때까지 본다. 넘친 것은 다음 tick에 지우고 그동안 새로 만들지 않으므로
+  // 예약 스냅샷은 많아야 keep+1개다. 이름은 지운 뒤 다시 쓰일 수 있어 만든 시각(초)과 함께 센다.
+  const seen: string[] = [];
+  let most = 0;
+  await expect
+    .poll(
+      async () => {
+        const rows = await scheduledSnapshots(page);
+        most = Math.max(most, rows.length);
+        for (const { name, created } of rows) {
+          if (created !== null && !seen.includes(`${name} ${created}`)) {
+            seen.push(`${name} ${created}`);
+          }
+        }
+        return seen.length;
+      },
+      { timeout: 90_000, intervals: [200] },
+    )
+    .toBeGreaterThanOrEqual(4);
+  expect(most).toBeLessThanOrEqual(3);
+
+  // 예약을 끈다. 예약 스냅샷 Task가 도는 동안에는 VM을 고칠 수 없어(vm_busy) 될 때까지 다시 한다.
+  await expect(async () => {
+    if (await page.getByRole("heading", { name: "Edit web" }).isVisible()) {
+      await page.getByRole("link", { name: "Cancel" }).click();
+    }
+    await page.getByRole("link", { name: "Edit", exact: true }).click();
+    await page.getByLabel("Take snapshots").selectOption("off");
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect(page.getByRole("heading", { name: "Edit web" })).toHaveCount(0, {
+      timeout: 5_000,
+    });
+  }).toPass({ timeout: 60_000 });
+  await page.getByRole("tab", { name: "Snapshots" }).click();
+  await expect(page.getByText("No snapshot schedule.")).toBeVisible();
+  // 도는 Task가 끝나면 남은 예약 스냅샷은 keep개(마지막이 만들기였으면 keep+1개)이고 처음 것은 지웠다.
+  // 사용자가 만든 스냅샷은 그대로다.
+  await expect(page.getByText("Creating", { exact: true })).toHaveCount(0, { timeout: 60_000 });
+  const left = await scheduledSnapshots(page);
+  expect(left.length).toBeGreaterThanOrEqual(2);
+  expect(left.length).toBeLessThanOrEqual(3);
+  expect(left.map(({ name, created }) => `${name} ${created}`)).not.toContain(seen[0]);
+  await expect(off).toBeVisible();
+  await expect(page.getByText("Last scheduled snapshot failed:")).toHaveCount(0);
+
   // 스냅샷이 있는 VM은 스냅샷도 지우겠다고 골라야 지울 수 있다.
   await page.getByRole("button", { name: "Delete", exact: true }).click();
-  let confirm = page.getByRole("alertdialog");
+  confirm = page.getByRole("alertdialog");
   await confirm.getByLabel("Type web to confirm").fill("web");
   await expect(confirm.getByRole("button", { name: "Delete" })).toBeDisabled();
-  await confirm.getByRole("checkbox", { name: "Also delete its snapshot" }).check();
+  await confirm.getByRole("checkbox", { name: /^Also delete all \d+ of its snapshots$/ }).check();
   await confirm.getByRole("button", { name: "Delete" }).click();
   await expect(page).toHaveURL(/\/vms$/);
   await expect(page.getByRole("link", { name: "web", exact: true })).toHaveCount(0, {
@@ -165,6 +268,13 @@ test("upload an image, run a VM from it, then delete everything", async ({ page 
   await confirm.getByLabel("Type root to confirm").fill("root");
   await confirm.getByRole("button", { name: "Delete" }).click();
   await expect(page.getByRole("cell", { name: "root", exact: true })).toHaveCount(0, {
+    timeout: 60_000,
+  });
+  await page.getByRole("button", { name: "Delete copy-root" }).click();
+  confirm = page.getByRole("alertdialog");
+  await confirm.getByLabel("Type copy-root to confirm").fill("copy-root");
+  await confirm.getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByRole("cell", { name: "copy-root", exact: true })).toHaveCount(0, {
     timeout: 60_000,
   });
 

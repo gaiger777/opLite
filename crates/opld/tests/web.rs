@@ -1,5 +1,6 @@
 //! 웹 UI E2E: 실제 opld(QEMU)에 브라우저(Playwright)로 로그인해 풀을 만들고 이미지를 올린 뒤, 그 볼륨으로
-//! VM을 만들어 콘솔을 보고, 스냅샷을 만들고 되돌리고 지우고, 볼륨을 늘린 뒤, VM(스냅샷과 함께)·볼륨·풀을 모두 지운다. 클러스터와 로그인 정보는 여기서 준비한다.
+//! VM을 만들어 콘솔을 보고, 스냅샷을 만들고 되돌리고, 그 스냅샷에서 복제한 VM을 시작했다가 지우고, 스냅샷을
+//! 지우고, 볼륨을 늘리고, 예약 스냅샷이 생기고 보관 개수대로 지워지는지 본 뒤, VM(스냅샷과 함께)·볼륨·풀을 모두 지운다. 클러스터와 로그인 정보는 여기서 준비한다.
 //! `pnpm -C web build && cargo test -p opld --features web-it --test web`
 //! QEMU(`qemu-it`와 같다), pnpm, `pnpm -C web exec playwright install chromium`이 필요하다.
 #![cfg(feature = "web-it")]
@@ -36,8 +37,11 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
         web.join("dist/index.html").exists(),
         "build the web UI first: pnpm -C web build"
     );
-    // 디스크에 OS가 없는 UEFI 게스트는 ACPI 종료에 응하지 않을 수 있다.
-    let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
+    // 디스크에 OS가 없는 UEFI 게스트는 ACPI 종료에 응하지 않을 수 있다. 예약 스냅샷은 한 시간을 2초로.
+    let mut d = Daemon::new(
+        "node1",
+        "[reconciler]\nacpi_timeout_secs = 5\n[schedule]\ntick_secs = 1\nhour_secs = 2\n",
+    );
     d.start().await;
     d.init("web-e2e").await;
     d.login().await;
@@ -70,17 +74,35 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
     if !out.status.success() {
         // 브라우저가 지우지 못한 VM을 끄고 지운다(QEMU가 남지 않게). 볼륨 삭제는 Task를 오래 기다릴 수
         // 있어 잠깐만 기다리고, 풀과 남은 파일은 데몬의 임시 디렉터리와 함께 사라진다. 실패는 무시한다.
+        // 예약이 새 스냅샷을 만들지 않게 먼저 끈다(CLI가 vm_busy면 30초까지 다시 시도한다).
+        let _ = tokio::time::timeout(
+            Duration::from_secs(40),
+            d.ctl(&["vm", "snapshot", "schedule", "web", "--off"]),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            d.ctl(&["vm", "stop", "copy", "--force"]),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(60),
+            d.ctl(&["vm", "delete", "copy", "--with-snapshots"]),
+        )
+        .await;
         let _ = d.ctl(&["vm", "stop", "web", "--force"]).await;
         let _ = tokio::time::timeout(
             Duration::from_secs(60),
             d.ctl(&["vm", "delete", "web", "--with-snapshots"]),
         )
         .await;
-        let _ = tokio::time::timeout(
-            Duration::from_secs(30),
-            d.ctl(&["volume", "delete", "root"]),
-        )
-        .await;
+        for volume in ["root", "copy-root"] {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(30),
+                d.ctl(&["volume", "delete", volume]),
+            )
+            .await;
+        }
     }
     assert!(
         out.status.success(),
