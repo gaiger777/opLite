@@ -220,6 +220,13 @@ async fn running_vm_snapshots_revert_resize_and_delete() {
     // 실행 중에 지우면 QEMU가 디스크의 태그를 지우고, 지금 위치는 부모로 옮긴다.
     let out = d.ctl(&["vm", "start", "web"]).await.unwrap();
     assert!(out.contains("vm web: start done"), "{out}");
+    // 실행 중인 VM은 지울 수 없으므로 스냅샷도 하나도 지우지 않는다.
+    let err = d
+        .ctl(&["vm", "delete", "web", "--with-snapshots"])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("is not stopped"), "{err}");
+    assert_eq!(tags(&file), sorted(vec![mem_id.clone(), disk_id.clone()]));
     delete_snapshot(&c, "disk").await;
     assert_eq!(tags(&file), vec![mem_id.clone()]);
     let v = vm(&c).await;

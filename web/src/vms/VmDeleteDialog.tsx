@@ -3,13 +3,14 @@ import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { api, call } from "@/api/client";
-import { useList } from "@/api/live";
+import { listKey, useList, type List } from "@/api/live";
 import type { Snapshot, Vm } from "@/api/types";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ListPending } from "@/components/ListPending";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { trackTask, waitForTask } from "@/tasks/tasks";
+import { isStopped } from "@/vms/actions";
 
 /**
  * VM 삭제 확인. 열 때만 그린다. 서버는 스냅샷이 남은 VM을 지우지 않으므로(vm_has_snapshots), 스냅샷이
@@ -44,6 +45,12 @@ export function VmDeleteDialog({
   const shown = deleting ?? mine;
 
   async function confirm() {
+    // 대화상자를 연 뒤 VM이 시작됐을 수 있다. 서버가 VM을 지우지 않을 것이면 스냅샷도 지우지 않는다.
+    const latest =
+      queryClient.getQueryData<List<Vm>>(listKey("vm"))?.items.find((v) => v.id === vm.id) ?? vm;
+    if (!isStopped(latest)) {
+      throw new Error(t("errors.vm_running"));
+    }
     const controller = new AbortController();
     abort.current = controller;
     const targets = withSnapshots ? mine : [];

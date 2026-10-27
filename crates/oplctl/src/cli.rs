@@ -944,9 +944,13 @@ async fn vm(
         VmCmd::Reboot { vm } => act(client, &vm, "reboot", out).await?,
         VmCmd::Delete { vm, with_snapshots } => {
             if with_snapshots {
-                // 내부 스냅샷은 서로 독립이라 차례는 상관없다.
+                // 내부 스냅샷은 서로 독립이라 차례는 상관없다. VM을 지울 수 없는데 스냅샷만
+                // 지우지 않도록 먼저 모두 확인한다.
+                let current = client.get(&format!("/vms/{vm}")).await?;
                 let list = client.get(&format!("/vms/{vm}/snapshots")).await?;
-                for s in list["items"].as_array().cloned().unwrap_or_default() {
+                let items = list["items"].as_array().cloned().unwrap_or_default();
+                check_deletable(&vm, &current, &items)?;
+                for s in items {
                     let name = cell(&s["spec"]["name"]);
                     let path = format!("/vms/{vm}/snapshots/{}", cell(&s["id"]));
                     client.wait_task(&client.delete(&path).await?).await?;
@@ -974,6 +978,26 @@ async fn vm(
                 _ = tokio::signal::ctrl_c() => {}
             }
         }
+    }
+    Ok(())
+}
+
+/// 서버의 VM 삭제 조건(꺼짐을 바라고 멈췄거나 실패함)과 모든 스냅샷이 다 만들어졌는지 본다.
+/// `vm delete --with-snapshots`가 아무것도 지우기 전에 쓴다.
+fn check_deletable(vm: &str, current: &Value, snapshots: &[Value]) -> anyhow::Result<()> {
+    let stopped = current["spec"]["power"] == "stopped"
+        && matches!(
+            current["status"]["phase"].as_str(),
+            Some("stopped" | "failed")
+        );
+    if !stopped {
+        bail!("VM {vm} is not stopped; stop it first");
+    }
+    if let Some(s) = snapshots.iter().find(|s| s["status"]["phase"] != "ready") {
+        bail!(
+            "snapshot {} of VM {vm} is still being created; try again later",
+            cell(&s["spec"]["name"])
+        );
     }
     Ok(())
 }
@@ -1264,6 +1288,38 @@ mod tests {
             Cmd::Volume { cmd: VolumeCmd::Resize { size, .. } } if size == 20 << 30
         ));
         assert!(Cli::try_parse_from(["oplctl", "volume", "resize", "root"]).is_err());
+    }
+
+    #[test]
+    fn delete_with_snapshots_checks_everything_first() {
+        let vm = |power: &str, phase: &str| json!({ "spec": { "power": power }, "status": { "phase": phase } });
+        let snap = |name: &str, phase: &str| json!({ "spec": { "name": name }, "status": { "phase": phase } });
+        let ready = [snap("a", "ready"), snap("b", "ready")];
+        for (power, phase) in [("stopped", "stopped"), ("stopped", "failed")] {
+            check_deletable("web", &vm(power, phase), &ready).unwrap();
+        }
+        // 서버의 VM 삭제 조건과 같다. 시작·정지 중도 지울 수 없다.
+        for (power, phase) in [
+            ("running", "running"),
+            ("running", "stopped"),
+            ("stopped", "running"),
+            ("stopped", "stopping"),
+            ("running", "starting"),
+        ] {
+            let err = check_deletable("web", &vm(power, phase), &ready).unwrap_err();
+            assert!(
+                err.to_string().contains("is not stopped"),
+                "{power} {phase}: {err}"
+            );
+        }
+        // 만드는 중인 스냅샷이 하나라도 있으면 지우지 않는다.
+        let err = check_deletable(
+            "web",
+            &vm("stopped", "stopped"),
+            &[snap("a", "ready"), snap("b", "pending")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("snapshot b of VM web"), "{err}");
     }
 
     #[test]

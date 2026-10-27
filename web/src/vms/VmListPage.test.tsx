@@ -203,6 +203,34 @@ it("keeps the VM when a snapshot cannot be deleted", async () => {
   expect(dialog).toBeVisible();
 });
 
+it("deletes nothing when the VM has started since the dialog opened", async () => {
+  const only = snapshot("before", db, 1);
+  mockLists({ vm: [db], node: [NODE], snapshot: [only] });
+  const sent: string[] = [];
+  server.use(
+    http.delete(apiUrl(`/vms/${db.id}/*`), ({ request }) => {
+      sent.push(request.url);
+      return new HttpResponse(null, { status: 204 });
+    }),
+    http.delete(apiUrl(`/vms/${db.id}`), ({ request }) => {
+      sent.push(request.url);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const { queryClient } = renderPage(<VmListPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for db" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Delete" }));
+  const dialog = await screen.findByRole("alertdialog");
+  await userEvent.type(within(dialog).getByLabelText("Type db to confirm"), "db");
+  await userEvent.click(within(dialog).getByRole("checkbox", { name: "Also delete its snapshot" }));
+  // 대화상자가 열린 동안 다른 곳에서 VM을 시작했다.
+  queryClient.setQueryData(["list", "vm"], { revision: 3, items: [vm("db", "running")] });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent("Stop the VM first.");
+  expect(sent).toEqual([]);
+  expect(dialog).toBeVisible();
+});
+
 it("waits for the snapshots before offering a delete", async () => {
   mockLists({ vm: [db], node: [NODE] });
   server.use(
