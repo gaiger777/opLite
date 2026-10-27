@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use opl_api::SnapshotSchedulerConfig;
+use opl_api::{ClusterJanitorConfig, SnapshotSchedulerConfig};
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use serde::Deserialize;
 
@@ -41,6 +41,8 @@ pub struct Config {
     pub reconciler: ReconcilerSection,
     #[serde(default)]
     pub schedule: ScheduleSection,
+    #[serde(default)]
+    pub janitor: JanitorSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -133,6 +135,38 @@ impl ScheduleSection {
     }
 }
 
+/// 클러스터 정리 작업. 테스트만 줄인다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JanitorSection {
+    /// 목록을 확인하는 간격(초)
+    #[serde(default = "default_janitor_tick_secs")]
+    pub tick_secs: u64,
+    /// 오프라인 노드의 `pending` Task를 실패로 끝내기까지 기다리는 시간(초)
+    #[serde(default = "default_offline_grace_secs")]
+    pub offline_grace_secs: u64,
+}
+
+impl Default for JanitorSection {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_janitor_tick_secs(),
+            offline_grace_secs: default_offline_grace_secs(),
+        }
+    }
+}
+
+impl JanitorSection {
+    pub fn janitor_config(&self) -> ClusterJanitorConfig {
+        ClusterJanitorConfig {
+            tick: Duration::from_secs(self.tick_secs),
+            offline_grace: Duration::from_secs(self.offline_grace_secs),
+            // 고아 스냅샷의 유예는 설정하지 않는다(기본 30초).
+            ..ClusterJanitorConfig::default()
+        }
+    }
+}
+
 fn default_listen() -> SocketAddr {
     "0.0.0.0:8006".parse().unwrap()
 }
@@ -162,6 +196,12 @@ fn default_tick_secs() -> u64 {
 }
 fn default_hour_secs() -> u64 {
     3600
+}
+fn default_janitor_tick_secs() -> u64 {
+    10
+}
+fn default_offline_grace_secs() -> u64 {
+    60
 }
 
 /// `host:port`. IPv6 주소는 대괄호로 감싼다.
@@ -220,6 +260,9 @@ impl Config {
         }
         if self.schedule.tick_secs == 0 || self.schedule.hour_secs == 0 {
             anyhow::bail!("schedule.tick_secs and schedule.hour_secs must be at least 1");
+        }
+        if self.janitor.tick_secs == 0 || self.janitor.offline_grace_secs == 0 {
+            anyhow::bail!("janitor.tick_secs and janitor.offline_grace_secs must be at least 1");
         }
         // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
         if self.listen.port() == self.cluster_listen.port() {
@@ -304,6 +347,10 @@ mod tests {
         let schedule = c.schedule.scheduler_config();
         assert_eq!(schedule.tick, Duration::from_secs(60));
         assert_eq!(schedule.hour, Duration::from_secs(3600));
+        let janitor = c.janitor.janitor_config();
+        assert_eq!(janitor.tick, Duration::from_secs(10));
+        assert_eq!(janitor.offline_grace, Duration::from_secs(60));
+        assert_eq!(janitor.orphan_grace, Duration::from_secs(30));
         assert_eq!(c.hypervisor.accel, AccelSetting::Auto);
         assert_eq!(c.hypervisor.systemd_scope, cfg!(target_os = "linux"));
         assert_eq!(
@@ -376,6 +423,25 @@ mod tests {
         }
         assert!(
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[schedule]\ntick = 1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn janitor_section_shortens_periods_but_not_to_zero() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[janitor]\ntick_secs = 1\noffline_grace_secs = 2",
+        );
+        assert!(c.validate().is_ok());
+        let janitor = c.janitor.janitor_config();
+        assert_eq!(janitor.tick, Duration::from_secs(1));
+        assert_eq!(janitor.offline_grace, Duration::from_secs(2));
+        for bad in ["tick_secs = 0", "offline_grace_secs = 0"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[janitor]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[janitor]\ngrace = 1")
                 .is_err()
         );
     }

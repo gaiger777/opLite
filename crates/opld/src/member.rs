@@ -1,5 +1,5 @@
 //! 클러스터 멤버로 도는 노드: 노드 간 서버, 클러스터 저장소, reconciler, Task 실행기, HTTPS API,
-//! 노드 감시, 예약 스냅샷.
+//! 노드 감시, 예약 스냅샷, 클러스터 정리.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Context;
 use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
-use opl_api::{AppState, SnapshotScheduler, TaskRunner, TaskRunnerConfig};
+use opl_api::{AppState, ClusterJanitor, SnapshotScheduler, TaskRunner, TaskRunnerConfig};
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError};
 use opl_driver::{DirStorage, Hypervisor, QemuHypervisor, Storage};
@@ -98,6 +98,7 @@ pub struct Member {
     runner: TaskRunner,
     monitor: NodeMonitor,
     schedule: SnapshotScheduler,
+    janitor: ClusterJanitor,
     register: JoinHandle<()>,
     promotion: JoinHandle<()>,
     /// 서버 태스크가 끝나면 그 이유가 온다.
@@ -280,6 +281,7 @@ impl Member {
         let (stop, rx) = oneshot::channel::<()>();
         let state = Arc::new(state);
         let schedule = SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config());
+        let janitor = ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config());
         let app = opl_api::router(state).merge(crate::web::router());
         let task = tokio::spawn(async move {
             let r = axum::serve(listener, app)
@@ -299,6 +301,7 @@ impl Member {
             runner,
             monitor,
             schedule,
+            janitor,
             register,
             promotion,
             exited,
@@ -361,6 +364,7 @@ impl Member {
         }
         self.monitor.shutdown().await;
         self.schedule.shutdown().await;
+        self.janitor.shutdown().await;
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
         self.register.abort();
