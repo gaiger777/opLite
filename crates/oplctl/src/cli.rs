@@ -228,6 +228,13 @@ enum VolumeCmd {
         #[arg(long, value_enum, default_value = "qcow2")]
         format: Format,
     },
+    /// 볼륨 크기를 늘린다. 줄이지는 않는다.
+    Resize {
+        volume: String,
+        /// 새 크기. 단위 K, M, G, T(1024 배수)를 붙일 수 있다.
+        #[arg(long, value_parser = parse_size)]
+        size: u64,
+    },
     Delete {
         volume: String,
     },
@@ -272,6 +279,14 @@ enum VmCmd {
     },
     Delete {
         vm: String,
+        /// 스냅샷을 하나씩 먼저 지운다.
+        #[arg(long)]
+        with_snapshots: bool,
+    },
+    /// VM 스냅샷(디스크, 실행 중이면 메모리, VM 설정)
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCmd,
     },
     /// 로컬 포트에서 VNC 연결을 받아 VM 콘솔로 잇는다. Ctrl-C로 끝낸다.
     Console {
@@ -311,6 +326,33 @@ struct VmCreate {
     /// 만든 뒤 바로 시작하고 실행될 때까지 기다린다.
     #[arg(long)]
     start: bool,
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// 스냅샷을 만든다. 실행 중인 VM은 기본으로 메모리 상태까지 담는다.
+    Create {
+        vm: String,
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        /// 메모리 상태 없이 디스크만 담는다.
+        #[arg(long)]
+        no_memory: bool,
+    },
+    /// 스냅샷을 나무 모양으로 보여 준다. `*`가 VM의 현재 위치다.
+    List {
+        vm: String,
+    },
+    /// VM을 스냅샷 때로 되돌린다. 실행 중이면 끈다. 메모리 스냅샷이면 그 상태로 다시 시작한다.
+    Revert {
+        vm: String,
+        name: String,
+    },
+    Delete {
+        vm: String,
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -593,6 +635,14 @@ where
                 let task = client.upload("/volumes/import", &query, &file).await?;
                 client.wait_task(&task).await?;
                 writeln!(out, "volume {name} imported")?;
+            }
+            VolumeCmd::Resize { volume, size } => {
+                let body = json!({ "size_bytes": size });
+                let task = client
+                    .post(&format!("/volumes/{volume}/resize"), &body)
+                    .await?;
+                client.wait_task(&task).await?;
+                writeln!(out, "volume {volume} resized to {}", bytes(&size.into()))?;
             }
             VolumeCmd::Delete { volume } => {
                 let task = client.delete(&format!("/volumes/{volume}")).await?;
@@ -892,10 +942,21 @@ async fn vm(
             .await?
         }
         VmCmd::Reboot { vm } => act(client, &vm, "reboot", out).await?,
-        VmCmd::Delete { vm } => {
+        VmCmd::Delete { vm, with_snapshots } => {
+            if with_snapshots {
+                // 내부 스냅샷은 서로 독립이라 차례는 상관없다.
+                let list = client.get(&format!("/vms/{vm}/snapshots")).await?;
+                for s in list["items"].as_array().cloned().unwrap_or_default() {
+                    let name = cell(&s["spec"]["name"]);
+                    let path = format!("/vms/{vm}/snapshots/{}", cell(&s["id"]));
+                    client.wait_task(&client.delete(&path).await?).await?;
+                    writeln!(out, "snapshot {name} of vm {vm} deleted")?;
+                }
+            }
             client.delete(&format!("/vms/{vm}")).await?;
             writeln!(out, "vm {vm} deleted")?;
         }
+        VmCmd::Snapshot { cmd } => snapshot(client, cmd, json_out, out).await?,
         VmCmd::Console { vm, port } => {
             // 콘솔을 열 수 있는지 먼저 확인한다(없는 VM, 권한).
             client.get(&format!("/vms/{vm}")).await?;
@@ -915,6 +976,119 @@ async fn vm(
         }
     }
     Ok(())
+}
+
+async fn snapshot(
+    client: &Client,
+    cmd: SnapshotCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        SnapshotCmd::Create {
+            vm,
+            name,
+            description,
+            no_memory,
+        } => {
+            // 메모리를 담을지는 생략하면 서버가 정한다(실행 중이면 담는다).
+            let body = json!({
+                "name": name,
+                "description": description.unwrap_or_default(),
+                "memory": no_memory.then_some(false),
+            });
+            let task = client.post(&format!("/vms/{vm}/snapshots"), &body).await?;
+            client.wait_task(&task).await?;
+            writeln!(out, "snapshot {name} of vm {vm} created")?;
+        }
+        SnapshotCmd::List { vm } => {
+            let list = client.get(&format!("/vms/{vm}/snapshots")).await?;
+            if json_out {
+                return print_list(out, true, &list, &[], |_| vec![]);
+            }
+            let current = client.get(&format!("/vms/{vm}")).await?["status"]["snapshot"].clone();
+            let items = list["items"].as_array().cloned().unwrap_or_default();
+            let rows = snapshot_rows(&items, current.as_str());
+            table(
+                out,
+                &["", "NAME", "CREATED", "MEMORY", "DESCRIPTION"],
+                &rows,
+            )?;
+        }
+        SnapshotCmd::Revert { vm, name } => {
+            let path = format!("/vms/{vm}/snapshots/{name}/revert");
+            let task = client.send(client.request(Method::POST, &path)).await?;
+            client.wait_task(&task).await?;
+            writeln!(out, "vm {vm}: reverted to snapshot {name}")?;
+        }
+        SnapshotCmd::Delete { vm, name } => {
+            let task = client
+                .delete(&format!("/vms/{vm}/snapshots/{name}"))
+                .await?;
+            client.wait_task(&task).await?;
+            writeln!(out, "snapshot {name} of vm {vm} deleted")?;
+        }
+    }
+    Ok(())
+}
+
+/// 스냅샷 목록을 나무 모양의 표 행으로. 첫 칸은 현재 위치 표시(`*`), 형제는 만든 차례(id가 UUIDv7)다.
+fn snapshot_rows(items: &[Value], current: Option<&str>) -> Vec<Vec<String>> {
+    let mut items: Vec<&Value> = items.iter().collect();
+    items.sort_by_key(|s| s["id"].as_str().unwrap_or_default().to_string());
+    let mut rows = Vec::new();
+    snapshot_subtree(&items, None, "", current, &mut rows);
+    rows
+}
+
+/// `parent`의 자식들(목록에 없는 부모를 가리키면 뿌리)과 그 아래를 행으로 더한다.
+fn snapshot_subtree(
+    items: &[&Value],
+    parent: Option<&str>,
+    prefix: &str,
+    current: Option<&str>,
+    rows: &mut Vec<Vec<String>>,
+) {
+    let known = |p: &&str| items.iter().any(|i| i["id"] == *p);
+    let children: Vec<&Value> = items
+        .iter()
+        .copied()
+        .filter(|s| s["spec"]["parent"].as_str().filter(known) == parent)
+        .collect();
+    for (i, s) in children.iter().enumerate() {
+        let (branch, next) = match (parent, i + 1 == children.len()) {
+            (None, _) => ("", ""),
+            (Some(_), true) => ("└─ ", "   "),
+            (Some(_), false) => ("├─ ", "│  "),
+        };
+        let id = s["id"].as_str();
+        let created = match s["status"]["created_at"].as_i64() {
+            _ if s["status"]["phase"] != "ready" => "pending".to_string(),
+            Some(t) => unix_time(t),
+            None => "-".to_string(),
+        };
+        rows.push(vec![
+            if id.is_some() && id == current {
+                "*"
+            } else {
+                ""
+            }
+            .to_string(),
+            format!("{prefix}{branch}{}", cell(&s["spec"]["name"])),
+            created,
+            cell(&s["spec"]["memory"]),
+            cell(&s["spec"]["description"]),
+        ]);
+        snapshot_subtree(items, id, &format!("{prefix}{next}"), current, rows);
+    }
+}
+
+/// 유닉스 초를 `2026-10-26 09:30 UTC`처럼
+fn unix_time(secs: i64) -> String {
+    match time::OffsetDateTime::from_unix_timestamp(secs) {
+        Ok(t) => format!("{} {:02}:{:02} UTC", t.date(), t.hour(), t.minute()),
+        Err(_) => secs.to_string(),
+    }
 }
 
 /// VM 동작을 요청하고 Task가 끝날 때까지 기다린다.
@@ -1029,6 +1203,7 @@ async fn login(server: &str, args: &LoginArgs, ca_pem: Option<String>) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parses_sizes() {
@@ -1052,6 +1227,84 @@ mod tests {
         assert!(is_https("HTTPS://host"));
         assert!(!is_https("http://host"));
         assert!(!is_https("HTTP://host"));
+    }
+
+    #[test]
+    fn parses_snapshot_and_resize_commands() {
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "snapshot",
+            "create",
+            "web",
+            "before",
+            "--no-memory",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Snapshot { cmd: SnapshotCmd::Create { vm, name, description: None, no_memory: true } } }
+                if vm == "web" && name == "before"
+        ));
+        let cli =
+            Cli::try_parse_from(["oplctl", "vm", "delete", "web", "--with-snapshots"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm {
+                cmd: VmCmd::Delete {
+                    with_snapshots: true,
+                    ..
+                }
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["oplctl", "volume", "resize", "root", "--size", "20G"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Volume { cmd: VolumeCmd::Resize { size, .. } } if size == 20 << 30
+        ));
+        assert!(Cli::try_parse_from(["oplctl", "volume", "resize", "root"]).is_err());
+    }
+
+    #[test]
+    fn snapshot_list_is_a_tree_with_the_current_position() {
+        let id = |n: u8| format!("01900000-0000-7000-8000-0000000000{n:02}");
+        let snap = |n: u8, name: &str, parent: Option<u8>, memory: bool, description: &str| {
+            json!({
+                "id": id(n),
+                "spec": { "name": name, "parent": parent.map(id), "memory": memory, "description": description },
+                "status": { "phase": "ready", "created_at": 1_793_000_000 + u64::from(n) * 60 },
+            })
+        };
+        let mut pending = snap(6, "new", Some(5), false, "");
+        pending["status"] = json!({ "phase": "pending" });
+        // 순서를 섞어도 만든 차례로 놓는다. 목록에 없는 부모(4)는 뿌리로 본다.
+        let items = [
+            snap(3, "c", Some(1), false, ""),
+            snap(2, "b", Some(1), true, ""),
+            snap(1, "base", None, false, "clean install"),
+            snap(5, "orphan", Some(4), true, ""),
+            snap(7, "b2", Some(2), false, ""),
+            pending,
+        ];
+        let rows = snapshot_rows(&items, Some(&id(2)));
+        let mut out = Vec::new();
+        table(
+            &mut out,
+            &["", "NAME", "CREATED", "MEMORY", "DESCRIPTION"],
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "   NAME      CREATED               MEMORY  DESCRIPTION\n\
+             \x20  base      2026-10-26 07:34 UTC  false   clean install\n\
+             *  ├─ b      2026-10-26 07:35 UTC  true\n\
+             \x20  │  └─ b2  2026-10-26 07:40 UTC  false\n\
+             \x20  └─ c      2026-10-26 07:36 UTC  false\n\
+             \x20  orphan    2026-10-26 07:38 UTC  true\n\
+             \x20  └─ new    pending               false\n"
+        );
     }
 
     #[test]

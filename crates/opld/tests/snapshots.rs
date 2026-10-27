@@ -1,5 +1,5 @@
 //! 실제 QEMU로 VM 스냅샷(만들기·되돌리기·삭제)과 볼륨 크기 늘리기를 데몬 전체를 거쳐 확인한다.
-//! 스냅샷 CLI는 아직 없어 API를 직접 부른다. 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용이
+//! 꺼진 VM은 oplctl로, 실행 중인 VM은 응답을 자세히 보려고 API를 직접 부른다. 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용이
 //! 돌아오는지는 정지한 VM에서 `qemu-io`로 본다.
 //! `cargo test -p opld --features qemu-it --test snapshots`
 //! QEMU(`qemu-it`와 같다)와 qemu-img, qemu-io가 필요하다.
@@ -158,12 +158,11 @@ async fn running_vm_snapshots_revert_resize_and_delete() {
     assert!(vm_state_size(&file, &mem_id) > 0);
 
     // 실행 중 크기 늘리기: QEMU가 늘리고(헤더의 크기), 스펙도 그 크기를 받는다.
-    run(
-        &c,
-        "/volumes/root/resize",
-        json!({ "size_bytes": 128 * MIB }),
-    )
-    .await;
+    let out = d
+        .ctl(&["volume", "resize", "root", "--size", "128M"])
+        .await
+        .unwrap();
+    assert!(out.contains("volume root resized to 128.0MiB"), "{out}");
     assert_eq!(virtual_size(&file), 128 * MIB);
     let volume = c.get("/volumes/root").await.unwrap();
     assert_eq!(volume["spec"]["size_bytes"], 128 * MIB, "{volume}");
@@ -251,7 +250,19 @@ async fn stopped_vm_snapshot_restores_disk_content() {
 
     assert!(qemu_io(&file, "write -P 0xab 0 64k"));
     // 꺼진 VM은 기본으로 디스크만 담는다.
-    run(&c, "/vms/web/snapshots", json!({ "name": "before" })).await;
+    let out = d
+        .ctl(&[
+            "vm",
+            "snapshot",
+            "create",
+            "web",
+            "before",
+            "--description",
+            "clean",
+        ])
+        .await
+        .unwrap();
+    assert!(out.contains("snapshot before of vm web created"), "{out}");
     let before = snapshot(&c, "before").await;
     let id = before["id"].as_str().unwrap().to_string();
     assert_eq!(before["status"]["phase"], "ready", "{before}");
@@ -260,19 +271,41 @@ async fn stopped_vm_snapshot_restores_disk_content() {
 
     assert!(qemu_io(&file, "write -P 0xcd 0 64k"));
     assert!(!qemu_io(&file, "read -P 0xab 0 64k"));
-    run(&c, "/vms/web/snapshots/before/revert", json!({})).await;
+    let out = d
+        .ctl(&["vm", "snapshot", "revert", "web", "before"])
+        .await
+        .unwrap();
+    assert!(out.contains("vm web: reverted to snapshot before"), "{out}");
     assert!(qemu_io(&file, "read -P 0xab 0 64k"));
     let v = vm(&c).await;
     assert_eq!(v["status"]["phase"], "stopped", "{v}");
     assert_eq!(v["status"]["snapshot"], id.as_str(), "{v}");
 
+    // 두 번째 스냅샷은 지금 위치(before) 아래에 붙고 현재 위치가 된다.
+    d.ctl(&["vm", "snapshot", "create", "web", "after"])
+        .await
+        .unwrap();
+    let out = d.ctl(&["vm", "snapshot", "list", "web"]).await.unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert!(
+        lines[1].starts_with("   before ") && lines[1].ends_with("clean"),
+        "{out}"
+    );
+    assert!(lines[2].starts_with("*  └─ after "), "{out}");
+
     let resp = c.request(Method::DELETE, "/vms/web").send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
-    delete_snapshot(&c, "before").await;
+    // 스냅샷을 하나씩 지운 뒤 VM을 지운다. 지운 뒤에도 디스크 내용은 그대로다.
+    let out = d
+        .ctl(&["vm", "delete", "web", "--with-snapshots"])
+        .await
+        .unwrap();
+    assert!(out.contains("snapshot before of vm web deleted"), "{out}");
+    assert!(out.contains("snapshot after of vm web deleted"), "{out}");
+    assert!(out.contains("vm web deleted"), "{out}");
     assert!(tags(&file).is_empty());
-    // 지운 뒤에도 디스크 내용은 그대로다.
     assert!(qemu_io(&file, "read -P 0xab 0 64k"));
-    d.ctl(&["vm", "delete", "web"]).await.unwrap();
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     d.stop();
 }
