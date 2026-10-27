@@ -208,7 +208,8 @@ pub async fn update_vm(
     ))
 }
 
-/// 꺼진 VM만 지울 수 있다. 스냅샷이 남아 있으면 409 `vm_has_snapshots`.
+/// 꺼진 VM만 지울 수 있다. 스냅샷이 남아 있으면 409 `vm_has_snapshots`, 끝나지 않은 스냅샷·복제
+/// Task가 있으면 409 `vm_busy`(복제는 원본 VM과 그 스냅샷을 읽는다).
 #[utoipa::path(delete, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -233,6 +234,7 @@ pub async fn delete_vm(
             ),
         ));
     }
+    check_no_snapshot_task(&state, &vm)?;
     state
         .cluster
         .delete::<VmSpec>(vm.id, if_match(&headers)?)

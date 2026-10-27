@@ -1,5 +1,6 @@
 //! 디스크 파일의 스냅샷 태그를 다루는 Task: 정지한 VM의 만들기·되돌리기·삭제, 메모리 스냅샷
-//! 되돌리기, 실패와 시작할 때의 정리. 볼륨 크기 늘리기와 그 차례. qemu-img와 qemu-io가 필요하다.
+//! 되돌리기, 실패와 시작할 때의 정리. 볼륨 크기 늘리기와 그 차례. 스냅샷·꺼진 VM에서 복제.
+//! qemu-img와 qemu-io가 필요하다.
 //! `cargo test -p opl-api --features storage-it --test snapshot_disks`
 #![cfg(feature = "storage-it")]
 
@@ -474,4 +475,74 @@ async fn resize_waits_for_a_revert_of_the_same_disk() {
     }
     succeeded(&admin.wait_task(&grow).await);
     assert_eq!(env.hv.disk_size(id, 0), Some(8 * MIB));
+}
+
+/// 복제한 VM의 첫 디스크 파일
+fn cloned_disk(env: &Env, vm: &str) -> PathBuf {
+    let vm = env.cluster.get_by_name::<VmSpec>(vm).unwrap().unwrap();
+    let volume = env
+        .cluster
+        .get_by_name::<VolumeSpec>(&vm.spec.disks[0].volume)
+        .unwrap()
+        .unwrap();
+    assert_eq!(volume.status.phase, VolumePhase::Ready);
+    pool_dir(env).join(format!("{}.qcow2", volume.id))
+}
+
+#[tokio::test]
+async fn clone_copies_the_snapshot_or_the_current_disk() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    create_pool(&env).await;
+    let file = create_volume(&env, &admin, "root").await;
+    create_vm(&admin, "web", &["root"]).await;
+    assert!(qemu_io(&file, "write -P 0xaa 0 64k"));
+    succeeded(
+        &wait(
+            &admin,
+            admin
+                .post("/vms/web/snapshots", json!({ "name": "s1" }))
+                .await,
+        )
+        .await,
+    );
+    assert!(qemu_io(&file, "write -P 0xbb 0 64k"));
+
+    let clone = |body: Value| {
+        let admin = admin.clone();
+        async move { wait(&admin, admin.post("/vms/web/clone", body).await).await }
+    };
+    succeeded(&clone(json!({ "name": "from-s1", "snapshot": "s1" })).await);
+    succeeded(&clone(json!({ "name": "now" })).await);
+    let from_s1 = cloned_disk(&env, "from-s1");
+    assert!(qemu_io(&from_s1, "read -P 0xaa 0 64k"));
+    assert!(tags(&from_s1).is_empty());
+    assert!(qemu_io(&cloned_disk(&env, "now"), "read -P 0xbb 0 64k"));
+
+    // 실행 중인 VM의 스냅샷에서. Mock 하이퍼바이저는 파일에 쓰지 않으므로 QEMU가 만들었을 태그를
+    // 대신 만든다.
+    succeeded(&admin.act("web", "start").await);
+    succeeded(
+        &wait(
+            &admin,
+            admin
+                .post("/vms/web/snapshots", json!({ "name": "mem" }))
+                .await,
+        )
+        .await,
+    );
+    let id = env
+        .cluster
+        .get_by_name::<VmSpec>("web")
+        .unwrap()
+        .unwrap()
+        .id;
+    let mem = get(&env, id, "mem").unwrap();
+    qemu_img(&["snapshot", "-c", &mem.id.to_string(), path_str(&file)]);
+    assert!(qemu_io(&file, "write -P 0xcc 0 64k"));
+    succeeded(&clone(json!({ "name": "from-mem", "snapshot": "mem" })).await);
+    assert!(qemu_io(
+        &cloned_disk(&env, "from-mem"),
+        "read -P 0xbb 0 64k"
+    ));
 }

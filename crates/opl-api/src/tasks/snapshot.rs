@@ -15,13 +15,13 @@ use uuid::Uuid;
 
 use super::{Ctx, set_power, set_volume_size, started, stopped, superseded, wait_vm};
 
-fn get_snapshot(ctx: &Ctx, id: Uuid) -> Result<Option<Snapshot>, String> {
+pub(super) fn get_snapshot(ctx: &Ctx, id: Uuid) -> Result<Option<Snapshot>, String> {
     ctx.cluster
         .get::<SnapshotSpec>(id)
         .map_err(|e| e.to_string())
 }
 
-fn get_vm(ctx: &Ctx, id: Uuid) -> Result<Vm, String> {
+pub(super) fn get_vm(ctx: &Ctx, id: Uuid) -> Result<Vm, String> {
     ctx.cluster
         .get::<VmSpec>(id)
         .map_err(|e| e.to_string())?
@@ -46,7 +46,7 @@ fn volume_by_name(ctx: &Ctx, name: &str) -> Result<Option<(Volume, StoragePool)>
 }
 
 /// VM 스펙의 디스크 볼륨들. 모두 있고 다 만들어졌어야 한다.
-fn ready_disks(ctx: &Ctx, spec: &VmSpec) -> Result<Vec<(Volume, StoragePool)>, String> {
+pub(super) fn ready_disks(ctx: &Ctx, spec: &VmSpec) -> Result<Vec<(Volume, StoragePool)>, String> {
     let mut disks = Vec::with_capacity(spec.disks.len());
     for disk in &spec.disks {
         let (volume, pool) = volume_by_name(ctx, &disk.volume)?
@@ -60,7 +60,7 @@ fn ready_disks(ctx: &Ctx, spec: &VmSpec) -> Result<Vec<(Volume, StoragePool)>, S
 }
 
 /// 시작·정지 중인 VM은 스냅샷 작업을 받지 않는다.
-fn check_settled(vm: &Vm) -> Result<(), String> {
+pub(super) fn check_settled(vm: &Vm) -> Result<(), String> {
     let doing = match vm.status.phase {
         VmPhase::Starting => "starting",
         VmPhase::Stopping => "stopping",
@@ -70,7 +70,7 @@ fn check_settled(vm: &Vm) -> Result<(), String> {
 }
 
 /// 스냅샷의 UEFI 변수 사본 `{state_dir}/vm/{vm}/snapshots/{snapshot}.vars`
-fn vars_copy(ctx: &Ctx, vm: Uuid, snapshot: Uuid) -> Option<PathBuf> {
+pub(super) fn vars_copy(ctx: &Ctx, vm: Uuid, snapshot: Uuid) -> Option<PathBuf> {
     let dir = ctx.config.state_dir.as_ref()?;
     Some(
         vm_state_dir(dir, vm)
@@ -80,7 +80,7 @@ fn vars_copy(ctx: &Ctx, vm: Uuid, snapshot: Uuid) -> Option<PathBuf> {
 }
 
 /// `from`을 `to`로 복사한다. 디렉터리가 없으면 만든다.
-async fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(super) async fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
     if let Some(dir) = to.parent() {
         tokio::fs::create_dir_all(dir).await?;
     }
@@ -88,7 +88,7 @@ async fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// 이 노드에서 파일이 보이는 볼륨인지. 다른 노드에 만든 볼륨은 풀이 공유되지 않으면 오류다.
-fn check_local(ctx: &Ctx, volume: &Volume, pool: &StoragePool) -> Result<(), String> {
+pub(super) fn check_local(ctx: &Ctx, volume: &Volume, pool: &StoragePool) -> Result<(), String> {
     match volume.status.node {
         Some(node) if node != ctx.config.node && !pool.spec.shared => {
             Err(format!("volume {:?} is on node {node}", volume.name))
@@ -400,7 +400,7 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
     Ok(())
 }
 
-fn is_down(vm: &Vm) -> bool {
+pub(super) fn is_down(vm: &Vm) -> bool {
     matches!(vm.status.phase, VmPhase::Stopped | VmPhase::Failed)
 }
 

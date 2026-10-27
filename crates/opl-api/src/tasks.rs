@@ -3,6 +3,7 @@
 //! API는 Task를 저장소에 만들기만 한다. 실행기는 reconciler처럼 목록을 읽고 그 revision부터
 //! 구독하므로, 어느 노드의 API가 만든 Task든 대상 노드에서 실행된다.
 
+mod clone;
 mod snapshot;
 
 use std::collections::{HashMap, HashSet};
@@ -80,6 +81,8 @@ struct Ctx {
     hv: Arc<dyn Hypervisor>,
     reconciler: ReconcilerHandle,
     config: TaskRunnerConfig,
+    /// 실행 중인 복제 Task가 만든 것(Task id별). 실패하면 정리가 지운다.
+    cloned: std::sync::Mutex<HashMap<Uuid, clone::Made>>,
 }
 
 impl TaskRunner {
@@ -99,6 +102,7 @@ impl TaskRunner {
             hv,
             reconciler,
             config,
+            cloned: Default::default(),
         });
         let (revision, tasks) = loop {
             match ctx.cluster.list::<TaskSpec>() {
@@ -219,14 +223,17 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 }
 
 /// Task가 설 줄. 볼륨 Task는 그 볼륨의 줄에 선다(`Storage`의 요구). 스냅샷 Task는 VM의 줄에
-/// 선다(부모·현재 위치가 차례로 바뀐다). 볼륨 크기 늘리기는 그 볼륨을 쓰는 VM의 줄에 선다. 스냅샷
+/// 선다(부모·현재 위치가 차례로 바뀐다). 복제 Task도 원본 VM의 줄에 선다. 복사하는 동안 그 스냅샷을
+/// 지우거나 디스크를 되돌리면 안 된다. 볼륨 크기 늘리기는 그 볼륨을 쓰는 VM의 줄에 선다. 스냅샷
 /// 만들기·되돌리기가 같은 디스크를 다루고 되돌리기는 크기도 되돌리므로 섞이면 안 된다. 지금 쓰는
 /// VM이 없으면 그 볼륨을 담은 스냅샷의 VM(되돌리면 다시 붙는다), 그것도 없으면 볼륨의 줄이다.
 /// VM 전원 Task는 기다리기만 하므로 줄을 두지 않는다. 강제 종료가 앞의 reboot 뒤에 묶이면 안 된다.
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
     if !matches!(task.spec.op, TaskOp::VolumeResize { .. }) {
-        return (is_volume_op(&task.spec.op) || is_snapshot_op(&task.spec.op)).then_some(target);
+        let vm_clone = matches!(task.spec.op, TaskOp::VmClone { .. });
+        return (is_volume_op(&task.spec.op) || is_snapshot_op(&task.spec.op) || vm_clone)
+            .then_some(target);
     }
     let Ok(Some(volume)) = ctx.cluster.get::<VolumeSpec>(target) else {
         return Some(target);
@@ -296,7 +303,7 @@ async fn fail(ctx: &Ctx, task: &Task, error: String) {
     set_status(ctx, task.id, TaskState::Failed, Some(error)).await;
 }
 
-/// 실패한 볼륨 생성·가져오기, 스냅샷 만들기의 흔적을 지워 이름을 다시 쓸 수 있게 한다.
+/// 실패한 볼륨 생성·가져오기, 스냅샷 만들기, 복제의 흔적을 지워 이름을 다시 쓸 수 있게 한다.
 /// 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
 /// 재시작으로 중단) 작업이 아직 돌고 있을 수 있어 태그를 두고 리소스만 지운다(설계 §6 "태그만 남은 경우").
 async fn cleanup(ctx: &Ctx, task: &Task) {
@@ -307,6 +314,9 @@ async fn cleanup(ctx: &Ctx, task: &Task) {
     }
     if let TaskOp::VolumeImport { source, .. } = &task.spec.op {
         let _ = tokio::fs::remove_file(source).await;
+    }
+    if let TaskOp::VmClone { .. } = task.spec.op {
+        clone::discard(ctx, task.id).await;
     }
     if matches!(
         task.spec.op,
@@ -351,8 +361,11 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
         TaskOp::SnapshotRevert { snapshot } => snapshot::revert(ctx, task, *snapshot).await,
         TaskOp::SnapshotDelete { snapshot } => snapshot::delete(ctx, id, *snapshot).await,
         TaskOp::VolumeResize { size_bytes } => resize_volume(ctx, id, *size_bytes).await,
-        // 복제 실행은 아직 없다.
-        TaskOp::VmClone { .. } => Err("vm clone is not implemented yet".into()),
+        TaskOp::VmClone {
+            name,
+            snapshot,
+            pool,
+        } => clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
     }
 }
 

@@ -208,13 +208,24 @@ impl Env {
 
     /// `storage`를 쓰는 Task 실행기를 띄운다.
     pub async fn start_runner_with(&mut self, storage: Arc<dyn Storage>) {
+        self.start_runner_config(storage, |_| {}).await;
+    }
+
+    /// `storage`를 쓰고 `tweak`으로 설정을 바꾼 Task 실행기를 띄운다.
+    pub async fn start_runner_config(
+        &mut self,
+        storage: Arc<dyn Storage>,
+        tweak: impl FnOnce(&mut TaskRunnerConfig),
+    ) {
+        let mut config = runner_config(self.node, self.dir.path());
+        tweak(&mut config);
         self.runner = Some(
             TaskRunner::spawn(
                 self.cluster.clone(),
                 storage,
                 self.hv.clone(),
                 self.reconciler.as_ref().unwrap().handle(),
-                runner_config(self.node, self.dir.path()),
+                config,
             )
             .await,
         );
