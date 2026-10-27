@@ -4,6 +4,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
+use opl_cluster::ClusterError;
 use opl_driver::uefi_vars_path;
 use opl_types::resource::Resource;
 use opl_types::snapshot::SnapshotPhase;
@@ -192,10 +193,13 @@ pub(super) async fn clone(
     new.spec.power = PowerState::Stopped;
     new.spec.snapshot_schedule = None;
     // 이름이나 MAC이 그새 쓰였으면 저장소가 거부한다.
-    ctx.cluster
-        .create(&new)
-        .await
-        .map_err(|e| format!("cannot create VM {name:?}: {e}"))?;
+    if let Err(e) = ctx.cluster.create(&new).await {
+        // 나중에 만들어질 수도 있으면 새 VM이 볼륨을 쓸 수 있으므로 지우지 않고 남긴다(설계 §11).
+        if matches!(e, ClusterError::Timeout | ClusterError::Unreachable(_)) {
+            ctx.cloned.lock().unwrap().remove(&task.id);
+        }
+        return Err(format!("cannot create VM {name:?}: {e}"));
+    }
     ctx.cloned.lock().unwrap().remove(&task.id);
     Ok(())
 }
