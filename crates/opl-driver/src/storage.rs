@@ -125,6 +125,22 @@ pub trait Storage: Send + Sync {
         format: ImageFormat,
         size_bytes: u64,
     ) -> Result<(), DriverError>;
+
+    /// 볼륨을 같은 형식의 새 볼륨 `dst_id`로 복사한다. `tag`가 있으면 그 스냅샷 때의 내용을,
+    /// 없으면 지금 내용을 복사한다. `force_share`는 실행 중인 VM이 쥔 볼륨의 스냅샷을 읽을 때만
+    /// 쓴다(스냅샷 데이터는 바뀌지 않는다). 대상이 이미 있으면 `VolumeExists`.
+    /// 실패하면 만들다 만 파일을 남기지 않는다.
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_volume(
+        &self,
+        src_pool: &StoragePoolSpec,
+        src_id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
+        force_share: bool,
+        dst_pool: &StoragePoolSpec,
+        dst_id: Uuid,
+    ) -> Result<(), DriverError>;
 }
 
 /// `dir` 풀: 디렉터리 안에 `{id}.qcow2` / `{id}.raw` 파일을 두고 `qemu-img`로 다룬다.
@@ -598,6 +614,38 @@ impl Storage for DirStorage {
         .await?;
         Ok(())
     }
+
+    async fn copy_volume(
+        &self,
+        src_pool: &StoragePoolSpec,
+        src_id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
+        force_share: bool,
+        dst_pool: &StoragePoolSpec,
+        dst_id: Uuid,
+    ) -> Result<(), DriverError> {
+        let src = match tag {
+            Some(_) => self.snapshot_path(src_pool, src_id, format)?,
+            None => Self::existing_path(src_pool, src_id, format)?,
+        };
+        pool_dir(dst_pool)?;
+        let dst = Self::volume_path(dst_pool, dst_id, format);
+        if dst.exists() {
+            return Err(DriverError::VolumeExists(dst_id));
+        }
+        // `-l`의 값은 옵션 문자열이므로 `,`를 `,,`로 쓴다.
+        let snapshot = tag.map(|t| format!("snapshot.name={}", t.replace(',', ",,")));
+        let mut before = vec!["convert", "-q", "-f", fmt_name(format)];
+        if force_share {
+            before.push("-U");
+        }
+        if let Some(s) = &snapshot {
+            before.extend(["-l", s.as_str()]);
+        }
+        before.extend(["-O", fmt_name(format), path_str(&src)?]);
+        self.write_new(dst_id, &dst, &before, &[]).await
+    }
 }
 
 #[cfg(test)]
@@ -971,6 +1019,138 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn copy_volume_passes_snapshot_and_share_options() {
+        let tools = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        // 경로와 태그의 쉼표는 옵션 문자열에서 `,,`로 쓴다.
+        let dst_dir = tools.path().join("dst");
+        std::fs::create_dir(&dst_dir).unwrap();
+        let (src_pool, dst_pool) = (
+            pool(src_dir.path().to_str().unwrap()),
+            pool(dst_dir.to_str().unwrap()),
+        );
+        let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
+        let qcow2 = ImageFormat::Qcow2;
+        let src_path = DirStorage::volume_path(&src_pool, src, qcow2);
+        std::fs::write(&src_path, b"").unwrap();
+        // 인자를 한 줄에 하나씩 적고 출력 파일을 만든다.
+        let args = tools.path().join("args");
+        let storage = DirStorage::new(fake_tool(
+            tools.path(),
+            &format!("printf '%s\\n' \"$@\" > {args:?}\necho copy > \"$last\""),
+        ));
+
+        storage
+            .copy_volume(&src_pool, src, qcow2, Some("a,b"), true, &dst_pool, dst)
+            .await
+            .unwrap();
+        let dst_path = DirStorage::volume_path(&dst_pool, dst, qcow2);
+        assert_eq!(std::fs::read(&dst_path).unwrap(), b"copy\n");
+        let got = std::fs::read_to_string(&args).unwrap();
+        let got: Vec<&str> = got.lines().collect();
+        assert_eq!(
+            got[..got.len() - 1],
+            [
+                "convert",
+                "-q",
+                "-f",
+                "qcow2",
+                "-U",
+                "-l",
+                "snapshot.name=a,,b",
+                "-O",
+                "qcow2",
+                src_path.to_str().unwrap(),
+            ]
+        );
+        assert!(got[got.len() - 1].ends_with(".part"), "{got:?}");
+
+        // 태그 없이, 잠금을 지키며 지금 내용을 복사한다.
+        let dst2 = Uuid::now_v7();
+        storage
+            .copy_volume(&src_pool, src, qcow2, None, false, &dst_pool, dst2)
+            .await
+            .unwrap();
+        let got = std::fs::read_to_string(&args).unwrap();
+        let got: Vec<&str> = got.lines().collect();
+        assert_eq!(
+            got[..got.len() - 1],
+            [
+                "convert",
+                "-q",
+                "-f",
+                "qcow2",
+                "-O",
+                "qcow2",
+                src_path.to_str().unwrap()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_volume_checks_source_and_never_overwrites() {
+        // 도구까지 가면 다른 오류(Io NotFound)가 난다.
+        let storage = DirStorage::new("/nonexistent/qemu-img");
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
+        let raw = ImageFormat::Raw;
+
+        let res = storage
+            .copy_volume(&p, src, raw, None, false, &p, dst)
+            .await;
+        assert!(
+            matches!(res, Err(DriverError::VolumeNotFound(id)) if id == src),
+            "{res:?}"
+        );
+
+        std::fs::write(DirStorage::volume_path(&p, src, raw), b"").unwrap();
+        // raw 볼륨에는 스냅샷이 없다.
+        let res = storage
+            .copy_volume(&p, src, raw, Some("t"), false, &p, dst)
+            .await;
+        assert!(matches!(res, Err(DriverError::InvalidSpec(_))), "{res:?}");
+
+        let dst_path = DirStorage::volume_path(&p, dst, raw);
+        std::fs::write(&dst_path, b"precious").unwrap();
+        let res = storage
+            .copy_volume(&p, src, raw, None, false, &p, dst)
+            .await;
+        assert!(
+            matches!(res, Err(DriverError::VolumeExists(id)) if id == dst),
+            "{res:?}"
+        );
+        assert_eq!(std::fs::read(&dst_path).unwrap(), b"precious");
+
+        let rel = pool("pools/local");
+        let res = storage
+            .copy_volume(&p, src, raw, None, false, &rel, dst)
+            .await;
+        assert!(matches!(res, Err(DriverError::InvalidSpec(_))), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn failed_copy_leaves_no_files() {
+        let tools = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let src = Uuid::now_v7();
+        std::fs::write(DirStorage::volume_path(&p, src, ImageFormat::Raw), b"").unwrap();
+        // 출력 파일을 반쯤 쓰고 실패한다.
+        let storage = DirStorage::new(fake_tool(
+            tools.path(),
+            "echo partial > \"$last\"\necho broken >&2\nexit 1",
+        ));
+
+        let err = storage
+            .copy_volume(&p, src, ImageFormat::Raw, None, false, &p, Uuid::now_v7())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+        assert_eq!(pool_files(tmp.path()), vec![format!("{src}.raw")]);
     }
 
     #[tokio::test]

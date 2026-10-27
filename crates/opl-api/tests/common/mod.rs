@@ -524,4 +524,19 @@ impl Storage for FakeStorage {
         self.set_size(id, size_bytes);
         Ok(())
     }
+    async fn copy_volume(
+        &self,
+        _: &StoragePoolSpec,
+        src_id: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
+        _: bool,
+        _: &StoragePoolSpec,
+        dst_id: Uuid,
+    ) -> Result<(), DriverError> {
+        self.record("copy", dst_id).await;
+        let size = self.sizes.lock().unwrap().get(&src_id).copied();
+        self.set_size(dst_id, size.ok_or(DriverError::VolumeNotFound(src_id))?);
+        Ok(())
+    }
 }
