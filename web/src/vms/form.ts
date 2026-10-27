@@ -10,6 +10,8 @@ export const MAX_NICS = 16;
 /** 서버의 `cores`(u16)와 `boot_order`(u8)의 최댓값 */
 const MAX_CORES = 65535;
 const MAX_BOOT_ORDER = 255;
+/** 서버의 `MAX_SCHEDULE_KEEP` */
+const MAX_SCHEDULE_KEEP = 100;
 /** 서버의 리소스 이름 규칙: 소문자·숫자·`-`, 63자까지, `-`로 시작하거나 끝나지 않는다. */
 const NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -34,6 +36,13 @@ export interface NicRow {
   mac: string;
 }
 
+/** 예약 스냅샷 입력. 끄더라도 보관 개수와 메모리는 남겨 두어 다시 켤 때 쓴다. */
+export interface ScheduleRow {
+  every: Schemas["ScheduleEvery"] | "off";
+  keep: string;
+  memory: boolean;
+}
+
 export interface VmFormValues {
   name: string;
   sockets: number;
@@ -47,8 +56,7 @@ export interface VmFormValues {
   /** 빈 문자열이면 스케줄러가 고른다. */
   node: string;
   restart: Schemas["RestartPolicy"];
-  /** 예약 스냅샷. null이면 없다. */
-  snapshotSchedule: Schemas["SnapshotSchedule"] | null;
+  snapshotSchedule: ScheduleRow;
   /** 만든 뒤 곧바로 시작한다(만들 때만). */
   start: boolean;
 }
@@ -87,7 +95,7 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     nics: [{ network: "user", model: "virtio", mac: "" }],
     node: "",
     restart: "never",
-    snapshotSchedule: null,
+    snapshotSchedule: { every: "off", keep: "7", memory: false },
     start: true,
   };
 }
@@ -113,7 +121,13 @@ export function fromVm(vm: Vm): VmFormValues {
     nics: (s.nics ?? []).map((n) => ({ network: n.network, model: n.model, mac: n.mac ?? "" })),
     node: s.node ?? "",
     restart: s.restart ?? "never",
-    snapshotSchedule: s.snapshot_schedule ?? null,
+    snapshotSchedule: s.snapshot_schedule
+      ? {
+          every: s.snapshot_schedule.every,
+          keep: String(s.snapshot_schedule.keep),
+          memory: s.snapshot_schedule.memory ?? false,
+        }
+      : { every: "off", keep: "7", memory: false },
     start: false,
   };
 }
@@ -203,6 +217,10 @@ export function validate(
     }
     macs.add(mac);
   });
+  const schedule = v.snapshotSchedule;
+  if (schedule.every !== "off" && !intIn(schedule.keep, 1, MAX_SCHEDULE_KEEP)) {
+    errors["schedule.keep"] = "vmForm.errors.keep";
+  }
   return errors;
 }
 
@@ -226,6 +244,13 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
     node: v.node === "" ? null : v.node,
     power,
     restart: v.restart,
-    snapshot_schedule: v.snapshotSchedule,
+    snapshot_schedule:
+      v.snapshotSchedule.every === "off"
+        ? null
+        : {
+            every: v.snapshotSchedule.every,
+            keep: Number(v.snapshotSchedule.keep),
+            memory: v.snapshotSchedule.memory,
+          },
   };
 }

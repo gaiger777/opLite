@@ -41,8 +41,33 @@ it("round-trips a VM through the form", () => {
       snapshot_schedule: { every: "daily", keep: 7, memory: true },
     },
   });
-  // 폼에 없는 예약 스냅샷도 고칠 때 잃지 않는다.
   expect(toSpec(fromVm(web), "running")).toEqual(web.spec);
+  // 예약이 없으면 끔으로 보이고 그대로 없다.
+  const plain = vm("db", "stopped");
+  expect(fromVm(plain).snapshotSchedule.every).toBe("off");
+  expect(toSpec(fromVm(plain), "stopped").snapshot_schedule).toBeNull();
+});
+
+it("checks the number of scheduled snapshots to keep only when scheduled", () => {
+  const v = { ...emptyForm("q35"), name: "web" };
+  const schedule = { every: "daily" as const, keep: "7", memory: false };
+  for (const keep of ["0", "101", "1.5", ""]) {
+    expect(validate({ ...v, snapshotSchedule: { ...schedule, keep } }, true)).toEqual({
+      "schedule.keep": "vmForm.errors.keep",
+    });
+  }
+  for (const keep of ["1", "100"]) {
+    expect(validate({ ...v, snapshotSchedule: { ...schedule, keep } }, true)).toEqual({});
+  }
+  // 끄면 남은 보관 개수는 보지 않고 보내지도 않는다.
+  const off = { ...v, snapshotSchedule: { ...schedule, every: "off" as const, keep: "0" } };
+  expect(validate(off, true)).toEqual({});
+  expect(toSpec(off, "stopped").snapshot_schedule).toBeNull();
+  expect(toSpec({ ...v, snapshotSchedule: schedule }, "stopped").snapshot_schedule).toEqual({
+    every: "daily",
+    keep: 7,
+    memory: false,
+  });
 });
 
 it("picks virt only when every node is Apple Silicon", () => {

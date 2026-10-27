@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import type { List } from "@/api/live";
 import type { Task } from "@/api/types";
-import { NODE, task, vm } from "@/test/fixtures";
+import { NODE, task, vm, volume } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
@@ -225,4 +225,96 @@ it("says why the create page cannot load", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "You do not have permission to do this.",
   );
+});
+
+it("sets a snapshot schedule and checks how many to keep", async () => {
+  const web = vm("web", "running");
+  mockLists({ vm: [web], node: [NODE] });
+  const bodies: { spec: { snapshot_schedule: unknown } }[] = [];
+  server.use(
+    http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+      bodies.push((await request.json()) as (typeof bodies)[number]);
+      return HttpResponse.json(web);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  // 실행 중인 VM도 예약은 바꿀 수 있다.
+  const every = await screen.findByLabelText("Take snapshots");
+  expect(every).toBeEnabled();
+  expect(every).toHaveValue("off");
+  // 끄면 보관 개수와 메모리는 묻지 않는다.
+  expect(screen.queryByLabelText("Snapshots to keep")).not.toBeInTheDocument();
+  await user.selectOptions(every, "daily");
+  const keep = screen.getByLabelText("Snapshots to keep");
+  expect(keep).toHaveValue(7);
+  await user.clear(keep);
+  await user.type(keep, "0");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  expect(keep).toHaveAttribute("aria-invalid", "true");
+  expect(keep).toHaveAccessibleDescription("From 1 to 100.");
+  expect(bodies).toHaveLength(0);
+
+  await user.clear(keep);
+  await user.type(keep, "3");
+  await user.click(screen.getByLabelText("Include memory"));
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  expect(bodies[0]!.spec.snapshot_schedule).toEqual({ every: "daily", keep: 3, memory: true });
+});
+
+it("turns a snapshot schedule off", async () => {
+  const web = vm("web", "stopped", {
+    spec: {
+      ...vm("web", "stopped").spec,
+      snapshot_schedule: { every: "weekly", keep: 4, memory: false },
+    },
+  });
+  mockLists({ vm: [web], node: [NODE] });
+  const bodies: { spec: { snapshot_schedule: unknown } }[] = [];
+  server.use(
+    http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+      bodies.push((await request.json()) as (typeof bodies)[number]);
+      return HttpResponse.json(web);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  const every = await screen.findByLabelText("Take snapshots");
+  expect(every).toHaveValue("weekly");
+  expect(screen.getByLabelText("Snapshots to keep")).toHaveValue(4);
+  await user.selectOptions(every, "off");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  expect(bodies[0]!.spec.snapshot_schedule).toBeNull();
+});
+
+it("explains the schedule and warns about raw disks", async () => {
+  const web = vm("web", "stopped", {
+    spec: {
+      ...vm("web", "stopped").spec,
+      disks: [
+        { volume: "web-root", bus: "virtio-blk", boot_order: 1 },
+        { volume: "web-data", bus: "virtio-blk", boot_order: null },
+      ],
+    },
+  });
+  const raw = volume("web-data", "local");
+  raw.spec.format = "raw";
+  mockLists({ vm: [web], node: [NODE], volume: [volume("web-root", "local"), raw] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  const every = await screen.findByLabelText("Take snapshots");
+  expect(every).toHaveAccessibleDescription(
+    "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2.",
+  );
+  // 끈 동안은 경고하지 않는다.
+  expect(screen.queryByText(/scheduled snapshots will fail/)).not.toBeInTheDocument();
+  await user.selectOptions(every, "hourly");
+  expect(
+    screen.getByText("web-data is raw, so scheduled snapshots will fail. All disks must be qcow2."),
+  ).toBeVisible();
+  // raw 디스크를 떼면 경고도 사라진다.
+  await user.click(screen.getByRole("button", { name: "Remove disk 2" }));
+  expect(screen.queryByText(/scheduled snapshots will fail/)).not.toBeInTheDocument();
 });

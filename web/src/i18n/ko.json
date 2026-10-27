@@ -233,7 +233,18 @@
     "errors": {
       "exists": "이 VM에 같은 이름의 스냅샷이 이미 있습니다.",
       "description": "1024자까지 쓰세요."
-    }
+    },
+    "scheduled": "예약",
+    "every": {
+      "hourly": "매시간",
+      "daily": "매일",
+      "weekly": "매주"
+    },
+    "schedule": "예약 스냅샷: {{every}}, {{keep}}개 보관",
+    "scheduleMemory": "예약 스냅샷: {{every}}, {{keep}}개 보관, 메모리 포함",
+    "noSchedule": "스냅샷 예약이 없습니다.",
+    "scheduleEdit": "예약 바꾸기",
+    "scheduleFailed": "마지막 예약 스냅샷 실패:"
   },
   "clone": {
     "title": "{{name}} 복제",
@@ -512,9 +523,17 @@
       "volumeDuplicate": "디스크마다 다른 볼륨이어야 합니다.",
       "volumeExists": "같은 이름의 볼륨이 이미 있습니다.",
       "macMulticast": "멀티캐스트 주소(첫 바이트가 홀수)는 쓸 수 없습니다.",
-      "macDuplicate": "인터페이스마다 다른 MAC 주소여야 합니다."
+      "macDuplicate": "인터페이스마다 다른 MAC 주소여야 합니다.",
+      "keep": "1에서 100 사이여야 합니다."
     },
-    "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}"
+    "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}",
+    "schedule": "예약 스냅샷",
+    "scheduleNote": "주기마다 스냅샷을 만들고 예약으로 만든 것은 최근 것만 남깁니다. 직접 만든 스냅샷은 지우지 않습니다. 디스크가 모두 qcow2여야 합니다.",
+    "scheduleEvery": "스냅샷 주기",
+    "scheduleOff": "끔",
+    "scheduleKeep": "보관 개수",
+    "scheduleRaw": "{{volume}}이(가) {{format}}이라 예약 스냅샷이 실패합니다. 디스크가 모두 qcow2여야 합니다.",
+    "scheduleMemoryHint": "VM이 실행 중이고 디스크가 있을 때만 메모리도 저장합니다."
   },
   "console": {
     "connecting": "연결 중…",

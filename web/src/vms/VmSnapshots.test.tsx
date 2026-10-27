@@ -301,3 +301,48 @@ it("says why the snapshots could not be read", async () => {
   // 목록을 모르면 이름이 겹치는지 모르므로 만들 수 없다.
   expect(screen.getByRole("button", { name: "Take snapshot" })).toBeDisabled();
 });
+
+it("shows the schedule, its last failure and the snapshots it took", async () => {
+  const failure =
+    'VM "web" is being snapshotted, reverted or cloned; try again when the task has finished';
+  const scheduled = {
+    ...web,
+    spec: { ...web.spec, snapshot_schedule: { every: "daily" as const, keep: 7, memory: true } },
+    status: { ...web.status, schedule_error: failure },
+  };
+  const auto = snapshot("auto-20261027-0300", web, 5, { spec: { scheduled: true } });
+  mockLists({
+    vm: [scheduled],
+    node: [NODE],
+    volume: [volume("web-root", "local")],
+    snapshot: [base, auto],
+  });
+  open(scheduled);
+  expect(
+    await screen.findByText("Snapshot schedule: Daily, keep 7, with memory"),
+  ).toBeInTheDocument();
+  // 서버가 남긴 이유를 그대로, 무엇의 실패인지와 함께 보인다.
+  expect(screen.getByText("Last scheduled snapshot failed:").parentElement).toHaveTextContent(
+    `Last scheduled snapshot failed: ${failure}`,
+  );
+  expect(screen.getByRole("link", { name: "Change schedule" })).toHaveAttribute(
+    "href",
+    "/vms/web/edit",
+  );
+  const table = screen.getByRole("table", { name: "Snapshots" });
+  await within(table).findByText("base");
+  const cells = within(table)
+    .getAllByRole("row")
+    .slice(1)
+    .map((r) => within(r).getAllByRole("cell")[0]!.textContent);
+  // 예약으로 만든 스냅샷만 표시한다.
+  expect(cells).toEqual(["base", "auto-20261027-0300 Scheduled"]);
+});
+
+it("says there is no schedule and lets only writers change it", async () => {
+  mockLists({ vm: [web], node: [NODE], volume: [volume("web-root", "local")], snapshot: [] });
+  open(web, { ...ADMIN, role: "viewer" });
+  expect(await screen.findByText("No snapshot schedule.")).toBeInTheDocument();
+  expect(screen.queryByText("Last scheduled snapshot failed:")).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Change schedule" })).not.toBeInTheDocument();
+});

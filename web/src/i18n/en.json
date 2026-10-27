@@ -233,7 +233,18 @@
     "errors": {
       "exists": "This VM already has a snapshot with this name.",
       "description": "Use at most 1024 characters."
-    }
+    },
+    "scheduled": "Scheduled",
+    "every": {
+      "hourly": "Hourly",
+      "daily": "Daily",
+      "weekly": "Weekly"
+    },
+    "schedule": "Snapshot schedule: {{every}}, keep {{keep}}",
+    "scheduleMemory": "Snapshot schedule: {{every}}, keep {{keep}}, with memory",
+    "noSchedule": "No snapshot schedule.",
+    "scheduleEdit": "Change schedule",
+    "scheduleFailed": "Last scheduled snapshot failed:"
   },
   "clone": {
     "title": "Clone {{name}}",
@@ -512,9 +523,17 @@
       "volumeDuplicate": "Each disk needs a different volume.",
       "volumeExists": "A volume with this name already exists.",
       "macMulticast": "A multicast address (odd first byte) cannot be used.",
-      "macDuplicate": "Each interface needs a different MAC address."
+      "macDuplicate": "Each interface needs a different MAC address.",
+      "keep": "From 1 to 100."
     },
-    "volumesCreated": "Volumes {{names}} were created; {{error}}"
+    "volumesCreated": "Volumes {{names}} were created; {{error}}",
+    "schedule": "Scheduled snapshots",
+    "scheduleNote": "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2.",
+    "scheduleEvery": "Take snapshots",
+    "scheduleOff": "Off",
+    "scheduleKeep": "Snapshots to keep",
+    "scheduleRaw": "{{volume}} is {{format}}, so scheduled snapshots will fail. All disks must be qcow2.",
+    "scheduleMemoryHint": "Memory is saved only while the VM is running and has disks."
   },
   "console": {
     "connecting": "Connecting…",

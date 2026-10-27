@@ -1,6 +1,7 @@
 import { Camera } from "lucide-react";
 import { type RefObject, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router";
 
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
@@ -58,6 +59,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
         .find((v) => v !== undefined && v.spec.format !== "qcow2")
     : undefined;
   const columns = operate ? 5 : 4;
+  const schedule = vm.spec.snapshot_schedule;
 
   function ask(e: React.MouseEvent<HTMLElement>, action: "revert" | "delete", snapshot: Snapshot) {
     opener.current = e.currentTarget;
@@ -98,6 +100,34 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
           ))}
       </div>
       {operate && busy && <p className="text-sm text-muted-foreground">{t("snapshots.busy")}</p>}
+      <div className="flex flex-col gap-1 text-sm">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <p>
+            {schedule
+              ? t(schedule.memory ? "snapshots.scheduleMemory" : "snapshots.schedule", {
+                  every: t(`snapshots.every.${schedule.every}`),
+                  keep: schedule.keep,
+                })
+              : t("snapshots.noSchedule")}
+          </p>
+          {/* 예약은 VM 설정이라 VM 편집에서 바꾼다. */}
+          {can(me.role, "write", "vm") && (
+            <Link
+              to={`/vms/${encodeURIComponent(vm.name)}/edit`}
+              className="underline-offset-4 hover:underline"
+            >
+              {t("snapshots.scheduleEdit")}
+            </Link>
+          )}
+        </div>
+        {/* 예약을 꺼도 마지막 실패는 남는다. 서버가 쓴 이유를 줄바꿈·긴 낱말까지 그대로 보인다. */}
+        {vm.status.schedule_error && (
+          <p className="text-destructive">
+            <span className="font-medium">{t("snapshots.scheduleFailed")}</span>{" "}
+            <span className="whitespace-pre-wrap break-words">{vm.status.schedule_error}</span>
+          </p>
+        )}
+      </div>
       <Table aria-labelledby="vm-snapshots">
         <TableHeader>
           <TableRow>
@@ -133,6 +163,14 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
                     <span className="sr-only"> {t("snapshots.after", { parent })}</span>
                   )}
                   {/* 공백이 없으면 접근 이름이 "이름현재"로 붙는다. */}
+                  {snapshot.spec.scheduled && (
+                    <>
+                      {" "}
+                      <Badge variant="outline" className="ml-1">
+                        {t("snapshots.scheduled")}
+                      </Badge>
+                    </>
+                  )}
                   {vm.status.snapshot === snapshot.id && (
                     <>
                       {" "}
