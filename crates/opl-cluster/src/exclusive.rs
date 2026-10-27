@@ -5,8 +5,14 @@ use opl_types::resource::Kind;
 use serde_json::Value;
 
 /// spec에서 다른 리소스와 겹치면 안 되는 값을 `(필드, 값)`으로 꺼낸다. 지금은 VM이 붙인
-/// 볼륨 이름과 NIC의 MAC 주소다.
+/// 볼륨 이름과 NIC의 MAC 주소, 스냅샷의 `{vm id}/{이름}`이다.
 pub(crate) fn exclusive_values(kind: Kind, spec: &Value) -> Vec<(&'static str, String)> {
+    if kind == Kind::Snapshot {
+        return match (spec["vm"].as_str(), spec["name"].as_str()) {
+            (Some(vm), Some(name)) => vec![("name", format!("{vm}/{name}"))],
+            _ => Vec::new(),
+        };
+    }
     if kind != Kind::Vm {
         return Vec::new();
     }
@@ -43,5 +49,20 @@ mod tests {
             ]
         );
         assert!(exclusive_values(Kind::Volume, &spec).is_empty());
+    }
+
+    #[test]
+    fn extracts_snapshot_name_within_its_vm() {
+        let vm = "0195f7a0-0000-7000-8000-000000000001";
+        let spec = json!({
+            "vm": vm,
+            "name": "before-upgrade",
+            "vm_spec": {"disks": [{"volume": "root"}]}
+        });
+        // 같은 VM 안에서만 이름이 겹치면 안 된다. vm_spec의 볼륨은 배타 값이 아니다.
+        assert_eq!(
+            exclusive_values(Kind::Snapshot, &spec),
+            vec![("name", format!("{vm}/before-upgrade"))]
+        );
     }
 }

@@ -6,6 +6,7 @@ pub mod network;
 pub mod node;
 pub mod resource;
 pub mod runtime;
+pub mod snapshot;
 pub mod storage;
 pub mod task;
 pub mod vm;

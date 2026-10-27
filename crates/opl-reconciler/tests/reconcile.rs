@@ -28,6 +28,7 @@ async fn starts_assigned_vm_and_records_status() {
             node: Some(env.node),
             pid: Some(pid),
             last_error: None,
+            snapshot: None,
         }
     );
 }
@@ -271,6 +272,26 @@ async fn guest_shutdown_turns_power_off() {
         .await;
     assert_eq!(got.status.last_error, None);
     assert_eq!(env.pid(vm.id).await, None);
+}
+
+#[tokio::test]
+async fn power_off_keeps_current_snapshot() {
+    let env = Env::start().await;
+    let mut vm = vm("web", env.node);
+    let snapshot = Uuid::now_v7();
+    vm.status.snapshot = Some(snapshot);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    env.hv.guest_shutdown(vm.id);
+
+    // 상태를 새로 써도 스냅샷 위치는 reconciler가 지우지 않는다.
+    let got = env
+        .wait(vm.id, "powered off", |v| {
+            v.spec.power == PowerState::Stopped && v.status.phase == VmPhase::Stopped
+        })
+        .await;
+    assert_eq!(got.status.snapshot, Some(snapshot));
 }
 
 #[tokio::test]

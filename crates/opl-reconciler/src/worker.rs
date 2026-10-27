@@ -383,6 +383,7 @@ impl Worker {
             node: Some(self.config.node),
             pid: None,
             last_error: error,
+            snapshot: vm.status.snapshot,
         };
         self.cluster
             .update_status::<VmSpec>(self.id, &status)

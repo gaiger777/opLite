@@ -242,3 +242,34 @@ async fn a_volume_or_mac_belongs_to_one_vm() {
         ClusterError::Rejected(Rejection::InUse { holder, .. }) if holder == c2.id
     ));
 }
+
+fn snapshot(vm_id: uuid::Uuid, name: &str) -> opl_types::snapshot::Snapshot {
+    let spec = serde_json::json!({
+        "vm": vm_id,
+        "name": name,
+        "memory": false,
+        "vm_spec": vm("src", &["root-a"], &[]).spec,
+    });
+    let mut s: opl_types::snapshot::Snapshot =
+        opl_types::resource::Resource::new("", serde_json::from_value(spec).unwrap());
+    s.name = s.id.to_string();
+    s
+}
+
+#[tokio::test]
+async fn a_snapshot_name_is_unique_within_its_vm() {
+    let tc = TestCluster::start(1).await;
+    let c = tc.get(node(1));
+    let (vm_a, vm_b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let first = snapshot(vm_a, "before");
+    c.create(&first).await.unwrap();
+
+    let err = c.create(&snapshot(vm_a, "before")).await.unwrap_err();
+    assert!(matches!(
+        err,
+        ClusterError::Rejected(Rejection::InUse { kind: Kind::Snapshot, holder, .. }) if holder == first.id
+    ));
+    // 다른 VM은 같은 이름을 쓸 수 있고, 같은 VM도 다른 이름은 된다.
+    c.create(&snapshot(vm_b, "before")).await.unwrap();
+    c.create(&snapshot(vm_a, "after")).await.unwrap();
+}

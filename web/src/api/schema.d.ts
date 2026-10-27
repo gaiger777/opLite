@@ -786,7 +786,7 @@ export interface components {
                     op: components["schemas"]["TaskOp"];
                     /**
                      * Format: uuid
-                     * @description 대상 리소스(VM 또는 Volume)의 id
+                     * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷 Task는 VM이다.
                      */
                     target: string;
                 };
@@ -847,6 +847,12 @@ export interface components {
                      * @default null
                      */
                     pid: number | null;
+                    /**
+                     * Format: uuid
+                     * @description 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
+                     * @default null
+                     */
+                    snapshot: string | null;
                 };
             }[];
             /** Format: int64 */
@@ -1134,7 +1140,7 @@ export interface components {
                 op: components["schemas"]["TaskOp"];
                 /**
                  * Format: uuid
-                 * @description 대상 리소스(VM 또는 Volume)의 id
+                 * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷 Task는 VM이다.
                  */
                 target: string;
             };
@@ -1191,6 +1197,12 @@ export interface components {
                  * @default null
                  */
                 pid: number | null;
+                /**
+                 * Format: uuid
+                 * @description 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
+                 * @default null
+                 */
+                snapshot: string | null;
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -1286,6 +1298,26 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "volume-delete";
+        } | {
+            /** @enum {string} */
+            kind: "snapshot-create";
+            /** Format: uuid */
+            snapshot: string;
+        } | {
+            /** @enum {string} */
+            kind: "snapshot-revert";
+            /** Format: uuid */
+            snapshot: string;
+        } | {
+            /** @enum {string} */
+            kind: "snapshot-delete";
+            /** Format: uuid */
+            snapshot: string;
+        } | {
+            /** @enum {string} */
+            kind: "volume-resize";
+            /** Format: int64 */
+            size_bytes: number;
         };
         TaskSpec: {
             /**
@@ -1296,7 +1328,7 @@ export interface components {
             op: components["schemas"]["TaskOp"];
             /**
              * Format: uuid
-             * @description 대상 리소스(VM 또는 Volume)의 id
+             * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷 Task는 VM이다.
              */
             target: string;
         };
@@ -1399,6 +1431,12 @@ export interface components {
              * @default null
              */
             pid: number | null;
+            /**
+             * Format: uuid
+             * @description 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
+             * @default null
+             */
+            snapshot: string | null;
         };
         /**
          * @description 볼륨 파일이 준비됐는지. VM은 준비된 볼륨만 붙일 수 있다.

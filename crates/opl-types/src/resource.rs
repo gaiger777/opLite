@@ -46,6 +46,7 @@ pub enum Kind {
     Cluster,
     JoinToken,
     Network,
+    Snapshot,
 }
 
 impl Kind {
@@ -61,6 +62,7 @@ impl Kind {
             Kind::Cluster => "cluster",
             Kind::JoinToken => "join-token",
             Kind::Network => "network",
+            Kind::Snapshot => "snapshot",
         }
     }
 }
@@ -126,6 +128,7 @@ mod tests {
             Kind::Cluster,
             Kind::JoinToken,
             Kind::Network,
+            Kind::Snapshot,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }

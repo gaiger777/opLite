@@ -18,7 +18,13 @@ export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm
       restart: "never",
       node: "n1",
     },
-    status: { phase, node: phase === "running" ? "n1" : null, pid: null, last_error: null },
+    status: {
+      phase,
+      node: phase === "running" ? "n1" : null,
+      pid: null,
+      last_error: null,
+      snapshot: null,
+    },
     ...extra,
   } satisfies Vm;
 }

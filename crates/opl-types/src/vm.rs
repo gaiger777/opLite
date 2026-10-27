@@ -205,6 +205,8 @@ pub struct VmStatus {
     pub node: Option<Uuid>,
     pub pid: Option<u32>,
     pub last_error: Option<String>,
+    /// 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
+    pub snapshot: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -381,6 +383,7 @@ mod tests {
     fn status_missing_fields_default() {
         let st: VmStatus = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(st, VmStatus::default());
+        assert_eq!(st.snapshot, None);
     }
 
     #[test]

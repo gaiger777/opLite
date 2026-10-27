@@ -297,6 +297,11 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
             source_format,
         } => import_volume(ctx, id, source, *source_format).await,
         TaskOp::VolumeDelete => delete_volume(ctx, id).await,
+        // 실행은 뒤에서 붙인다.
+        TaskOp::SnapshotCreate { .. }
+        | TaskOp::SnapshotRevert { .. }
+        | TaskOp::SnapshotDelete { .. }
+        | TaskOp::VolumeResize { .. } => Err("not implemented yet".into()),
     }
 }
 
