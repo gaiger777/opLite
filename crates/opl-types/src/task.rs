@@ -53,6 +53,9 @@ pub enum TaskOp {
     },
     SnapshotDelete {
         snapshot: Uuid,
+        /// 예약 정리가 만든 삭제면 true. 이 삭제의 실패만 `schedule_error`에 남긴다.
+        #[serde(default)]
+        scheduled: bool,
     },
     /// 볼륨 크기를 늘린다(줄이지 않는다).
     VolumeResize {
@@ -124,7 +127,6 @@ mod tests {
         for (op, kind) in [
             (TaskOp::SnapshotCreate { snapshot }, "snapshot-create"),
             (TaskOp::SnapshotRevert { snapshot }, "snapshot-revert"),
-            (TaskOp::SnapshotDelete { snapshot }, "snapshot-delete"),
         ] {
             let json = serde_json::to_value(&op).unwrap();
             assert_eq!(
@@ -133,6 +135,27 @@ mod tests {
             );
             assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
         }
+        let op = TaskOp::SnapshotDelete {
+            snapshot,
+            scheduled: true,
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "snapshot-delete", "snapshot": snapshot, "scheduled": true })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        // 옛 Task에는 scheduled가 없다. 사용자 삭제로 읽는다.
+        assert_eq!(
+            serde_json::from_value::<TaskOp>(
+                serde_json::json!({ "kind": "snapshot-delete", "snapshot": snapshot })
+            )
+            .unwrap(),
+            TaskOp::SnapshotDelete {
+                snapshot,
+                scheduled: false
+            }
+        );
         let op = TaskOp::VolumeResize {
             size_bytes: 20 << 30,
         };

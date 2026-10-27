@@ -243,7 +243,37 @@ pub struct VmStatus {
     /// 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
     pub snapshot: Option<Uuid>,
     /// 마지막 예약 스냅샷이 실패한 이유. 성공하면 지운다.
-    pub schedule_error: Option<String>,
+    pub schedule_error: Option<ScheduleError>,
+}
+
+/// 예약 스냅샷이 실패한 이유. `code`는 거절한 API 오류의 code(`vm_busy` 등)이고, Task가 실패했으면
+/// `task_failed`다. 옛 상태의 문자열은 `{ code: "unknown", message: <문자열> }`로 읽는다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(from = "ScheduleErrorRepr")]
+pub struct ScheduleError {
+    pub code: String,
+    pub message: String,
+}
+
+/// [`ScheduleError`]가 읽는 형식: 지금의 구조나 옛 문자열
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ScheduleErrorRepr {
+    Current { code: String, message: String },
+    Old(String),
+}
+
+impl From<ScheduleErrorRepr> for ScheduleError {
+    fn from(r: ScheduleErrorRepr) -> Self {
+        match r {
+            ScheduleErrorRepr::Current { code, message } => ScheduleError { code, message },
+            ScheduleErrorRepr::Old(message) => ScheduleError {
+                code: "unknown".into(),
+                message,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -423,6 +453,35 @@ mod tests {
         assert_eq!(st, VmStatus::default());
         assert_eq!(st.snapshot, None);
         assert_eq!(st.schedule_error, None);
+    }
+
+    #[test]
+    fn schedule_error_reads_old_string_and_writes_structure() {
+        let e = ScheduleError {
+            code: "vm_busy".into(),
+            message: "VM web is busy".into(),
+        };
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "code": "vm_busy", "message": "VM web is busy" })
+        );
+        assert_eq!(serde_json::from_value::<ScheduleError>(json).unwrap(), e);
+        // 옛 상태는 문자열이었다. code를 모르므로 unknown으로 읽는다.
+        let st: VmStatus =
+            serde_json::from_value(serde_json::json!({ "schedule_error": "VM web is busy" }))
+                .unwrap();
+        assert_eq!(
+            st.schedule_error,
+            Some(ScheduleError {
+                code: "unknown".into(),
+                message: "VM web is busy".into(),
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&st).unwrap()["schedule_error"],
+            serde_json::json!({ "code": "unknown", "message": "VM web is busy" })
+        );
     }
 
     #[test]

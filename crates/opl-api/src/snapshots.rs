@@ -381,6 +381,7 @@ pub(crate) async fn start_delete(state: &AppState, vm: &Vm, key: &str) -> Result
     check_ready(&snapshot)?;
     let op = TaskOp::SnapshotDelete {
         snapshot: snapshot.id,
+        scheduled: false,
     };
     create_task(&state.cluster, op, vm.id, vm_node(state, vm)).await
 }

@@ -164,7 +164,7 @@ async fn refused_requests_and_failed_tasks_are_recorded_until_a_success() {
         get_vm(&env, raw)
             .status
             .schedule_error
-            .is_some_and(|e| e.contains("non-qcow2"))
+            .is_some_and(|e| e.message.contains("non-qcow2"))
     })
     .await;
     assert!(snapshots(&env, raw).is_empty());
@@ -174,7 +174,7 @@ async fn refused_requests_and_failed_tasks_are_recorded_until_a_success() {
         get_vm(&env, web)
             .status
             .schedule_error
-            .is_some_and(|e| e.contains("no space"))
+            .is_some_and(|e| e.message.contains("no space"))
     })
     .await;
     until("success", || {
@@ -240,7 +240,7 @@ async fn a_failed_delete_is_recorded_and_not_retried_every_tick() {
         get_vm(&env, vm)
             .status
             .schedule_error
-            .is_some_and(|e| e.contains("no space"))
+            .is_some_and(|e| e.message.contains("no space"))
     })
     .await;
     // 실패한 삭제를 tick마다 다시 하지 않는다(한 시간 뒤에 한다).
@@ -272,7 +272,7 @@ async fn offline_task_node_is_recorded_without_a_request() {
         get_vm(&env, vm)
             .status
             .schedule_error
-            .is_some_and(|e| e.contains("offline"))
+            .is_some_and(|e| e.message.contains("offline"))
     })
     .await;
     assert!(snapshots(&env, vm).is_empty());

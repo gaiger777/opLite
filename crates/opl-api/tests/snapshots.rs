@@ -349,7 +349,7 @@ async fn revert_and_delete_need_a_ready_snapshot() {
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     assert_eq!(
         task["spec"]["op"],
-        json!({ "kind": "snapshot-delete", "snapshot": snap.id })
+        json!({ "kind": "snapshot-delete", "snapshot": snap.id, "scheduled": false })
     );
     // Task가 실행되기 전이므로 리소스는 남아 있다.
     assert_eq!(admin.get("/vms/web/snapshots/s1").await.0, StatusCode::OK);

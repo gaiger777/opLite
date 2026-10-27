@@ -10,7 +10,7 @@ use opl_driver::{DriverError, uefi_vars_path, vm_state_dir};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp};
-use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{PowerState, ScheduleError, Vm, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
 
 use crate::schedule::set_schedule_error;
@@ -289,7 +289,8 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
 
 /// 예약으로 만든 스냅샷의 만들기·삭제 Task면 그 VM
 pub(super) fn scheduled_vm(ctx: &Ctx, task: &Task) -> Option<Uuid> {
-    let (TaskOp::SnapshotCreate { snapshot } | TaskOp::SnapshotDelete { snapshot }) = task.spec.op
+    let (TaskOp::SnapshotCreate { snapshot } | TaskOp::SnapshotDelete { snapshot, .. }) =
+        task.spec.op
     else {
         return None;
     };
@@ -301,7 +302,7 @@ pub(super) fn scheduled_vm(ctx: &Ctx, task: &Task) -> Option<Uuid> {
 }
 
 /// 예약 스냅샷 만들기·삭제의 결과를 VM의 `schedule_error`에 남긴다. 성공(`None`)이면 지운다.
-pub(super) async fn record_schedule(ctx: &Ctx, vm: Uuid, error: Option<String>) {
+pub(super) async fn record_schedule(ctx: &Ctx, vm: Uuid, error: Option<ScheduleError>) {
     if let Err(e) = set_schedule_error(&ctx.cluster, vm, error).await {
         tracing::warn!(vm = %vm, error = %e, "cannot record schedule error");
     }

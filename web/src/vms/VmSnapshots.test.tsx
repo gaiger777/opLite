@@ -308,7 +308,7 @@ it("shows the schedule, its last failure and the snapshots it took", async () =>
   const scheduled = {
     ...web,
     spec: { ...web.spec, snapshot_schedule: { every: "daily" as const, keep: 7, memory: true } },
-    status: { ...web.status, schedule_error: failure },
+    status: { ...web.status, schedule_error: { code: "vm_busy", message: failure } },
   };
   const auto = snapshot("auto-20261027-0300", web, 5, { spec: { scheduled: true } });
   mockLists({

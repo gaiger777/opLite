@@ -1043,11 +1043,8 @@ export interface components {
                      * @default null
                      */
                     pid: number | null;
-                    /**
-                     * @description 마지막 예약 스냅샷이 실패한 이유. 성공하면 지운다.
-                     * @default null
-                     */
-                    schedule_error: string | null;
+                    /** @default null */
+                    schedule_error: components["schemas"]["ScheduleError"] | null;
                     /**
                      * Format: uuid
                      * @description 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
@@ -1457,11 +1454,8 @@ export interface components {
                  * @default null
                  */
                 pid: number | null;
-                /**
-                 * @description 마지막 예약 스냅샷이 실패한 이유. 성공하면 지운다.
-                 * @default null
-                 */
-                schedule_error: string | null;
+                /** @default null */
+                schedule_error: components["schemas"]["ScheduleError"] | null;
                 /**
                  * Format: uuid
                  * @description 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.
@@ -1516,6 +1510,14 @@ export interface components {
         RestartPolicy: "never" | "on-failure";
         /** @enum {string} */
         Role: "admin" | "operator" | "viewer";
+        /**
+         * @description 예약 스냅샷이 실패한 이유. `code`는 거절한 API 오류의 code(`vm_busy` 등)이고, Task가 실패했으면
+         *     `task_failed`다. 옛 상태의 문자열은 `{ code: "unknown", message: <문자열> }`로 읽는다.
+         */
+        ScheduleError: {
+            code: string;
+            message: string;
+        };
         /** @enum {string} */
         ScheduleEvery: "hourly" | "daily" | "weekly";
         /** @enum {string} */
@@ -1628,6 +1630,8 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "snapshot-delete";
+            /** @description 예약 정리가 만든 삭제면 true. 이 삭제의 실패만 `schedule_error`에 남긴다. */
+            scheduled?: boolean;
             /** Format: uuid */
             snapshot: string;
         } | {
@@ -1757,11 +1761,8 @@ export interface components {
              * @default null
              */
             pid: number | null;
-            /**
-             * @description 마지막 예약 스냅샷이 실패한 이유. 성공하면 지운다.
-             * @default null
-             */
-            schedule_error: string | null;
+            /** @default null */
+            schedule_error: components["schemas"]["ScheduleError"] | null;
             /**
              * Format: uuid
              * @description 현재 위치: 마지막으로 만들었거나 되돌린 스냅샷. 다음 스냅샷의 부모가 된다.

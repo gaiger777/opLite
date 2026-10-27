@@ -22,7 +22,7 @@ use opl_types::storage::{
     SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, VolumeStatus,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
+use opl_types::vm::{PowerState, ScheduleError, Vm, VmPhase, VmSpec};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
@@ -310,7 +310,11 @@ async fn fail(ctx: &Ctx, task: &Task, error: String) {
     let scheduled = snapshot::scheduled_vm(ctx, task);
     cleanup(ctx, task).await;
     if let Some(vm) = scheduled {
-        snapshot::record_schedule(ctx, vm, Some(error.clone())).await;
+        let failure = ScheduleError {
+            code: "task_failed".into(),
+            message: error.clone(),
+        };
+        snapshot::record_schedule(ctx, vm, Some(failure)).await;
     }
     set_status(ctx, task.id, TaskState::Failed, Some(error)).await;
 }
@@ -371,7 +375,7 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
         TaskOp::VolumeDelete => delete_volume(ctx, id).await,
         TaskOp::SnapshotCreate { snapshot } => snapshot::create(ctx, id, *snapshot).await,
         TaskOp::SnapshotRevert { snapshot } => snapshot::revert(ctx, task, *snapshot).await,
-        TaskOp::SnapshotDelete { snapshot } => snapshot::delete(ctx, id, *snapshot).await,
+        TaskOp::SnapshotDelete { snapshot, .. } => snapshot::delete(ctx, id, *snapshot).await,
         TaskOp::VolumeResize { size_bytes } => resize_volume(ctx, id, *size_bytes).await,
         TaskOp::VmClone {
             name,

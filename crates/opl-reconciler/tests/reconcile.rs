@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use common::{Env, vm};
 use opl_driver::{DriverError, Hypervisor, StopMode};
-use opl_types::vm::{DiskBus, DiskSpec, PowerState, RestartPolicy, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{
+    DiskBus, DiskSpec, PowerState, RestartPolicy, ScheduleError, VmPhase, VmSpec, VmStatus,
+};
 use uuid::Uuid;
 
 fn running(v: &opl_types::vm::Vm) -> bool {
@@ -275,13 +277,21 @@ async fn guest_shutdown_turns_power_off() {
     assert_eq!(env.pid(vm.id).await, None);
 }
 
+/// 예약 작업이 남긴 오류
+fn busy() -> ScheduleError {
+    ScheduleError {
+        code: "vm_busy".into(),
+        message: "vm busy".into(),
+    }
+}
+
 #[tokio::test]
 async fn power_off_keeps_current_snapshot() {
     let env = Env::start().await;
     let mut vm = vm("web", env.node);
     let snapshot = Uuid::now_v7();
     vm.status.snapshot = Some(snapshot);
-    vm.status.schedule_error = Some("vm busy".into());
+    vm.status.schedule_error = Some(busy());
     env.create(&vm).await;
     env.wait(vm.id, "running", running).await;
 
@@ -294,7 +304,7 @@ async fn power_off_keeps_current_snapshot() {
         })
         .await;
     assert_eq!(got.status.snapshot, Some(snapshot));
-    assert_eq!(got.status.schedule_error.as_deref(), Some("vm busy"));
+    assert_eq!(got.status.schedule_error, Some(busy()));
 }
 
 #[tokio::test]
@@ -515,7 +525,7 @@ async fn status_writes_keep_snapshot_position_written_meanwhile() {
     let snapshot = Uuid::now_v7();
     let status = VmStatus {
         snapshot: Some(snapshot),
-        schedule_error: Some("vm busy".into()),
+        schedule_error: Some(busy()),
         ..current.status.clone()
     };
     env.cluster
@@ -526,8 +536,5 @@ async fn status_writes_keep_snapshot_position_written_meanwhile() {
     // 작업자가 쓴 Running status가 그 값을 덮지 않는다.
     env.wait(vm.id, "running", running).await;
     assert_eq!(env.get(vm.id).status.snapshot, Some(snapshot));
-    assert_eq!(
-        env.get(vm.id).status.schedule_error.as_deref(),
-        Some("vm busy")
-    );
+    assert_eq!(env.get(vm.id).status.schedule_error, Some(busy()));
 }

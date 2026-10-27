@@ -12,7 +12,7 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_types::node::NodeSpec;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec};
-use opl_types::vm::{ScheduleEvery, Vm, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{ScheduleError, ScheduleEvery, Vm, VmPhase, VmSpec, VmStatus};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -277,7 +277,11 @@ async fn tick(
             // 검사에 걸렸다. 다음 tick에 다시 본다.
             Err(e) if e.status.is_client_error() => {
                 tracing::info!(vm = %vm.name, ?plan, error = %e.message, "scheduled snapshot refused");
-                if let Err(w) = set_schedule_error(cluster, vm.id, Some(e.message)).await {
+                let error = ScheduleError {
+                    code: e.code.into(),
+                    message: e.message,
+                };
+                if let Err(w) = set_schedule_error(cluster, vm.id, Some(error)).await {
                     tracing::warn!(vm = %vm.name, error = %w, "cannot record schedule error");
                 }
             }
@@ -312,7 +316,7 @@ fn check_node(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
 pub(crate) async fn set_schedule_error(
     cluster: &Cluster,
     vm: Uuid,
-    error: Option<String>,
+    error: Option<ScheduleError>,
 ) -> Result<(), ClusterError> {
     loop {
         let Some(current) = cluster.get::<VmSpec>(vm)? else {
@@ -552,7 +556,10 @@ mod tests {
         );
         // 지우기 Task가 아직 끝나지 않았으면 실패가 아니라 기다린다.
         let t = task(
-            TaskOp::SnapshotDelete { snapshot: a.id },
+            TaskOp::SnapshotDelete {
+                snapshot: a.id,
+                scheduled: false,
+            },
             v.id,
             TaskState::Running,
         );
@@ -649,7 +656,10 @@ mod tests {
         for op in [
             TaskOp::SnapshotCreate { snapshot: some },
             TaskOp::SnapshotRevert { snapshot: some },
-            TaskOp::SnapshotDelete { snapshot: some },
+            TaskOp::SnapshotDelete {
+                snapshot: some,
+                scheduled: false,
+            },
             TaskOp::VmClone {
                 name: "copy".into(),
                 snapshot: None,

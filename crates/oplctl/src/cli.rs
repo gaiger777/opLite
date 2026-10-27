@@ -1222,7 +1222,7 @@ fn describe_schedule(vm: &Value) -> String {
             cell(&s["keep"])
         )
     };
-    if let Some(e) = vm["status"]["schedule_error"].as_str() {
+    if let Some(e) = vm["status"]["schedule_error"]["message"].as_str() {
         text.push_str(&format!("last error: {e}\n"));
     }
     text
@@ -1602,7 +1602,7 @@ mod tests {
         assert_eq!(
             describe_schedule(&vm(
                 json!({ "every": "hourly", "keep": 1, "memory": false }),
-                json!("VM web is busy")
+                json!({ "code": "vm_busy", "message": "VM web is busy" })
             )),
             "schedule: hourly, keep 1\nlast error: VM web is busy\n"
         );

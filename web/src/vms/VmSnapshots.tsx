@@ -124,7 +124,9 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
         {vm.status.schedule_error && (
           <p className="text-destructive">
             <span className="font-medium">{t("snapshots.scheduleFailed")}</span>{" "}
-            <span className="whitespace-pre-wrap break-words">{vm.status.schedule_error}</span>
+            <span className="whitespace-pre-wrap break-words">
+              {vm.status.schedule_error.message}
+            </span>
           </p>
         )}
       </div>
