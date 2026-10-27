@@ -10,11 +10,12 @@ use axum::http::{HeaderMap, StatusCode};
 use futures_util::StreamExt;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::runtime::ImageFormat;
+use opl_types::snapshot::SnapshotSpec;
 use opl_types::storage::{
     SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
-use opl_types::vm::VmSpec;
+use opl_types::vm::{VmPhase, VmSpec};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use utoipa::{IntoParams, ToSchema};
@@ -36,6 +37,7 @@ fn check_volume_name(name: &str) -> Result<(), ApiError> {
     }
     Ok(())
 }
+use crate::snapshots::vm_node;
 use crate::state::AppState;
 use crate::tasks::create_task;
 
@@ -47,6 +49,19 @@ fn pool_node(state: &AppState, pool: &StoragePool) -> Uuid {
     } else {
         nodes[0]
     }
+}
+
+/// 볼륨 파일 작업을 실행할 노드. 풀이 없어졌으면 이 노드다.
+fn volume_node(state: &AppState, volume: &Volume) -> Result<Uuid, ApiError> {
+    Ok(
+        match state
+            .cluster
+            .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
+        {
+            Some(pool) => pool_node(state, &pool),
+            None => state.node,
+        },
+    )
 }
 
 fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
@@ -233,6 +248,7 @@ async fn receive(path: &FsPath, body: Body, length: u64) -> Result<(), ApiError>
 }
 
 /// VM이 쓰지 않는 볼륨을 지울 Task를 돌려준다(202). 아직 만들고 있는 볼륨은 지울 수 없다.
+/// 스냅샷의 VM 스펙이 가리키면 409 `volume_in_snapshot`.
 #[utoipa::path(delete, path = "/volumes/{key}", tag = "storage",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -259,13 +275,75 @@ pub async fn delete_volume(
             format!("volume {:?} is attached to VM {:?}", volume.name, vm.name),
         ));
     }
-    let node = match state
-        .cluster
-        .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
+    let (_, snapshots) = state.cluster.list::<SnapshotSpec>()?;
+    if let Some(s) = snapshots
+        .iter()
+        .find(|s| s.spec.vm_spec.disks.iter().any(|d| d.volume == volume.name))
     {
-        Some(pool) => pool_node(&state, &pool),
-        None => state.node,
-    };
+        return Err(ApiError::conflict(
+            "volume_in_snapshot",
+            format!(
+                "volume {:?} is used by snapshot {:?} of VM {}",
+                volume.name, s.spec.name, s.spec.vm
+            ),
+        ));
+    }
+    let node = volume_node(&state, &volume)?;
     let task = create_task(&state.cluster, TaskOp::VolumeDelete, volume.id, node).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResizeRequest {
+    /// 새 크기(바이트). 지금보다 크고 512의 배수여야 한다.
+    pub size_bytes: u64,
+}
+
+/// 볼륨 크기를 늘릴 Task를 돌려준다(202). 줄이지는 않는다(400). 실행 중인 VM이 쓰면 그 VM의
+/// 노드에서, 아니면 볼륨의 노드에서 한다.
+#[utoipa::path(post, path = "/volumes/{key}/resize", tag = "storage",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = ResizeRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn resize_volume(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    Json(req): Json<ResizeRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
+    let volume = lookup::<VolumeSpec>(&state.cluster, &key)?;
+    if volume.status.phase != VolumePhase::Ready {
+        return Err(ApiError::conflict(
+            "volume_not_ready",
+            format!("volume {:?} is still being created", volume.name),
+        ));
+    }
+    if req.size_bytes <= volume.spec.size_bytes {
+        return Err(ApiError::bad_request(format!(
+            "size_bytes must be larger than the current size ({} bytes)",
+            volume.spec.size_bytes
+        )));
+    }
+    // qcow2는 `qemu-img resize`도 QMP `block_resize`도 512 배수가 아니면 거부한다.
+    if req.size_bytes % 512 != 0 {
+        return Err(ApiError::bad_request(
+            "size_bytes must be a multiple of 512",
+        ));
+    }
+    let (_, vms) = state.cluster.list::<VmSpec>()?;
+    let running = vms.iter().find(|vm| {
+        !matches!(vm.status.phase, VmPhase::Stopped | VmPhase::Failed)
+            && vm.spec.disks.iter().any(|d| d.volume == volume.name)
+    });
+    let node = match running {
+        Some(vm) => vm_node(&state, vm),
+        None => volume_node(&state, &volume)?,
+    };
+    let op = TaskOp::VolumeResize {
+        size_bytes: req.size_bytes,
+    };
+    let task = create_task(&state.cluster, op, volume.id, node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }

@@ -189,6 +189,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/snapshots": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 모든 VM의 스냅샷. watch와 함께 쓰는 목록이다. */
+        get: operations["list_snapshots"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/storage-pools": {
         parameters: {
             query?: never;
@@ -357,7 +374,7 @@ export interface paths {
          */
         put: operations["update_vm"];
         post?: never;
-        /** 꺼진 VM만 지울 수 있다. */
+        /** 꺼진 VM만 지울 수 있다. 스냅샷이 남아 있으면 409 `vm_has_snapshots`. */
         delete: operations["delete_vm"];
         options?: never;
         head?: never;
@@ -394,6 +411,64 @@ export interface paths {
         get: operations["console"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/snapshots": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_vm_snapshots"];
+        put?: never;
+        /**
+         * `pending` 스냅샷을 만들고(부모는 VM의 현재 위치, `vm_spec`은 지금 스펙) 그것을 채울 Task를
+         *     돌려준다(202). 시작·정지 중이면 409 `vm_busy`, qcow2가 아닌 디스크가 있으면 409
+         *     `snapshot_unsupported`. 실행 중이 아니거나 디스크가 없는 VM의 메모리 스냅샷은 400.
+         */
+        post: operations["create_snapshot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/snapshots/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_snapshot"];
+        put?: never;
+        post?: never;
+        /** 스냅샷을 지울 Task를 돌려준다(202). 자식은 지운 스냅샷의 부모로 옮겨 붙는다. */
+        delete: operations["delete_snapshot"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/snapshots/{name}/revert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 디스크·UEFI 변수·VM 스펙을 스냅샷 것으로 되돌릴 Task를 돌려준다(202). 실행 중이면 강제로 끈다.
+         *     스냅샷 스펙의 볼륨이 모두 있고 다 만들어졌으며 다른 VM이 쓰지 않아야 한다.
+         */
+        post: operations["revert_snapshot"];
         delete?: never;
         options?: never;
         head?: never;
@@ -447,8 +522,31 @@ export interface paths {
         get: operations["get_volume"];
         put?: never;
         post?: never;
-        /** VM이 쓰지 않는 볼륨을 지울 Task를 돌려준다(202). 아직 만들고 있는 볼륨은 지울 수 없다. */
+        /**
+         * VM이 쓰지 않는 볼륨을 지울 Task를 돌려준다(202). 아직 만들고 있는 볼륨은 지울 수 없다.
+         *     스냅샷의 VM 스펙이 가리키면 409 `volume_in_snapshot`.
+         */
         delete: operations["delete_volume"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/volumes/{key}/resize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 볼륨 크기를 늘릴 Task를 돌려준다(202). 줄이지는 않는다(400). 실행 중인 VM이 쓰면 그 VM의
+         *     노드에서, 아니면 볼륨의 노드에서 한다.
+         */
+        post: operations["resize_volume"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -569,6 +667,14 @@ export interface components {
                 /** Format: int64 */
                 size_bytes: number;
             };
+        };
+        CreateSnapshotRequest: {
+            /** @description 최대 1024자 */
+            description?: string;
+            /** @description 메모리 상태도 담는다. 기본은 VM이 실행 중이고 디스크가 있으면 true다. */
+            memory?: boolean | null;
+            /** @description VM 안에서 고유한 이름 */
+            name: string;
         };
         CreateTokenRequest: {
             name: string;
@@ -721,6 +827,61 @@ export interface components {
                     memory_mib: number;
                     /** @default false */
                     online: boolean;
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_SnapshotSpec_SnapshotStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    description?: string;
+                    /** @description 메모리 상태를 담았는지. 담았으면 VM의 첫 디스크에 있다. */
+                    memory: boolean;
+                    /** @description 사용자가 붙인 이름. VM 안에서 고유하다. */
+                    name: string;
+                    /**
+                     * Format: uuid
+                     * @description 부모 스냅샷 id. VM의 첫 스냅샷이면 없다.
+                     */
+                    parent?: string | null;
+                    /** @description 예약으로 만들었는지. 보관 개수 정리는 이것만 지운다. */
+                    scheduled?: boolean;
+                    /**
+                     * Format: uuid
+                     * @description VM id
+                     */
+                    vm: string;
+                    /** @description 만든 순간의 VM 스펙 */
+                    vm_spec: components["schemas"]["VmSpec"];
+                };
+                status: {
+                    /**
+                     * Format: int64
+                     * @description 만든 시각(유닉스 초)
+                     * @default null
+                     */
+                    created_at: number | null;
+                    /** @default pending */
+                    phase: components["schemas"]["SnapshotPhase"];
+                    /**
+                     * Format: int64
+                     * @description 메모리 상태 크기. 메모리 스냅샷만 있다.
+                     * @default null
+                     */
+                    vmstate_bytes: number | null;
                 };
             }[];
             /** Format: int64 */
@@ -1016,6 +1177,13 @@ export interface components {
             /** Format: uuid */
             user: string;
         };
+        ResizeRequest: {
+            /**
+             * Format: int64
+             * @description 새 크기(바이트). 지금보다 크고 512의 배수여야 한다.
+             */
+            size_bytes: number;
+        };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_NetworkSpec_NetworkStatus: {
             /** Format: uuid */
@@ -1083,6 +1251,57 @@ export interface components {
                 memory_mib: number;
                 /** @default false */
                 online: boolean;
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_SnapshotSpec_SnapshotStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                description?: string;
+                /** @description 메모리 상태를 담았는지. 담았으면 VM의 첫 디스크에 있다. */
+                memory: boolean;
+                /** @description 사용자가 붙인 이름. VM 안에서 고유하다. */
+                name: string;
+                /**
+                 * Format: uuid
+                 * @description 부모 스냅샷 id. VM의 첫 스냅샷이면 없다.
+                 */
+                parent?: string | null;
+                /** @description 예약으로 만들었는지. 보관 개수 정리는 이것만 지운다. */
+                scheduled?: boolean;
+                /**
+                 * Format: uuid
+                 * @description VM id
+                 */
+                vm: string;
+                /** @description 만든 순간의 VM 스펙 */
+                vm_spec: components["schemas"]["VmSpec"];
+            };
+            status: {
+                /**
+                 * Format: int64
+                 * @description 만든 시각(유닉스 초)
+                 * @default null
+                 */
+                created_at: number | null;
+                /** @default pending */
+                phase: components["schemas"]["SnapshotPhase"];
+                /**
+                 * Format: int64
+                 * @description 메모리 상태 크기. 메모리 스냅샷만 있다.
+                 * @default null
+                 */
+                vmstate_bytes: number | null;
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -1251,6 +1470,45 @@ export interface components {
         RestartPolicy: "never" | "on-failure";
         /** @enum {string} */
         Role: "admin" | "operator" | "viewer";
+        /** @enum {string} */
+        SnapshotPhase: "pending" | "ready";
+        SnapshotSpec: {
+            description?: string;
+            /** @description 메모리 상태를 담았는지. 담았으면 VM의 첫 디스크에 있다. */
+            memory: boolean;
+            /** @description 사용자가 붙인 이름. VM 안에서 고유하다. */
+            name: string;
+            /**
+             * Format: uuid
+             * @description 부모 스냅샷 id. VM의 첫 스냅샷이면 없다.
+             */
+            parent?: string | null;
+            /** @description 예약으로 만들었는지. 보관 개수 정리는 이것만 지운다. */
+            scheduled?: boolean;
+            /**
+             * Format: uuid
+             * @description VM id
+             */
+            vm: string;
+            /** @description 만든 순간의 VM 스펙 */
+            vm_spec: components["schemas"]["VmSpec"];
+        };
+        SnapshotStatus: {
+            /**
+             * Format: int64
+             * @description 만든 시각(유닉스 초)
+             * @default null
+             */
+            created_at: number | null;
+            /** @default pending */
+            phase: components["schemas"]["SnapshotPhase"];
+            /**
+             * Format: int64
+             * @description 메모리 상태 크기. 메모리 스냅샷만 있다.
+             * @default null
+             */
+            vmstate_bytes: number | null;
+        };
         /**
          * @description 가져올 원본 이미지 형식
          * @enum {string}
@@ -1915,6 +2173,33 @@ export interface operations {
             };
         };
     };
+    list_snapshots: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_SnapshotSpec_SnapshotStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_pools: {
         parameters: {
             query?: never;
@@ -2518,6 +2803,166 @@ export interface operations {
             };
         };
     };
+    list_vm_snapshots: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_SnapshotSpec_SnapshotStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_snapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateSnapshotRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_snapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+                /** @description snapshot name or id */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_SnapshotSpec_SnapshotStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_snapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+                /** @description snapshot name or id */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    revert_snapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+                /** @description snapshot name or id */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_volumes: {
         parameters: {
             query?: never;
@@ -2654,6 +3099,40 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resize_volume: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResizeRequest"];
+            };
+        };
         responses: {
             202: {
                 headers: {

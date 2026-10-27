@@ -9,6 +9,7 @@ mod console;
 pub mod error;
 pub mod resources;
 pub mod scheduler;
+mod snapshots;
 mod state;
 mod tasks;
 pub mod users;
@@ -81,9 +82,17 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::list_vms, vms::create_vm))
         .routes(routes!(r::get_vm, vms::update_vm, vms::delete_vm))
         .routes(routes!(vms::vm_action))
+        .routes(routes!(snapshots::list_snapshots))
+        .routes(routes!(
+            snapshots::list_vm_snapshots,
+            snapshots::create_snapshot
+        ))
+        .routes(routes!(snapshots::get_snapshot, snapshots::delete_snapshot))
+        .routes(routes!(snapshots::revert_snapshot))
         .routes(routes!(r::list_volumes, volumes::create_volume))
         .routes(routes!(volumes::import_volume))
         .routes(routes!(r::get_volume, volumes::delete_volume))
+        .routes(routes!(volumes::resize_volume))
         .routes(routes!(console::console))
         .routes(routes!(watch::watch))
 }

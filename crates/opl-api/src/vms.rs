@@ -20,6 +20,7 @@ use crate::auth::{Action, Principal};
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
 use crate::scheduler::{Inventory, schedule};
+use crate::snapshots::count_snapshots;
 use crate::state::AppState;
 use crate::tasks::create_task;
 
@@ -41,7 +42,7 @@ fn vm_running(vm: &Vm, what: &str) -> ApiError {
 
 /// 저장하기 전에 spec을 검증하고 채운다: 빠진 MAC 할당, 참조 확인, 필요하면 노드 배치.
 /// `id`는 이 spec을 가질 VM이다(자기 자신의 MAC과 디스크는 충돌로 보지 않는다).
-fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(), ApiError> {
+pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(), ApiError> {
     let inv = Inventory::load(&state.cluster)?;
     let others = inv.vms.iter().filter(|v| v.id != id);
 
@@ -206,7 +207,7 @@ pub async fn update_vm(
     ))
 }
 
-/// 꺼진 VM만 지울 수 있다.
+/// 꺼진 VM만 지울 수 있다. 스냅샷이 남아 있으면 409 `vm_has_snapshots`.
 #[utoipa::path(delete, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -220,6 +221,16 @@ pub async fn delete_vm(
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     if !is_stopped(&vm) {
         return Err(vm_running(&vm, "delete"));
+    }
+    let snapshots = count_snapshots(&state, vm.id)?;
+    if snapshots > 0 {
+        return Err(ApiError::conflict(
+            "vm_has_snapshots",
+            format!(
+                "VM {:?} has {snapshots} snapshot(s); delete them first",
+                vm.name
+            ),
+        ));
     }
     state
         .cluster

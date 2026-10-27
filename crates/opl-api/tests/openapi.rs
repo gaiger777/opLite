@@ -18,6 +18,11 @@ async fn openapi_document_is_served_without_login() {
         "/vms/{key}/actions/{action}",
         "/vms/{key}/console",
         "/volumes/import",
+        "/volumes/{key}/resize",
+        "/snapshots",
+        "/vms/{key}/snapshots",
+        "/vms/{key}/snapshots/{name}",
+        "/vms/{key}/snapshots/{name}/revert",
         "/watch",
     ] {
         assert!(paths.contains_key(path), "{path} is not documented");
@@ -28,6 +33,7 @@ async fn openapi_document_is_served_without_login() {
         "#/components/schemas/Resource_VmSpec_VmStatus"
     );
     assert!(doc["components"]["schemas"]["Resource_TaskSpec_TaskStatus"].is_object());
+    assert!(doc["components"]["schemas"]["Resource_SnapshotSpec_SnapshotStatus"].is_object());
     let schemes = &doc["components"]["securitySchemes"];
     assert_eq!(schemes["token"]["scheme"], "bearer");
     assert_eq!(schemes["session"]["name"], "opl_session");
