@@ -239,6 +239,23 @@ impl Cluster {
         .await
     }
 
+    /// 리소스의 revision이 `expected_revision`일 때만 status를 바꾼다. 아니면 `RevisionMismatch`.
+    /// 같은 status를 여러 곳에서 나눠 쓸 때, 읽은 뒤 다른 쪽이 쓴 값을 덮지 않게 한다.
+    pub async fn update_status_checked<S: ResourceSpec>(
+        &self,
+        id: Uuid,
+        expected_revision: u64,
+        status: &S::Status,
+    ) -> Result<u64, ClusterError> {
+        self.write(Command::UpdateStatusIf {
+            kind: S::KIND,
+            id,
+            expected_revision,
+            status: serde_json::to_value(status)?,
+        })
+        .await
+    }
+
     pub async fn delete<S: ResourceSpec>(
         &self,
         id: Uuid,

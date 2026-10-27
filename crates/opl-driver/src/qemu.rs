@@ -38,6 +38,16 @@ const SHUTDOWN_EXIT_WAIT: Duration = Duration::from_secs(1);
 /// Task 한도(600초)보다 짧아야 Task가 먼저 끊기지 않고 이 오류(작업이 남아 있을 수 있음)를 받는다.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(540);
 
+/// VM별 상태 디렉터리 `{state_dir}/vm/{id}`. `state_dir`은 [`QemuConfig::state_dir`]이다.
+pub fn vm_state_dir(state_dir: &Path, id: Uuid) -> PathBuf {
+    state_dir.join("vm").join(id.to_string())
+}
+
+/// VM의 UEFI 변수 파일. UEFI VM을 처음 띄울 때 템플릿을 복사해 만든다(BIOS VM에는 없다).
+pub fn uefi_vars_path(state_dir: &Path, id: Uuid) -> PathBuf {
+    vm_state_dir(state_dir, id).join("uefi-vars.fd")
+}
+
 #[derive(Debug, Clone)]
 pub struct QemuConfig {
     pub host: HostProfile,
@@ -129,12 +139,12 @@ impl QemuHypervisor {
     fn paths(&self, id: Uuid) -> Result<RuntimePaths, DriverError> {
         let mut paths = RuntimePaths::new(&self.config.run_dir, id)
             .map_err(|e| DriverError::InvalidSpec(e.to_string()))?;
-        paths.uefi_vars = self.state_dir(id).join("uefi-vars.fd");
+        paths.uefi_vars = uefi_vars_path(&self.config.state_dir, id);
         Ok(paths)
     }
 
     fn state_dir(&self, id: Uuid) -> PathBuf {
-        self.config.state_dir.join("vm").join(id.to_string())
+        vm_state_dir(&self.config.state_dir, id)
     }
 
     fn handle(&self, id: Uuid) -> Option<Arc<VmHandle>> {

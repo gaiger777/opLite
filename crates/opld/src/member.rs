@@ -252,13 +252,21 @@ impl Member {
         };
         let mut reconciler_config = ReconcilerConfig::new(node);
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
-        let reconciler = Reconciler::spawn(cluster.clone(), hv, reconciler_config);
+        let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
         let storage: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img));
         // Task 실행기는 시작할 때 이 노드가 남긴 고아를 지운다. 그것이 끝난 뒤에 API를 연다.
         let mut runner_config = TaskRunnerConfig::new(node);
         runner_config.upload_dir = Some(config.data_dir.join("uploads"));
-        let runner =
-            TaskRunner::spawn(cluster.clone(), storage, reconciler.handle(), runner_config).await;
+        // QEMU 드라이버의 state_dir과 같다(host.rs).
+        runner_config.state_dir = Some(config.data_dir.clone());
+        let runner = TaskRunner::spawn(
+            cluster.clone(),
+            storage,
+            hv,
+            reconciler.handle(),
+            runner_config,
+        )
+        .await;
         let monitor = NodeMonitor::spawn(cluster.clone(), peers, NodeMonitorConfig::default());
 
         let listener = TlsListener::new(api_listener, api_tls)?;

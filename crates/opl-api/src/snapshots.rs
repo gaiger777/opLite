@@ -67,6 +67,31 @@ fn check_not_busy(vm: &Vm) -> Result<(), ApiError> {
     ))
 }
 
+/// 이 VM의 스냅샷 만들기·되돌리기 Task가 끝나지 않았으면 409 `vm_busy`. 그 Task는 전원을 끄고
+/// 켜며 디스크를 바꾸므로, 그사이 전원이나 스펙을 바꾸면 되돌리는 디스크를 QEMU가 열거나 담는
+/// 스펙이 실제와 달라진다. Task는 실행기의 시간 제한 안에 끝난다.
+pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    let busy = tasks.iter().any(|t| {
+        t.spec.target == vm.id
+            && !t.status.state.is_finished()
+            && matches!(
+                t.spec.op,
+                TaskOp::SnapshotCreate { .. } | TaskOp::SnapshotRevert { .. }
+            )
+    });
+    if busy {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            format!(
+                "VM {:?} is being snapshotted or reverted; try again when the task has finished",
+                vm.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 모든 디스크가 스냅샷을 담을 수 있고 다 만들어졌는지. dir 백엔드(`Storage::supports_snapshots`)는
 /// qcow2만 담는다. raw가 하나라도 있으면 일부 디스크만 되돌아가므로 거부한다.
 fn check_disks(state: &AppState, vm: &Vm) -> Result<(), ApiError> {

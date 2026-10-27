@@ -1440,6 +1440,7 @@ name = "opl-api"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "axum",
  "fs4",
  "futures-util",
@@ -1449,6 +1450,7 @@ dependencies = [
  "opl-cluster",
  "opl-driver",
  "opl-peer",
+ "opl-qemu",
  "opl-reconciler",
  "opl-types",
  "reqwest",

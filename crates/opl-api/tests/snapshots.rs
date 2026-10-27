@@ -1,5 +1,5 @@
 //! 스냅샷 API: 검사, 리소스와 Task 만들기, VM·볼륨 삭제 규칙, 볼륨 크기 늘리기.
-//! Task 실행은 아직 붙지 않았으므로 Task의 모양만 확인한다.
+//! Task 실행기를 멈춰 두고 API가 남긴 리소스와 Task의 모양만 확인한다(실행은 `snapshot_tasks`).
 
 mod common;
 
@@ -8,12 +8,35 @@ use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
+use opl_types::task::{TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{VmPhase, VmSpec, VmStatus};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 const MIB: u64 = 1 << 20;
+
+/// Task 실행기 없이 띄운다. 만든 Task는 pending으로 남는다.
+async fn env() -> Env {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    env
+}
+
+/// 남은 Task를 끝난 것으로 기록한다. 끝나지 않은 스냅샷 만들기 Task는 VM 수정을 막는다.
+async fn finish_tasks(env: &Env) {
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    let done = TaskStatus {
+        state: TaskState::Succeeded,
+        error: None,
+    };
+    for task in tasks {
+        env.cluster
+            .update_status::<TaskSpec>(task.id, &done)
+            .await
+            .unwrap();
+    }
+}
 
 /// 풀 `local`(노드 `nodes`)을 저장소에 직접 만든다.
 async fn pool(env: &Env, nodes: Vec<Uuid>) {
@@ -97,7 +120,7 @@ async fn mark_ready(env: &Env, id: Uuid) {
 
 #[tokio::test]
 async fn create_records_pending_snapshot_and_task() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     pool(&env, vec![]).await;
     volume(&env, "root", ImageFormat::Qcow2).await;
@@ -172,7 +195,7 @@ async fn create_records_pending_snapshot_and_task() {
 
 #[tokio::test]
 async fn create_validates_request() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     pool(&env, vec![]).await;
     volume(&env, "root", ImageFormat::Qcow2).await;
@@ -206,7 +229,7 @@ async fn create_validates_request() {
 
 #[tokio::test]
 async fn running_vm_snapshots_memory_by_default_on_its_node() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     pool(&env, vec![]).await;
     volume(&env, "root", ImageFormat::Qcow2).await;
@@ -242,7 +265,7 @@ async fn running_vm_snapshots_memory_by_default_on_its_node() {
 
 #[tokio::test]
 async fn disks_must_be_qcow2_and_memory_needs_a_disk() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     pool(&env, vec![]).await;
     volume(&env, "root", ImageFormat::Qcow2).await;
@@ -274,7 +297,7 @@ async fn disks_must_be_qcow2_and_memory_needs_a_disk() {
 
 #[tokio::test]
 async fn revert_and_delete_need_a_ready_snapshot() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     pool(&env, vec![]).await;
     volume(&env, "root", ImageFormat::Qcow2).await;
@@ -330,7 +353,7 @@ async fn revert_and_delete_need_a_ready_snapshot() {
 
 #[tokio::test]
 async fn revert_needs_the_snapshot_volumes() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     pool(&env, vec![]).await;
     volume(&env, "root", ImageFormat::Qcow2).await;
@@ -339,6 +362,7 @@ async fn revert_needs_the_snapshot_volumes() {
         .post("/vms/web/snapshots", json!({ "name": "s1" }))
         .await;
     mark_ready(&env, snapshot_of(&env, vm, "s1").await.id).await;
+    finish_tasks(&env).await;
 
     // 볼륨을 떼어 다른 VM에 붙이면 되돌릴 수 없다.
     let (_, current) = admin.get("/vms/web").await;
@@ -385,7 +409,7 @@ async fn revert_needs_the_snapshot_volumes() {
 
 #[tokio::test]
 async fn snapshots_block_vm_and_volume_deletion() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     pool(&env, vec![]).await;
     volume(&env, "root", ImageFormat::Qcow2).await;
@@ -399,6 +423,7 @@ async fn snapshots_block_vm_and_volume_deletion() {
     assert_eq!(body["code"], "vm_has_snapshots");
 
     // VM에서 떼어 낸 볼륨도 스냅샷이 가리키면 지울 수 없다.
+    finish_tasks(&env).await;
     let (_, current) = admin.get("/vms/web").await;
     let mut spec = current["spec"].clone();
     spec["disks"] = json!([]);
@@ -418,7 +443,7 @@ async fn snapshots_block_vm_and_volume_deletion() {
 
 #[tokio::test]
 async fn viewers_read_snapshots_and_operators_manage_them() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     let viewer = env.user("viewer", "viewer").await;
     let operator = env.user("operator", "operator").await;
@@ -460,7 +485,7 @@ async fn viewers_read_snapshots_and_operators_manage_them() {
 
 #[tokio::test]
 async fn resize_only_grows_and_runs_where_the_volume_is_used() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     let viewer = env.user("viewer", "viewer").await;
     let operator = env.user("operator", "operator").await;
@@ -509,7 +534,7 @@ async fn resize_only_grows_and_runs_where_the_volume_is_used() {
 
 #[tokio::test]
 async fn tasks_run_where_the_vm_disks_will_be_used() {
-    let env = Env::start().await;
+    let env = env().await;
     let admin = env.admin().await;
     pool(&env, vec![]).await;
     let (a, b) = (Uuid::now_v7(), Uuid::now_v7());

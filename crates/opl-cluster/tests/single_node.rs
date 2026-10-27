@@ -102,8 +102,29 @@ async fn conflicting_writes_are_rejected() {
         ClusterError::Rejected(Rejection::NotFound { .. })
     ));
 
+    let err = c
+        .update_status_checked::<VolumeSpec>(v.id, rev + 100, &VolumeStatus::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ClusterError::Rejected(Rejection::RevisionMismatch { expected, actual })
+            if expected == rev + 100 && actual == rev
+    ));
+
     // 거부된 명령은 아무것도 바꾸지 않는다.
     assert_eq!(c.get::<VolumeSpec>(v.id).unwrap().unwrap().revision, rev);
+
+    let status = VolumeStatus {
+        allocated_bytes: Some(1),
+        ..Default::default()
+    };
+    let rev2 = c
+        .update_status_checked::<VolumeSpec>(v.id, rev, &status)
+        .await
+        .unwrap();
+    let got = c.get::<VolumeSpec>(v.id).unwrap().unwrap();
+    assert_eq!((got.revision, got.status), (rev2, status));
 }
 
 #[tokio::test]

@@ -54,6 +54,15 @@ impl DriverError {
             | DriverError::ToolFailed { .. } => false,
         }
     }
+
+    /// 응답을 기다리다 시간이 다 된 오류인지. 요청한 작업(스냅샷 저장 등)이 하이퍼바이저 안에서
+    /// 아직 돌고 있을 수 있으므로, 그 결과를 곧바로 되돌리거나 지우면 안 된다.
+    pub fn may_be_in_progress(&self) -> bool {
+        matches!(
+            self,
+            DriverError::Qmp(QmpError::JobTimeout { .. }) | DriverError::Timeout(_)
+        )
+    }
 }
 
 #[cfg(test)]
@@ -97,5 +106,23 @@ mod tests {
         assert!(!DriverError::StartFailed("x".into()).is_transient());
         assert!(!DriverError::InvalidSpec("x".into()).is_transient());
         assert!(!DriverError::VolumeNotFound(Uuid::nil()).is_transient());
+    }
+
+    #[test]
+    fn timeouts_may_leave_work_in_progress() {
+        let timeout = QmpError::JobTimeout {
+            id: "j".into(),
+            timeout: std::time::Duration::from_secs(1),
+        };
+        assert!(DriverError::Qmp(timeout).may_be_in_progress());
+        assert!(DriverError::Timeout("QMP transaction").may_be_in_progress());
+        let failed = QmpError::JobFailed {
+            id: "j".into(),
+            error: "x".into(),
+        };
+        assert!(!DriverError::Qmp(failed).may_be_in_progress());
+        assert!(!DriverError::NotRunning(Uuid::nil()).may_be_in_progress());
+        // 다시 붙지 못한 VM에는 요청을 보내지 않았다.
+        assert!(!DriverError::NotAttached(Uuid::nil()).may_be_in_progress());
     }
 }

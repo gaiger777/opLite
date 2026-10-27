@@ -98,6 +98,7 @@ impl Node {
         let runner = TaskRunner::spawn(
             self.cluster.clone(),
             storage,
+            hv.clone(),
             reconciler.handle(),
             runner_config(self.id, &work),
         )

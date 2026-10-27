@@ -48,6 +48,15 @@ pub enum Command {
     },
     /// status만 바꾼다. reconciler가 쓰며 revision을 확인하지 않는다.
     UpdateStatus { kind: Kind, id: Uuid, status: Value },
+    /// 현재 revision이 `expected_revision`일 때만 status를 바꾼다. `UpdateStatus`에 필드를 더하면
+    /// 옛 노드가 그 필드를 버리고 확인 없이 덮어쓰므로 새 명령으로 둔다. 옛 노드는 모르는 명령을
+    /// 오류로 처리한다(설계 3.1절).
+    UpdateStatusIf {
+        kind: Kind,
+        id: Uuid,
+        expected_revision: u64,
+        status: Value,
+    },
     Delete {
         kind: Kind,
         id: Uuid,
@@ -196,6 +205,44 @@ mod tests {
                 "expected_revision": null,
                 "labels": {},
                 "spec": {"cpus": 2}
+            })
+        );
+        assert_eq!(serde_json::from_value::<Command>(value).unwrap(), cmd);
+    }
+
+    /// 확인하지 않는 status 쓰기는 예전 형식 그대로다. 확인하는 쓰기는 새 명령이다.
+    #[test]
+    fn update_status_storage_format_is_stable() {
+        let id = Uuid::from_u128(1);
+        let old = json!({
+            "op": "update-status",
+            "kind": "vm",
+            "id": id.to_string(),
+            "status": {"phase": "running"}
+        });
+        let cmd = Command::UpdateStatus {
+            kind: Kind::Vm,
+            id,
+            status: json!({"phase": "running"}),
+        };
+        assert_eq!(serde_json::to_value(&cmd).unwrap(), old);
+        assert_eq!(serde_json::from_value::<Command>(old).unwrap(), cmd);
+
+        let cmd = Command::UpdateStatusIf {
+            kind: Kind::Vm,
+            id,
+            expected_revision: 7,
+            status: json!(null),
+        };
+        let value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "op": "update-status-if",
+                "kind": "vm",
+                "id": id.to_string(),
+                "expected_revision": 7,
+                "status": null
             })
         );
         assert_eq!(serde_json::from_value::<Command>(value).unwrap(), cmd);

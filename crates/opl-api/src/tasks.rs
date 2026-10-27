@@ -3,16 +3,20 @@
 //! API는 Task를 저장소에 만들기만 한다. 실행기는 reconciler처럼 목록을 읽고 그 revision부터
 //! 구독하므로, 어느 노드의 API가 만든 Task든 대상 노드에서 실행된다.
 
+mod snapshot;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use opl_cluster::types::Rejection;
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::{DriverError, Storage};
+use opl_driver::{DriverError, Hypervisor, Storage};
 use opl_reconciler::ReconcilerHandle;
 use opl_types::resource::{Kind, Resource};
+use opl_types::snapshot::{SnapshotPhase, SnapshotSpec};
 use opl_types::storage::{
     SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, VolumeStatus,
 };
@@ -23,6 +27,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::snapshots::vm_placement;
 
 /// 새 Task를 저장소에 만든다. 이름은 id 문자열이다.
 pub(crate) async fn create_task(
@@ -47,6 +52,9 @@ pub struct TaskRunnerConfig {
     pub poll_interval: Duration,
     /// API가 올린 이미지를 받아 두는 디렉터리. 시작할 때 Task가 없는 파일을 지운다.
     pub upload_dir: Option<PathBuf>,
+    /// VM별 상태 디렉터리의 뿌리(`QemuConfig::state_dir`). 스냅샷의 UEFI 변수 사본을 둔다.
+    /// 없으면 변수를 복사하거나 되돌리지 않는다.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl TaskRunnerConfig {
@@ -56,6 +64,7 @@ impl TaskRunnerConfig {
             timeout: Duration::from_secs(600),
             poll_interval: Duration::from_millis(200),
             upload_dir: None,
+            state_dir: None,
         }
     }
 }
@@ -68,22 +77,26 @@ pub struct TaskRunner {
 struct Ctx {
     cluster: Arc<Cluster>,
     storage: Arc<dyn Storage>,
+    hv: Arc<dyn Hypervisor>,
     reconciler: ReconcilerHandle,
     config: TaskRunnerConfig,
 }
 
 impl TaskRunner {
-    /// 고아(Task 없는 Pending 볼륨, 올린 파일)를 지운 뒤 실행 루프를 띄우고 돌아온다.
+    /// 고아(Task 없는 Pending 볼륨·스냅샷, 올린 파일)를 지운 뒤 실행 루프를 띄우고 돌아온다.
     /// API가 막 만든 볼륨이나 올린 파일을 고아로 지우지 않도록 API 서버는 이것을 기다린 뒤 띄운다.
+    /// `hv`는 실행 중인 VM의 스냅샷을 다룬다(이 노드의 reconciler와 같은 하이퍼바이저).
     pub async fn spawn(
         cluster: Arc<Cluster>,
         storage: Arc<dyn Storage>,
+        hv: Arc<dyn Hypervisor>,
         reconciler: ReconcilerHandle,
         config: TaskRunnerConfig,
     ) -> Self {
         let ctx = Arc::new(Ctx {
             cluster,
             storage,
+            hv,
             reconciler,
             config,
         });
@@ -116,7 +129,7 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>) {
     let mut started: HashSet<Uuid> = HashSet::new();
     // 실행 중인 Task. 실행기가 멈출 때 함께 멈춘다.
     let mut running: HashMap<Uuid, AbortHandle> = HashMap::new();
-    // 볼륨별 마지막 Task. 같은 볼륨의 Task는 앞의 것이 끝난 뒤에 시작한다.
+    // 대상(볼륨, 스냅샷 Task의 VM)별 마지막 Task. 같은 대상의 Task는 앞의 것이 끝난 뒤에 시작한다.
     let mut by_target: HashMap<Uuid, JoinHandle<()>> = HashMap::new();
     let mut first = true;
     'sync: loop {
@@ -196,8 +209,18 @@ fn is_volume_op(op: &TaskOp) -> bool {
     )
 }
 
+fn is_snapshot_op(op: &TaskOp) -> bool {
+    matches!(
+        op,
+        TaskOp::SnapshotCreate { .. }
+            | TaskOp::SnapshotRevert { .. }
+            | TaskOp::SnapshotDelete { .. }
+    )
+}
+
 /// Task를 실행한다. 볼륨 Task는 같은 볼륨의 앞 Task가 끝난 뒤에 시작한다(`Storage`의 요구).
-/// VM Task는 기다리기만 하므로 차례를 두지 않는다. 강제 종료가 앞의 reboot 뒤에 묶이면 안 된다.
+/// 스냅샷 Task도 같은 VM의 앞 스냅샷 Task가 끝난 뒤에 시작한다(부모·현재 위치가 차례로 바뀐다).
+/// VM 전원 Task는 기다리기만 하므로 차례를 두지 않는다. 강제 종료가 앞의 reboot 뒤에 묶이면 안 된다.
 /// `interrupted`면 이전 opld가 실행하다 멈춘 Task이므로 실패로 기록한다.
 fn start(
     ctx: &Arc<Ctx>,
@@ -210,7 +233,7 @@ fn start(
     started.insert(task.id);
     let id = task.id;
     let target = task.spec.target;
-    let queued = is_volume_op(&task.spec.op);
+    let queued = is_volume_op(&task.spec.op) || is_snapshot_op(&task.spec.op);
     let previous = if queued {
         by_target.remove(&target)
     } else {
@@ -246,15 +269,22 @@ async fn execute(ctx: &Ctx, task: Task) {
     }
 }
 
-/// 실패로 기록한다. 만들다 만 볼륨은 지운다.
+/// 실패로 기록한다. 만들다 만 볼륨·스냅샷은 지운다.
 async fn fail(ctx: &Ctx, task: &Task, error: String) {
     tracing::warn!(task = %task.id, error = %error, "task failed");
     cleanup(ctx, task).await;
     set_status(ctx, task.id, TaskState::Failed, Some(error)).await;
 }
 
-/// 실패한 볼륨 생성·가져오기의 흔적을 지워 이름을 다시 쓸 수 있게 한다.
+/// 실패한 볼륨 생성·가져오기, 스냅샷 만들기의 흔적을 지워 이름을 다시 쓸 수 있게 한다.
+/// 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
+/// 재시작으로 중단) 작업이 아직 돌고 있을 수 있어 태그를 두고 리소스만 지운다(설계 §6 "태그만 남은 경우").
 async fn cleanup(ctx: &Ctx, task: &Task) {
+    if let TaskOp::SnapshotCreate { snapshot } = task.spec.op
+        && let Err(e) = snapshot::discard_pending(ctx, snapshot).await
+    {
+        tracing::warn!(snapshot = %snapshot, error = %e, "cannot clean up failed snapshot");
+    }
     if let TaskOp::VolumeImport { source, .. } = &task.spec.op {
         let _ = tokio::fs::remove_file(source).await;
     }
@@ -297,11 +327,11 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
             source_format,
         } => import_volume(ctx, id, source, *source_format).await,
         TaskOp::VolumeDelete => delete_volume(ctx, id).await,
+        TaskOp::SnapshotCreate { snapshot } => snapshot::create(ctx, id, *snapshot).await,
+        TaskOp::SnapshotRevert { snapshot } => snapshot::revert(ctx, task, *snapshot).await,
+        TaskOp::SnapshotDelete { snapshot } => snapshot::delete(ctx, id, *snapshot).await,
         // 실행은 뒤에서 붙인다.
-        TaskOp::SnapshotCreate { .. }
-        | TaskOp::SnapshotRevert { .. }
-        | TaskOp::SnapshotDelete { .. }
-        | TaskOp::VolumeResize { .. } => Err("not implemented yet".into()),
+        TaskOp::VolumeResize { .. } => Err("not implemented yet".into()),
     }
 }
 
@@ -392,12 +422,22 @@ async fn reboot(ctx: &Ctx, task: &Task) -> Result<(), String> {
     wait_vm(ctx, id, started).await
 }
 
-/// 이 Task 뒤에 같은 VM에 대한 동작 Task가 만들어졌는지. Task id는 UUIDv7이라 만든 순서대로 커진다.
+/// 이 Task 뒤에 같은 VM의 전원을 바꾸는 Task(동작, 스냅샷 되돌리기)가 만들어졌는지.
+/// 스냅샷 만들기·삭제는 전원을 바꾸지 않으므로 세지 않는다. Task id는 UUIDv7이라 만든 순서대로 커진다.
 fn superseded(ctx: &Ctx, task: &Task) -> Result<bool, String> {
     let (_, tasks) = ctx.cluster.list::<TaskSpec>().map_err(|e| e.to_string())?;
-    Ok(tasks
-        .iter()
-        .any(|t| t.spec.target == task.spec.target && t.id > task.id && !is_volume_op(&t.spec.op)))
+    Ok(tasks.iter().any(|t| {
+        t.spec.target == task.spec.target
+            && t.id > task.id
+            && matches!(
+                t.spec.op,
+                TaskOp::VmStart
+                    | TaskOp::VmStop
+                    | TaskOp::VmForceStop
+                    | TaskOp::VmReboot
+                    | TaskOp::SnapshotRevert { .. }
+            )
+    }))
 }
 
 fn volume_and_pool(ctx: &Ctx, id: Uuid) -> Result<(Volume, StoragePool), String> {
@@ -412,6 +452,34 @@ fn volume_and_pool(ctx: &Ctx, id: Uuid) -> Result<(Volume, StoragePool), String>
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("storage pool {:?} not found", volume.spec.pool))?;
     Ok((volume, pool))
+}
+
+/// 볼륨 스펙의 크기를 바꾼다. 다른 쓰기(라벨 등)를 덮지 않게 다시 읽은 revision으로 쓰고,
+/// 그 사이 바뀌었으면 다시 읽어 쓴다.
+async fn set_volume_size(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), String> {
+    loop {
+        let volume = ctx
+            .cluster
+            .get::<VolumeSpec>(id)
+            .map_err(|e| e.to_string())?
+            .ok_or("volume was deleted")?;
+        if volume.spec.size_bytes == size_bytes {
+            return Ok(());
+        }
+        let spec = VolumeSpec {
+            size_bytes,
+            ..volume.spec.clone()
+        };
+        match ctx
+            .cluster
+            .update_spec(id, Some(volume.revision), volume.labels.clone(), &spec)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// 파일이 준비된 볼륨을 Ready로 기록한다. 실제 크기(qemu-img가 512바이트 단위로 올림하고, 가져온
@@ -535,7 +603,8 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 }
 
 /// 이전 opld가 남긴 고아를 지운다: 이 노드가 만들던, 실행할 Task가 없는 Pending 볼륨(볼륨을 만든
-/// 뒤 Task를 만들기 전에, 또는 업로드 도중 opld가 죽었다)과, 가져오기 Task가 없는 올린 파일.
+/// 뒤 Task를 만들기 전에, 또는 업로드 도중 opld가 죽었다)과 Pending 스냅샷, 가져오기 Task가 없는
+/// 올린 파일.
 /// `tasks`는 `revision`에서 읽은 Task 목록이다. 다른 노드가 만드는 볼륨은 그 노드가 정리한다.
 async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) {
     let unfinished: Vec<&Task> = tasks
@@ -562,6 +631,37 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) {
             }
         }
         Err(e) => tracing::warn!(error = %e, "cannot list volumes"),
+    }
+    match ctx.cluster.list::<SnapshotSpec>() {
+        Ok((_, snapshots)) => {
+            for s in snapshots {
+                if s.revision > revision || s.status.phase != SnapshotPhase::Pending {
+                    continue;
+                }
+                let creates = |t: &&Task| matches!(t.spec.op, TaskOp::SnapshotCreate { snapshot } if snapshot == s.id);
+                if unfinished.iter().any(creates) {
+                    continue;
+                }
+                // 만들던 노드: 끝난 Task가 있으면 그 노드, 없으면(Task를 만들기 전에 API가 죽었다)
+                // API가 Task를 배정했을 노드(`vm_placement`). 그것도 없으면 디스크가 없는 VM이라
+                // 태그가 없으니 어느 노드가 지워도 된다.
+                let vm = ctx.cluster.get::<VmSpec>(s.spec.vm).ok().flatten();
+                let owner = tasks
+                    .iter()
+                    .filter(creates)
+                    .map(|t| t.spec.node)
+                    .next_back()
+                    .or_else(|| vm.and_then(|vm| vm_placement(&ctx.cluster, &vm)));
+                if owner.is_some_and(|n| n != ctx.config.node) {
+                    continue;
+                }
+                tracing::warn!(snapshot = %s.id, vm = %s.spec.vm, "removing a snapshot left unfinished");
+                if let Err(e) = snapshot::discard(ctx, &s).await {
+                    tracing::warn!(snapshot = %s.id, error = %e, "cannot remove snapshot");
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "cannot list snapshots"),
     }
     let Some(dir) = &ctx.config.upload_dir else {
         return;

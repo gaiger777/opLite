@@ -281,6 +281,22 @@ fn apply_command(
             resource.revision = index;
             (kind, resource)
         }
+        Command::UpdateStatusIf {
+            kind,
+            id,
+            expected_revision,
+            status,
+        } => {
+            let Some(mut resource) = load(objects, kind, id)? else {
+                return Ok(Err(Rejection::NotFound { kind, id }));
+            };
+            if let Err(r) = check(Some(expected_revision), resource.revision) {
+                return Ok(Err(r));
+            }
+            resource.status = status;
+            resource.revision = index;
+            (kind, resource)
+        }
         Command::Delete {
             kind,
             id,

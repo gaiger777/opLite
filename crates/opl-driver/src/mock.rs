@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_types::runtime::VmRuntimeSpec;
@@ -23,6 +24,10 @@ struct MockState {
     vms: HashMap<Uuid, u32>,
     next_pid: u32,
     fail_next_start: Option<DriverError>,
+    /// `start`가 이만큼 기다린 뒤에 동작한다.
+    start_delay: Option<Duration>,
+    /// 다음 `snapshot_save`·`snapshot_delete` 한 번을 실패시킬 오류
+    fail_next_snapshot: Option<DriverError>,
     /// 살아 있지만 QMP로 다룰 수 없는 VM
     unresponsive: HashSet<Uuid>,
     console_dir: Option<PathBuf>,
@@ -50,6 +55,17 @@ impl MockHypervisor {
     /// 다음 `start` 한 번을 이 오류로 실패시킨다. 이미 실행 중인 VM에 대한 `start`에는 쓰이지 않는다.
     pub fn fail_next_start(&self, err: DriverError) {
         self.state.lock().unwrap().fail_next_start = Some(err);
+    }
+
+    /// 이후의 `start`가 `delay`만큼 기다린 뒤에 동작하게 한다. 시작 도중에 일어나는 일을 흉내 낸다.
+    pub fn delay_starts(&self, delay: Duration) {
+        self.state.lock().unwrap().start_delay = Some(delay);
+    }
+
+    /// 다음 `snapshot_save`나 `snapshot_delete` 한 번을 이 오류로 실패시킨다. `snapshot_save`는
+    /// 태그를 남긴 채 실패한다(일부 디스크에 만들었거나, 시간 초과로 작업이 아직 돌고 있는 것처럼).
+    pub fn fail_next_snapshot(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_snapshot = Some(err);
     }
 
     /// 게스트 OS 안에서 전원을 끈 것처럼 만든다. `stop(Acpi)` 요청에 게스트가 응한 경우도 이것으로 흉내 낸다.
@@ -139,6 +155,10 @@ impl MockHypervisor {
 #[async_trait]
 impl Hypervisor for MockHypervisor {
     async fn start(&self, vm: &VmRuntimeSpec, restore: Option<&str>) -> Result<(), DriverError> {
+        let delay = self.state.lock().unwrap().start_delay;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         {
             let mut st = self.state.lock().unwrap();
             // 실제 드라이버처럼 이미 실행 중이면 기동을 시도하지 않으므로 주입한 오류도 쓰지 않는다.
@@ -226,12 +246,18 @@ impl Hypervisor for MockHypervisor {
             .entry(id)
             .or_default()
             .push((tag.to_string(), memory));
-        Ok(())
+        match st.fail_next_snapshot.take() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
         let mut st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
+        if let Some(err) = st.fail_next_snapshot.take() {
+            return Err(err);
+        }
         if let Some(snapshots) = st.snapshots.get_mut(&id) {
             snapshots.retain(|(t, _)| t != tag);
         }
@@ -462,6 +488,22 @@ mod tests {
         hv.set_unresponsive(vm.id, true);
         let err = hv.snapshot_save(vm.id, "x", false).await.unwrap_err();
         assert!(err.is_transient(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn injected_snapshot_failure_applies_once() {
+        let hv = MockHypervisor::default();
+        let vm = spec();
+        hv.start(&vm, None).await.unwrap();
+        // 저장은 태그를 남긴 채 실패한다.
+        hv.fail_next_snapshot(DriverError::StartFailed("boom".into()));
+        assert!(hv.snapshot_save(vm.id, "s", true).await.is_err());
+        assert_eq!(hv.snapshots(vm.id), vec![("s".to_string(), true)]);
+        hv.fail_next_snapshot(DriverError::StartFailed("boom".into()));
+        assert!(hv.snapshot_delete(vm.id, "s").await.is_err());
+        assert_eq!(hv.snapshots(vm.id).len(), 1);
+        hv.snapshot_delete(vm.id, "s").await.unwrap();
+        assert!(hv.snapshots(vm.id).is_empty());
     }
 
     #[tokio::test]

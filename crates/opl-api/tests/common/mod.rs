@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,11 +11,15 @@ use opl_api::{AppState, TaskRunner, TaskRunnerConfig, hash_password};
 use opl_cluster::memnet::MemRouter;
 use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig};
-use opl_driver::{DirStorage, Hypervisor, MockHypervisor, Storage};
+use opl_driver::{
+    Capacity, DirStorage, DriverError, Hypervisor, MockHypervisor, Storage, VolumeInfo,
+};
 use opl_reconciler::{Reconciler, ReconcilerConfig, RestartBackoff};
 use opl_types::auth::{Role, UserSpec};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
+use opl_types::runtime::ImageFormat;
+use opl_types::storage::{SourceFormat, StoragePoolSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -50,11 +54,12 @@ pub fn reconciler_config(node: Uuid) -> ReconcilerConfig {
     }
 }
 
-/// API 서버와 같은 업로드 디렉터리를 쓰는 Task 실행기 설정
+/// API 서버와 같은 업로드 디렉터리를 쓰는 Task 실행기 설정. VM 상태 디렉터리는 `{dir}/state`다.
 pub fn runner_config(node: Uuid, dir: &Path) -> TaskRunnerConfig {
     let mut config = TaskRunnerConfig::new(node);
     config.poll_interval = Duration::from_millis(20);
     config.upload_dir = Some(dir.join("uploads"));
+    config.state_dir = Some(dir.join("state"));
     config
 }
 
@@ -132,6 +137,7 @@ impl Env {
         let runner = TaskRunner::spawn(
             cluster.clone(),
             storage,
+            hv_dyn.clone(),
             reconciler.handle(),
             runner_config(node, dir.path()),
         )
@@ -196,11 +202,17 @@ impl Env {
     }
 
     pub async fn start_runner(&mut self) {
-        let storage: Arc<dyn Storage> = Arc::new(DirStorage::new("qemu-img"));
+        self.start_runner_with(Arc::new(DirStorage::new("qemu-img")))
+            .await;
+    }
+
+    /// `storage`를 쓰는 Task 실행기를 띄운다.
+    pub async fn start_runner_with(&mut self, storage: Arc<dyn Storage>) {
         self.runner = Some(
             TaskRunner::spawn(
                 self.cluster.clone(),
                 storage,
+                self.hv.clone(),
                 self.reconciler.as_ref().unwrap().handle(),
                 runner_config(self.node, self.dir.path()),
             )
@@ -361,4 +373,155 @@ pub fn vm_request(name: &str) -> Value {
             "nics": [ { "network": "user", "model": "virtio" } ]
         }
     })
+}
+
+/// 파일 없이 볼륨 호출을 받아 기록하는 스토리지. `pause()` 뒤 처음 오는 `snapshot_revert`나
+/// `resize_volume`은 `resume()`까지 멈춘다. 그사이 테스트가 다른 요청을 끼워 넣는다.
+#[derive(Default)]
+pub struct FakeStorage {
+    calls: std::sync::Mutex<Vec<(&'static str, Uuid)>>,
+    sizes: std::sync::Mutex<std::collections::HashMap<Uuid, u64>>,
+    paused: std::sync::atomic::AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl FakeStorage {
+    pub fn calls(&self) -> Vec<(&'static str, Uuid)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// `volume_info`가 알릴 크기
+    pub fn set_size(&self, id: Uuid, size_bytes: u64) {
+        self.sizes.lock().unwrap().insert(id, size_bytes);
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 멈춘 호출이 들어올 때까지 기다린다.
+    pub async fn reached(&self) {
+        tokio::time::timeout(WAIT, self.reached.notified())
+            .await
+            .expect("paused call");
+    }
+
+    pub fn resume(&self) {
+        self.release.notify_one();
+    }
+
+    async fn record(&self, call: &'static str, id: Uuid) {
+        self.calls.lock().unwrap().push((call, id));
+        if self.paused.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Storage for FakeStorage {
+    async fn create_volume(
+        &self,
+        _: &StoragePoolSpec,
+        id: Uuid,
+        size_bytes: u64,
+        _: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.set_size(id, size_bytes);
+        Ok(PathBuf::new())
+    }
+    async fn import_volume(
+        &self,
+        _: &StoragePoolSpec,
+        _: Uuid,
+        _: &Path,
+        _: SourceFormat,
+        _: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        Err(DriverError::InvalidSpec("not supported".into()))
+    }
+    async fn check_import_source(&self, _: &Path, _: SourceFormat) -> Result<(), DriverError> {
+        Err(DriverError::InvalidSpec("not supported".into()))
+    }
+    async fn delete_volume(
+        &self,
+        _: &StoragePoolSpec,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+    async fn volume_info(
+        &self,
+        _: &StoragePoolSpec,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<VolumeInfo, DriverError> {
+        let size = self.sizes.lock().unwrap().get(&id).copied();
+        let virtual_bytes = size.ok_or(DriverError::VolumeNotFound(id))?;
+        Ok(VolumeInfo {
+            virtual_bytes,
+            allocated_bytes: 0,
+        })
+    }
+    async fn capacity(&self, _: &StoragePoolSpec) -> Result<Capacity, DriverError> {
+        Ok(Capacity {
+            total_bytes: 1 << 40,
+            available_bytes: 1 << 40,
+        })
+    }
+    fn supports_snapshots(&self, format: ImageFormat) -> bool {
+        format == ImageFormat::Qcow2
+    }
+    async fn snapshot_create(
+        &self,
+        _: &StoragePoolSpec,
+        id: Uuid,
+        _: ImageFormat,
+        _: &str,
+    ) -> Result<(), DriverError> {
+        self.record("create", id).await;
+        Ok(())
+    }
+    async fn snapshot_revert(
+        &self,
+        _: &StoragePoolSpec,
+        id: Uuid,
+        _: ImageFormat,
+        _: &str,
+    ) -> Result<(), DriverError> {
+        self.record("revert", id).await;
+        Ok(())
+    }
+    async fn snapshot_delete(
+        &self,
+        _: &StoragePoolSpec,
+        id: Uuid,
+        _: ImageFormat,
+        _: &str,
+    ) -> Result<(), DriverError> {
+        self.record("delete", id).await;
+        Ok(())
+    }
+    async fn snapshot_tags(
+        &self,
+        _: &StoragePoolSpec,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<Vec<String>, DriverError> {
+        Ok(vec![])
+    }
+    async fn resize_volume(
+        &self,
+        _: &StoragePoolSpec,
+        id: Uuid,
+        _: ImageFormat,
+        size_bytes: u64,
+    ) -> Result<(), DriverError> {
+        self.record("resize", id).await;
+        self.set_size(id, size_bytes);
+        Ok(())
+    }
 }

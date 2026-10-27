@@ -20,7 +20,7 @@ use crate::auth::{Action, Principal};
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
 use crate::scheduler::{Inventory, schedule};
-use crate::snapshots::count_snapshots;
+use crate::snapshots::{check_no_snapshot_task, count_snapshots};
 use crate::state::AppState;
 use crate::tasks::create_task;
 
@@ -161,6 +161,7 @@ pub async fn update_vm(
     for _ in 0..10 {
         let _lock = state.vm_lock.lock().await;
         let current = lookup::<VmSpec>(&state.cluster, &key)?;
+        check_no_snapshot_task(&state, &current)?;
         if let Some(expected) = expected
             && expected != current.revision
         {
@@ -272,7 +273,11 @@ pub async fn vm_action(
     if query.mode == StopMode::Force && action != "stop" {
         return Err(ApiError::bad_request("mode=force applies only to stop"));
     }
-    let id = lookup::<VmSpec>(&state.cluster, &key)?.id;
+    let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    // 강제 정지도 막는다. 되돌리기가 디스크를 바꾸는 중에 끄고 켜는 것이 섞이면 안 되고, 만들기
+    // 중에 끄면 저장이 끊긴다. 멈춘 스냅샷 Task도 실행기의 시간 제한으로 끝난다.
+    check_no_snapshot_task(&state, &vm)?;
+    let id = vm.id;
     let (op, vm) = match action.as_str() {
         "start" => {
             let _lock = state.vm_lock.lock().await;

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::{Env, vm};
 use opl_driver::{DriverError, Hypervisor, StopMode};
-use opl_types::vm::{DiskBus, DiskSpec, PowerState, RestartPolicy, VmPhase, VmStatus};
+use opl_types::vm::{DiskBus, DiskSpec, PowerState, RestartPolicy, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
 
 fn running(v: &opl_types::vm::Vm) -> bool {
@@ -496,4 +496,30 @@ async fn failed_restore_marks_failed_and_consumes_tag() {
         env.hv.launches(),
         vec![(vm.id, Some("snap-1".into())), (vm.id, None)]
     );
+}
+
+#[tokio::test]
+async fn status_writes_keep_snapshot_position_written_meanwhile() {
+    let env = Env::start().await;
+    let vm = stopped_vm(&env).await;
+
+    // 작업자가 VM을 읽고 시작하는 사이에 Task 실행기가 현재 스냅샷 위치를 쓴다.
+    env.hv.delay_starts(Duration::from_millis(300));
+    env.set_power(vm.id, PowerState::Running).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let current = env.get(vm.id);
+    assert_ne!(current.status.phase, VmPhase::Running);
+    let snapshot = Uuid::now_v7();
+    let status = VmStatus {
+        snapshot: Some(snapshot),
+        ..current.status.clone()
+    };
+    env.cluster
+        .update_status_checked::<VmSpec>(vm.id, current.revision, &status)
+        .await
+        .unwrap();
+
+    // 작업자가 쓴 Running status가 그 값을 덮지 않는다.
+    env.wait(vm.id, "running", running).await;
+    assert_eq!(env.get(vm.id).status.snapshot, Some(snapshot));
 }

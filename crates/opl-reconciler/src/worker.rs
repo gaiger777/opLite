@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
 use opl_types::vm::{PowerState, RestartPolicy, Vm, VmPhase, VmSpec, VmStatus};
@@ -154,9 +155,7 @@ impl Worker {
             let status = self.reconcile(&vm).await?;
             if self.power_off.is_none() {
                 if status != vm.status {
-                    self.cluster
-                        .update_status::<VmSpec>(self.id, &status)
-                        .await?;
+                    self.write_status(status, vm).await?;
                 }
                 return Ok(());
             }
@@ -375,15 +374,39 @@ impl Worker {
         self.hv.start(&spec, None).await.map_err(|e| e.to_string())
     }
 
+    /// `vm`을 읽은 뒤 계산한 status를 기록한다. `snapshot`(현재 스냅샷 위치)은 Task 실행기가 쓰는
+    /// 값이므로 저장소의 것을 지킨다: revision을 확인하며 쓰고, 그 사이 누가 썼으면 다시 읽어
+    /// 그 `snapshot`으로 다시 쓴다. 나머지 필드는 전처럼 이 작업자가 계산한 값으로 덮는다.
+    async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
+        loop {
+            status.snapshot = vm.status.snapshot;
+            match self
+                .cluster
+                .update_status_checked::<VmSpec>(self.id, vm.revision, &status)
+                .await
+            {
+                Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {
+                    match self.cluster.get::<VmSpec>(self.id)? {
+                        Some(current) => vm = current,
+                        None => return Ok(()),
+                    }
+                }
+                r => return r.map(|_| ()).map_err(Into::into),
+            }
+        }
+    }
+
     /// spec.power를 stopped로 바꾸고 status를 기록한다. 둘 다 성공해야 끝난다.
-    async fn write_power_off(&mut self, vm: Vm) -> Result<(), StepError> {
+    async fn write_power_off(&mut self, mut vm: Vm) -> Result<(), StepError> {
         let error = self.power_off.clone().flatten();
         if vm.spec.power == PowerState::Running {
             let mut spec = vm.spec.clone();
             spec.power = PowerState::Stopped;
             // 이 단계에서 읽은 뒤 spec이 바뀌었으면 RevisionMismatch로 거부된다. 다음 단계에서
             // 다시 읽은 revision으로 쓰므로, 그 사이 사용자가 바꾼 spec.power도 stopped로 덮어쓴다.
-            self.cluster
+            // status는 방금 쓴 revision으로 곧바로 이어 쓴다.
+            vm.revision = self
+                .cluster
                 .update_spec(self.id, Some(vm.revision), vm.labels.clone(), &spec)
                 .await?;
         }
@@ -398,9 +421,7 @@ impl Worker {
             last_error: error,
             snapshot: vm.status.snapshot,
         };
-        self.cluster
-            .update_status::<VmSpec>(self.id, &status)
-            .await?;
+        self.write_status(status, vm).await?;
         self.power_off = None;
         self.backoff = None;
         self.failures.clear();
