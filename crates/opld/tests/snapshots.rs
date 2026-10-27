@@ -1,4 +1,5 @@
-//! 실제 QEMU로 VM 스냅샷(만들기·되돌리기·삭제)과 볼륨 크기 늘리기를 데몬 전체를 거쳐 확인한다.
+//! 실제 QEMU로 VM 스냅샷(만들기·되돌리기·삭제), 볼륨 크기 늘리기, VM 복제(꺼진 VM, 실행 중인 VM의
+//! 스냅샷), 예약 스냅샷(짧은 주기로 만들고 보관 개수대로 지우기)을 데몬 전체를 거쳐 확인한다.
 //! 꺼진 VM은 oplctl로, 실행 중인 VM은 응답을 자세히 보려고 API를 직접 부른다. 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용이
 //! 돌아오는지는 정지한 VM에서 `qemu-io`로 본다.
 //! `cargo test -p opld --features qemu-it --test snapshots`
@@ -9,8 +10,9 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
-use common::Daemon;
+use common::{Daemon, eventually};
 use oplctl::Client;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -123,6 +125,20 @@ fn qemu_io(file: &Path, cmd: &str) -> bool {
         .status()
         .expect("run qemu-io")
         .success()
+}
+
+/// 볼륨 `name`의 파일(풀 `local`의 qcow2)
+async fn volume_file(d: &Daemon, c: &Client, name: &str) -> PathBuf {
+    let volume = c.get(&format!("/volumes/{name}")).await.unwrap();
+    assert_eq!(volume["status"]["phase"], "ready", "{volume}");
+    d.path("pool")
+        .join(format!("{}.qcow2", volume["id"].as_str().unwrap()))
+}
+
+/// VM `web`의 스냅샷 목록
+async fn snapshots(c: &Client) -> Vec<Value> {
+    let list = c.get("/vms/web/snapshots").await.unwrap();
+    list["items"].as_array().unwrap().clone()
 }
 
 fn sorted(mut v: Vec<String>) -> Vec<String> {
@@ -313,6 +329,225 @@ async fn stopped_vm_snapshot_restores_disk_content() {
     assert!(out.contains("vm web deleted"), "{out}");
     assert!(tags(&file).is_empty());
     assert!(qemu_io(&file, "read -P 0xab 0 64k"));
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    d.stop();
+}
+
+#[tokio::test]
+async fn stopped_vm_clone_copies_disk_content() {
+    let mut d = Daemon::new("node1", "");
+    let file = setup(&mut d).await;
+    let c = client(&d);
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--nic", "user",
+    ])
+    .await
+    .unwrap();
+    assert!(qemu_io(&file, "write -P 0xab 0 64k"));
+
+    // 꺼진 VM은 지금 디스크 내용을 복사한다.
+    run(&c, "/vms/web/clone", json!({ "name": "copy" })).await;
+    let web = vm(&c).await;
+    let copy = c.get("/vms/copy").await.unwrap();
+    assert_eq!(copy["spec"]["disks"][0]["volume"], "copy-root", "{copy}");
+    assert_eq!(copy["spec"]["memory_mib"], 256, "{copy}");
+    assert_eq!(copy["spec"]["power"], "stopped", "{copy}");
+    assert_eq!(copy["spec"]["node"], Value::Null, "{copy}");
+    let mac = &copy["spec"]["nics"][0]["mac"];
+    assert!(mac.is_string(), "{copy}");
+    assert_ne!(mac, &web["spec"]["nics"][0]["mac"], "{copy} {web}");
+    let copy_file = volume_file(&d, &c, "copy-root").await;
+    assert!(qemu_io(&copy_file, "read -P 0xab 0 64k"));
+
+    // 복사본은 원본과 따로다.
+    assert!(qemu_io(&file, "write -P 0xcd 0 64k"));
+    assert!(qemu_io(&copy_file, "read -P 0xab 0 64k"));
+    // 복제가 끝나면 원본을 다시 다룰 수 있다.
+    assert_eq!(vm(&c).await["spec"]["disks"][0]["volume"], "root");
+
+    d.ctl(&["vm", "delete", "copy"]).await.unwrap();
+    d.ctl(&["volume", "delete", "copy-root"]).await.unwrap();
+    assert!(!copy_file.exists());
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    d.stop();
+}
+
+#[tokio::test]
+async fn running_vm_snapshot_clone_starts() {
+    let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
+    let file = setup(&mut d).await;
+    let c = client(&d);
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--nic", "user",
+    ])
+    .await
+    .unwrap();
+    assert!(qemu_io(&file, "write -P 0xab 0 64k"));
+    d.ctl(&["vm", "start", "web"]).await.unwrap();
+    run(&c, "/vms/web/snapshots", json!({ "name": "base" })).await;
+    let base = snapshot(&c, "base").await;
+    assert_eq!(base["spec"]["memory"], true, "{base}");
+    // 스냅샷 뒤에 디스크를 바꾸고 다시 켠다(실행 중에는 디스크에 쓸 수 없다).
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&file, "write -P 0xcd 0 64k"));
+    d.ctl(&["vm", "start", "web"]).await.unwrap();
+    let web = vm(&c).await;
+    let pid = web["status"]["pid"].as_u64().unwrap();
+
+    // 실행 중인 VM의 스냅샷에서 복제한다. QEMU가 디스크를 쥔 채로 복사하고 VM은 계속 돈다.
+    run(
+        &c,
+        "/vms/web/clone",
+        json!({ "name": "copy", "snapshot": "base" }),
+    )
+    .await;
+    let v = vm(&c).await;
+    assert_eq!(v["status"]["phase"], "running", "{v}");
+    assert_eq!(v["status"]["pid"].as_u64(), Some(pid), "{v}");
+
+    // 새 디스크는 지금 내용이 아니라 스냅샷의 내용을 담고 스냅샷 태그는 없다.
+    let copy_file = volume_file(&d, &c, "copy-root").await;
+    assert!(tags(&copy_file).is_empty());
+    assert!(qemu_io(&copy_file, "read -P 0xab 0 64k"));
+    // UEFI 변수는 스냅샷의 사본을 받는다(BIOS VM이면 둘 다 없다).
+    let copy = c.get("/vms/copy").await.unwrap();
+    let vm_dir = |id: &Value| d.data_dir().join("vm").join(id.as_str().unwrap());
+    let snapshot_vars = vm_dir(&web["id"])
+        .join("snapshots")
+        .join(format!("{}.vars", base["id"].as_str().unwrap()));
+    let copy_vars = vm_dir(&copy["id"]).join("uefi-vars.fd");
+    assert_eq!(snapshot_vars.exists(), copy_vars.exists());
+    if copy_vars.exists() {
+        assert_eq!(
+            std::fs::read(&snapshot_vars).unwrap(),
+            std::fs::read(&copy_vars).unwrap()
+        );
+    }
+
+    // 복제한 VM은 원본과 함께 따로 돈다.
+    let out = d.ctl(&["vm", "start", "copy"]).await.unwrap();
+    assert!(out.contains("vm copy: start done"), "{out}");
+    let copy = c.get("/vms/copy").await.unwrap();
+    assert_eq!(copy["status"]["phase"], "running", "{copy}");
+    assert_ne!(copy["status"]["pid"].as_u64(), Some(pid), "{copy}");
+
+    d.ctl(&["vm", "stop", "copy", "--force"]).await.unwrap();
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&["vm", "delete", "copy"]).await.unwrap();
+    d.ctl(&["volume", "delete", "copy-root"]).await.unwrap();
+    d.ctl(&["vm", "delete", "web", "--with-snapshots"])
+        .await
+        .unwrap();
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    d.stop();
+}
+
+/// VM `web`의 예약을 바꾼다. 스냅샷 Task가 도는 동안은 수정이 `vm_busy`라 다시 한다.
+async fn set_schedule(c: &Client, schedule: Value) {
+    eventually("schedule update", || {
+        let schedule = schedule.clone();
+        async move {
+            let mut spec = vm(c).await["spec"].clone();
+            spec["snapshot_schedule"] = schedule;
+            match c.put("/vms/web", &json!({ "spec": spec })).await {
+                Ok(_) => true,
+                Err(e) if e.to_string().contains("vm_busy") => false,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn schedule_creates_and_prunes_snapshots() {
+    // 한 시간이 1초인 예약
+    let mut d = Daemon::new(
+        "node1",
+        "[reconciler]\nacpi_timeout_secs = 5\n[schedule]\ntick_secs = 1\nhour_secs = 1\n",
+    );
+    let file = setup(&mut d).await;
+    let c = client(&d);
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--start",
+    ])
+    .await
+    .unwrap();
+    // 사용자가 만든 스냅샷은 세지도 지우지도 않는다.
+    run(
+        &c,
+        "/vms/web/snapshots",
+        json!({ "name": "mine", "memory": false }),
+    )
+    .await;
+    set_schedule(&c, json!({ "every": "hourly", "keep": 2 })).await;
+
+    // 넷 이상 만들어질 때까지 본다. 넘친 것은 다음 tick에 지우고 그동안 새로 만들지 않으므로
+    // 예약 스냅샷은 많아야 keep+1개다.
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while seen.len() < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "only {} scheduled:\n{}",
+            seen.len(),
+            d.log()
+        );
+        let all = snapshots(&c).await;
+        assert!(all.iter().any(|s| s["spec"]["name"] == "mine"), "{all:?}");
+        let auto: Vec<&Value> = all
+            .iter()
+            .filter(|s| s["spec"]["scheduled"] == true)
+            .collect();
+        assert!(auto.len() <= 3, "{auto:?}");
+        for s in auto {
+            assert!(
+                s["spec"]["name"].as_str().unwrap().starts_with("auto-"),
+                "{s}"
+            );
+            assert_eq!(s["spec"]["memory"], false, "{s}");
+            let id = s["id"].as_str().unwrap().to_string();
+            if !seen.contains(&id) {
+                seen.push(id);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    set_schedule(&c, Value::Null).await;
+
+    // 예약을 끄고 도는 Task가 끝나면, 디스크의 태그와 스냅샷 리소스가 같다. 가장 먼저 만든 것은 지웠다.
+    let (c, file) = (&c, file.as_path());
+    eventually("snapshots settle", move || async move {
+        let all = snapshots(c).await;
+        let ids = all
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        all.iter().all(|s| s["status"]["phase"] == "ready") && sorted(ids) == tags(file)
+    })
+    .await;
+    let left = snapshots(c).await;
+    let auto: Vec<String> = left
+        .iter()
+        .filter(|s| s["spec"]["scheduled"] == true)
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!((2..=3).contains(&auto.len()), "{left:?}");
+    assert!(!auto.contains(&seen[0]), "{left:?}");
+    assert!(left.iter().any(|s| s["spec"]["name"] == "mine"), "{left:?}");
+    for id in &auto {
+        assert_eq!(vm_state_size(file, id), 0);
+    }
+    let v = vm(c).await;
+    assert_eq!(v["status"]["schedule_error"], Value::Null, "{v}");
+    assert_eq!(v["status"]["phase"], "running", "{v}");
+
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&["vm", "delete", "web", "--with-snapshots"])
+        .await
+        .unwrap();
+    assert!(tags(file).is_empty());
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     d.stop();
 }

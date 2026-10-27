@@ -266,6 +266,13 @@ impl Drop for Daemon {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // 테스트가 중간에 실패해도 이 데몬이 띄운 QEMU(데몬과 따로 돈다)를 남기지 않는다.
+        // 명령줄에 이 임시 디렉터리의 경로가 든 프로세스만 맞는다.
+        let _ = Command::new("pkill")
+            .arg("-KILL")
+            .arg("-f")
+            .arg(self.path("run").join("vm").display().to_string())
+            .status();
     }
 }
 
