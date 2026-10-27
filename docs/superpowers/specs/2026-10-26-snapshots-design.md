@@ -52,13 +52,15 @@ VM의 한 순간(디스크, 실행 중이면 메모리, VM 설정)을 저장했�
 
 - `status.snapshot`: 현재 위치(마지막으로 만들었거나 되돌린 스냅샷). 다음 스냅샷의 부모.
 - `spec.snapshot_schedule` (계획 11): `{every: hourly|daily|weekly, keep: 1..=100, memory: bool}`. 기본은 없음, `memory` 기본 false.
-- `status.schedule_error` (계획 11): 마지막 예약 스냅샷 실패 이유.
+- `status.schedule_error` (계획 11): 마지막 예약 스냅샷 실패 이유. reconciler의 상태 쓰기는 `snapshot`처럼 이 필드도 저장소 것을 지킨다.
 
 기존 VM은 새 필드가 기본값이라 그대로 읽힌다.
 
 ### Task 종류
 
 `snapshot-create`, `snapshot-revert`, `snapshot-delete`, `volume-resize`, `vm-clone`(계획 11). 스냅샷·복제 Task는 VM의 디스크를 쓸 노드에서 돈다: `spec.node`(꺼진 VM을 옮겼으면 옮긴 노드), 없으면 `status.node`, 배치된 적이 없으면 첫 디스크 볼륨의 노드(`status.node`), 그것도 없으면 API를 받은 노드. 크기 늘리기는 볼륨을 쓰는 VM에 같은 순서(API 노드 대신 볼륨의 노드)를 쓰고, 쓰는 VM이 없으면 볼륨의 노드에서 돈다(§5). 시작할 때의 고아 정리도 같은 순서로 주인 노드를 정한다(§6).
+
+`vm-clone`(`{name, snapshot?, pool?}`)의 대상은 **원본 VM**이다. 원본 VM의 줄에 서서 그 VM의 스냅샷 Task와 차례로 돈다.
 
 ## 4. 드라이버
 
@@ -68,7 +70,7 @@ VM의 한 순간(디스크, 실행 중이면 메모리, VM 설정)을 저장했�
   - 구현: `Hypervisor::start(vm, restore: Option<tag>)`. reconciler는 VM별 "불러올 태그"를 공유 맵에 둔다(`restore_on_start`·`clear_restore`). 채널이 아니라 맡기는 즉시 보이고 `power` 쓰기와 순서가 꼬이지 않는다. 작업자가 새로 띄울 때만 꺼내 쓴다(다시 붙기에는 없음). 이미 살아 있는 VM에는 무시한다.
   - 태그가 있던 시작이 실패하면 일시 오류라도 재시도 없이 `failed`. 태그는 한 번 쓰면 사라진다. VM 삭제·다른 노드로 옮김에도 버린다.
   - 맵은 메모리에만 있다. 되돌리기와 시작 사이에 opld가 재시작하면 태그가 사라지고 VM은 처음부터 부팅한다.
-- **`Storage` 트레잇**에 정지한 볼륨용 메서드: `snapshot_create/revert/delete(pool, volume, format, tag)`, `snapshot_tags`(`qemu-img info -U`의 스냅샷 이름), `resize_volume`, `copy_volume(src, tag: Option, dst)`(계획 11). 같은 태그 만들기는 거부하고, 삭제는 겹친 태그를 모두 지운다. 줄이기는 `qemu-img`가 거부한다. 백엔드가 스냅샷을 지원하는지 알리는 `supports_snapshots(format)`을 둔다. `dir` 백엔드는 qcow2만 지원한다. 뒤의 LVM·ZFS·RBD는 자기 방식으로 구현한다.
+- **`Storage` 트레잇**에 정지한 볼륨용 메서드: `snapshot_create/revert/delete(pool, volume, format, tag)`, `snapshot_tags`(`qemu-img info -U`의 스냅샷 이름), `resize_volume`, `copy_volume(src_pool, src_id, format, tag: Option, force_share, dst_pool, dst_id)`(계획 11, `qemu-img convert -q -f F [-U] [-l snapshot.name=T] -O F`. 대상이 이미 있으면 `VolumeExists`, raw에 태그를 주면 거부. 가져오기처럼 임시 파일에 쓴 뒤 hard link로 게시한다). 같은 태그 만들기는 거부하고, 삭제는 겹친 태그를 모두 지운다. 줄이기는 `qemu-img`가 거부한다. 백엔드가 스냅샷을 지원하는지 알리는 `supports_snapshots(format)`을 둔다. `dir` 백엔드는 qcow2만 지원한다. 뒤의 LVM·ZFS·RBD는 자기 방식으로 구현한다.
 - **같은 VM의 작업 직렬화:** Task 실행기의 대상별 줄(`by_target`)을 VM에도 쓴다. 같은 VM의 스냅샷 Task와 전원 Task가 한 노드에서 동시에 돌지 않는다. reconciler의 시작·정지와는 VM 상태(안정 상태 검사)와 Task 안의 재확인으로 겹치지 않게 한다.
 - **조건부 상태 쓰기:** reconciler와 Task가 같은 VM `status`를 쓴다. 통째 교체면 Task가 옮긴 현재 위치를 reconciler가 덮는다. 그래서 revision을 확인하는 새 Raft 명령 `UpdateStatusIf { kind, id, expected_revision, status }`를 더했다(`Cluster::update_status_checked`). 기존 `UpdateStatus`는 형식 그대로 둔다. `UpdateStatus`에 선택 필드를 더하면 옛 노드가 그 필드를 버리고 확인 없이 덮어쓰기 때문이다. 옛 노드는 모르는 명령을 오류로 처리한다(노드 코어 설계 3.1절). reconciler의 쓰기는 revision이 다르면 다시 읽어 `snapshot`만 저장소 것을 쓰고 나머지는 전처럼 덮는다. Task의 위치 쓰기도 revision을 확인한다.
 
@@ -129,21 +131,25 @@ UEFI 변수를 복사하고 `ready`로 바꾸고 VM의 `status.snapshot`을 이 
 - "실행 중" = VM phase가 `stopped`·`failed`가 아님. Task 안에서 `ready`·크기·VM 상태를 다시 본다. 시작·정지 중이면 실패다. QEMU 디스크 번호는 VM 스펙의 디스크 순서(`disk{i}`)다.
 - 차례: 같은 디스크의 스냅샷 Task와 겹치지 않게, 크기 늘리기는 볼륨이 아니라 그 볼륨을 쓰는 VM의 줄에 세운다(스펙에서 쓰는 VM → 그 볼륨을 담은 스냅샷의 VM → 없으면 볼륨). 줄은 노드별이라, 꺼진 VM이 쓰는 볼륨도 그 VM의 스냅샷 Task가 돌 노드(§3 순서)로 보낸다. 스펙 크기는 다시 읽은 revision으로 쓴다. API에서 거절하는 방식은 노드 간 확인·실행 틈이 남아 택하지 않았다.
 
-### 복제 (계획 11) — `POST /vms/{vm}/clone {name, snapshot?, pool?}` → 202
+### 복제 (계획 11) — `POST /vms/{key}/clone {name, snapshot?, pool?}` → 202
 
-- 원본: 스냅샷, 또는 정지한 VM의 지금 상태. 실행 중인데 스냅샷을 주지 않으면 409 `vm_running`.
-- 원본 VM 스펙(스냅샷이면 `vm_spec`)의 디스크마다 새 볼륨 `{새 VM}-{원래 볼륨}`(63자로 자르고, 겹치면 `-2`, `-3`)을 만들고 `qemu-img convert`(스냅샷이면 `-l snapshot.name=<id>`)로 복사한다.
-- 대상 풀은 원본 볼륨의 노드에서 쓸 수 있어야 한다(기본은 원본과 같은 풀).
-- 새 VM: MAC 새로, `node` 없음, `power: stopped`, 예약 없음, 스냅샷 없음.
-- 실패하면 만든 볼륨을 지운다.
+- 원본: 스냅샷(이름 또는 id, `ready`가 아니면 409 `snapshot_not_ready`), 또는 정지한 VM의 지금 상태. 실행 중인데 스냅샷을 주지 않으면 409 `vm_running`. 원본 VM이 바쁘면(만들기의 안정 상태 검사) 409 `vm_busy`.
+- 이름 규칙, 같은 이름 VM이 있으면 409 `name_taken`(API는 VM 리소스만 본다. 진행 중인 다른 복제와 겹치면 늦은 Task가 VM을 만들 때 실패한다). `pool`은 있어야 하고(400) Task 노드에서 쓸 수 있어야 한다(409 `pool_not_on_node`). 원본 스펙의 볼륨은 있는지만 본다(400). `ready`·노드는 Task가 본다.
+- 복제 Task가 끝나지 않았으면 원본 VM의 동작·수정·삭제는 `vm_busy`다(꺼진 VM을 복사하는 동안 켜면 `qemu-img` 잠금으로 시작이 실패한다). 원본의 전원은 바꾸지 않으므로 전원 Task의 `superseded` 검사는 그대로다.
+- Task: 원본을 다시 읽고 같은 조건을 다시 본다. 디스크마다 원본 볼륨이 이 노드에 있고 `ready`여야 하며, 대상 풀(요청 풀, 없으면 원본 볼륨의 풀)을 이 노드에서 쓸 수 있어야 한다. 새 볼륨 `{새 VM}-{원래 볼륨}`(63자로 자르고 끝의 `-`는 뗀다, 겹치면 `-2`, `-3`…)을 원본과 같은 형식·크기로 `pending`(`status.node` = 이 노드)으로 만들고 `copy_volume`(스냅샷이면 태그 = 스냅샷 id)으로 복사한다. `-U`는 스냅샷에서 복사하고 원본 VM이 완전히 꺼지지 않았을 때만 쓴다. 모든 디스크를 복사하면 UEFI 변수(스냅샷이면 그 사본, 아니면 지금 변수 파일, 없으면 건너뜀)를 새 VM 자리로 복사하고, 볼륨을 `ready`로 바꾼 뒤 새 VM을 만든다.
+- 새 VM: 원본 스펙에서 디스크 볼륨 이름만 바꾸고, MAC 새로(다른 VM과 겹치지 않게), `node` 없음, `power: stopped`, 예약 없음, 스냅샷 없음, 라벨 없음.
+- 실패·Task 시간 초과면 이 Task가 만든 볼륨(파일과 리소스)과 변수 사본을 지운다. 이름 경합(새 볼륨·VM 이름이 그새 쓰임)도 다시 시도하지 않고 실패다.
 
 ### 예약 스냅샷 (계획 11)
 
-리더에서 1분마다 도는 반복 작업(`NodeMonitor`와 같은 모양: 리더 확인 → `read_barrier` → 목록).
-- 예약이 있는 VM마다, 마지막 예약 스냅샷의 `created_at`에서 주기가 지났으면 `auto-YYYYMMDD-HHMM`(UTC) 스냅샷을 만든다. 실행 중이고 `memory`면 메모리 포함.
-- 만든 뒤 `scheduled`인 스냅샷이 `keep`개를 넘으면 오래된 것부터 지운다. 사용자가 만든 스냅샷은 지우지 않는다.
-- 만들 수 없으면(raw 디스크, VM 바쁨, 노드 오프라인) `status.schedule_error`에 남기고 다음 주기에 다시 본다. 성공하면 지운다.
-- 같은 VM에 예약 Task가 이미 돌고 있으면 건너뛴다.
+리더에서 `tick`(기본 60초)마다 도는 반복 작업 `SnapshotScheduler`(`schedule.rs`, `NodeMonitor`와 같은 모양: 리더 확인 → `read_barrier` → 목록). 할 일은 순수 함수 `plan`이 정한다.
+- 이 VM의 스냅샷 만들기·되돌리기·삭제나 복제 Task가 끝나지 않았거나 `pending` 스냅샷이 있으면 건너뛴다.
+- 보관: `scheduled`이고 `ready`인 스냅샷이 `keep`개보다 많으면 가장 오래된 것(`created_at`) 하나를 지우고 그 tick에는 만들지 않는다. 한 번에 하나라, 만든 뒤 다음 tick에 지울 때까지 잠시 `keep + 1`개가 있다. 사용자가 만든 스냅샷은 지우지 않는다. 지우려 한(요청했거나 4xx로 거절된) 스냅샷의 id와 시각을 기억해, 끝나지 않은 Task 없이 그 스냅샷이 아직 있으면 지우기가 실패한 것으로 보고 그 삭제는 `hour` 뒤에 다시 한다. 그동안은 만들기 판단으로 넘어간다(보관 정리가 막혀도 새 스냅샷은 만든다).
+- 만들기: 마지막 예약 스냅샷의 `created_at`에서 주기가 지났으면(없으면 바로) `auto-YYYYMMDD-HHMM`(UTC, 겹치면 `-2`…) 이름, 빈 설명으로 만든다. 마지막 만들기 시도는 종류와 시각을 기억한다: 4xx로 거절되었으면(바쁨, 노드 오프라인 등 잠깐일 수 있다) `hour` 뒤에, Task를 보냈는데 실패했으면 **다음 주기**에 다시 한다(둘 중 늦은 때). 5xx는 시도로 세지 않아 다음 tick에 다시 한다. 시도는 메모리에만 있어 리더가 바뀌거나 opld가 재시작하면 잊고 한 번 일찍 다시 시도한다. `memory`는 `schedule.memory && phase running && 디스크 있음`.
+- 요청은 API 핸들러와 같은 함수(`start_create`·`start_delete`)로 해 같은 검사를 받는다. Task 노드(`vm_placement`)가 노드 목록에 없거나 오프라인이면 요청하지 않고 `node_offline`으로 거절된 것으로 본다(노드를 정할 수 없으면 보지 않는다).
+- `schedule_error`: 4xx 거절이면 그 메시지(예: raw 디스크면 `snapshot_unsupported`, 시작·정지 중이면 `vm_busy`, 노드 오프라인)를 쓴다. 보관 삭제의 거절도 쓴다. 5xx(리더를 잃는 등)는 로그만. 예약으로 만든 스냅샷의 만들기 Task는 끝날 때 성공이면 지우고 실패(시간 초과·재시작 중단 포함)면 Task 오류를 쓴다. 보관 삭제 Task는 실패하면 오류를 쓰고, 성공해도 지우지 않는다(만들기가 성공해야 지운다). 같은 값이면 쓰지 않고, 조건부 쓰기(`update_status_checked`, revision이 다르면 다시 읽어 쓰기)로 쓴다. 예약을 꺼도 지우지 않는다.
+- 주기: hourly = `hour`, daily = 24×`hour`, weekly = 168×`hour`. `opld` 설정 `[schedule] tick_secs = 60, hour_secs = 3600`(0은 거부, 테스트만 줄인다).
+- 되돌리기는 VM의 지금 `snapshot_schedule`을 지킨다(스냅샷 스펙의 예약으로 되돌리지 않는다). 예약 설정은 VM 수정(PUT, VM Write)이다.
 
 ## 6. 일관성과 장애
 
@@ -151,6 +157,7 @@ UEFI 변수를 복사하고 `ready`로 바꾸고 VM의 `status.snapshot`을 이 
 - **메모리 복원 대기 중 재시작:** 불러올 태그는 메모리에만 있어 사라진다. VM은 메모리 상태 없이 처음부터 부팅한다(§4).
 - **되돌리기 중단:** 디스크 일부만 되돌아간 채 멈추면 VM은 정지 상태로 남고 Task는 실패다. 같은 되돌리기를 다시 하면 처음부터 다시 한다(`-a`는 몇 번 해도 같다).
 - **삭제 중단:** 태그가 없으면 성공으로 보므로 다시 하면 된다.
+- **복제 중단:** 실패·시간 초과는 Task가 정리한다. opld가 죽으면 복사 중이던 볼륨은 아직 `pending`이라 다음 시작의 볼륨 고아 정리가 지운다(이미 복사한 UEFI 변수 사본은 남는다). 볼륨을 `ready`로 바꾼 뒤 새 VM을 만들기 전에 죽으면 볼륨도 남는다(§11).
 - **태그만 남은 경우:** 리소스 없이 디스크에 남은 태그는 공간만 쓴다. 자동으로 지우지 않고, 노드에서 `qemu-img snapshot -l`로 볼 수 있다. 만들기가 시간 초과로 끝나도 태그가 남는다(§5).
 
 ## 7. 권한
@@ -167,12 +174,14 @@ UEFI 변수를 복사하고 `ready`로 바꾸고 VM의 `status.snapshot`을 이 
 | `oplctl vm delete <vm> --with-snapshots` | 10 |
 | `oplctl volume resize <볼륨> --size 20G` | 10 |
 | `oplctl vm clone <vm> <새 이름> [--snapshot …] [--pool …]` | 11 |
-| VM 수정에 `--snapshot-every hourly|daily|weekly --snapshot-keep N [--snapshot-memory]`, `--no-snapshot-schedule` | 11 |
+| `oplctl vm snapshot schedule <vm> [--every hourly\|daily\|weekly --keep N [--memory] \| --off]` | 11 |
 
 명령은 Task가 끝날 때까지 기다린다.
 
 - `list` 열: 현재 위치 `*`, NAME(`├─`/`└─` 나무, 형제는 id 차례, 목록에 없는 부모면 뿌리), CREATED(UTC, `2026-10-26 07:34 UTC`, `ready`가 아니면 `pending`), MEMORY(true/false), DESCRIPTION. `-o json`이면 `items` 배열.
 - `--no-memory`면 `memory: false`를 보낸다. 아니면 생략해 서버 기본을 따른다.
+- 예약: CLI에 VM 수정 명령이 없어 처음 생각한 VM 수정 옵션 대신 `vm snapshot schedule`을 둔다. `--every`와 `--keep`은 함께 써야 하고 `--off`는 다른 옵션과 함께 쓸 수 없다. 옵션이 없으면 지금 예약(`schedule: daily, keep 7, with memory` / `schedule: off`)과 마지막 예약 실패(`last error: …`)를 보인다(`-o json`이면 `{snapshot_schedule, schedule_error}`). 바꿀 때는 VM을 읽어 `If-Match: revision`으로 라벨·스펙을 그대로 둔 채 예약만 바꿔 PUT 한다(`revision_mismatch`면 세 번까지, 스냅샷·복제 Task 중이라 `vm_busy`면 1초마다 30초까지 다시). `vm delete --with-snapshots`는 지우기 전 확인을 통과하면 예약을 먼저 끄고(`snapshot schedule of vm X turned off`) 다시 확인한 뒤 지운다(그새 예약 스냅샷이 생기지 않게).
+- `list`에 SCHEDULED 열(true/false, MEMORY 뒤). `vm clone`은 "vm {새 이름} cloned from {vm}"을 출력한다.
 
 ## 9. 웹 UI
 
@@ -188,6 +197,8 @@ UEFI 변수를 복사하고 `ready`로 바꾸고 VM의 `status.snapshot`을 이 
 계획 11:
 - **VM 메뉴 "복제":** 새 이름, 원본(지금 상태 / 스냅샷), 대상 풀.
 - **VM 폼 "예약 스냅샷":** 주기, 보관 개수, 메모리 포함. VM 상세에 마지막 예약 실패.
+- 구현: 복제는 VM 메뉴(목록·상세)와 상세 헤더에 있고 VM·볼륨 Write일 때만 보인다. 원본 기본값은 꺼진 VM이면 지금 상태, 아니면 가장 최근 `ready` 스냅샷. 실행 중이면 지금 상태를 고를 수 없고(까닭을 글로), 시작·정지 중이거나 스냅샷 목록을 읽기 전이면 막는다. 대상 풀은 "원본과 같은 풀"과 VM 노드(`vm_placement`와 같은 순서)에서 쓸 수 있는 풀만 보인다(노드를 모르면 모든 풀). 이름은 형식과 기존 VM 이름으로 미리 확인한다. 진행은 작업 알림으로 보인다.
+- 구현: 예약은 실행 중에도 바꿀 수 있다. 꺼도 보관 개수·메모리 값은 폼에 남는다. 스냅샷 탭에 예약 요약("Daily, keep 7, with memory"), 수정 권한이 있으면 "예약 바꾸기"(VM 편집 화면으로), 예약 스냅샷 행에 "예약" 배지를 보인다. `schedule_error`는 code 없는 서버 메시지라 번역하지 않고 그대로(영어) 보인다.
 
 ## 10. 테스트
 
@@ -195,6 +206,7 @@ UEFI 변수를 복사하고 `ready`로 바꾸고 VM의 `status.snapshot`을 이 
 - **실제 `qemu-img`:** 정지 볼륨의 스냅샷 만들기·되돌리기·삭제(`qemu-io`로 쓴 패턴이 되돌아가는지), 크기 늘리기, 스냅샷에서 복사.
 - **실제 QEMU (`qemu-it`, 맥 hvf와 CI KVM):** 실행 중 메모리 스냅샷 → 되돌리기 → 실행 상태로 돌아옴. 실행 중 디스크만 스냅샷. 실행 중 크기 늘리기(QMP 연결은 opld가 쥐고 있어 `query-block` 대신 `qemu-img info -U`의 `virtual-size`로 확인). 되돌리기로 디스크 내용이 돌아오는지는 정지 상태에서 확인(OS 없는 게스트).
 - **브라우저 E2E:** 계획 10은 기존 흐름에 메모리 스냅샷 만들기 → 되돌리기 → 삭제와 볼륨 크기 늘리기를 더한다. 계획 11은 스냅샷에서 복제한 VM 시작, 예약 스냅샷(테스트에서만 주기를 짧게 하는 설정).
+- 계획 11 구현: 실제 QEMU 테스트는 정지 VM 복제(`qemu-io`로 내용 확인), 실행 중 VM의 스냅샷에서 복제(스냅샷 뒤 바꾼 내용이 들어가지 않음, `-U`) → 시작, `[schedule] tick_secs = 1, hour_secs = 1`로 hourly keep 2가 만들어지고 정리되는지. E2E 하네스는 `tick_secs = 1, hour_secs = 2`이고 예약 행이 3개(`keep + 1`)를 넘지 않는지 본다. 예약을 끄는 PUT은 예약 만들기 Task와 겹치면 `vm_busy`라 CLI가 기다렸다 다시 하고, E2E는 다시 저장한다.
 
 ## 11. 알고 받아들인 제한
 
@@ -203,6 +215,13 @@ UEFI 변수를 복사하고 `ready`로 바꾸고 VM의 `status.snapshot`을 이 
 - 되돌리기는 실행 중인 VM을 강제로 끈다(저장하지 않은 게스트 상태는 사라진다).
 - 복제는 디스크 전체를 복사한다(링크드 클론 없음). 대상 풀은 원본 볼륨의 노드에서 쓸 수 있어야 한다.
 - 예약은 주기만 있고 시각을 정하지 못한다. 리더가 바뀌면 그 주기의 스냅샷이 1분 남짓 늦을 수 있다.
+- 예약 만들기 Task가 실패하면 다음 tick이 아니라 다음 주기에 다시 한다(매일이면 하루 뒤). 요청이 거절되면 `hour` 뒤에, 보관 삭제가 실패하면 그 스냅샷의 삭제를 `hour` 뒤에 다시 한다. 리더가 바뀌거나 opld가 재시작하면 시도를 잊어 한 번 일찍 다시 한다. 보관 정리 때문에 잠시 `keep + 1`개가 있을 수 있다.
+- 예약 스냅샷 만들기 Task가 도는 동안 VM 수정(예약 끄기 포함)·동작은 `vm_busy`다. 다시 하면 된다(CLI `vm snapshot schedule`은 30초까지 기다렸다 다시 한다).
+- 오프라인 노드에 걸린 그 VM의 스냅샷·복제 Task가 끝나지 않으면 예약 작업은 그 VM을 건너뛰므로, 그동안 `schedule_error`에 아무것도 쓰지 않는다(노드 오프라인이 보이지 않는다).
+- `schedule_error`는 영어 서버 메시지 그대로라 웹에서 번역되지 않는다. 예약을 꺼도 남는다(다음 예약 만들기가 성공해야 지워진다).
+- 복제·가져오기는 Task 제한 시간 600초 안에 끝나야 한다. 큰 디스크 복제는 시간 초과로 실패할 수 있다(만든 볼륨은 지운다).
+- 서로 다른 VM의 복제가 동시에 같은 새 볼륨 이름(`{새 VM}-{원래 볼륨}`, 겹치면 `-2`…)을 고르면 뒤의 것이 이름 경합으로 실패한다(다시 하면 된다).
+- 복제 중 볼륨을 `ready`로 바꾼 뒤 새 VM을 만들기 전에 opld가 재시작하면 그 볼륨들(`{새 VM}-…`)과 UEFI 변수 사본이 남는다. 볼륨은 손으로 지운다.
 - 리소스 없이 디스크에 남은 태그는 자동으로 지우지 않는다. 만들기가 시간 초과로 끝나도 남는다.
 - 메모리 스냅샷으로 되돌린 뒤 VM이 시작되기 전에 opld가 재시작하면 VM은 메모리 상태 없이 처음부터 부팅한다(디스크·위치는 그 스냅샷).
 - 메모리 불러오기가 실패하면 되돌리기 Task의 오류가 원래 오류 대신 "VM was stopped"로 보일 수 있다(reconciler가 끄기를 두 번에 쓴다). VM의 `failed` 오류에는 원래 오류가 남는다.
@@ -210,7 +229,7 @@ UEFI 변수를 복사하고 `ready`로 바꾸고 VM의 `status.snapshot`을 이 
 - 다른 노드의 API가 `pending` 스냅샷을 만들고 Task를 만들기 전의 짧은 틈에 주인 노드가 재시작 정리를 하면 그 스냅샷을 지울 수 있다. 그 만들기 Task는 "snapshot was deleted"로 실패한다(다시 하면 된다).
 - 메모리 스냅샷을 불러오며 시작하는 중(`-S`로 띄워 `snapshot-load`를 하는 동안)에 opld가 재시작하면, 다시 붙을 때 `prelaunch`로 남은 VM으로 보고 `cont`를 보내 불러오기와 겹칠 수 있다.
 - 실행 중 메모리 스냅샷의 UEFI 변수 사본은 저장이 끝난 뒤 복사한다. 그사이 게스트가 바꾼 변수가 들어가 메모리 상태보다 조금 뒤일 수 있다.
-- VM 삭제 확인과 실제 삭제 사이에 만들어진 스냅샷은 막지 않는다.
+- VM 삭제 확인과 실제 삭제 사이에 만들어진 스냅샷은 막지 않는다(`oplctl vm delete --with-snapshots`는 예약을 먼저 끈다).
 - `status.vmstate_bytes`는 채우지 않는다.
 - 오프라인 노드에 배정된 만들기·되돌리기 Task는 시작하지 못하므로 Task 제한 시간이 적용되지 않는다. 그 노드가 돌아올 때까지 `pending`이고, 그동안 그 VM의 전원 조작과 수정은 `vm_busy`다. 반대로 오프라인 노드에 배정된 전원 Task가 끝나지 않으면 그 VM의 스냅샷 요청이 `vm_busy`다. VM을 다른 노드로 옮겨도(`spec.node`) 남은 Task 때문에 마찬가지다.
 - 스냅샷이 가리키는 볼륨이 지금 다른 실행 중 VM에 붙어 있으면(되돌리기 뒤 떼어 낸 디스크를 다른 VM에 붙인 경우 등) 그 스냅샷의 삭제는 `qemu-img`의 이미지 잠금으로 실패한다(디스크는 손상되지 않는다). 스냅샷이 남으므로 그 VM이 멈출 때까지 원래 VM도 지울 수 없다.
