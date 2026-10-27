@@ -23,8 +23,9 @@ import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/a
 import { VmConsole } from "@/vms/lazyConsole";
 import { VmConfirm } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
+import { VmSnapshots } from "@/vms/VmSnapshots";
 
-const TABS = ["summary", "hardware", "console", "tasks", "json"] as const;
+const TABS = ["summary", "hardware", "console", "snapshots", "tasks", "json"] as const;
 
 /** 이름으로 VM을 찾는다. 목록이 아직 없으면 undefined, 없는 VM이면 null */
 export function useVmByName(name: string): Vm | null | undefined {
@@ -95,6 +96,9 @@ export function VmDetailPage() {
               <VmConsole vm={vm} />
             </Suspense>
           )}
+        </TabsContent>
+        <TabsContent value="snapshots">
+          <VmSnapshots vm={vm} />
         </TabsContent>
         <TabsContent value="tasks">
           <VmTasks vm={vm} />

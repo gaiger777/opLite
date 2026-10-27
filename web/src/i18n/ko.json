@@ -26,6 +26,11 @@
     "last_admin": "마지막 관리자는 관리자 역할을 내려놓을 수 없습니다.",
     "cannot_delete_self": "자기 계정은 지울 수 없습니다.",
     "pool_in_use": "풀에 볼륨이 남아 있습니다. 먼저 볼륨을 지우세요.",
+    "vm_busy": "VM이 시작하거나 정지하는 중입니다. 끝난 뒤 다시 시도하세요.",
+    "snapshot_unsupported": "디스크가 모두 qcow2인 VM만 스냅샷을 만들 수 있습니다.",
+    "vm_has_snapshots": "VM에 스냅샷이 있습니다. 먼저 스냅샷을 지우세요.",
+    "volume_in_snapshot": "VM 스냅샷이 아직 이 볼륨을 씁니다. 먼저 그 스냅샷을 지우세요.",
+    "snapshot_not_ready": "아직 만드는 중인 스냅샷입니다.",
     "internal": "서버 오류: {{message}}"
   },
   "nav": {
@@ -92,7 +97,11 @@
       "vm-reboot": "{{target}} 재시작",
       "volume-create": "볼륨 {{target}} 만들기",
       "volume-import": "볼륨 {{target}} 가져오기",
-      "volume-delete": "볼륨 {{target}} 삭제"
+      "volume-delete": "볼륨 {{target}} 삭제",
+      "snapshot-create": "{{target}} 스냅샷 만들기",
+      "snapshot-revert": "{{target}} 스냅샷으로 되돌리기",
+      "snapshot-delete": "{{target}} 스냅샷 삭제",
+      "volume-resize": "볼륨 {{target}} 크기 늘리기"
     }
   },
   "common": {
@@ -146,6 +155,7 @@
       "summary": "요약",
       "hardware": "하드웨어",
       "console": "콘솔",
+      "snapshots": "스냅샷",
       "tasks": "작업",
       "json": "JSON"
     },
@@ -179,6 +189,44 @@
     "bulkSummary": "{{action}}: {{done}}개 요청, {{failed}}개 실패, {{skipped}}개 건너뜀.",
     "noDisks": "디스크가 없습니다.",
     "noNics": "네트워크 인터페이스가 없습니다."
+  },
+  "snapshots": {
+    "name": "이름",
+    "created": "만든 시각",
+    "memory": "메모리",
+    "description": "설명",
+    "empty": "스냅샷이 없습니다.",
+    "current": "현재 위치",
+    "after": "({{parent}} 다음)",
+    "pending": "만드는 중",
+    "memoryYes": "포함",
+    "memoryNo": "없음",
+    "memorySize": "포함 ({{size}})",
+    "create": "스냅샷 만들기",
+    "createTitle": "{{name}} 스냅샷 만들기",
+    "createDescription": "VM의 디스크, 펌웨어 변수, 설정을 저장해 나중에 이 시점으로 돌아올 수 있게 합니다.",
+    "includeMemory": "메모리 포함",
+    "includeMemoryHint": "실행 상태도 저장합니다. 되돌리면 VM이 그때 상태에서 이어서 실행됩니다.",
+    "unsupported": "디스크가 모두 qcow2인 VM만 스냅샷을 만들 수 있습니다. {{volume}}은(는) {{format}}입니다.",
+    "busy": "VM이 시작하거나 정지하는 중입니다. 끝나면 스냅샷을 만들고 되돌리고 지울 수 있습니다.",
+    "revert": "되돌리기",
+    "revertNamed": "{{name}}(으)로 되돌리기",
+    "revertTitle": "{{vm}}을(를) {{name}}(으)로 되돌릴까요?",
+    "revertDescription": "{{vm}}의 지금 상태는 사라집니다. VM을 끈 뒤 디스크, 펌웨어 변수, 설정을 스냅샷 때로 되돌립니다. VM은 꺼진 채로 남습니다.",
+    "revertDescriptionMemory": "{{vm}}의 지금 상태는 사라집니다. VM을 끈 뒤 디스크, 펌웨어 변수, 설정을 스냅샷 때로 되돌리고, 저장한 메모리에서 이어서 실행합니다.",
+    "delete": "삭제",
+    "deleteNamed": "스냅샷 {{name}} 삭제",
+    "deleteTitle": "스냅샷 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "스냅샷을 지웁니다. 그 뒤에 만든 스냅샷은 남고, VM의 지금 상태는 바뀌지 않습니다.",
+    "op": {
+      "create": "{{vm}} 스냅샷 {{name}} 만들기",
+      "revert": "{{vm}}을(를) {{name}}(으)로 되돌리기",
+      "delete": "{{vm}} 스냅샷 {{name}} 삭제"
+    },
+    "errors": {
+      "exists": "이 VM에 같은 이름의 스냅샷이 이미 있습니다.",
+      "description": "1024자까지 쓰세요."
+    }
   },
   "forms": {
     "name": "소문자·숫자·-로 1–63자, -로 시작하거나 끝날 수 없습니다."

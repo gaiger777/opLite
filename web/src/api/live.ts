@@ -4,7 +4,15 @@ import { api, call } from "@/api/client";
 import type { Resources, WatchKind } from "@/api/types";
 
 /** 화면이 실시간으로 보는 리소스 종류. 사용자와 토큰은 감시할 수 없다. */
-export const KINDS: WatchKind[] = ["vm", "volume", "storage-pool", "node", "task", "network"];
+export const KINDS: WatchKind[] = [
+  "vm",
+  "volume",
+  "storage-pool",
+  "node",
+  "task",
+  "network",
+  "snapshot",
+];
 
 /** 목록 응답. `revision`은 목록을 읽은 시점의 클러스터 revision이다. */
 export interface List<T> {
@@ -42,6 +50,8 @@ export async function fetchList<K extends WatchKind>(kind: K): Promise<List<Reso
         return call(api.GET("/tasks"));
       case "network":
         return call(api.GET("/networks"));
+      case "snapshot":
+        return call(api.GET("/snapshots"));
     }
   })();
   return list as List<Resources[K]>;

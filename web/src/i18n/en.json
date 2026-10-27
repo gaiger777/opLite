@@ -26,6 +26,11 @@
     "last_admin": "The last administrator cannot give up the administrator role.",
     "cannot_delete_self": "You cannot delete your own account.",
     "pool_in_use": "The pool still has volumes. Delete them first.",
+    "vm_busy": "The VM is starting or stopping. Try again when it has settled.",
+    "snapshot_unsupported": "Only VMs whose disks are all qcow2 can take snapshots.",
+    "vm_has_snapshots": "The VM has snapshots. Delete them first.",
+    "volume_in_snapshot": "A VM snapshot still uses this volume. Delete that snapshot first.",
+    "snapshot_not_ready": "The snapshot is still being taken.",
     "internal": "The server failed: {{message}}"
   },
   "nav": {
@@ -92,7 +97,11 @@
       "vm-reboot": "Reboot {{target}}",
       "volume-create": "Create volume {{target}}",
       "volume-import": "Import volume {{target}}",
-      "volume-delete": "Delete volume {{target}}"
+      "volume-delete": "Delete volume {{target}}",
+      "snapshot-create": "Take snapshot of {{target}}",
+      "snapshot-revert": "Revert {{target}} to a snapshot",
+      "snapshot-delete": "Delete snapshot of {{target}}",
+      "volume-resize": "Resize volume {{target}}"
     }
   },
   "common": {
@@ -146,6 +155,7 @@
       "summary": "Summary",
       "hardware": "Hardware",
       "console": "Console",
+      "snapshots": "Snapshots",
       "tasks": "Tasks",
       "json": "JSON"
     },
@@ -179,6 +189,44 @@
     "bulkSummary": "{{action}}: {{done}} requested, {{failed}} failed, {{skipped}} skipped.",
     "noDisks": "No disks.",
     "noNics": "No network interfaces."
+  },
+  "snapshots": {
+    "name": "Name",
+    "created": "Created",
+    "memory": "Memory",
+    "description": "Description",
+    "empty": "No snapshots.",
+    "current": "Current",
+    "after": "(after {{parent}})",
+    "pending": "Creating",
+    "memoryYes": "Included",
+    "memoryNo": "No",
+    "memorySize": "Included ({{size}})",
+    "create": "Take snapshot",
+    "createTitle": "Take a snapshot of {{name}}",
+    "createDescription": "Saves the VM's disks, firmware variables and settings so you can return to this point later.",
+    "includeMemory": "Include memory",
+    "includeMemoryHint": "Also saves the running state. Reverting resumes the VM where it was.",
+    "unsupported": "Only VMs whose disks are all qcow2 can take snapshots. {{volume}} is {{format}}.",
+    "busy": "The VM is starting or stopping. Snapshots can be taken, reverted and deleted once it settles.",
+    "revert": "Revert",
+    "revertNamed": "Revert to {{name}}",
+    "revertTitle": "Revert {{vm}} to {{name}}?",
+    "revertDescription": "The current state of {{vm}} is lost. The VM is powered off, then its disks, firmware variables and settings return to the snapshot. It stays off.",
+    "revertDescriptionMemory": "The current state of {{vm}} is lost. The VM is powered off, then its disks, firmware variables and settings return to the snapshot, and it resumes running from the saved memory.",
+    "delete": "Delete",
+    "deleteNamed": "Delete snapshot {{name}}",
+    "deleteTitle": "Delete snapshot {{name}}?",
+    "deleteDescription": "The snapshot is deleted. Snapshots taken after it are kept, and the VM's current state does not change.",
+    "op": {
+      "create": "Take snapshot {{name}} of {{vm}}",
+      "revert": "Revert {{vm}} to {{name}}",
+      "delete": "Delete snapshot {{name}} of {{vm}}"
+    },
+    "errors": {
+      "exists": "This VM already has a snapshot with this name.",
+      "description": "Use at most 1024 characters."
+    }
   },
   "forms": {
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."

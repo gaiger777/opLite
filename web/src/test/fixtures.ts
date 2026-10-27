@@ -1,4 +1,4 @@
-import type { Node, StoragePool, Task, Vm, Volume } from "@/api/types";
+import type { Node, Snapshot, StoragePool, Task, Vm, Volume } from "@/api/types";
 
 /** 테스트용 VM. 필요한 필드만 바꿔 쓴다. */
 export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm> = {}): Vm {
@@ -67,5 +67,32 @@ export function volume(name: string, pool: string, extra: Partial<Volume["status
     labels: {},
     spec: { pool, size_bytes: 16 * 1024 ** 3, format: "qcow2" },
     status: { phase: "ready", node: "n1", allocated_bytes: 1024 ** 3, attached_to: null, ...extra },
+  };
+}
+
+/** 테스트용 스냅샷. `n`은 id 끝자리(UUIDv7처럼 만든 차례)다. 리소스 이름은 서버처럼 id다. */
+export function snapshot(
+  name: string,
+  of: Vm,
+  n: number,
+  extra: { spec?: Partial<Snapshot["spec"]>; status?: Partial<Snapshot["status"]> } = {},
+): Snapshot {
+  const id = `019a0f3c-0000-7000-8003-${String(n).padStart(12, "0")}`;
+  return {
+    id,
+    name: id,
+    revision: 1,
+    labels: {},
+    spec: {
+      vm: of.id,
+      name,
+      parent: null,
+      memory: false,
+      description: "",
+      scheduled: false,
+      vm_spec: of.spec,
+      ...extra.spec,
+    },
+    status: { phase: "ready", created_at: 1_792_000_000, vmstate_bytes: null, ...extra.status },
   };
 }
