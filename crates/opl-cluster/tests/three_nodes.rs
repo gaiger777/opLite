@@ -295,6 +295,120 @@ async fn hung_forward_is_retried_before_the_write_timeout() {
     assert!(tc.get(follower).get::<VolumeSpec>(v.id).unwrap().is_some());
 }
 
+/// 첫 전달은 리더가 처리하지만 응답이 오지 않는다. `hang`이면 시도 제한 시간까지 붙잡고,
+/// 아니면 보낸 뒤 연결이 끊긴 것처럼 `Unreachable`을 돌려준다. 리더가 처리하지 못한 전달
+/// (`NotLeader` 등)은 그대로 돌려주고 다음 전달에서 다시 잃는다(`lost`는 실제로 잃었을 때만).
+struct LoseFirstReply {
+    lost: AtomicBool,
+    hang: bool,
+    inner: Arc<MemForwarder>,
+}
+
+#[async_trait]
+impl Forwarder for LoseFirstReply {
+    async fn forward(
+        &self,
+        leader: NodeId,
+        addr: &str,
+        req: LeaderRequest,
+    ) -> Result<u64, ClusterError> {
+        let result = self.inner.forward(leader, addr, req).await;
+        if result.is_err() || self.lost.swap(true, Ordering::SeqCst) {
+            return result;
+        }
+        if self.hang {
+            std::future::pending::<()>().await;
+        }
+        Err(ClusterError::Unreachable("connection reset".into()))
+    }
+}
+
+/// 리더가 아닌 노드 하나의 전달자를 첫 응답을 잃는 것으로 바꾸고 그 노드와 전달자를 돌려준다.
+async fn follower_losing_first_reply(
+    tc: &mut TestCluster,
+    hang: bool,
+) -> (NodeId, Arc<LoseFirstReply>) {
+    let leader = tc.leader().await;
+    let follower = *tc.nodes.keys().find(|id| **id != leader).unwrap();
+    let forwarder = Arc::new(LoseFirstReply {
+        lost: AtomicBool::new(false),
+        hang,
+        inner: tc.router.forwarder(follower),
+    });
+    let cluster = tc.nodes.remove(&follower).unwrap();
+    let cluster = cluster.with_forwarder(forwarder.clone());
+    tc.nodes.insert(follower, cluster);
+    (follower, forwarder)
+}
+
+#[tokio::test]
+async fn retried_create_after_a_lost_reply_succeeds() {
+    let mut tc = TestCluster::start_forwarding(3).await;
+    let (follower, forwarder) = follower_losing_first_reply(&mut tc, false).await;
+
+    let v = volume("disk-a");
+    let rev = tc.get(follower).create(&v).await.unwrap();
+    assert!(forwarder.lost.load(Ordering::SeqCst));
+    // 다시 보낸 요청의 `AlreadyExists`는 첫 요청이 적용된 결과이므로 그 revision으로 성공한다.
+    let got = tc.get(follower).get::<VolumeSpec>(v.id).unwrap().unwrap();
+    assert_eq!(got.revision, rev);
+}
+
+#[tokio::test]
+async fn retried_create_after_a_timed_out_attempt_succeeds() {
+    let mut tc = TestCluster::start_forwarding(3).await;
+    let (follower, forwarder) = follower_losing_first_reply(&mut tc, true).await;
+
+    let v = volume("disk-a");
+    let rev = tc.get(follower).create(&v).await.unwrap();
+    assert!(forwarder.lost.load(Ordering::SeqCst));
+    let got = tc.get(follower).get::<VolumeSpec>(v.id).unwrap().unwrap();
+    assert_eq!(got.revision, rev);
+}
+
+#[tokio::test]
+async fn retried_delete_after_a_lost_reply_succeeds() {
+    let mut tc = TestCluster::start_forwarding(3).await;
+    let v = volume("disk-a");
+    let leader = tc.leader().await;
+    let rev = tc.get(leader).create(&v).await.unwrap();
+    let (follower, forwarder) = follower_losing_first_reply(&mut tc, false).await;
+    tc.wait_applied(follower, rev).await;
+
+    // 다시 보낸 요청의 `NotFound`는 첫 요청이 지운 결과다. 이 노드에서도 곧바로 없다.
+    tc.get(follower)
+        .delete::<VolumeSpec>(v.id, Some(rev))
+        .await
+        .unwrap();
+    assert!(forwarder.lost.load(Ordering::SeqCst));
+    assert!(tc.get(follower).get::<VolumeSpec>(v.id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn retried_conditional_update_after_a_lost_reply_is_still_rejected() {
+    let mut tc = TestCluster::start_forwarding(3).await;
+    let v = volume("disk-a");
+    let leader = tc.leader().await;
+    let rev = tc.get(leader).create(&v).await.unwrap();
+    let (follower, forwarder) = follower_losing_first_reply(&mut tc, false).await;
+    tc.wait_applied(follower, rev).await;
+
+    // 조건부 수정은 거부가 자기 요청 때문인지 알 수 없어 그대로 돌려준다.
+    let err = tc
+        .get(follower)
+        .update_spec(v.id, Some(rev), v.labels.clone(), &v.spec)
+        .await
+        .unwrap_err();
+    assert!(forwarder.lost.load(Ordering::SeqCst));
+    assert!(
+        matches!(
+            err,
+            ClusterError::Rejected(Rejection::RevisionMismatch { .. })
+        ),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn concurrent_membership_changes_wait_for_each_other() {
     let mut tc = TestCluster::start(3).await;

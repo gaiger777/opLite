@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{BasicNode, Raft, RaftNetworkFactory};
-use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::resource::{Kind, Resource, ResourceSpec};
 use redb::Database;
 use uuid::Uuid;
 
@@ -278,9 +278,12 @@ impl Cluster {
     /// 요청을 리더에서 처리한다. 이 노드가 리더가 아니면 전달자로 리더에 보내고, 리더가 커밋한
     /// 인덱스까지 이 노드에도 적용되기를 기다린다(이 노드에서 곧바로 읽어도 결과가 보인다).
     /// 리더가 없거나(선거 중) 닿지 않으면 `write_timeout`까지 다시 시도하고, 그래도 안 되면
-    /// `Timeout`이다. 전달이 실패해 다시 보낸 요청이 이미 적용된 것이었다면 두 번째는 거부될 수 있다.
+    /// `Timeout`이다. 전달 시도가 응답 없이 끝나면(시도 제한 시간, 보낸 뒤 연결 끊김) 요청이 이미
+    /// 적용됐을 수 있으므로, 그 뒤 다시 보낸 만들기·삭제의 거부는 `already_applied`로 판단한다.
     pub async fn request(&self, req: LeaderRequest) -> Result<u64, ClusterError> {
         let deadline = tokio::time::Instant::now() + self.write_timeout;
+        // 응답 없이 끝난 전달 시도가 있었다(리더가 처리했을 수 있다).
+        let mut maybe_applied = false;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let result = match leader::execute(&self.raft, req.clone(), remaining).await {
@@ -305,9 +308,12 @@ impl Cluster {
                             Err(ClusterError::Timeout)
                         }
                         // 이번 시도만 제한에 걸렸다. 리더를 다시 읽고 다시 보낸다.
-                        Err(_) => Err(ClusterError::Unreachable(
-                            "forward attempt timed out".into(),
-                        )),
+                        Err(_) => {
+                            maybe_applied = true;
+                            Err(ClusterError::Unreachable(
+                                "forward attempt timed out".into(),
+                            ))
+                        }
                         // 자기 자신을 뺀 요청이면 리더가 더는 이 노드에 복제하지 않으므로
                         // 적용을 기다리면 제한 시간까지 멈춘다.
                         Ok(Ok(index)) if matches!(req, LeaderRequest::Remove { id } if id == self.id) => {
@@ -323,11 +329,19 @@ impl Cluster {
                                 .await;
                             Ok(index)
                         }
-                        Ok(Err(e)) => Err(e),
+                        // 연결하지 못한 것과 보낸 뒤 끊긴 것을 구분할 수 없어 둘 다 적용됐을 수 있다고 본다.
+                        Ok(Err(e)) => {
+                            maybe_applied |= matches!(e, ClusterError::Unreachable(_));
+                            Err(e)
+                        }
                     }
                 }
                 other => other,
             };
+            if maybe_applied && let Some(done) = self.already_applied(&req, &result, deadline).await
+            {
+                return done;
+            }
             let retry = match &result {
                 Err(ClusterError::NotLeader {
                     leader_id: None, ..
@@ -343,6 +357,61 @@ impl Cluster {
                 return Err(ClusterError::Timeout);
             }
             tokio::time::sleep(RETRY_INTERVAL).await;
+        }
+    }
+
+    /// 다시 보낸 요청의 거부가 앞서 응답 없이 끝난 같은 요청이 적용된 결과면, 이 노드에도 적용되기를
+    /// 기다려 성공으로 돌려준다. 만들기의 id는 요청한 쪽이 만든 UUID v7이라 같은 id가 있으면 자기
+    /// 요청이다. 조건부 수정 등은 거부가 자기 요청 때문인지 알 수 없어 판단하지 않는다(`None`, 다시
+    /// 보낸 요청이 `RevisionMismatch`로 끝날 수 있다).
+    async fn already_applied(
+        &self,
+        req: &LeaderRequest,
+        result: &Result<u64, ClusterError>,
+        deadline: tokio::time::Instant,
+    ) -> Option<Result<u64, ClusterError>> {
+        let LeaderRequest::Write { command } = req else {
+            return None;
+        };
+        match (command, result) {
+            (
+                Command::Create { kind, resource },
+                Err(ClusterError::Rejected(Rejection::AlreadyExists { id, .. })),
+            ) if *id == resource.id => Some(self.wait_local(*kind, *id, true, deadline).await),
+            (
+                Command::Delete { kind, id, .. },
+                Err(ClusterError::Rejected(Rejection::NotFound { .. })),
+            ) => Some(self.wait_local(*kind, *id, false, deadline).await),
+            _ => None,
+        }
+    }
+
+    /// 이 노드에서 리소스가 보이거나(`present`) 사라질 때까지 기다린다. 보이면 그 revision을,
+    /// 사라지면 이 노드가 적용한 인덱스를 돌려준다. `deadline`까지 안 되면 `Timeout`이다.
+    /// 한 번에 적용된 묶음에 다른 쪽의 삭제까지 들어 있으면 "있음"을 보지 못하고 `Timeout`
+    /// (=적용됐을 수 있음)으로 끝난다.
+    async fn wait_local(
+        &self,
+        kind: Kind,
+        id: Uuid,
+        present: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<u64, ClusterError> {
+        let db = self.db.clone();
+        let metrics = self
+            .raft
+            .wait(Some(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ))
+            .metrics(
+                move |_| get_object(&db, kind, id).is_ok_and(|r| r.is_some() == present),
+                "retried request applied",
+            )
+            .await
+            .map_err(|_| ClusterError::Timeout)?;
+        match get_object(&self.db, kind, id)? {
+            Some(r) if present => Ok(r.revision),
+            _ => Ok(metrics.last_applied.map_or(0, |l| l.index)),
         }
     }
 
