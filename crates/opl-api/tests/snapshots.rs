@@ -9,7 +9,7 @@ use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{PowerState, VmPhase, VmSpec, VmStatus};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -84,8 +84,14 @@ async fn vm_with_disks(admin: &Client, name: &str, volumes: &[&str]) -> Uuid {
     vm["id"].as_str().unwrap().parse().unwrap()
 }
 
-/// VM의 실제 상태를 직접 쓴다. `spec.node`가 없는 VM은 reconciler가 다루지 않아 그대로 남는다.
+/// VM의 실제 상태와 그에 맞는 원하는 전원 상태(시작 중·실행 중이면 켜짐)를 직접 쓴다.
+/// `spec.node`가 없는 VM은 reconciler가 다루지 않아 그대로 남는다.
 async fn set_vm_status(env: &Env, id: Uuid, phase: VmPhase, node: Option<Uuid>) {
+    let power = match phase {
+        VmPhase::Starting | VmPhase::Running => PowerState::Running,
+        _ => PowerState::Stopped,
+    };
+    set_vm_power(env, id, power).await;
     let vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
     let status = VmStatus {
         phase,
@@ -94,6 +100,19 @@ async fn set_vm_status(env: &Env, id: Uuid, phase: VmPhase, node: Option<Uuid>) 
     };
     env.cluster
         .update_status::<VmSpec>(id, &status)
+        .await
+        .unwrap();
+}
+
+/// 원하는 전원 상태만 직접 쓴다(reconciler가 아직 따라가지 않은 상태).
+async fn set_vm_power(env: &Env, id: Uuid, power: PowerState) {
+    let vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+    let spec = VmSpec {
+        power,
+        ..vm.spec.clone()
+    };
+    env.cluster
+        .update_spec(id, Some(vm.revision), vm.labels.clone(), &spec)
         .await
         .unwrap();
 }
@@ -349,6 +368,66 @@ async fn revert_and_delete_need_a_ready_snapshot() {
     let (status, body) = admin.delete("/vms/web/snapshots/s1").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "vm_busy");
+}
+
+/// 만들기·되돌리기·삭제 요청이 모두 `vm_busy`로 거절되는지.
+async fn assert_snapshot_ops_busy(admin: &Client, why: &str) {
+    let (status, body) = admin
+        .post(
+            "/vms/web/snapshots",
+            json!({ "name": "busy", "memory": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}: {body}");
+    assert_eq!(body["code"], "vm_busy", "{why}: {body}");
+    let (status, body) = admin
+        .post("/vms/web/snapshots/s1/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}: {body}");
+    assert_eq!(body["code"], "vm_busy", "{why}: {body}");
+    let (status, body) = admin.delete("/vms/web/snapshots/s1").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}: {body}");
+    assert_eq!(body["code"], "vm_busy", "{why}: {body}");
+}
+
+#[tokio::test]
+async fn snapshot_ops_wait_for_power_changes() {
+    let env = env().await;
+    let admin = env.admin().await;
+    pool(&env, vec![]).await;
+    volume(&env, "root", ImageFormat::Qcow2).await;
+    let vm = vm_with_disks(&admin, "web", &["root"]).await;
+    admin
+        .post("/vms/web/snapshots", json!({ "name": "s1" }))
+        .await;
+    mark_ready(&env, snapshot_of(&env, vm, "s1").await.id).await;
+    finish_tasks(&env).await;
+
+    // 켜라고 했지만 아직 켜지지 않았다.
+    set_vm_power(&env, vm, PowerState::Running).await;
+    assert_snapshot_ops_busy(&admin, "start pending").await;
+    // 끄라고 했지만 아직 돌고 있다.
+    set_vm_status(&env, vm, VmPhase::Running, Some(env.node)).await;
+    set_vm_power(&env, vm, PowerState::Stopped).await;
+    assert_snapshot_ops_busy(&admin, "stop pending").await;
+
+    // 실행 중으로 자리 잡은 VM이라도 재시작 Task가 끝나지 않았으면 기다린다.
+    set_vm_status(&env, vm, VmPhase::Running, Some(env.node)).await;
+    let (status, task) = admin.post("/vms/web/actions/reboot", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_snapshot_ops_busy(&admin, "reboot task").await;
+
+    finish_tasks(&env).await;
+    let (status, body) = admin
+        .post(
+            "/vms/web/snapshots",
+            json!({ "name": "s2", "memory": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    finish_tasks(&env).await;
+    let (status, body) = admin.delete("/vms/web/snapshots/s1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 }
 
 #[tokio::test]

@@ -25,7 +25,7 @@ use crate::state::AppState;
 use crate::tasks::create_task;
 
 /// 원하는 상태도 실제 상태도 꺼져 있다. 삭제와 노드·디스크 변경은 이때만 할 수 있다.
-fn is_stopped(vm: &Vm) -> bool {
+pub(crate) fn is_stopped(vm: &Vm) -> bool {
     vm.spec.power == PowerState::Stopped
         && matches!(vm.status.phase, VmPhase::Stopped | VmPhase::Failed)
 }

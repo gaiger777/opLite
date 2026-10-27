@@ -21,7 +21,7 @@ use crate::error::{ApiError, Json};
 use crate::resources::{List, check_name, lookup};
 use crate::state::AppState;
 use crate::tasks::create_task;
-use crate::vms::prepare;
+use crate::vms::{is_stopped, prepare};
 
 /// 설명의 최대 글자 수
 const MAX_DESCRIPTION_CHARS: usize = 1024;
@@ -54,17 +54,49 @@ pub(crate) fn vm_node(state: &AppState, vm: &Vm) -> Uuid {
     vm_placement(&state.cluster, vm).unwrap_or(state.node)
 }
 
-/// 시작·정지 중인 VM은 스냅샷 작업을 받지 않는다.
-fn check_not_busy(vm: &Vm) -> Result<(), ApiError> {
-    let doing = match vm.status.phase {
-        VmPhase::Starting => "starting",
-        VmPhase::Stopping => "stopping",
-        _ => return Ok(()),
+/// 시작·정지 중인 VM은 스냅샷 작업을 받지 않는다: phase가 Starting·Stopping이거나, 원하는 전원
+/// 상태(`spec.power`)에 아직 닿지 않았거나(reconciler가 켜거나 끄는 중), 전원 Task(시작·정지·
+/// 강제 정지·재시작)가 끝나지 않았으면 409 `vm_busy`. 전원 조작이 스냅샷 Task를 기다리는
+/// [`check_no_snapshot_task`]의 반대쪽이다.
+fn check_not_busy(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    let settled = match vm.spec.power {
+        PowerState::Running => vm.status.phase == VmPhase::Running,
+        PowerState::Stopped => is_stopped(vm),
     };
-    Err(ApiError::conflict(
-        "vm_busy",
-        format!("VM {:?} is {doing}; try again when it has settled", vm.name),
-    ))
+    let doing = match vm.status.phase {
+        VmPhase::Starting => Some("starting"),
+        VmPhase::Stopping => Some("stopping"),
+        _ if !settled => Some(match vm.spec.power {
+            PowerState::Running => "starting",
+            PowerState::Stopped => "stopping",
+        }),
+        _ => None,
+    };
+    if let Some(doing) = doing {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            format!("VM {:?} is {doing}; try again when it has settled", vm.name),
+        ));
+    }
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    let busy = tasks.iter().any(|t| {
+        t.spec.target == vm.id
+            && !t.status.state.is_finished()
+            && matches!(
+                t.spec.op,
+                TaskOp::VmStart | TaskOp::VmStop | TaskOp::VmForceStop | TaskOp::VmReboot
+            )
+    });
+    if busy {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            format!(
+                "VM {:?} is being started, stopped or rebooted; try again when the task has finished",
+                vm.name
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// 이 VM의 스냅샷 만들기·되돌리기 Task가 끝나지 않았으면 409 `vm_busy`. 그 Task는 전원을 끄고
@@ -218,7 +250,7 @@ pub async fn create_snapshot(
         )));
     }
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    check_not_busy(&vm)?;
+    check_not_busy(&state, &vm)?;
     check_disks(&state, &vm)?;
     let running = vm.status.phase == VmPhase::Running;
     let has_disk = !vm.spec.disks.is_empty();
@@ -282,7 +314,7 @@ pub async fn revert_snapshot(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    check_not_busy(&vm)?;
+    check_not_busy(&state, &vm)?;
     let snapshot = find_snapshot(&state, &vm, &name)?;
     check_ready(&snapshot)?;
     // 되돌린 스펙을 VM 수정처럼 검증한다. 노드는 지금 것을 유지하고, 시작은 Task가 한다.
@@ -308,7 +340,7 @@ pub async fn delete_snapshot(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    check_not_busy(&vm)?;
+    check_not_busy(&state, &vm)?;
     let snapshot = find_snapshot(&state, &vm, &name)?;
     check_ready(&snapshot)?;
     let op = TaskOp::SnapshotDelete {
