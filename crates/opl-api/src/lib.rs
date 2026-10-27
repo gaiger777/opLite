@@ -89,6 +89,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         ))
         .routes(routes!(snapshots::get_snapshot, snapshots::delete_snapshot))
         .routes(routes!(snapshots::revert_snapshot))
+        .routes(routes!(snapshots::clone_vm))
         .routes(routes!(r::list_volumes, volumes::create_volume))
         .routes(routes!(volumes::import_volume))
         .routes(routes!(r::get_volume, volumes::delete_volume))

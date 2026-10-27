@@ -401,6 +401,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vms/{key}/clone": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * VM을 `name`으로 복제할 Task를 돌려준다(202). 원본은 `ready` 스냅샷이나 꺼진 VM의 지금 상태다
+         *     (실행 중인데 스냅샷이 없으면 409 `vm_running`). 원본 스펙의 볼륨이 모두 있어야 하고, `pool`은 Task
+         *     노드에서 쓸 수 있어야 한다. Task는 원본 VM을 대상으로 그 VM의 디스크 노드에서 돈다.
+         */
+        post: operations["clone_vm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vms/{key}/console": {
         parameters: {
             query?: never;
@@ -582,6 +603,14 @@ export interface components {
             name: string;
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
             vlan_filtering: boolean;
+        };
+        CloneRequest: {
+            /** @description 새 VM의 이름 */
+            name: string;
+            /** @description 새 디스크를 둘 풀. 없으면 원본 볼륨마다 그 볼륨의 풀이다. */
+            pool?: string | null;
+            /** @description 복제할 스냅샷(이름이나 id). 없으면 꺼진 VM의 지금 상태에서 복제한다. */
+            snapshot?: string | null;
         };
         ClusterView: {
             /** @description 클러스터 CA 인증서의 지문. `oplctl login --ca-fingerprint`에 쓴다. */
@@ -2796,6 +2825,40 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    clone_vm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CloneRequest"];
+            };
+        };
         responses: {
             202: {
                 headers: {

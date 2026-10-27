@@ -1,4 +1,5 @@
 //! VM 스냅샷 목록·조회·만들기·되돌리기·삭제. 권한은 VM을 따른다(보기는 Read, 나머지는 Operate).
+//! 스냅샷이나 꺼진 VM에서 VM 복제(VM·볼륨 Write).
 //! 실제 작업은 VM이 있는 노드의 Task 실행기가 한다.
 
 use std::sync::Arc;
@@ -6,10 +7,11 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use opl_cluster::Cluster;
+use opl_types::network::{NetworkSpec, USER_NETWORK};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
-use opl_types::storage::{VolumePhase, VolumeSpec};
+use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use serde::Deserialize;
@@ -36,6 +38,17 @@ pub struct CreateSnapshotRequest {
     pub description: String,
     /// 메모리 상태도 담는다. 기본은 VM이 실행 중이고 디스크가 있으면 true다.
     pub memory: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CloneRequest {
+    /// 새 VM의 이름
+    pub name: String,
+    /// 복제할 스냅샷(이름이나 id). 없으면 꺼진 VM의 지금 상태에서 복제한다.
+    pub snapshot: Option<String>,
+    /// 새 디스크를 둘 풀. 없으면 원본 볼륨마다 그 볼륨의 풀이다.
+    pub pool: Option<String>,
 }
 
 /// VM의 디스크 작업을 할 노드: 다음에 돌 노드(`spec.node`), 지금(또는 마지막으로) 돈 노드
@@ -99,9 +112,9 @@ fn check_not_busy(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// 이 VM의 스냅샷 만들기·되돌리기 Task가 끝나지 않았으면 409 `vm_busy`. 그 Task는 전원을 끄고
-/// 켜며 디스크를 바꾸므로, 그사이 전원이나 스펙을 바꾸면 되돌리는 디스크를 QEMU가 열거나 담는
-/// 스펙이 실제와 달라진다. 시작한 Task는 실행기의 시간 제한 안에 끝나지만, 오프라인 노드에 배정된
+/// 이 VM의 스냅샷 만들기·되돌리기나 복제 Task가 끝나지 않았으면 409 `vm_busy`. 스냅샷 Task는
+/// 전원을 끄고 켜며 디스크를 바꾸므로, 그사이 전원이나 스펙을 바꾸면 되돌리는 디스크를 QEMU가 열거나
+/// 담는 스펙이 실제와 달라진다. 꺼진 VM을 복사하는 동안 켜면 디스크 잠금 때문에 시작이 실패한다. 시작한 Task는 실행기의 시간 제한 안에 끝나지만, 오프라인 노드에 배정된
 /// Task는 그 노드가 돌아올 때까지 남는다(설계 §11).
 pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
     let (_, tasks) = state.cluster.list::<TaskSpec>()?;
@@ -110,14 +123,16 @@ pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), Ap
             && !t.status.state.is_finished()
             && matches!(
                 t.spec.op,
-                TaskOp::SnapshotCreate { .. } | TaskOp::SnapshotRevert { .. }
+                TaskOp::SnapshotCreate { .. }
+                    | TaskOp::SnapshotRevert { .. }
+                    | TaskOp::VmClone { .. }
             )
     });
     if busy {
         return Err(ApiError::conflict(
             "vm_busy",
             format!(
-                "VM {:?} is being snapshotted or reverted; try again when the task has finished",
+                "VM {:?} is being snapshotted, reverted or cloned; try again when the task has finished",
                 vm.name
             ),
         ));
@@ -348,6 +363,98 @@ pub async fn delete_snapshot(
         snapshot: snapshot.id,
     };
     let task = create_task(&state.cluster, op, vm.id, vm_node(&state, &vm)).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// VM을 `name`으로 복제할 Task를 돌려준다(202). 원본은 `ready` 스냅샷이나 꺼진 VM의 지금 상태다
+/// (실행 중인데 스냅샷이 없으면 409 `vm_running`). 원본 스펙의 볼륨이 모두 있어야 하고, `pool`은 Task
+/// 노드에서 쓸 수 있어야 한다. Task는 원본 VM을 대상으로 그 VM의 디스크 노드에서 돈다.
+#[utoipa::path(post, path = "/vms/{key}/clone", tag = "vms",
+    params(("key" = String, Path, description = "VM id or name")),
+    request_body = CloneRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn clone_vm(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    Json(req): Json<CloneRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
+    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
+    check_name(&req.name)?;
+    let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    // 이름이 그새 쓰이면 Task가 VM을 만들 때 실패한다.
+    if state.cluster.get_by_name::<VmSpec>(&req.name)?.is_some() {
+        return Err(ApiError::conflict(
+            "name_taken",
+            format!("VM {:?} already exists", req.name),
+        ));
+    }
+    check_not_busy(&state, &vm)?;
+    let (snapshot, spec) = match &req.snapshot {
+        Some(key) => {
+            let snapshot = find_snapshot(&state, &vm, key)?;
+            check_ready(&snapshot)?;
+            (Some(snapshot.id), snapshot.spec.vm_spec)
+        }
+        None if !is_stopped(&vm) => {
+            return Err(ApiError::conflict(
+                "vm_running",
+                format!(
+                    "VM {:?} is running; stop it or clone from a snapshot",
+                    vm.name
+                ),
+            ));
+        }
+        None => (None, vm.spec.clone()),
+    };
+    let node = vm_node(&state, &vm);
+    if let Some(name) = &req.pool {
+        let pool = state
+            .cluster
+            .get_by_name::<StoragePoolSpec>(name)?
+            .ok_or_else(|| ApiError::bad_request(format!("storage pool {name:?} not found")))?;
+        if !pool.spec.nodes.is_empty() && !pool.spec.nodes.contains(&node) {
+            return Err(ApiError::conflict(
+                "pool_not_on_node",
+                format!(
+                    "storage pool {name:?} is not available on the node holding VM {:?}",
+                    vm.name
+                ),
+            ));
+        }
+    }
+    for disk in &spec.disks {
+        if state
+            .cluster
+            .get_by_name::<VolumeSpec>(&disk.volume)?
+            .is_none()
+        {
+            return Err(ApiError::bad_request(format!(
+                "volume {:?} not found",
+                disk.volume
+            )));
+        }
+    }
+    // 새 VM은 원본 스펙의 NIC를 그대로 가진다(VM 만들기와 같은 검사).
+    for nic in spec.nics.iter().filter(|n| n.network != USER_NETWORK) {
+        if state
+            .cluster
+            .get_by_name::<NetworkSpec>(&nic.network)?
+            .is_none()
+        {
+            return Err(ApiError::bad_request(format!(
+                "network {:?} not found",
+                nic.network
+            )));
+        }
+    }
+    let op = TaskOp::VmClone {
+        name: req.name,
+        snapshot,
+        pool: req.pool,
+    };
+    let task = create_task(&state.cluster, op, vm.id, node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
