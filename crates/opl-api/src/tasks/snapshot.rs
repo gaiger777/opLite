@@ -87,6 +87,16 @@ async fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
     tokio::fs::copy(from, to).await.map(|_| ())
 }
 
+/// 이 노드에서 파일이 보이는 볼륨인지. 다른 노드에 만든 볼륨은 풀이 공유되지 않으면 오류다.
+fn check_local(ctx: &Ctx, volume: &Volume, pool: &StoragePool) -> Result<(), String> {
+    match volume.status.node {
+        Some(node) if node != ctx.config.node && !pool.spec.shared => {
+            Err(format!("volume {:?} is on node {node}", volume.name))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// 디스크의 태그를 지운다. 실행 중이면 QEMU가 디스크를 쥐고 있으므로 하이퍼바이저로, 아니면
 /// `spec`의 디스크마다 스토리지로 지운다. 태그나 볼륨이 없는 디스크는 그냥 넘어가고, 한 디스크가
 /// 실패해도 나머지를 지운 뒤 첫 오류를 돌려준다. 다른 노드에 있는 볼륨은 이 노드에서 파일이 보이지
@@ -110,12 +120,9 @@ async fn remove_tags(
         let Some((volume, pool)) = volume_by_name(ctx, &disk.volume)? else {
             continue;
         };
-        if let Some(node) = volume.status.node
-            && node != ctx.config.node
-            && !pool.spec.shared
-        {
+        if let Err(e) = check_local(ctx, &volume, &pool) {
             if result.is_ok() {
-                result = Err(format!("volume {:?} is on node {node}", volume.name));
+                result = Err(e);
             }
             continue;
         }
@@ -322,9 +329,12 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
     if snapshot.status.phase != SnapshotPhase::Ready {
         return Err("snapshot is not ready".into());
     }
-    // 되돌릴 수 없는데 VM만 꺼지지 않도록 끄기 전에 볼륨을 확인한다. API가 확인한 뒤 다른 VM이
-    // 볼륨을 붙였을 수 있다.
+    // 되돌릴 수 없는데 VM만 꺼지지 않도록 끄기 전에 볼륨을 확인한다: 이 노드에서 보이는지, API가
+    // 확인한 뒤 다른 VM이 붙이지 않았는지.
     let disks = ready_disks(ctx, &snapshot.spec.vm_spec)?;
+    for (volume, pool) in &disks {
+        check_local(ctx, volume, pool)?;
+    }
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
     for (volume, _) in &disks {
         if let Some(other) = vms

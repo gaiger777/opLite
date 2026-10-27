@@ -562,6 +562,46 @@ async fn delete_does_not_treat_a_volume_of_another_node_as_gone() {
 }
 
 #[tokio::test]
+async fn revert_checks_volumes_of_another_node_before_stopping() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "s" })).await);
+    let pid = env.pid(vm).await;
+    let before = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+
+    // 볼륨 파일이 다른 노드에 있다. 이 노드에서는 되돌릴 수 없다.
+    let mut root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    root.status.node = Some(Uuid::now_v7());
+    env.cluster
+        .update_status::<VolumeSpec>(root.id, &root.status)
+        .await
+        .unwrap();
+    let (status, revert) = admin.post("/vms/web/snapshots/s/revert", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{revert}");
+    let task = admin.wait_task(&revert).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(
+        task["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("is on node"),
+        "{task}"
+    );
+    // 끄지도, 스펙을 바꾸지도 않았다.
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(got.spec, before.spec);
+    assert_eq!(env.pid(vm).await, pid);
+    assert!(!storage.calls().iter().any(|(call, _)| *call == "revert"));
+}
+
+#[tokio::test]
 async fn resize_keeps_volume_labels_written_meanwhile() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
