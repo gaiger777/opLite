@@ -247,7 +247,7 @@ async fn console_is_relayed_to_the_node_running_the_vm() {
         "firmware": "uefi", "machine": "virt", "disks": [], "nics": []
     }))
     .unwrap();
-    target.hv.start(&spec).await.unwrap();
+    target.hv.start(&spec, None).await.unwrap();
     let listener = tokio::net::UnixListener::bind(tmp.path().join(format!("{vm}.vnc"))).unwrap();
     tokio::spawn(async move {
         let (mut conn, _) = listener.accept().await.unwrap();

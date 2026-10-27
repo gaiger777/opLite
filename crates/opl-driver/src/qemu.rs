@@ -34,6 +34,9 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// SHUTDOWN 뒤 연결이 끊겼을 때 런타임 디렉터리를 지우려고 프로세스 종료를 잠깐 기다리는 한도.
 /// QEMU는 소켓을 닫고 곧 끝나지만, 플러시가 길면 디렉터리는 다음 launch/new()에 맡기고 종료를 바로 알린다.
 const SHUTDOWN_EXIT_WAIT: Duration = Duration::from_secs(1);
+/// 내부 스냅샷(저장·불러오기·삭제) 하나를 기다리는 한도. 메모리 스냅샷은 메모리 크기만큼 걸린다.
+/// Task 한도(600초)보다 짧아야 Task가 먼저 끊기지 않고 이 오류(작업이 남아 있을 수 있음)를 받는다.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(540);
 
 #[derive(Debug, Clone)]
 pub struct QemuConfig {
@@ -178,7 +181,12 @@ impl QemuHypervisor {
         Ok(())
     }
 
-    async fn launch(&self, vm: &VmRuntimeSpec, paths: &RuntimePaths) -> Result<(), DriverError> {
+    async fn launch(
+        &self,
+        vm: &VmRuntimeSpec,
+        paths: &RuntimePaths,
+        restore: Option<&str>,
+    ) -> Result<(), DriverError> {
         std::fs::create_dir_all(&paths.dir)?;
         std::fs::create_dir_all(self.state_dir(vm.id))?;
         if vm.firmware == Firmware::Uefi && !paths.uefi_vars.exists() {
@@ -232,6 +240,25 @@ impl QemuHypervisor {
             // 그새 끝났다. 모니터가 종료 이벤트를 보냈다.
             return Ok(());
         };
+        if let Some(tag) = restore {
+            // -S로 멈춘 채 불러온 뒤 cont로 이어서 실행한다. 메모리 상태는 첫 디스크(disk0)에 있다.
+            let devices: Vec<String> = (0..vm.disks.len()).map(|i| format!("disk{i}")).collect();
+            let load = job(
+                handle
+                    .qmp
+                    .snapshot_load(tag, "disk0", &devices, SNAPSHOT_TIMEOUT),
+                "QMP snapshot-load",
+            )
+            .await;
+            if let Err(e) = load {
+                drop(handle);
+                // 작업이 끝나지 않았으면 QMP가 답하지 않을 수 있으므로 끝날 때까지 기다리고 필요하면 죽인다.
+                if let Err(stop) = self.stop(vm.id, StopMode::Force).await {
+                    tracing::error!(id = %vm.id, error = %stop, "failed to stop QEMU after snapshot load failed");
+                }
+                return Err(e);
+            }
+        }
         let cont = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.cont()).await;
         if let Err(e) = flatten(cont, "QMP cont") {
             let _ = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.quit()).await;
@@ -311,6 +338,19 @@ impl QemuHypervisor {
         true
     }
 
+    /// QMP로 다룰 수 있는 실행 중인 VM의 핸들
+    fn running_handle(&self, id: Uuid) -> Result<Arc<VmHandle>, DriverError> {
+        if let Some(handle) = self.handle(id) {
+            return Ok(handle);
+        }
+        match liveness(&self.paths(id)?.pidfile) {
+            Liveness::Dead => Err(DriverError::NotRunning(id)),
+            // 살아 있지만 QMP로 다룰 수 없다. 꺼졌다고 알리면 호출자가 쓰고 있는 디스크를 건드린다.
+            // 요청을 보내지 않았으므로 시간 초과(작업이 남아 있을 수 있음)와 구별한다.
+            Liveness::Alive(_) | Liveness::Unknown => Err(DriverError::NotAttached(id)),
+        }
+    }
+
     /// opld가 `-daemonize`와 `cont` 사이에 죽으면 VM이 `-S`(prelaunch) 상태로 남는다. 이어서 실행한다.
     async fn resume_if_prelaunch(&self, id: Uuid) -> Result<(), DriverError> {
         let Some(handle) = self.handle(id) else {
@@ -360,7 +400,8 @@ impl QemuHypervisor {
 
 #[async_trait]
 impl Hypervisor for QemuHypervisor {
-    async fn start(&self, vm: &VmRuntimeSpec) -> Result<(), DriverError> {
+    async fn start(&self, vm: &VmRuntimeSpec, restore: Option<&str>) -> Result<(), DriverError> {
+        // 이미 살아 있는 VM에는 restore를 쓰지 않는다. -S로 남은 VM도 그대로 이어서 실행한다.
         if self.handle(vm.id).is_some() {
             return self.resume_if_prelaunch(vm.id).await;
         }
@@ -381,7 +422,12 @@ impl Hypervisor for QemuHypervisor {
             }
             return Err(DriverError::Timeout("reattach to running QEMU"));
         }
-        if let Err(e) = self.launch(vm, &paths).await {
+        if restore.is_some() && vm.disks.is_empty() {
+            return Err(DriverError::InvalidSpec(
+                "a snapshot to restore needs a disk for its memory state".into(),
+            ));
+        }
+        if let Err(e) = self.launch(vm, &paths, restore).await {
             if self.handle(vm.id).is_none() {
                 self.kill_and_cleanup(vm.id, &paths).await;
             }
@@ -489,9 +535,85 @@ impl Hypervisor for QemuHypervisor {
             .ok_or(DriverError::NotRunning(id))
     }
 
+    async fn snapshot_save(&self, id: Uuid, tag: &str, memory: bool) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let devices = query_disk_nodes(&handle.qmp).await?;
+        let Some(vmstate) = devices.first() else {
+            return Err(DriverError::InvalidSpec(format!("VM {id} has no disks")));
+        };
+        if memory {
+            let save = handle
+                .qmp
+                .snapshot_save(tag, vmstate, &devices, SNAPSHOT_TIMEOUT);
+            job(save, "QMP snapshot-save").await
+        } else {
+            let r =
+                tokio::time::timeout(SNAPSHOT_TIMEOUT, handle.qmp.snapshot_disks(tag, &devices))
+                    .await;
+            flatten(r, "QMP transaction")
+        }
+    }
+
+    async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let devices = query_disk_nodes(&handle.qmp).await?;
+        if devices.is_empty() {
+            return Ok(());
+        }
+        let delete = handle.qmp.snapshot_delete(tag, &devices, SNAPSHOT_TIMEOUT);
+        job(delete, "QMP snapshot-delete").await
+    }
+
+    async fn block_resize(
+        &self,
+        id: Uuid,
+        disk: usize,
+        size_bytes: u64,
+    ) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let node = format!("disk{disk}");
+        let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.block_resize(&node, size_bytes)).await;
+        flatten(r, "QMP block_resize")
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
         self.events.subscribe()
     }
+}
+
+/// 실행 중인 VM의 디스크 노드 이름(`disk{i}`)을 디스크 순서로 읽는다. 다시 붙은 VM은 스펙을
+/// 모르므로 QEMU에 묻는다.
+async fn query_disk_nodes(qmp: &QmpClient) -> Result<Vec<String>, DriverError> {
+    let r = tokio::time::timeout(QMP_TIMEOUT, qmp.execute("query-named-block-nodes", None)).await;
+    Ok(disk_nodes(&flatten(r, "QMP query-named-block-nodes")?))
+}
+
+/// 블록 노드 목록에서 cmdline이 디스크 포맷 노드에 붙인 `disk{i}`만 골라 i 순서로 돌려준다.
+fn disk_nodes(nodes: &serde_json::Value) -> Vec<String> {
+    let mut disks: Vec<(usize, String)> = nodes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n["node-name"].as_str())
+        .filter_map(|name| {
+            let i = name.strip_prefix("disk")?.parse().ok()?;
+            Some((i, name.to_string()))
+        })
+        .collect();
+    disks.sort();
+    disks.into_iter().map(|(_, name)| name).collect()
+}
+
+/// QMP 작업 명령을 기다린다. 작업의 제한 시간은 이벤트를 기다리는 동안에만 걸리므로, QEMU가
+/// 명령 자체에 답하지 않아도(SIGSTOP 등) 묶이지 않게 한 번 더 감싼다.
+async fn job(
+    fut: impl Future<Output = Result<(), QmpError>>,
+    what: &'static str,
+) -> Result<(), DriverError> {
+    flatten(
+        tokio::time::timeout(SNAPSHOT_TIMEOUT + QMP_TIMEOUT, fut).await,
+        what,
+    )
 }
 
 /// QMP 연결이 끊길 때까지 이벤트를 지켜보다가, 종료 종류를 판정해 알리고 런타임 파일을 정리한다.
@@ -764,7 +886,7 @@ mod tests {
         let hv = QemuHypervisor::new(config(tmp.path(), fake)).await.unwrap();
         let vm = spec();
 
-        let err = hv.start(&vm).await.unwrap_err();
+        let err = hv.start(&vm, None).await.unwrap_err();
         match &err {
             DriverError::StartFailed(msg) => assert_eq!(msg, "qemu: something broke"),
             other => panic!("unexpected error: {other:?}"),
@@ -841,6 +963,8 @@ time.sleep(60)
         closed: tokio::sync::oneshot::Receiver<()>,
         /// 받은 명령 이름
         commands: Arc<Mutex<Vec<String>>>,
+        /// 받은 명령의 인자(`commands`와 같은 순서)
+        arguments: Arc<Mutex<Vec<serde_json::Value>>>,
         /// 보내면 서버가 (주어진 이벤트를 먼저 보낸 뒤) 연결을 끊는다.
         hangup: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
     }
@@ -856,6 +980,8 @@ time.sleep(60)
         let (hangup, mut hangup_rx) = tokio::sync::oneshot::channel::<Option<serde_json::Value>>();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let recorded = commands.clone();
+        let args = Arc::new(Mutex::new(Vec::new()));
+        let arguments = args.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
@@ -883,9 +1009,17 @@ time.sleep(60)
                     "query-status" => {
                         serde_json::json!({ "running": status == "running", "status": status })
                     }
+                    // 디스크 두 개를 가진 VM의 블록 노드
+                    "query-named-block-nodes" => serde_json::json!([
+                        { "node-name": "disk1" },
+                        { "node-name": "disk1-file" },
+                        { "node-name": "disk0" },
+                        { "node-name": "disk0-file" },
+                    ]),
                     _ => serde_json::json!({}),
                 };
                 recorded.lock().unwrap().push(name);
+                arguments.lock().unwrap().push(cmd["arguments"].clone());
                 let reply = serde_json::json!({ "return": ret, "id": cmd["id"] });
                 if write
                     .write_all(format!("{reply}\n").as_bytes())
@@ -900,6 +1034,7 @@ time.sleep(60)
         FakeQmp {
             closed,
             commands,
+            arguments: args,
             hangup,
         }
     }
@@ -965,12 +1100,88 @@ time.sleep(60)
         let hv = QemuHypervisor::new(cfg).await.unwrap();
         assert!(hv.inspect(vm.id).await.unwrap().is_some());
 
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         assert!(
             fake.commands.lock().unwrap().contains(&"cont".to_string()),
             "commands: {:?}",
             fake.commands.lock().unwrap()
         );
+    }
+
+    #[test]
+    fn disk_nodes_are_format_nodes_in_disk_order() {
+        let nodes = serde_json::json!([
+            { "node-name": "disk10" },
+            { "node-name": "disk2-file" },
+            { "node-name": "disk2" },
+            { "node-name": "#block123" },
+            { "node-name": "diskx" },
+            { "node-name": "disk0" },
+        ]);
+        assert_eq!(disk_nodes(&nodes), ["disk0", "disk2", "disk10"]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_ops_use_disk_node_names() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "running").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+
+        // 디스크만 스냅샷은 모든 디스크를 transaction 하나로 찍는다.
+        hv.snapshot_save(vm.id, "s1", false).await.unwrap();
+        hv.block_resize(vm.id, 1, 2 << 30).await.unwrap();
+        let commands = fake.commands.lock().unwrap().clone();
+        let arguments = fake.arguments.lock().unwrap().clone();
+        let at = |name: &str| commands.iter().position(|c| c == name).unwrap();
+        let actions = &arguments[at("transaction")]["actions"];
+        assert_eq!(actions[0]["data"]["device"], "disk0");
+        assert_eq!(actions[1]["data"]["device"], "disk1");
+        assert_eq!(actions[1]["data"]["name"], "s1");
+        assert_eq!(
+            arguments[at("block_resize")],
+            serde_json::json!({ "node-name": "disk1", "size": 2u64 << 30 })
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_ops_on_vm_that_is_not_attached() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let hv = QemuHypervisor::new(cfg.clone()).await.unwrap();
+        let err = hv
+            .snapshot_save(Uuid::now_v7(), "s", true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::NotRunning(_)), "{err:?}");
+
+        // 살아 있지만 QMP로 다룰 수 없는 VM을 꺼진 것으로 알리면 호출자가 쓰고 있는 디스크를
+        // qemu-img로 건드린다. 다시 시도할 수 있는 오류로 끝낸다.
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = unresponsive_vm(&dir).await;
+        for err in [
+            hv.snapshot_save(vm.id, "s", true).await.unwrap_err(),
+            hv.snapshot_delete(vm.id, "s").await.unwrap_err(),
+            hv.block_resize(vm.id, 0, 1 << 30).await.unwrap_err(),
+        ] {
+            assert!(matches!(err, DriverError::NotAttached(_)), "{err:?}");
+            assert!(err.is_transient());
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_without_disks_is_invalid() {
+        let tmp = short_tempdir();
+        let hv = QemuHypervisor::new(config(tmp.path(), PathBuf::from("/nonexistent/qemu")))
+            .await
+            .unwrap();
+        // 메모리 상태는 첫 디스크에 있으므로 디스크가 없으면 띄우기 전에 거부한다.
+        let err = hv.start(&spec(), Some("s1")).await.unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -983,7 +1194,7 @@ time.sleep(60)
         // QEMU는 살아 있지만(SIGSTOP 등) QMP에 답하지 않는다.
         let qemu = unresponsive_vm(&dir).await;
 
-        let err = hv.start(&vm).await.unwrap_err();
+        let err = hv.start(&vm, None).await.unwrap_err();
         assert!(err.is_transient(), "{err:?}");
         assert!(dir.join("qemu.pid").exists());
         assert!(dir.join("qmp.sock").exists());
@@ -1166,7 +1377,7 @@ time.sleep(60)
                 vlan: None,
             },
         });
-        let err = hv.start(&vm).await.unwrap_err();
+        let err = hv.start(&vm, None).await.unwrap_err();
         assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
     }
 
@@ -1187,7 +1398,7 @@ time.sleep(60)
                 vlan: None,
             },
         });
-        match hv.start(&vm).await.unwrap_err() {
+        match hv.start(&vm, None).await.unwrap_err() {
             DriverError::InvalidSpec(msg) => assert!(msg.contains("eth0"), "{msg}"),
             other => panic!("unexpected error: {other:?}"),
         }
@@ -1204,7 +1415,7 @@ time.sleep(60)
             ..spec()
         };
         assert!(matches!(
-            hv.start(&vm).await,
+            hv.start(&vm, None).await,
             Err(DriverError::InvalidSpec(_))
         ));
     }

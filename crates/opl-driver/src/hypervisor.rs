@@ -54,7 +54,11 @@ pub enum EventKind {
 #[async_trait]
 pub trait Hypervisor: Send + Sync {
     /// VM을 시작한다. 이미 실행 중이면 아무것도 하지 않고 성공한다.
-    async fn start(&self, vm: &VmRuntimeSpec) -> Result<(), DriverError>;
+    ///
+    /// `restore`가 있으면 새로 띄운 VM을 실행하기 전에 그 태그의 내부 스냅샷(디스크와 메모리,
+    /// 메모리는 첫 디스크)을 불러온다. 불러오지 못하면 VM을 끝내고 오류를 돌려준다.
+    /// 이미 실행 중인 VM에는 쓰지 않는다.
+    async fn start(&self, vm: &VmRuntimeSpec, restore: Option<&str>) -> Result<(), DriverError>;
 
     /// `Acpi`는 요청만 보내고 바로 돌아온다. `Force`는 프로세스가 끝날 때까지 기다린다.
     /// 실행 중이 아니면 아무것도 하지 않고 성공한다.
@@ -69,6 +73,17 @@ pub trait Hypervisor: Send + Sync {
 
     /// VNC 유닉스 소켓 경로
     async fn console_endpoint(&self, id: Uuid) -> Result<PathBuf, DriverError>;
+
+    /// 실행 중인 VM의 모든 디스크에 내부 스냅샷 `tag`를 만든다. `memory`면 메모리 상태도
+    /// 첫 디스크에 담는다(저장하는 동안 VM이 멈춘다). 아니면 VM을 멈추지 않고 디스크만 찍는다.
+    async fn snapshot_save(&self, id: Uuid, tag: &str, memory: bool) -> Result<(), DriverError>;
+
+    /// 실행 중인 VM의 모든 디스크에서 내부 스냅샷 `tag`를 지운다. 태그가 없어도 성공한다.
+    async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError>;
+
+    /// 실행 중인 VM의 `disk`번째 디스크(스펙의 `disks` 순서) 크기를 바꾼다. 게스트가 바로 본다.
+    async fn block_resize(&self, id: Uuid, disk: usize, size_bytes: u64)
+    -> Result<(), DriverError>;
 
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;

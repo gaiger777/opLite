@@ -343,7 +343,7 @@ impl Worker {
                 return Ok(false);
             }
         };
-        match self.hv.start(&spec).await {
+        match self.hv.start(&spec, None).await {
             Ok(()) => Ok(true),
             Err(e) if e.is_transient() => {
                 self.record_failure(format!("failed to start: {e}"));
@@ -359,7 +359,7 @@ impl Worker {
     /// 살아 있는 VM에 다시 붙거나 이어서 실행한다(`start`는 멱등이다). 참조 해석 오류도 돌려준다.
     async fn reattach(&self, vm: &Vm) -> Result<(), String> {
         let spec = runtime_spec(&self.cluster, vm, self.config.node).map_err(|e| e.to_string())?;
-        self.hv.start(&spec).await.map_err(|e| e.to_string())
+        self.hv.start(&spec, None).await.map_err(|e| e.to_string())
     }
 
     /// spec.power를 stopped로 바꾸고 status를 기록한다. 둘 다 성공해야 끝난다.

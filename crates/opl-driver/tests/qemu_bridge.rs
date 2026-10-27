@@ -121,14 +121,14 @@ async fn vm_nic_is_on_the_bridge_while_qemu_runs() {
     let vm = spec(&br.0);
     let tap = tap_name(vm.id, 0);
 
-    hv.start(&vm).await.unwrap();
+    hv.start(&vm, None).await.unwrap();
     assert_eq!(master_of(&tap), Some(br.0.clone()));
     hv.stop(vm.id, StopMode::Force).await.unwrap();
     wait_gone(&tap).await;
 
     // QEMU가 죽어도 tap을 지운다.
     let mut rx = hv.subscribe();
-    hv.start(&vm).await.unwrap();
+    hv.start(&vm, None).await.unwrap();
     assert_eq!(master_of(&tap), Some(br.0.clone()));
     let pid = hv.inspect(vm.id).await.unwrap().unwrap().pid;
     assert!(
@@ -169,7 +169,7 @@ async fn missing_bridge_fails_the_start_without_leftovers() {
             vlan: None,
         },
     });
-    let err = hv.start(&vm).await.unwrap_err();
+    let err = hv.start(&vm, None).await.unwrap_err();
     assert!(!err.is_transient(), "{err:?}");
     assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
     assert!(!exists(&tap_name(vm.id, 0)));
@@ -187,7 +187,7 @@ async fn tap_stays_on_the_bridge_across_driver_restart() {
     let tap = tap_name(vm.id, 0);
     {
         let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         assert_eq!(master_of(&tap), Some(br.0.clone()));
         // 드라이버(= opld)가 내려간다. QEMU는 분리되어 있으므로 tap도 그대로여야 한다.
     }

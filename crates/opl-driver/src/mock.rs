@@ -26,6 +26,12 @@ struct MockState {
     /// 살아 있지만 QMP로 다룰 수 없는 VM
     unresponsive: HashSet<Uuid>,
     console_dir: Option<PathBuf>,
+    /// 새로 띄우려 한 VM과 불러오려 한 스냅샷 태그 (실패한 시도 포함)
+    launches: Vec<(Uuid, Option<String>)>,
+    /// VM별 내부 스냅샷 (태그, 메모리 포함)
+    snapshots: HashMap<Uuid, Vec<(String, bool)>>,
+    /// `block_resize`로 바꾼 (VM, 디스크 번호)별 크기
+    disk_sizes: HashMap<(Uuid, usize), u64>,
 }
 
 impl Default for MockHypervisor {
@@ -78,6 +84,39 @@ impl MockHypervisor {
         self.state.lock().unwrap().console_dir = Some(dir.into());
     }
 
+    /// 새로 띄우려 한 VM과 `start`에 준 `restore` 태그를 순서대로 돌려준다. 이미 실행 중이어서
+    /// 띄우지 않은 `start`는 빠지고, 주입한 오류로 실패한 시도는 들어간다.
+    pub fn launches(&self) -> Vec<(Uuid, Option<String>)> {
+        self.state.lock().unwrap().launches.clone()
+    }
+
+    /// 실행 중에 `snapshot_save`로 만들고 지우지 않은 스냅샷 (태그, 메모리 포함). VM이 꺼져도 남는다.
+    pub fn snapshots(&self, id: Uuid) -> Vec<(String, bool)> {
+        let st = self.state.lock().unwrap();
+        st.snapshots.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// `block_resize`로 마지막에 바꾼 크기
+    pub fn disk_size(&self, id: Uuid, disk: usize) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .disk_sizes
+            .get(&(id, disk))
+            .copied()
+    }
+
+    /// 실제 드라이버처럼 실행 중인 VM만 다룬다. 살아 있지만 QMP로 다룰 수 없으면 다시 시도할 오류다.
+    fn controllable(st: &MockState, id: Uuid) -> Result<(), DriverError> {
+        if !st.vms.contains_key(&id) {
+            Err(DriverError::NotRunning(id))
+        } else if st.unresponsive.contains(&id) {
+            Err(DriverError::NotAttached(id))
+        } else {
+            Ok(())
+        }
+    }
+
     fn remove(&self, id: Uuid, kind: EventKind) {
         let mut st = self.state.lock().unwrap();
         st.unresponsive.remove(&id);
@@ -99,7 +138,7 @@ impl MockHypervisor {
 
 #[async_trait]
 impl Hypervisor for MockHypervisor {
-    async fn start(&self, vm: &VmRuntimeSpec) -> Result<(), DriverError> {
+    async fn start(&self, vm: &VmRuntimeSpec, restore: Option<&str>) -> Result<(), DriverError> {
         {
             let mut st = self.state.lock().unwrap();
             // 실제 드라이버처럼 이미 실행 중이면 기동을 시도하지 않으므로 주입한 오류도 쓰지 않는다.
@@ -109,6 +148,7 @@ impl Hypervisor for MockHypervisor {
                 }
                 return Ok(());
             }
+            st.launches.push((vm.id, restore.map(str::to_string)));
             if let Some(err) = st.fail_next_start.take() {
                 return Err(err);
             }
@@ -179,6 +219,37 @@ impl Hypervisor for MockHypervisor {
         }
     }
 
+    async fn snapshot_save(&self, id: Uuid, tag: &str, memory: bool) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        st.snapshots
+            .entry(id)
+            .or_default()
+            .push((tag.to_string(), memory));
+        Ok(())
+    }
+
+    async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        if let Some(snapshots) = st.snapshots.get_mut(&id) {
+            snapshots.retain(|(t, _)| t != tag);
+        }
+        Ok(())
+    }
+
+    async fn block_resize(
+        &self,
+        id: Uuid,
+        disk: usize,
+        size_bytes: u64,
+    ) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        st.disk_sizes.insert((id, disk), size_bytes);
+        Ok(())
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
         self.events.subscribe()
     }
@@ -212,8 +283,8 @@ mod tests {
         let hv = MockHypervisor::default();
         let mut rx = hv.subscribe();
         let vm = spec();
-        hv.start(&vm).await.unwrap();
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         assert_eq!(
             rx.recv().await.unwrap(),
             HypervisorEvent {
@@ -231,7 +302,7 @@ mod tests {
     async fn stop_removes_vm_and_is_idempotent() {
         let hv = MockHypervisor::default();
         let vm = spec();
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         let mut rx = hv.subscribe();
         hv.stop(vm.id, StopMode::Force).await.unwrap();
         hv.stop(vm.id, StopMode::Force).await.unwrap();
@@ -254,7 +325,7 @@ mod tests {
         let hv = MockHypervisor::default();
         let vm = spec();
         hv.set_console_dir("/tmp/consoles");
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         assert_eq!(
             hv.console_endpoint(vm.id).await.unwrap(),
             PathBuf::from(format!("/tmp/consoles/{}.vnc", vm.id))
@@ -267,24 +338,24 @@ mod tests {
         let vm = spec();
         hv.fail_next_start(DriverError::StartFailed("boom".into()));
         assert!(matches!(
-            hv.start(&vm).await,
+            hv.start(&vm, None).await,
             Err(DriverError::StartFailed(_))
         ));
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
     }
 
     #[tokio::test]
     async fn injected_failure_does_not_apply_to_running_vm() {
         let hv = MockHypervisor::default();
         let vm = spec();
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         hv.fail_next_start(DriverError::StartFailed("boom".into()));
         // 실제 드라이버처럼 이미 실행 중이면 기동을 시도하지 않으므로 실패하지 않는다.
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         // 주입한 오류는 소비되지 않고 다음 실제 기동에 적용된다.
         hv.crash(vm.id);
         assert!(matches!(
-            hv.start(&vm).await,
+            hv.start(&vm, None).await,
             Err(DriverError::StartFailed(_))
         ));
     }
@@ -293,7 +364,7 @@ mod tests {
     async fn acpi_stop_only_requests_shutdown() {
         let hv = MockHypervisor::default();
         let vm = spec();
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         let mut rx = hv.subscribe();
         hv.stop(vm.id, StopMode::Acpi).await.unwrap();
         // 게스트가 요청을 무시할 수 있으므로 VM은 그대로 돌고 이벤트도 없다.
@@ -315,7 +386,7 @@ mod tests {
     async fn unresponsive_vm_cannot_be_controlled_but_can_be_killed() {
         let hv = MockHypervisor::default();
         let vm = spec();
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         let pid = hv.inspect(vm.id).await.unwrap().unwrap().pid;
         let mut rx = hv.subscribe();
         hv.set_unresponsive(vm.id, true);
@@ -327,7 +398,10 @@ mod tests {
         };
         assert_eq!(hv.inspect(vm.id).await.unwrap(), Some(unresponsive.clone()));
         assert_eq!(hv.list().await.unwrap(), vec![unresponsive]);
-        assert!(matches!(hv.start(&vm).await, Err(DriverError::Timeout(_))));
+        assert!(matches!(
+            hv.start(&vm, None).await,
+            Err(DriverError::Timeout(_))
+        ));
         assert!(matches!(
             hv.stop(vm.id, StopMode::Acpi).await,
             Err(DriverError::Timeout(_))
@@ -335,7 +409,7 @@ mod tests {
 
         // 다시 붙을 수 있게 되면 그대로 돌고 있다.
         hv.set_unresponsive(vm.id, false);
-        hv.start(&vm).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
         let st = hv.inspect(vm.id).await.unwrap().unwrap();
         assert_eq!((st.pid, st.status), (pid, RuntimeStatus::Running));
 
@@ -347,11 +421,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn records_restore_tag_of_each_launch() {
+        let hv = MockHypervisor::default();
+        let vm = spec();
+        hv.start(&vm, Some("s1")).await.unwrap();
+        // 이미 실행 중이면 새로 띄우지 않으므로 기록하지 않는다.
+        hv.start(&vm, None).await.unwrap();
+        hv.stop(vm.id, StopMode::Force).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
+        assert_eq!(
+            hv.launches(),
+            vec![(vm.id, Some("s1".to_string())), (vm.id, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_ops_need_a_running_vm() {
+        let hv = MockHypervisor::default();
+        let vm = spec();
+        for res in [
+            hv.snapshot_save(vm.id, "s", true).await,
+            hv.snapshot_delete(vm.id, "s").await,
+            hv.block_resize(vm.id, 0, 1 << 30).await,
+        ] {
+            assert!(matches!(res, Err(DriverError::NotRunning(_))), "{res:?}");
+        }
+
+        hv.start(&vm, None).await.unwrap();
+        hv.snapshot_save(vm.id, "mem", true).await.unwrap();
+        hv.snapshot_save(vm.id, "disk", false).await.unwrap();
+        hv.snapshot_delete(vm.id, "mem").await.unwrap();
+        // 없는 태그를 지워도 성공한다.
+        hv.snapshot_delete(vm.id, "mem").await.unwrap();
+        assert_eq!(hv.snapshots(vm.id), vec![("disk".to_string(), false)]);
+        hv.block_resize(vm.id, 1, 2 << 30).await.unwrap();
+        assert_eq!(hv.disk_size(vm.id, 1), Some(2 << 30));
+        assert_eq!(hv.disk_size(vm.id, 0), None);
+
+        // QMP로 다룰 수 없는 VM은 다시 시도할 수 있는 오류로 끝난다.
+        hv.set_unresponsive(vm.id, true);
+        let err = hv.snapshot_save(vm.id, "x", false).await.unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn crash_and_guest_shutdown_emit_events() {
         let hv = MockHypervisor::default();
         let (a, b) = (spec(), spec());
-        hv.start(&a).await.unwrap();
-        hv.start(&b).await.unwrap();
+        hv.start(&a, None).await.unwrap();
+        hv.start(&b, None).await.unwrap();
         let mut rx = hv.subscribe();
         hv.crash(a.id);
         hv.guest_shutdown(b.id);
