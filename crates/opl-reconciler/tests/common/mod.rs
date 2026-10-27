@@ -225,6 +225,18 @@ impl Env {
         self.reconciler.as_ref().unwrap().handle().force_stop(id);
     }
 
+    pub fn restore_on_start(&self, id: Uuid, tag: &str) {
+        self.reconciler
+            .as_ref()
+            .unwrap()
+            .handle()
+            .restore_on_start(id, tag.into());
+    }
+
+    pub fn clear_restore(&self, id: Uuid) {
+        self.reconciler.as_ref().unwrap().handle().clear_restore(id);
+    }
+
     /// Mock 하이퍼바이저에서 실행 중인 VM의 pid
     pub async fn pid(&self, id: Uuid) -> Option<u32> {
         self.hv.inspect(id).await.unwrap().map(|s| s.pid)

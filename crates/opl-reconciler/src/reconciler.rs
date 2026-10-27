@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use opl_cluster::watch::{Watch, WatchError, WatchEvent};
 use opl_cluster::{Cluster, ClusterError};
@@ -21,13 +21,18 @@ pub struct Reconciler {
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<()>,
     commands: mpsc::UnboundedSender<Uuid>,
+    restores: Restores,
 }
+
+/// VM별로 다음 시작에 불러올 스냅샷 태그. 이 노드의 메모리에만 있어 opld가 재시작하면 사라진다.
+pub(crate) type Restores = Arc<Mutex<HashMap<Uuid, String>>>;
 
 /// 실행 중인 reconciler에 VM별 일회성 명령을 보낸다. 명령은 그 VM의 작업자 큐를 거치므로
 /// 같은 VM에 대한 드라이버 호출이 겹치지 않는다.
 #[derive(Clone)]
 pub struct ReconcilerHandle {
     commands: mpsc::UnboundedSender<Uuid>,
+    restores: Restores,
 }
 
 impl ReconcilerHandle {
@@ -37,16 +42,30 @@ impl ReconcilerHandle {
     pub fn force_stop(&self, id: Uuid) {
         let _ = self.commands.send(id);
     }
+
+    /// 이 노드에서 VM을 다음에 새로 띄울 때 한 번만 이 스냅샷 태그를 불러와 이어서 실행한다.
+    /// 원하는 상태를 running으로 기록하기 전에 부른다. 시작이 실패해도 태그는 쓴 것으로 치고,
+    /// 그 시작은 다시 시도하지 않는다(VM은 failed). 이미 맡긴 태그는 바꾼다.
+    pub fn restore_on_start(&self, id: Uuid, tag: String) {
+        self.restores.lock().unwrap().insert(id, tag);
+    }
+
+    /// 맡긴 태그를 쓰지 않고 버린다(시작하기 전에 되돌리기가 실패했을 때).
+    pub fn clear_restore(&self, id: Uuid) {
+        self.restores.lock().unwrap().remove(&id);
+    }
 }
 
 impl Reconciler {
     pub fn spawn(cluster: Arc<Cluster>, hv: Arc<dyn Hypervisor>, config: ReconcilerConfig) -> Self {
         let (shutdown, rx) = oneshot::channel();
         let (commands, command_rx) = mpsc::unbounded_channel();
+        let restores = Restores::default();
         let dispatcher = Dispatcher {
             cluster,
             hv,
             config: Arc::new(config),
+            restores: restores.clone(),
             workers: HashMap::new(),
             retired: HashMap::new(),
         };
@@ -54,12 +73,14 @@ impl Reconciler {
             shutdown,
             task: tokio::spawn(dispatcher.run(rx, command_rx)),
             commands,
+            restores,
         }
     }
 
     pub fn handle(&self) -> ReconcilerHandle {
         ReconcilerHandle {
             commands: self.commands.clone(),
+            restores: self.restores.clone(),
         }
     }
 
@@ -88,6 +109,7 @@ struct Dispatcher {
     cluster: Arc<Cluster>,
     hv: Arc<dyn Hypervisor>,
     config: Arc<ReconcilerConfig>,
+    restores: Restores,
     /// 이 노드에 배정된 VM의 작업자
     workers: HashMap<Uuid, WorkerHandle>,
     /// 내보냈지만 아직 끝나지 않았을 수 있는 작업자. 같은 VM이 다시 배정되면 새 작업자가 기다린다.
@@ -216,6 +238,7 @@ impl Dispatcher {
             self.cluster.clone(),
             self.hv.clone(),
             self.config.clone(),
+            self.restores.clone(),
         );
         let previous = self.retired.remove(&id);
         let task = tokio::spawn(worker.run(previous, rx));
@@ -225,6 +248,8 @@ impl Dispatcher {
 
     /// 삭제되었거나 다른 노드로 배정된 VM의 작업자를 내보낸다. 작업자는 마지막으로 한 번 확인하고 끝난다.
     fn retire(&mut self, id: Uuid) {
+        // 다시 배정되었을 때 묵은 태그로 시작하지 않게 한다.
+        self.restores.lock().unwrap().remove(&id);
         if let Some(w) = self.workers.remove(&id) {
             let _ = w.tx.send(Trigger::Sync);
             self.retired.insert(id, w.task);

@@ -426,3 +426,74 @@ async fn restarted_reconciler_keeps_running_vms() {
     assert_eq!(env.pid(vm.id).await, before.status.pid);
     assert_eq!(env.get(vm.id).status, before.status);
 }
+
+/// 정지한 VM을 만들고 reconciler가 처리할 때까지 기다린다.
+async fn stopped_vm(env: &Env) -> opl_types::vm::Vm {
+    let mut vm = vm("web", env.node);
+    vm.spec.power = PowerState::Stopped;
+    env.create(&vm).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    vm
+}
+
+#[tokio::test]
+async fn restore_tag_is_used_by_next_start_only() {
+    let env = Env::start().await;
+    let vm = stopped_vm(&env).await;
+
+    env.restore_on_start(vm.id, "snap-1");
+    env.set_power(vm.id, PowerState::Running).await;
+    env.wait(vm.id, "running", running).await;
+    assert_eq!(env.hv.launches(), vec![(vm.id, Some("snap-1".into()))]);
+
+    // 한 번 쓰면 사라진다. 다음 시작은 처음부터 부팅한다.
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    env.set_power(vm.id, PowerState::Running).await;
+    env.wait(vm.id, "running again", running).await;
+    assert_eq!(
+        env.hv.launches(),
+        vec![(vm.id, Some("snap-1".into())), (vm.id, None)]
+    );
+}
+
+#[tokio::test]
+async fn cleared_restore_tag_is_not_used() {
+    let env = Env::start().await;
+    let vm = stopped_vm(&env).await;
+
+    env.restore_on_start(vm.id, "snap-1");
+    env.clear_restore(vm.id);
+    env.set_power(vm.id, PowerState::Running).await;
+    env.wait(vm.id, "running", running).await;
+    assert_eq!(env.hv.launches(), vec![(vm.id, None)]);
+}
+
+#[tokio::test]
+async fn failed_restore_marks_failed_and_consumes_tag() {
+    let env = Env::start().await;
+    let vm = stopped_vm(&env).await;
+
+    // 일시 오류라도 다시 시도하지 않는다. 태그 없이 다시 시작하면 처음부터 부팅하게 된다.
+    env.hv.fail_next_start(DriverError::Timeout("qmp"));
+    env.restore_on_start(vm.id, "snap-1");
+    env.set_power(vm.id, PowerState::Running).await;
+    let got = env
+        .wait(vm.id, "failed", |v| v.status.phase == VmPhase::Failed)
+        .await;
+    assert_eq!(got.spec.power, PowerState::Stopped);
+    assert_eq!(
+        got.status.last_error.as_deref(),
+        Some("failed to restore snapshot snap-1: timed out waiting for qmp")
+    );
+    assert_eq!(env.pid(vm.id).await, None);
+
+    env.set_power(vm.id, PowerState::Running).await;
+    env.wait(vm.id, "running", running).await;
+    assert_eq!(
+        env.hv.launches(),
+        vec![(vm.id, Some("snap-1".into())), (vm.id, None)]
+    );
+}

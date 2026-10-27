@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::backoff::{FailureTracker, Next};
 use crate::config::ReconcilerConfig;
+use crate::reconciler::Restores;
 use crate::resolve::{ResolveError, runtime_spec};
 
 /// 실행 중이던 VM이 사라졌을 때 그 이유를 알리는 종료 이벤트를 기다리는 시간.
@@ -48,6 +49,8 @@ pub(crate) struct Worker {
     cluster: Arc<Cluster>,
     hv: Arc<dyn Hypervisor>,
     config: Arc<ReconcilerConfig>,
+    /// 다음 시작에 불러올 스냅샷 태그(`ReconcilerHandle::restore_on_start`)
+    restores: Restores,
     /// 진행 중인 ACPI 종료 요청을 보낸 시각. 강제 종료로 넘어갈 시점을 정한다.
     /// 원하는 상태가 다시 running으로 바뀌면 취소하므로, 새 종료는 늘 ACPI부터 다시 시작한다.
     stop_requested: Option<Instant>,
@@ -77,12 +80,14 @@ impl Worker {
         cluster: Arc<Cluster>,
         hv: Arc<dyn Hypervisor>,
         config: Arc<ReconcilerConfig>,
+        restores: Restores,
     ) -> Self {
         Self {
             id,
             cluster,
             hv,
             config,
+            restores,
             stop_requested: None,
             stopped_by_us: None,
             force_requested: false,
@@ -339,17 +344,25 @@ impl Worker {
             Err(ResolveError::Cluster(e)) => return Err(e.into()),
             // 참조가 틀렸다. spec을 고쳐야 하므로 다시 시도하지 않는다.
             Err(e) => {
+                self.restores.lock().unwrap().remove(&self.id);
                 self.power_off = Some(Some(e.to_string()));
                 return Ok(false);
             }
         };
-        match self.hv.start(&spec, None).await {
-            Ok(()) => Ok(true),
-            Err(e) if e.is_transient() => {
+        // 실패해도 다시 쓰지 않는다.
+        let restore = self.restores.lock().unwrap().remove(&self.id);
+        match (self.hv.start(&spec, restore.as_deref()).await, restore) {
+            (Ok(()), _) => Ok(true),
+            // 태그 없이 다시 시도하면 스냅샷이 아닌 처음부터 부팅하게 되므로 일시 오류라도 멈춘다.
+            (Err(e), Some(tag)) => {
+                self.power_off = Some(Some(format!("failed to restore snapshot {tag}: {e}")));
+                Ok(false)
+            }
+            (Err(e), None) if e.is_transient() => {
                 self.record_failure(format!("failed to start: {e}"));
                 Ok(false)
             }
-            Err(e) => {
+            (Err(e), None) => {
                 self.power_off = Some(Some(format!("failed to start: {e}")));
                 Ok(false)
             }
