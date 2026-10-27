@@ -388,8 +388,17 @@ async fn new_leader_does_not_revive_nodes_recorded_offline() {
     old.stop().await;
     let new_leader = wait_leader(&nodes).await;
     let new_leader = nodes.iter().find(|n| n.id() == new_leader).unwrap();
-    // 새 리더가 이전 커밋을 모두 적용한 뒤부터 본다.
-    new_leader.cluster.read_barrier().await.unwrap();
+    // 새 리더가 이전 커밋을 모두 적용한 뒤부터 본다. openraft는 리더 확인 RPC를 하트비트 간격
+    // (50ms)만 기다리고, 노드 둘이 죽어 남는 여유가 없어 CPU가 바쁘면 한 번에 실패할 수 있다.
+    // 운영 코드(노드 감시, 예약 작업)처럼 다시 한다.
+    let deadline = Instant::now() + WAIT;
+    while let Err(e) = new_leader.cluster.read_barrier().await {
+        assert!(
+            Instant::now() < deadline,
+            "read barrier never succeeded: {e}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     // 감시 간격보다 길고 `offline_after`보다 짧게 지켜본다.
     let until = Instant::now() + Duration::from_secs(2);
     while Instant::now() < until {
