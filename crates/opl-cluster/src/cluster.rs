@@ -362,8 +362,8 @@ impl Cluster {
 
     /// 다시 보낸 요청의 거부가 앞서 응답 없이 끝난 같은 요청이 적용된 결과면, 이 노드에도 적용되기를
     /// 기다려 성공으로 돌려준다. 만들기의 id는 요청한 쪽이 만든 UUID v7이라 같은 id가 있으면 자기
-    /// 요청이다. 조건부 수정 등은 거부가 자기 요청 때문인지 알 수 없어 판단하지 않는다(`None`, 다시
-    /// 보낸 요청이 `RevisionMismatch`로 끝날 수 있다).
+    /// 요청이다. 삭제는 조건 없는 것만 판단한다. 조건부 수정·삭제는 거부가 자기 요청 때문인지 알 수
+    /// 없어 판단하지 않는다(`None`, 다시 보낸 요청이 `RevisionMismatch`·`NotFound`로 끝날 수 있다).
     async fn already_applied(
         &self,
         req: &LeaderRequest,
@@ -378,8 +378,14 @@ impl Cluster {
                 Command::Create { kind, resource },
                 Err(ClusterError::Rejected(Rejection::AlreadyExists { id, .. })),
             ) if *id == resource.id => Some(self.wait_local(*kind, *id, true, deadline).await),
+            // 조건부 삭제는 판단하지 않는다. 합류 토큰처럼 "지운 쪽만 성공"을 뜻할 수 있어, 다른
+            // 쪽이 지운 것을 자기 성공으로 볼 수 없다.
             (
-                Command::Delete { kind, id, .. },
+                Command::Delete {
+                    kind,
+                    id,
+                    expected_revision: None,
+                },
                 Err(ClusterError::Rejected(Rejection::NotFound { .. })),
             ) => Some(self.wait_local(*kind, *id, false, deadline).await),
             _ => None,

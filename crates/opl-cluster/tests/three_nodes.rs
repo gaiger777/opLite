@@ -377,11 +377,34 @@ async fn retried_delete_after_a_lost_reply_succeeds() {
 
     // 다시 보낸 요청의 `NotFound`는 첫 요청이 지운 결과다. 이 노드에서도 곧바로 없다.
     tc.get(follower)
-        .delete::<VolumeSpec>(v.id, Some(rev))
+        .delete::<VolumeSpec>(v.id, None)
         .await
         .unwrap();
     assert!(forwarder.lost.load(Ordering::SeqCst));
     assert!(tc.get(follower).get::<VolumeSpec>(v.id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn retried_conditional_delete_after_a_lost_reply_is_still_rejected() {
+    let mut tc = TestCluster::start_forwarding(3).await;
+    let v = volume("disk-a");
+    let leader = tc.leader().await;
+    let rev = tc.get(leader).create(&v).await.unwrap();
+    let (follower, forwarder) = follower_losing_first_reply(&mut tc, false).await;
+    tc.wait_applied(follower, rev).await;
+
+    // 조건부 삭제(합류 토큰처럼 지운 쪽만 성공해야 하는 것)는 다른 쪽이 지운 것과 구별할 수 없어
+    // 그대로 돌려준다.
+    let err = tc
+        .get(follower)
+        .delete::<VolumeSpec>(v.id, Some(rev))
+        .await
+        .unwrap_err();
+    assert!(forwarder.lost.load(Ordering::SeqCst));
+    assert!(
+        matches!(err, ClusterError::Rejected(Rejection::NotFound { .. })),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
