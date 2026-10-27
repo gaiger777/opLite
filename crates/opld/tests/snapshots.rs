@@ -1,5 +1,6 @@
 //! 실제 QEMU로 VM 스냅샷(만들기·되돌리기·삭제), 볼륨 크기 늘리기, VM 복제(꺼진 VM, 실행 중인 VM의
-//! 스냅샷), 예약 스냅샷(짧은 주기로 만들고 보관 개수대로 지우기)을 데몬 전체를 거쳐 확인한다.
+//! 스냅샷), 예약 스냅샷(짧은 주기로 만들고 보관 개수대로 지우기), 메모리 스냅샷 중 강제 정지를 데몬
+//! 전체를 거쳐 확인한다.
 //! 꺼진 VM은 oplctl로, 실행 중인 VM은 응답을 자세히 보려고 API를 직접 부른다. 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용이
 //! 돌아오는지는 정지한 VM에서 `qemu-io`로 본다.
 //! `cargo test -p opld --features qemu-it --test snapshots`
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 use common::{Daemon, eventually};
 use oplctl::Client;
 use reqwest::{Method, StatusCode};
+use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use serde_json::{Value, json};
 
 const MIB: u64 = 1 << 20;
@@ -437,6 +439,91 @@ async fn running_vm_snapshot_clone_starts() {
     d.ctl(&["vm", "delete", "web", "--with-snapshots"])
         .await
         .unwrap();
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    d.stop();
+}
+
+/// 테스트가 SIGSTOP으로 멈춘 QEMU. 끝나기 전에 테스트가 실패하면 SIGKILL로 끝낸다.
+struct Frozen(Option<Pid>);
+
+impl Frozen {
+    fn new(pid: u64) -> Self {
+        let pid = Pid::from_raw(pid as i32).unwrap();
+        kill_process(pid, Signal::STOP).unwrap();
+        Self(Some(pid))
+    }
+
+    /// opld가 끝낸 프로세스는 더 지키지 않는다.
+    async fn wait_gone(&mut self) {
+        let pid = self.0.unwrap();
+        eventually("frozen QEMU to exit", || async move {
+            test_kill_process(pid).is_err()
+        })
+        .await;
+        self.0 = None;
+    }
+}
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = kill_process(pid, Signal::KILL);
+        }
+    }
+}
+
+#[tokio::test]
+async fn force_stop_during_memory_snapshot_fails_it() {
+    let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
+    let file = setup(&mut d).await;
+    let c = client(&d);
+    // 메모리 저장은 손대지 않은 메모리까지 훑으므로 메모리가 크면 디스크에 쓰는 동안을 볼 틈이 넉넉하다.
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "4096", "--disk", "root", "--start",
+    ])
+    .await
+    .unwrap();
+    let pid = vm(&c).await["status"]["pid"].as_u64().unwrap();
+    let size = std::fs::metadata(&file).unwrap().len();
+    let create = c
+        .post("/vms/web/snapshots", &json!({ "name": "mem" }))
+        .await
+        .unwrap();
+
+    // 메모리 상태를 쓰기 시작하면(파일이 커진다) QEMU를 멈춰 저장이 끝나지 않게 한다(멈춘 스토리지처럼).
+    // 저장 중인 QEMU는 QMP quit에 답하지 않으므로 강제 정지는 기다린 뒤 SIGKILL로 끝낸다.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while std::fs::metadata(&file).unwrap().len() == size {
+        assert!(
+            Instant::now() < deadline,
+            "memory state was not written:\n{}",
+            d.log()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut frozen = Frozen::new(pid);
+    // 저장 도중이다. 스냅샷 표는 마지막에 쓰므로 태그가 아직 없다.
+    assert!(
+        tags(&file).is_empty(),
+        "snapshot finished before QEMU was frozen"
+    );
+    assert_eq!(snapshot(&c, "mem").await["status"]["phase"], "pending");
+
+    // 만들기 중에도 강제 정지를 받는다.
+    let out = d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(out.contains("vm web: stop done"), "{out}");
+    frozen.wait_gone().await;
+    let v = vm(&c).await;
+    assert_eq!(v["status"]["phase"], "stopped", "{v}");
+    assert_eq!(v["status"]["snapshot"], Value::Null, "{v}");
+
+    // QMP가 끊겨 만들기가 실패하고 리소스를 지운다. 디스크에 태그도 없다.
+    let err = c.wait_task(&create).await.unwrap_err();
+    assert!(err.to_string().contains("QMP connection closed"), "{err}");
+    assert!(snapshots(&c).await.is_empty());
+    assert!(tags(&file).is_empty());
+
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     d.stop();
 }

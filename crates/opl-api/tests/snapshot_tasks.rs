@@ -687,6 +687,46 @@ async fn task_failed_by_someone_else_before_it_starts_is_not_run() {
     assert_eq!(root.spec.size_bytes, 2 << 20);
 }
 
+#[tokio::test]
+async fn force_stop_during_a_memory_snapshot_fails_it_and_removes_the_tag() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+
+    env.hv.hang_next_snapshot_save();
+    let (status, create) = admin
+        .post("/vms/web/snapshots", json!({ "name": "s" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{create}");
+    tokio::time::timeout(common::WAIT, env.hv.snapshot_save_reached())
+        .await
+        .expect("snapshot save");
+
+    // 만들기 중에도 강제 정지는 받는다(일반 정지는 그대로 막는다). 강제 정지 Task는 같은 VM의
+    // 만들기 Task를 기다리지 않는다. 기다렸다면 VM이 꺼지지 않아 저장도 끝나지 않는다.
+    let (status, body) = admin.post("/vms/web/actions/stop", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_busy", "{body}");
+    succeeded(&admin.act("web", "stop?mode=force").await);
+
+    // QMP가 끊겨 만들기가 실패한다. 꺼진 VM이므로 디스크의 태그는 스토리지로 지우고 리소스도 지운다.
+    let task = admin.wait_task(&create).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(find(&env, vm, "s").is_none());
+    assert!(storage.calls().contains(&("delete", root.id)));
+    assert!(env.hv.snapshots(vm).is_empty());
+    assert_eq!(position(&env, vm), None);
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(current.status.phase, VmPhase::Stopped);
+}
+
 fn vm_spec(node: Uuid) -> VmSpec {
     let mut spec: VmSpec = serde_json::from_value(vm_request("x")["spec"].clone()).unwrap();
     spec.node = Some(node);

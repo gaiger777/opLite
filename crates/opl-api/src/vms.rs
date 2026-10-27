@@ -20,7 +20,7 @@ use crate::auth::{Action, Principal};
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
 use crate::scheduler::{Inventory, schedule};
-use crate::snapshots::{check_no_snapshot_task, count_snapshots};
+use crate::snapshots::{check_no_revert_task, check_no_snapshot_task, count_snapshots};
 use crate::state::AppState;
 use crate::tasks::create_task;
 
@@ -276,9 +276,13 @@ pub async fn vm_action(
         return Err(ApiError::bad_request("mode=force applies only to stop"));
     }
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    // 강제 정지도 막는다. 되돌리기가 디스크를 바꾸는 중에 끄고 켜는 것이 섞이면 안 되고, 만들기
-    // 중에 끄면 저장이 끊긴다. 시작한 스냅샷 Task는 실행기의 시간 제한으로 끝난다.
-    check_no_snapshot_task(&state, &vm)?;
+    // 스냅샷 Task가 끝나지 않았으면 막는다. 시작한 스냅샷 Task는 실행기의 시간 제한으로 끝난다.
+    // 강제 정지는 되돌리기만 막는다. 저장이 멈춘 만들기 중에도 VM을 끌 수 있어야 한다.
+    if query.mode == StopMode::Force {
+        check_no_revert_task(&state, &vm)?;
+    } else {
+        check_no_snapshot_task(&state, &vm)?;
+    }
     let id = vm.id;
     let (op, vm) = match action.as_str() {
         "start" => {

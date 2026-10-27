@@ -117,22 +117,38 @@ fn check_not_busy(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
 /// 담는 스펙이 실제와 달라진다. 꺼진 VM을 복사하는 동안 켜면 디스크 잠금 때문에 시작이 실패한다. 시작한 Task는 실행기의 시간 제한 안에 끝나지만, 오프라인 노드에 배정된
 /// Task는 그 노드가 돌아올 때까지 남는다(설계 §11).
 pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    check_no_task(state, vm, "being snapshotted, reverted or cloned", |op| {
+        matches!(
+            op,
+            TaskOp::SnapshotCreate { .. } | TaskOp::SnapshotRevert { .. } | TaskOp::VmClone { .. }
+        )
+    })
+}
+
+/// 이 VM의 스냅샷 되돌리기 Task가 끝나지 않았으면 409 `vm_busy`. 강제 정지는 이것만 막는다
+/// (설계 §4). 만들기 중에 끄면 저장이 끊겨 만들기가 실패하고, 복제는 꺼진 VM이거나 실행 중인
+/// VM의 스냅샷을 `-U`로 읽으므로 꺼도 된다. 되돌리기는 디스크를 바꾸는 중에 끄고 켜는 것이 섞인다.
+pub(crate) fn check_no_revert_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    check_no_task(state, vm, "being reverted to a snapshot", |op| {
+        matches!(op, TaskOp::SnapshotRevert { .. })
+    })
+}
+
+fn check_no_task(
+    state: &AppState,
+    vm: &Vm,
+    doing: &str,
+    op: impl Fn(&TaskOp) -> bool,
+) -> Result<(), ApiError> {
     let (_, tasks) = state.cluster.list::<TaskSpec>()?;
-    let busy = tasks.iter().any(|t| {
-        t.spec.target == vm.id
-            && !t.status.state.is_finished()
-            && matches!(
-                t.spec.op,
-                TaskOp::SnapshotCreate { .. }
-                    | TaskOp::SnapshotRevert { .. }
-                    | TaskOp::VmClone { .. }
-            )
-    });
+    let busy = tasks
+        .iter()
+        .any(|t| t.spec.target == vm.id && !t.status.state.is_finished() && op(&t.spec.op));
     if busy {
         return Err(ApiError::conflict(
             "vm_busy",
             format!(
-                "VM {:?} is being snapshotted, reverted or cloned; try again when the task has finished",
+                "VM {:?} is {doing}; try again when the task has finished",
                 vm.name
             ),
         ));

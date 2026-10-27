@@ -4,8 +4,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use opl_qemu::QmpError;
 use opl_types::runtime::VmRuntimeSpec;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
 use crate::error::DriverError;
@@ -17,6 +18,8 @@ use crate::hypervisor::{
 pub struct MockHypervisor {
     state: Mutex<MockState>,
     events: broadcast::Sender<HypervisorEvent>,
+    /// 멈춘 `snapshot_save`가 들어왔다
+    save_reached: Notify,
 }
 
 #[derive(Default)]
@@ -28,6 +31,8 @@ struct MockState {
     start_delay: Option<Duration>,
     /// 다음 `snapshot_save`·`snapshot_delete` 한 번을 실패시킬 오류
     fail_next_snapshot: Option<DriverError>,
+    /// 다음 `snapshot_save` 한 번을 VM이 꺼질 때까지 멈춘다.
+    hang_next_save: bool,
     /// 살아 있지만 QMP로 다룰 수 없는 VM
     unresponsive: HashSet<Uuid>,
     console_dir: Option<PathBuf>,
@@ -47,6 +52,7 @@ impl Default for MockHypervisor {
                 ..Default::default()
             }),
             events: broadcast::channel(64).0,
+            save_reached: Notify::new(),
         }
     }
 }
@@ -66,6 +72,17 @@ impl MockHypervisor {
     /// 태그를 남긴 채 실패한다(일부 디스크에 만들었거나, 시간 초과로 작업이 아직 돌고 있는 것처럼).
     pub fn fail_next_snapshot(&self, err: DriverError) {
         self.state.lock().unwrap().fail_next_snapshot = Some(err);
+    }
+
+    /// 다음 `snapshot_save` 한 번이 VM이 꺼질 때까지 끝나지 않게 한다. 실제 QEMU의 메모리 저장처럼
+    /// 그동안 VM을 강제로 끄면 QMP가 끊긴 오류로 실패하고 태그를 남기지 않는다.
+    pub fn hang_next_snapshot_save(&self) {
+        self.state.lock().unwrap().hang_next_save = true;
+    }
+
+    /// 멈춘 `snapshot_save`가 들어올 때까지 기다린다.
+    pub async fn snapshot_save_reached(&self) {
+        self.save_reached.notified().await;
     }
 
     /// 게스트 OS 안에서 전원을 끈 것처럼 만든다. `stop(Acpi)` 요청에 게스트가 응한 경우도 이것으로 흉내 낸다.
@@ -240,8 +257,19 @@ impl Hypervisor for MockHypervisor {
     }
 
     async fn snapshot_save(&self, id: Uuid, tag: &str, memory: bool) -> Result<(), DriverError> {
+        let hang = {
+            let mut st = self.state.lock().unwrap();
+            Self::controllable(&st, id)?;
+            std::mem::take(&mut st.hang_next_save)
+        };
+        if hang {
+            self.save_reached.notify_one();
+            while self.state.lock().unwrap().vms.contains_key(&id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            return Err(DriverError::Qmp(QmpError::Disconnected));
+        }
         let mut st = self.state.lock().unwrap();
-        Self::controllable(&st, id)?;
         st.snapshots
             .entry(id)
             .or_default()

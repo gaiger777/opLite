@@ -259,6 +259,10 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         (Ok(()), Ok(())) => None,
     };
     if let Some(error) = failure {
+        // 저장하는 동안 VM이 꺼졌으면(강제 정지로 QMP가 끊김) 꺼진 VM처럼 스토리지로 지운다.
+        // QMP만 끊기고 QEMU가 아직 살아 있으면 qemu-img가 이미지 잠금으로 거부해 태그가 남는다
+        // (디스크는 손상되지 않고, 아래 로그만 남는다).
+        let running = running && !matches!(ctx.hv.inspect(vm_id).await, Ok(None));
         if let Err(e) = remove_tags(ctx, vm_id, running, &vm.spec, &tag).await {
             tracing::warn!(snapshot = %id, error = %e, "cannot remove tags of failed snapshot");
         }
