@@ -297,6 +297,16 @@ fn fmt_name(format: ImageFormat) -> &'static str {
     }
 }
 
+/// `--image-opts`로 줄 옵션 문자열. `qemu-img snapshot`은 QEMU 8.2에서 `-f`를 받지 않으므로
+/// 형식을 추측하지 않게 드라이버를 이렇게 정한다. 옵션 값 안의 `,`는 `,,`로 쓴다.
+fn image_opts(path: &Path, format: ImageFormat) -> Result<String, DriverError> {
+    Ok(format!(
+        "driver={},file.filename={}",
+        fmt_name(format),
+        path_str(path)?.replace(',', ",,")
+    ))
+}
+
 fn src_fmt_name(format: SourceFormat) -> &'static str {
     match format {
         SourceFormat::Vmdk => "vmdk",
@@ -514,8 +524,8 @@ impl Storage for DirStorage {
                 "snapshot {tag} already exists on volume {id}"
             )));
         }
-        let path = path_str(&path)?;
-        self.qemu_img(&["snapshot", "-q", "-f", fmt_name(format), "-c", tag, path])
+        let opts = image_opts(&path, format)?;
+        self.qemu_img(&["snapshot", "-q", "--image-opts", "-c", tag, &opts])
             .await?;
         Ok(())
     }
@@ -528,8 +538,8 @@ impl Storage for DirStorage {
         tag: &str,
     ) -> Result<(), DriverError> {
         let path = self.snapshot_path(pool, id, format)?;
-        let path = path_str(&path)?;
-        self.qemu_img(&["snapshot", "-q", "-f", fmt_name(format), "-a", tag, path])
+        let opts = image_opts(&path, format)?;
+        self.qemu_img(&["snapshot", "-q", "--image-opts", "-a", tag, &opts])
             .await?;
         Ok(())
     }
@@ -549,9 +559,9 @@ impl Storage for DirStorage {
             .iter()
             .filter(|t| *t == tag)
             .count();
-        let path = path_str(&path)?;
+        let opts = image_opts(&path, format)?;
         for _ in 0..count {
-            self.qemu_img(&["snapshot", "-q", "-f", fmt_name(format), "-d", tag, path])
+            self.qemu_img(&["snapshot", "-q", "--image-opts", "-d", tag, &opts])
                 .await?;
         }
         Ok(())
@@ -612,6 +622,14 @@ mod tests {
         assert_eq!(
             DirStorage::volume_path(&pool("/pools/local"), id, ImageFormat::Raw),
             PathBuf::from("/pools/local/00000000-0000-0000-0000-000000000000.raw")
+        );
+    }
+
+    #[test]
+    fn image_opts_escapes_commas() {
+        assert_eq!(
+            image_opts(Path::new("/pools/a,b/v.qcow2"), ImageFormat::Qcow2).unwrap(),
+            "driver=qcow2,file.filename=/pools/a,,b/v.qcow2"
         );
     }
 

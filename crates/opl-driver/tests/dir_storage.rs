@@ -227,7 +227,10 @@ fn qemu_io(path: &Path, cmd: &str) -> bool {
 #[tokio::test]
 async fn snapshot_revert_restores_contents_and_delete_is_idempotent() {
     let tmp = tempfile::tempdir().unwrap();
-    let pool = pool(tmp.path());
+    // 경로의 쉼표는 `--image-opts` 옵션 문자열에서 `,,`로 써야 한다.
+    let dir = tmp.path().join("a,b");
+    std::fs::create_dir(&dir).unwrap();
+    let pool = pool(&dir);
     let storage = DirStorage::new("qemu-img");
     let id = Uuid::now_v7();
     let qcow2 = ImageFormat::Qcow2;
