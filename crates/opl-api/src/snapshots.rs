@@ -101,7 +101,8 @@ fn check_not_busy(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
 
 /// 이 VM의 스냅샷 만들기·되돌리기 Task가 끝나지 않았으면 409 `vm_busy`. 그 Task는 전원을 끄고
 /// 켜며 디스크를 바꾸므로, 그사이 전원이나 스펙을 바꾸면 되돌리는 디스크를 QEMU가 열거나 담는
-/// 스펙이 실제와 달라진다. Task는 실행기의 시간 제한 안에 끝난다.
+/// 스펙이 실제와 달라진다. 시작한 Task는 실행기의 시간 제한 안에 끝나지만, 오프라인 노드에 배정된
+/// Task는 그 노드가 돌아올 때까지 남는다(설계 §11).
 pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
     let (_, tasks) = state.cluster.list::<TaskSpec>()?;
     let busy = tasks.iter().any(|t| {
