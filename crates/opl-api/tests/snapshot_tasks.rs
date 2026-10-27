@@ -631,6 +631,62 @@ async fn resize_keeps_volume_labels_written_meanwhile() {
     assert_eq!((root.spec.size_bytes, root.labels), (2 << 20, labels));
 }
 
+#[tokio::test]
+async fn task_failed_by_someone_else_before_it_starts_is_not_run() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+
+    storage.pause();
+    let (status, first) = admin
+        .post("/volumes/root/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    storage.reached().await;
+    // 같은 줄에서 앞의 Task를 기다리는 Task를, 시작하기 전에 다른 쪽(리더의 정리 작업)이 실패로 끝낸다.
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    let mut second: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VolumeResize {
+                size_bytes: 3 << 20,
+            },
+            target: root.id,
+            node: env.node,
+        },
+    );
+    second.name = second.id.to_string();
+    env.cluster.create(&second).await.unwrap();
+    let failed = TaskStatus {
+        state: TaskState::Failed,
+        error: Some(format!("node {} is offline", env.node)),
+    };
+    env.cluster
+        .update_status::<TaskSpec>(second.id, &failed)
+        .await
+        .unwrap();
+    storage.resume();
+
+    succeeded(&admin.wait_task(&first).await);
+    // 뒤의 Task가 돌았다면 이미 크기를 바꾸고 끝났을 시간을 기다린다.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let task = env.cluster.get::<TaskSpec>(second.id).unwrap().unwrap();
+    assert_eq!(task.status, failed);
+    let resized = storage
+        .calls()
+        .iter()
+        .filter(|(c, _)| *c == "resize")
+        .count();
+    assert_eq!(resized, 1);
+    let root = env.cluster.get::<VolumeSpec>(root.id).unwrap().unwrap();
+    assert_eq!(root.spec.size_bytes, 2 << 20);
+}
+
 fn vm_spec(node: Uuid) -> VmSpec {
     let mut spec: VmSpec = serde_json::from_value(vm_request("x")["spec"].clone()).unwrap();
     spec.node = Some(node);

@@ -285,7 +285,9 @@ fn start(
 }
 
 async fn execute(ctx: &Ctx, task: Task) {
-    set_status(ctx, task.id, TaskState::Running, None).await;
+    if !begin(ctx, task.id).await {
+        return;
+    }
     let result = match tokio::time::timeout(ctx.config.timeout, perform(ctx, &task)).await {
         Ok(r) => r,
         Err(_) => Err(format!("timed out after {:?}", ctx.config.timeout)),
@@ -340,6 +342,45 @@ async fn cleanup(ctx: &Ctx, task: &Task) {
     ) && let Err(e) = remove_volume(ctx, task.spec.target).await
     {
         tracing::warn!(volume = %task.spec.target, error = %e, "cannot clean up failed volume");
+    }
+}
+
+/// `pending`을 `running`으로 읽은 revision에서만 바꾼다. 그사이 다른 쪽(리더의 정리 작업)이
+/// 실패로 끝냈거나 Task가 지워졌으면 `false`로, 실행하지 않는다. `running`으로 읽히면 응답을 잃은
+/// 앞의 쓰기가 적용된 것이다(`running`은 이 노드만 쓴다). 기록될 때까지 다시 시도한다.
+async fn begin(ctx: &Ctx, id: Uuid) -> bool {
+    let running = TaskStatus {
+        state: TaskState::Running,
+        error: None,
+    };
+    loop {
+        let current = match ctx.cluster.get::<TaskSpec>(id) {
+            Ok(Some(task)) => task,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(task = %id, error = %e, "cannot read task; will retry");
+                tokio::time::sleep(ctx.config.poll_interval).await;
+                continue;
+            }
+        };
+        match current.status.state {
+            TaskState::Pending => {}
+            TaskState::Running => return true,
+            TaskState::Succeeded | TaskState::Failed => return false,
+        }
+        match ctx
+            .cluster
+            .update_status_checked::<TaskSpec>(id, current.revision, &running)
+            .await
+        {
+            Ok(_) => return true,
+            Err(ClusterError::Rejected(Rejection::NotFound { .. })) => return false,
+            // 바뀐 Task가 이 노드에 적용되면 다시 읽어 판단한다.
+            Err(e) => {
+                tracing::warn!(task = %id, error = %e, "cannot record task start; will retry");
+                tokio::time::sleep(ctx.config.poll_interval).await;
+            }
+        }
     }
 }
 
