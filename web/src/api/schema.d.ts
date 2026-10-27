@@ -542,8 +542,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 볼륨 크기를 늘릴 Task를 돌려준다(202). 줄이지는 않는다(400). 실행 중인 VM이 쓰면 그 VM의
-         *     노드에서, 아니면 볼륨의 노드에서 한다.
+         * 볼륨 크기를 늘릴 Task를 돌려준다(202). 줄이지는 않는다(400). VM이 쓰면 그 VM의 스냅샷
+         *     Task와 같은 노드(실행 중이면 그 VM의 노드, 꺼졌으면 다음에 돌 노드)의 실행기에서 차례로 돌도록
+         *     거기서 한다. 쓰는 VM이 없거나 정할 노드가 없으면 볼륨의 노드에서 한다.
          */
         post: operations["resize_volume"];
         delete?: never;

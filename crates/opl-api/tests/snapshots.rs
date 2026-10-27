@@ -517,14 +517,42 @@ async fn resize_only_grows_and_runs_where_the_volume_is_used() {
     assert_eq!(task["spec"]["target"], id.to_string());
     assert_eq!(task["spec"]["node"], pool_node.to_string());
 
-    // 실행 중인 VM이 쓰면 그 VM의 노드에서 한다.
+    // 배치된 적 없는 꺼진 VM이 쓰면 볼륨의 노드, 배치된 노드가 있으면 그 노드에서 한다
+    // (그 VM의 스냅샷 Task와 같은 실행기의 줄에 선다).
     let vm = vm_with_disks(&admin, "web", &["data"]).await;
+    let resize = || async {
+        let (status, task) = admin
+            .post("/volumes/data/resize", json!({ "size_bytes": 2 * MIB }))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        task["spec"]["node"].as_str().unwrap().to_string()
+    };
+    assert_eq!(resize().await, pool_node.to_string());
+    let placed = Uuid::now_v7();
+    set_vm_status(&env, vm, VmPhase::Stopped, Some(placed)).await;
+    assert_eq!(resize().await, placed.to_string());
+
+    // 실행 중인 VM이 쓰면 그 VM의 노드에서 한다.
     set_vm_status(&env, vm, VmPhase::Running, Some(env.node)).await;
     let (status, task) = admin
         .post("/volumes/data/resize", json!({ "size_bytes": 2 * MIB }))
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     assert_eq!(task["spec"]["node"], env.node.to_string());
+
+    // 끈 뒤 다른 노드로 옮겼으면 디스크를 다음에 쓸 그 노드에서 한다.
+    set_vm_status(&env, vm, VmPhase::Stopped, Some(env.node)).await;
+    let moved = Uuid::now_v7();
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    let spec = VmSpec {
+        node: Some(moved),
+        ..current.spec.clone()
+    };
+    env.cluster
+        .update_spec(vm, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    assert_eq!(resize().await, moved.to_string());
 
     let (status, _) = admin
         .post("/volumes/missing/resize", json!({ "size_bytes": 2 * MIB }))

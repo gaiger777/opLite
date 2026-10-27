@@ -561,6 +561,36 @@ async fn delete_does_not_treat_a_volume_of_another_node_as_gone() {
     assert!(!storage.calls().iter().any(|(call, _)| *call == "delete"));
 }
 
+#[tokio::test]
+async fn resize_keeps_volume_labels_written_meanwhile() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/volumes/root/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    let labels = std::collections::BTreeMap::from([("tier".to_string(), "gold".to_string())]);
+    env.cluster
+        .update_spec(root.id, Some(root.revision), labels.clone(), &root.spec)
+        .await
+        .unwrap();
+    storage.resume();
+
+    succeeded(&admin.wait_task(&task).await);
+    let root = env.cluster.get::<VolumeSpec>(root.id).unwrap().unwrap();
+    assert_eq!((root.spec.size_bytes, root.labels), (2 << 20, labels));
+}
+
 fn vm_spec(node: Uuid) -> VmSpec {
     let mut spec: VmSpec = serde_json::from_value(vm_request("x")["spec"].clone()).unwrap();
     spec.node = Some(node);

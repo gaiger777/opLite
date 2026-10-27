@@ -15,7 +15,7 @@ use opl_types::storage::{
     SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
-use opl_types::vm::{VmPhase, VmSpec};
+use opl_types::vm::VmSpec;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use utoipa::{IntoParams, ToSchema};
@@ -37,7 +37,7 @@ fn check_volume_name(name: &str) -> Result<(), ApiError> {
     }
     Ok(())
 }
-use crate::snapshots::vm_node;
+use crate::snapshots::vm_placement;
 use crate::state::AppState;
 use crate::tasks::create_task;
 
@@ -300,8 +300,9 @@ pub struct ResizeRequest {
     pub size_bytes: u64,
 }
 
-/// 볼륨 크기를 늘릴 Task를 돌려준다(202). 줄이지는 않는다(400). 실행 중인 VM이 쓰면 그 VM의
-/// 노드에서, 아니면 볼륨의 노드에서 한다.
+/// 볼륨 크기를 늘릴 Task를 돌려준다(202). 줄이지는 않는다(400). VM이 쓰면 그 VM의 스냅샷
+/// Task와 같은 노드(실행 중이면 그 VM의 노드, 꺼졌으면 다음에 돌 노드)의 실행기에서 차례로 돌도록
+/// 거기서 한다. 쓰는 VM이 없거나 정할 노드가 없으면 볼륨의 노드에서 한다.
 #[utoipa::path(post, path = "/volumes/{key}/resize", tag = "storage",
     params(("key" = String, Path, description = "id or name")),
     request_body = ResizeRequest,
@@ -333,12 +334,11 @@ pub async fn resize_volume(
         ));
     }
     let (_, vms) = state.cluster.list::<VmSpec>()?;
-    let running = vms.iter().find(|vm| {
-        !matches!(vm.status.phase, VmPhase::Stopped | VmPhase::Failed)
-            && vm.spec.disks.iter().any(|d| d.volume == volume.name)
-    });
-    let node = match running {
-        Some(vm) => vm_node(&state, vm),
+    let user = vms
+        .iter()
+        .find(|vm| vm.spec.disks.iter().any(|d| d.volume == volume.name));
+    let node = match user.and_then(|vm| vm_placement(&state.cluster, vm)) {
+        Some(node) => node,
         None => volume_node(&state, &volume)?,
     };
     let op = TaskOp::VolumeResize {

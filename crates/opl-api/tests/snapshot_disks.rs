@@ -1,5 +1,5 @@
 //! 디스크 파일의 스냅샷 태그를 다루는 Task: 정지한 VM의 만들기·되돌리기·삭제, 메모리 스냅샷
-//! 되돌리기, 실패와 시작할 때의 정리. qemu-img와 qemu-io가 필요하다.
+//! 되돌리기, 실패와 시작할 때의 정리. 볼륨 크기 늘리기와 그 차례. qemu-img와 qemu-io가 필요하다.
 //! `cargo test -p opl-api --features storage-it --test snapshot_disks`
 #![cfg(feature = "storage-it")]
 
@@ -7,8 +7,9 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
-use common::{Client, Env, vm_request};
+use common::{Client, Env, WAIT, vm_request};
 use opl_driver::uefi_vars_path;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -49,6 +50,13 @@ fn tags(path: &Path) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 파일의 가상 크기
+fn virtual_size(path: &Path) -> u64 {
+    let info: Value =
+        serde_json::from_str(&qemu_img(&["info", "-U", "--output=json", path_str(path)])).unwrap();
+    info["virtual-size"].as_u64().unwrap()
 }
 
 fn path_str(path: &Path) -> &str {
@@ -332,4 +340,138 @@ async fn unfinished_snapshot_tags_are_removed_at_startup() {
     assert!(tags(&file).is_empty());
     let (_, items) = env.cluster.list::<SnapshotSpec>().unwrap();
     assert!(items.is_empty());
+}
+
+fn volume_size(env: &Env, name: &str) -> u64 {
+    let volume = env
+        .cluster
+        .get_by_name::<VolumeSpec>(name)
+        .unwrap()
+        .unwrap();
+    volume.spec.size_bytes
+}
+
+async fn resize(admin: &Client, size: u64) -> (StatusCode, Value) {
+    admin
+        .post("/volumes/root/resize", json!({ "size_bytes": size }))
+        .await
+}
+
+#[tokio::test]
+async fn stopped_volume_grows_and_task_rechecks_the_size() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    create_pool(&env).await;
+    let file = create_volume(&env, &admin, "root").await;
+    let id = create_vm(&admin, "web", &["root"]).await;
+
+    succeeded(&wait(&admin, resize(&admin, 8 * MIB).await).await);
+    assert_eq!(virtual_size(&file), 8 * MIB);
+    assert_eq!(volume_size(&env, "root"), 8 * MIB);
+    assert_eq!(env.hv.disk_size(id, 0), None);
+
+    // 둘 다 API 검사를 지나지만, 앞의 것이 늘린 뒤에는 뒤의 것이 더 크지 않다.
+    env.stop_runner().await;
+    let first = resize(&admin, 12 * MIB).await;
+    let second = resize(&admin, 12 * MIB).await;
+    env.start_runner().await;
+    succeeded(&wait(&admin, first).await);
+    let task = wait(&admin, second).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(
+        task["status"]["error"].as_str().unwrap().contains("larger"),
+        "{task}"
+    );
+    assert_eq!(virtual_size(&file), 12 * MIB);
+    assert_eq!(volume_size(&env, "root"), 12 * MIB);
+}
+
+#[tokio::test]
+async fn running_vm_disk_grows_in_qemu_and_task_rechecks_the_vm() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    create_pool(&env).await;
+    let file = create_volume(&env, &admin, "root").await;
+    let id = create_vm(&admin, "web", &["root"]).await;
+    succeeded(&admin.act("web", "start").await);
+
+    // Mock 하이퍼바이저는 파일을 늘리지 않으므로 QEMU가 늘렸을 크기를 대신 만든다.
+    qemu_img(&["resize", "-q", path_str(&file), "8M"]);
+    succeeded(&wait(&admin, resize(&admin, 8 * MIB).await).await);
+    assert_eq!(env.hv.disk_size(id, 0), Some(8 * MIB));
+    assert_eq!(volume_size(&env, "root"), 8 * MIB);
+
+    // API는 실행 중일 때 받았지만 실행할 때는 꺼졌다. 파일을 늘린다.
+    env.stop_runner().await;
+    let task = resize(&admin, 12 * MIB).await;
+    let current = vm(&env, id);
+    let mut spec = current.spec.clone();
+    spec.power = PowerState::Stopped;
+    env.cluster
+        .update_spec(id, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while vm(&env, id).status.phase != VmPhase::Stopped {
+        assert!(Instant::now() < deadline, "VM did not stop");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    env.start_runner().await;
+    succeeded(&wait(&admin, task).await);
+    assert_eq!(env.hv.disk_size(id, 0), Some(8 * MIB));
+    assert_eq!(virtual_size(&file), 12 * MIB);
+    assert_eq!(volume_size(&env, "root"), 12 * MIB);
+}
+
+#[tokio::test]
+async fn resize_waits_for_a_revert_of_the_same_disk() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    create_pool(&env).await;
+    let file = create_volume(&env, &admin, "root").await;
+    let id = create_vm(&admin, "web", &["root"]).await;
+    succeeded(&admin.act("web", "start").await);
+    let task = wait(
+        &admin,
+        admin
+            .post("/vms/web/snapshots", json!({ "name": "mem" }))
+            .await,
+    )
+    .await;
+    succeeded(&task);
+    let mem = get(&env, id, "mem").unwrap();
+    qemu_img(&["snapshot", "-c", &mem.id.to_string(), path_str(&file)]);
+
+    // 되돌리기(VM의 줄)를 먼저, 크기 늘리기(볼륨 Task)를 뒤에 맡긴다. 되돌리기는 시작이 늦어
+    // 오래 걸린다. 크기 늘리기는 그동안 기다렸다가 다시 켜진 VM에서 한다.
+    env.stop_runner().await;
+    let (status, revert) = admin
+        .post("/vms/web/snapshots/mem/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{revert}");
+    let (status, grow) = resize(&admin, 8 * MIB).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{grow}");
+    env.hv.delay_starts(Duration::from_millis(500));
+    env.start_runner().await;
+    let state = |task: &Value| {
+        let path = format!("/tasks/{}", task["id"].as_str().unwrap());
+        let admin = admin.clone();
+        async move { admin.get(&path).await.1["status"]["state"].clone() }
+    };
+    let deadline = Instant::now() + WAIT;
+    loop {
+        // 크기 늘리기를 먼저 읽는다. 되돌리기를 먼저 읽으면 두 읽기 사이에 되돌리기가 끝나고
+        // 크기 늘리기가 시작될 수 있다.
+        let grown = state(&grow).await;
+        let reverted = state(&revert).await;
+        if reverted == "succeeded" {
+            break;
+        }
+        assert_ne!(reverted, "failed");
+        assert_eq!(grown, "pending", "resize ran during the revert");
+        assert!(Instant::now() < deadline, "revert did not finish");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    succeeded(&admin.wait_task(&grow).await);
+    assert_eq!(env.hv.disk_size(id, 0), Some(8 * MIB));
 }

@@ -129,7 +129,7 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>) {
     let mut started: HashSet<Uuid> = HashSet::new();
     // 실행 중인 Task. 실행기가 멈출 때 함께 멈춘다.
     let mut running: HashMap<Uuid, AbortHandle> = HashMap::new();
-    // 대상(볼륨, 스냅샷 Task의 VM)별 마지막 Task. 같은 대상의 Task는 앞의 것이 끝난 뒤에 시작한다.
+    // 줄(볼륨, VM)별 마지막 Task. 같은 줄의 Task는 앞의 것이 끝난 뒤에 시작한다(`queue`).
     let mut by_target: HashMap<Uuid, JoinHandle<()>> = HashMap::new();
     let mut first = true;
     'sync: loop {
@@ -218,9 +218,34 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
     )
 }
 
-/// Task를 실행한다. 볼륨 Task는 같은 볼륨의 앞 Task가 끝난 뒤에 시작한다(`Storage`의 요구).
-/// 스냅샷 Task도 같은 VM의 앞 스냅샷 Task가 끝난 뒤에 시작한다(부모·현재 위치가 차례로 바뀐다).
-/// VM 전원 Task는 기다리기만 하므로 차례를 두지 않는다. 강제 종료가 앞의 reboot 뒤에 묶이면 안 된다.
+/// Task가 설 줄. 볼륨 Task는 그 볼륨의 줄에 선다(`Storage`의 요구). 스냅샷 Task는 VM의 줄에
+/// 선다(부모·현재 위치가 차례로 바뀐다). 볼륨 크기 늘리기는 그 볼륨을 쓰는 VM의 줄에 선다. 스냅샷
+/// 만들기·되돌리기가 같은 디스크를 다루고 되돌리기는 크기도 되돌리므로 섞이면 안 된다. 지금 쓰는
+/// VM이 없으면 그 볼륨을 담은 스냅샷의 VM(되돌리면 다시 붙는다), 그것도 없으면 볼륨의 줄이다.
+/// VM 전원 Task는 기다리기만 하므로 줄을 두지 않는다. 강제 종료가 앞의 reboot 뒤에 묶이면 안 된다.
+fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
+    let target = task.spec.target;
+    if !matches!(task.spec.op, TaskOp::VolumeResize { .. }) {
+        return (is_volume_op(&task.spec.op) || is_snapshot_op(&task.spec.op)).then_some(target);
+    }
+    let Ok(Some(volume)) = ctx.cluster.get::<VolumeSpec>(target) else {
+        return Some(target);
+    };
+    let uses = |spec: &VmSpec| spec.disks.iter().any(|d| d.volume == volume.name);
+    if let Ok((_, vms)) = ctx.cluster.list::<VmSpec>()
+        && let Some(vm) = vms.iter().find(|vm| uses(&vm.spec))
+    {
+        return Some(vm.id);
+    }
+    if let Ok((_, snapshots)) = ctx.cluster.list::<SnapshotSpec>()
+        && let Some(s) = snapshots.iter().find(|s| uses(&s.spec.vm_spec))
+    {
+        return Some(s.spec.vm);
+    }
+    Some(target)
+}
+
+/// Task를 실행한다. 줄(`queue`)이 있으면 그 줄의 앞 Task가 끝난 뒤에 시작한다.
 /// `interrupted`면 이전 opld가 실행하다 멈춘 Task이므로 실패로 기록한다.
 fn start(
     ctx: &Arc<Ctx>,
@@ -232,13 +257,8 @@ fn start(
 ) {
     started.insert(task.id);
     let id = task.id;
-    let target = task.spec.target;
-    let queued = is_volume_op(&task.spec.op) || is_snapshot_op(&task.spec.op);
-    let previous = if queued {
-        by_target.remove(&target)
-    } else {
-        None
-    };
+    let queue = queue(ctx, &task);
+    let previous = queue.and_then(|q| by_target.remove(&q));
     let ctx = ctx.clone();
     let handle = tokio::spawn(async move {
         if let Some(previous) = previous {
@@ -252,8 +272,8 @@ fn start(
         }
     });
     running.insert(id, handle.abort_handle());
-    if queued {
-        by_target.insert(target, handle);
+    if let Some(q) = queue {
+        by_target.insert(q, handle);
     }
 }
 
@@ -330,8 +350,7 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
         TaskOp::SnapshotCreate { snapshot } => snapshot::create(ctx, id, *snapshot).await,
         TaskOp::SnapshotRevert { snapshot } => snapshot::revert(ctx, task, *snapshot).await,
         TaskOp::SnapshotDelete { snapshot } => snapshot::delete(ctx, id, *snapshot).await,
-        // 실행은 뒤에서 붙인다.
-        TaskOp::VolumeResize { .. } => Err("not implemented yet".into()),
+        TaskOp::VolumeResize { size_bytes } => resize_volume(ctx, id, *size_bytes).await,
     }
 }
 
@@ -562,6 +581,52 @@ async fn import_volume(
 
 async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
     remove_volume(ctx, id).await
+}
+
+/// 볼륨 크기를 늘린다(설계 §5). 실행 중인 VM이 쓰면 그 QEMU로(`block_resize`, 게스트가 바로
+/// 본다), 아니면 스토리지로 늘린 뒤 실제 크기를 스펙에 기록한다. API가 확인한 뒤 VM이 켜지거나
+/// 꺼졌을 수 있고 앞의 Task가 크기를 바꿨을 수 있어 여기서 다시 본다.
+async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), String> {
+    let (volume, pool) = volume_and_pool(ctx, id)?;
+    if volume.status.phase != VolumePhase::Ready {
+        return Err("volume is not ready".into());
+    }
+    if size_bytes <= volume.spec.size_bytes {
+        return Err(format!(
+            "size_bytes must be larger than the current size ({} bytes)",
+            volume.spec.size_bytes
+        ));
+    }
+    let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
+    let user = vms.iter().find_map(|vm| {
+        let disk = vm.spec.disks.iter().position(|d| d.volume == volume.name)?;
+        Some((vm, disk))
+    });
+    match user {
+        Some((vm, _)) if matches!(vm.status.phase, VmPhase::Starting | VmPhase::Stopping) => {
+            return Err(format!(
+                "VM {:?} is starting or stopping; try again when it has settled",
+                vm.name
+            ));
+        }
+        // 실행 중에는 디스크를 바꿀 수 없으므로 스펙의 순서가 QEMU의 디스크 번호다.
+        Some((vm, disk)) if vm.status.phase == VmPhase::Running => ctx
+            .hv
+            .block_resize(vm.id, disk, size_bytes)
+            .await
+            .map_err(|e| e.to_string())?,
+        _ => ctx
+            .storage
+            .resize_volume(&pool.spec, id, volume.spec.format, size_bytes)
+            .await
+            .map_err(|e| e.to_string())?,
+    }
+    let info = ctx
+        .storage
+        .volume_info(&pool.spec, id, volume.spec.format)
+        .await
+        .map_err(|e| format!("cannot read the new size: {e}"))?;
+    set_volume_size(ctx, id, info.virtual_bytes).await
 }
 
 /// VM이 쓰지 않는 볼륨의 파일(있으면)과 리소스를 지운다. 실패한 생성·가져오기를 정리할 때도
