@@ -184,3 +184,41 @@ it("hides the console from users who cannot operate VMs", async () => {
   );
   expect(screen.queryByRole("tab", { name: "Console" })).not.toBeInTheDocument();
 });
+
+it("blocks force stop while a snapshot is being reverted and says why", async () => {
+  const revert = {
+    ...task("t-revert", "snapshot-revert", web.id),
+    status: { state: "running" as const, error: null },
+  };
+  mockLists({ vm: [web], node: [NODE], task: [revert] });
+  const { queryClient } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  const button = await screen.findByRole("button", { name: "Force stop" });
+  await waitFor(() => expect(button).toBeDisabled());
+  expect(button).toHaveAccessibleDescription(
+    "Force stop is not available while a snapshot is being reverted.",
+  );
+  // 되돌리기가 끝나면 다시 켠다.
+  queryClient.setQueryData(["list", "task"], {
+    revision: 2,
+    items: [{ ...revert, status: { state: "succeeded", error: null } }],
+  });
+  await waitFor(() => expect(button).toBeEnabled());
+  expect(button).not.toHaveAccessibleDescription();
+  expect(
+    screen.queryByText("Force stop is not available while a snapshot is being reverted."),
+  ).not.toBeInTheDocument();
+});
+
+it("does not blame a revert for a VM that is already off", async () => {
+  const db = vm("db", "stopped");
+  const revert = {
+    ...task("t-revert", "snapshot-revert", db.id),
+    status: { state: "running" as const, error: null },
+  };
+  mockLists({ vm: [db], node: [NODE], task: [revert] });
+  const { queryClient } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/db" });
+  const button = await screen.findByRole("button", { name: "Force stop" });
+  await waitFor(() => expect(queryClient.getQueryData(["list", "task"])).toBeDefined());
+  expect(button).toBeDisabled();
+  expect(button).not.toHaveAccessibleDescription();
+});

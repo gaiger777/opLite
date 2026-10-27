@@ -31,6 +31,8 @@
     "vm_has_snapshots": "The VM has snapshots. Delete them first.",
     "volume_in_snapshot": "A VM snapshot still uses this volume. Delete that snapshot first.",
     "snapshot_not_ready": "The snapshot is still being taken.",
+    "node_offline": "The node holding this VM is offline.",
+    "task_failed": "Task error: {{message}}",
     "internal": "The server failed: {{message}}"
   },
   "nav": {
@@ -132,6 +134,7 @@
     "deleted": "Deleted {{name}}.",
     "forceStopTitle": "Force stop {{name}}?",
     "forceStopDescription": "The VM is turned off without shutting down its OS. Unsaved data in the guest is lost.",
+    "forceStopReverting": "Force stop is not available while a snapshot is being reverted.",
     "deleteTitle": "Delete {{name}}?",
     "deleteDescription": "The VM is deleted. Its volumes are kept.",
     "deleteSnapshots_one": "Also delete its snapshot",
@@ -244,7 +247,11 @@
     "scheduleMemory": "Snapshot schedule: {{every}}, keep {{keep}}, with memory",
     "noSchedule": "No snapshot schedule.",
     "scheduleEdit": "Change schedule",
-    "scheduleFailed": "Last scheduled snapshot failed:"
+    "scheduleFailed": "Last scheduled snapshot failed:",
+    "scheduleError": {
+      "vm_busy": "Skipped because the VM was busy; it will try again later.",
+      "node_offline": "Skipped because the VM's node is offline ({{message}})."
+    }
   },
   "clone": {
     "title": "Clone {{name}}",

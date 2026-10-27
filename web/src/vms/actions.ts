@@ -2,7 +2,7 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
-import type { Vm } from "@/api/types";
+import type { Task, Vm } from "@/api/types";
 import { errorMessage } from "@/i18n/errors";
 import { trackTask } from "@/tasks/tasks";
 
@@ -30,6 +30,20 @@ export function isBusy(vm: Vm): boolean {
     return true;
   }
   return vm.spec.power === "running" ? phase !== "running" : !isStopped(vm);
+}
+
+/**
+ * 서버의 `check_no_revert_task`: 이 VM의 스냅샷 되돌리기 Task가 끝나지 않았다. 강제 정지는 이때만
+ * 막힌다(만들기·삭제·복제 중에는 받는다). `tasks`는 watch로 들어온 Task 목록이다.
+ */
+export function isReverting(vm: Vm, tasks: readonly Task[]): boolean {
+  return tasks.some(
+    (task) =>
+      task.spec.target === vm.id &&
+      task.spec.op.kind === "snapshot-revert" &&
+      task.status.state !== "succeeded" &&
+      task.status.state !== "failed",
+  );
 }
 
 /** 지금 상태에서 할 수 있는 동작인지. 서버도 확인하지만 할 수 없는 버튼은 막아 둔다. */

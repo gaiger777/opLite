@@ -1,5 +1,6 @@
-import { vm } from "@/test/fixtures";
-import { ACTIONS, canDelete, canRun, isBusy, isStopped } from "@/vms/actions";
+import type { Task } from "@/api/types";
+import { task, vm } from "@/test/fixtures";
+import { ACTIONS, canDelete, canRun, isBusy, isReverting, isStopped } from "@/vms/actions";
 
 function allowed(v: ReturnType<typeof vm>) {
   return ACTIONS.filter((action) => canRun(v, action));
@@ -52,4 +53,27 @@ it("follows the server's check_not_busy: starting, stopping or power and phase a
   expect(isBusy(power(vm("g", "failed"), "running"))).toBe(true);
   // 끄려는데 아직 실행 중이다(ACPI 정지를 기다린다).
   expect(isBusy(power(vm("h", "running"), "stopped"))).toBe(true);
+});
+
+it("follows the server's check_no_revert_task: only an unfinished revert of this VM", () => {
+  const web = vm("web", "running");
+  const of = (
+    kind: Task["spec"]["op"]["kind"],
+    state: Task["status"]["state"],
+    target = web.id,
+  ) => ({
+    ...task(`t-${kind}-${state}`, kind, target),
+    status: { state, error: null },
+  });
+  expect(isReverting(web, [])).toBe(false);
+  expect(isReverting(web, [of("snapshot-revert", "pending")])).toBe(true);
+  expect(isReverting(web, [of("snapshot-revert", "running")])).toBe(true);
+  // 끝난 되돌리기, 다른 VM의 되돌리기
+  expect(isReverting(web, [of("snapshot-revert", "succeeded")])).toBe(false);
+  expect(isReverting(web, [of("snapshot-revert", "failed")])).toBe(false);
+  expect(isReverting(web, [of("snapshot-revert", "running", vm("db", "running").id)])).toBe(false);
+  // 만들기·삭제·복제 중에는 강제 정지를 받는다.
+  for (const kind of ["snapshot-create", "snapshot-delete", "vm-clone"] as const) {
+    expect(isReverting(web, [of(kind, "running")])).toBe(false);
+  }
 });

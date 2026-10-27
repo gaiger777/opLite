@@ -1,4 +1,4 @@
-import { Suspense, useState } from "react";
+import { Suspense, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
@@ -19,7 +19,14 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
-import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
+import {
+  ACTIONS,
+  canDelete,
+  canRun,
+  isReverting,
+  useVmActions,
+  type VmAction,
+} from "@/vms/actions";
 import { VmConsole } from "@/vms/lazyConsole";
 import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -118,17 +125,24 @@ function VmHeader({ vm }: { vm: Vm }) {
   const me = usePrincipal();
   const navigate = useNavigate();
   const nodes = useList("node");
+  const tasks = useList("task");
+  const hint = useId();
   const { run, remove } = useVmActions();
   const [confirm, setConfirm] = useState<VmDialog | null>(null);
   // 고정한 노드가 있으면 그 노드, 아니면 스케줄러가 놓은 노드
   const nodeId = vm.spec.node ?? vm.status.node;
   const node = nodes.data?.find((n) => n.id === nodeId);
+  const operate = can(me.role, "operate", "vm");
+  // 서버는 되돌리기 중의 강제 정지를 받지 않는다. Task 목록을 아직 모르면 서버에 맡긴다.
+  // 상태로도 끌 수 없는 VM이면 까닭은 되돌리기가 아니므로 보이지 않는다.
+  const reverting = operate && canRun(vm, "force-stop") && isReverting(vm, tasks.data ?? []);
   const button = (action: VmAction) => (
     <Button
       key={action}
       variant="outline"
       size="sm"
-      disabled={!canRun(vm, action)}
+      disabled={!canRun(vm, action) || (action === "force-stop" && reverting)}
+      aria-describedby={action === "force-stop" && reverting ? hint : undefined}
       onClick={() => (action === "force-stop" ? setConfirm("force-stop") : void run(vm, action))}
     >
       {t(`vms.action.${action}`)}
@@ -142,8 +156,8 @@ function VmHeader({ vm }: { vm: Vm }) {
         {node && <span className="text-sm text-muted-foreground">{node.name}</span>}
       </div>
       <div className="flex flex-wrap gap-2">
-        {can(me.role, "operate", "vm") && ACTIONS.map(button)}
-        {can(me.role, "operate", "vm") && vm.status.phase === "running" && (
+        {operate && ACTIONS.map(button)}
+        {operate && vm.status.phase === "running" && (
           <Button variant="outline" size="sm" asChild>
             <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
               {t("vms.openConsole")}
@@ -171,6 +185,11 @@ function VmHeader({ vm }: { vm: Vm }) {
           </Button>
         )}
       </div>
+      {reverting && (
+        <p id={hint} className="basis-full text-sm text-muted-foreground">
+          {t("vms.forceStopReverting")}
+        </p>
+      )}
       <VmConfirm
         vm={vm}
         which={confirm}

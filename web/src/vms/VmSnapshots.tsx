@@ -26,6 +26,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { codeMessage } from "@/i18n/errors";
 import { formatBytes, formatTime } from "@/lib/format";
 import { trackTask } from "@/tasks/tasks";
 import { isBusy } from "@/vms/actions";
@@ -120,12 +121,18 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
             </Link>
           )}
         </div>
-        {/* 예약을 꺼도 마지막 실패는 남는다. 서버가 쓴 이유를 줄바꿈·긴 낱말까지 그대로 보인다. */}
+        {/* 예약을 꺼도 마지막 실패는 남는다. code를 예약 전용 문구, 오류 번역 순으로 찾고, 번역이
+            없으면 서버가 쓴 이유를 줄바꿈·긴 낱말까지 그대로 보인다. */}
         {vm.status.schedule_error && (
           <p className="text-destructive">
             <span className="font-medium">{t("snapshots.scheduleFailed")}</span>{" "}
             <span className="whitespace-pre-wrap break-words">
-              {vm.status.schedule_error.message}
+              {codeMessage(
+                t,
+                vm.status.schedule_error.code,
+                vm.status.schedule_error.message,
+                "snapshots.scheduleError",
+              )}
             </span>
           </p>
         )}

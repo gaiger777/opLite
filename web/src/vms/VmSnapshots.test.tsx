@@ -321,10 +321,12 @@ it("shows the schedule, its last failure and the snapshots it took", async () =>
   expect(
     await screen.findByText("Snapshot schedule: Daily, keep 7, with memory"),
   ).toBeInTheDocument();
-  // 서버가 남긴 이유를 그대로, 무엇의 실패인지와 함께 보인다.
-  expect(screen.getByText("Last scheduled snapshot failed:").parentElement).toHaveTextContent(
-    `Last scheduled snapshot failed: ${failure}`,
+  // 서버가 남긴 code를 예약 전용 문구로 번역해, 무엇의 실패인지와 함께 보인다.
+  const shown = screen.getByText("Last scheduled snapshot failed:").parentElement;
+  expect(shown).toHaveTextContent(
+    "Last scheduled snapshot failed: Skipped because the VM was busy; it will try again later.",
   );
+  expect(shown).not.toHaveTextContent(failure);
   expect(screen.getByRole("link", { name: "Change schedule" })).toHaveAttribute(
     "href",
     "/vms/web/edit",
@@ -345,4 +347,34 @@ it("says there is no schedule and lets only writers change it", async () => {
   expect(await screen.findByText("No snapshot schedule.")).toBeInTheDocument();
   expect(screen.queryByText("Last scheduled snapshot failed:")).not.toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "Change schedule" })).not.toBeInTheDocument();
+});
+
+it.each([
+  // 실패한 Task는 번역 뒤에 Task의 오류를 덧붙인다.
+  ["task_failed", "no space left on device", "Task error: no space left on device"],
+  // 예약 전용 문구에 서버의 설명(노드 이름)을 넣는다.
+  [
+    "node_offline",
+    'node "node-a" holding VM "web" is offline',
+    'Skipped because the VM\'s node is offline (node "node-a" holding VM "web" is offline).',
+  ],
+  // 예약 전용 문구가 없으면 오류 번역을 쓴다.
+  [
+    "snapshot_unsupported",
+    "raw disks cannot be snapshotted",
+    "Only VMs whose disks are all qcow2 can take snapshots.",
+  ],
+  // 번역이 없는 code(옛 문자열을 읽은 unknown 포함)는 서버의 설명을 그대로 보인다.
+  ["unknown", "VM busy", "VM busy"],
+  ["something_new", "a new failure", "a new failure"],
+])("shows the schedule failure %s in the user's language", async (code, message, text) => {
+  const failed = {
+    ...web,
+    spec: { ...web.spec, snapshot_schedule: { every: "hourly" as const, keep: 3, memory: false } },
+    status: { ...web.status, schedule_error: { code, message } },
+  };
+  mockLists({ vm: [failed], node: [NODE], volume: [volume("web-root", "local")] });
+  open(failed);
+  const shown = (await screen.findByText("Last scheduled snapshot failed:")).parentElement;
+  expect(shown).toHaveTextContent(`Last scheduled snapshot failed: ${text}`);
 });

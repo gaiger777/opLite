@@ -31,6 +31,8 @@
     "vm_has_snapshots": "VM에 스냅샷이 있습니다. 먼저 스냅샷을 지우세요.",
     "volume_in_snapshot": "VM 스냅샷이 아직 이 볼륨을 씁니다. 먼저 그 스냅샷을 지우세요.",
     "snapshot_not_ready": "아직 만드는 중인 스냅샷입니다.",
+    "node_offline": "VM이 있는 노드가 오프라인입니다.",
+    "task_failed": "작업 오류: {{message}}",
     "internal": "서버 오류: {{message}}"
   },
   "nav": {
@@ -132,6 +134,7 @@
     "deleted": "{{name}}을(를) 삭제했습니다.",
     "forceStopTitle": "{{name}}을(를) 강제 정지할까요?",
     "forceStopDescription": "게스트 OS를 종료하지 않고 VM을 끕니다. 저장하지 않은 게스트의 데이터를 잃습니다.",
+    "forceStopReverting": "스냅샷을 되돌리는 중에는 강제 정지할 수 없습니다.",
     "deleteTitle": "{{name}}을(를) 삭제할까요?",
     "deleteDescription": "VM을 삭제합니다. 볼륨은 남습니다.",
     "deleteSnapshots_one": "스냅샷 {{count}}개도 모두 지우기",
@@ -244,7 +247,11 @@
     "scheduleMemory": "예약 스냅샷: {{every}}, {{keep}}개 보관, 메모리 포함",
     "noSchedule": "스냅샷 예약이 없습니다.",
     "scheduleEdit": "예약 바꾸기",
-    "scheduleFailed": "마지막 예약 스냅샷 실패:"
+    "scheduleFailed": "마지막 예약 스냅샷 실패:",
+    "scheduleError": {
+      "vm_busy": "VM이 다른 작업 중이라 건너뛰었습니다. 다음 기회에 다시 합니다.",
+      "node_offline": "VM의 노드가 오프라인이라 건너뛰었습니다 ({{message}})."
+    }
   },
   "clone": {
     "title": "{{name}} 복제",

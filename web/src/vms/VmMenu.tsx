@@ -1,8 +1,9 @@
 import { MoreHorizontal } from "lucide-react";
-import { useRef, useState, type RefObject } from "react";
+import { useId, useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 
+import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
@@ -15,7 +16,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { ACTIONS, canDelete, canRun, useVmActions, type VmAction } from "@/vms/actions";
+import {
+  ACTIONS,
+  canDelete,
+  canRun,
+  isReverting,
+  useVmActions,
+  type VmAction,
+} from "@/vms/actions";
 import { VmCloneDialog } from "@/vms/VmCloneDialog";
 import { VmDeleteDialog } from "@/vms/VmDeleteDialog";
 
@@ -27,6 +35,11 @@ export function VmMenu({ vm }: { vm: Vm }) {
   const { run, remove } = useVmActions();
   const [confirm, setConfirm] = useState<VmDialog | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
+  const tasks = useList("task");
+  const hint = useId();
+  // 서버는 되돌리기 중의 강제 정지를 받지 않는다. Task 목록을 아직 모르면 서버에 맡긴다.
+  // 상태로도 끌 수 없는 VM이면 까닭은 되돌리기가 아니므로 보이지 않는다.
+  const reverting = canRun(vm, "force-stop") && isReverting(vm, tasks.data ?? []);
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
   // 복제는 새 VM과 새 볼륨을 만든다.
@@ -53,7 +66,8 @@ export function VmMenu({ vm }: { vm: Vm }) {
             ACTIONS.map((action) => (
               <DropdownMenuItem
                 key={action}
-                disabled={!canRun(vm, action)}
+                disabled={!canRun(vm, action) || (action === "force-stop" && reverting)}
+                aria-describedby={action === "force-stop" && reverting ? hint : undefined}
                 onSelect={() =>
                   action === "force-stop" ? setConfirm("force-stop") : void run(vm, action)
                 }
@@ -61,6 +75,13 @@ export function VmMenu({ vm }: { vm: Vm }) {
                 {t(`vms.action.${action}`)}
               </DropdownMenuItem>
             ))}
+          {/* Radix는 비활성 항목을 키보드로 건너뛰므로 aria-describedby가 읽히지 않을 수 있다.
+              같은 까닭은 상세 화면에도 보인다. */}
+          {operate && reverting && (
+            <p id={hint} className="px-1.5 py-1 text-xs text-muted-foreground">
+              {t("vms.forceStopReverting")}
+            </p>
+          )}
           {operate && (
             <DropdownMenuItem
               disabled={vm.status.phase !== "running"}

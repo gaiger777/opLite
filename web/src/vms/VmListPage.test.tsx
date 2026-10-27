@@ -67,6 +67,45 @@ it("starts a VM from its menu and selected VMs together", async () => {
   );
 });
 
+it("force stops a VM while a snapshot is being taken but not while one is reverted", async () => {
+  const running = (id: string, kind: Task["spec"]["op"]["kind"]) => ({
+    ...task(id, kind, web.id),
+    status: { state: "running" as const, error: null },
+  });
+  mockLists({ vm: [web], node: [NODE], task: [running("t-create", "snapshot-create")] });
+  const sent: string[] = [];
+  server.use(
+    http.post(apiUrl("/vms/:key/actions/:action"), ({ request }) => {
+      sent.push(new URL(request.url).search);
+      return HttpResponse.json(task("t-stop", "vm-stop", web.id), { status: 202 });
+    }),
+  );
+  const { queryClient } = renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "web" });
+  // Task 목록을 읽은 뒤에 메뉴를 연다.
+  await waitFor(() => expect(queryClient.getQueryData(["list", "task"])).toBeDefined());
+  await userEvent.click(screen.getByRole("button", { name: "Actions for web" }));
+  // 서버는 만들기 중 강제 정지를 받는다(만들기가 실패로 끝난다).
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Force stop" }));
+  await userEvent.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Force stop" }),
+  );
+  await waitFor(() => expect(sent).toEqual(["?mode=force"]));
+
+  // 되돌리기 중에는 막고 까닭을 보인다.
+  queryClient.setQueryData<List<Task>>(["list", "task"], {
+    revision: 2,
+    items: [running("t-revert", "snapshot-revert")],
+  });
+  await userEvent.click(screen.getByRole("button", { name: "Actions for web" }));
+  const item = await screen.findByRole("menuitem", { name: "Force stop" });
+  expect(item).toHaveAttribute("aria-disabled", "true");
+  expect(item).toHaveAccessibleDescription(
+    "Force stop is not available while a snapshot is being reverted.",
+  );
+  expect(screen.getByRole("menuitem", { name: "Stop" })).not.toHaveAttribute("aria-disabled");
+});
+
 it("deletes only after the name is typed", async () => {
   mockLists({ vm: [db], node: [NODE] });
   let deleted = false;
