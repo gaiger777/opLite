@@ -9,8 +9,10 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum QmpError {
@@ -22,6 +24,10 @@ pub enum QmpError {
     Command { class: String, desc: String },
     #[error("QMP connection closed")]
     Disconnected,
+    #[error("QMP job {id} failed: {error}")]
+    JobFailed { id: String, error: String },
+    #[error("QMP job {id} did not finish within {timeout:?}")]
+    JobTimeout { id: String, timeout: Duration },
 }
 
 /// QEMU가 보낸 비동기 이벤트 (SHUTDOWN, STOP, RESUME 등)
@@ -190,6 +196,127 @@ impl QmpClient {
             Err(e) => Err(e),
         }
     }
+
+    /// 내부 스냅샷 `tag`를 `devices`(블록 node-name)에 만들고 메모리 상태를 `vmstate`에 담는다.
+    /// 저장하는 동안 VM이 멈췄다가 원래 상태로 돌아온다.
+    pub async fn snapshot_save(
+        &self,
+        tag: &str,
+        vmstate: &str,
+        devices: &[String],
+        timeout: Duration,
+    ) -> Result<(), QmpError> {
+        let args = json!({ "tag": tag, "vmstate": vmstate, "devices": devices });
+        self.run_job("snapshot-save", args, timeout).await
+    }
+
+    /// 내부 스냅샷 `tag`로 디스크와 메모리 상태를 되돌린다. `-S`로 띄운 뒤 `cont` 전에 부를 수 있다.
+    pub async fn snapshot_load(
+        &self,
+        tag: &str,
+        vmstate: &str,
+        devices: &[String],
+        timeout: Duration,
+    ) -> Result<(), QmpError> {
+        let args = json!({ "tag": tag, "vmstate": vmstate, "devices": devices });
+        self.run_job("snapshot-load", args, timeout).await
+    }
+
+    /// `devices`에서 내부 스냅샷 `tag`를 지운다.
+    pub async fn snapshot_delete(
+        &self,
+        tag: &str,
+        devices: &[String],
+        timeout: Duration,
+    ) -> Result<(), QmpError> {
+        let args = json!({ "tag": tag, "devices": devices });
+        self.run_job("snapshot-delete", args, timeout).await
+    }
+
+    /// 메모리 없이 `devices` 모두에 내부 스냅샷 `tag`를 한 번에 만든다. VM은 멈추지 않는다.
+    pub async fn snapshot_disks(&self, tag: &str, devices: &[String]) -> Result<(), QmpError> {
+        let actions: Vec<Value> = devices
+            .iter()
+            .map(|d| {
+                json!({
+                    "type": "blockdev-snapshot-internal-sync",
+                    "data": { "device": d, "name": tag },
+                })
+            })
+            .collect();
+        self.execute("transaction", Some(json!({ "actions": actions })))
+            .await
+            .map(drop)
+    }
+
+    /// 블록 노드 `node`의 크기를 `size` 바이트로 바꾼다. 게스트가 바로 본다.
+    pub async fn block_resize(&self, node: &str, size: u64) -> Result<(), QmpError> {
+        let args = json!({ "node-name": node, "size": size });
+        self.execute("block_resize", Some(args)).await.map(drop)
+    }
+
+    /// 작업(job) 명령을 새 `job-id`로 시작하고 `concluded`까지 기다린 뒤, 오류를 읽고 `job-dismiss`한다.
+    ///
+    /// 제한 시간이 지나면 작업은 QEMU에 남겨 두고 `JobTimeout`을 돌려준다.
+    async fn run_job(
+        &self,
+        command: &str,
+        mut arguments: Value,
+        timeout: Duration,
+    ) -> Result<(), QmpError> {
+        let id = format!("opl-{}", Uuid::new_v4());
+        arguments["job-id"] = json!(id);
+        // 작업 이벤트를 놓치지 않게 시작하기 전에 구독한다.
+        let mut events = self.subscribe();
+        self.execute(command, Some(arguments)).await?;
+
+        let wait = async {
+            loop {
+                match events.recv().await {
+                    Ok(ev) => {
+                        if ev.event == "JOB_STATUS_CHANGE"
+                            && ev.data["id"] == id.as_str()
+                            && ev.data["status"] == "concluded"
+                        {
+                            return Ok(());
+                        }
+                    }
+                    // 이벤트를 놓쳤으면 query-jobs로 상태를 직접 본다.
+                    Err(RecvError::Lagged(_)) => {
+                        if self.query_job(&id).await?["status"] == "concluded" {
+                            return Ok(());
+                        }
+                    }
+                    Err(RecvError::Closed) => return Err(QmpError::Disconnected),
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| QmpError::JobTimeout {
+                id: id.clone(),
+                timeout,
+            })??;
+
+        let error = self.query_job(&id).await?["error"]
+            .as_str()
+            .map(str::to_string);
+        self.execute("job-dismiss", Some(json!({ "id": id })))
+            .await?;
+        match error {
+            Some(error) => Err(QmpError::JobFailed { id, error }),
+            None => Ok(()),
+        }
+    }
+
+    /// `query-jobs`에서 작업 `id`를 찾는다.
+    async fn query_job(&self, id: &str) -> Result<Value, QmpError> {
+        let jobs = self.execute("query-jobs", None).await?;
+        jobs.as_array()
+            .and_then(|jobs| jobs.iter().find(|j| j["id"] == id))
+            .cloned()
+            .ok_or_else(|| QmpError::Protocol(format!("job {id} not in query-jobs: {jobs}")))
+    }
 }
 
 impl Drop for QmpClient {
@@ -292,7 +419,6 @@ mod tests {
     use std::time::Duration;
 
     use tokio::net::UnixListener;
-    use tokio::sync::broadcast::error::RecvError;
 
     use super::*;
 
@@ -324,6 +450,47 @@ mod tests {
             reply["id"] = cmd["id"].clone();
             self.send(reply).await;
         }
+    }
+
+    /// 작업을 시작하는 명령 하나를 받아 빈 응답을 주고, 인자(`job-id` 포함)를 돌려준다.
+    async fn accept_job(fake: &mut FakeQemu, expect: &str) -> Value {
+        let cmd = fake.recv().await;
+        assert_eq!(cmd["execute"], expect);
+        fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+        cmd["arguments"].clone()
+    }
+
+    async fn job_status(fake: &mut FakeQemu, id: &Value, status: &str) {
+        fake.send(json!({
+            "event": "JOB_STATUS_CHANGE",
+            "data": { "id": id, "status": status },
+            "timestamp": {}
+        }))
+        .await;
+    }
+
+    /// 실제 QEMU처럼 created부터 concluded까지 이벤트를 보내고, `query-jobs`(실패면 `error`)와
+    /// `job-dismiss`에 답한다.
+    async fn run_job(fake: &mut FakeQemu, id: &Value, error: Option<&str>) {
+        for status in ["created", "running", "waiting", "pending", "concluded"] {
+            job_status(fake, id, status).await;
+        }
+        answer_jobs(fake, id, error).await;
+    }
+
+    async fn answer_jobs(fake: &mut FakeQemu, id: &Value, error: Option<&str>) {
+        let mut job = json!({
+            "id": id, "type": "snapshot-save", "status": "concluded",
+            "current-progress": 1, "total-progress": 1
+        });
+        if let Some(e) = error {
+            job["error"] = json!(e);
+        }
+        fake.answer("query-jobs", json!({ "return": [job] })).await;
+        let cmd = fake.recv().await;
+        assert_eq!(cmd["execute"], "job-dismiss");
+        assert_eq!(&cmd["arguments"]["id"], id);
+        fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
     }
 
     /// 리스너를 열고, 클라이언트 연결을 받아 greeting과 capabilities 협상까지 처리한다.
@@ -497,5 +664,170 @@ mod tests {
         assert_eq!(status.unwrap(), RunState::Running);
         assert_eq!(name.unwrap()["name"], "vm1");
         assert_eq!(rx.recv().await.unwrap().event, "RESUME");
+    }
+
+    const T: Duration = Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn snapshot_save_waits_for_job_and_dismisses_it() {
+        let (client, mut fake, _dir) = setup().await;
+        let devices = ["disk0".to_string(), "disk1".to_string()];
+        let (res, ()) = tokio::join!(client.snapshot_save("s1", "disk0", &devices, T), async {
+            let args = accept_job(&mut fake, "snapshot-save").await;
+            assert_eq!(args["tag"], "s1");
+            assert_eq!(args["vmstate"], "disk0");
+            assert_eq!(args["devices"], json!(["disk0", "disk1"]));
+            let id = args["job-id"].clone();
+            assert!(id.as_str().is_some_and(|s| !s.is_empty()));
+            // 다른 작업의 이벤트는 무시해야 한다.
+            job_status(&mut fake, &json!("other"), "concluded").await;
+            run_job(&mut fake, &id, None).await;
+        });
+        res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_load_and_delete_send_their_arguments() {
+        let (client, mut fake, _dir) = setup().await;
+        let devices = ["disk0".to_string()];
+        let (res, ()) = tokio::join!(client.snapshot_load("s1", "disk0", &devices, T), async {
+            let args = accept_job(&mut fake, "snapshot-load").await;
+            assert_eq!(args["tag"], "s1");
+            assert_eq!(args["vmstate"], "disk0");
+            assert_eq!(args["devices"], json!(["disk0"]));
+            run_job(&mut fake, &args["job-id"], None).await;
+        });
+        res.unwrap();
+
+        let (res, ()) = tokio::join!(client.snapshot_delete("s1", &devices, T), async {
+            let args = accept_job(&mut fake, "snapshot-delete").await;
+            assert_eq!(args["tag"], "s1");
+            assert_eq!(args["devices"], json!(["disk0"]));
+            assert!(args.get("vmstate").is_none());
+            run_job(&mut fake, &args["job-id"], None).await;
+        });
+        res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_job_reports_error_and_is_still_dismissed() {
+        let (client, mut fake, _dir) = setup().await;
+        let devices = ["disk0".to_string()];
+        let (res, ()) = tokio::join!(client.snapshot_load("nope", "disk0", &devices, T), async {
+            let args = accept_job(&mut fake, "snapshot-load").await;
+            run_job(
+                &mut fake,
+                &args["job-id"],
+                Some("Snapshot 'nope' does not exist"),
+            )
+            .await;
+        });
+        match res.unwrap_err() {
+            QmpError::JobFailed { error, .. } => {
+                assert_eq!(error, "Snapshot 'nope' does not exist");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_start_error_is_returned_without_waiting() {
+        let (client, mut fake, _dir) = setup().await;
+        let (res, ()) = tokio::join!(client.snapshot_delete("s1", &[], T), async {
+            fake.answer(
+                "snapshot-delete",
+                json!({ "error": { "class": "GenericError", "desc": "bad" } }),
+            )
+            .await;
+        });
+        assert!(matches!(res, Err(QmpError::Command { .. })));
+    }
+
+    #[tokio::test]
+    async fn job_times_out_when_it_never_concludes() {
+        let (client, mut fake, _dir) = setup().await;
+        let devices = ["disk0".to_string()];
+        let (res, _fake) = tokio::join!(
+            client.snapshot_save("s1", "disk0", &devices, Duration::from_millis(200)),
+            async {
+                let args = accept_job(&mut fake, "snapshot-save").await;
+                job_status(&mut fake, &args["job-id"], "running").await;
+                fake
+            }
+        );
+        assert!(matches!(res, Err(QmpError::JobTimeout { .. })));
+    }
+
+    #[tokio::test]
+    async fn job_wait_fails_when_connection_closes() {
+        let (client, mut fake, _dir) = setup().await;
+        let devices = ["disk0".to_string()];
+        let (res, ()) = tokio::join!(client.snapshot_save("s1", "disk0", &devices, T), async {
+            accept_job(&mut fake, "snapshot-save").await;
+            drop(fake);
+        });
+        assert!(matches!(res, Err(QmpError::Disconnected)));
+    }
+
+    #[tokio::test]
+    async fn lagged_job_wait_falls_back_to_query_jobs() {
+        let (client, mut fake, _dir) = setup().await;
+        let devices = ["disk0".to_string()];
+        let (res, ()) = tokio::join!(client.snapshot_save("s1", "disk0", &devices, T), async {
+            let cmd = fake.recv().await;
+            let id = cmd["arguments"]["job-id"].clone();
+            // 응답보다 먼저 이벤트를 넘치게 보내 구독자가 `Lagged`를 받게 한다.
+            // concluded 이벤트도 이 사이에 묻힌다.
+            for _ in 0..100 {
+                job_status(&mut fake, &json!("other"), "running").await;
+            }
+            job_status(&mut fake, &id, "concluded").await;
+            for _ in 0..100 {
+                job_status(&mut fake, &json!("other"), "running").await;
+            }
+            fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+            // 놓친 것을 알고 상태를 묻는다. 그다음은 보통처럼 오류 확인과 dismiss.
+            fake.answer(
+                "query-jobs",
+                json!({ "return": [{ "id": id, "type": "snapshot-save", "status": "concluded" }] }),
+            )
+            .await;
+            answer_jobs(&mut fake, &id, None).await;
+        });
+        res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_disks_uses_one_transaction() {
+        let (client, mut fake, _dir) = setup().await;
+        let devices = ["disk0".to_string(), "disk1".to_string()];
+        let (res, ()) = tokio::join!(client.snapshot_disks("s1", &devices), async {
+            let cmd = fake.recv().await;
+            assert_eq!(cmd["execute"], "transaction");
+            assert_eq!(
+                cmd["arguments"]["actions"],
+                json!([
+                    { "type": "blockdev-snapshot-internal-sync", "data": { "device": "disk0", "name": "s1" } },
+                    { "type": "blockdev-snapshot-internal-sync", "data": { "device": "disk1", "name": "s1" } }
+                ])
+            );
+            fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+        });
+        res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn block_resize_sends_node_and_size() {
+        let (client, mut fake, _dir) = setup().await;
+        let (res, ()) = tokio::join!(client.block_resize("disk1", 2 << 30), async {
+            let cmd = fake.recv().await;
+            assert_eq!(cmd["execute"], "block_resize");
+            assert_eq!(
+                cmd["arguments"],
+                json!({ "node-name": "disk1", "size": 2u64 << 30 })
+            );
+            fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+        });
+        res.unwrap();
     }
 }

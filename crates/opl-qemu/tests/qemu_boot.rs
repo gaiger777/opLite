@@ -52,9 +52,8 @@ async fn wait_for(path: &Path) {
     panic!("{path:?} did not appear within 10s");
 }
 
-#[tokio::test]
-async fn boots_paused_resumes_reconnects_and_quits() {
-    let host = host();
+/// qcow2 디스크 하나(OS 없음)로 QEMU를 `-S`로 띄우고 QMP 소켓이 생길 때까지 기다린다.
+async fn launch(host: &HostProfile) -> (tempfile::TempDir, tokio::process::Child, RuntimePaths) {
     // macOS의 기본 TMPDIR은 경로가 길어 소켓 경로 한도(103바이트)를 넘기므로 /tmp를 쓴다.
     let tmp = tempfile::Builder::new()
         .prefix("opl")
@@ -74,13 +73,20 @@ async fn boots_paused_resumes_reconnects_and_quits() {
         .unwrap();
     assert!(status.success());
 
-    let args = build_cmdline(&spec(id, disk), &host, &paths).unwrap();
-    let mut child = tokio::process::Command::new(&host.qemu_binary)
+    let args = build_cmdline(&spec(id, disk), host, &paths).unwrap();
+    let child = tokio::process::Command::new(&host.qemu_binary)
         .args(&args)
         .kill_on_drop(true)
         .spawn()
         .unwrap();
     wait_for(&paths.qmp_socket).await;
+    (tmp, child, paths)
+}
+
+#[tokio::test]
+async fn boots_paused_resumes_reconnects_and_quits() {
+    let host = host();
+    let (_tmp, mut child, paths) = launch(&host).await;
 
     let qmp = QmpClient::connect(&paths.qmp_socket).await.unwrap();
     assert_eq!(qmp.query_status().await.unwrap(), RunState::Prelaunch);
@@ -91,6 +97,74 @@ async fn boots_paused_resumes_reconnects_and_quits() {
     drop(qmp);
     let qmp = QmpClient::connect(&paths.qmp_socket).await.unwrap();
     assert_eq!(qmp.query_status().await.unwrap(), RunState::Running);
+
+    qmp.quit().await.unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("qemu did not exit within 10s")
+        .unwrap();
+    assert!(exit.success(), "qemu exited with {exit}");
+}
+
+/// QMP의 `disk0` 노드에 있는 내부 스냅샷 이름들과 가상 크기
+async fn disk0(qmp: &QmpClient) -> (Vec<String>, u64) {
+    let nodes = qmp.execute("query-named-block-nodes", None).await.unwrap();
+    let node = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["node-name"] == "disk0")
+        .unwrap();
+    let tags = node["image"]["snapshots"]
+        .as_array()
+        .map(|s| {
+            s.iter()
+                .map(|s| s["name"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    (tags, node["image"]["virtual-size"].as_u64().unwrap())
+}
+
+#[tokio::test]
+async fn snapshot_jobs_and_block_resize() {
+    let host = host();
+    let (_tmp, mut child, paths) = launch(&host).await;
+    let qmp = QmpClient::connect(&paths.qmp_socket).await.unwrap();
+    qmp.cont().await.unwrap();
+    let devices = ["disk0".to_string()];
+    let t = Duration::from_secs(60);
+
+    // 메모리 스냅샷: 저장하는 동안 멈췄다가 다시 실행된다.
+    qmp.snapshot_save("mem", "disk0", &devices, t)
+        .await
+        .unwrap();
+    assert_eq!(qmp.query_status().await.unwrap(), RunState::Running);
+    // 디스크만 스냅샷
+    qmp.snapshot_disks("disk", &devices).await.unwrap();
+    assert_eq!(disk0(&qmp).await.0, ["mem", "disk"]);
+
+    qmp.snapshot_load("mem", "disk0", &devices, t)
+        .await
+        .unwrap();
+    assert_eq!(qmp.query_status().await.unwrap(), RunState::Running);
+    // 없는 태그를 불러오면 작업이 오류로 끝난다.
+    let err = qmp
+        .snapshot_load("nope", "disk0", &devices, t)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, opl_qemu::QmpError::JobFailed { .. }),
+        "{err:?}"
+    );
+
+    qmp.snapshot_delete("disk", &devices, t).await.unwrap();
+    // 없는 태그를 지워도 성공한다.
+    qmp.snapshot_delete("disk", &devices, t).await.unwrap();
+    assert_eq!(disk0(&qmp).await.0, ["mem"]);
+
+    qmp.block_resize("disk0", 2 << 30).await.unwrap();
+    assert_eq!(disk0(&qmp).await.1, 2 << 30);
 
     qmp.quit().await.unwrap();
     let exit = tokio::time::timeout(Duration::from_secs(10), child.wait())
