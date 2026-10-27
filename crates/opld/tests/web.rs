@@ -1,5 +1,5 @@
 //! 웹 UI E2E: 실제 opld(QEMU)에 브라우저(Playwright)로 로그인해 풀을 만들고 이미지를 올린 뒤, 그 볼륨으로
-//! VM을 만들어 콘솔을 보고, VM·볼륨·풀을 모두 지운다. 클러스터와 로그인 정보는 여기서 준비한다.
+//! VM을 만들어 콘솔을 보고, 스냅샷을 만들고 되돌리고 지우고, 볼륨을 늘린 뒤, VM(스냅샷과 함께)·볼륨·풀을 모두 지운다. 클러스터와 로그인 정보는 여기서 준비한다.
 //! `pnpm -C web build && cargo test -p opld --features web-it --test web`
 //! QEMU(`qemu-it`와 같다), pnpm, `pnpm -C web exec playwright install chromium`이 필요하다.
 #![cfg(feature = "web-it")]
@@ -11,9 +11,23 @@ use std::process::Command;
 use std::time::Duration;
 
 use common::Daemon;
+use oplctl::Client;
+use serde_json::Value;
 
 /// 브라우저가 올릴 디스크 이미지(raw, 0으로 채운 sparse 파일)의 크기
 const IMAGE_BYTES: u64 = 16 << 20;
+
+/// `oplctl login`이 저장한 로그인 정보로 API 클라이언트를 만든다(스냅샷 전체 목록은 oplctl에 없다).
+fn client(d: &Daemon) -> Client {
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(d.path("oplctl.json")).unwrap()).unwrap();
+    Client::new(
+        config["server"].as_str().unwrap(),
+        config["token"].as_str().map(str::to_string),
+        config["ca_pem"].as_str().map(str::to_string),
+    )
+    .unwrap()
+}
 
 #[tokio::test]
 async fn browser_uploads_image_runs_vm_and_cleans_up() {
@@ -57,7 +71,11 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
         // 브라우저가 지우지 못한 VM을 끄고 지운다(QEMU가 남지 않게). 볼륨 삭제는 Task를 오래 기다릴 수
         // 있어 잠깐만 기다리고, 풀과 남은 파일은 데몬의 임시 디렉터리와 함께 사라진다. 실패는 무시한다.
         let _ = d.ctl(&["vm", "stop", "web", "--force"]).await;
-        let _ = d.ctl(&["vm", "delete", "web"]).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(60),
+            d.ctl(&["vm", "delete", "web", "--with-snapshots"]),
+        )
+        .await;
         let _ = tokio::time::timeout(
             Duration::from_secs(30),
             d.ctl(&["volume", "delete", "root"]),
@@ -76,6 +94,12 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
         let list = d.ctl_json(&[kind, "list"]).await;
         assert_eq!(list.as_array().map(Vec::len), Some(0), "{kind}: {list}");
     }
+    let snapshots: Value = client(&d).get("/snapshots").await.unwrap();
+    assert_eq!(
+        snapshots["items"].as_array().map(Vec::len),
+        Some(0),
+        "snapshots: {snapshots}"
+    );
     // 볼륨 파일도 지웠다. dir 풀의 디렉터리에는 볼륨 파일과 만드는 동안의 임시 파일만 생긴다.
     let left: Vec<_> = std::fs::read_dir(&pool)
         .unwrap()

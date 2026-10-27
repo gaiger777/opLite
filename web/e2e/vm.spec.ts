@@ -89,17 +89,74 @@ test("upload an image, run a VM from it, then delete everything", async ({ page 
   await expect(page.getByRole("status").filter({ hasText: "Connected" })).toBeVisible();
   await expect.poll(() => consoleShowsSomething(page), { timeout: 60_000 }).toBe(true);
 
+  // 실행 중에 메모리까지 담은 스냅샷을 만든다. 만들기 Task가 끝나면 현재 위치가 된다.
+  // 스냅샷은 qcow2 디스크에만 만들 수 있다. 위에서 올린 raw 이미지를 qcow2로 가져왔다는 것이 전제다.
+  await page.getByRole("tab", { name: "Snapshots" }).click();
+  await page.getByRole("button", { name: "Take snapshot" }).click();
+  dialog = page.getByRole("dialog", { name: "Take a snapshot of web" });
+  await dialog.getByLabel("Name").fill("before");
+  await expect(dialog.getByRole("checkbox", { name: "Include memory" })).toBeChecked();
+  await dialog.getByRole("button", { name: "Take snapshot" }).click();
+  await expect(dialog).toBeHidden();
+  const before = page.getByRole("row").filter({ has: page.getByRole("cell", { name: /^before/ }) });
+  await expect(before.getByText("Current", { exact: true })).toBeVisible({ timeout: 60_000 });
+  await expect(before.getByRole("cell", { name: "Included", exact: true })).toBeVisible();
+
+  // 되돌리면 VM을 껐다가 저장한 메모리에서 다시 실행한다. Task가 끝날 때는 다시 실행 중이다.
+  await page.getByRole("button", { name: "Revert to before" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Revert" }).click();
+  await expect(page.getByText("Revert web to before: done")).toBeVisible({ timeout: 60_000 });
+  await expect(page.getByTestId("vm-phase")).toHaveText("Running");
+  await expect(before.getByText("Current", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Delete snapshot before" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByText("No snapshots.")).toBeVisible({ timeout: 60_000 });
+
+  // 실행 중인 VM의 볼륨을 1 GiB로 늘린다.
+  await page.getByRole("link", { name: "Volumes" }).click();
+  await page.getByRole("button", { name: "Resize root" }).click();
+  dialog = page.getByRole("dialog", { name: "Resize volume root" });
+  await expect(dialog.getByText("Current size: 16 MiB")).toBeVisible();
+  await dialog.getByLabel("New size (GiB)").fill("1");
+  await dialog.getByRole("button", { name: "Resize" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(root.getByRole("cell", { name: "1 GiB", exact: true })).toBeVisible({
+    timeout: 60_000,
+  });
+
+  await page.getByRole("link", { name: "Virtual machines" }).click();
+  await page.getByRole("link", { name: "web", exact: true }).click();
+  await expect(page.getByTestId("vm-phase")).toHaveText("Running");
+
   // OS가 없는 게스트는 ACPI 종료에 응하지 않으므로 강제로 끈다.
   await page.getByRole("button", { name: "Force stop" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Force stop" }).click();
   await expect(page.getByTestId("vm-phase")).toHaveText("Stopped", { timeout: 60_000 });
 
-  await page.getByRole("button", { name: "Delete" }).click();
+  // 꺼진 VM에는 디스크만 담는 스냅샷을 만든다(메모리 칸이 없다).
+  await page.getByRole("tab", { name: "Snapshots" }).click();
+  await page.getByRole("button", { name: "Take snapshot" }).click();
+  dialog = page.getByRole("dialog", { name: "Take a snapshot of web" });
+  await dialog.getByLabel("Name").fill("off");
+  await expect(dialog.getByRole("checkbox", { name: "Include memory" })).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Take snapshot" }).click();
+  await expect(dialog).toBeHidden();
+  const off = page.getByRole("row").filter({ has: page.getByRole("cell", { name: /^off/ }) });
+  await expect(off.getByText("Current", { exact: true })).toBeVisible({ timeout: 60_000 });
+  await expect(off.getByRole("cell", { name: "No", exact: true })).toBeVisible();
+
+  // 스냅샷이 있는 VM은 스냅샷도 지우겠다고 골라야 지울 수 있다.
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
   let confirm = page.getByRole("alertdialog");
   await confirm.getByLabel("Type web to confirm").fill("web");
+  await expect(confirm.getByRole("button", { name: "Delete" })).toBeDisabled();
+  await confirm.getByRole("checkbox", { name: "Also delete its snapshot" }).check();
   await confirm.getByRole("button", { name: "Delete" }).click();
   await expect(page).toHaveURL(/\/vms$/);
-  await expect(page.getByRole("link", { name: "web", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "web", exact: true })).toHaveCount(0, {
+    timeout: 60_000,
+  });
 
   // 볼륨과 풀을 지운다. 볼륨은 삭제 Task가 끝나야 목록에서 사라진다.
   await page.getByRole("link", { name: "Volumes" }).click();
