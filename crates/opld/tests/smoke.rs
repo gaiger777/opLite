@@ -110,6 +110,24 @@ async fn single_node_cluster_serves_cli_over_https_and_survives_restarts() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("name_taken"), "{err}");
+    // 가져오기는 파일을 보내기 전에 확인한다. 거절되면 파일을 열지 않는다(읽을 수 없는 파일이어도
+    // 서버의 거절 이유가 보인다). root는 권한과 상관없이 읽으므로 root로 돌리면 이 단언은 거절 이유만 본다.
+    let image = d.path("disk.vmdk");
+    std::fs::write(&image, [0u8; 512]).unwrap();
+    std::fs::set_permissions(&image, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    let err = d
+        .ctl(&[
+            "volume",
+            "import",
+            "disk",
+            "--pool",
+            "missing",
+            "--file",
+            image.to_str().unwrap(),
+        ])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not found"), "{err}");
 
     d.stop();
     d.start().await;

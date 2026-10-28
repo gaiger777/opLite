@@ -531,9 +531,26 @@ export interface paths {
         put?: never;
         /**
          * 요청 본문(이미지 파일)을 이 노드에 받아 두고, 그것을 변환해 볼륨을 채울 Task를 돌려준다(202).
-         *     풀은 이 노드에서 쓸 수 있어야 한다.
+         *     풀은 이 노드에서 쓸 수 있어야 한다. 받기 전에 `check_import`로 확인한다.
          */
         post: operations["import_volume"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/volumes/import/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 업로드 전에 받을 수 있는지 확인한다(204). 거절 이유는 업로드와 같다. 본문은 받지 않는다. */
+        post: operations["check_import_volume"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3170,6 +3187,39 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    check_import_volume: {
+        parameters: {
+            query: {
+                name: string;
+                pool: string;
+                /** @description 만들 볼륨의 형식 (기본 qcow2) */
+                format?: "qcow2" | "raw";
+                source_format: "vmdk" | "qcow2" | "raw";
+                /** @description 올릴 파일 크기(바이트) */
+                size: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {

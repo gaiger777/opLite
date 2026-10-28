@@ -113,13 +113,90 @@ fn qcow2() -> ImageFormat {
     ImageFormat::Qcow2
 }
 
+/// 업로드 사전 확인의 매개변수. 업로드의 것에 올릴 파일 크기(바이트)를 더한다.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct ImportCheckQuery {
+    pub name: String,
+    pub pool: String,
+    /// 만들 볼륨의 형식 (기본 qcow2)
+    #[serde(default = "qcow2")]
+    #[param(inline)]
+    pub format: ImageFormat,
+    #[param(inline)]
+    pub source_format: SourceFormat,
+    /// 올릴 파일 크기(바이트)
+    pub size: u64,
+}
+
+/// 업로드를 받기 전의 확인. 사전 확인과 업로드가 함께 쓴다. 문제가 없으면 풀을 돌려준다.
+/// 확인 뒤에 다른 요청이 이름을 가져가면 저장소에 만들 때 `name_taken`이 난다.
+pub async fn check_import(
+    state: &AppState,
+    principal: &Principal,
+    q: &ImportQuery,
+    size: u64,
+) -> Result<StoragePool, ApiError> {
+    state.authorize(principal, Action::Write, VolumeSpec::KIND)?;
+    check_volume_name(&q.name)?;
+    let pool = find_pool(state, &q.pool)?;
+    if pool_node(state, &pool) != state.node {
+        return Err(ApiError::conflict(
+            "pool_not_on_node",
+            format!(
+                "storage pool {:?} is not available on this node; upload to one of its nodes",
+                pool.name
+            ),
+        ));
+    }
+    if state.cluster.get_by_name::<VolumeSpec>(&q.name)?.is_some() {
+        return Err(ApiError::conflict(
+            "name_taken",
+            format!("volume {:?} already exists", q.name),
+        ));
+    }
+    tokio::fs::create_dir_all(&state.upload_dir)
+        .await
+        .map_err(ApiError::internal)?;
+    let available = fs4::available_space(&state.upload_dir).map_err(ApiError::internal)?;
+    if size.saturating_add(UPLOAD_RESERVE_BYTES) > available {
+        return Err(ApiError::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "insufficient_storage",
+            format!("not enough free space for a {size}-byte upload"),
+        ));
+    }
+    Ok(pool)
+}
+
+/// 업로드 전에 받을 수 있는지 확인한다(204). 거절 이유는 업로드와 같다. 본문은 받지 않는다.
+#[utoipa::path(post, path = "/volumes/import/check", tag = "storage",
+    params(ImportCheckQuery),
+    responses((status = 204), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn check_import_volume(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Query(q): Query<ImportCheckQuery>,
+) -> Result<StatusCode, ApiError> {
+    let size = q.size;
+    let q = ImportQuery {
+        name: q.name,
+        pool: q.pool,
+        format: q.format,
+        source_format: q.source_format,
+    };
+    check_import(&state, &principal, &q, size).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// 업로드 본문의 문서용 스키마: 바이너리 파일
 #[derive(ToSchema)]
 #[schema(value_type = String, format = Binary)]
 pub struct ImageFile(#[allow(dead_code)] Vec<u8>);
 
 /// 요청 본문(이미지 파일)을 이 노드에 받아 두고, 그것을 변환해 볼륨을 채울 Task를 돌려준다(202).
-/// 풀은 이 노드에서 쓸 수 있어야 한다.
+/// 풀은 이 노드에서 쓸 수 있어야 한다. 받기 전에 `check_import`로 확인한다.
 #[utoipa::path(post, path = "/volumes/import", tag = "storage",
     params(ImportQuery),
     request_body(content = ImageFile, content_type = "application/octet-stream"),
@@ -131,18 +208,8 @@ pub async fn import_volume(
     headers: HeaderMap,
     body: Body,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
-    check_volume_name(&q.name)?;
-    let pool = find_pool(&state, &q.pool)?;
-    if pool_node(&state, &pool) != state.node {
-        return Err(ApiError::conflict(
-            "pool_not_on_node",
-            format!(
-                "storage pool {:?} is not available on this node; upload to one of its nodes",
-                pool.name
-            ),
-        ));
-    }
+    let length = content_length(&headers)?;
+    let pool = check_import(&state, &principal, &q, length).await?;
     // 크기는 가져온 뒤 실제 이미지 크기로 바뀐다.
     let mut volume: Volume = Resource::new(
         q.name,
@@ -153,18 +220,6 @@ pub async fn import_volume(
         },
     );
     volume.status.node = Some(state.node);
-    let length = content_length(&headers)?;
-    tokio::fs::create_dir_all(&state.upload_dir)
-        .await
-        .map_err(ApiError::internal)?;
-    let available = fs4::available_space(&state.upload_dir).map_err(ApiError::internal)?;
-    if length.saturating_add(UPLOAD_RESERVE_BYTES) > available {
-        return Err(ApiError::new(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "insufficient_storage",
-            format!("not enough free space for a {length}-byte upload"),
-        ));
-    }
     state.cluster.create(&volume).await?;
     // 여기서부터 실패하거나 클라이언트가 끊어 이 future가 버려지면 볼륨과 파일을 지운다.
     let mut guard = UploadGuard {

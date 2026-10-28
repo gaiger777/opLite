@@ -18,6 +18,7 @@ async fn openapi_document_is_served_without_login() {
         "/vms/{key}/actions/{action}",
         "/vms/{key}/console",
         "/volumes/import",
+        "/volumes/import/check",
         "/volumes/{key}/resize",
         "/snapshots",
         "/vms/{key}/snapshots",

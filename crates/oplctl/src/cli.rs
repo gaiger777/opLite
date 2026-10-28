@@ -676,6 +676,21 @@ where
                     ("source_format", src.as_str()),
                     ("format", fmt.as_str()),
                 ];
+                // 파일을 보내기 전에 서버가 받을 수 있는지 확인한다.
+                let size = tokio::fs::metadata(&file)
+                    .await
+                    .with_context(|| format!("cannot read {}", file.display()))?
+                    .len()
+                    .to_string();
+                let mut check = query.to_vec();
+                check.push(("size", size.as_str()));
+                client
+                    .send(
+                        client
+                            .request(Method::POST, "/volumes/import/check")
+                            .query(&check),
+                    )
+                    .await?;
                 let task = client.upload("/volumes/import", &query, &file).await?;
                 client.wait_task(&task).await?;
                 writeln!(out, "volume {name} imported")?;
