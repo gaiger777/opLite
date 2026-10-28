@@ -254,10 +254,12 @@ impl Member {
                 }
             })
         };
-        let mut reconciler_config = ReconcilerConfig::new(node);
+        // NFS 풀의 마운트 지점은 `{data_dir}/pools/{풀 id}`다.
+        let mount_root = config.data_dir.join("pools");
+        let mut reconciler_config = ReconcilerConfig::new(node, &mount_root);
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
-        let storage: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img));
+        let storage: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img, mount_root));
         // Task 실행기는 시작할 때 이 노드가 남긴 고아를 지운다. 그것이 끝난 뒤에 API를 연다.
         let mut runner_config = TaskRunnerConfig::new(node);
         runner_config.upload_dir = Some(config.data_dir.join("uploads"));

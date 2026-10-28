@@ -132,7 +132,7 @@ async fn remove_tags(
         }
         match ctx
             .storage
-            .snapshot_delete(&pool.spec, volume.id, volume.spec.format, tag)
+            .snapshot_delete(&pool, volume.id, volume.spec.format, tag)
             .await
         {
             // 이 노드의 볼륨인데 파일이 없으면 태그도 없다.
@@ -225,7 +225,7 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         for (volume, pool) in &disks {
             result = ctx
                 .storage
-                .snapshot_create(&pool.spec, volume.id, volume.spec.format, &tag)
+                .snapshot_create(pool, volume.id, volume.spec.format, &tag)
                 .await;
             if result.is_err() {
                 break;
@@ -385,7 +385,7 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             return Err("VM was started again".into());
         }
         ctx.storage
-            .snapshot_revert(&pool.spec, volume.id, volume.spec.format, &tag)
+            .snapshot_revert(pool, volume.id, volume.spec.format, &tag)
             .await
             .map_err(|e| format!("cannot revert volume {:?}: {e}", volume.name))?;
     }
@@ -466,7 +466,7 @@ async fn write_reverted_spec(ctx: &Ctx, vm_id: Uuid, snapshot: &Snapshot) -> Res
 async fn record_size(ctx: &Ctx, volume: &Volume, pool: &StoragePool) {
     let info = match ctx
         .storage
-        .volume_info(&pool.spec, volume.id, volume.spec.format)
+        .volume_info(pool, volume.id, volume.spec.format)
         .await
     {
         Ok(info) => info,

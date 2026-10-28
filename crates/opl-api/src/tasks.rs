@@ -576,7 +576,7 @@ async fn set_volume_size(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Str
 /// 파일이 준비된 볼륨을 Ready로 기록한다. 실제 크기(qemu-img가 512바이트 단위로 올림하고, 가져온
 /// 이미지는 원본 크기다)와 할당 크기도 남기는데, 이것은 실패해도 넘어간다. Ready는 기록될 때까지
 /// 다시 시도한다. 실패로 끝내면 정리하면서 다 만든 파일을 지우게 된다.
-async fn mark_ready(ctx: &Ctx, volume: &Volume, pool: &StoragePoolSpec) {
+async fn mark_ready(ctx: &Ctx, volume: &Volume, pool: &StoragePool) {
     let info = match ctx
         .storage
         .volume_info(pool, volume.id, volume.spec.format)
@@ -620,14 +620,14 @@ async fn create_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
     let (volume, pool) = volume_and_pool(ctx, id)?;
     match ctx
         .storage
-        .create_volume(&pool.spec, id, volume.spec.size_bytes, volume.spec.format)
+        .create_volume(&pool, id, volume.spec.size_bytes, volume.spec.format)
         .await
     {
         // 볼륨 id는 유일하므로 이미 있는 파일은 이 Task의 이전 시도가 만든 것이다.
         Ok(_) | Err(DriverError::VolumeExists(_)) => {}
         Err(e) => return Err(e.to_string()),
     }
-    mark_ready(ctx, &volume, &pool.spec).await;
+    mark_ready(ctx, &volume, &pool).await;
     Ok(())
 }
 
@@ -643,11 +643,11 @@ async fn import_volume(
         .await
         .map_err(|e| e.to_string())?;
     ctx.storage
-        .import_volume(&pool.spec, id, source, source_format, volume.spec.format)
+        .import_volume(&pool, id, source, source_format, volume.spec.format)
         .await
         .map_err(|e| e.to_string())?;
     let _ = tokio::fs::remove_file(source).await;
-    mark_ready(ctx, &volume, &pool.spec).await;
+    mark_ready(ctx, &volume, &pool).await;
     Ok(())
 }
 
@@ -689,13 +689,13 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
             .map_err(|e| e.to_string())?,
         _ => ctx
             .storage
-            .resize_volume(&pool.spec, id, volume.spec.format, size_bytes)
+            .resize_volume(&pool, id, volume.spec.format, size_bytes)
             .await
             .map_err(|e| e.to_string())?,
     }
     let info = ctx
         .storage
-        .volume_info(&pool.spec, id, volume.spec.format)
+        .volume_info(&pool, id, volume.spec.format)
         .await
         .map_err(|e| format!("cannot read the new size: {e}"))?;
     set_volume_size(ctx, id, info.virtual_bytes).await
@@ -726,7 +726,7 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
     {
         match ctx
             .storage
-            .delete_volume(&pool.spec, id, volume.spec.format)
+            .delete_volume(&pool, id, volume.spec.format)
             .await
         {
             Ok(()) | Err(DriverError::VolumeNotFound(_)) => {}

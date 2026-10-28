@@ -338,7 +338,8 @@ impl Worker {
 
     /// VM을 시작한다. 시작하지 못하고 실패를 기록했으면(백오프 또는 포기) false.
     async fn start(&mut self, vm: &Vm) -> Result<bool, StepError> {
-        let spec = match runtime_spec(&self.cluster, vm, self.config.node) {
+        let spec = match runtime_spec(&self.cluster, vm, self.config.node, &self.config.mount_root)
+        {
             Ok(spec) => spec,
             Err(ResolveError::Cluster(e)) => return Err(e.into()),
             // 참조가 틀렸다. spec을 고쳐야 하므로 다시 시도하지 않는다.
@@ -370,7 +371,8 @@ impl Worker {
 
     /// 살아 있는 VM에 다시 붙거나 이어서 실행한다(`start`는 멱등이다). 참조 해석 오류도 돌려준다.
     async fn reattach(&self, vm: &Vm) -> Result<(), String> {
-        let spec = runtime_spec(&self.cluster, vm, self.config.node).map_err(|e| e.to_string())?;
+        let spec = runtime_spec(&self.cluster, vm, self.config.node, &self.config.mount_root)
+            .map_err(|e| e.to_string())?;
         self.hv.start(&spec, None).await.map_err(|e| e.to_string())
     }
 

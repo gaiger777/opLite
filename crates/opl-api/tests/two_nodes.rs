@@ -27,7 +27,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use uuid::Uuid;
 
-use common::{ADMIN_PASSWORD, WAIT, login_at, reconciler_config, runner_config, vm_request};
+use common::{
+    ADMIN_PASSWORD, MOUNT_ROOT, WAIT, login_at, reconciler_config, runner_config, vm_request,
+};
 
 struct Node {
     id: Uuid,
@@ -94,7 +96,7 @@ impl Node {
         });
         let reconciler =
             Reconciler::spawn(self.cluster.clone(), hv.clone(), reconciler_config(self.id));
-        let storage: Arc<dyn Storage> = Arc::new(DirStorage::new("qemu-img"));
+        let storage: Arc<dyn Storage> = Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT));
         let work = root.path().join(format!("{}-work", self.id));
         let runner = TaskRunner::spawn(
             self.cluster.clone(),

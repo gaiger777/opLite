@@ -19,7 +19,7 @@ use opl_types::auth::{Role, UserSpec};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{SourceFormat, StoragePoolSpec};
+use opl_types::storage::{SourceFormat, StoragePool};
 use opl_types::vm::Arch;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -42,9 +42,13 @@ pub struct Env {
     server: tokio::task::JoinHandle<()>,
 }
 
+/// NFS 풀을 마운트하는 디렉터리. 테스트는 dir 풀만 쓰므로 쓰이지 않는다.
+pub const MOUNT_ROOT: &str = "/nonexistent/opl-pools";
+
 pub fn reconciler_config(node: Uuid) -> ReconcilerConfig {
     ReconcilerConfig {
         node,
+        mount_root: MOUNT_ROOT.into(),
         resync_interval: Duration::from_secs(3600),
         acpi_timeout: Duration::from_millis(300),
         retry_interval: Duration::from_millis(100),
@@ -140,7 +144,7 @@ impl Env {
         tweak(&mut rc);
         let hv_dyn: Arc<dyn Hypervisor> = hv.clone();
         let reconciler = Reconciler::spawn(cluster.clone(), hv_dyn.clone(), rc);
-        let storage: Arc<dyn Storage> = Arc::new(DirStorage::new("qemu-img"));
+        let storage: Arc<dyn Storage> = Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT));
         let runner = TaskRunner::spawn(
             cluster.clone(),
             storage,
@@ -216,7 +220,7 @@ impl Env {
     }
 
     pub async fn start_runner(&mut self) {
-        self.start_runner_with(Arc::new(DirStorage::new("qemu-img")))
+        self.start_runner_with(Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT)))
             .await;
     }
 
@@ -449,7 +453,7 @@ impl FakeStorage {
 impl Storage for FakeStorage {
     async fn create_volume(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         id: Uuid,
         size_bytes: u64,
         _: ImageFormat,
@@ -459,7 +463,7 @@ impl Storage for FakeStorage {
     }
     async fn import_volume(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         _: Uuid,
         _: &Path,
         _: SourceFormat,
@@ -472,7 +476,7 @@ impl Storage for FakeStorage {
     }
     async fn delete_volume(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         _: Uuid,
         _: ImageFormat,
     ) -> Result<(), DriverError> {
@@ -480,7 +484,7 @@ impl Storage for FakeStorage {
     }
     async fn volume_info(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         id: Uuid,
         _: ImageFormat,
     ) -> Result<VolumeInfo, DriverError> {
@@ -491,7 +495,7 @@ impl Storage for FakeStorage {
             allocated_bytes: 0,
         })
     }
-    async fn capacity(&self, _: &StoragePoolSpec) -> Result<Capacity, DriverError> {
+    async fn capacity(&self, _: &StoragePool) -> Result<Capacity, DriverError> {
         Ok(Capacity {
             total_bytes: 1 << 40,
             available_bytes: 1 << 40,
@@ -502,7 +506,7 @@ impl Storage for FakeStorage {
     }
     async fn snapshot_create(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         id: Uuid,
         _: ImageFormat,
         _: &str,
@@ -512,7 +516,7 @@ impl Storage for FakeStorage {
     }
     async fn snapshot_revert(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         id: Uuid,
         _: ImageFormat,
         _: &str,
@@ -522,7 +526,7 @@ impl Storage for FakeStorage {
     }
     async fn snapshot_delete(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         id: Uuid,
         _: ImageFormat,
         _: &str,
@@ -532,7 +536,7 @@ impl Storage for FakeStorage {
     }
     async fn snapshot_tags(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         _: Uuid,
         _: ImageFormat,
     ) -> Result<Vec<String>, DriverError> {
@@ -540,7 +544,7 @@ impl Storage for FakeStorage {
     }
     async fn resize_volume(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         id: Uuid,
         _: ImageFormat,
         size_bytes: u64,
@@ -551,12 +555,12 @@ impl Storage for FakeStorage {
     }
     async fn copy_volume(
         &self,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         src_id: Uuid,
         _: ImageFormat,
         _: Option<&str>,
         _: bool,
-        _: &StoragePoolSpec,
+        _: &StoragePool,
         dst_id: Uuid,
     ) -> Result<(), DriverError> {
         self.record("copy", dst_id).await;

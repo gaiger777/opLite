@@ -16,6 +16,9 @@ pub enum DriverError {
     VolumeExists(Uuid),
     #[error("{tool} failed: {stderr}")]
     ToolFailed { tool: &'static str, stderr: String },
+    /// NFS 풀이 이 노드에 마운트돼 있지 않다. opld의 풀 새로 고침이 다시 마운트하면 풀린다.
+    #[error("storage pool is not mounted at {}", .0.display())]
+    PoolNotMounted(std::path::PathBuf),
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
     /// 살아 있지만 아직 다시 붙지 못해 QMP로 다룰 수 없는 VM. 요청을 보내지 않았으므로
@@ -45,7 +48,10 @@ impl DriverError {
                     | std::io::ErrorKind::InvalidInput
                     | std::io::ErrorKind::Unsupported
             ),
-            DriverError::Qmp(_) | DriverError::Timeout(_) | DriverError::NotAttached(_) => true,
+            DriverError::Qmp(_)
+            | DriverError::Timeout(_)
+            | DriverError::NotAttached(_)
+            | DriverError::PoolNotMounted(_) => true,
             DriverError::NotRunning(_)
             | DriverError::InvalidSpec(_)
             | DriverError::StartFailed(_)
@@ -73,6 +79,8 @@ mod tests {
     fn classifies_transient_errors() {
         assert!(DriverError::Timeout("qmp").is_transient());
         assert!(DriverError::NotAttached(Uuid::nil()).is_transient());
+        // NFS 풀을 다시 마운트하면 풀린다.
+        assert!(DriverError::PoolNotMounted("/var/lib/opl/pools/p".into()).is_transient());
         assert!(DriverError::Qmp(QmpError::Disconnected).is_transient());
         assert!(DriverError::Io(std::io::Error::other("x")).is_transient());
         // 바이너리나 풀 디렉터리가 없거나 권한이 없으면 다시 해도 실패한다.

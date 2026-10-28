@@ -1,23 +1,34 @@
 //! 실제 qemu-img를 쓰는 스토리지 통합 테스트. `cargo test -p opl-driver --features storage-it`
 #![cfg(feature = "storage-it")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use opl_driver::{DirStorage, DriverError, SourceFormat, Storage};
+use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{PoolBackend, StoragePoolSpec};
+use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec};
 use uuid::Uuid;
 
 const MIB: u64 = 1 << 20;
 
-fn pool(dir: &Path) -> StoragePoolSpec {
-    StoragePoolSpec {
-        backend: PoolBackend::Dir {
-            path: dir.to_path_buf(),
+/// `dir` 풀만 쓰므로 NFS 마운트 루트는 쓰이지 않는다.
+const MNT: &str = "/nonexistent/opl-pools";
+
+fn pool(dir: &Path) -> StoragePool {
+    Resource::new(
+        "local",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: dir.to_path_buf(),
+            },
+            nodes: vec![],
+            shared: false,
         },
-        nodes: vec![],
-        shared: false,
-    }
+    )
+}
+
+fn volume_path(pool: &StoragePool, id: Uuid, format: ImageFormat) -> PathBuf {
+    DirStorage::volume_path(pool, Path::new(MNT), id, format)
 }
 
 fn qemu_img(args: &[&str]) {
@@ -32,14 +43,14 @@ fn qemu_img(args: &[&str]) {
 async fn create_inspect_and_delete_volume() {
     let tmp = tempfile::tempdir().unwrap();
     let pool = pool(tmp.path());
-    let storage = DirStorage::new("qemu-img");
+    let storage = DirStorage::new("qemu-img", MNT);
     let id = Uuid::now_v7();
 
     let path = storage
         .create_volume(&pool, id, 64 * MIB, ImageFormat::Qcow2)
         .await
         .unwrap();
-    assert_eq!(path, DirStorage::volume_path(&pool, id, ImageFormat::Qcow2));
+    assert_eq!(path, volume_path(&pool, id, ImageFormat::Qcow2));
     let info = storage
         .volume_info(&pool, id, ImageFormat::Qcow2)
         .await
@@ -87,7 +98,7 @@ async fn imports_vmdk_preserving_contents() {
         vmdk.to_str().unwrap(),
     ]);
 
-    let storage = DirStorage::new("qemu-img");
+    let storage = DirStorage::new("qemu-img", MNT);
     let id = Uuid::now_v7();
     let path = storage
         .import_volume(&pool, id, &vmdk, SourceFormat::Vmdk, ImageFormat::Qcow2)
@@ -111,7 +122,7 @@ async fn imports_vmdk_preserving_contents() {
 #[tokio::test]
 async fn import_source_must_be_a_single_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let storage = DirStorage::new("qemu-img");
+    let storage = DirStorage::new("qemu-img", MNT);
     let raw = tmp.path().join("disk.raw");
     std::fs::write(&raw, vec![0u8; MIB as usize]).unwrap();
     let vmdk = tmp.path().join("disk.vmdk");
@@ -197,7 +208,7 @@ async fn import_source_must_be_a_single_file() {
 async fn failed_import_leaves_no_partial_volume() {
     let tmp = tempfile::tempdir().unwrap();
     let pool = pool(tmp.path());
-    let storage = DirStorage::new("qemu-img");
+    let storage = DirStorage::new("qemu-img", MNT);
     let id = Uuid::now_v7();
 
     let err = storage
@@ -211,7 +222,7 @@ async fn failed_import_leaves_no_partial_volume() {
         .await
         .unwrap_err();
     assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
-    assert!(!DirStorage::volume_path(&pool, id, ImageFormat::Qcow2).exists());
+    assert!(!volume_path(&pool, id, ImageFormat::Qcow2).exists());
 }
 
 /// `qemu-io` 명령 하나를 실행하고 성공했는지 돌려준다. `read -P`는 패턴이 다르면 실패한다.
@@ -239,7 +250,7 @@ async fn snapshot_revert_restores_contents_and_delete_is_idempotent() {
     let dir = tmp.path().join("a,b");
     std::fs::create_dir(&dir).unwrap();
     let pool = pool(&dir);
-    let storage = DirStorage::new("qemu-img");
+    let storage = DirStorage::new("qemu-img", MNT);
     let id = Uuid::now_v7();
     let qcow2 = ImageFormat::Qcow2;
     let path = storage
@@ -301,7 +312,7 @@ async fn snapshot_revert_restores_contents_and_delete_is_idempotent() {
 async fn resize_grows_volume_with_snapshots() {
     let tmp = tempfile::tempdir().unwrap();
     let pool = pool(tmp.path());
-    let storage = DirStorage::new("qemu-img");
+    let storage = DirStorage::new("qemu-img", MNT);
 
     for format in [ImageFormat::Qcow2, ImageFormat::Raw] {
         let id = Uuid::now_v7();
@@ -342,7 +353,7 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
     std::fs::create_dir(&src_dir).unwrap();
     std::fs::create_dir(&dst_dir).unwrap();
     let (src_pool, dst_pool) = (pool(&src_dir), pool(&dst_dir));
-    let storage = DirStorage::new("qemu-img");
+    let storage = DirStorage::new("qemu-img", MNT);
     let qcow2 = ImageFormat::Qcow2;
 
     let src = Uuid::now_v7();
@@ -373,7 +384,7 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
             )
             .await
             .unwrap();
-        let dst_path = DirStorage::volume_path(&dst_pool, dst, qcow2);
+        let dst_path = volume_path(&dst_pool, dst, qcow2);
         assert!(qemu_io(&dst_path, "read -P 0xab 0 64k"), "{force_share}");
         let info = storage.volume_info(&dst_pool, dst, qcow2).await.unwrap();
         assert_eq!(info.virtual_bytes, 64 * MIB);
@@ -394,7 +405,7 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
         .await
         .unwrap();
     assert!(qemu_io(
-        &DirStorage::volume_path(&dst_pool, now, qcow2),
+        &volume_path(&dst_pool, now, qcow2),
         "read -P 0xcd 0 64k"
     ));
     // 대상이 있으면 덮어쓰지 않는다.
@@ -420,7 +431,7 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
         .unwrap_err();
     assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
     assert_eq!(std::fs::read_dir(&dst_dir).unwrap().count(), 3);
-    assert!(!DirStorage::volume_path(&dst_pool, missing, qcow2).exists());
+    assert!(!volume_path(&dst_pool, missing, qcow2).exists());
 
     // raw도 같은 형식으로 복사한다.
     let raw = ImageFormat::Raw;
@@ -435,7 +446,7 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
         .copy_volume(&src_pool, src_raw, raw, None, false, &dst_pool, dst_raw)
         .await
         .unwrap();
-    let dst_raw_path = DirStorage::volume_path(&dst_pool, dst_raw, raw);
+    let dst_raw_path = volume_path(&dst_pool, dst_raw, raw);
     assert!(qemu_io_fmt(&dst_raw_path, raw, "read -P 0x5a 0 64k"));
     let info = storage.volume_info(&dst_pool, dst_raw, raw).await.unwrap();
     assert_eq!(info.virtual_bytes, 64 * MIB);

@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{PoolBackend, SourceFormat, StoragePoolSpec};
+use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::DriverError;
+use crate::mounts::{MOUNTINFO, nfs_mount_points};
 
 /// 올린 이미지를 검사하는 `qemu-img info`가 멈추면(이상한 extent 등) 무한정 기다리지 않는다.
 const INFO_TIMEOUT: Duration = Duration::from_secs(60);
@@ -32,7 +34,7 @@ pub trait Storage: Send + Sync {
     /// 실제 크기는 `VolumeInfo::virtual_bytes`로 확인한다.
     async fn create_volume(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         size_bytes: u64,
         format: ImageFormat,
@@ -45,7 +47,7 @@ pub trait Storage: Send + Sync {
     /// 사용자가 올린 파일을 검증하는 것은 API(계획 5)의 책임이다.
     async fn import_volume(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         src: &Path,
         src_format: SourceFormat,
@@ -62,7 +64,7 @@ pub trait Storage: Send + Sync {
 
     async fn delete_volume(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
     ) -> Result<(), DriverError>;
@@ -70,12 +72,12 @@ pub trait Storage: Send + Sync {
     /// VM이 실행 중이어도 조회할 수 있다.
     async fn volume_info(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
     ) -> Result<VolumeInfo, DriverError>;
 
-    async fn capacity(&self, pool: &StoragePoolSpec) -> Result<Capacity, DriverError>;
+    async fn capacity(&self, pool: &StoragePool) -> Result<Capacity, DriverError>;
 
     /// 이 백엔드가 `format` 볼륨의 스냅샷을 지원하는지. 지원하지 않는 형식에 스냅샷 메서드를
     /// 부르면 `InvalidSpec`.
@@ -84,7 +86,7 @@ pub trait Storage: Send + Sync {
     /// 정지한 볼륨에 스냅샷 `tag`를 만든다. 같은 태그가 이미 있으면 `InvalidSpec`.
     async fn snapshot_create(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
         tag: &str,
@@ -93,7 +95,7 @@ pub trait Storage: Send + Sync {
     /// 정지한 볼륨의 내용을 스냅샷 `tag` 때로 되돌린다.
     async fn snapshot_revert(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
         tag: &str,
@@ -102,7 +104,7 @@ pub trait Storage: Send + Sync {
     /// 정지한 볼륨에서 스냅샷 `tag`를 지운다. 태그가 없으면 성공(다시 시도해도 된다).
     async fn snapshot_delete(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
         tag: &str,
@@ -111,7 +113,7 @@ pub trait Storage: Send + Sync {
     /// 볼륨에 있는 스냅샷 태그들. VM이 실행 중이어도 조회할 수 있다.
     async fn snapshot_tags(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
     ) -> Result<Vec<String>, DriverError>;
@@ -120,7 +122,7 @@ pub trait Storage: Send + Sync {
     /// 실제 크기는 `volume_info`로 확인한다.
     async fn resize_volume(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
         size_bytes: u64,
@@ -133,36 +135,113 @@ pub trait Storage: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     async fn copy_volume(
         &self,
-        src_pool: &StoragePoolSpec,
+        src_pool: &StoragePool,
         src_id: Uuid,
         format: ImageFormat,
         tag: Option<&str>,
         force_share: bool,
-        dst_pool: &StoragePoolSpec,
+        dst_pool: &StoragePool,
         dst_id: Uuid,
     ) -> Result<(), DriverError>;
 }
 
-/// `dir` 풀: 디렉터리 안에 `{id}.qcow2` / `{id}.raw` 파일을 두고 `qemu-img`로 다룬다.
-/// 풀 디렉터리는 hard link를 지원하는 파일시스템이어야 한다.
+/// 풀의 볼륨 파일이 놓이는 디렉터리. `dir` 풀은 그 경로, `nfs` 풀은 이 노드의 마운트 지점
+/// `{mount_root}/{풀 id}`다.
+pub fn pool_root(pool: &StoragePool, mount_root: &Path) -> PathBuf {
+    match &pool.spec.backend {
+        PoolBackend::Dir { path } => path.clone(),
+        PoolBackend::Nfs { .. } => mount_root.join(pool.id.to_string()),
+    }
+}
+
+/// mountinfo를 읽는 함수. 테스트는 내용을 주입한다.
+type ReadMountinfo = dyn Fn() -> std::io::Result<String> + Send + Sync;
+
+fn read_mountinfo() -> std::io::Result<String> {
+    std::fs::read_to_string(MOUNTINFO)
+}
+
+/// 풀 루트를 확인해 돌려준다. NFS 풀은 루트가 `/proc/self/mountinfo`의 NFS 마운트 지점이어야 한다.
+/// 마운트되지 않았으면(mountinfo를 읽을 수 없거나 Linux가 아니어도) `PoolNotMounted` — 그 자리에
+/// 볼륨을 만들거나 디스크로 쓰면 로컬 디스크의 빈 디렉터리를 쓰게 된다.
+pub fn check_pool_root(pool: &StoragePool, mount_root: &Path) -> Result<PathBuf, DriverError> {
+    check_pool_root_with(pool, mount_root, &read_mountinfo)
+}
+
+fn check_pool_root_with(
+    pool: &StoragePool,
+    mount_root: &Path,
+    mountinfo: &ReadMountinfo,
+) -> Result<PathBuf, DriverError> {
+    let root = pool_root(pool, mount_root);
+    if let PoolBackend::Nfs { .. } = &pool.spec.backend {
+        // mountinfo는 실제 경로를 적는다. 마운트 지점은 stat하지 않고(NFS 서버가 멈추면 끝나지 않는다)
+        // 로컬 디렉터리인 마운트 루트만 실제 경로로 바꾼다.
+        let mounted = std::fs::canonicalize(mount_root)
+            .ok()
+            .zip(mountinfo().ok())
+            .is_some_and(|(real, info)| {
+                nfs_mount_points(&info).contains(&real.join(pool.id.to_string()))
+            });
+        if !mounted {
+            return Err(DriverError::PoolNotMounted(root));
+        }
+    }
+    Ok(root)
+}
+
+/// 파일 풀(`dir`, `nfs`): 풀 루트([`pool_root`]) 안에 `{id}.qcow2` / `{id}.raw` 파일을 두고
+/// `qemu-img`로 다룬다. 풀 루트는 hard link를 지원하는 파일시스템이어야 한다.
 pub struct DirStorage {
     qemu_img: PathBuf,
+    /// NFS 풀을 마운트하는 디렉터리(opld의 `{data_dir}/pools`)
+    mount_root: PathBuf,
+    mountinfo: Arc<ReadMountinfo>,
 }
 
 impl DirStorage {
-    pub fn new(qemu_img: impl Into<PathBuf>) -> Self {
+    pub fn new(qemu_img: impl Into<PathBuf>, mount_root: impl Into<PathBuf>) -> Self {
         Self {
             qemu_img: qemu_img.into(),
+            mount_root: mount_root.into(),
+            mountinfo: Arc::new(read_mountinfo),
         }
     }
 
-    pub fn volume_path(pool: &StoragePoolSpec, id: Uuid, format: ImageFormat) -> PathBuf {
-        let root = match &pool.backend {
-            PoolBackend::Dir { path } => path.as_path(),
-            // 아직 지원하지 않는다. 드라이버는 pool_dir에서, reconciler는 디스크를 풀 때 거절한다.
-            PoolBackend::Nfs { .. } => Path::new(""),
-        };
-        root.join(format!("{id}.{}", fmt_name(format)))
+    pub fn volume_path(
+        pool: &StoragePool,
+        mount_root: &Path,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> PathBuf {
+        pool_root(pool, mount_root).join(format!("{id}.{}", fmt_name(format)))
+    }
+
+    /// 풀 루트. qemu-img에 넘기므로 절대 경로여야 하고, NFS 풀은 마운트돼 있어야 한다.
+    fn pool_dir(&self, pool: &StoragePool) -> Result<PathBuf, DriverError> {
+        let root = check_pool_root_with(pool, &self.mount_root, &*self.mountinfo)?;
+        require_absolute(&root)?;
+        Ok(root)
+    }
+
+    /// 볼륨 파일이 없을 때의 오류. 그사이 NFS 풀의 마운트가 풀렸으면 빈 마운트 지점을 본 것이므로
+    /// `PoolNotMounted`다.
+    fn not_found(&self, pool: &StoragePool, id: Uuid) -> DriverError {
+        match self.pool_dir(pool) {
+            Err(e) => e,
+            Ok(_) => DriverError::VolumeNotFound(id),
+        }
+    }
+
+    /// 풀 안의 볼륨 파일 경로. 파일이 있는지는 보지 않는다.
+    fn file_path(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.pool_dir(pool)?;
+        Ok(Self::volume_path(pool, &self.mount_root, id, format))
     }
 
     async fn qemu_img(&self, args: &[&str]) -> Result<Vec<u8>, DriverError> {
@@ -184,14 +263,14 @@ impl DirStorage {
 
     /// 있는 볼륨의 경로. 없으면 `VolumeNotFound`.
     fn existing_path(
-        pool: &StoragePoolSpec,
+        &self,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        pool_dir(pool)?;
-        let path = Self::volume_path(pool, id, format);
+        let path = self.file_path(pool, id, format)?;
         if !path.exists() {
-            return Err(DriverError::VolumeNotFound(id));
+            return Err(self.not_found(pool, id));
         }
         Ok(path)
     }
@@ -199,7 +278,7 @@ impl DirStorage {
     /// 스냅샷을 다룰 볼륨의 경로. 형식이 스냅샷을 지원해야 한다.
     fn snapshot_path(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
@@ -209,7 +288,7 @@ impl DirStorage {
                 fmt_name(format)
             )));
         }
-        Self::existing_path(pool, id, format)
+        self.existing_path(pool, id, format)
     }
 
     /// `qemu-img info`의 JSON 출력.
@@ -301,18 +380,6 @@ fn require_absolute(p: &Path) -> Result<(), DriverError> {
         Err(DriverError::InvalidSpec(format!(
             "path must be absolute: {p:?}"
         )))
-    }
-}
-
-fn pool_dir(pool: &StoragePoolSpec) -> Result<&Path, DriverError> {
-    match &pool.backend {
-        PoolBackend::Dir { path } => {
-            require_absolute(path)?;
-            Ok(path)
-        }
-        PoolBackend::Nfs { .. } => Err(DriverError::InvalidSpec(
-            "nfs pools are not supported yet".into(),
-        )),
     }
 }
 
@@ -410,13 +477,12 @@ fn path_str(p: &Path) -> Result<&str, DriverError> {
 impl Storage for DirStorage {
     async fn create_volume(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         size_bytes: u64,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        pool_dir(pool)?;
-        let path = Self::volume_path(pool, id, format);
+        let path = self.file_path(pool, id, format)?;
         if path.exists() {
             return Err(DriverError::VolumeExists(id));
         }
@@ -433,15 +499,14 @@ impl Storage for DirStorage {
 
     async fn import_volume(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         src: &Path,
         src_format: SourceFormat,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        pool_dir(pool)?;
+        let path = self.file_path(pool, id, format)?;
         require_absolute(src)?;
-        let path = Self::volume_path(pool, id, format);
         if path.exists() {
             return Err(DriverError::VolumeExists(id));
         }
@@ -488,26 +553,23 @@ impl Storage for DirStorage {
 
     async fn delete_volume(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
     ) -> Result<(), DriverError> {
-        pool_dir(pool)?;
-        match std::fs::remove_file(Self::volume_path(pool, id, format)) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(DriverError::VolumeNotFound(id))
-            }
+        match std::fs::remove_file(self.file_path(pool, id, format)?) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(self.not_found(pool, id)),
             other => Ok(other?),
         }
     }
 
     async fn volume_info(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
     ) -> Result<VolumeInfo, DriverError> {
-        let path = Self::existing_path(pool, id, format)?;
+        let path = self.existing_path(pool, id, format)?;
         let json = self.info_json(&path, format).await?;
         let field = |k: &str| {
             json.get(k)
@@ -523,11 +585,11 @@ impl Storage for DirStorage {
         })
     }
 
-    async fn capacity(&self, pool: &StoragePoolSpec) -> Result<Capacity, DriverError> {
-        let path = pool_dir(pool)?;
+    async fn capacity(&self, pool: &StoragePool) -> Result<Capacity, DriverError> {
+        let path = self.pool_dir(pool)?;
         Ok(Capacity {
-            total_bytes: fs4::total_space(path)?,
-            available_bytes: fs4::available_space(path)?,
+            total_bytes: fs4::total_space(&path)?,
+            available_bytes: fs4::available_space(&path)?,
         })
     }
 
@@ -538,7 +600,7 @@ impl Storage for DirStorage {
 
     async fn snapshot_create(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
         tag: &str,
@@ -558,7 +620,7 @@ impl Storage for DirStorage {
 
     async fn snapshot_revert(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
         tag: &str,
@@ -572,7 +634,7 @@ impl Storage for DirStorage {
 
     async fn snapshot_delete(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
         tag: &str,
@@ -595,7 +657,7 @@ impl Storage for DirStorage {
 
     async fn snapshot_tags(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
     ) -> Result<Vec<String>, DriverError> {
@@ -605,12 +667,12 @@ impl Storage for DirStorage {
 
     async fn resize_volume(
         &self,
-        pool: &StoragePoolSpec,
+        pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
         size_bytes: u64,
     ) -> Result<(), DriverError> {
-        let path = Self::existing_path(pool, id, format)?;
+        let path = self.existing_path(pool, id, format)?;
         let size = size_bytes.to_string();
         // --shrink 없이는 qemu-img가 줄이기를 거부한다.
         self.qemu_img(&[
@@ -627,20 +689,19 @@ impl Storage for DirStorage {
 
     async fn copy_volume(
         &self,
-        src_pool: &StoragePoolSpec,
+        src_pool: &StoragePool,
         src_id: Uuid,
         format: ImageFormat,
         tag: Option<&str>,
         force_share: bool,
-        dst_pool: &StoragePoolSpec,
+        dst_pool: &StoragePool,
         dst_id: Uuid,
     ) -> Result<(), DriverError> {
         let src = match tag {
             Some(_) => self.snapshot_path(src_pool, src_id, format)?,
-            None => Self::existing_path(src_pool, src_id, format)?,
+            None => self.existing_path(src_pool, src_id, format)?,
         };
-        pool_dir(dst_pool)?;
-        let dst = Self::volume_path(dst_pool, dst_id, format);
+        let dst = self.file_path(dst_pool, dst_id, format)?;
         if dst.exists() {
             return Err(DriverError::VolumeExists(dst_id));
         }
@@ -661,24 +722,40 @@ impl Storage for DirStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opl_types::resource::Resource;
+    use opl_types::storage::StoragePoolSpec;
 
-    fn pool(path: &str) -> StoragePoolSpec {
-        StoragePoolSpec {
-            backend: PoolBackend::Dir { path: path.into() },
-            nodes: vec![],
-            shared: false,
-        }
+    /// `dir` 풀만 쓰는 테스트의 마운트 루트. 쓰이지 않는다.
+    const MNT: &str = "/nonexistent/opl-pools";
+
+    fn pool(path: &str) -> StoragePool {
+        Resource::new(
+            "local",
+            StoragePoolSpec {
+                backend: PoolBackend::Dir { path: path.into() },
+                nodes: vec![],
+                shared: false,
+            },
+        )
+    }
+
+    fn dir_storage(qemu_img: impl Into<PathBuf>) -> DirStorage {
+        DirStorage::new(qemu_img, MNT)
+    }
+
+    fn volume_path(pool: &StoragePool, id: Uuid, format: ImageFormat) -> PathBuf {
+        DirStorage::volume_path(pool, Path::new(MNT), id, format)
     }
 
     #[test]
     fn volume_path_uses_id_and_format() {
         let id = Uuid::nil();
         assert_eq!(
-            DirStorage::volume_path(&pool("/pools/local"), id, ImageFormat::Qcow2),
+            volume_path(&pool("/pools/local"), id, ImageFormat::Qcow2),
             PathBuf::from("/pools/local/00000000-0000-0000-0000-000000000000.qcow2")
         );
         assert_eq!(
-            DirStorage::volume_path(&pool("/pools/local"), id, ImageFormat::Raw),
+            volume_path(&pool("/pools/local"), id, ImageFormat::Raw),
             PathBuf::from("/pools/local/00000000-0000-0000-0000-000000000000.raw")
         );
     }
@@ -693,7 +770,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_failure_carries_stderr() {
-        let storage = DirStorage::new("/bin/sh");
+        let storage = dir_storage("/bin/sh");
         // `sh create ...`는 파일이 없어 실패하고 stderr를 남긴다.
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
@@ -710,24 +787,99 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn rejects_nfs_pools_for_now() {
-        // qemu-img를 부르기 전에 거절한다.
-        let storage = DirStorage::new("/nonexistent/qemu-img");
-        let p = StoragePoolSpec {
-            backend: PoolBackend::Nfs {
-                server: "nas".into(),
-                export: "/srv/vm".into(),
-                options: None,
+    fn nfs_pool() -> StoragePool {
+        Resource::new(
+            "nas",
+            StoragePoolSpec {
+                backend: PoolBackend::Nfs {
+                    server: "nas".into(),
+                    export: "/srv/vm".into(),
+                    options: None,
+                },
+                nodes: vec![],
+                shared: true,
             },
-            nodes: vec![],
-            shared: true,
+        )
+    }
+
+    #[test]
+    fn pool_root_depends_on_backend() {
+        let mnt = Path::new("/var/lib/opl/pools");
+        assert_eq!(
+            pool_root(&pool("/pools/local"), mnt),
+            PathBuf::from("/pools/local")
+        );
+        let nfs = nfs_pool();
+        assert_eq!(pool_root(&nfs, mnt), mnt.join(nfs.id.to_string()));
+        assert_eq!(
+            DirStorage::volume_path(&nfs, mnt, Uuid::nil(), ImageFormat::Qcow2),
+            mnt.join(nfs.id.to_string())
+                .join("00000000-0000-0000-0000-000000000000.qcow2")
+        );
+    }
+
+    #[tokio::test]
+    async fn unmounted_nfs_pool_is_refused_everywhere() {
+        let tools = tempfile::tempdir().unwrap();
+        let mnt = tempfile::tempdir().unwrap();
+        let p = nfs_pool();
+        // 마운트되지 않은 빈 마운트 지점(mountinfo에 없다). 여기에 볼륨을 만들면 로컬 디스크에 쌓인다.
+        let root = mnt.path().join(p.id.to_string());
+        std::fs::create_dir(&root).unwrap();
+        let storage = DirStorage::new(fake_tool(tools.path(), "echo new > \"$last\""), mnt.path());
+        let not_mounted = |e: DriverError| match e {
+            DriverError::PoolNotMounted(path) => {
+                assert_eq!(path, root);
+                assert!(DriverError::PoolNotMounted(path).is_transient());
+            }
+            other => panic!("unexpected error: {other:?}"),
         };
-        let err = storage
-            .create_volume(&p, Uuid::nil(), 1 << 20, ImageFormat::Qcow2)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        assert_eq!(
+            check_pool_root(&pool(tmp_str(&mnt)), mnt.path()).unwrap(),
+            mnt.path()
+        );
+        not_mounted(check_pool_root(&p, mnt.path()).unwrap_err());
+        let (id, f) = (Uuid::nil(), ImageFormat::Qcow2);
+        let src = tools.path().join("src.qcow2");
+        not_mounted(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
+        not_mounted(
+            storage
+                .import_volume(&p, id, &src, SourceFormat::Qcow2, f)
+                .await
+                .unwrap_err(),
+        );
+        not_mounted(storage.delete_volume(&p, id, f).await.unwrap_err());
+        not_mounted(storage.volume_info(&p, id, f).await.unwrap_err());
+        not_mounted(storage.capacity(&p).await.unwrap_err());
+        not_mounted(storage.snapshot_create(&p, id, f, "t").await.unwrap_err());
+        not_mounted(storage.snapshot_revert(&p, id, f, "t").await.unwrap_err());
+        not_mounted(storage.snapshot_delete(&p, id, f, "t").await.unwrap_err());
+        not_mounted(storage.snapshot_tags(&p, id, f).await.unwrap_err());
+        not_mounted(storage.resize_volume(&p, id, f, 2 << 20).await.unwrap_err());
+        // 복사는 원본이 있는 로컬 풀에서 마운트되지 않은 풀로 가도 거절된다.
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = pool(tmp_str(&local_dir));
+        std::fs::write(volume_path(&local, id, f), b"x").unwrap();
+        not_mounted(
+            storage
+                .copy_volume(&local, id, f, None, false, &p, id)
+                .await
+                .unwrap_err(),
+        );
+        not_mounted(
+            storage
+                .copy_volume(&p, id, f, None, false, &local, id)
+                .await
+                .unwrap_err(),
+        );
+        // 마운트 지점이 아예 없어도 같다.
+        std::fs::remove_dir(&root).unwrap();
+        not_mounted(storage.capacity(&p).await.unwrap_err());
+        assert_eq!(pool_files(mnt.path()), Vec::<String>::new());
+    }
+
+    fn tmp_str(dir: &tempfile::TempDir) -> &str {
+        dir.path().to_str().unwrap()
     }
 
     /// 실행 파일 셸 스크립트를 만든다. `"$last"`에 마지막 인자가 들어 있다.
@@ -754,9 +906,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         let id = Uuid::now_v7();
-        let fin = DirStorage::volume_path(&p, id, ImageFormat::Raw);
+        let fin = volume_path(&p, id, ImageFormat::Raw);
         std::fs::write(&fin, b"precious").unwrap();
-        let storage = DirStorage::new(fake_tool(tools.path(), "echo new > \"$last\""));
+        let storage = dir_storage(fake_tool(tools.path(), "echo new > \"$last\""));
 
         let err = storage
             .create_volume(&p, id, 1 << 20, ImageFormat::Raw)
@@ -772,9 +924,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         let id = Uuid::now_v7();
-        let fin = DirStorage::volume_path(&p, id, ImageFormat::Qcow2);
+        let fin = volume_path(&p, id, ImageFormat::Qcow2);
         // 도구가 도는 사이에 다른 누군가가 같은 볼륨을 만든다.
-        let storage = DirStorage::new(fake_tool(
+        let storage = dir_storage(fake_tool(
             tools.path(),
             &format!("echo other > {fin:?}\necho ours > \"$last\""),
         ));
@@ -800,7 +952,7 @@ mod tests {
         let orphan = tmp.path().join(format!(".{id}.raw.part"));
         std::fs::write(&orphan, b"orphan").unwrap();
         // create는 크기가 마지막 인자이므로 .part로 끝나는 출력 인자를 찾는다.
-        let storage = DirStorage::new(fake_tool(
+        let storage = dir_storage(fake_tool(
             tools.path(),
             "for a; do case \"$a\" in *.part) out=\"$a\";; esac; done\necho ours > \"$out\"",
         ));
@@ -820,7 +972,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         // 출력 파일을 반쯤 쓰고 실패한다.
-        let storage = DirStorage::new(fake_tool(
+        let storage = dir_storage(fake_tool(
             tools.path(),
             "echo partial > \"$last\"\necho broken >&2\nexit 1",
         ));
@@ -840,7 +992,7 @@ mod tests {
         assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
         assert!(pool_files(tmp.path()).is_empty());
 
-        let storage = DirStorage::new("/usr/bin/false");
+        let storage = dir_storage("/usr/bin/false");
         storage
             .import_volume(
                 &p,
@@ -858,7 +1010,7 @@ mod tests {
     async fn relative_paths_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         // qemu-img는 상대 경로를 `json:{...}`, `nbd:` 같은 프로토콜로 해석할 수 있다.
-        let storage = DirStorage::new("/usr/bin/true");
+        let storage = dir_storage("/usr/bin/true");
         let rel = pool("pools/local");
         let id = Uuid::nil();
         let raw = ImageFormat::Raw;
@@ -911,7 +1063,7 @@ mod tests {
     #[tokio::test]
     async fn import_source_header_is_rejected_before_running_tool() {
         // 도구까지 가면 다른 오류(Io NotFound)가 난다.
-        let storage = DirStorage::new("/nonexistent/qemu-img");
+        let storage = dir_storage("/nonexistent/qemu-img");
         let tmp = tempfile::tempdir().unwrap();
         let file = |name: &str, mut bytes: Vec<u8>| {
             bytes.resize(bytes.len().max(80), 0);
@@ -956,8 +1108,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         let id = Uuid::nil();
-        std::fs::write(DirStorage::volume_path(&p, id, ImageFormat::Raw), b"").unwrap();
-        let storage = DirStorage::new(fake_tool(tools.path(), "echo '{\"virtual-size\": 5}'"));
+        std::fs::write(volume_path(&p, id, ImageFormat::Raw), b"").unwrap();
+        let storage = dir_storage(fake_tool(tools.path(), "echo '{\"virtual-size\": 5}'"));
 
         let err = storage
             .volume_info(&p, id, ImageFormat::Raw)
@@ -969,7 +1121,7 @@ mod tests {
     #[tokio::test]
     async fn snapshots_need_qcow2_and_existing_volume() {
         // 도구까지 가면 다른 오류(Io NotFound)가 난다.
-        let storage = DirStorage::new("/nonexistent/qemu-img");
+        let storage = dir_storage("/nonexistent/qemu-img");
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         let id = Uuid::nil();
@@ -977,7 +1129,7 @@ mod tests {
         assert!(storage.supports_snapshots(qcow2));
         assert!(!storage.supports_snapshots(raw));
 
-        std::fs::write(DirStorage::volume_path(&p, id, raw), b"").unwrap();
+        std::fs::write(volume_path(&p, id, raw), b"").unwrap();
         for res in [
             storage.snapshot_create(&p, id, raw, "t").await,
             storage.snapshot_revert(&p, id, raw, "t").await,
@@ -1007,9 +1159,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         let id = Uuid::nil();
-        std::fs::write(DirStorage::volume_path(&p, id, ImageFormat::Qcow2), b"").unwrap();
+        std::fs::write(volume_path(&p, id, ImageFormat::Qcow2), b"").unwrap();
         // info만 답하고 다른 명령(snapshot -d)은 실패한다.
-        let storage = DirStorage::new(fake_tool(
+        let storage = dir_storage(fake_tool(
             tools.path(),
             "case \"$1\" in info) echo '{\"snapshots\": [{\"name\": \"other\"}]}';; \
              *) echo unexpected >&2; exit 1;; esac",
@@ -1039,9 +1191,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         let id = Uuid::nil();
-        std::fs::write(DirStorage::volume_path(&p, id, ImageFormat::Qcow2), b"").unwrap();
+        std::fs::write(volume_path(&p, id, ImageFormat::Qcow2), b"").unwrap();
         // 스냅샷이 없으면 qemu-img info는 snapshots 항목을 내지 않는다.
-        let storage = DirStorage::new(fake_tool(tools.path(), "echo '{\"virtual-size\": 5}'"));
+        let storage = dir_storage(fake_tool(tools.path(), "echo '{\"virtual-size\": 5}'"));
         assert!(
             storage
                 .snapshot_tags(&p, id, ImageFormat::Qcow2)
@@ -1064,11 +1216,11 @@ mod tests {
         );
         let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
         let qcow2 = ImageFormat::Qcow2;
-        let src_path = DirStorage::volume_path(&src_pool, src, qcow2);
+        let src_path = volume_path(&src_pool, src, qcow2);
         std::fs::write(&src_path, b"").unwrap();
         // 인자를 한 줄에 하나씩 적고 출력 파일을 만든다.
         let args = tools.path().join("args");
-        let storage = DirStorage::new(fake_tool(
+        let storage = dir_storage(fake_tool(
             tools.path(),
             &format!("printf '%s\\n' \"$@\" > {args:?}\necho copy > \"$last\""),
         ));
@@ -1077,7 +1229,7 @@ mod tests {
             .copy_volume(&src_pool, src, qcow2, Some("a,b"), true, &dst_pool, dst)
             .await
             .unwrap();
-        let dst_path = DirStorage::volume_path(&dst_pool, dst, qcow2);
+        let dst_path = volume_path(&dst_pool, dst, qcow2);
         assert_eq!(std::fs::read(&dst_path).unwrap(), b"copy\n");
         let got = std::fs::read_to_string(&args).unwrap();
         let got: Vec<&str> = got.lines().collect();
@@ -1123,7 +1275,7 @@ mod tests {
     #[tokio::test]
     async fn copy_volume_checks_source_and_never_overwrites() {
         // 도구까지 가면 다른 오류(Io NotFound)가 난다.
-        let storage = DirStorage::new("/nonexistent/qemu-img");
+        let storage = dir_storage("/nonexistent/qemu-img");
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
@@ -1137,14 +1289,14 @@ mod tests {
             "{res:?}"
         );
 
-        std::fs::write(DirStorage::volume_path(&p, src, raw), b"").unwrap();
+        std::fs::write(volume_path(&p, src, raw), b"").unwrap();
         // raw 볼륨에는 스냅샷이 없다.
         let res = storage
             .copy_volume(&p, src, raw, Some("t"), false, &p, dst)
             .await;
         assert!(matches!(res, Err(DriverError::InvalidSpec(_))), "{res:?}");
 
-        let dst_path = DirStorage::volume_path(&p, dst, raw);
+        let dst_path = volume_path(&p, dst, raw);
         std::fs::write(&dst_path, b"precious").unwrap();
         let res = storage
             .copy_volume(&p, src, raw, None, false, &p, dst)
@@ -1168,9 +1320,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         let src = Uuid::now_v7();
-        std::fs::write(DirStorage::volume_path(&p, src, ImageFormat::Raw), b"").unwrap();
+        std::fs::write(volume_path(&p, src, ImageFormat::Raw), b"").unwrap();
         // 출력 파일을 반쯤 쓰고 실패한다.
-        let storage = DirStorage::new(fake_tool(
+        let storage = dir_storage(fake_tool(
             tools.path(),
             "echo partial > \"$last\"\necho broken >&2\nexit 1",
         ));
@@ -1186,7 +1338,7 @@ mod tests {
     #[tokio::test]
     async fn delete_missing_volume_is_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = DirStorage::new("qemu-img");
+        let storage = dir_storage("qemu-img");
         let err = storage
             .delete_volume(
                 &pool(tmp.path().to_str().unwrap()),
@@ -1201,11 +1353,117 @@ mod tests {
     #[tokio::test]
     async fn capacity_reports_filesystem_space() {
         let tmp = tempfile::tempdir().unwrap();
-        let cap = DirStorage::new("qemu-img")
+        let cap = dir_storage("qemu-img")
             .capacity(&pool(tmp.path().to_str().unwrap()))
             .await
             .unwrap();
         assert!(cap.total_bytes > 0);
         assert!(cap.available_bytes <= cap.total_bytes);
+    }
+
+    /// `dir`의 NFS 마운트가 있다고 적은 mountinfo
+    fn mountinfo_with(dir: &Path) -> String {
+        format!(
+            "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n40 22 0:45 / {} rw - nfs4 nas:/srv/vm rw\n",
+            dir.display()
+        )
+    }
+
+    #[test]
+    fn nfs_pool_is_mounted_only_when_mountinfo_lists_it() {
+        let mnt = tempfile::tempdir().unwrap();
+        let p = nfs_pool();
+        let root = mnt.path().join(p.id.to_string());
+        // mountinfo는 실제 경로를 적는다(macOS의 임시 디렉터리는 심볼릭 링크 아래에 있다).
+        let real = mnt.path().canonicalize().unwrap().join(p.id.to_string());
+        let ok = |info: String| move || Ok::<_, std::io::Error>(info.clone());
+        assert_eq!(
+            check_pool_root_with(&p, mnt.path(), &ok(mountinfo_with(&real))).unwrap(),
+            root
+        );
+        // 마운트 지점은 stat하지 않는다. 디렉터리가 없어도 mountinfo에 있으면 마운트된 것이다.
+        assert!(!root.exists());
+        let not_mounted = |res: Result<PathBuf, DriverError>| match res {
+            Err(DriverError::PoolNotMounted(path)) => assert_eq!(path, root),
+            other => panic!("unexpected result: {other:?}"),
+        };
+        // 다른 풀의 마운트, NFS가 아닌 마운트, 읽을 수 없는 mountinfo
+        let other = mnt
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(Uuid::nil().to_string());
+        not_mounted(check_pool_root_with(
+            &p,
+            mnt.path(),
+            &ok(mountinfo_with(&other)),
+        ));
+        not_mounted(check_pool_root_with(
+            &p,
+            mnt.path(),
+            &ok(format!(
+                "43 22 0:48 / {} rw - tmpfs tmpfs rw\n",
+                real.display()
+            )),
+        ));
+        not_mounted(check_pool_root_with(&p, mnt.path(), &|| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }));
+        // 마운트 루트가 없다.
+        let missing = mnt.path().join("missing");
+        let res = check_pool_root_with(&p, &missing, &ok(mountinfo_with(&real)));
+        assert!(
+            matches!(res, Err(DriverError::PoolNotMounted(_))),
+            "{res:?}"
+        );
+        // 디렉터리 풀은 mountinfo를 보지 않는다.
+        let local = pool(tmp_str(&mnt));
+        assert_eq!(
+            check_pool_root_with(&local, Path::new(MNT), &|| panic!("read mountinfo")).unwrap(),
+            mnt.path()
+        );
+    }
+
+    /// 파일이 없다는 결과는 풀이 마운트된 채일 때만 믿는다. 그사이 마운트가 풀렸으면 빈 마운트
+    /// 지점을 본 것이다.
+    #[tokio::test]
+    async fn missing_volume_on_a_pool_unmounted_meanwhile_is_not_mounted() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mnt = tempfile::tempdir().unwrap();
+        let p = nfs_pool();
+        let root = mnt.path().join(p.id.to_string());
+        std::fs::create_dir(&root).unwrap();
+        let info = mountinfo_with(&mnt.path().canonicalize().unwrap().join(p.id.to_string()));
+        // `mounted_reads`번 읽을 때까지만 마운트돼 있다.
+        let storage = |mounted_reads: usize| {
+            let reads = AtomicUsize::new(0);
+            let info = info.clone();
+            let mut s = DirStorage::new("qemu-img", mnt.path());
+            s.mountinfo = Arc::new(move || {
+                let n = reads.fetch_add(1, Ordering::SeqCst);
+                Ok(if n < mounted_reads {
+                    info.clone()
+                } else {
+                    String::new()
+                })
+            });
+            s
+        };
+        let (id, f) = (Uuid::nil(), ImageFormat::Qcow2);
+        // 계속 마운트돼 있으면 정말 없는 볼륨이다.
+        let mounted = storage(usize::MAX);
+        let err = mounted.delete_volume(&p, id, f).await.unwrap_err();
+        assert!(matches!(err, DriverError::VolumeNotFound(_)), "{err:?}");
+        let err = mounted.volume_info(&p, id, f).await.unwrap_err();
+        assert!(matches!(err, DriverError::VolumeNotFound(_)), "{err:?}");
+        // 처음 확인 뒤에 마운트가 풀렸다.
+        let err = storage(1).delete_volume(&p, id, f).await.unwrap_err();
+        assert!(matches!(err, DriverError::PoolNotMounted(_)), "{err:?}");
+        let err = storage(1).volume_info(&p, id, f).await.unwrap_err();
+        assert!(matches!(err, DriverError::PoolNotMounted(_)), "{err:?}");
+        let err = storage(1).snapshot_tags(&p, id, f).await.unwrap_err();
+        assert!(matches!(err, DriverError::PoolNotMounted(_)), "{err:?}");
     }
 }

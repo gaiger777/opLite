@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::path::Path;
+
 use opl_cluster::memnet::MemRouter;
 use opl_reconciler::resolve::{ResolveError, runtime_spec};
 use opl_types::network::{Network, NetworkSpec, tap_name};
@@ -11,6 +13,9 @@ use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, Volu
 use opl_types::vm::{DiskBus, DiskSpec, MacAddr, NicModel, NicSpec};
 use tempfile::TempDir;
 use uuid::Uuid;
+
+/// NFS 풀을 마운트하는 디렉터리
+const MNT: &str = "/var/lib/opl/pools";
 
 fn pool(name: &str, nodes: Vec<Uuid>) -> StoragePool {
     Resource::new(
@@ -66,7 +71,7 @@ async fn resolves_volumes_to_pool_paths_and_user_network() {
     vm.spec.disks.push(disk("root"));
     vm.spec.nics.push(nic("user", Some(mac)));
 
-    let spec = runtime_spec(&cluster, &vm, node).unwrap();
+    let spec = runtime_spec(&cluster, &vm, node, Path::new(MNT)).unwrap();
     assert_eq!(spec.id, vm.id);
     assert_eq!(
         spec.disks,
@@ -88,6 +93,38 @@ async fn resolves_volumes_to_pool_paths_and_user_network() {
 }
 
 #[tokio::test]
+async fn resolves_nfs_volumes_under_mount_point() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let nas: StoragePool = Resource::new(
+        "nas",
+        StoragePoolSpec {
+            backend: PoolBackend::Nfs {
+                server: "nas".into(),
+                export: "/srv/vm".into(),
+                options: None,
+            },
+            nodes: vec![],
+            shared: true,
+        },
+    );
+    cluster.create(&nas).await.unwrap();
+    let root = volume("root", "nas");
+    cluster.create(&root).await.unwrap();
+
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    let spec = runtime_spec(&cluster, &vm, node, Path::new(MNT)).unwrap();
+    assert_eq!(
+        spec.disks[0].path,
+        Path::new(MNT)
+            .join(nas.id.to_string())
+            .join(format!("{}.qcow2", root.id))
+    );
+}
+
+#[tokio::test]
 async fn resolves_bridge_networks_to_taps() {
     let dir = TempDir::new().unwrap();
     let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
@@ -104,7 +141,7 @@ async fn resolves_bridge_networks_to_taps() {
     let mut vm = common::vm("web", node);
     vm.spec.nics.push(nic("user", Some(MacAddr::generate())));
     vm.spec.nics.push(nic("lan", Some(MacAddr::generate())));
-    let spec = runtime_spec(&cluster, &vm, node).unwrap();
+    let spec = runtime_spec(&cluster, &vm, node, Path::new(MNT)).unwrap();
     assert_eq!(spec.nics[0].backend, NicBackend::User);
     // tap 이름은 NIC 순번으로 정한다.
     assert_eq!(
@@ -139,7 +176,7 @@ async fn reports_unresolvable_references() {
         let mut vm = common::vm("web", node);
         vm.spec.disks = disks;
         vm.spec.nics = nics;
-        runtime_spec(&cluster, &vm, node).unwrap_err()
+        runtime_spec(&cluster, &vm, node, Path::new(MNT)).unwrap_err()
     };
     assert!(matches!(
         check(vec![disk("nope")], vec![]),

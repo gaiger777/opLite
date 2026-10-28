@@ -34,6 +34,8 @@ pub fn raft_config() -> openraft::Config {
 pub fn config(node: Uuid) -> ReconcilerConfig {
     ReconcilerConfig {
         node,
+        // 테스트는 dir 풀만 쓰므로 NFS 마운트 디렉터리는 쓰이지 않는다.
+        mount_root: "/nonexistent/opl-pools".into(),
         resync_interval: Duration::from_secs(3600),
         acpi_timeout: Duration::from_millis(300),
         retry_interval: Duration::from_millis(100),

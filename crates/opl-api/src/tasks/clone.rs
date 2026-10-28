@@ -142,12 +142,12 @@ pub(super) async fn clone(
             .map_err(|e| format!("cannot create volume {:?}: {e}", copy.name))?;
         ctx.storage
             .copy_volume(
-                &source_pool.spec,
+                source_pool,
                 source.id,
                 source.spec.format,
                 tag.as_deref(),
                 force_share,
-                &target.spec,
+                target,
                 copy.id,
             )
             .await
@@ -171,7 +171,7 @@ pub(super) async fn clone(
         }
     }
     for (copy, target) in &copies {
-        mark_ready(ctx, copy, &target.spec).await;
+        mark_ready(ctx, copy, target).await;
     }
 
     for (disk, (copy, _)) in new.spec.disks.iter_mut().zip(&copies) {

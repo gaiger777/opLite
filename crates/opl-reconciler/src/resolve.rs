@@ -1,10 +1,12 @@
 //! VM spec의 이름 참조(Volume, Network)를 풀어 드라이버가 받는 `VmRuntimeSpec`을 만든다.
 
+use std::path::Path;
+
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::DirStorage;
 use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
 use opl_types::runtime::{NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
-use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumeSpec};
+use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::vm::Vm;
 use uuid::Uuid;
 
@@ -24,8 +26,14 @@ pub enum ResolveError {
     Cluster(#[from] ClusterError),
 }
 
-/// 로컬 저장소에서 참조를 찾아 런타임 정의를 만든다. `node`는 이 노드의 id다.
-pub fn runtime_spec(cluster: &Cluster, vm: &Vm, node: Uuid) -> Result<VmRuntimeSpec, ResolveError> {
+/// 로컬 저장소에서 참조를 찾아 런타임 정의를 만든다. `node`는 이 노드의 id이고
+/// `mount_root`는 이 노드가 NFS 풀을 마운트하는 디렉터리다.
+pub fn runtime_spec(
+    cluster: &Cluster,
+    vm: &Vm,
+    node: Uuid,
+    mount_root: &Path,
+) -> Result<VmRuntimeSpec, ResolveError> {
     let mut disks = Vec::with_capacity(vm.spec.disks.len());
     for disk in &vm.spec.disks {
         let volume = cluster
@@ -35,14 +43,11 @@ pub fn runtime_spec(cluster: &Cluster, vm: &Vm, node: Uuid) -> Result<VmRuntimeS
         let pool = cluster
             .get_by_name::<StoragePoolSpec>(pool_name)?
             .ok_or_else(|| ResolveError::PoolNotFound(pool_name.clone()))?;
-        // NFS 풀은 아직 마운트하지 않는다.
-        if (!pool.spec.nodes.is_empty() && !pool.spec.nodes.contains(&node))
-            || matches!(pool.spec.backend, PoolBackend::Nfs { .. })
-        {
+        if !pool.spec.nodes.is_empty() && !pool.spec.nodes.contains(&node) {
             return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
         }
         disks.push(RuntimeDisk {
-            path: DirStorage::volume_path(&pool.spec, volume.id, volume.spec.format),
+            path: DirStorage::volume_path(&pool, mount_root, volume.id, volume.spec.format),
             format: volume.spec.format,
             bus: disk.bus,
             boot_order: disk.boot_order,
