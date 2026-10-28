@@ -10,7 +10,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 세션 쿠키를 발급한다. 웹 UI가 쓴다. CLI는 로그인한 뒤 API 토큰을 만들어 쓴다. */
+        /**
+         * 세션 쿠키를 발급한다. 웹 UI가 쓴다. CLI는 로그인한 뒤 API 토큰을 만들어 쓴다.
+         *     실패가 이어지면 잠시 막는다(429 `too_many_attempts`, `Retry-After`).
+         */
         post: operations["login"];
         delete?: never;
         options?: never;
@@ -333,6 +336,7 @@ export interface paths {
          * 관리자는 누구의 비밀번호와 역할이든 바꾼다. 다른 사용자는 자기 비밀번호만 바꾼다.
          *     자기 비밀번호를 바꿀 때는 현재 비밀번호가 필요하고(훔친 세션으로 계정을 빼앗지 못하게),
          *     바꾸면 그 사용자의 세션이 모두 끝난다. 마지막 관리자는 역할을 내려놓을 수 없다.
+         *     현재 비밀번호 확인은 로그인과 같은 시도 제한을 받는다.
          */
         put: operations["update_user"];
         post?: never;

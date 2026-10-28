@@ -7,6 +7,7 @@ use opl_peer::Peers;
 use uuid::Uuid;
 
 use crate::auth::{Authorizer, RoleAuthorizer, Sessions};
+use crate::limit::AttemptLimiter;
 
 /// 모든 핸들러가 공유하는 노드의 상태.
 pub struct AppState {
@@ -22,6 +23,8 @@ pub struct AppState {
     /// 세션 쿠키에 `Secure`를 붙인다(HTTPS로 서비스할 때).
     pub secure_cookies: bool,
     pub(crate) sessions: Sessions,
+    /// 로그인과 현재 비밀번호 확인의 실패 기록(노드마다 따로)
+    pub(crate) attempts: AttemptLimiter,
     /// 이 노드에서 VM spec의 검증과 쓰기를 한 번에 하나씩 한다(MAC·볼륨 중복 확인이 경합하지 않게).
     /// 여러 노드에 걸친 경합은 나중에 클러스터 수준의 확인이 필요하다.
     pub(crate) vm_lock: tokio::sync::Mutex<()>,
@@ -43,6 +46,7 @@ impl AppState {
             peers: None,
             secure_cookies: false,
             sessions: Sessions::default(),
+            attempts: AttemptLimiter::default(),
             vm_lock: tokio::sync::Mutex::new(()),
         }
     }

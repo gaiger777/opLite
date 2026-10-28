@@ -274,3 +274,149 @@ async fn viewers_cannot_probe_other_users() {
         assert_eq!(body["code"], "forbidden", "{key}");
     }
 }
+
+/// 로그인을 한 번 시도하고 (상태, Retry-After, 본문)을 돌려준다.
+async fn try_login(
+    env: &Env,
+    user: &str,
+    password: &str,
+) -> (StatusCode, Option<String>, serde_json::Value) {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/auth/login", env.base))
+        .json(&json!({ "username": user, "password": password }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .map(|v| v.to_str().unwrap().to_string());
+    (status, retry_after, resp.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn repeated_login_failures_are_throttled() {
+    let env = Env::start().await;
+    for i in 0..5 {
+        let (status, retry_after, _) = try_login(&env, "admin", "wrong-password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{i}");
+        assert_eq!(retry_after, None);
+    }
+    let (status, retry_after, body) = try_login(&env, "admin", "wrong-password").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["code"], "too_many_attempts");
+    let secs: u64 = retry_after.unwrap().parse().unwrap();
+    assert!((1..=30).contains(&secs), "{secs}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("try again in {secs} seconds")),
+        "{body}"
+    );
+    // 막힌 동안에는 맞는 비밀번호도 받지 않는다.
+    let (status, _, _) = try_login(&env, "admin", ADMIN_PASSWORD).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // 없는 사용자도 실패로 센다.
+    for _ in 0..5 {
+        assert_eq!(
+            try_login(&env, "nobody", "wrong-password").await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        try_login(&env, "nobody", "wrong-password").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn successful_login_resets_failures() {
+    let env = Env::start().await;
+    for _ in 0..4 {
+        try_login(&env, "admin", "wrong-password").await;
+    }
+    assert_eq!(
+        try_login(&env, "admin", ADMIN_PASSWORD).await.0,
+        StatusCode::OK
+    );
+    for _ in 0..4 {
+        try_login(&env, "admin", "wrong-password").await;
+    }
+    assert_eq!(
+        try_login(&env, "admin", ADMIN_PASSWORD).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn concurrent_logins_do_not_pass_the_limit() {
+    let env = Env::start().await;
+    // 비밀번호 확인을 기다리는 동안 들어온 시도도 앞의 시도를 실패로 보고 막힌다.
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let url = format!("{}/api/v1/auth/login", env.base);
+        set.spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .json(&json!({ "username": "admin", "password": "wrong-password" }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    let statuses = set.join_all().await;
+    let throttled = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert_eq!(throttled, 15, "{statuses:?}");
+}
+
+#[tokio::test]
+async fn impossible_user_names_count_only_against_the_ip() {
+    let env = Env::start().await;
+    let long = "a".repeat(10_000);
+    for name in ["Admin", "no such user", long.as_str()] {
+        let (status, _, body) = try_login(&env, name, "wrong-password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{name}");
+        assert_eq!(body["code"], "invalid_credentials");
+    }
+    for _ in 3..20 {
+        try_login(&env, &long, "wrong-password").await;
+    }
+    // IP 키는 20번 실패로 막혀 맞는 비밀번호도 받지 않는다.
+    assert_eq!(
+        try_login(&env, "admin", ADMIN_PASSWORD).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn current_password_check_is_throttled_with_login() {
+    let env = Env::start().await;
+    let alice = env.user("alice", "viewer").await;
+    let change = json!({ "password": "new-password", "current_password": "wrong-password" });
+    for i in 0..5 {
+        let (status, body) = alice.put("/users/alice", change.clone(), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{i}");
+        assert_eq!(body["code"], "invalid_credentials");
+    }
+    let (status, body) = alice
+        .put(
+            "/users/alice",
+            json!({ "password": "new-password", "current_password": "password-1" }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["code"], "too_many_attempts");
+    // 로그인과 같은 기록을 쓴다.
+    assert_eq!(
+        try_login(&env, "alice", "password-1").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}

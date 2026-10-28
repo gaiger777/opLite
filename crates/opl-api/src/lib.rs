@@ -8,6 +8,7 @@ pub mod cluster;
 mod console;
 pub mod error;
 mod janitor;
+pub mod limit;
 pub mod resources;
 mod schedule;
 pub mod scheduler;

@@ -1,7 +1,8 @@
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::{FromRequest, FromRequestParts};
-use axum::http::StatusCode;
+use axum::http::header::RETRY_AFTER;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
@@ -16,6 +17,8 @@ pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub details: Option<Value>,
+    /// `Retry-After` 헤더로 보낼 초(429)
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -25,6 +28,7 @@ impl ApiError {
             code,
             message: message.into(),
             details: None,
+            retry_after: None,
         }
     }
 
@@ -80,7 +84,13 @@ impl IntoResponse for ApiError {
             message: self.message,
             details: self.details,
         };
-        (self.status, axum::Json(body)).into_response()
+        let mut response = (self.status, axum::Json(body)).into_response();
+        if let Some(secs) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(secs));
+        }
+        response
     }
 }
 

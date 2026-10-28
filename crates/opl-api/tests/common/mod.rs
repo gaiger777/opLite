@@ -156,7 +156,13 @@ impl Env {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let app = opl_api::router(state.clone());
         let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            // opld처럼 연결 주소를 넘겨 시도 제한이 클라이언트 IP로 센다.
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
         Env {
             cluster,

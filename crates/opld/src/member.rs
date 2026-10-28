@@ -2,11 +2,13 @@
 //! 노드 감시, 예약 스냅샷, 클러스터 정리.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::serve::ListenerExt;
 use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{AppState, ClusterJanitor, SnapshotScheduler, TaskRunner, TaskRunnerConfig};
@@ -284,11 +286,17 @@ impl Member {
         let janitor = ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config());
         let app = opl_api::router(state).merge(crate::web::router());
         let task = tokio::spawn(async move {
-            let r = axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = rx.await;
-                })
-                .await;
+            // 연결 주소(클라이언트 IP)를 시도 제한에 넘긴다. axum은 `TapIo`로 감싼 리스너에
+            // `ConnectInfo<SocketAddr>`를 만들어 주므로 아무 일도 하지 않는 tap을 붙인다.
+            let listener = listener.tap_io(|_| {});
+            let r = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await;
             let _ = exited_tx.send(format!("API server stopped: {r:?}")).await;
             r
         });

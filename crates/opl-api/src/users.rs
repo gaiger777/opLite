@@ -7,7 +7,7 @@ use axum::http::header::SET_COOKIE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use opl_types::auth::{ApiToken, ApiTokenSpec, Role, User, UserSpec};
-use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -17,6 +17,7 @@ use crate::auth::{
     session_cookie, verify_password,
 };
 use crate::error::{ApiError, Json};
+use crate::limit::ClientIp;
 use crate::resources::{List, check_name, lookup};
 use crate::state::AppState;
 
@@ -77,13 +78,23 @@ pub struct LoginRequest {
 }
 
 /// 세션 쿠키를 발급한다. 웹 UI가 쓴다. CLI는 로그인한 뒤 API 토큰을 만들어 쓴다.
+/// 실패가 이어지면 잠시 막는다(429 `too_many_attempts`, `Retry-After`).
 #[utoipa::path(post, path = "/auth/login", tag = "auth", security(()),
     request_body = LoginRequest,
     responses((status = 200, body = UserView), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn login(
     State(state): State<Arc<AppState>>,
+    ClientIp(ip): ClientIp,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    // 이름 형식이 아니면 그런 사용자는 있을 수 없다. 해시를 계산하지 않고 IP만 실패로 센다(긴 이름을
+    // 기록에 넣지 않는다). 있을 수 없는 이름이라 응답 시간으로 드러나는 것도 없다.
+    if validate_name(&req.username).is_err() {
+        state.attempts.begin_ip(ip)?;
+        return Err(wrong_credentials());
+    }
+    // 막혀 있으면 해시를 계산하지 않는다. 이 시도는 미리 실패로 센다.
+    state.attempts.begin(&req.username, ip)?;
     let user = state.cluster.get_by_name::<UserSpec>(&req.username)?;
     // 사용자가 없어도 해시를 비교해 응답 시간으로 사용자 존재 여부를 알 수 없게 한다.
     let hash = match &user {
@@ -91,13 +102,11 @@ pub async fn login(
         None => dummy_hash().await,
     };
     let ok = verify_password(req.password, hash).await;
+    // 없는 사용자도 실패다(begin이 이미 셌다).
     let Some(user) = user.filter(|_| ok) else {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "invalid_credentials",
-            "wrong username or password",
-        ));
+        return Err(wrong_credentials());
     };
+    state.attempts.success(&req.username, ip);
     let session = state.sessions.create(user.id);
     let mut cookie = format!(
         "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
@@ -112,6 +121,14 @@ pub async fn login(
         HeaderValue::from_str(&cookie).map_err(ApiError::internal)?,
     );
     Ok(response)
+}
+
+fn wrong_credentials() -> ApiError {
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "invalid_credentials",
+        "wrong username or password",
+    )
 }
 
 /// 세션을 끝내고 브라우저의 세션 쿠키를 지운다.
@@ -202,6 +219,7 @@ pub struct UpdateUserRequest {
 /// 관리자는 누구의 비밀번호와 역할이든 바꾼다. 다른 사용자는 자기 비밀번호만 바꾼다.
 /// 자기 비밀번호를 바꿀 때는 현재 비밀번호가 필요하고(훔친 세션으로 계정을 빼앗지 못하게),
 /// 바꾸면 그 사용자의 세션이 모두 끝난다. 마지막 관리자는 역할을 내려놓을 수 없다.
+/// 현재 비밀번호 확인은 로그인과 같은 시도 제한을 받는다.
 #[utoipa::path(put, path = "/users/{key}", tag = "auth",
     params(("key" = String, Path, description = "id or name")),
     request_body = UpdateUserRequest,
@@ -209,6 +227,7 @@ pub struct UpdateUserRequest {
 pub async fn update_user(
     State(state): State<Arc<AppState>>,
     principal: Principal,
+    ClientIp(ip): ClientIp,
     Path(key): Path<String>,
     Json(req): Json<UpdateUserRequest>,
 ) -> Result<Json<UserView>, ApiError> {
@@ -229,6 +248,7 @@ pub async fn update_user(
     if let Some(password) = req.password {
         check_password(&password)?;
         if is_self {
+            state.attempts.begin(&principal.name, ip)?;
             let current = req.current_password.unwrap_or_default();
             if !verify_password(current, user.spec.password_hash.clone()).await {
                 return Err(ApiError::new(
@@ -237,6 +257,7 @@ pub async fn update_user(
                     "the current password is wrong",
                 ));
             }
+            state.attempts.success(&principal.name, ip);
         }
         spec.password_hash = hash_password(password).await?;
     }
