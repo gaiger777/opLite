@@ -140,7 +140,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
       <Table aria-labelledby="vm-snapshots">
         <TableHeader>
           <TableRow>
-            <TableHead>{t("snapshots.name")}</TableHead>
+            <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("snapshots.created")}</TableHead>
             <TableHead>{t("snapshots.memory")}</TableHead>
             <TableHead>{t("snapshots.description")}</TableHead>
@@ -227,7 +227,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
                       disabled={busy || !ready}
                       onClick={(e) => ask(e, "delete", snapshot)}
                     >
-                      {t("snapshots.delete")}
+                      {t("common.delete")}
                     </Button>
                   </TableCell>
                 )}
@@ -272,7 +272,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
         returnFocus={opener}
         title={t("snapshots.deleteTitle", { name: confirm?.snapshot.spec.name })}
         description={t("snapshots.deleteDescription")}
-        confirmLabel={t("snapshots.delete")}
+        confirmLabel={t("common.delete")}
         onConfirm={async () => {
           const { snapshot } = confirm!;
           const task = await call(
@@ -338,7 +338,7 @@ function CreateSnapshotDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="snapshot-name" label={t("snapshots.name")} error={errors.name}>
+      <Field id="snapshot-name" label={t("common.name")} error={errors.name}>
         {(a11y) => (
           <Input
             id="snapshot-name"

@@ -162,7 +162,7 @@ export function resetUploads() {
 export function startUpload(file: File, params: UploadParams, t: TFunction) {
   const id = `upload-${crypto.randomUUID()}`;
   const controller = new AbortController();
-  const cancel = { label: t("confirm.cancel"), onClick: () => controller.abort() };
+  const cancel = { label: t("common.cancel"), onClick: () => controller.abort() };
   if (active.size === 0) {
     window.addEventListener("beforeunload", guard);
   }

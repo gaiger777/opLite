@@ -116,8 +116,8 @@ export function DashboardPage() {
         <Table aria-labelledby="dashboard-nodes">
           <TableHeader>
             <TableRow>
-              <TableHead>{t("vms.node")}</TableHead>
-              <TableHead>{t("dashboard.state")}</TableHead>
+              <TableHead>{t("common.node")}</TableHead>
+              <TableHead>{t("common.state")}</TableHead>
               <TableHead>{t("dashboard.hypervisor")}</TableHead>
               <TableHead>{t("dashboard.activeVms")}</TableHead>
               <TableHead>{t("vms.vcpus")}</TableHead>

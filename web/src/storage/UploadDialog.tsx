@@ -96,7 +96,7 @@ export function UploadDialog({ onClose }: { onClose(): void }) {
           />
         )}
       </Field>
-      <Field id="upload-name" label={t("volumes.name")} error={errors.name}>
+      <Field id="upload-name" label={t("common.name")} error={errors.name}>
         {(a11y) => (
           <Input
             id="upload-name"

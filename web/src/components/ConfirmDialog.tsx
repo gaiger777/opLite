@@ -104,7 +104,7 @@ export function ConfirmDialog(props: Props) {
           </p>
         )}
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={busy}>{t("confirm.cancel")}</AlertDialogCancel>
+          <AlertDialogCancel disabled={busy}>{t("common.cancel")}</AlertDialogCancel>
           <Button
             variant="destructive"
             disabled={!ready || busy || props.confirmDisabled}

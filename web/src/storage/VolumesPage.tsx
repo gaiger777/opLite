@@ -80,7 +80,7 @@ export function VolumesPage() {
             </Button>
             <Button onClick={() => setCreating(true)}>
               <Plus />
-              {t("volumes.create")}
+              {t("common.create")}
             </Button>
           </div>
         )}
@@ -88,13 +88,13 @@ export function VolumesPage() {
       <Table aria-labelledby="volumes-title">
         <TableHeader>
           <TableRow>
-            <TableHead>{t("volumes.name")}</TableHead>
+            <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("volumes.pool")}</TableHead>
             <TableHead>{t("volumes.size")}</TableHead>
             <TableHead>{t("volumes.allocated")}</TableHead>
             <TableHead>{t("volumes.format")}</TableHead>
-            <TableHead>{t("volumes.state")}</TableHead>
-            <TableHead>{t("volumes.node")}</TableHead>
+            <TableHead>{t("common.state")}</TableHead>
+            <TableHead>{t("common.node")}</TableHead>
             <TableHead>{t("volumes.vm")}</TableHead>
             {write && (
               <TableHead>
@@ -172,7 +172,7 @@ export function VolumesPage() {
                     <ReasonButton
                       variant="ghost"
                       size="icon-sm"
-                      aria-label={t("volumes.deleteNamed", { name: volume.name })}
+                      aria-label={t("common.deleteNamed", { name: volume.name })}
                       reason={deleteReason}
                       reasons={reasons}
                       onClick={() => setDeleting(volume)}
@@ -201,7 +201,7 @@ export function VolumesPage() {
         onOpenChange={(open) => !open && setDeleting(null)}
         title={t("volumes.deleteTitle", { name: deleting?.name })}
         description={t("volumes.deleteDescription")}
-        confirmLabel={t("volumes.delete")}
+        confirmLabel={t("common.delete")}
         typeToConfirm={deleting?.name}
         onConfirm={async () => {
           const volume = deleting!;
@@ -254,11 +254,11 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
     <FormDialog
       title={t("volumes.createTitle")}
       description={t("volumes.createDescription")}
-      submitLabel={t("volumes.create")}
+      submitLabel={t("common.create")}
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="volume-name" label={t("volumes.name")} error={errors.name}>
+      <Field id="volume-name" label={t("common.name")} error={errors.name}>
         {(a11y) => (
           <Input
             id="volume-name"

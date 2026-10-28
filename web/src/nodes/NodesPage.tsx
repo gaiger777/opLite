@@ -82,8 +82,8 @@ export function NodesPage() {
       <Table aria-labelledby="nodes-title">
         <TableHeader>
           <TableRow>
-            <TableHead>{t("nodes.name")}</TableHead>
-            <TableHead>{t("nodes.state")}</TableHead>
+            <TableHead>{t("common.name")}</TableHead>
+            <TableHead>{t("common.state")}</TableHead>
             <TableHead>{t("nodes.address")}</TableHead>
             <TableHead>{t("nodes.hypervisor")}</TableHead>
             <TableHead>{t("nodes.arch")}</TableHead>

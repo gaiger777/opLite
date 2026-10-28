@@ -88,7 +88,7 @@ export function FormDialog({
           </fieldset>
           <DialogFooter>
             <Button type="button" variant="outline" disabled={busy} onClick={onClose}>
-              {t("confirm.cancel")}
+              {t("common.cancel")}
             </Button>
             <Button
               type="submit"

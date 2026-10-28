@@ -68,7 +68,7 @@ export function NetworksPage() {
         {write && (
           <Button onClick={() => setCreating(true)}>
             <Plus />
-            {t("networks.create")}
+            {t("common.create")}
           </Button>
         )}
       </div>
@@ -76,7 +76,7 @@ export function NetworksPage() {
       <Table aria-labelledby="networks-title">
         <TableHeader>
           <TableRow>
-            <TableHead>{t("networks.name")}</TableHead>
+            <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("networks.bridge")}</TableHead>
             <TableHead>{t("networks.vlan")}</TableHead>
             <TableHead>{t("networks.nodes")}</TableHead>
@@ -127,7 +127,7 @@ export function NetworksPage() {
                     <Button
                       variant="ghost"
                       size="icon-sm"
-                      aria-label={t("networks.deleteNamed", { name: network.name })}
+                      aria-label={t("common.deleteNamed", { name: network.name })}
                       // VM이 쓰는 네트워크는 서버가 지우지 않는다.
                       disabled={used !== 0}
                       onClick={() => setDeleting(network)}
@@ -147,7 +147,7 @@ export function NetworksPage() {
         onOpenChange={(open) => !open && setDeleting(null)}
         title={t("networks.deleteTitle", { name: deleting?.name })}
         description={t("networks.deleteDescription")}
-        confirmLabel={t("networks.delete")}
+        confirmLabel={t("common.delete")}
         onConfirm={async () => {
           const network = deleting!;
           await call(api.DELETE("/networks/{key}", { params: { path: { key: network.id } } }));
@@ -202,11 +202,11 @@ function CreateNetworkDialog({ onClose }: { onClose(): void }) {
     <FormDialog
       title={t("networks.createTitle")}
       description={t("networks.createDescription")}
-      submitLabel={t("networks.create")}
+      submitLabel={t("common.create")}
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="network-name" label={t("networks.name")} error={errors.name}>
+      <Field id="network-name" label={t("common.name")} error={errors.name}>
         {(a11y) => (
           <Input
             id="network-name"

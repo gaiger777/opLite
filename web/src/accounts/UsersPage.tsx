@@ -87,13 +87,13 @@ export function UsersPage() {
         </h1>
         <Button onClick={() => setDialog({ kind: "create" })}>
           <Plus />
-          {t("users.create")}
+          {t("common.create")}
         </Button>
       </div>
       <Table aria-labelledby="users-title">
         <TableHeader>
           <TableRow>
-            <TableHead>{t("users.name")}</TableHead>
+            <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("users.role")}</TableHead>
             <TableHead>
               <span className="sr-only">{t("vms.actions")}</span>
@@ -149,7 +149,7 @@ export function UsersPage() {
                         reason={self ? "users.reason.selfDelete" : null}
                         onSelect={() => setDialog({ kind: "delete", user })}
                       >
-                        {t("users.delete")}
+                        {t("common.delete")}
                       </ReasonMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -172,7 +172,7 @@ export function UsersPage() {
         onOpenChange={(open) => !open && close()}
         title={t("users.deleteTitle", { name: dialog?.kind === "delete" ? dialog.user.name : "" })}
         description={t("users.deleteDescription")}
-        confirmLabel={t("users.delete")}
+        confirmLabel={t("common.delete")}
         returnFocus={trigger}
         onConfirm={async () => {
           if (dialog?.kind !== "delete") {
@@ -240,11 +240,11 @@ function CreateUserDialog({ onClose, onDone }: { onClose(): void; onDone(): Prom
   return (
     <FormDialog
       title={t("users.createTitle")}
-      submitLabel={t("users.create")}
+      submitLabel={t("common.create")}
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="user-name" label={t("users.name")} error={errors.name}>
+      <Field id="user-name" label={t("common.name")} error={errors.name}>
         {(a11y) => (
           <Input
             id="user-name"
@@ -293,7 +293,7 @@ function RoleDialog({
   return (
     <FormDialog
       title={t("users.roleTitle", { name: user.name })}
-      submitLabel={t("users.save")}
+      submitLabel={t("common.save")}
       submitDisabled={role === user.role}
       returnFocus={returnFocus}
       onClose={onClose}
@@ -334,7 +334,7 @@ function ResetPasswordDialog({
     <FormDialog
       title={t("users.passwordTitle", { name: user.name })}
       description={t("users.passwordDescription")}
-      submitLabel={t("users.save")}
+      submitLabel={t("common.save")}
       returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}

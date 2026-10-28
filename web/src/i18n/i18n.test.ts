@@ -15,6 +15,34 @@ it("has the same keys in every language", () => {
   expect(keys(ko).sort()).toEqual(keys(en).sort());
 });
 
+// `common.*`으로 옮긴 키. 같은 뜻의 개별 키를 다시 만들지 않는다.
+const MOVED_TO_COMMON = [
+  "confirm.cancel",
+  "users.save",
+  "vmForm.save",
+  "tokens.done",
+  "tasks.node",
+  "tasks.stateColumn",
+  "dashboard.state",
+  ...["vms", "volumes", "pools", "networks", "users", "tokens"].map((s) => `${s}.create`),
+  ...["snapshots", "volumes", "pools", "networks", "users", "tokens"].map((s) => `${s}.delete`),
+  ...["volumes", "pools", "networks", "tokens"].map((s) => `${s}.deleteNamed`),
+  ...["vms", "snapshots", "volumes", "pools", "networks", "nodes", "users", "tokens"].map(
+    (s) => `${s}.name`,
+  ),
+  ...["vms", "volumes", "nodes"].map((s) => `${s}.state`),
+  ...["vms", "volumes"].map((s) => `${s}.node`),
+];
+
+it("keeps common words only under common", () => {
+  for (const language of [en, ko]) {
+    const present = keys(language);
+    expect(MOVED_TO_COMMON.filter((key) => present.includes(key))).toEqual([]);
+  }
+  expect(en.common).toMatchObject({ cancel: "Cancel", deleteNamed: "Delete {{name}}" });
+  expect(ko.common).toMatchObject({ cancel: "취소", deleteNamed: "{{name}} 삭제" });
+});
+
 it("translates API error codes and falls back to the server message", async () => {
   const t = i18n.t;
   expect(errorMessage(t, new ApiError(409, "vm_running", "cannot delete VM"))).toBe(

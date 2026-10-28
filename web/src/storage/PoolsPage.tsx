@@ -59,14 +59,14 @@ export function PoolsPage() {
         {write && (
           <Button onClick={() => setCreating(true)}>
             <Plus />
-            {t("pools.create")}
+            {t("common.create")}
           </Button>
         )}
       </div>
       <Table aria-labelledby="pools-title">
         <TableHeader>
           <TableRow>
-            <TableHead>{t("pools.name")}</TableHead>
+            <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("pools.path")}</TableHead>
             <TableHead>{t("pools.nodes")}</TableHead>
             <TableHead>{t("pools.free")}</TableHead>
@@ -106,7 +106,7 @@ export function PoolsPage() {
                     <Button
                       variant="ghost"
                       size="icon-sm"
-                      aria-label={t("pools.deleteNamed", { name: pool.name })}
+                      aria-label={t("common.deleteNamed", { name: pool.name })}
                       // 볼륨이 남은 풀은 서버가 지우지 않는다.
                       disabled={used !== 0}
                       onClick={() => setDeleting(pool)}
@@ -126,7 +126,7 @@ export function PoolsPage() {
         onOpenChange={(open) => !open && setDeleting(null)}
         title={t("pools.deleteTitle", { name: deleting?.name })}
         description={t("pools.deleteDescription")}
-        confirmLabel={t("pools.delete")}
+        confirmLabel={t("common.delete")}
         onConfirm={async () => {
           const pool = deleting!;
           await call(api.DELETE("/storage-pools/{key}", { params: { path: { key: pool.id } } }));
@@ -177,11 +177,11 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
     <FormDialog
       title={t("pools.createTitle")}
       description={t("pools.createDescription")}
-      submitLabel={t("pools.create")}
+      submitLabel={t("common.create")}
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="pool-name" label={t("pools.name")} error={errors.name}>
+      <Field id="pool-name" label={t("common.name")} error={errors.name}>
         {(a11y) => (
           <Input id="pool-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />
         )}

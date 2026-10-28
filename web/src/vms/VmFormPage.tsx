@@ -220,11 +220,11 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
       )}
       <div className="flex gap-2">
         <Button type="submit" disabled={busy}>
-          {creating ? t("vms.create") : t("vmForm.save")}
+          {creating ? t("common.create") : t("common.save")}
         </Button>
         <Button variant="ghost" asChild>
           <Link to={creating ? "/vms" : `/vms/${encodeURIComponent(vm.name)}`}>
-            {t("confirm.cancel")}
+            {t("common.cancel")}
           </Link>
         </Button>
       </div>

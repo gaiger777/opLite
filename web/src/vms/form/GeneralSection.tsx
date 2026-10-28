@@ -38,7 +38,7 @@ export function GeneralSection({
       </CardHeader>
       <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         {creating && (
-          <Field id="vm-name" label={t("vms.name")} error={errors.name}>
+          <Field id="vm-name" label={t("common.name")} error={errors.name}>
             {(a11y) => (
               <Input
                 id="vm-name"
@@ -111,7 +111,7 @@ export function GeneralSection({
             <NativeSelectOption value="virt">virt (aarch64)</NativeSelectOption>
           </NativeSelect>
         </Field>
-        <Field id="vm-node" label={t("vms.node")}>
+        <Field id="vm-node" label={t("common.node")}>
           <NativeSelect
             id="vm-node"
             className="w-full"

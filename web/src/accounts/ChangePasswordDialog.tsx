@@ -68,7 +68,7 @@ export function ChangePasswordDialog({
     <FormDialog
       title={t("accounts.changePassword")}
       description={t("accounts.changePasswordDescription")}
-      submitLabel={t("users.save")}
+      submitLabel={t("common.save")}
       returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}

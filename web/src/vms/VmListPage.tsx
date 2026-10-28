@@ -108,7 +108,7 @@ export function VmListPage() {
       {
         id: "name",
         accessorKey: "name",
-        header: t("vms.name"),
+        header: t("common.name"),
         cell: ({ row }) => (
           <Link
             to={`/vms/${encodeURIComponent(row.original.name)}`}
@@ -121,13 +121,13 @@ export function VmListPage() {
       {
         id: "phase",
         accessorFn: (vm) => vm.status.phase,
-        header: t("vms.state"),
+        header: t("common.state"),
         cell: ({ row }) => <VmPhaseBadge vm={row.original} />,
       },
       {
         id: "node",
         accessorFn: (vm) => nodeName(vm.spec.node ?? vm.status.node),
-        header: t("vms.node"),
+        header: t("common.node"),
       },
       { id: "cpu", accessorFn: vcpus, header: t("vms.vcpus") },
       {
@@ -183,7 +183,7 @@ export function VmListPage() {
             <Button asChild>
               <Link to="/vms/-new">
                 <Plus />
-                {t("vms.create")}
+                {t("common.create")}
               </Link>
             </Button>
           )}

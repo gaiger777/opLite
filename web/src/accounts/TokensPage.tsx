@@ -70,14 +70,14 @@ export function TokensPage() {
         </h1>
         <Button onClick={() => setCreating(true)}>
           <Plus />
-          {t("tokens.create")}
+          {t("common.create")}
         </Button>
       </div>
       <p className="text-sm text-muted-foreground">{t("tokens.note")}</p>
       <Table aria-labelledby="tokens-title">
         <TableHeader>
           <TableRow>
-            <TableHead>{t("tokens.name")}</TableHead>
+            <TableHead>{t("common.name")}</TableHead>
             {admin && <TableHead>{t("tokens.owner")}</TableHead>}
             <TableHead>{t("tokens.created")}</TableHead>
             <TableHead>
@@ -102,7 +102,7 @@ export function TokensPage() {
                   <Button
                     variant="ghost"
                     size="icon-sm"
-                    aria-label={t("tokens.deleteNamed", { name: token.name })}
+                    aria-label={t("common.deleteNamed", { name: token.name })}
                     onClick={() => setDeleting(token)}
                   >
                     <Trash2 />
@@ -128,7 +128,7 @@ export function TokensPage() {
         onOpenChange={(open) => !open && setDeleting(null)}
         title={t("tokens.deleteTitle", { name: deleting?.name })}
         description={t("tokens.deleteDescription")}
-        confirmLabel={t("tokens.delete")}
+        confirmLabel={t("common.delete")}
         onConfirm={async () => {
           const token = deleting!;
           await call(api.DELETE("/tokens/{key}", { params: { path: { key: token.id } } }));
@@ -164,11 +164,11 @@ function CreateTokenDialog({
     <FormDialog
       title={t("tokens.createTitle")}
       description={t("tokens.createDescription")}
-      submitLabel={t("tokens.create")}
+      submitLabel={t("common.create")}
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="token-name" label={t("tokens.name")} error={error}>
+      <Field id="token-name" label={t("common.name")} error={error}>
         {(a11y) => (
           <Input
             id="token-name"
@@ -211,7 +211,7 @@ function SecretDialog({ created, onClose }: { created: CreatedToken; onClose(): 
           {t("tokens.usage")} <code>Authorization: Bearer …</code>
         </p>
         <DialogFooter>
-          <Button onClick={onClose}>{t("tokens.done")}</Button>
+          <Button onClick={onClose}>{t("common.done")}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

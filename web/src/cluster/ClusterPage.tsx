@@ -98,8 +98,8 @@ export function ClusterPage() {
         <Table aria-labelledby="cluster-members">
           <TableHeader>
             <TableRow>
-              <TableHead>{t("nodes.name")}</TableHead>
-              <TableHead>{t("nodes.state")}</TableHead>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("common.state")}</TableHead>
               <TableHead>{t("cluster.role")}</TableHead>
               <TableHead>{t("nodes.address")}</TableHead>
               <TableHead>{t("cluster.clusterAddress")}</TableHead>
@@ -207,7 +207,7 @@ function JoinTokenDialog({ token, onClose }: { token: JoinToken; onClose(): void
         </div>
         <p className="text-xs text-muted-foreground">{t("cluster.commandNote")}</p>
         <DialogFooter>
-          <Button onClick={onClose}>{t("tokens.done")}</Button>
+          <Button onClick={onClose}>{t("common.done")}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

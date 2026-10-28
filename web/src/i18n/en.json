@@ -80,8 +80,6 @@
   "tasks": {
     "time": "Time",
     "operation": "Operation",
-    "node": "Node",
-    "stateColumn": "State",
     "error": "Error",
     "empty": "No tasks.",
     "emptyFailed": "No failed tasks.",
@@ -118,22 +116,26 @@
   "common": {
     "loading": "Loading…",
     "copied": "Copied.",
-    "copyFailed": "Could not copy. Select the text and copy it yourself."
+    "copyFailed": "Could not copy. Select the text and copy it yourself.",
+    "cancel": "Cancel",
+    "save": "Save",
+    "create": "Create",
+    "delete": "Delete",
+    "deleteNamed": "Delete {{name}}",
+    "done": "Done",
+    "name": "Name",
+    "state": "State",
+    "node": "Node"
   },
   "confirm": {
-    "cancel": "Cancel",
     "typeName": "Type {{name}} to confirm"
   },
   "vms": {
-    "name": "Name",
-    "state": "State",
-    "node": "Node",
     "vcpus": "vCPUs",
     "memory": "Memory",
     "actions": "Actions",
     "actionsFor": "Actions for {{name}}",
     "search": "Search by name",
-    "create": "Create",
     "empty": "No virtual machines.",
     "selectAll": "Select all",
     "select": "Select {{name}}",
@@ -216,7 +218,6 @@
     "noNics": "No network interfaces."
   },
   "snapshots": {
-    "name": "Name",
     "created": "Created",
     "memory": "Memory",
     "description": "Description",
@@ -239,7 +240,6 @@
     "revertTitle": "Revert {{vm}} to {{name}}?",
     "revertDescription": "The current state of {{vm}} is lost. The VM is powered off, then its disks, firmware variables and settings return to the snapshot. It stays off.",
     "revertDescriptionMemory": "The current state of {{vm}} is lost. The VM is powered off, then its disks, firmware variables and settings return to the snapshot, and it resumes running from the saved memory.",
-    "delete": "Delete",
     "deleteNamed": "Delete snapshot {{name}}",
     "deleteTitle": "Delete snapshot {{name}}?",
     "deleteDescription": "The snapshot is deleted. Snapshots taken after it are kept, and the VM's current state does not change.",
@@ -292,24 +292,18 @@
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."
   },
   "volumes": {
-    "name": "Name",
     "pool": "Storage pool",
     "size": "Size",
     "allocated": "Allocated",
     "format": "Format",
-    "state": "State",
-    "node": "Node",
     "vm": "Used by",
     "empty": "No volumes.",
     "phase": {
       "pending": "Creating",
       "ready": "Ready"
     },
-    "create": "Create",
     "createTitle": "Create an empty volume",
     "createDescription": "A new disk image in a storage pool. A qcow2 volume takes space only as it is written.",
-    "delete": "Delete",
-    "deleteNamed": "Delete {{name}}",
     "deleteTitle": "Delete volume {{name}}?",
     "deleteDescription": "The disk image and all data on it are deleted.",
     "resize": "Resize",
@@ -349,21 +343,17 @@
     }
   },
   "pools": {
-    "name": "Name",
     "path": "Directory",
     "nodes": "Nodes",
     "free": "Free / total",
     "volumes": "Volumes",
     "empty": "No storage pools.",
     "allNodes": "All nodes",
-    "create": "Create",
     "createTitle": "Create a storage pool",
     "createDescription": "A directory on the nodes that holds volume files. Create the directory on each node first.",
     "pathHint": "An absolute path on the nodes.",
     "nodesHint": "Leave all unchecked to use it on every node.",
     "created": "Created storage pool {{name}}.",
-    "delete": "Delete",
-    "deleteNamed": "Delete {{name}}",
     "deleteTitle": "Delete storage pool {{name}}?",
     "deleteDescription": "Only the pool is removed. Files in its directory stay on the nodes.",
     "deleted": "Deleted storage pool {{name}}.",
@@ -374,7 +364,6 @@
     }
   },
   "networks": {
-    "name": "Name",
     "bridge": "Bridge",
     "vlan": "VLAN",
     "vlanOptional": "VLAN tag (optional)",
@@ -385,12 +374,9 @@
     "userNote": "The user network (QEMU NAT) is always available and is not listed.",
     "noNode": "No node has this bridge",
     "noVlanFiltering": "VLAN filtering is off on {{nodes}}",
-    "create": "Create",
     "createTitle": "Create a network",
     "createDescription": "Points VM interfaces at a Linux bridge that already exists on the nodes. VMs on this network run only on nodes with the bridge.",
     "created": "Created network {{name}}.",
-    "delete": "Delete",
-    "deleteNamed": "Delete {{name}}",
     "deleteTitle": "Delete network {{name}}?",
     "deleteDescription": "Only the network is removed. The bridges on the nodes are not changed.",
     "deleted": "Deleted network {{name}}.",
@@ -402,8 +388,6 @@
     }
   },
   "nodes": {
-    "name": "Name",
-    "state": "State",
     "address": "API address",
     "hypervisor": "Hypervisor",
     "arch": "Architecture",
@@ -444,12 +428,10 @@
     }
   },
   "users": {
-    "name": "Name",
     "role": "Role",
     "you": "(you)",
     "empty": "No users.",
     "roleHint": "Operators change VMs and volumes. Viewers only read. Neither can see accounts.",
-    "create": "Create",
     "createTitle": "Create a user",
     "created": "Created user {{name}}.",
     "changeRole": "Change role",
@@ -459,8 +441,6 @@
     "passwordTitle": "Reset the password of {{name}}",
     "passwordDescription": "The user's sessions end and they sign in with the new password.",
     "passwordReset": "Reset the password of {{name}}.",
-    "save": "Save",
-    "delete": "Delete",
     "deleteTitle": "Delete user {{name}}?",
     "deleteDescription": "The user and their API tokens are deleted.",
     "deleted": "Deleted user {{name}}.",
@@ -473,12 +453,10 @@
     }
   },
   "tokens": {
-    "name": "Name",
     "owner": "Owner",
     "created": "Created",
     "empty": "No API tokens.",
     "note": "Scripts and tools use API tokens. A token has the role of its owner. oplctl login makes one for the CLI.",
-    "create": "Create",
     "createTitle": "Create an API token",
     "createDescription": "The token acts as you, with your role.",
     "secretTitle": "Token {{name}} was created",
@@ -486,9 +464,6 @@
     "secret": "Token",
     "copySecret": "Copy the token",
     "usage": "Send it in the header",
-    "done": "Done",
-    "delete": "Delete",
-    "deleteNamed": "Delete {{name}}",
     "deleteTitle": "Delete API token {{name}}?",
     "deleteDescription": "Anything using the token stops working right away.",
     "deleted": "Deleted API token {{name}}."
@@ -545,7 +520,6 @@
     "addNic": "Add an interface",
     "startAfter": "Start after creating",
     "reload": "Reload",
-    "save": "Save",
     "errors": {
       "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -.",
       "cores": "From 1 to 65535.",
@@ -591,7 +565,6 @@
     "vmCounts": "{{running}} running · {{stopped}} stopped · {{failed}} failed",
     "leader": "Leader",
     "perNode": "Nodes",
-    "state": "State",
     "hypervisor": "Hypervisor",
     "activeVms": "Active VMs",
     "nodeOnline": "Online",

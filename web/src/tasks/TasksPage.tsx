@@ -80,8 +80,8 @@ export function TaskTable({
         <TableRow>
           <TableHead>{t("tasks.time")}</TableHead>
           <TableHead>{t("tasks.operation")}</TableHead>
-          <TableHead>{t("tasks.node")}</TableHead>
-          <TableHead>{t("tasks.stateColumn")}</TableHead>
+          <TableHead>{t("common.node")}</TableHead>
+          <TableHead>{t("common.state")}</TableHead>
           <TableHead>{t("tasks.error")}</TableHead>
         </TableRow>
       </TableHeader>
