@@ -240,7 +240,7 @@ enum VolumeCmd {
     },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Machine {
     Virt,
     Q35,
@@ -319,7 +319,7 @@ struct VmCreate {
     /// 메모리(MiB)
     #[arg(long, default_value_t = 1024)]
     memory: u32,
-    /// 기본값은 호스트에 맞춘다(Apple Silicon: virt, x86_64: q35).
+    /// 기본값은 노드 아키텍처에 맞춘다(aarch64: virt, x86_64: q35).
     #[arg(long, value_enum)]
     machine: Option<Machine>,
     #[arg(long, value_enum, default_value = "uefi")]
@@ -948,15 +948,19 @@ async fn vm(
         }
         VmCmd::Get { vm } => print_json(out, &client.get(&format!("/vms/{vm}")).await?)?,
         VmCmd::Create(args) => {
-            let machine = args.machine.unwrap_or(if cfg!(target_arch = "aarch64") {
-                Machine::Virt
-            } else {
-                Machine::Q35
-            });
             let node = match &args.node {
-                Some(key) => Some(client.get(&format!("/nodes/{key}")).await?["id"].clone()),
+                Some(key) => Some(client.get(&format!("/nodes/{key}")).await?),
                 None => None,
             };
+            let machine = match args.machine {
+                Some(m) => m,
+                None => {
+                    let list = client.get("/nodes").await?;
+                    let nodes = list["items"].as_array().cloned().unwrap_or_default();
+                    default_machine(node.as_ref(), &nodes)?
+                }
+            };
+            let node = node.map(|n| n["id"].clone());
             let disks: Vec<Value> = args
                 .disks
                 .iter()
@@ -1059,6 +1063,25 @@ async fn vm(
         }
     }
     Ok(())
+}
+
+/// `--machine`이 없을 때의 머신: 지정 노드의 arch, 아니면 arch를 아는 노드가 모두 같은 arch.
+fn default_machine(node: Option<&Value>, nodes: &[Value]) -> anyhow::Result<Machine> {
+    let machine = |n: &Value| match n["status"]["arch"].as_str() {
+        Some("x86_64") => Some(Machine::Q35),
+        Some("aarch64") => Some(Machine::Virt),
+        _ => None,
+    };
+    if let Some(m) = node.and_then(machine) {
+        return Ok(m);
+    }
+    let mut known = nodes.iter().filter_map(machine);
+    match known.next() {
+        Some(first) if known.all(|m| m == first) => Ok(first),
+        _ => bail!(
+            "cannot choose a machine type from the node architectures; pass --machine virt or --machine q35"
+        ),
+    }
 }
 
 /// 서버의 VM 삭제 조건(꺼짐을 바라고 멈췄거나 실패함)과 모든 스냅샷이 다 만들어졌는지 본다.
@@ -1480,6 +1503,37 @@ mod tests {
             Cmd::Volume { cmd: VolumeCmd::Resize { size, .. } } if size == 20 << 30
         ));
         assert!(Cli::try_parse_from(["oplctl", "volume", "resize", "root"]).is_err());
+    }
+
+    #[test]
+    fn default_machine_follows_node_arch() {
+        let node = |arch: Value| json!({ "status": { "arch": arch } });
+        let (x86, arm, unknown) = (
+            node(json!("x86_64")),
+            node(json!("aarch64")),
+            node(Value::Null),
+        );
+        // 지정 노드의 arch가 먼저다.
+        let all = [x86.clone(), arm.clone()];
+        assert_eq!(default_machine(Some(&arm), &all).unwrap(), Machine::Virt);
+        assert_eq!(default_machine(Some(&x86), &all).unwrap(), Machine::Q35);
+        // 지정 노드의 arch를 모르거나 지정하지 않았으면 arch를 아는 노드가 모두 같을 때 그것이다.
+        let same = [arm.clone(), arm.clone(), unknown.clone()];
+        assert_eq!(
+            default_machine(Some(&unknown), &same).unwrap(),
+            Machine::Virt
+        );
+        assert_eq!(default_machine(None, &same).unwrap(), Machine::Virt);
+        assert_eq!(
+            default_machine(None, std::slice::from_ref(&x86)).unwrap(),
+            Machine::Q35
+        );
+        // 섞였거나 아는 노드가 없으면 --machine을 달라고 한다.
+        for nodes in [&all[..], &[unknown.clone()][..], &[][..]] {
+            let err = default_machine(None, nodes).unwrap_err().to_string();
+            assert!(err.contains("--machine"), "{err}");
+        }
+        assert!(default_machine(Some(&unknown), &all).is_err());
     }
 
     #[test]
