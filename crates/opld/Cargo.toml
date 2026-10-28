@@ -16,6 +16,9 @@ net-it = []
 # 웹 UI(web/dist)를 바이너리에 넣는다. 먼저 `pnpm -C web build`로 만든다. 디버그 빌드는 없어도 되고
 # 안내 페이지를 준다.
 web-ui = []
+# 실제 NFS 풀을 마운트하는 E2E 테스트. Linux에서 root, NFS 클라이언트(nfs-common), qemu-img와
+# 127.0.0.1에 내보낸 디렉터리(`OPL_TEST_NFS_EXPORT`)가 필요하다.
+nfs-it = []
 # 브라우저(Playwright)로 웹 UI를 확인하는 E2E. qemu-it의 준비물에 더해 pnpm과
 # `pnpm -C web exec playwright install chromium`, 빌드한 web/dist가 필요하다.
 web-it = ["qemu-it", "web-ui"]

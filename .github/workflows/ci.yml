@@ -103,13 +103,23 @@ jobs:
           pnpm -C web install --frozen-lockfile
           pnpm -C web build
           pnpm -C web exec playwright install --with-deps chromium
+      # NFS 풀 E2E가 마운트할 내보내기. root로 마운트한 opld가 쓰도록 root를 그대로 둔다.
+      - name: NFS server exporting a test directory
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nfs-kernel-server
+          sudo mkdir -p /srv/opl-nfs
+          echo '/srv/opl-nfs 127.0.0.1(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
+          sudo systemctl restart nfs-kernel-server
+          sudo exportfs -v
       # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다.
       - name: QEMU, bridge and E2E tests as root
         run: |
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it
+          OPL_TEST_NFS_EXPORT: /srv/opl-nfs
 
   deny:
     runs-on: ubuntu-latest

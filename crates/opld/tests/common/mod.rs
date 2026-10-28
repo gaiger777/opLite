@@ -203,6 +203,11 @@ impl Daemon {
         );
     }
 
+    /// `start`한 뒤 아직 멈추지 않았는지
+    pub fn is_running(&self) -> bool {
+        self.child.is_some()
+    }
+
     /// kill -9
     pub fn kill(&mut self) {
         let mut child = self.child.take().unwrap();
