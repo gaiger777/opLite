@@ -5,7 +5,7 @@ import { toast } from "sonner";
 
 import type { Principal, Vm } from "@/api/types";
 import { resetTasks } from "@/tasks/tasks";
-import { NODE, pool, snapshot, task, vm, volume } from "@/test/fixtures";
+import { NODE, pool, poolState, snapshot, task, vm, volume } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { cloneNode } from "@/vms/VmCloneDialog";
@@ -272,6 +272,50 @@ it("points at the pool when the VM's node cannot use it", async () => {
   expect(screen.getByRole("dialog", { name: "Clone db" })).toBeInTheDocument();
 });
 
+it("offers only pools ready on the VM's node and points at one that is not", async () => {
+  const nas = pool("nas", { backend: { kind: "nfs", server: "nas.lan", export: "/srv/vm" } });
+  const fast = pool("fast", { backend: { kind: "nfs", server: "fast.lan", export: "/srv/vm" } });
+  const here = {
+    ...NODE,
+    status: {
+      ...NODE.status,
+      pools: { nas: poolState("nas", { ready: false, error: "down" }), fast: poolState("fast") },
+    },
+  };
+  mockLists({
+    vm: [db],
+    node: [here],
+    volume: [volume("db-root", "local")],
+    "storage-pool": [pool("local"), nas, fast],
+  });
+  // 대화상자를 연 사이 준비되지 않게 됐다.
+  server.use(
+    http.post(apiUrl(`/vms/${db.id}/clone`), () =>
+      HttpResponse.json({ code: "pool_unavailable", message: "down" }, { status: 409 }),
+    ),
+  );
+  openDetail(db);
+  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  const dialog = await screen.findByRole("dialog", { name: "Clone db" });
+  await userEvent.type(within(dialog).getByLabelText("New VM name"), "db-copy");
+  const pools = within(dialog).getByLabelText("Storage pool for the disks");
+  await waitFor(() =>
+    expect(
+      within(pools)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["Same pool as each source disk", "local", "fast"]),
+  );
+  await userEvent.selectOptions(pools, "fast");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Clone" }));
+  await waitFor(() =>
+    expect(pools).toHaveAccessibleDescription(
+      "That storage pool is not ready on the node holding the VM.",
+    ),
+  );
+  expect(pools).toBeInvalid();
+});
+
 it("picks the node like the server's vm_node", () => {
   const free = withDisk(vm("db", "stopped", { spec: { ...db.spec, node: null } }));
   const vols = [volume("db-root", "local", { node: "n3" })];
@@ -293,7 +337,7 @@ it("offers the pools of the connected node when the VM has no node", async () =>
   const free = withDisk(vm("db", "stopped", { spec: { ...db.spec, node: null } }));
   mockLists({
     vm: [free],
-    node: [NODE],
+    node: [NODE, { ...NODE, id: "n2", name: "node-b" }],
     volume: [volume("db-root", "local", { node: null })],
     "storage-pool": [pool("all"), pool("here", { nodes: ["n2"] }), pool("far", { nodes: ["n1"] })],
   });

@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import {
   Table,
   TableBody,
@@ -26,6 +27,15 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatBytes } from "@/lib/format";
+import {
+  nfsExportError,
+  nfsOptionsError,
+  nfsServerError,
+  poolCapacity,
+  poolLocation,
+  poolNodes,
+} from "@/storage/pools";
+import { PoolStatus } from "@/storage/PoolStatus";
 import { validName } from "@/vms/form";
 
 export function PoolsPage() {
@@ -38,14 +48,7 @@ export function PoolsPage() {
   const [deleting, setDeleting] = useState<StoragePool | null>(null);
   const write = can(me.role, "write", "storage-pool");
 
-  const nodeName = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n.name])), [nodes.data]);
-  const nodeNames = (pool: StoragePool) => {
-    const ids = pool.spec.nodes ?? [];
-    // 노드를 정하지 않은 풀은 모든 노드에서 쓴다.
-    return ids.length === 0
-      ? t("pools.allNodes")
-      : ids.map((id) => nodeName.get(id) ?? id.slice(-8)).join(", ");
-  };
+  const nodeList = useMemo(() => nodes.data ?? [], [nodes.data]);
   // 볼륨 목록을 다 읽기 전에는 모른다(undefined).
   const volumeCount = (pool: StoragePool) =>
     volumes.isSuccess ? volumes.data.filter((v) => v.spec.pool === pool.name).length : undefined;
@@ -67,7 +70,8 @@ export function PoolsPage() {
         <TableHeader>
           <TableRow>
             <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("pools.path")}</TableHead>
+            <TableHead>{t("pools.kind")}</TableHead>
+            <TableHead>{t("pools.location")}</TableHead>
             <TableHead>{t("pools.nodes")}</TableHead>
             <TableHead>{t("pools.free")}</TableHead>
             <TableHead>{t("pools.volumes")}</TableHead>
@@ -80,24 +84,35 @@ export function PoolsPage() {
         </TableHeader>
         <TableBody>
           {(pools.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 6 : 5} query={pools} empty={t("pools.empty")} />
+            <TableMessage colSpan={write ? 7 : 6} query={pools} empty={t("pools.empty")} />
           )}
           {(pools.data ?? []).map((pool) => {
-            const { available_bytes: free, total_bytes: total } = pool.status;
+            const capacity = poolCapacity(pool, nodeList);
             const used = volumeCount(pool);
             return (
               <TableRow key={pool.id}>
                 <TableCell className="font-medium">{pool.name}</TableCell>
-                <TableCell className="font-mono text-xs">
-                  {pool.spec.backend.kind === "dir"
-                    ? pool.spec.backend.path
-                    : `${pool.spec.backend.server}:${pool.spec.backend.export}`}
-                </TableCell>
-                <TableCell>{nodeNames(pool)}</TableCell>
+                <TableCell>{t(`pools.kinds.${pool.spec.backend.kind}`)}</TableCell>
+                <TableCell className="font-mono text-xs">{poolLocation(pool)}</TableCell>
                 <TableCell>
-                  {free !== null && total !== null
-                    ? `${formatBytes(free)} / ${formatBytes(total)}`
-                    : "—"}
+                  {/* 노드를 정하지 않은 풀은 모든 노드에서 쓴다. */}
+                  {(pool.spec.nodes ?? []).length === 0 && (
+                    <div className="text-xs text-muted-foreground">{t("pools.allNodes")}</div>
+                  )}
+                  {poolNodes(pool, nodeList).map((n) => (
+                    <PoolStatus key={n.id} name={n.name} state={n.state} offline={n.offline} />
+                  ))}
+                </TableCell>
+                <TableCell>
+                  {/* 공유 풀은 값 하나, 로컬 풀은 준비된 노드마다(노드가 둘 이상이면 이름을 붙인다). */}
+                  {capacity.length === 0
+                    ? "—"
+                    : capacity.map((c) => (
+                        <div key={c.node ?? ""}>
+                          {capacity.length > 1 && `${c.node}: `}
+                          {`${formatBytes(c.free)} / ${formatBytes(c.total)}`}
+                        </div>
+                      ))}
                 </TableCell>
                 <TableCell>
                   {used ?? "—"}
@@ -145,7 +160,11 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
   const nodes = useList("node");
   const [name, setName] = useState("");
+  const [kind, setKind] = useState<"dir" | "nfs">("dir");
   const [path, setPath] = useState("");
+  const [nfsServer, setNfsServer] = useState("");
+  const [nfsExport, setNfsExport] = useState("");
+  const [nfsOptions, setNfsOptions] = useState("");
   const [chosen, setChosen] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -154,8 +173,22 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
     if (!validName(name)) {
       found.name = "forms.name";
     }
-    if (!path.startsWith("/")) {
+    if (kind === "dir" && !path.startsWith("/")) {
       found.path = "pools.errors.path";
+    }
+    if (kind === "nfs") {
+      const server = nfsServerError(nfsServer);
+      if (server) {
+        found.server = server;
+      }
+      const exportError = nfsExportError(nfsExport);
+      if (exportError) {
+        found.export = exportError;
+      }
+      const optionsError = nfsOptions === "" ? undefined : nfsOptionsError(nfsOptions);
+      if (optionsError) {
+        found.options = optionsError;
+      }
     }
     // 고른 뒤에 목록에서 빠진 노드는 보내지 않는다.
     const known = chosen.filter((id) => nodes.data?.some((n) => n.id === id));
@@ -169,11 +202,17 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
     if (Object.keys(found).length > 0) {
       return false;
     }
-    await call(
-      api.POST("/storage-pools", {
-        body: { name, spec: { backend: { kind: "dir", path }, nodes: known } },
-      }),
-    );
+    // NFS 풀의 `shared`는 보내지 않는다(서버가 늘 공유로 둔다). 빈 옵션은 커널 기본값이다.
+    const backend =
+      kind === "dir"
+        ? { kind, path }
+        : {
+            kind,
+            server: nfsServer,
+            export: nfsExport,
+            ...(nfsOptions !== "" && { options: nfsOptions }),
+          };
+    await call(api.POST("/storage-pools", { body: { name, spec: { backend, nodes: known } } }));
     toast.success(t("pools.created", { name }));
   }
 
@@ -190,17 +229,88 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
           <Input id="pool-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />
         )}
       </Field>
-      <Field id="pool-path" label={t("pools.path")} error={errors.path} hint={t("pools.pathHint")}>
+      <Field id="pool-kind" label={t("pools.kind")} hint={t(`pools.kindHint.${kind}`)}>
         {(a11y) => (
-          <Input
-            id="pool-path"
-            placeholder="/var/lib/opl/pool"
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
+          <NativeSelect
+            id="pool-kind"
+            className="w-full"
+            value={kind}
+            onChange={(e) => setKind(e.target.value as "dir" | "nfs")}
             {...a11y}
-          />
+          >
+            <NativeSelectOption value="dir">{t("pools.kinds.dir")}</NativeSelectOption>
+            <NativeSelectOption value="nfs">{t("pools.kinds.nfs")}</NativeSelectOption>
+          </NativeSelect>
         )}
       </Field>
+      {kind === "dir" ? (
+        <Field
+          id="pool-path"
+          label={t("pools.path")}
+          error={errors.path}
+          hint={t("pools.pathHint")}
+        >
+          {(a11y) => (
+            <Input
+              id="pool-path"
+              placeholder="/var/lib/opl/pool"
+              value={path}
+              onChange={(e) => setPath(e.target.value)}
+              {...a11y}
+            />
+          )}
+        </Field>
+      ) : (
+        <>
+          <Field
+            id="pool-server"
+            label={t("pools.server")}
+            error={errors.server}
+            hint={t("pools.serverHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="pool-server"
+                placeholder="nas.lan"
+                value={nfsServer}
+                onChange={(e) => setNfsServer(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          <Field
+            id="pool-export"
+            label={t("pools.export")}
+            error={errors.export}
+            hint={t("pools.exportHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="pool-export"
+                placeholder="/srv/vm"
+                value={nfsExport}
+                onChange={(e) => setNfsExport(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          <Field
+            id="pool-options"
+            label={t("pools.options")}
+            error={errors.options}
+            hint={t("pools.optionsHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="pool-options"
+                value={nfsOptions}
+                onChange={(e) => setNfsOptions(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+        </>
+      )}
       <fieldset
         className="flex flex-col gap-2"
         aria-describedby={errors.nodes ? "pool-nodes-error" : undefined}

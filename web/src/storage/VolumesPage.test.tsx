@@ -65,7 +65,13 @@ it("lists volumes with their size, state and VM", async () => {
 });
 
 it("creates an empty volume and follows its task", async () => {
-  mockLists({ "storage-pool": [pool("local")], volume: [volume("root", "local")] });
+  // 어느 노드에서도 쓸 수 없는 풀(상태를 알린 노드가 없는 NFS 풀)은 고를 수 없다.
+  const nas = pool("nas", { backend: { kind: "nfs", server: "nas.lan", export: "/srv/vm" } });
+  mockLists({
+    "storage-pool": [pool("local"), nas],
+    volume: [volume("root", "local")],
+    node: [NODE],
+  });
   let body: unknown;
   server.use(
     http.post(apiUrl("/volumes"), async ({ request }) => {
@@ -80,6 +86,9 @@ it("creates an empty volume and follows its task", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByText("A volume with this name already exists.")).toBeVisible();
   expect(within(dialog).getByText("Choose a storage pool.")).toBeVisible();
+
+  const pools = within(within(dialog).getByLabelText("Storage pool")).getAllByRole("option");
+  expect(pools.map((o) => o.textContent)).toEqual(["—", "local"]);
 
   await userEvent.clear(within(dialog).getByLabelText("Name"));
   await userEvent.type(within(dialog).getByLabelText("Name"), "data");

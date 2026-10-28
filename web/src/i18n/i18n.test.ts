@@ -54,6 +54,9 @@ it("translates API error codes and falls back to the server message", async () =
   expect(errorMessage(t, new ApiError(429, "too_many_attempts", "try again in 30 seconds"))).toBe(
     "Too many attempts. Try again later.",
   );
+  expect(
+    errorMessage(t, new ApiError(409, "pool_unavailable", 'storage pool "nas" is not ready')),
+  ).toBe('storage pool "nas" is not ready');
   expect(errorMessage(t, new ApiError(400, "machine_arch_mismatch", "virt on x86_64"))).toBe(
     "The machine type doesn't match the selected node's architecture.",
   );

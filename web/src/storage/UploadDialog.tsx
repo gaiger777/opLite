@@ -5,7 +5,6 @@ import { useTranslation } from "react-i18next";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
-import type { StoragePool } from "@/api/types";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
@@ -13,17 +12,11 @@ import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { errorMessage } from "@/i18n/errors";
 import { formatBytes } from "@/lib/format";
+import { poolsUsableOn } from "@/storage/pools";
 import { nameFromFile, sourceFormatOf, startUpload } from "@/storage/upload";
 import { volumeNameError } from "@/storage/volumes";
 
 type Schemas = components["schemas"];
-
-/** 서버는 받은 노드에서 쓸 수 있는 풀로만 가져온다(노드를 정하지 않은 풀은 모든 노드). */
-export function poolsOnNode(pools: StoragePool[], node: string | undefined): StoragePool[] {
-  return node === undefined
-    ? []
-    : pools.filter((p) => (p.spec.nodes ?? []).length === 0 || p.spec.nodes!.includes(node));
-}
 
 export function UploadDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
@@ -31,7 +24,8 @@ export function UploadDialog({ onClose }: { onClose(): void }) {
   const volumes = useList("volume");
   const nodes = useList("node");
   const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
-  const usable = poolsOnNode(pools.data ?? [], cluster.data?.node);
+  // 서버는 받은 노드에서 쓸 수 있는(준비된) 풀로만 가져온다.
+  const usable = poolsUsableOn(pools.data ?? [], nodes.data ?? [], cluster.data?.node);
   const here = nodes.data?.find((n) => n.id === cluster.data?.node)?.name ?? "—";
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState("");

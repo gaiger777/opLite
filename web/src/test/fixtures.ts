@@ -1,4 +1,5 @@
 import type { Node, Snapshot, StoragePool, Task, Vm, Volume } from "@/api/types";
+import type { PoolState } from "@/storage/pools";
 
 /** 테스트용 VM. 필요한 필드만 바꿔 쓴다. */
 export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm> = {}): Vm {
@@ -64,7 +65,20 @@ export function pool(name: string, extra: Partial<StoragePool["spec"]> = {}): St
     revision: 1,
     labels: {},
     spec: { backend: { kind: "dir", path: `/srv/${name}` }, nodes: [], ...extra },
-    status: { available_bytes: 64 * 1024 ** 3, total_bytes: 128 * 1024 ** 3 },
+    // 서버는 풀의 용량을 비워 두고, 노드가 풀 상태에 용량을 알린다.
+    status: { available_bytes: null, total_bytes: null },
+  };
+}
+
+/** 노드가 알린 풀 `name`(`pool(name)`)의 상태. 기본은 준비된 128 GiB 풀이다. */
+export function poolState(name: string, extra: Partial<PoolState> = {}): PoolState {
+  return {
+    pool_id: pool(name).id,
+    ready: true,
+    error: null,
+    total_bytes: 128 * 1024 ** 3,
+    available_bytes: 64 * 1024 ** 3,
+    ...extra,
   };
 }
 

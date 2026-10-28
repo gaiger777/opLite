@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
+import { PoolStatus } from "@/storage/PoolStatus";
 
 /** 그 노드에 고정했거나 그 노드에서 마지막으로 돈 VM의 수 */
 function vmCount(node: Node, vms: Vm[]): number {
@@ -90,6 +91,7 @@ export function NodesPage() {
             <TableHead>{t("nodes.cpus")}</TableHead>
             <TableHead>{t("nodes.memory")}</TableHead>
             <TableHead>{t("nodes.bridges")}</TableHead>
+            <TableHead>{t("nodes.pools")}</TableHead>
             <TableHead>{t("nodes.vms")}</TableHead>
             {write && (
               <TableHead>
@@ -100,7 +102,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 10 : 9} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 11 : 10} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -128,6 +130,20 @@ export function NodesPage() {
               <TableCell>{formatCapacity(node.status.memory_mib)}</TableCell>
               <TableCell className="font-mono text-xs">
                 {node.status.bridges.map((b) => b.name).join(", ") || "—"}
+              </TableCell>
+              <TableCell>
+                {Object.keys(node.status.pools).length === 0
+                  ? "—"
+                  : Object.entries(node.status.pools)
+                      .sort(([a], [b]) => a.localeCompare(b))
+                      .map(([name, state]) => (
+                        <PoolStatus
+                          key={name}
+                          name={name}
+                          state={state}
+                          offline={!node.status.online}
+                        />
+                      ))}
               </TableCell>
               {/* VM 목록을 다 읽기 전에는 모른다. */}
               <TableCell>{vms.isSuccess ? vmCount(node, vms.data) : "—"}</TableCell>

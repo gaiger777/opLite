@@ -2,11 +2,10 @@ import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
-import { poolsOnNode } from "@/storage/UploadDialog";
 import { resetUploads } from "@/storage/upload";
 import { VolumesPage } from "@/storage/VolumesPage";
 import { FakeXhr } from "@/test/fakeXhr";
-import { NODE, pool } from "@/test/fixtures";
+import { NODE, pool, poolState } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -16,14 +15,18 @@ afterEach(() => {
   resetUploads();
 });
 
-it("offers only the pools of the node it is connected to", () => {
-  const pools = [pool("all"), pool("here", { nodes: ["n1"] }), pool("far", { nodes: ["n2"] })];
-  expect(poolsOnNode(pools, "n1").map((p) => p.name)).toEqual(["all", "here"]);
-  expect(poolsOnNode(pools, undefined)).toEqual([]);
-});
+const nas = pool("nas", { backend: { kind: "nfs", server: "nas.lan", export: "/srv/vm" } });
 
 it("uploads a chosen file into a new volume", async () => {
-  mockLists({ "storage-pool": [pool("local"), pool("far", { nodes: ["n2"] })], node: [NODE] });
+  // 접속한 노드(n1)에서 쓸 수 없는 풀(다른 노드의 풀, 준비되지 않은 NFS 풀)은 고를 수 없다.
+  const here = {
+    ...NODE,
+    status: { ...NODE.status, pools: { nas: poolState("nas", { ready: false, error: "down" }) } },
+  };
+  mockLists({
+    "storage-pool": [pool("local"), pool("far", { nodes: ["n2"] }), nas],
+    node: [here],
+  });
   server.use(
     http.get(apiUrl("/cluster"), () =>
       HttpResponse.json({

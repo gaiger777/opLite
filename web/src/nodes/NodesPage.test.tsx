@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { NodesPage } from "@/nodes/NodesPage";
-import { NODE, vm } from "@/test/fixtures";
+import { NODE, poolState, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -57,6 +57,27 @@ it("lists nodes with their state, capacity and VMs", async () => {
   expect(within(b).getAllByRole("cell")[archColumn]).toHaveTextContent("aarch64");
   // 옛 버전으로 등록한 노드는 아키텍처를 모른다.
   expect(within(a).getAllByRole("cell")[archColumn]).toHaveTextContent("—");
+});
+
+it("shows the state of each pool on the node", async () => {
+  cluster();
+  const pools = {
+    nas: poolState("nas", { ready: false, error: "mount.nfs: access denied by server" }),
+    local: poolState("local"),
+  };
+  mockLists({ node: [{ ...NODE, status: { ...NODE.status, pools } }, DOWN] });
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const poolsColumn = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Storage pools");
+  const a = (await within(table).findByText("node-a")).closest("tr")!;
+  // 이름 순으로 보인다.
+  expect(within(a).getAllByRole("cell")[poolsColumn]).toHaveTextContent(
+    "local: Readynas: Not readymount.nfs: access denied by server",
+  );
+  const b = within(table).getByText("node-b").closest("tr")!;
+  expect(within(b).getAllByRole("cell")[poolsColumn]).toHaveTextContent("—");
 });
 
 it("turns maintenance on and off with the revision it read", async () => {

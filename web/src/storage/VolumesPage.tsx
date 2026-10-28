@@ -28,6 +28,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatBytes } from "@/lib/format";
+import { poolUsableSomewhere } from "@/storage/pools";
 import { UploadDialog } from "@/storage/UploadDialog";
 import { volumeNameError } from "@/storage/volumes";
 import { trackTask } from "@/tasks/tasks";
@@ -219,6 +220,9 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
   const pools = useList("storage-pool");
   const volumes = useList("volume");
+  const nodes = useList("node");
+  // 서버는 풀을 쓸 수 있는 온라인 노드에 볼륨을 만든다. 그런 노드가 없는 풀은 고를 수 없다.
+  const usable = (pools.data ?? []).filter((p) => poolUsableSomewhere(p, nodes.data ?? []));
   const [name, setName] = useState("");
   const [pool, setPool] = useState("");
   const [sizeGib, setSizeGib] = useState("16");
@@ -279,7 +283,7 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
             {...a11y}
           >
             <NativeSelectOption value="">—</NativeSelectOption>
-            {(pools.data ?? []).map((p) => (
+            {usable.map((p) => (
               <NativeSelectOption key={p.id} value={p.name}>
                 {p.name}
               </NativeSelectOption>

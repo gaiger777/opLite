@@ -10,7 +10,7 @@ import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import { poolsOnNode } from "@/storage/UploadDialog";
+import { poolsUsableOn } from "@/storage/pools";
 import { trackTask } from "@/tasks/tasks";
 import { isBusy, isStopped } from "@/vms/actions";
 import { validName } from "@/vms/form";
@@ -59,6 +59,7 @@ export function VmCloneDialog({
   const snapshots = useList("snapshot");
   const pools = useList("storage-pool");
   const volumes = useList("volume");
+  const nodes = useList("node");
   // 만들어진 차례(UUIDv7)의 역순: 최근 스냅샷이 위에 온다.
   const ready = (snapshots.data ?? [])
     .filter((s) => s.spec.vm === vm.id && s.status.phase === "ready")
@@ -80,7 +81,8 @@ export function VmCloneDialog({
   });
   // 노드를 정할 때까지는(목록을 읽는 중) 풀을 보이지 않는다.
   const node = cloneNode(vm, volumes.data, cluster.data?.node);
-  const usable = poolsOnNode(pools.data ?? [], node);
+  // 복제 Task는 그 노드에서 돈다. 그 노드에서 준비된 풀만 고른다.
+  const usable = poolsUsableOn(pools.data ?? [], nodes.data ?? [], node);
   // 서버는 시작·정지 중인 VM을 복제하지 않는다(vm_busy).
   const busy = isBusy(vm);
   // 지금 상태는 꺼진 VM에서만 복사한다(vm_running). 대화상자를 연 사이 켜질 수 있다.
@@ -113,6 +115,11 @@ export function VmCloneDialog({
       // 일반 번역은 업로드의 "접속한 노드"를 말한다. 복제는 VM이 있는 노드에서 돈다.
       if (err instanceof ApiError && err.code === "pool_not_on_node") {
         setErrors({ pool: "clone.errors.poolNotOnNode" });
+        return false;
+      }
+      // 대화상자를 연 사이 그 노드에서 풀이 준비되지 않게 됐다.
+      if (err instanceof ApiError && err.code === "pool_unavailable") {
+        setErrors({ pool: "clone.errors.poolUnavailable" });
         return false;
       }
       throw err;

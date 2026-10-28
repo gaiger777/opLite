@@ -26,6 +26,7 @@
     "last_admin": "The last administrator cannot give up the administrator role.",
     "cannot_delete_self": "You cannot delete your own account.",
     "pool_in_use": "The pool still has volumes. Delete them first.",
+    "pool_unavailable": "{{message}}",
     "vm_busy": "Another operation on this VM (start, stop, snapshot, revert or clone) is in progress. Try again when it has finished.",
     "snapshot_unsupported": "Only VMs whose disks are all qcow2 can take snapshots.",
     "vm_has_snapshots": "The VM has snapshots. Delete them first.",
@@ -286,7 +287,8 @@
     "op": "Clone {{vm}} to {{name}}",
     "errors": {
       "exists": "A VM with this name already exists.",
-      "poolNotOnNode": "That storage pool is not available on the node holding the VM."
+      "poolNotOnNode": "That storage pool is not available on the node holding the VM.",
+      "poolUnavailable": "That storage pool is not ready on the node holding the VM."
     }
   },
   "forms": {
@@ -351,17 +353,42 @@
     "empty": "No storage pools.",
     "allNodes": "All nodes",
     "createTitle": "Create a storage pool",
-    "createDescription": "A directory on the nodes that holds volume files. Create the directory on each node first.",
+    "createDescription": "Where volume files are kept: a directory on each node, or an NFS export that the nodes mount.",
     "pathHint": "An absolute path on the nodes.",
     "nodesHint": "Leave all unchecked to use it on every node.",
     "created": "Created storage pool {{name}}.",
     "deleteTitle": "Delete storage pool {{name}}?",
-    "deleteDescription": "Only the pool is removed. Files in its directory stay on the nodes.",
+    "deleteDescription": "Only the pool is removed. Files in its directory or export are kept.",
     "deleted": "Deleted storage pool {{name}}.",
     "inUse": "Delete its volumes first.",
+    "kind": "Kind",
+    "kinds": {
+      "dir": "Directory",
+      "nfs": "NFS"
+    },
+    "location": "Location",
+    "kindHint": {
+      "dir": "Create the directory on each node first.",
+      "nfs": "Each node mounts the export under its data directory. Mounting needs Linux nodes running as root. The pool is shared by its nodes."
+    },
+    "server": "NFS server",
+    "serverHint": "Host name or IP address.",
+    "export": "Export path",
+    "exportHint": "The absolute path the server exports, such as /srv/vm.",
+    "options": "Mount options (optional)",
+    "optionsHint": "Comma-separated options passed to mount -o after nosuid,nodev,noexec, such as vers=4.2,hard.",
+    "state": {
+      "ready": "Ready",
+      "notReady": "Not ready",
+      "unknown": "No status reported yet",
+      "offline": "Offline"
+    },
     "errors": {
       "path": "Enter an absolute path (starting with /).",
-      "nodesGone": "The chosen nodes are no longer in the cluster. Choose again."
+      "export": "Enter an absolute path (starting with /) without control characters.",
+      "nodesGone": "The chosen nodes are no longer in the cluster. Choose again.",
+      "server": "Enter a host name or IP address without spaces, commas, slashes or brackets.",
+      "options": "Separate the options with commas, without spaces. bind, rbind, remount, move, suid, dev, exec, helper, bg and x-* options are not allowed."
     }
   },
   "networks": {
@@ -395,6 +422,7 @@
     "cpus": "CPUs",
     "memory": "Memory",
     "bridges": "Bridges",
+    "pools": "Storage pools",
     "vms": "VMs",
     "thisNode": "(this node)",
     "joinNote": "To add a node, issue a join token on the Cluster page and run oplctl cluster join on the new node.",
