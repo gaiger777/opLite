@@ -145,6 +145,7 @@ async fn two_nodes() -> (TempDir, Node, Node) {
             bridges: vec![],
             // 테스트 VM은 virt(aarch64) 머신이다.
             arch: Some(Arch::Aarch64),
+            pools: Default::default(),
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();

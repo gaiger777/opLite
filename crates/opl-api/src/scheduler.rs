@@ -116,6 +116,7 @@ mod tests {
             hypervisor: "mock".into(),
             bridges: vec![],
             arch: Some(Arch::Aarch64),
+            pools: Default::default(),
         };
         n
     }

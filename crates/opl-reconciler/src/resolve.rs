@@ -4,7 +4,7 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_driver::DirStorage;
 use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
 use opl_types::runtime::{NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
-use opl_types::storage::{StoragePoolSpec, VolumeSpec};
+use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumeSpec};
 use opl_types::vm::Vm;
 use uuid::Uuid;
 
@@ -35,7 +35,10 @@ pub fn runtime_spec(cluster: &Cluster, vm: &Vm, node: Uuid) -> Result<VmRuntimeS
         let pool = cluster
             .get_by_name::<StoragePoolSpec>(pool_name)?
             .ok_or_else(|| ResolveError::PoolNotFound(pool_name.clone()))?;
-        if !pool.spec.nodes.is_empty() && !pool.spec.nodes.contains(&node) {
+        // NFS 풀은 아직 마운트하지 않는다.
+        if (!pool.spec.nodes.is_empty() && !pool.spec.nodes.contains(&node))
+            || matches!(pool.spec.backend, PoolBackend::Nfs { .. })
+        {
             return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
         }
         disks.push(RuntimeDisk {

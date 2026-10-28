@@ -43,6 +43,7 @@ export const NODE: Node = {
     hypervisor: "qemu-kvm",
     bridges: [],
     arch: null,
+    pools: {},
   },
 };
 

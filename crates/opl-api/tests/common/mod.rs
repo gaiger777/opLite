@@ -120,6 +120,7 @@ impl Env {
             bridges: vec![],
             // 테스트 VM은 virt(aarch64) 머신이다.
             arch: Some(Arch::Aarch64),
+            pools: Default::default(),
         };
         cluster.create(&me).await.unwrap();
         let admin = Resource::new(

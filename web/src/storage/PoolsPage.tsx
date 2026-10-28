@@ -88,7 +88,11 @@ export function PoolsPage() {
             return (
               <TableRow key={pool.id}>
                 <TableCell className="font-medium">{pool.name}</TableCell>
-                <TableCell className="font-mono text-xs">{pool.spec.backend.path}</TableCell>
+                <TableCell className="font-mono text-xs">
+                  {pool.spec.backend.kind === "dir"
+                    ? pool.spec.backend.path
+                    : `${pool.spec.backend.server}:${pool.spec.backend.export}`}
+                </TableCell>
                 <TableCell>{nodeNames(pool)}</TableCell>
                 <TableCell>
                   {free !== null && total !== null

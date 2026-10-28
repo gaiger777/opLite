@@ -193,9 +193,12 @@ pub async fn create_pool(
 ) -> Result<(StatusCode, Json<StoragePool>), ApiError> {
     state.authorize(&principal, Action::Write, StoragePoolSpec::KIND)?;
     check_name(&req.name)?;
-    let PoolBackend::Dir { path } = &req.spec.backend;
-    if !path.is_absolute() {
-        return Err(ApiError::bad_request("pool path must be absolute"));
+    req.spec
+        .validate()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // NFS 풀 마운트와 배치는 아직 없다.
+    if matches!(req.spec.backend, PoolBackend::Nfs { .. }) {
+        return Err(ApiError::bad_request("nfs pools are not supported yet"));
     }
     for node in &req.spec.nodes {
         if state.cluster.get::<NodeSpec>(*node)?.is_none() {

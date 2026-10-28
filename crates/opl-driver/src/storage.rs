@@ -157,8 +157,12 @@ impl DirStorage {
     }
 
     pub fn volume_path(pool: &StoragePoolSpec, id: Uuid, format: ImageFormat) -> PathBuf {
-        let PoolBackend::Dir { path } = &pool.backend;
-        path.join(format!("{id}.{}", fmt_name(format)))
+        let root = match &pool.backend {
+            PoolBackend::Dir { path } => path.as_path(),
+            // 아직 지원하지 않는다. 드라이버는 pool_dir에서, reconciler는 디스크를 풀 때 거절한다.
+            PoolBackend::Nfs { .. } => Path::new(""),
+        };
+        root.join(format!("{id}.{}", fmt_name(format)))
     }
 
     async fn qemu_img(&self, args: &[&str]) -> Result<Vec<u8>, DriverError> {
@@ -301,9 +305,15 @@ fn require_absolute(p: &Path) -> Result<(), DriverError> {
 }
 
 fn pool_dir(pool: &StoragePoolSpec) -> Result<&Path, DriverError> {
-    let PoolBackend::Dir { path } = &pool.backend;
-    require_absolute(path)?;
-    Ok(path)
+    match &pool.backend {
+        PoolBackend::Dir { path } => {
+            require_absolute(path)?;
+            Ok(path)
+        }
+        PoolBackend::Nfs { .. } => Err(DriverError::InvalidSpec(
+            "nfs pools are not supported yet".into(),
+        )),
+    }
 }
 
 fn fmt_name(format: ImageFormat) -> &'static str {
@@ -698,6 +708,26 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_nfs_pools_for_now() {
+        // qemu-img를 부르기 전에 거절한다.
+        let storage = DirStorage::new("/nonexistent/qemu-img");
+        let p = StoragePoolSpec {
+            backend: PoolBackend::Nfs {
+                server: "nas".into(),
+                export: "/srv/vm".into(),
+                options: None,
+            },
+            nodes: vec![],
+            shared: true,
+        };
+        let err = storage
+            .create_volume(&p, Uuid::nil(), 1 << 20, ImageFormat::Qcow2)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
     }
 
     /// 실행 파일 셸 스크립트를 만든다. `"$last"`에 마지막 인자가 들어 있다.

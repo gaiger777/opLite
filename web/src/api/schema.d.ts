@@ -687,7 +687,7 @@ export interface components {
                 backend: components["schemas"]["PoolBackend"];
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
-                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. 라이브 마이그레이션에서 쓴다. */
+                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS 풀은 늘 공유다(`is_shared`). */
                 shared?: boolean;
             };
         };
@@ -889,6 +889,13 @@ export interface components {
                     memory_mib: number;
                     /** @default false */
                     online: boolean;
+                    /**
+                     * @description 이 노드가 쓸 수 있는 스토리지 풀(풀 이름 → 상태). 노드가 주기적으로 기록한다.
+                     * @default {}
+                     */
+                    pools: {
+                        [key: string]: components["schemas"]["PoolState"];
+                    };
                 };
             }[];
             /** Format: int64 */
@@ -967,7 +974,7 @@ export interface components {
                     backend: components["schemas"]["PoolBackend"];
                     /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                     nodes?: string[];
-                    /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. 라이브 마이그레이션에서 쓴다. */
+                    /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS 풀은 늘 공유다(`is_shared`). */
                     shared?: boolean;
                 };
                 status: {
@@ -1229,11 +1236,60 @@ export interface components {
             memory_mib: number;
             /** @default false */
             online: boolean;
+            /**
+             * @description 이 노드가 쓸 수 있는 스토리지 풀(풀 이름 → 상태). 노드가 주기적으로 기록한다.
+             * @default {}
+             */
+            pools: {
+                [key: string]: components["schemas"]["PoolState"];
+            };
         };
         PoolBackend: {
             /** @enum {string} */
             kind: "dir";
             path: string;
+        } | {
+            /** @description 서버의 내보내기 경로(절대 경로) */
+            export: string;
+            /** @enum {string} */
+            kind: "nfs";
+            /**
+             * @description `mount -o`에 넘길 쉼표 목록(예: `vers=4.2,hard`). 늘 붙는 `nosuid,nodev,noexec` 뒤에 붙고,
+             *     마운트의 성격을 바꾸는 옵션(`bind`, `remount`, `exec` 등)은 받지 않는다. 없으면 커널 기본값.
+             */
+            options?: string | null;
+            /** @description 호스트 이름 또는 IP. IPv6는 `[...]` 없이 적는다. */
+            server: string;
+        };
+        /** @description 한 노드에서 본 스토리지 풀 상태 */
+        PoolState: {
+            /**
+             * Format: int64
+             * @default 0
+             */
+            available_bytes: number;
+            /**
+             * @description 준비되지 않은 이유(예: 마운트 실패 메시지)
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Format: uuid
+             * @description 이 상태를 적을 때의 풀 id. 같은 이름으로 다시 만든 풀에 옛 상태를 쓰지 않게, 쓰는 쪽은 이 값이
+             *     풀 id와 같을 때만 믿는다. 이 필드 전의 상태는 nil이다.
+             * @default 00000000-0000-0000-0000-000000000000
+             */
+            pool_id: string;
+            /**
+             * @description 이 노드에서 풀에 볼륨을 만들고 VM 디스크로 쓸 수 있는지
+             * @default false
+             */
+            ready: boolean;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            total_bytes: number;
         };
         /** @enum {string} */
         PowerState: "running" | "stopped";
@@ -1320,6 +1376,13 @@ export interface components {
                 memory_mib: number;
                 /** @default false */
                 online: boolean;
+                /**
+                 * @description 이 노드가 쓸 수 있는 스토리지 풀(풀 이름 → 상태). 노드가 주기적으로 기록한다.
+                 * @default {}
+                 */
+                pools: {
+                    [key: string]: components["schemas"]["PoolState"];
+                };
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -1390,7 +1453,7 @@ export interface components {
                 backend: components["schemas"]["PoolBackend"];
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
-                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. 라이브 마이그레이션에서 쓴다. */
+                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS 풀은 늘 공유다(`is_shared`). */
                 shared?: boolean;
             };
             status: {
@@ -1611,7 +1674,7 @@ export interface components {
             backend: components["schemas"]["PoolBackend"];
             /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
             nodes?: string[];
-            /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. 라이브 마이그레이션에서 쓴다. */
+            /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS 풀은 늘 공유다(`is_shared`). */
             shared?: boolean;
         };
         StoragePoolStatus: {

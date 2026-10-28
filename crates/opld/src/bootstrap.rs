@@ -109,6 +109,8 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
         hypervisor: host.hypervisor_name(),
         bridges: host.bridges().await.unwrap_or(recorded),
         arch: Some(host.profile.arch),
+        // 풀 상태는 풀 새로 고침이 채운다.
+        pools: Default::default(),
     };
     cluster.update_status::<NodeSpec>(id, &status).await?;
     Ok(())
