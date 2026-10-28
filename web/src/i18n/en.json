@@ -109,6 +109,12 @@
       "vm-clone": "Clone {{target}}"
     }
   },
+  "pager": {
+    "label": "Pages",
+    "previous": "Previous",
+    "next": "Next",
+    "range": "{{from}}–{{to}} of {{total}}"
+  },
   "common": {
     "loading": "Loading…",
     "copied": "Copied.",

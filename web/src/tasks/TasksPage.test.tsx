@@ -59,3 +59,31 @@ it("names deleted targets by the end of their id and says when no task failed", 
   await userEvent.click(screen.getByLabelText("Failed only"));
   expect(screen.getByText("No failed tasks.")).toBeInTheDocument();
 });
+
+function many(n: number, state: "failed" | "succeeded" = "succeeded") {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `019a0f3c-8a10-7000-8000-${String(i).padStart(12, "0")}`,
+    spec: { op: { kind: "vm-start" as const }, target: VM, node: "n1" },
+    status: { state, error: state === "failed" ? "boom" : null },
+  }));
+}
+
+it("shows tasks fifty at a time", async () => {
+  mockLists({ vm: [{ id: VM, name: "web" }], task: many(51) });
+  renderPage(<TasksPage />);
+  expect(await screen.findByText("1–50 of 51")).toBeInTheDocument();
+  // 머리 줄 + 50줄
+  expect(screen.getAllByRole("row")).toHaveLength(51);
+  await userEvent.click(screen.getByRole("button", { name: "Next" }));
+  expect(screen.getByText("51–51 of 51")).toBeInTheDocument();
+  expect(screen.getAllByRole("row")).toHaveLength(2);
+});
+
+it("goes back to the first page when the filter changes", async () => {
+  mockLists({ vm: [{ id: VM, name: "web" }], task: many(120, "failed") });
+  renderPage(<TasksPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+  expect(screen.getByText("51–100 of 120")).toBeInTheDocument();
+  await userEvent.click(screen.getByLabelText("Failed only"));
+  expect(screen.getByText("1–50 of 120")).toBeInTheDocument();
+});

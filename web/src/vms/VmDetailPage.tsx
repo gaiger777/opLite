@@ -8,6 +8,7 @@ import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ListPending } from "@/components/ListPending";
+import { Pager, usePage } from "@/components/Pager";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,7 +21,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
-import { newestFirst, TaskTable } from "@/tasks/TasksPage";
+import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
 import { ACTIONS, availability, useVmActions, type VmAction } from "@/vms/actions";
 import { VmConsole } from "@/vms/lazyConsole";
 import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
@@ -103,7 +104,7 @@ export function VmDetailPage() {
           <VmSnapshots vm={vm} />
         </TabsContent>
         <TabsContent value="tasks">
-          <VmTasks vm={vm} />
+          <VmTasks key={vm.id} vm={vm} />
         </TabsContent>
         <TabsContent value="json">
           <pre className="overflow-x-auto rounded-md bg-muted p-4 text-xs">
@@ -312,12 +313,14 @@ function VmTasks({ vm }: { vm: Vm }) {
     () => newestFirst((tasks.data ?? []).filter((task) => task.spec.target === vm.id)),
     [tasks.data, vm.id],
   );
+  const pager = usePage(mine, TASK_PAGE_SIZE);
   return (
-    <section>
+    <section className="flex flex-col gap-4">
       <h2 id="vm-tasks" className="sr-only">
         {t("vms.tab.tasks")}
       </h2>
-      <TaskTable tasks={mine.slice(0, 50)} labelledBy="vm-tasks" />
+      <TaskTable tasks={pager.pageItems} labelledBy="vm-tasks" />
+      <Pager {...pager} pageSize={TASK_PAGE_SIZE} total={mine.length} />
     </section>
   );
 }

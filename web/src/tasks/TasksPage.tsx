@@ -6,6 +6,7 @@ import { useList } from "@/api/live";
 import type { Task } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Pager, usePage } from "@/components/Pager";
 import { Label } from "@/components/ui/label";
 import {
   Table,
@@ -18,8 +19,8 @@ import {
 import { formatTime, uuidTime } from "@/lib/format";
 import { describeTask } from "@/tasks/tasks";
 
-/** API에 페이지 나누기가 없어 모두 받아 최근 것만 보여 준다. */
-const SHOWN = 200;
+/** 한 페이지에 보일 Task 수. API에 페이지 나누기가 없어 모두 받아 화면에서 나눈다. */
+export const TASK_PAGE_SIZE = 50;
 
 const STATE_VARIANT = {
   pending: "outline",
@@ -138,11 +139,10 @@ export function TasksPage() {
   const [failedOnly, setFailedOnly] = useState(false);
   const shown = useMemo(
     () =>
-      newestFirst(tasks.data ?? [])
-        .filter((task) => !failedOnly || task.status.state === "failed")
-        .slice(0, SHOWN),
+      newestFirst(tasks.data ?? []).filter((task) => !failedOnly || task.status.state === "failed"),
     [tasks.data, failedOnly],
   );
+  const pager = usePage(shown, TASK_PAGE_SIZE);
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between gap-4">
@@ -153,16 +153,20 @@ export function TasksPage() {
           <Checkbox
             id="failed-only"
             checked={failedOnly}
-            onCheckedChange={(v) => setFailedOnly(v === true)}
+            onCheckedChange={(v) => {
+              setFailedOnly(v === true);
+              pager.setPage(0);
+            }}
           />
           <Label htmlFor="failed-only">{t("tasks.failedOnly")}</Label>
         </div>
       </div>
       <TaskTable
-        tasks={shown}
+        tasks={pager.pageItems}
         labelledBy="tasks-title"
         empty={failedOnly ? t("tasks.emptyFailed") : undefined}
       />
+      <Pager {...pager} pageSize={TASK_PAGE_SIZE} total={shown.length} />
     </div>
   );
 }

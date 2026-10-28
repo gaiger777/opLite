@@ -109,6 +109,12 @@
       "vm-clone": "{{target}} 복제"
     }
   },
+  "pager": {
+    "label": "페이지",
+    "previous": "이전",
+    "next": "다음",
+    "range": "{{from}}–{{to}} / {{total}}"
+  },
   "common": {
     "loading": "불러오는 중…",
     "copied": "복사했습니다.",
