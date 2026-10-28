@@ -162,6 +162,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const [name, setName] = useState("");
   const [kind, setKind] = useState<"dir" | "nfs">("dir");
   const [path, setPath] = useState("");
+  const [shared, setShared] = useState(false);
   const [nfsServer, setNfsServer] = useState("");
   const [nfsExport, setNfsExport] = useState("");
   const [nfsOptions, setNfsOptions] = useState("");
@@ -203,6 +204,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       return false;
     }
     // NFS 풀의 `shared`는 보내지 않는다(서버가 늘 공유로 둔다). 빈 옵션은 커널 기본값이다.
+    const sharedDir = kind === "dir" && shared;
     const backend =
       kind === "dir"
         ? { kind, path }
@@ -212,7 +214,8 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             export: nfsExport,
             ...(nfsOptions !== "" && { options: nfsOptions }),
           };
-    await call(api.POST("/storage-pools", { body: { name, spec: { backend, nodes: known } } }));
+    const spec = { backend, nodes: known, ...(sharedDir && { shared: true }) };
+    await call(api.POST("/storage-pools", { body: { name, spec } }));
     toast.success(t("pools.created", { name }));
   }
 
@@ -244,22 +247,39 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
         )}
       </Field>
       {kind === "dir" ? (
-        <Field
-          id="pool-path"
-          label={t("pools.path")}
-          error={errors.path}
-          hint={t("pools.pathHint")}
-        >
-          {(a11y) => (
-            <Input
-              id="pool-path"
-              placeholder="/var/lib/opl/pool"
-              value={path}
-              onChange={(e) => setPath(e.target.value)}
-              {...a11y}
-            />
-          )}
-        </Field>
+        <>
+          <Field
+            id="pool-path"
+            label={t("pools.path")}
+            error={errors.path}
+            hint={t("pools.pathHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="pool-path"
+                placeholder="/var/lib/opl/pool"
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          {/* 밖에서 마운트한 공유 디렉터리. 공유가 아닌 풀의 VM은 볼륨이 있는 노드에서만 돈다. */}
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="pool-shared"
+                checked={shared}
+                onCheckedChange={(v) => setShared(v === true)}
+                aria-describedby="pool-shared-hint"
+              />
+              <Label htmlFor="pool-shared">{t("pools.shared")}</Label>
+            </div>
+            <p id="pool-shared-hint" className="text-xs text-muted-foreground">
+              {t("pools.sharedHint")}
+            </p>
+          </div>
+        </>
       ) : (
         <>
           <Field

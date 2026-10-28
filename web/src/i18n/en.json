@@ -355,6 +355,8 @@
     "createTitle": "Create a storage pool",
     "createDescription": "Where volume files are kept: a directory on each node, or an NFS export that the nodes mount.",
     "pathHint": "An absolute path on the nodes.",
+    "shared": "Shared storage",
+    "sharedHint": "Check when every node sees the same files at this path, such as an NFS share mounted outside opLite.",
     "nodesHint": "Leave all unchecked to use it on every node.",
     "created": "Created storage pool {{name}}.",
     "deleteTitle": "Delete storage pool {{name}}?",
@@ -376,7 +378,7 @@
     "export": "Export path",
     "exportHint": "The absolute path the server exports, such as /srv/vm.",
     "options": "Mount options (optional)",
-    "optionsHint": "Comma-separated options passed to mount -o after nosuid,nodev,noexec, such as vers=4.2,hard.",
+    "optionsHint": "Comma-separated options passed to mount -o after nosuid,nodev,noexec,retry=0, such as vers=4.2,hard.",
     "state": {
       "ready": "Ready",
       "notReady": "Not ready",

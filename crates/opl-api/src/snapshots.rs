@@ -11,7 +11,7 @@ use opl_types::network::{NetworkSpec, USER_NETWORK};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
-use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
+use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec, is_shared};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use serde::Deserialize;
@@ -24,7 +24,7 @@ use crate::resources::{List, check_name, lookup};
 use crate::state::AppState;
 use crate::tasks::create_task;
 use crate::vms::{is_stopped, prepare};
-use crate::volumes::check_pool_on;
+use crate::volumes::{check_pool_on, usable_node};
 
 /// 설명의 최대 글자 수
 const MAX_DESCRIPTION_CHARS: usize = 1024;
@@ -54,18 +54,25 @@ pub struct CloneRequest {
 
 /// VM의 디스크 작업을 할 노드: 다음에 돌 노드(`spec.node`), 지금(또는 마지막으로) 돈 노드
 /// (`status.node`), 배치된 적이 없으면 첫 디스크 볼륨을 만든 노드. 꺼진 VM을 다른 노드로 옮겼으면
-/// 그 디스크는 옮긴 노드에서 쓰인다. 셋 다 없으면 `None`.
-pub(crate) fn vm_placement(cluster: &Cluster, vm: &Vm) -> Option<Uuid> {
+/// 그 디스크는 옮긴 노드에서 쓰인다. 첫 디스크가 공유 풀에 있으면 볼륨을 만든 노드 대신 풀을 쓸 수
+/// 있는 온라인 노드(`prefer`가 그런 노드면 그 노드, 아니면 id가 가장 작은 노드)다. 정할 수 없으면 `None`.
+pub(crate) fn vm_placement(cluster: &Cluster, prefer: Option<Uuid>, vm: &Vm) -> Option<Uuid> {
     vm.spec.node.or(vm.status.node).or_else(|| {
         let disk = vm.spec.disks.first()?;
         let volume = cluster.get_by_name::<VolumeSpec>(&disk.volume).ok()??;
-        volume.status.node
+        match cluster
+            .get_by_name::<StoragePoolSpec>(&volume.spec.pool)
+            .ok()?
+        {
+            Some(pool) if is_shared(&pool) => usable_node(cluster, &pool, prefer).ok()?,
+            _ => volume.status.node,
+        }
     })
 }
 
 /// 스냅샷 Task를 실행할 노드: [`vm_placement`], 없으면 요청을 받은 이 노드(설계 §3).
 pub(crate) fn vm_node(state: &AppState, vm: &Vm) -> Uuid {
-    vm_placement(&state.cluster, vm).unwrap_or(state.node)
+    vm_placement(&state.cluster, Some(state.node), vm).unwrap_or(state.node)
 }
 
 /// 시작·정지 중인 VM은 스냅샷 작업을 받지 않는다: phase가 Starting·Stopping이거나, 원하는 전원

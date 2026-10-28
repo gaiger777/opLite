@@ -1254,8 +1254,9 @@ export interface components {
             /** @enum {string} */
             kind: "nfs";
             /**
-             * @description `mount -o`에 넘길 쉼표 목록(예: `vers=4.2,hard`). 늘 붙는 `nosuid,nodev,noexec` 뒤에 붙고,
-             *     마운트의 성격을 바꾸는 옵션(`bind`, `remount`, `exec` 등)은 받지 않는다. 없으면 커널 기본값.
+             * @description `mount -o`에 넘길 쉼표 목록(예: `vers=4.2,hard`). 늘 붙는 `nosuid,nodev,noexec,retry=0` 뒤에
+             *     붙고, 마운트의 성격을 바꾸는 옵션(`bind`, `remount`, `exec` 등)은 받지 않는다. 없으면 커널
+             *     기본값.
              */
             options?: string | null;
             /** @description 호스트 이름 또는 IP. IPv6는 `[...]` 없이 적는다. */

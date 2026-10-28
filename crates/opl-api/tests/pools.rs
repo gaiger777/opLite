@@ -210,4 +210,16 @@ async fn volume_tasks_go_to_a_node_where_the_pool_is_ready() {
     let (status, task) = admin.delete("/volumes/c").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     assert_eq!(task_node(&task), other.to_string());
+
+    // 파일이 있던 노드가 클러스터에서 빠졌으면 이 노드다(리소스만 지운다).
+    let mut v = env.cluster.get_by_name::<VolumeSpec>("b").unwrap().unwrap();
+    v.status.phase = VolumePhase::Ready;
+    v.status.node = Some(Uuid::new_v4());
+    env.cluster
+        .update_status::<VolumeSpec>(v.id, &v.status)
+        .await
+        .unwrap();
+    let (status, task) = admin.delete("/volumes/b").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task_node(&task), env.node.to_string());
 }

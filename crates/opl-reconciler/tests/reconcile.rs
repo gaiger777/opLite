@@ -425,6 +425,73 @@ async fn unresolvable_volume_marks_failed() {
     assert_eq!(env.pid(vm.id).await, None);
 }
 
+/// NFS를 지원하지 않는 노드(macOS)에 놓인 NFS 풀 디스크의 VM은 기다려도 시작할 수 없으므로
+/// 다시 시도하지 않고 끄고 이유를 남긴다(노드는 풀을 준비되지 않았다고 알린다).
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn nfs_disk_on_a_node_without_nfs_powers_off() {
+    let env = Env::start().await;
+    let pool: StoragePool = Resource::new(
+        "nas",
+        StoragePoolSpec {
+            backend: PoolBackend::Nfs {
+                server: "nas".into(),
+                export: "/srv/vm".into(),
+                options: None,
+            },
+            nodes: vec![],
+            shared: true,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    let volume: Volume = Resource::new(
+        "root",
+        VolumeSpec {
+            pool: "nas".into(),
+            size_bytes: 1 << 30,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    let mut me: Node = Resource::new(
+        "n1",
+        NodeSpec {
+            address: "a".into(),
+            maintenance: false,
+        },
+    );
+    me.id = env.node;
+    let unsupported = PoolState {
+        pool_id: pool.id,
+        ready: false,
+        error: Some("nfs pools are not supported on macOS".into()),
+        ..Default::default()
+    };
+    me.status.pools.insert("nas".into(), unsupported);
+    env.cluster.create(&me).await.unwrap();
+    let mut vm = vm("web", env.node);
+    vm.spec.disks.push(DiskSpec {
+        volume: "root".into(),
+        bus: DiskBus::VirtioBlk,
+        boot_order: Some(1),
+    });
+    env.create(&vm).await;
+
+    let got = env
+        .wait(vm.id, "failed", |v| v.status.phase == VmPhase::Failed)
+        .await;
+    assert_eq!(got.spec.power, PowerState::Stopped);
+    assert!(
+        got.status
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("not supported")),
+        "{:?}",
+        got.status.last_error
+    );
+    assert_eq!(env.pid(vm.id).await, None);
+}
+
 /// 풀이 이 노드에서 준비되지 않았으면(NFS 서버가 멈춤 등) 시작을 미루고 다시 시도한다. 실패로 세지
 /// 않으므로 오래 걸려도 포기하고 끄지 않는다.
 #[tokio::test]

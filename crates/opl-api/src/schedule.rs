@@ -296,7 +296,7 @@ async fn tick(
 
 /// Task를 실행할 노드가 오프라인이면 요청하지 않는다(Task가 그 노드가 돌아올 때까지 남는다).
 fn check_node(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
-    let Some(node) = vm_placement(&state.cluster, vm) else {
+    let Some(node) = vm_placement(&state.cluster, Some(state.node), vm) else {
         return Ok(());
     };
     match state.cluster.get::<NodeSpec>(node)? {

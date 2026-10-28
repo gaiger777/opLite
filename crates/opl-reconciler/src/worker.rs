@@ -352,7 +352,8 @@ impl Worker {
                 ));
                 return Ok(false);
             }
-            // 참조가 틀렸다. spec을 고쳐야 하므로 다시 시도하지 않는다.
+            // 참조가 틀렸거나 이 노드가 지원하지 않는 풀(NFS on macOS)이다. spec을 고치거나 VM을
+            // 옮겨야 하므로 다시 시도하지 않는다.
             Err(e) => {
                 self.restores.lock().unwrap().remove(&self.id);
                 self.power_off = Some(Some(e.to_string()));

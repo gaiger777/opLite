@@ -213,7 +213,7 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<
     retry.abort();
 }
 
-/// 풀이 마운트되지 않아 지우지 못한 고아 볼륨을 `orphan_retry`마다 다시 지워 본다. 지웠거나 볼륨이
+/// 풀이 마운트되지 않았거나 응답하지 않아 지우지 못한 고아 볼륨을 `orphan_retry`마다 다시 지워 본다. 지웠거나 볼륨이
 /// 없어졌으면 목록에서 뺀다. 마운트 말고 다른 이유로 실패하면 시작할 때처럼 기록만 하고 뺀다.
 async fn retry_orphans(ctx: Arc<Ctx>, mut volumes: Vec<Uuid>) {
     while !volumes.is_empty() {
@@ -222,7 +222,9 @@ async fn retry_orphans(ctx: Arc<Ctx>, mut volumes: Vec<Uuid>) {
         for id in volumes {
             match remove_volume(&ctx, id).await {
                 Ok(()) => tracing::info!(volume = %id, "removed a volume left unfinished"),
-                Err(RemoveError::Storage(DriverError::PoolNotMounted(_))) => left.push(id),
+                Err(RemoveError::Storage(
+                    DriverError::PoolNotMounted(_) | DriverError::PoolNotResponding(_),
+                )) => left.push(id),
                 Err(e) => tracing::warn!(volume = %id, error = %e, "cannot remove volume"),
             }
         }
@@ -803,7 +805,11 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
                     tracing::warn!(volume = %volume.name, "removing a volume left unfinished");
                     match remove_volume(ctx, volume.id).await {
                         Ok(()) => {}
-                        Err(e @ RemoveError::Storage(DriverError::PoolNotMounted(_))) => {
+                        Err(
+                            e @ RemoveError::Storage(
+                                DriverError::PoolNotMounted(_) | DriverError::PoolNotResponding(_),
+                            ),
+                        ) => {
                             tracing::info!(volume = %volume.name, error = %e, "will remove the volume when its pool is mounted");
                             unmounted.push(volume.id);
                         }
@@ -827,15 +833,16 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
                     continue;
                 }
                 // 만들던 노드: 끝난 Task가 있으면 그 노드, 없으면(Task를 만들기 전에 API가 죽었다)
-                // API가 Task를 배정했을 노드(`vm_placement`). 그것도 없으면 디스크가 없는 VM이라
-                // 태그가 없으니 어느 노드가 지워도 된다.
+                // API가 Task를 배정했을 노드(`vm_placement`, 공유 풀이면 노드마다 같은 답이 나오게
+                // 이 노드를 앞세우지 않는다). 그것도 없으면 디스크가 없는 VM이라 태그가 없으니 어느
+                // 노드가 지워도 된다.
                 let vm = ctx.cluster.get::<VmSpec>(s.spec.vm).ok().flatten();
                 let owner = tasks
                     .iter()
                     .filter(creates)
                     .map(|t| t.spec.node)
                     .next_back()
-                    .or_else(|| vm.and_then(|vm| vm_placement(&ctx.cluster, &vm)));
+                    .or_else(|| vm.and_then(|vm| vm_placement(&ctx.cluster, None, &vm)));
                 if owner.is_some_and(|n| n != ctx.config.node) {
                     continue;
                 }

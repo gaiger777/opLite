@@ -8,6 +8,7 @@ use axum::extract::{Path, State};
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::StreamExt;
+use opl_cluster::{Cluster, ClusterError};
 use opl_types::node::NodeSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::runtime::ImageFormat;
@@ -46,16 +47,7 @@ use crate::tasks::create_task;
 /// 볼륨 파일 작업을 실행할 노드. 이 노드에서 풀을 쓸 수 있으면 이 노드, 아니면 풀을 쓸 수 있는
 /// 온라인 노드 가운데 id가 가장 작은 노드다. 그런 노드가 없으면 409 `pool_unavailable`.
 fn pool_node(state: &AppState, pool: &StoragePool) -> Result<Uuid, ApiError> {
-    let (_, nodes) = state.cluster.list::<NodeSpec>()?;
-    let usable: Vec<Uuid> = nodes
-        .iter()
-        .filter(|n| n.status.online && pool_usable_on(pool, n))
-        .map(|n| n.id)
-        .collect();
-    if usable.contains(&state.node) {
-        return Ok(state.node);
-    }
-    usable.into_iter().min().ok_or_else(|| {
+    usable_node(&state.cluster, pool, Some(state.node))?.ok_or_else(|| {
         ApiError::conflict(
             "pool_unavailable",
             format!("storage pool {:?} is not ready on any node", pool.name),
@@ -63,15 +55,40 @@ fn pool_node(state: &AppState, pool: &StoragePool) -> Result<Uuid, ApiError> {
     })
 }
 
+/// 풀을 쓸 수 있는 온라인 노드: `prefer`가 그런 노드면 그 노드, 아니면 id가 가장 작은 노드.
+pub(crate) fn usable_node(
+    cluster: &Cluster,
+    pool: &StoragePool,
+    prefer: Option<Uuid>,
+) -> Result<Option<Uuid>, ClusterError> {
+    let (_, nodes) = cluster.list::<NodeSpec>()?;
+    let usable: Vec<Uuid> = nodes
+        .iter()
+        .filter(|n| n.status.online && pool_usable_on(pool, n))
+        .map(|n| n.id)
+        .collect();
+    if let Some(node) = prefer.filter(|n| usable.contains(n)) {
+        return Ok(Some(node));
+    }
+    Ok(usable.into_iter().min())
+}
+
 /// 볼륨 파일 작업을 실행할 노드. 공유가 아닌 풀은 파일이 있는 노드(볼륨을 만든 노드)이고, 공유
-/// 풀은 [`pool_node`]의 규칙이다. 풀이 없어졌으면 이 노드다.
+/// 풀은 [`pool_node`]의 규칙이다. 풀이 없어졌거나 파일이 있던 노드가 클러스터에서 빠졌으면 이
+/// 노드다(파일이 없으니 리소스만 지운다).
 fn volume_node(state: &AppState, volume: &Volume) -> Result<Uuid, ApiError> {
     match state
         .cluster
         .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
     {
         Some(pool) => match volume.status.node {
-            Some(node) if !is_shared(&pool) => Ok(node),
+            Some(node) if !is_shared(&pool) => {
+                if state.cluster.get::<NodeSpec>(node)?.is_some() {
+                    Ok(node)
+                } else {
+                    Ok(state.node)
+                }
+            }
             _ => pool_node(state, &pool),
         },
         None => Ok(state.node),
@@ -437,7 +454,7 @@ pub async fn resize_volume(
     let user = vms
         .iter()
         .find(|vm| vm.spec.disks.iter().any(|d| d.volume == volume.name));
-    let node = match user.and_then(|vm| vm_placement(&state.cluster, vm)) {
+    let node = match user.and_then(|vm| vm_placement(&state.cluster, Some(state.node), vm)) {
         Some(node) => node,
         None => volume_node(&state, &volume)?,
     };

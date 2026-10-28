@@ -4,6 +4,7 @@
 mod common;
 
 use common::{Client, Env, vm_request};
+use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
@@ -570,7 +571,15 @@ async fn resize_only_grows_and_runs_where_the_volume_is_used() {
     let viewer = env.user("viewer", "viewer").await;
     let operator = env.user("operator", "operator").await;
     // 풀은 다른 노드에만 있고 볼륨 파일은 그 노드에 있다(파일 작업은 그 노드에서 한다).
-    let pool_node = Uuid::now_v7();
+    let node: Node = Resource::new(
+        "n2",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+        },
+    );
+    env.cluster.create(&node).await.unwrap();
+    let pool_node = node.id;
     pool(&env, vec![pool_node]).await;
     let id = volume(&env, "data", ImageFormat::Raw).await;
     let mut data = env.cluster.get::<VolumeSpec>(id).unwrap().unwrap();
@@ -686,4 +695,24 @@ async fn tasks_run_where_the_vm_disks_will_be_used() {
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     assert_eq!(task["spec"]["node"], a.to_string());
+
+    // 공유 풀이면 볼륨을 만든 노드가 아니라 풀을 쓸 수 있는 노드(이 노드)에서 한다.
+    let pool = env
+        .cluster
+        .get_by_name::<StoragePoolSpec>("local")
+        .unwrap()
+        .unwrap();
+    let spec = StoragePoolSpec {
+        shared: true,
+        ..pool.spec.clone()
+    };
+    env.cluster
+        .update_spec(pool.id, Some(pool.revision), pool.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let (status, task) = admin
+        .post("/vms/new/snapshots", json!({ "name": "s2" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], env.node.to_string());
 }

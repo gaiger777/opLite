@@ -14,6 +14,10 @@ use crate::mounts::{MOUNTINFO, nfs_mount_points};
 /// 올린 이미지를 검사하는 `qemu-img info`가 멈추면(이상한 extent 등) 무한정 기다리지 않는다.
 const INFO_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 풀 경로의 파일시스템 호출(있는지 보기·링크·지우기·용량)을 기다리는 시간. hard 마운트한 NFS의
+/// 서버가 멈추면 끝나지 않으므로 blocking 스레드에서 돌리고 이 시간이 지나면 `PoolNotResponding`이다.
+const FS_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VolumeInfo {
     pub virtual_bytes: u64,
@@ -261,22 +265,37 @@ impl DirStorage {
         Ok(out.stdout)
     }
 
+    /// 풀 안의 파일시스템 호출. [`on_pool`]에 풀 루트를 넘긴다.
+    async fn on_pool<T: Send + 'static>(
+        &self,
+        pool: &StoragePool,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, DriverError> {
+        on_pool(FS_TIMEOUT, &pool_root(pool, &self.mount_root), f).await
+    }
+
+    /// 풀 안의 `path`가 있는지
+    async fn exists(&self, pool: &StoragePool, path: &Path) -> Result<bool, DriverError> {
+        let path = path.to_path_buf();
+        self.on_pool(pool, move || path.exists()).await
+    }
+
     /// 있는 볼륨의 경로. 없으면 `VolumeNotFound`.
-    fn existing_path(
+    async fn existing_path(
         &self,
         pool: &StoragePool,
         id: Uuid,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
         let path = self.file_path(pool, id, format)?;
-        if !path.exists() {
+        if !self.exists(pool, &path).await? {
             return Err(self.not_found(pool, id));
         }
         Ok(path)
     }
 
     /// 스냅샷을 다룰 볼륨의 경로. 형식이 스냅샷을 지원해야 한다.
-    fn snapshot_path(
+    async fn snapshot_path(
         &self,
         pool: &StoragePool,
         id: Uuid,
@@ -288,7 +307,7 @@ impl DirStorage {
                 fmt_name(format)
             )));
         }
-        self.existing_path(pool, id, format)
+        self.existing_path(pool, id, format).await
     }
 
     /// `qemu-img info`의 JSON 출력.
@@ -337,6 +356,7 @@ impl DirStorage {
     /// 출력 경로는 `before`와 `after` 인자 사이에 들어간다.
     async fn write_new(
         &self,
+        pool: &StoragePool,
         id: Uuid,
         path: &Path,
         before: &[&str],
@@ -353,8 +373,17 @@ impl DirStorage {
         let mut args = before.to_vec();
         args.push(path_str(&tmp.0)?);
         args.extend_from_slice(after);
-        self.qemu_img(&args).await?;
-        match std::fs::hard_link(&tmp.0, path) {
+        let linked = match self.qemu_img(&args).await {
+            Ok(_) => {
+                let (from, to) = (tmp.0.clone(), path.to_path_buf());
+                self.on_pool(pool, move || std::fs::hard_link(from, to))
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        // 임시 파일은 결과와 상관없이 기다려서 지운다(이 future가 버려지면 drop이 지운다).
+        tmp.remove(self, pool).await;
+        match linked? {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(DriverError::VolumeExists(id))
             }
@@ -363,12 +392,48 @@ impl DirStorage {
     }
 }
 
+/// `f`를 blocking 스레드에서 돌린다. 멈춘 NFS에서 끝나지 않는 호출이 tokio 워커를 붙잡지 않게
+/// 하고, `timeout`이 지나면 기다리지 않고 `PoolNotResponding(root)`(일시 오류)를 돌려준다.
+/// 끝나지 않은 호출은 blocking 스레드에 남는다.
+async fn on_pool<T: Send + 'static>(
+    timeout: Duration,
+    root: &Path,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, DriverError> {
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
+        Ok(joined) => joined.map_err(|e| DriverError::Io(std::io::Error::other(e))),
+        Err(_) => Err(DriverError::PoolNotResponding(root.to_path_buf())),
+    }
+}
+
 /// drop되면 파일을 지운다. 실패하거나 취소돼도 임시 파일이 남지 않게 한다.
 struct TempFile(PathBuf);
 
+impl TempFile {
+    /// 기다려서 지운다. 결과는 보지 않는다.
+    async fn remove(mut self, storage: &DirStorage, pool: &StoragePool) {
+        let path = std::mem::take(&mut self.0);
+        let _ = storage
+            .on_pool(pool, move || std::fs::remove_file(path))
+            .await;
+    }
+}
+
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // `remove`로 이미 지웠다.
+        if self.0.as_os_str().is_empty() {
+            return;
+        }
+        // 취소된 경우. 멈춘 NFS에서 워커를 붙잡지 않게 blocking 스레드에서 지운다.
+        let path = std::mem::take(&mut self.0);
+        let remove = move || {
+            let _ = std::fs::remove_file(path);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => drop(rt.spawn_blocking(remove)),
+            Err(_) => remove(),
+        }
     }
 }
 
@@ -483,11 +548,12 @@ impl Storage for DirStorage {
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
         let path = self.file_path(pool, id, format)?;
-        if path.exists() {
+        if self.exists(pool, &path).await? {
             return Err(DriverError::VolumeExists(id));
         }
         let size = size_bytes.to_string();
         self.write_new(
+            pool,
             id,
             &path,
             &["create", "-q", "-f", fmt_name(format)],
@@ -507,7 +573,7 @@ impl Storage for DirStorage {
     ) -> Result<PathBuf, DriverError> {
         let path = self.file_path(pool, id, format)?;
         require_absolute(src)?;
-        if path.exists() {
+        if self.exists(pool, &path).await? {
             return Err(DriverError::VolumeExists(id));
         }
         let before = [
@@ -519,7 +585,7 @@ impl Storage for DirStorage {
             fmt_name(format),
             path_str(src)?,
         ];
-        self.write_new(id, &path, &before, &[]).await?;
+        self.write_new(pool, id, &path, &before, &[]).await?;
         Ok(path)
     }
 
@@ -557,7 +623,11 @@ impl Storage for DirStorage {
         id: Uuid,
         format: ImageFormat,
     ) -> Result<(), DriverError> {
-        match std::fs::remove_file(self.file_path(pool, id, format)?) {
+        let path = self.file_path(pool, id, format)?;
+        match self
+            .on_pool(pool, move || std::fs::remove_file(path))
+            .await?
+        {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(self.not_found(pool, id)),
             other => Ok(other?),
         }
@@ -569,7 +639,7 @@ impl Storage for DirStorage {
         id: Uuid,
         format: ImageFormat,
     ) -> Result<VolumeInfo, DriverError> {
-        let path = self.existing_path(pool, id, format)?;
+        let path = self.existing_path(pool, id, format).await?;
         let json = self.info_json(&path, format).await?;
         let field = |k: &str| {
             json.get(k)
@@ -587,10 +657,13 @@ impl Storage for DirStorage {
 
     async fn capacity(&self, pool: &StoragePool) -> Result<Capacity, DriverError> {
         let path = self.pool_dir(pool)?;
-        Ok(Capacity {
-            total_bytes: fs4::total_space(&path)?,
-            available_bytes: fs4::available_space(&path)?,
-        })
+        let space = move || -> std::io::Result<Capacity> {
+            Ok(Capacity {
+                total_bytes: fs4::total_space(&path)?,
+                available_bytes: fs4::available_space(&path)?,
+            })
+        };
+        Ok(self.on_pool(pool, space).await??)
     }
 
     /// 내부 스냅샷은 qcow2만 담을 수 있다.
@@ -605,7 +678,7 @@ impl Storage for DirStorage {
         format: ImageFormat,
         tag: &str,
     ) -> Result<(), DriverError> {
-        let path = self.snapshot_path(pool, id, format)?;
+        let path = self.snapshot_path(pool, id, format).await?;
         // qemu-img는 이름이 겹치는 스냅샷도 만든다.
         if self.tags_at(&path, format).await?.iter().any(|t| t == tag) {
             return Err(DriverError::InvalidSpec(format!(
@@ -625,7 +698,7 @@ impl Storage for DirStorage {
         format: ImageFormat,
         tag: &str,
     ) -> Result<(), DriverError> {
-        let path = self.snapshot_path(pool, id, format)?;
+        let path = self.snapshot_path(pool, id, format).await?;
         let opts = image_opts(&path, format)?;
         self.qemu_img(&["snapshot", "-q", "--image-opts", "-a", tag, &opts])
             .await?;
@@ -639,7 +712,7 @@ impl Storage for DirStorage {
         format: ImageFormat,
         tag: &str,
     ) -> Result<(), DriverError> {
-        let path = self.snapshot_path(pool, id, format)?;
+        let path = self.snapshot_path(pool, id, format).await?;
         // `-d`는 태그가 없으면 실패하므로 먼저 확인한다. 겹친 태그가 있으면 모두 지운다.
         let count = self
             .tags_at(&path, format)
@@ -661,7 +734,7 @@ impl Storage for DirStorage {
         id: Uuid,
         format: ImageFormat,
     ) -> Result<Vec<String>, DriverError> {
-        let path = self.snapshot_path(pool, id, format)?;
+        let path = self.snapshot_path(pool, id, format).await?;
         self.tags_at(&path, format).await
     }
 
@@ -672,7 +745,7 @@ impl Storage for DirStorage {
         format: ImageFormat,
         size_bytes: u64,
     ) -> Result<(), DriverError> {
-        let path = self.existing_path(pool, id, format)?;
+        let path = self.existing_path(pool, id, format).await?;
         let size = size_bytes.to_string();
         // --shrink 없이는 qemu-img가 줄이기를 거부한다.
         self.qemu_img(&[
@@ -698,11 +771,11 @@ impl Storage for DirStorage {
         dst_id: Uuid,
     ) -> Result<(), DriverError> {
         let src = match tag {
-            Some(_) => self.snapshot_path(src_pool, src_id, format)?,
-            None => self.existing_path(src_pool, src_id, format)?,
+            Some(_) => self.snapshot_path(src_pool, src_id, format).await?,
+            None => self.existing_path(src_pool, src_id, format).await?,
         };
         let dst = self.file_path(dst_pool, dst_id, format)?;
-        if dst.exists() {
+        if self.exists(dst_pool, &dst).await? {
             return Err(DriverError::VolumeExists(dst_id));
         }
         // `-l`의 값은 옵션 문자열이므로 `,`를 `,,`로 쓴다.
@@ -715,7 +788,7 @@ impl Storage for DirStorage {
             before.extend(["-l", s.as_str()]);
         }
         before.extend(["-O", fmt_name(format), path_str(&src)?]);
-        self.write_new(dst_id, &dst, &before, &[]).await
+        self.write_new(dst_pool, dst_id, &dst, &before, &[]).await
     }
 }
 
@@ -876,6 +949,20 @@ mod tests {
         std::fs::remove_dir(&root).unwrap();
         not_mounted(storage.capacity(&p).await.unwrap_err());
         assert_eq!(pool_files(mnt.path()), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn stuck_pool_calls_time_out() {
+        let root = Path::new("/pools/nas");
+        let stuck = || std::thread::sleep(Duration::from_millis(300));
+        match on_pool(Duration::from_millis(20), root, stuck).await {
+            Err(DriverError::PoolNotResponding(path)) => {
+                assert_eq!(path, root);
+                assert!(DriverError::PoolNotResponding(path).is_transient());
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(on_pool(FS_TIMEOUT, root, || 7).await.unwrap(), 7);
     }
 
     fn tmp_str(dir: &tempfile::TempDir) -> &str {

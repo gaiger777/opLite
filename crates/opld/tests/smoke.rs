@@ -108,6 +108,24 @@ async fn single_node_cluster_serves_cli_over_https_and_survives_restarts() {
     assert!(pools.contains("dir") && pools.contains("1/1"), "{pools}");
     let detail = d.ctl(&["pool", "get", "local"]).await.unwrap();
     assert!(detail.contains("\nnode1  true "), "{detail}");
+    // 밖에서 마운트한 공유 디렉터리는 --shared로 공유 풀로 만든다.
+    let shared = d.path("shared");
+    std::fs::create_dir(&shared).unwrap();
+    d.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    assert_eq!(
+        d.ctl_json(&["pool", "get", "shared"]).await["spec"]["shared"],
+        true
+    );
+    d.ctl(&["pool", "delete", "shared"]).await.unwrap();
     d.ctl(&["vm", "create", "web", "--memory", "256", "--nic", "user"])
         .await
         .unwrap();

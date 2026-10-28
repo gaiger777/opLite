@@ -93,13 +93,8 @@ async fn resolves_volumes_to_pool_paths_and_user_network() {
     );
 }
 
-/// NFS 풀의 디스크는 마운트 지점 아래에 있다. 마운트되지 않았으면(빈 마운트 지점) 노드가 아직
-/// 상태를 알리지 않았어도 잠시 뒤 다시 시도할 `PoolUnavailable`이다. 경로는 `pool_root`가 정한다.
-#[tokio::test]
-async fn refuses_nfs_volumes_until_mounted() {
-    let dir = TempDir::new().unwrap();
-    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
-    let node = cluster.id().0;
+/// NFS 풀 `nas`와 그 볼륨 `root`를 쓰는 VM을 만든다.
+async fn nfs_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (StoragePool, opl_types::vm::Vm) {
     let nas: StoragePool = Resource::new(
         "nas",
         StoragePoolSpec {
@@ -113,11 +108,38 @@ async fn refuses_nfs_volumes_until_mounted() {
         },
     );
     cluster.create(&nas).await.unwrap();
-    let root = volume("root", "nas");
-    cluster.create(&root).await.unwrap();
-
+    cluster.create(&volume("root", "nas")).await.unwrap();
     let mut vm = common::vm("web", node);
     vm.spec.disks.push(disk("root"));
+    (nas, vm)
+}
+
+/// NFS를 지원하지 않는 노드(macOS)에서는 NFS 풀의 디스크를 쓸 수 없다. 기다려도 풀리지 않으므로
+/// 다시 시도할 `PoolUnavailable`이 아니라 참조 오류다(VM을 끄고 이유를 남긴다).
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn refuses_nfs_volumes_where_nfs_is_unsupported() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let (_, vm) = nfs_vm(&cluster, node).await;
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT)).unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::NfsUnsupported(n) if n == "nas"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("not supported"), "{err}");
+}
+
+/// NFS 풀의 디스크는 마운트 지점 아래에 있다. 마운트되지 않았으면(빈 마운트 지점) 노드가 아직
+/// 상태를 알리지 않았어도 잠시 뒤 다시 시도할 `PoolUnavailable`이다. 경로는 `pool_root`가 정한다.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn refuses_nfs_volumes_until_mounted() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let (nas, vm) = nfs_vm(&cluster, node).await;
     let mnt = TempDir::new().unwrap();
     std::fs::create_dir(mnt.path().join(nas.id.to_string())).unwrap();
     let err = runtime_spec(&cluster, &vm, node, mnt.path()).unwrap_err();

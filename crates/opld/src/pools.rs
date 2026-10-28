@@ -33,6 +33,8 @@ const MOUNT_IN_PROGRESS: &str = "mount in progress";
 /// 마운트에 실패한 뒤 다시 시도하기까지 처음 기다리는 시간. 실패할 때마다 두 배로 늘린다.
 const MOUNT_BACKOFF_INITIAL: Duration = Duration::from_secs(15);
 const MOUNT_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// 용량이 앞서 적은 값과 이만큼 바뀌어야 노드 상태를 다시 쓴다.
+const GIB: u64 = 1 << 30;
 
 /// 마운트와 풀 디렉터리 확인. 테스트는 가짜로 바꾼다.
 #[async_trait]
@@ -98,15 +100,17 @@ async fn run(program: &str, args: &[OsString]) -> Result<(), String> {
         ))
 }
 
-/// `mount -t nfs -o nosuid,nodev,noexec[,options] server:export dir`의 인자. 풀에는 이미지 파일만
-/// 두므로 setuid·장치 파일·실행을 늘 막고, 사용자 옵션은 그 뒤에 붙인다. IPv6 서버는 `[...]`로 감싼다.
+/// `mount -t nfs -o nosuid,nodev,noexec,retry=0[,options] server:export dir`의 인자. 풀에는 이미지
+/// 파일만 두므로 setuid·장치 파일·실행을 늘 막는다. `retry=0`은 시간 제한으로 `mount`를 끝낸 뒤
+/// mount.nfs가 앞에서 계속 다시 시도하지 않게 한다(다시 시도는 마운터가 한다). 사용자 옵션은 그
+/// 뒤에 붙어 `retry`도 바꿀 수 있다. IPv6 서버는 `[...]`로 감싼다.
 pub fn mount_args(server: &str, export: &str, options: Option<&str>, dir: &Path) -> Vec<OsString> {
     let source = if server.contains(':') {
         format!("[{server}]:{export}")
     } else {
         format!("{server}:{export}")
     };
-    let mut opts = String::from("nosuid,nodev,noexec");
+    let mut opts = String::from("nosuid,nodev,noexec,retry=0");
     if let Some(options) = options {
         opts.push(',');
         opts.push_str(options);
@@ -577,17 +581,19 @@ impl Pools {
         Ok(dirs)
     }
 
-    /// 바뀌었으면 `NodeStatus.pools`에 쓴다. 다른 쪽이 그 사이 status를 썼으면 다시 읽고 쓴다.
+    /// 바뀌었으면(용량은 1 GiB 넘게, [`keep_capacity`]) `NodeStatus.pools`에 쓴다. 다른 쪽이 그 사이
+    /// status를 썼으면 다시 읽고 쓴다.
     async fn write(&self, pools: BTreeMap<String, PoolState>) -> anyhow::Result<()> {
         loop {
             let Some(node) = self.cluster.get::<NodeSpec>(self.node)? else {
                 return Ok(());
             };
+            let pools = keep_capacity(&node.status.pools, pools.clone());
             if node.status.pools == pools {
                 return Ok(());
             }
             let status = NodeStatus {
-                pools: pools.clone(),
+                pools,
                 ..node.status
             };
             match self
@@ -603,6 +609,27 @@ impl Pools {
     }
 }
 
+/// 앞서 적은 상태와 용량만 1 GiB 넘게 바뀌지 않았으면 앞 용량을 둔다. 쓰기·지우기로 조금씩 바뀌는
+/// 용량 때문에 tick마다 노드 상태를 다시 쓰지 않게 한다.
+fn keep_capacity(
+    old: &BTreeMap<String, PoolState>,
+    mut new: BTreeMap<String, PoolState>,
+) -> BTreeMap<String, PoolState> {
+    for (name, state) in &mut new {
+        if let Some(prev) = old.get(name)
+            && prev.pool_id == state.pool_id
+            && prev.ready == state.ready
+            && prev.error == state.error
+            && prev.total_bytes.abs_diff(state.total_bytes) < GIB
+            && prev.available_bytes.abs_diff(state.available_bytes) < GIB
+        {
+            state.total_bytes = prev.total_bytes;
+            state.available_bytes = prev.available_bytes;
+        }
+    }
+    new
+}
+
 fn not_ready(pool: Uuid, error: String) -> PoolState {
     PoolState {
         pool_id: pool,
@@ -616,7 +643,7 @@ fn not_ready(pool: Uuid, error: String) -> PoolState {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use opl_types::resource::Resource;
     use opl_types::vm::VmStatus;
@@ -627,14 +654,14 @@ mod tests {
     #[test]
     fn builds_mount_arguments() {
         let dir = Path::new("/var/lib/opl/pools/p1");
-        // 사용자 옵션이 있든 없든 nosuid,nodev,noexec를 먼저 붙인다.
+        // 사용자 옵션이 있든 없든 nosuid,nodev,noexec,retry=0을 먼저 붙인다(사용자 옵션이 이긴다).
         assert_eq!(
             mount_args("nas.lan", "/srv/vm", None, dir),
             [
                 "-t",
                 "nfs",
                 "-o",
-                "nosuid,nodev,noexec",
+                "nosuid,nodev,noexec,retry=0",
                 "nas.lan:/srv/vm",
                 "/var/lib/opl/pools/p1"
             ]
@@ -645,7 +672,7 @@ mod tests {
                 "-t",
                 "nfs",
                 "-o",
-                "nosuid,nodev,noexec,vers=4.2,hard",
+                "nosuid,nodev,noexec,retry=0,vers=4.2,hard",
                 "10.0.0.5:/srv/vm",
                 "/var/lib/opl/pools/p1"
             ]
@@ -667,6 +694,8 @@ mod tests {
         /// 참이면 `/srv/slow` 마운트가 풀릴 때까지 멈춘다.
         hang_slow_mount: AtomicBool,
         checks: Mutex<usize>,
+        /// 용량에 더하는 바이트(쓰기·지우기로 조금씩 바뀌는 용량)
+        extra: AtomicU64,
     }
 
     impl FakeMount {
@@ -724,9 +753,10 @@ mod tests {
             if !dir.is_dir() {
                 return Err(std::io::ErrorKind::NotFound.into());
             }
+            let extra = self.extra.load(Ordering::SeqCst);
             Ok(Capacity {
-                total_bytes: 100,
-                available_bytes: 40,
+                total_bytes: 100 * GIB + extra,
+                available_bytes: 40 * GIB + extra,
             })
         }
     }
@@ -823,8 +853,8 @@ mod tests {
             pool_id: pool.id,
             ready: true,
             error: None,
-            total_bytes: 100,
-            available_bytes: 40,
+            total_bytes: 100 * GIB,
+            available_bytes: 40 * GIB,
         }
     }
 
@@ -858,7 +888,7 @@ mod tests {
         assert_eq!(
             s.fake.calls(),
             [format!(
-                "mount -t nfs -o nosuid,nodev,noexec,vers=4.2 nas:/srv/vm {}",
+                "mount -t nfs -o nosuid,nodev,noexec,retry=0,vers=4.2 nas:/srv/vm {}",
                 mount_dir.display()
             )]
         );
@@ -880,6 +910,18 @@ mod tests {
         assert_eq!(s.fake.calls(), Vec::<String>::new());
         let after = s.cluster.get::<NodeSpec>(s.node).unwrap().unwrap().revision;
         assert_eq!(after, revision);
+
+        // 용량이 1 GiB 넘게 바뀌지 않았으면 다시 쓰지 않는다.
+        s.fake.extra.store(GIB - 1, Ordering::SeqCst);
+        s.pools.tick().await.unwrap();
+        let after = s.cluster.get::<NodeSpec>(s.node).unwrap().unwrap().revision;
+        assert_eq!(after, revision);
+        assert_eq!(s.states()["nas"], ready(&nas));
+        s.fake.extra.store(GIB, Ordering::SeqCst);
+        s.pools.tick().await.unwrap();
+        let state = &s.states()["nas"];
+        assert_eq!(state.total_bytes, 101 * GIB);
+        assert_eq!(state.available_bytes, 41 * GIB);
         s.cluster.shutdown().await.unwrap();
     }
 

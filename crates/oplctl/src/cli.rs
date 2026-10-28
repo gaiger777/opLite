@@ -163,6 +163,10 @@ enum PoolCmd {
         /// `mount -o`에 넘길 쉼표 목록(예: vers=4.2,hard)
         #[arg(long, requires = "nfs", conflicts_with = "path")]
         nfs_options: Option<String>,
+        /// `--path`가 모든 노드가 같은 데이터를 보는 공유 스토리지(밖에서 마운트한 공유 디렉터리)다.
+        /// NFS 풀은 늘 공유다.
+        #[arg(long, requires = "path", conflicts_with = "nfs")]
+        shared: bool,
         /// 이 풀을 쓸 수 있는 노드 id. 생략하면 모든 노드.
         #[arg(long = "node")]
         nodes: Vec<String>,
@@ -625,6 +629,7 @@ where
                 path,
                 nfs,
                 nfs_options,
+                shared,
                 nodes,
             } => {
                 // NFS 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
@@ -634,10 +639,11 @@ where
                     }),
                     None => json!({ "kind": "dir", "path": path }),
                 };
-                let body = json!({
-                    "name": name,
-                    "spec": { "backend": backend, "nodes": nodes }
-                });
+                let mut spec = json!({ "backend": backend, "nodes": nodes });
+                if shared {
+                    spec["shared"] = json!(true);
+                }
+                let body = json!({ "name": name, "spec": spec });
                 client.post("/storage-pools", &body).await?;
                 writeln!(out, "storage pool {name} created")?;
             }
@@ -1930,9 +1936,10 @@ mod tests {
                             path,
                             nfs,
                             nfs_options,
+                            shared,
                             ..
                         },
-                } => (path, nfs, nfs_options),
+                } => (path, nfs, nfs_options, shared),
                 _ => unreachable!(),
             })
         };
@@ -1942,14 +1949,17 @@ mod tests {
         };
         assert_eq!(
             create(&["--path", "/srv/pool"]).unwrap(),
-            (Some(PathBuf::from("/srv/pool")), None, None)
+            (Some(PathBuf::from("/srv/pool")), None, None, false)
         );
+        // 디렉터리 풀은 공유 스토리지(밖에서 마운트한 공유 디렉터리)라고 적을 수 있다.
+        assert!(create(&["--path", "/mnt/shared", "--shared"]).unwrap().3);
         assert_eq!(
             create(&["--nfs", "nas.lan:/srv/vm", "--nfs-options", "vers=4.2,hard"]).unwrap(),
             (
                 None,
                 Some(nfs("nas.lan", "/srv/vm")),
-                Some("vers=4.2,hard".into())
+                Some("vers=4.2,hard".into()),
+                false
             )
         );
         // IPv6는 대괄호로 감싼다.
@@ -1957,9 +1967,11 @@ mod tests {
             create(&["--nfs", "[fd00::1]:/srv/vm"]).unwrap().1,
             Some(nfs("fd00::1", "/srv/vm"))
         );
-        // 둘 중 하나만, 옵션은 --nfs와 함께, 내보내기는 절대 경로
+        // 둘 중 하나만, 옵션은 --nfs와 함께, 내보내기는 절대 경로, NFS 풀은 늘 공유라 --shared가 없다
         for args in [
             &[][..],
+            &["--nfs", "nas:/srv/vm", "--shared"],
+            &["--shared"],
             &["--path", "/srv/pool", "--nfs", "nas:/srv/vm"],
             &["--path", "/srv/pool", "--nfs-options", "hard"],
             &["--nfs", "nas"],

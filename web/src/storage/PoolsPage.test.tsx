@@ -147,6 +147,39 @@ it("creates a pool on the chosen nodes", async () => {
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
+it("creates a directory pool on shared storage", async () => {
+  mockLists({ node: [NODE] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/storage-pools"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("shared"), { status: 201 });
+    }),
+  );
+  renderPage(<PoolsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "shared");
+  await userEvent.type(within(dialog).getByLabelText("Directory"), "/mnt/vm");
+  const shared = within(dialog).getByRole("checkbox", { name: "Shared storage" });
+  expect(shared).toHaveAccessibleDescription(
+    "Check when every node sees the same files at this path, such as an NFS share mounted outside opLite.",
+  );
+  await userEvent.click(shared);
+  // NFS 풀은 늘 공유라 고를 것이 없다.
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "nfs");
+  expect(within(dialog).queryByRole("checkbox", { name: "Shared storage" })).toBeNull();
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "dir");
+  expect(within(dialog).getByRole("checkbox", { name: "Shared storage" })).toBeChecked();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  await vi.waitFor(() =>
+    expect(body).toEqual({
+      name: "shared",
+      spec: { backend: { kind: "dir", path: "/mnt/vm" }, nodes: [], shared: true },
+    }),
+  );
+});
+
 it("creates an NFS pool", async () => {
   mockLists({ node: [NODE] });
   let body: unknown;
@@ -274,7 +307,8 @@ it("says when the nodes cannot be read", async () => {
   await userEvent.click(await screen.findByRole("button", { name: "Create" }));
   const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
   expect(await within(dialog).findByRole("alert")).toBeInTheDocument();
-  expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
+  const nodes = within(dialog).getByRole("group", { name: "Nodes" });
+  expect(within(nodes).queryByRole("checkbox")).not.toBeInTheDocument();
 });
 
 it("keeps the confirmation open when the pool is still in use", async () => {
