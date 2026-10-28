@@ -85,6 +85,7 @@ export function NodesPage() {
             <TableHead>{t("nodes.state")}</TableHead>
             <TableHead>{t("nodes.address")}</TableHead>
             <TableHead>{t("nodes.hypervisor")}</TableHead>
+            <TableHead>{t("nodes.arch")}</TableHead>
             <TableHead>{t("nodes.cpus")}</TableHead>
             <TableHead>{t("nodes.memory")}</TableHead>
             <TableHead>{t("nodes.bridges")}</TableHead>
@@ -98,7 +99,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 9 : 8} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 10 : 9} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -120,6 +121,8 @@ export function NodesPage() {
               </TableCell>
               <TableCell className="font-mono text-xs">{node.spec.address}</TableCell>
               <TableCell>{node.status.hypervisor}</TableCell>
+              {/* 옛 버전으로 등록한 노드는 모른다. */}
+              <TableCell>{node.status.arch ?? "—"}</TableCell>
               <TableCell>{node.status.cpus}</TableCell>
               <TableCell>{formatCapacity(node.status.memory_mib)}</TableCell>
               <TableCell className="font-mono text-xs">

@@ -163,12 +163,15 @@ it("stops uploads when signing out", async () => {
   server.use(
     http.get(apiUrl("/auth/whoami"), () => HttpResponse.json(ADMIN)),
     http.post(apiUrl("/auth/logout"), () => new HttpResponse(null, { status: 204 })),
+    http.post(apiUrl("/volumes/import/check"), () => new HttpResponse(null, { status: 204 })),
   );
   renderAuth();
   expect(await screen.findByText("admin")).toBeInTheDocument();
   const params = { name: "img", pool: "local", format: "qcow2", sourceFormat: "raw" } as const;
   act(() => startUpload(new File(["x"], "img.raw"), params, i18n.t));
   expect(await screen.findByText(/^Uploading img/)).toBeInTheDocument();
+  // 확인을 통과해 파일을 보내는 중이다.
+  await vi.waitFor(() => expect(FakeXhr.last).toBeDefined());
 
   await userEvent.click(screen.getByRole("button", { name: "logout" }));
   expect(await screen.findByText("signed out")).toBeInTheDocument();
@@ -189,11 +192,13 @@ it("does not sign out for an upload's 401 from before signing in again", async (
       return HttpResponse.json(ADMIN);
     }),
     http.post(apiUrl("/auth/login"), () => HttpResponse.json(ADMIN)),
+    http.post(apiUrl("/volumes/import/check"), () => new HttpResponse(null, { status: 204 })),
   );
   renderAuth();
   expect(await screen.findByText("admin")).toBeInTheDocument();
   const params = { name: "img", pool: "local", format: "qcow2", sourceFormat: "raw" } as const;
   act(() => startUpload(new File(["x"], "img.raw"), params, i18n.t));
+  await vi.waitFor(() => expect(FakeXhr.last).toBeDefined());
   // 다시 로그인해 세대가 바뀐 뒤에 앞 세대의 업로드가 401을 받는다.
   await userEvent.click(screen.getByRole("button", { name: "login" }));
   await vi.waitFor(() => expect(checks).toBe(2));

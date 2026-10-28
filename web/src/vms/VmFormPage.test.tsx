@@ -68,6 +68,50 @@ it("shows input errors without calling the API", async () => {
   expect(screen.getByText("At least 64 MiB.")).toBeInTheDocument();
 });
 
+it("follows the chosen node's architecture until a machine is picked", async () => {
+  const arm = { ...NODE, status: { ...NODE.status, arch: "aarch64" as const } };
+  const x86 = {
+    ...NODE,
+    id: "n2",
+    name: "node-b",
+    status: { ...NODE.status, arch: "x86_64" as const },
+  };
+  mockLists({ node: [arm, x86] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  const machine = await screen.findByLabelText("Machine type");
+  // 아키텍처가 섞여 있으면 q35다.
+  expect(machine).toHaveValue("q35");
+  await user.selectOptions(screen.getByLabelText("Node"), "node-a");
+  expect(machine).toHaveValue("virt");
+  await user.selectOptions(screen.getByLabelText("Node"), "node-b");
+  expect(machine).toHaveValue("q35");
+  // 직접 고르면 노드를 바꿔도 그대로다.
+  await user.selectOptions(machine, "virt");
+  await user.selectOptions(screen.getByLabelText("Node"), "");
+  await user.selectOptions(screen.getByLabelText("Node"), "node-b");
+  expect(machine).toHaveValue("virt");
+});
+
+it("keeps the machine of an edited VM when its node changes", async () => {
+  const arm = { ...NODE, status: { ...NODE.status, arch: "aarch64" as const } };
+  const x86 = {
+    ...NODE,
+    id: "n2",
+    name: "node-b",
+    status: { ...NODE.status, arch: "x86_64" as const },
+  };
+  mockLists({ vm: [vm("web", "stopped")], node: [arm, x86] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  const machine = await screen.findByLabelText("Machine type");
+  expect(machine).toHaveValue("virt");
+  await screen.findByRole("option", { name: "node-b" });
+  await user.selectOptions(screen.getByLabelText("Node"), "node-b");
+  expect(screen.getByLabelText("Node")).toHaveValue("n2");
+  expect(machine).toHaveValue("virt");
+});
+
 it("saves with the revision it read and offers to reload on a conflict", async () => {
   const web = vm("web", "running");
   mockLists({ vm: [web], node: [NODE] });

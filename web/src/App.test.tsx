@@ -75,6 +75,25 @@ it("signs in, returns to the requested page and signs out", async () => {
   expect(window.location.search).toBe("");
 });
 
+it("says when sign-in attempts are throttled", async () => {
+  signedOut();
+  server.use(
+    http.post(apiUrl("/auth/login"), () =>
+      HttpResponse.json(
+        { code: "too_many_attempts", message: "try again in 30 seconds" },
+        { status: 429, headers: { "Retry-After": "30" } },
+      ),
+    ),
+  );
+  window.history.pushState({}, "", "/login");
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(await screen.findByLabelText("Username"), "admin");
+  await user.type(screen.getByLabelText("Password"), "admin-password");
+  await user.click(screen.getByRole("button", { name: "Sign in" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Too many attempts. Try again later.");
+});
+
 it("does not show the sign-in form while checking the session", async () => {
   signedOut();
   let answer = () => {};

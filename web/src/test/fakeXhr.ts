@@ -11,9 +11,10 @@ export class FakeXhr {
   status = 0;
   responseText = "";
   aborted = false;
-  upload: { onprogress: ((e: { loaded: number; total: number }) => void) | null } = {
-    onprogress: null,
-  };
+  upload: {
+    onprogress: ((e: { loaded: number; total: number }) => void) | null;
+    onload: (() => void) | null;
+  } = { onprogress: null, onload: null };
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
   onabort: (() => void) | null = null;
@@ -42,6 +43,11 @@ export class FakeXhr {
 
   progress(loaded: number, total: number) {
     this.upload.onprogress?.({ loaded, total });
+  }
+
+  /** 본문을 다 보냈다(`xhr.upload`의 load). */
+  uploaded() {
+    this.upload.onload?.();
   }
 
   respond(status: number, body: unknown) {

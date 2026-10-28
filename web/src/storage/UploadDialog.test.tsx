@@ -34,6 +34,7 @@ it("uploads a chosen file into a new volume", async () => {
         members: [],
       }),
     ),
+    http.post(apiUrl("/volumes/import/check"), () => new HttpResponse(null, { status: 204 })),
   );
   renderPage(<VolumesPage />);
   await userEvent.click(await screen.findByRole("button", { name: "Upload image" }));
@@ -54,6 +55,8 @@ it("uploads a chosen file into a new volume", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Upload" }));
 
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  // 확인을 통과한 뒤에 보낸다.
+  await vi.waitFor(() => expect(FakeXhr.last).toBeDefined());
   expect(FakeXhr.last!.url).toContain(
     "/volumes/import?name=ubuntu-24-04&pool=local&format=qcow2&source_format=qcow2",
   );

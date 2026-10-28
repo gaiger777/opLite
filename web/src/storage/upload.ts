@@ -1,7 +1,14 @@
 import type { TFunction } from "i18next";
 import { toast } from "sonner";
 
-import { currentAuthEpoch, NetworkError, reportUnauthorized, toApiError } from "@/api/client";
+import {
+  api,
+  call,
+  currentAuthEpoch,
+  NetworkError,
+  reportUnauthorized,
+  toApiError,
+} from "@/api/client";
 import type { components } from "@/api/schema";
 import type { Task } from "@/api/types";
 import { errorMessage } from "@/i18n/errors";
@@ -34,9 +41,33 @@ export function sourceFormatOf(file: string): Schemas["SourceFormat"] {
   return ext === "vmdk" ? "vmdk" : ext === "qcow2" ? "qcow2" : "raw";
 }
 
+/** 다 보낸 뒤 이만큼 응답이 없으면 알림을 바꾼다. 요청은 끊지 않는다(끊으면 서버가 받은 볼륨을 지운다). */
+export const NO_RESPONSE_MS = 2 * 60 * 1000;
+
+/**
+ * 본문을 보내기 전에 서버가 받을 수 있는지 묻는다(`/volumes/import/check`, 204). 권한·이름·풀·공간 따위로
+ * 거절하면 `ApiError`를 던진다.
+ */
+export async function checkUpload(size: number, params: UploadParams, signal?: AbortSignal) {
+  await call(
+    api.POST("/volumes/import/check", {
+      params: {
+        query: {
+          name: params.name,
+          pool: params.pool,
+          format: params.format,
+          source_format: params.sourceFormat,
+          size,
+        },
+      },
+      signal,
+    }),
+  );
+}
+
 /**
  * 이미지를 `/volumes/import`로 올린다. fetch는 올리는 진행률을 알려 주지 않아 `XMLHttpRequest`를 쓴다.
- * 받은 Task(202)로 끝나고, 오류 응답은 `ApiError`, 연결 실패는 `NetworkError`, 취소는 `signal`의 이유로
+ * 본문을 다 보내면 `onSent`를 부른다(빈 파일이어도). 받은 Task(202)로 끝나고, 오류 응답은 `ApiError`, 연결 실패는 `NetworkError`, 취소는 `signal`의 이유로
  * 거부한다. 중간에 끊기면 서버가 만들던 볼륨과 받은 파일을 지운다.
  */
 export function uploadImage(
@@ -44,8 +75,13 @@ export function uploadImage(
   params: UploadParams,
   {
     onProgress,
+    onSent,
     signal,
-  }: { onProgress?(loaded: number, total: number): void; signal?: AbortSignal },
+  }: {
+    onProgress?(loaded: number, total: number): void;
+    onSent?(): void;
+    signal?: AbortSignal;
+  },
 ): Promise<Task> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -66,6 +102,7 @@ export function uploadImage(
     xhr.open("POST", `${window.location.origin}/api/v1/volumes/import?${query}`);
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
     xhr.upload.onprogress = (e) => onProgress?.(e.loaded, e.total || file.size);
+    xhr.upload.onload = () => onSent?.();
     xhr.onload = () => {
       done();
       let body: unknown = null;
@@ -132,18 +169,27 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
   const upload = { controller, silent: false };
   active.set(id, upload);
   let shown = -1;
-  const show = (loaded: number, total: number) => {
-    if (shown === 100) {
-      return;
-    }
-    if (total > 0 && loaded >= total) {
-      // 다 보냈다. 서버가 파일을 쓰고 Task를 만드는 동안은 취소하지 않는다.
-      shown = 100;
-      toast.loading(t("uploads.processing", { name: params.name }), {
+  let processing = false;
+  let waiting: ReturnType<typeof setTimeout> | undefined;
+  // 다 보냈다. 서버가 파일을 쓰고 Task를 만드는 동안은 취소하지 않는다.
+  const sentAll = () => {
+    processing = true;
+    toast.loading(t("uploads.processing", { name: params.name }), {
+      id,
+      action: undefined,
+      duration: Infinity,
+    });
+    // 오래 답이 없으면 닫을 수 있는 알림으로 바꾼다. 늦게 오는 응답은 평소처럼 알린다.
+    waiting = setTimeout(() => {
+      toast.warning(t("uploads.noResponse", { name: params.name }), {
         id,
-        action: undefined,
         duration: Infinity,
+        closeButton: true,
       });
+    }, NO_RESPONSE_MS);
+  };
+  const show = (loaded: number, total: number) => {
+    if (processing) {
       return;
     }
     // 화면 낭독기가 덜 읽도록 5% 단위로만 바꾼다.
@@ -163,7 +209,17 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
     );
   };
   show(0, file.size);
-  void uploadImage(file, params, { onProgress: show, signal: controller.signal })
+  // 확인에서 거절되면 본문을 보내지 않는다.
+  let sent = false;
+  void checkUpload(file.size, params, controller.signal)
+    .then(() => {
+      sent = true;
+      return uploadImage(file, params, {
+        onProgress: show,
+        onSent: sentAll,
+        signal: controller.signal,
+      });
+    })
     .then((task) => {
       toast.dismiss(id);
       trackTask(task, t("tasks.op.volume-import", { target: params.name }));
@@ -182,7 +238,8 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
         });
       } else {
         // 서버가 본문을 다 받기 전에 거절해도(401·409·507 따위) 브라우저는 연결 끊김으로만 알린다.
-        const error = err instanceof NetworkError ? t("uploads.dropped") : errorMessage(t, err);
+        const error =
+          sent && err instanceof NetworkError ? t("uploads.dropped") : errorMessage(t, err);
         toast.error(t("uploads.failed", { name: params.name, error }), {
           id,
           action: undefined,
@@ -192,6 +249,7 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
       }
     })
     .finally(() => {
+      clearTimeout(waiting);
       active.delete(id);
       if (active.size === 0) {
         window.removeEventListener("beforeunload", guard);

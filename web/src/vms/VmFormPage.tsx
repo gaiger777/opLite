@@ -70,6 +70,8 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [failure, setFailure] = useState<{ message: string; conflict: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
+  // 사용자가 머신을 직접 고르기 전에는 노드를 바꾸면 그 노드에 맞게 기본값을 다시 정한다(만들 때만).
+  const [machineChosen, setMachineChosen] = useState(false);
   // 화면을 떠나면 기다리던 볼륨 Task를 그만 기다리고 VM을 만들지 않는다.
   const abort = useRef<AbortController | null>(null);
   useEffect(() => () => abort.current?.abort(), []);
@@ -290,7 +292,10 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
                 id="vm-machine"
                 className="w-full"
                 value={values.machine}
-                onChange={(e) => set("machine", e.target.value as VmFormValues["machine"])}
+                onChange={(e) => {
+                  setMachineChosen(true);
+                  set("machine", e.target.value as VmFormValues["machine"]);
+                }}
               >
                 <NativeSelectOption value="q35">q35 (x86_64)</NativeSelectOption>
                 <NativeSelectOption value="virt">virt (aarch64)</NativeSelectOption>
@@ -302,7 +307,17 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
                 className="w-full"
                 disabled={locked}
                 value={values.node}
-                onChange={(e) => set("node", e.target.value)}
+                onChange={(e) => {
+                  const node = e.target.value;
+                  setValues((v) => ({
+                    ...v,
+                    node,
+                    machine:
+                      creating && !machineChosen
+                        ? defaultMachine(nodes.data ?? [], node)
+                        : v.machine,
+                  }));
+                }}
               >
                 <NativeSelectOption value="">{t("vmForm.nodeAuto")}</NativeSelectOption>
                 {nodes.data?.map((n) => (

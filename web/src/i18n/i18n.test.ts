@@ -23,6 +23,12 @@ it("translates API error codes and falls back to the server message", async () =
   expect(errorMessage(t, new ApiError(409, "no_node", "no node has bridge br0"))).toBe(
     "No node can run this VM: no node has bridge br0",
   );
+  expect(errorMessage(t, new ApiError(429, "too_many_attempts", "try again in 30 seconds"))).toBe(
+    "Too many attempts. Try again later.",
+  );
+  expect(errorMessage(t, new ApiError(400, "machine_arch_mismatch", "virt on x86_64"))).toBe(
+    "The machine type doesn't match the selected node's architecture.",
+  );
   expect(errorMessage(t, new ApiError(400, "invalid_request", "memory_mib must be > 0"))).toBe(
     "memory_mib must be > 0",
   );

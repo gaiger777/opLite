@@ -12,7 +12,12 @@ const DOWN = {
   id: "n2",
   name: "node-b",
   revision: 7,
-  status: { ...NODE.status, online: false, bridges: [{ name: "vmbr0", vlan_filtering: true }] },
+  status: {
+    ...NODE.status,
+    online: false,
+    bridges: [{ name: "vmbr0", vlan_filtering: true }],
+    arch: "aarch64" as const,
+  },
 };
 
 function cluster() {
@@ -46,6 +51,12 @@ it("lists nodes with their state, capacity and VMs", async () => {
   const b = within(table).getByText("node-b").closest("tr")!;
   expect(b).toHaveTextContent("Offline");
   expect(b).toHaveTextContent("vmbr0");
+  const archColumn = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Architecture");
+  expect(within(b).getAllByRole("cell")[archColumn]).toHaveTextContent("aarch64");
+  // 옛 버전으로 등록한 노드는 아키텍처를 모른다.
+  expect(within(a).getAllByRole("cell")[archColumn]).toHaveTextContent("—");
 });
 
 it("turns maintenance on and off with the revision it read", async () => {

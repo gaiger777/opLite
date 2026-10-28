@@ -61,14 +61,22 @@ export interface VmFormValues {
   start: boolean;
 }
 
+const MACHINE_OF: Record<Schemas["Arch"], Schemas["MachineType"]> = {
+  x86_64: "q35",
+  aarch64: "virt",
+};
+
 /**
- * 노드의 아키텍처를 API가 알려 주지 않으므로, 모든 노드가 hvf(Apple Silicon)면 `virt`, 아니면 `q35`를
- * 기본값으로 한다. 다른 경우는 사용자가 고른다.
+ * 머신 기본값: 지정 노드(`selectedNode`, 빈 문자열이면 자동)의 아키텍처, 아니면 아키텍처를 아는 노드가 모두
+ * 같을 때 그 아키텍처의 머신, 그 밖에는 `q35`다.
  */
-export function defaultMachine(nodes: Node[]): Schemas["MachineType"] {
-  return nodes.length > 0 && nodes.every((n) => n.status.hypervisor === "qemu-hvf")
-    ? "virt"
-    : "q35";
+export function defaultMachine(nodes: Node[], selectedNode = ""): Schemas["MachineType"] {
+  const chosen = nodes.find((n) => n.id === selectedNode)?.status.arch;
+  if (chosen) {
+    return MACHINE_OF[chosen];
+  }
+  const [only, ...others] = new Set(nodes.flatMap((n) => (n.status.arch ? [n.status.arch] : [])));
+  return only && others.length === 0 ? MACHINE_OF[only] : "q35";
 }
 
 export function emptyDisk(vmName: string, index: number): DiskRow {

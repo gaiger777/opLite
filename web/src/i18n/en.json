@@ -32,6 +32,8 @@
     "volume_in_snapshot": "A VM snapshot still uses this volume. Delete that snapshot first.",
     "snapshot_not_ready": "The snapshot is still being taken.",
     "node_offline": "The node holding this VM is offline.",
+    "too_many_attempts": "Too many attempts. Try again later.",
+    "machine_arch_mismatch": "The machine type doesn't match the selected node's architecture.",
     "task_failed": "Task error: {{message}}",
     "internal": "The server failed: {{message}}"
   },
@@ -323,6 +325,7 @@
     "cancelled": "Cancelled the upload of {{name}}.",
     "failed": "Upload of {{name}} failed. {{error}}",
     "processing": "Processing {{name}}…",
+    "noResponse": "{{name}}: no response from the server. Check the volume list for the result.",
     "dropped": "The server rejected the upload or the connection was lost.",
     "noNode": "Cannot tell which node you are connected to. {{error}}",
     "errors": {
@@ -387,6 +390,7 @@
     "state": "State",
     "address": "API address",
     "hypervisor": "Hypervisor",
+    "arch": "Architecture",
     "cpus": "CPUs",
     "memory": "Memory",
     "bridges": "Bridges",

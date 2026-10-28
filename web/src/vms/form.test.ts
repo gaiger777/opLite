@@ -70,11 +70,18 @@ it("checks the number of scheduled snapshots to keep only when scheduled", () =>
   });
 });
 
-it("picks virt only when every node is Apple Silicon", () => {
-  const hvf = { ...NODE, status: { ...NODE.status, hypervisor: "qemu-hvf" } };
-  const kvm = NODE;
-  expect(defaultMachine([hvf])).toBe("virt");
-  expect(defaultMachine([hvf, kvm])).toBe("q35");
+it("picks the machine from the node architecture", () => {
+  const arm = { ...NODE, id: "n2", status: { ...NODE.status, arch: "aarch64" as const } };
+  const x86 = { ...NODE, id: "n3", status: { ...NODE.status, arch: "x86_64" as const } };
+  const unknown = NODE;
+  // 지정 노드의 아키텍처가 먼저다.
+  expect(defaultMachine([arm, x86], "n2")).toBe("virt");
+  expect(defaultMachine([arm, x86], "n3")).toBe("q35");
+  // 자동이거나 지정 노드의 아키텍처를 모르면, 아는 노드가 모두 같을 때 그것이다.
+  expect(defaultMachine([arm, unknown])).toBe("virt");
+  expect(defaultMachine([arm, unknown], "n1")).toBe("virt");
+  expect(defaultMachine([arm, x86])).toBe("q35");
+  expect(defaultMachine([unknown])).toBe("q35");
   expect(defaultMachine([])).toBe("q35");
 });
 
