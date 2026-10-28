@@ -2,7 +2,10 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::{ADMIN_PASSWORD, Env};
+use opl_api::AppState;
 use reqwest::StatusCode;
 use serde_json::json;
 
@@ -419,4 +422,97 @@ async fn current_password_check_is_throttled_with_login() {
         try_login(&env, "alice", "password-1").await.0,
         StatusCode::TOO_MANY_REQUESTS
     );
+}
+
+/// 같은 클러스터를 쓰는 두 번째 API 서버(다른 노드 역할, 세션 저장소가 따로다)를 띄우고 주소를 돌려준다.
+async fn serve_another_node(env: &Env) -> String {
+    let state = Arc::new(AppState::new(
+        env.cluster.clone(),
+        env.node,
+        env.hv.clone(),
+        env.dir.path().join("uploads-b"),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = opl_api::router(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+/// `base`에 로그인해 세션 쿠키(`opl_session=...`)를 돌려준다.
+async fn cookie_login(base: &str, user: &str, password: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&json!({ "username": user, "password": password }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+async fn whoami_with_cookie(base: &str, cookie: &str) -> (StatusCode, serde_json::Value) {
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/auth/whoami"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap();
+    (resp.status(), resp.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn password_change_ends_sessions_on_other_nodes() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let alice = env.user("alice", "viewer").await;
+    let b = serve_another_node(&env).await;
+
+    // 본인이 노드 A에서 비밀번호를 바꾸면 노드 B의 옛 세션도 끊긴다.
+    let cookie = cookie_login(&b, "alice", "password-1").await;
+    assert_eq!(whoami_with_cookie(&b, &cookie).await.0, StatusCode::OK);
+    let (status, body) = alice
+        .put(
+            "/users/alice",
+            json!({ "password": "new-password", "current_password": "password-1" }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = whoami_with_cookie(&b, &cookie).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "unauthorized");
+    // API 토큰은 그대로다.
+    assert_eq!(alice.get("/auth/whoami").await.0, StatusCode::OK);
+
+    // 관리자가 바꿔도 같다.
+    let cookie = cookie_login(&b, "alice", "new-password").await;
+    let (status, body) = admin
+        .put(
+            "/users/alice",
+            json!({ "password": "reset-password" }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        whoami_with_cookie(&b, &cookie).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 비밀번호가 아닌 것(역할)을 바꾸면 세션은 남는다.
+    let cookie = cookie_login(&b, "alice", "reset-password").await;
+    let (status, body) = admin
+        .put("/users/alice", json!({ "role": "operator" }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = whoami_with_cookie(&b, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["role"], "operator");
 }

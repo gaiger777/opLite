@@ -11,7 +11,7 @@ use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
 use axum::http::request::Parts;
-use opl_types::auth::{ApiTokenSpec, Role, UserSpec};
+use opl_types::auth::{ApiTokenSpec, Role, User, UserSpec};
 use opl_types::resource::Kind;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -134,26 +134,28 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// 노드 메모리에만 두는 세션. opld가 재시작하면 다시 로그인한다.
+/// 만들 때 사용자의 세션 세대를 함께 둔다(다른 노드에서 비밀번호가 바뀌면 끊으려고).
 #[derive(Default)]
 pub struct Sessions {
-    inner: Mutex<HashMap<String, (Uuid, Instant)>>,
+    inner: Mutex<HashMap<String, (Uuid, u64, Instant)>>,
 }
 
 impl Sessions {
-    pub fn create(&self, user: Uuid) -> String {
+    pub fn create(&self, user: Uuid, epoch: u64) -> String {
         let id = random_hex(32);
         let now = Instant::now();
         let mut map = self.inner.lock().unwrap();
-        map.retain(|_, (_, expires)| *expires > now);
-        map.insert(id.clone(), (user, now + SESSION_TTL));
+        map.retain(|_, (_, _, expires)| *expires > now);
+        map.insert(id.clone(), (user, epoch, now + SESSION_TTL));
         id
     }
 
-    pub fn get(&self, id: &str) -> Option<Uuid> {
+    /// (사용자, 만들 때의 세션 세대)
+    pub fn get(&self, id: &str) -> Option<(Uuid, u64)> {
         let map = self.inner.lock().unwrap();
         map.get(id)
-            .filter(|(_, expires)| *expires > Instant::now())
-            .map(|(user, _)| *user)
+            .filter(|(_, _, expires)| *expires > Instant::now())
+            .map(|(user, epoch, _)| (*user, *epoch))
     }
 
     pub fn remove(&self, id: &str) {
@@ -162,7 +164,7 @@ impl Sessions {
 
     /// 사용자의 세션을 모두 끝낸다(비밀번호를 바꿨을 때).
     pub fn remove_user(&self, user: Uuid) {
-        self.inner.lock().unwrap().retain(|_, (u, _)| *u != user);
+        self.inner.lock().unwrap().retain(|_, (u, _, _)| *u != user);
     }
 }
 
@@ -188,13 +190,17 @@ fn same_origin(headers: &HeaderMap) -> bool {
     origin_host.is_some() && origin_host == host
 }
 
+fn principal_of(u: User) -> Principal {
+    Principal {
+        user: u.id,
+        name: u.name,
+        role: u.spec.role,
+    }
+}
+
 impl AppState {
     fn principal_for(&self, user: Uuid) -> Result<Option<Principal>, ApiError> {
-        Ok(self.cluster.get::<UserSpec>(user)?.map(|u| Principal {
-            user: u.id,
-            name: u.name,
-            role: u.spec.role,
-        }))
+        Ok(self.cluster.get::<UserSpec>(user)?.map(principal_of))
     }
 
     async fn authenticate(&self, parts: &Parts) -> Result<Principal, ApiError> {
@@ -216,8 +222,10 @@ impl AppState {
                 .principal_for(stored.spec.user)?
                 .ok_or_else(ApiError::unauthorized);
         }
-        let user = session_cookie(&parts.headers)
-            .and_then(|id| self.sessions.get(id))
+        let session = session_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
+        let (user, epoch) = self
+            .sessions
+            .get(session)
             .ok_or_else(ApiError::unauthorized)?;
         // 쿠키는 브라우저가 알아서 붙이므로, 다른 출처의 페이지가 보낸 요청(WebSocket 포함)은 받지 않는다.
         if !same_origin(&parts.headers) {
@@ -227,7 +235,16 @@ impl AppState {
                 "cookie-authenticated requests must come from the same origin",
             ));
         }
-        self.principal_for(user)?.ok_or_else(ApiError::unauthorized)
+        let user = self
+            .cluster
+            .get::<UserSpec>(user)?
+            .ok_or_else(ApiError::unauthorized)?;
+        // 세션을 만든 뒤 비밀번호가 바뀌었다(다른 노드에서 바뀌었을 수도 있다).
+        if user.spec.session_epoch != epoch {
+            self.sessions.remove(session);
+            return Err(ApiError::unauthorized());
+        }
+        Ok(principal_of(user))
     }
 
     /// 권한이 없으면 403
@@ -319,14 +336,14 @@ mod tests {
     fn sessions_can_be_removed() {
         let s = Sessions::default();
         let user = Uuid::now_v7();
-        let id = s.create(user);
-        assert_eq!(s.get(&id), Some(user));
+        let id = s.create(user, 7);
+        assert_eq!(s.get(&id), Some((user, 7)));
         s.remove(&id);
         assert_eq!(s.get(&id), None);
         assert_eq!(s.get("unknown"), None);
 
-        let (a, b) = (s.create(user), s.create(user));
-        let other = s.create(Uuid::now_v7());
+        let (a, b) = (s.create(user, 0), s.create(user, 0));
+        let other = s.create(Uuid::now_v7(), 0);
         s.remove_user(user);
         assert_eq!((s.get(&a), s.get(&b)), (None, None));
         assert!(s.get(&other).is_some());

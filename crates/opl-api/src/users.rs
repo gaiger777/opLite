@@ -107,7 +107,7 @@ pub async fn login(
         return Err(wrong_credentials());
     };
     state.attempts.success(&req.username, ip);
-    let session = state.sessions.create(user.id);
+    let session = state.sessions.create(user.id, user.spec.session_epoch);
     let mut cookie = format!(
         "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
         SESSION_TTL.as_secs()
@@ -218,7 +218,7 @@ pub struct UpdateUserRequest {
 
 /// 관리자는 누구의 비밀번호와 역할이든 바꾼다. 다른 사용자는 자기 비밀번호만 바꾼다.
 /// 자기 비밀번호를 바꿀 때는 현재 비밀번호가 필요하고(훔친 세션으로 계정을 빼앗지 못하게),
-/// 바꾸면 그 사용자의 세션이 모두 끝난다. 마지막 관리자는 역할을 내려놓을 수 없다.
+/// 바꾸면 모든 노드에서 그 사용자의 세션이 끝난다(API 토큰은 남는다). 마지막 관리자는 역할을 내려놓을 수 없다.
 /// 현재 비밀번호 확인은 로그인과 같은 시도 제한을 받는다.
 #[utoipa::path(put, path = "/users/{key}", tag = "auth",
     params(("key" = String, Path, description = "id or name")),
@@ -260,6 +260,8 @@ pub async fn update_user(
             state.attempts.success(&principal.name, ip);
         }
         spec.password_hash = hash_password(password).await?;
+        // 모든 노드의 옛 세션을 끊는다(쿠키 인증이 세대를 비교한다).
+        spec.session_epoch += 1;
     }
     if let Some(role) = req.role {
         if user.spec.role == Role::Admin && role != Role::Admin {
