@@ -4,7 +4,7 @@
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use opl_api::error::ApiError;
 use rust_embed::EmbeddedFile;
@@ -42,19 +42,19 @@ pub fn router() -> Router {
 }
 
 fn serve(files: Files) -> Router {
-    Router::new().fallback(move |method: Method, uri: Uri| async move {
+    Router::new().fallback(move |method: Method, uri: Uri, req: HeaderMap| async move {
         if let Some(r) = reject(&method, &uri) {
             return r;
         }
         let path = uri.path().trim_start_matches('/');
         let path = if path.is_empty() { "index.html" } else { path };
         let mut r = match files(path) {
-            Some(file) => file_response(path, file),
+            Some(file) => file_response(path, file, &req),
             // 없는 빌드 결과를 index.html로 주면 브라우저가 HTML을 스크립트로 읽는다.
             None if path.starts_with(ASSETS) => StatusCode::NOT_FOUND.into_response(),
             // 화면 주소(`/vms/web-01`)는 index.html이 받아 브라우저에서 고른다.
             None => match files("index.html") {
-                Some(file) => file_response("index.html", file),
+                Some(file) => file_response("index.html", file, &req),
                 None => return not_built(),
             },
         };
@@ -92,12 +92,23 @@ fn reject(method: &Method, uri: &Uri) -> Option<Response> {
     None
 }
 
-fn file_response(path: &str, file: EmbeddedFile) -> Response {
+/// 파일 응답. 내용 해시로 강한 ETag를 붙이고, `If-None-Match`가 맞으면 본문 없이 304로 답한다.
+fn file_response(path: &str, file: EmbeddedFile, req: &HeaderMap) -> Response {
     let cache = if path.starts_with(ASSETS) {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"
     };
+    let etag = format!("\"{}\"", hex::encode(file.metadata.sha256_hash()));
+    let fresh = matches(req, &etag);
+    let etag = HeaderValue::from_str(&etag).expect("16진수 ETag");
+    if fresh {
+        let mut r = StatusCode::NOT_MODIFIED.into_response();
+        let h = r.headers_mut();
+        h.insert(header::ETAG, etag);
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+        return r;
+    }
     let mime = match file.metadata.mimetype() {
         "text/html" => "text/html; charset=utf-8".to_string(),
         other => other.to_string(),
@@ -110,7 +121,19 @@ fn file_response(path: &str, file: EmbeddedFile) -> Response {
             .unwrap_or(HeaderValue::from_static("application/octet-stream")),
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    h.insert(header::ETAG, etag);
     r
+}
+
+/// `If-None-Match`의 쉼표 목록 가운데 하나가 ETag와 같거나 `*`인가. 약한 비교(RFC 9110)라
+/// 앞의 `W/`는 떼고 비교한다.
+fn matches(req: &HeaderMap, etag: &str) -> bool {
+    req.get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|v| v == "*" || v.strip_prefix("W/").unwrap_or(v) == etag)
 }
 
 fn secure(r: &mut Response) {
@@ -144,14 +167,25 @@ mod tests {
         method: &str,
         path: &str,
     ) -> (StatusCode, axum::http::HeaderMap, String) {
+        get_if(app, method, path, None).await
+    }
+
+    /// `If-None-Match`를 붙여 요청한다.
+    async fn get_if(
+        app: Router,
+        method: &str,
+        path: &str,
+        if_none_match: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let resp = reqwest::Client::new()
-            .request(method.parse().unwrap(), format!("http://{addr}{path}"))
-            .send()
-            .await
-            .unwrap();
+        let mut req =
+            reqwest::Client::new().request(method.parse().unwrap(), format!("http://{addr}{path}"));
+        if let Some(v) = if_none_match {
+            req = req.header(header::IF_NONE_MATCH, v);
+        }
+        let resp = req.send().await.unwrap();
         let (status, headers) = (resp.status(), resp.headers().clone());
         (status, headers, resp.text().await.unwrap())
     }
@@ -180,6 +214,44 @@ mod tests {
         // 없는 빌드 결과는 index.html이 아니라 404
         let (status, _, _) = get(serve(Fixture::get), "GET", "/assets/gone-000.js").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn etag_revalidation_answers_not_modified() {
+        // 모든 파일 응답에 내용 해시의 강한 ETag
+        let (_, h, _) = get(serve(Fixture::get), "GET", "/").await;
+        let etag = h["etag"].to_str().unwrap().to_string();
+        let hash = hex::encode(Fixture::get("index.html").unwrap().metadata.sha256_hash());
+        assert_eq!(etag, format!("\"{hash}\""));
+        let (_, h, _) = get(serve(Fixture::get), "GET", "/assets/app-1a2b3c.js").await;
+        assert_ne!(h["etag"], etag.as_str());
+        // SPA 폴백은 index.html의 ETag
+        let (_, h, _) = get(serve(Fixture::get), "GET", "/vms/web-01").await;
+        assert_eq!(h["etag"], etag.as_str());
+
+        // 같으면 본문 없이 304, 헤더는 그대로
+        for path in ["/", "/vms/web-01"] {
+            let (status, h, body) = get_if(serve(Fixture::get), "GET", path, Some(&etag)).await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{path}");
+            assert!(body.is_empty(), "{body}");
+            assert_eq!(h["etag"], etag.as_str());
+            assert_eq!(h["cache-control"], "no-cache");
+            assert_eq!(h["content-security-policy"], CSP);
+            assert_eq!(h["x-content-type-options"], "nosniff");
+            assert_eq!(h["referrer-policy"], "no-referrer");
+        }
+        // 쉼표 목록 가운데 하나, `*`, 약한 비교
+        let list = format!("\"other\", {etag}");
+        let weak = format!("W/{etag}");
+        for v in [list.as_str(), "*", weak.as_str()] {
+            let (status, _, _) = get_if(serve(Fixture::get), "GET", "/", Some(v)).await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{v}");
+        }
+        // 다르면 200과 본문
+        let (status, h, body) = get_if(serve(Fixture::get), "GET", "/", Some("\"other\"")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("fixture index"), "{body}");
+        assert_eq!(h["etag"], etag.as_str());
     }
 
     #[tokio::test]

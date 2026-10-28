@@ -1609,6 +1609,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "hex",
  "openraft",
  "opl-api",
  "opl-cluster",
