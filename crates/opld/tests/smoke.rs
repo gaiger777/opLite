@@ -102,6 +102,12 @@ async fn single_node_cluster_serves_cli_over_https_and_survives_restarts() {
     d.ctl(&["pool", "create", "local", "--path", pool.to_str().unwrap()])
         .await
         .unwrap();
+    // 풀 목록과 상세는 노드별 준비 상태를 보인다.
+    d.wait_pool_ready("local").await;
+    let pools = d.ctl(&["pool", "list"]).await.unwrap();
+    assert!(pools.contains("dir") && pools.contains("1/1"), "{pools}");
+    let detail = d.ctl(&["pool", "get", "local"]).await.unwrap();
+    assert!(detail.contains("\nnode1  true "), "{detail}");
     d.ctl(&["vm", "create", "web", "--memory", "256", "--nic", "user"])
         .await
         .unwrap();

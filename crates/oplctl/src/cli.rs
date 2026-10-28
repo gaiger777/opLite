@@ -151,12 +151,18 @@ enum PoolCmd {
     Get {
         pool: String,
     },
-    /// 로컬 디렉터리 풀을 만든다.
+    /// 로컬 디렉터리 풀이나 NFS 풀을 만든다.
     Create {
         name: String,
         /// 풀 디렉터리(절대 경로)
-        #[arg(long)]
-        path: PathBuf,
+        #[arg(long, required_unless_present = "nfs", conflicts_with = "nfs")]
+        path: Option<PathBuf>,
+        /// NFS 내보내기 `SERVER:/EXPORT`(IPv6는 `[ADDR]:/EXPORT`). 노드마다 마운트하는 공유 풀이다.
+        #[arg(long, value_parser = parse_nfs)]
+        nfs: Option<NfsSource>,
+        /// `mount -o`에 넘길 쉼표 목록(예: vers=4.2,hard)
+        #[arg(long, requires = "nfs", conflicts_with = "path")]
+        nfs_options: Option<String>,
         /// 이 풀을 쓸 수 있는 노드 id. 생략하면 모든 노드.
         #[arg(long = "node")]
         nodes: Vec<String>,
@@ -164,6 +170,30 @@ enum PoolCmd {
     Delete {
         pool: String,
     },
+}
+
+/// `--nfs`로 받은 NFS 서버와 내보내기 경로
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NfsSource {
+    server: String,
+    export: String,
+}
+
+/// `nas:/srv/vm`, `[fd00::1]:/srv/vm`처럼 쓴다. 서버 이름의 나머지 검사는 API가 한다.
+fn parse_nfs(s: &str) -> Result<NfsSource, String> {
+    let split = match s.strip_prefix('[') {
+        Some(rest) => rest.split_once("]:"),
+        None => s.split_once(':'),
+    };
+    match split {
+        Some((server, export)) if !server.is_empty() && export.starts_with('/') => Ok(NfsSource {
+            server: server.into(),
+            export: export.into(),
+        }),
+        _ => Err(format!(
+            "invalid nfs source {s:?}: use SERVER:/EXPORT ([ADDR]:/EXPORT for IPv6)"
+        )),
+    }
 }
 
 #[derive(Subcommand)]
@@ -573,26 +603,40 @@ where
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::List => {
                 let list = client.get("/storage-pools").await?;
-                print_list(out, json_out, &list, &["NAME", "PATH", "NODES"], |p| {
-                    let nodes = p["spec"]["nodes"].as_array().map_or(0, Vec::len);
-                    vec![
-                        cell(&p["name"]),
-                        cell(&p["spec"]["backend"]["path"]),
-                        if nodes == 0 {
-                            "all".into()
-                        } else {
-                            nodes.to_string()
-                        },
-                    ]
-                })?;
+                let nodes = if json_out {
+                    Vec::new()
+                } else {
+                    items(&client.get("/nodes").await?)
+                };
+                print_list(out, json_out, &list, POOL_HEADERS, |p| pool_row(p, &nodes))?;
             }
             PoolCmd::Get { pool } => {
-                print_json(out, &client.get(&format!("/storage-pools/{pool}")).await?)?
+                let pool = client.get(&format!("/storage-pools/{pool}")).await?;
+                if json_out {
+                    print_json(out, &pool)?;
+                } else {
+                    let nodes = items(&client.get("/nodes").await?);
+                    write!(out, "{}", describe_pool(&pool))?;
+                    table(out, POOL_NODE_HEADERS, &pool_node_rows(&pool, &nodes))?;
+                }
             }
-            PoolCmd::Create { name, path, nodes } => {
+            PoolCmd::Create {
+                name,
+                path,
+                nfs,
+                nfs_options,
+                nodes,
+            } => {
+                // NFS 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
+                let backend = match nfs {
+                    Some(n) => json!({
+                        "kind": "nfs", "server": n.server, "export": n.export, "options": nfs_options
+                    }),
+                    None => json!({ "kind": "dir", "path": path }),
+                };
                 let body = json!({
                     "name": name,
-                    "spec": { "backend": { "kind": "dir", "path": path }, "nodes": nodes }
+                    "spec": { "backend": backend, "nodes": nodes }
                 });
                 client.post("/storage-pools", &body).await?;
                 writeln!(out, "storage pool {name} created")?;
@@ -1363,6 +1407,131 @@ fn print_list(
     Ok(())
 }
 
+/// 목록 응답의 항목들
+fn items(list: &Value) -> Vec<Value> {
+    list["items"].as_array().cloned().unwrap_or_default()
+}
+
+/// `pool list`의 열
+const POOL_HEADERS: &[&str] = &["NAME", "KIND", "LOCATION", "NODES", "READY"];
+
+/// `pool list`의 한 행. READY는 이 풀을 쓸 수 있는 노드(없는 노드 포함) 가운데 온라인이고 준비된
+/// 노드 수다.
+fn pool_row(pool: &Value, nodes: &[Value]) -> Vec<String> {
+    let listed = pool["spec"]["nodes"].as_array().map_or(0, Vec::len);
+    let usable = pool_nodes(pool, nodes);
+    let ready = usable
+        .iter()
+        .filter(|n| n.is_ok_and(|n| node_online(n) && pool_state(pool, n)["ready"] == true))
+        .count();
+    vec![
+        cell(&pool["name"]),
+        cell(&pool["spec"]["backend"]["kind"]),
+        pool_location(pool),
+        if listed == 0 {
+            "all".into()
+        } else {
+            listed.to_string()
+        },
+        format!("{ready}/{}", usable.len()),
+    ]
+}
+
+/// 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`)
+fn pool_location(pool: &Value) -> String {
+    let b = &pool["spec"]["backend"];
+    match b["server"].as_str() {
+        Some(server) if server.contains(':') => format!("[{server}]:{}", cell(&b["export"])),
+        Some(server) => format!("{server}:{}", cell(&b["export"])),
+        None => cell(&b["path"]),
+    }
+}
+
+/// 풀을 쓸 수 있는 노드. 노드 목록이 비었으면 모든 노드이고, 아니면 목록의 노드를 그 순서대로
+/// 본다. 목록에 있지만 없는 노드는 그 id(`Err`)다.
+fn pool_nodes<'a>(pool: &'a Value, nodes: &'a [Value]) -> Vec<Result<&'a Value, &'a Value>> {
+    match pool["spec"]["nodes"].as_array() {
+        Some(listed) if !listed.is_empty() => listed
+            .iter()
+            .map(|id| nodes.iter().find(|n| n["id"] == *id).ok_or(id))
+            .collect(),
+        _ => nodes.iter().map(Ok).collect(),
+    }
+}
+
+fn node_online(node: &Value) -> bool {
+    node["status"]["online"] == true
+}
+
+/// 노드가 알린 풀 상태. 알리지 않았거나 같은 이름의 다른 풀(`pool_id`가 다름)의 상태면 `null`이다.
+fn pool_state<'a>(pool: &Value, node: &'a Value) -> &'a Value {
+    let name = pool["name"].as_str().unwrap_or_default();
+    let state = &node["status"]["pools"][name];
+    if state["pool_id"] == pool["id"] {
+        state
+    } else {
+        &Value::Null
+    }
+}
+
+/// `pool get`의 머리 줄들
+fn describe_pool(pool: &Value) -> String {
+    let b = &pool["spec"]["backend"];
+    let mut text = format!(
+        "pool: {}\nkind: {}\nlocation: {}\n",
+        cell(&pool["name"]),
+        cell(&b["kind"]),
+        pool_location(pool)
+    );
+    if let Some(options) = b["options"].as_str() {
+        text.push_str(&format!("options: {options}\n"));
+    }
+    text.push_str(&format!("shared: {}\n", cell(&pool["spec"]["shared"])));
+    text
+}
+
+/// `pool get`의 노드별 상태 열
+const POOL_NODE_HEADERS: &[&str] = &["NODE", "READY", "SIZE", "AVAILABLE", "ERROR"];
+
+/// 풀을 쓸 수 있는 노드마다 상태·용량·오류. 용량은 온라인이고 준비된 노드만 보인다.
+fn pool_node_rows(pool: &Value, nodes: &[Value]) -> Vec<Vec<String>> {
+    pool_nodes(pool, nodes)
+        .into_iter()
+        .map(|n| {
+            let n = match n {
+                Ok(n) => n,
+                Err(id) => {
+                    return vec![
+                        cell(id),
+                        "false".into(),
+                        "-".into(),
+                        "-".into(),
+                        "node not found".into(),
+                    ];
+                }
+            };
+            let state = pool_state(pool, n);
+            let online = node_online(n);
+            let ready = online && state["ready"] == true;
+            let size = |v: &Value| if ready { bytes(v) } else { "-".into() };
+            let error = if !online {
+                "node offline".into()
+            } else if state.is_null() {
+                "no status reported yet".into()
+            } else {
+                cell(&state["error"])
+            };
+            vec![
+                cell(&n["name"]),
+                ready.to_string(),
+                size(&state["total_bytes"]),
+                size(&state["available_bytes"]),
+                error,
+            ]
+        })
+        .collect()
+}
+
 /// 토큰 문자열 `opl_<id>_<secret>`의 id
 fn token_id(token: &str) -> Option<uuid::Uuid> {
     let rest = token.strip_prefix("opl_")?;
@@ -1746,6 +1915,154 @@ mod tests {
              \x20  └─ c                      2026-10-26 07:36 UTC  false   false\n\
              \x20  orphan                    2026-10-26 07:38 UTC  true    false\n\
              \x20  └─ new                    pending               false   false\n"
+        );
+    }
+
+    #[test]
+    fn parses_pool_create_commands() {
+        let create = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "pool", "create", "nas"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Pool {
+                    cmd:
+                        PoolCmd::Create {
+                            path,
+                            nfs,
+                            nfs_options,
+                            ..
+                        },
+                } => (path, nfs, nfs_options),
+                _ => unreachable!(),
+            })
+        };
+        let nfs = |server: &str, export: &str| NfsSource {
+            server: server.into(),
+            export: export.into(),
+        };
+        assert_eq!(
+            create(&["--path", "/srv/pool"]).unwrap(),
+            (Some(PathBuf::from("/srv/pool")), None, None)
+        );
+        assert_eq!(
+            create(&["--nfs", "nas.lan:/srv/vm", "--nfs-options", "vers=4.2,hard"]).unwrap(),
+            (
+                None,
+                Some(nfs("nas.lan", "/srv/vm")),
+                Some("vers=4.2,hard".into())
+            )
+        );
+        // IPv6는 대괄호로 감싼다.
+        assert_eq!(
+            create(&["--nfs", "[fd00::1]:/srv/vm"]).unwrap().1,
+            Some(nfs("fd00::1", "/srv/vm"))
+        );
+        // 둘 중 하나만, 옵션은 --nfs와 함께, 내보내기는 절대 경로
+        for args in [
+            &[][..],
+            &["--path", "/srv/pool", "--nfs", "nas:/srv/vm"],
+            &["--path", "/srv/pool", "--nfs-options", "hard"],
+            &["--nfs", "nas"],
+            &["--nfs", "nas:srv"],
+            &["--nfs", ":/srv"],
+            &["--nfs", "fd00::1:/srv"],
+            &["--nfs", "[fd00::1/srv"],
+        ] {
+            assert!(create(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn pool_list_and_details_show_each_node() {
+        let node = |name: &str, online: bool, pools: Value| {
+            json!({
+                "id": format!("id-{name}"),
+                "name": name,
+                "status": { "online": online, "pools": pools },
+            })
+        };
+        let gib = 1u64 << 30;
+        let state = |ready: bool, error: Value, total: u64, available: u64| json!({ "pool_id": "id-nas", "ready": ready, "error": error, "total_bytes": total, "available_bytes": available });
+        let nodes = [
+            node(
+                "a",
+                true,
+                json!({ "nas": state(true, Value::Null, 100 * gib, 40 * gib) }),
+            ),
+            node(
+                "b",
+                true,
+                json!({ "nas": state(false, json!("mount failed"), 0, 0) }),
+            ),
+            node("c", true, json!({})),
+            // 준비됐다고 알렸지만 꺼진 노드는 준비로 세지 않는다.
+            node(
+                "d",
+                false,
+                json!({ "nas": state(true, Value::Null, 100 * gib, 40 * gib) }),
+            ),
+            // 같은 이름의 지워진 풀이 남긴 상태는 이 풀의 것이 아니다.
+            node(
+                "e",
+                true,
+                json!({ "nas": { "pool_id": "id-old", "ready": true, "error": null } }),
+            ),
+        ];
+        let nas = json!({
+            "id": "id-nas",
+            "name": "nas",
+            "spec": {
+                "backend": { "kind": "nfs", "server": "fd00::1", "export": "/srv/vm", "options": "hard" },
+                "nodes": [],
+                "shared": true,
+            },
+        });
+        // 노드 목록의 노드를 그 순서대로 본다. 없는 노드도 센다.
+        let local = json!({
+            "id": "id-local",
+            "name": "local",
+            "spec": {
+                "backend": { "kind": "dir", "path": "/srv/pool" },
+                "nodes": ["id-gone", "id-b"],
+                "shared": false,
+            },
+        });
+        assert_eq!(
+            pool_row(&nas, &nodes),
+            ["nas", "nfs", "[fd00::1]:/srv/vm", "all", "1/5"]
+        );
+        assert_eq!(
+            pool_row(&local, &nodes),
+            ["local", "dir", "/srv/pool", "2", "0/2"]
+        );
+
+        let mut out = describe_pool(&nas).into_bytes();
+        table(&mut out, POOL_NODE_HEADERS, &pool_node_rows(&nas, &nodes)).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "pool: nas\n\
+             kind: nfs\n\
+             location: [fd00::1]:/srv/vm\n\
+             options: hard\n\
+             shared: true\n\
+             NODE  READY  SIZE      AVAILABLE  ERROR\n\
+             a     true   100.0GiB  40.0GiB    -\n\
+             b     false  -         -          mount failed\n\
+             c     false  -         -          no status reported yet\n\
+             d     false  -         -          node offline\n\
+             e     false  -         -          no status reported yet\n"
+        );
+        assert_eq!(
+            describe_pool(&local),
+            "pool: local\nkind: dir\nlocation: /srv/pool\nshared: false\n"
+        );
+        let mut out = Vec::new();
+        table(&mut out, POOL_NODE_HEADERS, &pool_node_rows(&local, &nodes)).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NODE     READY  SIZE  AVAILABLE  ERROR\n\
+             id-gone  false  -     -          node not found\n\
+             b        false  -     -          no status reported yet\n"
         );
     }
 

@@ -13,7 +13,7 @@ use std::process::Command;
 
 use common::{Daemon, eventually};
 use oplctl::Client;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// `oplctl login`이 저장한 로그인 정보로 API 클라이언트를 만든다.
 fn client(d: &Daemon) -> Client {
@@ -120,16 +120,11 @@ async fn nfs_pool_mounts_holds_volumes_and_unmounts() {
     d.login().await;
     let c = client(&d);
 
-    // NFS 풀은 shared를 적지 않아도 공유다. 만들면 곧바로 마운트한다.
-    c.post(
-        "/storage-pools",
-        &json!({
-            "name": "nas",
-            "spec": { "backend": { "kind": "nfs", "server": "127.0.0.1", "export": export } }
-        }),
-    )
-    .await
-    .unwrap();
+    // oplctl로 만든 NFS 풀은 shared를 적지 않아도 공유다. 만들면 곧바로 마운트한다.
+    let source = format!("127.0.0.1:{}", export.display());
+    d.ctl(&["pool", "create", "nas", "--nfs", &source])
+        .await
+        .unwrap();
     d.wait_pool_ready("nas").await;
     let pool = c.get("/storage-pools/nas").await.unwrap();
     assert_eq!(pool["spec"]["shared"], true, "{pool}");
