@@ -1117,7 +1117,14 @@ mod tests {
             not_ready(nas.id, "nfs server not responding".into())
         );
         s.fake.hang.store(false, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // 멈췄던 확인이 실제로 끝날 때까지 기다린다(느린 머신에서는 50ms로 모자랐다).
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !s.pools.stuck[&nas.id].is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         s.pools.tick().await.unwrap();
         assert_eq!(*s.fake.checks.lock().unwrap(), 2);
         assert_eq!(s.states()["nas"], ready(&nas));
