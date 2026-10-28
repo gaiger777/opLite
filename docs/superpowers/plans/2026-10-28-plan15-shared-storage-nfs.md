@@ -12895,3 +12895,25 @@ git commit -m "docs: NFS 풀과 노드별 풀 상태 안내, 공유 스토리지
 - **상태 지연:** 노드별 풀 상태는 `refresh_secs`(15초)만큼 늦을 수 있다(풀을 만들고 지울 때는 곧바로 새로 고친다). 디렉터리 풀은 보고 전에도 쓸 수 있지만 화면에는 "아직 알린 상태 없음"으로 보인다.
 - **마운트 위치 주의:** 마운트된 풀이 있는 노드에서 `rm -rf {data_dir}`을 하면 NFS 내보내기의 내용까지 지워진다.
 - 그 밖의 제한은 설계 문서 §10에 있다.
+
+## 실행 후 기록 (2026-10-29)
+
+8개 Task는 계획대로 적용했고, Task마다 검증된 단계와 트리가 같았다(생성 파일 `schema.d.ts` 포함). 최종 리뷰(심각 없음, 중요 셋)로 아래가 바뀌었다(`811f226`). 저장소의 코드가 기준이다. 위 Task의 코드 블록은 고치기 전 것이다.
+
+- **지워진 노드의 볼륨(중요):** 공유가 아닌 풀의 볼륨을 만든 노드가 클러스터에서 지워졌으면 지우기·크기 Task를 이 노드에서 돌린다(파일에는 닿지 못하므로 리소스만 지운다). 전에는 그 볼륨과 풀을 지울 수 없었다.
+- **멈춘 NFS의 파일 호출(중요):** 드라이버의 파일 호출(있는지 확인, 하드 링크, 지우기, 용량, 임시 파일 정리)을 `spawn_blocking`과 30초 제한(`FS_TIMEOUT`)으로 돌리고, 넘으면 일시 오류 `DriverError::PoolNotResponding`. 전에는 하드 마운트가 멈추면 opld의 비동기 스레드가 묶였다.
+- **기존 공유 디렉터리 풀(중요):** `pool create --path … --shared`와 웹의 "공유 스토리지" 확인란을 더했다. 공유가 아닌 풀은 이제 VM을 볼륨이 있는 노드에 묶으므로 README에 업그레이드 안내를 적었다.
+- 마운트 옵션 맨 앞이 `nosuid,nodev,noexec,retry=0`(사용자가 `retry`를 덮을 수 있다), 노드 상태의 용량은 1 GiB 넘게 바뀔 때만 다시 쓴다, 배치된 적 없는 VM의 공유 풀 Task는 쓸 수 있는 노드로, macOS 노드의 NFS 디스크는 VM을 이유와 함께 끈다(`ResolveError::NfsUnsupported`), README에 클러스터를 떠나도 마운트가 남는다는 주의.
+
+알고 받아들인 동작(위 제한 목록에 더해):
+- 풀의 `shared`를 나중에 바꾸는 API는 없다(볼륨을 옮긴 뒤 다시 만든다).
+- CI의 TCG에서 실행 중 VM의 메모리 스냅샷(`snapshot-save`)이 느려 시간 제한에 걸린 적이 한 번 있었다(같은 트리의 다른 실행은 통과).
+
+테스트: macOS `cargo test --workspace` 437개, `opl-driver` `storage-it` 66개, `opl-api` `storage-it` 178개, `qemu-it` `smoke`·`e2e` 5개, 브라우저 E2E, 웹 Vitest 270개, `fmt`·`clippy -D warnings`(모든 기능). 실제 NFS(`nfs-it`)는 Linux CI `linux-kvm`에서.
+CI(확인용 브랜치): `check` 2개, `deny`, `web`, `linux-kvm`(실제 NFS 포함)이 모두 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 계획 16: 블록 백엔드 바탕(디스크 소스 추상화 `host_device`, 백엔드 스냅샷, 메모리 스냅샷의 vmstate 위치)과 LVM-thin.
+- 계획 17: ZFS(zvol). 계획 18: iSCSI, Ceph RBD.
+- 하위 프로젝트 4: 라이브 마이그레이션, UEFI 변수 공유, 풀 `shared` 바꾸기.
