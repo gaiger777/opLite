@@ -1,5 +1,5 @@
 import { Plus, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -38,12 +38,13 @@ export function PoolsPage() {
   const [deleting, setDeleting] = useState<StoragePool | null>(null);
   const write = can(me.role, "write", "storage-pool");
 
+  const nodeName = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n.name])), [nodes.data]);
   const nodeNames = (pool: StoragePool) => {
     const ids = pool.spec.nodes ?? [];
     // 노드를 정하지 않은 풀은 모든 노드에서 쓴다.
     return ids.length === 0
       ? t("pools.allNodes")
-      : ids.map((id) => nodes.data?.find((n) => n.id === id)?.name ?? id.slice(-8)).join(", ");
+      : ids.map((id) => nodeName.get(id) ?? id.slice(-8)).join(", ");
   };
   // 볼륨 목록을 다 읽기 전에는 모른다(undefined).
   const volumeCount = (pool: StoragePool) =>

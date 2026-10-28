@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -58,10 +58,9 @@ export function TokensPage() {
   const [created, setCreated] = useState<CreatedToken | null>(null);
   const [deleting, setDeleting] = useState<Token | null>(null);
   const changed = () => queryClient.invalidateQueries({ queryKey: ["tokens"] });
+  const userName = useMemo(() => new Map(users.data?.map((u) => [u.id, u.name])), [users.data]);
   const owner = (token: Token) =>
-    token.user === me.user
-      ? me.name
-      : (users.data?.find((u) => u.id === token.user)?.name ?? token.user.slice(-8));
+    token.user === me.user ? me.name : (userName.get(token.user) ?? token.user.slice(-8));
 
   return (
     <div className="flex flex-col gap-4">

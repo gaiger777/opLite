@@ -6,6 +6,7 @@ import { TokensPage } from "@/accounts/TokensPage";
 import { UsersPage } from "@/accounts/UsersPage";
 import { LiveProvider } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
+import { TaskIndexProvider } from "@/api/taskIndex";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { RequireAuth } from "@/auth/RequireAuth";
 import { ClusterPage } from "@/cluster/ClusterPage";
@@ -35,8 +36,10 @@ function routes() {
         {
           element: (
             <LiveProvider>
-              <TaskToasts />
-              <AppLayout />
+              <TaskIndexProvider>
+                <TaskToasts />
+                <AppLayout />
+              </TaskIndexProvider>
             </LiveProvider>
           ),
           children: [

@@ -34,12 +34,11 @@ export function isBusy(vm: Vm): boolean {
 
 /**
  * 서버의 `check_no_revert_task`: 이 VM의 스냅샷 되돌리기 Task가 끝나지 않았다. 강제 정지는 이때만
- * 막힌다(만들기·삭제·복제 중에는 받는다). `tasks`는 watch로 들어온 Task 목록이다.
+ * 막힌다(만들기·삭제·복제 중에는 받는다). `vmTasks`는 이 VM을 대상으로 한 Task다(`useTaskIndex`).
  */
-export function isReverting(vm: Vm, tasks: readonly Task[]): boolean {
-  return tasks.some(
+export function isReverting(vmTasks: readonly Task[]): boolean {
+  return vmTasks.some(
     (task) =>
-      task.spec.target === vm.id &&
       task.spec.op.kind === "snapshot-revert" &&
       task.status.state !== "succeeded" &&
       task.status.state !== "failed",

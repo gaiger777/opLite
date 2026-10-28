@@ -3,7 +3,7 @@ import { useId, useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 
-import { useList } from "@/api/live";
+import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
@@ -35,11 +35,11 @@ export function VmMenu({ vm }: { vm: Vm }) {
   const { run, remove } = useVmActions();
   const [confirm, setConfirm] = useState<VmDialog | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
-  const tasks = useList("task");
+  const vmTasks = useTaskIndex().get(vm.id) ?? [];
   const hint = useId();
   // 서버는 되돌리기 중의 강제 정지를 받지 않는다. Task 목록을 아직 모르면 서버에 맡긴다.
   // 상태로도 끌 수 없는 VM이면 까닭은 되돌리기가 아니므로 보이지 않는다.
-  const reverting = canRun(vm, "force-stop") && isReverting(vm, tasks.data ?? []);
+  const reverting = canRun(vm, "force-stop") && isReverting(vmTasks);
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
   // 복제는 새 VM과 새 볼륨을 만든다.

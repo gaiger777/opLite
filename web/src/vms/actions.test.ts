@@ -57,23 +57,18 @@ it("follows the server's check_not_busy: starting, stopping or power and phase a
 
 it("follows the server's check_no_revert_task: only an unfinished revert of this VM", () => {
   const web = vm("web", "running");
-  const of = (
-    kind: Task["spec"]["op"]["kind"],
-    state: Task["status"]["state"],
-    target = web.id,
-  ) => ({
-    ...task(`t-${kind}-${state}`, kind, target),
+  const of = (kind: Task["spec"]["op"]["kind"], state: Task["status"]["state"]) => ({
+    ...task(`t-${kind}-${state}`, kind, web.id),
     status: { state, error: null },
   });
-  expect(isReverting(web, [])).toBe(false);
-  expect(isReverting(web, [of("snapshot-revert", "pending")])).toBe(true);
-  expect(isReverting(web, [of("snapshot-revert", "running")])).toBe(true);
-  // 끝난 되돌리기, 다른 VM의 되돌리기
-  expect(isReverting(web, [of("snapshot-revert", "succeeded")])).toBe(false);
-  expect(isReverting(web, [of("snapshot-revert", "failed")])).toBe(false);
-  expect(isReverting(web, [of("snapshot-revert", "running", vm("db", "running").id)])).toBe(false);
+  expect(isReverting([])).toBe(false);
+  expect(isReverting([of("snapshot-revert", "pending")])).toBe(true);
+  expect(isReverting([of("snapshot-revert", "running")])).toBe(true);
+  // 끝난 되돌리기
+  expect(isReverting([of("snapshot-revert", "succeeded")])).toBe(false);
+  expect(isReverting([of("snapshot-revert", "failed")])).toBe(false);
   // 만들기·삭제·복제 중에는 강제 정지를 받는다.
   for (const kind of ["snapshot-create", "snapshot-delete", "vm-clone"] as const) {
-    expect(isReverting(web, [of(kind, "running")])).toBe(false);
+    expect(isReverting([of(kind, "running")])).toBe(false);
   }
 });

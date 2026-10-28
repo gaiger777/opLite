@@ -1,8 +1,9 @@
-import { Suspense, useId, useState } from "react";
+import { Suspense, useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { useList } from "@/api/live";
+import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
@@ -125,7 +126,7 @@ function VmHeader({ vm }: { vm: Vm }) {
   const me = usePrincipal();
   const navigate = useNavigate();
   const nodes = useList("node");
-  const tasks = useList("task");
+  const vmTasks = useTaskIndex().get(vm.id) ?? [];
   const hint = useId();
   const { run, remove } = useVmActions();
   const [confirm, setConfirm] = useState<VmDialog | null>(null);
@@ -135,7 +136,7 @@ function VmHeader({ vm }: { vm: Vm }) {
   const operate = can(me.role, "operate", "vm");
   // 서버는 되돌리기 중의 강제 정지를 받지 않는다. Task 목록을 아직 모르면 서버에 맡긴다.
   // 상태로도 끌 수 없는 VM이면 까닭은 되돌리기가 아니므로 보이지 않는다.
-  const reverting = operate && canRun(vm, "force-stop") && isReverting(vm, tasks.data ?? []);
+  const reverting = operate && canRun(vm, "force-stop") && isReverting(vmTasks);
   const button = (action: VmAction) => (
     <Button
       key={action}
@@ -306,7 +307,10 @@ function Hardware({ vm }: { vm: Vm }) {
 function VmTasks({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
   const tasks = useList("task");
-  const mine = newestFirst((tasks.data ?? []).filter((task) => task.spec.target === vm.id));
+  const mine = useMemo(
+    () => newestFirst((tasks.data ?? []).filter((task) => task.spec.target === vm.id)),
+    [tasks.data, vm.id],
+  );
   return (
     <section>
       <h2 id="vm-tasks" className="sr-only">

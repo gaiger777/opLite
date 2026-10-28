@@ -1,12 +1,12 @@
 import { Maximize2, Plus, Trash2, Upload } from "lucide-react";
-import { type RefObject, useRef, useState } from "react";
+import { type RefObject, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
-import type { Volume } from "@/api/types";
+import type { Vm, Volume } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -50,8 +50,19 @@ export function VolumesPage() {
   const opener = useRef<HTMLElement | null>(null);
   const write = can(me.role, "write", "volume");
   // 서버는 VM spec의 디스크로 사용 중인지 판단한다(`attached_to`는 마지막으로 실행한 VM이다).
-  const userOf = (volume: Volume) =>
-    vms.data?.find((vm) => vm.spec.disks?.some((d) => d.volume === volume.name));
+  const userByVolume = useMemo(() => {
+    const users = new Map<string, Vm>();
+    for (const vm of vms.data ?? []) {
+      for (const disk of vm.spec.disks ?? []) {
+        // 목록에서 먼저 나온 VM을 보인다.
+        if (!users.has(disk.volume)) {
+          users.set(disk.volume, vm);
+        }
+      }
+    }
+    return users;
+  }, [vms.data]);
+  const nodeById = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n])), [nodes.data]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -95,9 +106,9 @@ export function VolumesPage() {
             <TableMessage colSpan={write ? 9 : 8} query={volumes} empty={t("volumes.empty")} />
           )}
           {(volumes.data ?? []).map((volume) => {
-            const vm = userOf(volume);
+            const vm = userByVolume.get(volume.name);
             const ready = volume.status.phase === "ready";
-            const node = nodes.data?.find((n) => n.id === volume.status.node);
+            const node = volume.status.node ? nodeById.get(volume.status.node) : undefined;
             return (
               <TableRow key={volume.id}>
                 <TableCell className="font-medium">{volume.name}</TableCell>

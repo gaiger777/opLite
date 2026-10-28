@@ -41,15 +41,19 @@ export function TaskStateBadge({ task }: { task: Task }) {
 export function useTaskTarget() {
   const vms = useList("vm");
   const volumes = useList("volume");
-  return (task: Task) => {
-    const vm = vms.data?.find((v) => v.id === task.spec.target);
-    if (vm) {
-      return { name: vm.name, href: `/vms/${encodeURIComponent(vm.name)}` };
-    }
-    const volume = volumes.data?.find((v) => v.id === task.spec.target);
-    // 지워진 대상은 id의 끝(UUIDv7의 무작위 부분)으로 구분한다. 앞부분은 시각이라 서로 비슷하다.
-    return { name: volume?.name ?? task.spec.target.slice(-8), href: undefined };
-  };
+  return useMemo(() => {
+    const vmById = new Map(vms.data?.map((v) => [v.id, v]));
+    const volumeById = new Map(volumes.data?.map((v) => [v.id, v]));
+    return (task: Task) => {
+      const vm = vmById.get(task.spec.target);
+      if (vm) {
+        return { name: vm.name, href: `/vms/${encodeURIComponent(vm.name)}` };
+      }
+      const volume = volumeById.get(task.spec.target);
+      // 지워진 대상은 id의 끝(UUIDv7의 무작위 부분)으로 구분한다. 앞부분은 시각이라 서로 비슷하다.
+      return { name: volume?.name ?? task.spec.target.slice(-8), href: undefined };
+    };
+  }, [vms.data, volumes.data]);
 }
 
 /**
@@ -68,6 +72,7 @@ export function TaskTable({
   const { t, i18n } = useTranslation();
   const target = useTaskTarget();
   const nodes = useList("node");
+  const nodeById = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n])), [nodes.data]);
   return (
     <Table aria-labelledby={labelledBy}>
       <TableHeader>
@@ -89,7 +94,7 @@ export function TaskTable({
         )}
         {tasks.map((task) => {
           const { name, href } = target(task);
-          const node = nodes.data?.find((n) => n.id === task.spec.node);
+          const node = nodeById.get(task.spec.node);
           const time = uuidTime(task.id);
           return (
             <TableRow key={task.id}>

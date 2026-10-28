@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw";
 import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { createQueryClient } from "@/api/queryClient";
+import { TaskIndexProvider } from "@/api/taskIndex";
 import type { Principal, Resources, WatchKind } from "@/api/types";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { RequireAuth } from "@/auth/RequireAuth";
@@ -46,7 +47,11 @@ export function renderPage(
   server.use(http.get(apiUrl("/auth/whoami"), () => HttpResponse.json(as)));
   const router = createMemoryRouter(
     [
-      { element: <RequireAuth />, children: [{ path, element }] },
+      {
+        element: <RequireAuth />,
+        // 앱처럼 화면들 바깥에 Task 색인을 둔다.
+        children: [{ path, element: <TaskIndexProvider>{element}</TaskIndexProvider> }],
+      },
       { path: "*", element: <p>moved</p> },
     ],
     { initialEntries: [url] },
