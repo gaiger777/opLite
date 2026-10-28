@@ -100,9 +100,7 @@ it("force stops a VM while a snapshot is being taken but not while one is revert
   await userEvent.click(screen.getByRole("button", { name: "Actions for web" }));
   const item = await screen.findByRole("menuitem", { name: "Force stop" });
   expect(item).toHaveAttribute("aria-disabled", "true");
-  expect(item).toHaveAccessibleDescription(
-    "Force stop is not available while a snapshot is being reverted.",
-  );
+  expect(item).toHaveAccessibleDescription("Not available while a snapshot is being reverted.");
   expect(screen.getByRole("menuitem", { name: "Stop" })).not.toHaveAttribute("aria-disabled");
 });
 
@@ -124,10 +122,11 @@ it("blocks starting a VM whose start is still pending, alone or with others", as
   // Task 목록을 읽은 뒤에 메뉴를 연다.
   await waitFor(() => expect(queryClient.getQueryData(["list", "task"])).toBeDefined());
   await userEvent.click(screen.getByRole("button", { name: "Actions for db" }));
-  expect(await screen.findByRole("menuitem", { name: "Start" })).toHaveAttribute(
-    "aria-disabled",
-    "true",
-  );
+  const start = await screen.findByRole("menuitem", { name: "Start" });
+  expect(start).toHaveAttribute("aria-disabled", "true");
+  expect(start).toHaveAccessibleDescription("A power action is still in progress.");
+  // 골라도 시작하지 않는다.
+  await userEvent.click(start);
   await userEvent.keyboard("{Escape}");
 
   // 여럿을 시작할 때도 db는 건너뛴다.

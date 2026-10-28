@@ -105,10 +105,9 @@ it("does not remove this node even when it shows offline", async () => {
   mockLists({ node: [{ ...NODE, status: { ...NODE.status, online: false } }] });
   renderPage(<NodesPage />);
   await userEvent.click(await screen.findByRole("button", { name: "Actions for node-a" }));
-  expect(await screen.findByRole("menuitem", { name: "Remove from cluster" })).toHaveAttribute(
-    "aria-disabled",
-    "true",
-  );
+  const remove = await screen.findByRole("menuitem", { name: "Remove from cluster" });
+  expect(remove).toHaveAttribute("aria-disabled", "true");
+  expect(remove).toHaveAccessibleDescription("You are connected through this node.");
 });
 
 it("removes only offline nodes, after typing the name", async () => {

@@ -13,12 +13,12 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field, type FieldA11y } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { ReasonMenuItem } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -131,26 +131,26 @@ export function UsersPage() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      <DropdownMenuItem
-                        disabled={self}
+                      <ReasonMenuItem
+                        reason={self ? "users.reason.selfRole" : null}
                         onSelect={() => setDialog({ kind: "role", user })}
                       >
                         {t("users.changeRole")}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        disabled={self}
+                      </ReasonMenuItem>
+                      <ReasonMenuItem
+                        reason={self ? "users.reason.selfPassword" : null}
                         onSelect={() => setDialog({ kind: "password", user })}
                       >
                         {t("users.resetPassword")}
-                      </DropdownMenuItem>
+                      </ReasonMenuItem>
                       <DropdownMenuSeparator />
-                      <DropdownMenuItem
+                      <ReasonMenuItem
                         variant="destructive"
-                        disabled={self}
+                        reason={self ? "users.reason.selfDelete" : null}
                         onSelect={() => setDialog({ kind: "delete", user })}
                       >
                         {t("users.delete")}
-                      </DropdownMenuItem>
+                      </ReasonMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </TableCell>

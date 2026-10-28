@@ -144,7 +144,6 @@
       "failed": "VM이 실패 상태입니다.",
       "busy": "VM이 시작하거나 정지하는 중입니다."
     },
-    "forceStopReverting": "스냅샷을 되돌리는 중에는 강제 정지할 수 없습니다.",
     "deleteTitle": "{{name}}을(를) 삭제할까요?",
     "deleteDescription": "VM을 삭제합니다. 볼륨은 남습니다.",
     "deleteSnapshots_one": "스냅샷 {{count}}개도 모두 지우기",
@@ -307,18 +306,21 @@
     "deleteNamed": "{{name}} 삭제",
     "deleteTitle": "볼륨 {{name}}을(를) 삭제할까요?",
     "deleteDescription": "디스크 이미지와 그 안의 데이터가 모두 지워집니다.",
-    "inUse": "먼저 VM에서 빼세요.",
     "resize": "크기 늘리기",
     "resizeNamed": "{{name}} 크기 늘리기",
     "resizeTitle": "볼륨 {{name}} 크기 늘리기",
     "resizeDescription": "볼륨은 늘리기만 할 수 있습니다. 실행 중인 VM은 바로 새 크기를 봅니다. 게스트 안의 파티션과 파일 시스템은 직접 늘리세요.",
     "currentSize": "지금 크기: {{size}}",
     "newSize": "새 크기(GiB)",
-    "notReady": "준비되면 쓸 수 있습니다.",
     "errors": {
       "reserved": "import는 예약된 이름입니다.",
       "exists": "같은 이름의 볼륨이 이미 있습니다.",
       "grow": "지금 크기보다 큰 값을 넣으세요."
+    },
+    "reason": {
+      "inUse": "먼저 VM에서 빼세요.",
+      "notReady": "준비되면 쓸 수 있습니다.",
+      "vmsUnknown": "어느 VM이 쓰는지 알 수 없습니다."
     }
   },
   "uploads": {
@@ -414,7 +416,11 @@
     "removeTitle": "{{name}}을(를) 클러스터에서 제거할까요?",
     "removeDescription": "완전히 멈춘 노드에만 쓰세요. 지금 데이터로는 다시 합류할 수 없고, 이 노드에 배정된 VM은 그대로 남습니다.",
     "removeNote": "오프라인 노드만 여기서 제거할 수 있습니다. 살아 있는 노드는 그 노드에서 oplctl cluster leave를 실행하세요.",
-    "removed": "{{name}}을(를) 클러스터에서 제거했습니다."
+    "removed": "{{name}}을(를) 클러스터에서 제거했습니다.",
+    "reason": {
+      "thisNode": "지금 이 노드로 접속해 있습니다.",
+      "online": "노드가 온라인입니다. 그 노드에서 oplctl cluster leave를 실행하세요."
+    }
   },
   "accounts": {
     "currentPassword": "현재 비밀번호",
@@ -453,7 +459,12 @@
     "deleteDescription": "사용자와 그 사용자의 API 토큰이 지워집니다.",
     "deleted": "사용자 {{name}}을(를) 삭제했습니다.",
     "adminOnly": "사용자는 관리자만 관리할 수 있습니다.",
-    "selfNote": "내 비밀번호는 계정 메뉴에서 바꿉니다. 내 역할 변경과 삭제는 다른 관리자가 합니다."
+    "selfNote": "내 비밀번호는 계정 메뉴에서 바꿉니다. 내 역할 변경과 삭제는 다른 관리자가 합니다.",
+    "reason": {
+      "selfRole": "내 역할은 다른 관리자가 바꿉니다.",
+      "selfPassword": "내 비밀번호는 계정 메뉴에서 바꿉니다.",
+      "selfDelete": "내 계정은 다른 관리자가 삭제합니다."
+    }
   },
   "tokens": {
     "name": "이름",

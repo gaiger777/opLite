@@ -1,5 +1,5 @@
 import { Maximize2, Plus, Trash2, Upload } from "lucide-react";
-import { type RefObject, useMemo, useRef, useState } from "react";
+import { type RefObject, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -13,6 +13,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { ReasonButton, ReasonList } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -63,6 +64,7 @@ export function VolumesPage() {
     return users;
   }, [vms.data]);
   const nodeById = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n])), [nodes.data]);
+  const reasonBase = useId();
 
   return (
     <div className="flex flex-col gap-4">
@@ -109,6 +111,17 @@ export function VolumesPage() {
             const vm = userByVolume.get(volume.name);
             const ready = volume.status.phase === "ready";
             const node = volume.status.node ? nodeById.get(volume.status.node) : undefined;
+            // 만드는 중인 볼륨은 서버가 크기를 바꾸지 않는다(volume_not_ready).
+            const resizeReason = ready ? null : "volumes.reason.notReady";
+            // 서버는 VM이 쓰거나 아직 만드는 볼륨을 지우지 않는다. VM 목록을 다 읽어야 안다.
+            const deleteReason = !ready
+              ? "volumes.reason.notReady"
+              : !vms.isSuccess
+                ? "volumes.reason.vmsUnknown"
+                : vm
+                  ? "volumes.reason.inUse"
+                  : null;
+            const reasons = `${reasonBase}-${volume.id}`;
             return (
               <TableRow key={volume.id}>
                 <TableCell className="font-medium">{volume.name}</TableCell>
@@ -131,49 +144,42 @@ export function VolumesPage() {
                 <TableCell>{node?.name ?? volume.status.node?.slice(-8) ?? "—"}</TableCell>
                 <TableCell>
                   {vm ? (
-                    <>
-                      <Link
-                        to={`/vms/${encodeURIComponent(vm.name)}`}
-                        className="underline-offset-4 hover:underline"
-                      >
-                        {vm.name}
-                      </Link>
-                      {write && (
-                        <div className="text-xs text-muted-foreground">{t("volumes.inUse")}</div>
-                      )}
-                    </>
+                    <Link
+                      to={`/vms/${encodeURIComponent(vm.name)}`}
+                      className="underline-offset-4 hover:underline"
+                    >
+                      {vm.name}
+                    </Link>
                   ) : (
                     "—"
                   )}
                 </TableCell>
                 {write && (
                   <TableCell className="text-right">
-                    <Button
+                    <ReasonButton
                       variant="ghost"
                       size="icon-sm"
                       aria-label={t("volumes.resizeNamed", { name: volume.name })}
-                      // 만드는 중인 볼륨은 서버가 크기를 바꾸지 않는다(volume_not_ready).
-                      disabled={!ready}
+                      reason={resizeReason}
+                      reasons={reasons}
                       onClick={(e) => {
                         opener.current = e.currentTarget;
                         setResizing(volume.id);
                       }}
                     >
                       <Maximize2 />
-                    </Button>
-                    <Button
+                    </ReasonButton>
+                    <ReasonButton
                       variant="ghost"
                       size="icon-sm"
                       aria-label={t("volumes.deleteNamed", { name: volume.name })}
-                      // 서버는 VM이 쓰거나 아직 만드는 볼륨을 지우지 않는다. VM 목록을 다 읽어야 안다.
-                      disabled={!vms.isSuccess || vm !== undefined || !ready}
+                      reason={deleteReason}
+                      reasons={reasons}
                       onClick={() => setDeleting(volume)}
                     >
                       <Trash2 />
-                    </Button>
-                    {!ready && (
-                      <div className="text-xs text-muted-foreground">{t("volumes.notReady")}</div>
-                    )}
+                    </ReasonButton>
+                    <ReasonList base={reasons} reasons={[resizeReason, deleteReason]} />
                   </TableCell>
                 )}
               </TableRow>

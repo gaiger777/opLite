@@ -10,6 +10,7 @@ import type { Node, Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ReasonMenuItem } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -153,14 +154,20 @@ export function NodesPage() {
                         )}
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
-                      <DropdownMenuItem
+                      <ReasonMenuItem
                         variant="destructive"
                         // 살아 있는 노드는 그 노드에서 `oplctl cluster leave`로 뺀다(서버도 막는다).
-                        disabled={node.status.online || node.id === cluster.data?.node}
+                        reason={
+                          node.id === cluster.data?.node
+                            ? "nodes.reason.thisNode"
+                            : node.status.online
+                              ? "nodes.reason.online"
+                              : null
+                        }
                         onSelect={() => setRemoving(node)}
                       >
                         {t("nodes.remove")}
-                      </DropdownMenuItem>
+                      </ReasonMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </TableCell>

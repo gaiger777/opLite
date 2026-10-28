@@ -1,5 +1,5 @@
 import { MoreHorizontal } from "lucide-react";
-import { useId, useRef, useState, type RefObject } from "react";
+import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 
@@ -8,6 +8,7 @@ import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ReasonMenuItem } from "@/components/Reason";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -29,11 +30,11 @@ export function VmMenu({ vm }: { vm: Vm }) {
   const [confirm, setConfirm] = useState<VmDialog | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
-  const hint = useId();
-  // 서버는 되돌리기 중의 강제 정지를 받지 않는다. Task 목록을 아직 모르면 서버에 맡긴다.
-  // 상태로도 끌 수 없는 VM이면 까닭은 되돌리기가 아니므로 보이지 않는다.
-  const forceStop = availability(vm, "force-stop", vmTasks);
-  const reverting = !forceStop.ok && forceStop.reason === "vms.reason.reverting";
+  // Task 목록을 아직 모르면 Task 때문에는 막지 않는다(서버에 맡긴다).
+  const reasonOf = (action: VmAction | "console" | "delete") => {
+    const able = availability(vm, action, vmTasks);
+    return able.ok ? null : able.reason;
+  };
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
   // 복제는 새 VM과 새 볼륨을 만든다.
@@ -58,31 +59,23 @@ export function VmMenu({ vm }: { vm: Vm }) {
         <DropdownMenuContent align="end">
           {operate &&
             ACTIONS.map((action) => (
-              <DropdownMenuItem
+              <ReasonMenuItem
                 key={action}
-                disabled={!availability(vm, action, vmTasks).ok}
-                aria-describedby={action === "force-stop" && reverting ? hint : undefined}
+                reason={reasonOf(action)}
                 onSelect={() =>
                   action === "force-stop" ? setConfirm("force-stop") : void run(vm, action)
                 }
               >
                 {t(`vms.action.${action}`)}
-              </DropdownMenuItem>
+              </ReasonMenuItem>
             ))}
-          {/* Radix는 비활성 항목을 키보드로 건너뛰므로 aria-describedby가 읽히지 않을 수 있다.
-              같은 까닭은 상세 화면에도 보인다. */}
-          {operate && reverting && (
-            <p id={hint} className="px-1.5 py-1 text-xs text-muted-foreground">
-              {t("vms.forceStopReverting")}
-            </p>
-          )}
           {operate && (
-            <DropdownMenuItem
-              disabled={!availability(vm, "console", vmTasks).ok}
+            <ReasonMenuItem
+              reason={reasonOf("console")}
               onSelect={() => void navigate(`/vms/${encodeURIComponent(vm.name)}/console`)}
             >
               {t("vms.action.console")}
-            </DropdownMenuItem>
+            </ReasonMenuItem>
           )}
           {clone && (
             <DropdownMenuItem onSelect={() => setConfirm("clone")}>
@@ -92,13 +85,13 @@ export function VmMenu({ vm }: { vm: Vm }) {
           {write && (
             <>
               <DropdownMenuSeparator />
-              <DropdownMenuItem
+              <ReasonMenuItem
                 variant="destructive"
-                disabled={!availability(vm, "delete", vmTasks).ok}
+                reason={reasonOf("delete")}
                 onSelect={() => setConfirm("delete")}
               >
                 {t("vms.action.delete")}
-              </DropdownMenuItem>
+              </ReasonMenuItem>
             </>
           )}
         </DropdownMenuContent>

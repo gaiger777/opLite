@@ -43,10 +43,9 @@ it("lists users and keeps admins from changing themselves", async () => {
   const me = (await within(table).findByText("admin")).closest("tr")!;
   expect(me).toHaveTextContent("(you)");
   await userEvent.click(within(me).getByRole("button", { name: "Actions for admin" }));
-  expect(await screen.findByRole("menuitem", { name: "Delete" })).toHaveAttribute(
-    "aria-disabled",
-    "true",
-  );
+  const remove = await screen.findByRole("menuitem", { name: "Delete" });
+  expect(remove).toHaveAttribute("aria-disabled", "true");
+  expect(remove).toHaveAccessibleDescription("Only another administrator can delete your account.");
   expect(screen.getByRole("menuitem", { name: "Reset password" })).toHaveAttribute(
     "aria-disabled",
     "true",

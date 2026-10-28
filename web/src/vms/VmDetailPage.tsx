@@ -8,6 +8,7 @@ import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ListPending } from "@/components/ListPending";
+import { ReasonButton, ReasonList } from "@/components/Reason";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -127,21 +128,29 @@ function VmHeader({ vm }: { vm: Vm }) {
   const nodeId = vm.spec.node ?? vm.status.node;
   const node = nodes.data?.find((n) => n.id === nodeId);
   const operate = can(me.role, "operate", "vm");
-  // 서버는 되돌리기 중의 강제 정지를 받지 않는다. Task 목록을 아직 모르면 서버에 맡긴다.
-  // 상태로도 끌 수 없는 VM이면 까닭은 되돌리기가 아니므로 보이지 않는다.
-  const forceStop = availability(vm, "force-stop", vmTasks);
-  const reverting = operate && !forceStop.ok && forceStop.reason === "vms.reason.reverting";
+  const write = can(me.role, "write", "vm");
+  // Task 목록을 아직 모르면 Task 때문에는 막지 않는다(서버에 맡긴다).
+  const reasonOf = (action: VmAction | "console" | "delete") => {
+    const able = availability(vm, action, vmTasks);
+    return able.ok ? null : able.reason;
+  };
+  const consoleReason = reasonOf("console");
+  // 보이는 버튼의 막힌 이유만 모은다.
+  const reasons = [
+    ...(operate ? [...ACTIONS.map(reasonOf), consoleReason] : []),
+    write ? reasonOf("delete") : null,
+  ];
   const button = (action: VmAction) => (
-    <Button
+    <ReasonButton
       key={action}
       variant="outline"
       size="sm"
-      disabled={!availability(vm, action, vmTasks).ok}
-      aria-describedby={action === "force-stop" && reverting ? hint : undefined}
+      reason={reasonOf(action)}
+      reasons={hint}
       onClick={() => (action === "force-stop" ? setConfirm("force-stop") : void run(vm, action))}
     >
       {t(`vms.action.${action}`)}
-    </Button>
+    </ReasonButton>
   );
   return (
     <div className="flex flex-wrap items-center justify-between gap-2">
@@ -152,39 +161,37 @@ function VmHeader({ vm }: { vm: Vm }) {
       </div>
       <div className="flex flex-wrap gap-2">
         {operate && ACTIONS.map(button)}
-        {operate && vm.status.phase === "running" && (
-          <Button variant="outline" size="sm" asChild>
+        {/* 막혀도 같은 링크로 두어 상태가 바뀔 때 포커스를 잃지 않는다. 막히면 눌러도 열리지 않는다. */}
+        {operate && (
+          <ReasonButton variant="outline" size="sm" reason={consoleReason} reasons={hint} asChild>
             <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
               {t("vms.openConsole")}
             </Link>
-          </Button>
+          </ReasonButton>
         )}
-        {can(me.role, "write", "vm") && (
+        {write && (
           <Button variant="outline" size="sm" asChild>
             <Link to={`/vms/${encodeURIComponent(vm.name)}/edit`}>{t("vms.action.edit")}</Link>
           </Button>
         )}
-        {can(me.role, "write", "vm") && can(me.role, "write", "volume") && (
+        {write && can(me.role, "write", "volume") && (
           <Button variant="outline" size="sm" onClick={() => setConfirm("clone")}>
             {t("vms.action.clone")}
           </Button>
         )}
-        {can(me.role, "write", "vm") && (
-          <Button
+        {write && (
+          <ReasonButton
             variant="destructive"
             size="sm"
-            disabled={!availability(vm, "delete", vmTasks).ok}
+            reason={reasonOf("delete")}
+            reasons={hint}
             onClick={() => setConfirm("delete")}
           >
             {t("vms.action.delete")}
-          </Button>
+          </ReasonButton>
         )}
       </div>
-      {reverting && (
-        <p id={hint} className="basis-full text-sm text-muted-foreground">
-          {t("vms.forceStopReverting")}
-        </p>
-      )}
+      <ReasonList base={hint} reasons={reasons} className="basis-full" />
       <VmConfirm
         vm={vm}
         which={confirm}

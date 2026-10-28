@@ -30,8 +30,11 @@ it("shows a VM, its hardware and its tasks", async () => {
   expect(await screen.findByRole("heading", { name: "web" })).toBeInTheDocument();
   expect(await screen.findByText("node-a")).toBeInTheDocument();
   expect(screen.getByText("1 × 2 cores (host)")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
-  expect(screen.getByRole("button", { name: "Delete" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Start" })).toHaveAttribute("aria-disabled", "true");
+  expect(screen.getByRole("button", { name: "Start" })).toHaveAccessibleDescription(
+    "The VM is running.",
+  );
+  expect(screen.getByRole("button", { name: "Delete" })).toHaveAttribute("aria-disabled", "true");
 
   await userEvent.click(screen.getByRole("tab", { name: "Hardware" }));
   expect(screen.getByText("web-root")).toBeInTheDocument();
@@ -193,19 +196,17 @@ it("blocks force stop while a snapshot is being reverted and says why", async ()
   mockLists({ vm: [web], node: [NODE], task: [revert] });
   const { queryClient } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
   const button = await screen.findByRole("button", { name: "Force stop" });
-  await waitFor(() => expect(button).toBeDisabled());
-  expect(button).toHaveAccessibleDescription(
-    "Force stop is not available while a snapshot is being reverted.",
-  );
+  await waitFor(() => expect(button).toHaveAttribute("aria-disabled", "true"));
+  expect(button).toHaveAccessibleDescription("Not available while a snapshot is being reverted.");
   // 되돌리기가 끝나면 다시 켠다.
   queryClient.setQueryData(["list", "task"], {
     revision: 2,
     items: [{ ...revert, status: { state: "succeeded", error: null } }],
   });
-  await waitFor(() => expect(button).toBeEnabled());
+  await waitFor(() => expect(button).not.toHaveAttribute("aria-disabled"));
   expect(button).not.toHaveAccessibleDescription();
   expect(
-    screen.queryByText("Force stop is not available while a snapshot is being reverted."),
+    screen.queryByText("Not available while a snapshot is being reverted."),
   ).not.toBeInTheDocument();
 });
 
@@ -219,6 +220,28 @@ it("does not blame a revert for a VM that is already off", async () => {
   const { queryClient } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/db" });
   const button = await screen.findByRole("button", { name: "Force stop" });
   await waitFor(() => expect(queryClient.getQueryData(["list", "task"])).toBeDefined());
-  expect(button).toBeDisabled();
-  expect(button).not.toHaveAccessibleDescription();
+  expect(button).toHaveAttribute("aria-disabled", "true");
+  expect(button).toHaveAccessibleDescription("The VM is stopped.");
+});
+
+it("keeps the same console link when the VM stops and blocks it with a reason", async () => {
+  mockLists({ vm: [web], node: [NODE] });
+  const { queryClient } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  const link = await screen.findByRole("link", { name: "Open console" });
+  expect(link).not.toHaveAttribute("aria-disabled");
+  link.focus();
+  // 멈추면 같은 링크가 막히고 이유를 읽는다. 포커스는 그대로다.
+  queryClient.setQueryData(["list", "vm"], {
+    revision: 2,
+    items: [
+      {
+        ...web,
+        spec: { ...web.spec, power: "stopped" },
+        status: { ...web.status, phase: "stopped" },
+      },
+    ],
+  });
+  await waitFor(() => expect(link).toHaveAttribute("aria-disabled", "true"));
+  expect(link).toHaveAccessibleDescription("The VM is stopped.");
+  expect(link).toHaveFocus();
 });

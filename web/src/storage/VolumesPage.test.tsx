@@ -36,18 +36,31 @@ it("lists volumes with their size, state and VM", async () => {
   expect(root).toHaveTextContent("1 GiB");
   expect(root).toHaveTextContent("Ready");
   expect(within(root).getByRole("link", { name: "web" })).toHaveAttribute("href", "/vms/web");
-  expect(within(root).getByRole("button", { name: "Delete root" })).toBeDisabled();
-  expect(root).toHaveTextContent("Remove it from the VM first.");
+  expect(within(root).getByRole("button", { name: "Delete root" })).toHaveAccessibleDescription(
+    "Remove it from the VM first.",
+  );
   const img = within(table).getByText("img").closest("tr")!;
   expect(img).toHaveTextContent("Creating");
   const sizeColumn = within(table)
     .getAllByRole("columnheader")
     .findIndex((h) => h.textContent === "Size");
   expect(within(img).getAllByRole("cell")[sizeColumn]).toHaveTextContent("—");
-  expect(within(img).getByRole("button", { name: "Delete img" })).toBeDisabled();
-  expect(within(img).getByRole("button", { name: "Resize img" })).toBeDisabled();
-  expect(img).toHaveTextContent("Available once ready.");
-  expect(within(root).getByRole("button", { name: "Resize root" })).toBeEnabled();
+  expect(within(img).getByRole("button", { name: "Delete img" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  expect(within(img).getByRole("button", { name: "Resize img" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  expect(within(img).getByRole("button", { name: "Resize img" })).toHaveAccessibleDescription(
+    "Available once ready.",
+  );
+  // 두 버튼이 같은 이유면 한 번만 보인다.
+  expect(within(img).getAllByText("Available once ready.")).toHaveLength(1);
+  expect(within(root).getByRole("button", { name: "Resize root" })).not.toHaveAttribute(
+    "aria-disabled",
+  );
   expect(root).not.toHaveTextContent("Available once ready.");
 });
 
@@ -109,7 +122,9 @@ it("does not offer a delete without the VMs", async () => {
   );
   renderPage(<VolumesPage />);
   const data = (await screen.findByText("data")).closest("tr")!;
-  expect(within(data).getByRole("button", { name: "Delete data" })).toBeDisabled();
+  expect(within(data).getByRole("button", { name: "Delete data" })).toHaveAccessibleDescription(
+    "Cannot tell which VMs use it.",
+  );
   expect(data).toHaveTextContent("0000abcd");
 });
 
