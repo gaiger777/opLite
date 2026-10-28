@@ -34,6 +34,20 @@ async fn rejects_bad_backend_values() {
             ),
             "options with space",
         ),
+        (
+            pool(
+                "vg",
+                json!({ "kind": "lvm-thin", "vg": "-vg", "thinpool": "tp" }),
+            ),
+            "vg starting with '-'",
+        ),
+        (
+            pool(
+                "tp",
+                json!({ "kind": "lvm-thin", "vg": "vg0", "thinpool": "a/b" }),
+            ),
+            "thin pool with '/'",
+        ),
     ] {
         let (status, body) = admin.post("/storage-pools", bad).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
@@ -96,6 +110,60 @@ async fn nfs_pools_are_always_shared() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "invalid_request");
+}
+
+/// LVM-thin 풀은 노드 로컬이고 raw 볼륨만 담는다.
+#[tokio::test]
+async fn lvm_thin_pools_are_node_local_and_hold_raw_volumes() {
+    let mut env = Env::start().await;
+    // Task는 실행하지 않고 받아들였는지만 본다.
+    env.stop_runner().await;
+    let admin = env.admin().await;
+    let lvm = json!({ "kind": "lvm-thin", "vg": "vg0", "thinpool": "tp" });
+    let (status, body) = admin
+        .post(
+            "/storage-pools",
+            json!({ "name": "vg2", "spec": { "backend": lvm, "shared": true } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert!(
+        body["message"].as_str().unwrap().contains("node-local"),
+        "{body}"
+    );
+    let (status, body) = admin.post("/storage-pools", pool("vg", lvm.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["spec"]["shared"], false, "{body}");
+    assert_eq!(body["spec"]["backend"]["kind"], "lvm-thin", "{body}");
+    let (status, body) = admin
+        .post(
+            "/storage-pools",
+            json!({ "name": "vg3", "spec": { "backend": lvm, "shared": false } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    env.pool_ready("vg").await;
+
+    let create = |format: &str| json!({ "name": "disk", "spec": { "pool": "vg", "size_bytes": 1 << 20, "format": format } });
+    let (status, body) = admin.post("/volumes", create("qcow2")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["message"], "lvm-thin pools hold raw volumes");
+    let (status, body) = admin.post("/volumes", create("raw")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // 가져오기도 같다. 형식을 적지 않으면 qcow2이므로 거절한다.
+    let check = |format: &str| {
+        format!("/volumes/import/check?name=up&pool=vg&source_format=vmdk&size=512{format}")
+    };
+    for format in ["&format=qcow2", ""] {
+        let (status, body) = admin.post(&check(format), Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{format}: {body}");
+        assert_eq!(body["message"], "lvm-thin pools hold raw volumes");
+    }
+    let (status, body) = admin.post(&check("&format=raw"), Value::Null).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
 
 /// 풀 `pools`가 준비됐다고 알린 다른 노드를 저장소에 직접 만든다.

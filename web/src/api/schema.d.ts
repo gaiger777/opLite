@@ -1261,6 +1261,13 @@ export interface components {
             options?: string | null;
             /** @description 호스트 이름 또는 IP. IPv6는 `[...]` 없이 적는다. */
             server: string;
+        } | {
+            /** @enum {string} */
+            kind: "lvm-thin";
+            /** @description VG 안의 thin pool LV 이름 */
+            thinpool: string;
+            /** @description 볼륨 그룹 이름 */
+            vg: string;
         };
         /** @description 한 노드에서 본 스토리지 풀 상태 */
         PoolState: {

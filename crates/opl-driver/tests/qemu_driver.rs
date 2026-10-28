@@ -10,7 +10,7 @@ use opl_driver::{
     StopMode,
 };
 use opl_qemu::HostProfile;
-use opl_types::runtime::{ImageFormat, RuntimeDisk, VmRuntimeSpec};
+use opl_types::runtime::{DiskKind, ImageFormat, RuntimeDisk, VmRuntimeSpec};
 use opl_types::vm::{Arch, CpuModel, CpuSpec, DiskBus, Firmware};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -305,6 +305,7 @@ fn with_qcow2_disk(mut vm: VmRuntimeSpec, path: &Path) -> VmRuntimeSpec {
     assert!(status.success());
     vm.disks.push(RuntimeDisk {
         path: path.to_path_buf(),
+        kind: DiskKind::File,
         format: ImageFormat::Qcow2,
         bus: DiskBus::VirtioBlk,
         boot_order: None,

@@ -27,6 +27,7 @@ pub const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 쓰기 확인과 용량 읽기를 기다리는 시간. NFS 서버가 멈추면 이 작업이 멈춘다.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const NFS_UNSUPPORTED: &str = "nfs pools are not supported on macOS";
+const LVM_UNSUPPORTED: &str = "lvm-thin pools are not supported yet";
 const NFS_NOT_RESPONDING: &str = "nfs server not responding";
 const DIR_NOT_RESPONDING: &str = "pool directory not responding";
 const MOUNT_IN_PROGRESS: &str = "mount in progress";
@@ -357,6 +358,9 @@ impl Pools {
     ) -> Step {
         let (server, export, options) = match &pool.spec.backend {
             PoolBackend::Dir { path } => return Step::Check(path.clone(), DIR_NOT_RESPONDING),
+            PoolBackend::LvmThin { .. } => {
+                return Step::State(not_ready(pool.id, LVM_UNSUPPORTED.into()));
+            }
             PoolBackend::Nfs {
                 server,
                 export,
@@ -922,6 +926,24 @@ mod tests {
         let state = &s.states()["nas"];
         assert_eq!(state.total_bytes, 101 * GIB);
         assert_eq!(state.available_bytes, 41 * GIB);
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// LVM-thin 풀은 아직 확인하지 않고 준비되지 않았다고 적는다.
+    #[tokio::test]
+    async fn lvm_thin_pools_are_not_ready_yet() {
+        let mut s = setup().await;
+        let backend = PoolBackend::LvmThin {
+            vg: "vg0".into(),
+            thinpool: "tp".into(),
+        };
+        let vg = s.pool("vg", backend, vec![]).await;
+        s.pools.settle().await;
+        assert_eq!(s.fake.calls(), Vec::<String>::new());
+        assert_eq!(
+            s.states()["vg"],
+            not_ready(vg.id, "lvm-thin pools are not supported yet".into())
+        );
         s.cluster.shutdown().await.unwrap();
     }
 

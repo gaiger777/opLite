@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use opl_qemu::{HostProfile, QmpClient, RunState, RuntimePaths, build_cmdline};
-use opl_types::runtime::{ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
+use opl_types::runtime::{
+    DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec,
+};
 use opl_types::vm::{Arch, CpuModel, CpuSpec, DiskBus, Firmware, NicModel};
 use uuid::Uuid;
 
@@ -30,6 +32,7 @@ fn spec(id: Uuid, disk: PathBuf) -> VmRuntimeSpec {
         machine: Arch::native().machine(),
         disks: vec![RuntimeDisk {
             path: disk,
+            kind: DiskKind::File,
             format: ImageFormat::Qcow2,
             bus: DiskBus::VirtioBlk,
             boot_order: Some(1),

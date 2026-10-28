@@ -150,11 +150,12 @@ pub trait Storage: Send + Sync {
 }
 
 /// 풀의 볼륨 파일이 놓이는 디렉터리. `dir` 풀은 그 경로, `nfs` 풀은 이 노드의 마운트 지점
-/// `{mount_root}/{풀 id}`다.
+/// `{mount_root}/{풀 id}`, `lvm-thin` 풀은 VG의 장치 디렉터리 `/dev/{vg}`다.
 pub fn pool_root(pool: &StoragePool, mount_root: &Path) -> PathBuf {
     match &pool.spec.backend {
         PoolBackend::Dir { path } => path.clone(),
         PoolBackend::Nfs { .. } => mount_root.join(pool.id.to_string()),
+        PoolBackend::LvmThin { vg, .. } => Path::new("/dev").join(vg),
     }
 }
 
@@ -178,6 +179,12 @@ fn check_pool_root_with(
     mountinfo: &ReadMountinfo,
 ) -> Result<PathBuf, DriverError> {
     let root = pool_root(pool, mount_root);
+    // 파일 저장소는 LVM 풀을 다루지 않는다. LVM 드라이버가 들어오기 전까지는 쓸 수 없다.
+    if let PoolBackend::LvmThin { .. } = &pool.spec.backend {
+        return Err(DriverError::InvalidSpec(
+            "lvm-thin pools are not supported yet".into(),
+        ));
+    }
     if let PoolBackend::Nfs { .. } = &pool.spec.backend {
         // mountinfo는 실제 경로를 적는다. 마운트 지점은 stat하지 않고(NFS 서버가 멈추면 끝나지 않는다)
         // 로컬 디렉터리인 마운트 루트만 실제 경로로 바꾼다.
@@ -889,6 +896,40 @@ mod tests {
             mnt.join(nfs.id.to_string())
                 .join("00000000-0000-0000-0000-000000000000.qcow2")
         );
+    }
+
+    fn lvm_pool() -> StoragePool {
+        Resource::new(
+            "vg",
+            StoragePoolSpec {
+                backend: PoolBackend::LvmThin {
+                    vg: "vg0".into(),
+                    thinpool: "tp".into(),
+                },
+                nodes: vec![],
+                shared: false,
+            },
+        )
+    }
+
+    /// LVM 드라이버가 들어오기 전에는 파일 저장소가 LVM 풀을 거절한다(`/dev/{vg}`에 파일을 만들지 않는다).
+    #[tokio::test]
+    async fn lvm_thin_pool_is_not_supported_yet() {
+        let tools = tempfile::tempdir().unwrap();
+        let mnt = tempfile::tempdir().unwrap();
+        let p = lvm_pool();
+        assert_eq!(pool_root(&p, mnt.path()), PathBuf::from("/dev/vg0"));
+        let storage = DirStorage::new(fake_tool(tools.path(), "exit 1"), mnt.path());
+        let unsupported = |e: DriverError| match e {
+            DriverError::InvalidSpec(msg) => assert!(msg.contains("not supported"), "{msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        };
+        unsupported(check_pool_root(&p, mnt.path()).unwrap_err());
+        let (id, f) = (Uuid::nil(), ImageFormat::Raw);
+        unsupported(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
+        unsupported(storage.delete_volume(&p, id, f).await.unwrap_err());
+        unsupported(storage.volume_info(&p, id, f).await.unwrap_err());
+        unsupported(storage.capacity(&p).await.unwrap_err());
     }
 
     #[tokio::test]

@@ -14,8 +14,8 @@ use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::SnapshotSpec;
 use opl_types::storage::{
-    SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, is_shared,
-    pool_error_on, pool_listed_on, pool_usable_on,
+    PoolBackend, SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
+    is_shared, pool_error_on, pool_listed_on, pool_usable_on,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::VmSpec;
@@ -136,6 +136,14 @@ fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
         .ok_or_else(|| ApiError::bad_request(format!("storage pool {name:?} not found")))
 }
 
+/// 풀이 `format` 볼륨을 담을 수 있는지. LVM-thin 풀은 raw만 담는다.
+fn check_pool_format(pool: &StoragePool, format: ImageFormat) -> Result<(), ApiError> {
+    if matches!(pool.spec.backend, PoolBackend::LvmThin { .. }) && format != ImageFormat::Raw {
+        return Err(ApiError::bad_request("lvm-thin pools hold raw volumes"));
+    }
+    Ok(())
+}
+
 /// 볼륨 리소스를 만들고, 파일을 만들 Task를 돌려준다(202). Task가 실패하면 리소스도 지운다.
 #[utoipa::path(post, path = "/volumes", tag = "storage",
     request_body = CreateRequest<VolumeSpec>,
@@ -151,6 +159,7 @@ pub async fn create_volume(
         return Err(ApiError::bad_request("size_bytes must be greater than 0"));
     }
     let pool = find_pool(&state, &req.spec.pool)?;
+    check_pool_format(&pool, req.spec.format)?;
     let node = pool_node(&state, &pool)?;
     let mut volume: Volume = Resource::new(req.name, req.spec);
     volume.labels = req.labels;
@@ -206,6 +215,7 @@ pub async fn check_import(
     state.authorize(principal, Action::Write, VolumeSpec::KIND)?;
     check_volume_name(&q.name)?;
     let pool = find_pool(state, &q.pool)?;
+    check_pool_format(&pool, q.format)?;
     check_pool_on(state, &pool, state.node, || {
         format!(
             "storage pool {:?} is not available on this node; upload to one of its nodes",

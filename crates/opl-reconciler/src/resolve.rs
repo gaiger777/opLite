@@ -6,7 +6,7 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DirStorage, check_pool_root};
 use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
 use opl_types::node::NodeSpec;
-use opl_types::runtime::{NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
+use opl_types::runtime::{DiskKind, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
 use opl_types::storage::{
     PoolBackend, StoragePoolSpec, VolumeSpec, pool_error_on, pool_listed_on, pool_state_on,
 };
@@ -26,6 +26,9 @@ pub enum ResolveError {
     /// 이 노드의 OS(macOS)는 NFS 풀을 지원하지 않는다. 기다려도 풀리지 않는다.
     #[error("storage pool {0:?} is an nfs pool, which is not supported on this node's OS")]
     NfsUnsupported(String),
+    /// 이 노드에서 풀의 백엔드를 쓸 수 없다(이유). 기다려도 풀리지 않는다.
+    #[error("storage pool {0:?} cannot be used on this node: {1}")]
+    PoolUnsupported(String, &'static str),
     #[error("network {0:?} not found")]
     NetworkNotFound(String),
     #[error("nic {0} has no MAC address")]
@@ -58,6 +61,13 @@ pub fn runtime_spec(
         if !pool_listed_on(&pool, node) {
             return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
         }
+        // LVM-thin 풀의 디스크는 아직 다루지 않는다.
+        if matches!(pool.spec.backend, PoolBackend::LvmThin { .. }) {
+            return Err(ResolveError::PoolUnsupported(
+                pool_name.clone(),
+                "lvm-thin pools are not supported yet",
+            ));
+        }
         // opld는 Linux에서만 NFS 풀을 마운트한다.
         if !cfg!(target_os = "linux") && matches!(pool.spec.backend, PoolBackend::Nfs { .. }) {
             return Err(ResolveError::NfsUnsupported(pool_name.clone()));
@@ -78,6 +88,7 @@ pub fn runtime_spec(
         }
         disks.push(RuntimeDisk {
             path: DirStorage::volume_path(&pool, mount_root, volume.id, volume.spec.format),
+            kind: DiskKind::File,
             format: volume.spec.format,
             bus: disk.bus,
             boot_order: disk.boot_order,

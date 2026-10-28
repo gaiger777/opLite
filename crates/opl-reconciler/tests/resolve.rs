@@ -9,7 +9,7 @@ use opl_reconciler::resolve::{ResolveError, runtime_spec};
 use opl_types::network::{Network, NetworkSpec, tap_name};
 use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
-use opl_types::runtime::{ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
+use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::vm::{DiskBus, DiskSpec, MacAddr, NicModel, NicSpec};
 use tempfile::TempDir;
@@ -78,6 +78,7 @@ async fn resolves_volumes_to_pool_paths_and_user_network() {
         spec.disks,
         vec![RuntimeDisk {
             path: format!("/pools/local/{}.qcow2", root.id).into(),
+            kind: DiskKind::File,
             format: ImageFormat::Qcow2,
             bus: DiskBus::VirtioBlk,
             boot_order: Some(1),
@@ -147,6 +148,35 @@ async fn refuses_nfs_volumes_until_mounted() {
         matches!(&err, ResolveError::PoolUnavailable(n, e) if n == "nas" && e.contains("not mounted")),
         "{err:?}"
     );
+}
+
+/// LVM-thin 풀의 디스크는 아직 쓸 수 없다. 기다려도 풀리지 않으므로 참조 오류다(VM을 끄고 이유를 남긴다).
+#[tokio::test]
+async fn refuses_lvm_thin_volumes_for_now() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let vg: StoragePool = Resource::new(
+        "vg",
+        StoragePoolSpec {
+            backend: PoolBackend::LvmThin {
+                vg: "vg0".into(),
+                thinpool: "tp".into(),
+            },
+            nodes: vec![],
+            shared: false,
+        },
+    );
+    cluster.create(&vg).await.unwrap();
+    cluster.create(&volume("root", "vg")).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT)).unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::PoolUnsupported(n, _) if n == "vg"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("not supported"), "{err}");
 }
 
 #[tokio::test]

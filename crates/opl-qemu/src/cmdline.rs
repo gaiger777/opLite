@@ -193,7 +193,7 @@ fn esc_path(p: &Path) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use opl_types::runtime::{RuntimeDisk, RuntimeNic};
+    use opl_types::runtime::{DiskKind, RuntimeDisk, RuntimeNic};
     use opl_types::vm::CpuSpec;
     use uuid::Uuid;
 
@@ -232,12 +232,14 @@ mod tests {
             disks: vec![
                 RuntimeDisk {
                     path: "/var/lib/opl/pools/local/web-01-root.qcow2".into(),
+                    kind: DiskKind::File,
                     format: ImageFormat::Qcow2,
                     bus: DiskBus::VirtioBlk,
                     boot_order: Some(1),
                 },
                 RuntimeDisk {
                     path: "/var/lib/opl/pools/local/web-01-data.raw".into(),
+                    kind: DiskKind::File,
                     format: ImageFormat::Raw,
                     bus: DiskBus::Sata,
                     boot_order: None,
@@ -267,6 +269,7 @@ mod tests {
             machine: MachineType::Virt,
             disks: vec![RuntimeDisk {
                 path: "/tmp/opl/root.qcow2".into(),
+                kind: DiskKind::File,
                 format: ImageFormat::Qcow2,
                 bus: DiskBus::VirtioBlk,
                 boot_order: Some(1),
@@ -360,6 +363,7 @@ mod tests {
         many.disks = (0..7)
             .map(|i| RuntimeDisk {
                 path: format!("/d{i}.raw").into(),
+                kind: DiskKind::File,
                 format: ImageFormat::Raw,
                 bus: DiskBus::Sata,
                 boot_order: None,

@@ -206,6 +206,12 @@ pub async fn create_pool(
         }
         spec.shared = true;
     }
+    // LVM-thin 풀은 노드 로컬이다.
+    if matches!(spec.backend, PoolBackend::LvmThin { .. }) && spec.shared {
+        return Err(ApiError::bad_request(
+            "lvm-thin pools are node-local; shared must be false",
+        ));
+    }
     for node in &spec.nodes {
         if state.cluster.get::<NodeSpec>(*node)?.is_none() {
             return Err(ApiError::bad_request(format!("node {node} not found")));
