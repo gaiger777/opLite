@@ -14,6 +14,7 @@ import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
 import { useList } from "@/api/live";
+import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
@@ -70,6 +71,7 @@ export function VmListPage() {
   const vms = useList("vm");
   const nodes = useList("node");
   const { runMany } = useVmActions();
+  const taskIndex = useTaskIndex();
   const [filter, setFilter] = useState("");
   const [sorting, setSorting] = useState<SortingState>(savedSorting);
   const [selection, setSelection] = useState<RowSelectionState>({});
@@ -161,7 +163,7 @@ export function VmListPage() {
   // 검색으로 가려진 행은 선택돼 있어도 일괄 동작에 넣지 않는다.
   const selected = table.getFilteredSelectedRowModel().rows.map((r) => r.original);
   const bulk = (action: "start" | "stop") => {
-    void runMany(selected, action);
+    void runMany(selected, action, taskIndex);
     setSelection({});
   };
 

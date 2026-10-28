@@ -106,6 +106,37 @@ it("force stops a VM while a snapshot is being taken but not while one is revert
   expect(screen.getByRole("menuitem", { name: "Stop" })).not.toHaveAttribute("aria-disabled");
 });
 
+it("blocks starting a VM whose start is still pending, alone or with others", async () => {
+  const app = vm("app", "stopped");
+  const starting = task("t-start", "vm-start", db.id);
+  mockLists({ vm: [web, db, app], node: [NODE], task: [starting] });
+  const started: string[] = [];
+  server.use(
+    http.post(apiUrl("/vms/:key/actions/:action"), ({ params }) => {
+      started.push(String(params.key));
+      return HttpResponse.json(task(`t-p${started.length}`, "vm-start", String(params.key)), {
+        status: 202,
+      });
+    }),
+  );
+  const { queryClient } = renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "db" });
+  // Task 목록을 읽은 뒤에 메뉴를 연다.
+  await waitFor(() => expect(queryClient.getQueryData(["list", "task"])).toBeDefined());
+  await userEvent.click(screen.getByRole("button", { name: "Actions for db" }));
+  expect(await screen.findByRole("menuitem", { name: "Start" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  await userEvent.keyboard("{Escape}");
+
+  // 여럿을 시작할 때도 db는 건너뛴다.
+  await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+  await userEvent.click(within(screen.getByText("3 selected").parentElement!).getByText("Start"));
+  expect(await screen.findByText("Start: 1 requested, 0 failed, 2 skipped.")).toBeInTheDocument();
+  expect(started).toEqual([app.id]);
+});
+
 it("deletes only after the name is typed", async () => {
   mockLists({ vm: [db], node: [NODE] });
   let deleted = false;

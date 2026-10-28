@@ -20,14 +20,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
-import {
-  ACTIONS,
-  canDelete,
-  canRun,
-  isReverting,
-  useVmActions,
-  type VmAction,
-} from "@/vms/actions";
+import { ACTIONS, availability, useVmActions, type VmAction } from "@/vms/actions";
 import { VmConsole } from "@/vms/lazyConsole";
 import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -136,13 +129,14 @@ function VmHeader({ vm }: { vm: Vm }) {
   const operate = can(me.role, "operate", "vm");
   // 서버는 되돌리기 중의 강제 정지를 받지 않는다. Task 목록을 아직 모르면 서버에 맡긴다.
   // 상태로도 끌 수 없는 VM이면 까닭은 되돌리기가 아니므로 보이지 않는다.
-  const reverting = operate && canRun(vm, "force-stop") && isReverting(vmTasks);
+  const forceStop = availability(vm, "force-stop", vmTasks);
+  const reverting = operate && !forceStop.ok && forceStop.reason === "vms.reason.reverting";
   const button = (action: VmAction) => (
     <Button
       key={action}
       variant="outline"
       size="sm"
-      disabled={!canRun(vm, action) || (action === "force-stop" && reverting)}
+      disabled={!availability(vm, action, vmTasks).ok}
       aria-describedby={action === "force-stop" && reverting ? hint : undefined}
       onClick={() => (action === "force-stop" ? setConfirm("force-stop") : void run(vm, action))}
     >
@@ -179,7 +173,7 @@ function VmHeader({ vm }: { vm: Vm }) {
           <Button
             variant="destructive"
             size="sm"
-            disabled={!canDelete(vm)}
+            disabled={!availability(vm, "delete", vmTasks).ok}
             onClick={() => setConfirm("delete")}
           >
             {t("vms.action.delete")}

@@ -1,9 +1,13 @@
 import type { Task } from "@/api/types";
 import { task, vm } from "@/test/fixtures";
-import { ACTIONS, canDelete, canRun, isBusy, isReverting, isStopped } from "@/vms/actions";
+import { ACTIONS, availability, isBusy, isReverting, isStopped } from "@/vms/actions";
 
-function allowed(v: ReturnType<typeof vm>) {
-  return ACTIONS.filter((action) => canRun(v, action));
+function allowed(v: ReturnType<typeof vm>, vmTasks: Task[] = []) {
+  return ACTIONS.filter((action) => availability(v, action, vmTasks).ok);
+}
+
+function canDelete(v: ReturnType<typeof vm>) {
+  return availability(v, "delete", []).ok;
 }
 
 it("follows the server's is_stopped: desired power and phase together", () => {
@@ -71,4 +75,88 @@ it("follows the server's check_no_revert_task: only an unfinished revert of this
   for (const kind of ["snapshot-create", "snapshot-delete", "vm-clone"] as const) {
     expect(isReverting([of(kind, "running")])).toBe(false);
   }
+});
+
+/** 이 VM을 대상으로 한, 아직 끝나지 않은 Task */
+function pendingOf(v: ReturnType<typeof vm>, kind: Task["spec"]["op"]["kind"]): Task {
+  return { ...task(`t-${kind}`, kind, v.id), status: { state: "running", error: null } };
+}
+
+it("says why a power action is not available in the VM's state", () => {
+  const stopped = vm("a", "stopped");
+  const running = vm("b", "running");
+  const stopping = vm("c", "stopping");
+  const starting = vm("d", "starting");
+  expect(availability(stopped, "start", [])).toEqual({ ok: true });
+  expect(availability(stopped, "stop", [])).toEqual({ ok: false, reason: "vms.reason.stopped" });
+  expect(availability(stopped, "force-stop", [])).toEqual({
+    ok: false,
+    reason: "vms.reason.stopped",
+  });
+  expect(availability(stopped, "reboot", [])).toEqual({ ok: false, reason: "vms.reason.stopped" });
+  expect(availability(running, "start", [])).toEqual({ ok: false, reason: "vms.reason.running" });
+  expect(availability(stopping, "start", [])).toEqual({ ok: false, reason: "vms.reason.busy" });
+  expect(availability(stopping, "stop", [])).toEqual({ ok: false, reason: "vms.reason.busy" });
+  expect(availability(stopping, "reboot", [])).toEqual({ ok: false, reason: "vms.reason.busy" });
+  expect(availability(starting, "start", [])).toEqual({ ok: false, reason: "vms.reason.busy" });
+  expect(availability(starting, "reboot", [])).toEqual({ ok: false, reason: "vms.reason.busy" });
+});
+
+it("blames a failed VM's state as failed", () => {
+  const failed = vm("e", "failed");
+  const reason = { ok: false, reason: "vms.reason.failed" };
+  expect(availability(failed, "start", [])).toEqual({ ok: true });
+  expect(availability(failed, "delete", [])).toEqual({ ok: true });
+  for (const action of ["stop", "force-stop", "reboot", "console"] as const) {
+    expect(availability(failed, action, [])).toEqual(reason);
+  }
+  // 켜려는 채 실패했으면 시작도 실패 때문에 막힌다.
+  const wantsRunning = vm("f", "failed", {
+    spec: { ...failed.spec, power: "running" },
+  });
+  expect(availability(wantsRunning, "start", [])).toEqual(reason);
+});
+
+it("blocks start, stop and reboot while a power task of the VM is unfinished", () => {
+  const stopped = vm("a", "stopped");
+  const running = vm("b", "running");
+  const pending = { ok: false, reason: "vms.reason.powerPending" };
+  for (const kind of ["vm-start", "vm-stop", "vm-force-stop", "vm-reboot"] as const) {
+    expect(availability(stopped, "start", [pendingOf(stopped, kind)])).toEqual(pending);
+    expect(availability(running, "stop", [pendingOf(running, kind)])).toEqual(pending);
+    expect(availability(running, "reboot", [pendingOf(running, kind)])).toEqual(pending);
+    // 강제 정지는 ACPI 정지가 멈췄을 때 빠져나갈 길이다.
+    expect(availability(running, "force-stop", [pendingOf(running, kind)])).toEqual({ ok: true });
+  }
+  // 끝난 전원 Task나 다른 Task는 막지 않는다.
+  const done = { ...pendingOf(stopped, "vm-start"), status: { state: "succeeded", error: null } };
+  expect(availability(stopped, "start", [done as Task])).toEqual({ ok: true });
+  expect(availability(stopped, "start", [pendingOf(stopped, "snapshot-create")])).toEqual({
+    ok: true,
+  });
+});
+
+it("blocks force stop while reverting, but blames the state first", () => {
+  const running = vm("b", "running");
+  const stopped = vm("a", "stopped");
+  expect(availability(running, "force-stop", [pendingOf(running, "snapshot-revert")])).toEqual({
+    ok: false,
+    reason: "vms.reason.reverting",
+  });
+  expect(availability(stopped, "force-stop", [pendingOf(stopped, "snapshot-revert")])).toEqual({
+    ok: false,
+    reason: "vms.reason.stopped",
+  });
+});
+
+it("says why the console or delete is not available", () => {
+  const stopped = vm("a", "stopped");
+  const running = vm("b", "running");
+  const starting = vm("d", "starting");
+  expect(availability(running, "console", [])).toEqual({ ok: true });
+  expect(availability(stopped, "console", [])).toEqual({ ok: false, reason: "vms.reason.stopped" });
+  expect(availability(starting, "console", [])).toEqual({ ok: false, reason: "vms.reason.busy" });
+  expect(availability(stopped, "delete", [])).toEqual({ ok: true });
+  expect(availability(running, "delete", [])).toEqual({ ok: false, reason: "vms.reason.running" });
+  expect(availability(starting, "delete", [])).toEqual({ ok: false, reason: "vms.reason.busy" });
 });

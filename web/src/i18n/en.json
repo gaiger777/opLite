@@ -136,6 +136,14 @@
     "deleted": "Deleted {{name}}.",
     "forceStopTitle": "Force stop {{name}}?",
     "forceStopDescription": "The VM is turned off without shutting down its OS. Unsaved data in the guest is lost.",
+    "reason": {
+      "powerPending": "A power action is still in progress.",
+      "reverting": "Not available while a snapshot is being reverted.",
+      "running": "The VM is running.",
+      "stopped": "The VM is stopped.",
+      "failed": "The VM has failed.",
+      "busy": "The VM is starting or stopping."
+    },
     "forceStopReverting": "Force stop is not available while a snapshot is being reverted.",
     "deleteTitle": "Delete {{name}}?",
     "deleteDescription": "The VM is deleted. Its volumes are kept.",

@@ -45,8 +45,14 @@ export function isReverting(vmTasks: readonly Task[]): boolean {
   );
 }
 
-/** 지금 상태에서 할 수 있는 동작인지. 서버도 확인하지만 할 수 없는 버튼은 막아 둔다. */
-export function canRun(vm: Vm, action: VmAction): boolean {
+/** 할 수 있는지, 없으면 그 이유(번역 키) */
+export type Availability = { ok: true } | { ok: false; reason: string };
+
+/** 끝나지 않으면 다른 시작·정지·재시작을 막는 전원 Task */
+const POWER_KINDS: readonly string[] = ["vm-start", "vm-stop", "vm-force-stop", "vm-reboot"];
+
+/** 상태만 보고 할 수 있는 동작인지. 서버도 확인하지만 할 수 없는 버튼은 막아 둔다. */
+function allowedByState(vm: Vm, action: VmAction | "console" | "delete"): boolean {
   const phase = vm.status.phase;
   const powerOn = vm.spec.power === "running";
   switch (action) {
@@ -60,12 +66,54 @@ export function canRun(vm: Vm, action: VmAction): boolean {
     case "reboot":
       // 서버는 원하는 전원 상태가 켜짐인 실행 중 VM만 재시작한다.
       return powerOn && phase === "running";
+    case "console":
+      return phase === "running";
+    case "delete":
+      // 서버는 멈추지 않은 VM을 지우지 않는다.
+      return isStopped(vm);
   }
 }
 
-/** 지울 수 있는 상태인지(서버는 멈추지 않은 VM을 지우지 않는다) */
-export function canDelete(vm: Vm): boolean {
-  return isStopped(vm);
+/** 상태 때문에 막혔을 때의 이유: 실패, 멈춤, 켜져 실행 중, 그 사이(바뀌는 중) */
+function stateReason(vm: Vm): string {
+  if (vm.status.phase === "failed") {
+    return "vms.reason.failed";
+  }
+  if (isStopped(vm)) {
+    return "vms.reason.stopped";
+  }
+  return isBusy(vm) ? "vms.reason.busy" : "vms.reason.running";
+}
+
+/**
+ * 지금 할 수 있는 동작인지와 막힌 이유. `vmTasks`는 이 VM을 대상으로 한 Task다(`useTaskIndex`). 전원 Task가
+ * 끝나지 않았으면 시작·정지·재시작을 막는다(서버는 새 요청으로 앞 것을 대체하지만 웹에서는 겹치지 않게).
+ * 강제 정지는 정지가 ACPI에서 멈췄을 때 빠져나갈 길이므로 되돌리기 중에만 막는다.
+ */
+export function availability(
+  vm: Vm,
+  action: VmAction | "console" | "delete",
+  vmTasks: readonly Task[],
+): Availability {
+  const power = action === "start" || action === "stop" || action === "reboot";
+  if (
+    power &&
+    vmTasks.some(
+      (task) =>
+        POWER_KINDS.includes(task.spec.op.kind) &&
+        task.status.state !== "succeeded" &&
+        task.status.state !== "failed",
+    )
+  ) {
+    return { ok: false, reason: "vms.reason.powerPending" };
+  }
+  if (!allowedByState(vm, action)) {
+    return { ok: false, reason: stateReason(vm) };
+  }
+  if (action === "force-stop" && isReverting(vmTasks)) {
+    return { ok: false, reason: "vms.reason.reverting" };
+  }
+  return { ok: true };
 }
 
 /** 여럿에 한 동작의 결과: 요청이 받아들여진 수, 실패한 수, 할 수 없어 건너뛴 수 */
@@ -99,9 +147,16 @@ export function useVmActions() {
     }
   }
 
-  /** 여러 VM에 같은 동작을 한다. 건너뛰거나 실패한 것이 있으면 요약 알림을 하나 더 띄운다. */
-  async function runMany(vms: Vm[], action: VmAction): Promise<BulkResult> {
-    const able = vms.filter((vm) => canRun(vm, action));
+  /**
+   * 여러 VM에 같은 동작을 한다. 할 수 없는 VM은 건너뛴다(`taskIndex`는 `useTaskIndex`). 건너뛰거나 실패한
+   * 것이 있으면 요약 알림을 하나 더 띄운다.
+   */
+  async function runMany(
+    vms: Vm[],
+    action: VmAction,
+    taskIndex: Map<string, Task[]>,
+  ): Promise<BulkResult> {
+    const able = vms.filter((vm) => availability(vm, action, taskIndex.get(vm.id) ?? []).ok);
     const results = await Promise.allSettled(
       able.map((vm) =>
         request(vm, action).catch((err: unknown) => {

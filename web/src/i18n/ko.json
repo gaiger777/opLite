@@ -136,6 +136,14 @@
     "deleted": "{{name}}을(를) 삭제했습니다.",
     "forceStopTitle": "{{name}}을(를) 강제 정지할까요?",
     "forceStopDescription": "게스트 OS를 종료하지 않고 VM을 끕니다. 저장하지 않은 게스트의 데이터를 잃습니다.",
+    "reason": {
+      "powerPending": "전원 작업이 아직 처리 중입니다.",
+      "reverting": "스냅샷을 되돌리는 중에는 할 수 없습니다.",
+      "running": "VM이 실행 중입니다.",
+      "stopped": "VM이 정지되어 있습니다.",
+      "failed": "VM이 실패 상태입니다.",
+      "busy": "VM이 시작하거나 정지하는 중입니다."
+    },
     "forceStopReverting": "스냅샷을 되돌리는 중에는 강제 정지할 수 없습니다.",
     "deleteTitle": "{{name}}을(를) 삭제할까요?",
     "deleteDescription": "VM을 삭제합니다. 볼륨은 남습니다.",

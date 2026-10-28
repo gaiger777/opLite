@@ -16,14 +16,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  ACTIONS,
-  canDelete,
-  canRun,
-  isReverting,
-  useVmActions,
-  type VmAction,
-} from "@/vms/actions";
+import { ACTIONS, availability, useVmActions, type VmAction } from "@/vms/actions";
 import { VmCloneDialog } from "@/vms/VmCloneDialog";
 import { VmDeleteDialog } from "@/vms/VmDeleteDialog";
 
@@ -39,7 +32,8 @@ export function VmMenu({ vm }: { vm: Vm }) {
   const hint = useId();
   // 서버는 되돌리기 중의 강제 정지를 받지 않는다. Task 목록을 아직 모르면 서버에 맡긴다.
   // 상태로도 끌 수 없는 VM이면 까닭은 되돌리기가 아니므로 보이지 않는다.
-  const reverting = canRun(vm, "force-stop") && isReverting(vmTasks);
+  const forceStop = availability(vm, "force-stop", vmTasks);
+  const reverting = !forceStop.ok && forceStop.reason === "vms.reason.reverting";
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
   // 복제는 새 VM과 새 볼륨을 만든다.
@@ -66,7 +60,7 @@ export function VmMenu({ vm }: { vm: Vm }) {
             ACTIONS.map((action) => (
               <DropdownMenuItem
                 key={action}
-                disabled={!canRun(vm, action) || (action === "force-stop" && reverting)}
+                disabled={!availability(vm, action, vmTasks).ok}
                 aria-describedby={action === "force-stop" && reverting ? hint : undefined}
                 onSelect={() =>
                   action === "force-stop" ? setConfirm("force-stop") : void run(vm, action)
@@ -84,7 +78,7 @@ export function VmMenu({ vm }: { vm: Vm }) {
           )}
           {operate && (
             <DropdownMenuItem
-              disabled={vm.status.phase !== "running"}
+              disabled={!availability(vm, "console", vmTasks).ok}
               onSelect={() => void navigate(`/vms/${encodeURIComponent(vm.name)}/console`)}
             >
               {t("vms.action.console")}
@@ -100,7 +94,7 @@ export function VmMenu({ vm }: { vm: Vm }) {
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 variant="destructive"
-                disabled={!canDelete(vm)}
+                disabled={!availability(vm, "delete", vmTasks).ok}
                 onSelect={() => setConfirm("delete")}
               >
                 {t("vms.action.delete")}
