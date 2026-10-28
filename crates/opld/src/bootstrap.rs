@@ -153,7 +153,7 @@ pub async fn mark_offline(cluster: &Cluster) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -198,7 +198,7 @@ mod tests {
     }
 
     /// 멤버가 이 노드 하나인 클러스터. 리더가 될 때까지 기다린다.
-    async fn single_node(dir: &Path) -> (Cluster, NodeId) {
+    pub(crate) async fn single_node(dir: &Path) -> (Cluster, NodeId) {
         let router = MemRouter::default();
         let id = NodeId(Uuid::now_v7());
         let cluster = Cluster::open(ClusterConfig::new(id, dir), router.network(id))

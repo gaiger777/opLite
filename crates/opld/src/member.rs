@@ -1,5 +1,5 @@
 //! 클러스터 멤버로 도는 노드: 노드 간 서버, 클러스터 저장소, reconciler, Task 실행기, HTTPS API,
-//! 노드 감시, 예약 스냅샷, 클러스터 정리.
+//! 노드 감시, 예약 스냅샷, 클러스터 정리, 노드별 풀 상태.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -29,6 +29,7 @@ use uuid::Uuid;
 use crate::bootstrap;
 use crate::config::Config;
 use crate::host::Host;
+use crate::pools::PoolMounter;
 
 /// 데이터 디렉터리 아래 클러스터 저장소(Raft 로그와 상태)를 두는 디렉터리
 pub const CLUSTER_DIR: &str = "cluster";
@@ -101,6 +102,7 @@ pub struct Member {
     monitor: NodeMonitor,
     schedule: SnapshotScheduler,
     janitor: ClusterJanitor,
+    pools: PoolMounter,
     register: JoinHandle<()>,
     promotion: JoinHandle<()>,
     /// 서버 태스크가 끝나면 그 이유가 온다.
@@ -259,6 +261,7 @@ impl Member {
         let mut reconciler_config = ReconcilerConfig::new(node, &mount_root);
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
+        let pools = PoolMounter::spawn(cluster.clone(), mount_root.clone(), config.pools.refresh());
         let storage: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img, mount_root));
         // Task 실행기는 시작할 때 이 노드가 남긴 고아를 지운다. 그것이 끝난 뒤에 API를 연다.
         let mut runner_config = TaskRunnerConfig::new(node);
@@ -312,6 +315,7 @@ impl Member {
             monitor,
             schedule,
             janitor,
+            pools,
             register,
             promotion,
             exited,
@@ -375,6 +379,7 @@ impl Member {
         self.monitor.shutdown().await;
         self.schedule.shutdown().await;
         self.janitor.shutdown().await;
+        self.pools.shutdown().await;
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
         self.register.abort();

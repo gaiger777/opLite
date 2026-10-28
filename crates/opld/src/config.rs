@@ -43,6 +43,8 @@ pub struct Config {
     pub schedule: ScheduleSection,
     #[serde(default)]
     pub janitor: JanitorSection,
+    #[serde(default)]
+    pub pools: PoolsSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -177,6 +179,29 @@ impl JanitorSection {
     }
 }
 
+/// 노드별 풀 상태 새로 고침(NFS 마운트 포함)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolsSection {
+    /// 풀 상태를 확인하는 간격(초)
+    #[serde(default = "default_pools_refresh_secs")]
+    pub refresh_secs: u64,
+}
+
+impl Default for PoolsSection {
+    fn default() -> Self {
+        Self {
+            refresh_secs: default_pools_refresh_secs(),
+        }
+    }
+}
+
+impl PoolsSection {
+    pub fn refresh(&self) -> Duration {
+        Duration::from_secs(self.refresh_secs)
+    }
+}
+
 fn default_listen() -> SocketAddr {
     "0.0.0.0:8006".parse().unwrap()
 }
@@ -220,6 +245,9 @@ fn default_task_max_age_days() -> u64 {
 }
 fn default_task_max_finished() -> usize {
     1000
+}
+fn default_pools_refresh_secs() -> u64 {
+    15
 }
 
 /// `host:port`. IPv6 주소는 대괄호로 감싼다.
@@ -291,6 +319,9 @@ impl Config {
         // 날수를 초로 바꿀 때 넘치지 않도록 100년까지만 받는다.
         if self.janitor.task_max_age_days > MAX_TASK_AGE_DAYS {
             anyhow::bail!("janitor.task_max_age_days must be at most {MAX_TASK_AGE_DAYS}");
+        }
+        if self.pools.refresh_secs == 0 {
+            anyhow::bail!("pools.refresh_secs must be at least 1");
         }
         // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
         if self.listen.port() == self.cluster_listen.port() {
@@ -382,6 +413,7 @@ mod tests {
         assert_eq!(janitor.task_max_age, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(janitor.task_max_finished, 1000);
         assert_eq!(janitor.finished_grace, Duration::from_secs(600));
+        assert_eq!(c.pools.refresh(), Duration::from_secs(15));
         assert_eq!(c.hypervisor.accel, AccelSetting::Auto);
         assert_eq!(c.hypervisor.systemd_scope, cfg!(target_os = "linux"));
         assert_eq!(
@@ -496,6 +528,19 @@ mod tests {
             let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[janitor]\n{bad}"));
             assert!(c.validate().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn pools_section_sets_the_refresh_interval_but_not_to_zero() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[pools]\nrefresh_secs = 2");
+        assert!(c.validate().is_ok());
+        assert_eq!(c.pools.refresh(), Duration::from_secs(2));
+        let c = parse("name = \"n\"\naddress = \"h\"\n[pools]\nrefresh_secs = 0");
+        assert!(c.validate().is_err());
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[pools]\nrefresh = 1")
+                .is_err()
+        );
     }
 
     #[test]

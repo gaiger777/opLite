@@ -22,6 +22,7 @@ web-it = ["qemu-it", "web-ui"]
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 clap.workspace = true
 hex.workspace = true
@@ -45,7 +46,6 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 oplctl.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true

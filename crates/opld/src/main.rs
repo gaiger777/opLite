@@ -14,6 +14,7 @@ mod control;
 mod host;
 mod join;
 mod member;
+mod pools;
 mod web;
 
 use std::fs::File;
