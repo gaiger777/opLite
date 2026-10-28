@@ -3,10 +3,13 @@
 use std::path::Path;
 
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::DirStorage;
+use opl_driver::{DirStorage, check_pool_root};
 use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
+use opl_types::node::NodeSpec;
 use opl_types::runtime::{NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
-use opl_types::storage::{StoragePoolSpec, VolumeSpec};
+use opl_types::storage::{
+    PoolBackend, StoragePoolSpec, VolumeSpec, pool_error_on, pool_listed_on, pool_state_on,
+};
 use opl_types::vm::Vm;
 use uuid::Uuid;
 
@@ -18,6 +21,8 @@ pub enum ResolveError {
     PoolNotFound(String),
     #[error("storage pool {0:?} is not available on this node")]
     PoolNotOnNode(String),
+    #[error("storage pool {0:?} is not ready on this node: {1}")]
+    PoolUnavailable(String, String),
     #[error("network {0:?} not found")]
     NetworkNotFound(String),
     #[error("nic {0} has no MAC address")]
@@ -27,13 +32,16 @@ pub enum ResolveError {
 }
 
 /// 로컬 저장소에서 참조를 찾아 런타임 정의를 만든다. `node`는 이 노드의 id이고
-/// `mount_root`는 이 노드가 NFS 풀을 마운트하는 디렉터리다.
+/// `mount_root`는 이 노드가 NFS 풀을 마운트하는 디렉터리다. 이 노드가 준비되지 않았다고 알린 풀은
+/// `PoolUnavailable`(잠시 뒤 다시 시도할 일)로 거절한다. 아직 알리지 않은 풀(opld가 막 시작해 첫 새로
+/// 고침 전)은 막지 않되, NFS 풀은 실제로 마운트돼 있는지 확인한다.
 pub fn runtime_spec(
     cluster: &Cluster,
     vm: &Vm,
     node: Uuid,
     mount_root: &Path,
 ) -> Result<VmRuntimeSpec, ResolveError> {
+    let me = cluster.get::<NodeSpec>(node)?;
     let mut disks = Vec::with_capacity(vm.spec.disks.len());
     for disk in &vm.spec.disks {
         let volume = cluster
@@ -43,8 +51,22 @@ pub fn runtime_spec(
         let pool = cluster
             .get_by_name::<StoragePoolSpec>(pool_name)?
             .ok_or_else(|| ResolveError::PoolNotFound(pool_name.clone()))?;
-        if !pool.spec.nodes.is_empty() && !pool.spec.nodes.contains(&node) {
+        if !pool_listed_on(&pool, node) {
             return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
+        }
+        if let Some(me) = &me
+            && pool_state_on(&pool, me).is_some_and(|s| !s.ready)
+        {
+            let error = pool_error_on(&pool, me);
+            return Err(ResolveError::PoolUnavailable(pool_name.clone(), error));
+        }
+        if matches!(pool.spec.backend, PoolBackend::Nfs { .. })
+            && let Err(e) = check_pool_root(&pool, mount_root)
+        {
+            return Err(ResolveError::PoolUnavailable(
+                pool_name.clone(),
+                e.to_string(),
+            ));
         }
         disks.push(RuntimeDisk {
             path: DirStorage::volume_path(&pool, mount_root, volume.id, volume.spec.format),

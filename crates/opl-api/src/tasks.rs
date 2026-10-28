@@ -57,6 +57,8 @@ pub struct TaskRunnerConfig {
     /// VM별 상태 디렉터리의 뿌리(`QemuConfig::state_dir`). 스냅샷의 UEFI 변수 사본을 둔다.
     /// 없으면 변수를 복사하거나 되돌리지 않는다.
     pub state_dir: Option<PathBuf>,
+    /// 풀이 마운트되지 않아 시작할 때 지우지 못한 고아 볼륨을 다시 지워 보는 간격
+    pub orphan_retry: Duration,
 }
 
 impl TaskRunnerConfig {
@@ -67,6 +69,7 @@ impl TaskRunnerConfig {
             poll_interval: Duration::from_millis(200),
             upload_dir: None,
             state_dir: None,
+            orphan_retry: Duration::from_secs(60),
         }
     }
 }
@@ -114,11 +117,11 @@ impl TaskRunner {
                 }
             }
         };
-        sweep_orphans(&ctx, revision, &tasks).await;
+        let unmounted = sweep_orphans(&ctx, revision, &tasks).await;
         let (shutdown, rx) = oneshot::channel();
         Self {
             shutdown,
-            task: tokio::spawn(run(ctx, rx)),
+            task: tokio::spawn(run(ctx, rx, unmounted)),
         }
     }
 
@@ -129,7 +132,9 @@ impl TaskRunner {
     }
 }
 
-async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>) {
+/// `unmounted`는 풀이 마운트되지 않아 지우지 못한 고아 볼륨이다. 따로 다시 지워 본다.
+async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<Uuid>) {
+    let retry = tokio::spawn(retry_orphans(ctx.clone(), unmounted));
     // 실행을 시작한 Task. 목록을 다시 읽을 때 같은 Task를 두 번 시작하지 않게 한다.
     let mut started: HashSet<Uuid> = HashSet::new();
     // 실행 중인 Task. 실행기가 멈출 때 함께 멈춘다.
@@ -204,6 +209,24 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>) {
     }
     for handle in running.values() {
         handle.abort();
+    }
+    retry.abort();
+}
+
+/// 풀이 마운트되지 않아 지우지 못한 고아 볼륨을 `orphan_retry`마다 다시 지워 본다. 지웠거나 볼륨이
+/// 없어졌으면 목록에서 뺀다. 마운트 말고 다른 이유로 실패하면 시작할 때처럼 기록만 하고 뺀다.
+async fn retry_orphans(ctx: Arc<Ctx>, mut volumes: Vec<Uuid>) {
+    while !volumes.is_empty() {
+        tokio::time::sleep(ctx.config.orphan_retry).await;
+        let mut left = Vec::new();
+        for id in volumes {
+            match remove_volume(&ctx, id).await {
+                Ok(()) => tracing::info!(volume = %id, "removed a volume left unfinished"),
+                Err(RemoveError::Storage(DriverError::PoolNotMounted(_))) => left.push(id),
+                Err(e) => tracing::warn!(volume = %id, error = %e, "cannot remove volume"),
+            }
+        }
+        volumes = left;
     }
 }
 
@@ -652,7 +675,7 @@ async fn import_volume(
 }
 
 async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
-    remove_volume(ctx, id).await
+    remove_volume(ctx, id).await.map_err(|e| e.to_string())
 }
 
 /// 볼륨 크기를 늘린다(설계 §5). 실행 중인 VM이 쓰면 그 QEMU로(`block_resize`, 게스트가 바로
@@ -701,10 +724,25 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
     set_volume_size(ctx, id, info.virtual_bytes).await
 }
 
+/// 볼륨을 지우지 못한 이유
+#[derive(Debug, thiserror::Error)]
+enum RemoveError {
+    #[error(transparent)]
+    Storage(DriverError),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for RemoveError {
+    fn from(e: String) -> Self {
+        RemoveError::Other(e)
+    }
+}
+
 /// VM이 쓰지 않는 볼륨의 파일(있으면)과 리소스를 지운다. 실패한 생성·가져오기를 정리할 때도
 /// 쓴다. 준비되지 않은 볼륨은 API가 붙이지 못하게 하지만, 확인과 생성 사이에 붙었을 수도 있어
 /// 여기서 다시 본다.
-async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
+async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), RemoveError> {
     let Some(volume) = ctx
         .cluster
         .get::<VolumeSpec>(id)
@@ -717,7 +755,7 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
         .iter()
         .find(|vm| vm.spec.disks.iter().any(|d| d.volume == volume.name))
     {
-        return Err(format!("volume is attached to VM {:?}", vm.name));
+        return Err(format!("volume is attached to VM {:?}", vm.name).into());
     }
     if let Some(pool) = ctx
         .cluster
@@ -730,12 +768,12 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
             .await
         {
             Ok(()) | Err(DriverError::VolumeNotFound(_)) => {}
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(RemoveError::Storage(e)),
         }
     }
     match ctx.cluster.delete::<VolumeSpec>(id, None).await {
         Ok(_) | Err(ClusterError::Rejected(_)) => Ok(()),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.to_string().into()),
     }
 }
 
@@ -743,7 +781,9 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 /// 뒤 Task를 만들기 전에, 또는 업로드 도중 opld가 죽었다)과 Pending 스냅샷, 가져오기 Task가 없는
 /// 올린 파일.
 /// `tasks`는 `revision`에서 읽은 Task 목록이다. 다른 노드가 만드는 볼륨은 그 노드가 정리한다.
-async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) {
+/// 풀이 아직 마운트되지 않아(opld가 막 시작했다) 지우지 못한 볼륨을 돌려준다.
+async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
+    let mut unmounted = Vec::new();
     let unfinished: Vec<&Task> = tasks
         .iter()
         .filter(|t| !t.status.state.is_finished())
@@ -761,8 +801,15 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) {
                 let has_task = unfinished.iter().any(|t| t.spec.target == volume.id);
                 if volume.status.phase == VolumePhase::Pending && !has_task {
                     tracing::warn!(volume = %volume.name, "removing a volume left unfinished");
-                    if let Err(e) = remove_volume(ctx, volume.id).await {
-                        tracing::warn!(volume = %volume.name, error = %e, "cannot remove volume");
+                    match remove_volume(ctx, volume.id).await {
+                        Ok(()) => {}
+                        Err(e @ RemoveError::Storage(DriverError::PoolNotMounted(_))) => {
+                            tracing::info!(volume = %volume.name, error = %e, "will remove the volume when its pool is mounted");
+                            unmounted.push(volume.id);
+                        }
+                        Err(e) => {
+                            tracing::warn!(volume = %volume.name, error = %e, "cannot remove volume")
+                        }
                     }
                 }
             }
@@ -801,10 +848,10 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) {
         Err(e) => tracing::warn!(error = %e, "cannot list snapshots"),
     }
     let Some(dir) = &ctx.config.upload_dir else {
-        return;
+        return unmounted;
     };
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return unmounted;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -816,4 +863,5 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) {
             let _ = std::fs::remove_file(&path);
         }
     }
+    unmounted
 }

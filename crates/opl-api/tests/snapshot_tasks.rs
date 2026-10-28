@@ -33,6 +33,7 @@ async fn pool_and_root(env: &Env) {
         },
     );
     env.cluster.create(&pool).await.unwrap();
+    env.pool_ready("local").await;
     let mut volume = Resource::new(
         "root",
         VolumeSpec {

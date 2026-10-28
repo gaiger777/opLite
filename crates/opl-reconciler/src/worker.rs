@@ -342,6 +342,16 @@ impl Worker {
         {
             Ok(spec) => spec,
             Err(ResolveError::Cluster(e)) => return Err(e.into()),
+            // 풀이 이 노드에서 아직 준비되지 않았다(NFS 서버가 멈춤, 마운트 전 등). 풀이 돌아오면
+            // 시작할 수 있으므로 실패로 세지 않고 잠시 뒤 다시 시도한다.
+            Err(e @ ResolveError::PoolUnavailable(..)) => {
+                let delay = self.config.retry_interval;
+                self.backoff = Some((
+                    Instant::now() + delay,
+                    format!("{e}; retrying in {delay:?}"),
+                ));
+                return Ok(false);
+            }
             // 참조가 틀렸다. spec을 고쳐야 하므로 다시 시도하지 않는다.
             Err(e) => {
                 self.restores.lock().unwrap().remove(&self.id);

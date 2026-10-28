@@ -9,7 +9,9 @@ use opl_cluster::types::Rejection;
 use opl_driver::{DriverError, uefi_vars_path, vm_state_dir};
 use opl_types::node::NodeSpec;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
-use opl_types::storage::{StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
+use opl_types::storage::{
+    StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, is_shared,
+};
 use opl_types::task::Task;
 use opl_types::vm::{PowerState, ScheduleError, Vm, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
@@ -94,7 +96,7 @@ pub(super) async fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
 /// 이 노드에서 파일이 보이는 볼륨인지. 다른 노드에 만든 볼륨은 풀이 공유되지 않으면 오류다.
 pub(super) fn check_local(ctx: &Ctx, volume: &Volume, pool: &StoragePool) -> Result<(), String> {
     match volume.status.node {
-        Some(node) if node != ctx.config.node && !pool.spec.shared => {
+        Some(node) if node != ctx.config.node && !is_shared(pool) => {
             Err(format!("volume {:?} is on node {node}", volume.name))
         }
         _ => Ok(()),

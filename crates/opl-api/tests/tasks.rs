@@ -80,6 +80,49 @@ async fn orphans_of_a_previous_opld_are_removed() {
     }
 }
 
+/// 풀이 아직 마운트되지 않아(NFS) 지우지 못한 고아 볼륨은 남겨 두고 나중에 다시 지운다.
+#[tokio::test]
+async fn orphans_on_an_unmounted_pool_are_removed_later() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let pool = Resource::new(
+        "local",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: env.dir.path().join("local"),
+            },
+            nodes: vec![],
+            shared: false,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    let volume: Volume = Resource::new(
+        "half",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1,
+            format: ImageFormat::Raw,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    let storage = Arc::new(FakeStorage::default());
+    storage.fail_deletes_unmounted(2);
+    env.start_runner_config(storage, |config| {
+        config.orphan_retry = std::time::Duration::from_millis(50);
+    })
+    .await;
+    // 실행기가 뜰 때 지우지 못했다.
+    assert!(env.cluster.get::<VolumeSpec>(volume.id).unwrap().is_some());
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while env.cluster.get::<VolumeSpec>(volume.id).unwrap().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "orphan volume was kept"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn tasks_created_while_runner_is_down_run_when_it_starts() {
     let mut env = Env::start().await;
@@ -149,6 +192,7 @@ async fn a_task_deleted_while_running_does_not_block_its_queue() {
         },
     );
     env.cluster.create(&pool).await.unwrap();
+    env.pool_ready("local").await;
     let mut volume: Volume = Resource::new(
         "data",
         VolumeSpec {

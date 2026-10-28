@@ -258,6 +258,17 @@ impl Daemon {
         argv.extend_from_slice(args);
         serde_json::from_str(&self.ctl(&argv).await.unwrap()).unwrap()
     }
+
+    /// 이 노드가 풀 `pool`을 준비됐다고 알릴 때까지 기다린다. 볼륨 만들기와 배치는 준비된 노드만 고른다.
+    pub async fn wait_pool_ready(&self, pool: &str) {
+        eventually(&format!("pool {pool} ready on {}", self.name), || async {
+            let nodes = self.ctl_json(&["node", "list"]).await;
+            nodes.as_array().unwrap().iter().any(|n| {
+                n["name"] == self.name.as_str() && n["status"]["pools"][pool]["ready"] == true
+            })
+        })
+        .await;
+    }
 }
 
 impl Drop for Daemon {

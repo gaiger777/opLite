@@ -43,6 +43,7 @@ async fn setup(d: &mut Daemon) -> PathBuf {
     d.ctl(&["pool", "create", "local", "--path", pool.to_str().unwrap()])
         .await
         .unwrap();
+    d.wait_pool_ready("local").await;
     d.ctl(&[
         "volume", "create", "root", "--pool", "local", "--size", "64M",
     ])

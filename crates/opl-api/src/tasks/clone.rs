@@ -6,9 +6,12 @@ use std::path::PathBuf;
 
 use opl_cluster::ClusterError;
 use opl_driver::uefi_vars_path;
+use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
 use opl_types::snapshot::SnapshotPhase;
-use opl_types::storage::{StoragePool, StoragePoolSpec, Volume, VolumeSpec};
+use opl_types::storage::{
+    StoragePool, StoragePoolSpec, Volume, VolumeSpec, pool_error_on, pool_listed_on, pool_usable_on,
+};
 use opl_types::task::Task;
 use opl_types::vm::{MacAddr, PowerState, Vm, VmSpec};
 use uuid::Uuid;
@@ -107,10 +110,23 @@ pub(super) async fn clone(
             Some(p) => pool_by_name(ctx, p)?,
             None => source_pool.clone(),
         };
-        if !target.spec.nodes.is_empty() && !target.spec.nodes.contains(&ctx.config.node) {
+        if !pool_listed_on(&target, ctx.config.node) {
             return Err(format!(
                 "storage pool {:?} is not available on this node",
                 target.name
+            ));
+        }
+        // 마운트되지 않은 NFS 풀의 빈 마운트 지점에 복사본을 만들지 않는다.
+        let me = ctx
+            .cluster
+            .get::<NodeSpec>(ctx.config.node)
+            .map_err(|e| e.to_string())?
+            .ok_or("this node is not registered")?;
+        if !pool_usable_on(&target, &me) {
+            return Err(format!(
+                "storage pool {:?} is not ready on this node: {}",
+                target.name,
+                pool_error_on(&target, &me)
             ));
         }
         targets.push(target);

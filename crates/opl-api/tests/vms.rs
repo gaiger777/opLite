@@ -128,6 +128,7 @@ async fn ready_volume(env: &Env, admin: &common::Client, name: &str) {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    env.pool_ready("local").await;
     let mut volume = Resource::new(
         name,
         VolumeSpec {

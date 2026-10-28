@@ -16,10 +16,10 @@ use opl_driver::{
 };
 use opl_reconciler::{Reconciler, ReconcilerConfig, RestartBackoff};
 use opl_types::auth::{Role, UserSpec};
-use opl_types::node::{NodeSpec, NodeStatus};
+use opl_types::node::{NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{SourceFormat, StoragePool};
+use opl_types::storage::{SourceFormat, StoragePool, StoragePoolSpec};
 use opl_types::vm::Arch;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -249,6 +249,11 @@ impl Env {
         );
     }
 
+    /// 이 노드가 풀을 준비됐다고 알린 것처럼 기록한다([`mark_pool_ready`]).
+    pub async fn pool_ready(&self, pool: &str) {
+        mark_pool_ready(&self.cluster, self.node, pool).await;
+    }
+
     pub async fn pid(&self, id: Uuid) -> Option<u32> {
         self.hv.inspect(id).await.unwrap().map(|s| s.pid)
     }
@@ -378,6 +383,31 @@ pub async fn login_at(base: &str, user: &str, password: &str) -> Client {
     }
 }
 
+/// opld의 풀 새로 고침 대신 `node`가 풀 `pool`을 준비됐다고 알린 것처럼 기록한다. 배치와 볼륨
+/// Task 노드는 준비된 노드만 고른다.
+pub async fn mark_pool_ready(cluster: &Cluster, node: Uuid, pool: &str) {
+    let state = PoolState {
+        ready: true,
+        ..Default::default()
+    };
+    set_pool_state(cluster, node, pool, state).await;
+}
+
+/// `node`가 풀 `pool`의 상태를 `state`로 알린 것처럼 기록한다. 상태의 `pool_id`는 그 풀의 id로 채운다.
+pub async fn set_pool_state(cluster: &Cluster, node: Uuid, pool: &str, mut state: PoolState) {
+    state.pool_id = cluster
+        .get_by_name::<StoragePoolSpec>(pool)
+        .unwrap()
+        .expect("create the pool first")
+        .id;
+    let mut n = cluster.get::<NodeSpec>(node).unwrap().unwrap();
+    n.status.pools.insert(pool.into(), state);
+    cluster
+        .update_status::<NodeSpec>(node, &n.status)
+        .await
+        .unwrap();
+}
+
 /// 클러스터 정보(이름 `test`, 새 CA)를 저장소에 만든다. 클러스터를 만들 때 opld가 하는 일이다.
 pub async fn seed_cluster_info(cluster: &Cluster) {
     let ca = opl_peer::pki::ClusterCa::generate("test").unwrap();
@@ -413,6 +443,8 @@ pub struct FakeStorage {
     paused: std::sync::atomic::AtomicBool,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    /// 남은 횟수만큼 `delete_volume`이 `PoolNotMounted`로 실패한다(풀이 아직 마운트되지 않음).
+    unmounted_deletes: std::sync::Mutex<usize>,
 }
 
 impl FakeStorage {
@@ -423,6 +455,11 @@ impl FakeStorage {
     /// `volume_info`가 알릴 크기
     pub fn set_size(&self, id: Uuid, size_bytes: u64) {
         self.sizes.lock().unwrap().insert(id, size_bytes);
+    }
+
+    /// 다음 `n`번의 `delete_volume`이 `PoolNotMounted`로 실패한다.
+    pub fn fail_deletes_unmounted(&self, n: usize) {
+        *self.unmounted_deletes.lock().unwrap() = n;
     }
 
     pub fn pause(&self) {
@@ -480,6 +517,13 @@ impl Storage for FakeStorage {
         _: Uuid,
         _: ImageFormat,
     ) -> Result<(), DriverError> {
+        let mut left = self.unmounted_deletes.lock().unwrap();
+        if *left > 0 {
+            *left -= 1;
+            return Err(DriverError::PoolNotMounted(
+                "/nonexistent/opl-pools/p".into(),
+            ));
+        }
         Ok(())
     }
     async fn volume_info(

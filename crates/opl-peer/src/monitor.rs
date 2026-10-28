@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use opl_cluster::Cluster;
-use opl_cluster::types::NodeId;
+use opl_cluster::types::{NodeId, Rejection};
+use opl_cluster::{Cluster, ClusterError};
 use opl_types::node::{NodeSpec, NodeStatus};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -140,20 +140,27 @@ async fn tick(
             last_seen.clear();
             return;
         }
-        // 목록을 읽은 뒤 노드가 스스로 등록한 상태를 덮어쓰지 않도록 쓰기 직전에 다시 읽는다.
+        // 목록을 읽은 뒤 노드가 스스로 등록한 상태를 덮어쓰지 않도록 쓰기 직전에 다시 읽고, 그 사이
+        // 노드가 status(풀 상태 등)를 썼으면 쓰지 않는다(다음 핑에서 다시 본다).
         let Ok(Some(fresh)) = cluster.get::<NodeSpec>(node.id) else {
             continue;
         };
         if fresh.status.online == online {
             continue;
         }
-        tracing::info!(node = %node.name, online, "node availability changed");
         let status = NodeStatus {
             online,
             ..fresh.status
         };
-        if let Err(e) = cluster.update_status::<NodeSpec>(node.id, &status).await {
-            tracing::warn!(node = %node.name, error = %e, "cannot record node availability");
+        match cluster
+            .update_status_checked::<NodeSpec>(node.id, fresh.revision, &status)
+            .await
+        {
+            Ok(_) => tracing::info!(node = %node.name, online, "node availability changed"),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+            Err(e) => {
+                tracing::warn!(node = %node.name, error = %e, "cannot record node availability")
+            }
         }
     }
 }

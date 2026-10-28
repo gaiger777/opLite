@@ -66,6 +66,7 @@ async fn ready_volume(env: &Env, name: &str, format: ImageFormat) {
             },
         );
         env.cluster.create(&pool).await.unwrap();
+        env.pool_ready("local").await;
     }
     let mut volume = Resource::new(
         name,

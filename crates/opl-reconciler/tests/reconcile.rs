@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use common::{Env, vm};
 use opl_driver::{DriverError, Hypervisor, StopMode};
+use opl_types::node::{Node, NodeSpec, PoolState};
+use opl_types::resource::Resource;
+use opl_types::runtime::ImageFormat;
+use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::vm::{
     DiskBus, DiskSpec, PowerState, RestartPolicy, ScheduleError, VmPhase, VmSpec, VmStatus,
 };
@@ -419,6 +423,83 @@ async fn unresolvable_volume_marks_failed() {
         Some("volume \"missing\" not found")
     );
     assert_eq!(env.pid(vm.id).await, None);
+}
+
+/// 풀이 이 노드에서 준비되지 않았으면(NFS 서버가 멈춤 등) 시작을 미루고 다시 시도한다. 실패로 세지
+/// 않으므로 오래 걸려도 포기하고 끄지 않는다.
+#[tokio::test]
+async fn unavailable_pool_is_retried_without_powering_off() {
+    let env = Env::start().await;
+    let pool: StoragePool = Resource::new(
+        "local",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: "/pools/local".into(),
+            },
+            nodes: vec![],
+            shared: false,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    let volume: Volume = Resource::new(
+        "root",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 30,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    let mut me: Node = Resource::new(
+        "n1",
+        NodeSpec {
+            address: "a".into(),
+            maintenance: false,
+        },
+    );
+    me.id = env.node;
+    let down = PoolState {
+        pool_id: pool.id,
+        ready: false,
+        error: Some("pool directory not responding".into()),
+        ..Default::default()
+    };
+    me.status.pools.insert("local".into(), down);
+    env.cluster.create(&me).await.unwrap();
+    let mut vm = vm("web", env.node);
+    vm.spec.disks.push(DiskSpec {
+        volume: "root".into(),
+        bus: DiskBus::VirtioBlk,
+        boot_order: Some(1),
+    });
+    env.create(&vm).await;
+
+    let got = env
+        .wait(vm.id, "waiting for the pool", |v| {
+            v.status.phase == VmPhase::Starting
+                && v.status
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("pool directory not responding"))
+        })
+        .await;
+    assert_eq!(got.spec.power, PowerState::Running);
+    // 재시작 포기 횟수(3번)보다 훨씬 많이 다시 시도해도 끄지 않는다.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let got = env.get(vm.id);
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(got.status.phase, VmPhase::Starting);
+    assert_eq!(env.pid(vm.id).await, None);
+
+    // 풀이 준비되면 시작한다.
+    let mut me = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    me.status.pools.get_mut("local").unwrap().ready = true;
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &me.status)
+        .await
+        .unwrap();
+    let got = env.wait(vm.id, "running", running).await;
+    assert_eq!(got.status.last_error, None);
 }
 
 #[tokio::test]

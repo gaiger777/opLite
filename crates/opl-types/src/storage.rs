@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::node::{Node, PoolState};
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::runtime::ImageFormat;
 
@@ -113,6 +114,39 @@ fn denied_option(option: &str) -> bool {
 /// 모든 노드가 같은 데이터를 보는 풀인지. NFS 풀은 `shared` 값과 상관없이 공유다.
 pub fn is_shared(pool: &StoragePool) -> bool {
     pool.spec.shared || matches!(pool.spec.backend, PoolBackend::Nfs { .. })
+}
+
+/// 풀의 노드 목록이 이 노드를 허용하는지(`nodes`가 비었거나 포함)
+pub fn pool_listed_on(pool: &StoragePool, node: Uuid) -> bool {
+    pool.spec.nodes.is_empty() || pool.spec.nodes.contains(&node)
+}
+
+/// 노드가 알린 이 풀의 상태. 상태의 `pool_id`가 풀 id와 다르면(같은 이름으로 다시 만든 풀, 옛 상태)
+/// 알리지 않은 것으로 본다.
+pub fn pool_state_on<'a>(pool: &StoragePool, node: &'a Node) -> Option<&'a PoolState> {
+    node.status
+        .pools
+        .get(&pool.name)
+        .filter(|s| s.pool_id == pool.id)
+}
+
+/// 이 노드에서 풀을 쓸 수 있는지: 노드 목록이 허용하고, 노드가 알린 그 풀의 상태가 준비됨.
+/// 디렉터리 풀은 노드가 상태를 아직 알리지 않았어도(옛 노드, 첫 새로 고침 전) 쓸 수 있다고 보고
+/// 준비되지 않았다고 알렸을 때만 막는다. NFS 풀은 마운트됐다고 알려야 한다.
+pub fn pool_usable_on(pool: &StoragePool, node: &Node) -> bool {
+    pool_listed_on(pool, node.id)
+        && match pool_state_on(pool, node) {
+            Some(state) => state.ready,
+            None => matches!(pool.spec.backend, PoolBackend::Dir { .. }),
+        }
+}
+
+/// 노드에서 풀이 준비되지 않은 이유. 노드가 알린 오류이고, 상태를 아직 알리지 않았으면 그렇게 적는다.
+pub fn pool_error_on(pool: &StoragePool, node: &Node) -> String {
+    match pool_state_on(pool, node) {
+        Some(state) => state.error.clone().unwrap_or_else(|| "not ready".into()),
+        None => "no status reported yet".into(),
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -334,6 +368,74 @@ mod tests {
         assert!(is_shared(&pool));
         pool.spec = nfs("nas", "/srv/vm", None);
         assert!(is_shared(&pool));
+    }
+
+    #[test]
+    fn usable_on_needs_the_node_list_and_a_ready_state() {
+        use crate::node::NodeSpec;
+
+        let mut node: Node = Resource::new(
+            "n1",
+            NodeSpec {
+                address: "a".into(),
+                maintenance: false,
+            },
+        );
+        let mut pool = StoragePool::new("p", nfs("nas", "/srv/vm", None));
+        // 상태를 알리지 않은 노드에서는 NFS 풀을 쓸 수 없다. 디렉터리 풀은 쓸 수 있다.
+        assert!(pool_listed_on(&pool, node.id));
+        assert!(!pool_usable_on(&pool, &node));
+        assert_eq!(pool_error_on(&pool, &node), "no status reported yet");
+        let mut dir = StoragePool::new(
+            "d",
+            StoragePoolSpec {
+                backend: PoolBackend::Dir {
+                    path: "/srv/d".into(),
+                },
+                nodes: vec![],
+                shared: false,
+            },
+        );
+        assert!(pool_usable_on(&dir, &node));
+        // 디렉터리 풀도 준비되지 않았다고 알렸거나 노드 목록에 없으면 쓸 수 없다.
+        let down = PoolState {
+            pool_id: dir.id,
+            ready: false,
+            error: Some("no such directory".into()),
+            ..Default::default()
+        };
+        node.status.pools.insert("d".into(), down);
+        assert!(!pool_usable_on(&dir, &node));
+        node.status.pools.get_mut("d").unwrap().pool_id = Uuid::now_v7();
+        assert!(pool_usable_on(&dir, &node));
+        dir.spec.nodes = vec![Uuid::now_v7()];
+        assert!(!pool_usable_on(&dir, &node));
+        let failed = PoolState {
+            pool_id: pool.id,
+            ready: false,
+            error: Some("mount.nfs: access denied".into()),
+            ..Default::default()
+        };
+        node.status.pools.insert("p".into(), failed);
+        assert!(!pool_usable_on(&pool, &node));
+        assert_eq!(pool_error_on(&pool, &node), "mount.nfs: access denied");
+        node.status.pools.get_mut("p").unwrap().ready = true;
+        assert!(pool_usable_on(&pool, &node));
+        // 같은 이름의 다른 풀(지우고 다시 만든 풀)이나 pool_id 전의 상태는 알리지 않은 것으로 본다.
+        for other in [Uuid::now_v7(), Uuid::nil()] {
+            node.status.pools.get_mut("p").unwrap().pool_id = other;
+            assert_eq!(pool_state_on(&pool, &node), None);
+            assert!(!pool_usable_on(&pool, &node));
+            assert_eq!(pool_error_on(&pool, &node), "no status reported yet");
+        }
+        node.status.pools.get_mut("p").unwrap().pool_id = pool.id;
+        assert!(pool_state_on(&pool, &node).is_some_and(|s| s.ready));
+        // 노드 목록에 없으면 준비됐다고 알려도 쓸 수 없다.
+        pool.spec.nodes = vec![Uuid::now_v7()];
+        assert!(!pool_listed_on(&pool, node.id));
+        assert!(!pool_usable_on(&pool, &node));
+        pool.spec.nodes.push(node.id);
+        assert!(pool_usable_on(&pool, &node));
     }
 
     #[test]

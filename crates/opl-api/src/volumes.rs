@@ -8,11 +8,13 @@ use axum::extract::{Path, State};
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::StreamExt;
+use opl_types::node::NodeSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::SnapshotSpec;
 use opl_types::storage::{
-    SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
+    SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, is_shared,
+    pool_error_on, pool_listed_on, pool_usable_on,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::VmSpec;
@@ -41,27 +43,73 @@ use crate::snapshots::vm_placement;
 use crate::state::AppState;
 use crate::tasks::create_task;
 
-/// 볼륨 파일 작업을 실행할 노드. 이 노드가 풀을 쓸 수 있으면 이 노드다.
-fn pool_node(state: &AppState, pool: &StoragePool) -> Uuid {
-    let nodes = &pool.spec.nodes;
-    if nodes.is_empty() || nodes.contains(&state.node) {
-        state.node
-    } else {
-        nodes[0]
+/// 볼륨 파일 작업을 실행할 노드. 이 노드에서 풀을 쓸 수 있으면 이 노드, 아니면 풀을 쓸 수 있는
+/// 온라인 노드 가운데 id가 가장 작은 노드다. 그런 노드가 없으면 409 `pool_unavailable`.
+fn pool_node(state: &AppState, pool: &StoragePool) -> Result<Uuid, ApiError> {
+    let (_, nodes) = state.cluster.list::<NodeSpec>()?;
+    let usable: Vec<Uuid> = nodes
+        .iter()
+        .filter(|n| n.status.online && pool_usable_on(pool, n))
+        .map(|n| n.id)
+        .collect();
+    if usable.contains(&state.node) {
+        return Ok(state.node);
+    }
+    usable.into_iter().min().ok_or_else(|| {
+        ApiError::conflict(
+            "pool_unavailable",
+            format!("storage pool {:?} is not ready on any node", pool.name),
+        )
+    })
+}
+
+/// 볼륨 파일 작업을 실행할 노드. 공유가 아닌 풀은 파일이 있는 노드(볼륨을 만든 노드)이고, 공유
+/// 풀은 [`pool_node`]의 규칙이다. 풀이 없어졌으면 이 노드다.
+fn volume_node(state: &AppState, volume: &Volume) -> Result<Uuid, ApiError> {
+    match state
+        .cluster
+        .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
+    {
+        Some(pool) => match volume.status.node {
+            Some(node) if !is_shared(&pool) => Ok(node),
+            _ => pool_node(state, &pool),
+        },
+        None => Ok(state.node),
     }
 }
 
-/// 볼륨 파일 작업을 실행할 노드. 풀이 없어졌으면 이 노드다.
-fn volume_node(state: &AppState, volume: &Volume) -> Result<Uuid, ApiError> {
-    Ok(
-        match state
-            .cluster
-            .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
-        {
-            Some(pool) => pool_node(state, &pool),
-            None => state.node,
-        },
-    )
+/// `node`에서 풀을 쓸 수 있는지 확인한다. 노드 목록에 없으면 409 `pool_not_on_node`(메시지는
+/// `not_on_node`), 있지만 그 노드에서 준비되지 않았으면 409 `pool_unavailable`(노드가 알린 오류).
+pub(crate) fn check_pool_on(
+    state: &AppState,
+    pool: &StoragePool,
+    node: Uuid,
+    not_on_node: impl FnOnce() -> String,
+) -> Result<(), ApiError> {
+    if !pool_listed_on(pool, node) {
+        return Err(ApiError::conflict("pool_not_on_node", not_on_node()));
+    }
+    let Some(n) = state.cluster.get::<NodeSpec>(node)? else {
+        return Err(ApiError::conflict(
+            "pool_unavailable",
+            format!(
+                "storage pool {:?} is not ready: node {node} not found",
+                pool.name
+            ),
+        ));
+    };
+    if !pool_usable_on(pool, &n) {
+        return Err(ApiError::conflict(
+            "pool_unavailable",
+            format!(
+                "storage pool {:?} is not ready on node {:?}: {}",
+                pool.name,
+                n.name,
+                pool_error_on(pool, &n)
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
@@ -86,7 +134,7 @@ pub async fn create_volume(
         return Err(ApiError::bad_request("size_bytes must be greater than 0"));
     }
     let pool = find_pool(&state, &req.spec.pool)?;
-    let node = pool_node(&state, &pool);
+    let node = pool_node(&state, &pool)?;
     let mut volume: Volume = Resource::new(req.name, req.spec);
     volume.labels = req.labels;
     volume.status.node = Some(node);
@@ -141,15 +189,12 @@ pub async fn check_import(
     state.authorize(principal, Action::Write, VolumeSpec::KIND)?;
     check_volume_name(&q.name)?;
     let pool = find_pool(state, &q.pool)?;
-    if pool_node(state, &pool) != state.node {
-        return Err(ApiError::conflict(
-            "pool_not_on_node",
-            format!(
-                "storage pool {:?} is not available on this node; upload to one of its nodes",
-                pool.name
-            ),
-        ));
-    }
+    check_pool_on(state, &pool, state.node, || {
+        format!(
+            "storage pool {:?} is not available on this node; upload to one of its nodes",
+            pool.name
+        )
+    })?;
     if state.cluster.get_by_name::<VolumeSpec>(&q.name)?.is_some() {
         return Err(ApiError::conflict(
             "name_taken",

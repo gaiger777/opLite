@@ -82,6 +82,7 @@ async fn create_pool(env: &Env) {
         },
     );
     env.cluster.create(&pool).await.unwrap();
+    env.pool_ready("local").await;
 }
 
 /// 4 MiB qcow2 볼륨을 API로 만들고 파일 경로를 돌려준다.

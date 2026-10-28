@@ -7,6 +7,7 @@ use std::path::Path;
 use opl_cluster::memnet::MemRouter;
 use opl_reconciler::resolve::{ResolveError, runtime_spec};
 use opl_types::network::{Network, NetworkSpec, tap_name};
+use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
@@ -92,8 +93,10 @@ async fn resolves_volumes_to_pool_paths_and_user_network() {
     );
 }
 
+/// NFS 풀의 디스크는 마운트 지점 아래에 있다. 마운트되지 않았으면(빈 마운트 지점) 노드가 아직
+/// 상태를 알리지 않았어도 잠시 뒤 다시 시도할 `PoolUnavailable`이다. 경로는 `pool_root`가 정한다.
 #[tokio::test]
-async fn resolves_nfs_volumes_under_mount_point() {
+async fn refuses_nfs_volumes_until_mounted() {
     let dir = TempDir::new().unwrap();
     let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
     let node = cluster.id().0;
@@ -115,12 +118,12 @@ async fn resolves_nfs_volumes_under_mount_point() {
 
     let mut vm = common::vm("web", node);
     vm.spec.disks.push(disk("root"));
-    let spec = runtime_spec(&cluster, &vm, node, Path::new(MNT)).unwrap();
-    assert_eq!(
-        spec.disks[0].path,
-        Path::new(MNT)
-            .join(nas.id.to_string())
-            .join(format!("{}.qcow2", root.id))
+    let mnt = TempDir::new().unwrap();
+    std::fs::create_dir(mnt.path().join(nas.id.to_string())).unwrap();
+    let err = runtime_spec(&cluster, &vm, node, mnt.path()).unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::PoolUnavailable(n, e) if n == "nas" && e.contains("not mounted")),
+        "{err:?}"
     );
 }
 
@@ -198,4 +201,58 @@ async fn reports_unresolvable_references() {
         check(vec![], vec![nic("user", None)]),
         ResolveError::MissingMac(0)
     ));
+}
+
+#[tokio::test]
+async fn refuses_pools_this_node_reports_not_ready() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let mut pools = Vec::new();
+    for name in ["down", "unknown", "stale"] {
+        let p = pool(name, vec![]);
+        cluster.create(&p).await.unwrap();
+        pools.push(p);
+        cluster
+            .create(&volume(&format!("{name}-root"), name))
+            .await
+            .unwrap();
+    }
+    let mut me: Node = Resource::new(
+        "n1",
+        NodeSpec {
+            address: "a".into(),
+            maintenance: false,
+        },
+    );
+    me.id = node;
+    let down = PoolState {
+        pool_id: pools[0].id,
+        ready: false,
+        error: Some("mount.nfs: access denied".into()),
+        ..Default::default()
+    };
+    me.status.pools.insert("down".into(), down.clone());
+    // 같은 이름의 지워진 풀이 남긴 상태는 이 풀의 것이 아니다.
+    let stale = PoolState {
+        pool_id: Uuid::now_v7(),
+        ..down
+    };
+    me.status.pools.insert("stale".into(), stale);
+    cluster.create(&me).await.unwrap();
+
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("down-root"));
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT)).unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::PoolUnavailable(n, e)
+            if n == "down" && e == "mount.nfs: access denied"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("access denied"), "{err}");
+    // 상태를 아직 알리지 않은 풀(opld가 막 시작함)은 막지 않는다. 파일이 없으면 시작이 실패한다.
+    for disk_name in ["unknown-root", "stale-root"] {
+        vm.spec.disks = vec![disk(disk_name)];
+        runtime_spec(&cluster, &vm, node, Path::new(MNT)).unwrap();
+    }
 }

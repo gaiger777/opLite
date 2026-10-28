@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_cluster::types::{NodeId, Rejection};
+use opl_cluster::watch::{Watch, WatchEvent};
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::Capacity;
 use opl_types::node::{NodeSpec, NodeStatus, PoolState};
+use opl_types::resource::Kind;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, VolumeSpec};
 use opl_types::vm::{VmPhase, VmSpec};
 use tokio::sync::{Notify, oneshot};
@@ -146,12 +148,23 @@ async fn run_pools(mut pools: Pools, refresh: Duration, mut shutdown: oneshot::R
     let done = pools.done.clone();
     let mut interval = tokio::time::interval(refresh);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut watch = None;
     loop {
+        // 풀이 바뀌면(만들기·지우기) 곧바로 새로 고친다. 배치와 볼륨 Task는 준비된 노드만 고른다.
         tokio::select! {
             _ = &mut shutdown => return,
             // 마운트·언마운트가 끝나면 곧바로 결과를 적는다.
             () = done.notified() => {}
             _ = interval.tick() => {}
+            () = pool_changed(&mut watch) => {}
+        }
+        // 이 새로 고침이 읽을 목록 뒤의 변경을 놓치지 않게 먼저 구독한다.
+        if watch.is_none() {
+            watch = pools
+                .cluster
+                .list::<StoragePoolSpec>()
+                .ok()
+                .and_then(|(revision, _)| pools.cluster.watch(revision).ok());
         }
         // 마운트·기록이 오래 걸릴 수 있으므로 종료 요청과 겨룬다.
         tokio::select! {
@@ -159,6 +172,33 @@ async fn run_pools(mut pools: Pools, refresh: Duration, mut shutdown: oneshot::R
             r = pools.tick() => if let Err(e) = r {
                 tracing::warn!(error = format!("{e:#}"), "cannot refresh storage pool states");
             }
+        }
+    }
+}
+
+/// 풀 리소스가 바뀔 때까지 기다린다. 구독이 끊기면(뒤처짐, 스냅샷 설치) 구독을 버리고 돌아가 새로
+/// 고친 뒤 다시 구독하게 한다. 구독이 없으면 기다리기만 한다.
+async fn pool_changed(watch: &mut Option<Watch>) {
+    let Some(w) = watch else {
+        return std::future::pending().await;
+    };
+    loop {
+        match w.next().await {
+            Ok(
+                WatchEvent::Put {
+                    kind: Kind::StoragePool,
+                    ..
+                }
+                | WatchEvent::Deleted {
+                    kind: Kind::StoragePool,
+                    ..
+                },
+            ) => return,
+            Ok(WatchEvent::Reset { .. }) | Err(_) => {
+                *watch = None;
+                return;
+            }
+            Ok(_) => {}
         }
     }
 }
@@ -840,6 +880,47 @@ mod tests {
         assert_eq!(s.fake.calls(), Vec::<String>::new());
         let after = s.cluster.get::<NodeSpec>(s.node).unwrap().unwrap().revision;
         assert_eq!(after, revision);
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refreshes_as_soon_as_a_pool_is_created() {
+        let s = setup().await;
+        let dir = |path: &Path| PoolBackend::Dir {
+            path: path.to_path_buf(),
+        };
+        s.pool("first", dir(&s.local), vec![]).await;
+        let (stop, rx) = oneshot::channel();
+        // 주기는 길게 둔다. 첫 새로 고침 뒤에 만든 풀도 주기를 기다리지 않고 적는다.
+        let task = tokio::spawn(run_pools(s.pools, Duration::from_secs(3600), rx));
+        let wait_ready = |name: &'static str| {
+            let cluster = s.cluster.clone();
+            let node = s.node;
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let states = cluster.get::<NodeSpec>(node).unwrap().unwrap().status.pools;
+                    if states.get(name).is_some_and(|p| p.ready) {
+                        return;
+                    }
+                    assert!(tokio::time::Instant::now() < deadline, "{name}: {states:?}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        wait_ready("first").await;
+        let local = Resource::new(
+            "local",
+            StoragePoolSpec {
+                backend: dir(&s.local),
+                nodes: vec![],
+                shared: false,
+            },
+        );
+        s.cluster.create(&local).await.unwrap();
+        wait_ready("local").await;
+        stop.send(()).unwrap();
+        task.await.unwrap();
         s.cluster.shutdown().await.unwrap();
     }
 

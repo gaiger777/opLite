@@ -3,7 +3,9 @@
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec};
-use opl_types::storage::{StoragePool, StoragePoolSpec, Volume, VolumeSpec};
+use opl_types::storage::{
+    StoragePool, StoragePoolSpec, Volume, VolumeSpec, is_shared, pool_usable_on,
+};
 use opl_types::vm::{PowerState, Vm, VmSpec};
 use uuid::Uuid;
 
@@ -50,15 +52,18 @@ impl Inventory {
             })
     }
 
-    /// 이 VM의 디스크가 있는 풀을 모두 쓸 수 있는 노드인지
-    fn reaches_disks(&self, spec: &VmSpec, node: Uuid) -> bool {
+    /// 이 VM의 디스크가 있는 풀을 모두 쓸 수 있는 노드인지. 공유가 아닌 풀의 볼륨은 그 파일이 있는
+    /// 노드(볼륨을 만든 노드)에서만 쓸 수 있다.
+    fn reaches_disks(&self, spec: &VmSpec, node: &Node) -> bool {
         spec.disks.iter().all(|disk| {
-            let pool = self
-                .volumes
-                .iter()
-                .find(|v| v.name == disk.volume)
-                .and_then(|v| self.pools.iter().find(|p| p.name == v.spec.pool));
-            pool.is_none_or(|p| p.spec.nodes.is_empty() || p.spec.nodes.contains(&node))
+            let Some(volume) = self.volumes.iter().find(|v| v.name == disk.volume) else {
+                return true;
+            };
+            let Some(pool) = self.pools.iter().find(|p| p.name == volume.spec.pool) else {
+                return true;
+            };
+            pool_usable_on(pool, node)
+                && (is_shared(pool) || volume.status.node.is_none_or(|n| n == node.id))
         })
     }
 
@@ -83,7 +88,7 @@ pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode
         .iter()
         .filter(|n| n.status.online && !n.spec.maintenance)
         .filter(|n| n.status.arch == Some(spec.machine.arch()))
-        .filter(|n| inv.reaches_disks(spec, n.id))
+        .filter(|n| inv.reaches_disks(spec, n))
         .filter(|n| inv.has_bridges(spec, n))
         .map(|n| (inv.free_memory_mib(n, vm), n.id))
         .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
@@ -93,7 +98,7 @@ pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode
 
 #[cfg(test)]
 mod tests {
-    use opl_types::node::{BridgeInfo, NodeStatus};
+    use opl_types::node::{BridgeInfo, NodeStatus, PoolState};
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
     use opl_types::storage::PoolBackend;
@@ -119,6 +124,43 @@ mod tests {
             pools: Default::default(),
         };
         n
+    }
+
+    /// 노드가 알린 풀 상태
+    fn with_pool(mut node: Node, pool: &StoragePool, ready: bool) -> Node {
+        let state = PoolState {
+            pool_id: pool.id,
+            ready,
+            ..Default::default()
+        };
+        node.status.pools.insert(pool.name.clone(), state);
+        node
+    }
+
+    fn pool(name: &str, shared: bool) -> StoragePool {
+        Resource::new(
+            name,
+            StoragePoolSpec {
+                backend: PoolBackend::Dir {
+                    path: "/pool".into(),
+                },
+                nodes: vec![],
+                shared,
+            },
+        )
+    }
+
+    fn volume(name: &str, pool: &str, node: Option<Uuid>) -> Volume {
+        let mut v: Volume = Resource::new(
+            name,
+            VolumeSpec {
+                pool: pool.into(),
+                size_bytes: 1,
+                format: ImageFormat::Qcow2,
+            },
+        );
+        v.status.node = node;
+        v
     }
 
     fn spec(memory_mib: u32, node: Option<Uuid>, power: PowerState) -> VmSpec {
@@ -168,7 +210,6 @@ mod tests {
         offline.status.online = false;
         let mut maint = node(64000);
         maint.spec.maintenance = true;
-        let far = node(32000);
         let near = node(1024);
         let pool = Resource::new(
             "local",
@@ -180,6 +221,8 @@ mod tests {
                 shared: false,
             },
         );
+        let far = with_pool(node(32000), &pool, true);
+        let near = with_pool(near, &pool, true);
         let volume = Resource::new(
             "root",
             VolumeSpec {
@@ -205,6 +248,67 @@ mod tests {
 
         let empty = Inventory::default();
         assert_eq!(schedule(Uuid::now_v7(), &me, &empty), Err(NoNode));
+    }
+
+    #[test]
+    fn local_volumes_stay_on_their_node_and_shared_pools_need_a_ready_node() {
+        let big = node(64000);
+        let mid = node(32000);
+        let small = node(1024);
+        let mut me = spec(512, None, PowerState::Running);
+        me.disks.push(DiskSpec {
+            volume: "root".into(),
+            bus: DiskBus::VirtioBlk,
+            boot_order: Some(1),
+        });
+        let inv = |pool: StoragePool, volume: Volume, ready: [bool; 3]| Inventory {
+            nodes: [&big, &mid, &small]
+                .into_iter()
+                .zip(ready)
+                .map(|(n, r)| with_pool(n.clone(), &pool, r))
+                .collect(),
+            volumes: vec![volume],
+            pools: vec![pool],
+            ..Default::default()
+        };
+
+        // 공유가 아닌 풀은 모든 노드가 쓸 수 있어도 볼륨 파일이 있는 노드로 간다.
+        let local = inv(
+            pool("local", false),
+            volume("root", "local", Some(small.id)),
+            [true; 3],
+        );
+        assert_eq!(schedule(Uuid::now_v7(), &me, &local), Ok(small.id));
+        // 그 노드에서 풀이 준비되지 않았으면 갈 곳이 없다.
+        let local = inv(
+            pool("local", false),
+            volume("root", "local", Some(small.id)),
+            [true, true, false],
+        );
+        assert_eq!(schedule(Uuid::now_v7(), &me, &local), Err(NoNode));
+
+        // 공유 풀은 준비된 노드 가운데 메모리가 가장 많은 노드로 간다.
+        let shared = inv(
+            pool("nas", true),
+            volume("root", "nas", Some(small.id)),
+            [false, true, true],
+        );
+        assert_eq!(schedule(Uuid::now_v7(), &me, &shared), Ok(mid.id));
+        // 상태를 알리지 않은 노드(옛 노드, 첫 새로 고침 전)는 NFS 풀에는 후보가 아니고, 디렉터리
+        // 풀에는 후보다.
+        let mut nfs = pool("nas", true);
+        nfs.spec.backend = PoolBackend::Nfs {
+            server: "nas".into(),
+            export: "/srv/vm".into(),
+            options: None,
+        };
+        let mut unknown = inv(nfs, volume("root", "nas", None), [true; 3]);
+        for n in &mut unknown.nodes {
+            n.status.pools.clear();
+        }
+        assert_eq!(schedule(Uuid::now_v7(), &me, &unknown), Err(NoNode));
+        unknown.pools[0] = pool("nas", true);
+        assert_eq!(schedule(Uuid::now_v7(), &me, &unknown), Ok(big.id));
     }
 
     #[test]

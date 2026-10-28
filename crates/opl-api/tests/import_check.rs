@@ -4,6 +4,7 @@
 mod common;
 
 use common::{Client, Env};
+use opl_types::node::PoolState;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumeSpec};
@@ -24,6 +25,7 @@ async fn pool(env: &Env, name: &str, nodes: Vec<Uuid>) {
         },
     );
     env.cluster.create(&pool).await.unwrap();
+    env.pool_ready(name).await;
 }
 
 /// 풀 `local`에 볼륨을 저장소에 직접 만든다.
@@ -57,6 +59,13 @@ async fn check_rejects_with_the_upload_codes() {
     let admin = env.admin().await;
     pool(&env, "local", vec![]).await;
     pool(&env, "remote", vec![Uuid::now_v7()]).await;
+    pool(&env, "down", vec![]).await;
+    let down = PoolState {
+        ready: false,
+        error: Some("mount.nfs: access denied".into()),
+        ..Default::default()
+    };
+    common::set_pool_state(&env.cluster, env.node, "down", down).await;
     volume(&env, "taken").await;
 
     let (status, body) = check(&admin, "disk", "local", 1 << 20).await;
@@ -97,6 +106,14 @@ async fn check_rejects_with_the_upload_codes() {
             StatusCode::CONFLICT,
             "pool_not_on_node",
         ),
+        // 노드 목록에는 있지만 이 노드에서 준비되지 않았다.
+        (
+            "disk",
+            "down",
+            1 << 20,
+            StatusCode::CONFLICT,
+            "pool_unavailable",
+        ),
         (
             "taken",
             "local",
@@ -127,6 +144,11 @@ async fn check_rejects_with_the_upload_codes() {
             "{name} {pool} {body}"
         );
     }
+
+    // 준비되지 않은 이유는 노드가 알린 오류다.
+    let (_, body) = check(&admin, "disk", "down", 1 << 20).await;
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("access denied"), "{body}");
 
     // 크기가 없으면 확인할 수 없다.
     let (status, body) = admin

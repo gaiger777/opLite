@@ -51,6 +51,7 @@ async fn pool(env: &Env, nodes: Vec<Uuid>) {
         },
     );
     env.cluster.create(&pool).await.unwrap();
+    env.pool_ready("local").await;
 }
 
 /// 바로 Ready인 볼륨을 저장소에 직접 만든다(파일은 만들지 않는다).
@@ -568,10 +569,16 @@ async fn resize_only_grows_and_runs_where_the_volume_is_used() {
     let admin = env.admin().await;
     let viewer = env.user("viewer", "viewer").await;
     let operator = env.user("operator", "operator").await;
-    // 풀은 다른 노드에만 있다(파일 작업은 그 노드에서 한다).
+    // 풀은 다른 노드에만 있고 볼륨 파일은 그 노드에 있다(파일 작업은 그 노드에서 한다).
     let pool_node = Uuid::now_v7();
     pool(&env, vec![pool_node]).await;
     let id = volume(&env, "data", ImageFormat::Raw).await;
+    let mut data = env.cluster.get::<VolumeSpec>(id).unwrap().unwrap();
+    data.status.node = Some(pool_node);
+    env.cluster
+        .update_status::<VolumeSpec>(id, &data.status)
+        .await
+        .unwrap();
 
     // 줄이기·같은 크기와 512 배수가 아닌 크기는 받지 않는다.
     for size in [0, MIB, 2 * MIB + 1] {

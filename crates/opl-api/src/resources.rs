@@ -189,23 +189,29 @@ list_and_get!(
 pub async fn create_pool(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Json(req): Json<CreateRequest<StoragePoolSpec>>,
+    Json(req): Json<CreateRequest<serde_json::Value>>,
 ) -> Result<(StatusCode, Json<StoragePool>), ApiError> {
     state.authorize(&principal, Action::Write, StoragePoolSpec::KIND)?;
     check_name(&req.name)?;
-    req.spec
-        .validate()
+    // `shared`를 적었는지 알아야 하므로 spec은 JSON 값으로 받아 읽는다.
+    let shared_given = req.spec.get("shared").is_some();
+    let mut spec: StoragePoolSpec = serde_json::from_value(req.spec)
+        .map_err(|e| ApiError::bad_request(format!("spec: {e}")))?;
+    spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    // NFS 풀 마운트와 배치는 아직 없다.
-    if matches!(req.spec.backend, PoolBackend::Nfs { .. }) {
-        return Err(ApiError::bad_request("nfs pools are not supported yet"));
+    // NFS 풀은 늘 공유다. `shared`가 없으면 true로 두고 false면 거절한다.
+    if matches!(spec.backend, PoolBackend::Nfs { .. }) {
+        if shared_given && !spec.shared {
+            return Err(ApiError::bad_request("nfs pools are always shared"));
+        }
+        spec.shared = true;
     }
-    for node in &req.spec.nodes {
+    for node in &spec.nodes {
         if state.cluster.get::<NodeSpec>(*node)?.is_none() {
             return Err(ApiError::bad_request(format!("node {node} not found")));
         }
     }
-    let mut pool = Resource::new(req.name, req.spec);
+    let mut pool = Resource::new(req.name, spec);
     pool.labels = req.labels;
     pool.revision = state.cluster.create(&pool).await?;
     Ok((StatusCode::CREATED, Json(pool)))

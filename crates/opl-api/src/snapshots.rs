@@ -24,6 +24,7 @@ use crate::resources::{List, check_name, lookup};
 use crate::state::AppState;
 use crate::tasks::create_task;
 use crate::vms::{is_stopped, prepare};
+use crate::volumes::check_pool_on;
 
 /// 설명의 최대 글자 수
 const MAX_DESCRIPTION_CHARS: usize = 1024;
@@ -456,15 +457,12 @@ pub async fn clone_vm(
             .cluster
             .get_by_name::<StoragePoolSpec>(name)?
             .ok_or_else(|| ApiError::bad_request(format!("storage pool {name:?} not found")))?;
-        if !pool.spec.nodes.is_empty() && !pool.spec.nodes.contains(&node) {
-            return Err(ApiError::conflict(
-                "pool_not_on_node",
-                format!(
-                    "storage pool {name:?} is not available on the node holding VM {:?}",
-                    vm.name
-                ),
-            ));
-        }
+        check_pool_on(&state, &pool, node, || {
+            format!(
+                "storage pool {name:?} is not available on the node holding VM {:?}",
+                vm.name
+            )
+        })?;
     }
     for disk in &spec.disks {
         if state

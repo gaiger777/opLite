@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use common::{Client, Env, FakeStorage, vm_request};
 use opl_driver::uefi_vars_path;
+use opl_types::node::PoolState;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
@@ -55,6 +56,7 @@ async fn pool(env: &Env, name: &str, nodes: Vec<Uuid>) {
         },
     );
     env.cluster.create(&pool).await.unwrap();
+    env.pool_ready(name).await;
 }
 
 /// 풀 `local`에 바로 Ready인 qcow2 볼륨을 저장소에 직접 만든다(파일은 만들지 않는다).
@@ -215,6 +217,16 @@ async fn clone_validates_request() {
         "web",
         json!({ "name": "web-2", "pool": "remote" }),
         "pool_not_on_node",
+    )
+    .await;
+    // 노드 목록에는 있지만 그 노드에서 준비되지 않았다.
+    pool(&env, "down", vec![]).await;
+    common::set_pool_state(&env.cluster, env.node, "down", Default::default()).await;
+    assert_conflict(
+        &admin,
+        "web",
+        json!({ "name": "web-2", "pool": "down" }),
+        "pool_unavailable",
     )
     .await;
     let (status, _) = clone(&admin, "missing", json!({ "name": "web-2" })).await;
@@ -639,6 +651,33 @@ async fn clone_fails_cleanly_when_the_source_is_gone() {
     env.start_runner_with(storage.clone()).await;
     failed_with(&admin.wait_task(&from_vm).await, "VM was deleted");
 
+    assert!(!storage.calls().iter().any(|(call, _)| *call == "copy"));
+    assert!(volumes_named(&env, "web-2").is_empty());
+    assert!(get_vm(&env, "web-2").is_none());
+}
+
+#[tokio::test]
+async fn clone_fails_when_the_target_pool_is_no_longer_ready() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool(&env, "local", vec![]).await;
+    pool(&env, "nas", vec![]).await;
+    let root = volume(&env, "root").await;
+    let storage = fake_storage(&mut env, &[root]).await;
+    vm_with_disks(&admin, "web", &["root"]).await;
+
+    // API가 받은 뒤 Task가 돌기 전에 대상 풀이 이 노드에서 준비되지 않게 됐다(NFS 서버가 멈춤).
+    env.stop_runner().await;
+    let (status, task) = clone(&admin, "web", json!({ "name": "web-2", "pool": "nas" })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let down = PoolState {
+        ready: false,
+        error: Some("nfs server not responding".into()),
+        ..Default::default()
+    };
+    common::set_pool_state(&env.cluster, env.node, "nas", down).await;
+    env.start_runner_with(storage.clone()).await;
+    failed_with(&admin.wait_task(&task).await, "nfs server not responding");
     assert!(!storage.calls().iter().any(|(call, _)| *call == "copy"));
     assert!(volumes_named(&env, "web-2").is_empty());
     assert!(get_vm(&env, "web-2").is_none());

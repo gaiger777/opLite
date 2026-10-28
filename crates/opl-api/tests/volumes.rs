@@ -13,7 +13,7 @@ use serde_json::json;
 
 const MIB: u64 = 1 << 20;
 
-async fn create_pool(admin: &Client, dir: &Path) {
+async fn create_pool(env: &Env, admin: &Client, dir: &Path) {
     let (status, body) = admin
         .post(
             "/storage-pools",
@@ -24,6 +24,7 @@ async fn create_pool(admin: &Client, dir: &Path) {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    env.pool_ready("local").await;
 }
 
 fn qemu_img(args: &[&str]) {
@@ -37,7 +38,7 @@ async fn creates_and_deletes_volume_files() {
     let admin = env.admin().await;
     let pool = env.dir.path().join("pool");
     std::fs::create_dir(&pool).unwrap();
-    create_pool(&admin, &pool).await;
+    create_pool(&env, &admin, &pool).await;
 
     let (status, task) = admin
         .post(
@@ -87,7 +88,7 @@ async fn failed_create_removes_the_volume() {
     let env = Env::start().await;
     let admin = env.admin().await;
     // 풀 디렉터리가 없으면 qemu-img가 실패한다.
-    create_pool(&admin, &env.dir.path().join("missing")).await;
+    create_pool(&env, &admin, &env.dir.path().join("missing")).await;
     let (_, task) = admin
         .post(
             "/volumes",
@@ -108,7 +109,7 @@ async fn imports_uploaded_vmdk() {
     let admin = env.admin().await;
     let pool = env.dir.path().join("pool");
     std::fs::create_dir(&pool).unwrap();
-    create_pool(&admin, &pool).await;
+    create_pool(&env, &admin, &pool).await;
     let raw = env.dir.path().join("disk.raw");
     std::fs::write(&raw, vec![7u8; 3 * MIB as usize]).unwrap();
     let vmdk = env.dir.path().join("disk.vmdk");
@@ -148,7 +149,7 @@ async fn upload_needs_content_length() {
     let admin = env.admin().await;
     let pool = env.dir.path().join("pool");
     std::fs::create_dir(&pool).unwrap();
-    create_pool(&admin, &pool).await;
+    create_pool(&env, &admin, &pool).await;
     // 스트림 본문은 길이를 모르므로 chunked로 간다.
     let chunks = futures_util::stream::iter([Ok::<_, std::io::Error>(vec![0u8; 512])]);
     let r = admin
@@ -170,7 +171,7 @@ async fn rejects_images_that_refer_to_other_files() {
     let admin = env.admin().await;
     let pool = env.dir.path().join("pool");
     std::fs::create_dir(&pool).unwrap();
-    create_pool(&admin, &pool).await;
+    create_pool(&env, &admin, &pool).await;
     let descriptor = "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\n\
                       createType=\"monolithicFlat\"\n\nRW 2048 FLAT \"/etc/hosts\" 0\n";
 
