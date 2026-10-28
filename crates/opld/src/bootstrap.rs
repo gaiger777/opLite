@@ -71,7 +71,7 @@ pub async fn create_cluster(
     Ok(password)
 }
 
-/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지를 기록한다.
+/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지, 아키텍처를 기록한다.
 pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> anyhow::Result<()> {
     let NodeId(id) = cluster.id();
     let address = config.api_address();
@@ -108,7 +108,7 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
         memory_mib: crate::host::memory_mib(),
         hypervisor: host.hypervisor_name(),
         bridges: host.bridges().await.unwrap_or(recorded),
-        arch: None,
+        arch: Some(host.profile.arch),
     };
     cluster.update_status::<NodeSpec>(id, &status).await?;
     Ok(())
@@ -162,6 +162,7 @@ mod tests {
     use opl_cluster::memnet::MemRouter;
     use opl_driver::{DriverError, HostNet, Tap};
     use opl_types::node::BridgeInfo;
+    use opl_types::vm::Arch;
 
     use super::*;
 
@@ -194,12 +195,11 @@ mod tests {
         assert!(node_id(dir.path()).is_err());
     }
 
-    #[tokio::test]
-    async fn failed_bridge_listing_keeps_the_recorded_bridges() {
-        let dir = tempfile::tempdir().unwrap();
+    /// 멤버가 이 노드 하나인 클러스터. 리더가 될 때까지 기다린다.
+    async fn single_node(dir: &Path) -> (Cluster, NodeId) {
         let router = MemRouter::default();
         let id = NodeId(Uuid::now_v7());
-        let cluster = Cluster::open(ClusterConfig::new(id, dir.path()), router.network(id))
+        let cluster = Cluster::open(ClusterConfig::new(id, dir), router.network(id))
             .await
             .unwrap();
         router.register(id, cluster.raft().clone());
@@ -211,11 +211,38 @@ mod tests {
             .metrics(|m| m.state == ServerState::Leader, "leader")
             .await
             .unwrap();
+        (cluster, id)
+    }
 
-        let config: Config = toml::from_str(
+    fn test_config() -> Config {
+        toml::from_str(
             "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"tcg\"\nsystemd_scope = false",
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn registration_records_the_host_architecture() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        // 컴파일된 아키텍처가 아니라 HostProfile의 것을 기록한다.
+        let mut host = Host::from_config(&config).unwrap();
+        host.net = None;
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            host.profile.arch = arch;
+            register_node(&cluster, &config, &host).await.unwrap();
+            let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+            assert_eq!(node.status.arch, Some(arch));
+        }
+        cluster.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_bridge_listing_keeps_the_recorded_bridges() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
         let host = |bridges: Option<Vec<BridgeInfo>>| Host {
             net: Some(Arc::new(FakeNet(bridges))),
             ..Host::from_config(&config).unwrap()

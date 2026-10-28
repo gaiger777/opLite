@@ -20,6 +20,7 @@ use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{SourceFormat, StoragePoolSpec};
+use opl_types::vm::Arch;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -117,7 +118,8 @@ impl Env {
             memory_mib: 8192,
             hypervisor: "mock".into(),
             bridges: vec![],
-            arch: None,
+            // 테스트 VM은 virt(aarch64) 머신이다.
+            arch: Some(Arch::Aarch64),
         };
         cluster.create(&me).await.unwrap();
         let admin = Resource::new(

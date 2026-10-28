@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::network::USER_NETWORK;
+use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::storage::VolumePhase;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
@@ -111,15 +112,39 @@ pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(
             ));
         }
     }
-    if let Some(node) = spec.node
-        && !inv.nodes.iter().any(|n| n.id == node)
-    {
-        return Err(ApiError::bad_request(format!("node {node} not found")));
+    if let Some(id) = spec.node {
+        let Some(node) = inv.nodes.iter().find(|n| n.id == id) else {
+            return Err(ApiError::bad_request(format!("node {id} not found")));
+        };
+        check_node_arch(node, spec)?;
     }
     if spec.power == PowerState::Running && spec.node.is_none() {
         spec.node = Some(
             schedule(id, spec, &inv).map_err(|e| ApiError::conflict("no_node", e.to_string()))?,
         );
+    }
+    Ok(())
+}
+
+/// 노드의 arch가 머신과 다르면 400 `machine_arch_mismatch`. arch를 모르는 노드(옛 버전)는 막지 않는다.
+/// 업그레이드 중에도 VM을 고칠 수 있게.
+pub(crate) fn check_node_arch(node: &Node, spec: &VmSpec) -> Result<(), ApiError> {
+    if let Some(arch) = node.status.arch
+        && arch != spec.machine.arch()
+    {
+        // Debug 이름을 소문자로 바꾸면 API의 값(q35, x86_64 등)과 같다.
+        let name = |v: &dyn std::fmt::Debug| format!("{v:?}").to_lowercase();
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "machine_arch_mismatch",
+            format!(
+                "machine type {} needs an {} node, but node {:?} is {}",
+                name(&spec.machine),
+                name(&spec.machine.arch()),
+                node.name,
+                name(&arch)
+            ),
+        ));
     }
     Ok(())
 }
@@ -288,6 +313,12 @@ pub async fn vm_action(
         "start" => {
             let _lock = state.vm_lock.lock().await;
             let vm = modify_spec(&state, id, |spec| {
+                // 고정된 노드는 VM을 고칠 때 확인했지만, 그때 arch를 모르던 노드일 수 있다.
+                if let Some(node) = spec.node
+                    && let Some(node) = state.cluster.get::<NodeSpec>(node)?
+                {
+                    check_node_arch(&node, spec)?;
+                }
                 if spec.node.is_none() {
                     let inv = Inventory::load(&state.cluster)?;
                     let node = schedule(id, spec, &inv)

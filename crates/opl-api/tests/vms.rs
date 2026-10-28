@@ -6,9 +6,11 @@ use std::time::Duration;
 
 use common::{Env, vm_request};
 use opl_driver::DriverError;
+use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{VolumePhase, VolumeSpec};
+use opl_types::vm::Arch;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -376,6 +378,64 @@ async fn start_fails_when_no_node_can_run_the_vm() {
     let (status, body) = admin.post("/vms/web/actions/start", Value::Null).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["code"], "no_node");
+}
+
+#[tokio::test]
+async fn machine_must_match_the_node_architecture() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node = env.node.to_string();
+    // 테스트 노드는 aarch64다. q35(x86_64)를 이 노드에 두면 거절한다.
+    let mut x86 = vm_request("x86");
+    x86["spec"]["machine"] = json!("q35");
+    x86["spec"]["node"] = json!(node);
+    let (status, body) = admin.post("/vms", x86.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "machine_arch_mismatch");
+
+    // 고칠 때도 같은 검증이다.
+    let mut arm = vm_request("arm");
+    arm["spec"]["node"] = json!(node);
+    let (status, vm) = admin.post("/vms", arm).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let mut spec = vm["spec"].clone();
+    spec["machine"] = json!("q35");
+    let (status, body) = admin.put("/vms/arm", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "machine_arch_mismatch");
+
+    // 노드를 정하지 않은 q35 VM은 만들 수 있지만 맞는 노드가 없어 시작하지 못한다.
+    let mut free = vm_request("free");
+    free["spec"]["machine"] = json!("q35");
+    assert_eq!(admin.post("/vms", free).await.0, StatusCode::CREATED);
+    let (status, body) = admin.post("/vms/free/actions/start", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "no_node");
+
+    // arch를 모르는 노드(옛 버전)는 지정을 막지 않는다.
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.arch = None;
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let (code, body) = admin.post("/vms", x86).await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+
+    // 그 노드가 arch를 기록한 뒤 시작하면 지정 노드 검증과 같은 400이다.
+    status.arch = Some(Arch::Aarch64);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let (code, body) = admin.post("/vms/x86/actions/start", Value::Null).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "machine_arch_mismatch");
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_driver::{DriverError, uefi_vars_path, vm_state_dir};
+use opl_types::node::NodeSpec;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
 use opl_types::task::Task;
@@ -14,6 +15,7 @@ use opl_types::vm::{PowerState, ScheduleError, Vm, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
 
 use crate::schedule::{recorded_vm, set_schedule_error};
+use crate::vms::check_node_arch;
 
 use super::{Ctx, set_power, set_volume_size, started, stopped, superseded, wait_vm};
 
@@ -436,6 +438,15 @@ async fn write_reverted_spec(ctx: &Ctx, vm_id: Uuid, snapshot: &Snapshot) -> Res
         // 예약은 스냅샷 때의 것이 아니라 지금 것을 지킨다.
         spec.snapshot_schedule = vm.spec.snapshot_schedule;
         if snapshot.spec.memory && spec.node.is_none() {
+            // 이 노드의 arch가 머신과 다르면 여기서 시작할 수 없다. 다른 노드로 보내면 메모리 상태를
+            // 이어 쓸 수 없으므로 고정하지 않고 Task를 실패로 끝낸다(디스크를 건드리기 전이다).
+            if let Some(node) = ctx
+                .cluster
+                .get::<NodeSpec>(ctx.config.node)
+                .map_err(|e| e.to_string())?
+            {
+                check_node_arch(&node, &spec).map_err(|e| e.message)?;
+            }
             spec.node = Some(ctx.config.node);
         }
         spec.power = PowerState::Stopped;

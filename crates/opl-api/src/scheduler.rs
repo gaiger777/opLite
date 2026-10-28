@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
-    "no node can run this VM (needs an online node that is not in maintenance, can reach its storage pools and has the bridges of its networks)"
+    "no node can run this VM (needs an online node that is not in maintenance, has the architecture of its machine type, can reach its storage pools and has the bridges of its networks)"
 )]
 pub struct NoNode;
 
@@ -75,12 +75,14 @@ impl Inventory {
     }
 }
 
-/// 온라인이고 유지보수 중이 아니며 디스크의 풀을 쓸 수 있고 네트워크의 브리지가 있는 노드 가운데 미할당 메모리가 가장
-/// 많은 노드를 고른다. 같으면 id가 작은 노드다. 메모리가 모자라도 고른다(오버커밋 정책은 범위 밖).
+/// 온라인이고 유지보수 중이 아니며 머신 타입의 아키텍처이고 디스크의 풀을 쓸 수 있고 네트워크의 브리지가 있는 노드
+/// 가운데 미할당 메모리가 가장 많은 노드를 고른다. 같으면 id가 작은 노드다. 메모리가 모자라도 고른다(오버커밋 정책은
+/// 범위 밖). arch를 모르는 노드(옛 버전)는 고르지 않는다.
 pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode> {
     inv.nodes
         .iter()
         .filter(|n| n.status.online && !n.spec.maintenance)
+        .filter(|n| n.status.arch == Some(spec.machine.arch()))
         .filter(|n| inv.reaches_disks(spec, n.id))
         .filter(|n| inv.has_bridges(spec, n))
         .map(|n| (inv.free_memory_mib(n, vm), n.id))
@@ -95,7 +97,7 @@ mod tests {
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
     use opl_types::storage::PoolBackend;
-    use opl_types::vm::{CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec};
+    use opl_types::vm::{Arch, CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec};
 
     use super::*;
 
@@ -113,7 +115,7 @@ mod tests {
             memory_mib,
             hypervisor: "mock".into(),
             bridges: vec![],
-            arch: None,
+            arch: Some(Arch::Aarch64),
         };
         n
     }
@@ -243,6 +245,35 @@ mod tests {
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(aware.id));
         // 없는 네트워크는 어디서도 돌 수 없다.
         me.nics.push(nic("gone"));
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+    }
+
+    #[test]
+    fn needs_the_architecture_of_its_machine() {
+        let x86 = {
+            let mut n = node(64000);
+            n.status.arch = Some(Arch::X86_64);
+            n
+        };
+        let unknown = {
+            let mut n = node(32000);
+            n.status.arch = None;
+            n
+        };
+        let arm = node(1024);
+        let inv = Inventory {
+            nodes: vec![x86.clone(), unknown, arm.clone()],
+            ..Default::default()
+        };
+        // virt는 aarch64 노드에서만 돈다. arch를 모르는 노드(옛 버전)는 후보가 아니다.
+        let mut me = spec(512, None, PowerState::Running);
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(arm.id));
+        me.machine = MachineType::Q35;
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(x86.id));
+        let inv = Inventory {
+            nodes: vec![arm],
+            ..Default::default()
+        };
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
     }
 }

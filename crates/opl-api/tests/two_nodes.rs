@@ -18,6 +18,7 @@ use opl_reconciler::Reconciler;
 use opl_types::auth::{Role, UserSpec};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
+use opl_types::vm::Arch;
 use reqwest::StatusCode;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -142,7 +143,8 @@ async fn two_nodes() -> (TempDir, Node, Node) {
             memory_mib: 8192,
             hypervisor: "mock".into(),
             bridges: vec![],
-            arch: None,
+            // 테스트 VM은 virt(aarch64) 머신이다.
+            arch: Some(Arch::Aarch64),
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();

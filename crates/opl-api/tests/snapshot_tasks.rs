@@ -8,12 +8,13 @@ use std::sync::{Arc, Mutex};
 use common::{Client, Env, FakeStorage, vm_request};
 use opl_driver::{DriverError, uefi_vars_path};
 use opl_qemu::QmpError;
+use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
 use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{PowerState, VmPhase, VmSpec};
+use opl_types::vm::{Arch, PowerState, VmPhase, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -253,6 +254,46 @@ async fn revert_restores_the_spec_of_a_diskless_vm() {
     assert_eq!(got.status.phase, VmPhase::Stopped);
     assert_eq!(got.status.snapshot, Some(cfg.id));
     assert_eq!(env.pid(vm).await, None);
+}
+
+#[tokio::test]
+async fn memory_revert_does_not_place_the_vm_on_a_node_of_another_architecture() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "mem" })).await);
+    assert!(get(&env, vm, "mem").spec.memory);
+    // 끄고 배치를 푼다. 그 뒤 이 노드가 다른 arch로 기록됐다.
+    succeeded(&admin.act("web", "stop").await);
+    let (_, current) = admin.get("/vms/web").await;
+    let mut spec = current["spec"].clone();
+    spec["node"] = Value::Null;
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    node.status.arch = Some(Arch::X86_64);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &node.status)
+        .await
+        .unwrap();
+
+    let (status, task) = admin
+        .post("/vms/web/snapshots/mem/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(
+        task["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("machine type"),
+        "{task}"
+    );
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(got.spec.node, None);
+    assert_eq!(got.spec.power, PowerState::Stopped);
 }
 
 #[tokio::test]
