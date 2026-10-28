@@ -1,37 +1,22 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Plus, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams } from "react-router";
 
-import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
-import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { errorMessage } from "@/i18n/errors";
-import { trackTask, waitForTask } from "@/tasks/tasks";
 import { isStopped } from "@/vms/actions";
-import {
-  defaultMachine,
-  type DiskRow,
-  emptyDisk,
-  emptyForm,
-  fromVm,
-  gibToBytes,
-  MAX_NICS,
-  type NicRow,
-  type ScheduleRow,
-  toSpec,
-  validate,
-  type VmFormValues,
-} from "@/vms/form";
+import { defaultMachine, emptyForm, fromVm, validate, type VmFormValues } from "@/vms/form";
+import { DisksSection } from "@/vms/form/DisksSection";
+import { GeneralSection } from "@/vms/form/GeneralSection";
+import { NicsSection } from "@/vms/form/NicsSection";
+import { ScheduleSection } from "@/vms/form/ScheduleSection";
+import { createVm, createVolume, isConflict, updateVm } from "@/vms/form/submit";
 import { useVmByName } from "@/vms/VmDetailPage";
 
 export function VmCreatePage() {
@@ -79,40 +64,17 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   // 멈추지 않은 VM(서버의 `is_stopped`가 아닌)의 노드와 디스크는 서버가 바꾸지 않는다.
   const locked = !creating && !isStopped(vm);
 
-  const set = <K extends keyof VmFormValues>(key: K, value: VmFormValues[K]) =>
-    setValues((v) => ({ ...v, [key]: value }));
-  const setDisk = (i: number, patch: Partial<DiskRow>) =>
-    set(
-      "disks",
-      values.disks.map((d, j) => (j === i ? { ...d, ...patch } : d)),
-    );
-  const setSchedule = (patch: Partial<ScheduleRow>) =>
-    set("snapshotSchedule", { ...values.snapshotSchedule, ...patch });
-  const setNic = (i: number, patch: Partial<NicRow>) =>
-    set(
-      "nics",
-      values.nics.map((n, j) => (j === i ? { ...n, ...patch } : n)),
-    );
+  const change = (patch: Partial<VmFormValues>) => setValues((v) => ({ ...v, ...patch }));
+  // 행을 넣거나 빼면 행 번호로 단 오류가 다른 행을 가리키므로 지운다.
+  const changeRows = (patch: Pick<VmFormValues, "disks"> | Pick<VmFormValues, "nics">) => {
+    change(patch);
+    setErrors({});
+  };
 
   // 이 VM에 붙어 있거나 아무 데도 붙지 않은 준비된 볼륨
-  // 예약을 켰는데 붙은 볼륨 중 qcow2가 아닌 것이 있으면 예약 스냅샷이 실패한다. 볼륨 목록을 읽어야 안다.
-  // 새로 만드는 디스크는 늘 qcow2다.
-  const rawDisk =
-    values.snapshotSchedule.every !== "off" && volumes.isSuccess
-      ? values.disks
-          .filter((d) => d.kind === "existing")
-          .map((d) => volumes.data.find((v) => v.name === d.volume))
-          .find((v) => v !== undefined && v.spec.format !== "qcow2")
-      : undefined;
   const freeVolumes = (volumes.data ?? []).filter(
     (v) => v.status.phase === "ready" && (!v.status.attached_to || v.status.attached_to === vm?.id),
   );
-
-  // 행을 넣거나 빼면 행 번호로 단 오류가 다른 행을 가리키므로 지운다.
-  const setRows = <K extends "disks" | "nics">(key: K, rows: VmFormValues[K]) => {
-    set(key, rows);
-    setErrors({});
-  };
 
   /** 다른 사람이 바꾼 VM을 다시 읽는다. `vm`은 watch로 늘 최신이다(지워지면 이 폼은 사라진다). */
   function reload() {
@@ -145,20 +107,12 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
       if (creating) {
         // 새 빈 볼륨을 먼저 만들고, 그 Task가 끝나면 VM을 만든다.
         for (const disk of values.disks.filter((d) => d.kind === "new")) {
-          const task = await call(
-            api.POST("/volumes", {
-              body: {
-                name: disk.volume,
-                spec: {
-                  pool: disk.pool,
-                  size_bytes: gibToBytes(disk.sizeGib)!,
-                  format: "qcow2",
-                },
-              },
-            }),
+          await createVolume(
+            queryClient,
+            disk,
+            t("tasks.op.volume-create", { target: disk.volume }),
+            signal,
           );
-          trackTask(task, t("tasks.op.volume-create", { target: disk.volume }));
-          await waitForTask(queryClient, task.id, signal);
           created.push(disk.volume);
           // 다시 보낼 때 같은 볼륨을 또 만들지 않게 있는 볼륨으로 바꾼다.
           setValues((v) => ({
@@ -171,24 +125,12 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
         if (signal.aborted) {
           return;
         }
-        await call(
-          api.POST("/vms", {
-            body: { name: values.name, spec: toSpec(values, values.start ? "running" : "stopped") },
-          }),
-        );
+        await createVm(values);
         if (!signal.aborted) {
           void navigate(`/vms/${encodeURIComponent(values.name)}`);
         }
       } else {
-        await call(
-          api.PUT("/vms/{key}", {
-            params: {
-              path: { key: vm.id },
-              header: { "If-Match": revision },
-            },
-            body: { labels: vm.labels, spec: toSpec(values, vm.spec.power ?? "stopped") },
-          }),
-        );
+        await updateVm(vm, revision, values);
         if (!signal.aborted) {
           void navigate(`/vms/${encodeURIComponent(vm.name)}`);
         }
@@ -197,14 +139,13 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
       if (signal.aborted) {
         return;
       }
-      const conflict = err instanceof ApiError && err.code === "revision_mismatch";
       const message = errorMessage(t, err);
       setFailure({
         message:
           created.length > 0
             ? t("vmForm.volumesCreated", { names: created.join(", "), error: message })
             : message,
-        conflict,
+        conflict: isConflict(err),
       });
     } finally {
       if (!signal.aborted) {
@@ -222,473 +163,46 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
 
       {/* 보내는 동안에는 고치지 못하게 한다. */}
       <fieldset disabled={busy} className="flex min-w-0 flex-col gap-4">
-        <Card>
-          <CardHeader>
-            <CardTitle>{t("vmForm.general")}</CardTitle>
-          </CardHeader>
-          <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            {creating && (
-              <Field id="vm-name" label={t("vms.name")} error={errors.name}>
-                {(a11y) => (
-                  <Input
-                    id="vm-name"
-                    {...a11y}
-                    value={values.name}
-                    onChange={(e) => set("name", e.target.value)}
-                  />
-                )}
-              </Field>
-            )}
-            <Field id="vm-cores" label={t("vmForm.cores")} error={errors.cores}>
-              {(a11y) => (
-                <Input
-                  id="vm-cores"
-                  {...a11y}
-                  type="number"
-                  min={1}
-                  max={65535}
-                  value={values.cores}
-                  onChange={(e) => set("cores", e.target.value)}
-                />
-              )}
-            </Field>
-            <Field id="vm-memory" label={t("vmForm.memory")} error={errors.memory}>
-              {(a11y) => (
-                <Input
-                  id="vm-memory"
-                  {...a11y}
-                  type="number"
-                  min={64}
-                  step={256}
-                  value={values.memory}
-                  onChange={(e) => set("memory", e.target.value)}
-                />
-              )}
-            </Field>
-            <Field id="vm-cpu-model" label={t("vmForm.cpuModel")}>
-              <NativeSelect
-                id="vm-cpu-model"
-                className="w-full"
-                value={values.model}
-                onChange={(e) => set("model", e.target.value as VmFormValues["model"])}
-              >
-                <NativeSelectOption value="host">host</NativeSelectOption>
-                <NativeSelectOption value="max">max</NativeSelectOption>
-              </NativeSelect>
-            </Field>
-            <Field id="vm-firmware" label={t("vms.firmware")}>
-              <NativeSelect
-                id="vm-firmware"
-                className="w-full"
-                value={values.firmware}
-                onChange={(e) => set("firmware", e.target.value as VmFormValues["firmware"])}
-              >
-                <NativeSelectOption value="uefi">UEFI</NativeSelectOption>
-                <NativeSelectOption value="bios">BIOS</NativeSelectOption>
-              </NativeSelect>
-            </Field>
-            <Field id="vm-machine" label={t("vms.machine")}>
-              <NativeSelect
-                id="vm-machine"
-                className="w-full"
-                value={values.machine}
-                onChange={(e) => {
-                  setMachineChosen(true);
-                  set("machine", e.target.value as VmFormValues["machine"]);
-                }}
-              >
-                <NativeSelectOption value="q35">q35 (x86_64)</NativeSelectOption>
-                <NativeSelectOption value="virt">virt (aarch64)</NativeSelectOption>
-              </NativeSelect>
-            </Field>
-            <Field id="vm-node" label={t("vms.node")}>
-              <NativeSelect
-                id="vm-node"
-                className="w-full"
-                disabled={locked}
-                value={values.node}
-                onChange={(e) => {
-                  const node = e.target.value;
-                  setValues((v) => ({
-                    ...v,
-                    node,
-                    machine:
-                      creating && !machineChosen
-                        ? defaultMachine(nodes.data ?? [], node)
-                        : v.machine,
-                  }));
-                }}
-              >
-                <NativeSelectOption value="">{t("vmForm.nodeAuto")}</NativeSelectOption>
-                {nodes.data?.map((n) => (
-                  <NativeSelectOption key={n.id} value={n.id}>
-                    {n.name}
-                  </NativeSelectOption>
-                ))}
-              </NativeSelect>
-            </Field>
-            <Field id="vm-restart" label={t("vms.restart")}>
-              <NativeSelect
-                id="vm-restart"
-                className="w-full"
-                value={values.restart}
-                onChange={(e) => set("restart", e.target.value as VmFormValues["restart"])}
-              >
-                <NativeSelectOption value="never">
-                  {t("vms.restartPolicy.never")}
-                </NativeSelectOption>
-                <NativeSelectOption value="on-failure">
-                  {t("vms.restartPolicy.on-failure")}
-                </NativeSelectOption>
-              </NativeSelect>
-            </Field>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>{t("vms.disks")}</CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            {values.disks.map((disk, i) => (
-              <fieldset
-                key={i}
-                disabled={locked}
-                aria-label={t("vmForm.diskN", { n: i + 1 })}
-                className="grid grid-cols-2 items-end gap-2 rounded-md border p-3 sm:grid-cols-5"
-              >
-                {disk.kind === "existing" ? (
-                  <Field
-                    id={`disk-${i}-volume`}
-                    label={t("vms.volume")}
-                    error={errors[`disks.${i}.volume`]}
-                  >
-                    {(a11y) => (
-                      <NativeSelect
-                        id={`disk-${i}-volume`}
-                        {...a11y}
-                        className="w-full"
-                        value={disk.volume}
-                        onChange={(e) => setDisk(i, { volume: e.target.value })}
-                      >
-                        <NativeSelectOption value="">—</NativeSelectOption>
-                        {freeVolumes
-                          .filter(
-                            (v) =>
-                              v.name === disk.volume ||
-                              !values.disks.some((d) => d.volume === v.name),
-                          )
-                          .map((v) => (
-                            <NativeSelectOption key={v.id} value={v.name}>
-                              {v.name}
-                            </NativeSelectOption>
-                          ))}
-                      </NativeSelect>
-                    )}
-                  </Field>
-                ) : (
-                  <>
-                    <Field
-                      id={`disk-${i}-volume`}
-                      label={t("vmForm.newVolume")}
-                      error={errors[`disks.${i}.volume`]}
-                    >
-                      {(a11y) => (
-                        <Input
-                          id={`disk-${i}-volume`}
-                          {...a11y}
-                          value={disk.volume}
-                          onChange={(e) => setDisk(i, { volume: e.target.value })}
-                        />
-                      )}
-                    </Field>
-                    <Field
-                      id={`disk-${i}-pool`}
-                      label={t("vmForm.pool")}
-                      error={errors[`disks.${i}.pool`]}
-                    >
-                      {(a11y) => (
-                        <NativeSelect
-                          id={`disk-${i}-pool`}
-                          {...a11y}
-                          className="w-full"
-                          value={disk.pool}
-                          onChange={(e) => setDisk(i, { pool: e.target.value })}
-                        >
-                          <NativeSelectOption value="">—</NativeSelectOption>
-                          {pools.data?.map((p) => (
-                            <NativeSelectOption key={p.id} value={p.name}>
-                              {p.name}
-                            </NativeSelectOption>
-                          ))}
-                        </NativeSelect>
-                      )}
-                    </Field>
-                    <Field
-                      id={`disk-${i}-size`}
-                      label={t("vmForm.sizeGib")}
-                      error={errors[`disks.${i}.size`]}
-                    >
-                      {(a11y) => (
-                        <Input
-                          id={`disk-${i}-size`}
-                          {...a11y}
-                          type="number"
-                          min={1}
-                          value={disk.sizeGib}
-                          onChange={(e) => setDisk(i, { sizeGib: e.target.value })}
-                        />
-                      )}
-                    </Field>
-                  </>
-                )}
-                <Field id={`disk-${i}-bus`} label={t("vms.bus")}>
-                  <NativeSelect
-                    id={`disk-${i}-bus`}
-                    className="w-full"
-                    value={disk.bus}
-                    onChange={(e) => setDisk(i, { bus: e.target.value as DiskRow["bus"] })}
-                  >
-                    <NativeSelectOption value="virtio-blk">virtio-blk</NativeSelectOption>
-                    <NativeSelectOption value="sata">sata</NativeSelectOption>
-                  </NativeSelect>
-                </Field>
-                <div className="flex items-end gap-2">
-                  <Field
-                    id={`disk-${i}-boot`}
-                    label={t("vms.bootOrder")}
-                    error={errors[`disks.${i}.bootOrder`]}
-                  >
-                    {(a11y) => (
-                      <Input
-                        id={`disk-${i}-boot`}
-                        {...a11y}
-                        type="number"
-                        min={1}
-                        max={255}
-                        className="w-20"
-                        value={disk.bootOrder}
-                        onChange={(e) => setDisk(i, { bootOrder: e.target.value })}
-                      />
-                    )}
-                  </Field>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    aria-label={t("vmForm.removeDisk", { n: i + 1 })}
-                    onClick={() =>
-                      setRows(
-                        "disks",
-                        values.disks.filter((_, j) => j !== i),
-                      )
-                    }
-                  >
-                    <X />
-                  </Button>
-                </div>
-              </fieldset>
-            ))}
-            {!locked && (
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    setRows("disks", [
-                      ...values.disks,
-                      { ...emptyDisk("", values.disks.length), kind: "existing" },
-                    ])
-                  }
-                >
-                  <Plus />
-                  {t("vmForm.addExisting")}
-                </Button>
-                {creating && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() =>
-                      setRows("disks", [
-                        ...values.disks,
-                        emptyDisk(values.name, values.disks.length),
-                      ])
-                    }
-                  >
-                    <Plus />
-                    {t("vmForm.addNew")}
-                  </Button>
-                )}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>{t("vms.nics")}</CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            {values.nics.map((nic, i) => (
-              <fieldset
-                key={i}
-                aria-label={t("vmForm.nicN", { n: i + 1 })}
-                className="grid grid-cols-2 items-end gap-2 rounded-md border p-3 sm:grid-cols-4"
-              >
-                <Field id={`nic-${i}-network`} label={t("vms.network")}>
-                  <NativeSelect
-                    id={`nic-${i}-network`}
-                    className="w-full"
-                    value={nic.network}
-                    onChange={(e) => setNic(i, { network: e.target.value })}
-                  >
-                    <NativeSelectOption value="user">{t("vmForm.userNetwork")}</NativeSelectOption>
-                    {networks.data?.map((n) => (
-                      <NativeSelectOption key={n.id} value={n.name}>
-                        {n.name}
-                      </NativeSelectOption>
-                    ))}
-                  </NativeSelect>
-                </Field>
-                <Field id={`nic-${i}-model`} label={t("vms.model")}>
-                  <NativeSelect
-                    id={`nic-${i}-model`}
-                    className="w-full"
-                    value={nic.model}
-                    onChange={(e) => setNic(i, { model: e.target.value as NicRow["model"] })}
-                  >
-                    <NativeSelectOption value="virtio">virtio</NativeSelectOption>
-                    <NativeSelectOption value="e1000e">e1000e</NativeSelectOption>
-                  </NativeSelect>
-                </Field>
-                <Field id={`nic-${i}-mac`} label={t("vms.mac")} error={errors[`nics.${i}.mac`]}>
-                  {(a11y) => (
-                    <Input
-                      id={`nic-${i}-mac`}
-                      {...a11y}
-                      placeholder={t("vmForm.macAuto")}
-                      value={nic.mac}
-                      onChange={(e) => setNic(i, { mac: e.target.value })}
-                    />
-                  )}
-                </Field>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  aria-label={t("vmForm.removeNic", { n: i + 1 })}
-                  onClick={() =>
-                    setRows(
-                      "nics",
-                      values.nics.filter((_, j) => j !== i),
-                    )
-                  }
-                >
-                  <X />
-                </Button>
-              </fieldset>
-            ))}
-            {values.nics.length < MAX_NICS && (
-              <div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    setRows("nics", [...values.nics, { network: "user", model: "virtio", mac: "" }])
-                  }
-                >
-                  <Plus />
-                  {t("vmForm.addNic")}
-                </Button>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>{t("vmForm.schedule")}</CardTitle>
-          </CardHeader>
-          <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <Field
-              id="vm-schedule-every"
-              label={t("vmForm.scheduleEvery")}
-              hint={t("vmForm.scheduleNote")}
-            >
-              {(a11y) => (
-                <NativeSelect
-                  id="vm-schedule-every"
-                  {...a11y}
-                  className="w-full"
-                  value={values.snapshotSchedule.every}
-                  onChange={(e) => setSchedule({ every: e.target.value as ScheduleRow["every"] })}
-                >
-                  <NativeSelectOption value="off">{t("vmForm.scheduleOff")}</NativeSelectOption>
-                  <NativeSelectOption value="hourly">
-                    {t("snapshots.every.hourly")}
-                  </NativeSelectOption>
-                  <NativeSelectOption value="daily">
-                    {t("snapshots.every.daily")}
-                  </NativeSelectOption>
-                  <NativeSelectOption value="weekly">
-                    {t("snapshots.every.weekly")}
-                  </NativeSelectOption>
-                </NativeSelect>
-              )}
-            </Field>
-            {rawDisk && (
-              <p className="text-sm text-destructive sm:col-span-2">
-                {t("vmForm.scheduleRaw", { volume: rawDisk.name, format: rawDisk.spec.format })}
-              </p>
-            )}
-            {/* 끄면 보관 개수와 메모리는 쓰지 않으므로 묻지 않는다. */}
-            {values.snapshotSchedule.every !== "off" && (
-              <>
-                <Field
-                  id="vm-schedule-keep"
-                  label={t("vmForm.scheduleKeep")}
-                  error={errors["schedule.keep"]}
-                >
-                  {(a11y) => (
-                    <Input
-                      id="vm-schedule-keep"
-                      {...a11y}
-                      type="number"
-                      min={1}
-                      max={100}
-                      value={values.snapshotSchedule.keep}
-                      onChange={(e) => setSchedule({ keep: e.target.value })}
-                    />
-                  )}
-                </Field>
-                <div className="flex flex-col gap-1.5 sm:col-span-2">
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      id="vm-schedule-memory"
-                      aria-describedby="vm-schedule-memory-hint"
-                      checked={values.snapshotSchedule.memory}
-                      onCheckedChange={(v) => setSchedule({ memory: v === true })}
-                    />
-                    <Label htmlFor="vm-schedule-memory">{t("snapshots.includeMemory")}</Label>
-                  </div>
-                  <p id="vm-schedule-memory-hint" className="text-xs text-muted-foreground">
-                    {t("vmForm.scheduleMemoryHint")}
-                  </p>
-                </div>
-              </>
-            )}
-          </CardContent>
-        </Card>
+        <GeneralSection
+          values={values}
+          errors={errors}
+          onChange={change}
+          nodes={nodes.data}
+          creating={creating}
+          locked={locked}
+          autoMachine={creating && !machineChosen}
+          onMachineChosen={() => setMachineChosen(true)}
+        />
+        <DisksSection
+          values={values}
+          errors={errors}
+          onChange={change}
+          onRowsChange={(disks) => changeRows({ disks })}
+          volumes={freeVolumes}
+          pools={pools.data}
+          creating={creating}
+          locked={locked}
+        />
+        <NicsSection
+          values={values}
+          errors={errors}
+          onChange={change}
+          onRowsChange={(nics) => changeRows({ nics })}
+          networks={networks.data}
+        />
+        <ScheduleSection
+          values={values}
+          errors={errors}
+          onChange={change}
+          volumes={volumes.isSuccess ? volumes.data : undefined}
+        />
 
         {creating && (
           <div className="flex items-center gap-2">
             <Checkbox
               id="vm-start"
               checked={values.start}
-              onCheckedChange={(v) => set("start", v === true)}
+              onCheckedChange={(v) => change({ start: v === true })}
             />
             <Label htmlFor="vm-start">{t("vmForm.startAfter")}</Label>
           </div>
