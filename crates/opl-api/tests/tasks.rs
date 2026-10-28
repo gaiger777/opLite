@@ -1,12 +1,15 @@
-//! Task 실행기의 재시작 처리.
+//! Task 실행기의 재시작 처리와 실행 중에 지워진 Task.
 
 mod common;
 
-use common::Env;
+use std::sync::Arc;
+
+use common::{Env, FakeStorage};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{Volume, VolumeSpec};
+use opl_types::storage::{PoolBackend, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
+use reqwest::StatusCode;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -129,4 +132,60 @@ async fn orphans_are_removed_only_by_the_node_that_made_them() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn a_task_deleted_while_running_does_not_block_its_queue() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let pool = Resource::new(
+        "local",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: env.dir.path().join("local"),
+            },
+            nodes: vec![],
+            shared: false,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    let mut volume: Volume = Resource::new(
+        "data",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    volume.status.phase = VolumePhase::Ready;
+    env.cluster
+        .update_status::<VolumeSpec>(volume.id, &volume.status)
+        .await
+        .unwrap();
+    let storage = Arc::new(FakeStorage::default());
+    storage.set_size(volume.id, 1 << 20);
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+
+    // 크기 늘리기가 도는 사이에 Task가 지워졌다. 결과를 쓸 곳이 없으므로 끝난 것으로 본다.
+    storage.pause();
+    let resize = |size: u64| {
+        admin.post(
+            "/volumes/data/resize",
+            serde_json::json!({ "size_bytes": size }),
+        )
+    };
+    let (status, first) = resize(2 << 20).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    storage.reached().await;
+    let id: Uuid = first["id"].as_str().unwrap().parse().unwrap();
+    env.cluster.delete::<TaskSpec>(id, None).await.unwrap();
+    storage.resume();
+
+    // 같은 볼륨의 줄에 선 다음 Task가 돈다.
+    let (status, second) = resize(3 << 20).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{second}");
+    let second = admin.wait_task(&second).await;
+    assert_eq!(second["status"]["state"], "succeeded", "{second}");
 }

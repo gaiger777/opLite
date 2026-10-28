@@ -2,10 +2,11 @@
 //! 유예보다 오래 간 노드의 `pending` Task와 제거된 노드의 끝나지 않은 Task를 실패로 끝내고, 만들
 //! Task 없이 남은 `pending` 스냅샷을 지운다. 실패로 끝낸 Task의 정리(볼륨·태그)는 하지 않는다.
 //! 예약 스냅샷의 만들기·예약 정리의 삭제를 끝냈으면 실행기처럼 `task_failed`로 VM에 남긴다.
+//! 끝난 Task는 기간·개수 기준으로 지운다(웹 정리 설계 §2).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
@@ -28,7 +29,17 @@ pub struct ClusterJanitorConfig {
     /// 만들 Task 없이 `pending`인 스냅샷을 처음 본 뒤 이만큼 지나도 그대로면 지운다. API는 스냅샷을
     /// 만든 뒤 Task를 만들므로 그 사이(전달된 쓰기는 하나에 최대 `write_timeout`)보다 길어야 한다.
     pub orphan_grace: Duration,
+    /// 만든 지 이보다 오래된 끝난 Task를 지운다. 만든 시각은 UUIDv7 id의 시각이다.
+    pub task_max_age: Duration,
+    /// 끝난 Task를 이보다 많이 남기지 않는다(넘으면 오래된 것부터 지운다).
+    pub task_max_finished: usize,
+    /// 개수 기준으로는 끝난 것을 처음 본 뒤 이만큼 지난 Task만 지운다. 막 끝난 Task를 기다리는
+    /// 쪽(oplctl `wait_task`, 웹 `waitForTask`)이 결과를 읽을 시간이다.
+    pub finished_grace: Duration,
 }
+
+/// 한 tick에 지우는 끝난 Task의 최대 수. 나머지는 다음 tick에 지운다.
+const TASK_DELETES_PER_TICK: usize = 200;
 
 impl Default for ClusterJanitorConfig {
     fn default() -> Self {
@@ -36,6 +47,9 @@ impl Default for ClusterJanitorConfig {
             tick: Duration::from_secs(10),
             offline_grace: Duration::from_secs(60),
             orphan_grace: Duration::from_secs(30),
+            task_max_age: Duration::from_secs(7 * 24 * 3600),
+            task_max_finished: 1000,
+            finished_grace: Duration::from_secs(600),
         }
     }
 }
@@ -89,6 +103,8 @@ struct Seen {
     offline_since: HashMap<Uuid, Instant>,
     /// 만들 Task 없이 `pending`인 스냅샷과 처음 그렇게 보인 시각
     orphans: HashMap<Uuid, Instant>,
+    /// 끝난 Task와 처음 끝난 것으로 보인 시각
+    finished: HashMap<Uuid, Instant>,
 }
 
 /// 정리 작업이 할 일. 읽은 revision에서만 쓴다(그사이 바뀌었으면 다음 tick에 다시 본다).
@@ -100,6 +116,10 @@ enum Action {
         error: String,
     },
     DeleteSnapshot {
+        id: Uuid,
+        revision: u64,
+    },
+    DeleteTask {
         id: Uuid,
         revision: u64,
     },
@@ -173,6 +193,54 @@ fn decide(
     actions
 }
 
+/// 지울 끝난 Task를 오래된 것부터 최대 `limit`개 고르고 `seen`을 고친다. 만든 지 `task_max_age`가
+/// 넘은 것과, 그러고도 `task_max_finished`를 넘는 만큼 오래된 것 중 끝난 것을 처음 본 뒤
+/// `finished_grace`가 지난 것이다. 끝나지 않은 Task는 고르지 않는다.
+fn expired_tasks(
+    now: SystemTime,
+    instant: Instant,
+    config: &ClusterJanitorConfig,
+    tasks: &[Task],
+    seen: &mut Seen,
+    limit: usize,
+) -> Vec<Action> {
+    let mut finished: Vec<(SystemTime, &Task)> = tasks
+        .iter()
+        .filter(|t| t.status.state.is_finished())
+        .map(|t| (created(t.id), t))
+        .collect();
+    finished.sort_by_key(|(at, t)| (*at, t.id));
+    // 지워졌거나 없어진 Task는 잊는다.
+    seen.finished = finished
+        .iter()
+        .map(|(_, t)| (t.id, seen.finished.get(&t.id).copied().unwrap_or(instant)))
+        .collect();
+    let over = finished.len().saturating_sub(config.task_max_finished);
+    let old = finished
+        .iter()
+        .take_while(|(at, _)| now.duration_since(*at).unwrap_or_default() > config.task_max_age)
+        .count();
+    let settled = |t: &Task| instant.duration_since(seen.finished[&t.id]) >= config.finished_grace;
+    finished
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, t))| *i < old || (*i < over && settled(t)))
+        .take(limit)
+        .map(|(_, (_, t))| Action::DeleteTask {
+            id: t.id,
+            revision: t.revision,
+        })
+        .collect()
+}
+
+/// UUIDv7 id에 담긴 만든 시각. 시각이 없는 id는 가장 오래된 것으로 본다.
+fn created(id: Uuid) -> SystemTime {
+    id.get_timestamp().map_or(SystemTime::UNIX_EPOCH, |ts| {
+        let (secs, nanos) = ts.to_unix();
+        SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
+    })
+}
+
 async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) {
     let cluster = &state.cluster;
     let members = cluster.members();
@@ -200,16 +268,21 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
         .chain(members.learners.keys())
         .map(|id| id.0)
         .collect();
-    let actions = decide(
-        Instant::now(),
+    let now = Instant::now();
+    let mut actions = decide(now, config, &nodes, &ids, &tasks, &snapshots, seen);
+    actions.extend(expired_tasks(
+        SystemTime::now(),
+        now,
         config,
-        &nodes,
-        &ids,
         &tasks,
-        &snapshots,
         seen,
-    );
+        TASK_DELETES_PER_TICK,
+    ));
+    let mut skip_deletes = false;
     for action in actions {
+        if skip_deletes && matches!(action, Action::DeleteTask { .. }) {
+            continue;
+        }
         let result = apply(cluster, &action).await;
         // 그사이 바뀌었으면(실행기가 시작했다 등) 다음 tick에 다시 본다.
         match result {
@@ -219,6 +292,10 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
             }
             Err(e) => {
                 tracing::info!(?action, error = %e, "janitor action not applied");
+                if stops_deletes(&action, &e) {
+                    tracing::warn!(error = %e, "janitor: deleting finished tasks again next tick");
+                    skip_deletes = true;
+                }
                 continue;
             }
         }
@@ -247,7 +324,17 @@ async fn apply(cluster: &Cluster, action: &Action) -> Result<u64, ClusterError> 
         Action::DeleteSnapshot { id, revision } => {
             cluster.delete::<SnapshotSpec>(*id, Some(*revision)).await
         }
+        Action::DeleteTask { id, revision } => {
+            cluster.delete::<TaskSpec>(*id, Some(*revision)).await
+        }
     }
+}
+
+/// 끝난 Task 지우기가 거부(그사이 바뀜·없어짐)가 아닌 오류(시간 초과, 리더 아님 등)로 실패했으면
+/// 클러스터가 쓰기를 받지 못하는 것이므로 이 tick의 남은 지우기는 건너뛴다(한 tick에 최대
+/// `TASK_DELETES_PER_TICK`번 기다리지 않게).
+fn stops_deletes(action: &Action, err: &ClusterError) -> bool {
+    matches!(action, Action::DeleteTask { .. }) && !matches!(err, ClusterError::Rejected(_))
 }
 
 /// 실패 쓰기가 `RevisionMismatch`로 거부됐어도 앞선 시도의 응답만 잃은 자기 쓰기일 수 있다(전달
@@ -300,10 +387,14 @@ mod tests {
 
     const GRACE: Duration = Duration::from_secs(60);
     const ORPHAN_GRACE: Duration = Duration::from_secs(30);
+    const FINISHED_GRACE: Duration = Duration::from_secs(600);
     const CONFIG: ClusterJanitorConfig = ClusterJanitorConfig {
         tick: Duration::from_secs(10),
         offline_grace: GRACE,
         orphan_grace: ORPHAN_GRACE,
+        task_max_age: Duration::from_secs(7 * 24 * 3600),
+        task_max_finished: 1000,
+        finished_grace: FINISHED_GRACE,
     };
 
     fn node(online: bool) -> Node {
@@ -540,6 +631,196 @@ mod tests {
             vec![]
         );
         assert_eq!(at(t0 + 2 * ORPHAN_GRACE, &[]).len(), 1);
+    }
+
+    /// `ago` 전에 만든 끝난(`state`) Task
+    fn task_made(now: SystemTime, ago: Duration, state: TaskState) -> Task {
+        let at = (now - ago).duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        let mut t = task(TaskOp::VmStart, Uuid::now_v7(), state);
+        t.id = Uuid::new_v7(uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            at.as_secs(),
+            at.subsec_nanos(),
+        ));
+        t
+    }
+
+    fn delete(t: &Task) -> Action {
+        Action::DeleteTask {
+            id: t.id,
+            revision: t.revision,
+        }
+    }
+
+    /// 끝난 것을 처음 본 뒤 `finished_grace`가 지난 리더가 고르는 것
+    fn expired(
+        now: SystemTime,
+        config: &ClusterJanitorConfig,
+        tasks: &[Task],
+        limit: usize,
+    ) -> Vec<Action> {
+        let t0 = Instant::now();
+        let mut seen = Seen::default();
+        expired_tasks(now, t0, config, tasks, &mut seen, limit);
+        let later = t0 + config.finished_grace;
+        expired_tasks(now, later, config, tasks, &mut seen, limit)
+    }
+
+    #[test]
+    fn just_finished_tasks_over_the_max_count_stay_for_the_grace() {
+        let now = SystemTime::now();
+        let config = ClusterJanitorConfig {
+            task_max_finished: 1,
+            ..CONFIG
+        };
+        let min = Duration::from_secs(60);
+        let day = Duration::from_secs(24 * 3600);
+        let older = task_made(now, 2 * min, TaskState::Succeeded);
+        let newer = task_made(now, min, TaskState::Succeeded);
+        let mut seen = Seen::default();
+        let t0 = Instant::now();
+        let mut at =
+            |instant, tasks: &[Task]| expired_tasks(now, instant, &config, tasks, &mut seen, 200);
+        // 막 끝난 것으로 보인 Task는 개수가 넘어도 남는다.
+        let tasks = [older.clone(), newer.clone()];
+        assert_eq!(at(t0, &tasks), vec![]);
+        assert_eq!(
+            at(t0 + FINISHED_GRACE - Duration::from_secs(1), &tasks),
+            vec![]
+        );
+        assert_eq!(at(t0 + FINISHED_GRACE, &tasks), vec![delete(&older)]);
+        // 지워진 Task는 잊고, 새로 끝난 Task는 처음 본 때부터 잰다.
+        let newest = task_made(now, Duration::ZERO, TaskState::Failed);
+        let tasks = [newer.clone(), newest];
+        assert_eq!(at(t0 + FINISHED_GRACE, &tasks), vec![delete(&newer)]);
+        // 기간 기준은 유예를 기다리지 않는다.
+        let old = task_made(now, 8 * day, TaskState::Succeeded);
+        assert_eq!(
+            at(t0 + FINISHED_GRACE, std::slice::from_ref(&old)),
+            vec![delete(&old)]
+        );
+        assert!(seen.finished.contains_key(&old.id));
+        assert!(!seen.finished.contains_key(&older.id));
+    }
+
+    #[test]
+    fn finished_tasks_older_than_the_max_age_go() {
+        let now = SystemTime::now();
+        let day = Duration::from_secs(24 * 3600);
+        let old_ok = task_made(now, 8 * day, TaskState::Succeeded);
+        let old_failed = task_made(now, 9 * day, TaskState::Failed);
+        let young = task_made(now, 6 * day, TaskState::Succeeded);
+        // 끝나지 않은 Task는 오래됐어도 남긴다.
+        let old_pending = task_made(now, 30 * day, TaskState::Pending);
+        let old_running = task_made(now, 30 * day, TaskState::Running);
+        let tasks = [
+            old_ok.clone(),
+            young,
+            old_pending,
+            old_failed.clone(),
+            old_running,
+        ];
+        // 오래된 것부터 고른다.
+        assert_eq!(
+            expired(now, &CONFIG, &tasks, 200),
+            vec![delete(&old_failed), delete(&old_ok)]
+        );
+    }
+
+    #[test]
+    fn finished_tasks_over_the_max_count_go_oldest_first() {
+        let now = SystemTime::now();
+        let config = ClusterJanitorConfig {
+            task_max_finished: 2,
+            ..CONFIG
+        };
+        let min = Duration::from_secs(60);
+        let finished: Vec<Task> = (1..=4)
+            .map(|i| task_made(now, i * min, TaskState::Succeeded))
+            .collect();
+        let pending = task_made(now, 10 * min, TaskState::Pending);
+        let mut tasks = finished.clone();
+        tasks.push(pending);
+        // 끝나지 않은 Task는 세지 않는다.
+        assert_eq!(
+            expired(now, &config, &tasks, 200),
+            vec![delete(&finished[3]), delete(&finished[2])]
+        );
+        assert_eq!(expired(now, &config, &tasks[2..], 200), vec![]);
+    }
+
+    #[test]
+    fn a_task_exactly_at_the_max_age_stays_and_ties_go_by_id() {
+        let now = SystemTime::now();
+        // id의 시각은 밀리초까지다.
+        let now = SystemTime::UNIX_EPOCH
+            + Duration::from_millis(
+                now.duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            );
+        let at_limit = task_made(now, CONFIG.task_max_age, TaskState::Succeeded);
+        assert_eq!(expired(now, &CONFIG, &[at_limit], 200), vec![]);
+
+        // 만든 시각이 같으면 id가 작은 것을 먼저 지운다.
+        let config = ClusterJanitorConfig {
+            task_max_finished: 1,
+            ..CONFIG
+        };
+        let min = Duration::from_secs(60);
+        let mut tied = [
+            task_made(now, min, TaskState::Succeeded),
+            task_made(now, min, TaskState::Failed),
+        ];
+        assert_ne!(tied[0].id, tied[1].id);
+        tied.sort_by_key(|t| std::cmp::Reverse(t.id));
+        assert_eq!(expired(now, &config, &tied, 200), vec![delete(&tied[1])]);
+    }
+
+    #[test]
+    fn deletes_per_tick_are_capped() {
+        let now = SystemTime::now();
+        let day = Duration::from_secs(24 * 3600);
+        let tasks: Vec<Task> = (0..5)
+            .map(|i| task_made(now, (10 + i) * day, TaskState::Failed))
+            .collect();
+        // 상한까지 오래된 것부터 고르고 나머지는 다음 tick에 고른다.
+        assert_eq!(
+            expired(now, &CONFIG, &tasks, 2),
+            vec![delete(&tasks[4]), delete(&tasks[3])]
+        );
+        assert_eq!(expired(now, &CONFIG, &tasks[..3], 2).len(), 2);
+        assert_eq!(expired(now, &CONFIG, &tasks[..1], 2).len(), 1);
+    }
+
+    #[test]
+    fn a_task_delete_that_cannot_be_written_stops_the_rest_of_the_deletes() {
+        let t = task(TaskOp::VmStart, Uuid::now_v7(), TaskState::Succeeded);
+        let rejected = || {
+            ClusterError::Rejected(Rejection::RevisionMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        };
+        let not_leader = || ClusterError::NotLeader {
+            leader_id: None,
+            leader_addr: None,
+        };
+        // 쓰기를 받지 못하면 남은 지우기를 다음 tick으로 미룬다.
+        for err in [
+            ClusterError::Timeout,
+            ClusterError::Unreachable("x".into()),
+            not_leader(),
+        ] {
+            assert!(stops_deletes(&delete(&t), &err), "{err:?}");
+        }
+        // 그 Task만 바뀌었거나 없어진 것이면 다음 것을 지운다.
+        assert!(!stops_deletes(&delete(&t), &rejected()));
+        // 다른 동작의 실패는 지우기를 막지 않는다.
+        assert!(!stops_deletes(
+            &fail(&t, "x".into()),
+            &ClusterError::Timeout
+        ));
     }
 
     /// 노드 하나짜리 클러스터

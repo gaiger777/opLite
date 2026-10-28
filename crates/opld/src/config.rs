@@ -135,7 +135,7 @@ impl ScheduleSection {
     }
 }
 
-/// 클러스터 정리 작업. 테스트만 줄인다.
+/// 클러스터 정리 작업. 간격·유예는 테스트만 줄인다.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JanitorSection {
@@ -145,6 +145,12 @@ pub struct JanitorSection {
     /// 오프라인 노드의 `pending` Task를 실패로 끝내기까지 기다리는 시간(초)
     #[serde(default = "default_offline_grace_secs")]
     pub offline_grace_secs: u64,
+    /// 만든 지 이 날수가 넘은 끝난 Task를 지운다.
+    #[serde(default = "default_task_max_age_days")]
+    pub task_max_age_days: u64,
+    /// 끝난 Task를 이보다 많이 남기지 않는다(넘으면 오래된 것부터 지운다).
+    #[serde(default = "default_task_max_finished")]
+    pub task_max_finished: usize,
 }
 
 impl Default for JanitorSection {
@@ -152,6 +158,8 @@ impl Default for JanitorSection {
         Self {
             tick_secs: default_janitor_tick_secs(),
             offline_grace_secs: default_offline_grace_secs(),
+            task_max_age_days: default_task_max_age_days(),
+            task_max_finished: default_task_max_finished(),
         }
     }
 }
@@ -161,7 +169,9 @@ impl JanitorSection {
         ClusterJanitorConfig {
             tick: Duration::from_secs(self.tick_secs),
             offline_grace: Duration::from_secs(self.offline_grace_secs),
-            // 고아 스냅샷의 유예는 설정하지 않는다(기본 30초).
+            task_max_age: Duration::from_secs(self.task_max_age_days * 24 * 3600),
+            task_max_finished: self.task_max_finished,
+            // 고아 스냅샷·끝난 Task의 유예는 설정하지 않는다(기본 30초·10분).
             ..ClusterJanitorConfig::default()
         }
     }
@@ -202,6 +212,14 @@ fn default_janitor_tick_secs() -> u64 {
 }
 fn default_offline_grace_secs() -> u64 {
     60
+}
+/// `task_max_age_days`의 상한(100년)
+const MAX_TASK_AGE_DAYS: u64 = 36500;
+fn default_task_max_age_days() -> u64 {
+    7
+}
+fn default_task_max_finished() -> usize {
+    1000
 }
 
 /// `host:port`. IPv6 주소는 대괄호로 감싼다.
@@ -263,6 +281,16 @@ impl Config {
         }
         if self.janitor.tick_secs == 0 || self.janitor.offline_grace_secs == 0 {
             anyhow::bail!("janitor.tick_secs and janitor.offline_grace_secs must be at least 1");
+        }
+        // 0이면 끝난 Task를 곧바로 지워 Task를 기다리는 쪽이 결과를 못 본다.
+        if self.janitor.task_max_age_days == 0 || self.janitor.task_max_finished == 0 {
+            anyhow::bail!(
+                "janitor.task_max_age_days and janitor.task_max_finished must be at least 1"
+            );
+        }
+        // 날수를 초로 바꿀 때 넘치지 않도록 100년까지만 받는다.
+        if self.janitor.task_max_age_days > MAX_TASK_AGE_DAYS {
+            anyhow::bail!("janitor.task_max_age_days must be at most {MAX_TASK_AGE_DAYS}");
         }
         // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
         if self.listen.port() == self.cluster_listen.port() {
@@ -351,6 +379,9 @@ mod tests {
         assert_eq!(janitor.tick, Duration::from_secs(10));
         assert_eq!(janitor.offline_grace, Duration::from_secs(60));
         assert_eq!(janitor.orphan_grace, Duration::from_secs(30));
+        assert_eq!(janitor.task_max_age, Duration::from_secs(7 * 24 * 3600));
+        assert_eq!(janitor.task_max_finished, 1000);
+        assert_eq!(janitor.finished_grace, Duration::from_secs(600));
         assert_eq!(c.hypervisor.accel, AccelSetting::Auto);
         assert_eq!(c.hypervisor.systemd_scope, cfg!(target_os = "linux"));
         assert_eq!(
@@ -444,6 +475,27 @@ mod tests {
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[janitor]\ngrace = 1")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn janitor_section_sets_task_retention_but_not_to_zero() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[janitor]\ntask_max_age_days = 2\ntask_max_finished = 50",
+        );
+        assert!(c.validate().is_ok());
+        let janitor = c.janitor.janitor_config();
+        assert_eq!(janitor.task_max_age, Duration::from_secs(2 * 24 * 3600));
+        assert_eq!(janitor.task_max_finished, 50);
+        let c = parse("name = \"n\"\naddress = \"h\"\n[janitor]\ntask_max_age_days = 36500");
+        assert!(c.validate().is_ok());
+        for bad in [
+            "task_max_age_days = 0",
+            "task_max_finished = 0",
+            "task_max_age_days = 36501",
+        ] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[janitor]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

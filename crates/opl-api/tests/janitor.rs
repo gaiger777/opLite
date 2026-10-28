@@ -1,10 +1,11 @@
 //! 클러스터 정리 작업: 오프라인 노드의 `pending` 스냅샷 Task가 유예 뒤 실패해 VM 조작이 풀리고
 //! `running` Task는 남는지, 제거된 노드의 Task가 곧바로 실패하는지, 만들 Task 없이 남은 `pending`
-//! 스냅샷을 지우는지, 끝낸 예약 스냅샷 만들기를 `schedule_error`에 남기는지.
+//! 스냅샷을 지우는지, 끝낸 예약 스냅샷 만들기를 `schedule_error`에 남기는지, 끝난 Task를 기간·개수
+//! 기준으로 지우고 끝나지 않은 Task는 남기는지.
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use common::{Env, WAIT, vm_request};
 use opl_api::{ClusterJanitor, ClusterJanitorConfig};
@@ -27,6 +28,7 @@ fn fast_janitor(env: &Env) -> ClusterJanitor {
             tick: Duration::from_millis(50),
             offline_grace: GRACE,
             orphan_grace: GRACE,
+            ..ClusterJanitorConfig::default()
         },
     )
 }
@@ -94,7 +96,32 @@ async fn snapshot_task_of(
 }
 
 async fn task(env: &Env, op: TaskOp, target: Uuid, node: Uuid, state: TaskState) -> Task {
+    task_with_id(env, Uuid::now_v7(), op, target, node, state).await
+}
+
+/// `ago` 전에 만든 것처럼 id의 시각을 정한 Task
+async fn old_task(env: &Env, ago: Duration, node: Uuid, state: TaskState) -> Task {
+    let at = (SystemTime::now() - ago)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let id = Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        at.as_secs(),
+        at.subsec_nanos(),
+    ));
+    task_with_id(env, id, TaskOp::VmStart, Uuid::now_v7(), node, state).await
+}
+
+async fn task_with_id(
+    env: &Env,
+    id: Uuid,
+    op: TaskOp,
+    target: Uuid,
+    node: Uuid,
+    state: TaskState,
+) -> Task {
     let mut t: Task = Resource::new("", TaskSpec { op, target, node });
+    t.id = id;
     t.name = t.id.to_string();
     env.cluster.create(&t).await.unwrap();
     if state != TaskState::Pending {
@@ -109,6 +136,11 @@ async fn task(env: &Env, op: TaskOp, target: Uuid, node: Uuid, state: TaskState)
 
 fn get_task(env: &Env, id: Uuid) -> Task {
     env.cluster.get::<TaskSpec>(id).unwrap().unwrap()
+}
+
+fn task_ids(env: &Env) -> Vec<Uuid> {
+    let (_, items) = env.cluster.list::<TaskSpec>().unwrap();
+    items.into_iter().map(|t| t.id).collect()
 }
 
 fn snapshot_ids(env: &Env) -> Vec<Uuid> {
@@ -184,6 +216,7 @@ async fn removed_node_tasks_fail_at_once() {
             tick: Duration::from_millis(50),
             offline_grace: Duration::from_secs(3600),
             orphan_grace: Duration::from_secs(3600),
+            ..ClusterJanitorConfig::default()
         },
     );
     let error = Some(format!("node {gone} was removed"));
@@ -242,4 +275,63 @@ async fn failed_scheduled_snapshot_creation_is_recorded() {
     .await;
     janitor.shutdown().await;
     assert_eq!(get_task(&env, pending.id).status.state, TaskState::Failed);
+}
+
+#[tokio::test]
+async fn old_finished_tasks_go_and_unfinished_ones_stay() {
+    let env = Env::start().await;
+    // 실행기가 집어 가지 않도록 다른 온라인 노드에 배정한다.
+    let node = other_node(&env, "node2", true).await;
+    let day = Duration::from_secs(24 * 3600);
+    let succeeded = old_task(&env, 8 * day, node, TaskState::Succeeded).await;
+    let failed = old_task(&env, 9 * day, node, TaskState::Failed).await;
+    let young = old_task(&env, 6 * day, node, TaskState::Succeeded).await;
+    let pending = old_task(&env, 30 * day, node, TaskState::Pending).await;
+    let running = old_task(&env, 30 * day, node, TaskState::Running).await;
+    let janitor = fast_janitor(&env);
+    until("old finished tasks deleted", || {
+        let ids = task_ids(&env);
+        !ids.contains(&succeeded.id) && !ids.contains(&failed.id)
+    })
+    .await;
+    // 몇 tick 더 지나도 남은 것은 그대로다.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    janitor.shutdown().await;
+    let mut left = task_ids(&env);
+    left.sort();
+    let mut expected = vec![young.id, pending.id, running.id];
+    expected.sort();
+    assert_eq!(left, expected);
+    assert_eq!(get_task(&env, pending.id).status.state, TaskState::Pending);
+}
+
+#[tokio::test]
+async fn finished_tasks_over_the_limit_go_oldest_first() {
+    let env = Env::start().await;
+    let node = other_node(&env, "node2", true).await;
+    let min = Duration::from_secs(60);
+    let mut finished = vec![];
+    for i in (1..=5).rev() {
+        finished.push(old_task(&env, i * min, node, TaskState::Succeeded).await);
+    }
+    let pending = old_task(&env, 10 * min, node, TaskState::Pending).await;
+    let janitor = ClusterJanitor::spawn(
+        env.state.clone(),
+        ClusterJanitorConfig {
+            tick: Duration::from_millis(50),
+            task_max_finished: 3,
+            finished_grace: GRACE,
+            ..ClusterJanitorConfig::default()
+        },
+    );
+    until("over the limit", || task_ids(&env).len() == 4).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    janitor.shutdown().await;
+    // 가장 최근 3개와 끝나지 않은 Task가 남는다.
+    let mut left = task_ids(&env);
+    left.sort();
+    let mut expected: Vec<Uuid> = finished[2..].iter().map(|t| t.id).collect();
+    expected.push(pending.id);
+    expected.sort();
+    assert_eq!(left, expected);
 }

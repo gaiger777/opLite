@@ -388,6 +388,8 @@ async fn set_status(ctx: &Ctx, id: Uuid, state: TaskState, error: Option<String>
     loop {
         match ctx.cluster.update_status::<TaskSpec>(id, &status).await {
             Ok(_) => return,
+            // 정리 작업이 지운 Task는 끝난 것이다(`begin`과 같다).
+            Err(ClusterError::Rejected(Rejection::NotFound { .. })) => return,
             Err(e) => {
                 tracing::warn!(task = %id, error = %e, "cannot record task status; will retry");
                 tokio::time::sleep(ctx.config.poll_interval).await;
