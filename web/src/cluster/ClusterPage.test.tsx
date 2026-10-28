@@ -94,6 +94,22 @@ it("issues a join token and shows the command once", async () => {
   expect(dialog).toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "Done" }));
   await vi.waitFor(() => expect(dialog).not.toBeInTheDocument());
+  // 명령 대화상자를 닫으면 연 버튼으로 돌아간다.
+  await vi.waitFor(() =>
+    expect(screen.getByRole("button", { name: "Issue a join token" })).toHaveFocus(),
+  );
+});
+
+it("returns focus to the issue button after cancelling", async () => {
+  const user = userEvent.setup();
+  renderPage(<ClusterPage />);
+  await user.click(await screen.findByRole("button", { name: "Issue a join token" }));
+  const form = await screen.findByRole("dialog", { name: "Issue a join token" });
+  await user.click(within(form).getByRole("button", { name: "Cancel" }));
+  await vi.waitFor(() => expect(form).not.toBeInTheDocument());
+  await vi.waitFor(() =>
+    expect(screen.getByRole("button", { name: "Issue a join token" })).toHaveFocus(),
+  );
 });
 
 it("shows no leader while there is none and shortens unnamed ids", async () => {

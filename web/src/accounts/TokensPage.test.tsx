@@ -94,6 +94,19 @@ it("shows a new token's secret once, with a copy button", async () => {
   await vi.waitFor(() => expect(dialog).not.toBeInTheDocument());
   expect(screen.queryByDisplayValue("opl_abc_secret")).not.toBeInTheDocument();
   expect(await screen.findByRole("cell", { name: "backup" })).toBeInTheDocument();
+  // 비밀값 대화상자를 닫으면 연 버튼으로 돌아간다.
+  await vi.waitFor(() => expect(screen.getByRole("button", { name: "Create" })).toHaveFocus());
+});
+
+it("returns focus to the create button after cancelling", async () => {
+  const user = userEvent.setup();
+  tokens([]);
+  renderPage(<TokensPage />);
+  await user.click(await screen.findByRole("button", { name: "Create" }));
+  const form = await screen.findByRole("dialog", { name: "Create an API token" });
+  await user.click(within(form).getByRole("button", { name: "Cancel" }));
+  await vi.waitFor(() => expect(form).not.toBeInTheDocument());
+  await vi.waitFor(() => expect(screen.getByRole("button", { name: "Create" })).toHaveFocus());
 });
 
 it("deletes a token after confirming", async () => {

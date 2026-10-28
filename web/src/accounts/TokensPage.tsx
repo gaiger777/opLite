@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -12,6 +12,7 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CopyButton } from "@/components/CopyButton";
 import { Field } from "@/components/Field";
+import { focusBack } from "@/components/focusBack";
 import { FormDialog } from "@/components/FormDialog";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
@@ -57,6 +58,8 @@ export function TokensPage() {
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<CreatedToken | null>(null);
   const [deleting, setDeleting] = useState<Token | null>(null);
+  // 만들기·비밀값 대화상자를 닫으면 "만들기" 버튼으로 돌아간다.
+  const opener = useRef<HTMLButtonElement>(null);
   const changed = () => queryClient.invalidateQueries({ queryKey: ["tokens"] });
   const userName = useMemo(() => new Map(users.data?.map((u) => [u.id, u.name])), [users.data]);
   const owner = (token: Token) =>
@@ -68,7 +71,7 @@ export function TokensPage() {
         <h1 id="tokens-title" className="text-2xl font-semibold">
           {t("nav.tokens")}
         </h1>
-        <Button onClick={() => setCreating(true)}>
+        <Button ref={opener} onClick={() => setCreating(true)}>
           <Plus />
           {t("common.create")}
         </Button>
@@ -115,6 +118,7 @@ export function TokensPage() {
       </Table>
       {creating && (
         <CreateTokenDialog
+          returnFocus={opener}
           onClose={() => setCreating(false)}
           onCreated={(token) => {
             setCreated(token);
@@ -122,7 +126,9 @@ export function TokensPage() {
           }}
         />
       )}
-      {created && <SecretDialog created={created} onClose={() => setCreated(null)} />}
+      {created && (
+        <SecretDialog created={created} returnFocus={opener} onClose={() => setCreated(null)} />
+      )}
       <ConfirmDialog
         open={deleting !== null}
         onOpenChange={(open) => !open && setDeleting(null)}
@@ -141,9 +147,11 @@ export function TokensPage() {
 }
 
 function CreateTokenDialog({
+  returnFocus,
   onClose,
   onCreated,
 }: {
+  returnFocus: RefObject<HTMLElement | null>;
   onClose(): void;
   onCreated(token: CreatedToken): void;
 }) {
@@ -165,6 +173,7 @@ function CreateTokenDialog({
       title={t("tokens.createTitle")}
       description={t("tokens.createDescription")}
       submitLabel={t("common.create")}
+      returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}
     >
@@ -184,7 +193,15 @@ function CreateTokenDialog({
 }
 
 /** 만든 토큰의 비밀값. 서버는 다시 보여 주지 않으므로 "완료"로만 닫는다. */
-function SecretDialog({ created, onClose }: { created: CreatedToken; onClose(): void }) {
+function SecretDialog({
+  created,
+  returnFocus,
+  onClose,
+}: {
+  created: CreatedToken;
+  returnFocus: RefObject<HTMLElement | null>;
+  onClose(): void;
+}) {
   const { t } = useTranslation();
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -192,6 +209,7 @@ function SecretDialog({ created, onClose }: { created: CreatedToken; onClose(): 
         showCloseButton={false}
         onEscapeKeyDown={(e) => e.preventDefault()}
         onInteractOutside={(e) => e.preventDefault()}
+        onCloseAutoFocus={(e) => focusBack(e, returnFocus)}
       >
         <DialogHeader>
           <DialogTitle>{t("tokens.secretTitle", { name: created.token.name })}</DialogTitle>

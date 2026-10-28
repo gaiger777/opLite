@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Download, Plus } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 
 import { api, call } from "@/api/client";
@@ -9,6 +9,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { CopyButton } from "@/components/CopyButton";
 import { Field } from "@/components/Field";
+import { focusBack } from "@/components/focusBack";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { Badge } from "@/components/ui/badge";
@@ -55,6 +56,8 @@ export function ClusterPage() {
   });
   const [issuing, setIssuing] = useState(false);
   const [issued, setIssued] = useState<JoinToken | null>(null);
+  // 발급·명령 대화상자를 닫으면 "참가 토큰 발급" 버튼으로 돌아간다.
+  const opener = useRef<HTMLButtonElement>(null);
 
   if (!cluster.data) {
     return <ListPending error={cluster.error} />;
@@ -65,7 +68,7 @@ export function ClusterPage() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-2xl font-semibold">{t("cluster.title", { name })}</h1>
         {can(me.role, "write", "join-token") && (
-          <Button onClick={() => setIssuing(true)}>
+          <Button ref={opener} onClick={() => setIssuing(true)}>
             <Plus />
             {t("cluster.issue")}
           </Button>
@@ -135,14 +138,28 @@ export function ClusterPage() {
         <p className="text-sm text-muted-foreground">{t("cluster.membersNote")}</p>
       </section>
       {issuing && (
-        <IssueDialog onClose={() => setIssuing(false)} onIssued={(token) => setIssued(token)} />
+        <IssueDialog
+          returnFocus={opener}
+          onClose={() => setIssuing(false)}
+          onIssued={(token) => setIssued(token)}
+        />
       )}
-      {issued && <JoinTokenDialog token={issued} onClose={() => setIssued(null)} />}
+      {issued && (
+        <JoinTokenDialog token={issued} returnFocus={opener} onClose={() => setIssued(null)} />
+      )}
     </div>
   );
 }
 
-function IssueDialog({ onClose, onIssued }: { onClose(): void; onIssued(token: JoinToken): void }) {
+function IssueDialog({
+  returnFocus,
+  onClose,
+  onIssued,
+}: {
+  returnFocus: RefObject<HTMLElement | null>;
+  onClose(): void;
+  onIssued(token: JoinToken): void;
+}) {
   const { t } = useTranslation();
   const [ttl, setTtl] = useState<number>(TTLS[0]);
 
@@ -155,6 +172,7 @@ function IssueDialog({ onClose, onIssued }: { onClose(): void; onIssued(token: J
       title={t("cluster.issueTitle")}
       description={t("cluster.issueDescription")}
       submitLabel={t("cluster.issue")}
+      returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}
     >
@@ -177,7 +195,15 @@ function IssueDialog({ onClose, onIssued }: { onClose(): void; onIssued(token: J
 }
 
 /** 발급한 조인 URL. 서버는 다시 보여 주지 않으므로 "완료"로만 닫는다. */
-function JoinTokenDialog({ token, onClose }: { token: JoinToken; onClose(): void }) {
+function JoinTokenDialog({
+  token,
+  returnFocus,
+  onClose,
+}: {
+  token: JoinToken;
+  returnFocus: RefObject<HTMLElement | null>;
+  onClose(): void;
+}) {
   const { t, i18n } = useTranslation();
   const command = joinCommand(token.url);
   return (
@@ -186,6 +212,7 @@ function JoinTokenDialog({ token, onClose }: { token: JoinToken; onClose(): void
         showCloseButton={false}
         onEscapeKeyDown={(e) => e.preventDefault()}
         onInteractOutside={(e) => e.preventDefault()}
+        onCloseAutoFocus={(e) => focusBack(e, returnFocus)}
       >
         <DialogHeader>
           <DialogTitle>{t("cluster.issuedTitle")}</DialogTitle>
