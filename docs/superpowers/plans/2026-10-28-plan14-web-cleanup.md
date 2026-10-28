@@ -4,7 +4,7 @@
 
 **Goal:** 계획 8·9·12에서 넘긴 웹 정리 사항을 마친다. 끝난 Task가 끝없이 쌓이지 않게 janitor가 지우고, 내장 웹 파일에 ETag를 붙이며, 웹은 Task 색인으로 행마다 목록을 훑지 않고, 처리 중인 전원 Task로 버튼을 미리 막고, 막힌 동작의 이유를 보이고 읽게 하며, 작업 목록을 페이지로 나누고, VM 폼·번역 키·대화상자 뒤 포커스를 정리한다.
 
-**Architecture:** 리더의 `ClusterJanitor`가 tick마다 끝난 Task를 UUIDv7 id의 시각으로 7일·1000개 기준으로 지운다(tick당 200개, 개수 규칙은 끝난 뒤 10분 유예). opld `web.rs`는 rust-embed의 sha256으로 강한 ETag를 붙이고 `If-None-Match`(약한 비교)에 304로 답한다. 웹은 `TaskIndexProvider`가 끝나지 않은 Task를 대상별로 한 번 묶고, `availability(vm, action, vmTasks)`가 버튼을 막을 이유(번역 키)를 돌려주며, `ReasonMenuItem`·`ReasonButton`·`ReasonList`가 `aria-disabled`와 `aria-describedby`로 이유를 보이고 읽게 한다. `usePage`·`Pager`가 50개씩 나눈다.
+**Architecture:** 리더의 `ClusterJanitor`가 tick마다 끝난 Task를 UUIDv7 id의 시각으로 7일·1000개 기준으로 지운다(tick당 200개, 끝난 뒤 10분 유예). opld `web.rs`는 rust-embed의 sha256으로 강한 ETag를 붙이고 `If-None-Match`(약한 비교)에 304로 답한다. 웹은 `TaskIndexProvider`가 끝나지 않은 Task를 대상별로 한 번 묶고, `availability(vm, action, vmTasks)`가 버튼을 막을 이유(번역 키)를 돌려주며, `ReasonMenuItem`·`ReasonButton`·`ReasonList`가 `aria-disabled`와 `aria-describedby`로 이유를 보이고 읽게 한다. `usePage`·`Pager`가 50개씩 나눈다.
 
 **Tech Stack:** Rust 2024(MSRV 1.88), openraft, axum 0.8, rust-embed; 웹은 계획 8~13과 같다(React 19.3, TanStack Query 5, shadcn/ui·Radix, i18next, Vitest, MSW). 새 의존성은 없다(opld가 워크스페이스의 `hex`를 쓴다).
 
@@ -41,7 +41,7 @@
 
 ## 설계 결정
 
-- **보존.** 끝난(`succeeded`·`failed`) Task만 지운다. 만든 시각은 Task id(UUIDv7)의 시각이다. 기간 규칙: 나이가 `task_max_age`(7일)보다 크면 지운다. 개수 규칙: 그 뒤에도 끝난 Task가 `task_max_finished`(1000)를 넘으면 오래된 것부터, 단 리더가 끝난 것을 처음 본 뒤 `finished_grace`(10분)가 지난 것만 지운다(oplctl `wait_task`·웹 `waitForTask`가 결과를 놓치지 않게). tick당 200개, 오래된 것부터, 리비전을 걸고 지운다. 쓰기가 `Rejected`가 아닌 오류로 실패하면 이 tick의 남은 삭제를 건너뛴다. opld는 0과 36500일 넘는 값을 거절한다. 실행기는 상태를 쓸 Task가 지워졌으면(`NotFound`) 다시 시도하지 않는다.
+- **보존.** 끝난(`succeeded`·`failed`) Task만 지운다. 만든 시각은 Task id(UUIDv7)의 시각이다. 기간 규칙: 나이가 `task_max_age`(7일)보다 크면 지운다. 개수 규칙: 그 뒤에도 끝난 Task가 `task_max_finished`(1000)를 넘으면 오래된 것부터 지운다. 두 규칙 모두 리더가 끝난 것을 처음 본 뒤 `finished_grace`(10분)가 지난 것만 지운다(oplctl `wait_task`·웹 `waitForTask`가 결과를 놓치지 않게). tick당 200개, 오래된 것부터, 리비전을 걸고 지운다. 쓰기가 `Rejected`가 아닌 오류로 실패하면 이 tick의 남은 삭제를 건너뛴다. opld는 0과 36500일 넘는 값을 거절한다. 실행기는 상태를 쓸 Task가 지워졌으면(`NotFound`) 다시 시도하지 않는다.
 - **ETag.** 모든 내장 파일 응답에 `"<sha256 hex>"`. `If-None-Match`는 RFC 9110 약한 비교(`W/`를 떼고 비교, `*`는 모두)로, 맞으면 본문 없는 304에 ETag·Cache-Control·보안 헤더. `Cache-Control`은 그대로(`assets/*`는 immutable, 그 밖은 `no-cache`).
 - **Task 색인.** `TaskIndexProvider`가 `LiveProvider` 안쪽에서 `useList("task")`를 한 번 읽어 대상 id → 끝나지 않은 Task 목록을 만든다. Provider 밖에서는 빈 `Map`. 행은 `useTaskIndex().get(vm.id) ?? []`.
 - **전원 버튼.** `availability(vm, action, vmTasks)`: 시작·정지·재시작은 끝나지 않은 전원 Task가 있으면 `vms.reason.powerPending`(상태보다 먼저), 그다음 상태(`failed`·`stopped`·`busy`·`running`), 강제 정지는 되돌리는 중이면 `reverting`. 서버는 그대로다.
@@ -9547,6 +9547,6 @@ git commit -m "docs: 작업 보존·페이지·비활성 이유 안내와 웹 �
 ## 알고 받아들인 제한
 
 - **Task 전송:** 웹은 여전히 모든 Task를 받는다. 보존 정책으로 끝난 Task가 1000개 남짓을 넘지 않아 상한이 생긴다.
-- **보존 기준:** 기간은 만든 시각 기준이다. 리더가 바뀌면 새 리더는 10분 동안 개수 규칙으로 지우지 않는다.
+- **보존 기준:** 기간은 만든 시각 기준이다. 리더가 바뀌면 새 리더는 10분 동안 끝난 Task를 지우지 않는다.
 - **전원 버튼:** 웹에서만 막는다. CLI·API로는 처리 중인 전원 Task를 대체할 수 있다.
 - 그 밖의 제한은 설계 문서 §12에 있다.

@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 const GRACE: Duration = Duration::from_millis(500);
 
-/// 50ms마다 보고 유예(오프라인·고아 스냅샷)가 0.5초인 정리 작업
+/// 50ms마다 보고 유예(오프라인·고아 스냅샷·끝난 Task)가 0.5초인 정리 작업
 fn fast_janitor(env: &Env) -> ClusterJanitor {
     ClusterJanitor::spawn(
         env.state.clone(),
@@ -28,6 +28,7 @@ fn fast_janitor(env: &Env) -> ClusterJanitor {
             tick: Duration::from_millis(50),
             offline_grace: GRACE,
             orphan_grace: GRACE,
+            finished_grace: GRACE,
             ..ClusterJanitorConfig::default()
         },
     )
@@ -289,11 +290,14 @@ async fn old_finished_tasks_go_and_unfinished_ones_stay() {
     let pending = old_task(&env, 30 * day, node, TaskState::Pending).await;
     let running = old_task(&env, 30 * day, node, TaskState::Running).await;
     let janitor = fast_janitor(&env);
+    let started = Instant::now();
     until("old finished tasks deleted", || {
         let ids = task_ids(&env);
         !ids.contains(&succeeded.id) && !ids.contains(&failed.id)
     })
     .await;
+    // 오래됐어도 끝난 것을 처음 본 뒤 유예를 기다린다.
+    assert!(started.elapsed() >= GRACE, "{:?}", started.elapsed());
     // 몇 tick 더 지나도 남은 것은 그대로다.
     tokio::time::sleep(Duration::from_millis(200)).await;
     janitor.shutdown().await;

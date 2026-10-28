@@ -5,8 +5,8 @@ import { toast } from "sonner";
 import { type List, listKey } from "@/api/live";
 import type { Task } from "@/api/types";
 
-/** 결과를 기다리는 Task: id → 알림에 쓸 설명 */
-const pending = new Map<string, string>();
+/** 결과를 기다리는 Task: id → 알림에 쓸 설명과 만든 revision */
+const pending = new Map<string, { label: string; revision: number }>();
 
 let tracked = () => {};
 
@@ -34,25 +34,32 @@ export function resetTasks() {
  * `settleTasks`가 찾는다.
  */
 export function trackTask(task: Task, label: string) {
-  pending.set(task.id, label);
+  pending.set(task.id, { label, revision: task.revision });
   toast.loading(label, { id: task.id });
   tracked();
 }
 
-/** 끝난 Task의 알림을 결과로 바꾼다. Task 목록이 바뀔 때마다 부른다. */
-export function settleTasks(tasks: Task[], t: TFunction) {
-  for (const task of tasks) {
-    const label = pending.get(task.id);
-    if (label === undefined) {
-      continue;
-    }
-    if (task.status.state === "succeeded") {
-      pending.delete(task.id);
-      toast.success(t("tasks.done", { label }), { id: task.id });
+/**
+ * 끝난 Task의 알림을 결과로 바꾼다. Task 목록이 바뀔 때마다 부른다. 만든 뒤에 읽은 목록에 없는 Task는
+ * watch가 끊긴 사이 정리 작업이 지운 것이므로 결과를 알 수 없다고 알린다.
+ */
+export function settleTasks(list: List<Task>, t: TFunction) {
+  const byId = new Map(list.items.map((task) => [task.id, task]));
+  for (const [id, { label, revision }] of pending) {
+    const task = byId.get(id);
+    if (task === undefined) {
+      // 목록의 revision은 다시 읽을 때만 바뀌므로, 만들기 전에 읽은 목록이면 아직 들어오지 않은 것이다.
+      if (list.revision >= revision) {
+        pending.delete(id);
+        toast.info(t("tasks.gone", { label }), { id });
+      }
+    } else if (task.status.state === "succeeded") {
+      pending.delete(id);
+      toast.success(t("tasks.done", { label }), { id });
     } else if (task.status.state === "failed") {
-      pending.delete(task.id);
+      pending.delete(id);
       toast.error(t("tasks.failed", { label, error: task.status.error ?? "" }), {
-        id: task.id,
+        id,
         duration: Infinity,
         closeButton: true,
       });

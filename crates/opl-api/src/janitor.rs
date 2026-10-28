@@ -194,8 +194,8 @@ fn decide(
 }
 
 /// 지울 끝난 Task를 오래된 것부터 최대 `limit`개 고르고 `seen`을 고친다. 만든 지 `task_max_age`가
-/// 넘은 것과, 그러고도 `task_max_finished`를 넘는 만큼 오래된 것 중 끝난 것을 처음 본 뒤
-/// `finished_grace`가 지난 것이다. 끝나지 않은 Task는 고르지 않는다.
+/// 넘은 것과 `task_max_finished`를 넘는 만큼 오래된 것 중 끝난 것을 처음 본 뒤 `finished_grace`가
+/// 지난 것이다. 끝나지 않은 Task는 고르지 않는다.
 fn expired_tasks(
     now: SystemTime,
     instant: Instant,
@@ -224,7 +224,7 @@ fn expired_tasks(
     finished
         .iter()
         .enumerate()
-        .filter(|(i, (_, t))| *i < old || (*i < over && settled(t)))
+        .filter(|(i, (_, t))| (*i < old || *i < over) && settled(t))
         .take(limit)
         .map(|(_, (_, t))| Action::DeleteTask {
             id: t.id,
@@ -693,12 +693,15 @@ mod tests {
         let newest = task_made(now, Duration::ZERO, TaskState::Failed);
         let tasks = [newer.clone(), newest];
         assert_eq!(at(t0 + FINISHED_GRACE, &tasks), vec![delete(&newer)]);
-        // 기간 기준은 유예를 기다리지 않는다.
-        let old = task_made(now, 8 * day, TaskState::Succeeded);
+        // 기간 기준도 끝난 것을 처음 본 뒤 유예를 기다린다(오래 꺼져 있던 노드의 Task가 늦게 실패한 경우).
+        let old = task_made(now, 8 * day, TaskState::Failed);
+        let tasks = std::slice::from_ref(&old);
+        assert_eq!(at(t0 + FINISHED_GRACE, tasks), vec![]);
         assert_eq!(
-            at(t0 + FINISHED_GRACE, std::slice::from_ref(&old)),
-            vec![delete(&old)]
+            at(t0 + 2 * FINISHED_GRACE - Duration::from_secs(1), tasks),
+            vec![]
         );
+        assert_eq!(at(t0 + 2 * FINISHED_GRACE, tasks), vec![delete(&old)]);
         assert!(seen.finished.contains_key(&old.id));
         assert!(!seen.finished.contains_key(&older.id));
     }

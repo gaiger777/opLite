@@ -94,7 +94,10 @@ it("forgets toasts and tracked tasks when signing out", async () => {
   });
   // 로그아웃 전에 지켜보던 Task의 결과는 알리지 않는다.
   const success = vi.spyOn(toast, "success");
-  settleTasks([{ ...task, status: { state: "succeeded", error: null } }], i18n.t);
+  settleTasks(
+    { revision: 2, items: [{ ...task, status: { state: "succeeded", error: null } }] },
+    i18n.t,
+  );
   expect(success).not.toHaveBeenCalled();
   success.mockRestore();
 });
@@ -124,7 +127,10 @@ it("forgets toasts and tracked tasks when the session ends", async () => {
     expect(screen.queryByText("other")).not.toBeInTheDocument();
   });
   const success = vi.spyOn(toast, "success");
-  settleTasks([{ ...task, status: { state: "succeeded", error: null } }], i18n.t);
+  settleTasks(
+    { revision: 2, items: [{ ...task, status: { state: "succeeded", error: null } }] },
+    i18n.t,
+  );
   expect(success).not.toHaveBeenCalled();
   success.mockRestore();
 });

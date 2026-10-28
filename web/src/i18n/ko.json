@@ -86,6 +86,7 @@
     "failedOnly": "실패만",
     "done": "{{label}}: 완료",
     "failed": "{{label}}: 실패. {{error}}",
+    "gone": "{{label}}: 결과를 더 이상 볼 수 없습니다",
     "state": {
       "pending": "대기",
       "running": "진행 중",

@@ -86,6 +86,7 @@
     "failedOnly": "Failed only",
     "done": "{{label}}: done",
     "failed": "{{label}}: failed. {{error}}",
+    "gone": "{{label}}: result is no longer available",
     "state": {
       "pending": "Pending",
       "running": "Running",

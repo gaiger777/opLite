@@ -43,12 +43,12 @@ it("turns a tracked task's toast into its result", async () => {
   );
   trackTask(task("1", "pending"), "Start web");
   expect(await screen.findByText("Start web")).toBeInTheDocument();
-  settleTasks([task("1", "running")], i18n.t);
-  settleTasks([task("1", "failed", "no firmware")], i18n.t);
+  settleTasks({ revision: 2, items: [task("1", "running")] }, i18n.t);
+  settleTasks({ revision: 3, items: [task("1", "failed", "no firmware")] }, i18n.t);
   expect(await screen.findByText("Start web: failed. no firmware")).toBeInTheDocument();
   // 한 번 알린 결과는 다시 알리지 않는다.
   const success = vi.spyOn(toast, "success");
-  settleTasks([task("1", "succeeded")], i18n.t);
+  settleTasks({ revision: 4, items: [task("1", "succeeded")] }, i18n.t);
   expect(success).not.toHaveBeenCalled();
 });
 
@@ -65,6 +65,22 @@ it("settles a task that finished before it was tracked", async () => {
   );
   trackTask(task("2", "pending"), "Stop web");
   expect(await screen.findByText("Stop web: done")).toBeInTheDocument();
+});
+
+it("settles a tracked task that was deleted before its result arrived", async () => {
+  render(
+    <ThemeProvider>
+      <Toaster />
+    </ThemeProvider>,
+  );
+  trackTask({ ...task("8", "pending"), revision: 5 }, "Start web");
+  expect(await screen.findByText("Start web")).toBeInTheDocument();
+  // 만들기 전에 읽은 목록에 없는 것은 아직 들어오지 않은 것이다.
+  settleTasks({ revision: 4, items: [] }, i18n.t);
+  expect(screen.queryByText("Start web: result is no longer available")).not.toBeInTheDocument();
+  // 만든 뒤에 읽은 목록에 없으면 정리 작업이 지운 것이다.
+  settleTasks({ revision: 9, items: [] }, i18n.t);
+  expect(await screen.findByText("Start web: result is no longer available")).toBeInTheDocument();
 });
 
 it("keeps the newer listener when an older one unsubscribes", () => {

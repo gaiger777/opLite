@@ -12,17 +12,18 @@ export function TaskToasts() {
   const queryClient = useQueryClient();
   const tasks = useList("task");
   useEffect(() => {
-    if (tasks.data) {
-      settleTasks(tasks.data, t);
+    const list = queryClient.getQueryData<List<Task>>(listKey("task"));
+    if (tasks.data && list) {
+      settleTasks(list, t);
     }
-  }, [tasks.data, t]);
+  }, [tasks.data, queryClient, t]);
   // 202 응답보다 watch가 알린 결과가 먼저 올 수 있으므로 지켜보기 시작할 때도 지금 목록을 본다.
   useEffect(
     () =>
       onTrack(() => {
         const list = queryClient.getQueryData<List<Task>>(listKey("task"));
         if (list) {
-          settleTasks(list.items, t);
+          settleTasks(list, t);
         }
       }),
     [queryClient, t],
