@@ -23,21 +23,24 @@
 - **키 두 종류.**
   - (소문자로 바꾼 사용자 이름, IP): 연속 5번 실패하면 30초 막는다.
   - IP만: 연속 20번 실패하면 30초 막는다. 한 IP에서 사용자 이름을 바꿔 가며 시도하는 것과 argon2 계산으로 CPU를 쓰게 하는 것을 막는다.
-- **늘어나는 잠금.** 막힌 뒤 풀린 다음에도 실패가 이어지면 실패할 때마다 막는 시간을 두 배로 늘린다. 최대 15분이다.
-- **성공하면** 그 (사용자 이름, IP) 기록과 그 IP 기록을 지운다.
-- **기록 정리.** 마지막 시도 뒤 15분이 지난 기록은 지운다(기록할 때 함께). 기록 수는 1만 개를 넘지 않는다. 넘치면 마지막 시도가 가장 오래된 것부터 버린다.
-- **판단 순서.** 막힌 상태면 해시를 계산하지 않고 바로 **429** `too_many_attempts`를 돌려준다. `Retry-After` 헤더에 남은 초를 넣고, 메시지에 "try again in N seconds"를 넣는다. 막히지 않았으면 평소처럼 확인하고 성공·실패를 기록한다.
+  - IP는 IPv4-mapped IPv6면 IPv4로 바꾸고(`to_canonical()`), IPv6는 /64 네트워크 하나로 센다(한 사용자가 쉽게 바꿔 쓸 수 있는 주소 묶음이다).
+- **늘어나는 잠금.** 막힌 뒤 풀린 다음에도 실패가 이어지면 실패할 때마다 막는 시간을 두 배로 늘린다. 최대 15분이다. 곧 잠금 시간은 30초 × 2^(실패 수 − 한도)이고 15분을 넘지 않는다(5번째 실패에 30초, 6번째에 1분, …).
+- **성공하면** 그 (사용자 이름, IP) 기록을 지우고, IP 기록에서는 이번 시도로 센 1만 뺀다(그 시도로 IP 키가 한도에 닿아 걸린 잠금도 푼다). IP 기록을 지우지 않는 것은 자기 계정으로 로그인해 IP의 실패 수를 처음으로 돌리는 우회를 막기 위해서다.
+- **기록 정리.** 마지막 시도 뒤 15분이 **넘게** 지난 기록은 지운다(시도를 셀 때 함께). 성공은 시도 시각을 바꾸지 않으므로 사실상 마지막 실패 기준이다. 최대 잠금과 같은 길이라, 15분 잠금이 막 풀린 뒤의 실패는 이어서 세어 다시 15분 막는다. 기록 수는 1만 개를 넘지 않는다. 넘치면 잠기지 않은 기록 가운데 마지막 시도가 가장 오래된 것부터 버리고, 그래도 넘치면 잠긴 기록 가운데 가장 오래된 것을 버린다(기록을 채워 잠금을 풀지 못하게).
+- **판단 순서.** 막힌 상태면 해시를 계산하지 않고 바로 **429** `too_many_attempts`를 돌려준다. `Retry-After` 헤더에 남은 초를 넣고, 메시지에 "try again in N seconds"를 넣는다. 막히지 않았으면 **확인하기 전에 이 시도를 실패로 먼저 센다**(`AttemptLimiter::begin`: 두 키의 실패 수를 올리고 한도에 닿으면 잠근다). 막힘 확인과 세기를 한 잠금 안에서 하므로, argon2 확인을 기다리는 동안 들어온 동시 요청도 앞의 시도를 실패로 보고 막힌다(같은 사용자·IP로 동시에 20번 틀려도 5번만 비밀번호 확인까지 간다). 실패하면 따로 기록하지 않고, 성공하면 위처럼 되돌린다(`success`). 429로 돌려보낸 시도는 기록하지 않는다(마지막 시도 시각도 바꾸지 않는다). 그래서 막힌 동안 계속 두드려도 잠금이 늘거나 기록이 오래 남지 않는다.
 - **적용 대상.**
-  - `POST /auth/login`. 없는 사용자도 실패로 센다.
-  - 자기 비밀번호를 바꿀 때의 현재 비밀번호 확인(`PATCH /users/{id}`의 `current_password`). 키는 (요청한 사용자 이름, IP)이고 로그인과 같은 기록을 쓴다.
+  - `POST /auth/login`. 없는 사용자도 실패로 센다. 사용자 이름이 이름 형식(`opl_types`의 `validate_name`: 1–63자의 소문자·숫자·`-`)이 아니면 그런 사용자는 있을 수 없으므로 해시를 계산하지 않고 IP 키만 실패로 세어(`begin_ip`) 401 `invalid_credentials`를 돌려준다. 긴 이름으로 기록의 메모리를 늘리지 못하게 기록에는 형식을 통과한 이름만 들어간다. 있을 수 없는 이름이므로 응답 시간으로 드러나는 것도 없다.
+  - 자기 비밀번호를 바꿀 때의 현재 비밀번호 확인(`PUT /users/{key}`의 `current_password`). 키는 (요청한 사용자 이름, IP)이고 로그인과 같은 기록을 쓴다. 새 비밀번호의 길이 확인(400) 뒤에 한다. 새 비밀번호가 너무 짧으면 시도 제한을 보지도 세지도 않는다.
 - **값**은 상수다. 설정에 노출하지 않는다.
-- **클라이언트 IP**는 TLS 리스너의 연결 주소(`into_make_service_with_connect_info::<SocketAddr>()`)다. 프록시 뒤에서는 모든 요청이 프록시 IP로 보인다(문서에 적는다). IP를 얻을 수 없는 경우(테스트 라우터를 `oneshot`으로 부를 때)는 미지정 주소(`0.0.0.0`) 하나로 센다.
+- **클라이언트 IP**는 TLS 리스너의 연결 주소(`into_make_service_with_connect_info::<SocketAddr>()`)다. 프록시 뒤에서는 모든 요청이 프록시 IP로 보인다(README에 적는다). IP를 얻을 수 없는 경우(테스트 라우터를 `oneshot`으로 부를 때)는 미지정 주소(`0.0.0.0`) 하나로 센다.
+  - handler는 `limit.rs`의 `ClientIp` 추출기로 IP를 받는다. axum 0.8은 `Option<ConnectInfo<SocketAddr>>`를 추출기로 받을 수 없어서(`ConnectInfo`가 선택 추출을 구현하지 않는다), `ClientIp`가 요청 확장에서 `ConnectInfo<SocketAddr>`를 직접 찾고 없으면 `0.0.0.0`을 쓴다. 없을 때는 처음 한 번 `warn` 로그를 남긴다(테스트 라우터에서는 괜찮고, opld에서 보이면 리스너 설정이 빠진 것이다).
+  - opld의 TLS 리스너는 axum이 연결 주소를 알 수 있는 타입이 아니다. 아무 일도 하지 않는 `tap_io(|_| {})`로 감싸면 axum이 `TapIo` 리스너의 `ConnectInfo<SocketAddr>`를 만들어 준다.
 - 시계는 `tokio::time::Instant`를 써서 테스트가 시간을 멈추고 당길 수 있게 한다.
 
 ## 3. 세션 세대
 
-- `UserSpec.session_epoch: u64`, `#[serde(default)]`(옛 데이터는 0).
-- 비밀번호가 바뀌면(본인이든 관리자든) 같은 쓰기에서 1을 올린다.
+- `UserSpec.session_epoch: u64`, `#[serde(default)]`(옛 데이터는 0). 0이면 쓰지 않는다(`skip_serializing_if`). `UserSpec`은 모르는 필드를 거절하므로, 세대가 0인 사용자를 옛 버전이 읽지 못하게 만들지 않으려는 것이다(버전이 섞인 클러스터를 지원한다는 뜻은 아니다 — 8절).
+- 비밀번호가 바뀌면(본인이든 관리자든) 같은 쓰기에서 1을 올린다. 세대는 요청에 비밀번호가 있을 때만 올린다. 역할만 바꾸면 세션은 그대로다(역할은 요청마다 다시 읽으므로 바로 반영된다).
 - 세션은 만들 때의 세대를 함께 저장한다.
 - 쿠키로 인증할 때 Raft에서 다시 읽은 사용자의 세대와 비교한다(지금도 요청마다 사용자를 다시 읽는다). 다르면 그 세션을 지우고 401 `unauthorized`를 돌려준다. 그래서 다른 노드의 옛 세션도 다음 요청에서 끊긴다.
 - 요청을 처리한 노드의 `sessions.remove_user`는 그대로 둔다.
@@ -45,33 +48,35 @@
 
 ## 4. 업로드 사전 확인
 
-- `import_volume` 앞부분의 확인을 `check_import(state, principal, params, size)`로 뽑는다. 순서:
+- `import_volume` 앞부분의 확인을 `check_import(state, principal, params, size)`로 뽑는다. 문제가 없으면 풀을 돌려준다. 순서:
   1. 권한(Volume 쓰기)
   2. 이름 형식과 예약어 `import`
   3. 풀이 있는지
   4. 풀이 이 노드에 있는지(`pool_not_on_node`)
-  5. 이름 중복(`name_taken`, 이름으로 조회)
+  5. 이름 중복(409 `name_taken`, 이름으로 조회, 메시지 `volume "x" already exists`)
   6. 공간: 크기 + 1 GiB를 남길 수 있는지(`insufficient_storage`)
-- **`POST /volumes/import/check?name&pool&format&source_format&size`**: `check_import`만 부르고 문제가 없으면 204. 본문은 받지 않는다. OpenAPI에 등록한다.
-- 실제 업로드도 `check_import`를 부른다(크기는 `Content-Length`, 없으면 411). 확인과 업로드 사이에 다른 요청이 이름을 가져갈 수 있으므로 Raft에 만들 때의 `name_taken`도 그대로 둔다.
-- **웹**(`web/src/storage/upload.ts`): XHR 전에 확인 API를 부르고, 거절이면 업로드하지 않고 오류 코드 문구로 실패 토스트를 보인다.
-- **처리 대기 제한 시간(웹).** 모든 바이트를 보낸 뒤 2분 안에 응답이 없으면 "처리 중" 토스트를 `uploads.noResponse`("서버 응답이 없습니다. 볼륨 목록에서 결과를 확인하세요.")로 바꾸고 닫을 수 있게 한다. XHR은 끊지 않는다(끊으면 서버의 `UploadGuard`가 받은 볼륨을 지운다). 나중에 응답이 오면 평소처럼 결과 토스트를 띄운다.
+- **`POST /volumes/import/check?name&pool&format&source_format&size`**: `check_import`만 부르고 문제가 없으면 204. 본문은 받지 않는다. OpenAPI에 등록한다. 쿼리는 업로드의 `ImportQuery`에 `size`를 더한 별도 구조체 `ImportCheckQuery`다(업로드 쿼리에 `size`를 받지 않게 하려고 나눈다. 둘 다 모르는 매개변수는 거절한다).
+- 실제 업로드도 `check_import`를 부른다(크기는 `Content-Length`, 없으면 411 `length_required`). `Content-Length`가 없으면 크기를 알 수 없으므로 411을 권한·이름·풀 확인보다 **먼저** 돌려준다(전에는 풀 확인 뒤였다). 확인과 업로드 사이에 다른 요청이 이름을 가져갈 수 있으므로 Raft에 만들 때의 `name_taken`도 그대로 둔다.
+- **웹**(`web/src/storage/upload.ts`): XHR 전에 확인 API를 부르고, 거절이면 업로드하지 않고 오류 코드 문구로 실패 토스트를 보인다. 확인 요청이 서버에 닿지 못하면(네트워크 오류) "업로드 거절 또는 끊김"이 아니라 `errors.network`("Cannot reach the server.")를 보인다.
+- **처리 대기 제한 시간(웹).** 모든 바이트를 보낸 뒤(`xhr.upload`의 `load`. 진행률 이벤트가 없는 빈 파일도) "처리 중" 토스트로 바꾸고, 2분 안에 응답이 없으면 `uploads.noResponse`("{{name}}: 서버 응답이 없습니다. 볼륨 목록에서 결과를 확인하세요.")로 바꾸고 닫을 수 있게 한다. XHR은 끊지 않는다(끊으면 서버의 `UploadGuard`가 받은 볼륨을 지운다). 나중에 응답이 오면 평소처럼 결과 토스트를 띄운다.
 - **oplctl**(`volume import`): 파일 크기로 확인 API를 먼저 부르고, 거절이면 파일을 보내지 않는다.
 
 ## 5. 노드 아키텍처
 
 - **타입.** `Arch { X86_64, Aarch64 }`(serde `x86_64`/`aarch64`)를 opl-types로 옮긴다. `native()`(컴파일된 아키텍처)와 `machine()`도 함께 옮기고, opl-qemu는 opl-types 것을 쓴다. `MachineType::arch()`(`q35` → `x86_64`, `virt` → `aarch64`)를 둔다. `NodeStatus.arch: Option<Arch>`, `#[serde(default)]`(옛 노드는 `None`).
 - **opld.** `register_node`가 이 노드의 `HostProfile.arch`로 채운다.
-- **스케줄러.** 후보 조건에 "노드 arch == VM 머신의 arch"를 더한다. arch가 `None`인 노드는 후보가 아니다. 맞는 노드가 없으면 지금처럼 409 `no_node`다.
-- **지정 노드 검증.** VM을 만들거나 고칠 때(같은 검증 함수) 지정 노드의 arch가 있고 머신의 arch와 다르면 400 `machine_arch_mismatch`. arch를 모르는 노드는 통과시킨다(옛 노드가 섞인 업그레이드 중에 막지 않는다).
-- **oplctl.** `--machine`이 없으면 노드 목록을 읽어 정한다. 지정 노드에 arch가 있으면 그것, 아니면 arch를 아는 노드가 모두 같은 arch일 때 그것. 그 밖에는 오류로 `--machine`을 달라고 한다. 클라이언트의 컴파일 아키텍처로 정하던 코드는 지운다.
-- **웹.** `defaultMachine(nodes, selectedNode)`: 지정 노드의 arch → arch를 아는 노드가 모두 같으면 그 arch → `q35`. hvf로 추측하던 코드는 지운다. 노드를 바꾸면 사용자가 머신을 직접 고르지 않았을 때만 기본값을 다시 정한다. 노드 목록과 상세에 "아키텍처"를 보인다.
+- **스케줄러.** 후보 조건에 "노드 arch == VM 머신의 arch"를 더한다. arch가 `None`인 노드는 후보가 아니다. 맞는 노드가 없으면 지금처럼 409 `no_node`다. 그 메시지에 조건으로 "머신 타입의 아키텍처"를 더한다("… has the architecture of its machine type, …").
+- **지정 노드 검증.** VM을 만들거나 고칠 때(같은 검증 함수 `vms::prepare`) 지정 노드의 arch가 있고 머신의 arch와 다르면 400 `machine_arch_mismatch`. arch를 모르는 노드는 통과시킨다(새 opld가 시작해 arch를 등록하기 전에도 VM을 고칠 수 있게. 버전이 섞인 클러스터는 지원하지 않는다 — 8절). 판단은 `vms::check_node_arch` 하나로 한다. 스냅샷 되돌리기도 되돌린 스펙을 같은 함수로 검증하므로(노드는 지금 것) 같은 400을 받는다.
+  - VM을 시작할 때(`POST /vms/{key}/actions/start`) 고정된 노드도 같은 함수로 확인한다. arch를 모르던 때 고정했을 수 있다.
+  - 메모리 스냅샷 되돌리기가 배치되지 않은 VM을 이 노드에 고정할 때(`tasks/snapshot.rs`의 `write_reverted_spec`) 이 노드의 arch가 머신과 다르면 고정하지 않고 Task를 실패로 끝낸다. 메모리 상태는 이 노드에서만 이어 쓸 수 있으므로 다른 노드로 보내지 않는다. 디스크를 건드리기 전이다.
+- **oplctl.** `--machine`이 없으면 노드 목록(`GET /nodes`)을 읽어 정한다. `--machine`을 주면 노드 목록을 읽지 않는다. 지정 노드에 arch가 있으면 그것, 아니면 arch를 아는 노드가 모두 같은 arch일 때 그것. 그 밖에는 오류로 `--machine`을 달라고 한다. 클라이언트의 컴파일 아키텍처로 정하던 코드는 지운다.
+- **웹.** `defaultMachine(nodes, selectedNode)`: 지정 노드의 arch → arch를 아는 노드가 모두 같으면 그 arch → `q35`. hvf로 추측하던 코드는 지운다. 노드를 바꾸면 사용자가 머신을 직접 고르지 않았을 때만 기본값을 다시 정한다. 다시 정하는 것은 만들기 화면뿐이다(편집 화면은 VM의 지금 머신을 그대로 둔다). 웹에는 노드 상세 화면이 없으므로 "아키텍처"는 노드 목록의 열로만 보인다(모르면 —).
 
 ## 6. 클라이언트 문구
 
 - 웹 `errors.too_many_attempts`: ko "시도가 너무 많습니다. 잠시 뒤에 다시 하세요." / en "Too many attempts. Try again later."
 - 웹 `errors.machine_arch_mismatch`: ko "선택한 노드의 아키텍처와 머신 종류가 맞지 않습니다." / en "The machine type doesn't match the selected node's architecture."
-- 웹 `uploads.noResponse`: ko "서버 응답이 없습니다. 볼륨 목록에서 결과를 확인하세요." / en "No response from the server. Check the volume list for the result."
+- 웹 `uploads.noResponse`: ko "{{name}}: 서버 응답이 없습니다. 볼륨 목록에서 결과를 확인하세요." / en "{{name}}: no response from the server. Check the volume list for the result."
 - oplctl은 서버 메시지를 그대로 보인다.
 
 ## 7. 테스트
@@ -88,4 +93,6 @@
 - 시도 제한은 노드마다 따로 센다. opld가 다시 시작하면 기록이 사라진다.
 - 프록시 뒤에서는 모든 사용자가 한 IP로 보여, IP 키가 정상 사용자를 함께 막을 수 있다.
 - API 토큰은 비밀번호를 바꿔도 살아 있다.
+- 열린 WebSocket 콘솔은 비밀번호를 바꿔도 끊기지 않는다(연결할 때 한 번 인증한다).
+- 버전이 섞인 클러스터는 지원하지 않는다. 모든 노드를 함께 올린다(`robustness-design.md`와 같다).
 - arch를 모르는 노드(옛 버전)는 자동 배치 후보가 아니다. 모든 노드가 새 버전으로 다시 등록하면 풀린다.
