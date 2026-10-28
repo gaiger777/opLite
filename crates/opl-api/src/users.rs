@@ -94,7 +94,7 @@ pub async fn login(
         return Err(wrong_credentials());
     }
     // 막혀 있으면 해시를 계산하지 않는다. 이 시도는 미리 실패로 센다.
-    state.attempts.begin(&req.username, ip)?;
+    let attempt = state.attempts.begin(&req.username, ip)?;
     let user = state.cluster.get_by_name::<UserSpec>(&req.username)?;
     // 사용자가 없어도 해시를 비교해 응답 시간으로 사용자 존재 여부를 알 수 없게 한다.
     let hash = match &user {
@@ -106,7 +106,7 @@ pub async fn login(
     let Some(user) = user.filter(|_| ok) else {
         return Err(wrong_credentials());
     };
-    state.attempts.success(&req.username, ip);
+    state.attempts.success(&req.username, ip, attempt);
     let session = state.sessions.create(user.id, user.spec.session_epoch);
     let mut cookie = format!(
         "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
@@ -248,7 +248,7 @@ pub async fn update_user(
     if let Some(password) = req.password {
         check_password(&password)?;
         if is_self {
-            state.attempts.begin(&principal.name, ip)?;
+            let attempt = state.attempts.begin(&principal.name, ip)?;
             let current = req.current_password.unwrap_or_default();
             if !verify_password(current, user.spec.password_hash.clone()).await {
                 return Err(ApiError::new(
@@ -257,7 +257,7 @@ pub async fn update_user(
                     "the current password is wrong",
                 ));
             }
-            state.attempts.success(&principal.name, ip);
+            state.attempts.success(&principal.name, ip, attempt);
         }
         spec.password_hash = hash_password(password).await?;
         // 모든 노드의 옛 세션을 끊는다(쿠키 인증이 세대를 비교한다).

@@ -74,6 +74,13 @@ fn wait(map: &HashMap<Key, Entry>, keys: &[Key], now: Instant) -> Option<Duratio
         .max()
 }
 
+/// `begin`이 센 시도. 성공하면 `success`에 넘긴다.
+#[derive(Debug)]
+pub struct Attempt {
+    /// 이 시도가 IP 키에 건 잠금
+    ip_lock: Option<Instant>,
+}
+
 impl AttemptLimiter {
     /// 막혀 있으면 풀릴 때까지 남은 시간
     pub fn blocked(&self, user: &str, ip: IpAddr) -> Option<Duration> {
@@ -86,23 +93,25 @@ impl AttemptLimiter {
 
     /// 시도를 시작한다. 막혀 있으면 기록하지 않고 429 `too_many_attempts`. 아니면 이 시도를 미리
     /// 실패로 센다(한도에 닿으면 잠근다). 확인을 기다리는 동안 들어온 다른 시도가 이 실패를 보고
-    /// 막히도록 확인과 세기를 한 번에 한다. 실패하면 따로 기록하지 않고, 성공하면 `success`를 부른다.
-    pub fn begin(&self, user: &str, ip: IpAddr) -> Result<(), ApiError> {
+    /// 막히도록 확인과 세기를 한 번에 한다. 실패하면 따로 기록하지 않고, 성공하면 돌려받은 `Attempt`로
+    /// `success`를 부른다.
+    pub fn begin(&self, user: &str, ip: IpAddr) -> Result<Attempt, ApiError> {
         self.begin_keys(&keys(user, ip))
     }
 
     /// 사용자 이름 없이 IP 키만 세는 `begin`. 있을 수 없는 이름의 로그인에 쓴다(기록에 그 이름을 넣지 않는다).
     pub fn begin_ip(&self, ip: IpAddr) -> Result<(), ApiError> {
-        self.begin_keys(&[Key::Ip(counted_ip(ip))])
+        self.begin_keys(&[Key::Ip(counted_ip(ip))]).map(|_| ())
     }
 
-    fn begin_keys(&self, keys: &[Key]) -> Result<(), ApiError> {
+    fn begin_keys(&self, keys: &[Key]) -> Result<Attempt, ApiError> {
         let now = Instant::now();
         let mut map = self.entries.lock().unwrap();
         if let Some(wait) = wait(&map, keys, now) {
             return Err(too_many_attempts(wait));
         }
         map.retain(|_, e| now.duration_since(e.last) <= IDLE);
+        let mut attempt = Attempt { ip_lock: None };
         for key in keys {
             let limit = key.limit();
             let e = map.entry(key.clone()).or_insert(Entry {
@@ -116,6 +125,9 @@ impl AttemptLimiter {
                 // 한도를 넘은 실패마다 두 배. 2^6 * 30초가 이미 15분을 넘는다.
                 let lock = FIRST_LOCK * 2u32.pow((e.failures - limit).min(6));
                 e.locked_until = Some(now + lock.min(MAX_LOCK));
+                if matches!(key, Key::Ip(_)) {
+                    attempt.ip_lock = e.locked_until;
+                }
             }
         }
         // 넘치면 잠기지 않은 것 가운데 마지막 시도가 가장 오래된 것부터 버린다. 잠긴 것은 그 다음이다
@@ -128,19 +140,20 @@ impl AttemptLimiter {
                 .expect("map is not empty");
             map.remove(&oldest);
         }
-        Ok(())
+        Ok(attempt)
     }
 
     /// 성공한 시도. 그 (사용자 이름, IP) 기록은 지우고, IP 기록에서는 `begin`이 미리 센 이 시도 하나만
     /// 뺀다. IP 기록을 지우지 않는 것은 자기 계정 로그인으로 다른 이름의 실패를 지우지 못하게 하려는 것이다.
-    pub fn success(&self, user: &str, ip: IpAddr) {
+    pub fn success(&self, user: &str, ip: IpAddr, attempt: Attempt) {
         let [user_key, ip_key] = keys(user, ip);
         let mut map = self.entries.lock().unwrap();
         map.remove(&user_key);
         if let Some(e) = map.get_mut(&ip_key) {
             e.failures = e.failures.saturating_sub(1);
-            // 이 시도로 한도에 닿아 걸린 잠금은 푼다. 한도 아래에서는 잠금이 생기지 않는다.
-            if e.failures < IP_FAILURES {
+            // 이 시도가 건 잠금만 푼다(`begin`은 잠기지 않았을 때만 지나가므로 그 전에는 잠금이 없었다).
+            // 그사이 다른 시도의 실패가 건 잠금은 남긴다.
+            if attempt.ip_lock.is_some() && e.locked_until == attempt.ip_lock {
                 e.locked_until = None;
             }
         }
@@ -269,8 +282,8 @@ mod tests {
     async fn success_resets_the_user_record() {
         let l = AttemptLimiter::default();
         fail(&l, "alice", IP, 4);
-        fail(&l, "alice", IP, 1);
-        l.success("alice", IP);
+        let attempt = l.begin("alice", IP).unwrap();
+        l.success("alice", IP, attempt);
         // 처음부터 다시 센다.
         fail(&l, "alice", IP, 4);
         assert_eq!(l.blocked("alice", IP), None);
@@ -285,11 +298,37 @@ mod tests {
             fail(&l, &format!("user{i}"), IP, 1);
         }
         // 스무 번째 시도는 성공한다. 미리 센 실패와 그로 걸린 잠금을 되돌린다.
-        fail(&l, "alice", IP, 1);
-        l.success("alice", IP);
+        let attempt = l.begin("alice", IP).unwrap();
+        l.success("alice", IP, attempt);
         assert_eq!(l.blocked("new-user", IP), None);
         // 앞의 실패 19번은 남아 있어 한 번 더 실패하면 막힌다.
         fail(&l, "other", IP, 1);
+        assert_eq!(l.blocked("new-user", IP), Some(FIRST_LOCK));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_above_the_ip_limit_does_not_lock_the_ip_again() {
+        let l = AttemptLimiter::default();
+        for i in 0..IP_FAILURES {
+            fail(&l, &format!("user{i}"), IP, 1);
+        }
+        tokio::time::advance(FIRST_LOCK).await;
+        // 풀린 뒤의 맞는 로그인은 IP를 다시 잠그지 않는다.
+        let attempt = l.begin("alice", IP).unwrap();
+        l.success("alice", IP, attempt);
+        assert_eq!(l.blocked("new-user", IP), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_keeps_a_lock_set_by_a_concurrent_attempt() {
+        let l = AttemptLimiter::default();
+        for i in 0..IP_FAILURES - 2 {
+            fail(&l, &format!("user{i}"), IP, 1);
+        }
+        // alice의 확인을 기다리는 동안 mallory의 시도가 스무 번째가 되어 IP를 잠근다.
+        let attempt = l.begin("alice", IP).unwrap();
+        l.begin("mallory", IP).unwrap();
+        l.success("alice", IP, attempt);
         assert_eq!(l.blocked("new-user", IP), Some(FIRST_LOCK));
     }
 
