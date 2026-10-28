@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use opl_types::runtime::{ImageFormat, NicBackend, VmRuntimeSpec};
-use opl_types::vm::{CpuModel, DiskBus, Firmware, MachineType, NicModel};
+use opl_types::vm::{Arch, CpuModel, DiskBus, Firmware, MachineType, NicModel};
 use thiserror::Error;
 
-use crate::host::{Accel, Arch, HostProfile};
+use crate::host::{Accel, HostProfile};
 use crate::paths::RuntimePaths;
 
 /// q35의 내장 AHCI 컨트롤러 포트 수

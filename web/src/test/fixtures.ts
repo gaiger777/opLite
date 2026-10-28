@@ -36,7 +36,14 @@ export const NODE: Node = {
   revision: 1,
   labels: {},
   spec: { address: "10.0.0.1", maintenance: false },
-  status: { online: true, cpus: 8, memory_mib: 16384, hypervisor: "qemu-kvm", bridges: [] },
+  status: {
+    online: true,
+    cpus: 8,
+    memory_mib: 16384,
+    hypervisor: "qemu-kvm",
+    bridges: [],
+    arch: null,
+  },
 };
 
 export function task(id: string, kind: Task["spec"]["op"]["kind"], target: string): Task {

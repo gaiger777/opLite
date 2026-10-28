@@ -834,9 +834,9 @@ fn remove_if_exists(path: &Path) -> std::io::Result<()> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use opl_qemu::{Accel, Arch};
+    use opl_qemu::Accel;
     use opl_types::runtime::RuntimeNic;
-    use opl_types::vm::{CpuModel, CpuSpec, MachineType, NicModel};
+    use opl_types::vm::{Arch, CpuModel, CpuSpec, MachineType, NicModel};
 
     use super::*;
 

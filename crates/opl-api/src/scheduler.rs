@@ -113,6 +113,7 @@ mod tests {
             memory_mib,
             hypervisor: "mock".into(),
             bridges: vec![],
+            arch: None,
         };
         n
     }

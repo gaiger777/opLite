@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opl_driver::{EventKind, Hypervisor, IpRoute, QemuConfig, QemuHypervisor, StopMode};
-use opl_qemu::{Arch, HostProfile};
+use opl_qemu::HostProfile;
 use opl_types::network::tap_name;
 use opl_types::runtime::{NicBackend, RuntimeNic, VmRuntimeSpec};
-use opl_types::vm::{CpuModel, CpuSpec, Firmware, NicModel};
+use opl_types::vm::{Arch, CpuModel, CpuSpec, Firmware, NicModel};
 use uuid::Uuid;
 
 struct TestBridge(String);

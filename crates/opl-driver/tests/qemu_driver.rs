@@ -9,9 +9,9 @@ use opl_driver::{
     ActualState, EventKind, Hypervisor, HypervisorEvent, QemuConfig, QemuHypervisor, RuntimeStatus,
     StopMode,
 };
-use opl_qemu::{Arch, HostProfile};
+use opl_qemu::HostProfile;
 use opl_types::runtime::{ImageFormat, RuntimeDisk, VmRuntimeSpec};
-use opl_types::vm::{CpuModel, CpuSpec, DiskBus, Firmware};
+use opl_types::vm::{Arch, CpuModel, CpuSpec, DiskBus, Firmware};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 

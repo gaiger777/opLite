@@ -108,7 +108,7 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
             },
             memory_mib: 256,
             firmware: Firmware::Uefi,
-            machine: opl_qemu::Arch::native().machine(),
+            machine: opl_types::vm::Arch::native().machine(),
             disks: vec![],
             nics: vec![],
             power: PowerState::Running,

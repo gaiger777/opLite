@@ -142,6 +142,7 @@ async fn two_nodes() -> (TempDir, Node, Node) {
             memory_mib: 8192,
             hypervisor: "mock".into(),
             bridges: vec![],
+            arch: None,
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();
@@ -151,6 +152,7 @@ async fn two_nodes() -> (TempDir, Node, Node) {
         UserSpec {
             password_hash: hash_password(ADMIN_PASSWORD.into()).await.unwrap(),
             role: Role::Admin,
+            session_epoch: 0,
         },
     );
     a.cluster.create(&admin).await.unwrap();

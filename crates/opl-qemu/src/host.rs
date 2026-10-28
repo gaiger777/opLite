@@ -1,37 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use opl_types::vm::MachineType;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Arch {
-    X86_64,
-    Aarch64,
-}
+use opl_types::vm::Arch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accel {
     Kvm,
     Hvf,
     Tcg,
-}
-
-impl Arch {
-    /// 이 프로그램이 컴파일된 아키텍처
-    pub fn native() -> Self {
-        if cfg!(target_arch = "x86_64") {
-            Arch::X86_64
-        } else {
-            Arch::Aarch64
-        }
-    }
-
-    /// 이 아키텍처에서 쓸 수 있는 머신 타입
-    pub fn machine(self) -> MachineType {
-        match self {
-            Arch::X86_64 => MachineType::Q35,
-            Arch::Aarch64 => MachineType::Virt,
-        }
-    }
 }
 
 impl Accel {

@@ -180,6 +180,7 @@ pub async fn create_user(
         UserSpec {
             password_hash: hash_password(req.password).await?,
             role: req.role,
+            session_epoch: 0,
         },
     );
     user.revision = state.cluster.create(&user).await?;

@@ -64,6 +64,7 @@ pub async fn create_cluster(
                 .await
                 .map_err(|e| anyhow::anyhow!(e.message))?,
             role: Role::Admin,
+            session_epoch: 0,
         },
     );
     cluster.create(&admin).await?;
@@ -107,6 +108,7 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
         memory_mib: crate::host::memory_mib(),
         hypervisor: host.hypervisor_name(),
         bridges: host.bridges().await.unwrap_or(recorded),
+        arch: None,
     };
     cluster.update_status::<NodeSpec>(id, &status).await?;
     Ok(())

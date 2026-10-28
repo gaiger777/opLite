@@ -602,6 +602,11 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description CPU 아키텍처. 노드가 등록할 때 기록하고, 머신 타입마다 하나로 정해진다.
+         * @enum {string}
+         */
+        Arch: "x86_64" | "aarch64";
         BridgeInfo: {
             name: string;
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
@@ -839,6 +844,8 @@ export interface components {
                 };
                 /** @description 노드가 시작할 때 스스로 기록한다. */
                 status: {
+                    /** @default null */
+                    arch: components["schemas"]["Arch"] | null;
                     /**
                      * @description 이 노드에 있는 Linux 브리지. 스케줄러가 브리지 네트워크를 쓰는 VM을 배치할 때 본다.
                      * @default []
@@ -1177,6 +1184,8 @@ export interface components {
         };
         /** @description 노드가 시작할 때 스스로 기록한다. */
         NodeStatus: {
+            /** @default null */
+            arch: components["schemas"]["Arch"] | null;
             /**
              * @description 이 노드에 있는 Linux 브리지. 스케줄러가 브리지 네트워크를 쓰는 VM을 배치할 때 본다.
              * @default []
@@ -1266,6 +1275,8 @@ export interface components {
             };
             /** @description 노드가 시작할 때 스스로 기록한다. */
             status: {
+                /** @default null */
+                arch: components["schemas"]["Arch"] | null;
                 /**
                  * @description 이 노드에 있는 Linux 브리지. 스케줄러가 브리지 네트워크를 쓰는 VM을 배치할 때 본다.
                  * @default []

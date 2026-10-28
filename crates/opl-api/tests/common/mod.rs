@@ -117,6 +117,7 @@ impl Env {
             memory_mib: 8192,
             hypervisor: "mock".into(),
             bridges: vec![],
+            arch: None,
         };
         cluster.create(&me).await.unwrap();
         let admin = Resource::new(
@@ -124,6 +125,7 @@ impl Env {
             UserSpec {
                 password_hash: hash_password(ADMIN_PASSWORD.into()).await.unwrap(),
                 role: Role::Admin,
+                session_epoch: 0,
             },
         );
         cluster.create(&admin).await.unwrap();

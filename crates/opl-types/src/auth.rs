@@ -26,6 +26,14 @@ pub struct UserSpec {
     /// argon2 PHC 문자열
     pub password_hash: String,
     pub role: Role,
+    /// 비밀번호가 바뀔 때마다 1 올린다. 세션은 만들 때의 값과 다르면 끊긴다.
+    /// 0이면 쓰지 않는다(이 필드를 모르는 옛 노드가 읽을 수 있게).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub session_epoch: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl ResourceSpec for UserSpec {
@@ -54,3 +62,41 @@ impl ResourceSpec for ApiTokenSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ApiTokenStatus {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_session_epoch_defaults_to_zero() {
+        // 옛 사용자에는 session_epoch가 없다.
+        let old: UserSpec = serde_json::from_value(serde_json::json!({
+            "password_hash": "h",
+            "role": "admin"
+        }))
+        .unwrap();
+        assert_eq!(old.session_epoch, 0);
+        let user = UserSpec {
+            session_epoch: 3,
+            ..old
+        };
+        let json = serde_json::to_value(&user).unwrap();
+        assert_eq!(json["session_epoch"], 3);
+        assert_eq!(serde_json::from_value::<UserSpec>(json).unwrap(), user);
+    }
+
+    #[test]
+    fn zero_session_epoch_is_not_written() {
+        // 옛 노드의 UserSpec은 모르는 필드를 거절하므로, 세대가 0이면 쓰지 않는다.
+        let user = UserSpec {
+            password_hash: "h".into(),
+            role: Role::Admin,
+            session_epoch: 0,
+        };
+        let json = serde_json::to_value(&user).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "password_hash": "h", "role": "admin" })
+        );
+    }
+}

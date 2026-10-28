@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::resource::{Kind, Resource, ResourceSpec};
+use crate::vm::Arch;
 
 /// 클러스터 노드. 리소스 id는 그 노드의 Raft 노드 id와 같다.
 pub type Node = Resource<NodeSpec, NodeStatus>;
@@ -33,6 +34,8 @@ pub struct NodeStatus {
     pub hypervisor: String,
     /// 이 노드에 있는 Linux 브리지. 스케줄러가 브리지 네트워크를 쓰는 VM을 배치할 때 본다.
     pub bridges: Vec<BridgeInfo>,
+    /// 이 노드의 CPU 아키텍처. 옛 버전 노드는 기록하지 않아 None이다.
+    pub arch: Option<Arch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,5 +57,20 @@ mod tests {
         assert!(!spec.maintenance);
         let status: NodeStatus = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(status, NodeStatus::default());
+    }
+
+    #[test]
+    fn status_arch_is_optional() {
+        // 옛 노드는 arch를 기록하지 않았다.
+        let old: NodeStatus =
+            serde_json::from_value(serde_json::json!({ "online": true, "cpus": 2 })).unwrap();
+        assert_eq!(old.arch, None);
+        let status = NodeStatus {
+            arch: Some(Arch::X86_64),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["arch"], "x86_64");
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
 }

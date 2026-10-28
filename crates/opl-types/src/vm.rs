@@ -173,6 +173,44 @@ pub enum MachineType {
     Virt,
 }
 
+impl MachineType {
+    /// 이 머신 타입을 쓸 수 있는 아키텍처
+    pub fn arch(self) -> Arch {
+        match self {
+            MachineType::Q35 => Arch::X86_64,
+            MachineType::Virt => Arch::Aarch64,
+        }
+    }
+}
+
+/// CPU 아키텍처. 노드가 등록할 때 기록하고, 머신 타입마다 하나로 정해진다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum Arch {
+    X86_64,
+    Aarch64,
+}
+
+impl Arch {
+    /// 이 프로그램이 컴파일된 아키텍처
+    pub fn native() -> Self {
+        if cfg!(target_arch = "x86_64") {
+            Arch::X86_64
+        } else {
+            Arch::Aarch64
+        }
+    }
+
+    /// 이 아키텍처에서 쓸 수 있는 머신 타입
+    pub fn machine(self) -> MachineType {
+        match self {
+            Arch::X86_64 => MachineType::Q35,
+            Arch::Aarch64 => MachineType::Virt,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -371,6 +409,21 @@ mod tests {
 
     fn sample() -> VmSpec {
         serde_json::from_value(sample_json()).unwrap()
+    }
+
+    #[test]
+    fn arch_serializes_as_lowercase_and_pairs_with_machine() {
+        assert_eq!(serde_json::to_value(Arch::X86_64).unwrap(), "x86_64");
+        assert_eq!(serde_json::to_value(Arch::Aarch64).unwrap(), "aarch64");
+        assert_eq!(
+            serde_json::from_value::<Arch>(serde_json::json!("aarch64")).unwrap(),
+            Arch::Aarch64
+        );
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            assert_eq!(arch.machine().arch(), arch);
+        }
+        assert_eq!(MachineType::Q35.arch(), Arch::X86_64);
+        assert_eq!(MachineType::Virt.arch(), Arch::Aarch64);
     }
 
     #[test]
