@@ -1,16 +1,16 @@
 //! 스냅샷 Task 실행: 실행 중인 VM(Mock 하이퍼바이저)의 만들기·삭제, 부모와 현재 위치, 실패 정리,
-//! 디스크 없는 VM 되돌리기, 시작할 때의 고아 정리. 디스크 파일을 다루는 경우는 `snapshot_disks`.
+//! 디스크 없는 VM 되돌리기, 시작할 때의 고아 정리, 실행 중인 VM의 LVM 스냅샷과 크기 늘리기. 디스크 파일을 다루는 경우는 `snapshot_disks`.
 
 mod common;
 
 use std::sync::{Arc, Mutex};
 
 use common::{Client, Env, FakeStorage, vm_request};
-use opl_driver::{DriverError, uefi_vars_path};
+use opl_driver::{DriverError, Hypervisor, RuntimeStatus, uefi_vars_path};
 use opl_qemu::QmpError;
 use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
-use opl_types::runtime::ImageFormat;
+use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
 use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
@@ -790,4 +790,338 @@ fn pending(vm: Uuid, spec: &VmSpec, name: &str) -> Snapshot {
     );
     s.name = s.id.to_string();
     s
+}
+
+/// LVM-thin 풀 `thin`과 그 풀의 바로 Ready인 1 MiB raw 볼륨 `names`를 저장소에 직접 만들고, 파일
+/// 없는 스토리지로 실행기를 다시 띄운다(볼륨은 1 MiB로 알린다).
+async fn lvm_volumes(env: &mut Env, names: &[&str]) -> (Vec<Uuid>, Arc<FakeStorage>) {
+    let pool = Resource::new(
+        "thin",
+        StoragePoolSpec {
+            backend: opl_types::storage::PoolBackend::LvmThin {
+                vg: "vg0".into(),
+                thinpool: "tp".into(),
+            },
+            nodes: vec![],
+            shared: false,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    env.pool_ready("thin").await;
+    let storage = Arc::new(FakeStorage::default());
+    let mut ids = Vec::new();
+    for name in names {
+        let mut volume = Resource::new(
+            *name,
+            VolumeSpec {
+                pool: "thin".into(),
+                size_bytes: 1 << 20,
+                format: ImageFormat::Raw,
+            },
+        );
+        env.cluster.create(&volume).await.unwrap();
+        volume.status.phase = VolumePhase::Ready;
+        env.cluster
+            .update_status::<VolumeSpec>(volume.id, &volume.status)
+            .await
+            .unwrap();
+        storage.set_size(volume.id, 1 << 20);
+        ids.push(volume.id);
+    }
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    (ids, storage)
+}
+
+/// 디스크 `disks`를 붙인 VM을 이 노드에서 실행 중으로 만든다. LVM-thin 풀은 macOS에서 쓸 수 없어
+/// reconciler가 띄우지 못하므로 Mock 하이퍼바이저에 직접 띄운 뒤 이 노드에 켜진 것으로 배치한다
+/// (reconciler는 이미 돌고 있는 VM을 그대로 둔다).
+async fn running_lvm_vm(env: &Env, admin: &Client, name: &str, disks: &[&str]) -> Uuid {
+    let mut req = vm_request(name);
+    req["spec"]["disks"] = disks
+        .iter()
+        .map(|v| json!({ "volume": v, "bus": "virtio-blk" }))
+        .collect();
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let id: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let current = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+    let runtime = VmRuntimeSpec {
+        id,
+        name: name.into(),
+        cpu: current.spec.cpu.clone(),
+        memory_mib: current.spec.memory_mib,
+        firmware: current.spec.firmware,
+        machine: current.spec.machine,
+        disks: vec![],
+        nics: vec![],
+    };
+    env.hv.start(&runtime, None).await.unwrap();
+    let mut spec = current.spec.clone();
+    spec.node = Some(env.node);
+    spec.power = PowerState::Running;
+    env.cluster
+        .update_spec(id, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while env.cluster.get::<VmSpec>(id).unwrap().unwrap().status.phase != VmPhase::Running {
+        assert!(std::time::Instant::now() < deadline, "VM did not run");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    id
+}
+
+#[tokio::test]
+async fn running_vm_lvm_snapshot_pauses_it_while_the_disks_are_snapshotted() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0", "lv1"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
+
+    // 첫 디스크를 찍는 동안 VM은 멈춰 있다.
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert!(env.hv.is_paused(vm));
+    storage.resume();
+    succeeded(&admin.wait_task(&task).await);
+    assert!(!env.hv.is_paused(vm));
+    assert_eq!(storage.calls(), [("create", lvs[0]), ("create", lvs[1])]);
+    // QEMU의 내부 스냅샷은 쓰지 않는다.
+    assert!(env.hv.snapshots(vm).is_empty());
+    let a = get(&env, vm, "a");
+    assert_eq!(a.status.phase, SnapshotPhase::Ready);
+    assert!(!a.spec.memory);
+    assert_eq!(position(&env, vm), Some(a.id));
+
+    // 실행 중이어도 스냅샷 LV는 스토리지로 지운다.
+    let (status, task) = admin.delete("/vms/web/snapshots/a").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(
+        storage.calls()[2..],
+        [("delete", lvs[0]), ("delete", lvs[1])]
+    );
+    assert!(find(&env, vm, "a").is_none());
+    assert!(env.pid(vm).await.is_some());
+}
+
+#[tokio::test]
+async fn failed_lvm_snapshot_resumes_the_vm_and_removes_the_lvs_made() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0", "lv1"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
+
+    storage.fail_snapshot_create(lvs[1]);
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(!env.hv.is_paused(vm));
+    assert_eq!(
+        storage.calls(),
+        [
+            ("create", lvs[0]),
+            ("create", lvs[1]),
+            ("delete", lvs[0]),
+            ("delete", lvs[1]),
+        ]
+    );
+    assert!(find(&env, vm, "a").is_none());
+    assert_eq!(position(&env, vm), None);
+}
+
+#[tokio::test]
+async fn running_vm_lvm_disk_grows_in_storage_before_qemu() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+
+    // LV를 늘리는 동안 QEMU에는 아직 알리지 않았다.
+    storage.pause();
+    let (status, task) = admin
+        .post("/volumes/lv0/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert_eq!(env.hv.disk_size(vm, 0), None);
+    storage.resume();
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(storage.calls(), [("resize", lvs[0])]);
+    assert_eq!(env.hv.disk_size(vm, 0), Some(2 << 20));
+    let lv0 = env.cluster.get::<VolumeSpec>(lvs[0]).unwrap().unwrap();
+    assert_eq!(lv0.spec.size_bytes, 2 << 20);
+}
+
+/// LVM 디스크의 VM은 예약이 메모리를 원해도 디스크만 찍는다(메모리를 요청하면 거절되어 예약이
+/// 실패로 남는다).
+#[tokio::test]
+async fn scheduled_lvm_snapshot_leaves_out_memory() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    let mut spec = current.spec.clone();
+    spec.snapshot_schedule = Some(opl_types::vm::SnapshotSchedule {
+        every: opl_types::vm::ScheduleEvery::Hourly,
+        keep: 3,
+        memory: true,
+    });
+    env.cluster
+        .update_spec(vm, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+
+    let scheduler = opl_api::SnapshotScheduler::spawn(
+        env.state.clone(),
+        opl_api::SnapshotSchedulerConfig {
+            tick: std::time::Duration::from_millis(50),
+            hour: std::time::Duration::from_secs(3600),
+        },
+    );
+    let deadline = std::time::Instant::now() + common::WAIT;
+    let made = loop {
+        let (_, all) = env.cluster.list::<SnapshotSpec>().unwrap();
+        if let Some(s) = all
+            .into_iter()
+            .find(|s| s.spec.vm == vm && s.spec.scheduled && s.status.phase == SnapshotPhase::Ready)
+        {
+            break s;
+        }
+        let error = env.cluster.get::<VmSpec>(vm).unwrap().unwrap().status;
+        assert_eq!(error.schedule_error, None);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no scheduled snapshot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    scheduler.shutdown().await;
+    assert!(!made.spec.memory);
+    assert_eq!(storage.calls(), [("create", lvs[0])]);
+    assert!(env.hv.snapshots(vm).is_empty());
+}
+
+/// 멈춘 동안 Task가 시간을 넘겨 버려져도 VM을 다시 돌린다.
+#[tokio::test]
+async fn abandoned_lvm_snapshot_still_resumes_the_vm() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |c| {
+        c.timeout = std::time::Duration::from_millis(500)
+    })
+    .await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert!(env.hv.is_paused(vm));
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while env.hv.is_paused(vm) {
+        assert!(std::time::Instant::now() < deadline, "VM stayed paused");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    storage.resume();
+}
+
+/// QEMU가 스스로 멈춘 VM(I/O 오류 등)은 멈추지도 이어서 실행하지도 않고 디스크만 찍는다.
+#[tokio::test]
+async fn lvm_snapshot_leaves_a_vm_paused_by_qemu_paused() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    // Mock 하이퍼바이저에서는 멈춘 것처럼 보이게 한다.
+    env.hv.pause(vm).await.unwrap();
+
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    succeeded(&task);
+    assert!(env.hv.is_paused(vm));
+    assert_eq!(storage.calls(), [("create", lvs[0])]);
+    assert_eq!(get(&env, vm, "a").status.phase, SnapshotPhase::Ready);
+}
+
+/// QEMU가 스스로 멈춘 VM(`io-error` 등, 실행 중도 일시정지도 아닌 상태)은 멈추지도 이어서 실행하지도
+/// 않고 디스크만 찍는다.
+#[tokio::test]
+async fn lvm_snapshot_of_a_vm_stopped_on_io_error_neither_pauses_nor_resumes_it() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    env.hv
+        .set_status(vm, Some(RuntimeStatus::Other("io-error".into())));
+
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    succeeded(&task);
+    assert_eq!(env.hv.pause_calls(vm), Vec::<&str>::new());
+    assert_eq!(storage.calls(), [("create", lvs[0])]);
+    assert_eq!(get(&env, vm, "a").status.phase, SnapshotPhase::Ready);
+}
+
+/// QMP로 다룰 수 없는 VM은 멈출 수 없으므로 디스크를 건드리기 전에 실패한다.
+#[tokio::test]
+async fn lvm_snapshot_of_an_unresponsive_vm_fails_before_touching_the_disks() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    env.hv.set_unresponsive(vm, true);
+
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(
+        task["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not responding"),
+        "{task}"
+    );
+    assert_eq!(env.hv.pause_calls(vm), Vec::<&str>::new());
+    assert!(storage.calls().is_empty());
+    assert!(find(&env, vm, "a").is_none());
+}
+
+/// 디스크는 찍었는데 VM을 이어서 실행하지 못하면 스냅샷은 그대로 두고 Task만 실패로 끝낸다.
+#[tokio::test]
+async fn lvm_snapshot_taken_but_not_resumed_is_kept() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    // 멈춘 동안 QMP를 잃었다.
+    env.hv.set_unresponsive(vm, true);
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    env.hv.set_unresponsive(vm, false);
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("snapshot taken; resuming the VM failed:"),
+        "{error}"
+    );
+    assert_eq!(storage.calls(), [("create", lvs[0])]);
+    let a = get(&env, vm, "a");
+    assert_eq!(a.status.phase, SnapshotPhase::Ready);
+    assert_eq!(position(&env, vm), Some(a.id));
 }

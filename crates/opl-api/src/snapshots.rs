@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use opl_cluster::Cluster;
+use opl_cluster::{Cluster, ClusterError};
 use opl_types::network::{NetworkSpec, USER_NETWORK};
 use opl_types::resource::{Resource, ResourceSpec};
-use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
-use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec, is_shared};
+use opl_types::storage::{
+    PoolBackend, StoragePool, StoragePoolSpec, VolumePhase, VolumeSpec, is_shared,
+    pool_kind_supports_snapshots,
+};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use serde::Deserialize;
@@ -164,20 +166,65 @@ fn check_no_task(
     Ok(())
 }
 
-/// 모든 디스크가 스냅샷을 담을 수 있고 다 만들어졌는지. dir 백엔드(`Storage::supports_snapshots`)는
-/// qcow2만 담는다. raw가 하나라도 있으면 일부 디스크만 되돌아가므로 거부한다.
-fn check_disks(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+/// 디스크 스냅샷을 LV 스냅샷으로 두는 풀(`lvm-thin`)인지. 아니면 qcow2 내부 스냅샷이다.
+pub(crate) fn uses_lv_snapshots(pool: &StoragePool) -> bool {
+    matches!(pool.spec.backend, PoolBackend::LvmThin { .. })
+}
+
+/// VM의 디스크 중 LV 스냅샷을 쓰는 것([`uses_lv_snapshots`])이 있는지. 없는 볼륨·풀은 넘어간다.
+pub(crate) fn vm_uses_lv_snapshots(cluster: &Cluster, vm: &Vm) -> Result<bool, ClusterError> {
+    for disk in &vm.spec.disks {
+        let Some(volume) = cluster.get_by_name::<VolumeSpec>(&disk.volume)? else {
+            continue;
+        };
+        if let Some(pool) = cluster.get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
+            && uses_lv_snapshots(&pool)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 모든 디스크가 스냅샷을 담을 수 있고 다 만들어졌는지. 풀 종류마다 담는 형식이 다르다
+/// ([`pool_kind_supports_snapshots`]: 파일 풀은 qcow2, LVM-thin 풀은 raw). 담지 못하는 디스크가
+/// 하나라도 있으면 일부 디스크만 되돌아가므로 거부하고, 방식(qcow2 내부 스냅샷, LV 스냅샷)이
+/// 섞여도 거부한다. 디스크가 LV 스냅샷을 쓰면 true.
+fn check_disks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
+    let mut lvm = None;
     for disk in &vm.spec.disks {
         let volume = state
             .cluster
             .get_by_name::<VolumeSpec>(&disk.volume)?
             .ok_or_else(|| ApiError::bad_request(format!("volume {:?} not found", disk.volume)))?;
-        if volume.spec.format != ImageFormat::Qcow2 {
+        let pool = state
+            .cluster
+            .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("storage pool {:?} not found", volume.spec.pool))
+            })?;
+        if !pool_kind_supports_snapshots(&pool.spec.backend, volume.spec.format) {
+            let only = if uses_lv_snapshots(&pool) {
+                "raw"
+            } else {
+                "qcow2"
+            };
             return Err(ApiError::conflict(
                 "snapshot_unsupported",
                 format!(
-                    "VM {:?} has non-qcow2 disk {:?}; only qcow2 disks can be snapshotted",
-                    vm.name, disk.volume
+                    "VM {:?} has disk {:?} that cannot be snapshotted; only {only} disks in \
+                     storage pool {:?} can be snapshotted",
+                    vm.name, disk.volume, pool.name
+                ),
+            ));
+        }
+        let this = uses_lv_snapshots(&pool);
+        if lvm.replace(this).is_some_and(|before| before != this) {
+            return Err(ApiError::conflict(
+                "snapshot_unsupported",
+                format!(
+                    "VM {:?} cannot be snapshotted: disks use different snapshot methods",
+                    vm.name
                 ),
             ));
         }
@@ -188,7 +235,7 @@ fn check_disks(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
             ));
         }
     }
-    Ok(())
+    Ok(lvm == Some(true))
 }
 
 /// VM의 스냅샷 전부
@@ -270,7 +317,8 @@ pub async fn get_snapshot(
 }
 
 /// `pending` 스냅샷을 만들고(부모는 VM의 현재 위치, `vm_spec`은 지금 스펙) 그것을 채울 Task를
-/// 돌려준다(202). 시작·정지 중이면 409 `vm_busy`, qcow2가 아닌 디스크가 있으면 409
+/// 돌려준다(202). 시작·정지 중이면 409 `vm_busy`, 스냅샷을 담지 못하는 디스크가 있거나 디스크의
+/// 스냅샷 방식이 섞였거나 LVM-thin 디스크의 VM에 메모리 스냅샷을 요청하면 409
 /// `snapshot_unsupported`. 실행 중이 아니거나 디스크가 없는 VM의 메모리 스냅샷은 400.
 #[utoipa::path(post, path = "/vms/{key}/snapshots", tag = "snapshots",
     params(("key" = String, Path, description = "VM id or name")),
@@ -305,10 +353,20 @@ pub(crate) async fn start_create(
     scheduled: bool,
 ) -> Result<Task, ApiError> {
     check_not_busy(state, vm)?;
-    check_disks(state, vm)?;
+    let lvm = check_disks(state, vm)?;
     let running = vm.status.phase == VmPhase::Running;
     let has_disk = !vm.spec.disks.is_empty();
-    let memory = memory.unwrap_or(running && has_disk);
+    // LV 스냅샷에는 메모리 상태를 담을 qcow2가 없다.
+    if lvm && memory == Some(true) {
+        return Err(ApiError::conflict(
+            "snapshot_unsupported",
+            format!(
+                "VM {:?} has lvm-thin disks; their snapshots cannot hold the memory state",
+                vm.name
+            ),
+        ));
+    }
+    let memory = memory.unwrap_or(running && has_disk && !lvm);
     if memory && !running {
         return Err(ApiError::bad_request(format!(
             "VM {:?} is not running; only its disks can be snapshotted",

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, Weak};
@@ -38,6 +38,10 @@ const SHUTDOWN_EXIT_WAIT: Duration = Duration::from_secs(1);
 /// Task 한도(600초)보다 짧아야 Task가 먼저 끊기지 않고 이 오류(작업이 남아 있을 수 있음)를 받는다.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(540);
 
+/// opl이 스냅샷을 위해 VM을 멈춰 두었다는 표시 파일. VM 실행 디렉터리에 `pause`가 쓰고 `resume`이
+/// 지운다. opld가 멈춘 채 죽었으면 다시 붙을 때 이 표시를 보고 이어서 실행한다.
+const PAUSED_MARK: &str = "paused-by-opl";
+
 /// VM별 상태 디렉터리 `{state_dir}/vm/{id}`. `state_dir`은 [`QemuConfig::state_dir`]이다.
 pub fn vm_state_dir(state_dir: &Path, id: Uuid) -> PathBuf {
     state_dir.join("vm").join(id.to_string())
@@ -71,6 +75,8 @@ pub struct QemuHypervisor {
     config: QemuConfig,
     vms: Arc<Mutex<HashMap<Uuid, Arc<VmHandle>>>>,
     events: broadcast::Sender<HypervisorEvent>,
+    /// `pause`로 멈추고 아직 `resume`을 부르지 않은 VM. 다시 붙어도 이어서 실행하지 않는다.
+    pausing: Mutex<HashSet<Uuid>>,
 }
 
 struct VmHandle {
@@ -97,6 +103,7 @@ impl QemuHypervisor {
             config,
             vms: Arc::new(Mutex::new(HashMap::new())),
             events: broadcast::channel(64).0,
+            pausing: Mutex::default(),
         };
         for entry in std::fs::read_dir(&vm_run_dir)? {
             let entry = entry?;
@@ -361,16 +368,24 @@ impl QemuHypervisor {
         }
     }
 
-    /// opld가 `-daemonize`와 `cont` 사이에 죽으면 VM이 `-S`(prelaunch) 상태로 남는다. 이어서 실행한다.
-    async fn resume_if_prelaunch(&self, id: Uuid) -> Result<(), DriverError> {
+    /// opld가 `-daemonize`와 `cont` 사이에 죽으면 VM이 `-S`(prelaunch) 상태로 남는다. 스냅샷을 위해
+    /// 멈춘 채([`PAUSED_MARK`]) opld가 죽었거나 이어서 실행하지 못한 VM도 멈춘 채 남는다. 둘 다 이어서
+    /// 실행한다. 지금 `pause`로 멈춰 둔 VM과 QEMU가 스스로 멈춘 VM(표시 없음)은 그대로 둔다.
+    async fn continue_if_left_stopped(&self, id: Uuid) -> Result<(), DriverError> {
         let Some(handle) = self.handle(id) else {
             return Ok(());
         };
+        let mark = handle.paths.dir.join(PAUSED_MARK);
+        let ours = !self.pausing.lock().unwrap().contains(&id) && mark.exists();
         let status = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_status()).await;
-        if flatten(status, "QMP query-status")? == RunState::Prelaunch {
-            tracing::info!(%id, "continuing VM left in prelaunch");
+        let state = flatten(status, "QMP query-status")?;
+        if state == RunState::Prelaunch || (ours && state == RunState::Paused) {
+            tracing::info!(%id, ?state, "continuing VM left stopped");
             let cont = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.cont()).await;
             flatten(cont, "QMP cont")?;
+        }
+        if ours {
+            remove_if_exists(&mark)?;
         }
         Ok(())
     }
@@ -400,6 +415,14 @@ impl QemuHypervisor {
             Ok(Err(QmpError::Disconnected)) => return Ok(None),
             Ok(Err(e)) => return Err(e.into()),
         };
+        // 실행 중인데 지금 멈춰 두지 않았으면 표시는 남은 것이다(이어서 실행했지만 지우지 못했거나
+        // 누가 `cont`함). 그대로 두면 나중에 다른 까닭으로 멈춘 VM을 다시 붙을 때 이어서 실행한다.
+        if status == RuntimeStatus::Running && !self.pausing.lock().unwrap().contains(&id) {
+            let mark = handle.paths.dir.join(PAUSED_MARK);
+            if let Err(e) = remove_if_exists(&mark) {
+                tracing::warn!(%id, error = %e, "cannot remove paused mark");
+            }
+        }
         Ok(Some(ActualState {
             id,
             pid: handle.pid,
@@ -413,7 +436,7 @@ impl Hypervisor for QemuHypervisor {
     async fn start(&self, vm: &VmRuntimeSpec, restore: Option<&str>) -> Result<(), DriverError> {
         // 이미 살아 있는 VM에는 restore를 쓰지 않는다. -S로 남은 VM도 그대로 이어서 실행한다.
         if self.handle(vm.id).is_some() {
-            return self.resume_if_prelaunch(vm.id).await;
+            return self.continue_if_left_stopped(vm.id).await;
         }
         let paths = self.paths(vm.id)?;
         if liveness(&paths.pidfile) != Liveness::Dead {
@@ -423,7 +446,7 @@ impl Hypervisor for QemuHypervisor {
             match tokio::time::timeout(ATTACH_TIMEOUT, self.attach(vm.id, paths, false)).await {
                 Ok(Ok(())) => {
                     tracing::info!(id = %vm.id, "reattached to running VM");
-                    return self.resume_if_prelaunch(vm.id).await;
+                    return self.continue_if_left_stopped(vm.id).await;
                 }
                 Ok(Err(e)) => {
                     tracing::error!(id = %vm.id, error = %e, "could not reattach to running VM")
@@ -584,6 +607,25 @@ impl Hypervisor for QemuHypervisor {
         let node = format!("disk{disk}");
         let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.block_resize(&node, size_bytes)).await;
         flatten(r, "QMP block_resize")
+    }
+
+    /// 멈추기 전에 표시([`PAUSED_MARK`])를 남긴다.
+    async fn pause(&self, id: Uuid) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        self.pausing.lock().unwrap().insert(id);
+        std::fs::write(handle.paths.dir.join(PAUSED_MARK), b"")?;
+        let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.stop()).await;
+        flatten(r, "QMP stop")
+    }
+
+    /// 이어서 실행한 뒤 표시를 지운다. 실패하면 표시가 남아 다시 붙을 때(`start`) 이어서 실행한다.
+    async fn resume(&self, id: Uuid) -> Result<(), DriverError> {
+        self.pausing.lock().unwrap().remove(&id);
+        let handle = self.running_handle(id)?;
+        let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.cont()).await;
+        flatten(r, "QMP cont")?;
+        remove_if_exists(&handle.paths.dir.join(PAUSED_MARK))?;
+        Ok(())
     }
 
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
@@ -1118,6 +1160,42 @@ time.sleep(60)
         );
     }
 
+    /// 스냅샷을 위해 멈춘 채 opld가 죽은 VM은 다시 붙을 때 이어서 실행하고 표시를 지운다.
+    #[tokio::test]
+    async fn start_continues_vm_left_paused_for_snapshots() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        std::fs::write(dir.join(PAUSED_MARK), b"").unwrap();
+        let fake = fake_qmp(&dir, "paused").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+
+        hv.start(&vm, None).await.unwrap();
+        assert!(
+            fake.commands.lock().unwrap().contains(&"cont".to_string()),
+            "commands: {:?}",
+            fake.commands.lock().unwrap()
+        );
+        assert!(!dir.join(PAUSED_MARK).exists());
+    }
+
+    /// 표시 없이 멈춘 VM(QEMU가 스스로 멈춤)은 그대로 둔다.
+    #[tokio::test]
+    async fn start_leaves_vm_paused_by_qemu() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "paused").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+
+        hv.start(&vm, None).await.unwrap();
+        assert!(!fake.commands.lock().unwrap().contains(&"cont".to_string()));
+    }
+
     #[test]
     fn disk_nodes_are_format_nodes_in_disk_order() {
         let nodes = serde_json::json!([
@@ -1157,6 +1235,59 @@ time.sleep(60)
         );
     }
 
+    /// 실행 중인데 지금 멈춰 두지 않은 VM의 표시는 남은 것이다(이어서 실행했지만 지우지 못함, 누가
+    /// `cont`함). 상태를 보면 지운다. 그대로 두면 나중에 다른 까닭으로 멈춘 VM을 이어서 실행한다.
+    #[tokio::test]
+    async fn running_vm_drops_a_left_over_paused_mark() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let _fake = fake_qmp(&dir, "running").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let mark = dir.join(PAUSED_MARK);
+
+        // 멈춰 두는 동안에는 지우지 않는다(가짜 QMP는 늘 running이라고 답한다).
+        hv.pause(vm.id).await.unwrap();
+        hv.inspect(vm.id).await.unwrap().unwrap();
+        assert!(mark.exists());
+        hv.pausing.lock().unwrap().clear();
+        let state = hv.inspect(vm.id).await.unwrap().unwrap();
+        assert_eq!(state.status, RuntimeStatus::Running);
+        assert!(!mark.exists());
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_send_stop_and_cont() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "running").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+
+        let mark = dir.join(PAUSED_MARK);
+        hv.pause(vm.id).await.unwrap();
+        assert!(mark.exists());
+        // 멈춰 둔 동안 reconciler가 다시 붙어도(start) 이어서 실행하지 않는다.
+        hv.start(&vm, None).await.unwrap();
+        assert!(mark.exists());
+        hv.resume(vm.id).await.unwrap();
+        assert!(!mark.exists());
+        let commands = fake.commands.lock().unwrap().clone();
+        let sent: Vec<&str> = commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| ["stop", "cont"].contains(c))
+            .collect();
+        assert_eq!(sent, ["stop", "cont"]);
+
+        let err = hv.pause(Uuid::now_v7()).await.unwrap_err();
+        assert!(matches!(err, DriverError::NotRunning(_)), "{err:?}");
+    }
+
     #[tokio::test]
     async fn snapshot_ops_on_vm_that_is_not_attached() {
         let tmp = short_tempdir();
@@ -1177,6 +1308,8 @@ time.sleep(60)
             hv.snapshot_save(vm.id, "s", true).await.unwrap_err(),
             hv.snapshot_delete(vm.id, "s").await.unwrap_err(),
             hv.block_resize(vm.id, 0, 1 << 30).await.unwrap_err(),
+            hv.pause(vm.id).await.unwrap_err(),
+            hv.resume(vm.id).await.unwrap_err(),
         ] {
             assert!(matches!(err, DriverError::NotAttached(_)), "{err:?}");
             assert!(err.is_transient());

@@ -316,6 +316,93 @@ async fn disks_must_be_qcow2_and_memory_needs_a_disk() {
     assert!(!snapshot_of(&env, bare, "a").await.spec.memory);
 }
 
+/// LVM-thin 풀 `thin`과 그 풀의 바로 Ready인 볼륨 `name`(형식 `format`)을 저장소에 직접 만든다.
+async fn lvm_volume(env: &Env, name: &str, format: ImageFormat) {
+    if env
+        .cluster
+        .get_by_name::<StoragePoolSpec>("thin")
+        .unwrap()
+        .is_none()
+    {
+        let pool = Resource::new(
+            "thin",
+            StoragePoolSpec {
+                backend: opl_types::storage::PoolBackend::LvmThin {
+                    vg: "vg0".into(),
+                    thinpool: "tp".into(),
+                },
+                nodes: vec![],
+                shared: false,
+            },
+        );
+        env.cluster.create(&pool).await.unwrap();
+        env.pool_ready("thin").await;
+    }
+    let mut volume = Resource::new(
+        name,
+        VolumeSpec {
+            pool: "thin".into(),
+            size_bytes: MIB,
+            format,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    volume.status.phase = VolumePhase::Ready;
+    env.cluster
+        .update_status::<VolumeSpec>(volume.id, &volume.status)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn lvm_disks_take_disk_snapshots_of_one_method() {
+    let env = env().await;
+    let admin = env.admin().await;
+    pool(&env, vec![]).await;
+    volume(&env, "root", ImageFormat::Qcow2).await;
+    lvm_volume(&env, "lv0", ImageFormat::Raw).await;
+    lvm_volume(&env, "lv1", ImageFormat::Raw).await;
+    lvm_volume(&env, "lv2", ImageFormat::Raw).await;
+
+    // 실행 중이어도 기본은 디스크만이다. 메모리는 담을 곳이 없다.
+    let web = vm_with_disks(&admin, "web", &["lv0", "lv1"]).await;
+    set_vm_status(&env, web, VmPhase::Running, Some(env.node)).await;
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "m", "memory": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "snapshot_unsupported");
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(!snapshot_of(&env, web, "a").await.spec.memory);
+
+    // qcow2 내부 스냅샷과 LV 스냅샷은 섞지 않는다.
+    vm_with_disks(&admin, "mixed", &["root", "lv2"]).await;
+    let (status, body) = admin
+        .post("/vms/mixed/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "snapshot_unsupported");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("different snapshot methods"),
+        "{body}"
+    );
+
+    // LVM-thin 풀의 qcow2 볼륨(API로는 만들 수 없다)은 스냅샷을 담지 못한다.
+    lvm_volume(&env, "odd", ImageFormat::Qcow2).await;
+    vm_with_disks(&admin, "odd", &["odd"]).await;
+    let (status, body) = admin
+        .post("/vms/odd/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "snapshot_unsupported");
+}
+
 #[tokio::test]
 async fn revert_and_delete_need_a_ready_snapshot() {
     let env = env().await;

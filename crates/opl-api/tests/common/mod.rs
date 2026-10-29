@@ -20,7 +20,9 @@ use opl_types::auth::{Role, UserSpec};
 use opl_types::node::{NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{SourceFormat, StoragePool, StoragePoolSpec};
+use opl_types::storage::{
+    SourceFormat, StoragePool, StoragePoolSpec, pool_kind_supports_snapshots,
+};
 use opl_types::vm::Arch;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -447,6 +449,10 @@ pub struct FakeStorage {
     release: tokio::sync::Notify,
     /// 남은 횟수만큼 `delete_volume`이 `PoolNotMounted`로 실패한다(풀이 아직 마운트되지 않음).
     unmounted_deletes: std::sync::Mutex<usize>,
+    /// 이 볼륨의 `snapshot_create`는 실패한다.
+    failing_creates: std::sync::Mutex<Vec<Uuid>>,
+    /// `copy_volume`으로 만든 볼륨과 그 형식
+    copy_formats: std::sync::Mutex<Vec<(Uuid, ImageFormat)>>,
 }
 
 impl FakeStorage {
@@ -462,6 +468,16 @@ impl FakeStorage {
     /// 다음 `n`번의 `delete_volume`이 `PoolNotMounted`로 실패한다.
     pub fn fail_deletes_unmounted(&self, n: usize) {
         *self.unmounted_deletes.lock().unwrap() = n;
+    }
+
+    /// 볼륨 `id`의 `snapshot_create`가 (호출을 기록한 뒤) 실패한다.
+    pub fn fail_snapshot_create(&self, id: Uuid) {
+        self.failing_creates.lock().unwrap().push(id);
+    }
+
+    /// `copy_volume`으로 만든 볼륨과 그 형식
+    pub fn copy_formats(&self) -> Vec<(Uuid, ImageFormat)> {
+        self.copy_formats.lock().unwrap().clone()
     }
 
     pub fn pause(&self) {
@@ -555,8 +571,8 @@ impl Storage for FakeStorage {
     ) -> Result<(), DriverError> {
         Ok(())
     }
-    fn supports_snapshots(&self, _: &StoragePool, format: ImageFormat) -> bool {
-        format == ImageFormat::Qcow2
+    fn supports_snapshots(&self, pool: &StoragePool, format: ImageFormat) -> bool {
+        pool_kind_supports_snapshots(&pool.spec.backend, format)
     }
     async fn snapshot_create(
         &self,
@@ -566,6 +582,9 @@ impl Storage for FakeStorage {
         _: &str,
     ) -> Result<(), DriverError> {
         self.record("create", id).await;
+        if self.failing_creates.lock().unwrap().contains(&id) {
+            return Err(DriverError::Lvm("injected".into()));
+        }
         Ok(())
     }
     async fn snapshot_revert(
@@ -634,8 +653,10 @@ impl Storage for FakeStorage {
         _: bool,
         _: &StoragePool,
         dst_id: Uuid,
+        dst_format: ImageFormat,
     ) -> Result<(), DriverError> {
         self.record("copy", dst_id).await;
+        self.copy_formats.lock().unwrap().push((dst_id, dst_format));
         let size = self.sizes.lock().unwrap().get(&src_id).copied();
         self.set_size(dst_id, size.ok_or(DriverError::VolumeNotFound(src_id))?);
         Ok(())

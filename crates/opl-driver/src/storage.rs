@@ -186,9 +186,9 @@ pub trait Storage: Send + Sync {
         tag: Option<&str>,
     ) -> Result<(), DriverError>;
 
-    /// 볼륨을 같은 형식의 새 볼륨 `dst_id`로 복사한다. `tag`가 있으면 그 스냅샷 때의 내용을,
-    /// 없으면 지금 내용을 복사한다. `force_share`는 실행 중인 VM이 쥔 볼륨의 스냅샷을 읽을 때만
-    /// 쓴다(스냅샷 데이터는 바뀌지 않는다). 대상이 이미 있으면 `VolumeExists`.
+    /// 볼륨(형식 `format`)을 형식 `dst_format`의 새 볼륨 `dst_id`로 복사한다. `tag`가 있으면 그
+    /// 스냅샷 때의 내용을, 없으면 지금 내용을 복사한다. `force_share`는 실행 중인 VM이 쥔 볼륨의
+    /// 스냅샷을 읽을 때만 쓴다(스냅샷 데이터는 바뀌지 않는다). 대상이 이미 있으면 `VolumeExists`.
     /// 실패하면 만들다 만 파일을 남기지 않는다.
     #[allow(clippy::too_many_arguments)]
     async fn copy_volume(
@@ -200,6 +200,7 @@ pub trait Storage: Send + Sync {
         force_share: bool,
         dst_pool: &StoragePool,
         dst_id: Uuid,
+        dst_format: ImageFormat,
     ) -> Result<(), DriverError>;
 }
 
@@ -907,13 +908,14 @@ impl Storage for DirStorage {
         force_share: bool,
         dst_pool: &StoragePool,
         dst_id: Uuid,
+        dst_format: ImageFormat,
     ) -> Result<(), DriverError> {
         let src = self.volume_source(src_pool, src_id, format, tag).await?;
-        let dst = self.file_path(dst_pool, dst_id, format)?;
+        let dst = self.file_path(dst_pool, dst_id, dst_format)?;
         if self.exists(dst_pool, &dst).await? {
             return Err(DriverError::VolumeExists(dst_id));
         }
-        let from = convert_from(&src, force_share, format)?;
+        let from = convert_from(&src, force_share, dst_format)?;
         let mut before = vec!["convert", "-q"];
         before.extend(from.iter().map(String::as_str));
         self.write_new(dst_pool, dst_id, &dst, &before, &[]).await
@@ -1192,13 +1194,13 @@ mod tests {
         std::fs::write(volume_path(&local, id, f), b"x").unwrap();
         not_mounted(
             storage
-                .copy_volume(&local, id, f, None, false, &p, id)
+                .copy_volume(&local, id, f, None, false, &p, id, f)
                 .await
                 .unwrap_err(),
         );
         not_mounted(
             storage
-                .copy_volume(&p, id, f, None, false, &local, id)
+                .copy_volume(&p, id, f, None, false, &local, id, f)
                 .await
                 .unwrap_err(),
         );
@@ -1623,7 +1625,16 @@ mod tests {
         ));
 
         storage
-            .copy_volume(&src_pool, src, qcow2, Some("a,b"), true, &dst_pool, dst)
+            .copy_volume(
+                &src_pool,
+                src,
+                qcow2,
+                Some("a,b"),
+                true,
+                &dst_pool,
+                dst,
+                qcow2,
+            )
             .await
             .unwrap();
         let dst_path = volume_path(&dst_pool, dst, qcow2);
@@ -1650,7 +1661,7 @@ mod tests {
         // 태그 없이, 잠금을 지키며 지금 내용을 복사한다.
         let dst2 = Uuid::now_v7();
         storage
-            .copy_volume(&src_pool, src, qcow2, None, false, &dst_pool, dst2)
+            .copy_volume(&src_pool, src, qcow2, None, false, &dst_pool, dst2, qcow2)
             .await
             .unwrap();
         let got = std::fs::read_to_string(&args).unwrap();
@@ -1667,6 +1678,32 @@ mod tests {
                 src_path.to_str().unwrap()
             ]
         );
+
+        // 대상 형식이 다르면 그 형식으로 바꿔 쓴다.
+        let dst3 = Uuid::now_v7();
+        let raw = ImageFormat::Raw;
+        storage
+            .copy_volume(&src_pool, src, qcow2, None, false, &dst_pool, dst3, raw)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(volume_path(&dst_pool, dst3, raw)).unwrap(),
+            b"copy\n"
+        );
+        let got = std::fs::read_to_string(&args).unwrap();
+        let got: Vec<&str> = got.lines().collect();
+        assert_eq!(
+            got[..got.len() - 1],
+            [
+                "convert",
+                "-q",
+                "-f",
+                "qcow2",
+                "-O",
+                "raw",
+                src_path.to_str().unwrap()
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1680,7 +1717,7 @@ mod tests {
         let raw = ImageFormat::Raw;
 
         let res = storage
-            .copy_volume(&p, src, raw, None, false, &p, dst)
+            .copy_volume(&p, src, raw, None, false, &p, dst, raw)
             .await;
         assert!(
             matches!(res, Err(DriverError::VolumeNotFound(id)) if id == src),
@@ -1690,14 +1727,14 @@ mod tests {
         std::fs::write(volume_path(&p, src, raw), b"").unwrap();
         // raw 볼륨에는 스냅샷이 없다.
         let res = storage
-            .copy_volume(&p, src, raw, Some("t"), false, &p, dst)
+            .copy_volume(&p, src, raw, Some("t"), false, &p, dst, raw)
             .await;
         assert!(matches!(res, Err(DriverError::InvalidSpec(_))), "{res:?}");
 
         let dst_path = volume_path(&p, dst, raw);
         std::fs::write(&dst_path, b"precious").unwrap();
         let res = storage
-            .copy_volume(&p, src, raw, None, false, &p, dst)
+            .copy_volume(&p, src, raw, None, false, &p, dst, raw)
             .await;
         assert!(
             matches!(res, Err(DriverError::VolumeExists(id)) if id == dst),
@@ -1707,7 +1744,7 @@ mod tests {
 
         let rel = pool("pools/local");
         let res = storage
-            .copy_volume(&p, src, raw, None, false, &rel, dst)
+            .copy_volume(&p, src, raw, None, false, &rel, dst, raw)
             .await;
         assert!(matches!(res, Err(DriverError::InvalidSpec(_))), "{res:?}");
     }
@@ -1726,7 +1763,16 @@ mod tests {
         ));
 
         let err = storage
-            .copy_volume(&p, src, ImageFormat::Raw, None, false, &p, Uuid::now_v7())
+            .copy_volume(
+                &p,
+                src,
+                ImageFormat::Raw,
+                None,
+                false,
+                &p,
+                Uuid::now_v7(),
+                ImageFormat::Raw,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");

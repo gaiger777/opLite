@@ -888,7 +888,7 @@ impl Storage for LvmThinStorage {
         }
     }
 
-    /// 원본의 지금 크기로 대상 볼륨 LV를 만들고 원본(스냅샷이면 그 LV)을 써 넣는다.
+    /// 원본(스냅샷이면 그 LV)의 크기로 대상 볼륨 LV를 만들고 원본을 써 넣는다.
     async fn copy_volume(
         &self,
         src_pool: &StoragePool,
@@ -898,15 +898,16 @@ impl Storage for LvmThinStorage {
         force_share: bool,
         dst_pool: &StoragePool,
         dst_id: Uuid,
+        dst_format: ImageFormat,
     ) -> Result<(), DriverError> {
-        let (src_vg, _) = Self::target(src_pool, format)?;
-        let (vg, thinpool) = Self::target(dst_pool, format)?;
-        let size = self.existing(src_vg, src_id).await?.size_bytes;
+        let (vg, thinpool) = Self::target(dst_pool, dst_format)?;
         let source = self.volume_source(src_pool, src_id, format, tag).await?;
         let guard = self.source_guard(src_pool, src_id, format, tag)?;
         let copied = async {
-            let dst = self.create_lv(vg, thinpool, dst_id, size).await?;
-            let from = convert_from(&source, force_share, format)?;
+            let dst = self
+                .create_lv(vg, thinpool, dst_id, source.size_bytes)
+                .await?;
+            let from = convert_from(&source, force_share, dst_format)?;
             self.fill(vg, dst_id, &dst, &from).await
         };
         let copied = copied.await;
@@ -1648,7 +1649,7 @@ mod tests {
         assert_eq!(lvm.taken(), Vec::<String>::new());
     }
 
-    /// 같은 VG 안 복사: 원본 크기로 LV를 만들고 원본(스냅샷 LV)을 써 넣는다.
+    /// 같은 VG 안 복사: 원본(스냅샷 LV)의 크기로 LV를 만들고 원본을 써 넣는다.
     #[tokio::test]
     async fn copies_into_a_new_lv() {
         let tools = tempfile::tempdir().unwrap();
@@ -1657,10 +1658,12 @@ mod tests {
         let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
         storage.create_volume(&p, src, 1 << 20, RAW).await.unwrap();
         storage.snapshot_create(&p, src, RAW, "t").await.unwrap();
+        // 스냅샷 뒤에 늘렸어도 스냅샷 때의 크기로 만든다.
+        storage.resize_volume(&p, src, RAW, 2 << 20).await.unwrap();
         lvm.taken();
 
         storage
-            .copy_volume(&p, src, RAW, Some("t"), true, &p, dst)
+            .copy_volume(&p, src, RAW, Some("t"), true, &p, dst, RAW)
             .await
             .unwrap();
         let snap = format!("opl-{src}-s-t");
@@ -1693,7 +1696,7 @@ mod tests {
         );
         // 대상이 이미 있으면 덮어쓰지 않는다. 원본은 내놓는다.
         let err = storage
-            .copy_volume(&p, src, RAW, Some("t"), true, &p, dst)
+            .copy_volume(&p, src, RAW, Some("t"), true, &p, dst, RAW)
             .await
             .unwrap_err();
         assert!(
@@ -1713,7 +1716,7 @@ mod tests {
         storage.create_volume(&p, src, 1 << 20, RAW).await.unwrap();
         lvm.taken();
         storage
-            .copy_volume(&p, src, RAW, None, false, &p, dst)
+            .copy_volume(&p, src, RAW, None, false, &p, dst, RAW)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1873,7 +1876,7 @@ mod tests {
         storage.snapshot_create(&p, src, RAW, "t").await.unwrap();
         let snap = format!("opl-{src}-s-t");
 
-        let copy = storage.copy_volume(&p, src, RAW, Some("t"), false, &p, dst);
+        let copy = storage.copy_volume(&p, src, RAW, Some("t"), false, &p, dst, RAW);
         let res = tokio::time::timeout(Duration::from_millis(300), copy).await;
         assert!(res.is_err(), "copy should still be running");
         for _ in 0..200 {

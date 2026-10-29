@@ -85,6 +85,14 @@ pub trait Hypervisor: Send + Sync {
     async fn block_resize(&self, id: Uuid, disk: usize, size_bytes: u64)
     -> Result<(), DriverError>;
 
+    /// 실행 중인 VM을 멈춘다(QMP `stop`). 돌아오면 게스트의 블록 I/O가 끝나 있으므로 디스크를
+    /// 바깥에서 찍을 수 있다. 반드시 `resume`으로 이어서 실행한다. 그러지 못한 채 opld가 끝나면
+    /// 다음에 다시 붙을 때(`start`) 이어서 실행한다.
+    async fn pause(&self, id: Uuid) -> Result<(), DriverError>;
+
+    /// `pause`로 멈춘 VM을 이어서 실행한다(QMP `cont`). 실행 중이어도 성공한다.
+    async fn resume(&self, id: Uuid) -> Result<(), DriverError>;
+
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;
 }

@@ -385,6 +385,7 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
                 force_share,
                 &dst_pool,
                 dst,
+                qcow2,
             )
             .await
             .unwrap();
@@ -405,7 +406,7 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
     // 태그가 없으면 지금 내용
     let now = Uuid::now_v7();
     storage
-        .copy_volume(&src_pool, src, qcow2, None, false, &dst_pool, now)
+        .copy_volume(&src_pool, src, qcow2, None, false, &dst_pool, now, qcow2)
         .await
         .unwrap();
     assert!(qemu_io(
@@ -414,7 +415,7 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
     ));
     // 대상이 있으면 덮어쓰지 않는다.
     let err = storage
-        .copy_volume(&src_pool, src, qcow2, None, false, &dst_pool, now)
+        .copy_volume(&src_pool, src, qcow2, None, false, &dst_pool, now, qcow2)
         .await
         .unwrap_err();
     assert!(matches!(err, DriverError::VolumeExists(_)), "{err:?}");
@@ -430,6 +431,7 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
             false,
             &dst_pool,
             missing,
+            qcow2,
         )
         .await
         .unwrap_err();
@@ -447,7 +449,9 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
     assert!(qemu_io_fmt(&src_raw_path, raw, "write -P 0x5a 0 64k"));
     let dst_raw = Uuid::now_v7();
     storage
-        .copy_volume(&src_pool, src_raw, raw, None, false, &dst_pool, dst_raw)
+        .copy_volume(
+            &src_pool, src_raw, raw, None, false, &dst_pool, dst_raw, raw,
+        )
         .await
         .unwrap();
     let dst_raw_path = volume_path(&dst_pool, dst_raw, raw);
@@ -605,6 +609,7 @@ impl Storage for InDir {
         _: bool,
         _: &StoragePool,
         _: Uuid,
+        _: ImageFormat,
     ) -> Result<(), DriverError> {
         unreachable!("copies between backends go through Storages")
     }
@@ -654,7 +659,16 @@ async fn storages_copy_between_backends() {
     // 스냅샷 때의 내용을 다른 백엔드로
     let dst = Uuid::now_v7();
     storages
-        .copy_volume(&src_pool, src, qcow2, Some("s1"), true, &other_pool, dst)
+        .copy_volume(
+            &src_pool,
+            src,
+            qcow2,
+            Some("s1"),
+            true,
+            &other_pool,
+            dst,
+            qcow2,
+        )
         .await
         .unwrap();
     assert!(qemu_io(&other_path(dst, qcow2), "read -P 0xab 0 64k"));
@@ -664,7 +678,7 @@ async fn storages_copy_between_backends() {
     // 다시 돌아오는 방향, 지금 내용
     let back = Uuid::now_v7();
     storages
-        .copy_volume(&other_pool, dst, qcow2, None, false, &src_pool, back)
+        .copy_volume(&other_pool, dst, qcow2, None, false, &src_pool, back, qcow2)
         .await
         .unwrap();
     assert!(qemu_io(
@@ -683,6 +697,7 @@ async fn storages_copy_between_backends() {
             false,
             &other_pool,
             missing,
+            qcow2,
         )
         .await
         .unwrap_err();
@@ -692,7 +707,7 @@ async fn storages_copy_between_backends() {
     // 같은 백엔드 사이(디렉터리 풀끼리)는 파일 저장소의 복사다.
     let same = Uuid::now_v7();
     storages
-        .copy_volume(&src_pool, src, qcow2, None, false, &src_pool, same)
+        .copy_volume(&src_pool, src, qcow2, None, false, &src_pool, same, qcow2)
         .await
         .unwrap();
     assert!(qemu_io(

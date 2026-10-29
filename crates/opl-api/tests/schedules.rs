@@ -162,10 +162,9 @@ async fn refused_requests_and_failed_tasks_are_recorded_until_a_success() {
 
     // raw 디스크는 요청이 거절된다. 스냅샷은 생기지 않는다.
     until("raw refusal", || {
-        get_vm(&env, raw)
-            .status
-            .schedule_error
-            .is_some_and(|e| e.code == "snapshot_unsupported" && e.message.contains("non-qcow2"))
+        get_vm(&env, raw).status.schedule_error.is_some_and(|e| {
+            e.code == "snapshot_unsupported" && e.message.contains("cannot be snapshotted")
+        })
     })
     .await;
     assert!(snapshots(&env, raw).is_empty());

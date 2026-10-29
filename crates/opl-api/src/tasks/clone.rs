@@ -8,6 +8,7 @@ use opl_cluster::ClusterError;
 use opl_driver::uefi_vars_path;
 use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
+use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::SnapshotPhase;
 use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumeSpec, pool_error_on, pool_listed_on, pool_usable_on,
@@ -20,6 +21,7 @@ use super::snapshot::{
     check_local, check_settled, copy_file, get_snapshot, get_vm, is_down, ready_disks, vars_copy,
 };
 use super::{Ctx, mark_ready, remove_volume};
+use crate::snapshots::uses_lv_snapshots;
 
 /// 리소스 이름의 최대 길이
 const MAX_NAME: usize = 63;
@@ -58,6 +60,16 @@ fn volume_name(vm: &str, volume: &str, taken: impl Fn(&str) -> bool) -> String {
         })
         .find(|name| !taken(name))
         .expect("some suffix is free")
+}
+
+/// 복사본의 형식(설계 §5): LVM-thin 풀은 raw만 담는다. LVM-thin 볼륨(raw)을 파일 풀로 옮기면
+/// 그 풀에서 스냅샷을 담을 수 있는 qcow2로 바꾼다. 그 밖에는 원본 형식 그대로다.
+fn copy_format(source: &StoragePool, target: &StoragePool, format: ImageFormat) -> ImageFormat {
+    match (uses_lv_snapshots(source), uses_lv_snapshots(target)) {
+        (_, true) => ImageFormat::Raw,
+        (true, false) => ImageFormat::Qcow2,
+        (false, false) => format,
+    }
 }
 
 fn pool_by_name(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
@@ -141,12 +153,13 @@ pub(super) async fn clone(
     for ((source, source_pool), target) in disks.iter().zip(&targets) {
         let copy_name = volume_name(name, &source.name, |n| taken.contains(n));
         taken.insert(copy_name.clone());
+        let format = copy_format(source_pool, target, source.spec.format);
         let mut copy: Volume = Resource::new(
             copy_name,
             VolumeSpec {
                 pool: target.name.clone(),
                 size_bytes: source.spec.size_bytes,
-                format: source.spec.format,
+                format,
             },
         );
         copy.status.node = Some(ctx.config.node);
@@ -165,6 +178,7 @@ pub(super) async fn clone(
                 force_share,
                 target,
                 copy.id,
+                format,
             )
             .await
             .map_err(|e| format!("cannot copy volume {:?}: {e}", source.name))?;
@@ -241,7 +255,39 @@ pub(super) async fn discard(ctx: &Ctx, task: Uuid) {
 
 #[cfg(test)]
 mod tests {
+    use opl_types::storage::PoolBackend;
+
     use super::*;
+
+    fn pool(backend: PoolBackend) -> StoragePool {
+        Resource::new(
+            "p",
+            StoragePoolSpec {
+                backend,
+                nodes: vec![],
+                shared: false,
+            },
+        )
+    }
+
+    #[test]
+    fn copies_take_the_format_the_target_pool_holds() {
+        let dir = pool(PoolBackend::Dir {
+            path: "/pools/local".into(),
+        });
+        let lvm = pool(PoolBackend::LvmThin {
+            vg: "vg0".into(),
+            thinpool: "tp".into(),
+        });
+        let (raw, qcow2) = (ImageFormat::Raw, ImageFormat::Qcow2);
+        assert_eq!(copy_format(&dir, &dir, raw), raw);
+        assert_eq!(copy_format(&dir, &dir, qcow2), qcow2);
+        // LVM-thin 풀은 raw만 담는다.
+        assert_eq!(copy_format(&dir, &lvm, qcow2), raw);
+        assert_eq!(copy_format(&lvm, &lvm, raw), raw);
+        // 파일 풀로 옮긴 LVM 볼륨은 스냅샷을 담을 수 있게 qcow2로 바꾼다.
+        assert_eq!(copy_format(&lvm, &dir, raw), qcow2);
+    }
 
     #[test]
     fn volume_name_joins_cuts_and_numbers() {

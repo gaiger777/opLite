@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::schedule::task_failed;
-use crate::snapshots::vm_placement;
+use crate::snapshots::{uses_lv_snapshots, vm_placement};
 
 /// 새 Task를 저장소에 만든다. 이름은 id 문자열이다.
 pub(crate) async fn create_task(
@@ -681,8 +681,9 @@ async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 }
 
 /// 볼륨 크기를 늘린다(설계 §5). 실행 중인 VM이 쓰면 그 QEMU로(`block_resize`, 게스트가 바로
-/// 본다), 아니면 스토리지로 늘린 뒤 실제 크기를 스펙에 기록한다. API가 확인한 뒤 VM이 켜지거나
-/// 꺼졌을 수 있고 앞의 Task가 크기를 바꿨을 수 있어 여기서 다시 본다.
+/// 본다. LVM-thin 볼륨은 스토리지로 먼저 늘린다), 아니면 스토리지로 늘린 뒤 실제 크기를 스펙에
+/// 기록한다. API가 확인한 뒤 VM이 켜지거나 꺼졌을 수 있고 앞의 Task가 크기를 바꿨을 수 있어 여기서
+/// 다시 본다.
 async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), String> {
     let (volume, pool) = volume_and_pool(ctx, id)?;
     if volume.status.phase != VolumePhase::Ready {
@@ -706,12 +707,20 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
                 vm.name
             ));
         }
-        // 실행 중에는 디스크를 바꿀 수 없으므로 스펙의 순서가 QEMU의 디스크 번호다.
-        Some((vm, disk)) if vm.status.phase == VmPhase::Running => ctx
-            .hv
-            .block_resize(vm.id, disk, size_bytes)
-            .await
-            .map_err(|e| e.to_string())?,
+        // 실행 중에는 디스크를 바꿀 수 없으므로 스펙의 순서가 QEMU의 디스크 번호다. LV는 QEMU가
+        // 늘릴 수 없으므로 저장소로 먼저 늘린 뒤 QEMU에 새 크기를 알린다.
+        Some((vm, disk)) if vm.status.phase == VmPhase::Running => {
+            if uses_lv_snapshots(&pool) {
+                ctx.storage
+                    .resize_volume(&pool, id, volume.spec.format, size_bytes)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            ctx.hv
+                .block_resize(vm.id, disk, size_bytes)
+                .await
+                .map_err(|e| e.to_string())?
+        }
         _ => ctx
             .storage
             .resize_volume(&pool, id, volume.spec.format, size_bytes)

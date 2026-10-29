@@ -184,6 +184,11 @@ impl QmpClient {
         self.execute("cont", None).await.map(drop)
     }
 
+    /// VM 실행을 멈춘다. 돌아오기 전에 진행 중인 블록 I/O를 비운다. `cont`로 이어서 실행한다.
+    pub async fn stop(&self) -> Result<(), QmpError> {
+        self.execute("stop", None).await.map(drop)
+    }
+
     /// 게스트에 ACPI 전원 버튼 이벤트를 보낸다. 게스트가 응답하지 않을 수 있다.
     pub async fn system_powerdown(&self) -> Result<(), QmpError> {
         self.execute("system_powerdown", None).await.map(drop)

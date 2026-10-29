@@ -42,6 +42,12 @@ struct MockState {
     snapshots: HashMap<Uuid, Vec<(String, bool)>>,
     /// `block_resize`로 바꾼 (VM, 디스크 번호)별 크기
     disk_sizes: HashMap<(Uuid, usize), u64>,
+    /// `pause`로 멈추고 아직 `resume`하지 않은 VM
+    paused: HashSet<Uuid>,
+    /// `pause`·`resume` 호출 (VM, 이름)
+    pauses: Vec<(Uuid, &'static str)>,
+    /// 조회에 드러낼 상태(QEMU가 스스로 멈춘 상태 등)
+    statuses: HashMap<Uuid, RuntimeStatus>,
 }
 
 impl Default for MockHypervisor {
@@ -139,6 +145,31 @@ impl MockHypervisor {
             .copied()
     }
 
+    /// `pause`로 멈추고 아직 `resume`하지 않았는지
+    pub fn is_paused(&self, id: Uuid) -> bool {
+        self.state.lock().unwrap().paused.contains(&id)
+    }
+
+    /// VM에 부른 `pause`·`resume`(실패한 호출 포함)을 순서대로 돌려준다.
+    pub fn pause_calls(&self, id: Uuid) -> Vec<&'static str> {
+        let st = self.state.lock().unwrap();
+        st.pauses
+            .iter()
+            .filter(|(vm, _)| *vm == id)
+            .map(|(_, call)| *call)
+            .collect()
+    }
+
+    /// 조회(`inspect`·`list`)가 VM의 상태를 `status`로 알리게 한다(`None`이면 되돌린다). QEMU가 스스로
+    /// 멈춘 상태(`io-error` 등)를 흉내 낸다. QMP로 다룰 수 없는 VM은 그대로 `unresponsive`다.
+    pub fn set_status(&self, id: Uuid, status: Option<RuntimeStatus>) {
+        let mut st = self.state.lock().unwrap();
+        match status {
+            Some(status) => st.statuses.insert(id, status),
+            None => st.statuses.remove(&id),
+        };
+    }
+
     /// 실제 드라이버처럼 실행 중인 VM만 다룬다. 살아 있지만 QMP로 다룰 수 없으면 다시 시도할 오류다.
     fn controllable(st: &MockState, id: Uuid) -> Result<(), DriverError> {
         if !st.vms.contains_key(&id) {
@@ -153,6 +184,7 @@ impl MockHypervisor {
     fn remove(&self, id: Uuid, kind: EventKind) {
         let mut st = self.state.lock().unwrap();
         st.unresponsive.remove(&id);
+        st.paused.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -162,6 +194,10 @@ impl MockHypervisor {
     fn state_of(st: &MockState, id: Uuid, pid: u32) -> ActualState {
         let status = if st.unresponsive.contains(&id) {
             RuntimeStatus::Other("unresponsive".into())
+        } else if let Some(status) = st.statuses.get(&id) {
+            status.clone()
+        } else if st.paused.contains(&id) {
+            RuntimeStatus::Paused
         } else {
             RuntimeStatus::Running
         };
@@ -210,6 +246,7 @@ impl Hypervisor for MockHypervisor {
                     StopMode::Acpi => Err(DriverError::Timeout("reattach to running QEMU")),
                     StopMode::Force => {
                         st.unresponsive.remove(&id);
+                        st.paused.remove(&id);
                         st.vms.remove(&id);
                         Ok(())
                     }
@@ -301,6 +338,22 @@ impl Hypervisor for MockHypervisor {
         let mut st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
         st.disk_sizes.insert((id, disk), size_bytes);
+        Ok(())
+    }
+
+    async fn pause(&self, id: Uuid) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.pauses.push((id, "pause"));
+        Self::controllable(&st, id)?;
+        st.paused.insert(id);
+        Ok(())
+    }
+
+    async fn resume(&self, id: Uuid) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.pauses.push((id, "resume"));
+        Self::controllable(&st, id)?;
+        st.paused.remove(&id);
         Ok(())
     }
 
@@ -497,6 +550,8 @@ mod tests {
             hv.snapshot_save(vm.id, "s", true).await,
             hv.snapshot_delete(vm.id, "s").await,
             hv.block_resize(vm.id, 0, 1 << 30).await,
+            hv.pause(vm.id).await,
+            hv.resume(vm.id).await,
         ] {
             assert!(matches!(res, Err(DriverError::NotRunning(_))), "{res:?}");
         }
@@ -511,6 +566,14 @@ mod tests {
         hv.block_resize(vm.id, 1, 2 << 30).await.unwrap();
         assert_eq!(hv.disk_size(vm.id, 1), Some(2 << 30));
         assert_eq!(hv.disk_size(vm.id, 0), None);
+        hv.pause(vm.id).await.unwrap();
+        assert!(hv.is_paused(vm.id));
+        let state = hv.inspect(vm.id).await.unwrap().unwrap();
+        assert_eq!(state.status, RuntimeStatus::Paused);
+        hv.resume(vm.id).await.unwrap();
+        assert!(!hv.is_paused(vm.id));
+        let state = hv.inspect(vm.id).await.unwrap().unwrap();
+        assert_eq!(state.status, RuntimeStatus::Running);
 
         // QMP로 다룰 수 없는 VM은 다시 시도할 수 있는 오류로 끝난다.
         hv.set_unresponsive(vm.id, true);

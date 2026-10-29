@@ -2,11 +2,12 @@
 //! API가 확인한 뒤 Task가 줄 서 기다리는 사이 VM이 바뀌었을 수 있으므로 여기서 다시 확인한다.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
-use opl_driver::{DriverError, uefi_vars_path, vm_state_dir};
+use opl_driver::{DriverError, Hypervisor, RuntimeStatus, uefi_vars_path, vm_state_dir};
 use opl_types::node::NodeSpec;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{
@@ -17,9 +18,78 @@ use opl_types::vm::{PowerState, ScheduleError, Vm, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
 
 use crate::schedule::{recorded_vm, set_schedule_error};
+use crate::snapshots::uses_lv_snapshots;
 use crate::vms::check_node_arch;
 
 use super::{Ctx, set_power, set_volume_size, started, stopped, superseded, wait_vm};
+
+/// 실행 중인 VM을 LV 스냅샷을 위해 멈춰 두는 한도. Task 한도(600초)보다 충분히 짧다.
+const PAUSE_LIMIT: Duration = Duration::from_secs(120);
+
+/// 멈춘 VM을 이어서 실행하는 시도 횟수와 그 간격
+const RESUME_TRIES: u32 = 3;
+const RESUME_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 멈춘 VM을 이어서 실행한다. 일시 오류면 [`RESUME_INTERVAL`] 간격으로 모두 [`RESUME_TRIES`]번
+/// 해 본다. VM이 꺼졌으면 이어서 실행할 것이 없으므로 성공이다.
+async fn resume_vm(hv: &dyn Hypervisor, id: Uuid) -> Result<(), DriverError> {
+    let mut tries = 1;
+    loop {
+        match hv.resume(id).await {
+            Err(DriverError::NotRunning(_)) => return Ok(()),
+            Err(e) if e.is_transient() && tries < RESUME_TRIES => {
+                tracing::warn!(vm = %id, error = %e, "cannot resume VM; retrying");
+                tries += 1;
+                tokio::time::sleep(RESUME_INTERVAL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// 스냅샷을 위해 멈춘 VM. 이어서 실행해 보기 전에 버려지면(Task가 시간을 넘기거나 opld가 끝나
+/// future가 버려짐) 뒤에서 이어서 실행한다. 해 보고도 못 했거나 opld가 멈춘 채 죽으면 하이퍼바이저가
+/// 다시 붙을 때 표시를 보고 이어서 실행한다.
+struct Paused {
+    hv: Arc<dyn Hypervisor>,
+    id: Uuid,
+    /// 이어서 실행하기를 (재시도까지) 해 봤다
+    tried: bool,
+}
+
+impl Paused {
+    fn new(hv: &Arc<dyn Hypervisor>, id: Uuid) -> Self {
+        Self {
+            hv: hv.clone(),
+            id,
+            tried: false,
+        }
+    }
+
+    /// 이어서 실행한다([`resume_vm`]). 끝나면 결과와 상관없이 가드를 끈다.
+    async fn resume(&mut self) -> Result<(), DriverError> {
+        let resumed = resume_vm(&*self.hv, self.id).await;
+        self.tried = true;
+        resumed
+    }
+}
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        if self.tried {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (hv, id) = (self.hv.clone(), self.id);
+        rt.spawn(async move {
+            if let Err(e) = resume_vm(&*hv, id).await {
+                tracing::error!(vm = %id, error = %e, "cannot resume VM paused for lvm snapshots");
+            }
+        });
+    }
+}
 
 pub(super) fn get_snapshot(ctx: &Ctx, id: Uuid) -> Result<Option<Snapshot>, String> {
     ctx.cluster
@@ -103,10 +173,49 @@ pub(super) fn check_local(ctx: &Ctx, volume: &Volume, pool: &StoragePool) -> Res
     }
 }
 
+/// LV 스냅샷을 위해 VM을 멈춰야 하는지: 하이퍼바이저가 실행 중(`Running`)이라고 알리면 그렇다.
+/// 그 밖의 상태(일시정지, QEMU가 I/O 오류 등으로 스스로 멈춤)는 게스트가 디스크에 쓰지 않으므로
+/// 멈추지도 이어서 실행하지도 않는다. QMP로 다룰 수 없거나, 꺼졌거나, 상태를 알 수 없으면 오류다.
+async fn needs_pause(ctx: &Ctx, vm: Uuid) -> Result<bool, String> {
+    match ctx.hv.inspect(vm).await {
+        Ok(Some(s)) => match s.status {
+            RuntimeStatus::Running => Ok(true),
+            RuntimeStatus::Other(s) if s == "unresponsive" => {
+                Err("VM is not responding; it cannot be paused for lvm snapshots".into())
+            }
+            _ => Ok(false),
+        },
+        Ok(None) => Err("VM is no longer running".into()),
+        Err(e) => Err(format!("cannot read VM state: {e}")),
+    }
+}
+
+/// 디스크들이 LV 스냅샷을 쓰는지([`uses_lv_snapshots`]). 방식이 섞였으면 오류다.
+fn lv_snapshots(disks: &[(Volume, StoragePool)]) -> Result<bool, String> {
+    let lvm = disks.iter().filter(|(_, p)| uses_lv_snapshots(p)).count();
+    if lvm != 0 && lvm != disks.len() {
+        return Err("disks use different snapshot methods".into());
+    }
+    Ok(lvm != 0)
+}
+
+/// `spec`의 디스크 중 LV 스냅샷을 쓰는 것이 있는지. 없는 볼륨은 넘어간다.
+fn has_lv_disks(ctx: &Ctx, spec: &VmSpec) -> Result<bool, String> {
+    for disk in &spec.disks {
+        if let Some((_, pool)) = volume_by_name(ctx, &disk.volume)?
+            && uses_lv_snapshots(&pool)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// 디스크의 태그를 지운다. 실행 중이면 QEMU가 디스크를 쥐고 있으므로 하이퍼바이저로, 아니면
-/// `spec`의 디스크마다 스토리지로 지운다. 태그나 볼륨이 없는 디스크는 그냥 넘어가고, 한 디스크가
-/// 실패해도 나머지를 지운 뒤 첫 오류를 돌려준다. 다른 노드에 있는 볼륨은 이 노드에서 파일이 보이지
-/// 않으므로(없는 것으로 보면 태그가 남는다) 오류다.
+/// `spec`의 디스크마다 스토리지로 지운다. LV 스냅샷은 QEMU가 쓰지 않으므로 실행 중이어도 스토리지로
+/// 지운다. 태그나 볼륨이 없는 디스크는 그냥 넘어가고, 한 디스크가 실패해도 나머지를 지운 뒤 첫
+/// 오류를 돌려준다. 다른 노드에 있는 볼륨은 이 노드에서 파일이 보이지 않으므로(없는 것으로 보면
+/// 태그가 남는다) 오류다.
 async fn remove_tags(
     ctx: &Ctx,
     vm: Uuid,
@@ -114,7 +223,7 @@ async fn remove_tags(
     spec: &VmSpec,
     tag: &str,
 ) -> Result<(), String> {
-    if running {
+    if running && !has_lv_disks(ctx, spec)? {
         return ctx
             .hv
             .snapshot_delete(vm, tag)
@@ -185,9 +294,10 @@ fn now_secs() -> u64 {
 }
 
 /// `pending` 스냅샷을 채운다. 실행 중이면 하이퍼바이저로(메모리 포함 또는 디스크만), 정지했으면
-/// 디스크마다 스토리지로 태그를 만들고, UEFI 변수를 복사한 뒤 `ready`로 바꾸고 VM의 현재 위치로
-/// 삼는다. 실패를 확인했으면 만든 태그를 지운다(리소스는 실행기의 정리가 지운다). 응답을 기다리다
-/// 시간이 다 됐으면 작업이 아직 돌 수 있으므로 태그를 두고 실패한다.
+/// 디스크마다 스토리지로 태그를 만든다(LV 스냅샷은 실행 중이면 VM을 잠시 멈추고 스토리지로).
+/// UEFI 변수를 복사한 뒤 `ready`로 바꾸고 VM의 현재 위치로 삼는다. 실패를 확인했으면 만든 태그를
+/// 지운다(리소스는 실행기의 정리가 지운다). 응답을 기다리다 시간이 다 됐으면 작업이 아직 돌 수
+/// 있으므로 태그를 두고 실패한다.
 pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), String> {
     let snapshot = get_snapshot(ctx, id)?.ok_or("snapshot was deleted")?;
     let vm = get_vm(ctx, vm_id)?;
@@ -206,8 +316,12 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
             volume.name, volume.spec.format
         ));
     }
+    let lvm = lv_snapshots(&disks)?;
     if snapshot.spec.memory && disks.is_empty() {
         return Err("VM has no disk to hold the memory state".into());
+    }
+    if snapshot.spec.memory && lvm {
+        return Err("lvm-thin disks cannot hold the memory state".into());
     }
 
     // 부모와 VM 스펙은 실행하는 지금의 것이다. 앞에 줄 선 스냅샷 Task가 현재 위치를 바꿨을 수 있다.
@@ -222,23 +336,55 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     }
 
     let tag = id.to_string();
-    let made = if !running {
-        let mut result = Ok(());
-        for (volume, pool) in &disks {
-            result = ctx
-                .storage
-                .snapshot_create(pool, volume.id, volume.spec.format, &tag)
-                .await;
-            if result.is_err() {
-                break;
+    // 실행 중인 VM의 LV 스냅샷: VM을 멈춰 블록 I/O를 비운 뒤 디스크마다 저장소로 찍고, 찍기가
+    // 실패해도 반드시 이어서 실행한다(설계 §5). 멈춘 구간은 `PAUSE_LIMIT`을 넘기지 않는다. QEMU가
+    // 스스로 멈춘 VM(I/O 오류 등)은 멈추지도 이어서 실행하지도 않는다([`needs_pause`]).
+    let lv_running = running && lvm && !disks.is_empty();
+    let mut paused = None;
+    if lv_running && needs_pause(ctx, vm_id).await? {
+        let mut guard = Paused::new(&ctx.hv, vm_id);
+        if let Err(e) = ctx.hv.pause(vm_id).await {
+            // 응답만 늦었으면 멈췄을 수 있다.
+            if let Err(r) = guard.resume().await {
+                tracing::warn!(vm = %vm_id, error = %r, "cannot resume VM after a failed pause");
             }
+            return Err(format!("cannot pause VM: {e}"));
         }
-        result
+        paused = Some(guard);
+    }
+    let paused_at = Instant::now();
+    let made = if !running || lv_running {
+        let take = async {
+            for (volume, pool) in &disks {
+                ctx.storage
+                    .snapshot_create(pool, volume.id, volume.spec.format, &tag)
+                    .await?;
+            }
+            Ok(())
+        };
+        match paused {
+            Some(_) => tokio::time::timeout(PAUSE_LIMIT, take)
+                .await
+                .unwrap_or(Err(DriverError::Timeout("lvm snapshots of a paused VM"))),
+            None => take.await,
+        }
     } else if disks.is_empty() {
         // 디스크 없는 VM은 설정만 담는다.
         Ok(())
     } else {
         ctx.hv.snapshot_save(vm_id, &tag, spec.memory).await
+    };
+    let resumed = match &mut paused {
+        Some(guard) => {
+            let resumed = guard.resume().await;
+            let paused_ms = paused_at.elapsed().as_millis() as u64;
+            tracing::info!(vm = %vm_id, snapshot = %id, paused_ms, "VM was paused for lvm snapshots");
+            if let Err(e) = &resumed {
+                tracing::error!(vm = %vm_id, error = %e, "cannot resume VM paused for lvm snapshots");
+            }
+            resumed
+        }
+        None => Ok(()),
     };
     let copied = match (&made, ctx.config.state_dir.as_ref()) {
         (Ok(()), Some(dir)) => {
@@ -273,7 +419,10 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         if let Some(copy) = vars_copy(ctx, vm_id, id) {
             let _ = tokio::fs::remove_file(copy).await;
         }
-        return Err(error);
+        return Err(match resumed {
+            Err(e) => format!("{error}; resuming the VM failed: {e}"),
+            Ok(()) => error,
+        });
     }
 
     let status = SnapshotStatus {
@@ -292,7 +441,9 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
             }
         }
     }
-    set_position(ctx, vm_id, |_| Some(id)).await
+    set_position(ctx, vm_id, |_| Some(id)).await?;
+    // 스냅샷은 다 만들었으므로 그대로 두고 Task만 실패로 끝낸다. VM은 다시 붙을 때 이어서 실행한다.
+    resumed.map_err(|e| format!("snapshot taken; resuming the VM failed: {e}"))
 }
 
 /// 예약 스냅샷의 만들기나 예약 정리의 삭제 Task면 그 VM([`recorded_vm`])
@@ -536,4 +687,93 @@ pub(super) async fn delete(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         set_position(ctx, vm_id, |at| if at == Some(id) { parent } else { at }).await?;
     }
     delete_resource(ctx, &snapshot).await
+}
+
+#[cfg(test)]
+mod tests {
+    use opl_driver::mock::MockHypervisor;
+    use opl_types::runtime::VmRuntimeSpec;
+    use opl_types::vm::{CpuModel, CpuSpec, Firmware, MachineType};
+
+    use super::*;
+
+    /// 멈춘 VM을 Mock 하이퍼바이저에 띄운다.
+    async fn paused_vm(hv: &MockHypervisor) -> Uuid {
+        let id = Uuid::now_v7();
+        let vm = VmRuntimeSpec {
+            id,
+            name: "web".into(),
+            cpu: CpuSpec {
+                sockets: 1,
+                cores: 1,
+                model: CpuModel::Host,
+            },
+            memory_mib: 256,
+            firmware: Firmware::Bios,
+            machine: MachineType::Q35,
+            disks: vec![],
+            nics: vec![],
+        };
+        hv.start(&vm, None).await.unwrap();
+        hv.pause(id).await.unwrap();
+        id
+    }
+
+    /// 이어서 실행하지 못하면 1초 간격으로 세 번까지 해 본다.
+    #[tokio::test(start_paused = true)]
+    async fn resume_is_retried() {
+        let hv = Arc::new(MockHypervisor::default());
+        let id = paused_vm(&hv).await;
+        // QMP로 잠시 다룰 수 없다.
+        hv.set_unresponsive(id, true);
+        let later = hv.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            later.set_unresponsive(id, false);
+        });
+        resume_vm(&*hv, id).await.unwrap();
+        assert!(!hv.is_paused(id));
+
+        // 끝내 안 되면 세 번째 오류를 돌려준다.
+        hv.pause(id).await.unwrap();
+        hv.set_unresponsive(id, true);
+        let started = tokio::time::Instant::now();
+        let err = resume_vm(&*hv, id).await.unwrap_err();
+        assert!(matches!(err, DriverError::NotAttached(_)), "{err:?}");
+        assert_eq!(started.elapsed(), RESUME_INTERVAL * (RESUME_TRIES - 1));
+    }
+
+    /// 꺼진 VM은 이어서 실행할 것이 없으므로 성공이다(다시 해 보지 않는다).
+    #[tokio::test(start_paused = true)]
+    async fn resume_of_a_vm_that_is_gone_succeeds() {
+        let hv = Arc::new(MockHypervisor::default());
+        let id = paused_vm(&hv).await;
+        hv.crash(id);
+        let started = tokio::time::Instant::now();
+        resume_vm(&*hv, id).await.unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(hv.pause_calls(id), ["pause", "resume"]);
+    }
+
+    /// 가드는 이어서 실행하기를 한 번(재시도 포함) 해 보면 실패해도 꺼진다. 그 뒤는 표시 파일과
+    /// 다시 붙기가 맡는다.
+    #[tokio::test(start_paused = true)]
+    async fn guard_is_off_after_one_round_of_resume_tries() {
+        let hv = Arc::new(MockHypervisor::default());
+        let id = paused_vm(&hv).await;
+        hv.set_unresponsive(id, true);
+        let shared: Arc<dyn Hypervisor> = hv.clone();
+        let mut guard = Paused::new(&shared, id);
+        guard.resume().await.unwrap_err();
+        drop(guard);
+        hv.set_unresponsive(id, false);
+        tokio::time::sleep(RESUME_INTERVAL * 10).await;
+        let resumes = hv
+            .pause_calls(id)
+            .iter()
+            .filter(|c| **c == "resume")
+            .count();
+        assert_eq!(resumes, RESUME_TRIES as usize);
+        assert!(hv.is_paused(id));
+    }
 }

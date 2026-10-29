@@ -161,6 +161,7 @@ impl Storage for Activations {
         _: bool,
         _: &StoragePool,
         _: Uuid,
+        _: ImageFormat,
     ) -> Result<(), DriverError> {
         unreachable!()
     }

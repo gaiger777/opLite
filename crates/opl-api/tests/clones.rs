@@ -714,3 +714,38 @@ async fn snapshot_delete_waits_for_a_clone_of_the_same_vm() {
     let calls: Vec<&str> = storage.calls().into_iter().map(|(c, _)| c).collect();
     assert_eq!(calls, ["create", "copy", "delete"]);
 }
+
+#[tokio::test]
+async fn clone_between_lvm_and_file_pools_takes_the_target_format() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool(&env, "local", vec![]).await;
+    let thin = Resource::new(
+        "thin",
+        StoragePoolSpec {
+            backend: opl_types::storage::PoolBackend::LvmThin {
+                vg: "vg0".into(),
+                thinpool: "tp".into(),
+            },
+            nodes: vec![],
+            shared: false,
+        },
+    );
+    env.cluster.create(&thin).await.unwrap();
+    env.pool_ready("thin").await;
+    let root = volume(&env, "root").await;
+    let storage = fake_storage(&mut env, &[root]).await;
+    vm_with_disks(&admin, "web", &["root"]).await;
+
+    // qcow2 디스크를 LVM-thin 풀로: raw
+    succeeded(&clone_and_wait(&admin, "web", json!({ "name": "lv", "pool": "thin" })).await);
+    let copy = get_volume(&env, "lv-root").unwrap();
+    assert_eq!(copy.spec.format, ImageFormat::Raw);
+    assert_eq!(storage.copy_formats(), [(copy.id, ImageFormat::Raw)]);
+
+    // 그 LVM 디스크를 파일 풀로: 스냅샷을 담을 수 있는 qcow2
+    succeeded(&clone_and_wait(&admin, "lv", json!({ "name": "back", "pool": "local" })).await);
+    let back = get_volume(&env, "back-lv-root").unwrap();
+    assert_eq!(back.spec.format, ImageFormat::Qcow2);
+    assert_eq!(storage.copy_formats()[1], (back.id, ImageFormat::Qcow2));
+}

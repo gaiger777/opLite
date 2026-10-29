@@ -65,8 +65,8 @@ impl Storages {
         }
     }
 
-    /// 대상 백엔드에 빈 볼륨을 만들고 `src`를 써 넣는다. 쓰다 실패하면 만든 볼륨을 지운다.
-    /// 그사이 취소되면 볼륨이 남는다(호출자가 만든 볼륨으로 적어 두고 정리한다).
+    /// 대상 백엔드에 형식 `format`의 빈 볼륨을 만들고 `src`를 써 넣는다. 쓰다 실패하면 만든
+    /// 볼륨을 지운다. 그사이 취소되면 볼륨이 남는다(호출자가 만든 볼륨으로 적어 두고 정리한다).
     #[allow(clippy::too_many_arguments)]
     async fn write_into(
         &self,
@@ -273,11 +273,21 @@ impl Storage for Storages {
         force_share: bool,
         dst_pool: &StoragePool,
         dst_id: Uuid,
+        dst_format: ImageFormat,
     ) -> Result<(), DriverError> {
         let (src, dst) = (self.backend(src_pool)?, self.backend(dst_pool)?);
         if Kind::of(src_pool) == Kind::of(dst_pool) {
             return dst
-                .copy_volume(src_pool, src_id, format, tag, force_share, dst_pool, dst_id)
+                .copy_volume(
+                    src_pool,
+                    src_id,
+                    format,
+                    tag,
+                    force_share,
+                    dst_pool,
+                    dst_id,
+                    dst_format,
+                )
                 .await;
         }
         let source = src.volume_source(src_pool, src_id, format, tag).await?;
@@ -285,7 +295,15 @@ impl Storage for Storages {
         let guard = Source::new(self.shared(src_pool)?, src_pool, src_id, format, tag);
         let size = source.size_bytes;
         let written = self
-            .write_into(&source, force_share, size, dst, dst_pool, dst_id, format)
+            .write_into(
+                &source,
+                force_share,
+                size,
+                dst,
+                dst_pool,
+                dst_id,
+                dst_format,
+            )
             .await;
         // 복사는 끝났으므로 내놓기가 실패해도 성공이다(활성화된 채 남을 뿐이다).
         guard.release().await;
@@ -564,6 +582,7 @@ mod tests {
             _: bool,
             _: &StoragePool,
             _: Uuid,
+            _: ImageFormat,
         ) -> Result<(), DriverError> {
             self.call("copy_volume")
         }
@@ -655,7 +674,7 @@ mod tests {
             storages.release_source(&p, id, f, None).await.unwrap();
             // 같은 백엔드 사이 복사는 그 저장소가 한다.
             storages
-                .copy_volume(&p, id, f, None, false, &p, Uuid::now_v7())
+                .copy_volume(&p, id, f, None, false, &p, Uuid::now_v7(), f)
                 .await
                 .unwrap();
             let methods = [
@@ -686,7 +705,7 @@ mod tests {
         assert_eq!(taken(&log), ["file.check_import_source"]);
         // dir과 nfs는 같은 백엔드다.
         storages
-            .copy_volume(&dir_pool(), id, f, None, false, &nfs_pool(), id)
+            .copy_volume(&dir_pool(), id, f, None, false, &nfs_pool(), id, f)
             .await
             .unwrap();
         assert_eq!(taken(&log), ["file.copy_volume"]);
@@ -713,7 +732,7 @@ mod tests {
         assert!(!storages.supports_snapshots(&p, f));
         unsupported(
             storages
-                .copy_volume(&dir_pool(), id, f, None, false, &p, id)
+                .copy_volume(&dir_pool(), id, f, None, false, &p, id, f)
                 .await
                 .unwrap_err(),
         );
@@ -731,11 +750,20 @@ mod tests {
         )
         .with_lvm_thin(Arc::new(Recorder::new("lvm", "/dev/vg0".as_ref(), &log)));
         let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
-        let raw = ImageFormat::Raw;
+        let (raw, qcow2) = (ImageFormat::Raw, ImageFormat::Qcow2);
 
-        // 실행 중인 VM의 스냅샷을 읽는다. 태그의 쉼표는 옵션 문자열에서 `,,`로 쓴다.
+        // 실행 중인 VM의 qcow2 스냅샷을 raw로 바꿔 읽는다. 태그의 쉼표는 옵션 문자열에서 `,,`로 쓴다.
         storages
-            .copy_volume(&dir_pool(), src, raw, Some("a,b"), true, &lvm_pool(), dst)
+            .copy_volume(
+                &dir_pool(),
+                src,
+                qcow2,
+                Some("a,b"),
+                true,
+                &lvm_pool(),
+                dst,
+                raw,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -756,7 +784,7 @@ mod tests {
                 "-n",
                 "--target-is-zero",
                 "-f",
-                "raw",
+                "qcow2",
                 "-U",
                 "-l",
                 "snapshot.name=a,,b",
@@ -769,7 +797,7 @@ mod tests {
 
         // 반대 방향, 지금 내용
         storages
-            .copy_volume(&lvm_pool(), src, raw, None, false, &nfs_pool(), dst)
+            .copy_volume(&lvm_pool(), src, raw, None, false, &nfs_pool(), dst, raw)
             .await
             .unwrap();
         assert_eq!(
@@ -814,7 +842,7 @@ mod tests {
         )
         .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)));
         let err = storages
-            .copy_volume(&from, src, raw, None, false, &to, dst)
+            .copy_volume(&from, src, raw, None, false, &to, dst, raw)
             .await
             .unwrap_err();
         match err {
@@ -842,7 +870,7 @@ mod tests {
             Recorder::new("lvm", "/l".as_ref(), &log).failing("create_volume"),
         ));
         storages
-            .copy_volume(&from, src, raw, None, false, &to, dst)
+            .copy_volume(&from, src, raw, None, false, &to, dst, raw)
             .await
             .unwrap_err();
         assert_eq!(
@@ -861,7 +889,7 @@ mod tests {
         )
         .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)));
         storages
-            .copy_volume(&from, src, raw, Some("t"), false, &to, dst)
+            .copy_volume(&from, src, raw, Some("t"), false, &to, dst, raw)
             .await
             .unwrap_err();
         assert_eq!(taken(&log), ["file.volume_source"]);
@@ -875,7 +903,7 @@ mod tests {
             Recorder::new("lvm", "/l".as_ref(), &log).failing("release_source"),
         ));
         storages
-            .copy_volume(&to, src, raw, None, false, &from, dst)
+            .copy_volume(&to, src, raw, None, false, &from, dst, raw)
             .await
             .unwrap();
         assert_eq!(
@@ -903,7 +931,7 @@ mod tests {
         let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
         let (raw, from, to) = (ImageFormat::Raw, dir_pool(), lvm_pool());
         storages
-            .copy_volume(&from, src, raw, Some("t"), false, &to, dst)
+            .copy_volume(&from, src, raw, Some("t"), false, &to, dst, raw)
             .await
             .unwrap();
         assert_eq!(*lvm.created.lock().unwrap(), [2 << 30]);
@@ -924,7 +952,7 @@ mod tests {
         let raw = ImageFormat::Raw;
 
         let (from, to) = (lvm_pool(), dir_pool());
-        let copy = storages.copy_volume(&from, src, raw, Some("t"), false, &to, dst);
+        let copy = storages.copy_volume(&from, src, raw, Some("t"), false, &to, dst, raw);
         let res = tokio::time::timeout(std::time::Duration::from_millis(300), copy).await;
         assert!(res.is_err(), "copy should still be running");
         for _ in 0..200 {
