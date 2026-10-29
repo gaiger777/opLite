@@ -1,14 +1,19 @@
 import type { QueryClient } from "@tanstack/react-query";
 
 import { ApiError, api, call } from "@/api/client";
+import type { components } from "@/api/schema";
 import type { Vm } from "@/api/types";
 import { trackTask, waitForTask } from "@/tasks/tasks";
 import { type DiskRow, gibToBytes, toSpec, type VmFormValues } from "@/vms/form";
 
-/** 새 빈 qcow2 볼륨을 만들고 그 Task가 끝날 때까지 기다린다. `label`은 진행 알림 문구다. */
+/**
+ * 새 빈 볼륨을 `format`(풀 종류의 기본 형식)으로 만들고 그 Task가 끝날 때까지 기다린다. `label`은
+ * 진행 알림 문구다.
+ */
 export async function createVolume(
   queryClient: QueryClient,
   disk: DiskRow,
+  format: components["schemas"]["ImageFormat"],
   label: string,
   signal: AbortSignal,
 ): Promise<void> {
@@ -19,7 +24,7 @@ export async function createVolume(
         spec: {
           pool: disk.pool,
           size_bytes: gibToBytes(disk.sizeGib)!,
-          format: "qcow2",
+          format,
         },
       },
     }),

@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/table";
 import { formatBytes } from "@/lib/format";
 import {
+  lvmNameError,
   nfsExportError,
   nfsOptionsError,
   nfsServerError,
@@ -156,16 +157,20 @@ export function PoolsPage() {
   );
 }
 
+type Kind = StoragePool["spec"]["backend"]["kind"];
+
 function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
   const nodes = useList("node");
   const [name, setName] = useState("");
-  const [kind, setKind] = useState<"dir" | "nfs">("dir");
+  const [kind, setKind] = useState<Kind>("dir");
   const [path, setPath] = useState("");
   const [shared, setShared] = useState(false);
   const [nfsServer, setNfsServer] = useState("");
   const [nfsExport, setNfsExport] = useState("");
   const [nfsOptions, setNfsOptions] = useState("");
+  const [vg, setVg] = useState("");
+  const [thinpool, setThinpool] = useState("");
   const [chosen, setChosen] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -191,6 +196,16 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
         found.options = optionsError;
       }
     }
+    if (kind === "lvm-thin") {
+      const vgError = lvmNameError(vg);
+      if (vgError) {
+        found.vg = vgError;
+      }
+      const thinpoolError = lvmNameError(thinpool);
+      if (thinpoolError) {
+        found.thinpool = thinpoolError;
+      }
+    }
     // 고른 뒤에 목록에서 빠진 노드는 보내지 않는다.
     const known = chosen.filter((id) => nodes.data?.some((n) => n.id === id));
     // 고른 노드가 모두 빠졌으면 빈 목록(모든 노드)으로 보내지 않는다.
@@ -204,16 +219,19 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       return false;
     }
     // NFS 풀의 `shared`는 보내지 않는다(서버가 늘 공유로 둔다). 빈 옵션은 커널 기본값이다.
+    // LVM-thin 풀은 노드 로컬이라 `shared`를 보내지 않는다.
     const sharedDir = kind === "dir" && shared;
     const backend =
       kind === "dir"
         ? { kind, path }
-        : {
-            kind,
-            server: nfsServer,
-            export: nfsExport,
-            ...(nfsOptions !== "" && { options: nfsOptions }),
-          };
+        : kind === "lvm-thin"
+          ? { kind, vg, thinpool }
+          : {
+              kind,
+              server: nfsServer,
+              export: nfsExport,
+              ...(nfsOptions !== "" && { options: nfsOptions }),
+            };
     const spec = { backend, nodes: known, ...(sharedDir && { shared: true }) };
     await call(api.POST("/storage-pools", { body: { name, spec } }));
     toast.success(t("pools.created", { name }));
@@ -238,15 +256,42 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             id="pool-kind"
             className="w-full"
             value={kind}
-            onChange={(e) => setKind(e.target.value as "dir" | "nfs")}
+            onChange={(e) => setKind(e.target.value as Kind)}
             {...a11y}
           >
             <NativeSelectOption value="dir">{t("pools.kinds.dir")}</NativeSelectOption>
             <NativeSelectOption value="nfs">{t("pools.kinds.nfs")}</NativeSelectOption>
+            <NativeSelectOption value="lvm-thin">{t("pools.kinds.lvm-thin")}</NativeSelectOption>
           </NativeSelect>
         )}
       </Field>
-      {kind === "dir" ? (
+      {kind === "lvm-thin" && (
+        <>
+          <Field id="pool-vg" label={t("pools.vg")} error={errors.vg}>
+            {(a11y) => (
+              <Input
+                id="pool-vg"
+                placeholder="vg0"
+                value={vg}
+                onChange={(e) => setVg(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          <Field id="pool-thinpool" label={t("pools.thinpool")} error={errors.thinpool}>
+            {(a11y) => (
+              <Input
+                id="pool-thinpool"
+                placeholder="thinpool"
+                value={thinpool}
+                onChange={(e) => setThinpool(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+        </>
+      )}
+      {kind === "dir" && (
         <>
           <Field
             id="pool-path"
@@ -280,7 +325,8 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             </p>
           </div>
         </>
-      ) : (
+      )}
+      {kind === "nfs" && (
         <>
           <Field
             id="pool-server"

@@ -4,13 +4,13 @@ import { http, HttpResponse } from "msw";
 
 import type { List } from "@/api/live";
 import type { Task } from "@/api/types";
-import { NODE, task, vm, volume } from "@/test/fixtures";
+import { NODE, pool, task, vm, volume } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
 
 it("creates a new volume first, then the VM", async () => {
-  mockLists({ node: [NODE], "storage-pool": [{ id: "p1", name: "local" }] });
+  mockLists({ node: [NODE], "storage-pool": [pool("local")] });
   const bodies: unknown[] = [];
   server.use(
     http.post(apiUrl("/volumes"), async ({ request }) => {
@@ -154,7 +154,7 @@ it("locks the node of a VM that should run even if it has failed", async () => {
 });
 
 it("keeps created volumes when the VM cannot be created, and does not recreate them", async () => {
-  mockLists({ node: [NODE], "storage-pool": [{ id: "p1", name: "local" }] });
+  mockLists({ node: [NODE], "storage-pool": [pool("local")] });
   const volumes: string[] = [];
   let vmPosts = 0;
   server.use(
@@ -181,7 +181,7 @@ it("keeps created volumes when the VM cannot be created, and does not recreate t
   // watch가 만든 볼륨도 알려 준다.
   queryClient.setQueryData(["list", "volume"], {
     revision: 3,
-    items: [{ id: "v1", name: "web-disk0", status: { phase: "ready", attached_to: null } }],
+    items: [volume("web-disk0", "local")],
   });
   expect(await screen.findByRole("alert")).toHaveTextContent(
     /^Volumes web-disk0 were created; .*name is taken/,
@@ -197,7 +197,7 @@ it("keeps created volumes when the VM cannot be created, and does not recreate t
 });
 
 it("stops waiting for the volume and does not create the VM after leaving", async () => {
-  mockLists({ node: [NODE], "storage-pool": [{ id: "p1", name: "local" }] });
+  mockLists({ node: [NODE], "storage-pool": [pool("local")] });
   let posted = false;
   let vmPosted = false;
   server.use(
@@ -350,15 +350,96 @@ it("explains the schedule and warns about raw disks", async () => {
   const user = userEvent.setup();
   const every = await screen.findByLabelText("Take snapshots");
   expect(every).toHaveAccessibleDescription(
-    "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2.",
+    "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2, or all in LVM-thin pools.",
   );
   // 끈 동안은 경고하지 않는다.
   expect(screen.queryByText(/scheduled snapshots will fail/)).not.toBeInTheDocument();
   await user.selectOptions(every, "hourly");
   expect(
-    screen.getByText("web-data is raw, so scheduled snapshots will fail. All disks must be qcow2."),
+    screen.getByText(
+      "web-data is raw, so scheduled snapshots will fail. All disks must be qcow2, or all in LVM-thin pools.",
+    ),
   ).toBeVisible();
   // raw 디스크를 떼면 경고도 사라진다.
   await user.click(screen.getByRole("button", { name: "Remove disk 2" }));
   expect(screen.queryByText(/scheduled snapshots will fail/)).not.toBeInTheDocument();
+});
+
+const fast = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } });
+
+it("does not ask about memory for scheduled snapshots of disks in LVM-thin pools", async () => {
+  const web = vm("web", "stopped", {
+    spec: {
+      ...vm("web", "stopped").spec,
+      disks: [{ volume: "web-root", bus: "virtio-blk", boot_order: 1 }],
+      snapshot_schedule: { every: "daily", keep: 3, memory: true },
+    },
+  });
+  const root = volume("web-root", "fast");
+  root.spec.format = "raw";
+  mockLists({ vm: [web], node: [NODE], volume: [root], "storage-pool": [fast] });
+  const bodies: { spec: { snapshot_schedule: unknown } }[] = [];
+  server.use(
+    http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+      bodies.push((await request.json()) as (typeof bodies)[number]);
+      return HttpResponse.json(web);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  // LV 스냅샷은 메모리를 담지 못하므로 묻지 않는다. 저장한 선택은 그대로 둔다(예약 작업이 이런 VM은
+  // 메모리 없이 찍는다).
+  expect(
+    await screen.findByText(
+      "Disks in LVM-thin pools are saved without memory. A running VM pauses briefly while they are saved.",
+    ),
+  ).toBeVisible();
+  expect(screen.queryByLabelText("Include memory")).not.toBeInTheDocument();
+  expect(screen.queryByText(/scheduled snapshots will fail/)).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  expect(bodies[0]!.spec.snapshot_schedule).toEqual({ every: "daily", keep: 3, memory: true });
+});
+
+it("makes new volumes in LVM-thin pools raw and warns about mixed snapshot methods", async () => {
+  mockLists({
+    node: [NODE],
+    volume: [volume("data", "local")],
+    "storage-pool": [pool("local"), fast],
+  });
+  const bodies: unknown[] = [];
+  server.use(
+    http.post(apiUrl("/volumes"), async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(task("t-vol", "volume-create", "v1"), { status: 202 });
+    }),
+  );
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("button", { name: "New empty volume" }));
+  await user.selectOptions(
+    within(screen.getByRole("group", { name: "Disk 1" })).getByLabelText("Storage pool"),
+    "fast",
+  );
+  await user.click(screen.getByRole("button", { name: "Attach a volume" }));
+  await user.selectOptions(
+    within(screen.getByRole("group", { name: "Disk 2" })).getByLabelText("Volume"),
+    "data",
+  );
+  await user.selectOptions(screen.getByLabelText("Take snapshots"), "hourly");
+  // 새 LVM 디스크(LV 스냅샷)와 qcow2 디스크(내부 스냅샷)는 함께 스냅샷하지 못한다.
+  expect(
+    screen.getByText(
+      "Disks in LVM-thin pools and qcow2 disks are mixed, so scheduled snapshots will fail.",
+    ),
+  ).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Remove disk 2" }));
+  expect(screen.queryByText(/scheduled snapshots will fail/)).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  expect(bodies[0]).toEqual({
+    name: "web-disk0",
+    spec: { pool: "fast", size_bytes: 16 * 1024 ** 3, format: "raw" },
+  });
 });

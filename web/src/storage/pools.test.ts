@@ -1,9 +1,11 @@
 import {
+  lvmNameError,
   nfsServerError,
   nfsExportError,
   nfsOptionsError,
   poolCapacity,
   poolLocation,
+  poolFormats,
   poolNodes,
   poolsUsableOn,
   poolUsableSomewhere,
@@ -13,6 +15,7 @@ import { NODE, pool, poolState } from "@/test/fixtures";
 const GIB = 1024 ** 3;
 const nfs = (server: string) =>
   pool("nas", { backend: { kind: "nfs", server, export: "/srv/vm" }, shared: true });
+const lvm = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } });
 const withPool = (
   id: string,
   name: string,
@@ -34,6 +37,46 @@ it("shows where a pool keeps its files", () => {
   expect(poolLocation(nfs("nas.lan"))).toBe("nas.lan:/srv/vm");
   // IPv6 주소는 mount처럼 대괄호로 감싼다.
   expect(poolLocation(nfs("fd00::5"))).toBe("[fd00::5]:/srv/vm");
+  expect(poolLocation(lvm)).toBe("vg0/tp");
+});
+
+it("checks LVM names like the server", () => {
+  for (const ok of ["vg0", "VG_data", "a+b.c-d", "x".repeat(127), "...", "my_snapshot", "tdata"]) {
+    expect(lvmNameError(ok)).toBeUndefined();
+  }
+  for (const bad of ["", "-vg", "vg 0", "vg/tp", "볼륨", "x".repeat(128)]) {
+    expect(lvmNameError(bad)).toBe("pools.errors.lvmName");
+  }
+  // LVM이 받지 않는 이름: `.`·`..`, `snapshot`·`pvmove`로 시작, 내부 LV의 접미어 포함
+  for (const reserved of [
+    ".",
+    "..",
+    "snapshot1",
+    "pvmove0",
+    "data_tdata",
+    "x_tmeta",
+    "a_cdata",
+    "a_cmeta",
+    "a_corig",
+    "a_mimage_0",
+    "a_mlog",
+    "a_pmspare",
+    "a_rimage",
+    "a_rmeta",
+    "a_vorigin",
+    "a_vdata",
+  ]) {
+    expect(lvmNameError(reserved)).toBe("pools.errors.lvmName");
+  }
+});
+
+it("offers the volume formats a pool holds, the default first", () => {
+  expect(poolFormats(pool("local"))).toEqual(["qcow2", "raw"]);
+  expect(poolFormats(nfs("nas.lan"))).toEqual(["qcow2", "raw"]);
+  // LVM-thin 풀은 raw 볼륨만 둔다(서버가 qcow2를 거절한다).
+  expect(poolFormats(lvm)).toEqual(["raw"]);
+  // 풀을 고르기 전에는 파일 풀처럼 둘 다다.
+  expect(poolFormats(undefined)).toEqual(["qcow2", "raw"]);
 });
 
 it("checks NFS servers like the server", () => {
@@ -133,4 +176,13 @@ it("offers the pools a node can use, like the server's pool_usable_on", () => {
 
   expect(poolUsableSomewhere(nas, [unknown, withPool("n2", "node-b", {}, false)])).toBe(false);
   expect(poolUsableSomewhere(nas, [unknown, withPool("n2", "node-b", {})])).toBe(true);
+
+  // LVM-thin 풀도 NFS 풀처럼 준비됐다고 알린 노드에서만 쓴다.
+  const fast = (state: Parameters<typeof poolState>[1]) => ({
+    ...NODE,
+    status: { ...NODE.status, pools: { fast: poolState("fast", state) } },
+  });
+  expect(poolsUsableOn([lvm], [unknown], "n1")).toEqual([]);
+  expect(poolsUsableOn([lvm], [fast({})], "n1")).toEqual([lvm]);
+  expect(poolsUsableOn([lvm], [fast({ ready: false, error: "x" })], "n1")).toEqual([]);
 });

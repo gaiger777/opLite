@@ -28,7 +28,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatBytes } from "@/lib/format";
-import { poolUsableSomewhere } from "@/storage/pools";
+import { poolFormats, poolUsableSomewhere } from "@/storage/pools";
 import { UploadDialog } from "@/storage/UploadDialog";
 import { volumeNameError } from "@/storage/volumes";
 import { trackTask } from "@/tasks/tasks";
@@ -228,6 +228,12 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
   const [sizeGib, setSizeGib] = useState("16");
   const [format, setFormat] = useState<components["schemas"]["ImageFormat"]>("qcow2");
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // 형식은 풀 종류를 따른다(LVM-thin 풀은 raw만). 풀을 바꾸면 그 풀의 기본 형식으로 돌린다.
+  const formats = poolFormats(usable.find((p) => p.name === pool));
+  const choosePool = (chosen: string) => {
+    setPool(chosen);
+    setFormat(poolFormats(usable.find((p) => p.name === chosen))[0]);
+  };
 
   async function submit() {
     const found: Record<string, string> = {};
@@ -279,7 +285,7 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
             id="volume-pool"
             className="w-full"
             value={pool}
-            onChange={(e) => setPool(e.target.value)}
+            onChange={(e) => choosePool(e.target.value)}
             {...a11y}
           >
             <NativeSelectOption value="">—</NativeSelectOption>
@@ -310,8 +316,11 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
             value={format}
             onChange={(e) => setFormat(e.target.value as typeof format)}
           >
-            <NativeSelectOption value="qcow2">qcow2</NativeSelectOption>
-            <NativeSelectOption value="raw">raw</NativeSelectOption>
+            {formats.map((f) => (
+              <NativeSelectOption key={f} value={f}>
+                {f}
+              </NativeSelectOption>
+            ))}
           </NativeSelect>
         </Field>
       </div>

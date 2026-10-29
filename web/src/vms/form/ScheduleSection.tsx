@@ -1,6 +1,5 @@
 import { useTranslation } from "react-i18next";
 
-import type { Volume } from "@/api/types";
 import { Field } from "@/components/Field";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -8,32 +7,28 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import type { ScheduleRow, VmFormValues } from "@/vms/form";
+import type { SnapshotSupport } from "@/vms/snapshots";
 
 /** 예약 스냅샷 */
 export function ScheduleSection({
   values,
   errors,
   onChange,
-  volumes,
+  support,
 }: {
   values: VmFormValues;
   errors: Record<string, string>;
   onChange: (patch: Partial<VmFormValues>) => void;
-  /** 볼륨 목록. 아직 읽지 못했으면 `undefined`다. */
-  volumes: Volume[] | undefined;
+  /** 디스크의 스냅샷 가능 여부. 볼륨·풀 목록을 아직 읽지 못했으면 `undefined`다. */
+  support: SnapshotSupport | undefined;
 }) {
   const { t } = useTranslation();
   const setSchedule = (patch: Partial<ScheduleRow>) =>
     onChange({ snapshotSchedule: { ...values.snapshotSchedule, ...patch } });
-  // 예약을 켰는데 붙은 볼륨 중 qcow2가 아닌 것이 있으면 예약 스냅샷이 실패한다. 볼륨 목록을 읽어야 안다.
-  // 새로 만드는 디스크는 늘 qcow2다.
-  const rawDisk =
-    values.snapshotSchedule.every !== "off" && volumes
-      ? values.disks
-          .filter((d) => d.kind === "existing")
-          .map((d) => volumes.find((v) => v.name === d.volume))
-          .find((v) => v !== undefined && v.spec.format !== "qcow2")
-      : undefined;
+  // 예약을 켰는데 디스크가 스냅샷을 담지 못하거나 방식이 섞이면 예약 스냅샷이 실패한다.
+  const on = values.snapshotSchedule.every !== "off";
+  // LV 스냅샷은 메모리를 담지 못하므로 묻지 않는다(예약 작업이 메모리 없이 찍는다).
+  const lvm = support?.kind === "ok" && support.lvm;
   return (
     <Card>
       <CardHeader>
@@ -60,13 +55,16 @@ export function ScheduleSection({
             </NativeSelect>
           )}
         </Field>
-        {rawDisk && (
+        {on && support?.kind === "format" && (
           <p className="text-sm text-destructive sm:col-span-2">
-            {t("vmForm.scheduleRaw", { volume: rawDisk.name, format: rawDisk.spec.format })}
+            {t("vmForm.scheduleRaw", { volume: support.disk.volume, format: support.disk.format })}
           </p>
         )}
+        {on && support?.kind === "mixed" && (
+          <p className="text-sm text-destructive sm:col-span-2">{t("vmForm.scheduleMixed")}</p>
+        )}
         {/* 끄면 보관 개수와 메모리는 쓰지 않으므로 묻지 않는다. */}
-        {values.snapshotSchedule.every !== "off" && (
+        {on && (
           <>
             <Field
               id="vm-schedule-keep"
@@ -85,20 +83,26 @@ export function ScheduleSection({
                 />
               )}
             </Field>
-            <div className="flex flex-col gap-1.5 sm:col-span-2">
-              <div className="flex items-center gap-2">
-                <Checkbox
-                  id="vm-schedule-memory"
-                  aria-describedby="vm-schedule-memory-hint"
-                  checked={values.snapshotSchedule.memory}
-                  onCheckedChange={(v) => setSchedule({ memory: v === true })}
-                />
-                <Label htmlFor="vm-schedule-memory">{t("snapshots.includeMemory")}</Label>
-              </div>
-              <p id="vm-schedule-memory-hint" className="text-xs text-muted-foreground">
-                {t("vmForm.scheduleMemoryHint")}
+            {lvm ? (
+              <p className="text-xs text-muted-foreground sm:col-span-2">
+                {t("snapshots.lvmHint")}
               </p>
-            </div>
+            ) : (
+              <div className="flex flex-col gap-1.5 sm:col-span-2">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="vm-schedule-memory"
+                    aria-describedby="vm-schedule-memory-hint"
+                    checked={values.snapshotSchedule.memory}
+                    onCheckedChange={(v) => setSchedule({ memory: v === true })}
+                  />
+                  <Label htmlFor="vm-schedule-memory">{t("snapshots.includeMemory")}</Label>
+                </div>
+                <p id="vm-schedule-memory-hint" className="text-xs text-muted-foreground">
+                  {t("vmForm.scheduleMemoryHint")}
+                </p>
+              </div>
+            )}
           </>
         )}
       </CardContent>

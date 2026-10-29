@@ -12,7 +12,7 @@ import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { errorMessage } from "@/i18n/errors";
 import { formatBytes } from "@/lib/format";
-import { poolsUsableOn } from "@/storage/pools";
+import { poolFormats, poolsUsableOn } from "@/storage/pools";
 import { nameFromFile, sourceFormatOf, startUpload } from "@/storage/upload";
 import { volumeNameError } from "@/storage/volumes";
 
@@ -33,6 +33,12 @@ export function UploadDialog({ onClose }: { onClose(): void }) {
   const [sourceFormat, setSourceFormat] = useState<Schemas["SourceFormat"]>("vmdk");
   const [format, setFormat] = useState<Schemas["ImageFormat"]>("qcow2");
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // 형식은 풀 종류를 따른다(LVM-thin 풀은 raw만). 풀을 바꾸면 그 풀의 기본 형식으로 돌린다.
+  const formats = poolFormats(usable.find((p) => p.name === pool));
+  const choosePool = (chosen: string) => {
+    setPool(chosen);
+    setFormat(poolFormats(usable.find((p) => p.name === chosen))[0]);
+  };
 
   function choose(chosen: File | null) {
     setFile(chosen);
@@ -114,7 +120,7 @@ export function UploadDialog({ onClose }: { onClose(): void }) {
             id="upload-pool"
             className="w-full"
             value={pool}
-            onChange={(e) => setPool(e.target.value)}
+            onChange={(e) => choosePool(e.target.value)}
             {...a11y}
           >
             <NativeSelectOption value="">—</NativeSelectOption>
@@ -146,8 +152,11 @@ export function UploadDialog({ onClose }: { onClose(): void }) {
             value={format}
             onChange={(e) => setFormat(e.target.value as typeof format)}
           >
-            <NativeSelectOption value="qcow2">qcow2</NativeSelectOption>
-            <NativeSelectOption value="raw">raw</NativeSelectOption>
+            {formats.map((f) => (
+              <NativeSelectOption key={f} value={f}>
+                {f}
+              </NativeSelectOption>
+            ))}
           </NativeSelect>
         </Field>
       </div>

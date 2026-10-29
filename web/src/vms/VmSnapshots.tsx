@@ -30,7 +30,13 @@ import { codeMessage } from "@/i18n/errors";
 import { formatBytes, formatTime } from "@/lib/format";
 import { trackTask } from "@/tasks/tasks";
 import { isBusy } from "@/vms/actions";
-import { descriptionError, snapshotNameError, snapshotTree } from "@/vms/snapshots";
+import {
+  descriptionError,
+  snapshotNameError,
+  snapshotSupport,
+  snapshotTree,
+  volumeDisk,
+} from "@/vms/snapshots";
 
 /** VM 상세의 스냅샷 탭: 나무 목록과 만들기·되돌리기·삭제 */
 export function VmSnapshots({ vm }: { vm: Vm }) {
@@ -38,6 +44,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
   const me = usePrincipal();
   const snapshots = useList("snapshot");
   const volumes = useList("volume");
+  const pools = useList("storage-pool");
   const [creating, setCreating] = useState(false);
   // 닫히는 동안에도 대상과 동작을 남겨 두어 대화상자의 글이 바뀌지 않게 한다.
   const [confirm, setConfirm] = useState<{
@@ -53,12 +60,18 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
   const names = new Map(mine.map((s) => [s.id, s.spec.name]));
   // 서버는 시작·정지 중인 VM의 스냅샷 작업을 받지 않는다(vm_busy).
   const busy = isBusy(vm);
-  // qcow2가 아닌 디스크가 있으면 만들 수 없다(snapshot_unsupported). 볼륨 목록을 다 읽어야 안다.
-  const unsupported = volumes.isSuccess
-    ? (vm.spec.disks ?? [])
-        .map((d) => volumes.data.find((v) => v.name === d.volume))
-        .find((v) => v !== undefined && v.spec.format !== "qcow2")
+  // 풀 종류가 담지 못하는 형식의 디스크가 있거나 방식이 섞이면 만들 수 없다(snapshot_unsupported).
+  // 볼륨·풀 목록을 다 읽어야 안다.
+  const listed = volumes.isSuccess && pools.isSuccess;
+  const support = listed
+    ? snapshotSupport(
+        (vm.spec.disks ?? []).flatMap((d) => {
+          const volume = volumes.data.find((v) => v.name === d.volume);
+          return volume ? [volumeDisk(volume, pools.data)] : [];
+        }),
+      )
     : undefined;
+  const lvm = support?.kind === "ok" && support.lvm;
   const columns = operate ? 5 : 4;
   const schedule = vm.spec.snapshot_schedule;
 
@@ -75,20 +88,23 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
           {t("vms.tab.snapshots")}
         </h2>
         {operate &&
-          (unsupported ? (
+          (support?.kind === "format" ? (
             <p className="text-sm text-muted-foreground">
               {t("snapshots.unsupported", {
-                volume: unsupported.name,
-                format: unsupported.spec.format,
+                volume: support.disk.volume,
+                format: support.disk.format,
               })}
             </p>
+          ) : support?.kind === "mixed" ? (
+            <p className="text-sm text-muted-foreground">{t("snapshots.mixed")}</p>
           ) : (
             <div className="flex flex-wrap items-center gap-2 text-sm">
-              {/* 볼륨 목록을 읽어야 디스크 형식을 알아 만들 수 있다. */}
+              {/* 볼륨·풀 목록을 읽어야 디스크의 스냅샷 방식을 알아 만들 수 있다. */}
               {!volumes.isSuccess && <ListPending error={volumes.error} />}
+              {!pools.isSuccess && <ListPending error={pools.error} />}
               <Button
                 size="sm"
-                disabled={busy || !snapshots.isSuccess || !volumes.isSuccess}
+                disabled={busy || !snapshots.isSuccess || !listed}
                 onClick={(e) => {
                   opener.current = e.currentTarget;
                   setCreating(true);
@@ -104,8 +120,9 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
       <div className="flex flex-col gap-1 text-sm">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <p>
+            {/* LVM 디스크의 VM은 예약이 메모리를 원해도 메모리 없이 찍는다. */}
             {schedule
-              ? t(schedule.memory ? "snapshots.scheduleMemory" : "snapshots.schedule", {
+              ? t(schedule.memory && !lvm ? "snapshots.scheduleMemory" : "snapshots.schedule", {
                   every: t(`snapshots.every.${schedule.every}`),
                   keep: schedule.keep,
                 })
@@ -240,6 +257,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
         <CreateSnapshotDialog
           vm={vm}
           taken={mine.map((s) => s.spec.name)}
+          lvm={support?.kind === "ok" && support.lvm}
           returnFocus={opener}
           onClose={() => setCreating(false)}
         />
@@ -290,11 +308,14 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
 function CreateSnapshotDialog({
   vm,
   taken,
+  lvm,
   returnFocus,
   onClose,
 }: {
   vm: Vm;
   taken: string[];
+  /** 디스크가 LV 스냅샷을 쓴다(메모리를 담지 못한다). */
+  lvm: boolean;
   returnFocus: RefObject<HTMLElement | null>;
   onClose(): void;
 }) {
@@ -304,7 +325,8 @@ function CreateSnapshotDialog({
   const [memory, setMemory] = useState(true);
   const [errors, setErrors] = useState<Record<string, string>>({});
   // 서버는 실행 중이고 디스크가 있는 VM만 메모리를 담는다. 그 밖에는 묻지 않고 디스크만 담는다.
-  const canMemory = vm.status.phase === "running" && (vm.spec.disks ?? []).length > 0;
+  // LV 스냅샷은 메모리를 담지 못한다(서버가 409).
+  const canMemory = vm.status.phase === "running" && (vm.spec.disks ?? []).length > 0 && !lvm;
 
   async function submit() {
     const found: Record<string, string> = {};
@@ -375,6 +397,7 @@ function CreateSnapshotDialog({
           <p className="text-xs text-muted-foreground">{t("snapshots.includeMemoryHint")}</p>
         </div>
       )}
+      {lvm && <p className="text-xs text-muted-foreground">{t("snapshots.lvmHint")}</p>}
     </FormDialog>
   );
 }

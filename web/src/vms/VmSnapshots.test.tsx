@@ -5,7 +5,7 @@ import { http, HttpResponse } from "msw";
 import type { Vm } from "@/api/types";
 import { formatTime } from "@/lib/format";
 import { resetTasks } from "@/tasks/tasks";
-import { NODE, snapshot, task, vm, volume } from "@/test/fixtures";
+import { NODE, pool, snapshot, task, vm, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -173,7 +173,76 @@ it("says why a VM with a raw disk cannot take snapshots", async () => {
   open(web);
   expect(
     await screen.findByText(
-      "Only VMs whose disks are all qcow2 can take snapshots. web-root is raw.",
+      "Only VMs whose disks are all qcow2, or all in LVM-thin pools, can take snapshots. web-root is raw.",
+    ),
+  ).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Take snapshot" })).not.toBeInTheDocument();
+});
+
+const fast = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } });
+const lv = (name: string) => {
+  const v = volume(name, "fast");
+  return { ...v, spec: { ...v.spec, format: "raw" as const } };
+};
+
+it("takes a running VM's snapshot of disks in LVM-thin pools without memory", async () => {
+  mockLists({ vm: [web], node: [NODE], volume: [lv("web-root")], "storage-pool": [fast] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl(`/vms/${web.id}/snapshots`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t1", "snapshot-create", web.id), { status: 202 });
+    }),
+  );
+  open(web);
+  await userEvent.click(await screen.findByRole("button", { name: "Take snapshot" }));
+  const dialog = await screen.findByRole("dialog", { name: "Take a snapshot of web" });
+  // LV 스냅샷은 메모리를 담지 못한다(서버가 409).
+  expect(within(dialog).queryByLabelText("Include memory")).not.toBeInTheDocument();
+  expect(
+    within(dialog).getByText(
+      "Disks in LVM-thin pools are saved without memory. A running VM pauses briefly while they are saved.",
+    ),
+  ).toBeVisible();
+  await userEvent.type(within(dialog).getByLabelText("Name"), "base");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Take snapshot" }));
+  expect(await screen.findByText("Take snapshot base of web")).toBeInTheDocument();
+  expect(body).toEqual({ name: "base", description: "", memory: false });
+});
+
+it("does not promise memory in the schedule of a VM with disks in LVM-thin pools", async () => {
+  const scheduled = {
+    ...web,
+    spec: { ...web.spec, snapshot_schedule: { every: "daily" as const, keep: 7, memory: true } },
+  };
+  mockLists({ vm: [scheduled], node: [NODE], volume: [lv("web-root")], "storage-pool": [fast] });
+  open(scheduled);
+  // 예약 작업이 이런 VM은 메모리 없이 찍는다.
+  expect(await screen.findByText("Snapshot schedule: Daily, keep 7")).toBeInTheDocument();
+  expect(screen.queryByText(/with memory/)).not.toBeInTheDocument();
+});
+
+it("says why a VM mixing snapshot methods cannot take snapshots", async () => {
+  const both: Vm = {
+    ...web,
+    spec: {
+      ...web.spec,
+      disks: [
+        { volume: "web-root", bus: "virtio-blk", boot_order: 1 },
+        { volume: "web-data", bus: "virtio-blk", boot_order: null },
+      ],
+    },
+  };
+  mockLists({
+    vm: [both],
+    node: [NODE],
+    volume: [volume("web-root", "local"), lv("web-data")],
+    "storage-pool": [pool("local"), fast],
+  });
+  open(both);
+  expect(
+    await screen.findByText(
+      "Only VMs whose disks are all qcow2, or all in LVM-thin pools, can take snapshots. This VM has both.",
     ),
   ).toBeVisible();
   expect(screen.queryByRole("button", { name: "Take snapshot" })).not.toBeInTheDocument();
@@ -362,7 +431,7 @@ it.each([
   [
     "snapshot_unsupported",
     "raw disks cannot be snapshotted",
-    "Only VMs whose disks are all qcow2 can take snapshots.",
+    "Only VMs whose disks are all qcow2, or all in LVM-thin pools, can take snapshots. Snapshots of disks in LVM-thin pools cannot include memory.",
   ],
   // 번역이 없는 code(옛 문자열을 읽은 unknown 포함)는 서버의 설명을 그대로 보인다.
   ["unknown", "VM busy", "VM busy"],

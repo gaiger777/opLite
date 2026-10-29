@@ -9,7 +9,11 @@ import { apiUrl, server } from "@/test/server";
 
 it("lists pools with their nodes, space and volumes", async () => {
   mockLists({
-    "storage-pool": [pool("local"), pool("busy", { nodes: ["n1"] })],
+    "storage-pool": [
+      pool("local"),
+      pool("busy", { nodes: ["n1"] }),
+      pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } }),
+    ],
     node: [
       {
         ...NODE,
@@ -35,6 +39,10 @@ it("lists pools with their nodes, space and volumes", async () => {
   expect(busy).toHaveTextContent("Delete its volumes first.");
   expect(within(local).getByRole("button", { name: "Delete local" })).toBeEnabled();
   expect(local).not.toHaveTextContent("Delete its volumes first.");
+  const fast = within(table).getByText("fast").closest("tr")!;
+  expect(fast).toHaveTextContent("LVM-thin");
+  expect(fast).toHaveTextContent("vg0/tp");
+  expect(fast).toHaveTextContent("node-a: No status reported yet");
 });
 
 it("shows each node's pool state and space", async () => {
@@ -139,6 +147,8 @@ it("creates a pool on the chosen nodes", async () => {
   await userEvent.type(within(dialog).getByLabelText("Directory"), "/srv/fast");
   await userEvent.click(await within(dialog).findByRole("checkbox", { name: "node-b" }));
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  await vi.waitFor(() => expect(body).toBeDefined());
+  console.log("DBG", JSON.stringify(body), dialog.textContent);
   expect(await screen.findByText("Created storage pool fast.")).toBeInTheDocument();
   expect(body).toEqual({
     name: "fast",
@@ -231,6 +241,51 @@ it("creates an NFS pool", async () => {
     name: "nas",
     spec: { backend: { kind: "nfs", server: "fd00::5", export: "/srv/vm" }, nodes: [] },
   });
+});
+
+it("creates an LVM-thin pool", async () => {
+  mockLists({ node: [NODE] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/storage-pools"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("fast"), { status: 201 });
+    }),
+  );
+  renderPage(<PoolsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "fast");
+  await userEvent.click(within(dialog).getByRole("checkbox", { name: "Shared storage" }));
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "lvm-thin");
+  expect(within(dialog).getByLabelText("Kind")).toHaveAccessibleDescription(
+    "Create the volume group and thin pool on each node first. Volumes are raw thin volumes kept on the node that creates them, and their snapshots hold disks only. Needs Linux nodes running as root.",
+  );
+  // 노드 로컬 풀이라 공유를 고를 수 없고, 디렉터리·NFS 입력도 없다.
+  expect(within(dialog).queryByRole("checkbox", { name: "Shared storage" })).toBeNull();
+  expect(within(dialog).queryByLabelText("Directory")).toBeNull();
+  expect(within(dialog).queryByLabelText("NFS server")).toBeNull();
+  await userEvent.type(within(dialog).getByLabelText("Volume group"), "-vg");
+  await userEvent.type(within(dialog).getByLabelText("Thin pool"), "thin pool");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  const nameError =
+    "Use 1 to 127 letters, digits, +, _, . or -, not starting with -, snapshot or pvmove. LVM also reserves . and .. and names containing parts like _tdata or _tmeta.";
+  expect(within(dialog).getByLabelText("Volume group")).toHaveAccessibleDescription(nameError);
+  expect(within(dialog).getByLabelText("Thin pool")).toHaveAccessibleDescription(nameError);
+  expect(body).toBeUndefined();
+
+  await userEvent.clear(within(dialog).getByLabelText("Volume group"));
+  await userEvent.type(within(dialog).getByLabelText("Volume group"), "vg0");
+  await userEvent.clear(within(dialog).getByLabelText("Thin pool"));
+  await userEvent.type(within(dialog).getByLabelText("Thin pool"), "tp");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  // 디렉터리 풀에서 고른 공유는 보내지 않는다.
+  await vi.waitFor(() =>
+    expect(body).toEqual({
+      name: "fast",
+      spec: { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" }, nodes: [] },
+    }),
+  );
 });
 
 it("sends NFS mount options", async () => {

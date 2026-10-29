@@ -7,7 +7,7 @@ import type { Volume } from "@/api/types";
 import { volumeNameError } from "@/storage/volumes";
 import { VolumesPage } from "@/storage/VolumesPage";
 import { resetTasks } from "@/tasks/tasks";
-import { NODE, pool, task, vm, volume } from "@/test/fixtures";
+import { NODE, pool, poolState, task, vm, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -101,6 +101,47 @@ it("creates an empty volume and follows its task", async () => {
   expect(body).toEqual({
     name: "data",
     spec: { pool: "local", size_bytes: 512 * 1024 ** 2, format: "raw" },
+  });
+});
+
+it("makes volumes in LVM-thin pools raw", async () => {
+  const fast = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } });
+  mockLists({
+    "storage-pool": [pool("local"), fast],
+    volume: [],
+    node: [{ ...NODE, status: { ...NODE.status, pools: { fast: poolState("fast") } } }],
+  });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/volumes"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t1", "volume-create", "v9"), { status: 202 });
+    }),
+  );
+  renderPage(<VolumesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create an empty volume" });
+  const format = within(dialog).getByLabelText("Format");
+  const formats = () =>
+    within(format)
+      .getAllByRole("option")
+      .map((o) => o.textContent);
+  expect(format).toHaveValue("qcow2");
+  // LVM-thin 풀은 raw 볼륨만 둔다.
+  await userEvent.selectOptions(within(dialog).getByLabelText("Storage pool"), "fast");
+  expect(format).toHaveValue("raw");
+  expect(formats()).toEqual(["raw"]);
+  // 디렉터리 풀로 바꾸면 그 풀의 기본 형식(qcow2)으로 돌아간다.
+  await userEvent.selectOptions(within(dialog).getByLabelText("Storage pool"), "local");
+  expect(format).toHaveValue("qcow2");
+  expect(formats()).toEqual(["qcow2", "raw"]);
+  await userEvent.selectOptions(within(dialog).getByLabelText("Storage pool"), "fast");
+  await userEvent.type(within(dialog).getByLabelText("Name"), "data");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await screen.findByText("Create volume data")).toBeInTheDocument();
+  expect(body).toEqual({
+    name: "data",
+    spec: { pool: "fast", size_bytes: 16 * 1024 ** 3, format: "raw" },
   });
 });
 

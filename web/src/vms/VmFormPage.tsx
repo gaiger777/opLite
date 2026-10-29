@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { errorMessage } from "@/i18n/errors";
+import { poolFormats } from "@/storage/pools";
 import { isStopped } from "@/vms/actions";
 import { defaultMachine, emptyForm, fromVm, validate, type VmFormValues } from "@/vms/form";
 import { DisksSection } from "@/vms/form/DisksSection";
@@ -17,6 +18,7 @@ import { GeneralSection } from "@/vms/form/GeneralSection";
 import { NicsSection } from "@/vms/form/NicsSection";
 import { ScheduleSection } from "@/vms/form/ScheduleSection";
 import { createVm, createVolume, isConflict, updateVm } from "@/vms/form/submit";
+import { formSnapshotSupport } from "@/vms/snapshots";
 import { useVmByName } from "@/vms/VmDetailPage";
 
 export function VmCreatePage() {
@@ -76,6 +78,13 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
     (v) => v.status.phase === "ready" && (!v.status.attached_to || v.status.attached_to === vm?.id),
   );
 
+  // 디스크의 스냅샷 가능 여부(예약 스냅샷). 볼륨·풀 목록을 다 읽어야 안다.
+  const support = formSnapshotSupport(
+    values,
+    volumes.isSuccess ? volumes.data : undefined,
+    pools.isSuccess ? pools.data : undefined,
+  );
+
   /** 다른 사람이 바꾼 VM을 다시 읽는다. `vm`은 watch로 늘 최신이다(지워지면 이 폼은 사라진다). */
   function reload() {
     if (vm) {
@@ -110,6 +119,8 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           await createVolume(
             queryClient,
             disk,
+            // 새 볼륨은 풀 종류의 기본 형식이다(LVM-thin 풀은 raw).
+            poolFormats(pools.data?.find((p) => p.name === disk.pool))[0],
             t("tasks.op.volume-create", { target: disk.volume }),
             signal,
           );
@@ -190,12 +201,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           onRowsChange={(nics) => changeRows({ nics })}
           networks={networks.data}
         />
-        <ScheduleSection
-          values={values}
-          errors={errors}
-          onChange={change}
-          volumes={volumes.isSuccess ? volumes.data : undefined}
-        />
+        <ScheduleSection values={values} errors={errors} onChange={change} support={support} />
 
         {creating && (
           <div className="flex items-center gap-2">

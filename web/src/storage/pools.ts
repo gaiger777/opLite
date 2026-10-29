@@ -2,6 +2,7 @@ import type { components } from "@/api/schema";
 import type { Node, StoragePool } from "@/api/types";
 
 export type PoolState = components["schemas"]["PoolState"];
+type ImageFormat = components["schemas"]["ImageFormat"];
 
 /** 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`), LVM-thin 풀은 `VG/THINPOOL` */
 export function poolLocation(pool: StoragePool): string {
@@ -28,6 +29,46 @@ export function nfsServerError(server: string): string | undefined {
   return server === "" || server.startsWith("-") || /[\s,/[\]]/.test(server)
     ? "pools.errors.server"
     : undefined;
+}
+
+/** LVM이 내부 LV 이름에 쓰므로 이름에 담을 수 없는 문자열(서버의 `LVM_RESERVED`) */
+const LVM_RESERVED = [
+  "_cdata",
+  "_cmeta",
+  "_corig",
+  "_mimage",
+  "_mlog",
+  "_pmspare",
+  "_rimage",
+  "_rmeta",
+  "_tdata",
+  "_tmeta",
+  "_vorigin",
+  "_vdata",
+];
+
+/**
+ * LVM 이름(VG, thin pool) 입력 오류(번역 키). 서버처럼 `A-Za-z0-9+_.-`의 1–127자이고 `-`로
+ * 시작하지 않아야 한다. LVM이 받지 않는 이름(`.`·`..`, `snapshot`·`pvmove`로 시작, 예약어를 담은
+ * 것)도 안 된다.
+ */
+export function lvmNameError(name: string): string | undefined {
+  const ok =
+    /^[A-Za-z0-9+_.][A-Za-z0-9+_.-]{0,126}$/.test(name) &&
+    name !== "." &&
+    name !== ".." &&
+    !name.startsWith("snapshot") &&
+    !name.startsWith("pvmove") &&
+    !LVM_RESERVED.some((r) => name.includes(r));
+  return ok ? undefined : "pools.errors.lvmName";
+}
+
+/**
+ * 풀에 둘 수 있는 볼륨 형식. 첫 값이 기본값이고 스냅샷을 담는 형식이다(서버의
+ * `pool_kind_supports_snapshots`). LVM-thin 풀은 raw만 둔다. 풀을 모르면 파일 풀처럼 본다.
+ */
+export function poolFormats(pool: StoragePool | undefined): [ImageFormat, ...ImageFormat[]] {
+  return pool?.spec.backend.kind === "lvm-thin" ? ["raw"] : ["qcow2", "raw"];
 }
 
 /** 서버의 `char::is_control`처럼 C0·C1 제어 문자와 DEL */

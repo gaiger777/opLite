@@ -66,6 +66,42 @@ it("uploads a chosen file into a new volume", async () => {
   expect(await screen.findByText(/^Uploading ubuntu-24-04: 0%/)).toBeInTheDocument();
 });
 
+it("imports into LVM-thin pools as raw", async () => {
+  const fast = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } });
+  mockLists({
+    "storage-pool": [pool("local"), fast],
+    node: [{ ...NODE, status: { ...NODE.status, pools: { fast: poolState("fast") } } }],
+  });
+  server.use(
+    http.get(apiUrl("/cluster"), () =>
+      HttpResponse.json({
+        name: "lab",
+        ca_fingerprint: "x",
+        leader: "n1",
+        node: "n1",
+        members: [],
+      }),
+    ),
+    http.post(apiUrl("/volumes/import/check"), () => new HttpResponse(null, { status: 204 })),
+  );
+  renderPage(<VolumesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Upload image" }));
+  const dialog = await screen.findByRole("dialog", { name: "Upload a disk image" });
+  await userEvent.upload(within(dialog).getByLabelText("Image file"), new File(["disk"], "a.vmdk"));
+  await userEvent.selectOptions(await within(dialog).findByLabelText("Storage pool"), "fast");
+  // LVM-thin 풀은 raw 볼륨만 둔다.
+  const format = within(dialog).getByLabelText("Format");
+  expect(format).toHaveValue("raw");
+  expect(
+    within(format)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["raw"]);
+  await userEvent.click(within(dialog).getByRole("button", { name: "Upload" }));
+  await vi.waitFor(() => expect(FakeXhr.last).toBeDefined());
+  expect(FakeXhr.last!.url).toContain("/volumes/import?name=a&pool=fast&format=raw");
+});
+
 it("says when it cannot tell the node it is connected to", async () => {
   mockLists({ "storage-pool": [pool("local")], node: [NODE] });
   server.use(
