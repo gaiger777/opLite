@@ -2,8 +2,12 @@
 #![cfg(feature = "storage-it")]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use opl_driver::{DirStorage, DriverError, SourceFormat, Storage};
+use async_trait::async_trait;
+use opl_driver::{
+    Capacity, DirStorage, DriverError, SourceFormat, Storage, Storages, VolumeInfo, VolumeSource,
+};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec};
@@ -450,4 +454,249 @@ async fn copy_volume_copies_snapshot_or_current_contents() {
     assert!(qemu_io_fmt(&dst_raw_path, raw, "read -P 0x5a 0 64k"));
     let info = storage.volume_info(&dst_pool, dst_raw, raw).await.unwrap();
     assert_eq!(info.virtual_bytes, 64 * MIB);
+}
+
+/// 다른 백엔드 대신 쓰는 저장소: 어떤 풀이 와도 디렉터리 풀 `dir`의 파일로 다룬다.
+struct InDir {
+    storage: DirStorage,
+    dir: StoragePool,
+}
+
+#[async_trait]
+impl Storage for InDir {
+    async fn create_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        size_bytes: u64,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.storage
+            .create_volume(&self.dir, id, size_bytes, format)
+            .await
+    }
+    async fn import_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        src: &Path,
+        src_format: SourceFormat,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.storage
+            .import_volume(&self.dir, id, src, src_format, format)
+            .await
+    }
+    async fn check_import_source(
+        &self,
+        src: &Path,
+        src_format: SourceFormat,
+    ) -> Result<(), DriverError> {
+        self.storage.check_import_source(src, src_format).await
+    }
+    async fn delete_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.storage.delete_volume(&self.dir, id, format).await
+    }
+    async fn activate_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.storage.activate_volume(&self.dir, id, format).await
+    }
+    async fn volume_info(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<VolumeInfo, DriverError> {
+        self.storage.volume_info(&self.dir, id, format).await
+    }
+    async fn capacity(&self, _: &StoragePool) -> Result<Capacity, DriverError> {
+        self.storage.capacity(&self.dir).await
+    }
+    fn supports_snapshots(&self, _: &StoragePool, format: ImageFormat) -> bool {
+        self.storage.supports_snapshots(&self.dir, format)
+    }
+    async fn snapshot_create(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError> {
+        self.storage
+            .snapshot_create(&self.dir, id, format, tag)
+            .await
+    }
+    async fn snapshot_revert(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError> {
+        self.storage
+            .snapshot_revert(&self.dir, id, format, tag)
+            .await
+    }
+    async fn snapshot_delete(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError> {
+        self.storage
+            .snapshot_delete(&self.dir, id, format, tag)
+            .await
+    }
+    async fn snapshot_tags(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<Vec<String>, DriverError> {
+        self.storage.snapshot_tags(&self.dir, id, format).await
+    }
+    async fn resize_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        size_bytes: u64,
+    ) -> Result<(), DriverError> {
+        self.storage
+            .resize_volume(&self.dir, id, format, size_bytes)
+            .await
+    }
+    async fn volume_source(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
+    ) -> Result<VolumeSource, DriverError> {
+        self.storage.volume_source(&self.dir, id, format, tag).await
+    }
+    async fn release_source(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
+    ) -> Result<(), DriverError> {
+        self.storage
+            .release_source(&self.dir, id, format, tag)
+            .await
+    }
+    async fn copy_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
+        _: bool,
+        _: &StoragePool,
+        _: Uuid,
+    ) -> Result<(), DriverError> {
+        unreachable!("copies between backends go through Storages")
+    }
+}
+
+/// 백엔드가 다른 풀 사이 복사는 대상에 만든 볼륨에 `qemu-img convert -n`으로 써 넣는다.
+/// 같은 백엔드 사이 복사는 그 저장소가 그대로 한다.
+#[tokio::test]
+async fn storages_copy_between_backends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src_dir, other_dir) = (tmp.path().join("src"), tmp.path().join("other"));
+    std::fs::create_dir(&src_dir).unwrap();
+    std::fs::create_dir(&other_dir).unwrap();
+    let src_pool = pool(&src_dir);
+    let other = InDir {
+        storage: DirStorage::new("qemu-img", MNT),
+        dir: pool(&other_dir),
+    };
+    let other_pool = Resource::new(
+        "lvm",
+        StoragePoolSpec {
+            backend: PoolBackend::LvmThin {
+                vg: "vg0".into(),
+                thinpool: "tp".into(),
+            },
+            nodes: vec![],
+            shared: false,
+        },
+    );
+    let storages = Storages::new("qemu-img", Arc::new(DirStorage::new("qemu-img", MNT)))
+        .with_lvm_thin(Arc::new(other));
+    let other_path = |id, format| volume_path(&pool(&other_dir), id, format);
+    let qcow2 = ImageFormat::Qcow2;
+
+    let src = Uuid::now_v7();
+    let src_path = storages
+        .create_volume(&src_pool, src, 64 * MIB, qcow2)
+        .await
+        .unwrap();
+    assert!(qemu_io(&src_path, "write -P 0xab 0 64k"));
+    storages
+        .snapshot_create(&src_pool, src, qcow2, "s1")
+        .await
+        .unwrap();
+    assert!(qemu_io(&src_path, "write -P 0xcd 0 64k"));
+
+    // 스냅샷 때의 내용을 다른 백엔드로
+    let dst = Uuid::now_v7();
+    storages
+        .copy_volume(&src_pool, src, qcow2, Some("s1"), true, &other_pool, dst)
+        .await
+        .unwrap();
+    assert!(qemu_io(&other_path(dst, qcow2), "read -P 0xab 0 64k"));
+    let info = storages.volume_info(&other_pool, dst, qcow2).await.unwrap();
+    assert_eq!(info.virtual_bytes, 64 * MIB);
+
+    // 다시 돌아오는 방향, 지금 내용
+    let back = Uuid::now_v7();
+    storages
+        .copy_volume(&other_pool, dst, qcow2, None, false, &src_pool, back)
+        .await
+        .unwrap();
+    assert!(qemu_io(
+        &volume_path(&src_pool, back, qcow2),
+        "read -P 0xab 0 64k"
+    ));
+
+    // 없는 태그는 실패하고 만든 볼륨을 지운다.
+    let missing = Uuid::now_v7();
+    let err = storages
+        .copy_volume(
+            &src_pool,
+            src,
+            qcow2,
+            Some("gone"),
+            false,
+            &other_pool,
+            missing,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+    assert!(!other_path(missing, qcow2).exists());
+
+    // 같은 백엔드 사이(디렉터리 풀끼리)는 파일 저장소의 복사다.
+    let same = Uuid::now_v7();
+    storages
+        .copy_volume(&src_pool, src, qcow2, None, false, &src_pool, same)
+        .await
+        .unwrap();
+    assert!(qemu_io(
+        &volume_path(&src_pool, same, qcow2),
+        "read -P 0xcd 0 64k"
+    ));
 }

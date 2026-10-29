@@ -11,6 +11,10 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::mounts::{MOUNTINFO, nfs_mount_points};
 
+mod storages;
+
+pub use storages::Storages;
+
 /// 올린 이미지를 검사하는 `qemu-img info`가 멈추면(이상한 extent 등) 무한정 기다리지 않는다.
 const INFO_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -28,6 +32,19 @@ pub struct VolumeInfo {
 pub struct Capacity {
     pub total_bytes: u64,
     pub available_bytes: u64,
+}
+
+/// 복사할 때 읽을 볼륨 내용([`Storage::volume_source`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeSource {
+    /// 볼륨 파일 또는 블록 장치
+    pub path: PathBuf,
+    pub format: ImageFormat,
+    /// 이미지 안의 내부 스냅샷(qcow2)에서 읽으면 그 이름(`qemu-img convert -l snapshot.name=`)
+    pub snapshot: Option<String>,
+    /// 읽을 내용의 가상 크기. 백엔드 사이 복사는 대상 볼륨을 이 크기로 만든다. LV 스냅샷이면 그
+    /// 스냅샷 때의 크기다(뒤에 볼륨을 되돌려 지금이 더 작을 수 있다).
+    pub size_bytes: u64,
 }
 
 /// 볼륨 파일의 생성, 가져오기, 삭제. 볼륨은 풀 안에서 id로 식별한다.
@@ -139,6 +156,26 @@ pub trait Storage: Send + Sync {
         id: Uuid,
         format: ImageFormat,
         size_bytes: u64,
+    ) -> Result<(), DriverError>;
+
+    /// 볼륨(`tag`가 있으면 그 스냅샷 때)의 내용을 읽을 수 있게 하고 그 위치를 돌려준다. 백엔드가 다른
+    /// 풀 사이 복사([`Storages`])의 원본이다. 볼륨이 없으면 `VolumeNotFound`, 스냅샷을 지원하지 않는
+    /// 형식에 `tag`를 주면 `InvalidSpec`. 다 읽으면 같은 인자로 `release_source`를 부른다.
+    async fn volume_source(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
+    ) -> Result<VolumeSource, DriverError>;
+
+    /// `volume_source`가 읽을 수 있게 한 것을 되돌린다. 파일 볼륨은 할 일이 없다.
+    async fn release_source(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
     ) -> Result<(), DriverError>;
 
     /// 볼륨을 같은 형식의 새 볼륨 `dst_id`로 복사한다. `tag`가 있으면 그 스냅샷 때의 내용을,
@@ -280,20 +317,7 @@ impl DirStorage {
     }
 
     async fn qemu_img(&self, args: &[&str]) -> Result<Vec<u8>, DriverError> {
-        let out = tokio::process::Command::new(&self.qemu_img)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            // 호출자가 취소하면 qemu-img도 끝낸다.
-            .kill_on_drop(true)
-            .output()
-            .await?;
-        if !out.status.success() {
-            return Err(DriverError::ToolFailed {
-                tool: "qemu-img",
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            });
-        }
-        Ok(out.stdout)
+        run_qemu_img(&self.qemu_img, args).await
     }
 
     /// 풀 안의 파일시스템 호출. [`on_pool`]에 풀 루트를 넘긴다.
@@ -421,6 +445,46 @@ impl DirStorage {
             other => Ok(other?),
         }
     }
+}
+
+/// `qemu-img`를 돌려 표준 출력을 돌려준다. 실패하면 stderr를 담은 `ToolFailed`.
+async fn run_qemu_img(qemu_img: &Path, args: &[&str]) -> Result<Vec<u8>, DriverError> {
+    let out = tokio::process::Command::new(qemu_img)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        // 호출자가 취소하면 qemu-img도 끝낸다.
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(DriverError::ToolFailed {
+            tool: "qemu-img",
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(out.stdout)
+}
+
+/// `qemu-img convert`가 `src`를 읽어 `out_format`으로 쓰게 하는 인자. 출력 경로는 뒤에 붙인다.
+/// `force_share`면 실행 중인 VM이 쥔 이미지의 잠금을 무시하고 읽는다(`-U`).
+fn convert_from(
+    src: &VolumeSource,
+    force_share: bool,
+    out_format: ImageFormat,
+) -> Result<Vec<String>, DriverError> {
+    let mut args = vec!["-f".to_string(), fmt_name(src.format).to_string()];
+    if force_share {
+        args.push("-U".into());
+    }
+    // `-l`의 값은 옵션 문자열이므로 `,`를 `,,`로 쓴다.
+    if let Some(name) = &src.snapshot {
+        args.push("-l".into());
+        args.push(format!("snapshot.name={}", name.replace(',', ",,")));
+    }
+    args.push("-O".into());
+    args.push(fmt_name(out_format).into());
+    args.push(path_str(&src.path)?.into());
+    Ok(args)
 }
 
 /// `f`를 blocking 스레드에서 돌린다. 멈춘 NFS에서 끝나지 않는 호출이 tokio 워커를 붙잡지 않게
@@ -810,25 +874,47 @@ impl Storage for DirStorage {
         dst_pool: &StoragePool,
         dst_id: Uuid,
     ) -> Result<(), DriverError> {
-        let src = match tag {
-            Some(_) => self.snapshot_path(src_pool, src_id, format).await?,
-            None => self.existing_path(src_pool, src_id, format).await?,
-        };
+        let src = self.volume_source(src_pool, src_id, format, tag).await?;
         let dst = self.file_path(dst_pool, dst_id, format)?;
         if self.exists(dst_pool, &dst).await? {
             return Err(DriverError::VolumeExists(dst_id));
         }
-        // `-l`의 값은 옵션 문자열이므로 `,`를 `,,`로 쓴다.
-        let snapshot = tag.map(|t| format!("snapshot.name={}", t.replace(',', ",,")));
-        let mut before = vec!["convert", "-q", "-f", fmt_name(format)];
-        if force_share {
-            before.push("-U");
-        }
-        if let Some(s) = &snapshot {
-            before.extend(["-l", s.as_str()]);
-        }
-        before.extend(["-O", fmt_name(format), path_str(&src)?]);
+        let from = convert_from(&src, force_share, format)?;
+        let mut before = vec!["convert", "-q"];
+        before.extend(from.iter().map(String::as_str));
         self.write_new(dst_pool, dst_id, &dst, &before, &[]).await
+    }
+
+    /// 볼륨 파일. 스냅샷은 qcow2 안의 내부 스냅샷으로 읽는다. 크기는 지금 볼륨의 가상 크기다
+    /// (`qemu-img info`는 내부 스냅샷의 크기를 알려 주지 않고, `convert -l`도 지금 크기만큼 읽는다).
+    async fn volume_source(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
+    ) -> Result<VolumeSource, DriverError> {
+        let path = match tag {
+            Some(_) => self.snapshot_path(pool, id, format).await?,
+            None => self.existing_path(pool, id, format).await?,
+        };
+        let size_bytes = self.volume_info(pool, id, format).await?.virtual_bytes;
+        Ok(VolumeSource {
+            path,
+            format,
+            snapshot: tag.map(str::to_string),
+            size_bytes,
+        })
+    }
+
+    async fn release_source(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
+    ) -> Result<(), DriverError> {
+        Ok(())
     }
 }
 
@@ -1003,7 +1089,8 @@ mod tests {
         // 마운트되지 않은 빈 마운트 지점(mountinfo에 없다). 여기에 볼륨을 만들면 로컬 디스크에 쌓인다.
         let root = mnt.path().join(p.id.to_string());
         std::fs::create_dir(&root).unwrap();
-        let storage = DirStorage::new(fake_tool(tools.path(), "echo new > \"$last\""), mnt.path());
+        let body = format!("{INFO_5}\necho new > \"$last\"");
+        let storage = DirStorage::new(fake_tool(tools.path(), &body), mnt.path());
         let not_mounted = |e: DriverError| match e {
             DriverError::PoolNotMounted(path) => {
                 assert_eq!(path, root);
@@ -1081,6 +1168,10 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
+
+    /// [`fake_tool`]의 본문 앞에 두면 `info`에 가상 크기 5를 답한다(복사 원본의 크기).
+    const INFO_5: &str =
+        "if [ \"$1\" = info ]; then echo '{\"virtual-size\": 5, \"actual-size\": 0}'; exit 0; fi";
 
     fn pool_files(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
@@ -1344,6 +1435,55 @@ mod tests {
         }
     }
 
+    /// 파일 볼륨의 복사 원본은 볼륨 파일이고, 스냅샷은 qcow2 안의 내부 스냅샷이다.
+    #[tokio::test]
+    async fn file_volume_source_is_the_volume_file() {
+        let tools = tempfile::tempdir().unwrap();
+        let storage = dir_storage(fake_tool(tools.path(), &format!("{INFO_5}\nexit 1")));
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp_str(&tmp));
+        let id = Uuid::now_v7();
+        let (raw, qcow2) = (ImageFormat::Raw, ImageFormat::Qcow2);
+
+        let res = storage.volume_source(&p, id, qcow2, None).await;
+        assert!(
+            matches!(res, Err(DriverError::VolumeNotFound(v)) if v == id),
+            "{res:?}"
+        );
+        for format in [raw, qcow2] {
+            std::fs::write(volume_path(&p, id, format), b"").unwrap();
+            assert_eq!(
+                storage.volume_source(&p, id, format, None).await.unwrap(),
+                VolumeSource {
+                    path: volume_path(&p, id, format),
+                    format,
+                    snapshot: None,
+                    size_bytes: 5,
+                }
+            );
+        }
+        assert_eq!(
+            storage
+                .volume_source(&p, id, qcow2, Some("t1"))
+                .await
+                .unwrap(),
+            VolumeSource {
+                path: volume_path(&p, id, qcow2),
+                format: qcow2,
+                snapshot: Some("t1".into()),
+                size_bytes: 5,
+            }
+        );
+        // raw 볼륨에는 스냅샷이 없다.
+        let res = storage.volume_source(&p, id, raw, Some("t1")).await;
+        assert!(matches!(res, Err(DriverError::InvalidSpec(_))), "{res:?}");
+        // 내놓을 것이 없다.
+        storage
+            .release_source(&p, id, qcow2, Some("t1"))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn snapshot_delete_skips_missing_tag() {
         let tools = tempfile::tempdir().unwrap();
@@ -1413,7 +1553,7 @@ mod tests {
         let args = tools.path().join("args");
         let storage = dir_storage(fake_tool(
             tools.path(),
-            &format!("printf '%s\\n' \"$@\" > {args:?}\necho copy > \"$last\""),
+            &format!("{INFO_5}\nprintf '%s\\n' \"$@\" > {args:?}\necho copy > \"$last\""),
         ));
 
         storage
@@ -1465,8 +1605,9 @@ mod tests {
 
     #[tokio::test]
     async fn copy_volume_checks_source_and_never_overwrites() {
-        // 도구까지 가면 다른 오류(Io NotFound)가 난다.
-        let storage = dir_storage("/nonexistent/qemu-img");
+        // 원본 크기(`info`)만 답한다. 복사까지 가면 다른 오류(ToolFailed)가 난다.
+        let tools = tempfile::tempdir().unwrap();
+        let storage = dir_storage(fake_tool(tools.path(), &format!("{INFO_5}\nexit 1")));
         let tmp = tempfile::tempdir().unwrap();
         let p = pool(tmp.path().to_str().unwrap());
         let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
@@ -1512,10 +1653,10 @@ mod tests {
         let p = pool(tmp.path().to_str().unwrap());
         let src = Uuid::now_v7();
         std::fs::write(volume_path(&p, src, ImageFormat::Raw), b"").unwrap();
-        // 출력 파일을 반쯤 쓰고 실패한다.
+        // 원본 크기를 읽은 뒤 출력 파일을 반쯤 쓰고 실패한다.
         let storage = dir_storage(fake_tool(
             tools.path(),
-            "echo partial > \"$last\"\necho broken >&2\nexit 1",
+            &format!("{INFO_5}\necho partial > \"$last\"\necho broken >&2\nexit 1"),
         ));
 
         let err = storage

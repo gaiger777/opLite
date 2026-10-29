@@ -13,6 +13,7 @@ use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::{
     Capacity, DirStorage, DriverError, Hypervisor, MockHypervisor, Storage, VolumeInfo,
+    VolumeSource,
 };
 use opl_reconciler::{Reconciler, ReconcilerConfig, RestartBackoff};
 use opl_types::auth::{Role, UserSpec};
@@ -604,6 +605,24 @@ impl Storage for FakeStorage {
     ) -> Result<(), DriverError> {
         self.record("resize", id).await;
         self.set_size(id, size_bytes);
+        Ok(())
+    }
+    async fn volume_source(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
+    ) -> Result<VolumeSource, DriverError> {
+        Err(DriverError::InvalidSpec("not supported".into()))
+    }
+    async fn release_source(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
+    ) -> Result<(), DriverError> {
         Ok(())
     }
     async fn copy_volume(

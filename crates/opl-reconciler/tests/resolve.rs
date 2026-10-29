@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use opl_cluster::memnet::MemRouter;
-use opl_driver::{Capacity, DriverError, SourceFormat, Storage, VolumeInfo};
+use opl_driver::{Capacity, DriverError, SourceFormat, Storage, VolumeInfo, VolumeSource};
 use opl_reconciler::resolve::{ResolveError, runtime_spec};
 use opl_types::network::{Network, NetworkSpec, tap_name};
 use opl_types::node::{Node, NodeSpec, PoolState};
@@ -131,6 +131,24 @@ impl Storage for Activations {
         _: Uuid,
         _: ImageFormat,
         _: u64,
+    ) -> Result<(), DriverError> {
+        unreachable!()
+    }
+    async fn volume_source(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
+    ) -> Result<VolumeSource, DriverError> {
+        unreachable!()
+    }
+    async fn release_source(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
     ) -> Result<(), DriverError> {
         unreachable!()
     }

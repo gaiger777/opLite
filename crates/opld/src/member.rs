@@ -14,7 +14,7 @@ use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{AppState, ClusterJanitor, SnapshotScheduler, TaskRunner, TaskRunnerConfig};
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError};
-use opl_driver::{DirStorage, Hypervisor, QemuHypervisor, Storage};
+use opl_driver::{DirStorage, Hypervisor, QemuHypervisor, Storage, Storages};
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{TlsListener, api_server_config};
 use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers};
@@ -258,7 +258,9 @@ impl Member {
         };
         // NFS 풀의 마운트 지점은 `{data_dir}/pools/{풀 id}`다.
         let mount_root = config.data_dir.join("pools");
-        let storage: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img, &mount_root));
+        // 풀 백엔드 종류로 나눠 보내는 저장소 하나를 reconciler와 Task 실행기가 함께 쓴다.
+        let files: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img, &mount_root));
+        let storage: Arc<dyn Storage> = Arc::new(Storages::new(&config.qemu_img, files));
         let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
