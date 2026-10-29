@@ -22563,6 +22563,7 @@ git commit -m "docs: ZFS 풀 안내, 공유 스토리지 설계 3에 구현하�
 - 지연 태그 정리가 같은 zvol의 새 스냅샷과 겹치면 새 스냅샷이 일시 오류로 실패할 수 있다.
 
 테스트: macOS `cargo test --workspace` 559개, `opl-driver` `storage-it` 133개, `opl-api` `storage-it` 210개, `qemu-it` `smoke`·`e2e`·`snapshots` 11개, 브라우저 E2E, 웹 Vitest 286개, `fmt`·`clippy -D warnings`(모든 기능). 실제 ZFS(`zfs-it`)·LVM·NFS는 Linux CI `linux-kvm`에서.
+CI(확인용 브랜치): `check` 2개, `deny`, `web`, `linux-kvm`(실제 ZFS·LVM·NFS 포함)이 모두 통과했다. 최종 리뷰 수정 뒤 스냅샷 직후 udev를 기다리지 않게 되어, 스냅샷 장치를 곧바로 열던 시험을 `volume_source`로 기다리게 고쳤다(`0a700ca`).
 
 ## 다음 계획으로 넘길 사항
 
