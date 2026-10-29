@@ -435,6 +435,39 @@ async fn refuses_lvm_thin_volumes_on_macos() {
     assert!(storage.calls.lock().unwrap().is_empty());
 }
 
+/// ZFS 풀의 디스크는 아직 쓸 수 없다. 기다려도 풀리지 않으므로 참조 오류이고, 볼륨을 활성화하지 않는다.
+#[tokio::test]
+async fn refuses_zfs_volumes_for_now() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let z: StoragePool = Resource::new(
+        "z",
+        StoragePoolSpec {
+            backend: PoolBackend::Zfs {
+                dataset: "tank/opl".into(),
+            },
+            nodes: vec![],
+            shared: false,
+        },
+    );
+    cluster.create(&z).await.unwrap();
+    let mut root = volume("root", "z");
+    root.spec.format = ImageFormat::Raw;
+    cluster.create(&root).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    let storage = Activations::default();
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::PoolUnsupported(n, why) if n == "z" && why.contains("not supported")),
+        "{err:?}"
+    );
+    assert!(storage.calls.lock().unwrap().is_empty());
+}
+
 /// Linux에서는 LVM-thin 볼륨을 활성화한 뒤 LV 장치를 디스크로 쓴다. 활성화한 뒤에도 장치 노드가
 /// 없으면 잠시 뒤 다시 시도할 `PoolUnavailable`이다.
 #[cfg(target_os = "linux")]

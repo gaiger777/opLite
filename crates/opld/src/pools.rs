@@ -29,6 +29,7 @@ pub const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const NFS_UNSUPPORTED: &str = "nfs pools are not supported on macOS";
 const LVM_UNSUPPORTED: &str = "lvm-thin pools are not supported on macOS";
+const ZFS_UNSUPPORTED: &str = "zfs pools are not supported yet";
 const LVS_TIMED_OUT: &str = "lvs timed out";
 const NFS_NOT_RESPONDING: &str = "nfs server not responding";
 const DIR_NOT_RESPONDING: &str = "pool directory not responding";
@@ -410,6 +411,9 @@ impl Pools {
                     return Step::State(not_ready(pool.id, LVM_UNSUPPORTED.into()));
                 }
                 return Step::Lvm(vg.clone(), thinpool.clone());
+            }
+            PoolBackend::Zfs { .. } => {
+                return Step::State(not_ready(pool.id, ZFS_UNSUPPORTED.into()));
             }
             PoolBackend::Nfs {
                 server,
@@ -1108,6 +1112,23 @@ mod tests {
         assert_eq!(
             s.states()["tp"],
             not_ready(tp.id, "lvm-thin pools are not supported on macOS".into())
+        );
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// ZFS 풀은 아직 확인하지 않고 준비되지 않았다고 적는다.
+    #[tokio::test]
+    async fn zfs_pools_are_not_ready_yet() {
+        let mut s = setup().await;
+        let backend = PoolBackend::Zfs {
+            dataset: "tank/opl".into(),
+        };
+        let z = s.pool("z", backend, vec![]).await;
+        s.pools.tick().await.unwrap();
+        assert_eq!(s.fake.calls(), Vec::<String>::new());
+        assert_eq!(
+            s.states()["z"],
+            not_ready(z.id, "zfs pools are not supported yet".into())
         );
         s.cluster.shutdown().await.unwrap();
     }

@@ -1269,6 +1269,11 @@ export interface components {
             thinpool: string;
             /** @description 볼륨 그룹 이름 */
             vg: string;
+        } | {
+            /** @description zvol을 둘 데이터셋 이름(예: `tank/opl`) */
+            dataset: string;
+            /** @enum {string} */
+            kind: "zfs";
         };
         /** @description 한 노드에서 본 스토리지 풀 상태 */
         PoolState: {

@@ -205,12 +205,14 @@ pub trait Storage: Send + Sync {
 }
 
 /// 풀의 볼륨 파일이 놓이는 디렉터리. `dir` 풀은 그 경로, `nfs` 풀은 이 노드의 마운트 지점
-/// `{mount_root}/{풀 id}`, `lvm-thin` 풀은 VG의 장치 디렉터리 `/dev/{vg}`다(볼륨 파일은 없다).
+/// `{mount_root}/{풀 id}`, `lvm-thin` 풀은 VG의 장치 디렉터리 `/dev/{vg}`, `zfs` 풀은 데이터셋의 zvol
+/// 장치 디렉터리 `/dev/zvol/{dataset}`이다(블록 풀에는 볼륨 파일이 없다).
 pub fn pool_root(pool: &StoragePool, mount_root: &Path) -> PathBuf {
     match &pool.spec.backend {
         PoolBackend::Dir { path } => path.clone(),
         PoolBackend::Nfs { .. } => mount_root.join(pool.id.to_string()),
         PoolBackend::LvmThin { vg, .. } => Path::new("/dev").join(vg),
+        PoolBackend::Zfs { dataset } => Path::new("/dev/zvol").join(dataset),
     }
 }
 
@@ -234,11 +236,19 @@ fn check_pool_root_with(
     mountinfo: &ReadMountinfo,
 ) -> Result<PathBuf, DriverError> {
     let root = pool_root(pool, mount_root);
-    // LVM 풀의 볼륨은 파일이 아니다(`/dev/{vg}`에 파일을 만들지 않는다).
-    if let PoolBackend::LvmThin { .. } = &pool.spec.backend {
-        return Err(DriverError::InvalidSpec(
-            "lvm-thin pools hold no volume files".into(),
-        ));
+    // 블록 풀의 볼륨은 파일이 아니다(`/dev/{vg}`, `/dev/zvol/{dataset}`에 파일을 만들지 않는다).
+    match &pool.spec.backend {
+        PoolBackend::LvmThin { .. } => {
+            return Err(DriverError::InvalidSpec(
+                "lvm-thin pools hold no volume files".into(),
+            ));
+        }
+        PoolBackend::Zfs { .. } => {
+            return Err(DriverError::InvalidSpec(
+                "zfs pools hold no volume files".into(),
+            ));
+        }
+        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => {}
     }
     if let PoolBackend::Nfs { .. } = &pool.spec.backend {
         // mountinfo는 실제 경로를 적는다. 마운트 지점은 stat하지 않고(NFS 서버가 멈추면 끝나지 않는다)
@@ -279,6 +289,11 @@ fn disk_location_in(
     if let PoolBackend::LvmThin { vg, .. } = &pool.spec.backend {
         lvm::require_raw(format)?;
         return Ok((lvm::volume_device(dev, vg, id)?, DiskKind::Block));
+    }
+    if let PoolBackend::Zfs { .. } = &pool.spec.backend {
+        return Err(DriverError::InvalidSpec(
+            "zfs pools are not supported yet".into(),
+        ));
     }
     check_pool_root(pool, mount_root)?;
     Ok((
@@ -1114,6 +1129,41 @@ mod tests {
         refused(storage.delete_volume(&p, id, f).await.unwrap_err());
         refused(storage.volume_info(&p, id, f).await.unwrap_err());
         refused(storage.capacity(&p).await.unwrap_err());
+    }
+
+    /// 파일 저장소는 ZFS 풀도 다루지 않고(`/dev/zvol/{dataset}`에 파일을 만들지 않는다), 디스크
+    /// 위치도 아직 정하지 않는다.
+    #[tokio::test]
+    async fn zfs_pools_are_not_file_pools() {
+        let tools = tempfile::tempdir().unwrap();
+        let mnt = tempfile::tempdir().unwrap();
+        let p: StoragePool = Resource::new(
+            "z",
+            StoragePoolSpec {
+                backend: PoolBackend::Zfs {
+                    dataset: "tank/opl".into(),
+                },
+                nodes: vec![],
+                shared: false,
+            },
+        );
+        assert_eq!(
+            pool_root(&p, mnt.path()),
+            PathBuf::from("/dev/zvol/tank/opl")
+        );
+        let storage = DirStorage::new(fake_tool(tools.path(), "exit 1"), mnt.path());
+        let refused = |e: DriverError| match e {
+            DriverError::InvalidSpec(msg) => assert!(msg.contains("no volume files"), "{msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        };
+        refused(check_pool_root(&p, mnt.path()).unwrap_err());
+        let (id, f) = (Uuid::nil(), ImageFormat::Raw);
+        refused(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
+        refused(storage.capacity(&p).await.unwrap_err());
+        match disk_location(&p, mnt.path(), id, f).unwrap_err() {
+            DriverError::InvalidSpec(msg) => assert_eq!(msg, "zfs pools are not supported yet"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     /// LVM 풀의 디스크는 LV 장치다. 장치 노드가 없으면 비활성(일시 오류)이다.

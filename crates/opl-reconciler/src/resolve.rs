@@ -68,6 +68,13 @@ pub async fn runtime_spec(
         if !pool_listed_on(&pool, node) {
             return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
         }
+        // ZFS 풀의 디스크는 아직 다루지 않는다.
+        if matches!(pool.spec.backend, PoolBackend::Zfs { .. }) {
+            return Err(ResolveError::PoolUnsupported(
+                pool_name.clone(),
+                "zfs pools are not supported yet",
+            ));
+        }
         // opld는 Linux에서만 NFS 풀을 마운트하고 LVM을 쓴다.
         if !cfg!(target_os = "linux") {
             match pool.spec.backend {
@@ -80,7 +87,7 @@ pub async fn runtime_spec(
                         "lvm-thin pools are not supported on macOS",
                     ));
                 }
-                PoolBackend::Dir { .. } => {}
+                PoolBackend::Dir { .. } | PoolBackend::Zfs { .. } => {}
             }
         }
         if let Some(me) = &me

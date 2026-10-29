@@ -206,10 +206,15 @@ pub async fn create_pool(
         }
         spec.shared = true;
     }
-    // LVM-thin 풀은 노드 로컬이다.
+    // LVM-thin·ZFS 풀은 노드 로컬이다.
     if matches!(spec.backend, PoolBackend::LvmThin { .. }) && spec.shared {
         return Err(ApiError::bad_request(
             "lvm-thin pools are node-local; shared must be false",
+        ));
+    }
+    if matches!(spec.backend, PoolBackend::Zfs { .. }) && spec.shared {
+        return Err(ApiError::bad_request(
+            "zfs pools are node-local; shared must be false",
         ));
     }
     for node in &spec.nodes {

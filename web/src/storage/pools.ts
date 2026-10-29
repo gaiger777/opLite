@@ -4,7 +4,10 @@ import type { Node, StoragePool } from "@/api/types";
 export type PoolState = components["schemas"]["PoolState"];
 type ImageFormat = components["schemas"]["ImageFormat"];
 
-/** 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`), LVM-thin 풀은 `VG/THINPOOL` */
+/**
+ * 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`), LVM-thin 풀은 `VG/THINPOOL`,
+ * ZFS 풀은 데이터셋
+ */
 export function poolLocation(pool: StoragePool): string {
   const b = pool.spec.backend;
   if (b.kind === "dir") {
@@ -12,6 +15,9 @@ export function poolLocation(pool: StoragePool): string {
   }
   if (b.kind === "lvm-thin") {
     return `${b.vg}/${b.thinpool}`;
+  }
+  if (b.kind === "zfs") {
+    return b.dataset;
   }
   return b.server.includes(":") ? `[${b.server}]:${b.export}` : `${b.server}:${b.export}`;
 }

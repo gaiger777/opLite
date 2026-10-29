@@ -57,6 +57,12 @@ pub enum PoolBackend {
         /// VG 안의 thin pool LV 이름
         thinpool: String,
     },
+    /// 노드의 ZFS 데이터셋 아래에 볼륨마다 sparse zvol(`{dataset}/opl-{id}`, raw)을 둔다. 노드 로컬
+    /// 풀이고, 데이터셋은 관리자가 노드마다 같은 이름으로 만들어 둔다.
+    Zfs {
+        /// zvol을 둘 데이터셋 이름(예: `tank/opl`)
+        dataset: String,
+    },
 }
 
 impl StoragePoolSpec {
@@ -94,6 +100,11 @@ impl StoragePoolSpec {
                     }
                 }
             }
+            PoolBackend::Zfs { dataset } => {
+                if !valid_zfs_dataset(dataset) {
+                    return Err(PoolError::BadZfsDataset(dataset.clone()));
+                }
+            }
         }
         Ok(())
     }
@@ -127,6 +138,24 @@ fn valid_lvm_name(name: &str) -> bool {
         && !LVM_RESERVED.iter().any(|r| name.contains(r))
 }
 
+/// ZFS 데이터셋 이름: 177자 이하이고(zvol 스냅샷 `{dataset}/opl-{uuid}@{uuid}`가 ZFS 이름 상한
+/// 255자 안에 들게) `/`로 나뉜 구성 요소가 비지 않는다. 구성 요소는
+/// `A-Za-z0-9_.:-`로만 되고 `-`로 시작하지 않으며(명령 옵션으로 읽히지 않게) `.`·`..`이 아니다.
+/// 첫 구성 요소(풀 이름)는 문자로 시작한다.
+fn valid_zfs_dataset(name: &str) -> bool {
+    name.len() <= 177
+        && name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name.split('/').all(|part| {
+            !part.is_empty()
+                && !part.starts_with('-')
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_.:-".contains(&c))
+        })
+}
+
 /// LVM이 내부 LV 이름에 쓰므로 LV 이름에 담을 수 없는 문자열
 const LVM_RESERVED: [&str; 12] = [
     "_cdata", "_cmeta", "_corig", "_mimage", "_mlog", "_pmspare", "_rimage", "_rmeta", "_tdata",
@@ -148,22 +177,22 @@ fn denied_option(option: &str) -> bool {
     ) || name.starts_with("x-")
 }
 
-/// 모든 노드가 같은 데이터를 보는 풀인지. NFS 풀은 `shared` 값과 상관없이 공유이고, LVM-thin 풀은
-/// 늘 노드 로컬이다.
+/// 모든 노드가 같은 데이터를 보는 풀인지. NFS 풀은 `shared` 값과 상관없이 공유이고, LVM-thin·ZFS
+/// 풀은 늘 노드 로컬이다.
 pub fn is_shared(pool: &StoragePool) -> bool {
     match pool.spec.backend {
         PoolBackend::Dir { .. } => pool.spec.shared,
         PoolBackend::Nfs { .. } => true,
-        PoolBackend::LvmThin { .. } => false,
+        PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } => false,
     }
 }
 
 /// 이 백엔드의 `format` 볼륨이 스냅샷을 담을 수 있는지. 파일 풀(dir, nfs)은 qcow2 내부 스냅샷,
-/// LVM-thin 풀은 raw 볼륨의 thin 스냅샷이다.
+/// LVM-thin 풀은 raw 볼륨의 thin 스냅샷, ZFS 풀은 raw zvol의 ZFS 스냅샷이다.
 pub fn pool_kind_supports_snapshots(backend: &PoolBackend, format: ImageFormat) -> bool {
     match backend {
         PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => format == ImageFormat::Qcow2,
-        PoolBackend::LvmThin { .. } => format == ImageFormat::Raw,
+        PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } => format == ImageFormat::Raw,
     }
 }
 
@@ -183,8 +212,8 @@ pub fn pool_state_on<'a>(pool: &StoragePool, node: &'a Node) -> Option<&'a PoolS
 
 /// 이 노드에서 풀을 쓸 수 있는지: 노드 목록이 허용하고, 노드가 알린 그 풀의 상태가 준비됨.
 /// 디렉터리 풀은 노드가 상태를 아직 알리지 않았어도(옛 노드, 첫 새로 고침 전) 쓸 수 있다고 보고
-/// 준비되지 않았다고 알렸을 때만 막는다. NFS 풀은 마운트됐다고, LVM-thin 풀은 thin pool이 있다고
-/// 알려야 한다.
+/// 준비되지 않았다고 알렸을 때만 막는다. NFS 풀은 마운트됐다고, LVM-thin 풀은 thin pool이, ZFS 풀은
+/// 데이터셋이 있다고 알려야 한다.
 pub fn pool_usable_on(pool: &StoragePool, node: &Node) -> bool {
     pool_listed_on(pool, node.id)
         && match pool_state_on(pool, node) {
@@ -220,6 +249,12 @@ pub enum PoolError {
          names lvm reserves such as '_tdata' or '_tmeta'"
     )]
     BadLvmName(String),
+    #[error(
+        "invalid zfs dataset {0:?}: use at most 177 characters in '/'-separated components of \
+         A-Z, a-z, 0-9, '_', '.', ':' and '-', none empty, '.', '..' or starting with '-', \
+         and the first (the pool name) starting with a letter"
+    )]
+    BadZfsDataset(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -612,10 +647,12 @@ mod tests {
         };
         let nfs = nfs("nas", "/srv/vm", None).backend;
         let lvm = lvm("vg0", "tp").backend;
+        let zfs = zfs("tank/opl").backend;
         for (backend, qcow2, raw) in [
             (&dir, true, false),
             (&nfs, true, false),
             (&lvm, false, true),
+            (&zfs, false, true),
         ] {
             assert_eq!(
                 pool_kind_supports_snapshots(backend, ImageFormat::Qcow2),
@@ -628,6 +665,102 @@ mod tests {
                 "{backend:?}"
             );
         }
+    }
+
+    fn zfs(dataset: &str) -> StoragePoolSpec {
+        StoragePoolSpec {
+            backend: PoolBackend::Zfs {
+                dataset: dataset.into(),
+            },
+            nodes: vec![],
+            shared: false,
+        }
+    }
+
+    #[test]
+    fn zfs_pool_round_trips() {
+        let spec: StoragePoolSpec = serde_json::from_value(serde_json::json!({
+            "backend": { "kind": "zfs", "dataset": "tank/opl" }
+        }))
+        .unwrap();
+        assert_eq!(spec, zfs("tank/opl"));
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["backend"]["kind"], "zfs");
+        assert_eq!(json["backend"]["dataset"], "tank/opl");
+        let typo = serde_json::from_value::<StoragePoolSpec>(serde_json::json!({
+            "backend": { "kind": "zfs", "pool": "tank/opl" }
+        }));
+        assert!(typo.is_err());
+    }
+
+    #[test]
+    fn validates_zfs_dataset_names() {
+        // zvol 스냅샷 `{dataset}/opl-{uuid}@{uuid}`가 ZFS 이름 상한 255자를 넘지 않게 177자까지다.
+        let long = format!("t/{}", "a".repeat(175));
+        for ok in [
+            "tank",
+            "tank/opl",
+            "Tank0/a_b.c:d-e/f",
+            "t/x-",
+            "t/.x",
+            "t/9",
+            long.as_str(),
+        ] {
+            assert_eq!(zfs(ok).validate(), Ok(()), "{ok}");
+        }
+        let too_long = format!("t/{}", "a".repeat(176));
+        for bad in [
+            "",
+            "/tank",
+            "tank/",
+            "tank//opl",
+            // 풀 이름은 문자로 시작한다.
+            "0tank",
+            "_tank",
+            "-tank",
+            ".tank",
+            // `-`로 시작하는 구성 요소는 명령 옵션으로 읽힐 수 있다.
+            "tank/-opl",
+            "tank/opl@snap",
+            "tank/opl#bm",
+            "tank/my opl",
+            "tank/opl+",
+            "tank/데이터",
+            "tank/.",
+            "tank/..",
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                zfs(bad).validate(),
+                Err(PoolError::BadZfsDataset(bad.into())),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn zfs_pools_are_node_local_and_need_a_ready_state() {
+        use crate::node::NodeSpec;
+
+        let mut pool = StoragePool::new("z", zfs("tank/opl"));
+        assert!(!is_shared(&pool));
+        pool.spec.shared = true;
+        assert!(!is_shared(&pool));
+        let mut node: Node = Resource::new(
+            "n1",
+            NodeSpec {
+                address: "a".into(),
+                maintenance: false,
+            },
+        );
+        assert!(!pool_usable_on(&pool, &node));
+        let state = PoolState {
+            pool_id: pool.id,
+            ready: true,
+            ..Default::default()
+        };
+        node.status.pools.insert("z".into(), state);
+        assert!(pool_usable_on(&pool, &node));
     }
 
     #[test]
