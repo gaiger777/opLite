@@ -24,6 +24,13 @@ pub enum DriverError {
     PoolNotResponding(std::path::PathBuf),
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
+    /// LVM 명령이 실패했다. 내용은 stderr의 첫 줄이다.
+    #[error("lvm failed: {0}")]
+    Lvm(String),
+    /// 블록 장치 볼륨의 장치 노드가 이 노드에 없다(활성화돼 있지 않거나 노드가 아직 생기지 않았다).
+    /// 저장소의 `activate_volume`이 활성화하면 풀린다.
+    #[error("volume device node missing: {}", .0.display())]
+    VolumeNotActive(std::path::PathBuf),
     /// 살아 있지만 아직 다시 붙지 못해 QMP로 다룰 수 없는 VM. 요청을 보내지 않았으므로
     /// 하이퍼바이저 안에서 돌고 있는 작업은 없다.
     #[error("VM {0} is running but not attached yet")]
@@ -55,13 +62,15 @@ impl DriverError {
             | DriverError::Timeout(_)
             | DriverError::NotAttached(_)
             | DriverError::PoolNotMounted(_)
-            | DriverError::PoolNotResponding(_) => true,
+            | DriverError::PoolNotResponding(_)
+            | DriverError::VolumeNotActive(_) => true,
             DriverError::NotRunning(_)
             | DriverError::InvalidSpec(_)
             | DriverError::StartFailed(_)
             | DriverError::VolumeNotFound(_)
             | DriverError::VolumeExists(_)
-            | DriverError::ToolFailed { .. } => false,
+            | DriverError::ToolFailed { .. }
+            | DriverError::Lvm(_) => false,
         }
     }
 
@@ -86,6 +95,8 @@ mod tests {
         // NFS 풀을 다시 마운트하면 풀린다.
         assert!(DriverError::PoolNotMounted("/var/lib/opl/pools/p".into()).is_transient());
         assert!(DriverError::PoolNotResponding("/var/lib/opl/pools/p".into()).is_transient());
+        // 활성화하면 장치 노드가 생긴다.
+        assert!(DriverError::VolumeNotActive("/dev/vg0/opl-x".into()).is_transient());
         assert!(DriverError::Qmp(QmpError::Disconnected).is_transient());
         assert!(DriverError::Io(std::io::Error::other("x")).is_transient());
         // 바이너리나 풀 디렉터리가 없거나 권한이 없으면 다시 해도 실패한다.
@@ -119,6 +130,7 @@ mod tests {
         assert!(!DriverError::StartFailed("x".into()).is_transient());
         assert!(!DriverError::InvalidSpec("x".into()).is_transient());
         assert!(!DriverError::VolumeNotFound(Uuid::nil()).is_transient());
+        assert!(!DriverError::Lvm("Volume group \"vg0\" not found".into()).is_transient());
     }
 
     #[test]

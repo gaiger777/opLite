@@ -322,6 +322,15 @@ async fn activates_volumes_before_use() {
     assert!(
         matches!(&err, ResolveError::PoolUnavailable(n, e) if n == "local" && e.contains("device busy")),
         "{err:?}"
+    ); // LVM 명령의 실패(영구 오류로 분류되는 `Lvm`)도 VM을 끄지 않고 다시 해 본다.
+    *storage.fail.lock().unwrap() =
+        Some(|| DriverError::Lvm("lvchange: Volume group \"vg0\" not found".into()));
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::PoolUnavailable(n, e) if n == "local" && e.contains("vg0")),
+        "{err:?}"
     );
 }
 

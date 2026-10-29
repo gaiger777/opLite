@@ -78,14 +78,18 @@ impl Storages {
         dst_id: Uuid,
         format: ImageFormat,
     ) -> Result<(), DriverError> {
+        let zero = dst.target_reads_zero(dst_pool).await?;
         let path = dst
             .create_volume(dst_pool, dst_id, size_bytes, format)
             .await?;
         let written = async {
             let from = convert_from(src, force_share, format)?;
-            // -n: 만들어 둔 볼륨(파일 또는 장치)에 쓴다. 새 볼륨은 0으로 읽히므로 0인 부분은 쓰지
+            // -n: 만들어 둔 볼륨(파일 또는 장치)에 쓴다. 새 볼륨이 0으로 읽히면 0인 부분은 쓰지
             // 않는다(--target-is-zero).
-            let mut args = vec!["convert", "-q", "-n", "--target-is-zero"];
+            let mut args = vec!["convert", "-q", "-n"];
+            if zero {
+                args.push("--target-is-zero");
+            }
             args.extend(from.iter().map(String::as_str));
             args.push(path_str(&path)?);
             run_qemu_img(&self.qemu_img, &args).await
@@ -165,6 +169,10 @@ impl Storage for Storages {
 
     async fn capacity(&self, pool: &StoragePool) -> Result<Capacity, DriverError> {
         self.backend(pool)?.capacity(pool).await
+    }
+
+    async fn target_reads_zero(&self, pool: &StoragePool) -> Result<bool, DriverError> {
+        self.backend(pool)?.target_reads_zero(pool).await
     }
 
     /// 다룰 저장소가 없는 풀은 지원하지 않는다.
@@ -374,6 +382,8 @@ mod tests {
         log: Log,
         fail: Vec<&'static str>,
         created: Mutex<Vec<u64>>,
+        /// 새 볼륨이 0으로 읽히는지([`Storage::target_reads_zero`])
+        reads_zero: bool,
     }
 
     impl Recorder {
@@ -384,6 +394,7 @@ mod tests {
                 log: log.clone(),
                 fail: vec![],
                 created: Mutex::default(),
+                reads_zero: true,
             }
         }
 
@@ -471,6 +482,9 @@ mod tests {
         }
         fn supports_snapshots(&self, _: &StoragePool, _: ImageFormat) -> bool {
             self.call("supports_snapshots").is_ok()
+        }
+        async fn target_reads_zero(&self, _: &StoragePool) -> Result<bool, DriverError> {
+            Ok(self.reads_zero)
         }
         async fn snapshot_create(
             &self,
@@ -930,6 +944,45 @@ mod tests {
                 "lvm.volume_source",
                 "file.create_volume",
                 "lvm.release_source",
+            ]
+        );
+    }
+
+    /// 백엔드 사이 복사는 대상 백엔드가 새 볼륨이 0으로 읽힌다고 하지 않으면(0으로 채우지 않는 thin
+    /// pool) `--target-is-zero`를 쓰지 않는다.
+    #[tokio::test]
+    async fn copy_between_backends_asks_the_target_whether_it_reads_zero() {
+        let tools = tempfile::tempdir().unwrap();
+        let log = Log::default();
+        let lvm = Recorder {
+            reads_zero: false,
+            ..Recorder::new("lvm", "/l".as_ref(), &log)
+        };
+        let storages = Storages::new(
+            fake_qemu_img(tools.path(), false),
+            Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
+        )
+        .with_lvm_thin(Arc::new(lvm));
+        assert!(storages.target_reads_zero(&dir_pool()).await.unwrap());
+        assert!(!storages.target_reads_zero(&lvm_pool()).await.unwrap());
+        let (src, dst, raw) = (Uuid::now_v7(), Uuid::now_v7(), ImageFormat::Raw);
+        let source = VolumeSource {
+            path: format!("/f/{src}").into(),
+            format: raw,
+            snapshot: None,
+            size_bytes: 1 << 20,
+        };
+        let target = storages.backend(&lvm_pool()).unwrap();
+        storages
+            .write_into(&source, false, 1 << 20, target, &lvm_pool(), dst, raw)
+            .await
+            .unwrap();
+        let args = std::fs::read_to_string(tools.path().join("args")).unwrap();
+        let (src_path, dst_path) = (format!("/f/{src}"), format!("/l/{dst}"));
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "convert", "-q", "-n", "-f", "raw", "-O", "raw", &src_path, &dst_path
             ]
         );
     }

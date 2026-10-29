@@ -11,8 +11,10 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::mounts::{MOUNTINFO, nfs_mount_points};
 
+mod lvm;
 mod storages;
 
+pub use lvm::{LvInfo, LvmOps, LvmThinStorage, SystemLvm, parse_lvs};
 pub use storages::Storages;
 
 /// 올린 이미지를 검사하는 `qemu-img info`가 멈추면(이상한 extent 등) 무한정 기다리지 않는다.
@@ -109,6 +111,12 @@ pub trait Storage: Send + Sync {
 
     async fn capacity(&self, pool: &StoragePool) -> Result<Capacity, DriverError>;
 
+    /// `pool`에 새로 만든 볼륨이 쓰기 전에 0으로 읽히는지. 그러면 새 볼륨에 써 넣을 때 0인 부분을
+    /// 쓰지 않는다(`qemu-img convert --target-is-zero`). 파일 풀의 새 파일은 그렇다.
+    async fn target_reads_zero(&self, _pool: &StoragePool) -> Result<bool, DriverError> {
+        Ok(true)
+    }
+
     /// 이 백엔드가 `pool`의 `format` 볼륨의 스냅샷을 지원하는지. 지원하지 않는 형식에 스냅샷
     /// 메서드를 부르면 `InvalidSpec`.
     fn supports_snapshots(&self, pool: &StoragePool, format: ImageFormat) -> bool;
@@ -196,7 +204,7 @@ pub trait Storage: Send + Sync {
 }
 
 /// 풀의 볼륨 파일이 놓이는 디렉터리. `dir` 풀은 그 경로, `nfs` 풀은 이 노드의 마운트 지점
-/// `{mount_root}/{풀 id}`, `lvm-thin` 풀은 VG의 장치 디렉터리 `/dev/{vg}`다.
+/// `{mount_root}/{풀 id}`, `lvm-thin` 풀은 VG의 장치 디렉터리 `/dev/{vg}`다(볼륨 파일은 없다).
 pub fn pool_root(pool: &StoragePool, mount_root: &Path) -> PathBuf {
     match &pool.spec.backend {
         PoolBackend::Dir { path } => path.clone(),
@@ -225,10 +233,10 @@ fn check_pool_root_with(
     mountinfo: &ReadMountinfo,
 ) -> Result<PathBuf, DriverError> {
     let root = pool_root(pool, mount_root);
-    // 파일 저장소는 LVM 풀을 다루지 않는다. LVM 드라이버가 들어오기 전까지는 쓸 수 없다.
+    // LVM 풀의 볼륨은 파일이 아니다(`/dev/{vg}`에 파일을 만들지 않는다).
     if let PoolBackend::LvmThin { .. } = &pool.spec.backend {
         return Err(DriverError::InvalidSpec(
-            "lvm-thin pools are not supported yet".into(),
+            "lvm-thin pools hold no volume files".into(),
         ));
     }
     if let PoolBackend::Nfs { .. } = &pool.spec.backend {
@@ -248,13 +256,29 @@ fn check_pool_root_with(
 }
 
 /// VM 디스크로 쓸 볼륨의 위치와 종류. 파일 풀은 풀 루트([`check_pool_root`]로 확인한다) 안의
-/// 볼륨 파일이다.
+/// 볼륨 파일이다. LVM-thin 풀은 LV 장치 `/dev/{vg}/opl-{id}`(없으면 `/dev/mapper`의 노드)이고, 장치
+/// 노드가 없으면(비활성) `VolumeNotActive`다(활성화는 저장소의 `activate_volume`이 한다).
 pub fn disk_location(
     pool: &StoragePool,
     mount_root: &Path,
     id: Uuid,
     format: ImageFormat,
 ) -> Result<(PathBuf, DiskKind), DriverError> {
+    disk_location_in(Path::new(lvm::DEV), pool, mount_root, id, format)
+}
+
+/// [`disk_location`]. LV 장치 노드를 `dev` 아래에서 찾는다.
+fn disk_location_in(
+    dev: &Path,
+    pool: &StoragePool,
+    mount_root: &Path,
+    id: Uuid,
+    format: ImageFormat,
+) -> Result<(PathBuf, DiskKind), DriverError> {
+    if let PoolBackend::LvmThin { vg, .. } = &pool.spec.backend {
+        lvm::require_raw(format)?;
+        return Ok((lvm::volume_device(dev, vg, id)?, DiskKind::Block));
+    }
     check_pool_root(pool, mount_root)?;
     Ok((
         DirStorage::volume_path(pool, mount_root, id, format),
@@ -609,6 +633,36 @@ async fn check_source_header(src: &Path, src_format: SourceFormat) -> Result<(),
     }
 }
 
+/// [`Storage::check_import_source`]: 헤더를 본 뒤 `qemu-img info`로 이미지가 `src` 말고 다른 파일을
+/// 참조하지 않는지 확인한다.
+async fn check_image(
+    qemu_img: &Path,
+    src: &Path,
+    src_format: SourceFormat,
+) -> Result<(), DriverError> {
+    require_absolute(src)?;
+    check_source_header(src, src_format).await?;
+    let src = path_str(src)?;
+    let args = ["info", "--output=json", "-f", src_fmt_name(src_format), src];
+    // 시간이 지나 future가 버려지면 kill_on_drop이 qemu-img를 끝낸다.
+    let out = tokio::time::timeout(INFO_TIMEOUT, run_qemu_img(qemu_img, &args))
+        .await
+        .map_err(|_| DriverError::Timeout("qemu-img info"))??;
+    let json: Value = serde_json::from_slice(&out).map_err(|e| DriverError::ToolFailed {
+        tool: "qemu-img",
+        stderr: format!("unparseable info output: {e}"),
+    })?;
+    // 이미지 자신과 그 하위 노드(extent 등)가 가리키는 파일이 모두 src여야 한다.
+    let mut files = Vec::new();
+    referenced_files(&json, &mut files);
+    match files.into_iter().find(|f| f != src) {
+        None => Ok(()),
+        Some(other) => Err(DriverError::InvalidSpec(format!(
+            "image refers to another file: {other}"
+        ))),
+    }
+}
+
 /// `qemu-img info` 출력에서 이미지가 여는(열 수 있는) 파일 이름을 모두 모은다.
 fn referenced_files(v: &Value, out: &mut Vec<String>) {
     match v {
@@ -689,27 +743,7 @@ impl Storage for DirStorage {
         src: &Path,
         src_format: SourceFormat,
     ) -> Result<(), DriverError> {
-        require_absolute(src)?;
-        check_source_header(src, src_format).await?;
-        let src = path_str(src)?;
-        let args = ["info", "--output=json", "-f", src_fmt_name(src_format), src];
-        // 시간이 지나 future가 버려지면 kill_on_drop이 qemu-img를 끝낸다.
-        let out = tokio::time::timeout(INFO_TIMEOUT, self.qemu_img(&args))
-            .await
-            .map_err(|_| DriverError::Timeout("qemu-img info"))??;
-        let json: Value = serde_json::from_slice(&out).map_err(|e| DriverError::ToolFailed {
-            tool: "qemu-img",
-            stderr: format!("unparseable info output: {e}"),
-        })?;
-        // 이미지 자신과 그 하위 노드(extent 등)가 가리키는 파일이 모두 src여야 한다.
-        let mut files = Vec::new();
-        referenced_files(&json, &mut files);
-        match files.into_iter().find(|f| f != src) {
-            None => Ok(()),
-            Some(other) => Err(DriverError::InvalidSpec(format!(
-                "image refers to another file: {other}"
-            ))),
-        }
+        check_image(&self.qemu_img, src, src_format).await
     }
 
     async fn delete_volume(
@@ -1060,25 +1094,57 @@ mod tests {
         )
     }
 
-    /// LVM 드라이버가 들어오기 전에는 파일 저장소가 LVM 풀을 거절한다(`/dev/{vg}`에 파일을 만들지 않는다).
+    /// 파일 저장소는 LVM 풀을 다루지 않는다(`/dev/{vg}`에 파일을 만들지 않는다).
     #[tokio::test]
-    async fn lvm_thin_pool_is_not_supported_yet() {
+    async fn file_storage_refuses_lvm_thin_pools() {
         let tools = tempfile::tempdir().unwrap();
         let mnt = tempfile::tempdir().unwrap();
         let p = lvm_pool();
         assert_eq!(pool_root(&p, mnt.path()), PathBuf::from("/dev/vg0"));
         let storage = DirStorage::new(fake_tool(tools.path(), "exit 1"), mnt.path());
-        let unsupported = |e: DriverError| match e {
-            DriverError::InvalidSpec(msg) => assert!(msg.contains("not supported"), "{msg}"),
+        let refused = |e: DriverError| match e {
+            DriverError::InvalidSpec(msg) => assert!(msg.contains("no volume files"), "{msg}"),
             other => panic!("unexpected error: {other:?}"),
         };
-        unsupported(check_pool_root(&p, mnt.path()).unwrap_err());
+        refused(check_pool_root(&p, mnt.path()).unwrap_err());
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
-        unsupported(disk_location(&p, mnt.path(), id, f).unwrap_err());
-        unsupported(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
-        unsupported(storage.delete_volume(&p, id, f).await.unwrap_err());
-        unsupported(storage.volume_info(&p, id, f).await.unwrap_err());
-        unsupported(storage.capacity(&p).await.unwrap_err());
+        refused(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
+        refused(storage.delete_volume(&p, id, f).await.unwrap_err());
+        refused(storage.volume_info(&p, id, f).await.unwrap_err());
+        refused(storage.capacity(&p).await.unwrap_err());
+    }
+
+    /// LVM 풀의 디스크는 LV 장치다. 장치 노드가 없으면 비활성(일시 오류)이다.
+    #[test]
+    fn lvm_thin_disks_are_lv_devices() {
+        let dev = tempfile::tempdir().unwrap();
+        let mnt = Path::new(MNT);
+        let p = lvm_pool();
+        let id = Uuid::nil();
+        let path = dev
+            .path()
+            .join("vg0/opl-00000000-0000-0000-0000-000000000000");
+        match disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Raw).unwrap_err() {
+            DriverError::VolumeNotActive(missing) => assert_eq!(missing, path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        std::fs::create_dir(dev.path().join("vg0")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(
+            disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Raw).unwrap(),
+            (path, DiskKind::Block)
+        );
+        // LVM 풀은 raw 볼륨만 담는다.
+        let err = disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Qcow2).unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        // 실제 장치 디렉터리
+        let id = Uuid::now_v7();
+        match disk_location(&p, mnt, id, ImageFormat::Raw).unwrap_err() {
+            DriverError::VolumeNotActive(missing) => {
+                assert_eq!(missing, PathBuf::from(format!("/dev/vg0/opl-{id}")))
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[tokio::test]
