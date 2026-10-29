@@ -112,9 +112,9 @@ export function snapshotSupport(disks: readonly SnapshotDisk[]): SnapshotSupport
 
 /**
  * ZFS 디스크라 되돌릴 수 없는 스냅샷인지. 서버의 `check_zfs_latest`처럼 스냅샷이 찍은 디스크
- * (`vm_spec`)에 ZFS 풀의 볼륨이 있고, `snapshots`(같은 VM의 스냅샷) 가운데 더 나중 것이 있으면 막힌다.
- * 순서는 만든 시각, 같으면 id(UUIDv7)이고 만드는 중인 스냅샷은 가장 나중이다. 목록에 없는 볼륨·풀은
- * 건너뛴다.
+ * (`vm_spec`)의 ZFS 풀 볼륨 가운데 하나를 담은 더 나중의 스냅샷이 `snapshots`(같은 VM의 스냅샷)에
+ * 있으면 막힌다. 순서는 만든 시각, 같으면 id(UUIDv7)이고 만드는 중인 스냅샷은 가장 나중이다. 목록에
+ * 없는 볼륨·풀은 건너뛴다.
  */
 export function zfsNotLatest(
   snapshot: Snapshot,
@@ -122,16 +122,22 @@ export function zfsNotLatest(
   volumes: readonly Volume[],
   pools: readonly StoragePool[],
 ): boolean {
-  const zfs = (snapshot.spec.vm_spec.disks ?? []).some((d) => {
-    const volume = volumes.find((v) => v.name === d.volume);
-    const pool = volume && pools.find((p) => p.name === volume.spec.pool);
-    return pool?.spec.backend.kind === "zfs";
-  });
+  // 스냅샷이 찍은 디스크의 볼륨(목록에 있는 것)
+  const diskVolumes = (s: Snapshot) =>
+    (s.spec.vm_spec.disks ?? []).flatMap((d) => {
+      const volume = volumes.find((v) => v.name === d.volume);
+      return volume ? [volume] : [];
+    });
+  const zfs = new Set(
+    diskVolumes(snapshot)
+      .filter((v) => pools.find((p) => p.name === v.spec.pool)?.spec.backend.kind === "zfs")
+      .map((v) => v.id),
+  );
   const newer = (a: Snapshot, b: Snapshot) => {
     const at = (s: Snapshot) => s.status.created_at ?? Infinity;
     return at(a) !== at(b) ? at(a) > at(b) : a.id > b.id;
   };
-  return zfs && snapshots.some((s) => newer(s, snapshot));
+  return snapshots.some((s) => newer(s, snapshot) && diskVolumes(s).some((v) => zfs.has(v.id)));
 }
 
 /**

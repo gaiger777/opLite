@@ -1267,6 +1267,18 @@ async fn zfs_revert_checks_the_latest_disk_snapshot_before_stopping() {
     storage.set_tags(zvols[1], &[&b, &a]);
     let error = revert_b().await;
     assert!(error.contains("more recent snapshot \"a\""), "{error}");
+    // UUID 태그인데 스냅샷 자원이 없으면 opld가 뒤에서 치우는 opLite 스냅샷의 남은 것이다.
+    let leftover = Uuid::now_v7().to_string();
+    storage.set_tags(zvols[1], &[&a, &b, &leftover]);
+    let error = revert_b().await;
+    assert_eq!(
+        error,
+        format!(
+            "volume \"z1\" has a more recent snapshot {leftover:?} left by an opLite snapshot that \
+             opld removes in the background (retry later or restart opld); zfs disks can only \
+             revert to the latest snapshot"
+        )
+    );
     // 되돌릴 스냅샷이 디스크에 없다.
     storage.set_tags(zvols[1], &[&a]);
     let error = revert_b().await;

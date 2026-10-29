@@ -587,6 +587,8 @@ impl Storage for LvmThinStorage {
     /// 실패한 되돌리기가 남긴 LV를 지운다. 볼륨 LV가 없어도(지우다 멈춘 뒤 다시 지움) 남은 것을
     /// 지우고 `VolumeNotFound`다. 볼륨 LV가 `-revert-` 이름으로만 남았으면 먼저 이름을 되돌려
     /// 볼륨으로 지운다([`volume_lvs`](Self::volume_lvs): 명령이 돌고 있거나 여럿이면 지우지 않는다).
+    /// 볼륨 LV가 없어도 그 LV를 바꾸는 명령이 아직 돌고 있으면(시간을 넘긴 만들기) LV가 곧 생길 수
+    /// 있으므로 일시 오류다.
     async fn delete_volume(
         &self,
         pool: &StoragePool,
@@ -596,6 +598,11 @@ impl Storage for LvmThinStorage {
         let (vg, _) = Self::target(pool, format)?;
         let lvs = self.volume_lvs(vg, id).await?;
         let found = lvs.iter().any(|lv| lv.name == volume_lv(id));
+        if !found && self.ops.changing(vg, &volume_lv(id)) {
+            return Err(DriverError::Timeout(
+                "an earlier lvm command still running on the volume",
+            ));
+        }
         if found {
             self.ops.remove(vg, &volume_lv(id)).await?;
         }
@@ -1443,6 +1450,25 @@ mod tests {
         lvm.busy.lock().unwrap().clear();
         storage.snapshot_delete(&p, id, RAW, "t").await.unwrap();
         assert!(lvm.taken().is_empty());
+    }
+
+    /// 볼륨 LV가 아직 없어도 그 LV를 바꾸는 명령이 돌고 있으면(시간을 넘긴 만들기) 지우기는 일시
+    /// 오류다. `VolumeNotFound`로 자원을 지우면 명령이 끝나 생긴 LV가 남는다.
+    #[tokio::test]
+    async fn delete_waits_for_a_running_create() {
+        let (lvm, storage) = setup("/nonexistent/qemu-img");
+        let (p, id) = (lvm_pool(), Uuid::now_v7());
+        *lvm.busy.lock().unwrap() = vec![format!("opl-{id}")];
+        let err = storage.delete_volume(&p, id, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Timeout(m) if m.contains("still running")),
+            "{err:?}"
+        );
+        assert!(err.is_transient());
+        assert!(lvm.taken().is_empty());
+        lvm.busy.lock().unwrap().clear();
+        let err = storage.delete_volume(&p, id, RAW).await.unwrap_err();
+        assert!(matches!(err, DriverError::VolumeNotFound(_)), "{err:?}");
     }
 
     /// 여러 볼륨의 스냅샷은 기본 구현대로 하나씩 만든다.

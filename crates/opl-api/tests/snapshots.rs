@@ -534,6 +534,64 @@ async fn zfs_disks_revert_only_to_the_latest_snapshot() {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 }
 
+/// 더 나중의 스냅샷이 막는 것은 같은 ZFS 볼륨을 담은 것뿐이다. 다른 볼륨만 담았으면 그 볼륨의
+/// 최근 스냅샷이 아니어도 되돌린다.
+#[tokio::test]
+async fn zfs_revert_only_blocked_by_newer_snapshots_of_the_same_volume() {
+    let env = env().await;
+    let admin = env.admin().await;
+    zfs_volume(&env, "z0").await;
+    zfs_volume(&env, "z1").await;
+    let web = vm_with_disks(&admin, "web", &["z0"]).await;
+    let set_disks = |volumes: &'static [&'static str]| {
+        let env = &env;
+        async move {
+            let vm = env.cluster.get::<VmSpec>(web).unwrap().unwrap();
+            let mut spec = vm.spec.clone();
+            spec.disks = volumes
+                .iter()
+                .map(|v| serde_json::from_value(json!({ "volume": v, "bus": "virtio-blk" })))
+                .collect::<Result<_, _>>()
+                .unwrap();
+            env.cluster
+                .update_spec(web, Some(vm.revision), vm.labels.clone(), &spec)
+                .await
+                .unwrap();
+        }
+    };
+    let take = |name: &'static str, at: u64| {
+        let (env, admin) = (&env, &admin);
+        async move {
+            let (status, body) = admin
+                .post("/vms/web/snapshots", json!({ "name": name }))
+                .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            finish_tasks(env).await;
+            mark_ready_at(env, snapshot_of(env, web, name).await.id, at).await;
+        }
+    };
+    take("s1", 10).await;
+    set_disks(&["z1"]).await;
+    take("s2", 20).await;
+
+    // s2는 z1만 담았으므로 z0의 최근 스냅샷은 s1이다.
+    let (status, body) = admin
+        .post("/vms/web/snapshots/s1/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    finish_tasks(&env).await;
+
+    // z0도 담은 더 나중의 스냅샷이 있으면 막는다.
+    set_disks(&["z0", "z1"]).await;
+    take("s3", 30).await;
+    for name in ["s1", "s2"] {
+        let path = format!("/vms/web/snapshots/{name}/revert");
+        let (status, body) = admin.post(&path, Value::Null).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "snapshot_unsupported");
+    }
+}
+
 #[tokio::test]
 async fn revert_and_delete_need_a_ready_snapshot() {
     let env = env().await;

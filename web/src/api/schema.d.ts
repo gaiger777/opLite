@@ -3244,7 +3244,7 @@ export interface operations {
             query: {
                 name: string;
                 pool: string;
-                /** @description 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin은 raw, 그 밖은 qcow2) */
+                /** @description 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin·zfs는 raw, 그 밖은 qcow2) */
                 format?: "qcow2" | "raw";
                 source_format: "vmdk" | "qcow2" | "raw";
             };
@@ -3281,7 +3281,7 @@ export interface operations {
             query: {
                 name: string;
                 pool: string;
-                /** @description 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin은 raw, 그 밖은 qcow2) */
+                /** @description 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin·zfs는 raw, 그 밖은 qcow2) */
                 format?: "qcow2" | "raw";
                 source_format: "vmdk" | "qcow2" | "raw";
                 /** @description 올릴 파일 크기(바이트) */

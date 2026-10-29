@@ -707,7 +707,8 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
 }
 
 /// 볼륨의 가장 최근 스냅샷이 `tag`(스냅샷 `name`)인지. 아니면 더 최근 스냅샷의 이름(opLite의
-/// 스냅샷이면 그 이름, 아니면 디스크의 태그)과 함께 오류다.
+/// 스냅샷이면 그 이름, 아니면 디스크의 태그)과 함께 오류다. UUID 태그인데 스냅샷 자원이 없으면
+/// opld가 뒤에서 치우는 남은 스냅샷이라고 알린다.
 async fn check_latest_tag(
     ctx: &Ctx,
     volume: &Volume,
@@ -727,11 +728,17 @@ async fn check_latest_tag(
         return Ok(());
     };
     let newer = match last.parse::<Uuid>() {
-        Ok(id) => get_snapshot(ctx, id)?.map_or_else(|| last.clone(), |s| s.spec.name),
-        Err(_) => last.clone(),
+        Ok(id) => match get_snapshot(ctx, id)? {
+            Some(s) => format!("{:?}", s.spec.name),
+            None => format!(
+                "{last:?} left by an opLite snapshot that opld removes in the background (retry \
+                 later or restart opld)"
+            ),
+        },
+        Err(_) => format!("{last:?}"),
     };
     Err(format!(
-        "volume {:?} has a more recent snapshot {newer:?}; zfs disks can only revert to the \
+        "volume {:?} has a more recent snapshot {newer}; zfs disks can only revert to the \
          latest snapshot",
         volume.name
     ))

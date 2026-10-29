@@ -447,9 +447,24 @@ impl ZfsStorage {
 
     /// zvol을 스냅샷과 함께 지운다. "busy"로 실패하면 [`BUSY_RETRIES`]번까지 다시 시도한다.
     async fn destroy(&self, zvol: &str) -> Result<(), DriverError> {
+        self.retry_busy(zvol, || self.ops.destroy(zvol)).await
+    }
+
+    /// zvol의 스냅샷 `tag`를 지운다. "busy"로 실패하면 [`BUSY_RETRIES`]번까지 다시 시도한다.
+    async fn destroy_snapshot(&self, zvol: &str, tag: &str) -> Result<(), DriverError> {
+        self.retry_busy(zvol, || self.ops.destroy_snapshot(zvol, tag))
+            .await
+    }
+
+    /// 지우기 `destroy`가 "busy"로 실패하면 [`BUSY_RETRIES`]번까지 다시 시도한다.
+    async fn retry_busy<F, Fut>(&self, zvol: &str, destroy: F) -> Result<(), DriverError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<(), DriverError>>,
+    {
         let mut retries = 0;
         loop {
-            match self.ops.destroy(zvol).await {
+            match destroy().await {
                 Err(DriverError::Zfs(msg)) if msg.contains("busy") && retries < BUSY_RETRIES => {
                     tracing::debug!(zvol, error = %msg, "zvol busy, retrying destroy");
                     retries += 1;
@@ -589,7 +604,9 @@ impl Storage for ZfsStorage {
         check_image(&self.qemu_img, src, src_format).await
     }
 
-    /// zvol을 스냅샷과 함께 지운다.
+    /// zvol을 스냅샷과 함께 지운다. 먼저 udev를 기다린다(방금 생긴 스냅샷 장치를 열고 있을 수
+    /// 있다). zvol이 없어도 그 zvol을 바꾸는 명령이 아직 돌고 있으면(시간을 넘긴 만들기) zvol이 곧
+    /// 생길 수 있으므로 `VolumeNotFound`가 아니라 일시 오류다.
     async fn delete_volume(
         &self,
         pool: &StoragePool,
@@ -597,7 +614,14 @@ impl Storage for ZfsStorage {
         format: ImageFormat,
     ) -> Result<(), DriverError> {
         let dataset = Self::dataset(pool, format)?;
-        let zvol = self.existing(dataset, id).await?.name;
+        let zvol = volume_zvol(dataset, id);
+        if self.find(dataset, &zvol).await?.is_none() {
+            if self.ops.changing(&zvol) {
+                return Err(DriverError::Timeout(ZFS_BUSY));
+            }
+            return Err(DriverError::VolumeNotFound(id));
+        }
+        self.settle().await;
         self.destroy(&zvol).await
     }
 
@@ -687,10 +711,9 @@ impl Storage for ZfsStorage {
             zvols.push(zvol);
         }
         let zvols: Vec<&str> = zvols.iter().map(String::as_str).collect();
-        self.ops.snapshot(&zvols, tag).await?;
-        // 스냅샷 장치 노드가 생긴다(`snapdev=visible`).
-        self.settle().await;
-        Ok(())
+        // 스냅샷 장치 노드가 생기지만(`snapdev=visible`) udev를 기다리지 않는다: VM이 멈춘 동안일 수
+        // 있고 `udevadm settle`은 호스트의 udev 이벤트를 모두 기다린다. 쓰거나 지울 때 기다린다.
+        self.ops.snapshot(&zvols, tag).await
     }
 
     /// 그 볼륨의 가장 최근 스냅샷으로만 되돌린다(`zfs rollback`은 더 최근 스냅샷이 있으면 그것을
@@ -721,6 +744,7 @@ impl Storage for ZfsStorage {
 
     /// VM이 실행 중이어도 지울 수 있다. 볼륨이나 태그가 없으면 지운 것으로 본다. 다만 그 zvol을
     /// 바꾸는 명령이 아직 돌고 있으면(시간을 넘긴 스냅샷 등) 태그가 곧 생길 수 있으므로 일시 오류다.
+    /// 지우기 전에 udev를 기다린다(방금 생긴 스냅샷 장치를 열고 있을 수 있다).
     async fn snapshot_delete(
         &self,
         pool: &StoragePool,
@@ -744,7 +768,8 @@ impl Storage for ZfsStorage {
             .iter()
             .any(|s| s.tag == tag)
         {
-            self.ops.destroy_snapshot(&zvol, tag).await?;
+            self.settle().await;
+            self.destroy_snapshot(&zvol, tag).await?;
         }
         Ok(())
     }
@@ -1322,7 +1347,11 @@ mod tests {
         }
         zfs.taken();
         storage.delete_volume(&p, id, RAW).await.unwrap();
-        assert_eq!(zfs.taken(), [format!("destroy -r {}", zvol(id))]);
+        // 스냅샷 장치 노드를 udev가 아직 다루고 있을 수 있으므로 먼저 기다린다.
+        assert_eq!(
+            zfs.taken_all(),
+            ["settle".into(), format!("destroy -r {}", zvol(id))]
+        );
         assert_eq!(zfs.names(), [zvol(other)]);
         not_found(storage.delete_volume(&p, id, RAW).await.unwrap_err(), id);
         assert!(zfs.taken().is_empty());
@@ -1534,6 +1563,54 @@ mod tests {
         assert!(zfs.taken().is_empty());
     }
 
+    /// 스냅샷 지우기는 udev를 먼저 기다리고(방금 생긴 스냅샷 장치를 udev가 열고 있을 수 있다)
+    /// "busy"면 세 번까지 다시 시도한다.
+    #[tokio::test]
+    async fn snapshot_delete_settles_and_retries_while_busy() {
+        let (zfs, storage) = setup("/nonexistent/qemu-img");
+        let (p, id) = (pool(), Uuid::now_v7());
+        let destroy = format!("destroy {}@t", zvol(id));
+        storage.create_volume(&p, id, MIB, RAW).await.unwrap();
+        storage.snapshot_create(&p, id, RAW, "t").await.unwrap();
+        zfs.taken();
+        zfs.busy_on(&destroy, 3);
+        storage.snapshot_delete(&p, id, RAW, "t").await.unwrap();
+        let mut want = vec!["settle".to_string()];
+        want.extend(vec![destroy.clone(); 4]);
+        assert_eq!(zfs.taken_all(), want);
+        assert!(storage.snapshot_tags(&p, id, RAW).await.unwrap().is_empty());
+
+        // 네 번째도 busy면 그 오류다.
+        storage.snapshot_create(&p, id, RAW, "t").await.unwrap();
+        zfs.taken();
+        zfs.busy_on(&destroy, 4);
+        let err = storage.snapshot_delete(&p, id, RAW, "t").await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Zfs(ref m) if m.contains("busy")),
+            "{err:?}"
+        );
+        assert_eq!(zfs.taken(), vec![destroy.clone(); 4]);
+        assert_eq!(storage.snapshot_tags(&p, id, RAW).await.unwrap(), ["t"]);
+    }
+
+    /// zvol이 아직 없어도 그 zvol을 바꾸는 명령이 돌고 있으면(시간을 넘긴 만들기) 지우기는 일시
+    /// 오류다. `VolumeNotFound`로 자원을 지우면 명령이 끝나 생긴 zvol이 남는다.
+    #[tokio::test]
+    async fn delete_waits_for_a_running_create() {
+        let (zfs, storage) = setup("/nonexistent/qemu-img");
+        let (p, id) = (pool(), Uuid::now_v7());
+        zfs.changing.lock().unwrap().push(zvol(id));
+        let err = storage.delete_volume(&p, id, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Timeout(m) if m.contains("still running")),
+            "{err:?}"
+        );
+        assert!(err.is_transient());
+        assert!(zfs.taken().is_empty());
+        zfs.changing.lock().unwrap().clear();
+        not_found(storage.delete_volume(&p, id, RAW).await.unwrap_err(), id);
+    }
+
     /// 여러 볼륨을 한 명령으로 찍는다. 볼륨이 없거나 태그가 이미 있으면 아무것도 찍지 않는다.
     #[tokio::test]
     async fn snapshot_many_takes_one_atomic_command() {
@@ -1545,13 +1622,10 @@ mod tests {
         }
         zfs.taken();
         storage.snapshot_many(&p, &[a, b], RAW, "t").await.unwrap();
-        // 스냅샷 장치 노드가 생기므로 udev를 기다린다.
+        // VM이 멈춘 동안이므로 udev를 기다리지 않는다(지울 때 기다린다).
         assert_eq!(
             zfs.taken_all(),
-            [
-                format!("snapshot {} {} @t", zvol(a), zvol(b)),
-                "settle".into()
-            ]
+            [format!("snapshot {} {} @t", zvol(a), zvol(b))]
         );
         for v in [a, b] {
             assert_eq!(storage.snapshot_tags(&p, v, RAW).await.unwrap(), ["t"]);

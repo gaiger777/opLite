@@ -191,7 +191,7 @@ pub async fn create_volume(
 pub struct ImportQuery {
     pub name: String,
     pub pool: String,
-    /// 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin은 raw, 그 밖은 qcow2)
+    /// 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin·zfs는 raw, 그 밖은 qcow2)
     #[serde(default)]
     #[param(inline)]
     pub format: Option<ImageFormat>,
@@ -206,7 +206,7 @@ pub struct ImportQuery {
 pub struct ImportCheckQuery {
     pub name: String,
     pub pool: String,
-    /// 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin은 raw, 그 밖은 qcow2)
+    /// 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin·zfs는 raw, 그 밖은 qcow2)
     #[serde(default)]
     #[param(inline)]
     pub format: Option<ImageFormat>,

@@ -250,10 +250,10 @@ fn check_disks(state: &AppState, vm: &Vm) -> Result<Option<&'static str>, ApiErr
 }
 
 /// ZFS는 볼륨의 가장 최근 스냅샷으로만 되돌린다(설계 §4). `snapshot`의 디스크에 ZFS 볼륨이 있고 VM에
-/// 그보다 나중의 스냅샷(만드는 중인 것 포함)이 있으면 409 `snapshot_unsupported`. 순서는 만든 시각,
-/// 같으면 id(UUIDv7)다. 드라이버도 되돌릴 때 같은 확인을 한다.
+/// 그 볼륨 중 하나를 담은 그보다 나중의 스냅샷(만드는 중인 것 포함)이 있으면 409
+/// `snapshot_unsupported`. 순서는 만든 시각, 같으면 id(UUIDv7)다. 드라이버도 되돌릴 때 같은 확인을 한다.
 fn check_zfs_latest(state: &AppState, vm: &Vm, snapshot: &Snapshot) -> Result<(), ApiError> {
-    let mut zfs = false;
+    let mut zfs = Vec::new();
     for disk in &snapshot.spec.vm_spec.disks {
         let Some(volume) = state.cluster.get_by_name::<VolumeSpec>(&disk.volume)? else {
             continue;
@@ -263,28 +263,34 @@ fn check_zfs_latest(state: &AppState, vm: &Vm, snapshot: &Snapshot) -> Result<()
             .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
             && matches!(pool.spec.backend, PoolBackend::Zfs { .. })
         {
-            zfs = true;
-            break;
+            zfs.push(volume.id);
         }
     }
-    if !zfs {
+    if zfs.is_empty() {
         return Ok(());
     }
     // 만드는 중인 스냅샷은 가장 나중이다.
     let order = |s: &Snapshot| (s.status.created_at.unwrap_or(u64::MAX), s.id);
-    let newer = snapshots_of(state, vm.id)?
+    for newer in snapshots_of(state, vm.id)?
         .1
         .iter()
-        .any(|s| order(s) > order(snapshot));
-    if newer {
-        return Err(ApiError::conflict(
-            "snapshot_unsupported",
-            format!(
-                "zfs disks can only revert to the latest snapshot; snapshot {:?} of VM {:?} is \
-                 not the latest",
-                snapshot.spec.name, vm.name
-            ),
-        ));
+        .filter(|s| order(s) > order(snapshot))
+    {
+        for disk in &newer.spec.vm_spec.disks {
+            let Some(volume) = state.cluster.get_by_name::<VolumeSpec>(&disk.volume)? else {
+                continue;
+            };
+            if zfs.contains(&volume.id) {
+                return Err(ApiError::conflict(
+                    "snapshot_unsupported",
+                    format!(
+                        "zfs disks can only revert to the latest snapshot; snapshot {:?} of VM \
+                         {:?} is not the latest of volume {:?}",
+                        snapshot.spec.name, vm.name, volume.name
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }

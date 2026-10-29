@@ -165,4 +165,24 @@ it("finds snapshots a VM with disks in ZFS pools cannot revert to, like the serv
   expect(notLatest(old, all, [raw("z-root", "fast")])).toBe(false);
   // 목록에 없는 볼륨은 건너뛴다.
   expect(notLatest(old, all, [])).toBe(false);
+  // 같은 ZFS 볼륨을 담지 않은 더 나중의 스냅샷은 막지 않는다.
+  const other = {
+    ...zvm,
+    spec: {
+      ...zvm.spec,
+      disks: [{ volume: "z-data", bus: "virtio-blk" as const, boot_order: null }],
+    },
+  };
+  const data = snapshot("data", other, 4, { status: { created_at: 1_792_000_200 } });
+  const vols = [...zvols, raw("z-data", "tank")];
+  expect(notLatest(tie, [...all, data], vols)).toBe(false);
+  expect(notLatest(old, [old, data], vols)).toBe(false);
+  // 둘 다 담았으면 막는다.
+  const both = {
+    ...zvm,
+    spec: { ...zvm.spec, disks: [...zvm.spec.disks, ...other.spec.disks] },
+  };
+  const later = snapshot("later", both, 5, { status: { created_at: 1_792_000_300 } });
+  expect(notLatest(tie, [...all, data, later], vols)).toBe(true);
+  expect(notLatest(data, [...all, data, later], vols)).toBe(true);
 });
