@@ -23,13 +23,13 @@ use opl_types::storage::{
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::schedule::task_failed;
-use crate::snapshots::{uses_lv_snapshots, vm_placement};
+use crate::snapshots::{uses_block_snapshots, vm_placement};
 
 /// 새 Task를 저장소에 만든다. 이름은 id 문자열이다.
 pub(crate) async fn create_task(
@@ -57,7 +57,8 @@ pub struct TaskRunnerConfig {
     /// VM별 상태 디렉터리의 뿌리(`QemuConfig::state_dir`). 스냅샷의 UEFI 변수 사본을 둔다.
     /// 없으면 변수를 복사하거나 되돌리지 않는다.
     pub state_dir: Option<PathBuf>,
-    /// 풀이 마운트되지 않아 시작할 때 지우지 못한 고아 볼륨을 다시 지워 보는 간격
+    /// 풀이 마운트되지 않아 시작할 때 지우지 못한 고아 볼륨, 시간을 넘긴 블록 스냅샷이 남긴 태그를
+    /// 다시 지워 보는 간격
     pub orphan_retry: Duration,
 }
 
@@ -87,6 +88,8 @@ struct Ctx {
     config: TaskRunnerConfig,
     /// 실행 중인 복제 Task가 만든 것(Task id별). 실패하면 정리가 지운다.
     cloned: std::sync::Mutex<HashMap<Uuid, clone::Made>>,
+    /// 실행기가 멈췄는지. 뒤에서 도는 일(남은 태그 지우기)이 보고 함께 멈춘다.
+    stopped: watch::Sender<bool>,
 }
 
 impl TaskRunner {
@@ -107,6 +110,7 @@ impl TaskRunner {
             reconciler,
             config,
             cloned: Default::default(),
+            stopped: watch::channel(false).0,
         });
         let (revision, tasks) = loop {
             match ctx.cluster.list::<TaskSpec>() {
@@ -135,6 +139,7 @@ impl TaskRunner {
 /// `unmounted`는 풀이 마운트되지 않아 지우지 못한 고아 볼륨이다. 따로 다시 지워 본다.
 async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<Uuid>) {
     let retry = tokio::spawn(retry_orphans(ctx.clone(), unmounted));
+    let tags = tokio::spawn(sweep_block_tags(ctx.clone()));
     // 실행을 시작한 Task. 목록을 다시 읽을 때 같은 Task를 두 번 시작하지 않게 한다.
     let mut started: HashSet<Uuid> = HashSet::new();
     // 실행 중인 Task. 실행기가 멈출 때 함께 멈춘다.
@@ -211,6 +216,62 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<
         handle.abort();
     }
     retry.abort();
+    tags.abort();
+    ctx.stopped.send_replace(true);
+}
+
+/// 시간을 넘긴 블록 스냅샷이 남긴 태그를 지운다: 이 노드가 맡는 블록 풀(LVM-thin, ZFS) 볼륨의
+/// 태그 중 UUID 모양인데 그 id의 스냅샷 리소스가 없는 것. 스냅샷 Task는 리소스를 만든 뒤 태그를
+/// 찍고 태그를 지운 뒤 리소스를 지우므로 그런 태그는 남은 것이다. opLite 밖에서 만든 태그는 두고,
+/// 스토리지 명령이 느려도 실행기 시작을 막지 않게 뒤에서 돈다.
+async fn sweep_block_tags(ctx: Arc<Ctx>) {
+    let volumes = match ctx.cluster.list::<VolumeSpec>() {
+        Ok((_, volumes)) => volumes,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot list volumes");
+            return;
+        }
+    };
+    for volume in volumes {
+        if volume.status.phase != VolumePhase::Ready
+            || volume.status.node.is_some_and(|n| n != ctx.config.node)
+        {
+            continue;
+        }
+        let Ok(Some(pool)) = ctx
+            .cluster
+            .get_by_name::<StoragePoolSpec>(&volume.spec.pool)
+        else {
+            continue;
+        };
+        if !uses_block_snapshots(&pool) {
+            continue;
+        }
+        let format = volume.spec.format;
+        let tags = match ctx.storage.snapshot_tags(&pool, volume.id, format).await {
+            Ok(tags) => tags,
+            Err(e) => {
+                tracing::debug!(volume = %volume.name, error = %e, "cannot read block snapshots");
+                continue;
+            }
+        };
+        for tag in tags {
+            let Ok(id) = tag.parse::<Uuid>() else {
+                continue;
+            };
+            if !matches!(ctx.cluster.get::<SnapshotSpec>(id), Ok(None)) {
+                continue;
+            }
+            tracing::warn!(volume = %volume.name, tag, "removing a block snapshot left without its snapshot");
+            if let Err(e) = ctx
+                .storage
+                .snapshot_delete(&pool, volume.id, format, &tag)
+                .await
+            {
+                tracing::warn!(volume = %volume.name, tag, error = %e, "cannot remove block snapshot");
+            }
+        }
+    }
 }
 
 /// 풀이 마운트되지 않았거나 응답하지 않아 지우지 못한 고아 볼륨을 `orphan_retry`마다 다시 지워 본다. 지웠거나 볼륨이
@@ -299,7 +360,7 @@ fn start(
         }
         if interrupted {
             let error = "interrupted: opld restarted while the task was running".to_string();
-            fail(&ctx, &task, error).await;
+            fail(&ctx, &task, error, true).await;
         } else {
             execute(&ctx, task).await;
         }
@@ -314,10 +375,15 @@ async fn execute(ctx: &Ctx, task: Task) {
     if !begin(ctx, task.id).await {
         return;
     }
-    let result = match tokio::time::timeout(ctx.config.timeout, perform(ctx, &task)).await {
-        Ok(r) => r,
-        Err(_) => Err(format!("timed out after {:?}", ctx.config.timeout)),
-    };
+    // 시간을 넘겨 버린 작업은 끝나지 않았다(명령이 아직 돌 수 있다).
+    let (result, unfinished) =
+        match tokio::time::timeout(ctx.config.timeout, perform(ctx, &task)).await {
+            Ok(r) => (r, false),
+            Err(_) => (
+                Err(format!("timed out after {:?}", ctx.config.timeout)),
+                true,
+            ),
+        };
     match result {
         Ok(()) => {
             // 예약 오류는 만들기가 성공해야 지운다(보관 삭제의 성공은 만들기 실패를 풀지 않는다).
@@ -327,17 +393,17 @@ async fn execute(ctx: &Ctx, task: Task) {
             }
             set_status(ctx, task.id, TaskState::Succeeded, None).await
         }
-        Err(e) => fail(ctx, &task, e).await,
+        Err(e) => fail(ctx, &task, e, unfinished).await,
     }
 }
 
 /// 실패로 기록한다. 만들다 만 볼륨·스냅샷은 지운다. 예약 스냅샷의 만들기나 예약 정리의 삭제였으면
-/// VM에 이유를 남긴다.
-async fn fail(ctx: &Ctx, task: &Task, error: String) {
+/// VM에 이유를 남긴다. `unfinished`면 작업이 끝나지 않았다(시간 초과, 재시작으로 중단).
+async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
     tracing::warn!(task = %task.id, error = %error, "task failed");
     // 정리가 스냅샷 리소스를 지우므로 먼저 본다.
     let scheduled = snapshot::scheduled_vm(ctx, task);
-    cleanup(ctx, task).await;
+    cleanup(ctx, task, unfinished).await;
     if let Some(vm) = scheduled {
         snapshot::record_schedule(ctx, vm, Some(task_failed(error.clone()))).await;
     }
@@ -347,11 +413,15 @@ async fn fail(ctx: &Ctx, task: &Task, error: String) {
 /// 실패한 볼륨 생성·가져오기, 스냅샷 만들기, 복제의 흔적을 지워 이름을 다시 쓸 수 있게 한다.
 /// 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
 /// 재시작으로 중단) 작업이 아직 돌고 있을 수 있어 태그를 두고 리소스만 지운다(설계 §6 "태그만 남은 경우").
-async fn cleanup(ctx: &Ctx, task: &Task) {
-    if let TaskOp::SnapshotCreate { snapshot } = task.spec.op
-        && let Err(e) = snapshot::discard_pending(ctx, snapshot).await
-    {
-        tracing::warn!(snapshot = %snapshot, error = %e, "cannot clean up failed snapshot");
+/// 블록 디스크의 태그는 뒤에서 다시 지운다([`snapshot::remove_unfinished_tags`]).
+async fn cleanup(ctx: &Ctx, task: &Task, unfinished: bool) {
+    if let TaskOp::SnapshotCreate { snapshot } = task.spec.op {
+        if unfinished {
+            snapshot::remove_unfinished_tags(ctx, snapshot);
+        }
+        if let Err(e) = snapshot::discard_pending(ctx, snapshot).await {
+            tracing::warn!(snapshot = %snapshot, error = %e, "cannot clean up failed snapshot");
+        }
     }
     if let TaskOp::VolumeImport { source, .. } = &task.spec.op {
         let _ = tokio::fs::remove_file(source).await;
@@ -681,7 +751,7 @@ async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 }
 
 /// 볼륨 크기를 늘린다(설계 §5). 실행 중인 VM이 쓰면 그 QEMU로(`block_resize`, 게스트가 바로
-/// 본다. LVM-thin 볼륨은 스토리지로 먼저 늘린다), 아니면 스토리지로 늘린 뒤 실제 크기를 스펙에
+/// 본다. 블록 볼륨(LVM-thin, ZFS)은 스토리지로 먼저 늘린다), 아니면 스토리지로 늘린 뒤 실제 크기를 스펙에
 /// 기록한다. API가 확인한 뒤 VM이 켜지거나 꺼졌을 수 있고 앞의 Task가 크기를 바꿨을 수 있어 여기서
 /// 다시 본다.
 async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), String> {
@@ -707,12 +777,13 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
                 vm.name
             ));
         }
-        // 실행 중에는 디스크를 바꿀 수 없으므로 스펙의 순서가 QEMU의 디스크 번호다. LV는 QEMU가
-        // 늘릴 수 없으므로 저장소로 먼저 늘린 뒤 QEMU에 LV의 실제 크기(LVM은 extent 단위로
-        // 올린다)를 알린다. 그래야 게스트가 보는 크기가 아래에서 기록하는 크기와 같다.
+        // 실행 중에는 디스크를 바꿀 수 없으므로 스펙의 순서가 QEMU의 디스크 번호다. 블록 볼륨은
+        // QEMU가 늘릴 수 없으므로 저장소로 먼저 늘린 뒤 QEMU에 볼륨의 실제 크기(LVM은 extent,
+        // ZFS는 1 MiB 단위로 올린다)를 알린다. 그래야 게스트가 보는 크기가 아래에서 기록하는
+        // 크기와 같다.
         Some((vm, disk)) if vm.status.phase == VmPhase::Running => {
             let mut size_bytes = size_bytes;
-            if uses_lv_snapshots(&pool) {
+            if uses_block_snapshots(&pool) {
                 ctx.storage
                     .resize_volume(&pool, id, volume.spec.format, size_bytes)
                     .await

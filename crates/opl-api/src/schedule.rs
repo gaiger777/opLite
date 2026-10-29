@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::snapshots::{start_create, start_delete, vm_placement, vm_uses_lv_snapshots};
+use crate::snapshots::{start_create, start_delete, vm_placement, vm_uses_block_snapshots};
 use crate::state::AppState;
 
 #[derive(Debug, Clone)]
@@ -147,7 +147,7 @@ fn auto_name(now: u64, snapshots: &[Snapshot]) -> String {
 /// 한 번에 하나씩 지우고(만들지 않는다), 아니면 마지막 예약 스냅샷에서 주기가 지났을 때 만든다.
 /// 마지막 만들기 시도가 그 뒤면, 거절된 것은 한 시간 뒤에, 보낸 Task가 실패한 것은 다음 주기에
 /// 다시 한다. 지우려 한 스냅샷이 아직 있으면(지우기가 실패했다) 그 삭제는 한 시간 뒤에 다시 하고,
-/// 그동안은 만들기를 본다(보관 정리가 막혀도 새 스냅샷은 만든다). `lv_disks`면 VM의 디스크가 LV
+/// 그동안은 만들기를 본다(보관 정리가 막혀도 새 스냅샷은 만든다). `block_disks`면 VM의 디스크가 블록
 /// 스냅샷을 쓰므로(메모리 상태를 담지 못한다) 예약이 메모리를 원해도 디스크만 찍는다.
 fn plan(
     now: u64,
@@ -156,7 +156,7 @@ fn plan(
     snapshots: &[Snapshot],
     tasks: &[Task],
     attempts: &Attempts,
-    lv_disks: bool,
+    block_disks: bool,
 ) -> Option<Plan> {
     let schedule = vm.spec.snapshot_schedule?;
     let busy = tasks.iter().any(|t| {
@@ -208,7 +208,7 @@ fn plan(
     let running = vm.status.phase == VmPhase::Running;
     Some(Plan::Create {
         name: auto_name(now, snapshots),
-        memory: schedule.memory && running && !vm.spec.disks.is_empty() && !lv_disks,
+        memory: schedule.memory && running && !vm.spec.disks.is_empty() && !block_disks,
     })
 }
 
@@ -251,10 +251,10 @@ async fn tick(
             .cloned()
             .collect();
         let attempted = attempts.get(&vm.id).copied().unwrap_or_default();
-        let Ok(lv_disks) = vm_uses_lv_snapshots(cluster, vm) else {
+        let Ok(block_disks) = vm_uses_block_snapshots(cluster, vm) else {
             continue;
         };
-        let Some(plan) = plan(now, config.hour, vm, &mine, &tasks, &attempted, lv_disks) else {
+        let Some(plan) = plan(now, config.hour, vm, &mine, &tasks, &attempted, block_disks) else {
             continue;
         };
         let result = match check_node(state, vm) {
@@ -655,7 +655,7 @@ mod tests {
             plan(NOW, HOUR, &off, &[], &[]),
             create("auto-20261027-0507", false)
         );
-        // LV 스냅샷을 쓰는 디스크는 메모리를 담지 못한다(요청하면 거절된다).
+        // 블록 스냅샷을 쓰는 디스크는 메모리를 담지 못한다(요청하면 거절된다).
         let v = vm(ScheduleEvery::Hourly, 3, true);
         assert_eq!(
             super::plan(NOW, HOUR, &v, &[], &[], &Attempts::default(), true),

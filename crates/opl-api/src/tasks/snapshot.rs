@@ -18,13 +18,16 @@ use opl_types::vm::{PowerState, ScheduleError, Vm, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
 
 use crate::schedule::{recorded_vm, set_schedule_error};
-use crate::snapshots::uses_lv_snapshots;
+use crate::snapshots::{block_snapshot_kind, uses_block_snapshots};
 use crate::vms::check_node_arch;
 
 use super::{Ctx, set_power, set_volume_size, started, stopped, superseded, wait_vm};
 
-/// 실행 중인 VM을 LV 스냅샷을 위해 멈춰 두는 한도. Task 한도(600초)보다 충분히 짧다.
+/// 실행 중인 VM을 블록 스냅샷을 위해 멈춰 두는 한도. Task 한도(600초)보다 충분히 짧다.
 const PAUSE_LIMIT: Duration = Duration::from_secs(120);
+
+/// 시간을 넘겨 실패한 블록 스냅샷이 남긴 태그를 뒤에서 다시 지워 보는 횟수. 간격은 `orphan_retry`다.
+const LEFT_TAG_TRIES: u32 = 10;
 
 /// 멈춘 VM을 이어서 실행하는 시도 횟수와 그 간격
 const RESUME_TRIES: u32 = 3;
@@ -85,9 +88,74 @@ impl Drop for Paused {
         let (hv, id) = (self.hv.clone(), self.id);
         rt.spawn(async move {
             if let Err(e) = resume_vm(&*hv, id).await {
-                tracing::error!(vm = %id, error = %e, "cannot resume VM paused for lvm snapshots");
+                tracing::error!(vm = %id, error = %e, "cannot resume VM paused for block snapshots");
             }
         });
+    }
+}
+
+/// 시간을 넘겨 실패한 블록 스냅샷 `snapshot`이 디스크 `disks`에 남겼을 수 있는 태그를 뒤에서
+/// 지운다. 명령이 아직 돌 수 있으므로 `orphan_retry` 뒤부터 그 간격으로 [`LEFT_TAG_TRIES`]번까지
+/// 해 본다. 그 id의 스냅샷 리소스가 있으면 그 스냅샷의 태그이므로 그 차례는 건너뛴다. 그래도 남은
+/// 태그는 실행기가 다음에 시작할 때 지운다. 실행기가 멈추면 함께 멈춘다.
+fn remove_left_tags(ctx: &Ctx, snapshot: Uuid, mut disks: Vec<(Volume, StoragePool)>) {
+    let (cluster, storage) = (ctx.cluster.clone(), ctx.storage.clone());
+    let interval = ctx.config.orphan_retry;
+    let tag = snapshot.to_string();
+    let mut stopped = ctx.stopped.subscribe();
+    let remove = async move {
+        for _ in 0..LEFT_TAG_TRIES {
+            tokio::time::sleep(interval).await;
+            if !matches!(cluster.get::<SnapshotSpec>(snapshot), Ok(None)) {
+                continue;
+            }
+            let mut left = Vec::new();
+            for (volume, pool) in disks {
+                match storage
+                    .snapshot_delete(&pool, volume.id, volume.spec.format, &tag)
+                    .await
+                {
+                    Ok(()) | Err(DriverError::VolumeNotFound(_)) => {}
+                    Err(e) => {
+                        tracing::debug!(snapshot = %snapshot, volume = %volume.name, error = %e, "cannot remove block snapshot left by a timed-out snapshot yet");
+                        left.push((volume, pool));
+                    }
+                }
+            }
+            disks = left;
+            if disks.is_empty() {
+                tracing::info!(snapshot = %snapshot, "removed block snapshots left by a timed-out snapshot");
+                return;
+            }
+        }
+        tracing::warn!(snapshot = %snapshot, "cannot remove block snapshots left by a timed-out snapshot");
+    };
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = stopped.wait_for(|s| *s) => {}
+            () = remove => {}
+        }
+    });
+}
+
+/// 끝나지 않은 채(Task 시간 초과, 재시작으로 중단) 실패한 만들기 Task의 스냅샷 `id`가 이 노드의
+/// 블록 디스크에 남겼을 수 있는 태그를 뒤에서 지운다([`remove_left_tags`]). 리소스를 지우기 전에
+/// 부른다(디스크는 리소스의 VM 스펙에서 읽는다).
+pub(super) fn remove_unfinished_tags(ctx: &Ctx, id: Uuid) {
+    let Ok(Some(snapshot)) = get_snapshot(ctx, id) else {
+        return;
+    };
+    let mut disks = Vec::new();
+    for disk in &snapshot.spec.vm_spec.disks {
+        if let Ok(Some((volume, pool))) = volume_by_name(ctx, &disk.volume)
+            && uses_block_snapshots(&pool)
+            && check_local(ctx, &volume, &pool).is_ok()
+        {
+            disks.push((volume, pool));
+        }
+    }
+    if !disks.is_empty() {
+        remove_left_tags(ctx, id, disks);
     }
 }
 
@@ -173,7 +241,7 @@ pub(super) fn check_local(ctx: &Ctx, volume: &Volume, pool: &StoragePool) -> Res
     }
 }
 
-/// LV 스냅샷을 위해 VM을 멈춰야 하는지: 하이퍼바이저가 실행 중(`Running`)이라고 알리면 그렇다.
+/// 블록 스냅샷을 위해 VM을 멈춰야 하는지: 하이퍼바이저가 실행 중(`Running`)이라고 알리면 그렇다.
 /// 그 밖의 상태(일시정지, QEMU가 I/O 오류 등으로 스스로 멈춤)는 게스트가 디스크에 쓰지 않으므로
 /// 멈추지도 이어서 실행하지도 않는다. QMP로 다룰 수 없거나, 꺼졌거나, 상태를 알 수 없으면 오류다.
 async fn needs_pause(ctx: &Ctx, vm: Uuid) -> Result<bool, String> {
@@ -181,7 +249,7 @@ async fn needs_pause(ctx: &Ctx, vm: Uuid) -> Result<bool, String> {
         Ok(Some(s)) => match s.status {
             RuntimeStatus::Running => Ok(true),
             RuntimeStatus::Other(s) if s == "unresponsive" => {
-                Err("VM is not responding; it cannot be paused for lvm snapshots".into())
+                Err("VM is not responding; it cannot be paused for block snapshots".into())
             }
             _ => Ok(false),
         },
@@ -190,20 +258,40 @@ async fn needs_pause(ctx: &Ctx, vm: Uuid) -> Result<bool, String> {
     }
 }
 
-/// 디스크들이 LV 스냅샷을 쓰는지([`uses_lv_snapshots`]). 방식이 섞였으면 오류다.
-fn lv_snapshots(disks: &[(Volume, StoragePool)]) -> Result<bool, String> {
-    let lvm = disks.iter().filter(|(_, p)| uses_lv_snapshots(p)).count();
-    if lvm != 0 && lvm != disks.len() {
+/// 디스크들이 블록 스냅샷을 쓰면 그 종류([`block_snapshot_kind`]). 방식(qcow2 내부 스냅샷,
+/// 블록 백엔드 종류)이 섞였으면 오류다.
+fn block_snapshots(disks: &[(Volume, StoragePool)]) -> Result<Option<&'static str>, String> {
+    let mut kinds = disks.iter().map(|(_, p)| block_snapshot_kind(p));
+    let first = kinds.next().flatten();
+    if kinds.any(|k| k != first) {
         return Err("disks use different snapshot methods".into());
     }
-    Ok(lvm != 0)
+    Ok(first)
 }
 
-/// `spec`의 디스크 중 LV 스냅샷을 쓰는 것이 있는지. 없는 볼륨은 넘어간다.
-fn has_lv_disks(ctx: &Ctx, spec: &VmSpec) -> Result<bool, String> {
+/// 같은 풀·형식의 디스크끼리 묶는다(처음 나온 순서). 한 묶음은 [`Storage::snapshot_many`] 한
+/// 번으로 찍는다.
+///
+/// [`Storage::snapshot_many`]: opl_driver::Storage::snapshot_many
+fn by_pool(disks: &[(Volume, StoragePool)]) -> Vec<Vec<&(Volume, StoragePool)>> {
+    let mut groups: Vec<Vec<&(Volume, StoragePool)>> = Vec::new();
+    for disk in disks {
+        let same = |g: &&mut Vec<&(Volume, StoragePool)>| {
+            g[0].1.id == disk.1.id && g[0].0.spec.format == disk.0.spec.format
+        };
+        match groups.iter_mut().find(same) {
+            Some(group) => group.push(disk),
+            None => groups.push(vec![disk]),
+        }
+    }
+    groups
+}
+
+/// `spec`의 디스크 중 블록 스냅샷을 쓰는 것이 있는지. 없는 볼륨은 넘어간다.
+fn has_block_disks(ctx: &Ctx, spec: &VmSpec) -> Result<bool, String> {
     for disk in &spec.disks {
         if let Some((_, pool)) = volume_by_name(ctx, &disk.volume)?
-            && uses_lv_snapshots(&pool)
+            && uses_block_snapshots(&pool)
         {
             return Ok(true);
         }
@@ -212,9 +300,9 @@ fn has_lv_disks(ctx: &Ctx, spec: &VmSpec) -> Result<bool, String> {
 }
 
 /// 디스크의 태그를 지운다. 실행 중이면 QEMU가 디스크를 쥐고 있으므로 하이퍼바이저로, 아니면
-/// `spec`의 디스크마다 스토리지로 지운다. LV 스냅샷은 QEMU가 쓰지 않으므로 실행 중이어도 스토리지로
-/// 지운다. 태그나 볼륨이 없는 디스크는 그냥 넘어가고, 한 디스크가 실패해도 나머지를 지운 뒤 첫
-/// 오류를 돌려준다. 다른 노드에 있는 볼륨은 이 노드에서 파일이 보이지 않으므로(없는 것으로 보면
+/// `spec`의 디스크마다 스토리지로 지운다. 블록 스냅샷은 QEMU가 쓰지 않으므로 실행 중이어도
+/// 스토리지로 지운다. 태그나 볼륨이 없는 디스크는 그냥 넘어가고, 한 디스크가 실패해도 나머지를
+/// 지운 뒤 첫 오류를 돌려준다. 다른 노드에 있는 볼륨은 이 노드에서 파일이 보이지 않으므로(없는 것으로 보면
 /// 태그가 남는다) 오류다.
 async fn remove_tags(
     ctx: &Ctx,
@@ -223,7 +311,7 @@ async fn remove_tags(
     spec: &VmSpec,
     tag: &str,
 ) -> Result<(), String> {
-    if running && !has_lv_disks(ctx, spec)? {
+    if running && !has_block_disks(ctx, spec)? {
         return ctx
             .hv
             .snapshot_delete(vm, tag)
@@ -294,10 +382,11 @@ fn now_secs() -> u64 {
 }
 
 /// `pending` 스냅샷을 채운다. 실행 중이면 하이퍼바이저로(메모리 포함 또는 디스크만), 정지했으면
-/// 디스크마다 스토리지로 태그를 만든다(LV 스냅샷은 실행 중이면 VM을 잠시 멈추고 스토리지로).
+/// 디스크마다 스토리지로 태그를 만든다(블록 스냅샷은 실행 중이면 VM을 잠시 멈추고 스토리지로).
+/// 스토리지로는 같은 풀의 디스크를 한 번에 찍는다(ZFS는 원자적).
 /// UEFI 변수를 복사한 뒤 `ready`로 바꾸고 VM의 현재 위치로 삼는다. 실패를 확인했으면 만든 태그를
 /// 지운다(리소스는 실행기의 정리가 지운다). 응답을 기다리다 시간이 다 됐으면 작업이 아직 돌 수
-/// 있으므로 태그를 두고 실패한다.
+/// 있으므로 태그를 두고 실패한다(블록 스냅샷의 태그는 뒤에서 다시 지운다, [`remove_left_tags`]).
 pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), String> {
     let snapshot = get_snapshot(ctx, id)?.ok_or("snapshot was deleted")?;
     let vm = get_vm(ctx, vm_id)?;
@@ -316,12 +405,14 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
             volume.name, volume.spec.format
         ));
     }
-    let lvm = lv_snapshots(&disks)?;
+    let block = block_snapshots(&disks)?;
     if snapshot.spec.memory && disks.is_empty() {
         return Err("VM has no disk to hold the memory state".into());
     }
-    if snapshot.spec.memory && lvm {
-        return Err("lvm-thin disks cannot hold the memory state".into());
+    if let Some(kind) = block
+        && snapshot.spec.memory
+    {
+        return Err(format!("{kind} disks cannot hold the memory state"));
     }
 
     // 부모와 VM 스펙은 실행하는 지금의 것이다. 앞에 줄 선 스냅샷 Task가 현재 위치를 바꿨을 수 있다.
@@ -336,12 +427,12 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     }
 
     let tag = id.to_string();
-    // 실행 중인 VM의 LV 스냅샷: VM을 멈춰 블록 I/O를 비운 뒤 디스크마다 저장소로 찍고, 찍기가
+    // 실행 중인 VM의 블록 스냅샷: VM을 멈춰 블록 I/O를 비운 뒤 풀마다 저장소로 찍고, 찍기가
     // 실패해도 반드시 이어서 실행한다(설계 §5). 멈춘 구간은 `PAUSE_LIMIT`을 넘기지 않는다. QEMU가
     // 스스로 멈춘 VM(I/O 오류 등)은 멈추지도 이어서 실행하지도 않는다([`needs_pause`]).
-    let lv_running = running && lvm && !disks.is_empty();
+    let block_running = running && block.is_some() && !disks.is_empty();
     let mut paused = None;
-    if lv_running && needs_pause(ctx, vm_id).await? {
+    if block_running && needs_pause(ctx, vm_id).await? {
         let mut guard = Paused::new(&ctx.hv, vm_id);
         if let Err(e) = ctx.hv.pause(vm_id).await {
             // 응답만 늦었으면 멈췄을 수 있다.
@@ -353,22 +444,24 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         paused = Some(guard);
     }
     let paused_at = Instant::now();
-    // 찍기가 끝난 디스크. 시간을 넘겨 실패하면 이것들의 스냅샷만 지운다.
+    // 찍기가 끝난 묶음의 디스크. 시간을 넘겨 실패하면 이것들의 스냅샷만 지운다.
     let mut taken = Vec::new();
-    let made = if !running || lv_running {
+    let made = if !running || block_running {
         let take = async {
-            for (volume, pool) in &disks {
+            for group in by_pool(&disks) {
+                let (volume, pool) = group[0];
+                let ids: Vec<Uuid> = group.iter().map(|(v, _)| v.id).collect();
                 ctx.storage
-                    .snapshot_create(pool, volume.id, volume.spec.format, &tag)
+                    .snapshot_many(pool, &ids, volume.spec.format, &tag)
                     .await?;
-                taken.push((volume, pool));
+                taken.extend(group.into_iter().map(|(v, p)| (v, p)));
             }
             Ok(())
         };
         match paused {
             Some(_) => tokio::time::timeout(PAUSE_LIMIT, take)
                 .await
-                .unwrap_or(Err(DriverError::Timeout("lvm snapshots of a paused VM"))),
+                .unwrap_or(Err(DriverError::Timeout("block snapshots of a paused VM"))),
             None => take.await,
         }
     } else if disks.is_empty() {
@@ -381,9 +474,9 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         Some(guard) => {
             let resumed = guard.resume().await;
             let paused_ms = paused_at.elapsed().as_millis() as u64;
-            tracing::info!(vm = %vm_id, snapshot = %id, paused_ms, "VM was paused for lvm snapshots");
+            tracing::info!(vm = %vm_id, snapshot = %id, paused_ms, "VM was paused for block snapshots");
             if let Err(e) = &resumed {
-                tracing::error!(vm = %vm_id, error = %e, "cannot resume VM paused for lvm snapshots");
+                tracing::error!(vm = %vm_id, error = %e, "cannot resume VM paused for block snapshots");
             }
             resumed
         }
@@ -402,16 +495,22 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         _ => Ok(()),
     };
     let failure = match (made, copied) {
-        // LV 스냅샷은 디스크마다 따로 만든다. 끝난 디스크의 것은 지우고, 아직 돌 수 있는
-        // 디스크의 것만 둔다.
-        (Err(e), _) if e.may_be_in_progress() && lv_running => {
+        // 블록 스냅샷은 풀마다 따로 만든다. 끝난 묶음의 것은 지우고, 아직 돌 수 있는 묶음의
+        // 것만 둔다(그 안에서 어느 디스크가 끝났는지는 모른다).
+        (Err(e), _) if e.may_be_in_progress() && block_running => {
+            let left = disks
+                .iter()
+                .filter(|(v, _)| !taken.iter().any(|(t, _)| t.id == v.id))
+                .cloned()
+                .collect();
+            remove_left_tags(ctx, id, left);
             for (volume, pool) in taken {
                 if let Err(e) = ctx
                     .storage
                     .snapshot_delete(pool, volume.id, volume.spec.format, &tag)
                     .await
                 {
-                    tracing::warn!(snapshot = %id, volume = %volume.name, error = %e, "cannot remove lvm snapshot of failed snapshot");
+                    tracing::warn!(snapshot = %id, volume = %volume.name, error = %e, "cannot remove block snapshot of failed snapshot");
                 }
             }
             let error = format!(
@@ -424,6 +523,9 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
             });
         }
         (Err(e), _) if e.may_be_in_progress() => {
+            if block.is_some() {
+                remove_left_tags(ctx, id, disks.clone());
+            }
             return Err(format!(
                 "{e}; the snapshot may still be written to the disks and its tag {tag} is left there"
             ));
@@ -545,6 +647,13 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
         }
     }
     let tag = id.to_string();
+    // ZFS 디스크는 가장 최근 스냅샷으로만 되돌린다. API는 VM의 스냅샷 순서만 보므로, 디스크에
+    // 더 최근 스냅샷(opLite 밖에서 만든 것 등)이 있으면 끄기 전에 그만둔다.
+    for (volume, pool) in &disks {
+        if block_snapshot_kind(pool) == Some("zfs") {
+            check_latest_tag(ctx, volume, pool, &tag, &snapshot.spec.name).await?;
+        }
+    }
 
     let vm = get_vm(ctx, vm_id)?;
     if vm.spec.power != PowerState::Stopped || !is_down(&vm) {
@@ -595,6 +704,37 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
         wait_vm(ctx, vm_id, started).await?;
     }
     Ok(())
+}
+
+/// 볼륨의 가장 최근 스냅샷이 `tag`(스냅샷 `name`)인지. 아니면 더 최근 스냅샷의 이름(opLite의
+/// 스냅샷이면 그 이름, 아니면 디스크의 태그)과 함께 오류다.
+async fn check_latest_tag(
+    ctx: &Ctx,
+    volume: &Volume,
+    pool: &StoragePool,
+    tag: &str,
+    name: &str,
+) -> Result<(), String> {
+    let tags = ctx
+        .storage
+        .snapshot_tags(pool, volume.id, volume.spec.format)
+        .await
+        .map_err(|e| format!("cannot read snapshots of volume {:?}: {e}", volume.name))?;
+    if !tags.iter().any(|t| t == tag) {
+        return Err(format!("volume {:?} has no snapshot {name:?}", volume.name));
+    }
+    let Some(last) = tags.last().filter(|t| *t != tag) else {
+        return Ok(());
+    };
+    let newer = match last.parse::<Uuid>() {
+        Ok(id) => get_snapshot(ctx, id)?.map_or_else(|| last.clone(), |s| s.spec.name),
+        Err(_) => last.clone(),
+    };
+    Err(format!(
+        "volume {:?} has a more recent snapshot {newer:?}; zfs disks can only revert to the \
+         latest snapshot",
+        volume.name
+    ))
 }
 
 pub(super) fn is_down(vm: &Vm) -> bool {

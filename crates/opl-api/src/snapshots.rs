@@ -166,19 +166,29 @@ fn check_no_task(
     Ok(())
 }
 
-/// 디스크 스냅샷을 LV 스냅샷으로 두는 풀(`lvm-thin`)인지. 아니면 qcow2 내부 스냅샷이다.
-pub(crate) fn uses_lv_snapshots(pool: &StoragePool) -> bool {
-    matches!(pool.spec.backend, PoolBackend::LvmThin { .. })
+/// 디스크 스냅샷을 블록 장치의 스냅샷으로 두는 풀의 종류(`lvm-thin`, `zfs`). 파일 풀(qcow2 내부
+/// 스냅샷)이면 `None`.
+pub(crate) fn block_snapshot_kind(pool: &StoragePool) -> Option<&'static str> {
+    match pool.spec.backend {
+        PoolBackend::LvmThin { .. } => Some("lvm-thin"),
+        PoolBackend::Zfs { .. } => Some("zfs"),
+        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => None,
+    }
 }
 
-/// VM의 디스크 중 LV 스냅샷을 쓰는 것([`uses_lv_snapshots`])이 있는지. 없는 볼륨·풀은 넘어간다.
-pub(crate) fn vm_uses_lv_snapshots(cluster: &Cluster, vm: &Vm) -> Result<bool, ClusterError> {
+/// 디스크 스냅샷을 블록 스냅샷으로 두는 풀(LVM-thin, ZFS)인지. 아니면 qcow2 내부 스냅샷이다.
+pub(crate) fn uses_block_snapshots(pool: &StoragePool) -> bool {
+    block_snapshot_kind(pool).is_some()
+}
+
+/// VM의 디스크 중 블록 스냅샷을 쓰는 것([`uses_block_snapshots`])이 있는지. 없는 볼륨·풀은 넘어간다.
+pub(crate) fn vm_uses_block_snapshots(cluster: &Cluster, vm: &Vm) -> Result<bool, ClusterError> {
     for disk in &vm.spec.disks {
         let Some(volume) = cluster.get_by_name::<VolumeSpec>(&disk.volume)? else {
             continue;
         };
         if let Some(pool) = cluster.get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
-            && uses_lv_snapshots(&pool)
+            && uses_block_snapshots(&pool)
         {
             return Ok(true);
         }
@@ -187,11 +197,12 @@ pub(crate) fn vm_uses_lv_snapshots(cluster: &Cluster, vm: &Vm) -> Result<bool, C
 }
 
 /// 모든 디스크가 스냅샷을 담을 수 있고 다 만들어졌는지. 풀 종류마다 담는 형식이 다르다
-/// ([`pool_kind_supports_snapshots`]: 파일 풀은 qcow2, LVM-thin 풀은 raw). 담지 못하는 디스크가
-/// 하나라도 있으면 일부 디스크만 되돌아가므로 거부하고, 방식(qcow2 내부 스냅샷, LV 스냅샷)이
-/// 섞여도 거부한다. 디스크가 LV 스냅샷을 쓰면 true.
-fn check_disks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
-    let mut lvm = None;
+/// ([`pool_kind_supports_snapshots`]: 파일 풀은 qcow2, 블록 풀은 raw). 담지 못하는 디스크가
+/// 하나라도 있으면 일부 디스크만 되돌아가므로 거부하고, 방식(qcow2 내부 스냅샷, 블록 백엔드
+/// 종류마다의 블록 스냅샷)이 섞여도 거부한다. 디스크가 블록 스냅샷을 쓰면 그 종류
+/// ([`block_snapshot_kind`]).
+fn check_disks(state: &AppState, vm: &Vm) -> Result<Option<&'static str>, ApiError> {
+    let mut method = None;
     for disk in &vm.spec.disks {
         let volume = state
             .cluster
@@ -204,7 +215,7 @@ fn check_disks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
                 ApiError::bad_request(format!("storage pool {:?} not found", volume.spec.pool))
             })?;
         if !pool_kind_supports_snapshots(&pool.spec.backend, volume.spec.format) {
-            let only = if uses_lv_snapshots(&pool) {
+            let only = if uses_block_snapshots(&pool) {
                 "raw"
             } else {
                 "qcow2"
@@ -218,8 +229,8 @@ fn check_disks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
                 ),
             ));
         }
-        let this = uses_lv_snapshots(&pool);
-        if lvm.replace(this).is_some_and(|before| before != this) {
+        let this = block_snapshot_kind(&pool);
+        if method.replace(this).is_some_and(|before| before != this) {
             return Err(ApiError::conflict(
                 "snapshot_unsupported",
                 format!(
@@ -235,7 +246,47 @@ fn check_disks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
             ));
         }
     }
-    Ok(lvm == Some(true))
+    Ok(method.flatten())
+}
+
+/// ZFS는 볼륨의 가장 최근 스냅샷으로만 되돌린다(설계 §4). `snapshot`의 디스크에 ZFS 볼륨이 있고 VM에
+/// 그보다 나중의 스냅샷(만드는 중인 것 포함)이 있으면 409 `snapshot_unsupported`. 순서는 만든 시각,
+/// 같으면 id(UUIDv7)다. 드라이버도 되돌릴 때 같은 확인을 한다.
+fn check_zfs_latest(state: &AppState, vm: &Vm, snapshot: &Snapshot) -> Result<(), ApiError> {
+    let mut zfs = false;
+    for disk in &snapshot.spec.vm_spec.disks {
+        let Some(volume) = state.cluster.get_by_name::<VolumeSpec>(&disk.volume)? else {
+            continue;
+        };
+        if let Some(pool) = state
+            .cluster
+            .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
+            && matches!(pool.spec.backend, PoolBackend::Zfs { .. })
+        {
+            zfs = true;
+            break;
+        }
+    }
+    if !zfs {
+        return Ok(());
+    }
+    // 만드는 중인 스냅샷은 가장 나중이다.
+    let order = |s: &Snapshot| (s.status.created_at.unwrap_or(u64::MAX), s.id);
+    let newer = snapshots_of(state, vm.id)?
+        .1
+        .iter()
+        .any(|s| order(s) > order(snapshot));
+    if newer {
+        return Err(ApiError::conflict(
+            "snapshot_unsupported",
+            format!(
+                "zfs disks can only revert to the latest snapshot; snapshot {:?} of VM {:?} is \
+                 not the latest",
+                snapshot.spec.name, vm.name
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// VM의 스냅샷 전부
@@ -318,7 +369,7 @@ pub async fn get_snapshot(
 
 /// `pending` 스냅샷을 만들고(부모는 VM의 현재 위치, `vm_spec`은 지금 스펙) 그것을 채울 Task를
 /// 돌려준다(202). 시작·정지 중이면 409 `vm_busy`, 스냅샷을 담지 못하는 디스크가 있거나 디스크의
-/// 스냅샷 방식이 섞였거나 LVM-thin 디스크의 VM에 메모리 스냅샷을 요청하면 409
+/// 스냅샷 방식이 섞였거나 블록 디스크(LVM-thin, ZFS)의 VM에 메모리 스냅샷을 요청하면 409
 /// `snapshot_unsupported`. 실행 중이 아니거나 디스크가 없는 VM의 메모리 스냅샷은 400.
 #[utoipa::path(post, path = "/vms/{key}/snapshots", tag = "snapshots",
     params(("key" = String, Path, description = "VM id or name")),
@@ -353,20 +404,22 @@ pub(crate) async fn start_create(
     scheduled: bool,
 ) -> Result<Task, ApiError> {
     check_not_busy(state, vm)?;
-    let lvm = check_disks(state, vm)?;
+    let block = check_disks(state, vm)?;
     let running = vm.status.phase == VmPhase::Running;
     let has_disk = !vm.spec.disks.is_empty();
-    // LV 스냅샷에는 메모리 상태를 담을 qcow2가 없다.
-    if lvm && memory == Some(true) {
+    // 블록 스냅샷에는 메모리 상태를 담을 qcow2가 없다.
+    if let Some(kind) = block
+        && memory == Some(true)
+    {
         return Err(ApiError::conflict(
             "snapshot_unsupported",
             format!(
-                "VM {:?} has lvm-thin disks; their snapshots cannot hold the memory state",
+                "VM {:?} has {kind} disks; their snapshots cannot hold the memory state",
                 vm.name
             ),
         ));
     }
-    let memory = memory.unwrap_or(running && has_disk && !lvm);
+    let memory = memory.unwrap_or(running && has_disk && block.is_none());
     if memory && !running {
         return Err(ApiError::bad_request(format!(
             "VM {:?} is not running; only its disks can be snapshotted",
@@ -415,7 +468,8 @@ pub(crate) async fn start_create(
 }
 
 /// 디스크·UEFI 변수·VM 스펙을 스냅샷 것으로 되돌릴 Task를 돌려준다(202). 실행 중이면 강제로 끈다.
-/// 스냅샷 스펙의 볼륨이 모두 있고 다 만들어졌으며 다른 VM이 쓰지 않아야 한다.
+/// 스냅샷 스펙의 볼륨이 모두 있고 다 만들어졌으며 다른 VM이 쓰지 않아야 한다. ZFS 디스크는 VM의
+/// 가장 최근 스냅샷으로만 되돌린다(아니면 409 `snapshot_unsupported`).
 #[utoipa::path(post, path = "/vms/{key}/snapshots/{name}/revert", tag = "snapshots",
     params(("key" = String, Path, description = "VM id or name"), ("name" = String, Path, description = "snapshot name or id")),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -429,6 +483,7 @@ pub async fn revert_snapshot(
     check_not_busy(&state, &vm)?;
     let snapshot = find_snapshot(&state, &vm, &name)?;
     check_ready(&snapshot)?;
+    check_zfs_latest(&state, &vm, &snapshot)?;
     // 되돌린 스펙을 VM 수정처럼 검증한다. 노드는 지금 것을 유지하고, 시작은 Task가 한다.
     let mut spec = snapshot.spec.vm_spec.clone();
     spec.node = vm.spec.node;
@@ -566,4 +621,39 @@ pub async fn clone_vm(
 /// VM의 스냅샷 수. VM 삭제를 막는 데 쓴다.
 pub(crate) fn count_snapshots(state: &AppState, vm: Uuid) -> Result<usize, ApiError> {
     Ok(snapshots_of(state, vm)?.1.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool(backend: PoolBackend) -> StoragePool {
+        Resource::new(
+            "p",
+            StoragePoolSpec {
+                backend,
+                nodes: vec![],
+                shared: false,
+            },
+        )
+    }
+
+    #[test]
+    fn block_pools_use_block_snapshots_of_their_kind() {
+        let dir = pool(PoolBackend::Dir {
+            path: "/pools/local".into(),
+        });
+        let lvm = pool(PoolBackend::LvmThin {
+            vg: "vg0".into(),
+            thinpool: "tp".into(),
+        });
+        let zfs = pool(PoolBackend::Zfs {
+            dataset: "tank/opl".into(),
+        });
+        assert_eq!(block_snapshot_kind(&dir), None);
+        assert_eq!(block_snapshot_kind(&lvm), Some("lvm-thin"));
+        assert_eq!(block_snapshot_kind(&zfs), Some("zfs"));
+        assert!(!uses_block_snapshots(&dir));
+        assert!(uses_block_snapshots(&zfs));
+    }
 }

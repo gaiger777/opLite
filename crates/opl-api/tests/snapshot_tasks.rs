@@ -1,5 +1,6 @@
 //! 스냅샷 Task 실행: 실행 중인 VM(Mock 하이퍼바이저)의 만들기·삭제, 부모와 현재 위치, 실패 정리,
-//! 디스크 없는 VM 되돌리기, 시작할 때의 고아 정리, 실행 중인 VM의 LVM 스냅샷과 크기 늘리기. 디스크 파일을 다루는 경우는 `snapshot_disks`.
+//! 디스크 없는 VM 되돌리기, 시작할 때의 고아 정리, 실행 중인 VM의 블록(LVM, ZFS) 스냅샷과 크기
+//! 늘리기. 디스크 파일을 다루는 경우는 `snapshot_disks`.
 
 mod common;
 
@@ -12,7 +13,7 @@ use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
-use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
+use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{Arch, PowerState, VmPhase, VmSpec};
 use reqwest::StatusCode;
@@ -793,51 +794,71 @@ fn pending(vm: Uuid, spec: &VmSpec, name: &str) -> Snapshot {
     s
 }
 
-/// LVM-thin 풀 `thin`과 그 풀의 바로 Ready인 1 MiB raw 볼륨 `names`를 저장소에 직접 만들고, 파일
-/// 없는 스토리지로 실행기를 다시 띄운다(볼륨은 1 MiB로 알린다).
-async fn lvm_volumes(env: &mut Env, names: &[&str]) -> (Vec<Uuid>, Arc<FakeStorage>) {
-    let pool = Resource::new(
-        "thin",
-        StoragePoolSpec {
-            backend: opl_types::storage::PoolBackend::LvmThin {
-                vg: "vg0".into(),
-                thinpool: "tp".into(),
-            },
-            nodes: vec![],
-            shared: false,
-        },
-    );
-    env.cluster.create(&pool).await.unwrap();
-    env.pool_ready("thin").await;
+fn lvm(vg: &str) -> PoolBackend {
+    PoolBackend::LvmThin {
+        vg: vg.into(),
+        thinpool: "tp".into(),
+    }
+}
+
+fn zfs(dataset: &str) -> PoolBackend {
+    PoolBackend::Zfs {
+        dataset: dataset.into(),
+    }
+}
+
+/// 블록 풀들(이름, 백엔드, 볼륨 이름)과 각 풀의 바로 Ready인 1 MiB raw 볼륨을 저장소에 직접 만들고,
+/// 파일 없는 스토리지로 실행기를 다시 띄운다(볼륨은 1 MiB로 알린다). id는 볼륨을 적은 순서다.
+async fn block_volumes(
+    env: &mut Env,
+    pools: &[(&str, PoolBackend, &[&str])],
+) -> (Vec<Uuid>, Arc<FakeStorage>) {
     let storage = Arc::new(FakeStorage::default());
     let mut ids = Vec::new();
-    for name in names {
-        let mut volume = Resource::new(
-            *name,
-            VolumeSpec {
-                pool: "thin".into(),
-                size_bytes: 1 << 20,
-                format: ImageFormat::Raw,
-            },
-        );
-        env.cluster.create(&volume).await.unwrap();
-        volume.status.phase = VolumePhase::Ready;
+    for (pool, backend, names) in pools {
+        let spec = StoragePoolSpec {
+            backend: backend.clone(),
+            nodes: vec![],
+            shared: false,
+        };
         env.cluster
-            .update_status::<VolumeSpec>(volume.id, &volume.status)
+            .create(&Resource::new(*pool, spec))
             .await
             .unwrap();
-        storage.set_size(volume.id, 1 << 20);
-        ids.push(volume.id);
+        env.pool_ready(pool).await;
+        for name in names.iter() {
+            let mut volume = Resource::new(
+                *name,
+                VolumeSpec {
+                    pool: (*pool).into(),
+                    size_bytes: 1 << 20,
+                    format: ImageFormat::Raw,
+                },
+            );
+            env.cluster.create(&volume).await.unwrap();
+            volume.status.phase = VolumePhase::Ready;
+            env.cluster
+                .update_status::<VolumeSpec>(volume.id, &volume.status)
+                .await
+                .unwrap();
+            storage.set_size(volume.id, 1 << 20);
+            ids.push(volume.id);
+        }
     }
     env.stop_runner().await;
     env.start_runner_with(storage.clone()).await;
     (ids, storage)
 }
 
+/// LVM-thin 풀 `thin`과 그 풀의 볼륨 `names`([`block_volumes`])
+async fn lvm_volumes(env: &mut Env, names: &[&str]) -> (Vec<Uuid>, Arc<FakeStorage>) {
+    block_volumes(env, &[("thin", lvm("vg0"), names)]).await
+}
+
 /// 디스크 `disks`를 붙인 VM을 이 노드에서 실행 중으로 만든다. LVM-thin 풀은 macOS에서 쓸 수 없어
 /// reconciler가 띄우지 못하므로 Mock 하이퍼바이저에 직접 띄운 뒤 이 노드에 켜진 것으로 배치한다
 /// (reconciler는 이미 돌고 있는 VM을 그대로 둔다).
-async fn running_lvm_vm(env: &Env, admin: &Client, name: &str, disks: &[&str]) -> Uuid {
+async fn running_block_vm(env: &Env, admin: &Client, name: &str, disks: &[&str]) -> Uuid {
     let mut req = vm_request(name);
     req["spec"]["disks"] = disks
         .iter()
@@ -878,7 +899,7 @@ async fn running_vm_lvm_snapshot_pauses_it_while_the_disks_are_snapshotted() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (lvs, storage) = lvm_volumes(&mut env, &["lv0", "lv1"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
 
     // 첫 디스크를 찍는 동안 VM은 멈춰 있다.
     storage.pause();
@@ -916,7 +937,7 @@ async fn failed_lvm_snapshot_resumes_the_vm_and_removes_the_lvs_made() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (lvs, storage) = lvm_volumes(&mut env, &["lv0", "lv1"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
 
     storage.fail_snapshot_create(lvs[1]);
     let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
@@ -935,14 +956,21 @@ async fn failed_lvm_snapshot_resumes_the_vm_and_removes_the_lvs_made() {
     assert_eq!(position(&env, vm), None);
 }
 
-/// 한 디스크의 찍기가 시간을 넘기면 그 디스크의 스냅샷 LV는 아직 만들어지고 있을 수 있으므로
-/// 두고, 찍기가 끝난 디스크의 것만 지운다. 다시 돌리지 못했으면 그것도 알린다.
+/// 한 풀의 찍기가 시간을 넘기면 그 풀의 스냅샷 LV는 아직 만들어지고 있을 수 있으므로 두고, 찍기가
+/// 끝난 풀의 것만 지운다. 다시 돌리지 못했으면 그것도 알린다.
 #[tokio::test]
 async fn timed_out_lvm_snapshot_removes_only_the_lvs_made() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
-    let (lvs, storage) = lvm_volumes(&mut env, &["lv0", "lv1"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
+    let (lvs, storage) = block_volumes(
+        &mut env,
+        &[
+            ("thin", lvm("vg0"), &["lv0"]),
+            ("thin2", lvm("vg1"), &["lv1"]),
+        ],
+    )
+    .await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
 
     storage.time_out_snapshot_create(lvs[1]);
     storage.pause();
@@ -966,12 +994,327 @@ async fn timed_out_lvm_snapshot_removes_only_the_lvs_made() {
     env.hv.set_unresponsive(vm, false);
 }
 
+/// 같은 풀의 디스크는 한 번에 찍으므로(ZFS는 원자적) 그 묶음이 시간을 넘기면 어느 디스크가
+/// 끝났는지 모른다. 그 풀의 스냅샷은 모두 둔다.
+#[tokio::test]
+async fn timed_out_snapshot_of_one_pool_leaves_all_its_disks() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0", "z1"])]).await;
+    running_block_vm(&env, &admin, "web", &["z0", "z1"]).await;
+
+    storage.time_out_snapshot_create(zvols[1]);
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(storage.snapshot_groups(), [vec![zvols[0], zvols[1]]]);
+    assert_eq!(
+        storage.calls(),
+        [("create", zvols[0]), ("create", zvols[1])]
+    );
+}
+
+/// 시간을 넘겨 남긴 태그는 그 스냅샷 리소스가 없으면 뒤에서 `orphan_retry` 간격으로 다시 지운다.
+/// 시간을 넘긴 명령이 아직 돌아 지우기가 일시 오류면 다음 차례에 다시 지운다. 지웠으면 더 하지
+/// 않는다.
+#[tokio::test]
+async fn timed_out_block_snapshot_tags_are_removed_later() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("y", zfs("tank/other"), &["y0"]),
+            ("z", zfs("tank/opl"), &["z0", "z1"]),
+        ],
+    )
+    .await;
+    let retry = std::time::Duration::from_millis(100);
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |config| config.orphan_retry = retry)
+        .await;
+    running_block_vm(&env, &admin, "web", &["y0", "z0", "z1"]).await;
+
+    storage.time_out_snapshot_create(zvols[2]);
+    storage.busy_snapshot_deletes(zvols[2], 1);
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    // 끝난 풀의 것은 바로 지우고, 시간을 넘긴 풀의 것은 뒤에서 지운다.
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while !(storage.tags(zvols[1]).is_empty() && storage.tags(zvols[2]).is_empty()) {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(retry * 4).await;
+    let deletes = |id: Uuid| {
+        storage
+            .calls()
+            .iter()
+            .filter(|c| **c == ("delete", id))
+            .count()
+    };
+    assert_eq!(
+        (deletes(zvols[0]), deletes(zvols[1]), deletes(zvols[2])),
+        (1, 1, 2)
+    );
+}
+
+/// 남은 태그가 지워질 때까지 기다린다.
+async fn wait_untagged(storage: &FakeStorage, id: Uuid) {
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while !storage.tags(id).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 블록 스냅샷 Task가 Task 제한 시간에 걸려 버려지면 명령이 아직 돌다 태그를 남길 수 있다. 리소스를
+/// 지운 뒤 뒤에서 `orphan_retry` 간격으로 그 태그를 지운다.
+#[tokio::test]
+async fn block_snapshot_abandoned_at_the_task_limit_has_its_tags_removed_later() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0"]).await;
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |c| {
+        c.timeout = std::time::Duration::from_millis(500);
+        c.orphan_retry = std::time::Duration::from_millis(100);
+    })
+    .await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    // 버려진 명령이 끝나 태그를 남긴다.
+    let tag = get(&env, vm, "a").id.to_string();
+    storage.set_tags(zvols[0], &[&tag]);
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(find(&env, vm, "a").is_none());
+    wait_untagged(&storage, zvols[0]).await;
+}
+
+/// 블록 스냅샷 Task가 끝나지 않은 채 실행기가 멈췄다 다시 시작하면 Task를 실패로 끝내고 리소스를
+/// 지운 뒤, 남았을 수 있는 태그를 뒤에서 지운다(시작할 때의 정리는 리소스가 아직 있어 두었다).
+#[tokio::test]
+async fn interrupted_block_snapshot_has_its_tags_removed_later() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0"]).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    env.stop_runner().await;
+    let tag = get(&env, vm, "a").id.to_string();
+    storage.set_tags(zvols[0], &[&tag]);
+    env.start_runner_config(storage.clone(), |c| {
+        c.orphan_retry = std::time::Duration::from_millis(100)
+    })
+    .await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(find(&env, vm, "a").is_none());
+    wait_untagged(&storage, zvols[0]).await;
+}
+
+/// 실행기가 멈추면 뒤에서 태그를 지우던 일도 멈춘다.
+#[tokio::test]
+async fn left_tag_removal_stops_with_the_runner() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0"])]).await;
+    let retry = std::time::Duration::from_millis(300);
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |c| c.orphan_retry = retry)
+        .await;
+    running_block_vm(&env, &admin, "web", &["z0"]).await;
+
+    storage.time_out_snapshot_create(zvols[0]);
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    env.stop_runner().await;
+    tokio::time::sleep(retry * 3).await;
+    assert!(!storage.calls().contains(&("delete", zvols[0])));
+    assert_eq!(storage.tags(zvols[0]).len(), 1);
+}
+
+/// 실행기가 시작하면 이 노드의 블록 풀 볼륨에서 스냅샷 리소스가 없는 opLite 태그(UUID)를 지운다.
+/// 리소스가 있는 태그, opLite 밖의 태그, 다른 노드의 볼륨은 그대로 둔다.
+#[tokio::test]
+async fn block_snapshot_tags_without_snapshots_are_removed_at_startup() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("z", zfs("tank/opl"), &["z0", "z1"]),
+            ("thin", lvm("vg0"), &["lv0"]),
+        ],
+    )
+    .await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "a" })).await);
+    let a = get(&env, vm, "a").id.to_string();
+    let orphan = Uuid::now_v7().to_string();
+    storage.set_tags(vols[0], &[&a, &orphan, "autosnap_hourly"]);
+    storage.set_tags(vols[1], &[&orphan]);
+    storage.set_tags(vols[2], &[&orphan]);
+    let mut z1 = env.cluster.get::<VolumeSpec>(vols[1]).unwrap().unwrap();
+    z1.status.node = Some(Uuid::now_v7());
+    env.cluster
+        .update_status::<VolumeSpec>(z1.id, &z1.status)
+        .await
+        .unwrap();
+
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while !storage.tags(vols[2]).is_empty() || storage.tags(vols[0]).len() != 2 {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(storage.tags(vols[0]), [a.as_str(), "autosnap_hourly"]);
+    assert_eq!(storage.tags(vols[1]), [orphan.as_str()]);
+}
+
+/// 실행 중인 VM의 ZFS 스냅샷: VM을 멈추고 같은 풀의 디스크를 한 번에 찍는다. 풀이 다르면 풀마다
+/// 찍는다. 메모리는 담지 못한다.
+#[tokio::test]
+async fn running_vm_zfs_snapshot_takes_each_pool_at_once() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("z", zfs("tank/opl"), &["z0", "z1"]),
+            ("y", zfs("tank/other"), &["y0"]),
+        ],
+    )
+    .await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0", "y0", "z1"]).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert!(env.hv.is_paused(vm));
+    storage.resume();
+    succeeded(&admin.wait_task(&task).await);
+    assert!(!env.hv.is_paused(vm));
+    assert_eq!(
+        storage.snapshot_groups(),
+        [vec![zvols[0], zvols[1]], vec![zvols[2]]]
+    );
+    assert!(env.hv.snapshots(vm).is_empty());
+    let a = get(&env, vm, "a");
+    assert_eq!(a.status.phase, SnapshotPhase::Ready);
+    assert!(!a.spec.memory);
+
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "m", "memory": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("zfs disks"),
+        "{body}"
+    );
+}
+
+/// ZFS 디스크는 가장 최근 스냅샷으로만 되돌린다. API가 확인한 뒤에도 디스크에 더 최근 스냅샷이
+/// 있으면(opLite 밖에서 만든 것 등) VM을 끄기 전에 그 이름과 함께 실패한다.
+#[tokio::test]
+async fn zfs_revert_checks_the_latest_disk_snapshot_before_stopping() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0", "z1"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0", "z1"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "a" })).await);
+    succeeded(&snapshot(&admin, "web", json!({ "name": "b" })).await);
+    let (a, b) = (
+        get(&env, vm, "a").id.to_string(),
+        get(&env, vm, "b").id.to_string(),
+    );
+    assert_eq!(storage.tags(zvols[1]), [a.as_str(), b.as_str()]);
+    let pid = env.pid(vm).await;
+    let before = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    let revert_b = || async {
+        let (status, task) = admin.post("/vms/web/snapshots/b/revert", Value::Null).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        let task = admin.wait_task(&task).await;
+        assert_eq!(task["status"]["state"], "failed", "{task}");
+        task["status"]["error"].as_str().unwrap().to_string()
+    };
+
+    // 자동 스냅샷 도구가 찍은 것
+    storage.set_tags(zvols[1], &[&a, &b, "autosnap_hourly"]);
+    let error = revert_b().await;
+    assert_eq!(
+        error,
+        "volume \"z1\" has a more recent snapshot \"autosnap_hourly\"; zfs disks can only \
+         revert to the latest snapshot"
+    );
+    // opLite의 스냅샷이면 그 이름이다.
+    storage.set_tags(zvols[1], &[&b, &a]);
+    let error = revert_b().await;
+    assert!(error.contains("more recent snapshot \"a\""), "{error}");
+    // 되돌릴 스냅샷이 디스크에 없다.
+    storage.set_tags(zvols[1], &[&a]);
+    let error = revert_b().await;
+    assert!(error.contains("has no snapshot \"b\""), "{error}");
+
+    // 끄지도, 스펙을 바꾸지도 않았다.
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(got.spec, before.spec);
+    assert_eq!(env.pid(vm).await, pid);
+    assert!(!storage.calls().iter().any(|(call, _)| *call == "revert"));
+
+    // 가장 최근이면 되돌린다.
+    storage.set_tags(zvols[1], &[&a, &b]);
+    let (status, task) = admin.post("/vms/web/snapshots/b/revert", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let reverts: Vec<_> = storage
+        .calls()
+        .into_iter()
+        .filter(|(call, _)| *call == "revert")
+        .collect();
+    assert_eq!(reverts, [("revert", zvols[0]), ("revert", zvols[1])]);
+}
+
+/// 실행 중인 VM의 ZFS 디스크도 스토리지로 먼저 늘린 뒤 QEMU에 알린다.
+#[tokio::test]
+async fn running_vm_zfs_disk_grows_in_storage_before_qemu() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0"]).await;
+    storage.round_resizes(4 << 20);
+
+    let (status, task) = admin
+        .post("/volumes/z0/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(storage.calls(), [("resize", zvols[0])]);
+    assert_eq!(env.hv.disk_size(vm, 0), Some(4 << 20));
+}
+
 #[tokio::test]
 async fn running_vm_lvm_disk_grows_in_storage_before_qemu() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
 
     // LV를 늘리는 동안 QEMU에는 아직 알리지 않았다.
     storage.pause();
@@ -995,7 +1338,7 @@ async fn running_vm_lvm_disk_grows_to_the_lv_size() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
     storage.round_resizes(4 << 20);
 
     let (status, task) = admin
@@ -1018,7 +1361,7 @@ async fn scheduled_lvm_snapshot_leaves_out_memory() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
     let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
     let mut spec = current.spec.clone();
     spec.snapshot_schedule = Some(opl_types::vm::SnapshotSchedule {
@@ -1067,7 +1410,7 @@ async fn abandoned_lvm_snapshot_still_resumes_the_vm() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (_, storage) = lvm_volumes(&mut env, &["lv0"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
     env.stop_runner().await;
     env.start_runner_config(storage.clone(), |c| {
         c.timeout = std::time::Duration::from_millis(500)
@@ -1097,7 +1440,7 @@ async fn lvm_snapshot_leaves_a_vm_paused_by_qemu_paused() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
     // Mock 하이퍼바이저에서는 멈춘 것처럼 보이게 한다.
     env.hv.pause(vm).await.unwrap();
 
@@ -1115,7 +1458,7 @@ async fn lvm_snapshot_of_a_vm_stopped_on_io_error_neither_pauses_nor_resumes_it(
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
     env.hv
         .set_status(vm, Some(RuntimeStatus::Other("io-error".into())));
 
@@ -1132,7 +1475,7 @@ async fn lvm_snapshot_of_an_unresponsive_vm_fails_before_touching_the_disks() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (_, storage) = lvm_volumes(&mut env, &["lv0"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
     env.hv.set_unresponsive(vm, true);
 
     let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
@@ -1155,7 +1498,7 @@ async fn lvm_snapshot_taken_but_not_resumed_is_kept() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
-    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
 
     storage.pause();
     let (status, task) = admin

@@ -457,7 +457,7 @@ export interface paths {
         /**
          * `pending` 스냅샷을 만들고(부모는 VM의 현재 위치, `vm_spec`은 지금 스펙) 그것을 채울 Task를
          *     돌려준다(202). 시작·정지 중이면 409 `vm_busy`, 스냅샷을 담지 못하는 디스크가 있거나 디스크의
-         *     스냅샷 방식이 섞였거나 LVM-thin 디스크의 VM에 메모리 스냅샷을 요청하면 409
+         *     스냅샷 방식이 섞였거나 블록 디스크(LVM-thin, ZFS)의 VM에 메모리 스냅샷을 요청하면 409
          *     `snapshot_unsupported`. 실행 중이 아니거나 디스크가 없는 VM의 메모리 스냅샷은 400.
          */
         post: operations["create_snapshot"];
@@ -495,7 +495,8 @@ export interface paths {
         put?: never;
         /**
          * 디스크·UEFI 변수·VM 스펙을 스냅샷 것으로 되돌릴 Task를 돌려준다(202). 실행 중이면 강제로 끈다.
-         *     스냅샷 스펙의 볼륨이 모두 있고 다 만들어졌으며 다른 VM이 쓰지 않아야 한다.
+         *     스냅샷 스펙의 볼륨이 모두 있고 다 만들어졌으며 다른 VM이 쓰지 않아야 한다. ZFS 디스크는 VM의
+         *     가장 최근 스냅샷으로만 되돌린다(아니면 409 `snapshot_unsupported`).
          */
         post: operations["revert_snapshot"];
         delete?: never;

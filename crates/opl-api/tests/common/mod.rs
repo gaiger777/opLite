@@ -457,6 +457,12 @@ pub struct FakeStorage {
     copy_formats: std::sync::Mutex<Vec<(Uuid, ImageFormat)>>,
     /// `resize_volume`이 크기를 이 단위로 올린다(LVM의 extent처럼). 0이면 그대로다.
     resize_unit: std::sync::Mutex<u64>,
+    /// `snapshot_many`로 한 번에 찍은 볼륨들
+    snapshot_groups: std::sync::Mutex<Vec<Vec<Uuid>>>,
+    /// 볼륨마다 스냅샷 태그(만든 순서). 만들기·지우기가 바꾼다.
+    tags: std::sync::Mutex<std::collections::HashMap<Uuid, Vec<String>>>,
+    /// 볼륨마다 남은 횟수만큼 `snapshot_delete`가 일시 오류다(앞 명령이 아직 돈다).
+    busy_deletes: std::sync::Mutex<std::collections::HashMap<Uuid, usize>>,
 }
 
 impl FakeStorage {
@@ -487,6 +493,32 @@ impl FakeStorage {
     /// 이후의 `resize_volume`이 크기를 `unit` 단위로 올린다.
     pub fn round_resizes(&self, unit: u64) {
         *self.resize_unit.lock().unwrap() = unit;
+    }
+
+    /// `snapshot_many`로 한 번에 찍은 볼륨들(부른 순서)
+    pub fn snapshot_groups(&self) -> Vec<Vec<Uuid>> {
+        self.snapshot_groups.lock().unwrap().clone()
+    }
+
+    /// 볼륨 `id`의 스냅샷 태그(만든 순서)
+    pub fn tags(&self, id: Uuid) -> Vec<String> {
+        self.tags
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 볼륨 `id`의 스냅샷 태그를 바꾼다(opLite 밖에서 만든 스냅샷 등).
+    pub fn set_tags(&self, id: Uuid, tags: &[&str]) {
+        let tags = tags.iter().map(|t| t.to_string()).collect();
+        self.tags.lock().unwrap().insert(id, tags);
+    }
+
+    /// 볼륨 `id`의 다음 `n`번의 `snapshot_delete`가 (호출을 기록한 뒤) 일시 오류다.
+    pub fn busy_snapshot_deletes(&self, id: Uuid, n: usize) {
+        self.busy_deletes.lock().unwrap().insert(id, n);
     }
 
     /// `copy_volume`으로 만든 볼륨과 그 형식
@@ -593,14 +625,31 @@ impl Storage for FakeStorage {
         _: &StoragePool,
         id: Uuid,
         _: ImageFormat,
-        _: &str,
+        tag: &str,
     ) -> Result<(), DriverError> {
         self.record("create", id).await;
         if self.failing_creates.lock().unwrap().contains(&id) {
             return Err(DriverError::Lvm("injected".into()));
         }
+        let mut tags = self.tags.lock().unwrap();
+        tags.entry(id).or_default().push(tag.into());
+        drop(tags);
         if self.timing_out_creates.lock().unwrap().contains(&id) {
             return Err(DriverError::Timeout("lvm command"));
+        }
+        Ok(())
+    }
+    /// 묶음을 기록하고 기본처럼 하나씩 찍는다(호출은 `create`로 기록된다).
+    async fn snapshot_many(
+        &self,
+        pool: &StoragePool,
+        ids: &[Uuid],
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError> {
+        self.snapshot_groups.lock().unwrap().push(ids.to_vec());
+        for &id in ids {
+            self.snapshot_create(pool, id, format, tag).await?;
         }
         Ok(())
     }
@@ -619,18 +668,27 @@ impl Storage for FakeStorage {
         _: &StoragePool,
         id: Uuid,
         _: ImageFormat,
-        _: &str,
+        tag: &str,
     ) -> Result<(), DriverError> {
         self.record("delete", id).await;
+        if let Some(left) = self.busy_deletes.lock().unwrap().get_mut(&id)
+            && *left > 0
+        {
+            *left -= 1;
+            return Err(DriverError::Timeout("an earlier command still running"));
+        }
+        if let Some(tags) = self.tags.lock().unwrap().get_mut(&id) {
+            tags.retain(|t| t != tag);
+        }
         Ok(())
     }
     async fn snapshot_tags(
         &self,
         _: &StoragePool,
-        _: Uuid,
+        id: Uuid,
         _: ImageFormat,
     ) -> Result<Vec<String>, DriverError> {
-        Ok(vec![])
+        Ok(self.tags(id))
     }
     async fn resize_volume(
         &self,

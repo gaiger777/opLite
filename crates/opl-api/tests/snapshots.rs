@@ -8,7 +8,7 @@ use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
-use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
+use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{PowerState, VmPhase, VmSpec, VmStatus};
 use reqwest::StatusCode;
@@ -128,9 +128,14 @@ async fn snapshot_of(env: &Env, vm: Uuid, name: &str) -> Resource<SnapshotSpec, 
 }
 
 async fn mark_ready(env: &Env, id: Uuid) {
+    mark_ready_at(env, id, 1).await;
+}
+
+/// 스냅샷을 `created_at`에 만든 것으로 Ready로 바꾼다.
+async fn mark_ready_at(env: &Env, id: Uuid, created_at: u64) {
     let status = SnapshotStatus {
         phase: SnapshotPhase::Ready,
-        created_at: Some(1),
+        created_at: Some(created_at),
         vmstate_bytes: None,
     };
     env.cluster
@@ -316,32 +321,36 @@ async fn disks_must_be_qcow2_and_memory_needs_a_disk() {
     assert!(!snapshot_of(&env, bare, "a").await.spec.memory);
 }
 
-/// LVM-thin 풀 `thin`과 그 풀의 바로 Ready인 볼륨 `name`(형식 `format`)을 저장소에 직접 만든다.
-async fn lvm_volume(env: &Env, name: &str, format: ImageFormat) {
+/// 블록 풀 `pool`(`backend`, 없으면 만든다)과 그 풀의 바로 Ready인 볼륨 `name`(형식 `format`)을
+/// 저장소에 직접 만든다.
+async fn block_volume(
+    env: &Env,
+    pool: &str,
+    backend: PoolBackend,
+    name: &str,
+    format: ImageFormat,
+) {
     if env
         .cluster
-        .get_by_name::<StoragePoolSpec>("thin")
+        .get_by_name::<StoragePoolSpec>(pool)
         .unwrap()
         .is_none()
     {
-        let pool = Resource::new(
-            "thin",
-            StoragePoolSpec {
-                backend: opl_types::storage::PoolBackend::LvmThin {
-                    vg: "vg0".into(),
-                    thinpool: "tp".into(),
-                },
-                nodes: vec![],
-                shared: false,
-            },
-        );
-        env.cluster.create(&pool).await.unwrap();
-        env.pool_ready("thin").await;
+        let spec = StoragePoolSpec {
+            backend,
+            nodes: vec![],
+            shared: false,
+        };
+        env.cluster
+            .create(&Resource::new(pool, spec))
+            .await
+            .unwrap();
+        env.pool_ready(pool).await;
     }
     let mut volume = Resource::new(
         name,
         VolumeSpec {
-            pool: "thin".into(),
+            pool: pool.into(),
             size_bytes: MIB,
             format,
         },
@@ -352,6 +361,23 @@ async fn lvm_volume(env: &Env, name: &str, format: ImageFormat) {
         .update_status::<VolumeSpec>(volume.id, &volume.status)
         .await
         .unwrap();
+}
+
+/// LVM-thin 풀 `thin`과 그 풀의 바로 Ready인 볼륨 `name`(형식 `format`)을 저장소에 직접 만든다.
+async fn lvm_volume(env: &Env, name: &str, format: ImageFormat) {
+    let backend = PoolBackend::LvmThin {
+        vg: "vg0".into(),
+        thinpool: "tp".into(),
+    };
+    block_volume(env, "thin", backend, name, format).await;
+}
+
+/// ZFS 풀 `zfs`와 그 풀의 바로 Ready인 raw 볼륨 `name`을 저장소에 직접 만든다.
+async fn zfs_volume(env: &Env, name: &str) {
+    let backend = PoolBackend::Zfs {
+        dataset: "tank/opl".into(),
+    };
+    block_volume(env, "zfs", backend, name, ImageFormat::Raw).await;
 }
 
 #[tokio::test]
@@ -401,6 +427,111 @@ async fn lvm_disks_take_disk_snapshots_of_one_method() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "snapshot_unsupported");
+}
+
+#[tokio::test]
+async fn zfs_disks_take_block_snapshots_of_their_own_method() {
+    let env = env().await;
+    let admin = env.admin().await;
+    zfs_volume(&env, "z0").await;
+    zfs_volume(&env, "z1").await;
+    lvm_volume(&env, "lv0", ImageFormat::Raw).await;
+
+    // 메모리는 담을 곳이 없다. 실행 중이어도 기본은 디스크만이다.
+    let web = vm_with_disks(&admin, "web", &["z0"]).await;
+    set_vm_status(&env, web, VmPhase::Running, Some(env.node)).await;
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "m", "memory": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "snapshot_unsupported");
+    assert!(
+        body["message"].as_str().unwrap().contains("zfs disks"),
+        "{body}"
+    );
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(!snapshot_of(&env, web, "a").await.spec.memory);
+
+    // 블록 스냅샷이어도 LVM과 ZFS는 섞지 않는다.
+    vm_with_disks(&admin, "mixed", &["z1", "lv0"]).await;
+    let (status, body) = admin
+        .post("/vms/mixed/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "snapshot_unsupported");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("different snapshot methods"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn zfs_disks_revert_only_to_the_latest_snapshot() {
+    let env = env().await;
+    let admin = env.admin().await;
+    zfs_volume(&env, "z0").await;
+    lvm_volume(&env, "lv0", ImageFormat::Raw).await;
+    let web = vm_with_disks(&admin, "web", &["z0"]).await;
+    let thin = vm_with_disks(&admin, "thin", &["lv0"]).await;
+    // 만든 시각 순서가 id 순서와 반대여도 만든 시각을 따른다.
+    for (vm, key) in [(web, "web"), (thin, "thin")] {
+        for name in ["s2", "s1"] {
+            let path = format!("/vms/{key}/snapshots");
+            let (status, body) = admin.post(&path, json!({ "name": name })).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        }
+        finish_tasks(&env).await;
+        mark_ready_at(&env, snapshot_of(&env, vm, "s1").await.id, 10).await;
+        mark_ready_at(&env, snapshot_of(&env, vm, "s2").await.id, 20).await;
+    }
+    let revert = |vm: &'static str, name: &'static str| {
+        let admin = &admin;
+        async move {
+            let path = format!("/vms/{vm}/snapshots/{name}/revert");
+            admin.post(&path, Value::Null).await
+        }
+    };
+
+    let (status, body) = revert("web", "s1").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "snapshot_unsupported");
+    assert!(
+        body["message"].as_str().unwrap().contains("latest"),
+        "{body}"
+    );
+    let (status, body) = revert("web", "s2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    // LVM 디스크는 어느 스냅샷으로도 되돌린다.
+    let (status, body) = revert("thin", "s1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    finish_tasks(&env).await;
+
+    // 만드는 중인 스냅샷도 나중의 것이다.
+    let s2 = snapshot_of(&env, web, "s2").await;
+    env.cluster
+        .delete::<SnapshotSpec>(s2.id, None)
+        .await
+        .unwrap();
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "s3" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    finish_tasks(&env).await;
+    let (status, body) = revert("web", "s1").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let s3 = snapshot_of(&env, web, "s3").await;
+    env.cluster
+        .delete::<SnapshotSpec>(s3.id, None)
+        .await
+        .unwrap();
+    let (status, body) = revert("web", "s1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 }
 
 #[tokio::test]
