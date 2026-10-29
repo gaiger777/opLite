@@ -1,6 +1,6 @@
 //! 노드별 풀 상태. 이 노드가 쓸 수 있는 풀마다 준비 여부와 용량을 `NodeStatus.pools`에 적는다.
 //! NFS 풀은 `{data_dir}/pools/{풀 id}`에 마운트하고, 이 노드가 쓸 수 없게 된 NFS 풀은 언마운트한다.
-//! LVM-thin 풀은 `lvs`로 thin pool을 확인한다.
+//! LVM-thin 풀은 `lvs`로 thin pool을, ZFS 풀은 `zfs get`으로 데이터셋을 확인한다.
 //! opld가 내려가도 마운트는 그대로 둔다.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use opl_cluster::types::{NodeId, Rejection};
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::{Capacity, LvInfo};
+use opl_driver::{Capacity, LvInfo, ZfsDataset};
 use opl_types::node::{NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Kind;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, VolumeSpec};
@@ -25,12 +25,13 @@ use uuid::Uuid;
 
 /// `mount`·`umount`를 기다리는 시간
 pub const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
-/// 쓰기 확인과 용량 읽기(LVM-thin은 `lvs`)를 기다리는 시간. NFS 서버가 멈추면 이 작업이 멈춘다.
+/// 쓰기 확인과 용량 읽기(LVM-thin은 `lvs`, ZFS는 `zfs get`)를 기다리는 시간. NFS 서버가 멈추면 이 작업이 멈춘다.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const NFS_UNSUPPORTED: &str = "nfs pools are not supported on macOS";
 const LVM_UNSUPPORTED: &str = "lvm-thin pools are not supported on macOS";
-const ZFS_UNSUPPORTED: &str = "zfs pools are not supported yet";
+const ZFS_UNSUPPORTED: &str = "zfs pools are not supported on macOS";
 const LVS_TIMED_OUT: &str = "lvs timed out";
+const ZFS_TIMED_OUT: &str = "zfs timed out";
 const NFS_NOT_RESPONDING: &str = "nfs server not responding";
 const DIR_NOT_RESPONDING: &str = "pool directory not responding";
 const MOUNT_IN_PROGRESS: &str = "mount in progress";
@@ -53,6 +54,8 @@ pub trait MountOps: Send + Sync + 'static {
     fn check(&self, dir: &Path, probe: &str) -> std::io::Result<Capacity>;
     /// `lvs`로 읽은 VG `vg`의 LV `thinpool`. 실패하면 stderr.
     async fn lvm_pool(&self, vg: &str, thinpool: &str) -> Result<LvInfo, String>;
+    /// `zfs get`으로 읽은 데이터셋 `dataset`. 실패하면 stderr.
+    async fn zfs_dataset(&self, dataset: &str) -> Result<ZfsDataset, String>;
 }
 
 /// 실제 명령과 파일시스템
@@ -104,6 +107,21 @@ impl MountOps for SystemMount {
             .into_iter()
             .find(|lv| lv.name == thinpool)
             .ok_or_else(|| format!("{vg}/{thinpool} not found"))
+    }
+
+    async fn zfs_dataset(&self, dataset: &str) -> Result<ZfsDataset, String> {
+        let out = tokio::process::Command::new("zfs")
+            .args(["get", "-Hp", "-o", "value", "available,used,type", dataset])
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| format!("cannot run zfs: {e}"))?;
+        if !out.status.success() {
+            return Err(failure("zfs", &out));
+        }
+        opl_driver::parse_zfs_dataset(&out.stdout).map_err(|e| e.to_string())
     }
 }
 
@@ -252,6 +270,8 @@ struct Pools {
     nfs_supported: bool,
     /// 이 OS가 LVM을 지원하는지(Linux)
     lvm_supported: bool,
+    /// 이 OS가 ZFS를 지원하는지(Linux)
+    zfs_supported: bool,
     mount_timeout: Duration,
     check_timeout: Duration,
     /// 시간 안에 끝나지 않은 확인 작업(풀 id별). 끝날 때까지 그 풀은 건너뛴다.
@@ -291,6 +311,8 @@ enum Step {
     Check(PathBuf, &'static str),
     /// VG의 thin pool을 `lvs`로 확인한다.
     Lvm(String, String),
+    /// ZFS 데이터셋을 `zfs get`으로 확인한다.
+    Zfs(String),
 }
 
 /// 마운트에 실패한 뒤 다음 시도까지 기다리는 시간: 15초부터 실패할 때마다 두 배, 최대 5분
@@ -308,6 +330,7 @@ impl Pools {
             ops,
             nfs_supported: cfg!(target_os = "linux"),
             lvm_supported: cfg!(target_os = "linux"),
+            zfs_supported: cfg!(target_os = "linux"),
             mount_timeout: MOUNT_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
             stuck: HashMap::new(),
@@ -346,7 +369,7 @@ impl Pools {
             .retain(|id, _| usable.iter().any(|p| p.id == *id));
         let mut states = BTreeMap::new();
         let mut checks = Vec::new();
-        let mut lvm_checks = Vec::new();
+        let mut block_checks = Vec::new();
         for pool in &usable {
             match self.step(pool, &mounted, mount_results.remove(&pool.id)) {
                 Step::State(state) => {
@@ -354,7 +377,10 @@ impl Pools {
                 }
                 Step::Check(dir, not_responding) => checks.push((*pool, dir, not_responding)),
                 Step::Lvm(vg, thinpool) => {
-                    lvm_checks.push((*pool, self.spawn_lvm_check(pool.id, vg, thinpool)));
+                    block_checks.push((*pool, self.spawn_lvm_check(pool.id, vg, thinpool)));
+                }
+                Step::Zfs(dataset) => {
+                    block_checks.push((*pool, self.spawn_zfs_check(pool.id, dataset)));
                 }
             }
         }
@@ -372,7 +398,7 @@ impl Pools {
             };
             states.insert(pool.name.clone(), state);
         }
-        for (pool, task) in lvm_checks {
+        for (pool, task) in block_checks {
             let state = task
                 .await
                 .unwrap_or_else(|e| not_ready(pool.id, e.to_string()));
@@ -412,8 +438,11 @@ impl Pools {
                 }
                 return Step::Lvm(vg.clone(), thinpool.clone());
             }
-            PoolBackend::Zfs { .. } => {
-                return Step::State(not_ready(pool.id, ZFS_UNSUPPORTED.into()));
+            PoolBackend::Zfs { dataset } => {
+                if !self.zfs_supported {
+                    return Step::State(not_ready(pool.id, ZFS_UNSUPPORTED.into()));
+                }
+                return Step::Zfs(dataset.clone());
             }
             PoolBackend::Nfs {
                 server,
@@ -495,6 +524,29 @@ impl Pools {
                 Ok(Ok(_)) => not_ready(id, format!("{vg}/{thinpool} is not a thin pool")),
                 Ok(Err(e)) => not_ready(id, e),
                 Err(_) => not_ready(id, LVS_TIMED_OUT.into()),
+            }
+        })
+    }
+
+    /// `zfs get`으로 데이터셋을 확인하는 작업을 시작한다. zvol이 아닌 데이터셋이면 준비됐고, 용량은
+    /// `available`+`used`와 `available`이다. 시간 제한이 지나면 `zfs`를 죽인다.
+    fn spawn_zfs_check(&self, id: Uuid, dataset: String) -> JoinHandle<PoolState> {
+        let (ops, timeout) = (self.ops.clone(), self.check_timeout);
+        tokio::spawn(async move {
+            match tokio::time::timeout(timeout, ops.zfs_dataset(&dataset)).await {
+                Ok(Ok(ds)) if ds.kind != "volume" => PoolState {
+                    pool_id: id,
+                    ready: true,
+                    error: None,
+                    total_bytes: ds.space.available_bytes.saturating_add(ds.space.used_bytes),
+                    available_bytes: ds.space.available_bytes,
+                },
+                Ok(Ok(_)) => not_ready(
+                    id,
+                    format!("{dataset} is a volume, not a filesystem dataset"),
+                ),
+                Ok(Err(e)) => not_ready(id, e),
+                Err(_) => not_ready(id, ZFS_TIMED_OUT.into()),
             }
         })
     }
@@ -722,6 +774,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    use opl_driver::ZfsSpace;
     use opl_types::resource::Resource;
     use opl_types::vm::VmStatus;
 
@@ -777,6 +830,10 @@ mod tests {
         lvs: Mutex<BTreeMap<String, Vec<LvInfo>>>,
         /// 참이면 `lvs`가 풀릴 때까지 멈춘다.
         hang_lvs: AtomicBool,
+        /// 이름별 ZFS 데이터셋
+        datasets: Mutex<BTreeMap<String, ZfsDataset>>,
+        /// 참이면 `zfs`가 풀릴 때까지 멈춘다.
+        hang_zfs: AtomicBool,
     }
 
     impl FakeMount {
@@ -843,6 +900,22 @@ mod tests {
                 .ok_or_else(|| format!("Failed to find logical volume \"{vg}/{thinpool}\""))
         }
 
+        async fn zfs_dataset(&self, dataset: &str) -> Result<ZfsDataset, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("zfs get {dataset}"));
+            while self.hang_zfs.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.datasets
+                .lock()
+                .unwrap()
+                .get(dataset)
+                .cloned()
+                .ok_or_else(|| format!("cannot open '{dataset}': dataset does not exist"))
+        }
+
         fn check(&self, dir: &Path, probe: &str) -> std::io::Result<Capacity> {
             *self.checks.lock().unwrap() += 1;
             while self.hang.load(Ordering::SeqCst) {
@@ -890,6 +963,7 @@ mod tests {
         let mut pools = Pools::new(cluster.clone(), root.clone(), fake.clone());
         pools.nfs_supported = true;
         pools.lvm_supported = true;
+        pools.zfs_supported = true;
         pools.check_timeout = Duration::from_millis(200);
         Setup {
             _dir: dir,
@@ -1116,19 +1190,108 @@ mod tests {
         s.cluster.shutdown().await.unwrap();
     }
 
-    /// ZFS 풀은 아직 확인하지 않고 준비되지 않았다고 적는다.
+    fn zfs(dataset: &str) -> PoolBackend {
+        PoolBackend::Zfs {
+            dataset: dataset.into(),
+        }
+    }
+
+    fn dataset(kind: &str, available_bytes: u64, used_bytes: u64) -> ZfsDataset {
+        ZfsDataset {
+            kind: kind.into(),
+            space: ZfsSpace {
+                available_bytes,
+                used_bytes,
+            },
+        }
+    }
+
+    /// ZFS 풀은 `zfs get`으로 데이터셋을 확인해 `available`+`used`를 전체로, `available`을 남은
+    /// 용량으로 적는다. 데이터셋이 없거나 zvol이면 이유와 함께 준비되지 않았다.
     #[tokio::test]
-    async fn zfs_pools_are_not_ready_yet() {
+    async fn records_zfs_pool_states() {
         let mut s = setup().await;
-        let backend = PoolBackend::Zfs {
-            dataset: "tank/opl".into(),
+        {
+            let mut datasets = s.fake.datasets.lock().unwrap();
+            datasets.insert("tank/opl".into(), dataset("filesystem", 40 * GIB, 60 * GIB));
+            datasets.insert("tank/vol".into(), dataset("volume", 40 * GIB, 10 * GIB));
+            datasets.insert("tank/huge".into(), dataset("filesystem", u64::MAX, GIB));
+        }
+        let z = s.pool("z", zfs("tank/opl"), vec![]).await;
+        let huge = s.pool("huge", zfs("tank/huge"), vec![]).await;
+        let vol = s.pool("vol", zfs("tank/vol"), vec![]).await;
+        let gone = s.pool("gone", zfs("tank/gone"), vec![]).await;
+
+        s.pools.settle().await;
+        let states = s.states();
+        assert_eq!(states["z"], ready(&z));
+        // 합이 넘치면 가장 큰 값이다.
+        assert_eq!(
+            states["huge"],
+            PoolState {
+                total_bytes: u64::MAX,
+                available_bytes: u64::MAX,
+                ..ready(&huge)
+            }
+        );
+        assert_eq!(
+            states["vol"],
+            not_ready(
+                vol.id,
+                "tank/vol is a volume, not a filesystem dataset".into()
+            )
+        );
+        assert_eq!(
+            states["gone"],
+            not_ready(
+                gone.id,
+                "cannot open 'tank/gone': dataset does not exist".into()
+            )
+        );
+        // 마운트하지 않는다.
+        let mut calls = s.fake.calls();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(
+            calls,
+            [
+                "zfs get tank/gone",
+                "zfs get tank/huge",
+                "zfs get tank/opl",
+                "zfs get tank/vol"
+            ]
+        );
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// 멈춘 `zfs`는 시간 제한 뒤 준비되지 않았다고 적고, 다른 풀의 기록을 막지 않는다.
+    #[tokio::test]
+    async fn hung_zfs_times_out() {
+        let mut s = setup().await;
+        let local = PoolBackend::Dir {
+            path: s.local.clone(),
         };
-        let z = s.pool("z", backend, vec![]).await;
+        let local = s.pool("local", local, vec![]).await;
+        let z = s.pool("z", zfs("tank/opl"), vec![]).await;
+        s.fake.hang_zfs.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        s.pools.tick().await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(s.states()["local"], ready(&local));
+        assert_eq!(s.states()["z"], not_ready(z.id, ZFS_TIMED_OUT.into()));
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zfs_is_not_checked_where_unsupported() {
+        let mut s = setup().await;
+        s.pools.zfs_supported = false;
+        let z = s.pool("z", zfs("tank/opl"), vec![]).await;
         s.pools.tick().await.unwrap();
         assert_eq!(s.fake.calls(), Vec::<String>::new());
         assert_eq!(
             s.states()["z"],
-            not_ready(z.id, "zfs pools are not supported yet".into())
+            not_ready(z.id, "zfs pools are not supported on macOS".into())
         );
         s.cluster.shutdown().await.unwrap();
     }

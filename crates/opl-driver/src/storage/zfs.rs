@@ -65,6 +65,14 @@ pub struct ZfsSpace {
     pub used_bytes: u64,
 }
 
+/// `zfs get -Hp -o value available,used,type`로 읽은 데이터셋(opld 마운터가 풀을 확인한다)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZfsDataset {
+    /// `type`: `filesystem`, `volume` 등
+    pub kind: String,
+    pub space: ZfsSpace,
+}
+
 /// ZFS 명령. zvol은 전체 이름이다. 테스트는 가짜로 바꾼다.
 #[async_trait]
 pub trait ZfsOps: Send + Sync {
@@ -166,6 +174,23 @@ fn parse_space(out: &[u8]) -> Result<ZfsSpace, DriverError> {
             used_bytes: number(used[0])?,
         }),
         _ => Err(bad_output(format!("space {values:?}"))),
+    }
+}
+
+/// `zfs get -Hp -o value available,used,type`의 출력
+pub fn parse_zfs_dataset(out: &[u8]) -> Result<ZfsDataset, DriverError> {
+    let values: Vec<Vec<&str>> = rows(out).collect();
+    match values.as_slice() {
+        [available, used, kind] if [available, used, kind].iter().all(|v| v.len() == 1) => {
+            Ok(ZfsDataset {
+                kind: kind[0].trim().to_string(),
+                space: ZfsSpace {
+                    available_bytes: number(available[0])?,
+                    used_bytes: number(used[0])?,
+                },
+            })
+        }
+        _ => Err(bad_output(format!("dataset {values:?}"))),
     }
 }
 
@@ -1831,6 +1856,24 @@ mod tests {
             parse_space(b"1\n").unwrap_err(),
             parse_space(b"1\t2\n3\n").unwrap_err(),
         ] {
+            assert!(matches!(err, DriverError::Zfs(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn parses_zfs_dataset() {
+        assert_eq!(
+            parse_zfs_dataset(b"6442450944\n2147483648\nfilesystem\n").unwrap(),
+            ZfsDataset {
+                kind: "filesystem".into(),
+                space: ZfsSpace {
+                    available_bytes: 6 << 30,
+                    used_bytes: 2 << 30,
+                },
+            }
+        );
+        for bad in [&b"1\n2\n"[..], b"1\nx\nfilesystem\n", b"1\n2\nvolume\n3\n"] {
+            let err = parse_zfs_dataset(bad).unwrap_err();
             assert!(matches!(err, DriverError::Zfs(_)), "{err:?}");
         }
     }

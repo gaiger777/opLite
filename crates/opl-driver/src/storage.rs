@@ -18,7 +18,9 @@ mod zfs;
 
 pub use lvm::{LvInfo, LvmOps, LvmThinStorage, SystemLvm, parse_lvs};
 pub use storages::Storages;
-pub use zfs::{SystemZfs, ZfsOps, ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo};
+pub use zfs::{
+    SystemZfs, ZfsDataset, ZfsOps, ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo, parse_zfs_dataset,
+};
 
 /// 올린 이미지를 검사하는 `qemu-img info`가 멈추면(이상한 extent 등) 무한정 기다리지 않는다.
 const INFO_TIMEOUT: Duration = Duration::from_secs(60);
