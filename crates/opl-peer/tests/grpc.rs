@@ -50,6 +50,7 @@ struct Node {
     peers: Arc<Peers>,
     hv: Arc<MockHypervisor>,
     stop: Option<oneshot::Sender<()>>,
+    server: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Node {
@@ -76,7 +77,7 @@ impl Node {
         let hv = Arc::new(MockHypervisor::default());
         let service = PeerService::new(cluster.clone(), Some(hv.clone() as Arc<dyn Hypervisor>));
         let (stop, rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             opl_peer::serve(listener, &tls, service, async {
                 let _ = rx.await;
             })
@@ -89,6 +90,7 @@ impl Node {
             peers,
             hv,
             stop: Some(stop),
+            server: Some(server),
         }
     }
 
@@ -97,7 +99,10 @@ impl Node {
     }
 
     async fn stop(&mut self) {
+        // opld처럼 노드 간 서버가 끝난 뒤 Raft를 멈춘다. 먼저 멈추면 서버가 아직 받는 전달 요청에
+        // 다시 시도하지 않는 "raft stopped"로 답한다.
         let _ = self.stop.take().unwrap().send(());
+        self.server.take().unwrap().await.unwrap();
         self.cluster.shutdown().await.unwrap();
     }
 }
