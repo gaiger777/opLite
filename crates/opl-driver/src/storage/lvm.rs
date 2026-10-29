@@ -123,6 +123,10 @@ pub trait LvmOps: Send + Sync {
     async fn rename(&self, vg: &str, from: &str, to: &str) -> Result<(), DriverError>;
     /// 활성화(건너뛰기 표시가 있어도) 또는 비활성화(`lvchange -ay -K` / `-an`)
     async fn set_active(&self, vg: &str, name: &str, active: bool) -> Result<(), DriverError>;
+    /// 활성화 건너뛰기 표시를 지운다(`lvchange -kn`).
+    async fn clear_skip(&self, vg: &str, name: &str) -> Result<(), DriverError>;
+    /// LV `name`을 바꾸는 명령이 아직 돌고 있는지(시간을 넘겨 뒤에서 도는 중)
+    fn changing(&self, vg: &str, name: &str) -> bool;
 }
 
 /// 실제 LVM 명령. root여야 한다.
@@ -319,6 +323,15 @@ impl LvmOps for SystemLvm {
         };
         Self::change("lvchange", args, vg, &[name]).await
     }
+
+    async fn clear_skip(&self, vg: &str, name: &str) -> Result<(), DriverError> {
+        let lv = format!("{vg}/{name}");
+        Self::change("lvchange", &["-q", "-kn", &lv], vg, &[name]).await
+    }
+
+    fn changing(&self, vg: &str, name: &str) -> bool {
+        CHANGING.lock().unwrap().contains(&format!("{vg}/{name}"))
+    }
 }
 
 /// 볼륨의 LV 이름
@@ -432,10 +445,53 @@ impl LvmThinStorage {
             .find(|lv| lv.name == name))
     }
 
-    /// 있는 볼륨 LV. 없으면 `VolumeNotFound`.
+    /// VG의 LV들. 볼륨 LV가 없고 되돌리기가 옮겨 둔 `-revert-` LV가 하나만 있으면(시간을 넘긴
+    /// 이름 바꾸기가 되돌리기가 실패한 뒤에 끝났다) 그 LV가 볼륨이므로 이름을 되돌린 뒤 다시 읽는다.
+    /// 둘 중 하나라도 바꾸는 명령이 아직 돌고 있으면 일시 오류(`Timeout`)이고, `-revert-` LV가
+    /// 여럿이면 어느 것인지 모르므로 `Lvm`이다(수동 복구).
+    async fn volume_lvs(&self, vg: &str, id: Uuid) -> Result<Vec<LvInfo>, DriverError> {
+        let lvs = self.ops.list(vg).await?;
+        let volume = volume_lv(id);
+        if lvs.iter().any(|lv| lv.name == volume) {
+            return Ok(lvs);
+        }
+        let prefix = revert_prefix(id);
+        let reverts: Vec<&str> = lvs
+            .iter()
+            .map(|lv| lv.name.as_str())
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        let old = match reverts.as_slice() {
+            [] => return Ok(lvs),
+            [old] => old.to_string(),
+            _ => {
+                return Err(DriverError::Lvm(format!(
+                    "volume {id} is missing and several lvs may hold it ({}); rename the right \
+                     one to {vg}/{volume}",
+                    reverts.join(", ")
+                )));
+            }
+        };
+        if self.ops.changing(vg, &old) || self.ops.changing(vg, &volume) {
+            return Err(DriverError::Timeout(
+                "an earlier lvm command still running on the volume",
+            ));
+        }
+        tracing::warn!(volume = %id, lv = %old, "restoring volume left by an unfinished revert");
+        if let Err(e) = self.ops.rename(vg, &old, &volume).await
+            && !self.done_after(&e, vg, &volume, false).await
+        {
+            return Err(e);
+        }
+        self.ops.list(vg).await
+    }
+
+    /// 있는 볼륨 LV([`volume_lvs`](Self::volume_lvs)). 없으면 `VolumeNotFound`.
     async fn existing(&self, vg: &str, id: Uuid) -> Result<LvInfo, DriverError> {
-        self.find(vg, &volume_lv(id))
+        self.volume_lvs(vg, id)
             .await?
+            .into_iter()
+            .find(|lv| lv.name == volume_lv(id))
             .ok_or(DriverError::VolumeNotFound(id))
     }
 
@@ -447,7 +503,7 @@ impl LvmThinStorage {
         tag: &str,
     ) -> Result<LvInfo, DriverError> {
         let name = Self::snapshot_lv(id, tag)?;
-        let lvs = self.ops.list(vg).await?;
+        let lvs = self.volume_lvs(vg, id).await?;
         if !lvs.iter().any(|lv| lv.name == volume_lv(id)) {
             return Err(DriverError::VolumeNotFound(id));
         }
@@ -654,7 +710,8 @@ impl Storage for LvmThinStorage {
 
     /// 볼륨 LV를 먼저 지운다(쓰고 있으면 실패하고 스냅샷은 그대로 남는다). 그다음 스냅샷 LV와
     /// 실패한 되돌리기가 남긴 LV를 지운다. 볼륨 LV가 없어도(지우다 멈춘 뒤 다시 지움) 남은 것을
-    /// 지우고 `VolumeNotFound`다.
+    /// 지우고 `VolumeNotFound`다. 볼륨 LV가 `-revert-` 이름으로만 남았으면 먼저 이름을 되돌려
+    /// 볼륨으로 지운다([`volume_lvs`](Self::volume_lvs): 명령이 돌고 있거나 여럿이면 지우지 않는다).
     async fn delete_volume(
         &self,
         pool: &StoragePool,
@@ -662,7 +719,7 @@ impl Storage for LvmThinStorage {
         format: ImageFormat,
     ) -> Result<(), DriverError> {
         let (vg, _) = Self::target(pool, format)?;
-        let lvs = self.ops.list(vg).await?;
+        let lvs = self.volume_lvs(vg, id).await?;
         let found = lvs.iter().any(|lv| lv.name == volume_lv(id));
         if found {
             self.ops.remove(vg, &volume_lv(id)).await?;
@@ -739,7 +796,7 @@ impl Storage for LvmThinStorage {
     ) -> Result<(), DriverError> {
         let (vg, _) = Self::target(pool, format)?;
         let name = Self::snapshot_lv(id, tag)?;
-        let lvs = self.ops.list(vg).await?;
+        let lvs = self.volume_lvs(vg, id).await?;
         if !lvs.iter().any(|lv| lv.name == volume_lv(id)) {
             return Err(DriverError::VolumeNotFound(id));
         }
@@ -752,9 +809,10 @@ impl Storage for LvmThinStorage {
     }
 
     /// 볼륨 LV를 `opl-{id}-revert-{tag}`로 옮기고, 스냅샷 LV의 thin 스냅샷을 새 볼륨 LV로 만들어
-    /// 활성화한 뒤 옮긴 옛 LV를 지운다. 새 LV를 만들거나 활성화하지 못하면 옛 LV를 되돌린다.
-    /// 앞서 실패한 되돌리기가 남긴 같은 이름의 LV는 먼저 지운다(볼륨 LV는 있다). 단계가 시간을
-    /// 넘겼으면 다시 보고 끝났으면 이어서 한다.
+    /// 활성화하고 활성화 건너뛰기 표시를 지운 뒤 옮긴 옛 LV를 지운다. 새 LV를 만들거나 활성화하지
+    /// 못하면 옛 LV를 되돌린다. 볼륨 LV가 `-revert-` 이름으로만 남았으면 먼저 되돌리고
+    /// ([`volume_lvs`](Self::volume_lvs)), 앞서 실패한 되돌리기가 남긴 `-revert-` LV는 먼저 지운다
+    /// (볼륨 LV는 있다). 단계가 시간을 넘겼으면 다시 보고 끝났으면 이어서 한다.
     async fn snapshot_revert(
         &self,
         pool: &StoragePool,
@@ -765,8 +823,12 @@ impl Storage for LvmThinStorage {
         let (vg, _) = Self::target(pool, format)?;
         let snapshot = self.existing_snapshot(vg, id, tag).await?.name;
         let (volume, old) = (volume_lv(id), format!("{}{tag}", revert_prefix(id)));
-        if self.find(vg, &old).await?.is_some() {
-            self.ops.remove(vg, &old).await?;
+        // 볼륨 LV가 있으므로 남은 `-revert-` LV는 모두 옛것이다. 남겨 두면 다음에 볼륨 LV가 없을
+        // 때 어느 것이 볼륨인지 모른다.
+        for lv in self.ops.list(vg).await? {
+            if lv.name.starts_with(&revert_prefix(id)) {
+                self.ops.remove(vg, &lv.name).await?;
+            }
         }
         if let Err(e) = self.ops.rename(vg, &volume, &old).await
             && !self.done_after(&e, vg, &old, false).await
@@ -788,6 +850,11 @@ impl Storage for LvmThinStorage {
                 )));
             }
             return Err(self.restore_name(vg, id, &old, e).await);
+        }
+        // 스냅샷으로 만든 LV에 붙은 표시를 지워 노드를 다시 켜면 다른 LV처럼 활성화되게 한다.
+        // 지우지 못해도 VM을 시작할 때 표시와 상관없이 활성화한다(`-K`).
+        if let Err(e) = self.ops.clear_skip(vg, &volume).await {
+            tracing::warn!(volume = %id, error = %e, "cannot clear activation skip of reverted volume");
         }
         // 되돌리기는 끝났다. 옛 LV가 남으면 공간만 차지한다.
         if let Err(e) = self.ops.remove(vg, &old).await {
@@ -819,7 +886,7 @@ impl Storage for LvmThinStorage {
         format: ImageFormat,
     ) -> Result<Vec<String>, DriverError> {
         let (vg, _) = Self::target(pool, format)?;
-        let lvs = self.ops.list(vg).await?;
+        let lvs = self.volume_lvs(vg, id).await?;
         if !lvs.iter().any(|lv| lv.name == volume_lv(id)) {
             return Err(DriverError::VolumeNotFound(id));
         }
@@ -930,14 +997,17 @@ mod tests {
     struct FakeLv {
         size: u64,
         active: bool,
+        /// 활성화 건너뛰기 표시
+        skip: bool,
     }
 
     /// VG `vg0` 하나를 메모리에 두는 LVM. thin pool `tp`와 관계없는 LV `root`가 있다. 바꾸는 호출을
     /// 적고, `fail`에 적은 호출은 실패한다. `stuck`에 적은 호출은 하지 않고, `late`에 적은 이름
     /// 바꾸기·스냅샷은 해 놓고 `Timeout`을 돌려준다(시간을 넘긴 명령). 활성인 LV의 장치 노드를 `dev`
-    /// 아래에 둔다(udev처럼).
+    /// 아래에 둔다(udev처럼). `busy`에 적은 LV는 바꾸는 명령이 아직 돌고 있다고 알린다.
     struct FakeLvm {
         lvs: Mutex<BTreeMap<String, FakeLv>>,
+        busy: Mutex<Vec<String>>,
         log: Mutex<Vec<String>>,
         fail: Mutex<Vec<String>>,
         late: Mutex<Vec<String>>,
@@ -951,6 +1021,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 lvs: Mutex::default(),
+                busy: Mutex::default(),
                 log: Mutex::default(),
                 fail: Mutex::default(),
                 late: Mutex::default(),
@@ -1073,6 +1144,7 @@ mod tests {
             let lv = FakeLv {
                 size: size_bytes,
                 active: true,
+                skip: false,
             };
             lvs.insert(name.into(), lv);
             self.sync_nodes(&lvs);
@@ -1091,6 +1163,7 @@ mod tests {
             let lv = FakeLv {
                 size,
                 active: false,
+                skip: true,
             };
             lvs.insert(name.into(), lv);
             self.finish(&call)
@@ -1135,6 +1208,18 @@ mod tests {
             lvs.get_mut(name).ok_or_else(|| Self::missing(name))?.active = active;
             self.sync_nodes(&lvs);
             Ok(())
+        }
+
+        async fn clear_skip(&self, vg: &str, name: &str) -> Result<(), DriverError> {
+            self.call(format!("unskip {vg}/{name}"))?;
+            let mut lvs = self.lvs.lock().unwrap();
+            lvs.get_mut(name).ok_or_else(|| Self::missing(name))?.skip = false;
+            Ok(())
+        }
+
+        fn changing(&self, vg: &str, name: &str) -> bool {
+            assert_eq!(vg, "vg0");
+            self.busy.lock().unwrap().iter().any(|lv| lv == name)
         }
     }
 
@@ -1480,12 +1565,14 @@ mod tests {
                 format!("rename vg0/{volume} {old}"),
                 format!("snapshot vg0/opl-{id}-s-t {volume}"),
                 format!("activate vg0/{volume}"),
+                format!("unskip vg0/{volume}"),
                 format!("remove vg0/{old}"),
             ]
         );
-        // 스냅샷 때의 크기로 돌아가고, 스냅샷은 남는다.
+        // 스냅샷 때의 크기로 돌아가고, 스냅샷은 남는다. 새 볼륨 LV는 활성화 건너뛰기 표시가 없다.
         let lv = lvm.lv(&volume).unwrap();
         assert!(lv.active);
+        assert!(!lv.skip);
         assert_eq!(lv.size, 1 << 20);
         assert_eq!(lvm.names(), [volume.clone(), format!("opl-{id}-s-t")]);
 
@@ -1500,6 +1587,7 @@ mod tests {
                 format!("rename vg0/{volume} {old}"),
                 format!("snapshot vg0/opl-{id}-s-t {volume}"),
                 format!("activate vg0/{volume}"),
+                format!("unskip vg0/{volume}"),
                 format!("remove vg0/{old}"),
             ]
         );
@@ -1572,6 +1660,7 @@ mod tests {
             format!("rename vg0/{volume} {old}"),
             format!("snapshot vg0/opl-{id}-s-t {volume}"),
             format!("activate vg0/{volume}"),
+            format!("unskip vg0/{volume}"),
             format!("remove vg0/{old}"),
         ];
         for late in &steps[..2] {
@@ -1591,6 +1680,81 @@ mod tests {
         assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
         assert_eq!(lvm.taken(), steps[..1]);
         assert_eq!(lvm.names(), [volume, format!("opl-{id}-s-t")]);
+    }
+
+    /// 시간을 넘긴 이름 바꾸기가 되돌리기가 실패한 뒤에 끝나 볼륨 LV가 `-revert-` 이름으로만
+    /// 남았으면, 그 LV를 다루는 명령이 돌고 있지 않을 때 볼륨 LV로 이름을 되돌린 뒤 이어서 한다.
+    /// 돌고 있으면 일시 오류이고, `-revert-` LV가 여럿이면 어느 것인지 모르므로 건드리지 않는다.
+    #[tokio::test]
+    async fn volume_left_under_a_revert_name_is_restored() {
+        let (lvm, storage) = setup("/nonexistent/qemu-img");
+        let (p, id) = (lvm_pool(), Uuid::now_v7());
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        storage.snapshot_create(&p, id, RAW, "t").await.unwrap();
+        let (volume, old) = (format!("opl-{id}"), format!("opl-{id}-revert-t"));
+        let snapshot = format!("opl-{id}-s-t");
+        // 되돌리기의 이름 바꾸기가 시간을 넘겨 실패하고, 그 뒤에 끝난다.
+        let leave = || async {
+            *lvm.stuck.lock().unwrap() = vec![format!("rename vg0/{volume} {old}")];
+            let err = storage.snapshot_revert(&p, id, RAW, "t").await.unwrap_err();
+            assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
+            lvm.stuck.lock().unwrap().clear();
+            lvm.rename("vg0", &volume, &old).await.unwrap();
+            assert_eq!(lvm.names(), [old.clone(), snapshot.clone()]);
+            lvm.taken();
+        };
+
+        leave().await;
+        // 아직 돌고 있으면 볼륨이 없다고 하지 않고(VM을 끄지 않는다) 잠시 뒤 다시 해 볼 오류다.
+        for busy in [&old, &volume] {
+            *lvm.busy.lock().unwrap() = vec![busy.clone()];
+            let err = storage.activate_volume(&p, id, RAW).await.unwrap_err();
+            assert!(err.is_transient(), "{busy}: {err:?}");
+            let err = storage.delete_volume(&p, id, RAW).await.unwrap_err();
+            assert!(err.is_transient(), "{busy}: {err:?}");
+            assert_eq!(lvm.names(), [old.clone(), snapshot.clone()]);
+        }
+        assert!(lvm.taken().is_empty());
+        lvm.busy.lock().unwrap().clear();
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), [format!("rename vg0/{old} {volume}")]);
+        assert_eq!(lvm.names(), [volume.clone(), snapshot.clone()]);
+        let info = storage.volume_info(&p, id, RAW).await.unwrap();
+        assert_eq!(info.virtual_bytes, 1 << 20);
+
+        // 되돌리기를 다시 하면 이름을 되돌린 뒤 처음부터 한다.
+        leave().await;
+        storage.snapshot_revert(&p, id, RAW, "t").await.unwrap();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("rename vg0/{old} {volume}"),
+                format!("rename vg0/{volume} {old}"),
+                format!("snapshot vg0/{snapshot} {volume}"),
+                format!("activate vg0/{volume}"),
+                format!("unskip vg0/{volume}"),
+                format!("remove vg0/{old}"),
+            ]
+        );
+        assert_eq!(lvm.names(), [volume.clone(), snapshot.clone()]);
+
+        // `-revert-` LV가 여럿이면 어느 것이 볼륨인지 모른다. 지우기도 아무것도 지우지 않는다.
+        leave().await;
+        let other = format!("opl-{id}-revert-u");
+        lvm.snapshot("vg0", &snapshot, &other).await.unwrap();
+        lvm.taken();
+        let err = storage.activate_volume(&p, id, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Lvm(ref m) if m.contains(&old) && m.contains(&other)),
+            "{err:?}"
+        );
+        storage.delete_volume(&p, id, RAW).await.unwrap_err();
+        assert!(lvm.taken().is_empty());
+        lvm.remove("vg0", &other).await.unwrap();
+
+        // 볼륨을 지우면 `-revert-` LV를 볼륨으로 보고 지운다(볼륨이 없다고 하지 않는다).
+        storage.delete_volume(&p, id, RAW).await.unwrap();
+        assert!(lvm.names().is_empty());
     }
 
     /// 스냅샷은 활성화해 읽고 내놓을 때 비활성화한다. 볼륨 자체는 활성화만 한다.

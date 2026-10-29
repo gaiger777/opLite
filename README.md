@@ -169,7 +169,11 @@ oplctl pool get fast                                 # 노드별 준비·thin po
   `"shared": true`는 **400** `invalid_request`다. VG·thin pool 이름은 `A-Za-z0-9+_.-`의 1–127자이고 `-`로 시작하지 않는다. LVM이 받지 않는 이름(`.`·`..`,
   `snapshot`·`pvmove`로 시작, `_tdata`·`_tmeta` 같은 LVM 내부 이름 조각을 담은 것)도 안 된다.
 - **raw만.** LVM-thin 풀의 볼륨은 raw다. qcow2 볼륨을 만들거나 가져오면 **400** `invalid_request`("lvm-thin pools
-  hold raw volumes"). `oplctl volume create`/`import`와 웹은 풀 종류로 형식을 정한다. 가져온 이미지는 raw로 바뀐다.
+  hold raw volumes"). `oplctl volume create`/`import`와 웹은 풀 종류로 형식을 정한다. API의 가져오기(`/volumes/import`,
+  `/volumes/import/check`)도 `format`을 생략하면 풀 종류로 정한다(LVM-thin은 raw, 그 밖은 qcow2). 가져온 이미지는
+  raw로 바뀐다.
+- **업그레이드 먼저.** LVM-thin(또는 NFS) 풀을 만들기 전에 클러스터의 모든 노드를 이 기능이 있는 버전으로 올린다.
+  예전 opld는 모르는 종류의 풀을 읽지 못해 풀 목록부터 실패한다.
 - **노드별 상태.** opld는 15초마다(`[pools] refresh_secs`) `lvs`로 thin pool을 확인해(10초 제한) 크기와 사용률로 용량을 알린다. VG나
   thin pool이 없거나 thin pool이 아니면 준비되지 않은 것이고(`"vg0/tp is not a thin pool"`, `lvs`의 오류,
   `"lvs timed out"`), NFS 풀처럼 준비됐다고 알린 노드에만 VM과 볼륨이 간다. LVM 명령은 opld(root)가 부르고 하나에
@@ -188,23 +192,31 @@ oplctl pool get fast                                 # 노드별 준비·thin po
   숨긴다).
 - **실행 중 스냅샷의 짧은 멈춤.** 실행 중인 VM은 QMP `stop`으로 잠깐 멈춰 블록 I/O를 비운 뒤 디스크마다 `lvcreate`
   하고 `cont`로 다시 돌린다(디스크 수만큼 걸린다. 멈춘 시간은 opld 로그의 `paused_ms`). 하나라도 실패하면 먼저
-  VM을 다시 돌리고 만든 스냅샷 LV를 지운다. 멈춘 채 두지 않는다: 디스크 찍기는 120초를 넘기면 실패로 끝내고,
+  VM을 다시 돌리고 만든 스냅샷 LV를 지운다. 디스크 찍기가 시간을 넘겼으면(120초 한도나 LVM 명령의 60초) 찍기가
+  끝난 디스크의 스냅샷 LV만 지우고, 아직 만들어지고 있을 수 있는 나머지는 남긴다(Task 오류에 태그가 나오고,
+  다시 돌리지 못했으면 "; resuming the VM failed: …"가 붙는다). 멈춘 채 두지 않는다: 디스크 찍기는 120초를 넘기면 실패로 끝내고,
   `cont`는 일시 오류면 1초 간격으로 세 번까지 해 보며(VM이 꺼졌으면 할 것이 없다), Task가 시간을 넘겨 버려져도
   뒤에서 다시 돌린다. 디스크는 찍었는데 다시 돌리지 못하면 스냅샷은 그대로 두고 Task만 실패로 끝낸다("snapshot
   taken; resuming the VM failed: …"). opld가 멈춘 채 죽었거나 다시 돌리지 못한 VM은 VM 실행 디렉터리의
-  표시(`paused-by-opl`)를 보고 다시 붙을 때 이어서 실행한다(실행 중인 VM에 남은 표시는 상태를 볼 때 지운다).
+  표시(`paused-by-opl`)를 보고 다시 붙을 때 이어서 실행한다(디스크를 다시 해석하지 않으므로 LVM이 응답하지 않아도
+  된다. 실행 중인 VM에 남은 표시는 상태를 볼 때 지운다).
   하이퍼바이저가 실행 중이라고 알리는 VM만 멈춘다: 일시정지됐거나 QEMU가 스스로 멈춘 VM(`io-error`,
   `guest-panicked` 등)은 멈추지도 다시 돌리지도 않고 디스크만 찍고, QMP로 다룰 수 없는 VM은 디스크를 건드리기
   전에 실패한다.
 - **되돌리기·지우기·복제·크기.** 되돌리기는 지금처럼 VM을 강제로 끈 뒤 스냅샷 LV에서 볼륨 LV를 새로 만든다(앞서
   실패한 되돌리기가 남긴 `opl-{볼륨 id}-revert-…` LV는 먼저 지운다. 한 단계가 시간을 넘기면 `lvs`로 다시 보고
-  끝났으면 이어서 한다). 스냅샷 지우기는 VM이 돌고 있어도 된다. 볼륨을
+  끝났으면 이어서 한다. 새 볼륨 LV는 활성화 건너뛰기 표시를 지운다(`lvchange -kn`)). 시간을 넘긴 이름 바꾸기가
+  되돌리기가 실패한 뒤에 끝나 볼륨 LV가 `-revert-` 이름으로만 남으면, opld가 그 LV를 쓸 때(VM 시작, 되돌리기,
+  스냅샷, 지우기 등) 이름을 되돌린다. 그 LV의 명령이 아직 돌고 있으면 잠시 뒤 다시 시도하고(VM을 끄지 않는다),
+  `-revert-` LV가 여럿이면 어느 것인지 모르므로 손대지 않고 오류로 알린다(관리자가 맞는 것을 `opl-{볼륨 id}`로
+  `lvrename`한다). 스냅샷 지우기는 VM이 돌고 있어도 된다. 볼륨을
   지우면 볼륨 LV를 먼저 지우고(쓰고 있으면 실패하고 스냅샷은 남는다) 그 스냅샷 LV와 남은 `-revert-` LV도 함께
-  지운다. 스냅샷에서 복제하면 대상 풀이 LVM-thin이면 raw, 디렉터리·NFS 풀이면 스냅샷을 담을 수 있게 qcow2로
+  지운다(볼륨 LV가 `-revert-` 이름으로만 남았으면 위처럼 이름을 되돌린 뒤 볼륨으로 지운다). 스냅샷에서 복제하면 대상 풀이 LVM-thin이면 raw, 디렉터리·NFS 풀이면 스냅샷을 담을 수 있게 qcow2로
   만들고, 대상은 스냅샷 때의 크기로 만든다. qcow2 디스크의 스냅샷에서 복제하면 `qemu-img`가 지금 볼륨 크기만큼만
   읽는다(볼륨을 늘린 뒤 찍은 스냅샷을, 그보다 작던 때의 스냅샷으로 되돌린 볼륨에서 복제하면 늘린 부분이 빠진다). 새 LV에 써 넣을 때 thin pool이 새 블록을 0으로 채우면
   (`lv_attr`의 `z`, 기본값) 0인 부분은 쓰지 않고, `lvcreate -Zn`으로 만든 thin pool이면 모두 쓴다. 크기 늘리기는
-  실행 중이어도 되고 `lvextend` 뒤 QEMU에 새 크기를 알린다(LV가 이미 그 크기 이상이면 `lvextend`는 건너뛴다).
+  실행 중이어도 되고 `lvextend` 뒤 QEMU에 LV의 실제 크기(extent 단위로 올라간다)를 알린다(LV가 이미 그 크기
+  이상이면 `lvextend`는 건너뛴다). 기록되는 볼륨 크기도 그 크기다.
 - **thin pool이 가득 차면** 게스트의 쓰기가 실패한다. opLite는 thin pool을 늘리지 않으므로 노드별 남은 공간을 보고
   관리자가 늘린다(LVM의 `thin_pool_autoextend_threshold`도 쓸 수 있다).
 

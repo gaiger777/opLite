@@ -708,13 +708,21 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
             ));
         }
         // 실행 중에는 디스크를 바꿀 수 없으므로 스펙의 순서가 QEMU의 디스크 번호다. LV는 QEMU가
-        // 늘릴 수 없으므로 저장소로 먼저 늘린 뒤 QEMU에 새 크기를 알린다.
+        // 늘릴 수 없으므로 저장소로 먼저 늘린 뒤 QEMU에 LV의 실제 크기(LVM은 extent 단위로
+        // 올린다)를 알린다. 그래야 게스트가 보는 크기가 아래에서 기록하는 크기와 같다.
         Some((vm, disk)) if vm.status.phase == VmPhase::Running => {
+            let mut size_bytes = size_bytes;
             if uses_lv_snapshots(&pool) {
                 ctx.storage
                     .resize_volume(&pool, id, volume.spec.format, size_bytes)
                     .await
                     .map_err(|e| e.to_string())?;
+                size_bytes = ctx
+                    .storage
+                    .volume_info(&pool, id, volume.spec.format)
+                    .await
+                    .map_err(|e| format!("cannot read the new size: {e}"))?
+                    .virtual_bytes;
             }
             ctx.hv
                 .block_resize(vm.id, disk, size_bytes)

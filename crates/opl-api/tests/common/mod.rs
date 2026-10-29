@@ -451,8 +451,12 @@ pub struct FakeStorage {
     unmounted_deletes: std::sync::Mutex<usize>,
     /// 이 볼륨의 `snapshot_create`는 실패한다.
     failing_creates: std::sync::Mutex<Vec<Uuid>>,
+    /// 이 볼륨의 `snapshot_create`는 시간을 넘긴다(명령이 아직 돌 수 있다).
+    timing_out_creates: std::sync::Mutex<Vec<Uuid>>,
     /// `copy_volume`으로 만든 볼륨과 그 형식
     copy_formats: std::sync::Mutex<Vec<(Uuid, ImageFormat)>>,
+    /// `resize_volume`이 크기를 이 단위로 올린다(LVM의 extent처럼). 0이면 그대로다.
+    resize_unit: std::sync::Mutex<u64>,
 }
 
 impl FakeStorage {
@@ -473,6 +477,16 @@ impl FakeStorage {
     /// 볼륨 `id`의 `snapshot_create`가 (호출을 기록한 뒤) 실패한다.
     pub fn fail_snapshot_create(&self, id: Uuid) {
         self.failing_creates.lock().unwrap().push(id);
+    }
+
+    /// 볼륨 `id`의 `snapshot_create`가 (호출을 기록한 뒤) `Timeout`으로 실패한다.
+    pub fn time_out_snapshot_create(&self, id: Uuid) {
+        self.timing_out_creates.lock().unwrap().push(id);
+    }
+
+    /// 이후의 `resize_volume`이 크기를 `unit` 단위로 올린다.
+    pub fn round_resizes(&self, unit: u64) {
+        *self.resize_unit.lock().unwrap() = unit;
     }
 
     /// `copy_volume`으로 만든 볼륨과 그 형식
@@ -585,6 +599,9 @@ impl Storage for FakeStorage {
         if self.failing_creates.lock().unwrap().contains(&id) {
             return Err(DriverError::Lvm("injected".into()));
         }
+        if self.timing_out_creates.lock().unwrap().contains(&id) {
+            return Err(DriverError::Timeout("lvm command"));
+        }
         Ok(())
     }
     async fn snapshot_revert(
@@ -623,7 +640,8 @@ impl Storage for FakeStorage {
         size_bytes: u64,
     ) -> Result<(), DriverError> {
         self.record("resize", id).await;
-        self.set_size(id, size_bytes);
+        let unit = (*self.resize_unit.lock().unwrap()).max(1);
+        self.set_size(id, size_bytes.div_ceil(unit) * unit);
         Ok(())
     }
     async fn volume_source(

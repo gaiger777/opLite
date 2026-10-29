@@ -44,6 +44,8 @@ struct MockState {
     disk_sizes: HashMap<(Uuid, usize), u64>,
     /// `pause`로 멈추고 아직 `resume`하지 않은 VM
     paused: HashSet<Uuid>,
+    /// 멈춘 채 남은 표시(`paused-by-opl`)가 있는 VM(이전 opld가 멈춘 채 죽었다)
+    marked: HashSet<Uuid>,
     /// `pause`·`resume` 호출 (VM, 이름)
     pauses: Vec<(Uuid, &'static str)>,
     /// 조회에 드러낼 상태(QEMU가 스스로 멈춘 상태 등)
@@ -150,6 +152,14 @@ impl MockHypervisor {
         self.state.lock().unwrap().paused.contains(&id)
     }
 
+    /// 이전 opld가 `pause`한 채 죽은 것처럼 VM을 표시와 함께 멈춘다. `resume_left_stopped`가
+    /// 이어서 실행한다(지금 `pause`해 둔 VM은 표시가 없는 것으로 본다).
+    pub fn leave_paused(&self, id: Uuid) {
+        let mut st = self.state.lock().unwrap();
+        st.paused.insert(id);
+        st.marked.insert(id);
+    }
+
     /// VM에 부른 `pause`·`resume`(실패한 호출 포함)을 순서대로 돌려준다.
     pub fn pause_calls(&self, id: Uuid) -> Vec<&'static str> {
         let st = self.state.lock().unwrap();
@@ -185,6 +195,7 @@ impl MockHypervisor {
         let mut st = self.state.lock().unwrap();
         st.unresponsive.remove(&id);
         st.paused.remove(&id);
+        st.marked.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -354,7 +365,19 @@ impl Hypervisor for MockHypervisor {
         st.pauses.push((id, "resume"));
         Self::controllable(&st, id)?;
         st.paused.remove(&id);
+        st.marked.remove(&id);
         Ok(())
+    }
+
+    async fn resume_left_stopped(&self, id: Uuid) -> Result<bool, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        if Self::controllable(&st, id).is_err() {
+            return Ok(false);
+        }
+        if st.marked.remove(&id) {
+            st.paused.remove(&id);
+        }
+        Ok(true)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {

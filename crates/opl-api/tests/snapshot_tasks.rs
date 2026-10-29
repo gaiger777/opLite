@@ -934,6 +934,37 @@ async fn failed_lvm_snapshot_resumes_the_vm_and_removes_the_lvs_made() {
     assert_eq!(position(&env, vm), None);
 }
 
+/// 한 디스크의 찍기가 시간을 넘기면 그 디스크의 스냅샷 LV는 아직 만들어지고 있을 수 있으므로
+/// 두고, 찍기가 끝난 디스크의 것만 지운다. 다시 돌리지 못했으면 그것도 알린다.
+#[tokio::test]
+async fn timed_out_lvm_snapshot_removes_only_the_lvs_made() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0", "lv1"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
+
+    storage.time_out_snapshot_create(lvs[1]);
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    // 멈춘 동안 QMP로 다룰 수 없게 되어 다시 돌리지 못한다.
+    env.hv.set_unresponsive(vm, true);
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(error.contains("may still"), "{error}");
+    assert!(error.contains("resuming the VM failed"), "{error}");
+    assert_eq!(
+        storage.calls(),
+        [("create", lvs[0]), ("create", lvs[1]), ("delete", lvs[0])]
+    );
+    env.hv.set_unresponsive(vm, false);
+}
+
 #[tokio::test]
 async fn running_vm_lvm_disk_grows_in_storage_before_qemu() {
     let mut env = Env::start().await;
@@ -955,6 +986,28 @@ async fn running_vm_lvm_disk_grows_in_storage_before_qemu() {
     assert_eq!(env.hv.disk_size(vm, 0), Some(2 << 20));
     let lv0 = env.cluster.get::<VolumeSpec>(lvs[0]).unwrap().unwrap();
     assert_eq!(lv0.spec.size_bytes, 2 << 20);
+}
+
+/// LVM이 크기를 extent 단위로 올리면 QEMU에도 기록한 크기와 같은 LV의 실제 크기를 알린다.
+#[tokio::test]
+async fn running_vm_lvm_disk_grows_to_the_lv_size() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_lvm_vm(&env, &admin, "web", &["lv0"]).await;
+    storage.round_resizes(4 << 20);
+
+    let (status, task) = admin
+        .post(
+            "/volumes/lv0/resize",
+            json!({ "size_bytes": (2 << 20) + 512 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(env.hv.disk_size(vm, 0), Some(4 << 20));
+    let lv0 = env.cluster.get::<VolumeSpec>(lvs[0]).unwrap().unwrap();
+    assert_eq!(lv0.spec.size_bytes, 4 << 20);
 }
 
 /// LVM 디스크의 VM은 예약이 메모리를 원해도 디스크만 찍는다(메모리를 요청하면 거절되어 예약이

@@ -153,17 +153,26 @@ async fn lvm_thin_pools_are_node_local_and_hold_raw_volumes() {
     let (status, body) = admin.post("/volumes", create("raw")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 
-    // 가져오기도 같다. 형식을 적지 않으면 qcow2이므로 거절한다.
+    // 가져오기도 같다. 형식을 적지 않으면 풀 종류를 따라 raw다.
     let check = |format: &str| {
         format!("/volumes/import/check?name=up&pool=vg&source_format=vmdk&size=512{format}")
     };
-    for format in ["&format=qcow2", ""] {
+    let (status, body) = admin.post(&check("&format=qcow2"), Value::Null).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["message"], "lvm-thin pools hold raw volumes");
+    for format in ["&format=raw", ""] {
         let (status, body) = admin.post(&check(format), Value::Null).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{format}: {body}");
-        assert_eq!(body["message"], "lvm-thin pools hold raw volumes");
+        assert_eq!(status, StatusCode::NO_CONTENT, "{format}: {body}");
     }
-    let (status, body) = admin.post(&check("&format=raw"), Value::Null).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, task) = admin
+        .upload(
+            "/volumes/import?name=up&pool=vg&source_format=raw",
+            vec![0; 512],
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let (_, volume) = admin.get("/volumes/up").await;
+    assert_eq!(volume["spec"]["format"], "raw", "{volume}");
 }
 
 /// 풀 `pools`가 준비됐다고 알린 다른 노드를 저장소에 직접 만든다.

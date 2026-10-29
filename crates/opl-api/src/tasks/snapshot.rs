@@ -353,12 +353,15 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         paused = Some(guard);
     }
     let paused_at = Instant::now();
+    // 찍기가 끝난 디스크. 시간을 넘겨 실패하면 이것들의 스냅샷만 지운다.
+    let mut taken = Vec::new();
     let made = if !running || lv_running {
         let take = async {
             for (volume, pool) in &disks {
                 ctx.storage
                     .snapshot_create(pool, volume.id, volume.spec.format, &tag)
                     .await?;
+                taken.push((volume, pool));
             }
             Ok(())
         };
@@ -399,6 +402,27 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         _ => Ok(()),
     };
     let failure = match (made, copied) {
+        // LV 스냅샷은 디스크마다 따로 만든다. 끝난 디스크의 것은 지우고, 아직 돌 수 있는
+        // 디스크의 것만 둔다.
+        (Err(e), _) if e.may_be_in_progress() && lv_running => {
+            for (volume, pool) in taken {
+                if let Err(e) = ctx
+                    .storage
+                    .snapshot_delete(pool, volume.id, volume.spec.format, &tag)
+                    .await
+                {
+                    tracing::warn!(snapshot = %id, volume = %volume.name, error = %e, "cannot remove lvm snapshot of failed snapshot");
+                }
+            }
+            let error = format!(
+                "{e}; the snapshot may still be written to the disks that were not done and its \
+                 tag {tag} is left there"
+            );
+            return Err(match resumed {
+                Err(e) => format!("{error}; resuming the VM failed: {e}"),
+                Ok(()) => error,
+            });
+        }
         (Err(e), _) if e.may_be_in_progress() => {
             return Err(format!(
                 "{e}; the snapshot may still be written to the disks and its tag {tag} is left there"

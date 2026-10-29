@@ -628,6 +628,14 @@ impl Hypervisor for QemuHypervisor {
         Ok(())
     }
 
+    async fn resume_left_stopped(&self, id: Uuid) -> Result<bool, DriverError> {
+        if self.handle(id).is_none() {
+            return Ok(false);
+        }
+        self.continue_if_left_stopped(id).await?;
+        Ok(true)
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
         self.events.subscribe()
     }

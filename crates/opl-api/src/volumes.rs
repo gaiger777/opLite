@@ -144,6 +144,14 @@ fn check_pool_format(pool: &StoragePool, format: ImageFormat) -> Result<(), ApiE
     Ok(())
 }
 
+/// 형식을 적지 않았을 때의 볼륨 형식: LVM-thin 풀은 raw, 그 밖은 스냅샷을 담을 수 있는 qcow2
+fn default_format(pool: &StoragePool) -> ImageFormat {
+    match pool.spec.backend {
+        PoolBackend::LvmThin { .. } => ImageFormat::Raw,
+        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => ImageFormat::Qcow2,
+    }
+}
+
 /// 볼륨 리소스를 만들고, 파일을 만들 Task를 돌려준다(202). Task가 실패하면 리소스도 지운다.
 #[utoipa::path(post, path = "/volumes", tag = "storage",
     request_body = CreateRequest<VolumeSpec>,
@@ -175,16 +183,12 @@ pub async fn create_volume(
 pub struct ImportQuery {
     pub name: String,
     pub pool: String,
-    /// 만들 볼륨의 형식 (기본 qcow2)
-    #[serde(default = "qcow2")]
+    /// 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin은 raw, 그 밖은 qcow2)
+    #[serde(default)]
     #[param(inline)]
-    pub format: ImageFormat,
+    pub format: Option<ImageFormat>,
     #[param(inline)]
     pub source_format: SourceFormat,
-}
-
-fn qcow2() -> ImageFormat {
-    ImageFormat::Qcow2
 }
 
 /// 업로드 사전 확인의 매개변수. 업로드의 것에 올릴 파일 크기(바이트)를 더한다.
@@ -194,28 +198,29 @@ fn qcow2() -> ImageFormat {
 pub struct ImportCheckQuery {
     pub name: String,
     pub pool: String,
-    /// 만들 볼륨의 형식 (기본 qcow2)
-    #[serde(default = "qcow2")]
+    /// 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin은 raw, 그 밖은 qcow2)
+    #[serde(default)]
     #[param(inline)]
-    pub format: ImageFormat,
+    pub format: Option<ImageFormat>,
     #[param(inline)]
     pub source_format: SourceFormat,
     /// 올릴 파일 크기(바이트)
     pub size: u64,
 }
 
-/// 업로드를 받기 전의 확인. 사전 확인과 업로드가 함께 쓴다. 문제가 없으면 풀을 돌려준다.
-/// 확인 뒤에 다른 요청이 이름을 가져가면 저장소에 만들 때 `name_taken`이 난다.
+/// 업로드를 받기 전의 확인. 사전 확인과 업로드가 함께 쓴다. 문제가 없으면 풀과 만들 볼륨의
+/// 형식을 돌려준다. 확인 뒤에 다른 요청이 이름을 가져가면 저장소에 만들 때 `name_taken`이 난다.
 pub async fn check_import(
     state: &AppState,
     principal: &Principal,
     q: &ImportQuery,
     size: u64,
-) -> Result<StoragePool, ApiError> {
+) -> Result<(StoragePool, ImageFormat), ApiError> {
     state.authorize(principal, Action::Write, VolumeSpec::KIND)?;
     check_volume_name(&q.name)?;
     let pool = find_pool(state, &q.pool)?;
-    check_pool_format(&pool, q.format)?;
+    let format = q.format.unwrap_or_else(|| default_format(&pool));
+    check_pool_format(&pool, format)?;
     check_pool_on(state, &pool, state.node, || {
         format!(
             "storage pool {:?} is not available on this node; upload to one of its nodes",
@@ -239,7 +244,7 @@ pub async fn check_import(
             format!("not enough free space for a {size}-byte upload"),
         ));
     }
-    Ok(pool)
+    Ok((pool, format))
 }
 
 /// 업로드 전에 받을 수 있는지 확인한다(204). 거절 이유는 업로드와 같다. 본문은 받지 않는다.
@@ -281,14 +286,14 @@ pub async fn import_volume(
     body: Body,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     let length = content_length(&headers)?;
-    let pool = check_import(&state, &principal, &q, length).await?;
+    let (pool, format) = check_import(&state, &principal, &q, length).await?;
     // 크기는 가져온 뒤 실제 이미지 크기로 바뀐다.
     let mut volume: Volume = Resource::new(
         q.name,
         VolumeSpec {
             pool: pool.name.clone(),
             size_bytes: 0,
-            format: q.format,
+            format,
         },
     );
     volume.status.node = Some(state.node);

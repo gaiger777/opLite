@@ -93,6 +93,12 @@ pub trait Hypervisor: Send + Sync {
     /// `pause`로 멈춘 VM을 이어서 실행한다(QMP `cont`). 실행 중이어도 성공한다.
     async fn resume(&self, id: Uuid) -> Result<(), DriverError>;
 
+    /// 이미 붙어 있는 VM이 멈춘 채 남았으면(기동 도중 `-S`, 표시가 남은 `pause`) `start`처럼
+    /// 이어서 실행하고 true. 지금 `pause`해 둔 VM과 QEMU가 스스로 멈춘 VM은 그대로 두고 true다.
+    /// 붙어 있지 않으면 아무것도 하지 않고 false(다시 붙는 것은 `start`가 한다). 디스크를 다시
+    /// 해석하지 않으므로 저장소가 응답하지 않아도 된다.
+    async fn resume_left_stopped(&self, id: Uuid) -> Result<bool, DriverError>;
+
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;
 }

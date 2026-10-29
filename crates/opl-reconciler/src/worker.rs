@@ -236,9 +236,16 @@ impl Worker {
                 status.pid = Some(state.pid);
                 status.last_error = None;
                 if state.status != RuntimeStatus::Running {
-                    // opld가 기동 도중(cont 전)에 죽었거나 QMP로 다룰 수 없다. start()가 cont를
-                    // 보내거나 다시 붙는다. 실패해도 돌고 있는 VM이므로 끄거나 실패로 세지 않는다.
-                    if let Err(e) = self.reattach(vm).await {
+                    // opld가 기동 도중(cont 전)이나 스냅샷으로 멈춘 채 죽었거나 QMP로 다룰 수 없다.
+                    // 붙어 있으면 디스크를 다시 해석하지 않고(LVM이 응답하지 않을 수 있다) 이어서
+                    // 실행하고, 아니면 start()가 다시 붙는다. 실패해도 돌고 있는 VM이므로 끄거나
+                    // 실패로 세지 않는다.
+                    let continued = match self.hv.resume_left_stopped(self.id).await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => self.reattach(vm).await,
+                        Err(e) => Err(e.to_string()),
+                    };
+                    if let Err(e) = continued {
                         tracing::warn!(vm = %self.id, error = %e, "VM is unresponsive; will retry");
                         status.last_error = Some(format!("VM is unresponsive: {e}"));
                         self.wake(now + self.config.retry_interval);

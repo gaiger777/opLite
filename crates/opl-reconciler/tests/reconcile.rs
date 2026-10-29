@@ -201,6 +201,45 @@ async fn unresponsive_vm_is_reattached_and_reported() {
     assert_eq!(env.pid(vm.id).await, pid);
 }
 
+/// 멈춘 채 남은 VM(표시가 있는 `pause`)은 디스크를 다시 해석하지 않고 이어서 실행한다(LVM이
+/// 응답하지 않아도 된다). 지금 `pause`해 둔 VM은 그대로 두고 응답하지 않는다고 알리지 않는다.
+#[tokio::test]
+async fn vm_left_paused_continues_without_resolving_disks() {
+    let env = Env::start_with(|c| c.resync_interval = Duration::from_millis(100)).await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    let pid = env.wait(vm.id, "running", running).await.status.pid;
+    // 디스크를 해석할 수 없게 한다(볼륨이 없다).
+    let current = env.get(vm.id);
+    let mut spec = current.spec.clone();
+    spec.disks.push(DiskSpec {
+        volume: "missing".into(),
+        bus: DiskBus::VirtioBlk,
+        boot_order: Some(1),
+    });
+    env.cluster
+        .update_spec(vm.id, Some(current.revision), current.labels, &spec)
+        .await
+        .unwrap();
+
+    env.hv.pause(vm.id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let got = env.get(vm.id);
+    assert_eq!(got.status.last_error, None);
+    assert_eq!(got.status.phase, VmPhase::Running);
+    assert!(env.hv.is_paused(vm.id));
+
+    env.hv.leave_paused(vm.id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while env.hv.is_paused(vm.id) {
+        assert!(std::time::Instant::now() < deadline, "VM stayed paused");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got = env.get(vm.id);
+    assert_eq!(got.status.last_error, None);
+    assert_eq!(got.status.pid, pid);
+}
+
 #[tokio::test]
 async fn host_kill_does_not_turn_power_off() {
     let env = Env::start().await;
