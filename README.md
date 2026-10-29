@@ -370,3 +370,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 13: API·보안 보완](docs/superpowers/plans/2026-10-28-plan13-api-security.md)
 - [계획 14: 웹 정리](docs/superpowers/plans/2026-10-28-plan14-web-cleanup.md)
 - [계획 15: 공유 스토리지 1 — 백엔드 구조와 NFS](docs/superpowers/plans/2026-10-28-plan15-shared-storage-nfs.md)
+- [계획 16: 공유 스토리지 2 — 블록 백엔드 바탕과 LVM-thin](docs/superpowers/plans/2026-10-29-plan16-shared-storage-lvm-thin.md)

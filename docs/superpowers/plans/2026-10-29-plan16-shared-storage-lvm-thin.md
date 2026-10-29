@@ -32004,3 +32004,23 @@ git commit -m "docs: LVM-thin 풀 안내, 공유 스토리지 설계 2에 구현
 - **thin pool이 가득 차면 쓰기가 실패한다.** 자동 확장은 LVM 설정에 맡긴다.
 - **qcow2 스냅샷에서 복제할 때** 대상 크기는 지금 볼륨 크기다(`qemu-img`가 스냅샷 시점의 크기를 알려 주지 않는다).
 - 그 밖의 제한은 설계 문서 §10에 있다.
+
+## 실행 후 기록 (2026-10-29)
+
+10개 Task는 계획대로 적용했고, Task마다 검증된 단계와 트리가 같았다(생성 파일 `schema.d.ts` 포함). 최종 리뷰(심각 없음, 중요 하나)로 아래가 바뀌었다(`193ae67`). 저장소의 코드가 기준이다. 위 Task의 코드 블록은 고치기 전 것이다.
+
+- **이름이 `-revert-`로 남은 볼륨(중요):** 되돌리기의 `lvrename`이 시간 초과 뒤 늦게 끝나 `opl-{id}`가 없고 `opl-{id}-revert-*` 하나만 있으면, 볼륨을 찾는 모든 곳(활성화·정보·크기·스냅샷·되돌리기·원본·지우기)이 먼저 이름을 되돌린다. 그 LV에 명령이 돌고 있으면 `VolumeNotFound` 대신 일시 오류라 VM을 끄지 않는다. 여럿이면 손대지 않고 이름을 알린다. `LvmOps`에 `changing`·`clear_skip`.
+- 되돌린 LV의 활성화 건너뛰기 표시를 지운다(`lvchange -kn`), 실행 중 LVM 디스크의 크기 늘리기는 실제 LV 크기를 게스트에 알린다, 실행 중 LVM 스냅샷이 시간 초과되면 끝난 디스크의 LV만 지우고 재개 오류를 메시지에 붙인다, 멈춘 채 남은 VM의 자동 재개는 디스크 확인 없이(`Hypervisor::resume_left_stopped`), 가져오기 API의 `format`이 없으면 풀 종류로(LVM은 raw), README에 모든 노드를 올린 뒤 새 풀 종류를 만들라는 안내.
+
+알고 받아들인 동작(위 제한 목록에 더해):
+- `-revert-` LV가 여럿 남으면 관리자가 맞는 것을 `lvrename`해야 한다.
+- CI의 TCG에서 실행 중 VM의 메모리 스냅샷(`snapshot-save`)이 가끔 QEMU가 QMP에 답하지 않아 시간 제한에 걸린다(계획 15부터 두 번, 원인 미상 — 다음에 어디서 멈췄는지 알려 주는 진단을 따로 넣는다).
+
+테스트: macOS `cargo test --workspace` 506개, `opl-driver` `storage-it` 103개, `opl-api` `storage-it` 196개, `qemu-it` `smoke`·`e2e`·`snapshots` 11개, 브라우저 E2E, 웹 Vitest 282개, `fmt`·`clippy -D warnings`(모든 기능). 실제 LVM(`lvm-it`)과 NFS(`nfs-it`)는 Linux CI `linux-kvm`에서.
+CI(확인용 브랜치): `check` 2개, `deny`, `web`, `linux-kvm`(실제 LVM·NFS 포함)이 모두 통과했다(첫 실행의 메모리 스냅샷 멈춤과 opl-peer gRPC 3노드 테스트 실패는 실패한 작업만 다시 돌려 통과).
+
+## 다음 계획으로 넘길 사항
+
+- 계획 17: ZFS(zvol, 이 계획의 블록 바탕 위).
+- 계획 18: iSCSI, Ceph RBD(QEMU 네트워크 블록 드라이버, 공유 LVM).
+- 하위 프로젝트 4: 라이브 마이그레이션, UEFI 변수 공유, 풀 `shared` 바꾸기.
