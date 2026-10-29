@@ -22,6 +22,9 @@ nfs-it = []
 # 실제 LVM-thin 풀의 볼륨으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서 root, lvm2,
 # qemu-io와 테스트가 LV를 만들고 지워도 되는 VG/thin pool(`OPL_TEST_LVM=VG/THINPOOL`)이 필요하다.
 lvm-it = []
+# 실제 ZFS 풀의 볼륨(zvol)으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서 root,
+# zfsutils-linux, qemu-io와 테스트가 zvol을 만들고 지워도 되는 데이터셋(`OPL_TEST_ZFS=POOL/DATASET`)이 필요하다.
+zfs-it = []
 # 브라우저(Playwright)로 웹 UI를 확인하는 E2E. qemu-it의 준비물에 더해 pnpm과
 # `pnpm -C web exec playwright install chromium`, 빌드한 web/dist가 필요하다.
 web-it = ["qemu-it", "web-ui"]
