@@ -27,8 +27,8 @@ export function ScheduleSection({
     onChange({ snapshotSchedule: { ...values.snapshotSchedule, ...patch } });
   // 예약을 켰는데 디스크가 스냅샷을 담지 못하거나 방식이 섞이면 예약 스냅샷이 실패한다.
   const on = values.snapshotSchedule.every !== "off";
-  // LV 스냅샷은 메모리를 담지 못하므로 묻지 않는다(예약 작업이 메모리 없이 찍는다).
-  const lvm = support?.kind === "ok" && support.lvm;
+  // 블록 스냅샷은 메모리를 담지 못하므로 묻지 않는다(예약 작업이 메모리 없이 찍는다).
+  const block = support?.kind === "ok" && support.block;
   return (
     <Card>
       <CardHeader>
@@ -83,9 +83,9 @@ export function ScheduleSection({
                 />
               )}
             </Field>
-            {lvm ? (
+            {block ? (
               <p className="text-xs text-muted-foreground sm:col-span-2">
-                {t("snapshots.lvmHint")}
+                {t("snapshots.blockHint")}
               </p>
             ) : (
               <div className="flex flex-col gap-1.5 sm:col-span-2">

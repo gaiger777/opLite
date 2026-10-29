@@ -1,6 +1,6 @@
 import type { components } from "@/api/schema";
 import type { Snapshot, StoragePool, Volume } from "@/api/types";
-import { poolFormats } from "@/storage/pools";
+import { blockSnapshotKind, poolFormats } from "@/storage/pools";
 import { validName, type VmFormValues } from "@/vms/form";
 
 /** 서버의 `MAX_DESCRIPTION_CHARS`(문자 수) */
@@ -73,11 +73,12 @@ export interface SnapshotDisk {
 }
 
 /**
- * 디스크들의 스냅샷 가능 여부. `ok`면 `lvm`이 LV 스냅샷(메모리 없음)인지, `format`은 풀 종류가
- * 담지 못하는 형식의 디스크, `mixed`는 qcow2 내부 스냅샷과 LV 스냅샷이 섞인 것이다.
+ * 디스크들의 스냅샷 가능 여부. `ok`면 `block`이 블록 스냅샷(LVM-thin·ZFS, 메모리 없음)인지,
+ * `format`은 풀 종류가 담지 못하는 형식의 디스크, `mixed`는 방식(qcow2 내부 스냅샷, 블록 백엔드
+ * 종류마다의 블록 스냅샷)이 섞인 것이다.
  */
 export type SnapshotSupport =
-  { kind: "ok"; lvm: boolean } | { kind: "format"; disk: SnapshotDisk } | { kind: "mixed" };
+  { kind: "ok"; block: boolean } | { kind: "format"; disk: SnapshotDisk } | { kind: "mixed" };
 
 /** 볼륨을 스냅샷 방식을 따질 디스크로 바꾼다. */
 export function volumeDisk(volume: Volume, pools: readonly StoragePool[]): SnapshotDisk {
@@ -89,23 +90,48 @@ export function volumeDisk(volume: Volume, pools: readonly StoragePool[]): Snaps
 }
 
 /**
- * 서버의 `check_disks`처럼 판단한다: 파일 풀의 디스크는 qcow2, LVM-thin 풀의 디스크는 raw여야 하고,
- * 모든 디스크가 같은 방식이어야 한다. 서버와 다른 점: 호출자는 목록에 없는 볼륨을 넘기지 않으므로
+ * 서버의 `check_disks`처럼 판단한다: 파일 풀의 디스크는 qcow2, 블록 풀(LVM-thin, ZFS)의 디스크는
+ * raw여야 하고, 모든 디스크가 같은 방식이어야 한다. 서버와 다른 점: 호출자는 목록에 없는 볼륨을 넘기지 않으므로
  * (서버는 400) 그런 디스크는 건너뛴 셈이고, 풀을 모르는 디스크는 파일 풀처럼 본다(서버는 400).
  */
 export function snapshotSupport(disks: readonly SnapshotDisk[]): SnapshotSupport {
-  let lvm: boolean | undefined;
+  // 디스크마다의 방식: 블록 백엔드 종류, qcow2 내부 스냅샷이면 `null`. 아직 디스크가 없으면 `undefined`.
+  let method: string | null | undefined;
   for (const disk of disks) {
-    const lv = disk.pool?.spec.backend.kind === "lvm-thin";
+    const kind = blockSnapshotKind(disk.pool) ?? null;
     if (disk.format !== poolFormats(disk.pool)[0]) {
       return { kind: "format", disk };
     }
-    if (lvm !== undefined && lvm !== lv) {
+    if (method !== undefined && method !== kind) {
       return { kind: "mixed" };
     }
-    lvm = lv;
+    method = kind;
   }
-  return { kind: "ok", lvm: lvm === true };
+  return { kind: "ok", block: typeof method === "string" };
+}
+
+/**
+ * ZFS 디스크라 되돌릴 수 없는 스냅샷인지. 서버의 `check_zfs_latest`처럼 스냅샷이 찍은 디스크
+ * (`vm_spec`)에 ZFS 풀의 볼륨이 있고, `snapshots`(같은 VM의 스냅샷) 가운데 더 나중 것이 있으면 막힌다.
+ * 순서는 만든 시각, 같으면 id(UUIDv7)이고 만드는 중인 스냅샷은 가장 나중이다. 목록에 없는 볼륨·풀은
+ * 건너뛴다.
+ */
+export function zfsNotLatest(
+  snapshot: Snapshot,
+  snapshots: readonly Snapshot[],
+  volumes: readonly Volume[],
+  pools: readonly StoragePool[],
+): boolean {
+  const zfs = (snapshot.spec.vm_spec.disks ?? []).some((d) => {
+    const volume = volumes.find((v) => v.name === d.volume);
+    const pool = volume && pools.find((p) => p.name === volume.spec.pool);
+    return pool?.spec.backend.kind === "zfs";
+  });
+  const newer = (a: Snapshot, b: Snapshot) => {
+    const at = (s: Snapshot) => s.status.created_at ?? Infinity;
+    return at(a) !== at(b) ? at(a) > at(b) : a.id > b.id;
+  };
+  return zfs && snapshots.some((s) => newer(s, snapshot));
 }
 
 /**

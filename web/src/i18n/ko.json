@@ -28,7 +28,7 @@
     "pool_in_use": "풀에 볼륨이 남아 있습니다. 먼저 볼륨을 지우세요.",
     "pool_unavailable": "{{message}}",
     "vm_busy": "이 VM에 다른 작업(시작·정지, 스냅샷, 되돌리기, 복제)이 진행 중입니다. 끝나면 다시 시도하세요.",
-    "snapshot_unsupported": "디스크가 모두 qcow2이거나 모두 LVM-thin 풀에 있는 VM만 스냅샷을 만들 수 있습니다. LVM-thin 풀의 디스크 스냅샷에는 메모리를 담을 수 없습니다.",
+    "snapshot_unsupported": "디스크가 모두 qcow2이거나, 모두 LVM-thin 풀에 있거나, 모두 ZFS 풀에 있는 VM만 스냅샷을 만들 수 있습니다. LVM-thin·ZFS 풀의 디스크 스냅샷에는 메모리를 담을 수 없고, ZFS 풀의 디스크는 가장 최근 스냅샷으로만 되돌릴 수 있습니다.",
     "vm_has_snapshots": "VM에 스냅샷이 있습니다. 먼저 스냅샷을 지우세요.",
     "volume_in_snapshot": "VM 스냅샷이 아직 이 볼륨을 씁니다. 먼저 그 스냅샷을 지우세요.",
     "snapshot_not_ready": "아직 만드는 중인 스냅샷입니다.",
@@ -235,7 +235,7 @@
     "createDescription": "VM의 디스크, 펌웨어 변수, 설정을 저장해 나중에 이 시점으로 돌아올 수 있게 합니다.",
     "includeMemory": "메모리 포함",
     "includeMemoryHint": "실행 상태도 저장합니다. 되돌리면 VM이 그때 상태에서 이어서 실행됩니다.",
-    "unsupported": "디스크가 모두 qcow2이거나 모두 LVM-thin 풀에 있는 VM만 스냅샷을 만들 수 있습니다. {{volume}}은(는) {{format}}입니다.",
+    "unsupported": "디스크가 모두 qcow2이거나, 모두 LVM-thin 풀에 있거나, 모두 ZFS 풀에 있는 VM만 스냅샷을 만들 수 있습니다. {{volume}}은(는) {{format}}입니다.",
     "busy": "VM이 시작하거나 정지하는 중입니다. 끝나면 스냅샷을 만들고 되돌리고 지울 수 있습니다.",
     "revert": "되돌리기",
     "revertNamed": "{{name}}(으)로 되돌리기",
@@ -269,8 +269,9 @@
       "vm_busy": "VM이 다른 작업 중이라 건너뛰었습니다. 다음 기회에 다시 합니다.",
       "node_offline": "VM의 노드가 오프라인이라 건너뛰었습니다 ({{message}})."
     },
-    "mixed": "디스크가 모두 qcow2이거나 모두 LVM-thin 풀에 있는 VM만 스냅샷을 만들 수 있습니다. 이 VM에는 둘이 섞여 있습니다.",
-    "lvmHint": "LVM-thin 풀의 디스크는 메모리 없이 저장합니다. 실행 중인 VM은 저장하는 동안 잠깐 멈춥니다."
+    "mixed": "디스크가 모두 qcow2이거나, 모두 LVM-thin 풀에 있거나, 모두 ZFS 풀에 있는 VM만 스냅샷을 만들 수 있습니다. 이 VM에는 여러 방식이 섞여 있습니다.",
+    "blockHint": "LVM-thin·ZFS 풀의 디스크는 메모리 없이 저장합니다. 실행 중인 VM은 저장하는 동안 잠깐 멈춥니다.",
+    "zfsLatest": "ZFS 풀의 디스크는 가장 최근 스냅샷으로만 되돌릴 수 있습니다."
   },
   "clone": {
     "title": "{{name}} 복제",
@@ -355,7 +356,7 @@
     "empty": "스토리지 풀이 없습니다.",
     "allNodes": "모든 노드",
     "createTitle": "스토리지 풀 만들기",
-    "createDescription": "볼륨을 두는 곳입니다: 각 노드의 디렉터리, 노드들이 마운트하는 NFS 내보내기, 또는 각 노드의 LVM thin pool.",
+    "createDescription": "볼륨을 두는 곳입니다: 각 노드의 디렉터리, 노드들이 마운트하는 NFS 내보내기, 또는 각 노드의 LVM thin pool이나 ZFS 데이터셋.",
     "pathHint": "노드의 절대 경로입니다.",
     "shared": "공유 스토리지",
     "sharedHint": "모든 노드가 이 경로에서 같은 파일을 보면 고르세요(예: opLite 밖에서 마운트한 NFS 공유).",
@@ -369,13 +370,15 @@
     "kinds": {
       "dir": "디렉터리",
       "nfs": "NFS",
-      "lvm-thin": "LVM-thin"
+      "lvm-thin": "LVM-thin",
+      "zfs": "ZFS"
     },
     "location": "위치",
     "kindHint": {
       "dir": "먼저 각 노드에 디렉터리를 만드세요.",
       "nfs": "각 노드가 내보내기를 데이터 디렉터리 아래에 마운트합니다. 마운트는 root로 도는 Linux 노드에서만 됩니다. 풀의 노드들이 함께 쓰는 공유 풀입니다.",
-      "lvm-thin": "먼저 각 노드에 볼륨 그룹과 thin pool을 만드세요. 볼륨은 만든 노드에 두는 raw thin 볼륨이고, 스냅샷은 디스크만 담습니다. root로 도는 Linux 노드에서만 됩니다."
+      "lvm-thin": "먼저 각 노드에 볼륨 그룹과 thin pool을 만드세요. 볼륨은 만든 노드에 두는 raw thin 볼륨이고, 스냅샷은 디스크만 담습니다. root로 도는 Linux 노드에서만 됩니다.",
+      "zfs": "먼저 각 노드에 데이터셋을 만드세요. 볼륨은 만든 노드에 두는 raw zvol이고, 스냅샷은 디스크만 담습니다. 디스크는 가장 최근 스냅샷으로만 되돌릴 수 있습니다. root로 도는 Linux 노드에서만 됩니다."
     },
     "server": "NFS 서버",
     "serverHint": "호스트 이름 또는 IP 주소입니다.",
@@ -395,10 +398,12 @@
       "nodesGone": "고른 노드가 더 이상 클러스터에 없습니다. 다시 고르세요.",
       "server": "공백·쉼표·빗금·대괄호 없이 호스트 이름이나 IP 주소를 입력하세요.",
       "options": "옵션은 공백 없이 쉼표로 나누세요. bind, rbind, remount, move, suid, dev, exec, helper, bg와 x-* 옵션은 쓸 수 없습니다.",
-      "lvmName": "-, snapshot, pvmove로 시작하지 않는 1–127자의 영문자, 숫자, +, _, ., -를 쓰세요. LVM이 쓰는 .과 .., _tdata·_tmeta 같은 이름이 든 것도 쓸 수 없습니다."
+      "lvmName": "-, snapshot, pvmove로 시작하지 않는 1–127자의 영문자, 숫자, +, _, ., -를 쓰세요. LVM이 쓰는 .과 .., _tdata·_tmeta 같은 이름이 든 것도 쓸 수 없습니다.",
+      "zfsDataset": "tank/opl처럼 177자 이하의 데이터셋 이름을 쓰세요: /로 나눈 각 부분은 영문자, 숫자, _, ., :, -로 되고 비어 있거나 . 또는 ..이거나 -로 시작하면 안 됩니다. 맨 앞은 풀 이름이고 영문자로 시작합니다."
     },
     "vg": "볼륨 그룹",
-    "thinpool": "Thin pool"
+    "thinpool": "Thin pool",
+    "dataset": "데이터셋"
   },
   "networks": {
     "bridge": "브리지",
@@ -576,13 +581,13 @@
     },
     "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}",
     "schedule": "예약 스냅샷",
-    "scheduleNote": "주기마다 스냅샷을 만들고 예약으로 만든 것은 최근 것만 남깁니다. 직접 만든 스냅샷은 지우지 않습니다. 디스크가 모두 qcow2이거나 모두 LVM-thin 풀에 있어야 합니다.",
+    "scheduleNote": "주기마다 스냅샷을 만들고 예약으로 만든 것은 최근 것만 남깁니다. 직접 만든 스냅샷은 지우지 않습니다. 디스크가 모두 qcow2이거나, 모두 LVM-thin 풀에 있거나, 모두 ZFS 풀에 있어야 합니다.",
     "scheduleEvery": "스냅샷 주기",
     "scheduleOff": "끔",
     "scheduleKeep": "보관 개수",
-    "scheduleRaw": "{{volume}}이(가) {{format}}이라 예약 스냅샷이 실패합니다. 디스크가 모두 qcow2이거나 모두 LVM-thin 풀에 있어야 합니다.",
+    "scheduleRaw": "{{volume}}이(가) {{format}}이라 예약 스냅샷이 실패합니다. 디스크가 모두 qcow2이거나, 모두 LVM-thin 풀에 있거나, 모두 ZFS 풀에 있어야 합니다.",
     "scheduleMemoryHint": "VM이 실행 중이고 디스크가 있을 때만 메모리도 저장합니다.",
-    "scheduleMixed": "LVM-thin 풀의 디스크와 qcow2 디스크가 섞여 있어 예약 스냅샷이 실패합니다."
+    "scheduleMixed": "스냅샷 방식(qcow2, LVM-thin 풀, ZFS 풀)이 다른 디스크가 섞여 있어 예약 스냅샷이 실패합니다."
   },
   "console": {
     "connecting": "연결 중…",

@@ -35,6 +35,7 @@ import {
   poolCapacity,
   poolLocation,
   poolNodes,
+  zfsDatasetError,
 } from "@/storage/pools";
 import { PoolStatus } from "@/storage/PoolStatus";
 import { validName } from "@/vms/form";
@@ -157,8 +158,7 @@ export function PoolsPage() {
   );
 }
 
-/** 만들 수 있는 풀 종류. ZFS 풀 만들기는 아직 없다. */
-type Kind = Exclude<StoragePool["spec"]["backend"]["kind"], "zfs">;
+type Kind = StoragePool["spec"]["backend"]["kind"];
 
 function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
@@ -172,6 +172,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const [nfsOptions, setNfsOptions] = useState("");
   const [vg, setVg] = useState("");
   const [thinpool, setThinpool] = useState("");
+  const [dataset, setDataset] = useState("");
   const [chosen, setChosen] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -207,6 +208,12 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
         found.thinpool = thinpoolError;
       }
     }
+    if (kind === "zfs") {
+      const datasetError = zfsDatasetError(dataset);
+      if (datasetError) {
+        found.dataset = datasetError;
+      }
+    }
     // 고른 뒤에 목록에서 빠진 노드는 보내지 않는다.
     const known = chosen.filter((id) => nodes.data?.some((n) => n.id === id));
     // 고른 노드가 모두 빠졌으면 빈 목록(모든 노드)으로 보내지 않는다.
@@ -220,19 +227,21 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       return false;
     }
     // NFS 풀의 `shared`는 보내지 않는다(서버가 늘 공유로 둔다). 빈 옵션은 커널 기본값이다.
-    // LVM-thin 풀은 노드 로컬이라 `shared`를 보내지 않는다.
+    // LVM-thin·ZFS 풀은 노드 로컬이라 `shared`를 보내지 않는다.
     const sharedDir = kind === "dir" && shared;
     const backend =
       kind === "dir"
         ? { kind, path }
         : kind === "lvm-thin"
           ? { kind, vg, thinpool }
-          : {
-              kind,
-              server: nfsServer,
-              export: nfsExport,
-              ...(nfsOptions !== "" && { options: nfsOptions }),
-            };
+          : kind === "zfs"
+            ? { kind, dataset }
+            : {
+                kind,
+                server: nfsServer,
+                export: nfsExport,
+                ...(nfsOptions !== "" && { options: nfsOptions }),
+              };
     const spec = { backend, nodes: known, ...(sharedDir && { shared: true }) };
     await call(api.POST("/storage-pools", { body: { name, spec } }));
     toast.success(t("pools.created", { name }));
@@ -263,6 +272,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             <NativeSelectOption value="dir">{t("pools.kinds.dir")}</NativeSelectOption>
             <NativeSelectOption value="nfs">{t("pools.kinds.nfs")}</NativeSelectOption>
             <NativeSelectOption value="lvm-thin">{t("pools.kinds.lvm-thin")}</NativeSelectOption>
+            <NativeSelectOption value="zfs">{t("pools.kinds.zfs")}</NativeSelectOption>
           </NativeSelect>
         )}
       </Field>
@@ -291,6 +301,19 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             )}
           </Field>
         </>
+      )}
+      {kind === "zfs" && (
+        <Field id="pool-dataset" label={t("pools.dataset")} error={errors.dataset}>
+          {(a11y) => (
+            <Input
+              id="pool-dataset"
+              placeholder="tank/opl"
+              value={dataset}
+              onChange={(e) => setDataset(e.target.value)}
+              {...a11y}
+            />
+          )}
+        </Field>
       )}
       {kind === "dir" && (
         <>

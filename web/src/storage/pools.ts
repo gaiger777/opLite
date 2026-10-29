@@ -70,11 +70,34 @@ export function lvmNameError(name: string): string | undefined {
 }
 
 /**
+ * ZFS 데이터셋 입력 오류(번역 키). 서버처럼 177자 이하이고 `/`로 나뉜 구성 요소가 비지 않으며,
+ * 구성 요소는 `A-Za-z0-9_.:-`로만 되고 `-`로 시작하지 않으며 `.`·`..`이 아니다. 첫 구성 요소(풀
+ * 이름)는 문자로 시작한다.
+ */
+export function zfsDatasetError(dataset: string): string | undefined {
+  const ok =
+    dataset.length <= 177 &&
+    /^[A-Za-z]/.test(dataset) &&
+    dataset
+      .split("/")
+      .every(
+        (part) => /^[A-Za-z0-9_.:][A-Za-z0-9_.:-]*$/.test(part) && part !== "." && part !== "..",
+      );
+  return ok ? undefined : "pools.errors.zfsDataset";
+}
+
+/** 디스크 스냅샷을 블록 스냅샷으로 두는 풀(LVM-thin, ZFS)의 종류. 아니면(파일 풀, 모름) `undefined`. */
+export function blockSnapshotKind(pool: StoragePool | undefined): "lvm-thin" | "zfs" | undefined {
+  const kind = pool?.spec.backend.kind;
+  return kind === "lvm-thin" || kind === "zfs" ? kind : undefined;
+}
+
+/**
  * 풀에 둘 수 있는 볼륨 형식. 첫 값이 기본값이고 스냅샷을 담는 형식이다(서버의
- * `pool_kind_supports_snapshots`). LVM-thin 풀은 raw만 둔다. 풀을 모르면 파일 풀처럼 본다.
+ * `pool_kind_supports_snapshots`). 블록 풀(LVM-thin, ZFS)은 raw만 둔다. 풀을 모르면 파일 풀처럼 본다.
  */
 export function poolFormats(pool: StoragePool | undefined): [ImageFormat, ...ImageFormat[]] {
-  return pool?.spec.backend.kind === "lvm-thin" ? ["raw"] : ["qcow2", "raw"];
+  return blockSnapshotKind(pool) ? ["raw"] : ["qcow2", "raw"];
 }
 
 /** 서버의 `char::is_control`처럼 C0·C1 제어 문자와 DEL */

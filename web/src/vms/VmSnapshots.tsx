@@ -1,5 +1,5 @@
 import { Camera } from "lucide-react";
-import { type RefObject, useRef, useState } from "react";
+import { type RefObject, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -12,6 +12,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { ReasonButton, ReasonList } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -36,6 +37,7 @@ import {
   snapshotSupport,
   snapshotTree,
   volumeDisk,
+  zfsNotLatest,
 } from "@/vms/snapshots";
 
 /** VM 상세의 스냅샷 탭: 나무 목록과 만들기·되돌리기·삭제 */
@@ -54,6 +56,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   // 트리거 없이 연 대화상자는 닫힐 때 포커스를 돌려줄 곳을 모르므로 연 버튼을 기억한다.
   const opener = useRef<HTMLElement | null>(null);
+  const reasonBase = useId();
   const operate = can(me.role, "operate", "vm");
   const mine = (snapshots.data ?? []).filter((s) => s.spec.vm === vm.id);
   const rows = snapshotTree(mine);
@@ -71,7 +74,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
         }),
       )
     : undefined;
-  const lvm = support?.kind === "ok" && support.lvm;
+  const block = support?.kind === "ok" && support.block;
   const columns = operate ? 5 : 4;
   const schedule = vm.spec.snapshot_schedule;
 
@@ -120,9 +123,9 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
       <div className="flex flex-col gap-1 text-sm">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <p>
-            {/* LVM 디스크의 VM은 예약이 메모리를 원해도 메모리 없이 찍는다. */}
+            {/* 블록 디스크의 VM은 예약이 메모리를 원해도 메모리 없이 찍는다. */}
             {schedule
-              ? t(schedule.memory && !lvm ? "snapshots.scheduleMemory" : "snapshots.schedule", {
+              ? t(schedule.memory && !block ? "snapshots.scheduleMemory" : "snapshots.schedule", {
                   every: t(`snapshots.every.${schedule.every}`),
                   keep: schedule.keep,
                 })
@@ -176,6 +179,12 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
             const ready = snapshot.status.phase === "ready";
             const { name } = snapshot.spec;
             const parent = depth > 0 ? names.get(snapshot.spec.parent ?? "") : undefined;
+            // ZFS 디스크는 가장 최근 스냅샷으로만 되돌린다(서버가 409).
+            const revertReason =
+              listed && zfsNotLatest(snapshot, mine, volumes.data, pools.data)
+                ? "snapshots.zfsLatest"
+                : null;
+            const reasons = `${reasonBase}-${snapshot.id}`;
             return (
               <TableRow key={snapshot.id}>
                 {/* 깊이만큼 들여 써 나무를 보인다. */}
@@ -227,15 +236,27 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
                 </TableCell>
                 {operate && (
                   <TableCell className="text-right whitespace-nowrap">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      aria-label={t("snapshots.revertNamed", { name })}
-                      disabled={busy || !ready}
-                      onClick={(e) => ask(e, "revert", snapshot)}
-                    >
-                      {t("snapshots.revert")}
-                    </Button>
+                    {revertReason ? (
+                      <ReasonButton
+                        variant="outline"
+                        size="sm"
+                        aria-label={t("snapshots.revertNamed", { name })}
+                        reason={revertReason}
+                        reasons={reasons}
+                      >
+                        {t("snapshots.revert")}
+                      </ReasonButton>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        aria-label={t("snapshots.revertNamed", { name })}
+                        disabled={busy || !ready}
+                        onClick={(e) => ask(e, "revert", snapshot)}
+                      >
+                        {t("snapshots.revert")}
+                      </Button>
+                    )}
                     <Button
                       variant="ghost"
                       size="sm"
@@ -246,6 +267,12 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
                     >
                       {t("common.delete")}
                     </Button>
+                    {/* 셀은 줄을 바꾸지 않으므로 이유는 좁게 줄을 바꿔 표를 넓히지 않는다. */}
+                    <ReasonList
+                      base={reasons}
+                      reasons={[revertReason]}
+                      className="ml-auto max-w-xs whitespace-normal"
+                    />
                   </TableCell>
                 )}
               </TableRow>
@@ -257,7 +284,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
         <CreateSnapshotDialog
           vm={vm}
           taken={mine.map((s) => s.spec.name)}
-          lvm={support?.kind === "ok" && support.lvm}
+          block={block}
           returnFocus={opener}
           onClose={() => setCreating(false)}
         />
@@ -308,14 +335,14 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
 function CreateSnapshotDialog({
   vm,
   taken,
-  lvm,
+  block,
   returnFocus,
   onClose,
 }: {
   vm: Vm;
   taken: string[];
-  /** 디스크가 LV 스냅샷을 쓴다(메모리를 담지 못한다). */
-  lvm: boolean;
+  /** 디스크가 블록 스냅샷(LVM-thin, ZFS)을 쓴다(메모리를 담지 못한다). */
+  block: boolean;
   returnFocus: RefObject<HTMLElement | null>;
   onClose(): void;
 }) {
@@ -325,8 +352,8 @@ function CreateSnapshotDialog({
   const [memory, setMemory] = useState(true);
   const [errors, setErrors] = useState<Record<string, string>>({});
   // 서버는 실행 중이고 디스크가 있는 VM만 메모리를 담는다. 그 밖에는 묻지 않고 디스크만 담는다.
-  // LV 스냅샷은 메모리를 담지 못한다(서버가 409).
-  const canMemory = vm.status.phase === "running" && (vm.spec.disks ?? []).length > 0 && !lvm;
+  // 블록 스냅샷은 메모리를 담지 못한다(서버가 409).
+  const canMemory = vm.status.phase === "running" && (vm.spec.disks ?? []).length > 0 && !block;
 
   async function submit() {
     const found: Record<string, string> = {};
@@ -397,7 +424,7 @@ function CreateSnapshotDialog({
           <p className="text-xs text-muted-foreground">{t("snapshots.includeMemoryHint")}</p>
         </div>
       )}
-      {lvm && <p className="text-xs text-muted-foreground">{t("snapshots.lvmHint")}</p>}
+      {block && <p className="text-xs text-muted-foreground">{t("snapshots.blockHint")}</p>}
     </FormDialog>
   );
 }

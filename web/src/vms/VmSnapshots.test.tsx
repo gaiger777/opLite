@@ -173,7 +173,7 @@ it("says why a VM with a raw disk cannot take snapshots", async () => {
   open(web);
   expect(
     await screen.findByText(
-      "Only VMs whose disks are all qcow2, or all in LVM-thin pools, can take snapshots. web-root is raw.",
+      "Only VMs whose disks are all qcow2, all in LVM-thin pools, or all in ZFS pools can take snapshots. web-root is raw.",
     ),
   ).toBeVisible();
   expect(screen.queryByRole("button", { name: "Take snapshot" })).not.toBeInTheDocument();
@@ -201,7 +201,7 @@ it("takes a running VM's snapshot of disks in LVM-thin pools without memory", as
   expect(within(dialog).queryByLabelText("Include memory")).not.toBeInTheDocument();
   expect(
     within(dialog).getByText(
-      "Disks in LVM-thin pools are saved without memory. A running VM pauses briefly while they are saved.",
+      "Disks in LVM-thin and ZFS pools are saved without memory. A running VM pauses briefly while they are saved.",
     ),
   ).toBeVisible();
   await userEvent.type(within(dialog).getByLabelText("Name"), "base");
@@ -242,10 +242,50 @@ it("says why a VM mixing snapshot methods cannot take snapshots", async () => {
   open(both);
   expect(
     await screen.findByText(
-      "Only VMs whose disks are all qcow2, or all in LVM-thin pools, can take snapshots. This VM has both.",
+      "Only VMs whose disks are all qcow2, all in LVM-thin pools, or all in ZFS pools can take snapshots. This VM mixes them.",
     ),
   ).toBeVisible();
   expect(screen.queryByRole("button", { name: "Take snapshot" })).not.toBeInTheDocument();
+});
+
+it("says why a VM with disks in ZFS pools cannot revert to older snapshots", async () => {
+  const tank = pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } });
+  const zvol = volume("web-root", "tank");
+  const stopped = withDisk(vm("web", "stopped"));
+  const first = snapshot("first", stopped, 1);
+  const second = snapshot("second", stopped, 2, { spec: { parent: first.id } });
+  mockLists({
+    vm: [stopped],
+    node: [NODE],
+    volume: [{ ...zvol, spec: { ...zvol.spec, format: "raw" } }],
+    "storage-pool": [tank],
+    snapshot: [first, second],
+  });
+  let reverted = false;
+  server.use(
+    http.post(apiUrl(`/vms/${web.id}/snapshots/${first.id}/revert`), () => {
+      reverted = true;
+      return HttpResponse.json(task("t1", "snapshot-revert", web.id), { status: 202 });
+    }),
+  );
+  open(stopped);
+  // 가장 최근 스냅샷만 되돌릴 수 있고, 막힌 버튼은 이유를 알린다.
+  const older = await screen.findByRole("button", { name: "Revert to first" });
+  await waitFor(() =>
+    expect(older).toHaveAccessibleDescription(
+      "Disks in ZFS pools can only revert to their latest snapshot.",
+    ),
+  );
+  expect(older).toHaveAttribute("aria-disabled", "true");
+  // 이유는 줄을 바꿔 표를 넓히지 않는다.
+  const reason = screen.getByText("Disks in ZFS pools can only revert to their latest snapshot.");
+  expect(reason.parentElement).toHaveClass("whitespace-normal", "max-w-xs");
+  await userEvent.click(older);
+  expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  expect(reverted).toBe(false);
+  const latest = screen.getByRole("button", { name: "Revert to second" });
+  expect(latest).toBeEnabled();
+  expect(latest).not.toHaveAttribute("aria-disabled");
 });
 
 it("says why snapshots wait while the VM is starting", async () => {
@@ -431,7 +471,7 @@ it.each([
   [
     "snapshot_unsupported",
     "raw disks cannot be snapshotted",
-    "Only VMs whose disks are all qcow2, or all in LVM-thin pools, can take snapshots. Snapshots of disks in LVM-thin pools cannot include memory.",
+    "Only VMs whose disks are all qcow2, all in LVM-thin pools, or all in ZFS pools can take snapshots. Snapshots of disks in LVM-thin or ZFS pools cannot include memory, and disks in ZFS pools can only revert to their latest snapshot.",
   ],
   // 번역이 없는 code(옛 문자열을 읽은 unknown 포함)는 서버의 설명을 그대로 보인다.
   ["unknown", "VM busy", "VM busy"],

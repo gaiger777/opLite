@@ -350,14 +350,14 @@ it("explains the schedule and warns about raw disks", async () => {
   const user = userEvent.setup();
   const every = await screen.findByLabelText("Take snapshots");
   expect(every).toHaveAccessibleDescription(
-    "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2, or all in LVM-thin pools.",
+    "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2, all in LVM-thin pools, or all in ZFS pools.",
   );
   // 끈 동안은 경고하지 않는다.
   expect(screen.queryByText(/scheduled snapshots will fail/)).not.toBeInTheDocument();
   await user.selectOptions(every, "hourly");
   expect(
     screen.getByText(
-      "web-data is raw, so scheduled snapshots will fail. All disks must be qcow2, or all in LVM-thin pools.",
+      "web-data is raw, so scheduled snapshots will fail. All disks must be qcow2, all in LVM-thin pools, or all in ZFS pools.",
     ),
   ).toBeVisible();
   // raw 디스크를 떼면 경고도 사라진다.
@@ -391,7 +391,7 @@ it("does not ask about memory for scheduled snapshots of disks in LVM-thin pools
   // 메모리 없이 찍는다).
   expect(
     await screen.findByText(
-      "Disks in LVM-thin pools are saved without memory. A running VM pauses briefly while they are saved.",
+      "Disks in LVM-thin and ZFS pools are saved without memory. A running VM pauses briefly while they are saved.",
     ),
   ).toBeVisible();
   expect(screen.queryByLabelText("Include memory")).not.toBeInTheDocument();
@@ -431,7 +431,7 @@ it("makes new volumes in LVM-thin pools raw and warns about mixed snapshot metho
   // 새 LVM 디스크(LV 스냅샷)와 qcow2 디스크(내부 스냅샷)는 함께 스냅샷하지 못한다.
   expect(
     screen.getByText(
-      "Disks in LVM-thin pools and qcow2 disks are mixed, so scheduled snapshots will fail.",
+      "Disks with different snapshot methods (qcow2, LVM-thin pools, ZFS pools) are mixed, so scheduled snapshots will fail.",
     ),
   ).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Remove disk 2" }));

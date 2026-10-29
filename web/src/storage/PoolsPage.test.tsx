@@ -13,6 +13,7 @@ it("lists pools with their nodes, space and volumes", async () => {
       pool("local"),
       pool("busy", { nodes: ["n1"] }),
       pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } }),
+      pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } }),
     ],
     node: [
       {
@@ -43,6 +44,9 @@ it("lists pools with their nodes, space and volumes", async () => {
   expect(fast).toHaveTextContent("LVM-thin");
   expect(fast).toHaveTextContent("vg0/tp");
   expect(fast).toHaveTextContent("node-a: No status reported yet");
+  const tank = within(table).getByText("tank").closest("tr")!;
+  expect(tank).toHaveTextContent("ZFS");
+  expect(tank).toHaveTextContent("tank/opl");
 });
 
 it("shows each node's pool state and space", async () => {
@@ -148,7 +152,6 @@ it("creates a pool on the chosen nodes", async () => {
   await userEvent.click(await within(dialog).findByRole("checkbox", { name: "node-b" }));
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   await vi.waitFor(() => expect(body).toBeDefined());
-  console.log("DBG", JSON.stringify(body), dialog.textContent);
   expect(await screen.findByText("Created storage pool fast.")).toBeInTheDocument();
   expect(body).toEqual({
     name: "fast",
@@ -284,6 +287,47 @@ it("creates an LVM-thin pool", async () => {
     expect(body).toEqual({
       name: "fast",
       spec: { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" }, nodes: [] },
+    }),
+  );
+});
+
+it("creates a ZFS pool", async () => {
+  mockLists({ node: [NODE] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/storage-pools"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("tank"), { status: 201 });
+    }),
+  );
+  renderPage(<PoolsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "tank");
+  await userEvent.click(within(dialog).getByRole("checkbox", { name: "Shared storage" }));
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "zfs");
+  expect(within(dialog).getByLabelText("Kind")).toHaveAccessibleDescription(
+    "Create the dataset on each node first. Volumes are raw zvols kept on the node that creates them, and their snapshots hold disks only. Disks can only revert to their latest snapshot. Needs Linux nodes running as root.",
+  );
+  // 노드 로컬 풀이라 공유를 고를 수 없고, 다른 종류의 입력도 없다.
+  expect(within(dialog).queryByRole("checkbox", { name: "Shared storage" })).toBeNull();
+  expect(within(dialog).queryByLabelText("Directory")).toBeNull();
+  expect(within(dialog).queryByLabelText("Volume group")).toBeNull();
+  await userEvent.type(within(dialog).getByLabelText("Dataset"), "tank/-opl");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByLabelText("Dataset")).toHaveAccessibleDescription(
+    "Use a dataset name such as tank/opl, at most 177 characters: parts separated by / with letters, digits, _, ., : or -, none empty, . or .. or starting with -. The pool name comes first and starts with a letter.",
+  );
+  expect(body).toBeUndefined();
+
+  await userEvent.clear(within(dialog).getByLabelText("Dataset"));
+  await userEvent.type(within(dialog).getByLabelText("Dataset"), "tank/opl");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  // 디렉터리 풀에서 고른 공유는 보내지 않는다.
+  await vi.waitFor(() =>
+    expect(body).toEqual({
+      name: "tank",
+      spec: { backend: { kind: "zfs", dataset: "tank/opl" }, nodes: [] },
     }),
   );
 });

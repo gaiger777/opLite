@@ -9,6 +9,7 @@ import {
   poolNodes,
   poolsUsableOn,
   poolUsableSomewhere,
+  zfsDatasetError,
 } from "@/storage/pools";
 import { NODE, pool, poolState } from "@/test/fixtures";
 
@@ -16,6 +17,7 @@ const GIB = 1024 ** 3;
 const nfs = (server: string) =>
   pool("nas", { backend: { kind: "nfs", server, export: "/srv/vm" }, shared: true });
 const lvm = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } });
+const zfs = pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } });
 const withPool = (
   id: string,
   name: string,
@@ -38,6 +40,7 @@ it("shows where a pool keeps its files", () => {
   // IPv6 주소는 mount처럼 대괄호로 감싼다.
   expect(poolLocation(nfs("fd00::5"))).toBe("[fd00::5]:/srv/vm");
   expect(poolLocation(lvm)).toBe("vg0/tp");
+  expect(poolLocation(zfs)).toBe("tank/opl");
 });
 
 it("checks LVM names like the server", () => {
@@ -70,11 +73,44 @@ it("checks LVM names like the server", () => {
   }
 });
 
+it("checks ZFS datasets like the server", () => {
+  // zvol 스냅샷 `{dataset}/opl-{uuid}@{uuid}`가 ZFS 이름 상한 255자를 넘지 않게 177자까지다.
+  const long = `t/${"a".repeat(175)}`;
+  for (const ok of ["tank", "tank/opl", "Tank0/a_b.c:d-e/f", "t/x-", "t/.x", "t/9", long]) {
+    expect(zfsDatasetError(ok)).toBeUndefined();
+  }
+  for (const bad of [
+    "",
+    "/tank",
+    "tank/",
+    "tank//opl",
+    // 풀 이름은 문자로 시작한다.
+    "0tank",
+    "_tank",
+    "-tank",
+    ".tank",
+    // `-`로 시작하는 구성 요소는 명령 옵션으로 읽힐 수 있다.
+    "tank/-opl",
+    "tank/opl@snap",
+    "tank/opl#bm",
+    "tank/my opl",
+    "tank/opl+",
+    "tank/데이터",
+    "tank/.",
+    "tank/..",
+    `${long}a`,
+  ]) {
+    expect(zfsDatasetError(bad)).toBe("pools.errors.zfsDataset");
+  }
+});
+
 it("offers the volume formats a pool holds, the default first", () => {
   expect(poolFormats(pool("local"))).toEqual(["qcow2", "raw"]);
   expect(poolFormats(nfs("nas.lan"))).toEqual(["qcow2", "raw"]);
   // LVM-thin 풀은 raw 볼륨만 둔다(서버가 qcow2를 거절한다).
   expect(poolFormats(lvm)).toEqual(["raw"]);
+  // ZFS 풀도 raw zvol만 둔다.
+  expect(poolFormats(zfs)).toEqual(["raw"]);
   // 풀을 고르기 전에는 파일 풀처럼 둘 다다.
   expect(poolFormats(undefined)).toEqual(["qcow2", "raw"]);
 });
