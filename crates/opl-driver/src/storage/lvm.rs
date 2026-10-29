@@ -1,12 +1,8 @@
 //! LVM-thin 풀: VG의 thin pool 안에 볼륨마다 thin LV `opl-{id}`(raw)를 두고, 스냅샷은 thin 스냅샷
 //! LV `opl-{id}-s-{tag}`로 둔다. LVM 명령은 [`LvmOps`] 뒤에 있다(테스트는 가짜).
 
-use std::collections::BTreeSet;
-use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,6 +11,7 @@ use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::blockcmd::BlockTool;
 use super::{
     Capacity, INFO_TIMEOUT, Storage, VolumeInfo, VolumeSource, check_image, convert_from, path_str,
     require_absolute, run_qemu_img, src_fmt_name,
@@ -132,124 +129,17 @@ pub trait LvmOps: Send + Sync {
 /// 실제 LVM 명령. root여야 한다.
 pub struct SystemLvm;
 
-/// LVM 명령. 숫자를 `.`로 쓰고, 물려받은 파일 기술자 경고를 stderr에 섞지 않는다.
-fn lvm_command(program: &str, args: &[&str]) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
-        .env("LC_ALL", "C")
-        .env("LVM_SUPPRESS_FD_WARNINGS", "1")
-        .stdin(Stdio::null());
-    cmd
-}
-
-/// 실패한 명령의 오류: stderr 첫 줄(없으면 종료 상태)을 담은 `Lvm`
-fn lvm_failure(program: &str, status: std::process::ExitStatus, stderr: &[u8]) -> DriverError {
-    let stderr = String::from_utf8_lossy(stderr);
-    let line = stderr
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .map_or_else(|| status.to_string(), str::to_string);
-    DriverError::Lvm(format!("{program}: {line}"))
-}
-
-/// 읽기만 하는 명령(`lvs`)을 돌려 표준 출력을 돌려준다. `timeout`이 지나면 `Timeout`이고, 시간이
-/// 지나거나 취소되면 명령을 죽인다.
-async fn run_read(program: &str, args: &[&str], timeout: Duration) -> Result<Vec<u8>, DriverError> {
-    let mut cmd = lvm_command(program, args);
-    cmd.stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .map_err(|_| DriverError::Timeout("lvm command"))??;
-    if !out.status.success() {
-        return Err(lvm_failure(program, out.status, &out.stderr));
-    }
-    Ok(out.stdout)
-}
-
-/// LVM을 바꾸는 명령이 돌고 있는 LV(`{vg}/{lv}`)
-static CHANGING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-
-/// 바꾸는 명령이 돌고 있다는 LV들의 표시. 명령이 끝나 버려지면 지운다.
-struct Changing(Vec<String>);
-
-impl Changing {
-    /// LV `lvs` 중 하나라도 앞 명령이 돌고 있으면(시간을 넘겨 뒤에서 도는 중) 일시 오류다.
-    fn begin(lvs: &[&str]) -> Result<Self, DriverError> {
-        let mut changing = CHANGING.lock().unwrap();
-        if lvs.iter().any(|lv| changing.contains(*lv)) {
-            return Err(DriverError::Timeout(
-                "an earlier lvm command still running on the same lv",
-            ));
-        }
-        let lvs: Vec<String> = lvs.iter().map(|lv| lv.to_string()).collect();
-        changing.extend(lvs.iter().cloned());
-        Ok(Self(lvs))
-    }
-}
-
-impl Drop for Changing {
-    fn drop(&mut self) {
-        let mut changing = CHANGING.lock().unwrap();
-        for lv in &self.0 {
-            changing.remove(lv);
-        }
-    }
-}
-
-/// LV `lvs`(`{vg}/{lv}`)를 바꾸는 명령을 돌린다. `timeout`이 지나면 `Timeout`이지만 명령은 죽이지
-/// 않는다(중간에 죽이면 메타데이터 갱신이 반쯤 끝나 남을 수 있다). 이 future가 버려져도 끝날 때까지
-/// 기다리는 작업이 프로세스를 거둔다. 그동안 같은 LV를 바꾸는 명령은 띄우지 않고 일시 오류다.
-/// 기다리는 쪽이 떠난 뒤에도 출력 때문에 막히거나 죽지 않도록(SIGPIPE) 표준 출력은 버리고 stderr는
-/// 지운 임시 파일에 받는다.
-async fn run_change(
-    program: &str,
-    args: &[&str],
-    lvs: &[&str],
-    timeout: Duration,
-) -> Result<(), DriverError> {
-    let changing = Changing::begin(lvs)?;
-    let mut stderr = stderr_file()?;
-    let mut child = lvm_command(program, args)
-        .stdout(Stdio::null())
-        .stderr(stderr.try_clone()?)
-        .kill_on_drop(false)
-        .spawn()?;
-    let waited = tokio::spawn(async move {
-        let status = child.wait().await;
-        drop(changing);
-        status
-    });
-    let status = tokio::time::timeout(timeout, waited)
-        .await
-        .map_err(|_| DriverError::Timeout("lvm command"))?
-        .map_err(|e| DriverError::Io(std::io::Error::other(e)))??;
-    if status.success() {
-        return Ok(());
-    }
-    let mut text = Vec::new();
-    stderr.seek(SeekFrom::Start(0))?;
-    stderr.read_to_end(&mut text)?;
-    Err(lvm_failure(program, status, &text))
-}
-
-/// 명령의 stderr를 받을 임시 파일. 만들자마자 지우므로 열린 동안만 있다.
-fn stderr_file() -> std::io::Result<std::fs::File> {
-    let path = std::env::temp_dir().join(format!("opl-lvm-{}.err", Uuid::now_v7()));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    std::fs::remove_file(&path)?;
-    Ok(file)
-}
+/// LVM 명령. 숫자를 `.`로 쓰고, 물려받은 파일 기술자 경고를 stderr에 섞지 않는다. 바꾸는 명령의
+/// 대상은 `{vg}/{lv}`다.
+static LVM: BlockTool = BlockTool::new(
+    "lvm command",
+    "an earlier lvm command still running on the same lv",
+    &[("LC_ALL", "C"), ("LVM_SUPPRESS_FD_WARNINGS", "1")],
+    DriverError::Lvm,
+);
 
 impl SystemLvm {
-    /// VG `vg`의 LV `lvs`를 바꾸는 명령([`run_change`])
+    /// VG `vg`의 LV `lvs`를 바꾸는 명령([`BlockTool::run_change`])
     async fn change(
         program: &str,
         args: &[&str],
@@ -258,28 +148,29 @@ impl SystemLvm {
     ) -> Result<(), DriverError> {
         let lvs: Vec<String> = lvs.iter().map(|lv| format!("{vg}/{lv}")).collect();
         let lvs: Vec<&str> = lvs.iter().map(String::as_str).collect();
-        run_change(program, args, &lvs, LVM_TIMEOUT).await
+        LVM.run_change(program, args, &lvs, LVM_TIMEOUT).await
     }
 }
 
 #[async_trait]
 impl LvmOps for SystemLvm {
     async fn list(&self, vg: &str) -> Result<Vec<LvInfo>, DriverError> {
-        let out = run_read(
-            "lvs",
-            &[
-                "--reportformat",
-                "json",
-                "--units",
-                "b",
-                "--nosuffix",
-                "-o",
-                "lv_name,lv_attr,lv_size,data_percent",
-                vg,
-            ],
-            LVM_TIMEOUT,
-        )
-        .await?;
+        let out = LVM
+            .run_read(
+                "lvs",
+                &[
+                    "--reportformat",
+                    "json",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "-o",
+                    "lv_name,lv_attr,lv_size,data_percent",
+                    vg,
+                ],
+                LVM_TIMEOUT,
+            )
+            .await?;
         parse_lvs(&out)
     }
 
@@ -330,7 +221,7 @@ impl LvmOps for SystemLvm {
     }
 
     fn changing(&self, vg: &str, name: &str) -> bool {
-        CHANGING.lock().unwrap().contains(&format!("{vg}/{name}"))
+        LVM.changing(&format!("{vg}/{name}"))
     }
 }
 
@@ -1938,91 +1829,21 @@ mod tests {
         );
     }
 
-    /// 읽기만 하는 명령(`lvs`)만 시간이 지나면 죽인다. LVM을 바꾸는 명령은 뒤에서 끝나게 둔다.
+    /// LVM 명령은 숫자를 `.`로 쓰고 파일 기술자 경고를 끄며, 실패는 `Lvm` 오류다.
     #[tokio::test]
-    async fn only_reads_are_killed_on_timeout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let short = Duration::from_millis(50);
-        let (read, change) = (tmp.path().join("read"), tmp.path().join("change"));
-        let script = |done: &Path| format!("sleep 0.3; touch {}", done.display());
-        let err = run_read("/bin/sh", &["-c", &script(&read)], short)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
-        let err = run_change("/bin/sh", &["-c", &script(&change)], &[], short)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(!read.exists());
-        assert!(change.exists());
-
-        // 읽기는 표준 출력을 돌려준다. 실패하면 둘 다 stderr 첫 줄이다.
+    async fn lvm_commands_use_c_locale_and_lvm_errors() {
         let long = Duration::from_secs(10);
-        let out = run_read("/bin/sh", &["-c", "echo ok"], long).await;
-        assert_eq!(out.unwrap(), b"ok\n");
-        let fail = ["-c", "echo '  no vg' >&2; echo more >&2; exit 5"];
-        for err in [
-            run_read("/bin/sh", &fail, long).await.unwrap_err(),
-            run_change("/bin/sh", &fail, &[], long).await.unwrap_err(),
-        ] {
-            assert!(
-                matches!(err, DriverError::Lvm(ref m) if m == "/bin/sh: no vg"),
-                "{err:?}"
-            );
-        }
-        run_change("/bin/sh", &["-c", "exit 0"], &[], long)
+        let env = "echo $LC_ALL $LVM_SUPPRESS_FD_WARNINGS";
+        let out = LVM.run_read("/bin/sh", &["-c", env], long).await.unwrap();
+        assert_eq!(out, b"C 1\n");
+        let err = LVM
+            .run_read("/bin/sh", &["-c", "echo no vg >&2; exit 5"], long)
             .await
-            .unwrap();
-    }
-
-    /// 바꾸는 명령의 출력은 파이프가 아니다(표준 출력은 버리고 stderr는 파일). 기다리는 쪽이 떠나
-    /// 파이프가 닫혀도 명령이 SIGPIPE로 죽지 않는다.
-    #[tokio::test]
-    async fn change_output_is_not_a_pipe() {
-        let script = "if [ -p /dev/fd/1 ] || [ -p /dev/fd/2 ]; then exit 3; fi";
-        run_change("/bin/sh", &["-c", script], &[], Duration::from_secs(10))
-            .await
-            .unwrap();
-    }
-
-    /// 같은 LV를 바꾸는 앞 명령이 아직 돌고 있으면 새 명령을 띄우지 않고 일시 오류다. 다른 LV는
-    /// 상관없고, 앞 명령이 끝나면 다시 띄운다.
-    #[tokio::test]
-    async fn one_change_per_lv_at_a_time() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (lv, other) = (
-            format!("vg0/{}", Uuid::now_v7()),
-            format!("vg0/{}", Uuid::now_v7()),
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::Lvm(ref m) if m == "/bin/sh: no vg"),
+            "{err:?}"
         );
-        let (first, second) = (tmp.path().join("first"), tmp.path().join("second"));
-        let slow = format!("sleep 0.4; touch {}", first.display());
-        let touch = format!("touch {}", second.display());
-        let long = Duration::from_secs(10);
-
-        let err = run_change("/bin/sh", &["-c", &slow], &[&lv], Duration::from_millis(50))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
-        // 이름 바꾸기처럼 여러 LV를 다루는 명령도 그중 하나가 돌고 있으면 띄우지 않는다.
-        for lvs in [vec![lv.as_str()], vec![other.as_str(), lv.as_str()]] {
-            let err = run_change("/bin/sh", &["-c", &touch], &lvs, long)
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("still running"), "{err}");
-            assert!(err.is_transient(), "{err:?}");
-            assert!(!second.exists());
-        }
-        run_change("/bin/sh", &["-c", "exit 0"], &[&other], long)
-            .await
-            .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(first.exists());
-        run_change("/bin/sh", &["-c", &touch], &[&lv], long)
-            .await
-            .unwrap();
-        assert!(second.exists());
     }
 
     /// 같은 VG 안 복사가 취소돼도(future가 버려짐) 원본 스냅샷 LV를 뒤에서 비활성화한다.

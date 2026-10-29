@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::mounts::{MOUNTINFO, nfs_mount_points};
 
+mod blockcmd;
 mod lvm;
 mod storages;
 
