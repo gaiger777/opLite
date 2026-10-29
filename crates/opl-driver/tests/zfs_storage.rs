@@ -383,12 +383,18 @@ async fn copies_snapshots_within_and_across_backends() {
         .await
         .unwrap();
     assert!(qemu_io(&src_path, RAW, "write -P 0xcd 0 64k"));
-    // `snapdev=visible`이라 스냅샷도 장치로 읽는다.
-    assert!(qemu_io(
-        &device(&format!("opl-{src}@s1")),
-        RAW,
-        "read -P 0xab 0 64k"
-    ));
+    // `snapdev=visible`이라 스냅샷도 장치로 읽는다. 장치 노드는 udev가 늦게 만들 수 있어
+    // 드라이버가 기다려 주는 `volume_source`로 경로를 받는다.
+    let snap = storages
+        .volume_source(&pool, src, RAW, Some("s1"))
+        .await
+        .unwrap();
+    assert_eq!(snap.path, device(&format!("opl-{src}@s1")));
+    assert!(qemu_io(&snap.path, RAW, "read -P 0xab 0 64k"));
+    storages
+        .release_source(&pool, src, RAW, Some("s1"))
+        .await
+        .unwrap();
 
     // 같은 풀 안: 스냅샷 때의 내용을 새 zvol로
     let copy = Uuid::now_v7();
