@@ -151,8 +151,8 @@ enum PoolCmd {
     Get {
         pool: String,
     },
-    /// 로컬 디렉터리 풀, NFS 풀, LVM-thin 풀을 만든다.
-    #[command(group(ArgGroup::new("kind").required(true).args(["path", "nfs", "lvm_thin"])))]
+    /// 로컬 디렉터리 풀, NFS 풀, LVM-thin 풀, ZFS 풀을 만든다.
+    #[command(group(ArgGroup::new("kind").required(true).args(["path", "nfs", "lvm_thin", "zfs"])))]
     Create {
         name: String,
         /// 풀 디렉터리(절대 경로)
@@ -167,6 +167,9 @@ enum PoolCmd {
         /// 관리자가 준비한 VG와 thin pool `VG/THINPOOL`. 노드 로컬 풀이고 볼륨은 raw만 담는다.
         #[arg(long, value_parser = parse_lvm_thin, conflicts_with_all = ["path", "nfs", "nfs_options", "shared"])]
         lvm_thin: Option<LvmThinSource>,
+        /// 관리자가 준비한 ZFS 데이터셋 `POOL/DATASET`. 노드 로컬 풀이고 볼륨은 raw zvol만 담는다.
+        #[arg(long, conflicts_with_all = ["path", "nfs", "nfs_options", "lvm_thin", "shared"])]
+        zfs: Option<String>,
         /// `--path`가 모든 노드가 같은 데이터를 보는 공유 스토리지(밖에서 마운트한 공유 디렉터리)다.
         /// NFS 풀은 늘 공유다.
         #[arg(long, requires = "path", conflicts_with = "nfs")]
@@ -273,7 +276,7 @@ enum VolumeCmd {
         /// 크기. 단위 K, M, G, T(1024 배수)를 붙일 수 있다.
         #[arg(long, value_parser = parse_size)]
         size: u64,
-        /// 생략하면 풀 종류로 정한다(LVM-thin은 raw, 그 밖은 qcow2).
+        /// 생략하면 풀 종류로 정한다(LVM-thin과 ZFS는 raw, 그 밖은 qcow2).
         #[arg(long, value_enum)]
         format: Option<Format>,
     },
@@ -286,7 +289,7 @@ enum VolumeCmd {
         file: PathBuf,
         #[arg(long, value_enum, default_value = "vmdk")]
         source_format: SourceFormat,
-        /// 생략하면 풀 종류로 정한다(LVM-thin은 raw, 그 밖은 qcow2).
+        /// 생략하면 풀 종류로 정한다(LVM-thin과 ZFS는 raw, 그 밖은 qcow2).
         #[arg(long, value_enum)]
         format: Option<Format>,
     },
@@ -559,9 +562,10 @@ async fn volume_format(
     }
 }
 
-/// 풀 종류의 기본 볼륨 형식: LVM-thin은 raw(스냅샷은 LV 스냅샷), 파일 풀은 qcow2
+/// 풀 종류의 기본 볼륨 형식: 블록 풀(LVM-thin, ZFS)은 raw(스냅샷은 블록 스냅샷), 파일 풀은 qcow2
 fn pool_default_format(pool: &Value) -> Format {
-    if pool["spec"]["backend"]["kind"] == "lvm-thin" {
+    let kind = &pool["spec"]["backend"]["kind"];
+    if kind == "lvm-thin" || kind == "zfs" {
         Format::Raw
     } else {
         Format::Qcow2
@@ -687,18 +691,20 @@ where
                 nfs,
                 nfs_options,
                 lvm_thin,
+                zfs,
                 shared,
                 nodes,
             } => {
                 // NFS 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
-                let backend = match (nfs, lvm_thin) {
-                    (Some(n), _) => json!({
+                let backend = match (nfs, lvm_thin, zfs) {
+                    (Some(n), _, _) => json!({
                         "kind": "nfs", "server": n.server, "export": n.export, "options": nfs_options
                     }),
-                    (None, Some(l)) => {
+                    (None, Some(l), _) => {
                         json!({ "kind": "lvm-thin", "vg": l.vg, "thinpool": l.thinpool })
                     }
-                    (None, None) => json!({ "kind": "dir", "path": path }),
+                    (None, None, Some(dataset)) => json!({ "kind": "zfs", "dataset": dataset }),
+                    (None, None, None) => json!({ "kind": "dir", "path": path }),
                 };
                 let mut spec = json!({ "backend": backend, "nodes": nodes });
                 if shared {
@@ -1507,11 +1513,14 @@ fn pool_row(pool: &Value, nodes: &[Value]) -> Vec<String> {
 }
 
 /// 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`), LVM-thin 풀은
-/// `vg/thinpool`
+/// `vg/thinpool`, ZFS 풀은 데이터셋
 fn pool_location(pool: &Value) -> String {
     let b = &pool["spec"]["backend"];
     if let Some(vg) = b["vg"].as_str() {
         return format!("{vg}/{}", cell(&b["thinpool"]));
+    }
+    if let Some(dataset) = b["dataset"].as_str() {
+        return dataset.into();
     }
     match b["server"].as_str() {
         Some(server) if server.contains(':') => format!("[{server}]:{}", cell(&b["export"])),
@@ -2083,16 +2092,49 @@ mod tests {
         ] {
             assert!(create(args).is_err(), "{args:?}");
         }
-        // 종류(--path, --nfs, --lvm-thin) 중 하나가 있어야 한다.
+        // 종류(--path, --nfs, --lvm-thin, --zfs) 중 하나가 있어야 한다.
         let err = create(&[]).expect_err("a pool kind is required");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let msg = err.to_string();
-        for kind in ["--path", "--nfs", "--lvm-thin"] {
+        for kind in ["--path", "--nfs", "--lvm-thin", "--zfs"] {
             assert!(msg.contains(kind), "{msg}");
         }
         assert!(create(&["--node", "a"]).is_err());
         assert!(create(&["--path", "/srv/p"]).is_ok());
         assert!(create(&["--nfs", "nas:/srv/vm"]).is_ok());
+    }
+
+    #[test]
+    fn parses_zfs_pool_create() {
+        let create = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "pool", "create", "fast"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Pool {
+                    cmd: PoolCmd::Create { zfs, .. },
+                } => zfs,
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(
+            create(&["--zfs", "tank/opl"]).unwrap(),
+            Some("tank/opl".to_string())
+        );
+        assert_eq!(
+            create(&["--zfs", "tank"]).unwrap(),
+            Some("tank".to_string())
+        );
+        // 다른 종류·--shared와 함께 못 쓴다. 데이터셋 이름의 검사는 API가 한다.
+        for args in [
+            &["--zfs", "tank/opl", "--path", "/srv/pool"][..],
+            &["--zfs", "tank/opl", "--nfs", "nas:/srv/vm"],
+            &["--zfs", "tank/opl", "--nfs-options", "hard"],
+            &["--zfs", "tank/opl", "--lvm-thin", "vg0/tp"],
+            &["--zfs", "tank/opl", "--shared"],
+            &["--zfs"],
+        ] {
+            assert!(create(args).is_err(), "{args:?}");
+        }
     }
 
     /// 풀을 읽지 못하면 --format을 주라고 알린다. 주면 풀을 읽지 않는다.
@@ -2121,6 +2163,7 @@ mod tests {
     fn volume_format_defaults_to_pool_kind() {
         let pool = |kind: &str| json!({ "spec": { "backend": { "kind": kind } } });
         assert_eq!(pool_default_format(&pool("lvm-thin")), Format::Raw);
+        assert_eq!(pool_default_format(&pool("zfs")), Format::Raw);
         assert_eq!(pool_default_format(&pool("dir")), Format::Qcow2);
         assert_eq!(pool_default_format(&pool("nfs")), Format::Qcow2);
         // --format를 주지 않으면 풀을 읽어 정하고, 주면 그대로 쓴다.
@@ -2250,6 +2293,23 @@ mod tests {
         assert_eq!(
             describe_pool(&fast),
             "pool: fast\nkind: lvm-thin\nlocation: vg0/tp\nshared: false\n"
+        );
+        let tank = json!({
+            "id": "id-tank",
+            "name": "tank",
+            "spec": {
+                "backend": { "kind": "zfs", "dataset": "tank/opl" },
+                "nodes": ["id-a"],
+                "shared": false,
+            },
+        });
+        assert_eq!(
+            pool_row(&tank, &nodes),
+            ["tank", "zfs", "tank/opl", "1", "0/1"]
+        );
+        assert_eq!(
+            describe_pool(&tank),
+            "pool: tank\nkind: zfs\nlocation: tank/opl\nshared: false\n"
         );
         let mut out = Vec::new();
         table(&mut out, POOL_NODE_HEADERS, &pool_node_rows(&local, &nodes)).unwrap();
