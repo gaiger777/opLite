@@ -19,6 +19,9 @@ web-ui = []
 # 실제 NFS 풀을 마운트하는 E2E 테스트. Linux에서 root, NFS 클라이언트(nfs-common), qemu-img와
 # 127.0.0.1에 내보낸 디렉터리(`OPL_TEST_NFS_EXPORT`)가 필요하다.
 nfs-it = []
+# 실제 LVM-thin 풀의 볼륨으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서 root, lvm2,
+# qemu-io와 테스트가 LV를 만들고 지워도 되는 VG/thin pool(`OPL_TEST_LVM=VG/THINPOOL`)이 필요하다.
+lvm-it = []
 # 브라우저(Playwright)로 웹 UI를 확인하는 E2E. qemu-it의 준비물에 더해 pnpm과
 # `pnpm -C web exec playwright install chromium`, 빌드한 web/dist가 필요하다.
 web-it = ["qemu-it", "web-ui"]

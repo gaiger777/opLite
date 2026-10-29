@@ -14,6 +14,9 @@ storage-it = []
 qemu-it = []
 # 실제 tap과 브리지를 만드는 통합 테스트. Linux에서 root(CAP_NET_ADMIN)와 iproute2가 필요하다.
 net-it = []
+# 실제 LVM-thin 풀의 통합 테스트. Linux에서 root, lvm2, qemu-img, qemu-io와 테스트가 LV를 만들고 지워도
+# 되는 VG/thin pool(`OPL_TEST_LVM=VG/THINPOOL`)이 필요하다.
+lvm-it = []
 
 [dependencies]
 async-trait.workspace = true
