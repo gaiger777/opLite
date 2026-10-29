@@ -151,7 +151,8 @@ async fn single_node_cluster_serves_cli_over_https_and_survives_restarts() {
         ])
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("not found"), "{err}");
+    // oplctl은 오류를 원인까지 이어 보인다(`{:#}`).
+    assert!(format!("{err:#}").contains("not found"), "{err:#}");
 
     d.stop();
     d.start().await;

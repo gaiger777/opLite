@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use reqwest::Method;
 use serde_json::{Value, json};
 
@@ -151,11 +151,12 @@ enum PoolCmd {
     Get {
         pool: String,
     },
-    /// 로컬 디렉터리 풀이나 NFS 풀을 만든다.
+    /// 로컬 디렉터리 풀, NFS 풀, LVM-thin 풀을 만든다.
+    #[command(group(ArgGroup::new("kind").required(true).args(["path", "nfs", "lvm_thin"])))]
     Create {
         name: String,
         /// 풀 디렉터리(절대 경로)
-        #[arg(long, required_unless_present = "nfs", conflicts_with = "nfs")]
+        #[arg(long, conflicts_with = "nfs")]
         path: Option<PathBuf>,
         /// NFS 내보내기 `SERVER:/EXPORT`(IPv6는 `[ADDR]:/EXPORT`). 노드마다 마운트하는 공유 풀이다.
         #[arg(long, value_parser = parse_nfs)]
@@ -163,6 +164,9 @@ enum PoolCmd {
         /// `mount -o`에 넘길 쉼표 목록(예: vers=4.2,hard)
         #[arg(long, requires = "nfs", conflicts_with = "path")]
         nfs_options: Option<String>,
+        /// 관리자가 준비한 VG와 thin pool `VG/THINPOOL`. 노드 로컬 풀이고 볼륨은 raw만 담는다.
+        #[arg(long, value_parser = parse_lvm_thin, conflicts_with_all = ["path", "nfs", "nfs_options", "shared"])]
+        lvm_thin: Option<LvmThinSource>,
         /// `--path`가 모든 노드가 같은 데이터를 보는 공유 스토리지(밖에서 마운트한 공유 디렉터리)다.
         /// NFS 풀은 늘 공유다.
         #[arg(long, requires = "path", conflicts_with = "nfs")]
@@ -200,6 +204,28 @@ fn parse_nfs(s: &str) -> Result<NfsSource, String> {
     }
 }
 
+/// `--lvm-thin`으로 받은 VG와 thin pool 이름
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LvmThinSource {
+    vg: String,
+    thinpool: String,
+}
+
+/// `vg0/tp`처럼 쓴다. 이름 규칙의 나머지 검사는 API가 한다.
+fn parse_lvm_thin(s: &str) -> Result<LvmThinSource, String> {
+    match s.split_once('/') {
+        Some((vg, thinpool))
+            if !vg.is_empty() && !thinpool.is_empty() && !thinpool.contains('/') =>
+        {
+            Ok(LvmThinSource {
+                vg: vg.into(),
+                thinpool: thinpool.into(),
+            })
+        }
+        _ => Err(format!("invalid lvm-thin pool {s:?}: use VG/THINPOOL")),
+    }
+}
+
 #[derive(Subcommand)]
 enum NetworkCmd {
     List,
@@ -221,7 +247,7 @@ enum NetworkCmd {
     },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
     Qcow2,
     Raw,
@@ -247,8 +273,9 @@ enum VolumeCmd {
         /// 크기. 단위 K, M, G, T(1024 배수)를 붙일 수 있다.
         #[arg(long, value_parser = parse_size)]
         size: u64,
-        #[arg(long, value_enum, default_value = "qcow2")]
-        format: Format,
+        /// 생략하면 풀 종류로 정한다(LVM-thin은 raw, 그 밖은 qcow2).
+        #[arg(long, value_enum)]
+        format: Option<Format>,
     },
     /// 이미지 파일(VMDK 등)을 올려 새 볼륨으로 가져온다.
     Import {
@@ -259,8 +286,9 @@ enum VolumeCmd {
         file: PathBuf,
         #[arg(long, value_enum, default_value = "vmdk")]
         source_format: SourceFormat,
-        #[arg(long, value_enum, default_value = "qcow2")]
-        format: Format,
+        /// 생략하면 풀 종류로 정한다(LVM-thin은 raw, 그 밖은 qcow2).
+        #[arg(long, value_enum)]
+        format: Option<Format>,
     },
     /// 볼륨 크기를 늘린다. 줄이지는 않는다.
     Resize {
@@ -511,6 +539,35 @@ fn value_name<T: ValueEnum>(v: T) -> String {
     v.to_possible_value().unwrap().get_name().to_string()
 }
 
+/// 볼륨 형식. 주지 않았으면 풀을 읽어 그 종류의 기본값으로 정한다.
+async fn volume_format(
+    client: &Client,
+    pool: &str,
+    format: Option<Format>,
+) -> anyhow::Result<Format> {
+    match format {
+        Some(f) => Ok(f),
+        None => {
+            let read = client.get(&format!("/storage-pools/{pool}")).await;
+            let pool = read.with_context(|| {
+                format!(
+                    "cannot read storage pool {pool:?} to choose a volume format; pass --format"
+                )
+            })?;
+            Ok(pool_default_format(&pool))
+        }
+    }
+}
+
+/// 풀 종류의 기본 볼륨 형식: LVM-thin은 raw(스냅샷은 LV 스냅샷), 파일 풀은 qcow2
+fn pool_default_format(pool: &Value) -> Format {
+    if pool["spec"]["backend"]["kind"] == "lvm-thin" {
+        Format::Raw
+    } else {
+        Format::Qcow2
+    }
+}
+
 /// 명령을 실행하고 결과를 `out`에 쓴다. 인자 오류는 `clap::Error`로 돌려준다.
 pub async fn run<I, T>(args: I, out: &mut (dyn Write + Send)) -> anyhow::Result<()>
 where
@@ -629,15 +686,19 @@ where
                 path,
                 nfs,
                 nfs_options,
+                lvm_thin,
                 shared,
                 nodes,
             } => {
                 // NFS 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
-                let backend = match nfs {
-                    Some(n) => json!({
+                let backend = match (nfs, lvm_thin) {
+                    (Some(n), _) => json!({
                         "kind": "nfs", "server": n.server, "export": n.export, "options": nfs_options
                     }),
-                    None => json!({ "kind": "dir", "path": path }),
+                    (None, Some(l)) => {
+                        json!({ "kind": "lvm-thin", "vg": l.vg, "thinpool": l.thinpool })
+                    }
+                    (None, None) => json!({ "kind": "dir", "path": path }),
                 };
                 let mut spec = json!({ "backend": backend, "nodes": nodes });
                 if shared {
@@ -704,6 +765,7 @@ where
                 size,
                 format,
             } => {
+                let format = volume_format(&client, &pool, format).await?;
                 let body = json!({
                     "name": name,
                     "spec": { "pool": pool, "size_bytes": size, "format": value_name(format) }
@@ -719,6 +781,7 @@ where
                 source_format,
                 format,
             } => {
+                let format = volume_format(&client, &pool, format).await?;
                 let (src, fmt) = (value_name(source_format), value_name(format));
                 let query = [
                     ("name", name.as_str()),
@@ -1443,9 +1506,13 @@ fn pool_row(pool: &Value, nodes: &[Value]) -> Vec<String> {
     ]
 }
 
-/// 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`)
+/// 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`), LVM-thin 풀은
+/// `vg/thinpool`
 fn pool_location(pool: &Value) -> String {
     let b = &pool["spec"]["backend"];
+    if let Some(vg) = b["vg"].as_str() {
+        return format!("{vg}/{}", cell(&b["thinpool"]));
+    }
     match b["server"].as_str() {
         Some(server) if server.contains(':') => format!("[{server}]:{}", cell(&b["export"])),
         Some(server) => format!("{server}:{}", cell(&b["export"])),
@@ -1985,6 +2052,105 @@ mod tests {
     }
 
     #[test]
+    fn parses_lvm_thin_pool_create() {
+        let create = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "pool", "create", "fast"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Pool {
+                    cmd: PoolCmd::Create { lvm_thin, .. },
+                } => lvm_thin,
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(
+            create(&["--lvm-thin", "vg0/tp"]).unwrap(),
+            Some(LvmThinSource {
+                vg: "vg0".into(),
+                thinpool: "tp".into()
+            })
+        );
+        // 다른 종류·--shared와 함께 못 쓰고, VG와 thin pool이 모두 있어야 한다
+        for args in [
+            &["--lvm-thin", "vg0/tp", "--path", "/srv/pool"][..],
+            &["--lvm-thin", "vg0/tp", "--nfs", "nas:/srv/vm"],
+            &["--lvm-thin", "vg0/tp", "--shared"],
+            &["--lvm-thin", "vg0/tp", "--nfs-options", "hard"],
+            &["--lvm-thin", "vg0"],
+            &["--lvm-thin", "/tp"],
+            &["--lvm-thin", "vg0/"],
+            &["--lvm-thin", "vg0/tp/x"],
+        ] {
+            assert!(create(args).is_err(), "{args:?}");
+        }
+        // 종류(--path, --nfs, --lvm-thin) 중 하나가 있어야 한다.
+        let err = create(&[]).expect_err("a pool kind is required");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let msg = err.to_string();
+        for kind in ["--path", "--nfs", "--lvm-thin"] {
+            assert!(msg.contains(kind), "{msg}");
+        }
+        assert!(create(&["--node", "a"]).is_err());
+        assert!(create(&["--path", "/srv/p"]).is_ok());
+        assert!(create(&["--nfs", "nas:/srv/vm"]).is_ok());
+    }
+
+    /// 풀을 읽지 못하면 --format을 주라고 알린다. 주면 풀을 읽지 않는다.
+    #[tokio::test]
+    async fn volume_format_explains_an_unreadable_pool() {
+        // 아무도 듣지 않는 포트
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), None, None).unwrap();
+        let err = volume_format(&client, "fast", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with(
+                "cannot read storage pool \"fast\" to choose a volume format; pass --format: "
+            ),
+            "{msg}"
+        );
+        let format = volume_format(&client, "fast", Some(Format::Raw)).await;
+        assert_eq!(format.unwrap(), Format::Raw);
+    }
+
+    #[test]
+    fn volume_format_defaults_to_pool_kind() {
+        let pool = |kind: &str| json!({ "spec": { "backend": { "kind": kind } } });
+        assert_eq!(pool_default_format(&pool("lvm-thin")), Format::Raw);
+        assert_eq!(pool_default_format(&pool("dir")), Format::Qcow2);
+        assert_eq!(pool_default_format(&pool("nfs")), Format::Qcow2);
+        // --format를 주지 않으면 풀을 읽어 정하고, 주면 그대로 쓴다.
+        let cli = Cli::try_parse_from([
+            "oplctl", "volume", "create", "root", "--pool", "fast", "--size", "1G",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Volume {
+                cmd: VolumeCmd::Create { format: None, .. }
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "oplctl", "volume", "import", "root", "--pool", "fast", "--file", "a.vmdk", "--format",
+            "raw",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Volume {
+                cmd: VolumeCmd::Import {
+                    format: Some(Format::Raw),
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
     fn pool_list_and_details_show_each_node() {
         let node = |name: &str, online: bool, pools: Value| {
             json!({
@@ -2067,6 +2233,23 @@ mod tests {
         assert_eq!(
             describe_pool(&local),
             "pool: local\nkind: dir\nlocation: /srv/pool\nshared: false\n"
+        );
+        let fast = json!({
+            "id": "id-fast",
+            "name": "fast",
+            "spec": {
+                "backend": { "kind": "lvm-thin", "vg": "vg0", "thinpool": "tp" },
+                "nodes": ["id-a"],
+                "shared": false,
+            },
+        });
+        assert_eq!(
+            pool_row(&fast, &nodes),
+            ["fast", "lvm-thin", "vg0/tp", "1", "0/1"]
+        );
+        assert_eq!(
+            describe_pool(&fast),
+            "pool: fast\nkind: lvm-thin\nlocation: vg0/tp\nshared: false\n"
         );
         let mut out = Vec::new();
         table(&mut out, POOL_NODE_HEADERS, &pool_node_rows(&local, &nodes)).unwrap();
