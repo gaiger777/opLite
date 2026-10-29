@@ -125,6 +125,7 @@ mod tests {
         let timeout = QmpError::JobTimeout {
             id: "j".into(),
             timeout: std::time::Duration::from_secs(1),
+            stage: "x".into(),
         };
         assert!(!DriverError::Qmp(timeout).is_transient());
         assert!(!DriverError::StartFailed("x".into()).is_transient());
@@ -138,6 +139,7 @@ mod tests {
         let timeout = QmpError::JobTimeout {
             id: "j".into(),
             timeout: std::time::Duration::from_secs(1),
+            stage: "x".into(),
         };
         assert!(DriverError::Qmp(timeout).may_be_in_progress());
         assert!(DriverError::Timeout("QMP transaction").may_be_in_progress());

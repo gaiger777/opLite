@@ -172,6 +172,7 @@ async fn failed_snapshot_is_removed_but_a_timed_out_one_keeps_its_tag() {
         .fail_next_snapshot(DriverError::Qmp(QmpError::JobTimeout {
             id: "j".into(),
             timeout: std::time::Duration::from_secs(600),
+            stage: "x".into(),
         }));
     let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
     assert_eq!(task["status"]["state"], "failed", "{task}");

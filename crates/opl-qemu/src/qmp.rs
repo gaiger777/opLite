@@ -26,8 +26,13 @@ pub enum QmpError {
     Disconnected,
     #[error("QMP job {id} failed: {error}")]
     JobFailed { id: String, error: String },
-    #[error("QMP job {id} did not finish within {timeout:?}")]
-    JobTimeout { id: String, timeout: Duration },
+    #[error("QMP job {id} did not finish within {timeout:?} ({stage})")]
+    JobTimeout {
+        id: String,
+        timeout: Duration,
+        /// 어디서 멈췄는지와 그때의 `query-jobs` 결과
+        stage: String,
+    },
 }
 
 /// QEMU가 보낸 비동기 이벤트 (SHUTDOWN, STOP, RESUME 등)
@@ -59,6 +64,9 @@ impl RunState {
         }
     }
 }
+
+/// 작업이 제한 시간을 넘겼을 때 상태를 묻는 `query-jobs`를 기다리는 시간
+const JOB_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 type Reply = Result<Value, QmpError>;
 /// None이면 연결이 끊긴 상태다. 이후의 명령은 바로 Disconnected로 실패한다.
@@ -273,41 +281,62 @@ impl QmpClient {
         arguments["job-id"] = json!(id);
         // 작업 이벤트를 놓치지 않게 시작하기 전에 구독한다.
         let mut events = self.subscribe();
-        self.execute(command, Some(arguments)).await?;
-
-        let wait = async {
+        // 제한 시간에 걸렸을 때 어디까지 갔는지
+        let mut stage = format!("no reply to {command}");
+        // 시작 명령부터 dismiss까지 모두 제한 시간 안에 끝나야 한다. QEMU는 snapshot-save에
+        // 작업이 끝난 뒤에야 답할 수 있으므로, 시작 명령의 응답도 기다림에 넣어야 멈춘 작업을 잡는다.
+        let run = async {
+            self.execute(command, Some(arguments)).await?;
+            stage = "job started, no JOB_STATUS_CHANGE seen".into();
             loop {
                 match events.recv().await {
                     Ok(ev) => {
-                        if ev.event == "JOB_STATUS_CHANGE"
-                            && ev.data["id"] == id.as_str()
-                            && ev.data["status"] == "concluded"
-                        {
-                            return Ok(());
+                        if ev.event == "JOB_STATUS_CHANGE" && ev.data["id"] == id.as_str() {
+                            stage = format!("last job status {}", ev.data["status"]);
+                            if ev.data["status"] == "concluded" {
+                                break;
+                            }
                         }
                     }
                     // 이벤트를 놓쳤으면 query-jobs로 상태를 직접 본다.
                     Err(RecvError::Lagged(_)) => {
                         if self.query_job(&id).await?["status"] == "concluded" {
-                            return Ok(());
+                            break;
                         }
                     }
                     Err(RecvError::Closed) => return Err(QmpError::Disconnected),
                 }
             }
+            stage = "no reply to query-jobs after the job concluded".into();
+            let error = self.query_job(&id).await?["error"]
+                .as_str()
+                .map(str::to_string);
+            stage = "no reply to job-dismiss".into();
+            self.execute("job-dismiss", Some(json!({ "id": id })))
+                .await?;
+            Ok(error)
         };
-        tokio::time::timeout(timeout, wait)
-            .await
-            .map_err(|_| QmpError::JobTimeout {
-                id: id.clone(),
-                timeout,
-            })??;
-
-        let error = self.query_job(&id).await?["error"]
-            .as_str()
-            .map(str::to_string);
-        self.execute("job-dismiss", Some(json!({ "id": id })))
-            .await?;
+        let error = match tokio::time::timeout(timeout, run).await {
+            Ok(r) => r?,
+            Err(_) => {
+                // QEMU의 모니터가 아직 답하는지, 작업이 어떤 상태인지 짧게 물어 오류에 남긴다.
+                let jobs =
+                    match tokio::time::timeout(JOB_PROBE_TIMEOUT, self.execute("query-jobs", None))
+                        .await
+                    {
+                        Ok(Ok(jobs)) => format!("query-jobs: {jobs}"),
+                        Ok(Err(e)) => format!("query-jobs failed: {e}"),
+                        Err(_) => {
+                            format!("QEMU did not answer query-jobs within {JOB_PROBE_TIMEOUT:?}")
+                        }
+                    };
+                return Err(QmpError::JobTimeout {
+                    id,
+                    timeout,
+                    stage: format!("{stage}; {jobs}"),
+                });
+            }
+        };
         match error {
             Some(error) => Err(QmpError::JobFailed { id, error }),
             None => Ok(()),
@@ -761,6 +790,30 @@ mod tests {
             }
         );
         assert!(matches!(res, Err(QmpError::JobTimeout { .. })));
+    }
+
+    /// QEMU가 작업을 시작하는 명령 자체에 답하지 않아도(CI에서 본 snapshot-save 멈춤) 제한 시간에
+    /// 끝나고, 어디서 멈췄는지와 그때 QEMU가 `query-jobs`에 답했는지를 오류에 담는다.
+    #[tokio::test]
+    async fn job_timeout_covers_unanswered_start_and_says_where_it_stuck() {
+        let (client, mut fake, _dir) = setup().await;
+        let devices = ["disk0".to_string()];
+        // 명령을 받기만 하고 답하지 않는다(연결은 열어 둔다).
+        let fake_side =
+            tokio::spawn(async move { while let Ok(Some(_)) = fake.lines.next_line().await {} });
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.snapshot_save("s1", "disk0", &devices, Duration::from_millis(200)),
+        )
+        .await;
+        fake_side.abort();
+        let err = res
+            .expect("run_job must not outlive its timeout")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, QmpError::JobTimeout { .. }), "{msg}");
+        assert!(msg.contains("no reply to snapshot-save"), "{msg}");
+        assert!(msg.contains("query-jobs"), "{msg}");
     }
 
     #[tokio::test]
