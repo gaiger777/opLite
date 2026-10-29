@@ -1,5 +1,6 @@
 //! 노드별 풀 상태. 이 노드가 쓸 수 있는 풀마다 준비 여부와 용량을 `NodeStatus.pools`에 적는다.
 //! NFS 풀은 `{data_dir}/pools/{풀 id}`에 마운트하고, 이 노드가 쓸 수 없게 된 NFS 풀은 언마운트한다.
+//! LVM-thin 풀은 `lvs`로 thin pool을 확인한다.
 //! opld가 내려가도 마운트는 그대로 둔다.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -12,7 +13,7 @@ use async_trait::async_trait;
 use opl_cluster::types::{NodeId, Rejection};
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::Capacity;
+use opl_driver::{Capacity, LvInfo};
 use opl_types::node::{NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Kind;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, VolumeSpec};
@@ -24,10 +25,11 @@ use uuid::Uuid;
 
 /// `mount`·`umount`를 기다리는 시간
 pub const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
-/// 쓰기 확인과 용량 읽기를 기다리는 시간. NFS 서버가 멈추면 이 작업이 멈춘다.
+/// 쓰기 확인과 용량 읽기(LVM-thin은 `lvs`)를 기다리는 시간. NFS 서버가 멈추면 이 작업이 멈춘다.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const NFS_UNSUPPORTED: &str = "nfs pools are not supported on macOS";
-const LVM_UNSUPPORTED: &str = "lvm-thin pools are not supported yet";
+const LVM_UNSUPPORTED: &str = "lvm-thin pools are not supported on macOS";
+const LVS_TIMED_OUT: &str = "lvs timed out";
 const NFS_NOT_RESPONDING: &str = "nfs server not responding";
 const DIR_NOT_RESPONDING: &str = "pool directory not responding";
 const MOUNT_IN_PROGRESS: &str = "mount in progress";
@@ -48,6 +50,8 @@ pub trait MountOps: Send + Sync + 'static {
     async fn umount(&self, dir: &Path) -> Result<(), String>;
     /// `dir`에 `probe` 파일을 만들고 지운 뒤 용량을 읽는다. 블로킹이고, 멈춘 NFS에서는 끝나지 않을 수 있다.
     fn check(&self, dir: &Path, probe: &str) -> std::io::Result<Capacity>;
+    /// `lvs`로 읽은 VG `vg`의 LV `thinpool`. 실패하면 stderr.
+    async fn lvm_pool(&self, vg: &str, thinpool: &str) -> Result<LvInfo, String>;
 }
 
 /// 실제 명령과 파일시스템
@@ -77,6 +81,29 @@ impl MountOps for SystemMount {
             available_bytes: st.f_bavail * st.f_frsize,
         })
     }
+
+    async fn lvm_pool(&self, vg: &str, thinpool: &str) -> Result<LvInfo, String> {
+        let out = tokio::process::Command::new("lvs")
+            .args(["--reportformat", "json", "--units", "b", "--nosuffix", "-o"])
+            .arg("lv_name,lv_attr,lv_size,data_percent")
+            .arg(format!("{vg}/{thinpool}"))
+            // 숫자를 `.`로 쓰고, 물려받은 파일 기술자 경고를 stderr에 섞지 않는다.
+            .env("LC_ALL", "C")
+            .env("LVM_SUPPRESS_FD_WARNINGS", "1")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| format!("cannot run lvs: {e}"))?;
+        if !out.status.success() {
+            return Err(failure("lvs", &out));
+        }
+        opl_driver::parse_lvs(&out.stdout)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|lv| lv.name == thinpool)
+            .ok_or_else(|| format!("{vg}/{thinpool} not found"))
+    }
 }
 
 /// 명령을 실행한다. 시간 제한으로 버려지면 프로세스를 죽인다.
@@ -90,15 +117,20 @@ async fn run(program: &str, args: &[OsString]) -> Result<(), String> {
     if out.status.success() {
         return Ok(());
     }
+    Err(failure(program, &out))
+}
+
+/// 실패한 명령의 stderr 첫 줄. 비어 있으면 종료 상태.
+fn failure(program: &str, out: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Err(stderr
+    stderr
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .map_or_else(
             || format!("{program} failed: {}", out.status),
             str::to_string,
-        ))
+        )
 }
 
 /// `mount -t nfs -o nosuid,nodev,noexec,retry=0[,options] server:export dir`의 인자. 풀에는 이미지
@@ -217,6 +249,8 @@ struct Pools {
     ops: Arc<dyn MountOps>,
     /// 이 OS가 NFS 마운트를 지원하는지(Linux)
     nfs_supported: bool,
+    /// 이 OS가 LVM을 지원하는지(Linux)
+    lvm_supported: bool,
     mount_timeout: Duration,
     check_timeout: Duration,
     /// 시간 안에 끝나지 않은 확인 작업(풀 id별). 끝날 때까지 그 풀은 건너뛴다.
@@ -254,6 +288,8 @@ enum Step {
     State(PoolState),
     /// 이 디렉터리를 확인한다. 멈추면 이 오류를 적는다.
     Check(PathBuf, &'static str),
+    /// VG의 thin pool을 `lvs`로 확인한다.
+    Lvm(String, String),
 }
 
 /// 마운트에 실패한 뒤 다음 시도까지 기다리는 시간: 15초부터 실패할 때마다 두 배, 최대 5분
@@ -270,6 +306,7 @@ impl Pools {
             mount_root,
             ops,
             nfs_supported: cfg!(target_os = "linux"),
+            lvm_supported: cfg!(target_os = "linux"),
             mount_timeout: MOUNT_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
             stuck: HashMap::new(),
@@ -308,12 +345,16 @@ impl Pools {
             .retain(|id, _| usable.iter().any(|p| p.id == *id));
         let mut states = BTreeMap::new();
         let mut checks = Vec::new();
+        let mut lvm_checks = Vec::new();
         for pool in &usable {
             match self.step(pool, &mounted, mount_results.remove(&pool.id)) {
                 Step::State(state) => {
                     states.insert(pool.name.clone(), state);
                 }
                 Step::Check(dir, not_responding) => checks.push((*pool, dir, not_responding)),
+                Step::Lvm(vg, thinpool) => {
+                    lvm_checks.push((*pool, self.spawn_lvm_check(pool.id, vg, thinpool)));
+                }
             }
         }
         for (pool, state) in self.check_all(checks).await {
@@ -328,6 +369,12 @@ impl Pools {
                     .cloned()
                     .unwrap_or_else(|| not_ready(pool.id, NFS_NOT_RESPONDING.into())),
             };
+            states.insert(pool.name.clone(), state);
+        }
+        for (pool, task) in lvm_checks {
+            let state = task
+                .await
+                .unwrap_or_else(|e| not_ready(pool.id, e.to_string()));
             states.insert(pool.name.clone(), state);
         }
         if self.nfs_supported {
@@ -358,8 +405,11 @@ impl Pools {
     ) -> Step {
         let (server, export, options) = match &pool.spec.backend {
             PoolBackend::Dir { path } => return Step::Check(path.clone(), DIR_NOT_RESPONDING),
-            PoolBackend::LvmThin { .. } => {
-                return Step::State(not_ready(pool.id, LVM_UNSUPPORTED.into()));
+            PoolBackend::LvmThin { vg, thinpool } => {
+                if !self.lvm_supported {
+                    return Step::State(not_ready(pool.id, LVM_UNSUPPORTED.into()));
+                }
+                return Step::Lvm(vg.clone(), thinpool.clone());
             }
             PoolBackend::Nfs {
                 server,
@@ -424,6 +474,25 @@ impl Pools {
             done.notify_one();
         });
         Step::State(not_ready(pool.id, MOUNT_IN_PROGRESS.into()))
+    }
+
+    /// `lvs`로 thin pool을 확인하는 작업을 시작한다. 시간 제한이 지나면 `lvs`를 죽인다.
+    fn spawn_lvm_check(&self, id: Uuid, vg: String, thinpool: String) -> JoinHandle<PoolState> {
+        let (ops, timeout) = (self.ops.clone(), self.check_timeout);
+        tokio::spawn(async move {
+            match tokio::time::timeout(timeout, ops.lvm_pool(&vg, &thinpool)).await {
+                Ok(Ok(lv)) if lv.is_thin_pool() => PoolState {
+                    pool_id: id,
+                    ready: true,
+                    error: None,
+                    total_bytes: lv.size_bytes,
+                    available_bytes: lv.size_bytes - lv.used_bytes(),
+                },
+                Ok(Ok(_)) => not_ready(id, format!("{vg}/{thinpool} is not a thin pool")),
+                Ok(Err(e)) => not_ready(id, e),
+                Err(_) => not_ready(id, LVS_TIMED_OUT.into()),
+            }
+        })
     }
 
     /// 끝난 마운트·언마운트를 거둔다. 마운트 결과는 풀 id별로 돌려주고, 언마운트 결과는 기록한다.
@@ -700,6 +769,10 @@ mod tests {
         checks: Mutex<usize>,
         /// 용량에 더하는 바이트(쓰기·지우기로 조금씩 바뀌는 용량)
         extra: AtomicU64,
+        /// VG별 LV
+        lvs: Mutex<BTreeMap<String, Vec<LvInfo>>>,
+        /// 참이면 `lvs`가 풀릴 때까지 멈춘다.
+        hang_lvs: AtomicBool,
     }
 
     impl FakeMount {
@@ -748,6 +821,24 @@ mod tests {
             Ok(())
         }
 
+        async fn lvm_pool(&self, vg: &str, thinpool: &str) -> Result<LvInfo, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("lvs {vg}/{thinpool}"));
+            while self.hang_lvs.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let lvs = self.lvs.lock().unwrap();
+            let lvs = lvs
+                .get(vg)
+                .ok_or_else(|| format!("Volume group \"{vg}\" not found"))?;
+            lvs.iter()
+                .find(|lv| lv.name == thinpool)
+                .cloned()
+                .ok_or_else(|| format!("Failed to find logical volume \"{vg}/{thinpool}\""))
+        }
+
         fn check(&self, dir: &Path, probe: &str) -> std::io::Result<Capacity> {
             *self.checks.lock().unwrap() += 1;
             while self.hang.load(Ordering::SeqCst) {
@@ -794,6 +885,7 @@ mod tests {
         let fake = Arc::new(FakeMount::default());
         let mut pools = Pools::new(cluster.clone(), root.clone(), fake.clone());
         pools.nfs_supported = true;
+        pools.lvm_supported = true;
         pools.check_timeout = Duration::from_millis(200);
         Setup {
             _dir: dir,
@@ -929,20 +1021,93 @@ mod tests {
         s.cluster.shutdown().await.unwrap();
     }
 
-    /// LVM-thin 풀은 아직 확인하지 않고 준비되지 않았다고 적는다.
+    fn lvm(vg: &str, thinpool: &str) -> PoolBackend {
+        PoolBackend::LvmThin {
+            vg: vg.into(),
+            thinpool: thinpool.into(),
+        }
+    }
+
+    fn lv(name: &str, attr: &str, size_bytes: u64, data_percent: Option<f64>) -> LvInfo {
+        LvInfo {
+            name: name.into(),
+            attr: attr.into(),
+            size_bytes,
+            data_percent,
+        }
+    }
+
+    /// LVM-thin 풀은 `lvs`로 thin pool을 확인해 크기와 데이터 사용률로 용량을 적는다. VG나 LV가
+    /// 없거나 thin pool이 아니면 이유와 함께 준비되지 않았다.
     #[tokio::test]
-    async fn lvm_thin_pools_are_not_ready_yet() {
+    async fn records_lvm_thin_pool_states() {
         let mut s = setup().await;
-        let backend = PoolBackend::LvmThin {
-            vg: "vg0".into(),
-            thinpool: "tp".into(),
-        };
-        let vg = s.pool("vg", backend, vec![]).await;
+        s.fake.lvs.lock().unwrap().insert(
+            "vg0".into(),
+            vec![
+                lv("tp", "twi-aotz--", 100 * GIB, Some(60.0)),
+                lv("data", "-wi-a-----", 10 * GIB, None),
+            ],
+        );
+        let tp = s.pool("tp", lvm("vg0", "tp"), vec![]).await;
+        let plain = s.pool("plain", lvm("vg0", "data"), vec![]).await;
+        let gone = s.pool("gone", lvm("vg0", "nope"), vec![]).await;
+        let novg = s.pool("novg", lvm("vg1", "tp"), vec![]).await;
+
         s.pools.settle().await;
+        let states = s.states();
+        assert_eq!(states["tp"], ready(&tp));
+        assert_eq!(
+            states["plain"],
+            not_ready(plain.id, "vg0/data is not a thin pool".into())
+        );
+        assert_eq!(
+            states["gone"],
+            not_ready(gone.id, "Failed to find logical volume \"vg0/nope\"".into())
+        );
+        assert_eq!(
+            states["novg"],
+            not_ready(novg.id, "Volume group \"vg1\" not found".into())
+        );
+        // 마운트하지 않는다.
+        let mut calls = s.fake.calls();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(
+            calls,
+            ["lvs vg0/data", "lvs vg0/nope", "lvs vg0/tp", "lvs vg1/tp"]
+        );
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// 멈춘 `lvs`는 시간 제한 뒤 준비되지 않았다고 적고, 다른 풀의 기록을 막지 않는다.
+    #[tokio::test]
+    async fn hung_lvs_times_out() {
+        let mut s = setup().await;
+        let local = PoolBackend::Dir {
+            path: s.local.clone(),
+        };
+        let local = s.pool("local", local, vec![]).await;
+        let tp = s.pool("tp", lvm("vg0", "tp"), vec![]).await;
+        s.fake.hang_lvs.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        s.pools.tick().await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(s.states()["local"], ready(&local));
+        assert_eq!(s.states()["tp"], not_ready(tp.id, LVS_TIMED_OUT.into()));
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lvm_thin_is_not_checked_where_unsupported() {
+        let mut s = setup().await;
+        s.pools.lvm_supported = false;
+        let tp = s.pool("tp", lvm("vg0", "tp"), vec![]).await;
+        s.pools.tick().await.unwrap();
         assert_eq!(s.fake.calls(), Vec::<String>::new());
         assert_eq!(
-            s.states()["vg"],
-            not_ready(vg.id, "lvm-thin pools are not supported yet".into())
+            s.states()["tp"],
+            not_ready(tp.id, "lvm-thin pools are not supported on macOS".into())
         );
         s.cluster.shutdown().await.unwrap();
     }
