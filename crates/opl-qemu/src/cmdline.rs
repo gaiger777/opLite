@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use opl_types::runtime::{ImageFormat, NicBackend, VmRuntimeSpec};
+use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, VmRuntimeSpec};
 use opl_types::vm::{Arch, CpuModel, DiskBus, Firmware, MachineType, NicModel};
 use thiserror::Error;
 
@@ -95,10 +95,14 @@ pub fn build_cmdline(
             ImageFormat::Qcow2 => "qcow2",
             ImageFormat::Raw => "raw",
         };
+        let proto = match disk.kind {
+            DiskKind::File => "file",
+            DiskKind::Block => "host_device",
+        };
         a.opt(
             "-blockdev",
             format!(
-                "driver=file,filename={},node-name=disk{i}-file",
+                "driver={proto},filename={},node-name=disk{i}-file",
                 esc_path(&disk.path)
             ),
         );
@@ -329,6 +333,23 @@ mod tests {
                 &"driver=file,filename=/pool/x,,y.qcow2,node-name=disk0-file".to_string()
             )
         );
+    }
+
+    /// 블록 장치 디스크는 `host_device`로 연다. 포맷 노드는 파일 디스크와 같다.
+    #[test]
+    fn block_disks_use_host_device() {
+        let mut spec = x86_spec();
+        spec.disks[1].path = "/dev/vg0/opl-a".into();
+        spec.disks[1].kind = DiskKind::Block;
+        let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        assert!(args.contains(
+            &"driver=host_device,filename=/dev/vg0/opl-a,node-name=disk1-file".to_string()
+        ));
+        assert!(args.contains(&"driver=raw,file=disk1-file,node-name=disk1".to_string()));
+        assert!(args.contains(
+            &"driver=file,filename=/var/lib/opl/pools/local/web-01-root.qcow2,node-name=disk0-file"
+                .to_string()
+        ));
     }
 
     #[test]

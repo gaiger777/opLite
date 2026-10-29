@@ -49,6 +49,7 @@ pub fn reconciler_config(node: Uuid) -> ReconcilerConfig {
     ReconcilerConfig {
         node,
         mount_root: MOUNT_ROOT.into(),
+        storage: Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT)),
         resync_interval: Duration::from_secs(3600),
         acpi_timeout: Duration::from_millis(300),
         retry_interval: Duration::from_millis(100),
@@ -545,7 +546,15 @@ impl Storage for FakeStorage {
             available_bytes: 1 << 40,
         })
     }
-    fn supports_snapshots(&self, format: ImageFormat) -> bool {
+    async fn activate_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+    fn supports_snapshots(&self, _: &StoragePool, format: ImageFormat) -> bool {
         format == ImageFormat::Qcow2
     }
     async fn snapshot_create(

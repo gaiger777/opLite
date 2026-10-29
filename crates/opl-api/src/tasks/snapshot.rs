@@ -199,7 +199,7 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     let disks = ready_disks(ctx, &vm.spec)?;
     if let Some((volume, _)) = disks
         .iter()
-        .find(|(v, _)| !ctx.storage.supports_snapshots(v.spec.format))
+        .find(|(v, p)| !ctx.storage.supports_snapshots(p, v.spec.format))
     {
         return Err(format!(
             "volume {:?} ({:?}) cannot be snapshotted",

@@ -4,6 +4,7 @@ use std::time::Duration;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
+use opl_types::runtime::VmRuntimeSpec;
 use opl_types::vm::{PowerState, RestartPolicy, Vm, VmPhase, VmSpec, VmStatus};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -338,8 +339,7 @@ impl Worker {
 
     /// VM을 시작한다. 시작하지 못하고 실패를 기록했으면(백오프 또는 포기) false.
     async fn start(&mut self, vm: &Vm) -> Result<bool, StepError> {
-        let spec = match runtime_spec(&self.cluster, vm, self.config.node, &self.config.mount_root)
-        {
+        let spec = match self.resolve(vm).await {
             Ok(spec) => spec,
             Err(ResolveError::Cluster(e)) => return Err(e.into()),
             // 풀이 이 노드에서 아직 준비되지 않았다(NFS 서버가 멈춤, 마운트 전 등). 풀이 돌아오면
@@ -352,8 +352,8 @@ impl Worker {
                 ));
                 return Ok(false);
             }
-            // 참조가 틀렸거나 이 노드가 지원하지 않는 풀(NFS on macOS)이다. spec을 고치거나 VM을
-            // 옮겨야 하므로 다시 시도하지 않는다.
+            // 참조가 틀렸거나, 이 노드가 지원하지 않는 풀(NFS on macOS)이거나, 저장소가 볼륨을
+            // 내주지 못했다. spec을 고치거나 VM을 옮겨야 하므로 다시 시도하지 않는다.
             Err(e) => {
                 self.restores.lock().unwrap().remove(&self.id);
                 self.power_off = Some(Some(e.to_string()));
@@ -380,10 +380,15 @@ impl Worker {
         }
     }
 
+    /// VM의 런타임 정의. 디스크 볼륨을 활성화한다.
+    async fn resolve(&self, vm: &Vm) -> Result<VmRuntimeSpec, ResolveError> {
+        let c = &self.config;
+        runtime_spec(&self.cluster, vm, c.node, &c.mount_root, &*c.storage).await
+    }
+
     /// 살아 있는 VM에 다시 붙거나 이어서 실행한다(`start`는 멱등이다). 참조 해석 오류도 돌려준다.
     async fn reattach(&self, vm: &Vm) -> Result<(), String> {
-        let spec = runtime_spec(&self.cluster, vm, self.config.node, &self.config.mount_root)
-            .map_err(|e| e.to_string())?;
+        let spec = self.resolve(vm).await.map_err(|e| e.to_string())?;
         self.hv.start(&spec, None).await.map_err(|e| e.to_string())
     }
 

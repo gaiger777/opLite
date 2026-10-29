@@ -11,7 +11,7 @@ use opl_cluster::memnet::MemRouter;
 use opl_cluster::store::StoreError;
 use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig, ClusterError};
-use opl_driver::{Hypervisor, MockHypervisor};
+use opl_driver::{DirStorage, Hypervisor, MockHypervisor};
 use opl_reconciler::{Reconciler, ReconcilerConfig, RestartBackoff};
 use opl_types::resource::Resource;
 use opl_types::vm::{CpuModel, CpuSpec, Firmware, PowerState, Vm, VmSpec};
@@ -36,6 +36,8 @@ pub fn config(node: Uuid) -> ReconcilerConfig {
         node,
         // 테스트는 dir 풀만 쓰므로 NFS 마운트 디렉터리는 쓰이지 않는다.
         mount_root: "/nonexistent/opl-pools".into(),
+        // dir 풀의 볼륨은 활성화할 것이 없다.
+        storage: Arc::new(DirStorage::new("qemu-img", "/nonexistent/opl-pools")),
         resync_interval: Duration::from_secs(3600),
         acpi_timeout: Duration::from_millis(300),
         retry_interval: Duration::from_millis(100),

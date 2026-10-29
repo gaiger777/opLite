@@ -257,8 +257,8 @@ async fn snapshot_revert_restores_contents_and_delete_is_idempotent() {
         .create_volume(&pool, id, 64 * MIB, qcow2)
         .await
         .unwrap();
-    assert!(storage.supports_snapshots(qcow2));
-    assert!(!storage.supports_snapshots(ImageFormat::Raw));
+    assert!(storage.supports_snapshots(&pool, qcow2));
+    assert!(!storage.supports_snapshots(&pool, ImageFormat::Raw));
 
     assert!(qemu_io(&path, "write -P 0xab 0 64k"));
     let tag = Uuid::now_v7().to_string();

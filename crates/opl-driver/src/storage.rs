@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use opl_types::runtime::ImageFormat;
+use opl_types::runtime::{DiskKind, ImageFormat};
 use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
 use serde_json::Value;
 use uuid::Uuid;
@@ -73,6 +73,15 @@ pub trait Storage: Send + Sync {
         format: ImageFormat,
     ) -> Result<(), DriverError>;
 
+    /// VM이 볼륨을 디스크로 쓸 수 있게 한다([`disk_location`]의 장치를 만든다). 이미 쓸 수 있으면
+    /// 아무것도 하지 않는다. 파일 볼륨은 할 일이 없다.
+    async fn activate_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError>;
+
     /// VM이 실행 중이어도 조회할 수 있다.
     async fn volume_info(
         &self,
@@ -83,9 +92,9 @@ pub trait Storage: Send + Sync {
 
     async fn capacity(&self, pool: &StoragePool) -> Result<Capacity, DriverError>;
 
-    /// 이 백엔드가 `format` 볼륨의 스냅샷을 지원하는지. 지원하지 않는 형식에 스냅샷 메서드를
-    /// 부르면 `InvalidSpec`.
-    fn supports_snapshots(&self, format: ImageFormat) -> bool;
+    /// 이 백엔드가 `pool`의 `format` 볼륨의 스냅샷을 지원하는지. 지원하지 않는 형식에 스냅샷
+    /// 메서드를 부르면 `InvalidSpec`.
+    fn supports_snapshots(&self, pool: &StoragePool, format: ImageFormat) -> bool;
 
     /// 정지한 볼륨에 스냅샷 `tag`를 만든다. 같은 태그가 이미 있으면 `InvalidSpec`.
     async fn snapshot_create(
@@ -201,6 +210,21 @@ fn check_pool_root_with(
     Ok(root)
 }
 
+/// VM 디스크로 쓸 볼륨의 위치와 종류. 파일 풀은 풀 루트([`check_pool_root`]로 확인한다) 안의
+/// 볼륨 파일이다.
+pub fn disk_location(
+    pool: &StoragePool,
+    mount_root: &Path,
+    id: Uuid,
+    format: ImageFormat,
+) -> Result<(PathBuf, DiskKind), DriverError> {
+    check_pool_root(pool, mount_root)?;
+    Ok((
+        DirStorage::volume_path(pool, mount_root, id, format),
+        DiskKind::File,
+    ))
+}
+
 /// 파일 풀(`dir`, `nfs`): 풀 루트([`pool_root`]) 안에 `{id}.qcow2` / `{id}.raw` 파일을 두고
 /// `qemu-img`로 다룬다. 풀 루트는 hard link를 지원하는 파일시스템이어야 한다.
 pub struct DirStorage {
@@ -308,7 +332,7 @@ impl DirStorage {
         id: Uuid,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        if !self.supports_snapshots(format) {
+        if !self.supports_snapshots(pool, format) {
             return Err(DriverError::InvalidSpec(format!(
                 "{} volumes do not support snapshots",
                 fmt_name(format)
@@ -673,8 +697,17 @@ impl Storage for DirStorage {
         Ok(self.on_pool(pool, space).await??)
     }
 
+    async fn activate_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+
     /// 내부 스냅샷은 qcow2만 담을 수 있다.
-    fn supports_snapshots(&self, format: ImageFormat) -> bool {
+    fn supports_snapshots(&self, _: &StoragePool, format: ImageFormat) -> bool {
         format == ImageFormat::Qcow2
     }
 
@@ -898,6 +931,35 @@ mod tests {
         );
     }
 
+    /// 파일 풀의 디스크는 볼륨 파일이다. 활성화할 것이 없다.
+    #[tokio::test]
+    async fn file_pool_disks_are_volume_files() {
+        let mnt = tempfile::tempdir().unwrap();
+        let p = pool("/pools/local");
+        let id = Uuid::nil();
+        assert_eq!(
+            disk_location(&p, mnt.path(), id, ImageFormat::Raw).unwrap(),
+            (
+                PathBuf::from("/pools/local/00000000-0000-0000-0000-000000000000.raw"),
+                DiskKind::File
+            )
+        );
+        // 없는 볼륨이어도 dir 저장소는 아무것도 하지 않는다.
+        let storage = dir_storage("/nonexistent/qemu-img");
+        storage
+            .activate_volume(&p, id, ImageFormat::Qcow2)
+            .await
+            .unwrap();
+        // 마운트되지 않은 NFS 풀의 디스크는 쓸 수 없다(일시 오류).
+        let nfs = nfs_pool();
+        match disk_location(&nfs, mnt.path(), id, ImageFormat::Qcow2).unwrap_err() {
+            DriverError::PoolNotMounted(path) => {
+                assert_eq!(path, mnt.path().join(nfs.id.to_string()))
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
     fn lvm_pool() -> StoragePool {
         Resource::new(
             "vg",
@@ -926,6 +988,7 @@ mod tests {
         };
         unsupported(check_pool_root(&p, mnt.path()).unwrap_err());
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
+        unsupported(disk_location(&p, mnt.path(), id, f).unwrap_err());
         unsupported(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
         unsupported(storage.delete_volume(&p, id, f).await.unwrap_err());
         unsupported(storage.volume_info(&p, id, f).await.unwrap_err());
@@ -1254,8 +1317,8 @@ mod tests {
         let p = pool(tmp.path().to_str().unwrap());
         let id = Uuid::nil();
         let (raw, qcow2) = (ImageFormat::Raw, ImageFormat::Qcow2);
-        assert!(storage.supports_snapshots(qcow2));
-        assert!(!storage.supports_snapshots(raw));
+        assert!(storage.supports_snapshots(&p, qcow2));
+        assert!(!storage.supports_snapshots(&p, raw));
 
         std::fs::write(volume_path(&p, id, raw), b"").unwrap();
         for res in [

@@ -1,15 +1,19 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use opl_driver::Storage;
 use uuid::Uuid;
 
 /// reconciler 설정. 기본값은 설계 문서 5.3절을 따른다.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReconcilerConfig {
     /// 이 노드의 id. `spec.node`가 이 값인 VM만 다룬다.
     pub node: Uuid,
     /// NFS 풀을 마운트하는 디렉터리(opld의 `{data_dir}/pools`). 디스크 경로를 만들 때 쓴다.
     pub mount_root: PathBuf,
+    /// VM을 시작하기 전에 디스크 볼륨을 활성화하는 저장소
+    pub storage: Arc<dyn Storage>,
     /// 이벤트를 놓쳤더라도 원하는 상태와 실제 상태를 다시 맞추는 주기
     pub resync_interval: Duration,
     /// ACPI 종료를 요청한 뒤 강제 종료로 넘어가기까지 기다리는 시간
@@ -31,10 +35,11 @@ pub struct RestartBackoff {
 }
 
 impl ReconcilerConfig {
-    pub fn new(node: Uuid, mount_root: impl Into<PathBuf>) -> Self {
+    pub fn new(node: Uuid, mount_root: impl Into<PathBuf>, storage: Arc<dyn Storage>) -> Self {
         Self {
             node,
             mount_root: mount_root.into(),
+            storage,
             resync_interval: Duration::from_secs(30),
             acpi_timeout: Duration::from_secs(60),
             retry_interval: Duration::from_secs(2),
