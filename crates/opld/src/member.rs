@@ -16,6 +16,7 @@ use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError};
 use opl_driver::{
     DirStorage, Hypervisor, LvmThinStorage, QemuHypervisor, Storage, Storages, SystemLvm,
+    SystemZfs, ZfsStorage,
 };
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{TlsListener, api_server_config};
@@ -263,8 +264,12 @@ impl Member {
         // 풀 백엔드 종류로 나눠 보내는 저장소 하나를 reconciler와 Task 실행기가 함께 쓴다.
         let files: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img, &mount_root));
         let lvm = LvmThinStorage::new(&config.qemu_img, Arc::new(SystemLvm));
-        let storage: Arc<dyn Storage> =
-            Arc::new(Storages::new(&config.qemu_img, files).with_lvm_thin(Arc::new(lvm)));
+        let zfs = ZfsStorage::new(&config.qemu_img, Arc::new(SystemZfs));
+        let storage: Arc<dyn Storage> = Arc::new(
+            Storages::new(&config.qemu_img, files)
+                .with_lvm_thin(Arc::new(lvm))
+                .with_zfs(Arc::new(zfs)),
+        );
         let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);

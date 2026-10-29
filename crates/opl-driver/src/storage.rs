@@ -14,9 +14,11 @@ use crate::mounts::{MOUNTINFO, nfs_mount_points};
 mod blockcmd;
 mod lvm;
 mod storages;
+mod zfs;
 
 pub use lvm::{LvInfo, LvmOps, LvmThinStorage, SystemLvm, parse_lvs};
 pub use storages::Storages;
+pub use zfs::{SystemZfs, ZfsOps, ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo};
 
 /// 올린 이미지를 검사하는 `qemu-img info`가 멈추면(이상한 extent 등) 무한정 기다리지 않는다.
 const INFO_TIMEOUT: Duration = Duration::from_secs(60);
@@ -130,6 +132,21 @@ pub trait Storage: Send + Sync {
         format: ImageFormat,
         tag: &str,
     ) -> Result<(), DriverError>;
+
+    /// 같은 풀의 볼륨들(`ids`)에 같은 스냅샷 `tag`를 만든다. 기본은 하나씩 만든다(중간에 실패하면
+    /// 앞서 만든 것은 남는다). 여러 볼륨을 한 번에 찍을 수 있는 백엔드(ZFS)는 덮어쓴다.
+    async fn snapshot_many(
+        &self,
+        pool: &StoragePool,
+        ids: &[Uuid],
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError> {
+        for &id in ids {
+            self.snapshot_create(pool, id, format, tag).await?;
+        }
+        Ok(())
+    }
 
     /// 정지한 볼륨의 내용을 스냅샷 `tag` 때로 되돌린다.
     async fn snapshot_revert(
@@ -269,7 +286,8 @@ fn check_pool_root_with(
 
 /// VM 디스크로 쓸 볼륨의 위치와 종류. 파일 풀은 풀 루트([`check_pool_root`]로 확인한다) 안의
 /// 볼륨 파일이다. LVM-thin 풀은 LV 장치 `/dev/{vg}/opl-{id}`(없으면 `/dev/mapper`의 노드)이고, 장치
-/// 노드가 없으면(비활성) `VolumeNotActive`다(활성화는 저장소의 `activate_volume`이 한다).
+/// 노드가 없으면(비활성) `VolumeNotActive`다(활성화는 저장소의 `activate_volume`이 한다). ZFS 풀은
+/// zvol 장치 `/dev/zvol/{dataset}/opl-{id}`이고, 노드가 없으면(아직 생기지 않음) `VolumeNotActive`다.
 pub fn disk_location(
     pool: &StoragePool,
     mount_root: &Path,
@@ -279,7 +297,7 @@ pub fn disk_location(
     disk_location_in(Path::new(lvm::DEV), pool, mount_root, id, format)
 }
 
-/// [`disk_location`]. LV 장치 노드를 `dev` 아래에서 찾는다.
+/// [`disk_location`]. 블록 장치 노드를 `dev` 아래에서 찾는다.
 fn disk_location_in(
     dev: &Path,
     pool: &StoragePool,
@@ -291,10 +309,9 @@ fn disk_location_in(
         lvm::require_raw(format)?;
         return Ok((lvm::volume_device(dev, vg, id)?, DiskKind::Block));
     }
-    if let PoolBackend::Zfs { .. } = &pool.spec.backend {
-        return Err(DriverError::InvalidSpec(
-            "zfs pools are not supported yet".into(),
-        ));
+    if let PoolBackend::Zfs { dataset } = &pool.spec.backend {
+        zfs::require_raw(format)?;
+        return Ok((zfs::volume_device(dev, dataset, id)?, DiskKind::Block));
     }
     check_pool_root(pool, mount_root)?;
     Ok((
@@ -504,6 +521,31 @@ async fn run_qemu_img(qemu_img: &Path, args: &[&str]) -> Result<Vec<u8>, DriverE
         });
     }
     Ok(out.stdout)
+}
+
+/// 가져올 원본 `src`의 가상 크기(`qemu-img info`). 블록 풀은 이 크기로 볼륨을 만든 뒤 써 넣는다.
+async fn source_virtual_size(
+    qemu_img: &Path,
+    src: &Path,
+    src_format: SourceFormat,
+) -> Result<u64, DriverError> {
+    let args = [
+        "info",
+        "--output=json",
+        "-f",
+        src_fmt_name(src_format),
+        path_str(src)?,
+    ];
+    let out = tokio::time::timeout(INFO_TIMEOUT, run_qemu_img(qemu_img, &args))
+        .await
+        .map_err(|_| DriverError::Timeout("qemu-img info"))??;
+    serde_json::from_slice::<Value>(&out)
+        .ok()
+        .and_then(|json| json.get("virtual-size").and_then(Value::as_u64))
+        .ok_or_else(|| DriverError::ToolFailed {
+            tool: "qemu-img",
+            stderr: "info output has no virtual-size".into(),
+        })
 }
 
 /// `qemu-img convert`가 `src`를 읽어 `out_format`으로 쓰게 하는 인자. 출력 경로는 뒤에 붙인다.
@@ -1132,8 +1174,7 @@ mod tests {
         refused(storage.capacity(&p).await.unwrap_err());
     }
 
-    /// 파일 저장소는 ZFS 풀도 다루지 않고(`/dev/zvol/{dataset}`에 파일을 만들지 않는다), 디스크
-    /// 위치도 아직 정하지 않는다.
+    /// 파일 저장소는 ZFS 풀도 다루지 않는다(`/dev/zvol/{dataset}`에 파일을 만들지 않는다).
     #[tokio::test]
     async fn zfs_pools_are_not_file_pools() {
         let tools = tempfile::tempdir().unwrap();
@@ -1161,8 +1202,49 @@ mod tests {
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
         refused(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
         refused(storage.capacity(&p).await.unwrap_err());
-        match disk_location(&p, mnt.path(), id, f).unwrap_err() {
-            DriverError::InvalidSpec(msg) => assert_eq!(msg, "zfs pools are not supported yet"),
+    }
+
+    /// ZFS 풀의 디스크는 zvol 장치다. 장치 노드가 없으면(아직 생기지 않음) 일시 오류다.
+    #[test]
+    fn zfs_disks_are_zvol_devices() {
+        let dev = tempfile::tempdir().unwrap();
+        let mnt = Path::new(MNT);
+        let p: StoragePool = Resource::new(
+            "z",
+            StoragePoolSpec {
+                backend: PoolBackend::Zfs {
+                    dataset: "tank/opl".into(),
+                },
+                nodes: vec![],
+                shared: false,
+            },
+        );
+        let id = Uuid::nil();
+        let path = dev
+            .path()
+            .join("zvol/tank/opl/opl-00000000-0000-0000-0000-000000000000");
+        match disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Raw).unwrap_err() {
+            DriverError::VolumeNotActive(missing) => assert_eq!(missing, path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(
+            disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Raw).unwrap(),
+            (path, DiskKind::Block)
+        );
+        // ZFS 풀은 raw 볼륨만 담는다.
+        let err = disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Qcow2).unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        // 실제 장치 디렉터리
+        let id = Uuid::now_v7();
+        match disk_location(&p, mnt, id, ImageFormat::Raw).unwrap_err() {
+            DriverError::VolumeNotActive(missing) => {
+                assert_eq!(
+                    missing,
+                    PathBuf::from(format!("/dev/zvol/tank/opl/opl-{id}"))
+                )
+            }
             other => panic!("unexpected error: {other:?}"),
         }
     }

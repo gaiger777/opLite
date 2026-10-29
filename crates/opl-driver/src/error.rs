@@ -27,6 +27,9 @@ pub enum DriverError {
     /// LVM 명령이 실패했다. 내용은 stderr의 첫 줄이다.
     #[error("lvm failed: {0}")]
     Lvm(String),
+    /// ZFS 명령이 실패했다. 내용은 stderr의 첫 줄이다.
+    #[error("zfs failed: {0}")]
+    Zfs(String),
     /// 블록 장치 볼륨의 장치 노드가 이 노드에 없다(활성화돼 있지 않거나 노드가 아직 생기지 않았다).
     /// 저장소의 `activate_volume`이 활성화하면 풀린다.
     #[error("volume device node missing: {}", .0.display())]
@@ -70,7 +73,8 @@ impl DriverError {
             | DriverError::VolumeNotFound(_)
             | DriverError::VolumeExists(_)
             | DriverError::ToolFailed { .. }
-            | DriverError::Lvm(_) => false,
+            | DriverError::Lvm(_)
+            | DriverError::Zfs(_) => false,
         }
     }
 
@@ -132,6 +136,7 @@ mod tests {
         assert!(!DriverError::InvalidSpec("x".into()).is_transient());
         assert!(!DriverError::VolumeNotFound(Uuid::nil()).is_transient());
         assert!(!DriverError::Lvm("Volume group \"vg0\" not found".into()).is_transient());
+        assert!(!DriverError::Zfs("dataset does not exist".into()).is_transient());
     }
 
     #[test]

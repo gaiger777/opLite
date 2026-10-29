@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use super::blockcmd::BlockTool;
 use super::{
-    Capacity, INFO_TIMEOUT, Storage, VolumeInfo, VolumeSource, check_image, convert_from, path_str,
-    require_absolute, run_qemu_img, src_fmt_name,
+    Capacity, Storage, VolumeInfo, VolumeSource, check_image, convert_from, path_str,
+    require_absolute, run_qemu_img, source_virtual_size, src_fmt_name,
 };
 use crate::error::DriverError;
 
@@ -567,23 +567,7 @@ impl Storage for LvmThinStorage {
         let (vg, thinpool) = Self::target(pool, format)?;
         require_absolute(src)?;
         let src_str = path_str(src)?;
-        let args = [
-            "info",
-            "--output=json",
-            "-f",
-            src_fmt_name(src_format),
-            src_str,
-        ];
-        let out = tokio::time::timeout(INFO_TIMEOUT, run_qemu_img(&self.qemu_img, &args))
-            .await
-            .map_err(|_| DriverError::Timeout("qemu-img info"))??;
-        let size = serde_json::from_slice::<Value>(&out)
-            .ok()
-            .and_then(|json| json.get("virtual-size").and_then(Value::as_u64))
-            .ok_or_else(|| DriverError::ToolFailed {
-                tool: "qemu-img",
-                stderr: "info output has no virtual-size".into(),
-            })?;
+        let size = source_virtual_size(&self.qemu_img, src, src_format).await?;
         let dst = self.create_lv(vg, thinpool, id, size).await?;
         let from = ["-f", src_fmt_name(src_format), "-O", "raw", src_str].map(String::from);
         self.fill(vg, id, &dst, &from).await?;
@@ -754,7 +738,9 @@ impl Storage for LvmThinStorage {
         Ok(())
     }
 
-    /// VM이 실행 중이어도 지울 수 있다(QEMU는 스냅샷 LV를 쓰지 않는다).
+    /// VM이 실행 중이어도 지울 수 있다(QEMU는 스냅샷 LV를 쓰지 않는다). 스냅샷 LV가 없으면 지운
+    /// 것으로 본다. 다만 그 LV를 바꾸는 명령이 아직 돌고 있으면(시간을 넘긴 스냅샷 등) LV가 곧 생길
+    /// 수 있으므로 일시 오류다.
     async fn snapshot_delete(
         &self,
         pool: &StoragePool,
@@ -764,6 +750,11 @@ impl Storage for LvmThinStorage {
     ) -> Result<(), DriverError> {
         let (vg, _) = Self::target(pool, format)?;
         let name = Self::snapshot_lv(id, tag)?;
+        if self.ops.changing(vg, &name) {
+            return Err(DriverError::Timeout(
+                "an earlier lvm command still running on the snapshot",
+            ));
+        }
         if self.find(vg, &name).await?.is_some() {
             self.ops.remove(vg, &name).await?;
         }
@@ -1431,6 +1422,46 @@ mod tests {
                 .await
                 .unwrap_err(),
             "raw volumes",
+        );
+    }
+
+    /// 그 스냅샷 LV를 바꾸는 명령이 아직 돌고 있으면(시간을 넘긴 스냅샷 등) LV가 아직 없어도
+    /// 지우기는 일시 오류다. 명령이 끝나면 LV가 생길 수 있다.
+    #[tokio::test]
+    async fn snapshot_delete_waits_for_a_running_command() {
+        let (lvm, storage) = setup("/nonexistent/qemu-img");
+        let (p, id) = (lvm_pool(), Uuid::now_v7());
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.taken();
+        *lvm.busy.lock().unwrap() = vec![format!("opl-{id}-s-t")];
+        let err = storage.snapshot_delete(&p, id, RAW, "t").await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Timeout(m) if m.contains("still running")),
+            "{err:?}"
+        );
+        assert!(err.is_transient());
+        lvm.busy.lock().unwrap().clear();
+        storage.snapshot_delete(&p, id, RAW, "t").await.unwrap();
+        assert!(lvm.taken().is_empty());
+    }
+
+    /// 여러 볼륨의 스냅샷은 기본 구현대로 하나씩 만든다.
+    #[tokio::test]
+    async fn snapshot_many_takes_one_volume_at_a_time() {
+        let (lvm, storage) = setup("/nonexistent/qemu-img");
+        let p = lvm_pool();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        for v in [a, b] {
+            storage.create_volume(&p, v, 1 << 20, RAW).await.unwrap();
+        }
+        lvm.taken();
+        storage.snapshot_many(&p, &[a, b], RAW, "t").await.unwrap();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("snapshot vg0/opl-{a} opl-{a}-s-t"),
+                format!("snapshot vg0/opl-{b} opl-{b}-s-t"),
+            ]
         );
     }
 

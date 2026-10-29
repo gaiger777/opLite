@@ -15,7 +15,6 @@ enum Kind {
     /// 볼륨 파일(`dir`, `nfs`)
     File,
     LvmThin,
-    /// 아직 다루는 저장소가 없다.
     Zfs,
 }
 
@@ -37,6 +36,8 @@ pub struct Storages {
     file: Arc<dyn Storage>,
     /// `lvm-thin` 풀. 없으면 그 풀은 쓸 수 없다.
     lvm_thin: Option<Arc<dyn Storage>>,
+    /// `zfs` 풀. 없으면 그 풀은 쓸 수 없다.
+    zfs: Option<Arc<dyn Storage>>,
 }
 
 impl Storages {
@@ -45,12 +46,19 @@ impl Storages {
             qemu_img: qemu_img.into(),
             file,
             lvm_thin: None,
+            zfs: None,
         }
     }
 
     /// `lvm-thin` 풀을 다룰 저장소를 정한다.
     pub fn with_lvm_thin(mut self, storage: Arc<dyn Storage>) -> Self {
         self.lvm_thin = Some(storage);
+        self
+    }
+
+    /// `zfs` 풀을 다룰 저장소를 정한다.
+    pub fn with_zfs(mut self, storage: Arc<dyn Storage>) -> Self {
+        self.zfs = Some(storage);
         self
     }
 
@@ -65,9 +73,10 @@ impl Storages {
             Kind::LvmThin => self.lvm_thin.as_ref().ok_or_else(|| {
                 DriverError::InvalidSpec("lvm-thin pools are not supported yet".into())
             }),
-            Kind::Zfs => Err(DriverError::InvalidSpec(
-                "zfs pools are not supported yet".into(),
-            )),
+            Kind::Zfs => self
+                .zfs
+                .as_ref()
+                .ok_or_else(|| DriverError::InvalidSpec("zfs pools are not supported yet".into())),
         }
     }
 
@@ -196,6 +205,18 @@ impl Storage for Storages {
     ) -> Result<(), DriverError> {
         self.backend(pool)?
             .snapshot_create(pool, id, format, tag)
+            .await
+    }
+
+    async fn snapshot_many(
+        &self,
+        pool: &StoragePool,
+        ids: &[Uuid],
+        format: ImageFormat,
+        tag: &str,
+    ) -> Result<(), DriverError> {
+        self.backend(pool)?
+            .snapshot_many(pool, ids, format, tag)
             .await
     }
 
@@ -519,6 +540,15 @@ mod tests {
         ) -> Result<(), DriverError> {
             self.call("snapshot_create")
         }
+        async fn snapshot_many(
+            &self,
+            _: &StoragePool,
+            _: &[Uuid],
+            _: ImageFormat,
+            _: &str,
+        ) -> Result<(), DriverError> {
+            self.call("snapshot_many")
+        }
         async fn snapshot_revert(
             &self,
             _: &StoragePool,
@@ -626,6 +656,12 @@ mod tests {
         })
     }
 
+    fn zfs_pool() -> StoragePool {
+        pool(PoolBackend::Zfs {
+            dataset: "tank/opl".into(),
+        })
+    }
+
     /// 인자를 한 줄에 하나씩 `{dir}/args`에 적는 가짜 qemu-img. `fail`이면 실패한다.
     fn fake_qemu_img(dir: &Path, fail: bool) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -645,7 +681,7 @@ mod tests {
         std::mem::take(&mut *log.lock().unwrap())
     }
 
-    /// 파일 풀(dir, nfs)은 파일 저장소로, lvm-thin 풀은 LVM 저장소로 간다.
+    /// 파일 풀(dir, nfs)은 파일 저장소로, lvm-thin 풀은 LVM 저장소로, zfs 풀은 ZFS 저장소로 간다.
     #[tokio::test]
     async fn calls_go_to_the_pool_backend() {
         let log = Log::default();
@@ -653,12 +689,14 @@ mod tests {
             "qemu-img",
             Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
         )
-        .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)));
+        .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)))
+        .with_zfs(Arc::new(Recorder::new("zfs", "/z".as_ref(), &log)));
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
         for (p, name) in [
             (dir_pool(), "file"),
             (nfs_pool(), "file"),
             (lvm_pool(), "lvm"),
+            (zfs_pool(), "zfs"),
         ] {
             storages.create_volume(&p, id, 1, f).await.unwrap();
             let src = Path::new("/up/x.vmdk");
@@ -672,6 +710,7 @@ mod tests {
             storages.capacity(&p).await.unwrap();
             assert!(storages.supports_snapshots(&p, f));
             storages.snapshot_create(&p, id, f, "t").await.unwrap();
+            storages.snapshot_many(&p, &[id], f, "t").await.unwrap();
             storages.snapshot_revert(&p, id, f, "t").await.unwrap();
             storages.snapshot_delete(&p, id, f, "t").await.unwrap();
             storages.snapshot_tags(&p, id, f).await.unwrap();
@@ -692,6 +731,7 @@ mod tests {
                 "capacity",
                 "supports_snapshots",
                 "snapshot_create",
+                "snapshot_many",
                 "snapshot_revert",
                 "snapshot_delete",
                 "snapshot_tags",
@@ -745,9 +785,9 @@ mod tests {
         assert_eq!(taken(&log), Vec::<String>::new());
     }
 
-    /// ZFS 풀은 아직 쓸 수 없다(다른 저장소로 보내지 않는다).
+    /// ZFS 저장소가 없으면 zfs 풀은 쓸 수 없다(다른 저장소로 보내지 않는다).
     #[tokio::test]
-    async fn zfs_pool_is_unsupported_for_now() {
+    async fn zfs_pool_without_backend_is_unsupported() {
         let log = Log::default();
         let storages = Storages::new(
             "qemu-img",
@@ -863,6 +903,48 @@ mod tests {
                 &dst_path,
             ]
         );
+    }
+
+    /// LVM과 ZFS는 다른 백엔드다(원본을 읽어 대상에 새로 써 넣는다).
+    #[tokio::test]
+    async fn copy_between_lvm_and_zfs_converts_into_new_volume() {
+        let tools = tempfile::tempdir().unwrap();
+        let log = Log::default();
+        let storages = Storages::new(
+            fake_qemu_img(tools.path(), false),
+            Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
+        )
+        .with_lvm_thin(Arc::new(Recorder::new("lvm", "/dev/vg0".as_ref(), &log)))
+        .with_zfs(Arc::new(Recorder::new(
+            "zfs",
+            "/dev/zvol/tank/opl".as_ref(),
+            &log,
+        )));
+        let (src, dst, raw) = (Uuid::now_v7(), Uuid::now_v7(), ImageFormat::Raw);
+        storages
+            .copy_volume(
+                &lvm_pool(),
+                src,
+                raw,
+                Some("t"),
+                false,
+                &zfs_pool(),
+                dst,
+                raw,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            taken(&log),
+            [
+                "lvm.volume_source",
+                "zfs.create_volume",
+                "lvm.release_source",
+            ]
+        );
+        let args = std::fs::read_to_string(tools.path().join("args")).unwrap();
+        let dst_path = format!("/dev/zvol/tank/opl/{dst}");
+        assert_eq!(args.lines().last(), Some(dst_path.as_str()));
     }
 
     /// 써 넣다 실패하면 만든 볼륨을 지우고, 원본은 어느 경우에도 내놓는다.
