@@ -791,8 +791,8 @@ async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 }
 
 /// 볼륨 크기를 늘린다(설계 §5). 실행 중인 VM이 쓰면 그 QEMU로(`block_resize`, 게스트가 바로
-/// 본다. 블록 볼륨(LVM-thin, ZFS)은 스토리지로 먼저 늘린다), 아니면 스토리지로 늘린 뒤 실제 크기를 스펙에
-/// 기록한다. API가 확인한 뒤 VM이 켜지거나 꺼졌을 수 있고 앞의 Task가 크기를 바꿨을 수 있어 여기서
+/// 본다. 블록 볼륨(LVM-thin, ZFS, RBD)은 스토리지로 먼저 늘린다), 아니면 스토리지로 늘린 뒤 실제 크기를
+/// 스펙에 기록한다. API가 확인한 뒤 VM이 켜지거나 꺼졌을 수 있고 앞의 Task가 크기를 바꿨을 수 있어 여기서
 /// 다시 본다.
 async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), String> {
     let (volume, pool) = volume_and_pool(ctx, id)?;

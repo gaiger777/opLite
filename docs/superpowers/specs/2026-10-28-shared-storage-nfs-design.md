@@ -12,7 +12,10 @@
 | **15 (이 문서)** | 백엔드 구조, `shared`의 뜻 바로잡기, 노드별 풀 상태·용량, **NFS** 풀 | 백엔드별 풀 경로, 노드가 알리는 풀 상태 |
 | 16 | 블록 백엔드 바탕과 **LVM-thin** | 디스크 소스 추상화(`host_device`), 백엔드 스냅샷, 메모리 스냅샷의 vmstate 위치 |
 | 17 | **ZFS**(zvol) | 16의 블록 바탕 |
-| 18 | **iSCSI**, **Ceph RBD** | QEMU 네트워크 블록 드라이버(`iscsi`, `rbd`) |
+| 18 | **Ceph RBD** | QEMU 네트워크 블록 드라이버(`rbd`), 네트워크 디스크 소스(`RuntimeDisk.rbd`) |
+| 19 | **iSCSI** | 18의 네트워크 디스크 소스(`iscsi`) 또는 공유 LUN 위의 블록 바탕 |
+
+구현: 처음에는 계획 18이 iSCSI와 Ceph RBD를 함께 했으나, 성격이 달라(RBD는 이미지·스냅샷을 API로 다루고 iSCSI는 관리자가 만든 LUN을 쓴다) 계획 18은 Ceph RBD만 하고 iSCSI는 계획 19로 미뤘다(`2026-10-29-shared-storage-ceph-rbd-design.md` §1).
 
 하위 프로젝트 4(라이브 마이그레이션)는 그 뒤다. UEFI 변수를 공유 스토리지로 옮기는 일도 거기서 다룬다.
 
