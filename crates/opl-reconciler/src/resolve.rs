@@ -68,7 +68,7 @@ pub async fn runtime_spec(
         if !pool_listed_on(&pool, node) {
             return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
         }
-        // opld는 Linux에서만 NFS 풀을 마운트하고 LVM·ZFS를 쓴다.
+        // opld는 Linux에서만 NFS 풀을 마운트하고 LVM·ZFS·RBD를 쓴다(Homebrew QEMU에는 rbd가 없다).
         if !cfg!(target_os = "linux") {
             match pool.spec.backend {
                 PoolBackend::Nfs { .. } => {
@@ -86,7 +86,13 @@ pub async fn runtime_spec(
                         "zfs pools are not supported on macOS",
                     ));
                 }
-                PoolBackend::Dir { .. } | PoolBackend::Rbd { .. } => {}
+                PoolBackend::Rbd { .. } => {
+                    return Err(ResolveError::PoolUnsupported(
+                        pool_name.clone(),
+                        "rbd pools are not supported on macOS",
+                    ));
+                }
+                PoolBackend::Dir { .. } => {}
             }
         }
         if let Some(me) = &me

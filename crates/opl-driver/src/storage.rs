@@ -18,7 +18,10 @@ mod storages;
 mod zfs;
 
 pub use lvm::{LvInfo, LvmOps, LvmThinStorage, SystemLvm, parse_lvs};
-pub use rbd::{RbdOps, RbdSnapshot, RbdSpace, RbdStorage, SystemRbd};
+pub use rbd::{
+    DEFAULT_USER as RBD_DEFAULT_USER, RbdOps, RbdSnapshot, RbdSpace, RbdStorage, SystemRbd,
+    parse_ceph_df,
+};
 pub use storages::Storages;
 pub use zfs::{
     SystemZfs, ZfsDataset, ZfsOps, ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo, parse_zfs_dataset,

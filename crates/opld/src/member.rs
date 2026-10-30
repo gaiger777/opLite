@@ -242,6 +242,8 @@ impl Member {
             let (cluster, peers) = (cluster.clone(), peers.clone());
             tokio::spawn(async move { promote_until_voter(&cluster, &peers).await })
         };
+        // 풀 마운터가 QEMU의 rbd 블록 드라이버를 확인한다.
+        let qemu_binary = host.profile.qemu_binary.clone();
         let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
             tokio::spawn(async move {
@@ -275,7 +277,12 @@ impl Member {
         let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
-        let pools = PoolMounter::spawn(cluster.clone(), mount_root.clone(), config.pools.refresh());
+        let pools = PoolMounter::spawn(
+            cluster.clone(),
+            mount_root.clone(),
+            qemu_binary,
+            config.pools.refresh(),
+        );
         // Task 실행기는 시작할 때 이 노드가 남긴 고아를 지운다. 그것이 끝난 뒤에 API를 연다.
         let mut runner_config = TaskRunnerConfig::new(node);
         runner_config.upload_dir = Some(config.data_dir.join("uploads"));

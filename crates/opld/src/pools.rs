@@ -1,11 +1,13 @@
 //! 노드별 풀 상태. 이 노드가 쓸 수 있는 풀마다 준비 여부와 용량을 `NodeStatus.pools`에 적는다.
 //! NFS 풀은 `{data_dir}/pools/{풀 id}`에 마운트하고, 이 노드가 쓸 수 없게 된 NFS 풀은 언마운트한다.
-//! LVM-thin 풀은 `lvs`로 thin pool을, ZFS 풀은 `zfs get`으로 데이터셋을 확인한다.
+//! LVM-thin 풀은 `lvs`로 thin pool을, ZFS 풀은 `zfs get`으로 데이터셋을, RBD 풀은 `rbd ls`와
+//! `ceph df`로 Ceph 풀을(그 전에 QEMU의 rbd 블록 드라이버를) 확인한다.
 //! opld가 내려가도 마운트는 그대로 둔다.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +15,7 @@ use async_trait::async_trait;
 use opl_cluster::types::{NodeId, Rejection};
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::{Capacity, LvInfo, ZfsDataset};
+use opl_driver::{Capacity, LvInfo, RbdSpace, ZfsDataset};
 use opl_types::node::{NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Kind;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, VolumeSpec};
@@ -25,14 +27,16 @@ use uuid::Uuid;
 
 /// `mount`·`umount`를 기다리는 시간
 pub const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
-/// 쓰기 확인과 용량 읽기(LVM-thin은 `lvs`, ZFS는 `zfs get`)를 기다리는 시간. NFS 서버가 멈추면 이 작업이 멈춘다.
+/// 쓰기 확인과 용량 읽기(LVM-thin은 `lvs`, ZFS는 `zfs get`, RBD는 `rbd ls`와 `ceph df`)를 기다리는 시간. NFS 서버가 멈추면 이 작업이 멈춘다.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const NFS_UNSUPPORTED: &str = "nfs pools are not supported on macOS";
 const LVM_UNSUPPORTED: &str = "lvm-thin pools are not supported on macOS";
 const ZFS_UNSUPPORTED: &str = "zfs pools are not supported on macOS";
-const RBD_UNSUPPORTED: &str = "rbd pools are not supported yet";
+const RBD_UNSUPPORTED: &str = "rbd pools are not supported on macOS";
+const QEMU_NO_RBD: &str = "qemu has no rbd block driver";
 const LVS_TIMED_OUT: &str = "lvs timed out";
 const ZFS_TIMED_OUT: &str = "zfs timed out";
+const RBD_TIMED_OUT: &str = "rbd timed out";
 const NFS_NOT_RESPONDING: &str = "nfs server not responding";
 const DIR_NOT_RESPONDING: &str = "pool directory not responding";
 const MOUNT_IN_PROGRESS: &str = "mount in progress";
@@ -57,10 +61,24 @@ pub trait MountOps: Send + Sync + 'static {
     async fn lvm_pool(&self, vg: &str, thinpool: &str) -> Result<LvInfo, String>;
     /// `zfs get`으로 읽은 데이터셋 `dataset`. 실패하면 stderr.
     async fn zfs_dataset(&self, dataset: &str) -> Result<ZfsDataset, String>;
+    /// Ceph 풀 `pool`(네임스페이스 `namespace`)에 `rbd ls`로 접근해 보고 `ceph df`로 읽은 공간.
+    /// 클라이언트 id `user`, ceph.conf `conf`로 접속한다. 실패하면 stderr.
+    async fn rbd_pool(
+        &self,
+        pool: &str,
+        namespace: Option<&str>,
+        user: &str,
+        conf: Option<&str>,
+    ) -> Result<RbdSpace, String>;
+    /// QEMU에 rbd 블록 드라이버가 있는지. 없으면 그 이유.
+    async fn qemu_rbd(&self) -> Result<(), String>;
 }
 
 /// 실제 명령과 파일시스템
-pub struct SystemMount;
+pub struct SystemMount {
+    /// VM을 실행하는 QEMU(rbd 블록 드라이버를 확인한다)
+    pub qemu_binary: PathBuf,
+}
 
 #[async_trait]
 impl MountOps for SystemMount {
@@ -124,6 +142,87 @@ impl MountOps for SystemMount {
         }
         opl_driver::parse_zfs_dataset(&out.stdout).map_err(|e| e.to_string())
     }
+
+    async fn rbd_pool(
+        &self,
+        pool: &str,
+        namespace: Option<&str>,
+        user: &str,
+        conf: Option<&str>,
+    ) -> Result<RbdSpace, String> {
+        let mut ls = vec!["ls", "--format", "json", "--pool", pool];
+        if let Some(ns) = namespace {
+            ls.extend(["--namespace", ns]);
+        }
+        ceph("rbd", user, conf, &ls).await?;
+        let df = ceph("ceph", user, conf, &["df", "detail", "--format", "json"]).await?;
+        opl_driver::parse_ceph_df(&df, pool).map_err(|e| e.to_string())
+    }
+
+    /// 빠진 인자(풀)로 rbd 드라이브를 열어 본다. 드라이버가 있으면 인자 오류로, 없으면(Homebrew
+    /// QEMU, Ubuntu에서 `qemu-block-extra`가 없음) `Unknown driver 'rbd'`로 곧바로 끝난다
+    /// ([`qemu_rbd_result`]). `-blockdev`는 드라이버를 찾기 전에 인자를 검사하므로 `-drive`를 쓴다.
+    async fn qemu_rbd(&self) -> Result<(), String> {
+        let out = tokio::process::Command::new(&self.qemu_binary)
+            .args(["-M", "none", "-nodefaults", "-display", "none", "-S"])
+            .args(["-drive", RBD_PROBE_DRIVE])
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| format!("cannot run {}: {e}", self.qemu_binary.display()))?;
+        qemu_rbd_result(&String::from_utf8_lossy(&out.stderr))
+    }
+}
+
+/// QEMU rbd 드라이버 확인에 여는 드라이브(풀·이미지가 빠졌다)
+const RBD_PROBE_DRIVE: &str = "driver=rbd,if=none";
+
+/// QEMU rbd 드라이버 확인의 stderr를 읽는다. `Unknown driver 'rbd'`면 드라이버가 없다. rbd 드라이버가
+/// 빠진 인자를 알렸으면(QEMU 8.2: `Parameter 'pool' is missing`) 있다. 그 밖의 결과는 확인하지 못한
+/// 것이다(있다고 기억하지 않으므로 다음 새로 고침에서 다시 확인한다). 오류 줄 앞에 QEMU가 되풀이하는
+/// 드라이브 인자(`driver=rbd,...`)는 빼고 본다.
+fn qemu_rbd_result(stderr: &str) -> Result<(), String> {
+    if stderr.contains("Unknown driver 'rbd'") {
+        return Err(QEMU_NO_RBD.into());
+    }
+    let reason = stderr.replace(RBD_PROBE_DRIVE, "");
+    if reason.contains("pool") || reason.contains("image") {
+        return Ok(());
+    }
+    let line = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no error from qemu");
+    Err(format!("cannot check the qemu rbd block driver: {line}"))
+}
+
+/// Ceph 명령 `program --id user [--conf conf] args`를 실행해 stdout을 돌려준다. 실패하면 stderr.
+async fn ceph(
+    program: &str,
+    user: &str,
+    conf: Option<&str>,
+    args: &[&str],
+) -> Result<Vec<u8>, String> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(["--id", user]);
+    if let Some(conf) = conf {
+        cmd.args(["--conf", conf]);
+    }
+    let out = cmd
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("cannot run {program}: {e}"))?;
+    if !out.status.success() {
+        return Err(failure(program, &out));
+    }
+    Ok(out.stdout)
 }
 
 /// 명령을 실행한다. 시간 제한으로 버려지면 프로세스를 죽인다.
@@ -185,8 +284,13 @@ pub struct PoolMounter {
 }
 
 impl PoolMounter {
-    pub fn spawn(cluster: Arc<Cluster>, mount_root: PathBuf, refresh: Duration) -> Self {
-        let pools = Pools::new(cluster, mount_root, Arc::new(SystemMount));
+    pub fn spawn(
+        cluster: Arc<Cluster>,
+        mount_root: PathBuf,
+        qemu_binary: PathBuf,
+        refresh: Duration,
+    ) -> Self {
+        let pools = Pools::new(cluster, mount_root, Arc::new(SystemMount { qemu_binary }));
         let (shutdown, rx) = oneshot::channel();
         Self {
             shutdown,
@@ -273,6 +377,10 @@ struct Pools {
     lvm_supported: bool,
     /// 이 OS가 ZFS를 지원하는지(Linux)
     zfs_supported: bool,
+    /// 이 OS가 RBD를 지원하는지(Linux)
+    rbd_supported: bool,
+    /// QEMU에 rbd 블록 드라이버가 있음을 확인했는지. 확인한 뒤에는 다시 확인하지 않는다.
+    qemu_rbd: Arc<AtomicBool>,
     mount_timeout: Duration,
     check_timeout: Duration,
     /// 시간 안에 끝나지 않은 확인 작업(풀 id별). 끝날 때까지 그 풀은 건너뛴다.
@@ -314,6 +422,13 @@ enum Step {
     Lvm(String, String),
     /// ZFS 데이터셋을 `zfs get`으로 확인한다.
     Zfs(String),
+    /// Ceph 풀(네임스페이스)을 `rbd ls`와 `ceph df`로 확인한다. 사용자는 기본값을 채웠다.
+    Rbd {
+        pool: String,
+        namespace: Option<String>,
+        user: String,
+        conf: Option<String>,
+    },
 }
 
 /// 마운트에 실패한 뒤 다음 시도까지 기다리는 시간: 15초부터 실패할 때마다 두 배, 최대 5분
@@ -332,6 +447,8 @@ impl Pools {
             nfs_supported: cfg!(target_os = "linux"),
             lvm_supported: cfg!(target_os = "linux"),
             zfs_supported: cfg!(target_os = "linux"),
+            rbd_supported: cfg!(target_os = "linux"),
+            qemu_rbd: Arc::default(),
             mount_timeout: MOUNT_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
             stuck: HashMap::new(),
@@ -382,6 +499,15 @@ impl Pools {
                 }
                 Step::Zfs(dataset) => {
                     block_checks.push((*pool, self.spawn_zfs_check(pool.id, dataset)));
+                }
+                Step::Rbd {
+                    pool: ceph_pool,
+                    namespace,
+                    user,
+                    conf,
+                } => {
+                    let task = self.spawn_rbd_check(pool.id, ceph_pool, namespace, user, conf);
+                    block_checks.push((*pool, task));
                 }
             }
         }
@@ -445,8 +571,23 @@ impl Pools {
                 }
                 return Step::Zfs(dataset.clone());
             }
-            PoolBackend::Rbd { .. } => {
-                return Step::State(not_ready(pool.id, RBD_UNSUPPORTED.into()));
+            PoolBackend::Rbd {
+                pool: ceph_pool,
+                namespace,
+                user,
+                conf,
+            } => {
+                if !self.rbd_supported {
+                    return Step::State(not_ready(pool.id, RBD_UNSUPPORTED.into()));
+                }
+                return Step::Rbd {
+                    pool: ceph_pool.clone(),
+                    namespace: namespace.clone(),
+                    user: user
+                        .clone()
+                        .unwrap_or_else(|| opl_driver::RBD_DEFAULT_USER.into()),
+                    conf: conf.clone(),
+                };
             }
             PoolBackend::Nfs {
                 server,
@@ -551,6 +692,42 @@ impl Pools {
                 ),
                 Ok(Err(e)) => not_ready(id, e),
                 Err(_) => not_ready(id, ZFS_TIMED_OUT.into()),
+            }
+        })
+    }
+
+    /// QEMU의 rbd 블록 드라이버(아직 확인하지 않았으면)와 Ceph 풀을 확인하는 작업을 시작한다. 접근할
+    /// 수 있으면 준비됐고, 용량은 `max_avail`+`stored`와 `max_avail`이다. 시간 제한이 지나면 명령을
+    /// 죽인다.
+    fn spawn_rbd_check(
+        &self,
+        id: Uuid,
+        pool: String,
+        namespace: Option<String>,
+        user: String,
+        conf: Option<String>,
+    ) -> JoinHandle<PoolState> {
+        let (ops, timeout, qemu_rbd) =
+            (self.ops.clone(), self.check_timeout, self.qemu_rbd.clone());
+        tokio::spawn(async move {
+            let check = async {
+                if !qemu_rbd.load(Ordering::SeqCst) {
+                    ops.qemu_rbd().await?;
+                    qemu_rbd.store(true, Ordering::SeqCst);
+                }
+                ops.rbd_pool(&pool, namespace.as_deref(), &user, conf.as_deref())
+                    .await
+            };
+            match tokio::time::timeout(timeout, check).await {
+                Ok(Ok(space)) => PoolState {
+                    pool_id: id,
+                    ready: true,
+                    error: None,
+                    total_bytes: space.available_bytes.saturating_add(space.stored_bytes),
+                    available_bytes: space.available_bytes,
+                },
+                Ok(Err(e)) => not_ready(id, e),
+                Err(_) => not_ready(id, RBD_TIMED_OUT.into()),
             }
         })
     }
@@ -776,7 +953,7 @@ fn not_ready(pool: Uuid, error: String) -> PoolState {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     use opl_driver::ZfsSpace;
     use opl_types::resource::Resource;
@@ -838,6 +1015,12 @@ mod tests {
         datasets: Mutex<BTreeMap<String, ZfsDataset>>,
         /// 참이면 `zfs`가 풀릴 때까지 멈춘다.
         hang_zfs: AtomicBool,
+        /// `{pool}[/{namespace}]`별 Ceph 풀 공간
+        rbd: Mutex<BTreeMap<String, RbdSpace>>,
+        /// 참이면 `rbd`가 풀릴 때까지 멈춘다.
+        hang_rbd: AtomicBool,
+        /// 참이면 QEMU에 rbd 블록 드라이버가 없다.
+        no_qemu_rbd: AtomicBool,
     }
 
     impl FakeMount {
@@ -920,6 +1103,35 @@ mod tests {
                 .ok_or_else(|| format!("cannot open '{dataset}': dataset does not exist"))
         }
 
+        async fn rbd_pool(
+            &self,
+            pool: &str,
+            namespace: Option<&str>,
+            user: &str,
+            conf: Option<&str>,
+        ) -> Result<RbdSpace, String> {
+            let spec = namespace.map_or_else(|| pool.to_string(), |ns| format!("{pool}/{ns}"));
+            let conf = conf.map(|c| format!(" --conf {c}")).unwrap_or_default();
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("rbd ls {spec} --id {user}{conf}"));
+            while self.hang_rbd.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.rbd.lock().unwrap().get(&spec).copied().ok_or_else(|| {
+                format!("rbd: error opening pool '{pool}': (2) No such file or directory")
+            })
+        }
+
+        async fn qemu_rbd(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("qemu rbd".into());
+            if self.no_qemu_rbd.load(Ordering::SeqCst) {
+                return Err(QEMU_NO_RBD.into());
+            }
+            Ok(())
+        }
+
         fn check(&self, dir: &Path, probe: &str) -> std::io::Result<Capacity> {
             *self.checks.lock().unwrap() += 1;
             while self.hang.load(Ordering::SeqCst) {
@@ -968,6 +1180,7 @@ mod tests {
         pools.nfs_supported = true;
         pools.lvm_supported = true;
         pools.zfs_supported = true;
+        pools.rbd_supported = true;
         pools.check_timeout = Duration::from_millis(200);
         Setup {
             _dir: dir,
@@ -1300,22 +1513,163 @@ mod tests {
         s.cluster.shutdown().await.unwrap();
     }
 
-    /// RBD 풀은 아직 확인하지 않고 준비되지 않았다고 적는다.
+    fn rbd(
+        pool: &str,
+        namespace: Option<&str>,
+        user: Option<&str>,
+        conf: Option<&str>,
+    ) -> PoolBackend {
+        PoolBackend::Rbd {
+            pool: pool.into(),
+            namespace: namespace.map(Into::into),
+            user: user.map(Into::into),
+            conf: conf.map(Into::into),
+        }
+    }
+
+    fn space(available_bytes: u64, stored_bytes: u64) -> RbdSpace {
+        RbdSpace {
+            available_bytes,
+            stored_bytes,
+        }
+    }
+
+    /// RBD 풀은 `rbd ls`로 풀(네임스페이스)에 접근할 수 있으면 준비됐고, 용량은 `ceph df`의
+    /// `max_avail`+`stored`와 `max_avail`이다. 사용자가 없으면 `admin`으로 접속한다. 접근할 수
+    /// 없으면 이유와 함께 준비되지 않았다. 마운트하지 않는다.
     #[tokio::test]
-    async fn rbd_pools_are_not_ready_yet() {
+    async fn records_rbd_pool_states() {
         let mut s = setup().await;
-        let backend = PoolBackend::Rbd {
-            pool: "rbd".into(),
-            namespace: None,
-            user: None,
-            conf: None,
+        {
+            let mut rbd = s.fake.rbd.lock().unwrap();
+            rbd.insert("rbd".into(), space(40 * GIB, 60 * GIB));
+            rbd.insert("rbd/opl".into(), space(40 * GIB, 60 * GIB));
+            rbd.insert("huge".into(), space(u64::MAX, GIB));
+        }
+        let r = s.pool("r", rbd("rbd", None, None, None), vec![]).await;
+        let ns = rbd("rbd", Some("opl"), Some("opl"), Some("/etc/ceph/opl.conf"));
+        let ns = s.pool("ns", ns, vec![]).await;
+        let huge = s.pool("huge", rbd("huge", None, None, None), vec![]).await;
+        let gone = s.pool("gone", rbd("gone", None, None, None), vec![]).await;
+
+        s.pools.settle().await;
+        let states = s.states();
+        assert_eq!(states["r"], ready(&r));
+        assert_eq!(states["ns"], ready(&ns));
+        // 합이 넘치면 가장 큰 값이다.
+        assert_eq!(
+            states["huge"],
+            PoolState {
+                total_bytes: u64::MAX,
+                available_bytes: u64::MAX,
+                ..ready(&huge)
+            }
+        );
+        assert_eq!(
+            states["gone"],
+            not_ready(
+                gone.id,
+                "rbd: error opening pool 'gone': (2) No such file or directory".into()
+            )
+        );
+        let mut calls = s.fake.calls();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(
+            calls,
+            [
+                "qemu rbd",
+                "rbd ls gone --id admin",
+                "rbd ls huge --id admin",
+                "rbd ls rbd --id admin",
+                "rbd ls rbd/opl --id opl --conf /etc/ceph/opl.conf",
+            ]
+        );
+        // QEMU의 rbd 드라이버는 한 번 확인하면 다시 확인하지 않는다.
+        s.pools.tick().await.unwrap();
+        assert!(!s.fake.calls().contains(&"qemu rbd".to_string()));
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// QEMU에 rbd 블록 드라이버가 없으면 RBD 풀은 그 이유로 준비되지 않았고 `rbd`를 부르지 않는다.
+    /// 드라이버를 설치하면 다음 새로 고침에서 준비된다.
+    #[tokio::test]
+    async fn rbd_pools_need_the_qemu_rbd_driver() {
+        let mut s = setup().await;
+        s.fake
+            .rbd
+            .lock()
+            .unwrap()
+            .insert("rbd".into(), space(40 * GIB, 60 * GIB));
+        s.fake.no_qemu_rbd.store(true, Ordering::SeqCst);
+        let r = s.pool("r", rbd("rbd", None, None, None), vec![]).await;
+        s.pools.tick().await.unwrap();
+        assert_eq!(s.fake.calls(), ["qemu rbd"]);
+        assert_eq!(s.states()["r"], not_ready(r.id, QEMU_NO_RBD.into()));
+
+        s.fake.no_qemu_rbd.store(false, Ordering::SeqCst);
+        s.pools.tick().await.unwrap();
+        assert_eq!(s.fake.calls(), ["qemu rbd", "rbd ls rbd --id admin"]);
+        assert_eq!(s.states()["r"], ready(&r));
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// QEMU rbd 드라이브 확인: 모르는 드라이버면 없음, rbd 드라이버의 인자 오류면 있음, 그 밖은
+    /// 확인하지 못한 것이다.
+    #[test]
+    fn classifies_the_qemu_rbd_probe() {
+        let drive = "qemu-system-x86_64: -drive driver=rbd,if=none:";
+        assert_eq!(
+            qemu_rbd_result(&format!("{drive} Unknown driver 'rbd'\n")),
+            Err(QEMU_NO_RBD.to_string())
+        );
+        for missing in [
+            "Parameter 'pool' is missing",
+            "Parameter 'image' is missing",
+        ] {
+            assert_eq!(qemu_rbd_result(&format!("{drive} {missing}\n")), Ok(()));
+        }
+        for other in [
+            String::new(),
+            "qemu-system-x86_64: cannot allocate memory\n".into(),
+            format!("{drive} Could not open 'x': Permission denied\n"),
+        ] {
+            let err = qemu_rbd_result(&other).unwrap_err();
+            assert!(
+                err.starts_with("cannot check the qemu rbd block driver"),
+                "{err}"
+            );
+        }
+    }
+
+    /// 멈춘 `rbd`는 시간 제한 뒤 준비되지 않았다고 적고, 다른 풀의 기록을 막지 않는다.
+    #[tokio::test]
+    async fn hung_rbd_times_out() {
+        let mut s = setup().await;
+        let local = PoolBackend::Dir {
+            path: s.local.clone(),
         };
-        let r = s.pool("r", backend, vec![]).await;
+        let local = s.pool("local", local, vec![]).await;
+        let r = s.pool("r", rbd("rbd", None, None, None), vec![]).await;
+        s.fake.hang_rbd.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        s.pools.tick().await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(s.states()["local"], ready(&local));
+        assert_eq!(s.states()["r"], not_ready(r.id, RBD_TIMED_OUT.into()));
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rbd_is_not_checked_where_unsupported() {
+        let mut s = setup().await;
+        s.pools.rbd_supported = false;
+        let r = s.pool("r", rbd("rbd", None, None, None), vec![]).await;
         s.pools.tick().await.unwrap();
         assert_eq!(s.fake.calls(), Vec::<String>::new());
         assert_eq!(
             s.states()["r"],
-            not_ready(r.id, "rbd pools are not supported yet".into())
+            not_ready(r.id, "rbd pools are not supported on macOS".into())
         );
         s.cluster.shutdown().await.unwrap();
     }

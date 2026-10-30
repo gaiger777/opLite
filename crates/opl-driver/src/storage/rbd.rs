@@ -21,7 +21,7 @@ use super::{
 use crate::error::DriverError;
 
 /// 풀에 사용자가 없을 때 쓰는 Ceph 클라이언트 id
-const DEFAULT_USER: &str = "admin";
+pub const DEFAULT_USER: &str = "admin";
 
 /// RBD 명령 하나를 기다리는 시간. 지나면 `Timeout`(일시 오류)이다.
 const RBD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -259,7 +259,7 @@ fn parse_snapshots(out: &[u8]) -> Result<Vec<RbdSnapshot>, DriverError> {
 }
 
 /// `ceph df detail --format json`에서 풀 `pool`의 `max_avail`·`stored`(없는 값은 0). 풀이 없으면 오류.
-fn parse_ceph_df(out: &[u8], pool: &str) -> Result<RbdSpace, DriverError> {
+pub fn parse_ceph_df(out: &[u8], pool: &str) -> Result<RbdSpace, DriverError> {
     let v = json(out)?;
     let stats = v
         .get("pools")
