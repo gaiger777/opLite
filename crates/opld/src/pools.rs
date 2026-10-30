@@ -181,14 +181,15 @@ const RBD_PROBE_DRIVE: &str = "driver=rbd,if=none";
 
 /// QEMU rbd 드라이버 확인의 stderr를 읽는다. `Unknown driver 'rbd'`면 드라이버가 없다. rbd 드라이버가
 /// 빠진 인자를 알렸으면(QEMU 8.2: `Parameter 'pool' is missing`) 있다. 그 밖의 결과는 확인하지 못한
-/// 것이다(있다고 기억하지 않으므로 다음 새로 고침에서 다시 확인한다). 오류 줄 앞에 QEMU가 되풀이하는
-/// 드라이브 인자(`driver=rbd,...`)는 빼고 본다.
+/// 것이다(있다고 기억하지 않으므로 다음 새로 고침에서 다시 확인한다).
 fn qemu_rbd_result(stderr: &str) -> Result<(), String> {
     if stderr.contains("Unknown driver 'rbd'") {
         return Err(QEMU_NO_RBD.into());
     }
-    let reason = stderr.replace(RBD_PROBE_DRIVE, "");
-    if reason.contains("pool") || reason.contains("image") {
+    if ["pool", "image"]
+        .iter()
+        .any(|p| stderr.contains(&format!("Parameter '{p}' is missing")))
+    {
         return Ok(());
     }
     let line = stderr
@@ -1633,6 +1634,7 @@ mod tests {
             String::new(),
             "qemu-system-x86_64: cannot allocate memory\n".into(),
             format!("{drive} Could not open 'x': Permission denied\n"),
+            format!("{drive} Could not open image: pool not found\n"),
         ] {
             let err = qemu_rbd_result(&other).unwrap_err();
             assert!(
