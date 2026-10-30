@@ -725,6 +725,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [공유 스토리지 설계 3: ZFS zvol (계획 17)](docs/superpowers/specs/2026-10-29-shared-storage-zfs-design.md)
 - [공유 스토리지 설계 4: Ceph RBD (계획 18)](docs/superpowers/specs/2026-10-29-shared-storage-ceph-rbd-design.md)
 - [공유 스토리지 설계 5: iSCSI와 공유 LVM (계획 19)](docs/superpowers/specs/2026-10-30-shared-storage-iscsi-lvm-design.md)
+- [라이브 마이그레이션 설계 (하위 프로젝트 4: 계획 20·21)](docs/superpowers/specs/2026-10-30-live-migration-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)
@@ -744,3 +745,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 17: 공유 스토리지 3 — ZFS zvol](docs/superpowers/plans/2026-10-29-plan17-shared-storage-zfs.md)
 - [계획 18: 공유 스토리지 4 — Ceph RBD](docs/superpowers/plans/2026-10-29-plan18-shared-storage-ceph-rbd.md)
 - [계획 19: 공유 스토리지 5 — iSCSI와 공유 LVM](docs/superpowers/plans/2026-10-30-plan19-shared-storage-iscsi-lvm.md)
+- [계획 20: 라이브 마이그레이션](docs/superpowers/plans/2026-10-30-plan20-live-migration.md)

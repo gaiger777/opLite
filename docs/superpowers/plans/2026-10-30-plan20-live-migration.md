@@ -22094,3 +22094,20 @@ git commit -m "docs: 라이브 마이그레이션 안내, 설계에 구현하며
 - **마이그레이션 포트 범위(기본 60000–60099)를 노드 사이 방화벽에서 열어야 한다.** macOS 노드는 마이그레이션을 할 수 없다.
 - **계획 20 전에 합류한 노드는 다시 합류해야** Linux(QEMU 8.2)에서 마이그레이션 TLS가 된다.
 - 그 밖의 제한은 설계 문서 §8에 있다.
+
+## 실행 후 기록 (2026-10-31)
+
+9개 Task는 계획대로 적용했고, Task마다 검증된 단계와 트리가 같았다(생성 파일 `schema.d.ts`·`Cargo.lock` 포함). 계획 문서를 만들기 전에 스테이지 작업에서 리뷰를 두 차례 돌려 고쳤다 — 위 Task의 코드에 이미 들어 있다.
+
+- 1차: 진행 중이던 마이그레이션이 opld 재시작·되돌리기 뒤에 끝나 원본이 멈춘 채 남는 경우(`cancel_migration`과 `postmigrate` 원본 재개), API 검사와 Task 사이 경쟁(`Migrating` 기록 뒤 다시 확인, `power`가 Running이 아니면 확정하지 않음, `modify_spec` 다시 확인), 받는 중 표시의 Task id, 공유 LVM 배타 복귀를 메모리에 두지 않음, 받는 QEMU는 `cluster_listen` IP에서, 예전 노드 인증서 경고, 보류 중 이벤트, `oplctl vm migrate`의 24시간 대기, 마이그레이션 중 콘솔 허용.
+- 2차: 1차의 재개 규칙이 확정된 마이그레이션의 옛 원본(`postmigrate`)을 냉각 이동 뒤 되살릴 수 있었다 — 상태 노드가 이 노드이고 Running·Migrating일 때만 재개하고, 그 밖에는 끄고 새로 켠다.
+
+CI 확인용 브랜치에서 찾아 고친 것: QEMU 8.2(GnuTLS)는 키 용도가 critical인 노드 인증서에 keyEncipherment를 요구한다(`sign_node`에 더함, 예전 노드는 다시 합류). 대상 펌웨어가 넘겨받은 직후 UEFI 변수를 더 바꾸므로 시험은 파일 전체가 아니라 원본 표식을 본다.
+
+테스트: macOS `cargo test --workspace` 727개, `opl-api` `storage-it` 251개, `opl-qemu`·`opl-driver` `qemu-it`(실제 TLS 마이그레이션 2개, TCG), `opld` `qemu-it`·`migration-it`(opld 둘, TCG), 브라우저 E2E, 웹 Vitest 307개, `fmt`·`clippy -D warnings`(모든 기능). Linux CI `linux-kvm`(KVM, QEMU 8.2)에서 드라이버 TLS 마이그레이션 2개와 opld 마이그레이션 E2E 4개(공유 디렉터리·NFS·RBD·공유 LVM, 공유 LVM은 `lvchange -aey` 세 시점)가 통과했다. 확인용 브랜치의 마지막 CI는 5개 작업 모두 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 계획 21: 멈춘 채 옮긴 VM의 UEFI 변수 따라가기(`VmStatus.firmware_node`, 노드 사이 변수 전송), 디렉터리 풀의 `shared` 바꾸기(`PATCH /pools/{key}`) — 설계 §5·§6.
+- 공유 LVM 마이그레이션 시험은 한 호스트(잠금 하나)라 진짜 두 호스트 잠금은 확인하지 못했다.
+- CI에서 `opl-api`의 `storage-it` 전체를 돌리는 것을 검토한다.
