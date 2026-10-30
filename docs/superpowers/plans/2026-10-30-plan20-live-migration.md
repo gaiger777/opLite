@@ -22104,7 +22104,7 @@ git commit -m "docs: 라이브 마이그레이션 안내, 설계에 구현하며
 
 CI 확인용 브랜치에서 찾아 고친 것: QEMU 8.2(GnuTLS)는 키 용도가 critical인 노드 인증서에 keyEncipherment를 요구한다(`sign_node`에 더함, 예전 노드는 다시 합류). 대상 펌웨어가 넘겨받은 직후 UEFI 변수를 더 바꾸므로 시험은 파일 전체가 아니라 원본 표식을 본다.
 
-테스트: macOS `cargo test --workspace` 727개, `opl-api` `storage-it` 251개, `opl-qemu`·`opl-driver` `qemu-it`(실제 TLS 마이그레이션 2개, TCG), `opld` `qemu-it`·`migration-it`(opld 둘, TCG), 브라우저 E2E, 웹 Vitest 307개, `fmt`·`clippy -D warnings`(모든 기능). Linux CI `linux-kvm`(KVM, QEMU 8.2)에서 드라이버 TLS 마이그레이션 2개와 opld 마이그레이션 E2E 4개(공유 디렉터리·NFS·RBD·공유 LVM, 공유 LVM은 `lvchange -aey` 세 시점)가 통과했다. 확인용 브랜치의 마지막 CI는 5개 작업 모두 통과했다.
+테스트: macOS `cargo test --workspace` 727개, `opl-api` `storage-it` 251개, `opl-qemu`·`opl-driver` `qemu-it`(실제 TLS 마이그레이션 2개, TCG), `opld` `qemu-it`·`migration-it`(opld 둘, TCG), 브라우저 E2E, 웹 Vitest 307개, `fmt`·`clippy -D warnings`(모든 기능). Linux CI `linux-kvm`(KVM, QEMU 8.2)에서 드라이버 TLS 마이그레이션 2개와 opld 마이그레이션 E2E 4개(공유 디렉터리·NFS·RBD·공유 LVM, 공유 LVM은 `lvchange -aey` 세 시점)가 통과했다. 확인용 브랜치의 마지막 CI는 5개 작업 모두 통과했다. 병합한 main(`08f6f99`)의 CI도 5개 작업이 모두 통과했다.
 
 ## 다음 계획으로 넘길 사항
 
