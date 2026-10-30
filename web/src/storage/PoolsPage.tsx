@@ -30,6 +30,8 @@ import { formatBytes } from "@/lib/format";
 import {
   cephNameError,
   cephUserError,
+  iscsiPortalError,
+  iscsiTargetError,
   lvmNameError,
   nfsExportError,
   nfsOptionsError,
@@ -161,8 +163,7 @@ export function PoolsPage() {
   );
 }
 
-/** 만들 수 있는 풀 종류. 공유 LVM 풀 만들기는 아직 없다. */
-type Kind = Exclude<StoragePool["spec"]["backend"]["kind"], "lvm-shared">;
+type Kind = StoragePool["spec"]["backend"]["kind"];
 
 function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
@@ -181,6 +182,9 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const [namespace, setNamespace] = useState("");
   const [cephUser, setCephUser] = useState("");
   const [cephConf, setCephConf] = useState("");
+  const [iscsi, setIscsi] = useState(false);
+  const [portal, setPortal] = useState("");
+  const [target, setTarget] = useState("");
   const [chosen, setChosen] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -214,6 +218,21 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       const thinpoolError = lvmNameError(thinpool);
       if (thinpoolError) {
         found.thinpool = thinpoolError;
+      }
+    }
+    if (kind === "lvm-shared") {
+      const vgError = lvmNameError(vg);
+      if (vgError) {
+        found.vg = vgError;
+      }
+      // iSCSI를 고르지 않았으면 포털·타깃은 보지 않고 보내지도 않는다.
+      const portalError = iscsi ? iscsiPortalError(portal) : undefined;
+      if (portalError) {
+        found.portal = portalError;
+      }
+      const targetError = iscsi ? iscsiTargetError(target) : undefined;
+      if (targetError) {
+        found.target = targetError;
       }
     }
     if (kind === "zfs") {
@@ -253,7 +272,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
     if (Object.keys(found).length > 0) {
       return false;
     }
-    // NFS·RBD 풀의 `shared`는 보내지 않는다(서버가 늘 공유로 둔다). 빈 옵션은 커널 기본값이다.
+    // NFS·RBD·공유 LVM 풀의 `shared`는 보내지 않는다(서버가 늘 공유로 둔다). 빈 옵션은 커널 기본값이다.
     // LVM-thin·ZFS 풀은 노드 로컬이라 `shared`를 보내지 않는다.
     const sharedDir = kind === "dir" && shared;
     const backend =
@@ -263,20 +282,22 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
           ? { kind, vg, thinpool }
           : kind === "zfs"
             ? { kind, dataset }
-            : kind === "rbd"
-              ? {
-                  kind,
-                  pool: cephPool,
-                  ...(namespace !== "" && { namespace }),
-                  ...(cephUser !== "" && { user: cephUser }),
-                  ...(cephConf !== "" && { conf: cephConf }),
-                }
-              : {
-                  kind,
-                  server: nfsServer,
-                  export: nfsExport,
-                  ...(nfsOptions !== "" && { options: nfsOptions }),
-                };
+            : kind === "lvm-shared"
+              ? { kind, vg, ...(iscsi && { iscsi: { portal, target } }) }
+              : kind === "rbd"
+                ? {
+                    kind,
+                    pool: cephPool,
+                    ...(namespace !== "" && { namespace }),
+                    ...(cephUser !== "" && { user: cephUser }),
+                    ...(cephConf !== "" && { conf: cephConf }),
+                  }
+                : {
+                    kind,
+                    server: nfsServer,
+                    export: nfsExport,
+                    ...(nfsOptions !== "" && { options: nfsOptions }),
+                  };
     const spec = { backend, nodes: known, ...(sharedDir && { shared: true }) };
     await call(api.POST("/storage-pools", { body: { name, spec } }));
     toast.success(t("pools.created", { name }));
@@ -309,6 +330,9 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             <NativeSelectOption value="lvm-thin">{t("pools.kinds.lvm-thin")}</NativeSelectOption>
             <NativeSelectOption value="zfs">{t("pools.kinds.zfs")}</NativeSelectOption>
             <NativeSelectOption value="rbd">{t("pools.kinds.rbd")}</NativeSelectOption>
+            <NativeSelectOption value="lvm-shared">
+              {t("pools.kinds.lvm-shared")}
+            </NativeSelectOption>
           </NativeSelect>
         )}
       </Field>
@@ -336,6 +360,81 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
               />
             )}
           </Field>
+        </>
+      )}
+      {kind === "lvm-shared" && (
+        <>
+          <Field id="pool-vg" label={t("pools.vg")} error={errors.vg}>
+            {(a11y) => (
+              <Input
+                id="pool-vg"
+                placeholder="san"
+                value={vg}
+                onChange={(e) => setVg(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          {/* FC·멀티패스처럼 노드가 이미 LUN을 보면 로그인하지 않는다. */}
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="pool-iscsi"
+                checked={iscsi}
+                onCheckedChange={(v) => {
+                  setIscsi(v === true);
+                  // 바꾸면 포털·타깃의 앞 오류는 맞지 않으므로 지운다.
+                  setErrors((prev) => {
+                    const next = { ...prev };
+                    delete next.portal;
+                    delete next.target;
+                    return next;
+                  });
+                }}
+                aria-describedby="pool-iscsi-hint"
+              />
+              <Label htmlFor="pool-iscsi">{t("pools.iscsi")}</Label>
+            </div>
+            <p id="pool-iscsi-hint" className="text-xs text-muted-foreground">
+              {t("pools.iscsiHint")}
+            </p>
+          </div>
+          {iscsi && (
+            <>
+              <Field
+                id="pool-portal"
+                label={t("pools.portal")}
+                error={errors.portal}
+                hint={t("pools.portalHint")}
+              >
+                {(a11y) => (
+                  <Input
+                    id="pool-portal"
+                    placeholder="san.lan:3260"
+                    value={portal}
+                    onChange={(e) => setPortal(e.target.value)}
+                    {...a11y}
+                  />
+                )}
+              </Field>
+              <Field
+                id="pool-target"
+                label={t("pools.target")}
+                error={errors.target}
+                hint={t("pools.targetHint")}
+              >
+                {(a11y) => (
+                  <Input
+                    id="pool-target"
+                    placeholder="iqn.2003-01.org.example:storage"
+                    value={target}
+                    onChange={(e) => setTarget(e.target.value)}
+                    {...a11y}
+                  />
+                )}
+              </Field>
+            </>
+          )}
         </>
       )}
       {kind === "zfs" && (

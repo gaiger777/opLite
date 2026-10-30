@@ -15,6 +15,13 @@ it("lists pools with their nodes, space and volumes", async () => {
       pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } }),
       pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } }),
       pool("ceph", { backend: { kind: "rbd", pool: "rbd", namespace: "opl" } }),
+      pool("san", {
+        backend: {
+          kind: "lvm-shared",
+          vg: "san",
+          iscsi: { portal: "10.0.0.5:3260", target: "iqn.2003-01.org:opl" },
+        },
+      }),
     ],
     node: [
       {
@@ -51,6 +58,9 @@ it("lists pools with their nodes, space and volumes", async () => {
   const ceph = within(table).getByText("ceph").closest("tr")!;
   expect(ceph).toHaveTextContent("Ceph RBD");
   expect(ceph).toHaveTextContent("rbd/opl");
+  const san = within(table).getByText("san").closest("tr")!;
+  expect(san).toHaveTextContent("Shared LVM");
+  expect(san).toHaveTextContent("san @ 10.0.0.5:3260 iqn.2003-01.org:opl");
 });
 
 it("shows each node's pool state and space", async () => {
@@ -440,6 +450,122 @@ it("creates a Ceph RBD pool with a namespace, user and ceph.conf", async () => {
         },
         nodes: [],
       },
+    }),
+  );
+});
+
+it("creates a shared LVM pool", async () => {
+  mockLists({ node: [NODE] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/storage-pools"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("san"), { status: 201 });
+    }),
+  );
+  renderPage(<PoolsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "san");
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "lvm-shared");
+  expect(within(dialog).getByLabelText("Kind")).toHaveAccessibleDescription(
+    "Create the shared volume group (vgcreate --shared) on a LUN every node sees first, and run lvmlockd with sanlock or dlm on each node. Volumes are raw logical volumes that every node of the pool can use, without snapshots. Needs Linux nodes running as root.",
+  );
+  // 늘 공유라 고를 것이 없고, 다른 종류의 입력도 없다.
+  expect(within(dialog).queryByRole("checkbox", { name: "Shared storage" })).toBeNull();
+  expect(within(dialog).queryByLabelText("Thin pool")).toBeNull();
+  // iSCSI는 고를 때만 묻는다.
+  const iscsi = within(dialog).getByRole("checkbox", { name: "Log in to an iSCSI target" });
+  expect(iscsi).toHaveAccessibleDescription(
+    "Each node logs in to the target before using the volume group. Leave unchecked when the nodes already see the LUN, such as over Fibre Channel.",
+  );
+  expect(within(dialog).queryByLabelText("iSCSI portal")).toBeNull();
+  await userEvent.type(within(dialog).getByLabelText("Volume group"), "-san");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByLabelText("Volume group")).toHaveAccessibleDescription(
+    "Use 1 to 127 letters, digits, +, _, . or -, not starting with -, snapshot or pvmove. LVM also reserves . and .. and names containing parts like _tdata or _tmeta.",
+  );
+  expect(body).toBeUndefined();
+
+  // 서버처럼 포털과 타깃을 검사한다.
+  await userEvent.click(iscsi);
+  expect(within(dialog).getByLabelText("iSCSI portal")).toHaveAccessibleDescription(
+    "Host name or IP address with an optional port, such as san.lan:3260 or [fd00::5]:3260.",
+  );
+  expect(within(dialog).getByLabelText("iSCSI target")).toHaveAccessibleDescription(
+    "The target name, such as iqn.2003-01.org.example:storage.",
+  );
+  await userEvent.type(within(dialog).getByLabelText("iSCSI portal"), "fd00::5");
+  await userEvent.type(within(dialog).getByLabelText("iSCSI target"), "IQN.2003-01.org:opl");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByLabelText("iSCSI portal")).toHaveAccessibleDescription(
+    "Enter a host name or IP address with an optional :port (1–65535), without spaces, commas or slashes. Put IPv6 addresses in brackets, such as [fd00::5]:3260.",
+  );
+  expect(within(dialog).getByLabelText("iSCSI target")).toHaveAccessibleDescription(
+    "Use a target name starting with iqn., eui. or naa., at most 223 characters of lowercase letters, digits, ., : or -.",
+  );
+  expect(body).toBeUndefined();
+
+  await userEvent.clear(within(dialog).getByLabelText("Volume group"));
+  await userEvent.type(within(dialog).getByLabelText("Volume group"), "san");
+  await userEvent.clear(within(dialog).getByLabelText("iSCSI portal"));
+  await userEvent.type(within(dialog).getByLabelText("iSCSI portal"), "[[fd00::5]:3260"); // `[[`는 글자 `[`다.
+  await userEvent.clear(within(dialog).getByLabelText("iSCSI target"));
+  await userEvent.type(within(dialog).getByLabelText("iSCSI target"), "iqn.2003-01.org:opl");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await screen.findByText("Created storage pool san.")).toBeInTheDocument();
+  // 공유 여부는 서버가 정한다.
+  expect(body).toEqual({
+    name: "san",
+    spec: {
+      backend: {
+        kind: "lvm-shared",
+        vg: "san",
+        iscsi: { portal: "[fd00::5]:3260", target: "iqn.2003-01.org:opl" },
+      },
+      nodes: [],
+    },
+  });
+});
+
+it("creates a shared LVM pool without iSCSI, ignoring a portal typed before unchecking", async () => {
+  mockLists({ node: [NODE] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/storage-pools"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("san"), { status: 201 });
+    }),
+  );
+  renderPage(<PoolsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "san");
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "lvm-shared");
+  await userEvent.type(within(dialog).getByLabelText("Volume group"), "san");
+  const iscsi = within(dialog).getByRole("checkbox", { name: "Log in to an iSCSI target" });
+  await userEvent.click(iscsi);
+  await userEvent.type(within(dialog).getByLabelText("iSCSI portal"), "bad portal");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByLabelText("iSCSI portal")).toHaveAccessibleDescription(
+    /^Enter a host name/,
+  );
+  expect(body).toBeUndefined();
+  // iSCSI를 바꾸면 포털·타깃의 오류를 지운다(다시 골라도 남지 않는다).
+  await userEvent.click(iscsi);
+  await userEvent.click(iscsi);
+  expect(within(dialog).getByLabelText("iSCSI portal")).toHaveAccessibleDescription(
+    "Host name or IP address with an optional port, such as san.lan:3260 or [fd00::5]:3260.",
+  );
+  expect(within(dialog).getByLabelText("iSCSI target")).toHaveAccessibleDescription(
+    "The target name, such as iqn.2003-01.org.example:storage.",
+  );
+  await userEvent.click(iscsi);
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  await vi.waitFor(() =>
+    expect(body).toEqual({
+      name: "san",
+      spec: { backend: { kind: "lvm-shared", vg: "san" }, nodes: [] },
     }),
   );
 });

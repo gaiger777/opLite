@@ -248,6 +248,29 @@ it("says why a VM mixing snapshot methods cannot take snapshots", async () => {
   expect(screen.queryByRole("button", { name: "Take snapshot" })).not.toBeInTheDocument();
 });
 
+it("says why a VM with disks in shared LVM pools cannot take snapshots", async () => {
+  const shared = volume("web-root", "san");
+  const scheduled = {
+    ...web,
+    spec: { ...web.spec, snapshot_schedule: { every: "daily" as const, keep: 7, memory: true } },
+  };
+  mockLists({
+    vm: [scheduled],
+    node: [NODE],
+    volume: [{ ...shared, spec: { ...shared.spec, format: "raw" } }],
+    "storage-pool": [pool("san", { backend: { kind: "lvm-shared", vg: "san" } })],
+  });
+  open(scheduled);
+  // raw여도 공유 LVM 풀에는 스냅샷이 없다(서버가 409).
+  expect(
+    await screen.findByText("Disks in shared LVM pools cannot be snapshotted. web-root is in one."),
+  ).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Take snapshot" })).not.toBeInTheDocument();
+  // 예약 요약은 메모리를 말하지 않는다.
+  expect(screen.getByText("Snapshot schedule: Daily, keep 7")).toBeInTheDocument();
+  expect(screen.queryByText(/with memory/)).not.toBeInTheDocument();
+});
+
 it("says why a VM with disks in ZFS pools cannot revert to older snapshots", async () => {
   const tank = pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } });
   const zvol = volume("web-root", "tank");

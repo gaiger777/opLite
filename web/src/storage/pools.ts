@@ -119,6 +119,54 @@ export function rbdConfError(conf: string): string | undefined {
     : undefined;
 }
 
+/** 포트(`:` 없이)가 서버처럼 숫자만으로 된 1–65535인지 */
+function validPort(port: string): boolean {
+  return /^[0-9]+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
+}
+
+/** 대괄호 없는 IPv6 주소인지(서버의 `Ipv6Addr`처럼 브라우저의 URL 파서로 읽어 본다) */
+function validIpv6(addr: string): boolean {
+  if (!/^[0-9A-Fa-f:.]+$/.test(addr)) return false;
+  try {
+    new URL(`http://[${addr}]/`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * iSCSI 포털 입력 오류(번역 키). 서버처럼 `호스트[:포트]` 또는 `[IPv6][:포트]`이고 포트는 1–65535다.
+ * 호스트는 `-`로 시작하지 않고 공백·`:`·`,`·`/`·`[`·`]` 없는 ASCII다.
+ */
+export function iscsiPortalError(portal: string): string | undefined {
+  let hostOk: boolean;
+  let port: string;
+  if (portal.startsWith("[")) {
+    const end = portal.indexOf("]");
+    const addr = end < 0 ? "" : portal.slice(1, end);
+    hostOk = end >= 0 && validIpv6(addr);
+    port = end < 0 ? "" : portal.slice(end + 1);
+  } else {
+    const colon = portal.indexOf(":");
+    const host = colon < 0 ? portal : portal.slice(0, colon);
+    hostOk = host !== "" && !host.startsWith("-") && /^[!-~]+$/.test(host) && !/[,/[\]]/.test(host);
+    port = colon < 0 ? "" : portal.slice(colon);
+  }
+  const portOk = port === "" || (port.startsWith(":") && validPort(port.slice(1)));
+  return hostOk && portOk ? undefined : "pools.errors.portal";
+}
+
+/**
+ * iSCSI 타깃 이름 입력 오류(번역 키). 서버처럼 `iqn.`·`eui.`·`naa.`로 시작하고 소문자·숫자·`.`·`:`·`-`로만
+ * 된 223자 이하여야 한다.
+ */
+export function iscsiTargetError(target: string): string | undefined {
+  return target.length <= 223 && /^(iqn|eui|naa)\.[a-z0-9.:-]+$/.test(target)
+    ? undefined
+    : "pools.errors.target";
+}
+
 /** 디스크 스냅샷을 블록 스냅샷으로 두는 풀(LVM-thin, ZFS, RBD)의 종류. 아니면(파일 풀, 모름) `undefined`. */
 export function blockSnapshotKind(
   pool: StoragePool | undefined,
@@ -129,11 +177,13 @@ export function blockSnapshotKind(
 
 /**
  * 풀에 둘 수 있는 볼륨 형식. 첫 값이 기본값이고 스냅샷을 담는 형식이다(서버의
- * `pool_kind_supports_snapshots`). 블록 풀(LVM-thin, ZFS, RBD)은 raw만 둔다. 풀을 모르면 파일 풀처럼
- * 본다.
+ * `pool_kind_supports_snapshots`). 블록 풀(LVM-thin, ZFS, RBD, 공유 LVM)은 raw만 둔다(공유 LVM 풀은
+ * 스냅샷이 없다). 풀을 모르면 파일 풀처럼 본다.
  */
 export function poolFormats(pool: StoragePool | undefined): [ImageFormat, ...ImageFormat[]] {
-  return blockSnapshotKind(pool) ? ["raw"] : ["qcow2", "raw"];
+  return blockSnapshotKind(pool) || pool?.spec.backend.kind === "lvm-shared"
+    ? ["raw"]
+    : ["qcow2", "raw"];
 }
 
 /** 서버의 `char::is_control`처럼 C0·C1 제어 문자와 DEL */

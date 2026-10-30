@@ -401,6 +401,32 @@ it("does not ask about memory for scheduled snapshots of disks in LVM-thin pools
   expect(bodies[0]!.spec.snapshot_schedule).toEqual({ every: "daily", keep: 3, memory: true });
 });
 
+it("warns that disks in shared LVM pools cannot be snapshotted on a schedule", async () => {
+  const web = vm("web", "stopped", {
+    spec: {
+      ...vm("web", "stopped").spec,
+      disks: [{ volume: "web-root", bus: "virtio-blk", boot_order: 1 }],
+    },
+  });
+  const root = volume("web-root", "san");
+  root.spec.format = "raw";
+  mockLists({
+    vm: [web],
+    node: [NODE],
+    volume: [root],
+    "storage-pool": [pool("san", { backend: { kind: "lvm-shared", vg: "san" } })],
+  });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  await user.selectOptions(await screen.findByLabelText("Take snapshots"), "daily");
+  expect(
+    screen.getByText("web-root is in a shared LVM pool, so scheduled snapshots will fail."),
+  ).toBeVisible();
+  // 스냅샷이 없으므로 메모리도 묻지 않는다.
+  expect(screen.queryByLabelText("Include memory")).not.toBeInTheDocument();
+  expect(screen.queryByText(/saved without memory/)).not.toBeInTheDocument();
+});
+
 it("makes new volumes in LVM-thin pools raw and warns about mixed snapshot methods", async () => {
   mockLists({
     node: [NODE],

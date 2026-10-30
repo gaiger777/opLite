@@ -1,6 +1,8 @@
 import {
   cephNameError,
   cephUserError,
+  iscsiPortalError,
+  iscsiTargetError,
   lvmNameError,
   nfsServerError,
   nfsExportError,
@@ -162,6 +164,74 @@ it("checks ceph.conf paths like the server", () => {
   }
 });
 
+it("checks iSCSI portals like the server", () => {
+  for (const ok of [
+    "san.lan",
+    "san.lan:3260",
+    "10.0.0.5",
+    "10.0.0.5:1",
+    "NAS-01:65535",
+    "[fd00::5]",
+    "[::1]:3260",
+    "[::ffff:10.0.0.5]:3260",
+  ]) {
+    expect(iscsiPortalError(ok)).toBeUndefined();
+  }
+  for (const bad of [
+    "",
+    "san lan",
+    "-oremount",
+    "a,b",
+    "a/b",
+    "san:",
+    "san:0",
+    "san:65536",
+    "san:+80",
+    "san:32a",
+    "san:3260:1",
+    "산",
+    // IPv6는 포트와 헷갈리지 않게 `[...]`로 감싼다.
+    "fd00::5",
+    "[fd00::5",
+    "[nas]:3260",
+    "[fd00::5]3260",
+    "[fd00::5]:",
+    // 대괄호 안은 IPv6 주소여야 한다.
+    "[:]",
+    "[1:2:3]",
+    "[::1.2]",
+    "[fd00::5%eth0]",
+    ":3260",
+  ]) {
+    expect(iscsiPortalError(bad)).toBe("pools.errors.portal");
+  }
+});
+
+it("checks iSCSI target names like the server", () => {
+  for (const ok of [
+    "iqn.2003-01.org.linux-iscsi.opl:shared",
+    "eui.02004567a425678d",
+    "naa.52004567ba64678d",
+    `iqn.${"a".repeat(219)}`,
+  ]) {
+    expect(iscsiTargetError(ok)).toBeUndefined();
+  }
+  for (const bad of [
+    "",
+    "iqn.",
+    "opl",
+    "IQN.2003-01.org:opl",
+    "iqn.2003-01.org:OPL",
+    "iqn.2003-01.org:my opl",
+    "iqn.2003-01.org:a,b",
+    "iqn.2003-01.org:a_b",
+    "-iqn.2003",
+    `iqn.${"a".repeat(220)}`,
+  ]) {
+    expect(iscsiTargetError(bad)).toBe("pools.errors.target");
+  }
+});
+
 it("offers the volume formats a pool holds, the default first", () => {
   expect(poolFormats(pool("local"))).toEqual(["qcow2", "raw"]);
   expect(poolFormats(nfs("nas.lan"))).toEqual(["qcow2", "raw"]);
@@ -171,6 +241,8 @@ it("offers the volume formats a pool holds, the default first", () => {
   expect(poolFormats(zfs)).toEqual(["raw"]);
   // RBD 풀도 raw 이미지만 둔다.
   expect(poolFormats(rbd())).toEqual(["raw"]);
+  // 공유 LVM 풀은 raw LV만 두고 스냅샷이 없다.
+  expect(poolFormats(lvmShared())).toEqual(["raw"]);
   // 풀을 고르기 전에는 파일 풀처럼 둘 다다.
   expect(poolFormats(undefined)).toEqual(["qcow2", "raw"]);
 });

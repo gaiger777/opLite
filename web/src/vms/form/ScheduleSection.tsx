@@ -29,6 +29,8 @@ export function ScheduleSection({
   const on = values.snapshotSchedule.every !== "off";
   // 블록 스냅샷은 메모리를 담지 못하므로 묻지 않는다(예약 작업이 메모리 없이 찍는다).
   const block = support?.kind === "ok" && support.block;
+  // 스냅샷이 없는 풀(공유 LVM)의 디스크면 메모리도 묻지 않는다.
+  const noSnapshots = support?.kind === "pool";
   return (
     <Card>
       <CardHeader>
@@ -55,6 +57,11 @@ export function ScheduleSection({
             </NativeSelect>
           )}
         </Field>
+        {on && support?.kind === "pool" && (
+          <p className="text-sm text-destructive sm:col-span-2">
+            {t("vmForm.scheduleSharedLvm", { volume: support.disk.volume })}
+          </p>
+        )}
         {on && support?.kind === "format" && (
           <p className="text-sm text-destructive sm:col-span-2">
             {t("vmForm.scheduleRaw", { volume: support.disk.volume, format: support.disk.format })}
@@ -83,7 +90,7 @@ export function ScheduleSection({
                 />
               )}
             </Field>
-            {block ? (
+            {noSnapshots ? null : block ? (
               <p className="text-xs text-muted-foreground sm:col-span-2">
                 {t("snapshots.blockHint")}
               </p>

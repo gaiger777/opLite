@@ -271,7 +271,8 @@
     },
     "mixed": "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. This VM mixes them.",
     "blockHint": "Disks in LVM-thin, ZFS and Ceph RBD pools are saved without memory. A running VM pauses briefly while they are saved.",
-    "zfsLatest": "Disks in ZFS pools can only revert to their latest snapshot."
+    "zfsLatest": "Disks in ZFS pools can only revert to their latest snapshot.",
+    "sharedLvm": "Disks in shared LVM pools cannot be snapshotted. {{volume}} is in one."
   },
   "clone": {
     "title": "Clone {{name}}",
@@ -356,7 +357,7 @@
     "empty": "No storage pools.",
     "allNodes": "All nodes",
     "createTitle": "Create a storage pool",
-    "createDescription": "Where volumes are kept: a directory on each node, an NFS export that the nodes mount, an LVM thin pool or ZFS dataset on each node, or a Ceph RBD pool.",
+    "createDescription": "Where volumes are kept: a directory on each node, an NFS export that the nodes mount, an LVM thin pool or ZFS dataset on each node, a Ceph RBD pool, or a volume group shared by the nodes.",
     "pathHint": "An absolute path on the nodes.",
     "shared": "Shared storage",
     "sharedHint": "Check when every node sees the same files at this path, such as an NFS share mounted outside opLite.",
@@ -372,7 +373,8 @@
       "nfs": "NFS",
       "lvm-thin": "LVM-thin",
       "zfs": "ZFS",
-      "rbd": "Ceph RBD"
+      "rbd": "Ceph RBD",
+      "lvm-shared": "Shared LVM"
     },
     "location": "Location",
     "kindHint": {
@@ -380,7 +382,8 @@
       "nfs": "Each node mounts the export under its data directory. Mounting needs Linux nodes running as root. The pool is shared by its nodes.",
       "lvm-thin": "Create the volume group and thin pool on each node first. Volumes are raw thin volumes kept on the node that creates them, and their snapshots hold disks only. Needs Linux nodes running as root.",
       "zfs": "Create the dataset on each node first. Volumes are raw zvols kept on the node that creates them, and their snapshots hold disks only. Disks can only revert to their latest snapshot. Needs Linux nodes running as root.",
-      "rbd": "Create the Ceph pool first and put ceph.conf and the keyring on each node. Volumes are raw RBD images that every node of the pool can use, and their snapshots hold disks only. Needs Linux nodes with QEMU's rbd driver (qemu-block-extra) and the rbd command (ceph-common)."
+      "rbd": "Create the Ceph pool first and put ceph.conf and the keyring on each node. Volumes are raw RBD images that every node of the pool can use, and their snapshots hold disks only. Needs Linux nodes with QEMU's rbd driver (qemu-block-extra) and the rbd command (ceph-common).",
+      "lvm-shared": "Create the shared volume group (vgcreate --shared) on a LUN every node sees first, and run lvmlockd with sanlock or dlm on each node. Volumes are raw logical volumes that every node of the pool can use, without snapshots. Needs Linux nodes running as root."
     },
     "server": "NFS server",
     "serverHint": "Host name or IP address.",
@@ -404,7 +407,9 @@
       "zfsDataset": "Use a dataset name such as tank/opl, at most 177 characters: parts separated by / with letters, digits, _, ., : or -, none empty, . or .. or starting with -. The pool name comes first and starts with a letter.",
       "rbdName": "Use 1 to 63 letters, digits, _, . or -, not starting with -.",
       "cephUser": "Write the Ceph user without the \"client.\" prefix, for example opl instead of client.opl.",
-      "rbdConf": "Enter an absolute path (starting with /) without control characters, commas, colons or equals signs."
+      "rbdConf": "Enter an absolute path (starting with /) without control characters, commas, colons or equals signs.",
+      "portal": "Enter a host name or IP address with an optional :port (1–65535), without spaces, commas or slashes. Put IPv6 addresses in brackets, such as [fd00::5]:3260.",
+      "target": "Use a target name starting with iqn., eui. or naa., at most 223 characters of lowercase letters, digits, ., : or -."
     },
     "vg": "Volume group",
     "thinpool": "Thin pool",
@@ -414,7 +419,13 @@
     "cephUser": "Ceph user (optional)",
     "cephUserHint": "The Ceph client ID without the \"client.\" prefix. Uses admin if empty.",
     "cephConf": "ceph.conf path (optional)",
-    "cephConfHint": "An absolute path on the nodes, /etc/ceph/ceph.conf if empty."
+    "cephConfHint": "An absolute path on the nodes, /etc/ceph/ceph.conf if empty.",
+    "iscsi": "Log in to an iSCSI target",
+    "iscsiHint": "Each node logs in to the target before using the volume group. Leave unchecked when the nodes already see the LUN, such as over Fibre Channel.",
+    "portal": "iSCSI portal",
+    "portalHint": "Host name or IP address with an optional port, such as san.lan:3260 or [fd00::5]:3260.",
+    "target": "iSCSI target",
+    "targetHint": "The target name, such as iqn.2003-01.org.example:storage."
   },
   "networks": {
     "bridge": "Bridge",
@@ -598,7 +609,8 @@
     "scheduleKeep": "Snapshots to keep",
     "scheduleRaw": "{{volume}} is {{format}}, so scheduled snapshots will fail. All disks must be qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools.",
     "scheduleMemoryHint": "Memory is saved only while the VM is running and has disks.",
-    "scheduleMixed": "Disks with different snapshot methods (qcow2, LVM-thin pools, ZFS pools, Ceph RBD pools) are mixed, so scheduled snapshots will fail."
+    "scheduleMixed": "Disks with different snapshot methods (qcow2, LVM-thin pools, ZFS pools, Ceph RBD pools) are mixed, so scheduled snapshots will fail.",
+    "scheduleSharedLvm": "{{volume}} is in a shared LVM pool, so scheduled snapshots will fail."
   },
   "console": {
     "connecting": "Connecting…",

@@ -64,7 +64,8 @@ const local = pool("local");
 const fast = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } });
 const tank = pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } });
 const ceph = pool("ceph", { backend: { kind: "rbd", pool: "rbd" } });
-const pools = [local, fast, tank, ceph];
+const san = pool("san", { backend: { kind: "lvm-shared", vg: "san" } });
+const pools = [local, fast, tank, ceph, san];
 const raw = (name: string, poolName: string) => {
   const v = volume(name, poolName);
   return { ...v, spec: { ...v.spec, format: "raw" as const } };
@@ -105,6 +106,14 @@ it("decides like the server whether disks can be snapshotted", () => {
   });
   const image = disk(volume("i", "ceph"));
   expect(snapshotSupport([image])).toEqual({ kind: "format", disk: image });
+  // 공유 LVM 풀의 디스크는 스냅샷이 없다. 서버처럼 디스크 차례대로 보고, 섞였는지보다 먼저다.
+  const shared = disk(raw("s", "san"));
+  expect(snapshotSupport([shared])).toEqual({ kind: "pool", disk: shared });
+  expect(snapshotSupport([disk(raw("a", "fast")), shared, disk(volume("b", "local"))])).toEqual({
+    kind: "pool",
+    disk: shared,
+  });
+  expect(snapshotSupport([plain, shared])).toEqual({ kind: "format", disk: plain });
   // 방식이 섞이면 안 된다. 블록 백엔드끼리도 종류가 다르면 섞인 것이다.
   expect(snapshotSupport([disk(volume("a", "local")), disk(raw("b", "fast"))])).toEqual({
     kind: "mixed",
@@ -144,6 +153,12 @@ it("judges the VM form's disks, new ones in their pool's format", () => {
   // 아직 고르지 않은 볼륨·풀은 따지지 않는다.
   const blank = { ...values, disks: [{ ...emptyDisk("web", 0), pool: "" }] };
   expect(formSnapshotSupport(blank, [], pools)).toEqual({ kind: "ok", block: false });
+  // 공유 LVM 풀의 새 디스크(raw)는 스냅샷이 없다.
+  const onSan = { ...values, disks: [{ ...emptyDisk("web", 0), volume: "web-0", pool: "san" }] };
+  expect(formSnapshotSupport(onSan, [], pools)).toEqual({
+    kind: "pool",
+    disk: { volume: "web-0", format: "raw", pool: san },
+  });
 });
 
 it("finds snapshots a VM with disks in ZFS pools cannot revert to, like the server", () => {

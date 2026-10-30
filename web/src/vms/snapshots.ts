@@ -74,11 +74,14 @@ export interface SnapshotDisk {
 
 /**
  * 디스크들의 스냅샷 가능 여부. `ok`면 `block`이 블록 스냅샷(LVM-thin·ZFS·RBD, 메모리 없음)인지,
- * `format`은 풀 종류가 담지 못하는 형식의 디스크, `mixed`는 방식(qcow2 내부 스냅샷, 블록 백엔드
- * 종류마다의 블록 스냅샷)이 섞인 것이다.
+ * `pool`은 스냅샷이 없는 풀(공유 LVM)의 디스크, `format`은 풀 종류가 담지 못하는 형식의 디스크,
+ * `mixed`는 방식(qcow2 내부 스냅샷, 블록 백엔드 종류마다의 블록 스냅샷)이 섞인 것이다.
  */
 export type SnapshotSupport =
-  { kind: "ok"; block: boolean } | { kind: "format"; disk: SnapshotDisk } | { kind: "mixed" };
+  | { kind: "ok"; block: boolean }
+  | { kind: "pool"; disk: SnapshotDisk }
+  | { kind: "format"; disk: SnapshotDisk }
+  | { kind: "mixed" };
 
 /** 볼륨을 스냅샷 방식을 따질 디스크로 바꾼다. */
 export function volumeDisk(volume: Volume, pools: readonly StoragePool[]): SnapshotDisk {
@@ -90,14 +93,18 @@ export function volumeDisk(volume: Volume, pools: readonly StoragePool[]): Snaps
 }
 
 /**
- * 서버의 `check_disks`처럼 판단한다: 파일 풀의 디스크는 qcow2, 블록 풀(LVM-thin, ZFS, RBD)의 디스크는
- * raw여야 하고, 모든 디스크가 같은 방식이어야 한다. 서버와 다른 점: 호출자는 목록에 없는 볼륨을 넘기지 않으므로
- * (서버는 400) 그런 디스크는 건너뛴 셈이고, 풀을 모르는 디스크는 파일 풀처럼 본다(서버는 400).
+ * 서버의 `check_disks`처럼 판단한다: 공유 LVM 풀의 디스크는 스냅샷이 없고, 파일 풀의 디스크는 qcow2,
+ * 블록 풀(LVM-thin, ZFS, RBD)의 디스크는 raw여야 하고, 모든 디스크가 같은 방식이어야 한다. 서버와
+ * 다른 점: 호출자는 목록에 없는 볼륨을 넘기지 않으므로(서버는 400) 그런 디스크는 건너뛴 셈이고, 풀을
+ * 모르는 디스크는 파일 풀처럼 본다(서버는 400).
  */
 export function snapshotSupport(disks: readonly SnapshotDisk[]): SnapshotSupport {
   // 디스크마다의 방식: 블록 백엔드 종류, qcow2 내부 스냅샷이면 `null`. 아직 디스크가 없으면 `undefined`.
   let method: string | null | undefined;
   for (const disk of disks) {
+    if (disk.pool?.spec.backend.kind === "lvm-shared") {
+      return { kind: "pool", disk };
+    }
     const kind = blockSnapshotKind(disk.pool) ?? null;
     if (disk.format !== poolFormats(disk.pool)[0]) {
       return { kind: "format", disk };

@@ -63,7 +63,8 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
   const names = new Map(mine.map((s) => [s.id, s.spec.name]));
   // 서버는 시작·정지 중인 VM의 스냅샷 작업을 받지 않는다(vm_busy).
   const busy = isBusy(vm);
-  // 풀 종류가 담지 못하는 형식의 디스크가 있거나 방식이 섞이면 만들 수 없다(snapshot_unsupported).
+  // 스냅샷이 없는 풀(공유 LVM)이나 풀 종류가 담지 못하는 형식의 디스크가 있거나 방식이 섞이면 만들 수
+  // 없다(snapshot_unsupported).
   // 볼륨·풀 목록을 다 읽어야 안다.
   const listed = volumes.isSuccess && pools.isSuccess;
   const support = listed
@@ -91,7 +92,11 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
           {t("vms.tab.snapshots")}
         </h2>
         {operate &&
-          (support?.kind === "format" ? (
+          (support?.kind === "pool" ? (
+            <p className="text-sm text-muted-foreground">
+              {t("snapshots.sharedLvm", { volume: support.disk.volume })}
+            </p>
+          ) : support?.kind === "format" ? (
             <p className="text-sm text-muted-foreground">
               {t("snapshots.unsupported", {
                 volume: support.disk.volume,
@@ -123,12 +128,18 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
       <div className="flex flex-col gap-1 text-sm">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <p>
-            {/* 블록 디스크의 VM은 예약이 메모리를 원해도 메모리 없이 찍는다. */}
+            {/* 블록 디스크의 VM은 예약이 메모리를 원해도 메모리 없이 찍는다. 공유 LVM 디스크의 VM은
+                스냅샷이 없으므로 메모리를 말하지 않는다. */}
             {schedule
-              ? t(schedule.memory && !block ? "snapshots.scheduleMemory" : "snapshots.schedule", {
-                  every: t(`snapshots.every.${schedule.every}`),
-                  keep: schedule.keep,
-                })
+              ? t(
+                  schedule.memory && !block && support?.kind !== "pool"
+                    ? "snapshots.scheduleMemory"
+                    : "snapshots.schedule",
+                  {
+                    every: t(`snapshots.every.${schedule.every}`),
+                    keep: schedule.keep,
+                  },
+                )
               : t("snapshots.noSchedule")}
           </p>
           {/* 예약은 VM 설정이라 VM 편집에서 바꾼다. */}
