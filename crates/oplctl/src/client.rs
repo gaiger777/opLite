@@ -10,6 +10,9 @@ use serde_json::Value;
 /// Task가 이보다 오래 끝나지 않으면 기다리기를 그만둔다. Task 실행기의 제한 시간(10분)보다 길다.
 const TASK_WAIT: Duration = Duration::from_secs(15 * 60);
 
+/// 라이브 마이그레이션 Task를 기다리는 시간. 마이그레이션은 서버 설정(`[migration] timeout`)만큼 걸릴 수 있다.
+pub const MIGRATE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Task 조회 요청 하나의 제한 시간. 서버가 응답하지 않아도 전체 기다리기 제한(`TASK_WAIT`)이 지켜지게 한다.
 const TASK_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -121,24 +124,45 @@ impl Client {
     /// Task가 끝날 때까지 기다린다. 실패했으면 그 오류를 돌려준다.
     pub async fn wait_task(&self, task: &Value) -> anyhow::Result<Value> {
         let id = task["id"].as_str().context("response has no task id")?;
-        let deadline = Instant::now() + TASK_WAIT;
+        match self.poll_task(id, TASK_WAIT).await? {
+            Ok(task) => Ok(task),
+            Err(task) => bail!(
+                "task {id} did not finish in {} minutes (state: {}); is opld running on node {}?",
+                TASK_WAIT.as_secs() / 60,
+                task["status"]["state"].as_str().unwrap_or("unknown"),
+                task["spec"]["node"].as_str().unwrap_or("?")
+            ),
+        }
+    }
+
+    /// `wait_task`와 같지만 `wait`만큼 기다린다. 시간이 지나도 Task는 아직 돌고 있을 수 있다.
+    pub async fn wait_task_for(&self, task: &Value, wait: Duration) -> anyhow::Result<Value> {
+        let id = task["id"].as_str().context("response has no task id")?;
+        match self.poll_task(id, wait).await? {
+            Ok(task) => Ok(task),
+            Err(task) => bail!(
+                "stopped waiting for task {id} after {} minutes (state: {}); it may still be running, see `oplctl task get {id}`",
+                wait.as_secs() / 60,
+                task["status"]["state"].as_str().unwrap_or("unknown"),
+            ),
+        }
+    }
+
+    /// Task가 끝나면 `Ok(Task)`, 실패하면 오류, `wait`이 지나면 마지막으로 읽은 Task를 `Err`로.
+    async fn poll_task(&self, id: &str, wait: Duration) -> anyhow::Result<Result<Value, Value>> {
+        let deadline = Instant::now() + wait;
         loop {
             let poll = self
                 .request(Method::GET, &format!("/tasks/{id}"))
                 .timeout(TASK_POLL_TIMEOUT);
             let task = self.send(poll).await?;
             match task["status"]["state"].as_str() {
-                Some("succeeded") => return Ok(task),
+                Some("succeeded") => return Ok(Ok(task)),
                 Some("failed") => bail!(
                     "task {id} failed: {}",
                     task["status"]["error"].as_str().unwrap_or("unknown error")
                 ),
-                state if Instant::now() > deadline => bail!(
-                    "task {id} did not finish in {} minutes (state: {}); is opld running on node {}?",
-                    TASK_WAIT.as_secs() / 60,
-                    state.unwrap_or("unknown"),
-                    task["spec"]["node"].as_str().unwrap_or("?")
-                ),
+                _ if Instant::now() > deadline => return Ok(Err(task)),
                 _ => tokio::time::sleep(Duration::from_millis(200)).await,
             }
         }
@@ -220,6 +244,7 @@ pub async fn local(socket: &Path, path: &str, body: &Value) -> anyhow::Result<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn cert_pem(name: &str) -> String {
         rcgen::generate_simple_self_signed(vec![name.to_string()])
@@ -242,5 +267,60 @@ mod tests {
     #[test]
     fn fingerprint_rejects_garbage() {
         assert!(fingerprint("not a pem").is_err());
+    }
+
+    /// 어떤 요청에도 `body`(JSON)로 답하는 HTTP 서버의 주소
+    async fn serve_json(body: Value) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let body = body.to_string();
+                tokio::spawn(async move {
+                    let mut buf = vec![0; 4096];
+                    let mut req = Vec::new();
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = s.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    s.write_all(resp.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 정한 시간이 지나면 기다리기를 그만두고, Task가 아직 돌 수 있다고 Task id와 함께 알린다.
+    #[tokio::test]
+    async fn wait_task_for_gives_up_after_the_given_time() {
+        let id = "0b7f3a52-3f0e-4d5c-9a51-2b8f0c1d2e3f";
+        let task = json!({ "id": id, "spec": { "node": "n1" }, "status": { "state": "running" } });
+        let client = Client::new(&serve_json(task.clone()).await, None, None).unwrap();
+        let err = client
+            .wait_task_for(&task, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "stopped waiting for task {id} after 0 minutes (state: running); it may still be running, see `oplctl task get {id}`"
+            )
+        );
+        // 끝난 Task는 그대로 돌려준다.
+        let done = json!({ "id": id, "status": { "state": "succeeded" } });
+        let client = Client::new(&serve_json(done.clone()).await, None, None).unwrap();
+        assert_eq!(
+            client.wait_task_for(&done, MIGRATE_WAIT).await.unwrap(),
+            done
+        );
     }
 }

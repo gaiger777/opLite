@@ -9,7 +9,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use crate::client::{Client, fetch_ca, fingerprint, local};
+use crate::client::{Client, MIGRATE_WAIT, fetch_ca, fingerprint, local};
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
 
@@ -434,6 +434,12 @@ enum VmCmd {
     },
     Reboot {
         vm: String,
+    },
+    /// 실행 중인 VM을 멈추지 않고 다른 노드로 옮긴다(디스크가 모두 공유 풀에 있어야 한다).
+    Migrate {
+        vm: String,
+        /// 대상 노드 이름이나 id
+        node: String,
     },
     Delete {
         vm: String,
@@ -1125,16 +1131,7 @@ async fn vm(
                 json_out,
                 &list,
                 &["NAME", "POWER", "PHASE", "NODE", "PID", "ERROR"],
-                |v| {
-                    vec![
-                        cell(&v["name"]),
-                        cell(&v["spec"]["power"]),
-                        cell(&v["status"]["phase"]),
-                        cell(&v["status"]["node"]),
-                        cell(&v["status"]["pid"]),
-                        cell(&v["status"]["last_error"]),
-                    ]
-                },
+                vm_row,
             )?;
         }
         VmCmd::Get { vm } => print_json(out, &client.get(&format!("/vms/{vm}")).await?)?,
@@ -1196,6 +1193,14 @@ async fn vm(
             .await?
         }
         VmCmd::Reboot { vm } => act(client, &vm, "reboot", out).await?,
+        VmCmd::Migrate { vm, node } => {
+            let task = client
+                .post(&format!("/vms/{vm}/migrate"), &json!({ "node": node }))
+                .await?;
+            // 마이그레이션은 일반 Task 제한(10분)보다 오래 걸릴 수 있다.
+            client.wait_task_for(&task, MIGRATE_WAIT).await?;
+            writeln!(out, "vm {vm}: migrated to {node}")?;
+        }
         VmCmd::Delete { vm, with_snapshots } => {
             if with_snapshots {
                 // 내부 스냅샷은 서로 독립이라 차례는 상관없다. VM을 지울 수 없는데 스냅샷만
@@ -1254,6 +1259,23 @@ async fn vm(
         }
     }
     Ok(())
+}
+
+/// `vm list`의 한 행. 마이그레이션 중이면 NODE에 대상 노드를 붙인다(`A -> B`).
+fn vm_row(v: &Value) -> Vec<String> {
+    let mut node = cell(&v["status"]["node"]);
+    let target = &v["status"]["migration"]["node"];
+    if !target.is_null() {
+        node = format!("{node} -> {}", cell(target));
+    }
+    vec![
+        cell(&v["name"]),
+        cell(&v["spec"]["power"]),
+        cell(&v["status"]["phase"]),
+        node,
+        cell(&v["status"]["pid"]),
+        cell(&v["status"]["last_error"]),
+    ]
 }
 
 /// `--machine`이 없을 때의 머신: 지정 노드의 arch, 아니면 arch를 아는 노드가 모두 같은 arch.
@@ -1967,6 +1989,43 @@ mod tests {
         assert_eq!(
             schedule_update(&vm, None),
             json!({ "labels": {}, "spec": { "memory_mib": 256, "snapshot_schedule": null } })
+        );
+    }
+
+    #[test]
+    fn parses_vm_migrate() {
+        let cli = Cli::try_parse_from(["oplctl", "vm", "migrate", "web", "n2"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Migrate { vm, node } } if vm == "web" && node == "n2"
+        ));
+        assert!(Cli::try_parse_from(["oplctl", "vm", "migrate", "web"]).is_err());
+    }
+
+    /// 마이그레이션 중인 VM은 PHASE가 migrating이고 NODE에 대상 노드가 붙는다.
+    #[test]
+    fn vm_list_shows_migration_target() {
+        let vm = json!({
+            "name": "web",
+            "spec": { "power": "running" },
+            "status": {
+                "phase": "migrating",
+                "node": "id-a",
+                "pid": 42,
+                "migration": { "node": "id-b", "task": "t1" },
+            },
+        });
+        assert_eq!(
+            vm_row(&vm),
+            ["web", "running", "migrating", "id-a -> id-b", "42", "-"]
+        );
+        // 마이그레이션이 없으면(필드 없음) 지금 노드만
+        let mut vm = vm;
+        vm["status"].as_object_mut().unwrap().remove("migration");
+        vm["status"]["phase"] = json!("running");
+        assert_eq!(
+            vm_row(&vm),
+            ["web", "running", "running", "id-a", "42", "-"]
         );
     }
 
