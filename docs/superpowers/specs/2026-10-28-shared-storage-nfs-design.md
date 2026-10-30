@@ -13,9 +13,11 @@
 | 16 | 블록 백엔드 바탕과 **LVM-thin** | 디스크 소스 추상화(`host_device`), 백엔드 스냅샷, 메모리 스냅샷의 vmstate 위치 |
 | 17 | **ZFS**(zvol) | 16의 블록 바탕 |
 | 18 | **Ceph RBD** | QEMU 네트워크 블록 드라이버(`rbd`), 네트워크 디스크 소스(`RuntimeDisk.rbd`) |
-| 19 | **iSCSI** | 18의 네트워크 디스크 소스(`iscsi`) 또는 공유 LUN 위의 블록 바탕 |
+| 19 | **iSCSI**(공유 LVM) | 공유 LUN 위의 공유(lvmlockd) VG, 16의 블록 디스크 소스, LV 배타 활성화 |
 
 구현: 처음에는 계획 18이 iSCSI와 Ceph RBD를 함께 했으나, 성격이 달라(RBD는 이미지·스냅샷을 API로 다루고 iSCSI는 관리자가 만든 LUN을 쓴다) 계획 18은 Ceph RBD만 하고 iSCSI는 계획 19로 미뤘다(`2026-10-29-shared-storage-ceph-rbd-design.md` §1).
+
+구현: 계획 19는 두 길 가운데 LUN을 그대로 디스크로 쓰는 QEMU `iscsi` 드라이버가 아니라 공유 LUN 위의 공유 LVM(lvmlockd·sanlock, 볼륨마다 두꺼운 LV)을 택했다. LUN을 opLite가 만들거나 늘릴 수 없어 볼륨 모델과 맞지 않기 때문이다. 같은 풀을 iSCSI 로그인 없이 FC·멀티패스 SAN에도 쓴다(`2026-10-30-shared-storage-iscsi-lvm-design.md` §1).
 
 하위 프로젝트 4(라이브 마이그레이션)는 그 뒤다. UEFI 변수를 공유 스토리지로 옮기는 일도 거기서 다룬다.
 

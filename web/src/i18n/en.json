@@ -364,7 +364,7 @@
     "nodesHint": "Leave all unchecked to use it on every node.",
     "created": "Created storage pool {{name}}.",
     "deleteTitle": "Delete storage pool {{name}}?",
-    "deleteDescription": "Only the pool is removed. Files in its directory or export and images in its Ceph pool are kept.",
+    "deleteDescription": "Only the pool is removed. Files in its directory or export, images in its Ceph pool and logical volumes in its shared volume group are kept.",
     "deleted": "Deleted storage pool {{name}}.",
     "inUse": "Delete its volumes first.",
     "kind": "Kind",
