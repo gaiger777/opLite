@@ -831,6 +831,7 @@ impl Storage for ZfsStorage {
             format,
             snapshot: None,
             size_bytes,
+            rbd: None,
         })
     }
 
@@ -859,7 +860,7 @@ impl Storage for ZfsStorage {
         let dataset = Self::dataset(dst_pool, dst_format)?;
         let source = self.volume_source(src_pool, src_id, format, tag).await?;
         let dst = self.create_zvol(dataset, dst_id, source.size_bytes).await?;
-        let from = convert_from(&source, force_share, dst_format)?;
+        let from = convert_from(&source, force_share, Some(dst_format))?;
         self.fill(dataset, dst_id, &dst, &from).await
     }
 }
@@ -1141,19 +1142,16 @@ mod tests {
     /// `info`면 가상 크기 1000을 알리고, 그 밖은 인자를 한 줄에 하나씩 `{dir}/args`에 적는 가짜
     /// qemu-img. `fail`이면 `info`가 아닌 호출이 실패한다.
     fn fake_qemu_img(dir: &Path, fail: bool) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-qemu-img");
         let args = dir.join("args");
         let end = if fail { "echo broken >&2\nexit 1" } else { "" };
-        std::fs::write(
+        crate::storage::tests::write_script(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\nif [ \"$1\" = info ]; then echo '{{\"virtual-size\": 1000}}'; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > {args:?}\n{end}\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path
     }
 
@@ -1735,6 +1733,7 @@ mod tests {
                 format: RAW,
                 snapshot: None,
                 size_bytes: MIB,
+                rbd: None,
             }
         );
         storage

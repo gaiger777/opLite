@@ -15,8 +15,8 @@ use opl_api::{AppState, ClusterJanitor, SnapshotScheduler, TaskRunner, TaskRunne
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError};
 use opl_driver::{
-    DirStorage, Hypervisor, LvmThinStorage, QemuHypervisor, Storage, Storages, SystemLvm,
-    SystemZfs, ZfsStorage,
+    DirStorage, Hypervisor, LvmThinStorage, QemuHypervisor, RbdStorage, Storage, Storages,
+    SystemLvm, SystemRbd, SystemZfs, ZfsStorage,
 };
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{TlsListener, api_server_config};
@@ -265,10 +265,12 @@ impl Member {
         let files: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img, &mount_root));
         let lvm = LvmThinStorage::new(&config.qemu_img, Arc::new(SystemLvm));
         let zfs = ZfsStorage::new(&config.qemu_img, Arc::new(SystemZfs));
+        let rbd = RbdStorage::new(&config.qemu_img, Arc::new(SystemRbd));
         let storage: Arc<dyn Storage> = Arc::new(
             Storages::new(&config.qemu_img, files)
                 .with_lvm_thin(Arc::new(lvm))
-                .with_zfs(Arc::new(zfs)),
+                .with_zfs(Arc::new(zfs))
+                .with_rbd(Arc::new(rbd)),
         );
         let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();

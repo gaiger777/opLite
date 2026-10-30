@@ -826,6 +826,7 @@ impl Storage for LvmThinStorage {
             format,
             snapshot: None,
             size_bytes: lv.size_bytes,
+            rbd: None,
         })
     }
 
@@ -866,7 +867,7 @@ impl Storage for LvmThinStorage {
             let dst = self
                 .create_lv(vg, thinpool, dst_id, source.size_bytes)
                 .await?;
-            let from = convert_from(&source, force_share, dst_format)?;
+            let from = convert_from(&source, force_share, Some(dst_format))?;
             self.fill(vg, dst_id, &dst, &from).await
         };
         let copied = copied.await;
@@ -1132,19 +1133,16 @@ mod tests {
     /// `info`면 가상 크기 1000을 알리고, 그 밖은 인자를 한 줄에 하나씩 `{dir}/args`에 적는 가짜
     /// qemu-img. `fail`이면 `info`가 아닌 호출이 실패한다.
     fn fake_qemu_img(dir: &Path, fail: bool) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-qemu-img");
         let args = dir.join("args");
         let end = if fail { "echo broken >&2\nexit 1" } else { "" };
-        std::fs::write(
+        crate::storage::tests::write_script(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\nif [ \"$1\" = info ]; then echo '{{\"virtual-size\": 1000}}'; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > {args:?}\n{end}\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path
     }
 
@@ -1727,6 +1725,7 @@ mod tests {
                 format: RAW,
                 snapshot: None,
                 size_bytes: 1 << 20,
+                rbd: None,
             }
         );
         storage
@@ -1909,11 +1908,9 @@ mod tests {
     /// 같은 VG 안 복사가 취소돼도(future가 버려짐) 원본 스냅샷 LV를 뒤에서 비활성화한다.
     #[tokio::test]
     async fn cancelled_copy_deactivates_the_source_snapshot() {
-        use std::os::unix::fs::PermissionsExt;
         let tools = tempfile::tempdir().unwrap();
         let slow = tools.path().join("slow-qemu-img");
-        std::fs::write(&slow, "#!/bin/sh\nsleep 5\n").unwrap();
-        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::storage::tests::write_script(&slow, "#!/bin/sh\nsleep 5\n");
         let (lvm, storage) = setup(slow);
         let p = lvm_pool();
         let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());

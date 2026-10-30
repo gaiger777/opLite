@@ -18,6 +18,7 @@ mod storages;
 mod zfs;
 
 pub use lvm::{LvInfo, LvmOps, LvmThinStorage, SystemLvm, parse_lvs};
+pub use rbd::{RbdOps, RbdSnapshot, RbdSpace, RbdStorage, SystemRbd};
 pub use storages::Storages;
 pub use zfs::{
     SystemZfs, ZfsDataset, ZfsOps, ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo, parse_zfs_dataset,
@@ -45,14 +46,17 @@ pub struct Capacity {
 /// 복사할 때 읽을 볼륨 내용([`Storage::volume_source`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeSource {
-    /// 볼륨 파일 또는 블록 장치
+    /// 볼륨 파일 또는 블록 장치. RBD 이미지면 빈 경로다.
     pub path: PathBuf,
     pub format: ImageFormat,
-    /// 이미지 안의 내부 스냅샷(qcow2)에서 읽으면 그 이름(`qemu-img convert -l snapshot.name=`)
+    /// 이미지 안의 내부 스냅샷(qcow2)에서 읽으면 그 이름(`qemu-img convert -l snapshot.name=`).
+    /// RBD 이미지면 읽을 RBD 스냅샷의 이름이다.
     pub snapshot: Option<String>,
     /// 읽을 내용의 가상 크기. 백엔드 사이 복사는 대상 볼륨을 이 크기로 만든다. LV 스냅샷이면 그
     /// 스냅샷 때의 크기다(뒤에 볼륨을 되돌려 지금이 더 작을 수 있다).
     pub size_bytes: u64,
+    /// RBD 이미지면 그 이미지(`qemu-img`가 `rbd` 드라이버로 연다)
+    pub rbd: Option<RbdTarget>,
 }
 
 /// 볼륨 파일의 생성, 가져오기, 삭제. 볼륨은 풀 안에서 id로 식별한다.
@@ -592,24 +596,35 @@ async fn source_virtual_size(
 }
 
 /// `qemu-img convert`가 `src`를 읽어 `out_format`으로 쓰게 하는 인자. 출력 경로는 뒤에 붙인다.
-/// `force_share`면 실행 중인 VM이 쥔 이미지의 잠금을 무시하고 읽는다(`-U`).
+/// 대상을 옵션 문자열로 줄 때(`--target-image-opts`, RBD 이미지)는 형식도 그 안에 있으므로
+/// `out_format`이 `None`이다(`-O`를 함께 쓰면 qemu-img가 거부한다). RBD 원본은 옵션
+/// 문자열(`--image-opts`)로 연다. `force_share`면 실행 중인 VM이 쥔 이미지의 잠금을 무시하고
+/// 읽는다(`-U`).
 fn convert_from(
     src: &VolumeSource,
     force_share: bool,
-    out_format: ImageFormat,
+    out_format: Option<ImageFormat>,
 ) -> Result<Vec<String>, DriverError> {
-    let mut args = vec!["-f".to_string(), fmt_name(src.format).to_string()];
+    let mut args = match &src.rbd {
+        Some(_) => vec!["--image-opts".to_string()],
+        None => vec!["-f".to_string(), fmt_name(src.format).to_string()],
+    };
     if force_share {
         args.push("-U".into());
     }
-    // `-l`의 값은 옵션 문자열이므로 `,`를 `,,`로 쓴다.
-    if let Some(name) = &src.snapshot {
+    // `-l`의 값은 옵션 문자열이므로 `,`를 `,,`로 쓴다. RBD 스냅샷은 옵션 문자열 안에 있다.
+    if let (Some(name), None) = (&src.snapshot, &src.rbd) {
         args.push("-l".into());
         args.push(format!("snapshot.name={}", name.replace(',', ",,")));
     }
-    args.push("-O".into());
-    args.push(fmt_name(out_format).into());
-    args.push(path_str(&src.path)?.into());
+    if let Some(out_format) = out_format {
+        args.push("-O".into());
+        args.push(fmt_name(out_format).into());
+    }
+    match &src.rbd {
+        Some(image) => args.push(rbd::image_opts(image, src.snapshot.as_deref())),
+        None => args.push(path_str(&src.path)?.into()),
+    }
     Ok(args)
 }
 
@@ -1016,7 +1031,7 @@ impl Storage for DirStorage {
         if self.exists(dst_pool, &dst).await? {
             return Err(DriverError::VolumeExists(dst_id));
         }
-        let from = convert_from(&src, force_share, dst_format)?;
+        let from = convert_from(&src, force_share, Some(dst_format))?;
         let mut before = vec!["convert", "-q"];
         before.extend(from.iter().map(String::as_str));
         self.write_new(dst_pool, dst_id, &dst, &before, &[]).await
@@ -1041,6 +1056,7 @@ impl Storage for DirStorage {
             format,
             snapshot: tag.map(str::to_string),
             size_bytes,
+            rbd: None,
         })
     }
 
@@ -1484,12 +1500,25 @@ mod tests {
         dir.path().to_str().unwrap()
     }
 
+    /// 실행 파일 `path`(가짜 도구 스크립트)를 `text`로 만든다. 이 프로세스가 쓰려고 연 파일은 그동안
+    /// 다른 테스트가 띄우는 자식 프로세스가 물려받을 수 있고, 그러면 스크립트 실행이 ETXTBSY("Text
+    /// file busy")로 실패한다. 그래서 파일은 자식 셸이 열고 쓰고 닫는다.
+    pub(super) fn write_script(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut sh = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        sh.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        assert!(sh.wait().unwrap().success(), "cannot write {path:?}");
+    }
+
     /// 실행 파일 셸 스크립트를 만든다. `"$last"`에 마지막 인자가 들어 있다.
     fn fake_tool(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-qemu-img");
-        std::fs::write(&path, format!("#!/bin/sh\nfor last; do :; done\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&path, &format!("#!/bin/sh\nfor last; do :; done\n{body}\n"));
         path
     }
 
@@ -1783,6 +1812,7 @@ mod tests {
                     format,
                     snapshot: None,
                     size_bytes: 5,
+                    rbd: None,
                 }
             );
         }
@@ -1796,6 +1826,7 @@ mod tests {
                 format: qcow2,
                 snapshot: Some("t1".into()),
                 size_bytes: 5,
+                rbd: None,
             }
         );
         // raw 볼륨에는 스냅샷이 없다.

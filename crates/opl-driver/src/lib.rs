@@ -17,7 +17,8 @@ pub use net::{HostNet, IpRoute, Tap};
 pub use opl_types::storage::SourceFormat;
 pub use qemu::{QemuConfig, QemuHypervisor, uefi_vars_path, vm_state_dir};
 pub use storage::{
-    Capacity, DirStorage, DiskLocation, LvInfo, LvmOps, LvmThinStorage, Storage, Storages,
-    SystemLvm, SystemZfs, VolumeInfo, VolumeSource, ZfsDataset, ZfsOps, ZfsSnapshot, ZfsSpace,
-    ZfsStorage, ZvolInfo, check_pool_root, disk_location, parse_lvs, parse_zfs_dataset, pool_root,
+    Capacity, DirStorage, DiskLocation, LvInfo, LvmOps, LvmThinStorage, RbdOps, RbdSnapshot,
+    RbdSpace, RbdStorage, Storage, Storages, SystemLvm, SystemRbd, SystemZfs, VolumeInfo,
+    VolumeSource, ZfsDataset, ZfsOps, ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo, check_pool_root,
+    disk_location, parse_lvs, parse_zfs_dataset, pool_root,
 };

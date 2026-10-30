@@ -6,7 +6,9 @@ use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
 use uuid::Uuid;
 
-use super::{Capacity, Storage, VolumeInfo, VolumeSource, convert_from, path_str, run_qemu_img};
+use super::{
+    Capacity, Storage, VolumeInfo, VolumeSource, convert_from, path_str, rbd, run_qemu_img,
+};
 use crate::error::DriverError;
 
 /// 볼륨을 다루는 방식이 같은 풀 백엔드의 묶음.
@@ -16,7 +18,6 @@ enum Kind {
     File,
     LvmThin,
     Zfs,
-    /// 아직 다루는 저장소가 없다.
     Rbd,
 }
 
@@ -41,6 +42,8 @@ pub struct Storages {
     lvm_thin: Option<Arc<dyn Storage>>,
     /// `zfs` 풀. 없으면 그 풀은 쓸 수 없다.
     zfs: Option<Arc<dyn Storage>>,
+    /// `rbd` 풀. 없으면 그 풀은 쓸 수 없다.
+    rbd: Option<Arc<dyn Storage>>,
 }
 
 impl Storages {
@@ -50,6 +53,7 @@ impl Storages {
             file,
             lvm_thin: None,
             zfs: None,
+            rbd: None,
         }
     }
 
@@ -62,6 +66,12 @@ impl Storages {
     /// `zfs` 풀을 다룰 저장소를 정한다.
     pub fn with_zfs(mut self, storage: Arc<dyn Storage>) -> Self {
         self.zfs = Some(storage);
+        self
+    }
+
+    /// `rbd` 풀을 다룰 저장소를 정한다.
+    pub fn with_rbd(mut self, storage: Arc<dyn Storage>) -> Self {
+        self.rbd = Some(storage);
         self
     }
 
@@ -80,9 +90,10 @@ impl Storages {
                 .zfs
                 .as_ref()
                 .ok_or_else(|| DriverError::InvalidSpec("zfs pools are not supported yet".into())),
-            Kind::Rbd => Err(DriverError::InvalidSpec(
-                "rbd pools are not supported yet".into(),
-            )),
+            Kind::Rbd => self
+                .rbd
+                .as_ref()
+                .ok_or_else(|| DriverError::InvalidSpec("rbd pools are not supported yet".into())),
         }
     }
 
@@ -104,15 +115,24 @@ impl Storages {
             .create_volume(dst_pool, dst_id, size_bytes, format)
             .await?;
         let written = async {
-            let from = convert_from(src, force_share, format)?;
-            // -n: 만들어 둔 볼륨(파일 또는 장치)에 쓴다. 새 볼륨이 0으로 읽히면 0인 부분은 쓰지
-            // 않는다(--target-is-zero).
+            // RBD 이미지는 경로가 없으므로 옵션 문자열로 준다(형식도 그 안에 있다).
+            let image = rbd::pool_target(dst_pool, dst_id);
+            let from = convert_from(src, force_share, image.is_none().then_some(format))?;
+            // -n: 만들어 둔 볼륨(파일, 장치 또는 RBD 이미지)에 쓴다. 새 볼륨이 0으로 읽히면 0인
+            // 부분은 쓰지 않는다(--target-is-zero).
             let mut args = vec!["convert", "-q", "-n"];
             if zero {
                 args.push("--target-is-zero");
             }
+            if image.is_some() {
+                args.push("--target-image-opts");
+            }
             args.extend(from.iter().map(String::as_str));
-            args.push(path_str(&path)?);
+            let dst = match &image {
+                Some(image) => rbd::image_opts(image, None),
+                None => path_str(&path)?.to_string(),
+            };
+            args.push(&dst);
             run_qemu_img(&self.qemu_img, &args).await
         };
         if let Err(e) = written.await {
@@ -593,17 +613,23 @@ mod tests {
         }
         async fn volume_source(
             &self,
-            _: &StoragePool,
+            pool: &StoragePool,
             id: Uuid,
             format: ImageFormat,
             tag: Option<&str>,
         ) -> Result<VolumeSource, DriverError> {
             self.call("volume_source")?;
+            // RBD 풀이면 RBD 이미지다.
+            let image = rbd::pool_target(pool, id);
             Ok(VolumeSource {
-                path: self.dir.join(id.to_string()),
+                path: match image {
+                    Some(_) => PathBuf::new(),
+                    None => self.dir.join(id.to_string()),
+                },
                 format,
                 snapshot: tag.map(str::to_string),
                 size_bytes: 2 << 30,
+                rbd: image,
             })
         }
         async fn release_source(
@@ -668,18 +694,24 @@ mod tests {
         })
     }
 
+    fn rbd_pool() -> StoragePool {
+        pool(PoolBackend::Rbd {
+            pool: "rbd".into(),
+            namespace: None,
+            user: Some("opl".into()),
+            conf: None,
+        })
+    }
+
     /// 인자를 한 줄에 하나씩 `{dir}/args`에 적는 가짜 qemu-img. `fail`이면 실패한다.
     fn fake_qemu_img(dir: &Path, fail: bool) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-qemu-img");
         let args = dir.join("args");
         let end = if fail { "echo broken >&2\nexit 1" } else { "" };
-        std::fs::write(
+        crate::storage::tests::write_script(
             &path,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {args:?}\n{end}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {args:?}\n{end}\n"),
+        );
         path
     }
 
@@ -687,7 +719,8 @@ mod tests {
         std::mem::take(&mut *log.lock().unwrap())
     }
 
-    /// 파일 풀(dir, nfs)은 파일 저장소로, lvm-thin 풀은 LVM 저장소로, zfs 풀은 ZFS 저장소로 간다.
+    /// 파일 풀(dir, nfs)은 파일 저장소로, lvm-thin 풀은 LVM 저장소로, zfs 풀은 ZFS 저장소로, rbd
+    /// 풀은 RBD 저장소로 간다.
     #[tokio::test]
     async fn calls_go_to_the_pool_backend() {
         let log = Log::default();
@@ -696,13 +729,15 @@ mod tests {
             Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
         )
         .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)))
-        .with_zfs(Arc::new(Recorder::new("zfs", "/z".as_ref(), &log)));
+        .with_zfs(Arc::new(Recorder::new("zfs", "/z".as_ref(), &log)))
+        .with_rbd(Arc::new(Recorder::new("rbd", "".as_ref(), &log)));
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
         for (p, name) in [
             (dir_pool(), "file"),
             (nfs_pool(), "file"),
             (lvm_pool(), "lvm"),
             (zfs_pool(), "zfs"),
+            (rbd_pool(), "rbd"),
         ] {
             storages.create_volume(&p, id, 1, f).await.unwrap();
             let src = Path::new("/up/x.vmdk");
@@ -823,9 +858,9 @@ mod tests {
         assert_eq!(taken(&log), Vec::<String>::new());
     }
 
-    /// RBD 풀은 아직 쓸 수 없다(다른 저장소로 보내지 않는다).
+    /// RBD 저장소가 없으면 rbd 풀은 쓸 수 없다(다른 저장소로 보내지 않는다).
     #[tokio::test]
-    async fn rbd_pool_is_unsupported_for_now() {
+    async fn rbd_pool_without_backend_is_unsupported() {
         let log = Log::default();
         let storages = Storages::new(
             "qemu-img",
@@ -989,6 +1024,112 @@ mod tests {
         assert_eq!(args.lines().last(), Some(dst_path.as_str()));
     }
 
+    /// RBD 이미지는 경로가 없으므로 `qemu-img`에 옵션 문자열로 준다: 대상은 `--target-image-opts`
+    /// (`-O` 없이), 원본은 `--image-opts`(스냅샷도 그 안에)다.
+    #[tokio::test]
+    async fn copy_to_and_from_rbd_uses_image_opts() {
+        let tools = tempfile::tempdir().unwrap();
+        let log = Log::default();
+        let storages = Storages::new(
+            fake_qemu_img(tools.path(), false),
+            Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
+        )
+        .with_rbd(Arc::new(Recorder::new("rbd", "".as_ref(), &log)));
+        let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
+        let (raw, qcow2) = (ImageFormat::Raw, ImageFormat::Qcow2);
+
+        storages
+            .copy_volume(
+                &dir_pool(),
+                src,
+                qcow2,
+                Some("t"),
+                true,
+                &rbd_pool(),
+                dst,
+                raw,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            taken(&log),
+            [
+                "file.volume_source",
+                "rbd.create_volume",
+                "file.release_source",
+            ]
+        );
+        let (src_path, to) = (
+            format!("/f/{src}"),
+            format!("driver=raw,file.driver=rbd,file.pool=rbd,file.image=opl-{dst},file.user=opl"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(tools.path().join("args"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "convert",
+                "-q",
+                "-n",
+                "--target-is-zero",
+                "--target-image-opts",
+                "-f",
+                "qcow2",
+                "-U",
+                "-l",
+                "snapshot.name=t",
+                &src_path,
+                &to,
+            ]
+        );
+
+        storages
+            .copy_volume(
+                &rbd_pool(),
+                src,
+                raw,
+                Some("t"),
+                false,
+                &nfs_pool(),
+                dst,
+                qcow2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            taken(&log),
+            [
+                "rbd.volume_source",
+                "file.create_volume",
+                "rbd.release_source",
+            ]
+        );
+        let (from, dst_path) = (
+            format!(
+                "driver=raw,file.driver=rbd,file.pool=rbd,file.image=opl-{src},file.snapshot=t,file.user=opl"
+            ),
+            format!("/f/{dst}"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(tools.path().join("args"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "convert",
+                "-q",
+                "-n",
+                "--target-is-zero",
+                "--image-opts",
+                "-O",
+                "qcow2",
+                &from,
+                &dst_path,
+            ]
+        );
+    }
+
     /// 써 넣다 실패하면 만든 볼륨을 지우고, 원본은 어느 경우에도 내놓는다.
     #[tokio::test]
     async fn failed_copy_between_backends_cleans_up() {
@@ -1102,11 +1243,9 @@ mod tests {
     /// 복사가 취소돼도(future가 버려짐) 원본을 뒤에서 내놓는다.
     #[tokio::test]
     async fn cancelled_copy_between_backends_releases_the_source() {
-        use std::os::unix::fs::PermissionsExt;
         let tools = tempfile::tempdir().unwrap();
         let slow = tools.path().join("slow-qemu-img");
-        std::fs::write(&slow, "#!/bin/sh\nsleep 5\n").unwrap();
-        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::storage::tests::write_script(&slow, "#!/bin/sh\nsleep 5\n");
         let log = Log::default();
         let storages = Storages::new(slow, Arc::new(Recorder::new("file", "/f".as_ref(), &log)))
             .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)));
@@ -1161,6 +1300,7 @@ mod tests {
             format: raw,
             snapshot: None,
             size_bytes: 1 << 20,
+            rbd: None,
         };
         let target = storages.backend(&lvm_pool()).unwrap();
         storages
