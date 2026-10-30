@@ -1,7 +1,8 @@
 //! 실제 라이브 마이그레이션: 한 호스트의 opld 둘로 클러스터를 만들고, 공유 풀 디스크를 가진 UEFI VM을
 //! 실행 중에 다른 노드로 옮긴다. 확정 뒤 상태, 원본 QEMU 정리, UEFI 변수 파일, 디스크 내용, 마이그레이션
-//! 중의 `vm_busy`, 대상 포트가 막혀 실패하면 원본이 계속 도는지를 본다. 게스트에는 OS가 없으므로(UEFI
-//! 펌웨어만) 디스크 내용은 정지한 VM에서 `qemu-io`로 본다.
+//! 중의 `vm_busy`, 대상 포트가 막혀 실패하면 원본이 계속 도는지를 본다. 멈춘 UEFI VM을 옮겨 켜면 변수
+//! 파일이 따라가는지도 본다. 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용은 정지한 VM에서
+//! `qemu-io`로 본다.
 //! `cargo test -p opld --features migration-it --test migration`
 //! QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다. 이 Mac에서도 돈다(TCG).
 //!
@@ -401,6 +402,109 @@ async fn migrates_a_running_vm_between_two_nodes() {
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     assert!(!disk.exists());
     d.ctl(&["pool", "delete", "shared"]).await.unwrap();
+}
+
+/// 멈춘 UEFI VM을 다른 노드로 옮겨(`PUT`의 `node`) 켜면, 그 노드가 앞 노드의 변수 파일을 받아 켜고
+/// 변수 노드가 된다. 로컬로 만든 디렉터리 풀을 공유로 바꾸고(`pool set`), VM이 볼륨과 다른 노드에
+/// 있는 동안은 다시 로컬로 바꾸지 못하는지도 본다.
+#[tokio::test]
+async fn uefi_variables_follow_a_stopped_vm() {
+    let p = Pair::new("mig-vars", ["60180-60189", "60190-60199"]).await;
+    let (c, d) = (&p.c[0], &p.d[0]);
+    let (node1, node2) = (p.node_id(0).await, p.node_id(1).await);
+
+    let dir = tempfile::Builder::new()
+        .prefix("oplvars")
+        .tempdir_in("/tmp")
+        .unwrap();
+    d.ctl(&[
+        "pool",
+        "create",
+        "vars",
+        "--path",
+        dir.path().to_str().unwrap(),
+    ])
+    .await
+    .unwrap();
+    p.wait_pool_ready("vars").await;
+    d.ctl(&[
+        "volume",
+        "create",
+        "vars-root",
+        "--pool",
+        "vars",
+        "--size",
+        "64M",
+    ])
+    .await
+    .unwrap();
+    let out = d.ctl(&["pool", "set", "vars", "--shared"]).await.unwrap();
+    assert!(out.contains("storage pool vars: shared"), "{out}");
+
+    // 노드 1에서 켜면 그 노드가 변수 노드다. 끈 뒤 노드 1의 변수 파일 끝에 표식을 남긴다.
+    d.ctl(&[
+        "vm",
+        "create",
+        "web",
+        "--memory",
+        "256",
+        "--disk",
+        "vars-root",
+        "--node",
+        "node1",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    let vm = c.get("/vms/web").await.unwrap();
+    let uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    eventually("node 1 has the UEFI variables", || async {
+        let vm = c.get("/vms/web").await.unwrap();
+        vm["status"]["firmware_node"].as_str() == Some(node1.as_str())
+    })
+    .await;
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    let src_vars = opl_driver::uefi_vars_path(&p.d[0].data_dir(), uuid);
+    let dst_vars = opl_driver::uefi_vars_path(&p.d[1].data_dir(), uuid);
+    let mut content = std::fs::read(&src_vars).unwrap();
+    let at = content.len() - MARKER.len();
+    content[at..].copy_from_slice(MARKER);
+    std::fs::write(&src_vars, &content).unwrap();
+    assert!(!dst_vars.exists());
+
+    // 멈춘 채 노드 2로 옮긴다. VM이 볼륨과 다른 노드에 있으므로 풀을 로컬로 되돌릴 수 없다.
+    let mut spec = c.get("/vms/web").await.unwrap()["spec"].clone();
+    spec["node"] = json!(node2);
+    c.put("/vms/web", &json!({ "spec": spec })).await.unwrap();
+    let (status, body) = error(
+        c,
+        Method::PATCH,
+        "/storage-pools/vars",
+        json!({ "shared": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "pool_in_use", "{body}");
+
+    // 노드 2가 노드 1의 변수 파일을 받아 켜고 변수 노드가 된다. 노드 1의 파일은 남는다.
+    let out = d.ctl(&["vm", "start", "web"]).await.unwrap();
+    assert!(out.contains("vm web: start done"), "{out}");
+    assert!(std::fs::read(&dst_vars).unwrap().ends_with(MARKER));
+    assert!(src_vars.exists());
+    eventually("node 2 has the UEFI variables", || async {
+        let vm = c.get("/vms/web").await.unwrap();
+        vm["status"]["firmware_node"].as_str() == Some(node2.as_str())
+    })
+    .await;
+    assert!(process_with(&vm_run_dir(
+        &p.d[1],
+        vm["id"].as_str().unwrap()
+    )));
+
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", "vars-root"]).await.unwrap();
+    d.ctl(&["pool", "delete", "vars"]).await.unwrap();
 }
 
 /// NFS 풀(두 노드가 각자 마운트한다)
