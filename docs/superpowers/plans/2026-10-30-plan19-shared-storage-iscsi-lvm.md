@@ -22784,7 +22784,7 @@ Task 8의 확인에서 `cargo test -p opl-api --features storage-it`의 `snapsho
 - CI는 `opl-api`의 `storage-it` 중 `volumes`만 돌리므로 이 실패를 잡지 못했다. 계획을 마칠 때 `storage-it` 전체를 macOS에서 돌린다.
 
 테스트: macOS `cargo test --workspace` 653개, `opl-api` `storage-it` 223개, `opl-driver` `storage-it` `dir_storage` 8개, `qemu-it` `smoke`·`e2e`·`snapshots` 11개, 브라우저 E2E, 웹 Vitest 297개, `fmt`·`clippy -D warnings`(모든 기능). 실제 공유 LVM(`lvm-shared-it`)·RBD·ZFS·LVM·NFS는 Linux CI `linux-kvm`에서.
-CI(확인용 브랜치, 리뷰 수정마다): `check` 2개, `deny`, `web`, `linux-kvm`(실제 iSCSI 타깃과 sanlock 공유 VG의 드라이버 시험 5개와 E2E 포함)이 모두 통과했다. 위 수정은 main CI에서 확인한다.
+CI(확인용 브랜치, 리뷰 수정마다): `check` 2개, `deny`, `web`, `linux-kvm`(실제 iSCSI 타깃과 sanlock 공유 VG의 드라이버 시험 5개와 E2E 포함)이 모두 통과했다. 위 수정을 넣은 main(`7111679`)의 CI도 5개 작업이 모두 통과했다.
 
 ## 다음 계획으로 넘길 사항
 
