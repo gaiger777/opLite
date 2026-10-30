@@ -151,7 +151,7 @@ enum PoolCmd {
     Get {
         pool: String,
     },
-    /// 로컬 디렉터리 풀, NFS 풀, LVM-thin 풀, ZFS 풀, Ceph RBD 풀을 만든다.
+    /// 로컬 디렉터리 풀, NFS 풀, LVM-thin 풀, ZFS 풀, Ceph RBD 풀, 공유 LVM 풀을 만든다.
     Create(Box<PoolCreate>),
     Delete {
         pool: String,
@@ -159,7 +159,7 @@ enum PoolCmd {
 }
 
 #[derive(Args)]
-#[command(group(ArgGroup::new("kind").required(true).args(["path", "nfs", "lvm_thin", "zfs", "rbd"])))]
+#[command(group(ArgGroup::new("kind").required(true).args(["path", "nfs", "lvm_thin", "zfs", "rbd", "lvm_shared"])))]
 struct PoolCreate {
     name: String,
     /// 풀 디렉터리(절대 경로)
@@ -187,8 +187,17 @@ struct PoolCreate {
     /// RBD 풀에 쓸 ceph.conf 절대 경로. 생략하면 Ceph 기본(/etc/ceph/ceph.conf).
     #[arg(long, requires = "rbd", conflicts_with_all = ["path", "nfs", "lvm_thin", "zfs"])]
     rbd_conf: Option<String>,
+    /// 관리자가 준비한 공유 VG(lvmlockd). 늘 공유 풀이고 볼륨은 raw 두꺼운 LV만 담는다.
+    #[arg(long, conflicts_with_all = ["path", "nfs", "nfs_options", "lvm_thin", "zfs", "rbd", "rbd_user", "rbd_conf", "shared"])]
+    lvm_shared: Option<String>,
+    /// 공유 VG가 놓인 iSCSI 타깃의 포털 `HOST[:PORT]`(IPv6는 `[ADDR][:PORT]`). 노드가 로그인한다.
+    #[arg(long, requires_all = ["lvm_shared", "iscsi_target"], conflicts_with_all = ["path", "nfs", "lvm_thin", "zfs", "rbd"])]
+    iscsi_portal: Option<String>,
+    /// 공유 VG가 놓인 iSCSI 타깃 이름(IQN)
+    #[arg(long, requires_all = ["lvm_shared", "iscsi_portal"], conflicts_with_all = ["path", "nfs", "lvm_thin", "zfs", "rbd"])]
+    iscsi_target: Option<String>,
     /// `--path`가 모든 노드가 같은 데이터를 보는 공유 스토리지(밖에서 마운트한 공유 디렉터리)다.
-    /// NFS·RBD 풀은 늘 공유다.
+    /// NFS·RBD·공유 LVM 풀은 늘 공유다.
     #[arg(long, requires = "path", conflicts_with = "nfs")]
     shared: bool,
     /// 이 풀을 쓸 수 있는 노드 id. 생략하면 모든 노드.
@@ -196,7 +205,7 @@ struct PoolCreate {
     nodes: Vec<String>,
 }
 
-/// `pool create`의 요청 본문. NFS·RBD 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
+/// `pool create`의 요청 본문. NFS·RBD·공유 LVM 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
 fn pool_create_body(args: PoolCreate) -> Value {
     let PoolCreate {
         name,
@@ -208,22 +217,32 @@ fn pool_create_body(args: PoolCreate) -> Value {
         rbd,
         rbd_user,
         rbd_conf,
+        lvm_shared,
+        iscsi_portal,
+        iscsi_target,
         shared,
         nodes,
     } = args;
-    let backend = match (nfs, lvm_thin, zfs, rbd) {
-        (Some(n), _, _, _) => json!({
+    let backend = match (nfs, lvm_thin, zfs, rbd, lvm_shared) {
+        (Some(n), _, _, _, _) => json!({
             "kind": "nfs", "server": n.server, "export": n.export, "options": nfs_options
         }),
-        (None, Some(l), _, _) => {
+        (None, Some(l), _, _, _) => {
             json!({ "kind": "lvm-thin", "vg": l.vg, "thinpool": l.thinpool })
         }
-        (None, None, Some(dataset), _) => json!({ "kind": "zfs", "dataset": dataset }),
-        (None, None, None, Some(r)) => json!({
+        (None, None, Some(dataset), _, _) => json!({ "kind": "zfs", "dataset": dataset }),
+        (None, None, None, Some(r), _) => json!({
             "kind": "rbd", "pool": r.pool, "namespace": r.namespace,
             "user": rbd_user, "conf": rbd_conf
         }),
-        (None, None, None, None) => json!({ "kind": "dir", "path": path }),
+        (None, None, None, None, Some(vg)) => {
+            // 포털과 타깃은 clap이 함께 받게 한다.
+            let iscsi = iscsi_portal
+                .zip(iscsi_target)
+                .map(|(portal, target)| json!({ "portal": portal, "target": target }));
+            json!({ "kind": "lvm-shared", "vg": vg, "iscsi": iscsi })
+        }
+        (None, None, None, None, None) => json!({ "kind": "dir", "path": path }),
     };
     let mut spec = json!({ "backend": backend, "nodes": nodes });
     if shared {
@@ -350,7 +369,7 @@ enum VolumeCmd {
         /// 크기. 단위 K, M, G, T(1024 배수)를 붙일 수 있다.
         #[arg(long, value_parser = parse_size)]
         size: u64,
-        /// 생략하면 풀 종류로 정한다(LVM-thin, ZFS, RBD는 raw, 그 밖은 qcow2).
+        /// 생략하면 풀 종류로 정한다(LVM-thin, ZFS, RBD, 공유 LVM은 raw, 그 밖은 qcow2).
         #[arg(long, value_enum)]
         format: Option<Format>,
     },
@@ -363,7 +382,7 @@ enum VolumeCmd {
         file: PathBuf,
         #[arg(long, value_enum, default_value = "vmdk")]
         source_format: SourceFormat,
-        /// 생략하면 풀 종류로 정한다(LVM-thin, ZFS, RBD는 raw, 그 밖은 qcow2).
+        /// 생략하면 풀 종류로 정한다(LVM-thin, ZFS, RBD, 공유 LVM은 raw, 그 밖은 qcow2).
         #[arg(long, value_enum)]
         format: Option<Format>,
     },
@@ -636,11 +655,11 @@ async fn volume_format(
     }
 }
 
-/// 풀 종류의 기본 볼륨 형식: 블록 풀(LVM-thin, ZFS, RBD)은 raw(스냅샷은 블록 스냅샷), 파일 풀은
-/// qcow2
+/// 풀 종류의 기본 볼륨 형식: 블록 풀(LVM-thin, ZFS, RBD, 공유 LVM)은 raw(스냅샷은 블록 스냅샷,
+/// 공유 LVM은 스냅샷 없음), 파일 풀은 qcow2
 fn pool_default_format(pool: &Value) -> Format {
     let kind = &pool["spec"]["backend"]["kind"];
-    if kind == "lvm-thin" || kind == "zfs" || kind == "rbd" {
+    if kind == "lvm-thin" || kind == "zfs" || kind == "rbd" || kind == "lvm-shared" {
         Format::Raw
     } else {
         Format::Qcow2
@@ -1566,9 +1585,22 @@ fn pool_row(pool: &Value, nodes: &[Value]) -> Vec<String> {
 }
 
 /// 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`), LVM-thin 풀은
-/// `vg/thinpool`, ZFS 풀은 데이터셋, RBD 풀은 `pool[/namespace]`
+/// `vg/thinpool`, ZFS 풀은 데이터셋, RBD 풀은 `pool[/namespace]`, 공유 LVM 풀은 `vg`(iSCSI면
+/// `vg @ portal target`)
 fn pool_location(pool: &Value) -> String {
     let b = &pool["spec"]["backend"];
+    if b["kind"] == "lvm-shared" {
+        let iscsi = &b["iscsi"];
+        if iscsi.is_object() {
+            return format!(
+                "{} @ {} {}",
+                cell(&b["vg"]),
+                cell(&iscsi["portal"]),
+                cell(&iscsi["target"])
+            );
+        }
+        return cell(&b["vg"]);
+    }
     if b["kind"] == "rbd" {
         return match b["namespace"].as_str() {
             Some(namespace) => format!("{}/{namespace}", cell(&b["pool"])),
@@ -2150,11 +2182,18 @@ mod tests {
         ] {
             assert!(create(args).is_err(), "{args:?}");
         }
-        // 종류(--path, --nfs, --lvm-thin, --zfs, --rbd) 중 하나가 있어야 한다.
+        // 종류(--path, --nfs, --lvm-thin, --zfs, --rbd, --lvm-shared) 중 하나가 있어야 한다.
         let err = create(&[]).expect_err("a pool kind is required");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let msg = err.to_string();
-        for kind in ["--path", "--nfs", "--lvm-thin", "--zfs", "--rbd"] {
+        for kind in [
+            "--path",
+            "--nfs",
+            "--lvm-thin",
+            "--zfs",
+            "--rbd",
+            "--lvm-shared",
+        ] {
             assert!(msg.contains(kind), "{msg}");
         }
         assert!(create(&["--node", "a"]).is_err());
@@ -2298,6 +2337,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_lvm_shared_pool_create() {
+        let create = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "pool", "create", "san"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Pool {
+                    cmd: PoolCmd::Create(c),
+                } => (c.lvm_shared, c.iscsi_portal, c.iscsi_target),
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(
+            create(&["--lvm-shared", "san"]).unwrap(),
+            (Some("san".into()), None, None)
+        );
+        assert_eq!(
+            create(&[
+                "--lvm-shared",
+                "san",
+                "--iscsi-portal",
+                "10.0.0.5:3260",
+                "--iscsi-target",
+                "iqn.2003-01.org.example:san"
+            ])
+            .unwrap(),
+            (
+                Some("san".into()),
+                Some("10.0.0.5:3260".into()),
+                Some("iqn.2003-01.org.example:san".into())
+            )
+        );
+        // 다른 종류·--shared(늘 공유)와 함께 못 쓰고, 포털·타깃은 --lvm-shared와 함께, 둘이 함께
+        // 쓴다. 이름 규칙의 검사는 API가 한다.
+        for args in [
+            &["--lvm-shared", "san", "--path", "/srv/pool"][..],
+            &["--lvm-shared", "san", "--nfs", "nas:/srv/vm"],
+            &["--lvm-shared", "san", "--nfs-options", "hard"],
+            &["--lvm-shared", "san", "--lvm-thin", "vg0/tp"],
+            &["--lvm-shared", "san", "--zfs", "tank/opl"],
+            &["--lvm-shared", "san", "--rbd", "rbd"],
+            &["--lvm-shared", "san", "--rbd-user", "opl"],
+            &["--lvm-shared", "san", "--shared"],
+            &["--lvm-shared", "san", "--iscsi-portal", "nas"],
+            &[
+                "--lvm-shared",
+                "san",
+                "--iscsi-target",
+                "iqn.2003-01.org.example:san",
+            ],
+            &[
+                "--path",
+                "/srv/pool",
+                "--iscsi-portal",
+                "nas",
+                "--iscsi-target",
+                "iqn.2003-01.org.example:san",
+            ],
+            &["--lvm-shared"],
+        ] {
+            assert!(create(args).is_err(), "{args:?}");
+        }
+    }
+
+    /// 공유 LVM 풀은 VG와 iSCSI 타깃(없으면 null)을 담고 `shared`는 적지 않는다.
+    #[test]
+    fn pool_create_sends_the_lvm_shared_backend() {
+        let body = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "pool", "create", "san"];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Pool {
+                    cmd: PoolCmd::Create(c),
+                } => pool_create_body(*c),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(
+            body(&[
+                "--lvm-shared",
+                "san",
+                "--iscsi-portal",
+                "[fd00::5]:3260",
+                "--iscsi-target",
+                "iqn.2003-01.org.example:san"
+            ]),
+            json!({
+                "name": "san",
+                "spec": {
+                    "backend": {
+                        "kind": "lvm-shared", "vg": "san",
+                        "iscsi": { "portal": "[fd00::5]:3260", "target": "iqn.2003-01.org.example:san" }
+                    },
+                    "nodes": []
+                }
+            })
+        );
+        assert_eq!(
+            body(&["--lvm-shared", "san", "--node", "n1"])["spec"],
+            json!({
+                "backend": { "kind": "lvm-shared", "vg": "san", "iscsi": null },
+                "nodes": ["n1"]
+            })
+        );
+    }
+
     /// 풀을 읽지 못하면 --format을 주라고 알린다. 주면 풀을 읽지 않는다.
     #[tokio::test]
     async fn volume_format_explains_an_unreadable_pool() {
@@ -2326,6 +2471,7 @@ mod tests {
         assert_eq!(pool_default_format(&pool("lvm-thin")), Format::Raw);
         assert_eq!(pool_default_format(&pool("zfs")), Format::Raw);
         assert_eq!(pool_default_format(&pool("rbd")), Format::Raw);
+        assert_eq!(pool_default_format(&pool("lvm-shared")), Format::Raw);
         assert_eq!(pool_default_format(&pool("dir")), Format::Qcow2);
         assert_eq!(pool_default_format(&pool("nfs")), Format::Qcow2);
         // --format를 주지 않으면 풀을 읽어 정하고, 주면 그대로 쓴다.
@@ -2511,6 +2657,51 @@ mod tests {
             describe_pool(&opl),
             "pool: opl\nkind: rbd\nlocation: rbd/opl\nuser: opl\nconf: /etc/ceph/opl.conf\n\
              shared: true\n"
+        );
+        // 공유 LVM 풀의 위치는 `VG`, iSCSI면 `VG @ PORTAL TARGET`
+        let fc = json!({
+            "id": "id-fc",
+            "name": "fc",
+            "spec": {
+                "backend": { "kind": "lvm-shared", "vg": "san", "iscsi": null },
+                "nodes": [],
+                "shared": true,
+            },
+        });
+        assert_eq!(
+            pool_row(&fc, &nodes),
+            ["fc", "lvm-shared", "san", "all", "0/5"]
+        );
+        assert_eq!(
+            describe_pool(&fc),
+            "pool: fc\nkind: lvm-shared\nlocation: san\nshared: true\n"
+        );
+        let san = json!({
+            "id": "id-san",
+            "name": "san",
+            "spec": {
+                "backend": {
+                    "kind": "lvm-shared", "vg": "san",
+                    "iscsi": { "portal": "10.0.0.5:3260", "target": "iqn.2003-01.org.example:san" }
+                },
+                "nodes": ["id-a"],
+                "shared": true,
+            },
+        });
+        assert_eq!(
+            pool_row(&san, &nodes),
+            [
+                "san",
+                "lvm-shared",
+                "san @ 10.0.0.5:3260 iqn.2003-01.org.example:san",
+                "1",
+                "0/1"
+            ]
+        );
+        assert_eq!(
+            describe_pool(&san),
+            "pool: san\nkind: lvm-shared\nlocation: san @ 10.0.0.5:3260 \
+             iqn.2003-01.org.example:san\nshared: true\n"
         );
         let mut out = Vec::new();
         table(&mut out, POOL_NODE_HEADERS, &pool_node_rows(&local, &nodes)).unwrap();
