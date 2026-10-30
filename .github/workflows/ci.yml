@@ -72,6 +72,8 @@ jobs:
 
   # M7: 실제 KVM으로 VM을 띄우고 NIC를 브리지에 잇는다. tap과 브리지를 만들려면 root가 필요하고,
   # QEMU는 systemd 스코프로 감싼다(OPL_TEST_SYSTEMD). 웹 UI E2E는 브라우저로 같은 opld를 다룬다.
+  # 라이브 마이그레이션 E2E는 한 호스트의 opld 둘로 공유 디렉터리·NFS·RBD·공유 LVM 풀 위의 VM을 옮긴다
+  # (두 노드의 스코프 이름이 겹치므로 그 시험만 스코프를 끈다).
   linux-kvm:
     runs-on: ubuntu-latest
     timeout-minutes: 55
@@ -234,7 +236,7 @@ jobs:
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it
           OPL_TEST_NFS_EXPORT: /srv/opl-nfs
           OPL_TEST_LVM: opltest/tp
           OPL_TEST_ZFS: opltestz/opl

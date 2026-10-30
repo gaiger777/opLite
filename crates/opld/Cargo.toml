@@ -37,6 +37,9 @@ lvm-shared-it = []
 # 브라우저(Playwright)로 웹 UI를 확인하는 E2E. qemu-it의 준비물에 더해 pnpm과
 # `pnpm -C web exec playwright install chromium`, 빌드한 web/dist가 필요하다.
 web-it = ["qemu-it", "web-ui"]
+# 한 호스트의 opld 둘로 실행 중인 VM을 공유 풀 위에서 옮기는 라이브 마이그레이션 E2E. qemu-it의 준비물과
+# qemu-img, qemu-io가 필요하다. nfs-it·rbd-it·lvm-shared-it와 함께 켜면 그 풀로도 옮긴다(그 시험의 준비물).
+migration-it = []
 
 [dependencies]
 anyhow.workspace = true

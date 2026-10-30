@@ -33,6 +33,17 @@ pub fn free_port() -> u16 {
 impl Daemon {
     /// 유닉스 소켓 경로 길이 제한 때문에 /tmp 아래 짧은 경로를 쓴다.
     pub fn new(name: &str, extra_config: &str) -> Self {
+        // systemd가 있는 Linux(CI)에서만 `OPL_TEST_SYSTEMD=1`로 QEMU를 스코프로 감싼다.
+        let systemd_scope = std::env::var_os("OPL_TEST_SYSTEMD").is_some();
+        Self::with_hypervisor(
+            name,
+            extra_config,
+            &format!("systemd_scope = {systemd_scope}"),
+        )
+    }
+
+    /// `[hypervisor]` 절의 내용을 정해 만든다.
+    pub fn with_hypervisor(name: &str, extra_config: &str, hypervisor: &str) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("opl")
             .tempdir_in("/tmp")
@@ -41,13 +52,11 @@ impl Daemon {
         let cluster_port = free_port();
         let share =
             std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
-        // systemd가 있는 Linux(CI)에서만 `OPL_TEST_SYSTEMD=1`로 QEMU를 스코프로 감싼다.
-        let systemd_scope = std::env::var_os("OPL_TEST_SYSTEMD").is_some();
         let config = format!(
             "name = \"{name}\"\naddress = \"127.0.0.1\"\nlisten = \"127.0.0.1:{port}\"\n\
              cluster_listen = \"127.0.0.1:{cluster_port}\"\ncontrol_socket = \"{sock}\"\n\
              data_dir = \"{data}\"\nrun_dir = \"{run}\"\nqemu_share_dir = \"{share}\"\n{extra_config}\n\
-             [hypervisor]\nsystemd_scope = {systemd_scope}\n",
+             [hypervisor]\n{hypervisor}\n",
             sock = dir.path().join("opld.sock").display(),
             data = dir.path().join("data").display(),
             run = dir.path().join("run").display(),
