@@ -184,6 +184,18 @@ pub trait Storage: Send + Sync {
         format: ImageFormat,
     ) -> Result<Vec<String>, DriverError>;
 
+    /// 볼륨의 스냅샷 태그 중 만든 지 `age`가 지난 것(만든 순서). 공유 풀의 남은 태그 정리가 다른
+    /// 노드에서 막 찍는 스냅샷을 건드리지 않게 쓴다. 기본은 만든 시각을 모르므로 모든 태그다.
+    async fn snapshot_tags_older_than(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        _age: Duration,
+    ) -> Result<Vec<String>, DriverError> {
+        self.snapshot_tags(pool, id, format).await
+    }
+
     /// 정지한 볼륨의 크기를 `size_bytes`로 늘린다. 줄이지는 않는다(실패한다).
     /// 실제 크기는 `volume_info`로 확인한다.
     async fn resize_volume(

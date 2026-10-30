@@ -20,6 +20,7 @@ use opl_types::resource::{Kind, Resource};
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec};
 use opl_types::storage::{
     SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, VolumeStatus,
+    is_shared,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
@@ -30,6 +31,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::schedule::task_failed;
 use crate::snapshots::{uses_block_snapshots, vm_placement};
+use crate::volumes::usable_node;
 
 /// 새 Task를 저장소에 만든다. 이름은 id 문자열이다.
 pub(crate) async fn create_task(
@@ -60,6 +62,8 @@ pub struct TaskRunnerConfig {
     /// 풀이 마운트되지 않아 시작할 때 지우지 못한 고아 볼륨, 시간을 넘긴 블록 스냅샷이 남긴 태그를
     /// 다시 지워 보는 간격
     pub orphan_retry: Duration,
+    /// 블록 스냅샷이 남긴 태그를 다시 찾아 지우는 간격(시작할 때 한 번 찾고 그 뒤로)
+    pub tag_sweep: Duration,
 }
 
 impl TaskRunnerConfig {
@@ -71,6 +75,7 @@ impl TaskRunnerConfig {
             upload_dir: None,
             state_dir: None,
             orphan_retry: Duration::from_secs(60),
+            tag_sweep: Duration::from_secs(30 * 60),
         }
     }
 }
@@ -139,7 +144,7 @@ impl TaskRunner {
 /// `unmounted`는 풀이 마운트되지 않아 지우지 못한 고아 볼륨이다. 따로 다시 지워 본다.
 async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<Uuid>) {
     let retry = tokio::spawn(retry_orphans(ctx.clone(), unmounted));
-    let tags = tokio::spawn(sweep_block_tags(ctx.clone()));
+    let tags = tokio::spawn(sweep_block_tags_every(ctx.clone()));
     // 실행을 시작한 Task. 목록을 다시 읽을 때 같은 Task를 두 번 시작하지 않게 한다.
     let mut started: HashSet<Uuid> = HashSet::new();
     // 실행 중인 Task. 실행기가 멈출 때 함께 멈춘다.
@@ -220,10 +225,28 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<
     ctx.stopped.send_replace(true);
 }
 
-/// 시간을 넘긴 블록 스냅샷이 남긴 태그를 지운다: 이 노드가 맡는 블록 풀(LVM-thin, ZFS) 볼륨의
+/// 공유 풀에서 남은 태그로 보고 지우려면 스냅샷이 만들어진 뒤 지나야 하는 시간. 다른 노드의 스냅샷
+/// Task가 막 찍은 태그를 그 리소스보다 먼저 보고 지우지 않게 한다.
+const SHARED_TAG_MIN_AGE: Duration = Duration::from_secs(30 * 60);
+
+/// 남은 블록 스냅샷 태그를 시작할 때와 그 뒤 `tag_sweep`마다 지운다([`sweep_block_tags`]). 실행기가
+/// 멈추면 함께 멈춘다.
+async fn sweep_block_tags_every(ctx: Arc<Ctx>) {
+    loop {
+        sweep_block_tags(ctx.clone()).await;
+        tokio::time::sleep(ctx.config.tag_sweep).await;
+    }
+}
+
+/// 시간을 넘긴 블록 스냅샷이 남긴 태그를 지운다: 이 노드가 맡는 블록 풀(LVM-thin, ZFS, RBD) 볼륨의
 /// 태그 중 UUID 모양인데 그 id의 스냅샷 리소스가 없는 것. 스냅샷 Task는 리소스를 만든 뒤 태그를
 /// 찍고 태그를 지운 뒤 리소스를 지우므로 그런 태그는 남은 것이다. opLite 밖에서 만든 태그는 두고,
 /// 스토리지 명령이 느려도 실행기 시작을 막지 않게 뒤에서 돈다.
+///
+/// 노드 로컬 풀의 볼륨은 그 볼륨을 만든 노드가 맡는다. 공유 풀(RBD)의 볼륨은 어느 노드에서나
+/// 보이므로 노드마다 같은 답이 나오게 풀을 쓸 수 있는 온라인 노드 가운데 id가 가장 작은 노드가
+/// 맡는다(그런 노드가 없으면 만든 노드). 공유 풀에서는 다른 노드의 Task가 막 찍은 태그일 수 있으므로
+/// 만든 지 [`SHARED_TAG_MIN_AGE`]가 지난 태그만 지운다.
 async fn sweep_block_tags(ctx: Arc<Ctx>) {
     let volumes = match ctx.cluster.list::<VolumeSpec>() {
         Ok((_, volumes)) => volumes,
@@ -233,9 +256,7 @@ async fn sweep_block_tags(ctx: Arc<Ctx>) {
         }
     };
     for volume in volumes {
-        if volume.status.phase != VolumePhase::Ready
-            || volume.status.node.is_some_and(|n| n != ctx.config.node)
-        {
+        if volume.status.phase != VolumePhase::Ready {
             continue;
         }
         let Ok(Some(pool)) = ctx
@@ -247,8 +268,27 @@ async fn sweep_block_tags(ctx: Arc<Ctx>) {
         if !uses_block_snapshots(&pool) {
             continue;
         }
+        let shared = is_shared(&pool);
+        let owner = if shared {
+            usable_node(&ctx.cluster, &pool, None)
+                .ok()
+                .flatten()
+                .or(volume.status.node)
+        } else {
+            volume.status.node
+        };
+        if owner.is_some_and(|n| n != ctx.config.node) {
+            continue;
+        }
         let format = volume.spec.format;
-        let tags = match ctx.storage.snapshot_tags(&pool, volume.id, format).await {
+        let tags = if shared {
+            ctx.storage
+                .snapshot_tags_older_than(&pool, volume.id, format, SHARED_TAG_MIN_AGE)
+                .await
+        } else {
+            ctx.storage.snapshot_tags(&pool, volume.id, format).await
+        };
+        let tags = match tags {
             Ok(tags) => tags,
             Err(e) => {
                 tracing::debug!(volume = %volume.name, error = %e, "cannot read block snapshots");

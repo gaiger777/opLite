@@ -45,9 +45,13 @@ use crate::state::AppState;
 use crate::tasks::create_task;
 
 /// 볼륨 파일 작업을 실행할 노드. 이 노드에서 풀을 쓸 수 있으면 이 노드, 아니면 풀을 쓸 수 있는
-/// 온라인 노드 가운데 id가 가장 작은 노드다. 그런 노드가 없으면 409 `pool_unavailable`.
+/// 온라인 노드 가운데 id가 가장 작은 노드다. RBD 풀은 이 노드를 앞세우지 않고 늘 id가 가장 작은
+/// 노드다: 이미지를 바꾸는 명령이 아직 돌고 있다는 표시가 노드마다 따로이므로 한 볼륨의 Task가 같은
+/// 노드에서 돌게 한다. 그런 노드가 없으면 409 `pool_unavailable`.
 fn pool_node(state: &AppState, pool: &StoragePool) -> Result<Uuid, ApiError> {
-    usable_node(&state.cluster, pool, Some(state.node))?.ok_or_else(|| {
+    let rbd = matches!(pool.spec.backend, PoolBackend::Rbd { .. });
+    let prefer = (!rbd).then_some(state.node);
+    usable_node(&state.cluster, pool, prefer)?.ok_or_else(|| {
         ApiError::conflict(
             "pool_unavailable",
             format!("storage pool {:?} is not ready on any node", pool.name),

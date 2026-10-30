@@ -319,6 +319,59 @@ async fn rbd_pools_are_always_shared_and_hold_raw_volumes() {
     assert_eq!(volume["spec"]["format"], "raw", "{volume}");
 }
 
+/// RBD 풀의 볼륨 Task(만들기, 지우기, 쓰는 VM이 없는 크기 늘리기)는 이 노드에서 풀이 준비됐어도 풀이
+/// 준비된 온라인 노드 가운데 id가 가장 작은 노드가 맡는다. 바꾸는 명령이 아직 돌고 있다는 표시가
+/// 노드마다 따로이므로 한 볼륨의 Task가 늘 같은 노드에서 돌게 한다.
+#[tokio::test]
+async fn rbd_volume_tasks_go_to_the_lowest_ready_node() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let admin = env.admin().await;
+    let rbd = json!({ "kind": "rbd", "pool": "rbd" });
+    let (status, body) = admin.post("/storage-pools", pool("ceph", rbd)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    env.pool_ready("ceph").await;
+    let mut low: Node = Resource::new(
+        "low",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+        },
+    );
+    low.id = Uuid::nil();
+    env.cluster.create(&low).await.unwrap();
+    low.status.online = true;
+    env.cluster
+        .update_status::<NodeSpec>(low.id, &low.status)
+        .await
+        .unwrap();
+    common::mark_pool_ready(&env.cluster, low.id, "ceph").await;
+    let low = low.id.to_string();
+
+    let body = json!({
+        "name": "r",
+        "spec": { "pool": "ceph", "size_bytes": 1 << 20, "format": "raw" }
+    });
+    let (status, task) = admin.post("/volumes", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], low, "{task}");
+    let mut v = env.cluster.get_by_name::<VolumeSpec>("r").unwrap().unwrap();
+    v.status.phase = VolumePhase::Ready;
+    v.status.node = Some(env.node);
+    env.cluster
+        .update_status::<VolumeSpec>(v.id, &v.status)
+        .await
+        .unwrap();
+    let (status, task) = admin
+        .post("/volumes/r/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], low, "{task}");
+    let (status, task) = admin.delete("/volumes/r").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], low, "{task}");
+}
+
 /// 풀 `pools`가 준비됐다고 알린 다른 노드를 저장소에 직접 만든다.
 async fn other_node(env: &Env, name: &str, online: bool, pools: &[&str]) -> Uuid {
     let mut node: Node = Resource::new(

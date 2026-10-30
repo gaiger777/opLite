@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_types::runtime::ImageFormat;
@@ -277,6 +278,18 @@ impl Storage for Storages {
         format: ImageFormat,
     ) -> Result<Vec<String>, DriverError> {
         self.backend(pool)?.snapshot_tags(pool, id, format).await
+    }
+
+    async fn snapshot_tags_older_than(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        age: Duration,
+    ) -> Result<Vec<String>, DriverError> {
+        self.backend(pool)?
+            .snapshot_tags_older_than(pool, id, format, age)
+            .await
     }
 
     async fn resize_volume(
@@ -602,6 +615,16 @@ mod tests {
             self.call("snapshot_tags")?;
             Ok(vec![])
         }
+        async fn snapshot_tags_older_than(
+            &self,
+            _: &StoragePool,
+            _: Uuid,
+            _: ImageFormat,
+            _: Duration,
+        ) -> Result<Vec<String>, DriverError> {
+            self.call("snapshot_tags_older_than")?;
+            Ok(vec![])
+        }
         async fn resize_volume(
             &self,
             _: &StoragePool,
@@ -755,6 +778,10 @@ mod tests {
             storages.snapshot_revert(&p, id, f, "t").await.unwrap();
             storages.snapshot_delete(&p, id, f, "t").await.unwrap();
             storages.snapshot_tags(&p, id, f).await.unwrap();
+            storages
+                .snapshot_tags_older_than(&p, id, f, Duration::from_secs(60))
+                .await
+                .unwrap();
             storages.resize_volume(&p, id, f, 2).await.unwrap();
             storages.volume_source(&p, id, f, None).await.unwrap();
             storages.release_source(&p, id, f, None).await.unwrap();
@@ -776,6 +803,7 @@ mod tests {
                 "snapshot_revert",
                 "snapshot_delete",
                 "snapshot_tags",
+                "snapshot_tags_older_than",
                 "resize_volume",
                 "volume_source",
                 "release_source",

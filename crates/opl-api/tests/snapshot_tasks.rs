@@ -1,5 +1,5 @@
 //! 스냅샷 Task 실행: 실행 중인 VM(Mock 하이퍼바이저)의 만들기·삭제, 부모와 현재 위치, 실패 정리,
-//! 디스크 없는 VM 되돌리기, 시작할 때의 고아 정리, 실행 중인 VM의 블록(LVM, ZFS) 스냅샷과 크기
+//! 디스크 없는 VM 되돌리기, 시작할 때의 고아 정리, 실행 중인 VM의 블록(LVM, ZFS, RBD) 스냅샷과 크기
 //! 늘리기. 디스크 파일을 다루는 경우는 `snapshot_disks`.
 
 mod common;
@@ -807,6 +807,25 @@ fn zfs(dataset: &str) -> PoolBackend {
     }
 }
 
+fn rbd(pool: &str) -> PoolBackend {
+    PoolBackend::Rbd {
+        pool: pool.into(),
+        namespace: None,
+        user: None,
+        conf: None,
+    }
+}
+
+/// 볼륨을 `node`가 만든 것으로 기록한다.
+async fn set_volume_node(env: &Env, id: Uuid, node: Uuid) {
+    let mut volume = env.cluster.get::<VolumeSpec>(id).unwrap().unwrap();
+    volume.status.node = Some(node);
+    env.cluster
+        .update_status::<VolumeSpec>(id, &volume.status)
+        .await
+        .unwrap();
+}
+
 /// 블록 풀들(이름, 백엔드, 볼륨 이름)과 각 풀의 바로 Ready인 1 MiB raw 볼륨을 저장소에 직접 만들고,
 /// 파일 없는 스토리지로 실행기를 다시 띄운다(볼륨은 1 MiB로 알린다). id는 볼륨을 적은 순서다.
 async fn block_volumes(
@@ -1183,6 +1202,134 @@ async fn block_snapshot_tags_without_snapshots_are_removed_at_startup() {
     }
     assert_eq!(storage.tags(vols[0]), [a.as_str(), "autosnap_hourly"]);
     assert_eq!(storage.tags(vols[1]), [orphan.as_str()]);
+}
+
+/// 공유 블록 풀(RBD)의 볼륨은 어느 노드에서나 보이므로, 시작할 때 남은 태그는 볼륨을 만든 노드가
+/// 아니라 풀을 쓸 수 있는 온라인 노드 가운데 id가 가장 작은 노드가 지운다.
+#[tokio::test]
+async fn shared_block_pool_tags_are_removed_by_one_usable_node_at_startup() {
+    let mut env = Env::start().await;
+    let (vols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("ceph", rbd("rbd"), &["r0"]),
+            ("thin", lvm("vg0"), &["lv0"]),
+        ],
+    )
+    .await;
+    let orphan = Uuid::now_v7().to_string();
+    // 다른 노드(지금은 클러스터에 없다)가 만든 RBD 볼륨도 이 노드가 지운다.
+    set_volume_node(&env, vols[0], Uuid::now_v7()).await;
+    storage.set_tags(vols[0], &[&orphan]);
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    wait_untagged(&storage, vols[0]).await;
+
+    // id가 더 작은 온라인 노드도 그 풀을 쓸 수 있으면 그 노드에 맡긴다. 뒤에 만든 이 노드의 LVM
+    // 볼륨이 지워지면 RBD 볼륨은 이미 지나갔다.
+    let mut low: opl_types::node::Node = Resource::new(
+        "low",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+        },
+    );
+    low.id = Uuid::nil();
+    env.cluster.create(&low).await.unwrap();
+    low.status.online = true;
+    env.cluster
+        .update_status::<NodeSpec>(low.id, &low.status)
+        .await
+        .unwrap();
+    common::mark_pool_ready(&env.cluster, low.id, "ceph").await;
+    storage.set_tags(vols[0], &[&orphan]);
+    storage.set_tags(vols[1], &[&orphan]);
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    wait_untagged(&storage, vols[1]).await;
+    assert_eq!(storage.tags(vols[0]), [orphan.as_str()]);
+}
+
+/// 남은 태그 정리는 시작할 때뿐 아니라 `tag_sweep`마다 돈다. 공유 풀(RBD)에서는 만든 지 오래된
+/// 태그만 지운다(다른 노드의 Task가 막 찍은 태그일 수 있다). 노드 로컬 풀은 나이를 보지 않는다.
+#[tokio::test]
+async fn block_tags_are_swept_periodically_sparing_new_shared_tags() {
+    let mut env = Env::start().await;
+    let (vols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("ceph", rbd("rbd"), &["r0"]),
+            ("thin", lvm("vg0"), &["lv0"]),
+        ],
+    )
+    .await;
+    let sweep = std::time::Duration::from_millis(100);
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |c| c.tag_sweep = sweep)
+        .await;
+    // 실행기가 시작한 뒤에 남은 태그
+    tokio::time::sleep(sweep).await;
+    let (old, new) = (Uuid::now_v7().to_string(), Uuid::now_v7().to_string());
+    storage.mark_fresh(&new);
+    storage.set_tags(vols[0], &[&old, &new]);
+    storage.set_tags(vols[1], &[&new]);
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while storage.tags(vols[0]).len() != 1 || !storage.tags(vols[1]).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(sweep * 3).await;
+    assert_eq!(storage.tags(vols[0]), [new.as_str()]);
+}
+
+/// RBD 디스크: 실행 중인 VM을 멈추고 찍으며 메모리는 담지 못한다. 다른 노드가 만든 볼륨도 공유
+/// 풀이라 이 노드에서 찍고, 가장 최근이 아닌 스냅샷으로도(디스크에 더 최근 스냅샷이 있어도)
+/// 되돌린다.
+#[tokio::test]
+async fn rbd_disks_snapshot_anywhere_and_revert_to_any_snapshot() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vols, storage) = block_volumes(&mut env, &[("ceph", rbd("rbd"), &["r0", "r1"])]).await;
+    set_volume_node(&env, vols[1], Uuid::now_v7()).await;
+    let vm = running_block_vm(&env, &admin, "web", &["r0", "r1"]).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert!(env.hv.is_paused(vm));
+    storage.resume();
+    succeeded(&admin.wait_task(&task).await);
+    assert!(!env.hv.is_paused(vm));
+    assert_eq!(storage.snapshot_groups(), [vec![vols[0], vols[1]]]);
+    assert!(env.hv.snapshots(vm).is_empty());
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "m", "memory": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("rbd disks"),
+        "{body}"
+    );
+
+    succeeded(&snapshot(&admin, "web", json!({ "name": "b" })).await);
+    let (a, b) = (
+        get(&env, vm, "a").id.to_string(),
+        get(&env, vm, "b").id.to_string(),
+    );
+    storage.set_tags(vols[1], &[&a, &b, "backup"]);
+    let (status, task) = admin.post("/vms/web/snapshots/a/revert", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let reverts: Vec<_> = storage
+        .calls()
+        .into_iter()
+        .filter(|(call, _)| *call == "revert")
+        .collect();
+    assert_eq!(reverts, [("revert", vols[0]), ("revert", vols[1])]);
+    assert_eq!(storage.tags(vols[1]), [a.as_str(), b.as_str(), "backup"]);
 }
 
 /// 실행 중인 VM의 ZFS 스냅샷: VM을 멈추고 같은 풀의 디스크를 한 번에 찍는다. 풀이 다르면 풀마다

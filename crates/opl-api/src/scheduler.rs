@@ -294,6 +294,20 @@ mod tests {
             [false, true, true],
         );
         assert_eq!(schedule(Uuid::now_v7(), &me, &shared), Ok(mid.id));
+        // RBD 풀은 `shared` 값과 상관없이 공유다. 볼륨을 만든 노드에 묶이지 않는다.
+        let mut ceph = pool("ceph", false);
+        ceph.spec.backend = PoolBackend::Rbd {
+            pool: "rbd".into(),
+            namespace: None,
+            user: None,
+            conf: None,
+        };
+        let rbd = inv(
+            ceph,
+            volume("root", "ceph", Some(small.id)),
+            [false, true, true],
+        );
+        assert_eq!(schedule(Uuid::now_v7(), &me, &rbd), Ok(mid.id));
         // 상태를 알리지 않은 노드(옛 노드, 첫 새로 고침 전)는 NFS 풀에는 후보가 아니고, 디렉터리
         // 풀에는 후보다.
         let mut nfs = pool("nas", true);

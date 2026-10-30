@@ -463,6 +463,8 @@ pub struct FakeStorage {
     tags: std::sync::Mutex<std::collections::HashMap<Uuid, Vec<String>>>,
     /// 볼륨마다 남은 횟수만큼 `snapshot_delete`가 일시 오류다(앞 명령이 아직 돈다).
     busy_deletes: std::sync::Mutex<std::collections::HashMap<Uuid, usize>>,
+    /// 막 만든 스냅샷 태그. `snapshot_tags_older_than`이 고르지 않는다.
+    fresh_tags: std::sync::Mutex<Vec<String>>,
 }
 
 impl FakeStorage {
@@ -508,6 +510,11 @@ impl FakeStorage {
             .get(&id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// 태그 `tag`를 막 만든 것으로 둔다(`snapshot_tags_older_than`이 고르지 않는다).
+    pub fn mark_fresh(&self, tag: &str) {
+        self.fresh_tags.lock().unwrap().push(tag.into());
     }
 
     /// 볼륨 `id`의 스냅샷 태그를 바꾼다(opLite 밖에서 만든 스냅샷 등).
@@ -689,6 +696,20 @@ impl Storage for FakeStorage {
         _: ImageFormat,
     ) -> Result<Vec<String>, DriverError> {
         Ok(self.tags(id))
+    }
+    async fn snapshot_tags_older_than(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+        _: Duration,
+    ) -> Result<Vec<String>, DriverError> {
+        let fresh = self.fresh_tags.lock().unwrap().clone();
+        Ok(self
+            .tags(id)
+            .into_iter()
+            .filter(|t| !fresh.contains(t))
+            .collect())
     }
     async fn resize_volume(
         &self,

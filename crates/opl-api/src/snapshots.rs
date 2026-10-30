@@ -177,7 +177,7 @@ pub(crate) fn block_snapshot_kind(pool: &StoragePool) -> Option<&'static str> {
     }
 }
 
-/// 디스크 스냅샷을 블록 스냅샷으로 두는 풀(LVM-thin, ZFS)인지. 아니면 qcow2 내부 스냅샷이다.
+/// 디스크 스냅샷을 블록 스냅샷으로 두는 풀(LVM-thin, ZFS, RBD)인지. 아니면 qcow2 내부 스냅샷이다.
 pub(crate) fn uses_block_snapshots(pool: &StoragePool) -> bool {
     block_snapshot_kind(pool).is_some()
 }

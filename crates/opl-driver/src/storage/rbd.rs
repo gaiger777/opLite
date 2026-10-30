@@ -784,6 +784,29 @@ impl Storage for RbdStorage {
         Ok(())
     }
 
+    /// 만든 시각(`rbd snap ls`의 `timestamp`)으로 고른다. 시각을 알 수 없는 태그는 고르지 않는다.
+    async fn snapshot_tags_older_than(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        age: Duration,
+    ) -> Result<Vec<String>, DriverError> {
+        let image = Self::target(pool, id, format)?;
+        self.existing(&image, id).await?;
+        let now = SystemTime::now();
+        let snapshots = self.ops.snapshots(&image).await?;
+        Ok(snapshots
+            .into_iter()
+            .filter(|s| {
+                s.created
+                    .and_then(|t| now.duration_since(t).ok())
+                    .is_some_and(|d| d > age)
+            })
+            .map(|s| s.tag)
+            .collect())
+    }
+
     /// 만든 순서다.
     async fn snapshot_tags(
         &self,
@@ -879,8 +902,8 @@ mod tests {
     #[derive(Debug, Clone, PartialEq)]
     struct FakeImage {
         size: u64,
-        /// 만든 순서의 스냅샷(태그, 크기)
-        snapshots: Vec<(String, u64)>,
+        /// 만든 순서의 스냅샷(태그, 크기, 만든 시각)
+        snapshots: Vec<(String, u64, Option<SystemTime>)>,
     }
 
     /// Ceph 풀 `rbd`, `other`를 메모리에 두는 RBD. 이미지는 사양(`{pool}[/{ns}]/{image}`)으로
@@ -922,6 +945,13 @@ mod tests {
 
         fn image(&self, spec: &str) -> Option<FakeImage> {
             self.images.lock().unwrap().get(spec).cloned()
+        }
+
+        /// 이미지 `spec`의 스냅샷 `tag`를 만든 시각을 바꾼다.
+        fn set_created(&self, spec: &str, tag: &str, created: Option<SystemTime>) {
+            let mut images = self.images.lock().unwrap();
+            let snapshots = &mut images.get_mut(spec).unwrap().snapshots;
+            snapshots.iter_mut().find(|s| s.0 == tag).unwrap().2 = created;
         }
 
         fn missing(spec: &str) -> DriverError {
@@ -1001,10 +1031,10 @@ mod tests {
             let i = self.image(&spec).ok_or_else(|| Self::missing(&spec))?;
             Ok(i.snapshots
                 .iter()
-                .map(|(tag, size)| RbdSnapshot {
+                .map(|(tag, size, created)| RbdSnapshot {
                     tag: tag.clone(),
                     size_bytes: *size,
-                    created: None,
+                    created: *created,
                 })
                 .collect())
         }
@@ -1014,7 +1044,8 @@ mod tests {
             self.call(format!("snap create {spec}@{tag}"))?;
             let mut images = self.images.lock().unwrap();
             let i = images.get_mut(&spec).ok_or_else(|| Self::missing(&spec))?;
-            i.snapshots.push((tag.into(), i.size));
+            i.snapshots
+                .push((tag.into(), i.size, Some(SystemTime::now())));
             Ok(())
         }
 
@@ -1023,10 +1054,10 @@ mod tests {
             self.call(format!("snap rollback {spec}@{tag}"))?;
             let mut images = self.images.lock().unwrap();
             let i = images.get_mut(&spec).ok_or_else(|| Self::missing(&spec))?;
-            let (_, size) = i
+            let (_, size, _) = i
                 .snapshots
                 .iter()
-                .find(|(t, _)| t == tag)
+                .find(|(t, _, _)| t == tag)
                 .cloned()
                 .ok_or_else(|| Self::missing(&format!("{spec}@{tag}")))?;
             i.size = size;
@@ -1038,7 +1069,7 @@ mod tests {
             self.call(format!("snap rm {spec}@{tag}"))?;
             let mut images = self.images.lock().unwrap();
             let i = images.get_mut(&spec).ok_or_else(|| Self::missing(&spec))?;
-            i.snapshots.retain(|(t, _)| t != tag);
+            i.snapshots.retain(|(t, _, _)| t != tag);
             Ok(())
         }
 
@@ -1480,6 +1511,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
+    }
+
+    /// 만든 지 오래된 태그만 고른다. 만든 시각을 알 수 없는 태그는 고르지 않는다.
+    #[tokio::test]
+    async fn old_snapshot_tags_by_creation_time() {
+        let (rbd, storage) = setup("/nonexistent/qemu-img");
+        let (p, id) = (pool(), Uuid::now_v7());
+        let age = Duration::from_secs(30 * 60);
+        not_found(
+            storage
+                .snapshot_tags_older_than(&p, id, RAW, age)
+                .await
+                .unwrap_err(),
+            id,
+        );
+        storage.create_volume(&p, id, MIB, RAW).await.unwrap();
+        for tag in ["old", "new", "unknown", "older"] {
+            storage.snapshot_create(&p, id, RAW, tag).await.unwrap();
+        }
+        let ago = |secs| Some(SystemTime::now() - Duration::from_secs(secs));
+        rbd.set_created(&spec(id), "old", ago(31 * 60));
+        rbd.set_created(&spec(id), "new", ago(29 * 60));
+        rbd.set_created(&spec(id), "unknown", None);
+        rbd.set_created(&spec(id), "older", ago(24 * 3600));
+        assert_eq!(
+            storage
+                .snapshot_tags_older_than(&p, id, RAW, age)
+                .await
+                .unwrap(),
+            ["old", "older"]
+        );
     }
 
     /// 여러 볼륨은 하나씩 찍는다.

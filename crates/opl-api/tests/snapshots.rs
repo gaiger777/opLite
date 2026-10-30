@@ -380,6 +380,22 @@ async fn zfs_volume(env: &Env, name: &str) {
     block_volume(env, "zfs", backend, name, ImageFormat::Raw).await;
 }
 
+/// RBD 풀 `ceph`와 그 풀의 바로 Ready인 raw 볼륨 `name`을 저장소에 직접 만든다.
+async fn rbd_volume(env: &Env, name: &str) -> Uuid {
+    let backend = PoolBackend::Rbd {
+        pool: "rbd".into(),
+        namespace: None,
+        user: None,
+        conf: None,
+    };
+    block_volume(env, "ceph", backend, name, ImageFormat::Raw).await;
+    env.cluster
+        .get_by_name::<VolumeSpec>(name)
+        .unwrap()
+        .unwrap()
+        .id
+}
+
 #[tokio::test]
 async fn lvm_disks_take_disk_snapshots_of_one_method() {
     let env = env().await;
@@ -590,6 +606,67 @@ async fn zfs_revert_only_blocked_by_newer_snapshots_of_the_same_volume() {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], "snapshot_unsupported");
     }
+}
+
+/// RBD 디스크는 자기 종류의 블록 스냅샷을 쓰고(메모리 없이, 다른 블록 종류와 섞지 않는다) 어느
+/// 스냅샷으로나 되돌린다. 공유 풀이라 배치된 적 없는 VM의 Task는 볼륨을 만든 노드가 아니라 풀을
+/// 쓸 수 있는 노드에서 한다.
+#[tokio::test]
+async fn rbd_disks_revert_to_any_snapshot_and_run_where_the_pool_is_usable() {
+    let env = env().await;
+    let admin = env.admin().await;
+    let r0 = rbd_volume(&env, "r0").await;
+    rbd_volume(&env, "r1").await;
+    zfs_volume(&env, "z0").await;
+    let mut volume = env.cluster.get::<VolumeSpec>(r0).unwrap().unwrap();
+    volume.status.node = Some(Uuid::now_v7());
+    env.cluster
+        .update_status::<VolumeSpec>(r0, &volume.status)
+        .await
+        .unwrap();
+
+    let web = vm_with_disks(&admin, "web", &["r0"]).await;
+    for name in ["s1", "s2"] {
+        let (status, task) = admin
+            .post("/vms/web/snapshots", json!({ "name": name }))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        assert_eq!(task["spec"]["node"], env.node.to_string());
+        finish_tasks(&env).await;
+    }
+    mark_ready_at(&env, snapshot_of(&env, web, "s1").await.id, 10).await;
+    mark_ready_at(&env, snapshot_of(&env, web, "s2").await.id, 20).await;
+    let (status, task) = admin
+        .post("/vms/web/snapshots/s1/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], env.node.to_string());
+    finish_tasks(&env).await;
+
+    // 실행 중이어도 메모리는 담지 못한다.
+    set_vm_status(&env, web, VmPhase::Running, Some(env.node)).await;
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "m", "memory": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("rbd disks"),
+        "{body}"
+    );
+
+    // 블록 스냅샷이어도 RBD와 ZFS는 섞지 않는다.
+    vm_with_disks(&admin, "mixed", &["r1", "z0"]).await;
+    let (status, body) = admin
+        .post("/vms/mixed/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("different snapshot methods"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
