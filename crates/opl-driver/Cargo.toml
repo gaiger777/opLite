@@ -20,6 +20,11 @@ lvm-it = []
 # 실제 ZFS 풀의 통합 테스트. Linux에서 root, zfsutils-linux, qemu-img, qemu-io와 테스트가 zvol을 만들고
 # 지워도 되는 데이터셋(`OPL_TEST_ZFS=POOL/DATASET`)이 필요하다.
 zfs-it = []
+# 실제 Ceph RBD 풀의 통합 테스트. Linux에서 root, ceph-common, qemu-block-extra, qemu-img, qemu-io,
+# `client.admin`으로 접속할 수 있는 ceph.conf·키링과 테스트가 이미지를 만들고 지워도 되는 Ceph 풀
+# (`OPL_TEST_RBD=POOL`)이 필요하다. 제한된 사용자 시험은 `OPL_TEST_RBD_USER`·`OPL_TEST_RBD_NAMESPACE`·
+# `OPL_TEST_RBD_CONF`가 있을 때만 돈다.
+rbd-it = []
 
 [dependencies]
 async-trait.workspace = true

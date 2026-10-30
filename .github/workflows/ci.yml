@@ -74,7 +74,7 @@ jobs:
   # QEMU는 systemd 스코프로 감싼다(OPL_TEST_SYSTEMD). 웹 UI E2E는 브라우저로 같은 opld를 다룬다.
   linux-kvm:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 55
     # root로 도는 테스트도 runner가 설치한 브라우저를 쓴다.
     env:
       PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
@@ -137,16 +137,75 @@ jobs:
           sudo zfs list -r opltestz
           zfs version
           sudo zpool status opltestz
+      # RBD 풀 시험이 이미지를 만들 Ceph 풀 `rbd`. microceph로 노드 하나짜리 Ceph(루프 파일 OSD 하나,
+      # 복제 1)를 띄운다. ceph-common의 rbd·ceph와 QEMU(qemu-block-extra의 librbd)가 Ceph 기본 위치에서
+      # 읽도록 microceph의 ceph.conf와 키링을 /etc/ceph에 둔다. 제한된 사용자 시험을 위해 네임스페이스
+      # `rbd/opl`과 사용자 `client.opltest`(caps `profile rbd`)를 만들고, 그 키링은 Ceph 기본 위치가 아닌
+      # /etc/opl-ceph에 두어 그곳의 ceph.conf로만 찾게 한다.
+      - name: Ceph (microceph) with an rbd pool
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ceph-common qemu-block-extra jq
+          sudo snap install microceph --channel squid/stable
+          sudo snap refresh --hold microceph
+          # microceph의 별칭(/snap/bin/rbd·ceph 등)은 snap에 갇힌 클라이언트라 /etc/opl-ceph와 시험의
+          # /tmp(snap 전용 /tmp)를 보지 못한다. 시험은 `sudo -E env "PATH=$PATH"`로 돌고 러너의 PATH는
+          # /snap/bin이 /usr/bin보다 앞이므로 별칭을 없애 ceph-common의 명령을 쓰게 한다.
+          snap aliases microceph
+          if snap aliases microceph | grep -q '^microceph\.'; then sudo snap unalias microceph; fi
+          sudo env "PATH=$PATH" sh -c 'echo "PATH=$PATH"; command -v rbd ceph qemu-img qemu-io'
+          test "$(sudo env "PATH=$PATH" sh -c 'command -v rbd')" = /usr/bin/rbd
+          test "$(sudo env "PATH=$PATH" sh -c 'command -v ceph')" = /usr/bin/ceph
+          sudo microceph cluster bootstrap
+          sudo mkdir -p /etc/ceph
+          sudo ln -sf /var/snap/microceph/current/conf/ceph.conf /etc/ceph/ceph.conf
+          sudo ls -l /var/snap/microceph/current/conf
+          sudo sh -c 'ln -sf /var/snap/microceph/current/conf/*.keyring /etc/ceph/'
+          ls -l /etc/ceph
+          trap 'sudo ceph -s || true' EXIT
+          # 조건이 맞을 때까지 5초마다, 최대 10분 기다린다.
+          wait_for() {
+            for _ in $(seq 120); do
+              if "$@"; then return 0; fi
+              sleep 5
+            done
+            return 1
+          }
+          sudo ceph config set global mon_allow_pool_size_one true
+          sudo ceph config set global osd_pool_default_size 1
+          sudo microceph disk add loop,4G,1
+          wait_for sh -c 'sudo ceph osd stat | grep -q " 1 up"'
+          sudo ceph osd pool create rbd 32
+          sudo ceph osd pool set rbd size 1 --yes-i-really-mean-it
+          sudo ceph osd pool set .mgr size 1 --yes-i-really-mean-it || true
+          wait_for sh -c "sudo ceph status --format json | jq -e '.pgmap.num_pgs > 0 and ([.pgmap.pgs_by_state[] | select(.state_name | startswith(\"active\")) | .count] | add) == .pgmap.num_pgs'"
+          sudo rbd pool init rbd
+          sudo rbd create --size 1 rbd/opl-ci-probe
+          sudo rbd rm --no-progress rbd/opl-ci-probe
+          sudo ceph df
+          sudo rbd namespace create rbd/opl
+          sudo mkdir -p /etc/opl-ceph
+          sudo ceph auth get-or-create client.opltest mon 'profile rbd' osd 'profile rbd pool=rbd' mgr 'profile rbd pool=rbd' \
+            | sudo tee /etc/opl-ceph/opltest.keyring >/dev/null
+          { sudo cat /etc/ceph/ceph.conf; printf '\n[client.opltest]\nkeyring = /etc/opl-ceph/opltest.keyring\n'; } \
+            | sudo tee /etc/opl-ceph/ceph.conf >/dev/null
+          sudo rbd --id opltest --conf /etc/opl-ceph/ceph.conf ls --pool rbd --namespace opl
+          sudo ceph --id opltest --conf /etc/opl-ceph/ceph.conf df detail >/dev/null
       # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다.
       - name: QEMU, bridge and E2E tests as root
         run: |
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it
           OPL_TEST_NFS_EXPORT: /srv/opl-nfs
           OPL_TEST_LVM: opltest/tp
           OPL_TEST_ZFS: opltestz/opl
+          OPL_TEST_RBD: rbd
+          OPL_TEST_RBD_USER: opltest
+          OPL_TEST_RBD_NAMESPACE: opl
+          OPL_TEST_RBD_CONF: /etc/opl-ceph/ceph.conf
 
   deny:
     runs-on: ubuntu-latest

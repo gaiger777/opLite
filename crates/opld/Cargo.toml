@@ -25,6 +25,10 @@ lvm-it = []
 # 실제 ZFS 풀의 볼륨(zvol)으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서 root,
 # zfsutils-linux, qemu-io와 테스트가 zvol을 만들고 지워도 되는 데이터셋(`OPL_TEST_ZFS=POOL/DATASET`)이 필요하다.
 zfs-it = []
+# 실제 Ceph RBD 풀의 볼륨(RBD 이미지)으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서 root,
+# ceph-common, qemu-block-extra, qemu-io, `client.admin`으로 접속할 수 있는 ceph.conf·키링과 테스트가
+# 이미지를 만들고 지워도 되는 Ceph 풀(`OPL_TEST_RBD=POOL`)이 필요하다.
+rbd-it = []
 # 브라우저(Playwright)로 웹 UI를 확인하는 E2E. qemu-it의 준비물에 더해 pnpm과
 # `pnpm -C web exec playwright install chromium`, 빌드한 web/dist가 필요하다.
 web-it = ["qemu-it", "web-ui"]
