@@ -22,6 +22,8 @@ pub(super) struct BlockTool {
     env: &'static [(&'static str, &'static str)],
     /// 실패한 명령의 오류(stderr 첫 줄을 담는다)
     failure: fn(String) -> DriverError,
+    /// 이 말이 든 stderr 줄은 첫 줄보다 먼저 오류에 담는다(앞에 경고 줄이 올 수 있는 오류).
+    prefer: &'static [&'static str],
     /// 바꾸는 명령이 돌고 있는 대상
     changing: Mutex<BTreeSet<String>>,
 }
@@ -38,8 +40,15 @@ impl BlockTool {
             busy,
             env,
             failure,
+            prefer: &[],
             changing: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// 오류에 첫 줄보다 먼저 담을 stderr 줄의 말([`BlockTool::prefer`])
+    pub(super) const fn preferring(mut self, prefer: &'static [&'static str]) -> Self {
+        self.prefer = prefer;
+        self
     }
 
     fn command(&self, program: &str, args: &[&str]) -> tokio::process::Command {
@@ -50,7 +59,7 @@ impl BlockTool {
         cmd
     }
 
-    /// 실패한 명령의 오류: stderr 첫 줄(없으면 종료 상태)
+    /// 실패한 명령의 오류: `prefer`의 말이 든 stderr 줄, 없으면 첫 줄(없으면 종료 상태)
     fn failure(
         &self,
         program: &str,
@@ -58,10 +67,11 @@ impl BlockTool {
         stderr: &[u8],
     ) -> DriverError {
         let stderr = String::from_utf8_lossy(stderr);
-        let line = stderr
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
+        let mut lines = stderr.lines().map(str::trim).filter(|l| !l.is_empty());
+        let line = lines
+            .clone()
+            .find(|l| self.prefer.iter().any(|p| l.contains(p)))
+            .or_else(|| lines.next())
             .map_or_else(|| status.to_string(), str::to_string);
         (self.failure)(format!("{program}: {line}"))
     }
@@ -233,6 +243,38 @@ mod tests {
         TOOL.run_change("/bin/sh", &["-c", "exit 0"], &[], long)
             .await
             .unwrap();
+    }
+
+    /// `prefer`의 말이 든 stderr 줄은 앞에 다른 줄이 있어도 오류에 담는다.
+    #[tokio::test]
+    async fn preferred_stderr_lines_come_first() {
+        static PREFERRING: BlockTool =
+            BlockTool::new("test", "busy", &[], DriverError::Lvm).preferring(&["by other host"]);
+        let long = Duration::from_secs(10);
+        let fail = [
+            "-c",
+            "echo 'Retrying ex lock on LV' >&2; echo '  LV locked by other host' >&2; exit 5",
+        ];
+        for err in [
+            PREFERRING
+                .run_read("/bin/sh", &fail, long)
+                .await
+                .unwrap_err(),
+            PREFERRING
+                .run_change("/bin/sh", &fail, &[], long)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, DriverError::Lvm(ref m) if m == "/bin/sh: LV locked by other host"),
+                "{err:?}"
+            );
+        }
+        let err = TOOL.run_read("/bin/sh", &fail, long).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Lvm(ref m) if m == "/bin/sh: Retrying ex lock on LV"),
+            "{err:?}"
+        );
     }
 
     /// 바꾸는 명령의 출력은 파이프가 아니다(표준 출력은 버리고 stderr는 파일). 기다리는 쪽이 떠나

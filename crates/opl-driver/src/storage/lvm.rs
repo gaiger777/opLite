@@ -1,8 +1,10 @@
 //! LVM-thin 풀: VG의 thin pool 안에 볼륨마다 thin LV `opl-{id}`(raw)를 두고, 스냅샷은 thin 스냅샷
-//! LV `opl-{id}-s-{tag}`로 둔다. LVM 명령은 [`LvmOps`] 뒤에 있다(테스트는 가짜).
+//! LV `opl-{id}-s-{tag}`로 둔다. 공유 LVM 풀: 공유(lvmlockd) VG 안에 볼륨마다 두꺼운 LV `opl-{id}`
+//! (raw)를 두고 쓰는 노드에서만 배타 활성화한다. LVM 명령은 [`LvmOps`] 뒤에 있다(테스트는 가짜).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -99,6 +101,63 @@ pub fn parse_lvs(out: &[u8]) -> Result<Vec<LvInfo>, DriverError> {
     Ok(lvs)
 }
 
+/// `vgs`가 알려 준 VG 하나
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VgInfo {
+    pub name: String,
+    /// 잠금 종류(`vg_lock_type`). 공유 VG면 `sanlock`·`dlm`, 아니면 빈 문자열이다.
+    pub lock_type: String,
+    pub size_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// `vgs --reportformat json --units b --nosuffix -o vg_name,vg_lock_type,vg_size,vg_free`의 출력을
+/// 읽는다. 값은 문자열로 오지만 숫자도 받는다.
+pub fn parse_vgs(out: &[u8]) -> Result<Vec<VgInfo>, DriverError> {
+    let bad = |what: String| DriverError::Lvm(format!("unparseable vgs output: {what}"));
+    let json: Value = serde_json::from_slice(out).map_err(|e| bad(e.to_string()))?;
+    let reports = json
+        .get("report")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad("no report".into()))?;
+    let text = |v: &Value| match v {
+        Value::String(s) => Some(s.trim().to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let mut vgs = Vec::new();
+    for vg in reports
+        .iter()
+        .filter_map(|r| r.get("vg").and_then(Value::as_array))
+        .flatten()
+    {
+        let field = |k: &str| vg.get(k).and_then(text);
+        let (Some(name), Some(size), Some(free)) =
+            (field("vg_name"), field("vg_size"), field("vg_free"))
+        else {
+            return Err(bad(format!("vg without name, size or free: {vg}")));
+        };
+        let number = |k: &str, v: &str| v.parse().map_err(|_| bad(format!("{k} {v:?}")));
+        vgs.push(VgInfo {
+            name,
+            lock_type: field("vg_lock_type").unwrap_or_default(),
+            size_bytes: number("vg_size", &size)?,
+            free_bytes: number("vg_free", &free)?,
+        });
+    }
+    Ok(vgs)
+}
+
+/// `lvs --noheadings -o lv_tags`의 출력(쉼표로 나눈 태그)을 읽는다.
+fn parse_lv_tags(out: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(out)
+        .trim()
+        .split(',')
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 /// LVM 명령. 이름은 VG 안의 LV 이름이다. 테스트는 가짜로 바꾼다.
 #[async_trait]
 pub trait LvmOps: Send + Sync {
@@ -124,6 +183,20 @@ pub trait LvmOps: Send + Sync {
     async fn clear_skip(&self, vg: &str, name: &str) -> Result<(), DriverError>;
     /// LV `name`을 바꾸는 명령이 아직 돌고 있는지(시간을 넘겨 뒤에서 도는 중)
     fn changing(&self, vg: &str, name: &str) -> bool;
+    /// `size_bytes` 크기의 두꺼운(linear) LV를 켜지 않고 만든다(`lvcreate -an`).
+    async fn create_linear(&self, vg: &str, name: &str, size_bytes: u64)
+    -> Result<(), DriverError>;
+    /// 이 노드에서만 켠다(`lvchange -aey`). 공유 VG에서 다른 노드가 켜 두었으면 lvmlockd가 거절한다.
+    async fn activate_exclusive(&self, vg: &str, name: &str) -> Result<(), DriverError>;
+    /// 켜 둔 LV의 내용을 `offset` 바이트부터 끝까지 0으로 채운다(`blkdiscard -z`). 크기에 비례해
+    /// 걸리므로 시간 제한이 없다.
+    async fn zero(&self, vg: &str, name: &str, offset: u64) -> Result<(), DriverError>;
+    /// LV의 태그(`lvs -o lv_tags`)
+    async fn tags(&self, vg: &str, name: &str) -> Result<Vec<String>, DriverError>;
+    /// 태그를 붙이거나 뗀다(`lvchange --addtag` / `--deltag`).
+    async fn set_tag(&self, vg: &str, name: &str, tag: &str, on: bool) -> Result<(), DriverError>;
+    /// VG의 잠금 종류와 크기·남은 공간(`vgs`)
+    async fn vg_info(&self, vg: &str) -> Result<VgInfo, DriverError>;
 }
 
 /// 실제 LVM 명령. root여야 한다.
@@ -136,7 +209,8 @@ static LVM: BlockTool = BlockTool::new(
     "an earlier lvm command still running on the same lv",
     &[("LC_ALL", "C"), ("LVM_SUPPRESS_FD_WARNINGS", "1")],
     DriverError::Lvm,
-);
+)
+.preferring(&[LV_HELD_BY, VG_HELD_BY]);
 
 impl SystemLvm {
     /// VG `vg`의 LV `lvs`를 바꾸는 명령([`BlockTool::run_change`])
@@ -222,6 +296,70 @@ impl LvmOps for SystemLvm {
 
     fn changing(&self, vg: &str, name: &str) -> bool {
         LVM.changing(&format!("{vg}/{name}"))
+    }
+
+    /// 켜지 않으므로 처음 부분을 0으로 채우거나 서명을 지우지 않는다(`-Zn -Wn`). 내용은 뒤에
+    /// [`zero`](LvmOps::zero)가 모두 0으로 채운다.
+    async fn create_linear(
+        &self,
+        vg: &str,
+        name: &str,
+        size_bytes: u64,
+    ) -> Result<(), DriverError> {
+        let size = format!("{size_bytes}b");
+        let args = ["-q", "-an", "-Zn", "-Wn", "-L", &size, "-n", name, vg];
+        Self::change("lvcreate", &args, vg, &[name]).await
+    }
+
+    async fn activate_exclusive(&self, vg: &str, name: &str) -> Result<(), DriverError> {
+        let lv = format!("{vg}/{name}");
+        Self::change("lvchange", &["-q", "-aey", &lv], vg, &[name]).await
+    }
+
+    /// 새 LV에 옛 데이터의 서명이 남아 있어도 묻지 않는다(`-f`).
+    async fn zero(&self, vg: &str, name: &str, offset: u64) -> Result<(), DriverError> {
+        let device = device_node(Path::new(DEV), vg, name)?;
+        let (lv, offset) = (format!("{vg}/{name}"), offset.to_string());
+        let args = ["-f", "-z", "-o", &offset, path_str(&device)?];
+        LVM.run_change("blkdiscard", &args, &[&lv], Duration::MAX)
+            .await
+    }
+
+    async fn tags(&self, vg: &str, name: &str) -> Result<Vec<String>, DriverError> {
+        let lv = format!("{vg}/{name}");
+        let out = LVM
+            .run_read("lvs", &["--noheadings", "-o", "lv_tags", &lv], LVM_TIMEOUT)
+            .await?;
+        Ok(parse_lv_tags(&out))
+    }
+
+    async fn set_tag(&self, vg: &str, name: &str, tag: &str, on: bool) -> Result<(), DriverError> {
+        let lv = format!("{vg}/{name}");
+        let op = if on { "--addtag" } else { "--deltag" };
+        Self::change("lvchange", &["-q", op, tag, &lv], vg, &[name]).await
+    }
+
+    async fn vg_info(&self, vg: &str) -> Result<VgInfo, DriverError> {
+        let out = LVM
+            .run_read(
+                "vgs",
+                &[
+                    "--reportformat",
+                    "json",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "-o",
+                    "vg_name,vg_lock_type,vg_size,vg_free",
+                    vg,
+                ],
+                LVM_TIMEOUT,
+            )
+            .await?;
+        parse_vgs(&out)?
+            .into_iter()
+            .find(|v| v.name == vg)
+            .ok_or_else(|| DriverError::Lvm(format!("volume group {vg} not found")))
     }
 }
 
@@ -877,6 +1015,534 @@ impl Storage for LvmThinStorage {
     }
 }
 
+/// 공유 LVM 풀은 raw 볼륨만 담는다.
+pub(super) fn require_shared_raw(format: ImageFormat) -> Result<(), DriverError> {
+    match format {
+        ImageFormat::Raw => Ok(()),
+        ImageFormat::Qcow2 => Err(DriverError::InvalidSpec(
+            "lvm-shared pools hold raw volumes".into(),
+        )),
+    }
+}
+
+/// 공유 LVM 볼륨의 크기 단위(1 MiB)
+const SHARED_SIZE_UNIT: u64 = 1 << 20;
+
+/// 늘린 뒤 아직 0으로 채우지 않은 부분의 시작(바이트)을 LV에 적는 태그의 앞부분
+const ZERO_FROM_TAG: &str = "opl-zero-from-";
+
+/// 이 노드가 LV의 남은 부분을 0으로 채우는 중일 때의 일시 오류(`Timeout`)에 담는 말
+const LV_ZEROING: &str = "the lv to be zeroed";
+
+/// 다른 노드가 켜 둔 LV를 바꾸거나 켜려 했을 때의 일시 오류(`Timeout`)에 담는 말
+const LV_HELD: &str = "another node to stop using the lv";
+
+/// 다른 노드가 공유 VG의 잠금을 쥐고 있을 때의 일시 오류(`Timeout`)에 담는 말
+const VG_HELD: &str = "another node to release the shared vg lock";
+
+/// 다른 노드가 LV를 켜 두었다는 lvmlockd의 말("LV locked by other host")
+const LV_HELD_BY: &str = "locked by other host";
+
+/// 다른 노드가 VG 잠금을 쥐고 있다는 lvmlockd의 말("VG ... lock failed: held by other host")
+const VG_HELD_BY: &str = "held by other host";
+
+/// 공유 VG에서 다른 노드가 잠금을 쥐어 실패한 LVM 명령은 일시 오류로 바꾼다. 이 말이 든 줄은 앞에
+/// 경고 줄("Retrying ex lock …")이 있어도 오류에 담긴다([`LVM`]).
+fn held_elsewhere(e: DriverError) -> DriverError {
+    match e {
+        DriverError::Lvm(msg) if msg.contains(LV_HELD_BY) => DriverError::Timeout(LV_HELD),
+        DriverError::Lvm(msg) if msg.contains(VG_HELD_BY) => DriverError::Timeout(VG_HELD),
+        e => e,
+    }
+}
+
+fn no_snapshots() -> DriverError {
+    DriverError::InvalidSpec("lvm-shared pools have no snapshots".into())
+}
+
+/// 공유 LVM 풀(`lvm-shared`)의 볼륨. 볼륨은 공유 VG의 두꺼운 LV이고, 쓰는 동안만 이 노드에서
+/// 배타 활성화한다(VM 디스크면 [`activate_volume`](Storage::activate_volume)부터
+/// [`deactivate_volume`](Storage::deactivate_volume)까지). 스냅샷은 없다.
+pub struct LvmSharedStorage {
+    qemu_img: PathBuf,
+    ops: Arc<dyn LvmOps>,
+    /// LV 장치 노드가 놓이는 디렉터리([`DEV`]). 테스트는 바꾼다.
+    dev: PathBuf,
+    /// 이 노드에서 늘린 부분을 0으로 채우는 중인 LV(`{vg}/{lv}`, [`Zeroing`])
+    zeroing: Mutex<BTreeSet<String>>,
+}
+
+/// LV를 0으로 채우는 중이라는 표시. 버려지면 지운다.
+struct Zeroing<'a> {
+    set: &'a Mutex<BTreeSet<String>>,
+    lv: String,
+}
+
+impl<'a> Zeroing<'a> {
+    /// 이미 채우는 중이면 일시 오류다.
+    fn begin(set: &'a Mutex<BTreeSet<String>>, vg: &str, name: &str) -> Result<Self, DriverError> {
+        let lv = format!("{vg}/{name}");
+        if !set.lock().unwrap().insert(lv.clone()) {
+            return Err(DriverError::Timeout(LV_ZEROING));
+        }
+        Ok(Self { set, lv })
+    }
+}
+
+impl Drop for Zeroing<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.lv);
+    }
+}
+
+impl LvmSharedStorage {
+    pub fn new(qemu_img: impl Into<PathBuf>, ops: Arc<dyn LvmOps>) -> Self {
+        Self {
+            qemu_img: qemu_img.into(),
+            ops,
+            dev: PathBuf::from(DEV),
+            zeroing: Mutex::default(),
+        }
+    }
+
+    /// 늘린 뒤 아직 0으로 채우지 않은 부분의 시작(태그 `opl-zero-from-{바이트}`)
+    async fn pending_zero(&self, vg: &str, name: &str) -> Result<Option<u64>, DriverError> {
+        Ok(self
+            .ops
+            .tags(vg, name)
+            .await?
+            .iter()
+            .find_map(|t| t.strip_prefix(ZERO_FROM_TAG)?.parse::<u64>().ok()))
+    }
+
+    /// 남은 부분(태그의 위치부터 끝까지)을 0으로 채우고 태그를 뗀다. LV는 이 노드에서 켜져 있고
+    /// [`Zeroing`]을 쥐고 있어야 한다. 태그의 위치가 LV 끝이면(늘리기 전) 채울 것이 없으므로 태그를
+    /// 그대로 둔다(늘린 뒤 채운다).
+    async fn zero_pending(&self, vg: &str, id: Uuid) -> Result<(), DriverError> {
+        let name = volume_lv(id);
+        let Some(from) = self.pending_zero(vg, &name).await? else {
+            return Ok(());
+        };
+        if from >= self.existing(vg, id).await?.size_bytes {
+            return Ok(());
+        }
+        self.ops.zero(vg, &name, from).await?;
+        self.ops
+            .set_tag(vg, &name, &format!("{ZERO_FROM_TAG}{from}"), false)
+            .await
+            .map_err(held_elsewhere)
+    }
+
+    /// 꺼져 있으면 배타 활성화하고 크기 늘리기가 남긴 0 채우기(태그)를 마친 뒤 LV를 돌려준다. 켜 둔
+    /// LV의 장치를 내주기 전에(VM 시작, 복제·복사 원본) 부른다. 남은 부분에는 지운 볼륨의 옛 데이터가
+    /// 있을 수 있고, 장치를 쓰기 시작한 뒤에 채우면 쓴 데이터를 지운다. [`Zeroing`]을 잡은 뒤 LV를
+    /// 읽으므로 그동안 이 노드의 크기 늘리기가 LV를 켜거나 끄지 않는다. 이 노드가 그 LV를 채우는
+    /// 중이거나(크기 늘리기) 그 LV를 바꾸는 명령이 도는 중이면 LV를 건드리지 않고 일시 오류다. 마치지
+    /// 못하면 자기가 켠 LV만 끈다.
+    async fn activate_ready(&self, vg: &str, id: Uuid) -> Result<LvInfo, DriverError> {
+        let name = volume_lv(id);
+        let _zeroing = Zeroing::begin(&self.zeroing, vg, &name)?;
+        if self.ops.changing(vg, &name) {
+            return Err(DriverError::Timeout(
+                "an earlier lvm command still running on the volume",
+            ));
+        }
+        let lv = self.existing(vg, id).await?;
+        if !lv.is_active() {
+            self.ops
+                .activate_exclusive(vg, &name)
+                .await
+                .map_err(held_elsewhere)?;
+        }
+        let done = self.zero_pending(vg, id).await;
+        if done.is_err() && !lv.is_active() {
+            self.deactivate_quietly(vg, id).await;
+        }
+        done.map(|()| lv)
+    }
+
+    /// 풀의 VG. raw가 아니면 `InvalidSpec`.
+    fn target(pool: &StoragePool, format: ImageFormat) -> Result<&str, DriverError> {
+        require_shared_raw(format)?;
+        match &pool.spec.backend {
+            PoolBackend::LvmShared { vg, .. } => Ok(vg),
+            PoolBackend::Dir { .. }
+            | PoolBackend::Nfs { .. }
+            | PoolBackend::LvmThin { .. }
+            | PoolBackend::Zfs { .. }
+            | PoolBackend::Rbd { .. } => {
+                Err(DriverError::InvalidSpec("not an lvm-shared pool".into()))
+            }
+        }
+    }
+
+    /// 볼륨 LV. 없으면 `VolumeNotFound`.
+    async fn existing(&self, vg: &str, id: Uuid) -> Result<LvInfo, DriverError> {
+        self.ops
+            .list(vg)
+            .await?
+            .into_iter()
+            .find(|lv| lv.name == volume_lv(id))
+            .ok_or(DriverError::VolumeNotFound(id))
+    }
+
+    /// 볼륨 LV를 만들어 배타 활성화하고 0으로 채운다(켜 둔 채 돌려준다). 크기는 1 MiB 배수로
+    /// 올린다. 켜거나 채우지 못하면 만든 LV를 지운다.
+    async fn create_lv(&self, vg: &str, id: Uuid, size_bytes: u64) -> Result<PathBuf, DriverError> {
+        let name = volume_lv(id);
+        if self.ops.list(vg).await?.iter().any(|lv| lv.name == name) {
+            return Err(DriverError::VolumeExists(id));
+        }
+        let size = size_bytes.div_ceil(SHARED_SIZE_UNIT) * SHARED_SIZE_UNIT;
+        self.ops
+            .create_linear(vg, &name, size)
+            .await
+            .map_err(held_elsewhere)?;
+        let zeroed = async {
+            self.ops
+                .activate_exclusive(vg, &name)
+                .await
+                .map_err(held_elsewhere)?;
+            self.ops.zero(vg, &name, 0).await?;
+            device_node(&self.dev, vg, &name)
+        };
+        match zeroed.await {
+            Ok(path) => Ok(path),
+            Err(e) => {
+                self.remove_partial(vg, id).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// 만들다 만 볼륨 LV를 지운다. 지우지 못하면 로그만 남긴다.
+    async fn remove_partial(&self, vg: &str, id: Uuid) {
+        if let Err(del) = self.ops.remove(vg, &volume_lv(id)).await {
+            tracing::warn!(volume = %id, error = %del, "cannot remove partial volume");
+        }
+    }
+
+    /// 볼륨 LV를 끈다. 끄지 못하면 로그만 남긴다(켜진 채 남은 LV는 opld가 뒤에 정리한다).
+    async fn deactivate_quietly(&self, vg: &str, id: Uuid) {
+        if let Err(e) = self.ops.set_active(vg, &volume_lv(id), false).await {
+            tracing::warn!(volume = %id, error = %e, "cannot deactivate volume");
+        }
+    }
+
+    /// 새 볼륨 LV를 만들어(0으로 채운다) `qemu-img convert -n --target-is-zero`로 써 넣은 뒤 끈다.
+    /// 쓰다 실패하면 볼륨 LV를 지운다.
+    async fn fill(
+        &self,
+        vg: &str,
+        id: Uuid,
+        size_bytes: u64,
+        from: &[String],
+    ) -> Result<PathBuf, DriverError> {
+        let path = self.create_lv(vg, id, size_bytes).await?;
+        let written = async {
+            let mut args = vec!["convert", "-q", "-n", "--target-is-zero"];
+            args.extend(from.iter().map(String::as_str));
+            args.push(path_str(&path)?);
+            run_qemu_img(&self.qemu_img, &args).await
+        };
+        if let Err(e) = written.await {
+            self.remove_partial(vg, id).await;
+            return Err(e);
+        }
+        self.deactivate_quietly(vg, id).await;
+        Ok(path)
+    }
+}
+
+#[async_trait]
+impl Storage for LvmSharedStorage {
+    /// 만들어 0으로 채운 뒤 끈다. 돌려주는 장치 경로는 켜야 생긴다.
+    async fn create_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        size_bytes: u64,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        let vg = Self::target(pool, format)?;
+        self.create_lv(vg, id, size_bytes).await?;
+        self.deactivate_quietly(vg, id).await;
+        Ok(device_path(&self.dev, vg, &volume_lv(id)))
+    }
+
+    /// 원본의 가상 크기로 볼륨 LV를 만들고 raw로 변환해 써 넣는다.
+    async fn import_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        src: &Path,
+        src_format: SourceFormat,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        let vg = Self::target(pool, format)?;
+        require_absolute(src)?;
+        let src_str = path_str(src)?;
+        let size = source_virtual_size(&self.qemu_img, src, src_format).await?;
+        let from = ["-f", src_fmt_name(src_format), "-O", "raw", src_str].map(String::from);
+        self.fill(vg, id, size, &from).await
+    }
+
+    /// 올린 파일만 본다(풀과 상관없다).
+    async fn check_import_source(
+        &self,
+        src: &Path,
+        src_format: SourceFormat,
+    ) -> Result<(), DriverError> {
+        check_image(&self.qemu_img, src, src_format).await
+    }
+
+    /// 다른 노드가 켜 두었으면 lvmlockd가 거절하므로 일시 오류다. 볼륨 LV가 없어도 그 LV를 바꾸는
+    /// 명령이 아직 돌고 있으면(시간을 넘긴 만들기) LV가 곧 생길 수 있으므로 일시 오류다.
+    async fn delete_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let vg = Self::target(pool, format)?;
+        match self.existing(vg, id).await {
+            Err(DriverError::VolumeNotFound(_)) if self.ops.changing(vg, &volume_lv(id)) => Err(
+                DriverError::Timeout("an earlier lvm command still running on the volume"),
+            ),
+            Err(e) => Err(e),
+            Ok(_) => self
+                .ops
+                .remove(vg, &volume_lv(id))
+                .await
+                .map_err(held_elsewhere),
+        }
+    }
+
+    /// 이 노드에서 꺼져 있으면 배타 활성화한다. 다른 노드가 켜 두었으면 일시 오류다. 크기 늘리기가
+    /// 남긴 0 채우기를 마친 뒤 돌아온다([`activate_ready`](Self::activate_ready)).
+    async fn activate_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let vg = Self::target(pool, format)?;
+        self.activate_ready(vg, id).await.map(drop)
+    }
+
+    /// 이 노드에서 켜져 있으면 끈다. 볼륨이 없거나 이미 꺼져 있으면 할 일이 없다. 이 노드가 0으로
+    /// 채우는 중인 LV([`Zeroing`])는 끄지 않고 성공이다(켜진 채 남으면 남은 활성화 정리가 끈다).
+    /// 끄는 동안 표시를 쥐어 그사이 크기 늘리기가 LV를 켜지 않게 한다.
+    async fn deactivate_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let vg = Self::target(pool, format)?;
+        let Ok(_zeroing) = Zeroing::begin(&self.zeroing, vg, &volume_lv(id)) else {
+            tracing::info!(vg, lv = %volume_lv(id), "lv is being zeroed; leaving it active for the idle sweep");
+            return Ok(());
+        };
+        match self.existing(vg, id).await {
+            Ok(lv) if lv.is_active() => self.ops.set_active(vg, &volume_lv(id), false).await,
+            Ok(_) | Err(DriverError::VolumeNotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 두꺼운 LV이므로 크기만큼 쓴다.
+    async fn volume_info(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<VolumeInfo, DriverError> {
+        let vg = Self::target(pool, format)?;
+        let lv = self.existing(vg, id).await?;
+        Ok(VolumeInfo {
+            virtual_bytes: lv.size_bytes,
+            allocated_bytes: lv.size_bytes,
+        })
+    }
+
+    /// VG의 크기와 남은 공간
+    async fn capacity(&self, pool: &StoragePool) -> Result<Capacity, DriverError> {
+        let vg = Self::target(pool, ImageFormat::Raw)?;
+        let info = self.ops.vg_info(vg).await?;
+        Ok(Capacity {
+            total_bytes: info.size_bytes,
+            available_bytes: info.free_bytes,
+        })
+    }
+
+    /// 새 볼륨은 만들 때 0으로 채운다.
+    async fn target_reads_zero(&self, _pool: &StoragePool) -> Result<bool, DriverError> {
+        Ok(true)
+    }
+
+    fn supports_snapshots(&self, _: &StoragePool, _: ImageFormat) -> bool {
+        false
+    }
+
+    async fn snapshot_create(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: &str,
+    ) -> Result<(), DriverError> {
+        Err(no_snapshots())
+    }
+
+    async fn snapshot_revert(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: &str,
+    ) -> Result<(), DriverError> {
+        Err(no_snapshots())
+    }
+
+    async fn snapshot_delete(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: &str,
+    ) -> Result<(), DriverError> {
+        Err(no_snapshots())
+    }
+
+    async fn snapshot_tags(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<Vec<String>, DriverError> {
+        Err(no_snapshots())
+    }
+
+    /// 늘린 뒤 새 부분(늘리기 전 크기부터 끝까지)을 0으로 채운다. 새 익스텐트에는 지운 볼륨의 옛
+    /// 데이터가 남아 있을 수 있다. 꺼져 있으면 배타 활성화해 채운 뒤 끄고, 이 노드에서 켜져 있으면
+    /// (실행 중인 VM) 켠 채로 둔다. 다른 노드가 켜 두었으면 일시 오류다.
+    ///
+    /// 늘리기 전에 늘리기 전 크기를 태그(`opl-zero-from-{바이트}`)로 붙이고 다 채운 뒤 뗀다. 채우기가
+    /// 실패하면 오류이고 태그가 남으므로, 다시 하면(LV가 이미 그 크기여도) 남은 부분을 다시 채운다.
+    /// 그 전에 VM 시작이나 복제 원본이 LV를 켜면 그쪽이 마저 채운다. 태그가 없고 LV가 이미 그 크기
+    /// 이상이면 할 일이 없다. LV를 읽기 전부터 다 채울 때까지 [`Zeroing`]을 쥐어, 그동안 이 노드의
+    /// VM 시작·복제 원본은 일시 오류다(읽은 활성 여부가 끝까지 맞다).
+    async fn resize_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        size_bytes: u64,
+    ) -> Result<(), DriverError> {
+        let vg = Self::target(pool, format)?;
+        let name = volume_lv(id);
+        let _zeroing = Zeroing::begin(&self.zeroing, vg, &name)?;
+        let lv = self.existing(vg, id).await?;
+        let marked = self.pending_zero(vg, &name).await?;
+        let grow = lv.size_bytes < size_bytes;
+        if !grow && marked.is_none() {
+            return Ok(());
+        }
+        if grow {
+            if marked.is_none() {
+                let tag = format!("{ZERO_FROM_TAG}{}", lv.size_bytes);
+                self.ops
+                    .set_tag(vg, &name, &tag, true)
+                    .await
+                    .map_err(held_elsewhere)?;
+            }
+            self.ops
+                .extend(vg, &name, size_bytes)
+                .await
+                .map_err(held_elsewhere)?;
+        }
+        if !lv.is_active() {
+            self.ops
+                .activate_exclusive(vg, &name)
+                .await
+                .map_err(held_elsewhere)?;
+        }
+        let zeroed = self.zero_pending(vg, id).await;
+        if !lv.is_active() {
+            self.deactivate_quietly(vg, id).await;
+        }
+        zeroed
+    }
+
+    /// 볼륨 LV를 배타 활성화하고 남은 0 채우기를 마친 뒤 읽게 한다. 스냅샷이 없으므로 `tag`는
+    /// `InvalidSpec`이다.
+    async fn volume_source(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
+    ) -> Result<VolumeSource, DriverError> {
+        let vg = Self::target(pool, format)?;
+        if tag.is_some() {
+            return Err(no_snapshots());
+        }
+        let lv = self.activate_ready(vg, id).await?;
+        Ok(VolumeSource {
+            path: device_node(&self.dev, vg, &lv.name)?,
+            format,
+            snapshot: None,
+            size_bytes: lv.size_bytes,
+            rbd: None,
+        })
+    }
+
+    /// 볼륨 LV를 끈다.
+    async fn release_source(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
+    ) -> Result<(), DriverError> {
+        let vg = Self::target(pool, format)?;
+        if tag.is_some() {
+            return Err(no_snapshots());
+        }
+        self.ops.set_active(vg, &volume_lv(id), false).await
+    }
+
+    /// 원본 볼륨을 켜서 그 크기로 대상 볼륨 LV를 만들고 써 넣은 뒤 둘 다 끈다.
+    async fn copy_volume(
+        &self,
+        src_pool: &StoragePool,
+        src_id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
+        force_share: bool,
+        dst_pool: &StoragePool,
+        dst_id: Uuid,
+        dst_format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let vg = Self::target(dst_pool, dst_format)?;
+        let source = self.volume_source(src_pool, src_id, format, tag).await?;
+        // 읽는 동안 취소돼도 원본 LV를 끈다.
+        let guard = SourceGuard {
+            ops: self.ops.clone(),
+            vg: Self::target(src_pool, format)?.to_string(),
+            lv: Some(volume_lv(src_id)),
+        };
+        let copied = async {
+            let from = convert_from(&source, force_share, Some(dst_format))?;
+            self.fill(vg, dst_id, source.size_bytes, &from).await
+        };
+        let copied = copied.await;
+        guard.release().await;
+        copied.map(drop)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -898,29 +1564,40 @@ mod tests {
     /// VG `vg0` 하나를 메모리에 두는 LVM. thin pool `tp`와 관계없는 LV `root`가 있다. 바꾸는 호출을
     /// 적고, `fail`에 적은 호출은 실패한다. `stuck`에 적은 호출은 하지 않고, `late`에 적은 이름
     /// 바꾸기·스냅샷은 해 놓고 `Timeout`을 돌려준다(시간을 넘긴 명령). 활성인 LV의 장치 노드를 `dev`
-    /// 아래에 둔다(udev처럼). `busy`에 적은 LV는 바꾸는 명령이 아직 돌고 있다고 알린다.
+    /// 아래에 둔다(udev처럼). `busy`에 적은 LV는 바꾸는 명령이 아직 돌고 있다고 알린다. `held`에
+    /// 적은 LV는 다른 노드가 켜 두었다(공유 VG: 켜기·지우기·늘리기를 lvmlockd가 거절한다).
+    /// `on_list`는 다음 `list`가 결과를 만든 뒤 한 번 부른다(읽은 뒤 끼어드는 다른 작업).
     struct FakeLvm {
         lvs: Mutex<BTreeMap<String, FakeLv>>,
         busy: Mutex<Vec<String>>,
+        held: Mutex<Vec<String>>,
+        /// LV별 태그
+        tags: Mutex<BTreeMap<String, Vec<String>>>,
         log: Mutex<Vec<String>>,
         fail: Mutex<Vec<String>>,
         late: Mutex<Vec<String>>,
         stuck: Mutex<Vec<String>>,
         /// thin pool `tp`가 새 블록을 0으로 채우는지(`lv_attr` 여덟째 글자 `z`)
         zero: Mutex<bool>,
+        on_list: Mutex<Option<OnList>>,
         dev: tempfile::TempDir,
     }
+
+    type OnList = Box<dyn FnOnce(&mut BTreeMap<String, FakeLv>) + Send>;
 
     impl Default for FakeLvm {
         fn default() -> Self {
             Self {
                 lvs: Mutex::default(),
                 busy: Mutex::default(),
+                held: Mutex::default(),
+                tags: Mutex::default(),
                 log: Mutex::default(),
                 fail: Mutex::default(),
                 late: Mutex::default(),
                 stuck: Mutex::default(),
                 zero: Mutex::new(true),
+                on_list: Mutex::default(),
                 dev: tempfile::tempdir().unwrap(),
             }
         }
@@ -982,6 +1659,16 @@ mod tests {
         fn missing(name: &str) -> DriverError {
             DriverError::Lvm(format!("Failed to find logical volume \"vg0/{name}\""))
         }
+
+        /// 다른 노드가 켜 둔 LV면 lvmlockd의 거절
+        fn check_held(&self, name: &str) -> Result<(), DriverError> {
+            if self.held.lock().unwrap().iter().any(|lv| lv == name) {
+                return Err(DriverError::Lvm(format!(
+                    "lvchange: LV locked by other host: vg0/{name}"
+                )));
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1019,6 +1706,10 @@ mod tests {
                     size_bytes: lv.size,
                     data_percent: lv.active.then_some(50.0),
                 });
+            }
+            let hook = self.on_list.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&mut self.lvs.lock().unwrap());
             }
             Ok(out)
         }
@@ -1065,6 +1756,7 @@ mod tests {
 
         async fn remove(&self, vg: &str, name: &str) -> Result<(), DriverError> {
             self.call(format!("remove {vg}/{name}"))?;
+            self.check_held(name)?;
             let mut lvs = self.lvs.lock().unwrap();
             let removed = lvs.remove(name);
             self.sync_nodes(&lvs);
@@ -1073,6 +1765,7 @@ mod tests {
 
         async fn extend(&self, vg: &str, name: &str, size_bytes: u64) -> Result<(), DriverError> {
             self.call(format!("extend {vg}/{name} {size_bytes}"))?;
+            self.check_held(name)?;
             let mut lvs = self.lvs.lock().unwrap();
             let lv = lvs.get_mut(name).ok_or_else(|| Self::missing(name))?;
             if size_bytes <= lv.size {
@@ -1114,6 +1807,85 @@ mod tests {
         fn changing(&self, vg: &str, name: &str) -> bool {
             assert_eq!(vg, "vg0");
             self.busy.lock().unwrap().iter().any(|lv| lv == name)
+        }
+
+        async fn create_linear(
+            &self,
+            vg: &str,
+            name: &str,
+            size_bytes: u64,
+        ) -> Result<(), DriverError> {
+            self.call(format!("create-linear {vg} {name} {size_bytes}"))?;
+            let mut lvs = self.lvs.lock().unwrap();
+            if lvs.contains_key(name) {
+                return Err(DriverError::Lvm(format!("{name} already exists")));
+            }
+            let lv = FakeLv {
+                size: size_bytes,
+                active: false,
+                skip: false,
+            };
+            lvs.insert(name.into(), lv);
+            Ok(())
+        }
+
+        async fn activate_exclusive(&self, vg: &str, name: &str) -> Result<(), DriverError> {
+            self.call(format!("activate-ex {vg}/{name}"))?;
+            self.check_held(name)?;
+            let mut lvs = self.lvs.lock().unwrap();
+            lvs.get_mut(name).ok_or_else(|| Self::missing(name))?.active = true;
+            self.sync_nodes(&lvs);
+            Ok(())
+        }
+
+        /// 켜 둔 LV만 채울 수 있다(장치 노드가 있어야 한다).
+        async fn zero(&self, vg: &str, name: &str, offset: u64) -> Result<(), DriverError> {
+            self.call(format!("zero {vg}/{name} {offset}"))?;
+            if !self.lv(name).is_some_and(|lv| lv.active) {
+                return Err(DriverError::Lvm(format!("blkdiscard: {name} not active")));
+            }
+            Ok(())
+        }
+
+        async fn tags(&self, vg: &str, name: &str) -> Result<Vec<String>, DriverError> {
+            assert_eq!(vg, "vg0");
+            self.lv(name).ok_or_else(|| Self::missing(name))?;
+            Ok(self
+                .tags
+                .lock()
+                .unwrap()
+                .get(name)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn set_tag(
+            &self,
+            vg: &str,
+            name: &str,
+            tag: &str,
+            on: bool,
+        ) -> Result<(), DriverError> {
+            let op = if on { "addtag" } else { "deltag" };
+            self.call(format!("{op} {vg}/{name} {tag}"))?;
+            self.lv(name).ok_or_else(|| Self::missing(name))?;
+            let mut tags = self.tags.lock().unwrap();
+            let tags = tags.entry(name.into()).or_default();
+            tags.retain(|t| t != tag);
+            if on {
+                tags.push(tag.into());
+            }
+            Ok(())
+        }
+
+        async fn vg_info(&self, vg: &str) -> Result<VgInfo, DriverError> {
+            assert_eq!(vg, "vg0");
+            Ok(VgInfo {
+                name: "vg0".into(),
+                lock_type: "sanlock".into(),
+                size_bytes: 10 << 30,
+                free_bytes: 4 << 30,
+            })
         }
     }
 
@@ -2012,6 +2784,745 @@ mod tests {
             br#"{"nothing":[]}"#,
         ] {
             let err = parse_lvs(bad).unwrap_err();
+            assert!(matches!(err, DriverError::Lvm(_)), "{err:?}");
+        }
+    }
+
+    fn shared_pool() -> StoragePool {
+        Resource::new(
+            "san",
+            StoragePoolSpec {
+                backend: PoolBackend::LvmShared {
+                    vg: "vg0".into(),
+                    iscsi: None,
+                },
+                nodes: vec![],
+                shared: true,
+            },
+        )
+    }
+
+    fn setup_shared(qemu_img: impl Into<PathBuf>) -> (Arc<FakeLvm>, LvmSharedStorage) {
+        let lvm = Arc::new(FakeLvm::default());
+        let storage = LvmSharedStorage {
+            dev: lvm.dev.path().to_path_buf(),
+            ..LvmSharedStorage::new(qemu_img, lvm.clone())
+        };
+        (lvm, storage)
+    }
+
+    /// 다른 노드가 켜 두어 거절된 일시 오류
+    fn held(e: DriverError) {
+        assert!(matches!(e, DriverError::Timeout(LV_HELD)), "{e:?}");
+        assert!(e.is_transient());
+        assert!(e.to_string().contains("another node"), "{e}");
+    }
+
+    /// 두꺼운 LV를 켜지 않고 만든 뒤(1 MiB 배수로 올린다) 배타 활성화해 0으로 채우고 끈다.
+    #[tokio::test]
+    async fn shared_creates_zeroed_thick_lvs() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        let path = storage
+            .create_volume(&p, id, (1 << 20) + 1, RAW)
+            .await
+            .unwrap();
+        assert_eq!(path, lvm.node(&lv));
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("create-linear vg0 {lv} 2097152"),
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 0"),
+                format!("deactivate vg0/{lv}"),
+            ]
+        );
+        assert!(!lvm.lv(&lv).unwrap().active);
+        assert!(storage.target_reads_zero(&p).await.unwrap());
+
+        let err = storage
+            .create_volume(&p, id, 1 << 20, RAW)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeExists(v) if v == id),
+            "{err:?}"
+        );
+        invalid(
+            storage
+                .create_volume(&p, Uuid::now_v7(), 1 << 20, ImageFormat::Qcow2)
+                .await
+                .unwrap_err(),
+            "lvm-shared pools hold raw volumes",
+        );
+        assert_eq!(lvm.taken(), Vec::<String>::new());
+        // 다른 종류의 풀은 다루지 않는다.
+        invalid(
+            storage.capacity(&lvm_pool()).await.unwrap_err(),
+            "not an lvm-shared pool",
+        );
+    }
+
+    /// 0으로 채우지 못하면 만든 LV를 지운다.
+    #[tokio::test]
+    async fn shared_create_removes_the_lv_when_zeroing_fails() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        lvm.fail_on(format!("zero vg0/{lv} 0"));
+        let err = storage
+            .create_volume(&p, id, 1 << 20, RAW)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::Lvm(ref m) if m.contains("injected")),
+            "{err:?}"
+        );
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("create-linear vg0 {lv} 1048576"),
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 0"),
+                format!("remove vg0/{lv}"),
+            ]
+        );
+        assert_eq!(lvm.names(), Vec::<String>::new());
+    }
+
+    /// 이 노드가 0으로 채우는 중인 LV(크기 늘리기)는 끄지 않고 성공이다(채우는 쪽이 켜 둔 LV를 끄면
+    /// 채우기가 실패한다. 남은 활성화는 나중의 정리가 끈다).
+    #[tokio::test]
+    async fn shared_deactivation_skips_a_zeroing_lv() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        lvm.taken();
+
+        let zeroing = format!("vg0/{lv}");
+        storage.zeroing.lock().unwrap().insert(zeroing.clone());
+        storage.deactivate_volume(&p, id, RAW).await.unwrap();
+        assert!(lvm.taken().is_empty());
+        assert!(lvm.lv(&lv).unwrap().active);
+        storage.zeroing.lock().unwrap().remove(&zeroing);
+
+        storage.deactivate_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), [format!("deactivate vg0/{lv}")]);
+        assert!(!lvm.lv(&lv).unwrap().active);
+        // 끄는 동안 표시를 쥐었다가 놓는다.
+        assert!(storage.zeroing.lock().unwrap().is_empty());
+    }
+
+    /// 꺼져 있으면 배타 활성화하고, 다른 노드가 켜 두었으면 일시 오류다. 끄기는 켜져 있을 때만
+    /// 끄고, 볼륨이 없거나 이미 꺼져 있으면 성공이다.
+    #[tokio::test]
+    async fn shared_activation_is_exclusive() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        let err = storage.activate_volume(&p, id, RAW).await.unwrap_err();
+        assert!(matches!(err, DriverError::VolumeNotFound(_)), "{err:?}");
+        storage.deactivate_volume(&p, id, RAW).await.unwrap();
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.taken();
+
+        lvm.held.lock().unwrap().push(lv.clone());
+        held(storage.activate_volume(&p, id, RAW).await.unwrap_err());
+        assert!(!lvm.lv(&lv).unwrap().active);
+        lvm.held.lock().unwrap().clear();
+        lvm.taken();
+
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), [format!("activate-ex vg0/{lv}")]);
+        assert!(lvm.lv(&lv).unwrap().active);
+        storage.deactivate_volume(&p, id, RAW).await.unwrap();
+        storage.deactivate_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), [format!("deactivate vg0/{lv}")]);
+        assert!(!lvm.lv(&lv).unwrap().active);
+    }
+
+    /// 지우기: 다른 노드가 켜 두었으면 일시 오류, 없으면 `VolumeNotFound`, 없어도 만드는 명령이
+    /// 아직 돌고 있으면 일시 오류다.
+    #[tokio::test]
+    async fn shared_delete_removes_the_lv() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.taken();
+        lvm.held.lock().unwrap().push(lv.clone());
+        held(storage.delete_volume(&p, id, RAW).await.unwrap_err());
+        assert_eq!(lvm.names(), std::slice::from_ref(&lv));
+        lvm.held.lock().unwrap().clear();
+        lvm.taken();
+
+        storage.delete_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), [format!("remove vg0/{lv}")]);
+        let err = storage.delete_volume(&p, id, RAW).await.unwrap_err();
+        assert!(matches!(err, DriverError::VolumeNotFound(_)), "{err:?}");
+        *lvm.busy.lock().unwrap() = vec![lv];
+        let err = storage.delete_volume(&p, id, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Timeout(m) if m.contains("still running")),
+            "{err:?}"
+        );
+        assert!(lvm.taken().is_empty());
+    }
+
+    /// 크기는 늘리기 전 크기를 태그로 적고 늘린 뒤, 새 부분을 배타 활성화해 0으로 채우고 끄고 태그를
+    /// 뗀다. 다른 노드가 켜 두었으면 일시 오류다. 정보의 사용량은 크기와 같고, 용량은 VG의 크기와 남은
+    /// 공간이다. 스냅샷은 없다.
+    #[tokio::test]
+    async fn shared_resize_info_capacity_and_no_snapshots() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.taken();
+        storage.resize_volume(&p, id, RAW, 2 << 20).await.unwrap();
+        storage.resize_volume(&p, id, RAW, 1 << 20).await.unwrap();
+        let tag = "opl-zero-from-1048576";
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("addtag vg0/{lv} {tag}"),
+                format!("extend vg0/{lv} 2097152"),
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 1048576"),
+                format!("deltag vg0/{lv} {tag}"),
+                format!("deactivate vg0/{lv}"),
+            ]
+        );
+        assert!(!lvm.lv(&lv).unwrap().active);
+        assert!(lvm.tags.lock().unwrap()[&lv].is_empty());
+        lvm.held.lock().unwrap().push(lv);
+        held(
+            storage
+                .resize_volume(&p, id, RAW, 3 << 20)
+                .await
+                .unwrap_err(),
+        );
+
+        assert_eq!(
+            storage.volume_info(&p, id, RAW).await.unwrap(),
+            VolumeInfo {
+                virtual_bytes: 2 << 20,
+                allocated_bytes: 2 << 20,
+            }
+        );
+        assert_eq!(
+            storage.capacity(&p).await.unwrap(),
+            Capacity {
+                total_bytes: 10 << 30,
+                available_bytes: 4 << 30,
+            }
+        );
+        assert!(!storage.supports_snapshots(&p, RAW));
+        let no = "lvm-shared pools have no snapshots";
+        invalid(
+            storage.snapshot_create(&p, id, RAW, "t").await.unwrap_err(),
+            no,
+        );
+        invalid(
+            storage.snapshot_revert(&p, id, RAW, "t").await.unwrap_err(),
+            no,
+        );
+        invalid(
+            storage.snapshot_delete(&p, id, RAW, "t").await.unwrap_err(),
+            no,
+        );
+        invalid(storage.snapshot_tags(&p, id, RAW).await.unwrap_err(), no);
+        invalid(
+            storage
+                .volume_source(&p, id, RAW, Some("t"))
+                .await
+                .unwrap_err(),
+            no,
+        );
+    }
+
+    /// 늘린 부분을 0으로 채우지 못하면 오류이고 태그가 남는다. 다시 하면 LV가 이미 그 크기여도 늘리기
+    /// 전 크기부터 다시 채운다. 이 노드에서 켜져 있으면(실행 중인 VM) 켠 채로 채운다.
+    #[tokio::test]
+    async fn shared_resize_zeroes_the_new_part_again_after_a_failure() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.fail_on(format!("zero vg0/{lv} 1048576"));
+        lvm.taken();
+        let err = storage
+            .resize_volume(&p, id, RAW, 2 << 20)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::Lvm(ref m) if m.contains("injected")),
+            "{err:?}"
+        );
+        let tag = "opl-zero-from-1048576";
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("addtag vg0/{lv} {tag}"),
+                format!("extend vg0/{lv} 2097152"),
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 1048576"),
+                format!("deactivate vg0/{lv}"),
+            ]
+        );
+        assert_eq!(lvm.lv(&lv).unwrap().size, 2 << 20);
+        assert!(!lvm.lv(&lv).unwrap().active);
+        assert_eq!(lvm.tags.lock().unwrap()[&lv], [tag]);
+
+        lvm.fail.lock().unwrap().clear();
+        storage.resize_volume(&p, id, RAW, 2 << 20).await.unwrap();
+        storage.resize_volume(&p, id, RAW, 2 << 20).await.unwrap();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 1048576"),
+                format!("deltag vg0/{lv} {tag}"),
+                format!("deactivate vg0/{lv}"),
+            ]
+        );
+
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        lvm.taken();
+        storage.resize_volume(&p, id, RAW, 3 << 20).await.unwrap();
+        let tag = "opl-zero-from-2097152";
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("addtag vg0/{lv} {tag}"),
+                format!("extend vg0/{lv} 3145728"),
+                format!("zero vg0/{lv} 2097152"),
+                format!("deltag vg0/{lv} {tag}"),
+            ]
+        );
+        assert!(lvm.lv(&lv).unwrap().active);
+    }
+
+    /// 크기 늘리기가 늘린 부분을 0으로 다 채우지 못해 남긴 태그는 VM 시작(`activate_volume`)이 장치를
+    /// 내주기 전에 마저 채우고 뗀다. 또 채우지 못하면 오류이고 켠 LV를 끈다. 다 채운 뒤에는 할 일이 없다.
+    #[tokio::test]
+    async fn shared_activation_finishes_a_pending_zero() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        let tag = "opl-zero-from-1048576";
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.fail_on(format!("zero vg0/{lv} 1048576"));
+        storage
+            .resize_volume(&p, id, RAW, 2 << 20)
+            .await
+            .unwrap_err();
+        lvm.taken();
+
+        let err = storage.activate_volume(&p, id, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Lvm(ref m) if m.contains("injected")),
+            "{err:?}"
+        );
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 1048576"),
+                format!("deactivate vg0/{lv}"),
+            ]
+        );
+        assert!(!lvm.lv(&lv).unwrap().active);
+        assert_eq!(lvm.tags.lock().unwrap()[&lv], [tag]);
+
+        lvm.fail.lock().unwrap().clear();
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 1048576"),
+                format!("deltag vg0/{lv} {tag}"),
+            ]
+        );
+        assert!(lvm.lv(&lv).unwrap().active);
+        assert!(lvm.tags.lock().unwrap()[&lv].is_empty());
+    }
+
+    /// 복제·복사 원본(`volume_source`)도 읽게 하기 전에 남은 0 채우기를 마친다. 채우지 못하면 켠 LV를
+    /// 끈다.
+    #[tokio::test]
+    async fn shared_source_finishes_a_pending_zero() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        let tag = "opl-zero-from-1048576";
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.fail_on(format!("zero vg0/{lv} 1048576"));
+        storage
+            .resize_volume(&p, id, RAW, 2 << 20)
+            .await
+            .unwrap_err();
+        lvm.taken();
+
+        storage.volume_source(&p, id, RAW, None).await.unwrap_err();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 1048576"),
+                format!("deactivate vg0/{lv}"),
+            ]
+        );
+        assert!(!lvm.lv(&lv).unwrap().active);
+
+        lvm.fail.lock().unwrap().clear();
+        let source = storage.volume_source(&p, id, RAW, None).await.unwrap();
+        assert_eq!(source.size_bytes, 2 << 20);
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 1048576"),
+                format!("deltag vg0/{lv} {tag}"),
+            ]
+        );
+        assert!(lvm.tags.lock().unwrap()[&lv].is_empty());
+    }
+
+    /// 꺼진 볼륨을 늘리는 중에 같은 노드에서 VM 시작이나 복제 원본이 LV를 켜려 할 수 있다. 이 노드가
+    /// 그 LV를 채우는 중이거나(크기 늘리기) 그 LV를 바꾸는 명령이 도는 중이면 켜기는 LV를 건드리지
+    /// 않고 일시 오류다(reconciler가 잠시 뒤 다시 한다). 늘리기 전(태그만 붙은
+    /// 때)에는 채울 것이 없으므로 태그를 그대로 둔다. 켜기가 남은 부분을 먼저 채웠으면 크기 늘리기는
+    /// 다시 채우지 않는다(게스트가 쓴 데이터를 지우지 않는다).
+    #[tokio::test]
+    async fn shared_activation_during_a_resize() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        let tag = "opl-zero-from-1048576";
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        // 늘리기 전에 태그만 붙었다.
+        lvm.tags
+            .lock()
+            .unwrap()
+            .insert(lv.clone(), vec![tag.into()]);
+        lvm.taken();
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        storage.deactivate_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{lv}"),
+                format!("deactivate vg0/{lv}"),
+            ]
+        );
+        assert_eq!(lvm.tags.lock().unwrap()[&lv], [tag]);
+
+        // 늘린 뒤
+        lvm.lvs.lock().unwrap().get_mut(&lv).unwrap().size = 2 << 20;
+        *lvm.busy.lock().unwrap() = vec![lv.clone()];
+        let err = storage.activate_volume(&p, id, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Timeout(m) if m.contains("still running")),
+            "{err:?}"
+        );
+        lvm.busy.lock().unwrap().clear();
+        let zeroing = format!("vg0/{lv}");
+        storage.zeroing.lock().unwrap().insert(zeroing.clone());
+        let err = storage.activate_volume(&p, id, RAW).await.unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        storage.zeroing.lock().unwrap().remove(&zeroing);
+        assert!(lvm.taken().is_empty());
+        assert!(!lvm.lv(&lv).unwrap().active);
+
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        storage.resize_volume(&p, id, RAW, 2 << 20).await.unwrap();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 1048576"),
+                format!("deltag vg0/{lv} {tag}"),
+            ]
+        );
+    }
+
+    /// 크기 늘리기는 [`Zeroing`]을 잡은 뒤 LV를 읽는다. 먼저 읽으면, 읽은 직후 같은 노드의 VM 시작이
+    /// LV를 켜 QEMU에 내준 것을 모르고 채운 뒤 끈다. 표시를 먼저 잡으면 그 VM 시작은 일시 오류로
+    /// 기다린다.
+    #[tokio::test]
+    async fn shared_resize_marks_the_lv_before_reading_it() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let storage = Arc::new(storage);
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.taken();
+        // LV를 읽은 직후 VM 시작이 끼어든다: 표시가 없으면 LV를 켜 QEMU에 내준다.
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s, flag, name) = (storage.clone(), started.clone(), lv.clone());
+        *lvm.on_list.lock().unwrap() = Some(Box::new(move |lvs| {
+            if Zeroing::begin(&s.zeroing, "vg0", &name).is_ok() {
+                lvs.get_mut(&name).unwrap().active = true;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        storage.resize_volume(&p, id, RAW, 2 << 20).await.unwrap();
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        let tag = "opl-zero-from-1048576";
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("addtag vg0/{lv} {tag}"),
+                format!("extend vg0/{lv} 2097152"),
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 1048576"),
+                format!("deltag vg0/{lv} {tag}"),
+                format!("deactivate vg0/{lv}"),
+            ]
+        );
+    }
+
+    /// VM 시작(`activate_volume`)도 [`Zeroing`]을 잡은 뒤 LV를 읽고, 마치지 못하면 자기가 켠 LV만
+    /// 끈다. 먼저 읽으면, 읽은 직후 같은 노드의 크기 늘리기가 표시를 잡고 LV를 켠 것을 모르고 일시
+    /// 오류에 그 LV를 꺼 채우는 중인 크기 늘리기를 망친다.
+    #[tokio::test]
+    async fn shared_activation_marks_the_lv_before_reading_it() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let storage = Arc::new(storage);
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.taken();
+        // LV를 읽은 직후 크기 늘리기가 끼어든다: 표시가 비어 있으면 잡고 LV를 켠다.
+        let resizing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s, flag, name) = (storage.clone(), resizing.clone(), lv.clone());
+        *lvm.on_list.lock().unwrap() = Some(Box::new(move |lvs| {
+            if s.zeroing.lock().unwrap().insert(format!("vg0/{name}")) {
+                lvs.get_mut(&name).unwrap().active = true;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        assert!(!resizing.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(lvm.taken(), [format!("activate-ex vg0/{lv}")]);
+        assert!(lvm.lv(&lv).unwrap().active);
+    }
+
+    /// 가져오기: 원본의 가상 크기로 LV를 만들어 0으로 채운 뒤 켠 채로 써 넣고 끈다. 실패하면 지운다.
+    #[tokio::test]
+    async fn shared_imports_into_a_zeroed_lv() {
+        let tools = tempfile::tempdir().unwrap();
+        let (lvm, storage) = setup_shared(fake_qemu_img(tools.path(), false));
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        let src = Path::new("/up/disk.vmdk");
+        let path = storage
+            .import_volume(&p, id, src, SourceFormat::Vmdk, RAW)
+            .await
+            .unwrap();
+        assert_eq!(path, lvm.node(&lv));
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("create-linear vg0 {lv} 1048576"),
+                format!("activate-ex vg0/{lv}"),
+                format!("zero vg0/{lv} 0"),
+                format!("deactivate vg0/{lv}"),
+            ]
+        );
+        assert!(!lvm.lv(&lv).unwrap().active);
+        let args = std::fs::read_to_string(tools.path().join("args")).unwrap();
+        let dev = path.to_str().unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "convert",
+                "-q",
+                "-n",
+                "--target-is-zero",
+                "-f",
+                "vmdk",
+                "-O",
+                "raw",
+                "/up/disk.vmdk",
+                dev,
+            ]
+        );
+
+        let (lvm, storage) = setup_shared(fake_qemu_img(tools.path(), true));
+        let err = storage
+            .import_volume(&p, id, src, SourceFormat::Vmdk, RAW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+        assert_eq!(lvm.taken().last().unwrap(), &format!("remove vg0/{lv}"));
+        assert_eq!(lvm.names(), Vec::<String>::new());
+    }
+
+    /// 같은 VG 안 복사: 원본을 켜서 그 크기로 대상을 만들어(0 채움) 써 넣은 뒤 둘 다 끈다. 원본은
+    /// `volume_source`로 켜고 `release_source`로 끈다. 다른 노드가 원본을 켜 두었으면 일시 오류다.
+    #[tokio::test]
+    async fn shared_copies_into_a_new_lv() {
+        let tools = tempfile::tempdir().unwrap();
+        let (lvm, storage) = setup_shared(fake_qemu_img(tools.path(), false));
+        let p = shared_pool();
+        let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
+        let (a, b) = (format!("opl-{src}"), format!("opl-{dst}"));
+        storage.create_volume(&p, src, 2 << 20, RAW).await.unwrap();
+        lvm.taken();
+
+        let source = storage.volume_source(&p, src, RAW, None).await.unwrap();
+        assert_eq!(source.path, lvm.node(&a));
+        assert_eq!(source.size_bytes, 2 << 20);
+        storage.release_source(&p, src, RAW, None).await.unwrap();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{a}"),
+                format!("deactivate vg0/{a}")
+            ]
+        );
+
+        storage
+            .copy_volume(&p, src, RAW, None, false, &p, dst, RAW)
+            .await
+            .unwrap();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{a}"),
+                format!("create-linear vg0 {b} 2097152"),
+                format!("activate-ex vg0/{b}"),
+                format!("zero vg0/{b} 0"),
+                format!("deactivate vg0/{b}"),
+                format!("deactivate vg0/{a}"),
+            ]
+        );
+        let args = std::fs::read_to_string(tools.path().join("args")).unwrap();
+        let (from, to) = (lvm.node(&a), lvm.node(&b));
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "convert",
+                "-q",
+                "-n",
+                "--target-is-zero",
+                "-f",
+                "raw",
+                "-O",
+                "raw",
+                from.to_str().unwrap(),
+                to.to_str().unwrap(),
+            ]
+        );
+
+        lvm.held.lock().unwrap().push(a);
+        let other = Uuid::now_v7();
+        held(
+            storage
+                .copy_volume(&p, src, RAW, None, false, &p, other, RAW)
+                .await
+                .unwrap_err(),
+        );
+        assert!(!lvm.names().contains(&format!("opl-{other}")));
+    }
+
+    /// lvmlockd가 다른 노드의 잠금 때문에 거절하면(LV 또는 VG) 일시 오류다. 다른 LVM 오류는 그대로다.
+    #[test]
+    fn locks_held_by_other_hosts_are_transient() {
+        let lv = held_elsewhere(DriverError::Lvm(
+            "lvchange: LV locked by other host: san/opl-x".into(),
+        ));
+        assert!(matches!(lv, DriverError::Timeout(LV_HELD)), "{lv:?}");
+        let vg = held_elsewhere(DriverError::Lvm(
+            "lvcreate: VG san lock failed: held by other host.".into(),
+        ));
+        assert!(matches!(vg, DriverError::Timeout(VG_HELD)), "{vg:?}");
+        assert!(vg.is_transient());
+        let other = held_elsewhere(DriverError::Lvm("Volume group \"san\" not found".into()));
+        assert!(matches!(other, DriverError::Lvm(_)), "{other:?}");
+    }
+
+    /// LVM 명령이 잠금 오류 앞에 경고 줄을 내도 잠금 오류로 알아본다.
+    #[tokio::test]
+    async fn lock_errors_after_warning_lines_are_transient() {
+        let long = Duration::from_secs(10);
+        for (stderr, want) in [
+            (
+                "WARNING: retrying ex lock on LV san/opl-x\n  LV locked by other host: san/opl-x",
+                LV_HELD,
+            ),
+            (
+                "Retrying ex lock on VG san\n  VG san lock failed: held by other host.",
+                VG_HELD,
+            ),
+        ] {
+            let script = format!("printf '{stderr}\\n' >&2; exit 5");
+            let err = LVM
+                .run_change("/bin/sh", &["-c", &script], &[], long)
+                .await
+                .unwrap_err();
+            let err = held_elsewhere(err);
+            assert!(
+                matches!(err, DriverError::Timeout(m) if m == want),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_lv_tags() {
+        assert_eq!(
+            parse_lv_tags(b"  opl-zero-from-1048576,other\n"),
+            ["opl-zero-from-1048576", "other"]
+        );
+        assert!(parse_lv_tags(b"  \n").is_empty());
+    }
+
+    #[test]
+    fn parses_vgs_json() {
+        let out = br#"  {
+      "report": [
+          {
+              "vg": [
+                  {"vg_name":"san", "vg_lock_type":"sanlock", "vg_size":"10737418240", "vg_free":"4294967296"},
+                  {"vg_name":"local", "vg_lock_type":"", "vg_size":4096, "vg_free":0}
+              ]
+          }
+      ]
+  }
+"#;
+        assert_eq!(
+            parse_vgs(out).unwrap(),
+            [
+                VgInfo {
+                    name: "san".into(),
+                    lock_type: "sanlock".into(),
+                    size_bytes: 10 << 30,
+                    free_bytes: 4 << 30,
+                },
+                VgInfo {
+                    name: "local".into(),
+                    lock_type: String::new(),
+                    size_bytes: 4096,
+                    free_bytes: 0,
+                },
+            ]
+        );
+        for bad in [
+            &b"not json"[..],
+            br#"{"report":[{"vg":[{"vg_name":"x","vg_size":"big","vg_free":"1"}]}]}"#,
+            br#"{"report":[{"vg":[{"vg_name":"x","vg_size":"1"}]}]}"#,
+            br#"{"nothing":[]}"#,
+        ] {
+            let err = parse_vgs(bad).unwrap_err();
             assert!(matches!(err, DriverError::Lvm(_)), "{err:?}");
         }
     }

@@ -20,7 +20,6 @@ enum Kind {
     LvmThin,
     Zfs,
     Rbd,
-    /// 아직 다루는 저장소가 없다.
     LvmShared,
 }
 
@@ -48,6 +47,8 @@ pub struct Storages {
     zfs: Option<Arc<dyn Storage>>,
     /// `rbd` 풀. 없으면 그 풀은 쓸 수 없다.
     rbd: Option<Arc<dyn Storage>>,
+    /// `lvm-shared` 풀. 없으면 그 풀은 쓸 수 없다.
+    lvm_shared: Option<Arc<dyn Storage>>,
 }
 
 impl Storages {
@@ -58,6 +59,7 @@ impl Storages {
             lvm_thin: None,
             zfs: None,
             rbd: None,
+            lvm_shared: None,
         }
     }
 
@@ -76,6 +78,12 @@ impl Storages {
     /// `rbd` 풀을 다룰 저장소를 정한다.
     pub fn with_rbd(mut self, storage: Arc<dyn Storage>) -> Self {
         self.rbd = Some(storage);
+        self
+    }
+
+    /// `lvm-shared` 풀을 다룰 저장소를 정한다.
+    pub fn with_lvm_shared(mut self, storage: Arc<dyn Storage>) -> Self {
+        self.lvm_shared = Some(storage);
         self
     }
 
@@ -98,14 +106,15 @@ impl Storages {
                 .rbd
                 .as_ref()
                 .ok_or_else(|| DriverError::InvalidSpec("rbd pools are not supported yet".into())),
-            Kind::LvmShared => Err(DriverError::InvalidSpec(
-                "lvm-shared pools are not supported yet".into(),
-            )),
+            Kind::LvmShared => self.lvm_shared.as_ref().ok_or_else(|| {
+                DriverError::InvalidSpec("lvm-shared pools are not supported yet".into())
+            }),
         }
     }
 
     /// 대상 백엔드에 형식 `format`의 빈 볼륨을 만들고 `src`를 써 넣는다. 쓰다 실패하면 만든
     /// 볼륨을 지운다. 그사이 취소되면 볼륨이 남는다(호출자가 만든 볼륨으로 적어 두고 정리한다).
+    /// 공유 LVM 볼륨은 만든 뒤 꺼져 있으므로 쓰는 동안만 켠다.
     #[allow(clippy::too_many_arguments)]
     async fn write_into(
         &self,
@@ -121,7 +130,11 @@ impl Storages {
         let path = dst
             .create_volume(dst_pool, dst_id, size_bytes, format)
             .await?;
+        let activate = Kind::of(dst_pool) == Kind::LvmShared;
         let written = async {
+            if activate {
+                dst.activate_volume(dst_pool, dst_id, format).await?;
+            }
             // RBD 이미지는 경로가 없으므로 옵션 문자열로 준다(형식도 그 안에 있다).
             let image = rbd::pool_target(dst_pool, dst_id);
             let from = convert_from(src, force_share, image.is_none().then_some(format))?;
@@ -147,6 +160,10 @@ impl Storages {
                 tracing::warn!(volume = %dst_id, error = %del, "cannot remove partial copy");
             }
             return Err(e);
+        }
+        // 복사는 끝났다. 끄지 못하면 켜진 채 남을 뿐이다(opld가 뒤에 정리한다).
+        if activate && let Err(e) = dst.deactivate_volume(dst_pool, dst_id, format).await {
+            tracing::warn!(volume = %dst_id, error = %e, "cannot deactivate copied volume");
         }
         Ok(())
     }
@@ -204,6 +221,17 @@ impl Storage for Storages {
         format: ImageFormat,
     ) -> Result<(), DriverError> {
         self.backend(pool)?.activate_volume(pool, id, format).await
+    }
+
+    async fn deactivate_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.backend(pool)?
+            .deactivate_volume(pool, id, format)
+            .await
     }
 
     async fn volume_info(
@@ -551,6 +579,14 @@ mod tests {
         ) -> Result<(), DriverError> {
             self.call("activate_volume")
         }
+        async fn deactivate_volume(
+            &self,
+            _: &StoragePool,
+            _: Uuid,
+            _: ImageFormat,
+        ) -> Result<(), DriverError> {
+            self.call("deactivate_volume")
+        }
         async fn volume_info(
             &self,
             _: &StoragePool,
@@ -732,6 +768,13 @@ mod tests {
         })
     }
 
+    fn lvm_shared_pool() -> StoragePool {
+        pool(PoolBackend::LvmShared {
+            vg: "san".into(),
+            iscsi: None,
+        })
+    }
+
     /// 인자를 한 줄에 하나씩 `{dir}/args`에 적는 가짜 qemu-img. `fail`이면 실패한다.
     fn fake_qemu_img(dir: &Path, fail: bool) -> PathBuf {
         let path = dir.join("fake-qemu-img");
@@ -749,7 +792,7 @@ mod tests {
     }
 
     /// 파일 풀(dir, nfs)은 파일 저장소로, lvm-thin 풀은 LVM 저장소로, zfs 풀은 ZFS 저장소로, rbd
-    /// 풀은 RBD 저장소로 간다.
+    /// 풀은 RBD 저장소로, lvm-shared 풀은 공유 LVM 저장소로 간다.
     #[tokio::test]
     async fn calls_go_to_the_pool_backend() {
         let log = Log::default();
@@ -759,7 +802,8 @@ mod tests {
         )
         .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)))
         .with_zfs(Arc::new(Recorder::new("zfs", "/z".as_ref(), &log)))
-        .with_rbd(Arc::new(Recorder::new("rbd", "".as_ref(), &log)));
+        .with_rbd(Arc::new(Recorder::new("rbd", "".as_ref(), &log)))
+        .with_lvm_shared(Arc::new(Recorder::new("shared", "/s".as_ref(), &log)));
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
         for (p, name) in [
             (dir_pool(), "file"),
@@ -767,6 +811,7 @@ mod tests {
             (lvm_pool(), "lvm"),
             (zfs_pool(), "zfs"),
             (rbd_pool(), "rbd"),
+            (lvm_shared_pool(), "shared"),
         ] {
             storages.create_volume(&p, id, 1, f).await.unwrap();
             let src = Path::new("/up/x.vmdk");
@@ -776,6 +821,7 @@ mod tests {
                 .unwrap();
             storages.delete_volume(&p, id, f).await.unwrap();
             storages.activate_volume(&p, id, f).await.unwrap();
+            storages.deactivate_volume(&p, id, f).await.unwrap();
             storages.volume_info(&p, id, f).await.unwrap();
             storages.capacity(&p).await.unwrap();
             assert!(storages.supports_snapshots(&p, f));
@@ -801,6 +847,7 @@ mod tests {
                 "import_volume",
                 "delete_volume",
                 "activate_volume",
+                "deactivate_volume",
                 "volume_info",
                 "capacity",
                 "supports_snapshots",
@@ -928,9 +975,9 @@ mod tests {
         assert_eq!(taken(&log), Vec::<String>::new());
     }
 
-    /// 공유 LVM 풀은 아직 쓸 수 없다(다른 저장소로 보내지 않는다).
+    /// 공유 LVM 저장소가 없으면 lvm-shared 풀은 쓸 수 없다(다른 저장소로 보내지 않는다).
     #[tokio::test]
-    async fn lvm_shared_pool_is_unsupported_for_now() {
+    async fn lvm_shared_pool_without_backend_is_unsupported() {
         let log = Log::default();
         let storages = Storages::new(
             "qemu-img",
@@ -939,10 +986,7 @@ mod tests {
         .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)))
         .with_zfs(Arc::new(Recorder::new("zfs", "/z".as_ref(), &log)))
         .with_rbd(Arc::new(Recorder::new("rbd", "/r".as_ref(), &log)));
-        let p = pool(PoolBackend::LvmShared {
-            vg: "san".into(),
-            iscsi: None,
-        });
+        let p = lvm_shared_pool();
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
         let unsupported = |e: DriverError| match e {
             DriverError::InvalidSpec(msg) => {
@@ -952,6 +996,7 @@ mod tests {
         };
         unsupported(storages.create_volume(&p, id, 1, f).await.unwrap_err());
         unsupported(storages.activate_volume(&p, id, f).await.unwrap_err());
+        unsupported(storages.deactivate_volume(&p, id, f).await.unwrap_err());
         unsupported(storages.capacity(&p).await.unwrap_err());
         assert!(!storages.supports_snapshots(&p, f));
         unsupported(
@@ -961,6 +1006,74 @@ mod tests {
                 .unwrap_err(),
         );
         assert_eq!(taken(&log), Vec::<String>::new());
+    }
+
+    /// 공유 LVM 풀로 복사하면 만든 볼륨(꺼져 있다)을 쓰는 동안만 켠다. 쓰다 실패하면 지운다.
+    #[tokio::test]
+    async fn copy_into_lvm_shared_activates_the_new_volume_while_writing() {
+        let tools = tempfile::tempdir().unwrap();
+        let log = Log::default();
+        let (src, dst) = (Uuid::now_v7(), Uuid::now_v7());
+        let raw = ImageFormat::Raw;
+        let (from, to) = (dir_pool(), lvm_shared_pool());
+        for (fail, want) in [
+            (
+                false,
+                [
+                    "file.volume_source",
+                    "shared.create_volume",
+                    "shared.activate_volume",
+                    "shared.deactivate_volume",
+                    "file.release_source",
+                ],
+            ),
+            (
+                true,
+                [
+                    "file.volume_source",
+                    "shared.create_volume",
+                    "shared.activate_volume",
+                    "shared.delete_volume",
+                    "file.release_source",
+                ],
+            ),
+        ] {
+            let storages = Storages::new(
+                fake_qemu_img(tools.path(), fail),
+                Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
+            )
+            .with_lvm_shared(Arc::new(Recorder::new(
+                "shared",
+                "/dev/san".as_ref(),
+                &log,
+            )));
+            let copied = storages
+                .copy_volume(&from, src, raw, None, false, &to, dst, raw)
+                .await;
+            assert_eq!(copied.is_err(), fail);
+            assert_eq!(taken(&log), want);
+        }
+        let args = std::fs::read_to_string(tools.path().join("args")).unwrap();
+        assert!(args.ends_with(&format!("/dev/san/{dst}\n")), "{args}");
+
+        // 다른 백엔드로는 켜고 끄지 않는다.
+        let storages = Storages::new(
+            fake_qemu_img(tools.path(), false),
+            Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
+        )
+        .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)));
+        storages
+            .copy_volume(&from, src, raw, None, false, &lvm_pool(), dst, raw)
+            .await
+            .unwrap();
+        assert_eq!(
+            taken(&log),
+            [
+                "file.volume_source",
+                "lvm.create_volume",
+                "file.release_source"
+            ]
+        );
     }
 
     /// 백엔드가 다르면 대상에 빈 볼륨을 만들고 원본을 써 넣은 뒤 원본을 내놓는다.

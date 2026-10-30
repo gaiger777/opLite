@@ -17,7 +17,9 @@ mod rbd;
 mod storages;
 mod zfs;
 
-pub use lvm::{LvInfo, LvmOps, LvmThinStorage, SystemLvm, parse_lvs};
+pub use lvm::{
+    LvInfo, LvmOps, LvmSharedStorage, LvmThinStorage, SystemLvm, VgInfo, parse_lvs, parse_vgs,
+};
 pub use rbd::{
     DEFAULT_USER as RBD_DEFAULT_USER, RbdOps, RbdSnapshot, RbdSpace, RbdStorage, SystemRbd,
     parse_ceph_df,
@@ -113,6 +115,17 @@ pub trait Storage: Send + Sync {
         id: Uuid,
         format: ImageFormat,
     ) -> Result<(), DriverError>;
+
+    /// `activate_volume`이 이 노드에서 쓸 수 있게 한 것을 되돌린다(VM이 멈춘 뒤). 이미 되돌렸으면
+    /// 아무것도 하지 않는다. 기본은 할 일이 없다(공유 LVM 풀만 LV를 끈다).
+    async fn deactivate_volume(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
 
     /// VM이 실행 중이어도 조회할 수 있다.
     async fn volume_info(
@@ -334,7 +347,7 @@ pub enum DiskLocation {
 /// 볼륨 파일이다. LVM-thin 풀은 LV 장치 `/dev/{vg}/opl-{id}`(없으면 `/dev/mapper`의 노드)이고, 장치
 /// 노드가 없으면(비활성) `VolumeNotActive`다(활성화는 저장소의 `activate_volume`이 한다). ZFS 풀은
 /// zvol 장치 `/dev/zvol/{dataset}/opl-{id}`이고, 노드가 없으면(아직 생기지 않음) `VolumeNotActive`다.
-/// RBD 풀은 경로가 아니라 RBD 이미지 `opl-{id}`다(있는지는 `activate_volume`이 확인한다).
+/// 공유 LVM 풀은 LVM-thin과 같은 LV 장치다(이 노드에서 켜야 생긴다). RBD 풀은 경로가 아니라 RBD 이미지 `opl-{id}`다(있는지는 `activate_volume`이 확인한다).
 pub fn disk_location(
     pool: &StoragePool,
     mount_root: &Path,
@@ -382,9 +395,11 @@ fn disk_location_in(
             id,
         )));
     }
-    if let PoolBackend::LvmShared { .. } = &pool.spec.backend {
-        return Err(DriverError::InvalidSpec(
-            "lvm-shared pools are not supported yet".into(),
+    if let PoolBackend::LvmShared { vg, .. } = &pool.spec.backend {
+        lvm::require_shared_raw(format)?;
+        return Ok(DiskLocation::Path(
+            lvm::volume_device(dev, vg, id)?,
+            DiskKind::Block,
         ));
     }
     check_pool_root(pool, mount_root)?;
@@ -1320,23 +1335,12 @@ mod tests {
         refused(storage.capacity(&p).await.unwrap_err());
     }
 
-    /// 파일 저장소는 공유 LVM 풀도 다루지 않고, 디스크 위치도 아직 정하지 않는다. 풀 루트는 VG의 장치
-    /// 디렉터리다.
+    /// 파일 저장소는 공유 LVM 풀을 다루지 않는다. 풀 루트는 VG의 장치 디렉터리다.
     #[tokio::test]
     async fn lvm_shared_pools_are_not_file_pools() {
         let tools = tempfile::tempdir().unwrap();
         let mnt = tempfile::tempdir().unwrap();
-        let p: StoragePool = Resource::new(
-            "s",
-            StoragePoolSpec {
-                backend: PoolBackend::LvmShared {
-                    vg: "san".into(),
-                    iscsi: None,
-                },
-                nodes: vec![],
-                shared: true,
-            },
-        );
+        let p = lvm_shared_pool();
         assert_eq!(pool_root(&p, mnt.path()), PathBuf::from("/dev/san"));
         let storage = DirStorage::new(fake_tool(tools.path(), "exit 1"), mnt.path());
         let refused = |e: DriverError| match e {
@@ -1349,10 +1353,43 @@ mod tests {
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
         refused(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
         refused(storage.capacity(&p).await.unwrap_err());
-        match disk_location(&p, mnt.path(), id, f).unwrap_err() {
-            DriverError::InvalidSpec(msg) => {
-                assert_eq!(msg, "lvm-shared pools are not supported yet")
-            }
+    }
+
+    fn lvm_shared_pool() -> StoragePool {
+        Resource::new(
+            "s",
+            StoragePoolSpec {
+                backend: PoolBackend::LvmShared {
+                    vg: "san".into(),
+                    iscsi: None,
+                },
+                nodes: vec![],
+                shared: true,
+            },
+        )
+    }
+
+    /// 공유 LVM 풀의 디스크는 LVM-thin과 같은 LV 장치다. 이 노드에서 켜지 않았으면 장치 노드가 없다.
+    #[test]
+    fn lvm_shared_disks_are_lv_devices() {
+        let dev = tempfile::tempdir().unwrap();
+        let mnt = Path::new(MNT);
+        let (p, id) = (lvm_shared_pool(), Uuid::nil());
+        let path = dev
+            .path()
+            .join("san/opl-00000000-0000-0000-0000-000000000000");
+        match disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Raw).unwrap_err() {
+            DriverError::VolumeNotActive(missing) => assert_eq!(missing, path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        std::fs::create_dir(dev.path().join("san")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(
+            disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Raw).unwrap(),
+            DiskLocation::Path(path, DiskKind::Block)
+        );
+        match disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Qcow2).unwrap_err() {
+            DriverError::InvalidSpec(msg) => assert_eq!(msg, "lvm-shared pools hold raw volumes"),
             other => panic!("unexpected error: {other:?}"),
         }
     }
