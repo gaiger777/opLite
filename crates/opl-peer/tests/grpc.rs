@@ -9,7 +9,10 @@ use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::{Hypervisor, MockHypervisor};
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
-use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers};
+use opl_peer::{
+    GrpcNetwork, IncomingError, IncomingMigration, MigrateIncomingRequest, MigrationReceiver,
+    NodeMonitor, NodeMonitorConfig, PeerService, Peers,
+};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
@@ -55,6 +58,15 @@ struct Node {
 
 impl Node {
     async fn start(ca: &ClusterCa, root: &TempDir) -> Node {
+        Self::start_with(ca, root, None).await
+    }
+
+    /// `migrations`가 있으면 마이그레이션을 그것으로 받는다.
+    async fn start_with(
+        ca: &ClusterCa,
+        root: &TempDir,
+        migrations: Option<Arc<dyn MigrationReceiver>>,
+    ) -> Node {
         let id = NodeId(Uuid::now_v7());
         let tls = tls_for(ca, id);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -75,7 +87,11 @@ impl Node {
                 .with_forwarder(peers.clone()),
         );
         let hv = Arc::new(MockHypervisor::default());
-        let service = PeerService::new(cluster.clone(), Some(hv.clone() as Arc<dyn Hypervisor>));
+        let mut service =
+            PeerService::new(cluster.clone(), Some(hv.clone() as Arc<dyn Hypervisor>));
+        if let Some(migrations) = migrations {
+            service = service.with_migrations(migrations);
+        }
         let (stop, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             opl_peer::serve(listener, &tls, service, async {
@@ -104,6 +120,45 @@ impl Node {
         let _ = self.stop.take().unwrap().send(());
         self.server.take().unwrap().await.unwrap();
         self.cluster.shutdown().await.unwrap();
+    }
+}
+
+/// 받은 요청을 적고 정해 둔 결과를 돌려주는 받는 쪽
+#[derive(Default)]
+struct FakeReceiver {
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl MigrationReceiver for FakeReceiver {
+    async fn incoming(&self, req: MigrateIncomingRequest) -> Result<u16, IncomingError> {
+        self.calls.lock().unwrap().push(format!(
+            "incoming {} {} {}",
+            req.vm, req.task, req.qemu_version
+        ));
+        if req.qemu_version != "8.2.2" {
+            return Err(IncomingError::Incompatible(format!(
+                "QEMU {} differs from 8.2.2",
+                req.qemu_version
+            )));
+        }
+        Ok(60007)
+    }
+
+    async fn wait(&self, req: IncomingMigration) -> Result<(), IncomingError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("wait {} {}", req.vm, req.task));
+        Err(IncomingError::Failed("the receiving QEMU exited".into()))
+    }
+
+    async fn abort(&self, req: IncomingMigration) -> Result<(), IncomingError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("abort {} {}", req.vm, req.task));
+        Ok(())
     }
 }
 
@@ -416,4 +471,95 @@ async fn new_leader_does_not_revive_nodes_recorded_offline() {
     for m in monitors {
         m.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn migration_requests_reach_the_receiver_of_a_member() {
+    let (ca, root, nodes) = start(1).await;
+    let receiver = Arc::new(FakeReceiver::default());
+    let target = Node::start_with(&ca, &root, Some(receiver.clone())).await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+        })
+        .await
+        .unwrap();
+    // 대상 노드가 멤버십을 받아 원본 노드를 멤버로 알 때까지 기다린다.
+    let source = nodes[0].id();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(source) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (vm, task) = (Uuid::now_v7(), Uuid::now_v7());
+    let peers = &nodes[0].peers;
+    let req = |version: &str| MigrateIncomingRequest {
+        vm,
+        task,
+        qemu_version: version.into(),
+    };
+    assert_eq!(
+        peers
+            .migrate_incoming(&target.addr, req("8.2.2"))
+            .await
+            .unwrap(),
+        60007
+    );
+    // 받는 쪽의 거절과 실패는 그 종류 그대로 온다.
+    let err = peers
+        .migrate_incoming(&target.addr, req("9.0.0"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IncomingError::Incompatible(_)), "{err:?}");
+    let migration = IncomingMigration { vm, task };
+    let err = peers
+        .migrate_incoming_wait(&target.addr, migration)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        IncomingError::Failed("the receiving QEMU exited".into())
+    );
+    peers
+        .migrate_incoming_abort(&target.addr, migration)
+        .await
+        .unwrap();
+    assert_eq!(
+        *receiver.calls.lock().unwrap(),
+        [
+            format!("incoming {vm} {task} 8.2.2"),
+            format!("incoming {vm} {task} 9.0.0"),
+            format!("wait {vm} {task}"),
+            format!("abort {vm} {task}"),
+        ]
+    );
+
+    // 받는 처리가 없는 노드는 거부한다.
+    let err = target
+        .peers
+        .migrate_incoming_abort(&nodes[0].addr, migration)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, IncomingError::Unavailable(m) if m.contains("does not receive migrations")),
+        "{err:?}"
+    );
+    // 멤버가 아닌 노드의 요청은 받는 쪽에 닿지 않는다.
+    let outsider = Node::start(&ca, &root).await;
+    let err = outsider
+        .peers
+        .migrate_incoming(&target.addr, req("8.2.2"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, IncomingError::Unavailable(m) if m.contains("not a member")),
+        "{err:?}"
+    );
+    assert_eq!(receiver.calls.lock().unwrap().len(), 4);
 }

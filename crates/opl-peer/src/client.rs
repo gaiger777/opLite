@@ -1,4 +1,4 @@
-//! 다른 노드로 가는 gRPC 클라이언트: Raft 네트워크, 리더 전달, 생존 확인, 콘솔.
+//! 다른 노드로 가는 gRPC 클라이언트: Raft 네트워크, 리더 전달, 생존 확인, 콘솔, 마이그레이션 받기.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tonic::{Code, Request, Status, Streaming};
 use uuid::Uuid;
 
+use crate::migration::{IncomingError, IncomingMigration, MigrateIncomingRequest};
 use crate::pki::NodeTls;
 use crate::proto::peer_client::PeerClient;
 use crate::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, VM_METADATA};
@@ -33,6 +34,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// 리더 요청 하나를 기다리는 최대 시간. 리더가 AddVoter에서 새 노드를 따라잡게 기다리는 시간
 /// (`opl_cluster::CATCH_UP_TIMEOUT`, 60초)에 쓰기 시간을 더한 것보다 길어야 한다.
 const LEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// 받을 준비(`MigrateIncoming`)를 기다리는 최대 시간. 대상 노드가 VM 상태를 따라잡고(최대 10초),
+/// 디스크를 켜고, QEMU를 띄우는 시간이다.
+const MIGRATE_INCOMING_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 받기 확인(`MigrateIncomingWait`)을 기다리는 최대 시간. 대상 노드의 드라이버가 받기를 최대 120초
+/// 기다리므로(`incoming_wait`) 그보다 길어야 그 결과를 받는다.
+const MIGRATE_INCOMING_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 받기 취소(`MigrateIncomingAbort`)를 기다리는 최대 시간. 받는 QEMU를 강제로 끄고 디스크를 끈다.
+const MIGRATE_INCOMING_ABORT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 다른 노드로 가는 연결. 주소마다 채널 하나를 만들어 다시 쓴다(끊기면 tonic이 다시 잇는다).
 /// 연결할 때 이 노드의 인증서를 내밀고, 상대 인증서는 클러스터 CA로 확인한다.
@@ -129,6 +141,62 @@ impl Peers {
             receiver: ConsoleReceiver { inbound },
         })
     }
+}
+
+impl Peers {
+    /// `addr`의 노드에 VM을 받을 준비를 시킨다. 받는 QEMU가 연 포트를 돌려준다.
+    pub async fn migrate_incoming(
+        &self,
+        addr: &str,
+        req: MigrateIncomingRequest,
+    ) -> Result<u16, IncomingError> {
+        let mut req = Request::new(req);
+        req.set_timeout(MIGRATE_INCOMING_TIMEOUT);
+        let reply = self
+            .client(addr)
+            .map_err(unreachable)?
+            .migrate_incoming(req)
+            .await
+            .map_err(unreachable)?;
+        reply.into_inner().map(|r| r.port)
+    }
+
+    /// `addr`의 노드에서 받는 QEMU가 받기를 마칠 때까지 기다린다.
+    pub async fn migrate_incoming_wait(
+        &self,
+        addr: &str,
+        migration: IncomingMigration,
+    ) -> Result<(), IncomingError> {
+        let mut req = Request::new(migration);
+        req.set_timeout(MIGRATE_INCOMING_WAIT_TIMEOUT);
+        self.client(addr)
+            .map_err(unreachable)?
+            .migrate_incoming_wait(req)
+            .await
+            .map_err(unreachable)?
+            .into_inner()
+    }
+
+    /// `addr`의 노드에 확정 전의 마이그레이션을 버리게 한다(받는 QEMU를 끄고 디스크를 끈다).
+    pub async fn migrate_incoming_abort(
+        &self,
+        addr: &str,
+        migration: IncomingMigration,
+    ) -> Result<(), IncomingError> {
+        let mut req = Request::new(migration);
+        req.set_timeout(MIGRATE_INCOMING_ABORT_TIMEOUT);
+        self.client(addr)
+            .map_err(unreachable)?
+            .migrate_incoming_abort(req)
+            .await
+            .map_err(unreachable)?
+            .into_inner()
+    }
+}
+
+/// 받는 쪽의 처리 결과는 응답 본문에 오므로 gRPC 상태는 전송·권한 문제다.
+fn unreachable(s: Status) -> IncomingError {
+    IncomingError::Unavailable(s.message().to_string())
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -7,6 +7,7 @@ pub mod auth;
 pub mod cluster;
 mod console;
 pub mod error;
+mod incoming;
 mod janitor;
 pub mod limit;
 pub mod resources;
@@ -30,6 +31,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
+pub use incoming::{IncomingConfig, IncomingMigrations};
 pub use janitor::{ClusterJanitor, ClusterJanitorConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;

@@ -142,6 +142,19 @@ pub fn fingerprint(cert_pem: &str) -> Result<String, PkiError> {
     Ok(format!("sha256:{}", hex::encode(Sha256::digest(&der))))
 }
 
+/// 인증서(PEM)의 키 용도가 keyEncipherment를 허용하는지(키 용도 확장이 없으면 허용). 계획 20 전에
+/// 서명한 노드 인증서에는 없다. QEMU 8.2(GnuTLS)의 마이그레이션 TLS는 그것을 요구한다.
+pub fn allows_key_encipherment(cert_pem: &str) -> Result<bool, PkiError> {
+    let der = first_cert(cert_pem)?;
+    let (_, cert) =
+        x509_parser::parse_x509_certificate(&der).map_err(|e| PkiError::Pem(e.to_string()))?;
+    match cert.key_usage() {
+        Ok(Some(usage)) => Ok(usage.value.key_encipherment()),
+        Ok(None) => Ok(true),
+        Err(e) => Err(PkiError::Pem(e.to_string())),
+    }
+}
+
 /// 노드 인증서(DER)의 CN에 담긴 노드 id
 pub fn node_id_of(cert_der: &[u8]) -> Option<Uuid> {
     let (_, cert) = x509_parser::parse_x509_certificate(cert_der).ok()?;
@@ -256,6 +269,24 @@ mod tests {
             usage.digital_signature() && usage.key_encipherment(),
             "{usage:?}"
         );
+    }
+
+    #[test]
+    fn key_encipherment_of_old_and_new_node_certs() {
+        let ca = ClusterCa::generate("prod").unwrap();
+        let tls = node_tls(&ca, Uuid::now_v7());
+        assert!(allows_key_encipherment(&tls.cert_pem).unwrap());
+        // 계획 20 전의 노드 인증서: digitalSignature만
+        let key = KeyPair::generate().unwrap();
+        let mut old = CertificateParams::new(vec!["10.0.0.5".to_string()]).unwrap();
+        old.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let pem = old.self_signed(&key).unwrap().pem();
+        assert!(!allows_key_encipherment(&pem).unwrap());
+        // 키 용도 확장이 없으면 막지 않는다.
+        let any = CertificateParams::new(vec!["10.0.0.5".to_string()]).unwrap();
+        let pem = any.self_signed(&key).unwrap().pem();
+        assert!(allows_key_encipherment(&pem).unwrap());
+        assert!(allows_key_encipherment("not a cert").is_err());
     }
 
     #[test]

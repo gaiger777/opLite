@@ -47,6 +47,24 @@ fn main() {
             "crate::wire::Empty",
             "opl_cluster::types::NodeId",
         ))
+        .method(json(
+            "migrate_incoming",
+            "MigrateIncoming",
+            "crate::migration::MigrateIncomingRequest",
+            "crate::wire::MigrateIncomingReply",
+        ))
+        .method(json(
+            "migrate_incoming_wait",
+            "MigrateIncomingWait",
+            "crate::migration::IncomingMigration",
+            "crate::wire::IncomingReply",
+        ))
+        .method(json(
+            "migrate_incoming_abort",
+            "MigrateIncomingAbort",
+            "crate::migration::IncomingMigration",
+            "crate::wire::IncomingReply",
+        ))
         .method(
             Method::builder()
                 .name("console")

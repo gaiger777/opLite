@@ -38,6 +38,28 @@ async fn single_node_cluster_serves_cli_over_https_and_survives_restarts() {
             .permissions(),
     );
     assert_eq!(mode & 0o777, 0o600);
+    // 라이브 마이그레이션의 QEMU TLS 파일: 노드 인증서·키와 클러스터 CA, 키는 주인만 읽는다.
+    let tls = d.data_dir().join("migration-tls");
+    let read = |path: std::path::PathBuf| std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        read(tls.join("ca-cert.pem")),
+        read(d.data_dir().join("pki/ca.crt"))
+    );
+    for (name, pki, want) in [
+        ("server-cert.pem", "node.crt", 0o644),
+        ("client-cert.pem", "node.crt", 0o644),
+        ("server-key.pem", "node.key", 0o600),
+        ("client-key.pem", "node.key", 0o600),
+    ] {
+        assert_eq!(
+            read(tls.join(name)),
+            read(d.data_dir().join("pki").join(pki))
+        );
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(tls.join(name)).unwrap().permissions(),
+        );
+        assert_eq!(mode & 0o777, want, "{name}");
+    }
     // 저장소에 CA 개인 키가 있으므로 데이터 디렉터리도 주인만 들어간다. 제어 소켓은 주인만 쓴다.
     for (path, want) in [(d.data_dir(), 0o700), (d.path("opld.sock"), 0o600)] {
         let mode = std::os::unix::fs::PermissionsExt::mode(

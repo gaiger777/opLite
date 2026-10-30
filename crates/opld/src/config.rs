@@ -459,6 +459,13 @@ impl Config {
         with_port(&self.address, self.cluster_listen.port())
     }
 
+    /// 마이그레이션을 받는 QEMU가 들을 호스트: 노드 간 통신을 받는 IP(`cluster_listen`, 기본
+    /// `0.0.0.0`). `address`는 원본이 접속하는 이름일 뿐 이 기계의 주소로 풀리지 않을 수 있다(예:
+    /// `/etc/hosts`의 `127.0.1.1`).
+    pub fn migration_listen_host(&self) -> String {
+        self.cluster_listen.ip().to_string()
+    }
+
     /// 노드 인증서의 이름: 알리는 호스트와 같은 기계에서 쓰는 이름
     pub fn cert_names(&self) -> Vec<String> {
         let mut names = vec![self.address.clone()];
@@ -544,6 +551,16 @@ mod tests {
         for bad in ["0.0.0.0", "::"] {
             assert!(with("node1", bad).validate().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn migration_listens_on_the_cluster_listen_ip() {
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"");
+        assert_eq!(c.migration_listen_host(), "0.0.0.0");
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"\ncluster_listen = \"10.0.0.5:8007\"");
+        assert_eq!(c.migration_listen_host(), "10.0.0.5");
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"\ncluster_listen = \"[::]:8007\"");
+        assert_eq!(c.migration_listen_host(), "::");
     }
 
     #[test]

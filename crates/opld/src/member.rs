@@ -11,12 +11,15 @@ use anyhow::Context;
 use axum::serve::ListenerExt;
 use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
-use opl_api::{AppState, ClusterJanitor, SnapshotScheduler, TaskRunner, TaskRunnerConfig};
+use opl_api::{
+    AppState, ClusterJanitor, IncomingConfig, IncomingMigrations, SnapshotScheduler, TaskRunner,
+    TaskRunnerConfig,
+};
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError};
 use opl_driver::{
     DirStorage, Hypervisor, LvmSharedStorage, LvmThinStorage, QemuHypervisor, RbdStorage, Storage,
-    Storages, SystemLvm, SystemRbd, SystemZfs, ZfsStorage,
+    Storages, SystemLvm, SystemRbd, SystemZfs, ZfsStorage, migration_tls_dir, write_migration_tls,
 };
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{TlsListener, api_server_config};
@@ -164,9 +167,53 @@ impl Member {
                 return Err(e.into());
             }
         };
+        // QEMU가 마이그레이션 TLS에 쓰는 노드 인증서. 드라이버의 state_dir은 데이터 디렉터리다(host.rs).
+        let tls_dir = migration_tls_dir(&config.data_dir);
+        if let Err(e) = write_migration_tls(&tls_dir, &tls.ca_pem, &tls.cert_pem, &tls.key_pem) {
+            let _ = cluster.shutdown().await;
+            return Err(
+                anyhow::Error::new(e).context(format!("cannot write {}", tls_dir.display()))
+            );
+        }
+        // 계획 20 전에 받은 노드 인증서는 keyEncipherment가 없어 QEMU 8.2 이하의 마이그레이션 TLS가
+        // 실패한다. 노드가 클러스터를 나갔다 다시 들어오면 새 인증서를 받는다.
+        if let Ok(false) = opl_peer::pki::allows_key_encipherment(&tls.cert_pem) {
+            tracing::warn!(
+                "this node's certificate lacks the keyEncipherment key usage; live migration over TLS \
+                 will fail with QEMU 8.2 or older until the node leaves and rejoins the cluster"
+            );
+        }
+        // NFS 풀의 마운트 지점은 `{data_dir}/pools/{풀 id}`다.
+        let mount_root = config.data_dir.join("pools");
+        // 풀 백엔드 종류로 나눠 보내는 저장소 하나를 reconciler와 Task 실행기가 함께 쓴다.
+        let files: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img, &mount_root));
+        let lvm = LvmThinStorage::new(&config.qemu_img, Arc::new(SystemLvm));
+        let zfs = ZfsStorage::new(&config.qemu_img, Arc::new(SystemZfs));
+        let rbd = RbdStorage::new(&config.qemu_img, Arc::new(SystemRbd));
+        let lvm_shared = LvmSharedStorage::new(&config.qemu_img, Arc::new(SystemLvm));
+        let storage: Arc<dyn Storage> = Arc::new(
+            Storages::new(&config.qemu_img, files)
+                .with_lvm_thin(Arc::new(lvm))
+                .with_zfs(Arc::new(zfs))
+                .with_rbd(Arc::new(rbd))
+                .with_lvm_shared(Arc::new(lvm_shared)),
+        );
         let (exited_tx, exited) = mpsc::channel(2);
         let (stop, rx) = oneshot::channel::<()>();
-        let service = PeerService::new(cluster.clone(), Some(hv.clone()));
+        // 받는 VM은 원본 노드에 배정된 채이므로 reconciler 없이 받는다.
+        let incoming = IncomingMigrations::new(
+            cluster.clone(),
+            hv.clone(),
+            IncomingConfig {
+                node,
+                mount_root: mount_root.clone(),
+                storage: storage.clone(),
+                listen_host: config.migration_listen_host(),
+                ports: config.migration.ports.clone(),
+            },
+        );
+        let service =
+            PeerService::new(cluster.clone(), Some(hv.clone())).with_migrations(Arc::new(incoming));
         let peer_tls = tls.clone();
         let tx = exited_tx.clone();
         let task = tokio::spawn(async move {
@@ -261,21 +308,6 @@ impl Member {
                 }
             })
         };
-        // NFS 풀의 마운트 지점은 `{data_dir}/pools/{풀 id}`다.
-        let mount_root = config.data_dir.join("pools");
-        // 풀 백엔드 종류로 나눠 보내는 저장소 하나를 reconciler와 Task 실행기가 함께 쓴다.
-        let files: Arc<dyn Storage> = Arc::new(DirStorage::new(&config.qemu_img, &mount_root));
-        let lvm = LvmThinStorage::new(&config.qemu_img, Arc::new(SystemLvm));
-        let zfs = ZfsStorage::new(&config.qemu_img, Arc::new(SystemZfs));
-        let rbd = RbdStorage::new(&config.qemu_img, Arc::new(SystemRbd));
-        let lvm_shared = LvmSharedStorage::new(&config.qemu_img, Arc::new(SystemLvm));
-        let storage: Arc<dyn Storage> = Arc::new(
-            Storages::new(&config.qemu_img, files)
-                .with_lvm_thin(Arc::new(lvm))
-                .with_zfs(Arc::new(zfs))
-                .with_rbd(Arc::new(rbd))
-                .with_lvm_shared(Arc::new(lvm_shared)),
-        );
         let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);

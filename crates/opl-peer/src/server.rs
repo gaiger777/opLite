@@ -15,11 +15,12 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
+use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
 use crate::pki::{NodeTls, node_id_of};
 use crate::proto::peer_server::{Peer, PeerServer};
 use crate::wire::{
-    AppendEntriesReply, AppendEntriesRequest, InstallSnapshotReply, InstallSnapshotRequest,
-    LeaderReply, VoteReply, VoteRequest,
+    AppendEntriesReply, AppendEntriesRequest, IncomingReply, InstallSnapshotReply,
+    InstallSnapshotRequest, LeaderReply, MigrateIncomingReply, VoteReply, VoteRequest,
 };
 use crate::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, VM_METADATA};
 
@@ -28,12 +29,29 @@ use crate::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, VM_METADAT
 pub struct PeerService {
     cluster: Arc<Cluster>,
     hv: Option<Arc<dyn Hypervisor>>,
+    migrations: Option<Arc<dyn MigrationReceiver>>,
 }
 
 impl PeerService {
     /// `hv`는 콘솔 중계에 쓴다. 없으면 콘솔 요청을 거부한다.
     pub fn new(cluster: Arc<Cluster>, hv: Option<Arc<dyn Hypervisor>>) -> Self {
-        Self { cluster, hv }
+        Self {
+            cluster,
+            hv,
+            migrations: None,
+        }
+    }
+
+    /// 라이브 마이그레이션을 `receiver`로 받는다. 없으면 받기 요청을 거부한다.
+    pub fn with_migrations(mut self, receiver: Arc<dyn MigrationReceiver>) -> Self {
+        self.migrations = Some(receiver);
+        self
+    }
+
+    fn migrations(&self) -> Result<&dyn MigrationReceiver, Status> {
+        self.migrations
+            .as_deref()
+            .ok_or_else(|| Status::unimplemented("this node does not receive migrations"))
     }
 
     fn authorize<T>(&self, req: &Request<T>) -> Result<(), Status> {
@@ -95,6 +113,37 @@ impl Peer for PeerService {
     async fn ping(&self, req: Request<()>) -> Result<Response<NodeId>, Status> {
         self.authorize(&req)?;
         Ok(Response::new(self.cluster.id()))
+    }
+
+    async fn migrate_incoming(
+        &self,
+        req: Request<MigrateIncomingRequest>,
+    ) -> Result<Response<MigrateIncomingReply>, Status> {
+        self.authorize(&req)?;
+        let reply = self.migrations()?.incoming(req.into_inner()).await;
+        Ok(Response::new(reply.map(|port| {
+            crate::migration::MigrateIncomingResponse { port }
+        })))
+    }
+
+    async fn migrate_incoming_wait(
+        &self,
+        req: Request<IncomingMigration>,
+    ) -> Result<Response<IncomingReply>, Status> {
+        self.authorize(&req)?;
+        Ok(Response::new(
+            self.migrations()?.wait(req.into_inner()).await,
+        ))
+    }
+
+    async fn migrate_incoming_abort(
+        &self,
+        req: Request<IncomingMigration>,
+    ) -> Result<Response<IncomingReply>, Status> {
+        self.authorize(&req)?;
+        Ok(Response::new(
+            self.migrations()?.abort(req.into_inner()).await,
+        ))
     }
 
     type ConsoleStream = ReceiverStream<Result<Bytes, Status>>;
