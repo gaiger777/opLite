@@ -1097,6 +1097,12 @@ export interface components {
                 };
                 /** @description VM의 실제 상태. reconciler만 기록한다. */
                 status: {
+                    /**
+                     * Format: uuid
+                     * @description 지금 UEFI 변수 파일을 가진 노드. UEFI VM을 켠 노드나 마이그레이션의 대상 노드가 쓴다.
+                     *     다른 노드에서 켤 때 이 노드에서 변수를 받아 온다. BIOS VM은 늘 없다.
+                     */
+                    firmware_node?: string;
                     /** @default null */
                     last_error: string | null;
                     /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
@@ -1611,6 +1617,12 @@ export interface components {
             };
             /** @description VM의 실제 상태. reconciler만 기록한다. */
             status: {
+                /**
+                 * Format: uuid
+                 * @description 지금 UEFI 변수 파일을 가진 노드. UEFI VM을 켠 노드나 마이그레이션의 대상 노드가 쓴다.
+                 *     다른 노드에서 켤 때 이 노드에서 변수를 받아 온다. BIOS VM은 늘 없다.
+                 */
+                firmware_node?: string;
                 /** @default null */
                 last_error: string | null;
                 /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
@@ -1925,6 +1937,12 @@ export interface components {
         };
         /** @description VM의 실제 상태. reconciler만 기록한다. */
         VmStatus: {
+            /**
+             * Format: uuid
+             * @description 지금 UEFI 변수 파일을 가진 노드. UEFI VM을 켠 노드나 마이그레이션의 대상 노드가 쓴다.
+             *     다른 노드에서 켤 때 이 노드에서 변수를 받아 온다. BIOS VM은 늘 없다.
+             */
+            firmware_node?: string;
             /** @default null */
             last_error: string | null;
             /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */

@@ -1,12 +1,13 @@
 //! 다른 노드의 요청을 받는 gRPC 서버.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use opl_cluster::Cluster;
 use opl_cluster::types::{LeaderRequest, NodeId};
-use opl_driver::{DriverError, Hypervisor};
+use opl_driver::{DriverError, Hypervisor, uefi_vars_path};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::mpsc;
@@ -15,6 +16,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
+use crate::firmware::{UefiVarsChunk, UefiVarsRequest};
 use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
 use crate::pki::{NodeTls, node_id_of};
 use crate::proto::peer_server::{Peer, PeerServer};
@@ -30,6 +32,8 @@ pub struct PeerService {
     cluster: Arc<Cluster>,
     hv: Option<Arc<dyn Hypervisor>>,
     migrations: Option<Arc<dyn MigrationReceiver>>,
+    /// 드라이버의 `state_dir`. UEFI 변수 파일을 여기서 찾아 보낸다.
+    state_dir: Option<PathBuf>,
 }
 
 impl PeerService {
@@ -39,7 +43,14 @@ impl PeerService {
             cluster,
             hv,
             migrations: None,
+            state_dir: None,
         }
+    }
+
+    /// 드라이버의 `state_dir`에 있는 VM의 UEFI 변수 파일을 보낸다. 없으면 보내기 요청을 거부한다.
+    pub fn with_uefi_vars(mut self, state_dir: impl Into<PathBuf>) -> Self {
+        self.state_dir = Some(state_dir.into());
+        self
     }
 
     /// 라이브 마이그레이션을 `receiver`로 받는다. 없으면 받기 요청을 거부한다.
@@ -144,6 +155,36 @@ impl Peer for PeerService {
         Ok(Response::new(
             self.migrations()?.abort(req.into_inner()).await,
         ))
+    }
+
+    type UefiVarsStream = ReceiverStream<Result<UefiVarsChunk, Status>>;
+
+    async fn uefi_vars(
+        &self,
+        req: Request<UefiVarsRequest>,
+    ) -> Result<Response<Self::UefiVarsStream>, Status> {
+        self.authorize(&req)?;
+        let dir = self
+            .state_dir
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("this node does not serve UEFI variables"))?;
+        let vm = req.into_inner().vm;
+        let file = match tokio::fs::File::open(uefi_vars_path(dir, vm)).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Status::not_found(format!(
+                    "no UEFI variables for VM {vm} on this node"
+                )));
+            }
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "cannot open the UEFI variables of VM {vm}: {e}"
+                )));
+            }
+        };
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(crate::firmware::send_file(file, tx));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     type ConsoleStream = ReceiverStream<Result<Bytes, Status>>;

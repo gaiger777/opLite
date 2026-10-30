@@ -13,7 +13,7 @@ use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
     AppState, ClusterJanitor, IncomingConfig, IncomingMigrations, SnapshotScheduler, TaskRunner,
-    TaskRunnerConfig,
+    TaskRunnerConfig, UefiVarsFetcher,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError};
@@ -212,8 +212,10 @@ impl Member {
                 ports: config.migration.ports.clone(),
             },
         );
-        let service =
-            PeerService::new(cluster.clone(), Some(hv.clone())).with_migrations(Arc::new(incoming));
+        // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
+        let service = PeerService::new(cluster.clone(), Some(hv.clone()))
+            .with_migrations(Arc::new(incoming))
+            .with_uefi_vars(config.data_dir.clone());
         let peer_tls = tls.clone();
         let tx = exited_tx.clone();
         let task = tokio::spawn(async move {
@@ -310,6 +312,12 @@ impl Member {
         };
         let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
+        // 다른 노드에 있는 UEFI 변수 파일을 노드 사이 RPC로 받아 온다.
+        reconciler_config.firmware = Some(Arc::new(UefiVarsFetcher::new(
+            cluster.clone(),
+            peers.clone(),
+            config.data_dir.clone(),
+        )));
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
         let pools = PoolMounter::spawn(
             cluster.clone(),

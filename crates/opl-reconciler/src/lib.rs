@@ -5,9 +5,11 @@
 
 mod backoff;
 mod config;
+mod firmware;
 mod reconciler;
 pub mod resolve;
 mod worker;
 
 pub use config::{ReconcilerConfig, RestartBackoff};
+pub use firmware::{FirmwareError, FirmwareFetcher};
 pub use reconciler::{Reconciler, ReconcilerHandle};

@@ -1,5 +1,5 @@
 //! 노드 간 gRPC 서비스 정의. `.proto` 대신 Rust 타입을 serde JSON으로 주고받는다(`protoc`가 필요 없다).
-//! 콘솔 스트림만 바이트를 그대로 보낸다.
+//! 콘솔 스트림은 바이트를 그대로, UEFI 변수 조각은 이진 형식으로 보낸다.
 
 use tonic_build::manual::{Builder, Method, Service};
 
@@ -65,6 +65,16 @@ fn main() {
             "crate::migration::IncomingMigration",
             "crate::wire::IncomingReply",
         ))
+        .method(
+            Method::builder()
+                .name("uefi_vars")
+                .route_name("UefiVars")
+                .input_type("crate::firmware::UefiVarsRequest")
+                .output_type("crate::firmware::UefiVarsChunk")
+                .codec_path("crate::codec::BinaryCodec")
+                .server_streaming()
+                .build(),
+        )
         .method(
             Method::builder()
                 .name("console")

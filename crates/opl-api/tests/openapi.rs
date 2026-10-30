@@ -52,6 +52,17 @@ async fn openapi_document_is_served_without_login() {
             .is_some_and(|r| r.contains(&"migration".into())),
         "{vm_status}"
     );
+    // 변수 파일을 가진 노드도 없으면 빼고 쓰는 선택 필드다.
+    assert_eq!(
+        vm_status["properties"]["firmware_node"]["format"], "uuid",
+        "{vm_status}"
+    );
+    assert!(
+        !vm_status["required"]
+            .as_array()
+            .is_some_and(|r| r.contains(&"firmware_node".into())),
+        "{vm_status}"
+    );
     let schemes = &doc["components"]["securitySchemes"];
     assert_eq!(schemes["token"]["scheme"], "bearer");
     assert_eq!(schemes["session"]["name"], "opl_session");

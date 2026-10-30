@@ -665,6 +665,7 @@ impl Worker {
             snapshot: vm.status.snapshot,
             schedule_error: vm.status.schedule_error.clone(),
             migration: None,
+            firmware_node: vm.status.firmware_node,
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

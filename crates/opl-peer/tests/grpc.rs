@@ -1,17 +1,18 @@
 //! 실제 gRPC + mTLS로 잇는 노드들(한 프로세스 안, 127.0.0.1의 빈 포트).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openraft::{BasicNode, ServerState};
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{Cluster, ClusterConfig};
-use opl_driver::{Hypervisor, MockHypervisor};
+use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use opl_peer::{
     GrpcNetwork, IncomingError, IncomingMigration, MigrateIncomingRequest, MigrationReceiver,
-    NodeMonitor, NodeMonitorConfig, PeerService, Peers,
+    NodeMonitor, NodeMonitorConfig, PeerService, Peers, UefiVarsError,
 };
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
@@ -52,6 +53,8 @@ struct Node {
     cluster: Arc<Cluster>,
     peers: Arc<Peers>,
     hv: Arc<MockHypervisor>,
+    /// 이 노드의 드라이버 `state_dir`(UEFI 변수 파일을 보내는 곳)
+    state_dir: PathBuf,
     stop: Option<oneshot::Sender<()>>,
     server: Option<tokio::task::JoinHandle<()>>,
 }
@@ -87,8 +90,10 @@ impl Node {
                 .with_forwarder(peers.clone()),
         );
         let hv = Arc::new(MockHypervisor::default());
+        let state_dir = root.path().join(format!("{id}-state"));
         let mut service =
-            PeerService::new(cluster.clone(), Some(hv.clone() as Arc<dyn Hypervisor>));
+            PeerService::new(cluster.clone(), Some(hv.clone() as Arc<dyn Hypervisor>))
+                .with_uefi_vars(&state_dir);
         if let Some(migrations) = migrations {
             service = service.with_migrations(migrations);
         }
@@ -105,6 +110,7 @@ impl Node {
             cluster,
             peers,
             hv,
+            state_dir,
             stop: Some(stop),
             server: Some(server),
         }
@@ -562,4 +568,58 @@ async fn migration_requests_reach_the_receiver_of_a_member() {
         "{err:?}"
     );
     assert_eq!(receiver.calls.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn uefi_vars_are_fetched_from_a_member() {
+    let (ca, root, nodes) = start(2).await;
+    let (from, to) = (&nodes[1], &nodes[0]);
+    let vm = Uuid::now_v7();
+    // 데이터 조각, 0만 있는 조각 둘, 끝이 짧은 조각(마지막 바이트만 0이 아님)
+    let chunk = opl_peer::firmware::CHUNK_BYTES;
+    let mut vars: Vec<u8> = (0..chunk).map(|i| (i % 251) as u8 + 1).collect();
+    vars.resize(3 * chunk + 100, 0);
+    *vars.last_mut().unwrap() = 0xaa;
+    let src = uefi_vars_path(&from.state_dir, vm);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(&src, &vars).unwrap();
+
+    // 받는 노드의 옛 파일을 바꾼다.
+    let dest = uefi_vars_path(&to.state_dir, vm);
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::write(&dest, b"stale").unwrap();
+    let len = to.peers.uefi_vars(&from.addr, vm, &dest).await.unwrap();
+    assert_eq!(len, vars.len() as u64);
+    assert!(std::fs::read(&dest).unwrap() == vars, "content differs");
+
+    // 0만 있는 파일, 빈 파일도 크기 그대로 온다.
+    std::fs::write(&src, vec![0u8; chunk + 1]).unwrap();
+    to.peers.uefi_vars(&from.addr, vm, &dest).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), vec![0u8; chunk + 1]);
+    std::fs::write(&src, b"").unwrap();
+    assert_eq!(to.peers.uefi_vars(&from.addr, vm, &dest).await.unwrap(), 0);
+    assert!(std::fs::read(&dest).unwrap().is_empty());
+
+    // 그 노드에 파일이 없으면 NotFound이고 받는 쪽 파일은 그대로다.
+    std::fs::write(&dest, b"kept").unwrap();
+    let err = to
+        .peers
+        .uefi_vars(&from.addr, Uuid::now_v7(), &dest)
+        .await
+        .unwrap_err();
+    assert_eq!(err, UefiVarsError::NotFound);
+    assert_eq!(std::fs::read(&dest).unwrap(), b"kept");
+
+    // 멤버가 아닌 노드에는 보내지 않는다.
+    let outsider = Node::start(&ca, &root).await;
+    let err = outsider
+        .peers
+        .uefi_vars(&from.addr, vm, &root.path().join("outsider.fd"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, UefiVarsError::Unavailable(m) if m.contains("not a member")),
+        "{err:?}"
+    );
+    assert!(!root.path().join("outsider.fd").exists());
 }

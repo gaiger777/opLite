@@ -287,6 +287,11 @@ pub struct VmStatus {
     // 없으면 빼고 쓰므로 API 문서에서도 null·기본값이 아니라 선택 필드다.
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub migration: Option<MigrationStatus>,
+    /// 지금 UEFI 변수 파일을 가진 노드. UEFI VM을 켠 노드나 마이그레이션의 대상 노드가 쓴다.
+    /// 다른 노드에서 켤 때 이 노드에서 변수를 받아 온다. BIOS VM은 늘 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub firmware_node: Option<Uuid>,
 }
 
 /// 진행 중인 라이브 마이그레이션: 대상 노드와 그 마이그레이션 Task
@@ -522,6 +527,21 @@ mod tests {
         assert_eq!(st.snapshot, None);
         assert_eq!(st.schedule_error, None);
         assert_eq!(st.migration, None);
+        assert_eq!(st.firmware_node, None);
+    }
+
+    #[test]
+    fn firmware_node_is_written_only_when_known() {
+        let json = serde_json::to_value(VmStatus::default()).unwrap();
+        assert!(json.get("firmware_node").is_none(), "{json}");
+        let node = Uuid::now_v7();
+        let st = VmStatus {
+            firmware_node: Some(node),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(json["firmware_node"], serde_json::json!(node));
+        assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
     }
 
     #[test]

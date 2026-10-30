@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opl_driver::Storage;
+
+use crate::firmware::FirmwareFetcher;
 use uuid::Uuid;
 
 /// reconciler 설정. 기본값은 설계 문서 5.3절을 따른다.
@@ -22,6 +24,8 @@ pub struct ReconcilerConfig {
     /// 과반수가 없어 status를 못 쓰는 동안에도 이 간격으로 다시 쓴다.
     pub retry_interval: Duration,
     pub restart: RestartBackoff,
+    /// 다른 노드에 있는 UEFI 변수 파일을 받아 온다. 없으면 받지 않고 이 노드의 파일로 켠다.
+    pub firmware: Option<Arc<dyn FirmwareFetcher>>,
 }
 
 /// 크래시나 일시적 기동 실패 뒤 다시 시작하는 규칙.
@@ -49,6 +53,7 @@ impl ReconcilerConfig {
                 max_failures: 5,
                 window: Duration::from_secs(600),
             },
+            firmware: None,
         }
     }
 }

@@ -47,6 +47,7 @@ pub fn config(node: Uuid) -> ReconcilerConfig {
             max_failures: 3,
             window: Duration::from_secs(60),
         },
+        firmware: None,
     }
 }
 

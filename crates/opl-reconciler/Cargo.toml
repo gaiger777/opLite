@@ -12,6 +12,7 @@ repository.workspace = true
 qemu-it = []
 
 [dependencies]
+async-trait.workspace = true
 opl-cluster.workspace = true
 opl-driver.workspace = true
 opl-types.workspace = true
@@ -21,7 +22,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 openraft.workspace = true
 opl-qemu.workspace = true
 redb.workspace = true

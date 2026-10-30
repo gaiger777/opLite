@@ -9,13 +9,17 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use openraft::BasicNode;
-use opl_api::{AppState, IncomingConfig, IncomingMigrations, TaskRunner, hash_password};
+use opl_api::{
+    AppState, IncomingConfig, IncomingMigrations, TaskRunner, UefiVarsFetcher, hash_password,
+};
 use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig};
-use opl_driver::{DriverError, Hypervisor, MigrateTarget, MockHypervisor, RuntimeStatus, Storage};
+use opl_driver::{
+    DriverError, Hypervisor, MigrateTarget, MockHypervisor, RuntimeStatus, Storage, uefi_vars_path,
+};
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use opl_peer::{GrpcNetwork, PeerService, Peers};
-use opl_reconciler::Reconciler;
+use opl_reconciler::{FirmwareFetcher, Reconciler};
 use opl_types::auth::{Role, UserSpec};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
@@ -111,8 +115,10 @@ impl Node {
                 ports: MIGRATION_PORTS,
             },
         );
+        let work = root.path().join(format!("{}-work", self.id));
         let service = PeerService::new(self.cluster.clone(), Some(hv.clone()))
-            .with_migrations(Arc::new(incoming));
+            .with_migrations(Arc::new(incoming))
+            .with_uefi_vars(work.join("state"));
         let listener = self.listener.take().unwrap();
         let tls = self.tls.clone();
         tokio::spawn(async move {
@@ -123,7 +129,6 @@ impl Node {
         let mut reconciler_config = reconciler_config(self.id);
         reconciler_config.storage = storage.clone();
         let reconciler = Reconciler::spawn(self.cluster.clone(), hv.clone(), reconciler_config);
-        let work = root.path().join(format!("{}-work", self.id));
         let mut config = runner_config(self.id, &work);
         config.peers = Some(self.peers.clone());
         let runner = TaskRunner::spawn(
@@ -256,6 +261,43 @@ async fn console_of_a_vm_on_another_node_is_relayed() {
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// 노드의 드라이버 `state_dir`(Task 실행기 설정과 노드 간 서버가 같은 곳을 쓴다)
+fn state_dir(root: &TempDir, node: &Node) -> std::path::PathBuf {
+    root.path().join(format!("{}-work", node.id)).join("state")
+}
+
+#[tokio::test]
+async fn uefi_vars_are_fetched_from_the_node_that_has_them() {
+    let (root, a, b) = two_nodes().await;
+    let vm = Uuid::now_v7();
+    let src = uefi_vars_path(&state_dir(&root, &b), vm);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(&src, b"vars of b").unwrap();
+    let fetcher = UefiVarsFetcher::new(a.cluster.clone(), a.peers.clone(), state_dir(&root, &a));
+    let dest = uefi_vars_path(&state_dir(&root, &a), vm);
+
+    fetcher.fetch(vm, b.id).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"vars of b");
+
+    // 파일이 없거나 멤버가 아닌 노드면 실패하고 이 노드의 파일은 그대로다.
+    let err = fetcher.fetch(Uuid::now_v7(), b.id).await.unwrap_err();
+    assert!(err.0.contains("no UEFI variables"), "{err}");
+    let err = fetcher.fetch(vm, Uuid::now_v7()).await.unwrap_err();
+    assert!(err.0.contains("not a cluster member"), "{err}");
+
+    // 오프라인으로 기록된 노드에서는 받지 않는다.
+    std::fs::write(&src, b"newer").unwrap();
+    let mut node = a.cluster.get::<NodeSpec>(b.id).unwrap().unwrap();
+    node.status.online = false;
+    a.cluster
+        .update_status::<NodeSpec>(b.id, &node.status)
+        .await
+        .unwrap();
+    let err = fetcher.fetch(vm, b.id).await.unwrap_err();
+    assert_eq!(err.0, "node \"node2\" is offline");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"vars of b");
 }
 
 /// A에서 도는 VM `web`(디스크 없음)을 만든다.

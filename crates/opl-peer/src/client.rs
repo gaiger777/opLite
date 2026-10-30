@@ -1,6 +1,8 @@
-//! 다른 노드로 가는 gRPC 클라이언트: Raft 네트워크, 리더 전달, 생존 확인, 콘솔, 마이그레이션 받기.
+//! 다른 노드로 가는 gRPC 클라이언트: Raft 네트워크, 리더 전달, 생존 확인, 콘솔, 마이그레이션 받기,
+//! UEFI 변수 받기.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +25,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tonic::{Code, Request, Status, Streaming};
 use uuid::Uuid;
 
+use crate::firmware::{UefiVarsError, UefiVarsRequest};
 use crate::migration::{IncomingError, IncomingMigration, MigrateIncomingRequest};
 use crate::pki::NodeTls;
 use crate::proto::peer_client::PeerClient;
@@ -45,6 +48,10 @@ const MIGRATE_INCOMING_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// 받기 취소(`MigrateIncomingAbort`)를 기다리는 최대 시간. 받는 QEMU를 강제로 끄고 디스크를 끈다.
 const MIGRATE_INCOMING_ABORT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// UEFI 변수 파일 받기(`UefiVars`)를 기다리는 최대 시간. AAVMF 변수 파일은 64 MiB지만 대부분 0이라
+/// 길이만 온다.
+const UEFI_VARS_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 다른 노드로 가는 연결. 주소마다 채널 하나를 만들어 다시 쓴다(끊기면 tonic이 다시 잇는다).
 /// 연결할 때 이 노드의 인증서를 내밀고, 상대 인증서는 클러스터 CA로 확인한다.
@@ -191,6 +198,17 @@ impl Peers {
             .await
             .map_err(unreachable)?
             .into_inner()
+    }
+}
+
+impl Peers {
+    /// `addr`의 노드에서 VM의 UEFI 변수 파일을 받아 `dest`를 바꾼다(같은 디렉터리의 임시 파일에 받아
+    /// fsync한 뒤 이름을 바꾼다). 실패하면 `dest`는 그대로다. 받은 파일의 크기를 돌려준다.
+    pub async fn uefi_vars(&self, addr: &str, vm: Uuid, dest: &Path) -> Result<u64, UefiVarsError> {
+        let mut req = Request::new(UefiVarsRequest { vm });
+        req.set_timeout(UEFI_VARS_TIMEOUT);
+        let chunks = self.client(addr)?.uefi_vars(req).await?.into_inner();
+        crate::firmware::write_file(chunks, dest).await
     }
 }
 
