@@ -341,7 +341,7 @@ function CreateSnapshotDialog({
 }: {
   vm: Vm;
   taken: string[];
-  /** 디스크가 블록 스냅샷(LVM-thin, ZFS)을 쓴다(메모리를 담지 못한다). */
+  /** 디스크가 블록 스냅샷(LVM-thin, ZFS, RBD)을 쓴다(메모리를 담지 못한다). */
   block: boolean;
   returnFocus: RefObject<HTMLElement | null>;
   onClose(): void;

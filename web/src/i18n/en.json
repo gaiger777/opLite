@@ -28,7 +28,7 @@
     "pool_in_use": "The pool still has volumes. Delete them first.",
     "pool_unavailable": "{{message}}",
     "vm_busy": "Another operation on this VM (start, stop, snapshot, revert or clone) is in progress. Try again when it has finished.",
-    "snapshot_unsupported": "Only VMs whose disks are all qcow2, all in LVM-thin pools, or all in ZFS pools can take snapshots. Snapshots of disks in LVM-thin or ZFS pools cannot include memory, and disks in ZFS pools can only revert to their latest snapshot.",
+    "snapshot_unsupported": "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. Snapshots of disks in LVM-thin, ZFS or Ceph RBD pools cannot include memory, and disks in ZFS pools can only revert to their latest snapshot.",
     "vm_has_snapshots": "The VM has snapshots. Delete them first.",
     "volume_in_snapshot": "A VM snapshot still uses this volume. Delete that snapshot first.",
     "snapshot_not_ready": "The snapshot is still being taken.",
@@ -235,7 +235,7 @@
     "createDescription": "Saves the VM's disks, firmware variables and settings so you can return to this point later.",
     "includeMemory": "Include memory",
     "includeMemoryHint": "Also saves the running state. Reverting resumes the VM where it was.",
-    "unsupported": "Only VMs whose disks are all qcow2, all in LVM-thin pools, or all in ZFS pools can take snapshots. {{volume}} is {{format}}.",
+    "unsupported": "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. {{volume}} is {{format}}.",
     "busy": "The VM is starting or stopping. Snapshots can be taken, reverted and deleted once it settles.",
     "revert": "Revert",
     "revertNamed": "Revert to {{name}}",
@@ -269,8 +269,8 @@
       "vm_busy": "Skipped because the VM was busy; it will try again later.",
       "node_offline": "Skipped because the VM's node is offline ({{message}})."
     },
-    "mixed": "Only VMs whose disks are all qcow2, all in LVM-thin pools, or all in ZFS pools can take snapshots. This VM mixes them.",
-    "blockHint": "Disks in LVM-thin and ZFS pools are saved without memory. A running VM pauses briefly while they are saved.",
+    "mixed": "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. This VM mixes them.",
+    "blockHint": "Disks in LVM-thin, ZFS and Ceph RBD pools are saved without memory. A running VM pauses briefly while they are saved.",
     "zfsLatest": "Disks in ZFS pools can only revert to their latest snapshot."
   },
   "clone": {
@@ -356,7 +356,7 @@
     "empty": "No storage pools.",
     "allNodes": "All nodes",
     "createTitle": "Create a storage pool",
-    "createDescription": "Where volumes are kept: a directory on each node, an NFS export that the nodes mount, or an LVM thin pool or ZFS dataset on each node.",
+    "createDescription": "Where volumes are kept: a directory on each node, an NFS export that the nodes mount, an LVM thin pool or ZFS dataset on each node, or a Ceph RBD pool.",
     "pathHint": "An absolute path on the nodes.",
     "shared": "Shared storage",
     "sharedHint": "Check when every node sees the same files at this path, such as an NFS share mounted outside opLite.",
@@ -371,14 +371,16 @@
       "dir": "Directory",
       "nfs": "NFS",
       "lvm-thin": "LVM-thin",
-      "zfs": "ZFS"
+      "zfs": "ZFS",
+      "rbd": "Ceph RBD"
     },
     "location": "Location",
     "kindHint": {
       "dir": "Create the directory on each node first.",
       "nfs": "Each node mounts the export under its data directory. Mounting needs Linux nodes running as root. The pool is shared by its nodes.",
       "lvm-thin": "Create the volume group and thin pool on each node first. Volumes are raw thin volumes kept on the node that creates them, and their snapshots hold disks only. Needs Linux nodes running as root.",
-      "zfs": "Create the dataset on each node first. Volumes are raw zvols kept on the node that creates them, and their snapshots hold disks only. Disks can only revert to their latest snapshot. Needs Linux nodes running as root."
+      "zfs": "Create the dataset on each node first. Volumes are raw zvols kept on the node that creates them, and their snapshots hold disks only. Disks can only revert to their latest snapshot. Needs Linux nodes running as root.",
+      "rbd": "Create the Ceph pool first and put ceph.conf and the keyring on each node. Volumes are raw RBD images that every node of the pool can use, and their snapshots hold disks only. Needs Linux nodes with QEMU's rbd driver (qemu-block-extra) and the rbd command (ceph-common)."
     },
     "server": "NFS server",
     "serverHint": "Host name or IP address.",
@@ -399,11 +401,20 @@
       "server": "Enter a host name or IP address without spaces, commas, slashes or brackets.",
       "options": "Separate the options with commas, without spaces. bind, rbind, remount, move, suid, dev, exec, helper, bg and x-* options are not allowed.",
       "lvmName": "Use 1 to 127 letters, digits, +, _, . or -, not starting with -, snapshot or pvmove. LVM also reserves . and .. and names containing parts like _tdata or _tmeta.",
-      "zfsDataset": "Use a dataset name such as tank/opl, at most 177 characters: parts separated by / with letters, digits, _, ., : or -, none empty, . or .. or starting with -. The pool name comes first and starts with a letter."
+      "zfsDataset": "Use a dataset name such as tank/opl, at most 177 characters: parts separated by / with letters, digits, _, ., : or -, none empty, . or .. or starting with -. The pool name comes first and starts with a letter.",
+      "rbdName": "Use 1 to 63 letters, digits, _, . or -, not starting with -.",
+      "cephUser": "Write the Ceph user without the \"client.\" prefix, for example opl instead of client.opl.",
+      "rbdConf": "Enter an absolute path (starting with /) without control characters, commas, colons or equals signs."
     },
     "vg": "Volume group",
     "thinpool": "Thin pool",
-    "dataset": "Dataset"
+    "dataset": "Dataset",
+    "cephPool": "Ceph pool",
+    "namespace": "Namespace (optional)",
+    "cephUser": "Ceph user (optional)",
+    "cephUserHint": "The Ceph client ID without the \"client.\" prefix. Uses admin if empty.",
+    "cephConf": "ceph.conf path (optional)",
+    "cephConfHint": "An absolute path on the nodes, /etc/ceph/ceph.conf if empty."
   },
   "networks": {
     "bridge": "Bridge",
@@ -581,13 +592,13 @@
     },
     "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",
-    "scheduleNote": "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2, all in LVM-thin pools, or all in ZFS pools.",
+    "scheduleNote": "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools.",
     "scheduleEvery": "Take snapshots",
     "scheduleOff": "Off",
     "scheduleKeep": "Snapshots to keep",
-    "scheduleRaw": "{{volume}} is {{format}}, so scheduled snapshots will fail. All disks must be qcow2, all in LVM-thin pools, or all in ZFS pools.",
+    "scheduleRaw": "{{volume}} is {{format}}, so scheduled snapshots will fail. All disks must be qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools.",
     "scheduleMemoryHint": "Memory is saved only while the VM is running and has disks.",
-    "scheduleMixed": "Disks with different snapshot methods (qcow2, LVM-thin pools, ZFS pools) are mixed, so scheduled snapshots will fail."
+    "scheduleMixed": "Disks with different snapshot methods (qcow2, LVM-thin pools, ZFS pools, Ceph RBD pools) are mixed, so scheduled snapshots will fail."
   },
   "console": {
     "connecting": "Connecting…",

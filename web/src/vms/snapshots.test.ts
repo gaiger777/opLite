@@ -63,7 +63,8 @@ it("checks snapshot names and descriptions like the server", () => {
 const local = pool("local");
 const fast = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } });
 const tank = pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } });
-const pools = [local, fast, tank];
+const ceph = pool("ceph", { backend: { kind: "rbd", pool: "rbd" } });
+const pools = [local, fast, tank, ceph];
 const raw = (name: string, poolName: string) => {
   const v = volume(name, poolName);
   return { ...v, spec: { ...v.spec, format: "raw" as const } };
@@ -97,11 +98,21 @@ it("decides like the server whether disks can be snapshotted", () => {
   });
   const qcow = disk(volume("q", "tank"));
   expect(snapshotSupport([qcow])).toEqual({ kind: "format", disk: qcow });
+  // RBD 풀도 raw 블록 스냅샷이다.
+  expect(snapshotSupport([disk(raw("a", "ceph")), disk(raw("b", "ceph"))])).toEqual({
+    kind: "ok",
+    block: true,
+  });
+  const image = disk(volume("i", "ceph"));
+  expect(snapshotSupport([image])).toEqual({ kind: "format", disk: image });
   // 방식이 섞이면 안 된다. 블록 백엔드끼리도 종류가 다르면 섞인 것이다.
   expect(snapshotSupport([disk(volume("a", "local")), disk(raw("b", "fast"))])).toEqual({
     kind: "mixed",
   });
   expect(snapshotSupport([disk(raw("a", "fast")), disk(raw("b", "tank"))])).toEqual({
+    kind: "mixed",
+  });
+  expect(snapshotSupport([disk(raw("a", "tank")), disk(raw("b", "ceph"))])).toEqual({
     kind: "mixed",
   });
   // 풀을 모르는 볼륨은 파일 풀처럼 본다.
@@ -163,6 +174,8 @@ it("finds snapshots a VM with disks in ZFS pools cannot revert to, like the serv
   // 스냅샷이 찍은 디스크가 ZFS 풀에 없으면 막지 않는다(지금 VM의 디스크가 아니다).
   expect(notLatest(old, all, [volume("z-root", "local")])).toBe(false);
   expect(notLatest(old, all, [raw("z-root", "fast")])).toBe(false);
+  // RBD 디스크는 아무 스냅샷으로나 되돌린다.
+  expect(notLatest(old, all, [raw("z-root", "ceph")])).toBe(false);
   // 목록에 없는 볼륨은 건너뛴다.
   expect(notLatest(old, all, [])).toBe(false);
   // 같은 ZFS 볼륨을 담지 않은 더 나중의 스냅샷은 막지 않는다.

@@ -28,6 +28,8 @@ import {
 } from "@/components/ui/table";
 import { formatBytes } from "@/lib/format";
 import {
+  cephNameError,
+  cephUserError,
   lvmNameError,
   nfsExportError,
   nfsOptionsError,
@@ -35,6 +37,7 @@ import {
   poolCapacity,
   poolLocation,
   poolNodes,
+  rbdConfError,
   zfsDatasetError,
 } from "@/storage/pools";
 import { PoolStatus } from "@/storage/PoolStatus";
@@ -158,8 +161,7 @@ export function PoolsPage() {
   );
 }
 
-/** 만들 수 있는 풀 종류. RBD 풀 만들기는 아직 없다. */
-type Kind = Exclude<StoragePool["spec"]["backend"]["kind"], "rbd">;
+type Kind = StoragePool["spec"]["backend"]["kind"];
 
 function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
@@ -174,6 +176,10 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const [vg, setVg] = useState("");
   const [thinpool, setThinpool] = useState("");
   const [dataset, setDataset] = useState("");
+  const [cephPool, setCephPool] = useState("");
+  const [namespace, setNamespace] = useState("");
+  const [cephUser, setCephUser] = useState("");
+  const [cephConf, setCephConf] = useState("");
   const [chosen, setChosen] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -215,6 +221,25 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
         found.dataset = datasetError;
       }
     }
+    if (kind === "rbd") {
+      const poolError = cephNameError(cephPool);
+      if (poolError) {
+        found.cephPool = poolError;
+      }
+      // 네임스페이스·사용자·conf는 비우면 보내지 않는다(Ceph 기본값).
+      const namespaceError = namespace === "" ? undefined : cephNameError(namespace);
+      if (namespaceError) {
+        found.namespace = namespaceError;
+      }
+      const userError = cephUser === "" ? undefined : cephUserError(cephUser);
+      if (userError) {
+        found.cephUser = userError;
+      }
+      const confError = cephConf === "" ? undefined : rbdConfError(cephConf);
+      if (confError) {
+        found.cephConf = confError;
+      }
+    }
     // 고른 뒤에 목록에서 빠진 노드는 보내지 않는다.
     const known = chosen.filter((id) => nodes.data?.some((n) => n.id === id));
     // 고른 노드가 모두 빠졌으면 빈 목록(모든 노드)으로 보내지 않는다.
@@ -227,7 +252,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
     if (Object.keys(found).length > 0) {
       return false;
     }
-    // NFS 풀의 `shared`는 보내지 않는다(서버가 늘 공유로 둔다). 빈 옵션은 커널 기본값이다.
+    // NFS·RBD 풀의 `shared`는 보내지 않는다(서버가 늘 공유로 둔다). 빈 옵션은 커널 기본값이다.
     // LVM-thin·ZFS 풀은 노드 로컬이라 `shared`를 보내지 않는다.
     const sharedDir = kind === "dir" && shared;
     const backend =
@@ -237,12 +262,20 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
           ? { kind, vg, thinpool }
           : kind === "zfs"
             ? { kind, dataset }
-            : {
-                kind,
-                server: nfsServer,
-                export: nfsExport,
-                ...(nfsOptions !== "" && { options: nfsOptions }),
-              };
+            : kind === "rbd"
+              ? {
+                  kind,
+                  pool: cephPool,
+                  ...(namespace !== "" && { namespace }),
+                  ...(cephUser !== "" && { user: cephUser }),
+                  ...(cephConf !== "" && { conf: cephConf }),
+                }
+              : {
+                  kind,
+                  server: nfsServer,
+                  export: nfsExport,
+                  ...(nfsOptions !== "" && { options: nfsOptions }),
+                };
     const spec = { backend, nodes: known, ...(sharedDir && { shared: true }) };
     await call(api.POST("/storage-pools", { body: { name, spec } }));
     toast.success(t("pools.created", { name }));
@@ -274,6 +307,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             <NativeSelectOption value="nfs">{t("pools.kinds.nfs")}</NativeSelectOption>
             <NativeSelectOption value="lvm-thin">{t("pools.kinds.lvm-thin")}</NativeSelectOption>
             <NativeSelectOption value="zfs">{t("pools.kinds.zfs")}</NativeSelectOption>
+            <NativeSelectOption value="rbd">{t("pools.kinds.rbd")}</NativeSelectOption>
           </NativeSelect>
         )}
       </Field>
@@ -315,6 +349,61 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             />
           )}
         </Field>
+      )}
+      {kind === "rbd" && (
+        <>
+          <Field id="pool-ceph-pool" label={t("pools.cephPool")} error={errors.cephPool}>
+            {(a11y) => (
+              <Input
+                id="pool-ceph-pool"
+                placeholder="rbd"
+                value={cephPool}
+                onChange={(e) => setCephPool(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          <Field id="pool-namespace" label={t("pools.namespace")} error={errors.namespace}>
+            {(a11y) => (
+              <Input
+                id="pool-namespace"
+                value={namespace}
+                onChange={(e) => setNamespace(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          <Field
+            id="pool-ceph-user"
+            label={t("pools.cephUser")}
+            error={errors.cephUser}
+            hint={t("pools.cephUserHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="pool-ceph-user"
+                value={cephUser}
+                onChange={(e) => setCephUser(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          <Field
+            id="pool-ceph-conf"
+            label={t("pools.cephConf")}
+            error={errors.cephConf}
+            hint={t("pools.cephConfHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="pool-ceph-conf"
+                value={cephConf}
+                onChange={(e) => setCephConf(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+        </>
       )}
       {kind === "dir" && (
         <>

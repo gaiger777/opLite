@@ -1,4 +1,6 @@
 import {
+  cephNameError,
+  cephUserError,
   lvmNameError,
   nfsServerError,
   nfsExportError,
@@ -9,6 +11,7 @@ import {
   poolNodes,
   poolsUsableOn,
   poolUsableSomewhere,
+  rbdConfError,
   zfsDatasetError,
 } from "@/storage/pools";
 import { NODE, pool, poolState } from "@/test/fixtures";
@@ -18,6 +21,8 @@ const nfs = (server: string) =>
   pool("nas", { backend: { kind: "nfs", server, export: "/srv/vm" }, shared: true });
 const lvm = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } });
 const zfs = pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } });
+const rbd = (namespace?: string) =>
+  pool("ceph", { backend: { kind: "rbd", pool: "rbd", ...(namespace && { namespace }) } });
 const withPool = (
   id: string,
   name: string,
@@ -41,6 +46,8 @@ it("shows where a pool keeps its files", () => {
   expect(poolLocation(nfs("fd00::5"))).toBe("[fd00::5]:/srv/vm");
   expect(poolLocation(lvm)).toBe("vg0/tp");
   expect(poolLocation(zfs)).toBe("tank/opl");
+  expect(poolLocation(rbd())).toBe("rbd");
+  expect(poolLocation(rbd("opl"))).toBe("rbd/opl");
 });
 
 it("checks LVM names like the server", () => {
@@ -104,6 +111,51 @@ it("checks ZFS datasets like the server", () => {
   }
 });
 
+it("checks Ceph names like the server", () => {
+  for (const ok of ["rbd", "Opl_vm.1-a", "9", "a".repeat(63)]) {
+    expect(cephNameError(ok)).toBeUndefined();
+  }
+  // `-`로 시작하면 명령 옵션으로 읽힐 수 있다.
+  for (const bad of [
+    "",
+    "-rbd",
+    "rbd/opl",
+    "rbd@s",
+    "a,b",
+    "a:b",
+    "a=b",
+    "my rbd",
+    "데이터",
+    "a".repeat(64),
+  ]) {
+    expect(cephNameError(bad)).toBe("pools.errors.rbdName");
+  }
+});
+
+it("checks Ceph users like the server, without the client. prefix", () => {
+  expect(cephUserError("opl")).toBeUndefined();
+  expect(cephUserError("clients")).toBeUndefined();
+  expect(cephUserError("client.opl")).toBe("pools.errors.cephUser");
+  expect(cephUserError("client.admin")).toBe("pools.errors.cephUser");
+  expect(cephUserError("-opl")).toBe("pools.errors.rbdName");
+});
+
+it("checks ceph.conf paths like the server", () => {
+  expect(rbdConfError("/etc/ceph/ceph.conf")).toBeUndefined();
+  expect(rbdConfError("/etc/ceph/my ceph.conf")).toBeUndefined();
+  // conf는 QEMU 옵션 문자열(`conf=...`)에 들어간다.
+  for (const bad of [
+    "",
+    "ceph.conf",
+    "/etc/ceph/a,b.conf",
+    "/etc/ceph/a:b.conf",
+    "/etc/ceph/a=b.conf",
+    "/etc/ceph/\nceph.conf",
+  ]) {
+    expect(rbdConfError(bad)).toBe("pools.errors.rbdConf");
+  }
+});
+
 it("offers the volume formats a pool holds, the default first", () => {
   expect(poolFormats(pool("local"))).toEqual(["qcow2", "raw"]);
   expect(poolFormats(nfs("nas.lan"))).toEqual(["qcow2", "raw"]);
@@ -111,6 +163,8 @@ it("offers the volume formats a pool holds, the default first", () => {
   expect(poolFormats(lvm)).toEqual(["raw"]);
   // ZFS 풀도 raw zvol만 둔다.
   expect(poolFormats(zfs)).toEqual(["raw"]);
+  // RBD 풀도 raw 이미지만 둔다.
+  expect(poolFormats(rbd())).toEqual(["raw"]);
   // 풀을 고르기 전에는 파일 풀처럼 둘 다다.
   expect(poolFormats(undefined)).toEqual(["qcow2", "raw"]);
 });
@@ -189,6 +243,16 @@ it("takes the capacity from online nodes where the pool is ready", () => {
     { node: "node-c", free: 20 * GIB, total: 128 * GIB },
   ]);
   expect(poolCapacity(pool("local"), [a])).toEqual([]);
+  // RBD 풀은 `shared`가 없어도 늘 공유다(서버의 `is_shared`).
+  const ceph = (id: string, name: string) => ({
+    ...NODE,
+    id,
+    name,
+    status: { ...NODE.status, pools: { ceph: poolState("ceph", { available_bytes: GIB }) } },
+  });
+  expect(poolCapacity(rbd(), [ceph("n1", "node-a"), ceph("n2", "node-b")])).toEqual([
+    { node: null, free: GIB, total: 128 * GIB },
+  ]);
 });
 
 it("offers the pools a node can use, like the server's pool_usable_on", () => {

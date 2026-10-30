@@ -73,7 +73,7 @@ export interface SnapshotDisk {
 }
 
 /**
- * 디스크들의 스냅샷 가능 여부. `ok`면 `block`이 블록 스냅샷(LVM-thin·ZFS, 메모리 없음)인지,
+ * 디스크들의 스냅샷 가능 여부. `ok`면 `block`이 블록 스냅샷(LVM-thin·ZFS·RBD, 메모리 없음)인지,
  * `format`은 풀 종류가 담지 못하는 형식의 디스크, `mixed`는 방식(qcow2 내부 스냅샷, 블록 백엔드
  * 종류마다의 블록 스냅샷)이 섞인 것이다.
  */
@@ -90,7 +90,7 @@ export function volumeDisk(volume: Volume, pools: readonly StoragePool[]): Snaps
 }
 
 /**
- * 서버의 `check_disks`처럼 판단한다: 파일 풀의 디스크는 qcow2, 블록 풀(LVM-thin, ZFS)의 디스크는
+ * 서버의 `check_disks`처럼 판단한다: 파일 풀의 디스크는 qcow2, 블록 풀(LVM-thin, ZFS, RBD)의 디스크는
  * raw여야 하고, 모든 디스크가 같은 방식이어야 한다. 서버와 다른 점: 호출자는 목록에 없는 볼륨을 넘기지 않으므로
  * (서버는 400) 그런 디스크는 건너뛴 셈이고, 풀을 모르는 디스크는 파일 풀처럼 본다(서버는 400).
  */

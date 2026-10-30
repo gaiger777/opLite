@@ -14,6 +14,7 @@ it("lists pools with their nodes, space and volumes", async () => {
       pool("busy", { nodes: ["n1"] }),
       pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } }),
       pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } }),
+      pool("ceph", { backend: { kind: "rbd", pool: "rbd", namespace: "opl" } }),
     ],
     node: [
       {
@@ -47,6 +48,9 @@ it("lists pools with their nodes, space and volumes", async () => {
   const tank = within(table).getByText("tank").closest("tr")!;
   expect(tank).toHaveTextContent("ZFS");
   expect(tank).toHaveTextContent("tank/opl");
+  const ceph = within(table).getByText("ceph").closest("tr")!;
+  expect(ceph).toHaveTextContent("Ceph RBD");
+  expect(ceph).toHaveTextContent("rbd/opl");
 });
 
 it("shows each node's pool state and space", async () => {
@@ -328,6 +332,114 @@ it("creates a ZFS pool", async () => {
     expect(body).toEqual({
       name: "tank",
       spec: { backend: { kind: "zfs", dataset: "tank/opl" }, nodes: [] },
+    }),
+  );
+});
+
+it("creates a Ceph RBD pool", async () => {
+  mockLists({ node: [NODE] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/storage-pools"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("ceph"), { status: 201 });
+    }),
+  );
+  renderPage(<PoolsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "ceph");
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "rbd");
+  expect(within(dialog).getByLabelText("Kind")).toHaveAccessibleDescription(
+    "Create the Ceph pool first and put ceph.conf and the keyring on each node. Volumes are raw RBD images that every node of the pool can use, and their snapshots hold disks only. Needs Linux nodes with QEMU's rbd driver (qemu-block-extra) and the rbd command (ceph-common).",
+  );
+  // 늘 공유라 고를 것이 없고, 다른 종류의 입력도 없다.
+  expect(within(dialog).queryByRole("checkbox", { name: "Shared storage" })).toBeNull();
+  expect(within(dialog).queryByLabelText("Directory")).toBeNull();
+  expect(within(dialog).queryByLabelText("Dataset")).toBeNull();
+  expect(within(dialog).getByLabelText("Ceph user (optional)")).toHaveAccessibleDescription(
+    'The Ceph client ID without the "client." prefix. Uses admin if empty.',
+  );
+  expect(within(dialog).getByLabelText("ceph.conf path (optional)")).toHaveAccessibleDescription(
+    "An absolute path on the nodes, /etc/ceph/ceph.conf if empty.",
+  );
+  // 서버처럼 이름과 conf 경로를 검사한다.
+  await userEvent.type(within(dialog).getByLabelText("Ceph pool"), "rbd/opl");
+  await userEvent.type(within(dialog).getByLabelText("Namespace (optional)"), "-opl");
+  await userEvent.type(within(dialog).getByLabelText("Ceph user (optional)"), "opl user");
+  await userEvent.type(within(dialog).getByLabelText("ceph.conf path (optional)"), "ceph.conf");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  const nameError = "Use 1 to 63 letters, digits, _, . or -, not starting with -.";
+  expect(within(dialog).getByLabelText("Ceph pool")).toHaveAccessibleDescription(nameError);
+  expect(within(dialog).getByLabelText("Namespace (optional)")).toHaveAccessibleDescription(
+    nameError,
+  );
+  expect(within(dialog).getByLabelText("Ceph user (optional)")).toHaveAccessibleDescription(
+    nameError,
+  );
+  expect(within(dialog).getByLabelText("ceph.conf path (optional)")).toHaveAccessibleDescription(
+    "Enter an absolute path (starting with /) without control characters, commas, colons or equals signs.",
+  );
+  expect(body).toBeUndefined();
+  // 사용자는 `client.` 없이 쓴다.
+  await userEvent.clear(within(dialog).getByLabelText("Ceph user (optional)"));
+  await userEvent.type(within(dialog).getByLabelText("Ceph user (optional)"), "client.opl");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByLabelText("Ceph user (optional)")).toHaveAccessibleDescription(
+    'Write the Ceph user without the "client." prefix, for example opl instead of client.opl.',
+  );
+  expect(body).toBeUndefined();
+
+  // 선택 입력을 비우면 보내지 않는다.
+  await userEvent.clear(within(dialog).getByLabelText("Ceph pool"));
+  await userEvent.type(within(dialog).getByLabelText("Ceph pool"), "rbd");
+  await userEvent.clear(within(dialog).getByLabelText("Namespace (optional)"));
+  await userEvent.clear(within(dialog).getByLabelText("Ceph user (optional)"));
+  await userEvent.clear(within(dialog).getByLabelText("ceph.conf path (optional)"));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await screen.findByText("Created storage pool ceph.")).toBeInTheDocument();
+  // 공유 여부는 서버가 정한다.
+  expect(body).toEqual({
+    name: "ceph",
+    spec: { backend: { kind: "rbd", pool: "rbd" }, nodes: [] },
+  });
+});
+
+it("creates a Ceph RBD pool with a namespace, user and ceph.conf", async () => {
+  mockLists({ node: [NODE] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/storage-pools"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("ceph"), { status: 201 });
+    }),
+  );
+  renderPage(<PoolsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "ceph");
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "rbd");
+  await userEvent.type(within(dialog).getByLabelText("Ceph pool"), "rbd");
+  await userEvent.type(within(dialog).getByLabelText("Namespace (optional)"), "opl");
+  await userEvent.type(within(dialog).getByLabelText("Ceph user (optional)"), "opl");
+  await userEvent.type(
+    within(dialog).getByLabelText("ceph.conf path (optional)"),
+    "/etc/ceph/opl.conf",
+  );
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  await vi.waitFor(() =>
+    expect(body).toEqual({
+      name: "ceph",
+      spec: {
+        backend: {
+          kind: "rbd",
+          pool: "rbd",
+          namespace: "opl",
+          user: "opl",
+          conf: "/etc/ceph/opl.conf",
+        },
+        nodes: [],
+      },
     }),
   );
 });

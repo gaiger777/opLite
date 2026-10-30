@@ -25,9 +25,10 @@ export function poolLocation(pool: StoragePool): string {
   return b.server.includes(":") ? `[${b.server}]:${b.export}` : `${b.server}:${b.export}`;
 }
 
-/** 모든 노드가 같은 데이터를 보는 풀인지. NFS 풀은 늘 공유다(서버의 `is_shared`). */
+/** 모든 노드가 같은 데이터를 보는 풀인지. NFS·RBD 풀은 늘 공유다(서버의 `is_shared`). */
 export function isShared(pool: StoragePool): boolean {
-  return pool.spec.shared === true || pool.spec.backend.kind === "nfs";
+  const kind = pool.spec.backend.kind;
+  return pool.spec.shared === true || kind === "nfs" || kind === "rbd";
 }
 
 /**
@@ -89,15 +90,44 @@ export function zfsDatasetError(dataset: string): string | undefined {
   return ok ? undefined : "pools.errors.zfsDataset";
 }
 
-/** 디스크 스냅샷을 블록 스냅샷으로 두는 풀(LVM-thin, ZFS)의 종류. 아니면(파일 풀, 모름) `undefined`. */
-export function blockSnapshotKind(pool: StoragePool | undefined): "lvm-thin" | "zfs" | undefined {
+/**
+ * Ceph 이름(풀, 네임스페이스, 사용자) 입력 오류(번역 키). 서버처럼 `A-Za-z0-9_.-`의 1–63자이고
+ * `-`로 시작하지 않아야 한다.
+ */
+export function cephNameError(name: string): string | undefined {
+  return /^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,62}$/.test(name) ? undefined : "pools.errors.rbdName";
+}
+
+/**
+ * Ceph 사용자 입력 오류(번역 키). 이름 규칙([`cephNameError`])에 더해, 서버처럼 `client.` 없이 써야
+ * 한다(`rbd --id`와 QEMU가 접두어 없는 id를 받는다).
+ */
+export function cephUserError(user: string): string | undefined {
+  return cephNameError(user) ?? (user.startsWith("client.") ? "pools.errors.cephUser" : undefined);
+}
+
+/**
+ * ceph.conf 경로 입력 오류(번역 키). 서버처럼 절대 경로이고 제어 문자와 `,`·`:`·`=`가 없어야
+ * 한다(QEMU 옵션 문자열에 들어간다).
+ */
+export function rbdConfError(conf: string): string | undefined {
+  return !conf.startsWith("/") || hasControl(conf) || /[,:=]/.test(conf)
+    ? "pools.errors.rbdConf"
+    : undefined;
+}
+
+/** 디스크 스냅샷을 블록 스냅샷으로 두는 풀(LVM-thin, ZFS, RBD)의 종류. 아니면(파일 풀, 모름) `undefined`. */
+export function blockSnapshotKind(
+  pool: StoragePool | undefined,
+): "lvm-thin" | "zfs" | "rbd" | undefined {
   const kind = pool?.spec.backend.kind;
-  return kind === "lvm-thin" || kind === "zfs" ? kind : undefined;
+  return kind === "lvm-thin" || kind === "zfs" || kind === "rbd" ? kind : undefined;
 }
 
 /**
  * 풀에 둘 수 있는 볼륨 형식. 첫 값이 기본값이고 스냅샷을 담는 형식이다(서버의
- * `pool_kind_supports_snapshots`). 블록 풀(LVM-thin, ZFS)은 raw만 둔다. 풀을 모르면 파일 풀처럼 본다.
+ * `pool_kind_supports_snapshots`). 블록 풀(LVM-thin, ZFS, RBD)은 raw만 둔다. 풀을 모르면 파일 풀처럼
+ * 본다.
  */
 export function poolFormats(pool: StoragePool | undefined): [ImageFormat, ...ImageFormat[]] {
   return blockSnapshotKind(pool) ? ["raw"] : ["qcow2", "raw"];

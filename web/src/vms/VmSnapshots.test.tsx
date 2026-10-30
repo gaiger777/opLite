@@ -173,7 +173,7 @@ it("says why a VM with a raw disk cannot take snapshots", async () => {
   open(web);
   expect(
     await screen.findByText(
-      "Only VMs whose disks are all qcow2, all in LVM-thin pools, or all in ZFS pools can take snapshots. web-root is raw.",
+      "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. web-root is raw.",
     ),
   ).toBeVisible();
   expect(screen.queryByRole("button", { name: "Take snapshot" })).not.toBeInTheDocument();
@@ -201,7 +201,7 @@ it("takes a running VM's snapshot of disks in LVM-thin pools without memory", as
   expect(within(dialog).queryByLabelText("Include memory")).not.toBeInTheDocument();
   expect(
     within(dialog).getByText(
-      "Disks in LVM-thin and ZFS pools are saved without memory. A running VM pauses briefly while they are saved.",
+      "Disks in LVM-thin, ZFS and Ceph RBD pools are saved without memory. A running VM pauses briefly while they are saved.",
     ),
   ).toBeVisible();
   await userEvent.type(within(dialog).getByLabelText("Name"), "base");
@@ -242,7 +242,7 @@ it("says why a VM mixing snapshot methods cannot take snapshots", async () => {
   open(both);
   expect(
     await screen.findByText(
-      "Only VMs whose disks are all qcow2, all in LVM-thin pools, or all in ZFS pools can take snapshots. This VM mixes them.",
+      "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. This VM mixes them.",
     ),
   ).toBeVisible();
   expect(screen.queryByRole("button", { name: "Take snapshot" })).not.toBeInTheDocument();
@@ -471,7 +471,7 @@ it.each([
   [
     "snapshot_unsupported",
     "raw disks cannot be snapshotted",
-    "Only VMs whose disks are all qcow2, all in LVM-thin pools, or all in ZFS pools can take snapshots. Snapshots of disks in LVM-thin or ZFS pools cannot include memory, and disks in ZFS pools can only revert to their latest snapshot.",
+    "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. Snapshots of disks in LVM-thin, ZFS or Ceph RBD pools cannot include memory, and disks in ZFS pools can only revert to their latest snapshot.",
   ],
   // 번역이 없는 code(옛 문자열을 읽은 unknown 포함)는 서버의 설명을 그대로 보인다.
   ["unknown", "VM busy", "VM busy"],
