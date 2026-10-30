@@ -13,7 +13,7 @@ use opl_types::storage::{
     PoolBackend, StoragePool, StoragePoolSpec, VolumeSpec, pool_error_on, pool_listed_on,
     pool_state_on,
 };
-use opl_types::task::{TaskOp, TaskSpec};
+use opl_types::task::{TaskOp, TaskSpec, TaskState};
 use opl_types::vm::Vm;
 use uuid::Uuid;
 
@@ -27,7 +27,7 @@ pub enum ResolveError {
     PoolNotOnNode(String),
     #[error("storage pool {0:?} is not ready on this node: {1}")]
     PoolUnavailable(String, String),
-    /// 볼륨의 크기 늘리기 Task가 끝나지 않았다. 끝나면 풀린다.
+    /// 볼륨의 크기 늘리기 Task가 실행 중이다. 끝나면 풀린다.
     #[error("volume {0:?} is being resized")]
     VolumeResizing(String),
     /// 이 노드의 OS(macOS)는 NFS 풀을 지원하지 않는다. 기다려도 풀리지 않는다.
@@ -55,8 +55,12 @@ pub enum ResolveError {
 /// 활성화한 뒤 [`disk_location`]으로 위치를 정한다(RBD 풀은 경로 대신 `RuntimeDisk.rbd`의 이미지).
 /// 저장소의 일시 오류는 `PoolUnavailable`, 그 밖은 `VolumeUnusable`이다.
 /// (다시 해도 안 되는 것은 볼륨이 없거나 정의가 틀린 것뿐이고, 그 밖의 저장소 오류는 일시 오류로 본다.)
-/// 끝나지 않은 크기 늘리기 Task가 있는 볼륨은 켜지 않고 `VolumeResizing`이다(늘리는 중인 볼륨을 QEMU가
-/// 열면 안 된다. 공유 LVM은 늘린 부분을 0으로 채우기 전이다).
+/// 실행 중인 크기 늘리기 Task가 있는 볼륨은 켜지 않고 `VolumeResizing`이다(늘리는 중인 볼륨을 QEMU가
+/// 열면 안 된다. 공유 LVM은 늘린 부분을 0으로 채우기 전이다). 기다리는(Pending) Task는 막지 않는다.
+/// 그 Task가 VM의 줄에서 되돌리기 뒤에 서 있으면 되돌리기가 다시 켜는 VM을 기다리게 되어 서로
+/// 기다린다. 실행기는 Task를 Running으로 기록(이 노드에 적용될 때까지 기다린다)한 뒤 VM 상태를 읽어
+/// 꺼진 VM의 경로를 고른다. 그 전에 켜기 시작한 VM은 실행기가 원하는 상태가 running인 것을 보고 꺼진
+/// VM의 경로를 타지 않고, 그 뒤에 켜는 VM은 여기서 Running Task를 보고 기다린다.
 /// 실패하면 그때까지 활성화한 볼륨을 끈다(`deactivate_volume`, 끄지 못하면 경고만 남긴다).
 pub async fn runtime_spec(
     cluster: &Cluster,
@@ -130,7 +134,7 @@ async fn resolve(
         if wait_resize
             && tasks.iter().any(|t| {
                 t.spec.target == volume.id
-                    && !t.status.state.is_finished()
+                    && t.status.state == TaskState::Running
                     && matches!(t.spec.op, TaskOp::VolumeResize { .. })
             })
         {

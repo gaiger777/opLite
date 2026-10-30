@@ -304,9 +304,10 @@ async fn failed_resolve_deactivates_the_volumes_it_activated() {
     assert!(storage.deactivated.lock().unwrap().is_empty());
 }
 
-/// 디스크 볼륨에 끝나지 않은 크기 늘리기 Task가 있으면 그 볼륨을 켜지 않고 기다릴
+/// 디스크 볼륨에 실행 중인 크기 늘리기 Task가 있으면 그 볼륨을 켜지 않고 기다릴
 /// `VolumeResizing`이다. 시작과 겹치면 QEMU가 늘리는 중인 볼륨(공유 LVM은 0으로 채우기 전의 늘린
-/// 부분)을 열 수 있다. 다른 볼륨의 Task, 끝난 Task와 크기 늘리기가 아닌 Task는 막지 않는다.
+/// 부분)을 열 수 있다. 다른 볼륨의 Task, 끝난 Task, 크기 늘리기가 아닌 Task와 아직 기다리는(Pending)
+/// 크기 늘리기는 막지 않는다(기다리는 Task가 VM을 다시 켜야 끝나는 되돌리기 뒤에 서 있을 수 있다).
 #[tokio::test]
 async fn waits_for_resizes_of_its_disks() {
     let dir = TempDir::new().unwrap();
@@ -349,24 +350,28 @@ async fn waits_for_resizes_of_its_disks() {
     );
     task.name = task.id.to_string();
     cluster.create(&task).await.unwrap();
-    for state in [TaskState::Pending, TaskState::Running] {
-        let status = TaskStatus { state, error: None };
-        cluster
-            .update_status::<TaskSpec>(task.id, &status)
-            .await
-            .unwrap();
-        let storage = Activations::default();
-        let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ResolveError::VolumeResizing(ref v) if v == "data"),
-            "{err:?}"
-        );
-        assert!(err.to_string().contains("being resized"), "{err}");
-        let activated: Vec<Uuid> = storage.calls.lock().unwrap().iter().map(|c| c.1).collect();
-        assert!(!activated.contains(&data.id), "{activated:?}");
-    }
+    assert_eq!(task.status.state, TaskState::Pending);
+    resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+
+    let status = TaskStatus {
+        state: TaskState::Running,
+        error: None,
+    };
+    cluster
+        .update_status::<TaskSpec>(task.id, &status)
+        .await
+        .unwrap();
+    let storage = Activations::default();
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ResolveError::VolumeResizing(ref v) if v == "data"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("being resized"), "{err}");
+    let activated: Vec<Uuid> = storage.calls.lock().unwrap().iter().map(|c| c.1).collect();
+    assert!(!activated.contains(&data.id), "{activated:?}");
 
     let status = TaskStatus {
         state: TaskState::Succeeded,

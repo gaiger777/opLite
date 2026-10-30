@@ -983,7 +983,7 @@ async fn stopped_vm_deactivates_its_disks() {
     assert_eq!(storage.deactivated(), [root.id, root.id]);
 }
 
-/// 디스크 볼륨의 크기 늘리기 Task가 끝나지 않았으면 디스크를 켜지 않고 시작을 미룬다(실패로 세지
+/// 디스크 볼륨의 크기 늘리기 Task가 실행 중이면 디스크를 켜지 않고 시작을 미룬다(실패로 세지
 /// 않는다). Task가 끝나면 시작한다.
 #[tokio::test]
 async fn start_waits_for_a_resize_of_its_disk() {
@@ -1000,6 +1000,7 @@ async fn start_waits_for_a_resize_of_its_disk() {
         },
     );
     task.name = task.id.to_string();
+    task.status.state = TaskState::Running;
     env.cluster.create(&task).await.unwrap();
     env.create(&vm).await;
     let waiting = env
@@ -1028,6 +1029,30 @@ async fn start_waits_for_a_resize_of_its_disk() {
         .update_status::<TaskSpec>(task.id, &status)
         .await
         .unwrap();
+    env.wait(vm.id, "running", running).await;
+    assert_eq!(*storage.calls.lock().unwrap(), [("activate", root.id)]);
+}
+
+/// 아직 기다리는(Pending) 크기 늘리기 Task는 시작을 막지 않는다. 그 Task는 VM의 줄에서 VM을 다시
+/// 켜야 끝나는 되돌리기 뒤에 서 있을 수 있어, 막으면 서로 기다린다.
+#[tokio::test]
+async fn start_does_not_wait_for_a_pending_resize() {
+    let storage = Arc::new(Activations::default());
+    let (env, root, vm) = disk_vm(storage.clone()).await;
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VolumeResize {
+                size_bytes: 2 << 30,
+            },
+            target: root.id,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    assert_eq!(task.status.state, TaskState::Pending);
+    env.cluster.create(&task).await.unwrap();
+    env.create(&vm).await;
     env.wait(vm.id, "running", running).await;
     assert_eq!(*storage.calls.lock().unwrap(), [("activate", root.id)]);
 }
