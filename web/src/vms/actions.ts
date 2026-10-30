@@ -21,12 +21,12 @@ export function isStopped(vm: Vm): boolean {
 }
 
 /**
- * 서버의 `check_not_busy`: 시작·정지 중이거나 원하는 전원 상태에 아직 닿지 않았다. 이때 서버는 스냅샷·복제
- * 요청을 받지 않는다(vm_busy).
+ * 서버의 `check_not_busy`: 시작·정지·마이그레이션 중이거나 원하는 전원 상태에 아직 닿지 않았다. 이때 서버는
+ * 스냅샷·복제 요청을 받지 않는다(vm_busy).
  */
 export function isBusy(vm: Vm): boolean {
   const phase = vm.status.phase;
-  if (phase === "starting" || phase === "stopping") {
+  if (phase === "starting" || phase === "stopping" || phase === "migrating") {
     return true;
   }
   return vm.spec.power === "running" ? phase !== "running" : !isStopped(vm);
@@ -45,14 +45,36 @@ export function isReverting(vmTasks: readonly Task[]): boolean {
   );
 }
 
+/**
+ * 서버의 `check_no_migration`: 옮기는 중이거나(`migrating`) 이 VM의 마이그레이션 Task가 끝나지 않았다. 이때
+ * 서버는 다른 동작을 모두 받지 않는다(vm_busy).
+ */
+export function isMigrating(vm: Vm, vmTasks: readonly Task[]): boolean {
+  return (
+    vm.status.phase === "migrating" ||
+    vmTasks.some(
+      (task) =>
+        task.spec.op.kind === "vm-migrate" &&
+        task.status.state !== "succeeded" &&
+        task.status.state !== "failed",
+    )
+  );
+}
+
 /** 할 수 있는지, 없으면 그 이유(번역 키) */
 export type Availability = { ok: true } | { ok: false; reason: string };
 
 /** 끝나지 않으면 다른 시작·정지·재시작을 막는 전원 Task */
 const POWER_KINDS: readonly string[] = ["vm-start", "vm-stop", "vm-force-stop", "vm-reboot"];
 
+/** 끝나지 않으면 마이그레이션을 막는 스냅샷 Task(서버의 `check_no_snapshot_task`) */
+const SNAPSHOT_KINDS: readonly string[] = ["snapshot-create", "snapshot-revert", "vm-clone"];
+
+/** 막힌 이유를 따지는 동작: 전원 동작, 콘솔, 삭제, 마이그레이션 */
+export type VmOperation = VmAction | "console" | "delete" | "migrate";
+
 /** 상태만 보고 할 수 있는 동작인지. 서버도 확인하지만 할 수 없는 버튼은 막아 둔다. */
-function allowedByState(vm: Vm, action: VmAction | "console" | "delete"): boolean {
+function allowedByState(vm: Vm, action: VmOperation): boolean {
   const phase = vm.status.phase;
   const powerOn = vm.spec.power === "running";
   switch (action) {
@@ -67,10 +89,14 @@ function allowedByState(vm: Vm, action: VmAction | "console" | "delete"): boolea
       // 서버는 원하는 전원 상태가 켜짐인 실행 중 VM만 재시작한다.
       return powerOn && phase === "running";
     case "console":
-      return phase === "running";
+      // 옮기는 중에도 원본 QEMU가 돈다.
+      return phase === "running" || phase === "migrating";
     case "delete":
       // 서버는 멈추지 않은 VM을 지우지 않는다.
       return isStopped(vm);
+    case "migrate":
+      // 서버는 노드에 놓여 켜져 실행 중인 VM만 옮긴다(vm_not_running).
+      return powerOn && phase === "running" && vm.spec.node != null;
   }
 }
 
@@ -87,15 +113,16 @@ function stateReason(vm: Vm): string {
 
 /**
  * 지금 할 수 있는 동작인지와 막힌 이유. `vmTasks`는 이 VM을 대상으로 한 Task다(`useTaskIndex`). 전원 Task가
- * 끝나지 않았으면 시작·정지·재시작을 막는다(서버는 새 요청으로 앞 것을 대체하지만 웹에서는 겹치지 않게).
- * 강제 정지는 정지가 ACPI에서 멈췄을 때 빠져나갈 길이므로 되돌리기 중에만 막는다.
+ * 끝나지 않았으면 시작·정지·재시작·마이그레이션을 막는다(서버는 새 요청으로 앞 것을 대체하지만 웹에서는 겹치지 않게).
+ * 강제 정지는 정지가 ACPI에서 멈췄을 때 빠져나갈 길이므로 되돌리기 중에만 막는다. 마이그레이션 중에는 콘솔
+ * 말고 모두 막는다(실패하면 원본이 계속 돈다). 마이그레이션은 스냅샷·복제 Task가 끝나지 않았어도 막는다.
  */
-export function availability(
-  vm: Vm,
-  action: VmAction | "console" | "delete",
-  vmTasks: readonly Task[],
-): Availability {
-  const power = action === "start" || action === "stop" || action === "reboot";
+export function availability(vm: Vm, action: VmOperation, vmTasks: readonly Task[]): Availability {
+  if (action !== "console" && isMigrating(vm, vmTasks)) {
+    return { ok: false, reason: "vms.reason.migrating" };
+  }
+  const power =
+    action === "start" || action === "stop" || action === "reboot" || action === "migrate";
   if (
     power &&
     vmTasks.some(
@@ -112,6 +139,17 @@ export function availability(
   }
   if (action === "force-stop" && isReverting(vmTasks)) {
     return { ok: false, reason: "vms.reason.reverting" };
+  }
+  if (
+    action === "migrate" &&
+    vmTasks.some(
+      (task) =>
+        SNAPSHOT_KINDS.includes(task.spec.op.kind) &&
+        task.status.state !== "succeeded" &&
+        task.status.state !== "failed",
+    )
+  ) {
+    return { ok: false, reason: "vms.reason.snapshotPending" };
   }
   return { ok: true };
 }

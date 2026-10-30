@@ -27,7 +27,8 @@ export default function VmConsole({ vm }: { vm: Vm }) {
   const rfb = useRef<RFB | null>(null);
   const [state, setState] = useState<State>("connecting");
   const [attempt, setAttempt] = useState(0);
-  const running = vm.status.phase === "running";
+  // 옮기는 중에도 원본 QEMU가 돈다. 확정하면 원본이 꺼져 끊기고, 다시 연결하면 대상에 붙는다.
+  const running = vm.status.phase === "running" || vm.status.phase === "migrating";
 
   useEffect(() => {
     if (!running || !screen.current) {

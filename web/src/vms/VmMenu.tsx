@@ -17,9 +17,16 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { ACTIONS, availability, useVmActions, type VmAction } from "@/vms/actions";
+import {
+  ACTIONS,
+  availability,
+  useVmActions,
+  type VmAction,
+  type VmOperation,
+} from "@/vms/actions";
 import { VmCloneDialog } from "@/vms/VmCloneDialog";
 import { VmDeleteDialog } from "@/vms/VmDeleteDialog";
+import { VmMigrateDialog } from "@/vms/VmMigrateDialog";
 
 /** 목록 행의 동작 메뉴 */
 export function VmMenu({ vm }: { vm: Vm }) {
@@ -31,7 +38,7 @@ export function VmMenu({ vm }: { vm: Vm }) {
   const trigger = useRef<HTMLButtonElement>(null);
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
   // Task 목록을 아직 모르면 Task 때문에는 막지 않는다(서버에 맡긴다).
-  const reasonOf = (action: VmAction | "console" | "delete") => {
+  const reasonOf = (action: VmOperation) => {
     const able = availability(vm, action, vmTasks);
     return able.ok ? null : able.reason;
   };
@@ -109,9 +116,9 @@ export function VmMenu({ vm }: { vm: Vm }) {
 }
 
 /** 메뉴·상세 버튼이 여는 대화상자 */
-export type VmDialog = "force-stop" | "delete" | "clone";
+export type VmDialog = "force-stop" | "delete" | "clone" | "migrate";
 
-/** 강제 정지·삭제의 확인과 복제 대화상자 */
+/** 강제 정지·삭제의 확인과 복제·마이그레이션 대화상자 */
 export function VmConfirm({
   vm,
   which,
@@ -151,6 +158,9 @@ export function VmConfirm({
         />
       )}
       {which === "clone" && <VmCloneDialog vm={vm} onClose={onClose} returnFocus={returnFocus} />}
+      {which === "migrate" && (
+        <VmMigrateDialog vm={vm} onClose={onClose} returnFocus={returnFocus} />
+      )}
     </>
   );
 }

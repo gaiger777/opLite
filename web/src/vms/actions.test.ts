@@ -1,6 +1,6 @@
-import type { Task } from "@/api/types";
+import type { Task, Vm } from "@/api/types";
 import { task, vm } from "@/test/fixtures";
-import { ACTIONS, availability, isBusy, isReverting, isStopped } from "@/vms/actions";
+import { ACTIONS, availability, isBusy, isMigrating, isReverting, isStopped } from "@/vms/actions";
 
 function allowed(v: ReturnType<typeof vm>, vmTasks: Task[] = []) {
   return ACTIONS.filter((action) => availability(v, action, vmTasks).ok);
@@ -159,4 +159,70 @@ it("says why the console or delete is not available", () => {
   expect(availability(stopped, "delete", [])).toEqual({ ok: true });
   expect(availability(running, "delete", [])).toEqual({ ok: false, reason: "vms.reason.running" });
   expect(availability(starting, "delete", [])).toEqual({ ok: false, reason: "vms.reason.busy" });
+});
+
+/** 서버처럼 `migration`을 빼고 보낸 VM(없으면 undefined) */
+function withoutMigration(v: ReturnType<typeof vm>): ReturnType<typeof vm> {
+  const status: Partial<Vm["status"]> = { ...v.status };
+  delete status.migration;
+  return { ...v, status } as Vm;
+}
+
+const MIGRATION = { node: "n2", task: "t-migrate" };
+
+it("migrates only a running VM that should run", () => {
+  const running = withoutMigration(vm("b", "running"));
+  expect(isMigrating(running, [])).toBe(false);
+  expect(availability(running, "migrate", [])).toEqual({ ok: true });
+  expect(availability(vm("a", "stopped"), "migrate", [])).toEqual({
+    ok: false,
+    reason: "vms.reason.stopped",
+  });
+  expect(availability(vm("d", "starting"), "migrate", [])).toEqual({
+    ok: false,
+    reason: "vms.reason.busy",
+  });
+  // 정지를 기다리는 VM
+  const stopping = vm("e", "running", { spec: { ...running.spec, power: "stopped" } });
+  expect(availability(stopping, "migrate", []).ok).toBe(false);
+  // 전원 Task가 끝나지 않았다.
+  expect(availability(running, "migrate", [pendingOf(running, "vm-reboot")])).toEqual({
+    ok: false,
+    reason: "vms.reason.powerPending",
+  });
+  // 서버의 check_no_snapshot_task: 스냅샷 만들기·되돌리기·복제 Task가 끝나지 않았다.
+  for (const kind of ["snapshot-create", "snapshot-revert", "vm-clone"] as const) {
+    expect(availability(running, "migrate", [pendingOf(running, kind)])).toEqual({
+      ok: false,
+      reason: "vms.reason.snapshotPending",
+    });
+  }
+  // 스냅샷 지우기는 막지 않는다.
+  expect(availability(running, "migrate", [pendingOf(running, "snapshot-delete")])).toEqual({
+    ok: true,
+  });
+});
+
+it("follows the server's check_no_migration: every action waits for a migration", () => {
+  const running = vm("b", "running");
+  const migrating = vm("m", "migrating", {
+    spec: { ...running.spec, power: "running" },
+    status: { ...running.status, phase: "migrating", migration: MIGRATION },
+  });
+  // 상태를 아직 쓰지 않았지만 마이그레이션 Task가 끝나지 않았다.
+  const queued = [pendingOf(running, "vm-migrate")];
+  const reason = { ok: false, reason: "vms.reason.migrating" };
+  expect(isMigrating(migrating, [])).toBe(true);
+  expect(isMigrating(running, queued)).toBe(true);
+  expect(isBusy(migrating)).toBe(true);
+  for (const action of [...ACTIONS, "delete", "migrate"] as const) {
+    expect(availability(migrating, action, [])).toEqual(reason);
+    expect(availability(running, action, queued)).toEqual(reason);
+  }
+  // 콘솔은 서버가 마이그레이션 중에도 받는다(확정하면 끊기고 다시 연결한다).
+  expect(availability(migrating, "console", [])).toEqual({ ok: true });
+  expect(availability(running, "console", queued)).toEqual({ ok: true });
+  // 끝난 마이그레이션 Task는 막지 않는다.
+  const done = { ...queued[0]!, status: { state: "failed", error: "boom" } } as Task;
+  expect(availability(running, "migrate", [done])).toEqual({ ok: true });
 });

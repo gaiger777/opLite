@@ -27,7 +27,7 @@
     "cannot_delete_self": "You cannot delete your own account.",
     "pool_in_use": "The pool still has volumes. Delete them first.",
     "pool_unavailable": "{{message}}",
-    "vm_busy": "Another operation on this VM (start, stop, snapshot, revert or clone) is in progress. Try again when it has finished.",
+    "vm_busy": "Another operation on this VM (start, stop, snapshot, revert, clone or migration) is in progress. Try again when it has finished.",
     "snapshot_unsupported": "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. Snapshots of disks in LVM-thin, ZFS or Ceph RBD pools cannot include memory, and disks in ZFS pools can only revert to their latest snapshot.",
     "vm_has_snapshots": "The VM has snapshots. Delete them first.",
     "volume_in_snapshot": "A VM snapshot still uses this volume. Delete that snapshot first.",
@@ -35,6 +35,9 @@
     "node_offline": "The node holding this VM is offline.",
     "too_many_attempts": "Too many attempts. Try again later.",
     "machine_arch_mismatch": "The machine type doesn't match the selected node's architecture.",
+    "migration_unsupported": "This VM cannot be migrated: {{message}}",
+    "node_unavailable": "The target node is offline or in maintenance.",
+    "no_capacity": "The target node cannot take this VM: {{message}}",
     "task_failed": "Task error: {{message}}",
     "internal": "The server failed: {{message}}"
   },
@@ -153,7 +156,9 @@
       "running": "The VM is running.",
       "stopped": "The VM is stopped.",
       "failed": "The VM has failed.",
-      "busy": "The VM is starting or stopping."
+      "busy": "The VM is starting or stopping.",
+      "migrating": "Not available while the VM is being migrated.",
+      "snapshotPending": "Not available while a snapshot or clone task is in progress."
     },
     "deleteTitle": "Delete {{name}}?",
     "deleteDescription": "The VM is deleted. Its volumes are kept.",
@@ -170,6 +175,7 @@
       "failed": "Failed",
       "migrating": "Migrating"
     },
+    "migratingTo": "{{from}} → {{to}}",
     "action": {
       "start": "Start",
       "stop": "Stop",
@@ -178,7 +184,8 @@
       "console": "Console",
       "delete": "Delete",
       "edit": "Edit",
-      "clone": "Clone"
+      "clone": "Clone",
+      "migrate": "Migrate"
     },
     "notFound": "There is no VM {{name}}",
     "backToList": "Back to virtual machines",
@@ -238,7 +245,7 @@
     "includeMemory": "Include memory",
     "includeMemoryHint": "Also saves the running state. Reverting resumes the VM where it was.",
     "unsupported": "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. {{volume}} is {{format}}.",
-    "busy": "The VM is starting or stopping. Snapshots can be taken, reverted and deleted once it settles.",
+    "busy": "The VM is starting, stopping or migrating. Snapshots can be taken, reverted and deleted once it settles.",
     "revert": "Revert",
     "revertNamed": "Revert to {{name}}",
     "revertTitle": "Revert {{vm}} to {{name}}?",
@@ -284,7 +291,7 @@
     "current": "Current state (stopped VM only)",
     "snapshot": "Snapshot {{name}}",
     "running": "The VM is not stopped. Stop it first or choose a snapshot.",
-    "busy": "The VM is starting or stopping. Try again when it has settled.",
+    "busy": "The VM is starting, stopping or migrating. Try again when it has settled.",
     "gone": "The chosen snapshot no longer exists or is not ready. Choose another source.",
     "goneOption": "Chosen snapshot (no longer available)",
     "pool": "Storage pool for the disks",
@@ -296,6 +303,14 @@
       "poolNotOnNode": "That storage pool is not available on the node holding the VM.",
       "poolUnavailable": "That storage pool is not ready on the node holding the VM."
     }
+  },
+  "migrate": {
+    "title": "Migrate {{name}}",
+    "description": "The running VM moves to another node without stopping. Its disks must all be on shared storage pools, and both nodes need the same QEMU version and CPU.",
+    "node": "Target node",
+    "noTarget": "No other online node with the VM's architecture is available.",
+    "submit": "Migrate",
+    "op": "Migrate {{vm}} to {{node}}"
   },
   "forms": {
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."

@@ -18,7 +18,10 @@ it("summarizes nodes, VMs and failures", async () => {
       schedule_error: null,
     },
   });
-  mockLists({ node: [NODE, down], vm: [vm("web", "running"), vm("app", "running"), broken] });
+  // 옮기는 중인 VM도 실행 중으로 센다.
+  const app = vm("app", "running");
+  const migrating = { ...app, status: { ...app.status, phase: "migrating" as const } };
+  mockLists({ node: [NODE, down], vm: [vm("web", "running"), migrating, broken] });
   server.use(
     http.get(apiUrl("/cluster"), () =>
       HttpResponse.json({
@@ -88,10 +91,22 @@ it("counts only VMs whose QEMU runs on the node", () => {
       schedule_error: null,
     },
   });
-  expect(usage(NODE, [vm("web", "running"), failed, stopping, elsewhere])).toEqual({
-    vms: 2,
-    vcpus: 4,
-    memoryMib: 4096,
+  // 옮기는 중인 VM은 확정할 때까지 원본 노드(status.node)에서 돈다.
+  const migrating = vm("mig", "migrating", {
+    status: {
+      phase: "migrating",
+      node: "n1",
+      pid: 9,
+      last_error: null,
+      snapshot: null,
+      schedule_error: null,
+      migration: { node: "n2", task: "t1" },
+    },
+  });
+  expect(usage(NODE, [vm("web", "running"), failed, stopping, elsewhere, migrating])).toEqual({
+    vms: 3,
+    vcpus: 6,
+    memoryMib: 6144,
   });
 });
 

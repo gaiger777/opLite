@@ -201,7 +201,9 @@ it("blocks cloning while the VM is starting", async () => {
   await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
   const dialog = await screen.findByRole("dialog", { name: "Clone web" });
   expect(
-    within(dialog).getByText("The VM is starting or stopping. Try again when it has settled."),
+    within(dialog).getByText(
+      "The VM is starting, stopping or migrating. Try again when it has settled.",
+    ),
   ).toBeVisible();
   expect(within(dialog).getByRole("button", { name: "Clone" })).toBeDisabled();
 });
@@ -220,7 +222,9 @@ it("blocks cloning while a stop has yet to finish", async () => {
   await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
   const dialog = await screen.findByRole("dialog", { name: "Clone web" });
   expect(
-    within(dialog).getByText("The VM is starting or stopping. Try again when it has settled."),
+    within(dialog).getByText(
+      "The VM is starting, stopping or migrating. Try again when it has settled.",
+    ),
   ).toBeVisible();
   expect(within(dialog).getByRole("button", { name: "Clone" })).toBeDisabled();
 });
@@ -238,7 +242,7 @@ it("shows the server's refusal in the dialog", async () => {
   await userEvent.type(within(dialog).getByLabelText("New VM name"), "db-copy");
   await userEvent.click(within(dialog).getByRole("button", { name: "Clone" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "Another operation on this VM (start, stop, snapshot, revert or clone) is in progress. Try again when it has finished.",
+    "Another operation on this VM (start, stop, snapshot, revert, clone or migration) is in progress. Try again when it has finished.",
   );
 });
 

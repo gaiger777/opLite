@@ -22,7 +22,13 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
 import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
-import { ACTIONS, availability, useVmActions, type VmAction } from "@/vms/actions";
+import {
+  ACTIONS,
+  availability,
+  useVmActions,
+  type VmAction,
+  type VmOperation,
+} from "@/vms/actions";
 import { VmConsole } from "@/vms/lazyConsole";
 import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -125,20 +131,27 @@ function VmHeader({ vm }: { vm: Vm }) {
   const hint = useId();
   const { run, remove } = useVmActions();
   const [confirm, setConfirm] = useState<VmDialog | null>(null);
-  // 고정한 노드가 있으면 그 노드, 아니면 스케줄러가 놓은 노드
-  const nodeId = vm.spec.node ?? vm.status.node;
+  const migration = vm.status.migration;
+  // 옮기는 중이면 QEMU가 도는 원본(확정하며 spec.node가 먼저 대상이 될 수 있다). 아니면 고정한 노드가
+  // 있으면 그 노드, 없으면 스케줄러가 놓은 노드
+  const nodeId = (migration ? vm.status.node : null) ?? vm.spec.node ?? vm.status.node;
   const node = nodes.data?.find((n) => n.id === nodeId);
+  // 옮기는 중이면 옮겨 갈 노드(지금 노드면 보이지 않는다)
+  const target =
+    migration && migration.node !== nodeId
+      ? nodes.data?.find((n) => n.id === migration.node)
+      : undefined;
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
   // Task 목록을 아직 모르면 Task 때문에는 막지 않는다(서버에 맡긴다).
-  const reasonOf = (action: VmAction | "console" | "delete") => {
+  const reasonOf = (action: VmOperation) => {
     const able = availability(vm, action, vmTasks);
     return able.ok ? null : able.reason;
   };
   const consoleReason = reasonOf("console");
   // 보이는 버튼의 막힌 이유만 모은다.
   const reasons = [
-    ...(operate ? [...ACTIONS.map(reasonOf), consoleReason] : []),
+    ...(operate ? [...ACTIONS.map(reasonOf), consoleReason, reasonOf("migrate")] : []),
     write ? reasonOf("delete") : null,
   ];
   const button = (action: VmAction) => (
@@ -158,7 +171,11 @@ function VmHeader({ vm }: { vm: Vm }) {
       <div className="flex items-center gap-3">
         <h1 className="text-2xl font-semibold">{vm.name}</h1>
         <VmPhaseBadge vm={vm} />
-        {node && <span className="text-sm text-muted-foreground">{node.name}</span>}
+        {node && (
+          <span className="text-sm text-muted-foreground">
+            {target ? t("vms.migratingTo", { from: node.name, to: target.name }) : node.name}
+          </span>
+        )}
       </div>
       <div className="flex flex-wrap gap-2">
         {operate && ACTIONS.map(button)}
@@ -168,6 +185,17 @@ function VmHeader({ vm }: { vm: Vm }) {
             <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
               {t("vms.openConsole")}
             </Link>
+          </ReasonButton>
+        )}
+        {operate && (
+          <ReasonButton
+            variant="outline"
+            size="sm"
+            reason={reasonOf("migrate")}
+            reasons={hint}
+            onClick={() => setConfirm("migrate")}
+          >
+            {t("vms.action.migrate")}
           </ReasonButton>
         )}
         {write && (

@@ -23,9 +23,9 @@ import { newestFirst, TaskTable } from "@/tasks/TasksPage";
 import { vcpus } from "@/vms/VmListPage";
 
 /** QEMU가 떠 있는 단계. 실패한 VM도 `status.node`가 남으므로 단계로 거른다. */
-const ACTIVE: Vm["status"]["phase"][] = ["starting", "running", "stopping"];
+const ACTIVE: Vm["status"]["phase"][] = ["starting", "running", "stopping", "migrating"];
 
-/** 노드에서 시작 중·실행 중·정지 중인 VM이 쓰는 vCPU와 메모리 */
+/** 노드에서 시작 중·실행 중·정지 중·옮기는 중(원본 노드)인 VM이 쓰는 vCPU와 메모리 */
 export function usage(node: Node, vms: Vm[]) {
   const here = vms.filter((vm) => vm.status.node === node.id && ACTIVE.includes(vm.status.phase));
   return {
@@ -100,7 +100,8 @@ export function DashboardPage() {
           detail={
             vms.data &&
             t("dashboard.vmCounts", {
-              running: count("running"),
+              // 옮기는 중인 VM은 원본에서 계속 돈다.
+              running: count("running") + count("migrating"),
               stopped: count("stopped"),
               failed: count("failed"),
             })

@@ -322,7 +322,7 @@ it("says why snapshots wait while the VM is starting", async () => {
   open(starting);
   expect(
     await screen.findByText(
-      "The VM is starting or stopping. Snapshots can be taken, reverted and deleted once it settles.",
+      "The VM is starting, stopping or migrating. Snapshots can be taken, reverted and deleted once it settles.",
     ),
   ).toBeVisible();
   expect(screen.getByRole("button", { name: "Take snapshot" })).toBeDisabled();
@@ -342,7 +342,7 @@ it("waits like the server while the VM has yet to start", async () => {
   open(pending);
   expect(
     await screen.findByText(
-      "The VM is starting or stopping. Snapshots can be taken, reverted and deleted once it settles.",
+      "The VM is starting, stopping or migrating. Snapshots can be taken, reverted and deleted once it settles.",
     ),
   ).toBeVisible();
   expect(screen.getByRole("button", { name: "Take snapshot" })).toBeDisabled();
@@ -393,7 +393,7 @@ it("deletes a snapshot after confirming and shows why it could not", async () =>
   const dialog = await screen.findByRole("alertdialog", { name: "Delete snapshot base?" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "Another operation on this VM (start, stop, snapshot, revert or clone) is in progress. Try again when it has finished.",
+    "Another operation on this VM (start, stop, snapshot, revert, clone or migration) is in progress. Try again when it has finished.",
   );
 
   server.use(

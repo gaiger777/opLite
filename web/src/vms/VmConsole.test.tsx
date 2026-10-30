@@ -121,6 +121,17 @@ it("types at most PASTE_LIMIT characters and says so", async () => {
   warning.mockRestore();
 });
 
+it("stays connected while the VM is being migrated", () => {
+  const web = vm("web", "running");
+  const { rerender } = render(<VmConsole vm={web} />);
+  // 원본 QEMU가 계속 돈다. 상태가 바뀌어도 다시 연결하지 않는다.
+  rerender(<VmConsole vm={{ ...web, status: { ...web.status, phase: "migrating" } }} />);
+  expect(created).toHaveLength(1);
+  expect(created[0]!.disconnected).toBe(false);
+  render(<VmConsole vm={vm("app", "migrating")} />);
+  expect(created).toHaveLength(2);
+});
+
 it("does not connect to a stopped VM", () => {
   render(<VmConsole vm={vm("web", "stopped")} />);
   expect(created).toHaveLength(0);
