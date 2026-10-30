@@ -2,14 +2,21 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use common::{Env, vm};
-use opl_driver::{DriverError, Hypervisor, StopMode};
+use opl_driver::{
+    Capacity, DriverError, Hypervisor, SourceFormat, StopMode, Storage, VolumeInfo, VolumeSource,
+};
+use opl_reconciler::ReconcilerConfig;
 use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
+use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
     DiskBus, DiskSpec, PowerState, RestartPolicy, ScheduleError, VmPhase, VmSpec, VmStatus,
 };
@@ -724,4 +731,406 @@ async fn status_writes_keep_snapshot_position_written_meanwhile() {
     env.wait(vm.id, "running", running).await;
     assert_eq!(env.get(vm.id).status.snapshot, Some(snapshot));
     assert_eq!(env.get(vm.id).status.schedule_error, Some(busy()));
+}
+
+/// 볼륨 켜기·끄기를 적는 저장소. 켜기는 늘 성공한다. reconciler는 켜기·끄기만 부른다.
+#[derive(Default)]
+struct Activations {
+    calls: Mutex<Vec<(&'static str, Uuid)>>,
+    /// 켜기 때마다 이 VM의 저장된 phase를 `phases`에 적는다.
+    watch: std::sync::OnceLock<(Arc<opl_cluster::Cluster>, Uuid)>,
+    phases: Mutex<Vec<VmPhase>>,
+}
+
+impl Activations {
+    fn deactivated(&self) -> Vec<Uuid> {
+        let calls = self.calls.lock().unwrap();
+        calls
+            .iter()
+            .filter(|(call, _)| *call == "deactivate")
+            .map(|&(_, id)| id)
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Storage for Activations {
+    async fn activate_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.calls.lock().unwrap().push(("activate", id));
+        if let Some((cluster, vm)) = self.watch.get() {
+            let vm = cluster.get::<VmSpec>(*vm).unwrap().unwrap();
+            self.phases.lock().unwrap().push(vm.status.phase);
+        }
+        Ok(())
+    }
+    async fn deactivate_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.calls.lock().unwrap().push(("deactivate", id));
+        Ok(())
+    }
+    async fn create_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: u64,
+        _: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        unreachable!()
+    }
+    async fn import_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: &Path,
+        _: SourceFormat,
+        _: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        unreachable!()
+    }
+    async fn check_import_source(&self, _: &Path, _: SourceFormat) -> Result<(), DriverError> {
+        unreachable!()
+    }
+    async fn delete_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        unreachable!()
+    }
+    async fn volume_info(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<VolumeInfo, DriverError> {
+        unreachable!()
+    }
+    async fn capacity(&self, _: &StoragePool) -> Result<Capacity, DriverError> {
+        unreachable!()
+    }
+    fn supports_snapshots(&self, _: &StoragePool, _: ImageFormat) -> bool {
+        unreachable!()
+    }
+    async fn snapshot_create(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: &str,
+    ) -> Result<(), DriverError> {
+        unreachable!()
+    }
+    async fn snapshot_revert(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: &str,
+    ) -> Result<(), DriverError> {
+        unreachable!()
+    }
+    async fn snapshot_delete(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: &str,
+    ) -> Result<(), DriverError> {
+        unreachable!()
+    }
+    async fn snapshot_tags(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<Vec<String>, DriverError> {
+        unreachable!()
+    }
+    async fn resize_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: u64,
+    ) -> Result<(), DriverError> {
+        unreachable!()
+    }
+    async fn volume_source(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
+    ) -> Result<VolumeSource, DriverError> {
+        unreachable!()
+    }
+    async fn release_source(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
+    ) -> Result<(), DriverError> {
+        unreachable!()
+    }
+    async fn copy_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+        _: Option<&str>,
+        _: bool,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        unreachable!()
+    }
+}
+
+/// `storage`로 볼륨을 켜고 끄는 reconciler와, dir 풀 볼륨 `root`를 디스크로 쓰는 VM `web`(아직
+/// 만들지 않았다)
+async fn disk_vm(storage: Arc<Activations>) -> (Env, Volume, opl_types::vm::Vm) {
+    disk_vm_with(storage, |_| {}).await
+}
+
+/// [`disk_vm`]. 설정을 `tweak`으로 바꾼다.
+async fn disk_vm_with(
+    storage: Arc<Activations>,
+    tweak: impl FnOnce(&mut ReconcilerConfig),
+) -> (Env, Volume, opl_types::vm::Vm) {
+    let env = Env::start_with(|c| {
+        c.storage = storage;
+        tweak(c);
+    })
+    .await;
+    let pool: StoragePool = Resource::new(
+        "local",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: "/pools/local".into(),
+            },
+            nodes: vec![],
+            shared: false,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    let root: Volume = Resource::new(
+        "root",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 30,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    env.cluster.create(&root).await.unwrap();
+    let mut vm = vm("web", env.node);
+    vm.spec.disks.push(DiskSpec {
+        volume: "root".into(),
+        bus: DiskBus::VirtioBlk,
+        boot_order: Some(1),
+    });
+    (env, root, vm)
+}
+
+/// 기다리는 동안 `storage`가 볼륨을 `want`대로 끄기를 기다린다.
+async fn wait_deactivated(storage: &Activations, want: &[Uuid]) {
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while storage.deactivated() != want {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "deactivated {:?}, want {want:?}",
+            storage.deactivated()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// VM이 멈추면(사용자가 끔, 크래시) QEMU가 끝난 뒤 디스크 볼륨을 한 번 끈다(공유 LVM의 배타
+/// 활성화를 풀어 다른 노드가 쓸 수 있게). 실행 중에는 끄지 않는다.
+#[tokio::test]
+async fn stopped_vm_deactivates_its_disks() {
+    let storage = Arc::new(Activations::default());
+    let (env, root, vm) = disk_vm(storage.clone()).await;
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(*storage.calls.lock().unwrap(), [("activate", root.id)]);
+
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    wait_deactivated(&storage, &[root.id]).await;
+
+    env.set_power(vm.id, PowerState::Running).await;
+    env.wait(vm.id, "running again", running).await;
+    env.hv.crash(vm.id);
+    env.wait(vm.id, "failed", |v| v.status.phase == VmPhase::Failed)
+        .await;
+    wait_deactivated(&storage, &[root.id, root.id]).await;
+    // 멈춘 VM을 다시 맞춰도 또 끄지 않는다.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(storage.deactivated(), [root.id, root.id]);
+}
+
+/// 디스크 볼륨의 크기 늘리기 Task가 끝나지 않았으면 디스크를 켜지 않고 시작을 미룬다(실패로 세지
+/// 않는다). Task가 끝나면 시작한다.
+#[tokio::test]
+async fn start_waits_for_a_resize_of_its_disk() {
+    let storage = Arc::new(Activations::default());
+    let (env, root, vm) = disk_vm(storage.clone()).await;
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VolumeResize {
+                size_bytes: 2 << 30,
+            },
+            target: root.id,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+    env.create(&vm).await;
+    let waiting = env
+        .wait(vm.id, "waiting for the resize", |v| {
+            v.status
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("being resized"))
+        })
+        .await;
+    assert_eq!(waiting.status.phase, VmPhase::Starting);
+    assert_eq!(waiting.spec.power, PowerState::Running);
+    // 여러 번 다시 해 본 뒤에도 포기하지 않는다.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let still = env.get(vm.id);
+    assert_eq!(still.spec.power, PowerState::Running);
+    assert_eq!(still.status.phase, VmPhase::Starting);
+    assert!(storage.calls.lock().unwrap().is_empty());
+    assert!(env.hv.inspect(vm.id).await.unwrap().is_none());
+
+    let status = TaskStatus {
+        state: TaskState::Succeeded,
+        error: None,
+    };
+    env.cluster
+        .update_status::<TaskSpec>(task.id, &status)
+        .await
+        .unwrap();
+    env.wait(vm.id, "running", running).await;
+    assert_eq!(*storage.calls.lock().unwrap(), [("activate", root.id)]);
+}
+
+/// 이미 도는 VM에 다시 붙을 때는 크기 늘리기 Task를 기다리지 않고 디스크를 해석한다(QEMU가 이미
+/// 장치를 열었다). 기다리면 실행 중 VM의 크기 늘리기 동안 다시 붙지 못한다.
+#[tokio::test]
+async fn reattach_does_not_wait_for_a_resize() {
+    let storage = Arc::new(Activations::default());
+    // 응답하지 않는 VM은 재동기화로 알아채고 다시 붙는다.
+    let (env, root, vm) = disk_vm_with(storage.clone(), |c| {
+        c.resync_interval = Duration::from_millis(100)
+    })
+    .await;
+    env.create(&vm).await;
+    let pid = env.wait(vm.id, "running", running).await.status.pid;
+
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VolumeResize {
+                size_bytes: 2 << 30,
+            },
+            target: root.id,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+    // 가짜 하이퍼바이저는 응답하지 않는 VM에 다시 붙지 못한다(디스크를 해석한 뒤 실패한다).
+    env.hv.set_unresponsive(vm.id, true);
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while storage.calls.lock().unwrap().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disks not resolved: {:?}",
+            env.get(vm.id).status
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let got = env
+        .wait(vm.id, "reported unresponsive", |v| {
+            v.status.last_error.is_some()
+        })
+        .await;
+    let error = got.status.last_error.unwrap();
+    assert!(!error.contains("being resized"), "{error}");
+    assert_eq!(got.status.phase, VmPhase::Running);
+    assert_eq!(got.status.pid, pid);
+    assert!(
+        storage
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|&call| call == ("activate", root.id))
+    );
+}
+
+/// 돌던 QEMU가 끝나 곧바로(백오프 없이) 다시 켤 때 디스크를 해석하기 전에 phase를 Starting으로
+/// 먼저 기록한다. 저장된 phase가 Running인 채면 그사이 API·Task 실행기가 실행 중 VM으로 보고 디스크를
+/// 늘린다(공유 LVM은 늘린 부분을 0으로 채우기 전에 QEMU가 연다).
+#[tokio::test]
+async fn restart_records_starting_before_resolving_disks() {
+    let storage = Arc::new(Activations::default());
+    let (env, root, vm) = disk_vm(storage.clone()).await;
+    env.create(&vm).await;
+    let before = env.wait(vm.id, "running", running).await.status.pid;
+    storage
+        .watch
+        .set((env.cluster.clone(), vm.id))
+        .unwrap_or_else(|_| unreachable!());
+
+    // 호스트의 SIGTERM처럼 우리가 요청하지 않은 종료
+    env.hv.stop(vm.id, StopMode::Force).await.unwrap();
+    let got = env
+        .wait(vm.id, "restarted", |v| running(v) && v.status.pid != before)
+        .await;
+    assert_eq!(got.status.last_error, None);
+    assert_eq!(*storage.phases.lock().unwrap(), [VmPhase::Starting]);
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        [
+            ("activate", root.id),
+            ("deactivate", root.id),
+            ("activate", root.id)
+        ]
+    );
+}
+
+/// 디스크를 켠 뒤 QEMU가 시작하지 못하면 켠 볼륨을 끈다.
+#[tokio::test]
+async fn failed_start_deactivates_its_disks() {
+    let storage = Arc::new(Activations::default());
+    let (env, root, vm) = disk_vm(storage.clone()).await;
+    env.hv
+        .fail_next_start(DriverError::StartFailed("no firmware".into()));
+    env.create(&vm).await;
+    env.wait(vm.id, "failed", |v| v.status.phase == VmPhase::Failed)
+        .await;
+    wait_deactivated(&storage, &[root.id]).await;
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        [("activate", root.id), ("deactivate", root.id)]
+    );
 }

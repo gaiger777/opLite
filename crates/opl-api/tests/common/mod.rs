@@ -465,6 +465,10 @@ pub struct FakeStorage {
     busy_deletes: std::sync::Mutex<std::collections::HashMap<Uuid, usize>>,
     /// 막 만든 스냅샷 태그. `snapshot_tags_older_than`이 고르지 않는다.
     fresh_tags: std::sync::Mutex<Vec<String>>,
+    /// 이 노드에서 켜져 있는 볼륨(풀 이름, 볼륨). `active_volumes`가 알리고 `deactivate_volume`이 뺀다.
+    active: std::sync::Mutex<Vec<(String, Uuid)>>,
+    /// 끄는 데 이만큼 걸리는 볼륨
+    slow_deactivates: std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Duration>>,
 }
 
 impl FakeStorage {
@@ -526,6 +530,26 @@ impl FakeStorage {
     /// 볼륨 `id`의 다음 `n`번의 `snapshot_delete`가 (호출을 기록한 뒤) 일시 오류다.
     pub fn busy_snapshot_deletes(&self, id: Uuid, n: usize) {
         self.busy_deletes.lock().unwrap().insert(id, n);
+    }
+
+    /// 풀 `pool`의 볼륨 `id`가 이 노드에서 켜져 있는 것으로 둔다.
+    pub fn set_active(&self, pool: &str, id: Uuid) {
+        self.active.lock().unwrap().push((pool.into(), id));
+    }
+
+    /// 볼륨 `id`를 끄는 데 `delay`가 걸리게 한다(호출은 바로 적는다).
+    pub fn slow_deactivate(&self, id: Uuid, delay: std::time::Duration) {
+        self.slow_deactivates.lock().unwrap().insert(id, delay);
+    }
+
+    /// 켜져 있는 볼륨들(켠 순서)
+    pub fn active(&self) -> Vec<Uuid> {
+        self.active
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, id)| *id)
+            .collect()
     }
 
     /// `copy_volume`으로 만든 볼륨과 그 형식
@@ -623,6 +647,29 @@ impl Storage for FakeStorage {
         _: ImageFormat,
     ) -> Result<(), DriverError> {
         Ok(())
+    }
+    /// 호출을 `deactivate`로 적는다.
+    async fn deactivate_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.calls.lock().unwrap().push(("deactivate", id));
+        let delay = self.slow_deactivates.lock().unwrap().get(&id).copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.active.lock().unwrap().retain(|(_, v)| *v != id);
+        Ok(())
+    }
+    async fn active_volumes(&self, pool: &StoragePool) -> Result<Vec<Uuid>, DriverError> {
+        let active = self.active.lock().unwrap();
+        Ok(active
+            .iter()
+            .filter(|(p, _)| *p == pool.name)
+            .map(|(_, id)| *id)
+            .collect())
     }
     fn supports_snapshots(&self, pool: &StoragePool, format: ImageFormat) -> bool {
         pool_kind_supports_snapshots(&pool.spec.backend, format)

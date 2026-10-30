@@ -342,11 +342,21 @@ async fn rbd_pools_are_always_shared_and_hold_raw_volumes() {
 /// 노드마다 따로이므로 한 볼륨의 Task가 늘 같은 노드에서 돌게 한다.
 #[tokio::test]
 async fn rbd_volume_tasks_go_to_the_lowest_ready_node() {
+    volume_tasks_go_to_the_lowest_ready_node(json!({ "kind": "rbd", "pool": "rbd" })).await;
+}
+
+/// 공유 LVM 풀의 볼륨 Task도 RBD처럼 id가 가장 작은 준비된 온라인 노드가 맡는다.
+#[tokio::test]
+async fn lvm_shared_volume_tasks_go_to_the_lowest_ready_node() {
+    volume_tasks_go_to_the_lowest_ready_node(json!({ "kind": "lvm-shared", "vg": "san" })).await;
+}
+
+/// 공유 블록 풀 `backend`(이름 `ceph`)의 볼륨 Task가 id가 가장 작은 준비된 온라인 노드로 가는지 본다.
+async fn volume_tasks_go_to_the_lowest_ready_node(backend: Value) {
     let mut env = Env::start().await;
     env.stop_runner().await;
     let admin = env.admin().await;
-    let rbd = json!({ "kind": "rbd", "pool": "rbd" });
-    let (status, body) = admin.post("/storage-pools", pool("ceph", rbd)).await;
+    let (status, body) = admin.post("/storage-pools", pool("ceph", backend)).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     env.pool_ready("ceph").await;
     let mut low: Node = Resource::new(

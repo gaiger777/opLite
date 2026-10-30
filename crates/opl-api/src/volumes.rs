@@ -40,17 +40,20 @@ fn check_volume_name(name: &str) -> Result<(), ApiError> {
     }
     Ok(())
 }
-use crate::snapshots::vm_placement;
+use crate::snapshots::{check_not_busy, vm_placement};
 use crate::state::AppState;
 use crate::tasks::create_task;
 
 /// 볼륨 파일 작업을 실행할 노드. 이 노드에서 풀을 쓸 수 있으면 이 노드, 아니면 풀을 쓸 수 있는
-/// 온라인 노드 가운데 id가 가장 작은 노드다. RBD 풀은 이 노드를 앞세우지 않고 늘 id가 가장 작은
-/// 노드다: 이미지를 바꾸는 명령이 아직 돌고 있다는 표시가 노드마다 따로이므로 한 볼륨의 Task가 같은
-/// 노드에서 돌게 한다. 그런 노드가 없으면 409 `pool_unavailable`.
+/// 온라인 노드 가운데 id가 가장 작은 노드다. RBD·공유 LVM 풀은 이 노드를 앞세우지 않고 늘 id가 가장
+/// 작은 노드다: 이미지(LV)를 바꾸는 명령이 아직 돌고 있다는 표시가 노드마다 따로이므로 한 볼륨의
+/// Task가 같은 노드에서 돌게 한다. 그런 노드가 없으면 409 `pool_unavailable`.
 fn pool_node(state: &AppState, pool: &StoragePool) -> Result<Uuid, ApiError> {
-    let rbd = matches!(pool.spec.backend, PoolBackend::Rbd { .. });
-    let prefer = (!rbd).then_some(state.node);
+    let lowest = matches!(
+        pool.spec.backend,
+        PoolBackend::Rbd { .. } | PoolBackend::LvmShared { .. }
+    );
+    let prefer = (!lowest).then_some(state.node);
     usable_node(&state.cluster, pool, prefer)?.ok_or_else(|| {
         ApiError::conflict(
             "pool_unavailable",
@@ -457,7 +460,9 @@ pub struct ResizeRequest {
 
 /// 볼륨 크기를 늘릴 Task를 돌려준다(202). 줄이지는 않는다(400). VM이 쓰면 그 VM의 스냅샷
 /// Task와 같은 노드(실행 중이면 그 VM의 노드, 꺼졌으면 다음에 돌 노드)의 실행기에서 차례로 돌도록
-/// 거기서 한다. 쓰는 VM이 없거나 정할 노드가 없으면 볼륨의 노드에서 한다.
+/// 거기서 한다. 쓰는 VM이 없거나 정할 노드가 없으면 볼륨의 노드에서 한다. 쓰는 VM이 켜지거나 꺼지는
+/// 중이면(원하는 상태와 실제 상태가 다르다) 409 `vm_busy`다. 꺼진 VM으로 보고 저장소로 늘리는 동안
+/// 시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다.
 #[utoipa::path(post, path = "/volumes/{key}/resize", tag = "storage",
     params(("key" = String, Path, description = "id or name")),
     request_body = ResizeRequest,
@@ -492,6 +497,9 @@ pub async fn resize_volume(
     let user = vms
         .iter()
         .find(|vm| vm.spec.disks.iter().any(|d| d.volume == volume.name));
+    if let Some(vm) = user {
+        check_not_busy(&state, vm)?;
+    }
     let node = match user.and_then(|vm| vm_placement(&state.cluster, Some(state.node), vm)) {
         Some(node) => node,
         None => volume_node(&state, &volume)?,

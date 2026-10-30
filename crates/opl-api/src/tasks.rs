@@ -17,10 +17,11 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, Hypervisor, Storage};
 use opl_reconciler::ReconcilerHandle;
 use opl_types::resource::{Kind, Resource};
+use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec};
 use opl_types::storage::{
     SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, VolumeStatus,
-    is_shared,
+    is_shared, pool_listed_on,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
@@ -31,6 +32,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::schedule::task_failed;
 use crate::snapshots::{uses_block_snapshots, vm_placement};
+use crate::vms::is_stopped;
 use crate::volumes::{block_pool_kind, usable_node};
 
 /// 새 Task를 저장소에 만든다. 이름은 id 문자열이다.
@@ -62,7 +64,8 @@ pub struct TaskRunnerConfig {
     /// 풀이 마운트되지 않아 시작할 때 지우지 못한 고아 볼륨, 시간을 넘긴 블록 스냅샷이 남긴 태그를
     /// 다시 지워 보는 간격
     pub orphan_retry: Duration,
-    /// 블록 스냅샷이 남긴 태그를 다시 찾아 지우는 간격(시작할 때 한 번 찾고 그 뒤로)
+    /// 블록 스냅샷이 남긴 태그, 이 노드에서 켜진 채 남은 볼륨을 다시 찾아 정리하는 간격(시작할 때
+    /// 한 번 찾고 그 뒤로)
     pub tag_sweep: Duration,
 }
 
@@ -145,6 +148,7 @@ impl TaskRunner {
 async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<Uuid>) {
     let retry = tokio::spawn(retry_orphans(ctx.clone(), unmounted));
     let tags = tokio::spawn(sweep_block_tags_every(ctx.clone()));
+    let idle = tokio::spawn(deactivate_idle_volumes_every(ctx.clone()));
     // 실행을 시작한 Task. 목록을 다시 읽을 때 같은 Task를 두 번 시작하지 않게 한다.
     let mut started: HashSet<Uuid> = HashSet::new();
     // 실행 중인 Task. 실행기가 멈출 때 함께 멈춘다.
@@ -222,6 +226,7 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<
     }
     retry.abort();
     tags.abort();
+    idle.abort();
     ctx.stopped.send_replace(true);
 }
 
@@ -312,6 +317,113 @@ async fn sweep_block_tags(ctx: Arc<Ctx>) {
             }
         }
     }
+}
+
+/// 이 노드에서 켜진 채 남은 볼륨을 시작할 때와 그 뒤 `tag_sweep`마다 끈다
+/// ([`deactivate_idle_volumes`]). 실행기가 멈추면 함께 멈춘다.
+async fn deactivate_idle_volumes_every(ctx: Arc<Ctx>) {
+    loop {
+        deactivate_idle_volumes(&ctx).await;
+        tokio::time::sleep(ctx.config.tag_sweep).await;
+    }
+}
+
+/// 이 노드에서 켜진 채 남은 볼륨(공유 LVM의 배타 활성화)을 끈다. VM이 멈춘 뒤 reconciler가 끄지
+/// 못했거나 opld가 그 전에 내려갔을 때 남는다. 이 노드에 놓여 실행 중이거나 켜려는 VM(하이퍼바이저에서
+/// 도는 VM 포함)의 디스크, 이 노드에서 끝나지 않은 Task의 볼륨(VM Task면 그 VM의 디스크), 아직
+/// 만드는 중인(pending) 볼륨은 그대로 둔다. 리소스가 없는 볼륨은 끈다.
+///
+/// 켜진 볼륨을 먼저 읽고 그 뒤에 VM·Task를 읽는다: 볼륨을 켜는 VM·Task는 켜기 전에 이미 저장소에
+/// 있으므로 쓰는 중인 볼륨을 끄지 않는다(그 사이 켠 볼륨은 이번에 보지 않는다). 이미 켜져 있던 볼륨을
+/// 그 사이 시작한 VM이 그대로 쓸 수도 있으므로 VM·Task는 볼륨마다 끄기 직전에 다시 읽는다.
+async fn deactivate_idle_volumes(ctx: &Ctx) {
+    let me = ctx.config.node;
+    let pools = match ctx.cluster.list::<StoragePoolSpec>() {
+        Ok((_, pools)) => pools,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot list storage pools");
+            return;
+        }
+    };
+    let mut active = Vec::new();
+    for pool in pools.into_iter().filter(|p| pool_listed_on(p, me)) {
+        match ctx.storage.active_volumes(&pool).await {
+            Ok(ids) if !ids.is_empty() => active.push((pool, ids)),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(pool = %pool.name, error = %e, "cannot list active volumes")
+            }
+        }
+    }
+    for (pool, ids) in active {
+        for id in ids {
+            let (in_use, formats) = match volumes_in_use(ctx).await {
+                Ok(read) => read,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot read which volumes are in use");
+                    return;
+                }
+            };
+            if in_use.contains(&id) {
+                continue;
+            }
+            let format = formats.get(&id).copied().unwrap_or(ImageFormat::Raw);
+            tracing::info!(pool = %pool.name, volume = %id, "deactivating a volume left active");
+            if let Err(e) = ctx.storage.deactivate_volume(&pool, id, format).await {
+                tracing::warn!(pool = %pool.name, volume = %id, error = %e, "cannot deactivate volume");
+            }
+        }
+    }
+}
+
+/// 이 노드가 쓰는 볼륨([`deactivate_idle_volumes`]이 그대로 두는 볼륨)과 볼륨별 형식
+async fn volumes_in_use(ctx: &Ctx) -> Result<(HashSet<Uuid>, HashMap<Uuid, ImageFormat>), String> {
+    let me = ctx.config.node;
+    let running = ctx
+        .hv
+        .list()
+        .await
+        .map_err(|e| format!("cannot list running VMs: {e}"))?;
+    let (volumes, tasks, vms) = ctx
+        .cluster
+        .list::<VolumeSpec>()
+        .and_then(|(_, volumes)| {
+            Ok((
+                volumes,
+                ctx.cluster.list::<TaskSpec>()?.1,
+                ctx.cluster.list::<VmSpec>()?.1,
+            ))
+        })
+        .map_err(|e| format!("cannot list volumes, tasks or VMs: {e}"))?;
+    let mut in_use: HashSet<Uuid> = volumes
+        .iter()
+        .filter(|v| v.status.phase != VolumePhase::Ready)
+        .map(|v| v.id)
+        .collect();
+    let mut task_vms = HashSet::new();
+    for task in tasks
+        .iter()
+        .filter(|t| t.spec.node == me && !t.status.state.is_finished())
+    {
+        in_use.insert(task.spec.target);
+        task_vms.insert(task.spec.target);
+    }
+    let by_name: HashMap<&str, Uuid> = volumes.iter().map(|v| (v.name.as_str(), v.id)).collect();
+    for vm in &vms {
+        let used = task_vms.contains(&vm.id)
+            || running.iter().any(|r| r.id == vm.id)
+            || (vm.spec.node == Some(me) && vm.spec.power == PowerState::Running);
+        if used {
+            in_use.extend(
+                vm.spec
+                    .disks
+                    .iter()
+                    .filter_map(|d| by_name.get(d.volume.as_str())),
+            );
+        }
+    }
+    let formats = volumes.iter().map(|v| (v.id, v.spec.format)).collect();
+    Ok((in_use, formats))
 }
 
 /// 풀이 마운트되지 않았거나 응답하지 않아 지우지 못한 고아 볼륨을 `orphan_retry`마다 다시 지워 본다. 지웠거나 볼륨이
@@ -811,7 +923,9 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
         Some((vm, disk))
     });
     match user {
-        Some((vm, _)) if matches!(vm.status.phase, VmPhase::Starting | VmPhase::Stopping) => {
+        // 꺼진 VM의 경로(저장소로 늘린다)는 원하는 상태도 꺼짐일 때만 탄다. 켜는 중에 늘리면 그동안
+        // 시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다.
+        Some((vm, _)) if vm.status.phase != VmPhase::Running && !is_stopped(vm) => {
             return Err(format!(
                 "VM {:?} is starting or stopping; try again when it has settled",
                 vm.name

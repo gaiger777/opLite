@@ -14,6 +14,7 @@ use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
+use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{DiskBus, DiskSpec, MacAddr, NicModel, NicSpec, Vm};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -21,11 +22,12 @@ use uuid::Uuid;
 /// NFS 풀을 마운트하는 디렉터리
 const MNT: &str = "/var/lib/opl/pools";
 
-/// 활성화한 볼륨을 적는 저장소. `fail`이 있으면 활성화가 그 오류로 실패한다.
-/// resolve는 활성화만 부른다.
+/// 활성화한 볼륨과 끈 볼륨을 적는 저장소. `fail`이 있으면 활성화가 그 오류로 실패한다.
+/// resolve는 활성화와 (실패했을 때) 끄기만 부른다.
 #[derive(Default)]
 struct Activations {
     calls: Mutex<Vec<(String, Uuid, ImageFormat)>>,
+    deactivated: Mutex<Vec<Uuid>>,
     fail: Mutex<Option<fn() -> DriverError>>,
 }
 
@@ -45,6 +47,15 @@ impl Storage for Activations {
             Some(fail) => Err(fail()),
             None => Ok(()),
         }
+    }
+    async fn deactivate_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.deactivated.lock().unwrap().push(id);
+        Ok(())
     }
     async fn create_volume(
         &self,
@@ -251,6 +262,121 @@ async fn resolves_volumes_to_pool_paths_and_user_network() {
             backend: NicBackend::User,
         }]
     );
+}
+
+/// 풀다가 실패하면 그때까지 활성화한 볼륨을 끈다(VM을 시작하지 않으니 켜 둘 까닭이 없다).
+/// 성공하면 끄지 않는다.
+#[tokio::test]
+async fn failed_resolve_deactivates_the_volumes_it_activated() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    let (root, data) = (volume("root", "local"), volume("data", "local"));
+    cluster.create(&root).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    vm.spec.disks.push(disk("data"));
+
+    // 둘째 디스크의 볼륨이 없다.
+    let storage = Activations::default();
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::VolumeNotFound(_)), "{err:?}");
+    assert_eq!(*storage.deactivated.lock().unwrap(), [root.id]);
+
+    // 디스크를 모두 활성화한 뒤 NIC에서 실패해도 모두 끈다.
+    cluster.create(&data).await.unwrap();
+    vm.spec.nics.push(nic("missing", None));
+    let storage = Activations::default();
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::NetworkNotFound(_)), "{err:?}");
+    assert_eq!(*storage.deactivated.lock().unwrap(), [root.id, data.id]);
+
+    vm.spec.nics.clear();
+    let storage = Activations::default();
+    runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert!(storage.deactivated.lock().unwrap().is_empty());
+}
+
+/// 디스크 볼륨에 끝나지 않은 크기 늘리기 Task가 있으면 그 볼륨을 켜지 않고 기다릴
+/// `VolumeResizing`이다. 시작과 겹치면 QEMU가 늘리는 중인 볼륨(공유 LVM은 0으로 채우기 전의 늘린
+/// 부분)을 열 수 있다. 다른 볼륨의 Task, 끝난 Task와 크기 늘리기가 아닌 Task는 막지 않는다.
+#[tokio::test]
+async fn waits_for_resizes_of_its_disks() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    let (root, data, other) = (
+        volume("root", "local"),
+        volume("data", "local"),
+        volume("other", "local"),
+    );
+    for v in [&root, &data, &other] {
+        cluster.create(v).await.unwrap();
+    }
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    vm.spec.disks.push(disk("data"));
+    let resize = TaskOp::VolumeResize {
+        size_bytes: 2 << 30,
+    };
+    for (op, target, state) in [
+        (resize.clone(), other.id, TaskState::Running),
+        (resize.clone(), data.id, TaskState::Failed),
+        (TaskOp::VolumeDelete, data.id, TaskState::Pending),
+    ] {
+        let mut task: Task = Resource::new("", TaskSpec { op, target, node });
+        task.name = task.id.to_string();
+        task.status = TaskStatus { state, error: None };
+        cluster.create(&task).await.unwrap();
+    }
+    resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: resize,
+            target: data.id,
+            node,
+        },
+    );
+    task.name = task.id.to_string();
+    cluster.create(&task).await.unwrap();
+    for state in [TaskState::Pending, TaskState::Running] {
+        let status = TaskStatus { state, error: None };
+        cluster
+            .update_status::<TaskSpec>(task.id, &status)
+            .await
+            .unwrap();
+        let storage = Activations::default();
+        let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ResolveError::VolumeResizing(ref v) if v == "data"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("being resized"), "{err}");
+        let activated: Vec<Uuid> = storage.calls.lock().unwrap().iter().map(|c| c.1).collect();
+        assert!(!activated.contains(&data.id), "{activated:?}");
+    }
+
+    let status = TaskStatus {
+        state: TaskState::Succeeded,
+        error: None,
+    };
+    cluster
+        .update_status::<TaskSpec>(task.id, &status)
+        .await
+        .unwrap();
+    resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
 }
 
 /// 디스크로 쓰기 전에 저장소가 볼륨을 활성화한다. 활성화가 실패하면 다시 시도할 `PoolUnavailable`이고,

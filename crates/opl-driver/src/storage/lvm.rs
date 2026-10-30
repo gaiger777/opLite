@@ -1351,6 +1351,22 @@ impl Storage for LvmSharedStorage {
         }
     }
 
+    /// 이 노드에서 켜져 있는 볼륨 LV(`opl-{id}`). 다른 노드가 켠 LV는 이 노드에서 꺼져 보인다.
+    async fn active_volumes(&self, pool: &StoragePool) -> Result<Vec<Uuid>, DriverError> {
+        let vg = Self::target(pool, ImageFormat::Raw)?;
+        Ok(self
+            .ops
+            .list(vg)
+            .await?
+            .iter()
+            .filter(|lv| lv.is_active())
+            .filter_map(|lv| {
+                let id = lv.name.strip_prefix("opl-")?.parse::<Uuid>().ok()?;
+                (lv.name == volume_lv(id)).then_some(id)
+            })
+            .collect())
+    }
+
     /// 두꺼운 LV이므로 크기만큼 쓴다.
     async fn volume_info(
         &self,
@@ -2943,6 +2959,30 @@ mod tests {
         storage.deactivate_volume(&p, id, RAW).await.unwrap();
         assert_eq!(lvm.taken(), [format!("deactivate vg0/{lv}")]);
         assert!(!lvm.lv(&lv).unwrap().active);
+    }
+
+    /// 이 노드에서 켜져 있는 볼륨 LV(`opl-{id}`)만 알린다. 꺼진 볼륨 LV와 opLite 밖의 LV는 빼고 LVM
+    /// 명령은 목록뿐이다.
+    #[tokio::test]
+    async fn shared_lists_volumes_active_on_this_node() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let p = shared_pool();
+        let (on, off) = (Uuid::now_v7(), Uuid::now_v7());
+        for id in [on, off] {
+            storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        }
+        storage.activate_volume(&p, on, RAW).await.unwrap();
+        lvm.lvs.lock().unwrap().insert(
+            format!("opl-{on}-x"),
+            FakeLv {
+                size: 1 << 20,
+                active: true,
+                skip: false,
+            },
+        );
+        lvm.taken();
+        assert_eq!(storage.active_volumes(&p).await.unwrap(), [on]);
+        assert!(lvm.taken().is_empty());
     }
 
     /// 지우기: 다른 노드가 켜 두었으면 일시 오류, 없으면 `VolumeNotFound`, 없어도 만드는 명령이

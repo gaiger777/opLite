@@ -1023,6 +1023,20 @@ async fn resize_only_grows_and_runs_where_the_volume_is_used() {
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     assert_eq!(task["spec"]["node"], env.node.to_string());
 
+    // 켜는 중이거나(원하는 상태가 켜짐인데 아직 멈춤·시작 중) 끄는 중인 VM의 디스크는 409다.
+    // 꺼진 VM으로 보고 저장소로 늘리면 그동안 시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다.
+    for phase in [VmPhase::Stopped, VmPhase::Starting, VmPhase::Stopping] {
+        set_vm_status(&env, vm, phase, Some(env.node)).await;
+        if phase == VmPhase::Stopped {
+            set_vm_power(&env, vm, PowerState::Running).await;
+        }
+        let (status, body) = admin
+            .post("/volumes/data/resize", json!({ "size_bytes": 2 * MIB }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{phase:?}: {body}");
+        assert_eq!(body["code"], "vm_busy");
+    }
+
     // 끈 뒤 다른 노드로 옮겼으면 디스크를 다음에 쓸 그 노드에서 한다.
     set_vm_status(&env, vm, VmPhase::Stopped, Some(env.node)).await;
     let moved = Uuid::now_v7();

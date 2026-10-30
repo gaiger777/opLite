@@ -127,6 +127,12 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// 이 노드에서 `activate_volume`으로 켜져 있는 `pool`의 볼륨들. 켜진 채 남은 볼륨을 찾아 끄는
+    /// 정리가 쓴다. 기본은 없다(켜고 끌 것이 없다).
+    async fn active_volumes(&self, _pool: &StoragePool) -> Result<Vec<Uuid>, DriverError> {
+        Ok(Vec::new())
+    }
+
     /// VM이 실행 중이어도 조회할 수 있다.
     async fn volume_info(
         &self,

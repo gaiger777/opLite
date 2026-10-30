@@ -5,6 +5,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
 use opl_types::runtime::VmRuntimeSpec;
+use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::vm::{PowerState, RestartPolicy, Vm, VmPhase, VmSpec, VmStatus};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -14,7 +15,7 @@ use uuid::Uuid;
 use crate::backoff::{FailureTracker, Next};
 use crate::config::ReconcilerConfig;
 use crate::reconciler::Restores;
-use crate::resolve::{ResolveError, runtime_spec};
+use crate::resolve::{ResolveError, running_spec, runtime_spec};
 
 /// 실행 중이던 VM이 사라졌을 때 그 이유를 알리는 종료 이벤트를 기다리는 시간.
 /// 이벤트보다 재동기화가 먼저 오면, 게스트가 스스로 끈 VM을 다시 켰다가 끄게 된다.
@@ -73,6 +74,9 @@ pub(crate) struct Worker {
     was_running: bool,
     /// 사라진 VM의 종료 이벤트를 이 시각까지 기다린다.
     awaiting_event: Option<Instant>,
+    /// 디스크 볼륨이 켜져 있을 수 있다(시작하려고 켰거나 VM이 도는 것을 봤다). QEMU가 끝난 것을
+    /// 확인하면 끈다([`Worker::deactivate_disks`]).
+    disks_active: bool,
     wake_at: Option<Instant>,
 }
 
@@ -98,6 +102,7 @@ impl Worker {
             power_off: None,
             was_running: false,
             awaiting_event: None,
+            disks_active: false,
             wake_at: None,
         }
     }
@@ -136,7 +141,7 @@ impl Worker {
     async fn step(&mut self, trigger: Trigger) -> Result<(), StepError> {
         let node = self.config.node;
         let vm = self.cluster.get::<VmSpec>(self.id)?;
-        let Some(vm) = vm.filter(|vm| vm.spec.node == Some(node)) else {
+        let Some(mut vm) = vm.filter(|vm| vm.spec.node == Some(node)) else {
             // 삭제되었거나 다른 노드로 배정되었다. 돌고 있더라도 멋대로 끄지 않는다.
             if self.hv.inspect(self.id).await?.is_some() {
                 tracing::warn!(vm = %self.id, "VM is running but not assigned to this node; leaving it alone");
@@ -153,7 +158,7 @@ impl Worker {
             Trigger::Sync => {}
         }
         if self.power_off.is_none() {
-            let status = self.reconcile(&vm).await?;
+            let status = self.reconcile(&mut vm).await?;
             if self.power_off.is_none() {
                 if status != vm.status {
                     self.write_status(status, vm).await?;
@@ -217,14 +222,18 @@ impl Worker {
         }
     }
 
-    /// 원하는 상태를 향해 한 걸음 움직이고, 기록해야 할 status를 돌려준다.
-    async fn reconcile(&mut self, vm: &Vm) -> Result<VmStatus, StepError> {
+    /// 원하는 상태를 향해 한 걸음 움직이고, 기록해야 할 status를 돌려준다. 그 전에 status를 먼저
+    /// 기록했으면 `vm`을 다시 읽은 것으로 바꾼다.
+    async fn reconcile(&mut self, vm: &mut Vm) -> Result<VmStatus, StepError> {
         let actual = self.hv.inspect(self.id).await?;
         let mut status = vm.status.clone();
         status.node = Some(self.config.node);
         let now = Instant::now();
         if std::mem::replace(&mut self.was_running, actual.is_some()) && actual.is_none() {
             self.awaiting_event = Some(now + EVENT_GRACE);
+        }
+        if actual.is_some() {
+            self.disks_active = true;
         }
         match (vm.spec.power, actual) {
             (PowerState::Running, Some(state)) => {
@@ -262,8 +271,29 @@ impl Worker {
             (PowerState::Running, None) => {
                 self.awaiting_event = None;
                 self.force_requested = false;
+                self.deactivate_disks(vm).await;
                 if self.backoff.as_ref().is_some_and(|(at, _)| *at <= now) {
                     self.backoff = None;
+                }
+                if self.backoff.is_none() && vm.status.phase == VmPhase::Running {
+                    // 저장된 phase가 Running인 채 다시 켜면(QEMU가 스스로 끝났다) 그사이 API·Task
+                    // 실행기가 실행 중 VM으로 보고 디스크를 늘린다(공유 LVM은 늘린 부분을 0으로 채우기
+                    // 전에 QEMU가 연다). 디스크를 해석하기 전에 Starting을 먼저 기록해, 먼저 들어온
+                    // 크기 늘리기 Task는 resolve가 보고 나중 것은 API·실행기가 거절하게 한다. 기록하지
+                    // 못해도(예: 과반수 없음 — 그동안은 Task도 만들 수 없다) VM은 다시 켠다(설계 10절
+                    // 불변식 4). 기록이 시간 초과로 실패한 사이 과반수가 돌아오면 좁은 틈이 남는다.
+                    let mut starting = status.clone();
+                    starting.phase = VmPhase::Starting;
+                    starting.pid = None;
+                    match self.write_status(starting, vm.clone()).await {
+                        Ok(()) => match self.cluster.get::<VmSpec>(self.id)? {
+                            Some(current) => *vm = current,
+                            None => return Ok(status),
+                        },
+                        Err(e) => {
+                            tracing::warn!(vm = %self.id, error = %e, "cannot record starting phase; restarting anyway");
+                        }
+                    }
                 }
                 if self.backoff.is_none() && self.start(vm).await? {
                     // 이제 돌고 있다. 곧바로 꺼져도 이벤트보다 먼저 온 재동기화가 다시 시작하지
@@ -332,6 +362,7 @@ impl Worker {
                 self.stop_requested = None;
                 self.force_requested = false;
                 self.awaiting_event = None;
+                self.deactivate_disks(vm).await;
                 self.backoff = None;
                 self.failures.clear();
                 // 포기해서 멈춘 VM은 사용자가 다시 시작할 때까지 Failed로 남긴다.
@@ -349,9 +380,9 @@ impl Worker {
         let spec = match self.resolve(vm).await {
             Ok(spec) => spec,
             Err(ResolveError::Cluster(e)) => return Err(e.into()),
-            // 풀이 이 노드에서 아직 준비되지 않았다(NFS 서버가 멈춤, 마운트 전 등). 풀이 돌아오면
-            // 시작할 수 있으므로 실패로 세지 않고 잠시 뒤 다시 시도한다.
-            Err(e @ ResolveError::PoolUnavailable(..)) => {
+            // 풀이 이 노드에서 아직 준비되지 않았거나(NFS 서버가 멈춤, 마운트 전 등) 디스크를 늘리는
+            // 중이다. 끝나면 시작할 수 있으므로 실패로 세지 않고 잠시 뒤 다시 시도한다.
+            Err(e @ (ResolveError::PoolUnavailable(..) | ResolveError::VolumeResizing(_))) => {
                 let delay = self.config.retry_interval;
                 self.backoff = Some((
                     Instant::now() + delay,
@@ -367,9 +398,14 @@ impl Worker {
                 return Ok(false);
             }
         };
+        self.disks_active = true;
         // 실패해도 다시 쓰지 않는다.
         let restore = self.restores.lock().unwrap().remove(&self.id);
-        match (self.hv.start(&spec, restore.as_deref()).await, restore) {
+        let started = self.hv.start(&spec, restore.as_deref()).await;
+        if started.is_err() {
+            self.deactivate_disks(vm).await;
+        }
+        match (started, restore) {
             (Ok(()), _) => Ok(true),
             // 태그 없이 다시 시도하면 스냅샷이 아닌 처음부터 부팅하게 되므로 일시 오류라도 멈춘다.
             (Err(e), Some(tag)) => {
@@ -387,6 +423,44 @@ impl Worker {
         }
     }
 
+    /// 켜져 있을 수 있는 디스크 볼륨을 끈다(QEMU가 끝난 뒤). 끄지 못하면 경고만 남긴다(켜진 채 남은
+    /// 볼륨은 Task 실행기의 정리가 다시 끈다).
+    async fn deactivate_disks(&mut self, vm: &Vm) {
+        if !std::mem::take(&mut self.disks_active) {
+            return;
+        }
+        for disk in &vm.spec.disks {
+            let found = self
+                .cluster
+                .get_by_name::<VolumeSpec>(&disk.volume)
+                .and_then(|volume| {
+                    let Some(volume) = volume else {
+                        return Ok(None);
+                    };
+                    let pool = self
+                        .cluster
+                        .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?;
+                    Ok(pool.map(|pool| (volume, pool)))
+                });
+            let (volume, pool) = match found {
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(vm = %self.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
+                    continue;
+                }
+            };
+            if let Err(e) = self
+                .config
+                .storage
+                .deactivate_volume(&pool, volume.id, volume.spec.format)
+                .await
+            {
+                tracing::warn!(vm = %self.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
+            }
+        }
+    }
+
     /// VM의 런타임 정의. 디스크 볼륨을 활성화한다.
     async fn resolve(&self, vm: &Vm) -> Result<VmRuntimeSpec, ResolveError> {
         let c = &self.config;
@@ -394,8 +468,12 @@ impl Worker {
     }
 
     /// 살아 있는 VM에 다시 붙거나 이어서 실행한다(`start`는 멱등이다). 참조 해석 오류도 돌려준다.
+    /// QEMU가 이미 디스크를 열었으므로 크기 늘리기 Task를 기다리지 않는다.
     async fn reattach(&self, vm: &Vm) -> Result<(), String> {
-        let spec = self.resolve(vm).await.map_err(|e| e.to_string())?;
+        let c = &self.config;
+        let spec = running_spec(&self.cluster, vm, c.node, &c.mount_root, &*c.storage)
+            .await
+            .map_err(|e| e.to_string())?;
         self.hv.start(&spec, None).await.map_err(|e| e.to_string())
     }
 

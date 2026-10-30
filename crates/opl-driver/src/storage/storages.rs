@@ -234,6 +234,10 @@ impl Storage for Storages {
             .await
     }
 
+    async fn active_volumes(&self, pool: &StoragePool) -> Result<Vec<Uuid>, DriverError> {
+        self.backend(pool)?.active_volumes(pool).await
+    }
+
     async fn volume_info(
         &self,
         pool: &StoragePool,
@@ -587,6 +591,10 @@ mod tests {
         ) -> Result<(), DriverError> {
             self.call("deactivate_volume")
         }
+        async fn active_volumes(&self, _: &StoragePool) -> Result<Vec<Uuid>, DriverError> {
+            self.call("active_volumes")?;
+            Ok(Vec::new())
+        }
         async fn volume_info(
             &self,
             _: &StoragePool,
@@ -822,6 +830,7 @@ mod tests {
             storages.delete_volume(&p, id, f).await.unwrap();
             storages.activate_volume(&p, id, f).await.unwrap();
             storages.deactivate_volume(&p, id, f).await.unwrap();
+            storages.active_volumes(&p).await.unwrap();
             storages.volume_info(&p, id, f).await.unwrap();
             storages.capacity(&p).await.unwrap();
             assert!(storages.supports_snapshots(&p, f));
@@ -848,6 +857,7 @@ mod tests {
                 "delete_volume",
                 "activate_volume",
                 "deactivate_volume",
+                "active_volumes",
                 "volume_info",
                 "capacity",
                 "supports_snapshots",
@@ -997,6 +1007,7 @@ mod tests {
         unsupported(storages.create_volume(&p, id, 1, f).await.unwrap_err());
         unsupported(storages.activate_volume(&p, id, f).await.unwrap_err());
         unsupported(storages.deactivate_volume(&p, id, f).await.unwrap_err());
+        unsupported(storages.active_volumes(&p).await.unwrap_err());
         unsupported(storages.capacity(&p).await.unwrap_err());
         assert!(!storages.supports_snapshots(&p, f));
         unsupported(

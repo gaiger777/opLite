@@ -80,8 +80,8 @@ pub(crate) fn vm_node(state: &AppState, vm: &Vm) -> Uuid {
 /// 시작·정지 중인 VM은 스냅샷 작업을 받지 않는다: phase가 Starting·Stopping이거나, 원하는 전원
 /// 상태(`spec.power`)에 아직 닿지 않았거나(reconciler가 켜거나 끄는 중), 전원 Task(시작·정지·
 /// 강제 정지·재시작)가 끝나지 않았으면 409 `vm_busy`. 전원 조작이 스냅샷 Task를 기다리는
-/// [`check_no_snapshot_task`]의 반대쪽이다.
-fn check_not_busy(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+/// [`check_no_snapshot_task`]의 반대쪽이다. 디스크 크기 늘리기도 같은 규칙이다.
+pub(crate) fn check_not_busy(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
     let settled = match vm.spec.power {
         PowerState::Running => vm.status.phase == VmPhase::Running,
         PowerState::Stopped => is_stopped(vm),

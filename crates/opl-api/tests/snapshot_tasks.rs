@@ -675,6 +675,57 @@ async fn resize_keeps_volume_labels_written_meanwhile() {
     assert_eq!((root.spec.size_bytes, root.labels), (2 << 20, labels));
 }
 
+/// 원하는 상태가 켜짐인데 아직 멈춘 VM(켜는 중)의 디스크는 늘리지 않는다. 꺼진 VM으로 보고
+/// 저장소로 늘리면 그동안 시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다. API가 받은 뒤 켰을 수 있어
+/// 실행기가 다시 본다.
+#[tokio::test]
+async fn resize_fails_while_the_vm_is_being_started() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+    let mut req = vm_request("web");
+    req["spec"]["disks"] = json!([{ "volume": "root", "bus": "virtio-blk" }]);
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    // 노드가 없는 VM은 reconciler가 다루지 않아 멈춘 채 남는다.
+    let vm: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    let spec = VmSpec {
+        power: PowerState::Running,
+        ..current.spec.clone()
+    };
+    env.cluster
+        .update_spec(vm, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VolumeResize {
+                size_bytes: 2 << 20,
+            },
+            target: root.id,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+
+    let done = admin.wait_task(&json!({ "id": task.id })).await;
+    assert_eq!(done["status"]["state"], "failed", "{done}");
+    let error = done["status"]["error"].as_str().unwrap();
+    assert!(error.contains("starting or stopping"), "{error}");
+    assert!(!storage.calls().iter().any(|(c, _)| *c == "resize"));
+    let root = env.cluster.get::<VolumeSpec>(root.id).unwrap().unwrap();
+    assert_eq!(root.spec.size_bytes, 1 << 20);
+}
+
 #[tokio::test]
 async fn task_failed_by_someone_else_before_it_starts_is_not_run() {
     let mut env = Env::start().await;
