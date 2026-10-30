@@ -489,7 +489,12 @@ async fn uefi_variables_follow_a_stopped_vm() {
     // 노드 2가 노드 1의 변수 파일을 받아 켜고 변수 노드가 된다. 노드 1의 파일은 남는다.
     let out = d.ctl(&["vm", "start", "web"]).await.unwrap();
     assert!(out.contains("vm web: start done"), "{out}");
-    assert!(std::fs::read(&dst_vars).unwrap().ends_with(MARKER));
+    // 받아 온 파일은 펌웨어가 곧바로 고쳐 쓸 수 있다(KVM에서는 OVMF가 시작하면서 빈 영역의 표식을
+    // 정리한다). 그래서 파일 내용이 아니라 노드 2가 노드 1에서 받아 왔다는 기록으로 본다.
+    let log = p.d[1].log();
+    assert!(log.contains("fetched UEFI variables"), "{log}");
+    assert!(!log.contains("cannot fetch UEFI variables"), "{log}");
+    assert!(dst_vars.exists());
     assert!(src_vars.exists());
     eventually("node 2 has the UEFI variables", || async {
         let vm = c.get("/vms/web").await.unwrap();
