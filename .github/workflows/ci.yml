@@ -192,13 +192,49 @@ jobs:
             | sudo tee /etc/opl-ceph/ceph.conf >/dev/null
           sudo rbd --id opltest --conf /etc/opl-ceph/ceph.conf ls --pool rbd --namespace opl
           sudo ceph --id opltest --conf /etc/opl-ceph/ceph.conf df detail >/dev/null
+      # 공유 LVM 풀 시험이 LV를 만들 공유 VG `oplshared`. targetcli(LIO)로 파일 백스토어 LUN 하나를
+      # 내보내는 루프백 iSCSI 타깃(데모 모드 ACL, 인증 없음)을 만들어 open-iscsi로 로그인하고,
+      # lvmlockd와 sanlock(softdog 감시, host_id 1)으로 그 LUN 위에 공유 VG를 만든다. lvmlockd는 호스트
+      # 전체에 켜지지만 로컬 VG(LVM-thin 시험)는 그대로 쓴다. E2E는 잠금을 멈추고 로그아웃한 뒤 opld가
+      # 다시 로그인하고 잠금을 시작하게 한다.
+      - name: iSCSI target and a shared (lvmlockd) VG
+        timeout-minutes: 10
+        env:
+          IQN: iqn.2003-01.org.linux-iscsi.opl:shared
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y targetcli-fb open-iscsi lvm2-lockd sanlock
+          sudo modprobe target_core_mod
+          sudo modprobe iscsi_target_mod
+          sudo systemctl start iscsid
+          truncate -s 2G "$RUNNER_TEMP/oplshared.img"
+          sudo targetcli /backstores/fileio create oplshared "$RUNNER_TEMP/oplshared.img"
+          sudo targetcli /iscsi create "$IQN"
+          sudo targetcli "/iscsi/$IQN/tpg1/luns" create /backstores/fileio/oplshared
+          sudo targetcli "/iscsi/$IQN/tpg1" set attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
+          sudo targetcli ls
+          sudo iscsiadm -m discovery -t sendtargets -p 127.0.0.1
+          sudo iscsiadm -m node -T "$IQN" -p 127.0.0.1 --login
+          sudo udevadm settle
+          sudo iscsiadm -m session
+          DEV="/dev/disk/by-path/ip-127.0.0.1:3260-iscsi-$IQN-lun-0"
+          ls -l "$DEV"
+          sudo modprobe softdog
+          sudo sed -i 's/^\s*#\?\s*use_lvmlockd = .*/\tuse_lvmlockd = 1/' /etc/lvm/lvm.conf
+          printf 'local {\n\thost_id = 1\n}\n' | sudo tee /etc/lvm/lvmlocal.conf
+          sudo lvmconfig global/use_lvmlockd local/host_id
+          sudo systemctl start wdmd sanlock lvmlockd
+          sudo vgcreate --shared oplshared "$DEV"
+          sudo vgchange --lockstart oplshared
+          sudo vgs -o vg_name,vg_lock_type,vg_size,vg_free oplshared
+          sudo lvs opltest
       # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다.
       - name: QEMU, bridge and E2E tests as root
         run: |
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it
           OPL_TEST_NFS_EXPORT: /srv/opl-nfs
           OPL_TEST_LVM: opltest/tp
           OPL_TEST_ZFS: opltestz/opl
@@ -206,6 +242,8 @@ jobs:
           OPL_TEST_RBD_USER: opltest
           OPL_TEST_RBD_NAMESPACE: opl
           OPL_TEST_RBD_CONF: /etc/opl-ceph/ceph.conf
+          OPL_TEST_LVM_SHARED: oplshared
+          OPL_TEST_ISCSI: 127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared
 
   deny:
     runs-on: ubuntu-latest

@@ -29,6 +29,11 @@ zfs-it = []
 # ceph-common, qemu-block-extra, qemu-io, `client.admin`으로 접속할 수 있는 ceph.conf·키링과 테스트가
 # 이미지를 만들고 지워도 되는 Ceph 풀(`OPL_TEST_RBD=POOL`)이 필요하다.
 rbd-it = []
+# 실제 공유 LVM 풀(lvmlockd 공유 VG)의 볼륨으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서
+# root, lvm2-lockd와 sanlock(또는 dlm), qemu-io와 테스트가 LV를 만들고 지워도 되는 공유 VG
+# (`OPL_TEST_LVM_SHARED=VG`)가 필요하다. `OPL_TEST_ISCSI=PORTAL,TARGET`이 있으면 VG가 그 iSCSI 타깃의
+# LUN 위에 있다고 보고, 시험 전에 잠금을 멈추고 로그아웃해 opld가 다시 로그인하게 한다.
+lvm-shared-it = []
 # 브라우저(Playwright)로 웹 UI를 확인하는 E2E. qemu-it의 준비물에 더해 pnpm과
 # `pnpm -C web exec playwright install chromium`, 빌드한 web/dist가 필요하다.
 web-it = ["qemu-it", "web-ui"]

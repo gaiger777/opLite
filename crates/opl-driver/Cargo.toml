@@ -25,6 +25,10 @@ zfs-it = []
 # (`OPL_TEST_RBD=POOL`)이 필요하다. 제한된 사용자 시험은 `OPL_TEST_RBD_USER`·`OPL_TEST_RBD_NAMESPACE`·
 # `OPL_TEST_RBD_CONF`가 있을 때만 돈다.
 rbd-it = []
+# 실제 공유 LVM 풀(lvmlockd 공유 VG)의 통합 테스트. Linux에서 root, lvm2-lockd와 sanlock(또는 dlm),
+# qemu-img, qemu-io와 잠금을 시작한 공유 VG(`OPL_TEST_LVM_SHARED=VG`, 테스트가 LV를 만들고 지워도 된다)가
+# 필요하다.
+lvm-shared-it = []
 
 [dependencies]
 async-trait.workspace = true
