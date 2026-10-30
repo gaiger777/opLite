@@ -239,7 +239,12 @@ export interface paths {
         delete: operations["delete_pool"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * 디렉터리 풀의 `shared`를 바꾼다(다른 백엔드는 400). 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의
+         *     볼륨을 쓰는 VM이 그 볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면
+         *     409 `pool_in_use`다. 같은 값이면 쓰지 않고 그대로 200이다.
+         */
+        patch: operations["patch_pool"];
         trace?: never;
     };
     "/tasks": {
@@ -1342,6 +1347,10 @@ export interface components {
             kind: "lvm-shared";
             /** @description 공유 볼륨 그룹 이름 */
             vg: string;
+        };
+        /** @description 풀에서 바꿀 수 있는 값. 지금은 디렉터리 풀의 `shared`만이다. */
+        PoolPatch: {
+            shared: boolean;
         };
         /** @description 한 노드에서 본 스토리지 풀 상태 */
         PoolState: {
@@ -2580,6 +2589,42 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_pool: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PoolPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_StoragePoolSpec_StoragePoolStatus"];
+                };
             };
             "4XX": {
                 headers: {

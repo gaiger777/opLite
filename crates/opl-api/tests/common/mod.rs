@@ -322,6 +322,19 @@ impl Client {
         self.send(r).await
     }
 
+    pub async fn patch(
+        &self,
+        path: &str,
+        body: Value,
+        if_match: Option<u64>,
+    ) -> (StatusCode, Value) {
+        let mut r = self.req(reqwest::Method::PATCH, path).json(&body);
+        if let Some(rev) = if_match {
+            r = r.header("if-match", rev.to_string());
+        }
+        self.send(r).await
+    }
+
     pub async fn delete(&self, path: &str) -> (StatusCode, Value) {
         self.send(self.req(reqwest::Method::DELETE, path)).await
     }

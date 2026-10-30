@@ -2,10 +2,13 @@
 
 mod common;
 
-use common::Env;
+use common::{Env, vm_request};
 use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
-use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
+use opl_types::runtime::ImageFormat;
+use opl_types::storage::{StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
+use opl_types::task::{TaskOp, TaskSpec, TaskState};
+use opl_types::vm::VmSpec;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -584,4 +587,217 @@ async fn volume_tasks_go_to_a_node_where_the_pool_is_ready() {
     let (status, task) = admin.delete("/volumes/b").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     assert_eq!(task_node(&task), env.node.to_string());
+}
+
+/// `PATCH /storage-pools/{key}`는 디렉터리 풀의 `shared`만 바꾼다. 관리자만, 같은 값이면 그대로 200.
+#[tokio::test]
+async fn patch_changes_shared_of_dir_pools() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let admin = env.admin().await;
+    let (status, body) = admin
+        .post(
+            "/storage-pools",
+            pool("local", json!({ "kind": "dir", "path": env.dir.path() })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let operator = env.user("operator", "operator").await;
+    let (status, _) = operator
+        .patch("/storage-pools/local", json!({ "shared": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // 로컬 → 공유는 언제나 된다. 라벨과 백엔드는 그대로다.
+    let (status, body) = admin
+        .patch("/storage-pools/local", json!({ "shared": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["shared"], true, "{body}");
+    assert_eq!(body["spec"]["backend"]["kind"], "dir", "{body}");
+    let (_, got) = admin.get("/storage-pools/local").await;
+    assert_eq!(got["spec"]["shared"], true, "{got}");
+    assert_eq!(got["revision"], body["revision"], "{got}");
+    // 같은 값이면 쓰지 않고 그대로 200이다.
+    let revision = body["revision"].as_u64().unwrap();
+    let (status, body) = admin
+        .patch("/storage-pools/local", json!({ "shared": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], revision, "{body}");
+    // revision이 다르면 412, 맞으면 바꾼다. id로도 찾는다.
+    let (status, body) = admin
+        .patch(
+            "/storage-pools/local",
+            json!({ "shared": false }),
+            Some(revision + 1),
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    let id = got["id"].as_str().unwrap();
+    let (status, body) = admin
+        .patch(
+            &format!("/storage-pools/{id}"),
+            json!({ "shared": false }),
+            Some(revision),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["shared"], false, "{body}");
+
+    // 모르는 필드, 빠진 필드, 없는 풀
+    for bad in [json!({ "shared": true, "nodes": [] }), json!({})] {
+        let (status, body) = admin.patch("/storage-pools/local", bad, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "invalid_request");
+    }
+    let (status, _) = admin
+        .patch("/storage-pools/nope", json!({ "shared": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // 다른 백엔드는 바꿀 수 없다(같은 값이어도).
+    for (name, backend, shared) in [
+        (
+            "nas",
+            json!({ "kind": "nfs", "server": "nas.lan", "export": "/srv/vm" }),
+            false,
+        ),
+        ("r", json!({ "kind": "rbd", "pool": "rbd" }), true),
+        (
+            "vg",
+            json!({ "kind": "lvm-thin", "vg": "vg0", "thinpool": "tp" }),
+            true,
+        ),
+        ("z", json!({ "kind": "zfs", "dataset": "tank/opl" }), false),
+    ] {
+        let (status, body) = admin.post("/storage-pools", pool(name, backend)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = admin
+            .patch(
+                &format!("/storage-pools/{name}"),
+                json!({ "shared": shared }),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert_eq!(body["code"], "invalid_request", "{name}");
+        assert!(
+            body["message"].as_str().unwrap().contains("dir pools"),
+            "{body}"
+        );
+    }
+}
+
+/// 공유 → 로컬은 그 풀의 볼륨을 쓰는 VM이 볼륨을 만든 노드가 아닌 노드에 있거나 마이그레이션
+/// Task가 끝나지 않았으면 409 `pool_in_use`다.
+#[tokio::test]
+async fn patch_to_local_needs_vms_on_their_volume_nodes() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let admin = env.admin().await;
+    for name in ["nas", "other"] {
+        let backend = json!({ "kind": "dir", "path": env.dir.path().join(name) });
+        let (status, body) = admin
+            .post(
+                "/storage-pools",
+                json!({ "name": name, "spec": { "backend": backend, "shared": true } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        env.pool_ready(name).await;
+    }
+    let node2 = other_node(&env, "node2", true, &["nas", "other"]).await;
+    // 이 노드가 만든 볼륨과 그 볼륨을 디스크로 쓰는 꺼진 VM
+    for (volume, pool, vm) in [("root", "nas", "web"), ("data", "other", "db")] {
+        let mut v: Volume = Resource::new(
+            volume,
+            VolumeSpec {
+                pool: pool.into(),
+                size_bytes: 1 << 20,
+                format: ImageFormat::Qcow2,
+            },
+        );
+        v.status.node = Some(env.node);
+        env.cluster.create(&v).await.unwrap();
+        v.status.phase = VolumePhase::Ready;
+        env.cluster
+            .update_status::<VolumeSpec>(v.id, &v.status)
+            .await
+            .unwrap();
+        let mut req = vm_request(vm);
+        req["spec"]["disks"] = json!([{ "volume": volume, "bus": "virtio-blk" }]);
+        req["spec"]["node"] = json!(env.node);
+        let (status, body) = admin.post("/vms", req).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let set_node = |vm: &'static str, node: Uuid| {
+        let cluster = env.cluster.clone();
+        async move {
+            let v = cluster.get_by_name::<VmSpec>(vm).unwrap().unwrap();
+            let mut spec = v.spec.clone();
+            spec.node = Some(node);
+            cluster
+                .update_spec(v.id, None, v.labels.clone(), &spec)
+                .await
+                .unwrap();
+        }
+    };
+    // 다른 풀의 VM이 다른 노드로 옮겨 갔어도 상관없다.
+    set_node("db", node2).await;
+    let to_local = || admin.patch("/storage-pools/nas", json!({ "shared": false }), None);
+    let to_shared = || admin.patch("/storage-pools/nas", json!({ "shared": true }), None);
+    let (status, body) = to_local().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["shared"], false, "{body}");
+    let (status, body) = to_shared().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 공유 풀이라 옮겨 간 VM이 있으면 409(VM 이름)
+    set_node("web", node2).await;
+    let (status, body) = to_local().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "pool_in_use", "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("\"web\""),
+        "{body}"
+    );
+    let (_, got) = admin.get("/storage-pools/nas").await;
+    assert_eq!(got["spec"]["shared"], true, "{got}");
+
+    // 볼륨을 만든 노드로 돌아오면 된다. 다시 공유로.
+    set_node("web", env.node).await;
+    let (status, body) = to_local().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = to_shared().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 끝나지 않은 마이그레이션 Task가 있어도 409
+    let web = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
+    let mut task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VmMigrate { node: node2 },
+            target: web.id,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    task.revision = env.cluster.create(&task).await.unwrap();
+    let (status, body) = to_local().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "pool_in_use", "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("\"web\""),
+        "{body}"
+    );
+    // 끝난 Task는 상관없다.
+    task.status.state = TaskState::Failed;
+    env.cluster
+        .update_status::<TaskSpec>(task.id, &task.status)
+        .await
+        .unwrap();
+    let (status, body) = to_local().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["shared"], false, "{body}");
 }

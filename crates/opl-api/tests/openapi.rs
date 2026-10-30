@@ -30,6 +30,12 @@ async fn openapi_document_is_served_without_login() {
     ] {
         assert!(paths.contains_key(path), "{path} is not documented");
     }
+    // 풀은 `shared`만 바꾼다.
+    assert_eq!(
+        doc["paths"]["/storage-pools/{key}"]["patch"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/PoolPatch"
+    );
     // 리소스 종류마다 따로 스키마가 생긴다.
     assert_eq!(
         doc["paths"]["/vms"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
