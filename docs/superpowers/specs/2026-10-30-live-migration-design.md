@@ -88,12 +88,16 @@
 
 계획 20 확인: 라이브 마이그레이션에서는 QEMU가 pflash 변수를 옮겨 받는 쪽이 재개될 때 대상 노드의 변수 파일에 쓴다(CI에서 원본 파일 끝 표식이 대상 파일에 생기고 두 파일이 같았다, `migration-it`도 본다). 이 절은 멈춘 채 옮기기만 다룬다.
 
+구현: `firmware_node`는 `serde(default, skip_serializing_if)`인 선택 필드다(OpenAPI에서 필수 아님). RPC는 opl-peer의 이진 코덱(요청은 VM id 16바이트, 조각은 태그 0 데이터 / 태그 1 0 조각 길이 u64 BE, 오류는 gRPC 상태 코드 — 파일 없음은 `NotFound`)이고 기존 회원 검사를 거친다. 받는 쪽(`Peers::uefi_vars`, 60초)은 같은 디렉터리의 `.uefi-vars.fd.{uuid}.tmp`에 받아 flush·fsync 뒤 이름을 바꾸고(디렉터리도 fsync), 실패하면 기존 파일을 그대로 둔다. 받는 크기는 256 MiB까지이고, `UefiVarsFetcher`는 받은 크기가 이 노드의 UEFI 변수 템플릿(하이퍼바이저 설정)과 다르면 실패로 친다(다른 펌웨어 빌드). reconciler는 opl-peer에 의존하지 않고 `FirmwareFetcher` trait(`ReconcilerConfig.firmware`, Task 실행기는 `TaskRunnerConfig.firmware`)으로 받으며, opld가 opl-api의 `UefiVarsFetcher`(오프라인으로 기록된 노드는 연결해 보지 않고, 회원이 아니면 오류)를 넣는다. 워커는 QEMU를 새로 띄울 때(`start()`, 디스크 resolve 뒤)만 받고 다시 붙기·마이그레이션 넘겨받기에서는 받지 않는다. `firmware_node = 자기`는 QEMU가 뜬 뒤 `Running` 기록과 함께, 그리고 이 노드에서 UEFI VM의 QEMU가 도는 것을 볼 때마다 쓴다(넘겨받기가 원본의 마지막 기록보다 먼저 일어나는 경우). 워커의 status 쓰기는 자기가 바꾸지 않은 `firmware_node`를 덮지 않고, 상태를 새로 만드는 곳은 값을 이어받는다. 마이그레이션 확정 뒤의 status 쓰기(`finish()`)가 T를 쓴다. 스냅샷·복제 Task는 변수를 복사하기 전에 받고(BIOS, 이미 이 노드, 이 노드에서 QEMU가 돌면 받지 않는다), 되돌리기는 변수를 쓴 Task 노드를, 복제는 새 VM의 변수 복사본을 둔 Task 노드를 `firmware_node`로 쓴다. 실패는 모두 `tracing::warn` 뒤 이 노드의 파일(없으면 템플릿 또는 복사하지 않음)이다.
+
 ## 6. 풀의 `shared` 바꾸기 (계획 21)
 
 - `PATCH /pools/{key}` 본문 `{ "shared": bool }`(지금은 `shared`만), `Write` 권한(관리자). 디렉터리 풀만 바꿀 수 있다 — 다른 백엔드는 400(NFS·RBD·공유 LVM은 늘 공유, LVM-thin·ZFS는 늘 로컬). 같은 값이면 그대로 200.
 - 로컬 → 공유: 언제나 된다(관리자가 그 경로가 목록의 모든 노드에서 같은 공유 파일 시스템임을 보증한다).
 - 공유 → 로컬: 풀의 볼륨을 쓰는 VM 중 `spec.node`가 그 볼륨의 `status.node`(만든 노드)와 다른 것이 있거나, 그 풀 디스크를 가진 VM의 끝나지 않은 `VmMigrate` Task가 있으면 409 `pool_in_use`(VM 이름). 볼륨은 만든 노드에 있는 것으로 돌아간다.
 - revision 검사로 쓴다. oplctl `pool set POOL --shared|--no-shared`, 웹 풀 상세의 공유 스위치(디렉터리 풀만).
+
+구현: 경로는 기존 풀 경로인 `PATCH /api/v1/storage-pools/{key}`이고 본문 `PoolPatch { shared }`는 모르는 필드를 거절한다. 디렉터리가 아닌 풀은 같은 값이어도 400 "only dir pools can change shared; {kind} pools are always shared/node-local"이고, 같은 값이면 쓰지 않고 200이다. `If-Match`(선택, 다르면 412)가 없으면 revision 검사 쓰기를 10번까지 다시 해 보고 409 `busy`다. 검사는 VM 옮기기·마이그레이션 요청과 같은 `vm_lock` 안에서 한다. `vm_lock`은 이 노드의 요청만 막으므로 공유 → 로컬은 쓴 뒤 다시 검사해, 이제 안 되면 revision 검사로 공유로 되돌리고 409 `pool_in_use`다. 노드에 놓이지 않은 VM이나 만든 노드가 기록되지 않은 볼륨은 막지 않는다. oplctl `pool set`은 `--shared`·`--no-shared` 중 정확히 하나를 받고 `storage pool X: shared|node-local`을 찍는다. 웹은 풀 상세가 아니라 풀 목록의 "공유" 칸(쓰기 권한과 디렉터리 풀이면 스위치, 아니면 글자)이고 양쪽 다 확인 대화상자, 409는 `pools.sharingErrors.<code>` 문구에 서버 문구(VM 이름)를 붙인다.
 
 ## 7. 테스트
 
@@ -103,12 +107,17 @@
 구현: 기능 `migration-it`(opld, `crates/opld/tests/migration.rs`)은 Linux 전용이 아니고 이 Mac에서도 TCG로 돈다(HVF에서는 원본 QEMU가 가끔 `assert_hvf_ok`로 죽는다). 한 호스트의 두 노드는 systemd 스코프 이름과 탭 이름이 겹치므로 스코프를 끄고 NIC 없이 띄운다. 게스트 OS가 없으므로 디스크 내용은 정지한 VM에서 `qemu-io`로 본다. 포트 막힘 실패 뒤 포트를 풀고 되돌아오기까지 본다. NFS·RBD·공유 LVM은 각 풀 기능과 그 시험의 환경 변수가 있을 때(0→1→0 왕복), 공유 LVM은 세 시점에 `lvchange -aey`가 되는지 본다. 2노드 in-process 시험(`opl-api/tests/two_nodes.rs`, MockHypervisor)은 성공·실패·되돌리기를 본다.
 - 계획 21: 2노드 실제 시험에서 멈춘 UEFI VM을 옮겨 켰을 때 변수가 같은지(앞 노드에서 `efivar`를 쓰는 대신 변수 파일의 해시로 본다), `PATCH /pools`.
 
+구현(계획 21): `migration-it`의 `uefi_variables_follow_a_stopped_vm`은 로컬로 만든 디렉터리 풀을 `oplctl pool set --shared`로 공유로 바꾸고, node1에서 켠 VM의 `firmware_node`를 확인한 뒤 멈추고 node1 변수 파일 끝에 표식을 쓰고 `PUT`의 `node`로 node2에 옮긴다. 이때 공유 → 로컬 `PATCH`가 409 `pool_in_use`인지 보고, 켜면 node2 파일에 표식이 있고(node1 파일은 남는다) `firmware_node`가 node2인지 본다. 펌웨어가 켤 때 변수를 다시 쓰므로 해시가 아니라 표식으로 본다. 단위·in-process: opl-peer gRPC(조각·0 조각·없음·비회원), reconciler(가짜 fetcher — 받음, 실패해도 켬, 같은 노드면 안 받음, BIOS), `opl-api/tests/two_nodes.rs`(실제 gRPC로 멈춘 VM 옮겨 켜기), `tests/pools.rs`의 `PATCH`.
+
 ## 8. 알려진 한계
 
 - 디스크가 모두 공유 풀이어야 한다(로컬 디스크 복사 없음).
 - 같은 QEMU 버전·같은 CPU의 노드 사이만 된다. `-cpu host`이므로 CPU가 다르면 마이그레이션이 실패하거나 게스트가 멈출 수 있다(검사하지 않는다).
 - 취소가 없다. 수렴하지 않으면 `auto-converge`가 게스트를 늦추고, 시간 제한(30분)이 지나면 실패로 끝나 원본이 계속 돈다.
-- 노드가 죽으면 그 노드에만 있던 UEFI 변수는 잃는다(템플릿으로 켠다).
+- 노드가 죽으면 그 노드에만 있던 UEFI 변수는 잃는다(템플릿으로 켠다). 구현: 계획 21대로 — 다른 노드가 켤 때 경고를 남기고 그 노드의 파일이나 템플릿으로 켠다.
+- 스냅샷의 변수 복사본(`snapshots/{id}.vars`)은 RPC로 받지 않는다(변수 파일만). 스냅샷에서 복제하는 Task가 스냅샷을 찍은 노드가 아닌 곳에서 돌면 새 VM은 변수 없이(템플릿으로) 켜진다. 되돌리기 Task가 그런 노드에서 돌면 변수는 되돌리지 않고 지금 변수를 둔다(경고).
+- 모든 노드가 같은 펌웨어 빌드(같은 크기의 변수 템플릿)를 써야 변수가 따라간다. 크기가 다르면 받은 파일을 버리고 켜는 노드의 파일(없으면 템플릿)로 켠다.
+- VM이 거쳐 간 다른 노드의 변수 파일(받은 쪽은 옛 파일을 지우지 않는다)은 VM을 지워도 그 노드에 남는다.
 - 마이그레이션 포트 범위를 노드 사이 방화벽에서 열어야 한다.
 - macOS 노드는 마이그레이션을 할 수 없다.
 - 공유 LVM 디스크: 계획 20의 확인 결과에 따른다(§3). 구현: 지원한다(마이그레이션 동안 LV 공유 잠금).

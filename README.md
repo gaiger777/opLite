@@ -102,6 +102,7 @@ sudo apt install nfs-common                          # 노드마다 NFS 클라�
 oplctl pool create nas --nfs nas.lan:/srv/vm         # IPv6 서버는 --nfs '[fd00::5]:/srv/vm'
 oplctl pool create nas2 --nfs 10.0.0.5:/srv/vm --nfs-options vers=4.2,hard   # mount -o nosuid,nodev,noexec,retry=0 뒤에 붙는다
 oplctl pool create shared --path /mnt/vm --shared    # opLite 밖에서 마운트한 공유 디렉터리(모든 노드가 같은 파일을 본다)
+oplctl pool set local --shared                       # 디렉터리 풀을 공유로(--no-shared는 노드 로컬로)
 oplctl pool list                                     # NAME KIND LOCATION NODES READY(준비된 노드/쓸 수 있는 노드)
 oplctl pool get nas                                  # 노드별 준비·용량·오류(-o json: 풀 리소스 그대로)
                                                      # 꺼진 노드는 node offline, 목록의 없는 노드는 node not found
@@ -123,6 +124,13 @@ oplctl pool get nas                                  # 노드별 준비·용량�
 - **NFS 풀은 늘 공유 풀이다.** API에서 `shared`를 적지 않으면 `true`가 되고, `false`면 **400** `invalid_request`다.
   opld 밖에서(fstab 등) 마운트한 공유 디렉터리는 디렉터리 풀을 공유로 만든다: `oplctl pool create --path ... --shared`
   (API `"shared": true`, 웹은 "공유 스토리지" 체크). `--shared`는 `--nfs`와 함께 쓰지 않는다.
+- **공유 여부 바꾸기.** 디렉터리 풀만 `oplctl pool set POOL --shared|--no-shared`(관리자)로 바꾼다(API
+  `PATCH /api/v1/storage-pools/{key}` `{"shared": bool}`, `If-Match` 선택. 웹은 스토리지 풀 목록의 "공유" 스위치와
+  확인 대화상자). 다른 풀은 같은 값이어도 **400** `invalid_request`다(NFS·RBD·공유 LVM은 늘 공유, LVM-thin·ZFS는
+  늘 로컬). 같은 값이면 바꾸지 않고 200이다. 로컬 → 공유는 언제나 된다(그 경로가 풀의 모든 노드에서 같은 공유 파일
+  시스템인지는 관리자가 보증한다). 공유 → 로컬은 그 풀의 볼륨을 쓰는 VM이 볼륨을 만든 노드가 아닌 노드에 있거나
+  마이그레이션 중이면 **409** `pool_in_use`(VM 이름)다. VM을 볼륨의 노드로 되돌린 뒤 다시 한다. 로컬이 되면 볼륨은
+  만든 노드에 있는 것으로 돌아간다.
 - **노드별 풀 상태.** 노드는 자기가 쓸 수 있는 풀마다 준비 여부·용량·오류를 노드 상태(`status.pools`)에 알린다.
   15초마다(`[pools] refresh_secs`), 그리고 풀을 만들거나 지우면 곧바로 확인한다. 디렉터리 풀은 디렉터리가 있고
   쓸 수 있어야(작은 파일을 만들고 지워 본다) 준비된다. NFS 풀은 마운트(30초 제한)와 쓰기 확인(10초 제한)이 되어야
@@ -149,8 +157,8 @@ oplctl pool get nas                                  # 노드별 준비·용량�
   NFS를 지원하지 않는 노드(macOS)에 놓인 NFS 풀 디스크의 VM은 기다려도 시작할 수 없으므로 꺼지고 `last_error`에 이유가 남는다.
 - **올릴 때.** 새 opld는 첫 확인(시작 직후)에서 풀 상태를 채운다. 디렉터리 풀은 그 전에도 쓸 수 있다고 보지만,
   디렉터리가 없는 노드는 첫 확인 뒤 그 풀이 준비되지 않은 것으로 나온다. 공유가 아닌 풀의 VM은 이제 볼륨이 있는
-  노드에만 배치된다. 공유 스토리지 위의 디렉터리 풀은 `--shared`로 만들어야 VM이 다른 노드로 갈 수 있다. 풀을 바꾸는
-  API는 없으므로 기존 풀을 공유로 바꾸려면 볼륨을 다른 풀로 옮기고(예: 복제) 풀을 다시 만든다.
+  노드에만 배치된다. 공유 스토리지 위의 디렉터리 풀은 공유여야 VM이 다른 노드로 갈 수 있다. 기존 풀은
+  `oplctl pool set POOL --shared`로 바꾼다.
 
 ## LVM-thin 풀
 
@@ -497,7 +505,16 @@ timeout = "30m"           # 이 시간 안에 끝나지 않으면 취소하고 �
 - **실패.** 확정 전에 실패하면(대상 거절, 연결·TLS 실패, 시간 제한) 대상 QEMU를 끄고 원본이 계속 돈다. 작업
   오류에 QEMU의 이유가 남는다. 중간에 opld가 죽어도 다시 뜰 때 원본을 되살리거나(확정 전) 남은 원본·받는 QEMU를
   끈다(확정 뒤, 시작 때와 30분마다).
-- **UEFI 변수.** QEMU가 변수(pflash)도 함께 옮겨 대상 노드의 변수 파일에 쓴다.
+- **UEFI 변수.** QEMU가 변수(pflash)도 함께 옮겨 대상 노드의 변수 파일에 쓴다. 변수 파일은 노드마다
+  `{data_dir}/vm/{id}/uefi-vars.fd`에 있고, 클러스터 기록이 지금 파일을 가진 노드(`status.firmware_node`)를 안다.
+  멈춘 채 다른 노드로 옮긴 VM(웹 VM 편집이나 API `PUT /api/v1/vms/{key}`의 `node`)은 켤 때 그 노드에서 노드 사이
+  연결로 변수를 받아 온다. 스냅샷·복제도 변수를 복사하기 전에 받아 온다. 그 노드가 꺼졌거나 죽었거나 받지 못하면
+  경고를 남기고 켜는 노드의 파일(없으면 템플릿)로 켠다 — 그 노드에만 있던 변수(부팅 순서 등)는 잃는다. 옛 노드의
+  파일은 지우지 않는다. 모든 노드가 같은 펌웨어 빌드(같은 크기의 UEFI 변수 템플릿, `[hypervisor] uefi_vars`)를
+  써야 한다 — 받은 변수 파일의 크기가 켜는 노드의 템플릿과 다르면 버리고 같은 경고 뒤 그 노드의 파일로 켠다.
+  한계: 스냅샷의 변수 복사본은 받아 오지 않으므로, 스냅샷에서 복제하는 작업이 스냅샷을 찍은 노드가 아닌 곳에서
+  돌면 새 VM은 템플릿으로 켜고, 되돌리기가 그런 노드에서 돌면 변수는 되돌리지 않고 지금 것을 둔다(경고). VM이
+  거쳐 간 다른 노드의 변수 파일은 VM을 지워도 그 노드에 남는다.
 - **공유 LVM.** 옮기는 동안 디스크 LV를 공유 잠금(`lvchange -asy`)으로 바꾸고, 대상이 넘겨받은 뒤 다시 배타로
   바꾼다.
 
