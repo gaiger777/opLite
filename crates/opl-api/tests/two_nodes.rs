@@ -126,11 +126,23 @@ impl Node {
                 .await
                 .unwrap();
         });
+        // UEFI 변수 파일을 가진 노드에서 받아 온다(opld처럼 reconciler와 Task 실행기가 함께 쓴다).
+        // 시험의 변수 파일은 모두 템플릿과 같은 6바이트다.
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(template(root, self), b"vars 0").unwrap();
+        let firmware: Arc<dyn FirmwareFetcher> = Arc::new(UefiVarsFetcher::new(
+            self.cluster.clone(),
+            self.peers.clone(),
+            work.join("state"),
+            template(root, self),
+        ));
         let mut reconciler_config = reconciler_config(self.id);
         reconciler_config.storage = storage.clone();
+        reconciler_config.firmware = Some(firmware.clone());
         let reconciler = Reconciler::spawn(self.cluster.clone(), hv.clone(), reconciler_config);
         let mut config = runner_config(self.id, &work);
         config.peers = Some(self.peers.clone());
+        config.firmware = Some(firmware);
         let runner = TaskRunner::spawn(
             self.cluster.clone(),
             storage,
@@ -268,18 +280,36 @@ fn state_dir(root: &TempDir, node: &Node) -> std::path::PathBuf {
     root.path().join(format!("{}-work", node.id)).join("state")
 }
 
+/// 노드의 UEFI 변수 템플릿(받은 변수 파일의 크기를 이와 견준다)
+fn template(root: &TempDir, node: &Node) -> std::path::PathBuf {
+    root.path()
+        .join(format!("{}-work", node.id))
+        .join("vars-template.fd")
+}
+
 #[tokio::test]
 async fn uefi_vars_are_fetched_from_the_node_that_has_them() {
     let (root, a, b) = two_nodes().await;
     let vm = Uuid::now_v7();
     let src = uefi_vars_path(&state_dir(&root, &b), vm);
     std::fs::create_dir_all(src.parent().unwrap()).unwrap();
-    std::fs::write(&src, b"vars of b").unwrap();
-    let fetcher = UefiVarsFetcher::new(a.cluster.clone(), a.peers.clone(), state_dir(&root, &a));
+    std::fs::write(&src, b"vars b").unwrap();
+    let fetcher = UefiVarsFetcher::new(
+        a.cluster.clone(),
+        a.peers.clone(),
+        state_dir(&root, &a),
+        template(&root, &a),
+    );
     let dest = uefi_vars_path(&state_dir(&root, &a), vm);
 
     fetcher.fetch(vm, b.id).await.unwrap();
-    assert_eq!(std::fs::read(&dest).unwrap(), b"vars of b");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"vars b");
+
+    // 크기가 이 노드의 템플릿과 다르면(다른 펌웨어 빌드) 받은 것을 버린다.
+    std::fs::write(&src, b"other firmware").unwrap();
+    let err = fetcher.fetch(vm, b.id).await.unwrap_err();
+    assert!(err.0.contains("14 bytes"), "{err}");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"vars b");
 
     // 파일이 없거나 멤버가 아닌 노드면 실패하고 이 노드의 파일은 그대로다.
     let err = fetcher.fetch(Uuid::now_v7(), b.id).await.unwrap_err();
@@ -297,7 +327,106 @@ async fn uefi_vars_are_fetched_from_the_node_that_has_them() {
         .unwrap();
     let err = fetcher.fetch(vm, b.id).await.unwrap_err();
     assert_eq!(err.0, "node \"node2\" is offline");
-    assert_eq!(std::fs::read(&dest).unwrap(), b"vars of b");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"vars b");
+}
+
+/// 노드의 VM `vm` UEFI 변수 파일에 쓴다.
+fn write_vars(root: &TempDir, node: &Node, vm: Uuid, data: &[u8]) {
+    let path = uefi_vars_path(&state_dir(root, node), vm);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, data).unwrap();
+}
+
+fn read_vars(root: &TempDir, node: &Node, vm: Uuid) -> Vec<u8> {
+    std::fs::read(uefi_vars_path(&state_dir(root, node), vm)).unwrap()
+}
+
+/// 멈춘 UEFI VM을 다른 노드로 옮기면, 그 노드의 스냅샷·복제·시작이 앞 노드의 변수를 받아 쓴다.
+/// 되돌린 변수는 그 노드의 것이 된다(다시 받지 않는다).
+#[tokio::test]
+async fn variables_follow_a_stopped_vm_to_another_node() {
+    let (root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let vm = running_vm(&a, &admin).await;
+    wait_vm(&a, vm.id, "variables on A", |v| {
+        v.status.firmware_node == Some(a.id)
+    })
+    .await;
+    let task = admin.act("web", "stop").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    write_vars(&root, &a, vm.id, b"vars 1");
+
+    // 멈춘 채 B로 옮긴다.
+    let (_, current) = admin.get("/vms/web").await;
+    let mut spec = current["spec"].clone();
+    spec["node"] = serde_json::json!(b.id);
+    let (status, body) = admin
+        .put("/vms/web", serde_json::json!({ "spec": spec }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 스냅샷은 B에서 찍고 A의 변수를 받아 담는다.
+    let (status, task) = admin
+        .post("/vms/web/snapshots", serde_json::json!({ "name": "s1" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(task["spec"]["node"], b.id.to_string());
+    let s1 = b
+        .cluster
+        .list::<opl_types::snapshot::SnapshotSpec>()
+        .unwrap()
+        .1
+        .into_iter()
+        .find(|s| s.spec.vm == vm.id)
+        .unwrap();
+    let copy = state_dir(&root, &b).join(format!("vm/{}/snapshots/{}.vars", vm.id, s1.id));
+    assert_eq!(std::fs::read(copy).unwrap(), b"vars 1");
+
+    // 복제도 B에서 A의 변수를 받아 복사하고, 새 VM의 변수는 B에 있다.
+    write_vars(&root, &a, vm.id, b"vars 2");
+    let (status, task) = admin
+        .post("/vms/web/clone", serde_json::json!({ "name": "web-2" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let copy = b.cluster.get_by_name::<VmSpec>("web-2").unwrap().unwrap();
+    assert_eq!(read_vars(&root, &b, copy.id), b"vars 2");
+    assert_eq!(copy.status.firmware_node, Some(b.id));
+
+    // 켜면 B의 reconciler가 A의 변수를 받아 켜고 B를 변수 노드로 남긴다.
+    write_vars(&root, &a, vm.id, b"vars 3");
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert!(b.hv.inspect(vm.id).await.unwrap().is_some());
+    assert_eq!(read_vars(&root, &b, vm.id), b"vars 3");
+    wait_vm(&b, vm.id, "variables on B", |v| {
+        v.status.firmware_node == Some(b.id)
+    })
+    .await;
+    let task = admin.act("web", "stop").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    // 되돌리기는 스냅샷 때의 변수를 B에 쓰고 B를 변수 노드로 삼는다. 다음 시작은 A에서 받지 않는다.
+    let mut moved = b.cluster.get::<VmSpec>(vm.id).unwrap().unwrap();
+    moved.status.firmware_node = Some(a.id);
+    b.cluster
+        .update_status::<VmSpec>(vm.id, &moved.status)
+        .await
+        .unwrap();
+    let (status, task) = admin
+        .post("/vms/web/snapshots/s1/revert", serde_json::Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let reverted = b.cluster.get::<VmSpec>(vm.id).unwrap().unwrap();
+    assert_eq!(reverted.status.firmware_node, Some(b.id));
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(read_vars(&root, &b, vm.id), b"vars 1");
 }
 
 /// A에서 도는 VM `web`(디스크 없음)을 만든다.
@@ -353,6 +482,13 @@ async fn running_vm_migrates_to_the_other_node() {
     let (_root, a, b) = two_nodes().await;
     let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
     let vm = running_vm(&a, &admin).await;
+    wait_vm(&a, vm.id, "variables on A", |v| {
+        v.status.firmware_node == Some(a.id)
+    })
+    .await;
+    // B의 reconciler가 넘겨받으며 `firmware_node`를 쓰기 전에, 확정 뒤 기록이 B를 쓰는지 본다.
+    let b_reconciler = b._workers.as_ref().unwrap().0.handle();
+    b_reconciler.begin_migration(vm.id).await;
 
     // B의 API로 요청해도 Task는 원본 노드 A에서 돈다.
     let admin_b = login_at(&b.base, "admin", ADMIN_PASSWORD).await;
@@ -376,7 +512,10 @@ async fn running_vm_migrates_to_the_other_node() {
     assert_eq!(vm_now.spec.node, Some(b.id));
     assert_eq!(vm_now.status.node, Some(b.id));
     assert_eq!(vm_now.status.migration, None);
+    // QEMU가 변수를 B로 옮겼다.
+    assert_eq!(vm_now.status.firmware_node, Some(b.id));
     assert_eq!(runtime_status(&a, vm.id).await, None);
+    b_reconciler.end_migration(vm.id);
     // B의 reconciler가 받은 QEMU를 넘겨받아 이어서 실행한다(새로 띄우지 않는다).
     wait_vm(&b, vm.id, "running on B", |v| {
         v.status.phase == VmPhase::Running && v.status.node == Some(b.id) && v.status.pid.is_some()

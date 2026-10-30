@@ -504,6 +504,8 @@ async fn clone_copies_disks_into_a_new_stopped_vm() {
     assert!(copy.spec.nics[0].mac.is_some());
     assert_ne!(copy.spec.nics[0].mac, source.spec.nics[0].mac);
     assert_eq!(copy.status.snapshot, None);
+    // 새 VM의 UEFI 변수는 복제한 노드에 있다.
+    assert_eq!(copy.status.firmware_node, Some(env.node));
     let mut copied = Vec::new();
     for name in disks {
         let v = get_volume(&env, name).unwrap();

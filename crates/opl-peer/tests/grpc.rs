@@ -588,23 +588,36 @@ async fn uefi_vars_are_fetched_from_a_member() {
     let dest = uefi_vars_path(&to.state_dir, vm);
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::fs::write(&dest, b"stale").unwrap();
-    let len = to.peers.uefi_vars(&from.addr, vm, &dest).await.unwrap();
+    let len = to
+        .peers
+        .uefi_vars(&from.addr, vm, &dest, None)
+        .await
+        .unwrap();
     assert_eq!(len, vars.len() as u64);
     assert!(std::fs::read(&dest).unwrap() == vars, "content differs");
 
     // 0만 있는 파일, 빈 파일도 크기 그대로 온다.
     std::fs::write(&src, vec![0u8; chunk + 1]).unwrap();
-    to.peers.uefi_vars(&from.addr, vm, &dest).await.unwrap();
+    to.peers
+        .uefi_vars(&from.addr, vm, &dest, None)
+        .await
+        .unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), vec![0u8; chunk + 1]);
     std::fs::write(&src, b"").unwrap();
-    assert_eq!(to.peers.uefi_vars(&from.addr, vm, &dest).await.unwrap(), 0);
+    assert_eq!(
+        to.peers
+            .uefi_vars(&from.addr, vm, &dest, None)
+            .await
+            .unwrap(),
+        0
+    );
     assert!(std::fs::read(&dest).unwrap().is_empty());
 
     // 그 노드에 파일이 없으면 NotFound이고 받는 쪽 파일은 그대로다.
     std::fs::write(&dest, b"kept").unwrap();
     let err = to
         .peers
-        .uefi_vars(&from.addr, Uuid::now_v7(), &dest)
+        .uefi_vars(&from.addr, Uuid::now_v7(), &dest, None)
         .await
         .unwrap_err();
     assert_eq!(err, UefiVarsError::NotFound);
@@ -614,7 +627,7 @@ async fn uefi_vars_are_fetched_from_a_member() {
     let outsider = Node::start(&ca, &root).await;
     let err = outsider
         .peers
-        .uefi_vars(&from.addr, vm, &root.path().join("outsider.fd"))
+        .uefi_vars(&from.addr, vm, &root.path().join("outsider.fd"), None)
         .await
         .unwrap_err();
     assert!(

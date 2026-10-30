@@ -16,7 +16,7 @@ use opl_reconciler::ReconcilerHandle;
 use opl_reconciler::resolve::set_disks_shared;
 use opl_types::storage::VolumeSpec;
 use opl_types::task::{Task, TaskOp, TaskSpec};
-use opl_types::vm::{MigrationStatus, PowerState, Vm, VmPhase, VmSpec};
+use opl_types::vm::{Firmware, MigrationStatus, PowerState, Vm, VmPhase, VmSpec};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -382,7 +382,7 @@ async fn roll_back(
     Outcome::RolledBack(resumed.err())
 }
 
-/// 7~8단계(확정 뒤): status를 대상 노드의 `Running`으로 쓰고, 원본 QEMU를 끄고, 원본 쪽 디스크를
+/// 7~8단계(확정 뒤): status를 대상 노드의 `Running`으로(UEFI 변수도 대상 노드에) 쓰고, 원본 QEMU를 끄고, 원본 쪽 디스크를
 /// 끈다. 대상 QEMU는 대상 노드의 reconciler가 이어서 실행한다. 실패해도 확정은 끝났으므로 경고만
 /// 남긴다(남은 원본은 정리가 끈다).
 async fn finish(ctx: &Ctx, id: Uuid, migration: MigrationStatus) {
@@ -412,6 +412,10 @@ async fn finish(ctx: &Ctx, id: Uuid, migration: MigrationStatus) {
         if status.node != Some(migration.node) {
             status.node = Some(migration.node);
             status.pid = None;
+        }
+        // QEMU가 UEFI 변수(pflash)를 대상 노드의 변수 파일로 옮겼다(설계 §5).
+        if vm.spec.firmware == Firmware::Uefi {
+            status.firmware_node = Some(migration.node);
         }
         match ctx
             .cluster

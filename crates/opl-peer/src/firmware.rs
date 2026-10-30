@@ -155,8 +155,13 @@ async fn read_full(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
 }
 
 /// 받는 쪽: 조각을 `dest`와 같은 디렉터리의 임시 파일에 쓰고 fsync한 뒤 `dest`로 이름을 바꾼다.
-/// 받다가 실패하면 `dest`는 그대로다. 받은 파일의 크기를 돌려준다.
-pub(crate) async fn write_file<S>(mut chunks: S, dest: &Path) -> Result<u64, UefiVarsError>
+/// `expect_len`을 주면 받은 파일의 크기가 그와 달라도 실패한다. 받다가 실패하면 `dest`는 그대로다.
+/// 받은 파일의 크기를 돌려준다.
+pub(crate) async fn write_file<S>(
+    mut chunks: S,
+    dest: &Path,
+    expect_len: Option<u64>,
+) -> Result<u64, UefiVarsError>
 where
     S: Stream<Item = Result<UefiVarsChunk, Status>> + Unpin,
 {
@@ -193,6 +198,13 @@ where
                     file.seek(SeekFrom::Current(n)).await.map_err(io)?;
                 }
             }
+        }
+        if let Some(want) = expect_len
+            && len != want
+        {
+            return Err(UefiVarsError::Invalid(format!(
+                "{len} bytes, but this node's firmware uses {want} bytes"
+            )));
         }
         // tokio `File`은 쓰기를 뒤에서 하므로, 그 오류는 flush가 돌려준다. `set_len`·`sync_all`은
         // 남은 쓰기를 기다리기만 하고 그 오류를 버린다.
@@ -270,7 +282,7 @@ mod tests {
             // 끝의 0도 파일 크기에 든다.
             Ok(UefiVarsChunk::Zero(5)),
         ];
-        assert_eq!(write_file(stream(chunks), &dest).await.unwrap(), 22);
+        assert_eq!(write_file(stream(chunks), &dest, None).await.unwrap(), 22);
         let mut want = b"head".to_vec();
         want.extend([0u8; 10]);
         want.extend(b"mid");
@@ -279,7 +291,7 @@ mod tests {
 
         // 있던 파일을 바꾼다.
         let chunks = vec![Ok(UefiVarsChunk::Data(Bytes::from_static(b"new")))];
-        assert_eq!(write_file(stream(chunks), &dest).await.unwrap(), 3);
+        assert_eq!(write_file(stream(chunks), &dest, None).await.unwrap(), 3);
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         assert_eq!(
             std::fs::read_dir(dest.parent().unwrap()).unwrap().count(),
@@ -306,14 +318,37 @@ mod tests {
                 Ok(UefiVarsChunk::Zero(u64::MAX)),
             ],
         ] {
-            let err = write_file(stream(chunks), &dest).await.unwrap_err();
+            let err = write_file(stream(chunks), &dest, None).await.unwrap_err();
             assert!(matches!(err, UefiVarsError::Invalid(_)), "{err:?}");
             assert_eq!(std::fs::read(&dest).unwrap(), b"old");
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         }
         // 최대 크기까지는 받는다.
         let chunks = vec![Ok(UefiVarsChunk::Zero(MAX_BYTES))];
-        assert_eq!(write_file(stream(chunks), &dest).await.unwrap(), MAX_BYTES);
+        assert_eq!(
+            write_file(stream(chunks), &dest, None).await.unwrap(),
+            MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_of_another_size_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("uefi-vars.fd");
+        std::fs::write(&dest, b"old").unwrap();
+        let chunks = vec![Ok(UefiVarsChunk::Zero(4))];
+        let err = write_file(stream(chunks), &dest, Some(3))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UefiVarsError::Invalid("4 bytes, but this node's firmware uses 3 bytes".into())
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let chunks = vec![Ok(UefiVarsChunk::Data(Bytes::from_static(b"new")))];
+        assert_eq!(write_file(stream(chunks), &dest, Some(3)).await.unwrap(), 3);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
     }
 
     #[tokio::test]
@@ -325,7 +360,7 @@ mod tests {
             Ok(UefiVarsChunk::Data(Bytes::from_static(b"partial"))),
             Err(Status::unavailable("connection reset")),
         ];
-        let err = write_file(stream(chunks), &dest).await.unwrap_err();
+        let err = write_file(stream(chunks), &dest, None).await.unwrap_err();
         assert_eq!(err, UefiVarsError::Unavailable("connection reset".into()));
         assert_eq!(std::fs::read(&dest).unwrap(), b"old");
         // 임시 파일도 남기지 않는다.

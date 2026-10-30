@@ -24,7 +24,7 @@ use opl_driver::{
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{TlsListener, api_server_config};
 use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers};
-use opl_reconciler::{Reconciler, ReconcilerConfig};
+use opl_reconciler::{FirmwareFetcher, Reconciler, ReconcilerConfig};
 use opl_types::node::NodeSpec;
 use opl_types::vm::VmSpec;
 use tokio::net::TcpListener;
@@ -293,6 +293,8 @@ impl Member {
         };
         // 풀 마운터가 QEMU의 rbd 블록 드라이버를 확인한다.
         let qemu_binary = host.profile.qemu_binary.clone();
+        // 받은 UEFI 변수 파일의 크기를 이 노드의 템플릿과 견준다.
+        let uefi_vars_template = host.profile.uefi_vars_template.clone();
         let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
             tokio::spawn(async move {
@@ -312,12 +314,14 @@ impl Member {
         };
         let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
-        // 다른 노드에 있는 UEFI 변수 파일을 노드 사이 RPC로 받아 온다.
-        reconciler_config.firmware = Some(Arc::new(UefiVarsFetcher::new(
+        // 다른 노드에 있는 UEFI 변수 파일을 노드 사이 RPC로 받아 온다(시작, 스냅샷, 복제).
+        let firmware: Arc<dyn FirmwareFetcher> = Arc::new(UefiVarsFetcher::new(
             cluster.clone(),
             peers.clone(),
             config.data_dir.clone(),
-        )));
+            uefi_vars_template,
+        ));
+        reconciler_config.firmware = Some(firmware.clone());
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
         let pools = PoolMounter::spawn(
             cluster.clone(),
@@ -332,6 +336,7 @@ impl Member {
         runner_config.state_dir = Some(config.data_dir.clone());
         // 마이그레이션을 보낼 때 대상 노드를 부른다.
         runner_config.peers = Some(peers.clone());
+        runner_config.firmware = Some(firmware);
         runner_config.migration_bandwidth =
             (config.migration.bandwidth_mib > 0).then_some(config.migration.bandwidth_mib << 20);
         runner_config.migration_timeout = config.migration.timeout;

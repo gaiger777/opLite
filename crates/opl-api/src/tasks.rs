@@ -17,7 +17,7 @@ use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, Hypervisor, Storage};
 use opl_peer::Peers;
-use opl_reconciler::ReconcilerHandle;
+use opl_reconciler::{FirmwareFetcher, ReconcilerHandle};
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec};
@@ -76,6 +76,9 @@ pub struct TaskRunnerConfig {
     pub migration_bandwidth: Option<u64>,
     /// 마이그레이션이 이 시간 안에 끝나지 않으면 취소한다. 마이그레이션 Task는 `timeout` 대신 이것을 쓴다.
     pub migration_timeout: Duration,
+    /// 스냅샷·복제가 UEFI 변수를 복사하기 전에, 변수 파일이 다른 노드에 있으면 받아 온다. 없으면
+    /// 이 노드의 파일을 그대로 쓴다.
+    pub firmware: Option<Arc<dyn FirmwareFetcher>>,
 }
 
 impl TaskRunnerConfig {
@@ -91,6 +94,7 @@ impl TaskRunnerConfig {
             peers: None,
             migration_bandwidth: None,
             migration_timeout: Duration::from_secs(30 * 60),
+            firmware: None,
         }
     }
 }

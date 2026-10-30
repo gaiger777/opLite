@@ -14,7 +14,7 @@ use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, is_shared,
 };
 use opl_types::task::Task;
-use opl_types::vm::{PowerState, ScheduleError, Vm, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{Firmware, PowerState, ScheduleError, Vm, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
 
 use crate::schedule::{recorded_vm, set_schedule_error};
@@ -229,6 +229,48 @@ pub(super) async fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
         tokio::fs::create_dir_all(dir).await?;
     }
     tokio::fs::copy(from, to).await.map(|_| ())
+}
+
+/// UEFI VM의 변수 파일을 가진 노드(`firmware_node`)가 이 노드가 아니면 거기서 받아 와 이 노드의
+/// 파일을 바꾼다(설계 §5). 받지 못하면 경고만 남기고 이 노드의 파일(없으면 복사하지 않는다)을 쓴다.
+/// 이 노드에서 QEMU가 돌고 있으면(그 QEMU가 이 노드의 파일을 쓴다) 받지 않는다.
+pub(super) async fn fetch_vars(ctx: &Ctx, vm: &Vm) {
+    let (Some(fetcher), Some(node)) = (&ctx.config.firmware, vm.status.firmware_node) else {
+        return;
+    };
+    if vm.spec.firmware != Firmware::Uefi || node == ctx.config.node {
+        return;
+    }
+    if !matches!(ctx.hv.inspect(vm.id).await, Ok(None)) {
+        return;
+    }
+    if let Err(e) = fetcher.fetch(vm.id, node).await {
+        tracing::warn!(vm = %vm.id, from = %node, error = %e, "cannot fetch UEFI variables; copying this node's copy");
+    }
+}
+
+/// UEFI 변수 파일을 이 노드에 썼다: 이 노드를 `firmware_node`로 삼는다. reconciler도 status를
+/// 쓰므로 revision을 확인하며 쓰고, 그 사이 누가 썼으면 다시 읽어 쓴다.
+async fn set_firmware_node(ctx: &Ctx, vm: Uuid) -> Result<(), String> {
+    loop {
+        let current = get_vm(ctx, vm)?;
+        if current.status.firmware_node == Some(ctx.config.node) {
+            return Ok(());
+        }
+        let status = VmStatus {
+            firmware_node: Some(ctx.config.node),
+            ..current.status.clone()
+        };
+        match ctx
+            .cluster
+            .update_status_checked::<VmSpec>(vm, current.revision, &status)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// 이 노드에서 파일이 보이는 볼륨인지. 다른 노드에 만든 볼륨은 풀이 공유되지 않으면 오류다.
@@ -484,6 +526,7 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     };
     let copied = match (&made, ctx.config.state_dir.as_ref()) {
         (Ok(()), Some(dir)) => {
+            fetch_vars(ctx, &vm).await;
             let vars = uefi_vars_path(dir, vm_id);
             match tokio::fs::try_exists(&vars).await {
                 // BIOS VM이거나 한 번도 켠 적 없는 UEFI VM
@@ -675,12 +718,18 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             .await
             .map_err(|e| format!("cannot revert volume {:?}: {e}", volume.name))?;
     }
-    if let (Some(copy), Some(dir)) = (vars_copy(ctx, vm_id, id), &ctx.config.state_dir)
-        && tokio::fs::try_exists(&copy).await.unwrap_or(false)
-    {
-        copy_file(&copy, &uefi_vars_path(dir, vm_id))
-            .await
-            .map_err(|e| format!("cannot restore UEFI variables: {e}"))?;
+    if let (Some(copy), Some(dir)) = (vars_copy(ctx, vm_id, id), &ctx.config.state_dir) {
+        if tokio::fs::try_exists(&copy).await.unwrap_or(false) {
+            copy_file(&copy, &uefi_vars_path(dir, vm_id))
+                .await
+                .map_err(|e| format!("cannot restore UEFI variables: {e}"))?;
+            // 되돌린 변수는 이 노드에 있다. 다음 시작이 다른 노드에서 받아 덮지 않게 한다.
+            set_firmware_node(ctx, vm_id).await?;
+        } else if get_vm(ctx, vm_id)?.spec.firmware == Firmware::Uefi {
+            // 스냅샷을 다른 노드에서 찍었거나 한 번도 켜지 않은 VM이다. 변수 복사본은 노드 사이에
+            // 받아 오지 않으므로 지금 변수를 그대로 둔다.
+            tracing::warn!(vm = %vm_id, snapshot = %id, "this node has no UEFI variables copy of the snapshot; keeping the current variables");
+        }
     }
     // 스냅샷 뒤에 늘린 크기는 되돌아간다.
     for (volume, pool) in &disks {

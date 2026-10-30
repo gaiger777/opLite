@@ -6,7 +6,7 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
 use opl_types::runtime::VmRuntimeSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
-use opl_types::vm::{PowerState, RestartPolicy, Vm, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{Firmware, PowerState, RestartPolicy, Vm, VmPhase, VmSpec, VmStatus};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -298,6 +298,8 @@ impl Worker {
         }
         if actual.is_some() {
             self.disks_active = true;
+            // 이 노드의 QEMU가 이 노드의 변수 파일을 쓰고 있다(다시 붙음, 넘겨받은 마이그레이션 포함).
+            self.own_firmware(vm, &mut status);
         }
         match (vm.spec.power, actual) {
             (PowerState::Running, Some(state)) => {
@@ -385,6 +387,8 @@ impl Worker {
                     // 이제 돌고 있다. 곧바로 꺼져도 이벤트보다 먼저 온 재동기화가 다시 시작하지
                     // 않고 이벤트를 기다리게 한다.
                     self.was_running = true;
+                    // 이 노드의 변수 파일(받아 왔거나 로컬, 없으면 템플릿)로 켰다.
+                    self.own_firmware(vm, &mut status);
                     match self.hv.inspect(self.id).await? {
                         Some(state) => {
                             status.phase = VmPhase::Running;
@@ -487,6 +491,7 @@ impl Worker {
         self.disks_active = true;
         // 방금 이 노드에서 켰다(배타).
         self.disks_shared = false;
+        self.fetch_firmware(vm).await;
         // 실패해도 다시 쓰지 않는다.
         let restore = self.restores.lock().unwrap().remove(&self.id);
         let started = self.hv.start(&spec, restore.as_deref()).await;
@@ -508,6 +513,32 @@ impl Worker {
                 self.power_off = Some(Some(format!("failed to start: {e}")));
                 Ok(false)
             }
+        }
+    }
+
+    /// 멈춘 UEFI VM을 새로 켜기 전에, 변수 파일을 가진 노드(`firmware_node`)가 다른 노드면 거기서
+    /// 받아 와 이 노드의 파일을 바꾼다(설계 §5). 받지 못하면(그 노드가 오프라인이다, 파일이 없다 등)
+    /// 경고만 남기고 이 노드의 파일(없으면 템플릿)로 켠다. 도는 VM에 다시 붙거나 마이그레이션을
+    /// 넘겨받을 때는 부르지 않는다(QEMU가 이미 이 노드의 파일을 쓴다).
+    async fn fetch_firmware(&self, vm: &Vm) {
+        let (Some(fetcher), Some(node)) = (&self.config.firmware, vm.status.firmware_node) else {
+            return;
+        };
+        if vm.spec.firmware != Firmware::Uefi || node == self.config.node {
+            return;
+        }
+        match fetcher.fetch(self.id, node).await {
+            Ok(()) => tracing::info!(vm = %self.id, from = %node, "fetched UEFI variables"),
+            Err(e) => {
+                tracing::warn!(vm = %self.id, from = %node, error = %e, "cannot fetch UEFI variables; starting with this node's copy");
+            }
+        }
+    }
+
+    /// UEFI VM이 이 노드의 변수 파일로 돈다: 이 노드를 `firmware_node`로 남긴다. BIOS VM은 그대로 둔다.
+    fn own_firmware(&self, vm: &Vm, status: &mut VmStatus) {
+        if vm.spec.firmware == Firmware::Uefi {
+            status.firmware_node = Some(self.config.node);
         }
     }
 
@@ -618,11 +649,16 @@ impl Worker {
 
     /// `vm`을 읽은 뒤 계산한 status를 기록한다. `snapshot`(현재 스냅샷 위치)과 `schedule_error`는
     /// Task 실행기·예약 작업이 쓰는 값이므로 저장소의 것을 지킨다: revision을 확인하며 쓰고, 그 사이
-    /// 누가 썼으면 다시 읽어 그 값으로 다시 쓴다. 나머지 필드는 전처럼 이 작업자가 계산한 값으로 덮는다.
+    /// 누가 썼으면 다시 읽어 그 값으로 다시 쓴다. `firmware_node`도 이 작업자가 바꾸지 않았으면
+    /// 저장소의 것을 지킨다(스냅샷 되돌리기가 쓴다). 나머지 필드는 전처럼 이 작업자가 계산한 값으로 덮는다.
     async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
+        let keep_firmware = status.firmware_node == vm.status.firmware_node;
         loop {
             status.snapshot = vm.status.snapshot;
             status.schedule_error = vm.status.schedule_error.clone();
+            if keep_firmware {
+                status.firmware_node = vm.status.firmware_node;
+            }
             match self
                 .cluster
                 .update_status_checked::<VmSpec>(self.id, vm.revision, &status)

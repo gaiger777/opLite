@@ -18,7 +18,8 @@ use opl_types::vm::{MacAddr, PowerState, Vm, VmSpec};
 use uuid::Uuid;
 
 use super::snapshot::{
-    check_local, check_settled, copy_file, get_snapshot, get_vm, is_down, ready_disks, vars_copy,
+    check_local, check_settled, copy_file, fetch_vars, get_snapshot, get_vm, is_down, ready_disks,
+    vars_copy,
 };
 use super::{Ctx, mark_ready, remove_volume};
 use crate::volumes::block_pool_kind;
@@ -192,7 +193,10 @@ pub(super) async fn clone(
     if let Some(dir) = &ctx.config.state_dir {
         let from = match snapshot {
             Some(id) => vars_copy(ctx, vm.id, id).expect("state_dir is set"),
-            None => uefi_vars_path(dir, vm.id),
+            None => {
+                fetch_vars(ctx, &vm).await;
+                uefi_vars_path(dir, vm.id)
+            }
         };
         // BIOS VM이거나 한 번도 켠 적 없는 UEFI VM이면 없다.
         if tokio::fs::try_exists(&from).await.unwrap_or(false) {
@@ -201,6 +205,8 @@ pub(super) async fn clone(
             copy_file(&from, &to)
                 .await
                 .map_err(|e| format!("cannot copy UEFI variables: {e}"))?;
+            // 새 VM의 변수는 이 노드에 있다. 다른 노드에서 켜면 여기서 받아 간다.
+            new.status.firmware_node = Some(ctx.config.node);
         }
     }
     for (copy, target) in &copies {

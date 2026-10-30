@@ -46,7 +46,8 @@ async fn starts_assigned_vm_and_records_status() {
             snapshot: None,
             schedule_error: None,
             migration: None,
-            firmware_node: None,
+            // UEFI VM은 켠 노드가 변수 파일을 가진다.
+            firmware_node: Some(env.node),
         }
     );
 }
