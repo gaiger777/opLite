@@ -23390,3 +23390,21 @@ git commit -m "docs: Ceph RBD 풀 안내, 공유 스토리지 설계 4에 구현
 - **같은 Ceph 풀을 여러 opLite 풀(네임스페이스)이 나눠 쓰면** 각자 풀 전체 용량을 보인다.
 - **진행 중 명령 표시는 노드마다 따로다.** 공유 볼륨 Task를 한 노드로 보내 대부분을 막지만, 그 노드가 바뀌는 사이는 막지 못한다.
 - 그 밖의 제한은 설계 문서 §9에 있다.
+
+## 실행 후 기록 (2026-10-30)
+
+9개 Task는 계획대로 적용했고, Task마다 검증된 단계와 트리가 같았다(생성 파일 `schema.d.ts`·`Cargo.lock` 포함). 최종 리뷰(심각·중요 없음)의 작은 지적으로 아래가 바뀌었다(`48f62ec`). 저장소의 코드가 기준이다. 위 Task의 코드 블록은 고치기 전 것이다.
+
+- QEMU rbd 드라이버 확인은 stderr에 `Parameter 'pool' is missing`·`Parameter 'image' is missing`이 있을 때만 드라이버가 있다고 본다(전에는 `pool`·`image`라는 낱말만 있어도 있다고 보고 계속 기억했다).
+
+알고 받아들인 동작(위 제한 목록에 더해):
+- 가져오기는 업로드를 받은 노드에서, VM 디스크의 크기 늘리기·스냅샷은 VM 노드에서 돈다. 그래서 공유 RBD 볼륨의 명령이 늘 한 노드에서 도는 것은 아니다. 한 노드에서 `rbd create`가 시간 제한(60초)을 넘긴 사이 다른 노드에서 볼륨을 지우면, 늦게 끝난 만들기가 `opl-{id}` 이미지를 남길 수 있다(태그 정리는 이미지를 지우지 않는다). 그런 이미지는 관리자가 `rbd rm`으로 지운다.
+- `DriverError::Rbd`는 빨리 돌아오는 클러스터 오류(연결 시간 초과 등)도 영구 오류로 분류한다. VM 시작은 resolve가 풀을 쓸 수 없음으로 바꾸고 Task는 어차피 다시 하지 않으므로, 사용자에게 보이는 오류 종류만 다르다.
+
+테스트: macOS `cargo test --workspace` 602개, `opl-api` `storage-it`, `qemu-it` `smoke`·`e2e`·`snapshots` 11개, 브라우저 E2E, 웹 Vitest 291개, `fmt`·`clippy -D warnings`(모든 기능). 실제 Ceph(`rbd-it`, microceph)·ZFS·LVM·NFS는 Linux CI `linux-kvm`에서.
+CI(확인용 브랜치, 리뷰 수정 전과 같은 트리): `check` 2개, `deny`, `web`, `linux-kvm`(실제 Ceph RBD 드라이버 시험과 E2E, ZFS·LVM·NFS 포함)이 모두 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 계획 19: iSCSI(관리자가 만든 LUN, 또는 그 위의 공유 LVM).
+- 하위 프로젝트 4: 라이브 마이그레이션(RBD·NFS가 바탕), UEFI 변수 공유, 풀 `shared` 바꾸기.
