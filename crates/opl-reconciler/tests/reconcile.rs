@@ -9,7 +9,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::{Env, vm};
 use opl_driver::{
-    Capacity, DriverError, Hypervisor, SourceFormat, StopMode, Storage, VolumeInfo, VolumeSource,
+    Capacity, DriverError, Hypervisor, MigrateOptions, MigrateTarget, SourceFormat, StopMode,
+    Storage, VolumeInfo, VolumeSource,
 };
 use opl_reconciler::ReconcilerConfig;
 use opl_types::node::{Node, NodeSpec, PoolState};
@@ -18,7 +19,8 @@ use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
-    DiskBus, DiskSpec, PowerState, RestartPolicy, ScheduleError, VmPhase, VmSpec, VmStatus,
+    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, ScheduleError, VmPhase, VmSpec,
+    VmStatus,
 };
 use uuid::Uuid;
 
@@ -778,6 +780,24 @@ impl Storage for Activations {
         self.calls.lock().unwrap().push(("deactivate", id));
         Ok(())
     }
+    async fn share_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.calls.lock().unwrap().push(("share", id));
+        Ok(())
+    }
+    async fn exclusive_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.calls.lock().unwrap().push(("exclusive", id));
+        Ok(())
+    }
     async fn create_volume(
         &self,
         _: &StoragePool,
@@ -1159,4 +1179,112 @@ async fn failed_start_deactivates_its_disks() {
         *storage.calls.lock().unwrap(),
         [("activate", root.id), ("deactivate", root.id)]
     );
+}
+
+/// opld가 마이그레이션을 보내다 확정 전에 죽고 다시 떴다: 작업자가 원본을 이어서 실행한 뒤 공유로
+/// 바꿔 둔 디스크를 다시 배타로 바꾼다(한 번).
+#[tokio::test]
+async fn rolled_back_migration_makes_disks_exclusive_again() {
+    let storage = Arc::new(Activations::default());
+    let (mut env, root, vm) = disk_vm(storage.clone()).await;
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    env.stop_reconciler().await;
+    let mut status = env.get(vm.id).status;
+    status.phase = VmPhase::Migrating;
+    status.migration = Some(MigrationStatus {
+        node: Uuid::now_v7(),
+        task: Uuid::now_v7(),
+    });
+    env.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+    let target = MigrateTarget {
+        host: "127.0.0.2".into(),
+        port: 60000,
+        tls_hostname: "127.0.0.2".into(),
+    };
+    let opts = MigrateOptions {
+        bandwidth: None,
+        timeout: Duration::from_secs(60),
+    };
+    env.hv.migrate(vm.id, &target, &opts).await.unwrap();
+    env.start_reconciler();
+
+    env.wait(vm.id, "migration rolled back", |v| {
+        running(v) && v.status.migration.is_none()
+    })
+    .await;
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while !storage
+        .calls
+        .lock()
+        .unwrap()
+        .contains(&("exclusive", root.id))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disk not made exclusive"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        [("activate", root.id), ("exclusive", root.id)]
+    );
+}
+
+/// 디스크가 이 노드만 쓰는 상태인지는 메모리에 없다: opld가 다시 뜨면 작업자가 이미 도는 VM의
+/// 디스크를 다시 배타로 바꾼다(공유 LVM에서 마이그레이션 중 죽었을 수 있다, 한 번).
+#[tokio::test]
+async fn restarted_reconciler_makes_running_disks_exclusive() {
+    let storage = Arc::new(Activations::default());
+    let (mut env, root, vm) = disk_vm(storage.clone()).await;
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(*storage.calls.lock().unwrap(), [("activate", root.id)]);
+
+    env.stop_reconciler().await;
+    env.start_reconciler();
+    wait_exclusive(&storage, root.id).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        [("activate", root.id), ("exclusive", root.id)]
+    );
+}
+
+/// 마이그레이션 Task가 VM을 보류했다 풀었다(실패한 마이그레이션): 작업자가 디스크를 다시 배타로
+/// 바꾼다.
+#[tokio::test]
+async fn disks_are_made_exclusive_after_a_migration_ends() {
+    let storage = Arc::new(Activations::default());
+    let (env, root, vm) = disk_vm(storage.clone()).await;
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    let handle = env.handle();
+    handle.begin_migration(vm.id).await;
+    handle.end_migration(vm.id);
+    wait_exclusive(&storage, root.id).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        [("activate", root.id), ("exclusive", root.id)]
+    );
+}
+
+async fn wait_exclusive(storage: &Activations, id: Uuid) {
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while !storage.calls.lock().unwrap().contains(&("exclusive", id)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disk not made exclusive"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

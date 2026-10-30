@@ -127,6 +127,29 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// 라이브 마이그레이션 동안 원본·대상 두 노드가 볼륨을 함께 쓸 수 있게 한다: 이 노드에서 켜져
+    /// 있으면 다른 노드도 켤 수 있게 바꾸고, 꺼져 있으면 그렇게 켠다. 기본은 할 일이 없다(공유 LVM
+    /// 풀만 LV 잠금을 공유로 바꾼다).
+    async fn share_volume(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    /// [`share_volume`](Self::share_volume)으로 함께 쓰게 한 볼륨을 다시 이 노드만 쓰게 한다. 이
+    /// 노드에서 꺼져 있으면 할 일이 없다. 기본은 할 일이 없다.
+    async fn exclusive_volume(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+
     /// 이 노드에서 `activate_volume`으로 켜져 있는 `pool`의 볼륨들. 켜진 채 남은 볼륨을 찾아 끄는
     /// 정리가 쓴다. 기본은 없다(켜고 끌 것이 없다).
     async fn active_volumes(&self, _pool: &StoragePool) -> Result<Vec<Uuid>, DriverError> {

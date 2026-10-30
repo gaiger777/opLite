@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use opl_cluster::Cluster;
 use opl_driver::{Hypervisor, StopMode, Storage};
 use opl_peer::{IncomingError, IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
-use opl_reconciler::resolve::runtime_spec;
+use opl_reconciler::resolve::incoming_spec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::vm::{MigrationStatus, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
@@ -121,8 +121,9 @@ pub(crate) async fn deactivate_disks(cluster: &Cluster, storage: &dyn Storage, v
 
 #[async_trait]
 impl MigrationReceiver for IncomingMigrations {
-    /// QEMU 버전을 견주고, VM이 이 Task로 이 노드에 오는 중인지 본 뒤 디스크를 켜고 받는 QEMU를
-    /// 띄운다. 실패하면 켠 디스크를 끈다(띄운 QEMU는 드라이버가 끈다).
+    /// QEMU 버전을 견주고, VM이 이 Task로 이 노드에 오는 중인지 본 뒤 디스크를 공유로 켜고(원본이
+    /// 아직 쓴다) 받는 QEMU를 띄운다. 앞선 마이그레이션(다른 Task)의 받는 QEMU가 남아 있으면 먼저
+    /// 끈다. 실패하면 켠 디스크를 끈다(띄운 QEMU는 드라이버가 끈다).
     async fn incoming(&self, req: MigrateIncomingRequest) -> Result<u16, IncomingError> {
         let mine = self
             .hv
@@ -136,14 +137,23 @@ impl MigrationReceiver for IncomingMigrations {
             )));
         }
         let vm = self.wait_migrating_here(req.vm, req.task).await?;
+        let fail = |e: opl_driver::DriverError| IncomingError::Failed(e.to_string());
+        let left = self.hv.list_incoming().await.map_err(fail)?;
+        if left
+            .iter()
+            .any(|&(id, task)| id == req.vm && task != req.task)
+        {
+            tracing::info!(vm = %req.vm, task = %req.task, "stopping the receiving QEMU of an earlier migration");
+            self.hv.stop(req.vm, StopMode::Force).await.map_err(fail)?;
+        }
         let c = &self.config;
-        // 실패하면 runtime_spec이 켠 볼륨을 끈다.
-        let spec = runtime_spec(&self.cluster, &vm, c.node, &c.mount_root, &*c.storage)
+        // 실패하면 incoming_spec이 켠 볼륨을 끈다.
+        let spec = incoming_spec(&self.cluster, &vm, c.node, &c.mount_root, &*c.storage)
             .await
             .map_err(|e| IncomingError::Failed(e.to_string()))?;
         match self
             .hv
-            .start_incoming(&spec, &c.listen_host, c.ports.clone())
+            .start_incoming(&spec, req.task, &c.listen_host, c.ports.clone())
             .await
         {
             Ok(port) => {
@@ -166,9 +176,9 @@ impl MigrationReceiver for IncomingMigrations {
             .map_err(|e| IncomingError::Failed(e.to_string()))
     }
 
-    /// 확정 전이면(`spec.node`가 이 노드가 아니다) 받는 중 표시가 있는 QEMU를 끄고 디스크를 끈다.
-    /// 받는 QEMU가 이미 끝났어도(받기 실패) 디스크는 끈다. 확정됐거나 VM이 다른 마이그레이션 중이면
-    /// 거절하고 아무것도 하지 않는다.
+    /// 확정 전이면(`spec.node`가 이 노드가 아니다) 이 Task의 받는 중 표시가 있는 QEMU를 끄고 디스크를
+    /// 끈다. 받는 QEMU가 이미 끝났어도(받기 실패) 디스크는 끈다. 확정됐거나 VM이 다른 마이그레이션
+    /// 중이면 거절하고 아무것도 하지 않는다. 다른 Task의 받는 QEMU는 그대로 둔다(정리가 끈다).
     async fn abort(&self, req: IncomingMigration) -> Result<(), IncomingError> {
         let vm = self.read_vm(req.vm)?;
         if let Some(vm) = &vm {
@@ -188,13 +198,8 @@ impl MigrationReceiver for IncomingMigrations {
             }
         }
         let fail = |e: opl_driver::DriverError| IncomingError::Failed(e.to_string());
-        if self
-            .hv
-            .list_incoming()
-            .await
-            .map_err(fail)?
-            .contains(&req.vm)
-        {
+        let left = self.hv.list_incoming().await.map_err(fail)?;
+        if left.contains(&(req.vm, req.task)) {
             tracing::info!(vm = %req.vm, task = %req.task, "stopping the receiving QEMU of an aborted migration");
             self.hv.stop(req.vm, StopMode::Force).await.map_err(fail)?;
         } else if self.hv.inspect(req.vm).await.map_err(fail)?.is_some() {

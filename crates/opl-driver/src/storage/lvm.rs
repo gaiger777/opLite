@@ -188,6 +188,9 @@ pub trait LvmOps: Send + Sync {
     -> Result<(), DriverError>;
     /// 이 노드에서만 켠다(`lvchange -aey`). 공유 VG에서 다른 노드가 켜 두었으면 lvmlockd가 거절한다.
     async fn activate_exclusive(&self, vg: &str, name: &str) -> Result<(), DriverError>;
+    /// 다른 노드도 함께 켤 수 있게 켠다(`lvchange -asy`). 이 노드에서 배타로 켜져 있으면 공유로
+    /// 바꾼다. 다른 노드가 배타로 켜 두었으면 lvmlockd가 거절한다.
+    async fn activate_shared(&self, vg: &str, name: &str) -> Result<(), DriverError>;
     /// 켜 둔 LV의 내용을 `offset` 바이트부터 끝까지 0으로 채운다(`blkdiscard -z`). 크기에 비례해
     /// 걸리므로 시간 제한이 없다.
     async fn zero(&self, vg: &str, name: &str, offset: u64) -> Result<(), DriverError>;
@@ -314,6 +317,11 @@ impl LvmOps for SystemLvm {
     async fn activate_exclusive(&self, vg: &str, name: &str) -> Result<(), DriverError> {
         let lv = format!("{vg}/{name}");
         Self::change("lvchange", &["-q", "-aey", &lv], vg, &[name]).await
+    }
+
+    async fn activate_shared(&self, vg: &str, name: &str) -> Result<(), DriverError> {
+        let lv = format!("{vg}/{name}");
+        Self::change("lvchange", &["-q", "-asy", &lv], vg, &[name]).await
     }
 
     /// 새 LV에 옛 데이터의 서명이 남아 있어도 묻지 않는다(`-f`).
@@ -1062,7 +1070,8 @@ fn no_snapshots() -> DriverError {
 
 /// 공유 LVM 풀(`lvm-shared`)의 볼륨. 볼륨은 공유 VG의 두꺼운 LV이고, 쓰는 동안만 이 노드에서
 /// 배타 활성화한다(VM 디스크면 [`activate_volume`](Storage::activate_volume)부터
-/// [`deactivate_volume`](Storage::deactivate_volume)까지). 스냅샷은 없다.
+/// [`deactivate_volume`](Storage::deactivate_volume)까지). 라이브 마이그레이션 동안만 원본·대상이
+/// 공유로 켠다([`share_volume`](Storage::share_volume)). 스냅샷은 없다.
 pub struct LvmSharedStorage {
     qemu_img: PathBuf,
     ops: Arc<dyn LvmOps>,
@@ -1349,6 +1358,51 @@ impl Storage for LvmSharedStorage {
             Ok(_) | Err(DriverError::VolumeNotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// LV 잠금을 공유로 바꾸거나(이 노드에서 켜져 있으면, 마이그레이션 원본) 공유로 켠다(꺼져
+    /// 있으면, 받는 노드). 원본이 시작할 때 크기 늘리기가 남긴 0 채우기를 마쳤으므로 여기서는 채우지
+    /// 않는다. 다른 노드가 배타로 켜 두었거나 이 노드가 0으로 채우는 중이거나 그 LV를 바꾸는 명령이
+    /// 도는 중이면 일시 오류다.
+    async fn share_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let vg = Self::target(pool, format)?;
+        let name = volume_lv(id);
+        let _zeroing = Zeroing::begin(&self.zeroing, vg, &name)?;
+        if self.ops.changing(vg, &name) {
+            return Err(DriverError::Timeout(
+                "an earlier lvm command still running on the volume",
+            ));
+        }
+        self.existing(vg, id).await?;
+        self.ops
+            .activate_shared(vg, &name)
+            .await
+            .map_err(held_elsewhere)
+    }
+
+    /// 이 노드에서 켜져 있으면 LV 잠금을 다시 배타로 바꾼다(`lvchange -aey`). 꺼져 있으면 켜지 않는다.
+    /// 다른 노드가 아직 공유로 켜 두었으면(마이그레이션의 다른 쪽이 아직 끄지 않았다) 일시 오류다.
+    async fn exclusive_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let vg = Self::target(pool, format)?;
+        let name = volume_lv(id);
+        let _zeroing = Zeroing::begin(&self.zeroing, vg, &name)?;
+        if !self.existing(vg, id).await?.is_active() {
+            return Ok(());
+        }
+        self.ops
+            .activate_exclusive(vg, &name)
+            .await
+            .map_err(held_elsewhere)
     }
 
     /// 이 노드에서 켜져 있는 볼륨 LV(`opl-{id}`). 다른 노드가 켠 LV는 이 노드에서 꺼져 보인다.
@@ -1847,6 +1901,15 @@ mod tests {
 
         async fn activate_exclusive(&self, vg: &str, name: &str) -> Result<(), DriverError> {
             self.call(format!("activate-ex {vg}/{name}"))?;
+            self.check_held(name)?;
+            let mut lvs = self.lvs.lock().unwrap();
+            lvs.get_mut(name).ok_or_else(|| Self::missing(name))?.active = true;
+            self.sync_nodes(&lvs);
+            Ok(())
+        }
+
+        async fn activate_shared(&self, vg: &str, name: &str) -> Result<(), DriverError> {
+            self.call(format!("activate-sh {vg}/{name}"))?;
             self.check_held(name)?;
             let mut lvs = self.lvs.lock().unwrap();
             lvs.get_mut(name).ok_or_else(|| Self::missing(name))?.active = true;
@@ -2959,6 +3022,88 @@ mod tests {
         storage.deactivate_volume(&p, id, RAW).await.unwrap();
         assert_eq!(lvm.taken(), [format!("deactivate vg0/{lv}")]);
         assert!(!lvm.lv(&lv).unwrap().active);
+    }
+
+    /// 마이그레이션: 켜 둔 LV(원본)는 공유로 바꾸고 꺼진 LV(대상)는 공유로 켠다. 남은 0 채우기는
+    /// 하지 않는다. 다른 노드가 배타로 켜 두었거나 이 노드가 채우는 중이거나 LV를 바꾸는 명령이 도는
+    /// 중이면 일시 오류다.
+    #[tokio::test]
+    async fn shared_volume_for_a_migration() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        let err = storage.share_volume(&p, id, RAW).await.unwrap_err();
+        assert!(matches!(err, DriverError::VolumeNotFound(_)), "{err:?}");
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        storage.activate_volume(&p, id, RAW).await.unwrap();
+        lvm.taken();
+
+        storage.share_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), [format!("activate-sh vg0/{lv}")]);
+        assert!(lvm.lv(&lv).unwrap().active);
+
+        // 받는 노드: 꺼져 있으면 공유로 켠다. 늘리기가 남긴 표시가 있어도 채우지 않는다.
+        lvm.lvs.lock().unwrap().get_mut(&lv).unwrap().active = false;
+        lvm.tags
+            .lock()
+            .unwrap()
+            .insert(lv.clone(), vec![format!("{ZERO_FROM_TAG}4096")]);
+        storage.share_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), [format!("activate-sh vg0/{lv}")]);
+        assert!(lvm.lv(&lv).unwrap().active);
+
+        lvm.held.lock().unwrap().push(lv.clone());
+        held(storage.share_volume(&p, id, RAW).await.unwrap_err());
+        lvm.held.lock().unwrap().clear();
+        lvm.busy.lock().unwrap().push(lv.clone());
+        let err = storage.share_volume(&p, id, RAW).await.unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        lvm.busy.lock().unwrap().clear();
+        let zeroing = format!("vg0/{lv}");
+        storage.zeroing.lock().unwrap().insert(zeroing.clone());
+        let err = storage.share_volume(&p, id, RAW).await.unwrap_err();
+        assert!(matches!(err, DriverError::Timeout(LV_ZEROING)), "{err:?}");
+        storage.zeroing.lock().unwrap().remove(&zeroing);
+        assert_eq!(lvm.taken(), [format!("activate-sh vg0/{lv}")]);
+        invalid(
+            storage
+                .share_volume(&p, id, ImageFormat::Qcow2)
+                .await
+                .unwrap_err(),
+            "lvm-shared pools hold raw volumes",
+        );
+    }
+
+    /// 마이그레이션 뒤: 이 노드에서 켜져 있으면 다시 배타로 바꾸고, 꺼져 있으면 켜지 않는다. 다른
+    /// 노드가 아직 공유로 켜 두었으면 일시 오류다.
+    #[tokio::test]
+    async fn exclusive_volume_after_a_migration() {
+        let (lvm, storage) = setup_shared("/nonexistent/qemu-img");
+        let (p, id) = (shared_pool(), Uuid::now_v7());
+        let lv = format!("opl-{id}");
+        storage.create_volume(&p, id, 1 << 20, RAW).await.unwrap();
+        lvm.taken();
+
+        storage.exclusive_volume(&p, id, RAW).await.unwrap();
+        assert!(lvm.taken().is_empty());
+        assert!(!lvm.lv(&lv).unwrap().active);
+
+        storage.share_volume(&p, id, RAW).await.unwrap();
+        lvm.held.lock().unwrap().push(lv.clone());
+        lvm.taken();
+        held(storage.exclusive_volume(&p, id, RAW).await.unwrap_err());
+        assert!(lvm.lv(&lv).unwrap().active);
+        lvm.held.lock().unwrap().clear();
+
+        storage.exclusive_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("activate-ex vg0/{lv}"),
+                format!("activate-ex vg0/{lv}")
+            ]
+        );
+        assert!(lvm.lv(&lv).unwrap().active);
     }
 
     /// 이 노드에서 켜져 있는 볼륨 LV(`opl-{id}`)만 알린다. 꺼진 볼륨 LV와 opLite 밖의 LV는 빼고 LVM

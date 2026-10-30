@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::backoff::{FailureTracker, Next};
 use crate::config::ReconcilerConfig;
 use crate::reconciler::{Held, Restores};
-use crate::resolve::{ResolveError, running_spec, runtime_spec};
+use crate::resolve::{ResolveError, running_spec, runtime_spec, set_disks_shared};
 
 /// 실행 중이던 VM이 사라졌을 때 그 이유를 알리는 종료 이벤트를 기다리는 시간.
 /// 이벤트보다 재동기화가 먼저 오면, 게스트가 스스로 끈 VM을 다시 켰다가 끄게 된다.
@@ -81,6 +81,14 @@ pub(crate) struct Worker {
     /// 디스크 볼륨이 켜져 있을 수 있다(시작하려고 켰거나 VM이 도는 것을 봤다). QEMU가 끝난 것을
     /// 확인하면 끈다([`Worker::deactivate_disks`]).
     disks_active: bool,
+    /// 라이브 마이그레이션이 디스크 볼륨을 원본·대상이 함께 쓰게 해 두었을 수 있다(받은 VM을
+    /// 넘겨받았거나, 남은 마이그레이션을 되돌렸거나, 마이그레이션 Task가 보류했다 풀었다). VM이 도는
+    /// 동안 다시 이 노드만 쓰게 한다([`Worker::exclusive_disks`], 성공할 때까지). 저장소에 남지 않는
+    /// 상태이므로 이 작업자가 직접 켜서 시작한 것이 아니면 참으로 시작한다(opld 재시작이나 넘겨받기
+    /// 뒤 이미 도는 VM에 다시 붙으면 한 번 배타로 바꾼다, 멱등).
+    disks_shared: bool,
+    /// 보류 중에 받은 마지막 수명 이벤트(원본 QEMU의 크래시 등). 보류가 풀리면 처리한다.
+    held_event: Option<EventKind>,
     wake_at: Option<Instant>,
 }
 
@@ -109,6 +117,8 @@ impl Worker {
             was_running: false,
             awaiting_event: None,
             disks_active: false,
+            disks_shared: true,
+            held_event: None,
             wake_at: None,
         }
     }
@@ -132,8 +142,10 @@ impl Worker {
                 None => rx.recv().await,
             };
             let Some(trigger) = trigger else { return };
-            // 트리거는 차례로 처리하므로 앞의 단계는 이미 끝났다.
+            // 트리거는 차례로 처리하므로 앞의 단계는 이미 끝났다. 마이그레이션 Task가 디스크를
+            // 공유로 바꿀 수 있으므로 보류가 풀린 뒤 다시 배타로 바꾼다.
             if let Trigger::Barrier(done) = trigger {
+                self.disks_shared = true;
                 let _ = done.send(());
                 continue;
             }
@@ -150,13 +162,19 @@ impl Worker {
     }
 
     async fn step(&mut self, trigger: Trigger) -> Result<(), StepError> {
-        // 마이그레이션 Task가 status와 QEMU를 다룬다. 끝나면(`end_migration`) 다시 깨운다.
+        // 마이그레이션 Task가 status와 QEMU를 다룬다. 끝나면(`end_migration`) 다시 깨운다. 그동안
+        // QEMU가 끝났으면(크래시 등) 보류가 풀린 뒤 그 이벤트대로 다룬다(재시작 정책).
         if self.held.lock().unwrap().contains(&self.id) {
+            if let Trigger::Event(kind) = trigger {
+                self.held_event = Some(kind);
+            }
             return Ok(());
         }
         let node = self.config.node;
         let vm = self.cluster.get::<VmSpec>(self.id)?;
         let Some(mut vm) = vm.filter(|vm| vm.spec.node == Some(node)) else {
+            // 다른 노드로 옮겼다(보낸 원본이 꺼진 이벤트).
+            self.held_event = None;
             // 삭제되었거나 다른 노드로 배정되었다. 돌고 있더라도 멋대로 끄지 않는다.
             if self.hv.inspect(self.id).await?.is_some() {
                 tracing::warn!(vm = %self.id, "VM is running but not assigned to this node; leaving it alone");
@@ -165,13 +183,19 @@ impl Worker {
         };
         if vm.status.migration.is_some() || vm.status.phase == VmPhase::Migrating {
             match self.clear_migration(&vm).await? {
-                Some(current) => vm = current,
+                Some(current) => {
+                    self.disks_shared = true;
+                    vm = current;
+                }
                 // 그 사이 바뀌었다. 다시 읽어 맞춘다.
                 None => {
                     self.wake(Instant::now());
                     return Ok(());
                 }
             }
+        }
+        if let Some(kind) = self.held_event.take() {
+            self.on_event(&vm, kind);
         }
         match trigger {
             Trigger::Event(kind) => self.on_event(&vm, kind),
@@ -250,7 +274,22 @@ impl Worker {
     /// 원하는 상태를 향해 한 걸음 움직이고, 기록해야 할 status를 돌려준다. 그 전에 status를 먼저
     /// 기록했으면 `vm`을 다시 읽은 것으로 바꾼다.
     async fn reconcile(&mut self, vm: &mut Vm) -> Result<VmStatus, StepError> {
-        let actual = self.hv.inspect(self.id).await?;
+        let mut actual = self.hv.inspect(self.id).await?;
+        if let Some(state) = &actual
+            && state.status == postmigrate()
+            && !(vm.status.node == Some(self.config.node)
+                && matches!(vm.status.phase, VmPhase::Running | VmPhase::Migrating))
+        {
+            // 확정은 늘 status.node를 대상으로 바꾼다. 이 노드에서 돌던 VM이 아니면 다른 노드로 확정된
+            // 마이그레이션의 원본이 정리되지 않고 남은 것이다(그 뒤 VM이 이 노드로 다시 옮겨졌다). 멈춘
+            // 메모리는 그 사이 바뀐 디스크와 맞지 않으므로 이어서 실행하지 않고 끈 뒤 새로 시작한다.
+            tracing::warn!(vm = %self.id, "stopping the stale source of a migration committed elsewhere");
+            self.stopped_by_us = Some(Instant::now());
+            if !self.hv.stop_migrated(self.id).await? {
+                self.hv.stop(self.id, StopMode::Force).await?;
+            }
+            actual = self.hv.inspect(self.id).await?;
+        }
         let mut status = vm.status.clone();
         status.node = Some(self.config.node);
         let now = Instant::now();
@@ -274,10 +313,19 @@ impl Worker {
                     // 붙어 있으면 디스크를 다시 해석하지 않고(LVM이 응답하지 않을 수 있다) 이어서
                     // 실행하고, 아니면 start()가 다시 붙는다. 실패해도 돌고 있는 VM이므로 끄거나
                     // 실패로 세지 않는다.
-                    let mut continued = match self.hv.resume_left_stopped(self.id).await {
-                        Ok(true) => Ok(()),
-                        Ok(false) => self.reattach(vm).await,
-                        Err(e) => Err(e.to_string()),
+                    let mut continued = if state.status == postmigrate() {
+                        // 마이그레이션을 보내고 멈춘 원본인데 이 노드에서 돌던 VM이고(위에서 가렸다)
+                        // 표시가 없고(위에서 지웠다) 마이그레이션 Task도 다루지 않는다(보류가 아니다). 확정 쓰기는 표시가
+                        // 있는 revision에서만 적용되므로 이제 확정될 수 없다: 이어서 실행한다(되돌리기의
+                        // 재개 실패, 되돌린 뒤 끝난 마이그레이션).
+                        tracing::warn!(vm = %self.id, "resuming the source of a migration that was not committed");
+                        self.hv.resume(self.id).await.map_err(|e| e.to_string())
+                    } else {
+                        match self.hv.resume_left_stopped(self.id).await {
+                            Ok(true) => Ok(()),
+                            Ok(false) => self.reattach(vm).await,
+                            Err(e) => Err(e.to_string()),
+                        }
                     };
                     // 이 노드로 마이그레이션을 받아 멈춰 있는 QEMU다(확정되어 이 노드에 배정됐다).
                     // 받는 중 표시가 있을 때만 이어서 실행하고 표시를 지운다.
@@ -287,12 +335,16 @@ impl Worker {
                             .finish_incoming(self.id)
                             .await
                             .map_err(|e| e.to_string());
+                        self.disks_shared |= continued.is_ok();
                     }
                     if let Err(e) = continued {
                         tracing::warn!(vm = %self.id, error = %e, "VM is unresponsive; will retry");
                         status.last_error = Some(format!("VM is unresponsive: {e}"));
                         self.wake(now + self.config.retry_interval);
                     }
+                }
+                if self.disks_shared && status.last_error.is_none() {
+                    self.exclusive_disks(vm).await;
                 }
             }
             // 방금까지 돌던 VM이 사라졌다. 왜 꺼졌는지(게스트 종료, 크래시) 이벤트로 안 뒤에 움직인다.
@@ -433,6 +485,8 @@ impl Worker {
             }
         };
         self.disks_active = true;
+        // 방금 이 노드에서 켰다(배타).
+        self.disks_shared = false;
         // 실패해도 다시 쓰지 않는다.
         let restore = self.restores.lock().unwrap().remove(&self.id);
         let started = self.hv.start(&spec, restore.as_deref()).await;
@@ -460,6 +514,8 @@ impl Worker {
     /// 켜져 있을 수 있는 디스크 볼륨을 끈다(QEMU가 끝난 뒤). 끄지 못하면 경고만 남긴다(켜진 채 남은
     /// 볼륨은 Task 실행기의 정리가 다시 끈다).
     async fn deactivate_disks(&mut self, vm: &Vm) {
+        // 끄면 공유도 풀린다.
+        self.disks_shared = false;
         if !std::mem::take(&mut self.disks_active) {
             return;
         }
@@ -495,11 +551,29 @@ impl Worker {
         }
     }
 
+    /// 도는 VM의 디스크 볼륨을 다시 이 노드만 쓰게 한다(공유 LVM은 배타 잠금). 마이그레이션의 다른
+    /// 쪽 노드가 아직 볼륨을 끄지 않았으면(원본이 정리 전이다) 잠시 뒤 다시 한다. 그동안에도 VM은
+    /// 돈다.
+    async fn exclusive_disks(&mut self, vm: &Vm) {
+        match set_disks_shared(&self.cluster, vm, &*self.config.storage, false).await {
+            Ok(()) => self.disks_shared = false,
+            Err(e @ (ResolveError::PoolUnavailable(..) | ResolveError::Cluster(_))) => {
+                tracing::info!(vm = %self.id, error = %e, "disks are still shared with another node; will retry");
+                self.wake(Instant::now() + self.config.retry_interval);
+            }
+            Err(e) => {
+                tracing::warn!(vm = %self.id, error = %e, "cannot make disks exclusive to this node again");
+                self.disks_shared = false;
+            }
+        }
+    }
+
     /// 끝나지 않은 채 남은 마이그레이션 표시(`Migrating`, `status.migration`)를 지운다. 이 노드의
     /// 마이그레이션 Task가 다루지 않는 VM이므로, 원본 opld가 확정 전에 죽었거나(원본 노드) 확정 뒤
     /// 넘겨받는 중이다(대상 노드). 읽은 revision으로만 쓰므로 그 사이 확정되었으면(남은 확정 쓰기가
     /// 먼저 적용됨) 쓰지 않고 `None`이다. 쓰고 나면 그 확정은 더는 적용되지 않으므로, 이 노드의 QEMU가
-    /// 마이그레이션을 보내고 멈춰 있으면(`postmigrate`) 이어서 실행한다. 대상의 QEMU는 확정 뒤에만
+    /// 아직 보내고 있으면 취소하고(나중에 끝나 원본이 멈추지 않게), 마이그레이션을 보내고 멈춰 있으면
+    /// (`postmigrate`, 취소하는 사이에 끝난 경우 포함) 이어서 실행한다. 대상의 QEMU는 확정 뒤에만
     /// 돌므로 두 QEMU가 함께 돌지 않는다. 다시 읽은 VM을 돌려준다.
     async fn clear_migration(&self, vm: &Vm) -> Result<Option<Vm>, StepError> {
         let mut status = vm.status.clone();
@@ -515,8 +589,9 @@ impl Worker {
             Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => return Ok(None),
             r => r?,
         };
+        self.hv.cancel_migration(self.id).await?;
         if let Some(state) = self.hv.inspect(self.id).await?
-            && state.status == RuntimeStatus::Other("postmigrate".into())
+            && state.status == postmigrate()
         {
             tracing::warn!(vm = %self.id, "resuming the source of a migration that did not complete");
             self.hv.resume(self.id).await?;
@@ -597,4 +672,8 @@ impl Worker {
         self.failures.clear();
         Ok(())
     }
+}
+
+fn postmigrate() -> RuntimeStatus {
+    RuntimeStatus::Other("postmigrate".into())
 }

@@ -50,8 +50,9 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(540);
 /// 지운다. opld가 멈춘 채 죽었으면 다시 붙을 때 이 표시를 보고 이어서 실행한다.
 const PAUSED_MARK: &str = "paused-by-opl";
 
-/// 라이브 마이그레이션을 받는 QEMU라는 표시 파일. `start_incoming`이 QEMU를 띄우기 전에 실행
-/// 디렉터리에 쓰고 `finish_incoming`이 지운다. QEMU가 끝나면 실행 디렉터리와 함께 사라진다.
+/// 라이브 마이그레이션을 받는 QEMU라는 표시 파일(내용은 마이그레이션 Task id). `start_incoming`이
+/// QEMU를 띄우기 전에 실행 디렉터리에 쓰고 `finish_incoming`이 지운다. QEMU가 끝나면 실행 디렉터리와
+/// 함께 사라진다.
 const INCOMING_MARK: &str = "incoming";
 /// 마이그레이션 상태를 다시 묻는 간격(`MIGRATION` 이벤트를 놓쳐도 이만큼 뒤에 안다)
 const MIGRATION_POLL: Duration = Duration::from_secs(1);
@@ -104,8 +105,8 @@ pub struct QemuHypervisor {
 enum Launch<'a> {
     /// 띄우고(스냅샷 태그가 있으면 불러온 뒤) 이어서 실행한다.
     Start { restore: Option<&'a str> },
-    /// `-incoming defer`로 띄우고 받는 중 표시를 남긴다. 멈춘 채 둔다.
-    Incoming,
+    /// `-incoming defer`로 띄우고 받는 중 표시(마이그레이션 Task)를 남긴다. 멈춘 채 둔다.
+    Incoming { task: Uuid },
 }
 
 struct VmHandle {
@@ -247,13 +248,13 @@ impl QemuHypervisor {
 
         let args = match how {
             Launch::Start { .. } => build_cmdline(vm, &self.config.host, paths),
-            Launch::Incoming => build_incoming_cmdline(vm, &self.config.host, paths),
+            Launch::Incoming { .. } => build_incoming_cmdline(vm, &self.config.host, paths),
         };
         let mut args = args.map_err(|e| DriverError::InvalidSpec(e.to_string()))?;
         args.push("-daemonize".into());
-        if let Launch::Incoming = how {
+        if let Launch::Incoming { task } = how {
             // 띄우는 도중에 opld가 죽어도 남은 QEMU가 받는 쪽임을 알 수 있게 먼저 쓴다.
-            std::fs::write(paths.dir.join(INCOMING_MARK), b"")?;
+            std::fs::write(paths.dir.join(INCOMING_MARK), task.to_string())?;
         }
         self.create_taps(vm).await?;
         let mut cmd = if self.config.systemd_scope {
@@ -297,7 +298,7 @@ impl QemuHypervisor {
         let restore = match how {
             Launch::Start { restore } => restore,
             // 받기를 마칠 때까지 멈춰 둔다.
-            Launch::Incoming => return Ok(()),
+            Launch::Incoming { .. } => return Ok(()),
         };
         if let Some(tag) = restore {
             // -S로 멈춘 채 불러온 뒤 cont로 이어서 실행한다. 메모리 상태는 첫 디스크(disk0)에 있다.
@@ -773,6 +774,7 @@ impl Hypervisor for QemuHypervisor {
     async fn start_incoming(
         &self,
         vm: &VmRuntimeSpec,
+        task: Uuid,
         listen_host: &str,
         ports: RangeInclusive<u16>,
     ) -> Result<u16, DriverError> {
@@ -783,7 +785,7 @@ impl Hypervisor for QemuHypervisor {
                 vm.id
             )));
         }
-        if let Err(e) = self.launch(vm, &paths, Launch::Incoming).await {
+        if let Err(e) = self.launch(vm, &paths, Launch::Incoming { task }).await {
             if self.handle(vm.id).is_none() {
                 self.kill_and_cleanup(vm.id, &paths).await;
             } else if let Err(stop) = self.stop(vm.id, StopMode::Force).await {
@@ -846,7 +848,7 @@ impl Hypervisor for QemuHypervisor {
         Ok(())
     }
 
-    async fn list_incoming(&self) -> Result<Vec<Uuid>, DriverError> {
+    async fn list_incoming(&self) -> Result<Vec<(Uuid, Uuid)>, DriverError> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(self.config.run_dir.join("vm"))? {
             let entry = entry?;
@@ -858,9 +860,14 @@ impl Hypervisor for QemuHypervisor {
                 continue;
             };
             let paths = self.paths(id)?;
-            if paths.dir.join(INCOMING_MARK).exists() && liveness(&paths.pidfile) != Liveness::Dead
-            {
-                out.push(id);
+            let mark = paths.dir.join(INCOMING_MARK);
+            if mark.exists() && liveness(&paths.pidfile) != Liveness::Dead {
+                // 읽을 수 없으면 어느 마이그레이션과도 맞지 않는 nil로 둔다(정리가 끈다).
+                let task = std::fs::read_to_string(&mark)
+                    .ok()
+                    .and_then(|s| Uuid::parse_str(s.trim()).ok())
+                    .unwrap_or_default();
+                out.push((id, task));
             }
         }
         Ok(out)
@@ -924,6 +931,32 @@ impl Hypervisor for QemuHypervisor {
         tracing::info!(%id, "stopping migrated source QEMU");
         self.stop(id, StopMode::Force).await?;
         Ok(true)
+    }
+
+    async fn cancel_migration(&self, id: Uuid) -> Result<(), DriverError> {
+        let handle = match self.running_handle(id) {
+            Ok(handle) => handle,
+            Err(DriverError::NotRunning(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        // 받는 QEMU의 마이그레이션은 보내는 쪽이 다룬다.
+        if handle.paths.dir.join(INCOMING_MARK).exists() {
+            return Ok(());
+        }
+        let info = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_migrate()).await;
+        let info = flatten(info, "QMP query-migrate")?;
+        if info.state == MigrationState::None || info.state.is_finished() {
+            return Ok(());
+        }
+        tracing::warn!(%id, state = ?info.state, "cancelling an outgoing migration");
+        let cancel = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.migrate_cancel()).await;
+        flatten(cancel, "QMP migrate_cancel")?;
+        let wait = handle.qmp.wait_migration(MIGRATION_POLL);
+        flatten(
+            tokio::time::timeout(CANCEL_WAIT, wait).await,
+            "migration to cancel",
+        )?;
+        Ok(())
     }
 
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
@@ -1637,6 +1670,43 @@ time.sleep(60)
         assert!(arguments[at].get("max-bandwidth").is_none());
     }
 
+    /// 보내는 중인 마이그레이션만 취소하고 끝(`cancelled`)을 기다린다.
+    #[tokio::test]
+    async fn cancel_migration_cancels_only_an_outgoing_migration() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let (sending, idle, receiving) = (spec(), spec(), spec());
+        let dirs: Vec<PathBuf> = [&sending, &idle, &receiving]
+            .iter()
+            .map(|vm| cfg.run_dir.join("vm").join(vm.id.to_string()))
+            .collect();
+        let mut qemus = Vec::new();
+        for dir in &dirs {
+            qemus.push(hold_pidfile(dir).await);
+        }
+        std::fs::write(dirs[2].join(INCOMING_MARK), b"").unwrap();
+        let fake_sending = fake_qmp_with(&dirs[0], "running", "active").await;
+        let fake_idle = fake_qmp_with(&dirs[1], "running", "none").await;
+        let fake_receiving = fake_qmp_with(&dirs[2], "inmigrate", "active").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+
+        hv.cancel_migration(sending.id).await.unwrap();
+        let commands = fake_sending.commands.lock().unwrap().clone();
+        let cancel = commands.iter().position(|c| c == "migrate_cancel").unwrap();
+        assert!(commands[cancel + 1..].contains(&"query-migrate".to_string()));
+
+        hv.cancel_migration(idle.id).await.unwrap();
+        hv.cancel_migration(receiving.id).await.unwrap();
+        hv.cancel_migration(Uuid::now_v7()).await.unwrap();
+        for fake in [&fake_idle, &fake_receiving] {
+            let commands = fake.commands.lock().unwrap().clone();
+            assert!(
+                !commands.contains(&"migrate_cancel".to_string()),
+                "{commands:?}"
+            );
+        }
+    }
+
     /// 받은 VM은 멈춰 있으면 이어서 실행하고 표시를 지운다. 아직 받는 중이면 건드리지 않는다.
     #[tokio::test]
     async fn finish_incoming_continues_only_received_vms() {
@@ -1647,7 +1717,9 @@ time.sleep(60)
         let dir_b = cfg.run_dir.join("vm").join(receiving.id.to_string());
         let _qa = hold_pidfile(&dir_a).await;
         let _qb = hold_pidfile(&dir_b).await;
-        std::fs::write(dir_a.join(INCOMING_MARK), b"").unwrap();
+        // 표시에는 마이그레이션 Task가 있다. 읽을 수 없으면 nil이다.
+        let task = Uuid::now_v7();
+        std::fs::write(dir_a.join(INCOMING_MARK), format!("{task}\n")).unwrap();
         std::fs::write(dir_b.join(INCOMING_MARK), b"").unwrap();
         let fake_a = fake_qmp(&dir_a, "paused").await;
         let fake_b = fake_qmp_with(&dir_b, "inmigrate", "active").await;
@@ -1655,7 +1727,7 @@ time.sleep(60)
 
         let mut incoming = hv.list_incoming().await.unwrap();
         incoming.sort();
-        let mut expected = vec![received.id, receiving.id];
+        let mut expected = vec![(received.id, task), (receiving.id, Uuid::nil())];
         expected.sort();
         assert_eq!(incoming, expected);
         // 받는 중인 VM은 reconciler의 이어 가기에도 이어서 실행되지 않는다.
@@ -1683,7 +1755,10 @@ time.sleep(60)
                 .contains(&"cont".to_string())
         );
         assert!(!dir_a.join(INCOMING_MARK).exists());
-        assert_eq!(hv.list_incoming().await.unwrap(), vec![receiving.id]);
+        assert_eq!(
+            hv.list_incoming().await.unwrap(),
+            vec![(receiving.id, Uuid::nil())]
+        );
         // 표시가 없으면 아무것도 하지 않고, 기다릴 것도 없다.
         hv.finish_incoming(received.id).await.unwrap();
         assert!(matches!(
@@ -1729,7 +1804,7 @@ time.sleep(60)
         let fake = fake_qmp(&dir, "running").await;
         let hv = QemuHypervisor::new(cfg).await.unwrap();
         let err = hv
-            .start_incoming(&vm, "127.0.0.1", 60000..=60099)
+            .start_incoming(&vm, Uuid::now_v7(), "127.0.0.1", 60000..=60099)
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::Migration(_)), "{err:?}");
@@ -1747,7 +1822,7 @@ time.sleep(60)
             .unwrap();
         let vm = spec();
         let err = hv
-            .start_incoming(&vm, "127.0.0.1", 60000..=60099)
+            .start_incoming(&vm, Uuid::now_v7(), "127.0.0.1", 60000..=60099)
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::StartFailed(_)), "{err:?}");

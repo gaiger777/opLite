@@ -15,7 +15,7 @@ use opl_driver::{
     Capacity, DirStorage, DriverError, Hypervisor, MockHypervisor, Storage, VolumeInfo,
     VolumeSource,
 };
-use opl_reconciler::{Reconciler, ReconcilerConfig, RestartBackoff};
+use opl_reconciler::{Reconciler, ReconcilerConfig, ReconcilerHandle, RestartBackoff};
 use opl_types::auth::{Role, UserSpec};
 use opl_types::node::{NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
@@ -217,6 +217,11 @@ impl Env {
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         self.login(name, "password-1").await
+    }
+
+    /// reconciler의 핸들(마이그레이션 보류 등)
+    pub fn reconciler(&self) -> ReconcilerHandle {
+        self.reconciler.as_ref().unwrap().handle()
     }
 
     pub async fn stop_runner(&mut self) {
@@ -469,6 +474,8 @@ pub struct FakeStorage {
     active: std::sync::Mutex<Vec<(String, Uuid)>>,
     /// 끄는 데 이만큼 걸리는 볼륨
     slow_deactivates: std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Duration>>,
+    /// 남은 횟수만큼 `exclusive_volume`이 일시 오류다(다른 노드가 아직 공유로 켜 두었다).
+    held_exclusives: std::sync::Mutex<usize>,
 }
 
 impl FakeStorage {
@@ -535,6 +542,11 @@ impl FakeStorage {
     /// 풀 `pool`의 볼륨 `id`가 이 노드에서 켜져 있는 것으로 둔다.
     pub fn set_active(&self, pool: &str, id: Uuid) {
         self.active.lock().unwrap().push((pool.into(), id));
+    }
+
+    /// 다음 `n`번의 `exclusive_volume`이 (호출을 기록한 뒤) 일시 오류다.
+    pub fn hold_exclusives(&self, n: usize) {
+        *self.held_exclusives.lock().unwrap() = n;
     }
 
     /// 볼륨 `id`를 끄는 데 `delay`가 걸리게 한다(호출은 바로 적는다).
@@ -661,6 +673,31 @@ impl Storage for FakeStorage {
             tokio::time::sleep(delay).await;
         }
         self.active.lock().unwrap().retain(|(_, v)| *v != id);
+        Ok(())
+    }
+    /// 호출을 `share`로 적는다.
+    async fn share_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.calls.lock().unwrap().push(("share", id));
+        Ok(())
+    }
+    /// 호출을 `exclusive`로 적는다.
+    async fn exclusive_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.calls.lock().unwrap().push(("exclusive", id));
+        let mut held = self.held_exclusives.lock().unwrap();
+        if *held > 0 {
+            *held -= 1;
+            return Err(DriverError::Timeout("another node to stop using the lv"));
+        }
         Ok(())
     }
     async fn active_volumes(&self, pool: &StoragePool) -> Result<Vec<Uuid>, DriverError> {

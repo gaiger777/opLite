@@ -234,6 +234,24 @@ impl Storage for Storages {
             .await
     }
 
+    async fn share_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.backend(pool)?.share_volume(pool, id, format).await
+    }
+
+    async fn exclusive_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.backend(pool)?.exclusive_volume(pool, id, format).await
+    }
+
     async fn active_volumes(&self, pool: &StoragePool) -> Result<Vec<Uuid>, DriverError> {
         self.backend(pool)?.active_volumes(pool).await
     }
@@ -591,6 +609,22 @@ mod tests {
         ) -> Result<(), DriverError> {
             self.call("deactivate_volume")
         }
+        async fn share_volume(
+            &self,
+            _: &StoragePool,
+            _: Uuid,
+            _: ImageFormat,
+        ) -> Result<(), DriverError> {
+            self.call("share_volume")
+        }
+        async fn exclusive_volume(
+            &self,
+            _: &StoragePool,
+            _: Uuid,
+            _: ImageFormat,
+        ) -> Result<(), DriverError> {
+            self.call("exclusive_volume")
+        }
         async fn active_volumes(&self, _: &StoragePool) -> Result<Vec<Uuid>, DriverError> {
             self.call("active_volumes")?;
             Ok(Vec::new())
@@ -830,6 +864,8 @@ mod tests {
             storages.delete_volume(&p, id, f).await.unwrap();
             storages.activate_volume(&p, id, f).await.unwrap();
             storages.deactivate_volume(&p, id, f).await.unwrap();
+            storages.share_volume(&p, id, f).await.unwrap();
+            storages.exclusive_volume(&p, id, f).await.unwrap();
             storages.active_volumes(&p).await.unwrap();
             storages.volume_info(&p, id, f).await.unwrap();
             storages.capacity(&p).await.unwrap();
@@ -857,6 +893,8 @@ mod tests {
                 "delete_volume",
                 "activate_volume",
                 "deactivate_volume",
+                "share_volume",
+                "exclusive_volume",
                 "active_volumes",
                 "volume_info",
                 "capacity",

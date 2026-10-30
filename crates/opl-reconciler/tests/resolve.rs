@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use opl_cluster::memnet::MemRouter;
 use opl_driver::{Capacity, DriverError, SourceFormat, Storage, VolumeInfo, VolumeSource};
-use opl_reconciler::resolve::{ResolveError, runtime_spec};
+use opl_reconciler::resolve::{ResolveError, incoming_spec, runtime_spec, set_disks_shared};
 use opl_types::network::{Network, NetworkSpec, tap_name};
 use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
@@ -23,12 +23,24 @@ use uuid::Uuid;
 const MNT: &str = "/var/lib/opl/pools";
 
 /// 활성화한 볼륨과 끈 볼륨을 적는 저장소. `fail`이 있으면 활성화가 그 오류로 실패한다.
-/// resolve는 활성화와 (실패했을 때) 끄기만 부른다.
+/// resolve는 활성화와 (실패했을 때) 끄기만 부른다. 마이그레이션의 공유(`true`)·배타(`false`)
+/// 바꾸기는 `shared`에 적고, `fail`이 있으면 그 오류로 실패한다.
 #[derive(Default)]
 struct Activations {
     calls: Mutex<Vec<(String, Uuid, ImageFormat)>>,
     deactivated: Mutex<Vec<Uuid>>,
+    shared: Mutex<Vec<(Uuid, bool)>>,
     fail: Mutex<Option<fn() -> DriverError>>,
+}
+
+impl Activations {
+    fn share(&self, id: Uuid, shared: bool) -> Result<(), DriverError> {
+        self.shared.lock().unwrap().push((id, shared));
+        match *self.fail.lock().unwrap() {
+            Some(fail) => Err(fail()),
+            None => Ok(()),
+        }
+    }
 }
 
 #[async_trait]
@@ -56,6 +68,22 @@ impl Storage for Activations {
     ) -> Result<(), DriverError> {
         self.deactivated.lock().unwrap().push(id);
         Ok(())
+    }
+    async fn share_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.share(id, true)
+    }
+    async fn exclusive_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.share(id, false)
     }
     async fn create_volume(
         &self,
@@ -302,6 +330,90 @@ async fn failed_resolve_deactivates_the_volumes_it_activated() {
         .await
         .unwrap();
     assert!(storage.deactivated.lock().unwrap().is_empty());
+}
+
+/// 마이그레이션을 받을 때는 볼륨을 활성화하지 않고 공유로 켠다(원본이 아직 쓴다). 실패하면 켠
+/// 볼륨을 끈다.
+#[tokio::test]
+async fn incoming_spec_shares_the_volumes() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    let (root, data) = (volume("root", "local"), volume("data", "local"));
+    cluster.create(&root).await.unwrap();
+    cluster.create(&data).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    vm.spec.disks.push(disk("data"));
+
+    let storage = Activations::default();
+    let spec = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(spec.disks.len(), 2);
+    assert!(storage.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        *storage.shared.lock().unwrap(),
+        [(root.id, true), (data.id, true)]
+    );
+    assert!(storage.deactivated.lock().unwrap().is_empty());
+
+    vm.spec.nics.push(nic("missing", None));
+    let storage = Activations::default();
+    let err = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::NetworkNotFound(_)), "{err:?}");
+    assert_eq!(*storage.deactivated.lock().unwrap(), [root.id, data.id]);
+}
+
+/// 디스크마다 공유·배타로 바꾼다. 처음 실패에서 멈추고, 저장소의 일시 오류는 `PoolUnavailable`,
+/// 없는 볼륨은 `VolumeNotFound`다.
+#[tokio::test]
+async fn set_disks_shared_switches_every_disk() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    let (root, data) = (volume("root", "local"), volume("data", "local"));
+    cluster.create(&root).await.unwrap();
+    cluster.create(&data).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    vm.spec.disks.push(disk("data"));
+
+    let storage = Activations::default();
+    set_disks_shared(&cluster, &vm, &storage, true)
+        .await
+        .unwrap();
+    set_disks_shared(&cluster, &vm, &storage, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        *storage.shared.lock().unwrap(),
+        [
+            (root.id, true),
+            (data.id, true),
+            (root.id, false),
+            (data.id, false)
+        ]
+    );
+
+    let storage = Activations::default();
+    *storage.fail.lock().unwrap() = Some(|| DriverError::Timeout("another node"));
+    let err = set_disks_shared(&cluster, &vm, &storage, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::PoolUnavailable(..)), "{err:?}");
+    assert_eq!(*storage.shared.lock().unwrap(), [(root.id, false)]);
+
+    vm.spec.disks.push(disk("missing"));
+    let storage = Activations::default();
+    let err = set_disks_shared(&cluster, &vm, &storage, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::VolumeNotFound(_)), "{err:?}");
 }
 
 /// 디스크 볼륨에 실행 중인 크기 늘리기 Task가 있으면 그 볼륨을 켜지 않고 기다릴

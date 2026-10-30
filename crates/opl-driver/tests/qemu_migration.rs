@@ -167,6 +167,7 @@ fn opts() -> MigrateOptions {
 async fn migrates_a_running_vm_over_tls() {
     let n = nodes().await;
     let vm = spec(create_disk(n.tmp.path()));
+    let task = Uuid::now_v7();
     // 원본의 UEFI 변수 파일(템플릿 복사본) 끝에 표식을 남기고 띄운다. 대상은 템플릿으로 시작하므로,
     // 넘겨받은 뒤 대상 파일이 원본과 같으면 QEMU가 pflash 내용을 옮겨 쓴 것이다.
     let src_vars = vars(&n.tmp.path().join("a"), vm.id);
@@ -185,7 +186,7 @@ async fn migrates_a_running_vm_over_tls() {
 
     let port = n
         .dst
-        .start_incoming(&vm, HOST, 61000..=61019)
+        .start_incoming(&vm, task, HOST, 61000..=61019)
         .await
         .unwrap();
     assert!((61000..=61019).contains(&port));
@@ -193,7 +194,7 @@ async fn migrates_a_running_vm_over_tls() {
         status(&n.dst, vm.id).await,
         Some(RuntimeStatus::Other("inmigrate".into()))
     );
-    assert_eq!(n.dst.list_incoming().await.unwrap(), vec![vm.id]);
+    assert_eq!(n.dst.list_incoming().await.unwrap(), vec![(vm.id, task)]);
     // 그 포트는 이제 받는 QEMU가 쓴다.
     assert!(std::net::TcpListener::bind((HOST, port)).is_err());
 
@@ -256,6 +257,7 @@ async fn migrates_a_running_vm_over_tls() {
 async fn failed_migration_keeps_the_source_running() {
     let n = nodes().await;
     let vm = spec(create_disk(n.tmp.path()));
+    let task = Uuid::now_v7();
     n.src.start(&vm, None).await.unwrap();
 
     // 아무도 받지 않는 포트
@@ -275,7 +277,7 @@ async fn failed_migration_keeps_the_source_running() {
     // 받는 노드 인증서에 없는 이름: TLS가 실패한다.
     let port = n
         .dst
-        .start_incoming(&vm, HOST, 61020..=61039)
+        .start_incoming(&vm, task, HOST, 61020..=61039)
         .await
         .unwrap();
     let target = MigrateTarget {
@@ -296,7 +298,7 @@ async fn failed_migration_keeps_the_source_running() {
     // 다시 받고 보내면 된다(원본 QEMU에 TLS 객체를 다시 만든다).
     let port = n
         .dst
-        .start_incoming(&vm, HOST, 61020..=61039)
+        .start_incoming(&vm, task, HOST, 61020..=61039)
         .await
         .unwrap();
     let target = MigrateTarget {

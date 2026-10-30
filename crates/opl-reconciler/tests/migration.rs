@@ -8,7 +8,7 @@ use std::time::Duration;
 use common::{Env, vm};
 use opl_driver::{Hypervisor, MigrateOptions, MigrateTarget, RuntimeStatus};
 use opl_types::runtime::VmRuntimeSpec;
-use opl_types::vm::{MigrationStatus, Vm, VmPhase, VmSpec};
+use opl_types::vm::{MigrationStatus, PowerState, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
 fn running(v: &Vm) -> bool {
@@ -124,7 +124,7 @@ async fn received_vm_is_continued_after_the_commit() {
         nics: vec![],
     };
     env.hv
-        .start_incoming(&spec, "127.0.0.1", 60000..=60099)
+        .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099)
         .await
         .unwrap();
     env.hv.incoming_wait(vm.id).await.unwrap();
@@ -153,4 +153,144 @@ async fn received_vm_is_continued_after_the_commit() {
     }
     assert_eq!(status_of(&env, vm.id).await, Some(RuntimeStatus::Running));
     assert!(env.hv.launches().is_empty(), "{:?}", env.hv.launches());
+}
+
+/// opld가 마이그레이션을 보내다 확정 전에 죽었는데 QEMU는 아직 보내는 중이다: 작업자가 `Migrating`을
+/// 되돌린 뒤 그 마이그레이션을 취소한다. 나중에 끝나 원본을 멈추지 않는다.
+#[tokio::test]
+async fn active_migration_left_by_a_restart_is_cancelled() {
+    let mut env = Env::start().await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    env.stop_reconciler().await;
+    mark_migrating(&env, vm.id, Uuid::now_v7()).await;
+    env.hv.start_outgoing(vm.id);
+    env.start_reconciler();
+
+    env.wait(vm.id, "migration rolled back", |v| {
+        running(v) && v.status.migration.is_none()
+    })
+    .await;
+    assert!(!env.hv.is_outgoing(vm.id));
+    env.hv.complete_outgoing(vm.id);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(status_of(&env, vm.id).await, Some(RuntimeStatus::Running));
+}
+
+/// 취소하는 사이에 마이그레이션이 끝났다(원본은 `postmigrate`): 확정될 수 없으므로 이어서 실행한다.
+#[tokio::test]
+async fn migration_completing_while_cancelled_resumes_the_source() {
+    let mut env = Env::start().await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    env.stop_reconciler().await;
+    mark_migrating(&env, vm.id, Uuid::now_v7()).await;
+    env.hv.start_outgoing(vm.id);
+    env.hv.complete_on_cancel();
+    env.start_reconciler();
+
+    env.wait(vm.id, "migration rolled back", |v| {
+        running(v) && v.status.migration.is_none()
+    })
+    .await;
+    // 취소하지 않았으면 여기서 끝난다.
+    env.hv.complete_outgoing(vm.id);
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while status_of(&env, vm.id).await != Some(RuntimeStatus::Running) {
+        assert!(std::time::Instant::now() < deadline, "source not resumed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 마이그레이션 Task가 표시를 지웠지만 멈춘 원본을 이어서 실행하지 못하고 끝났다: 표시가 없고 이 노드의
+/// VM이므로 확정될 수 없다. 보류가 풀리면 작업자가 이어서 실행한다.
+#[tokio::test]
+async fn source_left_paused_after_a_rollback_is_resumed() {
+    let env = Env::start().await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    let pid = env.wait(vm.id, "running", running).await.status.pid;
+
+    let handle = env.handle();
+    handle.begin_migration(vm.id).await;
+    mark_migrating(&env, vm.id, Uuid::now_v7()).await;
+    env.hv.migrate(vm.id, &target(), &opts()).await.unwrap();
+    // 되돌리기: 표시만 지우고 원본은 멈춘 채 둔다(`cont` 실패).
+    let mut status = env.get(vm.id).status;
+    status.phase = VmPhase::Running;
+    status.migration = None;
+    env.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+    handle.end_migration(vm.id);
+
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while status_of(&env, vm.id).await != Some(RuntimeStatus::Running) {
+        assert!(std::time::Instant::now() < deadline, "source not resumed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got = env.get(vm.id);
+    assert!(running(&got));
+    assert_eq!(got.status.pid, pid);
+}
+
+/// 보류 중에 원본 QEMU가 크래시했다: 보류가 풀린 뒤 그 이벤트대로 다룬다(`restart = never`면 다시
+/// 켜지 않고 실패로 남긴다).
+#[tokio::test]
+async fn crash_while_held_follows_the_restart_policy() {
+    let env = Env::start().await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    let handle = env.handle();
+    handle.begin_migration(vm.id).await;
+    env.hv.crash(vm.id);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.end_migration(vm.id);
+
+    let got = env
+        .wait(vm.id, "failed", |v| v.status.phase == VmPhase::Failed)
+        .await;
+    assert_eq!(got.spec.power, PowerState::Stopped);
+    assert_eq!(got.status.last_error.as_deref(), Some("VM crashed"));
+    assert_eq!(env.hv.launches().len(), 1, "{:?}", env.hv.launches());
+}
+
+/// 다른 노드로 확정된 마이그레이션의 원본이 정리되지 않고 `postmigrate`로 남았는데, 그 뒤 VM이 그 노드에서
+/// 꺼지고 이 노드로 다시 옮겨져 켜졌다: 멈춘 원본의 메모리는 낡았으므로 이어서 실행하지 않고 끈 뒤
+/// 새로 시작한다.
+#[tokio::test]
+async fn stale_source_of_a_committed_migration_is_restarted_fresh() {
+    let mut env = Env::start().await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    let pid = env.wait(vm.id, "running", running).await.status.pid;
+
+    env.stop_reconciler().await;
+    env.hv.migrate(vm.id, &target(), &opts()).await.unwrap();
+    // 다른 노드로 확정되어 거기서 꺼진 뒤 이 노드로 다시 옮겨졌다(spec.node는 이 노드, power는 running).
+    let mut status = env.get(vm.id).status;
+    status.node = Some(Uuid::now_v7());
+    status.phase = VmPhase::Stopped;
+    status.pid = None;
+    env.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+    env.start_reconciler();
+
+    let got = env
+        .wait(vm.id, "started fresh", |v| {
+            running(v) && v.status.node == Some(env.node)
+        })
+        .await;
+    assert_ne!(got.status.pid, pid);
+    assert_eq!(env.hv.launches().len(), 2, "{:?}", env.hv.launches());
+    assert_eq!(status_of(&env, vm.id).await, Some(RuntimeStatus::Running));
 }

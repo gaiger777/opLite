@@ -69,7 +69,7 @@ pub async fn runtime_spec(
     mount_root: &Path,
     storage: &dyn Storage,
 ) -> Result<VmRuntimeSpec, ResolveError> {
-    resolve_activated(cluster, vm, node, mount_root, storage, true).await
+    resolve_activated(cluster, vm, node, mount_root, storage, Activate::Start).await
 }
 
 /// 이미 도는 VM에 다시 붙을 때의 [`runtime_spec`]. 크기 늘리기 Task를 기다리지 않는다(QEMU가 이미
@@ -81,29 +81,82 @@ pub async fn running_spec(
     mount_root: &Path,
     storage: &dyn Storage,
 ) -> Result<VmRuntimeSpec, ResolveError> {
-    resolve_activated(cluster, vm, node, mount_root, storage, false).await
+    resolve_activated(cluster, vm, node, mount_root, storage, Activate::Running).await
 }
 
-/// [`runtime_spec`]. `wait_resize`가 거짓이면 크기 늘리기 Task를 보지 않는다.
+/// 라이브 마이그레이션을 받을 때의 [`runtime_spec`]. 볼륨을 `activate_volume` 대신
+/// `share_volume`으로 켠다(원본 노드가 아직 쓰고 있다).
+pub async fn incoming_spec(
+    cluster: &Cluster,
+    vm: &Vm,
+    node: Uuid,
+    mount_root: &Path,
+    storage: &dyn Storage,
+) -> Result<VmRuntimeSpec, ResolveError> {
+    resolve_activated(cluster, vm, node, mount_root, storage, Activate::Incoming).await
+}
+
+/// VM 디스크의 볼륨을 이 노드에서 `share_volume`(`shared`) 또는 `exclusive_volume`으로 바꾼다(라이브
+/// 마이그레이션). 처음 실패에서 멈춘다. 오류는 [`runtime_spec`]처럼 나눈다: 저장소의 일시 오류(다른
+/// 노드가 아직 잠금을 쥐고 있다 등)는 `PoolUnavailable`이다.
+pub async fn set_disks_shared(
+    cluster: &Cluster,
+    vm: &Vm,
+    storage: &dyn Storage,
+    shared: bool,
+) -> Result<(), ResolveError> {
+    for disk in &vm.spec.disks {
+        let volume = cluster
+            .get_by_name::<VolumeSpec>(&disk.volume)?
+            .ok_or_else(|| ResolveError::VolumeNotFound(disk.volume.clone()))?;
+        let pool_name = &volume.spec.pool;
+        let pool = cluster
+            .get_by_name::<StoragePoolSpec>(pool_name)?
+            .ok_or_else(|| ResolveError::PoolNotFound(pool_name.clone()))?;
+        let format = volume.spec.format;
+        let done = if shared {
+            storage.share_volume(&pool, volume.id, format).await
+        } else {
+            storage.exclusive_volume(&pool, volume.id, format).await
+        };
+        match done {
+            Ok(()) => {}
+            Err(e @ (DriverError::VolumeNotFound(_) | DriverError::InvalidSpec(_))) => {
+                return Err(ResolveError::VolumeUnusable(disk.volume.clone(), e));
+            }
+            Err(e) => {
+                return Err(ResolveError::PoolUnavailable(
+                    pool_name.clone(),
+                    e.to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 볼륨을 켜는 방식
+#[derive(Clone, Copy, PartialEq)]
+enum Activate {
+    /// VM을 시작한다. 실행 중인 크기 늘리기 Task를 기다린다.
+    Start,
+    /// 이미 도는 VM에 다시 붙는다. 크기 늘리기 Task를 보지 않는다.
+    Running,
+    /// 마이그레이션을 받는다. 공유로 켜고(`share_volume`) 크기 늘리기 Task를 기다린다.
+    Incoming,
+}
+
+/// [`runtime_spec`]. `how`에 따라 볼륨을 켠다.
 async fn resolve_activated(
     cluster: &Cluster,
     vm: &Vm,
     node: Uuid,
     mount_root: &Path,
     storage: &dyn Storage,
-    wait_resize: bool,
+    how: Activate,
 ) -> Result<VmRuntimeSpec, ResolveError> {
     let mut activated = Vec::new();
-    let result = resolve(
-        cluster,
-        vm,
-        node,
-        mount_root,
-        storage,
-        wait_resize,
-        &mut activated,
-    )
-    .await;
+    let result = resolve(cluster, vm, node, mount_root, storage, how, &mut activated).await;
     if result.is_err() {
         for (pool, id, format) in activated {
             if let Err(e) = storage.deactivate_volume(&pool, id, format).await {
@@ -121,7 +174,7 @@ async fn resolve(
     node: Uuid,
     mount_root: &Path,
     storage: &dyn Storage,
-    wait_resize: bool,
+    how: Activate,
     activated: &mut Vec<(StoragePool, Uuid, ImageFormat)>,
 ) -> Result<VmRuntimeSpec, ResolveError> {
     let me = cluster.get::<NodeSpec>(node)?;
@@ -131,7 +184,7 @@ async fn resolve(
         let volume = cluster
             .get_by_name::<VolumeSpec>(&disk.volume)?
             .ok_or_else(|| ResolveError::VolumeNotFound(disk.volume.clone()))?;
-        if wait_resize
+        if how != Activate::Running
             && tasks.iter().any(|t| {
                 t.spec.target == volume.id
                     && t.status.state == TaskState::Running
@@ -188,7 +241,13 @@ async fn resolve(
             return Err(ResolveError::PoolUnavailable(pool_name.clone(), error));
         }
         let format = volume.spec.format;
-        let located = match storage.activate_volume(&pool, volume.id, format).await {
+        let activation = match how {
+            Activate::Incoming => storage.share_volume(&pool, volume.id, format).await,
+            Activate::Start | Activate::Running => {
+                storage.activate_volume(&pool, volume.id, format).await
+            }
+        };
+        let located = match activation {
             Ok(()) => {
                 let located = disk_location(&pool, mount_root, volume.id, format);
                 activated.push((pool.clone(), volume.id, format));

@@ -108,13 +108,15 @@ pub trait Hypervisor: Send + Sync {
     /// 이미 떠 있는 QEMU의 버전이다.
     async fn running_qemu_version(&self, id: Uuid) -> Result<String, DriverError>;
 
-    /// 라이브 마이그레이션을 받을 QEMU를 `-incoming defer`로 띄우고, 받는 중 표시를 남기고, TLS
+    /// 라이브 마이그레이션을 받을 QEMU를 `-incoming defer`로 띄우고, 받는 중 표시(마이그레이션 Task
+    /// `task`)를 남기고, TLS
     /// 자격 증명(받는 쪽, 상대 인증서 확인)과 능력을 정한 뒤 `ports`에서 빈 포트로 `listen_host`에서
     /// 받기 시작한다. 연 포트를 돌려준다. 실패하면 띄운 QEMU를 끈다. 이미 이 노드에서 돌고 있는
     /// VM이면 실패한다. 받은 뒤에도 멈춰 있다([`finish_incoming`](Self::finish_incoming)이 이어서 실행).
     async fn start_incoming(
         &self,
         vm: &VmRuntimeSpec,
+        task: Uuid,
         listen_host: &str,
         ports: RangeInclusive<u16>,
     ) -> Result<u16, DriverError>;
@@ -128,8 +130,9 @@ pub trait Hypervisor: Send + Sync {
     /// 확정된 뒤(VM이 이 노드로 옮겨진 뒤)에만 부른다.
     async fn finish_incoming(&self, id: Uuid) -> Result<(), DriverError>;
 
-    /// 받는 중 표시가 있는 살아 있는 VM. 확정되지 않은 채 남은 받는 QEMU를 찾아 끄는 데 쓴다.
-    async fn list_incoming(&self) -> Result<Vec<Uuid>, DriverError>;
+    /// 받는 중 표시가 있는 살아 있는 VM과 그 표시의 마이그레이션 Task(읽을 수 없으면 nil). 확정되지
+    /// 않은 채 남은 받는 QEMU를 찾아 끄는 데 쓴다.
+    async fn list_incoming(&self) -> Result<Vec<(Uuid, Uuid)>, DriverError>;
 
     /// 실행 중인 VM을 `target`으로 보낸다(TLS, 능력 `events`·`auto-converge`). 끝날 때까지 기다린다.
     /// 성공하면 원본은 `postmigrate`로 멈춰 있다([`stop_migrated`](Self::stop_migrated)로 끈다).
@@ -145,6 +148,12 @@ pub trait Hypervisor: Send + Sync {
     /// 마이그레이션을 보내고 `postmigrate`로 멈춘 원본 QEMU를 끄고 true. 다른 상태이거나 실행 중이
     /// 아니면 아무것도 하지 않고 false.
     async fn stop_migrated(&self, id: Uuid) -> Result<bool, DriverError>;
+
+    /// 이 VM이 보내는 중인 마이그레이션을 취소하고 끝날 때까지 기다린다(QMP `migrate_cancel`). 보내는
+    /// 중이 아니면(끝났거나, 받는 쪽이거나, VM이 없다) 아무것도 하지 않는다. 취소하는 사이에 끝났으면
+    /// 원본은 `postmigrate`로 멈춰 있다. opld가 기다리기를 그만둔 마이그레이션(재시작, 되돌리기)이
+    /// 나중에 끝나 원본을 멈추지 않게 한다.
+    async fn cancel_migration(&self, id: Uuid) -> Result<(), DriverError>;
 
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;

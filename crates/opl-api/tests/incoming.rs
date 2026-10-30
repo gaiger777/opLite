@@ -133,10 +133,15 @@ impl Setup {
     }
 
     fn deactivations(&self) -> usize {
+        self.count("deactivate")
+    }
+
+    /// 볼륨에 대한 저장소 호출 `op`의 수
+    fn count(&self, op: &str) -> usize {
         self.storage
             .calls()
             .iter()
-            .filter(|(op, id)| *op == "deactivate" && *id == self.volume)
+            .filter(|(o, id)| *o == op && *id == self.volume)
             .count()
     }
 }
@@ -150,7 +155,9 @@ async fn receives_waits_and_aborts() {
     let port = s.receiver.incoming(s.request(task)).await.unwrap();
     assert_eq!(port, 61000);
     assert!(s.env.hv.is_incoming(s.vm));
-    assert_eq!(s.env.hv.list_incoming().await.unwrap(), vec![s.vm]);
+    // 원본이 아직 쓰는 디스크를 공유로 켰다.
+    assert_eq!(s.count("share"), 1);
+    assert_eq!(s.env.hv.list_incoming().await.unwrap(), vec![(s.vm, task)]);
     // 원본 노드에 배정된 VM이므로 이 노드의 reconciler는 받는 QEMU를 그대로 둔다.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(s.env.hv.inspect(s.vm).await.unwrap().is_some());
@@ -261,6 +268,47 @@ async fn failures_turn_disks_off_again() {
     assert_eq!(s.deactivations(), 2);
 }
 
+/// 앞선 마이그레이션(다른 Task)의 받는 QEMU가 남아 있으면 끄고 새로 받는다. 취소는 그 Task의 받는
+/// QEMU만 끈다.
+#[tokio::test]
+async fn receiving_qemu_of_another_task_is_replaced() {
+    let s = setup().await;
+    let old = Uuid::now_v7();
+    s.mark_migrating(s.env.node, old).await;
+    s.receiver.incoming(s.request(old)).await.unwrap();
+
+    let task = Uuid::now_v7();
+    s.mark_migrating(s.env.node, task).await;
+    s.receiver.incoming(s.request(task)).await.unwrap();
+    assert_eq!(s.env.hv.list_incoming().await.unwrap(), vec![(s.vm, task)]);
+    assert_eq!(s.env.hv.launches().len(), 0);
+
+    // 마이그레이션 표시가 없어도 다른 Task의 취소는 이 받는 QEMU를 끄지 않는다(정리가 끈다).
+    let mut vm = s.env.cluster.get::<VmSpec>(s.vm).unwrap().unwrap();
+    vm.status.phase = VmPhase::Running;
+    vm.status.migration = None;
+    s.env
+        .cluster
+        .update_status::<VmSpec>(s.vm, &vm.status)
+        .await
+        .unwrap();
+    s.receiver
+        .abort(IncomingMigration {
+            vm: s.vm,
+            task: old,
+        })
+        .await
+        .unwrap();
+    assert!(s.env.hv.is_incoming(s.vm));
+    assert_eq!(s.deactivations(), 0);
+    s.receiver
+        .abort(IncomingMigration { vm: s.vm, task })
+        .await
+        .unwrap();
+    assert!(s.env.hv.inspect(s.vm).await.unwrap().is_none());
+    assert_eq!(s.deactivations(), 1);
+}
+
 #[tokio::test]
 async fn abort_leaves_a_committed_migration_alone() {
     let s = setup().await;
@@ -339,6 +387,19 @@ async fn sweep_stops_a_receiving_qemu_left_behind() {
     assert_eq!(s.deactivations(), 1);
 }
 
+/// 이 노드로 오는 중이지만 다른 Task다(앞선 마이그레이션의 받는 QEMU가 남았다): 정리가 끈다.
+#[tokio::test]
+async fn sweep_stops_a_receiving_qemu_of_another_task() {
+    let mut s = setup().await;
+    let old = Uuid::now_v7();
+    s.mark_migrating(s.env.node, old).await;
+    s.receiver.incoming(s.request(old)).await.unwrap();
+    s.mark_migrating(s.env.node, Uuid::now_v7()).await;
+    s.sweep_often().await;
+    s.wait_stopped(s.vm).await;
+    assert!(s.env.hv.list_incoming().await.unwrap().is_empty());
+}
+
 /// 이 노드에서 보낸 원본(`postmigrate`)이 남았는데 VM은 다른 노드로 확정됐다: 정리가 끄고 디스크를
 /// 끈다. 이 노드에 배정된 VM의 원본(확정 전)은 그대로 둔다.
 #[tokio::test]
@@ -382,8 +443,77 @@ async fn sweep_stops_a_source_qemu_committed_elsewhere() {
     s.wait_stopped(s.vm).await;
     assert_eq!(s.deactivations(), 1);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        s.running(db.id).await,
-        Some(RuntimeStatus::Other("postmigrate".into()))
-    );
+    // 정리는 끄지 않는다(이 노드의 reconciler가 이어서 실행할 수는 있다).
+    assert!(s.running(db.id).await.is_some());
+}
+
+/// 보낸 원본(`postmigrate`)이 남았는데 VM이 지워졌다(다른 노드로 옮긴 뒤 끄고 지웠다): 정리가 끈다.
+#[tokio::test]
+async fn sweep_stops_a_source_qemu_of_a_deleted_vm() {
+    let mut s = setup().await;
+    let target = MigrateTarget {
+        host: "127.0.0.2".into(),
+        port: 60000,
+        tls_hostname: "127.0.0.2".into(),
+    };
+    let opts = MigrateOptions {
+        bandwidth: None,
+        timeout: Duration::from_secs(60),
+    };
+    let vm = s.env.cluster.get::<VmSpec>(s.vm).unwrap().unwrap();
+    let spec = VmRuntimeSpec {
+        id: Uuid::now_v7(),
+        name: "gone".into(),
+        cpu: vm.spec.cpu.clone(),
+        memory_mib: vm.spec.memory_mib,
+        firmware: vm.spec.firmware,
+        machine: vm.spec.machine,
+        disks: vec![],
+        nics: vec![],
+    };
+    s.env.hv.start(&spec, None).await.unwrap();
+    s.env.hv.migrate(spec.id, &target, &opts).await.unwrap();
+    s.sweep_often().await;
+    s.wait_stopped(spec.id).await;
+}
+
+/// 이 노드에 배정된 VM의 원본(`postmigrate`)이 남았는데 이 노드에서 돌던 VM이 아니다(다른 노드로
+/// 확정된 뒤 거기서 꺼지고 이 노드로 다시 옮겨졌다): 낡은 원본이므로 정리가 끈다. 디스크는 이 노드의
+/// reconciler가 다루므로 끄지 않는다.
+#[tokio::test]
+async fn sweep_stops_a_stale_source_qemu_assigned_here() {
+    let mut s = setup().await;
+    let admin = s.env.admin().await;
+    let mut req = vm_request("db");
+    req["spec"]["node"] = json!(s.env.node);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act("db", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let db = vm_named(&s.env, "db");
+    // 정리만 보도록 reconciler는 손대지 않게 한다.
+    s.env.reconciler().begin_migration(db.id).await;
+    let target = MigrateTarget {
+        host: "127.0.0.2".into(),
+        port: 60000,
+        tls_hostname: "127.0.0.2".into(),
+    };
+    let opts = MigrateOptions {
+        bandwidth: None,
+        timeout: Duration::from_secs(60),
+    };
+    s.env.hv.migrate(db.id, &target, &opts).await.unwrap();
+    let mut status = db.status.clone();
+    status.node = Some(s.source);
+    status.phase = VmPhase::Stopped;
+    status.pid = None;
+    s.env
+        .cluster
+        .update_status::<VmSpec>(db.id, &status)
+        .await
+        .unwrap();
+
+    s.sweep_often().await;
+    s.wait_stopped(db.id).await;
+    assert_eq!(s.deactivations(), 0);
 }
