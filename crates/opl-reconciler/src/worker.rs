@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::backoff::{FailureTracker, Next};
 use crate::config::ReconcilerConfig;
-use crate::reconciler::Restores;
+use crate::reconciler::{Held, Restores};
 use crate::resolve::{ResolveError, running_spec, runtime_spec};
 
 /// 실행 중이던 VM이 사라졌을 때 그 이유를 알리는 종료 이벤트를 기다리는 시간.
@@ -24,7 +24,7 @@ use crate::resolve::{ResolveError, running_spec, runtime_spec};
 const EVENT_GRACE: Duration = Duration::from_secs(6);
 
 /// 작업자를 깨우는 이유.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(crate) enum Trigger {
     /// spec이 바뀌었거나 전체 재동기화. 원하는 상태와 실제 상태를 다시 맞춘다.
     Sync,
@@ -32,6 +32,8 @@ pub(crate) enum Trigger {
     Event(EventKind),
     /// 원하는 상태가 stopped인 VM을 ACPI 응답을 기다리지 않고 곧바로 끈다.
     ForceStop,
+    /// 앞의 단계를 마쳤음을 알린다(`ReconcilerHandle::begin_migration`).
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +56,8 @@ pub(crate) struct Worker {
     config: Arc<ReconcilerConfig>,
     /// 다음 시작에 불러올 스냅샷 태그(`ReconcilerHandle::restore_on_start`)
     restores: Restores,
+    /// 마이그레이션 Task가 다루는 중인 VM. 들어 있으면 이 작업자는 아무것도 하지 않는다.
+    held: Held,
     /// 진행 중인 ACPI 종료 요청을 보낸 시각. 강제 종료로 넘어갈 시점을 정한다.
     /// 원하는 상태가 다시 running으로 바뀌면 취소하므로, 새 종료는 늘 ACPI부터 다시 시작한다.
     stop_requested: Option<Instant>,
@@ -87,6 +91,7 @@ impl Worker {
         hv: Arc<dyn Hypervisor>,
         config: Arc<ReconcilerConfig>,
         restores: Restores,
+        held: Held,
     ) -> Self {
         Self {
             id,
@@ -94,6 +99,7 @@ impl Worker {
             hv,
             config,
             restores,
+            held,
             stop_requested: None,
             stopped_by_us: None,
             force_requested: false,
@@ -126,6 +132,11 @@ impl Worker {
                 None => rx.recv().await,
             };
             let Some(trigger) = trigger else { return };
+            // 트리거는 차례로 처리하므로 앞의 단계는 이미 끝났다.
+            if let Trigger::Barrier(done) = trigger {
+                let _ = done.send(());
+                continue;
+            }
             self.wake_at = None;
             if let Err(e) = self.step(trigger).await {
                 tracing::warn!(vm = %self.id, error = %e, "reconcile failed; will retry");
@@ -139,6 +150,10 @@ impl Worker {
     }
 
     async fn step(&mut self, trigger: Trigger) -> Result<(), StepError> {
+        // 마이그레이션 Task가 status와 QEMU를 다룬다. 끝나면(`end_migration`) 다시 깨운다.
+        if self.held.lock().unwrap().contains(&self.id) {
+            return Ok(());
+        }
         let node = self.config.node;
         let vm = self.cluster.get::<VmSpec>(self.id)?;
         let Some(mut vm) = vm.filter(|vm| vm.spec.node == Some(node)) else {
@@ -148,6 +163,16 @@ impl Worker {
             }
             return Ok(());
         };
+        if vm.status.migration.is_some() || vm.status.phase == VmPhase::Migrating {
+            match self.clear_migration(&vm).await? {
+                Some(current) => vm = current,
+                // 그 사이 바뀌었다. 다시 읽어 맞춘다.
+                None => {
+                    self.wake(Instant::now());
+                    return Ok(());
+                }
+            }
+        }
         match trigger {
             Trigger::Event(kind) => self.on_event(&vm, kind),
             // running을 원할 때 온 명령은 버린다. 남겨 두면 나중의 종료가 ACPI 없이 강제 종료된다.
@@ -155,7 +180,7 @@ impl Worker {
                 self.force_requested = true
             }
             Trigger::ForceStop => {}
-            Trigger::Sync => {}
+            Trigger::Sync | Trigger::Barrier(_) => {}
         }
         if self.power_off.is_none() {
             let status = self.reconcile(&mut vm).await?;
@@ -249,11 +274,20 @@ impl Worker {
                     // 붙어 있으면 디스크를 다시 해석하지 않고(LVM이 응답하지 않을 수 있다) 이어서
                     // 실행하고, 아니면 start()가 다시 붙는다. 실패해도 돌고 있는 VM이므로 끄거나
                     // 실패로 세지 않는다.
-                    let continued = match self.hv.resume_left_stopped(self.id).await {
+                    let mut continued = match self.hv.resume_left_stopped(self.id).await {
                         Ok(true) => Ok(()),
                         Ok(false) => self.reattach(vm).await,
                         Err(e) => Err(e.to_string()),
                     };
+                    // 이 노드로 마이그레이션을 받아 멈춰 있는 QEMU다(확정되어 이 노드에 배정됐다).
+                    // 받는 중 표시가 있을 때만 이어서 실행하고 표시를 지운다.
+                    if continued.is_ok() && state.status == RuntimeStatus::Paused {
+                        continued = self
+                            .hv
+                            .finish_incoming(self.id)
+                            .await
+                            .map_err(|e| e.to_string());
+                    }
                     if let Err(e) = continued {
                         tracing::warn!(vm = %self.id, error = %e, "VM is unresponsive; will retry");
                         status.last_error = Some(format!("VM is unresponsive: {e}"));
@@ -459,6 +493,36 @@ impl Worker {
                 tracing::warn!(vm = %self.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
             }
         }
+    }
+
+    /// 끝나지 않은 채 남은 마이그레이션 표시(`Migrating`, `status.migration`)를 지운다. 이 노드의
+    /// 마이그레이션 Task가 다루지 않는 VM이므로, 원본 opld가 확정 전에 죽었거나(원본 노드) 확정 뒤
+    /// 넘겨받는 중이다(대상 노드). 읽은 revision으로만 쓰므로 그 사이 확정되었으면(남은 확정 쓰기가
+    /// 먼저 적용됨) 쓰지 않고 `None`이다. 쓰고 나면 그 확정은 더는 적용되지 않으므로, 이 노드의 QEMU가
+    /// 마이그레이션을 보내고 멈춰 있으면(`postmigrate`) 이어서 실행한다. 대상의 QEMU는 확정 뒤에만
+    /// 돌므로 두 QEMU가 함께 돌지 않는다. 다시 읽은 VM을 돌려준다.
+    async fn clear_migration(&self, vm: &Vm) -> Result<Option<Vm>, StepError> {
+        let mut status = vm.status.clone();
+        status.migration = None;
+        if status.phase == VmPhase::Migrating {
+            status.phase = VmPhase::Running;
+        }
+        match self
+            .cluster
+            .update_status_checked::<VmSpec>(self.id, vm.revision, &status)
+            .await
+        {
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => return Ok(None),
+            r => r?,
+        };
+        if let Some(state) = self.hv.inspect(self.id).await?
+            && state.status == RuntimeStatus::Other("postmigrate".into())
+        {
+            tracing::warn!(vm = %self.id, "resuming the source of a migration that did not complete");
+            self.hv.resume(self.id).await?;
+        }
+        let vm = self.cluster.get::<VmSpec>(self.id)?;
+        Ok(vm.filter(|vm| vm.spec.node == Some(self.config.node)))
     }
 
     /// VM의 런타임 정의. 디스크 볼륨을 활성화한다.

@@ -4,6 +4,7 @@
 //! 구독하므로, 어느 노드의 API가 만든 Task든 대상 노드에서 실행된다.
 
 mod clone;
+mod migrate;
 mod snapshot;
 
 use std::collections::{HashMap, HashSet};
@@ -15,6 +16,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, Hypervisor, Storage};
+use opl_peer::Peers;
 use opl_reconciler::ReconcilerHandle;
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
@@ -48,7 +50,7 @@ pub(crate) async fn create_task(
     Ok(task)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TaskRunnerConfig {
     /// 이 노드의 id. `spec.node`가 이 값인 Task만 실행한다.
     pub node: Uuid,
@@ -65,8 +67,15 @@ pub struct TaskRunnerConfig {
     /// 다시 지워 보는 간격
     pub orphan_retry: Duration,
     /// 블록 스냅샷이 남긴 태그, 이 노드에서 켜진 채 남은 볼륨을 다시 찾아 정리하는 간격(시작할 때
-    /// 한 번 찾고 그 뒤로)
+    /// 한 번 찾고 그 뒤로). 확정되지 않았거나 확정 뒤 남은 마이그레이션 QEMU도 이 간격으로 정리한다.
     pub tag_sweep: Duration,
+    /// 라이브 마이그레이션을 보낼 때 대상 노드를 부르는 노드 간 클라이언트. 없으면 마이그레이션 Task는
+    /// 실패한다.
+    pub peers: Option<Arc<Peers>>,
+    /// 마이그레이션을 보내는 대역폭 상한(바이트/초). `None`이면 QEMU 기본값
+    pub migration_bandwidth: Option<u64>,
+    /// 마이그레이션이 이 시간 안에 끝나지 않으면 취소한다. 마이그레이션 Task는 `timeout` 대신 이것을 쓴다.
+    pub migration_timeout: Duration,
 }
 
 impl TaskRunnerConfig {
@@ -79,6 +88,9 @@ impl TaskRunnerConfig {
             state_dir: None,
             orphan_retry: Duration::from_secs(60),
             tag_sweep: Duration::from_secs(30 * 60),
+            peers: None,
+            migration_bandwidth: None,
+            migration_timeout: Duration::from_secs(30 * 60),
         }
     }
 }
@@ -149,6 +161,7 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<
     let retry = tokio::spawn(retry_orphans(ctx.clone(), unmounted));
     let tags = tokio::spawn(sweep_block_tags_every(ctx.clone()));
     let idle = tokio::spawn(deactivate_idle_volumes_every(ctx.clone()));
+    let migrations = tokio::spawn(migrate::sweep_every(ctx.clone()));
     // 실행을 시작한 Task. 목록을 다시 읽을 때 같은 Task를 두 번 시작하지 않게 한다.
     let mut started: HashSet<Uuid> = HashSet::new();
     // 실행 중인 Task. 실행기가 멈출 때 함께 멈춘다.
@@ -227,6 +240,7 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<
     retry.abort();
     tags.abort();
     idle.abort();
+    migrations.abort();
     ctx.stopped.send_replace(true);
 }
 
@@ -376,7 +390,9 @@ async fn deactivate_idle_volumes(ctx: &Ctx) {
     }
 }
 
-/// 이 노드가 쓰는 볼륨([`deactivate_idle_volumes`]이 그대로 두는 볼륨)과 볼륨별 형식
+/// 이 노드가 쓰는 볼륨([`deactivate_idle_volumes`]이 그대로 두는 볼륨)과 볼륨별 형식. 이 노드로
+/// 마이그레이션하는 중인 VM의 디스크도 쓰는 중이다(받는 QEMU를 띄우기 전에 켠다). 이 노드에서 보내는
+/// 중인 VM은 원하는 상태가 running이고 마이그레이션 Task가 있다.
 async fn volumes_in_use(ctx: &Ctx) -> Result<(HashSet<Uuid>, HashMap<Uuid, ImageFormat>), String> {
     let me = ctx.config.node;
     let running = ctx
@@ -412,7 +428,8 @@ async fn volumes_in_use(ctx: &Ctx) -> Result<(HashSet<Uuid>, HashMap<Uuid, Image
     for vm in &vms {
         let used = task_vms.contains(&vm.id)
             || running.iter().any(|r| r.id == vm.id)
-            || (vm.spec.node == Some(me) && vm.spec.power == PowerState::Running);
+            || (vm.spec.node == Some(me) && vm.spec.power == PowerState::Running)
+            || vm.status.migration.is_some_and(|m| m.node == me);
         if used {
             in_use.extend(
                 vm.spec
@@ -467,11 +484,15 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// 만들기·되돌리기가 같은 디스크를 다루고 되돌리기는 크기도 되돌리므로 섞이면 안 된다. 지금 쓰는
 /// VM이 없으면 그 볼륨을 담은 스냅샷의 VM(되돌리면 다시 붙는다), 그것도 없으면 볼륨의 줄이다.
 /// VM 전원 Task는 기다리기만 하므로 줄을 두지 않는다. 강제 종료가 앞의 reboot 뒤에 묶이면 안 된다.
+/// 마이그레이션 Task는 VM의 줄에 선다(앞의 스냅샷·복제가 끝난 뒤 옮긴다).
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
     if !matches!(task.spec.op, TaskOp::VolumeResize { .. }) {
-        let vm_clone = matches!(task.spec.op, TaskOp::VmClone { .. });
-        return (is_volume_op(&task.spec.op) || is_snapshot_op(&task.spec.op) || vm_clone)
+        let vm_queue = matches!(
+            task.spec.op,
+            TaskOp::VmClone { .. } | TaskOp::VmMigrate { .. }
+        );
+        return (is_volume_op(&task.spec.op) || is_snapshot_op(&task.spec.op) || vm_queue)
             .then_some(target);
     }
     let Ok(Some(volume)) = ctx.cluster.get::<VolumeSpec>(target) else {
@@ -527,15 +548,20 @@ async fn execute(ctx: &Ctx, task: Task) {
     if !begin(ctx, task.id).await {
         return;
     }
-    // 시간을 넘겨 버린 작업은 끝나지 않았다(명령이 아직 돌 수 있다).
-    let (result, unfinished) =
+    // 시간을 넘겨 버린 작업은 끝나지 않았다(명령이 아직 돌 수 있다). 마이그레이션은 단계마다
+    // 시간 제한이 있고(`migration_timeout`, RPC 기한), 확정 쓰기 도중에 버리면 안 되므로 감싸지 않는다.
+    let migration = matches!(task.spec.op, TaskOp::VmMigrate { .. });
+    let (result, unfinished) = if migration {
+        (perform(ctx, &task).await, false)
+    } else {
         match tokio::time::timeout(ctx.config.timeout, perform(ctx, &task)).await {
             Ok(r) => (r, false),
             Err(_) => (
                 Err(format!("timed out after {:?}", ctx.config.timeout)),
                 true,
             ),
-        };
+        }
+    };
     match result {
         Ok(()) => {
             // 예약 오류는 만들기가 성공해야 지운다(보관 삭제의 성공은 만들기 실패를 풀지 않는다).
@@ -670,7 +696,7 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
             snapshot,
             pool,
         } => clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
-        TaskOp::VmMigrate { .. } => Err("VM migration is not supported yet".into()),
+        TaskOp::VmMigrate { node } => migrate::migrate(ctx, task, *node).await,
     }
 }
 

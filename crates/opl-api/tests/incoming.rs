@@ -1,5 +1,6 @@
 //! 라이브 마이그레이션의 받는 쪽(`IncomingMigrations`): 원본 노드가 RPC로 부르는 처리를 직접 부른다.
-//! 이 노드(Env의 노드)가 대상이고, 원본 노드는 저장소에만 있다.
+//! 이 노드(Env의 노드)가 대상이고, 원본 노드는 저장소에만 있다. Task 실행기의 남은 마이그레이션
+//! QEMU 정리도 본다.
 
 mod common;
 
@@ -9,11 +10,11 @@ use std::time::Duration;
 use common::{Env, FakeStorage, MOUNT_ROOT, vm_request};
 use opl_api::{IncomingConfig, IncomingMigrations};
 use opl_driver::mock::MOCK_QEMU_VERSION;
-use opl_driver::{DriverError, Hypervisor, Storage};
+use opl_driver::{DriverError, Hypervisor, MigrateOptions, MigrateTarget, RuntimeStatus, Storage};
 use opl_peer::{IncomingError, IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Resource;
-use opl_types::runtime::ImageFormat;
+use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::storage::{Volume, VolumePhase, VolumeSpec};
 use opl_types::vm::{MigrationStatus, Vm, VmPhase, VmSpec};
 use reqwest::StatusCode;
@@ -284,4 +285,105 @@ async fn abort_leaves_a_committed_migration_alone() {
     );
     assert!(s.env.hv.inspect(s.vm).await.unwrap().is_some());
     assert_eq!(s.deactivations(), 0);
+}
+
+impl Setup {
+    /// 남은 마이그레이션 QEMU를 자주 정리하는 Task 실행기로 바꾼다(디스크는 `storage`로 끈다).
+    async fn sweep_often(&mut self) {
+        self.env.stop_runner().await;
+        let storage = self.storage.clone() as Arc<dyn Storage>;
+        self.env
+            .start_runner_config(storage, |c| c.tag_sweep = Duration::from_millis(50))
+            .await;
+    }
+
+    async fn running(&self, id: Uuid) -> Option<RuntimeStatus> {
+        self.env.hv.inspect(id).await.unwrap().map(|s| s.status)
+    }
+
+    async fn wait_stopped(&self, id: Uuid) {
+        let deadline = std::time::Instant::now() + common::WAIT;
+        while self.running(id).await.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "QEMU of {id} was not stopped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// 원본이 마이그레이션을 되돌렸는데(이 노드로 오는 표시가 없다) 받는 QEMU가 남았다: 정리가 끄고
+/// 디스크를 끈다. 이 노드로 오는 중이면 그대로 둔다.
+#[tokio::test]
+async fn sweep_stops_a_receiving_qemu_left_behind() {
+    let mut s = setup().await;
+    let task = Uuid::now_v7();
+    s.mark_migrating(s.env.node, task).await;
+    s.receiver.incoming(s.request(task)).await.unwrap();
+    s.sweep_often().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(s.env.hv.is_incoming(s.vm));
+    assert_eq!(s.deactivations(), 0);
+
+    let mut vm = s.env.cluster.get::<VmSpec>(s.vm).unwrap().unwrap();
+    vm.status.phase = VmPhase::Running;
+    vm.status.migration = None;
+    s.env
+        .cluster
+        .update_status::<VmSpec>(s.vm, &vm.status)
+        .await
+        .unwrap();
+    s.wait_stopped(s.vm).await;
+    assert!(s.env.hv.list_incoming().await.unwrap().is_empty());
+    assert_eq!(s.deactivations(), 1);
+}
+
+/// 이 노드에서 보낸 원본(`postmigrate`)이 남았는데 VM은 다른 노드로 확정됐다: 정리가 끄고 디스크를
+/// 끈다. 이 노드에 배정된 VM의 원본(확정 전)은 그대로 둔다.
+#[tokio::test]
+async fn sweep_stops_a_source_qemu_committed_elsewhere() {
+    let mut s = setup().await;
+    let admin = s.env.admin().await;
+    let target = MigrateTarget {
+        host: "127.0.0.2".into(),
+        port: 60000,
+        tls_hostname: "127.0.0.2".into(),
+    };
+    let opts = MigrateOptions {
+        bandwidth: None,
+        timeout: Duration::from_secs(60),
+    };
+    // `web`은 원본 노드에 배정돼 있다(이 노드에서 보냈고 원본 노드로 확정된 것과 같다).
+    let vm = s.env.cluster.get::<VmSpec>(s.vm).unwrap().unwrap();
+    let spec = VmRuntimeSpec {
+        id: vm.id,
+        name: vm.name.clone(),
+        cpu: vm.spec.cpu.clone(),
+        memory_mib: vm.spec.memory_mib,
+        firmware: vm.spec.firmware,
+        machine: vm.spec.machine,
+        disks: vec![],
+        nics: vec![],
+    };
+    s.env.hv.start(&spec, None).await.unwrap();
+    s.env.hv.migrate(vm.id, &target, &opts).await.unwrap();
+    // `db`는 이 노드에 배정돼 있고 확정 전이다.
+    let mut req = vm_request("db");
+    req["spec"]["node"] = json!(s.env.node);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act("db", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let db = vm_named(&s.env, "db");
+    s.env.hv.migrate(db.id, &target, &opts).await.unwrap();
+
+    s.sweep_often().await;
+    s.wait_stopped(s.vm).await;
+    assert_eq!(s.deactivations(), 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        s.running(db.id).await,
+        Some(RuntimeStatus::Other("postmigrate".into()))
+    );
 }

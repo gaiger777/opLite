@@ -322,6 +322,11 @@ impl Member {
         runner_config.upload_dir = Some(config.data_dir.join("uploads"));
         // QEMU 드라이버의 state_dir과 같다(host.rs).
         runner_config.state_dir = Some(config.data_dir.clone());
+        // 마이그레이션을 보낼 때 대상 노드를 부른다.
+        runner_config.peers = Some(peers.clone());
+        runner_config.migration_bandwidth =
+            (config.migration.bandwidth_mib > 0).then_some(config.migration.bandwidth_mib << 20);
+        runner_config.migration_timeout = config.migration.timeout;
         let runner = TaskRunner::spawn(
             cluster.clone(),
             storage,

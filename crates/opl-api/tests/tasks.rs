@@ -9,7 +9,7 @@ use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{DiskBus, DiskSpec, PowerState, Vm, VmSpec};
+use opl_types::vm::{DiskBus, DiskSpec, MigrationStatus, PowerState, Vm, VmPhase, VmSpec};
 use reqwest::StatusCode;
 use uuid::Uuid;
 
@@ -310,6 +310,7 @@ async fn volumes_left_active_are_deactivated() {
         ("resizing", "san", true),
         ("snapping", "san", true),
         ("making", "san", false),
+        ("coming", "san", true),
     ] {
         let mut volume: Volume = Resource::new(
             name,
@@ -328,6 +329,29 @@ async fn volumes_left_active_are_deactivated() {
     let web = vm_with_disks(&env, "web", PowerState::Running, &["boot"]).await;
     vm_with_disks(&env, "off", PowerState::Stopped, &["stopped"]).await;
     let snap = vm_with_disks(&env, "snap", PowerState::Stopped, &["snapping"]).await;
+    // 다른 노드에서 이 노드로 마이그레이션하는 중인 VM(받는 QEMU를 띄우기 전에 디스크를 켠다)
+    let source = Uuid::now_v7();
+    let mut spec: VmSpec =
+        serde_json::from_value(common::vm_request("moving")["spec"].clone()).unwrap();
+    spec.node = Some(source);
+    spec.nics.clear();
+    spec.disks = vec![DiskSpec {
+        volume: "coming".into(),
+        bus: DiskBus::VirtioBlk,
+        boot_order: None,
+    }];
+    let mut moving: Vm = Resource::new("moving", spec);
+    moving.status.phase = VmPhase::Migrating;
+    moving.status.node = Some(source);
+    moving.status.migration = Some(MigrationStatus {
+        node: env.node,
+        task: Uuid::now_v7(),
+    });
+    env.cluster.create(&moving).await.unwrap();
+    env.cluster
+        .update_status::<VmSpec>(moving.id, &moving.status)
+        .await
+        .unwrap();
     let running = TaskState::Running;
     let resize = TaskOp::VolumeResize {
         size_bytes: 2 << 20,
@@ -355,7 +379,7 @@ async fn volumes_left_active_are_deactivated() {
         v.sort();
         v
     };
-    let want = kept(&["boot", "resizing", "snapping", "making"]);
+    let want = kept(&["boot", "resizing", "snapping", "making", "coming"]);
     let active = || {
         let mut v = storage.active();
         v.sort();

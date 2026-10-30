@@ -1,5 +1,5 @@
 //! VM 라이브 마이그레이션 API: 요청 검사(설계 §4)와 마이그레이션 중 다른 동작 막기.
-//! 실제 마이그레이션은 아직 없다. Task 실행기는 "not supported yet"으로 실패시킨다.
+//! 이 노드 하나만 실제로 돈다(노드 간 클라이언트가 없다). 실제 마이그레이션은 `two_nodes.rs`가 본다.
 
 mod common;
 
@@ -143,7 +143,15 @@ async fn migrate_creates_a_task_on_the_source_node() {
     assert_eq!(task["spec"]["node"], env.node.to_string());
     let task = admin.wait_task(&task).await;
     assert_eq!(task["status"]["state"], "failed", "{task}");
-    assert_eq!(task["status"]["error"], "VM migration is not supported yet");
+    assert_eq!(
+        task["status"]["error"],
+        "this node cannot reach other nodes"
+    );
+    // 원본 VM은 그대로 돈다.
+    let vm = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
+    assert_eq!(vm.spec.node, Some(env.node));
+    assert_eq!(vm.status.phase, VmPhase::Running);
+    assert_eq!(vm.status.migration, None);
 
     // 노드는 id로도 고른다. 이름이 없으면 404, 지금 노드면 400이다.
     let (status, task) = migrate(&admin, "web", &node2.to_string()).await;

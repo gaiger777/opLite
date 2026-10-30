@@ -12,7 +12,7 @@ use opl_cluster::store::StoreError;
 use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig, ClusterError};
 use opl_driver::{DirStorage, Hypervisor, MockHypervisor};
-use opl_reconciler::{Reconciler, ReconcilerConfig, RestartBackoff};
+use opl_reconciler::{Reconciler, ReconcilerConfig, ReconcilerHandle, RestartBackoff};
 use opl_types::resource::Resource;
 use opl_types::vm::{CpuModel, CpuSpec, Firmware, PowerState, Vm, VmSpec};
 use tempfile::TempDir;
@@ -236,6 +236,10 @@ impl Env {
             .unwrap()
             .handle()
             .restore_on_start(id, tag.into());
+    }
+
+    pub fn handle(&self) -> ReconcilerHandle {
+        self.reconciler.as_ref().unwrap().handle()
     }
 
     pub fn clear_restore(&self, id: Uuid) {

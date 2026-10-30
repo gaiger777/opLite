@@ -20,19 +20,33 @@ use crate::worker::{Trigger, Worker};
 pub struct Reconciler {
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<()>,
-    commands: mpsc::UnboundedSender<Uuid>,
+    commands: mpsc::UnboundedSender<Command>,
     restores: Restores,
+    held: Held,
 }
 
 /// VM별로 다음 시작에 불러올 스냅샷 태그. 이 노드의 메모리에만 있어 opld가 재시작하면 사라진다.
 pub(crate) type Restores = Arc<Mutex<HashMap<Uuid, String>>>;
 
+/// 이 노드의 마이그레이션 Task가 다루는 중인 VM(`ReconcilerHandle::begin_migration`). 작업자는
+/// 이 VM에 손대지 않는다. 메모리에만 있으므로 opld가 재시작하면 풀린다.
+pub(crate) type Held = Arc<Mutex<HashSet<Uuid>>>;
+
+/// 작업자에게 보내는 일회성 명령
+enum Command {
+    ForceStop(Uuid),
+    /// 그 VM의 작업자가 지금 하던 단계를 마치면 알린다.
+    Barrier(Uuid, oneshot::Sender<()>),
+    Sync(Uuid),
+}
+
 /// 실행 중인 reconciler에 VM별 일회성 명령을 보낸다. 명령은 그 VM의 작업자 큐를 거치므로
 /// 같은 VM에 대한 드라이버 호출이 겹치지 않는다.
 #[derive(Clone)]
 pub struct ReconcilerHandle {
-    commands: mpsc::UnboundedSender<Uuid>,
+    commands: mpsc::UnboundedSender<Command>,
     restores: Restores,
+    held: Held,
 }
 
 impl ReconcilerHandle {
@@ -40,7 +54,7 @@ impl ReconcilerHandle {
     /// stopped로 기록한 뒤에 부른다. 이 노드에 배정되지 않은 VM이거나 원하는 상태가 running이면
     /// 아무것도 하지 않는다. 결과는 VM status로 확인한다.
     pub fn force_stop(&self, id: Uuid) {
-        let _ = self.commands.send(id);
+        let _ = self.commands.send(Command::ForceStop(id));
     }
 
     /// 이 노드에서 VM을 다음에 새로 띄울 때 한 번만 이 스냅샷 태그를 불러와 이어서 실행한다.
@@ -54,6 +68,25 @@ impl ReconcilerHandle {
     pub fn clear_restore(&self, id: Uuid) {
         self.restores.lock().unwrap().remove(&id);
     }
+
+    /// 라이브 마이그레이션을 보내는 동안 작업자가 이 VM에 손대지 않게 한다(status를 덮어쓰거나, 멈춘
+    /// 원본을 이어서 실행하거나, 이벤트로 다시 시작하지 않는다). 작업자가 하던 단계를 마칠 때까지
+    /// 기다린 뒤 돌아오므로, 돌아온 뒤에 쓴 status를 작업자가 덮지 않는다. 반드시
+    /// [`end_migration`](Self::end_migration)으로 푼다.
+    pub async fn begin_migration(&self, id: Uuid) {
+        self.held.lock().unwrap().insert(id);
+        let (tx, rx) = oneshot::channel();
+        if self.commands.send(Command::Barrier(id, tx)).is_ok() {
+            // 작업자가 없으면 보낸 쪽이 버려져 곧바로 돌아온다.
+            let _ = rx.await;
+        }
+    }
+
+    /// [`begin_migration`](Self::begin_migration)을 풀고 작업자가 VM을 다시 맞추게 한다.
+    pub fn end_migration(&self, id: Uuid) {
+        self.held.lock().unwrap().remove(&id);
+        let _ = self.commands.send(Command::Sync(id));
+    }
 }
 
 impl Reconciler {
@@ -61,11 +94,13 @@ impl Reconciler {
         let (shutdown, rx) = oneshot::channel();
         let (commands, command_rx) = mpsc::unbounded_channel();
         let restores = Restores::default();
+        let held = Held::default();
         let dispatcher = Dispatcher {
             cluster,
             hv,
             config: Arc::new(config),
             restores: restores.clone(),
+            held: held.clone(),
             workers: HashMap::new(),
             retired: HashMap::new(),
         };
@@ -74,6 +109,7 @@ impl Reconciler {
             task: tokio::spawn(dispatcher.run(rx, command_rx)),
             commands,
             restores,
+            held,
         }
     }
 
@@ -81,6 +117,7 @@ impl Reconciler {
         ReconcilerHandle {
             commands: self.commands.clone(),
             restores: self.restores.clone(),
+            held: self.held.clone(),
         }
     }
 
@@ -110,6 +147,7 @@ struct Dispatcher {
     hv: Arc<dyn Hypervisor>,
     config: Arc<ReconcilerConfig>,
     restores: Restores,
+    held: Held,
     /// 이 노드에 배정된 VM의 작업자
     workers: HashMap<Uuid, WorkerHandle>,
     /// 내보냈지만 아직 끝나지 않았을 수 있는 작업자. 같은 VM이 다시 배정되면 새 작업자가 기다린다.
@@ -120,7 +158,7 @@ impl Dispatcher {
     async fn run(
         mut self,
         mut shutdown: oneshot::Receiver<()>,
-        mut commands: mpsc::UnboundedReceiver<Uuid>,
+        mut commands: mpsc::UnboundedReceiver<Command>,
     ) {
         // 목록을 읽기 전에 구독해야 그 사이에 난 이벤트를 놓치지 않는다.
         let mut events = self.hv.subscribe();
@@ -159,11 +197,20 @@ impl Dispatcher {
                         Err(broadcast::error::RecvError::Lagged(_)) => continue 'sync,
                         Err(broadcast::error::RecvError::Closed) => break 'sync,
                     },
-                    Some(id) = commands.recv() => {
-                        if !self.notify(id, Trigger::ForceStop) {
-                            tracing::warn!(vm = %id, "force stop for a VM not assigned to this node");
+                    Some(command) = commands.recv() => match command {
+                        Command::ForceStop(id) => {
+                            if !self.notify(id, Trigger::ForceStop) {
+                                tracing::warn!(vm = %id, "force stop for a VM not assigned to this node");
+                            }
                         }
-                    }
+                        // 작업자가 없으면 보낸 쪽이 버려진다(기다릴 단계가 없다).
+                        Command::Barrier(id, done) => {
+                            self.notify(id, Trigger::Barrier(done));
+                        }
+                        Command::Sync(id) => {
+                            self.notify(id, Trigger::Sync);
+                        }
+                    },
                 }
             }
         }
@@ -239,6 +286,7 @@ impl Dispatcher {
             self.hv.clone(),
             self.config.clone(),
             self.restores.clone(),
+            self.held.clone(),
         );
         let previous = self.retired.remove(&id);
         let task = tokio::spawn(worker.run(previous, rx));

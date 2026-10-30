@@ -87,38 +87,34 @@ impl IncomingMigrations {
             }
         }
     }
+}
 
-    /// 받으려고 켠 디스크 볼륨을 끈다. 끄지 못하면 경고만 남긴다(남은 볼륨은 Task 실행기의 정리가 끈다).
-    async fn deactivate_disks(&self, vm: &Vm) {
-        for disk in &vm.spec.disks {
-            let found = self
-                .cluster
-                .get_by_name::<VolumeSpec>(&disk.volume)
-                .and_then(|volume| {
-                    let Some(volume) = volume else {
-                        return Ok(None);
-                    };
-                    let pool = self
-                        .cluster
-                        .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?;
-                    Ok(pool.map(|pool| (volume, pool)))
-                });
-            let (volume, pool) = match found {
-                Ok(Some(found)) => found,
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::warn!(vm = %vm.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
-                    continue;
-                }
-            };
-            if let Err(e) = self
-                .config
-                .storage
-                .deactivate_volume(&pool, volume.id, volume.spec.format)
-                .await
-            {
+/// VM 디스크의 볼륨을 이 노드에서 끈다(받으려고 켰거나, 마이그레이션을 보낸 원본·남은 받는 QEMU의
+/// 디스크). 끄지 못하면 경고만 남긴다(남은 볼륨은 Task 실행기의 정리가 끈다).
+pub(crate) async fn deactivate_disks(cluster: &Cluster, storage: &dyn Storage, vm: &Vm) {
+    for disk in &vm.spec.disks {
+        let found = cluster
+            .get_by_name::<VolumeSpec>(&disk.volume)
+            .and_then(|volume| {
+                let Some(volume) = volume else {
+                    return Ok(None);
+                };
+                let pool = cluster.get_by_name::<StoragePoolSpec>(&volume.spec.pool)?;
+                Ok(pool.map(|pool| (volume, pool)))
+            });
+        let (volume, pool) = match found {
+            Ok(Some(found)) => found,
+            Ok(None) => continue,
+            Err(e) => {
                 tracing::warn!(vm = %vm.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
+                continue;
             }
+        };
+        if let Err(e) = storage
+            .deactivate_volume(&pool, volume.id, volume.spec.format)
+            .await
+        {
+            tracing::warn!(vm = %vm.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
         }
     }
 }
@@ -155,7 +151,7 @@ impl MigrationReceiver for IncomingMigrations {
                 Ok(port)
             }
             Err(e) => {
-                self.deactivate_disks(&vm).await;
+                deactivate_disks(&self.cluster, &*self.config.storage, &vm).await;
                 Err(IncomingError::Failed(e.to_string()))
             }
         }
@@ -206,7 +202,7 @@ impl MigrationReceiver for IncomingMigrations {
             return Ok(());
         }
         if let Some(vm) = &vm {
-            self.deactivate_disks(vm).await;
+            deactivate_disks(&self.cluster, &*self.config.storage, vm).await;
         }
         Ok(())
     }
