@@ -23,6 +23,8 @@ const lvm = pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp
 const zfs = pool("tank", { backend: { kind: "zfs", dataset: "tank/opl" } });
 const rbd = (namespace?: string) =>
   pool("ceph", { backend: { kind: "rbd", pool: "rbd", ...(namespace && { namespace }) } });
+const lvmShared = (iscsi?: { portal: string; target: string }) =>
+  pool("san", { backend: { kind: "lvm-shared", vg: "san", ...(iscsi && { iscsi }) } });
 const withPool = (
   id: string,
   name: string,
@@ -48,6 +50,10 @@ it("shows where a pool keeps its files", () => {
   expect(poolLocation(zfs)).toBe("tank/opl");
   expect(poolLocation(rbd())).toBe("rbd");
   expect(poolLocation(rbd("opl"))).toBe("rbd/opl");
+  expect(poolLocation(lvmShared())).toBe("san");
+  expect(poolLocation(lvmShared({ portal: "10.0.0.5:3260", target: "iqn.2003-01.org:opl" }))).toBe(
+    "san @ 10.0.0.5:3260 iqn.2003-01.org:opl",
+  );
 });
 
 it("checks LVM names like the server", () => {
@@ -251,6 +257,16 @@ it("takes the capacity from online nodes where the pool is ready", () => {
     status: { ...NODE.status, pools: { ceph: poolState("ceph", { available_bytes: GIB }) } },
   });
   expect(poolCapacity(rbd(), [ceph("n1", "node-a"), ceph("n2", "node-b")])).toEqual([
+    { node: null, free: GIB, total: 128 * GIB },
+  ]);
+  // 공유 LVM 풀도 그렇다.
+  const san = (id: string, name: string) => ({
+    ...NODE,
+    id,
+    name,
+    status: { ...NODE.status, pools: { san: poolState("san", { available_bytes: GIB }) } },
+  });
+  expect(poolCapacity(lvmShared(), [san("n1", "node-a"), san("n2", "node-b")])).toEqual([
     { node: null, free: GIB, total: 128 * GIB },
   ]);
 });

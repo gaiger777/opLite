@@ -309,7 +309,8 @@ impl LvmThinStorage {
             PoolBackend::Dir { .. }
             | PoolBackend::Nfs { .. }
             | PoolBackend::Zfs { .. }
-            | PoolBackend::Rbd { .. } => {
+            | PoolBackend::Rbd { .. }
+            | PoolBackend::LvmShared { .. } => {
                 Err(DriverError::InvalidSpec("not an lvm-thin pool".into()))
             }
         }

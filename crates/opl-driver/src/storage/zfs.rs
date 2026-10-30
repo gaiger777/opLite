@@ -382,7 +382,10 @@ impl ZfsStorage {
             PoolBackend::Dir { .. }
             | PoolBackend::Nfs { .. }
             | PoolBackend::LvmThin { .. }
-            | PoolBackend::Rbd { .. } => Err(DriverError::InvalidSpec("not a zfs pool".into())),
+            | PoolBackend::Rbd { .. }
+            | PoolBackend::LvmShared { .. } => {
+                Err(DriverError::InvalidSpec("not a zfs pool".into()))
+            }
         }
     }
 

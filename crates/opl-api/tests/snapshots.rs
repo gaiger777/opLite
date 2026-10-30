@@ -445,6 +445,41 @@ async fn lvm_disks_take_disk_snapshots_of_one_method() {
     assert_eq!(body["code"], "snapshot_unsupported");
 }
 
+/// 공유 LVM 디스크는 스냅샷을 담지 못한다. 그런 디스크가 하나라도 있는 VM의 스냅샷은 409다.
+#[tokio::test]
+async fn lvm_shared_disks_cannot_be_snapshotted() {
+    let env = env().await;
+    let admin = env.admin().await;
+    pool(&env, vec![]).await;
+    volume(&env, "root", ImageFormat::Qcow2).await;
+    let backend = PoolBackend::LvmShared {
+        vg: "san".into(),
+        iscsi: None,
+    };
+    block_volume(&env, "san", backend.clone(), "s0", ImageFormat::Raw).await;
+    block_volume(&env, "san", backend, "s1", ImageFormat::Raw).await;
+
+    let web = vm_with_disks(&admin, "web", &["s0"]).await;
+    set_vm_status(&env, web, VmPhase::Running, Some(env.node)).await;
+    vm_with_disks(&admin, "mixed", &["root", "s1"]).await;
+    for (vm, request) in [
+        ("web", json!({ "name": "a" })),
+        ("web", json!({ "name": "m", "memory": true })),
+        ("mixed", json!({ "name": "a" })),
+    ] {
+        let (status, body) = admin.post(&format!("/vms/{vm}/snapshots"), request).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{vm}: {body}");
+        assert_eq!(body["code"], "snapshot_unsupported");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("disks in storage pool \"san\" cannot be snapshotted"),
+            "{body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn zfs_disks_take_block_snapshots_of_their_own_method() {
     let env = env().await;

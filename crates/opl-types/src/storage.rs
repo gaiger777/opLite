@@ -18,7 +18,7 @@ pub struct StoragePoolSpec {
     /// 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드.
     #[serde(default)]
     pub nodes: Vec<Uuid>,
-    /// 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`).
+    /// 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`).
     #[serde(default)]
     pub shared: bool,
 }
@@ -78,6 +78,26 @@ pub enum PoolBackend {
         #[serde(default)]
         conf: Option<String>,
     },
+    /// 여러 노드가 함께 보는 LUN 위의 공유 VG(lvmlockd)에 볼륨마다 두꺼운 LV(`opl-{id}`, raw)를 둔다.
+    /// 늘 공유 풀이고, 공유 VG와 lvmlockd·sanlock은 관리자가 준비해 둔다.
+    LvmShared {
+        /// 공유 볼륨 그룹 이름
+        vg: String,
+        /// VG가 놓인 iSCSI LUN. 있으면 노드가 그 타깃에 로그인한다. 없으면 LUN이 이미 보인다(FC 등).
+        #[serde(default)]
+        iscsi: Option<IscsiTarget>,
+    },
+}
+
+/// 노드가 로그인할 iSCSI 타깃
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct IscsiTarget {
+    /// `호스트[:포트]` 또는 `[IPv6][:포트]`
+    pub portal: String,
+    /// 타깃 이름(`iqn.`·`eui.`·`naa.`로 시작)
+    pub target: String,
 }
 
 impl StoragePoolSpec {
@@ -144,6 +164,19 @@ impl StoragePoolSpec {
                     return Err(PoolError::BadRbdConf(conf.clone()));
                 }
             }
+            PoolBackend::LvmShared { vg, iscsi } => {
+                if !valid_lvm_name(vg) {
+                    return Err(PoolError::BadLvmName(vg.clone()));
+                }
+                if let Some(IscsiTarget { portal, target }) = iscsi {
+                    if !valid_portal(portal) {
+                        return Err(PoolError::BadIscsiPortal(portal.clone()));
+                    }
+                    if !valid_iscsi_target(target) {
+                        return Err(PoolError::BadIscsiTarget(target.clone()));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -160,6 +193,39 @@ fn valid_server(server: &str) -> bool {
         && server
             .bytes()
             .all(|c| c.is_ascii_graphic() && !b":,/[]".contains(&c))
+}
+
+/// iSCSI 포털: `호스트[:포트]` 또는 `[IPv6][:포트]`. 호스트는 NFS 서버와 같은 규칙이되 IPv6는
+/// 포트와 헷갈리지 않게 `[...]`로 감싼다. 포트는 1–65535.
+fn valid_portal(portal: &str) -> bool {
+    let (host_ok, port) = match portal.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((addr, port)) => (addr.parse::<std::net::Ipv6Addr>().is_ok(), port),
+            None => return false,
+        },
+        None => match portal.find(':') {
+            Some(i) => (valid_server(&portal[..i]), &portal[i..]),
+            None => (valid_server(portal), ""),
+        },
+    };
+    host_ok
+        && (port.is_empty()
+            || port.strip_prefix(':').is_some_and(|p| {
+                !p.is_empty()
+                    && p.bytes().all(|c| c.is_ascii_digit())
+                    && p.parse::<u16>().is_ok_and(|n| n > 0)
+            }))
+}
+
+/// iSCSI 타깃 이름: `iqn.`·`eui.`·`naa.`로 시작하고 소문자·숫자·`.`·`:`·`-`로만 된 223바이트 이하
+fn valid_iscsi_target(target: &str) -> bool {
+    target.len() <= 223
+        && ["iqn.", "eui.", "naa."]
+            .iter()
+            .any(|p| target.len() > p.len() && target.starts_with(p))
+        && target
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b".:-".contains(&c))
 }
 
 /// LVM 이름(VG, LV): `A-Za-z0-9+_.-`의 1–127자이고 `-`로 시작하지 않는다(명령 옵션으로 읽히지 않게).
@@ -226,25 +292,26 @@ fn denied_option(option: &str) -> bool {
     ) || name.starts_with("x-")
 }
 
-/// 모든 노드가 같은 데이터를 보는 풀인지. NFS·RBD 풀은 `shared` 값과 상관없이 공유이고, LVM-thin·ZFS
-/// 풀은 늘 노드 로컬이다.
+/// 모든 노드가 같은 데이터를 보는 풀인지. NFS·RBD·공유 LVM 풀은 `shared` 값과 상관없이 공유이고,
+/// LVM-thin·ZFS 풀은 늘 노드 로컬이다.
 pub fn is_shared(pool: &StoragePool) -> bool {
     match pool.spec.backend {
         PoolBackend::Dir { .. } => pool.spec.shared,
-        PoolBackend::Nfs { .. } | PoolBackend::Rbd { .. } => true,
+        PoolBackend::Nfs { .. } | PoolBackend::Rbd { .. } | PoolBackend::LvmShared { .. } => true,
         PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } => false,
     }
 }
 
 /// 이 백엔드의 `format` 볼륨이 스냅샷을 담을 수 있는지. 파일 풀(dir, nfs)은 qcow2 내부 스냅샷,
 /// LVM-thin 풀은 raw 볼륨의 thin 스냅샷, ZFS 풀은 raw zvol의 ZFS 스냅샷, RBD 풀은 raw 이미지의 RBD
-/// 스냅샷이다.
+/// 스냅샷이다. 공유 LVM 풀은 스냅샷을 담지 못한다.
 pub fn pool_kind_supports_snapshots(backend: &PoolBackend, format: ImageFormat) -> bool {
     match backend {
         PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => format == ImageFormat::Qcow2,
         PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } | PoolBackend::Rbd { .. } => {
             format == ImageFormat::Raw
         }
+        PoolBackend::LvmShared { .. } => false,
     }
 }
 
@@ -265,7 +332,8 @@ pub fn pool_state_on<'a>(pool: &StoragePool, node: &'a Node) -> Option<&'a PoolS
 /// 이 노드에서 풀을 쓸 수 있는지: 노드 목록이 허용하고, 노드가 알린 그 풀의 상태가 준비됨.
 /// 디렉터리 풀은 노드가 상태를 아직 알리지 않았어도(옛 노드, 첫 새로 고침 전) 쓸 수 있다고 보고
 /// 준비되지 않았다고 알렸을 때만 막는다. NFS 풀은 마운트됐다고, LVM-thin 풀은 thin pool이, ZFS 풀은
-/// 데이터셋이 있다고, RBD 풀은 Ceph 풀에 닿는다고 알려야 한다.
+/// 데이터셋이 있다고, RBD 풀은 Ceph 풀에 닿는다고, 공유 LVM 풀은 공유 VG의 잠금이 시작됐다고 알려야
+/// 한다.
 pub fn pool_usable_on(pool: &StoragePool, node: &Node) -> bool {
     pool_listed_on(pool, node.id)
         && match pool_state_on(pool, node) {
@@ -318,6 +386,15 @@ pub enum PoolError {
         "invalid ceph conf path {0:?}: use an absolute path without control characters, ',', ':' or '='"
     )]
     BadRbdConf(String),
+    #[error(
+        "invalid iscsi portal {0:?}: use host[:port] or [ipv6][:port] with a port from 1 to 65535"
+    )]
+    BadIscsiPortal(String),
+    #[error(
+        "invalid iscsi target {0:?}: use at most 223 characters from a-z, 0-9, '.', ':' and '-', \
+         starting with iqn., eui. or naa."
+    )]
+    BadIscsiTarget(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -717,6 +794,7 @@ mod tests {
             (&lvm, false, true),
             (&zfs, false, true),
             (&rbd("rbd").backend, false, true),
+            (&lvm_shared("vg0", None).backend, false, false),
         ] {
             assert_eq!(
                 pool_kind_supports_snapshots(backend, ImageFormat::Qcow2),
@@ -973,6 +1051,165 @@ mod tests {
             ..Default::default()
         };
         node.status.pools.insert("r".into(), state);
+        assert!(pool_usable_on(&pool, &node));
+    }
+
+    fn lvm_shared(vg: &str, iscsi: Option<(&str, &str)>) -> StoragePoolSpec {
+        StoragePoolSpec {
+            backend: PoolBackend::LvmShared {
+                vg: vg.into(),
+                iscsi: iscsi.map(|(portal, target)| IscsiTarget {
+                    portal: portal.into(),
+                    target: target.into(),
+                }),
+            },
+            nodes: vec![],
+            shared: true,
+        }
+    }
+
+    const IQN: &str = "iqn.2003-01.org.linux-iscsi.san:opl";
+
+    #[test]
+    fn lvm_shared_pool_round_trips() {
+        let spec: StoragePoolSpec = serde_json::from_value(serde_json::json!({
+            "backend": { "kind": "lvm-shared", "vg": "san" }, "shared": true
+        }))
+        .unwrap();
+        assert_eq!(spec, lvm_shared("san", None));
+        let full = lvm_shared("san", Some(("10.0.0.5:3260", IQN)));
+        let json = serde_json::to_value(&full).unwrap();
+        assert_eq!(
+            json["backend"],
+            serde_json::json!({
+                "kind": "lvm-shared", "vg": "san",
+                "iscsi": { "portal": "10.0.0.5:3260", "target": IQN }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<StoragePoolSpec>(json).unwrap(),
+            full
+        );
+        for typo in [
+            serde_json::json!({ "kind": "lvm-shared", "vg": "san", "thinpool": "tp" }),
+            serde_json::json!({
+                "kind": "lvm-shared", "vg": "san",
+                "iscsi": { "portal": "nas", "target": IQN, "chap": "secret" }
+            }),
+            serde_json::json!({ "kind": "lvm-shared", "vg": "san", "iscsi": { "portal": "nas" } }),
+        ] {
+            let res =
+                serde_json::from_value::<StoragePoolSpec>(serde_json::json!({ "backend": typo }));
+            assert!(res.is_err(), "{typo}");
+        }
+    }
+
+    #[test]
+    fn validates_lvm_shared_vg_portal_and_target() {
+        assert_eq!(lvm_shared("san", None).validate(), Ok(()));
+        // VG 이름은 LVM-thin과 같은 규칙이다.
+        for bad in ["", "-vg", "a/b", "snapshot"] {
+            assert_eq!(
+                lvm_shared(bad, None).validate(),
+                Err(PoolError::BadLvmName(bad.into())),
+                "{bad}"
+            );
+        }
+        for ok in [
+            "san.lan",
+            "san.lan:3260",
+            "10.0.0.5",
+            "10.0.0.5:1",
+            "NAS-01:65535",
+            "[fd00::5]",
+            "[::1]:3260",
+        ] {
+            assert_eq!(
+                lvm_shared("san", Some((ok, IQN))).validate(),
+                Ok(()),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "",
+            "san lan",
+            "-oremount",
+            "a,b",
+            "a/b",
+            "san:",
+            "san:0",
+            "san:65536",
+            "san:+80",
+            "san:32a",
+            "san:3260:1",
+            // IPv6는 포트와 헷갈리지 않게 `[...]`로 감싼다.
+            "fd00::5",
+            "[fd00::5",
+            "[nas]:3260",
+            "[fd00::5]3260",
+            "[fd00::5]:",
+            ":3260",
+        ] {
+            assert_eq!(
+                lvm_shared("san", Some((bad, IQN))).validate(),
+                Err(PoolError::BadIscsiPortal(bad.into())),
+                "{bad}"
+            );
+        }
+        let long = format!("iqn.{}", "a".repeat(219));
+        for ok in [
+            IQN,
+            "eui.02004567a425678d",
+            "naa.52004567ba64678d",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                lvm_shared("san", Some(("san", ok))).validate(),
+                Ok(()),
+                "{ok}"
+            );
+        }
+        let too_long = format!("iqn.{}", "a".repeat(220));
+        for bad in [
+            "",
+            "iqn.",
+            "opl",
+            "IQN.2003-01.org:opl",
+            "iqn.2003-01.org:OPL",
+            "iqn.2003-01.org:my opl",
+            "iqn.2003-01.org:a,b",
+            "iqn.2003-01.org:a_b",
+            "-iqn.2003",
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                lvm_shared("san", Some(("san", bad))).validate(),
+                Err(PoolError::BadIscsiTarget(bad.into())),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn lvm_shared_pools_are_always_shared_and_need_a_ready_state() {
+        let mut pool = StoragePool::new("s", lvm_shared("san", None));
+        assert!(is_shared(&pool));
+        pool.spec.shared = false;
+        assert!(is_shared(&pool));
+        let mut node: Node = Resource::new(
+            "n1",
+            crate::node::NodeSpec {
+                address: "a".into(),
+                maintenance: false,
+            },
+        );
+        assert!(!pool_usable_on(&pool, &node));
+        let state = PoolState {
+            pool_id: pool.id,
+            ready: true,
+            ..Default::default()
+        };
+        node.status.pools.insert("s".into(), state);
         assert!(pool_usable_on(&pool, &node));
     }
 

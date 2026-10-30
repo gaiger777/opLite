@@ -20,6 +20,8 @@ enum Kind {
     LvmThin,
     Zfs,
     Rbd,
+    /// 아직 다루는 저장소가 없다.
+    LvmShared,
 }
 
 impl Kind {
@@ -29,6 +31,7 @@ impl Kind {
             PoolBackend::LvmThin { .. } => Kind::LvmThin,
             PoolBackend::Zfs { .. } => Kind::Zfs,
             PoolBackend::Rbd { .. } => Kind::Rbd,
+            PoolBackend::LvmShared { .. } => Kind::LvmShared,
         }
     }
 }
@@ -95,6 +98,9 @@ impl Storages {
                 .rbd
                 .as_ref()
                 .ok_or_else(|| DriverError::InvalidSpec("rbd pools are not supported yet".into())),
+            Kind::LvmShared => Err(DriverError::InvalidSpec(
+                "lvm-shared pools are not supported yet".into(),
+            )),
         }
     }
 
@@ -916,6 +922,41 @@ mod tests {
         unsupported(
             storages
                 .copy_volume(&zfs_pool(), id, f, None, false, &p, id, f)
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(taken(&log), Vec::<String>::new());
+    }
+
+    /// 공유 LVM 풀은 아직 쓸 수 없다(다른 저장소로 보내지 않는다).
+    #[tokio::test]
+    async fn lvm_shared_pool_is_unsupported_for_now() {
+        let log = Log::default();
+        let storages = Storages::new(
+            "qemu-img",
+            Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
+        )
+        .with_lvm_thin(Arc::new(Recorder::new("lvm", "/l".as_ref(), &log)))
+        .with_zfs(Arc::new(Recorder::new("zfs", "/z".as_ref(), &log)))
+        .with_rbd(Arc::new(Recorder::new("rbd", "/r".as_ref(), &log)));
+        let p = pool(PoolBackend::LvmShared {
+            vg: "san".into(),
+            iscsi: None,
+        });
+        let (id, f) = (Uuid::nil(), ImageFormat::Raw);
+        let unsupported = |e: DriverError| match e {
+            DriverError::InvalidSpec(msg) => {
+                assert_eq!(msg, "lvm-shared pools are not supported yet")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        };
+        unsupported(storages.create_volume(&p, id, 1, f).await.unwrap_err());
+        unsupported(storages.activate_volume(&p, id, f).await.unwrap_err());
+        unsupported(storages.capacity(&p).await.unwrap_err());
+        assert!(!storages.supports_snapshots(&p, f));
+        unsupported(
+            storages
+                .copy_volume(&lvm_pool(), id, f, None, false, &p, id, f)
                 .await
                 .unwrap_err(),
         );

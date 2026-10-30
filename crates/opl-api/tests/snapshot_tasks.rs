@@ -1468,6 +1468,28 @@ async fn running_vm_zfs_disk_grows_in_storage_before_qemu() {
     assert_eq!(env.hv.disk_size(vm, 0), Some(4 << 20));
 }
 
+/// 공유 LVM 디스크도 블록 볼륨이므로 스토리지로 먼저 늘린 뒤 QEMU에 알린다.
+#[tokio::test]
+async fn running_vm_lvm_shared_disk_grows_in_storage_before_qemu() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let shared = PoolBackend::LvmShared {
+        vg: "san".into(),
+        iscsi: None,
+    };
+    let (lvs, storage) = block_volumes(&mut env, &[("s", shared, &["s0"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["s0"]).await;
+    storage.round_resizes(4 << 20);
+
+    let (status, task) = admin
+        .post("/volumes/s0/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(storage.calls(), [("resize", lvs[0])]);
+    assert_eq!(env.hv.disk_size(vm, 0), Some(4 << 20));
+}
+
 #[tokio::test]
 async fn running_vm_lvm_disk_grows_in_storage_before_qemu() {
     let mut env = Env::start().await;

@@ -515,6 +515,41 @@ async fn resolves_rbd_volumes_to_images() {
     );
 }
 
+/// 공유 LVM 풀의 디스크는 아직 쓸 수 없다. 기다려도 풀리지 않으므로 참조 오류이고, 볼륨을 활성화하지
+/// 않는다.
+#[tokio::test]
+async fn refuses_lvm_shared_volumes_for_now() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let s: StoragePool = Resource::new(
+        "s",
+        StoragePoolSpec {
+            backend: PoolBackend::LvmShared {
+                vg: "san".into(),
+                iscsi: None,
+            },
+            nodes: vec![],
+            shared: true,
+        },
+    );
+    cluster.create(&s).await.unwrap();
+    let mut root = volume("root", "s");
+    root.spec.format = ImageFormat::Raw;
+    cluster.create(&root).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    let storage = Activations::default();
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::PoolUnsupported(n, why) if n == "s" && why == &"lvm-shared pools are not supported yet"),
+        "{err:?}"
+    );
+    assert!(storage.calls.lock().unwrap().is_empty());
+}
+
 /// ZFS 풀 `z`(데이터셋 `tank/opl`)와 그 raw 볼륨 `root`를 쓰는 VM을 만든다.
 async fn zfs_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, Vm) {
     let z: StoragePool = Resource::new(

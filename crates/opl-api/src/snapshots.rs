@@ -167,13 +167,13 @@ fn check_no_task(
 }
 
 /// 디스크 스냅샷을 블록 장치의 스냅샷으로 두는 풀의 종류(`lvm-thin`, `zfs`, `rbd`). 파일 풀(qcow2
-/// 내부 스냅샷)이면 `None`.
+/// 내부 스냅샷)과 스냅샷이 없는 공유 LVM 풀이면 `None`.
 pub(crate) fn block_snapshot_kind(pool: &StoragePool) -> Option<&'static str> {
     match pool.spec.backend {
         PoolBackend::LvmThin { .. } => Some("lvm-thin"),
         PoolBackend::Zfs { .. } => Some("zfs"),
         PoolBackend::Rbd { .. } => Some("rbd"),
-        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => None,
+        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } | PoolBackend::LvmShared { .. } => None,
     }
 }
 
@@ -216,17 +216,28 @@ fn check_disks(state: &AppState, vm: &Vm) -> Result<Option<&'static str>, ApiErr
                 ApiError::bad_request(format!("storage pool {:?} not found", volume.spec.pool))
             })?;
         if !pool_kind_supports_snapshots(&pool.spec.backend, volume.spec.format) {
-            let only = if uses_block_snapshots(&pool) {
-                "raw"
+            // 공유 LVM 풀은 어떤 형식의 스냅샷도 담지 못한다.
+            let why = if matches!(pool.spec.backend, PoolBackend::LvmShared { .. }) {
+                format!(
+                    "disks in storage pool {:?} cannot be snapshotted",
+                    pool.name
+                )
             } else {
-                "qcow2"
+                let only = if uses_block_snapshots(&pool) {
+                    "raw"
+                } else {
+                    "qcow2"
+                };
+                format!(
+                    "only {only} disks in storage pool {:?} can be snapshotted",
+                    pool.name
+                )
             };
             return Err(ApiError::conflict(
                 "snapshot_unsupported",
                 format!(
-                    "VM {:?} has disk {:?} that cannot be snapshotted; only {only} disks in \
-                     storage pool {:?} can be snapshotted",
-                    vm.name, disk.volume, pool.name
+                    "VM {:?} has disk {:?} that cannot be snapshotted; {why}",
+                    vm.name, disk.volume
                 ),
             ));
         }
@@ -667,6 +678,12 @@ mod tests {
             conf: None,
         });
         assert_eq!(block_snapshot_kind(&rbd), Some("rbd"));
+        // 공유 LVM 풀은 스냅샷이 없다.
+        let shared = pool(PoolBackend::LvmShared {
+            vg: "san".into(),
+            iscsi: None,
+        });
+        assert_eq!(block_snapshot_kind(&shared), None);
         assert!(!uses_block_snapshots(&dir));
         assert!(uses_block_snapshots(&zfs));
     }

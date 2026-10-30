@@ -33,6 +33,7 @@ const NFS_UNSUPPORTED: &str = "nfs pools are not supported on macOS";
 const LVM_UNSUPPORTED: &str = "lvm-thin pools are not supported on macOS";
 const ZFS_UNSUPPORTED: &str = "zfs pools are not supported on macOS";
 const RBD_UNSUPPORTED: &str = "rbd pools are not supported on macOS";
+const LVM_SHARED_UNSUPPORTED: &str = "lvm-shared pools are not supported yet";
 const QEMU_NO_RBD: &str = "qemu has no rbd block driver";
 const LVS_TIMED_OUT: &str = "lvs timed out";
 const ZFS_TIMED_OUT: &str = "zfs timed out";
@@ -589,6 +590,9 @@ impl Pools {
                         .unwrap_or_else(|| opl_driver::RBD_DEFAULT_USER.into()),
                     conf: conf.clone(),
                 };
+            }
+            PoolBackend::LvmShared { .. } => {
+                return Step::State(not_ready(pool.id, LVM_SHARED_UNSUPPORTED.into()));
             }
             PoolBackend::Nfs {
                 server,
@@ -1589,6 +1593,24 @@ mod tests {
         // QEMU의 rbd 드라이버는 한 번 확인하면 다시 확인하지 않는다.
         s.pools.tick().await.unwrap();
         assert!(!s.fake.calls().contains(&"qemu rbd".to_string()));
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// 공유 LVM 풀은 아직 확인하지 않고 준비되지 않았다고 적는다.
+    #[tokio::test]
+    async fn lvm_shared_pools_are_not_ready_yet() {
+        let mut s = setup().await;
+        let backend = PoolBackend::LvmShared {
+            vg: "san".into(),
+            iscsi: None,
+        };
+        let p = s.pool("s", backend, vec![]).await;
+        s.pools.tick().await.unwrap();
+        assert_eq!(s.fake.calls(), Vec::<String>::new());
+        assert_eq!(
+            s.states()["s"],
+            not_ready(p.id, "lvm-shared pools are not supported yet".into())
+        );
         s.cluster.shutdown().await.unwrap();
     }
 

@@ -6,7 +6,7 @@ type ImageFormat = components["schemas"]["ImageFormat"];
 
 /**
  * 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`), LVM-thin 풀은 `VG/THINPOOL`,
- * ZFS 풀은 데이터셋, RBD 풀은 `POOL[/NAMESPACE]`
+ * ZFS 풀은 데이터셋, RBD 풀은 `POOL[/NAMESPACE]`, 공유 LVM 풀은 `VG`(iSCSI면 `VG @ PORTAL TARGET`)
  */
 export function poolLocation(pool: StoragePool): string {
   const b = pool.spec.backend;
@@ -22,13 +22,16 @@ export function poolLocation(pool: StoragePool): string {
   if (b.kind === "rbd") {
     return b.namespace ? `${b.pool}/${b.namespace}` : b.pool;
   }
+  if (b.kind === "lvm-shared") {
+    return b.iscsi ? `${b.vg} @ ${b.iscsi.portal} ${b.iscsi.target}` : b.vg;
+  }
   return b.server.includes(":") ? `[${b.server}]:${b.export}` : `${b.server}:${b.export}`;
 }
 
-/** 모든 노드가 같은 데이터를 보는 풀인지. NFS·RBD 풀은 늘 공유다(서버의 `is_shared`). */
+/** 모든 노드가 같은 데이터를 보는 풀인지. NFS·RBD·공유 LVM 풀은 늘 공유다(서버의 `is_shared`). */
 export function isShared(pool: StoragePool): boolean {
   const kind = pool.spec.backend.kind;
-  return pool.spec.shared === true || kind === "nfs" || kind === "rbd";
+  return pool.spec.shared === true || kind === "nfs" || kind === "rbd" || kind === "lvm-shared";
 }
 
 /**

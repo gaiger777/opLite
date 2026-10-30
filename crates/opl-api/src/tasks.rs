@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::schedule::task_failed;
 use crate::snapshots::{uses_block_snapshots, vm_placement};
-use crate::volumes::usable_node;
+use crate::volumes::{block_pool_kind, usable_node};
 
 /// 새 Task를 저장소에 만든다. 이름은 id 문자열이다.
 pub(crate) async fn create_task(
@@ -791,7 +791,7 @@ async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 }
 
 /// 볼륨 크기를 늘린다(설계 §5). 실행 중인 VM이 쓰면 그 QEMU로(`block_resize`, 게스트가 바로
-/// 본다. 블록 볼륨(LVM-thin, ZFS, RBD)은 스토리지로 먼저 늘린다), 아니면 스토리지로 늘린 뒤 실제 크기를
+/// 본다. 블록 볼륨(LVM-thin, ZFS, RBD, 공유 LVM)은 스토리지로 먼저 늘린다), 아니면 스토리지로 늘린 뒤 실제 크기를
 /// 스펙에 기록한다. API가 확인한 뒤 VM이 켜지거나 꺼졌을 수 있고 앞의 Task가 크기를 바꿨을 수 있어 여기서
 /// 다시 본다.
 async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), String> {
@@ -823,7 +823,7 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
         // 크기와 같다.
         Some((vm, disk)) if vm.status.phase == VmPhase::Running => {
             let mut size_bytes = size_bytes;
-            if uses_block_snapshots(&pool) {
+            if block_pool_kind(&pool).is_some() {
                 ctx.storage
                     .resize_volume(&pool, id, volume.spec.format, size_bytes)
                     .await

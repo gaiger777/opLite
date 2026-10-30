@@ -246,13 +246,15 @@ pub trait Storage: Send + Sync {
 
 /// 풀의 볼륨 파일이 놓이는 디렉터리. `dir` 풀은 그 경로, `nfs` 풀은 이 노드의 마운트 지점
 /// `{mount_root}/{풀 id}`, `lvm-thin` 풀은 VG의 장치 디렉터리 `/dev/{vg}`, `zfs` 풀은 데이터셋의 zvol
-/// 장치 디렉터리 `/dev/zvol/{dataset}`이다(블록 풀에는 볼륨 파일이 없다). `rbd` 풀은 노드에 놓이는
-/// 곳이 없으므로 빈 경로다.
+/// 장치 디렉터리 `/dev/zvol/{dataset}`, `lvm-shared` 풀은 공유 VG의 장치 디렉터리 `/dev/{vg}`이다(블록
+/// 풀에는 볼륨 파일이 없다). `rbd` 풀은 노드에 놓이는 곳이 없으므로 빈 경로다.
 pub fn pool_root(pool: &StoragePool, mount_root: &Path) -> PathBuf {
     match &pool.spec.backend {
         PoolBackend::Dir { path } => path.clone(),
         PoolBackend::Nfs { .. } => mount_root.join(pool.id.to_string()),
-        PoolBackend::LvmThin { vg, .. } => Path::new("/dev").join(vg),
+        PoolBackend::LvmThin { vg, .. } | PoolBackend::LvmShared { vg, .. } => {
+            Path::new("/dev").join(vg)
+        }
         PoolBackend::Zfs { dataset } => Path::new("/dev/zvol").join(dataset),
         PoolBackend::Rbd { .. } => PathBuf::new(),
     }
@@ -294,6 +296,11 @@ fn check_pool_root_with(
         PoolBackend::Rbd { .. } => {
             return Err(DriverError::InvalidSpec(
                 "rbd pools hold no volume files".into(),
+            ));
+        }
+        PoolBackend::LvmShared { .. } => {
+            return Err(DriverError::InvalidSpec(
+                "lvm-shared pools hold no volume files".into(),
             ));
         }
         PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => {}
@@ -374,6 +381,11 @@ fn disk_location_in(
             conf.as_ref(),
             id,
         )));
+    }
+    if let PoolBackend::LvmShared { .. } = &pool.spec.backend {
+        return Err(DriverError::InvalidSpec(
+            "lvm-shared pools are not supported yet".into(),
+        ));
     }
     check_pool_root(pool, mount_root)?;
     Ok(DiskLocation::Path(
@@ -1306,6 +1318,43 @@ mod tests {
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
         refused(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
         refused(storage.capacity(&p).await.unwrap_err());
+    }
+
+    /// 파일 저장소는 공유 LVM 풀도 다루지 않고, 디스크 위치도 아직 정하지 않는다. 풀 루트는 VG의 장치
+    /// 디렉터리다.
+    #[tokio::test]
+    async fn lvm_shared_pools_are_not_file_pools() {
+        let tools = tempfile::tempdir().unwrap();
+        let mnt = tempfile::tempdir().unwrap();
+        let p: StoragePool = Resource::new(
+            "s",
+            StoragePoolSpec {
+                backend: PoolBackend::LvmShared {
+                    vg: "san".into(),
+                    iscsi: None,
+                },
+                nodes: vec![],
+                shared: true,
+            },
+        );
+        assert_eq!(pool_root(&p, mnt.path()), PathBuf::from("/dev/san"));
+        let storage = DirStorage::new(fake_tool(tools.path(), "exit 1"), mnt.path());
+        let refused = |e: DriverError| match e {
+            DriverError::InvalidSpec(msg) => {
+                assert_eq!(msg, "lvm-shared pools hold no volume files")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        };
+        refused(check_pool_root(&p, mnt.path()).unwrap_err());
+        let (id, f) = (Uuid::nil(), ImageFormat::Raw);
+        refused(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
+        refused(storage.capacity(&p).await.unwrap_err());
+        match disk_location(&p, mnt.path(), id, f).unwrap_err() {
+            DriverError::InvalidSpec(msg) => {
+                assert_eq!(msg, "lvm-shared pools are not supported yet")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     /// RBD 풀의 디스크는 경로가 아니라 RBD 이미지 `opl-{id}`다. 사용자가 없으면 `admin`이다.

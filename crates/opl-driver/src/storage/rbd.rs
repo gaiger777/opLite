@@ -443,7 +443,8 @@ pub(super) fn pool_target(pool: &StoragePool, id: Uuid) -> Option<RbdTarget> {
         PoolBackend::Dir { .. }
         | PoolBackend::Nfs { .. }
         | PoolBackend::LvmThin { .. }
-        | PoolBackend::Zfs { .. } => None,
+        | PoolBackend::Zfs { .. }
+        | PoolBackend::LvmShared { .. } => None,
     }
 }
 

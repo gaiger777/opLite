@@ -81,6 +81,24 @@ async fn rejects_bad_backend_values() {
             ),
             "ceph user with client.",
         ),
+        (
+            pool("s", json!({ "kind": "lvm-shared", "vg": "-san" })),
+            "shared vg starting with '-'",
+        ),
+        (
+            pool(
+                "s",
+                json!({ "kind": "lvm-shared", "vg": "san", "iscsi": { "portal": "fd00::5", "target": "iqn.2003-01.org:opl" } }),
+            ),
+            "ipv6 portal without brackets",
+        ),
+        (
+            pool(
+                "s",
+                json!({ "kind": "lvm-shared", "vg": "san", "iscsi": { "portal": "san", "target": "opl" } }),
+            ),
+            "target without iqn.",
+        ),
     ] {
         let (status, body) = admin.post("/storage-pools", bad).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
@@ -370,6 +388,66 @@ async fn rbd_volume_tasks_go_to_the_lowest_ready_node() {
     let (status, task) = admin.delete("/volumes/r").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     assert_eq!(task["spec"]["node"], low, "{task}");
+}
+
+/// 공유 LVM 풀은 늘 공유이고 raw 볼륨만 담는다. 가져오기의 기본 형식은 raw다.
+#[tokio::test]
+async fn lvm_shared_pools_are_always_shared_and_hold_raw_volumes() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let admin = env.admin().await;
+    let backend = json!({
+        "kind": "lvm-shared", "vg": "san",
+        "iscsi": { "portal": "[fd00::5]:3260", "target": "iqn.2003-01.org.linux-iscsi.san:opl" }
+    });
+    let (status, body) = admin
+        .post(
+            "/storage-pools",
+            json!({ "name": "s2", "spec": { "backend": backend, "shared": false } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(
+        body["message"], "lvm-shared pools are always shared",
+        "{body}"
+    );
+    // `shared`를 적지 않으면 공유 풀로 만든다.
+    let (status, body) = admin
+        .post("/storage-pools", pool("s", backend.clone()))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["spec"]["shared"], true, "{body}");
+    assert_eq!(body["spec"]["backend"], backend, "{body}");
+    env.pool_ready("s").await;
+
+    let create = |format: &str| json!({ "name": "disk", "spec": { "pool": "s", "size_bytes": 1 << 20, "format": format } });
+    let (status, body) = admin.post("/volumes", create("qcow2")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["message"], "lvm-shared pools hold raw volumes");
+    let (status, body) = admin.post("/volumes", create("raw")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    let check = |format: &str| {
+        format!("/volumes/import/check?name=up&pool=s&source_format=vmdk&size=512{format}")
+    };
+    let (status, body) = admin.post(&check("&format=qcow2"), Value::Null).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["message"], "lvm-shared pools hold raw volumes");
+    for format in ["&format=raw", ""] {
+        let (status, body) = admin.post(&check(format), Value::Null).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{format}: {body}");
+    }
+    let (status, task) = admin
+        .upload(
+            "/volumes/import?name=up&pool=s&source_format=raw",
+            vec![0; 512],
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let (_, volume) = admin.get("/volumes/up").await;
+    assert_eq!(volume["spec"]["format"], "raw", "{volume}");
 }
 
 /// 풀 `pools`가 준비됐다고 알린 다른 노드를 저장소에 직접 만든다.

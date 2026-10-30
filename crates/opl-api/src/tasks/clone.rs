@@ -21,7 +21,7 @@ use super::snapshot::{
     check_local, check_settled, copy_file, get_snapshot, get_vm, is_down, ready_disks, vars_copy,
 };
 use super::{Ctx, mark_ready, remove_volume};
-use crate::snapshots::uses_block_snapshots;
+use crate::volumes::block_pool_kind;
 
 /// 리소스 이름의 최대 길이
 const MAX_NAME: usize = 63;
@@ -62,10 +62,13 @@ fn volume_name(vm: &str, volume: &str, taken: impl Fn(&str) -> bool) -> String {
         .expect("some suffix is free")
 }
 
-/// 복사본의 형식(설계 §5): 블록 풀(LVM-thin, ZFS, RBD)은 raw만 담는다. 블록 볼륨(raw)을 파일
-/// 풀로 옮기면 그 풀에서 스냅샷을 담을 수 있는 qcow2로 바꾼다. 그 밖에는 원본 형식 그대로다.
+/// 복사본의 형식(설계 §5): 블록 풀(LVM-thin, ZFS, RBD, 공유 LVM)은 raw만 담는다. 블록 볼륨(raw)을
+/// 파일 풀로 옮기면 그 풀에서 스냅샷을 담을 수 있는 qcow2로 바꾼다. 그 밖에는 원본 형식 그대로다.
 fn copy_format(source: &StoragePool, target: &StoragePool, format: ImageFormat) -> ImageFormat {
-    match (uses_block_snapshots(source), uses_block_snapshots(target)) {
+    match (
+        block_pool_kind(source).is_some(),
+        block_pool_kind(target).is_some(),
+    ) {
         (_, true) => ImageFormat::Raw,
         (true, false) => ImageFormat::Qcow2,
         (false, false) => format,
@@ -295,6 +298,14 @@ mod tests {
         assert_eq!(copy_format(&zfs, &lvm, raw), raw);
         assert_eq!(copy_format(&lvm, &zfs, raw), raw);
         assert_eq!(copy_format(&zfs, &dir, raw), qcow2);
+        // 스냅샷이 없는 공유 LVM 풀도 raw만 담는 블록 풀이다.
+        let shared = pool(PoolBackend::LvmShared {
+            vg: "san".into(),
+            iscsi: None,
+        });
+        assert_eq!(copy_format(&dir, &shared, qcow2), raw);
+        assert_eq!(copy_format(&shared, &dir, raw), qcow2);
+        assert_eq!(copy_format(&shared, &lvm, raw), raw);
     }
 
     #[test]

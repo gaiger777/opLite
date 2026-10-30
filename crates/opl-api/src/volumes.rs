@@ -140,13 +140,22 @@ fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
         .ok_or_else(|| ApiError::bad_request(format!("storage pool {name:?} not found")))
 }
 
-/// 풀이 `format` 볼륨을 담을 수 있는지. 블록 풀(LVM-thin, ZFS, RBD)은 raw만 담는다.
+/// 볼륨이 raw 블록 장치나 이미지인 블록 풀의 종류(`lvm-thin`, `zfs`, `rbd`, `lvm-shared`). 파일
+/// 풀(dir, nfs)이면 `None`.
+pub(crate) fn block_pool_kind(pool: &StoragePool) -> Option<&'static str> {
+    match pool.spec.backend {
+        PoolBackend::LvmThin { .. } => Some("lvm-thin"),
+        PoolBackend::Zfs { .. } => Some("zfs"),
+        PoolBackend::Rbd { .. } => Some("rbd"),
+        PoolBackend::LvmShared { .. } => Some("lvm-shared"),
+        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => None,
+    }
+}
+
+/// 풀이 `format` 볼륨을 담을 수 있는지. 블록 풀(LVM-thin, ZFS, RBD, 공유 LVM)은 raw만 담는다.
 fn check_pool_format(pool: &StoragePool, format: ImageFormat) -> Result<(), ApiError> {
-    let kind = match pool.spec.backend {
-        PoolBackend::LvmThin { .. } => "lvm-thin",
-        PoolBackend::Zfs { .. } => "zfs",
-        PoolBackend::Rbd { .. } => "rbd",
-        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => return Ok(()),
+    let Some(kind) = block_pool_kind(pool) else {
+        return Ok(());
     };
     if format != ImageFormat::Raw {
         return Err(ApiError::bad_request(format!(
@@ -156,14 +165,13 @@ fn check_pool_format(pool: &StoragePool, format: ImageFormat) -> Result<(), ApiE
     Ok(())
 }
 
-/// 형식을 적지 않았을 때의 볼륨 형식: 블록 풀(LVM-thin, ZFS, RBD)은 raw, 그 밖은 스냅샷을 담을 수 있는
+/// 형식을 적지 않았을 때의 볼륨 형식: 블록 풀([`block_pool_kind`])은 raw, 그 밖은 스냅샷을 담을 수 있는
 /// qcow2
 fn default_format(pool: &StoragePool) -> ImageFormat {
-    match pool.spec.backend {
-        PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } | PoolBackend::Rbd { .. } => {
-            ImageFormat::Raw
-        }
-        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => ImageFormat::Qcow2,
+    if block_pool_kind(pool).is_some() {
+        ImageFormat::Raw
+    } else {
+        ImageFormat::Qcow2
     }
 }
 

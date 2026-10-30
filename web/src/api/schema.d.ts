@@ -689,7 +689,7 @@ export interface components {
                 backend: components["schemas"]["PoolBackend"];
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
-                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`). */
+                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
                 shared?: boolean;
             };
         };
@@ -785,6 +785,13 @@ export interface components {
         ImageFile: string;
         /** @enum {string} */
         ImageFormat: "qcow2" | "raw";
+        /** @description 노드가 로그인할 iSCSI 타깃 */
+        IscsiTarget: {
+            /** @description `호스트[:포트]` 또는 `[IPv6][:포트]` */
+            portal: string;
+            /** @description 타깃 이름(`iqn.`·`eui.`·`naa.`로 시작) */
+            target: string;
+        };
         JoinRequest: {
             /** @description 새 노드의 API 주소(`host:port`) */
             address: string;
@@ -976,7 +983,7 @@ export interface components {
                     backend: components["schemas"]["PoolBackend"];
                     /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                     nodes?: string[];
-                    /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`). */
+                    /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
                     shared?: boolean;
                 };
                 status: {
@@ -1286,6 +1293,12 @@ export interface components {
             pool: string;
             /** @description Ceph 클라이언트 id(`client.` 없이). 없으면 `admin`. */
             user?: string | null;
+        } | {
+            iscsi?: components["schemas"]["IscsiTarget"] | null;
+            /** @enum {string} */
+            kind: "lvm-shared";
+            /** @description 공유 볼륨 그룹 이름 */
+            vg: string;
         };
         /** @description 한 노드에서 본 스토리지 풀 상태 */
         PoolState: {
@@ -1479,7 +1492,7 @@ export interface components {
                 backend: components["schemas"]["PoolBackend"];
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
-                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`). */
+                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
                 shared?: boolean;
             };
             status: {
@@ -1700,7 +1713,7 @@ export interface components {
             backend: components["schemas"]["PoolBackend"];
             /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
             nodes?: string[];
-            /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`). */
+            /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
             shared?: boolean;
         };
         StoragePoolStatus: {

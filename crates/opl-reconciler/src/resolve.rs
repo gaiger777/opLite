@@ -68,6 +68,13 @@ pub async fn runtime_spec(
         if !pool_listed_on(&pool, node) {
             return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
         }
+        // 공유 LVM 풀의 디스크는 아직 다루지 않는다.
+        if matches!(pool.spec.backend, PoolBackend::LvmShared { .. }) {
+            return Err(ResolveError::PoolUnsupported(
+                pool_name.clone(),
+                "lvm-shared pools are not supported yet",
+            ));
+        }
         // opld는 Linux에서만 NFS 풀을 마운트하고 LVM·ZFS·RBD를 쓴다(Homebrew QEMU에는 rbd가 없다).
         if !cfg!(target_os = "linux") {
             match pool.spec.backend {
@@ -90,6 +97,12 @@ pub async fn runtime_spec(
                     return Err(ResolveError::PoolUnsupported(
                         pool_name.clone(),
                         "rbd pools are not supported on macOS",
+                    ));
+                }
+                PoolBackend::LvmShared { .. } => {
+                    return Err(ResolveError::PoolUnsupported(
+                        pool_name.clone(),
+                        "lvm-shared pools are not supported on macOS",
                     ));
                 }
                 PoolBackend::Dir { .. } => {}

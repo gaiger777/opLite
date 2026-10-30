@@ -161,7 +161,8 @@ export function PoolsPage() {
   );
 }
 
-type Kind = StoragePool["spec"]["backend"]["kind"];
+/** 만들 수 있는 풀 종류. 공유 LVM 풀 만들기는 아직 없다. */
+type Kind = Exclude<StoragePool["spec"]["backend"]["kind"], "lvm-shared">;
 
 function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
