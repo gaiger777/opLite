@@ -151,36 +151,85 @@ enum PoolCmd {
     Get {
         pool: String,
     },
-    /// 로컬 디렉터리 풀, NFS 풀, LVM-thin 풀, ZFS 풀을 만든다.
-    #[command(group(ArgGroup::new("kind").required(true).args(["path", "nfs", "lvm_thin", "zfs"])))]
-    Create {
-        name: String,
-        /// 풀 디렉터리(절대 경로)
-        #[arg(long, conflicts_with = "nfs")]
-        path: Option<PathBuf>,
-        /// NFS 내보내기 `SERVER:/EXPORT`(IPv6는 `[ADDR]:/EXPORT`). 노드마다 마운트하는 공유 풀이다.
-        #[arg(long, value_parser = parse_nfs)]
-        nfs: Option<NfsSource>,
-        /// `mount -o`에 넘길 쉼표 목록(예: vers=4.2,hard)
-        #[arg(long, requires = "nfs", conflicts_with = "path")]
-        nfs_options: Option<String>,
-        /// 관리자가 준비한 VG와 thin pool `VG/THINPOOL`. 노드 로컬 풀이고 볼륨은 raw만 담는다.
-        #[arg(long, value_parser = parse_lvm_thin, conflicts_with_all = ["path", "nfs", "nfs_options", "shared"])]
-        lvm_thin: Option<LvmThinSource>,
-        /// 관리자가 준비한 ZFS 데이터셋 `POOL/DATASET`. 노드 로컬 풀이고 볼륨은 raw zvol만 담는다.
-        #[arg(long, conflicts_with_all = ["path", "nfs", "nfs_options", "lvm_thin", "shared"])]
-        zfs: Option<String>,
-        /// `--path`가 모든 노드가 같은 데이터를 보는 공유 스토리지(밖에서 마운트한 공유 디렉터리)다.
-        /// NFS 풀은 늘 공유다.
-        #[arg(long, requires = "path", conflicts_with = "nfs")]
-        shared: bool,
-        /// 이 풀을 쓸 수 있는 노드 id. 생략하면 모든 노드.
-        #[arg(long = "node")]
-        nodes: Vec<String>,
-    },
+    /// 로컬 디렉터리 풀, NFS 풀, LVM-thin 풀, ZFS 풀, Ceph RBD 풀을 만든다.
+    Create(Box<PoolCreate>),
     Delete {
         pool: String,
     },
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("kind").required(true).args(["path", "nfs", "lvm_thin", "zfs", "rbd"])))]
+struct PoolCreate {
+    name: String,
+    /// 풀 디렉터리(절대 경로)
+    #[arg(long, conflicts_with = "nfs")]
+    path: Option<PathBuf>,
+    /// NFS 내보내기 `SERVER:/EXPORT`(IPv6는 `[ADDR]:/EXPORT`). 노드마다 마운트하는 공유 풀이다.
+    #[arg(long, value_parser = parse_nfs)]
+    nfs: Option<NfsSource>,
+    /// `mount -o`에 넘길 쉼표 목록(예: vers=4.2,hard)
+    #[arg(long, requires = "nfs", conflicts_with = "path")]
+    nfs_options: Option<String>,
+    /// 관리자가 준비한 VG와 thin pool `VG/THINPOOL`. 노드 로컬 풀이고 볼륨은 raw만 담는다.
+    #[arg(long, value_parser = parse_lvm_thin, conflicts_with_all = ["path", "nfs", "nfs_options", "shared"])]
+    lvm_thin: Option<LvmThinSource>,
+    /// 관리자가 준비한 ZFS 데이터셋 `POOL/DATASET`. 노드 로컬 풀이고 볼륨은 raw zvol만 담는다.
+    #[arg(long, conflicts_with_all = ["path", "nfs", "nfs_options", "lvm_thin", "shared"])]
+    zfs: Option<String>,
+    /// 관리자가 준비한 Ceph 풀과 RBD 네임스페이스 `POOL[/NAMESPACE]`. 늘 공유 풀이고 볼륨은 raw
+    /// 이미지만 담는다.
+    #[arg(long, value_parser = parse_rbd, conflicts_with_all = ["path", "nfs", "nfs_options", "lvm_thin", "zfs", "shared"])]
+    rbd: Option<RbdSource>,
+    /// RBD 풀에 쓸 Ceph 클라이언트 id(`client.` 없이). 생략하면 admin.
+    #[arg(long, requires = "rbd", conflicts_with_all = ["path", "nfs", "lvm_thin", "zfs"])]
+    rbd_user: Option<String>,
+    /// RBD 풀에 쓸 ceph.conf 절대 경로. 생략하면 Ceph 기본(/etc/ceph/ceph.conf).
+    #[arg(long, requires = "rbd", conflicts_with_all = ["path", "nfs", "lvm_thin", "zfs"])]
+    rbd_conf: Option<String>,
+    /// `--path`가 모든 노드가 같은 데이터를 보는 공유 스토리지(밖에서 마운트한 공유 디렉터리)다.
+    /// NFS·RBD 풀은 늘 공유다.
+    #[arg(long, requires = "path", conflicts_with = "nfs")]
+    shared: bool,
+    /// 이 풀을 쓸 수 있는 노드 id. 생략하면 모든 노드.
+    #[arg(long = "node")]
+    nodes: Vec<String>,
+}
+
+/// `pool create`의 요청 본문. NFS·RBD 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
+fn pool_create_body(args: PoolCreate) -> Value {
+    let PoolCreate {
+        name,
+        path,
+        nfs,
+        nfs_options,
+        lvm_thin,
+        zfs,
+        rbd,
+        rbd_user,
+        rbd_conf,
+        shared,
+        nodes,
+    } = args;
+    let backend = match (nfs, lvm_thin, zfs, rbd) {
+        (Some(n), _, _, _) => json!({
+            "kind": "nfs", "server": n.server, "export": n.export, "options": nfs_options
+        }),
+        (None, Some(l), _, _) => {
+            json!({ "kind": "lvm-thin", "vg": l.vg, "thinpool": l.thinpool })
+        }
+        (None, None, Some(dataset), _) => json!({ "kind": "zfs", "dataset": dataset }),
+        (None, None, None, Some(r)) => json!({
+            "kind": "rbd", "pool": r.pool, "namespace": r.namespace,
+            "user": rbd_user, "conf": rbd_conf
+        }),
+        (None, None, None, None) => json!({ "kind": "dir", "path": path }),
+    };
+    let mut spec = json!({ "backend": backend, "nodes": nodes });
+    if shared {
+        spec["shared"] = json!(true);
+    }
+    json!({ "name": name, "spec": spec })
 }
 
 /// `--nfs`로 받은 NFS 서버와 내보내기 경로
@@ -227,6 +276,31 @@ fn parse_lvm_thin(s: &str) -> Result<LvmThinSource, String> {
         }
         _ => Err(format!("invalid lvm-thin pool {s:?}: use VG/THINPOOL")),
     }
+}
+
+/// `--rbd`로 받은 Ceph 풀과 RBD 네임스페이스
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RbdSource {
+    pool: String,
+    namespace: Option<String>,
+}
+
+/// `rbd`, `rbd/opl`처럼 쓴다. 이름 규칙의 나머지 검사는 API가 한다.
+fn parse_rbd(s: &str) -> Result<RbdSource, String> {
+    let (pool, namespace) = match s.split_once('/') {
+        Some((pool, namespace)) => (pool, Some(namespace)),
+        None => (s, None),
+    };
+    let bad = |n: &str| n.is_empty() || n.contains('/');
+    if bad(pool) || namespace.is_some_and(bad) {
+        return Err(format!(
+            "invalid rbd pool {s:?}: use POOL or POOL/NAMESPACE"
+        ));
+    }
+    Ok(RbdSource {
+        pool: pool.into(),
+        namespace: namespace.map(Into::into),
+    })
 }
 
 #[derive(Subcommand)]
@@ -276,7 +350,7 @@ enum VolumeCmd {
         /// 크기. 단위 K, M, G, T(1024 배수)를 붙일 수 있다.
         #[arg(long, value_parser = parse_size)]
         size: u64,
-        /// 생략하면 풀 종류로 정한다(LVM-thin과 ZFS는 raw, 그 밖은 qcow2).
+        /// 생략하면 풀 종류로 정한다(LVM-thin, ZFS, RBD는 raw, 그 밖은 qcow2).
         #[arg(long, value_enum)]
         format: Option<Format>,
     },
@@ -289,7 +363,7 @@ enum VolumeCmd {
         file: PathBuf,
         #[arg(long, value_enum, default_value = "vmdk")]
         source_format: SourceFormat,
-        /// 생략하면 풀 종류로 정한다(LVM-thin과 ZFS는 raw, 그 밖은 qcow2).
+        /// 생략하면 풀 종류로 정한다(LVM-thin, ZFS, RBD는 raw, 그 밖은 qcow2).
         #[arg(long, value_enum)]
         format: Option<Format>,
     },
@@ -562,10 +636,11 @@ async fn volume_format(
     }
 }
 
-/// 풀 종류의 기본 볼륨 형식: 블록 풀(LVM-thin, ZFS)은 raw(스냅샷은 블록 스냅샷), 파일 풀은 qcow2
+/// 풀 종류의 기본 볼륨 형식: 블록 풀(LVM-thin, ZFS, RBD)은 raw(스냅샷은 블록 스냅샷), 파일 풀은
+/// qcow2
 fn pool_default_format(pool: &Value) -> Format {
     let kind = &pool["spec"]["backend"]["kind"];
-    if kind == "lvm-thin" || kind == "zfs" {
+    if kind == "lvm-thin" || kind == "zfs" || kind == "rbd" {
         Format::Raw
     } else {
         Format::Qcow2
@@ -685,33 +760,11 @@ where
                     table(out, POOL_NODE_HEADERS, &pool_node_rows(&pool, &nodes))?;
                 }
             }
-            PoolCmd::Create {
-                name,
-                path,
-                nfs,
-                nfs_options,
-                lvm_thin,
-                zfs,
-                shared,
-                nodes,
-            } => {
-                // NFS 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
-                let backend = match (nfs, lvm_thin, zfs) {
-                    (Some(n), _, _) => json!({
-                        "kind": "nfs", "server": n.server, "export": n.export, "options": nfs_options
-                    }),
-                    (None, Some(l), _) => {
-                        json!({ "kind": "lvm-thin", "vg": l.vg, "thinpool": l.thinpool })
-                    }
-                    (None, None, Some(dataset)) => json!({ "kind": "zfs", "dataset": dataset }),
-                    (None, None, None) => json!({ "kind": "dir", "path": path }),
-                };
-                let mut spec = json!({ "backend": backend, "nodes": nodes });
-                if shared {
-                    spec["shared"] = json!(true);
-                }
-                let body = json!({ "name": name, "spec": spec });
-                client.post("/storage-pools", &body).await?;
+            PoolCmd::Create(args) => {
+                let name = args.name.clone();
+                client
+                    .post("/storage-pools", &pool_create_body(*args))
+                    .await?;
                 writeln!(out, "storage pool {name} created")?;
             }
             PoolCmd::Delete { pool } => {
@@ -1513,9 +1566,15 @@ fn pool_row(pool: &Value, nodes: &[Value]) -> Vec<String> {
 }
 
 /// 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`), LVM-thin 풀은
-/// `vg/thinpool`, ZFS 풀은 데이터셋
+/// `vg/thinpool`, ZFS 풀은 데이터셋, RBD 풀은 `pool[/namespace]`
 fn pool_location(pool: &Value) -> String {
     let b = &pool["spec"]["backend"];
+    if b["kind"] == "rbd" {
+        return match b["namespace"].as_str() {
+            Some(namespace) => format!("{}/{namespace}", cell(&b["pool"])),
+            None => cell(&b["pool"]),
+        };
+    }
     if let Some(vg) = b["vg"].as_str() {
         return format!("{vg}/{}", cell(&b["thinpool"]));
     }
@@ -1567,6 +1626,12 @@ fn describe_pool(pool: &Value) -> String {
     );
     if let Some(options) = b["options"].as_str() {
         text.push_str(&format!("options: {options}\n"));
+    }
+    // RBD 풀의 Ceph 사용자·conf(생략하면 Ceph 기본이라 적지 않는다)
+    for key in ["user", "conf"] {
+        if let Some(value) = b[key].as_str() {
+            text.push_str(&format!("{key}: {value}\n"));
+        }
     }
     text.push_str(&format!("shared: {}\n", cell(&pool["spec"]["shared"])));
     text
@@ -2007,15 +2072,8 @@ mod tests {
             argv.extend_from_slice(args);
             Cli::try_parse_from(argv).map(|cli| match cli.cmd {
                 Cmd::Pool {
-                    cmd:
-                        PoolCmd::Create {
-                            path,
-                            nfs,
-                            nfs_options,
-                            shared,
-                            ..
-                        },
-                } => (path, nfs, nfs_options, shared),
+                    cmd: PoolCmd::Create(c),
+                } => (c.path, c.nfs, c.nfs_options, c.shared),
                 _ => unreachable!(),
             })
         };
@@ -2067,8 +2125,8 @@ mod tests {
             argv.extend_from_slice(args);
             Cli::try_parse_from(argv).map(|cli| match cli.cmd {
                 Cmd::Pool {
-                    cmd: PoolCmd::Create { lvm_thin, .. },
-                } => lvm_thin,
+                    cmd: PoolCmd::Create(c),
+                } => c.lvm_thin,
                 _ => unreachable!(),
             })
         };
@@ -2092,11 +2150,11 @@ mod tests {
         ] {
             assert!(create(args).is_err(), "{args:?}");
         }
-        // 종류(--path, --nfs, --lvm-thin, --zfs) 중 하나가 있어야 한다.
+        // 종류(--path, --nfs, --lvm-thin, --zfs, --rbd) 중 하나가 있어야 한다.
         let err = create(&[]).expect_err("a pool kind is required");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let msg = err.to_string();
-        for kind in ["--path", "--nfs", "--lvm-thin", "--zfs"] {
+        for kind in ["--path", "--nfs", "--lvm-thin", "--zfs", "--rbd"] {
             assert!(msg.contains(kind), "{msg}");
         }
         assert!(create(&["--node", "a"]).is_err());
@@ -2111,8 +2169,8 @@ mod tests {
             argv.extend_from_slice(args);
             Cli::try_parse_from(argv).map(|cli| match cli.cmd {
                 Cmd::Pool {
-                    cmd: PoolCmd::Create { zfs, .. },
-                } => zfs,
+                    cmd: PoolCmd::Create(c),
+                } => c.zfs,
                 _ => unreachable!(),
             })
         };
@@ -2135,6 +2193,109 @@ mod tests {
         ] {
             assert!(create(args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn parses_rbd_pool_create() {
+        let create = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "pool", "create", "ceph"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Pool {
+                    cmd: PoolCmd::Create(c),
+                } => (c.rbd, c.rbd_user, c.rbd_conf),
+                _ => unreachable!(),
+            })
+        };
+        let rbd = |pool: &str, namespace: Option<&str>| RbdSource {
+            pool: pool.into(),
+            namespace: namespace.map(Into::into),
+        };
+        assert_eq!(
+            create(&["--rbd", "rbd"]).unwrap(),
+            (Some(rbd("rbd", None)), None, None)
+        );
+        assert_eq!(
+            create(&[
+                "--rbd",
+                "rbd/opl",
+                "--rbd-user",
+                "opl",
+                "--rbd-conf",
+                "/etc/ceph/opl.conf"
+            ])
+            .unwrap(),
+            (
+                Some(rbd("rbd", Some("opl"))),
+                Some("opl".into()),
+                Some("/etc/ceph/opl.conf".into())
+            )
+        );
+        // 다른 종류·--shared(늘 공유)와 함께 못 쓰고, 사용자·conf는 --rbd와 함께만 쓴다.
+        // 이름 규칙의 나머지 검사는 API가 한다.
+        for args in [
+            &["--rbd", "rbd", "--path", "/srv/pool"][..],
+            &["--rbd", "rbd", "--nfs", "nas:/srv/vm"],
+            &["--rbd", "rbd", "--nfs-options", "hard"],
+            &["--rbd", "rbd", "--lvm-thin", "vg0/tp"],
+            &["--rbd", "rbd", "--zfs", "tank/opl"],
+            &["--rbd", "rbd", "--shared"],
+            &["--path", "/srv/pool", "--rbd-user", "opl"],
+            &["--path", "/srv/pool", "--rbd-conf", "/etc/ceph/ceph.conf"],
+            &["--rbd"],
+            &["--rbd", ""],
+            &["--rbd", "/opl"],
+            &["--rbd", "rbd/"],
+            &["--rbd", "rbd/opl/x"],
+        ] {
+            assert!(create(args).is_err(), "{args:?}");
+        }
+    }
+
+    /// `pool create`가 보내는 요청 본문. RBD 풀은 네임스페이스·사용자·conf를 담고 `shared`는 적지
+    /// 않는다.
+    #[test]
+    fn pool_create_sends_the_backend() {
+        let body = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "pool", "create", "ceph"];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Pool {
+                    cmd: PoolCmd::Create(c),
+                } => pool_create_body(*c),
+                _ => unreachable!(),
+            }
+        };
+        let args = [
+            "--rbd",
+            "rbd/opl",
+            "--rbd-user",
+            "opl",
+            "--rbd-conf",
+            "/etc/ceph/x.conf",
+        ];
+        assert_eq!(
+            body(&args),
+            json!({
+                "name": "ceph",
+                "spec": {
+                    "backend": {
+                        "kind": "rbd", "pool": "rbd", "namespace": "opl",
+                        "user": "opl", "conf": "/etc/ceph/x.conf"
+                    },
+                    "nodes": []
+                }
+            })
+        );
+        assert_eq!(
+            body(&["--rbd", "rbd", "--node", "n1"])["spec"],
+            json!({
+                "backend": {
+                    "kind": "rbd", "pool": "rbd", "namespace": null, "user": null, "conf": null
+                },
+                "nodes": ["n1"]
+            })
+        );
     }
 
     /// 풀을 읽지 못하면 --format을 주라고 알린다. 주면 풀을 읽지 않는다.
@@ -2164,6 +2325,7 @@ mod tests {
         let pool = |kind: &str| json!({ "spec": { "backend": { "kind": kind } } });
         assert_eq!(pool_default_format(&pool("lvm-thin")), Format::Raw);
         assert_eq!(pool_default_format(&pool("zfs")), Format::Raw);
+        assert_eq!(pool_default_format(&pool("rbd")), Format::Raw);
         assert_eq!(pool_default_format(&pool("dir")), Format::Qcow2);
         assert_eq!(pool_default_format(&pool("nfs")), Format::Qcow2);
         // --format를 주지 않으면 풀을 읽어 정하고, 주면 그대로 쓴다.
@@ -2310,6 +2472,45 @@ mod tests {
         assert_eq!(
             describe_pool(&tank),
             "pool: tank\nkind: zfs\nlocation: tank/opl\nshared: false\n"
+        );
+        // RBD 풀의 위치는 `POOL[/NAMESPACE]`, 상세는 사용자·conf가 있으면 보인다.
+        let ceph = json!({
+            "id": "id-ceph",
+            "name": "ceph",
+            "spec": {
+                "backend": { "kind": "rbd", "pool": "rbd" },
+                "nodes": [],
+                "shared": true,
+            },
+        });
+        assert_eq!(
+            pool_row(&ceph, &nodes),
+            ["ceph", "rbd", "rbd", "all", "0/5"]
+        );
+        assert_eq!(
+            describe_pool(&ceph),
+            "pool: ceph\nkind: rbd\nlocation: rbd\nshared: true\n"
+        );
+        let opl = json!({
+            "id": "id-opl",
+            "name": "opl",
+            "spec": {
+                "backend": {
+                    "kind": "rbd", "pool": "rbd", "namespace": "opl", "user": "opl",
+                    "conf": "/etc/ceph/opl.conf"
+                },
+                "nodes": ["id-a"],
+                "shared": true,
+            },
+        });
+        assert_eq!(
+            pool_row(&opl, &nodes),
+            ["opl", "rbd", "rbd/opl", "1", "0/1"]
+        );
+        assert_eq!(
+            describe_pool(&opl),
+            "pool: opl\nkind: rbd\nlocation: rbd/opl\nuser: opl\nconf: /etc/ceph/opl.conf\n\
+             shared: true\n"
         );
         let mut out = Vec::new();
         table(&mut out, POOL_NODE_HEADERS, &pool_node_rows(&local, &nodes)).unwrap();
