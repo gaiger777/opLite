@@ -34,6 +34,8 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 
 하위 프로젝트마다 별도로 설계 → 계획 → 구현 사이클을 거친다. 위 순서가 구현 권장 순서다.
 
+구현: 하위 프로젝트 4는 계획 20(공유 풀 위의 라이브 마이그레이션, QEMU TLS 마이그레이션·노드 사이 RPC·`VmMigrate` Task)과 계획 21(UEFI 변수가 멈춘 채 옮긴 VM을 따라감, 디렉터리 풀의 `shared` 바꾸기)로 나눴다(`2026-10-30-live-migration-design.md`). 디스크까지 복사하는 마이그레이션과 macOS(HVF) 노드는 넣지 않았다.
+
 ### 1.2 검토했지만 채택하지 않은 대안
 
 - **중앙 관리 서버 + 경량 에이전트 (vCenter 방식):** 관리 서버 자체의 HA를 따로 풀어야 하고 설치 단계가 늘어난다. 이 복잡함이 VMware를 떠나는 이유 중 하나다.
@@ -210,7 +212,7 @@ QEMU 커맨드라인 생성은 순수 함수 `fn build_cmdline(&VmRuntimeSpec, &
 ### 5.4 opld 재시작과 크래시 복구
 
 - QEMU는 `-daemonize`로 실행해 `opld`와 세션을 분리한다(Proxmox와 같은 방식). 초기화에 실패하면 부모 프로세스의 종료 코드와 stderr로 바로 알 수 있다. Linux에서는 `systemd-run --scope --unit=opl-vm-<id>`로 감싸 VM마다 cgroup을 나눈다(`[hypervisor] systemd_scope`, systemd가 없는 환경에서는 끈다). cgroup 자원 제한은 아직 걸지 않는다.
-- 런타임 파일은 `/run/opl/vm/{uuid}/`(macOS는 설정한 run_dir) 아래에 `qmp.sock`, `vnc.sock`, `qemu.pid`로 둔다. UEFI 변수처럼 재부팅 후에도 남아야 하는 파일은 `/var/lib/opl/vm/{uuid}/uefi-vars.fd`에 둔다. 라이브 마이그레이션(하위 프로젝트 4)에서 공유 스토리지로 옮기는 것을 다시 검토한다.
+- 런타임 파일은 `/run/opl/vm/{uuid}/`(macOS는 설정한 run_dir) 아래에 `qmp.sock`, `vnc.sock`, `qemu.pid`로 둔다. UEFI 변수처럼 재부팅 후에도 남아야 하는 파일은 `/var/lib/opl/vm/{uuid}/uefi-vars.fd`에 둔다. 라이브 마이그레이션(하위 프로젝트 4)에서 공유 스토리지로 옮기는 것을 다시 검토한다. 구현: 변수 파일은 노드 로컬에 그대로 둔다. 라이브 마이그레이션에서는 QEMU가 pflash 내용을 옮겨 대상 노드의 파일에 쓰고(계획 20, CI에서 확인), 멈춘 채 옮긴 VM은 시작할 때 변수를 가진 노드에서 받아 온다(계획 21, 라이브 마이그레이션 설계 §5).
 - VM마다 모니터 태스크가 QMP 이벤트를 지켜본다. `SHUTDOWN` 이벤트 뒤에 연결이 끊기면 정상 종료(`Stopped`), 이벤트 없이 끊기면 `Crashed`로 판정하고 런타임 디렉터리를 정리한다.
 - `opld`가 시작되면 런타임 디렉터리를 훑어 살아 있는 QEMU에 QMP로 다시 연결한다. 그 뒤 Raft의 원하는 상태와 비교해 조정한다.
 - QEMU의 생존 여부는 QEMU가 수명 내내 잡고 있는 pidfile의 fcntl 잠금으로 판정한다(QMP 응답 여부와 무관하며, SIGSTOP 상태에서도 정확하다). 잠금이 풀린 런타임 디렉터리만 지우고, 잠금 소유자 pid(F_GETLK)를 확인한 뒤에만 강제 종료한다. 살아 있지만 QMP에 붙지 못한 VM은 등록하지 않고 오류를 기록하며, 이후 `start()`가 재부착을 시도한다.
@@ -238,7 +240,7 @@ trait Storage: Send + Sync {
 
 - `dir` 풀은 로컬 디렉터리에 qcow2/raw 파일을 둔다. 작업은 `qemu-img`로 처리한다.
 - `import`는 `qemu-img convert`로 VMDK, qcow2, raw 이미지를 가져온다.
-- `PoolSpec.shared`는 라이브 마이그레이션(하위 프로젝트 4)에서 디스크 복사가 필요한지 판단하는 데 쓴다. 1차에서는 값을 저장하기만 한다.
+- `PoolSpec.shared`는 라이브 마이그레이션(하위 프로젝트 4)에서 디스크 복사가 필요한지 판단하는 데 쓴다. 1차에서는 값을 저장하기만 한다. 구현: 공유 스토리지 설계(계획 15~19)부터 배치와 Task 노드 선택에 쓰고(`is_shared`, NFS·RBD·공유 LVM은 늘 공유), 라이브 마이그레이션(계획 20)은 디스크가 모두 공유 풀일 때만 한다(아니면 409 `migration_unsupported`, 디스크 복사는 하지 않는다). 디렉터리 풀의 `shared` 바꾸기는 계획 21이다.
 - 사용 중인 Volume은 삭제할 수 없다(409).
 
 ## 7. 네트워크 (1차)

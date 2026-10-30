@@ -48,6 +48,8 @@
 - T의 받은 QEMU가 남음: T는 받는 중 표시가 있고 `spec.node != T`인 QEMU를, 그 VM의 `status.migration`이 없거나 다른 Task·노드를 가리키면 끈다(opld 시작 때, `MigrateIncomingAbort` 때, `tag_sweep`마다). 확정 전 S가 죽어 Task가 실패하면 S의 워커가 `migration`을 지우므로 T의 다음 정리가 끈다.
 - QEMU 자신이 이미 "디스크를 놓았다"(원본 `postmigrate`의 inactivate) — 확정 전 실패에서 `cont`가 다시 잡는다(QEMU 동작).
 
+구현: 원본 Task는 `opl-api/src/tasks/migrate.rs`이고 일반 Task 시간 제한 밖에서 단계마다 따로 제한한다(보내기는 `[migration] timeout`, `MigrateIncoming` 120초, `MigrateIncomingWait` 180초 — 받는 쪽 기다림 120초보다 길게, Abort 60초). 확정 쓰기와 되돌리기 쓰기는 같은 revision을 확인하므로 둘 중 하나만 적용되고, 확정 쓰기가 모호하게 실패하면 60초 동안 다시 해 본 뒤 되돌린다. S의 QEMU 버전은 실행 중인 원본의 QMP `query-version`, T의 버전은 `qemu --version`이다(같은 QEMU 바이너리). 접속 호스트와 `tls-hostname`은 T의 클러스터 멤버 주소(`members().addr`)의 호스트(T의 opld `address`, 노드 인증서에 있다)이고, 받는 QEMU는 T의 `cluster_listen` IP(기본 `0.0.0.0`, IPv6 `[::]`)에서 듣는다(`address`는 그 기계에서 `127.0.1.1` 등으로 풀릴 수 있다). 받는 쪽 처리는 opld가 아니라 opl-api의 `IncomingMigrations`(opld가 피어 서버에 주입)이고, 받는 VM의 기록이 Raft로 올 때까지 10초 기다린다. 포트는 opld가 범위에서 먼저 bind 해 보고 빈 것을 고른다(한 QEMU에 `migrate-incoming`은 한 번만 되므로 실패하면 그 QEMU를 버려야 한다). 모두 쓰는 중이면 "no free migration port in A-B on HOST"로 실패한다. TLS 객체(`opl-mig-tls`)는 QMP `object-add`로 매번 지우고 다시 만들고 양쪽 다 `verify-peer`다. 원본은 `ReconcilerHandle::begin_migration`(워커가 하던 걸음을 마칠 때까지 기다림)·`end_migration`으로 워커를 멈춰 둔다. QEMU 8.2의 받는 QEMU는 받기에 실패하면 스스로 끝나므로 T에는 자기 것이 아닌 VM의 충돌 이벤트가 생길 수 있다(무시한다). 남은 QEMU 정리는 Task 실행기 시작 때와 `tag_sweep`(30분)마다 돈다. 받는 중 표시 파일에는 마이그레이션 Task id를 적고, 정리는 `status.migration`이 그 Task와 이 노드를 가리킬 때만 남긴다(받기는 같은 VM의 다른 Task 받는 QEMU를 먼저 끈다). VM이 지워진 `postmigrate` 원본도 끈다. opld가 끝을 지켜보지 못한 마이그레이션(재시작, 되돌리기)은 `migrate_cancel`로 취소한 뒤 재개 여부를 정하고, 보류가 아니고 표시가 없는 자기 노드 VM의 `postmigrate` QEMU는 그 VM이 이 노드에서 돌던 것일 때만(`status.node`가 이 노드, phase `Running`·`Migrating`) 워커가 이어서 실행한다(확정 쓰기는 표시가 있는 revision에서만 적용되므로 더는 확정될 수 없다). 확정은 늘 `status.node`를 대상으로 바꾸므로, 아니면 다른 노드로 확정된 마이그레이션의 정리되지 않은 원본이 그 뒤 이 노드로 다시 옮겨진 것이다: 낡은 메모리를 이어서 실행하지 않고 워커와 정리가 그 QEMU를 끄고, 워커가 새로 켠다. `Migrating`을 쓴 뒤 그 VM의 스냅샷·복제·크기 늘리기 Task가 끝나지 않았으면 되돌리고, 확정 쓰기는 `spec.power`가 running일 때만 한다(검사와 기록 사이에 들어온 요청). 보류 중의 수명 이벤트(원본 크래시)는 보류가 풀린 뒤 처리한다. CI(QEMU 8.2.2)에서 확인: 완료 뒤 원본은 `postmigrate`, 받는 쪽은 `-S`라 `paused`로 남고 `cont` 뒤 `running`, 실패(연결 거부·TLS 없는 대상)에서 원본은 `running` 그대로.
+
 ## 3. 스토리지
 
 - 디스크는 모두 공유 풀이어야 한다(`is_shared`). 각 노드는 자기 경로로 디스크를 연다(NFS 마운트 경로가 달라도 된다) — cmdline의 블록 노드 이름(`disk{i}`)·장치는 같다.
@@ -55,6 +57,8 @@
 - RBD: 같다(배타 잠금 기능을 쓰지 않는다).
 - **공유 LVM:** 배타 활성화(`-aey`)가 두 노드의 동시 사용을 막으므로, 마이그레이션 동안 공유 잠금으로 바꾼다. `Storage`에 `share_volume(pool, id)`(켠 LV를 공유로: `lvchange -asy`)와 `exclusive_volume(pool, id)`(다시 배타로: `lvchange -aey`)를 더한다(기본 Ok, 다른 백엔드는 할 일이 없다). S가 3단계 전에 `share_volume`, T는 `activate_volume` 대신 공유로 켜고, 8단계에서 S가 끈 뒤 T의 워커가 넘겨받을 때 `exclusive_volume`. 실패하면(1단계 되돌리기) S가 다시 배타로. 구현 전 CI에서 lvmlockd가 켜진 LV의 배타↔공유 바꾸기를 하는지 확인한다(계획 20의 환경 탐색). **안 되면 공유 LVM 디스크의 마이그레이션은 409 `migration_unsupported`로 두고 한계에 적는다.**
 - 남은 활성화 정리(`deactivate_idle_volumes`)는 받는 중인 VM의 디스크를 쓰는 중으로 본다(로컬 하이퍼바이저에 떠 있다 — 기존 규칙). 원본의 `Migrating` VM도 그렇다.
+
+구현: 공유 LVM 마이그레이션을 구현했다. CI(lvm2 2.03.16, sanlock)에서 쓰는 중인 LV의 `lvchange -asy`(배타→공유)·`-aey`(다른 노드가 쥐지 않았을 때 공유→배타)가 모두 되는 것을 확인했다(`lvs`의 `lv_active_exclusively`는 공유 잠금이어도 참으로 보이므로 잠금 모드 판단에 쓰지 않는다). `Storage::share_volume`·`exclusive_volume`(기본 Ok, 공유 LVM만 `-asy`·`-aey`)에 형식 인자를 더했고, T는 `opl_reconciler::resolve::incoming_spec`으로 디스크를 공유로 켠다. S가 `Migrating`을 쓴 뒤 공유로 바꾸고(실패하면 되돌린다), 실패하면 보류가 풀린 뒤 S의 워커가 다시 배타로, T는 넘겨받아 재개한 뒤 배타로 바꾼다 — 원본이 아직 놓지 않았으면 `retry_interval`마다 다시 해 본다. 배타 여부는 메모리에만 있으므로 워커는 자기가 켜서 시작하지 않은 실행 중 VM(opld 재시작, 넘겨받기)에 붙을 때 한 번 `exclusive_volume`(멱등 `-aey`)을 부른다. 남은 활성화 정리는 `status.migration.node`가 자기인 VM의 디스크도 쓰는 중으로 본다.
 
 ## 4. API·Task·클라이언트 (계획 20)
 
@@ -74,11 +78,15 @@
 - 드라이버: `Hypervisor`에 `start_incoming(spec, ports) -> port`, `migrate(id, uri, opts) -> Result<(), DriverError>`(완료까지), `incoming_wait(id)`, `qemu_version()`을 더한다. `MockHypervisor`도 같이(API·reconciler 테스트). cmdline은 `VmRuntimeSpec`이 아니라 시작 방식으로 `-incoming defer`를 더한다.
 - oplctl: `vm migrate VM NODE`(Task를 기다리고 "vm X: migrated to NODE"). 웹: VM 상세의 "마이그레이션" 동작(실행 중일 때), 대상 노드 고르기 대화상자(온라인·같은 아키텍처 노드), `Migrating` 상태 표시와 다른 동작 막기, Task 설명(`vm-migrate`). 번역 키 ko·en.
 
+구현: macOS 판정은 노드 상태의 하이퍼바이저 이름(`qemu-hvf`)이다 — TCG로 도는 macOS 노드는 막지 않는다. 메모리 판정은 `scheduler::node_fits`(온라인·유지보수·아키텍처·풀·브리지)와 따로 `Inventory::free_memory_mib`로 하고, 아키텍처가 다르면 400 `machine_arch_mismatch`다. 이미 `Migrating`인 VM은 `vm_not_running`이 아니라 `vm_busy`로 거절한다. 검사와 Task 만들기는 `vm_lock` 안에서 한다. `VmMigrate`는 Task 실행기의 VM 큐로 돈다. `[migration] timeout`은 humantime이 아니라 작은 자체 파서(`30m`, `1h30m`, `90s`)다. TLS 파일은 `{data_dir}/migration-tls/`(드라이버의 `state_dir`가 데이터 디렉터리, 기본 `/var/lib/opl/migration-tls`)이고 opld가 시작할 때마다 쓴다. oplctl `vm list`의 NODE 칸은 마이그레이션 중에 `원본 -> 대상`이다. 웹은 VM 상세에만 "마이그레이션"이 있고(목록 메뉴에는 없다) 대상 목록은 HVF 노드를 거르지 않는다(서버가 409로 이유를 보인다). 마이그레이션 중인 VM은 대시보드에서 원본 노드에 센다.
+
 ## 5. UEFI 변수가 VM을 따라간다 (계획 21)
 
 - `VmStatus.firmware_node: Option<Uuid>` — 지금 UEFI 변수 파일을 가진 노드. 워커가 UEFI VM을 시작할 때(그 노드의 변수로 켰으므로) 자기 노드로 쓰고, 마이그레이션 확정(§2의 6)이 T로 쓴다(QEMU가 pflash를 옮겼다).
 - 시작할 때 `firmware_node`가 다른 노드면, 그 노드에서 RPC `UefiVars { vm } -> stream<Chunk>`로 변수 파일을 받아 로컬 파일을 바꾼다(임시 파일에 받은 뒤 이름 바꾸기). 1 MiB 조각, 0만 있는 조각은 표시만 보낸다(AAVMF 64 MiB). 그 노드가 오프라인이거나 파일이 없으면 경고를 남기고 로컬 파일(없으면 템플릿)로 켠다 — 시작을 막지 않는다. 받은 노드에서는 VM이 다시 그 노드에 오기 전까지 파일을 지우지 않는다(다시 오면 `firmware_node`가 달라 새로 받는다).
 - 스냅샷·복제가 변수를 복사하는 기존 경로(Task 노드의 로컬 파일)는 `firmware_node`가 그 노드가 아니면 같은 RPC로 먼저 받는다.
+
+계획 20 확인: 라이브 마이그레이션에서는 QEMU가 pflash 변수를 옮겨 받는 쪽이 재개될 때 대상 노드의 변수 파일에 쓴다(CI에서 원본 파일 끝 표식이 대상 파일에 생기고 두 파일이 같았다, `migration-it`도 본다). 이 절은 멈춘 채 옮기기만 다룬다.
 
 ## 6. 풀의 `shared` 바꾸기 (계획 21)
 
@@ -91,6 +99,8 @@
 
 - 단위: cmdline `-incoming defer`, QMP 마이그레이션 상태 해석, 포트 범위 해석, API 검사(각 409·400), `check_not_busy`의 마이그레이션, 워커의 `Migrating` 되돌리기·`postmigrate` 정리, MockHypervisor로 2노드 in-process 마이그레이션(`opl-api/tests/two_nodes.rs`의 실제 gRPC mTLS), RPC 회원 검사, `PATCH /pools`, 변수 조각 전송(0 조각).
 - 실제(`migration-it`, Linux root, CI `linux-kvm`): 한 호스트에서 opld 둘(`opld/tests/common`의 `Daemon`)로 클러스터를 만들고, 공유 디렉터리 풀의 qcow2 디스크 VM을 띄워 T로 옮긴다 — 확정 뒤 `spec.node`·T의 QEMU `running`·S의 QEMU 없음, 게스트가 계속 도는지(QMP `query-status`와 마이그레이션 전후 디스크 쓰기), UEFI VM의 변수 파일이 T에 쓰였는지. 확정 전 실패(대상 포트가 막힘)에서 원본이 계속 도는지. NFS·RBD·(되면) 공유 LVM 풀로 한 번씩.
+
+구현: 기능 `migration-it`(opld, `crates/opld/tests/migration.rs`)은 Linux 전용이 아니고 이 Mac에서도 TCG로 돈다(HVF에서는 원본 QEMU가 가끔 `assert_hvf_ok`로 죽는다). 한 호스트의 두 노드는 systemd 스코프 이름과 탭 이름이 겹치므로 스코프를 끄고 NIC 없이 띄운다. 게스트 OS가 없으므로 디스크 내용은 정지한 VM에서 `qemu-io`로 본다. 포트 막힘 실패 뒤 포트를 풀고 되돌아오기까지 본다. NFS·RBD·공유 LVM은 각 풀 기능과 그 시험의 환경 변수가 있을 때(0→1→0 왕복), 공유 LVM은 세 시점에 `lvchange -aey`가 되는지 본다. 2노드 in-process 시험(`opl-api/tests/two_nodes.rs`, MockHypervisor)은 성공·실패·되돌리기를 본다.
 - 계획 21: 2노드 실제 시험에서 멈춘 UEFI VM을 옮겨 켰을 때 변수가 같은지(앞 노드에서 `efivar`를 쓰는 대신 변수 파일의 해시로 본다), `PATCH /pools`.
 
 ## 8. 알려진 한계
@@ -101,4 +111,7 @@
 - 노드가 죽으면 그 노드에만 있던 UEFI 변수는 잃는다(템플릿으로 켠다).
 - 마이그레이션 포트 범위를 노드 사이 방화벽에서 열어야 한다.
 - macOS 노드는 마이그레이션을 할 수 없다.
-- 공유 LVM 디스크: 계획 20의 확인 결과에 따른다(§3).
+- 공유 LVM 디스크: 계획 20의 확인 결과에 따른다(§3). 구현: 지원한다(마이그레이션 동안 LV 공유 잠금).
+- 계획 20 전에 클러스터에 들어온 노드의 인증서는 키 용도에 keyEncipherment가 없어 QEMU 8.2 이하의 마이그레이션 TLS가 실패한다. opld가 시작할 때 경고하고, 노드를 다시 합류시켜야 새 인증서를 받는다.
+- 받기 준비 RPC가 기한(120초)에 끊기면 대상에 띄우던 받는 QEMU나 공유로 켠 디스크가 남을 수 있다. 다음 정리(`tag_sweep`, 30분)나 같은 VM의 다음 마이그레이션이 치운다.
+- 받기 확인 뒤 확정 전에 대상의 받는 QEMU가 죽으면, 확정 뒤 대상 워커가 VM을 새로 켠다(게스트 메모리 상태를 잃는다, 두 QEMU가 함께 돌지는 않는다).
