@@ -22773,3 +22773,20 @@ git commit -m "docs: 공유 LVM(iSCSI) 풀 안내, 공유 스토리지 설계 5�
 - **노드가 죽으면** sanlock 임대가 끝날 때까지 그 노드가 켠 디스크를 다른 노드에서 쓸 수 없다. 한 노드에서 끄기가 실패하면 그 노드의 정리(30분)까지 다른 노드에서 그 볼륨을 쓸 수 없다.
 - **각 노드에 lvm2-lockd·sanlock과 고유한 `host_id`**, iSCSI면 open-iscsi가 있어야 한다. CHAP은 지원하지 않는다. macOS는 공유 LVM을 쓸 수 없다.
 - 그 밖의 제한은 설계 문서 §8에 있다.
+
+## 실행 후 기록 (2026-10-30)
+
+8개 Task는 계획대로 적용했고, Task마다 검증된 단계와 트리가 같았다(생성 파일 `schema.d.ts` 포함). 계획 문서를 만들기 전에 스테이지 작업에서 리뷰를 네 차례 돌려 고쳤다(크기 늘리기의 0 채우기와 남은 태그, 남은 활성화 정리의 다시 확인, 잠금 오류 문구, 크기 늘리기와 VM 시작의 경쟁 — 위 Task의 코드에 이미 들어 있다).
+
+Task 8의 확인에서 `cargo test -p opl-api --features storage-it`의 `snapshot_disks::resize_waits_for_a_revert_of_the_same_disk`가 실패해 아래를 고쳤다(`371b337`). 저장소의 코드가 기준이다. 위 Task 4의 코드 블록은 고치기 전 것이다.
+
+- VM 시작은 디스크를 대상으로 하는 **실행 중(`running`)인** 크기 늘리기 Task만 기다린다. 끝나지 않은 Task를 모두 기다리면, 메모리 스냅샷 되돌리기(VM을 다시 켠다) 뒤에 줄 선 `pending` 크기 늘리기와 서로 기다려 끝나지 않았다. 경쟁은 그대로 닫힌다: 실행기는 Task를 `running`으로 기록(커밋·적용)한 뒤에 VM을 읽으므로, 그 전에 켜기 시작한 VM은 실행기가 켜는 중으로 보고 꺼진 VM 경로를 타지 않고, 그 뒤에 켜는 VM은 `running` Task를 보고 기다린다. 테스트 `start_does_not_wait_for_a_pending_resize`.
+- CI는 `opl-api`의 `storage-it` 중 `volumes`만 돌리므로 이 실패를 잡지 못했다. 계획을 마칠 때 `storage-it` 전체를 macOS에서 돌린다.
+
+테스트: macOS `cargo test --workspace` 653개, `opl-api` `storage-it` 223개, `opl-driver` `storage-it` `dir_storage` 8개, `qemu-it` `smoke`·`e2e`·`snapshots` 11개, 브라우저 E2E, 웹 Vitest 297개, `fmt`·`clippy -D warnings`(모든 기능). 실제 공유 LVM(`lvm-shared-it`)·RBD·ZFS·LVM·NFS는 Linux CI `linux-kvm`에서.
+CI(확인용 브랜치, 리뷰 수정마다): `check` 2개, `deny`, `web`, `linux-kvm`(실제 iSCSI 타깃과 sanlock 공유 VG의 드라이버 시험 5개와 E2E 포함)이 모두 통과했다. 위 수정은 main CI에서 확인한다.
+
+## 다음 계획으로 넘길 사항
+
+- 하위 프로젝트 4: 라이브 마이그레이션(공유 풀 — NFS·RBD·공유 LVM이 바탕), UEFI 변수 공유, 풀 `shared` 바꾸기.
+- CI에서 `opl-api`의 `storage-it` 전체를 돌리는 것을 검토한다.

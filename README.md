@@ -694,3 +694,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 16: 공유 스토리지 2 — 블록 백엔드 바탕과 LVM-thin](docs/superpowers/plans/2026-10-29-plan16-shared-storage-lvm-thin.md)
 - [계획 17: 공유 스토리지 3 — ZFS zvol](docs/superpowers/plans/2026-10-29-plan17-shared-storage-zfs.md)
 - [계획 18: 공유 스토리지 4 — Ceph RBD](docs/superpowers/plans/2026-10-29-plan18-shared-storage-ceph-rbd.md)
+- [계획 19: 공유 스토리지 5 — iSCSI와 공유 LVM](docs/superpowers/plans/2026-10-30-plan19-shared-storage-iscsi-lvm.md)
