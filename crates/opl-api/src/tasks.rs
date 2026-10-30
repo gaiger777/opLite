@@ -670,6 +670,7 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
             snapshot,
             pool,
         } => clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
+        TaskOp::VmMigrate { .. } => Err("VM migration is not supported yet".into()),
     }
 }
 

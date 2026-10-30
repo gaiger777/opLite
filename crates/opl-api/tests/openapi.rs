@@ -25,6 +25,7 @@ async fn openapi_document_is_served_without_login() {
         "/vms/{key}/snapshots/{name}",
         "/vms/{key}/snapshots/{name}/revert",
         "/vms/{key}/clone",
+        "/vms/{key}/migrate",
         "/watch",
     ] {
         assert!(paths.contains_key(path), "{path} is not documented");
@@ -36,6 +37,21 @@ async fn openapi_document_is_served_without_login() {
     );
     assert!(doc["components"]["schemas"]["Resource_TaskSpec_TaskStatus"].is_object());
     assert!(doc["components"]["schemas"]["Resource_SnapshotSpec_SnapshotStatus"].is_object());
+    // 마이그레이션 상태는 없으면 빼고 쓰므로 선택 필드다(null도 기본값도 아니다).
+    let vm_status = &doc["components"]["schemas"]["VmStatus"];
+    assert_eq!(
+        vm_status["properties"]["migration"],
+        serde_json::json!({
+            "$ref": "#/components/schemas/MigrationStatus",
+            "description": "진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다."
+        })
+    );
+    assert!(
+        !vm_status["required"]
+            .as_array()
+            .is_some_and(|r| r.contains(&"migration".into())),
+        "{vm_status}"
+    );
     let schemes = &doc["components"]["securitySchemes"];
     assert_eq!(schemes["token"]["scheme"], "bearer");
     assert_eq!(schemes["session"]["name"], "opl_session");

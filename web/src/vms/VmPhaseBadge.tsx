@@ -9,6 +9,7 @@ const VARIANT = {
   running: "default",
   stopping: "secondary",
   failed: "destructive",
+  migrating: "secondary",
 } as const;
 
 export function VmPhaseBadge({ vm }: { vm: Vm }) {

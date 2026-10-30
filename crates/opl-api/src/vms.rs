@@ -10,7 +10,7 @@ use opl_cluster::types::Rejection;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::{Resource, ResourceSpec};
-use opl_types::storage::VolumePhase;
+use opl_types::storage::{VolumePhase, is_shared};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{MacAddr, PowerState, Vm, VmPhase, VmSpec, VmStatus};
 use serde::Deserialize;
@@ -20,8 +20,11 @@ use uuid::Uuid;
 use crate::auth::{Action, Principal};
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
-use crate::scheduler::{Inventory, schedule};
-use crate::snapshots::{check_no_revert_task, check_no_snapshot_task, count_snapshots};
+use crate::scheduler::{Inventory, node_fits, schedule};
+use crate::snapshots::{
+    check_no_migration, check_no_revert_task, check_no_snapshot_task, check_not_busy,
+    check_not_migrating, count_snapshots,
+};
 use crate::state::AppState;
 use crate::tasks::create_task;
 
@@ -186,6 +189,7 @@ pub async fn update_vm(
     for _ in 0..10 {
         let _lock = state.vm_lock.lock().await;
         let current = lookup::<VmSpec>(&state.cluster, &key)?;
+        check_no_migration(&state, &current)?;
         check_no_snapshot_task(&state, &current)?;
         if let Some(expected) = expected
             && expected != current.revision
@@ -246,6 +250,7 @@ pub async fn delete_vm(
 ) -> Result<StatusCode, ApiError> {
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    check_no_migration(&state, &vm)?;
     if !is_stopped(&vm) {
         return Err(vm_running(&vm, "delete"));
     }
@@ -303,6 +308,8 @@ pub async fn vm_action(
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     // 스냅샷 Task가 끝나지 않았으면 막는다. 시작한 스냅샷 Task는 실행기의 시간 제한으로 끝난다.
     // 강제 정지는 되돌리기만 막는다. 저장이 멈춘 만들기 중에도 VM을 끌 수 있어야 한다.
+    // 마이그레이션 중에는 모두 막는다. 실패하면 원본이 계속 돌고, 시간 제한으로 끝난다.
+    check_no_migration(&state, &vm)?;
     if query.mode == StopMode::Force {
         check_no_revert_task(&state, &vm)?;
     } else {
@@ -365,7 +372,137 @@ pub async fn vm_action(
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateRequest {
+    /// 옮겨 갈 노드(이름이나 id)
+    pub node: String,
+}
+
+/// 실행 중인 VM을 다른 노드로 라이브 마이그레이션할 Task를 돌려준다(202). Task는 지금 노드의 실행기가
+/// 한다. 디스크가 모두 공유 풀에 있어야 하고, HVF(macOS) 노드는 원본도 대상도 될 수 없다(409
+/// `migration_unsupported`). 대상 노드가 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
+/// 스케줄러가 고를 수 없는 노드(풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
+#[utoipa::path(post, path = "/vms/{key}/migrate", tag = "vms",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = MigrateRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn migrate_vm(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    Json(req): Json<MigrateRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
+    // 두 요청이 함께 검사를 지나 Task를 둘 만들지 않게 한다.
+    let _lock = state.vm_lock.lock().await;
+    let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    let target = lookup::<NodeSpec>(&state.cluster, &req.node)?;
+    if vm.spec.node == Some(target.id) {
+        return Err(ApiError::bad_request(format!(
+            "VM {:?} is already on node {:?}",
+            vm.name, target.name
+        )));
+    }
+    // 이미 옮기는 중인 VM은 아래의 vm_busy로 거절한다.
+    let source = vm.spec.node.filter(|_| {
+        vm.spec.power == PowerState::Running
+            && matches!(vm.status.phase, VmPhase::Running | VmPhase::Migrating)
+    });
+    let Some(source) = source else {
+        return Err(ApiError::conflict(
+            "vm_not_running",
+            format!("VM {:?} is not running", vm.name),
+        ));
+    };
+    check_not_busy(&state, &vm)?;
+    check_no_snapshot_task(&state, &vm)?;
+    let inv = Inventory::load(&state.cluster)?;
+    check_no_resize_task(&state, &inv, &vm)?;
+    for disk in &vm.spec.disks {
+        let pool = inv
+            .volumes
+            .iter()
+            .find(|v| v.name == disk.volume)
+            .and_then(|v| inv.pools.iter().find(|p| p.name == v.spec.pool));
+        if !pool.is_some_and(is_shared) {
+            return Err(ApiError::conflict(
+                "migration_unsupported",
+                format!(
+                    "disk {:?} is not on a shared storage pool; only VMs whose disks are all on shared pools can be migrated",
+                    disk.volume
+                ),
+            ));
+        }
+    }
+    for node in [Some(&target), inv.nodes.iter().find(|n| n.id == source)]
+        .into_iter()
+        .flatten()
+    {
+        // HVF는 이 노드의 hypervisor 이름으로만 알 수 있다(macOS 노드).
+        if node.status.hypervisor == "qemu-hvf" {
+            return Err(ApiError::conflict(
+                "migration_unsupported",
+                format!(
+                    "node {:?} runs macOS (HVF), which cannot migrate VMs",
+                    node.name
+                ),
+            ));
+        }
+    }
+    if !target.status.online || target.spec.maintenance {
+        return Err(ApiError::conflict(
+            "node_unavailable",
+            format!("node {:?} is offline or in maintenance", target.name),
+        ));
+    }
+    check_node_arch(&target, &vm.spec)?;
+    node_fits(&vm.spec, &inv, &target).map_err(|e| ApiError::conflict("no_capacity", e))?;
+    let free = inv.free_memory_mib(&target, vm.id);
+    if free < i64::from(vm.spec.memory_mib) {
+        return Err(ApiError::conflict(
+            "no_capacity",
+            format!(
+                "node {:?} has {free} MiB of unassigned memory, but VM {:?} needs {} MiB",
+                target.name, vm.name, vm.spec.memory_mib
+            ),
+        ));
+    }
+    let op = TaskOp::VmMigrate { node: target.id };
+    let task = create_task(&state.cluster, op, vm.id, source).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// VM 디스크의 크기 늘리기 Task가 끝나지 않았으면 409 `vm_busy`. 실행 중인 VM의 디스크는 QMP로
+/// 늘리므로 원본 QEMU가 사라지면 안 된다.
+fn check_no_resize_task(state: &AppState, inv: &Inventory, vm: &Vm) -> Result<(), ApiError> {
+    let disks: BTreeSet<Uuid> = inv
+        .volumes
+        .iter()
+        .filter(|v| vm.spec.disks.iter().any(|d| d.volume == v.name))
+        .map(|v| v.id)
+        .collect();
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    let busy = tasks.iter().any(|t| {
+        disks.contains(&t.spec.target)
+            && !t.status.state.is_finished()
+            && matches!(t.spec.op, TaskOp::VolumeResize { .. })
+    });
+    if busy {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            format!(
+                "a disk of VM {:?} is being resized; try again when the task has finished",
+                vm.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// spec을 읽고 바꿔 revision을 확인하며 쓴다. reconciler의 status 쓰기와 부딪치면 다시 읽는다.
+/// 읽은 VM이 마이그레이션 중이면 409 `vm_busy`다(호출자의 검사 뒤에 시작한 마이그레이션). 이 쓰기가
+/// 먼저 적용되면 마이그레이션 Task가 바뀐 spec을 보고 그만둔다.
 pub(crate) async fn modify_spec(
     state: &AppState,
     id: Uuid,
@@ -376,6 +513,7 @@ pub(crate) async fn modify_spec(
             .cluster
             .get::<VmSpec>(id)?
             .ok_or_else(|| ApiError::not_found(format!("vm {id} not found")))?;
+        check_not_migrating(&vm)?;
         let mut spec = vm.spec.clone();
         f(&mut spec)?;
         if spec == vm.spec {

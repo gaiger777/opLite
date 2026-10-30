@@ -445,6 +445,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vms/{key}/migrate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 실행 중인 VM을 다른 노드로 라이브 마이그레이션할 Task를 돌려준다(202). Task는 지금 노드의 실행기가
+         *     한다. 디스크가 모두 공유 풀에 있어야 하고, HVF(macOS) 노드는 원본도 대상도 될 수 없다(409
+         *     `migration_unsupported`). 대상 노드가 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
+         *     스케줄러가 고를 수 없는 노드(풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
+         */
+        post: operations["migrate_vm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vms/{key}/snapshots": {
         parameters: {
             query?: never;
@@ -1077,6 +1099,8 @@ export interface components {
                 status: {
                     /** @default null */
                     last_error: string | null;
+                    /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
+                    migration?: components["schemas"]["MigrationStatus"];
                     /**
                      * Format: uuid
                      * @default null
@@ -1196,6 +1220,17 @@ export interface components {
             online: boolean;
             /** @description 투표 멤버인지(아니면 learner) */
             voter: boolean;
+        };
+        MigrateRequest: {
+            /** @description 옮겨 갈 노드(이름이나 id) */
+            node: string;
+        };
+        /** @description 진행 중인 라이브 마이그레이션: 대상 노드와 그 마이그레이션 Task */
+        MigrationStatus: {
+            /** Format: uuid */
+            node: string;
+            /** Format: uuid */
+            task: string;
         };
         NetworkSpec: {
             /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
@@ -1578,6 +1613,8 @@ export interface components {
             status: {
                 /** @default null */
                 last_error: string | null;
+                /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
+                migration?: components["schemas"]["MigrationStatus"];
                 /**
                  * Format: uuid
                  * @default null
@@ -1782,6 +1819,11 @@ export interface components {
             pool?: string | null;
             /** Format: uuid */
             snapshot?: string | null;
+        } | {
+            /** @enum {string} */
+            kind: "vm-migrate";
+            /** Format: uuid */
+            node: string;
         };
         TaskSpec: {
             /**
@@ -1862,7 +1904,7 @@ export interface components {
             role: components["schemas"]["Role"];
         };
         /** @enum {string} */
-        VmPhase: "stopped" | "starting" | "running" | "stopping" | "failed";
+        VmPhase: "stopped" | "starting" | "running" | "stopping" | "failed" | "migrating";
         /** @description VM의 원하는 상태. */
         VmSpec: {
             cpu: components["schemas"]["CpuSpec"];
@@ -1885,6 +1927,8 @@ export interface components {
         VmStatus: {
             /** @default null */
             last_error: string | null;
+            /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
+            migration?: components["schemas"]["MigrationStatus"];
             /**
              * Format: uuid
              * @default null
@@ -3036,6 +3080,40 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    migrate_vm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MigrateRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
             };
             "4XX": {
                 headers: {

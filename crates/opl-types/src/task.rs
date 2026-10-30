@@ -68,6 +68,10 @@ pub enum TaskOp {
         snapshot: Option<Uuid>,
         pool: Option<String>,
     },
+    /// 실행 중인 대상 VM을 `node`로 라이브 마이그레이션한다. 원본 노드(VM의 `spec.node`)에서 돈다.
+    VmMigrate {
+        node: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -192,6 +196,18 @@ mod tests {
             pool: None,
         };
         let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+    }
+
+    #[test]
+    fn migrate_op_is_tagged_by_kind() {
+        let node = Uuid::now_v7();
+        let op = TaskOp::VmMigrate { node };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "vm-migrate", "node": node })
+        );
         assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
     }
 

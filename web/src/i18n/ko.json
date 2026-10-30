@@ -106,7 +106,8 @@
       "snapshot-revert": "{{target}} 스냅샷으로 되돌리기",
       "snapshot-delete": "{{target}} 스냅샷 삭제",
       "volume-resize": "볼륨 {{target}} 크기 늘리기",
-      "vm-clone": "{{target}} 복제"
+      "vm-clone": "{{target}} 복제",
+      "vm-migrate": "{{target}} 마이그레이션"
     }
   },
   "pager": {
@@ -166,7 +167,8 @@
       "starting": "시작 중",
       "running": "실행 중",
       "stopping": "정지 중",
-      "failed": "실패"
+      "failed": "실패",
+      "migrating": "마이그레이션 중"
     },
     "action": {
       "start": "시작",

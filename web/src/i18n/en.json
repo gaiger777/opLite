@@ -106,7 +106,8 @@
       "snapshot-revert": "Revert {{target}} to a snapshot",
       "snapshot-delete": "Delete snapshot of {{target}}",
       "volume-resize": "Resize volume {{target}}",
-      "vm-clone": "Clone {{target}}"
+      "vm-clone": "Clone {{target}}",
+      "vm-migrate": "Migrate {{target}}"
     }
   },
   "pager": {
@@ -166,7 +167,8 @@
       "starting": "Starting",
       "running": "Running",
       "stopping": "Stopping",
-      "failed": "Failed"
+      "failed": "Failed",
+      "migrating": "Migrating"
     },
     "action": {
       "start": "Start",

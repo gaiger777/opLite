@@ -80,8 +80,10 @@ pub(crate) fn vm_node(state: &AppState, vm: &Vm) -> Uuid {
 /// 시작·정지 중인 VM은 스냅샷 작업을 받지 않는다: phase가 Starting·Stopping이거나, 원하는 전원
 /// 상태(`spec.power`)에 아직 닿지 않았거나(reconciler가 켜거나 끄는 중), 전원 Task(시작·정지·
 /// 강제 정지·재시작)가 끝나지 않았으면 409 `vm_busy`. 전원 조작이 스냅샷 Task를 기다리는
-/// [`check_no_snapshot_task`]의 반대쪽이다. 디스크 크기 늘리기도 같은 규칙이다.
+/// [`check_no_snapshot_task`]의 반대쪽이다. 디스크 크기 늘리기도 같은 규칙이다. 마이그레이션 중인
+/// VM도 같다([`check_no_migration`]).
 pub(crate) fn check_not_busy(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    check_no_migration(state, vm)?;
     let settled = match vm.spec.power {
         PowerState::Running => vm.status.phase == VmPhase::Running,
         PowerState::Stopped => is_stopped(vm),
@@ -133,6 +135,31 @@ pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), Ap
             TaskOp::SnapshotCreate { .. } | TaskOp::SnapshotRevert { .. } | TaskOp::VmClone { .. }
         )
     })
+}
+
+/// 마이그레이션 중인 VM(`migrating`이거나 끝나지 않은 마이그레이션 Task가 있다)은 다른 동작을 받지
+/// 않는다: 409 `vm_busy`. 원본 QEMU를 끄거나 디스크·스펙을 바꾸면 옮기는 중인 VM이 어긋난다.
+pub(crate) fn check_no_migration(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    check_not_migrating(vm)?;
+    check_no_task(state, vm, "being migrated", |op| {
+        matches!(op, TaskOp::VmMigrate { .. })
+    })
+}
+
+/// 읽은 VM이 마이그레이션 중(`migrating`, 마이그레이션 표시)이면 409 `vm_busy`. 마이그레이션 Task는
+/// 표시를 쓴 뒤에야 움직이므로, spec을 쓰기 직전에 다시 읽은 VM으로 보면 검사와 쓰기 사이에 시작한
+/// 마이그레이션도 막는다([`check_no_migration`]의 Task 검사는 그 전에 지나갔을 수 있다).
+pub(crate) fn check_not_migrating(vm: &Vm) -> Result<(), ApiError> {
+    if vm.status.phase == VmPhase::Migrating || vm.status.migration.is_some() {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            format!(
+                "VM {:?} is migrating; try again when it has settled",
+                vm.name
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// 이 VM의 스냅샷 되돌리기 Task가 끝나지 않았으면 409 `vm_busy`. 강제 정지는 이것만 막는다

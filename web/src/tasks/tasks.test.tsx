@@ -96,11 +96,13 @@ it("keeps the newer listener when an older one unsubscribes", () => {
 });
 
 it("describes unknown operations by their kind", () => {
-  const unknown = { ...task("4", "pending"), spec: { op: { kind: "vm-migrate" }, target: "x" } };
-  expect(describeTask(unknown as unknown as Task, i18n.t, "web")).toBe("vm-migrate web");
+  const unknown = { ...task("4", "pending"), spec: { op: { kind: "vm-teleport" }, target: "x" } };
+  expect(describeTask(unknown as unknown as Task, i18n.t, "web")).toBe("vm-teleport web");
   expect(describeTask(task("4", "pending"), i18n.t, "web")).toBe("Start web");
   const clone = { ...task("4", "pending"), spec: { op: { kind: "vm-clone" }, target: "x" } };
   expect(describeTask(clone as unknown as Task, i18n.t, "web")).toBe("Clone web");
+  const migrate = { ...task("4", "pending"), spec: { op: { kind: "vm-migrate" }, target: "x" } };
+  expect(describeTask(migrate as unknown as Task, i18n.t, "web")).toBe("Migrate web");
 });
 
 it("waits for a task and rejects with its error when it fails", async () => {

@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -45,6 +46,8 @@ pub struct Config {
     pub janitor: JanitorSection,
     #[serde(default)]
     pub pools: PoolsSection,
+    #[serde(default)]
+    pub migration: MigrationSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -200,6 +203,94 @@ impl PoolsSection {
     pub fn refresh(&self) -> Duration {
         Duration::from_secs(self.refresh_secs)
     }
+}
+
+/// 라이브 마이그레이션(설계 §4)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationSection {
+    /// 받는 쪽 QEMU가 마이그레이션을 받는 포트 범위(`"A-B"`, 둘 다 포함). 노드 사이 방화벽에서
+    /// 열어야 한다.
+    #[serde(
+        default = "default_migration_ports",
+        deserialize_with = "deserialize_port_range"
+    )]
+    pub ports: RangeInclusive<u16>,
+    /// 보내는 대역폭 상한(MiB/s). 0이면 QEMU 기본값이다.
+    #[serde(default)]
+    pub bandwidth_mib: u64,
+    /// 마이그레이션이 이 시간 안에 끝나지 않으면 취소한다(`"30m"`, `"1h30m"`, `"90s"`).
+    #[serde(
+        default = "default_migration_timeout",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub timeout: Duration,
+}
+
+impl Default for MigrationSection {
+    fn default() -> Self {
+        Self {
+            ports: default_migration_ports(),
+            bandwidth_mib: 0,
+            timeout: default_migration_timeout(),
+        }
+    }
+}
+
+fn default_migration_ports() -> RangeInclusive<u16> {
+    60000..=60099
+}
+fn default_migration_timeout() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+
+/// `"A-B"`: 0이 아닌 포트 A부터 B까지(A ≤ B)
+fn parse_port_range(s: &str) -> Result<RangeInclusive<u16>, String> {
+    let err =
+        || format!("invalid port range {s:?} (expected \"FIRST-LAST\", e.g. \"60000-60099\")");
+    let (a, b) = s.split_once('-').ok_or_else(err)?;
+    let a: u16 = a.trim().parse().map_err(|_| err())?;
+    let b: u16 = b.trim().parse().map_err(|_| err())?;
+    if a == 0 || a > b {
+        return Err(err());
+    }
+    Ok(a..=b)
+}
+
+/// 숫자와 단위(`h`, `m`, `s`)를 이어 쓴 시간: `"30m"`, `"1h30m"`. 0보다 커야 한다.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let err = || format!("invalid duration {s:?} (e.g. \"30m\", \"1h30m\", \"90s\")");
+    let mut rest = s.trim();
+    let mut secs: u64 = 0;
+    while !rest.is_empty() {
+        let digits = rest.find(|c: char| !c.is_ascii_digit()).ok_or_else(err)?;
+        let n: u64 = rest[..digits].parse().map_err(|_| err())?;
+        let unit = match rest.as_bytes()[digits] {
+            b'h' => 3600,
+            b'm' => 60,
+            b's' => 1,
+            _ => return Err(err()),
+        };
+        secs = n
+            .checked_mul(unit)
+            .and_then(|v| secs.checked_add(v))
+            .ok_or_else(err)?;
+        rest = &rest[digits + 1..];
+    }
+    if secs == 0 {
+        return Err(err());
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+fn deserialize_port_range<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<RangeInclusive<u16>, D::Error> {
+    parse_port_range(&String::deserialize(d)?).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_duration<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+    parse_duration(&String::deserialize(d)?).map_err(serde::de::Error::custom)
 }
 
 fn default_listen() -> SocketAddr {
@@ -414,6 +505,9 @@ mod tests {
         assert_eq!(janitor.task_max_finished, 1000);
         assert_eq!(janitor.finished_grace, Duration::from_secs(600));
         assert_eq!(c.pools.refresh(), Duration::from_secs(15));
+        assert_eq!(c.migration.ports, 60000..=60099);
+        assert_eq!(c.migration.bandwidth_mib, 0);
+        assert_eq!(c.migration.timeout, Duration::from_secs(30 * 60));
         assert_eq!(c.hypervisor.accel, AccelSetting::Auto);
         assert_eq!(c.hypervisor.systemd_scope, cfg!(target_os = "linux"));
         assert_eq!(
@@ -597,6 +691,38 @@ mod tests {
                 assert!(!kvm_available());
                 assert!(e.to_string().contains("/dev/kvm"), "{e}");
             }
+        }
+    }
+
+    #[test]
+    fn migration_section_parses_ports_and_timeout() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[migration]\nports = \"61000-61009\"\n\
+             bandwidth_mib = 100\ntimeout = \"1h30m\"",
+        );
+        assert_eq!(c.migration.ports, 61000..=61009);
+        assert_eq!(c.migration.bandwidth_mib, 100);
+        assert_eq!(c.migration.timeout, Duration::from_secs(5400));
+        let one = parse(
+            "name = \"n\"\naddress = \"h\"\n[migration]\nports = \"60000-60000\"\ntimeout = \"90s\"",
+        );
+        assert_eq!(one.migration.ports, 60000..=60000);
+        assert_eq!(one.migration.timeout, Duration::from_secs(90));
+        for bad in [
+            "ports = \"60099-60000\"",
+            "ports = \"0-10\"",
+            "ports = \"60000\"",
+            "ports = \"60000-70000\"",
+            "ports = \"a-b\"",
+            "timeout = \"0s\"",
+            "timeout = \"30\"",
+            "timeout = \"500ms\"",
+            "timeout = \"m\"",
+            "timeout = \"\"",
+            "bandwidth = 1",
+        ] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[migration]\n{bad}");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
         }
     }
 }

@@ -525,6 +525,7 @@ impl Worker {
             last_error: error,
             snapshot: vm.status.snapshot,
             schedule_error: vm.status.schedule_error.clone(),
+            migration: None,
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

@@ -68,7 +68,7 @@ impl Inventory {
     }
 
     /// 실행하기로 된 다른 VM에 배정되지 않은 메모리
-    fn free_memory_mib(&self, node: &Node, vm: Uuid) -> i64 {
+    pub fn free_memory_mib(&self, node: &Node, vm: Uuid) -> i64 {
         let used: i64 = self
             .vms
             .iter()
@@ -86,14 +86,39 @@ impl Inventory {
 pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode> {
     inv.nodes
         .iter()
-        .filter(|n| n.status.online && !n.spec.maintenance)
-        .filter(|n| n.status.arch == Some(spec.machine.arch()))
-        .filter(|n| inv.reaches_disks(spec, n))
-        .filter(|n| inv.has_bridges(spec, n))
+        .filter(|n| node_fits(spec, inv, n).is_ok())
         .map(|n| (inv.free_memory_mib(n, vm), n.id))
         .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
         .map(|(_, id)| id)
         .ok_or(NoNode)
+}
+
+/// [`schedule`]가 이 노드를 후보로 보는지. 아니면 그 이유다. 메모리는 보지 않는다.
+pub fn node_fits(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), String> {
+    let name = &node.name;
+    if !node.status.online {
+        return Err(format!("node {name:?} is offline"));
+    }
+    if node.spec.maintenance {
+        return Err(format!("node {name:?} is in maintenance"));
+    }
+    if node.status.arch != Some(spec.machine.arch()) {
+        let arch = format!("{:?}", spec.machine.arch()).to_lowercase();
+        return Err(format!(
+            "node {name:?} does not have the {arch} architecture of the VM's machine type"
+        ));
+    }
+    if !inv.reaches_disks(spec, node) {
+        return Err(format!(
+            "node {name:?} cannot use the storage pools of the VM's disks"
+        ));
+    }
+    if !inv.has_bridges(spec, node) {
+        return Err(format!(
+            "node {name:?} does not have the bridges of the VM's networks"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -394,5 +419,66 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+    }
+
+    #[test]
+    fn node_fits_names_why_a_node_cannot_run_the_vm() {
+        let pool = pool("nas", true);
+        let ready = with_pool(node(8192), &pool, true);
+        let inv = Inventory {
+            nodes: vec![ready.clone()],
+            volumes: vec![volume("root", "nas", None)],
+            pools: vec![pool.clone()],
+            networks: vec![Resource::new(
+                "lan",
+                NetworkSpec {
+                    bridge: "vmbr0".into(),
+                    vlan: None,
+                },
+            )],
+            ..Default::default()
+        };
+        let mut me = spec(512, None, PowerState::Running);
+        me.disks.push(DiskSpec {
+            volume: "root".into(),
+            bus: DiskBus::VirtioBlk,
+            boot_order: Some(1),
+        });
+        assert_eq!(node_fits(&me, &inv, &ready), Ok(()));
+
+        let mut offline = ready.clone();
+        offline.status.online = false;
+        assert_eq!(
+            node_fits(&me, &inv, &offline),
+            Err("node \"n\" is offline".into())
+        );
+        let mut maint = ready.clone();
+        maint.spec.maintenance = true;
+        assert_eq!(
+            node_fits(&me, &inv, &maint),
+            Err("node \"n\" is in maintenance".into())
+        );
+        let mut x86 = ready.clone();
+        x86.status.arch = Some(Arch::X86_64);
+        assert_eq!(
+            node_fits(&me, &inv, &x86),
+            Err(
+                "node \"n\" does not have the aarch64 architecture of the VM's machine type".into()
+            )
+        );
+        let not_ready = with_pool(node(8192), &pool, false);
+        assert_eq!(
+            node_fits(&me, &inv, &not_ready),
+            Err("node \"n\" cannot use the storage pools of the VM's disks".into())
+        );
+        me.nics.push(NicSpec {
+            network: "lan".into(),
+            model: NicModel::Virtio,
+            mac: None,
+        });
+        assert_eq!(
+            node_fits(&me, &inv, &ready),
+            Err("node \"n\" does not have the bridges of the VM's networks".into())
+        );
     }
 }

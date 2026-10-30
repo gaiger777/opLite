@@ -282,6 +282,19 @@ pub struct VmStatus {
     pub snapshot: Option<Uuid>,
     /// 마지막 예약 스냅샷이 실패한 이유. 성공하면 지운다.
     pub schedule_error: Option<ScheduleError>,
+    /// 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // 없으면 빼고 쓰므로 API 문서에서도 null·기본값이 아니라 선택 필드다.
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub migration: Option<MigrationStatus>,
+}
+
+/// 진행 중인 라이브 마이그레이션: 대상 노드와 그 마이그레이션 Task
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct MigrationStatus {
+    pub node: Uuid,
+    pub task: Uuid,
 }
 
 /// 예약 스냅샷이 실패한 이유. `code`는 거절한 API 오류의 code(`vm_busy` 등)이고, Task가 실패했으면
@@ -324,6 +337,8 @@ pub enum VmPhase {
     Running,
     Stopping,
     Failed,
+    /// 다른 노드로 라이브 마이그레이션 중이다(원본 QEMU가 아직 돈다).
+    Migrating,
 }
 
 /// `52:54:00:12:34:56` 형식의 MAC 주소.
@@ -506,6 +521,32 @@ mod tests {
         assert_eq!(st, VmStatus::default());
         assert_eq!(st.snapshot, None);
         assert_eq!(st.schedule_error, None);
+        assert_eq!(st.migration, None);
+    }
+
+    #[test]
+    fn migration_status_is_written_only_while_migrating() {
+        // 마이그레이션이 없으면 필드를 빼고 쓴다.
+        let json = serde_json::to_value(VmStatus::default()).unwrap();
+        assert!(json.get("migration").is_none(), "{json}");
+        let st = VmStatus {
+            phase: VmPhase::Migrating,
+            migration: Some(MigrationStatus {
+                node: Uuid::now_v7(),
+                task: Uuid::now_v7(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(json["phase"], "migrating");
+        assert_eq!(
+            json["migration"],
+            serde_json::json!({
+                "node": st.migration.unwrap().node,
+                "task": st.migration.unwrap().task
+            })
+        );
+        assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
     }
 
     #[test]
