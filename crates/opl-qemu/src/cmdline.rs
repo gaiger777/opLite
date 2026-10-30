@@ -152,6 +152,19 @@ pub fn build_cmdline(
     Ok(a.0)
 }
 
+/// 라이브 마이그레이션을 받을 QEMU의 인자. [`build_cmdline`]과 같은 장치에 `-incoming defer`를 더한다.
+/// QEMU는 QMP `migrate-incoming`을 받을 때까지 기다리고, 받은 뒤에도 `-S`라 `cont` 전까지 멈춰 있다.
+pub fn build_incoming_cmdline(
+    spec: &VmRuntimeSpec,
+    host: &HostProfile,
+    paths: &RuntimePaths,
+) -> Result<Vec<String>, CmdlineError> {
+    let mut args = build_cmdline(spec, host, paths)?;
+    args.push("-incoming".into());
+    args.push("defer".into());
+    Ok(args)
+}
+
 /// RBD 이미지를 여는 `rbd` 블록 드라이버 옵션. 네임스페이스와 conf는 있을 때만 넣는다.
 fn rbd_source(rbd: &RbdTarget) -> String {
     let mut s = format!("driver=rbd,pool={}", esc(&rbd.pool));
@@ -317,6 +330,25 @@ mod tests {
     fn aarch64_hvf_minimal() {
         let args = build_cmdline(&mac_spec(), &mac_host(), &paths()).unwrap();
         insta::assert_snapshot!(args.join("\n"));
+    }
+
+    /// 받는 쪽은 원본과 같은 장치(블록 노드 이름·장치 id)에 `-incoming defer`만 더한다.
+    #[test]
+    fn incoming_adds_defer_to_the_same_devices() {
+        let normal = build_cmdline(&x86_spec(), &x86_host(), &paths()).unwrap();
+        let incoming = build_incoming_cmdline(&x86_spec(), &x86_host(), &paths()).unwrap();
+        assert_eq!(incoming[..normal.len()], normal[..]);
+        assert_eq!(incoming[normal.len()..], ["-incoming", "defer"]);
+        assert!(incoming.contains(&"-S".to_string()));
+        assert!(!normal.contains(&"-incoming".to_string()));
+        // 맞지 않는 조합은 똑같이 거절한다.
+        assert_eq!(
+            build_incoming_cmdline(&x86_spec(), &mac_host(), &paths()).unwrap_err(),
+            CmdlineError::MachineArchMismatch {
+                machine: MachineType::Q35,
+                arch: Arch::Aarch64
+            }
+        );
     }
 
     #[test]

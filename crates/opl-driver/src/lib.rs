@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod hypervisor;
+pub mod migration;
 pub mod mock;
 pub mod mounts;
 pub mod net;
@@ -11,6 +12,10 @@ pub mod storage;
 pub use error::DriverError;
 pub use hypervisor::{
     ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
+};
+pub use migration::{
+    MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, migration_tls_dir, tcp_uri,
+    write_migration_tls,
 };
 pub use mock::MockHypervisor;
 pub use net::{HostNet, IpRoute, Tap};

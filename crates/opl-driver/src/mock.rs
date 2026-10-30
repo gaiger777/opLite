@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -13,6 +14,10 @@ use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
 };
+use crate::migration::{MigrateOptions, MigrateTarget};
+
+/// 따로 정하지 않았을 때 `qemu_version`이 돌려주는 버전
+pub const MOCK_QEMU_VERSION: &str = "8.2.2";
 
 /// 메모리 안에서만 동작하는 하이퍼바이저. reconciler 테스트에서 장애를 주입하는 데 쓴다.
 pub struct MockHypervisor {
@@ -50,6 +55,19 @@ struct MockState {
     pauses: Vec<(Uuid, &'static str)>,
     /// 조회에 드러낼 상태(QEMU가 스스로 멈춘 상태 등)
     statuses: HashMap<Uuid, RuntimeStatus>,
+    /// `set_qemu_version`으로 정한 QEMU 버전
+    qemu_version: Option<String>,
+    /// 받는 중 표시가 있는 VM(`start_incoming`으로 띄우고 아직 `finish_incoming`하지 않음)
+    incoming: HashSet<Uuid>,
+    /// 마이그레이션이 만든 상태: 받는 쪽 `inmigrate`·받은 뒤 멈춤, 보낸 원본 `postmigrate`.
+    /// VM이 꺼지면 사라진다.
+    migration_status: HashMap<Uuid, RuntimeStatus>,
+    /// 다음 `migrate` 한 번을 실패시킬 오류
+    fail_next_migrate: Option<DriverError>,
+    /// 다음 `incoming_wait` 한 번을 실패시킬 오류. 실제 QEMU처럼 받는 QEMU는 끝난다.
+    fail_next_incoming: Option<DriverError>,
+    /// `migrate` 호출 (VM, 보낸 곳). 실패한 호출 포함
+    migrations: Vec<(Uuid, MigrateTarget)>,
 }
 
 impl Default for MockHypervisor {
@@ -180,6 +198,37 @@ impl MockHypervisor {
         };
     }
 
+    /// `qemu_version`·`running_qemu_version`이 돌려줄 버전(기본 [`MOCK_QEMU_VERSION`])
+    pub fn set_qemu_version(&self, version: &str) {
+        self.state.lock().unwrap().qemu_version = Some(version.to_string());
+    }
+
+    /// 다음 `migrate` 한 번을 이 오류로 실패시킨다. 원본은 그대로 돈다.
+    pub fn fail_next_migrate(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_migrate = Some(err);
+    }
+
+    /// 다음 `incoming_wait` 한 번을 이 오류로 실패시킨다. 받는 QEMU는 크래시로 끝난다.
+    pub fn fail_next_incoming_wait(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_incoming = Some(err);
+    }
+
+    /// `migrate` 호출(실패 포함)을 순서대로 돌려준다.
+    pub fn migrations(&self) -> Vec<(Uuid, MigrateTarget)> {
+        self.state.lock().unwrap().migrations.clone()
+    }
+
+    /// 받는 중 표시가 있는지
+    pub fn is_incoming(&self, id: Uuid) -> bool {
+        self.state.lock().unwrap().incoming.contains(&id)
+    }
+
+    fn version(st: &MockState) -> String {
+        st.qemu_version
+            .clone()
+            .unwrap_or_else(|| MOCK_QEMU_VERSION.to_string())
+    }
+
     /// 실제 드라이버처럼 실행 중인 VM만 다룬다. 살아 있지만 QMP로 다룰 수 없으면 다시 시도할 오류다.
     fn controllable(st: &MockState, id: Uuid) -> Result<(), DriverError> {
         if !st.vms.contains_key(&id) {
@@ -196,6 +245,8 @@ impl MockHypervisor {
         st.unresponsive.remove(&id);
         st.paused.remove(&id);
         st.marked.remove(&id);
+        st.incoming.remove(&id);
+        st.migration_status.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -206,6 +257,8 @@ impl MockHypervisor {
         let status = if st.unresponsive.contains(&id) {
             RuntimeStatus::Other("unresponsive".into())
         } else if let Some(status) = st.statuses.get(&id) {
+            status.clone()
+        } else if let Some(status) = st.migration_status.get(&id) {
             status.clone()
         } else if st.paused.contains(&id) {
             RuntimeStatus::Paused
@@ -258,6 +311,8 @@ impl Hypervisor for MockHypervisor {
                     StopMode::Force => {
                         st.unresponsive.remove(&id);
                         st.paused.remove(&id);
+                        st.incoming.remove(&id);
+                        st.migration_status.remove(&id);
                         st.vms.remove(&id);
                         Ok(())
                     }
@@ -366,6 +421,10 @@ impl Hypervisor for MockHypervisor {
         Self::controllable(&st, id)?;
         st.paused.remove(&id);
         st.marked.remove(&id);
+        // 마이그레이션을 보낸 원본도 `cont`로 다시 돈다.
+        if st.migration_status.get(&id) == Some(&postmigrate()) {
+            st.migration_status.remove(&id);
+        }
         Ok(())
     }
 
@@ -380,9 +439,135 @@ impl Hypervisor for MockHypervisor {
         Ok(true)
     }
 
+    async fn qemu_version(&self) -> Result<String, DriverError> {
+        Ok(Self::version(&self.state.lock().unwrap()))
+    }
+
+    async fn running_qemu_version(&self, id: Uuid) -> Result<String, DriverError> {
+        let st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        Ok(Self::version(&st))
+    }
+
+    /// 범위의 첫 포트를 돌려준다. `fail_next_start`로 주입한 오류로 실패할 수 있다.
+    async fn start_incoming(
+        &self,
+        vm: &VmRuntimeSpec,
+        _listen_host: &str,
+        ports: RangeInclusive<u16>,
+    ) -> Result<u16, DriverError> {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.vms.contains_key(&vm.id) {
+                return Err(DriverError::Migration(format!(
+                    "VM {} is already running on this node",
+                    vm.id
+                )));
+            }
+            if let Some(err) = st.fail_next_start.take() {
+                return Err(err);
+            }
+            let pid = st.next_pid;
+            st.next_pid += 1;
+            st.vms.insert(vm.id, pid);
+            st.incoming.insert(vm.id);
+            st.migration_status.insert(vm.id, inmigrate());
+        }
+        let _ = self.events.send(HypervisorEvent {
+            id: vm.id,
+            kind: EventKind::Started,
+        });
+        Ok(*ports.start())
+    }
+
+    /// 주입한 실패가 없으면 받기를 마친 것으로 본다(멈춘 채).
+    async fn incoming_wait(&self, id: Uuid) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        if !st.incoming.contains(&id) {
+            return Err(DriverError::Migration(format!(
+                "VM {id} is not receiving a migration"
+            )));
+        }
+        if let Some(err) = st.fail_next_incoming.take() {
+            drop(st);
+            self.remove(id, EventKind::Crashed);
+            return Err(err);
+        }
+        st.migration_status.insert(id, RuntimeStatus::Paused);
+        Ok(())
+    }
+
+    async fn finish_incoming(&self, id: Uuid) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        if !st.incoming.contains(&id) {
+            return Ok(());
+        }
+        if st.migration_status.get(&id) == Some(&inmigrate()) {
+            return Err(DriverError::Migration(format!(
+                "incoming migration of VM {id} has not completed"
+            )));
+        }
+        st.incoming.remove(&id);
+        st.migration_status.remove(&id);
+        Ok(())
+    }
+
+    async fn list_incoming(&self) -> Result<Vec<Uuid>, DriverError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .incoming
+            .iter()
+            .filter(|id| st.vms.contains_key(id))
+            .copied()
+            .collect())
+    }
+
+    /// 주입한 실패가 없으면 원본을 `postmigrate`로 멈춘다.
+    async fn migrate(
+        &self,
+        id: Uuid,
+        target: &MigrateTarget,
+        _opts: &MigrateOptions,
+    ) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.migrations.push((id, target.clone()));
+        Self::controllable(&st, id)?;
+        if let Some(err) = st.fail_next_migrate.take() {
+            return Err(err);
+        }
+        st.migration_status.insert(id, postmigrate());
+        Ok(())
+    }
+
+    async fn stop_migrated(&self, id: Uuid) -> Result<bool, DriverError> {
+        let migrated = {
+            let st = self.state.lock().unwrap();
+            st.vms.contains_key(&id) && st.migration_status.get(&id) == Some(&postmigrate())
+        };
+        if migrated {
+            self.remove(
+                id,
+                EventKind::Stopped {
+                    guest_initiated: false,
+                },
+            );
+        }
+        Ok(migrated)
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
         self.events.subscribe()
     }
+}
+
+fn inmigrate() -> RuntimeStatus {
+    RuntimeStatus::Other("inmigrate".into())
+}
+
+fn postmigrate() -> RuntimeStatus {
+    RuntimeStatus::Other("postmigrate".into())
 }
 
 #[cfg(test)]
@@ -618,6 +803,137 @@ mod tests {
         assert_eq!(hv.snapshots(vm.id).len(), 1);
         hv.snapshot_delete(vm.id, "s").await.unwrap();
         assert!(hv.snapshots(vm.id).is_empty());
+    }
+
+    fn target() -> MigrateTarget {
+        MigrateTarget {
+            host: "10.0.0.2".into(),
+            port: 60000,
+            tls_hostname: "10.0.0.2".into(),
+        }
+    }
+
+    fn opts() -> MigrateOptions {
+        MigrateOptions {
+            bandwidth: None,
+            timeout: Duration::from_secs(60),
+        }
+    }
+
+    /// 원본 노드와 대상 노드의 하이퍼바이저로 한 번의 마이그레이션을 흉내 낸다.
+    #[tokio::test]
+    async fn migration_between_two_mocks() {
+        let (src, dst) = (MockHypervisor::default(), MockHypervisor::default());
+        let vm = spec();
+        assert_eq!(src.qemu_version().await.unwrap(), MOCK_QEMU_VERSION);
+        assert!(matches!(
+            src.running_qemu_version(vm.id).await,
+            Err(DriverError::NotRunning(_))
+        ));
+        src.start(&vm, None).await.unwrap();
+        assert_eq!(
+            src.running_qemu_version(vm.id).await.unwrap(),
+            dst.qemu_version().await.unwrap()
+        );
+
+        let mut events = dst.subscribe();
+        let port = dst
+            .start_incoming(&vm, "10.0.0.2", 60000..=60099)
+            .await
+            .unwrap();
+        assert_eq!(port, 60000);
+        assert_eq!(events.recv().await.unwrap().kind, EventKind::Started);
+        assert!(dst.is_incoming(vm.id));
+        assert_eq!(dst.list_incoming().await.unwrap(), vec![vm.id]);
+        let status = |hv: &MockHypervisor| {
+            let st = hv.state.lock().unwrap();
+            st.vms
+                .get(&vm.id)
+                .map(|&pid| MockHypervisor::state_of(&st, vm.id, pid).status)
+        };
+        assert_eq!(status(&dst), Some(inmigrate()));
+        // 아직 받는 중이면 넘겨받을 수 없다.
+        assert!(matches!(
+            dst.finish_incoming(vm.id).await,
+            Err(DriverError::Migration(_))
+        ));
+        // 이미 돌고 있는 VM은 받을 수 없다.
+        assert!(matches!(
+            src.start_incoming(&vm, "10.0.0.1", 60000..=60099).await,
+            Err(DriverError::Migration(_))
+        ));
+
+        src.migrate(vm.id, &target(), &opts()).await.unwrap();
+        assert_eq!(src.migrations(), vec![(vm.id, target())]);
+        assert_eq!(status(&src), Some(postmigrate()));
+        dst.incoming_wait(vm.id).await.unwrap();
+        assert_eq!(status(&dst), Some(RuntimeStatus::Paused));
+        dst.finish_incoming(vm.id).await.unwrap();
+        assert_eq!(status(&dst), Some(RuntimeStatus::Running));
+        assert!(!dst.is_incoming(vm.id));
+        assert!(dst.list_incoming().await.unwrap().is_empty());
+        // 두 번째 넘겨받기는 아무것도 하지 않는다.
+        dst.finish_incoming(vm.id).await.unwrap();
+        // 받는 중 표시가 없으면 기다릴 것이 없다.
+        assert!(matches!(
+            dst.incoming_wait(vm.id).await,
+            Err(DriverError::Migration(_))
+        ));
+
+        // 돌고 있는 VM은 끄지 않는다.
+        assert!(!dst.stop_migrated(vm.id).await.unwrap());
+        assert!(src.stop_migrated(vm.id).await.unwrap());
+        assert_eq!(src.inspect(vm.id).await.unwrap(), None);
+        assert!(!src.stop_migrated(vm.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_migration_keeps_source_and_receiver_exits() {
+        let (src, dst) = (MockHypervisor::default(), MockHypervisor::default());
+        let vm = spec();
+        src.start(&vm, None).await.unwrap();
+        src.fail_next_migrate(DriverError::Migration("Connection refused".into()));
+        assert!(matches!(
+            src.migrate(vm.id, &target(), &opts()).await,
+            Err(DriverError::Migration(_))
+        ));
+        let state = src.inspect(vm.id).await.unwrap().unwrap();
+        assert_eq!(state.status, RuntimeStatus::Running);
+
+        // 받기에 실패한 QEMU는 크래시로 끝난다.
+        dst.start_incoming(&vm, "10.0.0.2", 60000..=60099)
+            .await
+            .unwrap();
+        let mut events = dst.subscribe();
+        dst.fail_next_incoming_wait(DriverError::Migration("TLS handshake failed".into()));
+        assert!(dst.incoming_wait(vm.id).await.is_err());
+        assert_eq!(events.recv().await.unwrap().kind, EventKind::Crashed);
+        assert!(dst.list_incoming().await.unwrap().is_empty());
+
+        // 시작 실패를 주입하면 받기도 실패한다.
+        dst.fail_next_start(DriverError::StartFailed("boom".into()));
+        assert!(matches!(
+            dst.start_incoming(&vm, "10.0.0.2", 60000..=60099).await,
+            Err(DriverError::StartFailed(_))
+        ));
+        assert_eq!(dst.inspect(vm.id).await.unwrap(), None);
+
+        // 보낸 뒤 확정 전에 실패하면 원본을 이어서 실행한다.
+        src.migrate(vm.id, &target(), &opts()).await.unwrap();
+        assert_eq!(
+            src.inspect(vm.id).await.unwrap().unwrap().status,
+            postmigrate()
+        );
+        src.resume(vm.id).await.unwrap();
+        assert_eq!(
+            src.inspect(vm.id).await.unwrap().unwrap().status,
+            RuntimeStatus::Running
+        );
+        assert!(!src.stop_migrated(vm.id).await.unwrap());
+
+        // 받는 쪽에서 버전을 다르게 보이게 할 수 있다.
+        dst.set_qemu_version("9.0.0");
+        assert_eq!(dst.qemu_version().await.unwrap(), "9.0.0");
     }
 
     #[tokio::test]

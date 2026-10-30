@@ -5,7 +5,10 @@ pub mod host;
 pub mod paths;
 pub mod qmp;
 
-pub use cmdline::{CmdlineError, build_cmdline};
+pub use cmdline::{CmdlineError, build_cmdline, build_incoming_cmdline};
 pub use host::{Accel, HostProfile, kvm_available};
 pub use paths::{PathError, RuntimePaths};
-pub use qmp::{QmpClient, QmpError, QmpEvent, RunState};
+pub use qmp::{
+    MigrationInfo, MigrationParameters, MigrationState, QmpClient, QmpError, QmpEvent, RunState,
+    TlsEndpoint,
+};

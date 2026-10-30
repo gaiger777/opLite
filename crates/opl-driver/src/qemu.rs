@@ -1,11 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use opl_qemu::{HostProfile, QmpClient, QmpError, QmpEvent, RunState, RuntimePaths, build_cmdline};
+use opl_qemu::{
+    HostProfile, MigrationInfo, MigrationParameters, MigrationState, QmpClient, QmpError, QmpEvent,
+    RunState, RuntimePaths, TlsEndpoint, build_cmdline, build_incoming_cmdline,
+};
 use opl_types::network::tap_prefix;
 use opl_types::runtime::{NicBackend, VmRuntimeSpec};
 use opl_types::vm::Firmware;
@@ -18,6 +22,10 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
+};
+use crate::migration::{
+    MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, migration_tls_dir, parse_qemu_version,
+    pick_port, tcp_uri,
 };
 use crate::net::{HostNet, Tap};
 
@@ -41,6 +49,16 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(540);
 /// opl이 스냅샷을 위해 VM을 멈춰 두었다는 표시 파일. VM 실행 디렉터리에 `pause`가 쓰고 `resume`이
 /// 지운다. opld가 멈춘 채 죽었으면 다시 붙을 때 이 표시를 보고 이어서 실행한다.
 const PAUSED_MARK: &str = "paused-by-opl";
+
+/// 라이브 마이그레이션을 받는 QEMU라는 표시 파일. `start_incoming`이 QEMU를 띄우기 전에 실행
+/// 디렉터리에 쓰고 `finish_incoming`이 지운다. QEMU가 끝나면 실행 디렉터리와 함께 사라진다.
+const INCOMING_MARK: &str = "incoming";
+/// 마이그레이션 상태를 다시 묻는 간격(`MIGRATION` 이벤트를 놓쳐도 이만큼 뒤에 안다)
+const MIGRATION_POLL: Duration = Duration::from_secs(1);
+/// 원본이 끝난 뒤 받는 쪽이 마지막 장치 상태를 다 읽기를 기다리는 한도
+const INCOMING_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// 시간 제한으로 `migrate_cancel`한 뒤 마이그레이션이 끝나기를 기다리는 한도
+const CANCEL_WAIT: Duration = Duration::from_secs(30);
 
 /// VM별 상태 디렉터리 `{state_dir}/vm/{id}`. `state_dir`은 [`QemuConfig::state_dir`]이다.
 pub fn vm_state_dir(state_dir: &Path, id: Uuid) -> PathBuf {
@@ -77,6 +95,17 @@ pub struct QemuHypervisor {
     events: broadcast::Sender<HypervisorEvent>,
     /// `pause`로 멈추고 아직 `resume`을 부르지 않은 VM. 다시 붙어도 이어서 실행하지 않는다.
     pausing: Mutex<HashSet<Uuid>>,
+    /// 받을 포트를 고르고 QEMU가 그 포트를 열 때까지 쥔다. 동시에 받는 두 VM이 같은 포트를 고르지 않게 한다.
+    incoming_ports: tokio::sync::Mutex<()>,
+}
+
+/// QEMU를 띄우는 방식
+#[derive(Clone, Copy)]
+enum Launch<'a> {
+    /// 띄우고(스냅샷 태그가 있으면 불러온 뒤) 이어서 실행한다.
+    Start { restore: Option<&'a str> },
+    /// `-incoming defer`로 띄우고 받는 중 표시를 남긴다. 멈춘 채 둔다.
+    Incoming,
 }
 
 struct VmHandle {
@@ -104,6 +133,7 @@ impl QemuHypervisor {
             vms: Arc::new(Mutex::new(HashMap::new())),
             events: broadcast::channel(64).0,
             pausing: Mutex::default(),
+            incoming_ports: tokio::sync::Mutex::new(()),
         };
         for entry in std::fs::read_dir(&vm_run_dir)? {
             let entry = entry?;
@@ -202,7 +232,7 @@ impl QemuHypervisor {
         &self,
         vm: &VmRuntimeSpec,
         paths: &RuntimePaths,
-        restore: Option<&str>,
+        how: Launch<'_>,
     ) -> Result<(), DriverError> {
         std::fs::create_dir_all(&paths.dir)?;
         std::fs::create_dir_all(self.state_dir(vm.id))?;
@@ -215,9 +245,16 @@ impl QemuHypervisor {
             remove_if_exists(sock)?;
         }
 
-        let mut args = build_cmdline(vm, &self.config.host, paths)
-            .map_err(|e| DriverError::InvalidSpec(e.to_string()))?;
+        let args = match how {
+            Launch::Start { .. } => build_cmdline(vm, &self.config.host, paths),
+            Launch::Incoming => build_incoming_cmdline(vm, &self.config.host, paths),
+        };
+        let mut args = args.map_err(|e| DriverError::InvalidSpec(e.to_string()))?;
         args.push("-daemonize".into());
+        if let Launch::Incoming = how {
+            // 띄우는 도중에 opld가 죽어도 남은 QEMU가 받는 쪽임을 알 수 있게 먼저 쓴다.
+            std::fs::write(paths.dir.join(INCOMING_MARK), b"")?;
+        }
         self.create_taps(vm).await?;
         let mut cmd = if self.config.systemd_scope {
             clear_stale_scope(vm.id).await;
@@ -256,6 +293,11 @@ impl QemuHypervisor {
         let Some(handle) = self.handle(vm.id) else {
             // 그새 끝났다. 모니터가 종료 이벤트를 보냈다.
             return Ok(());
+        };
+        let restore = match how {
+            Launch::Start { restore } => restore,
+            // 받기를 마칠 때까지 멈춰 둔다.
+            Launch::Incoming => return Ok(()),
         };
         if let Some(tag) = restore {
             // -S로 멈춘 채 불러온 뒤 cont로 이어서 실행한다. 메모리 상태는 첫 디스크(disk0)에 있다.
@@ -390,6 +432,67 @@ impl QemuHypervisor {
         Ok(())
     }
 
+    /// 마이그레이션 TLS 자격 증명(`{state_dir}/migration-tls`)과 능력·매개변수를 정한다. 자격 증명
+    /// 객체는 파일을 만들 때 읽으므로, 인증서가 바뀌었을 수 있어 매번 지우고 다시 만든다.
+    async fn setup_migration(
+        &self,
+        qmp: &QmpClient,
+        endpoint: TlsEndpoint,
+        tls_hostname: Option<&str>,
+        bandwidth: Option<u64>,
+    ) -> Result<(), DriverError> {
+        // 처음이면 없어서 실패한다.
+        let _ = tokio::time::timeout(QMP_TIMEOUT, qmp.object_del(MIGRATION_TLS_ID)).await;
+        let dir = migration_tls_dir(&self.config.state_dir);
+        let add = qmp.add_tls_creds(MIGRATION_TLS_ID, &dir, endpoint);
+        flatten(
+            tokio::time::timeout(QMP_TIMEOUT, add).await,
+            "QMP object-add",
+        )?;
+        let caps = qmp.migrate_set_capabilities(&[("events", true), ("auto-converge", true)]);
+        flatten(
+            tokio::time::timeout(QMP_TIMEOUT, caps).await,
+            "QMP migrate-set-capabilities",
+        )?;
+        let params = MigrationParameters {
+            tls_creds: Some(MIGRATION_TLS_ID.into()),
+            tls_hostname: tls_hostname.map(str::to_string),
+            max_bandwidth: bandwidth,
+        };
+        let set = qmp.migrate_set_parameters(&params);
+        flatten(
+            tokio::time::timeout(QMP_TIMEOUT, set).await,
+            "QMP migrate-set-parameters",
+        )
+    }
+
+    /// 띄운 받는 QEMU에 마이그레이션 설정을 하고 빈 포트에서 받기 시작한다.
+    async fn listen_incoming(
+        &self,
+        id: Uuid,
+        host: &str,
+        ports: RangeInclusive<u16>,
+    ) -> Result<u16, DriverError> {
+        let handle = self.running_handle(id)?;
+        self.setup_migration(&handle.qmp, TlsEndpoint::Server, None, None)
+            .await?;
+        let _ports = self.incoming_ports.lock().await;
+        let Some(port) = pick_port(host, ports.clone()) else {
+            return Err(DriverError::Migration(format!(
+                "no free migration port in {}-{} on {host}",
+                ports.start(),
+                ports.end()
+            )));
+        };
+        let uri = tcp_uri(host, port);
+        let listen = handle.qmp.migrate_incoming(&uri);
+        flatten(
+            tokio::time::timeout(QMP_TIMEOUT, listen).await,
+            "QMP migrate-incoming",
+        )?;
+        Ok(port)
+    }
+
     async fn query_state(&self, id: Uuid) -> Result<Option<ActualState>, DriverError> {
         let Some(handle) = self.handle(id) else {
             // 살아 있지만 QMP에 붙지 못한 VM도 드러내야 reconciler가 놓치지 않는다.
@@ -410,6 +513,8 @@ impl QemuHypervisor {
             Ok(Ok(RunState::Running)) => RuntimeStatus::Running,
             Ok(Ok(RunState::Prelaunch | RunState::Paused)) => RuntimeStatus::Paused,
             Ok(Ok(RunState::Shutdown)) => RuntimeStatus::Other("shutdown".into()),
+            Ok(Ok(RunState::InMigrate)) => RuntimeStatus::Other("inmigrate".into()),
+            Ok(Ok(RunState::PostMigrate)) => RuntimeStatus::Other("postmigrate".into()),
             Ok(Ok(RunState::Other(s))) => RuntimeStatus::Other(s),
             // 조회하는 사이에 프로세스가 끝났다.
             Ok(Err(QmpError::Disconnected)) => return Ok(None),
@@ -460,7 +565,7 @@ impl Hypervisor for QemuHypervisor {
                 "a snapshot to restore needs a disk for its memory state".into(),
             ));
         }
-        if let Err(e) = self.launch(vm, &paths, restore).await {
+        if let Err(e) = self.launch(vm, &paths, Launch::Start { restore }).await {
             if self.handle(vm.id).is_none() {
                 self.kill_and_cleanup(vm.id, &paths).await;
             }
@@ -636,8 +741,205 @@ impl Hypervisor for QemuHypervisor {
         Ok(true)
     }
 
+    async fn qemu_version(&self) -> Result<String, DriverError> {
+        let output = tokio::process::Command::new(&self.config.host.qemu_binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(QMP_TIMEOUT, output)
+            .await
+            .map_err(|_| DriverError::Timeout("qemu --version"))??;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match parse_qemu_version(&stdout) {
+            Some(v) if output.status.success() => Ok(v),
+            _ => Err(DriverError::ToolFailed {
+                tool: "qemu --version",
+                stderr: format!(
+                    "{}{}",
+                    stdout.trim(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            }),
+        }
+    }
+
+    async fn running_qemu_version(&self, id: Uuid) -> Result<String, DriverError> {
+        let handle = self.running_handle(id)?;
+        let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_version()).await;
+        flatten(r, "QMP query-version")
+    }
+
+    async fn start_incoming(
+        &self,
+        vm: &VmRuntimeSpec,
+        listen_host: &str,
+        ports: RangeInclusive<u16>,
+    ) -> Result<u16, DriverError> {
+        let paths = self.paths(vm.id)?;
+        if self.handle(vm.id).is_some() || liveness(&paths.pidfile) != Liveness::Dead {
+            return Err(DriverError::Migration(format!(
+                "VM {} is already running on this node",
+                vm.id
+            )));
+        }
+        if let Err(e) = self.launch(vm, &paths, Launch::Incoming).await {
+            if self.handle(vm.id).is_none() {
+                self.kill_and_cleanup(vm.id, &paths).await;
+            } else if let Err(stop) = self.stop(vm.id, StopMode::Force).await {
+                tracing::error!(id = %vm.id, error = %stop, "failed to stop incoming QEMU");
+            }
+            return Err(e);
+        }
+        match self.listen_incoming(vm.id, listen_host, ports).await {
+            Ok(port) => Ok(port),
+            Err(e) => {
+                // QEMU 하나는 한 번만 받을 수 있으므로 버린다.
+                if let Err(stop) = self.stop(vm.id, StopMode::Force).await {
+                    tracing::error!(id = %vm.id, error = %stop, "failed to stop incoming QEMU");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn incoming_wait(&self, id: Uuid) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        if !handle.paths.dir.join(INCOMING_MARK).exists() {
+            return Err(DriverError::Migration(format!(
+                "VM {id} is not receiving a migration"
+            )));
+        }
+        let wait = handle.qmp.wait_migration(MIGRATION_POLL);
+        match tokio::time::timeout(INCOMING_WAIT_TIMEOUT, wait).await {
+            Err(_) => Err(DriverError::Timeout("incoming migration to complete")),
+            // 받기에 실패한 QEMU는 스스로 끝난다.
+            Ok(Err(QmpError::Disconnected)) => {
+                Err(DriverError::Migration("the receiving QEMU exited".into()))
+            }
+            Ok(Err(e)) => Err(e.into()),
+            Ok(Ok(info)) => migration_result(info),
+        }
+    }
+
+    async fn finish_incoming(&self, id: Uuid) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let mark = handle.paths.dir.join(INCOMING_MARK);
+        if !mark.exists() {
+            return Ok(());
+        }
+        let status = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_status()).await;
+        match flatten(status, "QMP query-status")? {
+            RunState::Paused => {
+                tracing::info!(%id, "continuing received VM");
+                let cont = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.cont()).await;
+                flatten(cont, "QMP cont")?;
+            }
+            RunState::Running => {}
+            state => {
+                return Err(DriverError::Migration(format!(
+                    "incoming migration of VM {id} has not completed (QEMU is {state:?})"
+                )));
+            }
+        }
+        remove_if_exists(&mark)?;
+        Ok(())
+    }
+
+    async fn list_incoming(&self) -> Result<Vec<Uuid>, DriverError> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(self.config.run_dir.join("vm"))? {
+            let entry = entry?;
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            let paths = self.paths(id)?;
+            if paths.dir.join(INCOMING_MARK).exists() && liveness(&paths.pidfile) != Liveness::Dead
+            {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn migrate(
+        &self,
+        id: Uuid,
+        target: &MigrateTarget,
+        opts: &MigrateOptions,
+    ) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        self.setup_migration(
+            qmp,
+            TlsEndpoint::Client,
+            Some(&target.tls_hostname),
+            opts.bandwidth,
+        )
+        .await?;
+        let uri = tcp_uri(&target.host, target.port);
+        tracing::info!(%id, %uri, "migrating VM");
+        flatten(
+            tokio::time::timeout(QMP_TIMEOUT, qmp.migrate(&uri)).await,
+            "QMP migrate",
+        )?;
+        let info =
+            match tokio::time::timeout(opts.timeout, qmp.wait_migration(MIGRATION_POLL)).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    tracing::warn!(%id, timeout = ?opts.timeout, "migration timed out; cancelling");
+                    let cancel = tokio::time::timeout(QMP_TIMEOUT, qmp.migrate_cancel()).await;
+                    flatten(cancel, "QMP migrate_cancel")?;
+                    let wait = qmp.wait_migration(MIGRATION_POLL);
+                    let info = flatten(
+                        tokio::time::timeout(CANCEL_WAIT, wait).await,
+                        "migration to cancel",
+                    )?;
+                    // 취소하는 사이에 끝났으면 그대로 성공이다.
+                    if info.state != MigrationState::Completed {
+                        return Err(DriverError::Migration(format!(
+                            "did not complete within {:?}; cancelled",
+                            opts.timeout
+                        )));
+                    }
+                    info
+                }
+            };
+        migration_result(info)
+    }
+
+    async fn stop_migrated(&self, id: Uuid) -> Result<bool, DriverError> {
+        let Some(handle) = self.handle(id) else {
+            return Ok(false);
+        };
+        let status = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_status()).await;
+        if flatten(status, "QMP query-status")? != RunState::PostMigrate {
+            return Ok(false);
+        }
+        drop(handle);
+        tracing::info!(%id, "stopping migrated source QEMU");
+        self.stop(id, StopMode::Force).await?;
+        Ok(true)
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
         self.events.subscribe()
+    }
+}
+
+/// 끝난 마이그레이션의 결과
+fn migration_result(info: MigrationInfo) -> Result<(), DriverError> {
+    match info.state {
+        MigrationState::Completed => Ok(()),
+        MigrationState::Cancelled => Err(DriverError::Migration("migration was cancelled".into())),
+        state => Err(DriverError::Migration(
+            info.error
+                .unwrap_or_else(|| format!("migration ended as {state:?}")),
+        )),
     }
 }
 
@@ -1032,6 +1334,12 @@ time.sleep(60)
     /// QEMU 대신 QMP 소켓을 여는 가짜 서버. greeting과 capabilities 협상까지 처리하고,
     /// `query-status`에는 `status`를 답한다.
     async fn fake_qmp(dir: &Path, status: &'static str) -> FakeQmp {
+        fake_qmp_with(dir, status, "completed").await
+    }
+
+    /// [`fake_qmp`]에 더해 `query-migrate`에 `migration` 상태로 답한다(`failed`면 `error-desc`도).
+    /// `migrate_cancel`을 받은 뒤에는 `cancelled`로 답한다.
+    async fn fake_qmp_with(dir: &Path, status: &'static str, migration: &'static str) -> FakeQmp {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         std::fs::create_dir_all(dir).unwrap();
@@ -1050,6 +1358,7 @@ time.sleep(60)
                 .write_all(b"{\"QMP\":{\"version\":{},\"capabilities\":[]}}\n")
                 .await
                 .unwrap();
+            let mut migration = migration;
             loop {
                 let line = tokio::select! {
                     ev = &mut hangup_rx => {
@@ -1069,6 +1378,17 @@ time.sleep(60)
                     "query-status" => {
                         serde_json::json!({ "running": status == "running", "status": status })
                     }
+                    "query-version" => serde_json::json!({
+                        "qemu": { "major": 8, "minor": 2, "micro": 2 }, "package": ""
+                    }),
+                    "migrate_cancel" => {
+                        migration = "cancelled";
+                        serde_json::json!({})
+                    }
+                    "query-migrate" if migration == "failed" => serde_json::json!({
+                        "status": "failed", "error-desc": "Connection refused"
+                    }),
+                    "query-migrate" => serde_json::json!({ "status": migration }),
                     // 디스크 두 개를 가진 VM의 블록 노드
                     "query-named-block-nodes" => serde_json::json!([
                         { "node-name": "disk1" },
@@ -1202,6 +1522,237 @@ time.sleep(60)
 
         hv.start(&vm, None).await.unwrap();
         assert!(!fake.commands.lock().unwrap().contains(&"cont".to_string()));
+    }
+
+    fn target() -> MigrateTarget {
+        MigrateTarget {
+            host: "10.0.0.2".into(),
+            port: 60005,
+            tls_hostname: "node-b".into(),
+        }
+    }
+
+    /// 보내는 쪽: TLS 자격 증명(client)을 다시 만들고, 능력·매개변수를 정한 뒤 보내고 끝을 기다린다.
+    #[tokio::test]
+    async fn migrate_sets_up_tls_and_waits_for_completion() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let state_dir = cfg.state_dir.clone();
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "running").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+
+        assert_eq!(hv.running_qemu_version(vm.id).await.unwrap(), "8.2.2");
+        let opts = MigrateOptions {
+            bandwidth: Some(64 << 20),
+            timeout: Duration::from_secs(10),
+        };
+        hv.migrate(vm.id, &target(), &opts).await.unwrap();
+
+        let commands = fake.commands.lock().unwrap().clone();
+        let arguments = fake.arguments.lock().unwrap().clone();
+        let at = |name: &str| commands.iter().position(|c| c == name).unwrap();
+        assert!(at("object-del") < at("object-add"));
+        assert_eq!(
+            arguments[at("object-del")],
+            serde_json::json!({ "id": "opl-mig-tls" })
+        );
+        let add = &arguments[at("object-add")];
+        assert_eq!(add["qom-type"], "tls-creds-x509");
+        assert_eq!(add["endpoint"], "client");
+        assert_eq!(
+            add["dir"],
+            state_dir.join("migration-tls").display().to_string()
+        );
+        assert_eq!(
+            arguments[at("migrate-set-capabilities")]["capabilities"],
+            serde_json::json!([
+                { "capability": "events", "state": true },
+                { "capability": "auto-converge", "state": true }
+            ])
+        );
+        assert_eq!(
+            arguments[at("migrate-set-parameters")],
+            serde_json::json!({
+                "tls-creds": "opl-mig-tls", "tls-hostname": "node-b", "max-bandwidth": 64u64 << 20
+            })
+        );
+        assert!(at("migrate-set-parameters") < at("migrate"));
+        assert_eq!(
+            arguments[at("migrate")],
+            serde_json::json!({ "uri": "tcp:10.0.0.2:60005" })
+        );
+        assert!(at("migrate") < at("query-migrate"));
+    }
+
+    #[tokio::test]
+    async fn failed_migration_reports_qemu_error() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let _fake = fake_qmp_with(&dir, "running", "failed").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let opts = MigrateOptions {
+            bandwidth: None,
+            timeout: Duration::from_secs(10),
+        };
+        match hv.migrate(vm.id, &target(), &opts).await.unwrap_err() {
+            DriverError::Migration(msg) => assert_eq!(msg, "Connection refused"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// 시간 제한이 지나면 취소하고 실패로 끝낸다.
+    #[tokio::test]
+    async fn migration_is_cancelled_after_timeout() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp_with(&dir, "running", "active").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let opts = MigrateOptions {
+            bandwidth: None,
+            timeout: Duration::from_millis(200),
+        };
+        let err = hv.migrate(vm.id, &target(), &opts).await.unwrap_err();
+        assert!(
+            matches!(&err, DriverError::Migration(m) if m.contains("cancelled")),
+            "{err:?}"
+        );
+        assert!(!err.is_transient());
+        let commands = fake.commands.lock().unwrap().clone();
+        assert!(commands.contains(&"migrate_cancel".to_string()));
+        // 보내지 않은 매개변수는 빠진다.
+        let arguments = fake.arguments.lock().unwrap().clone();
+        let at = commands
+            .iter()
+            .position(|c| c == "migrate-set-parameters")
+            .unwrap();
+        assert!(arguments[at].get("max-bandwidth").is_none());
+    }
+
+    /// 받은 VM은 멈춰 있으면 이어서 실행하고 표시를 지운다. 아직 받는 중이면 건드리지 않는다.
+    #[tokio::test]
+    async fn finish_incoming_continues_only_received_vms() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let (received, receiving) = (spec(), spec());
+        let dir_a = cfg.run_dir.join("vm").join(received.id.to_string());
+        let dir_b = cfg.run_dir.join("vm").join(receiving.id.to_string());
+        let _qa = hold_pidfile(&dir_a).await;
+        let _qb = hold_pidfile(&dir_b).await;
+        std::fs::write(dir_a.join(INCOMING_MARK), b"").unwrap();
+        std::fs::write(dir_b.join(INCOMING_MARK), b"").unwrap();
+        let fake_a = fake_qmp(&dir_a, "paused").await;
+        let fake_b = fake_qmp_with(&dir_b, "inmigrate", "active").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+
+        let mut incoming = hv.list_incoming().await.unwrap();
+        incoming.sort();
+        let mut expected = vec![received.id, receiving.id];
+        expected.sort();
+        assert_eq!(incoming, expected);
+        // 받는 중인 VM은 reconciler의 이어 가기에도 이어서 실행되지 않는다.
+        assert_eq!(
+            hv.inspect(receiving.id).await.unwrap().unwrap().status,
+            RuntimeStatus::Other("inmigrate".into())
+        );
+        hv.resume_left_stopped(receiving.id).await.unwrap();
+        hv.resume_left_stopped(received.id).await.unwrap();
+        assert!(
+            !fake_a
+                .commands
+                .lock()
+                .unwrap()
+                .contains(&"cont".to_string())
+        );
+
+        hv.incoming_wait(received.id).await.unwrap();
+        hv.finish_incoming(received.id).await.unwrap();
+        assert!(
+            fake_a
+                .commands
+                .lock()
+                .unwrap()
+                .contains(&"cont".to_string())
+        );
+        assert!(!dir_a.join(INCOMING_MARK).exists());
+        assert_eq!(hv.list_incoming().await.unwrap(), vec![receiving.id]);
+        // 표시가 없으면 아무것도 하지 않고, 기다릴 것도 없다.
+        hv.finish_incoming(received.id).await.unwrap();
+        assert!(matches!(
+            hv.incoming_wait(received.id).await,
+            Err(DriverError::Migration(_))
+        ));
+
+        let err = hv.finish_incoming(receiving.id).await.unwrap_err();
+        assert!(matches!(err, DriverError::Migration(_)), "{err:?}");
+        assert!(dir_b.join(INCOMING_MARK).exists());
+        assert!(
+            !fake_b
+                .commands
+                .lock()
+                .unwrap()
+                .contains(&"cont".to_string())
+        );
+    }
+
+    /// 보낸 원본(`postmigrate`)이 아니면 끄지 않는다.
+    #[tokio::test]
+    async fn stop_migrated_leaves_running_vm_alone() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "running").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        assert!(!hv.stop_migrated(vm.id).await.unwrap());
+        assert!(!hv.stop_migrated(Uuid::now_v7()).await.unwrap());
+        assert!(!fake.commands.lock().unwrap().contains(&"quit".to_string()));
+    }
+
+    /// 이미 이 노드에서 도는 VM은 받지 않는다(그 QEMU를 건드리지 않는다).
+    #[tokio::test]
+    async fn start_incoming_refuses_a_running_vm() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "running").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let err = hv
+            .start_incoming(&vm, "127.0.0.1", 60000..=60099)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::Migration(_)), "{err:?}");
+        assert!(dir.join("qemu.pid").exists());
+        assert!(!dir.join(INCOMING_MARK).exists());
+        assert!(!fake.commands.lock().unwrap().contains(&"quit".to_string()));
+    }
+
+    #[tokio::test]
+    async fn start_incoming_failure_cleans_run_dir() {
+        let tmp = short_tempdir();
+        // 곧바로 실패로 끝나는 QEMU
+        let hv = QemuHypervisor::new(config(tmp.path(), PathBuf::from("false")))
+            .await
+            .unwrap();
+        let vm = spec();
+        let err = hv
+            .start_incoming(&vm, "127.0.0.1", 60000..=60099)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::StartFailed(_)), "{err:?}");
+        assert!(!tmp.path().join("run/vm").join(vm.id.to_string()).exists());
+        assert!(hv.list_incoming().await.unwrap().is_empty());
     }
 
     #[test]

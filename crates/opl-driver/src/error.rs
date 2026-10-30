@@ -41,6 +41,9 @@ pub enum DriverError {
     /// 하이퍼바이저 안에서 돌고 있는 작업은 없다.
     #[error("VM {0} is running but not attached yet")]
     NotAttached(Uuid),
+    /// 라이브 마이그레이션이 실패했거나 취소됐다. 내용은 QEMU의 `error-desc` 등이다.
+    #[error("migration failed: {0}")]
+    Migration(String),
     #[error(transparent)]
     Qmp(#[from] QmpError),
     #[error("i/o error: {0}")]
@@ -78,7 +81,8 @@ impl DriverError {
             | DriverError::ToolFailed { .. }
             | DriverError::Lvm(_)
             | DriverError::Zfs(_)
-            | DriverError::Rbd(_) => false,
+            | DriverError::Rbd(_)
+            | DriverError::Migration(_) => false,
         }
     }
 
@@ -142,6 +146,8 @@ mod tests {
         assert!(!DriverError::Lvm("Volume group \"vg0\" not found".into()).is_transient());
         assert!(!DriverError::Zfs("dataset does not exist".into()).is_transient());
         assert!(!DriverError::Rbd("rbd: error opening pool 'x'".into()).is_transient());
+        // 마이그레이션 실패는 Task가 되돌린다. 같은 QEMU로 다시 받을 수 없다.
+        assert!(!DriverError::Migration("TLS handshake failed".into()).is_transient());
     }
 
     #[test]

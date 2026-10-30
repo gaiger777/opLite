@@ -1493,6 +1493,7 @@ dependencies = [
  "fs4",
  "opl-qemu",
  "opl-types",
+ "rcgen",
  "rustix",
  "serde",
  "serde_json",

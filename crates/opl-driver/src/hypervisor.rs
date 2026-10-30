@@ -1,3 +1,4 @@
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -6,6 +7,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::error::DriverError;
+use crate::migration::{MigrateOptions, MigrateTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopMode {
@@ -98,6 +100,51 @@ pub trait Hypervisor: Send + Sync {
     /// 붙어 있지 않으면 아무것도 하지 않고 false(다시 붙는 것은 `start`가 한다). 디스크를 다시
     /// 해석하지 않으므로 저장소가 응답하지 않아도 된다.
     async fn resume_left_stopped(&self, id: Uuid) -> Result<bool, DriverError>;
+
+    /// 이 노드가 새로 띄울 QEMU의 버전(`major.minor.micro`). 받는 쪽이 원본과 같은지 본다.
+    async fn qemu_version(&self) -> Result<String, DriverError>;
+
+    /// 실행 중인 VM의 QEMU 버전(`major.minor.micro`, QMP `query-version`). 바이너리를 바꾼 뒤에도
+    /// 이미 떠 있는 QEMU의 버전이다.
+    async fn running_qemu_version(&self, id: Uuid) -> Result<String, DriverError>;
+
+    /// 라이브 마이그레이션을 받을 QEMU를 `-incoming defer`로 띄우고, 받는 중 표시를 남기고, TLS
+    /// 자격 증명(받는 쪽, 상대 인증서 확인)과 능력을 정한 뒤 `ports`에서 빈 포트로 `listen_host`에서
+    /// 받기 시작한다. 연 포트를 돌려준다. 실패하면 띄운 QEMU를 끈다. 이미 이 노드에서 돌고 있는
+    /// VM이면 실패한다. 받은 뒤에도 멈춰 있다([`finish_incoming`](Self::finish_incoming)이 이어서 실행).
+    async fn start_incoming(
+        &self,
+        vm: &VmRuntimeSpec,
+        listen_host: &str,
+        ports: RangeInclusive<u16>,
+    ) -> Result<u16, DriverError>;
+
+    /// 받는 중인 VM의 마이그레이션이 끝나기를 기다린다. 완료면 성공, 실패했거나 받는 QEMU가
+    /// 사라졌으면 `Migration` 오류다. 받는 중 표시가 없는 VM이면 실패한다.
+    async fn incoming_wait(&self, id: Uuid) -> Result<(), DriverError>;
+
+    /// 받기를 마친 VM을 넘겨받는다: 멈춰 있으면 이어서 실행하고 받는 중 표시를 지운다. 표시가
+    /// 없으면(이미 넘겨받음) 아무것도 하지 않는다. 아직 받는 중이면 `Migration` 오류다. 마이그레이션이
+    /// 확정된 뒤(VM이 이 노드로 옮겨진 뒤)에만 부른다.
+    async fn finish_incoming(&self, id: Uuid) -> Result<(), DriverError>;
+
+    /// 받는 중 표시가 있는 살아 있는 VM. 확정되지 않은 채 남은 받는 QEMU를 찾아 끄는 데 쓴다.
+    async fn list_incoming(&self) -> Result<Vec<Uuid>, DriverError>;
+
+    /// 실행 중인 VM을 `target`으로 보낸다(TLS, 능력 `events`·`auto-converge`). 끝날 때까지 기다린다.
+    /// 성공하면 원본은 `postmigrate`로 멈춰 있다([`stop_migrated`](Self::stop_migrated)로 끈다).
+    /// 실패하거나 `opts.timeout`이 지나 취소하면 `Migration` 오류이고 원본은 대개 계속 돈다
+    /// (멈췄으면 [`resume`](Self::resume)으로 이어서 실행한다).
+    async fn migrate(
+        &self,
+        id: Uuid,
+        target: &MigrateTarget,
+        opts: &MigrateOptions,
+    ) -> Result<(), DriverError>;
+
+    /// 마이그레이션을 보내고 `postmigrate`로 멈춘 원본 QEMU를 끄고 true. 다른 상태이거나 실행 중이
+    /// 아니면 아무것도 하지 않고 false.
+    async fn stop_migrated(&self, id: Uuid) -> Result<bool, DriverError>;
 
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;

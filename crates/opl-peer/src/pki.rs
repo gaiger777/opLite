@@ -87,7 +87,11 @@ impl ClusterCa {
         params
             .distinguished_name
             .push(DnType::CommonName, node.to_string());
-        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        // QEMU 8.2(GnuTLS)는 키 용도가 critical이면 마이그레이션 TLS에 keyEncipherment도 요구한다.
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
         params.extended_key_usages = vec![
             ExtendedKeyUsagePurpose::ServerAuth,
             ExtendedKeyUsagePurpose::ClientAuth,
@@ -247,6 +251,11 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("evil"), "{shown}");
+        let usage = cert.key_usage().unwrap().unwrap().value;
+        assert!(
+            usage.digital_signature() && usage.key_encipherment(),
+            "{usage:?}"
+        );
     }
 
     #[test]

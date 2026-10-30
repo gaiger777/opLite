@@ -50,6 +50,10 @@ pub enum RunState {
     Running,
     Paused,
     Shutdown,
+    /// `-incoming`로 떠서 마이그레이션을 받기 전이거나 받는 중
+    InMigrate,
+    /// 마이그레이션을 보내 끝낸 원본. `cont`하면 다시 돈다.
+    PostMigrate,
     Other(String),
 }
 
@@ -60,9 +64,88 @@ impl RunState {
             "running" => RunState::Running,
             "paused" => RunState::Paused,
             "shutdown" => RunState::Shutdown,
+            "inmigrate" => RunState::InMigrate,
+            "postmigrate" => RunState::PostMigrate,
             other => RunState::Other(other.to_string()),
         }
     }
+}
+
+/// `query-migrate`의 `status` 값
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationState {
+    /// 마이그레이션을 한 적이 없다(`status`가 없다).
+    None,
+    Setup,
+    Active,
+    Completed,
+    Failed,
+    Cancelling,
+    Cancelled,
+    Other(String),
+}
+
+impl MigrationState {
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            None | Some("none") => MigrationState::None,
+            Some("setup") => MigrationState::Setup,
+            Some("active") => MigrationState::Active,
+            Some("completed") => MigrationState::Completed,
+            Some("failed") => MigrationState::Failed,
+            Some("cancelling") => MigrationState::Cancelling,
+            Some("cancelled") => MigrationState::Cancelled,
+            Some(other) => MigrationState::Other(other.to_string()),
+        }
+    }
+
+    /// 끝난 상태(완료·실패·취소)인지
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self,
+            MigrationState::Completed | MigrationState::Failed | MigrationState::Cancelled
+        )
+    }
+}
+
+/// `query-migrate`의 결과 중 opl이 보는 것
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationInfo {
+    pub state: MigrationState,
+    /// 실패했을 때 QEMU가 남긴 까닭(`error-desc`)
+    pub error: Option<String>,
+}
+
+impl MigrationInfo {
+    fn parse(v: &Value) -> Self {
+        Self {
+            state: MigrationState::parse(v.get("status").and_then(Value::as_str)),
+            error: v
+                .get("error-desc")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    }
+}
+
+/// TLS 자격 증명 객체(`tls-creds-x509`)를 쓰는 쪽
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsEndpoint {
+    /// 받는 쪽. 상대(보내는 쪽)의 인증서도 확인한다(`verify-peer`).
+    Server,
+    /// 보내는 쪽
+    Client,
+}
+
+/// `migrate-set-parameters`로 바꿀 값. `None`인 것은 보내지 않는다(QEMU의 지금 값 그대로).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MigrationParameters {
+    /// TLS 자격 증명 객체 id
+    pub tls_creds: Option<String>,
+    /// 보내는 쪽이 받는 쪽 인증서에서 확인할 이름(IP SAN이나 DNS SAN)
+    pub tls_hostname: Option<String>,
+    /// 바이트/초
+    pub max_bandwidth: Option<u64>,
 }
 
 /// 작업이 제한 시간을 넘겼을 때 상태를 묻는 `query-jobs`를 기다리는 시간
@@ -266,6 +349,135 @@ impl QmpClient {
     pub async fn block_resize(&self, node: &str, size: u64) -> Result<(), QmpError> {
         let args = json!({ "node-name": node, "size": size });
         self.execute("block_resize", Some(args)).await.map(drop)
+    }
+
+    /// QEMU 버전 `major.minor.micro`
+    pub async fn query_version(&self) -> Result<String, QmpError> {
+        let ret = self.execute("query-version", None).await?;
+        let q = &ret["qemu"];
+        match (
+            q["major"].as_u64(),
+            q["minor"].as_u64(),
+            q["micro"].as_u64(),
+        ) {
+            (Some(major), Some(minor), Some(micro)) => Ok(format!("{major}.{minor}.{micro}")),
+            _ => Err(QmpError::Protocol(format!(
+                "query-version without version: {ret}"
+            ))),
+        }
+    }
+
+    /// TLS 자격 증명 객체 `id`를 만든다. `dir`에 `ca-cert.pem`과 받는 쪽은 `server-cert.pem`·
+    /// `server-key.pem`, 보내는 쪽은 `client-cert.pem`·`client-key.pem`이 있어야 한다(만들 때 읽는다).
+    /// 늘 상대의 인증서를 확인한다(`verify-peer`).
+    pub async fn add_tls_creds(
+        &self,
+        id: &str,
+        dir: &Path,
+        endpoint: TlsEndpoint,
+    ) -> Result<(), QmpError> {
+        let endpoint = match endpoint {
+            TlsEndpoint::Server => "server",
+            TlsEndpoint::Client => "client",
+        };
+        let args = json!({
+            "qom-type": "tls-creds-x509",
+            "id": id,
+            "dir": dir.display().to_string(),
+            "endpoint": endpoint,
+            "verify-peer": true,
+        });
+        self.execute("object-add", Some(args)).await.map(drop)
+    }
+
+    /// `object-add`로 만든 객체 `id`를 지운다.
+    pub async fn object_del(&self, id: &str) -> Result<(), QmpError> {
+        self.execute("object-del", Some(json!({ "id": id })))
+            .await
+            .map(drop)
+    }
+
+    /// 마이그레이션 능력을 켜거나 끈다. 예: `("events", true)`
+    pub async fn migrate_set_capabilities(
+        &self,
+        capabilities: &[(&str, bool)],
+    ) -> Result<(), QmpError> {
+        let caps: Vec<Value> = capabilities
+            .iter()
+            .map(|(name, state)| json!({ "capability": name, "state": state }))
+            .collect();
+        self.execute(
+            "migrate-set-capabilities",
+            Some(json!({ "capabilities": caps })),
+        )
+        .await
+        .map(drop)
+    }
+
+    pub async fn migrate_set_parameters(
+        &self,
+        params: &MigrationParameters,
+    ) -> Result<(), QmpError> {
+        let mut args = serde_json::Map::new();
+        if let Some(creds) = &params.tls_creds {
+            args.insert("tls-creds".into(), json!(creds));
+        }
+        if let Some(host) = &params.tls_hostname {
+            args.insert("tls-hostname".into(), json!(host));
+        }
+        if let Some(bw) = params.max_bandwidth {
+            args.insert("max-bandwidth".into(), json!(bw));
+        }
+        self.execute("migrate-set-parameters", Some(Value::Object(args)))
+            .await
+            .map(drop)
+    }
+
+    /// 마이그레이션을 `uri`(`tcp:host:port`)로 보내기 시작한다. 곧바로 돌아오므로 끝은
+    /// [`wait_migration`](Self::wait_migration)으로 기다린다.
+    pub async fn migrate(&self, uri: &str) -> Result<(), QmpError> {
+        self.execute("migrate", Some(json!({ "uri": uri })))
+            .await
+            .map(drop)
+    }
+
+    /// `-incoming defer`로 띄운 QEMU가 `uri`에서 마이그레이션을 받기 시작한다. 돌아올 때는 이미
+    /// 포트를 열었다. QEMU 하나에 한 번만 부를 수 있다(실패해도 다시 부를 수 없다).
+    pub async fn migrate_incoming(&self, uri: &str) -> Result<(), QmpError> {
+        self.execute("migrate-incoming", Some(json!({ "uri": uri })))
+            .await
+            .map(drop)
+    }
+
+    /// 진행 중인 마이그레이션을 취소한다. 원본은 계속 돈다.
+    pub async fn migrate_cancel(&self) -> Result<(), QmpError> {
+        self.execute("migrate_cancel", None).await.map(drop)
+    }
+
+    pub async fn query_migrate(&self) -> Result<MigrationInfo, QmpError> {
+        let ret = self.execute("query-migrate", None).await?;
+        Ok(MigrationInfo::parse(&ret))
+    }
+
+    /// 마이그레이션이 끝난 상태(완료·실패·취소)가 될 때까지 기다린다. `MIGRATION` 이벤트(능력
+    /// `events`)를 받거나 `poll`마다 `query-migrate`로 확인한다. 제한 시간은 호출자가 건다.
+    pub async fn wait_migration(&self, poll: Duration) -> Result<MigrationInfo, QmpError> {
+        // 처음 조회와 이벤트 사이에 끝나도 놓치지 않게 먼저 구독한다.
+        let mut events = self.subscribe();
+        loop {
+            let info = self.query_migrate().await?;
+            if info.state.is_finished() {
+                return Ok(info);
+            }
+            tokio::select! {
+                ev = events.recv() => match ev {
+                    Err(RecvError::Closed) => return Err(QmpError::Disconnected),
+                    // 이벤트 내용과 상관없이 다시 조회한다(놓쳤으면 Lagged).
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                },
+                _ = tokio::time::sleep(poll) => {}
+            }
+        }
     }
 
     /// 작업(job) 명령을 새 `job-id`로 시작하고 `concluded`까지 기다린 뒤, 오류를 읽고 `job-dismiss`한다.
@@ -872,6 +1084,250 @@ mod tests {
             fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
         });
         res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_states_are_parsed() {
+        let (client, mut fake, _dir) = setup().await;
+        let (status, ()) = tokio::join!(client.query_status(), async {
+            fake.answer(
+                "query-status",
+                json!({ "return": { "running": false, "status": "postmigrate" } }),
+            )
+            .await;
+        });
+        assert_eq!(status.unwrap(), RunState::PostMigrate);
+        let (status, ()) = tokio::join!(client.query_status(), async {
+            fake.answer(
+                "query-status",
+                json!({ "return": { "running": false, "status": "inmigrate" } }),
+            )
+            .await;
+        });
+        assert_eq!(status.unwrap(), RunState::InMigrate);
+
+        // 마이그레이션을 한 적이 없으면 status가 없다.
+        for (ret, state, error) in [
+            (json!({}), MigrationState::None, None),
+            (
+                json!({ "status": "setup", "socket-address": [{ "port": "60000" }] }),
+                MigrationState::Setup,
+                None,
+            ),
+            (json!({ "status": "active" }), MigrationState::Active, None),
+            (
+                json!({ "status": "completed" }),
+                MigrationState::Completed,
+                None,
+            ),
+            (
+                json!({
+                    "status": "failed",
+                    "error-desc": "Failed to connect to '127.0.0.1:60099': Connection refused"
+                }),
+                MigrationState::Failed,
+                Some("Failed to connect to '127.0.0.1:60099': Connection refused"),
+            ),
+            (
+                json!({ "status": "cancelled" }),
+                MigrationState::Cancelled,
+                None,
+            ),
+            (
+                json!({ "status": "device" }),
+                MigrationState::Other("device".into()),
+                None,
+            ),
+        ] {
+            let (info, ()) = tokio::join!(client.query_migrate(), async {
+                fake.answer("query-migrate", json!({ "return": ret })).await;
+            });
+            let info = info.unwrap();
+            assert_eq!(info.state, state);
+            assert_eq!(info.error.as_deref(), error);
+        }
+        assert!(MigrationState::Completed.is_finished());
+        assert!(MigrationState::Failed.is_finished());
+        assert!(MigrationState::Cancelled.is_finished());
+        assert!(!MigrationState::Cancelling.is_finished());
+        assert!(!MigrationState::None.is_finished());
+    }
+
+    #[tokio::test]
+    async fn query_version_formats_major_minor_micro() {
+        let (client, mut fake, _dir) = setup().await;
+        let (v, ()) = tokio::join!(client.query_version(), async {
+            fake.answer(
+                "query-version",
+                json!({ "return": { "qemu": { "micro": 2, "minor": 2, "major": 8 }, "package": "Debian 1:8.2.2" } }),
+            )
+            .await;
+        });
+        assert_eq!(v.unwrap(), "8.2.2");
+        let (v, ()) = tokio::join!(client.query_version(), async {
+            fake.answer("query-version", json!({ "return": {} })).await;
+        });
+        assert!(matches!(v, Err(QmpError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn migration_setup_commands_send_their_arguments() {
+        let (client, mut fake, _dir) = setup().await;
+        let dir = Path::new("/var/lib/opl/migration-tls");
+        let (r, cmd) = tokio::join!(
+            client.add_tls_creds("opl-mig-tls", dir, TlsEndpoint::Server),
+            async {
+                let cmd = fake.recv().await;
+                fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+                cmd
+            }
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "object-add");
+        assert_eq!(
+            cmd["arguments"],
+            json!({
+                "qom-type": "tls-creds-x509", "id": "opl-mig-tls",
+                "dir": "/var/lib/opl/migration-tls", "endpoint": "server", "verify-peer": true
+            })
+        );
+        let (r, cmd) = tokio::join!(client.add_tls_creds("c", dir, TlsEndpoint::Client), async {
+            let cmd = fake.recv().await;
+            fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+            cmd
+        });
+        r.unwrap();
+        assert_eq!(cmd["arguments"]["endpoint"], "client");
+
+        let (r, cmd) = tokio::join!(client.object_del("opl-mig-tls"), async {
+            let cmd = fake.recv().await;
+            fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+            cmd
+        });
+        r.unwrap();
+        assert_eq!(cmd["execute"], "object-del");
+        assert_eq!(cmd["arguments"], json!({ "id": "opl-mig-tls" }));
+
+        let (r, cmd) = tokio::join!(
+            client.migrate_set_capabilities(&[("events", true), ("auto-converge", true)]),
+            async {
+                let cmd = fake.recv().await;
+                fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+                cmd
+            }
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "migrate-set-capabilities");
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "capabilities": [
+                { "capability": "events", "state": true },
+                { "capability": "auto-converge", "state": true }
+            ] })
+        );
+
+        // 정한 값만 보낸다.
+        let params = MigrationParameters {
+            tls_creds: Some("opl-mig-tls".into()),
+            tls_hostname: Some("10.0.0.2".into()),
+            max_bandwidth: Some(100 << 20),
+        };
+        let (r, cmd) = tokio::join!(client.migrate_set_parameters(&params), async {
+            let cmd = fake.recv().await;
+            fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+            cmd
+        });
+        r.unwrap();
+        assert_eq!(cmd["execute"], "migrate-set-parameters");
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "tls-creds": "opl-mig-tls", "tls-hostname": "10.0.0.2", "max-bandwidth": 100u64 << 20 })
+        );
+        let params = MigrationParameters {
+            tls_creds: Some("opl-mig-tls".into()),
+            ..Default::default()
+        };
+        let (r, cmd) = tokio::join!(client.migrate_set_parameters(&params), async {
+            let cmd = fake.recv().await;
+            fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+            cmd
+        });
+        r.unwrap();
+        assert_eq!(cmd["arguments"], json!({ "tls-creds": "opl-mig-tls" }));
+
+        for (name, expect) in [("migrate", "migrate"), ("incoming", "migrate-incoming")] {
+            let uri = "tcp:10.0.0.2:60000";
+            let fut = async {
+                match name {
+                    "migrate" => client.migrate(uri).await,
+                    _ => client.migrate_incoming(uri).await,
+                }
+            };
+            let (r, cmd) = tokio::join!(fut, async {
+                let cmd = fake.recv().await;
+                fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+                cmd
+            });
+            r.unwrap();
+            assert_eq!(cmd["execute"], expect);
+            assert_eq!(cmd["arguments"], json!({ "uri": uri }));
+        }
+        let (r, ()) = tokio::join!(client.migrate_cancel(), async {
+            fake.answer("migrate_cancel", json!({ "return": {} })).await;
+        });
+        r.unwrap();
+    }
+
+    /// 이벤트를 받으면 다시 조회하고, 끝난 상태에서 돌아온다.
+    #[tokio::test]
+    async fn wait_migration_requeries_on_events_until_finished() {
+        let (client, mut fake, _dir) = setup().await;
+        // 긴 poll: 이벤트로만 깨어나야 시간 안에 끝난다.
+        let (info, ()) = tokio::join!(client.wait_migration(Duration::from_secs(3600)), async {
+            fake.answer("query-migrate", json!({ "return": { "status": "active" } }))
+                .await;
+            fake.send(
+                json!({ "event": "MIGRATION", "data": { "status": "failed" }, "timestamp": {} }),
+            )
+            .await;
+            fake.answer(
+                "query-migrate",
+                json!({ "return": { "status": "failed", "error-desc": "TLS handshake failed" } }),
+            )
+            .await;
+        });
+        let info = info.unwrap();
+        assert_eq!(info.state, MigrationState::Failed);
+        assert_eq!(info.error.as_deref(), Some("TLS handshake failed"));
+    }
+
+    /// 이벤트가 없어도 poll마다 조회한다(능력 `events`가 꺼진 QEMU, 놓친 이벤트).
+    #[tokio::test]
+    async fn wait_migration_polls_without_events() {
+        let (client, mut fake, _dir) = setup().await;
+        let (info, ()) = tokio::join!(client.wait_migration(Duration::from_millis(20)), async {
+            fake.answer("query-migrate", json!({ "return": { "status": "setup" } }))
+                .await;
+            fake.answer("query-migrate", json!({ "return": { "status": "active" } }))
+                .await;
+            fake.answer(
+                "query-migrate",
+                json!({ "return": { "status": "completed" } }),
+            )
+            .await;
+        });
+        assert_eq!(info.unwrap().state, MigrationState::Completed);
+    }
+
+    #[tokio::test]
+    async fn wait_migration_fails_when_qemu_goes_away() {
+        let (client, mut fake, _dir) = setup().await;
+        let (info, ()) = tokio::join!(client.wait_migration(Duration::from_secs(3600)), async {
+            fake.answer("query-migrate", json!({ "return": { "status": "active" } }))
+                .await;
+            drop(fake);
+        });
+        assert!(matches!(info, Err(QmpError::Disconnected)), "{info:?}");
     }
 
     #[tokio::test]
