@@ -166,12 +166,13 @@ fn check_no_task(
     Ok(())
 }
 
-/// 디스크 스냅샷을 블록 장치의 스냅샷으로 두는 풀의 종류(`lvm-thin`, `zfs`). 파일 풀(qcow2 내부
-/// 스냅샷)이면 `None`.
+/// 디스크 스냅샷을 블록 장치의 스냅샷으로 두는 풀의 종류(`lvm-thin`, `zfs`, `rbd`). 파일 풀(qcow2
+/// 내부 스냅샷)이면 `None`.
 pub(crate) fn block_snapshot_kind(pool: &StoragePool) -> Option<&'static str> {
     match pool.spec.backend {
         PoolBackend::LvmThin { .. } => Some("lvm-thin"),
         PoolBackend::Zfs { .. } => Some("zfs"),
+        PoolBackend::Rbd { .. } => Some("rbd"),
         PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => None,
     }
 }
@@ -659,6 +660,13 @@ mod tests {
         assert_eq!(block_snapshot_kind(&dir), None);
         assert_eq!(block_snapshot_kind(&lvm), Some("lvm-thin"));
         assert_eq!(block_snapshot_kind(&zfs), Some("zfs"));
+        let rbd = pool(PoolBackend::Rbd {
+            pool: "rbd".into(),
+            namespace: None,
+            user: None,
+            conf: None,
+        });
+        assert_eq!(block_snapshot_kind(&rbd), Some("rbd"));
         assert!(!uses_block_snapshots(&dir));
         assert!(uses_block_snapshots(&zfs));
     }

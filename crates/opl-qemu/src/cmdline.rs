@@ -20,6 +20,8 @@ pub enum CmdlineError {
     SataRequiresQ35,
     #[error("at most {Q35_SATA_PORTS} SATA disks are supported")]
     TooManySataDisks,
+    #[error("rbd disks are not supported yet")]
+    RbdDisksUnsupported,
 }
 
 /// QEMU 인자 목록(바이너리 제외)을 만든다. 부수 효과가 없는 순수 함수다.
@@ -98,6 +100,7 @@ pub fn build_cmdline(
         let proto = match disk.kind {
             DiskKind::File => "file",
             DiskKind::Block => "host_device",
+            DiskKind::Rbd => return Err(CmdlineError::RbdDisksUnsupported),
         };
         a.opt(
             "-blockdev",
@@ -237,6 +240,7 @@ mod tests {
                 RuntimeDisk {
                     path: "/var/lib/opl/pools/local/web-01-root.qcow2".into(),
                     kind: DiskKind::File,
+                    rbd: None,
                     format: ImageFormat::Qcow2,
                     bus: DiskBus::VirtioBlk,
                     boot_order: Some(1),
@@ -244,6 +248,7 @@ mod tests {
                 RuntimeDisk {
                     path: "/var/lib/opl/pools/local/web-01-data.raw".into(),
                     kind: DiskKind::File,
+                    rbd: None,
                     format: ImageFormat::Raw,
                     bus: DiskBus::Sata,
                     boot_order: None,
@@ -274,6 +279,7 @@ mod tests {
             disks: vec![RuntimeDisk {
                 path: "/tmp/opl/root.qcow2".into(),
                 kind: DiskKind::File,
+                rbd: None,
                 format: ImageFormat::Qcow2,
                 bus: DiskBus::VirtioBlk,
                 boot_order: Some(1),
@@ -352,6 +358,17 @@ mod tests {
         ));
     }
 
+    /// RBD 디스크는 아직 열지 않는다.
+    #[test]
+    fn rbd_disks_are_unsupported_for_now() {
+        let mut spec = x86_spec();
+        spec.disks[1].kind = DiskKind::Rbd;
+        assert_eq!(
+            build_cmdline(&spec, &x86_host(), &paths()).unwrap_err(),
+            CmdlineError::RbdDisksUnsupported
+        );
+    }
+
     #[test]
     fn rejects_incompatible_combinations() {
         let err = |spec: &VmRuntimeSpec, host: &HostProfile| {
@@ -385,6 +402,7 @@ mod tests {
             .map(|i| RuntimeDisk {
                 path: format!("/d{i}.raw").into(),
                 kind: DiskKind::File,
+                rbd: None,
                 format: ImageFormat::Raw,
                 bus: DiskBus::Sata,
                 boot_order: None,

@@ -237,6 +237,7 @@ async fn resolves_volumes_to_pool_paths_and_user_network() {
         vec![RuntimeDisk {
             path: format!("/pools/local/{}.qcow2", root.id).into(),
             kind: DiskKind::File,
+            rbd: None,
             format: ImageFormat::Qcow2,
             bus: DiskBus::VirtioBlk,
             boot_order: Some(1),
@@ -430,6 +431,42 @@ async fn refuses_lvm_thin_volumes_on_macos() {
         .unwrap_err();
     assert!(
         matches!(&err, ResolveError::PoolUnsupported(n, why) if n == "vg" && why.contains("macOS")),
+        "{err:?}"
+    );
+    assert!(storage.calls.lock().unwrap().is_empty());
+}
+
+/// RBD 풀의 디스크는 아직 쓸 수 없다. 기다려도 풀리지 않으므로 참조 오류이고, 볼륨을 활성화하지 않는다.
+#[tokio::test]
+async fn refuses_rbd_volumes_for_now() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let r: StoragePool = Resource::new(
+        "r",
+        StoragePoolSpec {
+            backend: PoolBackend::Rbd {
+                pool: "rbd".into(),
+                namespace: None,
+                user: None,
+                conf: None,
+            },
+            nodes: vec![],
+            shared: true,
+        },
+    );
+    cluster.create(&r).await.unwrap();
+    let mut root = volume("root", "r");
+    root.spec.format = ImageFormat::Raw;
+    cluster.create(&root).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    let storage = Activations::default();
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::PoolUnsupported(n, why) if n == "r" && why == &"rbd pools are not supported yet"),
         "{err:?}"
     );
     assert!(storage.calls.lock().unwrap().is_empty());

@@ -689,7 +689,7 @@ export interface components {
                 backend: components["schemas"]["PoolBackend"];
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
-                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS 풀은 늘 공유다(`is_shared`). */
+                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`). */
                 shared?: boolean;
             };
         };
@@ -976,7 +976,7 @@ export interface components {
                     backend: components["schemas"]["PoolBackend"];
                     /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                     nodes?: string[];
-                    /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS 풀은 늘 공유다(`is_shared`). */
+                    /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`). */
                     shared?: boolean;
                 };
                 status: {
@@ -1275,6 +1275,17 @@ export interface components {
             dataset: string;
             /** @enum {string} */
             kind: "zfs";
+        } | {
+            /** @description ceph.conf 절대 경로. 없으면 Ceph 기본(`/etc/ceph/ceph.conf`). */
+            conf?: string | null;
+            /** @enum {string} */
+            kind: "rbd";
+            /** @description 풀 안의 RBD 네임스페이스. 없으면 기본 네임스페이스. */
+            namespace?: string | null;
+            /** @description Ceph 풀 이름 */
+            pool: string;
+            /** @description Ceph 클라이언트 id(`client.` 없이). 없으면 `admin`. */
+            user?: string | null;
         };
         /** @description 한 노드에서 본 스토리지 풀 상태 */
         PoolState: {
@@ -1468,7 +1479,7 @@ export interface components {
                 backend: components["schemas"]["PoolBackend"];
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
-                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS 풀은 늘 공유다(`is_shared`). */
+                /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`). */
                 shared?: boolean;
             };
             status: {
@@ -1689,7 +1700,7 @@ export interface components {
             backend: components["schemas"]["PoolBackend"];
             /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
             nodes?: string[];
-            /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS 풀은 늘 공유다(`is_shared`). */
+            /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`). */
             shared?: boolean;
         };
         StoragePoolStatus: {

@@ -306,6 +306,7 @@ fn with_qcow2_disk(mut vm: VmRuntimeSpec, path: &Path) -> VmRuntimeSpec {
     vm.disks.push(RuntimeDisk {
         path: path.to_path_buf(),
         kind: DiskKind::File,
+        rbd: None,
         format: ImageFormat::Qcow2,
         bus: DiskBus::VirtioBlk,
         boot_order: None,

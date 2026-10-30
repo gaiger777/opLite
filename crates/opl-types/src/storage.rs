@@ -18,7 +18,7 @@ pub struct StoragePoolSpec {
     /// 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드.
     #[serde(default)]
     pub nodes: Vec<Uuid>,
-    /// 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS 풀은 늘 공유다(`is_shared`).
+    /// 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD 풀은 늘 공유다(`is_shared`).
     #[serde(default)]
     pub shared: bool,
 }
@@ -63,6 +63,21 @@ pub enum PoolBackend {
         /// zvol을 둘 데이터셋 이름(예: `tank/opl`)
         dataset: String,
     },
+    /// Ceph RBD 풀에 볼륨마다 raw 이미지(`opl-{id}`)를 둔다. 모든 노드가 같은 이미지를 보는 공유
+    /// 풀이고, Ceph 클러스터와 노드의 ceph.conf·키링은 관리자가 준비해 둔다.
+    Rbd {
+        /// Ceph 풀 이름
+        pool: String,
+        /// 풀 안의 RBD 네임스페이스. 없으면 기본 네임스페이스.
+        #[serde(default)]
+        namespace: Option<String>,
+        /// Ceph 클라이언트 id(`client.` 없이). 없으면 `admin`.
+        #[serde(default)]
+        user: Option<String>,
+        /// ceph.conf 절대 경로. 없으면 Ceph 기본(`/etc/ceph/ceph.conf`).
+        #[serde(default)]
+        conf: Option<String>,
+    },
 }
 
 impl StoragePoolSpec {
@@ -103,6 +118,30 @@ impl StoragePoolSpec {
             PoolBackend::Zfs { dataset } => {
                 if !valid_zfs_dataset(dataset) {
                     return Err(PoolError::BadZfsDataset(dataset.clone()));
+                }
+            }
+            PoolBackend::Rbd {
+                pool,
+                namespace,
+                user,
+                conf,
+            } => {
+                for name in std::iter::once(pool).chain(namespace).chain(user) {
+                    if !valid_ceph_name(name) {
+                        return Err(PoolError::BadRbdName(name.clone()));
+                    }
+                }
+                // `rbd --id`와 QEMU `user`는 `client.` 없는 id를 받는다.
+                if let Some(user) = user
+                    && user.starts_with("client.")
+                {
+                    return Err(PoolError::RbdUserPrefix(user.clone()));
+                }
+                if let Some(conf) = conf
+                    && (!conf.starts_with('/')
+                        || conf.chars().any(|c| c.is_control() || ",:=".contains(c)))
+                {
+                    return Err(PoolError::BadRbdConf(conf.clone()));
                 }
             }
         }
@@ -156,6 +195,16 @@ fn valid_zfs_dataset(name: &str) -> bool {
         })
 }
 
+/// Ceph 이름(풀, 네임스페이스, 클라이언트 id): `A-Za-z0-9_.-`의 1–63자이고 `-`로 시작하지 않는다
+/// (명령 옵션으로 읽히지 않게). QEMU 옵션 문자열에도 그대로 들어간다.
+fn valid_ceph_name(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+}
+
 /// LVM이 내부 LV 이름에 쓰므로 LV 이름에 담을 수 없는 문자열
 const LVM_RESERVED: [&str; 12] = [
     "_cdata", "_cmeta", "_corig", "_mimage", "_mlog", "_pmspare", "_rimage", "_rmeta", "_tdata",
@@ -177,22 +226,25 @@ fn denied_option(option: &str) -> bool {
     ) || name.starts_with("x-")
 }
 
-/// 모든 노드가 같은 데이터를 보는 풀인지. NFS 풀은 `shared` 값과 상관없이 공유이고, LVM-thin·ZFS
+/// 모든 노드가 같은 데이터를 보는 풀인지. NFS·RBD 풀은 `shared` 값과 상관없이 공유이고, LVM-thin·ZFS
 /// 풀은 늘 노드 로컬이다.
 pub fn is_shared(pool: &StoragePool) -> bool {
     match pool.spec.backend {
         PoolBackend::Dir { .. } => pool.spec.shared,
-        PoolBackend::Nfs { .. } => true,
+        PoolBackend::Nfs { .. } | PoolBackend::Rbd { .. } => true,
         PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } => false,
     }
 }
 
 /// 이 백엔드의 `format` 볼륨이 스냅샷을 담을 수 있는지. 파일 풀(dir, nfs)은 qcow2 내부 스냅샷,
-/// LVM-thin 풀은 raw 볼륨의 thin 스냅샷, ZFS 풀은 raw zvol의 ZFS 스냅샷이다.
+/// LVM-thin 풀은 raw 볼륨의 thin 스냅샷, ZFS 풀은 raw zvol의 ZFS 스냅샷, RBD 풀은 raw 이미지의 RBD
+/// 스냅샷이다.
 pub fn pool_kind_supports_snapshots(backend: &PoolBackend, format: ImageFormat) -> bool {
     match backend {
         PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => format == ImageFormat::Qcow2,
-        PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } => format == ImageFormat::Raw,
+        PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } | PoolBackend::Rbd { .. } => {
+            format == ImageFormat::Raw
+        }
     }
 }
 
@@ -213,7 +265,7 @@ pub fn pool_state_on<'a>(pool: &StoragePool, node: &'a Node) -> Option<&'a PoolS
 /// 이 노드에서 풀을 쓸 수 있는지: 노드 목록이 허용하고, 노드가 알린 그 풀의 상태가 준비됨.
 /// 디렉터리 풀은 노드가 상태를 아직 알리지 않았어도(옛 노드, 첫 새로 고침 전) 쓸 수 있다고 보고
 /// 준비되지 않았다고 알렸을 때만 막는다. NFS 풀은 마운트됐다고, LVM-thin 풀은 thin pool이, ZFS 풀은
-/// 데이터셋이 있다고 알려야 한다.
+/// 데이터셋이 있다고, RBD 풀은 Ceph 풀에 닿는다고 알려야 한다.
 pub fn pool_usable_on(pool: &StoragePool, node: &Node) -> bool {
     pool_listed_on(pool, node.id)
         && match pool_state_on(pool, node) {
@@ -255,6 +307,17 @@ pub enum PoolError {
          and the first (the pool name) starting with a letter"
     )]
     BadZfsDataset(String),
+    #[error(
+        "invalid ceph name {0:?}: use 1-63 characters from A-Z, a-z, 0-9, '_', '.' and '-', \
+         not starting with '-'"
+    )]
+    BadRbdName(String),
+    #[error("invalid ceph user {0:?}: write the Ceph user without client.")]
+    RbdUserPrefix(String),
+    #[error(
+        "invalid ceph conf path {0:?}: use an absolute path without control characters, ',', ':' or '='"
+    )]
+    BadRbdConf(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -653,6 +716,7 @@ mod tests {
             (&nfs, true, false),
             (&lvm, false, true),
             (&zfs, false, true),
+            (&rbd("rbd").backend, false, true),
         ] {
             assert_eq!(
                 pool_kind_supports_snapshots(backend, ImageFormat::Qcow2),
@@ -760,6 +824,155 @@ mod tests {
             ..Default::default()
         };
         node.status.pools.insert("z".into(), state);
+        assert!(pool_usable_on(&pool, &node));
+    }
+
+    fn rbd(pool: &str) -> StoragePoolSpec {
+        StoragePoolSpec {
+            backend: PoolBackend::Rbd {
+                pool: pool.into(),
+                namespace: None,
+                user: None,
+                conf: None,
+            },
+            nodes: vec![],
+            shared: true,
+        }
+    }
+
+    /// `rbd` 풀의 `namespace`·`user`·`conf`의 값을 바꾼 spec
+    fn rbd_with(
+        namespace: Option<&str>,
+        user: Option<&str>,
+        conf: Option<&str>,
+    ) -> StoragePoolSpec {
+        StoragePoolSpec {
+            backend: PoolBackend::Rbd {
+                pool: "rbd".into(),
+                namespace: namespace.map(Into::into),
+                user: user.map(Into::into),
+                conf: conf.map(Into::into),
+            },
+            ..rbd("rbd")
+        }
+    }
+
+    #[test]
+    fn rbd_pool_round_trips_with_optional_fields() {
+        let spec: StoragePoolSpec = serde_json::from_value(serde_json::json!({
+            "backend": { "kind": "rbd", "pool": "rbd" }, "shared": true
+        }))
+        .unwrap();
+        assert_eq!(spec, rbd("rbd"));
+        let full = rbd_with(Some("opl"), Some("opl"), Some("/etc/ceph/opl.conf"));
+        let json = serde_json::to_value(&full).unwrap();
+        assert_eq!(
+            json["backend"],
+            serde_json::json!({
+                "kind": "rbd", "pool": "rbd", "namespace": "opl", "user": "opl",
+                "conf": "/etc/ceph/opl.conf"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<StoragePoolSpec>(json).unwrap(),
+            full
+        );
+        let typo = serde_json::from_value::<StoragePoolSpec>(serde_json::json!({
+            "backend": { "kind": "rbd", "pool": "rbd", "id": "admin" }
+        }));
+        assert!(typo.is_err());
+    }
+
+    #[test]
+    fn validates_rbd_names_and_conf() {
+        let long = "a".repeat(63);
+        for ok in ["rbd", "Opl_vm.1-a", "9", long.as_str()] {
+            assert_eq!(rbd(ok).validate(), Ok(()), "{ok}");
+            assert_eq!(
+                rbd_with(Some(ok), Some(ok), None).validate(),
+                Ok(()),
+                "{ok}"
+            );
+        }
+        let too_long = "a".repeat(64);
+        for bad in [
+            "",
+            // `-`로 시작하면 명령 옵션으로 읽힐 수 있다.
+            "-rbd",
+            "rbd/opl",
+            "rbd@s",
+            "a,b",
+            "a:b",
+            "a=b",
+            "my rbd",
+            "데이터",
+            too_long.as_str(),
+        ] {
+            let err = Err(PoolError::BadRbdName(bad.into()));
+            assert_eq!(rbd(bad).validate(), err, "pool {bad}");
+            assert_eq!(rbd_with(Some(bad), None, None).validate(), err, "ns {bad}");
+            assert_eq!(
+                rbd_with(None, Some(bad), None).validate(),
+                err,
+                "user {bad}"
+            );
+        }
+        // `rbd --id`와 QEMU `user`는 `client.` 없는 id를 받는다.
+        for user in ["client.admin", "client.opl"] {
+            let err = rbd_with(None, Some(user), None).validate().unwrap_err();
+            assert_eq!(err, PoolError::RbdUserPrefix(user.into()));
+            assert!(
+                err.to_string()
+                    .contains("write the Ceph user without client."),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            rbd_with(Some("client.a"), Some("clients"), None).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            rbd_with(None, None, Some("/etc/ceph/my ceph.conf")).validate(),
+            Ok(())
+        );
+        // conf는 QEMU 옵션 문자열(`conf=...`)과 `rbd:` 이미지 이름에 들어간다.
+        for bad in [
+            "",
+            "ceph.conf",
+            "/etc/ceph/a,b.conf",
+            "/etc/ceph/a:b.conf",
+            "/etc/ceph/a=b.conf",
+            "/etc/ceph/\nceph.conf",
+        ] {
+            assert_eq!(
+                rbd_with(None, None, Some(bad)).validate(),
+                Err(PoolError::BadRbdConf(bad.into())),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rbd_pools_are_always_shared() {
+        let mut pool = StoragePool::new("r", rbd("rbd"));
+        assert!(is_shared(&pool));
+        pool.spec.shared = false;
+        assert!(is_shared(&pool));
+        let mut node: Node = Resource::new(
+            "n1",
+            crate::node::NodeSpec {
+                address: "a".into(),
+                maintenance: false,
+            },
+        );
+        // 디렉터리 풀과 달리 준비됐다는 상태가 있어야 쓸 수 있다.
+        assert!(!pool_usable_on(&pool, &node));
+        let state = PoolState {
+            pool_id: pool.id,
+            ready: true,
+            ..Default::default()
+        };
+        node.status.pools.insert("r".into(), state);
         assert!(pool_usable_on(&pool, &node));
     }
 

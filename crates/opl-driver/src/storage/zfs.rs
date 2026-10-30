@@ -379,9 +379,10 @@ impl ZfsStorage {
         require_raw(format)?;
         match &pool.spec.backend {
             PoolBackend::Zfs { dataset } => Ok(dataset),
-            PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } | PoolBackend::LvmThin { .. } => {
-                Err(DriverError::InvalidSpec("not a zfs pool".into()))
-            }
+            PoolBackend::Dir { .. }
+            | PoolBackend::Nfs { .. }
+            | PoolBackend::LvmThin { .. }
+            | PoolBackend::Rbd { .. } => Err(DriverError::InvalidSpec("not a zfs pool".into())),
         }
     }
 

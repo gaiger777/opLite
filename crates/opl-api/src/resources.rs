@@ -199,10 +199,17 @@ pub async fn create_pool(
         .map_err(|e| ApiError::bad_request(format!("spec: {e}")))?;
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    // NFS 풀은 늘 공유다. `shared`가 없으면 true로 두고 false면 거절한다.
-    if matches!(spec.backend, PoolBackend::Nfs { .. }) {
+    // NFS·RBD 풀은 늘 공유다. `shared`가 없으면 true로 두고 false면 거절한다.
+    let always_shared = match spec.backend {
+        PoolBackend::Nfs { .. } => Some("nfs"),
+        PoolBackend::Rbd { .. } => Some("rbd"),
+        PoolBackend::Dir { .. } | PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } => None,
+    };
+    if let Some(kind) = always_shared {
         if shared_given && !spec.shared {
-            return Err(ApiError::bad_request("nfs pools are always shared"));
+            return Err(ApiError::bad_request(format!(
+                "{kind} pools are always shared"
+            )));
         }
         spec.shared = true;
     }

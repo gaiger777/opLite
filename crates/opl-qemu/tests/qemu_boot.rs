@@ -33,6 +33,7 @@ fn spec(id: Uuid, disk: PathBuf) -> VmRuntimeSpec {
         disks: vec![RuntimeDisk {
             path: disk,
             kind: DiskKind::File,
+            rbd: None,
             format: ImageFormat::Qcow2,
             bus: DiskBus::VirtioBlk,
             boot_order: Some(1),

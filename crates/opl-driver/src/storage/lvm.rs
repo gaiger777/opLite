@@ -306,7 +306,10 @@ impl LvmThinStorage {
         require_raw(format)?;
         match &pool.spec.backend {
             PoolBackend::LvmThin { vg, thinpool } => Ok((vg, thinpool)),
-            PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } | PoolBackend::Zfs { .. } => {
+            PoolBackend::Dir { .. }
+            | PoolBackend::Nfs { .. }
+            | PoolBackend::Zfs { .. }
+            | PoolBackend::Rbd { .. } => {
                 Err(DriverError::InvalidSpec("not an lvm-thin pool".into()))
             }
         }

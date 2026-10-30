@@ -21,16 +21,20 @@ pub struct VmRuntimeSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeDisk {
+    /// 파일·블록 디스크의 경로. RBD 디스크는 비어 있고 `rbd`를 쓴다.
     pub path: PathBuf,
-    /// `path`가 파일인지 블록 장치인지
+    /// 디스크 소스가 파일인지, 블록 장치인지, RBD 이미지인지
     #[serde(default)]
     pub kind: DiskKind,
+    /// RBD 디스크(`kind`가 `rbd`)의 이미지
+    #[serde(default)]
+    pub rbd: Option<RbdTarget>,
     pub format: ImageFormat,
     pub bus: DiskBus,
     pub boot_order: Option<u8>,
 }
 
-/// 디스크 소스의 종류. QEMU에 `driver=file` 또는 `driver=host_device`로 넘긴다.
+/// 디스크 소스의 종류. QEMU에 `driver=file`, `driver=host_device` 또는 `driver=rbd`로 넘긴다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiskKind {
@@ -39,6 +43,21 @@ pub enum DiskKind {
     File,
     /// 블록 장치(LVM LV 등)
     Block,
+    /// Ceph RBD 이미지(rbd 풀). QEMU가 네트워크로 직접 연다.
+    Rbd,
+}
+
+/// QEMU가 여는 RBD 이미지. 값은 풀을 만들 때 검증된 Ceph 이름과 conf 경로다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RbdTarget {
+    pub pool: String,
+    pub namespace: Option<String>,
+    /// 이미지 이름(`opl-{id}`)
+    pub image: String,
+    /// Ceph 클라이언트 id(`client.` 없이)
+    pub user: String,
+    /// ceph.conf 경로. 없으면 Ceph 기본.
+    pub conf: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,5 +108,32 @@ mod tests {
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["kind"], "block");
         assert_eq!(serde_json::from_value::<RuntimeDisk>(json).unwrap(), block);
+    }
+
+    #[test]
+    fn rbd_disk_round_trips() {
+        // rbd가 없는 옛 정의는 RBD 이미지가 없다.
+        let disk: RuntimeDisk = serde_json::from_value(serde_json::json!({
+            "path": "/dev/vg0/opl-a", "kind": "block", "format": "raw", "bus": "virtio-blk",
+            "boot_order": null
+        }))
+        .unwrap();
+        assert_eq!(disk.rbd, None);
+        let rbd = RuntimeDisk {
+            path: PathBuf::new(),
+            kind: DiskKind::Rbd,
+            rbd: Some(RbdTarget {
+                pool: "rbd".into(),
+                namespace: Some("opl".into()),
+                image: "opl-a".into(),
+                user: "admin".into(),
+                conf: None,
+            }),
+            ..disk
+        };
+        let json = serde_json::to_value(&rbd).unwrap();
+        assert_eq!(json["kind"], "rbd");
+        assert_eq!(json["rbd"]["image"], "opl-a");
+        assert_eq!(serde_json::from_value::<RuntimeDisk>(json).unwrap(), rbd);
     }
 }

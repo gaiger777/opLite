@@ -6,7 +6,7 @@ type ImageFormat = components["schemas"]["ImageFormat"];
 
 /**
  * 디렉터리 풀은 경로, NFS 풀은 `server:/export`(IPv6는 `[addr]:/export`), LVM-thin 풀은 `VG/THINPOOL`,
- * ZFS 풀은 데이터셋
+ * ZFS 풀은 데이터셋, RBD 풀은 `POOL[/NAMESPACE]`
  */
 export function poolLocation(pool: StoragePool): string {
   const b = pool.spec.backend;
@@ -18,6 +18,9 @@ export function poolLocation(pool: StoragePool): string {
   }
   if (b.kind === "zfs") {
     return b.dataset;
+  }
+  if (b.kind === "rbd") {
+    return b.namespace ? `${b.pool}/${b.namespace}` : b.pool;
   }
   return b.server.includes(":") ? `[${b.server}]:${b.export}` : `${b.server}:${b.export}`;
 }

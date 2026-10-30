@@ -136,11 +136,12 @@ fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
         .ok_or_else(|| ApiError::bad_request(format!("storage pool {name:?} not found")))
 }
 
-/// 풀이 `format` 볼륨을 담을 수 있는지. 블록 풀(LVM-thin, ZFS)은 raw만 담는다.
+/// 풀이 `format` 볼륨을 담을 수 있는지. 블록 풀(LVM-thin, ZFS, RBD)은 raw만 담는다.
 fn check_pool_format(pool: &StoragePool, format: ImageFormat) -> Result<(), ApiError> {
     let kind = match pool.spec.backend {
         PoolBackend::LvmThin { .. } => "lvm-thin",
         PoolBackend::Zfs { .. } => "zfs",
+        PoolBackend::Rbd { .. } => "rbd",
         PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => return Ok(()),
     };
     if format != ImageFormat::Raw {
@@ -151,11 +152,13 @@ fn check_pool_format(pool: &StoragePool, format: ImageFormat) -> Result<(), ApiE
     Ok(())
 }
 
-/// 형식을 적지 않았을 때의 볼륨 형식: 블록 풀(LVM-thin, ZFS)은 raw, 그 밖은 스냅샷을 담을 수 있는
+/// 형식을 적지 않았을 때의 볼륨 형식: 블록 풀(LVM-thin, ZFS, RBD)은 raw, 그 밖은 스냅샷을 담을 수 있는
 /// qcow2
 fn default_format(pool: &StoragePool) -> ImageFormat {
     match pool.spec.backend {
-        PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } => ImageFormat::Raw,
+        PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } | PoolBackend::Rbd { .. } => {
+            ImageFormat::Raw
+        }
         PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => ImageFormat::Qcow2,
     }
 }
