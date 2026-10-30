@@ -44,7 +44,7 @@ pub enum ResolveError {
 /// `mount_root`는 이 노드가 NFS 풀을 마운트하는 디렉터리다. 이 노드가 준비되지 않았다고 알린 풀은
 /// `PoolUnavailable`(잠시 뒤 다시 시도할 일)로 거절한다. 아직 알리지 않은 풀(opld가 막 시작해 첫 새로
 /// 고침 전)은 막지 않되, NFS 풀은 실제로 마운트돼 있는지 확인한다. Linux가 아닌 노드에서 NFS 풀은
-/// `NfsUnsupported`, LVM-thin·ZFS 풀은 `PoolUnsupported`(참조 오류)다. 디스크마다 `storage`로 볼륨을
+/// `NfsUnsupported`, LVM-thin·ZFS·RBD·공유 LVM 풀은 `PoolUnsupported`(참조 오류)다. 디스크마다 `storage`로 볼륨을
 /// 활성화한 뒤 [`disk_location`]으로 위치를 정한다(RBD 풀은 경로 대신 `RuntimeDisk.rbd`의 이미지).
 /// 저장소의 일시 오류는 `PoolUnavailable`, 그 밖은 `VolumeUnusable`이다.
 /// (다시 해도 안 되는 것은 볼륨이 없거나 정의가 틀린 것뿐이고, 그 밖의 저장소 오류는 일시 오류로 본다.)
@@ -68,14 +68,8 @@ pub async fn runtime_spec(
         if !pool_listed_on(&pool, node) {
             return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
         }
-        // 공유 LVM 풀의 디스크는 아직 다루지 않는다.
-        if matches!(pool.spec.backend, PoolBackend::LvmShared { .. }) {
-            return Err(ResolveError::PoolUnsupported(
-                pool_name.clone(),
-                "lvm-shared pools are not supported yet",
-            ));
-        }
-        // opld는 Linux에서만 NFS 풀을 마운트하고 LVM·ZFS·RBD를 쓴다(Homebrew QEMU에는 rbd가 없다).
+        // opld는 Linux에서만 NFS 풀을 마운트하고 LVM(공유 LVM 포함)·ZFS·RBD를 쓴다(Homebrew QEMU에는
+        // rbd가 없다).
         if !cfg!(target_os = "linux") {
             match pool.spec.backend {
                 PoolBackend::Nfs { .. } => {

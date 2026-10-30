@@ -515,13 +515,8 @@ async fn resolves_rbd_volumes_to_images() {
     );
 }
 
-/// 공유 LVM 풀의 디스크는 아직 쓸 수 없다. 기다려도 풀리지 않으므로 참조 오류이고, 볼륨을 활성화하지
-/// 않는다.
-#[tokio::test]
-async fn refuses_lvm_shared_volumes_for_now() {
-    let dir = TempDir::new().unwrap();
-    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
-    let node = cluster.id().0;
+/// 공유 LVM 풀 `s`(VG `san`)와 그 raw 볼륨 `root`를 쓰는 VM을 만든다.
+async fn lvm_shared_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, Vm) {
     let s: StoragePool = Resource::new(
         "s",
         StoragePoolSpec {
@@ -539,15 +534,51 @@ async fn refuses_lvm_shared_volumes_for_now() {
     cluster.create(&root).await.unwrap();
     let mut vm = common::vm("web", node);
     vm.spec.disks.push(disk("root"));
+    (root, vm)
+}
+
+/// 공유 LVM을 지원하지 않는 노드(macOS)에서는 공유 LVM 풀의 디스크를 쓸 수 없다. 기다려도 풀리지
+/// 않으므로 참조 오류이고, 볼륨을 활성화하지 않는다.
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn refuses_lvm_shared_volumes_on_macos() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let (_, vm) = lvm_shared_vm(&cluster, node).await;
     let storage = Activations::default();
     let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, ResolveError::PoolUnsupported(n, why) if n == "s" && why == &"lvm-shared pools are not supported yet"),
+        matches!(&err, ResolveError::PoolUnsupported(n, why) if n == "s" && why == &"lvm-shared pools are not supported on macOS"),
         "{err:?}"
     );
     assert!(storage.calls.lock().unwrap().is_empty());
+}
+
+/// Linux에서는 공유 LVM 볼륨을 (배타) 활성화한 뒤 LV 장치를 디스크로 쓴다. 활성화한 뒤에도 장치
+/// 노드가 없으면 잠시 뒤 다시 시도할 `PoolUnavailable`이다.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn activates_lvm_shared_volumes_and_waits_for_the_device() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let (root, vm) = lvm_shared_vm(&cluster, node).await;
+    let storage = Activations::default();
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        vec![("s".to_string(), root.id, ImageFormat::Raw)]
+    );
+    let device = format!("/dev/san/opl-{}", root.id);
+    assert!(
+        matches!(&err, ResolveError::PoolUnavailable(n, e) if n == "s" && e.contains(&device)),
+        "{err:?}"
+    );
 }
 
 /// ZFS 풀 `z`(데이터셋 `tank/opl`)와 그 raw 볼륨 `root`를 쓰는 VM을 만든다.

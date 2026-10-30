@@ -1,7 +1,8 @@
 //! 노드별 풀 상태. 이 노드가 쓸 수 있는 풀마다 준비 여부와 용량을 `NodeStatus.pools`에 적는다.
 //! NFS 풀은 `{data_dir}/pools/{풀 id}`에 마운트하고, 이 노드가 쓸 수 없게 된 NFS 풀은 언마운트한다.
 //! LVM-thin 풀은 `lvs`로 thin pool을, ZFS 풀은 `zfs get`으로 데이터셋을, RBD 풀은 `rbd ls`와
-//! `ceph df`로 Ceph 풀을(그 전에 QEMU의 rbd 블록 드라이버를) 확인한다.
+//! `ceph df`로 Ceph 풀을(그 전에 QEMU의 rbd 블록 드라이버를) 확인한다. 공유 LVM 풀은 iSCSI에
+//! 로그인하고(있으면) VG 잠금을 시작한 뒤 `vgs`로 공유 VG를 확인한다.
 //! opld가 내려가도 마운트는 그대로 둔다.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -15,10 +16,10 @@ use async_trait::async_trait;
 use opl_cluster::types::{NodeId, Rejection};
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::{Capacity, LvInfo, RbdSpace, ZfsDataset};
+use opl_driver::{Capacity, LvInfo, RbdSpace, VgInfo, ZfsDataset};
 use opl_types::node::{NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Kind;
-use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, VolumeSpec};
+use opl_types::storage::{IscsiTarget, PoolBackend, StoragePool, StoragePoolSpec, VolumeSpec};
 use opl_types::vm::{VmPhase, VmSpec};
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
@@ -33,11 +34,18 @@ const NFS_UNSUPPORTED: &str = "nfs pools are not supported on macOS";
 const LVM_UNSUPPORTED: &str = "lvm-thin pools are not supported on macOS";
 const ZFS_UNSUPPORTED: &str = "zfs pools are not supported on macOS";
 const RBD_UNSUPPORTED: &str = "rbd pools are not supported on macOS";
-const LVM_SHARED_UNSUPPORTED: &str = "lvm-shared pools are not supported yet";
+const LVM_SHARED_UNSUPPORTED: &str = "lvm-shared pools are not supported on macOS";
+/// iSCSI 로그인이나 VG 잠금 시작이 확인 시간 안에 끝나지 않았다(처음 잠금 시작은 오래 걸린다).
+const LVM_SHARED_STARTING: &str = "iscsi login or vg lock start in progress";
 const QEMU_NO_RBD: &str = "qemu has no rbd block driver";
 const LVS_TIMED_OUT: &str = "lvs timed out";
 const ZFS_TIMED_OUT: &str = "zfs timed out";
 const RBD_TIMED_OUT: &str = "rbd timed out";
+const VGS_TIMED_OUT: &str = "vgs timed out";
+/// `iscsiadm`의 종료 코드: 세션이 이미 있다(ISCSI_ERR_SESS_EXISTS).
+const ISCSI_SESSION_EXISTS: i32 = 15;
+/// `iscsiadm -m session`의 종료 코드: 세션이 하나도 없다(ISCSI_ERR_NO_OBJS_FOUND).
+const ISCSI_NO_SESSIONS: i32 = 21;
 const NFS_NOT_RESPONDING: &str = "nfs server not responding";
 const DIR_NOT_RESPONDING: &str = "pool directory not responding";
 const MOUNT_IN_PROGRESS: &str = "mount in progress";
@@ -73,6 +81,12 @@ pub trait MountOps: Send + Sync + 'static {
     ) -> Result<RbdSpace, String>;
     /// QEMU에 rbd 블록 드라이버가 있는지. 없으면 그 이유.
     async fn qemu_rbd(&self) -> Result<(), String>;
+    /// 타깃 `target`의 세션이 없으면 포털 `portal`에서 찾아 로그인한다. 실패하면 stderr.
+    async fn iscsi_login(&self, portal: &str, target: &str) -> Result<(), String>;
+    /// VG `vg`의 잠금을 시작한다(`vgchange --lockstart`). 실패하면 stderr.
+    async fn lvm_lockstart(&self, vg: &str) -> Result<(), String>;
+    /// `vgs`로 읽은 VG `vg`. 실패하면 stderr.
+    async fn lvm_vg(&self, vg: &str) -> Result<VgInfo, String>;
 }
 
 /// 실제 명령과 파일시스템
@@ -175,6 +189,88 @@ impl MountOps for SystemMount {
             .map_err(|e| format!("cannot run {}: {e}", self.qemu_binary.display()))?;
         qemu_rbd_result(&String::from_utf8_lossy(&out.stderr))
     }
+
+    /// 세션이 있으면 그대로 둔다. 없으면 sendtargets로 찾은 뒤 로그인하고, 장치 노드가 생길 때까지
+    /// 기다린다. 그 사이 다른 쪽이 로그인했으면(세션이 이미 있음) 성공이다. 시간 제한으로 죽이지
+    /// 않는다(iscsiadm이 스스로 시간 제한을 둔다).
+    async fn iscsi_login(&self, portal: &str, target: &str) -> Result<(), String> {
+        let out = run_to_end("iscsiadm", &["-m", "session"]).await?;
+        if out.status.code() != Some(ISCSI_NO_SESSIONS) {
+            if !out.status.success() {
+                return Err(failure("iscsiadm", &out));
+            }
+            if iscsi_session_present(&String::from_utf8_lossy(&out.stdout), target) {
+                return Ok(());
+            }
+        }
+        let discovery = ["-m", "discovery", "-t", "sendtargets", "-p", portal];
+        let out = run_to_end("iscsiadm", &discovery).await?;
+        if !out.status.success() {
+            return Err(failure("iscsiadm", &out));
+        }
+        let login = ["-m", "node", "-T", target, "-p", portal, "--login"];
+        let out = run_to_end("iscsiadm", &login).await?;
+        if !out.status.success() && out.status.code() != Some(ISCSI_SESSION_EXISTS) {
+            return Err(failure("iscsiadm", &out));
+        }
+        let out = run_to_end("udevadm", &["settle"]).await?;
+        if !out.status.success() {
+            return Err(failure("udevadm", &out));
+        }
+        Ok(())
+    }
+
+    /// 처음에는 sanlock 임대 때문에 오래 걸릴 수 있다. 이미 시작했으면 곧바로 끝난다. 시간 제한으로
+    /// 죽이지 않는다.
+    async fn lvm_lockstart(&self, vg: &str) -> Result<(), String> {
+        let out = run_to_end("vgchange", &["--lockstart", vg]).await?;
+        if !out.status.success() {
+            return Err(failure("vgchange", &out));
+        }
+        Ok(())
+    }
+
+    async fn lvm_vg(&self, vg: &str) -> Result<VgInfo, String> {
+        let out = tokio::process::Command::new("vgs")
+            .args(["--reportformat", "json", "--units", "b", "--nosuffix", "-o"])
+            .arg("vg_name,vg_lock_type,vg_size,vg_free")
+            .arg(vg)
+            .env("LC_ALL", "C")
+            .env("LVM_SUPPRESS_FD_WARNINGS", "1")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| format!("cannot run vgs: {e}"))?;
+        if !out.status.success() {
+            return Err(failure("vgs", &out));
+        }
+        opl_driver::parse_vgs(&out.stdout)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|v| v.name == vg)
+            .ok_or_else(|| format!("volume group {vg} not found"))
+    }
+}
+
+/// `iscsiadm -m session`의 출력(`tcp: [1] 10.0.0.9:3260,1 iqn.… (non-flash)`)에 타깃 `target`의
+/// 세션이 있는지. 포털은 보지 않는다(호스트 이름 포털도 세션에는 주소로 보인다).
+fn iscsi_session_present(sessions: &str, target: &str) -> bool {
+    sessions
+        .lines()
+        .any(|l| l.split_whitespace().nth(3) == Some(target))
+}
+
+/// 명령을 끝까지 실행해 결과를 돌려준다. 바꾸는 명령이므로 버려져도 죽이지 않는다.
+async fn run_to_end(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    tokio::process::Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .env("LVM_SUPPRESS_FD_WARNINGS", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("cannot run {program}: {e}"))
 }
 
 /// QEMU rbd 드라이버 확인에 여는 드라이브(풀·이미지가 빠졌다)
@@ -387,6 +483,8 @@ struct Pools {
     check_timeout: Duration,
     /// 시간 안에 끝나지 않은 확인 작업(풀 id별). 끝날 때까지 그 풀은 건너뛴다.
     stuck: HashMap<Uuid, JoinHandle<std::io::Result<Capacity>>>,
+    /// 시간 안에 끝나지 않은 공유 LVM 풀 확인(풀 id별). 끝날 때까지 새로 시작하지 않는다.
+    lvm_shared_checks: HashMap<Uuid, JoinHandle<PoolState>>,
     /// 진행 중인 마운트(풀 id)와 언마운트(마운트 지점). 풀마다 따로 돌고, 끝나기 전에는 같은 풀의
     /// 마운트·언마운트를 새로 시작하지 않는다.
     mounting: HashSet<Uuid>,
@@ -431,6 +529,8 @@ enum Step {
         user: String,
         conf: Option<String>,
     },
+    /// iSCSI에 로그인하고(있으면) VG 잠금을 시작한 뒤 공유 VG를 `vgs`로 확인한다.
+    LvmShared(String, Option<IscsiTarget>),
 }
 
 /// 마운트에 실패한 뒤 다음 시도까지 기다리는 시간: 15초부터 실패할 때마다 두 배, 최대 5분
@@ -454,6 +554,7 @@ impl Pools {
             mount_timeout: MOUNT_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
             stuck: HashMap::new(),
+            lvm_shared_checks: HashMap::new(),
             mounting: HashSet::new(),
             unmounting: HashSet::new(),
             finished: Arc::default(),
@@ -487,9 +588,14 @@ impl Pools {
         };
         self.backoff
             .retain(|id, _| usable.iter().any(|p| p.id == *id));
+        // 쓸 수 없게 된 풀의 확인도 끝날 때까지 둔다(다시 쓸 수 있게 되면 그것을 기다린다).
+        self.lvm_shared_checks
+            .retain(|id, task| !task.is_finished() || usable.iter().any(|p| p.id == *id));
+        let deadline = Instant::now() + self.check_timeout;
         let mut states = BTreeMap::new();
         let mut checks = Vec::new();
         let mut block_checks = Vec::new();
+        let mut lvm_shared_checks = Vec::new();
         for pool in &usable {
             match self.step(pool, &mounted, mount_results.remove(&pool.id)) {
                 Step::State(state) => {
@@ -511,6 +617,10 @@ impl Pools {
                     let task = self.spawn_rbd_check(pool.id, ceph_pool, namespace, user, conf);
                     block_checks.push((*pool, task));
                 }
+                Step::LvmShared(vg, iscsi) => {
+                    let task = self.lvm_shared_check(pool.id, vg, iscsi);
+                    lvm_shared_checks.push((*pool, task));
+                }
             }
         }
         for (pool, state) in self.check_all(checks).await {
@@ -531,6 +641,17 @@ impl Pools {
             let state = task
                 .await
                 .unwrap_or_else(|e| not_ready(pool.id, e.to_string()));
+            states.insert(pool.name.clone(), state);
+        }
+        // 공유 LVM 확인은 죽이지 않는다. 시간 안에 끝나지 않으면 두고 다음에 결과를 거둔다.
+        for (pool, mut task) in lvm_shared_checks {
+            let state = match tokio::time::timeout_at(deadline, &mut task).await {
+                Ok(state) => state.unwrap_or_else(|e| not_ready(pool.id, e.to_string())),
+                Err(_) => {
+                    self.lvm_shared_checks.insert(pool.id, task);
+                    not_ready(pool.id, LVM_SHARED_STARTING.into())
+                }
+            };
             states.insert(pool.name.clone(), state);
         }
         if self.nfs_supported {
@@ -591,8 +712,11 @@ impl Pools {
                     conf: conf.clone(),
                 };
             }
-            PoolBackend::LvmShared { .. } => {
-                return Step::State(not_ready(pool.id, LVM_SHARED_UNSUPPORTED.into()));
+            PoolBackend::LvmShared { vg, iscsi } => {
+                if !self.lvm_supported {
+                    return Step::State(not_ready(pool.id, LVM_SHARED_UNSUPPORTED.into()));
+                }
+                return Step::LvmShared(vg.clone(), iscsi.clone());
             }
             PoolBackend::Nfs {
                 server,
@@ -733,6 +857,47 @@ impl Pools {
                 },
                 Ok(Err(e)) => not_ready(id, e),
                 Err(_) => not_ready(id, RBD_TIMED_OUT.into()),
+            }
+        })
+    }
+
+    /// 공유 LVM 풀 확인 작업. 앞 작업이 아직 돌고 있으면 그것을, 아니면 새 작업을 돌려준다.
+    /// iSCSI 로그인(있으면)과 잠금 시작은 시간 제한 없이 기다리고, `vgs`는 시간 제한이 지나면 죽인다.
+    /// 잠금 종류가 `sanlock`·`dlm`인 공유 VG면 준비됐고, 용량은 VG의 크기와 남은 공간이다.
+    fn lvm_shared_check(
+        &mut self,
+        id: Uuid,
+        vg: String,
+        iscsi: Option<IscsiTarget>,
+    ) -> JoinHandle<PoolState> {
+        if let Some(task) = self.lvm_shared_checks.remove(&id) {
+            return task;
+        }
+        let (ops, timeout) = (self.ops.clone(), self.check_timeout);
+        tokio::spawn(async move {
+            let prepare = async {
+                if let Some(t) = &iscsi {
+                    ops.iscsi_login(&t.portal, &t.target).await?;
+                }
+                ops.lvm_lockstart(&vg).await
+            };
+            if let Err(e) = prepare.await {
+                return not_ready(id, e);
+            }
+            match tokio::time::timeout(timeout, ops.lvm_vg(&vg)).await {
+                Ok(Ok(info)) if matches!(info.lock_type.as_str(), "sanlock" | "dlm") => PoolState {
+                    pool_id: id,
+                    ready: true,
+                    error: None,
+                    total_bytes: info.size_bytes,
+                    available_bytes: info.free_bytes,
+                },
+                Ok(Ok(_)) => not_ready(
+                    id,
+                    format!("volume group {vg} is not a shared (lvmlockd) VG"),
+                ),
+                Ok(Err(e)) => not_ready(id, e),
+                Err(_) => not_ready(id, VGS_TIMED_OUT.into()),
             }
         })
     }
@@ -1026,6 +1191,12 @@ mod tests {
         hang_rbd: AtomicBool,
         /// 참이면 QEMU에 rbd 블록 드라이버가 없다.
         no_qemu_rbd: AtomicBool,
+        /// 이름별 VG
+        vgs: Mutex<BTreeMap<String, VgInfo>>,
+        /// iSCSI 로그인 오류
+        iscsi_error: Mutex<Option<String>>,
+        /// 참이면 잠금 시작이 풀릴 때까지 멈춘다.
+        hang_lockstart: AtomicBool,
     }
 
     impl FakeMount {
@@ -1135,6 +1306,41 @@ mod tests {
                 return Err(QEMU_NO_RBD.into());
             }
             Ok(())
+        }
+
+        async fn iscsi_login(&self, portal: &str, target: &str) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("iscsiadm login {target} -p {portal}"));
+            match self.iscsi_error.lock().unwrap().clone() {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        }
+
+        async fn lvm_lockstart(&self, vg: &str) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("vgchange --lockstart {vg}"));
+            while self.hang_lockstart.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if !self.vgs.lock().unwrap().contains_key(vg) {
+                return Err(format!("Volume group \"{vg}\" not found"));
+            }
+            Ok(())
+        }
+
+        async fn lvm_vg(&self, vg: &str) -> Result<VgInfo, String> {
+            self.calls.lock().unwrap().push(format!("vgs {vg}"));
+            self.vgs
+                .lock()
+                .unwrap()
+                .get(vg)
+                .cloned()
+                .ok_or_else(|| format!("Volume group \"{vg}\" not found"))
         }
 
         fn check(&self, dir: &Path, probe: &str) -> std::io::Result<Capacity> {
@@ -1596,22 +1802,206 @@ mod tests {
         s.cluster.shutdown().await.unwrap();
     }
 
-    /// 공유 LVM 풀은 아직 확인하지 않고 준비되지 않았다고 적는다.
+    fn lvm_shared(vg: &str, iscsi: Option<(&str, &str)>) -> PoolBackend {
+        PoolBackend::LvmShared {
+            vg: vg.into(),
+            iscsi: iscsi.map(|(portal, target)| IscsiTarget {
+                portal: portal.into(),
+                target: target.into(),
+            }),
+        }
+    }
+
+    fn vg(name: &str, lock_type: &str, size_bytes: u64, free_bytes: u64) -> VgInfo {
+        VgInfo {
+            name: name.into(),
+            lock_type: lock_type.into(),
+            size_bytes,
+            free_bytes,
+        }
+    }
+
+    const IQN: &str = "iqn.2003-01.org.linux-iscsi.san:opl";
+
+    /// 공유 LVM 풀은 iSCSI에 로그인하고(있으면) VG 잠금을 시작한 뒤 `vgs`로 확인한다. 잠금 종류가
+    /// `sanlock`·`dlm`이면 준비됐고 용량은 VG의 크기와 남은 공간이다. 잠금이 없는 VG나 없는 VG는 이유와
+    /// 함께 준비되지 않았다. 마운트하지 않는다.
     #[tokio::test]
-    async fn lvm_shared_pools_are_not_ready_yet() {
+    async fn records_lvm_shared_pool_states() {
         let mut s = setup().await;
-        let backend = PoolBackend::LvmShared {
-            vg: "san".into(),
-            iscsi: None,
+        {
+            let mut vgs = s.fake.vgs.lock().unwrap();
+            vgs.insert("san".into(), vg("san", "sanlock", 100 * GIB, 40 * GIB));
+            vgs.insert("fc".into(), vg("fc", "dlm", 100 * GIB, 40 * GIB));
+            vgs.insert("local".into(), vg("local", "", 100 * GIB, 40 * GIB));
+        }
+        let san = s
+            .pool("san", lvm_shared("san", Some(("10.0.0.9", IQN))), vec![])
+            .await;
+        let fc = s.pool("fc", lvm_shared("fc", None), vec![]).await;
+        let local = s.pool("local", lvm_shared("local", None), vec![]).await;
+        let gone = s.pool("gone", lvm_shared("gone", None), vec![]).await;
+
+        s.pools.settle().await;
+        let states = s.states();
+        assert_eq!(states["san"], ready(&san));
+        assert_eq!(states["fc"], ready(&fc));
+        assert_eq!(
+            states["local"],
+            not_ready(
+                local.id,
+                "volume group local is not a shared (lvmlockd) VG".into()
+            )
+        );
+        assert_eq!(
+            states["gone"],
+            not_ready(gone.id, "Volume group \"gone\" not found".into())
+        );
+        let mut calls = s.fake.calls();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(
+            calls,
+            [
+                format!("iscsiadm login {IQN} -p 10.0.0.9"),
+                "vgchange --lockstart fc".into(),
+                "vgchange --lockstart gone".into(),
+                "vgchange --lockstart local".into(),
+                "vgchange --lockstart san".into(),
+                "vgs fc".into(),
+                "vgs local".into(),
+                "vgs san".into(),
+            ]
+        );
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// iSCSI 로그인이 실패하면 그 이유로 준비되지 않았고 잠금을 시작하지 않는다.
+    #[tokio::test]
+    async fn lvm_shared_pools_need_the_iscsi_login() {
+        let mut s = setup().await;
+        s.fake
+            .vgs
+            .lock()
+            .unwrap()
+            .insert("san".into(), vg("san", "sanlock", 100 * GIB, 40 * GIB));
+        let error = "iscsiadm: No portals found";
+        *s.fake.iscsi_error.lock().unwrap() = Some(error.into());
+        let san = s
+            .pool("san", lvm_shared("san", Some(("10.0.0.9", IQN))), vec![])
+            .await;
+        s.pools.tick().await.unwrap();
+        assert_eq!(
+            s.fake.calls(),
+            [format!("iscsiadm login {IQN} -p 10.0.0.9")]
+        );
+        assert_eq!(s.states()["san"], not_ready(san.id, error.into()));
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// 오래 걸리는 잠금 시작은 죽이지 않고 두며 다른 풀의 기록을 막지 않는다. 그동안 새로 시작하지
+    /// 않고, 끝나면 그 결과를 적는다.
+    #[tokio::test]
+    async fn slow_lock_start_does_not_hold_up_other_pools() {
+        let mut s = setup().await;
+        let local = PoolBackend::Dir {
+            path: s.local.clone(),
         };
-        let p = s.pool("s", backend, vec![]).await;
+        let local = s.pool("local", local, vec![]).await;
+        s.fake
+            .vgs
+            .lock()
+            .unwrap()
+            .insert("san".into(), vg("san", "sanlock", 100 * GIB, 40 * GIB));
+        let san = s.pool("san", lvm_shared("san", None), vec![]).await;
+        s.fake.hang_lockstart.store(true, Ordering::SeqCst);
+        let starting = not_ready(san.id, LVM_SHARED_STARTING.into());
+        let started = Instant::now();
+        s.pools.tick().await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(s.states()["local"], ready(&local));
+        assert_eq!(s.states()["san"], starting);
+        s.pools.tick().await.unwrap();
+        assert_eq!(s.fake.calls(), ["vgchange --lockstart san"]);
+        assert_eq!(s.states()["san"], starting);
+
+        s.fake.hang_lockstart.store(false, Ordering::SeqCst);
+        s.pools.tick().await.unwrap();
+        assert_eq!(s.fake.calls(), ["vgs san"]);
+        assert_eq!(s.states()["san"], ready(&san));
+        assert!(s.pools.lvm_shared_checks.is_empty());
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    /// 잠금 시작이 도는 동안 풀을 이 노드에서 쓸 수 없게 되어도 그 작업을 버리지 않는다. 다시 쓸 수
+    /// 있게 되면 새로 시작하지 않고 그 결과를 쓴다.
+    #[tokio::test]
+    async fn lock_start_in_progress_is_kept_while_the_pool_is_unusable() {
+        let mut s = setup().await;
+        s.fake
+            .vgs
+            .lock()
+            .unwrap()
+            .insert("san".into(), vg("san", "sanlock", 100 * GIB, 40 * GIB));
+        let san = s.pool("san", lvm_shared("san", None), vec![]).await;
+        s.fake.hang_lockstart.store(true, Ordering::SeqCst);
+        s.pools.tick().await.unwrap();
+        assert_eq!(s.fake.calls(), ["vgchange --lockstart san"]);
+
+        let set_nodes = |nodes: Vec<Uuid>| {
+            let spec = StoragePoolSpec {
+                nodes,
+                ..san.spec.clone()
+            };
+            let cluster = s.cluster.clone();
+            async move {
+                cluster
+                    .update_spec(san.id, None, Default::default(), &spec)
+                    .await
+                    .unwrap();
+            }
+        };
+        set_nodes(vec![Uuid::now_v7()]).await;
+        s.pools.tick().await.unwrap();
+        assert!(s.pools.lvm_shared_checks.contains_key(&san.id));
+
+        set_nodes(vec![]).await;
+        s.fake.hang_lockstart.store(false, Ordering::SeqCst);
+        s.pools.tick().await.unwrap();
+        assert_eq!(s.fake.calls(), ["vgs san"]);
+        assert_eq!(s.states()["san"], ready(&san));
+        assert!(s.pools.lvm_shared_checks.is_empty());
+        s.cluster.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lvm_shared_is_not_checked_where_unsupported() {
+        let mut s = setup().await;
+        s.pools.lvm_supported = false;
+        let san = s.pool("san", lvm_shared("san", None), vec![]).await;
         s.pools.tick().await.unwrap();
         assert_eq!(s.fake.calls(), Vec::<String>::new());
         assert_eq!(
-            s.states()["s"],
-            not_ready(p.id, "lvm-shared pools are not supported yet".into())
+            s.states()["san"],
+            not_ready(san.id, "lvm-shared pools are not supported on macOS".into())
         );
         s.cluster.shutdown().await.unwrap();
+    }
+
+    /// `iscsiadm -m session`의 출력에서 타깃의 세션을 찾는다(포털은 보지 않는다).
+    #[test]
+    fn finds_iscsi_sessions_by_target() {
+        let sessions = format!(
+            "tcp: [1] 127.0.0.1:3260,1 {IQN} (non-flash)\n\
+             tcp: [2] [fd00::9]:3260,1 iqn.2003-01.org.other:x (non-flash)\n"
+        );
+        assert!(iscsi_session_present(&sessions, IQN));
+        assert!(iscsi_session_present(&sessions, "iqn.2003-01.org.other:x"));
+        assert!(!iscsi_session_present(
+            &sessions,
+            "iqn.2003-01.org.linux-iscsi.san"
+        ));
+        assert!(!iscsi_session_present("", IQN));
     }
 
     /// QEMU에 rbd 블록 드라이버가 없으면 RBD 풀은 그 이유로 준비되지 않았고 `rbd`를 부르지 않는다.
