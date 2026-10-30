@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, VmRuntimeSpec};
+use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, RbdTarget, VmRuntimeSpec};
 use opl_types::vm::{Arch, CpuModel, DiskBus, Firmware, MachineType, NicModel};
 use thiserror::Error;
 
@@ -20,8 +20,8 @@ pub enum CmdlineError {
     SataRequiresQ35,
     #[error("at most {Q35_SATA_PORTS} SATA disks are supported")]
     TooManySataDisks,
-    #[error("rbd disks are not supported yet")]
-    RbdDisksUnsupported,
+    #[error("disk {0} is an rbd disk without an rbd image")]
+    MissingRbdImage(usize),
 }
 
 /// QEMU 인자 목록(바이너리 제외)을 만든다. 부수 효과가 없는 순수 함수다.
@@ -97,18 +97,15 @@ pub fn build_cmdline(
             ImageFormat::Qcow2 => "qcow2",
             ImageFormat::Raw => "raw",
         };
-        let proto = match disk.kind {
-            DiskKind::File => "file",
-            DiskKind::Block => "host_device",
-            DiskKind::Rbd => return Err(CmdlineError::RbdDisksUnsupported),
+        let source = match disk.kind {
+            DiskKind::File => format!("driver=file,filename={}", esc_path(&disk.path)),
+            DiskKind::Block => format!("driver=host_device,filename={}", esc_path(&disk.path)),
+            DiskKind::Rbd => {
+                let rbd = disk.rbd.as_ref().ok_or(CmdlineError::MissingRbdImage(i))?;
+                rbd_source(rbd)
+            }
         };
-        a.opt(
-            "-blockdev",
-            format!(
-                "driver={proto},filename={},node-name=disk{i}-file",
-                esc_path(&disk.path)
-            ),
-        );
+        a.opt("-blockdev", format!("{source},node-name=disk{i}-file"));
         a.opt(
             "-blockdev",
             format!("driver={fmt},file=disk{i}-file,node-name=disk{i}"),
@@ -153,6 +150,23 @@ pub fn build_cmdline(
     );
     a.opt("-pidfile", paths.pidfile.display().to_string());
     Ok(a.0)
+}
+
+/// RBD 이미지를 여는 `rbd` 블록 드라이버 옵션. 네임스페이스와 conf는 있을 때만 넣는다.
+fn rbd_source(rbd: &RbdTarget) -> String {
+    let mut s = format!("driver=rbd,pool={}", esc(&rbd.pool));
+    if let Some(ns) = &rbd.namespace {
+        s.push_str(&format!(",namespace={}", esc(ns)));
+    }
+    s.push_str(&format!(
+        ",image={},user={}",
+        esc(&rbd.image),
+        esc(&rbd.user)
+    ));
+    if let Some(conf) = &rbd.conf {
+        s.push_str(&format!(",conf={}", esc(conf)));
+    }
+    s
 }
 
 fn check_compat(spec: &VmRuntimeSpec, host: &HostProfile) -> Result<(), CmdlineError> {
@@ -200,7 +214,7 @@ fn esc_path(p: &Path) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use opl_types::runtime::{DiskKind, RuntimeDisk, RuntimeNic};
+    use opl_types::runtime::{DiskKind, RbdTarget, RuntimeDisk, RuntimeNic};
     use opl_types::vm::CpuSpec;
     use uuid::Uuid;
 
@@ -358,14 +372,47 @@ mod tests {
         ));
     }
 
-    /// RBD 디스크는 아직 열지 않는다.
+    /// RBD 디스크는 QEMU의 `rbd` 드라이버로 연다. 네임스페이스와 conf는 있을 때만 넘긴다.
     #[test]
-    fn rbd_disks_are_unsupported_for_now() {
+    fn rbd_disks_use_rbd_driver() {
         let mut spec = x86_spec();
+        spec.disks[0] = RuntimeDisk {
+            path: PathBuf::new(),
+            kind: DiskKind::Rbd,
+            rbd: Some(RbdTarget {
+                pool: "rbd".into(),
+                namespace: Some("opl".into()),
+                image: "opl-a".into(),
+                user: "opl".into(),
+                conf: Some("/etc/ceph/opl.conf".into()),
+            }),
+            format: ImageFormat::Raw,
+            ..spec.disks[0].clone()
+        };
+        spec.disks[1].path = PathBuf::new();
         spec.disks[1].kind = DiskKind::Rbd;
+        spec.disks[1].rbd = Some(RbdTarget {
+            pool: "rbd".into(),
+            namespace: None,
+            image: "opl-b".into(),
+            user: "admin".into(),
+            conf: None,
+        });
+        let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        assert!(args.contains(
+            &"driver=rbd,pool=rbd,namespace=opl,image=opl-a,user=opl,conf=/etc/ceph/opl.conf,node-name=disk0-file"
+                .to_string()
+        ));
+        assert!(args.contains(&"driver=raw,file=disk0-file,node-name=disk0".to_string()));
+        assert!(args.contains(
+            &"driver=rbd,pool=rbd,image=opl-b,user=admin,node-name=disk1-file".to_string()
+        ));
+        assert!(args.contains(&"driver=raw,file=disk1-file,node-name=disk1".to_string()));
+        // 이미지가 없는 RBD 디스크는 열 수 없다.
+        spec.disks[1].rbd = None;
         assert_eq!(
             build_cmdline(&spec, &x86_host(), &paths()).unwrap_err(),
-            CmdlineError::RbdDisksUnsupported
+            CmdlineError::MissingRbdImage(1)
         );
     }
 

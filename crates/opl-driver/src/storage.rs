@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use opl_types::runtime::{DiskKind, ImageFormat};
+use opl_types::runtime::{DiskKind, ImageFormat, RbdTarget};
 use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
 use serde_json::Value;
 use uuid::Uuid;
@@ -13,6 +13,7 @@ use crate::mounts::{MOUNTINFO, nfs_mount_points};
 
 mod blockcmd;
 mod lvm;
+mod rbd;
 mod storages;
 mod zfs;
 
@@ -294,16 +295,26 @@ fn check_pool_root_with(
     Ok(root)
 }
 
+/// VM 디스크의 소스([`disk_location`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiskLocation {
+    /// 볼륨 파일 또는 블록 장치의 경로와 그 종류(`File`, `Block`)
+    Path(PathBuf, DiskKind),
+    /// QEMU가 네트워크로 여는 RBD 이미지
+    Rbd(RbdTarget),
+}
+
 /// VM 디스크로 쓸 볼륨의 위치와 종류. 파일 풀은 풀 루트([`check_pool_root`]로 확인한다) 안의
 /// 볼륨 파일이다. LVM-thin 풀은 LV 장치 `/dev/{vg}/opl-{id}`(없으면 `/dev/mapper`의 노드)이고, 장치
 /// 노드가 없으면(비활성) `VolumeNotActive`다(활성화는 저장소의 `activate_volume`이 한다). ZFS 풀은
 /// zvol 장치 `/dev/zvol/{dataset}/opl-{id}`이고, 노드가 없으면(아직 생기지 않음) `VolumeNotActive`다.
+/// RBD 풀은 경로가 아니라 RBD 이미지 `opl-{id}`다(있는지는 `activate_volume`이 확인한다).
 pub fn disk_location(
     pool: &StoragePool,
     mount_root: &Path,
     id: Uuid,
     format: ImageFormat,
-) -> Result<(PathBuf, DiskKind), DriverError> {
+) -> Result<DiskLocation, DriverError> {
     disk_location_in(Path::new(lvm::DEV), pool, mount_root, id, format)
 }
 
@@ -314,22 +325,39 @@ fn disk_location_in(
     mount_root: &Path,
     id: Uuid,
     format: ImageFormat,
-) -> Result<(PathBuf, DiskKind), DriverError> {
+) -> Result<DiskLocation, DriverError> {
     if let PoolBackend::LvmThin { vg, .. } = &pool.spec.backend {
         lvm::require_raw(format)?;
-        return Ok((lvm::volume_device(dev, vg, id)?, DiskKind::Block));
+        return Ok(DiskLocation::Path(
+            lvm::volume_device(dev, vg, id)?,
+            DiskKind::Block,
+        ));
     }
     if let PoolBackend::Zfs { dataset } = &pool.spec.backend {
         zfs::require_raw(format)?;
-        return Ok((zfs::volume_device(dev, dataset, id)?, DiskKind::Block));
-    }
-    if let PoolBackend::Rbd { .. } = &pool.spec.backend {
-        return Err(DriverError::InvalidSpec(
-            "rbd pools are not supported yet".into(),
+        return Ok(DiskLocation::Path(
+            zfs::volume_device(dev, dataset, id)?,
+            DiskKind::Block,
         ));
     }
+    if let PoolBackend::Rbd {
+        pool: rbd_pool,
+        namespace,
+        user,
+        conf,
+    } = &pool.spec.backend
+    {
+        rbd::require_raw(format)?;
+        return Ok(DiskLocation::Rbd(rbd::volume_target(
+            rbd_pool,
+            namespace.as_ref(),
+            user.as_ref(),
+            conf.as_ref(),
+            id,
+        )));
+    }
     check_pool_root(pool, mount_root)?;
-    Ok((
+    Ok(DiskLocation::Path(
         DirStorage::volume_path(pool, mount_root, id, format),
         DiskKind::File,
     ))
@@ -1134,7 +1162,7 @@ mod tests {
         let id = Uuid::nil();
         assert_eq!(
             disk_location(&p, mnt.path(), id, ImageFormat::Raw).unwrap(),
-            (
+            DiskLocation::Path(
                 PathBuf::from("/pools/local/00000000-0000-0000-0000-000000000000.raw"),
                 DiskKind::File
             )
@@ -1219,7 +1247,7 @@ mod tests {
         refused(storage.capacity(&p).await.unwrap_err());
     }
 
-    /// 파일 저장소는 RBD 풀도 다루지 않고, 디스크 위치도 아직 정하지 않는다.
+    /// 파일 저장소는 RBD 풀도 다루지 않는다.
     #[tokio::test]
     async fn rbd_pools_are_not_file_pools() {
         let tools = tempfile::tempdir().unwrap();
@@ -1247,8 +1275,54 @@ mod tests {
         let (id, f) = (Uuid::nil(), ImageFormat::Raw);
         refused(storage.create_volume(&p, id, 1 << 20, f).await.unwrap_err());
         refused(storage.capacity(&p).await.unwrap_err());
-        match disk_location(&p, mnt.path(), id, f).unwrap_err() {
-            DriverError::InvalidSpec(msg) => assert_eq!(msg, "rbd pools are not supported yet"),
+    }
+
+    /// RBD 풀의 디스크는 경로가 아니라 RBD 이미지 `opl-{id}`다. 사용자가 없으면 `admin`이다.
+    #[test]
+    fn rbd_disks_are_rbd_images() {
+        let mnt = Path::new(MNT);
+        let rbd =
+            |namespace: Option<&str>, user: Option<&str>, conf: Option<&str>| -> StoragePool {
+                Resource::new(
+                    "r",
+                    StoragePoolSpec {
+                        backend: PoolBackend::Rbd {
+                            pool: "rbd".into(),
+                            namespace: namespace.map(Into::into),
+                            user: user.map(Into::into),
+                            conf: conf.map(Into::into),
+                        },
+                        nodes: vec![],
+                        shared: true,
+                    },
+                )
+            };
+        let id = Uuid::nil();
+        let image = "opl-00000000-0000-0000-0000-000000000000".to_string();
+        assert_eq!(
+            disk_location(&rbd(None, None, None), mnt, id, ImageFormat::Raw).unwrap(),
+            DiskLocation::Rbd(RbdTarget {
+                pool: "rbd".into(),
+                namespace: None,
+                image: image.clone(),
+                user: "admin".into(),
+                conf: None,
+            })
+        );
+        let p = rbd(Some("opl"), Some("opl"), Some("/etc/ceph/opl.conf"));
+        assert_eq!(
+            disk_location(&p, mnt, id, ImageFormat::Raw).unwrap(),
+            DiskLocation::Rbd(RbdTarget {
+                pool: "rbd".into(),
+                namespace: Some("opl".into()),
+                image,
+                user: "opl".into(),
+                conf: Some("/etc/ceph/opl.conf".into()),
+            })
+        );
+        // RBD 풀은 raw 볼륨만 담는다.
+        match disk_location(&p, mnt, id, ImageFormat::Qcow2).unwrap_err() {
+            DriverError::InvalidSpec(msg) => assert_eq!(msg, "rbd pools hold raw volumes"),
             other => panic!("unexpected error: {other:?}"),
         }
     }
@@ -1280,7 +1354,7 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         assert_eq!(
             disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Raw).unwrap(),
-            (path, DiskKind::Block)
+            DiskLocation::Path(path, DiskKind::Block)
         );
         // ZFS 풀은 raw 볼륨만 담는다.
         let err = disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Qcow2).unwrap_err();
@@ -1316,7 +1390,7 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         assert_eq!(
             disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Raw).unwrap(),
-            (path, DiskKind::Block)
+            DiskLocation::Path(path, DiskKind::Block)
         );
         // LVM 풀은 raw 볼륨만 담는다.
         let err = disk_location_in(dev.path(), &p, mnt, id, ImageFormat::Qcow2).unwrap_err();

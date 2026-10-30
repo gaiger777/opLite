@@ -12,7 +12,7 @@ use opl_reconciler::resolve::{ResolveError, runtime_spec};
 use opl_types::network::{Network, NetworkSpec, tap_name};
 use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
-use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
+use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, RbdTarget, RuntimeDisk, RuntimeNic};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::vm::{DiskBus, DiskSpec, MacAddr, NicModel, NicSpec, Vm};
 use tempfile::TempDir;
@@ -436,9 +436,9 @@ async fn refuses_lvm_thin_volumes_on_macos() {
     assert!(storage.calls.lock().unwrap().is_empty());
 }
 
-/// RBD 풀의 디스크는 아직 쓸 수 없다. 기다려도 풀리지 않으므로 참조 오류이고, 볼륨을 활성화하지 않는다.
+/// RBD 풀의 디스크는 볼륨을 활성화(이미지 확인)한 뒤 경로 대신 RBD 이미지로 푼다.
 #[tokio::test]
-async fn refuses_rbd_volumes_for_now() {
+async fn resolves_rbd_volumes_to_images() {
     let dir = TempDir::new().unwrap();
     let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
     let node = cluster.id().0;
@@ -447,9 +447,9 @@ async fn refuses_rbd_volumes_for_now() {
         StoragePoolSpec {
             backend: PoolBackend::Rbd {
                 pool: "rbd".into(),
-                namespace: None,
+                namespace: Some("opl".into()),
                 user: None,
-                conf: None,
+                conf: Some("/etc/ceph/opl.conf".into()),
             },
             nodes: vec![],
             shared: true,
@@ -462,14 +462,30 @@ async fn refuses_rbd_volumes_for_now() {
     let mut vm = common::vm("web", node);
     vm.spec.disks.push(disk("root"));
     let storage = Activations::default();
-    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+    let spec = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
         .await
-        .unwrap_err();
-    assert!(
-        matches!(&err, ResolveError::PoolUnsupported(n, why) if n == "r" && why == &"rbd pools are not supported yet"),
-        "{err:?}"
+        .unwrap();
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        vec![("r".to_string(), root.id, ImageFormat::Raw)]
     );
-    assert!(storage.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        spec.disks,
+        vec![RuntimeDisk {
+            path: PathBuf::new(),
+            kind: DiskKind::Rbd,
+            rbd: Some(RbdTarget {
+                pool: "rbd".into(),
+                namespace: Some("opl".into()),
+                image: format!("opl-{}", root.id),
+                user: "admin".into(),
+                conf: Some("/etc/ceph/opl.conf".into()),
+            }),
+            format: ImageFormat::Raw,
+            bus: DiskBus::VirtioBlk,
+            boot_order: Some(1),
+        }]
+    );
 }
 
 /// ZFS 풀 `z`(데이터셋 `tank/opl`)와 그 raw 볼륨 `root`를 쓰는 VM을 만든다.

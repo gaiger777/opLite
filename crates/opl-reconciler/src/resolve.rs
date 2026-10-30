@@ -1,12 +1,12 @@
 //! VM spec의 이름 참조(Volume, Network)를 풀어 드라이버가 받는 `VmRuntimeSpec`을 만든다.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::{DriverError, Storage, disk_location};
+use opl_driver::{DiskLocation, DriverError, Storage, disk_location};
 use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
 use opl_types::node::NodeSpec;
-use opl_types::runtime::{NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
+use opl_types::runtime::{DiskKind, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
 use opl_types::storage::{
     PoolBackend, StoragePoolSpec, VolumeSpec, pool_error_on, pool_listed_on, pool_state_on,
 };
@@ -45,8 +45,8 @@ pub enum ResolveError {
 /// `PoolUnavailable`(잠시 뒤 다시 시도할 일)로 거절한다. 아직 알리지 않은 풀(opld가 막 시작해 첫 새로
 /// 고침 전)은 막지 않되, NFS 풀은 실제로 마운트돼 있는지 확인한다. Linux가 아닌 노드에서 NFS 풀은
 /// `NfsUnsupported`, LVM-thin·ZFS 풀은 `PoolUnsupported`(참조 오류)다. 디스크마다 `storage`로 볼륨을
-/// 활성화한 뒤 [`disk_location`]으로 위치를 정한다. 저장소의 일시 오류는 `PoolUnavailable`, 그 밖은
-/// `VolumeUnusable`이다.
+/// 활성화한 뒤 [`disk_location`]으로 위치를 정한다(RBD 풀은 경로 대신 `RuntimeDisk.rbd`의 이미지).
+/// 저장소의 일시 오류는 `PoolUnavailable`, 그 밖은 `VolumeUnusable`이다.
 /// (다시 해도 안 되는 것은 볼륨이 없거나 정의가 틀린 것뿐이고, 그 밖의 저장소 오류는 일시 오류로 본다.)
 pub async fn runtime_spec(
     cluster: &Cluster,
@@ -67,13 +67,6 @@ pub async fn runtime_spec(
             .ok_or_else(|| ResolveError::PoolNotFound(pool_name.clone()))?;
         if !pool_listed_on(&pool, node) {
             return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
-        }
-        // RBD 풀의 디스크는 아직 다루지 않는다.
-        if matches!(pool.spec.backend, PoolBackend::Rbd { .. }) {
-            return Err(ResolveError::PoolUnsupported(
-                pool_name.clone(),
-                "rbd pools are not supported yet",
-            ));
         }
         // opld는 Linux에서만 NFS 풀을 마운트하고 LVM·ZFS를 쓴다.
         if !cfg!(target_os = "linux") {
@@ -107,8 +100,9 @@ pub async fn runtime_spec(
             Ok(()) => disk_location(&pool, mount_root, volume.id, format),
             Err(e) => Err(e),
         };
-        let (path, kind) = match located {
-            Ok(location) => location,
+        let (path, kind, rbd) = match located {
+            Ok(DiskLocation::Path(path, kind)) => (path, kind, None),
+            Ok(DiskLocation::Rbd(target)) => (PathBuf::new(), DiskKind::Rbd, Some(target)),
             // 볼륨이 없거나 정의가 틀리면 다시 해도 같다.
             Err(e @ (DriverError::VolumeNotFound(_) | DriverError::InvalidSpec(_))) => {
                 return Err(ResolveError::VolumeUnusable(disk.volume.clone(), e));
@@ -124,7 +118,7 @@ pub async fn runtime_spec(
         disks.push(RuntimeDisk {
             path,
             kind,
-            rbd: None,
+            rbd,
             format: volume.spec.format,
             bus: disk.bus,
             boot_order: disk.boot_order,

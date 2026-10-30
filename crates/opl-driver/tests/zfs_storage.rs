@@ -10,9 +10,11 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use opl_driver::{DirStorage, DriverError, SourceFormat, Storage, Storages, SystemZfs, ZfsStorage};
+use opl_driver::{
+    DirStorage, DiskLocation, DriverError, SourceFormat, Storage, Storages, SystemZfs, ZfsStorage,
+};
 use opl_types::resource::Resource;
-use opl_types::runtime::ImageFormat;
+use opl_types::runtime::{DiskKind, ImageFormat};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec};
 use uuid::Uuid;
 
@@ -137,8 +139,8 @@ async fn create_inspect_resize_and_delete_volume() {
     assert_eq!(info.virtual_bytes, 64 * MIB);
     assert!(info.allocated_bytes < info.virtual_bytes, "{info:?}");
     assert!(qemu_io(&path, RAW, "write -P 0xab 0 1M"));
-    let (location, _) = opl_driver::disk_location(&pool, Path::new(MNT), id, RAW).unwrap();
-    assert_eq!(location, path);
+    let location = opl_driver::disk_location(&pool, Path::new(MNT), id, RAW).unwrap();
+    assert_eq!(location, DiskLocation::Path(path.clone(), DiskKind::Block));
     storage.activate_volume(&pool, id, RAW).await.unwrap();
 
     let capacity = storage.capacity(&pool).await.unwrap();
