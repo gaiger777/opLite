@@ -3,7 +3,7 @@ import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
-import { api, call } from "@/api/client";
+import { api, ApiError, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { StoragePool } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
@@ -18,6 +18,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -26,12 +27,14 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { codeMessage } from "@/i18n/errors";
 import { formatBytes } from "@/lib/format";
 import {
   cephNameError,
   cephUserError,
   iscsiPortalError,
   iscsiTargetError,
+  isShared,
   lvmNameError,
   nfsExportError,
   nfsOptionsError,
@@ -53,6 +56,9 @@ export function PoolsPage() {
   const nodes = useList("node");
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<StoragePool | null>(null);
+  // 공유 여부를 바꿀 디렉터리 풀과 바꿀 값. 닫히는 동안에도 남겨 두어 대화상자의 글이 바뀌지 않게 한다.
+  const [sharing, setSharing] = useState<{ pool: StoragePool; shared: boolean } | null>(null);
+  const [sharingOpen, setSharingOpen] = useState(false);
   const write = can(me.role, "write", "storage-pool");
 
   const nodeList = useMemo(() => nodes.data ?? [], [nodes.data]);
@@ -79,6 +85,7 @@ export function PoolsPage() {
             <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("pools.kind")}</TableHead>
             <TableHead>{t("pools.location")}</TableHead>
+            <TableHead>{t("pools.sharing")}</TableHead>
             <TableHead>{t("pools.nodes")}</TableHead>
             <TableHead>{t("pools.free")}</TableHead>
             <TableHead>{t("pools.volumes")}</TableHead>
@@ -91,7 +98,7 @@ export function PoolsPage() {
         </TableHeader>
         <TableBody>
           {(pools.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 7 : 6} query={pools} empty={t("pools.empty")} />
+            <TableMessage colSpan={write ? 8 : 7} query={pools} empty={t("pools.empty")} />
           )}
           {(pools.data ?? []).map((pool) => {
             const capacity = poolCapacity(pool, nodeList);
@@ -101,6 +108,23 @@ export function PoolsPage() {
                 <TableCell className="font-medium">{pool.name}</TableCell>
                 <TableCell>{t(`pools.kinds.${pool.spec.backend.kind}`)}</TableCell>
                 <TableCell className="font-mono text-xs">{poolLocation(pool)}</TableCell>
+                <TableCell>
+                  {/* 디렉터리 풀만 바꿀 수 있다. 다른 풀은 종류가 정한다(NFS·RBD·공유 LVM은 늘 공유). */}
+                  {write && pool.spec.backend.kind === "dir" ? (
+                    <Switch
+                      aria-label={t("pools.sharedNamed", { name: pool.name })}
+                      checked={isShared(pool)}
+                      onCheckedChange={(shared) => {
+                        setSharing({ pool, shared });
+                        setSharingOpen(true);
+                      }}
+                    />
+                  ) : isShared(pool) ? (
+                    t("pools.sharedState")
+                  ) : (
+                    t("pools.localState")
+                  )}
+                </TableCell>
                 <TableCell>
                   {/* 노드를 정하지 않은 풀은 모든 노드에서 쓴다. */}
                   {(pool.spec.nodes ?? []).length === 0 && (
@@ -147,6 +171,36 @@ export function PoolsPage() {
         </TableBody>
       </Table>
       {creating && <CreatePoolDialog onClose={() => setCreating(false)} />}
+      <ConfirmDialog
+        open={sharingOpen}
+        onOpenChange={setSharingOpen}
+        title={t(sharing?.shared ? "pools.makeSharedTitle" : "pools.makeLocalTitle", {
+          name: sharing?.pool.name,
+        })}
+        description={
+          sharing?.shared
+            ? t("pools.makeSharedDescription", { path: sharing ? poolLocation(sharing.pool) : "" })
+            : t("pools.makeLocalDescription")
+        }
+        confirmLabel={t(sharing?.shared ? "pools.makeShared" : "pools.makeLocal")}
+        onConfirm={async () => {
+          const { pool, shared } = sharing!;
+          try {
+            await call(
+              api.PATCH("/storage-pools/{key}", {
+                params: { path: { key: pool.id } },
+                body: { shared },
+              }),
+            );
+          } catch (err) {
+            // pool_in_use는 지우기와 뜻이 달라 이 동작의 문구로 보인다.
+            throw err instanceof ApiError
+              ? new Error(codeMessage(t, err.code, err.message, "pools.sharingErrors"))
+              : err;
+          }
+          toast.success(t(shared ? "pools.madeShared" : "pools.madeLocal", { name: pool.name }));
+        }}
+      />
       <ConfirmDialog
         open={deleting !== null}
         onOpenChange={(open) => !open && setDeleting(null)}

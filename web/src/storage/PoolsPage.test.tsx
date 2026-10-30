@@ -117,11 +117,11 @@ it("shows each node's pool state and space", async () => {
   expect(row).toHaveTextContent("node-c: No status reported yet");
   expect(row).toHaveTextContent("node-d: Offline");
   // 공유 풀은 첫 준비된 노드의 값 하나다.
-  const space = within(row).getAllByRole("cell")[4];
+  const space = within(row).getAllByRole("cell")[5];
   expect(space).toHaveTextContent(/^64 GiB \/ 128 GiB$/);
   // 로컬 풀은 준비된 노드마다 값을 보인다.
   const local = within(table).getByText("local").closest("tr")!;
-  expect(within(local).getAllByRole("cell")[4]).toHaveTextContent(
+  expect(within(local).getAllByRole("cell")[5]).toHaveTextContent(
     "node-a: 1 GiB / 128 GiBnode-b: 2 GiB / 128 GiB",
   );
 });
@@ -690,4 +690,77 @@ it("hides changes from operators", async () => {
   expect(await screen.findByText("local")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Delete local" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+  expect(screen.getByText("local").closest("tr")).toHaveTextContent("Node-local");
+});
+
+it("makes a directory pool shared after confirming", async () => {
+  const local = pool("local");
+  mockLists({ "storage-pool": [local] });
+  let body: unknown;
+  server.use(
+    http.patch(apiUrl(`/storage-pools/${local.id}`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("local", { shared: true }));
+    }),
+  );
+  renderPage(<PoolsPage />);
+  const toggle = await screen.findByRole("switch", { name: "Shared storage: local" });
+  expect(toggle).not.toBeChecked();
+  await userEvent.click(toggle);
+  const dialog = await screen.findByRole("alertdialog", {
+    name: "Make local shared storage?",
+  });
+  expect(dialog).toHaveTextContent("/srv/local");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Make shared" }));
+  expect(await screen.findByText("local is now shared storage.")).toBeInTheDocument();
+  expect(body).toEqual({ shared: true });
+});
+
+it("shows why a shared pool cannot become node-local", async () => {
+  const local = pool("local", { shared: true });
+  mockLists({ "storage-pool": [local] });
+  let body: unknown;
+  server.use(
+    http.patch(apiUrl(`/storage-pools/${local.id}`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(
+        { code: "pool_in_use", message: 'VM "web" is on a different node' },
+        { status: 409 },
+      );
+    }),
+  );
+  renderPage(<PoolsPage />);
+  const toggle = await screen.findByRole("switch", { name: "Shared storage: local" });
+  expect(toggle).toBeChecked();
+  await userEvent.click(toggle);
+  const dialog = await screen.findByRole("alertdialog", { name: "Make local node-local?" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Make node-local" }));
+  // 지우기의 pool_in_use 문구(볼륨이 남음)가 아니라 이 동작의 문구와 서버가 준 VM 이름
+  const alert = await within(dialog).findByRole("alert");
+  expect(alert).toHaveTextContent(
+    'A VM uses this pool\'s volumes away from the node that created them, or is migrating: VM "web" is on a different node',
+  );
+  expect(dialog).toBeVisible();
+  expect(body).toEqual({ shared: false });
+});
+
+// 디렉터리 풀만 공유 여부를 바꿀 수 있다. 다른 풀과 바꿀 수 없는 사용자에게는 글로만 보인다.
+it("shows the sharing of other pools without a switch", async () => {
+  mockLists({
+    "storage-pool": [
+      pool("local"),
+      pool("nas", { backend: { kind: "nfs", server: "nas", export: "/srv/vm" } }),
+      pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } }),
+    ],
+  });
+  renderPage(<PoolsPage />);
+  const table = await screen.findByRole("table", { name: "Storage pools" });
+  const nas = (await within(table).findByText("nas")).closest("tr")!;
+  expect(nas).toHaveTextContent("Shared");
+  expect(within(nas).queryByRole("switch")).not.toBeInTheDocument();
+  const fast = within(table).getByText("fast").closest("tr")!;
+  expect(fast).toHaveTextContent("Node-local");
+  expect(within(fast).queryByRole("switch")).not.toBeInTheDocument();
+  expect(within(table).getAllByRole("switch")).toHaveLength(1);
 });

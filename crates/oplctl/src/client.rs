@@ -97,6 +97,11 @@ impl Client {
         self.send(self.request(Method::PUT, path).json(body)).await
     }
 
+    pub async fn patch(&self, path: &str, body: &Value) -> anyhow::Result<Value> {
+        self.send(self.request(Method::PATCH, path).json(body))
+            .await
+    }
+
     pub async fn delete(&self, path: &str) -> anyhow::Result<Value> {
         self.send(self.request(Method::DELETE, path)).await
     }

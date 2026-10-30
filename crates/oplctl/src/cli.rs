@@ -153,9 +153,36 @@ enum PoolCmd {
     },
     /// 로컬 디렉터리 풀, NFS 풀, LVM-thin 풀, ZFS 풀, Ceph RBD 풀, 공유 LVM 풀을 만든다.
     Create(Box<PoolCreate>),
+    /// 디렉터리 풀을 공유 스토리지로 표시하거나 노드 로컬로 되돌린다.
+    Set(PoolSet),
     Delete {
         pool: String,
     },
+}
+
+#[derive(Args)]
+struct PoolSet {
+    pool: String,
+    #[command(flatten)]
+    sharing: Sharing,
+}
+
+/// `pool set`의 공유 여부. 둘 중 하나를 꼭 준다.
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct Sharing {
+    /// 모든 노드가 이 경로에서 같은 파일을 보는 공유 스토리지다.
+    #[arg(long)]
+    shared: bool,
+    /// 노드 로컬 풀로 되돌린다. 볼륨은 만든 노드에 있는 것으로 돌아간다(그 볼륨을 다른 노드에서
+    /// 쓰는 VM이나 마이그레이션 중인 VM이 있으면 거절한다).
+    #[arg(long)]
+    no_shared: bool,
+}
+
+/// `pool set`의 요청 본문(`PATCH /storage-pools/{key}`)
+fn pool_set_body(sharing: &Sharing) -> Value {
+    json!({ "shared": sharing.shared })
 }
 
 #[derive(Args)]
@@ -791,6 +818,17 @@ where
                     .post("/storage-pools", &pool_create_body(*args))
                     .await?;
                 writeln!(out, "storage pool {name} created")?;
+            }
+            PoolCmd::Set(PoolSet { pool, sharing }) => {
+                client
+                    .patch(&format!("/storage-pools/{pool}"), &pool_set_body(&sharing))
+                    .await?;
+                let state = if sharing.shared {
+                    "shared"
+                } else {
+                    "node-local"
+                };
+                writeln!(out, "storage pool {pool}: {state}")?;
             }
             PoolCmd::Delete { pool } => {
                 client.delete(&format!("/storage-pools/{pool}")).await?;
@@ -2154,6 +2192,31 @@ mod tests {
              \x20  orphan                    2026-10-26 07:38 UTC  true    false\n\
              \x20  └─ new                    pending               false   false\n"
         );
+    }
+
+    #[test]
+    fn parses_pool_set() {
+        let set = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "pool", "set", "nas"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Pool {
+                    cmd: PoolCmd::Set(s),
+                } => (s.pool, pool_set_body(&s.sharing)),
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(
+            set(&["--shared"]).unwrap(),
+            ("nas".into(), json!({ "shared": true }))
+        );
+        assert_eq!(
+            set(&["--no-shared"]).unwrap(),
+            ("nas".into(), json!({ "shared": false }))
+        );
+        // 둘 중 하나만, 꼭 하나
+        assert!(set(&[]).is_err());
+        assert!(set(&["--shared", "--no-shared"]).is_err());
     }
 
     #[test]
