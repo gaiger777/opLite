@@ -40,6 +40,9 @@ web-it = ["qemu-it", "web-ui"]
 # 한 호스트의 opld 둘로 실행 중인 VM을 공유 풀 위에서 옮기는 라이브 마이그레이션 E2E. qemu-it의 준비물과
 # qemu-img, qemu-io가 필요하다. nfs-it·rbd-it·lvm-shared-it와 함께 켜면 그 풀로도 옮긴다(그 시험의 준비물).
 migration-it = []
+# 한 호스트의 opld 둘(프로세스 펜싱)과 위트니스로 죽은 노드의 HA VM을 리더가 다른 노드에서 켜는지 보는
+# E2E. qemu-it의 준비물과 qemu-img가 필요하다.
+ha-it = []
 
 [dependencies]
 anyhow.workspace = true
