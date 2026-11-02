@@ -563,6 +563,103 @@ oplctl cluster status                            # WITNESS 열이 true, 경고 �
   위트니스의 `ADDRESS`(`node list`·`cluster status`)는 설정의 API 주소(`address:listen 포트`)이지만 위트니스는
   그 포트를 열지 않는다.
 
+## HA VM과 자기 펜싱
+
+HA VM은 노드가 클러스터 과반수와 끊기면 그 노드가 스스로 끈다(자기 펜싱, Proxmox HA의 watchdog 펜싱과 같은
+자리). 노드는 리더에게 몇 초마다 **리스**를 갱신하고, 마지막으로 성공한 갱신 뒤 `fence_after_secs`가 지나면 그
+노드의 HA VM을 강제로 끈다. opld 자신이 멈추거나 멈춰 서도 끄도록 Linux watchdog 장치를 쥐고 있다가, 리스를 잃은
+채 HA VM이 돌면 쓰다듬기를 멈춰 노드를 재시작시킨다. **죽은 노드의 HA VM을 다른 노드에서 다시 켜는 복구는 계획
+24에서 더한다.** 지금은 펜싱된 HA VM이 그 노드에 남아 있다가 리스가 돌아오면 그 노드에서 다시 켜진다.
+
+```bash
+oplctl vm create web --memory 1024 --disk root --ha --restart on-failure --start
+oplctl vm set web --no-ha            # 끄기(--ha로 다시 켠다). 실행 중이어도 바꿀 수 있다.
+oplctl vm list                       # HA 열(true/false)
+oplctl node list                     # FENCING 열: watchdog · process · -(꺼짐)
+oplctl cluster status                # 멤버마다 FENCING 열
+```
+
+웹은 VM 만들기·편집의 "고가용성(HA)" 스위치(그 노드의 펜싱이 꺼져 있으면 이유와 함께 막는다), VM 목록·상세의
+HA 배지, 노드·클러스터·대시보드 노드 표의 "펜싱" 열이다. API는 VM `spec.ha`(생성·`PUT /api/v1/vms/{key}`),
+Node `status.ha`(`{"fencing": "watchdog"|"process", "recover_after_secs": …}`, 펜싱이 꺼져 있으면 없다),
+`GET /api/v1/cluster`의 멤버 `fencing`(꺼져 있으면 null)이다. 같은 노드에서의 크래시 재시작은 지금처럼
+`restart`가 정하므로 HA VM에는 `on-failure`를 권한다.
+
+```toml
+# /etc/opl/opld.toml (노드마다, 생략하면 아래 기본값)
+[ha]
+fencing = "watchdog"              # watchdog | process | off (기본: Linux watchdog, macOS off)
+watchdog_device = "/dev/watchdog" # Linux watchdog 장치(하드웨어 또는 softdog)
+watchdog_timeout_secs = 30        # 장치에 정하는 제한 시간(5~3600초, WDIOC_SETTIMEOUT)
+fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나면 HA VM을 끈다(1초 이상)
+```
+
+- **펜싱 방식.** `watchdog`: opld가 HA VM을 끄고, opld가 멈추면 watchdog가 노드를 재시작한다(운영용). `process`:
+  opld가 끄는 것만 한다 — opld가 죽거나 멈추면 아무것도 끄지 않으므로 **시험·개발용**이다(macOS 노드도 쓸 수 있다).
+  `off`: 이 노드는 HA VM을 돌리지 않는다. Linux가 아니면 `watchdog`는 설정 오류다. 위트니스는 `[ha]`를 쓰지 않는다.
+- **HA 가능 노드.** 위트니스가 아니고 펜싱이 켜진 노드만 HA VM을 돌린다. HA VM의 노드(`--node`, 편집)나
+  마이그레이션 대상이 펜싱이 꺼진 노드면 **409** `ha_unsupported`, 노드를 정하지 않은 HA VM은 스케줄러가 HA 가능
+  노드만 고른다(없으면 **409** `no_node`). 노드는 등록할 때마다 `[ha]`를 `status.ha`에 쓴다. `recover_after_secs`는
+  `fence_after_secs + watchdog_timeout_secs(watchdog일 때) + 5`(기본 65초)로, 계획 24의 리더가 이만큼 기다린 뒤 옮긴다.
+- **리스.** 갱신 간격은 `fence_after_secs`의 10분의 1(0.2초 이상 2초 이하, 기본 2초)이다. 리더는 아직 과반수의
+  리더인지 확인한 뒤에만 갱신을 받아 준다. 그래서 과반수와 끊긴 노드는 물론, 고립된 리더 자신도 갱신하지 못한다.
+  리스는 opld가 시작한 때부터 센다(다시 시작한 직후 곧바로 끄지 않는다).
+- **리스를 잃으면.** `fence_after_secs`가 지나면 그 노드의 HA VM을 강제로 끈다(실패로 세지 않고 원하는 상태는
+  running 그대로, status "fenced: lost the cluster majority"). HA 아닌 VM은 그대로 돈다. 리스가 돌아오면 그 노드에서
+  다시 켠다. 리스 없이는 HA VM을 켜지도, 멈춘 채 받은 마이그레이션을 이어서 실행하지도 않는다("waiting for the
+  cluster majority before starting an HA VM", 실패로 세지 않고 다시 본다). 켜기 바로 앞에서 리스와 VM을 다시 보아,
+  그 사이 다른 노드로 배정됐거나 멈추라고 했으면 켜지 않는다. 짧은 네트워크 장애라도 `fence_after_secs`
+  보다 길면 HA VM이 꺼진다.
+- **watchdog.** 이 노드에서 HA VM을 켜거나 이미 도는 HA VM에 붙을 때 장치를 처음 열고(그 전에는 열지 않는다 —
+  HA VM이 없는 Linux 노드는 장치를 건드리지 않는다), 그 뒤로 opld가 끝날 때까지 쥔 채 1초마다 쓰다듬는다. 리스가
+  끝났는데 HA VM이 돌면 쓰다듬기를 멈춘다. opld가 제한 시간 안에 HA VM을 끄면 다시 쓰다듬으므로 노드는 재시작되지
+  않고, opld가 멈춰 끄지 못하면 노드가 재시작된다. 장치를 열지 못하면(없음, 다른 프로세스가 쥠) HA VM을 켜지 않고
+  status에 "cannot open the watchdog device: …"를 남긴다. 장치가 요청보다 긴 제한 시간을 고르거나 제한 시간을 정하지
+  못하면 HA VM에 쓰지 않는다(status "the watchdog device is unusable: …", 짧은 값을 고르면 경고만 남기고 쓴다). 그런
+  장치도 이미 열어 타이머가 돌므로 닫지 않고 쥔 채 같은 규칙으로 쓰다듬고, 정상 종료 때 magic close로 멈춘다.
+- **opld를 멈추면 노드가 재시작될 수 있다.** 정상 종료(SIGTERM) 때 이 노드에 도는 HA VM이 없으면 watchdog를 멈추고
+  닫는다(magic close). **도는 HA VM이 있으면 그대로 둔다**(경고 "HA VMs are running; leaving the watchdog armed …") —
+  QEMU는 opld 없이도 계속 돌므로, opld가 `watchdog_timeout_secs` 안에 다시 떠 리스를 갱신하지 못하면 노드가
+  재시작된다. 업그레이드·점검으로 opld를 오래 멈출 때는 먼저 HA VM을 끄거나 다른 노드로 옮기거나 `vm set --no-ha`를
+  한다. 펜싱을 `off`로 바꿔 다시 띄운 노드의 이미 도는 HA VM은 끄지 않고 status에 "HA is not available on this
+  node"만 남긴다(멈춘 HA VM은 켜지 않는다).
+- **watchdog 준비(Linux).** 하드웨어 watchdog(`iTCO_wdt`, IPMI 등)가 없으면 `softdog`를 올린다:
+  `echo softdog | sudo tee /etc/modules-load.d/softdog.conf && sudo modprobe softdog`.
+  `ls /sys/class/watchdog/`와 `cat /sys/class/watchdog/watchdog0/identity`로 장치를 확인한다. watchdog 장치는 한
+  프로세스만 열 수 있다. **공유 LVM 풀의 sanlock `wdmd`가 이미 쥔 장치는 쓸 수 없으므로** 그 노드에는 다른 장치(예:
+  하드웨어 watchdog를 `watchdog_device = "/dev/watchdog1"`로)가 있어야 한다. softdog는 장치를 하나만 만든다.
+  **`nowayout` 장치는 쓰지 않는다** — magic close가 듣지 않아 HA VM이 없어도 opld를 멈추면 노드가 재시작된다
+  (`cat /sys/class/watchdog/watchdog0/nowayout`이 0이어야 한다. 커널 `CONFIG_WATCHDOG_NOWAYOUT`이나 softdog의
+  `nowayout=1`이면 1이다).
+- **한계.** 라이브 마이그레이션이 진행 중인(보류 중인) HA VM은 리스를 잃어도 마이그레이션이 끝나거나 풀릴 때까지
+  끄지 않는다(`process`에서는 긴 마이그레이션이 `fence_after_secs`를 넘길 수 있다. `watchdog`면 쓰다듬기를 멈추므로
+  노드가 재시작된다). 실패한 마이그레이션이 원본을 멈춘(`paused`) 채로 남기면 HA VM은 이어서 실행되지 않는다(드묾 —
+  끄고 다시 켠다).
+
+**수동 watchdog 시험(Linux, root, 직접 할 때만 — 자동 시험·CI는 진짜 watchdog를 쓰지 않는다).** 버려도 되는 시험
+노드에서 한다. `soft_noboot=1`이면 softdog는 제한 시간이 지나도 재시작하지 않고 커널 로그에
+"softdog: Triggered - Reboot ignored"만 남긴다. 다른 프로세스(`wdmd` 등)가 watchdog를 쓰지 않는지 먼저 본다.
+
+```bash
+sudo modprobe -r softdog; sudo modprobe softdog soft_noboot=1   # 이미 올라와 있으면 내렸다가 다시
+cat /sys/class/watchdog/watchdog0/identity                      # Software Watchdog
+# opld.toml: [ha] fencing = "watchdog", watchdog_timeout_secs = 10, fence_after_secs = 10
+sudo opld --config /etc/opl/opld.toml &
+oplctl vm create hatest --memory 256 --ha --start
+cat /sys/class/watchdog/watchdog0/state                         # active (opld가 열었다)
+# 1) opld가 멈춰 서면: 쓰다듬기가 멈춰 약 10초 뒤 "Triggered - Reboot ignored"
+sudo kill -STOP "$(pidof opld)"; sleep 15; sudo dmesg | grep softdog; sudo kill -CONT "$(pidof opld)"
+# 2) HA VM이 돌 때 정상 종료: 경고 로그와 "watchdog did not stop!", 약 10초 뒤 Triggered
+sudo kill -TERM "$(pidof opld)"; sleep 15; sudo dmesg | tail
+# 3) HA VM이 없을 때 정상 종료: magic close로 state가 inactive, Triggered가 없다
+sudo opld --config /etc/opl/opld.toml &                         # 다시 띄우면 도는 hatest에 붙어 장치를 다시 연다
+oplctl vm stop hatest; oplctl vm list                           # PHASE stopped를 확인한 뒤
+sudo kill -TERM "$(pidof opld)"; sleep 15; cat /sys/class/watchdog/watchdog0/state
+# 4) (셋 이상의 클러스터) 이 노드와 다른 멤버 사이의 cluster_listen(8007)을 막으면 약 10초 뒤 HA VM이
+#    "fenced: lost the cluster majority"로 꺼지고 Triggered는 없다. 풀면 리스가 돌아와 다시 켜진다.
+sudo modprobe -r softdog                                        # 끝나면
+```
+
 ## 웹 UI
 
 opld를 `web-ui` 기능으로 빌드하면 API와 같은 주소(`https://<노드>:8006/`)에서 웹 UI가 열린다.
