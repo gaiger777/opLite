@@ -48,6 +48,7 @@ pub fn config(node: Uuid) -> ReconcilerConfig {
             window: Duration::from_secs(60),
         },
         firmware: None,
+        ha: None,
     }
 }
 

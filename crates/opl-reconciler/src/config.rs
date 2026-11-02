@@ -5,6 +5,7 @@ use std::time::Duration;
 use opl_driver::Storage;
 
 use crate::firmware::FirmwareFetcher;
+use crate::ha::HaGuard;
 use uuid::Uuid;
 
 /// reconciler 설정. 기본값은 설계 문서 5.3절을 따른다.
@@ -26,6 +27,8 @@ pub struct ReconcilerConfig {
     pub restart: RestartBackoff,
     /// 다른 노드에 있는 UEFI 변수 파일을 받아 온다. 없으면 받지 않고 이 노드의 파일로 켠다.
     pub firmware: Option<Arc<dyn FirmwareFetcher>>,
+    /// 이 노드의 HA 리스와 watchdog. None이면 펜싱이 꺼져 있어 HA VM을 켜지 않는다.
+    pub ha: Option<Arc<HaGuard>>,
 }
 
 /// 크래시나 일시적 기동 실패 뒤 다시 시작하는 규칙.
@@ -54,6 +57,7 @@ impl ReconcilerConfig {
                 window: Duration::from_secs(600),
             },
             firmware: None,
+            ha: None,
         }
     }
 }

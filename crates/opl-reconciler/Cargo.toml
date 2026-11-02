@@ -16,6 +16,7 @@ async-trait.workspace = true
 opl-cluster.workspace = true
 opl-driver.workspace = true
 opl-types.workspace = true
+rustix.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -26,3 +27,4 @@ openraft.workspace = true
 opl-qemu.workspace = true
 redb.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

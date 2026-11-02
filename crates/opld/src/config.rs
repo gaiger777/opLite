@@ -1,10 +1,13 @@
 use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use opl_api::{ClusterJanitorConfig, SnapshotSchedulerConfig};
 use opl_qemu::{Accel, HostProfile, kvm_available};
+use opl_reconciler::HaConfig;
+use opl_reconciler::ha::{DeviceWatchdog, WatchdogOpener};
 use opl_types::node::{Fencing, NodeHa};
 use serde::Deserialize;
 
@@ -318,8 +321,6 @@ impl HaSection {
     }
 }
 
-// 노드의 `HaGuard`를 만들 때 쓴다. 그 전까지는 시험만 쓴다.
-#[cfg_attr(not(test), expect(dead_code))]
 impl HaSection {
     pub fn fence_after(&self) -> Duration {
         Duration::from_secs(self.fence_after_secs)
@@ -328,6 +329,23 @@ impl HaSection {
     /// 리스 갱신 간격: `fence_after`의 10분의 1을 0.2초 이상 2초 이하로 자른 값
     pub fn renew_interval(&self) -> Duration {
         (self.fence_after() / 10).clamp(Duration::from_millis(200), Duration::from_secs(2))
+    }
+
+    /// 노드의 `HaGuard` 설정. 펜싱이 꺼져 있으면 None이다.
+    pub fn guard_config(&self) -> Option<HaConfig> {
+        let watchdog: Option<Arc<dyn WatchdogOpener>> = match self.fencing {
+            FencingSetting::Off => return None,
+            FencingSetting::Watchdog => Some(Arc::new(DeviceWatchdog {
+                path: self.watchdog_device.clone(),
+                timeout_secs: self.watchdog_timeout_secs,
+            })),
+            FencingSetting::Process => None,
+        };
+        Some(HaConfig {
+            fence_after: self.fence_after(),
+            renew_interval: self.renew_interval(),
+            watchdog,
+        })
     }
 }
 
@@ -936,6 +954,24 @@ mod tests {
             "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nwatchdog_timeout_secs = 0",
         );
         c.validate().unwrap();
+    }
+
+    /// 펜싱이 꺼져 있으면 guard가 없고, process는 watchdog 없이, watchdog는 장치와 함께 만든다.
+    #[test]
+    fn guard_config_follows_the_fencing() {
+        let mut ha = HaSection {
+            fencing: FencingSetting::Off,
+            fence_after_secs: 5,
+            ..HaSection::default()
+        };
+        assert!(ha.guard_config().is_none());
+        ha.fencing = FencingSetting::Process;
+        let config = ha.guard_config().unwrap();
+        assert_eq!(config.fence_after, Duration::from_secs(5));
+        assert_eq!(config.renew_interval, Duration::from_millis(500));
+        assert!(config.watchdog.is_none());
+        ha.fencing = FencingSetting::Watchdog;
+        assert!(ha.guard_config().unwrap().watchdog.is_some());
     }
 
     #[test]

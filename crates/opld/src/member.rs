@@ -25,7 +25,7 @@ use opl_driver::{
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{TlsListener, api_server_config};
 use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers};
-use opl_reconciler::{FirmwareFetcher, Reconciler, ReconcilerConfig};
+use opl_reconciler::{FirmwareFetcher, HaGuard, Reconciler, ReconcilerConfig};
 use opl_types::node::NodeSpec;
 use opl_types::vm::VmSpec;
 use tokio::net::TcpListener;
@@ -114,6 +114,8 @@ struct Services {
     schedule: SnapshotScheduler,
     janitor: ClusterJanitor,
     pools: PoolMounter,
+    /// HA 리스와 watchdog(`[ha] fencing = "off"`면 없다)
+    ha: Option<Arc<HaGuard>>,
 }
 
 impl Services {
@@ -131,6 +133,10 @@ impl Services {
         self.pools.shutdown().await;
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
+        // 작업자가 모두 멈춘 뒤에 닫아야 도는 HA VM 목록이 맞다.
+        if let Some(ha) = &self.ha {
+            ha.close();
+        }
     }
 }
 
@@ -348,6 +354,12 @@ impl Member {
             uefi_vars_template,
         ));
         reconciler_config.firmware = Some(firmware.clone());
+        // 펜싱이 켜져 있으면 지금부터 리스를 갱신한다(지금이 stale을 세는 기준점이다).
+        let ha = config
+            .ha
+            .guard_config()
+            .map(|ha| HaGuard::spawn(cluster.clone(), ha));
+        reconciler_config.ha = ha.clone();
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
         let pools = PoolMounter::spawn(
             cluster.clone(),
@@ -415,6 +427,7 @@ impl Member {
                 schedule,
                 janitor,
                 pools,
+                ha,
             }),
             register,
             promotion,
