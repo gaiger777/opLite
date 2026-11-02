@@ -4,10 +4,12 @@ import type { Node } from "@/api/types";
 import { Field } from "@/components/Field";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import { defaultMachine, type VmFormValues } from "@/vms/form";
+import { Switch } from "@/components/ui/switch";
+import { defaultMachine, haUnavailable, type VmFormValues } from "@/vms/form";
 
-/** 이름·CPU·메모리·펌웨어·머신·노드·재시작 정책 */
+/** 이름·CPU·메모리·펌웨어·머신·노드·재시작 정책·HA */
 export function GeneralSection({
   values,
   errors,
@@ -31,6 +33,7 @@ export function GeneralSection({
   onMachineChosen: () => void;
 }) {
   const { t } = useTranslation();
+  const noHa = haUnavailable(nodes, values.node);
   return (
     <Card>
       <CardHeader>
@@ -148,6 +151,27 @@ export function GeneralSection({
             </NativeSelectOption>
           </NativeSelect>
         </Field>
+        <div className="flex flex-col gap-1.5 sm:col-span-2">
+          <div className="flex items-center gap-2">
+            {/* 켤 수 없는 노드여도 이미 켜진 HA는 끌 수 있다(실행 중이어도 바꿀 수 있다). */}
+            <Switch
+              id="vm-ha"
+              aria-describedby="vm-ha-hint"
+              disabled={noHa !== null && !values.ha}
+              checked={values.ha}
+              onCheckedChange={(ha) => onChange({ ha })}
+            />
+            <Label htmlFor="vm-ha">{t("vmForm.ha")}</Label>
+          </div>
+          <p id="vm-ha-hint" className="text-xs text-muted-foreground">
+            {t("vmForm.haHint")}
+          </p>
+          {noHa && (
+            <p className={values.ha ? "text-sm text-destructive" : "text-sm text-muted-foreground"}>
+              {t(noHa.key, noHa.values)}
+            </p>
+          )}
+        </div>
       </CardContent>
     </Card>
   );

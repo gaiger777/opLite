@@ -71,6 +71,25 @@ it("marks witness nodes", async () => {
   expect(within(a).queryByText("Witness")).not.toBeInTheDocument();
 });
 
+it("shows how each node fences", async () => {
+  cluster();
+  const fenced = {
+    ...NODE,
+    status: { ...NODE.status, ha: { fencing: "watchdog" as const, recover_after_secs: 65 } },
+  };
+  mockLists({ node: [fenced, DOWN] });
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const a = (await within(table).findByText("node-a")).closest("tr")!;
+  const column = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Fencing");
+  expect(within(a).getAllByRole("cell")[column]).toHaveTextContent("Watchdog");
+  // 펜싱이 꺼진 노드는 `ha`가 없다.
+  const b = within(table).getByText("node-b").closest("tr")!;
+  expect(within(b).getAllByRole("cell")[column]).toHaveTextContent("—");
+});
+
 it("shows the state of each pool on the node", async () => {
   cluster();
   const pools = {

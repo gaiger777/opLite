@@ -486,3 +486,74 @@ it("makes new volumes in LVM-thin pools raw and warns about mixed snapshot metho
     spec: { pool: "fast", size_bytes: 16 * 1024 ** 3, format: "raw" },
   });
 });
+
+const FENCED = {
+  ...NODE,
+  status: { ...NODE.status, ha: { fencing: "watchdog" as const, recover_after_secs: 65 } },
+};
+const UNFENCED = { ...NODE, id: "n2", name: "node-b" };
+
+it("turns HA on only for nodes with fencing on and says why not", async () => {
+  mockLists({ node: [FENCED, UNFENCED] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/vms"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({ code: "ha_unsupported", message: "node is off" }, { status: 409 });
+    }),
+  );
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  const ha = screen.getByRole("switch", { name: "High availability (HA)" });
+  // 자동이면 HA 가능 노드가 하나라도 있으면 켤 수 있다.
+  expect(ha).toBeEnabled();
+  await user.selectOptions(screen.getByLabelText("Node"), "node-b");
+  expect(ha).toBeDisabled();
+  expect(screen.getByText("node-b has fencing off and cannot run HA VMs.")).toBeInTheDocument();
+  await user.selectOptions(screen.getByLabelText("Node"), "node-a");
+  expect(ha).toBeEnabled();
+  expect(screen.queryByText(/has fencing off/)).not.toBeInTheDocument();
+  await user.click(ha);
+  expect(ha).toBeChecked();
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  // 서버가 거부하면 번역한 이유를 보인다.
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "The node has fencing off and cannot run HA VMs.",
+  );
+  expect(body).toMatchObject({ name: "web", spec: { node: "n1", ha: true } });
+});
+
+it("says when no node can run HA VMs but lets an HA VM turn HA off", async () => {
+  const app = vm("app", "running", {
+    spec: { ...vm("app", "running").spec, node: "n2", ha: true },
+  });
+  mockLists({ vm: [app], node: [UNFENCED] });
+  let body: { spec: { ha: boolean } } | undefined;
+  server.use(
+    http.put(apiUrl(`/vms/${app.id}`), async ({ request }) => {
+      body = (await request.json()) as typeof body;
+      return HttpResponse.json(app);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });
+  const user = userEvent.setup();
+  const ha = await screen.findByRole("switch", { name: "High availability (HA)" });
+  // 실행 중이어도 HA는 바꿀 수 있고, 켜진 HA는 끌 수 있다.
+  expect(ha).toBeChecked();
+  expect(ha).toBeEnabled();
+  expect(
+    await screen.findByText("node-b has fencing off and cannot run HA VMs."),
+  ).toBeInTheDocument();
+  await user.click(ha);
+  expect(ha).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(body?.spec.ha).toBe(false));
+});
+
+it("says when no node has fencing on", async () => {
+  mockLists({ node: [UNFENCED] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  expect(await screen.findByRole("switch", { name: "High availability (HA)" })).toBeDisabled();
+  expect(screen.getByText("No node has fencing on, so HA VMs cannot run.")).toBeInTheDocument();
+});

@@ -450,6 +450,8 @@ enum VmCmd {
         vm: String,
     },
     Create(Box<VmCreate>),
+    /// VM 설정을 바꾼다. 실행 중이어도 된다.
+    Set(VmSet),
     Start {
         vm: String,
     },
@@ -529,6 +531,21 @@ struct VmCreate {
     /// 만든 뒤 바로 시작하고 실행될 때까지 기다린다.
     #[arg(long)]
     start: bool,
+    /// HA VM: 노드가 펜싱되면 다른 노드에서 켠다. 펜싱이 켜진 노드에서만 돈다.
+    #[arg(long)]
+    ha: bool,
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("change").required(true).args(["ha", "no_ha"])))]
+struct VmSet {
+    vm: String,
+    /// HA VM으로 만든다. VM의 노드가 펜싱이 켜진 노드여야 한다.
+    #[arg(long)]
+    ha: bool,
+    /// HA를 끈다.
+    #[arg(long)]
+    no_ha: bool,
 }
 
 #[derive(Subcommand)]
@@ -1107,7 +1124,7 @@ async fn vm(
                 out,
                 json_out,
                 &list,
-                &["NAME", "POWER", "PHASE", "NODE", "PID", "ERROR"],
+                &["NAME", "POWER", "PHASE", "NODE", "HA", "PID", "ERROR"],
                 vm_row,
             )?;
         }
@@ -1151,6 +1168,7 @@ async fn vm(
                     "nics": nics,
                     "restart": value_name(args.restart),
                     "node": node,
+                    "ha": args.ha,
                 }
             });
             client.post("/vms", &body).await?;
@@ -1158,6 +1176,11 @@ async fn vm(
             if args.start {
                 act(client, &args.name, "start", out).await?;
             }
+        }
+        VmCmd::Set(args) => {
+            put_spec_field(client, &args.vm, "ha", json!(args.ha)).await?;
+            let state = if args.ha { "on" } else { "off" };
+            writeln!(out, "vm {}: HA {state}", args.vm)?;
         }
         VmCmd::Start { vm } => act(client, &vm, "start", out).await?,
         VmCmd::Stop { vm, force } => {
@@ -1250,6 +1273,8 @@ fn vm_row(v: &Value) -> Vec<String> {
         cell(&v["spec"]["power"]),
         cell(&v["status"]["phase"]),
         node,
+        // 옛 서버는 보내지 않는다 — HA VM이 아니다.
+        (v["spec"]["ha"] == true).to_string(),
         cell(&v["status"]["pid"]),
         cell(&v["status"]["last_error"]),
     ]
@@ -1375,17 +1400,33 @@ async fn schedule(
     Ok(())
 }
 
-/// VM `vm`의 예약을 `schedule`로 바꾼다(`None`이면 끈다). VM을 읽어 그 revision으로(`If-Match`)
-/// spec 전체를 다시 쓴다.
+/// VM `vm`의 예약을 `schedule`로 바꾼다(`None`이면 끈다).
 async fn put_schedule(client: &Client, vm: &str, schedule: Option<Value>) -> anyhow::Result<()> {
+    put_spec_field(
+        client,
+        vm,
+        "snapshot_schedule",
+        schedule.unwrap_or(Value::Null),
+    )
+    .await
+}
+
+/// VM `vm`의 spec 필드 `field`를 `value`로 바꾼다. VM을 읽어 그 revision으로(`If-Match`)
+/// spec 전체를 다시 쓴다.
+async fn put_spec_field(
+    client: &Client,
+    vm: &str,
+    field: &str,
+    value: Value,
+) -> anyhow::Result<()> {
     let path = format!("/vms/{vm}");
-    let mut retries = ScheduleRetries::default();
+    let mut retries = SpecRetries::default();
     loop {
         let current = client.get(&path).await?;
         let r = client
             .request(Method::PUT, &path)
             .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
-            .json(&schedule_update(&current, schedule.clone()));
+            .json(&spec_update(&current, field, value.clone()));
         match client.send(r).await {
             Err(e) => match retries.next(&e.to_string()) {
                 Some(delay) => tokio::time::sleep(delay).await,
@@ -1401,14 +1442,14 @@ fn schedule_is_on(vm: &Value) -> bool {
     !vm["spec"]["snapshot_schedule"].is_null()
 }
 
-/// 예약 PUT을 다시 할 횟수
+/// VM 수정 PUT을 다시 할 횟수
 #[derive(Default)]
-struct ScheduleRetries {
+struct SpecRetries {
     mismatch: u32,
     busy: u32,
 }
 
-impl ScheduleRetries {
+impl SpecRetries {
     /// 오류 `error`면 얼마 뒤에 다시 할지. 읽은 뒤 status만 바뀌어도 revision이 달라지므로
     /// `revision_mismatch`는 바로 세 번까지, 스냅샷·복제 Task 중이면(`vm_busy`) 1초마다 30번까지.
     fn next(&mut self, error: &str) -> Option<std::time::Duration> {
@@ -1424,10 +1465,10 @@ impl ScheduleRetries {
     }
 }
 
-/// VM 수정 본문: 라벨과 spec은 그대로 두고 예약만 바꾼다(`None`이면 끈다).
-fn schedule_update(vm: &Value, schedule: Option<Value>) -> Value {
+/// VM 수정 본문: 라벨과 spec은 그대로 두고 spec 필드 `field`만 `value`로 바꾼다.
+fn spec_update(vm: &Value, field: &str, value: Value) -> Value {
     let mut spec = vm["spec"].clone();
-    spec["snapshot_schedule"] = schedule.unwrap_or(Value::Null);
+    spec[field] = value;
     // 라벨이 없으면 응답에 `labels`가 없다.
     let labels = vm.get("labels").cloned().unwrap_or_else(|| json!({}));
     json!({ "labels": labels, "spec": spec })
@@ -1563,6 +1604,7 @@ const NODE_HEADERS: &[&str] = &[
     "MEMORY",
     "MAINTENANCE",
     "WITNESS",
+    "FENCING",
 ];
 
 /// `node list`의 한 행
@@ -1577,6 +1619,8 @@ fn node_row(n: &Value) -> Vec<String> {
         cell(&n["spec"]["maintenance"]),
         // 옛 서버는 보내지 않는다 — 일반 노드다.
         (n["spec"]["witness"] == true).to_string(),
+        // 펜싱이 꺼진 노드(옛 서버도)는 `ha`가 없다.
+        cell(&n["status"]["ha"]["fencing"]),
     ]
 }
 
@@ -1602,13 +1646,14 @@ fn print_cluster_status(out: &mut (dyn Write + Send), view: &Value) -> anyhow::R
                 cell(&m["online"]),
                 (&m["id"] == leader).to_string(),
                 (m["witness"] == true).to_string(),
+                cell(&m["fencing"]),
             ]
         })
         .collect();
     table(
         out,
         &[
-            "NAME", "ID", "ADDRESS", "ROLE", "ONLINE", "LEADER", "WITNESS",
+            "NAME", "ID", "ADDRESS", "ROLE", "ONLINE", "LEADER", "WITNESS", "FENCING",
         ],
         &rows,
     )?;
@@ -2019,7 +2064,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_update_keeps_the_rest_of_the_vm() {
+    fn spec_update_keeps_the_rest_of_the_vm() {
         let vm = json!({
             "name": "web",
             "revision": 9,
@@ -2029,7 +2074,7 @@ mod tests {
         });
         let schedule = json!({ "every": "weekly", "keep": 2, "memory": false });
         assert_eq!(
-            schedule_update(&vm, Some(schedule.clone())),
+            spec_update(&vm, "snapshot_schedule", schedule.clone()),
             json!({
                 "labels": { "team": "a" },
                 "spec": { "memory_mib": 256, "snapshot_schedule": schedule },
@@ -2040,9 +2085,41 @@ mod tests {
         vm.as_object_mut().unwrap().remove("labels");
         vm["spec"]["snapshot_schedule"] = schedule;
         assert_eq!(
-            schedule_update(&vm, None),
+            spec_update(&vm, "snapshot_schedule", Value::Null),
             json!({ "labels": {}, "spec": { "memory_mib": 256, "snapshot_schedule": null } })
         );
+        // `vm set --ha`는 ha만 바꾼다.
+        assert_eq!(
+            spec_update(&vm, "ha", json!(true))["spec"],
+            json!({ "memory_mib": 256, "snapshot_schedule": vm["spec"]["snapshot_schedule"], "ha": true })
+        );
+    }
+
+    #[test]
+    fn parses_vm_ha_commands() {
+        let cli = Cli::try_parse_from(["oplctl", "vm", "create", "web", "--ha"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Vm { cmd: VmCmd::Create(c) } if c.ha));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "create", "web"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Vm { cmd: VmCmd::Create(c) } if !c.ha));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "set", "web", "--ha"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Set(VmSet { vm, ha: true, no_ha: false }) } if vm == "web"
+        ));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "set", "web", "--no-ha"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm {
+                cmd: VmCmd::Set(VmSet {
+                    ha: false,
+                    no_ha: true,
+                    ..
+                })
+            }
+        ));
+        // 바꿀 것이 하나는 있어야 하고, 둘을 함께 줄 수 없다.
+        assert!(Cli::try_parse_from(["oplctl", "vm", "set", "web"]).is_err());
+        assert!(Cli::try_parse_from(["oplctl", "vm", "set", "web", "--ha", "--no-ha"]).is_err());
     }
 
     #[test]
@@ -2070,7 +2147,15 @@ mod tests {
         });
         assert_eq!(
             vm_row(&vm),
-            ["web", "running", "migrating", "id-a -> id-b", "42", "-"]
+            [
+                "web",
+                "running",
+                "migrating",
+                "id-a -> id-b",
+                "false",
+                "42",
+                "-"
+            ]
         );
         // 마이그레이션이 없으면(필드 없음) 지금 노드만
         let mut vm = vm;
@@ -2078,8 +2163,11 @@ mod tests {
         vm["status"]["phase"] = json!("running");
         assert_eq!(
             vm_row(&vm),
-            ["web", "running", "running", "id-a", "42", "-"]
+            ["web", "running", "running", "id-a", "false", "42", "-"]
         );
+        // HA VM
+        vm["spec"]["ha"] = json!(true);
+        assert_eq!(vm_row(&vm)[4], "true");
     }
 
     #[test]
@@ -2094,9 +2182,9 @@ mod tests {
     }
 
     #[test]
-    fn schedule_update_retries_mismatch_and_busy() {
+    fn spec_update_retries_mismatch_and_busy() {
         use std::time::Duration;
-        let mut r = ScheduleRetries::default();
+        let mut r = SpecRetries::default();
         for _ in 0..3 {
             assert_eq!(r.next("changed (revision_mismatch)"), Some(Duration::ZERO));
         }
@@ -2110,7 +2198,7 @@ mod tests {
         }
         assert_eq!(r.next("VM web is busy (vm_busy)"), None);
         // 다른 오류는 다시 하지 않는다.
-        let mut r = ScheduleRetries::default();
+        let mut r = SpecRetries::default();
         assert_eq!(r.next("VM web not found (not_found)"), None);
     }
 
@@ -2858,7 +2946,7 @@ mod tests {
     }
 
     #[test]
-    fn node_list_shows_witnesses() {
+    fn node_list_shows_witnesses_and_fencing() {
         let node = |name: &str, witness: Option<bool>| {
             let mut spec = json!({ "address": "10.0.0.1:8006", "maintenance": false });
             if let Some(w) = witness {
@@ -2871,23 +2959,21 @@ mod tests {
                 "status": { "online": true, "cpus": 4, "memory_mib": 1024 },
             })
         };
-        let rows: Vec<_> = [
-            node("a", Some(false)),
-            node("w", Some(true)),
-            node("old", None),
-        ]
-        .iter()
-        .map(node_row)
-        .collect();
+        let mut a = node("a", Some(false));
+        a["status"]["ha"] = json!({ "fencing": "watchdog", "recover_after_secs": 65 });
+        let rows: Vec<_> = [a, node("w", Some(true)), node("old", None)]
+            .iter()
+            .map(node_row)
+            .collect();
         let mut out = Vec::new();
         table(&mut out, NODE_HEADERS, &rows).unwrap();
-        // 옛 서버는 witness를 보내지 않는다 — 일반 노드다.
+        // 옛 서버는 witness를 보내지 않는다 — 일반 노드다. 펜싱이 꺼진 노드는 `ha`가 없다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME  ID      ADDRESS        ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS\n\
-             a     id-a    10.0.0.1:8006  true    4     1.0GiB  false        false\n\
-             w     id-w    10.0.0.1:8006  true    4     1.0GiB  false        true\n\
-             old   id-old  10.0.0.1:8006  true    4     1.0GiB  false        false\n"
+            "NAME  ID      ADDRESS        ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  FENCING\n\
+             a     id-a    10.0.0.1:8006  true    4     1.0GiB  false        false    watchdog\n\
+             w     id-w    10.0.0.1:8006  true    4     1.0GiB  false        true     -\n\
+             old   id-old  10.0.0.1:8006  true    4     1.0GiB  false        false    -\n"
         );
     }
 
@@ -2916,18 +3002,19 @@ mod tests {
             print_cluster_status(&mut out, &view).unwrap();
             String::from_utf8(out).unwrap()
         };
-        // 일반 노드 둘과 위트니스면 투표 멤버가 셋이라 경고가 없다.
+        // 일반 노드 둘과 위트니스면 투표 멤버가 셋이라 경고가 없다. 펜싱이 꺼졌으면(null) 또는 옛
+        // 서버라 `fencing`이 없으면 `-`다.
+        let mut a = member("a", true, false);
+        a["fencing"] = json!("process");
+        let mut b = member("b", true, false);
+        b["fencing"] = Value::Null;
         assert_eq!(
-            status(vec![
-                member("a", true, false),
-                member("b", true, false),
-                member("w", true, true),
-            ]),
+            status(vec![a, b, member("w", true, true)]),
             "cluster: lab\nCA fingerprint: ab:cd\n\
-             NAME  ID    ADDRESS  ROLE   ONLINE  LEADER  WITNESS\n\
-             a     id-a  a:8006   voter  true    true    false\n\
-             b     id-b  b:8006   voter  true    false   false\n\
-             w     id-w  w:8006   voter  true    false   true\n"
+             NAME  ID    ADDRESS  ROLE   ONLINE  LEADER  WITNESS  FENCING\n\
+             a     id-a  a:8006   voter  true    true    false    process\n\
+             b     id-b  b:8006   voter  true    false   false    -\n\
+             w     id-w  w:8006   voter  true    false   true     -\n"
         );
         const TWO: &str = "warning: a two-node cluster";
         const HA: &str = "warning: HA needs at least two non-witness nodes";

@@ -18,6 +18,7 @@ export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm
       power: phase === "running" ? "running" : "stopped",
       restart: "never",
       node: "n1",
+      ha: false,
     },
     status: {
       phase,

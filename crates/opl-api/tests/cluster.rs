@@ -7,7 +7,7 @@ use opl_api::cluster::{JoinRequest, JoinUrl};
 use opl_cluster::types::NodeId;
 use opl_peer::pki::{fingerprint, first_cert, node_id_of, node_key_and_csr};
 use opl_types::cluster::JoinTokenSpec;
-use opl_types::node::{NodeSpec, NodeStatus};
+use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
 use reqwest::StatusCode;
 use serde_json::json;
 use uuid::Uuid;
@@ -25,6 +25,19 @@ async fn cluster_view_and_ca() {
     assert_eq!(view["members"][0]["name"], "node1");
     assert_eq!(view["members"][0]["voter"], true);
     assert_eq!(view["members"][0]["online"], true);
+    // 펜싱이 꺼진 노드는 null이다.
+    assert_eq!(view["members"][0]["fencing"], json!(null), "{view}");
+    let mut node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    node.status.ha = Some(NodeHa {
+        fencing: Fencing::Watchdog,
+        recover_after_secs: 65,
+    });
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &node.status)
+        .await
+        .unwrap();
+    let (_, view) = viewer.get("/cluster").await;
+    assert_eq!(view["members"][0]["fencing"], "watchdog", "{view}");
 
     // CA는 인증 없이 받고, 지문은 클러스터 정보와 같다.
     let anon = env.anonymous();

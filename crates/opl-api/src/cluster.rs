@@ -18,7 +18,7 @@ use opl_cluster::ClusterError;
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_peer::pki::{ClusterCa, fingerprint};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, JoinToken, JoinTokenSpec};
-use opl_types::node::{NodeSpec, NodeStatus};
+use opl_types::node::{Fencing, NodeSpec, NodeStatus};
 use opl_types::resource::{Resource, ResourceSpec};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -157,6 +157,8 @@ pub struct MemberView {
     pub online: bool,
     /// 위트니스 노드인지(VM을 돌리지 않는 투표 멤버)
     pub witness: bool,
+    /// 노드의 HA 펜싱. 펜싱이 꺼졌거나 Node가 아직 없으면 null이다.
+    pub fencing: Option<Fencing>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -191,6 +193,7 @@ pub async fn get_cluster(
             voter,
             online: node.is_some_and(|n| n.status.online),
             witness: node.is_some_and(|n| n.spec.witness),
+            fencing: node.and_then(|n| n.status.ha).map(|ha| ha.fencing),
         }
     };
     let mut list: Vec<MemberView> = members

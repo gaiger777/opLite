@@ -1243,6 +1243,7 @@ export interface components {
             address?: string | null;
             /** @description 노드 간 통신 주소 */
             cluster_address: string;
+            fencing?: components["schemas"]["Fencing"] | null;
             /** Format: uuid */
             id: string;
             /** @description Node 리소스 이름. 아직 없으면(합류 중) 비어 있다. */

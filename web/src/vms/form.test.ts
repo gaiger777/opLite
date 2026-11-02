@@ -5,6 +5,7 @@ import {
   emptyForm,
   fromVm,
   gibToBytes,
+  haUnavailable,
   toSpec,
   validate,
 } from "@/vms/form";
@@ -39,6 +40,7 @@ it("round-trips a VM through the form", () => {
       disks: [{ volume: "web-root", bus: "sata", boot_order: 1 }],
       nics: [{ network: "lan", model: "e1000e", mac: "52:54:00:12:34:56" }],
       snapshot_schedule: { every: "daily", keep: 7, memory: true },
+      ha: true,
     },
   });
   expect(toSpec(fromVm(web), "running")).toEqual(web.spec);
@@ -167,4 +169,27 @@ it("turns GiB into a whole number of bytes", () => {
   expect(validate({ ...v, disks: [{ ...v.disks[0]!, sizeGib: "1e3" }] }, true)).toEqual({
     "disks.0.size": "vmForm.errors.size",
   });
+});
+
+it("says why HA cannot be turned on for the chosen node", () => {
+  const fenced = {
+    ...NODE,
+    status: { ...NODE.status, ha: { fencing: "process" as const, recover_after_secs: 7 } },
+  };
+  const off = { ...NODE, id: "n2", name: "node-b" };
+  const witness = { ...fenced, id: "n3", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  // 노드 목록을 모르면 서버에 맡긴다.
+  expect(haUnavailable(undefined, "n2")).toBeNull();
+  expect(haUnavailable([fenced, off], "n1")).toBeNull();
+  expect(haUnavailable([fenced, off], "n2")).toEqual({
+    key: "vmForm.haNodeOff",
+    values: { node: "node-b" },
+  });
+  expect(haUnavailable([witness], "n3")).toEqual({
+    key: "vmForm.haNodeOff",
+    values: { node: "node-w" },
+  });
+  // 자동이면 HA 가능 노드가 하나라도 있으면 된다(위트니스는 세지 않는다).
+  expect(haUnavailable([fenced, off], "")).toBeNull();
+  expect(haUnavailable([off, witness], "")).toEqual({ key: "vmForm.haNoNode" });
 });

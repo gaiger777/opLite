@@ -245,3 +245,17 @@ it("keeps the same console link when the VM stops and blocks it with a reason", 
   expect(link).toHaveAccessibleDescription("The VM is stopped.");
   expect(link).toHaveFocus();
 });
+
+it("marks an HA VM", async () => {
+  mockLists({
+    vm: [web, { ...web, id: "x", name: "app", spec: { ...web.spec, ha: true } }],
+    node: [NODE],
+  });
+  const { unmount } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  expect(await screen.findByRole("heading", { name: "web" })).toBeInTheDocument();
+  expect(screen.queryByText("HA")).not.toBeInTheDocument();
+  unmount();
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/app" });
+  expect(await screen.findByRole("heading", { name: "app" })).toBeInTheDocument();
+  expect(screen.getByText("HA")).toBeInTheDocument();
+});

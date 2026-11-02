@@ -88,6 +88,7 @@ export function NodesPage() {
             <TableHead>{t("nodes.address")}</TableHead>
             <TableHead>{t("nodes.hypervisor")}</TableHead>
             <TableHead>{t("nodes.arch")}</TableHead>
+            <TableHead>{t("nodes.fencing")}</TableHead>
             <TableHead>{t("nodes.cpus")}</TableHead>
             <TableHead>{t("nodes.memory")}</TableHead>
             <TableHead>{t("nodes.bridges")}</TableHead>
@@ -102,7 +103,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 11 : 10} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 12 : 11} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -127,6 +128,10 @@ export function NodesPage() {
               <TableCell>{node.status.hypervisor}</TableCell>
               {/* 옛 버전으로 등록한 노드는 모른다. */}
               <TableCell>{node.status.arch ?? "—"}</TableCell>
+              {/* 펜싱이 꺼진 노드(위트니스 포함)는 HA VM을 돌리지 않는다. */}
+              <TableCell>
+                {node.status.ha ? t(`nodes.fencingMode.${node.status.ha.fencing}`) : "—"}
+              </TableCell>
               <TableCell>{node.status.cpus}</TableCell>
               <TableCell>{formatCapacity(node.status.memory_mib)}</TableCell>
               <TableCell className="font-mono text-xs">

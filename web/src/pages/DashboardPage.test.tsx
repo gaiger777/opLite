@@ -129,6 +129,25 @@ it("marks witness nodes", async () => {
   expect(within(table).getAllByText("Witness")).toHaveLength(1);
 });
 
+it("shows how each node fences", async () => {
+  const fenced = {
+    ...NODE,
+    status: { ...NODE.status, ha: { fencing: "process" as const, recover_after_secs: 35 } },
+  };
+  const off = { ...NODE, id: "n2", name: "node-b" };
+  mockLists({ node: [fenced, off], vm: [] });
+  server.use(cluster("n1"));
+  renderPage(<DashboardPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const column = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Fencing");
+  const a = (await within(table).findByText("node-a")).closest("tr")!;
+  expect(within(a).getAllByRole("cell")[column]).toHaveTextContent("Process");
+  const b = within(table).getByText("node-b").closest("tr")!;
+  expect(within(b).getAllByRole("cell")[column]).toHaveTextContent("—");
+});
+
 it("shows loading instead of zeros, then errors", async () => {
   let fail: (() => void) | undefined;
   server.use(

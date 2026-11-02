@@ -19,6 +19,7 @@ import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { TableMessage } from "@/components/TableMessage";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -110,12 +111,19 @@ export function VmListPage() {
         accessorKey: "name",
         header: t("common.name"),
         cell: ({ row }) => (
-          <Link
-            to={`/vms/${encodeURIComponent(row.original.name)}`}
-            className="font-medium underline-offset-4 hover:underline"
-          >
-            {row.original.name}
-          </Link>
+          <>
+            <Link
+              to={`/vms/${encodeURIComponent(row.original.name)}`}
+              className="font-medium underline-offset-4 hover:underline"
+            >
+              {row.original.name}
+            </Link>
+            {row.original.spec.ha && (
+              <Badge variant="outline" className="ml-2">
+                {t("vms.ha")}
+              </Badge>
+            )}
+          </>
         ),
       },
       {

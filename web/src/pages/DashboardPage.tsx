@@ -120,6 +120,7 @@ export function DashboardPage() {
               <TableHead>{t("common.node")}</TableHead>
               <TableHead>{t("common.state")}</TableHead>
               <TableHead>{t("dashboard.hypervisor")}</TableHead>
+              <TableHead>{t("nodes.fencing")}</TableHead>
               <TableHead>{t("dashboard.activeVms")}</TableHead>
               <TableHead>{t("vms.vcpus")}</TableHead>
               <TableHead>{t("vms.memory")}</TableHead>
@@ -128,7 +129,7 @@ export function DashboardPage() {
           <TableBody>
             {(!nodes.data || !vms.data || allNodes.length === 0) && (
               <TableRow>
-                <TableCell colSpan={6} className="text-center text-muted-foreground">
+                <TableCell colSpan={7} className="text-center text-muted-foreground">
                   {nodes.data && vms.data ? t("dashboard.noNodes") : waiting(t, nodes, vms)}
                 </TableCell>
               </TableRow>
@@ -156,6 +157,9 @@ export function DashboardPage() {
                     )}
                   </TableCell>
                   <TableCell>{node.status.hypervisor}</TableCell>
+                  <TableCell>
+                    {node.status.ha ? t(`nodes.fencingMode.${node.status.ha.fencing}`) : "—"}
+                  </TableCell>
                   <TableCell>{used.vms}</TableCell>
                   <TableCell>
                     {used.vcpus} / {node.status.cpus}

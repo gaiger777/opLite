@@ -57,6 +57,8 @@ export interface VmFormValues {
   node: string;
   restart: Schemas["RestartPolicy"];
   snapshotSchedule: ScheduleRow;
+  /** HA VM: 펜싱이 켜진 노드에서만 돈다. */
+  ha: boolean;
   /** 만든 뒤 곧바로 시작한다(만들 때만). */
   start: boolean;
 }
@@ -106,6 +108,7 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     node: "",
     restart: "never",
     snapshotSchedule: { every: "off", keep: "7", memory: false },
+    ha: false,
     start: true,
   };
 }
@@ -138,6 +141,7 @@ export function fromVm(vm: Vm): VmFormValues {
           memory: s.snapshot_schedule.memory ?? false,
         }
       : { every: "off", keep: "7", memory: false },
+    ha: s.ha ?? false,
     start: false,
   };
 }
@@ -262,5 +266,31 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
             keep: Number(v.snapshotSchedule.keep),
             memory: v.snapshotSchedule.memory,
           },
+    ha: v.ha,
   };
+}
+
+/** 서버의 `ha_capable`: 위트니스가 아니고 펜싱이 켜진 노드. HA VM은 이런 노드에서만 돈다. */
+export function haCapable(node: Node): boolean {
+  return !node.spec.witness && node.status.ha != null;
+}
+
+/**
+ * HA를 켤 수 없는 이유(번역 키와 값). 서버처럼 지정 노드(`node`, 빈 문자열이면 자동)만 보고, 자동이면 HA 가능
+ * 노드가 하나도 없을 때다. 노드 목록을 아직 모르면 막지 않는다.
+ */
+export function haUnavailable(
+  nodes: Node[] | undefined,
+  node: string,
+): { key: string; values?: Record<string, string> } | null {
+  if (!nodes) {
+    return null;
+  }
+  if (node !== "") {
+    const chosen = nodes.find((n) => n.id === node);
+    return chosen && !haCapable(chosen)
+      ? { key: "vmForm.haNodeOff", values: { node: chosen.name } }
+      : null;
+  }
+  return nodes.some(haCapable) ? null : { key: "vmForm.haNoNode" };
 }

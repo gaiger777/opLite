@@ -10,6 +10,7 @@ import { can } from "@/auth/permissions";
 import { ListPending } from "@/components/ListPending";
 import { Pager, usePage } from "@/components/Pager";
 import { ReasonButton, ReasonList } from "@/components/Reason";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -171,6 +172,7 @@ function VmHeader({ vm }: { vm: Vm }) {
       <div className="flex items-center gap-3">
         <h1 className="text-2xl font-semibold">{vm.name}</h1>
         <VmPhaseBadge vm={vm} />
+        {vm.spec.ha && <Badge variant="outline">{t("vms.ha")}</Badge>}
         {node && (
           <span className="text-sm text-muted-foreground">
             {target ? t("vms.migratingTo", { from: node.name, to: target.name }) : node.name}

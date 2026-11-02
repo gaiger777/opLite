@@ -406,3 +406,12 @@ it("names the VM that failed and sums up a bulk action", async () => {
   expect(await screen.findByText("Start: 1 requested, 1 failed, 1 skipped.")).toBeInTheDocument();
   expect(started).toEqual([db.id]);
 });
+
+it("marks HA VMs", async () => {
+  const ha = vm("app", "running", { spec: { ...vm("app", "running").spec, ha: true } });
+  mockLists({ vm: [web, ha], node: [NODE] });
+  renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "app" });
+  expect(within(rowOf("app")).getByText("HA")).toBeInTheDocument();
+  expect(within(rowOf("web")).queryByText("HA")).not.toBeInTheDocument();
+});

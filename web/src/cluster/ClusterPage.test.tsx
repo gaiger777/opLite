@@ -26,8 +26,8 @@ beforeEach(() =>
         leader: "n1",
         node: "n2",
         members: [
-          member("n1", "node-a"),
-          member("n2", "node-b"),
+          member("n1", "node-a", { fencing: "watchdog" }),
+          member("n2", "node-b", { fencing: null }),
           member("n3", null, { voter: false, online: false, address: null }),
           member("n4", "witness-w", { witness: true }),
         ],
@@ -63,6 +63,15 @@ it("shows the CA and the members", async () => {
   // 위트니스는 역할 옆에 배지가 붙는다.
   expect(within(table).getByText("witness-w").closest("tr")).toHaveTextContent("VoterWitness");
   expect(within(table).queryAllByText("Witness")).toHaveLength(1);
+  // 펜싱이 꺼졌거나(null) 모르면(옛 서버) 대시다.
+  const column = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Fencing");
+  const fencing = (name: string) =>
+    within(within(table).getByText(name).closest("tr")!).getAllByRole("cell")[column];
+  expect(fencing("node-a")).toHaveTextContent("Watchdog");
+  expect(fencing("node-b")).toHaveTextContent("—");
+  expect(fencing("witness-w")).toHaveTextContent("—");
   expect(screen.queryByRole("button", { name: "Issue a join token" })).not.toBeInTheDocument();
 });
 

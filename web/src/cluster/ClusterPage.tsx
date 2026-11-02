@@ -104,6 +104,7 @@ export function ClusterPage() {
               <TableHead>{t("common.name")}</TableHead>
               <TableHead>{t("common.state")}</TableHead>
               <TableHead>{t("cluster.role")}</TableHead>
+              <TableHead>{t("nodes.fencing")}</TableHead>
               <TableHead>{t("nodes.address")}</TableHead>
               <TableHead>{t("cluster.clusterAddress")}</TableHead>
             </TableRow>
@@ -134,6 +135,7 @@ export function ClusterPage() {
                     </Badge>
                   )}
                 </TableCell>
+                <TableCell>{m.fencing ? t(`nodes.fencingMode.${m.fencing}`) : "—"}</TableCell>
                 <TableCell className="font-mono text-xs">{m.address ?? "—"}</TableCell>
                 <TableCell className="font-mono text-xs">{m.cluster_address}</TableCell>
               </TableRow>

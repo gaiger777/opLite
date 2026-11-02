@@ -39,7 +39,8 @@
     "node_unavailable": "The target node is a witness, offline or in maintenance.",
     "no_capacity": "The target node cannot take this VM: {{message}}",
     "task_failed": "Task error: {{message}}",
-    "internal": "The server failed: {{message}}"
+    "internal": "The server failed: {{message}}",
+    "ha_unsupported": "The node has fencing off and cannot run HA VMs."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -226,7 +227,8 @@
     "actionFailed": "{{name}}: {{error}}",
     "bulkSummary": "{{action}}: {{done}} requested, {{failed}} failed, {{skipped}} skipped.",
     "noDisks": "No disks.",
-    "noNics": "No network interfaces."
+    "noNics": "No network interfaces.",
+    "ha": "HA"
   },
   "snapshots": {
     "created": "Created",
@@ -507,6 +509,11 @@
     "reason": {
       "thisNode": "You are connected through this node.",
       "online": "The node is online. Run oplctl cluster leave on it."
+    },
+    "fencing": "Fencing",
+    "fencingMode": {
+      "watchdog": "Watchdog",
+      "process": "Process"
     }
   },
   "accounts": {
@@ -642,7 +649,11 @@
     "scheduleRaw": "{{volume}} is {{format}}, so scheduled snapshots will fail. All disks must be qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools.",
     "scheduleMemoryHint": "Memory is saved only while the VM is running and has disks.",
     "scheduleMixed": "Disks with different snapshot methods (qcow2, LVM-thin pools, ZFS pools, Ceph RBD pools) are mixed, so scheduled snapshots will fail.",
-    "scheduleSharedLvm": "{{volume}} is in a shared LVM pool, so scheduled snapshots will fail."
+    "scheduleSharedLvm": "{{volume}} is in a shared LVM pool, so scheduled snapshots will fail.",
+    "ha": "High availability (HA)",
+    "haHint": "Runs only on nodes with fencing on. If its node loses the cluster majority, the node stops the VM.",
+    "haNodeOff": "{{node}} has fencing off and cannot run HA VMs.",
+    "haNoNode": "No node has fencing on, so HA VMs cannot run."
   },
   "console": {
     "connecting": "Connecting…",
