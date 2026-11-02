@@ -1,5 +1,5 @@
 //! Raft 과반수를 잃어도 실행 중인 VM은 그대로 돌고(설계 10절 불변식 4),
-//! 못 쓴 status는 과반수가 돌아오면 기록된다.
+//! 못 쓴 status는 과반수가 돌아오면 기록된다. HA VM은 Starting을 기록해야 다시 켠다.
 
 mod common;
 
@@ -12,7 +12,8 @@ use openraft::BasicNode;
 use opl_cluster::memnet::MemRouter;
 use opl_cluster::types::NodeId;
 use opl_driver::{Hypervisor, MockHypervisor};
-use opl_reconciler::Reconciler;
+use opl_reconciler::ha::LeaseRenewer;
+use opl_reconciler::{HaConfig, HaGuard, Reconciler};
 use opl_types::vm::{RestartPolicy, VmPhase, VmSpec};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -92,5 +93,97 @@ async fn vm_is_restarted_without_quorum_and_status_catches_up() {
     })
     .await;
     assert_eq!(hv.inspect(vm.id).await.unwrap().map(|s| s.pid), after);
+    reconciler.shutdown().await;
+}
+
+/// 늘 갱신에 성공하는 리스(과반수와 상관없이 fresh다). Starting 기록 규칙만 본다.
+struct AlwaysRenewed;
+
+#[async_trait::async_trait]
+impl LeaseRenewer for AlwaysRenewed {
+    async fn renew_lease(&self, _timeout: Duration) -> Result<(), opl_cluster::ClusterError> {
+        Ok(())
+    }
+}
+
+/// HA VM은 Starting을 기록하지 못하면 다시 켜지 않는다(과반수 쪽에서 리더가 다른 노드에서 켤 수
+/// 있다). 과반수가 돌아오면 켠다.
+#[tokio::test]
+async fn ha_vm_is_not_restarted_without_recording_starting() {
+    let dir = TempDir::new().unwrap();
+    let router = MemRouter::default();
+    let write_timeout = Duration::from_millis(300);
+    let (n1, n2) = (NodeId(Uuid::now_v7()), NodeId(Uuid::now_v7()));
+    let follower = openraft::Config {
+        election_timeout_min: 60_000,
+        election_timeout_max: 120_000,
+        ..raft_config()
+    };
+    let c1 = open_node(
+        &router,
+        n1,
+        &dir.path().join("n1"),
+        raft_config(),
+        write_timeout,
+    )
+    .await;
+    let c2 = open_node(
+        &router,
+        n2,
+        &dir.path().join("n2"),
+        follower.clone(),
+        write_timeout,
+    )
+    .await;
+    let members = BTreeMap::from([(n1, BasicNode::new("n1")), (n2, BasicNode::new("n2"))]);
+    c1.initialize(members).await.unwrap();
+    wait_leader(&c1).await;
+
+    let guard = HaGuard::spawn(
+        Arc::new(AlwaysRenewed),
+        HaConfig {
+            fence_after: Duration::from_secs(60),
+            renew_interval: Duration::from_millis(20),
+            watchdog: None,
+        },
+    );
+    let mut config = common::config(n1.0);
+    config.ha = Some(guard);
+    let hv = Arc::new(MockHypervisor::default());
+    let dyn_hv: Arc<dyn Hypervisor> = hv.clone();
+    let reconciler = Reconciler::spawn(c1.clone(), dyn_hv, config);
+    let mut vm = vm("web", n1.0);
+    vm.spec.restart = RestartPolicy::OnFailure;
+    vm.spec.ha = true;
+    c1.create(&vm).await.unwrap();
+    let before = wait_vm(&c1, vm.id, "running", |v| {
+        v.status.phase == VmPhase::Running
+    })
+    .await
+    .status
+    .pid;
+
+    router.unregister(n2);
+    c2.shutdown().await.unwrap();
+    drop(c2);
+    hv.crash(vm.id);
+    tokio::time::sleep(write_timeout * 4).await;
+    assert_eq!(
+        hv.inspect(vm.id).await.unwrap(),
+        None,
+        "restarted without quorum"
+    );
+    assert_eq!(hv.launches().len(), 1);
+
+    let _c2 = open_node(&router, n2, &dir.path().join("n2"), follower, write_timeout).await;
+    let got = wait_vm(&c1, vm.id, "running again", |v| {
+        v.status.phase == VmPhase::Running && v.status.pid != before
+    })
+    .await;
+    assert_eq!(
+        hv.inspect(vm.id).await.unwrap().map(|s| s.pid),
+        got.status.pid
+    );
+    assert_eq!(hv.launches().len(), 2);
     reconciler.shutdown().await;
 }

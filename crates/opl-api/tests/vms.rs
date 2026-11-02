@@ -2,10 +2,15 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use common::{Env, vm_request};
+use opl_cluster::ClusterError;
 use opl_driver::DriverError;
+use opl_reconciler::ha::LeaseRenewer;
+use opl_reconciler::{HaConfig, HaGuard};
 use opl_types::node::{Fencing, Node, NodeHa, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -484,7 +489,28 @@ async fn a_witness_cannot_hold_vms() {
 /// HA VM은 HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. 실행 중에도 `ha`를 바꿀 수 있다.
 #[tokio::test]
 async fn ha_vms_need_an_ha_capable_node() {
-    let env = Env::start().await;
+    // reconciler는 `process` 펜싱으로 HA VM을 켠다(리스는 늘 갱신된다).
+    struct Renewed;
+    #[async_trait]
+    impl LeaseRenewer for Renewed {
+        async fn renew_lease(&self, _timeout: Duration) -> Result<(), ClusterError> {
+            Ok(())
+        }
+    }
+    let env = Env::start_with(
+        |c| {
+            c.ha = Some(HaGuard::spawn(
+                Arc::new(Renewed),
+                HaConfig {
+                    fence_after: Duration::from_secs(30),
+                    renew_interval: Duration::from_secs(1),
+                    watchdog: None,
+                },
+            ))
+        },
+        |_| async {},
+    )
+    .await;
     let admin = env.admin().await;
     // 노드를 정하지 않은 HA VM은 만들 수 있지만, HA 가능 노드가 없으면 켤 수 없다.
     let mut req = vm_request("web");

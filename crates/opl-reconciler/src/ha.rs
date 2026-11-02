@@ -339,6 +339,17 @@ impl HaGuard {
         }
     }
 
+    /// 도는 HA VM 가운데 `keep`에 없는 것을 뺀다. 작업자가 없어 아무도 빼지 않는 VM(옮겨 간 뒤 멈춘
+    /// 원본 등)을 reconciler가 정리한다.
+    pub fn retain_running(&self, keep: &HashSet<Uuid>) {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .running
+            .retain(|vm| keep.contains(vm));
+    }
+
     /// 갱신과 쓰다듬기를 멈춘다. 도는 HA VM이 없으면 watchdog를 magic close로 멈추고 닫는다. 있으면
     /// 그대로 두어 opld가 제한 시간 안에 돌아오지 않으면 노드가 재시작된다.
     pub fn close(&self) {

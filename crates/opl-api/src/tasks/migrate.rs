@@ -313,7 +313,9 @@ enum Outcome {
 
 /// 확정 전 실패: 마이그레이션 표시를 지워(읽은 revision 확인) 확정을 막은 뒤 대상의 받는 QEMU를
 /// 끄게 하고, 원본이 아직 보내고 있으면 취소하고(나중에 끝나 원본이 멈추지 않게), 원본이 멈춰
-/// 있으면(`postmigrate`, `paused`) 이어서 실행한다(못 하면 보류가 풀린 뒤 reconciler가 한다). 디스크는
+/// 있으면(`postmigrate`, `paused`) 이어서 실행한다(못 하면 보류가 풀린 뒤 reconciler가 한다). HA VM은
+/// 여기서 이어서 실행하지 않는다: 보류가 풀린 뒤 reconciler가 리스와 watchdog를 확인하고 이어서 실행한다
+/// (그 사이 리스가 끝났으면 끈다). 디스크는
 /// 보류가 풀린 뒤 reconciler가 다시 이 노드만 쓰게 한다(대상이 아직 끄지 못했으면 될 때까지 다시
 /// 한다 — 그동안 공유로 남아도 원본은 돈다). 지우기 전에 확정이 적용됐으면 `Committed`다. 결과를 알 수 없으면(과반수 없음) 알 때까지 다시 시도한다. 그동안 원본은
 /// 멈춰 있을 수 있지만 두 QEMU가 함께 돌지는 않는다.
@@ -324,6 +326,7 @@ async fn roll_back(
     id: Uuid,
     migration: MigrationStatus,
 ) -> Outcome {
+    let mut ha = false;
     loop {
         let vm = match ctx.cluster.get::<VmSpec>(id) {
             Ok(Some(vm)) => vm,
@@ -337,6 +340,7 @@ async fn roll_back(
         if vm.spec.node == Some(migration.node) {
             return Outcome::Committed;
         }
+        ha = vm.spec.ha;
         let current = vm.status.migration == Some(migration);
         let revision = vm.revision;
         let mut status = vm.status.clone();
@@ -371,7 +375,7 @@ async fn roll_back(
     }
     let resumed = match ctx.hv.inspect(id).await {
         Ok(Some(state))
-            if state.status == postmigrate() || state.status == RuntimeStatus::Paused =>
+            if !ha && (state.status == postmigrate() || state.status == RuntimeStatus::Paused) =>
         {
             tracing::info!(vm = %id, "resuming the source of a failed migration");
             ctx.hv.resume(id).await.map_err(|e| e.to_string())

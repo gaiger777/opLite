@@ -3,14 +3,15 @@ use std::sync::{Arc, Mutex};
 
 use opl_cluster::watch::{Watch, WatchError, WatchEvent};
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::Hypervisor;
+use opl_driver::{EventKind, Hypervisor};
 use opl_types::resource::Kind;
 use opl_types::vm::VmSpec;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::ReconcilerConfig;
+use crate::ha::LeaseState;
 use crate::worker::{Trigger, Worker};
 
 /// 한 노드의 조정 루프. `spawn`으로 시작하고 `shutdown`으로 멈춘다.
@@ -141,6 +142,17 @@ struct WorkerHandle {
     task: JoinHandle<()>,
 }
 
+/// 리스 상태가 바뀔 때까지 기다린다. guard가 없으면 끝나지 않는다.
+async fn lease_changed(rx: &mut Option<watch::Receiver<LeaseState>>) {
+    if let Some(r) = rx.as_mut()
+        && r.changed().await.is_ok()
+    {
+        return;
+    }
+    *rx = None;
+    std::future::pending().await
+}
+
 /// 저장소 변경, 하이퍼바이저 이벤트, 주기적 재동기화를 VM별 작업자에게 나눠 준다.
 struct Dispatcher {
     cluster: Arc<Cluster>,
@@ -162,6 +174,8 @@ impl Dispatcher {
     ) {
         // 목록을 읽기 전에 구독해야 그 사이에 난 이벤트를 놓치지 않는다.
         let mut events = self.hv.subscribe();
+        // 리스가 살아나거나 끝나면 모든 작업자를 깨운다(HA VM을 켜거나 끈다).
+        let mut lease = self.config.ha.as_ref().map(|g| g.subscribe());
         'sync: loop {
             let mut watch = match self.full_sync().await {
                 Ok(watch) => watch,
@@ -191,12 +205,23 @@ impl Dispatcher {
                         Ok(ev) => {
                             if !self.notify(ev.id, Trigger::Event(ev.kind)) {
                                 tracing::debug!(vm = %ev.id, "event for a VM not assigned to this node");
+                                // 옮겨 간 HA VM의 원본처럼 작업자가 물러난 뒤 멈춘 QEMU다.
+                                if ev.kind != EventKind::Started
+                                    && let Some(guard) = &self.config.ha
+                                {
+                                    guard.set_running(ev.id, false);
+                                }
                             }
                         }
                         // 이벤트를 놓쳤다. 실제 상태를 전부 다시 맞춘다.
                         Err(broadcast::error::RecvError::Lagged(_)) => continue 'sync,
                         Err(broadcast::error::RecvError::Closed) => break 'sync,
                     },
+                    () = lease_changed(&mut lease) => {
+                        for &id in self.workers.keys() {
+                            self.notify(id, Trigger::Sync);
+                        }
+                    }
                     Some(command) = commands.recv() => match command {
                         Command::ForceStop(id) => {
                             if !self.notify(id, Trigger::ForceStop) {
@@ -244,13 +269,23 @@ impl Dispatcher {
         for &id in &mine {
             self.sync(id);
         }
-        // 경고를 남기려는 것뿐이므로 실패해도 동기화는 이어 간다.
+        // 경고를 남기고 도는 HA VM 목록을 정리하려는 것뿐이므로 실패해도 동기화는 이어 간다.
         match self.hv.list().await {
             Ok(states) => {
-                for state in states {
+                for state in &states {
                     if !mine.contains(&state.id) {
                         tracing::warn!(vm = %state.id, "VM is running on this node but not assigned to it; leaving it alone");
                     }
+                }
+                // 이벤트를 놓쳐 남은 것을 뺀다. 작업자가 있는 VM은 작업자가 맞춘다(켜는 중일 수 있다).
+                if let Some(guard) = &self.config.ha {
+                    let keep: HashSet<Uuid> = states
+                        .iter()
+                        .map(|s| s.id)
+                        .chain(self.workers.keys().copied())
+                        .chain(self.retired.keys().copied())
+                        .collect();
+                    guard.retain_running(&keep);
                 }
             }
             Err(e) => tracing::warn!(error = %e, "cannot list VMs on this node"),

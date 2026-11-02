@@ -1,5 +1,5 @@
 //! 실제 gRPC(mTLS)로 이은 두 노드: 한 노드의 API로 다른 노드에 VM을 띄우고 콘솔을 중계한다.
-//! 라이브 마이그레이션(Mock 하이퍼바이저): 성공, 확정 전 실패의 되돌리기, 공유 디스크의 잠금 바꾸기.
+//! 라이브 마이그레이션(Mock 하이퍼바이저): 성공, 확정 전 실패의 되돌리기(HA VM 포함), 공유 디스크의 잠금 바꾸기.
 
 mod common;
 
@@ -19,9 +19,10 @@ use opl_driver::{
 };
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use opl_peer::{GrpcNetwork, PeerService, Peers};
-use opl_reconciler::{FirmwareFetcher, Reconciler};
+use opl_reconciler::ha::LeaseRenewer;
+use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role, UserSpec};
-use opl_types::node::{NodeSpec, NodeStatus};
+use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
@@ -56,6 +57,8 @@ struct Node {
     tls: NodeTls,
     listener: Option<TcpListener>,
     base: String,
+    /// reconciler의 HA guard. None이면 펜싱이 꺼진 노드다.
+    ha: Option<Arc<HaGuard>>,
     _workers: Option<(Reconciler, TaskRunner)>,
 }
 
@@ -96,6 +99,7 @@ impl Node {
             tls,
             listener: Some(listener),
             base: String::new(),
+            ha: None,
             _workers: None,
         }
     }
@@ -139,6 +143,7 @@ impl Node {
         let mut reconciler_config = reconciler_config(self.id);
         reconciler_config.storage = storage.clone();
         reconciler_config.firmware = Some(firmware.clone());
+        reconciler_config.ha = self.ha.clone();
         let reconciler = Reconciler::spawn(self.cluster.clone(), hv.clone(), reconciler_config);
         let mut config = runner_config(self.id, &work);
         config.peers = Some(self.peers.clone());
@@ -164,10 +169,20 @@ impl Node {
 /// 두 노드를 띄워 클러스터를 만들고 Node 리소스와 관리자를 채운다. 노드 간 서버가 먼저 떠야
 /// 선거가 끝나므로 서버부터 띄운다.
 async fn two_nodes() -> (TempDir, Node, Node) {
+    two_nodes_with(None).await
+}
+
+/// `ha`가 있으면 A의 reconciler에 넣고 두 노드를 HA 가능 노드(`process`)로 등록한다.
+async fn two_nodes_with(ha: Option<Arc<HaGuard>>) -> (TempDir, Node, Node) {
     let ca = ClusterCa::generate("test").unwrap();
     let root = TempDir::new().unwrap();
     let mut a = Node::open(&ca, &root).await;
     let mut b = Node::open(&ca, &root).await;
+    let node_ha = ha.as_ref().map(|_| NodeHa {
+        fencing: Fencing::Process,
+        recover_after_secs: 60,
+    });
+    a.ha = ha;
     a.serve(&root).await;
     b.serve(&root).await;
     let members = BTreeMap::from([
@@ -194,7 +209,7 @@ async fn two_nodes() -> (TempDir, Node, Node) {
             // 테스트 VM은 virt(aarch64) 머신이다.
             arch: Some(Arch::Aarch64),
             pools: Default::default(),
-            ha: None,
+            ha: node_ha,
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();
@@ -574,6 +589,99 @@ async fn failed_receive_resumes_the_source() {
     assert!(error.contains("TLS handshake failed"), "{error}");
     assert_eq!(a.hv.migrations().len(), 1);
     assert_still_on_a(&a, &b, vm.id).await;
+}
+
+/// 정해 둔 대로 곧바로 갱신에 성공하거나 실패한다.
+struct FakeRenewer(std::sync::Mutex<bool>);
+
+#[async_trait::async_trait]
+impl LeaseRenewer for FakeRenewer {
+    async fn renew_lease(&self, _timeout: Duration) -> Result<(), opl_cluster::ClusterError> {
+        if *self.0.lock().unwrap() {
+            Ok(())
+        } else {
+            Err(opl_cluster::ClusterError::Timeout)
+        }
+    }
+}
+
+/// A에 가짜 리스의 HA guard(`process`, 리스는 `fence_after` 뒤에 끝난다)를 두고 HA VM `web`을 켠다.
+async fn ha_vm_on_a(
+    fence_after: Duration,
+) -> (TempDir, Node, Node, Arc<FakeRenewer>, opl_types::vm::Vm) {
+    let renewer = Arc::new(FakeRenewer(std::sync::Mutex::new(true)));
+    let guard = HaGuard::spawn(
+        renewer.clone(),
+        HaConfig {
+            fence_after,
+            renew_interval: Duration::from_millis(20),
+            watchdog: None,
+        },
+    );
+    let (root, a, b) = two_nodes_with(Some(guard)).await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let mut req = vm_request("web");
+    req["spec"]["node"] = serde_json::json!(a.id);
+    req["spec"]["ha"] = serde_json::json!(true);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let vm = a.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
+    wait_vm(&a, vm.id, "running", |v| v.status.phase == VmPhase::Running).await;
+    (root, a, b, renewer, vm)
+}
+
+/// 되돌린 HA VM의 원본은 reconciler가 리스를 확인한 뒤 이어서 실행한다.
+#[tokio::test]
+async fn failed_receive_of_an_ha_vm_resumes_the_source_with_the_lease() {
+    let (_root, a, b, _renewer, vm) = ha_vm_on_a(Duration::from_secs(60)).await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    b.hv.fail_next_incoming_wait(DriverError::Migration("TLS handshake failed".into()));
+    let task = migrate(&admin, "node2").await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let deadline = Instant::now() + WAIT;
+    while runtime_status(&a, vm.id).await != Some(RuntimeStatus::Running) {
+        assert!(Instant::now() < deadline, "source not resumed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_still_on_a(&a, &b, vm.id).await;
+    assert_eq!(a.hv.launches().len(), 1);
+}
+
+/// 마이그레이션하는 동안 리스가 끝났으면 되돌려도 원본을 이어서 실행하지 않고 끈다. 리스가 돌아오면
+/// 다시 켠다.
+#[tokio::test]
+async fn failed_receive_of_an_ha_vm_without_the_lease_stops_the_source() {
+    let (_root, a, b, renewer, vm) = ha_vm_on_a(Duration::from_millis(500)).await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    a.hv.delay_migrations(Duration::from_millis(1500));
+    b.hv.fail_next_incoming_wait(DriverError::Migration("TLS handshake failed".into()));
+    let (status, task) = admin
+        .post("/vms/web/migrate", serde_json::json!({ "node": "node2" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    *renewer.0.lock().unwrap() = false;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    wait_vm(&a, vm.id, "fenced", |v| {
+        v.status.last_error.as_deref() == Some("fenced: lost the cluster majority")
+    })
+    .await;
+    assert_eq!(runtime_status(&a, vm.id).await, None);
+    assert!(
+        !a.hv.pause_calls(vm.id).contains(&"resume"),
+        "{:?}",
+        a.hv.pause_calls(vm.id)
+    );
+
+    *renewer.0.lock().unwrap() = true;
+    wait_vm(&a, vm.id, "running again", |v| {
+        v.status.phase == VmPhase::Running && v.status.last_error.is_none()
+    })
+    .await;
+    assert_eq!(a.hv.launches().len(), 2);
+    assert_eq!(runtime_status(&b, vm.id).await, None);
 }
 
 /// 원본 QEMU가 보내는 중인데 기다리기가 실패했다: 되돌리며 그 마이그레이션을 취소한다. 나중에 끝나
