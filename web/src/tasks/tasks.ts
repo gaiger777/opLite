@@ -67,11 +67,20 @@ export function settleTasks(list: List<Task>, t: TFunction) {
   }
 }
 
-/** Task를 사람이 읽을 문장으로: "web-01 시작" */
-export function describeTask(task: Task, t: TFunction, target: string): string {
-  const kind = task.spec.op.kind;
+/**
+ * Task를 사람이 읽을 문장으로: "web-01 시작". `nodeName`은 노드 id의 이름(HA 복구의 죽은 노드)이고,
+ * 모르면 id를 보인다.
+ */
+export function describeTask(
+  task: Task,
+  t: TFunction,
+  target: string,
+  nodeName: (id: string) => string | undefined = () => undefined,
+): string {
+  const op = task.spec.op;
+  const from = op.kind === "vm-ha-recover" ? (nodeName(op.from) ?? op.from) : undefined;
   // 모르는 작업(새 서버)은 번역 키 대신 종류를 그대로 보여 준다.
-  return t(`tasks.op.${kind}`, { target, defaultValue: `${kind} ${target}` });
+  return t(`tasks.op.${op.kind}`, { target, from, defaultValue: `${op.kind} ${target}` });
 }
 
 /** `waitForTask`가 기다리는 가장 긴 시간. 볼륨 만들기는 보통 몇 초 안에 끝난다. */

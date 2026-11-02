@@ -111,7 +111,8 @@
       "snapshot-delete": "Delete snapshot of {{target}}",
       "volume-resize": "Resize volume {{target}}",
       "vm-clone": "Clone {{target}}",
-      "vm-migrate": "Migrate {{target}}"
+      "vm-migrate": "Migrate {{target}}",
+      "vm-ha-recover": "HA recovery of {{target}} (from node {{from}})"
     }
   },
   "pager": {

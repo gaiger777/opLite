@@ -111,7 +111,8 @@
       "snapshot-delete": "{{target}} 스냅샷 삭제",
       "volume-resize": "볼륨 {{target}} 크기 늘리기",
       "vm-clone": "{{target}} 복제",
-      "vm-migrate": "{{target}} 마이그레이션"
+      "vm-migrate": "{{target}} 마이그레이션",
+      "vm-ha-recover": "{{target}} HA 복구 (노드 {{from}}에서)"
     }
   },
   "pager": {

@@ -60,6 +60,28 @@ it("names deleted targets by the end of their id and says when no task failed", 
   expect(screen.getByText("No failed tasks.")).toBeInTheDocument();
 });
 
+it("shows HA recoveries with the failed node's name", async () => {
+  mockLists({
+    vm: [{ id: VM, name: "web" }],
+    node: [
+      { id: "n1", name: "node-a" },
+      { id: "n2", name: "node-b" },
+    ],
+    task: [
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000004",
+        spec: { op: { kind: "vm-ha-recover", from: "n1" }, target: VM, node: "n2" },
+        status: { state: "succeeded", error: null },
+      },
+    ],
+  });
+  renderPage(<TasksPage />);
+  const row = (
+    await screen.findByRole("link", { name: "HA recovery of web (from node node-a)" })
+  ).closest("tr")!;
+  expect(row).toHaveTextContent("node-b");
+});
+
 function many(n: number, state: "failed" | "succeeded" = "succeeded") {
   return Array.from({ length: n }, (_, i) => ({
     id: `019a0f3c-8a10-7000-8000-${String(i).padStart(12, "0")}`,

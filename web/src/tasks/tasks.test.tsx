@@ -105,6 +105,17 @@ it("describes unknown operations by their kind", () => {
   expect(describeTask(migrate as unknown as Task, i18n.t, "web")).toBe("Migrate web");
 });
 
+it("names the failed node of an HA recovery", () => {
+  const recover = {
+    ...task("4", "succeeded"),
+    spec: { op: { kind: "vm-ha-recover", from: "id-a" }, target: "x", node: "id-b" },
+  } as Task;
+  // 노드 이름을 모르면 id로
+  expect(describeTask(recover, i18n.t, "web")).toBe("HA recovery of web (from node id-a)");
+  const name = (id: string) => (id === "id-a" ? "node-a" : undefined);
+  expect(describeTask(recover, i18n.t, "web", name)).toBe("HA recovery of web (from node node-a)");
+});
+
 it("waits for a task and rejects with its error when it fails", async () => {
   const queryClient = createQueryClient();
   const id = task("5", "pending").id;

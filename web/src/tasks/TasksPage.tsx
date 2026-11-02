@@ -97,6 +97,7 @@ export function TaskTable({
           const { name, href } = target(task);
           const node = nodeById.get(task.spec.node);
           const time = uuidTime(task.id);
+          const label = describeTask(task, t, name, (id) => nodeById.get(id)?.name);
           return (
             <TableRow key={task.id}>
               <TableCell className="whitespace-nowrap">
@@ -105,10 +106,10 @@ export function TaskTable({
               <TableCell>
                 {href ? (
                   <Link to={href} className="underline-offset-4 hover:underline">
-                    {describeTask(task, t, name)}
+                    {label}
                   </Link>
                 ) : (
-                  describeTask(task, t, name)
+                  label
                 )}
               </TableCell>
               <TableCell>{node?.name ?? "—"}</TableCell>

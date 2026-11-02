@@ -946,15 +946,7 @@ where
                     json_out,
                     &list,
                     &["ID", "OP", "TARGET", "STATE", "ERROR"],
-                    |t| {
-                        vec![
-                            cell(&t["id"]),
-                            cell(&t["spec"]["op"]["kind"]),
-                            cell(&t["spec"]["target"]),
-                            cell(&t["status"]["state"]),
-                            cell(&t["status"]["error"]),
-                        ]
-                    },
+                    task_row,
                 )?;
             }
             TaskCmd::Get { task } => {
@@ -1259,6 +1251,22 @@ async fn vm(
         }
     }
     Ok(())
+}
+
+/// `task list`의 한 행. HA 복구면 OP에 죽은 노드를 붙인다(`vm-ha-recover (from A)`).
+fn task_row(t: &Value) -> Vec<String> {
+    let op = &t["spec"]["op"];
+    let mut kind = cell(&op["kind"]);
+    if op["kind"] == "vm-ha-recover" {
+        kind = format!("{kind} (from {})", cell(&op["from"]));
+    }
+    vec![
+        cell(&t["id"]),
+        kind,
+        cell(&t["spec"]["target"]),
+        cell(&t["status"]["state"]),
+        cell(&t["status"]["error"]),
+    ]
 }
 
 /// `vm list`의 한 행. 마이그레이션 중이면 NODE에 대상 노드를 붙인다(`A -> B`).
@@ -2168,6 +2176,23 @@ mod tests {
         // HA VM
         vm["spec"]["ha"] = json!(true);
         assert_eq!(vm_row(&vm)[4], "true");
+    }
+
+    #[test]
+    fn task_row_shows_where_ha_moved_the_vm_from() {
+        let task = json!({
+            "id": "t1",
+            "spec": { "op": { "kind": "vm-ha-recover", "from": "id-a" }, "target": "vm-1", "node": "id-b" },
+            "status": { "state": "succeeded", "error": null },
+        });
+        assert_eq!(
+            task_row(&task),
+            ["t1", "vm-ha-recover (from id-a)", "vm-1", "succeeded", "-"]
+        );
+        // 다른 종류는 이름만
+        let mut task = task;
+        task["spec"]["op"] = json!({ "kind": "vm-start" });
+        assert_eq!(task_row(&task)[1], "vm-start");
     }
 
     #[test]
