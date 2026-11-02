@@ -1,5 +1,5 @@
 //! 클러스터 멤버로 도는 노드: 노드 간 서버, 클러스터 저장소, reconciler, Task 실행기, HTTPS API,
-//! 노드 감시, 예약 스냅샷, 클러스터 정리, 노드별 풀 상태. 위트니스는 노드 간 서버와 클러스터
+//! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태. 위트니스는 노드 간 서버와 클러스터
 //! 저장소, 승격, Node 등록만 띄운다.
 
 use std::collections::BTreeMap;
@@ -13,8 +13,8 @@ use axum::serve::ListenerExt;
 use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
-    AppState, ClusterJanitor, IncomingConfig, IncomingMigrations, SnapshotScheduler, TaskRunner,
-    TaskRunnerConfig, UefiVarsFetcher,
+    AppState, ClusterJanitor, HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations,
+    SnapshotScheduler, TaskRunner, TaskRunnerConfig, UefiVarsFetcher,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
@@ -113,6 +113,8 @@ struct Services {
     monitor: NodeMonitor,
     schedule: SnapshotScheduler,
     janitor: ClusterJanitor,
+    /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
+    recovery: HaManager,
     pools: PoolMounter,
     /// HA 리스와 watchdog(`[ha] fencing = "off"`면 없다)
     ha: Option<Arc<HaGuard>>,
@@ -130,6 +132,7 @@ impl Services {
         self.monitor.shutdown().await;
         self.schedule.shutdown().await;
         self.janitor.shutdown().await;
+        self.recovery.shutdown().await;
         self.pools.shutdown().await;
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
@@ -399,6 +402,7 @@ impl Member {
         let state = Arc::new(state);
         let schedule = SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config());
         let janitor = ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config());
+        let recovery = HaManager::spawn(state.clone(), HaManagerConfig::default());
         let app = opl_api::router(state).merge(crate::web::router());
         let task = tokio::spawn(async move {
             // 연결 주소(클라이언트 IP)를 시도 제한에 넘긴다. axum은 `TapIo`로 감싼 리스너에
@@ -426,6 +430,7 @@ impl Member {
                 monitor,
                 schedule,
                 janitor,
+                recovery,
                 pools,
                 ha,
             }),

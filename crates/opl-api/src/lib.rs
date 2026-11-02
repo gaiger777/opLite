@@ -8,6 +8,7 @@ pub mod cluster;
 mod console;
 pub mod error;
 mod firmware;
+mod ha;
 mod incoming;
 mod janitor;
 pub mod limit;
@@ -33,6 +34,7 @@ use utoipa_axum::routes;
 
 pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
 pub use firmware::UefiVarsFetcher;
+pub use ha::{HaManager, HaManagerConfig, RecoveryWriter};
 pub use incoming::{IncomingConfig, IncomingMigrations};
 pub use janitor::{ClusterJanitor, ClusterJanitorConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};

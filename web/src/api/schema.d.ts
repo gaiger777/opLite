@@ -1886,6 +1886,11 @@ export interface components {
             kind: "vm-migrate";
             /** Format: uuid */
             node: string;
+        } | {
+            /** Format: uuid */
+            from: string;
+            /** @enum {string} */
+            kind: "vm-ha-recover";
         };
         TaskSpec: {
             /**

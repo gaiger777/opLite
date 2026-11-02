@@ -72,6 +72,11 @@ pub enum TaskOp {
     VmMigrate {
         node: Uuid,
     },
+    /// 리더의 HA 복구 기록: 노드 `from`이 죽어 대상 VM을 Task의 `node`로 옮겼다. 처음부터 끝난
+    /// 상태(Succeeded)로 만들고 실행기는 실행하지 않는다.
+    VmHaRecover {
+        from: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -207,6 +212,18 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({ "kind": "vm-migrate", "node": node })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+    }
+
+    #[test]
+    fn ha_recover_op_is_tagged_by_kind() {
+        let from = Uuid::now_v7();
+        let op = TaskOp::VmHaRecover { from };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "vm-ha-recover", "from": from })
         );
         assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
     }

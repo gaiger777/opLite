@@ -701,6 +701,8 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
             pool,
         } => clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
         TaskOp::VmMigrate { node } => migrate::migrate(ctx, task, *node).await,
+        // 기록 Task는 끝난 상태로 만들어지므로 실행되지 않는다.
+        TaskOp::VmHaRecover { .. } => Err("an HA recovery task is a record and is not run".into()),
     }
 }
 
