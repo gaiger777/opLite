@@ -810,3 +810,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 19: 공유 스토리지 5 — iSCSI와 공유 LVM](docs/superpowers/plans/2026-10-30-plan19-shared-storage-iscsi-lvm.md)
 - [계획 20: 라이브 마이그레이션](docs/superpowers/plans/2026-10-30-plan20-live-migration.md)
 - [계획 21: UEFI 변수 따라가기와 풀의 공유 설정 바꾸기](docs/superpowers/plans/2026-10-31-plan21-uefi-vars-pool-shared.md)
+- [계획 22: 위트니스 노드](docs/superpowers/plans/2026-11-02-plan22-witness.md)
