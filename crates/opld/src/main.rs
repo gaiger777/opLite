@@ -5,6 +5,9 @@
 //! `oplctl cluster init`(새 클러스터)이나 `oplctl cluster join`(합류)을 기다린다. 멤버가 되면 모든
 //! 것을 띄우고, `oplctl cluster leave`로 빠지면 다시 기다린다.
 //!
+//! 위트니스(설정 `witness = true`)는 VM을 돌리지 않는 Raft 투표 멤버다. 합류만 할 수 있고, 멤버가
+//! 되면 클러스터 저장소와 노드 간 서버만 띄운다.
+//!
 //! QEMU는 `-daemonize`로 떠 있으므로 opld가 멈추거나 죽어도 VM은 계속 돈다. 다시 시작하면
 //! 하이퍼바이저 드라이버가 살아 있는 VM에 다시 붙고 reconciler가 이어서 맞춘다.
 
@@ -184,6 +187,10 @@ async fn become_member(config: &Config, node: Uuid, req: Request) -> Option<Memb
             )));
             return None;
         }
+        Request::Init { reply, .. } if config.witness => {
+            let _ = reply.send(Err(ControlError::conflict(member::WITNESS_CANNOT_INIT)));
+            return None;
+        }
         Request::Init {
             cluster_name,
             reply,
@@ -297,8 +304,10 @@ fn lock_data_dir(dir: &Path) -> anyhow::Result<File> {
 }
 
 /// API와 노드 간 포트를 잠깐 묶어 본다. 쓰이고 있으면 init/join을 시작하기 전에 실패한다.
+/// 위트니스는 API를 열지 않는다.
 fn check_ports(config: &Config) -> anyhow::Result<()> {
-    for addr in [config.listen, config.cluster_listen] {
+    let api = (!config.witness).then_some(config.listen);
+    for addr in api.into_iter().chain([config.cluster_listen]) {
         std::net::TcpListener::bind(addr).with_context(|| format!("cannot listen on {addr}"))?;
     }
     Ok(())
@@ -328,5 +337,34 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_witness_refuses_to_start_a_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            toml::from_str("name = \"w\"\naddress = \"127.0.0.1\"\nwitness = true").unwrap();
+        config.data_dir = dir.path().to_path_buf();
+        let (reply, rx) = oneshot::channel();
+        let req = Request::Init {
+            cluster_name: "c".into(),
+            reply,
+        };
+        assert!(become_member(&config, Uuid::now_v7(), req).await.is_none());
+        let e = rx.await.unwrap().unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(
+            e.message,
+            "a witness cannot start a cluster; join an existing cluster instead"
+        );
+        assert!(!member::pki_dir(&config).exists());
     }
 }

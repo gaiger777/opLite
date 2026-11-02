@@ -1,7 +1,7 @@
 //! 한 프로세스 안에서 여러 노드를 띄우는 테스트 하네스.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use openraft::{BasicNode, ServerState};
@@ -49,6 +49,8 @@ pub struct TestCluster {
     pub write_timeout: Duration,
     /// 팔로워가 받은 요청을 리더로 전달한다.
     pub forward: bool,
+    /// 선거에 나서지 않는 노드(`enable_elect = false`, 위트니스)
+    pub witnesses: BTreeSet<NodeId>,
     root: TempDir,
 }
 
@@ -59,21 +61,33 @@ impl TestCluster {
     }
 
     pub async fn start_with(n: u64, raft: openraft::Config, write_timeout: Duration) -> Self {
-        Self::build(n, raft, write_timeout, false).await
+        Self::build(n, raft, write_timeout, false, &[]).await
     }
 
     /// 팔로워가 요청을 리더로 전달하는 클러스터
     pub async fn start_forwarding(n: u64) -> Self {
-        Self::build(n, raft_config(), Duration::from_secs(10), true).await
+        Self::build(n, raft_config(), Duration::from_secs(10), true, &[]).await
     }
 
-    async fn build(n: u64, raft: openraft::Config, write_timeout: Duration, forward: bool) -> Self {
+    /// `witnesses`가 선거에 나서지 않는 클러스터. 노드 1에서 초기화하므로 1은 넣지 않는다.
+    pub async fn start_with_witnesses(n: u64, witnesses: &[u64]) -> Self {
+        Self::build(n, raft_config(), Duration::from_secs(5), false, witnesses).await
+    }
+
+    async fn build(
+        n: u64,
+        raft: openraft::Config,
+        write_timeout: Duration,
+        forward: bool,
+        witnesses: &[u64],
+    ) -> Self {
         let mut tc = TestCluster {
             router: MemRouter::default(),
             nodes: BTreeMap::new(),
             raft,
             write_timeout,
             forward,
+            witnesses: witnesses.iter().map(|&i| node(i)).collect(),
             root: TempDir::new().unwrap(),
         };
         for i in 1..=n {
@@ -91,7 +105,10 @@ impl TestCluster {
     /// 아직 redb 파일을 쥐고 있으면 `DatabaseAlreadyOpen`이 나므로 잠시 뒤 다시 연다.
     pub async fn open(&mut self, id: NodeId) {
         let mut config = ClusterConfig::new(id, self.root.path().join(id.to_string()));
-        config.raft = self.raft.clone();
+        config.raft = openraft::Config {
+            enable_elect: !self.witnesses.contains(&id),
+            ..self.raft.clone()
+        };
         config.write_timeout = self.write_timeout;
         let deadline = Instant::now() + Duration::from_secs(5);
         let cluster = loop {

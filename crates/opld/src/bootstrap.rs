@@ -11,6 +11,7 @@ use opl_types::auth::{Role, UserSpec};
 use opl_types::cluster::ClusterSpec;
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
+use opl_types::vm::Arch;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -71,8 +72,28 @@ pub async fn create_cluster(
     Ok(password)
 }
 
-/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지, 아키텍처를 기록한다.
-pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> anyhow::Result<()> {
+/// 다시 시작한 노드의 역할(합류할 때 정해진 Node `spec.witness`)이 설정의 `witness`와 같은지 본다.
+/// 로컬 저장소만 읽는다. Node 리소스가 아직 없으면 그대로 둔다.
+pub fn check_role(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
+    let NodeId(id) = cluster.id();
+    let Some(node) = cluster.get::<NodeSpec>(id)? else {
+        return Ok(());
+    };
+    match (node.spec.witness, config.witness) {
+        (true, false) => anyhow::bail!(
+            "this node joined as a witness but opld.toml says witness = false; leave the cluster \
+             and join again to change the role"
+        ),
+        (false, true) => anyhow::bail!(
+            "this node joined as a non-witness node but opld.toml says witness = true; leave the \
+             cluster and join again to change the role"
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// 이 노드의 Node 리소스가 없으면 만들고(역할은 설정의 `witness`), 있으면 주소만 맞춘다.
+async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
     let NodeId(id) = cluster.id();
     let address = config.api_address();
     match cluster.get::<NodeSpec>(id)? {
@@ -82,7 +103,7 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
                 NodeSpec {
                     address,
                     maintenance: false,
-                    witness: false,
+                    witness: config.witness,
                 },
             );
             node.id = id;
@@ -97,6 +118,12 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
         }
         Some(_) => {}
     }
+    Ok(())
+}
+
+/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지, 아키텍처를 기록한다.
+pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> anyhow::Result<()> {
+    ensure_node(cluster, config).await?;
     let bridges = host.bridges().await;
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
     let memory_mib = crate::host::memory_mib();
@@ -111,6 +138,21 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
             arch: Some(host.profile.arch),
             // 풀 상태는 풀 새로 고침이 쓴다. 이미 적힌 것을 지우지 않는다.
             pools: std::mem::take(&mut status.pools),
+        };
+        true
+    })
+    .await
+}
+
+/// 위트니스의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 아키텍처만 기록한다. VM을 돌리지
+/// 않으므로 용량·하이퍼바이저·브리지·풀은 비운다.
+pub async fn register_witness(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
+    ensure_node(cluster, config).await?;
+    update_node_status(cluster, |status| {
+        *status = NodeStatus {
+            online: true,
+            arch: Some(Arch::native()),
+            ..NodeStatus::default()
         };
         true
     })
@@ -178,15 +220,13 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::*;
     use async_trait::async_trait;
     use openraft::{BasicNode, ServerState};
     use opl_cluster::ClusterConfig;
     use opl_cluster::memnet::MemRouter;
     use opl_driver::{DriverError, HostNet, Tap};
     use opl_types::node::{BridgeInfo, PoolState};
-    use opl_types::vm::Arch;
-
-    use super::*;
 
     /// 정해 둔 브리지를 돌려준다. `None`이면 `ip`가 실패한 것처럼 오류를 낸다.
     #[derive(Debug)]
@@ -257,6 +297,73 @@ pub(crate) mod tests {
             let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
             assert_eq!(node.status.arch, Some(arch));
         }
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 위트니스는 역할과 온라인, 아키텍처만 기록하고 VM을 돌리는 데 쓰는 값은 비운다.
+    #[tokio::test]
+    async fn witness_registration_records_only_the_role_and_architecture() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config: Config =
+            toml::from_str("name = \"w\"\naddress = \"h\"\nwitness = true").unwrap();
+        register_witness(&cluster, &config).await.unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert_eq!(node.name, "w");
+        assert!(node.spec.witness);
+        assert_eq!(node.spec.address, "h:8006");
+        assert_eq!(
+            node.status,
+            NodeStatus {
+                online: true,
+                arch: Some(Arch::native()),
+                ..NodeStatus::default()
+            }
+        );
+
+        mark_offline(&cluster).await;
+        register_witness(&cluster, &config).await.unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert!(node.spec.witness);
+        assert!(node.status.online);
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 합류할 때 정한 역할과 설정의 `witness`가 다르면 시작하지 않는다. Node 리소스가 없으면 본다.
+    #[tokio::test]
+    async fn a_role_change_in_the_config_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, _) = single_node(dir.path()).await;
+        let witness: Config =
+            toml::from_str("name = \"w\"\naddress = \"h\"\nwitness = true").unwrap();
+        let normal = test_config();
+        check_role(&cluster, &witness).unwrap();
+        check_role(&cluster, &normal).unwrap();
+
+        register_witness(&cluster, &witness).await.unwrap();
+        check_role(&cluster, &witness).unwrap();
+        let err = check_role(&cluster, &normal).unwrap_err().to_string();
+        assert!(
+            err.contains("joined as a witness but opld.toml says witness = false"),
+            "{err}"
+        );
+
+        let NodeId(id) = cluster.id();
+        let node = cluster.get::<NodeSpec>(id).unwrap().unwrap();
+        let spec = NodeSpec {
+            witness: false,
+            ..node.spec
+        };
+        cluster
+            .update_spec(id, None, node.labels, &spec)
+            .await
+            .unwrap();
+        check_role(&cluster, &normal).unwrap();
+        let err = check_role(&cluster, &witness).unwrap_err().to_string();
+        assert!(
+            err.contains("joined as a non-witness node but opld.toml says witness = true"),
+            "{err}"
+        );
         cluster.shutdown().await.unwrap();
     }
 

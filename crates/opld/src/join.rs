@@ -84,7 +84,7 @@ pub async fn request(config: &Config, node: Uuid, url: &JoinUrl) -> anyhow::Resu
             address: config.api_address(),
             cluster_address: config.cluster_address(),
             csr_pem,
-            witness: false,
+            witness: config.witness,
         })
         .send()
         .await

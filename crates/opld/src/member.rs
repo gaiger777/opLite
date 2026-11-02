@@ -1,5 +1,6 @@
 //! 클러스터 멤버로 도는 노드: 노드 간 서버, 클러스터 저장소, reconciler, Task 실행기, HTTPS API,
-//! 노드 감시, 예약 스냅샷, 클러스터 정리, 노드별 풀 상태.
+//! 노드 감시, 예약 스냅샷, 클러스터 정리, 노드별 풀 상태. 위트니스는 노드 간 서버와 클러스터
+//! 저장소, 승격, Node 등록만 띄운다.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -16,7 +17,7 @@ use opl_api::{
     TaskRunnerConfig, UefiVarsFetcher,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
-use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError};
+use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
 use opl_driver::{
     DirStorage, Hypervisor, LvmSharedStorage, LvmThinStorage, QemuHypervisor, RbdStorage, Storage,
     Storages, SystemLvm, SystemRbd, SystemZfs, ZfsStorage, migration_tls_dir, write_migration_tls,
@@ -78,10 +79,16 @@ pub struct Created {
     pub ca_fingerprint: String,
 }
 
+/// 위트니스가 `oplctl cluster init`을 받았을 때의 답
+pub const WITNESS_CANNOT_INIT: &str =
+    "a witness cannot start a cluster; join an existing cluster instead";
+
 /// 노드에서 노드 간 통신에 쓰는 Raft 설정. 스냅샷 조각은 JSON으로 가므로 작게 둔다.
-fn raft_config() -> openraft::Config {
+fn raft_config(witness: bool) -> openraft::Config {
     openraft::Config {
         cluster_name: "opl".into(),
+        // 위트니스는 투표는 하지만 후보가 되지 않는다. 리더 일은 늘 일반 노드가 한다.
+        enable_elect: !witness,
         heartbeat_interval: 200,
         election_timeout_min: 1000,
         election_timeout_max: 2000,
@@ -98,10 +105,8 @@ struct Server<E> {
     task: JoinHandle<Result<(), E>>,
 }
 
-pub struct Member {
-    config: Config,
-    cluster: Arc<Cluster>,
-    peer: Server<opl_peer::ServeError>,
+/// 위트니스가 띄우지 않는 것: HTTPS API와 VM·풀을 다스리는 일, 리더의 일
+struct Services {
     api: Server<std::io::Error>,
     reconciler: Reconciler,
     runner: TaskRunner,
@@ -109,6 +114,32 @@ pub struct Member {
     schedule: SnapshotScheduler,
     janitor: ClusterJanitor,
     pools: PoolMounter,
+}
+
+impl Services {
+    async fn shutdown(mut self) {
+        let _ = self.api.stop.send(());
+        if tokio::time::timeout(DRAIN_TIMEOUT, &mut self.api.task)
+            .await
+            .is_err()
+        {
+            self.api.task.abort();
+        }
+        self.monitor.shutdown().await;
+        self.schedule.shutdown().await;
+        self.janitor.shutdown().await;
+        self.pools.shutdown().await;
+        self.runner.shutdown().await;
+        self.reconciler.shutdown().await;
+    }
+}
+
+pub struct Member {
+    config: Config,
+    cluster: Arc<Cluster>,
+    peer: Server<opl_peer::ServeError>,
+    /// 위트니스면 없다.
+    services: Option<Services>,
     register: JoinHandle<()>,
     promotion: JoinHandle<()>,
     /// 서버 태스크가 끝나면 그 이유가 온다.
@@ -129,13 +160,24 @@ impl Member {
         let id = NodeId(node);
         let peers = Arc::new(Peers::new(&tls));
         let mut cluster_config = ClusterConfig::new(id, cluster_dir(config));
-        cluster_config.raft = raft_config();
+        cluster_config.raft = raft_config(config.witness);
         cluster_config.write_timeout = WRITE_TIMEOUT;
         let cluster = Arc::new(
             Cluster::open(cluster_config, GrpcNetwork::new(peers.clone()))
                 .await?
                 .with_forwarder(peers.clone()),
         );
+        // 역할은 합류할 때 정해진다. 설정만 바꿔 다시 시작하면 아무것도 띄우지 않는다.
+        if matches!(bootstrap, Bootstrap::Restart)
+            && let Err(e) = bootstrap::check_role(&cluster, config)
+        {
+            let _ = cluster.shutdown().await;
+            return Err(e);
+        }
+        if config.witness {
+            let member = Self::start_witness(config, cluster, peers, tls, bootstrap).await?;
+            return Ok((member, None));
+        }
         // 포트가 이미 쓰이고 있으면 아무것도 띄우기 전에 실패한다.
         let ports = async {
             let api = TcpListener::bind(config.listen)
@@ -199,7 +241,6 @@ impl Member {
                 .with_lvm_shared(Arc::new(lvm_shared)),
         );
         let (exited_tx, exited) = mpsc::channel(2);
-        let (stop, rx) = oneshot::channel::<()>();
         // 받는 VM은 원본 노드에 배정된 채이므로 reconciler 없이 받는다.
         let incoming = IncomingMigrations::new(
             cluster.clone(),
@@ -216,17 +257,7 @@ impl Member {
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(incoming))
             .with_uefi_vars(config.data_dir.clone());
-        let peer_tls = tls.clone();
-        let tx = exited_tx.clone();
-        let task = tokio::spawn(async move {
-            let r = opl_peer::serve(peer_listener, &peer_tls, service, async {
-                let _ = rx.await;
-            })
-            .await;
-            let _ = tx.send(format!("cluster server stopped: {r:?}")).await;
-            r
-        });
-        let peer = Server { stop, task };
+        let peer = serve_peer(peer_listener, &tls, service, exited_tx.clone());
 
         // 여기서 실패하면 노드 간 서버와 저장소를 닫는다.
         let first_time = !matches!(bootstrap, Bootstrap::Restart);
@@ -285,12 +316,7 @@ impl Member {
         };
 
         // 다시 시작한 노드는 과반수가 없어도 VM을 계속 다스려야 하므로, Node 리소스는 뒤에서 기록한다.
-        let promotion = if first_time {
-            tokio::spawn(async {})
-        } else {
-            let (cluster, peers) = (cluster.clone(), peers.clone());
-            tokio::spawn(async move { promote_until_voter(&cluster, &peers).await })
-        };
+        let promotion = spawn_promotion(first_time, &cluster, &peers);
         // 풀 마운터가 QEMU의 rbd 블록 드라이버를 확인한다.
         let qemu_binary = host.profile.qemu_binary.clone();
         // 받은 UEFI 변수 파일의 크기를 이 노드의 템플릿과 견준다.
@@ -381,18 +407,90 @@ impl Member {
             config: config.clone(),
             cluster,
             peer,
-            api: Server { stop, task },
-            reconciler,
-            runner,
-            monitor,
-            schedule,
-            janitor,
-            pools,
+            services: Some(Services {
+                api: Server { stop, task },
+                reconciler,
+                runner,
+                monitor,
+                schedule,
+                janitor,
+                pools,
+            }),
             register,
             promotion,
             exited,
         };
         Ok((member, created))
+    }
+
+    /// 위트니스로 시작한다. 노드 간 서버(하이퍼바이저 없음)와 승격, Node 등록만 띄우고 QEMU를 찾지
+    /// 않는다. 위트니스는 클러스터를 만들 수 없다(`Init`은 main이 먼저 거부한다).
+    async fn start_witness(
+        config: &Config,
+        cluster: Arc<Cluster>,
+        peers: Arc<Peers>,
+        tls: NodeTls,
+        bootstrap: Bootstrap,
+    ) -> anyhow::Result<Self> {
+        let peer_listener = match TcpListener::bind(config.cluster_listen)
+            .await
+            .with_context(|| format!("cannot listen on {}", config.cluster_listen))
+        {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = cluster.shutdown().await;
+                return Err(e);
+            }
+        };
+        let (exited_tx, exited) = mpsc::channel(2);
+        // 마이그레이션과 UEFI 변수는 받지 않는다.
+        let service = PeerService::new(cluster.clone(), None);
+        let peer = serve_peer(peer_listener, &tls, service, exited_tx);
+        let first_time = !matches!(bootstrap, Bootstrap::Restart);
+        let prepared = async {
+            match bootstrap {
+                Bootstrap::Restart => {}
+                Bootstrap::Init { .. } => anyhow::bail!(WITNESS_CANNOT_INIT),
+                Bootstrap::Join { via } => {
+                    tls.save(&pki_dir(config))?;
+                    promote(&cluster, &peers, Some(&via)).await?;
+                    bootstrap::register_witness(&cluster, config).await?;
+                }
+            }
+            anyhow::Ok(())
+        };
+        if let Err(e) = prepared.await {
+            let _ = peer.stop.send(());
+            let _ = peer.task.await;
+            let _ = cluster.shutdown().await;
+            return Err(e);
+        }
+        let promotion = spawn_promotion(first_time, &cluster, &peers);
+        let register = {
+            let (cluster, config) = (cluster.clone(), config.clone());
+            tokio::spawn(async move {
+                if !first_time {
+                    while let Err(e) = bootstrap::register_witness(&cluster, &config).await {
+                        tracing::warn!(error = %e, "cannot register this node; will retry");
+                        tokio::time::sleep(REGISTER_RETRY).await;
+                    }
+                }
+            })
+        };
+        tracing::info!(
+            node = %cluster.id(),
+            cluster = %config.cluster_listen,
+            "opld is ready as a witness"
+        );
+        Ok(Member {
+            config: config.clone(),
+            cluster,
+            peer,
+            services: None,
+            register,
+            promotion,
+            exited,
+        })
     }
 
     pub fn cluster(&self) -> &Cluster {
@@ -407,16 +505,13 @@ impl Member {
         }
     }
 
-    /// 클러스터에서 빠진다. 이 노드에 배정된 VM이 있거나 이 노드가 유일한 투표 멤버면 거부한다.
+    /// 클러스터에서 빠진다. 이 노드에 배정된 VM이 있거나, 남는 투표 멤버가 없거나 모두 위트니스면
+    /// 거부한다.
     /// 성공하면 `close(true)`로 닫는다.
     pub async fn leave(&self) -> anyhow::Result<()> {
         let me = self.cluster.id();
-        let members = self.cluster.members();
-        if members.voters.len() == 1 && members.voters.contains_key(&me) {
-            anyhow::bail!(
-                "this node is the only voting member; stop opld and remove its data directory instead"
-            );
-        }
+        let (_, nodes) = self.cluster.list::<NodeSpec>()?;
+        check_leave(me, &self.cluster.members().voters, &nodes)?;
         let (_, vms) = self.cluster.list::<VmSpec>()?;
         if let Some(vm) = vms
             .iter()
@@ -441,19 +536,9 @@ impl Member {
     /// 모든 것을 멈춘다. `left`면 클러스터에서 빠진 것이므로 클러스터 저장소와 노드 인증서를 지운다.
     /// 아니면 오프라인으로 기록한다. 실행 중인 VM은 그대로 둔다.
     pub async fn close(mut self, left: bool) -> anyhow::Result<()> {
-        let _ = self.api.stop.send(());
-        if tokio::time::timeout(DRAIN_TIMEOUT, &mut self.api.task)
-            .await
-            .is_err()
-        {
-            self.api.task.abort();
+        if let Some(services) = self.services.take() {
+            services.shutdown().await;
         }
-        self.monitor.shutdown().await;
-        self.schedule.shutdown().await;
-        self.janitor.shutdown().await;
-        self.pools.shutdown().await;
-        self.runner.shutdown().await;
-        self.reconciler.shutdown().await;
         self.register.abort();
         self.promotion.abort();
         if !left {
@@ -482,6 +567,59 @@ impl Member {
         shutdown?;
         Ok(())
     }
+}
+
+/// 이 노드가 빠진 뒤에도 리더가 될 수 있는 투표 멤버가 남는지 본다. 위트니스는 후보가 되지 않으므로
+/// 위트니스만 남으면 클러스터에 리더가 영영 생기지 않는다. Node 리소스가 없는 투표 멤버는 일반 노드로
+/// 본다(`get_cluster`처럼).
+fn check_leave(
+    me: NodeId,
+    voters: &BTreeMap<NodeId, String>,
+    nodes: &[Typed<NodeSpec>],
+) -> anyhow::Result<()> {
+    let mut rest = voters.keys().filter(|&&id| id != me).peekable();
+    if rest.peek().is_none() {
+        anyhow::bail!(
+            "this node is the only voting member; stop opld and remove its data directory instead"
+        );
+    }
+    let witness = |id: &NodeId| nodes.iter().any(|n| n.id == id.0 && n.spec.witness);
+    if rest.all(witness) {
+        anyhow::bail!(
+            "the remaining voting members are all witnesses, which cannot lead; add another \
+             non-witness node first"
+        );
+    }
+    Ok(())
+}
+
+/// 노드 간 서버를 띄운다. 서버가 스스로 멈추면 `exited`로 알린다.
+fn serve_peer(
+    listener: TcpListener,
+    tls: &NodeTls,
+    service: PeerService,
+    exited: mpsc::Sender<String>,
+) -> Server<opl_peer::ServeError> {
+    let (stop, rx) = oneshot::channel::<()>();
+    let tls = tls.clone();
+    let task = tokio::spawn(async move {
+        let r = opl_peer::serve(listener, &tls, service, async {
+            let _ = rx.await;
+        })
+        .await;
+        let _ = exited.send(format!("cluster server stopped: {r:?}")).await;
+        r
+    });
+    Server { stop, task }
+}
+
+/// 다시 시작한 노드는 투표 멤버가 될 때까지 승격을 다시 요청한다. 처음 멤버가 된 노드는 이미 했다.
+fn spawn_promotion(first_time: bool, cluster: &Arc<Cluster>, peers: &Arc<Peers>) -> JoinHandle<()> {
+    if first_time {
+        return tokio::spawn(async {});
+    }
+    let (cluster, peers) = (cluster.clone(), peers.clone());
+    tokio::spawn(async move { promote_until_voter(&cluster, &peers).await })
 }
 
 /// 클러스터 저장소(Raft 로그와 상태)를 지운다. 없으면 그대로 성공한다.
@@ -618,4 +756,55 @@ fn voter_addr(cluster: &Cluster) -> Option<String> {
         .and_then(|leader| members.voters.get(&leader))
         .or_else(|| members.voters.values().next())
         .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opl_types::resource::Resource;
+
+    #[test]
+    fn a_witness_does_not_stand_for_election() {
+        assert!(raft_config(false).enable_elect);
+        assert!(!raft_config(true).enable_elect);
+    }
+
+    /// 남는 투표 멤버가 없거나 모두 위트니스면(리더가 될 수 없다) 빠지지 않는다.
+    #[test]
+    fn leaving_keeps_a_voter_that_can_lead() {
+        let node = |witness: bool| {
+            let mut node = Resource::new(
+                "n",
+                NodeSpec {
+                    address: "h:8006".into(),
+                    maintenance: false,
+                    witness,
+                },
+            );
+            node.id = Uuid::now_v7();
+            node
+        };
+        let (a, b, w) = (node(false), node(false), node(true));
+        let id = |n: &Typed<NodeSpec>| NodeId(n.id);
+        let voters = |nodes: &[&Typed<NodeSpec>]| {
+            nodes
+                .iter()
+                .map(|n| (id(n), String::new()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let nodes = [a.clone(), b.clone(), w.clone()];
+
+        // 혼자 남은 투표 멤버
+        let only = check_leave(id(&a), &voters(&[&a]), &nodes).unwrap_err();
+        assert!(only.to_string().contains("only voting member"), "{only}");
+        // 위트니스만 남는다.
+        let err = check_leave(id(&a), &voters(&[&a, &w]), &nodes).unwrap_err();
+        assert!(err.to_string().contains("all witnesses"), "{err}");
+        // 일반 노드가 남으면 누구든 빠질 수 있다. 위트니스도.
+        check_leave(id(&a), &voters(&[&a, &b, &w]), &nodes).unwrap();
+        check_leave(id(&w), &voters(&[&a, &b, &w]), &nodes).unwrap();
+        check_leave(id(&w), &voters(&[&a, &w]), &nodes).unwrap();
+        // Node 리소스가 없는 투표 멤버는 일반 노드로 본다(get_cluster처럼).
+        check_leave(id(&a), &voters(&[&a, &b, &w]), &[a.clone(), w.clone()]).unwrap();
+    }
 }

@@ -16,6 +16,10 @@ pub struct Config {
     /// 다른 노드와 클라이언트가 이 노드에 닿는 호스트(IP나 DNS 이름). 노드 인증서에 들어가고,
     /// 클러스터에 알리는 주소(`address:포트`)가 된다. 나중에 바꿀 수 없다.
     pub address: String,
+    /// 위트니스 노드: VM을 돌리지 않고 선거에 나서지 않는 Raft 투표 멤버. 합류만 할 수 있고, HTTPS
+    /// API를 열지 않으며 `[hypervisor]`·`[pools]`·`[migration]`을 쓰지 않는다(QEMU가 없어도 된다).
+    #[serde(default)]
+    pub witness: bool,
     /// API(HTTPS)를 받을 소켓 주소
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
@@ -495,6 +499,7 @@ mod tests {
     #[test]
     fn fills_defaults() {
         let c = parse("name = \"node1\"\naddress = \"10.0.0.5\"");
+        assert!(!c.witness);
         assert_eq!(c.listen, "0.0.0.0:8006".parse().unwrap());
         assert_eq!(c.api_address(), "10.0.0.5:8006");
         assert_eq!(c.cluster_address(), "10.0.0.5:8007");
@@ -521,6 +526,15 @@ mod tests {
             c.cert_names(),
             ["10.0.0.5", "localhost", "127.0.0.1", "::1"]
         );
+    }
+
+    #[test]
+    fn witness_is_a_top_level_flag() {
+        let c = parse(
+            "name = \"w\"\naddress = \"h\"\nwitness = true\n[hypervisor]\nqemu_binary = \"/nonexistent/qemu\"",
+        );
+        assert!(c.witness);
+        c.validate().unwrap();
     }
 
     #[test]
