@@ -93,6 +93,23 @@ it("follows the chosen node's architecture until a machine is picked", async () 
   expect(machine).toHaveValue("virt");
 });
 
+it("does not offer witness nodes", async () => {
+  const arm = { ...NODE, status: { ...NODE.status, arch: "aarch64" as const } };
+  const witness = {
+    ...NODE,
+    id: "n2",
+    name: "node-w",
+    spec: { ...NODE.spec, witness: true },
+    status: { ...NODE.status, arch: "x86_64" as const },
+  };
+  mockLists({ node: [arm, witness] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  // 위트니스의 아키텍처는 머신 기본값에 섞이지 않는다.
+  expect(await screen.findByLabelText("Machine type")).toHaveValue("virt");
+  expect(screen.getByRole("option", { name: "node-a" })).toBeInTheDocument();
+  expect(screen.queryByRole("option", { name: "node-w" })).not.toBeInTheDocument();
+});
+
 it("keeps the machine of an edited VM when its node changes", async () => {
   const arm = { ...NODE, status: { ...NODE.status, arch: "aarch64" as const } };
   const x86 = {

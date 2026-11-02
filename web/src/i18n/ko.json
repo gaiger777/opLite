@@ -36,7 +36,7 @@
     "too_many_attempts": "시도가 너무 많습니다. 잠시 뒤에 다시 하세요.",
     "machine_arch_mismatch": "선택한 노드의 아키텍처와 머신 종류가 맞지 않습니다.",
     "migration_unsupported": "이 VM은 마이그레이션할 수 없습니다: {{message}}",
-    "node_unavailable": "대상 노드가 오프라인이거나 유지보수 중입니다.",
+    "node_unavailable": "대상 노드가 위트니스이거나 오프라인이거나 유지보수 중입니다.",
     "no_capacity": "대상 노드가 이 VM을 받을 수 없습니다: {{message}}",
     "task_failed": "작업 오류: {{message}}",
     "internal": "서버 오류: {{message}}"

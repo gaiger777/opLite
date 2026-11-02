@@ -333,9 +333,10 @@ pub fn pool_state_on<'a>(pool: &StoragePool, node: &'a Node) -> Option<&'a PoolS
 /// 디렉터리 풀은 노드가 상태를 아직 알리지 않았어도(옛 노드, 첫 새로 고침 전) 쓸 수 있다고 보고
 /// 준비되지 않았다고 알렸을 때만 막는다. NFS 풀은 마운트됐다고, LVM-thin 풀은 thin pool이, ZFS 풀은
 /// 데이터셋이 있다고, RBD 풀은 Ceph 풀에 닿는다고, 공유 LVM 풀은 공유 VG의 잠금이 시작됐다고 알려야
-/// 한다.
+/// 한다. 위트니스 노드는 풀을 쓰지 않는다.
 pub fn pool_usable_on(pool: &StoragePool, node: &Node) -> bool {
-    pool_listed_on(pool, node.id)
+    !node.spec.witness
+        && pool_listed_on(pool, node.id)
         && match pool_state_on(pool, node) {
             Some(state) => state.ready,
             None => matches!(pool.spec.backend, PoolBackend::Dir { .. }),
@@ -344,6 +345,9 @@ pub fn pool_usable_on(pool: &StoragePool, node: &Node) -> bool {
 
 /// 노드에서 풀이 준비되지 않은 이유. 노드가 알린 오류이고, 상태를 아직 알리지 않았으면 그렇게 적는다.
 pub fn pool_error_on(pool: &StoragePool, node: &Node) -> String {
+    if node.spec.witness {
+        return "witness nodes do not use storage pools".into();
+    }
     match pool_state_on(pool, node) {
         Some(state) => state.error.clone().unwrap_or_else(|| "not ready".into()),
         None => "no status reported yet".into(),
@@ -612,6 +616,7 @@ mod tests {
             NodeSpec {
                 address: "a".into(),
                 maintenance: false,
+                witness: false,
             },
         );
         let mut pool = StoragePool::new("p", nfs("nas", "/srv/vm", None));
@@ -669,6 +674,16 @@ mod tests {
         assert!(!pool_usable_on(&pool, &node));
         pool.spec.nodes.push(node.id);
         assert!(pool_usable_on(&pool, &node));
+        // 위트니스에서는 준비됐다고 알렸거나 상태가 없어도 되는 디렉터리 풀이라도 쓸 수 없다.
+        node.spec.witness = true;
+        assert!(!pool_usable_on(&pool, &node));
+        assert_eq!(
+            pool_error_on(&pool, &node),
+            "witness nodes do not use storage pools"
+        );
+        dir.spec.nodes.clear();
+        node.status.pools.remove("d");
+        assert!(!pool_usable_on(&dir, &node));
     }
 
     fn lvm(vg: &str, thinpool: &str) -> StoragePoolSpec {
@@ -767,6 +782,7 @@ mod tests {
             NodeSpec {
                 address: "a".into(),
                 maintenance: false,
+                witness: false,
             },
         );
         // 디렉터리 풀과 달리 상태를 알리기 전에는 쓸 수 없다.
@@ -893,6 +909,7 @@ mod tests {
             NodeSpec {
                 address: "a".into(),
                 maintenance: false,
+                witness: false,
             },
         );
         assert!(!pool_usable_on(&pool, &node));
@@ -1041,6 +1058,7 @@ mod tests {
             crate::node::NodeSpec {
                 address: "a".into(),
                 maintenance: false,
+                witness: false,
             },
         );
         // 디렉터리 풀과 달리 준비됐다는 상태가 있어야 쓸 수 있다.
@@ -1201,6 +1219,7 @@ mod tests {
             crate::node::NodeSpec {
                 address: "a".into(),
                 maintenance: false,
+                witness: false,
             },
         );
         assert!(!pool_usable_on(&pool, &node));

@@ -1680,15 +1680,19 @@ fn pool_location(pool: &Value) -> String {
     }
 }
 
-/// 풀을 쓸 수 있는 노드. 노드 목록이 비었으면 모든 노드이고, 아니면 목록의 노드를 그 순서대로
-/// 본다. 목록에 있지만 없는 노드는 그 id(`Err`)다.
+/// 풀을 쓸 수 있는 노드. 노드 목록이 비었으면 위트니스가 아닌 모든 노드이고, 아니면 목록의 노드를
+/// 그 순서대로 본다. 목록에 있지만 없는 노드는 그 id(`Err`)다.
 fn pool_nodes<'a>(pool: &'a Value, nodes: &'a [Value]) -> Vec<Result<&'a Value, &'a Value>> {
     match pool["spec"]["nodes"].as_array() {
         Some(listed) if !listed.is_empty() => listed
             .iter()
             .map(|id| nodes.iter().find(|n| n["id"] == *id).ok_or(id))
             .collect(),
-        _ => nodes.iter().map(Ok).collect(),
+        _ => nodes
+            .iter()
+            .filter(|n| n["spec"]["witness"] != true)
+            .map(Ok)
+            .collect(),
     }
 }
 
@@ -2658,6 +2662,13 @@ mod tests {
                 true,
                 json!({ "nas": { "pool_id": "id-old", "ready": true, "error": null } }),
             ),
+            // 위트니스는 풀을 쓰지 않으므로 "모든 노드"에 들지 않는다.
+            json!({
+                "id": "id-w",
+                "name": "w",
+                "spec": { "witness": true },
+                "status": { "online": true, "pools": {} },
+            }),
         ];
         let nas = json!({
             "id": "id-nas",

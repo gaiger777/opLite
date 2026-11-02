@@ -21,6 +21,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
         NodeSpec {
             address: "127.0.0.2:0".into(),
             maintenance: false,
+            witness: false,
         },
     );
     node.status = NodeStatus {
@@ -218,6 +219,15 @@ async fn migrate_checks_the_nodes() {
     .await;
     assert_conflict(migrate(&admin, "web", "node2").await, "node_unavailable");
     edit_node(&env, node2, |n| n.spec.maintenance = false).await;
+    // 위트니스는 VM을 받지 않는다.
+    edit_node(&env, node2, |n| n.spec.witness = true).await;
+    let (status, body) = migrate(&admin, "web", "node2").await;
+    assert_eq!(
+        body["message"], "node \"node2\" is a witness node and cannot run VMs",
+        "{body}"
+    );
+    assert_conflict((status, body), "node_unavailable");
+    edit_node(&env, node2, |n| n.spec.witness = false).await;
 
     edit_node(&env, node2, |n| n.status.arch = Some(Arch::X86_64)).await;
     let (status, body) = migrate(&admin, "web", "node2").await;

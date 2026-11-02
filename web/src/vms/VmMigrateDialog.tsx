@@ -22,14 +22,20 @@ const ARCH_OF: Record<Schemas["MachineType"], Schemas["Arch"]> = {
 };
 
 /**
- * 옮겨 갈 수 있어 보이는 노드: 온라인이고 유지보수 중이 아니며 VM 머신의 아키텍처인, 지금 노드가 아닌 노드.
+ * 옮겨 갈 수 있어 보이는 노드: 위트니스가 아니고 온라인이고 유지보수 중이 아니며 VM 머신의 아키텍처인,
+ * 지금 노드가 아닌 노드.
  * 풀·브리지·메모리는 서버가 본다(409로 알린다).
  */
 export function migrationTargets(vm: Vm, nodes: readonly Node[]): Node[] {
   const here = vm.spec.node ?? vm.status.node;
   const arch = ARCH_OF[vm.spec.machine];
   return nodes.filter(
-    (n) => n.id !== here && n.status.online && !n.spec.maintenance && n.status.arch === arch,
+    (n) =>
+      n.id !== here &&
+      !n.spec.witness &&
+      n.status.online &&
+      !n.spec.maintenance &&
+      n.status.arch === arch,
   );
 }
 

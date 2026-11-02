@@ -18,6 +18,9 @@ pub struct NodeSpec {
     /// 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다.
     #[serde(default)]
     pub maintenance: bool,
+    /// 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다.
+    #[serde(default)]
+    pub witness: bool,
 }
 
 impl ResourceSpec for NodeSpec {
@@ -76,6 +79,12 @@ mod tests {
         let spec: NodeSpec =
             serde_json::from_value(serde_json::json!({ "address": "10.0.0.1:8006" })).unwrap();
         assert!(!spec.maintenance);
+        assert!(!spec.witness);
+        let witness: NodeSpec = serde_json::from_value(
+            serde_json::json!({ "address": "10.0.0.1:8006", "witness": true }),
+        )
+        .unwrap();
+        assert!(witness.witness);
         let status: NodeStatus = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(status, NodeStatus::default());
     }

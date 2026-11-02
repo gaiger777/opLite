@@ -348,6 +348,7 @@ async fn leader_records_when_nodes_go_offline_and_come_back() {
             NodeSpec {
                 address: node.addr.clone(),
                 maintenance: false,
+                witness: false,
             },
         );
         r.id = node.id().0;
@@ -411,6 +412,7 @@ async fn new_leader_does_not_revive_nodes_recorded_offline() {
             NodeSpec {
                 address: node.addr.clone(),
                 maintenance: false,
+                witness: false,
             },
         );
         r.id = node.id().0;

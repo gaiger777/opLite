@@ -367,6 +367,7 @@ async fn volume_tasks_go_to_the_lowest_ready_node(backend: Value) {
         NodeSpec {
             address: "127.0.0.1:1".into(),
             maintenance: false,
+            witness: false,
         },
     );
     low.id = Uuid::nil();
@@ -401,6 +402,58 @@ async fn volume_tasks_go_to_the_lowest_ready_node(backend: Value) {
     let (status, task) = admin.delete("/volumes/r").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     assert_eq!(task["spec"]["node"], low, "{task}");
+}
+
+/// 위트니스는 볼륨 Task를 맡지 않는다. id가 가장 작고 풀이 준비됐다고 알렸어도, 상태를 알리지 않아도
+/// 되는 디렉터리 풀이라도 고르지 않는다.
+#[tokio::test]
+async fn volume_tasks_never_go_to_a_witness() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let admin = env.admin().await;
+    let backends = [
+        ("ceph", json!({ "kind": "rbd", "pool": "rbd" })),
+        ("local", json!({ "kind": "dir", "path": env.dir.path() })),
+    ];
+    for (name, backend) in &backends {
+        let (status, body) = admin
+            .post("/storage-pools", pool(name, backend.clone()))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    env.pool_ready("ceph").await;
+    let mut witness: Node = Resource::new(
+        "w",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: true,
+        },
+    );
+    witness.id = Uuid::nil();
+    env.cluster.create(&witness).await.unwrap();
+    witness.status.online = true;
+    env.cluster
+        .update_status::<NodeSpec>(witness.id, &witness.status)
+        .await
+        .unwrap();
+    common::mark_pool_ready(&env.cluster, witness.id, "ceph").await;
+
+    let create = |name: &str, pool: &str| json!({ "name": name, "spec": { "pool": pool, "size_bytes": 1 << 20, "format": "raw" } });
+    let (status, task) = admin.post("/volumes", create("r", "ceph")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], env.node.to_string(), "{task}");
+
+    // 이 노드에서 디렉터리 풀이 준비되지 않았으면 맡을 노드가 없다.
+    let state = PoolState {
+        ready: false,
+        error: Some("no such directory".into()),
+        ..Default::default()
+    };
+    common::set_pool_state(&env.cluster, env.node, "local", state).await;
+    let (status, body) = admin.post("/volumes", create("d", "local")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "pool_unavailable");
 }
 
 /// 공유 LVM 풀은 늘 공유이고 raw 볼륨만 담는다. 가져오기의 기본 형식은 raw다.
@@ -470,6 +523,7 @@ async fn other_node(env: &Env, name: &str, online: bool, pools: &[&str]) -> Uuid
         NodeSpec {
             address: "127.0.0.1:1".into(),
             maintenance: false,
+            witness: false,
         },
     );
     node.status.online = online;

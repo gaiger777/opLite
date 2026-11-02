@@ -306,6 +306,9 @@ pub struct JoinRequest {
     pub cluster_address: String,
     /// 새 노드가 만든 키의 CSR(PEM)
     pub csr_pem: String,
+    /// 새 노드가 위트니스(투표만 하고 VM을 돌리지 않는 노드)인지
+    #[serde(default)]
+    pub witness: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -424,6 +427,7 @@ pub async fn join(
     let spec = NodeSpec {
         address: req.address.clone(),
         maintenance: false,
+        witness: req.witness,
     };
     match state.cluster.get::<NodeSpec>(req.node)? {
         Some(node) => {

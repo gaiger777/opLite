@@ -63,6 +63,12 @@ it("offers online nodes of the same architecture other than the current one", ()
   // x86_64 머신(q35)은 x86_64 노드로만
   const q35 = { ...web, spec: { ...web.spec, machine: "q35" as const } };
   expect(migrationTargets(q35, NODES).map((n) => n.name)).toEqual(["node-e"]);
+  // 위트니스는 VM을 받지 않는다.
+  const witness = { ...node("n8", "node-w"), spec: { ...NODE.spec, witness: true } };
+  expect(migrationTargets(web, [...NODES, witness]).map((n) => n.name)).toEqual([
+    "node-b",
+    "node-g",
+  ]);
 });
 
 it("migrates a running VM to the chosen node", async () => {

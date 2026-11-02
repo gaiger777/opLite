@@ -83,6 +83,9 @@ it("picks the machine from the node architecture", () => {
   expect(defaultMachine([arm, x86])).toBe("q35");
   expect(defaultMachine([unknown])).toBe("q35");
   expect(defaultMachine([])).toBe("q35");
+  // 위트니스는 VM을 돌리지 않으므로 그 아키텍처는 보지 않는다.
+  const witness = { ...x86, id: "n4", spec: { ...NODE.spec, witness: true } };
+  expect(defaultMachine([arm, witness])).toBe("virt");
 });
 
 it("matches the server's limits on cores, boot order and MACs", () => {

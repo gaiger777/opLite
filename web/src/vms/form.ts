@@ -67,15 +67,17 @@ const MACHINE_OF: Record<Schemas["Arch"], Schemas["MachineType"]> = {
 };
 
 /**
- * 머신 기본값: 지정 노드(`selectedNode`, 빈 문자열이면 자동)의 아키텍처, 아니면 아키텍처를 아는 노드가 모두
- * 같을 때 그 아키텍처의 머신, 그 밖에는 `q35`다.
+ * 머신 기본값: 지정 노드(`selectedNode`, 빈 문자열이면 자동)의 아키텍처, 아니면 아키텍처를 아는 노드(위트니스
+ * 제외)가 모두 같을 때 그 아키텍처의 머신, 그 밖에는 `q35`다.
  */
 export function defaultMachine(nodes: Node[], selectedNode = ""): Schemas["MachineType"] {
   const chosen = nodes.find((n) => n.id === selectedNode)?.status.arch;
   if (chosen) {
     return MACHINE_OF[chosen];
   }
-  const [only, ...others] = new Set(nodes.flatMap((n) => (n.status.arch ? [n.status.arch] : [])));
+  const [only, ...others] = new Set(
+    nodes.flatMap((n) => (n.status.arch && !n.spec.witness ? [n.status.arch] : [])),
+  );
   return only && others.length === 0 ? MACHINE_OF[only] : "q35";
 }
 

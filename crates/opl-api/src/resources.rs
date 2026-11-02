@@ -464,6 +464,7 @@ pub async fn delete_network(
 }
 
 /// 노드의 주소와 유지보수 모드를 바꾼다. 노드 리소스는 opld가 시작할 때 스스로 만든다.
+/// 역할(`witness`)은 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다.
 #[utoipa::path(put, path = "/nodes/{key}", tag = "nodes",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<NodeSpec>,
@@ -477,9 +478,13 @@ pub async fn update_node(
 ) -> Result<Json<Node>, ApiError> {
     state.authorize(&principal, Action::Write, NodeSpec::KIND)?;
     let node = lookup::<NodeSpec>(&state.cluster, &key)?;
+    let spec = NodeSpec {
+        witness: node.spec.witness,
+        ..req.spec
+    };
     state
         .cluster
-        .update_spec(node.id, if_match(&headers)?, req.labels, &req.spec)
+        .update_spec(node.id, if_match(&headers)?, req.labels, &spec)
         .await?;
     Ok(Json(lookup::<NodeSpec>(&state.cluster, &key)?))
 }

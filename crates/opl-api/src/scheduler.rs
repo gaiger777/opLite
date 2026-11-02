@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
-    "no node can run this VM (needs an online node that is not in maintenance, has the architecture of its machine type, can reach its storage pools and has the bridges of its networks)"
+    "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools and has the bridges of its networks)"
 )]
 pub struct NoNode;
 
@@ -80,7 +80,7 @@ impl Inventory {
     }
 }
 
-/// 온라인이고 유지보수 중이 아니며 머신 타입의 아키텍처이고 디스크의 풀을 쓸 수 있고 네트워크의 브리지가 있는 노드
+/// 위트니스가 아니고 온라인이고 유지보수 중이 아니며 머신 타입의 아키텍처이고 디스크의 풀을 쓸 수 있고 네트워크의 브리지가 있는 노드
 /// 가운데 미할당 메모리가 가장 많은 노드를 고른다. 같으면 id가 작은 노드다. 메모리가 모자라도 고른다(오버커밋 정책은
 /// 범위 밖). arch를 모르는 노드(옛 버전)는 고르지 않는다.
 pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode> {
@@ -96,6 +96,10 @@ pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode
 /// [`schedule`]가 이 노드를 후보로 보는지. 아니면 그 이유다. 메모리는 보지 않는다.
 pub fn node_fits(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), String> {
     let name = &node.name;
+    // 위트니스는 투표만 하는 노드다. 다른 조건과 상관없이 VM을 돌리지 않는다.
+    if node.spec.witness {
+        return Err(format!("node {name:?} is a witness node"));
+    }
     if !node.status.online {
         return Err(format!("node {name:?} is offline"));
     }
@@ -137,6 +141,7 @@ mod tests {
             NodeSpec {
                 address: "a".into(),
                 maintenance: false,
+                witness: false,
             },
         );
         n.status = NodeStatus {
@@ -273,6 +278,22 @@ mod tests {
 
         let empty = Inventory::default();
         assert_eq!(schedule(Uuid::now_v7(), &me, &empty), Err(NoNode));
+    }
+
+    #[test]
+    fn skips_witness_nodes() {
+        // 위트니스는 메모리가 많고 다른 조건을 갖춰도 VM을 돌리지 않는다.
+        let mut witness = node(64000);
+        witness.spec.witness = true;
+        let small = node(1024);
+        let mut inv = Inventory {
+            nodes: vec![witness, small.clone()],
+            ..Default::default()
+        };
+        let me = spec(512, None, PowerState::Running);
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(small.id));
+        inv.nodes.pop();
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
     }
 
     #[test]
@@ -457,6 +478,13 @@ mod tests {
         assert_eq!(
             node_fits(&me, &inv, &maint),
             Err("node \"n\" is in maintenance".into())
+        );
+        // 위트니스는 다른 조건보다 먼저 거절한다.
+        let mut witness = offline.clone();
+        witness.spec.witness = true;
+        assert_eq!(
+            node_fits(&me, &inv, &witness),
+            Err("node \"n\" is a witness node".into())
         );
         let mut x86 = ready.clone();
         x86.status.arch = Some(Arch::X86_64);

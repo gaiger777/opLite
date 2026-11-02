@@ -125,11 +125,14 @@ export function GeneralSection({
             }}
           >
             <NativeSelectOption value="">{t("vmForm.nodeAuto")}</NativeSelectOption>
-            {nodes?.map((n) => (
-              <NativeSelectOption key={n.id} value={n.id}>
-                {n.name}
-              </NativeSelectOption>
-            ))}
+            {/* 위트니스는 VM을 돌리지 않는다. */}
+            {nodes
+              ?.filter((n) => !n.spec.witness)
+              .map((n) => (
+                <NativeSelectOption key={n.id} value={n.id}>
+                  {n.name}
+                </NativeSelectOption>
+              ))}
           </NativeSelect>
         </Field>
         <Field id="vm-restart" label={t("vms.restart")}>

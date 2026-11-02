@@ -181,6 +181,7 @@ async fn two_nodes() -> (TempDir, Node, Node) {
             NodeSpec {
                 address: node.base.clone(),
                 maintenance: false,
+                witness: false,
             },
         );
         r.id = node.id;

@@ -964,6 +964,7 @@ async fn resize_only_grows_and_runs_where_the_volume_is_used() {
         NodeSpec {
             address: "127.0.0.1:1".into(),
             maintenance: false,
+            witness: false,
         },
     );
     env.cluster.create(&node).await.unwrap();

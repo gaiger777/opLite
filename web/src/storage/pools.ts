@@ -223,12 +223,16 @@ function poolStateOn(pool: StoragePool, node: Node): PoolState | undefined {
 }
 
 /**
- * 이 노드에서 풀을 쓸 수 있는지. 서버의 `pool_usable_on`(노드 목록이 허용하고 준비됐다고 알림 —
- * 디렉터리 풀은 알리지 않았어도 됨)에 노드가 온라인일 것을 더한다.
+ * 이 노드에서 풀을 쓸 수 있는지. 서버의 `pool_usable_on`(위트니스가 아니고 노드 목록이 허용하고
+ * 준비됐다고 알림 — 디렉터리 풀은 알리지 않았어도 됨)에 노드가 온라인일 것을 더한다.
  */
 function usableOn(pool: StoragePool, node: Node): boolean {
   const listed = pool.spec.nodes ?? [];
-  if (!node.status.online || (listed.length > 0 && !listed.includes(node.id))) {
+  if (
+    node.spec.witness ||
+    !node.status.online ||
+    (listed.length > 0 && !listed.includes(node.id))
+  ) {
     return false;
   }
   const state = poolStateOn(pool, node);
@@ -251,15 +255,15 @@ export function poolUsableSomewhere(pool: StoragePool, nodes: Node[]): boolean {
 }
 
 /**
- * 풀을 쓸 수 있는 노드와 그 노드가 알린 풀 상태. 노드 목록이 비었으면 모든 노드다. 꺼진 노드는
- * `offline`이다.
+ * 풀을 쓸 수 있는 노드와 그 노드가 알린 풀 상태. 노드 목록이 비었으면 위트니스가 아닌 모든 노드다.
+ * 꺼진 노드는 `offline`이다.
  */
 export function poolNodes(
   pool: StoragePool,
   nodes: Node[],
 ): { id: string; name: string; state: PoolState | undefined; offline: boolean }[] {
   const listed = pool.spec.nodes ?? [];
-  const ids = listed.length === 0 ? nodes.map((n) => n.id) : listed;
+  const ids = listed.length === 0 ? nodes.filter((n) => !n.spec.witness).map((n) => n.id) : listed;
   return ids.map((id) => {
     const node = nodes.find((n) => n.id === id);
     return {

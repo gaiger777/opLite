@@ -119,12 +119,24 @@ pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(
         let Some(node) = inv.nodes.iter().find(|n| n.id == id) else {
             return Err(ApiError::bad_request(format!("node {id} not found")));
         };
+        check_not_witness(node)?;
         check_node_arch(node, spec)?;
     }
     if spec.power == PowerState::Running && spec.node.is_none() {
         spec.node = Some(
             schedule(id, spec, &inv).map_err(|e| ApiError::conflict("no_node", e.to_string()))?,
         );
+    }
+    Ok(())
+}
+
+/// 위트니스 노드면 409 `node_unavailable`. 위트니스는 VM을 돌리지 않는다.
+fn check_not_witness(node: &Node) -> Result<(), ApiError> {
+    if node.spec.witness {
+        return Err(ApiError::conflict(
+            "node_unavailable",
+            format!("node {:?} is a witness node and cannot run VMs", node.name),
+        ));
     }
     Ok(())
 }
@@ -381,7 +393,7 @@ pub struct MigrateRequest {
 
 /// 실행 중인 VM을 다른 노드로 라이브 마이그레이션할 Task를 돌려준다(202). Task는 지금 노드의 실행기가
 /// 한다. 디스크가 모두 공유 풀에 있어야 하고, HVF(macOS) 노드는 원본도 대상도 될 수 없다(409
-/// `migration_unsupported`). 대상 노드가 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
+/// `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
 /// 스케줄러가 고를 수 없는 노드(풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
 #[utoipa::path(post, path = "/vms/{key}/migrate", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
@@ -450,6 +462,7 @@ pub async fn migrate_vm(
             ));
         }
     }
+    check_not_witness(&target)?;
     if !target.status.online || target.spec.maintenance {
         return Err(ApiError::conflict(
             "node_unavailable",

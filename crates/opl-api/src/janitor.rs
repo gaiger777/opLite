@@ -403,6 +403,7 @@ mod tests {
             NodeSpec {
                 address: "h:1".into(),
                 maintenance: false,
+                witness: false,
             },
         );
         n.status = NodeStatus {

@@ -1379,6 +1379,7 @@ mod tests {
             NodeSpec {
                 address: "h:8006".into(),
                 maintenance: false,
+                witness: false,
             },
         );
         me.id = node;

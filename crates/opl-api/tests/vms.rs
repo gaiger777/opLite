@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::{Env, vm_request};
 use opl_driver::DriverError;
-use opl_types::node::NodeSpec;
+use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{VolumePhase, VolumeSpec};
@@ -437,6 +437,48 @@ async fn machine_must_match_the_node_architecture() {
     let (code, body) = admin.post("/vms/x86/actions/start", Value::Null).await;
     assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "machine_arch_mismatch");
+}
+
+/// 위트니스는 VM을 돌리지 않는다. VM의 노드로 지정하면 만들 때도 고칠 때도 409다.
+#[tokio::test]
+async fn a_witness_cannot_hold_vms() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mut witness: Node = Resource::new(
+        "w",
+        NodeSpec {
+            address: "127.0.0.2:0".into(),
+            maintenance: false,
+            witness: true,
+        },
+    );
+    witness.status.online = true;
+    witness.status.arch = Some(Arch::Aarch64);
+    env.cluster.create(&witness).await.unwrap();
+
+    let mut req = vm_request("web");
+    req["spec"]["node"] = json!(witness.id);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "node_unavailable");
+    assert_eq!(
+        body["message"],
+        "node \"w\" is a witness node and cannot run VMs"
+    );
+
+    let (status, vm) = admin.post("/vms", vm_request("web")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let mut spec = vm["spec"].clone();
+    spec["node"] = json!(witness.id);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "node_unavailable");
+
+    // 노드를 정하지 않고 켜면 위트니스가 아닌 이 노드로 간다.
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, vm) = admin.get("/vms/web").await;
+    assert_eq!(vm["spec"]["node"], env.node.to_string());
 }
 
 #[tokio::test]

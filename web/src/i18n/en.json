@@ -36,7 +36,7 @@
     "too_many_attempts": "Too many attempts. Try again later.",
     "machine_arch_mismatch": "The machine type doesn't match the selected node's architecture.",
     "migration_unsupported": "This VM cannot be migrated: {{message}}",
-    "node_unavailable": "The target node is offline or in maintenance.",
+    "node_unavailable": "The target node is a witness, offline or in maintenance.",
     "no_capacity": "The target node cannot take this VM: {{message}}",
     "task_failed": "Task error: {{message}}",
     "internal": "The server failed: {{message}}"

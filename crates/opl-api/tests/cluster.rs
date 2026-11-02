@@ -76,6 +76,7 @@ fn join_request(token: &str, name: &str) -> (JoinRequest, Uuid) {
             address: "10.0.0.7:8006".into(),
             cluster_address: "10.0.0.7:8007".into(),
             csr_pem,
+            witness: false,
         },
         node,
     )
@@ -180,6 +181,56 @@ async fn a_rejoining_learner_gets_its_new_cluster_address() {
     let joined = env.cluster.get::<NodeSpec>(node).unwrap().unwrap();
     assert_eq!(joined.spec.address, "10.0.0.8:8006");
     assert!(joined.status.online);
+}
+
+/// 합류 요청의 `witness`가 Node의 역할이 된다. 적지 않으면 일반 노드다. 역할은 노드를 고쳐도
+/// 바뀌지 않는다.
+#[tokio::test]
+async fn a_witness_joins_as_a_witness() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    let (mut req, witness) = join_request(&new_token(&env).await, "w");
+    req.witness = true;
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let joined = env.cluster.get::<NodeSpec>(witness).unwrap().unwrap();
+    assert!(joined.spec.witness);
+    assert!(joined.status.online);
+
+    let (req, node) = join_request(&new_token(&env).await, "node2");
+    let mut body = json!(req);
+    body.as_object_mut().unwrap().remove("witness");
+    let (status, body) = anon.post("/cluster/join", body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !env.cluster
+            .get::<NodeSpec>(node)
+            .unwrap()
+            .unwrap()
+            .spec
+            .witness
+    );
+
+    let admin = env.admin().await;
+    for spec in [
+        json!({ "address": "10.0.0.7:8006", "maintenance": true }),
+        json!({ "address": "10.0.0.7:8006", "witness": false }),
+    ] {
+        let (status, body) = admin
+            .put(&format!("/nodes/{witness}"), json!({ "spec": spec }), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["spec"]["witness"], true, "{body}");
+    }
+    let (status, body) = admin
+        .put(
+            &format!("/nodes/{node}"),
+            json!({ "spec": { "address": "10.0.0.7:8006", "witness": true } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["witness"], false, "{body}");
 }
 
 #[tokio::test]

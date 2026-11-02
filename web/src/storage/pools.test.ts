@@ -298,6 +298,9 @@ it("lists the nodes a pool may use", () => {
   expect(poolNodes(pool("local", { nodes: ["gone-node-12345678"] }), [NODE])).toEqual([
     { id: "gone-node-12345678", name: "12345678", state: undefined, offline: false },
   ]);
+  // 노드 목록이 비었으면 위트니스는 빼고 본다. 위트니스는 풀을 쓰지 않는다.
+  const witness = { ...b, id: "n9", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  expect(poolNodes(pool("local"), [NODE, witness]).map((n) => n.name)).toEqual(["node-a"]);
   // 꺼진 노드는 오프라인으로 보인다.
   const down = withPool("n3", "node-c", {}, false);
   expect(poolNodes(pool("local"), [down])[0]?.offline).toBe(true);
@@ -361,6 +364,9 @@ it("offers the pools a node can use, like the server's pool_usable_on", () => {
   expect(poolsUsableOn(pools, [withPool("n1", "node-a", {}, false)], "n1")).toEqual([]);
   expect(poolsUsableOn(pools, [ready], undefined)).toEqual([]);
   expect(poolsUsableOn(pools, [ready], "n9")).toEqual([]);
+  // 위트니스에서는 준비됐다고 알려도 아무 풀도 쓸 수 없다.
+  const witness = { ...ready, spec: { ...NODE.spec, witness: true } };
+  expect(poolsUsableOn(pools, [witness], "n1")).toEqual([]);
 
   expect(poolUsableSomewhere(nas, [unknown, withPool("n2", "node-b", {}, false)])).toBe(false);
   expect(poolUsableSomewhere(nas, [unknown, withPool("n2", "node-b", {})])).toBe(true);

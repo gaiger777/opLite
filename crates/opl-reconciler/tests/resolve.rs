@@ -1011,6 +1011,7 @@ async fn refuses_pools_this_node_reports_not_ready() {
         NodeSpec {
             address: "a".into(),
             maintenance: false,
+            witness: false,
         },
     );
     me.id = node;

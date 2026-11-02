@@ -41,6 +41,7 @@ async fn setup() -> Setup {
         NodeSpec {
             address: "127.0.0.2:0".into(),
             maintenance: false,
+            witness: false,
         },
     );
     env.cluster.create(&source).await.unwrap();

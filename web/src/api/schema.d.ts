@@ -179,7 +179,10 @@ export interface paths {
             cookie?: never;
         };
         get: operations["get_node"];
-        /** 노드의 주소와 유지보수 모드를 바꾼다. 노드 리소스는 opld가 시작할 때 스스로 만든다. */
+        /**
+         * 노드의 주소와 유지보수 모드를 바꾼다. 노드 리소스는 opld가 시작할 때 스스로 만든다.
+         *     역할(`witness`)은 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다.
+         */
         put: operations["update_node"];
         post?: never;
         /**
@@ -462,7 +465,7 @@ export interface paths {
         /**
          * 실행 중인 VM을 다른 노드로 라이브 마이그레이션할 Task를 돌려준다(202). Task는 지금 노드의 실행기가
          *     한다. 디스크가 모두 공유 풀에 있어야 하고, HVF(macOS) 노드는 원본도 대상도 될 수 없다(409
-         *     `migration_unsupported`). 대상 노드가 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
+         *     `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
          *     스케줄러가 고를 수 없는 노드(풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
          */
         post: operations["migrate_vm"];
@@ -837,6 +840,8 @@ export interface components {
             node: string;
             /** @description 조인 URL의 토큰 */
             token: string;
+            /** @description 새 노드가 위트니스(투표만 하고 VM을 돌리지 않는 노드)인지 */
+            witness?: boolean;
         };
         JoinResponse: {
             ca_pem: string;
@@ -900,6 +905,8 @@ export interface components {
                     address: string;
                     /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
                     maintenance?: boolean;
+                    /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
+                    witness?: boolean;
                 };
                 /** @description 노드가 시작할 때 스스로 기록한다. */
                 status: {
@@ -1266,6 +1273,8 @@ export interface components {
             address: string;
             /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
             maintenance?: boolean;
+            /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
+            witness?: boolean;
         };
         /** @description 노드가 시작할 때 스스로 기록한다. */
         NodeStatus: {
@@ -1440,6 +1449,8 @@ export interface components {
                 address: string;
                 /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
                 maintenance?: boolean;
+                /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
+                witness?: boolean;
             };
             /** @description 노드가 시작할 때 스스로 기록한다. */
             status: {
@@ -1885,6 +1896,8 @@ export interface components {
                 address: string;
                 /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
                 maintenance?: boolean;
+                /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
+                witness?: boolean;
             };
         };
         UpdateRequest_VmSpec: {

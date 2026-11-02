@@ -82,6 +82,7 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
                 NodeSpec {
                     address,
                     maintenance: false,
+                    witness: false,
                 },
             );
             node.id = id;
