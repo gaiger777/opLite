@@ -119,6 +119,8 @@ impl From<ClusterError> for ApiError {
                         },
                         message,
                     ),
+                    // 리스 갱신만 받는 거부라 API 요청에서는 나오지 않는다.
+                    Rejection::Fenced { .. } => ApiError::conflict("node_fenced", message),
                 }
             }
             ClusterError::Timeout | ClusterError::Unreachable(_) => ApiError::new(

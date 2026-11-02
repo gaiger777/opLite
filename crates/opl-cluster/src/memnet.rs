@@ -15,8 +15,8 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Raft};
 
-use crate::cluster::ClusterError;
-use crate::leader::{self, Forwarder};
+use crate::cluster::{Cluster, ClusterError};
+use crate::leader::{self, Forwarder, LeaderCtx};
 use crate::types::{LeaderRequest, NodeId, TypeConfig};
 
 /// 전달받은 요청을 리더가 처리하는 최대 시간
@@ -24,8 +24,10 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct Routes {
-    nodes: HashMap<NodeId, Raft<TypeConfig>>,
+    nodes: HashMap<NodeId, LeaderCtx>,
     isolated: HashSet<NodeId>,
+    /// Raft RPC만 끊긴 노드. 리더 전달은 된다.
+    raft_blocked: HashSet<NodeId>,
 }
 
 /// 노드 등록부. 등록되지 않았거나 격리된 노드로 가는 RPC는 `Unreachable`이 된다.
@@ -51,8 +53,12 @@ impl MemRouter {
         })
     }
 
-    pub fn register(&self, id: NodeId, raft: Raft<TypeConfig>) {
-        self.routes.lock().unwrap().nodes.insert(id, raft);
+    pub fn register(&self, id: NodeId, cluster: &Cluster) {
+        self.routes
+            .lock()
+            .unwrap()
+            .nodes
+            .insert(id, cluster.leader_ctx());
     }
 
     pub fn unregister(&self, id: NodeId) {
@@ -64,11 +70,18 @@ impl MemRouter {
         self.routes.lock().unwrap().isolated.insert(id);
     }
 
-    pub fn heal(&self, id: NodeId) {
-        self.routes.lock().unwrap().isolated.remove(&id);
+    /// 그 노드로 가거나 나가는 Raft RPC만 끊는다. 리더 전달은 그대로 된다(복제가 늦은 노드).
+    pub fn block_raft(&self, id: NodeId) {
+        self.routes.lock().unwrap().raft_blocked.insert(id);
     }
 
-    fn route(&self, from: NodeId, to: NodeId) -> Result<Raft<TypeConfig>, Unreachable> {
+    pub fn heal(&self, id: NodeId) {
+        let mut routes = self.routes.lock().unwrap();
+        routes.isolated.remove(&id);
+        routes.raft_blocked.remove(&id);
+    }
+
+    fn route(&self, from: NodeId, to: NodeId) -> Result<LeaderCtx, Unreachable> {
         let routes = self.routes.lock().unwrap();
         if routes.isolated.contains(&from) || routes.isolated.contains(&to) {
             return Err(unreachable("isolated"));
@@ -78,6 +91,15 @@ impl MemRouter {
             .get(&to)
             .cloned()
             .ok_or_else(|| unreachable("not registered"))
+    }
+
+    fn raft_route(&self, from: NodeId, to: NodeId) -> Result<Raft<TypeConfig>, Unreachable> {
+        let ctx = self.route(from, to)?;
+        let routes = self.routes.lock().unwrap();
+        if routes.raft_blocked.contains(&from) || routes.raft_blocked.contains(&to) {
+            return Err(unreachable("raft blocked"));
+        }
+        Ok(ctx.raft)
     }
 }
 
@@ -98,11 +120,11 @@ impl Forwarder for MemForwarder {
         _addr: &str,
         req: LeaderRequest,
     ) -> Result<u64, ClusterError> {
-        let raft = self
+        let ctx = self
             .router
             .route(self.from, leader)
             .map_err(|e| ClusterError::Unreachable(e.to_string()))?;
-        leader::execute(&raft, req, FORWARD_TIMEOUT).await
+        leader::execute(&ctx, req, FORWARD_TIMEOUT).await
     }
 }
 
@@ -138,7 +160,7 @@ impl RaftNetwork<TypeConfig> for MemConnection {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> RpcResult<AppendEntriesResponse<NodeId>> {
-        let raft = self.router.route(self.from, self.target)?;
+        let raft = self.router.raft_route(self.from, self.target)?;
         raft.append_entries(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -149,7 +171,7 @@ impl RaftNetwork<TypeConfig> for MemConnection {
         rpc: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
     ) -> RpcResult<InstallSnapshotResponse<NodeId>, InstallSnapshotError> {
-        let raft = self.router.route(self.from, self.target)?;
+        let raft = self.router.raft_route(self.from, self.target)?;
         raft.install_snapshot(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -160,7 +182,7 @@ impl RaftNetwork<TypeConfig> for MemConnection {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> RpcResult<VoteResponse<NodeId>> {
-        let raft = self.router.route(self.from, self.target)?;
+        let raft = self.router.raft_route(self.from, self.target)?;
         raft.vote(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))

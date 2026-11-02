@@ -74,7 +74,7 @@ pub async fn open_node(
             other => break other.unwrap(),
         }
     };
-    router.register(id, cluster.raft().clone());
+    router.register(id, &cluster);
     Arc::new(cluster)
 }
 

@@ -839,7 +839,7 @@ mod tests {
         let cluster = Cluster::open(ClusterConfig::new(id, dir), router.network(id))
             .await
             .unwrap();
-        router.register(id, cluster.raft().clone());
+        router.register(id, &cluster);
         cluster
             .initialize(std::collections::BTreeMap::from([(
                 id,

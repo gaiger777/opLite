@@ -84,6 +84,9 @@ pub enum Rejection {
         value: String,
         holder: Uuid,
     },
+    /// 리더가 이 노드를 펜싱하는 중이라 리스를 갱신해 주지 않는다(설계 §4.2).
+    #[error("node {node} is being fenced")]
+    Fenced { node: NodeId },
 }
 
 /// 리더가 처리하는 요청. 팔로워는 받은 쓰기와 멤버십 변경을 이것으로 리더에 전달한다.
@@ -105,6 +108,11 @@ pub enum LeaderRequest {
     /// 노드를 멤버십에서 뺀다(투표 멤버이든 learner이든).
     Remove {
         id: NodeId,
+    },
+    /// 노드의 HA 리스를 갱신한다. 리더는 과반수의 리더인지 확인한 뒤 받은 시각을 적고 자기가
+    /// 적용한 마지막 로그 인덱스를 돌려준다. 로그에는 아무것도 쓰지 않는다.
+    RenewLease {
+        node: NodeId,
     },
 }
 
@@ -246,6 +254,24 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<Command>(value).unwrap(), cmd);
+    }
+
+    /// 노드 사이로 오가는 형식이다. 리스 갱신과 그 거부.
+    #[test]
+    fn lease_wire_format_is_stable() {
+        let node = NodeId::from(2);
+        let req = LeaderRequest::RenewLease { node };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value,
+            json!({"op": "renew-lease", "node": node.to_string()})
+        );
+        assert_eq!(serde_json::from_value::<LeaderRequest>(value).unwrap(), req);
+
+        let r = Rejection::Fenced { node };
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value, json!({"reason": "fenced", "node": node.to_string()}));
+        assert_eq!(serde_json::from_value::<Rejection>(value).unwrap(), r);
     }
 
     #[test]

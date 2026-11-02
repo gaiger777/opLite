@@ -126,7 +126,7 @@ impl TestCluster {
         } else {
             cluster
         };
-        self.router.register(id, cluster.raft().clone());
+        self.router.register(id, &cluster);
         self.nodes.insert(id, cluster);
     }
 

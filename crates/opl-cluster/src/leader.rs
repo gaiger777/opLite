@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ use opl_types::resource::Kind;
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::ClusterError;
+use crate::lease::LeaseTable;
 use crate::types::{LeaderRequest, NodeId, Rejection, Response, TypeConfig};
 
 /// learner가 로그를 따라잡기를 기다리는 최대 시간. 스냅샷을 받아야 하면 오래 걸린다.
@@ -86,13 +88,23 @@ impl From<LeaderError> for ClusterError {
     }
 }
 
-/// 이 노드가 리더라고 보고 요청을 처리한다. 리더가 아니면 `NotLeader`다. 성공하면 커밋된 로그 인덱스.
+/// 리더로서 요청을 처리하는 데 쓰는 것: Raft와 리스 표
+#[derive(Clone)]
+pub(crate) struct LeaderCtx {
+    pub(crate) raft: Raft<TypeConfig>,
+    pub(crate) leases: Arc<LeaseTable>,
+}
+
+/// 이 노드가 리더라고 보고 요청을 처리한다. 리더가 아니면 `NotLeader`다. 성공하면 커밋된 로그 인덱스
+/// (리스 갱신은 리더가 적용한 마지막 인덱스).
 pub(crate) async fn execute(
-    raft: &Raft<TypeConfig>,
+    ctx: &LeaderCtx,
     req: LeaderRequest,
     timeout: Duration,
 ) -> Result<u64, ClusterError> {
+    let raft = &ctx.raft;
     match req {
+        LeaderRequest::RenewLease { node } => ctx.leases.renew(raft, node, timeout).await,
         LeaderRequest::Write { command } => {
             let resp = tokio::time::timeout(timeout, raft.client_write(command))
                 .await
@@ -192,7 +204,7 @@ where
 
 /// 이 노드가 아는 리더와 그 주소로 `NotLeader`를 만든다. openraft의 `change_membership`은
 /// 리더인지 보기 전에 변경을 검사하므로, 팔로워에서는 `ForwardToLeader` 대신 검사 오류가 날 수 있다.
-fn not_leader(m: &RaftMetrics<NodeId, BasicNode>) -> ClusterError {
+pub(crate) fn not_leader(m: &RaftMetrics<NodeId, BasicNode>) -> ClusterError {
     let leader_addr = m.current_leader.and_then(|l| {
         m.membership_config
             .membership()

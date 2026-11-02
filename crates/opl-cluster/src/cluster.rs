@@ -9,7 +9,8 @@ use opl_types::resource::{Kind, Resource, ResourceSpec};
 use redb::Database;
 use uuid::Uuid;
 
-use crate::leader::{self, Forwarder};
+use crate::leader::{self, Forwarder, LeaderCtx};
+use crate::lease::{LeaseTable, Leases};
 use crate::store::{Store, StoreError, get_object, get_object_by_name, list_objects};
 use crate::types::{Command, LeaderRequest, NodeId, RawResource, Rejection, TypeConfig};
 use crate::watch::{Watch, WatchError, WatchHub};
@@ -96,6 +97,8 @@ pub struct Cluster {
     watch: Arc<WatchHub>,
     write_timeout: Duration,
     forwarder: Option<Arc<dyn Forwarder>>,
+    /// 리더일 때 받은 HA 리스 갱신(메모리에만 둔다)
+    leases: Arc<LeaseTable>,
 }
 
 /// 지금 알고 있는 멤버십. 값은 노드의 Raft 주소다.
@@ -150,6 +153,7 @@ impl Cluster {
             watch: store.watch_hub().clone(),
             write_timeout: config.write_timeout,
             forwarder: None,
+            leases: Arc::default(),
         })
     }
 
@@ -281,12 +285,21 @@ impl Cluster {
     /// `Timeout`이다. 전달 시도가 응답 없이 끝나면(시도 제한 시간, 보낸 뒤 연결 끊김) 요청이 이미
     /// 적용됐을 수 있으므로, 그 뒤 다시 보낸 만들기·삭제의 거부는 `already_applied`로 판단한다.
     pub async fn request(&self, req: LeaderRequest) -> Result<u64, ClusterError> {
-        let deadline = tokio::time::Instant::now() + self.write_timeout;
+        self.request_within(req, self.write_timeout).await
+    }
+
+    /// `request`와 같되 `write_timeout` 대신 `timeout`까지만 기다린다.
+    async fn request_within(
+        &self,
+        req: LeaderRequest,
+        timeout: Duration,
+    ) -> Result<u64, ClusterError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         // 응답 없이 끝난 전달 시도가 있었다(리더가 처리했을 수 있다).
         let mut maybe_applied = false;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let result = match leader::execute(&self.raft, req.clone(), remaining).await {
+            let result = match leader::execute(&self.leader_ctx(), req.clone(), remaining).await {
                 Err(ClusterError::NotLeader {
                     leader_id: Some(leader),
                     leader_addr: Some(addr),
@@ -424,7 +437,51 @@ impl Cluster {
     /// 이 노드가 리더로서 요청을 처리한다. 노드 간 네트워크가 다른 노드에서 전달받은 요청을 넘긴다.
     /// 리더가 아니면 `NotLeader`다(다시 전달하지 않는다).
     pub async fn execute_as_leader(&self, req: LeaderRequest) -> Result<u64, ClusterError> {
-        leader::execute(&self.raft, req, self.write_timeout).await
+        leader::execute(&self.leader_ctx(), req, self.write_timeout).await
+    }
+
+    pub(crate) fn leader_ctx(&self) -> LeaderCtx {
+        LeaderCtx {
+            raft: self.raft.clone(),
+            leases: self.leases.clone(),
+        }
+    }
+
+    /// 이 노드의 HA 리스를 갱신한다. 리더가 과반수의 리더인지 확인하고 갱신을 적은 뒤, 리더가 돌려준
+    /// 적용 인덱스까지 이 노드에도 적용되어야 성공이다(그 사이 리더가 옮긴 VM이 이미 보인다).
+    /// `timeout` 안에 끝나지 않으면 `Timeout`이다. 호출자는 보내기 전에 시각을 재고 성공하면 그
+    /// 시각을 마지막 갱신으로 삼는다(설계 §3.2).
+    pub async fn renew_lease(&self, timeout: Duration) -> Result<(), ClusterError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let index = self
+            .request_within(LeaderRequest::RenewLease { node: self.id }, timeout)
+            .await?;
+        // 전달 경로의 적용 기다림은 제한 시간이 지나도 성공으로 돌려주므로 여기서 다시 확인한다.
+        self.raft
+            .wait(Some(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ))
+            .applied_index_at_least(Some(index), "lease renewal applied")
+            .await
+            .map_err(|_| ClusterError::Timeout)?;
+        Ok(())
+    }
+
+    /// 리더가 지금 임기에 받은 리스 갱신. 리더에서만 뜻이 있다(리더인지는 `read_barrier`로 확인한다).
+    pub fn leases(&self) -> Leases {
+        self.leases.leases(&self.raft)
+    }
+
+    /// `node`를 펜싱 중으로 표시한다. `end_fence`까지 그 노드의 갱신은 `Rejection::Fenced`로
+    /// 거부된다. 표시하기 직전에 받은 갱신이 있을 수 있으므로, 표시한 뒤 `leases`를 다시 읽어
+    /// 그 노드의 리스가 여전히 끝났는지 확인하고 나서 복구한다.
+    pub fn begin_fence(&self, node: NodeId) {
+        self.leases.begin_fence(node);
+    }
+
+    /// 펜싱 중 표시를 지운다. 복구 쓰기가 끝난(리더에 적용된) 뒤에 부른다.
+    pub fn end_fence(&self, node: NodeId) {
+        self.leases.end_fence(node);
     }
 
     /// 이 노드가 아는 멤버십과 리더

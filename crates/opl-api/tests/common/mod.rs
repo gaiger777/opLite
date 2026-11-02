@@ -100,7 +100,7 @@ impl Env {
             ..Default::default()
         };
         let cluster = Arc::new(Cluster::open(config, router.network(id)).await.unwrap());
-        router.register(id, cluster.raft().clone());
+        router.register(id, &cluster);
         cluster
             .initialize(BTreeMap::from([(id, BasicNode::new(id.to_string()))]))
             .await
