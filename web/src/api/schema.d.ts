@@ -1238,6 +1238,8 @@ export interface components {
             online: boolean;
             /** @description 투표 멤버인지(아니면 learner) */
             voter: boolean;
+            /** @description 위트니스 노드인지(VM을 돌리지 않는 투표 멤버) */
+            witness: boolean;
         };
         MigrateRequest: {
             /** @description 옮겨 갈 노드(이름이나 id) */

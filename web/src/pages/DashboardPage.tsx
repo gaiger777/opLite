@@ -149,6 +149,11 @@ export function DashboardPage() {
                         {t("dashboard.maintenance")}
                       </Badge>
                     )}
+                    {node.spec.witness && (
+                      <Badge variant="outline" className="ml-1">
+                        {t("dashboard.witness")}
+                      </Badge>
+                    )}
                   </TableCell>
                   <TableCell>{node.status.hypervisor}</TableCell>
                   <TableCell>{used.vms}</TableCell>

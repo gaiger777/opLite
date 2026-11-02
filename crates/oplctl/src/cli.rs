@@ -762,31 +762,7 @@ where
         Cmd::Node { cmd } => match cmd {
             NodeCmd::List => {
                 let list = client.get("/nodes").await?;
-                print_list(
-                    out,
-                    json_out,
-                    &list,
-                    &[
-                        "NAME",
-                        "ID",
-                        "ADDRESS",
-                        "ONLINE",
-                        "CPUS",
-                        "MEMORY",
-                        "MAINTENANCE",
-                    ],
-                    |n| {
-                        vec![
-                            cell(&n["name"]),
-                            cell(&n["id"]),
-                            cell(&n["spec"]["address"]),
-                            cell(&n["status"]["online"]),
-                            cell(&n["status"]["cpus"]),
-                            bytes(&n["status"]["memory_mib"].as_u64().map(|m| m << 20).into()),
-                            cell(&n["spec"]["maintenance"]),
-                        ]
-                    },
-                )?;
+                print_list(out, json_out, &list, NODE_HEADERS, node_row)?;
             }
             NodeCmd::Get { node } => {
                 print_json(out, &client.get(&format!("/nodes/{node}")).await?)?
@@ -1099,44 +1075,7 @@ async fn cluster(
                 print_json(out, &view)?;
                 return Ok(());
             }
-            writeln!(out, "cluster: {}", cell(&view["name"]))?;
-            writeln!(out, "CA fingerprint: {}", cell(&view["ca_fingerprint"]))?;
-            let leader = view["leader"].clone();
-            let rows: Vec<Vec<String>> = view["members"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .map(|m| {
-                    vec![
-                        cell(&m["name"]),
-                        cell(&m["id"]),
-                        cell(&m["address"]),
-                        if m["voter"] == true {
-                            "voter"
-                        } else {
-                            "learner"
-                        }
-                        .into(),
-                        cell(&m["online"]),
-                        (m["id"] == leader).to_string(),
-                    ]
-                })
-                .collect();
-            table(
-                out,
-                &["NAME", "ID", "ADDRESS", "ROLE", "ONLINE", "LEADER"],
-                &rows,
-            )?;
-            let voters = view["members"]
-                .as_array()
-                .map_or(0, |m| m.iter().filter(|m| m["voter"] == true).count());
-            if voters == 2 {
-                writeln!(
-                    out,
-                    "warning: a two-node cluster stops accepting changes when either node fails; add a third node"
-                )?;
-            }
+            print_cluster_status(out, &view)?;
         }
         ClusterCmd::JoinToken { ttl } => {
             let created = client
@@ -1610,6 +1549,78 @@ fn print_list(
     } else {
         let rows: Vec<_> = items.iter().map(row).collect();
         table(out, headers, &rows)?;
+    }
+    Ok(())
+}
+
+/// `node list`의 열
+const NODE_HEADERS: &[&str] = &[
+    "NAME",
+    "ID",
+    "ADDRESS",
+    "ONLINE",
+    "CPUS",
+    "MEMORY",
+    "MAINTENANCE",
+    "WITNESS",
+];
+
+/// `node list`의 한 행
+fn node_row(n: &Value) -> Vec<String> {
+    vec![
+        cell(&n["name"]),
+        cell(&n["id"]),
+        cell(&n["spec"]["address"]),
+        cell(&n["status"]["online"]),
+        cell(&n["status"]["cpus"]),
+        bytes(&n["status"]["memory_mib"].as_u64().map(|m| m << 20).into()),
+        cell(&n["spec"]["maintenance"]),
+        // 옛 서버는 보내지 않는다 — 일반 노드다.
+        (n["spec"]["witness"] == true).to_string(),
+    ]
+}
+
+/// `cluster status`의 표와 경고
+fn print_cluster_status(out: &mut (dyn Write + Send), view: &Value) -> anyhow::Result<()> {
+    writeln!(out, "cluster: {}", cell(&view["name"]))?;
+    writeln!(out, "CA fingerprint: {}", cell(&view["ca_fingerprint"]))?;
+    let leader = &view["leader"];
+    let members = view["members"].as_array().cloned().unwrap_or_default();
+    let rows: Vec<Vec<String>> = members
+        .iter()
+        .map(|m| {
+            vec![
+                cell(&m["name"]),
+                cell(&m["id"]),
+                cell(&m["address"]),
+                if m["voter"] == true {
+                    "voter"
+                } else {
+                    "learner"
+                }
+                .into(),
+                cell(&m["online"]),
+                (&m["id"] == leader).to_string(),
+                (m["witness"] == true).to_string(),
+            ]
+        })
+        .collect();
+    table(
+        out,
+        &[
+            "NAME", "ID", "ADDRESS", "ROLE", "ONLINE", "LEADER", "WITNESS",
+        ],
+        &rows,
+    )?;
+    let voters: Vec<&Value> = members.iter().filter(|m| m["voter"] == true).collect();
+    if voters.len() == 2 {
+        writeln!(
+            out,
+            "warning: a two-node cluster stops accepting changes when either node fails; add a third node"
+        )?;
+    } else if voters.len() >= 3 && voters.iter().filter(|m| m["witness"] != true).count() < 2 {
+        // 위트니스는 VM을 돌리지 않으므로 VM을 옮겨 받을 일반 노드가 둘 이상이어야 한다.
+        writeln!(out, "warning: HA needs at least two non-witness nodes")?;
     }
     Ok(())
 }
@@ -2844,6 +2855,109 @@ mod tests {
              id-gone  false  -     -          node not found\n\
              b        false  -     -          no status reported yet\n"
         );
+    }
+
+    #[test]
+    fn node_list_shows_witnesses() {
+        let node = |name: &str, witness: Option<bool>| {
+            let mut spec = json!({ "address": "10.0.0.1:8006", "maintenance": false });
+            if let Some(w) = witness {
+                spec["witness"] = json!(w);
+            }
+            json!({
+                "id": format!("id-{name}"),
+                "name": name,
+                "spec": spec,
+                "status": { "online": true, "cpus": 4, "memory_mib": 1024 },
+            })
+        };
+        let rows: Vec<_> = [
+            node("a", Some(false)),
+            node("w", Some(true)),
+            node("old", None),
+        ]
+        .iter()
+        .map(node_row)
+        .collect();
+        let mut out = Vec::new();
+        table(&mut out, NODE_HEADERS, &rows).unwrap();
+        // 옛 서버는 witness를 보내지 않는다 — 일반 노드다.
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NAME  ID      ADDRESS        ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS\n\
+             a     id-a    10.0.0.1:8006  true    4     1.0GiB  false        false\n\
+             w     id-w    10.0.0.1:8006  true    4     1.0GiB  false        true\n\
+             old   id-old  10.0.0.1:8006  true    4     1.0GiB  false        false\n"
+        );
+    }
+
+    #[test]
+    fn cluster_status_shows_witnesses_and_warns() {
+        let member = |name: &str, voter: bool, witness: bool| {
+            json!({
+                "id": format!("id-{name}"),
+                "name": name,
+                "address": format!("{name}:8006"),
+                "cluster_address": format!("{name}:8007"),
+                "voter": voter,
+                "online": true,
+                "witness": witness,
+            })
+        };
+        let status = |members: Vec<Value>| {
+            let view = json!({
+                "name": "lab",
+                "ca_fingerprint": "ab:cd",
+                "leader": "id-a",
+                "node": "id-a",
+                "members": members,
+            });
+            let mut out = Vec::new();
+            print_cluster_status(&mut out, &view).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        // 일반 노드 둘과 위트니스면 투표 멤버가 셋이라 경고가 없다.
+        assert_eq!(
+            status(vec![
+                member("a", true, false),
+                member("b", true, false),
+                member("w", true, true),
+            ]),
+            "cluster: lab\nCA fingerprint: ab:cd\n\
+             NAME  ID    ADDRESS  ROLE   ONLINE  LEADER  WITNESS\n\
+             a     id-a  a:8006   voter  true    true    false\n\
+             b     id-b  b:8006   voter  true    false   false\n\
+             w     id-w  w:8006   voter  true    false   true\n"
+        );
+        const TWO: &str = "warning: a two-node cluster";
+        const HA: &str = "warning: HA needs at least two non-witness nodes";
+        // 투표 멤버 둘이면 위트니스가 있어도 2노드 경고다.
+        let out = status(vec![member("a", true, false), member("w", true, true)]);
+        assert!(out.contains(TWO) && !out.contains(HA), "{out}");
+        // 투표 멤버가 셋 이상이어도 일반 노드가 하나뿐이면 HA 경고다.
+        let out = status(vec![
+            member("a", true, false),
+            member("w", true, true),
+            member("v", true, true),
+        ]);
+        assert!(out.contains(HA) && !out.contains(TWO), "{out}");
+        // learner는 투표 멤버로 세지 않는다.
+        let out = status(vec![
+            member("a", true, false),
+            member("w", true, true),
+            member("v", true, true),
+            member("b", false, false),
+        ]);
+        assert!(out.contains(HA), "{out}");
+        // 옛 서버는 witness를 보내지 않는다 — 모두 일반 노드로 본다.
+        let mut old = member("c", true, false);
+        old.as_object_mut().unwrap().remove("witness");
+        let out = status(vec![
+            member("a", true, false),
+            member("b", true, false),
+            old,
+        ]);
+        assert!(!out.contains("warning"), "{out}");
     }
 
     #[test]

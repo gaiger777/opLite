@@ -196,6 +196,19 @@ async fn a_witness_joins_as_a_witness() {
     let joined = env.cluster.get::<NodeSpec>(witness).unwrap().unwrap();
     assert!(joined.spec.witness);
     assert!(joined.status.online);
+    // 클러스터 멤버 목록에도 위트니스인지가 보인다.
+    let (_, view) = env.admin().await.get("/cluster").await;
+    let witness_of = |id: Uuid| {
+        view["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id.to_string())
+            .unwrap()["witness"]
+            .clone()
+    };
+    assert_eq!(witness_of(witness), true, "{view}");
+    assert_eq!(witness_of(env.node), false, "{view}");
 
     let (req, node) = join_request(&new_token(&env).await, "node2");
     let mut body = json!(req);

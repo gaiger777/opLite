@@ -128,6 +128,11 @@ export function ClusterPage() {
                   {m.id === leader
                     ? t("cluster.leader")
                     : t(m.voter ? "cluster.voter" : "cluster.learner")}
+                  {m.witness && (
+                    <Badge variant="outline" className="ml-2">
+                      {t("dashboard.witness")}
+                    </Badge>
+                  )}
                 </TableCell>
                 <TableCell className="font-mono text-xs">{m.address ?? "—"}</TableCell>
                 <TableCell className="font-mono text-xs">{m.cluster_address}</TableCell>

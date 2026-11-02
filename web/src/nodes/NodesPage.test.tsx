@@ -59,6 +59,18 @@ it("lists nodes with their state, capacity and VMs", async () => {
   expect(within(a).getAllByRole("cell")[archColumn]).toHaveTextContent("—");
 });
 
+it("marks witness nodes", async () => {
+  cluster();
+  const witness = { ...NODE, id: "n3", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  mockLists({ node: [NODE, witness] });
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const w = (await within(table).findByText("node-w")).closest("tr")!;
+  expect(within(w).getByText("Witness")).toBeInTheDocument();
+  const a = within(table).getByText("node-a").closest("tr")!;
+  expect(within(a).queryByText("Witness")).not.toBeInTheDocument();
+});
+
 it("shows the state of each pool on the node", async () => {
   cluster();
   const pools = {

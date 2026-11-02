@@ -13,6 +13,7 @@ const member = (id: string, name: string | null, extra = {}) => ({
   cluster_address: `${name}:8007`,
   voter: true,
   online: true,
+  witness: false,
   ...extra,
 });
 
@@ -28,6 +29,7 @@ beforeEach(() =>
           member("n1", "node-a"),
           member("n2", "node-b"),
           member("n3", null, { voter: false, online: false, address: null }),
+          member("n4", "witness-w", { witness: true }),
         ],
       }),
     ),
@@ -58,6 +60,9 @@ it("shows the CA and the members", async () => {
   const joining = within(table).getByText("n3").closest("tr")!;
   expect(joining).toHaveTextContent("Learner");
   expect(joining).toHaveTextContent("Offline");
+  // 위트니스는 역할 옆에 배지가 붙는다.
+  expect(within(table).getByText("witness-w").closest("tr")).toHaveTextContent("VoterWitness");
+  expect(within(table).queryAllByText("Witness")).toHaveLength(1);
   expect(screen.queryByRole("button", { name: "Issue a join token" })).not.toBeInTheDocument();
 });
 

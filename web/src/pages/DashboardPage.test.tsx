@@ -118,6 +118,17 @@ it("shows node capacity in GiB with one decimal", async () => {
   expect(await within(table).findByText("0 MiB / 15.5 GiB")).toBeInTheDocument();
 });
 
+it("marks witness nodes", async () => {
+  const witness = { ...NODE, id: "n3", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  mockLists({ node: [NODE, witness], vm: [] });
+  server.use(cluster("n1"));
+  renderPage(<DashboardPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const w = (await within(table).findByText("node-w")).closest("tr")!;
+  expect(within(w).getByText("Witness")).toBeInTheDocument();
+  expect(within(table).getAllByText("Witness")).toHaveLength(1);
+});
+
 it("shows loading instead of zeros, then errors", async () => {
   let fail: (() => void) | undefined;
   server.use(

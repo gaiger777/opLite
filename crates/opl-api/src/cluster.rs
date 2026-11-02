@@ -155,6 +155,8 @@ pub struct MemberView {
     /// 투표 멤버인지(아니면 learner)
     pub voter: bool,
     pub online: bool,
+    /// 위트니스 노드인지(VM을 돌리지 않는 투표 멤버)
+    pub witness: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -188,6 +190,7 @@ pub async fn get_cluster(
             cluster_address: addr.clone(),
             voter,
             online: node.is_some_and(|n| n.status.online),
+            witness: node.is_some_and(|n| n.spec.witness),
         }
     };
     let mut list: Vec<MemberView> = members

@@ -120,6 +120,7 @@ export function NodesPage() {
                   {node.spec.maintenance && (
                     <Badge variant="outline">{t("dashboard.maintenance")}</Badge>
                   )}
+                  {node.spec.witness && <Badge variant="outline">{t("dashboard.witness")}</Badge>}
                 </div>
               </TableCell>
               <TableCell className="font-mono text-xs">{node.spec.address}</TableCell>
