@@ -10,6 +10,10 @@ pub enum DriverError {
     InvalidSpec(String),
     #[error("QEMU failed to start: {0}")]
     StartFailed(String),
+    /// 다른 프로세스가 디스크 이미지의 잠금을 쥐고 있어 QEMU가 시작하지 못했다(죽은 노드의 NFS
+    /// 임대가 아직 남음 등). 내용은 QEMU의 stderr다. 잠금이 풀리면 시작할 수 있다.
+    #[error("disk image is locked by another process: {0}")]
+    ImageLocked(String),
     #[error("volume {0} not found")]
     VolumeNotFound(Uuid),
     #[error("volume {0} already exists")]
@@ -72,7 +76,8 @@ impl DriverError {
             | DriverError::NotAttached(_)
             | DriverError::PoolNotMounted(_)
             | DriverError::PoolNotResponding(_)
-            | DriverError::VolumeNotActive(_) => true,
+            | DriverError::VolumeNotActive(_)
+            | DriverError::ImageLocked(_) => true,
             DriverError::NotRunning(_)
             | DriverError::InvalidSpec(_)
             | DriverError::StartFailed(_)
@@ -109,6 +114,8 @@ mod tests {
         assert!(DriverError::PoolNotResponding("/var/lib/opl/pools/p".into()).is_transient());
         // 활성화하면 장치 노드가 생긴다.
         assert!(DriverError::VolumeNotActive("/dev/vg0/opl-x".into()).is_transient());
+        // 잠금을 쥔 프로세스가 끝나거나 NFS 임대가 끝나면 풀린다.
+        assert!(DriverError::ImageLocked("Failed to get \"write\" lock".into()).is_transient());
         assert!(DriverError::Qmp(QmpError::Disconnected).is_transient());
         assert!(DriverError::Io(std::io::Error::other("x")).is_transient());
         // 바이너리나 풀 디렉터리가 없거나 권한이 없으면 다시 해도 실패한다.

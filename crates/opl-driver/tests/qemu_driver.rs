@@ -400,6 +400,39 @@ async fn memory_snapshot_needs_a_disk() {
     hv.stop(vm.id, StopMode::Force).await.unwrap();
 }
 
+/// 다른 QEMU(다른 노드)가 쓰는 이미지로 켜면 잠금 오류로 구분된다(실제 QEMU 문구 확인).
+#[tokio::test]
+async fn image_locked_by_another_qemu_is_transient() {
+    let tmp = short_tempdir();
+    let disk = tmp.path().join("disk0.qcow2");
+    let vm = with_qcow2_disk(spec(), &disk);
+    let a = QemuHypervisor::new(config(&tmp.path().join("a")))
+        .await
+        .unwrap();
+    a.start(&vm, None).await.unwrap();
+
+    // 같은 디스크를 쓰는 다른 VM(systemd 스코프 이름이 겹치지 않게 다른 id)
+    let other = VmRuntimeSpec {
+        id: Uuid::now_v7(),
+        ..vm.clone()
+    };
+    let b = QemuHypervisor::new(config(&tmp.path().join("b")))
+        .await
+        .unwrap();
+    let err = b.start(&other, None).await.unwrap_err();
+    assert!(
+        matches!(err, opl_driver::DriverError::ImageLocked(_)),
+        "{err:?}"
+    );
+    assert!(err.is_transient());
+    assert_eq!(b.inspect(other.id).await.unwrap(), None);
+
+    // 잠금이 풀리면 켤 수 있다.
+    a.stop(vm.id, StopMode::Force).await.unwrap();
+    b.start(&other, None).await.unwrap();
+    b.stop(other.id, StopMode::Force).await.unwrap();
+}
+
 /// `OPL_TEST_SYSTEMD=1`(systemd가 있는 Linux)일 때만 확인한다: QEMU가 VM 전용 스코프에서 돈다.
 #[tokio::test]
 async fn qemu_runs_in_its_own_systemd_scope() {

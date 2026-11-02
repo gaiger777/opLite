@@ -30,6 +30,8 @@ const HA_WAITING: &str = "waiting for the cluster majority before starting an HA
 const HA_FENCED: &str = "fenced: lost the cluster majority";
 /// 펜싱이 꺼진 노드(`[ha] fencing = "off"`)의 HA VM status
 const HA_UNAVAILABLE: &str = "HA is not available on this node";
+/// 다른 프로세스가 디스크 이미지를 잠가 두어 다시 시도하는 동안의 status
+const IMAGE_LOCKED: &str = "disk image is locked by another process; retrying";
 
 /// 작업자를 깨우는 이유.
 #[derive(Debug)]
@@ -746,6 +748,16 @@ impl Worker {
                 self.power_off = Some(Some(format!("failed to restore snapshot {tag}: {e}")));
                 Ok(Start::NotStarted)
             }
+            // 다른 프로세스가 이미지를 잠가 두었다(죽은 노드의 NFS 임대 등, 설계 §4.3). 풀리면 켤 수
+            // 있으므로 실패로 세지 않고 잠시 뒤 다시 시도한다. 사용자는 정지로 멈출 수 있다.
+            (Err(e @ DriverError::ImageLocked(_)), None) => {
+                tracing::warn!(vm = %self.id, error = %e, "disk image is locked; will retry");
+                self.backoff = Some((
+                    Instant::now() + self.config.retry_interval,
+                    IMAGE_LOCKED.into(),
+                ));
+                Ok(Start::NotStarted)
+            }
             (Err(e), None) if e.is_transient() => {
                 self.record_failure(format!("failed to start: {e}"));
                 Ok(Start::NotStarted)
@@ -960,8 +972,12 @@ impl Worker {
             {
                 Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {
                     match self.cluster.get::<VmSpec>(self.id)? {
-                        Some(current) => vm = current,
-                        None => return Ok(()),
+                        Some(current) if current.spec.node == Some(self.config.node) => {
+                            vm = current
+                        }
+                        // 지워졌거나 그 사이 다른 노드로 옮겨졌다(HA 복구 등). 그 노드의 status를
+                        // 덮지 않는다.
+                        _ => return Ok(()),
                     }
                 }
                 r => return r.map(|_| ()).map_err(Into::into),

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -25,6 +25,10 @@ pub struct MockHypervisor {
     events: broadcast::Sender<HypervisorEvent>,
     /// 멈춘 `snapshot_save`가 들어왔다
     save_reached: Notify,
+    /// 멈춘 `start`가 들어왔다
+    start_reached: Notify,
+    /// 멈춘 `start`를 놓아준다
+    start_released: Notify,
 }
 
 #[derive(Default)]
@@ -32,8 +36,12 @@ struct MockState {
     vms: HashMap<Uuid, u32>,
     next_pid: u32,
     fail_next_start: Option<DriverError>,
+    /// 이후의 `start`를 차례로 실패시킬 오류들(`fail_next_start` 다음에 쓴다)
+    fail_starts: VecDeque<DriverError>,
     /// `start`가 이만큼 기다린 뒤에 동작한다.
     start_delay: Option<Duration>,
+    /// 다음 `start` 한 번을 `release_start`까지 멈춘다.
+    hold_next_start: bool,
     /// 다음 `snapshot_save`·`snapshot_delete` 한 번을 실패시킬 오류
     fail_next_snapshot: Option<DriverError>,
     /// 다음 `snapshot_save` 한 번을 VM이 꺼질 때까지 멈춘다.
@@ -88,6 +96,8 @@ impl Default for MockHypervisor {
             }),
             events: broadcast::channel(64).0,
             save_reached: Notify::new(),
+            start_reached: Notify::new(),
+            start_released: Notify::new(),
         }
     }
 }
@@ -98,9 +108,31 @@ impl MockHypervisor {
         self.state.lock().unwrap().fail_next_start = Some(err);
     }
 
+    /// 이후의 `start`를 차례로 이 오류들로 실패시킨다(한 번에 하나씩). `fail_next_start`처럼 이미
+    /// 실행 중인 VM에 대한 `start`에는 쓰이지 않는다.
+    pub fn fail_next_starts(&self, errs: impl IntoIterator<Item = DriverError>) {
+        self.state.lock().unwrap().fail_starts.extend(errs);
+    }
+
     /// 이후의 `start`가 `delay`만큼 기다린 뒤에 동작하게 한다. 시작 도중에 일어나는 일을 흉내 낸다.
     pub fn delay_starts(&self, delay: Duration) {
         self.state.lock().unwrap().start_delay = Some(delay);
+    }
+
+    /// 다음 `start` 한 번을 `release_start`까지 멈춘다. 시작 도중에 일어나는 일을 시간에 기대지 않고
+    /// 흉내 낸다.
+    pub fn hold_next_start(&self) {
+        self.state.lock().unwrap().hold_next_start = true;
+    }
+
+    /// 멈춘 `start`가 들어올 때까지 기다린다.
+    pub async fn start_held(&self) {
+        self.start_reached.notified().await;
+    }
+
+    /// 멈춘 `start`를 놓아준다.
+    pub fn release_start(&self) {
+        self.start_released.notify_one();
     }
 
     /// 다음 `snapshot_save`나 `snapshot_delete` 한 번을 이 오류로 실패시킨다. `snapshot_save`는
@@ -316,7 +348,14 @@ impl MockHypervisor {
 #[async_trait]
 impl Hypervisor for MockHypervisor {
     async fn start(&self, vm: &VmRuntimeSpec, restore: Option<&str>) -> Result<(), DriverError> {
-        let delay = self.state.lock().unwrap().start_delay;
+        let (delay, hold) = {
+            let mut st = self.state.lock().unwrap();
+            (st.start_delay, std::mem::take(&mut st.hold_next_start))
+        };
+        if hold {
+            self.start_reached.notify_one();
+            self.start_released.notified().await;
+        }
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
@@ -330,7 +369,11 @@ impl Hypervisor for MockHypervisor {
                 return Ok(());
             }
             st.launches.push((vm.id, restore.map(str::to_string)));
-            if let Some(err) = st.fail_next_start.take() {
+            if let Some(err) = st
+                .fail_next_start
+                .take()
+                .or_else(|| st.fail_starts.pop_front())
+            {
                 return Err(err);
             }
             let pid = st.next_pid;

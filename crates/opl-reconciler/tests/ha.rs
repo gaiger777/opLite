@@ -270,6 +270,8 @@ struct Ha {
 const FENCE_AFTER: Duration = Duration::from_millis(300);
 
 /// 가짜 갱신과 가짜 watchdog로 guard를 만들어 reconciler에 넣는다. 리스는 300ms 뒤에 끝난다.
+/// 부하로 런타임이 그만큼 멈추면 갱신에 성공하는 동안에도 리스가 잠깐 끝나(guard의 시계로는 맞다) 도는
+/// HA VM을 끄고 갱신 뒤 다시 켠다. 리스가 끝나야 하는 시험만 쓰고, 그 시험은 그런 끄기·켜기에 기대지 않는다.
 async fn start(ok: bool) -> (Env, Ha) {
     start_with(ok, FENCE_AFTER, |_| {}).await
 }
@@ -333,7 +335,8 @@ fn error_is(v: &Vm, msg: &str) -> bool {
 /// 리스를 갱신하기 전에는 HA VM을 켜지 않고(실패로 세지 않는다) 기다린다. 갱신되면 watchdog를 연 뒤 켠다.
 #[tokio::test]
 async fn ha_vm_waits_for_the_lease_before_starting() {
-    let (env, ha) = start(false).await;
+    // 시험하는 동안 stale이 되지 않게 리스를 길게 둔다.
+    let (env, ha) = start_with(false, Duration::from_secs(60), |_| {}).await;
     let vm = ha_vm("web", env.node);
     env.create(&vm).await;
     let got = env.wait(vm.id, "waiting", |v| error_is(v, WAITING)).await;
@@ -383,10 +386,10 @@ async fn ha_vm_is_not_started_if_the_lease_ends_while_starting() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    // 리스가 돌아오면 켠다. 켠 뒤 런타임이 멈추면 다시 끄고 켤 수 있으므로 횟수는 보지 않는다.
     ha.renewer.set_ok(true);
     let got = env.wait(vm.id, "running", running).await;
     assert_eq!(got.status.last_error, None);
-    assert_eq!(env.hv.launches().len(), 1);
 }
 
 /// HA가 아닌 VM은 리스와 상관없이 켠다.
@@ -439,19 +442,33 @@ async fn lost_lease_force_stops_ha_vms_and_restarts_them_when_it_returns() {
     assert_eq!(got.status.phase, VmPhase::Starting);
     assert_eq!(got.status.pid, None);
     assert_eq!(env.pid(vm.id).await, None);
+    // set_ok(false) 전에 런타임이 멈춰 리스가 잠깐 끝났으면 web을 이미 한 번 끄고 다시 켰을 수 있다(그때는
+    // 갱신 뒤라 맞다). 그래서 펜싱을 본 뒤의 횟수에서 센다: 리스가 없는 동안에는 켜지 않는다.
+    let fenced_web = launches_of(&env, vm.id);
     // 이벤트를 처리한 뒤에도 실패로 남지 않는다.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let got = env.get(vm.id);
     assert_eq!(got.spec.power, PowerState::Running);
     assert_ne!(got.status.phase, VmPhase::Failed);
-    assert_eq!(env.hv.launches().len(), 2, "only web and plain launched");
+    assert_eq!(
+        launches_of(&env, vm.id),
+        fenced_web,
+        "web launched while fenced"
+    );
+    assert_eq!(launches_of(&env, plain.id), 1, "plain launched again");
     assert_eq!(env.get(plain.id).status.pid, plain_pid);
     assert_eq!(env.pid(plain.id).await, plain_pid);
 
     ha.renewer.set_ok(true);
     let got = env.wait(vm.id, "running again", running).await;
     assert_eq!(got.status.last_error, None);
-    assert_eq!(env.hv.launches().len(), 3);
+    assert!(launches_of(&env, vm.id) > fenced_web);
+    assert_eq!(launches_of(&env, plain.id), 1, "plain launched again");
+}
+
+/// `id`를 켠 횟수
+fn launches_of(env: &Env, id: Uuid) -> usize {
+    env.hv.launches().iter().filter(|(v, _)| *v == id).count()
 }
 
 /// 펜싱이 꺼진 노드(guard 없음)에서는 HA VM을 켜지 않는다.
@@ -492,7 +509,8 @@ async fn running_ha_vm_on_a_node_without_fencing_is_left_running() {
 /// reconciler가 멈춰도 도는 HA VM은 도는 것으로 남는다: 정상 종료 때 watchdog를 그대로 둔다.
 #[tokio::test]
 async fn shutdown_keeps_running_ha_vms_armed() {
-    let (mut env, ha) = start(true).await;
+    // 시험하는 동안 stale이 되지 않게 리스를 길게 둔다.
+    let (mut env, ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
     let vm = ha_vm("web", env.node);
     env.create(&vm).await;
     env.wait(vm.id, "running", running).await;
@@ -575,7 +593,8 @@ async fn running_ha_vm_arms_the_watchdog_once_the_lease_is_fresh() {
 /// 다른 노드로 옮겨졌어도 QEMU가 아직 돌면 도는 HA VM으로 남긴다: 정상 종료 때 watchdog를 그대로 둔다.
 #[tokio::test]
 async fn ha_vm_moved_away_while_running_stays_running() {
-    let (mut env, ha) = start(true).await;
+    // 시험하는 동안 stale이 되지 않게 리스를 길게 둔다.
+    let (mut env, ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
     let mut vm = ha_vm("web", env.node);
     env.create(&vm).await;
     let pid = env.wait(vm.id, "running", running).await.status.pid;

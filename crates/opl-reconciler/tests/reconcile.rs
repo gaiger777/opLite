@@ -8,13 +8,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::{Env, vm};
+use opl_cluster::watch::WatchEvent;
 use opl_driver::{
     Capacity, DriverError, Hypervisor, MigrateOptions, MigrateTarget, SourceFormat, StopMode,
     Storage, VolumeInfo, VolumeSource,
 };
 use opl_reconciler::ReconcilerConfig;
 use opl_types::node::{Node, NodeSpec, PoolState};
-use opl_types::resource::Resource;
+use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
@@ -455,6 +456,53 @@ async fn transient_start_failure_is_retried() {
     assert_eq!(got.spec.power, PowerState::Running);
 }
 
+/// 다른 프로세스가 디스크 이미지를 잠가 둔 동안(죽은 노드의 NFS 임대 등)은 실패로 세지 않고
+/// 다시 시도한다. 하네스는 3번 실패하면 포기하지만 그보다 많이 잠겨 있어도 결국 켠다.
+#[tokio::test]
+async fn locked_image_is_retried_without_counting_failures() {
+    let env = Env::start().await;
+    env.hv.fail_next_starts(
+        (0..4).map(|_| DriverError::ImageLocked("Failed to get \"write\" lock".into())),
+    );
+    let (since, _) = env.cluster.list::<VmSpec>().unwrap();
+    let mut watch = env.cluster.watch(since).unwrap();
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+
+    let got = env.wait(vm.id, "running", running).await;
+    assert_eq!(got.status.last_error, None);
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(env.hv.launches().len(), 5);
+    // 잠긴 동안의 status는 Starting과 잠금 문구이고 Failed가 되지 않는다.
+    let mut locked = 0;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), watch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let WatchEvent::Put {
+            kind: Kind::Vm,
+            resource,
+        } = event
+        else {
+            continue;
+        };
+        if resource.id != vm.id {
+            continue;
+        }
+        let status = &resource.status;
+        assert_ne!(status["phase"], "failed");
+        if status["last_error"] == "disk image is locked by another process; retrying" {
+            assert_eq!(status["phase"], "starting");
+            locked += 1;
+        }
+        if status["phase"] == "running" {
+            break;
+        }
+    }
+    assert!(locked >= 1);
+}
+
 #[tokio::test]
 async fn unresolvable_volume_marks_failed() {
     let env = Env::start().await;
@@ -738,6 +786,40 @@ async fn status_writes_keep_snapshot_position_written_meanwhile() {
     env.wait(vm.id, "running", running).await;
     assert_eq!(env.get(vm.id).status.snapshot, Some(snapshot));
     assert_eq!(env.get(vm.id).status.schedule_error, Some(busy()));
+}
+
+/// status를 쓰다 revision 불일치로 다시 읽었을 때 그 사이 다른 노드로 옮겨졌으면 쓰지 않는다(낡은
+/// 로컬 저장소로 다시 시작한 노드가 HA로 옮겨 간 VM의 status를 덮지 않게).
+#[tokio::test]
+async fn status_is_not_written_after_the_vm_moved_away_meanwhile() {
+    let env = Env::start().await;
+    let vm = stopped_vm(&env).await;
+
+    // 작업자가 VM을 읽고 시작하는 사이에 VM을 다른 노드로 옮긴다.
+    env.hv.hold_next_start();
+    env.set_power(vm.id, PowerState::Running).await;
+    env.hv.start_held().await;
+    let current = env.get(vm.id);
+    assert_ne!(current.status.phase, VmPhase::Running);
+    let mut spec = current.spec.clone();
+    spec.node = Some(Uuid::now_v7());
+    let revision = env
+        .cluster
+        .update_spec(vm.id, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    env.hv.release_start();
+
+    // 시작이 끝난 뒤 Running status를 쓰려다 revision 불일치로 다시 읽고 멈춘다.
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while env.pid(vm.id).await.is_none() {
+        assert!(std::time::Instant::now() < deadline, "not started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let now = env.get(vm.id);
+    assert_eq!(now.revision, revision);
+    assert_eq!(now.status, current.status);
 }
 
 /// 볼륨 켜기·끄기를 적는 저장소. 켜기는 늘 성공한다. reconciler는 켜기·끄기만 부른다.

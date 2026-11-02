@@ -286,6 +286,9 @@ impl QemuHypervisor {
             .map_err(|_| DriverError::Timeout("QEMU to start"))??;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if image_locked(&stderr) {
+                return Err(DriverError::ImageLocked(stderr));
+            }
             return Err(DriverError::StartFailed(stderr));
         }
         tokio::time::timeout(ATTACH_TIMEOUT, self.attach(vm.id, paths.clone(), true))
@@ -964,6 +967,13 @@ impl Hypervisor for QemuHypervisor {
     }
 }
 
+/// QEMU 시작 stderr가 다른 프로세스가 쥔 이미지 잠금 때문인지. QEMU(file-posix, 8.2와 11 같음)는
+/// `Failed to get "write" lock`이나 `Failed to get shared "write" lock` 뒤에
+/// `Is another process using the image [경로]?`를 붙인다.
+fn image_locked(stderr: &str) -> bool {
+    stderr.contains("\"write\" lock") || stderr.contains("Is another process using the image")
+}
+
 /// 끝난 마이그레이션의 결과
 fn migration_result(info: MigrationInfo) -> Result<(), DriverError> {
     match info.state {
@@ -1296,6 +1306,50 @@ mod tests {
             .join("uefi-vars.fd");
         assert_eq!(std::fs::read(vars).unwrap(), b"vars");
         assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
+    }
+
+    /// 다른 프로세스(죽은 노드의 QEMU, NFS 임대가 아직 남은 잠금)가 이미지를 쥐고 있으면 QEMU는
+    /// 이 문구로 끝난다(QEMU 8.2·11 같음). 잠시 뒤 다시 시도할 오류로 구분한다.
+    #[tokio::test]
+    async fn locked_image_is_a_transient_start_error() {
+        let tmp = short_tempdir();
+        let fake = tmp.path().join("fake-qemu");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             echo 'qemu-system-x86_64: -blockdev driver=qcow2,file=disk0-file,node-name=disk0: Failed to get \"write\" lock' >&2\n\
+             echo 'Is another process using the image [/pool/d.qcow2]?' >&2\n\
+             exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hv = QemuHypervisor::new(config(tmp.path(), fake)).await.unwrap();
+        let vm = spec();
+
+        let err = hv.start(&vm, None).await.unwrap_err();
+        match &err {
+            DriverError::ImageLocked(msg) => {
+                assert!(msg.contains("Failed to get \"write\" lock"), "{msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(err.is_transient());
+        assert!(!tmp.path().join("run/vm").join(vm.id.to_string()).exists());
+    }
+
+    #[test]
+    fn classifies_image_lock_messages() {
+        // 쓰기를 원하는 쪽과 남이 쓰기를 공유하지 않는 쪽 모두
+        assert!(image_locked(
+            "qemu: -blockdev x: Failed to get \"write\" lock\nIs another process using the image [/d]?"
+        ));
+        assert!(image_locked(
+            "qemu: -blockdev x: Failed to get shared \"write\" lock\nIs another process using the image [/d]?"
+        ));
+        assert!(!image_locked("qemu: something broke"));
+        assert!(!image_locked(
+            "qemu: Could not open '/d': No such file or directory"
+        ));
     }
 
     #[tokio::test]
