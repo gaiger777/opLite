@@ -14,6 +14,8 @@ pub struct Daemon {
     pub dir: TempDir,
     pub port: u16,
     pub cluster_port: u16,
+    /// 위트니스(설정 `witness = true`)는 HTTPS API를 열지 않는다.
+    pub witness: bool,
     child: Option<Child>,
     /// `cluster init`이 출력한 것
     pub admin_password: Option<String>,
@@ -67,11 +69,23 @@ impl Daemon {
             dir,
             port,
             cluster_port,
+            witness: false,
             child: None,
             admin_password: None,
             ca_fingerprint: None,
             join_url: None,
         }
+    }
+
+    /// 위트니스. QEMU가 없어도 돌아야 하므로 `qemu_binary`는 없는 파일을 가리킨다.
+    pub fn witness(name: &str) -> Self {
+        let mut d = Self::with_hypervisor(
+            name,
+            "witness = true",
+            "qemu_binary = \"/nonexistent/qemu-system\"",
+        );
+        d.witness = true;
+        d
     }
 
     pub fn server(&self) -> String {
@@ -90,7 +104,8 @@ impl Daemon {
         self.path("opld.sock").display().to_string()
     }
 
-    /// opld를 띄우고 제어 소켓이 응답할 때까지 기다린다. 멤버였던 노드면 API까지 기다린다.
+    /// opld를 띄우고 제어 소켓이 응답할 때까지 기다린다. 멤버였던 노드면 API까지 기다린다(위트니스는
+    /// 멤버가 될 때까지만).
     pub async fn start(&mut self) {
         assert!(self.child.is_none());
         let log = std::fs::OpenOptions::new()
@@ -109,7 +124,7 @@ impl Daemon {
         let member = self.data_dir().join("pki").exists();
         self.wait_until(|status| status.is_some_and(|s| !member || s["state"] == "member"))
             .await;
-        if member {
+        if member && !self.witness {
             self.wait_api().await;
         }
     }
@@ -186,13 +201,18 @@ impl Daemon {
         out
     }
 
-    /// `oplctl cluster join`
+    /// `oplctl cluster join`. 위트니스는 API가 없으니 제어 소켓이 멤버라고 알릴 때까지 기다린다.
     pub async fn join(&mut self, url: &str) -> anyhow::Result<String> {
         let socket = self.socket();
         let out = self
             .ctl(&["cluster", "join", url, "--socket", &socket])
             .await?;
-        self.wait_api().await;
+        if self.witness {
+            self.wait_until(|status| status.is_some_and(|s| s["state"] == "member"))
+                .await;
+        } else {
+            self.wait_api().await;
+        }
         Ok(out)
     }
 
