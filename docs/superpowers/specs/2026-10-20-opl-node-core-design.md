@@ -36,6 +36,8 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 
 구현: 하위 프로젝트 4는 계획 20(공유 풀 위의 라이브 마이그레이션, QEMU TLS 마이그레이션·노드 사이 RPC·`VmMigrate` Task)과 계획 21(UEFI 변수가 멈춘 채 옮긴 VM을 따라감, 디렉터리 풀의 `shared` 바꾸기)로 나눴다(`2026-10-30-live-migration-design.md`). 디스크까지 복사하는 마이그레이션과 macOS(HVF) 노드는 넣지 않았다.
 
+구현: 하위 프로젝트 5는 계획 22(위트니스 노드: VM을 돌리지 않는 Raft 투표 멤버, 완료), 계획 23(HA 리스와 watchdog 자기 펜싱), 계획 24(HA VM 복구)로 나눴다(`2026-11-02-ha-fencing-witness-design.md`). 23·24는 아직이다.
+
 ### 1.2 검토했지만 채택하지 않은 대안
 
 - **중앙 관리 서버 + 경량 에이전트 (vCenter 방식):** 관리 서버 자체의 HA를 따로 풀어야 하고 설치 단계가 늘어난다. 이 복잡함이 VMware를 떠나는 이유 중 하나다.
@@ -269,7 +271,7 @@ node2$ oplctl cluster join 'opl-join://…'
 - 외부 API(기본 8006)는 클러스터 CA가 서명한 노드 인증서로 HTTPS를 연다. `oplctl`은 처음 로그인할 때 CA 지문(`--ca-fingerprint`)으로 서버를 확인하고 CA를 저장한다. 클라이언트 쪽 TLS는 OS 구현(native-tls)이다. macOS는 유효 기간이 825일을 넘는 서버 인증서를 거부하므로 노드 인증서는 824일짜리이고, 만료 전에 갱신해야 한다. 사용자 인증서로 교체하는 것은 나중에 한다. 세션 쿠키에는 `Secure`를 붙인다.
 - 리더는 2초마다 다른 노드에 Ping을 보내 10초 동안 응답이 없으면 `NodeStatus.online`을 false로 기록한다(바뀔 때만 기록한다). 스케줄러가 이 값을 본다.
 - `oplctl cluster leave`(정상 탈퇴)는 이 노드에 배정된 VM이 있거나 이 노드가 유일한 투표 멤버면 거부한다. Node 리소스를 지우고 멤버십에서 빠진 뒤, 클러스터 저장소와 노드 인증서를 지우고 미초기화 상태로 돌아간다. `oplctl cluster remove-node --force`(죽은 노드 제거)는 오프라인 노드만 뺀다. 멤버십 변경은 openraft의 joint consensus로 처리한다.
-- 2노드 클러스터는 만들 수 있지만 `oplctl cluster status`가 경고를 표시한다. 위트니스는 하위 프로젝트 5에서 다룬다.
+- 2노드 클러스터는 만들 수 있지만 `oplctl cluster status`가 경고를 표시한다. 위트니스는 하위 프로젝트 5에서 다룬다. 구현: 계획 22로 위트니스 노드(설정 `witness = true`, VM을 돌리지 않고 선거에 나서지 않는 투표 멤버)를 더했다. 일반 노드 둘과 위트니스면 투표 멤버가 셋이라 경고가 없고, 한 노드가 죽어도 과반수가 남는다(`2026-11-02-ha-fencing-witness-design.md` §2).
 
 ## 9. 범위 밖 (1차)
 

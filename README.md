@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 개발 초기 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션)
+- 상태: 개발 초기 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드)
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -518,6 +518,51 @@ timeout = "30m"           # 이 시간 안에 끝나지 않으면 취소하고 �
 - **공유 LVM.** 옮기는 동안 디스크 LV를 공유 잠금(`lvchange -asy`)으로 바꾸고, 대상이 넘겨받은 뒤 다시 배타로
   바꾼다.
 
+## 위트니스 노드
+
+2노드 클러스터는 한 노드만 죽어도 과반수를 잃어 아무것도 바꿀 수 없다. 위트니스는 VM을 돌리지 않고 Raft 투표만
+하는 opld다(vSAN 위트니스, corosync-qnetd와 같은 자리). **일반 노드 둘과 위트니스 하나**를 권한다. 투표 멤버가
+셋이므로 어느 한 노드가 죽어도 클러스터가 계속 돈다. QEMU가 필요 없으므로 작은 기계나 VM(이 클러스터 밖)에 둔다.
+
+```bash
+sudo tee /etc/opl/opld.toml >/dev/null <<'TOML'
+name = "wit"
+address = "10.0.0.13"
+witness = true
+TOML
+sudo opld --config /etc/opl/opld.toml &
+oplctl cluster join-token                        # 일반 노드의 API에 로그인한 곳에서
+sudo oplctl cluster join 'opl-join://…'          # 위트니스에서
+oplctl cluster status                            # WITNESS 열이 true, 경고 없음
+```
+
+- **합류만 된다.** 위트니스에서 `cluster init`은 거절된다("a witness cannot start a cluster; join an existing
+  cluster instead"). 역할은 합류할 때 정해지고 바뀌지 않는다. 바꾸려면 `cluster leave` 뒤 설정을 고치고 opld를
+  다시 띄워 다시 합류한다. 멤버인 채 `witness` 값만 바꿔 다시 띄우면 opld는 시작하지 않는다("this node joined
+  as a witness but opld.toml says witness = false; leave the cluster and join again to change the role", 반대도
+  같다).
+- **탈퇴.** 탈퇴·`remove-node`는 일반 노드와 같다. 다만 빠진 뒤 남는 투표 멤버가 모두 위트니스면 위트니스는
+  리더가 될 수 없어 클러스터가 멈추므로 `cluster leave`를 거절한다("the remaining voting members are all
+  witnesses, which cannot lead; add another non-witness node first"). 위트니스 자신은 일반 노드가 남으면 빠질
+  수 있다.
+- **도는 것과 돌지 않는 것.** 클러스터 저장소와 노드 사이 연결(`cluster_listen`, 기본 8007)만 돈다. HTTPS API(8006)·
+  웹 UI를 열지 않고, VM·Task·스토리지 풀·마이그레이션·예약 스냅샷·정리를 하지 않는다. 그래서 위트니스에서는
+  `cluster join`·`leave`(제어 소켓)만 쓰고, 상태는 일반 노드의 API로 본다. 방화벽은 노드 사이에 8007만 연다.
+- **설정.** `[hypervisor]`·`[pools]`·`[migration]`은 쓰지 않는다. 다만 `[hypervisor]` 값의 검사는 그대로 거치므로
+  (예: macOS에서 `accel = "kvm"`, `systemd_scope = true`) 잘못된 값이 있으면 시작하지 않는다. `qemu_binary`는
+  찾지 않는다.
+- **리더가 되지 않는다.** 투표는 하지만 선거에 나서지 않는다. 리더의 일(노드 감시, 정리, 예약 스냅샷)은 늘 일반
+  노드가 한다. 리더가 죽으면 남은 일반 노드가 위트니스의 표를 받아 리더가 된다.
+- **배치에서 빠진다.** 스케줄러, 작업 노드 선택, 마이그레이션 대상, 풀의 노드 목록이 위트니스를 세지 않는다. VM의
+  노드나 마이그레이션 대상으로 위트니스를 지정하면 **409** `node_unavailable`이다.
+- **표시.** `oplctl node list`·`cluster status`에 `WITNESS` 열(`true`/`false`), `node get`에 `spec.witness`가
+  있다. 웹은 노드 목록·클러스터 멤버·대시보드에 "위트니스" 배지를 붙인다. `cluster status`는 투표 멤버가 둘이면
+  2노드 경고("warning: a two-node cluster stops accepting changes when either node fails; add a third node")를,
+  투표 멤버가 셋 이상인데 위트니스가 아닌 노드가 하나뿐이면 "warning: HA needs at least two non-witness
+  nodes"를 보인다.
+  위트니스의 `ADDRESS`(`node list`·`cluster status`)는 설정의 API 주소(`address:listen 포트`)이지만 위트니스는
+  그 포트를 열지 않는다.
+
 ## 웹 UI
 
 opld를 `web-ui` 기능으로 빌드하면 API와 같은 주소(`https://<노드>:8006/`)에서 웹 UI가 열린다.
@@ -743,6 +788,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [공유 스토리지 설계 4: Ceph RBD (계획 18)](docs/superpowers/specs/2026-10-29-shared-storage-ceph-rbd-design.md)
 - [공유 스토리지 설계 5: iSCSI와 공유 LVM (계획 19)](docs/superpowers/specs/2026-10-30-shared-storage-iscsi-lvm-design.md)
 - [라이브 마이그레이션 설계 (하위 프로젝트 4: 계획 20·21)](docs/superpowers/specs/2026-10-30-live-migration-design.md)
+- [HA·펜싱·위트니스 설계 (하위 프로젝트 5: 계획 22·23·24)](docs/superpowers/specs/2026-11-02-ha-fencing-witness-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)
