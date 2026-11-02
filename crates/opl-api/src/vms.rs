@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::network::USER_NETWORK;
-use opl_types::node::{Node, NodeSpec};
+use opl_types::node::{Node, NodeSpec, ha_capable};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::storage::{VolumePhase, is_shared};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
@@ -120,6 +120,7 @@ pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(
             return Err(ApiError::bad_request(format!("node {id} not found")));
         };
         check_not_witness(node)?;
+        check_ha_capable(node, spec)?;
         check_node_arch(node, spec)?;
     }
     if spec.power == PowerState::Running && spec.node.is_none() {
@@ -136,6 +137,20 @@ fn check_not_witness(node: &Node) -> Result<(), ApiError> {
         return Err(ApiError::conflict(
             "node_unavailable",
             format!("node {:?} is a witness node and cannot run VMs", node.name),
+        ));
+    }
+    Ok(())
+}
+
+/// HA VM인데 노드가 HA 가능 노드(펜싱이 켜진 노드)가 아니면 409 `ha_unsupported`.
+fn check_ha_capable(node: &Node, spec: &VmSpec) -> Result<(), ApiError> {
+    if spec.ha && !ha_capable(node) {
+        return Err(ApiError::conflict(
+            "ha_unsupported",
+            format!(
+                "node {:?} does not support HA (fencing is off) and cannot run HA VMs",
+                node.name
+            ),
         ));
     }
     Ok(())
@@ -394,6 +409,7 @@ pub struct MigrateRequest {
 /// 실행 중인 VM을 다른 노드로 라이브 마이그레이션할 Task를 돌려준다(202). Task는 지금 노드의 실행기가
 /// 한다. 디스크가 모두 공유 풀에 있어야 하고, HVF(macOS) 노드는 원본도 대상도 될 수 없다(409
 /// `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
+/// HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
 /// 스케줄러가 고를 수 없는 노드(풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
 #[utoipa::path(post, path = "/vms/{key}/migrate", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
@@ -463,6 +479,7 @@ pub async fn migrate_vm(
         }
     }
     check_not_witness(&target)?;
+    check_ha_capable(&target, &vm.spec)?;
     if !target.status.online || target.spec.maintenance {
         return Err(ApiError::conflict(
             "node_unavailable",

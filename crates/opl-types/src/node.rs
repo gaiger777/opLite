@@ -44,6 +44,36 @@ pub struct NodeStatus {
     pub arch: Option<Arch>,
     /// 이 노드가 쓸 수 있는 스토리지 풀(풀 이름 → 상태). 노드가 주기적으로 기록한다.
     pub pools: BTreeMap<String, PoolState>,
+    /// 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // 없으면 빼고 쓰므로 API 문서에서도 null·기본값이 아니라 선택 필드다.
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub ha: Option<NodeHa>,
+}
+
+/// 노드가 등록할 때 쓰는 HA 펜싱 설정
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NodeHa {
+    pub fencing: Fencing,
+    /// 마지막 리스 갱신 뒤 이만큼 지나면 이 노드의 HA VM이 꺼졌다고 보고 리더가 옮긴다(초).
+    pub recover_after_secs: u64,
+}
+
+/// 리스를 잃은 노드가 HA VM을 끄는 방법
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Fencing {
+    /// opld가 HA VM을 끄고, opld가 멈추면 watchdog가 노드를 재시작한다.
+    Watchdog,
+    /// opld가 HA VM을 끄는 것만 한다(시험·개발용).
+    Process,
+}
+
+/// HA 가능 노드: 위트니스가 아니고 펜싱이 켜진 노드. HA VM은 이런 노드에서만 돈다.
+pub fn ha_capable(node: &Node) -> bool {
+    !node.spec.witness && node.status.ha.is_some()
 }
 
 /// 한 노드에서 본 스토리지 풀 상태
@@ -87,6 +117,50 @@ mod tests {
         assert!(witness.witness);
         let status: NodeStatus = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(status, NodeStatus::default());
+        assert_eq!(status.ha, None);
+    }
+
+    #[test]
+    fn status_ha_round_trips_and_is_omitted_when_off() {
+        let off = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(off.get("ha").is_none(), "{off}");
+        let status = NodeStatus {
+            ha: Some(NodeHa {
+                fencing: Fencing::Watchdog,
+                recover_after_secs: 65,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["ha"],
+            serde_json::json!({ "fencing": "watchdog", "recover_after_secs": 65 })
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+        assert_eq!(
+            serde_json::to_value(Fencing::Process).unwrap(),
+            serde_json::json!("process")
+        );
+    }
+
+    #[test]
+    fn ha_capable_needs_fencing_and_no_witness() {
+        let mut node: Node = Resource::new(
+            "n",
+            NodeSpec {
+                address: "a".into(),
+                maintenance: false,
+                witness: false,
+            },
+        );
+        assert!(!ha_capable(&node));
+        node.status.ha = Some(NodeHa {
+            fencing: Fencing::Process,
+            recover_after_secs: 7,
+        });
+        assert!(ha_capable(&node));
+        node.spec.witness = true;
+        assert!(!ha_capable(&node));
     }
 
     #[test]

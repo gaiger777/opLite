@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use opl_api::{ClusterJanitorConfig, SnapshotSchedulerConfig};
 use opl_qemu::{Accel, HostProfile, kvm_available};
+use opl_types::node::{Fencing, NodeHa};
 use serde::Deserialize;
 
 /// `opld --config <path>`로 읽는 TOML 설정.
@@ -52,6 +53,8 @@ pub struct Config {
     pub pools: PoolsSection,
     #[serde(default)]
     pub migration: MigrationSection,
+    #[serde(default)]
+    pub ha: HaSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -241,6 +244,103 @@ impl Default for MigrationSection {
     }
 }
 
+/// HA 리스와 자기 펜싱(설계 §3.1). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaSection {
+    /// `watchdog`(opld가 HA VM을 끄고, opld가 멈추면 watchdog가 노드를 재시작), `process`(opld가
+    /// 끄는 것만 — 시험·개발용), `off`(이 노드는 HA VM을 돌리지 않는다). 기본은 Linux `watchdog`,
+    /// macOS `off`다.
+    #[serde(default)]
+    pub fencing: FencingSetting,
+    /// Linux watchdog 장치(하드웨어 또는 `softdog`)
+    #[serde(default = "default_watchdog_device")]
+    pub watchdog_device: PathBuf,
+    /// 장치에 정하는 제한 시간(초, `WDIOC_SETTIMEOUT`)
+    #[serde(default = "default_watchdog_timeout_secs")]
+    pub watchdog_timeout_secs: u64,
+    /// 마지막으로 성공한 리스 갱신 뒤 이만큼 지나면 HA VM을 끈다(초).
+    #[serde(default = "default_fence_after_secs")]
+    pub fence_after_secs: u64,
+}
+
+impl Default for HaSection {
+    fn default() -> Self {
+        Self {
+            fencing: FencingSetting::default(),
+            watchdog_device: default_watchdog_device(),
+            watchdog_timeout_secs: default_watchdog_timeout_secs(),
+            fence_after_secs: default_fence_after_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FencingSetting {
+    Watchdog,
+    Process,
+    Off,
+}
+
+impl Default for FencingSetting {
+    fn default() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Watchdog
+        } else {
+            Self::Off
+        }
+    }
+}
+
+/// `watchdog_timeout_secs`의 하한. 1초마다 쓰다듬으므로 한두 번 늦어도 재시작되지 않게 둔다.
+const MIN_WATCHDOG_TIMEOUT_SECS: u64 = 5;
+/// `watchdog_timeout_secs`의 상한(1시간)
+const MAX_WATCHDOG_TIMEOUT_SECS: u64 = 3600;
+/// 리더가 옮기기 전에 더 기다리는 여유(초)
+const RECOVER_MARGIN_SECS: u64 = 5;
+
+impl HaSection {
+    /// 등록할 때 쓰는 이 노드의 HA 설정. 펜싱이 꺼져 있으면 None이다.
+    pub fn node_ha(&self) -> Option<NodeHa> {
+        let (fencing, watchdog) = match self.fencing {
+            FencingSetting::Off => return None,
+            FencingSetting::Watchdog => (Fencing::Watchdog, self.watchdog_timeout_secs),
+            FencingSetting::Process => (Fencing::Process, 0),
+        };
+        Some(NodeHa {
+            fencing,
+            recover_after_secs: self
+                .fence_after_secs
+                .saturating_add(watchdog)
+                .saturating_add(RECOVER_MARGIN_SECS),
+        })
+    }
+}
+
+// 노드의 `HaGuard`를 만들 때 쓴다. 그 전까지는 시험만 쓴다.
+#[cfg_attr(not(test), expect(dead_code))]
+impl HaSection {
+    pub fn fence_after(&self) -> Duration {
+        Duration::from_secs(self.fence_after_secs)
+    }
+
+    /// 리스 갱신 간격: `fence_after`의 10분의 1을 0.2초 이상 2초 이하로 자른 값
+    pub fn renew_interval(&self) -> Duration {
+        (self.fence_after() / 10).clamp(Duration::from_millis(200), Duration::from_secs(2))
+    }
+}
+
+fn default_watchdog_device() -> PathBuf {
+    "/dev/watchdog".into()
+}
+fn default_watchdog_timeout_secs() -> u64 {
+    30
+}
+fn default_fence_after_secs() -> u64 {
+    30
+}
+
 fn default_migration_ports() -> RangeInclusive<u16> {
     60000..=60099
 }
@@ -417,6 +517,21 @@ impl Config {
         }
         if self.pools.refresh_secs == 0 {
             anyhow::bail!("pools.refresh_secs must be at least 1");
+        }
+        if self.ha.fence_after_secs == 0 {
+            anyhow::bail!("ha.fence_after_secs must be at least 1");
+        }
+        if self.ha.fencing == FencingSetting::Watchdog {
+            if !(MIN_WATCHDOG_TIMEOUT_SECS..=MAX_WATCHDOG_TIMEOUT_SECS)
+                .contains(&self.ha.watchdog_timeout_secs)
+            {
+                anyhow::bail!(
+                    "ha.watchdog_timeout_secs must be between {MIN_WATCHDOG_TIMEOUT_SECS} and {MAX_WATCHDOG_TIMEOUT_SECS}"
+                );
+            }
+            if !linux {
+                anyhow::bail!("ha.fencing = \"watchdog\" needs Linux; use \"process\" or \"off\"");
+            }
         }
         // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
         if self.listen.port() == self.cluster_listen.port() {
@@ -723,6 +838,121 @@ mod tests {
                 assert!(e.to_string().contains("/dev/kvm"), "{e}");
             }
         }
+    }
+
+    #[test]
+    fn ha_section_defaults_by_os() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        c.validate().unwrap();
+        assert_eq!(c.ha.watchdog_device, Path::new("/dev/watchdog"));
+        assert_eq!(c.ha.watchdog_timeout_secs, 30);
+        assert_eq!(c.ha.fence_after_secs, 30);
+        assert_eq!(c.ha.fence_after(), Duration::from_secs(30));
+        if cfg!(target_os = "linux") {
+            assert_eq!(c.ha.fencing, FencingSetting::Watchdog);
+            assert_eq!(
+                c.ha.node_ha(),
+                Some(NodeHa {
+                    fencing: Fencing::Watchdog,
+                    recover_after_secs: 65,
+                })
+            );
+        } else {
+            assert_eq!(c.ha.fencing, FencingSetting::Off);
+            assert_eq!(c.ha.node_ha(), None);
+        }
+    }
+
+    #[test]
+    fn ha_section_sets_fencing_and_recover_after() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nfence_after_secs = 2",
+        );
+        c.validate().unwrap();
+        // process는 watchdog 제한 시간을 더하지 않는다.
+        assert_eq!(
+            c.ha.node_ha(),
+            Some(NodeHa {
+                fencing: Fencing::Process,
+                recover_after_secs: 7,
+            })
+        );
+        let c = parse("name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"off\"");
+        c.validate().unwrap();
+        assert_eq!(c.ha.node_ha(), None);
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"watchdog\"\n\
+             watchdog_device = \"/dev/watchdog1\"\nwatchdog_timeout_secs = 10\nfence_after_secs = 20",
+        );
+        assert_eq!(c.ha.watchdog_device, Path::new("/dev/watchdog1"));
+        assert_eq!(
+            c.ha.node_ha(),
+            Some(NodeHa {
+                fencing: Fencing::Watchdog,
+                recover_after_secs: 35,
+            })
+        );
+        // watchdog 장치는 Linux에만 있다.
+        assert_eq!(c.validate().is_ok(), cfg!(target_os = "linux"));
+        for bad in ["fencing = \"ipmi\"", "fence_after = 1"] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[ha]\n{bad}");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ha_section_validates_times() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nfence_after_secs = 0",
+        );
+        assert!(c.validate().is_err());
+        // 꺼져 있어도 fence_after는 검사한다.
+        let c =
+            parse("name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"off\"\nfence_after_secs = 0");
+        assert!(c.validate().is_err());
+        // 제한 시간은 5초 이상이다. 장치를 1초마다 쓰다듬으므로 너무 짧으면 쓰다듬기 한 번만 늦어도
+        // 노드가 재시작된다. Linux가 아니면 범위 안이어도 장치가 없어 실패한다.
+        for (timeout, ok) in [
+            (0, false),
+            (4, false),
+            (5, true),
+            (3600, true),
+            (3601, false),
+        ] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"watchdog\"\nwatchdog_timeout_secs = {timeout}"
+            ));
+            match c.validate() {
+                Ok(()) => assert!(ok && cfg!(target_os = "linux"), "{timeout}"),
+                Err(e) => assert_eq!(
+                    e.to_string().contains("watchdog_timeout_secs"),
+                    !ok,
+                    "{timeout}: {e}"
+                ),
+            }
+        }
+        // watchdog가 아니면 장치 제한 시간은 쓰지 않으므로 보지 않는다.
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nwatchdog_timeout_secs = 0",
+        );
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn renew_interval_is_a_tenth_of_fence_after_within_bounds() {
+        let interval = |fence_after_secs| {
+            HaSection {
+                fence_after_secs,
+                ..HaSection::default()
+            }
+            .renew_interval()
+        };
+        assert_eq!(interval(1), Duration::from_millis(200));
+        assert_eq!(interval(2), Duration::from_millis(200));
+        assert_eq!(interval(5), Duration::from_millis(500));
+        assert_eq!(interval(20), Duration::from_secs(2));
+        assert_eq!(interval(30), Duration::from_secs(2));
+        assert_eq!(interval(u64::MAX), Duration::from_secs(2));
     }
 
     #[test]

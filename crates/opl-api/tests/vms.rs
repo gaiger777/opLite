@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::{Env, vm_request};
 use opl_driver::DriverError;
-use opl_types::node::{Node, NodeSpec};
+use opl_types::node::{Fencing, Node, NodeHa, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{VolumePhase, VolumeSpec};
@@ -479,6 +479,86 @@ async fn a_witness_cannot_hold_vms() {
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
     let (_, vm) = admin.get("/vms/web").await;
     assert_eq!(vm["spec"]["node"], env.node.to_string());
+}
+
+/// HA VM은 HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. 실행 중에도 `ha`를 바꿀 수 있다.
+#[tokio::test]
+async fn ha_vms_need_an_ha_capable_node() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    // 노드를 정하지 않은 HA VM은 만들 수 있지만, HA 가능 노드가 없으면 켤 수 없다.
+    let mut req = vm_request("web");
+    req["spec"]["ha"] = json!(true);
+    let (status, vm) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["ha"], true);
+    let (status, body) = admin.post("/vms/web/actions/start", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "no_node");
+
+    // 펜싱이 꺼진 노드에 두면 만들 때도 고칠 때도 409다.
+    req["name"] = json!("db");
+    req["spec"]["node"] = json!(env.node);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "ha_unsupported");
+    assert_eq!(
+        body["message"],
+        "node \"node1\" does not support HA (fencing is off) and cannot run HA VMs"
+    );
+    let mut spec = vm["spec"].clone();
+    spec["node"] = json!(env.node);
+    let (status, body) = admin
+        .put("/vms/web", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "ha_unsupported");
+
+    // 이 노드에 펜싱을 켜면 스케줄러가 이 노드를 고른다.
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.ha = Some(NodeHa {
+        fencing: Fencing::Process,
+        recover_after_secs: 7,
+    });
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, vm) = admin.get("/vms/web").await;
+    assert_eq!(vm["spec"]["node"], env.node.to_string());
+
+    // 실행 중인 VM의 `ha`는 바꿀 수 있다.
+    for ha in [false, true] {
+        let mut spec = vm["spec"].clone();
+        spec["ha"] = json!(ha);
+        let (code, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(body["spec"]["ha"], ha);
+    }
+    // 노드의 펜싱이 꺼진 뒤에는 HA로 바꿀 수 없다.
+    status.ha = None;
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["ha"] = json!(false);
+    let (code, body) = admin
+        .put("/vms/web", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    spec["ha"] = json!(true);
+    let (code, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "ha_unsupported");
 }
 
 #[tokio::test]

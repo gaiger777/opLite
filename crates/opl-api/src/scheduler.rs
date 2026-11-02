@@ -2,7 +2,7 @@
 
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
-use opl_types::node::{Node, NodeSpec};
+use opl_types::node::{Node, NodeSpec, ha_capable};
 use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumeSpec, is_shared, pool_usable_on,
 };
@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
-    "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools and has the bridges of its networks)"
+    "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks and, for an HA VM, has HA fencing)"
 )]
 pub struct NoNode;
 
@@ -81,7 +81,7 @@ impl Inventory {
 }
 
 /// 위트니스가 아니고 온라인이고 유지보수 중이 아니며 머신 타입의 아키텍처이고 디스크의 풀을 쓸 수 있고 네트워크의 브리지가 있는 노드
-/// 가운데 미할당 메모리가 가장 많은 노드를 고른다. 같으면 id가 작은 노드다. 메모리가 모자라도 고른다(오버커밋 정책은
+/// (HA VM이면 HA 가능 노드) 가운데 미할당 메모리가 가장 많은 노드를 고른다. 같으면 id가 작은 노드다. 메모리가 모자라도 고른다(오버커밋 정책은
 /// 범위 밖). arch를 모르는 노드(옛 버전)는 고르지 않는다.
 pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode> {
     inv.nodes
@@ -106,6 +106,11 @@ pub fn node_fits(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), Stri
     if node.spec.maintenance {
         return Err(format!("node {name:?} is in maintenance"));
     }
+    if spec.ha && !ha_capable(node) {
+        return Err(format!(
+            "node {name:?} does not support HA (fencing is off)"
+        ));
+    }
     if node.status.arch != Some(spec.machine.arch()) {
         let arch = format!("{:?}", spec.machine.arch()).to_lowercase();
         return Err(format!(
@@ -127,7 +132,7 @@ pub fn node_fits(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), Stri
 
 #[cfg(test)]
 mod tests {
-    use opl_types::node::{BridgeInfo, NodeStatus, PoolState};
+    use opl_types::node::{BridgeInfo, Fencing, NodeHa, NodeStatus, PoolState};
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
     use opl_types::storage::PoolBackend;
@@ -152,6 +157,7 @@ mod tests {
             bridges: vec![],
             arch: Some(Arch::Aarch64),
             pools: Default::default(),
+            ha: None,
         };
         n
     }
@@ -209,6 +215,7 @@ mod tests {
             restart: Default::default(),
             node,
             snapshot_schedule: None,
+            ha: false,
         }
     }
 
@@ -292,6 +299,31 @@ mod tests {
         };
         let me = spec(512, None, PowerState::Running);
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(small.id));
+        inv.nodes.pop();
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+    }
+
+    #[test]
+    fn ha_vms_go_only_to_ha_capable_nodes() {
+        // 메모리가 가장 많은 노드도 펜싱이 꺼져 있으면 HA VM을 받지 않는다.
+        let off = node(64000);
+        let mut fenced = node(1024);
+        fenced.status.ha = Some(NodeHa {
+            fencing: Fencing::Process,
+            recover_after_secs: 7,
+        });
+        let mut inv = Inventory {
+            nodes: vec![off.clone(), fenced.clone()],
+            ..Default::default()
+        };
+        let mut me = spec(512, None, PowerState::Running);
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(off.id));
+        me.ha = true;
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(fenced.id));
+        assert_eq!(
+            node_fits(&me, &inv, &off),
+            Err("node \"n\" does not support HA (fencing is off)".into())
+        );
         inv.nodes.pop();
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
     }

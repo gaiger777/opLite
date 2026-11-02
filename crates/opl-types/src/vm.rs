@@ -36,6 +36,9 @@ pub struct VmSpec {
     /// 예약 스냅샷. None이면 예약하지 않는다.
     #[serde(default)]
     pub snapshot_schedule: Option<SnapshotSchedule>,
+    /// HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
+    #[serde(default)]
+    pub ha: bool,
 }
 
 impl ResourceSpec for VmSpec {
@@ -458,6 +461,7 @@ mod tests {
         assert_eq!(spec.restart, RestartPolicy::OnFailure);
         assert_eq!(spec.node, None);
         assert_eq!(spec.snapshot_schedule, None);
+        assert!(!spec.ha);
     }
 
     #[test]

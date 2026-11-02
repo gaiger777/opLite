@@ -259,6 +259,41 @@ async fn revert_restores_the_spec_of_a_diskless_vm() {
     assert_eq!(env.pid(vm).await, None);
 }
 
+/// 되돌려도 `ha`는 스냅샷 때의 것이 아니라 지금 것을 지킨다(예약처럼).
+#[tokio::test]
+async fn revert_keeps_the_current_ha() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = running_vm(&admin, "bare", &[]).await;
+    succeeded(&snapshot(&admin, "bare", json!({ "name": "cfg" })).await);
+    assert!(!get(&env, vm, "cfg").spec.vm_spec.ha);
+
+    // 시험 노드는 HA 가능 노드가 아니므로 API를 거치지 않고 바꾼다(reconciler의 status 쓰기와
+    // 부딪치면 다시 읽어 쓴다).
+    loop {
+        let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+        let mut spec = current.spec.clone();
+        spec.ha = true;
+        match env
+            .cluster
+            .update_spec(vm, Some(current.revision), current.labels, &spec)
+            .await
+        {
+            Err(opl_cluster::ClusterError::Rejected(_)) => continue,
+            r => {
+                r.unwrap();
+                break;
+            }
+        }
+    }
+    let (status, task) = admin
+        .post("/vms/bare/snapshots/cfg/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert!(env.cluster.get::<VmSpec>(vm).unwrap().unwrap().spec.ha);
+}
+
 #[tokio::test]
 async fn memory_revert_does_not_place_the_vm_on_a_node_of_another_architecture() {
     let env = Env::start().await;

@@ -452,6 +452,7 @@ mod tests {
                     restart: Default::default(),
                     node: None,
                     snapshot_schedule: None,
+                    ha: false,
                 },
             },
         );

@@ -4,7 +4,7 @@
 mod common;
 
 use common::{Client, Env, mark_pool_ready, vm_request};
-use opl_types::node::{Node, NodeSpec, NodeStatus};
+use opl_types::node::{Fencing, Node, NodeHa, NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{Volume, VolumePhase, VolumeSpec};
@@ -32,6 +32,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
         bridges: vec![],
         arch: Some(Arch::Aarch64),
         pools: Default::default(),
+        ha: None,
     };
     env.cluster.create(&node).await.unwrap();
     node.id
@@ -165,6 +166,38 @@ async fn migrate_creates_a_task_on_the_source_node() {
     assert_eq!(body["code"], "invalid_request");
     let (status, _) = migrate(&admin, "nope", "node2").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// HA VM은 HA 가능 노드(펜싱이 켜진 노드)로만 옮긴다.
+#[tokio::test]
+async fn ha_vms_migrate_only_to_ha_capable_nodes() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = setup(&env, &admin).await;
+    let ha = Some(NodeHa {
+        fencing: Fencing::Process,
+        recover_after_secs: 7,
+    });
+    edit_node(&env, env.node, |n| n.status.ha = ha).await;
+    // 실행 중인 VM도 HA로 바꿀 수 있다.
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["ha"] = json!(true);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = migrate(&admin, "web", "node2").await;
+    assert_eq!(
+        body["message"],
+        "node \"node2\" does not support HA (fencing is off) and cannot run HA VMs",
+        "{body}"
+    );
+    assert_conflict((status, body), "ha_unsupported");
+
+    edit_node(&env, node2, |n| n.status.ha = ha).await;
+    let (status, task) = migrate(&admin, "web", "node2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
 }
 
 #[tokio::test]

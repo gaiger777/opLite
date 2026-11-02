@@ -121,7 +121,8 @@ async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지, 아키텍처를 기록한다.
+/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지, 아키텍처, HA 펜싱을
+/// 기록한다.
 pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> anyhow::Result<()> {
     ensure_node(cluster, config).await?;
     let bridges = host.bridges().await;
@@ -138,6 +139,8 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
             arch: Some(host.profile.arch),
             // 풀 상태는 풀 새로 고침이 쓴다. 이미 적힌 것을 지우지 않는다.
             pools: std::mem::take(&mut status.pools),
+            // 펜싱이 꺼져 있으면 None이라 리더가 이 노드의 HA VM을 옮기지 않는다.
+            ha: config.ha.node_ha(),
         };
         true
     })
@@ -226,7 +229,9 @@ pub(crate) mod tests {
     use opl_cluster::ClusterConfig;
     use opl_cluster::memnet::MemRouter;
     use opl_driver::{DriverError, HostNet, Tap};
-    use opl_types::node::{BridgeInfo, PoolState};
+    use opl_types::node::{BridgeInfo, Fencing, NodeHa, PoolState};
+
+    use crate::config::FencingSetting;
 
     /// 정해 둔 브리지를 돌려준다. `None`이면 `ip`가 실패한 것처럼 오류를 낸다.
     #[derive(Debug)]
@@ -297,6 +302,32 @@ pub(crate) mod tests {
             let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
             assert_eq!(node.status.arch, Some(arch));
         }
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// `[ha]`의 펜싱을 기록하고, 설정을 바꿔 다시 등록하면 그 값으로 바꾼다. `off`면 없다.
+    #[tokio::test]
+    async fn registration_records_the_ha_fencing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let mut config = test_config();
+        let mut host = Host::from_config(&config).unwrap();
+        host.net = None;
+        config.ha.fencing = FencingSetting::Process;
+        config.ha.fence_after_secs = 2;
+        register_node(&cluster, &config, &host).await.unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert_eq!(
+            node.status.ha,
+            Some(NodeHa {
+                fencing: Fencing::Process,
+                recover_after_secs: 7,
+            })
+        );
+        config.ha.fencing = FencingSetting::Off;
+        register_node(&cluster, &config, &host).await.unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert_eq!(node.status.ha, None);
         cluster.shutdown().await.unwrap();
     }
 

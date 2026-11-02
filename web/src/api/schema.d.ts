@@ -466,6 +466,7 @@ export interface paths {
          * 실행 중인 VM을 다른 노드로 라이브 마이그레이션할 Task를 돌려준다(202). Task는 지금 노드의 실행기가
          *     한다. 디스크가 모두 공유 풀에 있어야 하고, HVF(macOS) 노드는 원본도 대상도 될 수 없다(409
          *     `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
+         *     HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
          *     스케줄러가 고를 수 없는 노드(풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
          */
         post: operations["migrate_vm"];
@@ -735,6 +736,8 @@ export interface components {
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
+                /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
+                ha?: boolean;
                 machine: components["schemas"]["MachineType"];
                 /** Format: int32 */
                 memory_mib: number;
@@ -808,6 +811,11 @@ export interface components {
             details?: unknown;
             message: string;
         };
+        /**
+         * @description 리스를 잃은 노드가 HA VM을 끄는 방법
+         * @enum {string}
+         */
+        Fencing: "watchdog" | "process";
         /** @enum {string} */
         Firmware: "bios" | "uefi";
         /**
@@ -922,6 +930,8 @@ export interface components {
                      * @default 0
                      */
                     cpus: number;
+                    /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
+                    ha?: components["schemas"]["NodeHa"];
                     /**
                      * @description 예: `qemu-hvf`, `qemu-kvm`, `qemu-tcg`
                      * @default
@@ -1094,6 +1104,8 @@ export interface components {
                     cpu: components["schemas"]["CpuSpec"];
                     disks?: components["schemas"]["DiskSpec"][];
                     firmware?: components["schemas"]["Firmware"];
+                    /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
+                    ha?: boolean;
                     machine: components["schemas"]["MachineType"];
                     /** Format: int32 */
                     memory_mib: number;
@@ -1270,6 +1282,15 @@ export interface components {
             /** @description Network 리소스 이름 */
             network: string;
         };
+        /** @description 노드가 등록할 때 쓰는 HA 펜싱 설정 */
+        NodeHa: {
+            fencing: components["schemas"]["Fencing"];
+            /**
+             * Format: int64
+             * @description 마지막 리스 갱신 뒤 이만큼 지나면 이 노드의 HA VM이 꺼졌다고 보고 리더가 옮긴다(초).
+             */
+            recover_after_secs: number;
+        };
         NodeSpec: {
             /** @description API 주소 (`host:port`) */
             address: string;
@@ -1292,6 +1313,8 @@ export interface components {
              * @default 0
              */
             cpus: number;
+            /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
+            ha?: components["schemas"]["NodeHa"];
             /**
              * @description 예: `qemu-hvf`, `qemu-kvm`, `qemu-tcg`
              * @default
@@ -1468,6 +1491,8 @@ export interface components {
                  * @default 0
                  */
                 cpus: number;
+                /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
+                ha?: components["schemas"]["NodeHa"];
                 /**
                  * @description 예: `qemu-hvf`, `qemu-kvm`, `qemu-tcg`
                  * @default
@@ -1624,6 +1649,8 @@ export interface components {
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
+                /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
+                ha?: boolean;
                 machine: components["schemas"]["MachineType"];
                 /** Format: int32 */
                 memory_mib: number;
@@ -1911,6 +1938,8 @@ export interface components {
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
+                /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
+                ha?: boolean;
                 machine: components["schemas"]["MachineType"];
                 /** Format: int32 */
                 memory_mib: number;
@@ -1946,6 +1975,8 @@ export interface components {
             cpu: components["schemas"]["CpuSpec"];
             disks?: components["schemas"]["DiskSpec"][];
             firmware?: components["schemas"]["Firmware"];
+            /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
+            ha?: boolean;
             machine: components["schemas"]["MachineType"];
             /** Format: int32 */
             memory_mib: number;
