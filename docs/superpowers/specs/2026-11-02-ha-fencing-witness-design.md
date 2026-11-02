@@ -54,9 +54,11 @@
   - HA VM을 만들거나 바꿀 때 `spec.node`가 HA 가능 노드가 아니면 409 `ha_unsupported`.
   - 노드가 없는 HA VM을 시작할 때는 스케줄러가 HA 가능 노드만 고른다(없으면 409 `no_capacity`).
   - HA VM의 마이그레이션 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`.
-  - 실행 중인 VM의 `ha`는 바꿀 수 있다.
+  - **HA는 멈춘 VM에서만 켠다**(계획 24에서 더한 규칙 — 처음에는 "실행 중인 VM의 `ha`는 바꿀 수 있다"였다). 수정에서 `ha`를 false → true로 바꾸는 것은 VM이 멈춰 있을 때만이다(원하는 상태 stopped이고 phase `Stopped`·`Failed`). 아니면 409 `vm_running`. 끄기는 언제든, 생성 때 `ha: true`는 그대로 된다. 이유: 노드 N이 과반수와 끊긴 동안 다수 쪽이 N에서 실행 중인 VM의 HA를 켜면 N은 그 기록을 받지 못해 HA인 줄 모르고 펜싱하지 않는데, 리더는 N의 리스가 끝난 뒤 그 VM을 복구해 둘이 함께 돈다. 멈춘 VM이면 N이 그것을 켜는 기록(`power = Running`)은 HA 기록 뒤에 있으므로, N은 둘을 함께 보거나(HA VM으로 리스를 보고 켠다) 둘 다 보지 못한다(켜지 않는다).
 
 구현(계획 23): 타입은 `opl_types::node`의 `NodeHa`, `Fencing { Watchdog, Process }`(`snake_case`), `ha_capable(&Node)`이고 `NodeStatus.ha`는 없으면 빼고 쓴다(OpenAPI에서도 선택 필드). opld 설정은 `Config.ha: HaSection`(`FencingSetting { Watchdog, Process, Off }`, `deny_unknown_fields`)이고, Linux가 아니면 `watchdog`는 설정 오류다. 검증은 `fence_after_secs ≥ 1`(펜싱이 꺼져 있어도), watchdog면 `watchdog_timeout_secs`가 **5..=3600**이다(1초마다 쓰다듬으므로 너무 짧으면 한 번만 늦어도 재시작된다). `HaSection::node_ha()`·`renew_interval()`·`guard_config()`가 등록 값·갱신 간격·`HaGuard` 설정을 만든다. API 검사는 `vms::check_ha_capable`(생성·수정의 `spec.node`, 마이그레이션 대상 — 마이그레이션은 `node_fits`보다 먼저)이고, 스케줄러는 `node_fits`가 HA VM에 "node {name:?} does not support HA (fencing is off)"로 HA 가능 노드만 남긴다. **HA 가능 노드가 없을 때의 오류는 설계의 `no_capacity`가 아니라 기존 스케줄러 오류인 409 `no_node`다**(`no_capacity`는 마이그레이션 대상 검사의 코드다). 실행 중 VM의 `ha` 수정은 원래 막는 필드가 아니라 바꿀 것이 없었다. 스냅샷 되돌리기는 예약처럼 지금 VM의 `ha`를 지킨다(`write_reverted_spec`).
+
+구현(계획 24, 새 규칙): `vms::update_vm`이 `prepare`와 노드·디스크 검사 뒤 `spec.ha && !current.spec.ha && !is_stopped(&current)`면 409 `vm_running`("cannot turn on HA for VM \"web\" while it is running; turn on HA while the VM is stopped")이다. 멈춤 판정은 노드·디스크 변경과 같은 `is_stopped`다. oplctl `vm set --ha`는 서버 문구를 그대로 보이고(다시 시도하지 않음) 도움말에 "VM이 멈춰 있어야" 한다고 적었다. 웹 VM 편집은 실행 중이고 HA가 꺼진 VM이면 HA 스위치의 켜기를 막고 이유(`vmForm.haRunning`, "HA는 VM이 멈춰 있을 때 켤 수 있습니다.")를 보인다(`GeneralSection`의 `haLocked`). 시험에서 실행 중인 HA VM이 필요하면 만들 때 `ha: true`로 하거나 저장소에 직접 쓴다(`migrate.rs`).
 
 ### 3.2 리스
 
@@ -115,9 +117,17 @@
 
 T의 reconciler는 `spec.node == T`가 되면 평소처럼 새로 켠다(UEFI 변수는 계획 21대로 N에서 받아 보고, 안 되면 T의 파일이나 템플릿).
 
+구현(계획 24): `opl-api`의 `ha.rs`. `HaManager::spawn(state, HaManagerConfig { tick })`(기본 1초)·`shutdown()`이고, opld가 위트니스가 아닌 모든 노드에서 `ClusterJanitor`·`SnapshotScheduler`처럼 띄운다(`Services.recovery`, 정리 작업 뒤에 멈춘다. 이 노드의 펜싱 설정과 상관없다). 틱마다 리더가 아니면 기준점을 잊고, 리더면 `read_barrier` 뒤 `leases()`를 읽는다. 기준점 b는 `base_at`(순수 함수 — (임기, 처음 본 시각)을 쥐고 임기가 바뀌면 다시 잡는다)이고 노드의 리스 나이는 now − max(b, r)(리스가 없으면 b). 펜싱할 노드마다 `begin_fence` → 같은 임기인지와 `leases()`로 여전히 만료인지 다시 확인 → VM을 이름 순서로 `recover_vm`. 대상은 `node_fits`(유지보수·오프라인·위트니스·HA 가능·아키텍처·풀·브리지) + 리스가 살아 있음 + N과 `status.migration.node`가 아님이고, 스케줄러처럼 미할당 메모리가 가장 많은(같으면 id가 작은) 노드다. **같은 틱에 앞서 옮긴 VM의 메모리를 센다**(메모리의 `Inventory`를 고친다). 쓰기는 status(`UpdateStatusIf`, 읽은 revision) → spec(`UpdateSpec`, status 쓰기가 돌려준 revision) 순서이고, **Task 실패는 spec 쓰기가 성공한 뒤 Task 목록을 다시 읽어** 한다(그 사이 만든 N의 Task도 본다). Task 실패 쓰기가 다른 쪽과 엇갈리면 다시 읽어 끝나지 않았을 때만 3번까지 다시 하고, 그래도 안 되면 로그만 남긴다. 기록 Task는 이름이 id이고 상태가 처음부터 `Succeeded`다. 대상이 없으면 `last_error`가 이미 그 문구가 아닐 때만 status를 쓴다. revision 불일치(`Rejected`)는 그 VM만 넘기고 다음 틱에 다시 보며, 그 밖의 오류는 그 노드의 나머지를 다음 틱으로 미룬다. 로그는 `tracing::warn!`("recovering HA VMs from a failed node", VM 이름 목록).
+
+- **쓰기 경로:** 복구 쓰기는 `Cluster::execute_as_leader`로만 한다(다른 노드로 전달하지 않는다 — 펜싱 표시는 이 노드의 리스 표에만 있기 때문이다. 리더를 잃으면 `NotLeader`). 시험에서 바꿔 끼우도록 `RecoveryWriter` trait(`write(&Cluster, Command) -> Result<u64, ClusterError>`, 결과를 모르는 쓰기를 판정하는 임기 `term(&Cluster)` — 기본 `leases().term`, 시험이 임기 변경을 흉내 낸다)로 감싸고 `HaManager::spawn_with_writer`가 받는다.
+- **펜싱 표시 해제:** `Fence` guard가 Drop에서 `end_fence`한다(오류, 리더를 잃음, `?`로 빠져나감 포함). 예외는 **결과를 모르는 쓰기**다. `Ok`·`Rejected`·`NotLeader`가 아닌 결과(`Timeout` 등)는 리더 로그에 남아 나중에 커밋될 수 있으므로 펜싱을 풀지 않고 그 노드를 `Unknown { term, vm, command, moved_to }`로 기억한다. 다음 틱부터 임기가 바뀌었으면(이 노드가 여전히 리더든 아니든) 푼다 — 새 임기 리더의 커밋 인덱스는 살아남은 옛 항목을 포함하고 노드의 첫 갱신은 그 인덱스까지 적용한 뒤에 성공한다. spec 쓰기였으면 남은 단계 목록(`Moved`)으로 옮겨, 이 노드가 리더인 틱마다(장벽 뒤) VM을 다시 읽어 `spec.node`가 그 대상이면 남은 단계(Task 실패, 기록 Task)를 하고 지우며, 다른 값이거나 VM이 없으면(쓰기가 버려졌거나 다른 리더가 끝냈거나 사용자가 옮김) 그냥 지운다. `NotLeader`는 결과를 아는 것으로 친다 — 항목이 로그에 들어갔을 수 있지만 리더를 잃었다는 것은 임기가 바뀐다는 뜻이고, 다음 임기의 리더는 그 항목을 커밋하거나 버린 뒤에야 갱신을 확인해 주므로 N은 그 결과를 본 뒤에야 fresh가 된다. 같은 임기면 같은 revision 검사 쓰기를 다시 보내(멱등이다. `Ok`면 이번에 적용됐고 `Rejected`면 앞의 것이 커밋됐거나 다른 쓰기가 이겼다) 결과를 알 때까지 펜싱을 쥐고, 알면 spec 쓰기였을 때 VM이 그 노드로 가 있으면 남은 단계(Task 실패, 기록 Task)를 한 뒤 푼다. 그사이 그 노드는 새 복구 대상에서 빠진다. 루프가 종료로 쓰기 도중에 취소되면 Drop에서 풀지 않는다(리더 자리는 곧 없어지고 새 리더는 빈 표에서 다시 센다).
+- **설계와 다른 점:** 리스 표를 잊는 것은 `Cluster::leases()`가 한다(임기가 다른 표는 비운다). `HaManager`는 기준점만 잊는다.
+
 ### 4.2 펜싱 중 표시
 
 리더가 N을 펜싱하기로 정한 뒤 쓰기가 끝나기 전에 N의 갱신이 도착하면 N이 낡은 `spec.node`를 보고 VM을 켤 수 있다. 그래서 리스 표에 `fencing: set<NodeId>`를 두고, 그 사이 N의 갱신을 `Fenced`로 거부한다. 표시를 지운 뒤의 갱신은 복구 쓰기를 포함하는 인덱스를 돌려준다(§3.2). N은 그것을 적용한 뒤에야 fresh가 되므로 옮겨진 VM을 켜지 않는다. 다른 임기에서 쓴 복구도 새 리더의 적용 인덱스에 들어 있다.
+
+구현(계획 24): 위의 펜싱 표시를 `HaManager`가 쓴다(§4.1 구현 — 결과를 모르는 쓰기가 있으면 풀지 않는다).
 
 구현(계획 23): 펜싱 표시는 `Cluster::begin_fence(node)`·`end_fence(node)`로 리스 표의 펜싱 집합에 넣고 뺀다(API와 시험만, 쓰는 것은 계획 24의 `HaManager`). 펜싱 검사와 갱신 기록이 한 잠금 안이라 `begin_fence` 뒤에는 그 노드의 새 갱신이 기록되지 않는다. 집합은 **임기가 바뀌어도 지우지 않는다**(지우면 이전 임기에 시작한 복구 쓰기가 끝나기 전에 그 노드가 리스를 받을 수 있다). 그래서 `HaManager`는 모든 경로에서 `end_fence`해야 하고, `begin_fence` 뒤 `leases()`를 다시 읽어 아직 만료인지 확인해야 한다.
 
@@ -128,10 +138,16 @@ T의 reconciler는 `spec.node == T`가 되면 평소처럼 새로 켠다(UEFI �
 - **공유 LVM(sanlock 임대가 끝날 때까지):** 이미 일시 오류(`PoolUnavailable`)라 세지 않고 다시 시도한다.
 - **NFS(QEMU의 OFD 잠금, NFSv4 임대 90초):** QEMU 시작이 `Failed to get "write" lock`으로 실패하면 새 `DriverError::ImageLocked`로 구분한다(QEMU stderr). 워커는 이것을 실패로 세지 않고 `retry_interval`마다 다시 시도한다. status: "disk image is locked by another process; retrying". 이 규칙은 HA가 아닌 VM에도 적용된다. 전에는 곧바로 `Failed`였다. 사용자는 정지로 멈출 수 있다.
 
+구현(계획 24): `DriverError::ImageLocked(String)`(내용은 QEMU stderr, 표시 "disk image is locked by another process: …", `is_transient()`가 true). `qemu.rs`의 `image_locked(stderr)`가 시작 실패 stderr에 `"write" lock`(`Failed to get "write" lock`·`Failed to get shared "write" lock`) 또는 `Is another process using the image`가 있으면 그렇게 본다 — QEMU 8.2와 11의 file-posix 문구가 같다(실제 QEMU 두 개로 같은 qcow2를 여는 `qemu-it` 시험으로 확인). 워커는 스냅샷 복원으로 켜는 중이 아닐 때 `ImageLocked`를 `record_failure` 없이 `retry_interval`(기본 2초) 백오프로 두고 status `Starting`, "disk image is locked by another process; retrying"을 쓴다(복원 시작의 오류는 지금처럼 복원 실패로 끝낸다). 원하는 상태가 running인 동안 끝없이 다시 시도한다. 시험용으로 `MockHypervisor::fail_next_starts(errs)`(다음 시작들을 차례로 그 오류로 실패시킨다)를 더했다.
+
+구현(계획 24, 워커 보강 — 실제 시험에서 찾음): 낡은 로컬 저장소로 다시 시작한 N의 워커가 옮겨 간 VM의 status를 쓰려다 revision 불일치로 다시 읽으면, 전에는 배정을 보지 않고 다시 썼다. 이제 `write_status`의 재시도는 다시 읽은 VM의 `spec.node`가 이 노드가 아니면(지워진 경우처럼) 쓰지 않고 멈춘다.
+
 ### 4.4 그 밖의 경우
 
 - **N이 돌아온 경우:** reconciler는 배정되지 않은 VM을 지금처럼 건드리지 않는다. 펜싱됐다면 그 VM은 이미 꺼져 있다. N의 Task 실행기는 실패로 기록된 Task를 다시 실행하지 않는다.
 - **HA 아닌 VM:** 그대로 둔다. 지금처럼 N에 묶여 있다.
+
+구현(계획 24): 실제 시험에서 N(A)을 다시 띄우면 HA VM은 B에 배정된 채 같은 QEMU로 계속 돌고, A는 그 VM을 켜지 않으며, HA 아닌 VM은 A에 배정된 채다. 끝나지 않은 N의 Task 가운데 복구한 VM을 대상으로 하지 않는 것은 건드리지 않는다.
 - **마이그레이션 중:** N이 원본이면 확정 전에는 `spec.node == N`이고 위대로 복구한다. 받던 노드는 `status.migration`이 지워졌으므로 다음 정리에서 받은 QEMU를 끈다(계획 20 규칙). N이 대상이면 원본의 Task가 실패를 처리한다.
 
 ## 5. API·oplctl·웹
@@ -140,7 +156,7 @@ T의 reconciler는 `spec.node == T`가 되면 평소처럼 새로 켠다(UEFI �
   - `VmSpec.ha`: 생성·수정에 쓰고 OpenAPI에 보인다.
   - 오류 `ha_unsupported`(409).
   - `NodeSpec.witness`, `NodeStatus.ha`.
-  - Task 종류 `vm_ha_recover`.
+  - Task 종류 `vm_ha_recover`. (구현: 선 위 이름은 다른 Task 종류처럼 케밥 `vm-ha-recover`다.)
 - **oplctl**
   - `vm create --ha`, `vm set VM --ha|--no-ha`(기존 VM 수정 API).
   - `vm list`·`vm get`에 HA 표시.
@@ -153,6 +169,8 @@ T의 reconciler는 `spec.node == T`가 되면 평소처럼 새로 켠다(UEFI �
   - 문구는 한국어와 영어 둘 다 둔다.
 
 구현(계획 23): `GET /cluster`의 멤버에 `fencing`(`watchdog`·`process`, 꺼졌거나 Node가 아직 없으면 null)을 더했다. oplctl `vm set VM --ha|--no-ha`는 VM을 읽어 그 revision으로(`If-Match`) spec 전체를 다시 쓴다(예약 스냅샷 바꾸기와 같은 `put_spec_field`). `vm list`의 HA 열은 `true`/`false`, `vm get`은 JSON의 `spec.ha`다. 웹은 VM 폼의 HA 스위치(`haUnavailable` — 노드가 HA 가능하지 않으면 켜기만 막고 이미 켜진 HA는 끌 수 있다), VM 목록·상세의 HA 배지, 노드·클러스터·대시보드 노드 표의 "펜싱" 열, `errors.ha_unsupported`다. 마이그레이션 대화상자는 HA 불가 대상을 거르지 않는다(서버가 409). `vm_ha_recover`와 Task 문구는 계획 24다.
+
+구현(계획 24): `TaskOp::VmHaRecover { from: Uuid }`이고 JSON은 `{"kind": "vm-ha-recover", "from": …}`이다(설계의 `vm_ha_recover`가 아니다 — `TaskOp`는 `kebab-case`로 태그된다). OpenAPI와 `web/src/api/schema.d.ts`에 보인다. Task의 `node`는 옮긴 노드, `target`은 VM이다. oplctl `task list`의 OP 열은 `vm-ha-recover (from <죽은 노드 id>)`(`task_row`), 웹 Task 목록은 `describeTask(task, t, target, nodeName)`으로 `tasks.op.vm-ha-recover` "{{target}} HA 복구 (노드 {{from}}에서)"/"HA recovery of {{target}} (from node {{from}})"이고 노드 이름을 모르면 id를 보인다. HA 켜기 규칙의 API·oplctl·웹은 §3.1 구현이다.
 
 ## 6. 테스트
 
@@ -178,6 +196,8 @@ T의 reconciler는 `spec.node == T`가 되면 평소처럼 새로 켠다(UEFI �
 
 구현(계획 23): 리스 표 시험은 `opl-cluster/tests/lease.rs`(고립된 노드와 고립된 리더의 갱신 실패, 펜싱 중 거부, 임기가 바뀌면 표가 비는지 등), `HaGuard`는 `ha.rs` 단위 시험(`start_paused`: fence_after 직전·직후, 시작 기준점, 리스 없이 `arm` 실패와 장치를 열지 않는지, 쓰다듬기 규칙, magic close 조건, `accept_timeout`), 워커는 `opl-reconciler/tests/ha.rs`(가짜 guard·MockHypervisor), opld 설정·등록은 `config.rs`·`bootstrap.rs` 단위 시험, API는 `opl-api/tests/vms.rs`·`two_nodes.rs`·`migrate.rs`·`snapshot_tasks.rs`다. 실제 프로세스 시험(`ha-it`)은 계획 24다. 수동 watchdog 시험 절차는 README "HA VM과 자기 펜싱"에 있다. Linux opld(CI 하네스 포함)는 기본으로 watchdog 펜싱을 등록하지만 HA VM이 있을 때만 장치를 연다.
 
+구현(계획 24): `HaManager`는 `opl-api/tests/ha.rs`(단일 노드 하네스에 Node를 직접 기록 — 작은 `recover_after_secs`, 갱신하지 않는 노드, 빠른 틱)로 이름 순서·대상 고르기(메모리, 죽은 노드 제외)·status/spec 순서·N의 Task 실패와 기록 Task, 리스가 살아 있는 노드는 옮기지 않음, 대상이 없을 때 오류를 한 번만 씀, 리더가 된 뒤 recover_after 전에는 옮기지 않음, 실행기가 기록 Task를 실행하지 않음, spec 쓰기 바로 앞에 만든 N의 Task도 실패로, 결과를 모르는 쓰기(가짜 `RecoveryWriter`로 status·spec 쓰기를 `Timeout` — 실제로 적용되거나 안 되거나) 동안 N의 갱신이 `Fenced`이고 결과를 알면 풀림, 쓰기 도중 종료하면 펜싱을 쥠, 쓰기 도중 리더를 잃거나 쓰기가 거부되면 펜싱이 풀림을 본다(12개). `base_at`·임기에 따른 해제·`settled`는 `ha.rs` 단위 시험이다(단일 노드에서 임기를 바꾸기 어렵다). 이미지 잠금은 `opl-driver`의 가짜 qemu 단위 시험(stderr 분류)과 `qemu-it` 실제 잠금 시험, `opl-reconciler/tests/reconcile.rs`(`fail_next_starts`로 잠금 4번 — 실패로 세지 않고 결국 Running, 그동안 status가 `Starting`과 잠금 문구, 그리고 status 쓰기 재시도 중 다른 노드로 옮겨지면 쓰지 않음)다. 실제 시험은 `crates/opld/tests/ha.rs`의 `the_leader_restarts_an_ha_vm_of_a_dead_node_on_another_node`(기능 `ha-it`): A·B(`fencing = "process"`, `fence_after_secs = 2`)와 위트니스, 공유 디렉터리 풀 디스크의 HA VM `db`(`--ha --restart on-failure`)와 디스크 없는 HA 아닌 VM `plain`을 A에서 켜고, A의 opld를 `kill -9`한 뒤 status의 pid로 QEMU들도 죽인다. 180초 안에 `db`가 B에서 Running(새 QEMU)이고 `vm-ha-recover` Task가 하나(from A, 노드 B, succeeded), `plain`은 A에 배정된 채인지, A를 다시 띄운 뒤 10초 동안 `db`가 B에서 같은 pid로 돌고 A가 켜지 않는지 본다. 한 호스트의 두 노드라 `systemd_scope = false`(`migration.rs`). 이 Mac에서 약 30초에 돈다. CI `linux-kvm` 작업의 기능 목록에 `opld/ha-it`를 더했다.
+
 ## 7. 알려진 한계
 
 - 펜싱은 노드의 watchdog를 믿는다. `process`는 opld가 멈추면 지켜 주지 못한다. sanlock(공유 LVM)을 쓰는 노드는 `wdmd`가 기본 watchdog를 쥐므로 다른 watchdog 장치가 있어야 한다.
@@ -186,7 +206,11 @@ T의 reconciler는 `spec.node == T`가 되면 평소처럼 새로 켠다(UEFI �
 - 죽은 노드에만 있던 UEFI 변수는 잃는다. 다른 노드의 낡은 복사본이나 템플릿으로 켠다(계획 21과 같다).
 - RBD는 디스크 잠금이 없어 펜싱만 믿는다. NFSv3에서는 죽은 노드의 잠금이 그 노드가 돌아올 때까지 남을 수 있다. 그동안 VM은 "locked"로 기다린다.
 - HA 아닌 VM은 죽은 노드에 묶여 있다(지금과 같다).
-- 구현(계획 23): 리더의 복구가 아직 없으므로 펜싱된 HA VM은 그 노드에 남아 있다가 리스가 돌아오면 그 노드에서 다시 켜진다. `recover_after_secs`는 등록만 한다.
+- 구현(계획 23 — 계획 24에서 풀림): 리더의 복구가 아직 없으므로 펜싱된 HA VM은 그 노드에 남아 있다가 리스가 돌아오면 그 노드에서 다시 켜진다. `recover_after_secs`는 등록만 한다. 계획 24에서 리더가 복구한다. 리더가 옮기기 전(`recover_after` 안)에 리스가 돌아오면 여전히 그 노드에서 다시 켜진다.
+- 구현(계획 24): 이미지 잠금은 다른 프로세스가 쥔 동안 끝없이 기다린다(HA 아닌 VM도). 잠금을 쥔 프로세스가 사라지지 않으면 사용자가 정지해야 멈춘다.
+- 구현(계획 24): 결과를 모르는 복구 쓰기가 있으면 결과를 알거나 임기가 바뀔 때까지 그 노드의 리스 갱신을 계속 거부한다(그 노드의 HA VM은 그동안 켜지지 않는다).
+- 구현(계획 24): 복구 도중 리더가 다른 노드로 바뀌면 죽은 노드에 남은 그 VM의 Task 실패와 기록 Task가 빠질 수 있다(옛 리더가 다시 리더가 되면 한다). 끝나지 않은 Task는 그 노드가 돌아오거나 제거될 때 정리된다.
+- 구현(계획 24): 실행 중인 VM의 HA는 켤 수 없다(§3.1). 켜려면 정지했다가 다시 시작해야 한다.
 - 구현(계획 23): 라이브 마이그레이션이 보류 중인 HA VM은 보류가 풀릴 때까지 강제 종료하지 않는다(`process`에서 긴 마이그레이션이 `fence_after`를 넘길 수 있다. `watchdog`면 쓰다듬기가 멈춰 노드가 재시작된다). 실패한 마이그레이션이 원본을 그냥 `Paused`로 남기면 HA VM은 이어서 실행되지 않는다(드묾).
 - 구현(계획 23): 정상 종료 때 도는 HA VM이 있으면 watchdog를 그대로 두므로 opld를 `watchdog_timeout` 안에 다시 띄우지 않으면 노드가 재시작된다.
 - 위트니스는 한 클러스터에만 속하고, 위트니스 하나로는 클러스터를 만들 수 없다. 구현: 위트니스는 HTTPS API를 열지 않으므로 그 노드에서는 제어 소켓 명령(`cluster join`·`leave`)만 되고, 상태는 일반 노드의 API로 본다. 역할은 합류할 때 정해지므로 바꾸려면 탈퇴한 뒤 설정을 고치고 opld를 다시 띄워 다시 합류한다.

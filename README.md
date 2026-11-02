@@ -568,19 +568,22 @@ oplctl cluster status                            # WITNESS 열이 true, 경고 �
 HA VM은 노드가 클러스터 과반수와 끊기면 그 노드가 스스로 끈다(자기 펜싱, Proxmox HA의 watchdog 펜싱과 같은
 자리). 노드는 리더에게 몇 초마다 **리스**를 갱신하고, 마지막으로 성공한 갱신 뒤 `fence_after_secs`가 지나면 그
 노드의 HA VM을 강제로 끈다. opld 자신이 멈추거나 멈춰 서도 끄도록 Linux watchdog 장치를 쥐고 있다가, 리스를 잃은
-채 HA VM이 돌면 쓰다듬기를 멈춰 노드를 재시작시킨다. **죽은 노드의 HA VM을 다른 노드에서 다시 켜는 복구는 계획
-24에서 더한다.** 지금은 펜싱된 HA VM이 그 노드에 남아 있다가 리스가 돌아오면 그 노드에서 다시 켜진다.
+채 HA VM이 돌면 쓰다듬기를 멈춰 노드를 재시작시킨다. 리더는 노드가 스스로 펜싱을 마쳤을 시간(`recover_after_secs`)이
+지나도록 리스가 돌아오지 않으면 그 노드의 HA VM을 다른 노드로 옮겨 켠다(**복구**, 아래).
 
 ```bash
 oplctl vm create web --memory 1024 --disk root --ha --restart on-failure --start
-oplctl vm set web --no-ha            # 끄기(--ha로 다시 켠다). 실행 중이어도 바꿀 수 있다.
+oplctl vm set web --no-ha            # 끄기. 실행 중이어도 된다.
+oplctl vm set web --ha               # 켜기. VM이 멈춰 있을 때만 된다(실행 중이면 409 vm_running).
 oplctl vm list                       # HA 열(true/false)
 oplctl node list                     # FENCING 열: watchdog · process · -(꺼짐)
 oplctl cluster status                # 멤버마다 FENCING 열
+oplctl task list                     # 복구 기록: OP "vm-ha-recover (from <죽은 노드 id>)"
 ```
 
-웹은 VM 만들기·편집의 "고가용성(HA)" 스위치(그 노드의 펜싱이 꺼져 있으면 이유와 함께 막는다), VM 목록·상세의
-HA 배지, 노드·클러스터·대시보드 노드 표의 "펜싱" 열이다. API는 VM `spec.ha`(생성·`PUT /api/v1/vms/{key}`),
+웹은 VM 만들기·편집의 "고가용성(HA)" 스위치(그 노드의 펜싱이 꺼져 있거나, 실행 중이고 HA가 꺼진 VM이면 이유와
+함께 켜기를 막는다), VM 목록·상세의 HA 배지, 노드·클러스터·대시보드 노드 표의 "펜싱" 열, 작업 목록의
+"web HA 복구 (노드 node-a에서)"다. API는 VM `spec.ha`(생성·`PUT /api/v1/vms/{key}`),
 Node `status.ha`(`{"fencing": "watchdog"|"process", "recover_after_secs": …}`, 펜싱이 꺼져 있으면 없다),
 `GET /api/v1/cluster`의 멤버 `fencing`(꺼져 있으면 null)이다. 같은 노드에서의 크래시 재시작은 지금처럼
 `restart`가 정하므로 HA VM에는 `on-failure`를 권한다.
@@ -600,14 +603,20 @@ fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나
 - **HA 가능 노드.** 위트니스가 아니고 펜싱이 켜진 노드만 HA VM을 돌린다. HA VM의 노드(`--node`, 편집)나
   마이그레이션 대상이 펜싱이 꺼진 노드면 **409** `ha_unsupported`, 노드를 정하지 않은 HA VM은 스케줄러가 HA 가능
   노드만 고른다(없으면 **409** `no_node`). 노드는 등록할 때마다 `[ha]`를 `status.ha`에 쓴다. `recover_after_secs`는
-  `fence_after_secs + watchdog_timeout_secs(watchdog일 때) + 5`(기본 65초)로, 계획 24의 리더가 이만큼 기다린 뒤 옮긴다.
+  `fence_after_secs + watchdog_timeout_secs(watchdog일 때) + 5`(기본 65초)로, 리더가 이만큼 기다린 뒤 옮긴다.
+- **HA는 멈춘 VM에서만 켠다.** 만들 때 `--ha`는 그대로 되지만, 이미 있는 VM의 HA를 켜는 수정(`vm set --ha`, 웹
+  편집, `PUT`의 `ha` false → true)은 VM이 멈춰 있을 때만 된다(원하는 상태가 stopped이고 phase가 stopped·failed).
+  아니면 **409** `vm_running`("cannot turn on HA for VM "web" while it is running; turn on HA while the VM is
+  stopped"). 끄기는 언제든 된다. 노드가 과반수와 끊긴 동안 실행 중인 VM의 HA를 켜면 그 노드는 HA인 줄 모르고
+  끄지 않는데 리더는 그 VM을 다른 노드에서 켜 둘이 함께 돌 수 있기 때문이다. 실행 중인 VM은 정지하고 HA를 켠 뒤
+  다시 시작한다.
 - **리스.** 갱신 간격은 `fence_after_secs`의 10분의 1(0.2초 이상 2초 이하, 기본 2초)이다. 리더는 아직 과반수의
   리더인지 확인한 뒤에만 갱신을 받아 준다. 그래서 과반수와 끊긴 노드는 물론, 고립된 리더 자신도 갱신하지 못한다.
   리스는 opld가 시작한 때부터 센다(다시 시작한 직후 곧바로 끄지 않는다).
 - **리스를 잃으면.** `fence_after_secs`가 지나면 그 노드의 HA VM을 강제로 끈다(실패로 세지 않고 원하는 상태는
-  running 그대로, status "fenced: lost the cluster majority"). HA 아닌 VM은 그대로 돈다. 리스가 돌아오면 그 노드에서
-  다시 켠다. 리스 없이는 HA VM을 켜지도, 멈춘 채 받은 마이그레이션을 이어서 실행하지도 않는다("waiting for the
-  cluster majority before starting an HA VM", 실패로 세지 않고 다시 본다). 켜기 바로 앞에서 리스와 VM을 다시 보아,
+  running 그대로, status "fenced: lost the cluster majority"). HA 아닌 VM은 그대로 돈다. 리더가 옮기기 전에 리스가
+  돌아오면 그 노드에서 다시 켠다. 리스 없이는 HA VM을 켜지도, 멈춘 채 받은 마이그레이션을 이어서 실행하지도
+  않는다("waiting for the cluster majority before starting an HA VM", 실패로 세지 않고 다시 본다). 켜기 바로 앞에서 리스와 VM을 다시 보아,
   그 사이 다른 노드로 배정됐거나 멈추라고 했으면 켜지 않는다. 짧은 네트워크 장애라도 `fence_after_secs`
   보다 길면 HA VM이 꺼진다.
 - **watchdog.** 이 노드에서 HA VM을 켜거나 이미 도는 HA VM에 붙을 때 장치를 처음 열고(그 전에는 열지 않는다 —
@@ -635,6 +644,44 @@ fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나
   끄지 않는다(`process`에서는 긴 마이그레이션이 `fence_after_secs`를 넘길 수 있다. `watchdog`면 쓰다듬기를 멈추므로
   노드가 재시작된다). 실패한 마이그레이션이 원본을 멈춘(`paused`) 채로 남기면 HA VM은 이어서 실행되지 않는다(드묾 —
   끄고 다시 켠다).
+
+**복구.** 리더(위트니스가 아닌 노드)가 1초마다 노드의 리스를 보고 다음 노드의 HA VM을 옮긴다.
+
+- **언제.** 리스를 마지막으로 갱신한 뒤 그 노드의 `recover_after_secs`(기본 65초)가 지난 노드. 리스는 리더의
+  메모리에만 있으므로 리더가 바뀌면 새 리더는 리더가 된 때부터 다시 센다. 그래서 노드가 죽고 VM이 다른 노드에서
+  켜지기까지는 대략 `recover_after_secs` + 1초에 부팅 시간이다. 리더도 함께 죽었으면 선거 시간이 더해지고, 디스크
+  잠금이 남아 있으면(아래) 그만큼 더 걸린다. `fencing = "process"`, `fence_after_secs = 2`(recover_after 7초)인
+  자동 시험에서는 수십 초다. 펜싱이 꺼진 노드(`status.ha` 없음)의 VM은 옮기지 않는다.
+- **무엇을.** 그 노드에 배정되고(`spec.node`) HA이고 원하는 상태가 running인 VM을 이름 순서로 옮긴다. 게스트가
+  스스로 끄거나 사용자가 정지한 VM, HA 아닌 VM은 그 노드에 남는다. 옮기는 동안 리더는 그 노드의 리스 갱신을
+  거부한다(펜싱 중 표시) — 그 노드가 돌아와 낡은 배정을 보고 VM을 켜지 않게 하려는 것이다. 복구 기록의 결과를
+  모르면(시간 초과 — 나중에 커밋될 수 있다) 결과를 알 때까지 같은 기록을 다시 보내며 거부를 이어 가고, 리더가
+  바뀌면 푼다.
+- **어디로.** 스케줄러와 같은 규칙(온라인, 유지보수 아님, 위트니스 아님, 아키텍처·디스크 풀·브리지, 미할당 메모리가
+  가장 많은 노드)에 더해 HA 가능 노드이고 리스가 살아 있는 노드다. 죽은 노드와 진행 중이던 마이그레이션의 대상
+  노드는 뺀다. 여러 VM을 옮기면 앞서 옮긴 VM의 메모리도 센다. 그런 노드가 없으면 VM은 그대로 두고 status에
+  "HA cannot find a node for this VM"만 남긴 뒤 1초마다 다시 본다.
+- **어떻게.** status를 먼저 비우고(phase stopped, "recovering: node node-a failed") 그 다음 `spec.node`를 대상
+  노드로 바꾼다(둘 다 revision 검사, 그 사이 바뀌었으면 1초 뒤 다시). 대상 노드의 reconciler가 평소처럼 새로
+  켠다. 죽은 노드가 맡았던 그 VM의 끝나지 않은 작업은 "node node-a failed; the VM was recovered by HA"로 실패
+  처리하고(그래야 `vm_busy`가 풀린다), 기록 작업 `vm-ha-recover`(대상 VM, 노드 = 옮긴 노드, `from` = 죽은 노드)를
+  처음부터 성공 상태로 남긴다. 작업 실행기는 이것을 실행하지 않는다.
+- **이미지 잠금 기다리기.** 죽은 노드의 QEMU가 쥐었던 디스크 잠금은 곧바로 풀리지 않을 수 있다(NFSv4 임대 약 90초,
+  공유 LVM의 sanlock 임대). QEMU 시작이 이미지 잠금 오류(`Failed to get "write" lock` / `Is another process using
+  the image`)로 실패하면 실패로 세지 않고 2초마다 다시 켠다(phase starting, "disk image is locked by
+  another process; retrying"). **이 규칙은 HA 아닌 VM에도 적용된다** — 다른 프로세스가 이미지를 쥔 동안에는 실패
+  (`failed`)로 끝나지 않고 계속 다시 시도하므로, 멈추려면 VM을 정지한다. 공유 LVM은 전부터 다시 시도하는 오류였다.
+- **죽은 노드가 돌아오면.** 펜싱 중 표시가 풀린 뒤의 첫 리스 갱신이 복구 기록까지 적용된 뒤에야 HA VM을 켜므로,
+  옮겨 간 VM은 이미 다른 노드의 것으로 보고 켜지 않는다(낡은 기록으로 status를 덮지도 않는다). 그 노드의 실행기는
+  실패 처리된 작업을 다시 하지 않는다. 그 노드에 남은 HA 아닌 VM은 평소처럼 그 노드가 다시 맞춘다. 옮긴 VM은
+  원래 노드로 되돌아가지 않는다(필요하면 마이그레이션한다).
+- **한계.** 죽은 노드에만 있던 UEFI 변수는 잃는다 — 대상 노드는 변수를 그 노드에서 받으려다 실패하면 경고를 남기고
+  자기 노드의 옛 파일(없으면 템플릿)로 켠다. HA 아닌 VM은 노드가 돌아올 때까지 그 노드에 묶여 있다. Ceph RBD에는
+  디스크 잠금이 없어 펜싱만 믿는다(opLite는 RBD 배타 잠금·blocklist를 쓰지 않는다). NFSv3에서는 죽은 노드의 잠금이
+  그 노드가 돌아올 때까지 남을 수 있고, 그동안 VM은 "disk image is locked …; retrying"으로 기다린다. `process`
+  펜싱 노드는 opld만 멈추면(QEMU는 남음) HA VM을 끄지 못하므로 복구가 VM을 둘 돌게 할 수 있다(시험·개발용).
+  복구 도중 리더가 다른 노드로 바뀌면 죽은 노드에 남은 그 VM의 작업 실패 처리와 기록 작업 `vm-ha-recover`가 빠질 수
+  있다(VM은 옮겨진다). 끝나지 않은 작업은 그 노드가 돌아오거나 제거될 때 정리된다.
 
 **수동 watchdog 시험(Linux, root, 직접 할 때만 — 자동 시험·CI는 진짜 watchdog를 쓰지 않는다).** 버려도 되는 시험
 노드에서 한다. `soft_noboot=1`이면 softdog는 제한 시간이 지나도 재시작하지 않고 커널 로그에
@@ -765,6 +812,8 @@ sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM_SHAR
 # 실제 라이브 마이그레이션: 한 호스트의 opld 둘, 공유 디렉터리 풀(macOS는 TCG로 돈다). nfs-it·rbd-it·lvm-shared-it와
 # 그 환경 변수를 함께 주면(Linux, root) 그 풀로도 옮긴다.
 cargo test -p opld --features migration-it --test migration
+# 실제 HA 복구: 한 호스트의 opld 둘(process 펜싱)과 위트니스, 공유 디렉터리 풀(macOS는 TCG로 돈다).
+cargo test -p opld --features ha-it --test ha
 ```
 
 `nfs-it` 시험은 opld가 내보내기를 마운트하고, 그 풀에 볼륨을 만들고 qcow2 스냅샷을 찍고 지운 뒤, 풀을 지우면

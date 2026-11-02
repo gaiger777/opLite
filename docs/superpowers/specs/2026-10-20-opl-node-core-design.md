@@ -36,7 +36,7 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 
 구현: 하위 프로젝트 4는 계획 20(공유 풀 위의 라이브 마이그레이션, QEMU TLS 마이그레이션·노드 사이 RPC·`VmMigrate` Task)과 계획 21(UEFI 변수가 멈춘 채 옮긴 VM을 따라감, 디렉터리 풀의 `shared` 바꾸기)로 나눴다(`2026-10-30-live-migration-design.md`). 디스크까지 복사하는 마이그레이션과 macOS(HVF) 노드는 넣지 않았다.
 
-구현: 하위 프로젝트 5는 계획 22(위트니스 노드: VM을 돌리지 않는 Raft 투표 멤버, 완료), 계획 23(HA 리스와 watchdog 자기 펜싱: `VmSpec.ha`, 리더의 리스 표, 노드의 `HaGuard`, 리스를 잃으면 HA VM을 끔, 완료), 계획 24(HA VM 복구)로 나눴다(`2026-11-02-ha-fencing-witness-design.md`). 24는 아직이다.
+구현: 하위 프로젝트 5는 계획 22(위트니스 노드: VM을 돌리지 않는 Raft 투표 멤버, 완료), 계획 23(HA 리스와 watchdog 자기 펜싱: `VmSpec.ha`, 리더의 리스 표, 노드의 `HaGuard`, 리스를 잃으면 HA VM을 끔, 완료), 계획 24(리더의 HA VM 복구: `HaManager`가 리스가 끝난 노드의 HA VM을 다른 노드로 옮기고 기록 Task `vm-ha-recover`를 남김, 이미지 잠금 기다리기, HA는 멈춘 VM에서만 켬, 실제 시험 `ha-it`, 완료)로 나눴다(`2026-11-02-ha-fencing-witness-design.md`). 하위 프로젝트 5는 끝났다. 외부 펜싱 장치, 유지보수 때 모두 옮기기, HA 그룹·우선순위, HA 아닌 VM의 자동 복구는 넣지 않았다.
 
 ### 1.2 검토했지만 채택하지 않은 대안
 
