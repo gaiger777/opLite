@@ -486,7 +486,7 @@ async fn a_witness_cannot_hold_vms() {
     assert_eq!(vm["spec"]["node"], env.node.to_string());
 }
 
-/// HA VM은 HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. 실행 중에도 `ha`를 바꿀 수 있다.
+/// HA VM은 HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. HA는 멈춘 VM에서만 켤 수 있다(끄기는 언제든).
 #[tokio::test]
 async fn ha_vms_need_an_ha_capable_node() {
     // reconciler는 `process` 펜싱으로 HA VM을 켠다(리스는 늘 갱신된다).
@@ -560,14 +560,31 @@ async fn ha_vms_need_an_ha_capable_node() {
     let (_, vm) = admin.get("/vms/web").await;
     assert_eq!(vm["spec"]["node"], env.node.to_string());
 
-    // 실행 중인 VM의 `ha`는 바꿀 수 있다.
-    for ha in [false, true] {
-        let mut spec = vm["spec"].clone();
-        spec["ha"] = json!(ha);
-        let (code, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
-        assert_eq!(code, StatusCode::OK, "{body}");
-        assert_eq!(body["spec"]["ha"], ha);
-    }
+    // 실행 중인 VM의 HA는 끌 수 있지만 켤 수는 없다. 멈춘 뒤에는 켤 수 있다.
+    let mut spec = vm["spec"].clone();
+    spec["ha"] = json!(false);
+    let (code, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["ha"], false);
+    let mut spec = body["spec"].clone();
+    spec["ha"] = json!(true);
+    let (code, body) = admin
+        .put("/vms/web", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_running");
+    assert_eq!(
+        body["message"],
+        "cannot turn on HA for VM \"web\" while it is running; turn on HA while the VM is stopped"
+    );
+    let task = admin.act("web", "stop").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["ha"] = json!(true);
+    let (code, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["ha"], true);
     // 노드의 펜싱이 꺼진 뒤에는 HA로 바꿀 수 없다.
     status.ha = None;
     env.cluster

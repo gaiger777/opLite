@@ -540,7 +540,7 @@ struct VmCreate {
 #[command(group(ArgGroup::new("change").required(true).args(["ha", "no_ha"])))]
 struct VmSet {
     vm: String,
-    /// HA VM으로 만든다. VM의 노드가 펜싱이 켜진 노드여야 한다.
+    /// HA VM으로 만든다. VM이 멈춰 있어야 하고 VM의 노드가 펜싱이 켜진 노드여야 한다.
     #[arg(long)]
     ha: bool,
     /// HA를 끈다.
@@ -2200,6 +2200,11 @@ mod tests {
         // 다른 오류는 다시 하지 않는다.
         let mut r = SpecRetries::default();
         assert_eq!(r.next("VM web not found (not_found)"), None);
+        // 실행 중인 VM의 HA 켜기는 서버의 409 문구를 그대로 보인다.
+        assert_eq!(
+            r.next("cannot turn on HA for VM \"web\" while it is running; turn on HA while the VM is stopped (vm_running)"),
+            None
+        );
     }
 
     #[test]

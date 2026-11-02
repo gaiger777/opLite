@@ -198,8 +198,8 @@ pub async fn create_vm(
     Ok((StatusCode::CREATED, Json(vm)))
 }
 
-/// spec 전체를 바꾼다. 실행 중인 VM의 `node`와 `disks`는 바꿀 수 없다. 다른 변경은 다음 시작부터
-/// 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 검증한다.
+/// spec 전체를 바꾼다. 실행 중인 VM의 `node`와 `disks`는 바꿀 수 없고 `ha`를 켤 수 없다. 다른
+/// 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 검증한다.
 #[utoipa::path(put, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<VmSpec>,
@@ -234,6 +234,16 @@ pub async fn update_vm(
         }
         if spec.disks != current.spec.disks && !is_stopped(&current) {
             return Err(vm_running(&current, "change the disks of"));
+        }
+        // 노드가 과반수와 끊긴 동안 켜면 그 노드는 HA인 줄 모르고 펜싱하지 않는다. 끄기는 언제든.
+        if spec.ha && !current.spec.ha && !is_stopped(&current) {
+            return Err(ApiError::conflict(
+                "vm_running",
+                format!(
+                    "cannot turn on HA for VM {:?} while it is running; turn on HA while the VM is stopped",
+                    current.name
+                ),
+            ));
         }
         match state
             .cluster

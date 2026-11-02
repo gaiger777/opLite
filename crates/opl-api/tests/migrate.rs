@@ -179,12 +179,13 @@ async fn ha_vms_migrate_only_to_ha_capable_nodes() {
         recover_after_secs: 7,
     });
     edit_node(&env, env.node, |n| n.status.ha = ha).await;
-    // 실행 중인 VM도 HA로 바꿀 수 있다.
-    let (_, vm) = admin.get("/vms/web").await;
-    let mut spec = vm["spec"].clone();
-    spec["ha"] = json!(true);
-    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    // API는 실행 중인 VM의 HA를 켜지 않으므로 저장소에 바로 쓴다.
+    let mut vm = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
+    vm.spec.ha = true;
+    env.cluster
+        .update_spec(vm.id, None, vm.labels, &vm.spec)
+        .await
+        .unwrap();
 
     let (status, body) = migrate(&admin, "web", "node2").await;
     assert_eq!(

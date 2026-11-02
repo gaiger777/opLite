@@ -17,6 +17,7 @@ export function GeneralSection({
   nodes,
   creating,
   locked,
+  haLocked,
   autoMachine,
   onMachineChosen,
 }: {
@@ -27,13 +28,15 @@ export function GeneralSection({
   creating: boolean;
   /** 멈추지 않은 VM의 노드는 바꾸지 못한다. */
   locked: boolean;
+  /** 실행 중이고 HA가 꺼진 VM은 HA를 켜지 못한다(서버의 409). */
+  haLocked: boolean;
   /** 노드를 바꾸면 그 노드에 맞게 머신 기본값을 다시 정한다. */
   autoMachine: boolean;
   /** 사용자가 머신을 직접 골랐다. */
   onMachineChosen: () => void;
 }) {
   const { t } = useTranslation();
-  const noHa = haUnavailable(nodes, values.node);
+  const noHa = haLocked ? { key: "vmForm.haRunning" } : haUnavailable(nodes, values.node);
   return (
     <Card>
       <CardHeader>
@@ -153,7 +156,7 @@ export function GeneralSection({
         </Field>
         <div className="flex flex-col gap-1.5 sm:col-span-2">
           <div className="flex items-center gap-2">
-            {/* 켤 수 없는 노드여도 이미 켜진 HA는 끌 수 있다(실행 중이어도 바꿀 수 있다). */}
+            {/* 켤 수 없어도 이미 켜진 HA는 끌 수 있다(실행 중이어도). */}
             <Switch
               id="vm-ha"
               aria-describedby="vm-ha-hint"

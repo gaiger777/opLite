@@ -539,7 +539,7 @@ it("says when no node can run HA VMs but lets an HA VM turn HA off", async () =>
   renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });
   const user = userEvent.setup();
   const ha = await screen.findByRole("switch", { name: "High availability (HA)" });
-  // 실행 중이어도 HA는 바꿀 수 있고, 켜진 HA는 끌 수 있다.
+  // 실행 중이어도 켜진 HA는 끌 수 있다.
   expect(ha).toBeChecked();
   expect(ha).toBeEnabled();
   expect(
@@ -549,6 +549,23 @@ it("says when no node can run HA VMs but lets an HA VM turn HA off", async () =>
   expect(ha).toBeDisabled();
   await user.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(body?.spec.ha).toBe(false));
+});
+
+it("turns HA on only while the VM is stopped and says why not", async () => {
+  mockLists({ vm: [vm("app", "running")], node: [FENCED] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });
+  const ha = await screen.findByRole("switch", { name: "High availability (HA)" });
+  expect(ha).not.toBeChecked();
+  expect(ha).toBeDisabled();
+  expect(screen.getByText("Turn on HA while the VM is stopped.")).toBeInTheDocument();
+});
+
+it("turns HA on for a stopped VM", async () => {
+  mockLists({ vm: [vm("app", "stopped")], node: [FENCED] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });
+  const ha = await screen.findByRole("switch", { name: "High availability (HA)" });
+  expect(ha).toBeEnabled();
+  expect(screen.queryByText(/while the VM is stopped/)).not.toBeInTheDocument();
 });
 
 it("says when no node has fencing on", async () => {

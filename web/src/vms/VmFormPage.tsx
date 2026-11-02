@@ -181,6 +181,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           nodes={nodes.data}
           creating={creating}
           locked={locked}
+          haLocked={locked && !vm?.spec.ha}
           autoMachine={creating && !machineChosen}
           onMachineChosen={() => setMachineChosen(true)}
         />

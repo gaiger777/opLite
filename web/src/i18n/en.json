@@ -653,7 +653,8 @@
     "ha": "High availability (HA)",
     "haHint": "Runs only on nodes with fencing on. If its node loses the cluster majority, the node stops the VM.",
     "haNodeOff": "{{node}} has fencing off and cannot run HA VMs.",
-    "haNoNode": "No node has fencing on, so HA VMs cannot run."
+    "haNoNode": "No node has fencing on, so HA VMs cannot run.",
+    "haRunning": "Turn on HA while the VM is stopped."
   },
   "console": {
     "connecting": "Connecting…",

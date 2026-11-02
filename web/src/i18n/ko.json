@@ -653,7 +653,8 @@
     "ha": "고가용성(HA)",
     "haHint": "펜싱이 켜진 노드에서만 돕니다. 노드가 클러스터 과반과 끊기면 그 노드가 VM을 끕니다.",
     "haNodeOff": "{{node}}의 펜싱이 꺼져 있어 HA VM을 돌릴 수 없습니다.",
-    "haNoNode": "펜싱이 켜진 노드가 없어 HA VM을 돌릴 수 없습니다."
+    "haNoNode": "펜싱이 켜진 노드가 없어 HA VM을 돌릴 수 없습니다.",
+    "haRunning": "HA는 VM이 멈춰 있을 때 켤 수 있습니다."
   },
   "console": {
     "connecting": "연결 중…",
