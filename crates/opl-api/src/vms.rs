@@ -10,6 +10,7 @@ use opl_cluster::types::Rejection;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{Node, NodeSpec, ha_capable};
 use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::security_group::SecurityGroupSpec;
 use opl_types::storage::{VolumePhase, is_shared};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{MacAddr, PowerState, Vm, VmPhase, VmSpec, VmStatus};
@@ -82,6 +83,7 @@ pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(
             )));
         }
     }
+    check_security_groups(state, spec)?;
     let mut disks = BTreeSet::new();
     for disk in &spec.disks {
         if !disks.insert(&disk.volume) {
@@ -127,6 +129,33 @@ pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(
         spec.node = Some(
             schedule(id, spec, &inv).map_err(|e| ApiError::conflict("no_node", e.to_string()))?,
         );
+    }
+    Ok(())
+}
+
+/// NIC의 보안 그룹이 모두 있고, 그룹을 건 NIC가 `user` 네트워크가 아닌지. 아니면 400.
+pub(crate) fn check_security_groups(state: &AppState, spec: &VmSpec) -> Result<(), ApiError> {
+    if spec.nics.iter().all(|n| n.security_groups.is_empty()) {
+        return Ok(());
+    }
+    let (_, groups) = state.cluster.list::<SecurityGroupSpec>()?;
+    for (i, nic) in spec.nics.iter().enumerate() {
+        if nic.security_groups.is_empty() {
+            continue;
+        }
+        // user 네트워크는 QEMU 안의 NAT라 노드의 방화벽 규칙이 닿지 않는다.
+        if nic.network == USER_NETWORK {
+            return Err(ApiError::bad_request(format!(
+                "NIC {i}: security groups cannot be used on the {USER_NETWORK:?} network"
+            )));
+        }
+        for name in &nic.security_groups {
+            if !groups.iter().any(|g| &g.name == name) {
+                return Err(ApiError::bad_request(format!(
+                    "security group {name:?} not found"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -198,8 +227,9 @@ pub async fn create_vm(
     Ok((StatusCode::CREATED, Json(vm)))
 }
 
-/// spec 전체를 바꾼다. 실행 중인 VM의 `node`와 `disks`는 바꿀 수 없고 `ha`를 켤 수 없다. 다른
-/// 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 검증한다.
+/// spec 전체를 바꾼다. 실행 중인 VM의 `node`와 `disks`는 바꿀 수 없고 `ha`를 켤 수 없다. 보안 그룹을
+/// 건 NIC가 있으면 실행 중에는 NIC의 `security_groups`만 바꿀 수 있다. NIC의
+/// `security_groups`는 곧바로, 다른 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 검증한다.
 #[utoipa::path(put, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<VmSpec>,
@@ -234,6 +264,35 @@ pub async fn update_vm(
         }
         if spec.disks != current.spec.disks && !is_stopped(&current) {
             return Err(vm_running(&current, "change the disks of"));
+        }
+        // 방화벽 규칙은 spec의 NIC 순번·MAC으로 tap을 정한다. 실행 중에 NIC 구성이 바뀌면 도는 tap과
+        // 어긋나 막히지 않은 채가 되므로, 방화벽 NIC가 있으면(전이나 뒤) 그룹만 바꿀 수 있다.
+        let firewalled = |s: &VmSpec| s.nics.iter().any(|n| !n.security_groups.is_empty());
+        let without_groups = |s: &VmSpec| {
+            let mut nics = s.nics.clone();
+            nics.iter_mut().for_each(|n| n.security_groups.clear());
+            nics
+        };
+        if (firewalled(&spec) || firewalled(&current.spec))
+            && without_groups(&spec) != without_groups(&current.spec)
+            && !is_stopped(&current)
+        {
+            return Err(ApiError::conflict(
+                "vm_running",
+                format!(
+                    "cannot change the NICs of VM {:?} while it is running; only security groups can change",
+                    current.name
+                ),
+            ));
+        }
+        // 방화벽이 없어도 NIC 개수·순서·MAC은 그대로 둔다. 그룹 없이 바꾼 뒤 그룹을 걸면 위 검사를 비켜
+        // 규칙의 tap이 도는 tap과 어긋난다.
+        let macs = |s: &VmSpec| s.nics.iter().map(|n| n.mac).collect::<Vec<_>>();
+        if macs(&spec) != macs(&current.spec) && !is_stopped(&current) {
+            return Err(vm_running(
+                &current,
+                "change the number, order or MAC addresses of the NICs of",
+            ));
         }
         // 노드가 과반수와 끊긴 동안 켜면 그 노드는 HA인 줄 모르고 펜싱하지 않는다. 끄기는 언제든.
         if spec.ha && !current.spec.ha && !is_stopped(&current) {

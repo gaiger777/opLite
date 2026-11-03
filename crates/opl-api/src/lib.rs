@@ -15,6 +15,7 @@ pub mod limit;
 pub mod resources;
 mod schedule;
 pub mod scheduler;
+mod security_groups;
 mod snapshots;
 mod state;
 mod tasks;
@@ -88,6 +89,15 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::get_pool, r::patch_pool, r::delete_pool))
         .routes(routes!(r::list_networks, r::create_network))
         .routes(routes!(r::get_network, r::delete_network))
+        .routes(routes!(
+            r::list_security_groups,
+            security_groups::create_security_group
+        ))
+        .routes(routes!(
+            r::get_security_group,
+            security_groups::patch_security_group,
+            security_groups::delete_security_group
+        ))
         .routes(routes!(r::list_tasks))
         .routes(routes!(r::get_task))
         .routes(routes!(r::list_vms, vms::create_vm))

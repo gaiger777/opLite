@@ -309,6 +309,51 @@ async fn clone_needs_the_networks_of_the_source_spec() {
     );
 }
 
+/// 새 VM은 원본 스펙의 NIC 보안 그룹도 가지므로 그 그룹이 모두 있어야 한다(VM 만들기와 같은 검사).
+#[tokio::test]
+async fn clone_needs_the_security_groups_of_the_source_spec() {
+    let env = env().await;
+    let admin = env.admin().await;
+    admin
+        .post(
+            "/networks",
+            json!({ "name": "lan", "spec": { "bridge": "vmbr0" } }),
+        )
+        .await;
+    let (status, body) = admin
+        .post("/security-groups", json!({ "name": "web", "spec": {} }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut req = vm_request("web");
+    req["spec"]["nics"] = json!([
+        { "network": "lan", "model": "virtio", "security_groups": ["web"] }
+    ]);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, task) = clone(&admin, "web", json!({ "name": "web-2" })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    finish_tasks(&env).await;
+
+    // API는 쓰는 그룹을 지우지 않으므로 저장소에서 바로 지운다(스냅샷 스펙이 옛 그룹을 가진 때와 같다).
+    let web = env
+        .cluster
+        .get_by_name::<opl_types::security_group::SecurityGroupSpec>("web")
+        .unwrap()
+        .unwrap();
+    env.cluster
+        .delete::<opl_types::security_group::SecurityGroupSpec>(web.id, None)
+        .await
+        .unwrap();
+    let (status, body) = clone(&admin, "web", json!({ "name": "web-3" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("security group \"web\" not found")),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn running_vm_clones_only_from_a_snapshot() {
     let env = env().await;

@@ -25,7 +25,7 @@ use crate::error::{ApiError, Json};
 use crate::resources::{List, check_name, lookup};
 use crate::state::AppState;
 use crate::tasks::create_task;
-use crate::vms::{is_stopped, prepare};
+use crate::vms::{check_security_groups, is_stopped, prepare};
 use crate::volumes::{check_pool_on, usable_node};
 
 /// 설명의 최대 글자 수
@@ -654,6 +654,7 @@ pub async fn clone_vm(
             )));
         }
     }
+    check_security_groups(&state, &spec)?;
     let op = TaskOp::VmClone {
         name: req.name,
         snapshot,

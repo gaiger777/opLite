@@ -198,6 +198,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/security-groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_security_groups"];
+        put?: never;
+        /** 규칙은 적힌 순서대로 보고 처음 맞는 것을 따른다. */
+        post: operations["create_security_group"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/security-groups/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_security_group"];
+        put?: never;
+        post?: never;
+        /** VM의 NIC가 쓰고 있으면 409 `security_group_in_use` */
+        delete: operations["delete_security_group"];
+        options?: never;
+        head?: never;
+        /**
+         * 설명이나 규칙을 바꾼다. 쓰는 VM의 노드가 곧바로 적용한다. `If-Match`가 없으면 읽은 revision에
+         *     쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다.
+         */
+        patch: operations["patch_security_group"];
+        trace?: never;
+    };
     "/snapshots": {
         parameters: {
             query?: never;
@@ -384,8 +422,9 @@ export interface paths {
         };
         get: operations["get_vm"];
         /**
-         * spec 전체를 바꾼다. 실행 중인 VM의 `node`와 `disks`는 바꿀 수 없고 `ha`를 켤 수 없다. 다른
-         *     변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 검증한다.
+         * spec 전체를 바꾼다. 실행 중인 VM의 `node`와 `disks`는 바꿀 수 없고 `ha`를 켤 수 없다. 보안 그룹을
+         *     건 NIC가 있으면 실행 중에는 NIC의 `security_groups`만 바꿀 수 있다. NIC의
+         *     `security_groups`는 곧바로, 다른 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 검증한다.
          */
         put: operations["update_vm"];
         post?: never;
@@ -661,6 +700,8 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @enum {string} */
+        Action: "accept" | "drop";
         /**
          * @description CPU 아키텍처. 노드가 등록할 때 기록하고, 머신 타입마다 하나로 정해진다.
          * @enum {string}
@@ -722,6 +763,18 @@ export interface components {
                 vlan?: number | null;
                 /** @description opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
                 vxlan?: components["schemas"]["Vxlan"];
+            };
+        };
+        CreateRequest_SecurityGroupSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            spec: {
+                /** @description 200자 이하 */
+                description?: string;
+                /** @description 적힌 순서대로 보고 처음 맞는 규칙을 따른다(200개 이하). */
+                rules?: components["schemas"]["Rule"][];
             };
         };
         CreateRequest_StoragePoolSpec: {
@@ -806,6 +859,8 @@ export interface components {
             secret: string;
             token: components["schemas"]["TokenView"];
         };
+        /** @enum {string} */
+        Direction: "in" | "out";
         /** @enum {string} */
         DiskBus: "virtio-blk" | "sata";
         DiskSpec: {
@@ -977,6 +1032,31 @@ export interface components {
                      */
                     underlay?: string;
                 };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_SecurityGroupSpec_SecurityGroupStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    /** @description 200자 이하 */
+                    description?: string;
+                    /** @description 적힌 순서대로 보고 처음 맞는 규칙을 따른다(200개 이하). */
+                    rules?: components["schemas"]["Rule"][];
+                };
+                status: Record<string, never>;
             }[];
             /** Format: int64 */
             revision: number;
@@ -1467,6 +1547,8 @@ export interface components {
             /** Format: uuid */
             user: string;
         };
+        /** @enum {string} */
+        Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
         ResizeRequest: {
             /**
              * Format: int64
@@ -1569,6 +1651,27 @@ export interface components {
                  */
                 underlay?: string;
             };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_SecurityGroupSpec_SecurityGroupStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /** @description 200자 이하 */
+                description?: string;
+                /** @description 적힌 순서대로 보고 처음 맞는 규칙을 따른다(200개 이하). */
+                rules?: components["schemas"]["Rule"][];
+            };
+            status: Record<string, never>;
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_SnapshotSpec_SnapshotStatus: {
@@ -1800,6 +1903,22 @@ export interface components {
         RestartPolicy: "never" | "on-failure";
         /** @enum {string} */
         Role: "admin" | "operator" | "viewer";
+        Rule: {
+            action: components["schemas"]["Action"];
+            direction: components["schemas"]["Direction"];
+            /**
+             * @description 목적지 포트 `"22"` 또는 `"8000-8080"`. tcp·udp에서만.
+             * @example 8000-8080
+             */
+            ports?: string;
+            /** @description 없으면 모든 프로토콜 */
+            protocol?: components["schemas"]["Protocol"];
+            /**
+             * @description `in`이면 보낸 쪽, `out`이면 받는 쪽 주소(CIDR). 없으면 어디든.
+             * @example 10.0.0.0/8
+             */
+            remote?: string;
+        };
         /**
          * @description 예약 스냅샷이 실패한 이유. `code`는 거절한 API 오류의 code(`vm_busy` 등)이고, Task가 실패했으면
          *     `task_failed`다. 옛 상태의 문자열은 `{ code: "unknown", message: <문자열> }`로 읽는다.
@@ -1810,6 +1929,20 @@ export interface components {
         };
         /** @enum {string} */
         ScheduleEvery: "hourly" | "daily" | "weekly";
+        /** @description 보안 그룹에서 바꿀 값. 주어진 필드만 바꾼다. */
+        SecurityGroupPatch: {
+            /** @description 빈 글이면 설명을 지운다. */
+            description?: string;
+            /** @description 규칙 전체를 이것으로 바꾼다. */
+            rules?: components["schemas"]["Rule"][];
+        };
+        SecurityGroupSpec: {
+            /** @description 200자 이하 */
+            description?: string;
+            /** @description 적힌 순서대로 보고 처음 맞는 규칙을 따른다(200개 이하). */
+            rules?: components["schemas"]["Rule"][];
+        };
+        SecurityGroupStatus: Record<string, never>;
         /** @enum {string} */
         SnapshotPhase: "pending" | "ready";
         /** @description 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다. */
@@ -2557,6 +2690,161 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_security_groups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_SecurityGroupSpec_SecurityGroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_security_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRequest_SecurityGroupSpec"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_SecurityGroupSpec_SecurityGroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_security_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_SecurityGroupSpec_SecurityGroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_security_group: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_security_group: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SecurityGroupPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_SecurityGroupSpec_SecurityGroupStatus"];
+                };
             };
             "4XX": {
                 headers: {

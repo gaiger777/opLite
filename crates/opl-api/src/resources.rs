@@ -11,6 +11,7 @@ use opl_cluster::{Cluster, ClusterError, Typed};
 use opl_types::network::{Network, NetworkSpec, NetworkStatus, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec, NodeStatus};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
+use opl_types::security_group::{SecurityGroupSpec, SecurityGroupStatus};
 use opl_types::storage::{
     PoolBackend, StoragePool, StoragePoolSpec, StoragePoolStatus, VolumeSpec, VolumeStatus,
 };
@@ -173,6 +174,15 @@ list_and_get!(
     "/networks",
     "/networks/{key}",
     "networks"
+);
+list_and_get!(
+    list_security_groups,
+    get_security_group,
+    SecurityGroupSpec,
+    SecurityGroupStatus,
+    "/security-groups",
+    "/security-groups/{key}",
+    "security-groups"
 );
 list_and_get!(
     list_tasks,
