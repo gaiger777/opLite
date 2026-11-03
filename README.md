@@ -1187,3 +1187,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 24: HA 복구](docs/superpowers/plans/2026-11-02-plan24-ha-recovery.md)
 - [계획 25: VXLAN 네트워크](docs/superpowers/plans/2026-11-03-plan25-vxlan.md)
 - [계획 26: VM 방화벽](docs/superpowers/plans/2026-11-03-plan26-vm-firewall.md)
+- [계획 27: 백업과 복원](docs/superpowers/plans/2026-11-04-plan27-backup-restore.md)
