@@ -289,7 +289,7 @@ async fn vms_use_existing_groups_which_cannot_be_deleted_while_used() {
     );
 }
 
-/// `lan` 브리지 네트워크(노드에 그 브리지가 있다)와 규칙 없는 그룹 `web`을 만든다.
+/// `lan` 브리지 네트워크(노드에 그 브리지와 방화벽이 있다)와 규칙 없는 그룹 `web`을 만든다.
 async fn lan_and_web(env: &Env, admin: &Client) {
     admin
         .post(
@@ -306,6 +306,7 @@ async fn lan_and_web(env: &Env, admin: &Client) {
         name: "vmbr0".into(),
         vlan_filtering: false,
     }];
+    status.firewall = true;
     env.cluster
         .update_status::<NodeSpec>(env.node, &status)
         .await
@@ -467,6 +468,56 @@ async fn running_vms_with_groups_change_only_the_groups_of_their_nics() {
     let (status, body) = admin.put("/vms/vm2", json!({ "spec": spec }), None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "vm_running", "{body}");
+}
+
+/// 노드를 정한 VM에 그룹을 걸려면 그 노드에 방화벽(nftables)이 있어야 한다.
+#[tokio::test]
+async fn pinned_vms_with_groups_need_a_node_with_a_firewall() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    lan_and_web(&env, &admin).await;
+    let node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    let mut status = node.status.clone();
+    status.firewall = false;
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+
+    let mut req = vm_with_groups("vm1", json!(["web"]));
+    req["spec"]["node"] = json!(env.node);
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "firewall_unsupported");
+    assert_eq!(
+        body["message"],
+        format!(
+            "node {:?} has no firewall (nftables) for security groups",
+            node.name
+        )
+    );
+    // 그룹이 없으면 되고, 그 뒤 그룹을 걸 때 같은 검사를 한다.
+    let mut plain = vm_with_groups("vm1", json!([]));
+    plain["spec"]["node"] = json!(env.node);
+    let (status, vm) = admin.post("/vms", plain).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let mut spec = vm["spec"].clone();
+    spec["nics"][0]["security_groups"] = json!(["web"]);
+    let (status, body) = admin
+        .put("/vms/vm1", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "firewall_unsupported");
+
+    let node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    let mut status = node.status.clone();
+    status.firewall = true;
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let (status, body) = admin.put("/vms/vm1", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

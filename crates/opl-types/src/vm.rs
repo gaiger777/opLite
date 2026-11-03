@@ -102,6 +102,11 @@ impl VmSpec {
         }
         Ok(())
     }
+
+    /// 보안 그룹을 건(방화벽이 켜진) NIC가 있는지. 이런 VM은 방화벽이 있는 노드에서만 돈다.
+    pub fn has_firewall(&self) -> bool {
+        self.nics.iter().any(|n| !n.security_groups.is_empty())
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -582,6 +587,16 @@ mod tests {
         second.network = "wan".into();
         s.nics.push(second);
         assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn has_firewall_when_any_nic_has_groups() {
+        let mut s = sample();
+        assert!(!s.has_firewall());
+        let mut second = s.nics[0].clone();
+        second.security_groups = vec!["web".into()];
+        s.nics.push(second);
+        assert!(s.has_firewall());
     }
 
     #[test]

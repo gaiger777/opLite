@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use opl_cluster::Cluster;
 use opl_driver::{Hypervisor, StopMode, Storage};
 use opl_peer::{IncomingError, IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
+use opl_reconciler::FirewallGate;
 use opl_reconciler::resolve::incoming_spec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::vm::{MigrationStatus, Vm, VmPhase, VmSpec};
@@ -40,6 +41,8 @@ pub struct IncomingMigrations {
     cluster: Arc<Cluster>,
     hv: Arc<dyn Hypervisor>,
     config: IncomingConfig,
+    /// 이 노드의 방화벽(reconciler와 같다). 없으면 보안 그룹을 건 NIC가 있는 VM을 받지 않는다.
+    firewall: Option<Arc<dyn FirewallGate>>,
 }
 
 impl IncomingMigrations {
@@ -48,7 +51,14 @@ impl IncomingMigrations {
             cluster,
             hv,
             config,
+            firewall: None,
         }
+    }
+
+    /// 보안 그룹을 건 NIC가 있는 VM을 받기 직전에 이 노드의 방화벽 규칙을 넣는다.
+    pub fn with_firewall(mut self, firewall: Option<Arc<dyn FirewallGate>>) -> Self {
+        self.firewall = firewall;
+        self
     }
 
     fn read_vm(&self, id: Uuid) -> Result<Option<Vm>, IncomingError> {
@@ -121,8 +131,8 @@ pub(crate) async fn deactivate_disks(cluster: &Cluster, storage: &dyn Storage, v
 
 #[async_trait]
 impl MigrationReceiver for IncomingMigrations {
-    /// QEMU 버전을 견주고, VM이 이 Task로 이 노드에 오는 중인지 본 뒤 디스크를 공유로 켜고(원본이
-    /// 아직 쓴다) 받는 QEMU를 띄운다. 앞선 마이그레이션(다른 Task)의 받는 QEMU가 남아 있으면 먼저
+    /// QEMU 버전을 견주고, VM이 이 Task로 이 노드에 오는 중인지 본 뒤 (보안 그룹이 있으면 방화벽
+    /// 규칙을 넣고) 디스크를 공유로 켜고(원본이 아직 쓴다) 받는 QEMU를 띄운다. 앞선 마이그레이션(다른 Task)의 받는 QEMU가 남아 있으면 먼저
     /// 끈다. 실패하면 켠 디스크를 끈다(띄운 QEMU는 드라이버가 끈다).
     async fn incoming(&self, req: MigrateIncomingRequest) -> Result<u16, IncomingError> {
         let mine = self
@@ -145,6 +155,18 @@ impl MigrationReceiver for IncomingMigrations {
         {
             tracing::info!(vm = %req.vm, task = %req.task, "stopping the receiving QEMU of an earlier migration");
             self.hv.stop(req.vm, StopMode::Force).await.map_err(fail)?;
+        }
+        // 보안 그룹을 건 NIC가 있으면 받는 QEMU(tap)를 띄우기 전에 방화벽 규칙을 넣는다. 넣지 못하면
+        // 받지 않는다.
+        if vm.spec.has_firewall() {
+            let Some(gate) = &self.firewall else {
+                return Err(IncomingError::Failed(
+                    "firewall: this node has no firewall (nftables)".into(),
+                ));
+            };
+            gate.sync()
+                .await
+                .map_err(|e| IncomingError::Failed(format!("firewall: {e}")))?;
         }
         let c = &self.config;
         // 실패하면 incoming_spec이 켠 볼륨을 끈다.

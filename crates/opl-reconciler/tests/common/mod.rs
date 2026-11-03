@@ -49,6 +49,7 @@ pub fn config(node: Uuid) -> ReconcilerConfig {
         },
         firmware: None,
         ha: None,
+        firewall: None,
     }
 }
 

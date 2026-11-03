@@ -1004,6 +1004,11 @@ export interface components {
                      * @default 0
                      */
                     cpus: number;
+                    /**
+                     * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
+                     *     (위트니스는 늘 false).
+                     */
+                    firewall?: boolean;
                     /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
                     ha?: components["schemas"]["NodeHa"];
                     /**
@@ -1429,6 +1434,11 @@ export interface components {
              * @default 0
              */
             cpus: number;
+            /**
+             * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
+             *     (위트니스는 늘 false).
+             */
+            firewall?: boolean;
             /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
             ha?: components["schemas"]["NodeHa"];
             /**
@@ -1623,6 +1633,11 @@ export interface components {
                  * @default 0
                  */
                 cpus: number;
+                /**
+                 * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
+                 *     (위트니스는 늘 false).
+                 */
+                firewall?: boolean;
                 /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
                 ha?: components["schemas"]["NodeHa"];
                 /**

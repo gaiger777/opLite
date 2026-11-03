@@ -12,6 +12,8 @@ use opl_api::{IncomingConfig, IncomingMigrations};
 use opl_driver::mock::MOCK_QEMU_VERSION;
 use opl_driver::{DriverError, Hypervisor, MigrateOptions, MigrateTarget, RuntimeStatus, Storage};
 use opl_peer::{IncomingError, IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
+use opl_reconciler::FirewallGate;
+use opl_types::network::NetworkSpec;
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
@@ -517,4 +519,80 @@ async fn sweep_stops_a_stale_source_qemu_assigned_here() {
     s.sweep_often().await;
     s.wait_stopped(db.id).await;
     assert_eq!(s.deactivations(), 0);
+}
+
+/// 부를 때마다 `fail`이면 실패하는 방화벽
+struct Gate {
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl FirewallGate for Gate {
+    async fn sync(&self) -> Result<(), String> {
+        if self.fail {
+            Err("nft: boom".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// 보안 그룹을 건 NIC가 있는 VM은 방화벽 규칙을 넣은 뒤에만 받는다. 넣지 못하면(방화벽이 없는 노드
+/// 포함) 디스크도 켜지 않고 거절한다.
+#[tokio::test]
+async fn a_vm_with_security_groups_needs_the_firewall() {
+    let s = setup().await;
+    let lan = Resource::new(
+        "lan",
+        NetworkSpec {
+            bridge: Some("vmbr0".into()),
+            vlan: None,
+            vxlan: None,
+            mtu: None,
+        },
+    );
+    s.env.cluster.create(&lan).await.unwrap();
+    let mut vm = vm_named(&s.env, "web");
+    vm.spec.nics[0].network = "lan".into();
+    vm.spec.nics[0].security_groups = vec!["web".into()];
+    s.env
+        .cluster
+        .update_spec(vm.id, None, vm.labels.clone(), &vm.spec)
+        .await
+        .unwrap();
+    let task = Uuid::now_v7();
+    s.mark_migrating(s.env.node, task).await;
+    let receiver = |gate: Option<Gate>| {
+        IncomingMigrations::new(
+            s.env.cluster.clone(),
+            s.env.hv.clone() as Arc<dyn Hypervisor>,
+            IncomingConfig {
+                node: s.env.node,
+                mount_root: MOUNT_ROOT.into(),
+                storage: s.storage.clone() as Arc<dyn Storage>,
+                listen_host: "127.0.0.1".into(),
+                ports: 61000..=61009,
+            },
+        )
+        .with_firewall(gate.map(|g| Arc::new(g) as Arc<dyn FirewallGate>))
+    };
+
+    for (gate, why) in [
+        (None, "firewall: this node has no firewall (nftables)"),
+        (Some(Gate { fail: true }), "firewall: nft: boom"),
+    ] {
+        let err = receiver(gate).incoming(s.request(task)).await.unwrap_err();
+        assert!(
+            matches!(&err, IncomingError::Failed(e) if e == why),
+            "{err:?}"
+        );
+        assert!(!s.env.hv.is_incoming(s.vm));
+        assert_eq!(s.count("share"), 0);
+    }
+    let port = receiver(Some(Gate { fail: false }))
+        .incoming(s.request(task))
+        .await
+        .unwrap();
+    assert_eq!(port, 61000);
+    assert!(s.env.hv.is_incoming(s.vm));
 }

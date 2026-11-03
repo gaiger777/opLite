@@ -32,6 +32,8 @@ const HA_FENCED: &str = "fenced: lost the cluster majority";
 const HA_UNAVAILABLE: &str = "HA is not available on this node";
 /// 다른 프로세스가 디스크 이미지를 잠가 두어 다시 시도하는 동안의 status
 const IMAGE_LOCKED: &str = "disk image is locked by another process; retrying";
+/// 방화벽이 없는 노드(nftables 없음, macOS)에서 보안 그룹을 건 NIC가 있는 VM을 켜려 할 때의 오류
+const NO_FIREWALL: &str = "failed to start: firewall: this node has no firewall (nftables)";
 
 /// 작업자를 깨우는 이유.
 #[derive(Debug)]
@@ -482,10 +484,14 @@ impl Worker {
                         tracing::warn!(vm = %self.id, "resuming the source of a migration that was not committed");
                         self.hv.resume(self.id).await.map_err(unresponsive)
                     } else {
-                        match self.hv.resume_left_stopped(self.id).await {
-                            Ok(true) => Ok(()),
-                            Ok(false) => self.reattach(vm).await,
-                            Err(e) => Err(unresponsive(e)),
+                        // 멈춘 VM을 이어서 실행하거나 다시 붙기 전에 방화벽 규칙을 넣는다.
+                        match self.sync_firewall(vm).await {
+                            Err(e) => Err(e),
+                            Ok(()) => match self.hv.resume_left_stopped(self.id).await {
+                                Ok(true) => Ok(()),
+                                Ok(false) => self.reattach(vm).await,
+                                Err(e) => Err(unresponsive(e)),
+                            },
                         }
                     };
                     // 이 노드로 마이그레이션을 받아 멈춰 있는 QEMU다(확정되어 이 노드에 배정됐다).
@@ -735,6 +741,22 @@ impl Worker {
                 return Ok(Start::Changed(current));
             }
         }
+        // 보안 그룹을 건 NIC가 있으면 켜기 직전에 지금 클러스터 상태로 이 노드의 방화벽 규칙을 넣는다.
+        // 넣지 못하면 켜지 않는다(방화벽 없이 도는 순간이 없게).
+        if vm.spec.has_firewall() {
+            let Some(gate) = &self.config.firewall else {
+                self.deactivate_disks(vm).await;
+                self.restores.lock().unwrap().remove(&self.id);
+                self.power_off = Some(Some(NO_FIREWALL.into()));
+                return Ok(Start::NotStarted);
+            };
+            if let Err(e) = gate.sync().await {
+                tracing::warn!(vm = %self.id, error = %e, "cannot apply the firewall rules; not starting");
+                self.deactivate_disks(vm).await;
+                self.record_failure(format!("failed to start: firewall: {e}"));
+                return Ok(Start::NotStarted);
+            }
+        }
         // 실패해도 다시 쓰지 않는다.
         let restore = self.restores.lock().unwrap().remove(&self.id);
         let started = self.hv.start(&spec, restore.as_deref()).await;
@@ -933,6 +955,7 @@ impl Worker {
     }
 
     /// 살아 있는 VM에 다시 붙거나 이어서 실행한다(`start`는 멱등이다). 참조 해석 오류도 돌려준다.
+    /// 방화벽 규칙은 부르는 쪽이 먼저 넣는다([`Worker::sync_firewall`]).
     /// QEMU가 이미 디스크를 열었으므로 크기 늘리기 Task를 기다리지 않는다. HA VM은 디스크를 해석한 뒤
     /// 다시 본다([`Worker::ha_recheck`]).
     async fn reattach(&self, vm: &Vm) -> Result<(), ContinueError> {
@@ -951,6 +974,23 @@ impl Worker {
             .start(&spec, None)
             .await
             .map_err(|e| unresponsive(&e))
+    }
+
+    /// 보안 그룹을 건 NIC가 있으면 멈춘 채 남은 VM을 이어서 실행하거나 다시 붙기 전에 방화벽 규칙을
+    /// 넣는다. 넣지 못하면 이어서 실행하지 않고 다음 차례에 다시 본다.
+    async fn sync_firewall(&self, vm: &Vm) -> Result<(), ContinueError> {
+        if !vm.spec.has_firewall() {
+            return Ok(());
+        }
+        let unresponsive = |e: &dyn std::fmt::Display| ContinueError::Unresponsive(e.to_string());
+        let Some(gate) = &self.config.firewall else {
+            return Err(unresponsive(
+                &"firewall: this node has no firewall (nftables)",
+            ));
+        };
+        gate.sync()
+            .await
+            .map_err(|e| unresponsive(&format!("firewall: {e}")))
     }
 
     /// `vm`을 읽은 뒤 계산한 status를 기록한다. `snapshot`(현재 스냅샷 위치)과 `schedule_error`는

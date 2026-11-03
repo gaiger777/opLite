@@ -5,6 +5,7 @@
 
 mod backoff;
 mod config;
+mod firewall;
 mod firmware;
 pub mod ha;
 mod reconciler;
@@ -12,6 +13,7 @@ pub mod resolve;
 mod worker;
 
 pub use config::{ReconcilerConfig, RestartBackoff};
+pub use firewall::FirewallGate;
 pub use firmware::{FirmwareError, FirmwareFetcher};
 pub use ha::{HaConfig, HaGuard};
 pub use reconciler::{Reconciler, ReconcilerHandle};

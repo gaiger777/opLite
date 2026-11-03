@@ -64,6 +64,7 @@ pub fn reconciler_config(node: Uuid) -> ReconcilerConfig {
         },
         firmware: None,
         ha: None,
+        firewall: None,
     }
 }
 
@@ -134,6 +135,7 @@ impl Env {
             pools: Default::default(),
             ha: None,
             underlay: None,
+            firewall: false,
         };
         cluster.create(&me).await.unwrap();
         let admin = Resource::new(

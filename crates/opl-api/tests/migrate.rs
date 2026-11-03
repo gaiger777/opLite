@@ -34,6 +34,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
         pools: Default::default(),
         ha: None,
         underlay: None,
+        firewall: false,
     };
     env.cluster.create(&node).await.unwrap();
     node.id

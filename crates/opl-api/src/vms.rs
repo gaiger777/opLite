@@ -124,6 +124,7 @@ pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(
         check_not_witness(node)?;
         check_ha_capable(node, spec)?;
         check_node_arch(node, spec)?;
+        check_firewall(node, spec)?;
     }
     if spec.power == PowerState::Running && spec.node.is_none() {
         spec.node = Some(
@@ -178,6 +179,20 @@ fn check_ha_capable(node: &Node, spec: &VmSpec) -> Result<(), ApiError> {
             "ha_unsupported",
             format!(
                 "node {:?} does not support HA (fencing is off) and cannot run HA VMs",
+                node.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 보안 그룹을 건 NIC가 있는데 노드에 방화벽(nftables)이 없으면 409 `firewall_unsupported`.
+fn check_firewall(node: &Node, spec: &VmSpec) -> Result<(), ApiError> {
+    if spec.has_firewall() && !node.status.firewall {
+        return Err(ApiError::conflict(
+            "firewall_unsupported",
+            format!(
+                "node {:?} has no firewall (nftables) for security groups",
                 node.name
             ),
         ));

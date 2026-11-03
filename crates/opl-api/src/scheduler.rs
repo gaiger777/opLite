@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
-    "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks and, for an HA VM, has HA fencing)"
+    "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, has a firewall (nftables) for VMs with security groups and, for an HA VM, has HA fencing)"
 )]
 pub struct NoNode;
 
@@ -82,7 +82,7 @@ impl Inventory {
 }
 
 /// 위트니스가 아니고 온라인이고 유지보수 중이 아니며 머신 타입의 아키텍처이고 디스크의 풀을 쓸 수 있고 네트워크의 브리지가 있는 노드
-/// (HA VM이면 HA 가능 노드) 가운데 미할당 메모리가 가장 많은 노드를 고른다. 같으면 id가 작은 노드다. 메모리가 모자라도 고른다(오버커밋 정책은
+/// (HA VM이면 HA 가능 노드, 보안 그룹을 건 NIC가 있으면 방화벽이 있는 노드) 가운데 미할당 메모리가 가장 많은 노드를 고른다. 같으면 id가 작은 노드다. 메모리가 모자라도 고른다(오버커밋 정책은
 /// 범위 밖). arch를 모르는 노드(옛 버전)는 고르지 않는다.
 pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode> {
     inv.nodes
@@ -128,6 +128,11 @@ pub fn node_fits(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), Stri
             "node {name:?} does not have the bridges of the VM's networks"
         ));
     }
+    if spec.has_firewall() && !node.status.firewall {
+        return Err(format!(
+            "node {name:?} does not have a firewall (nftables) for the VM's security groups"
+        ));
+    }
     Ok(())
 }
 
@@ -161,6 +166,7 @@ mod tests {
             pools: Default::default(),
             ha: None,
             underlay: None,
+            firewall: false,
         };
         n
     }
@@ -326,6 +332,52 @@ mod tests {
         assert_eq!(
             node_fits(&me, &inv, &off),
             Err("node \"n\" does not support HA (fencing is off)".into())
+        );
+        inv.nodes.pop();
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+    }
+
+    #[test]
+    fn vms_with_security_groups_go_only_to_nodes_with_a_firewall() {
+        // 메모리가 가장 많은 노드도 방화벽이 없으면 보안 그룹 NIC가 있는 VM을 받지 않는다.
+        let bare = node(64000);
+        let mut guarded = node(1024);
+        guarded.status.firewall = true;
+        let mut inv = Inventory {
+            nodes: vec![bare.clone(), guarded.clone()],
+            networks: vec![Resource::new(
+                "lan",
+                NetworkSpec {
+                    bridge: Some("vmbr0".into()),
+                    vlan: None,
+                    vxlan: None,
+                    mtu: None,
+                },
+            )],
+            ..Default::default()
+        };
+        for n in &mut inv.nodes {
+            n.status.bridges = vec![BridgeInfo {
+                name: "vmbr0".into(),
+                vlan_filtering: false,
+            }];
+        }
+        let mut me = spec(512, None, PowerState::Running);
+        me.nics = vec![NicSpec {
+            network: "lan".into(),
+            model: NicModel::Virtio,
+            mac: None,
+            security_groups: Vec::new(),
+        }];
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(bare.id));
+        me.nics[0].security_groups = vec!["web".into()];
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(guarded.id));
+        assert_eq!(
+            node_fits(&me, &inv, &inv.nodes[0]),
+            Err(
+                "node \"n\" does not have a firewall (nftables) for the VM's security groups"
+                    .into()
+            )
         );
         inv.nodes.pop();
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));

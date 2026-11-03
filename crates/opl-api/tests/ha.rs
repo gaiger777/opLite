@@ -82,6 +82,7 @@ async fn node_with(
             recover_after_secs: secs,
         }),
         underlay: None,
+        firewall: false,
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();

@@ -1,6 +1,6 @@
 //! 클러스터 멤버로 도는 노드: 노드 간 서버, 클러스터 저장소, reconciler, Task 실행기, HTTPS API,
-//! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태, VXLAN 장치. 위트니스는 노드 간
-//! 서버와 클러스터 저장소, 승격, Node 등록만 띄운다.
+//! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태, VXLAN 장치, VM 방화벽. 위트니스는
+//! 노드 간 서버와 클러스터 저장소, 승격, Node 등록만 띄운다.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -25,7 +25,7 @@ use opl_driver::{
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{TlsListener, api_server_config};
 use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers};
-use opl_reconciler::{FirmwareFetcher, HaGuard, Reconciler, ReconcilerConfig};
+use opl_reconciler::{FirewallGate, FirmwareFetcher, HaGuard, Reconciler, ReconcilerConfig};
 use opl_types::node::NodeSpec;
 use opl_types::vm::VmSpec;
 use tokio::net::TcpListener;
@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use crate::bootstrap;
 use crate::config::Config;
+use crate::firewall::{FirewallAgent, FirewallRules};
 use crate::host::Host;
 use crate::overlay::{OverlayAgent, cluster_tag};
 use crate::pools::PoolMounter;
@@ -119,12 +120,14 @@ struct Services {
     pools: PoolMounter,
     /// VXLAN 네트워크의 장치를 맞춘다(호스트 네트워크가 없으면 없다).
     overlay: Option<OverlayAgent>,
+    /// VM 방화벽 규칙을 맞춘다(방화벽이 없으면 없다).
+    firewall: Option<FirewallAgent>,
     /// HA 리스와 watchdog(`[ha] fencing = "off"`면 없다)
     ha: Option<Arc<HaGuard>>,
 }
 
 impl Services {
-    /// `left`면 클러스터에서 빠진 것이다(VXLAN 장치를 지운다).
+    /// `left`면 클러스터에서 빠진 것이다(VXLAN 장치와 방화벽 테이블을 지운다).
     async fn shutdown(mut self, left: bool) {
         let _ = self.api.stop.send(());
         if tokio::time::timeout(DRAIN_TIMEOUT, &mut self.api.task)
@@ -143,6 +146,10 @@ impl Services {
         }
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
+        // 작업자가 모두 멈춘 뒤에 멈춰야 테이블을 지운 뒤 시작 직전 확인이 다시 넣지 않는다.
+        if let Some(firewall) = self.firewall {
+            firewall.shutdown(left).await;
+        }
         // 작업자가 모두 멈춘 뒤에 닫아야 도는 HA VM 목록이 맞다.
         if let Some(ha) = &self.ha {
             ha.close();
@@ -216,13 +223,18 @@ impl Member {
             let host = Host::from_config(config, &tag)?;
             Ok((host, tag))
         });
-        let (host, tag) = match host {
+        let (mut host, tag) = match host {
             Ok(host) => host,
             Err(e) => {
                 let _ = cluster.shutdown().await;
                 return Err(e);
             }
         };
+        // 등록 때 방화벽 여부를 기록하므로 등록 전에 찾는다.
+        host.detect_firewall(&tag).await;
+        // 워커와 마이그레이션 받기가 VM을 켜기 직전에 규칙을 넣는다. 에이전트는 아래에서 띄운다.
+        let firewall = FirewallRules::new(cluster.clone(), config, &host, tag.clone());
+        let gate = firewall.clone().map(|f| f as Arc<dyn FirewallGate>);
         let hv: Arc<dyn Hypervisor> = match QemuHypervisor::new(host.qemu_config(config)).await {
             Ok(hv) => Arc::new(hv),
             Err(e) => {
@@ -276,7 +288,7 @@ impl Member {
         );
         // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
-            .with_migrations(Arc::new(incoming))
+            .with_migrations(Arc::new(incoming.with_firewall(gate.clone())))
             .with_uefi_vars(config.data_dir.clone());
         let peer = serve_peer(peer_listener, &tls, service, exited_tx.clone());
 
@@ -344,6 +356,7 @@ impl Member {
         let uefi_vars_template = host.profile.uefi_vars_template.clone();
         // 장치를 만들거나 지우면 곧바로 브리지 목록을 기록한다(아래 주기 갱신을 기다리지 않는다).
         let overlay = OverlayAgent::spawn(cluster.clone(), config, &host, tag);
+        let firewall = firewall.map(FirewallAgent::spawn);
         let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
             tokio::spawn(async move {
@@ -377,6 +390,7 @@ impl Member {
             .guard_config()
             .map(|ha| HaGuard::spawn(cluster.clone(), ha));
         reconciler_config.ha = ha.clone();
+        reconciler_config.firewall = gate;
         let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
         let pools = PoolMounter::spawn(
             cluster.clone(),
@@ -447,6 +461,7 @@ impl Member {
                 recovery,
                 pools,
                 overlay,
+                firewall,
                 ha,
             }),
             register,

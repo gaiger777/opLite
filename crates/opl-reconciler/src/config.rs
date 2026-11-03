@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use opl_driver::Storage;
 
+use crate::firewall::FirewallGate;
 use crate::firmware::FirmwareFetcher;
 use crate::ha::HaGuard;
 use uuid::Uuid;
@@ -29,6 +30,8 @@ pub struct ReconcilerConfig {
     pub firmware: Option<Arc<dyn FirmwareFetcher>>,
     /// 이 노드의 HA 리스와 watchdog. None이면 펜싱이 꺼져 있어 HA VM을 켜지 않는다.
     pub ha: Option<Arc<HaGuard>>,
+    /// 이 노드의 방화벽. None이면 방화벽이 없어 보안 그룹을 건 NIC가 있는 VM을 켜지 않는다.
+    pub firewall: Option<Arc<dyn FirewallGate>>,
 }
 
 /// 크래시나 일시적 기동 실패 뒤 다시 시작하는 규칙.
@@ -58,6 +61,7 @@ impl ReconcilerConfig {
             },
             firmware: None,
             ha: None,
+            firewall: None,
         }
     }
 }

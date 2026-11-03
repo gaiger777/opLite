@@ -14,6 +14,7 @@
 mod bootstrap;
 mod config;
 mod control;
+mod firewall;
 mod host;
 mod join;
 mod member;

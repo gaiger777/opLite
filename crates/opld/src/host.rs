@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use opl_driver::{HostNet, IpRoute, QemuConfig};
+use opl_driver::{Firewall, HostNet, IpRoute, Nft, QemuConfig};
 use opl_qemu::{Accel, HostProfile};
 use opl_types::node::BridgeInfo;
 
@@ -14,6 +14,8 @@ pub struct Host {
     pub profile: HostProfile,
     /// 브리지 NIC의 tap을 다룬다. Linux에서만 있다.
     pub net: Option<Arc<dyn HostNet>>,
+    /// VM 방화벽(nftables)을 넣는다. Linux에서 규칙을 넣을 수 있을 때만 있다([`Host::detect_firewall`]).
+    pub firewall: Option<Arc<dyn Firewall>>,
     pub systemd_scope: bool,
 }
 
@@ -36,8 +38,18 @@ impl Host {
         Ok(Self {
             profile,
             net,
+            firewall: None,
             systemd_scope: config.hypervisor.systemd_scope,
         })
+    }
+
+    /// Linux에서 클러스터 태그 `tag`의 테이블에 실제로 규칙을 넣을 수 있으면 VM 방화벽을 켠다. 안
+    /// 되면(nftables가 없음, root가 아님) 보안 그룹을 건 VM이 이 노드에서 돌지 않는다고 알린다.
+    pub async fn detect_firewall(&mut self, tag: &str) {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        self.firewall = probe_firewall(Arc::new(Nft::default()), tag).await;
     }
 
     pub fn qemu_config(&self, config: &Config) -> QemuConfig {
@@ -66,6 +78,24 @@ impl Host {
                 tracing::warn!(error = %e, "cannot list bridges; keeping the recorded ones");
                 None
             }
+        }
+    }
+}
+
+/// `firewall`로 테이블 `bridge opl_<tag>`를 (없으면) 만드는 글을 넣어 본다. 되면 `firewall`을 돌려준다.
+/// 있는 테이블과 규칙은 그대로 둔다(opld를 다시 시작해도 도는 VM을 계속 지킨다).
+async fn probe_firewall(firewall: Arc<dyn Firewall>, tag: &str) -> Option<Arc<dyn Firewall>> {
+    match firewall
+        .apply(&format!("table bridge opl_{tag} {{}}\n"))
+        .await
+    {
+        Ok(()) => Some(firewall),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cannot apply nftables rules; VMs with security groups cannot run on this node"
+            );
+            None
         }
     }
 }
@@ -99,6 +129,47 @@ fn bytes() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use opl_driver::{DriverError, Firewall};
+
+    /// 받은 글을 기록하고 `ok`가 아니면 실패한다.
+    #[derive(Debug)]
+    struct FakeFirewall {
+        ok: bool,
+        applied: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Firewall for FakeFirewall {
+        async fn apply(&self, ruleset: &str) -> Result<(), DriverError> {
+            self.applied.lock().unwrap().push(ruleset.to_string());
+            if self.ok {
+                Ok(())
+            } else {
+                Err(DriverError::ToolFailed {
+                    tool: "nft",
+                    stderr: "Operation not permitted".into(),
+                })
+            }
+        }
+    }
+
+    /// 방화벽은 이 클러스터의 테이블을 (지우지 않고) 만들어 보아 될 때만 켠다.
+    #[tokio::test]
+    async fn the_firewall_is_on_only_when_a_probe_applies() {
+        for ok in [true, false] {
+            let fake = Arc::new(FakeFirewall {
+                ok,
+                applied: Mutex::default(),
+            });
+            let got = super::probe_firewall(fake.clone(), "abc").await;
+            assert_eq!(got.is_some(), ok);
+            assert_eq!(*fake.applied.lock().unwrap(), ["table bridge opl_abc {}\n"]);
+        }
+    }
+
     #[test]
     fn reads_host_memory() {
         assert!(super::memory_mib() > 0);

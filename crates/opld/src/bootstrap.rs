@@ -123,7 +123,7 @@ async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
 }
 
 /// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지, 아키텍처, HA 펜싱,
-/// underlay를 기록한다.
+/// underlay, 방화벽 여부를 기록한다.
 pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> anyhow::Result<()> {
     let underlay = config.underlay().await;
     record_node(cluster, config, host, underlay).await
@@ -156,6 +156,7 @@ async fn record_node(
             // 이름을 풀지 못하면(설정·IP 리터럴이 아님) 기록된 값을 지킨다(잠깐 DNS가 안 된다고
             // VXLAN 네트워크를 잃지 않게).
             underlay: underlay.or(status.underlay),
+            firewall: host.firewall.is_some(),
         };
         true
     })
@@ -243,7 +244,7 @@ pub(crate) mod tests {
     use openraft::{BasicNode, ServerState};
     use opl_cluster::ClusterConfig;
     use opl_cluster::memnet::MemRouter;
-    use opl_driver::{DriverError, HostNet, Overlay, OverlayChanges, Tap};
+    use opl_driver::{DriverError, Firewall, HostNet, Overlay, OverlayChanges, Tap};
     use opl_types::node::{BridgeInfo, Fencing, NodeHa, PoolState};
 
     use crate::config::FencingSetting;
@@ -272,6 +273,16 @@ pub(crate) mod tests {
             _: &[Overlay],
         ) -> Result<OverlayChanges, DriverError> {
             unimplemented!()
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeFirewall;
+
+    #[async_trait]
+    impl Firewall for FakeFirewall {
+        async fn apply(&self, _: &str) -> Result<(), DriverError> {
+            Ok(())
         }
     }
 
@@ -383,6 +394,33 @@ pub(crate) mod tests {
         assert_eq!(underlay(), Some("fd00::5".parse().unwrap()));
         record_node(&cluster, &config, &host, None).await.unwrap();
         assert_eq!(underlay(), Some("fd00::5".parse().unwrap()));
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 방화벽(nftables)이 있는지 기록하고, 다시 등록하면 그때의 값으로 바꾼다.
+    #[tokio::test]
+    async fn registration_records_the_firewall() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        let firewall = || {
+            cluster
+                .get::<NodeSpec>(id.0)
+                .unwrap()
+                .unwrap()
+                .status
+                .firewall
+        };
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert!(!firewall());
+        host.firewall = Some(Arc::new(FakeFirewall));
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert!(firewall());
+        host.firewall = None;
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert!(!firewall());
         cluster.shutdown().await.unwrap();
     }
 

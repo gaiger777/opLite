@@ -58,6 +58,15 @@ pub struct NodeStatus {
         schema(value_type = String, format = "ip", nullable = false, default)
     )]
     pub underlay: Option<IpAddr>,
+    /// 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
+    /// (위트니스는 늘 false).
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub firewall: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// 노드가 등록할 때 쓰는 HA 펜싱 설정
@@ -165,6 +174,19 @@ mod tests {
             assert_eq!(json["underlay"], ip);
             assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
         }
+    }
+
+    #[test]
+    fn status_firewall_round_trips_and_is_omitted_when_false() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("firewall").is_none(), "{none}");
+        let status = NodeStatus {
+            firewall: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["firewall"], true);
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
 
     #[test]
