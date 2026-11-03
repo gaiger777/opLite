@@ -41,6 +41,7 @@ fn lvm_pool() -> StoragePool {
             backend: PoolBackend::LvmThin { vg, thinpool },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     )
 }
@@ -54,6 +55,7 @@ fn dir_pool(dir: &Path) -> StoragePool {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     )
 }

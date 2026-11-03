@@ -94,6 +94,7 @@ async fn orphans_on_an_unmounted_pool_are_removed_later() {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -190,6 +191,7 @@ async fn a_task_deleted_while_running_does_not_block_its_queue() {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -297,6 +299,7 @@ async fn volumes_left_active_are_deactivated() {
                 shared: matches!(backend, PoolBackend::LvmShared { .. }),
                 backend,
                 nodes: vec![],
+                backups: false,
             },
         );
         env.cluster.create(&pool).await.unwrap();
@@ -430,6 +433,7 @@ async fn a_volume_taken_up_during_the_sweep_is_not_deactivated() {
                 iscsi: None,
             },
             nodes: vec![],
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();

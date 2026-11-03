@@ -770,6 +770,7 @@ mod tests {
                 backend,
                 nodes: vec![],
                 shared: false,
+                backups: false,
             },
         )
     }

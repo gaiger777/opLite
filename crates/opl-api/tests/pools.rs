@@ -855,3 +855,102 @@ async fn patch_to_local_needs_vms_on_their_volume_nodes() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["spec"]["shared"], false, "{body}");
 }
+
+/// 백업 풀 표시(`backups`)는 dir·NFS 풀만 켤 수 있다. 만들 때와 PATCH 모두 받는다.
+#[tokio::test]
+async fn only_dir_and_nfs_pools_can_store_backups() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let admin = env.admin().await;
+    let with_backups = |name: &str, backend: Value| json!({ "name": name, "spec": { "backend": backend, "backups": true } });
+    let not_supported = |body: &Value| {
+        assert_eq!(body["code"], "invalid_request", "{body}");
+        assert_eq!(
+            body["message"], "only dir and nfs pools can store backups",
+            "{body}"
+        );
+    };
+    for (name, backend) in [
+        ("local", json!({ "kind": "dir", "path": env.dir.path() })),
+        (
+            "nas",
+            json!({ "kind": "nfs", "server": "nas.lan", "export": "/srv/backups" }),
+        ),
+    ] {
+        let (status, body) = admin
+            .post("/storage-pools", with_backups(name, backend))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["spec"]["backups"], true, "{body}");
+    }
+    let blocks = [
+        (
+            "vg",
+            json!({ "kind": "lvm-thin", "vg": "vg0", "thinpool": "tp" }),
+        ),
+        ("z", json!({ "kind": "zfs", "dataset": "tank/opl" })),
+        ("r", json!({ "kind": "rbd", "pool": "rbd" })),
+        ("sh", json!({ "kind": "lvm-shared", "vg": "vg1" })),
+    ];
+    for (name, backend) in &blocks {
+        let (status, body) = admin
+            .post("/storage-pools", with_backups(name, backend.clone()))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {body}");
+        not_supported(&body);
+    }
+
+    // PATCH: 끄고 켠다. 꺼진 표시는 spec에서 빠진다. 같은 값이면 쓰지 않는다.
+    let (status, body) = admin
+        .patch("/storage-pools/local", json!({ "backups": false }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["spec"].get("backups").is_none(), "{body}");
+    assert_eq!(body["spec"]["shared"], false, "{body}");
+    let (status, body) = admin
+        .patch("/storage-pools/local", json!({ "backups": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["backups"], true, "{body}");
+    let revision = body["revision"].as_u64().unwrap();
+    let (status, body) = admin
+        .patch("/storage-pools/local", json!({ "backups": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], revision, "{body}");
+    // `shared`와 함께 바꿀 수 있다.
+    let (status, body) = admin
+        .patch(
+            "/storage-pools/local",
+            json!({ "shared": true, "backups": false }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["shared"], true, "{body}");
+    assert!(body["spec"].get("backups").is_none(), "{body}");
+    // NFS 풀은 `shared`를 바꿀 수 없어도 `backups`는 바꾼다.
+    let (status, body) = admin
+        .patch("/storage-pools/nas", json!({ "backups": false }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["spec"].get("backups").is_none(), "{body}");
+    assert_eq!(body["spec"]["shared"], true, "{body}");
+
+    // 블록 풀은 켤 수 없다(끄는 것은 같은 값이라 그대로).
+    let (status, body) = admin
+        .post("/storage-pools", pool("z", blocks[1].1.clone()))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = admin
+        .patch("/storage-pools/z", json!({ "backups": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    not_supported(&body);
+    let (_, got) = admin.get("/storage-pools/z").await;
+    assert!(got["spec"].get("backups").is_none(), "{got}");
+    let (status, body) = admin
+        .patch("/storage-pools/z", json!({ "backups": false }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

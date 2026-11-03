@@ -273,16 +273,22 @@ pub async fn delete_pool(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 풀에서 바꿀 수 있는 값. 지금은 디렉터리 풀의 `shared`만이다.
+/// 풀에서 바꿀 수 있는 값: 디렉터리 풀의 `shared`, dir·NFS 풀의 `backups`. 적지 않은 값은 그대로 둔다.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PoolPatch {
-    pub shared: bool,
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub shared: Option<bool>,
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub backups: Option<bool>,
 }
 
-/// 디렉터리 풀의 `shared`를 바꾼다(다른 백엔드는 400). 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의
-/// 볼륨을 쓰는 VM이 그 볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면
-/// 409 `pool_in_use`다. 같은 값이면 쓰지 않고 그대로 200이다.
+/// 디렉터리 풀의 `shared`(다른 백엔드는 400)와 백업 풀 표시 `backups`(dir·NFS 풀만 켤 수 있다)를
+/// 바꾼다. 둘 다 없으면 400이다. 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의 볼륨을 쓰는 VM이 그
+/// 볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면 409 `pool_in_use`다.
+/// 같은 값이면 쓰지 않고 그대로 200이다.
 #[utoipa::path(patch, path = "/storage-pools/{key}", tag = "storage",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = PoolPatch,
@@ -295,6 +301,9 @@ pub async fn patch_pool(
     Json(req): Json<PoolPatch>,
 ) -> Result<Json<StoragePool>, ApiError> {
     state.authorize(&principal, Action::Write, StoragePoolSpec::KIND)?;
+    if req.shared.is_none() && req.backups.is_none() {
+        return Err(ApiError::bad_request("give shared or backups"));
+    }
     let expected = if_match(&headers)?;
     // VM 옮기기·마이그레이션 요청의 검사와 엇갈리지 않게 한다.
     let _lock = state.vm_lock.lock().await;
@@ -317,19 +326,23 @@ pub async fn patch_pool(
             PoolBackend::LvmThin { .. } => Some("lvm-thin pools are always node-local"),
             PoolBackend::Zfs { .. } => Some("zfs pools are always node-local"),
         };
-        if let Some(why) = fixed {
+        if let Some(why) = fixed.filter(|_| req.shared.is_some()) {
             return Err(ApiError::bad_request(format!(
                 "only dir pools can change shared; {why}"
             )));
         }
-        if pool.spec.shared == req.shared {
+        let mut spec = pool.spec.clone();
+        spec.shared = req.shared.unwrap_or(spec.shared);
+        spec.backups = req.backups.unwrap_or(spec.backups);
+        spec.validate()
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if spec == pool.spec {
             return Ok(Json(pool));
         }
-        if !req.shared {
+        let to_local = pool.spec.shared && !spec.shared;
+        if to_local {
             check_pool_local(&state, &pool)?;
         }
-        let mut spec = pool.spec.clone();
-        spec.shared = req.shared;
         match state
             .cluster
             .update_spec(pool.id, Some(pool.revision), pool.labels.clone(), &spec)
@@ -347,9 +360,7 @@ pub async fn patch_pool(
         // `vm_lock`은 이 노드의 요청만 막는다. 검사와 쓰기 사이에 다른 노드가 VM을 옮기거나
         // 마이그레이션을 시작했을 수 있으니 다시 보고, 이제 안 되면 공유로 되돌린다(그 사이 누가 풀을
         // 바꿨으면 그 값을 둔다).
-        if !req.shared
-            && let Err(e) = check_pool_local(&state, &written)
-        {
+        if to_local && let Err(e) = check_pool_local(&state, &written) {
             let mut spec = written.spec.clone();
             spec.shared = true;
             if let Err(revert) = state

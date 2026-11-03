@@ -15,7 +15,8 @@ pub type Task = Resource<TaskSpec, TaskStatus>;
 #[serde(deny_unknown_fields)]
 pub struct TaskSpec {
     pub op: TaskOp,
-    /// 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제 Task는 (원본) VM이다.
+    /// 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제·백업 Task는 (원본) VM, 백업 지우기는 백업,
+    /// 복원은 새 VM이다.
     pub target: Uuid,
     /// 작업을 실행할 노드
     pub node: Uuid,
@@ -76,6 +77,18 @@ pub enum TaskOp {
     /// 상태(Succeeded)로 만들고 실행기는 실행하지 않는다.
     VmHaRecover {
         from: Uuid,
+    },
+    /// 대상 VM을 백업 `backup`(`pending`으로 먼저 만든 Backup 리소스)에 담는다. VM의 노드에서 돈다.
+    VmBackup {
+        backup: Uuid,
+    },
+    /// 대상 백업의 파일과 리소스를 지운다.
+    BackupDelete,
+    /// 백업 `backup`을 대상 id(미리 정한 새 VM id)의 새 VM `name`으로 되살린다. 디스크는 `pool`에 만든다.
+    BackupRestore {
+        backup: Uuid,
+        name: String,
+        pool: String,
     },
 }
 
@@ -226,6 +239,37 @@ mod tests {
             serde_json::json!({ "kind": "vm-ha-recover", "from": from })
         );
         assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+    }
+
+    #[test]
+    fn backup_ops_are_tagged_by_kind() {
+        let backup = Uuid::now_v7();
+        for (op, json) in [
+            (
+                TaskOp::VmBackup { backup },
+                serde_json::json!({ "kind": "vm-backup", "backup": backup }),
+            ),
+            (
+                TaskOp::BackupDelete,
+                serde_json::json!({ "kind": "backup-delete" }),
+            ),
+            (
+                TaskOp::BackupRestore {
+                    backup,
+                    name: "web-2".into(),
+                    pool: "local".into(),
+                },
+                serde_json::json!({
+                    "kind": "backup-restore",
+                    "backup": backup,
+                    "name": "web-2",
+                    "pool": "local"
+                }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&op).unwrap(), json);
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        }
     }
 
     #[test]

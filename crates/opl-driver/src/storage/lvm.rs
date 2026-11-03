@@ -1978,6 +1978,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: false,
+                backups: false,
             },
         )
     }
@@ -2877,6 +2878,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: true,
+                backups: false,
             },
         )
     }

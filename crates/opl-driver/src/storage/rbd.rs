@@ -1111,6 +1111,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: true,
+                backups: false,
             },
         )
     }
@@ -1360,6 +1361,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: true,
+                backups: false,
             },
         );
         storage.capacity(&custom).await.unwrap();
@@ -1682,6 +1684,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: false,
+                backups: false,
             },
         );
         invalid(

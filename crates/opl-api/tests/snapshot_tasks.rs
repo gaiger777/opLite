@@ -31,6 +31,7 @@ async fn pool_and_root(env: &Env) {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -925,6 +926,7 @@ async fn block_volumes(
             backend: backend.clone(),
             nodes: vec![],
             shared: false,
+            backups: false,
         };
         env.cluster
             .create(&Resource::new(*pool, spec))

@@ -284,9 +284,10 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * 디렉터리 풀의 `shared`를 바꾼다(다른 백엔드는 400). 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의
-         *     볼륨을 쓰는 VM이 그 볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면
-         *     409 `pool_in_use`다. 같은 값이면 쓰지 않고 그대로 200이다.
+         * 디렉터리 풀의 `shared`(다른 백엔드는 400)와 백업 풀 표시 `backups`(dir·NFS 풀만 켤 수 있다)를
+         *     바꾼다. 둘 다 없으면 400이다. 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의 볼륨을 쓰는 VM이 그
+         *     볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면 409 `pool_in_use`다.
+         *     같은 값이면 쓰지 않고 그대로 200이다.
          */
         patch: operations["patch_pool"];
         trace?: never;
@@ -784,6 +785,8 @@ export interface components {
             name: string;
             spec: {
                 backend: components["schemas"]["PoolBackend"];
+                /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
+                backups?: boolean;
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
                 /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
@@ -1137,6 +1140,8 @@ export interface components {
                 revision: number;
                 spec: {
                     backend: components["schemas"]["PoolBackend"];
+                    /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
+                    backups?: boolean;
                     /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                     nodes?: string[];
                     /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
@@ -1181,7 +1186,8 @@ export interface components {
                     op: components["schemas"]["TaskOp"];
                     /**
                      * Format: uuid
-                     * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제 Task는 (원본) VM이다.
+                     * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제·백업 Task는 (원본) VM, 백업 지우기는 백업,
+                     *     복원은 새 VM이다.
                      */
                     target: string;
                 };
@@ -1514,9 +1520,10 @@ export interface components {
             /** @description 공유 볼륨 그룹 이름 */
             vg: string;
         };
-        /** @description 풀에서 바꿀 수 있는 값. 지금은 디렉터리 풀의 `shared`만이다. */
+        /** @description 풀에서 바꿀 수 있는 값: 디렉터리 풀의 `shared`, dir·NFS 풀의 `backups`. 적지 않은 값은 그대로 둔다. */
         PoolPatch: {
-            shared: boolean;
+            backups?: boolean;
+            shared?: boolean;
         };
         /** @description 한 노드에서 본 스토리지 풀 상태 */
         PoolState: {
@@ -1754,6 +1761,8 @@ export interface components {
             revision: number;
             spec: {
                 backend: components["schemas"]["PoolBackend"];
+                /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
+                backups?: boolean;
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
                 /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
@@ -1794,7 +1803,8 @@ export interface components {
                 op: components["schemas"]["TaskOp"];
                 /**
                  * Format: uuid
-                 * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제 Task는 (원본) VM이다.
+                 * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제·백업 Task는 (원본) VM, 백업 지우기는 백업,
+                 *     복원은 새 VM이다.
                  */
                 target: string;
             };
@@ -2015,6 +2025,8 @@ export interface components {
         SourceFormat: "vmdk" | "qcow2" | "raw";
         StoragePoolSpec: {
             backend: components["schemas"]["PoolBackend"];
+            /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
+            backups?: boolean;
             /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
             nodes?: string[];
             /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
@@ -2094,6 +2106,21 @@ export interface components {
             from: string;
             /** @enum {string} */
             kind: "vm-ha-recover";
+        } | {
+            /** Format: uuid */
+            backup: string;
+            /** @enum {string} */
+            kind: "vm-backup";
+        } | {
+            /** @enum {string} */
+            kind: "backup-delete";
+        } | {
+            /** Format: uuid */
+            backup: string;
+            /** @enum {string} */
+            kind: "backup-restore";
+            name: string;
+            pool: string;
         };
         TaskSpec: {
             /**
@@ -2104,7 +2131,8 @@ export interface components {
             op: components["schemas"]["TaskOp"];
             /**
              * Format: uuid
-             * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제 Task는 (원본) VM이다.
+             * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제·백업 Task는 (원본) VM, 백업 지우기는 백업,
+             *     복원은 새 VM이다.
              */
             target: string;
         };

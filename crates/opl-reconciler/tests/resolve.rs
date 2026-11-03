@@ -224,6 +224,7 @@ fn pool(name: &str, nodes: Vec<Uuid>) -> StoragePool {
             },
             nodes,
             shared: false,
+            backups: false,
         },
     )
 }
@@ -592,6 +593,7 @@ async fn nfs_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (StoragePool, opl
             },
             nodes: vec![],
             shared: true,
+            backups: false,
         },
     );
     cluster.create(&nas).await.unwrap();
@@ -649,6 +651,7 @@ async fn lvm_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, Vm) {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     );
     cluster.create(&vg).await.unwrap();
@@ -693,6 +696,7 @@ async fn rbd_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, Vm) {
             },
             nodes: vec![],
             shared: true,
+            backups: false,
         },
     );
     cluster.create(&r).await.unwrap();
@@ -770,6 +774,7 @@ async fn lvm_shared_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, V
             },
             nodes: vec![],
             shared: true,
+            backups: false,
         },
     );
     cluster.create(&s).await.unwrap();
@@ -835,6 +840,7 @@ async fn zfs_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, Vm) {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     );
     cluster.create(&z).await.unwrap();

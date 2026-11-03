@@ -1158,6 +1158,7 @@ mod tests {
                 backend: PoolBackend::Dir { path: path.into() },
                 nodes: vec![],
                 shared: false,
+                backups: false,
             },
         )
     }
@@ -1221,6 +1222,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: true,
+                backups: false,
             },
         )
     }
@@ -1280,6 +1282,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: false,
+                backups: false,
             },
         )
     }
@@ -1317,6 +1320,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: false,
+                backups: false,
             },
         );
         assert_eq!(
@@ -1350,6 +1354,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: true,
+                backups: false,
             },
         );
         assert_eq!(pool_root(&p, mnt.path()), PathBuf::new());
@@ -1394,6 +1399,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: true,
+                backups: false,
             },
         )
     }
@@ -1440,6 +1446,7 @@ mod tests {
                         },
                         nodes: vec![],
                         shared: true,
+                        backups: false,
                     },
                 )
             };
@@ -1486,6 +1493,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: false,
+                backups: false,
             },
         );
         let id = Uuid::nil();

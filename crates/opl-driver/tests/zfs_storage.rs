@@ -37,6 +37,7 @@ fn zfs_pool() -> StoragePool {
             backend: PoolBackend::Zfs { dataset: dataset() },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     )
 }
@@ -50,6 +51,7 @@ fn dir_pool(dir: &Path) -> StoragePool {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     )
 }

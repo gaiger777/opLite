@@ -21,6 +21,14 @@ pub struct StoragePoolSpec {
     /// 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`).
     #[serde(default)]
     pub shared: bool,
+    /// 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub backups: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl ResourceSpec for StoragePoolSpec {
@@ -103,6 +111,15 @@ pub struct IscsiTarget {
 impl StoragePoolSpec {
     /// 백엔드별 값 검사. API가 풀을 만들 때 부른다.
     pub fn validate(&self) -> Result<(), PoolError> {
+        // 백업 파일은 파일 시스템이 있는 dir·NFS 풀에만 둔다.
+        if self.backups
+            && !matches!(
+                self.backend,
+                PoolBackend::Dir { .. } | PoolBackend::Nfs { .. }
+            )
+        {
+            return Err(PoolError::BackupsNotSupported);
+        }
         match &self.backend {
             PoolBackend::Dir { path } => {
                 if !path.is_absolute() {
@@ -399,6 +416,8 @@ pub enum PoolError {
          starting with iqn., eui. or naa."
     )]
     BadIscsiTarget(String),
+    #[error("only dir and nfs pools can store backups")]
+    BackupsNotSupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -486,6 +505,7 @@ mod tests {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         }
     }
 
@@ -516,6 +536,7 @@ mod tests {
             backend: PoolBackend::Dir { path: path.into() },
             nodes: vec![],
             shared: false,
+            backups: false,
         };
         assert_eq!(dir("/srv/pool").validate(), Ok(()));
         assert_eq!(
@@ -598,6 +619,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: false,
+                backups: false,
             },
         );
         assert!(!is_shared(&pool));
@@ -632,6 +654,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared: false,
+                backups: false,
             },
         );
         assert!(pool_usable_on(&dir, &node));
@@ -694,6 +717,7 @@ mod tests {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         }
     }
 
@@ -832,6 +856,7 @@ mod tests {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         }
     }
 
@@ -932,6 +957,7 @@ mod tests {
             },
             nodes: vec![],
             shared: true,
+            backups: false,
         }
     }
 
@@ -1083,6 +1109,7 @@ mod tests {
             },
             nodes: vec![],
             shared: true,
+            backups: false,
         }
     }
 
@@ -1230,6 +1257,51 @@ mod tests {
         };
         node.status.pools.insert("s".into(), state);
         assert!(pool_usable_on(&pool, &node));
+    }
+
+    #[test]
+    fn only_dir_and_nfs_pools_store_backups() {
+        let spec = |backend: serde_json::Value| -> StoragePoolSpec {
+            serde_json::from_value(serde_json::json!({ "backend": backend, "backups": true }))
+                .unwrap()
+        };
+        for ok in [
+            serde_json::json!({ "kind": "dir", "path": "/srv/backups" }),
+            serde_json::json!({ "kind": "nfs", "server": "nas", "export": "/srv/backups" }),
+        ] {
+            let spec = spec(ok);
+            assert!(spec.backups);
+            assert_eq!(spec.validate(), Ok(()));
+        }
+        for bad in [
+            serde_json::json!({ "kind": "lvm-thin", "vg": "vg0", "thinpool": "tp" }),
+            serde_json::json!({ "kind": "zfs", "dataset": "tank/opl" }),
+            serde_json::json!({ "kind": "rbd", "pool": "rbd" }),
+            serde_json::json!({ "kind": "lvm-shared", "vg": "vg0" }),
+        ] {
+            let mut spec = spec(bad);
+            assert_eq!(spec.validate(), Err(PoolError::BackupsNotSupported));
+            spec.backups = false;
+            assert_eq!(spec.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn backups_is_left_out_when_false() {
+        let spec: StoragePoolSpec = serde_json::from_value(serde_json::json!({
+            "backend": { "kind": "dir", "path": "/p" }
+        }))
+        .unwrap();
+        assert!(!spec.backups);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(json.get("backups").is_none(), "{json}");
+        let on = StoragePoolSpec {
+            backups: true,
+            ..spec
+        };
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["backups"], true);
+        assert_eq!(serde_json::from_value::<StoragePoolSpec>(json).unwrap(), on);
     }
 
     #[test]

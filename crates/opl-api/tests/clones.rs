@@ -53,6 +53,7 @@ async fn pool(env: &Env, name: &str, nodes: Vec<Uuid>) {
             },
             nodes,
             shared: false,
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -776,6 +777,7 @@ async fn clone_between_lvm_and_file_pools_takes_the_target_format() {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     );
     env.cluster.create(&thin).await.unwrap();

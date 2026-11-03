@@ -540,6 +540,7 @@ async fn nfs_disk_on_a_node_without_nfs_powers_off() {
             },
             nodes: vec![],
             shared: true,
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -605,6 +606,7 @@ async fn unavailable_pool_is_retried_without_powering_off() {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -1029,6 +1031,7 @@ async fn disk_vm_with(
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();

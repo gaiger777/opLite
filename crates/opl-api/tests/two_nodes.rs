@@ -829,6 +829,7 @@ async fn running_vm_with_disk(a: &Node, admin: &common::Client) -> (opl_types::v
             },
             nodes: vec![],
             shared: true,
+            backups: false,
         },
     );
     a.cluster.create(&pool).await.unwrap();

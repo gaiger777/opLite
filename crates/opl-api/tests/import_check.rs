@@ -22,6 +22,7 @@ async fn pool(env: &Env, name: &str, nodes: Vec<Uuid>) {
             },
             nodes,
             shared: false,
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();

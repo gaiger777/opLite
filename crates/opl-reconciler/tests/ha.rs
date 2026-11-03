@@ -748,6 +748,7 @@ async fn ha_vm_reassigned_while_reattaching_is_not_started() {
             },
             nodes: vec![],
             shared: false,
+            backups: false,
         },
     );
     env.cluster.create(&pool).await.unwrap();

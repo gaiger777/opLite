@@ -703,6 +703,10 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
         TaskOp::VmMigrate { node } => migrate::migrate(ctx, task, *node).await,
         // 기록 Task는 끝난 상태로 만들어지므로 실행되지 않는다.
         TaskOp::VmHaRecover { .. } => Err("an HA recovery task is a record and is not run".into()),
+        // 백업·복원 실행은 아직 없다. API도 아직 이 Task를 만들지 않는다.
+        TaskOp::VmBackup { .. } | TaskOp::BackupDelete | TaskOp::BackupRestore { .. } => {
+            Err("backup tasks are not supported by this node yet".into())
+        }
     }
 }
 

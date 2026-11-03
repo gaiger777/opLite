@@ -191,6 +191,7 @@ mod tests {
                 },
                 nodes: vec![],
                 shared,
+                backups: false,
             },
         )
     }
@@ -265,6 +266,7 @@ mod tests {
                 },
                 nodes: vec![near.id],
                 shared: false,
+                backups: false,
             },
         );
         let far = with_pool(node(32000), &pool, true);
