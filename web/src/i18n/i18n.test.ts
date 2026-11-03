@@ -63,6 +63,9 @@ it("translates API error codes and falls back to the server message", async () =
   expect(
     errorMessage(t, new ApiError(409, "firewall_unsupported", 'node "n1" has no firewall')),
   ).toBe("The node has no firewall (nftables) and cannot run VMs with security groups.");
+  expect(errorMessage(t, new ApiError(409, "backup_not_ready", 'backup "b" is not ready'))).toBe(
+    "The backup is not ready. Only finished backups can be restored.",
+  );
   expect(errorMessage(t, new ApiError(400, "invalid_request", "memory_mib must be > 0"))).toBe(
     "memory_mib must be > 0",
   );

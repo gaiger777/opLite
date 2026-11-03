@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { PoolsPage } from "@/storage/PoolsPage";
-import { NODE, pool, poolState, volume } from "@/test/fixtures";
+import { backup, NODE, pool, poolState, vm, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -117,11 +117,11 @@ it("shows each node's pool state and space", async () => {
   expect(row).toHaveTextContent("node-c: No status reported yet");
   expect(row).toHaveTextContent("node-d: Offline");
   // 공유 풀은 첫 준비된 노드의 값 하나다.
-  const space = within(row).getAllByRole("cell")[5];
+  const space = within(row).getAllByRole("cell")[6];
   expect(space).toHaveTextContent(/^64 GiB \/ 128 GiB$/);
   // 로컬 풀은 준비된 노드마다 값을 보인다.
   const local = within(table).getByText("local").closest("tr")!;
-  expect(within(local).getAllByRole("cell")[5]).toHaveTextContent(
+  expect(within(local).getAllByRole("cell")[6]).toHaveTextContent(
     "node-a: 1 GiB / 128 GiBnode-b: 2 GiB / 128 GiB",
   );
 });
@@ -757,10 +757,95 @@ it("shows the sharing of other pools without a switch", async () => {
   renderPage(<PoolsPage />);
   const table = await screen.findByRole("table", { name: "Storage pools" });
   const nas = (await within(table).findByText("nas")).closest("tr")!;
+  const sharing = { name: /^Shared storage/ };
   expect(nas).toHaveTextContent("Shared");
-  expect(within(nas).queryByRole("switch")).not.toBeInTheDocument();
+  expect(within(nas).queryByRole("switch", sharing)).not.toBeInTheDocument();
   const fast = within(table).getByText("fast").closest("tr")!;
   expect(fast).toHaveTextContent("Node-local");
-  expect(within(fast).queryByRole("switch")).not.toBeInTheDocument();
-  expect(within(table).getAllByRole("switch")).toHaveLength(1);
+  expect(within(fast).queryByRole("switch", sharing)).not.toBeInTheDocument();
+  expect(within(table).getAllByRole("switch", sharing)).toHaveLength(1);
+});
+
+it("turns backups on for directory and NFS pools only", async () => {
+  const local = pool("local");
+  mockLists({
+    "storage-pool": [
+      local,
+      pool("nas", { backend: { kind: "nfs", server: "nas", export: "/srv/vm" }, backups: true }),
+      pool("fast", { backend: { kind: "lvm-thin", vg: "vg0", thinpool: "tp" } }),
+    ],
+  });
+  let body: unknown;
+  server.use(
+    http.patch(apiUrl(`/storage-pools/${local.id}`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("local", { backups: true }));
+    }),
+  );
+  renderPage(<PoolsPage />);
+  const table = await screen.findByRole("table", { name: "Storage pools" });
+  const backups = { name: /^Store backups/ };
+  expect(await within(table).findByRole("switch", { name: "Store backups: nas" })).toBeChecked();
+  const fast = within(table).getByText("fast").closest("tr")!;
+  expect(within(fast).queryByRole("switch", backups)).not.toBeInTheDocument();
+  expect(within(table).getAllByRole("switch", backups)).toHaveLength(2);
+  const toggle = within(table).getByRole("switch", { name: "Store backups: local" });
+  expect(toggle).not.toBeChecked();
+  await userEvent.click(toggle);
+  expect(await screen.findByText("local now stores backups.")).toBeInTheDocument();
+  expect(body).toEqual({ backups: true });
+});
+
+it("says why backups cannot be turned off and keeps the pool while it holds backups", async () => {
+  const bk = pool("bk", { backups: true });
+  mockLists({
+    "storage-pool": [bk],
+    volume: [],
+    backup: [backup("web-1", vm("web", "stopped"), 1)],
+  });
+  server.use(
+    http.patch(apiUrl(`/storage-pools/${bk.id}`), () =>
+      HttpResponse.json(
+        { code: "pool_in_use", message: 'pool "bk" holds backups' },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderPage(<PoolsPage />);
+  const table = await screen.findByRole("table", { name: "Storage pools" });
+  const row = (await within(table).findByText("bk")).closest("tr")!;
+  expect(await within(row).findByText("1 backup")).toBeInTheDocument();
+  expect(within(row).getByRole("button", { name: "Delete bk" })).toBeDisabled();
+  await userEvent.click(within(row).getByRole("switch", { name: "Store backups: bk" }));
+  // 지우기의 pool_in_use 문구(볼륨이 남음)가 아니라 이 동작의 문구
+  expect(
+    await screen.findByText("The pool still holds backups. Delete them first."),
+  ).toBeInTheDocument();
+});
+
+it("creates a pool that stores backups", async () => {
+  mockLists({ node: [NODE] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/storage-pools"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(pool("bk"), { status: 201 });
+    }),
+  );
+  renderPage(<PoolsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a storage pool" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "bk");
+  await userEvent.type(within(dialog).getByLabelText("Directory"), "/srv/bk");
+  await userEvent.click(within(dialog).getByLabelText("Store backups"));
+  // 블록 풀은 백업을 담지 못하므로 묻지 않는다.
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "lvm-thin");
+  expect(within(dialog).queryByLabelText("Store backups")).not.toBeInTheDocument();
+  await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "dir");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await screen.findByText("Created storage pool bk.")).toBeInTheDocument();
+  expect(body).toEqual({
+    name: "bk",
+    spec: { backend: { kind: "dir", path: "/srv/bk" }, nodes: [], backups: true },
+  });
 });

@@ -21,6 +21,7 @@ const PATHS: Record<WatchKind, string> = {
   network: "/networks",
   snapshot: "/snapshots",
   "security-group": "/security-groups",
+  backup: "/backups",
 };
 
 /** 목록 API의 응답을 정한다. 주지 않은 종류는 빈 목록이다. */

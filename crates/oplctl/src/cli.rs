@@ -9,7 +9,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use crate::client::{Client, MIGRATE_WAIT, fetch_ca, fingerprint, local};
+use crate::client::{BACKUP_WAIT, Client, MIGRATE_WAIT, fetch_ca, fingerprint, local};
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
 
@@ -70,6 +70,11 @@ enum Cmd {
     Vm {
         #[command(subcommand)]
         cmd: VmCmd,
+    },
+    /// VM 백업(백업 풀에 담은 디스크 복사본과 VM 설정)과 복원
+    Backup {
+        #[command(subcommand)]
+        cmd: BackupCmd,
     },
     Task {
         #[command(subcommand)]
@@ -158,7 +163,7 @@ enum PoolCmd {
     },
     /// 로컬 디렉터리 풀, NFS 풀, LVM-thin 풀, ZFS 풀, Ceph RBD 풀, 공유 LVM 풀을 만든다.
     Create(Box<PoolCreate>),
-    /// 디렉터리 풀을 공유 스토리지로 표시하거나 노드 로컬로 되돌린다.
+    /// 디렉터리 풀을 공유 스토리지로 표시하거나 노드 로컬로 되돌린다. 백업을 담는 풀로 표시하거나 끈다.
     Set(PoolSet),
     Delete {
         pool: String,
@@ -166,28 +171,47 @@ enum PoolCmd {
 }
 
 #[derive(Args)]
+#[command(group(ArgGroup::new("change").required(true).multiple(true).args(["shared", "no_shared", "backups"])))]
 struct PoolSet {
     pool: String,
-    #[command(flatten)]
-    sharing: Sharing,
-}
-
-/// `pool set`의 공유 여부. 둘 중 하나를 꼭 준다.
-#[derive(Args)]
-#[group(required = true, multiple = false)]
-struct Sharing {
     /// 모든 노드가 이 경로에서 같은 파일을 보는 공유 스토리지다.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_shared")]
     shared: bool,
     /// 노드 로컬 풀로 되돌린다. 볼륨은 만든 노드에 있는 것으로 돌아간다(그 볼륨을 다른 노드에서
     /// 쓰는 VM이나 마이그레이션 중인 VM이 있으면 거절한다).
     #[arg(long)]
     no_shared: bool,
+    /// VM 백업을 담는 풀로 표시한다(true, 디렉터리·NFS 풀만)거나 끈다(false, 백업이 남아 있으면 거절한다).
+    #[arg(long, value_name = "true|false")]
+    backups: Option<bool>,
 }
 
-/// `pool set`의 요청 본문(`PATCH /storage-pools/{key}`)
-fn pool_set_body(sharing: &Sharing) -> Value {
-    json!({ "shared": sharing.shared })
+/// `pool set`의 요청 본문(`PATCH /storage-pools/{key}`). 주지 않은 값은 보내지 않는다.
+fn pool_set_body(set: &PoolSet) -> Value {
+    let mut body = json!({});
+    if set.shared || set.no_shared {
+        body["shared"] = json!(set.shared);
+    }
+    if let Some(backups) = set.backups {
+        body["backups"] = json!(backups);
+    }
+    body
+}
+
+/// `pool set`이 바꾼 것: `shared, backups on`
+fn pool_set_summary(set: &PoolSet) -> String {
+    let mut parts = Vec::new();
+    if set.shared {
+        parts.push("shared");
+    } else if set.no_shared {
+        parts.push("node-local");
+    }
+    match set.backups {
+        Some(true) => parts.push("backups on"),
+        Some(false) => parts.push("backups off"),
+        None => {}
+    }
+    parts.join(", ")
 }
 
 #[derive(Args)]
@@ -235,6 +259,9 @@ struct PoolCreate {
     /// 이 풀을 쓸 수 있는 노드 id. 생략하면 모든 노드.
     #[arg(long = "node")]
     nodes: Vec<String>,
+    /// VM 백업을 담는 풀로 표시한다. 디렉터리·NFS 풀만 된다.
+    #[arg(long, conflicts_with_all = ["lvm_thin", "zfs", "rbd", "lvm_shared"])]
+    backups: bool,
 }
 
 /// `pool create`의 요청 본문. NFS·RBD·공유 LVM 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
@@ -254,6 +281,7 @@ fn pool_create_body(args: PoolCreate) -> Value {
         iscsi_target,
         shared,
         nodes,
+        backups,
     } = args;
     let backend = match (nfs, lvm_thin, zfs, rbd, lvm_shared) {
         (Some(n), _, _, _, _) => json!({
@@ -279,6 +307,9 @@ fn pool_create_body(args: PoolCreate) -> Value {
     let mut spec = json!({ "backend": backend, "nodes": nodes });
     if shared {
         spec["shared"] = json!(true);
+    }
+    if backups {
+        spec["backups"] = json!(true);
     }
     json!({ "name": name, "spec": spec })
 }
@@ -849,6 +880,49 @@ fn schedule_value(args: &ScheduleArgs) -> Option<Value> {
 }
 
 #[derive(Subcommand)]
+enum BackupCmd {
+    /// VM을 백업한다. 실행 중이면 디스크를 잠깐 스냅샷한 때의 상태(crash-consistent)를 담는다.
+    Create {
+        vm: String,
+        /// 백업 풀(`pool set NAME --backups true`로 표시한 풀)
+        #[arg(long)]
+        pool: String,
+        /// 생략하면 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC)다.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// 백업 목록. VM을 지운 백업도 보인다.
+    List {
+        /// 이 VM(이름이나 id)의 백업만. 지운 VM은 백업에 남은 이름으로 찾는다.
+        #[arg(long)]
+        vm: Option<String>,
+    },
+    Get {
+        backup: String,
+    },
+    /// 백업 파일과 기록을 지운다. 실패한 백업도 지운다.
+    Delete {
+        backup: String,
+        /// 파일을 지울 노드가 없으면 기록만 지운다(파일은 백업 풀에 남는다).
+        #[arg(long)]
+        force: bool,
+    },
+    /// 백업에서 새 VM(꺼짐)을 만든다. 디스크는 새 볼륨에 복사하고 NIC는 새 MAC을 받는다.
+    Restore {
+        backup: String,
+        /// 새 VM 이름
+        #[arg(long)]
+        name: String,
+        /// 새 디스크를 둘 풀
+        #[arg(long)]
+        pool: String,
+        /// 복원을 실행할 노드(이름이나 id). 생략하면 백업 풀과 대상 풀을 함께 쓸 수 있는 노드다.
+        #[arg(long)]
+        node: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum TaskCmd {
     List,
     Get { task: String },
@@ -1053,16 +1127,14 @@ where
                     .await?;
                 writeln!(out, "storage pool {name} created")?;
             }
-            PoolCmd::Set(PoolSet { pool, sharing }) => {
+            PoolCmd::Set(set) => {
                 client
-                    .patch(&format!("/storage-pools/{pool}"), &pool_set_body(&sharing))
+                    .patch(
+                        &format!("/storage-pools/{}", set.pool),
+                        &pool_set_body(&set),
+                    )
                     .await?;
-                let state = if sharing.shared {
-                    "shared"
-                } else {
-                    "node-local"
-                };
-                writeln!(out, "storage pool {pool}: {state}")?;
+                writeln!(out, "storage pool {}: {}", set.pool, pool_set_summary(&set))?;
             }
             PoolCmd::Delete { pool } => {
                 client.delete(&format!("/storage-pools/{pool}")).await?;
@@ -1173,6 +1245,7 @@ where
             }
         },
         Cmd::Vm { cmd } => vm(&client, cmd, json_out, out).await?,
+        Cmd::Backup { cmd } => backup(&client, cmd, json_out, out).await?,
         Cmd::Task { cmd } => match cmd {
             TaskCmd::List => {
                 let list = client.get("/tasks").await?;
@@ -1297,6 +1370,106 @@ async fn security_group(
         }
     }
     Ok(())
+}
+
+async fn backup(
+    client: &Client,
+    cmd: BackupCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        BackupCmd::Create { vm, pool, name } => {
+            let body = json!({ "pool": pool, "name": name });
+            let task = client.post(&format!("/vms/{vm}/backups"), &body).await?;
+            client.wait_task_for(&task, BACKUP_WAIT).await?;
+            // 이름을 주지 않았으면 서버가 정한 이름을 읽는다.
+            let name = match name {
+                Some(name) => name,
+                None => {
+                    let id = cell(&task["spec"]["op"]["backup"]);
+                    cell(&client.get(&format!("/backups/{id}")).await?["name"])
+                }
+            };
+            writeln!(out, "backup {name} of vm {vm} created")?;
+        }
+        BackupCmd::List { vm } => {
+            let mut r = client.request(Method::GET, "/backups");
+            if let Some(vm) = &vm {
+                r = r.query(&[("vm", vm)]);
+            }
+            let list = client.send(r).await?;
+            print_list(out, json_out, &list, BACKUP_HEADERS, backup_row)?;
+        }
+        BackupCmd::Get { backup } => {
+            print_json(out, &client.get(&format!("/backups/{backup}")).await?)?
+        }
+        BackupCmd::Delete { backup, force } => backup_delete(client, &backup, force, out).await?,
+        BackupCmd::Restore {
+            backup,
+            name,
+            pool,
+            node,
+        } => {
+            let body = json!({ "name": name, "pool": pool, "node": node });
+            let task = client
+                .post(&format!("/backups/{backup}/restore"), &body)
+                .await?;
+            client.wait_task_for(&task, BACKUP_WAIT).await?;
+            writeln!(out, "vm {name} restored from backup {backup}")?;
+        }
+    }
+    Ok(())
+}
+
+/// 백업을 지운다. `force`로 기록만 지웠으면(200) 서버의 알림을 보이고, 아니면 Task(202)를 기다린다.
+async fn backup_delete(
+    client: &Client,
+    backup: &str,
+    force: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let mut r = client.request(Method::DELETE, &format!("/backups/{backup}"));
+    if force {
+        r = r.query(&[("force", "true")]);
+    }
+    let got = client.send(r).await?;
+    if let Some(message) = got["message"].as_str() {
+        writeln!(out, "{message}")?;
+    } else {
+        client.wait_task(&got).await?;
+        writeln!(out, "backup {backup} deleted")?;
+    }
+    Ok(())
+}
+
+/// `backup list`의 열
+const BACKUP_HEADERS: &[&str] = &["NAME", "VM", "POOL", "PHASE", "CREATED", "SIZE"];
+
+/// `backup list`의 한 행. VM은 만든 때의 이름이고(VM을 지웠어도 남는다), SIZE는 백업 파일 크기의 합이다.
+fn backup_row(b: &Value) -> Vec<String> {
+    let status = &b["status"];
+    let created = status["created_at"]
+        .as_i64()
+        .map_or_else(|| "-".to_string(), unix_time);
+    let size = match status["disks"].as_array() {
+        Some(disks) if status["phase"] == "ready" => bytes(
+            &disks
+                .iter()
+                .filter_map(|d| d["stored_bytes"].as_u64())
+                .sum::<u64>()
+                .into(),
+        ),
+        _ => "-".into(),
+    };
+    vec![
+        cell(&b["name"]),
+        cell(&b["spec"]["vm_name"]),
+        cell(&b["spec"]["pool"]),
+        cell(&status["phase"]),
+        created,
+        size,
+    ]
 }
 
 /// 이 기계의 opld에 보내는 클러스터 명령. 로그인이 필요 없다. 다른 명령이면 `None`이다.
@@ -2148,6 +2321,10 @@ fn describe_pool(pool: &Value) -> String {
         }
     }
     text.push_str(&format!("shared: {}\n", cell(&pool["spec"]["shared"])));
+    // 백업 풀만 적는다(옛 서버와 끈 풀은 보내지 않는다).
+    if pool["spec"]["backups"] == true {
+        text.push_str("backups: true\n");
+    }
     text
 }
 
@@ -2689,21 +2866,159 @@ mod tests {
             Cli::try_parse_from(argv).map(|cli| match cli.cmd {
                 Cmd::Pool {
                     cmd: PoolCmd::Set(s),
-                } => (s.pool, pool_set_body(&s.sharing)),
+                } => (s.pool.clone(), pool_set_body(&s), pool_set_summary(&s)),
                 _ => unreachable!(),
             })
         };
         assert_eq!(
             set(&["--shared"]).unwrap(),
-            ("nas".into(), json!({ "shared": true }))
+            ("nas".into(), json!({ "shared": true }), "shared".into())
         );
         assert_eq!(
             set(&["--no-shared"]).unwrap(),
-            ("nas".into(), json!({ "shared": false }))
+            (
+                "nas".into(),
+                json!({ "shared": false }),
+                "node-local".into()
+            )
         );
-        // 둘 중 하나만, 꼭 하나
+        // 백업 표시는 따로 바꾸거나 공유 여부와 함께 바꾼다. 주지 않은 값은 보내지 않는다.
+        assert_eq!(
+            set(&["--backups", "true"]).unwrap(),
+            (
+                "nas".into(),
+                json!({ "backups": true }),
+                "backups on".into()
+            )
+        );
+        assert_eq!(
+            set(&["--no-shared", "--backups", "false"]).unwrap().1,
+            json!({ "shared": false, "backups": false })
+        );
+        assert_eq!(
+            set(&["--shared", "--backups", "false"]).unwrap().2,
+            "shared, backups off"
+        );
+        // 하나는 꼭, 공유와 노드 로컬은 함께 못 준다, 백업은 true나 false
         assert!(set(&[]).is_err());
         assert!(set(&["--shared", "--no-shared"]).is_err());
+        assert!(set(&["--backups"]).is_err());
+        assert!(set(&["--backups", "yes"]).is_err());
+    }
+
+    #[test]
+    fn pool_create_marks_backup_pools() {
+        let body = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "pool", "create", "bk"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Pool {
+                    cmd: PoolCmd::Create(c),
+                } => pool_create_body(*c),
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(
+            body(&["--path", "/srv/bk", "--backups"]).unwrap()["spec"],
+            json!({ "backend": { "kind": "dir", "path": "/srv/bk" }, "nodes": [], "backups": true })
+        );
+        assert_eq!(
+            body(&["--nfs", "nas:/bk", "--backups"]).unwrap()["spec"]["backups"],
+            json!(true)
+        );
+        // 끈 풀은 보내지 않는다.
+        assert!(body(&["--path", "/srv/bk"]).unwrap()["spec"]["backups"].is_null());
+        // 블록 풀은 백업을 담지 못한다.
+        for args in [
+            &["--lvm-thin", "vg0/tp", "--backups"][..],
+            &["--zfs", "tank/opl", "--backups"],
+            &["--rbd", "rbd", "--backups"],
+            &["--lvm-shared", "san", "--backups"],
+        ] {
+            assert!(body(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn describes_a_backup_pool() {
+        let pool = json!({
+            "name": "bk",
+            "spec": { "backend": { "kind": "dir", "path": "/srv/bk" }, "backups": true }
+        });
+        assert_eq!(
+            describe_pool(&pool),
+            "pool: bk\nkind: dir\nlocation: /srv/bk\nshared: -\nbackups: true\n"
+        );
+    }
+
+    #[test]
+    fn parses_backup_commands() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "backup"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Backup { cmd } => cmd,
+                _ => unreachable!(),
+            })
+        };
+        assert!(matches!(
+            parse(&["create", "web", "--pool", "bk"]).unwrap(),
+            BackupCmd::Create { vm, pool, name: None } if vm == "web" && pool == "bk"
+        ));
+        assert!(matches!(
+            parse(&["create", "web", "--pool", "bk", "--name", "before-upgrade"]).unwrap(),
+            BackupCmd::Create { name: Some(n), .. } if n == "before-upgrade"
+        ));
+        assert!(matches!(
+            parse(&["list", "--vm", "web"]).unwrap(),
+            BackupCmd::List { vm: Some(v) } if v == "web"
+        ));
+        assert!(matches!(
+            parse(&["restore", "web-1", "--name", "web2", "--pool", "local", "--node", "n1"])
+                .unwrap(),
+            BackupCmd::Restore { backup, name, pool, node: Some(node) }
+                if backup == "web-1" && name == "web2" && pool == "local" && node == "n1"
+        ));
+        // 백업 풀과 복원의 새 이름·풀은 꼭 준다.
+        for args in [
+            &["create", "web"][..],
+            &["restore", "web-1", "--pool", "local"],
+            &["restore", "web-1", "--name", "web2"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn backup_list_shows_the_vm_name_and_stored_size() {
+        let ready = json!({
+            "name": "web-20261104-030000",
+            "spec": { "vm": "x", "vm_name": "web", "pool": "bk" },
+            "status": {
+                "phase": "ready", "created_at": 1_793_761_200,
+                "disks": [
+                    { "name": "disk0", "stored_bytes": 3u64 << 30 },
+                    { "name": "disk1", "stored_bytes": 1u64 << 29 }
+                ]
+            }
+        });
+        assert_eq!(
+            backup_row(&ready),
+            [
+                "web-20261104-030000",
+                "web",
+                "bk",
+                "ready",
+                "2026-11-04 03:00 UTC",
+                "3.5GiB"
+            ]
+        );
+        // 만드는 중이거나 실패한 백업은 크기가 없다.
+        let pending = json!({
+            "name": "b", "spec": { "vm_name": "web", "pool": "bk" },
+            "status": { "phase": "pending", "created_at": null, "disks": [] }
+        });
+        assert_eq!(backup_row(&pending)[3..], ["pending", "-", "-"]);
     }
 
     #[test]
@@ -3116,6 +3431,81 @@ mod tests {
                 "nodes": ["n1"]
             })
         );
+    }
+
+    /// 받은 요청 줄을 `seen`에 남기고 경로에 맞는 JSON을 200으로 돌려주는 작은 HTTP 서버
+    async fn fake_api(
+        reply: fn(&str) -> Value,
+    ) -> (Client, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 4096];
+                let n = sock.read(&mut buf).await.unwrap();
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let line = head.lines().next().unwrap_or("").to_string();
+                let path = line.split(' ').nth(1).unwrap_or("").to_string();
+                log.lock().unwrap().push(line);
+                let body = reply(&path).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), None, None).unwrap();
+        (client, seen)
+    }
+
+    /// `backup delete --force`는 `?force=true`로 보내고, 기록만 지웠으면 서버의 알림을 보인다.
+    /// 아니면 Task를 기다린다.
+    #[tokio::test]
+    async fn backup_delete_force_shows_the_server_message() {
+        let cli = Cli::try_parse_from(["oplctl", "backup", "delete", "b1", "--force"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Backup {
+                cmd: BackupCmd::Delete { force: true, .. }
+            }
+        ));
+
+        let (client, seen) =
+            fake_api(|_| json!({ "message": "backup \"b1\" deleted; its files are left" })).await;
+        let mut out = Vec::new();
+        backup_delete(&client, "b1", true, &mut out).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["DELETE /api/v1/backups/b1?force=true HTTP/1.1"]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "backup \"b1\" deleted; its files are left\n"
+        );
+
+        let (client, seen) = fake_api(|path| {
+            if path.starts_with("/api/v1/tasks/") {
+                json!({ "id": "t1", "status": { "state": "succeeded" } })
+            } else {
+                json!({ "id": "t1", "spec": {}, "status": { "state": "pending" } })
+            }
+        })
+        .await;
+        let mut out = Vec::new();
+        backup_delete(&client, "b1", false, &mut out).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "DELETE /api/v1/backups/b1 HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1"
+            ]
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "backup b1 deleted\n");
     }
 
     /// 풀을 읽지 못하면 --format을 주라고 알린다. 주면 풀을 읽지 않는다.

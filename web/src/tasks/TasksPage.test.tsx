@@ -60,6 +60,43 @@ it("names deleted targets by the end of their id and says when no task failed", 
   expect(screen.getByText("No failed tasks.")).toBeInTheDocument();
 });
 
+it("names backup tasks by the backup and the VM being restored", async () => {
+  const backup = "019a0f3c-0000-7000-8006-000000000001";
+  mockLists({
+    vm: [{ id: VM, name: "web" }],
+    backup: [{ id: backup, name: "web-1" }],
+    task: [
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000001",
+        spec: { op: { kind: "vm-backup", backup }, target: VM, node: "n1" },
+        status: { state: "succeeded", error: null },
+      },
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000002",
+        spec: { op: { kind: "backup-delete" }, target: backup, node: "n1" },
+        status: { state: "running", error: null },
+      },
+      {
+        // 복원의 대상은 아직 없는 새 VM이다. 요청한 이름으로 보인다.
+        id: "019a0f3c-8a10-7000-8000-000000000003",
+        spec: {
+          op: { kind: "backup-restore", backup, name: "web2", pool: "local" },
+          target: "019a0f3c-0000-7000-8000-00000000cafe",
+          node: "n1",
+        },
+        status: { state: "running", error: null },
+      },
+    ],
+  });
+  renderPage(<TasksPage />);
+  expect(await screen.findByRole("link", { name: "Back up web" })).toHaveAttribute(
+    "href",
+    "/vms/web",
+  );
+  expect(await screen.findByText("Delete backup web-1")).toBeInTheDocument();
+  expect(screen.getByText("Restore a backup as web2")).toBeInTheDocument();
+});
+
 it("shows HA recoveries with the failed node's name", async () => {
   mockLists({
     vm: [{ id: VM, name: "web" }],

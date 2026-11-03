@@ -1,4 +1,5 @@
 import type {
+  Backup,
   Node,
   Rule,
   SecurityGroup,
@@ -143,5 +144,36 @@ export function securityGroup(
     labels: {},
     spec: { rules, ...(description && { description }) },
     status: {},
+  };
+}
+
+/** 테스트용 백업. `n`은 id 끝자리(UUIDv7처럼 만든 차례)다. */
+export function backup(
+  name: string,
+  of: Vm,
+  n: number,
+  extra: { spec?: Partial<Backup["spec"]>; status?: Partial<Backup["status"]> } = {},
+): Backup {
+  return {
+    id: `019a0f3c-0000-7000-8006-${String(n).padStart(12, "0")}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: { vm: of.id, vm_name: of.name, pool: "bk", vm_spec: of.spec, ...extra.spec },
+    status: {
+      phase: "ready",
+      created_at: 1_793_761_200,
+      disks: [
+        {
+          name: "disk0",
+          file: "disk0.qcow2",
+          virtual_bytes: 16 * 1024 ** 3,
+          stored_bytes: 1536 * 1024 ** 2,
+        },
+      ],
+      uefi_vars: true,
+      error: null,
+      ...extra.status,
+    },
   };
 }

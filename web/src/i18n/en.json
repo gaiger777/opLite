@@ -43,13 +43,16 @@
     "internal": "The server failed: {{message}}",
     "ha_unsupported": "The node has fencing off and cannot run HA VMs.",
     "firewall_unsupported": "The node has no firewall (nftables) and cannot run VMs with security groups.",
-    "security_group_in_use": "A VM interface uses this security group. Remove it from the VM first."
+    "security_group_in_use": "A VM interface uses this security group. Remove it from the VM first.",
+    "backup_busy": "A task on this backup (backing up, restoring or deleting) is in progress. Try again when it has finished.",
+    "backup_not_ready": "The backup is not ready. Only finished backups can be restored."
   },
   "nav": {
     "dashboard": "Dashboard",
     "vms": "Virtual machines",
     "volumes": "Volumes",
     "pools": "Storage pools",
+    "backups": "Backups",
     "networks": "Networks",
     "securityGroups": "Security groups",
     "nodes": "Nodes",
@@ -116,7 +119,10 @@
       "volume-resize": "Resize volume {{target}}",
       "vm-clone": "Clone {{target}}",
       "vm-migrate": "Migrate {{target}}",
-      "vm-ha-recover": "HA recovery of {{target}} (from node {{from}})"
+      "vm-ha-recover": "HA recovery of {{target}} (from node {{from}})",
+      "vm-backup": "Back up {{target}}",
+      "backup-delete": "Delete backup {{target}}",
+      "backup-restore": "Restore a backup as {{target}}"
     }
   },
   "pager": {
@@ -200,6 +206,7 @@
       "hardware": "Hardware",
       "console": "Console",
       "snapshots": "Snapshots",
+      "backups": "Backups",
       "tasks": "Tasks",
       "json": "JSON"
     },
@@ -309,6 +316,47 @@
       "exists": "A VM with this name already exists.",
       "poolNotOnNode": "That storage pool is not available on the node holding the VM.",
       "poolUnavailable": "That storage pool is not ready on the node holding the VM."
+    }
+  },
+  "backups": {
+    "vm": "VM",
+    "pool": "Backup pool",
+    "created": "Created",
+    "size": "Size",
+    "empty": "No backups.",
+    "phase": {
+      "pending": "Creating",
+      "ready": "Ready",
+      "failed": "Failed"
+    },
+    "pageHint": "Backups of every VM, including VMs that were deleted. Take a backup from the Backups tab of a VM.",
+    "create": "Back up now",
+    "createTitle": "Back up {{name}}",
+    "createDescription": "Copies the disks, firmware variables and settings of the VM to a backup pool. The copy is kept after the VM is deleted.",
+    "runningDescription": "Copies the disks, firmware variables and settings of the VM to a backup pool. The VM keeps running: the disks are copied as they were at one moment, like after a power cut.",
+    "noPools": "No storage pool stores backups. Turn on \"Store backups\" for a directory or NFS pool in Storage pools.",
+    "name": "Name (optional)",
+    "nameHint": "Leave empty to name it after the VM and the UTC time, such as web-20261104-030000.",
+    "busy": "The VM is starting, stopping or migrating. Back it up when it has settled.",
+    "restore": "Restore",
+    "restoreNamed": "Restore {{name}}",
+    "restoreTitle": "Restore {{name}}",
+    "restoreDescription": "Makes a new stopped VM from the backup with copies of its disks. It gets new MAC addresses and the same networks and security groups.",
+    "newName": "New VM name",
+    "diskPool": "Storage pool for the disks",
+    "choosePool": "Choose a pool",
+    "deleteNamed": "Delete backup {{name}}",
+    "deleteTitle": "Delete backup {{name}}?",
+    "deleteDescription": "The backup files are removed from the backup pool. This cannot be undone.",
+    "op": {
+      "create": "Back up {{vm}}",
+      "restore": "Restore {{backup}} as {{name}}",
+      "delete": "Delete backup {{name}}"
+    },
+    "errors": {
+      "exists": "A backup with this name already exists.",
+      "vmExists": "A VM with this name already exists.",
+      "pool": "Choose a storage pool."
     }
   },
   "migrate": {
@@ -464,7 +512,19 @@
     "portal": "iSCSI portal",
     "portalHint": "Host name or IP address with an optional port, such as san.lan:3260 or [fd00::5]:3260.",
     "target": "iSCSI target",
-    "targetHint": "The target name, such as iqn.2003-01.org.example:storage."
+    "targetHint": "The target name, such as iqn.2003-01.org.example:storage.",
+    "backups": "Backups",
+    "backupsNamed": "Store backups: {{name}}",
+    "backupsState": "Stored",
+    "backupsOn": "{{name}} now stores backups.",
+    "backupsOff": "{{name}} no longer stores backups.",
+    "backupsErrors": {
+      "pool_in_use": "The pool still holds backups. Delete them first."
+    },
+    "holdsBackups_one": "{{count}} backup",
+    "holdsBackups_other": "{{count}} backups",
+    "storeBackups": "Store backups",
+    "storeBackupsHint": "VM backups can be kept in this pool, under backups/ in its directory. VM disks can still be kept there too."
   },
   "networks": {
     "kind": "Type",

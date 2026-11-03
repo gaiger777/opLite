@@ -42,19 +42,26 @@ export function TaskStateBadge({ task }: { task: Task }) {
 export function useTaskTarget() {
   const vms = useList("vm");
   const volumes = useList("volume");
+  const backups = useList("backup");
   return useMemo(() => {
     const vmById = new Map(vms.data?.map((v) => [v.id, v]));
     const volumeById = new Map(volumes.data?.map((v) => [v.id, v]));
+    const backupById = new Map(backups.data?.map((b) => [b.id, b]));
     return (task: Task) => {
       const vm = vmById.get(task.spec.target);
       if (vm) {
         return { name: vm.name, href: `/vms/${encodeURIComponent(vm.name)}` };
       }
-      const volume = volumeById.get(task.spec.target);
+      const op = task.spec.op;
+      // 복원의 대상은 Task가 끝날 때 만들어지는 새 VM이다. 그 전에는 요청한 이름을 보인다.
+      if (op.kind === "backup-restore") {
+        return { name: op.name, href: undefined };
+      }
+      const name = volumeById.get(task.spec.target)?.name ?? backupById.get(task.spec.target)?.name;
       // 지워진 대상은 id의 끝(UUIDv7의 무작위 부분)으로 구분한다. 앞부분은 시각이라 서로 비슷하다.
-      return { name: volume?.name ?? task.spec.target.slice(-8), href: undefined };
+      return { name: name ?? task.spec.target.slice(-8), href: undefined };
     };
-  }, [vms.data, volumes.data]);
+  }, [vms.data, volumes.data, backups.data]);
 }
 
 /**

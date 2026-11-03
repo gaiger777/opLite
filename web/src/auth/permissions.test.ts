@@ -13,6 +13,10 @@ it("mirrors the server roles", () => {
   expect(can("viewer", "read", "security-group")).toBe(true);
   expect(can("operator", "write", "security-group")).toBe(false);
   expect(can("admin", "write", "security-group")).toBe(true);
+  // 백업은 누구나 읽고 operator도 지우고 되살린다(서버의 백업 쓰기 권한).
+  expect(can("viewer", "read", "backup")).toBe(true);
+  expect(can("viewer", "write", "backup")).toBe(false);
+  expect(can("operator", "write", "backup")).toBe(true);
 });
 
 it("keeps accounts to admins", () => {

@@ -10,6 +10,7 @@ export type Network = Schemas["Resource_NetworkSpec_NetworkStatus"];
 export type Node = Schemas["Resource_NodeSpec_NodeStatus"];
 export type Task = Schemas["Resource_TaskSpec_TaskStatus"];
 export type Snapshot = Schemas["Resource_SnapshotSpec_SnapshotStatus"];
+export type Backup = Schemas["Resource_BackupSpec_BackupStatus"];
 export type SecurityGroup = Schemas["Resource_SecurityGroupSpec_SecurityGroupStatus"];
 export type Rule = Schemas["Rule"];
 export type Principal = Schemas["Principal"];
@@ -17,7 +18,15 @@ export type Role = Schemas["Role"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =
-  "vm" | "volume" | "storage-pool" | "node" | "task" | "network" | "snapshot" | "security-group";
+  | "vm"
+  | "volume"
+  | "storage-pool"
+  | "node"
+  | "task"
+  | "network"
+  | "snapshot"
+  | "security-group"
+  | "backup";
 
 /** 종류별 리소스 */
 export interface Resources {
@@ -29,4 +38,5 @@ export interface Resources {
   network: Network;
   snapshot: Snapshot;
   "security-group": SecurityGroup;
+  backup: Backup;
 }

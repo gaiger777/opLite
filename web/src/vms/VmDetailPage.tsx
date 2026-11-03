@@ -7,6 +7,7 @@ import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
+import { VmBackups } from "@/backups/VmBackups";
 import { ListPending } from "@/components/ListPending";
 import { Pager, usePage } from "@/components/Pager";
 import { ReasonButton, ReasonList } from "@/components/Reason";
@@ -35,7 +36,7 @@ import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 import { VmSnapshots } from "@/vms/VmSnapshots";
 
-const TABS = ["summary", "hardware", "console", "snapshots", "tasks", "json"] as const;
+const TABS = ["summary", "hardware", "console", "snapshots", "backups", "tasks", "json"] as const;
 
 /** 이름으로 VM을 찾는다. 목록이 아직 없으면 undefined, 없는 VM이면 null */
 export function useVmByName(name: string): Vm | null | undefined {
@@ -109,6 +110,9 @@ export function VmDetailPage() {
         </TabsContent>
         <TabsContent value="snapshots">
           <VmSnapshots vm={vm} />
+        </TabsContent>
+        <TabsContent value="backups">
+          <VmBackups vm={vm} />
         </TabsContent>
         <TabsContent value="tasks">
           <VmTasks key={vm.id} vm={vm} />

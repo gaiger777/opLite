@@ -27,7 +27,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { codeMessage } from "@/i18n/errors";
+import { codeMessage, errorMessage } from "@/i18n/errors";
 import { formatBytes } from "@/lib/format";
 import {
   cephNameError,
@@ -53,6 +53,7 @@ export function PoolsPage() {
   const me = usePrincipal();
   const pools = useList("storage-pool");
   const volumes = useList("volume");
+  const backups = useList("backup");
   const nodes = useList("node");
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<StoragePool | null>(null);
@@ -65,6 +66,28 @@ export function PoolsPage() {
   // 볼륨 목록을 다 읽기 전에는 모른다(undefined).
   const volumeCount = (pool: StoragePool) =>
     volumes.isSuccess ? volumes.data.filter((v) => v.spec.pool === pool.name).length : undefined;
+  const backupCount = (pool: StoragePool) =>
+    backups.isSuccess ? backups.data.filter((b) => b.spec.pool === pool.name).length : undefined;
+
+  // 백업 표시는 확인 없이 바꾼다. 백업이 남은 풀은 끌 수 없다(서버가 409).
+  async function setBackups(pool: StoragePool, on: boolean) {
+    try {
+      await call(
+        api.PATCH("/storage-pools/{key}", {
+          params: { path: { key: pool.id } },
+          body: { backups: on },
+        }),
+      );
+      toast.success(t(on ? "pools.backupsOn" : "pools.backupsOff", { name: pool.name }));
+    } catch (err) {
+      // pool_in_use는 지우기와 뜻이 달라 이 동작의 문구로 보인다.
+      toast.error(
+        err instanceof ApiError
+          ? codeMessage(t, err.code, err.message, "pools.backupsErrors")
+          : errorMessage(t, err),
+      );
+    }
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -86,6 +109,7 @@ export function PoolsPage() {
             <TableHead>{t("pools.kind")}</TableHead>
             <TableHead>{t("pools.location")}</TableHead>
             <TableHead>{t("pools.sharing")}</TableHead>
+            <TableHead>{t("pools.backups")}</TableHead>
             <TableHead>{t("pools.nodes")}</TableHead>
             <TableHead>{t("pools.free")}</TableHead>
             <TableHead>{t("pools.volumes")}</TableHead>
@@ -98,11 +122,13 @@ export function PoolsPage() {
         </TableHeader>
         <TableBody>
           {(pools.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 8 : 7} query={pools} empty={t("pools.empty")} />
+            <TableMessage colSpan={write ? 9 : 8} query={pools} empty={t("pools.empty")} />
           )}
           {(pools.data ?? []).map((pool) => {
             const capacity = poolCapacity(pool, nodeList);
             const used = volumeCount(pool);
+            const held = backupCount(pool);
+            const backupKind = pool.spec.backend.kind === "dir" || pool.spec.backend.kind === "nfs";
             return (
               <TableRow key={pool.id}>
                 <TableCell className="font-medium">{pool.name}</TableCell>
@@ -123,6 +149,25 @@ export function PoolsPage() {
                     t("pools.sharedState")
                   ) : (
                     t("pools.localState")
+                  )}
+                </TableCell>
+                <TableCell>
+                  {/* 디렉터리·NFS 풀만 백업을 담는다. */}
+                  {write && backupKind ? (
+                    <Switch
+                      aria-label={t("pools.backupsNamed", { name: pool.name })}
+                      checked={pool.spec.backups === true}
+                      onCheckedChange={(on) => void setBackups(pool, on)}
+                    />
+                  ) : pool.spec.backups ? (
+                    t("pools.backupsState")
+                  ) : (
+                    "—"
+                  )}
+                  {write && held !== undefined && held > 0 && (
+                    <div className="text-xs text-muted-foreground">
+                      {t("pools.holdsBackups", { count: held })}
+                    </div>
                   )}
                 </TableCell>
                 <TableCell>
@@ -157,8 +202,8 @@ export function PoolsPage() {
                       variant="ghost"
                       size="icon-sm"
                       aria-label={t("common.deleteNamed", { name: pool.name })}
-                      // 볼륨이 남은 풀은 서버가 지우지 않는다.
-                      disabled={used !== 0}
+                      // 볼륨이나 백업이 남은 풀은 서버가 지우지 않는다.
+                      disabled={used !== 0 || held !== 0}
                       onClick={() => setDeleting(pool)}
                     >
                       <Trash2 />
@@ -226,6 +271,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const [kind, setKind] = useState<Kind>("dir");
   const [path, setPath] = useState("");
   const [shared, setShared] = useState(false);
+  const [backups, setBackups] = useState(false);
   const [nfsServer, setNfsServer] = useState("");
   const [nfsExport, setNfsExport] = useState("");
   const [nfsOptions, setNfsOptions] = useState("");
@@ -352,7 +398,14 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
                     export: nfsExport,
                     ...(nfsOptions !== "" && { options: nfsOptions }),
                   };
-    const spec = { backend, nodes: known, ...(sharedDir && { shared: true }) };
+    // 디렉터리·NFS 풀만 백업을 담는다. 끈 풀은 보내지 않는다.
+    const backupPool = (kind === "dir" || kind === "nfs") && backups;
+    const spec = {
+      backend,
+      nodes: known,
+      ...(sharedDir && { shared: true }),
+      ...(backupPool && { backups: true }),
+    };
     await call(api.POST("/storage-pools", { body: { name, spec } }));
     toast.success(t("pools.created", { name }));
   }
@@ -644,6 +697,22 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             )}
           </Field>
         </>
+      )}
+      {(kind === "dir" || kind === "nfs") && (
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="pool-backups"
+              checked={backups}
+              onCheckedChange={(v) => setBackups(v === true)}
+              aria-describedby="pool-backups-hint"
+            />
+            <Label htmlFor="pool-backups">{t("pools.storeBackups")}</Label>
+          </div>
+          <p id="pool-backups-hint" className="text-xs text-muted-foreground">
+            {t("pools.storeBackupsHint")}
+          </p>
+        </div>
       )}
       <fieldset
         className="flex flex-col gap-2"
