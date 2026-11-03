@@ -56,7 +56,9 @@ impl Authorizer for RoleAuthorizer {
             Role::Admin => true,
             Role::Operator => match action {
                 Action::Read => !account,
-                Action::Write | Action::Operate => matches!(kind, Kind::Vm | Kind::Volume),
+                Action::Write | Action::Operate => {
+                    matches!(kind, Kind::Vm | Kind::Volume | Kind::Backup)
+                }
             },
             Role::Viewer => action == Action::Read && !account,
         }
@@ -297,6 +299,7 @@ mod tests {
         assert!(a.check(&op, Action::Write, Kind::Vm));
         assert!(a.check(&op, Action::Operate, Kind::Vm));
         assert!(a.check(&op, Action::Write, Kind::Volume));
+        assert!(a.check(&op, Action::Write, Kind::Backup));
         assert!(!a.check(&op, Action::Write, Kind::StoragePool));
         assert!(!a.check(&op, Action::Write, Kind::Node));
         assert!(!a.check(&op, Action::Read, Kind::ApiToken));

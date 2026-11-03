@@ -48,7 +48,7 @@ use crate::tasks::create_task;
 /// 온라인 노드 가운데 id가 가장 작은 노드다. RBD·공유 LVM 풀은 이 노드를 앞세우지 않고 늘 id가 가장
 /// 작은 노드다: 이미지(LV)를 바꾸는 명령이 아직 돌고 있다는 표시가 노드마다 따로이므로 한 볼륨의
 /// Task가 같은 노드에서 돌게 한다. 그런 노드가 없으면 409 `pool_unavailable`.
-fn pool_node(state: &AppState, pool: &StoragePool) -> Result<Uuid, ApiError> {
+pub(crate) fn pool_node(state: &AppState, pool: &StoragePool) -> Result<Uuid, ApiError> {
     let lowest = matches!(
         pool.spec.backend,
         PoolBackend::Rbd { .. } | PoolBackend::LvmShared { .. }

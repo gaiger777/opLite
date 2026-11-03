@@ -22,6 +22,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
+use crate::backups::check_no_backups;
 use crate::error::{ApiError, Json};
 use crate::state::AppState;
 
@@ -247,7 +248,7 @@ pub async fn create_pool(
     Ok((StatusCode::CREATED, Json(pool)))
 }
 
-/// 볼륨이 남아 있으면 409
+/// 볼륨이나 백업이 남아 있으면 409 `pool_in_use`
 #[utoipa::path(delete, path = "/storage-pools/{key}", tag = "storage",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -266,6 +267,7 @@ pub async fn delete_pool(
             format!("pool {:?} still has volume {:?}", pool.name, v.name),
         ));
     }
+    check_no_backups(&state, &pool)?;
     state
         .cluster
         .delete::<StoragePoolSpec>(pool.id, if_match(&headers)?)
@@ -288,7 +290,8 @@ pub struct PoolPatch {
 /// 디렉터리 풀의 `shared`(다른 백엔드는 400)와 백업 풀 표시 `backups`(dir·NFS 풀만 켤 수 있다)를
 /// 바꾼다. 둘 다 없으면 400이다. 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의 볼륨을 쓰는 VM이 그
 /// 볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면 409 `pool_in_use`다.
-/// 같은 값이면 쓰지 않고 그대로 200이다.
+/// 백업이 남은 풀의 `backups`를 끄거나 `shared`를 바꾸면 409 `pool_in_use`다. 같은 값이면 쓰지 않고
+/// 그대로 200이다.
 #[utoipa::path(patch, path = "/storage-pools/{key}", tag = "storage",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = PoolPatch,
@@ -338,6 +341,10 @@ pub async fn patch_pool(
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
         if spec == pool.spec {
             return Ok(Json(pool));
+        }
+        // 공유가 아닌 풀의 백업은 쓴 노드에만 있다(`status.node`). 공유 여부를 바꾸면 그 기록이 틀린다.
+        if (pool.spec.backups && !spec.backups) || pool.spec.shared != spec.shared {
+            check_no_backups(&state, &pool)?;
         }
         let to_local = pool.spec.shared && !spec.shared;
         if to_local {

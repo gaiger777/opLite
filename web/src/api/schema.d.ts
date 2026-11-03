@@ -54,6 +54,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/backups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 모든 백업. `vm`(id나 이름)을 주면 그 VM의 백업만이다. */
+        get: operations["list_backups"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backups/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_backup"];
+        put?: never;
+        post?: never;
+        /**
+         * 백업 파일과 리소스를 지울 Task를 돌려준다(202). 실패한 백업도 지운다. 백업을 만들거나 되살리거나
+         *     지우는 Task가 끝나지 않았으면 409 `backup_busy`. Task는 파일이 있는 노드(공유가 아닌 풀은 파일을
+         *     쓴 노드, 공유 풀은 백업 풀을 쓸 수 있는 노드)에서 돈다. 풀이 없어졌으면 이 노드의 Task가 리소스만
+         *     지운다. 파일을 지울 노드가 없으면 409(`node_offline`, `pool_unavailable` 등)이고, `force`면 리소스만
+         *     바로 지우고 200이다(파일은 백업 풀에 남는다).
+         */
+        delete: operations["delete_backup"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backups/{key}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `ready` 백업을 새 VM `name`으로 되살릴 Task를 돌려준다(202). Task의 대상은 미리 정한 새 VM id다.
+         *     백업의 VM 스펙이 쓰는 네트워크·보안 그룹이 지금 있어야 한다(400). 백업이 준비되지 않았으면 409
+         *     `backup_not_ready`, 지우는 중이면 409 `backup_busy`, 이름이 겹치면 409 `name_taken`. 노드는 `node`나
+         *     백업 풀과 대상 풀을 함께 쓸 수 있는 온라인 노드 가운데 이름이 가장 앞선 노드다(없으면 409 `no_node`).
+         *     공유가 아닌 풀의 백업은 파일을 쓴 노드(`status.node`)에서만 되살린다: `node`가 다르면 409
+         *     `backup_on_other_node`. 고른 노드가 오프라인이면 409 `node_offline`.
+         */
+        post: operations["restore_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cluster": {
         parameters: {
             query?: never;
@@ -279,7 +343,7 @@ export interface paths {
         get: operations["get_pool"];
         put?: never;
         post?: never;
-        /** 볼륨이 남아 있으면 409 */
+        /** 볼륨이나 백업이 남아 있으면 409 `pool_in_use` */
         delete: operations["delete_pool"];
         options?: never;
         head?: never;
@@ -287,7 +351,8 @@ export interface paths {
          * 디렉터리 풀의 `shared`(다른 백엔드는 400)와 백업 풀 표시 `backups`(dir·NFS 풀만 켤 수 있다)를
          *     바꾼다. 둘 다 없으면 400이다. 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의 볼륨을 쓰는 VM이 그
          *     볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면 409 `pool_in_use`다.
-         *     같은 값이면 쓰지 않고 그대로 200이다.
+         *     백업이 남은 풀의 `backups`를 끄거나 `shared`를 바꾸면 409 `pool_in_use`다. 같은 값이면 쓰지 않고
+         *     그대로 200이다.
          */
         patch: operations["patch_pool"];
         trace?: never;
@@ -453,6 +518,29 @@ export interface paths {
          *     `stop?mode=force`와 `reboot`은 대상 노드의 Task 실행기가 수행한다.
          */
         post: operations["vm_action"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/backups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `pending` 백업을 만들고 그것을 채울 Task를 돌려준다(202). 풀은 백업 풀이어야 한다(400). 시작·정지
+         *     중이면 409 `vm_busy`, 실행 중인데 스냅샷을 담지 못하는 디스크가 있으면 409 `vm_running`(스냅샷
+         *     방식이 섞였으면 스냅샷처럼 409 `snapshot_unsupported`), Task를 돌릴 노드에서 백업 풀을 쓸 수 없으면
+         *     409 `pool_not_on_node`·`pool_unavailable`, 돌릴 노드가 없으면 409 `no_node`, 이름이 겹치면 409
+         *     `name_taken`. 그사이 풀이 지워졌거나 백업 표시가 꺼졌으면 만든 백업을 지우고 409 `pool_unavailable`.
+         */
+        post: operations["create_backup"];
         delete?: never;
         options?: never;
         head?: never;
@@ -708,6 +796,75 @@ export interface components {
          * @enum {string}
          */
         Arch: "x86_64" | "aarch64";
+        /** @description 백업에 담은 디스크 하나. VM 스펙의 디스크 순서를 따른다. */
+        BackupDisk: {
+            /** @description 백업 디렉터리 안의 파일 이름(`disk{i}.qcow2`) */
+            file: string;
+            /** @description 디스크 이름(`disk{i}`) */
+            name: string;
+            /**
+             * Format: int64
+             * @description 백업 파일 크기
+             */
+            stored_bytes: number;
+            /**
+             * Format: int64
+             * @description 디스크 크기
+             */
+            virtual_bytes: number;
+        };
+        /** @description 리소스만 지운 백업 지우기(`force`)의 응답 */
+        BackupForgotten: {
+            message: string;
+        };
+        /** @enum {string} */
+        BackupPhase: "pending" | "ready" | "failed";
+        BackupSpec: {
+            /**
+             * Format: uuid
+             * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
+             */
+            job?: string | null;
+            /** @description 백업 풀 이름 */
+            pool: string;
+            /**
+             * Format: uuid
+             * @description VM id. VM을 지워도 백업은 남는다.
+             */
+            vm: string;
+            /** @description 만든 때의 VM 이름(표시용) */
+            vm_name: string;
+            /** @description 만든 때의 VM 스펙 */
+            vm_spec: components["schemas"]["VmSpec"];
+        };
+        BackupStatus: {
+            /**
+             * Format: int64
+             * @description 만든 시각(유닉스 초)
+             * @default null
+             */
+            created_at: number | null;
+            /** @default [] */
+            disks: components["schemas"]["BackupDisk"][];
+            /**
+             * @description 실패한 이유
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Format: uuid
+             * @description 파일을 쓴 노드. 공유가 아닌 풀의 백업은 이 노드에만 있으므로 지우기·복원도 이 노드에서 한다.
+             *     공유 풀이면 없다.
+             */
+            node?: string;
+            /** @default pending */
+            phase: components["schemas"]["BackupPhase"];
+            /**
+             * @description UEFI 변수 파일(`vars.fd`)을 담았는지
+             * @default false
+             */
+            uefi_vars: boolean;
+        };
         BridgeInfo: {
             name: string;
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
@@ -742,6 +899,12 @@ export interface components {
             model?: components["schemas"]["CpuModel"];
             /** Format: int32 */
             sockets?: number;
+        };
+        CreateBackupRequest: {
+            /** @description 백업 이름(클러스터에서 고유). 없으면 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC)다. */
+            name?: string | null;
+            /** @description 백업 풀(`backups`를 켠 풀) */
+            pool: string;
         };
         CreateRequest_NetworkSpec: {
             labels?: {
@@ -934,6 +1097,70 @@ export interface components {
              * @description 유효 시간(초). 기본 1시간, 최대 7일
              */
             ttl_secs?: number | null;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_BackupSpec_BackupStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    /**
+                     * Format: uuid
+                     * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
+                     */
+                    job?: string | null;
+                    /** @description 백업 풀 이름 */
+                    pool: string;
+                    /**
+                     * Format: uuid
+                     * @description VM id. VM을 지워도 백업은 남는다.
+                     */
+                    vm: string;
+                    /** @description 만든 때의 VM 이름(표시용) */
+                    vm_name: string;
+                    /** @description 만든 때의 VM 스펙 */
+                    vm_spec: components["schemas"]["VmSpec"];
+                };
+                status: {
+                    /**
+                     * Format: int64
+                     * @description 만든 시각(유닉스 초)
+                     * @default null
+                     */
+                    created_at: number | null;
+                    /** @default [] */
+                    disks: components["schemas"]["BackupDisk"][];
+                    /**
+                     * @description 실패한 이유
+                     * @default null
+                     */
+                    error: string | null;
+                    /**
+                     * Format: uuid
+                     * @description 파일을 쓴 노드. 공유가 아닌 풀의 백업은 이 노드에만 있으므로 지우기·복원도 이 노드에서 한다.
+                     *     공유 풀이면 없다.
+                     */
+                    node?: string;
+                    /** @default pending */
+                    phase: components["schemas"]["BackupPhase"];
+                    /**
+                     * @description UEFI 변수 파일(`vars.fd`)을 담았는지
+                     * @default false
+                     */
+                    uefi_vars: boolean;
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
         };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_Resource_NetworkSpec_NetworkStatus: {
@@ -1574,6 +1801,66 @@ export interface components {
             size_bytes: number;
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_BackupSpec_BackupStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /**
+                 * Format: uuid
+                 * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
+                 */
+                job?: string | null;
+                /** @description 백업 풀 이름 */
+                pool: string;
+                /**
+                 * Format: uuid
+                 * @description VM id. VM을 지워도 백업은 남는다.
+                 */
+                vm: string;
+                /** @description 만든 때의 VM 이름(표시용) */
+                vm_name: string;
+                /** @description 만든 때의 VM 스펙 */
+                vm_spec: components["schemas"]["VmSpec"];
+            };
+            status: {
+                /**
+                 * Format: int64
+                 * @description 만든 시각(유닉스 초)
+                 * @default null
+                 */
+                created_at: number | null;
+                /** @default [] */
+                disks: components["schemas"]["BackupDisk"][];
+                /**
+                 * @description 실패한 이유
+                 * @default null
+                 */
+                error: string | null;
+                /**
+                 * Format: uuid
+                 * @description 파일을 쓴 노드. 공유가 아닌 풀의 백업은 이 노드에만 있으므로 지우기·복원도 이 노드에서 한다.
+                 *     공유 풀이면 없다.
+                 */
+                node?: string;
+                /** @default pending */
+                phase: components["schemas"]["BackupPhase"];
+                /**
+                 * @description UEFI 변수 파일(`vars.fd`)을 담았는지
+                 * @default false
+                 */
+                uefi_vars: boolean;
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_NetworkSpec_NetworkStatus: {
             /** Format: uuid */
             id: string;
@@ -1926,6 +2213,14 @@ export interface components {
         };
         /** @enum {string} */
         RestartPolicy: "never" | "on-failure";
+        RestoreRequest: {
+            /** @description 새 VM의 이름 */
+            name: string;
+            /** @description 복원을 실행할 노드(이름이나 id). 없으면 백업 풀과 대상 풀을 함께 쓸 수 있는 노드다. */
+            node?: string | null;
+            /** @description 새 디스크를 둘 풀 */
+            pool: string;
+        };
         /** @enum {string} */
         Role: "admin" | "operator" | "viewer";
         Rule: {
@@ -2374,6 +2669,142 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Principal"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_backups: {
+        parameters: {
+            query?: {
+                /** @description 이 VM(id나 이름)의 백업만. 이름이면 지금 그 이름의 VM 백업과 그 이름으로 남은(지운 VM의) 백업이다. */
+                vm?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_BackupSpec_BackupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupSpec_BackupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_backup: {
+        parameters: {
+            query?: {
+                /** @description 파일을 지울 노드가 없어도 리소스만 지운다. 파일은 백업 풀에 남는다. */
+                force?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description force: only the resource was deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackupForgotten"];
+                };
+            };
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    restore_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RestoreRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
                 };
             };
             "4XX": {
@@ -3517,6 +3948,40 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateBackupRequest"];
+            };
+        };
         responses: {
             202: {
                 headers: {

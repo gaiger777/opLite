@@ -124,17 +124,25 @@ pub(crate) fn check_not_busy(state: &AppState, vm: &Vm) -> Result<(), ApiError> 
     Ok(())
 }
 
-/// 이 VM의 스냅샷 만들기·되돌리기나 복제 Task가 끝나지 않았으면 409 `vm_busy`. 스냅샷 Task는
+/// 이 VM의 스냅샷 만들기·되돌리기나 복제·백업 Task가 끝나지 않았으면 409 `vm_busy`. 스냅샷 Task는
 /// 전원을 끄고 켜며 디스크를 바꾸므로, 그사이 전원이나 스펙을 바꾸면 되돌리는 디스크를 QEMU가 열거나
 /// 담는 스펙이 실제와 달라진다. 꺼진 VM을 복사하는 동안 켜면 디스크 잠금 때문에 시작이 실패한다. 시작한 Task는 실행기의 시간 제한 안에 끝나지만, 오프라인 노드에 배정된
 /// Task는 그 노드가 돌아올 때까지 남는다(설계 §11).
 pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
-    check_no_task(state, vm, "being snapshotted, reverted or cloned", |op| {
-        matches!(
-            op,
-            TaskOp::SnapshotCreate { .. } | TaskOp::SnapshotRevert { .. } | TaskOp::VmClone { .. }
-        )
-    })
+    check_no_task(
+        state,
+        vm,
+        "being snapshotted, reverted, cloned or backed up",
+        |op| {
+            matches!(
+                op,
+                TaskOp::SnapshotCreate { .. }
+                    | TaskOp::SnapshotRevert { .. }
+                    | TaskOp::VmClone { .. }
+                    | TaskOp::VmBackup { .. }
+            )
+        },
+    )
 }
 
 /// 마이그레이션 중인 VM(`migrating`이거나 끝나지 않은 마이그레이션 Task가 있다)은 다른 동작을 받지
@@ -229,7 +237,7 @@ pub(crate) fn vm_uses_block_snapshots(cluster: &Cluster, vm: &Vm) -> Result<bool
 /// 하나라도 있으면 일부 디스크만 되돌아가므로 거부하고, 방식(qcow2 내부 스냅샷, 블록 백엔드
 /// 종류마다의 블록 스냅샷)이 섞여도 거부한다. 디스크가 블록 스냅샷을 쓰면 그 종류
 /// ([`block_snapshot_kind`]).
-fn check_disks(state: &AppState, vm: &Vm) -> Result<Option<&'static str>, ApiError> {
+pub(crate) fn check_disks(state: &AppState, vm: &Vm) -> Result<Option<&'static str>, ApiError> {
     let mut method = None;
     for disk in &vm.spec.disks {
         let volume = state
