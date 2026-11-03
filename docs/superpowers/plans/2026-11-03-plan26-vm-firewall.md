@@ -3186,6 +3186,7 @@ impl MigrationReceiver for IncomingMigrations {
 ```rust
             self.hv.stop(req.vm, StopMode::Force).await.map_err(fail)?;
         }
+        let c = &self.config;
 ```
 
 을 다음으로 바꾼다:
@@ -3205,6 +3206,7 @@ impl MigrationReceiver for IncomingMigrations {
                 .await
                 .map_err(|e| IncomingError::Failed(format!("firewall: {e}")))?;
         }
+        let c = &self.config;
 ```
 
 `crates/opl-api/src/scheduler.rs`에서
@@ -12639,3 +12641,19 @@ git commit -m "test(opld): VM 방화벽 E2E와 문서 — README 방화벽 절, 
 - **IP 위조는 막지 않는다**(MAC만). 원격으로 다른 보안 그룹을 가리킬 수 없다.
 - **업그레이드 먼저:** 옛 opld는 `security_groups`가 있는 NIC를 읽지 못하므로 모든 노드를 올린 뒤 그룹을 건다.
 - 그 밖의 제한은 설계 문서 §3·§4와 README 방화벽 절에 있다.
+
+## 실행 후 기록 (2026-11-03)
+
+6개 Task는 계획대로 적용했고, Task마다 검증된 단계와 트리가 같았다(생성 파일 `schema.d.ts` 포함). Task 4의 첫 적용은 `crates/opl-api/src/incoming.rs`의 찾을 블록 하나가 두 번 나와 멈췄다 — 뒤 줄(`let c = &self.config;`)을 더해 한 번만 나오게 이 문서를 고치고, 반쯤 적용된 파일을 되돌린 뒤 다시 적용했다. 계획 문서를 만들기 전에 스테이지 작업에서 리뷰를 세 차례 돌리고 CI에서 실제 Linux로 확인해 고쳤다(위 Task의 코드에 이미 들어 있다).
+
+- 1차: 실행 중 VM의 NIC 순서·MAC이 바뀌면 규칙이 다른 tap에 붙어 열리던 것(방화벽 VM은 실행 중 그룹만 바꿈), VLAN 브리지에서 주소 규칙이 안 맞을 수 있던 것(`meta protocol`), 방화벽 없는 노드의 도는 VM에 그룹을 걸던 것(`firewall_unsupported`), 그룹 지우기 경쟁과 없는 그룹(양방향 차단), 복제의 그룹 검사, root가 아닌 opld가 방화벽 가능으로 보이던 것(시작 때 실제 적용 시험 — 기존 테이블은 건드리지 않음), 같은 tap 이름, 다시 붙이기 전 확인.
+- 2차: 그룹 없이 NIC를 바꾼 뒤 그룹을 거는 두 번 PUT으로 1차 규칙을 비켜 가던 것(실행 중 VM은 NIC 개수·순서·MAC을 바꿀 수 없음), VLAN 브리지의 ARP(`meta protocol arp`), 멈춘 VM을 다시 돌리기 전 확인.
+- 3차: 남은 중요한 문제 없음.
+- CI가 찾은 것: 새 러너 이미지에서 iSCSI by-path 링크가 `udevadm settle` 뒤 늦게 생겨 준비 단계가 실패(기다리기 추가, nftables와 무관함을 진단으로 확인), VLAN 시험의 인터페이스 이름 `link`가 `ip` 낱말과 겹친 시험 오류. 이미 알려진 `running_vm_snapshots_revert_resize_and_delete`의 QMP 시간 초과가 한 번 나 다시 돌렸다.
+
+테스트: macOS `cargo test --workspace` 938개, 웹 Vitest 351개, `fmt`·`clippy -D warnings`(모든 기능). Linux CI(`linux-kvm`)에서 `opl-driver` `net-it` `firewall`(이름공간 트래픽: 허용·차단 TCP, ping, 나가기 차단, MAC 위조, 허용 목록 + 끝 drop의 ARP, 곧바로 반영, 잘못된 글, VLAN 브리지)과 `opld` `firewall` E2E가 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 하위 프로젝트 6(네트워크·SDN)을 마쳤다. 다음은 처음 분해(`2026-10-20-opl-node-core-design.md` §1.1)의 하위 프로젝트 7(백업)이다.
+- 남은 방화벽 과제: `user` 네트워크 NIC를 실행 중 브리지로 바꾼 뒤 그룹을 걸면 API는 그룹을 보이지만 도는 NIC(NAT)는 거르지 않는다(노출은 없음 — 실행 중 network 변경도 막을지), 마이그레이션 원본 다시 돌리기 경로의 확인(지금은 원본 규칙이 남아 있어 안전 — 주석), 시작 때 nft 시험이 실패한 노드의 재시험, 적용 실패를 노드 상태로 알리기, 노드 목록의 방화벽 표시, IP 위조 막기, 원격 그룹 참조, 규칙 로그, IPv6·호스트 주소 트래픽 시험.
