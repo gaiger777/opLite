@@ -42,12 +42,16 @@ spec: { vxlan: { vni: 1000 }, mtu: 1450 }
 - 네트워크는 지금처럼 만들고 지우기만 한다(바꾸기 없음). VM이 쓰는 네트워크는 지울 수 없다(409 `network_in_use`, 그대로).
 - `NetworkSpec::bridge_name()`이 VM NIC가 붙을 브리지 이름을 준다(`bridge` 또는 `oplv<vni>`). 스케줄러, resolve, 웹이 이것을 쓴다.
 
+구현(계획 25): `opl_types::network`의 `NetworkSpec { bridge: Option<String>, vlan, vxlan: Option<Vxlan { vni }>, mtu }`(`deny_unknown_fields`), 비어 있는 필드는 `vlan`까지 모두 빼고 써서 옛 JSON이 같은 JSON으로 다시 쓰인다(OpenAPI는 `nullable = false`, 선택 필드). 검증 오류는 `NetworkError::{KindRequired, VlanWithVxlan, MtuWithBridge, BadVni, BadMtu, ReservedBridge}`(400). 함수 `vxlan_bridge`·`vxlan_device`·`is_managed_ifname`(정규식 크레이트 없이), 상수 `DEFAULT_VXLAN_MTU = 1450`·`VXLAN_PORT = 4789`, `NetworkSpec::{bridge_name, mtu, vni}`이다. `bridge_name()`은 검증을 통과하지 않은 스펙이면 빈 문자열이고, `mtu()`는 VXLAN이면 늘 값이 있다(없으면 기본값). `POST /networks`의 409 `vni_in_use`("VNI {vni} is used by network {name:?}")는 저장된 목록을 보고 판단하므로 같은 VNI를 동시에 만드는 두 요청은 막지 못한다. 그때 노드의 에이전트는 이름이 앞선 네트워크만 쓴다(§2.3): 두 네트워크의 VM이 같은 `oplv<vni>`에 붙어 L2를 나누고, 브리지·VXLAN 장치·tap의 MTU는 이름이 앞선 네트워크의 것이다. IPv6 underlay는 바깥 머리가 70바이트(IPv6 40 + UDP 8 + VXLAN 8 + 이더넷 14)라 underlay가 `mtu + 70`(기본 1450이면 1520)을 실어야 한다.
+
 ### 2.2 노드 underlay
 
 - 노드는 VXLAN 패킷을 주고받을 주소를 `NodeStatus.underlay: Option<IpAddr>`로 기록한다(없으면 필드를 뺀다).
 - 값: 설정 `[network] underlay = "10.0.0.11"`. 없으면 노드 `address`의 호스트 부분이 IP면 그것, 이름이면 시작할 때 한 번 풀어 나온 첫 주소. 어느 것도 안 되면 None이고 경고를 남긴다. 위트니스는 기록하지 않는다.
 - underlay가 없는 노드에는 VXLAN 장치를 만들지 않는다. 그래서 그 노드 브리지 목록에 `oplv<vni>`가 없고 스케줄러가 그 네트워크를 쓰는 VM을 배치하지 않는다.
 - 모든 노드의 underlay는 같은 주소 체계(IPv4끼리 또는 IPv6끼리)여야 한다. 다른 체계의 피어는 FDB에 넣지 않고 경고한다.
+
+구현(계획 25): opld 설정 `Config.network: NetworkSection { underlay: Option<IpAddr> }`, `0.0.0.0`·`::`은 설정 오류다. `Config::underlay_source()`(순수: 설정 → `address`가 IP 리터럴 → 이름)와 `Config::underlay()`(이름이면 `tokio::net::lookup_host((host, 0))`의 결과에서 `pick_underlay`가 loopback·link-local·미지정 주소를 빼고 IPv4를 먼저, 없으면 IPv6를 고른다. 남는 것이 없거나 실패하면 None과 경고; 시험은 `underlay_with`로 이름 풀기를 바꿔 끼운다)가 정하고, `register_node`가 시작할 때마다 `NodeStatus.underlay`에 쓴다(위트니스는 쓰지 않는다). 이름을 풀지 못해 None이면 기록된 값을 지킨다(`underlay.or(status.underlay)`). OpenAPI는 `format: ip`인 선택 필드다.
 
 ### 2.3 오버레이 에이전트
 
@@ -63,16 +67,24 @@ spec: { vxlan: { vni: 1000 }, mtu: 1450 }
 - 실패하면 경고를 남기고 다음 차례에 다시 한다. 한 네트워크 실패가 다른 네트워크를 막지 않는다.
 - `HostNet`에 `sync_overlays(&self, tag, desired: &[Overlay])`를 더한다. `Overlay { vni, mtu, local: IpAddr, peers: Vec<IpAddr> }`. Mock은 받은 값을 기록한다.
 
+구현(계획 25, 드라이버): `opl_driver::{Overlay, OverlayChanges { devices_changed }}`, `HostNet::sync_overlays(tag, desired) -> Result<OverlayChanges, DriverError>`. `devices_changed`는 장치를 만들거나 지우거나 다시 만들었을 때만 참이다(FDB·MTU만 고치면 거짓). 여러 네트워크의 실패는 모아 `DriverError::Overlay("VNI …: …; …")` 하나로 돌려주고, 실패하면 이번 호출에서 `ip link add`가 성공한 장치만 지운다(`rollback_links`). 이름이 관리 모양이고 alias도 포트도 없고 내려가 있는 장치는 만들다 멈춘 내 장치로 보고 지우고 다시 만든다(alias와 up을 한 명령으로 주므로 만들다 멈춘 장치는 늘 내려가 있다; alias가 다르거나 포트가 있거나 alias 없이 올라가 있으면 남의 것). 정리할 내 브리지에 자기 `oplx<vni>` 말고 포트(VM tap 따위)가 남아 있으면 그 브리지와 VXLAN 장치를 남기고 "bridge oplvN still has ports: …"를 오류에 더한다. `IpRoute`는 `IpRoute { netns: Option<String>, tag: Option<String> }`(`IpRoute::default()`, 시험용 `IpRoute::in_netns(name)`이 모든 `ip`·`bridge` 명령 앞에 `-n NAME`; `with_cluster_tag(tag)`면 `bridges()`와 `create_tap`이 관리 이름 브리지 가운데 alias가 `opl:<tag>`인 것만 쓰고, 태그가 없으면 관리 이름 브리지를 모두 뺀다 — 남의 것이나 만들다 멈춘 `oplv…`에 tap이 붙지 않게)이다. opld는 `Host::from_config(config, tag)`로 태그를 넘긴다. **Ubuntu 24.04의 iproute2 6.1(fan 패치)은 VXLAN 장치의 `ip -j -d link show` JSON을 깨뜨리고**(`"info_data":{"id":7fan-map ,…}`), **호스트 이름공간에서는 `ip -d link show` 목록(전체나 `type vxlan`)이 세그폴트한다**(장치 하나를 `dev`로 지정하면 된다). 그래서 목록 명령에는 `-d`를 쓰지 않는다: 이름·`master`·`ifalias`·`mtu`·up은 `ip -j link show`, 브리지 구별은 `ip -j link show type bridge`, 브리지가 아닌 관리 이름 장치마다 `ip -d -o link show dev NAME` 글의 `vxlan` 단락에서 `id`·`local`·`dstport`를 읽는다(`parse_vxlan_details`, `vxlan` 단락이 없으면 VXLAN 장치가 아니다). 세부를 읽지 못한 장치의 네트워크만 그 차례에 오류로 남기고 다시 만들지 않는다. 도구가 stderr 없이 실패하면 `ToolFailed`에 종료 상태("exit status N", "killed by signal N")를 넣는다. FDB는 `bridge -j fdb show dev oplx<vni>`의 전부 0 MAC 항목의 `dst`를 `bridge fdb append`·`del`로 맞춘다. 시험: 명령 목록·파싱 단위 시험, `net-it` `opl-driver/tests/overlay.rs`(이름공간 셋을 veth로 잇고 "VM" 사이 ping, 다시 부르면 바뀐 것 없음, 피어 빼기, 비우기, alias가 다른 장치는 남음).
+
+구현(계획 25, 에이전트): `crates/opld/src/overlay.rs`. `cluster_tag(ca_pem)`은 지문 `sha256:` 뒤 16진수 앞 12자, `desired_overlays(networks, nodes, me) -> Option<Vec<Overlay>>`는 순수 함수다(내가 없거나 위트니스거나 underlay가 없으면 None이고 에이전트는 sync를 건너뛴다 — 잠깐 underlay를 잃었다고 VM이 쓰는 장치를 지우지 않게, 경고는 한 번이고 내 Node가 아직 없으면(첫 부팅) debug만; 피어는 나·위트니스·underlay 없는 노드·내 주소와 같은 주소를 빼고 정렬·중복 제거, VNI 순, 같은 VNI가 둘이면 이름이 앞선 것). `OverlayAgent::spawn`은 위트니스가 아니고 `host.net`이 있을 때만 띄운다(member의 `Services.overlay`, 종료 때 멈추고 장치는 남긴다. `cluster leave`(`close(left = true)`)면 `sync_overlays(tag, &[])`로 이 노드의 장치를 지운다). 바라는 목록이 비어도 `sync_overlays`를 불러 내 태그 장치를 정리한다. `devices_changed`이거나 **`sync_overlays`가 실패해도**(다른 네트워크 장치는 바뀌었을 수 있다) 곧바로 `bootstrap::refresh_bridges`를 부른다(sync 오류를 먼저 경고로 남긴다). 종료 신호는 차례 사이에서만 보고 하던 sync는 끝까지 한다. Network·Node watch는 목록을 읽기 전에 구독하고, 구독이 끊기면(뒤처짐·스냅샷) 변경 때처럼 1초 기다리고 맞춘 뒤 다시 구독한다. 시험: `desired_overlays` 표, 기록하는 가짜 `HostNet`으로 만들기·노드 더하기·지우기 뒤 다시 맞춤과 브리지 기록, 위트니스·`host.net` 없음, underlay가 없으면 건너뜀, 종료가 하던 sync를 기다림.
+
 ### 2.4 tap과 QEMU
 
 - tap을 만들 때 MTU를 붙을 브리지의 MTU로 맞춘다(브리지 목록 JSON의 `mtu`). 모든 브리지에 같다.
 - `NicBackend::Tap`에 `mtu: Option<u16>`을 더한다. VXLAN 네트워크면 resolve가 네트워크 `mtu`를 넣고, QEMU는 virtio NIC에 `host_mtu=<mtu>`를 붙여 게스트가 MTU를 알게 한다(e1000 등은 게스트 설정에 맡긴다). `bridge` 네트워크는 None으로 지금과 같다.
+
+구현(계획 25): `create_tap`이 `ip tuntap add` 뒤, 브리지에 붙이기(`master`) 전에 브리지 목록 JSON(`ip -j -d link show type bridge`, 브리지만 나오므로 fan 패치와 상관없다)의 `mtu`로 `ip link set dev TAP mtu M`을 한다(값이 없으면 생략). 그래서 `Tap` 구조체에는 MTU가 없다. `NicBackend::Tap.mtu`는 None이면 빼고 쓴다(옛 정의는 None). `-incoming`(마이그레이션 받기)도 같은 명령줄 코드라 `host_mtu`가 붙는다.
 
 ### 2.5 API·oplctl·웹
 
 - API: `POST /networks`가 새 모양을 받는다. 검증 오류는 400, `vni_in_use`는 409.
 - oplctl: `network create NAME --vxlan VNI [--mtu N]`(지금의 `--bridge`·`--vlan`과 함께 하나만). `network list`는 `TYPE`(bridge·vxlan), `BRIDGE`, `VLAN/VNI`, `MTU`. `node list`/`show`에 underlay.
 - 웹: 네트워크 만들기에서 종류(브리지·VXLAN)를 고르고, 목록에 종류·VNI·MTU를 보인다. 노드 상세에 underlay.
+
+구현(계획 25): oplctl `network create NAME (--bridge B [--vlan V] | --vxlan VNI [--mtu M])`(clap 그룹, 주지 않은 값은 보내지 않는다), `network list` 열 `NAME TYPE BRIDGE VLAN/VNI MTU`(VXLAN의 BRIDGE는 `oplv<vni>`, MTU는 없으면 1450, 브리지 네트워크는 `-`), `node list`에 `UNDERLAY`(없으면 `-`). `node show` 명령은 없다 — `node get`이 JSON을 보이므로 `status.underlay`가 그대로 나온다. 웹은 만들기 대화상자의 종류 선택(브리지면 브리지·VLAN, VXLAN이면 VNI·MTU, 관리 이름 모양의 브리지 이름은 받지 않음), 목록의 종류·브리지(관리 이름)·VLAN/VNI·MTU, 그리고 노드 상세 대신 **노드 목록**의 "언더레이 주소" 열이다. E2E `crates/opld/tests/vxlan.rs`(`qemu-it,net-it`, Linux root): opld 하나에 무작위 VNI 네트워크를 만들면 `oplv`·`oplx`가 alias `opl:<태그>`로 생기고 노드 브리지 목록에 오르며, 그 네트워크 VM의 tap이 MTU 1450으로 붙고 QEMU 명령줄에 `host_mtu=1450`이 있다. 같은 호스트에 띄운 다른 클러스터의 opld는 그 장치를 지우지 않고, 네트워크를 지우면 두 장치와 브리지 목록 항목이 곧바로 사라진다. CI는 이미 `opld/net-it`·`opl-driver/net-it`를 돌리므로 바꾸지 않았다.
 
 ## 3. VM 방화벽 (계획 26)
 
