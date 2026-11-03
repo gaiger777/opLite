@@ -49,6 +49,7 @@ pub enum Kind {
     Snapshot,
     SecurityGroup,
     Backup,
+    BackupJob,
 }
 
 impl Kind {
@@ -67,6 +68,7 @@ impl Kind {
             Kind::Snapshot => "snapshot",
             Kind::SecurityGroup => "security-group",
             Kind::Backup => "backup",
+            Kind::BackupJob => "backup-job",
         }
     }
 }
@@ -135,6 +137,7 @@ mod tests {
             Kind::Snapshot,
             Kind::SecurityGroup,
             Kind::Backup,
+            Kind::BackupJob,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }
