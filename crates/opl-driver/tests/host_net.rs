@@ -89,7 +89,7 @@ fn vlans(ifname: &str) -> Vec<(u64, bool)> {
 async fn taps_join_bridges_with_vlans_and_are_removed_per_vm() {
     let aware = TestBridge::new(true);
     let plain = TestBridge::new(false);
-    let net = IpRoute;
+    let net = IpRoute::default();
 
     let bridges = net.bridges().await.unwrap();
     let find = |name: &str| bridges.iter().find(|b| b.name == name).cloned();
@@ -139,7 +139,7 @@ async fn taps_join_bridges_with_vlans_and_are_removed_per_vm() {
 #[tokio::test]
 async fn missing_or_vlan_unaware_bridges_are_refused() {
     let plain = TestBridge::new(false);
-    let net = IpRoute;
+    let net = IpRoute::default();
     let vm = Uuid::now_v7();
 
     let missing = Tap {

@@ -28,7 +28,7 @@ impl Host {
             tracing::warn!("KVM is not available; VMs run with TCG emulation (slow)");
         }
         let net: Option<Arc<dyn HostNet>> = if cfg!(target_os = "linux") {
-            Some(Arc::new(IpRoute))
+            Some(Arc::new(IpRoute::default()))
         } else {
             None
         };

@@ -243,7 +243,7 @@ pub(crate) mod tests {
     use openraft::{BasicNode, ServerState};
     use opl_cluster::ClusterConfig;
     use opl_cluster::memnet::MemRouter;
-    use opl_driver::{DriverError, HostNet, Tap};
+    use opl_driver::{DriverError, HostNet, Overlay, OverlayChanges, Tap};
     use opl_types::node::{BridgeInfo, Fencing, NodeHa, PoolState};
 
     use crate::config::FencingSetting;
@@ -264,6 +264,13 @@ pub(crate) mod tests {
             unimplemented!()
         }
         async fn delete_vm_taps(&self, _: Uuid) -> Result<(), DriverError> {
+            unimplemented!()
+        }
+        async fn sync_overlays(
+            &self,
+            _: &str,
+            _: &[Overlay],
+        ) -> Result<OverlayChanges, DriverError> {
             unimplemented!()
         }
     }

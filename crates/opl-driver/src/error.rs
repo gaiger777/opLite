@@ -48,6 +48,9 @@ pub enum DriverError {
     /// 라이브 마이그레이션이 실패했거나 취소됐다. 내용은 QEMU의 `error-desc` 등이다.
     #[error("migration failed: {0}")]
     Migration(String),
+    /// VXLAN 네트워크 몇 개를 맞추지 못했다. 내용은 네트워크(VNI)마다의 오류다. 나머지는 맞췄다.
+    #[error("VXLAN overlay sync failed: {0}")]
+    Overlay(String),
     #[error(transparent)]
     Qmp(#[from] QmpError),
     #[error("i/o error: {0}")]
@@ -87,7 +90,8 @@ impl DriverError {
             | DriverError::Lvm(_)
             | DriverError::Zfs(_)
             | DriverError::Rbd(_)
-            | DriverError::Migration(_) => false,
+            | DriverError::Migration(_)
+            | DriverError::Overlay(_) => false,
         }
     }
 

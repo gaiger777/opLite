@@ -69,7 +69,7 @@ fn config(root: &Path) -> QemuConfig {
         host: HostProfile::native(Path::new("/opt/homebrew/share/qemu")),
         run_dir: root.join("run"),
         state_dir: root.join("state"),
-        net: Some(Arc::new(IpRoute)),
+        net: Some(Arc::new(IpRoute::default())),
         systemd_scope: std::env::var_os("OPL_TEST_SYSTEMD").is_some(),
     }
 }
