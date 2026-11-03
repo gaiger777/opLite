@@ -252,6 +252,7 @@ fn nic(network: &str, mac: Option<MacAddr>) -> NicSpec {
         network: network.into(),
         model: NicModel::Virtio,
         mac,
+        security_groups: Vec::new(),
     }
 }
 

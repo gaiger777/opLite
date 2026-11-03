@@ -438,6 +438,7 @@ mod tests {
             network: network.into(),
             model: NicModel::Virtio,
             mac: None,
+            security_groups: Vec::new(),
         };
         let mut me = spec(512, None, PowerState::Running);
         me.nics = vec![nic("user"), nic("lan")];
@@ -479,6 +480,7 @@ mod tests {
             network: "overlay".into(),
             model: NicModel::Virtio,
             mac: None,
+            security_groups: Vec::new(),
         }];
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(ready.id));
     }
@@ -575,6 +577,7 @@ mod tests {
             network: "lan".into(),
             model: NicModel::Virtio,
             mac: None,
+            security_groups: Vec::new(),
         });
         assert_eq!(
             node_fits(&me, &inv, &ready),

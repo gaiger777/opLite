@@ -49,6 +49,9 @@ impl ResourceSpec for VmSpec {
 /// VM 하나의 최대 NIC 수. tap 장치 이름(15자)에 순번 두 자리를 넣는다.
 pub const MAX_NICS: usize = 16;
 
+/// NIC 하나에 거는 보안 그룹의 최대 수.
+pub const MAX_NIC_SECURITY_GROUPS: usize = 8;
+
 /// 예약 스냅샷 보관 개수의 최댓값.
 pub const MAX_SCHEDULE_KEEP: u32 = 100;
 
@@ -81,6 +84,17 @@ impl VmSpec {
                 return Err(ValidationError::DuplicateMac(mac));
             }
         }
+        for (i, nic) in self.nics.iter().enumerate() {
+            if nic.security_groups.len() > MAX_NIC_SECURITY_GROUPS {
+                return Err(ValidationError::TooManySecurityGroups(i));
+            }
+            let mut groups = BTreeSet::new();
+            for group in &nic.security_groups {
+                if !groups.insert(group) {
+                    return Err(ValidationError::DuplicateSecurityGroup(i, group.clone()));
+                }
+            }
+        }
         if let Some(schedule) = &self.snapshot_schedule
             && !(1..=MAX_SCHEDULE_KEEP).contains(&schedule.keep)
         {
@@ -108,6 +122,10 @@ pub enum ValidationError {
     TooManyNics,
     #[error("snapshot_schedule.keep must be between 1 and {MAX_SCHEDULE_KEEP}")]
     ScheduleKeep,
+    #[error("nics[{0}]: a NIC can have at most {MAX_NIC_SECURITY_GROUPS} security groups")]
+    TooManySecurityGroups(usize),
+    #[error("nics[{0}]: security group {1:?} is listed more than once")]
+    DuplicateSecurityGroup(usize, String),
 }
 
 /// 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다.
@@ -244,6 +262,9 @@ pub struct NicSpec {
     /// None이면 생성 시 자동 할당한다.
     #[serde(default)]
     pub mac: Option<MacAddr>,
+    /// 이 NIC에 거는 보안 그룹 이름(8개 이하, 겹치지 않게). 비어 있지 않으면 방화벽이 켜진다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,6 +543,64 @@ mod tests {
             nic.mac = None;
         }
         assert_eq!(s.validate(), Err(ValidationError::TooManyNics));
+    }
+
+    #[test]
+    fn validate_checks_nic_security_groups() {
+        let with_groups = |groups: &[&str]| {
+            let mut s = sample();
+            let mut second = s.nics[0].clone();
+            second.network = "wan".into();
+            second.security_groups = groups.iter().map(|g| g.to_string()).collect();
+            s.nics.push(second);
+            s.validate()
+        };
+        assert_eq!(with_groups(&[]), Ok(()));
+        let eight: Vec<String> = (0..MAX_NIC_SECURITY_GROUPS)
+            .map(|i| format!("g{i}"))
+            .collect();
+        let eight: Vec<&str> = eight.iter().map(String::as_str).collect();
+        assert_eq!(with_groups(&eight), Ok(()));
+        let mut nine = eight.clone();
+        nine.push("g8");
+        assert_eq!(
+            with_groups(&nine),
+            Err(ValidationError::TooManySecurityGroups(1))
+        );
+        assert_eq!(
+            with_groups(&["web", "ssh", "web"]),
+            Err(ValidationError::DuplicateSecurityGroup(1, "web".into()))
+        );
+        assert_eq!(
+            ValidationError::DuplicateSecurityGroup(1, "web".into()).to_string(),
+            "nics[1]: security group \"web\" is listed more than once"
+        );
+        // 다른 NIC에 같은 그룹을 거는 것은 된다.
+        let mut s = sample();
+        s.nics[0].security_groups = vec!["web".into()];
+        let mut second = s.nics[0].clone();
+        second.network = "wan".into();
+        s.nics.push(second);
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn nic_security_groups_default_empty_and_are_omitted() {
+        // 옛 NIC JSON은 그대로 읽고 그대로 쓴다.
+        let old = serde_json::json!({ "network": "lan", "model": "virtio", "mac": null });
+        let nic: NicSpec = serde_json::from_value(old.clone()).unwrap();
+        assert!(nic.security_groups.is_empty());
+        assert_eq!(serde_json::to_value(&nic).unwrap(), old);
+
+        let json = serde_json::json!({
+            "network": "lan",
+            "model": "virtio",
+            "mac": null,
+            "security_groups": ["web", "ssh"]
+        });
+        let nic: NicSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(nic.security_groups, ["web", "ssh"]);
+        assert_eq!(serde_json::to_value(&nic).unwrap(), json);
     }
 
     #[test]

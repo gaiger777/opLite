@@ -1315,6 +1315,8 @@ export interface components {
             model: components["schemas"]["NicModel"];
             /** @description Network 리소스 이름 */
             network: string;
+            /** @description 이 NIC에 거는 보안 그룹 이름(8개 이하, 겹치지 않게). 비어 있지 않으면 방화벽이 켜진다. */
+            security_groups?: string[];
         };
         /** @description 노드가 등록할 때 쓰는 HA 펜싱 설정 */
         NodeHa: {
