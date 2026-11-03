@@ -36,6 +36,7 @@ function lists(vms: unknown[], revision: number) {
     http.get(apiUrl("/tasks"), empty),
     http.get(apiUrl("/networks"), empty),
     http.get(apiUrl("/snapshots"), empty),
+    http.get(apiUrl("/security-groups"), empty),
   ];
 }
 
@@ -56,7 +57,9 @@ it("watches from the oldest list revision and applies changes", async () => {
     </QueryClientProvider>,
   );
   expect(await screen.findByText("live: web=running")).toBeInTheDocument();
-  expect(urls[0]).toContain("kinds=vm,volume,storage-pool,node,task,network,snapshot&since=7");
+  expect(urls[0]).toContain(
+    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group&since=7",
+  );
 });
 
 it("reads the lists again when the watch cannot continue", async () => {

@@ -11,7 +11,14 @@ const web = vm("web", "running", {
   spec: {
     ...vm("web", "running").spec,
     disks: [{ volume: "web-root", bus: "virtio-blk", boot_order: 1 }],
-    nics: [{ network: "lan", model: "virtio", mac: "52:54:00:12:34:56" }],
+    nics: [
+      {
+        network: "lan",
+        model: "virtio",
+        mac: "52:54:00:12:34:56",
+        security_groups: ["web", "ssh"],
+      },
+    ],
   },
 });
 
@@ -39,6 +46,7 @@ it("shows a VM, its hardware and its tasks", async () => {
   await userEvent.click(screen.getByRole("tab", { name: "Hardware" }));
   expect(screen.getByText("web-root")).toBeInTheDocument();
   expect(screen.getByText("52:54:00:12:34:56")).toBeInTheDocument();
+  expect(screen.getByText("web, ssh")).toBeInTheDocument();
 
   await userEvent.click(screen.getByRole("tab", { name: "Tasks" }));
   expect(await screen.findByText("Start web")).toBeInTheDocument();

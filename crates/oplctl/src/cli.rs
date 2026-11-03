@@ -58,6 +58,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NetworkCmd,
     },
+    /// VM NIC에 거는 방화벽 규칙 묶음. nftables가 있는 노드가 적용한다.
+    SecurityGroup {
+        #[command(subcommand)]
+        cmd: SecurityGroupCmd,
+    },
     Volume {
         #[command(subcommand)]
         cmd: VolumeCmd,
@@ -398,6 +403,167 @@ fn network_create_body(c: &NetworkCreate) -> Value {
     json!({ "name": c.name, "spec": spec })
 }
 
+#[derive(Subcommand)]
+enum SecurityGroupCmd {
+    List,
+    Get {
+        group: String,
+    },
+    /// 보안 그룹을 만든다. 규칙은 적힌 순서대로 보고 처음 맞는 것을 따른다. 맞는 규칙이 없으면
+    /// 들어오는 것은 막고 나가는 것은 보낸다.
+    Create {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        /// 규칙 `in|out accept|drop [tcp|udp|icmp|icmpv6] [PORTS] [CIDR]`
+        /// (예: "in accept tcp 22 10.0.0.0/8"). 여러 번 줄 수 있다.
+        #[arg(long = "rule", value_name = "RULE", value_parser = parse_rule)]
+        rules: Vec<Value>,
+    },
+    /// 보안 그룹을 지운다. 그룹을 쓰는 VM NIC가 없어야 한다.
+    Delete {
+        group: String,
+    },
+    /// 규칙을 더하거나 뺀다. 그룹을 쓰는 노드가 곧바로 적용한다.
+    Rule {
+        #[command(subcommand)]
+        cmd: RuleCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuleCmd {
+    /// 규칙 하나를 더한다(RULE은 `security-group create --rule`과 같다).
+    Add {
+        group: String,
+        #[arg(value_parser = parse_rule)]
+        rule: Value,
+        /// 이 번호(1부터) 자리에 넣는다. 생략하면 맨 끝이다.
+        #[arg(long, value_name = "N")]
+        at: Option<usize>,
+    },
+    /// N번 규칙(1부터, `security-group get`의 순서)을 뺀다.
+    Rm { group: String, n: usize },
+}
+
+/// `in accept tcp 22 10.0.0.0/8`처럼 쓴다: 방향과 동작, 그 뒤로 프로토콜·포트·원격 CIDR을 이 차례로
+/// (모두 생략할 수 있다). 값의 나머지 검사(포트 범위, 프로토콜과 포트·주소의 짝)는 API가 한다.
+fn parse_rule(s: &str) -> Result<Value, String> {
+    let bad = || {
+        format!("invalid rule {s:?}: use in|out accept|drop [tcp|udp|icmp|icmpv6] [PORTS] [CIDR]")
+    };
+    let mut words = s.split_whitespace().peekable();
+    let direction = words
+        .next()
+        .filter(|w| matches!(*w, "in" | "out"))
+        .ok_or_else(bad)?;
+    let action = words
+        .next()
+        .filter(|w| matches!(*w, "accept" | "drop"))
+        .ok_or_else(bad)?;
+    let mut rule = json!({ "direction": direction, "action": action });
+    if let Some(protocol) = words.next_if(|w| matches!(*w, "tcp" | "udp" | "icmp" | "icmpv6")) {
+        rule["protocol"] = json!(protocol);
+    }
+    if let Some(ports) = words.next_if(|w| is_ports(w)) {
+        rule["ports"] = json!(ports);
+    }
+    if let Some(remote) = words.next_if(|w| w.contains(['.', ':'])) {
+        rule["remote"] = json!(remote);
+    }
+    if words.next().is_some() {
+        return Err(bad());
+    }
+    Ok(rule)
+}
+
+/// `22`나 `8000-8080` 모양인지
+fn is_ports(word: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match word.split_once('-') {
+        Some((start, end)) => digits(start) && digits(end),
+        None => digits(word),
+    }
+}
+
+/// `security-group create`의 요청 본문(`POST /security-groups`)
+fn security_group_create_body(name: &str, description: Option<&str>, rules: &[Value]) -> Value {
+    let mut spec = json!({ "rules": rules });
+    if let Some(description) = description {
+        spec["description"] = json!(description);
+    }
+    json!({ "name": name, "spec": spec })
+}
+
+/// 그룹의 규칙에 `rule`을 `at`번(1부터, 생략하면 맨 끝) 자리에 넣은 목록
+fn rules_with(group: &Value, rule: Value, at: Option<usize>) -> anyhow::Result<Vec<Value>> {
+    let mut rules = group["spec"]["rules"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let at = at.unwrap_or(rules.len() + 1);
+    if at == 0 || at > rules.len() + 1 {
+        bail!(
+            "cannot add a rule at {at}: security group {} has {} rules (use 1 to {})",
+            cell(&group["name"]),
+            rules.len(),
+            rules.len() + 1
+        );
+    }
+    rules.insert(at - 1, rule);
+    Ok(rules)
+}
+
+/// 그룹의 규칙에서 `n`번(1부터)을 뺀 목록
+fn rules_without(group: &Value, n: usize) -> anyhow::Result<Vec<Value>> {
+    let mut rules = group["spec"]["rules"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if n == 0 || n > rules.len() {
+        bail!(
+            "security group {} has no rule {n} ({} rules, numbered from 1)",
+            cell(&group["name"]),
+            rules.len()
+        );
+    }
+    rules.remove(n - 1);
+    Ok(rules)
+}
+
+/// 그룹을 읽어 `edit`으로 만든 규칙 목록으로 바꾼다. 읽은 revision을 `If-Match`로 보내므로 그 사이
+/// 다른 사람이 바꿨으면 실패한다(규칙 번호가 달라졌을 수 있다).
+async fn patch_rules(
+    client: &Client,
+    group: &str,
+    edit: impl FnOnce(&Value) -> anyhow::Result<Vec<Value>>,
+) -> anyhow::Result<()> {
+    let path = format!("/security-groups/{group}");
+    let current = client.get(&path).await?;
+    let rules = edit(&current)?;
+    let r = client
+        .request(Method::PATCH, &path)
+        .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
+        .json(&json!({ "rules": rules }));
+    client.send(r).await?;
+    Ok(())
+}
+
+/// `security-group list`의 열
+const SECURITY_GROUP_HEADERS: &[&str] = &["NAME", "RULES", "DESCRIPTION"];
+
+/// `security-group list`의 한 행
+fn security_group_row(g: &Value) -> Vec<String> {
+    vec![
+        cell(&g["name"]),
+        g["spec"]["rules"]
+            .as_array()
+            .map_or(0, Vec::len)
+            .to_string(),
+        cell(&g["spec"]["description"]),
+    ]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
     Qcow2,
@@ -480,6 +646,13 @@ enum VmCmd {
     Create(Box<VmCreate>),
     /// VM 설정을 바꾼다. 실행 중이어도 된다.
     Set(VmSet),
+    /// NIC의 보안 그룹을 바꾼다. 실행 중이어도 곧바로 적용된다. 그룹을 주지 않으면 모두 뺀다.
+    NicSg {
+        vm: String,
+        /// NIC 번호(0부터, `vm get`의 nics 순서)
+        index: usize,
+        groups: Vec<String>,
+    },
     Start {
         vm: String,
     },
@@ -548,9 +721,10 @@ struct VmCreate {
     /// 붙일 볼륨 이름. 여러 번 줄 수 있고 첫 디스크로 부팅한다.
     #[arg(long = "disk")]
     disks: Vec<String>,
-    /// 연결할 네트워크 이름(`user`는 QEMU NAT). 여러 번 줄 수 있다.
-    #[arg(long = "nic")]
-    nics: Vec<String>,
+    /// 연결할 네트워크 이름(`user`는 QEMU NAT). 여러 번 줄 수 있다. `,sg=A+B`를 붙이면 그 NIC에
+    /// 보안 그룹을 건다(예: `lan,sg=web+db`).
+    #[arg(long = "nic", value_name = "NETWORK[,sg=GROUP+...]", value_parser = parse_nic)]
+    nics: Vec<NicArg>,
     #[arg(long, value_enum, default_value = "never")]
     restart: Restart,
     /// 노드 이름이나 id. 생략하면 시작할 때 스케줄러가 고른다.
@@ -562,6 +736,45 @@ struct VmCreate {
     /// HA VM: 노드가 펜싱되면 다른 노드에서 켠다. 펜싱이 켜진 노드에서만 돈다.
     #[arg(long)]
     ha: bool,
+}
+
+/// `--nic`으로 받은 네트워크와 보안 그룹
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NicArg {
+    network: String,
+    security_groups: Vec<String>,
+}
+
+/// `lan`, `lan,sg=web+db`처럼 쓴다. 그룹이 있는지는 API가 본다.
+fn parse_nic(s: &str) -> Result<NicArg, String> {
+    let bad = || format!("invalid nic {s:?}: use NETWORK or NETWORK,sg=GROUP+GROUP");
+    let (network, groups) = match s.split_once(',') {
+        Some((network, option)) => {
+            let groups = option.strip_prefix("sg=").ok_or_else(bad)?;
+            let groups: Vec<String> = groups.split('+').map(str::to_string).collect();
+            if groups.iter().any(|g| g.is_empty() || g.contains(',')) {
+                return Err(bad());
+            }
+            (network, groups)
+        }
+        None => (s, Vec::new()),
+    };
+    if network.is_empty() {
+        return Err(bad());
+    }
+    Ok(NicArg {
+        network: network.into(),
+        security_groups: groups,
+    })
+}
+
+/// `vm create`의 NIC 하나. 그룹이 없으면 `security_groups`를 보내지 않는다.
+fn nic_body(nic: &NicArg) -> Value {
+    let mut body = json!({ "network": nic.network, "model": "virtio" });
+    if !nic.security_groups.is_empty() {
+        body["security_groups"] = json!(nic.security_groups);
+    }
+    body
 }
 
 #[derive(Args)]
@@ -873,6 +1086,7 @@ where
                 writeln!(out, "network {network} deleted")?;
             }
         },
+        Cmd::SecurityGroup { cmd } => security_group(&client, cmd, json_out, out).await?,
         Cmd::Volume { cmd } => match cmd {
             VolumeCmd::List => {
                 let list = client.get("/volumes").await?;
@@ -1035,6 +1249,56 @@ where
     Ok(())
 }
 
+async fn security_group(
+    client: &Client,
+    cmd: SecurityGroupCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        SecurityGroupCmd::List => {
+            let list = client.get("/security-groups").await?;
+            print_list(
+                out,
+                json_out,
+                &list,
+                SECURITY_GROUP_HEADERS,
+                security_group_row,
+            )?;
+        }
+        SecurityGroupCmd::Get { group } => print_json(
+            out,
+            &client.get(&format!("/security-groups/{group}")).await?,
+        )?,
+        SecurityGroupCmd::Create {
+            name,
+            description,
+            rules,
+        } => {
+            let body = security_group_create_body(&name, description.as_deref(), &rules);
+            client.post("/security-groups", &body).await?;
+            writeln!(out, "security group {name} created")?;
+        }
+        SecurityGroupCmd::Delete { group } => {
+            client.delete(&format!("/security-groups/{group}")).await?;
+            writeln!(out, "security group {group} deleted")?;
+        }
+        SecurityGroupCmd::Rule {
+            cmd: RuleCmd::Add { group, rule, at },
+        } => {
+            patch_rules(client, &group, |g| rules_with(g, rule, at)).await?;
+            writeln!(out, "security group {group}: rule added")?;
+        }
+        SecurityGroupCmd::Rule {
+            cmd: RuleCmd::Rm { group, n },
+        } => {
+            patch_rules(client, &group, |g| rules_without(g, n)).await?;
+            writeln!(out, "security group {group}: rule {n} removed")?;
+        }
+    }
+    Ok(())
+}
+
 /// 이 기계의 opld에 보내는 클러스터 명령. 로그인이 필요 없다. 다른 명령이면 `None`이다.
 async fn cluster_local(
     cmd: &ClusterCmd,
@@ -1165,11 +1429,7 @@ async fn vm(
                     json!({ "volume": volume, "bus": "virtio-blk", "boot_order": boot })
                 })
                 .collect();
-            let nics: Vec<Value> = args
-                .nics
-                .iter()
-                .map(|network| json!({ "network": network, "model": "virtio" }))
-                .collect();
+            let nics: Vec<Value> = args.nics.iter().map(nic_body).collect();
             let body = json!({
                 "name": args.name,
                 "spec": {
@@ -1194,6 +1454,21 @@ async fn vm(
             put_spec_field(client, &args.vm, "ha", json!(args.ha)).await?;
             let state = if args.ha { "on" } else { "off" };
             writeln!(out, "vm {}: HA {state}", args.vm)?;
+        }
+        VmCmd::NicSg { vm, index, groups } => {
+            put_spec(client, &vm, |current| {
+                nic_groups_update(current, index, &groups)
+            })
+            .await?;
+            if groups.is_empty() {
+                writeln!(out, "vm {vm}: NIC {index} has no security groups")?;
+            } else {
+                writeln!(
+                    out,
+                    "vm {vm}: NIC {index} security groups {}",
+                    groups.join(", ")
+                )?;
+            }
         }
         VmCmd::Start { vm } => act(client, &vm, "start", out).await?,
         VmCmd::Stop { vm, force } => {
@@ -1440,13 +1715,24 @@ async fn put_schedule(client: &Client, vm: &str, schedule: Option<Value>) -> any
     .await
 }
 
-/// VM `vm`의 spec 필드 `field`를 `value`로 바꾼다. VM을 읽어 그 revision으로(`If-Match`)
-/// spec 전체를 다시 쓴다.
+/// VM `vm`의 spec 필드 `field`를 `value`로 바꾼다.
 async fn put_spec_field(
     client: &Client,
     vm: &str,
     field: &str,
     value: Value,
+) -> anyhow::Result<()> {
+    put_spec(client, vm, |current| {
+        Ok(spec_update(current, field, value.clone()))
+    })
+    .await
+}
+
+/// VM `vm`을 읽어 `body`(읽은 VM → 수정 본문)로 만든 본문을 그 revision으로(`If-Match`) 다시 쓴다.
+async fn put_spec(
+    client: &Client,
+    vm: &str,
+    body: impl Fn(&Value) -> anyhow::Result<Value>,
 ) -> anyhow::Result<()> {
     let path = format!("/vms/{vm}");
     let mut retries = SpecRetries::default();
@@ -1455,7 +1741,7 @@ async fn put_spec_field(
         let r = client
             .request(Method::PUT, &path)
             .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
-            .json(&spec_update(&current, field, value.clone()));
+            .json(&body(&current)?);
         match client.send(r).await {
             Err(e) => match retries.next(&e.to_string()) {
                 Some(delay) => tokio::time::sleep(delay).await,
@@ -1501,6 +1787,20 @@ fn spec_update(vm: &Value, field: &str, value: Value) -> Value {
     // 라벨이 없으면 응답에 `labels`가 없다.
     let labels = vm.get("labels").cloned().unwrap_or_else(|| json!({}));
     json!({ "labels": labels, "spec": spec })
+}
+
+/// VM 수정 본문: NIC `index`(0부터)의 보안 그룹만 `groups`로 바꾼다.
+fn nic_groups_update(vm: &Value, index: usize, groups: &[String]) -> anyhow::Result<Value> {
+    let mut nics = vm["spec"]["nics"].as_array().cloned().unwrap_or_default();
+    let count = nics.len();
+    let Some(nic) = nics.get_mut(index) else {
+        bail!(
+            "VM {} has no NIC {index} ({count} NICs, numbered from 0)",
+            cell(&vm["name"])
+        );
+    };
+    nic["security_groups"] = json!(groups);
+    Ok(spec_update(vm, "nics", Value::Array(nics)))
 }
 
 /// `schedule: daily, keep 7, with memory`와 마지막 예약 오류가 있으면 그 줄
@@ -3197,6 +3497,288 @@ mod tests {
             old,
         ]);
         assert!(!out.contains("warning"), "{out}");
+    }
+
+    /// 방향과 동작은 꼭, 프로토콜·포트·CIDR은 이 차례로 생략할 수 있다.
+    #[test]
+    fn parses_rules() {
+        assert_eq!(
+            parse_rule("in accept tcp 22 10.0.0.0/8"),
+            Ok(json!({
+                "direction": "in", "action": "accept", "protocol": "tcp",
+                "ports": "22", "remote": "10.0.0.0/8"
+            }))
+        );
+        assert_eq!(
+            parse_rule("out drop tcp 25"),
+            Ok(json!({ "direction": "out", "action": "drop", "protocol": "tcp", "ports": "25" }))
+        );
+        assert_eq!(
+            parse_rule("in accept icmp"),
+            Ok(json!({ "direction": "in", "action": "accept", "protocol": "icmp" }))
+        );
+        assert_eq!(
+            parse_rule("  in   accept udp 8000-8080 "),
+            Ok(json!({
+                "direction": "in", "action": "accept", "protocol": "udp", "ports": "8000-8080"
+            }))
+        );
+        assert_eq!(
+            parse_rule("out accept 2001:db8::/32"),
+            Ok(json!({ "direction": "out", "action": "accept", "remote": "2001:db8::/32" }))
+        );
+        assert_eq!(
+            parse_rule("in drop"),
+            Ok(json!({ "direction": "in", "action": "drop" }))
+        );
+        // 포트 범위와 프로토콜·포트의 짝은 서버가 본다.
+        assert_eq!(
+            parse_rule("in accept 99999"),
+            Ok(json!({ "direction": "in", "action": "accept", "ports": "99999" }))
+        );
+        for bad in [
+            "",
+            "in",
+            "accept in",
+            "up accept",
+            "in allow",
+            "in accept sctp",
+            "in accept tcp 22 10.0.0.0/8 extra",
+            "in accept 10.0.0.0/8 tcp",
+            "in accept tcp 10.0.0.0/8 22",
+            "in accept tcp ssh",
+            "in accept tcp 22-",
+            "in accept tcp -22",
+            "IN accept",
+        ] {
+            let err = parse_rule(bad).unwrap_err();
+            assert!(err.contains("in|out accept|drop"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn parses_security_group_commands() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "security-group"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::SecurityGroup { cmd } => cmd,
+                _ => unreachable!(),
+            })
+        };
+        let SecurityGroupCmd::Create {
+            name,
+            description,
+            rules,
+        } = parse(&[
+            "create",
+            "web",
+            "--description",
+            "web servers",
+            "--rule",
+            "in accept tcp 443",
+            "--rule",
+            "in accept icmp",
+        ])
+        .unwrap()
+        else {
+            panic!("not create")
+        };
+        assert_eq!(
+            security_group_create_body(&name, description.as_deref(), &rules),
+            json!({ "name": "web", "spec": {
+                "description": "web servers",
+                "rules": [
+                    { "direction": "in", "action": "accept", "protocol": "tcp", "ports": "443" },
+                    { "direction": "in", "action": "accept", "protocol": "icmp" },
+                ]
+            }})
+        );
+        // 설명이 없으면 보내지 않는다. 규칙 없는 그룹도 된다.
+        let SecurityGroupCmd::Create {
+            name,
+            description,
+            rules,
+        } = parse(&["create", "empty"]).unwrap()
+        else {
+            panic!("not create")
+        };
+        assert_eq!(
+            security_group_create_body(&name, description.as_deref(), &rules),
+            json!({ "name": "empty", "spec": { "rules": [] } })
+        );
+        assert!(parse(&["create", "web", "--rule", "in maybe"]).is_err());
+        assert!(matches!(
+            parse(&["rule", "add", "web", "out drop tcp 25", "--at", "2"]).unwrap(),
+            SecurityGroupCmd::Rule { cmd: RuleCmd::Add { group, rule, at: Some(2) } }
+                if group == "web" && rule["ports"] == "25"
+        ));
+        assert!(matches!(
+            parse(&["rule", "rm", "web", "3"]).unwrap(),
+            SecurityGroupCmd::Rule { cmd: RuleCmd::Rm { group, n: 3 } } if group == "web"
+        ));
+        assert!(parse(&["rule", "add", "web", "sideways accept"]).is_err());
+        assert!(parse(&["rule", "rm", "web", "first"]).is_err());
+        assert!(matches!(
+            parse(&["get", "web"]).unwrap(),
+            SecurityGroupCmd::Get { group } if group == "web"
+        ));
+        assert!(matches!(
+            parse(&["delete", "web"]).unwrap(),
+            SecurityGroupCmd::Delete { group } if group == "web"
+        ));
+    }
+
+    /// 규칙 번호는 1부터다. 범위 밖이면 아무것도 바꾸지 않고 실패한다.
+    #[test]
+    fn adds_and_removes_rules_by_number() {
+        let rule =
+            |n: u16| json!({ "direction": "in", "action": "accept", "ports": n.to_string() });
+        let group = json!({ "name": "web", "spec": { "rules": [rule(1), rule(2)] } });
+        assert_eq!(
+            rules_with(&group, rule(9), None).unwrap(),
+            vec![rule(1), rule(2), rule(9)]
+        );
+        assert_eq!(
+            rules_with(&group, rule(9), Some(1)).unwrap(),
+            vec![rule(9), rule(1), rule(2)]
+        );
+        assert_eq!(
+            rules_with(&group, rule(9), Some(3)).unwrap(),
+            vec![rule(1), rule(2), rule(9)]
+        );
+        for at in [0, 4] {
+            let err = rules_with(&group, rule(9), Some(at))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("use 1 to 3"), "{err}");
+        }
+        assert_eq!(rules_without(&group, 1).unwrap(), vec![rule(2)]);
+        assert_eq!(rules_without(&group, 2).unwrap(), vec![rule(1)]);
+        for n in [0, 3] {
+            let err = rules_without(&group, n).unwrap_err().to_string();
+            assert!(err.contains(&format!("has no rule {n}")), "{err}");
+        }
+        // 규칙이 없는 그룹은 응답에 rules가 비어 있다.
+        let empty = json!({ "name": "e", "spec": { "rules": [] } });
+        assert_eq!(rules_with(&empty, rule(1), None).unwrap(), vec![rule(1)]);
+        assert!(rules_without(&empty, 1).is_err());
+    }
+
+    #[test]
+    fn security_group_list_shows_rule_counts() {
+        let rows: Vec<_> = [
+            json!({ "name": "web", "spec": {
+                "description": "web servers",
+                "rules": [{ "direction": "in", "action": "accept" }, { "direction": "out", "action": "drop" }]
+            }}),
+            json!({ "name": "empty", "spec": { "rules": [] } }),
+        ]
+        .iter()
+        .map(security_group_row)
+        .collect();
+        let mut out = Vec::new();
+        table(&mut out, SECURITY_GROUP_HEADERS, &rows).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NAME   RULES  DESCRIPTION\n\
+             web    2      web servers\n\
+             empty  0      -\n"
+        );
+    }
+
+    /// `--nic NETWORK[,sg=A+B]`. 그룹이 없으면 `security_groups`를 보내지 않는다.
+    #[test]
+    fn parses_nics_with_security_groups() {
+        let nics = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "vm", "create", "web"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Vm {
+                    cmd: VmCmd::Create(c),
+                } => c.nics.iter().map(nic_body).collect::<Vec<_>>(),
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(
+            nics(&[
+                "--nic",
+                "user",
+                "--nic",
+                "lan,sg=web+db",
+                "--nic",
+                "dmz,sg=web"
+            ])
+            .unwrap(),
+            vec![
+                json!({ "network": "user", "model": "virtio" }),
+                json!({ "network": "lan", "model": "virtio", "security_groups": ["web", "db"] }),
+                json!({ "network": "dmz", "model": "virtio", "security_groups": ["web"] }),
+            ]
+        );
+        for bad in [
+            "",
+            ",sg=web",
+            "lan,",
+            "lan,sg=",
+            "lan,sg=web+",
+            "lan,sg=+web",
+            "lan,group=web",
+            "lan,sg=web,sg=db",
+        ] {
+            assert!(nics(&["--nic", bad]).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn parses_vm_nic_sg() {
+        let cli = Cli::try_parse_from(["oplctl", "vm", "nic-sg", "web", "1", "a", "b"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::NicSg { vm, index: 1, groups } }
+                if vm == "web" && groups == ["a", "b"]
+        ));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "nic-sg", "web", "0"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::NicSg { index: 0, groups, .. } } if groups.is_empty()
+        ));
+        assert!(Cli::try_parse_from(["oplctl", "vm", "nic-sg", "web"]).is_err());
+        assert!(Cli::try_parse_from(["oplctl", "vm", "nic-sg", "web", "-1"]).is_err());
+    }
+
+    /// 그 NIC의 그룹만 바꾸고 나머지(다른 NIC, 다른 필드, 라벨)는 그대로 둔다.
+    #[test]
+    fn nic_groups_update_changes_one_nic() {
+        let vm = json!({
+            "name": "web",
+            "revision": 4,
+            "labels": { "team": "a" },
+            "spec": {
+                "memory_mib": 256,
+                "nics": [
+                    { "network": "user", "model": "virtio" },
+                    { "network": "lan", "model": "virtio", "mac": "52:54:00:00:00:01", "security_groups": ["old"] },
+                ],
+            },
+        });
+        let groups = ["web".to_string(), "db".to_string()];
+        assert_eq!(
+            nic_groups_update(&vm, 1, &groups).unwrap(),
+            json!({ "labels": { "team": "a" }, "spec": {
+                "memory_mib": 256,
+                "nics": [
+                    { "network": "user", "model": "virtio" },
+                    { "network": "lan", "model": "virtio", "mac": "52:54:00:00:00:01", "security_groups": ["web", "db"] },
+                ],
+            }})
+        );
+        assert_eq!(
+            nic_groups_update(&vm, 1, &[]).unwrap()["spec"]["nics"][1]["security_groups"],
+            json!([])
+        );
+        let err = nic_groups_update(&vm, 2, &groups).unwrap_err().to_string();
+        assert_eq!(err, "VM web has no NIC 2 (2 NICs, numbered from 0)");
     }
 
     #[test]

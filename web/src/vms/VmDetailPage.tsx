@@ -312,12 +312,13 @@ function Hardware({ vm }: { vm: Vm }) {
               <TableHead>{t("vms.network")}</TableHead>
               <TableHead>{t("vms.model")}</TableHead>
               <TableHead>{t("vms.mac")}</TableHead>
+              <TableHead>{t("vmForm.securityGroups")}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {(vm.spec.nics ?? []).length === 0 && (
               <TableRow>
-                <TableCell colSpan={3} className="text-center text-muted-foreground">
+                <TableCell colSpan={4} className="text-center text-muted-foreground">
                   {t("vms.noNics")}
                 </TableCell>
               </TableRow>
@@ -327,6 +328,9 @@ function Hardware({ vm }: { vm: Vm }) {
                 <TableCell>{nic.network}</TableCell>
                 <TableCell>{nic.model}</TableCell>
                 <TableCell className="font-mono text-xs">{nic.mac ?? "—"}</TableCell>
+                <TableCell>
+                  {nic.security_groups?.length ? nic.security_groups.join(", ") : "—"}
+                </TableCell>
               </TableRow>
             ))}
           </TableBody>

@@ -20,7 +20,9 @@ it("checks values the server would reject", () => {
       { ...emptyDisk("web", 0), pool: "" },
       { ...emptyDisk("web", 1), pool: "local", bootOrder: "1" },
     ],
-    nics: [{ network: "user", model: "virtio" as const, mac: "52:54:00:12:34" }],
+    nics: [
+      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34", securityGroups: [] },
+    ],
   };
   expect(validate(v, true)).toEqual({
     name: "vmForm.errors.name",
@@ -38,7 +40,15 @@ it("round-trips a VM through the form", () => {
     spec: {
       ...vm("web", "running").spec,
       disks: [{ volume: "web-root", bus: "sata", boot_order: 1 }],
-      nics: [{ network: "lan", model: "e1000e", mac: "52:54:00:12:34:56" }],
+      nics: [
+        {
+          network: "lan",
+          model: "e1000e",
+          mac: "52:54:00:12:34:56",
+          security_groups: ["web", "db"],
+        },
+        { network: "user", model: "virtio", mac: "52:54:00:12:34:57" },
+      ],
       snapshot_schedule: { every: "daily", keep: 7, memory: true },
       ha: true,
     },
@@ -48,6 +58,22 @@ it("round-trips a VM through the form", () => {
   const plain = vm("db", "stopped");
   expect(fromVm(plain).snapshotSchedule.every).toBe("off");
   expect(toSpec(fromVm(plain), "stopped").snapshot_schedule).toBeNull();
+});
+
+it("allows up to eight security groups on an interface", () => {
+  const nic = (count: number) => ({
+    network: "lan",
+    model: "virtio" as const,
+    mac: "",
+    securityGroups: Array.from({ length: count }, (_, i) => `g${i}`),
+  });
+  const v = { ...emptyForm("q35"), name: "web", nics: [nic(8), nic(9)] };
+  expect(validate(v, true)).toEqual({ "nics.1.securityGroups": "vmForm.errors.securityGroups" });
+  // 그룹이 없는 NIC는 `security_groups`를 보내지 않는다.
+  expect(toSpec({ ...v, nics: [nic(0), nic(1)] }, "stopped").nics).toEqual([
+    { network: "lan", model: "virtio", mac: null },
+    { network: "lan", model: "virtio", mac: null, security_groups: ["g0"] },
+  ]);
 });
 
 it("checks the number of scheduled snapshots to keep only when scheduled", () => {
@@ -101,9 +127,9 @@ it("matches the server's limits on cores, boot order and MACs", () => {
       { ...emptyDisk("web", 2), pool: "local", bootOrder: "02" },
     ],
     nics: [
-      { network: "user", model: "virtio" as const, mac: "01:00:5e:00:00:01" },
-      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34:56" },
-      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34:56" },
+      { network: "user", model: "virtio" as const, mac: "01:00:5e:00:00:01", securityGroups: [] },
+      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34:56", securityGroups: [] },
+      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34:56", securityGroups: [] },
     ],
   };
   expect(validate(v, true)).toEqual({

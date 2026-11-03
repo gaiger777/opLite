@@ -1,5 +1,6 @@
 import type { components } from "@/api/schema";
 import type { Node, Vm, VmSpec } from "@/api/types";
+import { MAX_NIC_SECURITY_GROUPS } from "@/security-groups/rules";
 
 type Schemas = components["schemas"];
 
@@ -34,6 +35,8 @@ export interface NicRow {
   network: string;
   model: Schemas["NicModel"];
   mac: string;
+  /** 거는 보안 그룹 이름. `user` 네트워크는 쓸 수 없다. */
+  securityGroups: string[];
 }
 
 /** 예약 스냅샷 입력. 끄더라도 보관 개수와 메모리는 남겨 두어 다시 켤 때 쓴다. */
@@ -104,7 +107,7 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     firmware: "uefi",
     machine,
     disks: [],
-    nics: [{ network: "user", model: "virtio", mac: "" }],
+    nics: [{ network: "user", model: "virtio", mac: "", securityGroups: [] }],
     node: "",
     restart: "never",
     snapshotSchedule: { every: "off", keep: "7", memory: false },
@@ -131,7 +134,12 @@ export function fromVm(vm: Vm): VmFormValues {
       bus: d.bus,
       bootOrder: d.boot_order == null ? "" : String(d.boot_order),
     })),
-    nics: (s.nics ?? []).map((n) => ({ network: n.network, model: n.model, mac: n.mac ?? "" })),
+    nics: (s.nics ?? []).map((n) => ({
+      network: n.network,
+      model: n.model,
+      mac: n.mac ?? "",
+      securityGroups: n.security_groups ?? [],
+    })),
     node: s.node ?? "",
     restart: s.restart ?? "never",
     snapshotSchedule: s.snapshot_schedule
@@ -217,6 +225,9 @@ export function validate(
   });
   const macs = new Set<string>();
   v.nics.forEach((n, i) => {
+    if (n.securityGroups.length > MAX_NIC_SECURITY_GROUPS) {
+      errors[`nics.${i}.securityGroups`] = "vmForm.errors.securityGroups";
+    }
     if (n.mac === "") {
       return;
     }
@@ -254,6 +265,7 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
       network: n.network,
       model: n.model,
       mac: n.mac === "" ? null : n.mac.toLowerCase(),
+      ...(n.securityGroups.length > 0 && { security_groups: n.securityGroups }),
     })),
     node: v.node === "" ? null : v.node,
     power,

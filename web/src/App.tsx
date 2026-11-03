@@ -18,6 +18,8 @@ import { LoginPage } from "@/pages/LoginPage";
 import { NetworksPage } from "@/networks/NetworksPage";
 import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
+import { SecurityGroupPage } from "@/security-groups/SecurityGroupPage";
+import { SecurityGroupsPage } from "@/security-groups/SecurityGroupsPage";
 import { PoolsPage } from "@/storage/PoolsPage";
 import { VolumesPage } from "@/storage/VolumesPage";
 import { TasksPage } from "@/tasks/TasksPage";
@@ -53,6 +55,8 @@ function routes() {
             { path: "volumes", element: <VolumesPage /> },
             { path: "storage-pools", element: <PoolsPage /> },
             { path: "networks", element: <NetworksPage /> },
+            { path: "security-groups", element: <SecurityGroupsPage /> },
+            { path: "security-groups/:name", element: <SecurityGroupPage /> },
             { path: "nodes", element: <NodesPage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "users", element: <UsersPage /> },

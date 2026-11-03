@@ -1,4 +1,13 @@
-import type { Node, Snapshot, StoragePool, Task, Vm, Volume } from "@/api/types";
+import type {
+  Node,
+  Rule,
+  SecurityGroup,
+  Snapshot,
+  StoragePool,
+  Task,
+  Vm,
+  Volume,
+} from "@/api/types";
 import type { PoolState } from "@/storage/pools";
 
 /** 테스트용 VM. 필요한 필드만 바꿔 쓴다. */
@@ -118,5 +127,21 @@ export function snapshot(
       ...extra.spec,
     },
     status: { phase: "ready", created_at: 1_792_000_000, vmstate_bytes: null, ...extra.status },
+  };
+}
+
+/** 테스트용 보안 그룹 */
+export function securityGroup(
+  name: string,
+  rules: Rule[] = [],
+  description?: string,
+): SecurityGroup {
+  return {
+    id: `019a0f3c-0000-7000-8005-${name.padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: { rules, ...(description && { description }) },
+    status: {},
   };
 }

@@ -31,9 +31,16 @@ function signedOut() {
       signedIn = false;
       return new HttpResponse(null, { status: 204 });
     }),
-    ...["/vms", "/volumes", "/storage-pools", "/nodes", "/tasks", "/networks", "/snapshots"].map(
-      (path) => http.get(apiUrl(path), () => HttpResponse.json({ revision: 1, items: [] })),
-    ),
+    ...[
+      "/vms",
+      "/volumes",
+      "/storage-pools",
+      "/nodes",
+      "/tasks",
+      "/networks",
+      "/snapshots",
+      "/security-groups",
+    ].map((path) => http.get(apiUrl(path), () => HttpResponse.json({ revision: 1, items: [] }))),
     ws.link(`ws://${window.location.host}/api/v1/watch`).addEventListener("connection", () => {}),
     http.get(apiUrl("/cluster"), () =>
       HttpResponse.json({ name: "lab", ca_fingerprint: "x", node: admin.user, members: [] }),

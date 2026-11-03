@@ -41,7 +41,9 @@
     "no_capacity": "The target node cannot take this VM: {{message}}",
     "task_failed": "Task error: {{message}}",
     "internal": "The server failed: {{message}}",
-    "ha_unsupported": "The node has fencing off and cannot run HA VMs."
+    "ha_unsupported": "The node has fencing off and cannot run HA VMs.",
+    "firewall_unsupported": "The node has no firewall (nftables) and cannot run VMs with security groups.",
+    "security_group_in_use": "A VM interface uses this security group. Remove it from the VM first."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -49,6 +51,7 @@
     "volumes": "Volumes",
     "pools": "Storage pools",
     "networks": "Networks",
+    "securityGroups": "Security groups",
     "nodes": "Nodes",
     "tasks": "Tasks",
     "users": "Users",
@@ -504,6 +507,54 @@
       "mtu": "Use a number from 1280 to 9000."
     }
   },
+  "securityGroups": {
+    "note": "Firewall rules for VM interfaces. Nodes with nftables apply them right away, also to running VMs.",
+    "rules": "Rules",
+    "description": "Description",
+    "descriptionOptional": "Description (optional)",
+    "vms": "VMs",
+    "empty": "No security groups.",
+    "inUse": "Remove it from the VM interfaces first.",
+    "createTitle": "Create a security group",
+    "createDescription": "Creates an empty group. Add its rules on the next page.",
+    "created": "Created security group {{name}}.",
+    "deleteTitle": "Delete security group {{name}}?",
+    "deleteDescription": "No VM interface uses it, so no traffic changes.",
+    "deleted": "Deleted security group {{name}}.",
+    "notFound": "Security group {{name}} not found",
+    "saved": "Saved security group {{name}}.",
+    "order": "Rules are checked from the top, and the first match decides. An interface with groups drops incoming traffic that no rule accepts and sends outgoing traffic that no rule drops. With several groups, the first group's rules come first.",
+    "always": "Always allowed: replies to allowed traffic, ARP, IPv6 neighbor discovery and DHCP replies. A VM can only send from its own MAC address.",
+    "direction": "Direction",
+    "action": "Action",
+    "protocol": "Protocol",
+    "ports": "Ports",
+    "remote": "Remote CIDR",
+    "directionN": "Direction of rule {{n}}",
+    "actionN": "Action of rule {{n}}",
+    "protocolN": "Protocol of rule {{n}}",
+    "portsN": "Ports of rule {{n}}",
+    "remoteN": "Remote CIDR of rule {{n}}",
+    "in": "In (to the VM)",
+    "out": "Out (from the VM)",
+    "accept": "Accept",
+    "drop": "Drop",
+    "any": "Any",
+    "anyPort": "Any port",
+    "anywhere": "Anywhere",
+    "moveUp": "Move rule {{n}} up",
+    "moveDown": "Move rule {{n}} down",
+    "removeRule": "Remove rule {{n}}",
+    "addRule": "Add a rule",
+    "noRules": "No rules: incoming traffic is dropped and outgoing traffic is sent.",
+    "errors": {
+      "description": "Use at most 200 characters.",
+      "ports": "Use a port like 22 or a range like 8000-8080 (1–65535).",
+      "remote": "Use a CIDR like 10.0.0.0/8 or 2001:db8::/32.",
+      "icmpRemote": "ICMP rules take only IPv4 addresses.",
+      "icmpv6Remote": "ICMPv6 rules take only IPv6 addresses."
+    }
+  },
   "nodes": {
     "address": "API address",
     "underlay": "Underlay address",
@@ -624,7 +675,7 @@
   "vmForm": {
     "createTitle": "Create a virtual machine",
     "editTitle": "Edit {{name}}",
-    "runningNote": "The VM is running: its node and disks cannot change. Other changes apply from the next start.",
+    "runningNote": "The VM is running: its node, disks, and the number, order and MAC addresses of its interfaces cannot change, and if an interface has security groups, only the groups of the interfaces can change. Security groups apply right away; other changes apply from the next start.",
     "general": "General",
     "cores": "vCPU cores",
     "memory": "Memory (MiB)",
@@ -642,6 +693,10 @@
     "macAuto": "Automatic",
     "removeNic": "Remove interface {{n}}",
     "addNic": "Add an interface",
+    "nicsRunning": "Interfaces cannot be added or removed, and their MAC addresses cannot change, while the VM is running.",
+    "securityGroups": "Security groups",
+    "nicGroups": "Security groups of interface {{n}}",
+    "noSecurityGroups": "No security groups. Create them on the Security groups page.",
     "startAfter": "Start after creating",
     "reload": "Reload",
     "errors": {
@@ -658,7 +713,8 @@
       "volumeExists": "A volume with this name already exists.",
       "macMulticast": "A multicast address (odd first byte) cannot be used.",
       "macDuplicate": "Each interface needs a different MAC address.",
-      "keep": "From 1 to 100."
+      "keep": "From 1 to 100.",
+      "securityGroups": "Choose at most 8 security groups."
     },
     "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",

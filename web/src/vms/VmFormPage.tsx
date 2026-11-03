@@ -51,6 +51,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const nodes = useList("node");
   const pools = useList("storage-pool");
   const networks = useList("network");
+  const securityGroups = useList("security-group");
   const volumes = useList("volume");
   const [values, setValues] = useState(initial);
   const [revision, setRevision] = useState(vm?.revision);
@@ -63,7 +64,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const abort = useRef<AbortController | null>(null);
   useEffect(() => () => abort.current?.abort(), []);
   const creating = vm === undefined;
-  // 멈추지 않은 VM(서버의 `is_stopped`가 아닌)의 노드와 디스크는 서버가 바꾸지 않는다.
+  // 멈추지 않은 VM(서버의 `is_stopped`가 아닌)의 노드·디스크와 NIC 개수·순서·MAC은 서버가 바꾸지 않는다.
   const locked = !creating && !isStopped(vm);
 
   const change = (patch: Partial<VmFormValues>) => setValues((v) => ({ ...v, ...patch }));
@@ -201,6 +202,8 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           onChange={change}
           onRowsChange={(nics) => changeRows({ nics })}
           networks={networks.data}
+          securityGroups={securityGroups.data}
+          locked={locked}
         />
         <ScheduleSection values={values} errors={errors} onChange={change} support={support} />
 

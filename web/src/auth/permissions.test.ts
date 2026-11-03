@@ -9,6 +9,10 @@ it("mirrors the server roles", () => {
   expect(can("viewer", "operate", "vm")).toBe(false);
   // 스냅샷 목록은 누구나 읽는다. 만들기·되돌리기·삭제는 서버처럼 VM 동작 권한으로 따진다.
   expect(can("viewer", "read", "snapshot")).toBe(true);
+  // 보안 그룹은 누구나 읽고 admin만 바꾼다.
+  expect(can("viewer", "read", "security-group")).toBe(true);
+  expect(can("operator", "write", "security-group")).toBe(false);
+  expect(can("admin", "write", "security-group")).toBe(true);
 });
 
 it("keeps accounts to admins", () => {

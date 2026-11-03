@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import type { List } from "@/api/live";
 import type { Task } from "@/api/types";
-import { NODE, pool, task, vm, volume } from "@/test/fixtures";
+import { NODE, pool, securityGroup, task, vm, volume } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
@@ -170,6 +170,27 @@ it("locks the node of a VM that should run even if it has failed", async () => {
   expect(screen.queryByRole("button", { name: "Attach a volume" })).not.toBeInTheDocument();
 });
 
+it("keeps the interfaces and MAC addresses of a running VM", async () => {
+  const web = vm("web", "running", {
+    spec: {
+      ...vm("web", "running").spec,
+      nics: [{ network: "user", model: "virtio", mac: "52:54:00:00:00:01" }],
+    },
+  });
+  mockLists({ vm: [web], node: [NODE] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  expect(await screen.findByLabelText("MAC address")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Remove interface 1" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Add an interface" })).not.toBeInTheDocument();
+  expect(
+    screen.getByText(
+      "Interfaces cannot be added or removed, and their MAC addresses cannot change, while the VM is running.",
+    ),
+  ).toBeInTheDocument();
+  // 네트워크와 모델은 바꿀 수 있다(다음 시작부터).
+  expect(screen.getByLabelText("Network")).toBeEnabled();
+});
+
 it("keeps created volumes when the VM cannot be created, and does not recreate them", async () => {
   mockLists({ node: [NODE], "storage-pool": [pool("local")] });
   const volumes: string[] = [];
@@ -273,6 +294,71 @@ it("allows at most 16 network interfaces", async () => {
   }
   expect(screen.getAllByRole("group", { name: /^Network interface/ })).toHaveLength(16);
   expect(screen.queryByRole("button", { name: "Add an interface" })).not.toBeInTheDocument();
+});
+
+it("changes the security groups of a running VM's interfaces", async () => {
+  const web = vm("web", "running", {
+    spec: {
+      ...vm("web", "running").spec,
+      nics: [
+        { network: "lan", model: "virtio", mac: "52:54:00:00:00:01", security_groups: ["ssh"] },
+        { network: "user", model: "virtio", mac: "52:54:00:00:00:02" },
+      ],
+    },
+  });
+  mockLists({
+    vm: [web],
+    node: [NODE],
+    network: [{ id: "net", name: "lan", revision: 1, labels: {}, spec: { bridge: "br0" } }],
+    "security-group": [securityGroup("web"), securityGroup("ssh")],
+  });
+  let body: { spec: { nics: unknown } } | undefined;
+  server.use(
+    http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+      body = (await request.json()) as typeof body;
+      return HttpResponse.json(web);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  const groups = await screen.findByRole("group", {
+    name: "Security groups of interface 1",
+  });
+  expect(await within(groups).findByRole("checkbox", { name: "web" })).not.toBeChecked();
+  expect(within(groups).getByRole("checkbox", { name: "ssh" })).toBeChecked();
+  // user 네트워크(NAT)에는 그룹을 걸 수 없다.
+  expect(
+    screen.queryByRole("group", { name: "Security groups of interface 2" }),
+  ).not.toBeInTheDocument();
+  await user.click(within(groups).getByRole("checkbox", { name: "web" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await vi.waitFor(() => expect(body).toBeDefined());
+  expect(body!.spec.nics).toEqual([
+    {
+      network: "lan",
+      model: "virtio",
+      mac: "52:54:00:00:00:01",
+      security_groups: ["ssh", "web"],
+    },
+    { network: "user", model: "virtio", mac: "52:54:00:00:00:02" },
+  ]);
+});
+
+it("drops the security groups of an interface moved to the user network", async () => {
+  mockLists({
+    node: [NODE],
+    network: [{ id: "net", name: "lan", revision: 1, labels: {}, spec: { bridge: "br0" } }],
+    "security-group": [securityGroup("ssh")],
+  });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  const nic = await screen.findByRole("group", { name: "Network interface 1" });
+  await within(nic).findByRole("option", { name: "lan" });
+  await user.selectOptions(within(nic).getByLabelText("Network"), "lan");
+  await user.click(await within(nic).findByRole("checkbox", { name: "ssh" }));
+  await user.selectOptions(within(nic).getByLabelText("Network"), "user");
+  await user.selectOptions(within(nic).getByLabelText("Network"), "lan");
+  expect(within(nic).getByRole("checkbox", { name: "ssh" })).not.toBeChecked();
 });
 
 it("says why the create page cannot load", async () => {

@@ -60,6 +60,9 @@ it("translates API error codes and falls back to the server message", async () =
   expect(errorMessage(t, new ApiError(400, "machine_arch_mismatch", "virt on x86_64"))).toBe(
     "The machine type doesn't match the selected node's architecture.",
   );
+  expect(
+    errorMessage(t, new ApiError(409, "firewall_unsupported", 'node "n1" has no firewall')),
+  ).toBe("The node has no firewall (nftables) and cannot run VMs with security groups.");
   expect(errorMessage(t, new ApiError(400, "invalid_request", "memory_mib must be > 0"))).toBe(
     "memory_mib must be > 0",
   );
