@@ -480,6 +480,8 @@ pub struct FakeStorage {
     timing_out_creates: std::sync::Mutex<Vec<Uuid>>,
     /// `copy_volume`으로 만든 볼륨과 그 형식
     copy_formats: std::sync::Mutex<Vec<(Uuid, ImageFormat)>>,
+    /// `import_volume`으로 만든 볼륨과 그 형식
+    import_formats: std::sync::Mutex<Vec<(Uuid, ImageFormat)>>,
     /// `resize_volume`이 크기를 이 단위로 올린다(LVM의 extent처럼). 0이면 그대로다.
     resize_unit: std::sync::Mutex<u64>,
     /// `snapshot_many`로 한 번에 찍은 볼륨들
@@ -589,6 +591,11 @@ impl FakeStorage {
         self.copy_formats.lock().unwrap().clone()
     }
 
+    /// `import_volume`으로 만든 볼륨과 그 형식
+    pub fn import_formats(&self) -> Vec<(Uuid, ImageFormat)> {
+        self.import_formats.lock().unwrap().clone()
+    }
+
     pub fn pause(&self) {
         self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -625,18 +632,21 @@ impl Storage for FakeStorage {
         self.set_size(id, size_bytes);
         Ok(PathBuf::new())
     }
+    /// 호출을 `import`로 적고 형식을 남긴다. 원본 파일은 읽지 않는다.
     async fn import_volume(
         &self,
         _: &StoragePool,
-        _: Uuid,
+        id: Uuid,
         _: &Path,
         _: SourceFormat,
-        _: ImageFormat,
+        format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        Err(DriverError::InvalidSpec("not supported".into()))
+        self.record("import", id).await;
+        self.import_formats.lock().unwrap().push((id, format));
+        Ok(PathBuf::new())
     }
     async fn check_import_source(&self, _: &Path, _: SourceFormat) -> Result<(), DriverError> {
-        Err(DriverError::InvalidSpec("not supported".into()))
+        Ok(())
     }
     async fn delete_volume(
         &self,

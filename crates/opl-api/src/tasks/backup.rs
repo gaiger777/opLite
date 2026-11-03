@@ -1,7 +1,9 @@
-//! 백업 Task(설계 §2.3)와 백업 지우기 Task. 백업은 VM의 줄에 서서 그 VM의 스냅샷·복제 Task와 차례로
-//! 돌고, 지우기는 백업의 줄에 선다. API가 확인한 뒤 줄에서 기다리는 사이 VM이나 풀이 바뀌었을 수
-//! 있으므로 다시 확인한다.
+//! 백업 Task(설계 §2.3), 백업 지우기 Task, 복원 Task(설계 §2.4). 백업은 VM의 줄에 서서 그 VM의
+//! 스냅샷·복제 Task와 차례로 돌고, 지우기와 복원은 백업의 줄에 선다. API가 확인한 뒤 줄에서 기다리는
+//! 사이 VM이나 풀이 바뀌었을 수 있으므로 다시 확인한다.
 
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use opl_cluster::ClusterError;
@@ -12,18 +14,22 @@ use opl_types::backup::{
     MANIFEST_VERSION, backup_dir,
 };
 use opl_types::node::NodeSpec;
+use opl_types::resource::Resource;
+use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
-    StoragePool, StoragePoolSpec, Volume, pool_error_on, pool_listed_on, pool_usable_on,
+    SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumeSpec, pool_error_on, pool_listed_on,
+    pool_usable_on,
 };
 use opl_types::task::Task;
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
-use super::Ctx;
+use super::clone::{copy_format, create_vm, made, volume_name};
 use super::snapshot::{
     check_local, check_settled, copy_file, fetch_vars, get_vm, is_down, now_secs, ready_disks,
     remove_tags, take_tags,
 };
+use super::{Ctx, mark_ready};
 
 /// 백업 디렉터리 안의 UEFI 변수 파일 이름
 pub(super) const VARS_FILE: &str = "vars.fd";
@@ -38,9 +44,9 @@ fn temp_tag(backup: Uuid) -> String {
     backup.simple().to_string()
 }
 
-/// 백업 풀 `name`과 이 노드에서 그 풀의 루트. 풀이 이 노드에서 준비되지 않았으면(마운트되지 않은 NFS
-/// 풀의 빈 마운트 지점에 쓰지 않는다) 오류다.
-fn backup_root(ctx: &Ctx, name: &str) -> Result<(StoragePool, PathBuf), String> {
+/// 이 노드에서 준비된 풀 `name`. 준비되지 않았으면(마운트되지 않은 NFS 풀의 빈 마운트 지점에 쓰지
+/// 않는다) 오류다.
+fn ready_pool(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
     let pool = ctx
         .cluster
         .get_by_name::<StoragePoolSpec>(name)
@@ -62,6 +68,12 @@ fn backup_root(ctx: &Ctx, name: &str) -> Result<(StoragePool, PathBuf), String> 
             pool_error_on(&pool, &me)
         ));
     }
+    Ok(pool)
+}
+
+/// 백업 풀 `name`과 이 노드에서 그 풀의 루트. 풀이 이 노드에서 준비되지 않았으면 오류다.
+fn backup_root(ctx: &Ctx, name: &str) -> Result<(StoragePool, PathBuf), String> {
+    let pool = ready_pool(ctx, name)?;
     let root = check_pool_root(&pool, &ctx.config.mount_root)
         .map_err(|e| format!("storage pool {name:?}: {e}"))?;
     Ok((pool, root))
@@ -394,4 +406,143 @@ pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<(), String> {
         Ok(_) | Err(ClusterError::Rejected(Rejection::NotFound { .. })) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// 백업 디렉터리의 매니페스트를 읽는다. 형식 버전이 다르면 나머지를 읽지 않고 오류다.
+async fn read_manifest(dir: &Path) -> Result<BackupManifest, String> {
+    let text = tokio::fs::read(dir.join(MANIFEST_FILE))
+        .await
+        .map_err(|e| format!("cannot read backup manifest: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&text).map_err(|e| format!("invalid backup manifest: {e}"))?;
+    let version = value.get("version").and_then(|v| v.as_u64());
+    if version != Some(MANIFEST_VERSION.into()) {
+        let version = version.map_or("unknown".into(), |v| v.to_string());
+        return Err(format!(
+            "backup manifest version {version} is not supported (this node reads version {MANIFEST_VERSION})"
+        ));
+    }
+    serde_json::from_value(value).map_err(|e| format!("invalid backup manifest: {e}"))
+}
+
+/// 백업 디렉터리 `dir` 안의 일반 파일 `file`의 경로. 심볼릭 링크(디렉터리 밖을 가리킬 수 있다)나 다른
+/// 종류의 파일이면 오류다.
+async fn regular_file(dir: &Path, file: &str) -> Result<PathBuf, String> {
+    let path = dir.join(file);
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(m) if m.file_type().is_file() => Ok(path),
+        Ok(_) => Err(format!("{file} is not a regular file")),
+        Err(e) => Err(format!("cannot read {file}: {e}")),
+    }
+}
+
+/// `ready` 백업 `id`를 새 VM `name`(id는 Task의 대상)으로 되살린다(설계 §2.4): 매니페스트의 디스크마다
+/// 풀 `pool`에 새 볼륨 `{name}-disk{i}`를 만들어 백업 파일을 쓰고(블록 풀이면 raw, 아니면 qcow2),
+/// UEFI 변수를 복사한 뒤 백업 리소스에 적힌 VM 스펙으로 꺼진 VM을 만든다(새 MAC, 노드·예약·HA 없음).
+/// 매니페스트는 그 기록과 같아야 한다. 공유가 아닌 풀의 백업은 파일을 쓴 노드에서만 되살린다.
+/// 실패하면 실행기의 정리(복제와 같은 [`super::clone::discard`])가 만든 볼륨과 변수 사본을 지운다.
+pub(super) async fn restore(
+    ctx: &Ctx,
+    task: &Task,
+    id: Uuid,
+    name: &str,
+    pool: &str,
+) -> Result<(), String> {
+    let backup = get_backup(ctx, id)?.ok_or("backup was deleted")?;
+    if backup.status.phase != BackupPhase::Ready {
+        return Err("backup is not ready".into());
+    }
+    if ctx
+        .cluster
+        .get_by_name::<VmSpec>(name)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Err(format!("VM {name:?} already exists"));
+    }
+    if let Some(node) = backup.status.node.filter(|n| *n != ctx.config.node) {
+        return Err(format!("backup is stored on node {node}"));
+    }
+    let (source, root) = backup_root(ctx, &backup.spec.pool)?;
+    let target = ready_pool(ctx, pool)?;
+    let dir = backup_dir(&root, id);
+    let manifest = read_manifest(&dir).await?;
+    let spec = &backup.spec.vm_spec;
+    if manifest.backup != id
+        || manifest.vm_spec != *spec
+        || manifest.disks.len() != spec.disks.len()
+    {
+        return Err("backup manifest does not match the backup record".into());
+    }
+
+    let (_, volumes) = ctx
+        .cluster
+        .list::<VolumeSpec>()
+        .map_err(|e| e.to_string())?;
+    let mut taken: HashSet<String> = volumes.into_iter().map(|v| v.name).collect();
+    let format = copy_format(&source, &target, ImageFormat::Qcow2);
+    let mut copies: Vec<Volume> = Vec::with_capacity(manifest.disks.len());
+    for disk in &manifest.disks {
+        let failed =
+            |e: &dyn std::fmt::Display| format!("cannot restore disk {:?}: {e}", disk.name);
+        // 파일은 백업 디렉터리 바로 안에 있어야 한다. 다른 파일을 참조하는 이미지도 받지 않는다.
+        if Path::new(&disk.file).file_name() != Some(OsStr::new(&disk.file)) {
+            return Err(failed(&format!("invalid file name {:?}", disk.file)));
+        }
+        let file = regular_file(&dir, &disk.file)
+            .await
+            .map_err(|e| failed(&e))?;
+        ctx.storage
+            .check_import_source(&file, SourceFormat::Qcow2)
+            .await
+            .map_err(|e| failed(&e))?;
+        let copy_name = volume_name(name, &disk.name, |n| taken.contains(n));
+        taken.insert(copy_name.clone());
+        let mut copy: Volume = Resource::new(
+            copy_name,
+            VolumeSpec {
+                pool: target.name.clone(),
+                size_bytes: disk.virtual_bytes,
+                format,
+            },
+        );
+        copy.status.node = Some(ctx.config.node);
+        // 만들기 전에 적는다. 만들기가 끝났는지 모르는 채 끊겨도 정리가 찾는다.
+        made(ctx, task.id, |m| m.volumes.push(copy.id));
+        ctx.cluster
+            .create(&copy)
+            .await
+            .map_err(|e| format!("cannot create volume {:?}: {e}", copy.name))?;
+        ctx.storage
+            .import_volume(&target, copy.id, &file, SourceFormat::Qcow2, format)
+            .await
+            .map_err(|e| failed(&e))?;
+        copies.push(copy);
+    }
+
+    let mut new: Vm = Resource::new(name, backup.spec.vm_spec.clone());
+    new.id = task.spec.target;
+    if manifest.uefi_vars
+        && let Some(state) = &ctx.config.state_dir
+    {
+        let vars = regular_file(&dir, VARS_FILE).await?;
+        let to = uefi_vars_path(state, new.id);
+        made(ctx, task.id, |m| m.vars = Some(to.clone()));
+        copy_file(&vars, &to)
+            .await
+            .map_err(|e| format!("cannot copy UEFI variables: {e}"))?;
+        // 새 VM의 변수는 이 노드에 있다. 다른 노드에서 켜면 여기서 받아 간다.
+        new.status.firmware_node = Some(ctx.config.node);
+    }
+    for copy in &copies {
+        mark_ready(ctx, copy, &target).await;
+    }
+    for (disk, copy) in new.spec.disks.iter_mut().zip(&copies) {
+        disk.volume = copy.name.clone();
+    }
+    new.spec.ha = false;
+    new.spec
+        .validate()
+        .map_err(|e| format!("invalid VM spec in backup: {e}"))?;
+    create_vm(ctx, task, new).await
 }

@@ -587,10 +587,10 @@ async fn execute(ctx: &Ctx, task: Task) {
     }
     // 시간을 넘겨 버린 작업은 끝나지 않았다(명령이 아직 돌 수 있다). 마이그레이션은 단계마다
     // 시간 제한이 있고(`migration_timeout`, RPC 기한), 확정 쓰기 도중에 버리면 안 되므로 감싸지 않는다.
-    // 백업은 디스크 크기만큼 오래 걸릴 수 있으므로 시간 제한을 두지 않는다(설계 §2.3).
+    // 백업과 복원은 디스크 크기만큼 오래 걸릴 수 있으므로 시간 제한을 두지 않는다(설계 §2.3).
     let unlimited = matches!(
         task.spec.op,
-        TaskOp::VmMigrate { .. } | TaskOp::VmBackup { .. }
+        TaskOp::VmMigrate { .. } | TaskOp::VmBackup { .. } | TaskOp::BackupRestore { .. }
     );
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task).await, false)
@@ -629,7 +629,7 @@ async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
     set_status(ctx, task.id, TaskState::Failed, Some(error)).await;
 }
 
-/// 실패한 볼륨 생성·가져오기, 스냅샷 만들기, 복제의 흔적을 지워 이름을 다시 쓸 수 있게 한다. 실패한
+/// 실패한 볼륨 생성·가져오기, 스냅샷 만들기, 복제·복원의 흔적을 지워 이름을 다시 쓸 수 있게 한다. 실패한
 /// 백업은 디렉터리를 지우고 `failed`와 `error`를 남긴다.
 /// 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
 /// 재시작으로 중단) 작업이 아직 돌고 있을 수 있어 태그를 두고 리소스만 지운다(설계 §6 "태그만 남은 경우").
@@ -646,7 +646,7 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     if let TaskOp::VolumeImport { source, .. } = &task.spec.op {
         let _ = tokio::fs::remove_file(source).await;
     }
-    if let TaskOp::VmClone { .. } = task.spec.op {
+    if let TaskOp::VmClone { .. } | TaskOp::BackupRestore { .. } = task.spec.op {
         clone::discard(ctx, task.id).await;
     }
     if let TaskOp::VmBackup { backup } = task.spec.op {
@@ -746,9 +746,8 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
         TaskOp::VmHaRecover { .. } => Err("an HA recovery task is a record and is not run".into()),
         TaskOp::VmBackup { backup } => backup::backup(ctx, task, *backup).await,
         TaskOp::BackupDelete => backup::delete(ctx, id).await,
-        // 복원 실행은 아직 없다.
-        TaskOp::BackupRestore { .. } => {
-            Err("restoring backups is not supported by this node yet".into())
+        TaskOp::BackupRestore { backup, name, pool } => {
+            backup::restore(ctx, task, *backup, name, pool).await
         }
     }
 }

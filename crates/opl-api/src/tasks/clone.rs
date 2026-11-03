@@ -27,22 +27,22 @@ use crate::volumes::block_pool_kind;
 /// 리소스 이름의 최대 길이
 const MAX_NAME: usize = 63;
 
-/// 복제 Task가 지금까지 만든 것. Task가 실패하거나 시간이 다 되면 실행기의 정리([`discard`])가
+/// 복제(와 복원) Task가 지금까지 만든 것. Task가 실패하거나 시간이 다 되면 실행기의 정리([`discard`])가
 /// 지운다. opld가 죽으면 사라진다. 복사 중이던 볼륨은 아직 `pending`이라 다음 시작의 고아 정리가
 /// 지우지만(볼륨은 모두 복사한 뒤 VM을 만들기 바로 전에 `ready`로 바꾼다), `ready`로 바꾼 뒤 VM을
 /// 만들기 전에 죽으면 볼륨과 UEFI 변수 사본이 남는다(설계 §11).
 #[derive(Default)]
 pub(super) struct Made {
-    volumes: Vec<Uuid>,
-    vars: Option<PathBuf>,
+    pub(super) volumes: Vec<Uuid>,
+    pub(super) vars: Option<PathBuf>,
 }
 
-fn made(ctx: &Ctx, task: Uuid, f: impl FnOnce(&mut Made)) {
+pub(super) fn made(ctx: &Ctx, task: Uuid, f: impl FnOnce(&mut Made)) {
     f(ctx.cloned.lock().unwrap().entry(task).or_default());
 }
 
 /// 새 볼륨 이름 `{vm}-{volume}`. 63자로 자르고, `taken`이면 `-2`, `-3`…을 붙인다(붙인 뒤에도 63자).
-fn volume_name(vm: &str, volume: &str, taken: impl Fn(&str) -> bool) -> String {
+pub(super) fn volume_name(vm: &str, volume: &str, taken: impl Fn(&str) -> bool) -> String {
     let base = format!("{vm}-{volume}");
     // 이름은 ASCII다. 자른 끝이 `-`면 이름 규칙에 어긋나므로 뗀다.
     let cut = |max: usize| {
@@ -65,7 +65,11 @@ fn volume_name(vm: &str, volume: &str, taken: impl Fn(&str) -> bool) -> String {
 
 /// 복사본의 형식(설계 §5): 블록 풀(LVM-thin, ZFS, RBD, 공유 LVM)은 raw만 담는다. 블록 볼륨(raw)을
 /// 파일 풀로 옮기면 그 풀에서 스냅샷을 담을 수 있는 qcow2로 바꾼다. 그 밖에는 원본 형식 그대로다.
-fn copy_format(source: &StoragePool, target: &StoragePool, format: ImageFormat) -> ImageFormat {
+pub(super) fn copy_format(
+    source: &StoragePool,
+    target: &StoragePool,
+    format: ImageFormat,
+) -> ImageFormat {
     match (
         block_pool_kind(source).is_some(),
         block_pool_kind(target).is_some(),
@@ -216,6 +220,13 @@ pub(super) async fn clone(
     for (disk, (copy, _)) in new.spec.disks.iter_mut().zip(&copies) {
         disk.volume = copy.name.clone();
     }
+    create_vm(ctx, task, new).await
+}
+
+/// 복제·복원이 만든 새 VM `new`를 저장소에 만든다: MAC을 새로 받고, 노드·예약 없이 꺼진 VM이다.
+/// 성공하면 Task가 만든 것을 더는 정리하지 않는다.
+pub(super) async fn create_vm(ctx: &Ctx, task: &Task, mut new: Vm) -> Result<(), String> {
+    let name = new.name.clone();
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
     let mut used: BTreeSet<MacAddr> = vms
         .iter()
@@ -243,7 +254,7 @@ pub(super) async fn clone(
     Ok(())
 }
 
-/// 실패한 복제가 만든 볼륨(파일과 리소스)과 UEFI 변수 사본을 지운다.
+/// 실패한 복제(와 복원)가 만든 볼륨(파일과 리소스)과 UEFI 변수 사본을 지운다.
 pub(super) async fn discard(ctx: &Ctx, task: Uuid) {
     let Some(made) = ctx.cloned.lock().unwrap().remove(&task) else {
         return;
