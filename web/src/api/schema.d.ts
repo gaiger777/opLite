@@ -970,6 +970,12 @@ export interface components {
                     pools: {
                         [key: string]: components["schemas"]["PoolState"];
                     };
+                    /**
+                     * Format: ip
+                     * @description VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
+                     *     None).
+                     */
+                    underlay?: string;
                 };
             }[];
             /** Format: int64 */
@@ -1362,6 +1368,12 @@ export interface components {
             pools: {
                 [key: string]: components["schemas"]["PoolState"];
             };
+            /**
+             * Format: ip
+             * @description VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
+             *     None).
+             */
+            underlay?: string;
         };
         PoolBackend: {
             /** @enum {string} */
@@ -1548,6 +1560,12 @@ export interface components {
                 pools: {
                     [key: string]: components["schemas"]["PoolState"];
                 };
+                /**
+                 * Format: ip
+                 * @description VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
+                 *     None).
+                 */
+                underlay?: string;
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */

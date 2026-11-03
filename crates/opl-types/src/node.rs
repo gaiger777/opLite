@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,6 +50,14 @@ pub struct NodeStatus {
     // 없으면 빼고 쓰므로 API 문서에서도 null·기본값이 아니라 선택 필드다.
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub ha: Option<NodeHa>,
+    /// VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
+    /// None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = String, format = "ip", nullable = false, default)
+    )]
+    pub underlay: Option<IpAddr>,
 }
 
 /// 노드가 등록할 때 쓰는 HA 펜싱 설정
@@ -141,6 +150,21 @@ mod tests {
             serde_json::to_value(Fencing::Process).unwrap(),
             serde_json::json!("process")
         );
+    }
+
+    #[test]
+    fn status_underlay_round_trips_and_is_omitted_when_none() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("underlay").is_none(), "{none}");
+        for ip in ["10.0.0.11", "fd00::11"] {
+            let status = NodeStatus {
+                underlay: Some(ip.parse().unwrap()),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(json["underlay"], ip);
+            assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+        }
     }
 
     #[test]

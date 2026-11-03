@@ -133,6 +133,7 @@ impl Env {
             arch: Some(Arch::Aarch64),
             pools: Default::default(),
             ha: None,
+            underlay: None,
         };
         cluster.create(&me).await.unwrap();
         let admin = Resource::new(

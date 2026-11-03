@@ -81,6 +81,7 @@ async fn node_with(
             fencing: Fencing::Process,
             recover_after_secs: secs,
         }),
+        underlay: None,
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();

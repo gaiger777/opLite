@@ -160,6 +160,7 @@ mod tests {
             arch: Some(Arch::Aarch64),
             pools: Default::default(),
             ha: None,
+            underlay: None,
         };
         n
     }

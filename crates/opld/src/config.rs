@@ -58,6 +58,8 @@ pub struct Config {
     pub migration: MigrationSection,
     #[serde(default)]
     pub ha: HaSection,
+    #[serde(default)]
+    pub network: NetworkSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -349,6 +351,25 @@ impl HaSection {
     }
 }
 
+/// 노드 네트워크(VXLAN). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSection {
+    /// VXLAN 패킷을 주고받을 이 노드의 주소. 없으면 `address`가 IP면 그것, 이름이면 시작할 때 푼
+    /// 주소(loopback·link-local은 빼고 IPv4 먼저)다.
+    #[serde(default)]
+    pub underlay: Option<IpAddr>,
+}
+
+/// 노드 underlay를 정하는 방법
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnderlaySource<'a> {
+    /// 설정했거나 `address`가 IP 리터럴이다.
+    Ip(IpAddr),
+    /// `address`가 이름이라 풀어야 한다.
+    Lookup(&'a str),
+}
+
 fn default_watchdog_device() -> PathBuf {
     "/dev/watchdog".into()
 }
@@ -551,6 +572,12 @@ impl Config {
                 anyhow::bail!("ha.fencing = \"watchdog\" needs Linux; use \"process\" or \"off\"");
             }
         }
+        // 다른 노드가 VXLAN 패킷을 보낼 주소이므로 0.0.0.0이나 ::은 안 된다.
+        if let Some(ip) = self.network.underlay
+            && ip.is_unspecified()
+        {
+            anyhow::bail!("network.underlay must not be an unspecified address (got {ip})");
+        }
         // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
         if self.listen.port() == self.cluster_listen.port() {
             anyhow::bail!(
@@ -614,11 +641,82 @@ impl Config {
         names
     }
 
+    /// underlay를 정하는 방법: `[network] underlay`, 없으면 `address`
+    pub fn underlay_source(&self) -> UnderlaySource<'_> {
+        if let Some(ip) = self.network.underlay {
+            return UnderlaySource::Ip(ip);
+        }
+        match self.address.parse::<IpAddr>() {
+            Ok(ip) => UnderlaySource::Ip(ip),
+            Err(_) => UnderlaySource::Lookup(&self.address),
+        }
+    }
+
+    /// Node status에 기록할 underlay. 이름을 풀지 못하면 경고하고 None이다(이 노드에 VXLAN 장치를
+    /// 만들지 않는다).
+    pub async fn underlay(&self) -> Option<IpAddr> {
+        self.underlay_with(|host| async move {
+            let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            Ok(addrs.map(|a| a.ip()).collect())
+        })
+        .await
+    }
+
+    /// `underlay`와 같되 이름 풀기(`lookup`)를 받는다(시험이 DNS에 기대지 않게).
+    async fn underlay_with<F, Fut>(&self, lookup: F) -> Option<IpAddr>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = std::io::Result<Vec<IpAddr>>>,
+    {
+        let host = match self.underlay_source() {
+            UnderlaySource::Ip(ip) => return Some(ip),
+            UnderlaySource::Lookup(host) => host,
+        };
+        match lookup(host.to_string()).await {
+            Ok(addrs) => match pick_underlay(addrs) {
+                Some(ip) => Some(ip),
+                None => {
+                    tracing::warn!(
+                        host,
+                        "address has no usable IP (only loopback or link-local); set [network] underlay for VXLAN"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    host,
+                    error = %e,
+                    "cannot resolve address; set [network] underlay for VXLAN"
+                );
+                None
+            }
+        }
+    }
+
     pub fn control_socket(&self) -> PathBuf {
         self.control_socket
             .clone()
             .unwrap_or_else(|| self.run_dir.join("opld.sock"))
     }
+}
+
+/// 이름을 푼 주소 가운데 underlay로 쓸 것. 다른 노드가 닿을 수 없는 loopback·link-local·미지정 주소는
+/// 빼고(예: `/etc/hosts`의 `127.0.1.1`), IPv4를 먼저, 없으면 IPv6의 첫 주소다.
+fn pick_underlay(addrs: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
+    let usable: Vec<IpAddr> = addrs
+        .into_iter()
+        .filter(|ip| {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && match ip {
+                    IpAddr::V4(v4) => !v4.is_link_local(),
+                    IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+                }
+        })
+        .collect();
+    let v4 = usable.iter().find(|ip| ip.is_ipv4());
+    v4.or(usable.first()).copied()
 }
 
 #[cfg(test)]
@@ -1021,5 +1119,98 @@ mod tests {
             let text = format!("name = \"n\"\naddress = \"h\"\n[migration]\n{bad}");
             assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn underlay_comes_from_the_setting_or_the_address() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // 설정이 address보다 앞선다.
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"\n[network]\nunderlay = \"10.1.0.5\"");
+        c.validate().unwrap();
+        assert_eq!(c.underlay_source(), UnderlaySource::Ip(ip("10.1.0.5")));
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"\n[network]\nunderlay = \"fd00::5\"");
+        assert_eq!(c.underlay_source(), UnderlaySource::Ip(ip("fd00::5")));
+        // 없으면 address: IPv4·IPv6 리터럴은 그대로, 이름은 푼다.
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"");
+        assert_eq!(c.network, NetworkSection::default());
+        assert_eq!(c.underlay_source(), UnderlaySource::Ip(ip("10.0.0.5")));
+        let c = parse("name = \"n\"\naddress = \"::1\"");
+        assert_eq!(c.underlay_source(), UnderlaySource::Ip(ip("::1")));
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"");
+        assert_eq!(c.underlay_source(), UnderlaySource::Lookup("node1.lan"));
+        for bad in [
+            "underlay = \"node1.lan\"",
+            "underlay = \"10.0.0.5:4789\"",
+            "mtu = 1450",
+        ] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[network]\n{bad}");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+        for bad in ["0.0.0.0", "::"] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[network]\nunderlay = \"{bad}\""
+            ));
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("network.underlay"), "{err}");
+        }
+    }
+
+    #[test]
+    fn resolved_underlay_skips_local_addresses_and_prefers_ipv4() {
+        let pick = |addrs: &[&str]| pick_underlay(addrs.iter().map(|a| a.parse().unwrap()));
+        // `/etc/hosts`의 127.0.1.1 같은 loopback, link-local, 0.0.0.0은 다른 노드가 닿을 수 없다.
+        assert_eq!(pick(&["127.0.1.1"]), None);
+        assert_eq!(pick(&["169.254.1.1", "fe80::1", "::", "0.0.0.0"]), None);
+        assert_eq!(pick(&[]), None);
+        assert_eq!(
+            pick(&["::1", "10.0.0.5"]),
+            Some("10.0.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            pick(&["fe80::1", "2001:db8::5"]),
+            Some("2001:db8::5".parse().unwrap())
+        );
+        // IPv4가 먼저다.
+        assert_eq!(
+            pick(&["2001:db8::5", "10.0.0.5", "10.0.0.6"]),
+            Some("10.0.0.5".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn underlay_resolves_a_name_or_is_none() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // 이름 풀기를 바꿔 끼워 DNS에 기대지 않는다.
+        let lookup = |result: std::io::Result<Vec<IpAddr>>| {
+            move |host: String| {
+                assert_eq!(host, "node1.lan");
+                std::future::ready(result)
+            }
+        };
+        let no_lookup =
+            |_: String| -> std::future::Ready<std::io::Result<Vec<IpAddr>>> { panic!("lookup") };
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"");
+        assert_eq!(c.underlay().await, Some(ip("10.0.0.5")));
+        // 리터럴과 설정은 풀지 않는다. 리터럴은 loopback이어도 그대로 쓴다.
+        let c = parse("name = \"n\"\naddress = \"127.0.0.1\"");
+        assert_eq!(c.underlay_with(no_lookup).await, Some(ip("127.0.0.1")));
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"\n[network]\nunderlay = \"10.1.0.5\"");
+        assert_eq!(c.underlay_with(no_lookup).await, Some(ip("10.1.0.5")));
+        // 이름은 풀어서 쓸 수 있는 주소를 고른다. loopback만 나오거나 풀지 못하면 None이다.
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"");
+        assert_eq!(
+            c.underlay_with(lookup(Ok(vec![ip("127.0.1.1"), ip("10.0.0.7")])))
+                .await,
+            Some(ip("10.0.0.7"))
+        );
+        assert_eq!(
+            c.underlay_with(lookup(Ok(vec![ip("127.0.1.1")]))).await,
+            None
+        );
+        assert_eq!(
+            c.underlay_with(lookup(Err(std::io::Error::other("no such host"))))
+                .await,
+            None
+        );
     }
 }

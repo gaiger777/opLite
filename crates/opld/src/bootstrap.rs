@@ -1,6 +1,7 @@
 //! 노드 id, 새 클러스터의 첫 기록(클러스터 정보, 관리자), Node 리소스.
 
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::Context;
@@ -121,9 +122,20 @@ async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지, 아키텍처, HA 펜싱을
-/// 기록한다.
+/// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지, 아키텍처, HA 펜싱,
+/// underlay를 기록한다.
 pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> anyhow::Result<()> {
+    let underlay = config.underlay().await;
+    record_node(cluster, config, host, underlay).await
+}
+
+/// `register_node`의 기록. `underlay`는 정한 underlay다(None이면 풀지 못한 것).
+async fn record_node(
+    cluster: &Cluster,
+    config: &Config,
+    host: &Host,
+    underlay: Option<IpAddr>,
+) -> anyhow::Result<()> {
     ensure_node(cluster, config).await?;
     let bridges = host.bridges().await;
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
@@ -141,6 +153,9 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
             pools: std::mem::take(&mut status.pools),
             // 펜싱이 꺼져 있으면 None이라 리더가 이 노드의 HA VM을 옮기지 않는다.
             ha: config.ha.node_ha(),
+            // 이름을 풀지 못하면(설정·IP 리터럴이 아님) 기록된 값을 지킨다(잠깐 DNS가 안 된다고
+            // VXLAN 네트워크를 잃지 않게).
+            underlay: underlay.or(status.underlay),
         };
         true
     })
@@ -281,9 +296,10 @@ pub(crate) mod tests {
         (cluster, id)
     }
 
+    /// address는 IP 리터럴이다(등록이 이름을 풀지 않게).
     fn test_config() -> Config {
         toml::from_str(
-            "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"tcg\"\nsystemd_scope = false",
+            "name = \"n\"\naddress = \"10.0.0.1\"\n[hypervisor]\naccel = \"tcg\"\nsystemd_scope = false",
         )
         .unwrap()
     }
@@ -331,18 +347,53 @@ pub(crate) mod tests {
         cluster.shutdown().await.unwrap();
     }
 
+    /// `[network] underlay`를, 없으면 `address`의 IP를 기록한다. 이름을 풀지 못하면(None) 기록된 값을
+    /// 그대로 둔다(잠깐 DNS가 안 된다고 VM이 쓰는 VXLAN 장치를 지우지 않게).
+    #[tokio::test]
+    async fn registration_records_the_underlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let mut config = test_config();
+        let mut host = Host::from_config(&config).unwrap();
+        host.net = None;
+        let underlay = || {
+            cluster
+                .get::<NodeSpec>(id.0)
+                .unwrap()
+                .unwrap()
+                .status
+                .underlay
+        };
+        // 이름을 풀지 못한 새 노드에는 없다.
+        record_node(&cluster, &config, &host, None).await.unwrap();
+        assert_eq!(underlay(), None);
+        config.network.underlay = Some("10.1.0.5".parse().unwrap());
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(underlay(), Some("10.1.0.5".parse().unwrap()));
+        config.network.underlay = None;
+        config.address = "fd00::5".into();
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(underlay(), Some("fd00::5".parse().unwrap()));
+        record_node(&cluster, &config, &host, None).await.unwrap();
+        assert_eq!(underlay(), Some("fd00::5".parse().unwrap()));
+        cluster.shutdown().await.unwrap();
+    }
+
     /// 위트니스는 역할과 온라인, 아키텍처만 기록하고 VM을 돌리는 데 쓰는 값은 비운다.
     #[tokio::test]
     async fn witness_registration_records_only_the_role_and_architecture() {
         let dir = tempfile::tempdir().unwrap();
         let (cluster, id) = single_node(dir.path()).await;
-        let config: Config =
-            toml::from_str("name = \"w\"\naddress = \"h\"\nwitness = true").unwrap();
+        // underlay를 설정해도 기록하지 않는다.
+        let config: Config = toml::from_str(
+            "name = \"w\"\naddress = \"10.0.0.9\"\nwitness = true\n[network]\nunderlay = \"10.1.0.9\"",
+        )
+        .unwrap();
         register_witness(&cluster, &config).await.unwrap();
         let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
         assert_eq!(node.name, "w");
         assert!(node.spec.witness);
-        assert_eq!(node.spec.address, "h:8006");
+        assert_eq!(node.spec.address, "10.0.0.9:8006");
         assert_eq!(
             node.status,
             NodeStatus {
