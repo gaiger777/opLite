@@ -12,7 +12,7 @@ repository.workspace = true
 storage-it = []
 # 실제 VM을 띄우는 통합 테스트. macOS는 brew install qemu, Linux는 apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils가 필요하다(KVM이 없으면 TCG).
 qemu-it = []
-# 실제 tap과 브리지를 만드는 통합 테스트. Linux에서 root(CAP_NET_ADMIN)와 iproute2가 필요하다.
+# 실제 tap과 브리지, nft 규칙을 만드는 통합 테스트. Linux에서 root(CAP_NET_ADMIN)와 iproute2, nftables, python3가 필요하다.
 net-it = []
 # 실제 LVM-thin 풀의 통합 테스트. Linux에서 root, lvm2, qemu-img, qemu-io와 테스트가 LV를 만들고 지워도
 # 되는 VG/thin pool(`OPL_TEST_LVM=VG/THINPOOL`)이 필요하다.

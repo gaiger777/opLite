@@ -679,7 +679,7 @@ async fn run(program: &'static str, args: &[impl AsRef<str>]) -> Result<String, 
 }
 
 /// 실패한 명령의 stderr. 비어 있으면(세그폴트 따위) 종료 상태를 쓴다.
-fn failure_text(stderr: &[u8], status: std::process::ExitStatus) -> String {
+pub(crate) fn failure_text(stderr: &[u8], status: std::process::ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt;
     let text = String::from_utf8_lossy(stderr).trim().to_string();
     if !text.is_empty() {

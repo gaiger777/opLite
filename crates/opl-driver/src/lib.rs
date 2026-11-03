@@ -1,6 +1,7 @@
 //! 하이퍼바이저, 스토리지, 호스트 네트워크 드라이버. reconciler와 API는 트레이트만 보고, 구현은 여기서 고른다.
 
 pub mod error;
+pub mod firewall;
 pub mod hypervisor;
 pub mod migration;
 pub mod mock;
@@ -10,6 +11,7 @@ pub mod qemu;
 pub mod storage;
 
 pub use error::DriverError;
+pub use firewall::{Firewall, FirewallNic, Nft, ruleset};
 pub use hypervisor::{
     ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
 };
