@@ -409,7 +409,8 @@ fn check_pool_local(state: &AppState, pool: &StoragePool) -> Result<(), ApiError
     Ok(())
 }
 
-/// 노드에 미리 만든 Linux 브리지를 가리키는 네트워크. 이름 `user`는 예약되어 있다.
+/// 노드에 미리 만든 Linux 브리지를 가리키거나 opld가 만드는 VXLAN 네트워크. 이름 `user`는 예약되어 있다.
+/// VNI가 다른 네트워크와 겹치면 409 `vni_in_use`(동시에 만드는 두 요청의 경쟁은 막지 않는다).
 #[utoipa::path(post, path = "/networks", tag = "networks",
     request_body = CreateRequest<NetworkSpec>,
     responses((status = 201, body = Resource<NetworkSpec, NetworkStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -428,6 +429,15 @@ pub async fn create_network(
     req.spec
         .validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if let Some(vni) = req.spec.vni() {
+        let (_, networks) = state.cluster.list::<NetworkSpec>()?;
+        if let Some(other) = networks.iter().find(|n| n.spec.vni() == Some(vni)) {
+            return Err(ApiError::conflict(
+                "vni_in_use",
+                format!("VNI {vni} is used by network {:?}", other.name),
+            ));
+        }
+    }
     let mut network = Resource::new(req.name, req.spec);
     network.labels = req.labels;
     network.revision = state.cluster.create(&network).await?;

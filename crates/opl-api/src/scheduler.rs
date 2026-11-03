@@ -36,7 +36,8 @@ impl Inventory {
         })
     }
 
-    /// 이 VM의 브리지 네트워크가 쓰는 브리지가 모두 이 노드에 있는지. VLAN을 쓰면 VLAN-aware여야 한다.
+    /// 이 VM의 네트워크가 쓰는 브리지(VXLAN이면 `oplv<vni>`)가 모두 이 노드에 있는지.
+    /// VLAN을 쓰면 VLAN-aware여야 한다.
     fn has_bridges(&self, spec: &VmSpec, node: &Node) -> bool {
         spec.nics
             .iter()
@@ -46,7 +47,7 @@ impl Inventory {
                     return false;
                 };
                 node.status.bridges.iter().any(|b| {
-                    b.name == network.spec.bridge
+                    b.name == network.spec.bridge_name()
                         && (network.spec.vlan.is_none() || b.vlan_filtering)
                 })
             })
@@ -132,6 +133,7 @@ pub fn node_fits(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), Stri
 
 #[cfg(test)]
 mod tests {
+    use opl_types::network::Vxlan;
     use opl_types::node::{BridgeInfo, Fencing, NodeHa, NodeStatus, PoolState};
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
@@ -419,8 +421,10 @@ mod tests {
             Resource::new(
                 name,
                 NetworkSpec {
-                    bridge: "vmbr0".into(),
+                    bridge: Some("vmbr0".into()),
                     vlan,
+                    vxlan: None,
+                    mtu: None,
                 },
             )
         };
@@ -443,6 +447,39 @@ mod tests {
         // 없는 네트워크는 어디서도 돌 수 없다.
         me.nics.push(nic("gone"));
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+    }
+
+    #[test]
+    fn needs_the_managed_bridge_of_a_vxlan_network() {
+        let bridge = |name: &str| BridgeInfo {
+            name: name.into(),
+            vlan_filtering: false,
+        };
+        // 이 노드에는 아직 VXLAN 장치가 없다(underlay가 없는 노드 등).
+        let mut bare = node(64000);
+        bare.status.bridges = vec![bridge("vmbr0")];
+        let mut ready = node(1024);
+        ready.status.bridges = vec![bridge("vmbr0"), bridge("oplv1000")];
+        let inv = Inventory {
+            nodes: vec![bare, ready.clone()],
+            networks: vec![Resource::new(
+                "overlay",
+                NetworkSpec {
+                    bridge: None,
+                    vlan: None,
+                    vxlan: Some(Vxlan { vni: 1000 }),
+                    mtu: None,
+                },
+            )],
+            ..Default::default()
+        };
+        let mut me = spec(512, None, PowerState::Running);
+        me.nics = vec![NicSpec {
+            network: "overlay".into(),
+            model: NicModel::Virtio,
+            mac: None,
+        }];
+        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(ready.id));
     }
 
     #[test]
@@ -485,8 +522,10 @@ mod tests {
             networks: vec![Resource::new(
                 "lan",
                 NetworkSpec {
-                    bridge: "vmbr0".into(),
+                    bridge: Some("vmbr0".into()),
                     vlan: None,
+                    vxlan: None,
+                    mtu: None,
                 },
             )],
             ..Default::default()

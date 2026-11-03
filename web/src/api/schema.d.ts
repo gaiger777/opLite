@@ -130,7 +130,10 @@ export interface paths {
         };
         get: operations["list_networks"];
         put?: never;
-        /** 노드에 미리 만든 Linux 브리지를 가리키는 네트워크. 이름 `user`는 예약되어 있다. */
+        /**
+         * 노드에 미리 만든 Linux 브리지를 가리키거나 opld가 만드는 VXLAN 네트워크. 이름 `user`는 예약되어 있다.
+         *     VNI가 다른 네트워크와 겹치면 409 `vni_in_use`(동시에 만드는 두 요청의 경쟁은 막지 않는다).
+         */
         post: operations["create_network"];
         delete?: never;
         options?: never;
@@ -703,14 +706,22 @@ export interface components {
                 [key: string]: string;
             };
             name: string;
+            /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
             spec: {
                 /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
-                bridge: string;
+                bridge?: string;
                 /**
                  * Format: int32
-                 * @description VLAN 태그(1~4094). 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
+                 * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
+                 */
+                mtu?: number;
+                /**
+                 * Format: int32
+                 * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
                  */
                 vlan?: number | null;
+                /** @description opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
+                vxlan?: components["schemas"]["Vxlan"];
             };
         };
         CreateRequest_StoragePoolSpec: {
@@ -880,14 +891,22 @@ export interface components {
                  * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
                  */
                 revision: number;
+                /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
                 spec: {
                     /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
-                    bridge: string;
+                    bridge?: string;
                     /**
                      * Format: int32
-                     * @description VLAN 태그(1~4094). 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
+                     * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
+                     */
+                    mtu?: number;
+                    /**
+                     * Format: int32
+                     * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
                      */
                     vlan?: number | null;
+                    /** @description opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
+                    vxlan?: components["schemas"]["Vxlan"];
                 };
                 status: Record<string, never>;
             }[];
@@ -1265,14 +1284,22 @@ export interface components {
             /** Format: uuid */
             task: string;
         };
+        /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
         NetworkSpec: {
             /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
-            bridge: string;
+            bridge?: string;
             /**
              * Format: int32
-             * @description VLAN 태그(1~4094). 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
+             * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
+             */
+            mtu?: number;
+            /**
+             * Format: int32
+             * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
              */
             vlan?: number | null;
+            /** @description opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
+            vxlan?: components["schemas"]["Vxlan"];
         };
         NetworkStatus: Record<string, never>;
         /** @enum {string} */
@@ -1446,14 +1473,22 @@ export interface components {
              * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
              */
             revision: number;
+            /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
             spec: {
                 /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
-                bridge: string;
+                bridge?: string;
                 /**
                  * Format: int32
-                 * @description VLAN 태그(1~4094). 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
+                 * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
+                 */
+                mtu?: number;
+                /**
+                 * Format: int32
+                 * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
                  */
                 vlan?: number | null;
+                /** @description opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
+                vxlan?: components["schemas"]["Vxlan"];
             };
             status: Record<string, never>;
         };
@@ -2061,6 +2096,13 @@ export interface components {
             node: string | null;
             /** @default pending */
             phase: components["schemas"]["VolumePhase"];
+        };
+        Vxlan: {
+            /**
+             * Format: int32
+             * @description VXLAN 네트워크 식별자(1~16777215). 클러스터 안에서 겹치지 않는다.
+             */
+            vni: number;
         };
     };
     responses: never;

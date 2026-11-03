@@ -105,3 +105,89 @@ async fn vms_are_placed_on_nodes_with_the_bridge() {
     let (_, vm) = admin.get("/vms/web").await;
     assert_eq!(vm["spec"]["node"], env.node.to_string());
 }
+
+#[tokio::test]
+async fn vxlan_networks_need_their_own_vni() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let overlay = |name: &str, spec: Value| json!({ "name": name, "spec": spec });
+
+    let (status, body) = admin
+        .post(
+            "/networks",
+            overlay("blue", json!({ "vxlan": { "vni": 1000 } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["spec"], json!({ "vxlan": { "vni": 1000 } }));
+    let (status, body) = admin
+        .post(
+            "/networks",
+            overlay("green", json!({ "vxlan": { "vni": 1001 }, "mtu": 9000 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = admin
+        .post(
+            "/networks",
+            overlay("red", json!({ "vxlan": { "vni": 1000 }, "mtu": 1400 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vni_in_use");
+    assert_eq!(body["message"], "VNI 1000 is used by network \"blue\"");
+
+    for (bad, why) in [
+        (json!({}), "no kind"),
+        (
+            json!({ "bridge": "vmbr0", "vxlan": { "vni": 5 } }),
+            "both kinds",
+        ),
+        (
+            json!({ "vxlan": { "vni": 5 }, "vlan": 10 }),
+            "vlan with vxlan",
+        ),
+        (json!({ "bridge": "vmbr0", "mtu": 1450 }), "mtu with bridge"),
+        (json!({ "vxlan": { "vni": 0 } }), "VNI range"),
+        (json!({ "vxlan": { "vni": 5 }, "mtu": 1000 }), "MTU range"),
+        (json!({ "bridge": "oplv5" }), "reserved bridge name"),
+    ] {
+        let (status, body) = admin.post("/networks", overlay("bad", bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+        assert_eq!(body["code"], "invalid_request");
+    }
+}
+
+#[tokio::test]
+async fn vxlan_vms_are_placed_on_nodes_with_the_managed_bridge() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    admin
+        .post(
+            "/networks",
+            json!({ "name": "blue", "spec": { "vxlan": { "vni": 4242 } } }),
+        )
+        .await;
+    let mut vm = vm_request("web");
+    vm["spec"]["nics"][0]["network"] = json!("blue");
+    assert_eq!(admin.post("/vms", vm).await.0, StatusCode::CREATED);
+
+    // 노드가 아직 VXLAN 장치를 만들지 않았다.
+    let (status, body) = admin.post("/vms/web/actions/start", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "no_node");
+
+    let node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    let mut status = node.status.clone();
+    status.bridges = vec![BridgeInfo {
+        name: "oplv4242".into(),
+        vlan_filtering: false,
+    }];
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+}

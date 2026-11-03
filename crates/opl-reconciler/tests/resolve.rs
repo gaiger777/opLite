@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use opl_cluster::memnet::MemRouter;
 use opl_driver::{Capacity, DriverError, SourceFormat, Storage, VolumeInfo, VolumeSource};
 use opl_reconciler::resolve::{ResolveError, incoming_spec, runtime_spec, set_disks_shared};
-use opl_types::network::{Network, NetworkSpec, tap_name};
+use opl_types::network::{Network, NetworkSpec, Vxlan, tap_name};
 use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
@@ -921,8 +921,10 @@ async fn resolves_bridge_networks_to_taps() {
     let lan: Network = Resource::new(
         "lan",
         NetworkSpec {
-            bridge: "vmbr0".into(),
+            bridge: Some("vmbr0".into()),
             vlan: Some(10),
+            vxlan: None,
+            mtu: None,
         },
     );
     cluster.create(&lan).await.unwrap();
@@ -939,6 +941,35 @@ async fn resolves_bridge_networks_to_taps() {
             ifname: tap_name(vm.id, 1),
             bridge: "vmbr0".into(),
             vlan: Some(10),
+        }
+    );
+}
+
+#[tokio::test]
+async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let blue: Network = Resource::new(
+        "blue",
+        NetworkSpec {
+            bridge: None,
+            vlan: None,
+            vxlan: Some(Vxlan { vni: 1000 }),
+            mtu: None,
+        },
+    );
+    cluster.create(&blue).await.unwrap();
+
+    let mut vm = common::vm("web", node);
+    vm.spec.nics.push(nic("blue", Some(MacAddr::generate())));
+    let spec = resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+    assert_eq!(
+        spec.nics[0].backend,
+        NicBackend::Tap {
+            ifname: tap_name(vm.id, 0),
+            bridge: "oplv1000".into(),
+            vlan: None,
         }
     );
 }

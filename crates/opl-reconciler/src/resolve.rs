@@ -289,7 +289,7 @@ async fn resolve(
                 .ok_or_else(|| ResolveError::NetworkNotFound(nic.network.clone()))?;
             NicBackend::Tap {
                 ifname: tap_name(vm.id, i),
-                bridge: network.spec.bridge,
+                bridge: network.spec.bridge_name(),
                 vlan: network.spec.vlan,
             }
         };
