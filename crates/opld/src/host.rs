@@ -18,7 +18,8 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+    /// `tag`는 이 노드의 클러스터 태그다. 관리 이름 브리지(`oplv…`)는 이 클러스터의 것만 쓴다.
+    pub fn from_config(config: &Config, tag: &str) -> anyhow::Result<Self> {
         let profile = config.host_profile()?;
         // 관리자가 `accel = "tcg"`를 고른 때는 알리지 않는다.
         if cfg!(target_os = "linux")
@@ -28,7 +29,7 @@ impl Host {
             tracing::warn!("KVM is not available; VMs run with TCG emulation (slow)");
         }
         let net: Option<Arc<dyn HostNet>> = if cfg!(target_os = "linux") {
-            Some(Arc::new(IpRoute::default()))
+            Some(Arc::new(IpRoute::default().with_cluster_tag(tag)))
         } else {
             None
         };
@@ -109,7 +110,7 @@ mod tests {
             "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"tcg\"\nsystemd_scope = false",
         )
         .unwrap();
-        let host = super::Host::from_config(&config).unwrap();
+        let host = super::Host::from_config(&config, "t").unwrap();
         assert_eq!(host.hypervisor_name(), "qemu-tcg");
         assert_eq!(host.net.is_some(), cfg!(target_os = "linux"));
     }

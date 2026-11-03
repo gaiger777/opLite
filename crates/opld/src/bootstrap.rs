@@ -317,7 +317,7 @@ pub(crate) mod tests {
         let (cluster, id) = single_node(dir.path()).await;
         let config = test_config();
         // 컴파일된 아키텍처가 아니라 HostProfile의 것을 기록한다.
-        let mut host = Host::from_config(&config).unwrap();
+        let mut host = Host::from_config(&config, "t").unwrap();
         host.net = None;
         for arch in [Arch::X86_64, Arch::Aarch64] {
             host.profile.arch = arch;
@@ -334,7 +334,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cluster, id) = single_node(dir.path()).await;
         let mut config = test_config();
-        let mut host = Host::from_config(&config).unwrap();
+        let mut host = Host::from_config(&config, "t").unwrap();
         host.net = None;
         config.ha.fencing = FencingSetting::Process;
         config.ha.fence_after_secs = 2;
@@ -361,7 +361,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cluster, id) = single_node(dir.path()).await;
         let mut config = test_config();
-        let mut host = Host::from_config(&config).unwrap();
+        let mut host = Host::from_config(&config, "t").unwrap();
         host.net = None;
         let underlay = || {
             cluster
@@ -463,7 +463,7 @@ pub(crate) mod tests {
         let config = test_config();
         let host = |bridges: Option<Vec<BridgeInfo>>| Host {
             net: Some(Arc::new(FakeNet(bridges))),
-            ..Host::from_config(&config).unwrap()
+            ..Host::from_config(&config, "t").unwrap()
         };
         let br0 = vec![BridgeInfo {
             name: "br0".into(),
@@ -503,7 +503,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cluster, id) = single_node(dir.path()).await;
         let config = test_config();
-        let mut host = Host::from_config(&config).unwrap();
+        let mut host = Host::from_config(&config, "t").unwrap();
         host.net = None;
         register_node(&cluster, &config, &host).await.unwrap();
         let pools = BTreeMap::from([("local".to_string(), PoolState::default())]);

@@ -1,6 +1,6 @@
 //! 클러스터 멤버로 도는 노드: 노드 간 서버, 클러스터 저장소, reconciler, Task 실행기, HTTPS API,
-//! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태. 위트니스는 노드 간 서버와 클러스터
-//! 저장소, 승격, Node 등록만 띄운다.
+//! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태, VXLAN 장치. 위트니스는 노드 간
+//! 서버와 클러스터 저장소, 승격, Node 등록만 띄운다.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -36,6 +36,7 @@ use uuid::Uuid;
 use crate::bootstrap;
 use crate::config::Config;
 use crate::host::Host;
+use crate::overlay::{OverlayAgent, cluster_tag};
 use crate::pools::PoolMounter;
 
 /// 데이터 디렉터리 아래 클러스터 저장소(Raft 로그와 상태)를 두는 디렉터리
@@ -116,12 +117,15 @@ struct Services {
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
     recovery: HaManager,
     pools: PoolMounter,
+    /// VXLAN 네트워크의 장치를 맞춘다(호스트 네트워크가 없으면 없다).
+    overlay: Option<OverlayAgent>,
     /// HA 리스와 watchdog(`[ha] fencing = "off"`면 없다)
     ha: Option<Arc<HaGuard>>,
 }
 
 impl Services {
-    async fn shutdown(mut self) {
+    /// `left`면 클러스터에서 빠진 것이다(VXLAN 장치를 지운다).
+    async fn shutdown(mut self, left: bool) {
         let _ = self.api.stop.send(());
         if tokio::time::timeout(DRAIN_TIMEOUT, &mut self.api.task)
             .await
@@ -134,6 +138,9 @@ impl Services {
         self.janitor.shutdown().await;
         self.recovery.shutdown().await;
         self.pools.shutdown().await;
+        if let Some(overlay) = self.overlay {
+            overlay.shutdown(left).await;
+        }
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
         // 작업자가 모두 멈춘 뒤에 닫아야 도는 HA VM 목록이 맞다.
@@ -204,7 +211,12 @@ impl Member {
                 return Err(e);
             }
         };
-        let host = match Host::from_config(config) {
+        // 이 클러스터가 만든 VXLAN 장치의 표시. 남의 관리 이름 브리지는 브리지 목록에서 뺀다.
+        let host = cluster_tag(&tls.ca_pem).and_then(|tag| {
+            let host = Host::from_config(config, &tag)?;
+            Ok((host, tag))
+        });
+        let (host, tag) = match host {
             Ok(host) => host,
             Err(e) => {
                 let _ = cluster.shutdown().await;
@@ -330,6 +342,8 @@ impl Member {
         let qemu_binary = host.profile.qemu_binary.clone();
         // 받은 UEFI 변수 파일의 크기를 이 노드의 템플릿과 견준다.
         let uefi_vars_template = host.profile.uefi_vars_template.clone();
+        // 장치를 만들거나 지우면 곧바로 브리지 목록을 기록한다(아래 주기 갱신을 기다리지 않는다).
+        let overlay = OverlayAgent::spawn(cluster.clone(), config, &host, tag);
         let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
             tokio::spawn(async move {
@@ -432,6 +446,7 @@ impl Member {
                 janitor,
                 recovery,
                 pools,
+                overlay,
                 ha,
             }),
             register,
@@ -555,7 +570,7 @@ impl Member {
     /// 아니면 오프라인으로 기록한다. 실행 중인 VM은 그대로 둔다.
     pub async fn close(mut self, left: bool) -> anyhow::Result<()> {
         if let Some(services) = self.services.take() {
-            services.shutdown().await;
+            services.shutdown(left).await;
         }
         self.register.abort();
         self.promotion.abort();

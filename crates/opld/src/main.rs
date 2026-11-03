@@ -17,6 +17,7 @@ mod control;
 mod host;
 mod join;
 mod member;
+mod overlay;
 mod pools;
 mod web;
 
