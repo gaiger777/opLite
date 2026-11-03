@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import type { Network } from "@/api/types";
-import { NetworksPage, validBridge } from "@/networks/NetworksPage";
+import { bridgeName, NetworksPage, validBridge } from "@/networks/NetworksPage";
 import { NODE, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
@@ -19,6 +19,10 @@ function network(name: string, bridge: string, vlan: number | null = null): Netw
   };
 }
 
+function vxlan(name: string, vni: number, mtu?: number): Network {
+  return { ...network(name, ""), spec: { vxlan: { vni }, ...(mtu && { mtu }) } };
+}
+
 const bridged = {
   ...NODE,
   status: { ...NODE.status, bridges: [{ name: "vmbr0", vlan_filtering: false }] },
@@ -32,6 +36,47 @@ it("follows the server's bridge name rule", () => {
   expect(validBridge("br 0")).toBe(false);
   expect(validBridge("br:0")).toBe(false);
   expect(validBridge("..")).toBe(false);
+  // VXLAN 네트워크의 관리 이름 모양은 서버가 예약해 둔다.
+  expect(validBridge("oplv100")).toBe(false);
+  expect(validBridge("oplx7")).toBe(false);
+  expect(validBridge("oplv")).toBe(true);
+  expect(validBridge("oplvx1")).toBe(true);
+});
+
+it("names the bridge of each network kind", () => {
+  expect(bridgeName(network("lan", "vmbr0").spec)).toBe("vmbr0");
+  expect(bridgeName(vxlan("ov", 100).spec)).toBe("oplv100");
+});
+
+it("lists VXLAN networks with their managed bridge, VNI and MTU", async () => {
+  const overlay = {
+    ...NODE,
+    status: { ...NODE.status, bridges: [{ name: "oplv100", vlan_filtering: false }] },
+  };
+  mockLists({
+    network: [network("lan", "vmbr0", 10), vxlan("ov", 100), vxlan("jumbo", 7, 8950)],
+    node: [overlay],
+    vm: [],
+  });
+  renderPage(<NetworksPage />);
+  const table = await screen.findByRole("table", { name: "Networks" });
+  const headers = within(table).getAllByRole("columnheader");
+  const cell = (row: HTMLElement, name: string) =>
+    within(row).getAllByRole("cell")[headers.findIndex((h) => h.textContent === name)];
+  const lan = (await within(table).findByText("lan")).closest("tr")!;
+  expect(cell(lan, "Type")).toHaveTextContent("Bridge");
+  expect(cell(lan, "VLAN/VNI")).toHaveTextContent("10");
+  expect(cell(lan, "MTU")).toHaveTextContent("—");
+  const ov = within(table).getByText("ov").closest("tr")!;
+  expect(cell(ov, "Type")).toHaveTextContent("VXLAN");
+  expect(cell(ov, "Bridge")).toHaveTextContent("oplv100");
+  expect(cell(ov, "VLAN/VNI")).toHaveTextContent("100");
+  expect(cell(ov, "MTU")).toHaveTextContent("1450");
+  // opld가 만든 oplv100이 있는 노드
+  expect(cell(ov, "Nodes with the bridge")).toHaveTextContent("node-a");
+  const jumbo = within(table).getByText("jumbo").closest("tr")!;
+  expect(cell(jumbo, "MTU")).toHaveTextContent("8950");
+  expect(cell(jumbo, "Nodes with the bridge")).toHaveTextContent("No node has this bridge");
 });
 
 it("shows which nodes have each bridge and which VMs use it", async () => {
@@ -90,6 +135,32 @@ it("judges nothing without the nodes and VMs", async () => {
   expect(cell("VMs")).toHaveTextContent("—");
 });
 
+it("suggests the nodes' bridges except the managed VXLAN ones", async () => {
+  mockLists({
+    node: [
+      {
+        ...NODE,
+        status: {
+          ...NODE.status,
+          bridges: [
+            { name: "vmbr1", vlan_filtering: false },
+            { name: "oplv100", vlan_filtering: false },
+            { name: "vmbr0", vlan_filtering: true },
+          ],
+        },
+      },
+    ],
+  });
+  renderPage(<NetworksPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a network" });
+  const input = within(dialog).getByLabelText("Bridge");
+  const list = document.getElementById(input.getAttribute("list")!)!;
+  await vi.waitFor(() => expect(list.querySelectorAll("option")).toHaveLength(2));
+  const options = [...list.querySelectorAll("option")].map((o) => o.value);
+  expect(options).toEqual(["vmbr0", "vmbr1"]);
+});
+
 it("creates a network after checking its fields", async () => {
   mockLists({ node: [bridged] });
   let body: unknown;
@@ -138,10 +209,81 @@ it("rejects VLAN tags out of range and sends no tag when empty", async () => {
   expect(within(dialog).getByText("Use a number from 1 to 4094.")).toBeVisible();
   expect(body).toBeUndefined();
 
+  // VXLAN 네트워크의 관리 이름은 브리지로 쓸 수 없다.
+  await userEvent.clear(within(dialog).getByLabelText("Bridge"));
+  await userEvent.type(within(dialog).getByLabelText("Bridge"), "oplv100");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(
+    within(dialog).getByText("Names like oplv100 and oplx100 are reserved for VXLAN networks."),
+  ).toBeVisible();
+  await userEvent.clear(within(dialog).getByLabelText("Bridge"));
+  await userEvent.type(within(dialog).getByLabelText("Bridge"), "vmbr0");
+
   await userEvent.clear(within(dialog).getByLabelText("VLAN tag (optional)"));
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(await screen.findByText("Created network wan.")).toBeInTheDocument();
   expect(body).toEqual({ name: "wan", spec: { bridge: "vmbr0", vlan: null } });
+});
+
+it("creates a VXLAN network with a VNI and an optional MTU", async () => {
+  mockLists({ node: [bridged] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/networks"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(vxlan("ov", 100), { status: 201 });
+    }),
+  );
+  renderPage(<NetworksPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a network" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "ov");
+  await userEvent.selectOptions(within(dialog).getByLabelText("Type"), "vxlan");
+  // VXLAN에는 브리지와 VLAN이 없다.
+  expect(within(dialog).queryByLabelText("Bridge")).not.toBeInTheDocument();
+  expect(within(dialog).queryByLabelText("VLAN tag (optional)")).not.toBeInTheDocument();
+  expect(within(dialog).getByLabelText("MTU (optional)")).toHaveAccessibleDescription(
+    /Defaults to 1450/,
+  );
+  await userEvent.type(within(dialog).getByLabelText("VNI"), "16777216");
+  await userEvent.type(within(dialog).getByLabelText("MTU (optional)"), "1000");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByText("Use a number from 1 to 16777215.")).toBeVisible();
+  expect(within(dialog).getByText("Use a number from 1280 to 9000.")).toBeVisible();
+  expect(body).toBeUndefined();
+
+  await userEvent.clear(within(dialog).getByLabelText("VNI"));
+  await userEvent.type(within(dialog).getByLabelText("VNI"), "100");
+  await userEvent.clear(within(dialog).getByLabelText("MTU (optional)"));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await screen.findByText("Created network ov.")).toBeInTheDocument();
+  expect(body).toEqual({ name: "ov", spec: { vxlan: { vni: 100 } } });
+});
+
+it("sends the MTU of a VXLAN network and explains a VNI in use", async () => {
+  mockLists({ node: [bridged] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/networks"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(
+        { code: "vni_in_use", message: 'VNI 7 is used by network "ov"' },
+        { status: 409 },
+      );
+    }),
+  );
+  renderPage(<NetworksPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a network" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "jumbo");
+  await userEvent.selectOptions(within(dialog).getByLabelText("Type"), "vxlan");
+  await userEvent.type(within(dialog).getByLabelText("VNI"), "7");
+  await userEvent.type(within(dialog).getByLabelText("MTU (optional)"), "8950");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "Another network already uses this VNI.",
+  );
+  expect(body).toEqual({ name: "jumbo", spec: { vxlan: { vni: 7 }, mtu: 8950 } });
 });
 
 it("deletes an unused network and shows why a delete failed", async () => {

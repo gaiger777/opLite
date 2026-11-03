@@ -53,7 +53,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PoolCmd,
     },
-    /// VM NIC가 연결하는 네트워크(노드에 미리 만든 Linux 브리지)
+    /// VM NIC가 연결하는 네트워크(노드에 미리 만든 Linux 브리지나 opld가 만드는 VXLAN 네트워크)
     Network {
         #[command(subcommand)]
         cmd: NetworkCmd,
@@ -355,19 +355,47 @@ enum NetworkCmd {
     Get {
         network: String,
     },
-    /// 노드에 있는 Linux 브리지를 가리키는 네트워크를 만든다.
-    Create {
-        name: String,
-        /// 브리지 이름(예: vmbr0). 이 네트워크를 쓰는 VM은 이 브리지가 있는 노드에서만 돈다.
-        #[arg(long)]
-        bridge: String,
-        /// VLAN 태그(1-4094). 브리지가 VLAN-aware(vlan_filtering 1)여야 한다.
-        #[arg(long)]
-        vlan: Option<u16>,
-    },
+    /// 노드에 있는 Linux 브리지를 가리키는 네트워크나 VXLAN 네트워크를 만든다.
+    Create(NetworkCreate),
     Delete {
         network: String,
     },
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("kind").required(true).args(["bridge", "vxlan"])))]
+struct NetworkCreate {
+    name: String,
+    /// 브리지 이름(예: vmbr0). 이 네트워크를 쓰는 VM은 이 브리지가 있는 노드에서만 돈다.
+    #[arg(long)]
+    bridge: Option<String>,
+    /// VLAN 태그(1-4094). 브리지가 VLAN-aware(vlan_filtering 1)여야 한다.
+    #[arg(long, conflicts_with = "vxlan")]
+    vlan: Option<u16>,
+    /// VXLAN 네트워크 식별자(VNI, 1-16777215). opld가 모든 노드에 브리지 oplv<VNI>를 만든다.
+    #[arg(long, value_name = "VNI")]
+    vxlan: Option<u32>,
+    /// VXLAN 네트워크의 MTU(1280-9000, 기본 1450)
+    #[arg(long, conflicts_with = "bridge")]
+    mtu: Option<u16>,
+}
+
+/// `network create`의 요청 본문(`POST /networks`). 주지 않은 값은 보내지 않는다.
+fn network_create_body(c: &NetworkCreate) -> Value {
+    let mut spec = serde_json::Map::new();
+    if let Some(bridge) = &c.bridge {
+        spec.insert("bridge".into(), json!(bridge));
+    }
+    if let Some(vlan) = c.vlan {
+        spec.insert("vlan".into(), json!(vlan));
+    }
+    if let Some(vni) = c.vxlan {
+        spec.insert("vxlan".into(), json!({ "vni": vni }));
+    }
+    if let Some(mtu) = c.mtu {
+        spec.insert("mtu".into(), json!(mtu));
+    }
+    json!({ "name": c.name, "spec": spec })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -831,21 +859,14 @@ where
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::List => {
                 let list = client.get("/networks").await?;
-                print_list(out, json_out, &list, &["NAME", "BRIDGE", "VLAN"], |n| {
-                    vec![
-                        cell(&n["name"]),
-                        cell(&n["spec"]["bridge"]),
-                        cell(&n["spec"]["vlan"]),
-                    ]
-                })?;
+                print_list(out, json_out, &list, NETWORK_HEADERS, network_row)?;
             }
             NetworkCmd::Get { network } => {
                 print_json(out, &client.get(&format!("/networks/{network}")).await?)?
             }
-            NetworkCmd::Create { name, bridge, vlan } => {
-                let body = json!({ "name": name, "spec": { "bridge": bridge, "vlan": vlan } });
-                client.post("/networks", &body).await?;
-                writeln!(out, "network {name} created")?;
+            NetworkCmd::Create(c) => {
+                client.post("/networks", &network_create_body(&c)).await?;
+                writeln!(out, "network {} created", c.name)?;
             }
             NetworkCmd::Delete { network } => {
                 client.delete(&format!("/networks/{network}")).await?;
@@ -1607,6 +1628,7 @@ const NODE_HEADERS: &[&str] = &[
     "NAME",
     "ID",
     "ADDRESS",
+    "UNDERLAY",
     "ONLINE",
     "CPUS",
     "MEMORY",
@@ -1621,6 +1643,8 @@ fn node_row(n: &Value) -> Vec<String> {
         cell(&n["name"]),
         cell(&n["id"]),
         cell(&n["spec"]["address"]),
+        // VXLAN 패킷을 주고받는 주소. 위트니스와 옛 서버는 없다.
+        cell(&n["status"]["underlay"]),
         cell(&n["status"]["online"]),
         cell(&n["status"]["cpus"]),
         bytes(&n["status"]["memory_mib"].as_u64().map(|m| m << 20).into()),
@@ -1630,6 +1654,36 @@ fn node_row(n: &Value) -> Vec<String> {
         // 펜싱이 꺼진 노드(옛 서버도)는 `ha`가 없다.
         cell(&n["status"]["ha"]["fencing"]),
     ]
+}
+
+/// `network list`의 열
+const NETWORK_HEADERS: &[&str] = &["NAME", "TYPE", "BRIDGE", "VLAN/VNI", "MTU"];
+
+/// VXLAN 네트워크의 기본 MTU(서버의 `DEFAULT_VXLAN_MTU`)
+const DEFAULT_VXLAN_MTU: u64 = 1450;
+
+/// `network list`의 한 행. VXLAN 네트워크의 브리지는 opld가 만드는 `oplv<vni>`다.
+fn network_row(n: &Value) -> Vec<String> {
+    let spec = &n["spec"];
+    match spec["vxlan"]["vni"].as_u64() {
+        Some(vni) => vec![
+            cell(&n["name"]),
+            "vxlan".into(),
+            format!("oplv{vni}"),
+            vni.to_string(),
+            spec["mtu"]
+                .as_u64()
+                .unwrap_or(DEFAULT_VXLAN_MTU)
+                .to_string(),
+        ],
+        None => vec![
+            cell(&n["name"]),
+            "bridge".into(),
+            cell(&spec["bridge"]),
+            cell(&spec["vlan"]),
+            "-".into(),
+        ],
+    }
 }
 
 /// `cluster status`의 표와 경고
@@ -2405,6 +2459,72 @@ mod tests {
         }
     }
 
+    /// 브리지와 VXLAN 중 정확히 하나. VLAN은 브리지와, MTU는 VXLAN과만. 주지 않은 값은 보내지 않는다.
+    #[test]
+    fn parses_network_create() {
+        let create = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "network", "create", "lan"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Network {
+                    cmd: NetworkCmd::Create(c),
+                } => network_create_body(&c),
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(
+            create(&["--bridge", "vmbr0"]).unwrap(),
+            json!({ "name": "lan", "spec": { "bridge": "vmbr0" } })
+        );
+        assert_eq!(
+            create(&["--bridge", "vmbr0", "--vlan", "10"]).unwrap(),
+            json!({ "name": "lan", "spec": { "bridge": "vmbr0", "vlan": 10 } })
+        );
+        assert_eq!(
+            create(&["--vxlan", "100"]).unwrap(),
+            json!({ "name": "lan", "spec": { "vxlan": { "vni": 100 } } })
+        );
+        assert_eq!(
+            create(&["--vxlan", "100", "--mtu", "1400"]).unwrap(),
+            json!({ "name": "lan", "spec": { "vxlan": { "vni": 100 }, "mtu": 1400 } })
+        );
+        for args in [
+            &[][..],
+            &["--bridge", "vmbr0", "--vxlan", "100"],
+            &["--vxlan", "100", "--vlan", "10"],
+            &["--bridge", "vmbr0", "--mtu", "1400"],
+            &["--vlan", "10"],
+            &["--mtu", "1400"],
+            &["--vxlan", "-1"],
+        ] {
+            assert!(create(args).is_err(), "{args:?}");
+        }
+    }
+
+    /// 종류, 붙는 브리지(VXLAN은 관리 이름), VLAN이나 VNI, VXLAN MTU(없으면 기본값)
+    #[test]
+    fn network_list_shows_kind_bridge_and_mtu() {
+        let rows: Vec<_> = [
+            json!({ "name": "lan", "spec": { "bridge": "vmbr0" } }),
+            json!({ "name": "dmz", "spec": { "bridge": "vmbr0", "vlan": 20 } }),
+            json!({ "name": "ov", "spec": { "vxlan": { "vni": 100 } } }),
+            json!({ "name": "jumbo", "spec": { "vxlan": { "vni": 7 }, "mtu": 8950 } }),
+        ]
+        .iter()
+        .map(network_row)
+        .collect();
+        let mut out = Vec::new();
+        table(&mut out, NETWORK_HEADERS, &rows).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NAME   TYPE    BRIDGE   VLAN/VNI  MTU\n\
+             lan    bridge  vmbr0    -         -\n\
+             dmz    bridge  vmbr0    20        -\n\
+             ov     vxlan   oplv100  100       1450\n\
+             jumbo  vxlan   oplv7    7         8950\n"
+        );
+    }
+
     #[test]
     fn parses_lvm_thin_pool_create() {
         let create = |args: &[&str]| {
@@ -2991,6 +3111,7 @@ mod tests {
         };
         let mut a = node("a", Some(false));
         a["status"]["ha"] = json!({ "fencing": "watchdog", "recover_after_secs": 65 });
+        a["status"]["underlay"] = json!("10.0.0.1");
         let rows: Vec<_> = [a, node("w", Some(true)), node("old", None)]
             .iter()
             .map(node_row)
@@ -2998,12 +3119,13 @@ mod tests {
         let mut out = Vec::new();
         table(&mut out, NODE_HEADERS, &rows).unwrap();
         // 옛 서버는 witness를 보내지 않는다 — 일반 노드다. 펜싱이 꺼진 노드는 `ha`가 없다.
+        // underlay가 없는 노드(위트니스, 옛 서버)는 `-`다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME  ID      ADDRESS        ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  FENCING\n\
-             a     id-a    10.0.0.1:8006  true    4     1.0GiB  false        false    watchdog\n\
-             w     id-w    10.0.0.1:8006  true    4     1.0GiB  false        true     -\n\
-             old   id-old  10.0.0.1:8006  true    4     1.0GiB  false        false    -\n"
+            "NAME  ID      ADDRESS        UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  FENCING\n\
+             a     id-a    10.0.0.1:8006  10.0.0.1  true    4     1.0GiB  false        false    watchdog\n\
+             w     id-w    10.0.0.1:8006  -         true    4     1.0GiB  false        true     -\n\
+             old   id-old  10.0.0.1:8006  -         true    4     1.0GiB  false        false    -\n"
         );
     }
 

@@ -20,6 +20,7 @@
     "cluster_no_quorum": "The cluster has no quorum. The change may still be applied later.",
     "not_leader": "The cluster leader is changing. Try again shortly.",
     "network_in_use": "A VM uses this network. Remove its interface first.",
+    "vni_in_use": "Another network already uses this VNI.",
     "node_online": "The node is online. Run oplctl cluster leave on it instead.",
     "pool_not_on_node": "That storage pool is not available on the node you are connected to.",
     "insufficient_storage": "The node does not have enough free space for this upload.",
@@ -463,8 +464,22 @@
     "targetHint": "The target name, such as iqn.2003-01.org.example:storage."
   },
   "networks": {
+    "kind": "Type",
+    "kinds": {
+      "bridge": "Bridge",
+      "vxlan": "VXLAN"
+    },
+    "kindHint": {
+      "bridge": "A Linux bridge that already exists on the nodes. VMs on this network run only on nodes with the bridge.",
+      "vxlan": "opld creates the bridge oplv<VNI> and a VXLAN device on every node and links them over UDP 4789."
+    },
     "bridge": "Bridge",
-    "vlan": "VLAN",
+    "vlanVni": "VLAN/VNI",
+    "vni": "VNI",
+    "vniHint": "1–16777215, not used by another network.",
+    "mtu": "MTU",
+    "mtuOptional": "MTU (optional)",
+    "mtuHint": "1280–9000. Defaults to 1450: a 1500-byte underlay minus the 50-byte VXLAN header.",
     "vlanOptional": "VLAN tag (optional)",
     "vlanHint": "1–4094. The bridge must be VLAN-aware (vlan_filtering 1).",
     "nodes": "Nodes with the bridge",
@@ -474,20 +489,24 @@
     "noNode": "No node has this bridge",
     "noVlanFiltering": "VLAN filtering is off on {{nodes}}",
     "createTitle": "Create a network",
-    "createDescription": "Points VM interfaces at a Linux bridge that already exists on the nodes. VMs on this network run only on nodes with the bridge.",
+    "createDescription": "Points VM interfaces at a Linux bridge on the nodes or at a VXLAN network that spans the nodes.",
     "created": "Created network {{name}}.",
     "deleteTitle": "Delete network {{name}}?",
-    "deleteDescription": "Only the network is removed. The bridges on the nodes are not changed.",
+    "deleteDescription": "Bridges you created on the nodes are not changed. For a VXLAN network, opld removes its bridge and VXLAN device from the nodes.",
     "deleted": "Deleted network {{name}}.",
     "inUse": "Remove the VM interfaces first.",
     "errors": {
       "reserved": "The name user is reserved for NAT.",
       "bridge": "Use 1–15 characters without /, : or spaces.",
-      "vlan": "Use a number from 1 to 4094."
+      "vlan": "Use a number from 1 to 4094.",
+      "managed": "Names like oplv100 and oplx100 are reserved for VXLAN networks.",
+      "vni": "Use a number from 1 to 16777215.",
+      "mtu": "Use a number from 1280 to 9000."
     }
   },
   "nodes": {
     "address": "API address",
+    "underlay": "Underlay address",
     "hypervisor": "Hypervisor",
     "arch": "Architecture",
     "cpus": "CPUs",

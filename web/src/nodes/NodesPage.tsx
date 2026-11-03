@@ -86,6 +86,7 @@ export function NodesPage() {
             <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("common.state")}</TableHead>
             <TableHead>{t("nodes.address")}</TableHead>
+            <TableHead>{t("nodes.underlay")}</TableHead>
             <TableHead>{t("nodes.hypervisor")}</TableHead>
             <TableHead>{t("nodes.arch")}</TableHead>
             <TableHead>{t("nodes.fencing")}</TableHead>
@@ -103,7 +104,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 12 : 11} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 13 : 12} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -125,6 +126,8 @@ export function NodesPage() {
                 </div>
               </TableCell>
               <TableCell className="font-mono text-xs">{node.spec.address}</TableCell>
+              {/* VXLAN 패킷을 주고받는 주소. 위트니스와 정하지 못한 노드는 없다. */}
+              <TableCell className="font-mono text-xs">{node.status.underlay ?? "—"}</TableCell>
               <TableCell>{node.status.hypervisor}</TableCell>
               {/* 옛 버전으로 등록한 노드는 모른다. */}
               <TableCell>{node.status.arch ?? "—"}</TableCell>

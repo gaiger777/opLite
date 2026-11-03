@@ -14,6 +14,7 @@ import { FormDialog } from "@/components/FormDialog";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import {
   Table,
   TableBody,
@@ -27,20 +28,38 @@ import { validName } from "@/vms/form";
 /** QEMU user 모드 NAT. 서버가 이 이름을 예약해 둔다. */
 const USER_NETWORK = "user";
 
-/** 서버의 `valid_ifname`: 1–15바이트의 보이는 ASCII, `/`·`:` 없음, `.`·`..`가 아님 */
+/** 서버의 `DEFAULT_VXLAN_MTU`: underlay 1500에서 VXLAN 머리 50바이트를 뺀 값 */
+const DEFAULT_VXLAN_MTU = 1450;
+
+/** 서버의 `is_managed_ifname`: opld가 VXLAN 네트워크에 쓰는 이름 모양이라 브리지로 쓸 수 없다. */
+function managedName(name: string): boolean {
+  return /^opl[vx][0-9]+$/.test(name);
+}
+
+/** 서버의 `valid_ifname`(1–15바이트의 보이는 ASCII, `/`·`:` 없음, `.`·`..`가 아님)이고 관리 이름이 아님 */
 export function validBridge(name: string): boolean {
-  return /^[\x21-\x7e]{1,15}$/.test(name) && !/[/:]/.test(name) && name !== "." && name !== "..";
+  return (
+    /^[\x21-\x7e]{1,15}$/.test(name) &&
+    !/[/:]/.test(name) &&
+    name !== "." &&
+    name !== ".." &&
+    !managedName(name)
+  );
+}
+
+/** VM NIC가 붙는 브리지: `bridge` 또는 opld가 만드는 `oplv<vni>`(서버의 `bridge_name`) */
+export function bridgeName(spec: Network["spec"]): string {
+  return spec.vxlan ? `oplv${spec.vxlan.vni}` : (spec.bridge ?? "");
 }
 
 /** 그 브리지가 있는 노드와, VLAN을 쓰는데 VLAN 필터링이 꺼진 노드 */
 export function bridgeNodes(network: Network, nodes: Node[]) {
-  const having = nodes.filter((n) => n.status.bridges.some((b) => b.name === network.spec.bridge));
+  const bridge = bridgeName(network.spec);
+  const having = nodes.filter((n) => n.status.bridges.some((b) => b.name === bridge));
   const noVlan =
     network.spec.vlan == null
       ? []
-      : having.filter(
-          (n) => !n.status.bridges.find((b) => b.name === network.spec.bridge)?.vlan_filtering,
-        );
+      : having.filter((n) => !n.status.bridges.find((b) => b.name === bridge)?.vlan_filtering);
   return { having, noVlan };
 }
 
@@ -77,8 +96,10 @@ export function NetworksPage() {
         <TableHeader>
           <TableRow>
             <TableHead>{t("common.name")}</TableHead>
+            <TableHead>{t("networks.kind")}</TableHead>
             <TableHead>{t("networks.bridge")}</TableHead>
-            <TableHead>{t("networks.vlan")}</TableHead>
+            <TableHead>{t("networks.vlanVni")}</TableHead>
+            <TableHead>{t("networks.mtu")}</TableHead>
             <TableHead>{t("networks.nodes")}</TableHead>
             <TableHead>{t("networks.vms")}</TableHead>
             {write && (
@@ -90,7 +111,7 @@ export function NetworksPage() {
         </TableHeader>
         <TableBody>
           {(networks.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 6 : 5} query={networks} empty={t("networks.empty")} />
+            <TableMessage colSpan={write ? 8 : 7} query={networks} empty={t("networks.empty")} />
           )}
           {(networks.data ?? []).map((network) => {
             const { having, noVlan } = bridgeNodes(network, nodes.data ?? []);
@@ -98,8 +119,14 @@ export function NetworksPage() {
             return (
               <TableRow key={network.id}>
                 <TableCell className="font-medium">{network.name}</TableCell>
-                <TableCell className="font-mono text-xs">{network.spec.bridge}</TableCell>
-                <TableCell>{network.spec.vlan ?? "—"}</TableCell>
+                <TableCell>
+                  {t(network.spec.vxlan ? "networks.kinds.vxlan" : "networks.kinds.bridge")}
+                </TableCell>
+                <TableCell className="font-mono text-xs">{bridgeName(network.spec)}</TableCell>
+                <TableCell>{network.spec.vxlan?.vni ?? network.spec.vlan ?? "—"}</TableCell>
+                <TableCell>
+                  {network.spec.vxlan ? (network.spec.mtu ?? DEFAULT_VXLAN_MTU) : "—"}
+                </TableCell>
                 <TableCell>
                   {!nodes.isSuccess ? (
                     "—"
@@ -163,13 +190,17 @@ function CreateNetworkDialog({ onClose }: { onClose(): void }) {
   const nodes = useList("node");
   const bridgesId = useId();
   const [name, setName] = useState("");
+  const [kind, setKind] = useState<"bridge" | "vxlan">("bridge");
   const [bridge, setBridge] = useState("");
   const [vlan, setVlan] = useState("");
+  const [vni, setVni] = useState("");
+  const [mtu, setMtu] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
   // 노드가 알린 브리지를 제안한다. 아직 브리지를 만들지 않은 노드도 있으므로 직접 쓸 수도 있다.
-  const known = [
-    ...new Set((nodes.data ?? []).flatMap((n) => n.status.bridges.map((b) => b.name))),
-  ].sort();
+  // opld가 VXLAN 네트워크에 만든 브리지(관리 이름)는 쓸 수 없으므로 뺀다.
+  const known = [...new Set((nodes.data ?? []).flatMap((n) => n.status.bridges.map((b) => b.name)))]
+    .filter((b) => !managedName(b))
+    .sort();
 
   async function submit() {
     const found: Record<string, string> = {};
@@ -178,23 +209,35 @@ function CreateNetworkDialog({ onClose }: { onClose(): void }) {
     } else if (!validName(name)) {
       found.name = "forms.name";
     }
-    if (!validBridge(bridge)) {
-      found.bridge = "networks.errors.bridge";
-    }
     // 숫자만 받는다(`Number`는 "0x10"·"1e3"도 읽는다).
-    const tag = Number(vlan);
-    if (vlan !== "" && !(/^\d+$/.test(vlan) && tag >= 1 && tag <= 4094)) {
-      found.vlan = "networks.errors.vlan";
+    const inRange = (value: string, min: number, max: number) =>
+      /^\d+$/.test(value) && Number(value) >= min && Number(value) <= max;
+    if (kind === "bridge") {
+      if (managedName(bridge)) {
+        found.bridge = "networks.errors.managed";
+      } else if (!validBridge(bridge)) {
+        found.bridge = "networks.errors.bridge";
+      }
+      if (vlan !== "" && !inRange(vlan, 1, 4094)) {
+        found.vlan = "networks.errors.vlan";
+      }
+    } else {
+      if (!inRange(vni, 1, 16777215)) {
+        found.vni = "networks.errors.vni";
+      }
+      if (mtu !== "" && !inRange(mtu, 1280, 9000)) {
+        found.mtu = "networks.errors.mtu";
+      }
     }
     setErrors(found);
     if (Object.keys(found).length > 0) {
       return false;
     }
-    await call(
-      api.POST("/networks", {
-        body: { name, spec: { bridge, vlan: vlan === "" ? null : tag } },
-      }),
-    );
+    const spec =
+      kind === "bridge"
+        ? { bridge, vlan: vlan === "" ? null : Number(vlan) }
+        : { vxlan: { vni: Number(vni) }, ...(mtu !== "" && { mtu: Number(mtu) }) };
+    await call(api.POST("/networks", { body: { name, spec } }));
     toast.success(t("networks.created", { name }));
   }
 
@@ -216,39 +259,93 @@ function CreateNetworkDialog({ onClose }: { onClose(): void }) {
           />
         )}
       </Field>
-      <Field id="network-bridge" label={t("networks.bridge")} error={errors.bridge}>
+      <Field id="network-kind" label={t("networks.kind")} hint={t(`networks.kindHint.${kind}`)}>
         {(a11y) => (
-          <Input
-            id="network-bridge"
-            list={bridgesId}
-            placeholder="vmbr0"
-            value={bridge}
-            onChange={(e) => setBridge(e.target.value)}
+          <NativeSelect
+            id="network-kind"
+            className="w-full"
+            value={kind}
+            onChange={(e) => setKind(e.target.value as "bridge" | "vxlan")}
             {...a11y}
-          />
+          >
+            <NativeSelectOption value="bridge">{t("networks.kinds.bridge")}</NativeSelectOption>
+            <NativeSelectOption value="vxlan">{t("networks.kinds.vxlan")}</NativeSelectOption>
+          </NativeSelect>
         )}
       </Field>
-      <datalist id={bridgesId}>
-        {known.map((b) => (
-          <option key={b} value={b} />
-        ))}
-      </datalist>
-      <Field
-        id="network-vlan"
-        label={t("networks.vlanOptional")}
-        error={errors.vlan}
-        hint={t("networks.vlanHint")}
-      >
-        {(a11y) => (
-          <Input
+      {kind === "bridge" ? (
+        <>
+          <Field id="network-bridge" label={t("networks.bridge")} error={errors.bridge}>
+            {(a11y) => (
+              <Input
+                id="network-bridge"
+                list={bridgesId}
+                placeholder="vmbr0"
+                value={bridge}
+                onChange={(e) => setBridge(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          <datalist id={bridgesId}>
+            {known.map((b) => (
+              <option key={b} value={b} />
+            ))}
+          </datalist>
+          <Field
             id="network-vlan"
-            inputMode="numeric"
-            value={vlan}
-            onChange={(e) => setVlan(e.target.value)}
-            {...a11y}
-          />
-        )}
-      </Field>
+            label={t("networks.vlanOptional")}
+            error={errors.vlan}
+            hint={t("networks.vlanHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="network-vlan"
+                inputMode="numeric"
+                value={vlan}
+                onChange={(e) => setVlan(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+        </>
+      ) : (
+        <>
+          <Field
+            id="network-vni"
+            label={t("networks.vni")}
+            error={errors.vni}
+            hint={t("networks.vniHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="network-vni"
+                inputMode="numeric"
+                value={vni}
+                onChange={(e) => setVni(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+          <Field
+            id="network-mtu"
+            label={t("networks.mtuOptional")}
+            error={errors.mtu}
+            hint={t("networks.mtuHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="network-mtu"
+                inputMode="numeric"
+                placeholder={String(DEFAULT_VXLAN_MTU)}
+                value={mtu}
+                onChange={(e) => setMtu(e.target.value)}
+                {...a11y}
+              />
+            )}
+          </Field>
+        </>
+      )}
     </FormDialog>
   );
 }

@@ -17,6 +17,7 @@ const DOWN = {
     online: false,
     bridges: [{ name: "vmbr0", vlan_filtering: true }],
     arch: "aarch64" as const,
+    underlay: "fd00::2",
   },
 };
 
@@ -57,6 +58,12 @@ it("lists nodes with their state, capacity and VMs", async () => {
   expect(within(b).getAllByRole("cell")[archColumn]).toHaveTextContent("aarch64");
   // 옛 버전으로 등록한 노드는 아키텍처를 모른다.
   expect(within(a).getAllByRole("cell")[archColumn]).toHaveTextContent("—");
+  // VXLAN 패킷을 주고받는 주소. 정하지 못한 노드는 없다.
+  const underlayColumn = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Underlay address");
+  expect(within(b).getAllByRole("cell")[underlayColumn]).toHaveTextContent("fd00::2");
+  expect(within(a).getAllByRole("cell")[underlayColumn]).toHaveTextContent("—");
 });
 
 it("marks witness nodes", async () => {
