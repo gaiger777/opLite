@@ -847,6 +847,87 @@ sudo kill -TERM "$(pidof opld)"; sleep 15; cat /sys/class/watchdog/watchdog0/sta
 sudo modprobe -r softdog                                        # 끝나면
 ```
 
+## 백업과 복원
+
+백업은 VM 전체(디스크, UEFI 변수, VM 스펙)를 다른 저장소에 떠 둔 것이다. 스냅샷과 달리 VM 디스크의 저장소를
+잃거나 VM을 지워도 남고, 언제든 **새 VM**으로 되살린다. 백업은 `backups`를 켠 **디렉터리·NFS 풀**(백업 풀)에 둔다.
+
+```bash
+oplctl pool create bk --nfs nas.lan:/srv/backup --backups    # 백업 풀(디렉터리 풀이면 --path /srv/backup)
+oplctl pool set local --backups true                         # 있는 dir·NFS 풀을 백업 풀로(false는 끄기)
+oplctl backup create web --pool bk                           # 이름은 web-20261104-030000(UTC)처럼 정해진다
+oplctl backup create web --pool bk --name before-upgrade
+oplctl backup list                                           # --vm web이면 지금 web인 VM과 web이라는 이름으로 남은(지운 VM) 백업
+# NAME            VM   POOL  PHASE  CREATED               SIZE
+# before-upgrade  web  bk    ready  2026-11-04 03:00 UTC  412.5MiB
+oplctl backup get before-upgrade                             # 디스크별 크기, UEFI 변수, 오류(JSON)
+oplctl backup restore before-upgrade --name web2 --pool local   # 새 VM web2(꺼진 채), --node로 노드를 정할 수 있다
+oplctl backup delete before-upgrade                          # 파일과 리소스를 지운다(실패한 백업도)
+```
+
+웹은 사이드바의 "백업" 화면(모든 백업, VM이 지워진 백업 포함)과 VM 상세의 "백업" 탭(지금 백업, 복원)에서 하고,
+스토리지 풀 화면의 "백업 저장" 스위치로 백업 풀을 정한다. API는 `POST /api/v1/vms/{name}/backups`
+(`{"pool": …, "name": …}`), `GET /api/v1/backups[?vm=]`, `GET`·`DELETE /api/v1/backups/{name}`,
+`POST /api/v1/backups/{name}/restore`(`{"name": …, "pool": …, "node": …}`)이고 만들기·지우기·복원은 작업(Task)을 돌려준다.
+`DELETE /api/v1/backups/{name}?force=true`(`oplctl backup delete NAME --force`)는 파일을 지울 노드가 없을 때 리소스만
+지우고 200(`{"message": …}`)이다.
+
+- **백업 풀.** dir·NFS 풀만 백업을 담는다(다른 풀은 400). 백업 풀에도 지금처럼 VM 디스크를 둘 수 있다. 백업이 남은
+  풀은 지울 수 없고 `backups`를 끄거나 `shared`를 바꿀 수도 없다(409 `pool_in_use`, "holds backups"). 백업 디렉터리를
+  다른 서버에 두려면 NFS 풀을 쓴다 — 공유가 아닌 디렉터리 풀은 노드 로컬이라 그 노드의 디스크를 잃으면 함께 잃는다.
+  공유가 아닌 풀의 백업은 쓴 노드를 기억하고(`status.node`) 그 노드에서만 복원하고 지운다: 복원에서 다른 `node`를
+  주면 409 `backup_on_other_node`, 그 노드가 오프라인이면 409 `node_offline`, 대상 풀을 그 노드에서 쓸 수 없으면 409
+  `pool_not_on_node`다. 그 노드를 잃었으면 `oplctl backup delete NAME --force`(`DELETE …?force=true`)로 리소스만
+  지운다(파일은 남는다). 풀째 지워진
+  백업(저장소에서 풀이 사라짐)은 보통의 지우기가 리소스만 지운다.
+- **실행 중·꺼진 VM.** 실행 중인 VM은 디스크마다 메모리 없는 임시 스냅샷(이름은 하이픈 없는 백업 id)을 찍어 그때의
+  내용을 복사하고 끝나면 지운다. VM은 계속 돈다(블록 풀 디스크는 스냅샷을 찍는 동안만 잠깐 멈춘다). 그래서 실행
+  중인 VM의 디스크는 모두 스냅샷을 지원해야 한다 — dir·NFS 풀의 raw 디스크나 공유 LVM 풀 디스크가 있으면 409
+  `vm_running`("stop it to back it up")이고, VM을 끄면 된다. 스냅샷처럼 방식이 다른 디스크(qcow2와 블록 풀, 서로 다른
+  블록 백엔드)가 섞여도 409 `snapshot_unsupported`다. 블록 풀 디스크를 위해 멈춘 VM을 이어서 실행하지 못하면 한 번 더
+  해 보고, 그래도 안 되면 디스크를 읽지 않고 백업이 실패한다. 백업 작업이 도는 동안 그 VM의 시작·정지·수정·지우기와
+  마이그레이션은 409 `vm_busy`다(강제 정지는 된다). 작업은 VM의 노드에서 돈다. 배치된 적 없는 꺼진 VM은 백업 풀과
+  디스크를 모두 읽을 수 있는 온라인 노드에서 한다(없으면 409 `no_node`).
+- **crash-consistent.** 백업은 그 순간에 전원을 뽑은 것과 같은 디스크다(게스트 파일 시스템을 얼리지 않는다). 파일
+  시스템 저널은 되살아나지만, 데이터베이스처럼 메모리에 쓰기를 쥐는 앱은 게스트 안에서 덤프를 떠 두거나 백업 동안
+  쓰기를 멈춰 일관성을 맞춘다. 꺼진 VM의 백업은 일관적이다. 디스크 파일은 `qemu-img`가 닫을 때 디스크에 내려
+  쓰고(`-t writeback`), `vars.fd`와 `manifest.json`은 fsync한 뒤 이름을 바꾸고 백업 디렉터리도 fsync한 다음에야
+  `ready`가 된다.
+- **복원.** 늘 새 VM이다(기존 VM을 덮어쓰지 않는다). 디스크마다 대상 풀에 새 볼륨 `{새 이름}-disk0`, `-disk1`…을
+  만든다(블록 풀이면 raw, 아니면 qcow2). 새 VM은 백업 때의 VM 스펙(CPU·메모리·NIC·펌웨어 등)과 UEFI 변수를 받고, 새
+  MAC, 꺼진 채, 노드·예약 스냅샷 없음, HA 끔이다. VM 스펙은 클러스터의 백업 기록에서 가져오고 `manifest.json`이
+  그 기록(VM 스펙, 디스크 수)과 다르면 실패한다. 백업 디렉터리의 디스크·`vars.fd`는 일반 파일이어야 한다(심볼릭
+  링크는 거절). 스펙의 네트워크와 보안 그룹이 지금 있어야 한다(400). 복원은 백업
+  풀과 대상 풀을 함께 쓸 수 있는 노드에서 돈다. 실패하면 만든 볼륨을 지운다. 이름을 원래대로 돌리려면 원본을
+  지운 뒤 그 이름으로 복원한다.
+- **권한.** 읽기는 모든 사용자, 만들기·지우기·복원은 operator 이상이다(VM이 지워진 백업도 operator가 지운다).
+- **오래 걸린다.** 진행률은 없고 작업에 시간 제한이 없다. `oplctl backup create`·`restore`는 24시간까지 기다리고,
+  그 뒤에도 작업은 돈다(`oplctl task get`). 백업 하나는 디스크 크기만큼 읽고 압축해 쓴다(증분은 없다).
+
+**파일 형식과 opLite 없이 열기.** 백업 하나는 백업 풀 루트의 `backups/{백업 id}/` 디렉터리다(id는 `oplctl backup
+get NAME`의 `id`; NFS 풀이면 NFS 서버의 내보내기 아래 같은 경로). 그 안에 디스크마다 압축 qcow2 `disk0.qcow2`,
+`disk1.qcow2`…(backing file 없음, 스냅샷 없음), UEFI VM이면 변수 파일 `vars.fd`, 그리고 `manifest.json`(형식 버전
+`version: 1`, 백업 id, VM id·이름, VM 스펙 전체, 디스크 목록과 크기, 만든 시각)이 있다. 표준 qcow2라 opLite 없이도 연다:
+
+```bash
+qemu-img info backups/<id>/disk0.qcow2                                  # 크기 확인
+qemu-img convert -O raw backups/<id>/disk0.qcow2 disk0.raw              # raw 이미지로(dd로 디스크에 써도 된다)
+qemu-system-x86_64 -m 2048 -drive file=backups/<id>/disk0.qcow2,snapshot=on   # 원본을 바꾸지 않고 켜 보기
+jq .vm_spec backups/<id>/manifest.json                                 # CPU·메모리·NIC 등 VM 설정
+```
+
+UEFI VM은 OVMF(arm64는 AAVMF) 코드 파일과 함께 `vars.fd`의 사본을 `-drive if=pflash`로 준다. 다른 형식 버전의
+매니페스트는 복원하지 않는다(작업이 실패한다).
+
+- **한계.** 증분·변경 블록 추적, 중복 제거, 암호화, 원격(S3) 저장소, 게스트 에이전트로 얼리기, 파일 단위 복원, 기존
+  VM 덮어쓰기는 없다. 예약 백업과 보존 규칙은 계획 28에서 온다(지금은 손으로 만들고 지운다).
+- **남을 수 있는 것.** 작업을 만들기 전에 실패하거나 작업이 사라져 `pending`에 머문 백업은 저절로 치워지지 않는다 —
+  `oplctl backup delete`로 지운다. 실행 중 백업이 임시 스냅샷을 지우지 못하면 qcow2 디스크에 그 태그가 남을 수 있다
+  (블록 풀 디스크는 opld가 나중에 지운다; qcow2는 VM을 끄고 `qemu-img snapshot -d <태그> <파일>`). 복원이 볼륨을
+  다 만든 뒤 VM을 만들기 전에 opld가 죽으면 `{새 이름}-disk{i}` 볼륨이 남는다(복제도 같다) — `oplctl volume delete`로
+  지운다. 백업 디렉터리의 파일 작업에는 시간 제한이 없어, NFS 서버가 멈추면(hard 마운트) 백업·지우기·복원 작업이
+  서버가 돌아올 때까지 멈춘다.
+
 ## 웹 UI
 
 opld를 `web-ui` 기능으로 빌드하면 API와 같은 주소(`https://<노드>:8006/`)에서 웹 UI가 열린다.
@@ -863,8 +944,8 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 -fingerprint -sha256`의 지문을 `cluster init` 출력과 비교) 운영체제나 브라우저의 신뢰할 인증서로
 가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
-웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션),
-볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업,
+웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
+볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기), 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업,
 사용자(admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
@@ -924,6 +1005,7 @@ cargo test -p opl-driver --features qemu-it --test qemu_driver      # 드라이�
 cargo test -p opl-reconciler --features qemu-it --test qemu_restart # reconciler: opld 재시작 후 재연결
 cargo test -p opl-api --features storage-it --test volumes          # API: 볼륨 생성·가져오기 (qemu-img)
 cargo test -p opld --features qemu-it --test e2e                    # E2E: CLI → VM → 콘솔 → kill -9 → 재연결
+cargo test -p opld --features qemu-it --test backup                 # E2E: 실행 중 백업 → VM 지우기 → 복원(qemu-img, qemu-io 필요)
 cargo test -p opld --test cluster                                   # E2E: opld 프로세스 3개로 클러스터 구성
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
@@ -1078,6 +1160,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [라이브 마이그레이션 설계 (하위 프로젝트 4: 계획 20·21)](docs/superpowers/specs/2026-10-30-live-migration-design.md)
 - [HA·펜싱·위트니스 설계 (하위 프로젝트 5: 계획 22·23·24)](docs/superpowers/specs/2026-11-02-ha-fencing-witness-design.md)
 - [네트워크·SDN 설계 (하위 프로젝트 6: 계획 25·26)](docs/superpowers/specs/2026-11-03-network-sdn-design.md)
+- [백업 설계 (하위 프로젝트 7: 계획 27·28)](docs/superpowers/specs/2026-11-04-backup-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)
