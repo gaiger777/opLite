@@ -324,7 +324,7 @@ pub(crate) fn check_backup(
 }
 
 /// [`check_backup`]을 거친 VM의 `pending` 백업 `name`을 만들고 노드 `node`에서 그것을 채울 Task를
-/// 돌려준다. 백업 작업이 만드는 백업은 `job`에 작업 id를 적는다.
+/// 돌려준다. 이름이 올바르지 않으면 400. 백업 작업이 만드는 백업은 `job`에 작업 id를 적는다.
 pub(crate) async fn start_backup(
     state: &AppState,
     vm: &Vm,
@@ -333,6 +333,7 @@ pub(crate) async fn start_backup(
     name: String,
     job: Option<Uuid>,
 ) -> Result<Task, ApiError> {
+    check_name(&name)?;
     let backup: Backup = Resource::new(
         name,
         BackupSpec {

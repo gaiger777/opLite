@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use opl_api::{ClusterJanitorConfig, SnapshotSchedulerConfig};
+use opl_api::{BackupJobSchedulerConfig, ClusterJanitorConfig, SnapshotSchedulerConfig};
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
 use opl_reconciler::ha::{DeviceWatchdog, WatchdogOpener};
@@ -52,6 +52,8 @@ pub struct Config {
     pub schedule: ScheduleSection,
     #[serde(default)]
     pub janitor: JanitorSection,
+    #[serde(default)]
+    pub backup: BackupSection,
     #[serde(default)]
     pub pools: PoolsSection,
     #[serde(default)]
@@ -190,6 +192,36 @@ impl JanitorSection {
             task_max_finished: self.task_max_finished,
             // 고아 스냅샷·끝난 Task의 유예는 설정하지 않는다(기본 30초·10분).
             ..ClusterJanitorConfig::default()
+        }
+    }
+}
+
+/// 백업 작업 스케줄러(리더)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSection {
+    /// 작업을 확인하는 간격(초)
+    #[serde(default = "default_tick_secs")]
+    pub tick_secs: u64,
+    /// 노드마다 동시에 도는 백업 Task의 최대 수
+    #[serde(default = "default_backup_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+impl Default for BackupSection {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_tick_secs(),
+            max_concurrent: default_backup_max_concurrent(),
+        }
+    }
+}
+
+impl BackupSection {
+    pub fn scheduler_config(&self) -> BackupJobSchedulerConfig {
+        BackupJobSchedulerConfig {
+            tick: Duration::from_secs(self.tick_secs),
+            max_concurrent: self.max_concurrent,
         }
     }
 }
@@ -466,6 +498,9 @@ fn default_tick_secs() -> u64 {
 fn default_hour_secs() -> u64 {
     3600
 }
+fn default_backup_max_concurrent() -> usize {
+    2
+}
 fn default_janitor_tick_secs() -> u64 {
     10
 }
@@ -553,6 +588,9 @@ impl Config {
         // 날수를 초로 바꿀 때 넘치지 않도록 100년까지만 받는다.
         if self.janitor.task_max_age_days > MAX_TASK_AGE_DAYS {
             anyhow::bail!("janitor.task_max_age_days must be at most {MAX_TASK_AGE_DAYS}");
+        }
+        if self.backup.tick_secs == 0 || self.backup.max_concurrent == 0 {
+            anyhow::bail!("backup.tick_secs and backup.max_concurrent must be at least 1");
         }
         if self.pools.refresh_secs == 0 {
             anyhow::bail!("pools.refresh_secs must be at least 1");
@@ -747,6 +785,9 @@ mod tests {
         assert_eq!(janitor.task_max_age, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(janitor.task_max_finished, 1000);
         assert_eq!(janitor.finished_grace, Duration::from_secs(600));
+        let backup = c.backup.scheduler_config();
+        assert_eq!(backup.tick, Duration::from_secs(60));
+        assert_eq!(backup.max_concurrent, 2);
         assert_eq!(c.pools.refresh(), Duration::from_secs(15));
         assert_eq!(c.migration.ports, 60000..=60099);
         assert_eq!(c.migration.bandwidth_mib, 0);
@@ -884,6 +925,22 @@ mod tests {
             let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[janitor]\n{bad}"));
             assert!(c.validate().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn backup_section_sets_the_tick_and_the_limit_but_not_to_zero() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[backup]\ntick_secs = 1\nmax_concurrent = 4");
+        assert!(c.validate().is_ok());
+        let backup = c.backup.scheduler_config();
+        assert_eq!(backup.tick, Duration::from_secs(1));
+        assert_eq!(backup.max_concurrent, 4);
+        for bad in ["tick_secs = 0", "max_concurrent = 0"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[backup]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[backup]\ntick = 1").is_err()
+        );
     }
 
     #[test]

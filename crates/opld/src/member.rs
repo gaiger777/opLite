@@ -13,8 +13,8 @@ use axum::serve::ListenerExt;
 use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
-    AppState, ClusterJanitor, HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations,
-    SnapshotScheduler, TaskRunner, TaskRunnerConfig, UefiVarsFetcher,
+    AppState, BackupJobScheduler, ClusterJanitor, HaManager, HaManagerConfig, IncomingConfig,
+    IncomingMigrations, SnapshotScheduler, TaskRunner, TaskRunnerConfig, UefiVarsFetcher,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
@@ -115,6 +115,8 @@ struct Services {
     monitor: NodeMonitor,
     schedule: SnapshotScheduler,
     janitor: ClusterJanitor,
+    /// 리더가 백업 작업을 실행한다.
+    backups: BackupJobScheduler,
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
     recovery: HaManager,
     pools: PoolMounter,
@@ -139,6 +141,7 @@ impl Services {
         self.monitor.shutdown().await;
         self.schedule.shutdown().await;
         self.janitor.shutdown().await;
+        self.backups.shutdown().await;
         self.recovery.shutdown().await;
         self.pools.shutdown().await;
         if let Some(overlay) = self.overlay {
@@ -431,6 +434,7 @@ impl Member {
         let state = Arc::new(state);
         let schedule = SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config());
         let janitor = ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config());
+        let backups = BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config());
         let recovery = HaManager::spawn(state.clone(), HaManagerConfig::default());
         let app = opl_api::router(state).merge(crate::web::router());
         let task = tokio::spawn(async move {
@@ -459,6 +463,7 @@ impl Member {
                 monitor,
                 schedule,
                 janitor,
+                backups,
                 recovery,
                 pools,
                 overlay,

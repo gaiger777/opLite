@@ -36,6 +36,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
+pub use backup_jobs::{BackupJobScheduler, BackupJobSchedulerConfig};
 pub use firmware::UefiVarsFetcher;
 pub use ha::{HaManager, HaManagerConfig, RecoveryWriter};
 pub use incoming::{IncomingConfig, IncomingMigrations};
