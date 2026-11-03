@@ -38,7 +38,7 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 
 구현: 하위 프로젝트 5는 계획 22(위트니스 노드: VM을 돌리지 않는 Raft 투표 멤버, 완료), 계획 23(HA 리스와 watchdog 자기 펜싱: `VmSpec.ha`, 리더의 리스 표, 노드의 `HaGuard`, 리스를 잃으면 HA VM을 끔, 완료), 계획 24(리더의 HA VM 복구: `HaManager`가 리스가 끝난 노드의 HA VM을 다른 노드로 옮기고 기록 Task `vm-ha-recover`를 남김, 이미지 잠금 기다리기, HA는 멈춘 VM에서만 켬, 실제 시험 `ha-it`, 완료)로 나눴다(`2026-11-02-ha-fencing-witness-design.md`). 하위 프로젝트 5는 끝났다. 외부 펜싱 장치, 유지보수 때 모두 옮기기, HA 그룹·우선순위, HA 아닌 VM의 자동 복구는 넣지 않았다.
 
-구현: 하위 프로젝트 6은 계획 25(VXLAN 네트워크: opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만들고 다른 노드의 underlay를 FDB에 넣음, 노드 underlay, tap MTU와 `host_mtu`, 완료)와 계획 26(VM 방화벽: 보안 그룹과 nftables bridge 규칙, 남음)으로 나눴다(`2026-11-03-network-sdn-design.md`). 하위 프로젝트 6은 진행 중이다.
+구현: 하위 프로젝트 6은 계획 25(VXLAN 네트워크: opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만들고 다른 노드의 underlay를 FDB에 넣음, 노드 underlay, tap MTU와 `host_mtu`, 완료)와 계획 26(VM 방화벽: 보안 그룹 `SecurityGroup`을 VM NIC에 걸고 노드마다 nftables `bridge opl_<태그>` 테이블로 tap에서 거름, 노드 능력 `firewall`과 스케줄러 조건, 켜기 직전 규칙 넣기, 완료)으로 나눴다(`2026-11-03-network-sdn-design.md`). 하위 프로젝트 6은 끝났다. IPAM·DHCP·라우팅·SNAT, EVPN·BGP, VXLAN 암호화, 그룹을 원격으로 가리키는 규칙, 방화벽 로그, IP·ARP 위조 막기는 넣지 않았다.
 
 ### 1.2 검토했지만 채택하지 않은 대안
 
@@ -256,6 +256,8 @@ trait Storage: Send + Sync {
 - 브리지 생성과 관리, SDN, 방화벽은 하위 프로젝트 6에서 다룬다.
 
 구현(계획 25): VXLAN 네트워크(`spec: { vxlan: { vni }, mtu }`)는 관리자가 만든 브리지 대신 opld가 노드마다 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만든다. 노드의 오버레이 에이전트가 장치를 만들거나 지우면 1분을 기다리지 않고 곧바로 브리지 목록을 알린다. tap은 붙을 브리지의 MTU를 따른다. 물리 NIC·업링크 브리지 관리는 여전히 관리자 몫이다(`2026-11-03-network-sdn-design.md` §2).
+
+구현(계획 26): VM 방화벽은 NIC의 보안 그룹(`NicSpec.security_groups`)으로 켠다. 노드의 opld가 클러스터의 모든 방화벽 NIC를 nftables bridge family 테이블 `bridge opl_<클러스터 태그>` 하나로 만들어 `nft -f -`로 한 번에 바꾸고(tap 이름 → NIC 체인 판정 맵, `forward`·`input`·`output` 훅), 워커는 그런 VM을 켜기 직전에 규칙을 넣지 못하면 켜지 않는다. 노드는 `NodeStatus.firewall`로 능력을 알리고 스케줄러가 쓴다(`2026-11-03-network-sdn-design.md` §3).
 
 ## 8. 클러스터 부트스트랩과 보안
 

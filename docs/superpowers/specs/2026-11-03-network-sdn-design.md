@@ -12,7 +12,7 @@
 | 25 | VXLAN 네트워크: opld가 모든 노드에 브리지와 VXLAN 장치를 만들고 관리한다(노드 underlay 주소, 피어 목록, MTU), 스케줄러·API·oplctl·웹 |
 | 26 | VM 방화벽: 보안 그룹(`SecurityGroup`) 리소스, NIC마다 보안 그룹, 노드가 클러스터 상태로 nftables(bridge family) 규칙을 만들어 통째로 바꾼다, 상태 추적·MAC 위조 막기 |
 
-넣지 않는 것: 물리 NIC·본딩·업링크 브리지 관리(설치 ISO, 하위 프로젝트 9에서), EVPN·BGP 제어 평면, IPAM·DHCP·SNAT(서브넷), VXLAN 암호화, 노드(호스트) 방화벽과 클러스터 전체 규칙, IP 위조 막기(IPAM이 필요), 원격으로 다른 보안 그룹 가리키기, 규칙 로그, 실행 중 VM의 NIC 추가·제거(지금처럼 다음 시작에 반영).
+넣지 않는 것: 물리 NIC·본딩·업링크 브리지 관리(설치 ISO, 하위 프로젝트 9에서), EVPN·BGP 제어 평면, IPAM·DHCP·SNAT(서브넷), VXLAN 암호화, 노드(호스트) 방화벽과 클러스터 전체 규칙, IP 위조 막기(IPAM이 필요), 원격으로 다른 보안 그룹 가리키기, 규칙 로그, 실행 중 VM의 NIC 추가·제거(실행 중에는 막는다 — 멈춘 뒤 바꾼다).
 
 ### 견준 길
 
@@ -107,11 +107,15 @@ spec:
 - `remote`(선택): CIDR. `in`이면 보낸 쪽, `out`이면 받는 쪽 주소. 없으면 어디든. IPv4 CIDR은 IPv4 패킷에만, IPv6은 IPv6에만 맞는다. `icmp`는 IPv4, `icmpv6`는 IPv6에만 쓸 수 있다.
 - 규칙은 그룹당 200개까지. 이름 규칙은 다른 리소스와 같다. VM이 쓰는 그룹은 지울 수 없다(409 `security_group_in_use`).
 
+구현(계획 26): `opl_types::security_group`의 `SecurityGroup = Resource<SecurityGroupSpec { description: Option<String>, rules: Vec<Rule> }, SecurityGroupStatus {}>`, `Kind::SecurityGroup`(`security-group`). `Rule { direction: Direction(In|Out), action: Action(Accept|Drop), protocol: Option<Protocol(Tcp|Udp|Icmp|Icmpv6)>, ports: Option<PortRange { start, end }>, remote: Option<Cidr { addr, prefix }> }`는 `deny_unknown_fields`, None은 빼고 쓴다. `PortRange`·`Cidr`는 `FromStr`·`Display`로 JSON 문자열(`"22"`·`"8000-8080"`, `"10.0.0.0/8"`)이고 OpenAPI도 문자열이다. `Cidr`는 새 크레이트 없이 직접 읽는다(접두사를 빼면 /32·/128, 접두사 밖 비트가 켜져 있으면 거절). 상수 `MAX_RULES = 200`, `MAX_DESCRIPTION = 200`, 오류 `SecurityGroupError::{LongDescription, TooManyRules, Rule(n, RuleError)}`(메시지 "rule 3: …", 번호는 1부터). API는 `crates/opl-api/src/security_groups.rs`(만들기·`PATCH`·지우기, 목록·읽기는 다른 리소스와 같은 매크로)이고 쓰기는 admin만이다. `PATCH` 본문 `SecurityGroupPatch { description, rules }`는 보낸 필드만 바꾸고 빈 `description`은 지운다. `If-Match`가 없으면 revision 충돌 때 다시 읽어 되풀이하고, 오래된 `If-Match`는 412다. watch 종류에 `security-group`이 있다.
+
 ### 3.2 NIC에 걸기
 
 - `NicSpec.security_groups: Vec<String>`(기본 빈 목록, 비면 직렬화에서 뺀다). 비어 있지 않으면 그 NIC의 방화벽이 켜진다. 규칙 없는 그룹 하나만 걸면 "들어오기 모두 차단, 나가기 모두 허용"이다.
 - NIC당 8개까지, 겹치면 안 되고, 모두 있어야 한다(400). `user` 네트워크 NIC에는 걸 수 없다(400).
 - 실행 중에도 바꿀 수 있고 곧바로 적용된다(디스크·노드처럼 막지 않는다). 그룹 규칙을 바꿔도 곧바로 적용된다.
+
+구현(계획 26): `NicSpec.security_groups`(serde 기본, 비면 뺀다), `MAX_NIC_SECURITY_GROUPS = 8`, `ValidationError::{TooManySecurityGroups(nic), DuplicateSecurityGroup(nic, name)}`, `VmSpec::has_firewall()`(그룹을 건 NIC가 있는지). 같은 그룹을 여러 NIC에 거는 것은 된다. 그룹이 있는지와 `user` 네트워크가 아닌지는 API(VM 만들기·바꾸기·되돌리기는 `prepare`의 `check_security_groups`, 복제는 `clone_vm`이 같은 함수로)가 본다(400 "security group \"db\" not found", "NIC 0: security groups cannot be used on the \"user\" network"). VM 바꾸기의 실행 중 금지 목록에 `security_groups`는 없다. 다만 방화벽 NIC가 있는(바꾸기 전이나 뒤) 실행 중 VM은 NIC의 그룹 말고는 바꿀 수 없고(409 `vm_running` "cannot change the NICs of VM … while it is running; only security groups can change"), 방화벽 NIC가 없어도 실행 중 VM의 NIC 개수·순번별 MAC은 바꿀 수 없다(409 `vm_running` "cannot change the number, order or MAC addresses of the NICs of VM … while it is running; stop it first" — 그룹 없이 순서를 바꾼 뒤 그룹을 거는 두 번의 바꾸기도 막는다) — 규칙은 spec의 NIC 순번·MAC으로 tap을 정하므로 도는 tap과 어긋나 열린 채가 되지 않게. 방화벽 NIC가 없는 실행 중 VM의 네트워크·모델 변경은 지금처럼 다음 시작에 반영된다. 웹 VM 폼은 실행 중이면 NIC 더하기·빼기와 MAC 편집을 막는다(`vmForm.nicsRunning`). 노드를 정한(`spec.node`) VM에 그룹을 걸면 그 노드의 `status.firewall`이 참이어야 한다(409 `firewall_unsupported` "node … has no firewall (nftables) for security groups", 계획 26 노드 단계). 그룹 지우기는 VM 쓰기와 같은 `vm_lock`을 쥐고 사용 검사와 지우기를 한다.
 
 ### 3.3 규칙의 뜻
 
@@ -121,6 +125,8 @@ spec:
 - 들어오기(밖 → VM): ① ARP, IPv6 이웃 찾기(neighbor solicit·advert, router advert), DHCP 응답(UDP 67→68, 547→546) 허용 ② 이미 맺은 연결 허용, 잘못된 패킷 차단 ③ `in` 규칙 ④ 기본 차단.
 - 같은 브리지의 방화벽 VM 둘 사이 패킷은 보낸 VM의 나가기와 받는 VM의 들어오기를 모두 통과해야 한다. 나가기 체인의 허용은 `return`(다음 검사로), 차단만 끝이다.
 - 노드 자신과의 트래픽(브리지에 노드 주소가 있을 때)도 같은 체인을 탄다(bridge `input`·`output` 훅).
+
+구현(계획 26): `opl_driver::firewall`의 `FirewallNic { tap, mac, rules }`와 순수 함수 `ruleset(tag, nics) -> String`. 글은 `table bridge opl_T {}` → `delete table bridge opl_T` → (방화벽 NIC가 있으면) 새 정의 순이고, 정의 안은 NIC 체인(`o_<tap>`·`i_<tap>`) → 판정 맵(`out_nics`·`in_nics`, `type ifname : verdict`) → 훅 체인(`forward`: `iifname vmap @out_nics`·`oifname vmap @in_nics`, `input`: `iifname vmap @out_nics`, `output`: `oifname vmap @in_nics`, 모두 priority 0, policy accept) 순이다. 나가기 체인은 `ether saddr != MAC drop` → `meta protocol arp return` → `ct state established,related return` → `ct state invalid drop` → `out` 규칙(허용은 `return`, 차단은 `drop`), 들어오기 체인은 ARP(`meta protocol arp`)·이웃 찾기·DHCP 응답 `accept` → established·invalid → `in` 규칙 → `drop`이다. 규칙 한 줄은 remote(`meta protocol ip ip saddr|daddr C`/`meta protocol ip6 ip6 …`, 접두사 0이면 그 주소 체계 전체 `meta protocol ip`/`ip6`) → `meta l4proto tcp|udp|icmp|ipv6-icmp` → `th dport N[-M]` → 판정이다. 주소 체계를 `ether type`(nft가 `ip daddr`에 저절로 붙이는 조건) 대신 `meta protocol`로 적는 것(ARP도)은 VLAN-aware 브리지에서 태그가 붙은 프레임의 `ether type`이 802.1Q로 보일 수 있어서다. tap 이름이 1~15자 `[a-z0-9]`가 아닌 NIC는 경고하고 건너뛰고, NIC는 tap 이름 순으로 정렬하며 같은 tap 이름이 또 나오면 첫 것만 쓰고 경고한다(맵 원소가 겹쳐 글 전체가 실패하지 않게). 단위 시험은 글 전체를 고정 기대 문자열로 본다. `net-it` `opl-driver/tests/firewall.rs`는 이름공간 "호스트"의 브리지에 tap 이름 모양 veth로 "VM" 이름공간 둘을 붙여 허용 포트·ICMP, 나가기 차단, 이웃 캐시를 비운 뒤 허용 목록 + 끝 `out drop`(ARP는 늘 통한다), MAC 위조 차단, 테이블 지우기, 잘못된 글이면 옛 규칙이 남는 것을 본다(TCP는 python3로 듣고 잇는다). VLAN-aware 브리지(VM tap은 VLAN 10 pvid untagged, 업링크 veth는 VLAN 10 tagged로 다른 이름공간의 `link.10`과 이음)에서 주소 하나·`0.0.0.0/0`의 나가기 차단, 이웃 캐시를 비운 뒤 허용 목록 + 끝 `out drop`과 주소·접두사의 들어오기 허용도 본다.
 
 ### 3.4 노드의 방화벽 에이전트
 
@@ -132,11 +138,17 @@ spec:
 - 노드 능력: 시작할 때 `nft`를 찾으면 `NodeStatus.firewall = true`. 스케줄러는 방화벽 NIC가 있는 VM을 이런 노드에만 둔다. 워커도 이 노드에 방화벽이 없으면 켜지 않는다.
 - 위트니스와 macOS 노드에는 에이전트가 없다.
 
+구현(계획 26, 실행기): `#[async_trait] Firewall::apply(&self, ruleset) -> Result<(), DriverError>`, `Nft { netns: Option<String> }`(`Nft::default()`, 시험용 `Nft::in_netns(name)`이 `ip netns exec NAME nft -f -`)는 글을 stdin으로 `nft -f -`에 넣고, 실패는 `DriverError::ToolFailed`(stderr가 비면 종료 상태, 계획 25의 `failure_text`). 노드 능력은 `nft --version`이 아니라 실제 적용으로 정한다(아래 노드·에이전트) — `nft --version`은 root가 아니어도 성공한다. CI linux-kvm 작업의 apt에 `nftables`를 더했다.
+
+구현(계획 26, 노드·에이전트): `NodeStatus.firewall: bool`(false면 뺀다, OpenAPI 선택 필드)은 `register_node`가 시작할 때마다 `host.firewall.is_some()`으로 쓴다. `Host::detect_firewall(tag)`는 Linux에서 `Nft::default()`로 이 클러스터의 테이블을 만드는 글 `table bridge opl_<tag> {}`를 실제로 넣어 보아(있는 테이블·규칙은 그대로 — opld를 다시 시작해도 도는 VM이 열리지 않게) 되면 `Host.firewall = Some(…)`, 안 되면(nftables 없음, root 아님) 경고와 `None`이다. 스케줄러 `node_fits`는 `has_firewall()`인 VM에 `firewall`인 노드만 받는다("node … does not have a firewall (nftables) for the VM's security groups", `NoNode` 메시지에 "has a firewall (nftables) for VMs with security groups"). HA 복구와 마이그레이션 대상 검사도 `node_fits`라 같다. `crates/opld/src/firewall.rs`: 순수 `firewall_nics(vms, groups)`(배치와 상관없이 모든 VM, MAC 없는 NIC는 건너뜀, 없는 그룹은 빈 규칙이고 그 NIC의 규칙 끝에 `out drop`을 더해 들어오기·나가기를 모두 막음), `FirewallRules`(위트니스가 아니고 `host.firewall`이 있을 때만; 지금 클러스터 상태로 글을 만들어 넣고 마지막 글을 기억하는 뮤텍스가 넣기를 직렬화)와 그 `FirewallGate` 구현(`sync`는 늘 다시 넣는다), `FirewallAgent::spawn`·`shutdown(left)`(member의 서비스, 종료 때 규칙은 남기고 `cluster leave`면 빈 글로 테이블을 지운다). 루프는 시작과 60초마다 강제로, VM·SecurityGroup watch(목록을 읽기 전에 구독, 끊기면 다시 구독)는 0.5초 모아 바뀐 글일 때만 넣고, 종료는 차례 사이에서만 본다. 실패는 경고하고 다음 차례에 같은 글이어도 다시 넣는다. reconciler는 `opl_reconciler::FirewallGate`(`async fn sync(&self) -> Result<(), String>`)와 `ReconcilerConfig.firewall: Option<Arc<dyn FirewallGate>>`를 받고, 워커는 `has_firewall()`인 VM의 `hv.start` 직전에 부른다: 게이트가 없으면 다시 시도하지 않는 시작 실패("failed to start: firewall: this node has no firewall (nftables)"), `sync` 실패는 일시적 시작 실패("failed to start: firewall: …", 재시작 백오프 규칙 그대로)다. 살아 있는 VM에 다시 붙는 `reattach`와 멈춘 채 남은 VM을 이어서 실행하는 `resume_left_stopped`도 그 전에(`Worker::sync_firewall`) 부르고, 게이트가 없거나 실패하면 이어서 실행하지 않고 다음 차례에 다시 본다("VM is unresponsive: firewall: …"). 마이그레이션 받기는 opl-api `IncomingMigrations::with_firewall(gate)`가 받는 QEMU를 띄우기 전에 같은 확인을 한다.
+
 ### 3.5 API·oplctl·웹
 
 - API: `/security-groups` 다섯 경로, VM 만들기·바꾸기에서 그룹 검사.
 - oplctl: `security-group create NAME [--description D] [--rule RULE]...`, `list`, `show`, `delete`, `rule add NAME RULE [--at N]`, `rule rm NAME N`. RULE은 `in|out accept|drop [tcp|udp|icmp|icmpv6] [PORTS] [CIDR]` 한 줄이다(예: `"in accept tcp 22 10.0.0.0/8"`). `vm create`·`vm set`의 NIC 지정에 `sg=a+b`.
 - 웹: 보안 그룹 목록·만들기·규칙 편집 페이지, VM NIC 편집에서 그룹 고르기.
+
+구현(계획 26): oplctl `security-group {list, get, create NAME [--description D] [--rule RULE]..., delete, rule add NAME RULE [--at N], rule rm NAME N}`(설계의 `show`는 다른 리소스처럼 `get`이다; `list` 열 `NAME RULES DESCRIPTION`; `rule add/rm`은 읽은 revision을 `If-Match`로 `PATCH`한다). RULE은 oplctl이 JSON 규칙으로 바꾸고 값 검사는 API가 한다. VM은 `vm create --nic NETWORK[,sg=A+B]`와 `vm nic-sg VM INDEX [GROUP]...`(NIC 번호 0부터, 그룹이 없으면 비운다 — `vm set`에 NIC 지정이 없어 따로 두었다)이다. 웹은 `/security-groups`(목록·만들기·지우기)와 `/security-groups/:name`(규칙 표: 방향·동작·프로토콜·포트·원격 CIDR, 위·아래 순서 바꾸기, 저장은 `If-Match` `PATCH`), 사이드바 메뉴, VM NIC 편집의 그룹 체크박스(8개까지), `security_group_in_use` 문구(ko·en)다. 노드 목록에 `firewall`은 보이지 않는다(`node get`의 `status.firewall`). E2E `crates/opld/tests/firewall.rs`(`qemu-it,net-it`, Linux root): opld 하나에서 `node get`이 `firewall: true`, 보안 그룹 NIC로 VM을 켜면 `nft -j list table bridge opl_<태그>`에 그 tap의 `o_`·`i_` 체인과 두 맵 원소가 있고 그룹이 없는 VM의 tap은 없다. 규칙을 더하고 빼면(`PATCH`) 몇 초 안에 들어오기 체인이 바뀌고, VM과 그룹을 지우면 테이블이 사라진다. 시험 브리지 이름은 무작위이고, 남은 테이블은 데몬이 멈춘 뒤 지운다. CI는 이미 `opld/net-it`를 돌리므로 그 안에서 돈다.
 
 ## 4. 오류와 경계
 
