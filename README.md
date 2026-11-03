@@ -75,6 +75,9 @@ address = "10.0.0.11"
 # [janitor]
 # task_max_age_days = 7     # 끝난 작업(Task)을 남기는 날수(만든 때부터)
 # task_max_finished = 1000  # 끝난 작업을 이보다 많이 남기지 않는다(오래된 것부터 지운다)
+# [backup]
+# tick_secs = 60          # 백업 작업을 확인하는 간격(초, 리더 노드)
+# max_concurrent = 2      # 노드마다 동시에 도는 백업 작업(Task)의 최대 수
 # [pools]
 # refresh_secs = 15         # 노드별 풀 상태를 확인하는 간격(초, NFS 마운트 포함)
 TOML
@@ -919,8 +922,52 @@ jq .vm_spec backups/<id>/manifest.json                                 # CPU·�
 UEFI VM은 OVMF(arm64는 AAVMF) 코드 파일과 함께 `vars.fd`의 사본을 `-drive if=pflash`로 준다. 다른 형식 버전의
 매니페스트는 복원하지 않는다(작업이 실패한다).
 
+**백업 작업(예약 백업과 보존).** 백업 작업은 정한 VM들을 정한 시각에 백업 풀로 백업하고, 보존 규칙에 맞지 않는
+오래된 백업을 지운다.
+
+```bash
+oplctl backup-job create nightly --pool bk --all --at 03:00 --keep-daily 7 --keep-weekly 4   # 모든 VM, 매일 03:00 UTC
+oplctl backup-job create prod --pool bk --label tier=prod --at 01:30 --days mon,thu --keep-last 3
+oplctl backup-job create db --pool bk --vm db --vm db2 --at 02:00 --keep-last 2 --keep-monthly 6 --disabled
+oplctl backup-job list
+# NAME     POOL  VMS        SCHEDULE              KEEP              ENABLED  NEXT                  LAST
+# nightly  bk    all        daily 03:00 UTC       daily=7,weekly=4  true     2026-11-05 03:00 UTC  2026-11-04 03:00 UTC (12 ok, 1 failed)
+oplctl backup-job get nightly                  # 일정·보존·다음 실행·마지막 실행 결과와 VM별 오류(JSON)
+oplctl backup-job set prod --at 04:00 --keep-last 5 --enabled true   # 준 값만 바꾼다(보존은 준 단위만, 나머지는 그대로)
+oplctl backup-job run nightly                  # 지금 실행(스케줄러의 다음 확인 때 시작한다)
+oplctl backup-job delete nightly               # 작업만 지운다. 만든 백업은 남는다
+```
+
+- **대상.** `--all`(모든 VM), `--vm NAME`(여러 번), `--label KEY=VALUE`(여러 번이면 모두 맞는 VM) 중 하나다. VM은
+  실행할 때마다 다시 고르므로 나중에 만든 VM과 라벨을 붙인 VM도 들어간다.
+- **일정은 UTC다.** `--at HH:MM`(UTC)에, `--days`(`mon`…`sun`)를 주면 그 요일에만 돈다(없으면 매일). 리더 노드가
+  1분마다 확인하므로 정한 시각에서 1분쯤 늦게 시작할 수 있다. 리더가 꺼져 있던 사이 놓친 실행은 여러 번이어도 한
+  번만 하고, 리더가 바뀌면 새 리더가 진행 중인 실행을 이어 간다. 작업을 끄면(`--disabled`, `set --enabled false`)
+  예약 실행도 지금 실행도 하지 않는다(진행 중인 실행은 이미 요청한 백업만 끝까지 기다린다).
+- **한 번에 하나씩.** 실행은 대상 VM을 이름 순으로 하나씩 백업 작업(Task)으로 요청한다. 한 노드에서 동시에 도는
+  백업은 opld 설정 `[backup] max_concurrent`(기본 2, 손으로 만든 백업도 센다)까지이고 나머지는 차례를 기다린다.
+  이미 백업 중인 VM, 실행 중이라 백업할 수 없는 VM(위의 409와 같은 이유), `--vm`으로 골랐는데 없는 VM은 건너뛰고
+  작업의 `errors`에 남긴다. 실행 도중 지운 VM은 그냥 빠진다. 작업이 만든 백업의 이름은 보통처럼
+  `{VM 이름}-{UTC 시각}`(겹치면 `-2`…, 63자를 넘지 않게 VM 이름 부분을 줄인다)이고, 백업의
+  `spec.job`(`oplctl backup get`)과 웹 백업 목록의 작업 열에 작업이 보인다.
+- **마지막 실행.** 큐가 비고 이번에 만든 백업이 모두 끝나면 `last_run`에 시작·끝 시각과 성공(`ok`)·실패(`failed`,
+  실패한 백업과 백업하지 못한 VM) 수를 적는다. 백업하던 노드가 죽어 백업 작업(Task)이 끝나지 못한 백업도 실패로
+  센다. 실행 중에 `backup-job run`은 409 `job_running`이다. 일정을 바꿔도 이미 요청한 지금 실행은 그대로 돈다.
+- **보존 규칙(Proxmox와 같다).** 실행이 끝나면 VM마다 그 작업이 만든 `ready` 백업을 최신부터 보며 `--keep-last N`개를
+  먼저 남기고, 그다음 `--keep-daily`(UTC 날짜)·`--keep-weekly`(ISO 주)·`--keep-monthly`(달)마다 그 기간의 가장 새
+  백업을 하나씩 N개 기간까지 남긴다(어느 것이 더 새 것인지는 만든 순서로 정하고, 기간은 만든 시각으로 나눈다).
+  남지 않은 백업은 지운다. 예: `--keep-last 2 --keep-daily 7`이면 가장 새 백업 둘과, 지난 7일(백업이 있는 날
+  기준) 각각의 마지막 백업이 남는다. 보존 값을 모두 0으로 두면(기본) 지우지 않는다.
+  그 작업의 실패한 백업은 같은 VM의 더 새 성공한 백업이 생기면 지운다. 손으로 만든 백업과 다른 작업의 백업은
+  건드리지 않는다.
+- **작업을 지워도 백업은 남는다.** 그 백업은 더는 보존 규칙으로 지워지지 않으니 `oplctl backup delete`로 지운다.
+- 웹은 사이드바 "백업" 아래 "백업 작업" 화면(만들기·편집·지우기·지금 실행, 다음·마지막 실행 시각은 UTC로 표시)에서
+  한다. API는 `GET`·`POST /api/v1/backup-jobs`, `GET`·`PATCH`·`DELETE /api/v1/backup-jobs/{name}`,
+  `POST /api/v1/backup-jobs/{name}/run`이고, 읽기는 모든 사용자, 쓰기는 operator 이상이다. 스케줄러의 확인 간격은
+  `[backup] tick_secs`(기본 60초)다.
+
 - **한계.** 증분·변경 블록 추적, 중복 제거, 암호화, 원격(S3) 저장소, 게스트 에이전트로 얼리기, 파일 단위 복원, 기존
-  VM 덮어쓰기는 없다. 예약 백업과 보존 규칙은 계획 28에서 온다(지금은 손으로 만들고 지운다).
+  VM 덮어쓰기는 없다.
 - **남을 수 있는 것.** 작업을 만들기 전에 실패하거나 작업이 사라져 `pending`에 머문 백업은 저절로 치워지지 않는다 —
   `oplctl backup delete`로 지운다. 실행 중 백업이 임시 스냅샷을 지우지 못하면 qcow2 디스크에 그 태그가 남을 수 있다
   (블록 풀 디스크는 opld가 나중에 지운다; qcow2는 VM을 끄고 `qemu-img snapshot -d <태그> <파일>`). 복원이 볼륨을
@@ -945,7 +992,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
-볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기), 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업,
+볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기)과 백업 작업, 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업,
 사용자(admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.

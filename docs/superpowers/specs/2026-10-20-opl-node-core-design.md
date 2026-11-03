@@ -40,7 +40,7 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 
 구현: 하위 프로젝트 6은 계획 25(VXLAN 네트워크: opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만들고 다른 노드의 underlay를 FDB에 넣음, 노드 underlay, tap MTU와 `host_mtu`, 완료)와 계획 26(VM 방화벽: 보안 그룹 `SecurityGroup`을 VM NIC에 걸고 노드마다 nftables `bridge opl_<태그>` 테이블로 tap에서 거름, 노드 능력 `firewall`과 스케줄러 조건, 켜기 직전 규칙 넣기, 완료)으로 나눴다(`2026-11-03-network-sdn-design.md`). 하위 프로젝트 6은 끝났다. IPAM·DHCP·라우팅·SNAT, EVPN·BGP, VXLAN 암호화, 그룹을 원격으로 가리키는 규칙, 방화벽 로그, IP·ARP 위조 막기는 넣지 않았다.
 
-구현: 하위 프로젝트 7은 계획 27(백업과 복원: dir·NFS 풀의 `backups` 표시, `Backup` 리소스, 실행 중·꺼진 VM의 crash-consistent 전체 백업을 디스크마다 압축 qcow2와 `manifest.json`으로, 새 VM으로 복원, 지우기, API·oplctl·웹, 실제 시험, 완료)과 계획 28(백업 작업과 보존: `BackupJob`, 리더의 스케줄러, 노드당 동시 실행 제한, 보존 규칙, 남음)으로 나눴다(`2026-11-04-backup-design.md`). 하위 프로젝트 7은 진행 중이다.
+구현: 하위 프로젝트 7은 계획 27(백업과 복원: dir·NFS 풀의 `backups` 표시, `Backup` 리소스, 실행 중·꺼진 VM의 crash-consistent 전체 백업을 디스크마다 압축 qcow2와 `manifest.json`으로, 새 VM으로 복원, 지우기, API·oplctl·웹, 실제 시험, 완료)과 계획 28(백업 작업과 보존: `BackupJob`(대상 VM 고르기·UTC 일정·보존 규칙), 리더의 `BackupJobScheduler`, 노드당 동시 백업 제한, Proxmox식 보존 규칙으로 지우기, API·oplctl·웹, 실제 시험, 완료)으로 나눴다(`2026-11-04-backup-design.md`). 하위 프로젝트 7은 끝났다. 증분·변경 블록 추적, 중복 제거, 암호화, 원격(S3) 저장소, 게스트 에이전트로 얼리기, 파일 단위 복원, 기존 VM 덮어쓰기는 넣지 않았다.
 
 ### 1.2 검토했지만 채택하지 않은 대안
 

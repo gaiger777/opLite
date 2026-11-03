@@ -351,3 +351,129 @@ async fn stopped_vm_backup_with_raw_disk_restores_both_disks() {
     }
     d.stop();
 }
+
+/// 백업 작업 `job`의 실행 하나가 끝날 때까지 기다리고 작업을 돌려준다. `before`는 실행을 요청하기 전의
+/// `last_run`이다.
+async fn wait_job_run(c: &Client, job: &str, before: &Value) -> Value {
+    let deadline = std::time::Instant::now() + common::WAIT;
+    loop {
+        let job = c.get(&format!("/backup-jobs/{job}")).await.unwrap();
+        if job["status"]["run"].is_null() && &job["status"]["last_run"] != before {
+            return job;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for a run: {job}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// VM `vm`의 백업 id(만든 순서)
+async fn backup_ids(d: &Daemon, vm: &str) -> Vec<String> {
+    let list = d.ctl_json(&["backup", "list", "--vm", vm]).await;
+    let mut backups = list.as_array().unwrap().clone();
+    backups.sort_by_key(|b| b["status"]["created_at"].as_u64());
+    backups
+        .iter()
+        .map(|b| b["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn backup_job_keeps_last_backups_of_labeled_vms() {
+    let mut d = Daemon::new("node1", "[backup]\ntick_secs = 1\n");
+    setup(&mut d).await;
+    let c = client(&d);
+    for (vm, volume) in [("web", "web-root"), ("db", "db-root")] {
+        create_volume(&d, volume, "qcow2").await;
+        d.ctl(&["vm", "create", vm, "--memory", "256", "--disk", volume])
+            .await
+            .unwrap();
+    }
+    // oplctl에는 라벨을 넣는 길이 없어 API로 넣는다.
+    let web = c.get("/vms/web").await.unwrap();
+    c.put(
+        "/vms/web",
+        &json!({ "spec": web["spec"], "labels": { "tier": "prod" } }),
+    )
+    .await
+    .unwrap();
+
+    let out = d
+        .ctl(&[
+            "backup-job",
+            "create",
+            "nightly",
+            "--pool",
+            "bk",
+            "--label",
+            "tier=prod",
+            "--at",
+            "00:00",
+            "--keep-last",
+            "2",
+        ])
+        .await
+        .unwrap();
+    assert!(
+        out.starts_with("backup job nightly created; next run ") && out.ends_with(" 00:00 UTC\n"),
+        "{out}"
+    );
+    let job = c.get("/backup-jobs/nightly").await.unwrap();
+
+    // 지금 실행을 세 번. 매번 실행이 끝나기를 기다린다.
+    let mut first = Vec::new();
+    for i in 0..3 {
+        let before = c.get("/backup-jobs/nightly").await.unwrap()["status"]["last_run"].clone();
+        let out = d.ctl(&["backup-job", "run", "nightly"]).await.unwrap();
+        assert_eq!(
+            out,
+            "backup job nightly will run at the scheduler's next check\n"
+        );
+        let done = wait_job_run(&c, "nightly", &before).await;
+        let last_run = &done["status"]["last_run"];
+        assert_eq!(last_run["ok"], 1, "{done}");
+        assert_eq!(last_run["failed"], 0, "{done}");
+        assert_eq!(done["status"]["errors"], json!([]), "{done}");
+        if i == 0 {
+            first = backup_ids(&d, "web").await;
+            assert_eq!(first.len(), 1);
+        }
+    }
+
+    // 보존 규칙(마지막 2개)으로 가장 오래된 백업이 지워진다. 라벨이 없는 VM은 백업하지 않는다.
+    common::eventually("oldest backup pruned", || async {
+        backup_ids(&d, "web").await.len() == 2
+    })
+    .await;
+    let kept = backup_ids(&d, "web").await;
+    assert!(!kept.contains(&first[0]), "{kept:?} {first:?}");
+    assert!(
+        !d.path("bk").join("backups").join(&first[0]).exists(),
+        "pruned backup directory left"
+    );
+    assert_eq!(backup_ids(&d, "db").await, Vec::<String>::new());
+    for id in &kept {
+        let b = c.get(&format!("/backups/{id}")).await.unwrap();
+        assert_eq!(b["spec"]["job"], job["id"], "{b}");
+        assert_eq!(b["status"]["phase"], "ready", "{b}");
+    }
+
+    // 작업을 지워도 백업은 남는다.
+    let out = d.ctl(&["backup-job", "delete", "nightly"]).await.unwrap();
+    assert_eq!(out, "backup job nightly deleted; its backups are kept\n");
+    assert_eq!(d.ctl_json(&["backup-job", "list"]).await, json!([]));
+    assert_eq!(backup_ids(&d, "web").await, kept);
+
+    for id in &kept {
+        d.ctl(&["backup", "delete", id]).await.unwrap();
+    }
+    for vm in ["web", "db"] {
+        d.ctl(&["vm", "delete", vm]).await.unwrap();
+    }
+    for volume in ["web-root", "db-root"] {
+        d.ctl(&["volume", "delete", volume]).await.unwrap();
+    }
+    d.stop();
+}
