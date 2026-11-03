@@ -30,6 +30,9 @@ async fn openapi_document_is_served_without_login() {
         "/backups",
         "/backups/{key}",
         "/backups/{key}/restore",
+        "/backup-jobs",
+        "/backup-jobs/{key}",
+        "/backup-jobs/{key}/run",
         "/watch",
     ] {
         assert!(paths.contains_key(path), "{path} is not documented");
@@ -48,6 +51,10 @@ async fn openapi_document_is_served_without_login() {
     assert!(doc["components"]["schemas"]["Resource_TaskSpec_TaskStatus"].is_object());
     assert!(doc["components"]["schemas"]["Resource_SnapshotSpec_SnapshotStatus"].is_object());
     assert!(doc["components"]["schemas"]["Resource_BackupSpec_BackupStatus"].is_object());
+    assert!(doc["components"]["schemas"]["Resource_BackupJobSpec_BackupJobStatus"].is_object());
+    // 백업 작업의 VM 고르기는 세 객체 중 하나다.
+    let selector = &doc["components"]["schemas"]["VmSelector"]["oneOf"];
+    assert_eq!(selector.as_array().map(Vec::len), Some(3), "{selector}");
     // 마이그레이션 상태는 없으면 빼고 쓰므로 선택 필드다(null도 기본값도 아니다).
     let vm_status = &doc["components"]["schemas"]["VmStatus"];
     assert_eq!(

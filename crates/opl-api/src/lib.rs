@@ -4,6 +4,7 @@
 //! 각 노드의 reconciler이고, Task의 진행은 대상 노드의 [`TaskRunner`]가 기록한다.
 
 pub mod auth;
+mod backup_jobs;
 mod backups;
 pub mod cluster;
 mod console;
@@ -117,6 +118,13 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(backups::get_backup, backups::delete_backup))
         .routes(routes!(backups::create_backup))
         .routes(routes!(backups::restore_backup))
+        .routes(routes!(r::list_backup_jobs, backup_jobs::create_backup_job))
+        .routes(routes!(
+            r::get_backup_job,
+            backup_jobs::patch_backup_job,
+            backup_jobs::delete_backup_job
+        ))
+        .routes(routes!(backup_jobs::run_backup_job))
         .routes(routes!(r::list_volumes, volumes::create_volume))
         .routes(routes!(volumes::import_volume))
         .routes(routes!(volumes::check_import_volume))

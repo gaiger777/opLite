@@ -74,7 +74,7 @@ pub struct BackupForgotten {
 }
 
 /// 지금 시각(유닉스 초)
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -273,16 +273,31 @@ pub async fn create_backup(
     }
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let pool = find_pool(&state, &req.pool)?;
+    let node = check_backup(&state, &vm, &pool)?;
+    let name = req
+        .name
+        .unwrap_or_else(|| default_backup_name(&vm.name, now()));
+    let task = start_backup(&state, &vm, &pool, node, name, None).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// VM을 백업 풀 `pool`에 백업할 수 있는지 보고 백업 Task를 돌릴 노드를 돌려준다. 오류는
+/// [`create_backup`]과 같다. 백업 요청 API와 백업 작업 스케줄러가 쓴다(권한 검사는 부르는 쪽).
+pub(crate) fn check_backup(
+    state: &AppState,
+    vm: &Vm,
+    pool: &StoragePool,
+) -> Result<Uuid, ApiError> {
     if !pool.spec.backups {
         return Err(ApiError::bad_request(format!(
             "storage pool {:?} does not store backups; turn on its backups setting",
             pool.name
         )));
     }
-    check_not_busy(&state, &vm)?;
-    let disks = vm_disks(&state, &vm)?;
+    check_not_busy(state, vm)?;
+    let disks = vm_disks(state, vm)?;
     // 실행 중인 VM은 임시 스냅샷에서 읽는다.
-    if !is_stopped(&vm)
+    if !is_stopped(vm)
         && let Some((volume, _)) = disks
             .iter()
             .find(|(v, p)| !pool_kind_supports_snapshots(&p.spec.backend, v.spec.format))
@@ -295,19 +310,29 @@ pub async fn create_backup(
             ),
         ));
     }
-    if !is_stopped(&vm) {
-        check_disks(&state, &vm)?;
+    if !is_stopped(vm) {
+        check_disks(state, vm)?;
     }
-    let node = backup_node(&state, &vm, &pool, &disks)?;
-    check_pool_on(&state, &pool, node, || {
+    let node = backup_node(state, vm, pool, &disks)?;
+    check_pool_on(state, pool, node, || {
         format!(
             "storage pool {:?} is not available on the node holding VM {:?}",
             pool.name, vm.name
         )
     })?;
-    let name = req
-        .name
-        .unwrap_or_else(|| default_backup_name(&vm.name, now()));
+    Ok(node)
+}
+
+/// [`check_backup`]을 거친 VM의 `pending` 백업 `name`을 만들고 노드 `node`에서 그것을 채울 Task를
+/// 돌려준다. 백업 작업이 만드는 백업은 `job`에 작업 id를 적는다.
+pub(crate) async fn start_backup(
+    state: &AppState,
+    vm: &Vm,
+    pool: &StoragePool,
+    node: Uuid,
+    name: String,
+    job: Option<Uuid>,
+) -> Result<Task, ApiError> {
     let backup: Backup = Resource::new(
         name,
         BackupSpec {
@@ -315,13 +340,13 @@ pub async fn create_backup(
             vm_name: vm.name.clone(),
             pool: pool.name.clone(),
             vm_spec: vm.spec.clone(),
-            job: None,
+            job,
         },
     );
     // 같은 이름이 있으면 저장소가 거부한다(409 name_taken).
     state.cluster.create(&backup).await?;
     // 풀 지우기·백업 표시 끄기는 백업이 없을 때만 된다. 그 확인과 엇갈렸으면 만든 백업을 거둔다.
-    if !find_pool(&state, &pool.name).is_ok_and(|p| p.spec.backups) {
+    if !find_pool(state, &pool.name).is_ok_and(|p| p.spec.backups) {
         if let Err(d) = state.cluster.delete::<BackupSpec>(backup.id, None).await {
             tracing::warn!(backup = %backup.id, error = %d, "cannot remove backup of a removed pool");
         }
@@ -335,7 +360,7 @@ pub async fn create_backup(
     }
     let op = TaskOp::VmBackup { backup: backup.id };
     match create_task(&state.cluster, op, vm.id, node).await {
-        Ok(task) => Ok((StatusCode::ACCEPTED, Json(task))),
+        Ok(task) => Ok(task),
         Err(e) => {
             // 채울 Task가 없는 pending 백업은 이름만 차지한다.
             if let Err(d) = state.cluster.delete::<BackupSpec>(backup.id, None).await {
@@ -384,31 +409,52 @@ pub async fn delete_backup(
 ) -> Result<Response, ApiError> {
     state.authorize(&principal, Action::Write, BackupSpec::KIND)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
-    if let Some(doing) = backup_tasks(&state, backup.id)?.first() {
-        return Err(backup_busy(&backup, doing));
+    if q.force {
+        check_backup_idle(&state, &backup)?;
+        if let Err(e) = delete_node(&state, &backup)
+            && e.status == StatusCode::CONFLICT
+        {
+            tracing::warn!(backup = %backup.name, pool = %backup.spec.pool, reason = %e.message, "deleting backup without its files");
+            state.cluster.delete::<BackupSpec>(backup.id, None).await?;
+            let message = format!(
+                "backup {:?} deleted; its files are left in storage pool {:?} ({})",
+                backup.name, backup.spec.pool, e.message
+            );
+            return Ok(Json(BackupForgotten { message }).into_response());
+        }
     }
-    let node = match state
+    let task = start_backup_delete(&state, &backup).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)).into_response())
+}
+
+/// 백업을 만들거나 되살리거나 지우는 Task가 끝나지 않았으면 409 `backup_busy`
+fn check_backup_idle(state: &AppState, backup: &Backup) -> Result<(), ApiError> {
+    match backup_tasks(state, backup.id)?.first() {
+        Some(doing) => Err(backup_busy(backup, doing)),
+        None => Ok(()),
+    }
+}
+
+/// 백업 지우기 Task를 돌릴 노드. 풀이 없어졌으면(파일도 함께 없어졌다) 이 노드다.
+fn delete_node(state: &AppState, backup: &Backup) -> Result<Uuid, ApiError> {
+    match state
         .cluster
         .get_by_name::<StoragePoolSpec>(&backup.spec.pool)?
     {
-        // 풀과 함께 파일도 없어졌다. 이 노드의 Task가 리소스만 지운다.
-        None => state.node,
-        Some(pool) => match files_node(&state, &backup, &pool) {
-            Ok(node) => node,
-            Err(e) if q.force && e.status == StatusCode::CONFLICT => {
-                tracing::warn!(backup = %backup.name, pool = %pool.name, reason = %e.message, "deleting backup without its files");
-                state.cluster.delete::<BackupSpec>(backup.id, None).await?;
-                let message = format!(
-                    "backup {:?} deleted; its files are left in storage pool {:?} ({})",
-                    backup.name, pool.name, e.message
-                );
-                return Ok(Json(BackupForgotten { message }).into_response());
-            }
-            Err(e) => return Err(e),
-        },
-    };
-    let task = create_task(&state.cluster, TaskOp::BackupDelete, backup.id, node).await?;
-    Ok((StatusCode::ACCEPTED, Json(task)).into_response())
+        None => Ok(state.node),
+        Some(pool) => files_node(state, backup, &pool),
+    }
+}
+
+/// 백업 파일과 리소스를 지울 Task를 만든다. 오류는 `force` 없는 [`delete_backup`]과 같다. 백업 지우기
+/// API와 백업 작업의 보존이 쓴다(권한 검사는 부르는 쪽).
+pub(crate) async fn start_backup_delete(
+    state: &AppState,
+    backup: &Backup,
+) -> Result<Task, ApiError> {
+    check_backup_idle(state, backup)?;
+    let node = delete_node(state, backup)?;
+    create_task(&state.cluster, TaskOp::BackupDelete, backup.id, node).await
 }
 
 /// `ready` 백업을 새 VM `name`으로 되살릴 Task를 돌려준다(202). Task의 대상은 미리 정한 새 VM id다.

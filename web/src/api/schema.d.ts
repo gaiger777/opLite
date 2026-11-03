@@ -54,6 +54,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/backup-jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_backup_jobs"];
+        put?: never;
+        /** 작업을 만들고 다음 실행 시각(`status.next_run`)을 적는다. 이름이 겹치면 409 `name_taken`. */
+        post: operations["create_backup_job"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backup-jobs/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_backup_job"];
+        put?: never;
+        post?: never;
+        /** 작업만 지운다. 작업이 만든 백업은 남는다(백업의 `job`도 그대로). */
+        delete: operations["delete_backup_job"];
+        options?: never;
+        head?: never;
+        /**
+         * 스펙의 주어진 값을 바꾼다. 아무것도 없으면 400. 일정을 바꾸거나 작업을 다시 켜면 다음 실행 시각을
+         *     지금부터 다시 계산한다(꺼 둔 사이 지난 실행은 하지 않는다). 다만 켜 둔 작업의 지금 실행 요청이
+         *     기다리고 있으면(다음 실행이 지났으면) 그대로 둔다. 진행 중인 실행은 그대로 끝까지 간다.
+         *     `If-Match`가 없으면 읽은 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다.
+         */
+        patch: operations["patch_backup_job"];
+        trace?: never;
+    };
+    "/backup-jobs/{key}/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 다음 실행 시각을 지금으로 당긴다. 리더의 스케줄러가 다음 차례에 실행을 시작한다. 실행이 진행
+         *     중이면 409 `job_running`, 꺼 둔 작업이면 409 `job_disabled`.
+         */
+        post: operations["run_backup_job"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/backups": {
         parameters: {
             query?: never;
@@ -817,6 +877,46 @@ export interface components {
         BackupForgotten: {
             message: string;
         };
+        /** @description 백업 작업에서 바꿀 값. 주어진 필드만 바꾼다. */
+        BackupJobPatch: {
+            enabled?: boolean;
+            /** @description 보존 규칙 전체를 이것으로 바꾼다(적지 않은 단위는 0). */
+            keep?: components["schemas"]["Keep"];
+            pool?: string;
+            schedule?: components["schemas"]["JobSchedule"];
+            vms?: components["schemas"]["VmSelector"];
+        };
+        BackupJobSpec: {
+            /**
+             * @description 끄면 예약 실행을 하지 않는다.
+             * @default true
+             */
+            enabled: boolean;
+            /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
+            keep?: components["schemas"]["Keep"];
+            /** @description 백업 풀 이름 */
+            pool: string;
+            schedule: components["schemas"]["JobSchedule"];
+            /** @description 백업할 VM */
+            vms: components["schemas"]["VmSelector"];
+        };
+        BackupJobStatus: {
+            /**
+             * @description 마지막(또는 진행 중인) 실행에서 백업하지 못한 VM과 이유
+             * @default []
+             */
+            errors: components["schemas"]["JobError"][];
+            /** @default null */
+            last_run: components["schemas"]["JobRunResult"] | null;
+            /**
+             * Format: int64
+             * @description 다음 예약 실행 시각(유닉스 초)
+             * @default null
+             */
+            next_run: number | null;
+            /** @default null */
+            run: components["schemas"]["JobRun"] | null;
+        };
         /** @enum {string} */
         BackupPhase: "pending" | "ready" | "failed";
         BackupSpec: {
@@ -905,6 +1005,26 @@ export interface components {
             name?: string | null;
             /** @description 백업 풀(`backups`를 켠 풀) */
             pool: string;
+        };
+        CreateRequest_BackupJobSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            spec: {
+                /**
+                 * @description 끄면 예약 실행을 하지 않는다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
+                keep?: components["schemas"]["Keep"];
+                /** @description 백업 풀 이름 */
+                pool: string;
+                schedule: components["schemas"]["JobSchedule"];
+                /** @description 백업할 VM */
+                vms: components["schemas"]["VmSelector"];
+            };
         };
         CreateRequest_NetworkSpec: {
             labels?: {
@@ -1064,6 +1184,49 @@ export interface components {
             /** @description 타깃 이름(`iqn.`·`eui.`·`naa.`로 시작) */
             target: string;
         };
+        JobError: {
+            error: string;
+            /** @description VM 이름 */
+            vm: string;
+        };
+        /** @description 진행 중인 실행 */
+        JobRun: {
+            /** @description 이번 실행에서 만든 백업 id */
+            backups?: string[];
+            /** @description 아직 백업을 시작하지 않은 VM id */
+            queue?: string[];
+            /**
+             * Format: int64
+             * @description 시작한 시각(유닉스 초)
+             */
+            started_at: number;
+        };
+        /** @description 끝난 실행의 결과 */
+        JobRunResult: {
+            /**
+             * Format: int32
+             * @description 실패한 백업과 백업하지 못한 VM 수
+             */
+            failed: number;
+            /** Format: int64 */
+            finished_at: number;
+            /**
+             * Format: int32
+             * @description 성공한 백업 수
+             */
+            ok: number;
+            /** Format: int64 */
+            started_at: number;
+        };
+        /** @description 실행 일정: `days`의 `at`(UTC). `days`가 비면 매일. */
+        JobSchedule: {
+            /**
+             * @description `HH:MM`(UTC)
+             * @example 03:00
+             */
+            at: string;
+            days?: components["schemas"]["Weekday"][];
+        };
         JoinRequest: {
             /** @description 새 노드의 API 주소(`host:port`) */
             address: string;
@@ -1097,6 +1260,78 @@ export interface components {
              * @description 유효 시간(초). 기본 1시간, 최대 7일
              */
             ttl_secs?: number | null;
+        };
+        /** @description 보존 규칙: 최신 `last`개, 그다음 날(UTC)·ISO 주·달마다 가장 새 것 하나씩 `daily`·`weekly`·`monthly`개. */
+        Keep: {
+            /**
+             * Format: int32
+             * @default 0
+             */
+            daily: number;
+            /**
+             * Format: int32
+             * @default 0
+             */
+            last: number;
+            /**
+             * Format: int32
+             * @default 0
+             */
+            monthly: number;
+            /**
+             * Format: int32
+             * @default 0
+             */
+            weekly: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_BackupJobSpec_BackupJobStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    /**
+                     * @description 끄면 예약 실행을 하지 않는다.
+                     * @default true
+                     */
+                    enabled: boolean;
+                    /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
+                    keep?: components["schemas"]["Keep"];
+                    /** @description 백업 풀 이름 */
+                    pool: string;
+                    schedule: components["schemas"]["JobSchedule"];
+                    /** @description 백업할 VM */
+                    vms: components["schemas"]["VmSelector"];
+                };
+                status: {
+                    /**
+                     * @description 마지막(또는 진행 중인) 실행에서 백업하지 못한 VM과 이유
+                     * @default []
+                     */
+                    errors: components["schemas"]["JobError"][];
+                    /** @default null */
+                    last_run: components["schemas"]["JobRunResult"] | null;
+                    /**
+                     * Format: int64
+                     * @description 다음 예약 실행 시각(유닉스 초)
+                     * @default null
+                     */
+                    next_run: number | null;
+                    /** @default null */
+                    run: components["schemas"]["JobRun"] | null;
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
         };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_Resource_BackupSpec_BackupStatus: {
@@ -1801,6 +2036,51 @@ export interface components {
             size_bytes: number;
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_BackupJobSpec_BackupJobStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /**
+                 * @description 끄면 예약 실행을 하지 않는다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
+                keep?: components["schemas"]["Keep"];
+                /** @description 백업 풀 이름 */
+                pool: string;
+                schedule: components["schemas"]["JobSchedule"];
+                /** @description 백업할 VM */
+                vms: components["schemas"]["VmSelector"];
+            };
+            status: {
+                /**
+                 * @description 마지막(또는 진행 중인) 실행에서 백업하지 못한 VM과 이유
+                 * @default []
+                 */
+                errors: components["schemas"]["JobError"][];
+                /** @default null */
+                last_run: components["schemas"]["JobRunResult"] | null;
+                /**
+                 * Format: int64
+                 * @description 다음 예약 실행 시각(유닉스 초)
+                 * @default null
+                 */
+                next_run: number | null;
+                /** @default null */
+                run: components["schemas"]["JobRun"] | null;
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_BackupSpec_BackupStatus: {
             /** Format: uuid */
             id: string;
@@ -2502,6 +2782,15 @@ export interface components {
         };
         /** @enum {string} */
         VmPhase: "stopped" | "starting" | "running" | "stopping" | "failed" | "migrating";
+        VmSelector: {
+            all: boolean;
+        } | {
+            names: string[];
+        } | {
+            labels: {
+                [key: string]: string;
+            };
+        };
         /** @description VM의 원하는 상태. */
         VmSpec: {
             cpu: components["schemas"]["CpuSpec"];
@@ -2595,6 +2884,8 @@ export interface components {
              */
             vni: number;
         };
+        /** @enum {string} */
+        Weekday: "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
     };
     responses: never;
     parameters: never;
@@ -2669,6 +2960,191 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Principal"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_backup_jobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_BackupJobSpec_BackupJobStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_backup_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRequest_BackupJobSpec"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupJobSpec_BackupJobStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_backup_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupJobSpec_BackupJobStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_backup_job: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_backup_job: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BackupJobPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupJobSpec_BackupJobStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    run_backup_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupJobSpec_BackupJobStatus"];
                 };
             };
             "4XX": {

@@ -8,6 +8,7 @@ use axum::http::header::IF_MATCH;
 use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError, Typed};
+use opl_types::backup_job::{BackupJobSpec, BackupJobStatus};
 use opl_types::network::{Network, NetworkSpec, NetworkStatus, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec, NodeStatus};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
@@ -184,6 +185,15 @@ list_and_get!(
     "/security-groups",
     "/security-groups/{key}",
     "security-groups"
+);
+list_and_get!(
+    list_backup_jobs,
+    get_backup_job,
+    BackupJobSpec,
+    BackupJobStatus,
+    "/backup-jobs",
+    "/backup-jobs/{key}",
+    "backups"
 );
 list_and_get!(
     list_tasks,
