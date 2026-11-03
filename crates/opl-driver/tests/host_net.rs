@@ -160,3 +160,27 @@ async fn missing_or_vlan_unaware_bridges_are_refused() {
     // 거부하면 tap을 남기지 않는다.
     assert_eq!(master_of(&missing.ifname), None);
 }
+
+fn mtu_of(ifname: &str) -> u64 {
+    let links: Value = serde_json::from_str(&ip(&["-j", "link", "show", "dev", ifname])).unwrap();
+    links[0]["mtu"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn taps_take_the_bridge_mtu() {
+    // VXLAN 브리지처럼 MTU를 낮춘 브리지
+    let br = TestBridge::new(false);
+    ip(&["link", "set", "dev", &br.0, "mtu", "1450"]);
+    let net = IpRoute::default();
+    let vm = Uuid::now_v7();
+    let tap = Tap {
+        ifname: tap_name(vm, 0),
+        bridge: br.0.clone(),
+        vlan: None,
+    };
+    net.create_tap(&tap).await.unwrap();
+    assert_eq!(master_of(&tap.ifname), Some(br.0.clone()));
+    assert_eq!(mtu_of(&tap.ifname), 1450);
+    assert_eq!(mtu_of(&br.0), 1450);
+    net.delete_vm_taps(vm).await.unwrap();
+}

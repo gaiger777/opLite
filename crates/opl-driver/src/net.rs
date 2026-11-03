@@ -183,7 +183,7 @@ impl HostNet for IpRoute {
         }
         // 이전 VM 인스턴스가 남긴 같은 이름의 tap
         self.delete_link(&tap.ifname).await?;
-        for (program, args) in tap_commands(tap, bridge.default_pvid) {
+        for (program, args) in tap_commands(tap, bridge.default_pvid, bridge.mtu) {
             if let Err(e) = self.run(program, &args).await {
                 let _ = self.delete_link(&tap.ifname).await;
                 return Err(e);
@@ -631,17 +631,20 @@ fn stale_devices(
     (stale, errors)
 }
 
-/// tap을 만들고 브리지에 붙여 올리는 명령. VLAN이면 브리지 기본 VLAN 대신 그 VLAN만
-/// 태그 없이 주고받게 한다.
-fn tap_commands(tap: &Tap, default_pvid: u16) -> Vec<Command> {
+/// tap을 만들고 브리지에 붙여 올리는 명령. 브리지 MTU를 알면 붙이기 전에 tap도 같게 맞춘다
+/// (VXLAN 브리지의 MTU가 tap 기본값 1500으로 바뀌지 않게). VLAN이면 브리지 기본 VLAN 대신
+/// 그 VLAN만 태그 없이 주고받게 한다.
+fn tap_commands(tap: &Tap, default_pvid: u16, mtu: Option<u32>) -> Vec<Command> {
     let dev = tap.ifname.as_str();
-    let mut cmds = vec![
-        ("ip", args(&["tuntap", "add", "dev", dev, "mode", "tap"])),
-        (
-            "ip",
-            args(&["link", "set", "dev", dev, "master", &tap.bridge]),
-        ),
-    ];
+    let mut cmds = vec![("ip", args(&["tuntap", "add", "dev", dev, "mode", "tap"]))];
+    if let Some(mtu) = mtu {
+        let mtu = mtu.to_string();
+        cmds.push(("ip", args(&["link", "set", "dev", dev, "mtu", &mtu])));
+    }
+    cmds.push((
+        "ip",
+        args(&["link", "set", "dev", dev, "master", &tap.bridge]),
+    ));
     if let Some(vlan) = tap.vlan {
         if default_pvid != 0 && default_pvid != vlan {
             let pvid = default_pvid.to_string();
@@ -693,6 +696,8 @@ fn failure_text(stderr: &[u8], status: std::process::ExitStatus) -> String {
 struct Link {
     ifname: String,
     #[serde(default)]
+    mtu: Option<u32>,
+    #[serde(default)]
     linkinfo: Option<LinkInfo>,
 }
 
@@ -715,6 +720,7 @@ struct BridgeData {
 struct Bridge {
     info: BridgeInfo,
     default_pvid: u16,
+    mtu: Option<u32>,
 }
 
 /// `ip -j -d link show type bridge`의 출력
@@ -730,6 +736,7 @@ fn parse_bridges(json: &str) -> Result<Vec<Bridge>, DriverError> {
                     vlan_filtering: data.as_ref().is_some_and(|d| d.vlan_filtering == 1),
                 },
                 default_pvid: data.and_then(|d| d.vlan_default_pvid).unwrap_or(1),
+                mtu: l.mtu,
             }
         })
         .collect())
@@ -763,7 +770,7 @@ mod tests {
     #[test]
     fn plain_tap_joins_the_bridge() {
         assert_eq!(
-            joined(tap_commands(&tap(None), 1)),
+            joined(tap_commands(&tap(None), 1, None)),
             [
                 "ip tuntap add dev op0123456789n0 mode tap",
                 "ip link set dev op0123456789n0 master vmbr0",
@@ -775,7 +782,7 @@ mod tests {
     #[test]
     fn vlan_tap_replaces_the_default_pvid() {
         assert_eq!(
-            joined(tap_commands(&tap(Some(10)), 1)),
+            joined(tap_commands(&tap(Some(10)), 1, None)),
             [
                 "ip tuntap add dev op0123456789n0 mode tap",
                 "ip link set dev op0123456789n0 master vmbr0",
@@ -786,16 +793,29 @@ mod tests {
         );
         // 브리지에 기본 VLAN이 없거나(0) 같은 VLAN이면 지울 것이 없다.
         for pvid in [0, 10] {
-            let cmds = joined(tap_commands(&tap(Some(10)), pvid));
+            let cmds = joined(tap_commands(&tap(Some(10)), pvid, None));
             assert!(!cmds.iter().any(|c| c.contains("vlan del")), "{cmds:?}");
         }
     }
 
     #[test]
+    fn tap_takes_the_bridge_mtu_before_joining() {
+        assert_eq!(
+            joined(tap_commands(&tap(None), 1, Some(1450))),
+            [
+                "ip tuntap add dev op0123456789n0 mode tap",
+                "ip link set dev op0123456789n0 mtu 1450",
+                "ip link set dev op0123456789n0 master vmbr0",
+                "ip link set dev op0123456789n0 up",
+            ]
+        );
+    }
+
+    #[test]
     fn parses_bridges() {
         let json = r#"[
-            {"ifindex":2,"ifname":"vmbr0","linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":1,"vlan_default_pvid":1}}},
-            {"ifindex":3,"ifname":"br-plain","linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":0,"vlan_default_pvid":1}}},
+            {"ifindex":2,"ifname":"vmbr0","mtu":1500,"linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":1,"vlan_default_pvid":1}}},
+            {"ifindex":3,"ifname":"br-plain","mtu":1450,"linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":0,"vlan_default_pvid":1}}},
             {"ifindex":4,"ifname":"br-nopvid","linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":1}}}
         ]"#;
         assert_eq!(
@@ -806,21 +826,24 @@ mod tests {
                         name: "vmbr0".into(),
                         vlan_filtering: true
                     },
-                    default_pvid: 1
+                    default_pvid: 1,
+                    mtu: Some(1500),
                 },
                 Bridge {
                     info: BridgeInfo {
                         name: "br-plain".into(),
                         vlan_filtering: false
                     },
-                    default_pvid: 1
+                    default_pvid: 1,
+                    mtu: Some(1450),
                 },
                 Bridge {
                     info: BridgeInfo {
                         name: "br-nopvid".into(),
                         vlan_filtering: true
                     },
-                    default_pvid: 1
+                    default_pvid: 1,
+                    mtu: None,
                 },
             ]
         );

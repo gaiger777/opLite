@@ -340,6 +340,7 @@ impl QemuHypervisor {
                     ifname,
                     bridge,
                     vlan,
+                    ..
                 } => Some(Tap {
                     ifname: ifname.clone(),
                     bridge: bridge.clone(),
@@ -2206,6 +2207,7 @@ time.sleep(60)
                 ifname: opl_types::network::tap_name(vm.id, 0),
                 bridge: "vmbr0".into(),
                 vlan: None,
+                mtu: None,
             },
         });
         let err = hv.start(&vm, None).await.unwrap_err();
@@ -2227,6 +2229,7 @@ time.sleep(60)
                 ifname: "eth0".into(),
                 bridge: "vmbr0".into(),
                 vlan: None,
+                mtu: None,
             },
         });
         match hv.start(&vm, None).await.unwrap_err() {

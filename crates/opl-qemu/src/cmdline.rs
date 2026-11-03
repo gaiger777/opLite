@@ -137,10 +137,14 @@ pub fn build_cmdline(
             NicModel::Virtio => "virtio-net-pci",
             NicModel::E1000e => "e1000e",
         };
-        a.opt(
-            "-device",
-            format!("{model},netdev=net{i},mac={},id=nic{i}", nic.mac),
-        );
+        let mut dev = format!("{model},netdev=net{i},mac={},id=nic{i}", nic.mac);
+        // VXLAN 네트워크의 MTU를 게스트에 알린다(virtio만 받는다).
+        if let (NicModel::Virtio, NicBackend::Tap { mtu: Some(mtu), .. }) =
+            (nic.model, &nic.backend)
+        {
+            dev.push_str(&format!(",host_mtu={mtu}"));
+        }
+        a.opt("-device", dev);
     }
 
     a.opt("-vnc", format!("unix:{}", esc_path(&paths.vnc_socket)));
@@ -289,6 +293,7 @@ mod tests {
                         ifname: "tap0i0".into(),
                         bridge: "vmbr0".into(),
                         vlan: Some(10),
+                        mtu: None,
                     },
                 },
                 RuntimeNic {
@@ -349,6 +354,25 @@ mod tests {
                 arch: Arch::Aarch64
             }
         );
+    }
+
+    /// VXLAN 네트워크의 MTU는 virtio NIC에만 `host_mtu`로 알린다.
+    #[test]
+    fn tap_mtu_sets_virtio_host_mtu() {
+        let mut spec = x86_spec();
+        let tap = NicBackend::Tap {
+            ifname: "tap0i0".into(),
+            bridge: "oplv1000".into(),
+            vlan: None,
+            mtu: Some(1450),
+        };
+        spec.nics[0].backend = tap.clone();
+        spec.nics[1].backend = tap;
+        let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        assert!(args.contains(
+            &"virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56,id=nic0,host_mtu=1450".to_string()
+        ));
+        assert!(args.contains(&"e1000e,netdev=net1,mac=52:54:00:12:34:57,id=nic1".to_string()));
     }
 
     #[test]

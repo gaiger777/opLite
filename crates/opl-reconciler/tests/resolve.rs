@@ -941,6 +941,7 @@ async fn resolves_bridge_networks_to_taps() {
             ifname: tap_name(vm.id, 1),
             bridge: "vmbr0".into(),
             vlan: Some(10),
+            mtu: None,
         }
     );
 }
@@ -960,16 +961,38 @@ async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
         },
     );
     cluster.create(&blue).await.unwrap();
+    let jumbo: Network = Resource::new(
+        "jumbo",
+        NetworkSpec {
+            bridge: None,
+            vlan: None,
+            vxlan: Some(Vxlan { vni: 2000 }),
+            mtu: Some(8950),
+        },
+    );
+    cluster.create(&jumbo).await.unwrap();
 
     let mut vm = common::vm("web", node);
     vm.spec.nics.push(nic("blue", Some(MacAddr::generate())));
+    vm.spec.nics.push(nic("jumbo", Some(MacAddr::generate())));
     let spec = resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+    // MTU를 정하지 않으면 기본 1450이다.
     assert_eq!(
         spec.nics[0].backend,
         NicBackend::Tap {
             ifname: tap_name(vm.id, 0),
             bridge: "oplv1000".into(),
             vlan: None,
+            mtu: Some(1450),
+        }
+    );
+    assert_eq!(
+        spec.nics[1].backend,
+        NicBackend::Tap {
+            ifname: tap_name(vm.id, 1),
+            bridge: "oplv2000".into(),
+            vlan: None,
+            mtu: Some(8950),
         }
     );
 }

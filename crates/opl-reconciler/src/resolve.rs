@@ -291,6 +291,7 @@ async fn resolve(
                 ifname: tap_name(vm.id, i),
                 bridge: network.spec.bridge_name(),
                 vlan: network.spec.vlan,
+                mtu: network.spec.mtu(),
             }
         };
         nics.push(RuntimeNic {

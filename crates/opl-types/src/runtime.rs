@@ -85,6 +85,9 @@ pub enum NicBackend {
         ifname: String,
         bridge: String,
         vlan: Option<u16>,
+        /// VXLAN 네트워크의 MTU. virtio NIC에 `host_mtu`로 알린다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mtu: Option<u16>,
     },
 }
 
@@ -135,5 +138,25 @@ mod tests {
         assert_eq!(json["kind"], "rbd");
         assert_eq!(json["rbd"]["image"], "opl-a");
         assert_eq!(serde_json::from_value::<RuntimeDisk>(json).unwrap(), rbd);
+    }
+
+    #[test]
+    fn tap_mtu_is_optional() {
+        // mtu가 없는 옛 정의(브리지 네트워크)는 None이고, 다시 쓰면 그대로다.
+        let old = serde_json::json!({
+            "kind": "tap", "ifname": "op0123456789n0", "bridge": "vmbr0", "vlan": null
+        });
+        let tap: NicBackend = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(tap, NicBackend::Tap { mtu: None, .. }));
+        assert_eq!(serde_json::to_value(&tap).unwrap(), old);
+        let vxlan = NicBackend::Tap {
+            ifname: "op0123456789n0".into(),
+            bridge: "oplv1000".into(),
+            vlan: None,
+            mtu: Some(1450),
+        };
+        let json = serde_json::to_value(&vxlan).unwrap();
+        assert_eq!(json["mtu"], 1450);
+        assert_eq!(serde_json::from_value::<NicBackend>(json).unwrap(), vxlan);
     }
 }
