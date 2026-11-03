@@ -17,6 +17,10 @@ it("mirrors the server roles", () => {
   expect(can("viewer", "read", "backup")).toBe(true);
   expect(can("viewer", "write", "backup")).toBe(false);
   expect(can("operator", "write", "backup")).toBe(true);
+  // 백업 작업도 백업과 같다.
+  expect(can("viewer", "read", "backup-job")).toBe(true);
+  expect(can("viewer", "write", "backup-job")).toBe(false);
+  expect(can("operator", "write", "backup-job")).toBe(true);
 });
 
 it("keeps accounts to admins", () => {

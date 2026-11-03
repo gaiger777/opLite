@@ -37,7 +37,7 @@ const PHASE_VARIANT = {
 
 /**
  * 백업 표와 복원·지우기. VM 상세의 백업 탭과 백업 화면이 쓴다. `showVm`이면 VM 열을 보인다(VM을
- * 지웠으면 만든 때의 이름만).
+ * 지웠으면 만든 때의 이름만). 작업 열은 백업을 만든 백업 작업이다(손으로 만든 백업은 비어 있다).
  */
 export function BackupTable({
   backups,
@@ -53,6 +53,7 @@ export function BackupTable({
   const { t, i18n } = useTranslation();
   const me = usePrincipal();
   const vms = useList("vm");
+  const jobs = useList("backup-job");
   const [restoring, setRestoring] = useState<Backup | null>(null);
   // 닫히는 동안에도 대상을 남겨 두어 대화상자의 글이 바뀌지 않게 한다.
   const [deleting, setDeleting] = useState<Backup | null>(null);
@@ -66,8 +67,16 @@ export function BackupTable({
     can(me.role, "write", "volume");
   const remove = can(me.role, "write", "backup");
   const actions = restore || remove;
-  const columns = 5 + (showVm ? 1 : 0) + (actions ? 1 : 0);
+  const columns = 6 + (showVm ? 1 : 0) + (actions ? 1 : 0);
   const vmById = new Map((vms.data ?? []).map((v) => [v.id, v]));
+  const jobName = (id: string | null | undefined) => {
+    if (!id) {
+      return "—";
+    }
+    const job = (jobs.data ?? []).find((j) => j.id === id);
+    // 작업을 지워도 백업은 작업 id를 그대로 가진다.
+    return job ? job.name : jobs.isSuccess ? t("backups.jobDeleted") : "—";
+  };
 
   return (
     <>
@@ -77,6 +86,7 @@ export function BackupTable({
             <TableHead>{t("common.name")}</TableHead>
             {showVm && <TableHead>{t("backups.vm")}</TableHead>}
             <TableHead>{t("backups.pool")}</TableHead>
+            <TableHead>{t("backups.job")}</TableHead>
             <TableHead>{t("common.state")}</TableHead>
             <TableHead>{t("backups.created")}</TableHead>
             <TableHead>{t("backups.size")}</TableHead>
@@ -113,6 +123,7 @@ export function BackupTable({
                   </TableCell>
                 )}
                 <TableCell>{backup.spec.pool}</TableCell>
+                <TableCell>{jobName(backup.spec.job)}</TableCell>
                 <TableCell>
                   <Badge variant={PHASE_VARIANT[phase]}>{t(`backups.phase.${phase}`)}</Badge>
                   {error && (

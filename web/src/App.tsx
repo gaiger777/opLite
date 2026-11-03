@@ -9,6 +9,7 @@ import { createQueryClient } from "@/api/queryClient";
 import { TaskIndexProvider } from "@/api/taskIndex";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { RequireAuth } from "@/auth/RequireAuth";
+import { BackupJobsPage } from "@/backups/BackupJobsPage";
 import { BackupsPage } from "@/backups/BackupsPage";
 import { ClusterPage } from "@/cluster/ClusterPage";
 import { Toaster } from "@/components/ui/sonner";
@@ -56,6 +57,7 @@ function routes() {
             { path: "volumes", element: <VolumesPage /> },
             { path: "storage-pools", element: <PoolsPage /> },
             { path: "backups", element: <BackupsPage /> },
+            { path: "backup-jobs", element: <BackupJobsPage /> },
             { path: "networks", element: <NetworksPage /> },
             { path: "security-groups", element: <SecurityGroupsPage /> },
             { path: "security-groups/:name", element: <SecurityGroupPage /> },

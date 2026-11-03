@@ -1,5 +1,6 @@
 import type {
   Backup,
+  BackupJob,
   Node,
   Rule,
   SecurityGroup,
@@ -175,5 +176,28 @@ export function backup(
       error: null,
       ...extra.status,
     },
+  };
+}
+
+/** 테스트용 백업 작업: 매일 03:00(UTC)에 모든 VM을 `bk`에 백업하고 최신 3개를 남긴다. */
+export function backupJob(
+  name: string,
+  n: number,
+  extra: { spec?: Partial<BackupJob["spec"]>; status?: Partial<BackupJob["status"]> } = {},
+): BackupJob {
+  return {
+    id: `019a0f3c-0000-7000-8007-${String(n).padStart(12, "0")}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: {
+      vms: { all: true },
+      pool: "bk",
+      schedule: { at: "03:00", days: [] },
+      keep: { last: 3, daily: 0, weekly: 0, monthly: 0 },
+      enabled: true,
+      ...extra.spec,
+    },
+    status: { next_run: 1_793_761_200, run: null, last_run: null, errors: [], ...extra.status },
   };
 }

@@ -45,7 +45,9 @@
     "firewall_unsupported": "The node has no firewall (nftables) and cannot run VMs with security groups.",
     "security_group_in_use": "A VM interface uses this security group. Remove it from the VM first.",
     "backup_busy": "A task on this backup (backing up, restoring or deleting) is in progress. Try again when it has finished.",
-    "backup_not_ready": "The backup is not ready. Only finished backups can be restored."
+    "backup_not_ready": "The backup is not ready. Only finished backups can be restored.",
+    "job_running": "The backup job is already running. Wait for the run to finish.",
+    "job_disabled": "The backup job is off. Turn on \"Run on schedule\" first."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -53,6 +55,7 @@
     "volumes": "Volumes",
     "pools": "Storage pools",
     "backups": "Backups",
+    "backupJobs": "Backup jobs",
     "networks": "Networks",
     "securityGroups": "Security groups",
     "nodes": "Nodes",
@@ -321,6 +324,8 @@
   "backups": {
     "vm": "VM",
     "pool": "Backup pool",
+    "job": "Job",
+    "jobDeleted": "Deleted job",
     "created": "Created",
     "size": "Size",
     "empty": "No backups.",
@@ -357,6 +362,84 @@
       "exists": "A backup with this name already exists.",
       "vmExists": "A VM with this name already exists.",
       "pool": "Choose a storage pool."
+    }
+  },
+  "backupJobs": {
+    "pageHint": "Back up the chosen VMs at a set time and delete old backups by the retention rules. Times are in UTC. The cluster leader runs the jobs, at most a few backups per node at a time.",
+    "empty": "No backup jobs.",
+    "vms": "VMs",
+    "schedule": "Schedule (UTC)",
+    "keep": "Keep",
+    "nextRun": "Next run",
+    "lastRun": "Last run",
+    "everyDay": "Every day",
+    "day": {
+      "mon": "Mon",
+      "tue": "Tue",
+      "wed": "Wed",
+      "thu": "Thu",
+      "fri": "Fri",
+      "sat": "Sat",
+      "sun": "Sun"
+    },
+    "keepAll": "All backups",
+    "keepUnit": {
+      "last": "last {{n}}",
+      "daily": "{{n}} daily",
+      "weekly": "{{n}} weekly",
+      "monthly": "{{n}} monthly"
+    },
+    "state": {
+      "running": "Running",
+      "enabled": "On",
+      "disabled": "Off"
+    },
+    "waiting_one": "{{count}} VM waiting",
+    "waiting_other": "{{count}} VMs waiting",
+    "result": "{{ok}} ok, {{failed}} failed",
+    "runNow": "Run now",
+    "runNamed": "Run {{name}} now",
+    "runRequested": "{{name}} starts at the scheduler's next check.",
+    "editNamed": "Edit {{name}}",
+    "deleteNamed": "Delete backup job {{name}}",
+    "createTitle": "Create backup job",
+    "createDescription": "Backs up the chosen VMs to a backup pool on the chosen days and deletes the backups the retention rules no longer keep.",
+    "editTitle": "Edit {{name}}",
+    "editDescription": "Changes apply from the next run. A run in progress finishes.",
+    "target": "VMs to back up",
+    "targets": {
+      "all": "All VMs",
+      "names": "VMs by name",
+      "labels": "VMs with labels"
+    },
+    "names": "VM names",
+    "namesHint": "Separate names with commas.",
+    "labels": "Labels",
+    "labelsHint": "KEY=VALUE pairs separated by commas. A VM must have all of them.",
+    "at": "Time (UTC)",
+    "atHint": "HH:MM in UTC, such as 03:00.",
+    "days": "Days",
+    "daysHint": "Leave every day unchecked to run every day.",
+    "retention": "Retention",
+    "retentionHint": "Keeps the newest backups (Last), then the newest backup of each day, ISO week and month, counted per VM. Leave all at 0 to keep every backup. Failed backups are deleted after a later success.",
+    "keepLabel": {
+      "last": "Last",
+      "daily": "Daily",
+      "weekly": "Weekly",
+      "monthly": "Monthly"
+    },
+    "enabled": "Run on schedule",
+    "created": "Backup job {{name}} created.",
+    "saved": "Backup job {{name}} saved.",
+    "deleted": "Backup job {{name}} deleted.",
+    "deleteTitle": "Delete backup job {{name}}?",
+    "deleteDescription": "The job stops running. The backups it made are kept.",
+    "errors": {
+      "exists": "A backup job with this name already exists.",
+      "names": "Enter at least one VM name.",
+      "labels": "Enter at least one KEY=VALUE label.",
+      "at": "Enter a time from 00:00 to 23:59.",
+      "keep": "Enter whole numbers of 0 or more."
     }
   },
   "migrate": {

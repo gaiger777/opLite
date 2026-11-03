@@ -66,6 +66,9 @@ it("translates API error codes and falls back to the server message", async () =
   expect(errorMessage(t, new ApiError(409, "backup_not_ready", 'backup "b" is not ready'))).toBe(
     "The backup is not ready. Only finished backups can be restored.",
   );
+  expect(errorMessage(t, new ApiError(409, "job_disabled", 'backup job "n" is disabled'))).toBe(
+    'The backup job is off. Turn on "Run on schedule" first.',
+  );
   expect(errorMessage(t, new ApiError(400, "invalid_request", "memory_mib must be > 0"))).toBe(
     "memory_mib must be > 0",
   );

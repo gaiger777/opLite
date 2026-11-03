@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import { BackupsPage } from "@/backups/BackupsPage";
 import { resetTasks } from "@/tasks/tasks";
-import { backup, pool, task, vm } from "@/test/fixtures";
+import { backup, backupJob, pool, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -25,6 +25,24 @@ it("lists every backup and links only VMs that still exist", async () => {
   const orphan = within(table).getByText("old-1").closest("tr")!;
   expect(orphan).toHaveTextContent("old");
   expect(within(orphan).queryByRole("link")).not.toBeInTheDocument();
+});
+
+it("names the job that made each backup", async () => {
+  const nightly = backupJob("nightly", 1);
+  const byJob = backup("web-2", web, 3, { spec: { job: nightly.id } });
+  // 작업을 지워도 백업은 작업 id를 그대로 가진다.
+  const byGoneJob = backup("web-3", web, 4, { spec: { job: backupJob("gone", 2).id } });
+  mockLists({ vm: [web], backup: [ofWeb, byJob, byGoneJob], "backup-job": [nightly] });
+  renderPage(<BackupsPage />);
+  const table = await screen.findByRole("table", { name: "Backups" });
+  const headers = within(table).getAllByRole("columnheader");
+  const job = async (name: string) =>
+    within((await within(table).findByText(name)).closest("tr")!).getAllByRole("cell")[
+      headers.findIndex((h) => h.textContent === "Job")
+    ];
+  expect(await job("web-2")).toHaveTextContent("nightly");
+  expect(await job("web-3")).toHaveTextContent("Deleted job");
+  expect(await job("web-1")).toHaveTextContent("—");
 });
 
 it("restores a backup as a new VM", async () => {

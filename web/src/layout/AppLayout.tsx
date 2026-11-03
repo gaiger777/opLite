@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Archive,
   Boxes,
+  CalendarClock,
   Cpu,
   Database,
   HardDrive,
@@ -51,6 +52,7 @@ const NAV: { to: string; key: string; icon: LucideIcon; end: boolean; kind?: Kin
   { to: "/volumes", key: "nav.volumes", icon: HardDrive, end: false },
   { to: "/storage-pools", key: "nav.pools", icon: Database, end: false },
   { to: "/backups", key: "nav.backups", icon: Archive, end: false },
+  { to: "/backup-jobs", key: "nav.backupJobs", icon: CalendarClock, end: false },
   { to: "/networks", key: "nav.networks", icon: Network, end: false },
   { to: "/security-groups", key: "nav.securityGroups", icon: Shield, end: false },
   { to: "/nodes", key: "nav.nodes", icon: Cpu, end: false },

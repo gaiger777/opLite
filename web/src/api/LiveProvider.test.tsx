@@ -38,6 +38,7 @@ function lists(vms: unknown[], revision: number) {
     http.get(apiUrl("/snapshots"), empty),
     http.get(apiUrl("/security-groups"), empty),
     http.get(apiUrl("/backups"), empty),
+    http.get(apiUrl("/backup-jobs"), empty),
   ];
 }
 
@@ -59,7 +60,7 @@ it("watches from the oldest list revision and applies changes", async () => {
   );
   expect(await screen.findByText("live: web=running")).toBeInTheDocument();
   expect(urls[0]).toContain(
-    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup&since=7",
+    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job&since=7",
   );
 });
 

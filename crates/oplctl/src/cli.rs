@@ -76,6 +76,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BackupCmd,
     },
+    /// 백업 작업: 정한 시각(UTC)에 고른 VM들을 백업하고 보존 규칙대로 옛 백업을 지운다.
+    BackupJob {
+        #[command(subcommand)]
+        cmd: BackupJobCmd,
+    },
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
@@ -923,6 +928,212 @@ enum BackupCmd {
 }
 
 #[derive(Subcommand)]
+enum BackupJobCmd {
+    /// 백업 작업을 만든다. 정한 요일의 시각(UTC)에 고른 VM들을 백업하고 보존 규칙에 맞지 않는 옛
+    /// 백업을 지운다.
+    Create(BackupJobCreate),
+    List,
+    Get {
+        job: String,
+    },
+    /// 준 값만 바꾼다. 일정이나 보존 규칙의 일부만 주면 나머지는 지금 값을 그대로 둔다.
+    Set(BackupJobSet),
+    /// 작업만 지운다. 작업이 만든 백업은 남는다.
+    Delete {
+        job: String,
+    },
+    /// 지금 실행한다. 리더의 스케줄러가 다음 차례에 시작하며 끝나기를 기다리지 않는다.
+    Run {
+        job: String,
+    },
+}
+
+/// 백업할 VM 고르기. 셋 중 하나만 준다.
+#[derive(Args)]
+struct VmsArgs {
+    /// 모든 VM
+    #[arg(long)]
+    all: bool,
+    /// 이 이름의 VM(여러 번 줄 수 있다)
+    #[arg(long = "vm", value_name = "NAME")]
+    vms: Vec<String>,
+    /// 이 라벨을 모두 가진 VM(여러 번 줄 수 있다)
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
+    labels: Vec<(String, String)>,
+}
+
+/// 보존 규칙. 모두 0이면 지우지 않는다.
+#[derive(Args)]
+struct KeepArgs {
+    /// 최신 N개를 남긴다.
+    #[arg(long, value_name = "N")]
+    keep_last: Option<u32>,
+    /// 그다음 하루(UTC)마다 가장 새 것 하나씩 N일
+    #[arg(long, value_name = "N")]
+    keep_daily: Option<u32>,
+    /// 그다음 ISO 주마다 가장 새 것 하나씩 N주
+    #[arg(long, value_name = "N")]
+    keep_weekly: Option<u32>,
+    /// 그다음 달마다 가장 새 것 하나씩 N달
+    #[arg(long, value_name = "N")]
+    keep_monthly: Option<u32>,
+}
+
+impl KeepArgs {
+    fn given(&self) -> bool {
+        self.keep_last.is_some()
+            || self.keep_daily.is_some()
+            || self.keep_weekly.is_some()
+            || self.keep_monthly.is_some()
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Day {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("selector").required(true).args(["all", "vms", "labels"])))]
+struct BackupJobCreate {
+    name: String,
+    /// 백업 풀(`pool set NAME --backups true`로 표시한 풀)
+    #[arg(long)]
+    pool: String,
+    #[command(flatten)]
+    vms: VmsArgs,
+    /// 실행 시각(UTC)
+    #[arg(long, value_name = "HH:MM")]
+    at: String,
+    /// 실행할 요일(쉼표로 나눔). 생략하면 매일.
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "mon,tue,...")]
+    days: Vec<Day>,
+    #[command(flatten)]
+    keep: KeepArgs,
+    /// 예약 실행을 꺼 둔 채로 만든다.
+    #[arg(long)]
+    disabled: bool,
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("selector").args(["all", "vms", "labels"])))]
+#[command(group(ArgGroup::new("change").required(true).multiple(true).args([
+    "all", "vms", "labels", "pool", "at", "days",
+    "keep_last", "keep_daily", "keep_weekly", "keep_monthly", "enabled",
+])))]
+struct BackupJobSet {
+    job: String,
+    #[arg(long)]
+    pool: Option<String>,
+    #[command(flatten)]
+    vms: VmsArgs,
+    /// 실행 시각(UTC)
+    #[arg(long, value_name = "HH:MM")]
+    at: Option<String>,
+    /// 실행할 요일(쉼표로 나눔). 모든 요일을 주면 매일이다.
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "mon,tue,...")]
+    days: Vec<Day>,
+    #[command(flatten)]
+    keep: KeepArgs,
+    /// 예약 실행을 켜거나(다음 실행 시각을 지금부터 다시 정한다) 끈다. 진행 중인 실행은 끝까지 간다.
+    #[arg(long, value_name = "true|false")]
+    enabled: Option<bool>,
+}
+
+/// `--label`의 `KEY=VALUE`. 값에는 `=`가 있어도 된다.
+fn parse_label(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.into(), value.into())),
+        _ => Err(format!("invalid label {s:?}: use KEY=VALUE")),
+    }
+}
+
+/// VM 고르기(`vms` 값). 주지 않았으면 `None`이다.
+fn vms_value(args: &VmsArgs) -> Option<Value> {
+    if args.all {
+        Some(json!({ "all": true }))
+    } else if !args.vms.is_empty() {
+        Some(json!({ "names": args.vms }))
+    } else if !args.labels.is_empty() {
+        let labels: serde_json::Map<String, Value> = args
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        Some(json!({ "labels": labels }))
+    } else {
+        None
+    }
+}
+
+fn days_value(days: &[Day]) -> Value {
+    json!(days.iter().map(|d| value_name(*d)).collect::<Vec<_>>())
+}
+
+/// 보존 규칙(`keep` 값). 주지 않은 단위는 `current`의 값, 거기도 없으면 0이다.
+fn keep_value(args: &KeepArgs, current: &Value) -> Value {
+    let pick = |arg: Option<u32>, field: &str| {
+        arg.map_or_else(|| current[field].as_u64().unwrap_or(0), u64::from)
+    };
+    json!({
+        "last": pick(args.keep_last, "last"),
+        "daily": pick(args.keep_daily, "daily"),
+        "weekly": pick(args.keep_weekly, "weekly"),
+        "monthly": pick(args.keep_monthly, "monthly"),
+    })
+}
+
+/// `backup-job create`의 요청 본문
+fn backup_job_create_body(args: &BackupJobCreate) -> Value {
+    json!({
+        "name": args.name,
+        "spec": {
+            "vms": vms_value(&args.vms),
+            "pool": args.pool,
+            "schedule": { "at": args.at, "days": days_value(&args.days) },
+            "keep": keep_value(&args.keep, &Value::Null),
+            "enabled": !args.disabled,
+        }
+    })
+}
+
+/// `backup-job set`의 요청 본문(`PATCH /backup-jobs/{key}`). 준 값만 보낸다. 서버는 일정과 보존
+/// 규칙을 통째로 바꾸므로 그 일부만 주었으면 나머지는 읽은 작업(`current`)의 값으로 채운다.
+fn backup_job_set_body(args: &BackupJobSet, current: &Value) -> Value {
+    let mut body = json!({});
+    if let Some(vms) = vms_value(&args.vms) {
+        body["vms"] = vms;
+    }
+    if let Some(pool) = &args.pool {
+        body["pool"] = json!(pool);
+    }
+    let schedule = &current["spec"]["schedule"];
+    if args.at.is_some() || !args.days.is_empty() {
+        body["schedule"] = json!({
+            "at": args.at.as_ref().map_or_else(|| schedule["at"].clone(), |at| json!(at)),
+            "days": if args.days.is_empty() {
+                schedule["days"].as_array().map_or_else(|| json!([]), |d| json!(d))
+            } else {
+                days_value(&args.days)
+            },
+        });
+    }
+    if args.keep.given() {
+        body["keep"] = keep_value(&args.keep, &current["spec"]["keep"]);
+    }
+    if let Some(enabled) = args.enabled {
+        body["enabled"] = json!(enabled);
+    }
+    body
+}
+
+#[derive(Subcommand)]
 enum TaskCmd {
     List,
     Get { task: String },
@@ -1246,6 +1457,7 @@ where
         },
         Cmd::Vm { cmd } => vm(&client, cmd, json_out, out).await?,
         Cmd::Backup { cmd } => backup(&client, cmd, json_out, out).await?,
+        Cmd::BackupJob { cmd } => backup_job(&client, cmd, json_out, out).await?,
         Cmd::Task { cmd } => match cmd {
             TaskCmd::List => {
                 let list = client.get("/tasks").await?;
@@ -1469,6 +1681,130 @@ fn backup_row(b: &Value) -> Vec<String> {
         cell(&status["phase"]),
         created,
         size,
+    ]
+}
+
+async fn backup_job(
+    client: &Client,
+    cmd: BackupJobCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        BackupJobCmd::Create(args) => {
+            let job = client
+                .post("/backup-jobs", &backup_job_create_body(&args))
+                .await?;
+            if args.disabled {
+                writeln!(out, "backup job {} created (disabled)", args.name)?;
+            } else {
+                let next = job["status"]["next_run"]
+                    .as_i64()
+                    .map_or_else(|| "-".to_string(), unix_time);
+                writeln!(out, "backup job {} created; next run {next}", args.name)?;
+            }
+        }
+        BackupJobCmd::List => {
+            let list = client.get("/backup-jobs").await?;
+            print_list(out, json_out, &list, BACKUP_JOB_HEADERS, backup_job_row)?;
+        }
+        BackupJobCmd::Get { job } => {
+            print_json(out, &client.get(&format!("/backup-jobs/{job}")).await?)?
+        }
+        BackupJobCmd::Set(args) => {
+            // If-Match 없이 보낸다: 스케줄러가 status를 자주 써서 revision이 곧잘 바뀐다.
+            let path = format!("/backup-jobs/{}", args.job);
+            let current = client.get(&path).await?;
+            client
+                .patch(&path, &backup_job_set_body(&args, &current))
+                .await?;
+            writeln!(out, "backup job {} updated", args.job)?;
+        }
+        BackupJobCmd::Delete { job } => {
+            client.delete(&format!("/backup-jobs/{job}")).await?;
+            writeln!(out, "backup job {job} deleted; its backups are kept")?;
+        }
+        BackupJobCmd::Run { job } => {
+            client
+                .send(client.request(Method::POST, &format!("/backup-jobs/{job}/run")))
+                .await?;
+            writeln!(
+                out,
+                "backup job {job} will run at the scheduler's next check"
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// `backup-job list`의 열
+const BACKUP_JOB_HEADERS: &[&str] = &[
+    "NAME", "POOL", "VMS", "SCHEDULE", "KEEP", "ENABLED", "NEXT", "LAST",
+];
+
+/// `backup-job list`의 한 행. 시각은 모두 UTC다. 끈 작업은 다음 실행이 없다.
+fn backup_job_row(j: &Value) -> Vec<String> {
+    let spec = &j["spec"];
+    let status = &j["status"];
+    let vms = &spec["vms"];
+    let vms = if vms["all"] == true {
+        "all".to_string()
+    } else if let Some(names) = vms["names"].as_array() {
+        names.iter().map(cell).collect::<Vec<_>>().join(",")
+    } else if let Some(labels) = vms["labels"].as_object() {
+        labels
+            .iter()
+            .map(|(k, v)| format!("{k}={}", cell(v)))
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        "-".to_string()
+    };
+    let days = match spec["schedule"]["days"].as_array() {
+        Some(days) if !days.is_empty() => days.iter().map(cell).collect::<Vec<_>>().join(","),
+        _ => "daily".to_string(),
+    };
+    let schedule = format!("{days} {} UTC", cell(&spec["schedule"]["at"]));
+    let keep: Vec<String> = ["last", "daily", "weekly", "monthly"]
+        .iter()
+        .filter_map(|unit| match spec["keep"][unit].as_u64() {
+            Some(n) if n > 0 => Some(format!("{unit}={n}")),
+            _ => None,
+        })
+        .collect();
+    let keep = if keep.is_empty() {
+        "all".to_string()
+    } else {
+        keep.join(",")
+    };
+    let enabled = spec["enabled"] != false;
+    let next = match status["next_run"].as_i64() {
+        Some(t) if enabled => unix_time(t),
+        _ => "-".to_string(),
+    };
+    let last = if !status["run"].is_null() {
+        "running".to_string()
+    } else {
+        let r = &status["last_run"];
+        match r["finished_at"].as_i64() {
+            Some(t) => format!(
+                "{} ({} ok, {} failed)",
+                unix_time(t),
+                cell(&r["ok"]),
+                cell(&r["failed"])
+            ),
+            None => "-".to_string(),
+        }
+    };
+    vec![
+        cell(&j["name"]),
+        cell(&spec["pool"]),
+        vms,
+        schedule,
+        keep,
+        enabled.to_string(),
+        next,
+        last,
     ]
 }
 
@@ -3021,6 +3357,202 @@ mod tests {
         assert_eq!(backup_row(&pending)[3..], ["pending", "-", "-"]);
     }
 
+    /// `backup-job create`의 인자를 요청 본문으로
+    fn backup_job_create(args: &[&str]) -> Result<Value, clap::Error> {
+        let mut argv = vec!["oplctl", "backup-job", "create", "nightly"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+            Cmd::BackupJob {
+                cmd: BackupJobCmd::Create(c),
+            } => backup_job_create_body(&c),
+            _ => unreachable!(),
+        })
+    }
+
+    #[test]
+    fn backup_job_create_builds_the_spec() {
+        assert_eq!(
+            backup_job_create(&[
+                "--pool",
+                "bk",
+                "--label",
+                "tier=prod",
+                "--label",
+                "env=a=b",
+                "--at",
+                "03:00",
+                "--days",
+                "mon,wed",
+                "--keep-last",
+                "2",
+                "--keep-weekly",
+                "4",
+            ])
+            .unwrap(),
+            json!({
+                "name": "nightly",
+                "spec": {
+                    "vms": { "labels": { "tier": "prod", "env": "a=b" } },
+                    "pool": "bk",
+                    "schedule": { "at": "03:00", "days": ["mon", "wed"] },
+                    "keep": { "last": 2, "daily": 0, "weekly": 4, "monthly": 0 },
+                    "enabled": true
+                }
+            })
+        );
+        // 요일을 주지 않으면 매일, 보존 규칙을 주지 않으면 모두 0(지우지 않음)
+        let all =
+            backup_job_create(&["--pool", "bk", "--all", "--at", "00:00", "--disabled"]).unwrap();
+        assert_eq!(all["spec"]["vms"], json!({ "all": true }));
+        assert_eq!(
+            all["spec"]["schedule"],
+            json!({ "at": "00:00", "days": [] })
+        );
+        assert_eq!(
+            all["spec"]["keep"],
+            json!({ "last": 0, "daily": 0, "weekly": 0, "monthly": 0 })
+        );
+        assert_eq!(all["spec"]["enabled"], json!(false));
+        assert_eq!(
+            backup_job_create(&["--pool", "bk", "--vm", "web", "--vm", "db", "--at", "03:00"])
+                .unwrap()["spec"]["vms"],
+            json!({ "names": ["web", "db"] })
+        );
+        // VM 고르기는 셋 중 꼭 하나, 풀과 시각은 꼭, 라벨은 KEY=VALUE, 요일은 mon..sun
+        for args in [
+            &["--pool", "bk", "--at", "03:00"][..],
+            &["--pool", "bk", "--all", "--vm", "web", "--at", "03:00"],
+            &[
+                "--pool", "bk", "--vm", "web", "--label", "a=b", "--at", "03:00",
+            ],
+            &["--all", "--at", "03:00"],
+            &["--pool", "bk", "--all"],
+            &["--pool", "bk", "--label", "tier", "--at", "03:00"],
+            &["--pool", "bk", "--label", "=prod", "--at", "03:00"],
+            &["--pool", "bk", "--all", "--at", "03:00", "--days", "monday"],
+            &[
+                "--pool",
+                "bk",
+                "--all",
+                "--at",
+                "03:00",
+                "--keep-last",
+                "-1",
+            ],
+        ] {
+            assert!(backup_job_create(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn backup_job_set_changes_only_what_is_given() {
+        let current = json!({
+            "name": "nightly",
+            "revision": 9,
+            "spec": {
+                "vms": { "all": true }, "pool": "bk",
+                "schedule": { "at": "03:00", "days": ["sat"] },
+                "keep": { "last": 2, "daily": 7, "weekly": 0, "monthly": 0 },
+                "enabled": true
+            }
+        });
+        let set = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "backup-job", "set", "nightly"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::BackupJob {
+                    cmd: BackupJobCmd::Set(s),
+                } => backup_job_set_body(&s, &current),
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(
+            set(&["--enabled", "false"]).unwrap(),
+            json!({ "enabled": false })
+        );
+        assert_eq!(
+            set(&["--vm", "web", "--pool", "bk2"]).unwrap(),
+            json!({ "vms": { "names": ["web"] }, "pool": "bk2" })
+        );
+        // 일정과 보존 규칙은 통째로 바뀌므로 주지 않은 부분은 지금 값을 보낸다.
+        assert_eq!(
+            set(&["--at", "04:30"]).unwrap(),
+            json!({ "schedule": { "at": "04:30", "days": ["sat"] } })
+        );
+        assert_eq!(
+            set(&["--days", "sun,mon"]).unwrap(),
+            json!({ "schedule": { "at": "03:00", "days": ["sun", "mon"] } })
+        );
+        assert_eq!(
+            set(&["--keep-monthly", "6", "--keep-last", "1"]).unwrap(),
+            json!({ "keep": { "last": 1, "daily": 7, "weekly": 0, "monthly": 6 } })
+        );
+        // 바꿀 것은 꼭 하나, VM 고르기는 하나만, 사용 여부는 true나 false
+        for args in [
+            &[][..],
+            &["--all", "--vm", "web"],
+            &["--enabled"],
+            &["--enabled", "yes"],
+        ] {
+            assert!(set(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn backup_job_list_shows_the_schedule_and_runs() {
+        let job = json!({
+            "name": "nightly",
+            "spec": {
+                "vms": { "labels": { "env": "a", "tier": "prod" } }, "pool": "bk",
+                "schedule": { "at": "03:00", "days": ["mon", "wed"] },
+                "keep": { "last": 2, "daily": 0, "weekly": 4, "monthly": 0 },
+                "enabled": true
+            },
+            "status": {
+                "next_run": 1_793_761_200, "run": null,
+                "last_run": { "started_at": 1_793_674_800, "finished_at": 1_793_675_100, "ok": 3, "failed": 1 },
+                "errors": [{ "vm": "db", "error": "boom" }]
+            }
+        });
+        assert_eq!(
+            backup_job_row(&job),
+            [
+                "nightly",
+                "bk",
+                "env=a,tier=prod",
+                "mon,wed 03:00 UTC",
+                "last=2,weekly=4",
+                "true",
+                "2026-11-04 03:00 UTC",
+                "2026-11-03 03:05 UTC (3 ok, 1 failed)"
+            ]
+        );
+        // 매일, 보존 규칙 없음, 진행 중
+        let mut running = job.clone();
+        running["spec"]["vms"] = json!({ "names": ["web", "db"] });
+        running["spec"]["schedule"]["days"] = json!([]);
+        running["spec"]["keep"] = json!({ "last": 0, "daily": 0, "weekly": 0, "monthly": 0 });
+        running["status"]["run"] = json!({ "started_at": 1, "queue": [], "backups": [] });
+        assert_eq!(
+            backup_job_row(&running)[2..],
+            [
+                "web,db",
+                "daily 03:00 UTC",
+                "all",
+                "true",
+                "2026-11-04 03:00 UTC",
+                "running"
+            ]
+        );
+        // 끈 작업은 다음 실행이 없고, 한 번도 돌지 않았으면 마지막 실행도 없다.
+        let mut off = job.clone();
+        off["spec"]["vms"] = json!({ "all": true });
+        off["spec"]["enabled"] = json!(false);
+        off["status"]["last_run"] = Value::Null;
+        assert_eq!(backup_job_row(&off)[2], "all");
+        assert_eq!(backup_job_row(&off)[5..], ["false", "-", "-"]);
+    }
+
     #[test]
     fn parses_pool_create_commands() {
         let create = |args: &[&str]| {
@@ -3506,6 +4038,43 @@ mod tests {
             ]
         );
         assert_eq!(String::from_utf8(out).unwrap(), "backup b1 deleted\n");
+    }
+
+    /// `backup-job set`은 작업을 읽어 그 값에 맞춰 PATCH하고, `run`은 본문 없이 POST한다.
+    #[tokio::test]
+    async fn backup_job_set_reads_then_patches_and_run_posts() {
+        let (client, seen) = fake_api(|_| {
+            json!({
+                "name": "nightly", "revision": 3,
+                "spec": { "schedule": { "at": "03:00", "days": [] }, "keep": {} },
+                "status": {}
+            })
+        })
+        .await;
+        let cli = Cli::try_parse_from(["oplctl", "backup-job", "set", "nightly", "--at", "04:00"])
+            .unwrap();
+        let Cmd::BackupJob { cmd } = cli.cmd else {
+            unreachable!()
+        };
+        let mut out = Vec::new();
+        backup_job(&client, cmd, false, &mut out).await.unwrap();
+        let cli = Cli::try_parse_from(["oplctl", "backup-job", "run", "nightly"]).unwrap();
+        let Cmd::BackupJob { cmd } = cli.cmd else {
+            unreachable!()
+        };
+        backup_job(&client, cmd, false, &mut out).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/backup-jobs/nightly HTTP/1.1",
+                "PATCH /api/v1/backup-jobs/nightly HTTP/1.1",
+                "POST /api/v1/backup-jobs/nightly/run HTTP/1.1"
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "backup job nightly updated\nbackup job nightly will run at the scheduler's next check\n"
+        );
     }
 
     /// 풀을 읽지 못하면 --format을 주라고 알린다. 주면 풀을 읽지 않는다.

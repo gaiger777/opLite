@@ -14,6 +14,7 @@ export const KINDS: WatchKind[] = [
   "snapshot",
   "security-group",
   "backup",
+  "backup-job",
 ];
 
 /** 목록 응답. `revision`은 목록을 읽은 시점의 클러스터 revision이다. */
@@ -58,6 +59,8 @@ export async function fetchList<K extends WatchKind>(kind: K): Promise<List<Reso
         return call(api.GET("/security-groups"));
       case "backup":
         return call(api.GET("/backups"));
+      case "backup-job":
+        return call(api.GET("/backup-jobs"));
     }
   })();
   return list as List<Resources[K]>;

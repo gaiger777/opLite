@@ -41,6 +41,7 @@ function signedOut() {
       "/snapshots",
       "/security-groups",
       "/backups",
+      "/backup-jobs",
     ].map((path) => http.get(apiUrl(path), () => HttpResponse.json({ revision: 1, items: [] }))),
     ws.link(`ws://${window.location.host}/api/v1/watch`).addEventListener("connection", () => {}),
     http.get(apiUrl("/cluster"), () =>

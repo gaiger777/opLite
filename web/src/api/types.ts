@@ -11,6 +11,8 @@ export type Node = Schemas["Resource_NodeSpec_NodeStatus"];
 export type Task = Schemas["Resource_TaskSpec_TaskStatus"];
 export type Snapshot = Schemas["Resource_SnapshotSpec_SnapshotStatus"];
 export type Backup = Schemas["Resource_BackupSpec_BackupStatus"];
+export type BackupJob = Schemas["Resource_BackupJobSpec_BackupJobStatus"];
+export type Weekday = Schemas["Weekday"];
 export type SecurityGroup = Schemas["Resource_SecurityGroupSpec_SecurityGroupStatus"];
 export type Rule = Schemas["Rule"];
 export type Principal = Schemas["Principal"];
@@ -26,7 +28,8 @@ export type WatchKind =
   | "network"
   | "snapshot"
   | "security-group"
-  | "backup";
+  | "backup"
+  | "backup-job";
 
 /** 종류별 리소스 */
 export interface Resources {
@@ -39,4 +42,5 @@ export interface Resources {
   snapshot: Snapshot;
   "security-group": SecurityGroup;
   backup: Backup;
+  "backup-job": BackupJob;
 }
