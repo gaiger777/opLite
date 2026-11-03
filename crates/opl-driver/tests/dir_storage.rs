@@ -717,3 +717,101 @@ async fn storages_copy_between_backends() {
         "read -P 0xcd 0 64k"
     ));
 }
+
+/// `qemu-img info`의 JSON
+fn image_info(path: &Path) -> serde_json::Value {
+    let out = std::process::Command::new("qemu-img")
+        .args(["info", "--output=json", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// 백업 내보내기: qcow2 볼륨의 스냅샷(실행 중인 VM처럼 `-U`)과 raw 볼륨의 지금 내용을 압축 qcow2
+/// 파일로 쓴다. 내보낸 파일은 스냅샷 없는 qcow2이고 원본의 크기와 내용을 갖는다.
+#[tokio::test]
+async fn export_volume_writes_compressed_qcow2_of_snapshot_or_current_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src_dir, out) = (tmp.path().join("src"), tmp.path().join("out"));
+    std::fs::create_dir(&src_dir).unwrap();
+    std::fs::create_dir(&out).unwrap();
+    let src_pool = pool(&src_dir);
+    let storages = Storages::new("qemu-img", Arc::new(DirStorage::new("qemu-img", MNT)));
+    let (qcow2, raw) = (ImageFormat::Qcow2, ImageFormat::Raw);
+
+    let src = Uuid::now_v7();
+    let src_path = storages
+        .create_volume(&src_pool, src, 64 * MIB, qcow2)
+        .await
+        .unwrap();
+    assert!(qemu_io(&src_path, "write -P 0xab 0 1M"));
+    let tag = Uuid::now_v7().simple().to_string();
+    storages
+        .snapshot_create(&src_pool, src, qcow2, &tag)
+        .await
+        .unwrap();
+    assert_eq!(
+        storages.snapshot_tags(&src_pool, src, qcow2).await.unwrap(),
+        vec![tag.clone()]
+    );
+    assert!(qemu_io(&src_path, "write -P 0xcd 0 1M"));
+
+    let source = storages
+        .volume_source(&src_pool, src, qcow2, Some(&tag))
+        .await
+        .unwrap();
+    let dest = out.join("disk0.qcow2");
+    storages.export_volume(&source, true, &dest).await.unwrap();
+    storages
+        .release_source(&src_pool, src, qcow2, Some(&tag))
+        .await
+        .unwrap();
+    assert!(qemu_io(&dest, "read -P 0xab 0 1M"));
+    let info = image_info(&dest);
+    assert_eq!(info["format"], "qcow2");
+    assert_eq!(info["virtual-size"], 64 * MIB);
+    assert!(info.get("snapshots").is_none(), "{info}");
+    // 압축했으므로 같은 바이트로 채운 1 MiB보다 작다.
+    assert!(std::fs::metadata(&dest).unwrap().len() < MIB);
+    // 원본의 태그는 그대로다.
+    assert_eq!(
+        storages.snapshot_tags(&src_pool, src, qcow2).await.unwrap(),
+        vec![tag.clone()]
+    );
+
+    let src_raw = Uuid::now_v7();
+    let raw_path = storages
+        .create_volume(&src_pool, src_raw, 32 * MIB, raw)
+        .await
+        .unwrap();
+    assert!(qemu_io_fmt(&raw_path, raw, "write -P 0x5a 0 64k"));
+    let source = storages
+        .volume_source(&src_pool, src_raw, raw, None)
+        .await
+        .unwrap();
+    let dest1 = out.join("disk1.qcow2");
+    storages
+        .export_volume(&source, false, &dest1)
+        .await
+        .unwrap();
+    assert!(qemu_io(&dest1, "read -P 0x5a 0 64k"));
+    assert_eq!(image_info(&dest1)["virtual-size"], 32 * MIB);
+
+    // 없는 태그면 실패하고 `.part`를 남기지 않는다.
+    let gone = storages
+        .volume_source(&src_pool, src, qcow2, Some("gone"))
+        .await
+        .unwrap();
+    let err = storages
+        .export_volume(&gone, true, &out.join("disk2.qcow2"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+    let mut files: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["disk0.qcow2", "disk1.qcow2"]);
+}

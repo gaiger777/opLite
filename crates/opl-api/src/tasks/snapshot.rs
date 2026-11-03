@@ -35,7 +35,7 @@ const RESUME_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 멈춘 VM을 이어서 실행한다. 일시 오류면 [`RESUME_INTERVAL`] 간격으로 모두 [`RESUME_TRIES`]번
 /// 해 본다. VM이 꺼졌으면 이어서 실행할 것이 없으므로 성공이다.
-async fn resume_vm(hv: &dyn Hypervisor, id: Uuid) -> Result<(), DriverError> {
+pub(super) async fn resume_vm(hv: &dyn Hypervisor, id: Uuid) -> Result<(), DriverError> {
     let mut tries = 1;
     loop {
         match hv.resume(id).await {
@@ -94,14 +94,14 @@ impl Drop for Paused {
     }
 }
 
-/// 시간을 넘겨 실패한 블록 스냅샷 `snapshot`이 디스크 `disks`에 남겼을 수 있는 태그를 뒤에서
-/// 지운다. 명령이 아직 돌 수 있으므로 `orphan_retry` 뒤부터 그 간격으로 [`LEFT_TAG_TRIES`]번까지
-/// 해 본다. 그 id의 스냅샷 리소스가 있으면 그 스냅샷의 태그이므로 그 차례는 건너뛴다. 그래도 남은
-/// 태그는 실행기가 다음에 시작할 때 지운다. 실행기가 멈추면 함께 멈춘다.
-fn remove_left_tags(ctx: &Ctx, snapshot: Uuid, mut disks: Vec<(Volume, StoragePool)>) {
+/// 시간을 넘겨 실패한 블록 스냅샷 `snapshot`(백업의 임시 스냅샷이면 백업 id)이 디스크 `disks`에
+/// 남겼을 수 있는 태그 `tag`를 뒤에서 지운다. 명령이 아직 돌 수 있으므로 `orphan_retry` 뒤부터 그
+/// 간격으로 [`LEFT_TAG_TRIES`]번까지 해 본다. 그 id의 스냅샷 리소스가 있으면 그 스냅샷의 태그이므로
+/// 그 차례는 건너뛴다. 그래도 남은 태그는 실행기가 다음에 시작할 때 지운다. 실행기가 멈추면 함께 멈춘다.
+fn remove_left_tags(ctx: &Ctx, snapshot: Uuid, tag: &str, mut disks: Vec<(Volume, StoragePool)>) {
     let (cluster, storage) = (ctx.cluster.clone(), ctx.storage.clone());
     let interval = ctx.config.orphan_retry;
-    let tag = snapshot.to_string();
+    let tag = tag.to_string();
     let mut stopped = ctx.stopped.subscribe();
     let remove = async move {
         for _ in 0..LEFT_TAG_TRIES {
@@ -155,7 +155,7 @@ pub(super) fn remove_unfinished_tags(ctx: &Ctx, id: Uuid) {
         }
     }
     if !disks.is_empty() {
-        remove_left_tags(ctx, id, disks);
+        remove_left_tags(ctx, id, &id.to_string(), disks);
     }
 }
 
@@ -302,7 +302,9 @@ async fn needs_pause(ctx: &Ctx, vm: Uuid) -> Result<bool, String> {
 
 /// 디스크들이 블록 스냅샷을 쓰면 그 종류([`block_snapshot_kind`]). 방식(qcow2 내부 스냅샷,
 /// 블록 백엔드 종류)이 섞였으면 오류다.
-fn block_snapshots(disks: &[(Volume, StoragePool)]) -> Result<Option<&'static str>, String> {
+pub(super) fn block_snapshots(
+    disks: &[(Volume, StoragePool)],
+) -> Result<Option<&'static str>, String> {
     let mut kinds = disks.iter().map(|(_, p)| block_snapshot_kind(p));
     let first = kinds.next().flatten();
     if kinds.any(|k| k != first) {
@@ -346,7 +348,7 @@ fn has_block_disks(ctx: &Ctx, spec: &VmSpec) -> Result<bool, String> {
 /// 스토리지로 지운다. 태그나 볼륨이 없는 디스크는 그냥 넘어가고, 한 디스크가 실패해도 나머지를
 /// 지운 뒤 첫 오류를 돌려준다. 다른 노드에 있는 볼륨은 이 노드에서 파일이 보이지 않으므로(없는 것으로 보면
 /// 태그가 남는다) 오류다.
-async fn remove_tags(
+pub(super) async fn remove_tags(
     ctx: &Ctx,
     vm: Uuid,
     running: bool,
@@ -417,18 +419,14 @@ async fn set_position(
     }
 }
 
-fn now_secs() -> u64 {
+pub(super) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-/// `pending` 스냅샷을 채운다. 실행 중이면 하이퍼바이저로(메모리 포함 또는 디스크만), 정지했으면
-/// 디스크마다 스토리지로 태그를 만든다(블록 스냅샷은 실행 중이면 VM을 잠시 멈추고 스토리지로).
-/// 스토리지로는 같은 풀의 디스크를 한 번에 찍는다(ZFS는 원자적).
-/// UEFI 변수를 복사한 뒤 `ready`로 바꾸고 VM의 현재 위치로 삼는다. 실패를 확인했으면 만든 태그를
-/// 지운다(리소스는 실행기의 정리가 지운다). 응답을 기다리다 시간이 다 됐으면 작업이 아직 돌 수
-/// 있으므로 태그를 두고 실패한다(블록 스냅샷의 태그는 뒤에서 다시 지운다, [`remove_left_tags`]).
+/// `pending` 스냅샷을 채운다: 디스크에 태그를 찍고 UEFI 변수를 복사한 뒤([`take_tags`]) `ready`로
+/// 바꾸고 VM의 현재 위치로 삼는다. 실패하면 리소스는 실행기의 정리가 지운다.
 pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), String> {
     let snapshot = get_snapshot(ctx, id)?.ok_or("snapshot was deleted")?;
     let vm = get_vm(ctx, vm_id)?;
@@ -469,6 +467,73 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     }
 
     let tag = id.to_string();
+    let copy_vars = || async {
+        let Some(dir) = ctx.config.state_dir.as_ref() else {
+            return Ok(());
+        };
+        fetch_vars(ctx, &vm).await;
+        let vars = uefi_vars_path(dir, vm_id);
+        match tokio::fs::try_exists(&vars).await {
+            // BIOS VM이거나 한 번도 켠 적 없는 UEFI VM
+            Ok(false) => Ok(()),
+            Ok(true) => copy_file(&vars, &vars_copy(ctx, vm_id, id).unwrap()).await,
+            Err(e) => Err(e),
+        }
+    };
+    let resumed = match take_tags(ctx, &vm, &disks, id, &tag, spec.memory, copy_vars).await {
+        Ok(resumed) => resumed,
+        Err(e) => {
+            if let Some(copy) = vars_copy(ctx, vm_id, id) {
+                let _ = tokio::fs::remove_file(copy).await;
+            }
+            return Err(e);
+        }
+    };
+
+    let status = SnapshotStatus {
+        phase: SnapshotPhase::Ready,
+        created_at: Some(now_secs()),
+        vmstate_bytes: None,
+    };
+    // 다 만든 스냅샷이다. 실패로 끝내면 정리하면서 지우게 되므로 기록될 때까지 다시 시도한다.
+    loop {
+        match ctx.cluster.update_status::<SnapshotSpec>(id, &status).await {
+            Ok(_) => break,
+            Err(ClusterError::Rejected(r)) => return Err(r.to_string()),
+            Err(e) => {
+                tracing::warn!(snapshot = %id, error = %e, "cannot mark snapshot ready; will retry");
+                tokio::time::sleep(ctx.config.poll_interval).await;
+            }
+        }
+    }
+    set_position(ctx, vm_id, |_| Some(id)).await?;
+    // 스냅샷은 다 만들었으므로 그대로 두고 Task만 실패로 끝낸다. VM은 다시 붙을 때 이어서 실행한다.
+    resumed.map_err(|e| format!("snapshot taken; resuming the VM failed: {e}"))
+}
+
+/// VM `vm`의 디스크 `disks`에 스냅샷 태그 `tag`를 찍는다(스냅샷 만들기, 백업의 임시 스냅샷). 실행
+/// 중이면 하이퍼바이저로(`memory`면 메모리 포함, 아니면 디스크만), 정지했으면 디스크마다 스토리지로
+/// 찍는다(블록 스냅샷은 실행 중이면 VM을 잠시 멈추고 스토리지로). 스토리지로는 같은 풀의 디스크를 한
+/// 번에 찍는다(ZFS는 원자적). 찍은 뒤 `copy_vars`로 UEFI 변수를 복사한다. 실패를 확인했으면 만든 태그를
+/// 지운다. 응답을 기다리다 시간이 다 됐으면 작업이 아직 돌 수 있으므로 태그를 두고 실패한다(블록
+/// 스냅샷의 태그는 뒤에서 다시 지운다, [`remove_left_tags`]; `id`는 스냅샷이나 백업의 id). 찍었으면
+/// 블록 스냅샷을 위해 멈춘 VM을 이어서 실행한 결과를 돌려준다.
+pub(super) async fn take_tags<F, Fut>(
+    ctx: &Ctx,
+    vm: &Vm,
+    disks: &[(Volume, StoragePool)],
+    id: Uuid,
+    tag: &str,
+    memory: bool,
+    copy_vars: F,
+) -> Result<Result<(), DriverError>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = std::io::Result<()>>,
+{
+    let vm_id = vm.id;
+    let running = vm.status.phase == VmPhase::Running;
+    let block = block_snapshots(disks)?;
     // 실행 중인 VM의 블록 스냅샷: VM을 멈춰 블록 I/O를 비운 뒤 풀마다 저장소로 찍고, 찍기가
     // 실패해도 반드시 이어서 실행한다(설계 §5). 멈춘 구간은 `PAUSE_LIMIT`을 넘기지 않는다. QEMU가
     // 스스로 멈춘 VM(I/O 오류 등)은 멈추지도 이어서 실행하지도 않는다([`needs_pause`]).
@@ -490,11 +555,11 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     let mut taken = Vec::new();
     let made = if !running || block_running {
         let take = async {
-            for group in by_pool(&disks) {
+            for group in by_pool(disks) {
                 let (volume, pool) = group[0];
                 let ids: Vec<Uuid> = group.iter().map(|(v, _)| v.id).collect();
                 ctx.storage
-                    .snapshot_many(pool, &ids, volume.spec.format, &tag)
+                    .snapshot_many(pool, &ids, volume.spec.format, tag)
                     .await?;
                 taken.extend(group.into_iter().map(|(v, p)| (v, p)));
             }
@@ -510,7 +575,7 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         // 디스크 없는 VM은 설정만 담는다.
         Ok(())
     } else {
-        ctx.hv.snapshot_save(vm_id, &tag, spec.memory).await
+        ctx.hv.snapshot_save(vm_id, tag, memory).await
     };
     let resumed = match &mut paused {
         Some(guard) => {
@@ -524,18 +589,9 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         }
         None => Ok(()),
     };
-    let copied = match (&made, ctx.config.state_dir.as_ref()) {
-        (Ok(()), Some(dir)) => {
-            fetch_vars(ctx, &vm).await;
-            let vars = uefi_vars_path(dir, vm_id);
-            match tokio::fs::try_exists(&vars).await {
-                // BIOS VM이거나 한 번도 켠 적 없는 UEFI VM
-                Ok(false) => Ok(()),
-                Ok(true) => copy_file(&vars, &vars_copy(ctx, vm_id, id).unwrap()).await,
-                Err(e) => Err(e),
-            }
-        }
-        _ => Ok(()),
+    let copied = match &made {
+        Ok(()) => copy_vars().await,
+        Err(_) => Ok(()),
     };
     let failure = match (made, copied) {
         // 블록 스냅샷은 풀마다 따로 만든다. 끝난 묶음의 것은 지우고, 아직 돌 수 있는 묶음의
@@ -546,11 +602,11 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
                 .filter(|(v, _)| !taken.iter().any(|(t, _)| t.id == v.id))
                 .cloned()
                 .collect();
-            remove_left_tags(ctx, id, left);
+            remove_left_tags(ctx, id, tag, left);
             for (volume, pool) in taken {
                 if let Err(e) = ctx
                     .storage
-                    .snapshot_delete(pool, volume.id, volume.spec.format, &tag)
+                    .snapshot_delete(pool, volume.id, volume.spec.format, tag)
                     .await
                 {
                     tracing::warn!(snapshot = %id, volume = %volume.name, error = %e, "cannot remove block snapshot of failed snapshot");
@@ -567,7 +623,7 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         }
         (Err(e), _) if e.may_be_in_progress() => {
             if block.is_some() {
-                remove_left_tags(ctx, id, disks.clone());
+                remove_left_tags(ctx, id, tag, disks.to_vec());
             }
             return Err(format!(
                 "{e}; the snapshot may still be written to the disks and its tag {tag} is left there"
@@ -582,37 +638,15 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         // QMP만 끊기고 QEMU가 아직 살아 있으면 qemu-img가 이미지 잠금으로 거부해 태그가 남는다
         // (디스크는 손상되지 않고, 아래 로그만 남는다).
         let running = running && !matches!(ctx.hv.inspect(vm_id).await, Ok(None));
-        if let Err(e) = remove_tags(ctx, vm_id, running, &vm.spec, &tag).await {
+        if let Err(e) = remove_tags(ctx, vm_id, running, &vm.spec, tag).await {
             tracing::warn!(snapshot = %id, error = %e, "cannot remove tags of failed snapshot");
-        }
-        if let Some(copy) = vars_copy(ctx, vm_id, id) {
-            let _ = tokio::fs::remove_file(copy).await;
         }
         return Err(match resumed {
             Err(e) => format!("{error}; resuming the VM failed: {e}"),
             Ok(()) => error,
         });
     }
-
-    let status = SnapshotStatus {
-        phase: SnapshotPhase::Ready,
-        created_at: Some(now_secs()),
-        vmstate_bytes: None,
-    };
-    // 다 만든 스냅샷이다. 실패로 끝내면 정리하면서 지우게 되므로 기록될 때까지 다시 시도한다.
-    loop {
-        match ctx.cluster.update_status::<SnapshotSpec>(id, &status).await {
-            Ok(_) => break,
-            Err(ClusterError::Rejected(r)) => return Err(r.to_string()),
-            Err(e) => {
-                tracing::warn!(snapshot = %id, error = %e, "cannot mark snapshot ready; will retry");
-                tokio::time::sleep(ctx.config.poll_interval).await;
-            }
-        }
-    }
-    set_position(ctx, vm_id, |_| Some(id)).await?;
-    // 스냅샷은 다 만들었으므로 그대로 두고 Task만 실패로 끝낸다. VM은 다시 붙을 때 이어서 실행한다.
-    resumed.map_err(|e| format!("snapshot taken; resuming the VM failed: {e}"))
+    Ok(resumed)
 }
 
 /// 예약 스냅샷의 만들기나 예약 정리의 삭제 Task면 그 VM([`recorded_vm`])

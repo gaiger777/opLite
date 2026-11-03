@@ -284,6 +284,20 @@ pub trait Storage: Send + Sync {
         dst_id: Uuid,
         dst_format: ImageFormat,
     ) -> Result<(), DriverError>;
+
+    /// 원본 `src`(`volume_source`가 돌려준 것)를 압축 qcow2 파일 `dest`로 내보낸다(백업). 원본을 여는
+    /// 인자는 복사와 같다(`force_share`도). `{dest}.part`에 쓰고 다 쓰면 `dest`로 이름을 바꾼다(있으면
+    /// 덮어쓴다). 실패하면 `.part`를 남기지 않는다. `dest`는 절대 경로여야 한다. 기본은 지원하지 않는다.
+    async fn export_volume(
+        &self,
+        _src: &VolumeSource,
+        _force_share: bool,
+        _dest: &Path,
+    ) -> Result<(), DriverError> {
+        Err(DriverError::InvalidSpec(
+            "this storage cannot export volumes".into(),
+        ))
+    }
 }
 
 /// 풀의 볼륨 파일이 놓이는 디렉터리. `dir` 풀은 그 경로, `nfs` 풀은 이 노드의 마운트 지점
@@ -697,6 +711,39 @@ fn convert_from(
         None => args.push(path_str(&src.path)?.into()),
     }
     Ok(args)
+}
+
+/// [`Storage::export_volume`]: `qemu-img convert -c -O qcow2`로 `{dest}.part`에 쓰고(`-t writeback`:
+/// 닫을 때 디스크에 내려 쓴다) `dest`로 이름을 바꾼다. 파일시스템 호출은 [`on_pool`]로 한다(백업 풀이
+/// 멈춘 NFS일 수 있다).
+async fn export_to(
+    qemu_img: &Path,
+    src: &VolumeSource,
+    force_share: bool,
+    dest: &Path,
+) -> Result<(), DriverError> {
+    require_absolute(dest)?;
+    let mut part = dest.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let from = convert_from(src, force_share, Some(ImageFormat::Qcow2))?;
+    let mut args = vec!["convert", "-q", "-c", "-t", "writeback"];
+    args.extend(from.iter().map(String::as_str));
+    args.push(path_str(&part)?);
+    let dir = dest.parent().unwrap_or(dest);
+    let written = match run_qemu_img(qemu_img, &args).await {
+        Ok(_) => {
+            let (from, to) = (part.clone(), dest.to_path_buf());
+            on_pool(FS_TIMEOUT, dir, move || std::fs::rename(from, to))
+                .await
+                .and_then(|r| Ok(r?))
+        }
+        Err(e) => Err(e),
+    };
+    if written.is_err() {
+        let _ = on_pool(FS_TIMEOUT, dir, move || std::fs::remove_file(part)).await;
+    }
+    written
 }
 
 /// `f`를 blocking 스레드에서 돌린다. 멈춘 NFS에서 끝나지 않는 호출이 tokio 워커를 붙잡지 않게
@@ -1139,6 +1186,15 @@ impl Storage for DirStorage {
         _: Option<&str>,
     ) -> Result<(), DriverError> {
         Ok(())
+    }
+
+    async fn export_volume(
+        &self,
+        src: &VolumeSource,
+        force_share: bool,
+        dest: &Path,
+    ) -> Result<(), DriverError> {
+        export_to(&self.qemu_img, src, force_share, dest).await
     }
 }
 
@@ -2202,6 +2258,103 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
         assert_eq!(pool_files(tmp.path()), vec![format!("{src}.raw")]);
+    }
+
+    /// 내보내기는 원본을 복사와 같은 인자로 열어 압축 qcow2(`-c -O qcow2`)로 `.part`에 쓰고 이름을
+    /// 바꾼다. 실패하면 `.part`를 지운다.
+    #[tokio::test]
+    async fn export_volume_writes_compressed_qcow2_through_a_part_file() {
+        let tools = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let args = tools.path().join("args");
+        let storage = dir_storage(fake_tool(
+            tools.path(),
+            &format!("printf '%s\\n' \"$@\" > {args:?}\necho data > \"$last\""),
+        ));
+        let src = VolumeSource {
+            path: "/pools/local/v.qcow2".into(),
+            format: ImageFormat::Qcow2,
+            snapshot: Some("a,b".into()),
+            size_bytes: 5,
+            rbd: None,
+        };
+        let dest = out.path().join("disk0.qcow2");
+        storage.export_volume(&src, true, &dest).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"data\n");
+        assert_eq!(pool_files(out.path()), vec!["disk0.qcow2".to_string()]);
+        let got = std::fs::read_to_string(&args).unwrap();
+        let part = format!("{}.part", dest.to_str().unwrap());
+        assert_eq!(
+            got.lines().collect::<Vec<_>>(),
+            [
+                "convert",
+                "-q",
+                "-c",
+                "-t",
+                "writeback",
+                "-f",
+                "qcow2",
+                "-U",
+                "-l",
+                "snapshot.name=a,,b",
+                "-O",
+                "qcow2",
+                "/pools/local/v.qcow2",
+                part.as_str(),
+            ]
+        );
+
+        // 지금 내용(raw), 잠금을 지킨다.
+        let raw = VolumeSource {
+            path: "/pools/local/w.raw".into(),
+            format: ImageFormat::Raw,
+            snapshot: None,
+            size_bytes: 5,
+            rbd: None,
+        };
+        let dest1 = out.path().join("disk1.qcow2");
+        storage.export_volume(&raw, false, &dest1).await.unwrap();
+        let got = std::fs::read_to_string(&args).unwrap();
+        let part1 = format!("{}.part", dest1.to_str().unwrap());
+        assert_eq!(
+            got.lines().collect::<Vec<_>>(),
+            [
+                "convert",
+                "-q",
+                "-c",
+                "-t",
+                "writeback",
+                "-f",
+                "raw",
+                "-O",
+                "qcow2",
+                "/pools/local/w.raw",
+                part1.as_str(),
+            ]
+        );
+
+        // 반쯤 쓰고 실패하면 `.part`를 남기지 않는다.
+        let failing = dir_storage(fake_tool(
+            tools.path(),
+            "echo partial > \"$last\"\necho full >&2\nexit 1",
+        ));
+        let dest2 = out.path().join("disk2.qcow2");
+        let err = failing
+            .export_volume(&raw, false, &dest2)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+        assert_eq!(
+            pool_files(out.path()),
+            vec!["disk0.qcow2".to_string(), "disk1.qcow2".to_string()]
+        );
+
+        // 상대 경로는 받지 않는다.
+        let err = storage
+            .export_volume(&raw, false, Path::new("backups/disk0.qcow2"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
     }
 
     #[tokio::test]

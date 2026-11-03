@@ -8,7 +8,8 @@ use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
 use uuid::Uuid;
 
 use super::{
-    Capacity, Storage, VolumeInfo, VolumeSource, convert_from, path_str, rbd, run_qemu_img,
+    Capacity, Storage, VolumeInfo, VolumeSource, convert_from, export_to, path_str, rbd,
+    run_qemu_img,
 };
 use crate::error::DriverError;
 
@@ -430,6 +431,16 @@ impl Storage for Storages {
         // 복사는 끝났으므로 내놓기가 실패해도 성공이다(활성화된 채 남을 뿐이다).
         guard.release().await;
         written
+    }
+
+    /// 원본의 백엔드와 상관없이 `qemu-img`로 내보낸다.
+    async fn export_volume(
+        &self,
+        src: &VolumeSource,
+        force_share: bool,
+        dest: &Path,
+    ) -> Result<(), DriverError> {
+        export_to(&self.qemu_img, src, force_share, dest).await
     }
 }
 

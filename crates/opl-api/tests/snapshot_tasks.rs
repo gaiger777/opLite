@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use common::{Client, Env, FakeStorage, vm_request};
 use opl_driver::{DriverError, Hypervisor, RuntimeStatus, uefi_vars_path};
 use opl_qemu::QmpError;
+use opl_types::backup::{Backup, BackupPhase, BackupSpec};
 use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
@@ -1290,6 +1291,132 @@ async fn block_snapshot_tags_without_snapshots_are_removed_at_startup() {
     }
     assert_eq!(storage.tags(vols[0]), [a.as_str(), "autosnap_hourly"]);
     assert_eq!(storage.tags(vols[1]), [orphan.as_str()]);
+}
+
+/// 백업의 임시 스냅샷 태그(백업 id의 simple 문자열)도 UUID 모양이다. 시작할 때 백업 Task가 끝나지
+/// 않은 `pending` 백업의 태그는 두고, Task가 없는 `pending` 백업, 다 만들었거나 실패한 백업과 없는
+/// 백업의 태그는 지운다.
+#[tokio::test]
+async fn block_tags_of_pending_backups_are_kept_at_startup() {
+    let mut env = Env::start().await;
+    let (vols, storage) = block_volumes(&mut env, &[("thin", lvm("vg0"), &["lv0"])]).await;
+    let spec: VmSpec = serde_json::from_value(vm_request("web")["spec"].clone()).unwrap();
+    // 다른 노드에서 돌고 있는 백업 Task(이 노드의 실행기는 손대지 않는다)
+    let mut n2: opl_types::node::Node = Resource::new(
+        "n2",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: false,
+        },
+    );
+    n2.status.online = true;
+    env.cluster.create(&n2).await.unwrap();
+    let mut tags = Vec::new();
+    for (name, phase) in [
+        ("running", BackupPhase::Pending),
+        ("done", BackupPhase::Ready),
+        ("broken", BackupPhase::Failed),
+        ("abandoned", BackupPhase::Pending),
+    ] {
+        let mut backup: Backup = Resource::new(
+            name,
+            BackupSpec {
+                vm: Uuid::now_v7(),
+                vm_name: "web".into(),
+                pool: "thin".into(),
+                vm_spec: spec.clone(),
+                job: None,
+            },
+        );
+        env.cluster.create(&backup).await.unwrap();
+        backup.status.phase = phase;
+        env.cluster
+            .update_status::<BackupSpec>(backup.id, &backup.status)
+            .await
+            .unwrap();
+        tags.push(backup.id.simple().to_string());
+        if name == "running" {
+            let op = TaskOp::VmBackup { backup: backup.id };
+            let mut task: Task = Resource::new(
+                "",
+                TaskSpec {
+                    op,
+                    target: backup.spec.vm,
+                    node: n2.id,
+                },
+            );
+            task.name = task.id.to_string();
+            env.cluster.create(&task).await.unwrap();
+            let running = TaskStatus {
+                state: TaskState::Running,
+                error: None,
+            };
+            env.cluster
+                .update_status::<TaskSpec>(task.id, &running)
+                .await
+                .unwrap();
+        }
+    }
+    tags.push(Uuid::now_v7().simple().to_string());
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    storage.set_tags(vols[0], &tags);
+
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while storage.tags(vols[0]).len() != 1 {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(storage.tags(vols[0]), [tags[0]]);
+}
+
+/// 실행 중인 VM의 백업은 블록 스냅샷을 위해 VM을 잠깐 멈춘다. 이어서 실행하지 못하면 한 번 더 해 보고,
+/// 그래도 안 되면 오래 걸리는 내보내기를 하지 않고 실패한다: 임시 태그를 지우고 백업은 `failed`다.
+#[tokio::test]
+async fn backup_fails_before_exporting_when_the_paused_vm_cannot_resume() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+    let dir = env.dir.path().join("bk");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bk = StoragePoolSpec {
+        backend: PoolBackend::Dir { path: dir },
+        nodes: vec![],
+        shared: false,
+        backups: true,
+    };
+    env.cluster.create(&Resource::new("bk", bk)).await.unwrap();
+    env.pool_ready("bk").await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/backups", json!({ "pool": "bk", "name": "b1" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    // 멈춘 동안 QMP로 다룰 수 없게 되어 다시 돌리지 못한다.
+    env.hv.set_unresponsive(vm, true);
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    env.hv.set_unresponsive(vm, false);
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("cannot resume the VM after its temporary snapshot"),
+        "{error}"
+    );
+    assert!(error.contains("retrying failed"), "{error}");
+    // 찍은 임시 태그만 지웠고 디스크는 읽지 않았다.
+    assert_eq!(storage.calls(), [("create", lvs[0]), ("delete", lvs[0])]);
+    let b = env
+        .cluster
+        .get_by_name::<BackupSpec>("b1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.status.phase, BackupPhase::Failed);
 }
 
 /// 공유 블록 풀(RBD)의 볼륨은 어느 노드에서나 보이므로, 시작할 때 남은 태그는 볼륨을 만든 노드가

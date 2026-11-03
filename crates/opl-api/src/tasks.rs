@@ -3,6 +3,7 @@
 //! API는 Task를 저장소에 만들기만 한다. 실행기는 reconciler처럼 목록을 읽고 그 revision부터
 //! 구독하므로, 어느 노드의 API가 만든 Task든 대상 노드에서 실행된다.
 
+mod backup;
 mod clone;
 mod migrate;
 mod snapshot;
@@ -18,6 +19,7 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, Hypervisor, Storage};
 use opl_peer::Peers;
 use opl_reconciler::{FirmwareFetcher, ReconcilerHandle};
+use opl_types::backup::{BackupPhase, BackupSpec};
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec};
@@ -63,6 +65,8 @@ pub struct TaskRunnerConfig {
     /// VM별 상태 디렉터리의 뿌리(`QemuConfig::state_dir`). 스냅샷의 UEFI 변수 사본을 둔다.
     /// 없으면 변수를 복사하거나 되돌리지 않는다.
     pub state_dir: Option<PathBuf>,
+    /// NFS 풀을 마운트하는 디렉터리(opld의 `{data_dir}/pools`). 백업 Task가 백업 풀의 파일 경로를 정한다.
+    pub mount_root: PathBuf,
     /// 풀이 마운트되지 않아 시작할 때 지우지 못한 고아 볼륨, 시간을 넘긴 블록 스냅샷이 남긴 태그를
     /// 다시 지워 보는 간격
     pub orphan_retry: Duration,
@@ -89,6 +93,7 @@ impl TaskRunnerConfig {
             poll_interval: Duration::from_millis(200),
             upload_dir: None,
             state_dir: None,
+            mount_root: PathBuf::new(),
             orphan_retry: Duration::from_secs(60),
             tag_sweep: Duration::from_secs(30 * 60),
             peers: None,
@@ -263,7 +268,8 @@ async fn sweep_block_tags_every(ctx: Arc<Ctx>) {
 
 /// 시간을 넘긴 블록 스냅샷이 남긴 태그를 지운다: 이 노드가 맡는 블록 풀(LVM-thin, ZFS, RBD) 볼륨의
 /// 태그 중 UUID 모양인데 그 id의 스냅샷 리소스가 없는 것. 스냅샷 Task는 리소스를 만든 뒤 태그를
-/// 찍고 태그를 지운 뒤 리소스를 지우므로 그런 태그는 남은 것이다. opLite 밖에서 만든 태그는 두고,
+/// 찍고 태그를 지운 뒤 리소스를 지우므로 그런 태그는 남은 것이다. 백업의 임시 스냅샷(백업 id의 simple
+/// 문자열)도 같은 모양이므로, 백업 Task가 끝나지 않은 `pending` 백업의 태그는 둔다. opLite 밖에서 만든 태그는 두고,
 /// 스토리지 명령이 느려도 실행기 시작을 막지 않게 뒤에서 돈다.
 ///
 /// 노드 로컬 풀의 볼륨은 그 볼륨을 만든 노드가 맡는다. 공유 풀(RBD)의 볼륨은 어느 노드에서나
@@ -325,6 +331,13 @@ async fn sweep_block_tags(ctx: Arc<Ctx>) {
             if !matches!(ctx.cluster.get::<SnapshotSpec>(id), Ok(None)) {
                 continue;
             }
+            match ctx.cluster.get::<BackupSpec>(id) {
+                Ok(Some(b)) if b.status.phase != BackupPhase::Pending => {}
+                // 채울 Task가 없는 pending 백업(Task가 끝났거나 지워졌다)의 태그도 남은 것이다.
+                Ok(Some(_)) if !backing_up(&ctx, id) => {}
+                Ok(None) => {}
+                _ => continue,
+            }
             tracing::warn!(volume = %volume.name, tag, "removing a block snapshot left without its snapshot");
             if let Err(e) = ctx
                 .storage
@@ -335,6 +348,17 @@ async fn sweep_block_tags(ctx: Arc<Ctx>) {
             }
         }
     }
+}
+
+/// 백업 `id`를 채우는 백업 Task가 끝나지 않았는지. 목록을 읽지 못하면 그렇다고 본다.
+fn backing_up(ctx: &Ctx, id: Uuid) -> bool {
+    let Ok((_, tasks)) = ctx.cluster.list::<TaskSpec>() else {
+        return true;
+    };
+    tasks.iter().any(|t| {
+        !t.status.state.is_finished()
+            && matches!(t.spec.op, TaskOp::VmBackup { backup } if backup == id)
+    })
 }
 
 /// 이 노드에서 켜진 채 남은 볼륨을 시작할 때와 그 뒤 `tag_sweep`마다 끈다
@@ -488,15 +512,24 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// 만들기·되돌리기가 같은 디스크를 다루고 되돌리기는 크기도 되돌리므로 섞이면 안 된다. 지금 쓰는
 /// VM이 없으면 그 볼륨을 담은 스냅샷의 VM(되돌리면 다시 붙는다), 그것도 없으면 볼륨의 줄이다.
 /// VM 전원 Task는 기다리기만 하므로 줄을 두지 않는다. 강제 종료가 앞의 reboot 뒤에 묶이면 안 된다.
-/// 마이그레이션 Task는 VM의 줄에 선다(앞의 스냅샷·복제가 끝난 뒤 옮긴다).
+/// 마이그레이션 Task는 VM의 줄에 선다(앞의 스냅샷·복제가 끝난 뒤 옮긴다). 백업 Task도 VM의 줄에
+/// 선다(임시 스냅샷을 찍고 디스크를 읽는다). 백업 지우기와 복원은 그 백업의 줄에 서서 겹치지 않는다
+/// (복원 Task의 대상은 새 VM이다).
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
+    if let TaskOp::BackupRestore { backup, .. } = task.spec.op {
+        return Some(backup);
+    }
     if !matches!(task.spec.op, TaskOp::VolumeResize { .. }) {
         let vm_queue = matches!(
             task.spec.op,
-            TaskOp::VmClone { .. } | TaskOp::VmMigrate { .. }
+            TaskOp::VmClone { .. } | TaskOp::VmMigrate { .. } | TaskOp::VmBackup { .. }
         );
-        return (is_volume_op(&task.spec.op) || is_snapshot_op(&task.spec.op) || vm_queue)
+        let backup_queue = matches!(task.spec.op, TaskOp::BackupDelete);
+        return (is_volume_op(&task.spec.op)
+            || is_snapshot_op(&task.spec.op)
+            || vm_queue
+            || backup_queue)
             .then_some(target);
     }
     let Ok(Some(volume)) = ctx.cluster.get::<VolumeSpec>(target) else {
@@ -554,8 +587,12 @@ async fn execute(ctx: &Ctx, task: Task) {
     }
     // 시간을 넘겨 버린 작업은 끝나지 않았다(명령이 아직 돌 수 있다). 마이그레이션은 단계마다
     // 시간 제한이 있고(`migration_timeout`, RPC 기한), 확정 쓰기 도중에 버리면 안 되므로 감싸지 않는다.
-    let migration = matches!(task.spec.op, TaskOp::VmMigrate { .. });
-    let (result, unfinished) = if migration {
+    // 백업은 디스크 크기만큼 오래 걸릴 수 있으므로 시간 제한을 두지 않는다(설계 §2.3).
+    let unlimited = matches!(
+        task.spec.op,
+        TaskOp::VmMigrate { .. } | TaskOp::VmBackup { .. }
+    );
+    let (result, unfinished) = if unlimited {
         (perform(ctx, &task).await, false)
     } else {
         match tokio::time::timeout(ctx.config.timeout, perform(ctx, &task)).await {
@@ -585,18 +622,19 @@ async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
     tracing::warn!(task = %task.id, error = %error, "task failed");
     // 정리가 스냅샷 리소스를 지우므로 먼저 본다.
     let scheduled = snapshot::scheduled_vm(ctx, task);
-    cleanup(ctx, task, unfinished).await;
+    cleanup(ctx, task, &error, unfinished).await;
     if let Some(vm) = scheduled {
         snapshot::record_schedule(ctx, vm, Some(task_failed(error.clone()))).await;
     }
     set_status(ctx, task.id, TaskState::Failed, Some(error)).await;
 }
 
-/// 실패한 볼륨 생성·가져오기, 스냅샷 만들기, 복제의 흔적을 지워 이름을 다시 쓸 수 있게 한다.
+/// 실패한 볼륨 생성·가져오기, 스냅샷 만들기, 복제의 흔적을 지워 이름을 다시 쓸 수 있게 한다. 실패한
+/// 백업은 디렉터리를 지우고 `failed`와 `error`를 남긴다.
 /// 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
 /// 재시작으로 중단) 작업이 아직 돌고 있을 수 있어 태그를 두고 리소스만 지운다(설계 §6 "태그만 남은 경우").
 /// 블록 디스크의 태그는 뒤에서 다시 지운다([`snapshot::remove_unfinished_tags`]).
-async fn cleanup(ctx: &Ctx, task: &Task, unfinished: bool) {
+async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     if let TaskOp::SnapshotCreate { snapshot } = task.spec.op {
         if unfinished {
             snapshot::remove_unfinished_tags(ctx, snapshot);
@@ -610,6 +648,9 @@ async fn cleanup(ctx: &Ctx, task: &Task, unfinished: bool) {
     }
     if let TaskOp::VmClone { .. } = task.spec.op {
         clone::discard(ctx, task.id).await;
+    }
+    if let TaskOp::VmBackup { backup } = task.spec.op {
+        backup::discard(ctx, task, backup, error, unfinished).await;
     }
     if matches!(
         task.spec.op,
@@ -703,9 +744,11 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
         TaskOp::VmMigrate { node } => migrate::migrate(ctx, task, *node).await,
         // 기록 Task는 끝난 상태로 만들어지므로 실행되지 않는다.
         TaskOp::VmHaRecover { .. } => Err("an HA recovery task is a record and is not run".into()),
-        // 백업·복원 실행은 아직 없다. API도 아직 이 Task를 만들지 않는다.
-        TaskOp::VmBackup { .. } | TaskOp::BackupDelete | TaskOp::BackupRestore { .. } => {
-            Err("backup tasks are not supported by this node yet".into())
+        TaskOp::VmBackup { backup } => backup::backup(ctx, task, *backup).await,
+        TaskOp::BackupDelete => backup::delete(ctx, id).await,
+        // 복원 실행은 아직 없다.
+        TaskOp::BackupRestore { .. } => {
+            Err("restoring backups is not supported by this node yet".into())
         }
     }
 }

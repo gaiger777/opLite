@@ -403,6 +403,7 @@ impl Member {
         runner_config.upload_dir = Some(config.data_dir.join("uploads"));
         // QEMU 드라이버의 state_dir과 같다(host.rs).
         runner_config.state_dir = Some(config.data_dir.clone());
+        runner_config.mount_root = mount_root.clone();
         // 마이그레이션을 보낼 때 대상 노드를 부른다.
         runner_config.peers = Some(peers.clone());
         runner_config.firmware = Some(firmware);
