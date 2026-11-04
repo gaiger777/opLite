@@ -13,3 +13,4 @@ pub mod snapshot;
 pub mod storage;
 pub mod task;
 pub mod vm;
+pub mod vm_import;
