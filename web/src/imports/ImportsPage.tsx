@@ -117,7 +117,11 @@ export function ImportsPage() {
               <TableCell>{nodeName(imp.spec.node)}</TableCell>
               <TableCell>
                 {imp.status.source_vm?.name ?? "—"}
-                <div className="text-xs text-muted-foreground">{imp.spec.source.ova.file_name}</div>
+                {"ova" in imp.spec.source && (
+                  <div className="text-xs text-muted-foreground">
+                    {imp.spec.source.ova.file_name}
+                  </div>
+                )}
               </TableCell>
               <TableCell>
                 <ImportPhaseBadge phase={imp.status.phase} />

@@ -71,6 +71,7 @@ function ImportView({ imp }: { imp: VmImport }) {
   const [sentAt, setSentAt] = useState<number | null>(null);
   const busy = sentAt === imp.revision;
   const node = nodes.data?.find((n) => n.id === imp.spec.node)?.name ?? "—";
+  const ova = "ova" in imp.spec.source ? imp.spec.source.ova : undefined;
   const { phase, error, warnings, source_vm: src } = imp.status;
 
   return (
@@ -124,7 +125,7 @@ function ImportView({ imp }: { imp: VmImport }) {
           <dl className="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-1 text-sm">
             <dt className="text-muted-foreground">{t("imports.fileName")}</dt>
             <dd>
-              {imp.spec.source.ova.file_name} ({formatBytes(imp.spec.source.ova.size_bytes)}),{" "}
+              {ova && `${ova.file_name} (${formatBytes(ova.size_bytes)}), `}
               {node}
             </dd>
             {src && (

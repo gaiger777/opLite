@@ -4,6 +4,7 @@
 
 pub mod ova;
 pub mod ovf;
+pub mod vmx;
 
 use std::collections::BTreeSet;
 use std::path::{Path as FsPath, PathBuf};

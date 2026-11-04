@@ -1263,6 +1263,19 @@ export interface components {
             details?: unknown;
             message: string;
         };
+        EsxiSource: {
+            /** @description 데이터센터(ESXi는 `ha-datacenter`) */
+            datacenter: string;
+            datastore: string;
+            /** @description 믿기로 한 서버 인증서의 SHA-256 지문(대문자 콜론 구분 `AB:CD:…`) */
+            fingerprint: string;
+            host: string;
+            /** Format: int32 */
+            port: number;
+            user: string;
+            /** @description 데이터스토어 안의 `.vmx` 경로(예: `web01/web01.vmx`) */
+            vmx: string;
+        };
         /**
          * @description 리스를 잃은 노드가 HA VM을 끄는 방법
          * @enum {string}
@@ -1320,10 +1333,13 @@ export interface components {
             /** Format: int32 */
             sockets?: number | null;
         };
-        /** @description 원본. JSON은 `{"ova": {...}}`다. */
+        /** @description 원본. JSON은 `{"ova": {...}}` 또는 `{"esxi": {...}}`다. */
         ImportSource: {
             /** @description 올린 OVA 파일 */
             ova: components["schemas"]["OvaSource"];
+        } | {
+            /** @description ESXi·vCenter 데이터스토어의 VM. 비밀번호는 여기에 없다(받은 노드의 메모리에만 둔다). */
+            esxi: components["schemas"]["EsxiSource"];
         };
         /** @description 노드가 로그인할 iSCSI 타깃 */
         IscsiTarget: {

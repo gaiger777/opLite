@@ -3,6 +3,7 @@
 //! 디스크를 볼륨으로 옮기고 VM을 만든다.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -29,13 +30,15 @@ impl ResourceSpec for VmImportSpec {
     type Status = VmImportStatus;
 }
 
-/// 원본. JSON은 `{"ova": {...}}`다.
+/// 원본. JSON은 `{"ova": {...}}` 또는 `{"esxi": {...}}`다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum ImportSource {
     /// 올린 OVA 파일
     Ova(OvaSource),
+    /// ESXi·vCenter 데이터스토어의 VM. 비밀번호는 여기에 없다(받은 노드의 메모리에만 둔다).
+    Esxi(EsxiSource),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +48,81 @@ pub struct OvaSource {
     /// 올린 파일 이름(표시용)
     pub file_name: String,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EsxiSource {
+    pub host: String,
+    pub port: u16,
+    /// 데이터센터(ESXi는 `ha-datacenter`)
+    pub datacenter: String,
+    pub datastore: String,
+    /// 데이터스토어 안의 `.vmx` 경로(예: `web01/web01.vmx`)
+    pub vmx: String,
+    pub user: String,
+    /// 믿기로 한 서버 인증서의 SHA-256 지문(대문자 콜론 구분 `AB:CD:…`)
+    pub fingerprint: String,
+}
+
+/// ESXi·vCenter 연결(API 요청 본문). 비밀번호가 있으므로 저장하지 않고 로그에도 찍지 않는다.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EsxiConnection {
+    pub host: String,
+    #[serde(default = "https_port")]
+    #[cfg_attr(feature = "openapi", schema(default = 443))]
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    /// vCenter면 데이터센터 이름
+    #[serde(default = "ha_datacenter")]
+    #[cfg_attr(feature = "openapi", schema(default = "ha-datacenter"))]
+    pub datacenter: String,
+    /// 믿는 서버 인증서의 SHA-256 지문. 없으면 서버가 지문을 알려 주며 거절한다.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+fn https_port() -> u16 {
+    443
+}
+
+fn ha_datacenter() -> String {
+    "ha-datacenter".into()
+}
+
+/// 로그에 비밀번호가 찍히지 않게 한다.
+impl fmt::Debug for EsxiConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EsxiConnection")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("datacenter", &self.datacenter)
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
+}
+
+/// 인증서 SHA-256 지문(16진 64자, 콜론·공백 허용, 대소문자 무시)을 ESXi 화면과 같은 대문자 콜론
+/// 구분(`AB:CD:…`)으로 바꾼다. 그 모양이 아니면 `None`.
+pub fn normalize_fingerprint(text: &str) -> Option<String> {
+    let hex: Vec<char> = text
+        .chars()
+        .filter(|c| *c != ':' && !c.is_whitespace())
+        .collect();
+    if hex.len() != 64 || !hex.iter().all(char::is_ascii_hexdigit) {
+        return None;
+    }
+    let pairs: Vec<String> = hex
+        .chunks(2)
+        .map(|p| p.iter().collect::<String>().to_ascii_uppercase())
+        .collect();
+    Some(pairs.join(":"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -316,6 +394,96 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn esxi_source_has_no_password() {
+        let spec = VmImportSpec {
+            node: Uuid::nil(),
+            source: ImportSource::Esxi(EsxiSource {
+                host: "esx1.example.com".into(),
+                port: 443,
+                datacenter: "ha-datacenter".into(),
+                datastore: "datastore1".into(),
+                vmx: "web01/web01.vmx".into(),
+                user: "root".into(),
+                fingerprint: "AB".into(),
+            }),
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            v["source"],
+            json!({ "esxi": {
+                "host": "esx1.example.com", "port": 443, "datacenter": "ha-datacenter",
+                "datastore": "datastore1", "vmx": "web01/web01.vmx", "user": "root",
+                "fingerprint": "AB"
+            } })
+        );
+        assert_eq!(
+            serde_json::from_value::<VmImportSpec>(v.clone()).unwrap(),
+            spec
+        );
+        // 비밀번호 칸은 받지 않는다
+        let mut with_password = v;
+        with_password["source"]["esxi"]["password"] = json!("secret");
+        assert!(serde_json::from_value::<VmImportSpec>(with_password).is_err());
+    }
+
+    #[test]
+    fn esxi_connection_defaults_and_hides_password() {
+        let c: EsxiConnection = serde_json::from_value(json!({
+            "host": "esx1", "user": "root", "password": "s3cret!"
+        }))
+        .unwrap();
+        assert_eq!(c.port, 443);
+        assert_eq!(c.datacenter, "ha-datacenter");
+        assert_eq!(c.fingerprint, None);
+        assert_eq!(c.password, "s3cret!");
+        let debug = format!("{c:?}");
+        assert!(!debug.contains("s3cret!"), "{debug}");
+        assert!(debug.contains("esx1") && debug.contains("root"), "{debug}");
+        let c: EsxiConnection = serde_json::from_value(json!({
+            "host": "vc1", "port": 8443, "user": "u", "password": "p",
+            "datacenter": "DC1", "fingerprint": "ab:cd"
+        }))
+        .unwrap();
+        assert_eq!((c.port, c.datacenter.as_str()), (8443, "DC1"));
+        assert_eq!(c.fingerprint.as_deref(), Some("ab:cd"));
+        assert!(
+            serde_json::from_value::<EsxiConnection>(json!({
+                "host": "h", "user": "u", "password": "p", "bogus": 1
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn normalizes_fingerprints() {
+        let hex = "0123456789abcdef".repeat(4);
+        let want = ["01:23:45:67:89:AB:CD:EF"; 4].join(":");
+        assert_eq!(want.len(), 95);
+        let colons = want.to_ascii_lowercase();
+        let spaced = colons.replace(':', " ");
+        let upper = hex.to_ascii_uppercase();
+        let padded = format!("  {hex}\n");
+        for ok in [&hex, &upper, &want, &colons, &spaced, &padded] {
+            assert_eq!(
+                normalize_fingerprint(ok).as_deref(),
+                Some(want.as_str()),
+                "{ok}"
+            );
+        }
+        for bad in [
+            String::new(),
+            hex[..62].to_string(),
+            format!("{hex}00"),
+            hex.replacen('0', "g", 1),
+            // SHA-1 지문(20바이트)
+            "ab:".repeat(20),
+            format!("sha256:{hex}"),
+        ] {
+            assert_eq!(normalize_fingerprint(&bad), None, "{bad}");
+        }
     }
 
     #[test]
