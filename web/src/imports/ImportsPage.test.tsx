@@ -86,7 +86,7 @@ it("uploads an OVA under a name taken from the file", async () => {
   expect(within(dialog).getByText("An import with this name already exists.")).toBeVisible();
   await userEvent.upload(within(dialog).getByLabelText("OVA file"), new File(["ova"], "OVA.ova"));
   await userEvent.click(within(dialog).getByRole("button", { name: "Upload" }));
-  expect(within(dialog).getByText("The name ova is reserved.")).toBeVisible();
+  expect(within(dialog).getByText("The names ova and esxi are reserved.")).toBeVisible();
 
   await userEvent.upload(
     within(dialog).getByLabelText("OVA file"),

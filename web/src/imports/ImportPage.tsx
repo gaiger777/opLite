@@ -26,8 +26,15 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { codeMessage, errorMessage } from "@/i18n/errors";
-import { runForm, sourceNetworks, toRun, validateRun, type RunForm } from "@/imports/imports";
-import { ImportedVm, ImportPhaseBadge } from "@/imports/ImportsPage";
+import {
+  runForm,
+  sourceNetworks,
+  sourceText,
+  toRun,
+  validateRun,
+  type RunForm,
+} from "@/imports/imports";
+import { ImportedVm, ImportPhaseBadge, useImportError } from "@/imports/ImportsPage";
 import { formatBytes, formatMib } from "@/lib/format";
 import { poolsUsableOn } from "@/storage/pools";
 import { trackTask } from "@/tasks/tasks";
@@ -72,7 +79,8 @@ function ImportView({ imp }: { imp: VmImport }) {
   const busy = sentAt === imp.revision;
   const node = nodes.data?.find((n) => n.id === imp.spec.node)?.name ?? "—";
   const ova = "ova" in imp.spec.source ? imp.spec.source.ova : undefined;
-  const { phase, error, warnings, source_vm: src } = imp.status;
+  const { phase, warnings, source_vm: src } = imp.status;
+  const error = useImportError(imp);
 
   return (
     <div className="flex flex-col gap-4">
@@ -123,10 +131,12 @@ function ImportView({ imp }: { imp: VmImport }) {
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
           <dl className="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-1 text-sm">
-            <dt className="text-muted-foreground">{t("imports.fileName")}</dt>
+            <dt className="text-muted-foreground">
+              {t(ova ? "imports.fileName" : "imports.esxiSource")}
+            </dt>
             <dd>
-              {ova && `${ova.file_name} (${formatBytes(ova.size_bytes)}), `}
-              {node}
+              {ova ? `${ova.file_name} (${formatBytes(ova.size_bytes)})` : sourceText(imp)}
+              {`, ${node}`}
             </dd>
             {src && (
               <>
@@ -149,7 +159,7 @@ function ImportView({ imp }: { imp: VmImport }) {
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t("common.name")}</TableHead>
-                    <TableHead>{t("imports.diskFile")}</TableHead>
+                    <TableHead>{t(ova ? "imports.diskFile" : "imports.diskFileEsxi")}</TableHead>
                     <TableHead>{t("imports.capacity")}</TableHead>
                     <TableHead>{t("imports.controller")}</TableHead>
                   </TableRow>

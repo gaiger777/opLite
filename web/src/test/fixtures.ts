@@ -253,3 +253,34 @@ export function vmImport(
     },
   };
 }
+
+/** ESXi에서 만든 가져오기. 원본 VM과 제안은 `vmImport`와 같다. */
+export function esxiImport(
+  name: string,
+  n: number,
+  status: Partial<VmImport["status"]> = {},
+): VmImport {
+  const imp = vmImport(name, n, status);
+  return {
+    ...imp,
+    spec: {
+      node: "n1",
+      source: {
+        esxi: {
+          host: "esxi1.lab",
+          port: 443,
+          datacenter: "ha-datacenter",
+          datastore: "datastore1",
+          vmx: `${name}/${name}.vmx`,
+          user: "root",
+          fingerprint: FINGERPRINT,
+        },
+      },
+    },
+  };
+}
+
+/** 가짜 ESXi 인증서 지문 */
+export const FINGERPRINT = Array.from({ length: 32 }, (_, i) =>
+  (i * 7 + 16).toString(16).toUpperCase().padStart(2, "0"),
+).join(":");

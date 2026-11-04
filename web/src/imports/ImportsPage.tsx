@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Upload } from "lucide-react";
+import { Server, Upload } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate } from "react-router";
@@ -25,7 +25,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
-import { importNameError } from "@/imports/imports";
+import { EsxiImportDialog } from "@/imports/EsxiImportDialog";
+import { CREDENTIALS_LOST, importNameError, sourceText } from "@/imports/imports";
 import { startOvaUpload } from "@/imports/ova";
 import { formatBytes } from "@/lib/format";
 import { nameFromFile } from "@/storage/upload";
@@ -43,6 +44,21 @@ const PHASE_VARIANT = {
 export function ImportPhaseBadge({ phase }: { phase: ImportPhase }) {
   const { t } = useTranslation();
   return <Badge variant={PHASE_VARIANT[phase]}>{t(`imports.phase.${phase}`)}</Badge>;
+}
+
+/** 가져오기의 오류. ESXi 자격 증명이 사라진 오류는 무엇을 할지 알려 주는 문장으로 바꾼다. */
+export function useImportError(imp: VmImport): string | null | undefined {
+  const { t } = useTranslation();
+  const error = imp.status.error;
+  return error === CREDENTIALS_LOST ? t("imports.credentialsLost") : error;
+}
+
+/** 목록의 상태 아래 오류 */
+function ImportError({ imp }: { imp: VmImport }) {
+  const error = useImportError(imp);
+  return error ? (
+    <div className="max-w-xs text-xs whitespace-normal break-words text-destructive">{error}</div>
+  ) : null;
 }
 
 /** 만든 VM으로 가는 링크. 만들지 않았으면 "—", VM을 지웠으면 그렇다고 보인다. */
@@ -71,6 +87,7 @@ export function ImportsPage() {
   const imports = useList("vm-import");
   const nodes = useList("node");
   const [uploading, setUploading] = useState(false);
+  const [esxi, setEsxi] = useState(false);
   const write = can(me.role, "write", "vm-import");
   const nodeName = (id: string) => nodes.data?.find((n) => n.id === id)?.name ?? "—";
 
@@ -84,10 +101,16 @@ export function ImportsPage() {
           <p className="text-sm text-muted-foreground">{t("imports.pageHint")}</p>
         </div>
         {write && (
-          <Button onClick={() => setUploading(true)}>
-            <Upload />
-            {t("imports.upload")}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={() => setEsxi(true)}>
+              <Server />
+              {t("imports.esxi")}
+            </Button>
+            <Button onClick={() => setUploading(true)}>
+              <Upload />
+              {t("imports.upload")}
+            </Button>
+          </div>
         )}
       </div>
       <Table aria-labelledby="imports-title">
@@ -117,19 +140,11 @@ export function ImportsPage() {
               <TableCell>{nodeName(imp.spec.node)}</TableCell>
               <TableCell>
                 {imp.status.source_vm?.name ?? "—"}
-                {"ova" in imp.spec.source && (
-                  <div className="text-xs text-muted-foreground">
-                    {imp.spec.source.ova.file_name}
-                  </div>
-                )}
+                <div className="text-xs text-muted-foreground">{sourceText(imp)}</div>
               </TableCell>
               <TableCell>
                 <ImportPhaseBadge phase={imp.status.phase} />
-                {imp.status.error && (
-                  <div className="max-w-xs text-xs whitespace-normal break-words text-destructive">
-                    {imp.status.error}
-                  </div>
-                )}
+                <ImportError imp={imp} />
               </TableCell>
               <TableCell>
                 <ImportedVm imp={imp} />
@@ -139,6 +154,7 @@ export function ImportsPage() {
         </TableBody>
       </Table>
       {uploading && <OvaUploadDialog onClose={() => setUploading(false)} />}
+      {esxi && <EsxiImportDialog onClose={() => setEsxi(false)} />}
     </div>
   );
 }

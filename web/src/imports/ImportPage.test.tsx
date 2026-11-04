@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import type { Network, VmImport } from "@/api/types";
 import { ImportPage } from "@/imports/ImportPage";
-import { NODE, pool, task, vm, vmImport, volume } from "@/test/fixtures";
+import { esxiImport, NODE, pool, task, vm, vmImport, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -50,6 +50,26 @@ it("shows the source VM, its warnings and the last error", async () => {
   expect(screen.getByRole("region", { name: "Warnings" })).toHaveTextContent(
     "UEFI boot entries (NVRAM) are not imported",
   );
+});
+
+it("shows an ESXi source and explains lost credentials", async () => {
+  const lost = esxiImport("web01", 1, {
+    phase: "failed",
+    error:
+      "the ESXi credentials are no longer on this node (opld restarted or the request was interrupted); create the import again",
+  });
+  mockLists({ "vm-import": [lost], node: [NODE] });
+  open(lost);
+  expect(
+    await screen.findByText("esxi1.lab / datastore1 / web01/web01.vmx, node-a"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(
+      "The source cannot be used: The ESXi password is no longer on this node (opld restarted or the request was interrupted). Delete this import and create it again.",
+    ),
+  ).toBeInTheDocument();
+  const disks = screen.getByRole("table", { name: "Disks" });
+  expect(within(disks).getByRole("columnheader", { name: "File on the datastore" })).toBeVisible();
 });
 
 it("runs the import with the reviewed settings after every network is mapped", async () => {
@@ -142,7 +162,7 @@ it("checks the volume names the import will create", async () => {
   ).toBeVisible();
 });
 
-it("explains server errors in terms of the node holding the OVA", async () => {
+it("explains server errors in terms of the node running the import", async () => {
   const imp = vmImport("web01", 1, {
     proposal: { ...vmImport("web01", 1).status.proposal!, networks: { "VM Network": "lan" } },
   });
@@ -160,12 +180,12 @@ it("explains server errors in terms of the node holding the OVA", async () => {
   );
   await userEvent.click(screen.getByRole("button", { name: "Import" }));
   expect(
-    await screen.findByText("This storage pool is not available on the node holding the OVA."),
+    await screen.findByText("This storage pool is not available on the node running the import."),
   ).toBeVisible();
   code = "node_offline";
   await userEvent.click(screen.getByRole("button", { name: "Import" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "The node holding the OVA is offline or has left the cluster.",
+    "The node running the import is offline or has left the cluster.",
   );
 });
 
@@ -300,12 +320,14 @@ it("deletes the import and goes back to the list", async () => {
   open(web01);
   await userEvent.click(await screen.findByRole("button", { name: "Delete import web01" }));
   const dialog = await screen.findByRole("alertdialog", { name: "Delete import web01?" });
-  expect(dialog).toHaveTextContent("Deletes the uploaded OVA from node-a.");
+  expect(dialog).toHaveTextContent(
+    "Deletes the import and its files on node-a. The source VM and any VM already imported are kept.",
+  );
   // 원본 노드가 없으면 웹에서는 지울 수 없다. 리소스만 지우는 명령을 알린다.
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(
     await within(dialog).findByText(
-      "The node holding the OVA is offline or has left the cluster. To forget the import and leave its files on that node, run oplctl import delete web01 --force.",
+      "The node running the import is offline or has left the cluster. To forget the import and leave its files on that node, run oplctl import delete web01 --force.",
     ),
   ).toBeVisible();
   offline = false;

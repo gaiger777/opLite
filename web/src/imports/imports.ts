@@ -4,8 +4,11 @@ import { MIN_MEMORY_MIB, validName } from "@/vms/form";
 
 type Schemas = components["schemas"];
 
-/** `/vm-imports/ova` 경로와 겹쳐 서버가 가져오기 이름으로 받지 않는다. */
-export const RESERVED_IMPORT = "ova";
+/** `/vm-imports/ova`·`/vm-imports/esxi` 경로와 겹쳐 서버가 가져오기 이름으로 받지 않는다. */
+export const RESERVED_IMPORTS = ["ova", "esxi"];
+/** 서버의 `CREDENTIALS_LOST`. 원본 노드 메모리에 ESXi 자격 증명이 없는(opld가 다시 시작했거나 요청이 끊긴) 가져오기의 오류다. */
+export const CREDENTIALS_LOST =
+  "the ESXi credentials are no longer on this node (opld restarted or the request was interrupted); create the import again";
 /** 서버의 `cores`·`sockets`(u16)와 `memory_mib`(u32)의 최댓값 */
 const MAX_COUNT = 65535;
 const MAX_MEMORY_MIB = 2 ** 32 - 1;
@@ -17,13 +20,83 @@ export function importNameError(name: string, taken: readonly string[]): string 
   if (!validName(name)) {
     return "forms.name";
   }
-  if (name === RESERVED_IMPORT) {
+  if (RESERVED_IMPORTS.includes(name)) {
     return "imports.errors.reserved";
   }
   if (taken.includes(name)) {
     return "imports.errors.exists";
   }
   return undefined;
+}
+
+/** VM 이름에서 이름 규칙에 맞춘 가져오기 이름. 맞출 수 없으면 빈 문자열이다. */
+export function nameFromVm(vm: string): string {
+  return vm
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+/, "")
+    .slice(0, MAX_NAME)
+    .replace(/-+$/, "");
+}
+
+/**
+ * ESXi VM으로 만들 가져오기 이름: VM 이름에서, 맞출 수 없으면 `.vmx`가 있는 디렉터리 이름에서, 그래도
+ * 안 되면 `esxi-import`.
+ */
+export function esxiImportName(vm: { name: string; vmx: string }): string {
+  const dir = vm.vmx.split("/").slice(0, -1).pop() ?? "";
+  return nameFromVm(vm.name) || nameFromVm(dir) || "esxi-import";
+}
+
+/** 원본이 어디 있는지: OVA면 파일 이름, ESXi면 `호스트 / 데이터스토어 / .vmx 경로` */
+export function sourceText(imp: VmImport): string {
+  const source = imp.spec.source;
+  if ("ova" in source) {
+    return source.ova.file_name;
+  }
+  return `${source.esxi.host} / ${source.esxi.datastore} / ${source.esxi.vmx}`;
+}
+
+/** ESXi 연결 폼. 포트는 입력 그대로의 문자열이다. 비밀번호는 이 상태에만 있고 저장하지 않는다. */
+export interface ConnectionForm {
+  host: string;
+  port: string;
+  user: string;
+  password: string;
+  datacenter: string;
+}
+
+/** ESXi 연결 폼의 입력 오류: 필드 → 번역 키. 비밀번호는 비어 있어도 된다. */
+export function validateConnection(form: ConnectionForm): Record<string, string> {
+  const errors: Record<string, string> = {};
+  if (form.host.trim() === "") {
+    errors.host = "imports.errors.host";
+  }
+  if (!intIn(form.port, 1, 65535)) {
+    errors.port = "imports.errors.port";
+  }
+  if (form.user === "") {
+    errors.user = "imports.errors.user";
+  }
+  if (form.datacenter.trim() === "") {
+    errors.datacenter = "imports.errors.datacenter";
+  }
+  return errors;
+}
+
+/** 연결 요청 본문. 포트와 데이터센터도 늘 보낸다. 지문은 믿기로 한 뒤에만 붙인다. */
+export function esxiConnection(
+  form: ConnectionForm,
+  fingerprint?: string,
+): Schemas["EsxiConnection"] {
+  return {
+    host: form.host.trim(),
+    port: Number(form.port),
+    user: form.user,
+    password: form.password,
+    datacenter: form.datacenter.trim(),
+    ...(fingerprint ? { fingerprint } : {}),
+  };
 }
 
 /** 원본 NIC들의 네트워크. 처음 나온 차례로, 겹치지 않게. */
