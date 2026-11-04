@@ -1,0 +1,212 @@
+name: ISO
+
+# 설치 ISO E2E: 패키지 → netinst(debian.lock) → build-iso.sh --unattended → KVM으로 무인 설치 →
+# 디스크로 부팅 → 첫 부팅 cluster init 출력(직렬 콘솔)으로 oplctl login·node list·node get.
+# BIOS(isolinux 메뉴)와 UEFI(OVMF, grub 메뉴) 두 경로를 따로 돌린다.
+# 오래 걸리므로(설치에 미러가 필요하다) PR마다 돌리지 않는다.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
+  push:
+    branches: ["ci-probe/**"]
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  iso-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        firmware: [bios, uefi]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-deb
+        id: build
+      - name: KVM, QEMU, xorriso
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update
+          sudo apt-get install -y xorriso qemu-system-x86 qemu-utils ovmf jq
+          ls -l /dev/kvm
+      # UEFI: OVMF 코드(읽기 전용)와 쓰기 가능한 VARS 복사본. 설치가 VARS에 남긴 부트 항목으로 디스크 부팅을 한다.
+      # ubuntu 24.04의 ovmf는 *_4M.fd다. 없으면 예전 이름을 쓴다.
+      - name: Firmware
+        if: matrix.firmware == 'uefi'
+        run: |
+          code=/usr/share/OVMF/OVMF_CODE_4M.fd vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+          if [ ! -f "$code" ]; then
+            code=/usr/share/OVMF/OVMF_CODE.fd vars=/usr/share/OVMF/OVMF_VARS.fd
+          fi
+          ls -l "$code" "$vars"
+          cp "$vars" "$RUNNER_TEMP/OVMF_VARS.fd"
+          echo "FW_ARGS=-drive if=pflash,format=raw,readonly=on,file=$code -drive if=pflash,format=raw,file=$RUNNER_TEMP/OVMF_VARS.fd" >> "$GITHUB_ENV"
+      - name: netinst version
+        id: lock
+        run: |
+          sha=$(sed -n 's/^DEBIAN_NETINST_SHA256=//p' packaging/iso/debian.lock)
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/netinst
+          key: debian-netinst-${{ steps.lock.outputs.sha256 }}
+      # debian.lock의 release/ URL은 다음 판이 나오면 cdimage/archive/<판>/로 옮겨진다. 404면 archive에서 받는다.
+      # 어느 쪽이든 debian.lock의 SHA-256과 같아야 한다(build-iso.sh도 다시 확인한다).
+      - name: Download Debian netinst
+        env:
+          NETINST_DIR: ${{ runner.temp }}/netinst
+        run: |
+          lock() { sed -n "s/^$1=//p" packaging/iso/debian.lock; }
+          url=$(lock DEBIAN_NETINST_URL)
+          release=$(lock DEBIAN_RELEASE)
+          iso="$NETINST_DIR/netinst.iso"
+          mkdir -p "$NETINST_DIR"
+          if [ ! -f "$iso" ]; then
+            code=$(curl -sSL -o "$iso.part" -w '%{http_code}' "$url")
+            if [ "$code" = 404 ]; then
+              url="https://cdimage.debian.org/cdimage/archive/$release/amd64/iso-cd/${url##*/}"
+              echo "release URL 404, archive에서 받는다: $url"
+              code=$(curl -sSL -o "$iso.part" -w '%{http_code}' "$url")
+            fi
+            if [ "$code" != 200 ]; then
+              echo "netinst를 받지 못했다: $url (HTTP $code)" >&2
+              exit 1
+            fi
+            mv "$iso.part" "$iso"
+          fi
+          echo "$(lock DEBIAN_NETINST_SHA256)  $iso" | sha256sum -c -
+          echo "NETINST=$iso" >> "$GITHUB_ENV"
+      - name: Build the unattended ISO
+        run: |
+          packaging/iso/build-iso.sh --netinst "$NETINST" --deb "$DEB" --out "$RUNNER_TEMP/oplite.iso" --unattended
+          ls -l "$RUNNER_TEMP/oplite.iso"
+        env:
+          DEB: ${{ steps.build.outputs.deb }}
+      # 설치가 끝나면 preseed가 전원을 끄고(-no-reboot) QEMU가 끝난다. QEMU를 백그라운드로 띄우고 30초마다 본다:
+      # 끝났으면 다음 단계, 직렬 로그에 oplite-setup 실패가 보이거나 40분이 지나면 실패.
+      # 실패하면 QEMU 모니터로 화면(install-screen.ppm, 아티팩트)을 남기고 직렬 로그의 oplite-setup: 줄을 보인다.
+      - name: Unattended install
+        working-directory: ${{ runner.temp }}
+        run: |
+          qemu-img create -f qcow2 disk.qcow2 20G
+          # FW_ARGS는 UEFI일 때만 있고 단어로 나눠 쓴다.
+          # shellcheck disable=SC2086
+          qemu-system-x86_64 -enable-kvm -m 4096 -smp 2 ${FW_ARGS:-} \
+            -drive file=disk.qcow2,if=virtio -cdrom oplite.iso -boot d \
+            -serial file:install.log -display none \
+            -monitor unix:"$RUNNER_TEMP/mon.sock",server,nowait \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -no-reboot &
+          qemu=$!
+          fail() {
+            echo "$1" >&2
+            python3 - "$RUNNER_TEMP/mon.sock" "$RUNNER_TEMP/install-screen.ppm" <<'EOF' || true
+          import socket, sys, time
+          s = socket.socket(socket.AF_UNIX)
+          s.connect(sys.argv[1])
+          s.sendall(("screendump " + sys.argv[2] + "\n").encode())
+          time.sleep(3)
+          s.close()
+          EOF
+            grep -a 'oplite-setup:' install.log || true
+            kill "$qemu" 2>/dev/null || true
+            exit 1
+          }
+          start=$(date +%s)
+          while kill -0 "$qemu" 2>/dev/null; do
+            if grep -aq 'oplite-setup: FAILED' install.log 2>/dev/null; then
+              fail "oplite-setup(late_command)이 실패했다"
+            fi
+            if [ $(($(date +%s) - start)) -ge 2400 ]; then
+              fail "40분 안에 설치가 끝나지 않았다"
+            fi
+            sleep 30
+          done
+          code=0
+          wait "$qemu" || code=$?
+          grep -a 'oplite-setup:' install.log || true
+          if [ "$code" != 0 ]; then
+            echo "QEMU가 $code로 끝났다" >&2
+            exit 1
+          fi
+          tail -n 20 install.log
+      - name: Boot the installed node
+        working-directory: ${{ runner.temp }}
+        run: |
+          qemu-system-x86_64 -enable-kvm -m 4096 -smp 2 ${FW_ARGS:-} \
+            -drive file=disk.qcow2,if=virtio \
+            -serial file:boot.log -display none \
+            -netdev user,id=n0,hostfwd=tcp::18006-:8006 -device virtio-net-pci,netdev=n0 \
+            -daemonize -pidfile qemu.pid
+      # oplite-ci-init.service가 첫 부팅에 cluster init 출력을 직렬 콘솔에 쓴다.
+      - name: Wait for cluster init
+        timeout-minutes: 15
+        working-directory: ${{ runner.temp }}
+        run: |
+          # CA 지문 다음 줄(join URL)까지 나오면 지문 줄이 다 쓰인 것이다.
+          # 그동안 QEMU가 죽거나 init이 실패하면(oplctl의 error: 줄, 유닛 실패) 바로 실패한다.
+          until grep -q 'join URL for the next node' boot.log 2>/dev/null; do
+            if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
+              echo "QEMU가 끝났다" >&2
+              tail -n 50 boot.log >&2 || true
+              exit 1
+            fi
+            if tr -d '\r' < boot.log 2>/dev/null | grep -E '^error: |Failed to start .*opLite CI first-boot' >&2; then
+              echo "첫 부팅 cluster init이 실패했다" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          fp=$(tr -d '\r' < boot.log | sed -n 's/.*CA fingerprint: \([^[:space:]]*\).*/\1/p' | head -n1)
+          pw=$(tr -d '\r' < boot.log | sed -n 's/.*admin password (shown only once): \([^[:space:]]*\).*/\1/p' | head -n1)
+          if [ -z "$fp" ] || [ -z "$pw" ]; then
+            echo "boot.log에서 CA 지문이나 admin 비밀번호를 찾지 못했다" >&2
+            exit 1
+          fi
+          echo "CA_FINGERPRINT=$fp" >> "$GITHUB_ENV"
+          printf '%s\n' "$pw" > admin-password
+      - name: oplctl login, node list, node get
+        timeout-minutes: 8
+        env:
+          OPL_CONFIG: ${{ runner.temp }}/oplctl.json
+        run: |
+          oplctl=target/release/oplctl
+          # init 직후 API가 HTTPS로 다시 열릴 때까지 잠깐 걸릴 수 있다.
+          until $oplctl login --server https://127.0.0.1:18006 --ca-fingerprint "$CA_FINGERPRINT" \
+            --password-file "$RUNNER_TEMP/admin-password"; do sleep 5; done
+          # 노드가 상태(online, 브리지)를 기록할 때까지 기다린다.
+          # 끝까지 나타나지 않으면 마지막 목록을 보이고 실패한다(원인을 보려고 30초마다도 찍는다).
+          i=0
+          until $oplctl -o json node list | jq -e '.[] | select(.name == "opl-ci" and .status.online == true)' >/dev/null; do
+            i=$((i + 1))
+            if [ $((i % 6)) -eq 0 ]; then $oplctl -o json node list || true; fi
+            if [ "$i" -ge 48 ]; then
+              echo "노드 opl-ci가 online이 되지 않았다" >&2
+              $oplctl -o json node list >&2 || true
+              exit 1
+            fi
+            sleep 5
+          done
+          $oplctl node list
+          $oplctl node get opl-ci | jq -e '.status.bridges[] | select(.name == "vmbr0")'
+          $oplctl network list
+      - name: Stop the node
+        if: always()
+        working-directory: ${{ runner.temp }}
+        run: |
+          if [ -f qemu.pid ]; then kill "$(cat qemu.pid)" || true; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: iso-e2e-logs-${{ matrix.firmware }}
+          path: |
+            ${{ runner.temp }}/install.log
+            ${{ runner.temp }}/install-screen.ppm
+            ${{ runner.temp }}/boot.log
+          if-no-files-found: ignore

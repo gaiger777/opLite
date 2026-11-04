@@ -91,45 +91,25 @@ jobs:
           OPL_SH="busybox sh" OPL_AWK="busybox awk" bash packaging/tests/setup-test.sh
       - run: bash packaging/tests/iso-test.sh
 
-  # Debian 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh → Debian 13 컨테이너에서 설치 시험
+  # Debian 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh(.github/actions/build-deb) → Debian 13 컨테이너에서 설치 시험
   package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          package_json_file: web/package.json
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: OpenSSL headers (native-tls)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-      - name: Web UI
-        run: |
-          pnpm -C web install --frozen-lockfile
-          pnpm -C web build
-      # 패키지 버전 = 워크스페이스 버전~ci<run 번호>. 바이너리의 --version도 이 값이다.
-      - name: Package version
-        run: |
-          WS_VERSION=$(grep '^version' Cargo.toml | head -n1 | cut -d'"' -f2)
-          echo "OPL_VERSION=${WS_VERSION}~ci${{ github.run_number }}" >> "$GITHUB_ENV"
-      - run: cargo build --release -p opld --features web-ui -p oplctl
-      - run: packaging/deb/build-deb.sh "$OPL_VERSION" dist
+      - uses: ./.github/actions/build-deb
+        id: build
       - name: Package info and contents
+        env:
+          DEB: ${{ steps.build.outputs.deb }}
         run: |
-          DEB="dist/oplite_${OPL_VERSION}_amd64.deb"
           dpkg-deb --info "$DEB"
           dpkg-deb --contents "$DEB"
       - name: Install test in Debian 13
+        env:
+          DEB: ${{ steps.build.outputs.deb }}
         run: |
           docker run --rm -v "$PWD:/work" debian:13 \
-            bash /work/packaging/tests/deb-test.sh "/work/dist/oplite_${OPL_VERSION}_amd64.deb"
+            bash /work/packaging/tests/deb-test.sh "/work/$DEB"
       # 빌드 버전 시험을 OPL_VERSION을 준 빌드로 다시 돌린다(clap 기본 version으로 되돌리면 실패한다).
       - name: Version tests with OPL_VERSION
         run: OPL_VERSION=9.9.9~t cargo test -p opl-types -p opld -p oplctl --lib --test version
