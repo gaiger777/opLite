@@ -15,6 +15,7 @@ hex.workspace = true
 reqwest.workspace = true
 rpassword.workspace = true
 native-tls.workspace = true
+opl-types.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

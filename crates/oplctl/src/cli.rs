@@ -16,7 +16,7 @@ use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
 
 #[derive(Parser)]
-#[command(name = "oplctl", version, about = "opLite command-line client")]
+#[command(name = "oplctl", version = opl_types::version::BUILD, about = "opLite command-line client")]
 struct Cli {
     /// 로그인 정보 파일 (기본: ~/.config/opl/oplctl.json)
     #[arg(long, global = true, env = "OPL_CONFIG")]
