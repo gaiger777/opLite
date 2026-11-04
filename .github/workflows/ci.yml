@@ -82,6 +82,14 @@ jobs:
           shellcheck packaging/**/*.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm
       - run: bash packaging/tests/build-deb-test.sh
       - run: bash packaging/tests/maint-test.sh
+      - run: bash packaging/tests/setup-test.sh
+      # 설치 프로그램 환경(busybox sh·awk)에서 oplite-setup.sh 함수가 같은 결과를 내는지
+      - name: setup-test with busybox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox
+          OPL_SH="busybox sh" OPL_AWK="busybox awk" bash packaging/tests/setup-test.sh
+      - run: bash packaging/tests/iso-test.sh
 
   # Debian 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh → Debian 13 컨테이너에서 설치 시험
   package:

@@ -1,0 +1,29 @@
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+source /etc/network/interfaces.d/*
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+# The primary network interface
+auto eno1
+iface eno1 inet manual
+
+# IPv6
+
+auto vmbr0
+iface vmbr0 inet static
+	address 10.0.0.11
+	netmask 255.255.255.0
+	gateway 10.0.0.1
+	bridge-ports eno1
+	bridge-stp off
+	bridge-fd 0
+	bridge-vlan-aware yes
+	bridge-vids 2-4094
+
+iface vmbr0 inet6 static
+	address 2001:db8::11/64
+	gateway 2001:db8::1

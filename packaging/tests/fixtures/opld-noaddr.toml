@@ -1,0 +1,5 @@
+# Written by the opLite installer. Example with all settings: /usr/share/oplite/opld.toml.example
+# The address cannot change once this node is in a cluster (it is in the node certificate). Reserve the DHCP address or use a static one; before cluster init/join you may still edit it.
+name = "node1"
+# Set address to this node's IP address (none was found during install).
+# address = ""

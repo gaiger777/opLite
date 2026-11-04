@@ -1,0 +1,8 @@
+# 설치 ISO의 바탕인 Debian 13 amd64 netinst 한 판. build-iso.sh와 CI가 읽는다(셸 KEY=value).
+# 해시는 cdimage.debian.org의 SHA256SUMS에서 확인했다(2026-11-05).
+# 13.7.0은 지금 판이라 아직 cdimage/archive/에 없어 release/ URL을 쓴다. 다음 판이 나오면
+# cdimage/archive/13.7.0/로 옮겨지므로 그때 URL을 archive로 바꾸거나 새 판으로 올린다.
+DEBIAN_RELEASE=13.7.0
+DEBIAN_CODENAME=trixie
+DEBIAN_NETINST_URL=https://cdimage.debian.org/cdimage/release/13.7.0/amd64/iso-cd/debian-13.7.0-amd64-netinst.iso
+DEBIAN_NETINST_SHA256=a7ef94ac2fb9a7fec454552abd629b7cc9d5155c886165a45649f5ce6167e355
