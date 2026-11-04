@@ -23,11 +23,12 @@ it("hides account pages from other roles", async () => {
   renderPage(<AppLayout />, { as: { ...ADMIN, role: "operator" } });
   expect(await screen.findByRole("link", { name: "Volumes" })).toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "Users" })).not.toBeInTheDocument();
-  // 보안 그룹과 백업, 백업 작업은 누구나 읽는다.
+  // 보안 그룹과 백업, 백업 작업, 가져오기는 누구나 읽는다.
   expect(screen.getByRole("link", { name: "Security groups" })).toHaveAttribute(
     "href",
     "/security-groups",
   );
   expect(screen.getByRole("link", { name: "Backups" })).toHaveAttribute("href", "/backups");
   expect(screen.getByRole("link", { name: "Backup jobs" })).toHaveAttribute("href", "/backup-jobs");
+  expect(screen.getByRole("link", { name: "Imports" })).toHaveAttribute("href", "/imports");
 });

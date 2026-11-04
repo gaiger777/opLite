@@ -47,11 +47,16 @@
     "backup_busy": "A task on this backup (backing up, restoring or deleting) is in progress. Try again when it has finished.",
     "backup_not_ready": "The backup is not ready. Only finished backups can be restored.",
     "job_running": "The backup job is already running. Wait for the run to finish.",
-    "job_disabled": "The backup job is off. Turn on \"Run on schedule\" first."
+    "job_disabled": "The backup job is off. Turn on \"Run on schedule\" first.",
+    "invalid_ova": "The file is not a usable OVA: {{message}}",
+    "import_busy": "The import is running, or another task on it has not finished.",
+    "import_done": "The VM has already been imported.",
+    "import_failed": "The import cannot run: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
     "vms": "Virtual machines",
+    "imports": "Imports",
     "volumes": "Volumes",
     "pools": "Storage pools",
     "backups": "Backups",
@@ -125,7 +130,9 @@
       "vm-ha-recover": "HA recovery of {{target}} (from node {{from}})",
       "vm-backup": "Back up {{target}}",
       "backup-delete": "Delete backup {{target}}",
-      "backup-restore": "Restore a backup as {{target}}"
+      "backup-restore": "Restore a backup as {{target}}",
+      "vm-import": "Import VM {{target}}",
+      "vm-import-delete": "Delete import {{target}}"
     }
   },
   "pager": {
@@ -440,6 +447,75 @@
       "labels": "Enter at least one KEY=VALUE label.",
       "at": "Enter a time from 00:00 to 23:59.",
       "keep": "Enter whole numbers of 0 or more."
+    }
+  },
+  "imports": {
+    "pageHint": "Bring VMware VMs into opLite from OVA files. Upload an OVA, review the settings proposed from the source VM, then run the import to create a stopped VM.",
+    "empty": "No imports.",
+    "upload": "Upload OVA",
+    "uploadTitle": "Upload an OVA",
+    "uploadDescription": "The file goes to the node you are connected to ({{node}}) and stays there until the import is done or deleted. The import runs on that node.",
+    "file": "OVA file",
+    "uploaded": "Uploaded {{name}}. Review the proposed settings and run the import.",
+    "review": "Review",
+    "noResponse": "{{name}}: no response from the server. Check the import list for the result.",
+    "sourceVm": "Source VM",
+    "vm": "VM",
+    "vmGone": "Deleted VM",
+    "phase": {
+      "ready": "Ready",
+      "importing": "Importing",
+      "done": "Done",
+      "failed": "Failed"
+    },
+    "notFound": "Import {{name}} not found",
+    "source": "Source",
+    "fileName": "File",
+    "guestOs": "Guest OS",
+    "cpuValue": "{{vcpus}} vCPU, {{cores}} per socket",
+    "diskFile": "File in the OVA",
+    "capacity": "Size",
+    "controller": "Controller",
+    "adapter": "Adapter",
+    "warnings": "Warnings",
+    "lastError": "The last run failed: {{error}}",
+    "failedError": "The source cannot be used: {{error}}",
+    "importing": "Importing. The progress is on the Tasks page.",
+    "imported": "Imported as VM",
+    "settings": "VM settings",
+    "settingsHint": "Proposed from the source VM. Change what you need.",
+    "vmName": "New VM name",
+    "pool": "Storage pool for the disks",
+    "poolHint": "Only pools usable on {{node}}, where the OVA is, are listed.",
+    "sockets": "Sockets",
+    "cores": "Cores per socket",
+    "diskBus": "Disk bus",
+    "nicModel": "NIC model",
+    "networks": "Network mapping",
+    "networksHint": "Choose an opLite network for each network the source VM uses.",
+    "chooseNetwork": "Choose a network",
+    "keepMacs": "Keep the source MAC addresses",
+    "keepMacsHint": "Power off the VMware VM before starting the imported one. Turn this off to give the interfaces new MAC addresses.",
+    "run": "Import",
+    "deleteNamed": "Delete import {{name}}",
+    "deleteTitle": "Delete import {{name}}?",
+    "deleteDescription": "Deletes the uploaded OVA from {{node}}. A VM already imported from it is kept.",
+    "forceHint": "{{error}} To forget the import and leave its files on that node, run oplctl import delete {{name}} --force.",
+    "codes": {
+      "node_offline": "The node holding the OVA is offline or has left the cluster.",
+      "mac_in_use": "Another VM uses a source MAC address. Turn off \"Keep the source MAC addresses\" to give the interfaces new MAC addresses."
+    },
+    "errors": {
+      "reserved": "The name ova is reserved.",
+      "exists": "An import with this name already exists.",
+      "vmExists": "A VM with this name already exists.",
+      "volumeExists": "A volume this import would create (NAME-disk0, …) already exists.",
+      "pool": "Choose a storage pool.",
+      "network": "Choose a network.",
+      "poolNotOnNode": "This storage pool is not available on the node holding the OVA.",
+      "poolUnavailable": "This storage pool is not ready on the node holding the OVA.",
+      "sockets": "Enter 1 to 65535 sockets.",
+      "nameTaken": "Name in use: {{message}}"
     }
   },
   "migrate": {

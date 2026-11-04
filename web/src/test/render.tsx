@@ -23,6 +23,7 @@ const PATHS: Record<WatchKind, string> = {
   "security-group": "/security-groups",
   backup: "/backups",
   "backup-job": "/backup-jobs",
+  "vm-import": "/vm-imports",
 };
 
 /** 목록 API의 응답을 정한다. 주지 않은 종류는 빈 목록이다. */

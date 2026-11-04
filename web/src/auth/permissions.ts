@@ -11,7 +11,7 @@ const ACCOUNT: ReadonlySet<Kind> = new Set(["user", "api-token", "join-token"]);
 
 /**
  * 서버의 `RoleAuthorizer`와 같은 규칙으로 버튼과 메뉴를 숨긴다. 실제 권한 확인은 서버가 한다.
- * operator는 VM과 볼륨, 백업과 백업 작업만 바꾸고, viewer는 읽기만 한다. 둘 다 계정은 읽지 못한다.
+ * operator는 VM과 볼륨, 백업과 백업 작업, VM 가져오기만 바꾸고, viewer는 읽기만 한다. 둘 다 계정은 읽지 못한다.
  */
 export function can(role: Role, action: Action, kind: Kind): boolean {
   const account = ACCOUNT.has(kind);
@@ -21,7 +21,11 @@ export function can(role: Role, action: Action, kind: Kind): boolean {
     case "operator":
       return action === "read"
         ? !account
-        : kind === "vm" || kind === "volume" || kind === "backup" || kind === "backup-job";
+        : kind === "vm" ||
+            kind === "volume" ||
+            kind === "backup" ||
+            kind === "backup-job" ||
+            kind === "vm-import";
     case "viewer":
       return action === "read" && !account;
   }

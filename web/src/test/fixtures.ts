@@ -8,6 +8,7 @@ import type {
   StoragePool,
   Task,
   Vm,
+  VmImport,
   Volume,
 } from "@/api/types";
 import type { PoolState } from "@/storage/pools";
@@ -199,5 +200,56 @@ export function backupJob(
       ...extra.spec,
     },
     status: { next_run: 1_793_761_200, run: null, last_run: null, errors: [], ...extra.status },
+  };
+}
+
+/**
+ * 테스트용 VM 가져오기: 노드 n1에 올린 `web01.ova`. 원본은 vSphere의 Linux VM(2 vCPU·소켓당 코어 2,
+ * 1 GiB, UEFI, SCSI 디스크 하나, "VM Network"의 vmxnet3 NIC 하나)이고, 제안은 `propose` 결과다.
+ */
+export function vmImport(
+  name: string,
+  n: number,
+  status: Partial<VmImport["status"]> = {},
+): VmImport {
+  return {
+    id: `019a0f3c-0000-7000-8008-${String(n).padStart(12, "0")}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: { node: "n1", source: { ova: { file_name: `${name}.ova`, size_bytes: 3 * 1024 ** 3 } } },
+    status: {
+      phase: "ready",
+      source_vm: {
+        name: "Web 01",
+        guest_os: "ubuntu64Guest",
+        firmware: "uefi",
+        vcpus: 2,
+        cores_per_socket: 2,
+        memory_mib: 1024,
+        disks: [
+          {
+            name: "disk0",
+            file: "web01-disk1.vmdk",
+            capacity_bytes: 16 * 1024 ** 3,
+            controller: "scsi",
+          },
+        ],
+        nics: [{ network: "VM Network", adapter: "vmxnet3", mac: "00:50:56:01:02:03" }],
+      },
+      proposal: {
+        sockets: 1,
+        cores: 2,
+        memory_mib: 1024,
+        firmware: "uefi",
+        disk_bus: "virtio-blk",
+        nic_model: "virtio",
+        networks: { "VM Network": null },
+      },
+      warnings: [
+        "UEFI boot entries (NVRAM) are not imported; the guest boots from its default boot path",
+      ],
+      ...status,
+    },
   };
 }

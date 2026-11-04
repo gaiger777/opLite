@@ -6,6 +6,7 @@ import {
   Cpu,
   Database,
   HardDrive,
+  Import,
   KeyRound,
   Languages,
   LayoutDashboard,
@@ -49,6 +50,7 @@ import { type Theme, useTheme } from "@/lib/theme";
 const NAV: { to: string; key: string; icon: LucideIcon; end: boolean; kind?: Kind }[] = [
   { to: "/", key: "nav.dashboard", icon: LayoutDashboard, end: true },
   { to: "/vms", key: "nav.vms", icon: Server, end: false },
+  { to: "/imports", key: "nav.imports", icon: Import, end: false },
   { to: "/volumes", key: "nav.volumes", icon: HardDrive, end: false },
   { to: "/storage-pools", key: "nav.pools", icon: Database, end: false },
   { to: "/backups", key: "nav.backups", icon: Archive, end: false },

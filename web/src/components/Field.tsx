@@ -9,19 +9,21 @@ export interface FieldA11y {
 }
 
 /**
- * 이름표와 입력, 그 아래의 오류(번역 키)와 도움말. 오류나 도움말이 있는 입력은 `children`에 함수를
+ * 이름표와 입력, 그 아래의 오류(번역 키, 끼울 값은 `errorValues`)와 도움말. 오류나 도움말이 있는 입력은 `children`에 함수를
  * 주어 `FieldA11y`를 받는다.
  */
 export function Field({
   id,
   label,
   error,
+  errorValues,
   hint,
   children,
 }: {
   id: string;
   label: string;
   error?: string;
+  errorValues?: Record<string, string>;
   hint?: string;
   children: React.ReactNode | ((a11y: FieldA11y) => React.ReactNode);
 }) {
@@ -44,7 +46,7 @@ export function Field({
       )}
       {error && (
         <p id={errorId} className="text-xs text-destructive">
-          {t(error)}
+          {t(error, errorValues)}
         </p>
       )}
     </div>

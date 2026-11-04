@@ -13,6 +13,8 @@ import { BackupJobsPage } from "@/backups/BackupJobsPage";
 import { BackupsPage } from "@/backups/BackupsPage";
 import { ClusterPage } from "@/cluster/ClusterPage";
 import { Toaster } from "@/components/ui/sonner";
+import { ImportPage } from "@/imports/ImportPage";
+import { ImportsPage } from "@/imports/ImportsPage";
 import { AppLayout } from "@/layout/AppLayout";
 import { ThemeProvider } from "@/lib/theme";
 import { DashboardPage } from "@/pages/DashboardPage";
@@ -54,6 +56,8 @@ function routes() {
             { path: "vms/:name", element: <VmDetailPage /> },
             { path: "vms/:name/edit", element: <VmEditPage /> },
             { path: "vms/:name/console", element: <ConsolePage /> },
+            { path: "imports", element: <ImportsPage /> },
+            { path: "imports/:name", element: <ImportPage /> },
             { path: "volumes", element: <VolumesPage /> },
             { path: "storage-pools", element: <PoolsPage /> },
             { path: "backups", element: <BackupsPage /> },

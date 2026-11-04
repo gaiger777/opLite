@@ -21,6 +21,10 @@ it("mirrors the server roles", () => {
   expect(can("viewer", "read", "backup-job")).toBe(true);
   expect(can("viewer", "write", "backup-job")).toBe(false);
   expect(can("operator", "write", "backup-job")).toBe(true);
+  // VM 가져오기도 같다.
+  expect(can("viewer", "read", "vm-import")).toBe(true);
+  expect(can("viewer", "write", "vm-import")).toBe(false);
+  expect(can("operator", "write", "vm-import")).toBe(true);
 });
 
 it("keeps accounts to admins", () => {

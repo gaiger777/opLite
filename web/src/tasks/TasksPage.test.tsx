@@ -97,6 +97,40 @@ it("names backup tasks by the backup and the VM being restored", async () => {
   expect(screen.getByText("Restore a backup as web2")).toBeInTheDocument();
 });
 
+it("names import tasks by the new VM and the import", async () => {
+  const imp = "019a0f3c-0000-7000-8008-000000000001";
+  mockLists({
+    "vm-import": [{ id: imp, name: "web01" }],
+    task: [
+      {
+        // 가져오기의 대상도 아직 없는 새 VM이다.
+        id: "019a0f3c-8a10-7000-8000-000000000001",
+        spec: {
+          op: {
+            kind: "vm-import",
+            import: imp,
+            run: { name: "web", pool: "local", keep_macs: true },
+          },
+          target: "019a0f3c-0000-7000-8000-00000000cafe",
+          node: "n1",
+        },
+        status: { state: "running", error: null },
+      },
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000002",
+        spec: { op: { kind: "vm-import-delete" }, target: imp, node: "n1" },
+        status: { state: "running", error: null },
+      },
+    ],
+  });
+  renderPage(<TasksPage />);
+  expect(await screen.findByText("Import VM web")).toBeInTheDocument();
+  expect(await screen.findByRole("link", { name: "Delete import web01" })).toHaveAttribute(
+    "href",
+    "/imports/web01",
+  );
+});
+
 it("shows HA recoveries with the failed node's name", async () => {
   mockLists({
     vm: [{ id: VM, name: "web" }],

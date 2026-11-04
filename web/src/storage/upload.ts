@@ -65,41 +65,56 @@ export async function checkUpload(size: number, params: UploadParams, signal?: A
   );
 }
 
+/** `sendFile`의 진행률·다 보냄·취소 */
+export interface SendOptions {
+  onProgress?(loaded: number, total: number): void;
+  onSent?(): void;
+  signal?: AbortSignal;
+}
+
 /**
- * 이미지를 `/volumes/import`로 올린다. fetch는 올리는 진행률을 알려 주지 않아 `XMLHttpRequest`를 쓴다.
- * 본문을 다 보내면 `onSent`를 부른다(빈 파일이어도). 받은 Task(202)로 끝나고, 오류 응답은 `ApiError`, 연결 실패는 `NetworkError`, 취소는 `signal`의 이유로
- * 거부한다. 중간에 끊기면 서버가 만들던 볼륨과 받은 파일을 지운다.
+ * 이미지를 `/volumes/import`로 올린다. 받은 Task(202)로 끝난다. 그 밖은 `sendFile`과 같다. 중간에 끊기면
+ * 서버가 만들던 볼륨과 받은 파일을 지운다.
  */
-export function uploadImage(
+export function uploadImage(file: Blob, params: UploadParams, options: SendOptions): Promise<Task> {
+  const query = new URLSearchParams({
+    name: params.name,
+    pool: params.pool,
+    format: params.format,
+    source_format: params.sourceFormat,
+  });
+  // Task가 아닌 본문(프록시 따위)은 실패로 본다.
+  return sendFile("/volumes/import", query, file, 202, isTask, options);
+}
+
+function isTask(body: unknown): body is Task {
+  return typeof (body as Partial<Task> | null)?.id === "string";
+}
+
+/**
+ * 파일을 API `path`로 올린다. fetch는 올리는 진행률을 알려 주지 않아 `XMLHttpRequest`를 쓴다.
+ * 본문을 다 보내면 `onSent`를 부른다(빈 파일이어도). `status` 응답의 본문이 `accept`를 통과하면 그것으로
+ * 끝나고, 그 밖의 응답은 `ApiError`, 연결 실패는 `NetworkError`, 취소는 `signal`의 이유로 거부한다.
+ */
+export function sendFile<T>(
+  path: string,
+  query: URLSearchParams,
   file: Blob,
-  params: UploadParams,
-  {
-    onProgress,
-    onSent,
-    signal,
-  }: {
-    onProgress?(loaded: number, total: number): void;
-    onSent?(): void;
-    signal?: AbortSignal;
-  },
-): Promise<Task> {
+  status: number,
+  accept: (body: unknown) => body is T,
+  { onProgress, onSent, signal }: SendOptions,
+): Promise<T> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(signal.reason);
       return;
     }
-    const query = new URLSearchParams({
-      name: params.name,
-      pool: params.pool,
-      format: params.format,
-      source_format: params.sourceFormat,
-    });
     const xhr = new XMLHttpRequest();
     const sentAt = currentAuthEpoch();
     const onAbort = () => xhr.abort();
     signal?.addEventListener("abort", onAbort);
     const done = () => signal?.removeEventListener("abort", onAbort);
-    xhr.open("POST", `${window.location.origin}/api/v1/volumes/import?${query}`);
+    xhr.open("POST", `${window.location.origin}/api/v1${path}?${query}`);
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
     xhr.upload.onprogress = (e) => onProgress?.(e.loaded, e.total || file.size);
     xhr.upload.onload = () => onSent?.();
@@ -111,13 +126,8 @@ export function uploadImage(
       } catch {
         // 프록시의 HTML 오류 페이지 따위
       }
-      if (xhr.status === 202) {
-        // Task가 아닌 본문(프록시 따위)은 실패로 본다.
-        if (typeof (body as Partial<Task> | null)?.id === "string") {
-          resolve(body as Task);
-        } else {
-          reject(toApiError(xhr.status, body));
-        }
+      if (xhr.status === status && accept(body)) {
+        resolve(body);
         return;
       }
       if (xhr.status === 401) {
@@ -156,10 +166,44 @@ export function resetUploads() {
 }
 
 /**
- * 업로드를 시작하고 진행률과 취소 버튼을 알림으로 보여 준다. 화면을 옮겨도 계속된다. 다 올리면 볼륨을
- * 채우는 Task를 `trackTask`로 넘긴다.
+ * 이미지 업로드를 시작한다(`runUpload`). 다 올리면 볼륨을 채우는 Task를 `trackTask`로 넘긴다.
  */
 export function startUpload(file: File, params: UploadParams, t: TFunction) {
+  runUpload(
+    file,
+    {
+      name: params.name,
+      check: (signal) => checkUpload(file.size, params, signal),
+      send: (options) => uploadImage(file, params, options),
+      done: (task, id) => {
+        toast.dismiss(id);
+        trackTask(task, t("tasks.op.volume-import", { target: params.name }));
+      },
+      noResponse: t("uploads.noResponse", { name: params.name }),
+    },
+    t,
+  );
+}
+
+/** `runUpload`이 할 일 */
+export interface UploadJob<T> {
+  /** 알림에 보일 이름 */
+  name: string;
+  /** 본문을 보내기 전에 서버가 받을 수 있는지 묻는다. 거절하면 던진다. */
+  check(signal: AbortSignal): Promise<void>;
+  /** 파일을 보낸다(`sendFile`). */
+  send(options: SendOptions): Promise<T>;
+  /** 받은 결과를 알림 `id`와 함께 넘긴다. 던지면 업로드 실패로 알린다. */
+  done(result: T, id: string): void;
+  /** 다 보낸 뒤 오래 답이 없을 때의 알림 */
+  noResponse: string;
+}
+
+/**
+ * 업로드를 시작하고 진행률과 취소 버튼을 알림으로 보여 준다. 화면을 옮겨도 계속되고, 진행 중에는
+ * 페이지를 떠나려 하면 확인한다. 끝나면 결과를 `job.done`으로 넘긴다.
+ */
+export function runUpload<T>(file: File, job: UploadJob<T>, t: TFunction) {
   const id = `upload-${crypto.randomUUID()}`;
   const controller = new AbortController();
   const cancel = { label: t("common.cancel"), onClick: () => controller.abort() };
@@ -174,14 +218,14 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
   // 다 보냈다. 서버가 파일을 쓰고 Task를 만드는 동안은 취소하지 않는다.
   const sentAll = () => {
     processing = true;
-    toast.loading(t("uploads.processing", { name: params.name }), {
+    toast.loading(t("uploads.processing", { name: job.name }), {
       id,
       action: undefined,
       duration: Infinity,
     });
     // 오래 답이 없으면 닫을 수 있는 알림으로 바꾼다. 늦게 오는 응답은 평소처럼 알린다.
     waiting = setTimeout(() => {
-      toast.warning(t("uploads.noResponse", { name: params.name }), {
+      toast.warning(job.noResponse, {
         id,
         duration: Infinity,
         closeButton: true,
@@ -200,7 +244,7 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
     shown = percent;
     toast.loading(
       t("uploads.progress", {
-        name: params.name,
+        name: job.name,
         percent,
         loaded: formatBytes(loaded),
         total: formatBytes(total),
@@ -211,19 +255,13 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
   show(0, file.size);
   // 확인에서 거절되면 본문을 보내지 않는다.
   let sent = false;
-  void checkUpload(file.size, params, controller.signal)
+  void job
+    .check(controller.signal)
     .then(() => {
       sent = true;
-      return uploadImage(file, params, {
-        onProgress: show,
-        onSent: sentAll,
-        signal: controller.signal,
-      });
+      return job.send({ onProgress: show, onSent: sentAll, signal: controller.signal });
     })
-    .then((task) => {
-      toast.dismiss(id);
-      trackTask(task, t("tasks.op.volume-import", { target: params.name }));
-    })
+    .then((result) => job.done(result, id))
     // 넘기다 던져도 알림이 "올리는 중"에 남지 않게 여기서 함께 받는다.
     // `trackTask`에서 던졌다면 서버의 가져오기 Task는 이미 돌고 있을 수 있다.
     .catch((err: unknown) => {
@@ -231,7 +269,7 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
       if (upload.silent) {
         toast.dismiss(id);
       } else if (controller.signal.aborted) {
-        toast.info(t("uploads.cancelled", { name: params.name }), {
+        toast.info(t("uploads.cancelled", { name: job.name }), {
           id,
           action: undefined,
           duration: 4000,
@@ -240,7 +278,7 @@ export function startUpload(file: File, params: UploadParams, t: TFunction) {
         // 서버가 본문을 다 받기 전에 거절해도(401·409·507 따위) 브라우저는 연결 끊김으로만 알린다.
         const error =
           sent && err instanceof NetworkError ? t("uploads.dropped") : errorMessage(t, err);
-        toast.error(t("uploads.failed", { name: params.name, error }), {
+        toast.error(t("uploads.failed", { name: job.name, error }), {
           id,
           action: undefined,
           duration: Infinity,

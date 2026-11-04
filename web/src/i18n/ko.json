@@ -47,11 +47,16 @@
     "backup_busy": "이 백업의 작업(백업, 복원, 삭제)이 진행 중입니다. 끝난 뒤 다시 시도하세요.",
     "backup_not_ready": "백업이 준비되지 않았습니다. 다 만든 백업만 복원할 수 있습니다.",
     "job_running": "백업 작업이 이미 실행 중입니다. 실행이 끝난 뒤 다시 시도하세요.",
-    "job_disabled": "꺼 둔 백업 작업입니다. 먼저 \"일정대로 실행\"을 켜세요."
+    "job_disabled": "꺼 둔 백업 작업입니다. 먼저 \"일정대로 실행\"을 켜세요.",
+    "invalid_ova": "쓸 수 있는 OVA가 아닙니다: {{message}}",
+    "import_busy": "가져오는 중이거나 이 가져오기의 다른 작업이 끝나지 않았습니다.",
+    "import_done": "이미 가져온 VM입니다.",
+    "import_failed": "가져오기를 실행할 수 없습니다: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
     "vms": "가상 머신",
+    "imports": "가져오기",
     "volumes": "볼륨",
     "pools": "스토리지 풀",
     "backups": "백업",
@@ -125,7 +130,9 @@
       "vm-ha-recover": "{{target}} HA 복구 (노드 {{from}}에서)",
       "vm-backup": "{{target}} 백업",
       "backup-delete": "백업 {{target}} 삭제",
-      "backup-restore": "백업을 {{target}}(으)로 복원"
+      "backup-restore": "백업을 {{target}}(으)로 복원",
+      "vm-import": "VM {{target}} 가져오기",
+      "vm-import-delete": "가져오기 {{target}} 삭제"
     }
   },
   "pager": {
@@ -440,6 +447,75 @@
       "labels": "KEY=VALUE 라벨을 하나 이상 적으세요.",
       "at": "00:00부터 23:59 사이의 시각을 적으세요.",
       "keep": "0 이상의 정수를 적으세요."
+    }
+  },
+  "imports": {
+    "pageHint": "OVA 파일로 VMware VM을 opLite로 가져옵니다. OVA를 올리고 원본 VM에서 제안한 설정을 확인한 뒤 실행하면 꺼진 VM이 만들어집니다.",
+    "empty": "가져오기가 없습니다.",
+    "upload": "OVA 올리기",
+    "uploadTitle": "OVA 올리기",
+    "uploadDescription": "파일은 지금 접속한 노드({{node}})로 올라가고 가져오기를 마치거나 지울 때까지 그 노드에 남습니다. 가져오기도 그 노드에서 돕니다.",
+    "file": "OVA 파일",
+    "uploaded": "{{name}}을(를) 올렸습니다. 제안한 설정을 확인하고 가져오기를 실행하세요.",
+    "review": "확인",
+    "noResponse": "{{name}}: 서버 응답이 없습니다. 가져오기 목록에서 결과를 확인하세요.",
+    "sourceVm": "원본 VM",
+    "vm": "VM",
+    "vmGone": "삭제한 VM",
+    "phase": {
+      "ready": "준비됨",
+      "importing": "가져오는 중",
+      "done": "완료",
+      "failed": "실패"
+    },
+    "notFound": "가져오기 {{name}}을(를) 찾을 수 없습니다",
+    "source": "원본",
+    "fileName": "파일",
+    "guestOs": "게스트 OS",
+    "cpuValue": "vCPU {{vcpus}}개, 소켓당 코어 {{cores}}개",
+    "diskFile": "OVA 안의 파일",
+    "capacity": "크기",
+    "controller": "컨트롤러",
+    "adapter": "어댑터",
+    "warnings": "경고",
+    "lastError": "마지막 실행이 실패했습니다: {{error}}",
+    "failedError": "원본을 쓸 수 없습니다: {{error}}",
+    "importing": "가져오는 중입니다. 진행 상황은 작업 화면에 있습니다.",
+    "imported": "가져온 VM",
+    "settings": "VM 설정",
+    "settingsHint": "원본 VM에서 제안한 값입니다. 필요한 것을 고치세요.",
+    "vmName": "새 VM 이름",
+    "pool": "디스크를 둘 스토리지 풀",
+    "poolHint": "OVA가 있는 {{node}}에서 쓸 수 있는 풀만 보입니다.",
+    "sockets": "소켓",
+    "cores": "소켓당 코어",
+    "diskBus": "디스크 버스",
+    "nicModel": "NIC 모델",
+    "networks": "네트워크 매핑",
+    "networksHint": "원본 VM이 쓰는 네트워크마다 opLite 네트워크를 고르세요.",
+    "chooseNetwork": "네트워크를 고르세요",
+    "keepMacs": "원본 MAC 주소 유지",
+    "keepMacsHint": "가져온 VM을 켜기 전에 VMware의 원본 VM을 끄세요. 끄면 인터페이스가 새 MAC 주소를 받습니다.",
+    "run": "가져오기",
+    "deleteNamed": "가져오기 {{name}} 삭제",
+    "deleteTitle": "가져오기 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "{{node}}에 올린 OVA를 지웁니다. 이미 가져온 VM은 남습니다.",
+    "forceHint": "{{error}} 파일을 그 노드에 남기고 가져오기만 지우려면 oplctl import delete {{name}} --force를 실행하세요.",
+    "codes": {
+      "node_offline": "OVA가 있는 노드가 오프라인이거나 클러스터에서 빠졌습니다.",
+      "mac_in_use": "다른 VM이 원본 MAC 주소를 쓰고 있습니다. \"원본 MAC 주소 유지\"를 끄면 새 MAC 주소를 받습니다."
+    },
+    "errors": {
+      "reserved": "ova는 예약된 이름입니다.",
+      "exists": "같은 이름의 가져오기가 이미 있습니다.",
+      "vmExists": "같은 이름의 VM이 이미 있습니다.",
+      "volumeExists": "가져오기가 만들 볼륨(이름-disk0, …)이 이미 있습니다.",
+      "pool": "스토리지 풀을 고르세요.",
+      "network": "네트워크를 고르세요.",
+      "poolNotOnNode": "OVA가 있는 노드에서 쓸 수 없는 스토리지 풀입니다.",
+      "poolUnavailable": "OVA가 있는 노드에서 준비되지 않은 스토리지 풀입니다.",
+      "sockets": "소켓 수는 1에서 65535 사이여야 합니다.",
+      "nameTaken": "이미 쓰는 이름입니다: {{message}}"
     }
   },
   "migrate": {

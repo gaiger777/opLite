@@ -12,6 +12,8 @@ export type Task = Schemas["Resource_TaskSpec_TaskStatus"];
 export type Snapshot = Schemas["Resource_SnapshotSpec_SnapshotStatus"];
 export type Backup = Schemas["Resource_BackupSpec_BackupStatus"];
 export type BackupJob = Schemas["Resource_BackupJobSpec_BackupJobStatus"];
+export type VmImport = Schemas["Resource_VmImportSpec_VmImportStatus"];
+export type ImportRun = Schemas["ImportRun"];
 export type Weekday = Schemas["Weekday"];
 export type SecurityGroup = Schemas["Resource_SecurityGroupSpec_SecurityGroupStatus"];
 export type Rule = Schemas["Rule"];
@@ -29,7 +31,8 @@ export type WatchKind =
   | "snapshot"
   | "security-group"
   | "backup"
-  | "backup-job";
+  | "backup-job"
+  | "vm-import";
 
 /** 종류별 리소스 */
 export interface Resources {
@@ -43,4 +46,5 @@ export interface Resources {
   "security-group": SecurityGroup;
   backup: Backup;
   "backup-job": BackupJob;
+  "vm-import": VmImport;
 }
