@@ -413,6 +413,8 @@ impl Member {
         runner_config.migration_bandwidth =
             (config.migration.bandwidth_mib > 0).then_some(config.migration.bandwidth_mib << 20);
         runner_config.migration_timeout = config.migration.timeout;
+        // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
+        runner_config.import_credentials = state.import_credentials.clone();
         let runner = TaskRunner::spawn(
             cluster.clone(),
             storage,

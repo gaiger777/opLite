@@ -39,6 +39,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::schedule::task_failed;
 use crate::snapshots::{uses_block_snapshots, vm_placement};
+use crate::vm_imports::ImportCredentials;
 use crate::vms::is_stopped;
 use crate::volumes::{block_pool_kind, usable_node};
 
@@ -86,6 +87,9 @@ pub struct TaskRunnerConfig {
     /// 스냅샷·복제가 UEFI 변수를 복사하기 전에, 변수 파일이 다른 노드에 있으면 받아 온다. 없으면
     /// 이 노드의 파일을 그대로 쓴다.
     pub firmware: Option<Arc<dyn FirmwareFetcher>>,
+    /// 이 노드가 받은 ESXi 가져오기의 자격 증명. 가져오기 Task가 쓰고, 끝나거나 지우면 지운다. API
+    /// (`AppState::import_credentials`)와 같은 것을 넘긴다.
+    pub import_credentials: Arc<ImportCredentials>,
 }
 
 impl TaskRunnerConfig {
@@ -103,6 +107,7 @@ impl TaskRunnerConfig {
             migration_bandwidth: None,
             migration_timeout: Duration::from_secs(30 * 60),
             firmware: None,
+            import_credentials: Arc::default(),
         }
     }
 }

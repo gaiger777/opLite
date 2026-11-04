@@ -1445,6 +1445,85 @@ async fn esxi_import_rejects_what_it_cannot_import() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
+/// ESXi 가져오기의 실행 요청은 업로드 디렉터리에 가장 큰 디스크를 통째로 받을 여유(용량 + 1 GiB)를 본다
+/// (씬 디스크도 전체 크기로 받는다). 모자라면 507이고 가져오기는 `ready`로 남는다. 원본 디렉터리가 없어도
+/// 실행할 수 있다.
+#[tokio::test]
+async fn esxi_run_needs_space_for_the_largest_disk() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    network(&env, "lan").await;
+    pool(&env, "local", vec![]).await;
+    env.stop_runner().await;
+    let available = fs4::available_space(env.dir.path()).unwrap();
+    let mut files = esxi_files();
+    files.insert(
+        "datastore1/big/big.vmx".into(),
+        WEB01_VMX.replace("web01", "big").into_bytes(),
+    );
+    files.insert(
+        "datastore1/big/big.vmdk".into(),
+        descriptor(
+            "vmfs",
+            &format!("RW {} VMFS \"big-flat.vmdk\"", available / 512 + 1),
+            "",
+        ),
+    );
+    let esxi = MockEsxi::start(files, ESXI_USER, ESXI_PASSWORD).await;
+    for (name, vmx) in [("big", "big/big.vmx"), ("web01", "web01/web01.vmx")] {
+        let conn = connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+        let (status, body) = admin
+            .post(
+                "/vm-imports/esxi",
+                esxi_import(name, conn, "datastore1", vmx),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (status, body) = run(&admin, "big", run_request("big")).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+    assert_eq!(body["code"], "insufficient_storage");
+    assert_eq!(
+        import_named(&env, "big").unwrap().status.phase,
+        ImportPhase::Ready
+    );
+    let (status, body) = run(&admin, "web01", run_request("web")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+/// 이 노드의 ESXi 가져오기인데 메모리에 자격 증명이 없으면 실행 요청은 Task를 만들지 않고 409
+/// `import_failed`이고, 가져오기는 `failed`가 된다(다시 실행해도 소용없다).
+#[tokio::test]
+async fn esxi_run_without_credentials_fails_the_import() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    network(&env, "lan").await;
+    pool(&env, "local", vec![]).await;
+    let esxi = mock_esxi().await;
+    let conn = connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi",
+            esxi_import("web01", conn, "datastore1", "web01/web01.vmx"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    env.state.import_credentials.remove(id);
+
+    let lost = "the ESXi credentials are no longer on this node (opld restarted or the request was interrupted); create the import again";
+    let (status, body) = run(&admin, "web01", run_request("web")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "import_failed");
+    assert!(body["message"].as_str().unwrap().contains(lost), "{body}");
+    let import = import_named(&env, "web01").unwrap();
+    assert_eq!(import.status.phase, ImportPhase::Failed);
+    assert_eq!(import.status.error.as_deref(), Some(lost));
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    assert!(tasks.is_empty(), "{tasks:?}");
+}
+
 /// 저장소에 ESXi 가져오기를 직접 만든다.
 async fn esxi_import_on(env: &Env, name: &str, node: Uuid, phase: ImportPhase) -> VmImport {
     let mut import: VmImport = Resource::new(

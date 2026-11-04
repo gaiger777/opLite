@@ -60,6 +60,8 @@ const BROWSE_MAX_DIRS: usize = 500;
 pub(crate) const SOURCE_OVA: &str = "source.ova";
 /// 가져오기 Task가 디스크를 하나씩 추출해 두는 파일 이름(가져오기 디렉터리 안)
 pub(crate) const EXTRACTED_DISK: &str = "disk.vmdk";
+/// ESXi 가져오기 Task가 디스크(extent)를 하나씩 받아 두는 파일 이름(가져오기 디렉터리 안)
+pub(crate) const DOWNLOADED_DISK: &str = "disk.raw";
 
 /// 가져오기 `id`의 원본 디렉터리
 pub(crate) fn import_dir(upload_dir: &FsPath, id: Uuid) -> PathBuf {
@@ -831,8 +833,8 @@ fn check_idle(state: &AppState, import: &VmImport) -> Result<(), ApiError> {
 }
 
 /// 끝난 실행 Task가 대상 VM을 이미 만들었으면(VM을 만든 뒤 가져오기를 `done`으로 바꾸지 못했다) 가져오기를
-/// `done`으로 끝내고 409 `import_done`. 원본이 이 노드에 있으면 원본 디렉터리도 지운다(다른 노드의 것은
-/// 가져오기를 지울 때 그 노드가 지운다).
+/// `done`으로 끝내고 409 `import_done`. 원본이 이 노드에 있으면 원본 디렉터리와 ESXi 자격 증명도 지운다
+/// (다른 노드의 것은 가져오기를 지울 때 그 노드가 지운다).
 async fn finish_made(state: &AppState, import: &VmImport) -> Result<(), ApiError> {
     let (_, tasks) = state.cluster.list::<TaskSpec>()?;
     let Some(vm) = made_vm(&state.cluster, import.id, &tasks) else {
@@ -863,6 +865,7 @@ async fn finish_made(state: &AppState, import: &VmImport) -> Result<(), ApiError
         Err(e) => return Err(e.into()),
     }
     if import.spec.node == state.node {
+        state.import_credentials.remove(import.id);
         let dir = import_dir(&state.upload_dir, import.id);
         if let Err(e) = tokio::fs::remove_dir_all(&dir).await
             && e.kind() != std::io::ErrorKind::NotFound
@@ -876,13 +879,17 @@ async fn finish_made(state: &AppState, import: &VmImport) -> Result<(), ApiError
     ))
 }
 
-/// 원본 디렉터리에 가장 큰 디스크를 추출하고도 여유가 남는지 본다(아니면 507). 원본이 없으면 409
-/// `import_failed`.
+/// 원본 디렉터리에 가장 큰 디스크를 추출하고도 여유가 남는지 본다(아니면 507). OVA 원본이 없으면 409
+/// `import_failed`. ESXi 원본은 디스크를 통째로 받으므로(씬 디스크도) 가장 큰 디스크의 용량을 본다.
 async fn check_extract_space(
     state: &AppState,
     import: &VmImport,
     src: &SourceVm,
 ) -> Result<(), ApiError> {
+    if let ImportSource::Esxi(_) = import.spec.source {
+        let largest = src.disks.iter().map(|d| d.capacity_bytes).max();
+        return check_upload_space(state, largest.unwrap_or(0)).await;
+    }
     let source = import_dir(&state.upload_dir, import.id).join(SOURCE_OVA);
     if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
         return Err(ApiError::conflict(
@@ -904,6 +911,37 @@ async fn check_extract_space(
     check_upload_space(state, largest).await
 }
 
+/// 이 노드의 ESXi 가져오기인데 메모리에 자격 증명이 없으면(opld가 다시 시작했다) 가져오기를 `failed`로
+/// 바꾸고 409 `import_failed`. 다시 실행해도 소용없으므로 Task를 만들지 않는다. 다른 노드의 것은 그
+/// 노드의 Task가 본다.
+async fn check_credentials(state: &AppState, import: &VmImport) -> Result<(), ApiError> {
+    if !matches!(import.spec.source, ImportSource::Esxi(_))
+        || import.spec.node != state.node
+        || state.import_credentials.get(import.id).is_some()
+    {
+        return Ok(());
+    }
+    let status = VmImportStatus {
+        phase: ImportPhase::Failed,
+        error: Some(CREDENTIALS_LOST.into()),
+        ..import.status.clone()
+    };
+    if let Err(e) = state
+        .cluster
+        .update_status_checked::<VmImportSpec>(import.id, import.revision, &status)
+        .await
+    {
+        tracing::warn!(import = %import.name, error = %e, "cannot record the import state");
+    }
+    Err(ApiError::conflict(
+        "import_failed",
+        format!(
+            "vm-import {:?} cannot be run: {CREDENTIALS_LOST}",
+            import.name
+        ),
+    ))
+}
+
 /// `ready` 가져오기를 `run`의 값으로 실행할 Task를 돌려준다(202). Task는 원본이 있는 노드에서 돌고, 대상은
 /// 미리 정한 새 VM id다. 실행 Task가 끝나지 않았으면 409 `import_busy`, 이미 가져왔으면 `import_done`(끝난 실행
 /// Task가 VM을 만들었으면 가져오기를 `done`으로 끝내고), 원본을 쓸 수
@@ -911,7 +949,7 @@ async fn check_extract_space(
 /// 네트워크로 매핑해야 하고(400), VM 이름과 볼륨 이름 `{name}-disk{i}`가 비어 있어야 한다(409
 /// `name_taken`). 풀은 원본 노드에서 쓸 수 있어야 하고(409 `pool_not_on_node`·`pool_unavailable`), 결과
 /// VM 스펙은 VM 만들기의 검증을 통과해야 한다(400). 원본 MAC을 쓰면 다른 VM과 겹치지 않아야 한다(409
-/// `mac_in_use`). 원본이 이 노드에 있으면 가장 큰 디스크를 추출할 여유도 본다(507).
+/// `mac_in_use`). 원본이 이 노드에 있으면 가장 큰 디스크를 추출하거나 받을 여유도 본다(507).
 #[utoipa::path(post, path = "/vm-imports/{key}/run", tag = "vm-imports",
     params(("key" = String, Path, description = "id or name")),
     request_body = ImportRun,
@@ -949,6 +987,7 @@ pub async fn run_import(
         }
     }
     check_online(&state, import.spec.node)?;
+    check_credentials(&state, &import).await?;
     let (Some(src), Some(proposal)) = (&import.status.source_vm, &import.status.proposal) else {
         return Err(ApiError::conflict(
             "import_failed",

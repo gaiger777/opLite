@@ -657,7 +657,7 @@ export interface paths {
          *     네트워크로 매핑해야 하고(400), VM 이름과 볼륨 이름 `{name}-disk{i}`가 비어 있어야 한다(409
          *     `name_taken`). 풀은 원본 노드에서 쓸 수 있어야 하고(409 `pool_not_on_node`·`pool_unavailable`), 결과
          *     VM 스펙은 VM 만들기의 검증을 통과해야 한다(400). 원본 MAC을 쓰면 다른 VM과 겹치지 않아야 한다(409
-         *     `mac_in_use`). 원본이 이 노드에 있으면 가장 큰 디스크를 추출할 여유도 본다(507).
+         *     `mac_in_use`). 원본이 이 노드에 있으면 가장 큰 디스크를 추출하거나 받을 여유도 본다(507).
          */
         post: operations["run_import"];
         delete?: never;

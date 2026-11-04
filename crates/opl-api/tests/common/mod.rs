@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openraft::{BasicNode, ServerState};
+use opl_api::vm_imports::ImportCredentials;
 use opl_api::{AppState, TaskRunner, TaskRunnerConfig, hash_password};
 use opl_cluster::memnet::MemRouter;
 use opl_cluster::types::NodeId;
@@ -159,20 +160,21 @@ impl Env {
         let hv_dyn: Arc<dyn Hypervisor> = hv.clone();
         let reconciler = Reconciler::spawn(cluster.clone(), hv_dyn.clone(), rc);
         let storage: Arc<dyn Storage> = Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT));
+        // opld처럼 API와 Task 실행기가 ESXi 자격 증명을 함께 쓴다.
+        let credentials: Arc<ImportCredentials> = Arc::default();
+        let mut config = runner_config(node, dir.path());
+        config.import_credentials = credentials.clone();
         let runner = TaskRunner::spawn(
             cluster.clone(),
             storage,
             hv_dyn.clone(),
             reconciler.handle(),
-            runner_config(node, dir.path()),
+            config,
         )
         .await;
-        let state = Arc::new(AppState::new(
-            cluster.clone(),
-            node,
-            hv_dyn,
-            dir.path().join("uploads"),
-        ));
+        let mut state = AppState::new(cluster.clone(), node, hv_dyn, dir.path().join("uploads"));
+        state.import_credentials = credentials;
+        let state = Arc::new(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let app = opl_api::router(state.clone());
@@ -255,6 +257,7 @@ impl Env {
         tweak: impl FnOnce(&mut TaskRunnerConfig),
     ) {
         let mut config = runner_config(self.node, self.dir.path());
+        config.import_credentials = self.state.import_credentials.clone();
         tweak(&mut config);
         self.runner = Some(
             TaskRunner::spawn(

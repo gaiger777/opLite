@@ -1,17 +1,20 @@
 //! VM 가져오기 Task와 가져오기 지우기 Task: Mock 하이퍼바이저와 dir 풀로, 시험에서 `qemu-img`로 만든
 //! streamOptimized VMDK를 담은 OVA를 가져와 꺼진 VM과 볼륨을 만든다. `.mf` 해시가 다르거나 VM을 만들지
-//! 못하면 만든 볼륨을 지우고 가져오기를 `ready`로 되돌리며, 고친 값으로 다시 실행할 수 있다.
+//! 못하면 만든 볼륨을 지우고 가져오기를 `ready`로 되돌리며, 고친 값으로 다시 실행할 수 있다. ESXi
+//! 가져오기는 가짜 ESXi에서 extent를 받아 같은 일을 한다.
 //! qemu-img와 qemu-io가 필요하다.
 //! `cargo test -p opl-api --features storage-it --test vm_import_tasks`
 #![cfg(feature = "storage-it")]
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::esxi::MockEsxi;
 use common::ustar::{Header, Tar};
 use common::{Client, Env, MOUNT_ROOT};
 use opl_driver::DirStorage;
@@ -453,4 +456,191 @@ async fn extract_needs_space_in_the_upload_directory() {
     assert_eq!(failed.status.phase, ImportPhase::Ready);
     assert!(get_volume(&env, "web-disk0").is_none());
     assert_eq!(source_files(&env, &failed), ["source.ova"]);
+}
+
+// --- ESXi에서 바로 가져오기 ---
+
+const ESXI_USER: &str = "root";
+const ESXI_PASSWORD: &str = "S3cret-esxi-pw";
+const ESXI_MAC: &str = "00:50:56:aa:bb:cc";
+const CREDENTIALS_LOST: &str = "the ESXi credentials are no longer on this node (opld restarted or the request was interrupted); create the import again";
+
+/// 2 vCPU(소켓당 코어 2), 1024 MiB, efi, Linux, SCSI 디스크 `web01.vmdk`, "VM Network"의 vmxnet3 NIC
+/// 하나([`ESXI_MAC`])
+const WEB01_VMX: &str = r#".encoding = "UTF-8"
+displayName = "web01"
+guestOS = "ubuntu-64"
+numvcpus = "2"
+cpuid.coresPerSocket = "2"
+memSize = "1024"
+firmware = "efi"
+scsi0.present = "TRUE"
+scsi0.virtualDev = "pvscsi"
+scsi0:0.present = "TRUE"
+scsi0:0.fileName = "web01.vmdk"
+ethernet0.present = "TRUE"
+ethernet0.networkName = "VM Network"
+ethernet0.virtualDev = "vmxnet3"
+ethernet0.addressType = "static"
+ethernet0.address = "00:50:56:aa:bb:cc"
+"#;
+
+/// 데이터스토어 `datastore1`의 VM `web01`: 디스크립터는 4 MiB(8192 섹터) VMFS 디스크이고, extent
+/// `web01-flat.vmdk`는 처음 64 KiB가 `0xaa`, 1 MiB부터 64 KiB가 `0x5a`인 `flat_len` 바이트의 raw다.
+async fn web01_esxi(flat_len: usize) -> MockEsxi {
+    let mut flat = vec![0u8; flat_len];
+    flat[..64 << 10].fill(0xaa);
+    flat[MIB as usize..(MIB as usize + (64 << 10))].fill(0x5a);
+    let descriptor = "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\n\
+                      createType=\"vmfs\"\n\n# Extent description\nRW 8192 VMFS \"web01-flat.vmdk\"\n";
+    let files = BTreeMap::from([
+        ("datastore1/web01/web01.vmx".to_string(), WEB01_VMX.into()),
+        ("datastore1/web01/web01.vmdk".to_string(), descriptor.into()),
+        ("datastore1/web01/web01-flat.vmdk".to_string(), flat),
+    ]);
+    MockEsxi::start(files, ESXI_USER, ESXI_PASSWORD).await
+}
+
+/// 가짜 ESXi의 `web01`로 가져오기 `web`을 만든다.
+async fn create_esxi(admin: &Client, esxi: &MockEsxi) -> VmImport {
+    let body = json!({
+        "name": "web",
+        "connection": {
+            "host": esxi.addr.ip().to_string(),
+            "port": esxi.addr.port(),
+            "user": ESXI_USER,
+            "password": ESXI_PASSWORD,
+            "fingerprint": esxi.fingerprint,
+        },
+        "datastore": "datastore1",
+        "vmx": "web01/web01.vmx",
+    });
+    let (status, body) = admin.post("/vm-imports/esxi", body).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    serde_json::from_value(body).unwrap()
+}
+
+/// ESXi 가져오기는 extent를 HTTPS로 받아(기본 인증) raw로 볼륨에 옮기고, 제안대로 원본 MAC을 쓰는 꺼진
+/// VM을 만든다. 끝나면 가져오기는 `done`이고, 받은 파일과 메모리의 자격 증명은 없다.
+#[tokio::test]
+async fn imports_from_esxi_into_a_stopped_vm() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let esxi = web01_esxi(4 * MIB as usize).await;
+    let created = create_esxi(&admin, &esxi).await;
+    assert!(env.state.import_credentials.get(created.id).is_some());
+
+    let task = run(&admin, run_request()).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let vm = get_vm(&env, "web").unwrap();
+    let spec = &vm.spec;
+    assert_eq!((spec.cpu.sockets, spec.cpu.cores), (1, 2));
+    assert_eq!(spec.memory_mib, 1024);
+    assert_eq!(spec.firmware, Firmware::Uefi);
+    assert_eq!(spec.power, PowerState::Stopped);
+    assert_eq!(spec.disks.len(), 1);
+    assert_eq!(spec.disks[0].volume, "web-disk0");
+    assert_eq!(spec.disks[0].bus, DiskBus::VirtioBlk);
+    assert_eq!(spec.nics[0].network, "lan");
+    assert_eq!(spec.nics[0].model, NicModel::Virtio);
+    assert_eq!(
+        spec.nics[0].mac.map(|m| m.to_string()).as_deref(),
+        Some(ESXI_MAC)
+    );
+
+    let volume = get_volume(&env, "web-disk0").unwrap();
+    assert_eq!(volume.spec.size_bytes, 4 * MIB);
+    assert_eq!(volume.status.phase, VolumePhase::Ready);
+    let path = pool_dir(&env).join(format!("{}.qcow2", volume.id));
+    assert!(qemu_io(&path, "qcow2", "read -P 0xaa 0 64k"));
+    assert!(qemu_io(&path, "qcow2", "read -P 0x5a 1M 64k"));
+    assert!(qemu_io(&path, "qcow2", "read -P 0 2M 64k"));
+
+    let done = import(&env).unwrap();
+    assert_eq!(done.status.phase, ImportPhase::Done);
+    assert_eq!(done.status.vm, Some(vm.id));
+    assert!(source_files(&env, &done).is_empty());
+    assert!(env.state.import_credentials.get(done.id).is_none());
+
+    // extent를 기본 인증으로 받았다.
+    let flat = esxi
+        .requests()
+        .into_iter()
+        .find(|r| r.path == "/folder/web01/web01-flat.vmdk")
+        .unwrap();
+    assert_eq!(flat.method, "GET");
+    assert!(flat.query.contains("dsName=datastore1"), "{}", flat.query);
+    assert!(flat.authorization.unwrap().starts_with("Basic "));
+}
+
+/// 받은 extent의 길이가 디스크립터의 크기와 다르면 실행은 실패한다: 볼륨과 받은 파일을 남기지 않고
+/// 가져오기는 `ready`로 돌아가 이유를 남긴다. 자격 증명은 남아 다시 실행할 수 있고, 가져오기를 지우면
+/// 메모리에서도 지운다.
+#[tokio::test]
+async fn esxi_download_of_the_wrong_length_fails_and_leaves_no_volumes() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let esxi = web01_esxi(3 * MIB as usize).await;
+    let created = create_esxi(&admin, &esxi).await;
+
+    let task = run(&admin, run_request()).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert_eq!(
+        error,
+        "cannot import disk \"disk0\": downloaded 3145728 bytes of [datastore1] \
+         web01/web01-flat.vmdk, expected 4194304"
+    );
+    let failed = import(&env).unwrap();
+    assert_eq!(failed.status.phase, ImportPhase::Ready);
+    assert_eq!(failed.status.error.as_deref(), Some(error));
+    assert!(get_vm(&env, "web").is_none());
+    assert!(get_volume(&env, "web-disk0").is_none());
+    let left: Vec<_> = std::fs::read_dir(pool_dir(&env)).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+    assert!(source_files(&env, &failed).is_empty());
+    assert!(env.state.import_credentials.get(created.id).is_some());
+
+    let (status, task) = admin.delete("/vm-imports/web").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert!(import(&env).is_none());
+    assert!(env.state.import_credentials.is_empty());
+}
+
+/// Task가 시작할 때 메모리에 자격 증명이 없으면(실행 요청을 받은 뒤 opld가 다시 시작했다) 실행은 실패하고
+/// 가져오기는 `failed`다. 다시 실행해도 소용없으므로 실행 API는 409 `import_failed`.
+#[tokio::test]
+async fn esxi_import_without_credentials_fails() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let esxi = web01_esxi(4 * MIB as usize).await;
+    let created = create_esxi(&admin, &esxi).await;
+    // 실행 API는 자격 증명이 있을 때 Task를 만든다. Task가 시작하기 전에 자격 증명을 잃는다.
+    env.stop_runner().await;
+    let (status, task) = admin.post("/vm-imports/web/run", run_request()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    env.state.import_credentials.remove(created.id);
+    env.start_runner().await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(task["status"]["error"], CREDENTIALS_LOST);
+    let failed = import(&env).unwrap();
+    assert_eq!(failed.status.phase, ImportPhase::Failed);
+    assert_eq!(failed.status.error.as_deref(), Some(CREDENTIALS_LOST));
+    assert!(get_volume(&env, "web-disk0").is_none());
+    assert!(
+        !esxi
+            .requests()
+            .iter()
+            .any(|r| r.path.ends_with("-flat.vmdk"))
+    );
+
+    let (status, body) = admin.post("/vm-imports/web/run", run_request()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "import_failed");
 }
