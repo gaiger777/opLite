@@ -9,7 +9,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use crate::client::{BACKUP_WAIT, Client, IMPORT_WAIT, MIGRATE_WAIT, fetch_ca, fingerprint, local};
+use crate::client::{
+    ApiError, BACKUP_WAIT, Client, IMPORT_WAIT, MIGRATE_WAIT, fetch_ca, fingerprint, local,
+};
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
 
@@ -81,7 +83,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BackupJobCmd,
     },
-    /// 다른 하이퍼바이저(VMware)에서 내보낸 VM(OVA) 가져오기
+    /// 다른 하이퍼바이저(VMware)의 VM 가져오기(OVA, ESXi·vCenter)
     Import {
         #[command(subcommand)]
         cmd: ImportCmd,
@@ -1148,6 +1150,31 @@ enum ImportCmd {
         #[arg(long)]
         name: String,
     },
+    /// ESXi·vCenter의 데이터스토어에 있는 VM을 보인다. 비밀번호는 `--password-file`이나
+    /// `OPL_ESXI_PASSWORD`에서, 없으면 터미널에서 묻는다. 지문을 주지 않으면 서버 인증서의 지문을 알려 준다.
+    EsxiBrowse {
+        #[command(flatten)]
+        conn: EsxiArgs,
+        /// 믿을 서버 인증서의 SHA-256 지문
+        #[arg(long)]
+        fingerprint: Option<String>,
+    },
+    /// ESXi·vCenter의 꺼진 VM을 읽어 VM 설정을 제안받는다. 비밀번호는 `esxi-browse`처럼 받고 연결을
+    /// 받은 노드의 메모리에만 남으므로, 그 opld를 다시 시작하면 가져오기를 다시 만들어야 한다.
+    Esxi {
+        /// 가져오기 이름
+        name: String,
+        #[command(flatten)]
+        conn: EsxiArgs,
+        /// 믿을 서버 인증서의 SHA-256 지문(`import esxi-browse`가 알려 준다)
+        #[arg(long)]
+        fingerprint: String,
+        #[arg(long)]
+        datastore: String,
+        /// 데이터스토어 안의 `.vmx` 경로(예: `web01/web01.vmx`)
+        #[arg(long)]
+        vmx: String,
+    },
     List,
     /// 원본 VM, 제안, 경고, 마지막 실행의 오류
     Get {
@@ -1162,6 +1189,55 @@ enum ImportCmd {
         #[arg(long)]
         force: bool,
     },
+}
+
+/// ESXi·vCenter 연결. 비밀번호는 인자로 받지 않는다.
+#[derive(Args)]
+struct EsxiArgs {
+    /// ESXi 호스트나 vCenter 주소
+    #[arg(long)]
+    host: String,
+    #[arg(long, default_value_t = 443)]
+    port: u16,
+    #[arg(long)]
+    user: String,
+    /// vCenter면 데이터센터 이름
+    #[arg(long, default_value = "ha-datacenter")]
+    datacenter: String,
+    /// 비밀번호가 든 파일. 없으면 `OPL_ESXI_PASSWORD`, 그것도 없으면 터미널에서 묻는다.
+    #[arg(long)]
+    password_file: Option<PathBuf>,
+}
+
+/// ESXi 비밀번호. `--password-file`, `OPL_ESXI_PASSWORD` 순서로 보고, 둘 다 없으면 터미널에서 묻는다.
+fn esxi_password(conn: &EsxiArgs) -> anyhow::Result<String> {
+    if let Some(file) = &conn.password_file {
+        return read_password(Some(file), "");
+    }
+    match std::env::var("OPL_ESXI_PASSWORD") {
+        Ok(password) => Ok(password),
+        Err(_) => Ok(rpassword::prompt_password(format!(
+            "password for {}@{}: ",
+            conn.user, conn.host
+        ))?),
+    }
+}
+
+/// API의 `EsxiConnection`
+fn esxi_connection(conn: &EsxiArgs, fingerprint: Option<&str>, password: &str) -> Value {
+    json!({
+        "host": conn.host,
+        "port": conn.port,
+        "user": conn.user,
+        "password": password,
+        "datacenter": conn.datacenter,
+        "fingerprint": fingerprint,
+    })
+}
+
+/// `import esxi`의 요청 본문
+fn esxi_import_body(name: &str, connection: &Value, datastore: &str, vmx: &str) -> Value {
+    json!({ "name": name, "connection": connection, "datastore": datastore, "vmx": vmx })
 }
 
 #[derive(Args)]
@@ -1982,6 +2058,23 @@ async fn import(
                 "vm-import {name} uploaded; review it with `oplctl import get {name}`"
             )?;
         }
+        ImportCmd::EsxiBrowse { conn, fingerprint } => {
+            let password = esxi_password(&conn)?;
+            let connection = esxi_connection(&conn, fingerprint.as_deref(), &password);
+            esxi_browse(client, &connection, json_out, out).await?;
+        }
+        ImportCmd::Esxi {
+            name,
+            conn,
+            fingerprint,
+            datastore,
+            vmx,
+        } => {
+            let password = esxi_password(&conn)?;
+            let connection = esxi_connection(&conn, Some(&fingerprint), &password);
+            let body = esxi_import_body(&name, &connection, &datastore, &vmx);
+            esxi_create(client, &body, out).await?;
+        }
         ImportCmd::List => {
             let list = client.get("/vm-imports").await?;
             let (nodes, vms) = if json_out {
@@ -2042,6 +2135,116 @@ async fn import(
     Ok(())
 }
 
+/// ESXi 연결 오류. 믿을 지문이 없으면 서버 인증서의 지문을 확인하고 다시 하라고 알린다.
+fn esxi_error(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<ApiError>() {
+        Some(api) if api.code == "untrusted_certificate" => {
+            let fingerprint = cell(&api.details["fingerprint"]);
+            anyhow::anyhow!(
+                "the ESXi certificate fingerprint is {fingerprint}; check it and rerun with --fingerprint {fingerprint}"
+            )
+        }
+        _ => e,
+    }
+}
+
+/// `import esxi-browse`: 데이터스토어마다 VM 표
+async fn esxi_browse(
+    client: &Client,
+    connection: &Value,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let got = client
+        .post("/vm-imports/esxi/browse", connection)
+        .await
+        .map_err(esxi_error)?;
+    if json_out {
+        return Ok(print_json(out, &got)?);
+    }
+    let mut rows = Vec::new();
+    for ds in got["datastores"].as_array().into_iter().flatten() {
+        for vm in ds["vms"].as_array().into_iter().flatten() {
+            rows.push(esxi_vm_row(&ds["name"], vm));
+        }
+    }
+    table(out, ESXI_VM_HEADERS, &rows)?;
+    Ok(())
+}
+
+/// `import esxi-browse`의 열
+const ESXI_VM_HEADERS: &[&str] = &[
+    "DATASTORE",
+    "VMX",
+    "NAME",
+    "GUEST",
+    "CPU",
+    "MEMORY",
+    "DISKS",
+    "LOCKED",
+];
+
+/// `import esxi-browse`의 한 행. `.vmx`를 읽지 못한 VM은 NAME 자리에 오류를 보인다.
+fn esxi_vm_row(datastore: &Value, vm: &Value) -> Vec<String> {
+    let (name, guest, cpu, memory, disks) = match vm["error"].as_str() {
+        Some(error) => (
+            format!("error: {error}"),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+        ),
+        None => (
+            cell(&vm["name"]),
+            cell(&vm["guest_os"]),
+            cell(&vm["vcpus"]),
+            bytes(&vm["memory_mib"].as_u64().map(|m| m << 20).into()),
+            cell(&vm["disks"]),
+        ),
+    };
+    vec![
+        cell(datastore),
+        cell(&vm["vmx"]),
+        name,
+        guest,
+        cpu,
+        memory,
+        disks,
+        cell(&vm["locked"]),
+    ]
+}
+
+/// `import esxi`: 가져오기를 만든다.
+async fn esxi_create(
+    client: &Client,
+    body: &Value,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    client
+        .post("/vm-imports/esxi", body)
+        .await
+        .map_err(esxi_error)?;
+    writeln!(
+        out,
+        "vm-import {name} created; review it with `oplctl import get {name}`",
+        name = cell(&body["name"])
+    )?;
+    Ok(())
+}
+
+/// ESXi 원본의 표시(`esxi://호스트/데이터스토어/.vmx`). OVA 원본이면 `None`이다.
+fn esxi_source(i: &Value) -> Option<String> {
+    let esxi = &i["spec"]["source"]["esxi"];
+    esxi.is_object().then(|| {
+        format!(
+            "esxi://{}/{}/{}",
+            cell(&esxi["host"]),
+            cell(&esxi["datastore"]),
+            cell(&esxi["vmx"])
+        )
+    })
+}
+
 /// 목록에서 id가 `id`인 항목의 이름. 없으면 id다.
 fn name_of(list: &[Value], id: &Value) -> String {
     list.iter()
@@ -2053,11 +2256,13 @@ fn name_of(list: &[Value], id: &Value) -> String {
 const IMPORT_HEADERS: &[&str] = &["NAME", "NODE", "SOURCE", "PHASE", "VM"];
 
 /// `import list`의 한 행. SOURCE는 원본 VM 이름이고, 원본을 읽지 못했으면 올린 파일 이름이다.
+/// ESXi 원본이면 `esxi://호스트/데이터스토어/.vmx`다.
 fn import_row(i: &Value, nodes: &[Value], vms: &[Value]) -> Vec<String> {
     let status = &i["status"];
-    let source = match status["source_vm"]["name"].as_str() {
-        Some(name) => name.to_string(),
-        None => cell(&i["spec"]["source"]["ova"]["file_name"]),
+    let source = match (esxi_source(i), status["source_vm"]["name"].as_str()) {
+        (Some(esxi), _) => esxi,
+        (None, Some(name)) => name.to_string(),
+        (None, None) => cell(&i["spec"]["source"]["ova"]["file_name"]),
     };
     vec![
         cell(&i["name"]),
@@ -2079,12 +2284,15 @@ fn print_import(
     let status = &i["status"];
     writeln!(out, "vm-import: {}", cell(&i["name"]))?;
     writeln!(out, "node: {}", name_of(nodes, &i["spec"]["node"]))?;
-    writeln!(
-        out,
-        "source: {} ({})",
-        cell(&ova["file_name"]),
-        bytes(&ova["size_bytes"])
-    )?;
+    match esxi_source(i) {
+        Some(esxi) => writeln!(out, "source: {esxi}")?,
+        None => writeln!(
+            out,
+            "source: {} ({})",
+            cell(&ova["file_name"]),
+            bytes(&ova["size_bytes"])
+        )?,
+    }
     writeln!(out, "phase: {}", cell(&status["phase"]))?;
     if !status["vm"].is_null() {
         writeln!(out, "vm: {}", name_of(vms, &status["vm"]))?;
@@ -4321,6 +4529,13 @@ mod tests {
     async fn fake_api(
         reply: fn(&str) -> Value,
     ) -> (Client, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        fake_api_status(move |path| (200, reply(path))).await
+    }
+
+    /// `fake_api`와 같고 응답 상태 코드도 정한다.
+    async fn fake_api_status(
+        reply: impl Fn(&str) -> (u16, Value) + Send + 'static,
+    ) -> (Client, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -4335,9 +4550,10 @@ mod tests {
                 let line = head.lines().next().unwrap_or("").to_string();
                 let path = line.split(' ').nth(1).unwrap_or("").to_string();
                 log.lock().unwrap().push(line);
-                let body = reply(&path).to_string();
+                let (status, body) = reply(&path);
+                let body = body.to_string();
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 sock.write_all(resp.as_bytes()).await.unwrap();
@@ -5479,6 +5695,244 @@ warnings:
             ]
         );
         assert_eq!(String::from_utf8(out).unwrap(), "vm-import web01 deleted\n");
+    }
+
+    #[test]
+    fn parses_import_esxi_commands() {
+        let ImportCmd::EsxiBrowse { conn, fingerprint } =
+            parse_import(&["esxi-browse", "--host", "esx1", "--user", "root"]).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(fingerprint, None);
+        // 포트와 데이터센터는 ESXi 기본값이다.
+        assert_eq!(
+            esxi_connection(&conn, fingerprint.as_deref(), "secret"),
+            json!({
+                "host": "esx1", "port": 443, "user": "root", "password": "secret",
+                "datacenter": "ha-datacenter", "fingerprint": null
+            })
+        );
+        let ImportCmd::Esxi {
+            name,
+            conn,
+            fingerprint,
+            datastore,
+            vmx,
+        } = parse_import(&[
+            "esxi",
+            "web01",
+            "--host",
+            "vc1",
+            "--port",
+            "8443",
+            "--user",
+            "admin@vsphere.local",
+            "--datacenter",
+            "DC1",
+            "--datastore",
+            "datastore1",
+            "--vmx",
+            "web01/web01.vmx",
+            "--fingerprint",
+            "AB:CD",
+        ])
+        .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            esxi_import_body(
+                &name,
+                &esxi_connection(&conn, Some(&fingerprint), "pw"),
+                &datastore,
+                &vmx
+            ),
+            json!({
+                "name": "web01",
+                "connection": {
+                    "host": "vc1", "port": 8443, "user": "admin@vsphere.local", "password": "pw",
+                    "datacenter": "DC1", "fingerprint": "AB:CD"
+                },
+                "datastore": "datastore1",
+                "vmx": "web01/web01.vmx"
+            })
+        );
+        // 만들기에는 지문·데이터스토어·.vmx가 꼭 있어야 하고, 비밀번호는 인자로 받지 않는다.
+        let full = [
+            "esxi",
+            "web01",
+            "--host",
+            "esx1",
+            "--user",
+            "root",
+            "--datastore",
+            "ds",
+            "--vmx",
+            "a/a.vmx",
+            "--fingerprint",
+            "AB",
+        ];
+        assert!(parse_import(&full).is_ok());
+        for skip in ["--datastore", "--vmx", "--fingerprint", "--host", "--user"] {
+            let i = full.iter().position(|a| *a == skip).unwrap();
+            let args: Vec<&str> = full[..i].iter().chain(&full[i + 2..]).copied().collect();
+            assert!(parse_import(&args).is_err(), "{args:?}");
+        }
+        let mut with_password = full.to_vec();
+        with_password.extend(["--password", "x"]);
+        assert!(parse_import(&with_password).is_err());
+        assert!(parse_import(&["esxi-browse", "--host", "esx1"]).is_err());
+
+        // 비밀번호 파일(끝의 줄바꿈은 뺀다)
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("esxi-password");
+        std::fs::write(&file, "VMware1!\n").unwrap();
+        let mut with_file = full.to_vec();
+        with_file.extend(["--password-file", file.to_str().unwrap()]);
+        let ImportCmd::Esxi { conn, .. } = parse_import(&with_file).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(esxi_password(&conn).unwrap(), "VMware1!");
+    }
+
+    fn sample_browse() -> Value {
+        json!({
+            "datastores": [
+                {
+                    "name": "datastore1",
+                    "vms": [
+                        {
+                            "vmx": "web01/web01.vmx", "name": "web01", "guest_os": "ubuntu-64",
+                            "vcpus": 2, "memory_mib": 1024, "disks": 1, "locked": false, "error": null
+                        },
+                        {
+                            "vmx": "db/db.vmx", "name": "db", "guest_os": "", "vcpus": 0,
+                            "memory_mib": 0, "disks": 0, "locked": true,
+                            "error": "memsize is missing"
+                        }
+                    ]
+                },
+                { "name": "empty", "vms": [] }
+            ]
+        })
+    }
+
+    /// `import esxi-browse`는 연결을 보내고 데이터스토어의 VM을 표로 보인다. 읽지 못한 VM은 NAME
+    /// 자리에 오류를 보인다.
+    #[tokio::test]
+    async fn import_esxi_browse_shows_the_vms() {
+        let (client, seen) = fake_api(|_| sample_browse()).await;
+        let mut out = Vec::new();
+        let conn = json!({ "host": "esx1" });
+        esxi_browse(&client, &conn, false, &mut out).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["POST /api/v1/vm-imports/esxi/browse HTTP/1.1"]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\
+DATASTORE   VMX              NAME                       GUEST      CPU  MEMORY  DISKS  LOCKED
+datastore1  web01/web01.vmx  web01                      ubuntu-64  2    1.0GiB  1      false
+datastore1  db/db.vmx        error: memsize is missing  -          -    -       -      true
+"
+        );
+        // --json이면 응답 그대로
+        let mut out = Vec::new();
+        esxi_browse(&client, &conn, true, &mut out).await.unwrap();
+        let printed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed, sample_browse());
+    }
+
+    /// 지문을 주지 않았거나(409 `untrusted_certificate`) 틀리면 서버 인증서의 지문으로 다시 하라고 알린다.
+    #[tokio::test]
+    async fn import_esxi_explains_an_untrusted_certificate() {
+        let (client, _) = fake_api_status(|_| {
+            (
+                409,
+                json!({
+                    "code": "untrusted_certificate",
+                    "message": "verify the ESXi certificate fingerprint",
+                    "details": { "fingerprint": "AB:CD:EF" }
+                }),
+            )
+        })
+        .await;
+        let conn = json!({ "host": "esx1" });
+        let err = esxi_browse(&client, &conn, false, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the ESXi certificate fingerprint is AB:CD:EF; check it and rerun with --fingerprint AB:CD:EF"
+        );
+        let body = esxi_import_body("web01", &conn, "ds", "a/a.vmx");
+        let err = esxi_create(&client, &body, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the ESXi certificate fingerprint is AB:CD:EF; check it and rerun with --fingerprint AB:CD:EF"
+        );
+        // 다른 오류는 서버의 메시지와 코드 그대로
+        let (client, _) = fake_api_status(|_| {
+            (
+                400,
+                json!({ "code": "esxi_auth", "message": "ESXi rejected the user name or password" }),
+            )
+        })
+        .await;
+        let err = esxi_browse(&client, &conn, false, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ESXi rejected the user name or password (esxi_auth)"
+        );
+    }
+
+    /// `import esxi`는 가져오기를 만들고 검토 명령을 알린다.
+    #[tokio::test]
+    async fn import_esxi_creates_the_import() {
+        let (client, seen) = fake_api(|_| json!({ "name": "web01" })).await;
+        let mut out = Vec::new();
+        let body = esxi_import_body("web01", &json!({}), "ds", "a/a.vmx");
+        esxi_create(&client, &body, &mut out).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["POST /api/v1/vm-imports/esxi HTTP/1.1"]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm-import web01 created; review it with `oplctl import get web01`\n"
+        );
+    }
+
+    fn sample_esxi_import() -> Value {
+        let mut i = sample_import();
+        i["spec"]["source"] = json!({ "esxi": {
+            "host": "esx1.example.com", "port": 443, "datacenter": "ha-datacenter",
+            "datastore": "datastore1", "vmx": "web01/web01.vmx", "user": "root",
+            "fingerprint": "AB:CD"
+        } });
+        i
+    }
+
+    /// ESXi에서 가져오면 SOURCE는 `esxi://호스트/데이터스토어/.vmx`다.
+    #[test]
+    fn import_list_and_get_show_an_esxi_source() {
+        let url = "esxi://esx1.example.com/datastore1/web01/web01.vmx";
+        assert_eq!(import_row(&sample_esxi_import(), &[], &[])[2], url);
+        let mut out = Vec::new();
+        print_import(&mut out, &sample_esxi_import(), &[], &[]).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with(&format!(
+                "vm-import: web01\nnode: n-1\nsource: {url}\nphase: ready\n"
+            )),
+            "{text}"
+        );
     }
 
     #[test]

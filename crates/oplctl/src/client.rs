@@ -31,6 +31,22 @@ const CA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// CA를 받는 요청 전체의 제한 시간. 응답하지 않는 서버에서 `login`이 멈추지 않게 한다.
 const CA_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// API 오류 응답. 보일 때는 `메시지 (코드)`이고, 명령이 코드와 `details`를 보고 더 알릴 수 있다.
+#[derive(Debug)]
+pub struct ApiError {
+    pub code: String,
+    pub message: String,
+    pub details: Value,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
 #[derive(Clone)]
 pub struct Client {
     pub base: String,
@@ -86,7 +102,12 @@ impl Client {
             bail!("not logged in or the token is no longer valid; run `oplctl login`");
         }
         match (body["message"].as_str(), body["code"].as_str()) {
-            (Some(message), Some(code)) => bail!("{message} ({code})"),
+            (Some(message), Some(code)) => Err(ApiError {
+                code: code.into(),
+                message: message.into(),
+                details: body["details"].clone(),
+            }
+            .into()),
             _ => bail!("{status}: {body}"),
         }
     }
