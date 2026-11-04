@@ -240,14 +240,34 @@ pub fn vmx_to_source(
     let mut nics = Vec::new();
     for n in ethernets {
         let get = |key: &str| vmx.get(&format!("ethernet{n}.{key}"));
-        let network =
-            get("networkName").ok_or_else(|| invalid(format!("ethernet{n} has no networkName")))?;
+        // vCenter 분산 스위치의 NIC는 `networkName` 대신 포트 그룹을 적는다.
+        let network = match (get("networkName"), get("dvs.portgroupId")) {
+            (Some(network), _) => network.to_string(),
+            (None, Some(id)) => {
+                warn(format!(
+                    "ethernet{n} is on a distributed switch; map its network when running the import"
+                ));
+                get("dvs.portgroupName")
+                    .filter(|name| !name.is_empty())
+                    .map_or_else(|| format!("dvs:{id}"), str::to_string)
+            }
+            // NSX 네트워크의 NIC는 불투명 네트워크 id만 적는다.
+            (None, None) => match get("opaqueNetwork.id") {
+                Some(id) => {
+                    warn(format!(
+                        "ethernet{n} is on an NSX network; map its network when running the import"
+                    ));
+                    format!("nsx:{id}")
+                }
+                None => return Err(invalid(format!("ethernet{n} has no networkName"))),
+            },
+        };
         let mac = match get("addressType") {
             Some(t) if t.eq_ignore_ascii_case("static") => get("address"),
             _ => get("generatedAddress"),
         };
         nics.push(SourceNic {
-            network: network.to_string(),
+            network,
             adapter: get("virtualDev").unwrap_or("e1000").to_ascii_lowercase(),
             mac: mac.and_then(|m| m.parse::<MacAddr>().ok()),
         });

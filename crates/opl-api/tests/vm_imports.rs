@@ -1,10 +1,12 @@
 //! VM 가져오기 API: OVA 올리기 사전 확인, 올리기(해석과 제안), 목록·읽기, 실행 요청의 검사, 지우기와
-//! 강제 지우기, 노드 시작 때의 정리.
+//! 강제 지우기, 노드 시작 때의 정리. ESXi 연결(browse)과 ESXi에서 가져오기 만들기.
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use common::esxi::MockEsxi;
 use common::ustar::Tar;
 use common::{Client, Env, vm_request};
 use opl_types::network::NetworkSpec;
@@ -13,7 +15,7 @@ use opl_types::resource::Resource;
 use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumeSpec};
 use opl_types::task::{TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm_import::{
-    ImportPhase, ImportSource, OvaSource, VmImport, VmImportSpec, VmImportStatus,
+    EsxiSource, ImportPhase, ImportSource, OvaSource, VmImport, VmImportSpec, VmImportStatus,
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -879,4 +881,616 @@ async fn startup_finishes_imports_whose_vm_was_made() {
                 .is_some()
         );
     }
+}
+
+// --- ESXi에서 바로 가져오기 ---
+
+const ESXI_USER: &str = "root";
+const ESXI_PASSWORD: &str = "S3cret-esxi-pw";
+/// 형식은 맞지만 가짜 ESXi의 것이 아닌 지문
+const OTHER_FINGERPRINT: &str = "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF";
+
+const WEB01_VMX: &str = r#".encoding = "UTF-8"
+displayName = "web01"
+guestOS = "ubuntu-64"
+numvcpus = "2"
+cpuid.coresPerSocket = "2"
+memSize = "1024"
+firmware = "efi"
+scsi0.present = "TRUE"
+scsi0.virtualDev = "pvscsi"
+scsi0:0.present = "TRUE"
+scsi0:0.fileName = "web01.vmdk"
+sata0.present = "TRUE"
+sata0:0.present = "TRUE"
+sata0:0.deviceType = "cdrom-image"
+sata0:0.fileName = "/vmfs/volumes/datastore1/iso/ubuntu.iso"
+ethernet0.present = "TRUE"
+ethernet0.networkName = "VM Network"
+ethernet0.virtualDev = "vmxnet3"
+ethernet0.addressType = "static"
+ethernet0.address = "00:50:56:aa:bb:cc"
+"#;
+
+fn descriptor(create_type: &str, extent: &str, extra: &str) -> Vec<u8> {
+    format!(
+        "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\n{extra}\
+         createType=\"{create_type}\"\n\n# Extent description\n{extent}\n\n\
+         # The Disk Data Base\nddb.adapterType = \"lsilogic\"\n"
+    )
+    .into_bytes()
+}
+
+/// 가짜 ESXi의 파일: 데이터스토어 둘, 켜진 VM(`web01`, 잠금 파일), 스냅샷이 있는 VM, `.vmx`를 읽을 수
+/// 없는 VM, 다른 데이터스토어에 디스크가 있는 VM, VM이 아닌 디렉터리.
+fn esxi_files() -> BTreeMap<String, Vec<u8>> {
+    let minimal = |name: &str, disk: &str| {
+        format!(
+            "displayName = \"{name}\"\nguestOS = \"windows2019srv-64\"\nmemSize = \"2048\"\n\
+             numvcpus = \"4\"\nscsi0:0.present = \"TRUE\"\nscsi0:0.fileName = \"{disk}\"\n"
+        )
+        .into_bytes()
+    };
+    BTreeMap::from([
+        ("datastore1/web01/web01.vmx".into(), WEB01_VMX.into()),
+        (
+            "datastore1/web01/web01.vmdk".into(),
+            descriptor("vmfs", "RW 8192 VMFS \"web01-flat.vmdk\"", ""),
+        ),
+        ("datastore1/web01/web01-flat.vmdk".into(), vec![0; 4096]),
+        ("datastore1/web01/web01.vmx.lck".into(), vec![]),
+        ("datastore1/web01/vmware.log".into(), b"log".to_vec()),
+        (
+            "datastore1/snap/snap.vmx".into(),
+            minimal("snap", "snap-000001.vmdk"),
+        ),
+        (
+            "datastore1/snap/snap-000001.vmdk".into(),
+            descriptor(
+                "vmfsSparse",
+                "RW 8192 VMFSSPARSE \"snap-000001-delta.vmdk\"",
+                "parentFileNameHint=\"snap.vmdk\"\n",
+            ),
+        ),
+        (
+            "datastore1/broken/broken.vmx".into(),
+            b"numvcpus = \"2\"\n".to_vec(),
+        ),
+        (
+            "datastore1/far/far.vmx".into(),
+            minimal("far", "/vmfs/volumes/datastore2/far/far.vmdk"),
+        ),
+        ("datastore1/iso/ubuntu.iso".into(), b"iso".to_vec()),
+        (
+            "datastore2/db01/db01.vmx".into(),
+            minimal("db01", "db01.vmdk"),
+        ),
+        (
+            "datastore2/db01/db01.vmdk".into(),
+            descriptor("monolithicFlat", "RW 2048 FLAT \"db01-flat.vmdk\" 0", ""),
+        ),
+    ])
+}
+
+async fn mock_esxi() -> MockEsxi {
+    MockEsxi::start(esxi_files(), ESXI_USER, ESXI_PASSWORD).await
+}
+
+/// 요청 본문의 연결(`EsxiConnection`은 직렬화하지 않으므로 JSON으로 만든다)
+fn connection(esxi: &MockEsxi, password: &str, fingerprint: Option<&str>) -> Value {
+    let mut conn = json!({
+        "host": esxi.addr.ip().to_string(),
+        "port": esxi.addr.port(),
+        "user": ESXI_USER,
+        "password": password,
+    });
+    if let Some(f) = fingerprint {
+        conn["fingerprint"] = json!(f);
+    }
+    conn
+}
+
+fn esxi_import(name: &str, conn: Value, datastore: &str, vmx: &str) -> Value {
+    json!({ "name": name, "connection": conn, "datastore": datastore, "vmx": vmx })
+}
+
+/// 지문이 없으면 409 `untrusted_certificate`와 서버 지문, 다르면 409 `fingerprint_mismatch`와 실제 지문.
+/// 둘 다 자격 증명을 보내기 전에 끊는다. 비밀번호가 틀리면 400 `esxi_auth`, 연결할 수 없으면 502
+/// `esxi_unreachable`.
+#[tokio::test]
+async fn browse_needs_a_trusted_fingerprint() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let esxi = mock_esxi().await;
+
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi/browse",
+            connection(&esxi, ESXI_PASSWORD, None),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "untrusted_certificate");
+    assert_eq!(body["message"], "verify the ESXi certificate fingerprint");
+    assert_eq!(body["details"], json!({ "fingerprint": esxi.fingerprint }));
+
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi/browse",
+            connection(&esxi, ESXI_PASSWORD, Some(OTHER_FINGERPRINT)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "fingerprint_mismatch");
+    assert_eq!(body["details"], json!({ "fingerprint": esxi.fingerprint }));
+    assert!(esxi.requests().is_empty(), "{:?}", esxi.requests());
+
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi/browse",
+            connection(&esxi, "wrong", Some(&esxi.fingerprint)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "esxi_auth");
+
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let mut conn = connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+    conn["port"] = json!(port);
+    let (status, body) = admin.post("/vm-imports/esxi/browse", conn).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["code"], "esxi_unreachable");
+
+    // 알 수 없는 필드는 받지 않는다.
+    let mut conn = connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+    conn["extra"] = json!(1);
+    let (status, body) = admin.post("/vm-imports/esxi/browse", conn).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // 모양이 틀린 지문은 연결하기 전에 400
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi/browse",
+            connection(&esxi, ESXI_PASSWORD, Some("AB:CD")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid fingerprint \"AB:CD\""),
+        "{body}"
+    );
+}
+
+/// 데이터스토어마다 맨 위 디렉터리의 `.vmx`를 읽어 요약한다. 잠금 파일이 있으면 `locked`, 읽을 수 없는
+/// `.vmx`는 그 VM의 `error`, `.vmx`가 없는 디렉터리는 뺀다. 지문은 대소문자·콜론 없이 적어도 된다.
+#[tokio::test]
+async fn browse_lists_vms_on_every_datastore() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let esxi = mock_esxi().await;
+    let loose = esxi.fingerprint.replace(':', "").to_lowercase();
+
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi/browse",
+            connection(&esxi, ESXI_PASSWORD, Some(&loose)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let vm = |vmx: &str, name: &str, guest: &str, cpus: u32, mem: u64, locked: bool| {
+        json!({
+            "vmx": vmx, "name": name, "guest_os": guest, "vcpus": cpus, "memory_mib": mem,
+            "disks": 1, "locked": locked, "error": null,
+        })
+    };
+    assert_eq!(
+        body,
+        json!({ "datastores": [
+            { "name": "datastore1", "vms": [
+                {
+                    "vmx": "broken/broken.vmx", "name": "broken", "guest_os": "", "vcpus": 0,
+                    "memory_mib": 0, "disks": 0, "locked": false,
+                    "error": "the .vmx has no memSize",
+                },
+                vm("far/far.vmx", "far", "windows2019srv-64", 4, 2048, false),
+                vm("snap/snap.vmx", "snap", "windows2019srv-64", 4, 2048, false),
+                vm("web01/web01.vmx", "web01", "ubuntu-64", 2, 1024, true),
+            ]},
+            { "name": "datastore2", "vms": [
+                vm("db01/db01.vmx", "db01", "windows2019srv-64", 4, 2048, false),
+            ]},
+        ]})
+    );
+
+    // 읽기 사용자는 ESXi에 연결할 수 없다.
+    let viewer = env.user("viewer", "viewer").await;
+    let (status, body) = viewer
+        .post(
+            "/vm-imports/esxi/browse",
+            connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// `.vmx`와 디스크립터를 읽어 원본 VM·제안·경고를 담은 `ready` 가져오기를 만든다. 원본에는 비밀번호가
+/// 없고(저장소 어디에도 없다), 자격 증명은 이 노드의 메모리에만 둔다.
+#[tokio::test]
+async fn creates_an_import_from_esxi() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let esxi = mock_esxi().await;
+
+    let conn = connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi",
+            esxi_import("web01", conn, "datastore1", "web01/web01.vmx"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["spec"]["node"], env.node.to_string());
+    assert_eq!(
+        body["spec"]["source"],
+        json!({ "esxi": {
+            "host": "127.0.0.1", "port": esxi.addr.port(), "datacenter": "ha-datacenter",
+            "datastore": "datastore1", "vmx": "web01/web01.vmx", "user": ESXI_USER,
+            "fingerprint": esxi.fingerprint,
+        }})
+    );
+    let st = &body["status"];
+    assert_eq!(st["phase"], "ready");
+    assert_eq!(
+        st["source_vm"],
+        json!({
+            "name": "web01", "guest_os": "ubuntu-64", "firmware": "uefi", "vcpus": 2,
+            "cores_per_socket": 2, "memory_mib": 1024,
+            "disks": [{
+                "name": "disk0", "file": "web01/web01-flat.vmdk",
+                "capacity_bytes": 8192 * 512, "controller": "scsi",
+            }],
+            "nics": [{ "network": "VM Network", "adapter": "vmxnet3", "mac": "00:50:56:aa:bb:cc" }],
+        })
+    );
+    assert_eq!(
+        st["proposal"],
+        json!({
+            "sockets": 1, "cores": 2, "memory_mib": 1024, "firmware": "uefi",
+            "disk_bus": "virtio-blk", "nic_model": "virtio",
+            "networks": { "VM Network": null },
+        })
+    );
+    let warnings: Vec<&str> = st["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        warnings[..2],
+        [
+            "the VM looks powered on (lock files found); power it off before importing",
+            "CD-ROM drive is not imported",
+        ]
+    );
+
+    // 비밀번호는 저장소의 어떤 리소스에도 없다.
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let (_, imports) = env.cluster.list::<VmImportSpec>().unwrap();
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    let stored = serde_json::to_string(&(imports, tasks)).unwrap();
+    assert!(!stored.contains(ESXI_PASSWORD), "{stored}");
+    let (_, read) = admin.get("/vm-imports/web01").await;
+    assert!(!read.to_string().contains(ESXI_PASSWORD), "{read}");
+    // 자격 증명은 이 노드의 메모리에(정규화한 지문과 함께)
+    let stored = env.state.import_credentials.get(id).unwrap();
+    assert_eq!(stored.password, ESXI_PASSWORD);
+    assert_eq!(
+        stored.fingerprint.as_deref(),
+        Some(esxi.fingerprint.as_str())
+    );
+    // ESXi 가져오기에는 원본 디렉터리가 없다(실행할 때 만든다).
+    assert!(import_dirs(&env).is_empty());
+
+    // 같은 이름은 409
+    let conn = connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi",
+            esxi_import("web01", conn, "datastore2", "db01/db01.vmx"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "name_taken");
+
+    // vCenter 모양(monolithicFlat)도 된다. 잠금 파일이 없으면 경고도 없다.
+    let conn = connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi",
+            esxi_import("db01", conn, "datastore2", "db01/db01.vmx"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["status"]["source_vm"]["disks"][0]["file"],
+        "db01/db01-flat.vmdk"
+    );
+    assert_eq!(
+        body["status"]["source_vm"]["disks"][0]["capacity_bytes"],
+        2048 * 512
+    );
+    assert!(
+        !body["status"]["warnings"]
+            .to_string()
+            .contains("lock files found")
+    );
+}
+
+/// 켜진 VM은 잠금 파일로 짐작한다: `.lck`로 끝나는 항목, 스왑 파일(`.vswp`, 켜진 VM만 가진다), NFS 잠금
+/// (`.lck-`로 시작). 일시 중단된 VM은 `.vmss`를 가진다. browse는 `locked`, 만들기는 경고. 디스크립터가 따로
+/// 없는 VMDK(크기 제한을 넘는 바이너리)는 400 "not a VMDK descriptor".
+#[tokio::test]
+async fn detects_powered_on_vms_and_disks_without_descriptors() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = |name: &str| {
+        let vmx = WEB01_VMX.replace("web01", name).into_bytes();
+        let descriptor = descriptor("vmfs", &format!("RW 8 VMFS \"{name}-flat.vmdk\""), "");
+        [
+            (format!("datastore1/{name}/{name}.vmx"), vmx),
+            (format!("datastore1/{name}/{name}.vmdk"), descriptor),
+            (format!("datastore1/{name}/{name}-flat.vmdk"), vec![0; 4096]),
+        ]
+    };
+    let mut files = BTreeMap::new();
+    for name in ["off", "swap", "nfs", "lockdir", "suspended", "sparse"] {
+        files.extend(vm(name));
+    }
+    files.insert("datastore1/swap/swap-3f1a2b.vswp".into(), vec![]);
+    files.insert("datastore1/nfs/.lck-0011223344556677".into(), vec![]);
+    files.insert("datastore1/lockdir/lockdir.vmx.lck/lock".into(), vec![]);
+    files.insert("datastore1/suspended/suspended-5d3c.vmss".into(), vec![]);
+    // 디스크립터 없이 데이터가 들어 있는 VMDK(호스트형 스파스)
+    files.insert(
+        "datastore1/sparse/sparse.vmdk".into(),
+        vec![b'K'; 100 << 10],
+    );
+    let esxi = MockEsxi::start(files, ESXI_USER, ESXI_PASSWORD).await;
+
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi/browse",
+            connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let locked: Vec<(&str, bool)> = body["datastores"][0]["vms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|vm| {
+            (
+                vm["name"].as_str().unwrap(),
+                vm["locked"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        locked,
+        [
+            ("lockdir", true),
+            ("nfs", true),
+            ("off", false),
+            ("sparse", false),
+            ("suspended", true),
+            ("swap", true),
+        ]
+    );
+
+    let powered_on = "the VM looks powered on (lock files found); power it off before importing";
+    let suspended = "the VM is suspended; power it off in VMware before importing (its memory state is not imported)";
+    for (name, warning) in [
+        ("off", None),
+        ("swap", Some(powered_on)),
+        ("nfs", Some(powered_on)),
+        ("lockdir", Some(powered_on)),
+        ("suspended", Some(suspended)),
+    ] {
+        let conn = connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+        let (status, body) = admin
+            .post(
+                "/vm-imports/esxi",
+                esxi_import(name, conn, "datastore1", &format!("{name}/{name}.vmx")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+        let warnings = body["status"]["warnings"].as_array().unwrap();
+        for w in [powered_on, suspended] {
+            assert_eq!(
+                warnings.iter().any(|x| x == w),
+                warning == Some(w),
+                "{name}: {body}"
+            );
+        }
+        if let Some(w) = warning {
+            assert_eq!(warnings[0], w, "{name}: {body}");
+        }
+    }
+
+    let conn = connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi",
+            esxi_import("sparse", conn, "datastore1", "sparse/sparse.vmx"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["message"],
+        "[datastore1] sparse/sparse.vmdk is not a VMDK descriptor; only VMFS and flat disks can be imported"
+    );
+}
+
+/// 가져올 수 없는 VM과 잘못된 요청은 가져오기를 만들지 않고, 자격 증명도 남기지 않는다.
+#[tokio::test]
+async fn esxi_import_rejects_what_it_cannot_import() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let esxi = mock_esxi().await;
+    let trusted = || connection(&esxi, ESXI_PASSWORD, Some(&esxi.fingerprint));
+
+    // 지문이 없으면 browse와 같은 409
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi",
+            esxi_import(
+                "web01",
+                connection(&esxi, ESXI_PASSWORD, None),
+                "datastore1",
+                "web01/web01.vmx",
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "untrusted_certificate");
+    assert_eq!(body["details"]["fingerprint"], esxi.fingerprint);
+
+    // 모양이 틀린 지문은 연결하기 전에 400
+    let (status, body) = admin
+        .post(
+            "/vm-imports/esxi",
+            esxi_import(
+                "web01",
+                connection(&esxi, ESXI_PASSWORD, Some("not-a-fingerprint")),
+                "datastore1",
+                "web01/web01.vmx",
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid fingerprint"),
+        "{body}"
+    );
+
+    for (name, vmx, code, want) in [
+        (
+            "snap",
+            "snap/snap.vmx",
+            "invalid_request",
+            "the VM has snapshots; consolidate or delete them in VMware first",
+        ),
+        (
+            "far",
+            "far/far.vmx",
+            "invalid_request",
+            "is on another datastore",
+        ),
+        (
+            "broken",
+            "broken/broken.vmx",
+            "invalid_request",
+            "the .vmx has no memSize",
+        ),
+        (
+            "gone",
+            "gone/gone.vmx",
+            "invalid_request",
+            "[datastore1] gone/gone.vmx was not found",
+        ),
+        ("up", "../x.vmx", "invalid_request", "invalid .vmx path"),
+        (
+            "notvmx",
+            "web01/web01.vmdk",
+            "invalid_request",
+            "invalid .vmx path",
+        ),
+        ("esxi", "web01/web01.vmx", "invalid_request", "reserved"),
+        ("Bad Name", "web01/web01.vmx", "invalid_request", "name"),
+    ] {
+        let (status, body) = admin
+            .post(
+                "/vm-imports/esxi",
+                esxi_import(name, trusted(), "datastore1", vmx),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{vmx}: {body}");
+        assert_eq!(body["code"], code, "{vmx}: {body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains(want), "{vmx}: {message}");
+    }
+    let (_, imports) = env.cluster.list::<VmImportSpec>().unwrap();
+    assert!(imports.is_empty());
+    assert!(env.state.import_credentials.is_empty());
+
+    // 읽기 사용자는 만들 수 없다.
+    let viewer = env.user("viewer", "viewer").await;
+    let (status, body) = viewer
+        .post(
+            "/vm-imports/esxi",
+            esxi_import("web01", trusted(), "datastore1", "web01/web01.vmx"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// 저장소에 ESXi 가져오기를 직접 만든다.
+async fn esxi_import_on(env: &Env, name: &str, node: Uuid, phase: ImportPhase) -> VmImport {
+    let mut import: VmImport = Resource::new(
+        name,
+        VmImportSpec {
+            node,
+            source: ImportSource::Esxi(EsxiSource {
+                host: "esxi.example".into(),
+                port: 443,
+                datacenter: "ha-datacenter".into(),
+                datastore: "datastore1".into(),
+                vmx: format!("{name}/{name}.vmx"),
+                user: "root".into(),
+                fingerprint: OTHER_FINGERPRINT.into(),
+            }),
+        },
+    );
+    import.status = VmImportStatus {
+        phase,
+        ..Default::default()
+    };
+    env.cluster.create(&import).await.unwrap();
+    import
+}
+
+/// 노드가 시작할 때 이 노드의 `ready`·(Task 없는) `importing` ESXi 가져오기는 자격 증명을 잃었으므로
+/// `failed`가 된다. 원본 디렉터리가 없어도 "source files are gone"이 아니다. 다른 노드의 것과 끝난 것은
+/// 그대로 둔다.
+#[tokio::test]
+async fn startup_fails_esxi_imports_whose_credentials_are_lost() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let ready = esxi_import_on(&env, "ready", env.node, ImportPhase::Ready).await;
+    let cut = esxi_import_on(&env, "cut", env.node, ImportPhase::Importing).await;
+    let done = esxi_import_on(&env, "done", env.node, ImportPhase::Done).await;
+    let other = esxi_import_on(&env, "other", Uuid::now_v7(), ImportPhase::Ready).await;
+
+    env.start_runner().await;
+
+    let phase = |id: Uuid| {
+        let import = env.cluster.get::<VmImportSpec>(id).unwrap().unwrap();
+        (import.status.phase, import.status.error)
+    };
+    let lost = Some("the ESXi credentials are no longer on this node (opld restarted or the request was interrupted); create the import again".into());
+    assert_eq!(phase(ready.id), (ImportPhase::Failed, lost.clone()));
+    assert_eq!(phase(cut.id), (ImportPhase::Failed, lost));
+    assert_eq!(phase(done.id), (ImportPhase::Done, None));
+    assert_eq!(phase(other.id), (ImportPhase::Ready, None));
 }

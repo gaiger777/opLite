@@ -38,6 +38,8 @@ async fn openapi_document_is_served_without_login() {
         "/vm-imports/{key}/run",
         "/vm-imports/ova",
         "/vm-imports/ova/check",
+        "/vm-imports/esxi",
+        "/vm-imports/esxi/browse",
         "/watch",
     ] {
         assert!(paths.contains_key(path), "{path} is not documented");

@@ -1,20 +1,22 @@
 //! VM 가져오기. 올린 OVA를 읽어([`ova`]·[`ovf`]) 원본 VM을 알아내고 opLite VM 설정을 제안한다.
 //! 원본은 올린 노드의 `{upload_dir}/imports/{가져오기 id}/source.ova`에 둔다. 실행과 지우기는 그 노드의
-//! Task 실행기가 한다.
+//! Task 실행기가 한다. ESXi·vCenter 데이터스토어의 VM은 `.vmx`·디스크립터를 HTTPS로 읽어([`esxi`]·
+//! [`vmx`]) 같은 리소스를 만들고, 비밀번호는 요청을 받은 노드의 메모리([`ImportCredentials`])에만 둔다.
 
 pub mod esxi;
 pub mod ova;
 pub mod ovf;
 pub mod vmx;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures_util::{StreamExt, TryStreamExt};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::network::{NetworkSpec, USER_NETWORK};
@@ -27,8 +29,9 @@ use opl_types::vm::{
     VmSpec,
 };
 use opl_types::vm_import::{
-    ImportPhase, ImportProposal, ImportRun, ImportSource, OvaSource, SATA_PORTS, SourceVm,
-    VmImport, VmImportSpec, VmImportStatus, propose,
+    EsxiConnection, EsxiSource, ImportPhase, ImportProposal, ImportRun, ImportSource, OvaSource,
+    SATA_PORTS, SourceDisk, SourceVm, VmImport, VmImportSpec, VmImportStatus,
+    normalize_fingerprint, propose,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -41,10 +44,18 @@ use crate::resources::{check_name, lookup};
 use crate::state::AppState;
 use crate::tasks::{create_task, volume_name};
 use crate::volumes::{ImageFile, check_pool_on, check_upload_space, content_length, receive};
+use esxi::EsxiError;
 use ova::{OvaError, parse_ova, read_index};
+use vmx::{MAX_TEXT_BYTES, VmxError};
 
-/// `/vm-imports/ova` 경로와 겹치므로 가져오기 이름으로 쓸 수 없다.
-const RESERVED_NAME: &str = "ova";
+/// `/vm-imports/ova`·`/vm-imports/esxi` 경로와 겹치므로 가져오기 이름으로 쓸 수 없다.
+const RESERVED_NAMES: [&str; 2] = ["ova", "esxi"];
+/// 이 노드 메모리에 자격 증명이 없는(opld가 다시 시작했거나 요청이 끊긴) ESXi 가져오기의 오류
+pub(crate) const CREDENTIALS_LOST: &str = "the ESXi credentials are no longer on this node (opld restarted or the request was interrupted); create the import again";
+/// browse가 `.vmx`를 동시에 읽는 개수
+const BROWSE_CONCURRENCY: usize = 8;
+/// browse가 보는 VM 디렉터리의 최대 개수(넘으면 자른다)
+const BROWSE_MAX_DIRS: usize = 500;
 /// 가져오기 디렉터리 안의 원본 OVA 파일 이름
 pub(crate) const SOURCE_OVA: &str = "source.ova";
 /// 가져오기 Task가 디스크를 하나씩 추출해 두는 파일 이름(가져오기 디렉터리 안)
@@ -85,22 +96,17 @@ pub struct OvaCheckQuery {
     pub size: u64,
 }
 
-/// OVA를 받기 전의 확인. 사전 확인과 올리기가 함께 쓴다. 확인 뒤에 다른 요청이 이름을 가져가면
-/// 저장소에 만들 때 `name_taken`이 난다.
-async fn check_upload(
-    state: &AppState,
-    principal: &Principal,
-    name: &str,
-    size: u64,
-) -> Result<(), ApiError> {
+/// 이 노드에 새 가져오기를 만들 수 있는지 본다(권한, 이름, 위트니스 노드). OVA 올리기와 ESXi 가져오기가
+/// 함께 쓴다. 확인 뒤에 다른 요청이 이름을 가져가면 저장소에 만들 때 `name_taken`이 난다.
+fn check_new(state: &AppState, principal: &Principal, name: &str) -> Result<(), ApiError> {
     state.authorize(principal, Action::Write, VmImportSpec::KIND)?;
     check_name(name)?;
-    if name == RESERVED_NAME {
+    if RESERVED_NAMES.contains(&name) {
         return Err(ApiError::bad_request(format!(
-            "the name {RESERVED_NAME} is reserved"
+            "the name {name} is reserved"
         )));
     }
-    // 원본은 올린 노드에 남고 가져오기도 그 노드에서 하므로 VM을 돌리는 노드여야 한다.
+    // 원본은 받은 노드에 남고 가져오기도 그 노드에서 하므로 VM을 돌리는 노드여야 한다.
     if let Some(node) = state.cluster.get::<NodeSpec>(state.node)?
         && node.spec.witness
     {
@@ -115,6 +121,17 @@ async fn check_upload(
             format!("vm-import {name:?} already exists"),
         ));
     }
+    Ok(())
+}
+
+/// OVA를 받기 전의 확인. 사전 확인과 올리기가 함께 쓴다.
+async fn check_upload(
+    state: &AppState,
+    principal: &Principal,
+    name: &str,
+    size: u64,
+) -> Result<(), ApiError> {
+    check_new(state, principal, name)?;
     check_upload_space(state, size).await
 }
 
@@ -208,8 +225,411 @@ impl Drop for DirGuard {
     }
 }
 
+/// ESXi 가져오기의 자격 증명(가져오기 id → 연결). 비밀번호를 Raft·Task·로그에 남기지 않으려고 요청을
+/// 받은 노드의 메모리에만 둔다. opld가 다시 시작하면 사라진다(그 가져오기는 시작 정리가 `failed`로 바꾼다).
+#[derive(Default)]
+pub struct ImportCredentials(Mutex<HashMap<Uuid, EsxiConnection>>);
+
+impl ImportCredentials {
+    pub fn insert(&self, import: Uuid, conn: EsxiConnection) {
+        self.0.lock().unwrap().insert(import, conn);
+    }
+
+    pub fn get(&self, import: Uuid) -> Option<EsxiConnection> {
+        self.0.lock().unwrap().get(&import).cloned()
+    }
+
+    pub fn remove(&self, import: Uuid) {
+        self.0.lock().unwrap().remove(&import);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
+    }
+}
+
+/// 만들기를 끝내지 못한 가져오기의 자격 증명을 지운다. 정상 경로에서는 `armed`를 내린다.
+struct CredentialGuard {
+    credentials: Arc<ImportCredentials>,
+    import: Uuid,
+    armed: bool,
+}
+
+impl CredentialGuard {
+    fn insert(credentials: Arc<ImportCredentials>, import: Uuid, conn: EsxiConnection) -> Self {
+        credentials.insert(import, conn);
+        CredentialGuard {
+            credentials,
+            import,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for CredentialGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.credentials.remove(self.import);
+        }
+    }
+}
+
+/// ESXi 오류를 API 오류로. 지문이 없으면 409 `untrusted_certificate`, 다르면 409 `fingerprint_mismatch`
+/// (둘 다 `details.fingerprint`에 서버 인증서의 지문), 인증 실패 400 `esxi_auth`, 연결할 수 없으면 502
+/// `esxi_unreachable`. 없는 파일·그 밖의 HTTP 응답·잘못된 응답은 400(메시지에 이유).
+pub(crate) fn esxi_error(e: EsxiError) -> ApiError {
+    let with_fingerprint = |mut error: ApiError, fingerprint: &str| {
+        error.details = Some(serde_json::json!({ "fingerprint": fingerprint }));
+        error
+    };
+    match e {
+        EsxiError::Untrusted(actual) => with_fingerprint(
+            ApiError::conflict(
+                "untrusted_certificate",
+                "verify the ESXi certificate fingerprint",
+            ),
+            &actual,
+        ),
+        EsxiError::Fingerprint { ref actual, .. } => with_fingerprint(
+            ApiError::conflict("fingerprint_mismatch", e.to_string()),
+            actual,
+        ),
+        EsxiError::Auth => ApiError::new(StatusCode::BAD_REQUEST, "esxi_auth", e.to_string()),
+        EsxiError::Connect(_) => {
+            ApiError::new(StatusCode::BAD_GATEWAY, "esxi_unreachable", e.to_string())
+        }
+        EsxiError::NotFound(_)
+        | EsxiError::Http(_)
+        | EsxiError::TooLarge { .. }
+        | EsxiError::Invalid(_) => ApiError::bad_request(e.to_string()),
+        EsxiError::Io(e) => ApiError::internal(e),
+    }
+}
+
+/// 요청의 지문을 정규화한다. 모양이 틀리면 연결하기 전에 400(어떤 인증서와도 맞지 않으므로).
+fn check_fingerprint(conn: &mut EsxiConnection) -> Result<(), ApiError> {
+    if let Some(f) = &conn.fingerprint {
+        let normalized = normalize_fingerprint(f).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "invalid fingerprint {f:?}; expected the 64 hex digits of a SHA-256 fingerprint"
+            ))
+        })?;
+        conn.fingerprint = Some(normalized);
+    }
+    Ok(())
+}
+
+/// 켜진 VM이 디렉터리에 남기는 항목인지: 잠금(`.lck`로 끝남, 디렉터리일 수도), NFS 잠금(`.lck-`로
+/// 시작), 스왑 파일(`.vswp`, 켜진 동안만 있다). 짐작일 뿐이다.
+fn lock_file(name: &str) -> bool {
+    name.ends_with(".lck") || name.starts_with(".lck-") || name.ends_with(".vswp")
+}
+
+/// 일시 중단된 VM이 디렉터리에 남기는 메모리 상태 파일(`.vmss`)인지
+fn suspend_file(name: &str) -> bool {
+    name.ends_with(".vmss")
+}
+
+fn vmx_error(e: VmxError) -> ApiError {
+    ApiError::bad_request(e.0)
+}
+
+/// 연결 자체의 문제(인증·지문·연결)인지. browse는 이것만 요청 전체의 실패로 보고, 디렉터리 하나를 읽지
+/// 못한 것은 그 디렉터리만 건너뛴다.
+fn connection_failed(e: &EsxiError) -> bool {
+    matches!(
+        e,
+        EsxiError::Auth
+            | EsxiError::Connect(_)
+            | EsxiError::Untrusted(_)
+            | EsxiError::Fingerprint { .. }
+            | EsxiError::Io(_)
+    )
+}
+
+/// browse 응답
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EsxiBrowse {
+    pub datastores: Vec<EsxiDatastore>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EsxiDatastore {
+    pub name: String,
+    /// 맨 위 디렉터리마다 첫 `.vmx`(경로 순서)
+    pub vms: Vec<EsxiVm>,
+}
+
+/// 데이터스토어의 VM 요약. `.vmx`를 해석할 수 없으면 `error`가 있고 나머지는 빈 값이다.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EsxiVm {
+    /// 데이터스토어 안의 `.vmx` 경로(`web01/web01.vmx`)
+    pub vmx: String,
+    pub name: String,
+    pub guest_os: String,
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    pub disks: u32,
+    /// 디렉터리에 잠금·스왑 파일(`.lck`, `.lck-…`, `.vswp`)이 있거나(켜져 있을 수 있다) 일시 중단 파일
+    /// (`.vmss`)이 있다
+    pub locked: bool,
+    pub error: Option<String>,
+}
+
+/// ESXi·vCenter에 연결해 데이터스토어마다 맨 위 디렉터리의 VM(`.vmx`)을 요약한다. 지문이 없으면 409
+/// `untrusted_certificate`(`details.fingerprint`), 다르면 409 `fingerprint_mismatch`, 인증 실패 400
+/// `esxi_auth`, 연결할 수 없으면 502 `esxi_unreachable`. VM 디렉터리는 500개까지 본다.
+#[utoipa::path(post, path = "/vm-imports/esxi/browse", tag = "vm-imports",
+    request_body = EsxiConnection,
+    responses((status = 200, body = EsxiBrowse), (status = "4XX", body = crate::error::ErrorBody), (status = 502, body = crate::error::ErrorBody)))]
+pub async fn browse_esxi(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Json(mut conn): Json<EsxiConnection>,
+) -> Result<Json<EsxiBrowse>, ApiError> {
+    state.authorize(&principal, Action::Write, VmImportSpec::KIND)?;
+    check_fingerprint(&mut conn)?;
+    let datastores = esxi::list(&conn, None, "").await.map_err(esxi_error)?;
+    let mut dirs = Vec::new();
+    for ds in &datastores {
+        match esxi::list(&conn, Some(&ds.name), "").await {
+            Ok(entries) => dirs.extend(
+                entries
+                    .into_iter()
+                    .filter(|e| e.is_dir)
+                    .map(|e| (ds.name.clone(), e.name)),
+            ),
+            Err(e) if connection_failed(&e) => return Err(esxi_error(e)),
+            Err(e) => {
+                tracing::info!(datastore = %ds.name, error = %e, "cannot list an ESXi datastore")
+            }
+        }
+    }
+    dirs.truncate(BROWSE_MAX_DIRS);
+    let conn = &conn;
+    let vms: Vec<Option<(String, EsxiVm)>> = futures_util::stream::iter(dirs)
+        .map(|(ds, dir)| async move {
+            Ok::<_, ApiError>(browse_dir(conn, &ds, &dir).await?.map(|vm| (ds, vm)))
+        })
+        .buffered(BROWSE_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let mut vms: Vec<(String, EsxiVm)> = vms.into_iter().flatten().collect();
+    let datastores = datastores
+        .iter()
+        .map(|ds| EsxiDatastore {
+            name: ds.name.clone(),
+            vms: vms
+                .extract_if(.., |(name, _)| *name == ds.name)
+                .map(|(_, vm)| vm)
+                .collect(),
+        })
+        .collect();
+    Ok(Json(EsxiBrowse { datastores }))
+}
+
+/// 디렉터리 `dir`의 첫 `.vmx`를 요약한다. `.vmx`가 없거나 디렉터리를 읽을 수 없으면 None.
+async fn browse_dir(
+    conn: &EsxiConnection,
+    datastore: &str,
+    dir: &str,
+) -> Result<Option<EsxiVm>, ApiError> {
+    let entries = match esxi::list(conn, Some(datastore), dir).await {
+        Ok(entries) => entries,
+        Err(e) if connection_failed(&e) => return Err(esxi_error(e)),
+        Err(e) => {
+            tracing::info!(datastore, dir, error = %e, "cannot list an ESXi directory");
+            return Ok(None);
+        }
+    };
+    let Some(file) = entries
+        .iter()
+        .find(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".vmx"))
+    else {
+        return Ok(None);
+    };
+    let path = format!("{dir}/{}", file.name);
+    let locked = entries
+        .iter()
+        .any(|e| lock_file(&e.name) || suspend_file(&e.name));
+    let summary = match esxi::get_small(conn, datastore, &path, MAX_TEXT_BYTES).await {
+        Ok(text) => vmx::parse_vmx(&text)
+            .and_then(|v| vmx::vmx_to_source(&v, &path))
+            .map_err(|e| e.0),
+        Err(e) if connection_failed(&e) => return Err(esxi_error(e)),
+        Err(e) => Err(e.to_string()),
+    };
+    let vm = match summary {
+        Ok((vm, _, disks)) => EsxiVm {
+            vmx: path,
+            name: vm.name,
+            guest_os: vm.guest_os,
+            vcpus: vm.vcpus,
+            memory_mib: vm.memory_mib,
+            disks: disks.len() as u32,
+            locked,
+            error: None,
+        },
+        Err(error) => EsxiVm {
+            name: file
+                .name
+                .get(..file.name.len() - ".vmx".len())
+                .unwrap_or(&file.name)
+                .to_string(),
+            vmx: path,
+            guest_os: String::new(),
+            vcpus: 0,
+            memory_mib: 0,
+            disks: 0,
+            locked,
+            error: Some(error),
+        },
+    };
+    Ok(Some(vm))
+}
+
+/// ESXi에서 가져오기 만들기 요청
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EsxiImportRequest {
+    /// 가져오기 이름
+    pub name: String,
+    /// 연결(`fingerprint`가 있어야 한다)
+    pub connection: EsxiConnection,
+    pub datastore: String,
+    /// 데이터스토어 안의 `.vmx` 경로(`web01/web01.vmx`)
+    pub vmx: String,
+}
+
+/// 데이터스토어 안의 상대 경로이고 `.vmx`로 끝나는지
+fn valid_vmx_path(path: &str) -> bool {
+    path.ends_with(".vmx")
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|p| !p.is_empty() && p != "." && p != "..")
+}
+
+/// ESXi·vCenter 데이터스토어의 VM으로 `ready` 가져오기를 만든다(201). 이 노드가 `.vmx`와 디스크
+/// 디스크립터를 읽어 원본 VM과 제안을 만들고, 자격 증명은 이 노드의 메모리에만 둔다(실행 Task도 이
+/// 노드에서 돈다). 연결 오류는 browse와 같다(지문이 없으면 409 `untrusted_certificate`). 스냅샷이 있는
+/// VM, 다른 데이터스토어의 디스크, 통째로 받을 수 없는 디스크는 400. 잠금·일시 중단 파일이 있으면 경고만
+/// 한다.
+#[utoipa::path(post, path = "/vm-imports/esxi", tag = "vm-imports",
+    request_body = EsxiImportRequest,
+    responses((status = 201, body = Resource<VmImportSpec, VmImportStatus>), (status = "4XX", body = crate::error::ErrorBody), (status = 502, body = crate::error::ErrorBody)))]
+pub async fn create_esxi(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Json(req): Json<EsxiImportRequest>,
+) -> Result<(StatusCode, Json<VmImport>), ApiError> {
+    check_new(&state, &principal, &req.name)?;
+    let EsxiImportRequest {
+        name,
+        connection: mut conn,
+        datastore,
+        vmx: vmx_path,
+    } = req;
+    check_fingerprint(&mut conn)?;
+    if datastore.is_empty() || !valid_vmx_path(&vmx_path) {
+        return Err(ApiError::bad_request(format!(
+            "invalid .vmx path {vmx_path:?} on datastore {datastore:?}"
+        )));
+    }
+    let text = esxi::get_small(&conn, &datastore, &vmx_path, MAX_TEXT_BYTES)
+        .await
+        .map_err(esxi_error)?;
+    // 지문이 맞아 읽었으므로 지문은 있고 모양도 맞다.
+    let fingerprint = conn
+        .fingerprint
+        .as_deref()
+        .and_then(normalize_fingerprint)
+        .ok_or_else(|| ApiError::bad_request("invalid certificate fingerprint"))?;
+    conn.fingerprint = Some(fingerprint.clone());
+    let parsed = vmx::parse_vmx(&text).map_err(vmx_error)?;
+    let (mut vm, mut warnings, disks) =
+        vmx::vmx_to_source(&parsed, &vmx_path).map_err(vmx_error)?;
+    for disk in disks {
+        let path = vmx::disk_path(&vmx_path, &datastore, &disk.path).map_err(vmx_error)?;
+        let shown = format!("[{datastore}] {path}");
+        let text = match esxi::get_small(&conn, &datastore, &path, MAX_TEXT_BYTES).await {
+            Ok(text) => text,
+            // 크기 제한을 넘었다: 디스크립터가 따로 없는 VMDK(스파스·호스트형)다.
+            Err(EsxiError::TooLarge { .. }) => {
+                return Err(ApiError::bad_request(format!(
+                    "{shown} is not a VMDK descriptor; only VMFS and flat disks can be imported"
+                )));
+            }
+            Err(e) => return Err(esxi_error(e)),
+        };
+        let (file, capacity_bytes) = vmx::parse_descriptor(&text)
+            .and_then(|d| vmx::check_flat(&d))
+            .map_err(|e| ApiError::bad_request(format!("{shown}: {e}")))?;
+        // extent는 디스크립터와 같은 디렉터리에 있다.
+        let file = match path.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/{file}"),
+            None => file,
+        };
+        vm.disks.push(SourceDisk {
+            name: disk.name,
+            file,
+            capacity_bytes,
+            controller: disk.controller,
+        });
+    }
+    let dir = vmx_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let entries = esxi::list(&conn, Some(&datastore), dir)
+        .await
+        .map_err(esxi_error)?;
+    if entries.iter().any(|e| suspend_file(&e.name)) {
+        warnings.insert(
+            0,
+            "the VM is suspended; power it off in VMware before importing (its memory state is not imported)".into(),
+        );
+    }
+    if entries.iter().any(|e| lock_file(&e.name)) {
+        warnings.insert(
+            0,
+            "the VM looks powered on (lock files found); power it off before importing".into(),
+        );
+    }
+    let (_, networks) = state.cluster.list::<NetworkSpec>()?;
+    let networks: Vec<String> = networks.into_iter().map(|n| n.name).collect();
+    let (proposal, proposal_warnings) = propose(&vm, &networks);
+    warnings.extend(proposal_warnings);
+    let spec = VmImportSpec {
+        node: state.node,
+        source: ImportSource::Esxi(EsxiSource {
+            host: conn.host.clone(),
+            port: conn.port,
+            datacenter: conn.datacenter.clone(),
+            datastore,
+            vmx: vmx_path,
+            user: conn.user.clone(),
+            fingerprint,
+        }),
+    };
+    let mut import: VmImport = Resource::new(name, spec);
+    import.status = VmImportStatus {
+        phase: ImportPhase::Ready,
+        source_vm: Some(vm),
+        proposal: Some(proposal),
+        warnings,
+        vm: None,
+        error: None,
+    };
+    // 만들자마자 다른 노드로 온 실행 요청의 Task가 자격 증명을 찾을 수 있게 먼저 넣는다. 만들기가
+    // 실패하거나 클라이언트가 끊어 이 future가 버려지면 지운다.
+    let mut guard = CredentialGuard::insert(state.import_credentials.clone(), import.id, conn);
+    import.revision = state.cluster.create(&import).await?;
+    guard.armed = false;
+    Ok((StatusCode::CREATED, Json(import)))
+}
+
 /// 이전 opld가 남긴 가져오기 파일을 정리한다(노드가 시작할 때, API를 띄우기 전). 리소스가 없는
-/// `imports/{id}` 디렉터리를 지우고, 이 노드의 `ready` 가져오기인데 원본이 없으면 `failed`로 바꾼다.
+/// `imports/{id}` 디렉터리를 지우고, 이 노드의 `ready` OVA 가져오기인데 원본이 없으면 `failed`로 바꾼다.
+/// 이 노드의 `ready` ESXi 가져오기는 메모리의 자격 증명을 잃었으므로 `failed`로 바꾼다(ESXi 가져오기는
+/// 실행할 때만 디렉터리를 쓰므로 디렉터리는 보지 않는다).
 /// 실행할 Task가 없는 이 노드의 `importing` 가져오기(Task를 만들기 전에 API가 죽었다)는 `ready`로
 /// 되돌리고 이유를 남긴다. 다만 그 가져오기의 Task가 VM을 만든 뒤 죽었으면(대상 VM이 있다) `done`으로
 /// 끝내고 원본 디렉터리를 지운다. 끝나지 않은 Task가 있으면 실행기가 그 Task를 실패로 끝내며 정리한다.
@@ -279,7 +699,12 @@ pub(crate) async fn sweep(
                 }
             }
         }
-        if status.phase == ImportPhase::Ready
+        let esxi = matches!(import.spec.source, ImportSource::Esxi(_));
+        if status.phase == ImportPhase::Ready && esxi {
+            tracing::warn!(import = %import.name, "the ESXi credentials of the import were lost");
+            status.phase = ImportPhase::Failed;
+            status.error = Some(CREDENTIALS_LOST.into());
+        } else if status.phase == ImportPhase::Ready
             && !import_dir(upload_dir, import.id).join(SOURCE_OVA).exists()
         {
             tracing::warn!(import = %import.name, "the source files of the import are gone");
@@ -854,5 +1279,28 @@ mod tests {
         assert!(import_spec(&src, &proposal, &r, &volumes[..6]).is_ok());
         r.disk_bus = Some(DiskBus::VirtioBlk);
         assert!(import_spec(&src, &proposal, &r, &volumes).is_ok());
+    }
+
+    /// 만들기 전에 넣은 자격 증명은 만들기를 끝내지 못하면(guard가 그대로 버려지면) 지워진다.
+    #[test]
+    fn credential_guard_removes_unfinished_credentials() {
+        let credentials = Arc::new(ImportCredentials::default());
+        let conn = EsxiConnection {
+            host: "esxi.example".into(),
+            port: 443,
+            user: "root".into(),
+            password: "pw".into(),
+            datacenter: "ha-datacenter".into(),
+            fingerprint: None,
+        };
+        let (failed, created) = (Uuid::now_v7(), Uuid::now_v7());
+        let guard = CredentialGuard::insert(credentials.clone(), failed, conn.clone());
+        assert!(credentials.get(failed).is_some());
+        drop(guard);
+        assert!(credentials.get(failed).is_none());
+        let mut guard = CredentialGuard::insert(credentials.clone(), created, conn);
+        guard.armed = false;
+        drop(guard);
+        assert!(credentials.get(created).is_some());
     }
 }

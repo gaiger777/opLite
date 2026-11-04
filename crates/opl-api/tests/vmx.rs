@@ -174,6 +174,57 @@ fn rejects_bad_vmx() {
     );
 }
 
+/// vCenter 분산 스위치의 NIC는 `networkName`이 없다. 포트 그룹 이름(없으면 `dvs:{id}`)을 쓰고 경고한다.
+#[test]
+fn nics_on_a_distributed_switch_use_the_port_group() {
+    let text = "memsize = 1\n\
+                ethernet0.present = \"TRUE\"\n\
+                ethernet0.dvs.portgroupId = \"dvportgroup-1001\"\n\
+                ethernet0.dvs.switchId = \"50 1a 2b\"\n\
+                ethernet1.present = \"TRUE\"\n\
+                ethernet1.dvs.portgroupId = \"dvportgroup-1002\"\n\
+                ethernet1.dvs.portgroupName = \"Prod VLAN 10\"\n\
+                ethernet2.present = \"TRUE\"\n\
+                ethernet2.networkName = \"VM Network\"\n\
+                ethernet2.dvs.portgroupId = \"dvportgroup-1003\"\n";
+    let (vm, warnings, _) = source(text).unwrap();
+    let networks: Vec<&str> = vm.nics.iter().map(|n| n.network.as_str()).collect();
+    assert_eq!(
+        networks,
+        ["dvs:dvportgroup-1001", "Prod VLAN 10", "VM Network"]
+    );
+    assert_eq!(
+        warnings,
+        [
+            "ethernet0 is on a distributed switch; map its network when running the import",
+            "ethernet1 is on a distributed switch; map its network when running the import",
+        ]
+    );
+}
+
+/// NSX 네트워크의 NIC는 `networkName`도 분산 스위치도 없고 `opaqueNetwork.id`만 있다. `nsx:{id}`를 쓰고
+/// 경고한다.
+#[test]
+fn nics_on_an_nsx_network_use_the_opaque_network_id() {
+    let text = "memsize = 1\n\
+                ethernet0.present = \"TRUE\"\n\
+                ethernet0.opaqueNetwork.id = \"c3a1e2f4-0b1d-4e5f-8a9b-001122334455\"\n\
+                ethernet0.opaqueNetwork.type = \"nsx.LogicalSwitch\"\n\
+                ethernet1.present = \"TRUE\"\n\
+                ethernet1.networkName = \"VM Network\"\n\
+                ethernet1.opaqueNetwork.id = \"ignored\"\n";
+    let (vm, warnings, _) = source(text).unwrap();
+    let networks: Vec<&str> = vm.nics.iter().map(|n| n.network.as_str()).collect();
+    assert_eq!(
+        networks,
+        ["nsx:c3a1e2f4-0b1d-4e5f-8a9b-001122334455", "VM Network"]
+    );
+    assert_eq!(
+        warnings,
+        ["ethernet0 is on an NSX network; map its network when running the import"]
+    );
+}
+
 #[test]
 fn orders_disks_by_controller_bus_and_unit() {
     let mut text = String::from("memsize = 1\n");

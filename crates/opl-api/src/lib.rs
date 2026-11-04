@@ -132,6 +132,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(vm_imports::run_import))
         .routes(routes!(vm_imports::upload_ova))
         .routes(routes!(vm_imports::check_ova))
+        .routes(routes!(vm_imports::browse_esxi))
+        .routes(routes!(vm_imports::create_esxi))
         .routes(routes!(r::list_volumes, volumes::create_volume))
         .routes(routes!(volumes::import_volume))
         .routes(routes!(volumes::check_import_volume))

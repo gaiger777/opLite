@@ -538,6 +538,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vm-imports/esxi": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * ESXi·vCenter 데이터스토어의 VM으로 `ready` 가져오기를 만든다(201). 이 노드가 `.vmx`와 디스크
+         *     디스크립터를 읽어 원본 VM과 제안을 만들고, 자격 증명은 이 노드의 메모리에만 둔다(실행 Task도 이
+         *     노드에서 돈다). 연결 오류는 browse와 같다(지문이 없으면 409 `untrusted_certificate`). 스냅샷이 있는
+         *     VM, 다른 데이터스토어의 디스크, 통째로 받을 수 없는 디스크는 400. 잠금·일시 중단 파일이 있으면 경고만
+         *     한다.
+         */
+        post: operations["create_esxi"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vm-imports/esxi/browse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * ESXi·vCenter에 연결해 데이터스토어마다 맨 위 디렉터리의 VM(`.vmx`)을 요약한다. 지문이 없으면 409
+         *     `untrusted_certificate`(`details.fingerprint`), 다르면 409 `fingerprint_mismatch`, 인증 실패 400
+         *     `esxi_auth`, 연결할 수 없으면 502 `esxi_unreachable`. VM 디렉터리는 500개까지 본다.
+         */
+        post: operations["browse_esxi"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vm-imports/ova": {
         parameters: {
             query?: never;
@@ -1263,6 +1307,43 @@ export interface components {
             details?: unknown;
             message: string;
         };
+        /** @description browse 응답 */
+        EsxiBrowse: {
+            datastores: components["schemas"]["EsxiDatastore"][];
+        };
+        /** @description ESXi·vCenter 연결(API 요청 본문). 비밀번호가 있으므로 저장하지 않고 로그에도 찍지 않는다. */
+        EsxiConnection: {
+            /**
+             * @description vCenter면 데이터센터 이름
+             * @default ha-datacenter
+             */
+            datacenter: string;
+            /** @description 믿는 서버 인증서의 SHA-256 지문. 없으면 서버가 지문을 알려 주며 거절한다. */
+            fingerprint?: string | null;
+            host: string;
+            password: string;
+            /**
+             * Format: int32
+             * @default 443
+             */
+            port: number;
+            user: string;
+        };
+        EsxiDatastore: {
+            name: string;
+            /** @description 맨 위 디렉터리마다 첫 `.vmx`(경로 순서) */
+            vms: components["schemas"]["EsxiVm"][];
+        };
+        /** @description ESXi에서 가져오기 만들기 요청 */
+        EsxiImportRequest: {
+            /** @description 연결(`fingerprint`가 있어야 한다) */
+            connection: components["schemas"]["EsxiConnection"];
+            datastore: string;
+            /** @description 가져오기 이름 */
+            name: string;
+            /** @description 데이터스토어 안의 `.vmx` 경로(`web01/web01.vmx`) */
+            vmx: string;
+        };
         EsxiSource: {
             /** @description 데이터센터(ESXi는 `ha-datacenter`) */
             datacenter: string;
@@ -1274,6 +1355,25 @@ export interface components {
             port: number;
             user: string;
             /** @description 데이터스토어 안의 `.vmx` 경로(예: `web01/web01.vmx`) */
+            vmx: string;
+        };
+        /** @description 데이터스토어의 VM 요약. `.vmx`를 해석할 수 없으면 `error`가 있고 나머지는 빈 값이다. */
+        EsxiVm: {
+            /** Format: int32 */
+            disks: number;
+            error?: string | null;
+            guest_os: string;
+            /**
+             * @description 디렉터리에 잠금·스왑 파일(`.lck`, `.lck-…`, `.vswp`)이 있거나(켜져 있을 수 있다) 일시 중단 파일
+             *     (`.vmss`)이 있다
+             */
+            locked: boolean;
+            /** Format: int64 */
+            memory_mib: number;
+            name: string;
+            /** Format: int32 */
+            vcpus: number;
+            /** @description 데이터스토어 안의 `.vmx` 경로(`web01/web01.vmx`) */
             vmx: string;
         };
         /**
@@ -4600,6 +4700,84 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["List_Resource_VmImportSpec_VmImportStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_esxi: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EsxiImportRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmImportSpec_VmImportStatus"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    browse_esxi: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EsxiConnection"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EsxiBrowse"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "4XX": {

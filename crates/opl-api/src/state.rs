@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::auth::{Authorizer, RoleAuthorizer, Sessions};
 use crate::limit::AttemptLimiter;
+use crate::vm_imports::ImportCredentials;
 
 /// 모든 핸들러가 공유하는 노드의 상태.
 pub struct AppState {
@@ -28,6 +29,8 @@ pub struct AppState {
     /// 이 노드에서 VM spec의 검증과 쓰기를 한 번에 하나씩 한다(MAC·볼륨 중복 확인이 경합하지 않게).
     /// 여러 노드에 걸친 경합은 나중에 클러스터 수준의 확인이 필요하다.
     pub(crate) vm_lock: tokio::sync::Mutex<()>,
+    /// 이 노드가 받은 ESXi 가져오기의 자격 증명(메모리에만). 같은 노드의 Task 실행기와 나눠 쓴다.
+    pub import_credentials: Arc<ImportCredentials>,
 }
 
 impl AppState {
@@ -48,6 +51,7 @@ impl AppState {
             sessions: Sessions::default(),
             attempts: AttemptLimiter::default(),
             vm_lock: tokio::sync::Mutex::new(()),
+            import_credentials: Arc::default(),
         }
     }
 }
