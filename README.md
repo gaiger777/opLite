@@ -1318,3 +1318,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 26: VM 방화벽](docs/superpowers/plans/2026-11-03-plan26-vm-firewall.md)
 - [계획 27: 백업과 복원](docs/superpowers/plans/2026-11-04-plan27-backup-restore.md)
 - [계획 28: 백업 작업과 보존](docs/superpowers/plans/2026-11-04-plan28-backup-jobs.md)
+- [계획 29: OVA 가져오기](docs/superpowers/plans/2026-11-04-plan29-ova-import.md)
