@@ -9,7 +9,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use crate::client::{BACKUP_WAIT, Client, MIGRATE_WAIT, fetch_ca, fingerprint, local};
+use crate::client::{BACKUP_WAIT, Client, IMPORT_WAIT, MIGRATE_WAIT, fetch_ca, fingerprint, local};
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
 
@@ -80,6 +80,11 @@ enum Cmd {
     BackupJob {
         #[command(subcommand)]
         cmd: BackupJobCmd,
+    },
+    /// 다른 하이퍼바이저(VMware)에서 내보낸 VM(OVA) 가져오기
+    Import {
+        #[command(subcommand)]
+        cmd: ImportCmd,
     },
     Task {
         #[command(subcommand)]
@@ -1134,6 +1139,142 @@ fn backup_job_set_body(args: &BackupJobSet, current: &Value) -> Value {
 }
 
 #[derive(Subcommand)]
+enum ImportCmd {
+    /// VMware 등에서 내보낸 OVA를 이 서버의 노드에 올리고, 원본 VM을 읽어 VM 설정을 제안받는다.
+    /// 원본 파일은 그 노드에 남고 실행도 그 노드에서 한다.
+    Ova {
+        file: PathBuf,
+        /// 가져오기 이름
+        #[arg(long)]
+        name: String,
+    },
+    List,
+    /// 원본 VM, 제안, 경고, 마지막 실행의 오류
+    Get {
+        import: String,
+    },
+    /// 원본 디스크를 볼륨으로 옮겨 새 VM(꺼짐)을 만든다. 주지 않은 값은 제안 값이다.
+    Run(Box<ImportRunArgs>),
+    /// 가져오기와 원본 파일을 지운다(만든 VM은 남는다).
+    Delete {
+        import: String,
+        /// 원본 노드가 없거나 오프라인이면 기록만 지운다(원본 파일은 그 노드에 남는다).
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Args)]
+struct ImportRunArgs {
+    import: String,
+    /// 새 VM 이름
+    #[arg(long)]
+    name: String,
+    /// 디스크 볼륨을 만들 풀
+    #[arg(long)]
+    pool: String,
+    /// 원본 네트워크를 opLite 네트워크에 잇는다(예: `"VM Network=lan"`). 원본 NIC의 네트워크마다
+    /// 준다. 원본 네트워크가 하나면 `NETWORK`만 줘도 된다.
+    #[arg(long = "net", value_name = "SOURCE=NETWORK", value_parser = parse_net)]
+    nets: Vec<NetArg>,
+    #[arg(long, value_enum)]
+    disk_bus: Option<DiskBus>,
+    #[arg(long, value_enum)]
+    nic_model: Option<NicModel>,
+    #[arg(long, value_enum)]
+    firmware: Option<Firmware>,
+    #[arg(long)]
+    sockets: Option<u16>,
+    #[arg(long)]
+    cores: Option<u16>,
+    /// 메모리(MiB)
+    #[arg(long)]
+    memory: Option<u32>,
+    /// 원본 MAC 주소 대신 새 MAC을 받는다.
+    #[arg(long)]
+    new_macs: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DiskBus {
+    VirtioBlk,
+    Sata,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum NicModel {
+    Virtio,
+    E1000e,
+}
+
+/// `--net`으로 받은 매핑. `source`가 없으면 하나뿐인 원본 네트워크다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetArg {
+    source: Option<String>,
+    network: String,
+}
+
+fn parse_net(s: &str) -> Result<NetArg, String> {
+    let bad = || format!("invalid network mapping {s:?}: use SOURCE=NETWORK or NETWORK");
+    // 원본 네트워크 이름에 `=`가 있을 수 있다. opLite 네트워크 이름에는 없다.
+    let (source, network) = match s.rsplit_once('=') {
+        Some(("", _)) => return Err(bad()),
+        Some((source, network)) => (Some(source.to_string()), network),
+        None => (None, s),
+    };
+    if network.is_empty() {
+        return Err(bad());
+    }
+    Ok(NetArg {
+        source,
+        network: network.into(),
+    })
+}
+
+/// 가져오기의 원본 네트워크(제안의 네트워크 매핑 키)
+fn source_networks(import: &Value) -> Vec<String> {
+    import["status"]["proposal"]["networks"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// `import run`의 요청 본문. `sources`는 `=` 없는 `--net`을 이을 원본 네트워크다.
+fn import_run_body(args: &ImportRunArgs, sources: &[String]) -> anyhow::Result<Value> {
+    let mut networks = serde_json::Map::new();
+    for net in &args.nets {
+        let source = match (&net.source, sources) {
+            (Some(source), _) => source.clone(),
+            (None, [only]) => only.clone(),
+            (None, _) => bail!(
+                "--net {} needs SOURCE=NETWORK: vm-import {} has {} source networks ({})",
+                net.network,
+                args.import,
+                sources.len(),
+                sources
+                    .iter()
+                    .map(|s| format!("{s:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        networks.insert(source, json!(net.network));
+    }
+    Ok(json!({
+        "name": args.name,
+        "pool": args.pool,
+        "networks": networks,
+        "disk_bus": args.disk_bus.map(value_name),
+        "nic_model": args.nic_model.map(value_name),
+        "firmware": args.firmware.map(value_name),
+        "sockets": args.sockets,
+        "cores": args.cores,
+        "memory_mib": args.memory,
+        "keep_macs": !args.new_macs,
+    }))
+}
+
+#[derive(Subcommand)]
 enum TaskCmd {
     List,
     Get { task: String },
@@ -1458,6 +1599,7 @@ where
         Cmd::Vm { cmd } => vm(&client, cmd, json_out, out).await?,
         Cmd::Backup { cmd } => backup(&client, cmd, json_out, out).await?,
         Cmd::BackupJob { cmd } => backup_job(&client, cmd, json_out, out).await?,
+        Cmd::Import { cmd } => import(&client, cmd, json_out, out).await?,
         Cmd::Task { cmd } => match cmd {
             TaskCmd::List => {
                 let list = client.get("/tasks").await?;
@@ -1806,6 +1948,216 @@ fn backup_job_row(j: &Value) -> Vec<String> {
         next,
         last,
     ]
+}
+
+async fn import(
+    client: &Client,
+    cmd: ImportCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        ImportCmd::Ova { file, name } => {
+            // 파일을 보내기 전에 서버가 받을 수 있는지 확인한다.
+            let size = tokio::fs::metadata(&file)
+                .await
+                .with_context(|| format!("cannot read {}", file.display()))?
+                .len()
+                .to_string();
+            client
+                .send(
+                    client
+                        .request(Method::POST, "/vm-imports/ova/check")
+                        .query(&[("name", name.as_str()), ("size", size.as_str())]),
+                )
+                .await?;
+            let file_name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("{name}.ova"));
+            let query = [("name", name.as_str()), ("file_name", file_name.as_str())];
+            client.upload("/vm-imports/ova", &query, &file).await?;
+            writeln!(
+                out,
+                "vm-import {name} uploaded; review it with `oplctl import get {name}`"
+            )?;
+        }
+        ImportCmd::List => {
+            let list = client.get("/vm-imports").await?;
+            let (nodes, vms) = if json_out {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    items(&client.get("/nodes").await?),
+                    items(&client.get("/vms").await?),
+                )
+            };
+            print_list(out, json_out, &list, IMPORT_HEADERS, |i| {
+                import_row(i, &nodes, &vms)
+            })?;
+        }
+        ImportCmd::Get { import } => {
+            let import = client.get(&format!("/vm-imports/{import}")).await?;
+            if json_out {
+                print_json(out, &import)?;
+            } else {
+                let nodes = items(&client.get("/nodes").await?);
+                let vms = if import["status"]["vm"].is_null() {
+                    Vec::new()
+                } else {
+                    items(&client.get("/vms").await?)
+                };
+                print_import(out, &import, &nodes, &vms)?;
+            }
+        }
+        ImportCmd::Run(args) => {
+            // `=` 없는 --net이 있을 때만 원본 네트워크를 읽는다.
+            let sources = if args.nets.iter().any(|n| n.source.is_none()) {
+                source_networks(&client.get(&format!("/vm-imports/{}", args.import)).await?)
+            } else {
+                Vec::new()
+            };
+            let body = import_run_body(&args, &sources)?;
+            let task = client
+                .post(&format!("/vm-imports/{}/run", args.import), &body)
+                .await?;
+            client.wait_task_for(&task, IMPORT_WAIT).await?;
+            writeln!(out, "vm {} imported", args.name)?;
+        }
+        ImportCmd::Delete { import, force } => {
+            let mut r = client.request(Method::DELETE, &format!("/vm-imports/{import}"));
+            if force {
+                r = r.query(&[("force", "true")]);
+            }
+            let got = client.send(r).await?;
+            // force로 기록만 지웠으면(200) 서버의 알림을 보이고, 아니면 Task(202)를 기다린다.
+            if let Some(message) = got["message"].as_str() {
+                writeln!(out, "{message}")?;
+            } else {
+                client.wait_task(&got).await?;
+                writeln!(out, "vm-import {import} deleted")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 목록에서 id가 `id`인 항목의 이름. 없으면 id다.
+fn name_of(list: &[Value], id: &Value) -> String {
+    list.iter()
+        .find(|v| v["id"] == *id)
+        .map_or_else(|| cell(id), |v| cell(&v["name"]))
+}
+
+/// `import list`의 열
+const IMPORT_HEADERS: &[&str] = &["NAME", "NODE", "SOURCE", "PHASE", "VM"];
+
+/// `import list`의 한 행. SOURCE는 원본 VM 이름이고, 원본을 읽지 못했으면 올린 파일 이름이다.
+fn import_row(i: &Value, nodes: &[Value], vms: &[Value]) -> Vec<String> {
+    let status = &i["status"];
+    let source = match status["source_vm"]["name"].as_str() {
+        Some(name) => name.to_string(),
+        None => cell(&i["spec"]["source"]["ova"]["file_name"]),
+    };
+    vec![
+        cell(&i["name"]),
+        name_of(nodes, &i["spec"]["node"]),
+        source,
+        cell(&status["phase"]),
+        name_of(vms, &status["vm"]),
+    ]
+}
+
+/// `import get`: 머리 줄들, 원본 디스크와 NIC 표, 경고
+fn print_import(
+    out: &mut (dyn Write + Send),
+    i: &Value,
+    nodes: &[Value],
+    vms: &[Value],
+) -> anyhow::Result<()> {
+    let ova = &i["spec"]["source"]["ova"];
+    let status = &i["status"];
+    writeln!(out, "vm-import: {}", cell(&i["name"]))?;
+    writeln!(out, "node: {}", name_of(nodes, &i["spec"]["node"]))?;
+    writeln!(
+        out,
+        "source: {} ({})",
+        cell(&ova["file_name"]),
+        bytes(&ova["size_bytes"])
+    )?;
+    writeln!(out, "phase: {}", cell(&status["phase"]))?;
+    if !status["vm"].is_null() {
+        writeln!(out, "vm: {}", name_of(vms, &status["vm"]))?;
+    }
+    if let Some(error) = status["error"].as_str() {
+        writeln!(out, "error: {error}")?;
+    }
+    let src = &status["source_vm"];
+    if src.is_object() {
+        writeln!(
+            out,
+            "source vm: {} ({}, {}, {} vCPUs, {} cores per socket, {} MiB)",
+            cell(&src["name"]),
+            cell(&src["guest_os"]),
+            cell(&src["firmware"]),
+            cell(&src["vcpus"]),
+            cell(&src["cores_per_socket"]),
+            cell(&src["memory_mib"])
+        )?;
+    }
+    let p = &status["proposal"];
+    if p.is_object() {
+        writeln!(
+            out,
+            "proposal: {} sockets x {} cores, {} MiB, {}, {} disks, {} NICs",
+            cell(&p["sockets"]),
+            cell(&p["cores"]),
+            cell(&p["memory_mib"]),
+            cell(&p["firmware"]),
+            cell(&p["disk_bus"]),
+            cell(&p["nic_model"])
+        )?;
+    }
+    if src.is_object() {
+        let disks: Vec<_> = src["disks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|d| {
+                vec![
+                    cell(&d["name"]),
+                    cell(&d["file"]),
+                    bytes(&d["capacity_bytes"]),
+                    cell(&d["controller"]),
+                ]
+            })
+            .collect();
+        writeln!(out)?;
+        table(out, &["DISK", "FILE", "SIZE", "CONTROLLER"], &disks)?;
+        // PROPOSED는 이름이 같아 제안한 opLite 네트워크다.
+        let nics: Vec<_> = src["nics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|n| {
+                vec![
+                    cell(&n["network"]),
+                    cell(&n["adapter"]),
+                    cell(&n["mac"]),
+                    cell(&p["networks"][n["network"].as_str().unwrap_or_default()]),
+                ]
+            })
+            .collect();
+        writeln!(out)?;
+        table(out, &["NETWORK", "ADAPTER", "MAC", "PROPOSED"], &nics)?;
+    }
+    if let Some(warnings) = status["warnings"].as_array().filter(|w| !w.is_empty()) {
+        writeln!(out, "\nwarnings:")?;
+        for w in warnings {
+            writeln!(out, "  {}", cell(w))?;
+        }
+    }
+    Ok(())
 }
 
 /// 이 기계의 opld에 보내는 클러스터 명령. 로그인이 필요 없다. 다른 명령이면 `None`이다.
@@ -4738,6 +5090,395 @@ mod tests {
         );
         let err = nic_groups_update(&vm, 2, &groups).unwrap_err().to_string();
         assert_eq!(err, "VM web has no NIC 2 (2 NICs, numbered from 0)");
+    }
+
+    /// `import` 명령의 인자
+    fn parse_import(args: &[&str]) -> Result<ImportCmd, clap::Error> {
+        let mut argv = vec!["oplctl", "import"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+            Cmd::Import { cmd } => cmd,
+            _ => unreachable!(),
+        })
+    }
+
+    /// `import run`의 인자를 요청 본문으로. `sources`는 가져오기의 원본 네트워크다.
+    fn import_run(args: &[&str], sources: &[&str]) -> anyhow::Result<Value> {
+        let mut argv = vec!["run", "web01"];
+        argv.extend_from_slice(args);
+        let ImportCmd::Run(run) = parse_import(&argv)? else {
+            unreachable!()
+        };
+        let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+        import_run_body(&run, &sources)
+    }
+
+    #[test]
+    fn parses_import_commands() {
+        assert!(matches!(
+            parse_import(&["ova", "/tmp/web01.ova", "--name", "web01"]).unwrap(),
+            ImportCmd::Ova { file, name } if file == std::path::Path::new("/tmp/web01.ova") && name == "web01"
+        ));
+        assert!(matches!(parse_import(&["list"]).unwrap(), ImportCmd::List));
+        assert!(matches!(
+            parse_import(&["get", "web01"]).unwrap(),
+            ImportCmd::Get { import } if import == "web01"
+        ));
+        assert!(matches!(
+            parse_import(&["delete", "web01", "--force"]).unwrap(),
+            ImportCmd::Delete { import, force: true } if import == "web01"
+        ));
+        // 가져오기 이름, 새 VM 이름과 풀은 꼭 준다.
+        for args in [
+            &["ova", "/tmp/web01.ova"][..],
+            &["run", "web01", "--pool", "local"],
+            &["run", "web01", "--name", "web"],
+            &[
+                "run",
+                "web01",
+                "--name",
+                "web",
+                "--pool",
+                "local",
+                "--disk-bus",
+                "ide",
+            ],
+            &[
+                "run",
+                "web01",
+                "--name",
+                "web",
+                "--pool",
+                "local",
+                "--net",
+                "VM Network=",
+            ],
+            &[
+                "run", "web01", "--name", "web", "--pool", "local", "--net", "=lan",
+            ],
+            &[
+                "run", "web01", "--name", "web", "--pool", "local", "--net", "",
+            ],
+        ] {
+            assert!(parse_import(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn import_run_builds_the_body() {
+        // 주지 않은 값은 비워 두어 서버가 제안 값을 쓴다.
+        assert_eq!(
+            import_run(
+                &[
+                    "--name",
+                    "web",
+                    "--pool",
+                    "local",
+                    "--net",
+                    "VM Network=lan",
+                    "--net",
+                    "DMZ=dmz",
+                    "--net",
+                    "a=b=lan"
+                ],
+                &["DMZ", "VM Network", "a=b"]
+            )
+            .unwrap(),
+            json!({
+                "name": "web", "pool": "local",
+                "networks": { "VM Network": "lan", "DMZ": "dmz", "a=b": "lan" },
+                "disk_bus": null, "nic_model": null, "firmware": null,
+                "sockets": null, "cores": null, "memory_mib": null,
+                "keep_macs": true
+            })
+        );
+        assert_eq!(
+            import_run(
+                &[
+                    "--name",
+                    "web",
+                    "--pool",
+                    "local",
+                    "--net",
+                    "lan",
+                    "--disk-bus",
+                    "sata",
+                    "--nic-model",
+                    "e1000e",
+                    "--firmware",
+                    "bios",
+                    "--sockets",
+                    "2",
+                    "--cores",
+                    "4",
+                    "--memory",
+                    "8192",
+                    "--new-macs"
+                ],
+                &["VM Network"]
+            )
+            .unwrap(),
+            json!({
+                "name": "web", "pool": "local",
+                "networks": { "VM Network": "lan" },
+                "disk_bus": "sata", "nic_model": "e1000e", "firmware": "bios",
+                "sockets": 2, "cores": 4, "memory_mib": 8192,
+                "keep_macs": false
+            })
+        );
+        assert_eq!(
+            import_run(
+                &["--name", "web", "--pool", "p", "--disk-bus", "virtio-blk"],
+                &[]
+            )
+            .unwrap()["disk_bus"],
+            "virtio-blk"
+        );
+        // `=` 없는 --net은 원본 네트워크가 하나일 때만 쓴다.
+        let err = import_run(
+            &["--name", "web", "--pool", "p", "--net", "lan"],
+            &["A", "B"],
+        );
+        assert_eq!(
+            err.unwrap_err().to_string(),
+            "--net lan needs SOURCE=NETWORK: vm-import web01 has 2 source networks (\"A\", \"B\")"
+        );
+        let err = import_run(&["--name", "web", "--pool", "p", "--net", "lan"], &[]);
+        assert_eq!(
+            err.unwrap_err().to_string(),
+            "--net lan needs SOURCE=NETWORK: vm-import web01 has 0 source networks ()"
+        );
+    }
+
+    fn sample_import() -> Value {
+        json!({
+            "id": "11111111-1111-1111-1111-111111111111",
+            "name": "web01",
+            "spec": {
+                "node": "n-1",
+                "source": { "ova": { "file_name": "web01.ova", "size_bytes": 3u64 << 29 } }
+            },
+            "status": {
+                "phase": "ready",
+                "source_vm": {
+                    "name": "web01-src", "guest_os": "otherLinux64Guest", "firmware": "uefi",
+                    "vcpus": 2, "cores_per_socket": 2, "memory_mib": 1024,
+                    "disks": [
+                        { "name": "disk0", "file": "web01-disk1.vmdk", "capacity_bytes": 10u64 << 30, "controller": "scsi" }
+                    ],
+                    "nics": [
+                        { "network": "VM Network", "adapter": "vmxnet3", "mac": "00:50:56:aa:bb:cc" },
+                        { "network": "DMZ", "adapter": "e1000" }
+                    ]
+                },
+                "proposal": {
+                    "sockets": 1, "cores": 2, "memory_mib": 1024, "firmware": "uefi",
+                    "disk_bus": "virtio-blk", "nic_model": "virtio",
+                    "networks": { "DMZ": null, "VM Network": "VM Network" }
+                },
+                "warnings": ["first warning", "second warning"],
+                "error": "checksum mismatch for web01-disk1.vmdk"
+            }
+        })
+    }
+
+    #[test]
+    fn source_networks_are_the_proposal_keys() {
+        assert_eq!(source_networks(&sample_import()), ["DMZ", "VM Network"]);
+        assert!(source_networks(&json!({ "status": {} })).is_empty());
+    }
+
+    #[test]
+    fn import_list_shows_node_source_and_vm_names() {
+        let nodes = [json!({ "id": "n-1", "name": "node1" })];
+        let vms = [json!({ "id": "v-1", "name": "web" })];
+        assert_eq!(
+            import_row(&sample_import(), &nodes, &vms),
+            ["web01", "node1", "web01-src", "ready", "-"]
+        );
+        // 만든 VM은 이름으로, 지운 VM·빠진 노드는 id로 보인다.
+        let mut done = sample_import();
+        done["status"]["phase"] = json!("done");
+        done["status"]["vm"] = json!("v-1");
+        assert_eq!(import_row(&done, &nodes, &vms)[3..], ["done", "web"]);
+        assert_eq!(
+            import_row(&done, &[], &[])[1..],
+            ["n-1", "web01-src", "done", "v-1"]
+        );
+        // 원본을 읽지 못한 가져오기는 파일 이름을 보인다.
+        let mut failed = sample_import();
+        failed["status"] = json!({ "phase": "failed" });
+        assert_eq!(import_row(&failed, &nodes, &vms)[2], "web01.ova");
+    }
+
+    #[test]
+    fn import_get_shows_the_source_proposal_and_warnings() {
+        let nodes = [json!({ "id": "n-1", "name": "node1" })];
+        let mut out = Vec::new();
+        print_import(&mut out, &sample_import(), &nodes, &[]).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\
+vm-import: web01
+node: node1
+source: web01.ova (1.5GiB)
+phase: ready
+error: checksum mismatch for web01-disk1.vmdk
+source vm: web01-src (otherLinux64Guest, uefi, 2 vCPUs, 2 cores per socket, 1024 MiB)
+proposal: 1 sockets x 2 cores, 1024 MiB, uefi, virtio-blk disks, virtio NICs
+
+DISK   FILE              SIZE     CONTROLLER
+disk0  web01-disk1.vmdk  10.0GiB  scsi
+
+NETWORK     ADAPTER  MAC                PROPOSED
+VM Network  vmxnet3  00:50:56:aa:bb:cc  VM Network
+DMZ         e1000    -                  -
+
+warnings:
+  first warning
+  second warning
+"
+        );
+        // 끝난 가져오기는 만든 VM을, 경고가 없으면 경고 줄을 뺀다.
+        let mut done = sample_import();
+        done["status"]["phase"] = json!("done");
+        done["status"]["vm"] = json!("v-1");
+        done["status"]["warnings"] = json!([]);
+        done["status"]["error"] = Value::Null;
+        let mut out = Vec::new();
+        print_import(
+            &mut out,
+            &done,
+            &nodes,
+            &[json!({ "id": "v-1", "name": "web" })],
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("phase: done\nvm: web\nsource vm: "), "{text}");
+        assert!(
+            !text.contains("warnings") && !text.contains("error"),
+            "{text}"
+        );
+    }
+
+    /// `import ova`는 크기로 먼저 확인하고 실제 파일 이름과 함께 올린다.
+    #[tokio::test]
+    async fn import_ova_checks_then_uploads_with_the_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // 본문이 없어야 작은 시험 서버가 요청 줄만 읽고 답할 수 있다.
+        let file = dir.path().join("web01-export.ova");
+        std::fs::write(&file, b"").unwrap();
+        let (client, seen) = fake_api(|_| json!({ "name": "web01" })).await;
+        let cmd = ImportCmd::Ova {
+            file,
+            name: "web01".into(),
+        };
+        let mut out = Vec::new();
+        import(&client, cmd, false, &mut out).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "POST /api/v1/vm-imports/ova/check?name=web01&size=0 HTTP/1.1",
+                "POST /api/v1/vm-imports/ova?name=web01&file_name=web01-export.ova HTTP/1.1"
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm-import web01 uploaded; review it with `oplctl import get web01`\n"
+        );
+    }
+
+    /// `=` 없는 `--net`이면 가져오기를 읽어 원본 네트워크를 찾고, 실행 Task를 기다린다.
+    #[tokio::test]
+    async fn import_run_reads_the_import_for_a_bare_net_and_waits() {
+        let (client, seen) = fake_api(|path| {
+            if path.starts_with("/api/v1/tasks/") {
+                json!({ "id": "t1", "status": { "state": "succeeded" } })
+            } else if path.ends_with("/run") {
+                json!({ "id": "t1", "spec": {}, "status": { "state": "pending" } })
+            } else {
+                json!({ "status": { "proposal": { "networks": { "VM Network": null } } } })
+            }
+        })
+        .await;
+        let run = |args: &[&str]| {
+            let mut argv = vec![
+                "oplctl", "import", "run", "web01", "--name", "web", "--pool", "p",
+            ];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Import { cmd } => cmd,
+                _ => unreachable!(),
+            }
+        };
+        let mut out = Vec::new();
+        import(&client, run(&["--net", "lan"]), false, &mut out)
+            .await
+            .unwrap();
+        // SOURCE=NETWORK만 주면 읽지 않는다.
+        import(&client, run(&["--net", "VM Network=lan"]), false, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/vm-imports/web01 HTTP/1.1",
+                "POST /api/v1/vm-imports/web01/run HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1",
+                "POST /api/v1/vm-imports/web01/run HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1"
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm web imported\nvm web imported\n"
+        );
+    }
+
+    /// `import delete --force`는 `?force=true`로 보내고 서버의 알림을 보인다. 아니면 Task를 기다린다.
+    #[tokio::test]
+    async fn import_delete_force_shows_the_server_message() {
+        let (client, seen) = fake_api(|_| {
+            json!({ "message": "vm-import \"web01\" deleted; its files are left on node \"n1\" (x)" })
+        })
+        .await;
+        let mut out = Vec::new();
+        let cmd = ImportCmd::Delete {
+            import: "web01".into(),
+            force: true,
+        };
+        import(&client, cmd, false, &mut out).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["DELETE /api/v1/vm-imports/web01?force=true HTTP/1.1"]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm-import \"web01\" deleted; its files are left on node \"n1\" (x)\n"
+        );
+
+        let (client, seen) = fake_api(|path| {
+            if path.starts_with("/api/v1/tasks/") {
+                json!({ "id": "t1", "status": { "state": "succeeded" } })
+            } else {
+                json!({ "id": "t1", "spec": {}, "status": { "state": "pending" } })
+            }
+        })
+        .await;
+        let mut out = Vec::new();
+        let cmd = ImportCmd::Delete {
+            import: "web01".into(),
+            force: false,
+        };
+        import(&client, cmd, false, &mut out).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "DELETE /api/v1/vm-imports/web01 HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1"
+            ]
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "vm-import web01 deleted\n");
     }
 
     #[test]

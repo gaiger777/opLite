@@ -16,6 +16,9 @@ pub const MIGRATE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 /// 백업·복원 Task를 기다리는 시간. 디스크를 모두 복사하므로 Task 실행기는 시간 제한을 두지 않는다.
 pub const BACKUP_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// VM 가져오기 Task를 기다리는 시간. 디스크를 모두 옮기므로 Task 실행기는 시간 제한을 두지 않는다.
+pub const IMPORT_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Task 조회 요청 하나의 제한 시간. 서버가 응답하지 않아도 전체 기다리기 제한(`TASK_WAIT`)이 지켜지게 한다.
 const TASK_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
