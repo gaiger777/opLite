@@ -22,6 +22,7 @@ mod snapshots;
 mod state;
 mod tasks;
 pub mod users;
+pub mod vm_imports;
 mod vms;
 mod volumes;
 mod watch;

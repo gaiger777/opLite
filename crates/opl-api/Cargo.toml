@@ -24,8 +24,10 @@ opl-driver.workspace = true
 opl-peer.workspace = true
 opl-reconciler.workspace = true
 opl-types = { workspace = true, features = ["openapi"] }
+roxmltree.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true

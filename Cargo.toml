@@ -35,6 +35,8 @@ utoipa = { version = "6.0.0", features = ["uuid"] }
 axum = { version = "0.8.9", features = ["ws", "macros"] }
 argon2 = "0.6.0"
 sha2 = "0.11.1"
+sha1 = "0.11.0"
+roxmltree = "0.21.2"
 getrandom = "0.4.3"
 hex = "0.4.3"
 futures-util = "0.3.34"
