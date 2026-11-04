@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::storage::SourceFormat;
+use crate::vm_import::ImportRun;
 
 /// 오래 걸리는 작업. API가 만들고 `node`의 작업 실행기가 실행해 status를 기록한다.
 /// 리소스 이름은 id 문자열이다.
@@ -16,7 +17,7 @@ pub type Task = Resource<TaskSpec, TaskStatus>;
 pub struct TaskSpec {
     pub op: TaskOp,
     /// 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제·백업 Task는 (원본) VM, 백업 지우기는 백업,
-    /// 복원은 새 VM이다.
+    /// 복원과 VM 가져오기는 새 VM, 가져오기 지우기는 가져오기다.
     pub target: Uuid,
     /// 작업을 실행할 노드
     pub node: Uuid,
@@ -90,6 +91,14 @@ pub enum TaskOp {
         name: String,
         pool: String,
     },
+    /// 가져오기 `import`를 `run`의 값으로 대상 id(미리 정한 새 VM id)의 새 VM으로 만든다. 가져오기의
+    /// 노드(원본이 있는 노드)에서 돈다.
+    VmImport {
+        import: Uuid,
+        run: ImportRun,
+    },
+    /// 대상 가져오기의 원본 디렉터리와 리소스를 지운다.
+    VmImportDelete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -265,6 +274,45 @@ mod tests {
                     "name": "web-2",
                     "pool": "local"
                 }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&op).unwrap(), json);
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        }
+    }
+
+    #[test]
+    fn vm_import_ops_are_tagged_by_kind() {
+        let import = Uuid::now_v7();
+        let run: ImportRun = serde_json::from_value(serde_json::json!({
+            "name": "web01",
+            "pool": "local",
+            "networks": { "VM Network": "lan" }
+        }))
+        .unwrap();
+        for (op, json) in [
+            (
+                TaskOp::VmImport { import, run },
+                serde_json::json!({
+                    "kind": "vm-import",
+                    "import": import,
+                    "run": {
+                        "name": "web01",
+                        "pool": "local",
+                        "networks": { "VM Network": "lan" },
+                        "disk_bus": null,
+                        "nic_model": null,
+                        "firmware": null,
+                        "sockets": null,
+                        "cores": null,
+                        "memory_mib": null,
+                        "keep_macs": true
+                    }
+                }),
+            ),
+            (
+                TaskOp::VmImportDelete,
+                serde_json::json!({ "kind": "vm-import-delete" }),
             ),
         ] {
             assert_eq!(serde_json::to_value(&op).unwrap(), json);

@@ -114,7 +114,7 @@ fn backup_tasks(state: &AppState, id: Uuid) -> Result<Vec<&'static str>, ApiErro
 }
 
 /// 노드 `id`가 온라인인지 확인한다. 아니면 409 `node_offline`.
-fn check_online(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+pub(crate) fn check_online(state: &AppState, id: Uuid) -> Result<(), ApiError> {
     match state.cluster.get::<NodeSpec>(id)? {
         Some(n) if n.status.online => Ok(()),
         n => Err(ApiError::conflict(
@@ -128,7 +128,7 @@ fn check_online(state: &AppState, id: Uuid) -> Result<(), ApiError> {
 }
 
 /// 노드 `id`의 이름(없으면 id)
-fn node_name(state: &AppState, id: Uuid) -> Result<String, ApiError> {
+pub(crate) fn node_name(state: &AppState, id: Uuid) -> Result<String, ApiError> {
     Ok(state
         .cluster
         .get::<NodeSpec>(id)?

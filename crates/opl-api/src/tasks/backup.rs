@@ -46,7 +46,7 @@ fn temp_tag(backup: Uuid) -> String {
 
 /// 이 노드에서 준비된 풀 `name`. 준비되지 않았으면(마운트되지 않은 NFS 풀의 빈 마운트 지점에 쓰지
 /// 않는다) 오류다.
-fn ready_pool(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
+pub(super) fn ready_pool(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
     let pool = ctx
         .cluster
         .get_by_name::<StoragePoolSpec>(name)
@@ -541,6 +541,10 @@ pub(super) async fn restore(
         disk.volume = copy.name.clone();
     }
     new.spec.ha = false;
+    // 되살린 VM은 MAC을 새로 받는다.
+    for nic in &mut new.spec.nics {
+        nic.mac = None;
+    }
     new.spec
         .validate()
         .map_err(|e| format!("invalid VM spec in backup: {e}"))?;

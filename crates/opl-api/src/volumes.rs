@@ -170,7 +170,7 @@ fn check_pool_format(pool: &StoragePool, format: ImageFormat) -> Result<(), ApiE
 
 /// 형식을 적지 않았을 때의 볼륨 형식: 블록 풀([`block_pool_kind`])은 raw, 그 밖은 스냅샷을 담을 수 있는
 /// qcow2
-fn default_format(pool: &StoragePool) -> ImageFormat {
+pub(crate) fn default_format(pool: &StoragePool) -> ImageFormat {
     if block_pool_kind(pool).is_some() {
         ImageFormat::Raw
     } else {
@@ -348,7 +348,7 @@ pub async fn import_volume(
 }
 
 /// 올린 파일이 다 들어와도 데이터 디렉터리(Raft 저장소가 있다)에 남겨 둘 여유 공간
-const UPLOAD_RESERVE_BYTES: u64 = 1 << 30;
+pub(crate) const UPLOAD_RESERVE_BYTES: u64 = 1 << 30;
 
 pub(crate) fn content_length(headers: &HeaderMap) -> Result<u64, ApiError> {
     headers

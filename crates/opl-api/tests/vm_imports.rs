@@ -1,14 +1,17 @@
-//! VM 가져오기 API: OVA 올리기 사전 확인, 올리기(해석과 제안), 목록·읽기, 노드 시작 때의 정리.
+//! VM 가져오기 API: OVA 올리기 사전 확인, 올리기(해석과 제안), 목록·읽기, 실행 요청의 검사, 지우기와
+//! 강제 지우기, 노드 시작 때의 정리.
 
 mod common;
 
 use std::path::PathBuf;
 
 use common::ustar::Tar;
-use common::{Client, Env};
+use common::{Client, Env, vm_request};
 use opl_types::network::NetworkSpec;
 use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
+use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumeSpec};
+use opl_types::task::{TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm_import::{
     ImportPhase, ImportSource, OvaSource, VmImport, VmImportSpec, VmImportStatus,
 };
@@ -336,4 +339,544 @@ async fn startup_sweeps_import_directories() {
     );
     assert_eq!(phase(done.id), (ImportPhase::Done, None));
     assert_eq!(phase(other.id), (ImportPhase::Ready, None));
+}
+
+/// 이 노드에서 준비된 dir 풀. `nodes`가 비어 있지 않으면 그 노드에서만 쓸 수 있다.
+async fn pool(env: &Env, name: &str, nodes: Vec<Uuid>) {
+    let dir = env.dir.path().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = Resource::new(
+        name,
+        StoragePoolSpec {
+            backend: PoolBackend::Dir { path: dir },
+            nodes,
+            shared: false,
+            backups: false,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    env.pool_ready(name).await;
+}
+
+/// 네트워크 `lan`, 풀 `local`, 올린 가져오기 `web01`(vSphere 견본: 디스크 셋, NIC 둘)
+async fn uploaded(env: &Env, admin: &Client) -> Value {
+    network(env, "lan").await;
+    pool(env, "local", vec![]).await;
+    let (status, body) = admin
+        .upload("/vm-imports/ova?name=web01", vsphere_ova())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body
+}
+
+/// 원본 네트워크를 모두 `lan`에 매핑한 실행 요청
+fn run_request(name: &str) -> Value {
+    json!({
+        "name": name,
+        "pool": "local",
+        "networks": { "VM Network": "lan", "lan": "lan" },
+    })
+}
+
+async fn run(client: &Client, import: &str, body: Value) -> (StatusCode, Value) {
+    client
+        .post(&format!("/vm-imports/{import}/run"), body)
+        .await
+}
+
+fn import_named(env: &Env, name: &str) -> Option<VmImport> {
+    env.cluster.get_by_name::<VmImportSpec>(name).unwrap()
+}
+
+async fn set_phase(env: &Env, name: &str, phase: ImportPhase) {
+    let import = import_named(env, name).unwrap();
+    let status = VmImportStatus {
+        phase,
+        ..import.status
+    };
+    env.cluster
+        .update_status::<VmImportSpec>(import.id, &status)
+        .await
+        .unwrap();
+}
+
+/// Task를 저장소에 직접 만든다(API의 검사 없이).
+async fn put_task(env: &Env, op: TaskOp, target: Uuid, state: TaskState) -> Value {
+    let mut task: opl_types::task::Task = Resource::new(
+        "",
+        TaskSpec {
+            op,
+            target,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+    if state != TaskState::Pending {
+        let status = TaskStatus { state, error: None };
+        env.cluster
+            .update_status::<TaskSpec>(task.id, &status)
+            .await
+            .unwrap();
+    }
+    json!({ "id": task.id })
+}
+
+/// 실행 요청은 Task를 만들기 전에 매핑·이름·풀·MAC과 결과 VM 스펙을 확인한다.
+#[tokio::test]
+async fn run_checks_the_request() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    uploaded(&env, &admin).await;
+    let (status, vm) = admin.post("/vms", vm_request("taken")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let volume = Resource::new(
+        "vol-disk1",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 20,
+            format: opl_types::runtime::ImageFormat::Qcow2,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    pool(&env, "far", vec![Uuid::now_v7()]).await;
+    // 원본의 첫 NIC과 같은 MAC을 쓰는 VM
+    let mut mac = vm_request("mac");
+    mac["spec"]["nics"][0]["mac"] = json!("00:50:56:8a:12:34");
+    let (status, vm) = admin.post("/vms", mac).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+
+    let with = |patch: Value| {
+        let mut body = run_request("web01");
+        for (k, v) in patch.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        body
+    };
+    for (body, want, code, message) in [
+        (
+            with(json!({ "networks": { "lan": "lan" } })),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            Some("no network mapping for \"VM Network\""),
+        ),
+        (
+            with(json!({ "networks": { "VM Network": "nope", "lan": "lan" } })),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            Some("network \"nope\" not found"),
+        ),
+        (
+            with(json!({ "name": "Bad_Name" })),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            None,
+        ),
+        (
+            with(json!({ "name": "taken" })),
+            StatusCode::CONFLICT,
+            "name_taken",
+            Some("VM \"taken\" already exists"),
+        ),
+        (
+            with(json!({ "name": "vol" })),
+            StatusCode::CONFLICT,
+            "name_taken",
+            Some("volume \"vol-disk1\" already exists"),
+        ),
+        (
+            with(json!({ "pool": "nope" })),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            Some("storage pool \"nope\" not found"),
+        ),
+        (
+            with(json!({ "pool": "far" })),
+            StatusCode::CONFLICT,
+            "pool_not_on_node",
+            None,
+        ),
+        (
+            with(json!({ "sockets": 0 })),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            Some("cpu.sockets must be at least 1"),
+        ),
+        (
+            run_request("web01"),
+            StatusCode::CONFLICT,
+            "mac_in_use",
+            Some("MAC address 00:50:56:8a:12:34 is already in use"),
+        ),
+        (
+            with(json!({ "surprise": 1 })),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            None,
+        ),
+    ] {
+        let (status, got) = run(&admin, "web01", body.clone()).await;
+        assert_eq!(
+            (status, got["code"].as_str()),
+            (want, Some(code)),
+            "{body} {got}"
+        );
+        if let Some(message) = message {
+            assert_eq!(got["message"], message, "{body}");
+        }
+    }
+    // 거절한 요청은 가져오기를 바꾸지 않는다.
+    let import = import_named(&env, "web01").unwrap();
+    assert_eq!(import.status.phase, ImportPhase::Ready);
+    assert_eq!(import.status.error, None);
+
+    let viewer = env.user("viewer", "viewer").await;
+    let (status, body) = run(&viewer, "web01", run_request("web01")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = run(&admin, "nope", run_request("web01")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// 받은 요청은 가져오기를 `importing`으로 바꾸고 새 VM id를 대상으로 한 Task를 돌려준다. 그동안 다시
+/// 실행하거나 지울 수 없다. Task가 실패하면 `ready`로 돌아가 이유를 남긴다(여기서는 가짜 디스크라 실패한다).
+#[tokio::test]
+async fn run_starts_a_task_and_failure_returns_to_ready() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    uploaded(&env, &admin).await;
+    let mut body = run_request("web01");
+    // 새 MAC을 받으면 원본 MAC이 겹쳐도 된다.
+    body["keep_macs"] = json!(false);
+    // 요청에 없는 원본 네트워크 `lan`은 제안의 매핑(이름이 같은 네트워크)을 쓴다.
+    body["networks"] = json!({ "VM Network": "lan" });
+    let mut mac = vm_request("mac");
+    mac["spec"]["nics"][0]["mac"] = json!("00:50:56:8a:12:34");
+    let (status, vm) = admin.post("/vms", mac).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+
+    let (status, task) = run(&admin, "web01", body.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let import = import_named(&env, "web01").unwrap();
+    assert_eq!(task["spec"]["op"]["kind"], "vm-import");
+    assert_eq!(task["spec"]["op"]["import"], import.id.to_string());
+    assert_eq!(task["spec"]["op"]["run"]["keep_macs"], false);
+    assert_eq!(task["spec"]["node"], env.node.to_string());
+    let target = task["spec"]["target"].as_str().unwrap();
+    assert_ne!(target, import.id.to_string());
+
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let import = import_named(&env, "web01").unwrap();
+    assert_eq!(import.status.phase, ImportPhase::Ready);
+    let error = import.status.error.unwrap();
+    assert!(error.starts_with("cannot import disk \"disk0\""), "{error}");
+    assert_eq!(task["status"]["error"], error.as_str());
+    // 추출한 파일은 지우고 원본은 남긴다.
+    let dir = imports_dir(&env).join(import.id.to_string());
+    assert!(!dir.join("disk.vmdk").exists());
+    assert!(dir.join("source.ova").exists());
+    let (_, volumes) = env.cluster.list::<VolumeSpec>().unwrap();
+    assert!(volumes.is_empty(), "{volumes:?}");
+}
+
+/// 실행 Task가 끝나지 않은 가져오기와 끝난·쓸 수 없는 가져오기는 실행하지 않는다. 실행·지우기 Task가
+/// 끝나지 않았으면 지우지도 않는다(`force`여도).
+#[tokio::test]
+async fn run_and_delete_need_an_idle_import() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    uploaded(&env, &admin).await;
+    let id = import_named(&env, "web01").unwrap().id;
+    env.stop_runner().await;
+    let op = TaskOp::VmImport {
+        import: id,
+        run: serde_json::from_value(run_request("web01")).unwrap(),
+    };
+    put_task(&env, op, Uuid::now_v7(), TaskState::Running).await;
+    for (phase, code) in [
+        (ImportPhase::Importing, "import_busy"),
+        (ImportPhase::Done, "import_done"),
+        (ImportPhase::Failed, "import_failed"),
+    ] {
+        set_phase(&env, "web01", phase).await;
+        let (status, body) = run(&admin, "web01", run_request("web01")).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some(code)),
+            "{body}"
+        );
+    }
+    set_phase(&env, "web01", ImportPhase::Importing).await;
+    for path in ["/vm-imports/web01", "/vm-imports/web01?force=true"] {
+        let (status, body) = admin.delete(path).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some("import_busy")),
+            "{body}"
+        );
+    }
+
+    // 끝나지 않은 지우기 Task가 있어도 바쁘다.
+    set_phase(&env, "web01", ImportPhase::Ready).await;
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    for task in tasks {
+        let status = TaskStatus {
+            state: TaskState::Failed,
+            error: None,
+        };
+        env.cluster
+            .update_status::<TaskSpec>(task.id, &status)
+            .await
+            .unwrap();
+    }
+    put_task(&env, TaskOp::VmImportDelete, id, TaskState::Pending).await;
+    let (status, body) = run(&admin, "web01", run_request("web01")).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("import_busy")),
+        "{body}"
+    );
+    let (status, body) = admin.delete("/vm-imports/web01").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("import_busy")),
+        "{body}"
+    );
+}
+
+/// 원본 노드가 없어져 실행 Task가 실패로 끝나면(정리가 돌지 않아) 가져오기는 `importing`에 남는다. 끝나지
+/// 않은 Task가 없으면 쉬는 것으로 보아 다시 실행하거나 지울 수 있고, 노드가 없으면 `force`로 지운다.
+#[tokio::test]
+async fn importing_without_a_running_task_is_idle() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    uploaded(&env, &admin).await;
+    let web01 = import_named(&env, "web01").unwrap();
+    let failed = |import: Uuid| TaskOp::VmImport {
+        import,
+        run: serde_json::from_value(run_request("web01")).unwrap(),
+    };
+    put_task(&env, failed(web01.id), Uuid::now_v7(), TaskState::Failed).await;
+    set_phase(&env, "web01", ImportPhase::Importing).await;
+
+    // 다시 실행할 수 있다(가짜 디스크라 실패해 `ready`로 돌아간다).
+    let (status, task) = run(&admin, "web01", run_request("web01")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(
+        import_named(&env, "web01").unwrap().status.phase,
+        ImportPhase::Ready
+    );
+
+    // 지우기 Task도 지운다.
+    set_phase(&env, "web01", ImportPhase::Importing).await;
+    let (status, task) = admin.delete("/vm-imports/web01").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert!(import_named(&env, "web01").is_none());
+    assert!(!imports_dir(&env).join(web01.id.to_string()).exists());
+
+    // 클러스터에서 없어진 노드의 가져오기는 `force`로 지운다.
+    let far = import_on(&env, "far", Uuid::now_v7(), ImportPhase::Importing).await;
+    put_task(&env, failed(far.id), Uuid::now_v7(), TaskState::Failed).await;
+    let (status, body) = admin.delete("/vm-imports/far").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("node_offline")),
+        "{body}"
+    );
+    let (status, body) = admin.delete("/vm-imports/far?force=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(import_named(&env, "far").is_none());
+}
+
+/// 끝난 실행 Task가 대상 VM을 이미 만들었는데 가져오기가 `done`이 되지 못했으면(VM을 만든 뒤 opld가
+/// 죽었다), 실행 요청이 가져오기를 `done`으로 끝내고 409 `import_done`이다. 이 노드의 원본 디렉터리는 지우고
+/// VM은 둔다. `importing`이든 `ready`든 같다.
+#[tokio::test]
+async fn run_finishes_an_import_whose_vm_was_made() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    uploaded(&env, &admin).await;
+    let web01 = import_named(&env, "web01").unwrap();
+    let other = import_on(&env, "other", env.node, ImportPhase::Ready).await;
+    for (import, phase) in [
+        (&web01, ImportPhase::Importing),
+        (&other, ImportPhase::Ready),
+    ] {
+        set_phase(&env, &import.name, phase).await;
+        let mut vm: opl_types::vm::Vm = Resource::new(
+            format!("{}-vm", import.name),
+            serde_json::from_value(vm_request("x")["spec"].clone()).unwrap(),
+        );
+        vm.id = Uuid::now_v7();
+        env.cluster.create(&vm).await.unwrap();
+        let op = TaskOp::VmImport {
+            import: import.id,
+            run: serde_json::from_value(run_request(&import.name)).unwrap(),
+        };
+        put_task(&env, op, vm.id, TaskState::Failed).await;
+
+        let (status, body) = run(&admin, &import.name, run_request("again")).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some("import_done")),
+            "{body}"
+        );
+        let done = import_named(&env, &import.name).unwrap();
+        assert_eq!(done.status.phase, ImportPhase::Done);
+        assert_eq!(done.status.vm, Some(vm.id));
+        assert_eq!(done.status.error, None);
+        assert!(!imports_dir(&env).join(import.id.to_string()).exists());
+        assert!(
+            env.cluster
+                .get::<opl_types::vm::VmSpec>(vm.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+/// 지우기 Task는 원본 디렉터리와 리소스를 지운다. 원본 노드가 오프라인이거나 없으면 409 `node_offline`이고,
+/// `force`면 리소스만 지운다(200).
+#[tokio::test]
+async fn delete_removes_files_and_force_forgets_an_unreachable_import() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let body = uploaded(&env, &admin).await;
+    let dir = imports_dir(&env).join(body["id"].as_str().unwrap());
+    assert!(dir.exists());
+
+    let viewer = env.user("viewer", "viewer").await;
+    let (status, body) = viewer.delete("/vm-imports/web01").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, task) = admin.delete("/vm-imports/web01").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["op"]["kind"], "vm-import-delete");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert!(import_named(&env, "web01").is_none());
+    assert!(!dir.exists());
+
+    // 클러스터에 없는 노드의 가져오기
+    import_on(&env, "far", Uuid::now_v7(), ImportPhase::Ready).await;
+    let (status, body) = admin.delete("/vm-imports/far").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("node_offline")),
+        "{body}"
+    );
+    let (status, body) = run(&admin, "far", run_request("far")).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("node_offline")),
+        "{body}"
+    );
+    let (status, body) = admin.delete("/vm-imports/far?force=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("vm-import \"far\" deleted; its files are left on node"),
+        "{body}"
+    );
+    assert!(import_named(&env, "far").is_none());
+}
+
+/// 노드가 시작할 때 실행할 Task가 없는 `importing` 가져오기는 `ready`로 되돌리고 이유를 남긴다. 이전
+/// opld가 돌리던 가져오기 Task는 실패로 끝나고, 그 정리가 가져오기를 `ready`로 되돌린다.
+#[tokio::test]
+async fn startup_returns_interrupted_imports_to_ready() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let lost = import_on(&env, "lost", env.node, ImportPhase::Importing).await;
+    let cut = import_on(&env, "cut", env.node, ImportPhase::Importing).await;
+    for import in [&lost, &cut] {
+        let dir = imports_dir(&env).join(import.id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("source.ova"), b"ova").unwrap();
+    }
+    let run = serde_json::from_value(run_request("cut")).unwrap();
+    let op = TaskOp::VmImport {
+        import: cut.id,
+        run,
+    };
+    let task = put_task(&env, op, Uuid::now_v7(), TaskState::Running).await;
+
+    env.start_runner().await;
+
+    let lost = env.cluster.get::<VmImportSpec>(lost.id).unwrap().unwrap();
+    assert_eq!(lost.status.phase, ImportPhase::Ready);
+    assert_eq!(
+        lost.status.error.as_deref(),
+        Some("the import was interrupted")
+    );
+    let admin = env.admin().await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let cut = env.cluster.get::<VmImportSpec>(cut.id).unwrap().unwrap();
+    assert_eq!(cut.status.phase, ImportPhase::Ready);
+    assert!(
+        cut.status
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("interrupted"),
+        "{cut:?}"
+    );
+}
+
+/// VM을 만든 뒤 가져오기를 `done`으로 바꾸기 전에 opld가 죽었으면, 노드가 시작할 때 대상 VM이 있는
+/// 가져오기를 `done`으로 끝내고 원본 디렉터리를 지운다. 끝난 Task(시작 정리)와 끝나지 않은 Task(실행기가
+/// 실패로 끝내는 정리) 둘 다 그렇다. VM과 볼륨은 지우지 않는다.
+#[tokio::test]
+async fn startup_finishes_imports_whose_vm_was_made() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let ended = import_on(&env, "ended", env.node, ImportPhase::Importing).await;
+    let cut = import_on(&env, "cut", env.node, ImportPhase::Importing).await;
+    let mut tasks = vec![];
+    for (import, state) in [(&ended, TaskState::Failed), (&cut, TaskState::Running)] {
+        let dir = imports_dir(&env).join(import.id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("source.ova"), b"ova").unwrap();
+        let mut vm: opl_types::vm::Vm = Resource::new(
+            import.name.as_str(),
+            serde_json::from_value(vm_request("x")["spec"].clone()).unwrap(),
+        );
+        vm.id = Uuid::now_v7();
+        env.cluster.create(&vm).await.unwrap();
+        let op = TaskOp::VmImport {
+            import: import.id,
+            run: serde_json::from_value(run_request(&import.name)).unwrap(),
+        };
+        tasks.push((put_task(&env, op, vm.id, state).await, vm.id));
+    }
+
+    env.start_runner().await;
+
+    let ended_done = env.cluster.get::<VmImportSpec>(ended.id).unwrap().unwrap();
+    assert_eq!(ended_done.status.phase, ImportPhase::Done);
+    assert_eq!(ended_done.status.vm, Some(tasks[0].1));
+    assert_eq!(ended_done.status.error, None);
+    assert!(!imports_dir(&env).join(ended.id.to_string()).exists());
+    let admin = env.admin().await;
+    let task = admin.wait_task(&tasks[1].0).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let cut_done = env.cluster.get::<VmImportSpec>(cut.id).unwrap().unwrap();
+    assert_eq!(cut_done.status.phase, ImportPhase::Done);
+    assert_eq!(cut_done.status.vm, Some(tasks[1].1));
+    assert!(!imports_dir(&env).join(cut.id.to_string()).exists());
+    for (_, vm) in tasks {
+        assert!(
+            env.cluster
+                .get::<opl_types::vm::VmSpec>(vm)
+                .unwrap()
+                .is_some()
+        );
+    }
 }

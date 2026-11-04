@@ -42,7 +42,7 @@ pub(super) fn made(ctx: &Ctx, task: Uuid, f: impl FnOnce(&mut Made)) {
 }
 
 /// 새 볼륨 이름 `{vm}-{volume}`. 63자로 자르고, `taken`이면 `-2`, `-3`…을 붙인다(붙인 뒤에도 63자).
-pub(super) fn volume_name(vm: &str, volume: &str, taken: impl Fn(&str) -> bool) -> String {
+pub(crate) fn volume_name(vm: &str, volume: &str, taken: impl Fn(&str) -> bool) -> String {
     let base = format!("{vm}-{volume}");
     // 이름은 ASCII다. 자른 끝이 `-`면 이름 규칙에 어긋나므로 뗀다.
     let cut = |max: usize| {
@@ -220,19 +220,24 @@ pub(super) async fn clone(
     for (disk, (copy, _)) in new.spec.disks.iter_mut().zip(&copies) {
         disk.volume = copy.name.clone();
     }
+    // 복제본은 MAC을 새로 받는다.
+    for nic in &mut new.spec.nics {
+        nic.mac = None;
+    }
     create_vm(ctx, task, new).await
 }
 
-/// 복제·복원이 만든 새 VM `new`를 저장소에 만든다: MAC을 새로 받고, 노드·예약 없이 꺼진 VM이다.
-/// 성공하면 Task가 만든 것을 더는 정리하지 않는다.
+/// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, 노드·예약 없이 꺼진
+/// VM이다. 성공하면 Task가 만든 것을 더는 정리하지 않는다.
 pub(super) async fn create_vm(ctx: &Ctx, task: &Task, mut new: Vm) -> Result<(), String> {
     let name = new.name.clone();
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
     let mut used: BTreeSet<MacAddr> = vms
         .iter()
+        .chain([&new])
         .flat_map(|v| v.spec.nics.iter().filter_map(|n| n.mac))
         .collect();
-    for nic in &mut new.spec.nics {
+    for nic in new.spec.nics.iter_mut().filter(|n| n.mac.is_none()) {
         let mac = std::iter::repeat_with(MacAddr::generate)
             .find(|m| !used.contains(m))
             .expect("random MACs eventually differ");

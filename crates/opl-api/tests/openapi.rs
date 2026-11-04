@@ -35,6 +35,7 @@ async fn openapi_document_is_served_without_login() {
         "/backup-jobs/{key}/run",
         "/vm-imports",
         "/vm-imports/{key}",
+        "/vm-imports/{key}/run",
         "/vm-imports/ova",
         "/vm-imports/ova/check",
         "/watch",

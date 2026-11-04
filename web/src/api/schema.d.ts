@@ -585,6 +585,37 @@ export interface paths {
         get: operations["get_vm_import"];
         put?: never;
         post?: never;
+        /**
+         * 원본 디렉터리와 리소스를 지울 Task를 돌려준다(202). Task는 원본 노드에서 돈다. 그것을 다루는 Task가
+         *     끝나지 않았으면(`force`여도) 409 `import_busy`. 원본 노드가 오프라인이거나 클러스터에 없으면 409
+         *     `node_offline`이고, `force`면 리소스만 바로 지우고 200이다.
+         */
+        delete: operations["delete_import"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vm-imports/{key}/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `ready` 가져오기를 `run`의 값으로 실행할 Task를 돌려준다(202). Task는 원본이 있는 노드에서 돌고, 대상은
+         *     미리 정한 새 VM id다. 실행 Task가 끝나지 않았으면 409 `import_busy`, 이미 가져왔으면 `import_done`(끝난 실행
+         *     Task가 VM을 만들었으면 가져오기를 `done`으로 끝내고), 원본을 쓸 수
+         *     없으면 `import_failed`, 원본 노드가 오프라인이면 `node_offline`. 원본 NIC의 네트워크마다 있는 opLite
+         *     네트워크로 매핑해야 하고(400), VM 이름과 볼륨 이름 `{name}-disk{i}`가 비어 있어야 한다(409
+         *     `name_taken`). 풀은 원본 노드에서 쓸 수 있어야 하고(409 `pool_not_on_node`·`pool_unavailable`), 결과
+         *     VM 스펙은 VM 만들기의 검증을 통과해야 한다(400). 원본 MAC을 쓰면 다른 VM과 겹치지 않아야 한다(409
+         *     `mac_in_use`). 원본이 이 노드에 있으면 가장 큰 디스크를 추출할 여유도 본다(507).
+         */
+        post: operations["run_import"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1264,6 +1295,31 @@ export interface components {
             /** Format: int32 */
             sockets: number;
         };
+        /** @description 실행 요청(`POST /vm-imports/{key}/run`). 비운 값은 제안 값을 쓴다. */
+        ImportRun: {
+            /** Format: int32 */
+            cores?: number | null;
+            disk_bus?: components["schemas"]["DiskBus"] | null;
+            firmware?: components["schemas"]["Firmware"] | null;
+            /**
+             * @description 원본 MAC 주소를 그대로 쓴다. 끄면 새 MAC을 받는다.
+             * @default true
+             */
+            keep_macs: boolean;
+            /** Format: int32 */
+            memory_mib?: number | null;
+            /** @description 만들 VM 이름 */
+            name: string;
+            /** @description 원본 네트워크 → opLite 네트워크. 원본 NIC의 네트워크마다 있어야 한다. */
+            networks?: {
+                [key: string]: string;
+            };
+            nic_model?: components["schemas"]["NicModel"] | null;
+            /** @description 디스크 볼륨을 만들 풀 */
+            pool: string;
+            /** Format: int32 */
+            sockets?: number | null;
+        };
         /** @description 원본. JSON은 `{"ova": {...}}`다. */
         ImportSource: {
             /** @description 올린 OVA 파일 */
@@ -1741,7 +1797,7 @@ export interface components {
                     /**
                      * Format: uuid
                      * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제·백업 Task는 (원본) VM, 백업 지우기는 백업,
-                     *     복원은 새 VM이다.
+                     *     복원과 VM 가져오기는 새 VM, 가져오기 지우기는 가져오기다.
                      */
                     target: string;
                 };
@@ -2515,7 +2571,7 @@ export interface components {
                 /**
                  * Format: uuid
                  * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제·백업 Task는 (원본) VM, 백업 지우기는 백업,
-                 *     복원은 새 VM이다.
+                 *     복원과 VM 가져오기는 새 VM, 가져오기 지우기는 가져오기다.
                  */
                 target: string;
             };
@@ -2915,6 +2971,15 @@ export interface components {
             kind: "backup-restore";
             name: string;
             pool: string;
+        } | {
+            /** Format: uuid */
+            import: string;
+            /** @enum {string} */
+            kind: "vm-import";
+            run: components["schemas"]["ImportRun"];
+        } | {
+            /** @enum {string} */
+            kind: "vm-import-delete";
         };
         TaskSpec: {
             /**
@@ -2926,7 +2991,7 @@ export interface components {
             /**
              * Format: uuid
              * @description 대상 리소스(VM 또는 Volume)의 id. 스냅샷·복제·백업 Task는 (원본) VM, 백업 지우기는 백업,
-             *     복원은 새 VM이다.
+             *     복원과 VM 가져오기는 새 VM, 가져오기 지우기는 가져오기다.
              */
             target: string;
         };
@@ -2998,6 +3063,10 @@ export interface components {
             /** Format: int64 */
             revision: number;
             role: components["schemas"]["Role"];
+        };
+        /** @description 리소스만 지운 가져오기 지우기(`force`)의 응답 */
+        VmImportForgotten: {
+            message: string;
         };
         VmImportSpec: {
             /**
@@ -4611,6 +4680,82 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_VmImportSpec_VmImportStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_import: {
+        parameters: {
+            query?: {
+                /** @description 원본 노드가 오프라인이거나 클러스터에 없어도 리소스만 지운다. 원본 파일은 그 노드에 남는다. */
+                force?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description force: only the resource was deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VmImportForgotten"];
+                };
+            };
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    run_import: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportRun"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
                 };
             };
             "4XX": {
