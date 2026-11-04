@@ -33,6 +33,10 @@ async fn openapi_document_is_served_without_login() {
         "/backup-jobs",
         "/backup-jobs/{key}",
         "/backup-jobs/{key}/run",
+        "/vm-imports",
+        "/vm-imports/{key}",
+        "/vm-imports/ova",
+        "/vm-imports/ova/check",
         "/watch",
     ] {
         assert!(paths.contains_key(path), "{path} is not documented");
@@ -52,6 +56,7 @@ async fn openapi_document_is_served_without_login() {
     assert!(doc["components"]["schemas"]["Resource_SnapshotSpec_SnapshotStatus"].is_object());
     assert!(doc["components"]["schemas"]["Resource_BackupSpec_BackupStatus"].is_object());
     assert!(doc["components"]["schemas"]["Resource_BackupJobSpec_BackupJobStatus"].is_object());
+    assert!(doc["components"]["schemas"]["Resource_VmImportSpec_VmImportStatus"].is_object());
     // 백업 작업의 VM 고르기는 세 객체 중 하나다.
     let selector = &doc["components"]["schemas"]["VmSelector"]["oneOf"];
     assert_eq!(selector.as_array().map(Vec::len), Some(3), "{selector}");

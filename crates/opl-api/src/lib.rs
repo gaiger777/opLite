@@ -127,6 +127,10 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             backup_jobs::delete_backup_job
         ))
         .routes(routes!(backup_jobs::run_backup_job))
+        .routes(routes!(r::list_vm_imports))
+        .routes(routes!(r::get_vm_import))
+        .routes(routes!(vm_imports::upload_ova))
+        .routes(routes!(vm_imports::check_ova))
         .routes(routes!(r::list_volumes, volumes::create_volume))
         .routes(routes!(volumes::import_volume))
         .routes(routes!(volumes::check_import_volume))

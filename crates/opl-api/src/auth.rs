@@ -59,7 +59,7 @@ impl Authorizer for RoleAuthorizer {
                 Action::Write | Action::Operate => {
                     matches!(
                         kind,
-                        Kind::Vm | Kind::Volume | Kind::Backup | Kind::BackupJob
+                        Kind::Vm | Kind::Volume | Kind::Backup | Kind::BackupJob | Kind::VmImport
                     )
                 }
             },
@@ -304,6 +304,7 @@ mod tests {
         assert!(a.check(&op, Action::Write, Kind::Volume));
         assert!(a.check(&op, Action::Write, Kind::Backup));
         assert!(a.check(&op, Action::Write, Kind::BackupJob));
+        assert!(a.check(&op, Action::Write, Kind::VmImport));
         assert!(!a.check(&op, Action::Write, Kind::StoragePool));
         assert!(!a.check(&op, Action::Write, Kind::Node));
         assert!(!a.check(&op, Action::Read, Kind::ApiToken));

@@ -18,6 +18,7 @@ use opl_types::storage::{
 };
 use opl_types::task::{TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{VmSpec, VmStatus};
+use opl_types::vm_import::{VmImportSpec, VmImportStatus};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -194,6 +195,15 @@ list_and_get!(
     "/backup-jobs",
     "/backup-jobs/{key}",
     "backups"
+);
+list_and_get!(
+    list_vm_imports,
+    get_vm_import,
+    VmImportSpec,
+    VmImportStatus,
+    "/vm-imports",
+    "/vm-imports/{key}",
+    "vm-imports"
 );
 list_and_get!(
     list_tasks,

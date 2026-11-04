@@ -1102,7 +1102,7 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), RemoveError> {
 
 /// 이전 opld가 남긴 고아를 지운다: 이 노드가 만들던, 실행할 Task가 없는 Pending 볼륨(볼륨을 만든
 /// 뒤 Task를 만들기 전에, 또는 업로드 도중 opld가 죽었다)과 Pending 스냅샷, 가져오기 Task가 없는
-/// 올린 파일.
+/// 올린 파일, VM 가져오기의 남은 파일([`crate::vm_imports::sweep`]).
 /// `tasks`는 `revision`에서 읽은 Task 목록이다. 다른 노드가 만드는 볼륨은 그 노드가 정리한다.
 /// 풀이 아직 마운트되지 않아(opld가 막 시작했다) 지우지 못한 볼륨을 돌려준다.
 async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
@@ -1178,11 +1178,16 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
     let Some(dir) = &ctx.config.upload_dir else {
         return unmounted;
     };
+    crate::vm_imports::sweep(&ctx.cluster, ctx.config.node, dir).await;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return unmounted;
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // 하위 디렉터리(`imports`)는 가져오기의 정리가 맡는다.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         let wanted = unfinished
             .iter()
             .any(|t| matches!(&t.spec.op, TaskOp::VolumeImport { source, .. } if *source == path));

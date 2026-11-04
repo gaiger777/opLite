@@ -259,6 +259,12 @@ pub async fn check_import(
             format!("volume {:?} already exists", q.name),
         ));
     }
+    check_upload_space(state, size).await?;
+    Ok((pool, format))
+}
+
+/// 업로드 디렉터리에 `size`바이트를 받고도 [`UPLOAD_RESERVE_BYTES`]가 남는지 본다. 아니면 507.
+pub(crate) async fn check_upload_space(state: &AppState, size: u64) -> Result<(), ApiError> {
     tokio::fs::create_dir_all(&state.upload_dir)
         .await
         .map_err(ApiError::internal)?;
@@ -270,7 +276,7 @@ pub async fn check_import(
             format!("not enough free space for a {size}-byte upload"),
         ));
     }
-    Ok((pool, format))
+    Ok(())
 }
 
 /// 업로드 전에 받을 수 있는지 확인한다(204). 거절 이유는 업로드와 같다. 본문은 받지 않는다.
@@ -344,7 +350,7 @@ pub async fn import_volume(
 /// 올린 파일이 다 들어와도 데이터 디렉터리(Raft 저장소가 있다)에 남겨 둘 여유 공간
 const UPLOAD_RESERVE_BYTES: u64 = 1 << 30;
 
-fn content_length(headers: &HeaderMap) -> Result<u64, ApiError> {
+pub(crate) fn content_length(headers: &HeaderMap) -> Result<u64, ApiError> {
     headers
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -382,7 +388,7 @@ impl Drop for UploadGuard {
 }
 
 /// 본문을 `length`바이트까지 받는다. 그보다 길거나 짧으면 실패다.
-async fn receive(path: &FsPath, body: Body, length: u64) -> Result<(), ApiError> {
+pub(crate) async fn receive(path: &FsPath, body: Body, length: u64) -> Result<(), ApiError> {
     let mut file = tokio::fs::File::create_new(path)
         .await
         .map_err(ApiError::internal)?;

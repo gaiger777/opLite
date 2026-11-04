@@ -522,6 +522,75 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vm-imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_vm_imports"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vm-imports/ova": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 요청 본문(OVA)을 이 노드에 받아 해석하고, 원본 VM과 제안을 담은 `ready` 가져오기를 돌려준다(201).
+         *     OVA를 쓸 수 없으면 400 `invalid_ova`. 실패하거나 연결이 끊기면 받은 파일을 지운다.
+         */
+        post: operations["upload_ova"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vm-imports/ova/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** OVA를 받기 전에 받을 수 있는지 확인한다(204). 거절 이유는 올리기와 같다. 본문은 받지 않는다. */
+        post: operations["check_ova"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vm-imports/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_vm_import"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vms": {
         parameters: {
             query?: never;
@@ -1177,6 +1246,29 @@ export interface components {
         ImageFile: string;
         /** @enum {string} */
         ImageFormat: "qcow2" | "raw";
+        /** @enum {string} */
+        ImportPhase: "ready" | "importing" | "done" | "failed";
+        /** @description opLite VM 설정 제안. 실행할 때 [`ImportRun`]에 없는 값의 기본값이다. */
+        ImportProposal: {
+            /** Format: int32 */
+            cores: number;
+            disk_bus: components["schemas"]["DiskBus"];
+            firmware: components["schemas"]["Firmware"];
+            /** Format: int32 */
+            memory_mib: number;
+            /** @description 원본 네트워크 → 이름이 같은 opLite 네트워크(없으면 null, 실행 때 정해야 한다) */
+            networks: {
+                [key: string]: string | null;
+            };
+            nic_model: components["schemas"]["NicModel"];
+            /** Format: int32 */
+            sockets: number;
+        };
+        /** @description 원본. JSON은 `{"ova": {...}}`다. */
+        ImportSource: {
+            /** @description 올린 OVA 파일 */
+            ova: components["schemas"]["OvaSource"];
+        };
         /** @description 노드가 로그인할 iSCSI 타깃 */
         IscsiTarget: {
             /** @description `호스트[:포트]` 또는 `[IPv6][:포트]` */
@@ -1664,6 +1756,52 @@ export interface components {
             revision: number;
         };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_VmImportSpec_VmImportStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    /**
+                     * Format: uuid
+                     * @description 원본 파일이 있는 노드(올린 노드)
+                     */
+                    node: string;
+                    source: components["schemas"]["ImportSource"];
+                };
+                status: {
+                    /** @description 마지막 실행이 실패한 이유(phase는 `ready`로 돌아간다), 또는 `failed`인 이유 */
+                    error?: string;
+                    /** @default ready */
+                    phase: components["schemas"]["ImportPhase"];
+                    /** @description [`propose`]가 만든 기본값 */
+                    proposal?: components["schemas"]["ImportProposal"];
+                    /** @description 원본 VM에서 읽은 것(표시용) */
+                    source_vm?: components["schemas"]["SourceVm"];
+                    /**
+                     * Format: uuid
+                     * @description 만든 VM id(`done`일 때)
+                     */
+                    vm?: string;
+                    /**
+                     * @description 해석과 제안의 경고
+                     * @default []
+                     */
+                    warnings: string[];
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_Resource_VmSpec_VmStatus: {
             items: {
                 /** Format: uuid */
@@ -1934,6 +2072,12 @@ export interface components {
              *     None).
              */
             underlay?: string;
+        };
+        OvaSource: {
+            /** @description 올린 파일 이름(표시용) */
+            file_name: string;
+            /** Format: int64 */
+            size_bytes: number;
         };
         PoolBackend: {
             /** @enum {string} */
@@ -2383,6 +2527,48 @@ export interface components {
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_VmImportSpec_VmImportStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /**
+                 * Format: uuid
+                 * @description 원본 파일이 있는 노드(올린 노드)
+                 */
+                node: string;
+                source: components["schemas"]["ImportSource"];
+            };
+            status: {
+                /** @description 마지막 실행이 실패한 이유(phase는 `ready`로 돌아간다), 또는 `failed`인 이유 */
+                error?: string;
+                /** @default ready */
+                phase: components["schemas"]["ImportPhase"];
+                /** @description [`propose`]가 만든 기본값 */
+                proposal?: components["schemas"]["ImportProposal"];
+                /** @description 원본 VM에서 읽은 것(표시용) */
+                source_vm?: components["schemas"]["SourceVm"];
+                /**
+                 * Format: uuid
+                 * @description 만든 VM id(`done`일 때)
+                 */
+                vm?: string;
+                /**
+                 * @description 해석과 제안의 경고
+                 * @default []
+                 */
+                warnings: string[];
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_VmSpec_VmStatus: {
             /** Format: uuid */
             id: string;
@@ -2593,11 +2779,44 @@ export interface components {
              */
             vmstate_bytes: number | null;
         };
+        SourceDisk: {
+            /** Format: int64 */
+            capacity_bytes: number;
+            /** @description 원본 컨트롤러(`ide`, `sata`, `scsi`, `nvme`) */
+            controller: string;
+            /** @description 원본 안의 디스크 파일 이름 */
+            file: string;
+            /** @description `disk{i}` */
+            name: string;
+        };
         /**
          * @description 가져올 원본 이미지 형식
          * @enum {string}
          */
         SourceFormat: "vmdk" | "qcow2" | "raw";
+        SourceNic: {
+            /** @description 원본 어댑터 종류(`vmxnet3`, `e1000` 등) */
+            adapter: string;
+            mac?: components["schemas"]["MacAddr"] | null;
+            /** @description 원본 네트워크 이름 */
+            network: string;
+        };
+        /** @description 원본 VM에서 읽은 것 */
+        SourceVm: {
+            /** Format: int32 */
+            cores_per_socket: number;
+            /** @description 디스크(컨트롤러 순서, 그 안에서 주소 순서) */
+            disks: components["schemas"]["SourceDisk"][];
+            firmware: components["schemas"]["Firmware"];
+            /** @description 게스트 OS(OVF `vmw:osType` 등) */
+            guest_os: string;
+            /** Format: int64 */
+            memory_mib: number;
+            name: string;
+            nics: components["schemas"]["SourceNic"][];
+            /** Format: int32 */
+            vcpus: number;
+        };
         StoragePoolSpec: {
             backend: components["schemas"]["PoolBackend"];
             /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
@@ -2779,6 +2998,34 @@ export interface components {
             /** Format: int64 */
             revision: number;
             role: components["schemas"]["Role"];
+        };
+        VmImportSpec: {
+            /**
+             * Format: uuid
+             * @description 원본 파일이 있는 노드(올린 노드)
+             */
+            node: string;
+            source: components["schemas"]["ImportSource"];
+        };
+        VmImportStatus: {
+            /** @description 마지막 실행이 실패한 이유(phase는 `ready`로 돌아간다), 또는 `failed`인 이유 */
+            error?: string;
+            /** @default ready */
+            phase: components["schemas"]["ImportPhase"];
+            /** @description [`propose`]가 만든 기본값 */
+            proposal?: components["schemas"]["ImportProposal"];
+            /** @description 원본 VM에서 읽은 것(표시용) */
+            source_vm?: components["schemas"]["SourceVm"];
+            /**
+             * Format: uuid
+             * @description 만든 VM id(`done`일 때)
+             */
+            vm?: string;
+            /**
+             * @description 해석과 제안의 경고
+             * @default []
+             */
+            warnings: string[];
         };
         /** @enum {string} */
         VmPhase: "stopped" | "starting" | "running" | "stopping" | "failed" | "migrating";
@@ -4242,6 +4489,129 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_vm_imports: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_VmImportSpec_VmImportStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    upload_ova: {
+        parameters: {
+            query: {
+                /** @description 가져오기 이름 */
+                name: string;
+                /** @description 올린 파일 이름(표시용). 없으면 `{name}.ova` */
+                file_name?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": components["schemas"]["ImageFile"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmImportSpec_VmImportStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    check_ova: {
+        parameters: {
+            query: {
+                /** @description 가져오기 이름 */
+                name: string;
+                /** @description 올릴 파일 크기(바이트) */
+                size: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_vm_import: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmImportSpec_VmImportStatus"];
+                };
             };
             "4XX": {
                 headers: {
