@@ -1,0 +1,14 @@
+# /etc/opl/opld.toml로 복사해 name·address를 고친다
+name = "node1"
+address = "10.0.0.11"
+# [hypervisor]
+# accel = "auto"          # auto | kvm | tcg
+# systemd_scope = true
+# [janitor]
+# task_max_age_days = 7     # 끝난 작업(Task)을 남기는 날수(만든 때부터)
+# task_max_finished = 1000  # 끝난 작업을 이보다 많이 남기지 않는다(오래된 것부터 지운다)
+# [backup]
+# tick_secs = 60          # 백업 작업을 확인하는 간격(초, 리더 노드)
+# max_concurrent = 2      # 노드마다 동시에 도는 백업 작업(Task)의 최대 수
+# [pools]
+# refresh_secs = 15         # 노드별 풀 상태를 확인하는 간격(초, NFS 마운트 포함)

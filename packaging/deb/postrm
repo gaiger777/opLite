@@ -1,0 +1,22 @@
+#!/bin/sh
+# oplite postrm. /var/lib/opl(Raft 데이터, 풀, 볼륨)과 /etc/opl은 purge여도 지우지 않는다.
+set -eu
+
+SYSTEMD_DIR="${OPL_SYSTEMD_DIR:-/run/systemd/system}"
+SYSTEMD_ETC="${OPL_SYSTEMD_ETC:-/etc/systemd/system}"
+
+case "$1" in
+remove | purge)
+	if [ "$1" = purge ]; then
+		# enable이 만든 링크를 정리한다(systemd가 돌지 않아도 된다).
+		systemctl disable opld.service || true
+		# systemctl이 없거나 실패해도 링크가 남지 않게 한다.
+		rm -f "$SYSTEMD_ETC/multi-user.target.wants/opld.service"
+	fi
+	if [ -d "$SYSTEMD_DIR" ]; then
+		systemctl daemon-reload || true
+	fi
+	;;
+esac
+
+exit 0
