@@ -44,6 +44,8 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 
 구현: 하위 프로젝트 8은 계획 29(OVA 가져오기: `VmImport` 리소스, OVA 올리기와 손으로 읽는 tar·OVF 해석, 원본 VM에서 opLite VM 제안(게스트 OS로 디스크 버스·NIC 모델, 코어 나누기, 경고), 사용자가 고친 값으로 디스크를 `.mf` 해시를 보며 추출해 볼륨으로 옮기고 꺼진 VM을 만드는 `VmImport` Task, 지우기, API·oplctl·웹, 실제 시험, 완료)과 계획 30(ESXi·vCenter에서 바로 가져오기: 서버 인증서 지문을 고정한 HTTPS 연결과 데이터스토어 브라우저(`/folder`) 목록, 데이터스토어의 `.vmx`·VMDK 디스크립터 해석, 비밀번호는 받은 노드의 메모리에만, 같은 `VmImport`와 Task에 extent 내려받기 단계, API·oplctl·웹, 가짜 ESXi로 실제 시험, 완료)으로 나눴다(`2026-11-04-vmware-import-design.md`). 하위 프로젝트 8은 끝났다. 실행 중인 VM 옮기기, 증분 동기화, VMware 스냅샷 체인, VDDK·NFC, 게스트 안 드라이버 바꾸기는 넣지 않았다.
 
+구현: 하위 프로젝트 9는 계획 31(Debian 패키지와 설치 ISO: 빌드 버전 `opl_types::version::BUILD`와 `--version`, 패키지 `oplite`(opld·oplctl·웹 UI·systemd 유닛·maintainer 스크립트), Debian 13 netinst에 preseed와 패키지를 더한 설치 ISO(설치가 기본 경로 인터페이스를 VLAN-aware `vmbr0`으로 옮기고 `/etc/opl/opld.toml`을 씀), CI `shell`·`package` 작업과 ISO 무인 설치 E2E 워크플로 `iso.yml`, 완료)부터 했다(`2026-11-05-install-update-subscription-design.md`). 계획 32(버전과 업데이트)·33(구독과 텔레메트리)이 남았다.
+
 ### 1.2 검토했지만 채택하지 않은 대안
 
 - **중앙 관리 서버 + 경량 에이전트 (vCenter 방식):** 관리 서버 자체의 HA를 따로 풀어야 하고 설치 단계가 늘어난다. 이 복잡함이 VMware를 떠나는 이유 중 하나다.

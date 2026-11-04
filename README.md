@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 개발 초기 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드)
+- 상태: 개발 초기 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO)
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -54,6 +54,89 @@ cargo run -p oplctl -- cluster status
 ```
 
 API 문서(OpenAPI)는 `https://127.0.0.1:8006/api/v1/openapi.json`에 있다.
+
+## 설치 (ISO와 패키지)
+
+서버에는 설치 ISO로 Debian 13(trixie)과 opLite를 함께 설치한다. ISO는 Debian netinst에 패키지 `oplite`와
+preseed를 더한 것이다. 만들기는 Linux(amd64)에서 한다(`dpkg-deb`, `xorriso`가 필요하다).
+
+```bash
+sudo apt install xorriso libssl-dev pkg-config     # 그리고 Rust, Node.js 22와 pnpm
+# 1. 패키지. 버전은 바이너리(--version)와 패키지에 같은 값을 쓴다(다르면 build-deb.sh가 멈춘다).
+pnpm -C web install --frozen-lockfile && pnpm -C web build
+OPL_VERSION=0.1.0 cargo build --release -p opld --features web-ui -p oplctl
+packaging/deb/build-deb.sh 0.1.0 dist              # dist/oplite_0.1.0_amd64.deb
+# 2. netinst. 판과 SHA-256은 packaging/iso/debian.lock에 있고, build-iso.sh가 해시를 확인한다.
+#    그 판보다 새 판이 나와 URL이 404면 같은 파일을 cdimage/archive/<판>/amd64/iso-cd/에서 받는다.
+. packaging/iso/debian.lock && curl -fLo netinst.iso "$DEBIAN_NETINST_URL"
+# 3. ISO. 기본 항목 "Install opLite"가 더해진다(BIOS·UEFI, 원래 항목은 남는다).
+packaging/iso/build-iso.sh --netinst netinst.iso --deb dist/oplite_0.1.0_amd64.deb --out oplite.iso
+```
+
+`oplite.iso`를 USB(`dd`)나 가상 CD로 부팅한다. "Install opLite"가 기본으로 골라져 있다. UEFI 메뉴에서는 맨 위
+줄이고, BIOS 메뉴에서는 "Graphical install" 다음 두 번째 줄이다. 설치 화면은 다음만 묻는다: 네트워크(DHCP가
+실패하면 수동), 호스트 이름, 도메인, root 비밀번호, 설치 디스크(디스크가 여럿이면 GRUB을 넣을 디스크도).
+나머지는 정해져 있다: 언어·키보드 en_US·us, 시간대 UTC(설치한 뒤 `timedatectl set-timezone Asia/Seoul`처럼 바꾼다),
+고른 디스크 전체에 LVM(`/`와 swap), 미러 `deb.debian.org`, 패키지 standard·ssh-server, 일반 사용자 없음.
+**고른 디스크의 내용은 묻지 않고 지운다.**
+
+설치 끝에 `oplite-setup.sh`가 돈다(로그는 대상 시스템의 `/root/oplite-setup.log`).
+
+- 패키지 `oplite`, `ifupdown2`, `isc-dhcp-client`(`vmbr0`의 DHCP)를 설치한다(의존 패키지는 미러에서 받는다).
+- 기본 경로 인터페이스(DHCP이거나 게이트웨이가 있는 것, 없으면 첫 고정 주소)를 VLAN-aware 브리지 `vmbr0`으로 옮긴다.
+  주소·게이트웨이·DNS는 `vmbr0`으로 가고, NIC는 `iface <nic> inet manual`로 `bridge-ports`가 된다(`bridge-vids 2-4094`).
+  설치 프로그램이 쓴 `/etc/network/interfaces`를 바꿔 설치 환경과 대상 시스템 두 곳에 쓴다(설치 프로그램은 이 파일을
+  나중에 대상으로 복사한다). 인터페이스를 찾지 못하면 바꾸지 않는다.
+- `/etc/opl/opld.toml`에 `name`(호스트 이름을 소문자로)과 `address`(`vmbr0`의 주소)를 쓴다. 호스트 이름이 노드 이름
+  규칙(소문자·숫자·`-`, 1~63자)에 맞지 않거나 주소를 찾지 못하면 그 줄을 주석으로 둔다. 그때 opld는 설정 오류로
+  시작하지 못하므로(`journalctl -u opld`) 값을 채우고 `systemctl restart opld`를 한다. 다른 설정은
+  `/usr/share/oplite/opld.toml.example`을 본다.
+- 콘솔 로그인 화면에 웹 UI 주소와 init·join 명령을 영어로 보인다(`/etc/issue.d/oplite.issue`). `opld.toml`의 주석도 영어다.
+- `opld.service`를 켠다. 다시 부팅하면 opld가 돈다(`systemctl status opld`, `journalctl -u opld`).
+
+설치한 시스템의 root는 SSH로 비밀번호 로그인을 할 수 없다(Debian 기본 `PermitRootLogin prohibit-password`).
+콘솔에서 root로 로그인해 `adduser <이름>`으로 일반 사용자를 만들거나 `/root/.ssh/authorized_keys`에 공개 키를 넣는다.
+
+클러스터는 설치한 뒤에 만든다. 첫 노드에서 `cluster init`을 하고, 다른 노드는 그 클러스터에 합류한다.
+
+```bash
+# 첫 노드(root)
+oplctl cluster init --name prod                  # admin 비밀번호(한 번만 나온다), CA 지문, 합류 URL
+oplctl login --server https://10.0.0.11:8006 --ca-fingerprint sha256:...
+oplctl cluster join-token                        # 합류 URL은 한 번 쓰고 1시간 간다. 노드마다 새로 만든다
+# 다른 노드(root)
+oplctl cluster join 'opl-join://…'
+```
+
+웹 UI는 `https://<노드 주소>:8006/`이다(클러스터 화면이 합류 명령을 만들어 준다).
+
+**DHCP 주소.** 설치를 DHCP로 하면 `address`는 설치할 때 받은 주소이고 파일에 그렇다는 주석이 붙는다. 다른 노드와
+클라이언트가 이 주소로 노드에 닿고, 노드가 클러스터에 들어간 뒤에는 주소를 바꿀 수 없다(노드 인증서에 들어 있다).
+DHCP 서버에서 주소를 예약하거나 고정 주소를 쓴다. `cluster init`·`join` 전이라면 `/etc/network/interfaces`의
+`vmbr0`과 `opld.toml`의 `address`를 고치고 `systemctl restart opld`를 해도 된다.
+
+**패키지만 설치하기.** Debian 13(amd64)이 이미 있으면 패키지만 넣는다. 브리지는 관리자가 만든다("실행 (Linux, KVM)").
+
+```bash
+sudo apt install ./oplite_0.1.0_amd64.deb         # 의존 패키지(QEMU, OVMF, nftables 등)도 받는다
+sudo mkdir -p /etc/opl
+sudo cp /usr/share/oplite/opld.toml.example /etc/opl/opld.toml   # name·address를 고친다
+sudo systemctl start opld                         # 설정이 없으면 유닛은 시작하지 않고 건너뛴다
+```
+
+패키지는 `/usr/bin/opld`·`oplctl`(웹 UI 포함), `/usr/lib/systemd/system/opld.service`,
+`/usr/share/oplite/opld.toml.example`을 설치한다. 업그레이드(`apt install`로 새 판)는 opld가 enable돼 있으면 다시 시작한다.
+VM의 QEMU는 VM마다 자기 scope에 있어 opld가 멈추거나 다시 시작해도 꺼지지 않는다.
+
+**지우기.** `apt remove oplite`는 opld를 멈추고, `apt purge oplite`는 서비스 링크까지 지운다. 어느 쪽도
+`/var/lib/opl`(클러스터 데이터, 풀, 볼륨)과 `/etc/opl`을 지우지 않는다. 데이터를 지우는 것은 관리자의 일이다.
+
+한계:
+
+- 설치에 인터넷(Debian 미러)이 필요하다. 모든 패키지를 담은 오프라인 ISO는 없다.
+- amd64만 있다(ISO와 패키지).
+- 루트 파일 시스템은 LVM 하나다. ZFS 루트와 소프트웨어 RAID 설치 선택지는 없다.
+- 설치 화면에서 클러스터를 만들거나 합류하지 않는다(설치한 뒤 위 명령으로).
 
 ## 실행 (Linux, KVM)
 
