@@ -2,6 +2,7 @@
 //! 원본은 올린 노드의 `{upload_dir}/imports/{가져오기 id}/source.ova`에 둔다. 실행과 지우기는 그 노드의
 //! Task 실행기가 한다.
 
+pub mod esxi;
 pub mod ova;
 pub mod ovf;
 pub mod vmx;

@@ -59,5 +59,8 @@ time = "0.3"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging"] }
 rustls-pki-types = "1.15.1"
+hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
 native-tls = "0.2.18"
 rust-embed = { version = "8.13.0", features = ["mime-guess", "interpolate-folder-path"] }

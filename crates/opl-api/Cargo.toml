@@ -19,12 +19,17 @@ fs4.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 opl-cluster.workspace = true
 opl-driver.workspace = true
 opl-peer.workspace = true
 opl-reconciler.workspace = true
 opl-types = { workspace = true, features = ["openapi"] }
 roxmltree.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
@@ -32,6 +37,7 @@ sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
 utoipa.workspace = true
 utoipa-axum.workspace = true
@@ -40,6 +46,7 @@ uuid.workspace = true
 [dev-dependencies]
 openraft.workspace = true
 opl-qemu.workspace = true
+rcgen.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
