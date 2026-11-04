@@ -3792,3 +3792,56 @@ git commit -m "docs: 설치 ISO와 패키지 — README 새 절 \"설치 (ISO와
 - DHCP로 설치하면 그때 받은 주소가 opld 주소가 된다. 클러스터에 들어간 뒤에는 바꿀 수 없다.
 - `debian.lock`의 판이 archive로 옮겨지면 워크플로는 archive URL을 쓴다. README의 수동 명령은 사람이 URL을 고쳐야 한다.
 - 그 밖의 제한은 설계 문서 §2.4·§2.5와 README "설치 (ISO와 패키지)" 절에 있다.
+
+## 실행 후 기록 (2026-11-05)
+
+5개 Task를 계획대로 적용했다. Task마다 검증된 단계와 트리가 같았고, 생성 파일 `Cargo.lock`도 같았다. 실행 전에 계획 문서를 처음부터 끝까지 main 복제본에 적용해, 각 단계의 트리와 같음을 확인했다. 계획 문서를 만들기 전에 스테이지 작업에서 리뷰를 두 차례 돌리고 CI 프로브 다섯 번으로 고쳤다. 고친 내용은 위 Task의 코드에 이미 들어 있다.
+
+- **1차 리뷰에서 고친 것:**
+  - 패키지 스크립트:
+    - 업그레이드할 때 켜져 있던 서비스만 다시 시작한다.
+    - purge할 때 `multi-user.target.wants` 링크를 지운다.
+    - 패키지 파일을 umask 022로 만들고 `md5sums`를 넣는다.
+  - 버전 시험의 기댓값을 빌드 환경 변수에서 계산한다.
+  - 설치 스크립트:
+    - DHCP 클라이언트를 함께 설치한다.
+    - 노드 이름을 소문자로 바꾼다.
+    - interfaces 파일을 설치 환경과 대상 시스템 양쪽에 쓴다.
+    - `/etc/issue` 안내를 영어로 쓴다.
+    - 게이트웨이 없는 고정 주소를 받아들인다.
+  - 부트 메뉴 fixture를 실제 13.7.0 파일로 바꾸고, bootdev를 정리하고, CI 첫 부팅 서비스(ci-init)를 둔다.
+  - ISO 워크플로에 UEFI를 넣어 BIOS·UEFI 행렬로 돌리고, qemu가 살아 있는지 확인한다.
+  - 문서를 고쳤다.
+- **2차 리뷰에서 고친 것:**
+  - 시간대를 UTC로 한다.
+  - 패키지 파일 이름과 바이너리 버전을 확인한다.
+  - cdrom apt-setup 키를 고친다.
+  - `sha256sum.txt`를 갱신한다.
+  - 문서와 root SSH 안내를 고쳤다.
+- **CI 프로브에서 고친 것 (5번째에 모두 통과):**
+  - xorriso가 "Cannot enable EL Torito boot image"로 실패했다. 압축을 푼 트리 전체를 덮어쓰던 것을, 바뀐 파일만 덮어쓰도록 고쳤다. 정리 trap의 변수도 전역으로 고쳤다.
+  - UEFI 설치가 late_command에서 멈췄다. noninteractive apt 옵션, `</dev/null`, `policy-rc.d`를 넣고 cdrom apt-setup을 껐다.
+  - BIOS에서 vesamenu가 입력을 기다려 시리얼 출력이 없었다. 무인 설치용 ISO는 메뉴 없이 시리얼로 바로 부팅한다.
+  - 노드가 online이 되기를 기다리는 단계에서 시간이 초과됐는데, 진단할 출력이 없었다. 기다리는 횟수를 정하고, 기다리는 동안 상태를 출력하도록 고쳤다.
+  - 설치 환경 busybox `tr`에 문자 클래스가 없어 노드 이름이 `owl-ci`가 됐다. 알파벳을 직접 나열하도록 고치고, 같은 실수를 잡는 시험을 넣었다.
+- **계획 문서의 작은 오류:** Task 2·3의 YAML 확인 명령에 Task 4에서 만드는 `.github/actions/build-deb/action.yml`이 들어 있다. 실행할 때는 그 파일을 빼고 워크플로 파일만 확인했다. 코드에는 영향이 없다.
+
+**테스트:**
+- macOS `cargo test --workspace` 1133개
+- `OPL_VERSION=9.9.9~t`로 빌드한 opld·oplctl `--version` 시험
+- 셸 시험 `maint-test.sh`·`build-deb-test.sh`·`setup-test.sh`·`iso-test.sh`와 shellcheck
+- `fmt`·`clippy -D warnings`(모든 기능)
+
+Linux CI에서는 다음이 통과했다.
+- 위 시험 전부
+- busybox로 돌리는 `setup-test.sh`
+- Debian 13 컨테이너에 패키지 설치(`deb-test.sh`)
+- BIOS·UEFI ISO 무인 설치 E2E: 설치, 디스크 부팅, 첫 부팅 클러스터 생성, `oplctl` 로그인, 노드 online, `vmbr0`
+
+## 다음 계획으로 넘길 사항
+
+- 다음은 계획 32(버전과 업데이트 채널, 설계 §3)다. 이 계획의 `opl_types::version::BUILD`를 `GET /api/v1/version`과 `NodeStatus.version`에 쓴다.
+  - 업데이트용 apt 저장소의 sources 파일은 opld가 관리한다.
+  - 저장소 빌드 스크립트는 `packaging/repo/`에 둔다.
+- 그다음은 계획 33(구독과 텔레메트리, 설계 §4)이다.
+- `iso.yml`은 main push에서는 돌지 않는다. 수동 실행, 주 1회 실행, `ci-probe/**` 브랜치, 태그에서만 돈다.
