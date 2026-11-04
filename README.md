@@ -975,6 +975,86 @@ oplctl backup-job delete nightly               # 작업만 지운다. 만든 백
   지운다. 백업 디렉터리의 파일 작업에는 시간 제한이 없어, NFS 서버가 멈추면(hard 마운트) 백업·지우기·복원 작업이
   서버가 돌아올 때까지 멈춘다.
 
+## VMware에서 가져오기
+
+VMware VM을 OVA 파일로 내보내 opLite로 가져온다. 가져오기(`vm-import`)는 세 단계다: OVA를 올리면 opld가 OVF를 읽어
+원본 VM(CPU, 메모리, 펌웨어, 디스크, NIC)과 opLite VM 제안을 보이고, 사용자가 이름·풀·네트워크 매핑과 고칠 값을 정해
+실행하면 디스크를 볼륨으로 옮겨 **꺼진** 새 VM을 만든다. 실행이 실패하면 원본이 남으므로 값을 바꿔 다시 실행한다.
+
+**OVA 만들기.** VMware에서 VM을 먼저 끈다(스냅샷이 있으면 통합하거나 지운다).
+
+- vSphere Client의 "Export OVF Template"은 `.ovf`·`.mf`·`.vmdk` 파일들을 내려받는다(OVA 하나가 아니다). 그 폴더를
+  `ovftool`로 OVA 하나로 묶는다: `ovftool web01/web01.ovf web01.ova`. `ovftool`로 바로 내보내도 된다:
+  `ovftool vi://user@vcenter/DC/vm/web01 web01.ova`.
+- VMware Workstation·Fusion은 "File → Export to OVF…"에서 파일 이름을 `.ova`로 정한다.
+- 디스크는 VMDK(streamOptimized·monolithicSparse)여야 한다. 압축(`ovf:compression`)·분할(`ovf:chunkSize`) 디스크,
+  VM 여럿이 든 OVA, 디스크가 32개 또는 NIC가 16개를 넘는 VM은 받지 않는다(400 `invalid_ova`).
+
+```bash
+oplctl import ova web01.ova --name web01        # 먼저 받을 수 있는지 묻고 올린다(이 노드에 원본이 남는다)
+oplctl import list
+# NAME   NODE   SOURCE  PHASE  VM
+# web01  node1  web01   ready  -
+oplctl import get web01                         # 원본 VM, 제안, 디스크와 NIC, 경고
+# proposal: 1 sockets x 2 cores, 1024 MiB, uefi, virtio-blk disks, virtio NICs
+oplctl import run web01 --name web --pool local --net "VM Network=lan"   # 디스크를 볼륨으로 옮겨 꺼진 VM web을 만든다
+oplctl import run web01 --name web --pool local --net lan --disk-bus sata --nic-model e1000e --memory 4096 --new-macs
+oplctl vm start web
+oplctl import delete web01                      # 가져오기와 남은 원본 파일을 지운다(만든 VM은 남는다)
+```
+
+- **제안.** 게스트 OS(`vmw:osType`)가 Windows(`win…`)면 디스크 `sata`·NIC `e1000e`(Windows가 드라이버를 갖고 있다),
+  그 밖은 `virtio-blk`·`virtio`다. vCPU는 원본의 소켓당 코어로 나누고(나누어떨어지지 않으면 소켓 하나), 메모리는
+  그대로(최소값보다 작으면 최소값), 펌웨어는 원본의 `efi`면 `uefi`, 아니면 `bios`, 머신은 `q35`, CPU 모델은 `host`다.
+  첫 디스크로 켠다(디스크가 여러 컨트롤러에 걸쳐 있으면 첫 디스크가 부트 디스크인지 확인하라는 경고가 나온다). SATA
+  디스크가 6개를 넘으면 `virtio-blk`를 제안한다(AHCI 포트 수, 실행 때 `--disk-bus sata`로 6개를 넘기면 400).
+  CD-ROM·플로피·USB 같은 장치는 가져오지 않고 경고로 보인다. `import run`의 `--disk-bus`·`--nic-model`·`--firmware`·`--sockets`·`--cores`·`--memory`가
+  제안을 바꾼다.
+- **네트워크 매핑.** 원본 NIC의 네트워크마다 opLite 네트워크를 정해야 한다(`--net "원본=opLite"`, 원본 네트워크가
+  하나면 `--net lan`만). 이름이 같은 opLite 네트워크가 있으면 제안에 들어 있고, 실행 때 그 원본 네트워크를 주지
+  않으면 제안대로 매핑한다. 매핑도 제안도 없거나 없는 네트워크면 400이다.
+- **MAC과 원본 끄기.** 게스트의 고정 IP·라이선스가 MAC에 묶인 경우가 많아 원본 MAC을 그대로 쓴다. **VMware의 원본
+  VM을 끈 뒤에** 가져온 VM을 켠다(같은 네트워크에 같은 MAC이 둘이면 안 된다). 새 MAC을 받으려면 `--new-macs`다.
+  다른 opLite VM이 같은 MAC을 쓰면 409 `mac_in_use`다(실행 작업도 디스크를 옮기기 전에 다시 본다).
+- **Windows.** 처음에는 제안대로 `sata`·`e1000e`로 켠다. virtio로 바꾸려면 게스트에
+  [virtio-win](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/) 드라이버를 먼저 넣고(VM에
+  작은 `virtio-blk` 볼륨을 하나 더 붙여 켜면 Windows가 드라이버를 붙인다), VM을 끄고 웹의 VM 편집(또는 API
+  `PUT /api/v1/vms/{name}`)으로 디스크 버스·NIC 모델을 바꾼다. 드라이버 없이 부트 디스크를 `virtio-blk`로 바꾸면 Windows가 켜지지 않는다
+  (`INACCESSIBLE_BOOT_DEVICE`).
+- **VMware Tools.** 게스트 안에서 지운다(Windows: 앱 및 기능, Linux: `open-vm-tools` 패키지). Linux 게스트는 virtio
+  드라이버를 커널에 갖고 있지만, 네트워크 장치 이름이 바뀌어(`ens192` → `enp1s0` 등) 네트워크 설정을 고쳐야 할 수 있다.
+- **UEFI 부트 항목.** UEFI 변수(NVRAM)는 옮기지 않는다. 대부분 OS 기본 경로(`\EFI\BOOT\BOOTX64.EFI` 등)로 켜지지만,
+  켜지지 않으면 콘솔에서 펌웨어 메뉴(켤 때 Esc)의 Boot Manager로 OS 부트 로더를 고른다.
+- **원본은 올린 노드에 남는다.** OVA는 접속한 노드의 `{data_dir}/uploads/imports/{가져오기 id}/source.ova`에 두고(올리기에
+  파일 크기 + 1 GiB, 실행에 가장 큰 디스크 파일 + 1 GiB의 여유가 필요하다, 아니면 507; 실행 작업도 디스크를 꺼내기
+  전마다 다시 보고 모자라면 실패한다), 실행도 그 노드에서 한다. 그래서
+  풀은 그 노드에서 쓸 수 있어야 하고(409 `pool_not_on_node`), 그 노드가 꺼져 있으면 실행할 수 없다(409
+  `node_offline`). 위트니스 노드에는 올릴 수 없다(400). 실행이 끝나면 원본을 지운다. 원본 노드가 클러스터에서 빠졌거나
+  꺼진 채 돌아오지 않으면 `oplctl import delete web01 --force`로 기록만 지운다(원본 파일은 그 노드에 남는다).
+- **볼륨.** 디스크마다 OVA에서 꺼내(`.mf`가 있으면 SHA-1·SHA-256·SHA-384·SHA-512를 확인한다; 모르는 알고리즘이거나
+  `.mf`에 없는 디스크는 확인하지 않고 경고한다) 볼륨 `{VM 이름}-disk{i}`(풀의 기본 형식:
+  dir·NFS는 qcow2, 블록 풀은 raw)로 옮긴다. 해시가 다르면 실행이 실패하고("checksum mismatch for …") 그때까지 만든
+  볼륨을 지운다. 실행은 디스크 크기만큼 걸리므로 작업(Task) 시간 제한이 없고, `oplctl import run`은 24시간까지 기다린다.
+- **상태.** `ready`(실행할 수 있다; 실패한 실행의 이유는 `error`), `importing`(실행 중, 지울 수 없다 — 409
+  `import_busy`), `done`(만든 VM이 `vm`에), `failed`(원본을 쓸 수 없다, 예: opld가 다시 시작할 때 원본 파일이 없음 —
+  지우고 다시 올린다). 실행 중에 opld가 멈추면 다시 시작할 때 `ready`로 돌아간다(VM을 이미 만들었으면 `done`;
+  그렇게 끝나지 못한 가져오기는 다시 실행하면 `done`이 되고 409 `import_done`이다).
+  원본 노드가 클러스터에서 빠져 실행 작업이 실패로 끝나면 `importing`에 남지만, 끝나지 않은 작업이 없으면 다시
+  실행하거나 지울 수 있다(노드가 없으면 `--force`). 웹의 지우기 단추는 `importing`에서도 누를 수 있고, 아직 실행 중이면
+  서버가 `import_busy`로 거절한다.
+- **아키텍처.** 가져온 VM은 x86 `q35`다. aarch64(macOS) 노드에도 가져올 수는 있지만 켜려면 x86_64 노드가 필요하다.
+- 웹은 사이드바 "가져오기" 화면에서 한다(목록, "OVA 올리기" — 진행률, 이름은 파일 이름에서; 항목 화면 — 원본 요약·경고,
+  이름·풀·CPU·메모리·펌웨어·디스크 버스·NIC 모델·네트워크 매핑·MAC 유지, 실행과 진행, 만든 VM 링크, 지우기). 강제
+  지우기는 `oplctl`로 한다. API는 `POST /api/v1/vm-imports/ova/check?name=&size=`, `POST /api/v1/vm-imports/ova?name=`
+  (본문 OVA, 201), `GET /api/v1/vm-imports`, `GET`·`DELETE /api/v1/vm-imports/{name}`(`?force=true`),
+  `POST /api/v1/vm-imports/{name}/run`(`{"name": …, "pool": …, "networks": {…}, …}`, 202 작업)이고, 읽기는 모든 사용자,
+  올리기·실행·지우기는 operator 이상이다.
+- **한계.** 실행 중인 VMware VM 옮기기, 증분 동기화, VMware 스냅샷 체인, VMware Tools 제거·virtio 드라이버 넣기(게스트에서
+  한다), OVA 서명(`.cert`, 확인하지 않고 경고), 압축·분할 디스크, 여러 VM이 든 OVA, VM 일괄 가져오기는 없다. ESXi·vCenter에서
+  바로 가져오기는 계획 30에서 온다.
+- **남을 수 있는 것.** 실행이 볼륨을 다 만든 뒤 VM을 만들기 전에 opld가 죽으면 `{VM 이름}-disk{i}` 볼륨이 남는다(복제·복원과
+  같다) — `oplctl volume delete`로 지운다.
+
 ## 웹 UI
 
 opld를 `web-ui` 기능으로 빌드하면 API와 같은 주소(`https://<노드>:8006/`)에서 웹 UI가 열린다.
@@ -992,7 +1072,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
-볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기)과 백업 작업, 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업,
+볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기)과 백업 작업, VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업,
 사용자(admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
@@ -1053,6 +1133,7 @@ cargo test -p opl-reconciler --features qemu-it --test qemu_restart # reconciler
 cargo test -p opl-api --features storage-it --test volumes          # API: 볼륨 생성·가져오기 (qemu-img)
 cargo test -p opld --features qemu-it --test e2e                    # E2E: CLI → VM → 콘솔 → kill -9 → 재연결
 cargo test -p opld --features qemu-it --test backup                 # E2E: 실행 중 백업 → VM 지우기 → 복원(qemu-img, qemu-io 필요)
+cargo test -p opld --features qemu-it --test vm_import              # E2E: OVA 올리기 → 제안 → 가져오기 → 볼륨 내용(qemu-img 필요)
 cargo test -p opld --test cluster                                   # E2E: opld 프로세스 3개로 클러스터 구성
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
@@ -1208,6 +1289,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [HA·펜싱·위트니스 설계 (하위 프로젝트 5: 계획 22·23·24)](docs/superpowers/specs/2026-11-02-ha-fencing-witness-design.md)
 - [네트워크·SDN 설계 (하위 프로젝트 6: 계획 25·26)](docs/superpowers/specs/2026-11-03-network-sdn-design.md)
 - [백업 설계 (하위 프로젝트 7: 계획 27·28)](docs/superpowers/specs/2026-11-04-backup-design.md)
+- [VMware 가져오기 설계 (하위 프로젝트 8: 계획 29·30)](docs/superpowers/specs/2026-11-04-vmware-import-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)
