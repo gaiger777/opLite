@@ -72,7 +72,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 oplctl.workspace = true
+rcgen.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

@@ -977,9 +977,10 @@ oplctl backup-job delete nightly               # 작업만 지운다. 만든 백
 
 ## VMware에서 가져오기
 
-VMware VM을 OVA 파일로 내보내 opLite로 가져온다. 가져오기(`vm-import`)는 세 단계다: OVA를 올리면 opld가 OVF를 읽어
-원본 VM(CPU, 메모리, 펌웨어, 디스크, NIC)과 opLite VM 제안을 보이고, 사용자가 이름·풀·네트워크 매핑과 고칠 값을 정해
-실행하면 디스크를 볼륨으로 옮겨 **꺼진** 새 VM을 만든다. 실행이 실패하면 원본이 남으므로 값을 바꿔 다시 실행한다.
+VMware VM을 OVA 파일로 내보내거나 ESXi·vCenter 데이터스토어에서 바로 읽어 opLite로 가져온다. 가져오기(`vm-import`)는
+세 단계다: OVA를 올리거나 ESXi의 VM을 고르면 opld가 OVF(또는 `.vmx`와 디스크 디스크립터)를 읽어 원본 VM(CPU, 메모리,
+펌웨어, 디스크, NIC)과 opLite VM 제안을 보이고, 사용자가 이름·풀·네트워크 매핑과 고칠 값을 정해 실행하면 디스크를
+볼륨으로 옮겨 **꺼진** 새 VM을 만든다. 실행이 실패하면 원본이 남으므로 값을 바꿔 다시 실행한다.
 
 **OVA 만들기.** VMware에서 VM을 먼저 끈다(스냅샷이 있으면 통합하거나 지운다).
 
@@ -1002,6 +1003,61 @@ oplctl import run web01 --name web --pool local --net lan --disk-bus sata --nic-
 oplctl vm start web
 oplctl import delete web01                      # 가져오기와 남은 원본 파일을 지운다(만든 VM은 남는다)
 ```
+
+**ESXi·vCenter에서 바로 가져오기.** 내보내기 없이 opld가 ESXi(또는 vCenter)의 데이터스토어 브라우저
+(`https://호스트/folder`)에서 `.vmx`와 디스크를 HTTPS로 읽는다. VMware에서 VM을 **끄고**, 스냅샷이 있으면 통합하거나
+지운다(스냅샷 디스크는 400 "the VM has snapshots; consolidate or delete them in VMware first", RDM도 400). 디스크는
+VMFS·flat VMDK(디스크립터 + `-flat.vmdk`)여야 한다. 아래의 제안·네트워크 매핑·MAC·상태 등은 OVA와 같다.
+
+```bash
+export OPL_ESXI_PASSWORD='…'                    # 또는 --password-file, 둘 다 없으면 터미널에서 묻는다(인자로는 받지 않는다)
+oplctl import esxi-browse --host esx1.example.com --user root
+# error: the ESXi certificate fingerprint is AB:CD:…; check it and rerun with --fingerprint AB:CD:…
+oplctl import esxi-browse --host esx1.example.com --user root --fingerprint AB:CD:…
+# DATASTORE   VMX              NAME   GUEST      CPU  MEMORY  DISKS  LOCKED
+# datastore1  web01/web01.vmx  web01  ubuntu-64  2    1.0GiB  1      false
+oplctl import esxi web01 --host esx1.example.com --user root --fingerprint AB:CD:… \
+  --datastore datastore1 --vmx web01/web01.vmx
+oplctl import get web01                         # SOURCE: esxi://esx1.example.com/datastore1/web01/web01.vmx
+oplctl import run web01 --name web --pool local --net lan     # 디스크를 내려받아 볼륨으로 옮긴다
+```
+
+- **인증서 지문.** ESXi 인증서는 대개 자체 서명이라 시스템 CA로 검증하지 않고 SHA-256 지문을 고정한다. 지문 없이
+  연결하면 opld가 서버 인증서의 지문을 알려 준다(409 `untrusted_certificate`). ESXi 호스트에서 직접 얻은 지문
+  (예: ESXi 셸의 `openssl x509 -in /etc/vmware/ssl/rui.crt -noout -fingerprint -sha256`)과 같은지 확인한 뒤
+  `--fingerprint`로 다시 한다. 지문이 다르면 비밀번호를 보내기 전에 끊는다(409 `fingerprint_mismatch`). 사용자
+  이름·비밀번호가 틀리면 400 `esxi_auth`, 연결할 수 없으면 502 `esxi_unreachable`, 지문 모양이 틀리면(SHA-256 16진 64자가
+  아니면) 연결하기 전에 400이다.
+- **찾기.** `esxi-browse`는 데이터스토어마다 맨 위 디렉터리의 첫 `.vmx`를 읽어(500개까지) 보인다. 읽지 못한 VM은 NAME
+  자리에 이유가 나온다. `LOCKED`가 `true`면 VM 디렉터리에 잠금 파일(`.lck`로 끝나는 항목, NFS의 `.lck-…`)이나 켜진
+  VM만 가지는 스왑 파일(`.vswp`)이 있다 — 켜져 있을 수 있으니 끈다(만들 때도 경고한다). 이 파일들로 짐작할 뿐이므로
+  켜진 VM을 가져오지 않게 직접 확인한다. **일시 중단된 VM**(디렉터리에 `.vmss`)도 `LOCKED`가 `true`이고 만들 때 경고한다
+  ("the VM is suspended; power it off in VMware before importing (its memory state is not imported)") — 메모리
+  상태는 가져오지 않으므로 VMware에서 다시 켠 뒤 게스트를 정상 종료한다. 목록을 읽지 못한 데이터스토어·폴더는 오류 없이
+  건너뛴다 — 보여야 할 VM이 없으면 opld 로그를 본다. ESXi `/folder` 페이지의 모양은 문서와 화면을 보고 가짜 ESXi로
+  흉내 내 시험했을 뿐 실제 ESXi에서는 시험하지 않았다.
+- **씬 디스크와 여유.** `/folder`는 디스크를 통째로 주므로 씬 디스크도 **전체 크기로** 내려받는다. 실행 노드의 업로드
+  디렉터리(`{data_dir}/uploads`)에 가장 큰 디스크 용량 + 1 GiB의 여유가 필요하고(아니면 507; 작업도 디스크마다 다시
+  본다), 시간도 전체 크기만큼 걸린다. 디스크마다 `disk.raw`로 받아 볼륨으로 옮기고 지운다(풀에는 0이 아닌 부분만
+  남는다). 받은 길이가 디스크립터와 다르면 실패한다. 내려받기는 취소할 수 없고, 실패하면 처음부터 다시 받는다. 전체
+  시간 제한은 없어(응답·조각마다 60초만 기다린다) ESXi가 바이트를 아주 느리게 보내면 작업이 오래 붙잡힌다.
+- **비밀번호는 받은 노드의 메모리에만.** 비밀번호는 클러스터 상태·작업·로그에 남지 않고 `import esxi`를 받은 노드의
+  메모리에만 있다. 실행 작업도 그 노드에서 돌며(실행 요청은 어느 노드로 보내도 된다) 끝나거나 가져오기를 지우면 잊는다.
+  그 노드의 **opld를 다시 시작하면** 끝나지 않은 ESXi 가져오기는 `failed`("the ESXi credentials are no longer on
+  this node (opld restarted or the request was interrupted); create the import again")가 된다 — 지우고 다시 만든다.
+  그 노드가 꺼져 있을 때 `--force`로 지운 가져오기의 비밀번호는 그 opld가 다시 시작할 때까지 메모리에 남는다(쓰이지는
+  않는다). ESXi 비밀번호를 바꾸면 남은 가져오기는 옛 비밀번호를 쓰므로 지우고 다시 만든다.
+- **vCenter.** `--host`에 vCenter 주소, `--datacenter`에 데이터센터 이름(ESXi 단독 호스트는 기본값 `ha-datacenter`)을 준다.
+  vCenter의 `/folder` 페이지는 ESXi의 것과 같은 모양이라고 보고 만들었고 실제 vCenter에서는 아직 시험하지 않았다.
+- **분산 스위치·NSX.** vCenter 분산 스위치(VDS)의 NIC는 원본 네트워크가 포트 그룹 이름으로, `.vmx`에 이름이 없으면(보통은
+  없다) `dvs:{포트 그룹 id}`로 보이고, NSX 네트워크의 NIC는 `nsx:{id}`로 보인다. 둘 다 경고가 나오고, 실행 때
+  `--net "dvs:dvportgroup-1001=lan"`처럼 매핑한다.
+- **권한과 연결.** 가져오기 쓰기 권한(operator 이상)이 있으면 opld 노드에서 아무 호스트:포트로 TLS 연결을 시도하게 할 수
+  있다(지문을 믿기 전에도 인증서를 받으려고 연결한다). 관리자는 operator 권한을 그만큼 믿어야 한다(연결할 곳의 허용
+  목록은 아직 없다).
+- `ova`·`esxi`는 예약 이름이라 예약 전에 그 이름으로 만든 옛 가져오기는 이름이 아니라 id로 다룬다
+  (`oplctl import get <id>`).
+- CD-ROM·플로피·USB·사운드는 경고로 보이고 가져오지 않는다.
 
 - **제안.** 게스트 OS(`vmw:osType`)가 Windows(`win…`)면 디스크 `sata`·NIC `e1000e`(Windows가 드라이버를 갖고 있다),
   그 밖은 `virtio-blk`·`virtio`다. vCPU는 원본의 소켓당 코어로 나누고(나누어떨어지지 않으면 소켓 하나), 메모리는
@@ -1030,7 +1086,8 @@ oplctl import delete web01                      # 가져오기와 남은 원본 
   전마다 다시 보고 모자라면 실패한다), 실행도 그 노드에서 한다. 그래서
   풀은 그 노드에서 쓸 수 있어야 하고(409 `pool_not_on_node`), 그 노드가 꺼져 있으면 실행할 수 없다(409
   `node_offline`). 위트니스 노드에는 올릴 수 없다(400). 실행이 끝나면 원본을 지운다. 원본 노드가 클러스터에서 빠졌거나
-  꺼진 채 돌아오지 않으면 `oplctl import delete web01 --force`로 기록만 지운다(원본 파일은 그 노드에 남는다).
+  꺼진 채 돌아오지 않으면 `oplctl import delete web01 --force`로 기록만 지운다(원본 파일은 그 노드에 남는다). ESXi
+  가져오기도 `import esxi`를 받은 노드에서 실행한다.
 - **볼륨.** 디스크마다 OVA에서 꺼내(`.mf`가 있으면 SHA-1·SHA-256·SHA-384·SHA-512를 확인한다; 모르는 알고리즘이거나
   `.mf`에 없는 디스크는 확인하지 않고 경고한다) 볼륨 `{VM 이름}-disk{i}`(풀의 기본 형식:
   dir·NFS는 qcow2, 블록 풀은 raw)로 옮긴다. 해시가 다르면 실행이 실패하고("checksum mismatch for …") 그때까지 만든
@@ -1043,15 +1100,19 @@ oplctl import delete web01                      # 가져오기와 남은 원본 
   실행하거나 지울 수 있다(노드가 없으면 `--force`). 웹의 지우기 단추는 `importing`에서도 누를 수 있고, 아직 실행 중이면
   서버가 `import_busy`로 거절한다.
 - **아키텍처.** 가져온 VM은 x86 `q35`다. aarch64(macOS) 노드에도 가져올 수는 있지만 켜려면 x86_64 노드가 필요하다.
-- 웹은 사이드바 "가져오기" 화면에서 한다(목록, "OVA 올리기" — 진행률, 이름은 파일 이름에서; 항목 화면 — 원본 요약·경고,
-  이름·풀·CPU·메모리·펌웨어·디스크 버스·NIC 모델·네트워크 매핑·MAC 유지, 실행과 진행, 만든 VM 링크, 지우기). 강제
-  지우기는 `oplctl`로 한다. API는 `POST /api/v1/vm-imports/ova/check?name=&size=`, `POST /api/v1/vm-imports/ova?name=`
-  (본문 OVA, 201), `GET /api/v1/vm-imports`, `GET`·`DELETE /api/v1/vm-imports/{name}`(`?force=true`),
+- 웹은 사이드바 "가져오기" 화면에서 한다(목록, "OVA 올리기" — 진행률, 이름은 파일 이름에서; "ESXi에서 가져오기" —
+  호스트·포트·사용자·비밀번호·데이터센터로 연결 → 처음 보는 인증서면 지문을 보이고 "이 지문을 믿고 계속" → VM 고르기
+  (잠금 경고, 읽지 못한 VM은 고를 수 없음) → 가져오기 이름 → 만들기, 비밀번호는 브라우저에 저장하지 않는다; 항목 화면 —
+  원본 요약·경고, 이름·풀·CPU·메모리·펌웨어·디스크 버스·NIC 모델·네트워크 매핑·MAC 유지, 실행과 진행, 만든 VM 링크,
+  지우기). 강제 지우기는 `oplctl`로 한다. API는 `POST /api/v1/vm-imports/ova/check?name=&size=`,
+  `POST /api/v1/vm-imports/ova?name=`(본문 OVA, 201), `POST /api/v1/vm-imports/esxi/browse`(본문 연결
+  `{"host", "port", "user", "password", "datacenter", "fingerprint"}`), `POST /api/v1/vm-imports/esxi`(`{"name", "connection",
+  "datastore", "vmx"}`, 201), `GET /api/v1/vm-imports`, `GET`·`DELETE /api/v1/vm-imports/{name}`(`?force=true`),
   `POST /api/v1/vm-imports/{name}/run`(`{"name": …, "pool": …, "networks": {…}, …}`, 202 작업)이고, 읽기는 모든 사용자,
-  올리기·실행·지우기는 operator 이상이다.
+  올리기·ESXi 연결·실행·지우기는 operator 이상이다.
 - **한계.** 실행 중인 VMware VM 옮기기, 증분 동기화, VMware 스냅샷 체인, VMware Tools 제거·virtio 드라이버 넣기(게스트에서
-  한다), OVA 서명(`.cert`, 확인하지 않고 경고), 압축·분할 디스크, 여러 VM이 든 OVA, VM 일괄 가져오기는 없다. ESXi·vCenter에서
-  바로 가져오기는 계획 30에서 온다.
+  한다), OVA 서명(`.cert`, 확인하지 않고 경고), 압축·분할 디스크, 여러 VM이 든 OVA, VM 일괄 가져오기, VDDK·NFC, 내려받기
+  이어 받기·취소·전체 시간 제한은 없다. ESXi에서는 디스크립터가 따로 없는 VMDK·여러 extent·RDM을 받지 않는다.
 - **남을 수 있는 것.** 실행이 볼륨을 다 만든 뒤 VM을 만들기 전에 opld가 죽으면 `{VM 이름}-disk{i}` 볼륨이 남는다(복제·복원과
   같다) — `oplctl volume delete`로 지운다.
 

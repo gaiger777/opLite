@@ -1,21 +1,27 @@
 //! 실제 opld로 VMware OVA를 가져온다: 시험이 만든 OVA(표식을 쓴 디스크의 streamOptimized VMDK, vSphere
 //! 모양 OVF, SHA256 `.mf`)를 `oplctl import ova`로 올리고 제안을 본 뒤 `import run`으로 꺼진 VM과 볼륨을
 //! 만든다. 볼륨을 `qemu-img convert`로 raw로 빼서 표식이 있는지 본다. `.mf` 해시가 틀린 OVA는 실행이
-//! 실패하고 볼륨을 남기지 않는다. 가져온 VM은 켜지 않는다(게스트 OS가 없고, aarch64 macOS 노드는 x86
-//! 게스트를 돌리지 못한다).
+//! 실패하고 볼륨을 남기지 않는다. 시험 안에 띄운 가짜 ESXi(`/folder` 데이터스토어 브라우저)에서는
+//! `oplctl import esxi-browse`·`import esxi`·`import run`으로 바로 가져오고, opld를 다시 시작하면 남은 ESXi
+//! 가져오기가 자격 증명을 잃어 `failed`가 된다. 가져온 VM은 켜지 않는다(게스트 OS가 없고, aarch64 macOS
+//! 노드는 x86 게스트를 돌리지 못한다).
 //! `cargo test -p opld --features qemu-it --test vm_import`
 //! QEMU(`qemu-it`와 같다)와 qemu-img가 필요하다.
 #![cfg(feature = "qemu-it")]
 
 mod common;
+#[path = "../../opl-api/tests/common/esxi.rs"]
+mod esxi;
 #[allow(dead_code)]
 #[path = "../../opl-api/tests/common/ustar.rs"]
 mod ustar;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::Daemon;
+use common::{Daemon, eventually};
+use esxi::MockEsxi;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ustar::Tar;
@@ -360,5 +366,264 @@ async fn checksum_mismatch_fails_the_run_and_leaves_no_volume() {
 
     d.ctl(&["import", "delete", "web01"]).await.unwrap();
     assert!(!import_dir(&d, &import).exists(), "source directory left");
+    d.stop();
+}
+
+// --- ESXi에서 바로 가져오기 ---
+
+const ESXI_USER: &str = "root";
+const ESXI_PASSWORD: &str = "S3cret-esxi-pw";
+const ESXI_MAC: &str = "00:50:56:aa:bb:cc";
+
+/// 2 vCPU(소켓당 코어 2), 1024 MiB, efi, Linux, SCSI 디스크 `web01.vmdk`, "VM Network"의 vmxnet3 NIC
+/// 하나([`ESXI_MAC`])
+const WEB01_VMX: &str = r#".encoding = "UTF-8"
+displayName = "web01"
+guestOS = "ubuntu-64"
+numvcpus = "2"
+cpuid.coresPerSocket = "2"
+memSize = "1024"
+firmware = "efi"
+scsi0.present = "TRUE"
+scsi0.virtualDev = "pvscsi"
+scsi0:0.present = "TRUE"
+scsi0:0.fileName = "web01.vmdk"
+ethernet0.present = "TRUE"
+ethernet0.networkName = "VM Network"
+ethernet0.virtualDev = "vmxnet3"
+ethernet0.addressType = "static"
+ethernet0.address = "00:50:56:aa:bb:cc"
+"#;
+
+/// 데이터스토어 `datastore1`의 VM `web01`: 디스크립터는 4 MiB(8192 섹터) VMFS 디스크이고, extent
+/// `web01-flat.vmdk`는 앞 `MARK` 바이트가 `0xcd`인 4 MiB raw다.
+async fn web01_esxi() -> MockEsxi {
+    let mut flat = vec![0u8; DISK_BYTES];
+    flat[..MARK].fill(0xcd);
+    let descriptor = "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\n\
+                      createType=\"vmfs\"\n\n# Extent description\nRW 8192 VMFS \"web01-flat.vmdk\"\n";
+    let files = BTreeMap::from([
+        ("datastore1/web01/web01.vmx".to_string(), WEB01_VMX.into()),
+        ("datastore1/web01/web01.vmdk".to_string(), descriptor.into()),
+        ("datastore1/web01/web01-flat.vmdk".to_string(), flat),
+    ]);
+    MockEsxi::start(files, ESXI_USER, ESXI_PASSWORD).await
+}
+
+/// oplctl에 줄 ESXi 비밀번호 파일(`--password-file`). oplctl이 이 프로세스 안에서 돌므로 환경 변수
+/// (`OPL_ESXI_PASSWORD`)는 바꾸지 않는다.
+fn esxi_password_file(d: &Daemon) -> String {
+    let file = d.path("esxi-password");
+    std::fs::write(&file, ESXI_PASSWORD).unwrap();
+    file.to_str().unwrap().to_string()
+}
+
+/// `import esxi`(가짜 ESXi의 `datastore1/web01/web01.vmx`)
+async fn create_esxi(d: &Daemon, esxi: &MockEsxi, name: &str) {
+    let (host, port) = (esxi.addr.ip().to_string(), esxi.addr.port().to_string());
+    let password_file = esxi_password_file(d);
+    let out = d
+        .ctl(&[
+            "import",
+            "esxi",
+            name,
+            "--host",
+            &host,
+            "--port",
+            &port,
+            "--user",
+            ESXI_USER,
+            "--password-file",
+            &password_file,
+            "--datastore",
+            "datastore1",
+            "--vmx",
+            "web01/web01.vmx",
+            "--fingerprint",
+            &esxi.fingerprint,
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        format!("vm-import {name} created; review it with `oplctl import get {name}`\n")
+    );
+}
+
+/// 가짜 ESXi에서 바로 가져온다: 지문 없이 browse하면 서버 인증서 지문을 알려 주고, 그 지문으로 browse하면
+/// `web01`이 보이고, 만들면 `.vmx`에서 제안이 나오고(비밀번호는 리소스에 없다), 실행하면 extent를 내려받아
+/// 원본 MAC을 쓰는 꺼진 VM과 볼륨을 만든다. 그 뒤 하나 더 만들어 두고 opld를 다시 시작하면 그 가져오기는
+/// 메모리의 자격 증명을 잃어 `failed`가 된다.
+#[tokio::test]
+async fn esxi_import_downloads_the_disk_and_restart_loses_credentials() {
+    let mut d = Daemon::new("node1", "");
+    setup(&mut d).await;
+    let esxi = web01_esxi().await;
+    let (host, port) = (esxi.addr.ip().to_string(), esxi.addr.port().to_string());
+    let password_file = esxi_password_file(&d);
+    let browse = [
+        "import",
+        "esxi-browse",
+        "--host",
+        &host,
+        "--port",
+        &port,
+        "--user",
+        ESXI_USER,
+        "--password-file",
+        &password_file,
+    ];
+
+    // 지문을 주지 않으면 서버 인증서의 지문을 알려 주고, ESXi에는 자격 증명을 보내지 않는다.
+    let err = d.ctl(&browse).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the ESXi certificate fingerprint is {0}; check it and rerun with --fingerprint {0}",
+            esxi.fingerprint
+        )
+    );
+    assert!(
+        esxi.requests().iter().all(|r| r.authorization.is_none()),
+        "{:?}",
+        esxi.requests()
+    );
+    let mut with_fingerprint = browse.to_vec();
+    with_fingerprint.extend(["--fingerprint", &esxi.fingerprint]);
+    let table = d.ctl(&with_fingerprint).await.unwrap();
+    let rows: Vec<Vec<&str>> = table
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(rows.len(), 2, "{table}");
+    assert_eq!(
+        rows[0],
+        [
+            "DATASTORE",
+            "VMX",
+            "NAME",
+            "GUEST",
+            "CPU",
+            "MEMORY",
+            "DISKS",
+            "LOCKED"
+        ]
+    );
+    assert_eq!(
+        rows[1][..5],
+        ["datastore1", "web01/web01.vmx", "web01", "ubuntu-64", "2"]
+    );
+
+    create_esxi(&d, &esxi, "web01").await;
+    let import = d.ctl_json(&["import", "get", "web01"]).await;
+    assert_eq!(import["status"]["phase"], "ready", "{import}");
+    let source = &import["spec"]["source"]["esxi"];
+    assert_eq!(
+        (
+            &source["host"],
+            &source["datastore"],
+            &source["vmx"],
+            &source["user"]
+        ),
+        (
+            &json!(host),
+            &json!("datastore1"),
+            &json!("web01/web01.vmx"),
+            &json!(ESXI_USER)
+        ),
+        "{import}"
+    );
+    assert_eq!(source["fingerprint"], esxi.fingerprint.as_str(), "{import}");
+    assert!(!import.to_string().contains(ESXI_PASSWORD), "{import}");
+    assert_eq!(
+        import["status"]["source_vm"]["disks"][0]["capacity_bytes"], DISK_BYTES,
+        "{import}"
+    );
+    let text = d.ctl(&["import", "get", "web01"]).await.unwrap();
+    assert!(
+        text.contains(
+            "proposal: 1 sockets x 2 cores, 1024 MiB, uefi, virtio-blk disks, virtio NICs\n"
+        ),
+        "{text}"
+    );
+    let list = d.ctl(&["import", "list"]).await.unwrap();
+    let source_url = format!("esxi://{host}/datastore1/web01/web01.vmx");
+    assert!(
+        list.lines()
+            .nth(1)
+            .is_some_and(|l| l.split_whitespace().collect::<Vec<_>>()
+                == ["web01", "node1", source_url.as_str(), "ready", "-"]),
+        "{list}"
+    );
+
+    let out = d
+        .ctl(&[
+            "import", "run", "web01", "--name", "web", "--pool", "local", "--net", "lan",
+        ])
+        .await
+        .unwrap();
+    assert_eq!(out, "vm web imported\n");
+
+    let vm = d.ctl_json(&["vm", "get", "web"]).await;
+    let spec = &vm["spec"];
+    assert_eq!(spec["power"], "stopped", "{vm}");
+    assert_eq!(spec["firmware"], "uefi", "{vm}");
+    assert_eq!(spec["memory_mib"], 1024, "{vm}");
+    assert_eq!(
+        (&spec["cpu"]["sockets"], &spec["cpu"]["cores"]),
+        (&json!(1), &json!(2))
+    );
+    assert_eq!(spec["disks"][0]["volume"], "web-disk0", "{vm}");
+    assert_eq!(spec["disks"][0]["bus"], "virtio-blk", "{vm}");
+    let nics = spec["nics"].as_array().unwrap();
+    assert_eq!(nics.len(), 1, "{vm}");
+    assert_eq!(nics[0]["network"], "lan", "{vm}");
+    assert_eq!(nics[0]["model"], "virtio", "{vm}");
+    assert_eq!(nics[0]["mac"], ESXI_MAC, "{vm}");
+
+    // 볼륨에 extent의 내용이 있다. extent는 비밀번호와 함께 한 번 내려받았다.
+    let volume = d.ctl_json(&["volume", "get", "web-disk0"]).await;
+    assert_eq!(volume["spec"]["size_bytes"], DISK_BYTES, "{volume}");
+    let file = volume_file(&d, "web-disk0").await;
+    assert_eq!(head(&d, &file), vec![0xcd; MARK]);
+    let downloads: Vec<_> = esxi
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/folder/web01/web01-flat.vmdk")
+        .collect();
+    assert_eq!(downloads.len(), 1, "{downloads:?}");
+    assert_eq!(
+        downloads[0].authorization.as_deref(),
+        Some(opl_api::vm_imports::esxi::basic_auth(ESXI_USER, ESXI_PASSWORD).as_str())
+    );
+
+    let done = d.ctl_json(&["import", "get", "web01"]).await;
+    assert_eq!(done["status"]["phase"], "done", "{done}");
+    assert_eq!(done["status"]["vm"], vm["id"], "{done}");
+    assert!(done["status"]["error"].is_null(), "{done}");
+    assert!(!import_dir(&d, &done).exists(), "import directory left");
+
+    // 하나 더 만들어 두고 opld를 다시 시작하면 메모리의 비밀번호가 사라져 그 가져오기는 실패한다.
+    create_esxi(&d, &esxi, "web02").await;
+    d.stop();
+    d.start().await;
+    eventually("web02 failed after the restart", || async {
+        d.ctl_json(&["import", "get", "web02"]).await["status"]["phase"] == "failed"
+    })
+    .await;
+    let failed = d.ctl_json(&["import", "get", "web02"]).await;
+    assert_eq!(
+        failed["status"]["error"],
+        "the ESXi credentials are no longer on this node (opld restarted or the request was interrupted); create the import again",
+        "{failed}"
+    );
+    // 끝난 가져오기는 그대로다.
+    let done = d.ctl_json(&["import", "get", "web01"]).await;
+    assert_eq!(done["status"]["phase"], "done", "{done}");
+
+    d.ctl(&["import", "delete", "web02"]).await.unwrap();
+    d.ctl(&["import", "delete", "web01"]).await.unwrap();
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", "web-disk0"]).await.unwrap();
     d.stop();
 }
