@@ -1,6 +1,6 @@
 //! 클러스터 멤버로 도는 노드: 노드 간 서버, 클러스터 저장소, reconciler, Task 실행기, HTTPS API,
-//! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태, VXLAN 장치, VM 방화벽. 위트니스는
-//! 노드 간 서버와 클러스터 저장소, 승격, Node 등록만 띄운다.
+//! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태, VXLAN 장치, VM 방화벽, APT
+//! 업데이트. 위트니스는 노드 간 서버와 클러스터 저장소, 승격, Node 등록만 띄운다.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -15,6 +15,7 @@ use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
     AppState, BackupJobScheduler, ClusterJanitor, HaManager, HaManagerConfig, IncomingConfig,
     IncomingMigrations, SnapshotScheduler, TaskRunner, TaskRunnerConfig, UefiVarsFetcher,
+    UpdateAgent, Updates,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
@@ -126,6 +127,8 @@ struct Services {
     firewall: Option<FirewallAgent>,
     /// HA 리스와 watchdog(`[ha] fencing = "off"`면 없다)
     ha: Option<Arc<HaGuard>>,
+    /// APT 소스 파일과 주기 업데이트 확인(업데이트가 꺼졌으면 없다)
+    updates: Option<UpdateAgent>,
 }
 
 impl Services {
@@ -144,6 +147,9 @@ impl Services {
         self.backups.shutdown().await;
         self.recovery.shutdown().await;
         self.pools.shutdown().await;
+        if let Some(updates) = self.updates {
+            updates.shutdown().await;
+        }
         if let Some(overlay) = self.overlay {
             overlay.shutdown(left).await;
         }
@@ -415,6 +421,12 @@ impl Member {
         runner_config.migration_timeout = config.migration.timeout;
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
+        // 업데이트 확인은 주기 에이전트와 다시 확인 Task가 함께 쓴다(한 번에 하나만 돈다).
+        let updates = config
+            .updates
+            .updates_config()
+            .map(|c| Arc::new(Updates::new(c)));
+        runner_config.updates = updates.clone();
         let runner = TaskRunner::spawn(
             cluster.clone(),
             storage,
@@ -424,6 +436,7 @@ impl Member {
         )
         .await;
         let monitor = NodeMonitor::spawn(cluster.clone(), peers, NodeMonitorConfig::default());
+        let updates = updates.map(|u| UpdateAgent::spawn(cluster.clone(), node, u));
 
         let listener = TlsListener::new(api_listener, api_tls)?;
         tracing::info!(
@@ -471,6 +484,7 @@ impl Member {
                 overlay,
                 firewall,
                 ha,
+                updates,
             }),
             register,
             promotion,

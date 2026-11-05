@@ -99,6 +99,8 @@ pub enum TaskOp {
     },
     /// 대상 가져오기의 원본 디렉터리와 리소스를 지운다.
     VmImportDelete,
+    /// 대상 노드(Task의 `node`와 같다)의 APT 업데이트를 확인해 Node `status.updates`에 쓴다.
+    NodeUpdateCheck,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -318,6 +320,16 @@ mod tests {
             assert_eq!(serde_json::to_value(&op).unwrap(), json);
             assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
         }
+    }
+
+    #[test]
+    fn node_update_check_op_is_tagged_by_kind() {
+        let json = serde_json::json!({ "kind": "node-update-check" });
+        assert_eq!(serde_json::to_value(TaskOp::NodeUpdateCheck).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<TaskOp>(json).unwrap(),
+            TaskOp::NodeUpdateCheck
+        );
     }
 
     #[test]

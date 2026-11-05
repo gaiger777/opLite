@@ -58,7 +58,7 @@ impl Daemon {
             "name = \"{name}\"\naddress = \"127.0.0.1\"\nlisten = \"127.0.0.1:{port}\"\n\
              cluster_listen = \"127.0.0.1:{cluster_port}\"\ncontrol_socket = \"{sock}\"\n\
              data_dir = \"{data}\"\nrun_dir = \"{run}\"\nqemu_share_dir = \"{share}\"\n{extra_config}\n\
-             [hypervisor]\n{hypervisor}\n",
+             [hypervisor]\n{hypervisor}\n[updates]\nenabled = false\n",
             sock = dir.path().join("opld.sock").display(),
             data = dir.path().join("data").display(),
             run = dir.path().join("run").display(),

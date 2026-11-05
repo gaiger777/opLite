@@ -213,6 +213,7 @@ async fn two_nodes_with(ha: Option<Arc<HaGuard>>) -> (TempDir, Node, Node) {
             underlay: None,
             firewall: false,
             version: None,
+            updates: None,
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();

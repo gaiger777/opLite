@@ -36,6 +36,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
         underlay: None,
         firewall: false,
         version: None,
+        updates: None,
     };
     env.cluster.create(&node).await.unwrap();
     node.id

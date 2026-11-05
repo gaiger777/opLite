@@ -168,6 +168,7 @@ mod tests {
             underlay: None,
             firewall: false,
             version: None,
+            updates: None,
         };
         n
     }

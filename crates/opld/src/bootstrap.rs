@@ -124,7 +124,7 @@ async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
 }
 
 /// 이 노드의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 용량, 브리지, 아키텍처, HA 펜싱,
-/// underlay, 방화벽 여부를 기록한다.
+/// underlay, 방화벽 여부, 버전, 업데이트 확인 여부를 기록한다.
 pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> anyhow::Result<()> {
     let underlay = config.underlay().await;
     record_node(cluster, config, host, underlay).await
@@ -159,6 +159,11 @@ async fn record_node(
             underlay: underlay.or(status.underlay),
             firewall: host.firewall.is_some(),
             version: Some(BUILD.to_string()),
+            // 업데이트 확인이 쓴 결과는 지우지 않는다. 꺼진 노드는 None이다(다시 확인을 받지 않는다).
+            updates: config
+                .updates
+                .enabled()
+                .then(|| status.updates.take().unwrap_or_default()),
         };
         true
     })
@@ -248,7 +253,7 @@ pub(crate) mod tests {
     use opl_cluster::ClusterConfig;
     use opl_cluster::memnet::MemRouter;
     use opl_driver::{DriverError, Firewall, HostNet, Overlay, OverlayChanges, Tap};
-    use opl_types::node::{BridgeInfo, Fencing, NodeHa, PoolState};
+    use opl_types::node::{BridgeInfo, Fencing, NodeHa, NodeUpdates, PoolState};
 
     use crate::config::FencingSetting;
 
@@ -456,14 +461,54 @@ pub(crate) mod tests {
         cluster.shutdown().await.unwrap();
     }
 
+    /// 업데이트가 켜진 노드는 `updates`를 기록하고(처음엔 빈 값) 확인 결과를 다시 등록해도 지키며,
+    /// 꺼지면 지운다.
+    #[tokio::test]
+    async fn registration_records_whether_updates_are_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let mut config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        let updates = || {
+            cluster
+                .get::<NodeSpec>(id.0)
+                .unwrap()
+                .unwrap()
+                .status
+                .updates
+        };
+        config.updates.enabled = Some(true);
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(updates(), Some(NodeUpdates::default()));
+        let checked = NodeUpdates {
+            checked_at: Some(1_793_000_000),
+            error: Some("apt-get update -q failed".into()),
+            ..NodeUpdates::default()
+        };
+        update_node_status(&cluster, |status| {
+            status.updates = Some(checked.clone());
+            true
+        })
+        .await
+        .unwrap();
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(updates(), Some(checked));
+        config.updates.enabled = Some(false);
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(updates(), None);
+        cluster.shutdown().await.unwrap();
+    }
+
     /// 위트니스는 역할과 온라인, 아키텍처만 기록하고 VM을 돌리는 데 쓰는 값은 비운다.
     #[tokio::test]
     async fn witness_registration_records_only_the_role_and_architecture() {
         let dir = tempfile::tempdir().unwrap();
         let (cluster, id) = single_node(dir.path()).await;
-        // underlay를 설정해도 기록하지 않는다.
+        // underlay와 업데이트를 설정해도 기록하지 않는다.
         let config: Config = toml::from_str(
-            "name = \"w\"\naddress = \"10.0.0.9\"\nwitness = true\n[network]\nunderlay = \"10.1.0.9\"",
+            "name = \"w\"\naddress = \"10.0.0.9\"\nwitness = true\n[network]\nunderlay = \"10.1.0.9\"\n\
+             [updates]\nenabled = true",
         )
         .unwrap();
         register_witness(&cluster, &config).await.unwrap();

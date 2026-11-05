@@ -39,6 +39,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::schedule::task_failed;
 use crate::snapshots::{uses_block_snapshots, vm_placement};
+use crate::updates::Updates;
 use crate::vm_imports::ImportCredentials;
 use crate::vms::is_stopped;
 use crate::volumes::{block_pool_kind, usable_node};
@@ -90,6 +91,8 @@ pub struct TaskRunnerConfig {
     /// 이 노드가 받은 ESXi 가져오기의 자격 증명. 가져오기 Task가 쓰고, 끝나거나 지우면 지운다. API
     /// (`AppState::import_credentials`)와 같은 것을 넘긴다.
     pub import_credentials: Arc<ImportCredentials>,
+    /// 이 노드의 업데이트 확인. 없으면(업데이트가 꺼진 노드) 업데이트 확인 Task는 실패한다.
+    pub updates: Option<Arc<Updates>>,
 }
 
 impl TaskRunnerConfig {
@@ -108,6 +111,7 @@ impl TaskRunnerConfig {
             migration_timeout: Duration::from_secs(30 * 60),
             firmware: None,
             import_credentials: Arc::default(),
+            updates: None,
         }
     }
 }
@@ -769,6 +773,10 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
         }
         TaskOp::VmImport { import, run } => import::import(ctx, task, *import, run).await,
         TaskOp::VmImportDelete => import::delete(ctx, id).await,
+        TaskOp::NodeUpdateCheck => match &ctx.config.updates {
+            Some(updates) => updates.refresh_waiting(&ctx.cluster, ctx.config.node).await,
+            None => Err("updates are not enabled on this node".into()),
+        },
     }
 }
 

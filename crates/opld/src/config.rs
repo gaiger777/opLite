@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use opl_api::{BackupJobSchedulerConfig, ClusterJanitorConfig, SnapshotSchedulerConfig};
+use opl_api::{
+    BackupJobSchedulerConfig, ClusterJanitorConfig, SnapshotSchedulerConfig, UpdatesConfig,
+};
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
 use opl_reconciler::ha::{DeviceWatchdog, WatchdogOpener};
@@ -62,6 +64,8 @@ pub struct Config {
     pub ha: HaSection,
     #[serde(default)]
     pub network: NetworkSection,
+    #[serde(default)]
+    pub updates: UpdatesSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -391,6 +395,128 @@ pub struct NetworkSection {
     /// 주소(loopback·link-local은 빼고 IPv4 먼저)다.
     #[serde(default)]
     pub underlay: Option<IpAddr>,
+}
+
+/// 노드의 APT 업데이트(소스 파일, 업데이트 확인). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatesSection {
+    /// 업데이트를 확인한다. 없으면 `apt_get`이 있을 때(Debian) 켜진다.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 업데이트를 확인하는 간격
+    #[serde(
+        default = "default_check_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub check_interval: Duration,
+    /// 시작한 뒤 첫 확인까지 기다리는 시간
+    #[serde(
+        default = "default_first_check",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub first_check: Duration,
+    /// opLite APT 저장소 주소. 비면 빌드 값(`OPL_APT_URL`), 그것도 비면 소스 파일을 쓰지 않는다.
+    #[serde(default)]
+    pub apt_url: String,
+    /// opld가 관리하는 deb822 소스 파일
+    #[serde(default = "default_sources_file")]
+    pub sources_file: PathBuf,
+    #[serde(default = "default_apt_get")]
+    pub apt_get: PathBuf,
+    #[serde(default = "default_systemd_run")]
+    pub systemd_run: PathBuf,
+    #[serde(default = "default_systemctl")]
+    pub systemctl: PathBuf,
+    #[serde(default = "default_dpkg")]
+    pub dpkg: PathBuf,
+    /// 업그레이드 로그를 두는 디렉터리
+    #[serde(default = "default_log_dir")]
+    pub log_dir: PathBuf,
+    /// 업그레이드 유닛 상태를 다시 보는 간격
+    #[serde(
+        default = "default_upgrade_poll",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub poll: Duration,
+}
+
+impl Default for UpdatesSection {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            check_interval: default_check_interval(),
+            first_check: default_first_check(),
+            apt_url: String::new(),
+            sources_file: default_sources_file(),
+            apt_get: default_apt_get(),
+            systemd_run: default_systemd_run(),
+            systemctl: default_systemctl(),
+            dpkg: default_dpkg(),
+            log_dir: default_log_dir(),
+            poll: default_upgrade_poll(),
+        }
+    }
+}
+
+impl UpdatesSection {
+    /// 업데이트를 확인하는지: `enabled`, 없으면 `apt_get`이 있는지
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or_else(|| self.apt_get.exists())
+    }
+
+    /// API의 업데이트 설정. 꺼졌으면 None이다.
+    pub fn updates_config(&self) -> Option<UpdatesConfig> {
+        if !self.enabled() {
+            return None;
+        }
+        let apt_url = if self.apt_url.is_empty() {
+            opl_types::version::APT_URL.to_string()
+        } else {
+            self.apt_url.clone()
+        };
+        Some(UpdatesConfig {
+            check_interval: self.check_interval,
+            first_check: self.first_check,
+            apt_url,
+            sources_file: self.sources_file.clone(),
+            keyring: opl_api::KEYRING.into(),
+            apt_get: self.apt_get.clone(),
+            systemd_run: self.systemd_run.clone(),
+            systemctl: self.systemctl.clone(),
+            dpkg: self.dpkg.clone(),
+            log_dir: self.log_dir.clone(),
+            poll: self.poll,
+        })
+    }
+}
+
+fn default_check_interval() -> Duration {
+    Duration::from_secs(24 * 3600)
+}
+fn default_first_check() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_sources_file() -> PathBuf {
+    "/etc/apt/sources.list.d/oplite.sources".into()
+}
+fn default_apt_get() -> PathBuf {
+    "/usr/bin/apt-get".into()
+}
+fn default_systemd_run() -> PathBuf {
+    "/usr/bin/systemd-run".into()
+}
+fn default_systemctl() -> PathBuf {
+    "/usr/bin/systemctl".into()
+}
+fn default_dpkg() -> PathBuf {
+    "/usr/bin/dpkg".into()
+}
+fn default_log_dir() -> PathBuf {
+    "/var/log/opl".into()
+}
+fn default_upgrade_poll() -> Duration {
+    Duration::from_secs(2)
 }
 
 /// 노드 underlay를 정하는 방법
@@ -954,6 +1080,80 @@ mod tests {
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[pools]\nrefresh = 1")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn updates_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        let u = &c.updates;
+        assert_eq!(u.enabled, None);
+        assert_eq!(u.check_interval, Duration::from_secs(24 * 3600));
+        assert_eq!(u.first_check, Duration::from_secs(60));
+        assert_eq!(u.apt_url, "");
+        assert_eq!(
+            u.sources_file,
+            Path::new("/etc/apt/sources.list.d/oplite.sources")
+        );
+        assert_eq!(u.apt_get, Path::new("/usr/bin/apt-get"));
+        assert_eq!(u.systemd_run, Path::new("/usr/bin/systemd-run"));
+        assert_eq!(u.systemctl, Path::new("/usr/bin/systemctl"));
+        assert_eq!(u.dpkg, Path::new("/usr/bin/dpkg"));
+        assert_eq!(u.log_dir, Path::new("/var/log/opl"));
+        assert_eq!(u.poll, Duration::from_secs(2));
+
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[updates]\nenabled = true\ncheck_interval = \"6h\"\n\
+             first_check = \"1s\"\napt_url = \"https://apt.example.com/oplite\"\n\
+             sources_file = \"/tmp/x.sources\"\napt_get = \"/opt/apt-get\"\npoll = \"1m30s\"",
+        );
+        let config = c.updates.updates_config().unwrap();
+        assert_eq!(config.check_interval, Duration::from_secs(6 * 3600));
+        assert_eq!(config.first_check, Duration::from_secs(1));
+        assert_eq!(config.apt_url, "https://apt.example.com/oplite");
+        assert_eq!(config.sources_file, Path::new("/tmp/x.sources"));
+        assert_eq!(config.apt_get, Path::new("/opt/apt-get"));
+        assert_eq!(config.poll, Duration::from_secs(90));
+        // 비어 있으면 빌드 값을 쓴다.
+        let c = parse("name = \"n\"\naddress = \"h\"\n[updates]\nenabled = true");
+        assert_eq!(
+            c.updates.updates_config().unwrap().apt_url,
+            opl_types::version::APT_URL
+        );
+
+        for bad in [
+            "check_interval = \"0s\"",
+            "first_check = \"soon\"",
+            "poll = 2",
+            "interval = \"1h\"",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!(
+                    "name = \"n\"\naddress = \"h\"\n[updates]\n{bad}"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn updates_are_enabled_when_apt_get_exists_unless_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let apt_get = dir.path().join("apt-get");
+        let with = |extra: &str| {
+            parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[updates]\napt_get = \"{}\"\n{extra}",
+                apt_get.display()
+            ))
+        };
+        assert!(!with("").updates.enabled());
+        assert!(with("").updates.updates_config().is_none());
+        assert!(with("enabled = true").updates.enabled());
+        std::fs::write(&apt_get, "").unwrap();
+        assert!(with("").updates.enabled());
+        assert!(with("").updates.updates_config().is_some());
+        assert!(!with("enabled = false").updates.enabled());
+        assert!(with("enabled = false").updates.updates_config().is_none());
     }
 
     #[test]

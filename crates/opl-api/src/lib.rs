@@ -22,6 +22,7 @@ mod settings;
 mod snapshots;
 mod state;
 mod tasks;
+mod updates;
 pub mod users;
 pub mod vm_imports;
 mod vms;
@@ -46,6 +47,7 @@ pub use janitor::{ClusterJanitor, ClusterJanitorConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
+pub use updates::{KEYRING, UpdateAgent, Updates, UpdatesConfig};
 
 use crate::resources as r;
 
@@ -86,6 +88,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(users::delete_token))
         .routes(routes!(r::list_nodes))
         .routes(routes!(r::get_node, r::update_node, cluster::delete_node))
+        .routes(routes!(updates::refresh_updates))
         .routes(routes!(cluster::get_cluster))
         .routes(routes!(cluster::get_ca))
         .routes(routes!(cluster::get_version))

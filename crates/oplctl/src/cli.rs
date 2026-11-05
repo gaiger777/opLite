@@ -169,7 +169,67 @@ enum ClusterCmd {
 #[derive(Subcommand)]
 enum NodeCmd {
     List,
-    Get { node: String },
+    Get {
+        node: String,
+    },
+    /// 노드의 업데이트 확인 결과(올릴 수 있는 패키지)를 보인다.
+    Updates {
+        node: String,
+        /// 먼저 노드에서 다시 확인하고(Task가 끝날 때까지 기다린다) 결과를 보인다.
+        #[arg(long)]
+        refresh: bool,
+    },
+}
+
+/// `node updates`의 패키지 표 열
+const UPDATE_HEADERS: &[&str] = &["PACKAGE", "CURRENT", "CANDIDATE"];
+
+/// `node updates`: `--refresh`면 다시 확인 Task를 기다린 뒤, 노드의 `status.updates`를 보인다. 확인 시각,
+/// 오류, 패키지 표(새로 설치할 패키지는 CURRENT가 `-`), 잘렸는지. `-o json`이면 `status.updates` 그대로.
+async fn node_updates(
+    client: &Client,
+    node: &str,
+    refresh: bool,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    if refresh {
+        let task = client
+            .post(&format!("/nodes/{node}/updates/refresh"), &json!({}))
+            .await?;
+        client.wait_task(&task).await?;
+    }
+    let found = client.get(&format!("/nodes/{node}")).await?;
+    let updates = &found["status"]["updates"];
+    if json_out {
+        return Ok(print_json(out, updates)?);
+    }
+    if !updates.is_object() {
+        bail!("node {node} does not check for updates");
+    }
+    let checked = updates["checked_at"]
+        .as_i64()
+        .map_or_else(|| "never".to_string(), unix_time);
+    writeln!(out, "checked: {checked}")?;
+    if let Some(error) = updates["error"].as_str() {
+        writeln!(out, "error: {error}")?;
+    }
+    let packages = updates["packages"].as_array().cloned().unwrap_or_default();
+    if packages.is_empty() {
+        if updates["checked_at"].is_u64() && updates["error"].is_null() {
+            writeln!(out, "no updates available")?;
+        }
+        return Ok(());
+    }
+    let rows: Vec<_> = packages
+        .iter()
+        .map(|p| vec![cell(&p["name"]), cell(&p["current"]), cell(&p["candidate"])])
+        .collect();
+    table(out, UPDATE_HEADERS, &rows)?;
+    if updates["truncated"] == true {
+        writeln!(out, "(only the first {} packages are shown)", rows.len())?;
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -1607,6 +1667,9 @@ where
             }
             NodeCmd::Get { node } => {
                 print_json(out, &client.get(&format!("/nodes/{node}")).await?)?
+            }
+            NodeCmd::Updates { node, refresh } => {
+                node_updates(&client, &node, refresh, json_out, out).await?
             }
         },
         Cmd::Pool { cmd } => match cmd {
@@ -6082,6 +6145,112 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             )),
             "{text}"
         );
+    }
+
+    /// `node updates`는 확인 시각, 오류, 패키지 표, 잘렸는지를 보인다. `--refresh`면 다시 확인 Task를
+    /// 기다린 뒤 읽는다.
+    #[tokio::test]
+    async fn node_updates_shows_the_check() {
+        fn reply(path: &str) -> Value {
+            match path {
+                "/api/v1/nodes/n1/updates/refresh" => json!({ "id": "t1" }),
+                "/api/v1/tasks/t1" => json!({ "id": "t1", "status": { "state": "succeeded" } }),
+                "/api/v1/nodes/n1" => json!({
+                    "name": "n1",
+                    "status": { "updates": {
+                        "checked_at": 1_793_000_000,
+                        "packages": [
+                            { "name": "oplite", "current": "0.2.0", "candidate": "0.2.1" },
+                            { "name": "linux-image-6.12.48+deb13-amd64", "current": null, "candidate": "6.12.48-1" }
+                        ],
+                        "truncated": true,
+                        "error": null
+                    } }
+                }),
+                "/api/v1/nodes/n2" => json!({
+                    "name": "n2",
+                    "status": { "updates": {
+                        "checked_at": 1_793_000_000, "packages": [],
+                        "error": "apt-get update -q failed (exit status: 100): E: no network"
+                    } }
+                }),
+                "/api/v1/nodes/n3" => json!({
+                    "name": "n3",
+                    "status": { "updates": { "checked_at": 1_793_000_000, "packages": [], "error": null } }
+                }),
+                "/api/v1/nodes/n4" => json!({
+                    "name": "n4",
+                    "status": { "updates": { "checked_at": null, "packages": [], "error": null } }
+                }),
+                _ => json!({ "name": "w", "status": { "online": true } }),
+            }
+        }
+        let (client, seen) = fake_api(reply).await;
+        let run = |args: &'static [&'static str], json_out: bool| {
+            let client = client.clone();
+            async move {
+                let Cmd::Node {
+                    cmd: NodeCmd::Updates { node, refresh },
+                } = Cli::try_parse_from(args).unwrap().cmd
+                else {
+                    unreachable!()
+                };
+                let mut out = Vec::new();
+                node_updates(&client, &node, refresh, json_out, &mut out)
+                    .await
+                    .map(|()| String::from_utf8(out).unwrap())
+            }
+        };
+
+        let text = run(&["oplctl", "node", "updates", "n1", "--refresh"], false)
+            .await
+            .unwrap();
+        assert_eq!(
+            text,
+            "checked: 2026-10-26 07:33 UTC\n\
+             PACKAGE                          CURRENT  CANDIDATE\n\
+             oplite                           0.2.0    0.2.1\n\
+             linux-image-6.12.48+deb13-amd64  -        6.12.48-1\n\
+             (only the first 2 packages are shown)\n"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "POST /api/v1/nodes/n1/updates/refresh HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1",
+                "GET /api/v1/nodes/n1 HTTP/1.1"
+            ]
+        );
+        assert_eq!(
+            run(&["oplctl", "node", "updates", "n2"], false)
+                .await
+                .unwrap(),
+            "checked: 2026-10-26 07:33 UTC\n\
+             error: apt-get update -q failed (exit status: 100): E: no network\n"
+        );
+        assert_eq!(
+            run(&["oplctl", "node", "updates", "n3"], false)
+                .await
+                .unwrap(),
+            "checked: 2026-10-26 07:33 UTC\nno updates available\n"
+        );
+        assert_eq!(
+            run(&["oplctl", "node", "updates", "n4"], false)
+                .await
+                .unwrap(),
+            "checked: never\n"
+        );
+        let err = run(&["oplctl", "node", "updates", "w"], false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "node w does not check for updates");
+        let shown: Value = serde_json::from_str(
+            &run(&["oplctl", "node", "updates", "n3"], true)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(shown["packages"], json!([]));
     }
 
     /// `settings set`은 KEY=VALUE를 PATCH 본문으로 바꾼다. 모르는 키와 `=` 없는 인자는 거절한다.

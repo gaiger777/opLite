@@ -67,6 +67,38 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub version: Option<String>,
+    /// 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
+    /// 빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub updates: Option<NodeUpdates>,
+}
+
+/// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(default)]
+pub struct NodeUpdates {
+    /// 마지막으로 확인한 시각(유닉스 초). 아직 확인하지 않았으면 None
+    pub checked_at: Option<u64>,
+    /// 올릴 수 있는 패키지. 너무 많으면 앞의 것만 담고 `truncated`가 true다.
+    pub packages: Vec<PackageUpdate>,
+    #[serde(skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub truncated: bool,
+    /// 확인이 실패한 이유(명령과 오류 출력 끝). 실패하면 `packages`는 비어 있다.
+    pub error: Option<String>,
+}
+
+/// 올릴 수 있는 패키지 하나
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PackageUpdate {
+    pub name: String,
+    /// 설치된 버전. 새로 설치할 패키지(새 의존성)는 None이다.
+    pub current: Option<String>,
+    /// 올릴 버전
+    pub candidate: String,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -203,6 +235,50 @@ mod tests {
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["version"], "0.2.0~ci7");
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+    }
+
+    #[test]
+    fn status_updates_round_trip_and_are_omitted_when_none() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("updates").is_none(), "{none}");
+        // 켜졌지만 아직 확인하지 않은 노드
+        let status = NodeStatus {
+            updates: Some(NodeUpdates::default()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["updates"],
+            serde_json::json!({ "checked_at": null, "packages": [], "error": null })
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+        let status = NodeStatus {
+            updates: Some(NodeUpdates {
+                checked_at: Some(1_793_000_000),
+                packages: vec![
+                    PackageUpdate {
+                        name: "oplite".into(),
+                        current: Some("0.2.0".into()),
+                        candidate: "0.2.1".into(),
+                    },
+                    PackageUpdate {
+                        name: "libnew1".into(),
+                        current: None,
+                        candidate: "1.0-1".into(),
+                    },
+                ],
+                truncated: true,
+                error: None,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["updates"]["truncated"], true);
+        assert_eq!(
+            json["updates"]["packages"][1],
+            serde_json::json!({ "name": "libnew1", "current": null, "candidate": "1.0-1" })
+        );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
 

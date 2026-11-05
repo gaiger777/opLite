@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod esxi;
+pub mod fake_apt;
 pub mod ustar;
 
 use std::collections::BTreeMap;
@@ -142,6 +143,7 @@ impl Env {
             underlay: None,
             firewall: false,
             version: None,
+            updates: None,
         };
         // 이 노드는 지금 빌드를 돌린다.
         me.status.version = Some(BUILD.into());

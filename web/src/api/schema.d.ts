@@ -322,6 +322,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/nodes/{key}/updates/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드의 업데이트를 다시 확인할 Task(`node-update-check`, 그 노드에서 돈다)를 돌려준다(202). 결과는
+         *     Node `status.updates`에 쓴다. 그 노드에 끝나지 않은 확인 Task가 있으면 새로 만들지 않고 그것을
+         *     돌려준다. 업데이트를 확인하지 않는 노드면 400 `updates_unsupported`, 오프라인이면 409 `node_offline`,
+         *     옛 노드가 남았으면 409 `cluster_upgrading`(옛 노드는 이 Task 종류를 풀지 못한다).
+         */
+        post: operations["refresh_updates"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/security-groups": {
         parameters: {
             query?: never;
@@ -1811,6 +1833,11 @@ export interface components {
                      *     None).
                      */
                     underlay?: string;
+                    /**
+                     * @description 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
+                     *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
+                     */
+                    updates?: components["schemas"]["NodeUpdates"];
                     /** @description 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
                     version?: string;
                 };
@@ -2294,14 +2321,47 @@ export interface components {
              *     None).
              */
             underlay?: string;
+            /**
+             * @description 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
+             *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
+             */
+            updates?: components["schemas"]["NodeUpdates"];
             /** @description 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
             version?: string;
+        };
+        /** @description 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지) */
+        NodeUpdates: {
+            /**
+             * Format: int64
+             * @description 마지막으로 확인한 시각(유닉스 초). 아직 확인하지 않았으면 None
+             * @default null
+             */
+            checked_at: number | null;
+            /**
+             * @description 확인이 실패한 이유(명령과 오류 출력 끝). 실패하면 `packages`는 비어 있다.
+             * @default null
+             */
+            error: string | null;
+            /**
+             * @description 올릴 수 있는 패키지. 너무 많으면 앞의 것만 담고 `truncated`가 true다.
+             * @default []
+             */
+            packages: components["schemas"]["PackageUpdate"][];
+            truncated?: boolean;
         };
         OvaSource: {
             /** @description 올린 파일 이름(표시용) */
             file_name: string;
             /** Format: int64 */
             size_bytes: number;
+        };
+        /** @description 올릴 수 있는 패키지 하나 */
+        PackageUpdate: {
+            /** @description 올릴 버전 */
+            candidate: string;
+            /** @description 설치된 버전. 새로 설치할 패키지(새 의존성)는 None이다. */
+            current?: string | null;
+            name: string;
         };
         PoolBackend: {
             /** @enum {string} */
@@ -2607,6 +2667,11 @@ export interface components {
                  *     None).
                  */
                 underlay?: string;
+                /**
+                 * @description 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
+                 *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
+                 */
+                updates?: components["schemas"]["NodeUpdates"];
                 /** @description 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
                 version?: string;
             };
@@ -3176,6 +3241,9 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "vm-import-delete";
+        } | {
+            /** @enum {string} */
+            kind: "node-update-check";
         };
         TaskSpec: {
             /**
@@ -4164,6 +4232,36 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    refresh_updates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
             };
             "4XX": {
                 headers: {
