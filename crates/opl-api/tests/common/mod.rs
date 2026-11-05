@@ -27,6 +27,7 @@ use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
     SourceFormat, StoragePool, StoragePoolSpec, pool_kind_supports_snapshots,
 };
+use opl_types::version::BUILD;
 use opl_types::vm::Arch;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -142,6 +143,8 @@ impl Env {
             firewall: false,
             version: None,
         };
+        // 이 노드는 지금 빌드를 돌린다.
+        me.status.version = Some(BUILD.into());
         cluster.create(&me).await.unwrap();
         let admin = Resource::new(
             "admin",

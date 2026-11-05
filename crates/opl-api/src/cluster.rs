@@ -373,6 +373,29 @@ fn check_version(state: &AppState, joining: Uuid, version: Option<&str>) -> Resu
     ))
 }
 
+/// 버전을 적지 않은 옛 노드(위트니스 포함)가 남아 있으면 새 종류의 상태를 쓰지 않고 409
+/// `cluster_upgrading`으로 거절한다. 버전을 적지 않는 옛 opld는 새 종류의 상태를 풀지 못한다.
+pub(crate) fn require_upgraded(cluster: &opl_cluster::Cluster) -> Result<(), ApiError> {
+    let mut old: Vec<String> = cluster
+        .list::<NodeSpec>()?
+        .1
+        .into_iter()
+        .filter(|n| n.status.version.is_none())
+        .map(|n| n.name)
+        .collect();
+    if old.is_empty() {
+        return Ok(());
+    }
+    old.sort();
+    Err(ApiError::conflict(
+        "cluster_upgrading",
+        format!(
+            "some nodes run an older opLite ({}); finish the upgrade on every node first",
+            old.join(", ")
+        ),
+    ))
+}
+
 fn invalid_token() -> ApiError {
     ApiError::new(
         StatusCode::UNAUTHORIZED,

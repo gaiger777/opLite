@@ -360,6 +360,28 @@ export interface paths {
         patch: operations["patch_security_group"];
         trace?: never;
     };
+    "/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 클러스터 설정. 로그인한 누구나 읽는다. */
+        get: operations["get_settings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * 설정의 주어진 값을 바꾼다. 아무것도 없으면 400. 설정이 아직 없으면 만든다(`If-Match`는 0).
+         *     `If-Match`가 없으면 읽은 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다. 같은 값이면 쓰지
+         *     않고 그대로 200이다.
+         */
+        patch: operations["patch_settings"];
+        trace?: never;
+    };
     "/snapshots": {
         parameters: {
             query?: never;
@@ -1131,6 +1153,11 @@ export interface components {
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
             vlan_filtering: boolean;
         };
+        /**
+         * @description 업데이트 채널. APT 소스 파일의 `Components`가 된다.
+         * @enum {string}
+         */
+        Channel: "stable" | "testing";
         CloneRequest: {
             /** @description 새 VM의 이름 */
             name: string;
@@ -2606,6 +2633,24 @@ export interface components {
             status: Record<string, never>;
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_SettingsSpec_SettingsStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                updates?: components["schemas"]["UpdateSettings"];
+            };
+            status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_SnapshotSpec_SnapshotStatus: {
             /** Format: uuid */
             id: string;
@@ -2928,6 +2973,14 @@ export interface components {
             rules?: components["schemas"]["Rule"][];
         };
         SecurityGroupStatus: Record<string, never>;
+        /** @description 설정에서 바꿀 값. 주어진 필드만 바꾼다. */
+        SettingsPatch: {
+            updates?: components["schemas"]["UpdateSettingsPatch"];
+        };
+        SettingsSpec: {
+            updates?: components["schemas"]["UpdateSettings"];
+        };
+        SettingsStatus: Record<string, never>;
         /** @enum {string} */
         SnapshotPhase: "pending" | "ready";
         /** @description 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다. */
@@ -3192,6 +3245,14 @@ export interface components {
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
             };
+        };
+        /** @description 노드 업데이트 설정 */
+        UpdateSettings: {
+            /** @description 노드가 패키지를 받는 APT 저장소 채널 */
+            channel?: components["schemas"]["Channel"];
+        };
+        UpdateSettingsPatch: {
+            channel?: components["schemas"]["Channel"];
         };
         UpdateUserRequest: {
             /** @description 자기 비밀번호를 바꿀 때 필요하다. */
@@ -4257,6 +4318,66 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_SecurityGroupSpec_SecurityGroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_SettingsSpec_SettingsStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_settings: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SettingsPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_SettingsSpec_SettingsStatus"];
                 };
             };
             "4XX": {

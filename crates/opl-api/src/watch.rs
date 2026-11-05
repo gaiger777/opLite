@@ -17,7 +17,7 @@ use crate::error::{ApiError, Query};
 use crate::state::AppState;
 
 /// 구독할 수 있는 종류. 사용자와 토큰은 해시를 담고 있어 내보내지 않는다.
-const WATCHABLE: [Kind; 11] = [
+const WATCHABLE: [Kind; 12] = [
     Kind::Vm,
     Kind::Volume,
     Kind::StoragePool,
@@ -29,6 +29,7 @@ const WATCHABLE: [Kind; 11] = [
     Kind::Backup,
     Kind::BackupJob,
     Kind::VmImport,
+    Kind::Settings,
 ];
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -145,6 +146,12 @@ mod tests {
     fn vm_imports_are_watchable() {
         let kinds = parse_kinds("vm-import").unwrap();
         assert!(kinds.contains(&Kind::VmImport));
+    }
+
+    #[test]
+    fn settings_are_watchable() {
+        let kinds = parse_kinds("settings").unwrap();
+        assert!(kinds.contains(&Kind::Settings));
     }
 
     #[test]

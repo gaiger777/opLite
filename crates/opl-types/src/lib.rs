@@ -9,6 +9,7 @@ pub mod node;
 pub mod resource;
 pub mod runtime;
 pub mod security_group;
+pub mod settings;
 pub mod snapshot;
 pub mod storage;
 pub mod task;

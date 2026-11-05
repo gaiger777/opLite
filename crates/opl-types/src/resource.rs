@@ -51,6 +51,7 @@ pub enum Kind {
     Backup,
     BackupJob,
     VmImport,
+    Settings,
 }
 
 impl Kind {
@@ -71,6 +72,7 @@ impl Kind {
             Kind::Backup => "backup",
             Kind::BackupJob => "backup-job",
             Kind::VmImport => "vm-import",
+            Kind::Settings => "settings",
         }
     }
 }
@@ -141,6 +143,7 @@ mod tests {
             Kind::Backup,
             Kind::BackupJob,
             Kind::VmImport,
+            Kind::Settings,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }

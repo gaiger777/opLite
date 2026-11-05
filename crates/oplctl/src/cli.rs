@@ -100,6 +100,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+    /// 클러스터 설정(업데이트 채널)
+    Settings {
+        #[command(subcommand)]
+        cmd: SettingsCmd,
+    },
 }
 
 #[derive(Args)]
@@ -1356,6 +1361,82 @@ enum TaskCmd {
     Get { task: String },
 }
 
+#[derive(Subcommand)]
+enum SettingsCmd {
+    /// 설정을 `키: 값` 줄로 보인다.
+    Get,
+    /// 설정을 바꾼다. 키: `updates.channel`(stable|testing)
+    Set {
+        /// 예: `updates.channel=testing`
+        #[arg(required = true, value_name = "KEY=VALUE")]
+        values: Vec<String>,
+    },
+}
+
+/// `settings set`이 아는 키
+const SETTING_KEYS: &[&str] = &["updates.channel"];
+
+/// `settings set`의 요청 본문(`PATCH /settings`). 준 키만 보낸다.
+fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
+    let mut body = json!({});
+    for value in values {
+        let Some((key, v)) = value.split_once('=') else {
+            bail!("expected KEY=VALUE, got {value:?}");
+        };
+        match key {
+            "updates.channel" => body["updates"]["channel"] = json!(v),
+            _ => bail!("unknown setting {key}; known: {}", SETTING_KEYS.join(", ")),
+        }
+    }
+    Ok(body)
+}
+
+/// 객체의 값들을 `a.b: 값` 줄로 펼친다.
+fn setting_lines(prefix: &str, value: &Value, lines: &mut Vec<String>) {
+    match value.as_object() {
+        Some(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                setting_lines(&key, v, lines);
+            }
+        }
+        None => lines.push(format!("{prefix}: {}", cell(value))),
+    }
+}
+
+async fn settings(
+    client: &Client,
+    cmd: SettingsCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        SettingsCmd::Get => {
+            let settings = client.get("/settings").await?;
+            if json_out {
+                print_json(out, &settings)?;
+            } else {
+                let mut lines = Vec::new();
+                setting_lines("", &settings["spec"], &mut lines);
+                for line in lines {
+                    writeln!(out, "{line}")?;
+                }
+            }
+        }
+        SettingsCmd::Set { values } => {
+            client
+                .patch("/settings", &settings_set_body(&values)?)
+                .await?;
+            writeln!(out, "settings updated")?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Role {
     Admin,
@@ -1748,6 +1829,7 @@ where
                 writeln!(out, "token {token} deleted")?;
             }
         },
+        Cmd::Settings { cmd } => settings(&client, cmd, json_out, out).await?,
     }
     Ok(())
 }
@@ -6000,6 +6082,83 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             )),
             "{text}"
         );
+    }
+
+    /// `settings set`은 KEY=VALUE를 PATCH 본문으로 바꾼다. 모르는 키와 `=` 없는 인자는 거절한다.
+    #[test]
+    fn settings_set_body_maps_known_keys() {
+        assert_eq!(
+            settings_set_body(&["updates.channel=testing".into()]).unwrap(),
+            json!({ "updates": { "channel": "testing" } })
+        );
+        let err = settings_set_body(&["updates.mirror=x".into()]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unknown setting updates.mirror; known: updates.channel"
+        );
+        let err = settings_set_body(&["updates.channel".into()]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "expected KEY=VALUE, got \"updates.channel\""
+        );
+    }
+
+    /// `settings get`은 spec을 `키: 값` 줄로, `-o json`이면 리소스 그대로 보인다. `set`은 PATCH한다.
+    #[tokio::test]
+    async fn settings_get_and_set() {
+        let (client, seen) = fake_api(|_| {
+            json!({
+                "id": "00000000-0000-0000-0000-000000000000", "name": "cluster", "revision": 0,
+                "spec": { "updates": { "channel": "stable" } }, "status": {}
+            })
+        })
+        .await;
+        let mut out = Vec::new();
+        for args in [
+            &["oplctl", "settings", "get"][..],
+            &["oplctl", "settings", "set", "updates.channel=testing"][..],
+        ] {
+            let Cmd::Settings { cmd } = Cli::try_parse_from(args).unwrap().cmd else {
+                unreachable!()
+            };
+            settings(&client, cmd, false, &mut out).await.unwrap();
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/settings HTTP/1.1",
+                "PATCH /api/v1/settings HTTP/1.1"
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "updates.channel: stable\nsettings updated\n"
+        );
+
+        let Cmd::Settings { cmd } = Cli::try_parse_from(["oplctl", "settings", "get"])
+            .unwrap()
+            .cmd
+        else {
+            unreachable!()
+        };
+        let mut out = Vec::new();
+        settings(&client, cmd, true, &mut out).await.unwrap();
+        let shown: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(shown["spec"]["updates"]["channel"], "stable");
+
+        // 모르는 키는 요청을 보내지 않는다.
+        let Cmd::Settings { cmd } = Cli::try_parse_from(["oplctl", "settings", "set", "x=1"])
+            .unwrap()
+            .cmd
+        else {
+            unreachable!()
+        };
+        assert!(
+            settings(&client, cmd, false, &mut Vec::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
     #[test]

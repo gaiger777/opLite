@@ -18,6 +18,7 @@ pub mod resources;
 mod schedule;
 pub mod scheduler;
 mod security_groups;
+mod settings;
 mod snapshots;
 mod state;
 mod tasks;
@@ -90,6 +91,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(cluster::get_version))
         .routes(routes!(cluster::create_join_token))
         .routes(routes!(cluster::join))
+        .routes(routes!(settings::get_settings, settings::patch_settings))
         .routes(routes!(r::list_pools, r::create_pool))
         .routes(routes!(r::get_pool, r::patch_pool, r::delete_pool))
         .routes(routes!(r::list_networks, r::create_network))
