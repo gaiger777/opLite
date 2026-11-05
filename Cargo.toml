@@ -63,4 +63,6 @@ hyper = { version = "1.12.0", default-features = false, features = ["client", "h
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 http-body-util = "0.1.5"
 native-tls = "0.2.18"
+ring = "0.17.14"
+base64 = "0.22.1"
 rust-embed = { version = "8.13.0", features = ["mime-guess", "interpolate-folder-path"] }

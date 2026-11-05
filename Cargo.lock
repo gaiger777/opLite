@@ -1442,6 +1442,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
+ "clap",
  "fs4",
  "futures-util",
  "getrandom 0.4.3",
@@ -1583,6 +1584,8 @@ dependencies = [
 name = "opl-types"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

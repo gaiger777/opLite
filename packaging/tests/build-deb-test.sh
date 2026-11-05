@@ -1,8 +1,13 @@
 #!/bin/bash
-# build-deb.sh가 바이너리의 --version이 패키지 버전과 같은지 확인하는지, OPL_APT_KEY의 키링을 싣는지 본다.
+# build-deb.sh가 바이너리의 --version이 패키지 버전과 같은지 확인하는지, OPL_APT_KEY의 키링을 싣는지,
+# OPL_LICENSE_KEYS 없이는 OPL_DEV_LICENSE=1일 때만 만드는지, OPL_LICENSE_KEYS의 항목·개발 키·opld에 든 값을
+# 확인하는지 본다.
 # 가짜 opld·oplctl(버전을 찍는 스크립트)과 가짜 dpkg-deb(만들 파일과 패키지 트리 사본만 만듦)를 쓴다. bash만 있으면 되고 macOS에서도 돈다.
 # 쓰는 법: bash packaging/tests/build-deb-test.sh
 set -eu
+
+# 사용자 셸의 값에 결과가 흔들리지 않게 한다(아래 run이 OPL_DEV_LICENSE 기본 1을 준다).
+unset OPL_DEV_LICENSE OPL_LICENSE_KEYS
 
 DEB_DIR="$(cd "$(dirname "$0")/../deb" && pwd)"
 WORK="$(mktemp -d)"
@@ -30,20 +35,22 @@ fail() {
 	FAILED=1
 }
 
-# fake_bins <opld 버전> <oplctl 버전>: <bin> --version이 "<bin> <버전>"을 찍는 가짜 바이너리
+# fake_bins <opld 버전> <oplctl 버전> [opld에 넣을 문자열]: <bin> --version이 "<bin> <버전>"을 찍는
+# 가짜 바이너리. 세 번째 인자는 OPL_LICENSE_KEYS로 빌드한 opld처럼 바이너리 안에 둔다.
 fake_bins() {
 	rm -rf "${WORK:?}/bin"
 	mkdir -p "$WORK/bin"
-	printf '#!/bin/sh\necho "opld %s"\n' "$1" >"$WORK/bin/opld"
+	printf '#!/bin/sh\necho "opld %s"\n# %s\n' "$1" "${3-}" >"$WORK/bin/opld"
 	printf '#!/bin/sh\necho "oplctl %s"\n' "$2" >"$WORK/bin/oplctl"
 	chmod 0755 "$WORK/bin/opld" "$WORK/bin/oplctl"
 }
 
 # run <버전>: build-deb.sh를 돌려 종료 코드(code)·stdout·stderr를 남긴다.
+# OPL_DEV_LICENSE는 따로 주지 않으면 1(개발 패키지)이다.
 run() {
 	rm -rf "$WORK/out"
 	code=0
-	PATH="$WORK/fakebin:$PATH" OPL_BIN_DIR="$WORK/bin" \
+	PATH="$WORK/fakebin:$PATH" OPL_BIN_DIR="$WORK/bin" OPL_DEV_LICENSE="${OPL_DEV_LICENSE-1}" \
 		sh "$DEB_DIR/build-deb.sh" "$1" "$WORK/out" >"$WORK/stdout" 2>"$WORK/stderr" || code=$?
 }
 
@@ -112,6 +119,67 @@ if [ "$code" -eq 1 ] && grep -q 'OPL_APT_KEY must be a binary keyring (gpg --exp
 else
 	fail "armor OPL_APT_KEY: 종료 코드 $code"
 fi
+
+# 구독 키 공개 키: OPL_LICENSE_KEYS도 OPL_DEV_LICENSE=1도 없으면 만들지 않는다.
+fake_bins 0.1.0 0.1.0
+OPL_LICENSE_KEYS='' OPL_DEV_LICENSE='' run 0.1.0
+if [ "$code" -eq 1 ] && grep -q 'build-deb: OPL_LICENSE_KEYS is not set; set it for a release build or OPL_DEV_LICENSE=1 for a development package' "$WORK/stderr" &&
+	[ ! -e "$WORK/out" ]; then
+	ok "OPL_LICENSE_KEYS 없이 개발 패키지가 아니면 실패"
+else
+	fail "OPL_LICENSE_KEYS 없음: 종료 코드 $code"
+fi
+OPL_LICENSE_KEYS='' OPL_DEV_LICENSE=0 run 0.1.0
+if [ "$code" -eq 1 ] && [ ! -e "$WORK/out" ]; then
+	ok "OPL_DEV_LICENSE가 1이 아니면 실패"
+else
+	fail "OPL_DEV_LICENSE=0: 종료 코드 $code"
+fi
+# 정식 키: opl-license keygen과 같은 형식(base64 32바이트)의 개발 키가 아닌 키 둘
+RELEASE_KEYS='Hk3pQ0m2u8Yx1bVd7cNf4sLw9gTzR6aJe5iKoP3qUyM=,mR8vT2wX4yZ6aB8cD0eF2gH4iJ6kL8mN0oP2qR4sT6U='
+DEV_KEY=$(cat "$DEB_DIR/../../crates/opl-types/keys/dev-license.pub")
+fake_bins 0.1.0 0.1.0 "$RELEASE_KEYS"
+OPL_LICENSE_KEYS=$RELEASE_KEYS OPL_DEV_LICENSE='' run 0.1.0
+if [ "$code" -eq 0 ] && [ -f "$WORK/out/oplite_0.1.0_amd64.deb" ]; then
+	ok "OPL_LICENSE_KEYS가 있으면 만든다"
+else
+	fail "OPL_LICENSE_KEYS 있음: 종료 코드 $code"
+	cat "$WORK/stderr"
+fi
+# check_key_error <이름> <문구>: 종료 코드 1, 그 문구, 패키지 없음
+check_key_error() {
+	if [ "$code" -eq 1 ] && grep -qF -- "$2" "$WORK/stderr" && [ ! -e "$WORK/out" ]; then
+		ok "$1"
+	else
+		fail "$1: 종료 코드 $code"
+		cat "$WORK/stderr"
+	fi
+}
+fake_bins 0.1.0 0.1.0 "$DEV_KEY"
+OPL_LICENSE_KEYS=$DEV_KEY OPL_DEV_LICENSE='' run 0.1.0
+check_key_error "OPL_LICENSE_KEYS의 개발 키는 거절" \
+	'build-deb: OPL_LICENSE_KEYS contains the development key; use OPL_DEV_LICENSE=1 for a development package'
+fake_bins 0.1.0 0.1.0 "${RELEASE_KEYS%%,*},$DEV_KEY"
+OPL_LICENSE_KEYS="${RELEASE_KEYS%%,*},$DEV_KEY" OPL_DEV_LICENSE='' run 0.1.0
+check_key_error "목록에 섞인 개발 키도 거절" 'OPL_LICENSE_KEYS contains the development key'
+# 패딩 없는 키, 끝 비트가 0이 아닌(정규형이 아닌) 키도 거절한다.
+for bad in 'not-base64!' 'AAAA' 'Hk3pQ0m2u8Yx1bVd7cNf4sLw9gTzR6aJe5iKoP3qUyMA' \
+	'Hk3pQ0m2u8Yx1bVd7cNf4sLw9gTzR6aJe5iKoP3qUyM' 'Hk3pQ0m2u8Yx1bVd7cNf4sLw9gTzR6aJe5iKoP3qUyN='; do
+	fake_bins 0.1.0 0.1.0 "${RELEASE_KEYS%%,*},$bad"
+	OPL_LICENSE_KEYS="${RELEASE_KEYS%%,*},$bad" OPL_DEV_LICENSE='' run 0.1.0
+	check_key_error "32바이트 base64가 아닌 항목 거절: $bad" \
+		"build-deb: OPL_LICENSE_KEYS entry is not a base64 Ed25519 public key: $bad"
+done
+# 공백·쉼표뿐이면 키가 하나도 없다.
+for none in ' ' ','; do
+	fake_bins 0.1.0 0.1.0 "$none"
+	OPL_LICENSE_KEYS=$none OPL_DEV_LICENSE='' run 0.1.0
+	check_key_error "키가 없는 OPL_LICENSE_KEYS 거절: '$none'" 'build-deb: OPL_LICENSE_KEYS has no keys'
+done
+fake_bins 0.1.0 0.1.0 "${RELEASE_KEYS%%,*}"
+OPL_LICENSE_KEYS=$RELEASE_KEYS OPL_DEV_LICENSE='' run 0.1.0
+check_key_error "opld에 OPL_LICENSE_KEYS가 그대로 없으면 거절" \
+	'build-deb: opld was not built with this OPL_LICENSE_KEYS'
 
 if [ "$FAILED" -ne 0 ]; then
 	echo "build-deb-test: 실패"

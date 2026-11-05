@@ -37,8 +37,11 @@ runs:
         echo "OPL_VERSION=${WS_VERSION}~ci${{ github.run_number }}" >> "$GITHUB_ENV"
     - shell: bash
       run: cargo build --release -p opld --features web-ui -p oplctl
+    # CI 패키지는 저장소의 개발 구독 키를 믿는 개발 패키지다(정식 빌드는 OPL_LICENSE_KEYS를 준다).
     - id: deb
       shell: bash
+      env:
+        OPL_DEV_LICENSE: "1"
       run: |
         packaging/deb/build-deb.sh "$OPL_VERSION" dist
         echo "path=dist/oplite_${OPL_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
