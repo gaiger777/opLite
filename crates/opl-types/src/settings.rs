@@ -50,6 +50,8 @@ pub enum Channel {
     Stable,
     /// 미리 써 보는 릴리스
     Testing,
+    /// 구독한 클러스터용 릴리스. 고르려면 구독이 active여야 하고, 저장소는 구독 키로 인증한다.
+    Enterprise,
 }
 
 impl Channel {
@@ -57,6 +59,7 @@ impl Channel {
         match self {
             Channel::Stable => "stable",
             Channel::Testing => "testing",
+            Channel::Enterprise => "enterprise",
         }
     }
 }
@@ -85,14 +88,18 @@ mod tests {
 
     #[test]
     fn channels_are_lowercase() {
-        for channel in [Channel::Stable, Channel::Testing] {
+        for channel in [Channel::Stable, Channel::Testing, Channel::Enterprise] {
             assert_eq!(serde_json::to_value(channel).unwrap(), channel.as_str());
         }
         let spec: SettingsSpec =
             serde_json::from_str(r#"{"updates":{"channel":"testing"}}"#).unwrap();
         assert_eq!(spec.updates.channel, Channel::Testing);
+        let spec: SettingsSpec =
+            serde_json::from_str(r#"{"updates":{"channel":"enterprise"}}"#).unwrap();
+        assert_eq!(spec.updates.channel, Channel::Enterprise);
+        assert_eq!(Channel::Enterprise.as_str(), "enterprise");
         assert!(serde_json::from_str::<Channel>(r#""Testing""#).is_err());
-        assert!(serde_json::from_str::<Channel>(r#""enterprise""#).is_err());
+        assert!(serde_json::from_str::<Channel>(r#""nightly""#).is_err());
     }
 
     /// 구독이 없으면 계획 32 노드가 쓰던 모양 그대로 쓰고, 있으면 함께 쓰고 푼다.

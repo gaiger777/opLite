@@ -1,4 +1,4 @@
-//! 노드의 APT 업데이트: opLite 저장소 소스 파일 관리, 업데이트 확인(`apt-get -s dist-upgrade`),
+//! 노드의 APT 업데이트: opLite 저장소 소스 파일과 enterprise 채널 인증 파일 관리, 업데이트 확인(`apt-get -s dist-upgrade`),
 //! 주기 확인 에이전트, 다시 확인 API(`POST /nodes/{key}/updates/refresh`), 업그레이드(`POST
 //! /nodes/{key}/upgrade`, `systemd-run`의 일시 유닛에서 `apt-get dist-upgrade`).
 
@@ -14,8 +14,10 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_types::node::{Node, NodeSpec, NodeStatus, NodeUpdates, PackageUpdate};
 use opl_types::resource::{Kind, Resource, ResourceSpec};
 use opl_types::settings::{Channel, SettingsSpec};
+use opl_types::subscription;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::version::{BUILD, SUITE};
+use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -28,10 +30,12 @@ use crate::resources::lookup;
 use crate::state::AppState;
 use crate::tasks::create_task;
 
-/// opld가 쓴 소스 파일의 첫 줄. 이 줄이 없는 파일은 관리자가 직접 관리하는 것으로 보고 건드리지 않는다.
+/// opld가 쓴 소스·인증 파일의 첫 줄. 이 줄이 없는 파일은 관리자가 직접 관리하는 것으로 보고 건드리지 않는다.
 pub const SOURCES_MARK: &str = "# managed by opld; edits are overwritten";
 /// 패키지가 싣는 저장소 공개 키(`UpdatesConfig.keyring`의 기본값)
 pub const KEYRING: &str = "/usr/share/keyrings/oplite-archive-keyring.gpg";
+/// enterprise 채널의 APT 인증 파일(`UpdatesConfig.auth_file`의 기본값)
+pub const AUTH_FILE: &str = "/etc/apt/auth.conf.d/oplite.conf";
 /// `NodeStatus.updates`에 담는 패키지 수의 상한
 pub const MAX_PACKAGES: usize = 500;
 /// 다른 확인이 도는 중일 때의 오류
@@ -64,6 +68,8 @@ pub struct UpdatesConfig {
     pub sources_file: PathBuf,
     /// 저장소 공개 키. 없으면 소스 파일을 쓰지 않는다(apt가 서명을 확인하지 못한다).
     pub keyring: PathBuf,
+    /// opld가 관리하는 APT 인증 파일(enterprise 채널에서 구독 키로 쓴다)
+    pub auth_file: PathBuf,
     pub apt_get: PathBuf,
     pub systemd_run: PathBuf,
     pub systemctl: PathBuf,
@@ -332,22 +338,24 @@ impl Updates {
         }
     }
 
-    /// 소스 파일을 지금 설정의 채널로 맞춘다(`apt_url`이 있을 때만).
-    /// 파일을 새로 썼으면 true다.
+    /// 소스 파일(`apt_url`이 있을 때만)과 인증 파일을 지금 설정으로 맞춘다.
+    /// 둘 중 하나라도 새로 썼으면 true다.
     fn sync_sources(&self, cluster: &Cluster) -> bool {
-        if self.config.apt_url.is_empty() {
-            return false;
-        }
-        let channel = match crate::settings::current(cluster) {
-            Ok(settings) => settings.spec.updates.channel,
+        let spec = match crate::settings::current(cluster) {
+            Ok(settings) => settings.spec,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot read the settings for the APT sources");
                 return false;
             }
         };
+        let auth = self.sync_auth(&spec);
+        if self.config.apt_url.is_empty() {
+            return auth;
+        }
+        let channel = spec.updates.channel;
         let c = &self.config;
         let path = &c.sources_file;
-        match write_sources(path, &c.apt_url, channel, &c.keyring) {
+        let sources = match write_sources(path, &c.apt_url, channel, &c.keyring) {
             Ok(SourcesOutcome::Written) => {
                 tracing::info!(file = %path.display(), channel = channel.as_str(), "wrote the APT sources");
                 true
@@ -357,6 +365,28 @@ impl Updates {
             ) => false,
             Err(e) => {
                 tracing::warn!(file = %path.display(), error = %e, "cannot write the APT sources");
+                false
+            }
+        };
+        sources || auth
+    }
+
+    /// 인증 파일을 설정 `spec`에 맞춘다. 새로 썼으면 true다.
+    fn sync_auth(&self, spec: &SettingsSpec) -> bool {
+        let path = &self.config.auth_file;
+        let contents = auth_contents(&self.config.apt_url, spec);
+        match write_auth(path, contents.as_deref()) {
+            Ok(AuthOutcome::Written) => {
+                tracing::info!(file = %path.display(), "wrote the APT credentials");
+                true
+            }
+            Ok(AuthOutcome::Removed) => {
+                tracing::info!(file = %path.display(), "removed the APT credentials");
+                false
+            }
+            Ok(AuthOutcome::Unchanged | AuthOutcome::Unmanaged) => false,
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "cannot write the APT credentials");
                 false
             }
         }
@@ -549,6 +579,14 @@ pub(crate) fn write_sources(
     if old.as_deref() == Some(contents.as_str()) {
         return Ok(SourcesOutcome::Unchanged);
     }
+    // 누구나 읽게 한다.
+    replace_file(path, &contents, 0o644)?;
+    Ok(SourcesOutcome::Written)
+}
+
+/// 파일을 임시 파일(apt가 무시하는 `.dpkg-tmp`)에 권한 `mode`로 쓰고 디스크에 내린 뒤 바꿔 넣는다.
+/// apt가 반쯤 쓴 파일을 읽지 않는다.
+fn replace_file(path: &Path, contents: &str, mode: u32) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".dpkg-tmp");
     {
@@ -558,10 +596,10 @@ pub(crate) fn write_sources(
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o644)
+            .mode(mode)
             .open(&tmp)?;
-        // 남은 임시 파일이나 umask와 상관없이 누구나 읽게 한다.
-        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        // 남은 임시 파일이나 umask와 상관없이 권한을 맞춘다.
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
     }
@@ -572,7 +610,103 @@ pub(crate) fn write_sources(
     {
         let _ = dir.sync_all();
     }
-    Ok(SourcesOutcome::Written)
+    Ok(())
+}
+
+/// 저장소 주소의 `호스트[:포트]`(apt 인증 파일의 `machine`). 모양이 이상하면 None이다.
+fn apt_host(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    (!host.is_empty() && !host.contains(char::is_whitespace)).then_some(host)
+}
+
+/// 설정 `spec`에 맞는 인증 파일 내용. enterprise 채널이고 저장된 구독 키의 서명이 맞을 때만 있다(만료는
+/// 보지 않는다 — 저장소가 거절하면 업데이트 확인 오류에 보인다). 로그인은 구독 id, 비밀번호는 키
+/// 문자열의 SHA-256 16진수다.
+pub(crate) fn auth_contents(url: &str, spec: &SettingsSpec) -> Option<String> {
+    if url.is_empty() || spec.updates.channel != Channel::Enterprise {
+        return None;
+    }
+    let key = spec.subscription.as_deref()?;
+    let license = match subscription::verify(key, &subscription::license_keys()) {
+        Ok(license) => license,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot use the subscription key for the APT credentials");
+            return None;
+        }
+    };
+    let Some(host) = apt_host(url) else {
+        tracing::warn!(
+            url,
+            "cannot find the host in the APT URL; not writing the APT credentials"
+        );
+        return None;
+    };
+    // 키 검사가 id를 이미 막지만, 한 줄 형식이 깨지지 않게 다시 확인한다.
+    if !auth_field_ok(host) || !auth_field_ok(&license.id) {
+        tracing::warn!(
+            url,
+            id = license.id,
+            "the APT host or subscription id has spaces or control characters; not writing the APT credentials"
+        );
+        return None;
+    }
+    Some(format!(
+        "{SOURCES_MARK}\nmachine {host} login {} password {}\n",
+        license.id,
+        hex::encode(Sha256::digest(key.as_bytes()))
+    ))
+}
+
+/// 인증 파일(netrc 모양)의 한 토큰으로 쓸 수 있는 값: 비어 있지 않고 공백·제어 문자가 없다.
+fn auth_field_ok(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// [`write_auth`]의 결과
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthOutcome {
+    Written,
+    /// 이미 같은 내용이다(쓸 것이 없으면 파일도 없다).
+    Unchanged,
+    /// opld가 쓴 파일을 지웠다.
+    Removed,
+    /// 관리 표시가 없는 파일이다(관리자가 직접 관리한다). 건드리지 않았다.
+    Unmanaged,
+}
+
+/// 인증 파일을 `contents`로 맞춘다(0600). None이면 opld가 쓴 파일을 지운다. 관리 표시가 없는 파일은
+/// [`write_sources`]처럼 건드리지 않고 경고한다.
+pub(crate) fn write_auth(path: &Path, contents: Option<&str>) -> std::io::Result<AuthOutcome> {
+    let old = match std::fs::read_to_string(path) {
+        Ok(old) => Some(old),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(old) = &old
+        && !old.trim().is_empty()
+        && old.lines().next() != Some(SOURCES_MARK)
+    {
+        tracing::warn!(
+            file = %path.display(),
+            "the APT credentials file has no opld mark; leaving it as it is"
+        );
+        return Ok(AuthOutcome::Unmanaged);
+    }
+    let Some(contents) = contents else {
+        if old.is_none() {
+            return Ok(AuthOutcome::Unchanged);
+        }
+        std::fs::remove_file(path)?;
+        return Ok(AuthOutcome::Removed);
+    };
+    if old.as_deref() == Some(contents) {
+        return Ok(AuthOutcome::Unchanged);
+    }
+    // 키에서 나온 비밀번호를 담으므로 root만 읽는다.
+    replace_file(path, contents, 0o600)?;
+    Ok(AuthOutcome::Written)
 }
 
 /// 노드 `node`의 `status.updates`와 이 노드의 버전을 쓴다.
@@ -934,6 +1068,7 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
             apt_url: String::new(),
             sources_file: dir.join("oplite.sources"),
             keyring: dir.join("keyring.gpg"),
+            auth_file: dir.join("oplite.conf"),
             apt_get: dir.join("apt-get"),
             systemd_run: dir.join("systemd-run"),
             systemctl: dir.join("systemctl"),
@@ -1182,6 +1317,132 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
             write_sources(&path, url, Channel::Stable, &keyring).unwrap(),
             SourcesOutcome::Unmanaged
         );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), own);
+    }
+
+    /// 개발 키로 서명한 구독 키(`expires_at`에 만료)
+    fn dev_key(expires_at: u64) -> String {
+        use opl_types::subscription::{Level, LicensePayload, decode_private_key, sign};
+        sign(
+            &decode_private_key(include_str!(
+                "../../opl-types/tests/fixtures/dev-license.key"
+            ))
+            .unwrap(),
+            &LicensePayload {
+                id: "sub-1".into(),
+                customer: "Example Corp".into(),
+                level: Level::Standard,
+                nodes: 3,
+                issued_at: 1_700_000_000,
+                expires_at,
+            },
+        )
+        .unwrap()
+    }
+
+    fn spec(channel: Channel, key: Option<&str>) -> SettingsSpec {
+        SettingsSpec {
+            updates: opl_types::settings::UpdateSettings { channel },
+            subscription: key.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn sources_name_the_enterprise_channel() {
+        assert!(
+            sources_contents(
+                "https://apt.example.com",
+                Channel::Enterprise,
+                Path::new(KEYRING)
+            )
+            .contains("Components: enterprise\n")
+        );
+    }
+
+    /// enterprise 채널이고 서명이 맞는 키가 있을 때만 쓴다. 만료된 키도 쓴다(저장소가 판단한다).
+    #[test]
+    fn auth_contents_need_the_enterprise_channel_and_a_signed_key() {
+        let key = dev_key(1_700_000_000 + 86_400);
+        let url = "https://user@apt.example.com:8443/oplite?x#y";
+        let password = hex::encode(Sha256::digest(key.as_bytes()));
+        assert_eq!(
+            auth_contents(url, &spec(Channel::Enterprise, Some(&key))).unwrap(),
+            format!(
+                "# managed by opld; edits are overwritten\n\
+                 machine apt.example.com:8443 login sub-1 password {password}\n"
+            )
+        );
+        assert_eq!(
+            auth_contents(
+                "http://apt.example.com",
+                &spec(Channel::Enterprise, Some(&key))
+            )
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap(),
+            format!("machine apt.example.com login sub-1 password {password}")
+        );
+        assert_eq!(auth_contents(url, &spec(Channel::Stable, Some(&key))), None);
+        assert_eq!(
+            auth_contents(url, &spec(Channel::Testing, Some(&key))),
+            None
+        );
+        assert_eq!(auth_contents(url, &spec(Channel::Enterprise, None)), None);
+        let tampered = format!("{key}x");
+        assert_eq!(
+            auth_contents(url, &spec(Channel::Enterprise, Some(&tampered))),
+            None
+        );
+        for bad in [
+            "",
+            "apt.example.com",
+            "https://",
+            "https:///oplite",
+            "https://apt.exam\u{7}ple.com",
+        ] {
+            assert_eq!(
+                auth_contents(bad, &spec(Channel::Enterprise, Some(&key))),
+                None,
+                "{bad}"
+            );
+        }
+    }
+
+    /// 인증 파일 한 줄에 들어가는 값은 공백·제어 문자가 없어야 한다(키 검사를 지나도 두 번째 방어).
+    #[test]
+    fn auth_fields_must_be_single_tokens() {
+        assert!(auth_field_ok("sub-1"));
+        assert!(auth_field_ok("apt.example.com:8443"));
+        for bad in ["", "Acme 2026", "a\nb", "a\tb", "a\u{0}b", "a\u{85}b"] {
+            assert!(!auth_field_ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn write_auth_writes_0600_replaces_removes_and_leaves_unmanaged_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oplite.conf");
+        let a = "# managed by opld; edits are overwritten\nmachine h login a password 1\n";
+        let b = "# managed by opld; edits are overwritten\nmachine h login b password 2\n";
+        assert_eq!(write_auth(&path, None).unwrap(), AuthOutcome::Unchanged);
+        assert!(!path.exists());
+        assert_eq!(write_auth(&path, Some(a)).unwrap(), AuthOutcome::Written);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), a);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(write_auth(&path, Some(a)).unwrap(), AuthOutcome::Unchanged);
+        assert_eq!(write_auth(&path, Some(b)).unwrap(), AuthOutcome::Written);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), b);
+        assert_eq!(write_auth(&path, None).unwrap(), AuthOutcome::Removed);
+        assert!(!path.exists());
+        assert!(!dir.path().join("oplite.conf.dpkg-tmp").exists());
+        // 관리 표시가 없는 파일(관리자가 직접 쓴 것)은 쓰지도 지우지도 않는다.
+        let own = "machine mirror.lan login me password secret\n";
+        std::fs::write(&path, own).unwrap();
+        assert_eq!(write_auth(&path, Some(a)).unwrap(), AuthOutcome::Unmanaged);
+        assert_eq!(write_auth(&path, None).unwrap(), AuthOutcome::Unmanaged);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), own);
     }
 }

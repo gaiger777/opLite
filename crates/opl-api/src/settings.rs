@@ -4,11 +4,12 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::{Channel, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus};
+use opl_types::subscription::SubscriptionState;
 use serde::Deserialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -64,7 +65,8 @@ pub async fn get_settings(
 
 /// 설정의 주어진 값을 바꾼다. 아무것도 없으면 400. 설정이 아직 없으면 만든다(`If-Match`는 0).
 /// `If-Match`가 없으면 읽은 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다. 같은 값이면 쓰지
-/// 않고 그대로 200이다.
+/// 않고 그대로 200이다. enterprise 채널은 모든 노드가 이 빌드 이상이고 구독이 active일 때만 고른다
+/// (이미 enterprise여도 다시 보내면 검사한다).
 #[utoipa::path(patch, path = "/settings", tag = "settings",
     params(("If-Match" = Option<u64>, Header)),
     request_body = SettingsPatch,
@@ -80,8 +82,25 @@ pub async fn patch_settings(
         return Err(ApiError::bad_request("give updates"));
     };
     crate::cluster::require_upgraded(&state.cluster)?;
+    let enterprise = updates.channel == Some(Channel::Enterprise);
+    // 옛 노드는 enterprise 채널을 풀지 못한다.
+    let used = if enterprise {
+        crate::cluster::require_current(&state.cluster)?;
+        crate::subscription::used_nodes(&state.cluster)?
+    } else {
+        0
+    };
     let expected = if_match(&headers)?;
     let written = write(&state.cluster, expected, |spec| {
+        if enterprise
+            && crate::subscription::state_of(spec, used).state != SubscriptionState::Active
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "subscription_required",
+                "an active subscription is required for the enterprise channel",
+            ));
+        }
         if let Some(channel) = updates.channel {
             spec.updates.channel = channel;
         }

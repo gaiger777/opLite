@@ -121,6 +121,7 @@ impl FakeApt {
             apt_url: String::new(),
             sources_file: self.path("oplite.sources"),
             keyring: self.path("keyring.gpg"),
+            auth_file: self.path("oplite.conf"),
             apt_get: self.path("apt-get"),
             systemd_run: self.path("systemd-run"),
             systemctl: self.path("systemctl"),

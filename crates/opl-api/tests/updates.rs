@@ -347,6 +347,112 @@ async fn the_agent_writes_the_sources_for_the_channel_and_checks() {
     agent.shutdown().await;
 }
 
+/// 개발 키로 서명한 구독 키(노드 3대, 30일)
+fn subscription_key() -> String {
+    use opl_types::subscription::{Level, LicensePayload, decode_private_key, sign};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sign(
+        &decode_private_key(include_str!(
+            "../../opl-types/tests/fixtures/dev-license.key"
+        ))
+        .unwrap(),
+        &LicensePayload {
+            id: "sub-1".into(),
+            customer: "Example Corp".into(),
+            level: Level::Standard,
+            nodes: 3,
+            issued_at: now - 60,
+            expires_at: now + 30 * 86_400,
+        },
+    )
+    .unwrap()
+}
+
+/// enterprise 채널이고 구독이 있으면 APT 인증 파일을 쓰고, 구독을 지우거나 채널을 바꾸면 지운다.
+#[tokio::test]
+async fn the_agent_writes_the_apt_credentials_for_the_enterprise_channel() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    let apt = FakeApt::new();
+    let env = Env::start().await;
+    set_node_status(&env, |s| s.updates = Some(NodeUpdates::default())).await;
+    let admin = env.admin().await;
+    let mut config = apt.config();
+    config.apt_url = "https://apt.example.com:8443/oplite".into();
+    let sources = config.sources_file.clone();
+    let auth = config.auth_file.clone();
+    let agent = UpdateAgent::spawn(
+        env.cluster.clone(),
+        env.node,
+        Arc::new(Updates::new(config)),
+    );
+    let read_sources = || std::fs::read_to_string(&sources).ok();
+    let read_auth = || std::fs::read_to_string(&auth).ok();
+    eventually("the sources file", read_sources).await;
+    assert_eq!(read_auth(), None);
+
+    let k = subscription_key();
+    let (status, got) = admin.put("/subscription", json!({ "key": k }), None).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let (status, got) = admin
+        .patch(
+            "/settings",
+            json!({ "updates": { "channel": "enterprise" } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    eventually("the enterprise channel", || {
+        read_sources().filter(|t| t.contains("Components: enterprise\n"))
+    })
+    .await;
+    let expected = format!(
+        "# managed by opld; edits are overwritten\n\
+         machine apt.example.com:8443 login sub-1 password {}\n",
+        hex::encode(Sha256::digest(k.as_bytes()))
+    );
+    let text = eventually("the APT credentials", read_auth).await;
+    assert_eq!(text, expected);
+    let mode = std::fs::metadata(&auth).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    // 구독을 지우면 지우고(채널은 그대로), 다시 넣으면 다시 쓴다.
+    assert_eq!(admin.delete("/subscription").await.0, StatusCode::OK);
+    eventually("the removed credentials", || {
+        read_auth().is_none().then_some(())
+    })
+    .await;
+    let (status, got) = admin.put("/subscription", json!({ "key": k }), None).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(
+        eventually("the credentials again", read_auth).await,
+        expected
+    );
+
+    // 다른 채널로 바꾸면 지운다.
+    let (status, got) = admin
+        .patch(
+            "/settings",
+            json!({ "updates": { "channel": "stable" } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    eventually("the stable channel", || {
+        read_sources().filter(|t| t.contains("Components: stable\n"))
+    })
+    .await;
+    eventually("the removed credentials", || {
+        read_auth().is_none().then_some(())
+    })
+    .await;
+    agent.shutdown().await;
+}
+
 /// 실행기가 업그레이드 유닛을 지켜보기 시작할 때까지(가짜 `systemctl`이 불릴 때까지) 기다린다.
 async fn wait_for_polling(apt: &FakeApt) {
     eventually("the unit to be polled", || {

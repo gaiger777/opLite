@@ -481,6 +481,7 @@ impl UpdatesSection {
             apt_url,
             sources_file: self.sources_file.clone(),
             keyring: opl_api::KEYRING.into(),
+            auth_file: opl_api::AUTH_FILE.into(),
             apt_get: self.apt_get.clone(),
             systemd_run: self.systemd_run.clone(),
             systemctl: self.systemctl.clone(),
@@ -1111,6 +1112,10 @@ mod tests {
         assert_eq!(config.first_check, Duration::from_secs(1));
         assert_eq!(config.apt_url, "https://apt.example.com/oplite");
         assert_eq!(config.sources_file, Path::new("/tmp/x.sources"));
+        assert_eq!(
+            config.auth_file,
+            Path::new("/etc/apt/auth.conf.d/oplite.conf")
+        );
         assert_eq!(config.apt_get, Path::new("/opt/apt-get"));
         assert_eq!(config.poll, Duration::from_secs(90));
         // 비어 있으면 빌드 값을 쓴다.

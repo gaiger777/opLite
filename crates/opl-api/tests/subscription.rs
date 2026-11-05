@@ -1,4 +1,4 @@
-//! 구독 API: 넣기·지우기, 권한, 상태 계산(노드 수, 위트니스 제외), 키를 내보내지 않음.
+//! 구독 API: 넣기·지우기, 권한, 상태 계산(노드 수, 위트니스 제외), 키를 내보내지 않음, enterprise 채널 조건.
 
 mod common;
 
@@ -281,4 +281,107 @@ async fn watch_does_not_send_the_key() {
         json!({ "updates": { "channel": "stable" } })
     );
     assert!(!ev.to_string().contains(&k));
+}
+
+fn stored_channel(env: &Env) -> Option<String> {
+    env.cluster
+        .get_by_name::<SettingsSpec>(SETTINGS_NAME)
+        .unwrap()
+        .map(|s| s.spec.updates.channel.as_str().to_string())
+}
+
+/// enterprise 채널은 구독이 active일 때만 고른다. 이미 enterprise여도 다시 보내면 같이 검사한다.
+#[tokio::test]
+async fn the_enterprise_channel_needs_an_active_subscription() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let enterprise = json!({ "updates": { "channel": "enterprise" } });
+    let got = admin.patch("/settings", enterprise.clone(), None).await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "subscription_required");
+    assert_eq!(
+        got.1["message"],
+        "an active subscription is required for the enterprise channel"
+    );
+    assert_eq!(stored_channel(&env), None);
+
+    let k = key(1, 30);
+    assert_eq!(
+        admin
+            .put("/subscription", json!({ "key": k }), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, got) = admin.patch("/settings", enterprise.clone(), None).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(
+        got["spec"],
+        json!({ "updates": { "channel": "enterprise" } })
+    );
+    assert_eq!(stored_channel(&env).as_deref(), Some("enterprise"));
+
+    // 노드가 한도를 넘으면(over_limit) 다시 enterprise를 보내도 거절한다. 다른 채널은 고른다.
+    add_node(&env, "node2", false, Some(BUILD)).await;
+    let got = admin.patch("/settings", enterprise.clone(), None).await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "subscription_required");
+    let (status, got) = admin
+        .patch(
+            "/settings",
+            json!({ "updates": { "channel": "testing" } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+
+    // 구독을 지워도 채널은 그대로 두지만, enterprise로는 바꾸지 못한다.
+    assert_eq!(
+        admin
+            .put("/subscription", json!({ "key": key(2, 30) }), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        admin.patch("/settings", enterprise.clone(), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(admin.delete("/subscription").await.0, StatusCode::OK);
+    assert_eq!(stored_channel(&env).as_deref(), Some("enterprise"));
+    let got = admin.patch("/settings", enterprise, None).await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "subscription_required");
+}
+
+/// 이 빌드보다 낮은 노드가 있으면 구독이 있어도 enterprise를 쓰지 않는다(옛 노드는 풀지 못한다).
+/// 구독을 넣은 뒤 옛 노드가 생기는 이 조합은 합류 버전 검사 때문에 실제로는 생기지 않는 인위적
+/// 상황이다. 여기서는 PATCH의 `require_current` 게이트만 확인한다.
+#[tokio::test]
+async fn the_enterprise_channel_waits_until_every_node_runs_this_build() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    assert_eq!(
+        admin
+            .put("/subscription", json!({ "key": key(3, 30) }), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    add_node(&env, "old", true, Some("0.0.1~old")).await;
+    let got = admin
+        .patch(
+            "/settings",
+            json!({ "updates": { "channel": "enterprise" } }),
+            None,
+        )
+        .await;
+    assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+    assert_eq!(stored_channel(&env).as_deref(), Some("stable"));
+    // 옛 노드가 푸는 채널은 그대로 고른다.
+    let (status, got) = admin
+        .patch(
+            "/settings",
+            json!({ "updates": { "channel": "testing" } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
 }

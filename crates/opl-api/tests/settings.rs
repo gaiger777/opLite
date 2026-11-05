@@ -107,7 +107,7 @@ async fn settings_patch_checks_the_request() {
         &admin
             .patch(
                 "/settings",
-                json!({ "updates": { "channel": "enterprise" } }),
+                json!({ "updates": { "channel": "nightly" } }),
                 None,
             )
             .await,

@@ -1463,7 +1463,7 @@ enum TaskCmd {
 enum SettingsCmd {
     /// 설정을 `키: 값` 줄로 보인다.
     Get,
-    /// 설정을 바꾼다. 키: `updates.channel`(stable|testing)
+    /// 설정을 바꾼다. 키: `updates.channel`(stable|testing|enterprise)
     Set {
         /// 예: `updates.channel=testing`
         #[arg(required = true, value_name = "KEY=VALUE")]

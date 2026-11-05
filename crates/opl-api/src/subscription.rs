@@ -27,20 +27,30 @@ pub struct SubscriptionKey {
     pub key: String,
 }
 
-/// 설정에 저장된 키의 지금 상태. 노드 수는 위트니스가 아닌 노드만 센다.
+/// 설정에 저장된 키의 지금 상태
 fn info(cluster: &Cluster, settings: &Settings) -> Result<SubscriptionInfo, ClusterError> {
+    Ok(state_of(&settings.spec, used_nodes(cluster)?))
+}
+
+/// 구독이 세는 노드 수: 위트니스가 아닌 노드
+pub(crate) fn used_nodes(cluster: &Cluster) -> Result<u32, ClusterError> {
     let used = cluster
         .list::<NodeSpec>()?
         .1
         .iter()
         .filter(|n| !n.spec.witness)
         .count();
-    Ok(subscription::status(
-        settings.spec.subscription.as_deref(),
+    Ok(u32::try_from(used).unwrap_or(u32::MAX))
+}
+
+/// 설정 `spec`에 저장된 키의 지금 상태(노드 `used`대)
+pub(crate) fn state_of(spec: &SettingsSpec, used: u32) -> SubscriptionInfo {
+    subscription::status(
+        spec.subscription.as_deref(),
         &subscription::license_keys(),
         now(),
-        u32::try_from(used).unwrap_or(u32::MAX),
-    ))
+        used,
+    )
 }
 
 /// 구독 상태. 로그인한 누구나 읽는다.

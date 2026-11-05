@@ -423,7 +423,8 @@ export interface paths {
         /**
          * 설정의 주어진 값을 바꾼다. 아무것도 없으면 400. 설정이 아직 없으면 만든다(`If-Match`는 0).
          *     `If-Match`가 없으면 읽은 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다. 같은 값이면 쓰지
-         *     않고 그대로 200이다.
+         *     않고 그대로 200이다. enterprise 채널은 모든 노드가 이 빌드 이상이고 구독이 active일 때만 고른다
+         *     (이미 enterprise여도 다시 보내면 검사한다).
          */
         patch: operations["patch_settings"];
         trace?: never;
@@ -1225,7 +1226,7 @@ export interface components {
          * @description 업데이트 채널. APT 소스 파일의 `Components`가 된다.
          * @enum {string}
          */
-        Channel: "stable" | "testing";
+        Channel: "stable" | "testing" | "enterprise";
         CloneRequest: {
             /** @description 새 VM의 이름 */
             name: string;
