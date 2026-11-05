@@ -424,7 +424,8 @@ export interface paths {
          * 설정의 주어진 값을 바꾼다. 아무것도 없으면 400. 설정이 아직 없으면 만든다(`If-Match`는 0).
          *     `If-Match`가 없으면 읽은 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다. 같은 값이면 쓰지
          *     않고 그대로 200이다. enterprise 채널은 모든 노드가 이 빌드 이상이고 구독이 active일 때만 고른다
-         *     (이미 enterprise여도 다시 보내면 검사한다).
+         *     (이미 enterprise여도 다시 보내면 검사한다). 텔레메트리도 모든 노드가 이 빌드 이상일 때만 바꾸고,
+         *     켤 때 id가 없으면 만든다.
          */
         patch: operations["patch_settings"];
         trace?: never;
@@ -534,6 +535,40 @@ export interface paths {
         get: operations["get_task"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/telemetry/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 지금 보낼 보고 그대로(꺼져 있어도). admin만 본다. */
+        get: operations["preview_telemetry"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/telemetry/reset-id": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 텔레메트리 id를 새로 만든다. 설정이 아직 없으면 만든다. */
+        post: operations["reset_telemetry_id"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2310,6 +2345,12 @@ export interface components {
             /** @description 이 NIC에 거는 보안 그룹 이름(8개 이하, 겹치지 않게). 비어 있지 않으면 방화벽이 켜진다. */
             security_groups?: string[];
         };
+        NodeCounts: {
+            /** Format: int64 */
+            total: number;
+            /** Format: int64 */
+            witness: number;
+        };
         /** @description 노드가 등록할 때 쓰는 HA 펜싱 설정 */
         NodeHa: {
             fencing: components["schemas"]["Fencing"];
@@ -2763,9 +2804,14 @@ export interface components {
              */
             revision: number;
             spec: {
+                /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
+                telemetry?: components["schemas"]["TelemetrySettings"];
                 updates?: components["schemas"]["UpdateSettings"];
             };
-            status: Record<string, never>;
+            status: {
+                /** @description 텔레메트리 상태. 처음 켤 때 생기고, 없으면 쓰지 않는다. */
+                telemetry?: components["schemas"]["TelemetryStatus"];
+            };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_SnapshotSpec_SnapshotStatus: {
@@ -3092,12 +3138,18 @@ export interface components {
         SecurityGroupStatus: Record<string, never>;
         /** @description 설정에서 바꿀 값. 주어진 필드만 바꾼다. */
         SettingsPatch: {
+            telemetry?: components["schemas"]["TelemetryPatch"];
             updates?: components["schemas"]["UpdateSettingsPatch"];
         };
         SettingsSpec: {
+            /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
+            telemetry?: components["schemas"]["TelemetrySettings"];
             updates?: components["schemas"]["UpdateSettings"];
         };
-        SettingsStatus: Record<string, never>;
+        SettingsStatus: {
+            /** @description 텔레메트리 상태. 처음 켤 때 생기고, 없으면 쓰지 않는다. */
+            telemetry?: components["schemas"]["TelemetryStatus"];
+        };
         /** @enum {string} */
         SnapshotPhase: "pending" | "ready";
         /** @description 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다. */
@@ -3356,6 +3408,93 @@ export interface components {
             /** @default pending */
             state: components["schemas"]["TaskState"];
         };
+        /** @description 텔레메트리에서 바꿀 값 */
+        TelemetryPatch: {
+            enabled?: boolean;
+            /** @description 보낼 `https://` 주소. `""`는 지워 빌드 기본 끝점을 쓴다. */
+            endpoint?: string;
+        };
+        /** @description 텔레메트리 보고. 맵은 종류 → 수다. */
+        TelemetryReport: {
+            /** @description 아키텍처별 노드 수(위트니스 제외, 모르면 `unknown`) */
+            arch: {
+                [key: string]: number;
+            };
+            /** Format: int64 */
+            backup_jobs: number;
+            /**
+             * Format: int64
+             * @description CPU 합(위트니스 제외)
+             */
+            cpus: number;
+            /** @description 하이퍼바이저별 노드 수(위트니스 제외) */
+            hypervisor: {
+                [key: string]: number;
+            };
+            /**
+             * Format: uuid
+             * @description 설정 상태의 텔레메트리 id(아직 없으면 nil UUID)
+             */
+            id: string;
+            /** @description 원본 종류별 VM 가져오기 수(`ova`, `esxi`) */
+            imports: {
+                [key: string]: number;
+            };
+            /**
+             * Format: int64
+             * @description 메모리 합(위트니스 제외, GiB 내림)
+             */
+            memory_gib: number;
+            /** @description 종류별 네트워크 수: `vxlan`, `vlan`(브리지와 VLAN), `bridge` */
+            networks: {
+                [key: string]: number;
+            };
+            nodes: components["schemas"]["NodeCounts"];
+            /** @description 백엔드 종류별 스토리지 풀 수 */
+            pools: {
+                [key: string]: number;
+            };
+            /**
+             * Format: int32
+             * @description 보고 형식 판(지금 1)
+             */
+            schema: number;
+            /** Format: int64 */
+            security_groups: number;
+            /**
+             * Format: int64
+             * @description 보낸 시각(유닉스 초)
+             */
+            sent_at: number;
+            /** @description 구독 수준(`standard`, `premium`). 서명이 맞으면 만료돼도 수준이고, 없으면 `none`. */
+            subscription: string;
+            /** @description 버전별 노드 수(위트니스 포함, 버전을 적지 않은 노드는 `unknown`) */
+            versions: {
+                [key: string]: number;
+            };
+            vms: components["schemas"]["VmCounts"];
+        };
+        /** @description 텔레메트리 설정. 켜면 리더가 하루 한 번 클러스터 규모(이름·주소 없음)를 끝점에 보낸다. */
+        TelemetrySettings: {
+            enabled?: boolean;
+            /** @description 보낼 `https://` 주소. 없으면 빌드 값(`version::TELEMETRY_URL`) */
+            endpoint?: string;
+        };
+        /** @description 텔레메트리 상태 */
+        TelemetryStatus: {
+            /**
+             * Format: uuid
+             * @description 보고에 붙는 무작위 id(UUID v4). 처음 켤 때 만들고, 꺼도 남는다.
+             */
+            id?: string;
+            /** @description 마지막 보내기가 실패한 이유 */
+            last_error?: string;
+            /**
+             * Format: int64
+             * @description 마지막으로 보낸 시각(유닉스 초)
+             */
+            last_sent_at?: number;
+        };
         TokenView: {
             /** Format: uuid */
             id: string;
@@ -3428,6 +3567,20 @@ export interface components {
         VersionInfo: {
             /** @description 이 노드의 opld 빌드 버전 */
             version: string;
+        };
+        VmCounts: {
+            /**
+             * Format: int64
+             * @description HA를 켠 VM
+             */
+            ha: number;
+            /**
+             * Format: int64
+             * @description 지금 도는 VM(phase running)
+             */
+            running: number;
+            /** Format: int64 */
+            total: number;
         };
         /** @description 리소스만 지운 가져오기 지우기(`force`)의 응답 */
         VmImportForgotten: {
@@ -4919,6 +5072,60 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    preview_telemetry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TelemetryReport"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    reset_telemetry_id: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_SettingsSpec_SettingsStatus"];
                 };
             };
             "4XX": {

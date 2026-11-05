@@ -111,6 +111,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SubscriptionCmd,
     },
+    /// 옵트인 텔레메트리(기본 꺼짐). 켜면 리더가 하루 한 번 클러스터 규모를 보낸다.
+    Telemetry {
+        #[command(subcommand)]
+        cmd: TelemetryCmd,
+    },
 }
 
 #[derive(Args)]
@@ -1624,6 +1629,96 @@ async fn subscription(
     Ok(())
 }
 
+#[derive(Subcommand)]
+enum TelemetryCmd {
+    /// 텔레메트리 설정과 마지막 전송을 보인다.
+    Show,
+    /// 텔레메트리를 켠다. 무엇을 보내는지는 `preview`로 먼저 본다.
+    Enable {
+        /// 보낼 `https://` 주소. 없으면 지금 끝점(설정 또는 빌드 기본값)
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
+    /// 텔레메트리를 끈다(id는 남는다).
+    Disable,
+    /// 지금 보낼 보고를 JSON 그대로 보인다(admin).
+    Preview,
+    /// 보고에 붙는 id를 새로 만든다.
+    ResetId,
+}
+
+/// `telemetry enable|disable`의 요청 본문(`PATCH /settings`)
+fn telemetry_body(enabled: bool, endpoint: Option<&str>) -> Value {
+    let mut body = json!({ "telemetry": { "enabled": enabled } });
+    if let Some(endpoint) = endpoint {
+        body["telemetry"]["endpoint"] = json!(endpoint);
+    }
+    body
+}
+
+/// 설정 리소스의 텔레메트리 부분을 `키: 값` 줄로. 끝점이 없으면 이 oplctl 빌드의 기본 끝점을 보인다.
+fn telemetry_lines(settings: &Value) -> Vec<String> {
+    let spec = &settings["spec"]["telemetry"];
+    let status = &settings["status"]["telemetry"];
+    let endpoint = match spec["endpoint"].as_str() {
+        Some(endpoint) => endpoint.to_string(),
+        None if !opl_types::version::TELEMETRY_URL.is_empty() => {
+            format!("{} (build default)", opl_types::version::TELEMETRY_URL)
+        }
+        None => "none".into(),
+    };
+    let last_sent = match status["last_sent_at"].as_i64() {
+        Some(at) => unix_time(at),
+        None => "never".into(),
+    };
+    vec![
+        format!("enabled: {}", spec["enabled"] == true),
+        format!("endpoint: {endpoint}"),
+        format!("id: {}", status["id"].as_str().unwrap_or("none")),
+        format!("last sent: {last_sent}"),
+        format!(
+            "last error: {}",
+            status["last_error"].as_str().unwrap_or("none")
+        ),
+    ]
+}
+
+async fn telemetry(
+    client: &Client,
+    cmd: TelemetryCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let settings = match cmd {
+        TelemetryCmd::Show => client.get("/settings").await?,
+        TelemetryCmd::Enable { endpoint } => {
+            client
+                .patch("/settings", &telemetry_body(true, endpoint.as_deref()))
+                .await?
+        }
+        TelemetryCmd::Disable => {
+            client
+                .patch("/settings", &telemetry_body(false, None))
+                .await?
+        }
+        TelemetryCmd::Preview => {
+            // 보낼 JSON 그대로 보인다.
+            let report = client.get("/telemetry/preview").await?;
+            print_json(out, &report)?;
+            return Ok(());
+        }
+        TelemetryCmd::ResetId => client.post("/telemetry/reset-id", &json!({})).await?,
+    };
+    if json_out {
+        print_json(out, &settings)?;
+    } else {
+        for line in telemetry_lines(&settings) {
+            writeln!(out, "{line}")?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Role {
     Admin,
@@ -2031,6 +2126,7 @@ where
         },
         Cmd::Settings { cmd } => settings(&client, cmd, json_out, out).await?,
         Cmd::Subscription { cmd } => subscription(&client, cmd, json_out, out).await?,
+        Cmd::Telemetry { cmd } => telemetry(&client, cmd, json_out, out).await?,
     }
     Ok(())
 }
@@ -6603,6 +6699,113 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    /// `telemetry show`는 켜짐·끝점·id·마지막 전송·오류를 줄로 보인다.
+    #[test]
+    fn telemetry_lines_show_the_state() {
+        let settings = json!({
+            "spec": { "telemetry": { "enabled": true, "endpoint": "https://t.example/r" } },
+            "status": { "telemetry": {
+                "id": "6f0c3b7e-8d2a-4c1e-9b5f-0a1b2c3d4e5f",
+                "last_sent_at": 1_761_471_000, "last_error": "HTTP 500"
+            } }
+        });
+        assert_eq!(
+            telemetry_lines(&settings),
+            [
+                "enabled: true",
+                "endpoint: https://t.example/r",
+                "id: 6f0c3b7e-8d2a-4c1e-9b5f-0a1b2c3d4e5f",
+                "last sent: 2025-10-26 09:30 UTC",
+                "last error: HTTP 500",
+            ]
+        );
+        let default_endpoint = if opl_types::version::TELEMETRY_URL.is_empty() {
+            "endpoint: none".to_string()
+        } else {
+            format!(
+                "endpoint: {} (build default)",
+                opl_types::version::TELEMETRY_URL
+            )
+        };
+        assert_eq!(
+            telemetry_lines(&json!({ "spec": { "updates": {} }, "status": {} })),
+            [
+                "enabled: false".to_string(),
+                default_endpoint,
+                "id: none".into(),
+                "last sent: never".into(),
+                "last error: none".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn telemetry_bodies_send_only_what_was_given() {
+        assert_eq!(
+            telemetry_body(true, None),
+            json!({ "telemetry": { "enabled": true } })
+        );
+        assert_eq!(
+            telemetry_body(true, Some("https://t.example/r")),
+            json!({ "telemetry": { "enabled": true, "endpoint": "https://t.example/r" } })
+        );
+        assert_eq!(
+            telemetry_body(false, None),
+            json!({ "telemetry": { "enabled": false } })
+        );
+    }
+
+    /// `telemetry`의 하위 명령이 부르는 API. preview는 받은 JSON을 그대로 예쁘게 보인다.
+    #[tokio::test]
+    async fn telemetry_commands_call_the_api() {
+        let (client, seen) = fake_api(|path| {
+            if path == "/api/v1/telemetry/preview" {
+                json!({ "schema": 1, "vms": { "total": 2 } })
+            } else {
+                json!({
+                    "spec": { "telemetry": { "enabled": true, "endpoint": "https://t.example/r" } },
+                    "status": { "telemetry": { "id": "abc" } }
+                })
+            }
+        })
+        .await;
+        let mut out = Vec::new();
+        for args in [
+            &["oplctl", "telemetry", "show"][..],
+            &[
+                "oplctl",
+                "telemetry",
+                "enable",
+                "--endpoint",
+                "https://t.example/r",
+            ][..],
+            &["oplctl", "telemetry", "disable"][..],
+            &["oplctl", "telemetry", "reset-id"][..],
+            &["oplctl", "telemetry", "preview"][..],
+        ] {
+            let Cmd::Telemetry { cmd } = Cli::try_parse_from(args).unwrap().cmd else {
+                unreachable!()
+            };
+            telemetry(&client, cmd, false, &mut out).await.unwrap();
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/settings HTTP/1.1",
+                "PATCH /api/v1/settings HTTP/1.1",
+                "PATCH /api/v1/settings HTTP/1.1",
+                "POST /api/v1/telemetry/reset-id HTTP/1.1",
+                "GET /api/v1/telemetry/preview HTTP/1.1",
+            ]
+        );
+        let shown = "enabled: true\nendpoint: https://t.example/r\nid: abc\nlast sent: never\nlast error: none\n";
+        let preview = "{\n  \"schema\": 1,\n  \"vms\": {\n    \"total\": 2\n  }\n}\n";
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{shown}{shown}{shown}{shown}{preview}")
+        );
     }
 
     #[test]

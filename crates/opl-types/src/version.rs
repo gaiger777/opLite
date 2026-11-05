@@ -17,6 +17,13 @@ pub const APT_URL: &str = match option_env!("OPL_APT_URL") {
     None => "",
 };
 
+/// 이 빌드의 텔레메트리 기본 끝점(빌드 때 환경 변수 `OPL_TELEMETRY_URL`). 없거나 비었으면 빈 문자열이고,
+/// 그러면 설정에 끝점을 주어야 텔레메트리를 켠다.
+pub const TELEMETRY_URL: &str = match option_env!("OPL_TELEMETRY_URL") {
+    Some(v) => v,
+    None => "",
+};
+
 /// 두 버전을 Debian 규칙으로 비교한다: `[에포크:]업스트림[-리비전]`, `~`는 끝보다도 낮다.
 /// 형식에 맞지 않는 문자열도 패닉하지 않고 같은 규칙으로 비교한다.
 pub fn compare(a: &str, b: &str) -> Ordering {
@@ -104,6 +111,10 @@ mod tests {
     fn apt_url_is_the_build_variable_or_empty() {
         assert_eq!(APT_URL, option_env!("OPL_APT_URL").unwrap_or(""));
         assert_eq!(SUITE, "trixie");
+        assert_eq!(
+            TELEMETRY_URL,
+            option_env!("OPL_TELEMETRY_URL").unwrap_or("")
+        );
     }
 
     #[test]

@@ -87,11 +87,7 @@ async fn settings_patch_checks_the_request() {
     );
     assert_error(
         &admin
-            .patch(
-                "/settings",
-                json!({ "telemetry": { "enabled": true } }),
-                None,
-            )
+            .patch("/settings", json!({ "telemetry": { "interval": 1 } }), None)
             .await,
         StatusCode::BAD_REQUEST,
         "invalid_request",

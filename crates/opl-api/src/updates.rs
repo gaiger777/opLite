@@ -1344,6 +1344,7 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
         SettingsSpec {
             updates: opl_types::settings::UpdateSettings { channel },
             subscription: key.map(Into::into),
+            ..SettingsSpec::default()
         }
     }
 

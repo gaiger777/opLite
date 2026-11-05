@@ -23,6 +23,7 @@ mod snapshots;
 mod state;
 mod subscription;
 mod tasks;
+mod telemetry;
 mod updates;
 pub mod users;
 pub mod vm_imports;
@@ -97,6 +98,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(cluster::create_join_token))
         .routes(routes!(cluster::join))
         .routes(routes!(settings::get_settings, settings::patch_settings))
+        .routes(routes!(settings::reset_telemetry_id))
+        .routes(routes!(telemetry::preview_telemetry))
         .routes(routes!(
             subscription::get_subscription,
             subscription::put_subscription,

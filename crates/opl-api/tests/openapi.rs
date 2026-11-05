@@ -16,6 +16,8 @@ async fn openapi_document_is_served_without_login() {
         "/version",
         "/settings",
         "/subscription",
+        "/telemetry/preview",
+        "/telemetry/reset-id",
         "/nodes/{key}/updates/refresh",
         "/nodes/{key}/upgrade",
         "/vms",
@@ -87,6 +89,25 @@ async fn openapi_document_is_served_without_login() {
         info["required"],
         serde_json::json!(["state", "used_nodes"]),
         "{info}"
+    );
+    // 텔레메트리 설정·상태와 미리 보기 보고
+    assert_eq!(
+        doc["components"]["schemas"]["SettingsSpec"]["properties"]["telemetry"]["$ref"],
+        "#/components/schemas/TelemetrySettings"
+    );
+    assert_eq!(
+        doc["components"]["schemas"]["SettingsStatus"]["properties"]["telemetry"]["$ref"],
+        "#/components/schemas/TelemetryStatus"
+    );
+    assert_eq!(
+        doc["paths"]["/telemetry/preview"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/TelemetryReport"
+    );
+    assert!(
+        doc["components"]["schemas"]["SettingsPatch"]["properties"]["telemetry"].is_object(),
+        "{}",
+        doc["components"]["schemas"]["SettingsPatch"]
     );
     // 백업 작업의 VM 고르기는 세 객체 중 하나다.
     let selector = &doc["components"]["schemas"]["VmSelector"]["oneOf"];

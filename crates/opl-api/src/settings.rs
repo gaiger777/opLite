@@ -4,12 +4,15 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::resource::{Resource, ResourceSpec};
-use opl_types::settings::{Channel, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus};
+use opl_types::settings::{
+    Channel, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus, TelemetrySettings,
+};
 use opl_types::subscription::SubscriptionState;
+use opl_types::version::TELEMETRY_URL;
 use serde::Deserialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -42,6 +45,9 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub updates: Option<UpdateSettingsPatch>,
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub telemetry: Option<TelemetryPatch>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -50,6 +56,66 @@ pub struct UpdateSettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub channel: Option<Channel>,
+}
+
+/// 텔레메트리에서 바꿀 값
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryPatch {
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub enabled: Option<bool>,
+    /// 보낼 `https://` 주소. `""`는 지워 빌드 기본 끝점을 쓴다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub endpoint: Option<String>,
+}
+
+/// 텔레메트리 끝점은 호스트가 있는 `https://` 주소여야 한다.
+fn check_endpoint(endpoint: &str) -> Result<(), ApiError> {
+    // 설정은 로그인한 누구나 읽으므로 끝점에 사용자 정보를 두지 않는다.
+    let authority = endpoint.split_once("://").map_or("", |(_, rest)| {
+        rest.split(['/', '?', '#']).next().unwrap_or("")
+    });
+    if authority.contains('@') {
+        return Err(ApiError::bad_request(
+            "telemetry.endpoint must not contain credentials",
+        ));
+    }
+    let ok = endpoint.starts_with("https://")
+        && endpoint.parse::<Uri>().is_ok_and(|uri| {
+            uri.scheme_str() == Some("https") && uri.host().is_some_and(|h| !h.is_empty())
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "telemetry.endpoint must be an https:// URL",
+        ))
+    }
+}
+
+/// 텔레메트리 패치를 `telemetry`에 적용한다. 켜져 있는데 끝점도 빌드 기본 끝점도 없으면 400.
+fn apply_telemetry(
+    telemetry: &mut TelemetrySettings,
+    patch: &TelemetryPatch,
+) -> Result<(), ApiError> {
+    if let Some(enabled) = patch.enabled {
+        telemetry.enabled = enabled;
+    }
+    match patch.endpoint.as_deref() {
+        Some("") => telemetry.endpoint = None,
+        Some(endpoint) => telemetry.endpoint = Some(endpoint.to_string()),
+        None => {}
+    }
+    if telemetry.enabled && telemetry.endpoint.is_none() && TELEMETRY_URL.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "telemetry_endpoint_required",
+            "set telemetry.endpoint; this build has no default endpoint",
+        ));
+    }
+    Ok(())
 }
 
 /// 클러스터 설정. 로그인한 누구나 읽는다.
@@ -66,7 +132,8 @@ pub async fn get_settings(
 /// 설정의 주어진 값을 바꾼다. 아무것도 없으면 400. 설정이 아직 없으면 만든다(`If-Match`는 0).
 /// `If-Match`가 없으면 읽은 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다. 같은 값이면 쓰지
 /// 않고 그대로 200이다. enterprise 채널은 모든 노드가 이 빌드 이상이고 구독이 active일 때만 고른다
-/// (이미 enterprise여도 다시 보내면 검사한다).
+/// (이미 enterprise여도 다시 보내면 검사한다). 텔레메트리도 모든 노드가 이 빌드 이상일 때만 바꾸고,
+/// 켤 때 id가 없으면 만든다.
 #[utoipa::path(patch, path = "/settings", tag = "settings",
     params(("If-Match" = Option<u64>, Header)),
     request_body = SettingsPatch,
@@ -78,14 +145,22 @@ pub async fn patch_settings(
     Json(req): Json<SettingsPatch>,
 ) -> Result<Json<Settings>, ApiError> {
     state.authorize(&principal, Action::Write, SettingsSpec::KIND)?;
-    let Some(updates) = req.updates else {
-        return Err(ApiError::bad_request("give updates"));
-    };
+    if req.updates.is_none() && req.telemetry.is_none() {
+        return Err(ApiError::bad_request("give updates or telemetry"));
+    }
+    if let Some(endpoint) = req.telemetry.as_ref().and_then(|t| t.endpoint.as_deref())
+        && !endpoint.is_empty()
+    {
+        check_endpoint(endpoint)?;
+    }
     crate::cluster::require_upgraded(&state.cluster)?;
-    let enterprise = updates.channel == Some(Channel::Enterprise);
-    // 옛 노드는 enterprise 채널을 풀지 못한다.
-    let used = if enterprise {
+    let channel = req.updates.and_then(|u| u.channel);
+    let enterprise = channel == Some(Channel::Enterprise);
+    // 옛 노드는 enterprise 채널과 텔레메트리 필드를 풀지 못한다.
+    if enterprise || req.telemetry.is_some() {
         crate::cluster::require_current(&state.cluster)?;
+    }
+    let used = if enterprise {
         crate::subscription::used_nodes(&state.cluster)?
     } else {
         0
@@ -101,13 +176,93 @@ pub async fn patch_settings(
                 "an active subscription is required for the enterprise channel",
             ));
         }
-        if let Some(channel) = updates.channel {
+        if let Some(channel) = channel {
             spec.updates.channel = channel;
+        }
+        if let Some(telemetry) = &req.telemetry {
+            apply_telemetry(&mut spec.telemetry, telemetry)?;
         }
         Ok(())
     })
     .await?;
+    let has_id = written
+        .status
+        .telemetry
+        .as_ref()
+        .is_some_and(|t| t.id.is_some());
+    if !written.spec.telemetry.enabled || has_id {
+        return Ok(Json(public(written)));
+    }
+    // 처음 켰다: 보고에 붙일 id를 만든다(다른 요청이 먼저 만들었으면 그대로).
+    let written = write_status(&state.cluster, |status| {
+        let telemetry = status.telemetry.get_or_insert_default();
+        if telemetry.id.is_none() {
+            telemetry.id = Some(Uuid::new_v4());
+        }
+    })
+    .await?;
     Ok(Json(public(written)))
+}
+
+/// 텔레메트리 id를 새로 만든다. 설정이 아직 없으면 만든다.
+#[utoipa::path(post, path = "/telemetry/reset-id", tag = "settings",
+    responses((status = 200, body = Resource<SettingsSpec, SettingsStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn reset_telemetry_id(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+) -> Result<Json<Settings>, ApiError> {
+    state.authorize(&principal, Action::Write, SettingsSpec::KIND)?;
+    crate::cluster::require_current(&state.cluster)?;
+    let written = write_status(&state.cluster, |status| {
+        status.telemetry.get_or_insert_default().id = Some(Uuid::new_v4());
+    })
+    .await?;
+    tracing::info!("telemetry id reset");
+    Ok(Json(public(written)))
+}
+
+/// 설정 status를 읽어 `change`로 바꿔 쓴다. 설정이 아직 없으면 기본 spec으로 만든다. 읽은 뒤 다른
+/// 쪽이 썼으면(revision) 다시 읽어 바꾼다. 같은 값이면 쓰지 않는다. 돌려주는 설정은 구독 키를 담고 있다.
+pub(crate) async fn write_status(
+    cluster: &Cluster,
+    change: impl Fn(&mut SettingsStatus),
+) -> Result<Settings, ApiError> {
+    for _ in 0..10 {
+        let settings = current(cluster)?;
+        let mut status = settings.status.clone();
+        change(&mut status);
+        if status == settings.status {
+            return Ok(settings);
+        }
+        let written = if settings.revision == 0 {
+            let mut created = Resource::new(SETTINGS_NAME, settings.spec);
+            created.status = status;
+            match cluster.create(&created).await {
+                Ok(revision) => {
+                    created.revision = revision;
+                    return Ok(created);
+                }
+                Err(e) => e,
+            }
+        } else {
+            match cluster
+                .update_status_checked::<SettingsSpec>(settings.id, settings.revision, &status)
+                .await
+            {
+                Ok(_) => return Ok(current(cluster)?),
+                Err(e) => e,
+            }
+        };
+        match written {
+            ClusterError::Rejected(Rejection::NameTaken { .. })
+            | ClusterError::Rejected(Rejection::RevisionMismatch { .. }) => continue,
+            e => return Err(e.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "busy",
+        "the settings kept changing while being updated; try again",
+    ))
 }
 
 /// 설정을 읽어 `change`로 바꿔 쓴다. 설정이 아직 없으면 만든다(`expected`는 0). `expected`가
