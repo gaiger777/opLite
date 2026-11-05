@@ -9941,6 +9941,7 @@ git commit -m "docs: 구독과 텔레메트리 — README 새 절 \"구독과 �
   - 시험을 다중 스레드 런타임으로 바꿨다. 보내기 시간 제한은 운영과 같은 30초, 기다리는 한도는 60초다.
   - 실패 뒤 다시 보낼 시각을 보내기를 시작한 때가 아니라 실패한 때부터 세도록 코드를 고쳤다. 보내기가 오래 걸리면 곧바로 다시 보내던 문제다.
   - 계획 문서도 같이 고쳤다.
+- **병합 뒤 main CI에서 고친 것:** 텔레메트리를 켤 때 spec 쓰기와 id 쓰기 사이에 리포터가 돌면, 자기 id로 첫 보고를 보내고 그 뒤 켜기의 id가 적혀 보고마다 id가 달랐다(macOS CI의 opld E2E가 잡음). 리포터는 id가 없으면 보내기 전에 먼저 적고 적힌 값을 쓴다(`fix/telemetry-report-id`). 같은 실행의 linux-kvm 실패는 microceph 준비 시간 초과로 무관했다.
 - **불안정한 시험(부하 때, 다시 돌리면 통과):**
   - opl-api `updates.rs` a_failed_upgrade_fails_the_task_with_the_last_log_lines
   - opld `cluster.rs`의 두 시험("API did not start")

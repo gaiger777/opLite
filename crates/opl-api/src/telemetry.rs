@@ -330,8 +330,29 @@ async fn tick(state: &AppState, config: &TelemetryConfig, memory: &mut Memory) {
     if !due(now, status.last_sent_at, memory, config.interval) {
         return;
     }
-    // id는 켤 때 만들지만, 없으면 여기서 만들어 보고와 함께 적는다.
-    let id = status.id.unwrap_or_else(Uuid::new_v4);
+    // id는 켤 때 따로 적으므로 그 사이에는 아직 없을 수 있다. 그때는 먼저 적고 적힌 값을 쓴다 —
+    // 켜는 쪽도 이미 있는 id는 두므로 보고마다 id가 같다.
+    let id = match status.id {
+        Some(id) => id,
+        None => {
+            let written = crate::settings::write_status(cluster, |status| {
+                status
+                    .telemetry
+                    .get_or_insert_default()
+                    .id
+                    .get_or_insert_with(Uuid::new_v4);
+            })
+            .await;
+            match written.map(|s| s.status.telemetry.and_then(|t| t.id)) {
+                Ok(Some(id)) => id,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!(error = %e.message, "cannot record the telemetry id");
+                    return;
+                }
+            }
+        }
+    };
     let report = match build_report(cluster, id, now).await {
         Ok(report) => report,
         Err(e) => {
@@ -354,7 +375,6 @@ async fn tick(state: &AppState, config: &TelemetryConfig, memory: &mut Memory) {
     }
     let written = crate::settings::write_status(cluster, |status| {
         let telemetry = status.telemetry.get_or_insert_default();
-        telemetry.id.get_or_insert(id);
         match &error {
             None => {
                 telemetry.last_sent_at = Some(now);
