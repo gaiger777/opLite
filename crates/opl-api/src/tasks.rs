@@ -565,7 +565,8 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
 }
 
 /// Task를 실행한다. 줄(`queue`)이 있으면 그 줄의 앞 Task가 끝난 뒤에 시작한다.
-/// `interrupted`면 이전 opld가 실행하다 멈춘 Task이므로 실패로 기록한다.
+/// `interrupted`면 이전 opld가 실행하다 멈춘 Task이므로 실패로 기록한다. 업그레이드 Task는 opld 밖의
+/// 유닛에서 돌고 opld를 다시 시작하게 하므로 실패로 기록하지 않고 그 유닛을 이어서 지켜본다.
 fn start(
     ctx: &Arc<Ctx>,
     started: &mut HashSet<Uuid>,
@@ -583,11 +584,11 @@ fn start(
         if let Some(previous) = previous {
             let _ = previous.await;
         }
-        if interrupted {
+        if interrupted && task.spec.op != TaskOp::NodeUpgrade {
             let error = "interrupted: opld restarted while the task was running".to_string();
             fail(&ctx, &task, error, true).await;
         } else {
-            execute(&ctx, task).await;
+            execute(&ctx, task, interrupted).await;
         }
     });
     running.insert(id, handle.abort_handle());
@@ -596,24 +597,27 @@ fn start(
     }
 }
 
-async fn execute(ctx: &Ctx, task: Task) {
+/// `resume`이면 이전 opld가 실행하던 Task를 이어서 한다(업그레이드만).
+async fn execute(ctx: &Ctx, task: Task, resume: bool) {
     if !begin(ctx, task.id).await {
         return;
     }
     // 시간을 넘겨 버린 작업은 끝나지 않았다(명령이 아직 돌 수 있다). 마이그레이션은 단계마다
     // 시간 제한이 있고(`migration_timeout`, RPC 기한), 확정 쓰기 도중에 버리면 안 되므로 감싸지 않는다.
     // 백업과 복원, VM 가져오기는 디스크 크기만큼 오래 걸릴 수 있으므로 시간 제한을 두지 않는다(설계 §2.3).
+    // 업그레이드도 오래 걸릴 수 있고 apt를 중간에 끊으면 더 나쁘다.
     let unlimited = matches!(
         task.spec.op,
         TaskOp::VmMigrate { .. }
             | TaskOp::VmBackup { .. }
             | TaskOp::BackupRestore { .. }
             | TaskOp::VmImport { .. }
+            | TaskOp::NodeUpgrade
     );
     let (result, unfinished) = if unlimited {
-        (perform(ctx, &task).await, false)
+        (perform(ctx, &task, resume).await, false)
     } else {
-        match tokio::time::timeout(ctx.config.timeout, perform(ctx, &task)).await {
+        match tokio::time::timeout(ctx.config.timeout, perform(ctx, &task, resume)).await {
             Ok(r) => (r, false),
             Err(_) => (
                 Err(format!("timed out after {:?}", ctx.config.timeout)),
@@ -738,7 +742,7 @@ async fn set_status(ctx: &Ctx, id: Uuid, state: TaskState, error: Option<String>
     }
 }
 
-async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
+async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<(), String> {
     let id = task.spec.target;
     match &task.spec.op {
         TaskOp::VmStart => wait_vm(ctx, id, started).await,
@@ -775,6 +779,14 @@ async fn perform(ctx: &Ctx, task: &Task) -> Result<(), String> {
         TaskOp::VmImportDelete => import::delete(ctx, id).await,
         TaskOp::NodeUpdateCheck => match &ctx.config.updates {
             Some(updates) => updates.refresh_waiting(&ctx.cluster, ctx.config.node).await,
+            None => Err("updates are not enabled on this node".into()),
+        },
+        TaskOp::NodeUpgrade => match &ctx.config.updates {
+            Some(updates) => {
+                updates
+                    .upgrade(&ctx.cluster, ctx.config.node, task.id, resume)
+                    .await
+            }
             None => Err("updates are not enabled on this node".into()),
         },
     }

@@ -335,9 +335,33 @@ export interface paths {
          * 노드의 업데이트를 다시 확인할 Task(`node-update-check`, 그 노드에서 돈다)를 돌려준다(202). 결과는
          *     Node `status.updates`에 쓴다. 그 노드에 끝나지 않은 확인 Task가 있으면 새로 만들지 않고 그것을
          *     돌려준다. 업데이트를 확인하지 않는 노드면 400 `updates_unsupported`, 오프라인이면 409 `node_offline`,
-         *     옛 노드가 남았으면 409 `cluster_upgrading`(옛 노드는 이 Task 종류를 풀지 못한다).
+         *     옛 노드가 남았으면 409 `cluster_upgrading`(옛 노드는 이 Task 종류를 풀지 못한다), 그 노드를
+         *     업그레이드하는 중이면 409 `upgrade_in_progress`.
          */
         post: operations["refresh_updates"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{key}/upgrade": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드의 패키지를 올릴 Task(`node-upgrade`, 그 노드에서 돈다)를 돌려준다(202). apt는 opld 밖의 일시
+         *     유닛에서 돌므로 VM은 계속 돌고 opld만 잠깐 다시 시작한다. 업데이트를 확인하지 않는 노드면 400
+         *     `updates_unsupported`, 오프라인이면 409 `node_offline`, 클러스터 어디든 끝나지 않은 업그레이드가
+         *     있으면 409 `upgrade_in_progress`(한 번에 한 노드 — 나머지 노드가 과반수와 서비스를 지킨다), 옛 노드가
+         *     남았으면 409 `cluster_upgrading`.
+         */
+        post: operations["upgrade_node"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3244,6 +3268,9 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "node-update-check";
+        } | {
+            /** @enum {string} */
+            kind: "node-upgrade";
         };
         TaskSpec: {
             /**
@@ -4244,6 +4271,36 @@ export interface operations {
         };
     };
     refresh_updates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    upgrade_node: {
         parameters: {
             query?: never;
             header?: never;

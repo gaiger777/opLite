@@ -16,6 +16,7 @@ async fn openapi_document_is_served_without_login() {
         "/version",
         "/settings",
         "/nodes/{key}/updates/refresh",
+        "/nodes/{key}/upgrade",
         "/vms",
         "/vms/{key}",
         "/vms/{key}/actions/{action}",

@@ -10,7 +10,8 @@ use reqwest::Method;
 use serde_json::{Value, json};
 
 use crate::client::{
-    ApiError, BACKUP_WAIT, Client, IMPORT_WAIT, MIGRATE_WAIT, fetch_ca, fingerprint, local,
+    ApiError, BACKUP_WAIT, Client, IMPORT_WAIT, MIGRATE_WAIT, UPGRADE_WAIT, fetch_ca, fingerprint,
+    local,
 };
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
@@ -179,6 +180,38 @@ enum NodeCmd {
         #[arg(long)]
         refresh: bool,
     },
+    /// 노드의 패키지를 올린다(`apt-get dist-upgrade`). VM은 계속 돌고 opld가 잠깐 다시 시작한다. 한 번에
+    /// 한 노드만 한다.
+    Upgrade {
+        node: String,
+        /// 업그레이드 Task가 끝날 때까지 기다린다.
+        #[arg(long)]
+        wait: bool,
+    },
+}
+
+/// `node upgrade`: 업그레이드 Task를 만든다. `wait`이면 끝날 때까지 기다리고, 아니면 Task를 따라가는
+/// 방법을 알린다.
+async fn node_upgrade(
+    client: &Client,
+    node: &str,
+    wait: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let task = client
+        .post(&format!("/nodes/{node}/upgrade"), &json!({}))
+        .await?;
+    if wait {
+        client.wait_task_for(&task, UPGRADE_WAIT).await?;
+        writeln!(out, "node {node} upgraded")?;
+    } else {
+        let id = cell(&task["id"]);
+        writeln!(
+            out,
+            "upgrade of {node} started (task {id}); follow it with `oplctl task get {id}`"
+        )?;
+    }
+    Ok(())
 }
 
 /// `node updates`의 패키지 표 열
@@ -1671,6 +1704,7 @@ where
             NodeCmd::Updates { node, refresh } => {
                 node_updates(&client, &node, refresh, json_out, out).await?
             }
+            NodeCmd::Upgrade { node, wait } => node_upgrade(&client, &node, wait, out).await?,
         },
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::List => {
@@ -6251,6 +6285,51 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         )
         .unwrap();
         assert_eq!(shown["packages"], json!([]));
+    }
+
+    /// `node upgrade`는 업그레이드 Task를 만들고 따라가는 방법을 알린다. `--wait`이면 Task를 기다린다.
+    #[tokio::test]
+    async fn node_upgrade_starts_the_task() {
+        let (client, seen) = fake_api(|path| match path {
+            "/api/v1/nodes/n1/upgrade" => json!({ "id": "t1" }),
+            _ => json!({ "id": "t1", "status": { "state": "succeeded" } }),
+        })
+        .await;
+        let run = |args: &'static [&'static str]| {
+            let client = client.clone();
+            async move {
+                let Cmd::Node {
+                    cmd: NodeCmd::Upgrade { node, wait },
+                } = Cli::try_parse_from(args).unwrap().cmd
+                else {
+                    unreachable!()
+                };
+                let mut out = Vec::new();
+                node_upgrade(&client, &node, wait, &mut out).await.unwrap();
+                String::from_utf8(out).unwrap()
+            }
+        };
+
+        assert_eq!(
+            run(&["oplctl", "node", "upgrade", "n1"]).await,
+            "upgrade of n1 started (task t1); follow it with `oplctl task get t1`\n"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["POST /api/v1/nodes/n1/upgrade HTTP/1.1"]
+        );
+        seen.lock().unwrap().clear();
+        assert_eq!(
+            run(&["oplctl", "node", "upgrade", "n1", "--wait"]).await,
+            "node n1 upgraded\n"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "POST /api/v1/nodes/n1/upgrade HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1"
+            ]
+        );
     }
 
     /// `settings set`은 KEY=VALUE를 PATCH 본문으로 바꾼다. 모르는 키와 `=` 없는 인자는 거절한다.

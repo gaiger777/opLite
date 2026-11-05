@@ -101,6 +101,9 @@ pub enum TaskOp {
     VmImportDelete,
     /// 대상 노드(Task의 `node`와 같다)의 APT 업데이트를 확인해 Node `status.updates`에 쓴다.
     NodeUpdateCheck,
+    /// 대상 노드(Task의 `node`와 같다)의 패키지를 `apt-get dist-upgrade`로 올린다. opld 밖의 일시
+    /// systemd 유닛에서 돌므로 opld가 다시 시작해도 이어서 지켜본다.
+    NodeUpgrade,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -329,6 +332,16 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<TaskOp>(json).unwrap(),
             TaskOp::NodeUpdateCheck
+        );
+    }
+
+    #[test]
+    fn node_upgrade_op_is_tagged_by_kind() {
+        let json = serde_json::json!({ "kind": "node-upgrade" });
+        assert_eq!(serde_json::to_value(TaskOp::NodeUpgrade).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<TaskOp>(json).unwrap(),
+            TaskOp::NodeUpgrade
         );
     }
 

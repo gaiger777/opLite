@@ -1,8 +1,15 @@
-//! 시험용 가짜 `apt-get`. 임시 디렉터리에 셸 스크립트를 두고 상태를 파일로 흉내 낸다:
+//! 시험용 가짜 `apt-get`·`systemd-run`·`systemctl`·`dpkg`. 임시 디렉터리에 셸 스크립트를 두고 상태를
+//! 파일로 흉내 낸다:
 //!
-//! - 부를 때마다 `LANG=<값> <인자…>` 한 줄을 `apt-get.calls`에 더한다.
-//! - 인자에 `-s`가 있으면 `simulate.txt`를 출력한다.
-//! - `update`면 `update.stderr`(있으면)를 표준 오류로 내고 `update.exit`(없으면 0)로 끝난다.
+//! - `apt-get`: 부를 때마다 `LANG=<값> <인자…>` 한 줄을 `apt-get.calls`에 더한다. 인자에 `-s`가
+//!   있으면 `simulate.txt`를 출력한다. `update`면 `update.stderr`(있으면)를 표준 오류로 내고
+//!   `update.exit`(없으면 0)로 끝난다.
+//! - `systemd-run`: 인자를 한 줄에 하나씩 `systemd-run.args`에 쓴다. `systemd-run.exit`가 있으면
+//!   `systemd-run.stderr`를 표준 오류로 내고 그 코드로 끝나고, 없으면 `unit.state`에 `active`를 쓴다.
+//!   명령은 돌리지 않는다.
+//! - `systemctl`: 인자를 `systemctl.calls`에 더하고 `unit.state`(`active`·`success`·`failed`, 없거나
+//!   `gone`이면 사라진 유닛)에 맞는 `ActiveState=`·`Result=`·`LoadState=` 줄을 출력한다.
+//! - `dpkg`: 인자를 `dpkg.calls`에 더하고 `audit.txt`(있으면)를 출력한다.
 //!
 //! ```ignore
 //! let apt = FakeApt::new();
@@ -33,6 +40,36 @@ fi
 exit 0
 "#;
 
+const SYSTEMD_RUN: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+: > "$d/systemd-run.args"
+for a; do printf '%s\n' "$a" >> "$d/systemd-run.args"; done
+if [ -f "$d/systemd-run.exit" ]; then
+    if [ -f "$d/systemd-run.stderr" ]; then cat "$d/systemd-run.stderr" >&2; fi
+    exit "$(cat "$d/systemd-run.exit")"
+fi
+echo active > "$d/unit.state"
+"#;
+
+const SYSTEMCTL: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+echo "$*" >> "$d/systemctl.calls"
+state=gone
+if [ -f "$d/unit.state" ]; then state=$(cat "$d/unit.state"); fi
+case $state in
+active) printf 'ActiveState=active\nResult=success\nLoadState=loaded\n' ;;
+success) printf 'ActiveState=inactive\nResult=success\nLoadState=loaded\n' ;;
+failed) printf 'ActiveState=failed\nResult=exit-code\nLoadState=loaded\n' ;;
+*) printf 'ActiveState=inactive\nResult=\nLoadState=not-found\n' ;;
+esac
+"#;
+
+const DPKG: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+echo "$*" >> "$d/dpkg.calls"
+if [ -f "$d/audit.txt" ]; then cat "$d/audit.txt"; fi
+"#;
+
 pub struct FakeApt {
     pub dir: TempDir,
 }
@@ -43,6 +80,9 @@ impl FakeApt {
             dir: TempDir::new().unwrap(),
         };
         write_script(&apt.path("apt-get"), APT_GET);
+        write_script(&apt.path("systemd-run"), SYSTEMD_RUN);
+        write_script(&apt.path("systemctl"), SYSTEMCTL);
+        write_script(&apt.path("dpkg"), DPKG);
         apt.set("simulate.txt", "");
         apt.set("keyring.gpg", "");
         apt
@@ -60,7 +100,12 @@ impl FakeApt {
 
     /// 가짜 `apt-get`이 받은 호출(`LANG=<값> <인자…>`)
     pub fn calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.path("apt-get.calls"))
+        self.lines("apt-get.calls")
+    }
+
+    /// 파일의 줄(없으면 빈 목록). `systemd-run.args`, `systemctl.calls`, `dpkg.calls` 등
+    pub fn lines(&self, name: &str) -> Vec<String> {
+        std::fs::read_to_string(self.path(name))
             .unwrap_or_default()
             .lines()
             .map(String::from)
