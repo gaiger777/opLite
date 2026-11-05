@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 개발 초기 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO)
+- 상태: 개발 초기 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트)
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -137,6 +137,135 @@ VM의 QEMU는 VM마다 자기 scope에 있어 opld가 멈추거나 다시 시작
 - amd64만 있다(ISO와 패키지).
 - 루트 파일 시스템은 LVM 하나다. ZFS 루트와 소프트웨어 RAID 설치 선택지는 없다.
 - 설치 화면에서 클러스터를 만들거나 합류하지 않는다(설치한 뒤 위 명령으로).
+
+## 업데이트
+
+패키지로 설치한 노드는 opLite APT 저장소에서 업데이트를 확인하고, 관리자가 노드를 **하나씩** 업그레이드한다.
+클러스터 설정의 **채널**(`stable`·`testing`)이 어느 저장소 구성 요소를 따를지 정한다.
+
+```bash
+oplctl settings get                              # updates.channel: stable
+oplctl settings set updates.channel=testing      # admin. 모든 노드의 소스 파일이 바뀐다
+oplctl node list                                 # VERSION 열(ADDRESS 다음)
+oplctl node updates node1                        # 마지막 확인 시각, PACKAGE CURRENT CANDIDATE 표, 확인 실패 이유
+oplctl node updates node1 --refresh              # 지금 다시 확인하고(작업을 기다린다) 결과를 보인다
+oplctl node upgrade node1                        # upgrade of node1 started (task …); follow it with `oplctl task get …`
+oplctl node upgrade node1 --wait                 # 끝날 때까지 기다린다: "node node1 upgraded"
+oplctl cluster status                            # 버전이 섞여 있으면 경고
+```
+
+- **채널.** 설정은 클러스터에 하나뿐인 `Settings` 리소스(이름 `cluster`)다. `GET /api/v1/settings`는 로그인한 누구나,
+  `PATCH /api/v1/settings`(`{"updates":{"channel":"testing"}}`, 다른 패치 API처럼 `If-Match`를 받는다)는 admin만
+  한다. 한 번도 바꾸지 않았으면 기본값(`stable`)이다. 웹은 "설정" 화면(admin만 저장, 그 밖은 읽기만).
+- **소스 파일.** 저장소 주소는 opld 설정 `[updates] apt_url`이고, 비면 빌드할 때 넣은 `OPL_APT_URL`이다. 둘 다 비면
+  opld는 소스 파일을 쓰지 않는다(관리자가 apt 소스를 직접 둔다). 주소가 있으면 opld가 시작할 때와 채널이 바뀔 때
+  `/etc/apt/sources.list.d/oplite.sources`를 쓴다:
+
+  ```
+  # managed by opld; edits are overwritten
+  Types: deb
+  URIs: https://apt.example.com/oplite
+  Suites: trixie
+  Components: stable
+  Signed-By: /usr/share/keyrings/oplite-archive-keyring.gpg
+  ```
+
+  첫 줄의 표시가 없는 파일은 opld가 건드리지 않고 로그에 경고만 남긴다(비었거나 공백뿐인 파일은 opld 것으로 본다).
+  소스를 직접 관리하려면 첫 줄을 지운다. 저장소 공개 키(`Signed-By`의 키링)가 없으면 apt가 저장소를 거절하므로
+  opld는 소스 파일을 쓰지 않고(경고) 자기가 쓴 파일은 지운다. 패키지를 지우면(`remove`·`purge`) postrm이 표시가
+  있는 소스 파일을 지운다.
+- **확인.** 노드마다 opld가 시작하고 1분 뒤, 그 뒤 24시간마다 `apt-get update -q`와 `apt-get -s -q dist-upgrade`
+  (설치하지 않고 흉내만)로 올릴 수 있는 패키지를 찾아 노드 상태(`node get`의 `status.updates`)에 쓴다. opLite만이
+  아니라 Debian 패키지(보안 업데이트 등)도 보인다. 500개까지 담고 넘으면 잘렸다고 표시한다. 다른 apt(무인 업그레이드
+  등)의 잠금은 `DPkg::Lock::Timeout=60`초까지 기다린다. 실패하면 이유(명령과 stderr 끝 5줄)를 남긴다. `--refresh`와
+  웹의 "다시 확인"은 그 노드에서 도는 작업 `node-update-check`다(admin. 끝나지 않은 확인이 있으면 새로 만들지 않고 그
+  작업을 돌려준다. 주기 확인이 도는 중이면 끝나기를 기다렸다가 확인하고, 그사이 업그레이드가 시작되면 확인하지 않고
+  끝난다). 채널을 바꿔 소스 파일이 바뀌면 다음 주기를 기다리지 않고 곧 확인한다. 업그레이드 중에는 주기 확인을
+  건너뛰고 다시 확인은 **409** `upgrade_in_progress`다(업그레이드가 apt 잠금을 잡고 있다).
+- **업그레이드.** `node upgrade`(admin)는 그 노드에서 작업 `node-upgrade`를 돌린다. 작업은 opld 밖의 systemd 유닛
+  `opl-upgrade-<작업 ID 32자(하이픈 없이)>`(`systemd-run`)에서 `apt-get update`와 `apt-get dist-upgrade`(바뀐 설정
+  파일은 지금 것을 둔다. 무인 업그레이드 같은 다른 apt의 잠금은 `DPkg::Lock::Timeout=600`초까지 기다린다)를 돌리고
+  유닛을 지켜본다. 로그는 `/var/log/opl/upgrade-<작업 ID>.log`이고 처음에 `opl-upgrade: start`, 끝에
+  `opl-upgrade: exit <코드>` 줄이 있다. opLite 패키지가 바뀌면 postinst가 opld를 다시 시작하고, 다시 시작한 opld가
+  같은 유닛을 이어 지켜본다. VM은 자기 scope에 있어 계속 돈다. 실패하면 작업 오류에 로그 끝 20줄이 있다. 유닛이
+  끝나고 치워졌으면 로그로 판단한다: 종료 줄이 있으면 그 코드, 시작 줄만 있으면(도중에 노드가 꺼짐) dpkg가 반쯤
+  설정된 채 남았을 때 "the upgrade was interrupted; run "dpkg --configure -a" on the node", 아니면 "the upgrade was
+  interrupted; start it again", 시작 줄도 없으면 이어 볼 때는 유닛을 지금 띄우고(apt는 다시 돌려도 된다) 아니면
+  "the upgrade did not start; try again"으로 실패한다. 업그레이드하는 동안 그 노드의 업데이트 확인은 쉰다. 시간 제한과
+  취소는 없다(apt를 중간에 끊으면 더 나쁘다). 끝나면(성공·실패 모두) 업데이트를 다시 확인하고, 새 버전은 다시 시작한
+  opld가 노드 상태에 쓴다.
+- **거절.** 클러스터 어디든 끝나지 않은 업그레이드가 있으면 **409** `upgrade_in_progress`(한 번에 한 노드. 다른
+  노드로 함께 온 두 요청이 모두 지나가도 나중에 시작한 작업이 "upgrade_in_progress: node "X" is being upgraded"로
+  실패한다), 오프라인 노드는 **409** `node_offline`, 업데이트를 확인하지 않는 노드(macOS, apt가 없는 노드, 위트니스)는
+  **400** `updates_unsupported`다. 버전을 적지 않은 옛 노드(계획 32 전의 opld)가 남아 있으면 설정 바꾸기·다시
+  확인·업그레이드는 **409** `cluster_upgrading`("some nodes run an older opLite (node2, node3); …")이다: 옛 노드는
+  모르는 리소스 종류와 작업 종류가 든 Raft 항목을 풀지 못한다. 그래서 계획 32 전 클러스터의 첫 업그레이드는 노드마다
+  손으로(`apt-get update && apt-get dist-upgrade`) 하고, 모든 노드가 버전을 적은 뒤부터 `node upgrade`를 쓴다.
+- **`--wait`.** 업그레이드하는 노드의 API에 로그인한 oplctl은 opld가 다시 시작할 때 연결 오류로 끝날 수 있다.
+  업그레이드는 계속된다. 다른 노드에 로그인해 두거나 `oplctl task get <ID>`로 다시 본다.
+- **합류.** 클러스터에서 가장 낮은 노드 버전보다 낮은 opld는 합류할 수 없다(**409** `version_too_old`: "this node runs
+  X; the cluster runs Y or newer; upgrade it first"). 버전을 보내지 않는 옛 opld도 버전을 적은 노드가 있는 클러스터에는
+  합류할 수 없다("this node runs an unknown version; …"). 새 노드는 먼저 클러스터와 같은 버전으로 올린다. 합류할 때
+  보낸 버전은 그 노드가 등록하기 전부터 노드 상태에 적힌다.
+
+**롤링 순서.** opLite는 노드를 자동으로 돌아가며 올리지 않고 노드를 다시 부팅하지도 않는다. 한 노드씩:
+
+1. `oplctl node updates <노드> --refresh`로 무엇이 바뀌는지 본다.
+2. 커널처럼 다시 부팅해야 하는 업데이트가 있으면 그 노드의 VM을 다른 노드로 옮기고(`vm migrate`) 웹에서 유지보수
+   모드로 둔다.
+3. `oplctl node upgrade <노드> --wait`(다른 노드에 로그인해서). 필요하면 노드를 다시 부팅하고 유지보수 모드를 끈다.
+4. `oplctl node list`에서 그 노드의 VERSION과 ONLINE을 확인하고 다음 노드로 간다.
+
+모든 노드가 같은 버전이 될 때까지 `cluster status`와 웹 대시보드에 "nodes run different opLite versions (…); finish
+the upgrade on every node" 경고가 보인다. 웹은 노드 표의 업데이트 배지(올릴 패키지 수, 확인 실패면 경고)를 누르면
+같은 정보와 "다시 확인"·"업그레이드" 버튼(admin)이 있는 대화상자를 연다. 로그인 화면 아래에 서버 버전
+(`GET /api/v1/version`, 인증 없음)이 보인다.
+
+설정(노드마다, 생략하면 아래 기본값):
+
+```toml
+[updates]
+# enabled = true                 # 없으면 apt_get이 있을 때(Debian) 켜진다. macOS는 꺼진다
+check_interval = "24h"           # 업데이트 확인 간격
+first_check = "1m"               # opld가 시작하고 첫 확인까지
+apt_url = ""                     # 비면 빌드 값 OPL_APT_URL. 그것도 비면 소스 파일을 쓰지 않는다
+sources_file = "/etc/apt/sources.list.d/oplite.sources"
+apt_get = "/usr/bin/apt-get"
+systemd_run = "/usr/bin/systemd-run"
+systemctl = "/usr/bin/systemctl"
+dpkg = "/usr/bin/dpkg"
+log_dir = "/var/log/opl"         # 업그레이드 로그
+poll = "2s"                      # 업그레이드 유닛을 다시 보는 간격
+```
+
+**저장소 만들기.** 저장소는 서명한 정적 파일 트리이고, 올릴 웹 서버는 opLite 밖이다. 패키지에는 저장소 주소와 서명
+공개 키를 빌드할 때 넣는다(키를 넣지 않은 패키지는 `Signed-By`의 키링이 없어 apt가 저장소를 거절한다).
+
+```bash
+# 서명 키(한 번). GPG 홈은 비밀 키를 둘 곳으로(GNUPGHOME).
+gpg --quick-generate-key 'opLite archive <apt@example.com>' ed25519 sign never
+KEY_ID=$(gpg --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+gpg --export "$KEY_ID" > oplite-archive-keyring.gpg
+# 패키지: 저장소 주소(바이너리에)와 공개 키(/usr/share/keyrings/oplite-archive-keyring.gpg)
+OPL_VERSION=0.2.0 OPL_APT_URL=https://apt.example.com/oplite \
+    cargo build --release -p opld --features web-ui -p oplctl
+OPL_APT_KEY=oplite-archive-keyring.gpg packaging/deb/build-deb.sh 0.2.0 dist
+# 저장소: 채널(stable|testing|enterprise)에 패키지를 더하고 색인을 다시 만들어 서명한다(apt-ftparchive, apt-utils)
+OPL_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo testing dist/oplite_0.2.0_amd64.deb
+# testing에서 확인한 뒤 같은 패키지를 stable에도
+OPL_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo stable dist/oplite_0.2.0_amd64.deb
+```
+
+레이아웃: `pool/<채널>/*.deb`, `dists/trixie/<채널>/binary-amd64/Packages(.gz)`, `dists/trixie/Release`
+(있는 모든 채널을 묶는다)와 서명 `InRelease`·`Release.gpg`. `repo/`를 `apt_url`이 가리키는 곳에 그대로 올린다.
+`build-repo.sh`는 고른 채널의 `Packages`만 다시 만들고 다른 채널은 그대로 둔다. pool의 옛 패키지는 지우지 않으므로
+옛 버전도 색인에 남는다(apt는 가장 새 버전을 고른다). 이미 올린 이름에 내용이 다른 deb는 거절한다("version already
+published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새 색인과 Release는 옆 디렉터리에서 만들어 두 서명이 다
+끝난 뒤에 옮기므로(`InRelease`가 마지막) 서명이 실패해도 저장소는 옛 색인 그대로다. 웹 서버에 올릴 때도 같은 순서로
+`pool/`과 `Packages`를 먼저, `Release`·`Release.gpg`를 다음, `InRelease`를 마지막에 올린다. `OPL_APT_KEY`는
+`gpg --export`의 바이너리 키링이어야 한다(armor면 `build-deb.sh`가 거절한다). Release에 `Valid-Until`은 넣지 않는다:
+넣으면 저장소를 주기적으로 다시 서명해야 하고, 그러지 못하면 모든 노드의 확인이 실패한다. `enterprise` 채널은
+계획 33(구독)이 쓴다.
 
 ## 실행 (Linux, KVM)
 
@@ -1434,6 +1563,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [네트워크·SDN 설계 (하위 프로젝트 6: 계획 25·26)](docs/superpowers/specs/2026-11-03-network-sdn-design.md)
 - [백업 설계 (하위 프로젝트 7: 계획 27·28)](docs/superpowers/specs/2026-11-04-backup-design.md)
 - [VMware 가져오기 설계 (하위 프로젝트 8: 계획 29·30)](docs/superpowers/specs/2026-11-04-vmware-import-design.md)
+- [설치·업데이트·구독 설계 (하위 프로젝트 9: 계획 31·32·33)](docs/superpowers/specs/2026-11-05-install-update-subscription-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)

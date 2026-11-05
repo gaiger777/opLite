@@ -106,7 +106,7 @@ preseed(`oplite.cfg`)는 질문을 줄이되 다음은 사람에게 묻는다: �
 - `opl_types::version::BUILD: &str` = `option_env!("OPL_VERSION")`, 없으면 `CARGO_PKG_VERSION`. opld·oplctl의 `--version`, API `GET /api/v1/version`(인증 없이, `{ "version": … }` — 로그인 화면과 oplctl이 서버 버전을 본다).
 - `NodeStatus.version: Option<String>`(옛 노드는 None, 빼고 쓴다). 노드가 등록·상태 갱신 때 `BUILD`를 쓴다.
 - `oplctl node list`에 `VERSION`, 웹 노드 표에 버전 열. 노드 버전이 둘 이상이면 웹 대시보드와 `oplctl cluster status`에 "nodes run different opLite versions (…); finish the upgrade on every node".
-- 합류: 합류 요청에 `version`을 넣는다. 받는 노드는 합류하는 노드의 버전이 클러스터에서 가장 오래된 노드보다 오래되었으면 409 `version_too_old`("this node runs X; the cluster runs Y or newer; upgrade it first"). 버전 비교는 Debian 버전 규칙(`~`가 가장 낮음)의 작은 구현(`opl_types::version::compare`)으로 한다. 버전이 없는 요청(옛 oplctl·opld)은 받는다.
+- 합류: 합류 요청에 `version`을 넣는다. 받는 노드는 합류하는 노드의 버전이 클러스터에서 가장 오래된 노드보다 오래되었으면 409 `version_too_old`("this node runs X; the cluster runs Y or newer; upgrade it first"). 버전 비교는 Debian 버전 규칙(`~`가 가장 낮음)의 작은 구현(`opl_types::version::compare`)으로 한다. 버전이 없는 요청(옛 opld)은 클러스터에 버전을 적은 노드가 하나도 없을 때만 받는다(구현에서 바꿈, §3.8).
 
 ### 3.2 클러스터 설정 `Settings`
 
@@ -165,6 +165,35 @@ log_dir = "/var/log/opl"
 - CI `package` 작업에 저장소 시험: 임시 GPG 키로 `build-repo.sh` → 컨테이너에서 `file://` 저장소와 `Signed-By`로 `apt-get install oplite`, 버전을 올린 두 번째 패키지를 `testing`에 넣고 소스를 `testing`으로 바꾸면 `apt-get -s dist-upgrade`가 그 버전을 보이는지(opld가 쓰는 해석 함수와 같은 줄 모양인지는 단위 시험의 견본으로).
 - `iso.yml`의 E2E는 버전 표시까지만(실제 업그레이드는 가짜 스크립트 시험으로).
 
+### 3.8 구현(계획 32)
+
+- 버전: `opl_types::version::{compare, SUITE, APT_URL}`. `compare`는 Debian 규칙(에포크, 업스트림, 마지막 `-` 뒤 리비전, `~` < 끝 < 문자 < 그 밖, 숫자는 앞 0을 무시한 수 비교)이고 이상한 문자열에도 패닉하지 않는다. `SUITE = "trixie"`, `APT_URL`은 빌드 때 `OPL_APT_URL`(없으면 ""). `GET /api/v1/version`(`opl_api::cluster::get_version`, 인증 없음) → `VersionInfo { version }`. `NodeStatus.version`은 `register_node`·`register_witness`가 `BUILD`로 쓴다(등록 때, 그리고 업데이트가 켜진 노드는 확인·`UpdateAgent` 시작 때도 — opld가 다시 시작하면 새 값). 합류를 받는 쪽도 Node를 만들거나 다시 쓸 때 요청의 `version`을 적어, 등록 전에도 버전 검사와 옛 노드 게이트가 그 노드를 센다. `GET /cluster`의 `MemberView.version`도 더했다(웹 대시보드 경고가 쓴다).
+- 합류: `JoinRequest.version`(`opld join::request`가 `BUILD`를 보냄). 토큰 검사 뒤(토큰을 쓰기 전), 이름 검사 앞에서 클러스터 노드(위트니스·오프라인 포함, 합류하는 노드 자신의 옛 기록은 뺌) 중 버전이 있는 가장 낮은 것과 비교한다. 설계와 다른 점: 버전을 보내지 않는 요청도 버전을 적은 노드가 있으면 409 `version_too_old`("this node runs an unknown version; the cluster runs Y or newer; upgrade it first")다. 옛 opld는 새 리소스·Task 종류가 든 Raft 항목을 풀지 못하기 때문이다(노드 코어 설계의 호환 규칙). 버전을 적은 노드가 없는 옛 클러스터는 받는다.
+- 옛 노드 게이트: 같은 이유로 버전을 적지 않은 노드가 하나라도 있으면 새 종류를 쓰는 `PATCH /settings`·`POST /nodes/{key}/updates/refresh`·`POST /nodes/{key}/upgrade`가 409 `cluster_upgrading`("some nodes run an older opLite (a, b); finish the upgrade on every node first" — 버전 없는 노드 이름을 이름 순으로)이다(`opl_api::cluster::require_upgraded`). 계획 32 전 클러스터의 첫 업그레이드는 노드마다 손으로 apt를 돌린다.
+- `Settings`(`opl_types::settings`, 이름은 언제나 `SETTINGS_NAME = "cluster"`): 리소스가 없으면 `GET`이 nil id·revision 0·기본 spec의 리소스 모양을 돌려준다(`opl_api::settings::current`, `UpdateAgent`도 이것으로 읽는다). 설계와 다른 점:
+  - `PATCH`는 JSON merge patch가 아니라 기존 Patch 관례다: `SettingsPatch { updates: Option<{ channel: Option<Channel> }> }`(`deny_unknown_fields`). `{}`는 400, `{"updates":{}}`는 쓰지 않고 200. 없으면 `create`, 있으면 `update_spec`. `If-Match`가 있으면 그 revision(없는 설정은 0)이 아니면 412(`If-Match: 0`으로 함께 만들다 진 요청도 409 `name_taken`이 아니라 412), 없으면 `RevisionMismatch`·`NameTaken`에 10번 다시 한 뒤 409 `busy`. 같은 값이면 쓰지 않는다.
+  - 감사 로그가 코드베이스에 없으므로 남기지 않는다.
+- `[updates]`(opld `UpdatesSection`): 설계의 키에 `first_check`(기본 "1m"), `dpkg`(`/usr/bin/dpkg`), `poll`(기본 "2s")을 더했다. `enabled`가 없으면 `apt_get`이 있을 때 켜진다. 꺼지면 `opl_api::UpdatesConfig`·`Updates`가 아예 없다(`TaskRunnerConfig.updates: None`). 같은 `Arc<Updates>`를 Task 실행기와 `UpdateAgent`가 쓴다. opld 전체 프로세스 시험의 데몬은 `enabled = false`다(Ubuntu CI 러너에 진짜 `apt-get`이 있다).
+- `NodeStatus.updates: Option<NodeUpdates { checked_at: Option<u64>(유닉스 초 — 다른 상태 시각과 같다), packages: [PackageUpdate { name, current: Option, candidate }], truncated, error }>`. 업데이트가 켜진 노드는 등록 때 `Some`(있던 결과는 `record_node`가 남김), 꺼진 노드·위트니스는 None이고 None이 `updates_unsupported`의 뜻이다. 쓰기는 노드 상태를 revision 확인하며 다시 쓴다.
+- `opl_api::updates`: `Updates::check`(`apt-get update -q` → `LANG=C apt-get -s -q dist-upgrade`의 `Inst` 줄 — 둘 다 `-o DPkg::Lock::Timeout=60`으로 다른 apt의 잠금을 60초까지 기다림, `[<cur>]`이 없으면 새 의존성으로 current None, 500개 넘으면 truncated; 실패는 명령과 stderr 끝 5줄; 명령은 `kill_on_drop`; 주기 확인은 잠금이 잡혀 있으면 기다리지 않고 "another update check is running", 다시 확인 Task는 잠금 줄에 서지 않고 `poll`마다 다시 해 보며, 이 노드의 업그레이드가 잠금을 잡고 있으면 확인하지 않고 성공한다 — 업그레이드가 끝날 때 확인한다), `sources_contents`·`write_sources`(`<파일>.dpkg-tmp`에 0644로 써서 `fsync` 뒤 바꿔 넣고 디렉터리도 `fsync`, 같으면 `Unchanged`, 관리 표시 없는 파일은 `Unmanaged`와 `warn!` — 비었거나 공백뿐인 파일은 관리하는 것으로 봄, 저장소 공개 키(`UpdatesConfig.keyring`, 기본 `/usr/share/keyrings/oplite-archive-keyring.gpg`)가 없으면 쓰지 않고 관리하던 파일은 지움), `UpdateAgent`(시작과 `Settings` watch 이벤트 때 소스 파일, `first_check` 뒤 처음·그 뒤 `check_interval`마다 확인, 채널이 바뀌어 소스 파일을 새로 썼으면 곧 확인, 이 노드의 `node-upgrade`가 끝나지 않았으면 건너뜀, 시작할 때와 확인할 때 이 노드 상태의 `version`·`updates`가 비었으면 되살림). 패키지의 postrm은 `remove`·`purge` 때 관리 표시가 있는 소스 파일을 지운다.
+- 다시 확인: 설계는 "그 노드로 전달"이지만 노드 사이 HTTP 전달 도우미가 없으므로 Task다. `POST /api/v1/nodes/{key}/updates/refresh` → `TaskOp::NodeUpdateCheck`(`node-update-check`, 대상·노드 = 그 노드), 202 Task. 거절 순서 403(admin만 — `Kind::Node` Write) → 404 → 400 `updates_unsupported` → 409 `node_offline` → 409 `cluster_upgrading` → 그 노드를 업그레이드하는 중이면 409 `upgrade_in_progress`. 그 노드에 끝나지 않은 확인이 있으면 그 Task를 돌려준다. 확인이 실패하면(결과에 `error`) Task도 실패한다.
+- 업그레이드: `TaskOp::NodeUpgrade`(`node-upgrade`)는 설계의 `{ node }` 필드 없이 Task의 대상·노드가 그 노드다. `POST /api/v1/nodes/{key}/upgrade`(`updates::upgrade_node`) 거절 순서 403 → 404 → 400 → 409 `node_offline` → 409 `cluster_upgrading` → 409 `upgrade_in_progress`("node "X" is still being upgraded; upgrade one node at a time"). 검사와 만들기는 프로세스 안 잠금으로 감싸고, 다른 노드로 함께 온 요청은 실행기가 막는다: running을 쓴 뒤 다른 running `node-upgrade`가 보이면 "upgrade_in_progress: node "X" is being upgraded"로 실패(running 쓰기는 Raft 순서로 적용되므로 둘 다 지나가지 않는다). 실행(`Updates::upgrade(cluster, node, task, resume)`)은 확인 잠금을 잡고(apt 잠금을 다투지 않게, 끝난 뒤의 확인까지 잡은 채) `log_dir`를 만들고 `systemd-run --unit=opl-upgrade-<task id 32자 simple> --collect --property=Type=exec --property=StandardOutput=append:<log> --property=StandardError=append:<log> --setenv=DEBIAN_FRONTEND=noninteractive --setenv=LANG=C /bin/sh -c 'echo "opl-upgrade: start"; … update -q -o DPkg::Lock::Timeout=600 && … -y -q -o DPkg::Lock::Timeout=600 … dist-upgrade; s=$?; echo "opl-upgrade: exit $s"; exit $s'`. 설계와 다른 점:
+  - 명령 처음에 시작 줄, 끝에 종료 상태 줄을 남겨, 유닛이 사라졌을 때(`ActiveState=inactive`이고 `Result`가 비었거나 `LoadState=not-found`) 로그로 판단한다: 시작·종료 줄이 있으면 그 코드, 시작 줄만 있으면 `dpkg --audit`가 무언가 알리면 "the upgrade was interrupted; run "dpkg --configure -a" on the node", 비었으면 "the upgrade was interrupted; start it again"(설계의 "audit가 비면 성공"은 끊긴 apt를 성공으로 보므로 바꿈), 시작 줄이 없으면 이어 볼 때는 유닛을 지금 띄우고 아니면 "the upgrade did not start; try again".
+  - `systemctl show`는 `-p LoadState`도 묻고, `systemctl` 자체가 실패하면 다음 `poll`에 다시 본다.
+  - 실행기 첫 패스(`resume = true`)에서 running인 `node-upgrade`는 실패로 정리하지 않고 task id로 유닛 이름을 다시 만들어 이어 본다. 시간 제한 없음(`unlimited`), 취소 없음. 끝나면 성공·실패 모두 잠금을 잡은 채 확인을 한 번 한다.
+- 저장소(`packaging/repo/build-repo.sh`): 설계에 더해 채널을 `stable|testing|enterprise`만 받고(그 밖은 종료 2), Release에 `Origin`·`Label: opLite`, `Components`는 `Packages`가 있는 채널만 고정 순서(stable testing enterprise), `Release.gpg`는 armor다. pool의 옛 패키지를 지우지 않으므로 옛 버전도 그 채널 `Packages`에 남는다. 이미 올린 이름에 내용이 다른 deb는 "version already published"로 거절(같으면 넘어감)하고, 새 색인·Release는 `dists/.trixie.new`에서 만들어 두 서명이 끝난 뒤 옮긴다(`InRelease`가 마지막). 도구 경로는 `APT_FTPARCHIVE`·`GPG`(시험용). `build-deb.sh`는 `OPL_APT_KEY` 파일을 `/usr/share/keyrings/oplite-archive-keyring.gpg`(0644)로 싣고, 없는 파일이면 1, armor 키면 "OPL_APT_KEY must be a binary keyring (gpg --export, not --armor)"로 1. CI의 패키지는 키링·`OPL_APT_URL` 없이 만든다.
+- oplctl: `node list`의 `VERSION`(ADDRESS 다음), `cluster status` 끝의 혼합 버전 경고(버전 순, 중복 없이, 버전 모르는 멤버 제외), `settings get|set`(`-o json`이면 리소스, 키는 `updates.channel`만), `node updates <node> [--refresh]`(`checked:`·`error:`·표·`no updates available`·잘림 줄, 꺼진 노드는 "node X does not check for updates"), `node upgrade <node> [--wait]`(기다림은 24시간까지).
+- 웹: 설계의 노드 상세 "업데이트" 탭 대신(노드 상세 페이지가 없다) 노드 표의 버전 열·업데이트 배지와 `NodeUpdatesDialog`(배지는 누구나 읽기 전용으로 열고, 행 메뉴 "업데이트…"·다시 확인·업그레이드는 admin). `/settings`(`SettingsPage`, `If-Match` PATCH), 로그인 화면 아래 서버 버전, 대시보드 혼합 버전 경고, watch 종류 `settings`(목록 캐시가 아니라 `useSettings()` 캐시), Task 라벨, 오류 문구.
+- 시험: opl-types 단위(비교 표, 설정 직렬화, 노드 상태), opl-api `tests/cluster.rs`(버전 API, 합류 거절), `tests/settings.rs`, `tests/updates.rs`(가짜 `apt-get`·`systemd-run`·`systemctl`·`dpkg` — `tests/common/fake_apt.rs` `FakeApt`, `unit.state`가 active·success·failed·gone; 확인·실패·꺼진 노드·같은 Task, 채널을 바꾸면 소스 파일, 업그레이드 인자·성공·실패·한 번에 하나·이어 보기·사라짐과 audit), `parse_simulate`의 실제 Debian 13 출력 견본, oplctl `fake_api`, 웹 vitest, 셸 `build-repo-test.sh`(macOS, 가짜 도구)와 `repo-test.sh`(CI `package`의 Debian 13 컨테이너: 임시 키, stable·testing, `gpgv`, `file://`+`Signed-By` 설치, testing으로 바꾸면 `Inst oplite [<v>] (<v>+1 `). `iso.yml`은 설치한 노드의 `oplctl node list` VERSION과 `status.version`이 빌드 버전(`OPL_VERSION`)인지 본다.
+- 알려진 틈:
+  - 업그레이드는 opld를 다시 시작할 뿐 노드를 다시 부팅하지 않는다. 커널 업데이트 뒤 부팅과 VM 비우기는 관리자의 일이다.
+  - 업그레이드하는 노드에 붙은 oplctl `--wait`·웹은 opld가 다시 시작할 때 연결이 끊길 수 있다(업그레이드는 계속).
+  - 업데이트 확인은 Debian 패키지 전체를 보이고, `testing`에서 `stable`로 돌아가도 이미 올린 버전을 내리지 않는다.
+  - 업그레이드 로그(`/var/log/opl/upgrade-*.log`)는 지우지 않는다.
+  - 이 필드를 모르는 옛 opld가 리더이면 노드 상태를 다시 쓰며 `version`·`updates`를 지울 수 있다. 업데이트가 켜진 노드는 `UpdateAgent`가 시작·확인 때 되살리지만, 꺼진 노드(macOS, 위트니스)는 opld가 다시 시작할 때까지 버전이 비어 보일 수 있다. 그동안 버전이 빈 노드 때문에 `cluster_upgrading` 게이트가 닫힌다(설정 바꾸기·다시 확인·업그레이드가 409).
+  - 저장소 Release에 `Valid-Until`을 넣지 않는다(의도). 넣으면 운영자가 주기적으로 다시 서명해야 하고, 놓치면 모든 노드의 확인이 실패한다. 대신 오래된 서명 색인을 다시 내미는 공격(freeze)은 막지 못한다.
+  - 저장소를 웹 서버에 올릴 때는 `pool/`·`Packages`를 먼저, `Release`·`Release.gpg` 다음, `InRelease`를 마지막에 올려야 apt가 반쯤 올린 저장소를 읽지 않는다(`build-repo.sh`는 로컬 디렉터리에서 이 순서로 바꿔 넣는다).
+
 ## 4. 구독과 텔레메트리 (계획 33)
 
 ### 4.1 구독 키
@@ -211,7 +240,8 @@ log_dir = "/var/log/opl"
 |---|---|---|
 | `version_too_old` | 409 | 클러스터보다 오래된 노드의 합류 |
 | `updates_unsupported` | 400 | 업데이트가 꺼진 노드(macOS, apt 없음)의 확인·업그레이드 |
-| `upgrade_in_progress` | 409 | 다른 노드 업그레이드가 끝나지 않음 |
+| `upgrade_in_progress` | 409 | 다른 노드 업그레이드가 끝나지 않음(그 노드를 업그레이드하는 중의 다시 확인도) |
+| `cluster_upgrading` | 409 | 버전을 적지 않은 옛 노드가 남은 클러스터에서 설정 바꾸기·다시 확인·업그레이드(계획 32 구현에서 더함) |
 | `subscription_required` | 400 | 구독 없이 enterprise 채널 |
 | `invalid_subscription_key` | 400 | 형식·서명·만료 |
 | `telemetry_endpoint_required` | 400 | 끝점 없이 텔레메트리 켜기 |

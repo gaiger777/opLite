@@ -1,7 +1,7 @@
 name: ISO
 
 # 설치 ISO E2E: 패키지 → netinst(debian.lock) → build-iso.sh --unattended → KVM으로 무인 설치 →
-# 디스크로 부팅 → 첫 부팅 cluster init 출력(직렬 콘솔)으로 oplctl login·node list·node get.
+# 디스크로 부팅 → 첫 부팅 cluster init 출력(직렬 콘솔)으로 oplctl login·node list(VERSION이 빌드 버전)·node get.
 # BIOS(isolinux 메뉴)와 UEFI(OVMF, grub 메뉴) 두 경로를 따로 돌린다.
 # 오래 걸리므로(설치에 미러가 필요하다) PR마다 돌리지 않는다.
 on:
@@ -194,6 +194,14 @@ jobs:
             sleep 5
           done
           $oplctl node list
+          # 설치한 노드의 VERSION 열이 이 빌드의 버전(build-deb가 남긴 OPL_VERSION)인지 본다.
+          $oplctl node list | awk -v want="$OPL_VERSION" '
+            NR == 1 { for (i = 1; i <= NF; i++) if ($i == "VERSION") col = i; next }
+            $1 == "opl-ci" { found = 1; got = col ? $col : "" }
+            END {
+              if (!found || got != want) { print "opl-ci VERSION: \"" got "\", 기대: \"" want "\"" > "/dev/stderr"; exit 1 }
+            }'
+          $oplctl node get opl-ci | jq -e --arg v "$OPL_VERSION" '.status.version == $v'
           $oplctl node get opl-ci | jq -e '.status.bridges[] | select(.name == "vmbr0")'
           $oplctl network list
       - name: Stop the node
