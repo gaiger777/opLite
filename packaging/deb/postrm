@@ -1,9 +1,12 @@
 #!/bin/sh
 # oplite postrm. /var/lib/opl(Raft 데이터, 풀, 볼륨)과 /etc/opl은 purge여도 지우지 않는다.
+# opld가 쓴 APT 소스 파일(첫 줄이 관리 표시)은 지운다: 함께 지워진 저장소 공개 키를 가리켜 apt-get
+# update가 실패한다. 관리자가 직접 쓴 파일은 남긴다.
 set -eu
 
 SYSTEMD_DIR="${OPL_SYSTEMD_DIR:-/run/systemd/system}"
 SYSTEMD_ETC="${OPL_SYSTEMD_ETC:-/etc/systemd/system}"
+APT_SOURCES="${OPL_APT_SOURCES:-/etc/apt/sources.list.d/oplite.sources}"
 
 case "$1" in
 remove | purge)
@@ -12,6 +15,9 @@ remove | purge)
 		systemctl disable opld.service || true
 		# systemctl이 없거나 실패해도 링크가 남지 않게 한다.
 		rm -f "$SYSTEMD_ETC/multi-user.target.wants/opld.service"
+	fi
+	if [ -f "$APT_SOURCES" ] && [ "$(head -n 1 "$APT_SOURCES")" = "# managed by opld; edits are overwritten" ]; then
+		rm -f "$APT_SOURCES"
 	fi
 	if [ -d "$SYSTEMD_DIR" ]; then
 		systemctl daemon-reload || true

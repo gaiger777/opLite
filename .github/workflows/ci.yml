@@ -71,7 +71,8 @@ jobs:
       - run: pnpm audit --prod
       - run: pnpm build
 
-  # 패키징 셸 스크립트: shellcheck, build-deb.sh 버전 확인 시험, maintainer 스크립트 시험(가짜 systemctl)
+  # 패키징 셸 스크립트: shellcheck, build-deb.sh 버전 확인·키링 시험, build-repo.sh 시험(가짜 apt-ftparchive·gpg),
+  # maintainer 스크립트 시험(가짜 systemctl)
   shell:
     runs-on: ubuntu-latest
     steps:
@@ -81,6 +82,7 @@ jobs:
           shopt -s globstar
           shellcheck packaging/**/*.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm
       - run: bash packaging/tests/build-deb-test.sh
+      - run: bash packaging/tests/build-repo-test.sh
       - run: bash packaging/tests/maint-test.sh
       - run: bash packaging/tests/setup-test.sh
       # 설치 프로그램 환경(busybox sh·awk)에서 oplite-setup.sh 함수가 같은 결과를 내는지
@@ -91,7 +93,8 @@ jobs:
           OPL_SH="busybox sh" OPL_AWK="busybox awk" bash packaging/tests/setup-test.sh
       - run: bash packaging/tests/iso-test.sh
 
-  # Debian 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh(.github/actions/build-deb) → Debian 13 컨테이너에서 설치 시험
+  # Debian 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh(.github/actions/build-deb) → Debian 13 컨테이너에서 설치 시험,
+  # build-repo.sh로 만든 APT 저장소에서 설치하고 testing 채널의 새 버전을 보는 시험
   package:
     runs-on: ubuntu-latest
     steps:
@@ -110,6 +113,12 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/work" debian:13 \
             bash /work/packaging/tests/deb-test.sh "/work/$DEB"
+      - name: APT repository test in Debian 13
+        env:
+          DEB: ${{ steps.build.outputs.deb }}
+        run: |
+          docker run --rm -v "$PWD:/work" debian:13 \
+            bash /work/packaging/tests/repo-test.sh "/work/$DEB"
       # 빌드 버전 시험을 OPL_VERSION을 준 빌드로 다시 돌린다(clap 기본 version으로 되돌리면 실패한다).
       - name: Version tests with OPL_VERSION
         run: OPL_VERSION=9.9.9~t cargo test -p opl-types -p opld -p oplctl --lib --test version

@@ -4,6 +4,8 @@
 # 바이너리는 OPL_VERSION=<version>으로 빌드해 둔다(--version이 그 버전이 아니면 실패한다):
 #   pnpm -C web build && OPL_VERSION=<version> cargo build --release -p opld --features web-ui -p oplctl
 # 바이너리 위치는 기본 target/release이고 OPL_BIN_DIR로 바꾼다.
+# OPL_APT_KEY(APT 저장소 공개 키 파일, armor가 아닌 gpg --export)가 있으면
+# /usr/share/keyrings/oplite-archive-keyring.gpg로 싣는다.
 set -eu
 # 만드는 파일·디렉터리 권한이 호출한 셸의 umask에 휘둘리지 않게 한다.
 umask 022
@@ -36,6 +38,17 @@ for bin in opld oplctl; do
 	fi
 done
 
+APT_KEY=${OPL_APT_KEY:-}
+if [ -n "$APT_KEY" ] && [ ! -f "$APT_KEY" ]; then
+	echo "build-deb: OPL_APT_KEY의 $APT_KEY 이 없다" >&2
+	exit 1
+fi
+# apt의 Signed-By는 .gpg 확장자의 armor 키를 읽지 못한다.
+if [ -n "$APT_KEY" ] && head -n 1 "$APT_KEY" | grep -q '^-----BEGIN PGP'; then
+	echo "build-deb: OPL_APT_KEY must be a binary keyring (gpg --export, not --armor)" >&2
+	exit 1
+fi
+
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 # mktemp -d는 0700이다. 패키지 루트(/)의 권한이 되므로 0755로 한다.
@@ -48,6 +61,11 @@ install -m 0755 "$BIN_DIR/opld" "$BIN_DIR/oplctl" "$STAGE/usr/bin/"
 install -m 0644 "$DEB_DIR/opld.service" "$STAGE/usr/lib/systemd/system/opld.service"
 install -m 0644 "$DEB_DIR/opld.toml.example" "$STAGE/usr/share/oplite/opld.toml.example"
 install -m 0644 "$DEB_DIR/copyright" "$STAGE/usr/share/doc/oplite/copyright"
+# 저장소 공개 키: opld가 쓰는 소스 파일의 Signed-By
+if [ -n "$APT_KEY" ]; then
+	mkdir -p "$STAGE/usr/share/keyrings"
+	install -m 0644 "$APT_KEY" "$STAGE/usr/share/keyrings/oplite-archive-keyring.gpg"
+fi
 
 # DEBIAN: control과 maintainer 스크립트. Installed-Size(KiB)는 DEBIAN을 넣기 전에 잰다.
 INSTALLED_SIZE=$(du -sk "$STAGE" | cut -f1)

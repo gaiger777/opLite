@@ -49,11 +49,14 @@ grep -qx 'ConditionPathExists=/etc/opl/opld.toml' "$UNIT" || fail "ConditionPath
 # systemd가 돌지 않아도 postinst가 enable 링크를 만든다.
 [ -L /etc/systemd/system/multi-user.target.wants/opld.service ] || fail "enable 링크 없음"
 
-# purge: enable 링크는 지우고, 데이터(/var/lib/opl)와 설정(/etc/opl)은 남긴다.
+# purge: enable 링크와 opld가 쓴 APT 소스 파일은 지우고, 데이터(/var/lib/opl)와 설정(/etc/opl)은 남긴다.
 mkdir -p /var/lib/opl /etc/opl
 echo keep >/var/lib/opl/deb-test.marker
 echo keep >/etc/opl/deb-test.marker
+SOURCES=/etc/apt/sources.list.d/oplite.sources
+printf '# managed by opld; edits are overwritten\nTypes: deb\n' >"$SOURCES"
 dpkg --purge oplite
+[ ! -e "$SOURCES" ] || fail "purge 뒤 opld가 쓴 소스 파일이 남음"
 LINK=/etc/systemd/system/multi-user.target.wants/opld.service
 if [ -e "$LINK" ] || [ -L "$LINK" ]; then fail "purge 뒤 enable 링크가 남음"; fi
 [ -f /var/lib/opl/deb-test.marker ] || fail "purge가 /var/lib/opl을 지웠다"

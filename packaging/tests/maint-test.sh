@@ -30,9 +30,9 @@ check() {
 	else
 		systemd_dir="$WORK/no-systemd"
 	fi
-	# OPL_SYSTEMD_ETC: postrm purge가 지우는 enable 링크가 시험 디렉터리 안에 있게 한다.
+	# OPL_SYSTEMD_ETC·OPL_APT_SOURCES: postrm이 지우는 enable 링크와 소스 파일이 시험 디렉터리 안에 있게 한다.
 	if ! PATH="$WORK/bin:$PATH" OPL_FAKE_LOG="$log" OPL_SYSTEMD_DIR="$systemd_dir" \
-		OPL_SYSTEMD_ETC="$WORK/etc-systemd" "$DEB_DIR/$1" "${@:2}"; then
+		OPL_SYSTEMD_ETC="$WORK/etc-systemd" OPL_APT_SOURCES="$WORK/oplite.sources" "$DEB_DIR/$1" "${@:2}"; then
 		echo "FAIL $name: 스크립트가 0이 아닌 코드로 끝났다"
 		FAILED=1
 		return
@@ -101,6 +101,32 @@ if [ ! -e "$WANTS/opld.service" ] && [ ! -L "$WANTS/opld.service" ]; then echo "
 	echo "FAIL purge 뒤 enable 링크가 남았다"
 	FAILED=1
 fi
+
+# remove·purge는 opld가 쓴 소스 파일(관리 표시)을 지우고, 관리자가 쓴 파일과 업그레이드 때는 남긴다.
+SOURCES="$WORK/oplite.sources"
+managed() { printf '# managed by opld; edits are overwritten\nTypes: deb\n' >"$SOURCES"; }
+own() { printf 'Types: deb\nURIs: http://mirror.lan/oplite\n' >"$SOURCES"; }
+for action in remove purge; do
+	managed
+	check "postrm $action(관리 소스 파일)" no "$([ "$action" = purge ] && echo "disable opld.service")" postrm "$action"
+	if [ ! -e "$SOURCES" ]; then echo "ok   $action 뒤 관리 소스 파일 없음"; else
+		echo "FAIL $action 뒤 관리 소스 파일이 남았다"
+		FAILED=1
+	fi
+	own
+	check "postrm $action(관리자 소스 파일)" no "$([ "$action" = purge ] && echo "disable opld.service")" postrm "$action"
+	if grep -q mirror.lan "$SOURCES"; then echo "ok   $action 뒤 관리자 소스 파일 남음"; else
+		echo "FAIL $action가 관리자 소스 파일을 지웠다"
+		FAILED=1
+	fi
+done
+managed
+check "postrm upgrade(소스 파일 둠)" no "" postrm upgrade 0.2.0
+if [ -e "$SOURCES" ]; then echo "ok   upgrade 뒤 소스 파일 남음"; else
+	echo "FAIL upgrade가 소스 파일을 지웠다"
+	FAILED=1
+fi
+rm -f "$SOURCES"
 
 # 가짜 systemctl이 실패해도 maintainer 스크립트는 성공해야 한다(|| true).
 cat >"$WORK/bin/systemctl" <<'EOF'

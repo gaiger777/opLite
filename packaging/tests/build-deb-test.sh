@@ -1,6 +1,6 @@
 #!/bin/bash
-# build-deb.sh가 바이너리의 --version이 패키지 버전과 같은지 확인하는지 본다.
-# 가짜 opld·oplctl(버전을 찍는 스크립트)과 가짜 dpkg-deb(만들 파일만 만듦)를 쓴다. bash만 있으면 되고 macOS에서도 돈다.
+# build-deb.sh가 바이너리의 --version이 패키지 버전과 같은지 확인하는지, OPL_APT_KEY의 키링을 싣는지 본다.
+# 가짜 opld·oplctl(버전을 찍는 스크립트)과 가짜 dpkg-deb(만들 파일과 패키지 트리 사본만 만듦)를 쓴다. bash만 있으면 되고 macOS에서도 돈다.
 # 쓰는 법: bash packaging/tests/build-deb-test.sh
 set -eu
 
@@ -9,11 +9,16 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/fakebin"
-# 가짜 dpkg-deb: 마지막 인자(만들 .deb)를 만든다.
+# 가짜 dpkg-deb: 마지막 인자(만들 .deb)를 만들고, 그 앞 인자(패키지 트리)를 $WORK/tree로 복사한다.
 cat >"$WORK/fakebin/dpkg-deb" <<'EOF'
 #!/bin/sh
-for a; do out=$a; done
+for a; do
+	root=${out-}
+	out=$a
+done
 echo deb >"$out"
+rm -rf "$(dirname "$out")/../tree"
+cp -Rp "$root" "$(dirname "$out")/../tree"
 EOF
 chmod 0755 "$WORK/fakebin/dpkg-deb"
 
@@ -72,6 +77,41 @@ check_mismatch "oplctl 버전이 다르면 실패"
 fake_bins 0.2.0~ci1 0.2.0~ci1
 run 0.2.0
 check_mismatch "버전 앞부분만 같으면 실패"
+
+# OPL_APT_KEY: 저장소 공개 키를 /usr/share/keyrings/oplite-archive-keyring.gpg(0644)로 싣고 md5sums에 넣는다.
+KEYRING=usr/share/keyrings/oplite-archive-keyring.gpg
+fake_bins 0.1.0 0.1.0
+run 0.1.0
+if [ "$code" -eq 0 ] && [ ! -e "$WORK/tree/usr/share/keyrings" ]; then
+	ok "OPL_APT_KEY가 없으면 키링을 싣지 않는다"
+else
+	fail "키링 없음: 종료 코드 $code"
+fi
+printf 'public key' >"$WORK/archive.gpg"
+chmod 0600 "$WORK/archive.gpg"
+OPL_APT_KEY="$WORK/archive.gpg" run 0.1.0
+if [ "$code" -eq 0 ] && cmp -s "$WORK/archive.gpg" "$WORK/tree/$KEYRING" &&
+	[ -n "$(find "$WORK/tree/$KEYRING" -perm 0644)" ] &&
+	grep -q " $KEYRING\$" "$WORK/tree/DEBIAN/md5sums"; then
+	ok "OPL_APT_KEY의 키링을 싣는다"
+else
+	fail "키링: 종료 코드 $code"
+	cat "$WORK/stderr"
+fi
+OPL_APT_KEY="$WORK/missing.gpg" run 0.1.0
+if [ "$code" -eq 1 ] && grep -q OPL_APT_KEY "$WORK/stderr" && [ ! -e "$WORK/out" ]; then
+	ok "OPL_APT_KEY 파일이 없으면 실패"
+else
+	fail "없는 OPL_APT_KEY: 종료 코드 $code"
+fi
+printf -- '-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmQINBG\n-----END PGP PUBLIC KEY BLOCK-----\n' >"$WORK/archive.asc"
+OPL_APT_KEY="$WORK/archive.asc" run 0.1.0
+if [ "$code" -eq 1 ] && grep -q 'OPL_APT_KEY must be a binary keyring (gpg --export, not --armor)' "$WORK/stderr" &&
+	[ ! -e "$WORK/out" ]; then
+	ok "armor 키는 거절"
+else
+	fail "armor OPL_APT_KEY: 종료 코드 $code"
+fi
 
 if [ "$FAILED" -ne 0 ]; then
 	echo "build-deb-test: 실패"
