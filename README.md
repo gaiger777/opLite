@@ -1595,3 +1595,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 29: OVA 가져오기](docs/superpowers/plans/2026-11-04-plan29-ova-import.md)
 - [계획 30: ESXi에서 바로 가져오기](docs/superpowers/plans/2026-11-04-plan30-esxi-import.md)
 - [계획 31: 패키지와 설치 ISO](docs/superpowers/plans/2026-11-05-plan31-packaging-iso.md)
+- [계획 32: 버전과 업데이트 채널](docs/superpowers/plans/2026-11-05-plan32-updates.md)

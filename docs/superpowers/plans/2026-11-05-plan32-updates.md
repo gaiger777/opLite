@@ -12332,3 +12332,68 @@ git commit -m "docs: 버전과 업데이트 — README 새 절 \"업데이트\"(
 - `testing`에서 `stable`로 돌아가도 패키지는 내려가지 않는다. 업그레이드 로그는 지우지 않는다.
 - 진짜 `systemd-run`·`systemctl`로 하는 업그레이드는 CI에서 시험하지 않는다(가짜 스크립트로 시험).
 - 그 밖의 제한은 설계 문서 §3.8과 README "업데이트" 절에 있다.
+
+## 실행 후 기록 (2026-11-05)
+
+7개 Task를 계획대로 적용했다. Task마다 검증된 단계와 트리가 같았고, 생성 파일 `web/src/api/schema.d.ts`도 같았다. 실행 전에 계획 문서를 처음부터 끝까지 main 복제본에 적용해, 각 단계의 트리와 같음을 확인했다. 계획 문서를 만들기 전에 스테이지 작업에서 리뷰를 두 차례 돌리고 CI 프로브 네 번으로 고쳤다. 고친 내용은 위 Task의 코드에 이미 들어 있다.
+
+- **1차 리뷰에서 고친 것 (28가지):**
+  - 혼합 버전 클러스터:
+    - 옛 노드는 모르는 `Kind`·`TaskOp`가 든 Raft 항목을 풀지 못한다. 그래서 모든 노드가 버전을 보고하기 전에는 설정 쓰기·다시 확인·업그레이드를 409 `cluster_upgrading`으로 막는다.
+    - 버전을 보내지 않는 합류는 버전이 있는 클러스터에서 거절한다.
+  - 업그레이드:
+    - 시작하지 못한 업그레이드를 성공으로 보던 것을 고쳤다. 스크립트가 시작 줄과 종료 줄을 남기고, 유닛이 사라지면 이 줄로 판단한다.
+    - 업그레이드와 업데이트 확인이 apt 잠금을 두고 다투던 것을 고쳤다. 업그레이드 동안 확인 잠금을 잡고, apt에 `DPkg::Lock::Timeout`을 준다.
+    - 동시 요청으로 두 노드가 함께 업그레이드되던 것을 막았다.
+    - 유닛 이름을 Task id 32자로 바꾸고, 스크립트를 실제 `sh`로 돌리는 시험을 넣었다.
+  - 소스 파일:
+    - 빈 파일은 관리하는 파일로 본다.
+    - 임시 파일을 `.dpkg-tmp`에 0644로 쓰고 fsync한다.
+    - 키링이 없으면 소스 파일을 쓰지 않는다.
+    - 채널을 바꾸면 곧 다시 확인한다.
+  - 옛 리더가 지운 노드의 버전·업데이트 상태를 에이전트가 되살린다.
+  - If-Match와 동시 생성이 부딪치면 412를 준다.
+  - 패키지:
+    - 패키지를 지우면 관리하는 소스 파일도 지운다.
+    - 저장소는 두 서명이 다 성공한 뒤에 색인을 옮긴다.
+    - 같은 이름에 다른 내용인 패키지는 거절한다.
+    - armored 키는 거절한다.
+  - 웹:
+    - 버전을 Debian 규칙으로 정렬한다.
+    - 배지의 접근 이름에 상태를 넣는다.
+    - 업그레이드 중에는 버튼을 끈다.
+    - 설정 저장 응답이 더 새 값을 덮지 않는다.
+  - 문서를 고쳤고, `iso.yml`이 `status.version`을 확인한다.
+- **2차 리뷰에서 고친 것 (4가지):**
+  - 다시 확인 Task가 잠금을 끝없이 기다리지 않는다. 업그레이드 중이면 확인 없이 끝난다.
+  - 합류가 노드의 버전을 적는다. `cluster_upgrading` 메시지에 버전 없는 노드 이름을 넣는다.
+  - 확인의 apt-get에 `DPkg::Lock::Timeout=60`을 준다.
+  - 설계 §3.8 문장을 고쳤다.
+- **CI 프로브 (4번째에 모두 통과):**
+  - 1번째: `package` 작업의 저장소 시험이 `gpgv: command not found`로 실패했다. Debian 13의 apt는 sqv를 쓰기 때문이다. `repo-test.sh`가 gpgv를 설치하게 고쳤다.
+  - 2~4번째는 이 계획과 무관한 기존 불안정 시험으로 실패했고, 실패한 작업만 다시 돌려 통과했다.
+    - opld `snapshots.rs`의 running_vm_snapshot_clone_starts(QMP 시간 초과)
+    - opl-driver `qemu_migration.rs`의 migrates_a_running_vm_over_tls
+    - opl-api `vm_imports.rs`의 run_finishes_an_import_whose_vm_was_made
+  - ISO E2E(BIOS·UEFI)는 버전 확인을 포함해 모든 프로브에서 통과했다.
+
+**테스트:**
+- macOS `cargo test --workspace` 1195개
+- 웹 시험 461개와 `typecheck`·`lint`·`build`
+- 셸 시험 `maint-test.sh`·`build-deb-test.sh`·`build-repo-test.sh`·`setup-test.sh`·`iso-test.sh`와 shellcheck
+- `fmt`·`clippy -D warnings`(모든 기능)
+
+Linux CI에서는 다음이 통과했다.
+- 위 시험 전부
+- Debian 13 컨테이너에 패키지 설치(`deb-test.sh`)
+- `file://` 저장소에서 설치하고 `testing`의 새 버전을 업데이트 후보로 보는 시험(`repo-test.sh`)
+- BIOS·UEFI ISO 무인 설치 E2E와 노드 버전 확인
+
+## 다음 계획으로 넘길 사항
+
+- 다음은 계획 33(구독과 텔레메트리, 설계 §4)이다.
+  - `enterprise` 채널은 이 계획의 `Channel`에 더한다.
+  - 구독 키는 `settings` 리소스에 둘 수 있다.
+  - 새 `Kind`·`TaskOp`는 이 계획의 `require_upgraded` 게이트를 쓴다.
+- 업그레이드 취소·시간 제한, 다운그레이드, 자동 롤링 업그레이드, 저장소 호스팅은 하지 않았다.
+- 진짜 `systemd-run`·`systemctl`로 하는 업그레이드는 CI에서 시험하지 않는다.
