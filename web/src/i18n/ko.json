@@ -55,7 +55,11 @@
     "untrusted_certificate": "ESXi 인증서 지문을 확인하고 믿기로 해야 계속할 수 있습니다.",
     "fingerprint_mismatch": "믿기로 한 뒤에 ESXi 인증서가 바뀌었습니다. 다시 연결해 새 지문을 확인하세요.",
     "esxi_auth": "ESXi가 사용자 이름이나 비밀번호를 거절했습니다. 확인하고 다시 시도하세요.",
-    "esxi_unreachable": "ESXi 호스트에 연결할 수 없습니다({{message}})."
+    "esxi_unreachable": "ESXi 호스트에 연결할 수 없습니다({{message}}).",
+    "version_too_old": "노드의 opLite가 클러스터보다 오래됐습니다. 먼저 업그레이드하세요: {{message}}",
+    "updates_unsupported": "이 노드는 업데이트를 확인하지 않습니다.",
+    "upgrade_in_progress": "업그레이드가 진행 중입니다: {{message}}",
+    "cluster_upgrading": "클러스터를 업그레이드하는 중입니다: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -71,7 +75,8 @@
     "tasks": "작업",
     "users": "사용자",
     "tokens": "API 토큰",
-    "cluster": "클러스터"
+    "cluster": "클러스터",
+    "settings": "설정"
   },
   "header": {
     "language": "언어",
@@ -90,7 +95,8 @@
   "login": {
     "username": "사용자 이름",
     "password": "비밀번호",
-    "submit": "로그인"
+    "submit": "로그인",
+    "version": "opLite {{version}}"
   },
   "notFound": {
     "title": "페이지를 찾을 수 없습니다",
@@ -136,7 +142,9 @@
       "backup-delete": "백업 {{target}} 삭제",
       "backup-restore": "백업을 {{target}}(으)로 복원",
       "vm-import": "VM {{target}} 가져오기",
-      "vm-import-delete": "가져오기 {{target}} 삭제"
+      "vm-import-delete": "가져오기 {{target}} 삭제",
+      "node-update-check": "{{target}} 업데이트 확인",
+      "node-upgrade": "{{target}} 업그레이드"
     }
   },
   "pager": {
@@ -836,6 +844,35 @@
     "fencingMode": {
       "watchdog": "Watchdog",
       "process": "프로세스"
+    },
+    "version": "버전",
+    "updates": {
+      "column": "업데이트",
+      "open": "{{name}}의 업데이트: {{state}}",
+      "stateCount": "{{n}}개",
+      "stateFailed": "확인 실패",
+      "stateNotChecked": "아직 확인하지 않음",
+      "menu": "업데이트…",
+      "title": "{{name}}의 업데이트",
+      "checked": "마지막 확인: {{time}}",
+      "notChecked": "아직 확인하지 않았습니다.",
+      "none": "올릴 업데이트가 없습니다.",
+      "failed": "마지막 확인이 실패했습니다:",
+      "failedBadge": "확인 실패",
+      "package": "패키지",
+      "current": "설치됨",
+      "candidate": "새 버전",
+      "newPackage": "(새 패키지)",
+      "truncated": "앞의 {{count}}개만 보입니다.",
+      "refresh": "다시 확인",
+      "checking": "확인 중…",
+      "upgrade": "업그레이드",
+      "upgrading": "업그레이드 중…",
+      "upgradeTitle": "{{name}}을(를) 업그레이드할까요?",
+      "upgradeDescription": "VM은 계속 돌지만 opld가 잠깐 다시 시작합니다. 다른 노드는 이 업그레이드가 끝난 뒤에 하세요.",
+      "errors": {
+        "node_offline": "노드가 오프라인입니다."
+      }
     }
   },
   "accounts": {
@@ -1013,6 +1050,18 @@
     "recentTasks": "최근 작업",
     "allTasks": "모든 작업",
     "noLeader": "리더 없음",
-    "noNodes": "노드가 없습니다."
+    "noNodes": "노드가 없습니다.",
+    "mixedVersions": "노드들이 서로 다른 opLite 버전({{versions}})을 돌립니다. 모든 노드의 업그레이드를 끝내세요."
+  },
+  "settings": {
+    "updates": "업데이트",
+    "channel": "업데이트 채널",
+    "channelHint": "모든 노드가 이 채널에서 opLite 패키지를 받습니다. testing은 stable보다 새 버전을 먼저 받습니다.",
+    "channels": {
+      "stable": "stable(안정)",
+      "testing": "testing(시험)"
+    },
+    "saved": "설정을 저장했습니다.",
+    "adminOnly": "설정은 관리자만 바꿀 수 있습니다."
   }
 }

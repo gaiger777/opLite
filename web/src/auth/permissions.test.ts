@@ -25,6 +25,10 @@ it("mirrors the server roles", () => {
   expect(can("viewer", "read", "vm-import")).toBe(true);
   expect(can("viewer", "write", "vm-import")).toBe(false);
   expect(can("operator", "write", "vm-import")).toBe(true);
+  // 클러스터 설정은 누구나 읽고 admin만 바꾼다.
+  expect(can("viewer", "read", "settings")).toBe(true);
+  expect(can("operator", "write", "settings")).toBe(false);
+  expect(can("admin", "write", "settings")).toBe(true);
 });
 
 it("keeps accounts to admins", () => {

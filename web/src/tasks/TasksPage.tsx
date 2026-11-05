@@ -41,6 +41,7 @@ export function TaskStateBadge({ task }: { task: Task }) {
 /** Task 대상의 이름. VM이면 VM 화면으로, 가져오기면 가져오기 화면으로 이어진다. */
 export function useTaskTarget() {
   const vms = useList("vm");
+  const nodes = useList("node");
   const volumes = useList("volume");
   const backups = useList("backup");
   const imports = useList("vm-import");
@@ -49,6 +50,7 @@ export function useTaskTarget() {
     const volumeById = new Map(volumes.data?.map((v) => [v.id, v]));
     const backupById = new Map(backups.data?.map((b) => [b.id, b]));
     const importById = new Map(imports.data?.map((i) => [i.id, i]));
+    const nodeById = new Map(nodes.data?.map((n) => [n.id, n]));
     return (task: Task) => {
       const vm = vmById.get(task.spec.target);
       if (vm) {
@@ -67,11 +69,15 @@ export function useTaskTarget() {
       if (imp) {
         return { name: imp.name, href: `/imports/${encodeURIComponent(imp.name)}` };
       }
-      const name = volumeById.get(task.spec.target)?.name ?? backupById.get(task.spec.target)?.name;
+      // 노드 업데이트 확인·업그레이드의 대상은 노드다.
+      const name =
+        volumeById.get(task.spec.target)?.name ??
+        backupById.get(task.spec.target)?.name ??
+        nodeById.get(task.spec.target)?.name;
       // 지워진 대상은 id의 끝(UUIDv7의 무작위 부분)으로 구분한다. 앞부분은 시각이라 서로 비슷하다.
       return { name: name ?? task.spec.target.slice(-8), href: undefined };
     };
-  }, [vms.data, volumes.data, backups.data, imports.data]);
+  }, [vms.data, volumes.data, backups.data, imports.data, nodes.data]);
 }
 
 /**

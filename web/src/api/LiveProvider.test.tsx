@@ -2,7 +2,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import { http, HttpResponse, ws } from "msw";
 
-import { listKey, useList } from "@/api/live";
+import { listKey, useList, useSettings } from "@/api/live";
 import { LiveProvider, useLiveStatus } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
 import { apiUrl, server } from "@/test/server";
@@ -61,8 +61,59 @@ it("watches from the oldest list revision and applies changes", async () => {
   );
   expect(await screen.findByText("live: web=running")).toBeInTheDocument();
   expect(urls[0]).toContain(
-    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import&since=7",
+    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import,settings&since=7",
   );
+});
+
+function settings(revision: number, channel: string) {
+  return {
+    id: "s1",
+    name: "cluster",
+    revision,
+    spec: { updates: { channel } },
+    status: {},
+  };
+}
+
+function SettingsProbe() {
+  const status = useLiveStatus();
+  const current = useSettings();
+  const vms = useList("vm");
+  return (
+    <p>
+      {status}: {current.data?.spec.updates?.channel} {vms.data?.map((v) => v.status.phase)}
+    </p>
+  );
+}
+
+it("reads the settings again on every connection and applies newer ones", async () => {
+  let reads = 0;
+  server.use(
+    ...lists([], 7),
+    http.get(apiUrl("/settings"), () => {
+      reads += 1;
+      return HttpResponse.json(settings(5, "stable"));
+    }),
+    watch.addEventListener("connection", ({ client }) => {
+      client.send(
+        JSON.stringify({ type: "put", kind: "settings", resource: settings(9, "testing") }),
+      );
+      // 가진 것보다 오래된 설정은 버린다.
+      client.send(JSON.stringify({ type: "put", kind: "settings", resource: settings(4, "x") }));
+      client.send(JSON.stringify({ type: "put", kind: "vm", resource: vm("web", 9, "running") }));
+    }),
+  );
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <LiveProvider>
+        <SettingsProbe />
+      </LiveProvider>
+    </QueryClientProvider>,
+  );
+  // 마지막 이벤트(VM)까지 반영한 뒤에도 새 설정이 남는다.
+  expect(await screen.findByText("live: testing running")).toBeInTheDocument();
+  // 연결하면서 다시 읽었다.
+  expect(reads).toBeGreaterThanOrEqual(2);
 });
 
 it("reads the lists again when the watch cannot continue", async () => {

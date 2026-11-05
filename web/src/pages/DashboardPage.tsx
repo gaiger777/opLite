@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
+import { compareVersions } from "@/lib/version";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
 import { vcpus } from "@/vms/VmListPage";
 
@@ -33,6 +34,12 @@ export function usage(node: Node, vms: Vm[]) {
     vcpus: here.reduce((sum, vm) => sum + vcpus(vm), 0),
     memoryMib: here.reduce((sum, vm) => sum + vm.spec.memory_mib, 0),
   };
+}
+
+/** 노드들이 돌리는 서로 다른 버전(낮은 것부터). 버전을 모르는 노드(옛 노드)는 뺀다. */
+function nodeVersions(nodes: Node[]): string[] {
+  const versions = new Set(nodes.flatMap((n) => (n.status.version ? [n.status.version] : [])));
+  return [...versions].sort(compareVersions);
 }
 
 /** 아직 받지 못한 데이터: 실패했으면 그 이유, 아니면 불러오는 중 */
@@ -69,6 +76,7 @@ export function DashboardPage() {
   const count = (phase: Vm["status"]["phase"]) =>
     allVms.filter((vm) => vm.status.phase === phase).length;
   const failed = allVms.filter((vm) => vm.status.phase === "failed");
+  const versions = nodeVersions(allNodes);
 
   // 리더 이름: Node 리소스, 클러스터 멤버, 그래도 없으면(합류 중) id 끝 8자
   let leader = waiting(t, cluster);
@@ -84,6 +92,15 @@ export function DashboardPage() {
   return (
     <div className="flex flex-col gap-6">
       <h1 className="text-2xl font-semibold">{t("nav.dashboard")}</h1>
+      {/* 롤링 업그레이드 중이거나 멈춘 업그레이드가 있다. */}
+      {versions.length > 1 && (
+        <p
+          role="alert"
+          className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+        >
+          {t("dashboard.mixedVersions", { versions: versions.join(", ") })}
+        </p>
+      )}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Stat
           title={t("dashboard.nodes")}

@@ -55,7 +55,11 @@
     "untrusted_certificate": "Check the ESXi certificate fingerprint and trust it to continue.",
     "fingerprint_mismatch": "The ESXi certificate changed since you trusted it. Connect again and check the new fingerprint.",
     "esxi_auth": "ESXi rejected the user name or password. Check them and try again.",
-    "esxi_unreachable": "Cannot reach the ESXi host ({{message}})."
+    "esxi_unreachable": "Cannot reach the ESXi host ({{message}}).",
+    "version_too_old": "The node runs an older opLite than the cluster. Upgrade it first: {{message}}",
+    "updates_unsupported": "The node does not check for updates.",
+    "upgrade_in_progress": "An upgrade is in progress: {{message}}",
+    "cluster_upgrading": "The cluster is being upgraded: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -71,7 +75,8 @@
     "tasks": "Tasks",
     "users": "Users",
     "tokens": "API tokens",
-    "cluster": "Cluster"
+    "cluster": "Cluster",
+    "settings": "Settings"
   },
   "header": {
     "language": "Language",
@@ -90,7 +95,8 @@
   "login": {
     "username": "Username",
     "password": "Password",
-    "submit": "Sign in"
+    "submit": "Sign in",
+    "version": "opLite {{version}}"
   },
   "notFound": {
     "title": "Page not found",
@@ -136,7 +142,9 @@
       "backup-delete": "Delete backup {{target}}",
       "backup-restore": "Restore a backup as {{target}}",
       "vm-import": "Import VM {{target}}",
-      "vm-import-delete": "Delete import {{target}}"
+      "vm-import-delete": "Delete import {{target}}",
+      "node-update-check": "Check updates on {{target}}",
+      "node-upgrade": "Upgrade {{target}}"
     }
   },
   "pager": {
@@ -836,6 +844,35 @@
     "fencingMode": {
       "watchdog": "Watchdog",
       "process": "Process"
+    },
+    "version": "Version",
+    "updates": {
+      "column": "Updates",
+      "open": "Updates for {{name}}: {{state}}",
+      "stateCount": "{{n}} available",
+      "stateFailed": "check failed",
+      "stateNotChecked": "not checked yet",
+      "menu": "Updates…",
+      "title": "Updates for {{name}}",
+      "checked": "Last checked {{time}}.",
+      "notChecked": "Not checked yet.",
+      "none": "No updates available.",
+      "failed": "The last check failed:",
+      "failedBadge": "Check failed",
+      "package": "Package",
+      "current": "Installed",
+      "candidate": "Candidate",
+      "newPackage": "(new)",
+      "truncated": "Only the first {{count}} packages are shown.",
+      "refresh": "Check again",
+      "checking": "Checking…",
+      "upgrade": "Upgrade",
+      "upgrading": "Upgrading…",
+      "upgradeTitle": "Upgrade {{name}}?",
+      "upgradeDescription": "VMs keep running, but opld restarts briefly. Upgrade other nodes after this upgrade finishes.",
+      "errors": {
+        "node_offline": "The node is offline."
+      }
     }
   },
   "accounts": {
@@ -1013,6 +1050,18 @@
     "recentTasks": "Recent tasks",
     "allTasks": "All tasks",
     "noLeader": "No leader",
-    "noNodes": "No nodes."
+    "noNodes": "No nodes.",
+    "mixedVersions": "Nodes run different opLite versions ({{versions}}). Finish the upgrade on every node."
+  },
+  "settings": {
+    "updates": "Updates",
+    "channel": "Update channel",
+    "channelHint": "Every node gets opLite packages from this channel. Testing gets new versions before stable.",
+    "channels": {
+      "stable": "Stable",
+      "testing": "Testing"
+    },
+    "saved": "Settings saved.",
+    "adminOnly": "Only administrators can change the settings."
   }
 }

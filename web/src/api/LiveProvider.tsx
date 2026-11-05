@@ -1,7 +1,17 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useState } from "react";
 
-import { applyEvent, fetchList, KINDS, type List, listKey, type WatchEvent } from "@/api/live";
+import {
+  applyEvent,
+  fetchList,
+  KINDS,
+  type List,
+  listKey,
+  SETTINGS_KEY,
+  SETTINGS_KIND,
+  type WatchEvent,
+} from "@/api/live";
+import type { Settings } from "@/api/types";
 
 export type LiveStatus = "connecting" | "live" | "offline";
 
@@ -14,7 +24,7 @@ const STABLE_MS = 30_000;
 
 function watchUrl(since: number) {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${scheme}://${window.location.host}/api/v1/watch?kinds=${KINDS.join(",")}&since=${since}`;
+  return `${scheme}://${window.location.host}/api/v1/watch?kinds=${[...KINDS, SETTINGS_KIND].join(",")}&since=${since}`;
 }
 
 /**
@@ -54,6 +64,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           ),
         );
         since = Math.min(...lists.map((list) => list.revision));
+        // 설정은 목록이 없으므로 watch를 열기 전에 다시 읽는다(보는 화면이 있을 때만).
+        await queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
       } catch {
         retry();
         return;
@@ -80,6 +92,16 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
         switch (event?.type) {
           case "put":
           case "deleted":
+            // 설정은 지우지 않는다. 읽은 것보다 새것일 때만 바꾼다.
+            if (event.kind === SETTINGS_KIND) {
+              const resource = event.resource as Settings;
+              if (event.type === "put") {
+                queryClient.setQueryData<Settings>(SETTINGS_KEY, (current) =>
+                  current && current.revision >= resource.revision ? current : resource,
+                );
+              }
+              break;
+            }
             queryClient.setQueryData<List<{ id: string; revision: number }>>(
               listKey(event.kind),
               (list) => list && applyEvent(list, event),

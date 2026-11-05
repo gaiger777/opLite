@@ -31,11 +31,41 @@ import {
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
+import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
 import { PoolStatus } from "@/storage/PoolStatus";
 
 /** 그 노드에 고정했거나 그 노드에서 마지막으로 돈 VM의 수 */
 function vmCount(node: Node, vms: Vm[]): number {
   return vms.filter((vm) => (vm.spec.node ?? vm.status.node) === node.id).length;
+}
+
+/** 배지 버튼의 접근 이름에 넣는 확인 상태 */
+function updatesState(
+  t: ReturnType<typeof useTranslation>["t"],
+  updates: NonNullable<Node["status"]["updates"]>,
+): string {
+  if (updates.error) {
+    return t("nodes.updates.stateFailed");
+  }
+  if (!updates.checked_at) {
+    return t("nodes.updates.stateNotChecked");
+  }
+  return t("nodes.updates.stateCount", {
+    n: `${updates.packages.length}${updates.truncated ? "+" : ""}`,
+  });
+}
+
+/** 올릴 수 있는 패키지 수. 확인이 실패했으면 경고, 아직 확인하지 않았으면 비어 있다. */
+function UpdatesBadge({ updates }: { updates: NonNullable<Node["status"]["updates"]> }) {
+  const { t } = useTranslation();
+  if (updates.error) {
+    return <Badge variant="destructive">{t("nodes.updates.failedBadge")}</Badge>;
+  }
+  if (!updates.checked_at) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  const count = `${updates.packages.length}${updates.truncated ? "+" : ""}`;
+  return <Badge variant={updates.packages.length > 0 ? "default" : "outline"}>{count}</Badge>;
 }
 
 export function NodesPage() {
@@ -46,6 +76,7 @@ export function NodesPage() {
   const vms = useList("vm");
   const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
   const [removing, setRemoving] = useState<Node | null>(null);
+  const [showingUpdates, setShowingUpdates] = useState<Node | null>(null);
   // 메뉴에서 연 대화상자를 닫으면 메뉴 항목이 사라지므로, 메뉴를 연 버튼으로 포커스를 돌린다.
   const trigger = useRef<HTMLButtonElement | null>(null);
   const rememberTrigger = (e: React.SyntheticEvent<HTMLButtonElement>) => {
@@ -86,6 +117,8 @@ export function NodesPage() {
             <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("common.state")}</TableHead>
             <TableHead>{t("nodes.address")}</TableHead>
+            <TableHead>{t("nodes.version")}</TableHead>
+            <TableHead>{t("nodes.updates.column")}</TableHead>
             <TableHead>{t("nodes.underlay")}</TableHead>
             <TableHead>{t("nodes.hypervisor")}</TableHead>
             <TableHead>{t("nodes.arch")}</TableHead>
@@ -104,7 +137,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 13 : 12} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 15 : 14} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -126,6 +159,28 @@ export function NodesPage() {
                 </div>
               </TableCell>
               <TableCell className="font-mono text-xs">{node.spec.address}</TableCell>
+              {/* 옛 버전으로 등록한 노드는 모른다. */}
+              <TableCell className="font-mono text-xs">{node.status.version ?? "—"}</TableCell>
+              {/* 업데이트를 확인하지 않는 노드(위트니스, 꺼 둔 노드)는 `updates`가 없다. */}
+              <TableCell>
+                {node.status.updates ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label={t("nodes.updates.open", {
+                      name: node.name,
+                      state: updatesState(t, node.status.updates),
+                    })}
+                    onPointerDown={rememberTrigger}
+                    onKeyDown={rememberTrigger}
+                    onClick={() => setShowingUpdates(node)}
+                  >
+                    <UpdatesBadge updates={node.status.updates} />
+                  </Button>
+                ) : (
+                  "—"
+                )}
+              </TableCell>
               {/* VXLAN 패킷을 주고받는 주소. 위트니스와 정하지 못한 노드는 없다. */}
               <TableCell className="font-mono text-xs">{node.status.underlay ?? "—"}</TableCell>
               <TableCell>{node.status.hypervisor}</TableCell>
@@ -178,6 +233,11 @@ export function NodesPage() {
                           node.spec.maintenance ? "nodes.endMaintenance" : "nodes.startMaintenance",
                         )}
                       </DropdownMenuItem>
+                      {node.status.updates && (
+                        <DropdownMenuItem onSelect={() => setShowingUpdates(node)}>
+                          {t("nodes.updates.menu")}
+                        </DropdownMenuItem>
+                      )}
                       <DropdownMenuSeparator />
                       <ReasonMenuItem
                         variant="destructive"
@@ -206,6 +266,13 @@ export function NodesPage() {
           <p className="text-sm text-muted-foreground">{t("nodes.maintenanceNote")}</p>
           <p className="text-sm text-muted-foreground">{t("nodes.removeNote")}</p>
         </>
+      )}
+      {showingUpdates && (
+        <NodeUpdatesDialog
+          node={showingUpdates}
+          returnFocus={trigger}
+          onClose={() => setShowingUpdates(null)}
+        />
       )}
       <ConfirmDialog
         open={removing !== null}

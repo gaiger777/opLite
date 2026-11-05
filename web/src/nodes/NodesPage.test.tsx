@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { NodesPage } from "@/nodes/NodesPage";
-import { NODE, poolState, vm } from "@/test/fixtures";
+import { NODE, poolState, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -231,4 +231,220 @@ it("does not count VMs it could not read", async () => {
     .getAllByRole("columnheader")
     .findIndex((h) => h.textContent === "VMs");
   await vi.waitFor(() => expect(within(a).getAllByRole("cell")[vmsColumn]).toHaveTextContent("—"));
+});
+
+/** 업데이트를 확인하는 노드. 기본은 2026-11-05 확인, 패키지 둘(하나는 새 의존성). */
+function updatable(extra: Partial<(typeof NODE)["status"]["updates"] & object> = {}) {
+  return {
+    ...NODE,
+    status: {
+      ...NODE.status,
+      version: "0.9.0",
+      updates: {
+        checked_at: 1_793_000_000,
+        packages: [
+          { name: "oplite", current: "0.9.0", candidate: "0.10.0" },
+          { name: "libfoo1", current: null, candidate: "1.2-3" },
+        ],
+        error: null,
+        ...extra,
+      },
+    },
+  };
+}
+
+it("shows each node's version and how many updates it has", async () => {
+  cluster();
+  const failing = {
+    ...DOWN,
+    status: { ...DOWN.status, updates: { checked_at: null, packages: [], error: "apt-get: boom" } },
+  };
+  const witness = { ...NODE, id: "n3", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  mockLists({ node: [updatable(), failing, witness] });
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const headers = within(table).getAllByRole("columnheader");
+  const version = headers.findIndex((h) => h.textContent === "Version");
+  const updates = headers.findIndex((h) => h.textContent === "Updates");
+  // 버전은 주소 다음이다.
+  expect(headers[version - 1]).toHaveTextContent("API address");
+  const a = (await within(table).findByText("node-a")).closest("tr")!;
+  expect(within(a).getAllByRole("cell")[version]).toHaveTextContent("0.9.0");
+  expect(within(a).getAllByRole("cell")[updates]).toHaveTextContent("2");
+  const b = within(table).getByText("node-b").closest("tr")!;
+  expect(within(b).getAllByRole("cell")[version]).toHaveTextContent("—");
+  expect(within(b).getAllByRole("cell")[updates]).toHaveTextContent("Check failed");
+  // 업데이트를 확인하지 않는 노드(위트니스 등)
+  const w = within(table).getByText("node-w").closest("tr")!;
+  expect(within(w).getAllByRole("cell")[updates]).toHaveTextContent("—");
+  expect(within(w).queryByRole("button", { name: /^Updates for node-w/ })).not.toBeInTheDocument();
+  // 배지 버튼의 이름에 확인 상태가 들어간다.
+  expect(within(a).getByRole("button", { name: "Updates for node-a: 2 available" })).toBeVisible();
+  expect(within(b).getByRole("button", { name: "Updates for node-b: check failed" })).toBeVisible();
+});
+
+it("names the badge of a node that has not checked yet or has more updates", async () => {
+  cluster();
+  const more = {
+    ...updatable({ truncated: true }),
+    id: "n2",
+    name: "node-b",
+  };
+  mockLists({ node: [updatable({ checked_at: null, packages: [] }), more] });
+  renderPage(<NodesPage />);
+  expect(
+    await screen.findByRole("button", { name: "Updates for node-a: not checked yet" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Updates for node-b: 2+ available" }),
+  ).toBeInTheDocument();
+});
+
+it("lists the updates of a node", async () => {
+  cluster();
+  mockLists({ node: [updatable({ truncated: true })] });
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: /^Updates for node-a:/ }));
+  const dialog = await screen.findByRole("dialog", { name: "Updates for node-a" });
+  expect(dialog).toHaveTextContent("Last checked");
+  const rows = within(within(dialog).getByRole("table")).getAllByRole("row");
+  expect(rows.map((r) => r.textContent)).toEqual([
+    "PackageInstalledCandidate",
+    "oplite0.9.00.10.0",
+    "libfoo1(new)1.2-3",
+  ]);
+  expect(dialog).toHaveTextContent("Only the first 2 packages are shown.");
+});
+
+it("shows why the last check failed", async () => {
+  cluster();
+  mockLists({ node: [updatable({ packages: [], error: "apt-get update: E: no network" })] });
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: /^Updates for node-a:/ }));
+  const dialog = await screen.findByRole("dialog", { name: "Updates for node-a" });
+  expect(dialog).toHaveTextContent("The last check failed:apt-get update: E: no network");
+  expect(within(dialog).queryByRole("table")).not.toBeInTheDocument();
+});
+
+it("says when a node has not checked yet or has nothing to update", async () => {
+  cluster();
+  mockLists({ node: [updatable({ checked_at: null, packages: [] })] });
+  const { unmount } = renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: /^Updates for node-a:/ }));
+  expect(await screen.findByRole("dialog")).toHaveTextContent("Not checked yet.");
+  unmount();
+
+  mockLists({ node: [updatable({ packages: [] })] });
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: /^Updates for node-a:/ }));
+  expect(await screen.findByRole("dialog")).toHaveTextContent("No updates available.");
+});
+
+it("checks again and upgrades from the row menu", async () => {
+  cluster();
+  mockLists({ node: [updatable()] });
+  const posted: string[] = [];
+  server.use(
+    http.post(apiUrl("/nodes/n1/updates/refresh"), () => {
+      posted.push("refresh");
+      return HttpResponse.json(task("t1", "node-update-check", "n1"), { status: 202 });
+    }),
+    http.post(apiUrl("/nodes/n1/upgrade"), () => {
+      posted.push("upgrade");
+      return HttpResponse.json(task("t2", "node-upgrade", "n1"), { status: 202 });
+    }),
+  );
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Updates…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Updates for node-a" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Check again" }));
+  expect(await screen.findByText("Check updates on node-a")).toBeInTheDocument();
+
+  await userEvent.click(within(dialog).getByRole("button", { name: "Upgrade" }));
+  const confirm = await screen.findByRole("alertdialog", { name: "Upgrade node-a?" });
+  expect(confirm).toHaveTextContent(
+    "VMs keep running, but opld restarts briefly. Upgrade other nodes after this upgrade finishes.",
+  );
+  await userEvent.click(within(confirm).getByRole("button", { name: "Upgrade" }));
+  expect(await screen.findByText("Upgrade node-a")).toBeInTheDocument();
+  expect(posted).toEqual(["refresh", "upgrade"]);
+});
+
+it("says why the upgrade did not start", async () => {
+  cluster();
+  mockLists({ node: [updatable()] });
+  server.use(
+    http.post(apiUrl("/nodes/n1/upgrade"), () =>
+      HttpResponse.json(
+        { code: "upgrade_in_progress", message: 'node "node-b" is still being upgraded' },
+        { status: 409 },
+      ),
+    ),
+    http.post(apiUrl("/nodes/n1/updates/refresh"), () =>
+      HttpResponse.json({ code: "node_offline", message: "offline" }, { status: 409 }),
+    ),
+  );
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: /^Updates for node-a:/ }));
+  const dialog = await screen.findByRole("dialog", { name: "Updates for node-a" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Check again" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent("The node is offline.");
+
+  await userEvent.click(within(dialog).getByRole("button", { name: "Upgrade" }));
+  const confirm = await screen.findByRole("alertdialog");
+  await userEvent.click(within(confirm).getByRole("button", { name: "Upgrade" }));
+  expect(await within(confirm).findByRole("alert")).toHaveTextContent(
+    'An upgrade is in progress: node "node-b" is still being upgraded',
+  );
+});
+
+it("waits for a running upgrade before checking or upgrading again", async () => {
+  cluster();
+  const running = {
+    ...task("t2", "node-upgrade", "n1"),
+    status: { state: "running" as const, error: null },
+  };
+  mockLists({ node: [updatable()], task: [running] });
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: /^Updates for node-a:/ }));
+  const dialog = await screen.findByRole("dialog", { name: "Updates for node-a" });
+  expect(await within(dialog).findByRole("button", { name: "Upgrading…" })).toBeDisabled();
+  expect(within(dialog).getByRole("button", { name: "Check again" })).toBeDisabled();
+  expect(within(dialog).queryByRole("button", { name: "Upgrade" })).not.toBeInTheDocument();
+});
+
+it("waits for a running check before checking or upgrading", async () => {
+  cluster();
+  const running = {
+    ...task("t1", "node-update-check", "n1"),
+    status: { state: "running" as const, error: null },
+  };
+  mockLists({ node: [updatable()], task: [running] });
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: /^Updates for node-a:/ }));
+  const dialog = await screen.findByRole("dialog", { name: "Updates for node-a" });
+  expect(await within(dialog).findByRole("button", { name: "Checking…" })).toBeDisabled();
+  // 확인이 apt를 쓰는 동안은 업그레이드도 하지 않는다.
+  expect(within(dialog).getByRole("button", { name: "Upgrade" })).toBeDisabled();
+});
+
+it("has no update menu for nodes that do not check for updates", async () => {
+  cluster();
+  mockLists({ node: [NODE] });
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  expect(await screen.findByRole("menuitem", { name: "Enter maintenance" })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Updates…" })).not.toBeInTheDocument();
+});
+
+it("lets viewers read the updates but not act on them", async () => {
+  cluster();
+  mockLists({ node: [updatable()] });
+  renderPage(<NodesPage />, { as: { ...ADMIN, role: "viewer" } });
+  await userEvent.click(await screen.findByRole("button", { name: /^Updates for node-a:/ }));
+  const dialog = await screen.findByRole("dialog", { name: "Updates for node-a" });
+  expect(within(dialog).getByText("oplite")).toBeInTheDocument();
+  expect(within(dialog).queryByRole("button", { name: "Check again" })).not.toBeInTheDocument();
+  expect(within(dialog).queryByRole("button", { name: "Upgrade" })).not.toBeInTheDocument();
 });

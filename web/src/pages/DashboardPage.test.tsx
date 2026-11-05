@@ -210,3 +210,29 @@ it("names the recent tasks table", async () => {
   renderPage(<DashboardPage />);
   expect(await screen.findByRole("table", { name: "Recent tasks" })).toBeInTheDocument();
 });
+
+it("warns while nodes run different versions", async () => {
+  const at = (id: string, version?: string) => ({
+    ...NODE,
+    id,
+    name: id,
+    status: { ...NODE.status, version },
+  });
+  // 버전을 모르는 노드(옛 노드)는 세지 않고, 같은 버전은 한 번만 보인다. Debian 순서로 보인다(~는
+  // 정식 버전보다 낮다).
+  mockLists({
+    node: [at("a", "0.10.0"), at("b", "0.9.0"), at("c", "0.9.0"), at("d"), at("e", "0.10.0~rc1")],
+    vm: [],
+  });
+  server.use(cluster("a"));
+  const { unmount } = renderPage(<DashboardPage />);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Nodes run different opLite versions (0.9.0, 0.10.0~rc1, 0.10.0). Finish the upgrade on every node.",
+  );
+  unmount();
+
+  mockLists({ node: [at("a", "0.10.0"), at("b", "0.10.0"), at("d")], vm: [] });
+  renderPage(<DashboardPage />);
+  expect(await screen.findByText("a", { selector: "td" })).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});

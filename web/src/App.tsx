@@ -24,6 +24,7 @@ import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { SecurityGroupPage } from "@/security-groups/SecurityGroupPage";
 import { SecurityGroupsPage } from "@/security-groups/SecurityGroupsPage";
+import { SettingsPage } from "@/settings/SettingsPage";
 import { PoolsPage } from "@/storage/PoolsPage";
 import { VolumesPage } from "@/storage/VolumesPage";
 import { TasksPage } from "@/tasks/TasksPage";
@@ -70,6 +71,7 @@ function routes() {
             { path: "users", element: <UsersPage /> },
             { path: "tokens", element: <TokensPage /> },
             { path: "cluster", element: <ClusterPage /> },
+            { path: "settings", element: <SettingsPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],
         },

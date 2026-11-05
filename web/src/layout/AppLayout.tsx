@@ -17,6 +17,7 @@ import {
   Moon,
   Network,
   Server,
+  Settings,
   Shield,
   Sun,
   User,
@@ -62,6 +63,7 @@ const NAV: { to: string; key: string; icon: LucideIcon; end: boolean; kind?: Kin
   { to: "/users", key: "nav.users", icon: Users, end: false, kind: "user" },
   { to: "/tokens", key: "nav.tokens", icon: KeyRound, end: false },
   { to: "/cluster", key: "nav.cluster", icon: Boxes, end: false },
+  { to: "/settings", key: "nav.settings", icon: Settings, end: false },
 ];
 
 export function AppLayout() {

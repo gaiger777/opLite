@@ -45,6 +45,7 @@ function signedOut() {
       "/vm-imports",
     ].map((path) => http.get(apiUrl(path), () => HttpResponse.json({ revision: 1, items: [] }))),
     ws.link(`ws://${window.location.host}/api/v1/watch`).addEventListener("connection", () => {}),
+    http.get(apiUrl("/version"), () => HttpResponse.json({ version: "0.9.0~ci7" })),
     http.get(apiUrl("/cluster"), () =>
       HttpResponse.json({ name: "lab", ca_fingerprint: "x", node: admin.user, members: [] }),
     ),
@@ -60,6 +61,8 @@ it("signs in, returns to the requested page and signs out", async () => {
   await screen.findByRole("button", { name: "Sign in" });
   expect(window.location.pathname).toBe("/login");
   expect(screen.getByRole("heading", { level: 1, name: "opLite" })).toBeInTheDocument();
+  // 로그인하기 전에도 서버 버전이 보인다.
+  expect(await screen.findByText("opLite 0.9.0~ci7")).toBeInTheDocument();
   await user.type(screen.getByLabelText("Username"), "admin");
   await user.type(screen.getByLabelText("Password"), "nope");
   await user.click(screen.getByRole("button", { name: "Sign in" }));

@@ -18,6 +18,13 @@ export const KINDS: WatchKind[] = [
   "vm-import",
 ];
 
+/**
+ * 목록 없이 watch로만 받는 클러스터 설정(`Settings`, 늘 하나). 캐시 키는 `SETTINGS_KEY`이고, 연결할 때마다
+ * `LiveProvider`가 다시 읽는다.
+ */
+export const SETTINGS_KIND = "settings";
+export const SETTINGS_KEY = ["settings"] as const;
+
 /** 목록 응답. `revision`은 목록을 읽은 시점의 클러스터 revision이다. */
 export interface List<T> {
   revision: number;
@@ -30,8 +37,13 @@ interface Versioned {
 }
 
 export type WatchEvent =
-  | { type: "put"; kind: WatchKind; resource: Versioned }
-  | { type: "deleted"; revision: number; kind: WatchKind; resource: Versioned }
+  | { type: "put"; kind: WatchKind | typeof SETTINGS_KIND; resource: Versioned }
+  | {
+      type: "deleted";
+      revision: number;
+      kind: WatchKind | typeof SETTINGS_KIND;
+      resource: Versioned;
+    }
   | { type: "reset"; revision: number }
   | { type: "error"; code: string; message?: string };
 
@@ -104,5 +116,14 @@ export function useList<K extends WatchKind>(kind: K) {
     queryFn: () => fetchList(kind),
     staleTime: Infinity,
     select: (list) => list.items,
+  });
+}
+
+/** 클러스터 설정. 아직 저장한 적이 없으면 서버가 기본값(revision 0)을 돌려준다. */
+export function useSettings() {
+  return useQuery({
+    queryKey: SETTINGS_KEY,
+    queryFn: () => call(api.GET("/settings")),
+    staleTime: Infinity,
   });
 }

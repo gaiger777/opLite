@@ -31,4 +31,6 @@ it("hides account pages from other roles", async () => {
   expect(screen.getByRole("link", { name: "Backups" })).toHaveAttribute("href", "/backups");
   expect(screen.getByRole("link", { name: "Backup jobs" })).toHaveAttribute("href", "/backup-jobs");
   expect(screen.getByRole("link", { name: "Imports" })).toHaveAttribute("href", "/imports");
+  // 설정도 누구나 읽는다(바꾸기는 admin만).
+  expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("href", "/settings");
 });

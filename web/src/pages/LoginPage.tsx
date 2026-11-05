@@ -1,7 +1,9 @@
+import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Navigate, useSearchParams } from "react-router";
 
+import { api, call } from "@/api/client";
 import { useAuth } from "@/auth/AuthProvider";
 import { safeNext } from "@/auth/RequireAuth";
 import { Button } from "@/components/ui/button";
@@ -18,6 +20,13 @@ export function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // 서버 버전은 로그인 없이 읽는다. 읽지 못하면(옛 서버) 보이지 않는다.
+  const version = useQuery({
+    queryKey: ["version"],
+    queryFn: () => call(api.GET("/version")),
+    staleTime: Infinity,
+    retry: false,
+  });
 
   // 세션을 확인하는 동안에는 폼을 그리지 않는다(로그인돼 있으면 잠깐 보였다 사라진다).
   if (principal === undefined) {
@@ -41,7 +50,7 @@ export function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-svh items-center justify-center p-4">
+    <div className="flex min-h-svh flex-col items-center justify-center gap-4 p-4">
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle className="text-xl">
@@ -84,6 +93,11 @@ export function LoginPage() {
           </form>
         </CardContent>
       </Card>
+      {version.data && (
+        <p className="text-xs text-muted-foreground">
+          {t("login.version", { version: version.data.version })}
+        </p>
+      )}
     </div>
   );
 }

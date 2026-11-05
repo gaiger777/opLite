@@ -19,6 +19,8 @@ export type SecurityGroup = Schemas["Resource_SecurityGroupSpec_SecurityGroupSta
 export type Rule = Schemas["Rule"];
 export type Principal = Schemas["Principal"];
 export type Role = Schemas["Role"];
+export type Settings = Schemas["Resource_SettingsSpec_SettingsStatus"];
+export type Channel = Schemas["Channel"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =

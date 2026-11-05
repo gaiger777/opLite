@@ -153,6 +153,27 @@ it("shows HA recoveries with the failed node's name", async () => {
   expect(row).toHaveTextContent("node-b");
 });
 
+it("names node update tasks by the node", async () => {
+  mockLists({
+    node: [{ id: "n2", name: "node-b" }],
+    task: [
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000005",
+        spec: { op: { kind: "node-update-check" }, target: "n2", node: "n2" },
+        status: { state: "succeeded", error: null },
+      },
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000006",
+        spec: { op: { kind: "node-upgrade" }, target: "n2", node: "n2" },
+        status: { state: "running", error: null },
+      },
+    ],
+  });
+  renderPage(<TasksPage />);
+  expect(await screen.findByText("Check updates on node-b")).toBeInTheDocument();
+  expect(screen.getByText("Upgrade node-b")).toBeInTheDocument();
+});
+
 function many(n: number, state: "failed" | "succeeded" = "succeeded") {
   return Array.from({ length: n }, (_, i) => ({
     id: `019a0f3c-8a10-7000-8000-${String(i).padStart(12, "0")}`,
