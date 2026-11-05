@@ -2997,6 +2997,7 @@ const NODE_HEADERS: &[&str] = &[
     "NAME",
     "ID",
     "ADDRESS",
+    "VERSION",
     "UNDERLAY",
     "ONLINE",
     "CPUS",
@@ -3012,6 +3013,8 @@ fn node_row(n: &Value) -> Vec<String> {
         cell(&n["name"]),
         cell(&n["id"]),
         cell(&n["spec"]["address"]),
+        // 옛 버전 노드는 기록하지 않는다.
+        cell(&n["status"]["version"]),
         // VXLAN 패킷을 주고받는 주소. 위트니스와 옛 서버는 없다.
         cell(&n["status"]["underlay"]),
         cell(&n["status"]["online"]),
@@ -3097,6 +3100,20 @@ fn print_cluster_status(out: &mut (dyn Write + Send), view: &Value) -> anyhow::R
     } else if voters.len() >= 3 && voters.iter().filter(|m| m["witness"] != true).count() < 2 {
         // 위트니스는 VM을 돌리지 않으므로 VM을 옮겨 받을 일반 노드가 둘 이상이어야 한다.
         writeln!(out, "warning: HA needs at least two non-witness nodes")?;
+    }
+    // 버전을 모르는 멤버(옛 버전 노드, 합류 중)는 세지 않는다.
+    let mut versions: Vec<&str> = members
+        .iter()
+        .filter_map(|m| m["version"].as_str())
+        .collect();
+    versions.sort_by(|a, b| opl_types::version::compare(a, b));
+    versions.dedup_by(|a, b| opl_types::version::compare(a, b).is_eq());
+    if versions.len() > 1 {
+        writeln!(
+            out,
+            "warning: nodes run different opLite versions ({}); finish the upgrade on every node",
+            versions.join(", ")
+        )?;
     }
     Ok(())
 }
@@ -4939,6 +4956,7 @@ mod tests {
         let mut a = node("a", Some(false));
         a["status"]["ha"] = json!({ "fencing": "watchdog", "recover_after_secs": 65 });
         a["status"]["underlay"] = json!("10.0.0.1");
+        a["status"]["version"] = json!("0.2.0");
         let rows: Vec<_> = [a, node("w", Some(true)), node("old", None)]
             .iter()
             .map(node_row)
@@ -4949,10 +4967,10 @@ mod tests {
         // underlay가 없는 노드(위트니스, 옛 서버)는 `-`다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME  ID      ADDRESS        UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  FENCING\n\
-             a     id-a    10.0.0.1:8006  10.0.0.1  true    4     1.0GiB  false        false    watchdog\n\
-             w     id-w    10.0.0.1:8006  -         true    4     1.0GiB  false        true     -\n\
-             old   id-old  10.0.0.1:8006  -         true    4     1.0GiB  false        false    -\n"
+            "NAME  ID      ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  FENCING\n\
+             a     id-a    10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    watchdog\n\
+             w     id-w    10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     -\n\
+             old   id-old  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -\n"
         );
     }
 
@@ -5022,6 +5040,55 @@ mod tests {
             member("a", true, false),
             member("b", true, false),
             old,
+        ]);
+        assert!(!out.contains("warning"), "{out}");
+    }
+
+    /// 버전을 아는 멤버의 버전이 둘 이상이면 낮은 것부터 한 번씩 적어 경고한다. 모르는 멤버는 세지 않는다.
+    #[test]
+    fn cluster_status_warns_about_mixed_versions() {
+        let member = |name: &str, version: Option<&str>| {
+            json!({
+                "id": format!("id-{name}"),
+                "name": name,
+                "address": format!("{name}:8006"),
+                "cluster_address": format!("{name}:8007"),
+                "voter": true,
+                "online": true,
+                "witness": false,
+                "version": version,
+            })
+        };
+        let status = |members: Vec<Value>| {
+            let view = json!({
+                "name": "lab",
+                "ca_fingerprint": "ab:cd",
+                "leader": "id-a",
+                "node": "id-a",
+                "members": members,
+            });
+            let mut out = Vec::new();
+            print_cluster_status(&mut out, &view).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let out = status(vec![
+            member("a", Some("0.10.0")),
+            member("b", Some("0.9.0")),
+            member("c", Some("0.10.0")),
+            member("d", Some("0.10.0~rc1")),
+            member("e", None),
+        ]);
+        assert!(
+            out.ends_with(
+                "warning: nodes run different opLite versions (0.9.0, 0.10.0~rc1, 0.10.0); \
+                 finish the upgrade on every node\n"
+            ),
+            "{out}"
+        );
+        let out = status(vec![
+            member("a", Some("0.10.0")),
+            member("b", Some("0.10.0")),
+            member("c", None),
         ]);
         assert!(!out.contains("warning"), "{out}");
     }

@@ -20,6 +20,7 @@ use opl_peer::pki::{ClusterCa, fingerprint};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, JoinToken, JoinTokenSpec};
 use opl_types::node::{Fencing, NodeSpec, NodeStatus};
 use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::version;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -159,6 +160,8 @@ pub struct MemberView {
     pub witness: bool,
     /// 노드의 HA 펜싱. 펜싱이 꺼졌거나 Node가 아직 없으면 null이다.
     pub fencing: Option<Fencing>,
+    /// 노드의 opld 빌드 버전. 옛 버전 노드이거나 Node가 아직 없으면 null이다.
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -194,6 +197,7 @@ pub async fn get_cluster(
             online: node.is_some_and(|n| n.status.online),
             witness: node.is_some_and(|n| n.spec.witness),
             fencing: node.and_then(|n| n.status.ha).map(|ha| ha.fencing),
+            version: node.and_then(|n| n.status.version.clone()),
         }
     };
     let mut list: Vec<MemberView> = members
@@ -214,6 +218,21 @@ pub async fn get_cluster(
         node: state.node,
         members: list,
     }))
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct VersionInfo {
+    /// 이 노드의 opld 빌드 버전
+    pub version: String,
+}
+
+/// 이 노드의 빌드 버전. 인증 없이 읽는다(로그인 화면과 oplctl이 서버 버전을 본다).
+#[utoipa::path(get, path = "/version", tag = "cluster", security(()),
+    responses((status = 200, body = VersionInfo)))]
+pub async fn get_version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        version: version::BUILD.to_string(),
+    })
 }
 
 /// 클러스터 CA 인증서(PEM). 인증 없이 읽는다. 받는 쪽은 반드시 지문을 확인해야 한다.
@@ -315,6 +334,9 @@ pub struct JoinRequest {
     /// 새 노드가 위트니스(투표만 하고 VM을 돌리지 않는 노드)인지
     #[serde(default)]
     pub witness: bool,
+    /// 새 노드의 opld 빌드 버전. 옛 버전 노드는 보내지 않는다.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -325,6 +347,30 @@ pub struct JoinResponse {
     pub cert_pem: String,
     /// 이 노드의 노드 간 통신 주소. 새 노드는 여기로 승격을 요청한다.
     pub via: String,
+}
+
+/// 합류하는 노드가 클러스터의 가장 낮은 노드 버전(위트니스 포함, 버전을 적은 노드만, 합류하는 노드
+/// 자신의 옛 기록은 빼고)보다 낮으면 거절한다. 버전을 보내지 않는 옛 노드도 버전을 적은 노드가
+/// 있으면 거절한다. 새 노드가 옛 노드가 모르는 상태를 쓰지 않게 한다.
+fn check_version(state: &AppState, joining: Uuid, version: Option<&str>) -> Result<(), ApiError> {
+    let nodes = state.cluster.list::<NodeSpec>()?.1;
+    let oldest = nodes
+        .iter()
+        .filter(|n| n.id != joining)
+        .filter_map(|n| n.status.version.as_deref())
+        .min_by(|a, b| version::compare(a, b));
+    let Some(oldest) = oldest else {
+        return Ok(());
+    };
+    let runs = match version {
+        Some(version) if version::compare(version, oldest).is_lt() => version,
+        Some(_) => return Ok(()),
+        None => "an unknown version",
+    };
+    Err(ApiError::conflict(
+        "version_too_old",
+        format!("this node runs {runs}; the cluster runs {oldest} or newer; upgrade it first"),
+    ))
 }
 
 fn invalid_token() -> ApiError {
@@ -360,6 +406,7 @@ pub async fn join(
         return Err(invalid_token());
     }
 
+    check_version(&state, req.node, req.version.as_deref())?;
     check_name(&req.name)?;
     let (Some(api_host), Some(cluster_host)) = (
         host_of(&req.address).filter(|h| valid_host(h)),
@@ -430,6 +477,7 @@ pub async fn join(
 
     // 앞서 합류하다 실패한 같은 노드면 Node 리소스를 다시 쓴다.
     // 온라인으로 기록해 첫 핑 전에 노드가 제거되지 않게 한다. 핑이 계속 실패하면 리더가 오프라인으로 바꾼다.
+    // 버전은 보낸 값으로 적어, 등록 전에도 버전 검사가 이 노드를 센다.
     let spec = NodeSpec {
         address: req.address.clone(),
         maintenance: false,
@@ -443,6 +491,7 @@ pub async fn join(
                 .await?;
             let status = NodeStatus {
                 online: true,
+                version: req.version.clone(),
                 ..node.status
             };
             state
@@ -454,6 +503,7 @@ pub async fn join(
             let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(req.name.clone(), spec);
             node.id = req.node;
             node.status.online = true;
+            node.status.version = req.version.clone();
             state.cluster.create(&node).await?;
         }
     }

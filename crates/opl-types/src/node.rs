@@ -63,6 +63,10 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub firewall: bool,
+    /// 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub version: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -186,6 +190,19 @@ mod tests {
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["firewall"], true);
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+    }
+
+    #[test]
+    fn status_version_round_trips_and_is_omitted_when_none() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("version").is_none(), "{none}");
+        let status = NodeStatus {
+            version: Some("0.2.0~ci7".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["version"], "0.2.0~ci7");
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
 

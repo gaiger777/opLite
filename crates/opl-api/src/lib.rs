@@ -87,6 +87,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::get_node, r::update_node, cluster::delete_node))
         .routes(routes!(cluster::get_cluster))
         .routes(routes!(cluster::get_ca))
+        .routes(routes!(cluster::get_version))
         .routes(routes!(cluster::create_join_token))
         .routes(routes!(cluster::join))
         .routes(routes!(r::list_pools, r::create_pool))

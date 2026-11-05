@@ -12,6 +12,7 @@ use opl_types::auth::{Role, UserSpec};
 use opl_types::cluster::ClusterSpec;
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
+use opl_types::version::BUILD;
 use opl_types::vm::Arch;
 use uuid::Uuid;
 
@@ -157,6 +158,7 @@ async fn record_node(
             // VXLAN 네트워크를 잃지 않게).
             underlay: underlay.or(status.underlay),
             firewall: host.firewall.is_some(),
+            version: Some(BUILD.to_string()),
         };
         true
     })
@@ -171,6 +173,7 @@ pub async fn register_witness(cluster: &Cluster, config: &Config) -> anyhow::Res
         *status = NodeStatus {
             online: true,
             arch: Some(Arch::native()),
+            version: Some(BUILD.to_string()),
             ..NodeStatus::default()
         };
         true
@@ -424,6 +427,35 @@ pub(crate) mod tests {
         cluster.shutdown().await.unwrap();
     }
 
+    /// 등록할 때 이 빌드의 버전을 쓴다(옛 버전으로 적힌 값도 바꾼다).
+    #[tokio::test]
+    async fn registration_records_the_build_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        let version = || {
+            cluster
+                .get::<NodeSpec>(id.0)
+                .unwrap()
+                .unwrap()
+                .status
+                .version
+        };
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(version().as_deref(), Some(BUILD));
+        update_node_status(&cluster, |status| {
+            status.version = Some("0.0.1".into());
+            true
+        })
+        .await
+        .unwrap();
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(version().as_deref(), Some(BUILD));
+        cluster.shutdown().await.unwrap();
+    }
+
     /// 위트니스는 역할과 온라인, 아키텍처만 기록하고 VM을 돌리는 데 쓰는 값은 비운다.
     #[tokio::test]
     async fn witness_registration_records_only_the_role_and_architecture() {
@@ -444,6 +476,7 @@ pub(crate) mod tests {
             NodeStatus {
                 online: true,
                 arch: Some(Arch::native()),
+                version: Some(BUILD.to_string()),
                 ..NodeStatus::default()
             }
         );

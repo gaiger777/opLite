@@ -140,6 +140,7 @@ impl Env {
             ha: None,
             underlay: None,
             firewall: false,
+            version: None,
         };
         cluster.create(&me).await.unwrap();
         let admin = Resource::new(

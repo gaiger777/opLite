@@ -8,6 +8,8 @@ use opl_cluster::types::NodeId;
 use opl_peer::pki::{fingerprint, first_cert, node_id_of, node_key_and_csr};
 use opl_types::cluster::JoinTokenSpec;
 use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
+use opl_types::resource::Resource;
+use opl_types::version::BUILD;
 use reqwest::StatusCode;
 use serde_json::json;
 use uuid::Uuid;
@@ -90,6 +92,7 @@ fn join_request(token: &str, name: &str) -> (JoinRequest, Uuid) {
             cluster_address: "10.0.0.7:8007".into(),
             csr_pem,
             witness: false,
+            version: Some(BUILD.into()),
         },
         node,
     )
@@ -257,6 +260,120 @@ async fn a_witness_joins_as_a_witness() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["spec"]["witness"], false, "{body}");
+}
+
+/// 빌드 버전은 로그인 없이 읽는다.
+#[tokio::test]
+async fn version_is_served_without_login() {
+    let env = Env::start().await;
+    let (status, body) = env.anonymous().get("/version").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "version": BUILD }));
+}
+
+/// 이 노드의 기록된 버전을 바꾼다.
+async fn set_version(env: &Env, node: Uuid, version: &str) {
+    let mut status = env.cluster.get::<NodeSpec>(node).unwrap().unwrap().status;
+    status.version = Some(version.into());
+    env.cluster
+        .update_status::<NodeSpec>(node, &status)
+        .await
+        .unwrap();
+}
+
+/// 클러스터의 가장 낮은 노드 버전(위트니스·오프라인 노드도)보다 낮은 노드와 버전을 보내지 않는
+/// 옛 노드는 토큰을 쓰지 않고 거절한다. 같거나 높은 버전은 합류한다. 멤버 목록에 버전이 보인다.
+#[tokio::test]
+async fn a_node_older_than_the_cluster_is_refused() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    set_version(&env, env.node, "1.2.0").await;
+    let mut witness: Resource<NodeSpec, NodeStatus> = Resource::new(
+        "w",
+        NodeSpec {
+            address: "10.0.0.9:8006".into(),
+            maintenance: false,
+            witness: true,
+        },
+    );
+    witness.status.version = Some("1.1.0".into());
+    env.cluster.create(&witness).await.unwrap();
+
+    let token = new_token(&env).await;
+    for old in ["1.0.5", "1.1.0~rc1"] {
+        let (mut req, _) = join_request(&token, "node2");
+        req.version = Some(old.into());
+        let (status, body) = anon.post("/cluster/join", json!(req)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "version_too_old");
+        assert_eq!(
+            body["message"],
+            format!("this node runs {old}; the cluster runs 1.1.0 or newer; upgrade it first")
+        );
+    }
+    // 거절은 토큰을 쓰지 않는다.
+    let (mut req, node) = join_request(&token, "node2");
+    req.version = Some("1.1.0".into());
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (mut req, node3) = join_request(&new_token(&env).await, "node3");
+    req.version = Some("1:0.1".into());
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (mut req, _) = join_request(&new_token(&env).await, "node4");
+    req.version = None;
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "version_too_old");
+    assert_eq!(
+        body["message"],
+        "this node runs an unknown version; the cluster runs 1.1.0 or newer; upgrade it first"
+    );
+
+    // 다시 합류하는 노드 자신의 옛 기록은 세지 않는다.
+    mark_offline(&env, node).await;
+    set_version(&env, node, "0.1.0").await;
+    let (mut req, _) = join_request(&new_token(&env).await, "node2");
+    req.node = node;
+    req.version = Some("1.1.0".into());
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, view) = env.admin().await.get("/cluster").await;
+    let version_of = |id: Uuid| {
+        view["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id.to_string())
+            .unwrap()["version"]
+            .clone()
+    };
+    assert_eq!(version_of(env.node), "1.2.0", "{view}");
+    // 합류 때 보낸 버전을 등록 전부터 적는다. 다시 합류하면 옛 기록을 바꾼다.
+    assert_eq!(version_of(node3), "1:0.1", "{view}");
+    assert_eq!(version_of(node), "1.1.0", "{view}");
+}
+
+/// 노드 버전을 하나도 적지 않은 옛 클러스터는 버전을 보내지 않는 노드도 받는다.
+#[tokio::test]
+async fn a_cluster_without_versions_takes_a_node_without_one() {
+    let env = Env::start().await;
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.version = None;
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let (mut req, _) = join_request(&new_token(&env).await, "node2");
+    req.version = None;
+    let (status, body) = env.anonymous().post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

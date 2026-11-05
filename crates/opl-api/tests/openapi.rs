@@ -13,6 +13,7 @@ async fn openapi_document_is_served_without_login() {
     let paths = doc["paths"].as_object().unwrap();
     for path in [
         "/auth/login",
+        "/version",
         "/vms",
         "/vms/{key}",
         "/vms/{key}/actions/{action}",

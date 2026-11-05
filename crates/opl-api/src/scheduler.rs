@@ -167,6 +167,7 @@ mod tests {
             ha: None,
             underlay: None,
             firewall: false,
+            version: None,
         };
         n
     }

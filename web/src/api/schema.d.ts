@@ -522,6 +522,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/version": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 이 노드의 빌드 버전. 인증 없이 읽는다(로그인 화면과 oplctl이 서버 버전을 본다). */
+        get: operations["get_version"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vm-imports": {
         parameters: {
             query?: never;
@@ -1507,6 +1524,8 @@ export interface components {
             node: string;
             /** @description 조인 URL의 토큰 */
             token: string;
+            /** @description 새 노드의 opld 빌드 버전. 옛 버전 노드는 보내지 않는다. */
+            version?: string | null;
             /** @description 새 노드가 위트니스(투표만 하고 VM을 돌리지 않는 노드)인지 */
             witness?: boolean;
         };
@@ -1765,6 +1784,8 @@ export interface components {
                      *     None).
                      */
                     underlay?: string;
+                    /** @description 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
+                    version?: string;
                 };
             }[];
             /** Format: int64 */
@@ -2137,6 +2158,8 @@ export interface components {
             /** @description Node 리소스 이름. 아직 없으면(합류 중) 비어 있다. */
             name?: string | null;
             online: boolean;
+            /** @description 노드의 opld 빌드 버전. 옛 버전 노드이거나 Node가 아직 없으면 null이다. */
+            version?: string | null;
             /** @description 투표 멤버인지(아니면 learner) */
             voter: boolean;
             /** @description 위트니스 노드인지(VM을 돌리지 않는 투표 멤버) */
@@ -2244,6 +2267,8 @@ export interface components {
              *     None).
              */
             underlay?: string;
+            /** @description 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
+            version?: string;
         };
         OvaSource: {
             /** @description 올린 파일 이름(표시용) */
@@ -2555,6 +2580,8 @@ export interface components {
                  *     None).
                  */
                 underlay?: string;
+                /** @description 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
+                version?: string;
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -3179,6 +3206,10 @@ export interface components {
             /** Format: int64 */
             revision: number;
             role: components["schemas"]["Role"];
+        };
+        VersionInfo: {
+            /** @description 이 노드의 opld 빌드 버전 */
+            version: string;
         };
         /** @description 리소스만 지운 가져오기 지우기(`force`)의 응답 */
         VmImportForgotten: {
@@ -4681,6 +4712,25 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_version: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionInfo"];
                 };
             };
         };
