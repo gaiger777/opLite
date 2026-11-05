@@ -8,6 +8,11 @@ export function formatTime(date: Date, language: string): string {
   return date.toLocaleString(language, { dateStyle: "medium", timeStyle: "medium" });
 }
 
+/** 날짜만(만료일 등). 서버·oplctl처럼 UTC 날짜다. */
+export function formatDate(date: Date, language: string): string {
+  return date.toLocaleDateString(language, { dateStyle: "medium", timeZone: "UTC" });
+}
+
 /** MiB를 읽기 좋게: 512 MiB, 4 GiB */
 export function formatMib(mib: number): string {
   return mib >= 1024 && mib % 1024 === 0 ? `${mib / 1024} GiB` : `${mib} MiB`;

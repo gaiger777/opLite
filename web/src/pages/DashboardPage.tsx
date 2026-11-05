@@ -20,6 +20,7 @@ import {
 import { errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
 import { compareVersions } from "@/lib/version";
+import { SubscriptionBanner } from "@/settings/SubscriptionBanner";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
 import { vcpus } from "@/vms/VmListPage";
 
@@ -92,6 +93,7 @@ export function DashboardPage() {
   return (
     <div className="flex flex-col gap-6">
       <h1 className="text-2xl font-semibold">{t("nav.dashboard")}</h1>
+      <SubscriptionBanner />
       {/* 롤링 업그레이드 중이거나 멈춘 업그레이드가 있다. */}
       {versions.length > 1 && (
         <p

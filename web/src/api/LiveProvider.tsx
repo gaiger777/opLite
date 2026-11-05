@@ -9,6 +9,7 @@ import {
   listKey,
   SETTINGS_KEY,
   SETTINGS_KIND,
+  SUBSCRIPTION_KEY,
   type WatchEvent,
 } from "@/api/live";
 import type { Settings } from "@/api/types";
@@ -64,8 +65,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           ),
         );
         since = Math.min(...lists.map((list) => list.revision));
-        // 설정은 목록이 없으므로 watch를 열기 전에 다시 읽는다(보는 화면이 있을 때만).
+        // 설정과 구독 상태는 목록이 없으므로 watch를 열기 전에 다시 읽는다(보는 화면이 있을 때만).
         await queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
+        await queryClient.invalidateQueries({ queryKey: SUBSCRIPTION_KEY });
       } catch {
         retry();
         return;
@@ -99,8 +101,20 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 queryClient.setQueryData<Settings>(SETTINGS_KEY, (current) =>
                   current && current.revision >= resource.revision ? current : resource,
                 );
+                // 구독 키가 바뀌었을 수 있다(이벤트에는 키가 없으므로 상태를 다시 읽는다).
+                void queryClient.invalidateQueries({ queryKey: SUBSCRIPTION_KEY });
               }
               break;
+            }
+            // 노드가 합류하거나 떠나면 구독의 노드 수가 바뀐다.
+            if (
+              event.kind === "node" &&
+              (event.type === "deleted" ||
+                !queryClient
+                  .getQueryData<List<{ id: string }>>(listKey("node"))
+                  ?.items.some((node) => node.id === event.resource.id))
+            ) {
+              void queryClient.invalidateQueries({ queryKey: SUBSCRIPTION_KEY });
             }
             queryClient.setQueryData<List<{ id: string; revision: number }>>(
               listKey(event.kind),

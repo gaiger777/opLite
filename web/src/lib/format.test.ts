@@ -1,4 +1,11 @@
-import { formatBytes, formatCapacity, formatMib, formatTime, uuidTime } from "@/lib/format";
+import {
+  formatBytes,
+  formatCapacity,
+  formatDate,
+  formatMib,
+  formatTime,
+  uuidTime,
+} from "@/lib/format";
 
 it("reads the time from a UUIDv7", () => {
   expect(uuidTime("019a0f3c-8a10-7000-8000-000000000000").toISOString()).toBe(
@@ -23,6 +30,14 @@ it("shows the full year", () => {
   const time = new Date("2025-10-23T04:03:37.104Z");
   expect(formatTime(time, "en")).toContain("2025");
   expect(formatTime(time, "ko")).toContain("2025");
+  expect(formatDate(time, "en")).toContain("2025");
+  expect(formatDate(time, "en")).not.toContain(":");
+});
+
+it("shows dates in UTC like the server and oplctl", () => {
+  // 어느 시간대의 브라우저에서도 같은 날이다(둘 중 하나는 로컬 시간대에서 다른 날이 된다).
+  expect(formatDate(new Date("2026-01-01T00:30:00Z"), "en")).toBe("Jan 1, 2026");
+  expect(formatDate(new Date("2025-12-31T23:30:00Z"), "en")).toBe("Dec 31, 2025");
 });
 
 it("formats byte counts", () => {

@@ -59,7 +59,10 @@
     "version_too_old": "The node runs an older opLite than the cluster. Upgrade it first: {{message}}",
     "updates_unsupported": "The node does not check for updates.",
     "upgrade_in_progress": "An upgrade is in progress: {{message}}",
-    "cluster_upgrading": "The cluster is being upgraded: {{message}}"
+    "cluster_upgrading": "The cluster is being upgraded: {{message}}",
+    "subscription_required": "An active subscription is required for the enterprise channel.",
+    "invalid_subscription_key": "The subscription key is not valid: {{message}}",
+    "telemetry_endpoint_required": "Set a telemetry endpoint first. This build has no default endpoint."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -1051,7 +1054,16 @@
     "allTasks": "All tasks",
     "noLeader": "No leader",
     "noNodes": "No nodes.",
-    "mixedVersions": "Nodes run different opLite versions ({{versions}}). Finish the upgrade on every node."
+    "mixedVersions": "Nodes run different opLite versions ({{versions}}). Finish the upgrade on every node.",
+    "subscription": {
+      "none": "This cluster has no subscription.",
+      "invalid": "The subscription key does not match this build.",
+      "expired": "The subscription expired on {{date}}.",
+      "over_limit": "The cluster has {{used}} nodes, but the subscription covers {{limit}}.",
+      "expiring": "The subscription expires on {{date}}.",
+      "manage": "Subscription settings",
+      "dismiss": "Hide for 7 days"
+    }
   },
   "settings": {
     "updates": "Updates",
@@ -1059,9 +1071,64 @@
     "channelHint": "Every node gets opLite packages from this channel. Testing gets new versions before stable.",
     "channels": {
       "stable": "Stable",
-      "testing": "Testing"
+      "testing": "Testing",
+      "enterprise": "Enterprise"
     },
     "saved": "Settings saved.",
-    "adminOnly": "Only administrators can change the settings."
+    "adminOnly": "Only administrators can change the settings.",
+    "errors": {
+      "busy": "Another settings change is in progress. Try again."
+    },
+    "enterpriseHint": "Enterprise needs an active subscription.",
+    "subscription": {
+      "title": "Subscription",
+      "states": {
+        "none": "No subscription",
+        "active": "Active",
+        "expired": "Expired",
+        "invalid": "Invalid key",
+        "over_limit": "Over the node limit"
+      },
+      "development": "Development key",
+      "customer": "Customer",
+      "level": "Level",
+      "levels": {
+        "standard": "Standard",
+        "premium": "Premium"
+      },
+      "nodes": "Nodes",
+      "expires": "Expires",
+      "key": "Subscription key",
+      "keyHint": "Paste the key you received. It starts with opl1.",
+      "apply": "Apply key",
+      "applied": "Subscription key applied.",
+      "remove": "Remove key",
+      "removeTitle": "Remove the subscription key?",
+      "removeDescription": "The cluster will have no subscription. Nodes on the enterprise channel stop getting updates.",
+      "removed": "Subscription key removed."
+    },
+    "telemetry": {
+      "title": "Telemetry",
+      "intro": "When on, the leader sends a usage report once a day: counts and versions only, without names, addresses or keys.",
+      "on": "On",
+      "off": "Off",
+      "endpoint": "Endpoint",
+      "buildDefault": "Not set (the build's default endpoint is used if it has one)",
+      "endpointHint": "An https:// address. Leave it empty to use the build default.",
+      "saveEndpoint": "Save endpoint",
+      "id": "Report ID",
+      "lastSent": "Last sent",
+      "never": "Never",
+      "lastError": "Last error",
+      "enable": "Turn on…",
+      "disable": "Turn off",
+      "resetId": "New report ID",
+      "previewTitle": "Turn on telemetry",
+      "previewDescription": "This is the report the cluster would send now. Nothing else is sent.",
+      "confirmEnable": "Turn on",
+      "enabled": "Telemetry turned on.",
+      "disabled": "Telemetry turned off.",
+      "idReset": "New report ID made."
+    }
   }
 }

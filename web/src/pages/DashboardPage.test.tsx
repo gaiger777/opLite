@@ -236,3 +236,13 @@ it("warns while nodes run different versions", async () => {
   expect(await screen.findByText("a", { selector: "td" })).toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
+
+it("shows the subscription notice above the dashboard", async () => {
+  mockLists({ node: [NODE], vm: [] });
+  server.use(
+    cluster("n1"),
+    http.get(apiUrl("/subscription"), () => HttpResponse.json({ state: "none", used_nodes: 1 })),
+  );
+  renderPage(<DashboardPage />);
+  expect(await screen.findByRole("status")).toHaveTextContent("This cluster has no subscription.");
+});

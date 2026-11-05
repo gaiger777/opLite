@@ -3,18 +3,19 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
-import { api, call } from "@/api/client";
-import { SETTINGS_KEY, useSettings } from "@/api/live";
-import type { Channel, Settings } from "@/api/types";
+import { useSettings, useSubscription } from "@/api/live";
+import type { Channel } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import { errorMessage } from "@/i18n/errors";
+import { patchSettings, settingsError } from "@/settings/save";
+import { SubscriptionSection } from "@/settings/SubscriptionSection";
+import { TelemetrySection } from "@/settings/TelemetrySection";
 
-const CHANNELS: Channel[] = ["stable", "testing"];
+const CHANNELS: Channel[] = ["stable", "testing", "enterprise"];
 
 /** 클러스터 설정. 누구나 읽고 admin만 바꾼다. */
 export function SettingsPage() {
@@ -22,6 +23,7 @@ export function SettingsPage() {
   const me = usePrincipal();
   const queryClient = useQueryClient();
   const settings = useSettings();
+  const subscription = useSubscription();
   const write = can(me.role, "write", "settings");
   // 고르기 전에는 서버의 값을 보인다(watch로 바뀌어도 따라간다).
   const [chosen, setChosen] = useState<Channel | null>(null);
@@ -34,26 +36,19 @@ export function SettingsPage() {
   const current = settings.data.spec.updates?.channel ?? "stable";
   const channel = chosen ?? current;
   const revision = settings.data.revision;
+  // enterprise 저장소는 구독 키로 인증하므로 구독이 active일 때만 고른다(서버도 확인한다).
+  const subscribed = subscription.data?.state === "active";
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
     try {
-      const updated = await call(
-        api.PATCH("/settings", {
-          params: { header: { "If-Match": revision } },
-          body: { updates: { channel } },
-        }),
-      );
-      // 응답을 기다리는 사이 watch가 더 새 설정을 넣었으면 그것을 남긴다.
-      queryClient.setQueryData<Settings>(SETTINGS_KEY, (old) =>
-        old && old.revision > updated.revision ? old : updated,
-      );
+      await patchSettings(queryClient, revision, { updates: { channel } });
       setChosen(null);
       toast.success(t("settings.saved"));
     } catch (err) {
-      setError(errorMessage(t, err));
+      setError(settingsError(t, err));
     } finally {
       setBusy(false);
     }
@@ -62,6 +57,7 @@ export function SettingsPage() {
   return (
     <div className="flex max-w-xl flex-col gap-6">
       <h1 className="text-2xl font-semibold">{t("nav.settings")}</h1>
+      <SubscriptionSection write={write} />
       <form noValidate onSubmit={(e) => void save(e)} className="flex flex-col gap-4">
         <h2 className="font-medium">{t("settings.updates")}</h2>
         {error && (
@@ -69,7 +65,15 @@ export function SettingsPage() {
             {error}
           </p>
         )}
-        <Field id="settings-channel" label={t("settings.channel")} hint={t("settings.channelHint")}>
+        <Field
+          id="settings-channel"
+          label={t("settings.channel")}
+          hint={
+            subscribed
+              ? t("settings.channelHint")
+              : `${t("settings.channelHint")} ${t("settings.enterpriseHint")}`
+          }
+        >
           {(a11y) => (
             <NativeSelect
               id="settings-channel"
@@ -79,7 +83,7 @@ export function SettingsPage() {
               {...a11y}
             >
               {CHANNELS.map((c) => (
-                <NativeSelectOption key={c} value={c}>
+                <NativeSelectOption key={c} value={c} disabled={c === "enterprise" && !subscribed}>
                   {t(`settings.channels.${c}`)}
                 </NativeSelectOption>
               ))}
@@ -96,6 +100,7 @@ export function SettingsPage() {
           <p className="text-sm text-muted-foreground">{t("settings.adminOnly")}</p>
         )}
       </form>
+      <TelemetrySection write={write} />
     </div>
   );
 }

@@ -2,7 +2,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import { http, HttpResponse, ws } from "msw";
 
-import { listKey, useList, useSettings } from "@/api/live";
+import { listKey, useList, useSettings, useSubscription } from "@/api/live";
 import { LiveProvider, useLiveStatus } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
 import { apiUrl, server } from "@/test/server";
@@ -114,6 +114,74 @@ it("reads the settings again on every connection and applies newer ones", async 
   expect(await screen.findByText("live: testing running")).toBeInTheDocument();
   // 연결하면서 다시 읽었다.
   expect(reads).toBeGreaterThanOrEqual(2);
+});
+
+function SubscriptionProbe() {
+  const status = useLiveStatus();
+  const subscription = useSubscription();
+  return (
+    <p>
+      {status}: {subscription.data?.state}
+    </p>
+  );
+}
+
+it("reads the subscription again when the settings change", async () => {
+  let state = "none";
+  let reads = 0;
+  server.use(
+    ...lists([], 7),
+    http.get(apiUrl("/subscription"), () => {
+      reads += 1;
+      return HttpResponse.json({ state, used_nodes: 1 });
+    }),
+    watch.addEventListener("connection", ({ client }) => {
+      // 다른 admin이 키를 넣었다. 이벤트의 설정에는 키가 없다.
+      state = "active";
+      client.send(
+        JSON.stringify({ type: "put", kind: "settings", resource: settings(9, "stable") }),
+      );
+    }),
+  );
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <LiveProvider>
+        <SubscriptionProbe />
+      </LiveProvider>
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByText("live: active")).toBeInTheDocument();
+  expect(reads).toBeGreaterThanOrEqual(2);
+});
+
+it("reads the subscription again when a node joins or leaves", async () => {
+  const node = (id: string, revision: number) => ({ id, name: id, revision, spec: {}, status: {} });
+  let state = "active";
+  let send: ((event: object) => void) | undefined;
+  server.use(
+    http.get(apiUrl("/nodes"), () => HttpResponse.json({ revision: 7, items: [node("a", 3)] })),
+    ...lists([], 7),
+    http.get(apiUrl("/subscription"), () => HttpResponse.json({ state, used_nodes: 1 })),
+    watch.addEventListener("connection", ({ client }) => {
+      send = (event) => client.send(JSON.stringify(event));
+    }),
+  );
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <LiveProvider>
+        <SubscriptionProbe />
+      </LiveProvider>
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByText("live: active")).toBeInTheDocument();
+  // 새 노드가 합류해 한도를 넘었다.
+  state = "over_limit";
+  send!({ type: "put", kind: "node", resource: node("b", 9) });
+  expect(await screen.findByText("live: over_limit")).toBeInTheDocument();
+  // 그 노드가 떠났다.
+  state = "active";
+  send!({ type: "deleted", kind: "node", revision: 10, resource: node("b", 9) });
+  expect(await screen.findByText("live: active")).toBeInTheDocument();
 });
 
 it("reads the lists again when the watch cannot continue", async () => {

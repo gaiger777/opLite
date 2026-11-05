@@ -24,6 +24,10 @@ export const KINDS: WatchKind[] = [
  */
 export const SETTINGS_KIND = "settings";
 export const SETTINGS_KEY = ["settings"] as const;
+/** 구독 상태(`GET /subscription`). 키는 설정에 있으므로 설정이 바뀌거나 다시 연결하면 다시 읽는다. */
+export const SUBSCRIPTION_KEY = ["subscription"] as const;
+/** 구독 상태를 다시 읽는 주기(만료는 시각으로 정해진다) */
+export const SUBSCRIPTION_REFRESH_MS = 60 * 60 * 1000;
 
 /** 목록 응답. `revision`은 목록을 읽은 시점의 클러스터 revision이다. */
 export interface List<T> {
@@ -125,5 +129,15 @@ export function useSettings() {
     queryKey: SETTINGS_KEY,
     queryFn: () => call(api.GET("/settings")),
     staleTime: Infinity,
+  });
+}
+
+/** 구독 상태. 노드 수와 시각으로 서버가 계산한다. 시각에 따라 만료되므로 한 시간마다 다시 읽는다. */
+export function useSubscription() {
+  return useQuery({
+    queryKey: SUBSCRIPTION_KEY,
+    queryFn: () => call(api.GET("/subscription")),
+    staleTime: Infinity,
+    refetchInterval: SUBSCRIPTION_REFRESH_MS,
   });
 }

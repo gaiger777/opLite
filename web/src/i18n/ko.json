@@ -59,7 +59,10 @@
     "version_too_old": "노드의 opLite가 클러스터보다 오래됐습니다. 먼저 업그레이드하세요: {{message}}",
     "updates_unsupported": "이 노드는 업데이트를 확인하지 않습니다.",
     "upgrade_in_progress": "업그레이드가 진행 중입니다: {{message}}",
-    "cluster_upgrading": "클러스터를 업그레이드하는 중입니다: {{message}}"
+    "cluster_upgrading": "클러스터를 업그레이드하는 중입니다: {{message}}",
+    "subscription_required": "enterprise 채널에는 유효한(active) 구독이 필요합니다.",
+    "invalid_subscription_key": "구독 키가 올바르지 않습니다: {{message}}",
+    "telemetry_endpoint_required": "먼저 텔레메트리 끝점을 정하세요. 이 빌드에는 기본 끝점이 없습니다."
   },
   "nav": {
     "dashboard": "대시보드",
@@ -1051,7 +1054,16 @@
     "allTasks": "모든 작업",
     "noLeader": "리더 없음",
     "noNodes": "노드가 없습니다.",
-    "mixedVersions": "노드들이 서로 다른 opLite 버전({{versions}})을 돌립니다. 모든 노드의 업그레이드를 끝내세요."
+    "mixedVersions": "노드들이 서로 다른 opLite 버전({{versions}})을 돌립니다. 모든 노드의 업그레이드를 끝내세요.",
+    "subscription": {
+      "none": "이 클러스터에는 구독이 없습니다.",
+      "invalid": "구독 키가 이 빌드와 맞지 않습니다.",
+      "expired": "구독이 {{date}}에 만료되었습니다.",
+      "over_limit": "클러스터의 노드는 {{used}}대인데 구독은 {{limit}}대까지입니다.",
+      "expiring": "구독이 {{date}}에 만료됩니다.",
+      "manage": "구독 설정",
+      "dismiss": "7일 동안 숨기기"
+    }
   },
   "settings": {
     "updates": "업데이트",
@@ -1059,9 +1071,64 @@
     "channelHint": "모든 노드가 이 채널에서 opLite 패키지를 받습니다. testing은 stable보다 새 버전을 먼저 받습니다.",
     "channels": {
       "stable": "stable(안정)",
-      "testing": "testing(시험)"
+      "testing": "testing(시험)",
+      "enterprise": "enterprise(구독)"
     },
     "saved": "설정을 저장했습니다.",
-    "adminOnly": "설정은 관리자만 바꿀 수 있습니다."
+    "adminOnly": "설정은 관리자만 바꿀 수 있습니다.",
+    "errors": {
+      "busy": "다른 설정 변경이 진행 중입니다. 다시 시도하세요."
+    },
+    "enterpriseHint": "enterprise는 유효한 구독이 있어야 고를 수 있습니다.",
+    "subscription": {
+      "title": "구독",
+      "states": {
+        "none": "구독 없음",
+        "active": "유효",
+        "expired": "만료됨",
+        "invalid": "잘못된 키",
+        "over_limit": "노드 수 초과"
+      },
+      "development": "개발용 키",
+      "customer": "고객",
+      "level": "수준",
+      "levels": {
+        "standard": "Standard",
+        "premium": "Premium"
+      },
+      "nodes": "노드",
+      "expires": "만료일",
+      "key": "구독 키",
+      "keyHint": "받은 키를 붙여 넣으세요. opl1.로 시작합니다.",
+      "apply": "키 넣기",
+      "applied": "구독 키를 넣었습니다.",
+      "remove": "키 지우기",
+      "removeTitle": "구독 키를 지울까요?",
+      "removeDescription": "클러스터에 구독이 없어집니다. enterprise 채널의 노드는 업데이트를 받지 못합니다.",
+      "removed": "구독 키를 지웠습니다."
+    },
+    "telemetry": {
+      "title": "텔레메트리",
+      "intro": "켜면 리더가 하루에 한 번 사용 보고를 보냅니다. 수와 버전만 보내고 이름·주소·키는 보내지 않습니다.",
+      "on": "켜짐",
+      "off": "꺼짐",
+      "endpoint": "끝점",
+      "buildDefault": "설정 안 됨 — 빌드에 기본 끝점이 있으면 그것을 씀",
+      "endpointHint": "https:// 주소. 비우면 빌드 기본 끝점을 씁니다.",
+      "saveEndpoint": "끝점 저장",
+      "id": "보고 ID",
+      "lastSent": "마지막 전송",
+      "never": "없음",
+      "lastError": "마지막 오류",
+      "enable": "켜기…",
+      "disable": "끄기",
+      "resetId": "보고 ID 새로 만들기",
+      "previewTitle": "텔레메트리 켜기",
+      "previewDescription": "지금 보낼 보고 그대로입니다. 이것 말고는 보내지 않습니다.",
+      "confirmEnable": "켜기",
+      "enabled": "텔레메트리를 켰습니다.",
+      "disabled": "텔레메트리를 껐습니다.",
+      "idReset": "보고 ID를 새로 만들었습니다."
+    }
   }
 }
