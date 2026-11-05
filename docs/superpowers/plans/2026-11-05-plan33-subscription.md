@@ -6642,7 +6642,8 @@ async fn tick(state: &AppState, config: &TelemetryConfig, memory: &mut Memory) {
             tracing::info!(%endpoint, "telemetry report sent");
         }
         Some(e) => {
-            memory.next_retry = Some(now.saturating_add(config.retry.as_secs()));
+            // 보내기가 오래 걸렸을 수 있으므로 retry는 실패한 때부터 센다.
+            memory.next_retry = Some(self::now().saturating_add(config.retry.as_secs()));
             tracing::warn!(%endpoint, error = %e, "cannot send the telemetry report");
         }
     }
@@ -6881,8 +6882,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use common::Env;
 use common::collector::Collector;
-use common::{Env, WAIT};
 use opl_api::{TelemetryConfig, TelemetryReporter};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
@@ -6893,6 +6894,9 @@ use opl_types::version::TELEMETRY_URL;
 use reqwest::StatusCode;
 use serde_json::json;
 
+/// 기다리는 한도. macOS에서는 새 CA로 하는 첫 TLS 연결의 인증서 검증이 15초쯤 걸리기도 한다.
+const REPORT_WAIT: Duration = Duration::from_secs(60);
+
 /// 50ms마다 보는 리포터. 수집 서버의 CA를 믿는다. 시각은 초 단위라 retry 3초는 적어도 2초 뒤다.
 fn reporter(env: &Env, collector: &Collector, interval: Duration) -> TelemetryReporter {
     TelemetryReporter::spawn(
@@ -6901,7 +6905,7 @@ fn reporter(env: &Env, collector: &Collector, interval: Duration) -> TelemetryRe
             tick: Duration::from_millis(50),
             interval,
             retry: Duration::from_secs(3),
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(30),
             extra_roots: vec![collector.ca_der.clone()],
         },
     )
@@ -6929,7 +6933,7 @@ fn telemetry(env: &Env) -> TelemetryStatus {
 }
 
 async fn until(why: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT;
+    let deadline = Instant::now() + REPORT_WAIT;
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {why}");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -6937,7 +6941,7 @@ async fn until(why: &str, mut done: impl FnMut() -> bool) {
 }
 
 /// 켜면 한 번 보내고 `last_sent_at`을 적는다. 간격(24시간) 전에는 다시 보내지 않는다.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sends_once_and_records_the_time() {
     let env = Env::start().await;
     let collector = Collector::start().await;
@@ -6962,7 +6966,7 @@ async fn sends_once_and_records_the_time() {
 }
 
 /// 간격이 지나면 다시 보낸다.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sends_again_after_the_interval() {
     let env = Env::start().await;
     let collector = Collector::start().await;
@@ -6979,7 +6983,7 @@ async fn sends_again_after_the_interval() {
 }
 
 /// 수집 서버가 실패하면 `last_error`를 적고 retry 전에는 다시 보내지 않으며, 그 뒤 다시 보낸다.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failure_is_recorded_and_retried() {
     let env = Env::start().await;
     let collector = Collector::start().await;
@@ -7007,7 +7011,7 @@ async fn a_failure_is_recorded_and_retried() {
 }
 
 /// 꺼져 있으면 보내지 않고, 켜면 보낸다.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nothing_is_sent_while_disabled() {
     let env = Env::start().await;
     let collector = Collector::start().await;
@@ -7024,7 +7028,7 @@ async fn nothing_is_sent_while_disabled() {
 }
 
 /// 이 빌드보다 낮은 노드가 남아 있으면(설정의 새 필드를 풀지 못한다) 보내지 않는다.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nothing_is_sent_while_an_old_node_remains() {
     let env = Env::start().await;
     let collector = Collector::start().await;
@@ -7051,7 +7055,7 @@ async fn nothing_is_sent_while_an_old_node_remains() {
 }
 
 /// 3xx는 따르지 않고 실패로 적는다(끝점을 바꾼 응답이 보고를 다른 곳으로 보내지 못하게).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redirects_are_not_followed() {
     let env = Env::start().await;
     let collector = Collector::start().await;
@@ -7070,7 +7074,7 @@ async fn redirects_are_not_followed() {
 }
 
 /// 켜져 있는데 쓸 끝점이 없으면(설정도 빌드 값도 없음) 그 이유를 last_error에 한 번 적는다.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_missing_endpoint_is_recorded() {
     if !TELEMETRY_URL.is_empty() {
         return;
