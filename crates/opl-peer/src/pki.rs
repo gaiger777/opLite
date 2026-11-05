@@ -136,6 +136,17 @@ pub fn first_cert(pem: &str) -> Result<CertificateDer<'static>, PkiError> {
     CertificateDer::from_pem_slice(pem.as_bytes()).map_err(|e| PkiError::Pem(e.to_string()))
 }
 
+/// PEM의 모든 인증서. 하나도 없으면 오류다.
+pub fn certs(pem: &str) -> Result<Vec<CertificateDer<'static>>, PkiError> {
+    let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| PkiError::Pem(e.to_string()))?;
+    if certs.is_empty() {
+        return Err(PkiError::Pem("no certificate".into()));
+    }
+    Ok(certs)
+}
+
 /// 인증서(PEM)의 SHA-256 지문. `sha256:<16진수>` 형식이다. 노드가 합류할 때 CA를 확인하는 데 쓴다.
 pub fn fingerprint(cert_pem: &str) -> Result<String, PkiError> {
     let der = first_cert(cert_pem)?;
@@ -287,6 +298,16 @@ mod tests {
         let pem = any.self_signed(&key).unwrap().pem();
         assert!(allows_key_encipherment(&pem).unwrap());
         assert!(allows_key_encipherment("not a cert").is_err());
+    }
+
+    #[test]
+    fn certs_reads_every_certificate_of_a_bundle() {
+        let a = ClusterCa::generate("a").unwrap().cert_pem;
+        let b = ClusterCa::generate("b").unwrap().cert_pem;
+        let both = certs(&format!("{a}{b}")).unwrap();
+        assert_eq!(both, vec![first_cert(&a).unwrap(), first_cert(&b).unwrap()]);
+        assert!(certs("not a cert").is_err());
+        assert!(certs("").is_err());
     }
 
     #[test]

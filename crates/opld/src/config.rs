@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opl_api::{
-    BackupJobSchedulerConfig, ClusterJanitorConfig, SnapshotSchedulerConfig, UpdatesConfig,
+    BackupJobSchedulerConfig, ClusterJanitorConfig, SnapshotSchedulerConfig, TelemetryConfig,
+    UpdatesConfig,
 };
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
@@ -66,6 +67,8 @@ pub struct Config {
     pub network: NetworkSection,
     #[serde(default)]
     pub updates: UpdatesSection,
+    #[serde(default)]
+    pub telemetry: TelemetrySection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -490,6 +493,75 @@ impl UpdatesSection {
             poll: self.poll,
         })
     }
+}
+
+/// 텔레메트리 리포터(리더). 켜고 끄기와 끝점은 클러스터 설정(`PATCH /settings`)이 정한다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySection {
+    /// 보낼 때가 됐는지 확인하는 간격
+    #[serde(
+        default = "default_telemetry_tick",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub tick: Duration,
+    /// 보고를 보내는 간격
+    #[serde(
+        default = "default_telemetry_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub interval: Duration,
+    /// 보내지 못한 뒤 다시 보내기까지 기다리는 시간
+    #[serde(
+        default = "default_telemetry_retry",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub retry: Duration,
+    /// 시스템 루트에 더해 믿는 CA 인증서(PEM, 여럿이어도 된다). 사설 수집 서버에 쓴다.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+}
+
+impl Default for TelemetrySection {
+    fn default() -> Self {
+        Self {
+            tick: default_telemetry_tick(),
+            interval: default_telemetry_interval(),
+            retry: default_telemetry_retry(),
+            ca_file: None,
+        }
+    }
+}
+
+impl TelemetrySection {
+    /// API의 리포터 설정. `ca_file`을 읽지 못하거나 인증서가 없으면 오류다.
+    pub fn telemetry_config(&self) -> anyhow::Result<TelemetryConfig> {
+        let mut extra_roots = Vec::new();
+        if let Some(path) = &self.ca_file {
+            let pem = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+            let certs = opl_peer::pki::certs(&pem)
+                .map_err(|e| anyhow::anyhow!("telemetry.ca_file {}: {e}", path.display()))?;
+            extra_roots = certs.into_iter().map(|c| c.to_vec()).collect();
+        }
+        Ok(TelemetryConfig {
+            tick: self.tick,
+            interval: self.interval,
+            retry: self.retry,
+            extra_roots,
+            ..TelemetryConfig::default()
+        })
+    }
+}
+
+fn default_telemetry_tick() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_telemetry_interval() -> Duration {
+    Duration::from_secs(24 * 3600)
+}
+fn default_telemetry_retry() -> Duration {
+    Duration::from_secs(3600)
 }
 
 fn default_check_interval() -> Duration {
@@ -1159,6 +1231,65 @@ mod tests {
         assert!(with("").updates.updates_config().is_some());
         assert!(!with("enabled = false").updates.enabled());
         assert!(with("enabled = false").updates.updates_config().is_none());
+    }
+
+    #[test]
+    fn telemetry_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.telemetry, TelemetrySection::default());
+        let t = c.telemetry.telemetry_config().unwrap();
+        assert_eq!(t.tick, Duration::from_secs(60));
+        assert_eq!(t.interval, Duration::from_secs(24 * 3600));
+        assert_eq!(t.retry, Duration::from_secs(3600));
+        assert_eq!(t.timeout, Duration::from_secs(30));
+        assert!(t.extra_roots.is_empty());
+
+        // ca_file의 인증서를 모두(DER로) 믿는다.
+        let dir = tempfile::tempdir().unwrap();
+        let ca_file = dir.path().join("ca.pem");
+        let a = opl_peer::pki::ClusterCa::generate("a").unwrap().cert_pem;
+        let b = opl_peer::pki::ClusterCa::generate("b").unwrap().cert_pem;
+        std::fs::write(&ca_file, format!("{a}{b}")).unwrap();
+        let c = parse(&format!(
+            "name = \"n\"\naddress = \"h\"\n[telemetry]\ntick = \"1s\"\ninterval = \"6h\"\n\
+             retry = \"10m\"\nca_file = \"{}\"",
+            ca_file.display()
+        ));
+        let t = c.telemetry.telemetry_config().unwrap();
+        assert_eq!(t.tick, Duration::from_secs(1));
+        assert_eq!(t.interval, Duration::from_secs(6 * 3600));
+        assert_eq!(t.retry, Duration::from_secs(600));
+        assert_eq!(
+            t.extra_roots,
+            vec![
+                opl_peer::pki::first_cert(&a).unwrap().to_vec(),
+                opl_peer::pki::first_cert(&b).unwrap().to_vec()
+            ]
+        );
+
+        // 읽지 못하거나 인증서가 없는 파일은 시작 오류다.
+        let with_ca = |path: &Path| {
+            parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[telemetry]\nca_file = \"{}\"",
+                path.display()
+            ))
+        };
+        let missing = dir.path().join("missing.pem");
+        let err = with_ca(&missing).telemetry.telemetry_config().unwrap_err();
+        assert!(err.to_string().contains("missing.pem"), "{err}");
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "not a certificate\n").unwrap();
+        assert!(with_ca(&empty).telemetry.telemetry_config().is_err());
+
+        for bad in ["interval = \"0s\"", "retry = \"1d\"", "endpoint = \"x\""] {
+            assert!(
+                toml::from_str::<Config>(&format!(
+                    "name = \"n\"\naddress = \"h\"\n[telemetry]\n{bad}"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

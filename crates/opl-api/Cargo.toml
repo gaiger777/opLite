@@ -28,6 +28,7 @@ opl-driver.workspace = true
 opl-peer.workspace = true
 opl-reconciler.workspace = true
 opl-types = { workspace = true, features = ["openapi"] }
+reqwest.workspace = true
 roxmltree.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
@@ -48,7 +49,6 @@ uuid.workspace = true
 openraft.workspace = true
 opl-qemu.workspace = true
 rcgen.workspace = true
-reqwest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true

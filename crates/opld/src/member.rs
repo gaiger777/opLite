@@ -14,8 +14,8 @@ use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
     AppState, BackupJobScheduler, ClusterJanitor, HaManager, HaManagerConfig, IncomingConfig,
-    IncomingMigrations, SnapshotScheduler, TaskRunner, TaskRunnerConfig, UefiVarsFetcher,
-    UpdateAgent, Updates,
+    IncomingMigrations, SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter,
+    UefiVarsFetcher, UpdateAgent, Updates,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
@@ -129,6 +129,8 @@ struct Services {
     ha: Option<Arc<HaGuard>>,
     /// APT 소스 파일과 주기 업데이트 확인(업데이트가 꺼졌으면 없다)
     updates: Option<UpdateAgent>,
+    /// 리더가 텔레메트리 보고를 보낸다(설정에서 켰을 때).
+    telemetry: TelemetryReporter,
 }
 
 impl Services {
@@ -145,6 +147,7 @@ impl Services {
         self.schedule.shutdown().await;
         self.janitor.shutdown().await;
         self.backups.shutdown().await;
+        self.telemetry.shutdown().await;
         self.recovery.shutdown().await;
         self.pools.shutdown().await;
         if let Some(updates) = self.updates {
@@ -189,6 +192,8 @@ impl Member {
         tls: NodeTls,
         bootstrap: Bootstrap,
     ) -> anyhow::Result<(Self, Option<Created>)> {
+        // `[telemetry] ca_file`을 읽지 못하면 아무것도 열기 전에 실패한다.
+        let telemetry_config = config.telemetry.telemetry_config()?;
         let id = NodeId(node);
         let peers = Arc::new(Peers::new(&tls));
         let mut cluster_config = ClusterConfig::new(id, cluster_dir(config));
@@ -450,6 +455,7 @@ impl Member {
         let schedule = SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config());
         let janitor = ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config());
         let backups = BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config());
+        let telemetry = TelemetryReporter::spawn(state.clone(), telemetry_config);
         let recovery = HaManager::spawn(state.clone(), HaManagerConfig::default());
         let app = opl_api::router(state).merge(crate::web::router());
         let task = tokio::spawn(async move {
@@ -479,6 +485,7 @@ impl Member {
                 schedule,
                 janitor,
                 backups,
+                telemetry,
                 recovery,
                 pools,
                 overlay,

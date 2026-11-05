@@ -49,6 +49,7 @@ pub use janitor::{ClusterJanitor, ClusterJanitorConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
+pub use telemetry::{TelemetryConfig, TelemetryReporter};
 pub use updates::{AUTH_FILE, KEYRING, UpdateAgent, Updates, UpdatesConfig};
 
 use crate::resources as r;
