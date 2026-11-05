@@ -485,6 +485,28 @@ export interface paths {
         patch: operations["patch_pool"];
         trace?: never;
     };
+    "/subscription": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 구독 상태. 로그인한 누구나 읽는다. */
+        get: operations["get_subscription"];
+        /**
+         * 구독 키를 넣는다(있던 키는 바꾼다). 형식·서명이 맞지 않거나 만료된 키는 400
+         *     `invalid_subscription_key`.
+         */
+        put: operations["put_subscription"];
+        post?: never;
+        /** 구독 키를 지운다. 없으면 그대로 200이다. */
+        delete: operations["delete_subscription"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/tasks": {
         parameters: {
             query?: never;
@@ -1640,6 +1662,11 @@ export interface components {
              */
             weekly: number;
         };
+        /**
+         * @description 구독 수준
+         * @enum {string}
+         */
+        Level: "standard" | "premium";
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_Resource_BackupJobSpec_BackupJobStatus: {
             items: {
@@ -3179,6 +3206,40 @@ export interface components {
              */
             total_bytes: number | null;
         };
+        /** @description 읽을 때 계산한 구독 상태. 키 문자열은 담지 않는다. */
+        SubscriptionInfo: {
+            customer?: string;
+            /** @description 개발 키로 검증됨 */
+            development?: boolean;
+            /**
+             * Format: int64
+             * @description 만료 시각(유닉스 초)
+             */
+            expires_at?: number;
+            id?: string;
+            level?: components["schemas"]["Level"];
+            /**
+             * Format: int32
+             * @description 노드 수 한도
+             */
+            nodes?: number;
+            state: components["schemas"]["SubscriptionState"];
+            /**
+             * Format: int32
+             * @description 위트니스가 아닌 노드 수
+             */
+            used_nodes: number;
+        };
+        /** @description 넣을 구독 키 */
+        SubscriptionKey: {
+            /** @description `opl1.<payload>.<signature>` */
+            key: string;
+        };
+        /**
+         * @description 구독 상태
+         * @enum {string}
+         */
+        SubscriptionState: "none" | "active" | "expired" | "invalid" | "over_limit";
         TaskOp: {
             /** @enum {string} */
             kind: "vm-start";
@@ -4715,6 +4776,91 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_StoragePoolSpec_StoragePoolStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_subscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SubscriptionInfo"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_subscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SubscriptionKey"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SubscriptionInfo"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_subscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SubscriptionInfo"];
                 };
             };
             "4XX": {

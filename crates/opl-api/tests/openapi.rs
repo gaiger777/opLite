@@ -15,6 +15,7 @@ async fn openapi_document_is_served_without_login() {
         "/auth/login",
         "/version",
         "/settings",
+        "/subscription",
         "/nodes/{key}/updates/refresh",
         "/nodes/{key}/upgrade",
         "/vms",
@@ -69,6 +70,23 @@ async fn openapi_document_is_served_without_login() {
         doc["paths"]["/settings"]["patch"]["requestBody"]["content"]["application/json"]["schema"]
             ["$ref"],
         "#/components/schemas/SettingsPatch"
+    );
+    // 구독 키 문자열은 설정 스키마에 없고, 상태만 따로 보인다.
+    assert!(
+        doc["components"]["schemas"]["SettingsSpec"]["properties"]["subscription"].is_null(),
+        "{}",
+        doc["components"]["schemas"]["SettingsSpec"]
+    );
+    assert_eq!(
+        doc["paths"]["/subscription"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/SubscriptionInfo"
+    );
+    let info = &doc["components"]["schemas"]["SubscriptionInfo"];
+    assert_eq!(
+        info["required"],
+        serde_json::json!(["state", "used_nodes"]),
+        "{info}"
     );
     // 백업 작업의 VM 고르기는 세 객체 중 하나다.
     let selector = &doc["components"]["schemas"]["VmSelector"]["oneOf"];

@@ -383,6 +383,30 @@ pub(crate) fn require_upgraded(cluster: &opl_cluster::Cluster) -> Result<(), Api
         .filter(|n| n.status.version.is_none())
         .map(|n| n.name)
         .collect();
+    upgrading(&mut old)
+}
+
+/// 이 빌드보다 낮은 노드나 버전을 적지 않은 노드(위트니스 포함)가 남아 있으면 409
+/// `cluster_upgrading`으로 거절한다. 설정의 새 필드(구독 등)를 기본값이 아닌 값으로 쓰기 전에 부른다.
+/// 옛 노드는 모르는 필드가 든 설정을 풀지 못한다.
+pub(crate) fn require_current(cluster: &opl_cluster::Cluster) -> Result<(), ApiError> {
+    let mut old: Vec<String> = cluster
+        .list::<NodeSpec>()?
+        .1
+        .into_iter()
+        .filter(|n| {
+            n.status
+                .version
+                .as_deref()
+                .is_none_or(|v| version::compare(v, version::BUILD).is_lt())
+        })
+        .map(|n| n.name)
+        .collect();
+    upgrading(&mut old)
+}
+
+/// 옛 노드 이름들(이름 순)로 `cluster_upgrading`을 만든다. 없으면 통과.
+fn upgrading(old: &mut [String]) -> Result<(), ApiError> {
     if old.is_empty() {
         return Ok(());
     }

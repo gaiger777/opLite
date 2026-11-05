@@ -17,6 +17,11 @@ pub struct SettingsSpec {
     #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub updates: UpdateSettings,
+    /// 구독 키 문자열. API는 내보내지 않고 `GET /subscription`이 상태만 보인다. 없으면 쓰지 않아
+    /// 구독을 모르는 옛 노드도 설정을 계속 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(ignore))]
+    pub subscription: Option<String>,
 }
 
 impl ResourceSpec for SettingsSpec {
@@ -88,6 +93,31 @@ mod tests {
         assert_eq!(spec.updates.channel, Channel::Testing);
         assert!(serde_json::from_str::<Channel>(r#""Testing""#).is_err());
         assert!(serde_json::from_str::<Channel>(r#""enterprise""#).is_err());
+    }
+
+    /// 구독이 없으면 계획 32 노드가 쓰던 모양 그대로 쓰고, 있으면 함께 쓰고 푼다.
+    #[test]
+    fn subscription_is_written_only_when_set() {
+        let spec = SettingsSpec {
+            updates: UpdateSettings {
+                channel: Channel::Testing,
+            },
+            subscription: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap(),
+            serde_json::json!({ "updates": { "channel": "testing" } })
+        );
+        let spec = SettingsSpec {
+            subscription: Some("opl1.a.b".into()),
+            ..spec
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "updates": { "channel": "testing" }, "subscription": "opl1.a.b" })
+        );
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
     }
 
     #[test]

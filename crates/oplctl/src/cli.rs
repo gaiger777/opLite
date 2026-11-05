@@ -106,6 +106,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SettingsCmd,
     },
+    /// 구독 키와 상태. 구독은 기능을 막지 않는다.
+    Subscription {
+        #[command(subcommand)]
+        cmd: SubscriptionCmd,
+    },
 }
 
 #[derive(Args)]
@@ -1530,6 +1535,95 @@ async fn settings(
     Ok(())
 }
 
+#[derive(Subcommand)]
+enum SubscriptionCmd {
+    /// 구독 상태를 보인다.
+    Show,
+    /// 구독 키를 넣는다(있던 키는 바꾼다).
+    #[command(group(ArgGroup::new("source").required(true).args(["key", "file"])))]
+    Set {
+        /// `opl1.<payload>.<signature>`
+        key: Option<String>,
+        /// 키가 든 파일(`-`면 표준 입력)
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// 구독 키를 지운다.
+    Remove,
+}
+
+/// 구독 상태(`SubscriptionInfo`)를 `키: 값` 줄로. 없는 값은 줄을 쓰지 않는다.
+fn subscription_lines(info: &Value) -> Vec<String> {
+    let mut state = cell(&info["state"]);
+    if info["development"] == true {
+        state.push_str(" (development key)");
+    }
+    let mut lines = vec![format!("state: {state}")];
+    for key in ["customer", "level"] {
+        if !info[key].is_null() {
+            lines.push(format!("{key}: {}", cell(&info[key])));
+        }
+    }
+    let used = cell(&info["used_nodes"]);
+    lines.push(match info["nodes"].as_u64() {
+        Some(limit) => format!("nodes: {used}/{limit}"),
+        None => format!("nodes: {used}"),
+    });
+    if let Some(at) = info["expires_at"].as_u64() {
+        lines.push(format!("expires: {}", opl_types::subscription::date(at)));
+    }
+    lines
+}
+
+fn print_subscription(
+    out: &mut (dyn Write + Send),
+    json_out: bool,
+    info: &Value,
+) -> anyhow::Result<()> {
+    if json_out {
+        print_json(out, info)?;
+    } else {
+        for line in subscription_lines(info) {
+            writeln!(out, "{line}")?;
+        }
+    }
+    Ok(())
+}
+
+async fn subscription(
+    client: &Client,
+    cmd: SubscriptionCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        SubscriptionCmd::Show => {
+            let info = client.get("/subscription").await?;
+            print_subscription(out, json_out, &info)?;
+        }
+        SubscriptionCmd::Set { key, file } => {
+            let key = match key {
+                Some(key) => key,
+                None => match file {
+                    Some(path) if path.as_os_str() == "-" => {
+                        read_stdin_key(&mut std::io::stdin().lock())?
+                    }
+                    file => read_password(file.as_ref(), "")?,
+                },
+            };
+            let info = client
+                .put("/subscription", &json!({ "key": key.trim() }))
+                .await?;
+            print_subscription(out, json_out, &info)?;
+        }
+        SubscriptionCmd::Remove => {
+            client.delete("/subscription").await?;
+            writeln!(out, "subscription removed")?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Role {
     Admin,
@@ -1596,6 +1690,15 @@ fn read_password(file: Option<&PathBuf>, prompt: &str) -> anyhow::Result<String>
             .to_string()),
         None => Ok(rpassword::prompt_password(prompt)?),
     }
+}
+
+/// 표준 입력의 구독 키(앞뒤 공백을 다듬음). 키를 명령줄에 두지 않으려고 쓴다.
+fn read_stdin_key(input: &mut dyn std::io::Read) -> anyhow::Result<String> {
+    let mut key = String::new();
+    input
+        .read_to_string(&mut key)
+        .context("cannot read the key from standard input")?;
+    Ok(key.trim().to_string())
 }
 
 fn value_name<T: ValueEnum>(v: T) -> String {
@@ -1927,6 +2030,7 @@ where
             }
         },
         Cmd::Settings { cmd } => settings(&client, cmd, json_out, out).await?,
+        Cmd::Subscription { cmd } => subscription(&client, cmd, json_out, out).await?,
     }
     Ok(())
 }
@@ -6407,6 +6511,98 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 .is_err()
         );
         assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    /// `subscription show`는 상태를 줄로 보인다. 한도가 없으면 쓰는 노드 수만.
+    #[test]
+    fn subscription_lines_show_the_state() {
+        let active = json!({
+            "state": "active", "id": "sub-1", "customer": "Example Corp", "level": "premium",
+            "nodes": 3, "used_nodes": 2, "expires_at": 1_700_000_000u64, "development": true
+        });
+        assert_eq!(
+            subscription_lines(&active),
+            [
+                "state: active (development key)",
+                "customer: Example Corp",
+                "level: premium",
+                "nodes: 2/3",
+                "expires: 2023-11-14",
+            ]
+        );
+        let expired = json!({
+            "state": "expired", "id": "sub-1", "customer": "C", "level": "standard",
+            "nodes": 1, "used_nodes": 1, "expires_at": 0, "development": false
+        });
+        assert_eq!(subscription_lines(&expired)[0], "state: expired");
+        assert_eq!(
+            subscription_lines(&json!({ "state": "none", "used_nodes": 1 })),
+            ["state: none", "nodes: 1"]
+        );
+    }
+
+    /// `subscription set --file -`은 표준 입력에서 키를 읽는다(앞뒤 공백·줄바꿈을 다듬음).
+    #[test]
+    fn subscription_key_can_come_from_stdin() {
+        let args = ["oplctl", "subscription", "set", "--file", "-"];
+        let Cmd::Subscription {
+            cmd: SubscriptionCmd::Set { key: None, file },
+        } = Cli::try_parse_from(args).unwrap().cmd
+        else {
+            panic!("parse --file -")
+        };
+        assert_eq!(file.unwrap().to_str(), Some("-"));
+        let mut input = std::io::Cursor::new(" opl1.a.b\r\n");
+        assert_eq!(read_stdin_key(&mut input).unwrap(), "opl1.a.b");
+    }
+
+    /// `subscription set`은 키(인자나 파일)를 PUT하고 상태를 보인다. `remove`는 DELETE한다.
+    #[tokio::test]
+    async fn subscription_set_show_and_remove() {
+        let (client, seen) = fake_api(|_| {
+            json!({ "state": "active", "customer": "C", "level": "standard", "nodes": 2,
+                    "used_nodes": 1, "expires_at": 1_700_000_000u64, "development": false })
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("key");
+        std::fs::write(&file, "opl1.a.b\r\n").unwrap();
+        let file = file.to_str().unwrap();
+        let mut out = Vec::new();
+        for args in [
+            &["oplctl", "subscription", "show"][..],
+            &["oplctl", "subscription", "set", "opl1.a.b"][..],
+            &["oplctl", "subscription", "set", "--file", file][..],
+            &["oplctl", "subscription", "remove"][..],
+        ] {
+            let Cmd::Subscription { cmd } = Cli::try_parse_from(args).unwrap().cmd else {
+                unreachable!()
+            };
+            subscription(&client, cmd, false, &mut out).await.unwrap();
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/subscription HTTP/1.1",
+                "PUT /api/v1/subscription HTTP/1.1",
+                "PUT /api/v1/subscription HTTP/1.1",
+                "DELETE /api/v1/subscription HTTP/1.1",
+            ]
+        );
+        let shown =
+            "state: active\ncustomer: C\nlevel: standard\nnodes: 1/2\nexpires: 2023-11-14\n";
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{shown}{shown}{shown}subscription removed\n")
+        );
+
+        // 키나 파일 중 하나만 준다.
+        for args in [
+            &["oplctl", "subscription", "set"][..],
+            &["oplctl", "subscription", "set", "k", "--file", "f"][..],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]

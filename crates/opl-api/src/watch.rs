@@ -83,12 +83,24 @@ fn wanted(event: &WatchEvent, kinds: &BTreeSet<Kind>) -> bool {
     }
 }
 
+/// 설정 이벤트에서 구독 키 문자열을 뺀다(`settings::public`과 같이).
+fn public(mut event: WatchEvent) -> WatchEvent {
+    if let WatchEvent::Put { kind, resource } | WatchEvent::Deleted { kind, resource, .. } =
+        &mut event
+        && *kind == Kind::Settings
+        && let Some(spec) = resource.spec.as_object_mut()
+    {
+        spec.remove("subscription");
+    }
+    event
+}
+
 async fn stream(mut socket: WebSocket, mut watch: Watch, kinds: BTreeSet<Kind>) {
     loop {
         tokio::select! {
             ev = watch.next() => {
                 let text = match ev {
-                    Ok(ev) if wanted(&ev, &kinds) => serde_json::to_string(&ev),
+                    Ok(ev) if wanted(&ev, &kinds) => serde_json::to_string(&public(ev)),
                     Ok(_) => continue,
                     Err(e) => {
                         let code = match e {
