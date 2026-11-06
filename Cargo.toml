@@ -67,3 +67,5 @@ ring = "0.17.14"
 base64 = "0.22.1"
 rust-embed = { version = "8.13.0", features = ["mime-guess", "interpolate-folder-path"] }
 libc = "0.2.191"
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
+lber = "0.5.1"

@@ -16,6 +16,7 @@ async fn openapi_document_is_served_without_login() {
         "/auth/realms",
         "/realms",
         "/realms/{key}",
+        "/realms/{key}/actions/test",
         "/version",
         "/settings",
         "/subscription",

@@ -442,6 +442,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/realms/{key}/actions/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 사용자 이름과 비밀번호로 영역의 디렉터리를 시험한다. 사용자도 세션도 만들지 않는다. */
+        post: operations["test_realm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/security-groups": {
         parameters: {
             query?: never;
@@ -2774,6 +2791,28 @@ export interface components {
             kind: components["schemas"]["RealmKind"];
             name: string;
         };
+        /** @description 영역 시험 본문 */
+        RealmTestRequest: {
+            password: string;
+            username: string;
+        };
+        /**
+         * @description 영역 시험의 결과. 단계는 `connect`, `service_bind`, `search`, `user_bind`, `groups` 순이고
+         *     실패한 단계에서 멈춘다.
+         */
+        RealmTestResult: {
+            /** @description 찾은 사용자 항목. 찾기 전에 멈췄으면 null */
+            dn: string | null;
+            /** @description 모든 단계가 성공했을 때의 그룹 속성 값들 */
+            groups: string[];
+            role: components["schemas"]["Role"] | null;
+            steps: components["schemas"]["RealmTestStep"][];
+        };
+        RealmTestStep: {
+            message: string;
+            name: string;
+            ok: boolean;
+        };
         /** @description 응답의 영역. 서비스 계정 비밀번호 대신 있는지만 보인다. */
         RealmView: {
             backend: components["schemas"]["RealmBackendView"];
@@ -4998,6 +5037,40 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    test_realm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RealmTestRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RealmTestResult"];
+                };
             };
             "4XX": {
                 headers: {

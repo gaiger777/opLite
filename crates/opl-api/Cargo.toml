@@ -23,6 +23,7 @@ hex.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+ldap3.workspace = true
 libc.workspace = true
 opl-cluster.workspace = true
 opl-driver.workspace = true
@@ -48,6 +49,9 @@ utoipa-axum.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# 시험용 가짜 LDAP 서버의 BER
+bytes.workspace = true
+lber.workspace = true
 openraft.workspace = true
 opl-qemu.workspace = true
 rcgen.workspace = true

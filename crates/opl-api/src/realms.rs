@@ -8,6 +8,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
+use opl_types::auth::Role;
 use opl_types::realm::{
     LdapRealm, Realm, RealmBackend, RealmSpec, RoleMapping, validate_realm_name,
 };
@@ -271,6 +272,64 @@ pub async fn delete_realm(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 영역 시험 본문
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RealmTestRequest {
+    pub username: String,
+    pub password: String,
+}
+
+// 비밀번호가 로그에 나가지 않게 가린다.
+impl std::fmt::Debug for RealmTestRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealmTestRequest")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
+/// 영역 시험의 결과. 단계는 `connect`, `service_bind`, `search`, `user_bind`, `groups` 순이고
+/// 실패한 단계에서 멈춘다.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RealmTestResult {
+    pub steps: Vec<RealmTestStep>,
+    /// 찾은 사용자 항목. 찾기 전에 멈췄으면 null
+    #[schema(required = true)]
+    pub dn: Option<String>,
+    /// 모든 단계가 성공했을 때의 그룹 속성 값들
+    pub groups: Vec<String>,
+    /// 그룹에서 정해질 역할. 실패했거나 맞는 매핑이 없으면 null
+    #[schema(required = true)]
+    pub role: Option<Role>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RealmTestStep {
+    pub name: String,
+    pub ok: bool,
+    pub message: String,
+}
+
+/// 사용자 이름과 비밀번호로 영역의 디렉터리를 시험한다. 사용자도 세션도 만들지 않는다.
+#[utoipa::path(post, path = "/realms/{key}/actions/test", tag = "auth",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = RealmTestRequest,
+    responses((status = 200, body = RealmTestResult), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn test_realm(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    Json(req): Json<RealmTestRequest>,
+) -> Result<Json<RealmTestResult>, ApiError> {
+    state.authorize(&principal, Action::Operate, RealmSpec::KIND)?;
+    let realm = lookup::<RealmSpec>(&state.cluster, &key)?;
+    Ok(Json(
+        crate::ldap::test(&realm.spec, &req.username, &req.password).await,
+    ))
+}
+
 /// 로그인 화면에 보일 영역의 종류
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -333,5 +392,16 @@ mod tests {
         let shown = format!("{req:?}");
         assert!(!shown.contains("s3cret"), "{shown}");
         assert!(shown.contains("***"), "{shown}");
+    }
+
+    #[test]
+    fn test_request_debug_hides_the_password() {
+        let req = RealmTestRequest {
+            username: "alice".into(),
+            password: "s3cret".into(),
+        };
+        let shown = format!("{req:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("alice"), "{shown}");
     }
 }

@@ -14,6 +14,7 @@ mod firmware;
 mod ha;
 mod incoming;
 mod janitor;
+pub mod ldap;
 pub mod limit;
 pub mod realms;
 pub mod resources;
@@ -99,6 +100,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             realms::update_realm,
             realms::delete_realm
         ))
+        .routes(routes!(realms::test_realm))
         .routes(routes!(r::list_nodes))
         .routes(routes!(r::get_node, r::update_node, cluster::delete_node))
         .routes(routes!(updates::refresh_updates))
