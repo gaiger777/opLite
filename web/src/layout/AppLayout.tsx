@@ -16,6 +16,7 @@ import {
   Monitor,
   Moon,
   Network,
+  ScrollText,
   Server,
   Settings,
   Shield,
@@ -47,8 +48,15 @@ import {
 import { type Language, setLanguage } from "@/i18n";
 import { type Theme, useTheme } from "@/lib/theme";
 
-/** 왼쪽 메뉴. `kind`가 있으면 그 종류를 읽을 수 있는 역할에만 보인다. */
-const NAV: { to: string; key: string; icon: LucideIcon; end: boolean; kind?: Kind }[] = [
+/** 왼쪽 메뉴. `kind`가 있으면 그 종류를 읽을 수 있는 역할에만, `admin`이면 admin에게만 보인다. */
+const NAV: {
+  to: string;
+  key: string;
+  icon: LucideIcon;
+  end: boolean;
+  kind?: Kind;
+  admin?: boolean;
+}[] = [
   { to: "/", key: "nav.dashboard", icon: LayoutDashboard, end: true },
   { to: "/vms", key: "nav.vms", icon: Server, end: false },
   { to: "/imports", key: "nav.imports", icon: Import, end: false },
@@ -60,6 +68,7 @@ const NAV: { to: string; key: string; icon: LucideIcon; end: boolean; kind?: Kin
   { to: "/security-groups", key: "nav.securityGroups", icon: Shield, end: false },
   { to: "/nodes", key: "nav.nodes", icon: Cpu, end: false },
   { to: "/tasks", key: "nav.tasks", icon: ListChecks, end: false },
+  { to: "/audit", key: "nav.audit", icon: ScrollText, end: false, admin: true },
   { to: "/users", key: "nav.users", icon: Users, end: false, kind: "user" },
   { to: "/tokens", key: "nav.tokens", icon: KeyRound, end: false },
   { to: "/cluster", key: "nav.cluster", icon: Boxes, end: false },
@@ -73,7 +82,10 @@ export function AppLayout() {
     queryKey: ["cluster"],
     queryFn: () => call(api.GET("/cluster")),
   });
-  const nav = NAV.filter((item) => !item.kind || can(me.role, "read", item.kind));
+  const nav = NAV.filter(
+    (item) =>
+      (!item.kind || can(me.role, "read", item.kind)) && (!item.admin || me.role === "admin"),
+  );
   return (
     <div className="flex min-h-svh flex-col md:flex-row">
       <aside className="border-b bg-sidebar text-sidebar-foreground md:w-56 md:border-r md:border-b-0">

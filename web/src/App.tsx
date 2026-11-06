@@ -4,6 +4,7 @@ import { createBrowserRouter, RouterProvider } from "react-router";
 
 import { TokensPage } from "@/accounts/TokensPage";
 import { UsersPage } from "@/accounts/UsersPage";
+import { AuditPage } from "@/audit/AuditPage";
 import { LiveProvider } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
 import { TaskIndexProvider } from "@/api/taskIndex";
@@ -68,6 +69,7 @@ function routes() {
             { path: "security-groups/:name", element: <SecurityGroupPage /> },
             { path: "nodes", element: <NodesPage /> },
             { path: "tasks", element: <TasksPage /> },
+            { path: "audit", element: <AuditPage /> },
             { path: "users", element: <UsersPage /> },
             { path: "tokens", element: <TokensPage /> },
             { path: "cluster", element: <ClusterPage /> },

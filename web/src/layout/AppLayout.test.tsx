@@ -17,12 +17,15 @@ it("shows account pages only to admins", async () => {
   renderPage(<AppLayout />);
   expect(await screen.findByRole("link", { name: "Volumes" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Users" })).toHaveAttribute("href", "/users");
+  expect(screen.getByRole("link", { name: "Audit log" })).toHaveAttribute("href", "/audit");
 });
 
 it("hides account pages from other roles", async () => {
   renderPage(<AppLayout />, { as: { ...ADMIN, role: "operator" } });
   expect(await screen.findByRole("link", { name: "Volumes" })).toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "Users" })).not.toBeInTheDocument();
+  // 감사 로그도 admin만 읽는다.
+  expect(screen.queryByRole("link", { name: "Audit log" })).not.toBeInTheDocument();
   // 보안 그룹과 백업, 백업 작업, 가져오기는 누구나 읽는다.
   expect(screen.getByRole("link", { name: "Security groups" })).toHaveAttribute(
     "href",

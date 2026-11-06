@@ -76,6 +76,7 @@
     "securityGroups": "Security groups",
     "nodes": "Nodes",
     "tasks": "Tasks",
+    "audit": "Audit log",
     "users": "Users",
     "tokens": "API tokens",
     "cluster": "Cluster",
@@ -1130,5 +1131,28 @@
       "disabled": "Telemetry turned off.",
       "idReset": "New report ID made."
     }
+  },
+  "audit": {
+    "adminOnly": "Only administrators can read the audit log.",
+    "refresh": "Refresh",
+    "range": "Time range",
+    "ranges": {
+      "1h": "Last hour",
+      "24h": "Last 24 hours",
+      "7d": "Last 7 days"
+    },
+    "user": "User",
+    "action": "Action",
+    "apply": "Apply",
+    "time": "Time",
+    "ip": "IP",
+    "target": "Target",
+    "status": "Status",
+    "refreshFailed": "Could not read the audit log again. {{error}}",
+    "empty": "No audit entries in this range.",
+    "unreachable": "No audit entries from these nodes (unreachable): {{nodes}}",
+    "disabled": "The audit log is turned off on these nodes: {{nodes}}",
+    "truncated": "Showing the newest {{count}} entries. More match; narrow the range or the filters.",
+    "entryTitle": "Audit entry"
   }
 }

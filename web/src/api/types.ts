@@ -25,6 +25,7 @@ export type SettingsPatch = Schemas["SettingsPatch"];
 export type SubscriptionInfo = Schemas["SubscriptionInfo"];
 export type SubscriptionState = Schemas["SubscriptionState"];
 export type TelemetryReport = Schemas["TelemetryReport"];
+export type AuditEntry = Schemas["AuditEntry"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =
