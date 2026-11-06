@@ -422,7 +422,7 @@ async fn send(
 }
 
 /// 오류와 그 원인들을 `: `로 잇는다(reqwest의 겉 오류만으로는 이유가 보이지 않는다).
-fn chain(e: &dyn Error) -> String {
+pub(crate) fn chain(e: &dyn Error) -> String {
     let mut text = e.to_string();
     let mut source = e.source();
     while let Some(cause) = source {

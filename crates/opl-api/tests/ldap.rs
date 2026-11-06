@@ -397,6 +397,16 @@ async fn the_test_action_reports_each_step() {
         .await;
     assert_eq!(step_names(&result), [("connect".to_string(), false)]);
 
+    // LDAP 영역은 사용자와 비밀번호가 있어야 한다.
+    for body in [json!({}), json!({ "username": "alice" })] {
+        let (status, got) = admin.post("/realms/corp/actions/test", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{got}");
+        assert_eq!(
+            got["message"],
+            "username and password are required to test an LDAP realm"
+        );
+    }
+
     // 없는 영역
     let (status, _) = admin
         .post(

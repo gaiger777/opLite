@@ -335,12 +335,17 @@ pub async fn delete_realm(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 영역 시험 본문
-#[derive(Deserialize, ToSchema)]
+/// 영역 시험 본문. LDAP 영역은 사용자 이름과 비밀번호가 필요하다. OIDC 영역은 본문 없이 부르고
+/// (있으면 무시한다) IdP의 discovery와 JWKS만 확인한다.
+#[derive(Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RealmTestRequest {
-    pub username: String,
-    pub password: String,
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub password: Option<String>,
 }
 
 // 비밀번호가 로그에 나가지 않게 가린다.
@@ -353,17 +358,17 @@ impl std::fmt::Debug for RealmTestRequest {
     }
 }
 
-/// 영역 시험의 결과. 단계는 `connect`, `service_bind`, `search`, `user_bind`, `groups` 순이고
-/// 실패한 단계에서 멈춘다.
+/// 영역 시험의 결과. 단계는 LDAP이면 `connect`, `service_bind`, `search`, `user_bind`, `groups`,
+/// OIDC면 `discovery`, `jwks` 순이고 실패한 단계에서 멈춘다.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RealmTestResult {
     pub steps: Vec<RealmTestStep>,
-    /// 찾은 사용자 항목. 찾기 전에 멈췄으면 null
+    /// 찾은 사용자 항목. 찾기 전에 멈췄거나 OIDC 영역이면 null
     #[schema(required = true)]
     pub dn: Option<String>,
-    /// 모든 단계가 성공했을 때의 그룹 속성 값들
+    /// 모든 단계가 성공했을 때의 그룹 속성 값들(OIDC 영역은 비어 있다)
     pub groups: Vec<String>,
-    /// 그룹에서 정해질 역할. 실패했거나 맞는 매핑이 없으면 null
+    /// 그룹에서 정해질 역할. 실패했거나 맞는 매핑이 없거나 OIDC 영역이면 null
     #[schema(required = true)]
     pub role: Option<Role>,
 }
@@ -375,28 +380,35 @@ pub struct RealmTestStep {
     pub message: String,
 }
 
-/// 사용자 이름과 비밀번호로 영역의 디렉터리를 시험한다. 사용자도 세션도 만들지 않는다.
+/// 영역을 시험한다. LDAP 영역은 사용자 이름과 비밀번호로 디렉터리를 확인하고, OIDC 영역은 IdP의
+/// discovery 문서와 서명 키를 받아 본다. 사용자도 세션도 만들지 않는다.
 #[utoipa::path(post, path = "/realms/{key}/actions/test", tag = "auth",
     params(("key" = String, Path, description = "id or name")),
-    request_body = RealmTestRequest,
+    request_body = Option<RealmTestRequest>,
     responses((status = 200, body = RealmTestResult), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn test_realm(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Path(key): Path<String>,
-    Json(req): Json<RealmTestRequest>,
+    req: Option<Json<Option<RealmTestRequest>>>,
 ) -> Result<Json<RealmTestResult>, ApiError> {
     state.authorize(&principal, Action::Operate, RealmSpec::KIND)?;
     let realm = lookup::<RealmSpec>(&state.cluster, &key)?;
-    // OIDC 영역의 시험은 다음 단계에서 더한다.
-    if let RealmBackend::Oidc(_) = realm.spec.backend {
-        return Err(ApiError::bad_request(
-            "testing an OIDC realm is not supported yet",
-        ));
+    // 본문이 없거나 null이면 빈 요청
+    let req = req.and_then(|Json(req)| req).unwrap_or_default();
+    match &realm.spec.backend {
+        RealmBackend::Ldap(_) => {
+            let (Some(username), Some(password)) = (&req.username, &req.password) else {
+                return Err(ApiError::bad_request(
+                    "username and password are required to test an LDAP realm",
+                ));
+            };
+            Ok(Json(
+                crate::ldap::test(&realm.spec, username, password).await,
+            ))
+        }
+        RealmBackend::Oidc(oidc) => Ok(Json(crate::oidc::test(oidc).await)),
     }
-    Ok(Json(
-        crate::ldap::test(&realm.spec, &req.username, &req.password).await,
-    ))
 }
 
 /// 로그인 화면에 보일 영역의 종류
@@ -468,8 +480,8 @@ mod tests {
     #[test]
     fn test_request_debug_hides_the_password() {
         let req = RealmTestRequest {
-            username: "alice".into(),
-            password: "s3cret".into(),
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
         };
         let shown = format!("{req:?}");
         assert!(!shown.contains("s3cret"), "{shown}");

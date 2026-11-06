@@ -16,6 +16,7 @@ mod incoming;
 mod janitor;
 pub mod ldap;
 pub mod limit;
+pub mod oidc;
 pub mod realms;
 pub mod resources;
 mod schedule;

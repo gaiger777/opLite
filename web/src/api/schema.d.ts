@@ -454,7 +454,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 사용자 이름과 비밀번호로 영역의 디렉터리를 시험한다. 사용자도 세션도 만들지 않는다. */
+        /**
+         * 영역을 시험한다. LDAP 영역은 사용자 이름과 비밀번호로 디렉터리를 확인하고, OIDC 영역은 IdP의
+         *     discovery 문서와 서명 키를 받아 본다. 사용자도 세션도 만들지 않는다.
+         */
         post: operations["test_realm"];
         delete?: never;
         options?: never;
@@ -2842,19 +2845,22 @@ export interface components {
             kind: components["schemas"]["RealmKind"];
             name: string;
         };
-        /** @description 영역 시험 본문 */
+        /**
+         * @description 영역 시험 본문. LDAP 영역은 사용자 이름과 비밀번호가 필요하다. OIDC 영역은 본문 없이 부르고
+         *     (있으면 무시한다) IdP의 discovery와 JWKS만 확인한다.
+         */
         RealmTestRequest: {
-            password: string;
-            username: string;
+            password?: string;
+            username?: string;
         };
         /**
-         * @description 영역 시험의 결과. 단계는 `connect`, `service_bind`, `search`, `user_bind`, `groups` 순이고
-         *     실패한 단계에서 멈춘다.
+         * @description 영역 시험의 결과. 단계는 LDAP이면 `connect`, `service_bind`, `search`, `user_bind`, `groups`,
+         *     OIDC면 `discovery`, `jwks` 순이고 실패한 단계에서 멈춘다.
          */
         RealmTestResult: {
-            /** @description 찾은 사용자 항목. 찾기 전에 멈췄으면 null */
+            /** @description 찾은 사용자 항목. 찾기 전에 멈췄거나 OIDC 영역이면 null */
             dn: string | null;
-            /** @description 모든 단계가 성공했을 때의 그룹 속성 값들 */
+            /** @description 모든 단계가 성공했을 때의 그룹 속성 값들(OIDC 영역은 비어 있다) */
             groups: string[];
             role: components["schemas"]["Role"] | null;
             steps: components["schemas"]["RealmTestStep"][];
@@ -5111,9 +5117,9 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody: {
+        requestBody?: {
             content: {
-                "application/json": components["schemas"]["RealmTestRequest"];
+                "application/json": components["schemas"]["RealmTestRequest"] | null;
             };
         };
         responses: {

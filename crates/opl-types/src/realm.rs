@@ -284,7 +284,7 @@ impl OidcRealm {
         if self.groups_claim.trim().is_empty() {
             return Err(RealmError::GroupsClaim);
         }
-        if !(1..=120).contains(&self.timeout_secs) {
+        if !(1..=30).contains(&self.timeout_secs) {
             return Err(RealmError::OidcTimeout);
         }
         Ok(())
@@ -373,7 +373,7 @@ pub enum RealmError {
     UsernameClaim,
     #[error("groups_claim must not be empty")]
     GroupsClaim,
-    #[error("timeout_secs must be between 1 and 120")]
+    #[error("timeout_secs must be between 1 and 30")]
     OidcTimeout,
     #[error("roles.groups[].group must not be empty")]
     EmptyGroup,
@@ -806,7 +806,7 @@ mod tests {
             ),
             (
                 OidcRealm {
-                    timeout_secs: 121,
+                    timeout_secs: 31,
                     ..oidc()
                 },
                 RealmError::OidcTimeout,
@@ -815,7 +815,7 @@ mod tests {
         for (o, err) in cases {
             assert_eq!(oidc_spec(o.clone()).validate(), Err(err), "{o:?}");
         }
-        for timeout_secs in [1, 120] {
+        for timeout_secs in [1, 30] {
             let o = OidcRealm {
                 timeout_secs,
                 ..oidc()
@@ -824,7 +824,7 @@ mod tests {
         }
         assert_eq!(
             RealmError::OidcTimeout.to_string(),
-            "timeout_secs must be between 1 and 120"
+            "timeout_secs must be between 1 and 30"
         );
         // 공개 클라이언트(비밀 없음)와 기밀 클라이언트 모두 된다.
         let o = OidcRealm {

@@ -171,6 +171,25 @@ impl From<QueryRejection> for ApiError {
 #[from_request(via(axum::Json), rejection(ApiError))]
 pub struct Json<T>(pub T);
 
+/// 본문이 없어도 되는 요청(`Option<Json<T>>`). `Content-Type`이 없으면 `None`이다.
+impl<T, S> axum::extract::OptionalFromRequest<S> for Json<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Option<Self>, ApiError> {
+        let body =
+            <axum::Json<T> as axum::extract::OptionalFromRequest<S>>::from_request(req, state)
+                .await?;
+        Ok(body.map(|axum::Json(value)| Json(value)))
+    }
+}
+
 impl<T: Serialize> IntoResponse for Json<T> {
     fn into_response(self) -> Response {
         axum::Json(self.0).into_response()

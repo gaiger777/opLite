@@ -118,7 +118,7 @@ async fn oidc_realms_are_created_without_showing_the_client_secret() {
         "username_claim": "email",
         "groups_claim": "roles",
         "ca_pem": "-----BEGIN CERTIFICATE-----",
-        "timeout_secs": 120
+        "timeout_secs": 30
     });
     let (status, got) = admin.post("/realms", full).await;
     assert_eq!(status, StatusCode::CREATED, "{got}");
@@ -132,7 +132,7 @@ async fn oidc_realms_are_created_without_showing_the_client_secret() {
             "username_claim": "email",
             "groups_claim": "roles",
             "ca_pem": "-----BEGIN CERTIFICATE-----",
-            "timeout_secs": 120,
+            "timeout_secs": 30,
             "has_client_secret": true
         })
     );
@@ -299,8 +299,8 @@ async fn bad_oidc_realms_are_rejected() {
             "groups_claim must not be empty",
         ),
         (
-            with(&|b| b["backend"]["timeout_secs"] = json!(121)),
-            "timeout_secs must be between 1 and 120",
+            with(&|b| b["backend"]["timeout_secs"] = json!(31)),
+            "timeout_secs must be between 1 and 30",
         ),
         // 모르는 필드와 다른 종류의 필드
         (with(&|b| b["backend"]["bogus"] = json!(1)), ""),

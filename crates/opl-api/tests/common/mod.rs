@@ -4,6 +4,7 @@
 pub mod collector;
 pub mod esxi;
 pub mod fake_apt;
+pub mod idp;
 pub mod ldap;
 pub mod ustar;
 
