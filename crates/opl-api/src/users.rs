@@ -95,7 +95,8 @@ pub struct LoginRequest {
 /// 세션 쿠키를 발급한다. 웹 UI가 쓴다. CLI는 로그인한 뒤 API 토큰을 만들어 쓴다.
 /// 실패가 이어지면 잠시 막는다(429 `too_many_attempts`, `Retry-After`).
 /// LDAP 영역 로그인은 디렉터리로 확인하고 외부 사용자 `<이름>@<영역>`을 만들거나 역할을 고친다.
-/// 모르는 영역은 400, 맞는 역할이 없으면 403 `no_role`, 디렉터리에 닿지 못하면 503 `realm_unavailable`.
+/// 모르는 영역과 OIDC 영역(IdP에서 로그인한다)은 400, 맞는 역할이 없으면 403 `no_role`, 디렉터리에
+/// 닿지 못하면 503 `realm_unavailable`.
 #[utoipa::path(post, path = "/auth/login", tag = "auth", security(()),
     request_body = LoginRequest,
     responses((status = 200, body = UserView), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -201,8 +202,16 @@ async fn login_realm(
         .cluster
         .get_by_name::<RealmSpec>(realm)?
         .ok_or_else(|| ApiError::bad_request(format!("unknown realm {realm:?}")))?;
+    let ldap = match &stored.spec.backend {
+        RealmBackend::Ldap(ldap) => ldap,
+        // 비밀번호를 받지 않으므로 시도로 세지 않는다.
+        RealmBackend::Oidc(_) => {
+            return Err(ApiError::bad_request(format!(
+                "realm {realm} signs in through its identity provider"
+            )));
+        }
+    };
     let attempt = state.attempts.begin(&name, ip)?;
-    let RealmBackend::Ldap(ldap) = &stored.spec.backend;
     // 디렉터리에는 소문자로 바꾼 이름(외부 사용자 이름의 앞부분)을 묻는다.
     let username = &name[..name.len() - realm.len() - 1];
     let found = match crate::ldap::authenticate(ldap, username, &req.password).await {
@@ -265,6 +274,7 @@ async fn upsert_external(
                         role,
                         session_epoch: 0,
                         realm: Some(realm.into()),
+                        subject: None,
                     },
                 );
                 state
@@ -372,6 +382,7 @@ pub async fn create_user(
             role: req.role,
             session_epoch: 0,
             realm: None,
+            subject: None,
         },
     );
     user.revision = state.cluster.create(&user).await?;

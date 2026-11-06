@@ -74,7 +74,15 @@ pub async fn authenticate(
 /// [`authenticate`]와 같은 흐름을 단계마다 기록한다. 실패한 단계에서 멈춘다. 사용자도 세션도
 /// 만들지 않고, 비밀번호는 결과에 넣지 않는다.
 pub async fn test(spec: &RealmSpec, username: &str, password: &str) -> RealmTestResult {
-    let opl_types::realm::RealmBackend::Ldap(realm) = &spec.backend;
+    let opl_types::realm::RealmBackend::Ldap(realm) = &spec.backend else {
+        // LDAP 영역이 아니면 시험할 단계가 없다.
+        return RealmTestResult {
+            steps: Vec::new(),
+            dn: None,
+            groups: Vec::new(),
+            role: None,
+        };
+    };
     let mut trace = Trace::default();
     let result =
         tokio::time::timeout(deadline(realm), run(realm, username, password, &mut trace)).await;

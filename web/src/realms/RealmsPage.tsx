@@ -121,7 +121,9 @@ export function RealmsPage() {
               <TableCell className="font-medium">{realm.name}</TableCell>
               <TableCell>{realm.display ?? "—"}</TableCell>
               <TableCell>{t(`realms.kinds.${realm.backend.kind}`)}</TableCell>
-              <TableCell className="font-mono text-xs">{realm.backend.url}</TableCell>
+              <TableCell className="font-mono text-xs">
+                {realm.backend.kind === "ldap" ? realm.backend.url : realm.backend.issuer}
+              </TableCell>
               <TableCell className="text-right whitespace-nowrap">
                 <Button
                   variant="outline"
@@ -227,7 +229,7 @@ function RealmDialog({
     change({ groups });
     setErrors({});
   };
-  const saved = realm?.backend.has_bind_password ?? false;
+  const saved = (realm?.backend.kind === "ldap" && realm.backend.has_bind_password) || false;
 
   async function submit() {
     const found = checkForm(form, realm ? null : taken, realm);

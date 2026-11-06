@@ -1,4 +1,4 @@
-//! 인증 영역. 로컬 사용자 말고 바깥 디렉터리(LDAP)로 로그인하게 한다. 리소스 이름이 영역 이름이고,
+//! 인증 영역. 로컬 사용자 말고 바깥 디렉터리(LDAP)나 OIDC 제공자로 로그인하게 한다. 리소스 이름이 영역 이름이고,
 //! 그 영역으로 로그인한 사용자는 `<사용자>@<영역>` 이름의 외부 사용자가 된다.
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,7 @@ pub struct RealmStatus {}
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RealmBackend {
     Ldap(LdapRealm),
+    Oidc(OidcRealm),
 }
 
 /// LDAP 디렉터리. `ldap://`는 StartTLS를 반드시 쓰고, `ldaps://`는 처음부터 TLS다.
@@ -95,6 +96,71 @@ pub const DEFAULT_USER_FILTER: &str = "(&(objectClass=person)(uid={username}))";
 pub const DEFAULT_GROUP_ATTR: &str = "memberOf";
 /// 시간 제한의 기본값(초)
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// OpenID Connect 제공자(IdP). 브라우저가 IdP에서 로그인하고(인증 코드 흐름과 PKCE) 돌아온다.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OidcRealm {
+    /// `https://host[:port][/path]`. discovery 문서의 `issuer`와 글자 그대로 같아야 한다.
+    pub issuer: String,
+    pub client_id: String,
+    /// 기밀 클라이언트의 비밀. 공개 클라이언트면 없다. API는 내보내지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub client_secret: Option<String>,
+    /// 요청할 scope. `openid`가 있어야 한다.
+    #[serde(default = "default_scopes")]
+    pub scopes: Vec<String>,
+    /// 사용자 이름을 담은 클레임
+    #[serde(default = "default_username_claim")]
+    pub username_claim: String,
+    /// 그룹(문자열 배열)을 담은 클레임
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
+    /// IdP 인증서를 확인할 CA(PEM). 없으면 시스템 루트
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub ca_pem: Option<String>,
+    /// IdP 요청마다의 시간 제한(초)
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+// 클라이언트 비밀이 로그에 나가지 않게 가린다.
+impl std::fmt::Debug for OidcRealm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcRealm")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| "***"))
+            .field("scopes", &self.scopes)
+            .field("username_claim", &self.username_claim)
+            .field("groups_claim", &self.groups_claim)
+            .field("ca_pem", &self.ca_pem)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
+/// OIDC scope의 기본값
+pub const DEFAULT_SCOPES: [&str; 3] = ["openid", "profile", "email"];
+/// 사용자 이름 클레임의 기본값
+pub const DEFAULT_USERNAME_CLAIM: &str = "preferred_username";
+/// 그룹 클레임의 기본값
+pub const DEFAULT_GROUPS_CLAIM: &str = "groups";
+
+fn default_scopes() -> Vec<String> {
+    DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect()
+}
+
+fn default_username_claim() -> String {
+    DEFAULT_USERNAME_CLAIM.into()
+}
+
+fn default_groups_claim() -> String {
+    DEFAULT_GROUPS_CLAIM.into()
+}
 
 fn default_user_filter() -> String {
     DEFAULT_USER_FILTER.into()
@@ -160,6 +226,7 @@ impl RealmSpec {
     pub fn validate(&self) -> Result<(), RealmError> {
         match &self.backend {
             RealmBackend::Ldap(ldap) => ldap.validate()?,
+            RealmBackend::Oidc(oidc) => oidc.validate()?,
         }
         if self.roles.groups.iter().any(|m| m.group.trim().is_empty()) {
             return Err(RealmError::EmptyGroup);
@@ -193,6 +260,56 @@ impl LdapRealm {
         }
         Ok(())
     }
+}
+
+impl OidcRealm {
+    fn validate(&self) -> Result<(), RealmError> {
+        if !https_url_has_host(&self.issuer) {
+            return Err(RealmError::Issuer);
+        }
+        if self.client_id.trim().is_empty() {
+            return Err(RealmError::ClientId);
+        }
+        if !self.scopes.iter().any(|s| s == "openid")
+            || self
+                .scopes
+                .iter()
+                .any(|s| s.is_empty() || s.chars().any(char::is_whitespace))
+        {
+            return Err(RealmError::Scopes);
+        }
+        if self.username_claim.trim().is_empty() {
+            return Err(RealmError::UsernameClaim);
+        }
+        if self.groups_claim.trim().is_empty() {
+            return Err(RealmError::GroupsClaim);
+        }
+        if !(1..=120).contains(&self.timeout_secs) {
+            return Err(RealmError::OidcTimeout);
+        }
+        Ok(())
+    }
+}
+
+/// `https://`로 시작하고 호스트가 있으며 쿼리·조각·공백이 없는지
+fn https_url_has_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if url.contains(['?', '#']) || url.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or_default();
+    // 사용자 정보는 받지 않는다.
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        // [IPv6]:port
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    !host.is_empty()
 }
 
 /// `ldap://` 또는 `ldaps://`로 시작하고 호스트가 있는지
@@ -246,6 +363,18 @@ pub enum RealmError {
     BindDnWithoutPassword,
     #[error("timeout_secs must be between 1 and 30")]
     Timeout,
+    #[error("issuer must be an https:// URL with a host and no query or fragment")]
+    Issuer,
+    #[error("client_id must not be empty")]
+    ClientId,
+    #[error("scopes must include openid, and each scope must be non-empty without spaces")]
+    Scopes,
+    #[error("username_claim must not be empty")]
+    UsernameClaim,
+    #[error("groups_claim must not be empty")]
+    GroupsClaim,
+    #[error("timeout_secs must be between 1 and 120")]
+    OidcTimeout,
     #[error("roles.groups[].group must not be empty")]
     EmptyGroup,
 }
@@ -310,7 +439,9 @@ mod tests {
             }
         });
         let s: RealmSpec = serde_json::from_value(full.clone()).unwrap();
-        let RealmBackend::Ldap(l) = &s.backend;
+        let RealmBackend::Ldap(l) = &s.backend else {
+            panic!("not ldap: {s:?}");
+        };
         assert_eq!(l.bind_password.as_deref(), Some("s3cret"));
         assert_eq!(l.timeout_secs, 5);
         assert_eq!(s.roles.default, Some(Role::Viewer));
@@ -347,7 +478,7 @@ mod tests {
         let mut extra_ldap = backend.clone();
         extra_ldap["bogus"] = json!(1);
         let mut extra_kind = backend.clone();
-        extra_kind["kind"] = json!("oidc");
+        extra_kind["kind"] = json!("saml");
         for bad in [
             extra_spec,
             json!({ "backend": extra_ldap }),
@@ -487,6 +618,240 @@ mod tests {
             role: Role::Admin,
         });
         assert_eq!(s.validate(), Err(RealmError::EmptyGroup));
+    }
+
+    fn oidc() -> OidcRealm {
+        serde_json::from_value(json!({
+            "issuer": "https://idp.example.com/realms/corp",
+            "client_id": "oplite"
+        }))
+        .unwrap()
+    }
+
+    fn oidc_spec(oidc: OidcRealm) -> RealmSpec {
+        RealmSpec {
+            display: None,
+            backend: RealmBackend::Oidc(oidc),
+            roles: RoleMapping::default(),
+        }
+    }
+
+    #[test]
+    fn oidc_fields_have_defaults() {
+        let o = oidc();
+        assert_eq!(o.scopes, ["openid", "profile", "email"]);
+        assert_eq!(o.username_claim, "preferred_username");
+        assert_eq!(o.groups_claim, "groups");
+        assert_eq!(o.timeout_secs, 10);
+        assert_eq!(o.client_secret, None);
+        assert_eq!(o.ca_pem, None);
+    }
+
+    #[test]
+    fn oidc_realm_round_trips_as_tagged_json() {
+        let full = json!({
+            "display": "Okta",
+            "backend": {
+                "kind": "oidc",
+                "issuer": "https://corp.okta.com/",
+                "client_id": "0oa1",
+                "client_secret": "s3cret",
+                "scopes": ["openid", "groups"],
+                "username_claim": "email",
+                "groups_claim": "roles",
+                "ca_pem": "-----BEGIN CERTIFICATE-----",
+                "timeout_secs": 60
+            },
+            "roles": {
+                "groups": [{ "group": "opl-admins", "role": "admin" }]
+            }
+        });
+        let s: RealmSpec = serde_json::from_value(full.clone()).unwrap();
+        let RealmBackend::Oidc(o) = &s.backend else {
+            panic!("not oidc: {s:?}");
+        };
+        assert_eq!(o.client_secret.as_deref(), Some("s3cret"));
+        assert_eq!(o.issuer, "https://corp.okta.com/");
+        assert_eq!(serde_json::to_value(&s).unwrap(), full);
+
+        // 없는 선택 필드는 쓰지 않는다.
+        let small = oidc_spec(oidc());
+        let json = serde_json::to_value(&small).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "backend": {
+                    "kind": "oidc",
+                    "issuer": "https://idp.example.com/realms/corp",
+                    "client_id": "oplite",
+                    "scopes": ["openid", "profile", "email"],
+                    "username_claim": "preferred_username",
+                    "groups_claim": "groups",
+                    "timeout_secs": 10
+                },
+                "roles": { "groups": [] }
+            })
+        );
+        assert_eq!(serde_json::from_value::<RealmSpec>(json).unwrap(), small);
+
+        // 모르는 필드와 LDAP 필드는 받지 않는다.
+        for (field, value) in [("bogus", json!(1)), ("url", json!("ldaps://h"))] {
+            let mut bad =
+                json!({ "backend": { "kind": "oidc", "issuer": "https://h", "client_id": "c" } });
+            bad["backend"][field] = value;
+            assert!(
+                serde_json::from_value::<RealmSpec>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        for missing in ["issuer", "client_id"] {
+            let mut bad =
+                json!({ "backend": { "kind": "oidc", "issuer": "https://h", "client_id": "c" } });
+            bad["backend"].as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<RealmSpec>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_oidc_realms() {
+        assert_eq!(oidc_spec(oidc()).validate(), Ok(()));
+        for issuer in [
+            "https://h",
+            "https://h/",
+            "https://h:8443/realms/corp",
+            "https://10.0.0.1",
+            "https://[::1]:8443/x",
+        ] {
+            let o = OidcRealm {
+                issuer: issuer.into(),
+                ..oidc()
+            };
+            assert_eq!(oidc_spec(o).validate(), Ok(()), "{issuer}");
+        }
+        for issuer in [
+            "",
+            "h",
+            "http://h",
+            "https://",
+            "https:///x",
+            "https://:443",
+            "https://[]:443",
+            "https://h?x=1",
+            "https://h/#frag",
+            "https://u@h",
+            "https://h /x",
+            " https://h",
+        ] {
+            let o = OidcRealm {
+                issuer: issuer.into(),
+                ..oidc()
+            };
+            assert_eq!(oidc_spec(o).validate(), Err(RealmError::Issuer), "{issuer}");
+        }
+
+        let scopes = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for good in [scopes(&["openid"]), scopes(&["email", "openid", "groups"])] {
+            let o = OidcRealm {
+                scopes: good.clone(),
+                ..oidc()
+            };
+            assert_eq!(oidc_spec(o).validate(), Ok(()), "{good:?}");
+        }
+        for bad in [
+            scopes(&[]),
+            scopes(&["profile", "email"]),
+            scopes(&["OpenID"]),
+            scopes(&["openid", ""]),
+            scopes(&["openid", "a b"]),
+            scopes(&["openid profile"]),
+        ] {
+            let o = OidcRealm {
+                scopes: bad.clone(),
+                ..oidc()
+            };
+            assert_eq!(oidc_spec(o).validate(), Err(RealmError::Scopes), "{bad:?}");
+        }
+
+        let cases = [
+            (
+                OidcRealm {
+                    client_id: " ".into(),
+                    ..oidc()
+                },
+                RealmError::ClientId,
+            ),
+            (
+                OidcRealm {
+                    username_claim: "".into(),
+                    ..oidc()
+                },
+                RealmError::UsernameClaim,
+            ),
+            (
+                OidcRealm {
+                    groups_claim: " ".into(),
+                    ..oidc()
+                },
+                RealmError::GroupsClaim,
+            ),
+            (
+                OidcRealm {
+                    timeout_secs: 0,
+                    ..oidc()
+                },
+                RealmError::OidcTimeout,
+            ),
+            (
+                OidcRealm {
+                    timeout_secs: 121,
+                    ..oidc()
+                },
+                RealmError::OidcTimeout,
+            ),
+        ];
+        for (o, err) in cases {
+            assert_eq!(oidc_spec(o.clone()).validate(), Err(err), "{o:?}");
+        }
+        for timeout_secs in [1, 120] {
+            let o = OidcRealm {
+                timeout_secs,
+                ..oidc()
+            };
+            assert_eq!(oidc_spec(o).validate(), Ok(()));
+        }
+        assert_eq!(
+            RealmError::OidcTimeout.to_string(),
+            "timeout_secs must be between 1 and 120"
+        );
+        // 공개 클라이언트(비밀 없음)와 기밀 클라이언트 모두 된다.
+        let o = OidcRealm {
+            client_secret: Some("s".into()),
+            ..oidc()
+        };
+        assert_eq!(oidc_spec(o).validate(), Ok(()));
+
+        let mut s = oidc_spec(oidc());
+        s.roles.groups.push(GroupRole {
+            group: "".into(),
+            role: Role::Admin,
+        });
+        assert_eq!(s.validate(), Err(RealmError::EmptyGroup));
+    }
+
+    #[test]
+    fn debug_hides_the_client_secret() {
+        let o = OidcRealm {
+            client_secret: Some("s3cret".into()),
+            ..oidc()
+        };
+        let shown = format!("{:?}", oidc_spec(o));
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains(r#"client_secret: Some("***")"#), "{shown}");
+        assert!(shown.contains(r#"client_id: "oplite""#), "{shown}");
+        assert!(format!("{:?}", oidc()).contains("client_secret: None"));
     }
 
     fn mapping() -> RoleMapping {

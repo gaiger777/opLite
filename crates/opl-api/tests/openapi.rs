@@ -81,6 +81,9 @@ async fn openapi_document_is_served_without_login() {
     let ldap_view = &doc["components"]["schemas"]["LdapRealmView"]["properties"];
     assert!(ldap_view["bind_password"].is_null(), "{ldap_view}");
     assert!(ldap_view["has_bind_password"].is_object(), "{ldap_view}");
+    let oidc_view = &doc["components"]["schemas"]["OidcRealmView"]["properties"];
+    assert!(oidc_view["client_secret"].is_null(), "{oidc_view}");
+    assert!(oidc_view["has_client_secret"].is_object(), "{oidc_view}");
     assert_eq!(
         doc["paths"]["/auth/realms"]["get"]["security"],
         serde_json::json!([{}])

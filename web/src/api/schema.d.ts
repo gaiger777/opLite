@@ -34,7 +34,8 @@ export interface paths {
          * 세션 쿠키를 발급한다. 웹 UI가 쓴다. CLI는 로그인한 뒤 API 토큰을 만들어 쓴다.
          *     실패가 이어지면 잠시 막는다(429 `too_many_attempts`, `Retry-After`).
          *     LDAP 영역 로그인은 디렉터리로 확인하고 외부 사용자 `<이름>@<영역>`을 만들거나 역할을 고친다.
-         *     모르는 영역은 400, 맞는 역할이 없으면 403 `no_role`, 디렉터리에 닿지 못하면 503 `realm_unavailable`.
+         *     모르는 영역과 OIDC 영역(IdP에서 로그인한다)은 400, 맞는 역할이 없으면 403 `no_role`, 디렉터리에
+         *     닿지 못하면 503 `realm_unavailable`.
          */
         post: operations["login"];
         delete?: never;
@@ -2656,6 +2657,40 @@ export interface components {
             packages: components["schemas"]["PackageUpdate"][];
             truncated?: boolean;
         };
+        /** @description OpenID Connect 제공자(IdP). 브라우저가 IdP에서 로그인하고(인증 코드 흐름과 PKCE) 돌아온다. */
+        OidcRealm: {
+            /** @description IdP 인증서를 확인할 CA(PEM). 없으면 시스템 루트 */
+            ca_pem?: string;
+            client_id: string;
+            /** @description 기밀 클라이언트의 비밀. 공개 클라이언트면 없다. API는 내보내지 않는다. */
+            client_secret?: string;
+            /** @description 그룹(문자열 배열)을 담은 클레임 */
+            groups_claim?: string;
+            /** @description `https://host[:port][/path]`. discovery 문서의 `issuer`와 글자 그대로 같아야 한다. */
+            issuer: string;
+            /** @description 요청할 scope. `openid`가 있어야 한다. */
+            scopes?: string[];
+            /**
+             * Format: int64
+             * @description IdP 요청마다의 시간 제한(초)
+             */
+            timeout_secs?: number;
+            /** @description 사용자 이름을 담은 클레임 */
+            username_claim?: string;
+        };
+        /** @description [`OidcRealm`]에서 `client_secret`을 뺀 것 */
+        OidcRealmView: {
+            ca_pem?: string;
+            client_id: string;
+            groups_claim: string;
+            /** @description 클라이언트 비밀이 저장되어 있는지(없으면 공개 클라이언트) */
+            has_client_secret: boolean;
+            issuer: string;
+            scopes: string[];
+            /** Format: int64 */
+            timeout_secs: number;
+            username_claim: string;
+        };
         OvaSource: {
             /** @description 올린 파일 이름(표시용) */
             file_name: string;
@@ -2764,24 +2799,33 @@ export interface components {
         /** @enum {string} */
         Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
         /** @description 영역이 사용자를 확인하는 방법 */
-        RealmBackend: components["schemas"]["LdapRealm"] & {
+        RealmBackend: (components["schemas"]["LdapRealm"] & {
             /** @enum {string} */
             kind: "ldap";
-        };
-        RealmBackendView: components["schemas"]["LdapRealmView"] & {
+        }) | (components["schemas"]["OidcRealm"] & {
+            /** @enum {string} */
+            kind: "oidc";
+        });
+        RealmBackendView: (components["schemas"]["LdapRealmView"] & {
             /** @enum {string} */
             kind: "ldap";
-        };
+        }) | (components["schemas"]["OidcRealmView"] & {
+            /** @enum {string} */
+            kind: "oidc";
+        });
         /**
          * @description 로그인 화면에 보일 영역의 종류
          * @enum {string}
          */
-        RealmKind: "local" | "ldap";
+        RealmKind: "local" | "ldap" | "oidc";
         /**
          * @description 영역 만들기·바꾸기 본문. 바꾸기는 통째로 바꾸되, `backend.bind_password`를 빼면 저장된 값을
          *     그대로 두고(`url`·`bind_dn`·`ca_pem`이 모두 그대로일 때만 — 하나라도 바뀌면 400), 빈 글이면
          *     지운다. `bind_dn`에는 비밀번호가 있어야 한다(익명 검색은 둘 다 없을 때). `url`·`bind_dn`은 앞뒤
          *     공백을 떼고 `ca_pem`은 CRLF를 LF로 바꿔 앞뒤 공백을 뗀 뒤 비교·저장한다.
+         *     OIDC 영역의 `backend.client_secret`도 같다: 빼면 `issuer`·`client_id`·`ca_pem`이 모두 그대로일 때만
+         *     저장된 값을 두고(저장된 비밀이 없으면 공개 클라이언트로 남는다), 빈 글이면 지운다. `issuer`·`client_id`는
+         *     앞뒤 공백을 떼고 `ca_pem`은 LDAP처럼 다듬는다.
          */
         RealmRequest: {
             backend: components["schemas"]["RealmBackend"];
@@ -2820,7 +2864,7 @@ export interface components {
             name: string;
             ok: boolean;
         };
-        /** @description 응답의 영역. 서비스 계정 비밀번호 대신 있는지만 보인다. */
+        /** @description 응답의 영역. 서비스 계정 비밀번호·클라이언트 비밀 대신 있는지만 보인다. */
         RealmView: {
             backend: components["schemas"]["RealmBackendView"];
             display?: string;

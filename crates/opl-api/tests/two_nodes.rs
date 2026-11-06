@@ -258,6 +258,7 @@ async fn two_nodes_with(ha: Option<Arc<HaGuard>>, b_audit: bool) -> (TempDir, No
             role: Role::Admin,
             session_epoch: 0,
             realm: None,
+            subject: None,
         },
     );
     a.cluster.create(&admin).await.unwrap();

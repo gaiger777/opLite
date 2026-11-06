@@ -57,19 +57,20 @@ export function emptyForm(): RealmForm {
 }
 
 export function formOf(realm: RealmView): RealmForm {
-  const ldap = realm.backend;
+  // OIDC 영역의 폼은 아직 없다. LDAP 칸은 기본값으로 둔다.
+  const ldap = realm.backend.kind === "ldap" ? realm.backend : null;
   return {
     name: realm.name,
     display: realm.display ?? "",
-    url: ldap.url,
-    baseDn: ldap.base_dn,
-    bindDn: ldap.bind_dn ?? "",
+    url: ldap?.url ?? "",
+    baseDn: ldap?.base_dn ?? "",
+    bindDn: ldap?.bind_dn ?? "",
     bindPassword: "",
     clearBindPassword: false,
-    userFilter: ldap.user_filter,
-    groupAttr: ldap.group_attr,
-    caPem: ldap.ca_pem ?? "",
-    timeout: String(ldap.timeout_secs),
+    userFilter: ldap?.user_filter ?? DEFAULT_USER_FILTER,
+    groupAttr: ldap?.group_attr ?? DEFAULT_GROUP_ATTR,
+    caPem: ldap?.ca_pem ?? "",
+    timeout: String(ldap?.timeout_secs ?? DEFAULT_TIMEOUT_SECS),
     groups: (realm.roles.groups ?? []).map((g) => ({ ...g })),
     defaultRole: realm.roles.default ?? "",
   };
@@ -108,7 +109,7 @@ export function checkForm(
     errors.groupAttr = "realms.errors.required";
   }
   const bindDn = form.bindDn.trim();
-  const saved = realm?.backend.has_bind_password ?? false;
+  const saved = (realm?.backend.kind === "ldap" && realm.backend.has_bind_password) || false;
   if (form.bindPassword && !form.clearBindPassword && !bindDn) {
     errors.bindPassword = "realms.errors.bindDn";
   }
@@ -120,7 +121,12 @@ export function checkForm(
   } else if (!bindDn && saved && !form.clearBindPassword && !form.bindPassword) {
     // 바인드 DN을 비우면 익명 검색이므로 저장된 비밀번호를 지워야 한다(다시 넣을 것이 아니다).
     errors.bindPassword = "realms.errors.clearSaved";
-  } else if (realm && saved && !form.clearBindPassword && !form.bindPassword) {
+  } else if (
+    realm?.backend.kind === "ldap" &&
+    saved &&
+    !form.clearBindPassword &&
+    !form.bindPassword
+  ) {
     // 저장된 비밀번호를 다른 서버·계정으로 보내지 않는다(서버도 400).
     const ldap = realm.backend;
     if (

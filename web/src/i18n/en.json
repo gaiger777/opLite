@@ -934,7 +934,8 @@
     "displayHint": "Shown on the sign-in page. Leave empty to show the name.",
     "kind": "Kind",
     "kinds": {
-      "ldap": "LDAP"
+      "ldap": "LDAP",
+      "oidc": "OIDC"
     },
     "url": "URL",
     "urlHint": "ldap:// always uses StartTLS. ldaps:// uses TLS from the start.",

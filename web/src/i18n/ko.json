@@ -934,7 +934,8 @@
     "displayHint": "로그인 화면에 보입니다. 비우면 이름이 보입니다.",
     "kind": "종류",
     "kinds": {
-      "ldap": "LDAP"
+      "ldap": "LDAP",
+      "oidc": "OIDC"
     },
     "url": "URL",
     "urlHint": "ldap://는 늘 StartTLS를 쓰고, ldaps://는 처음부터 TLS를 씁니다.",

@@ -1,6 +1,6 @@
 //! 인증 영역 `/api/v1/realms`와 로그인 화면이 읽는 `/api/v1/auth/realms`. 영역은 계정 종류처럼
-//! admin만 읽고 바꾼다. 서비스 계정 비밀번호는 응답에 넣지 않고 `has_bind_password`만 보인다.
-//! 영역은 watch로도 내보내지 않는다(비밀번호를 담고 있다).
+//! admin만 읽고 바꾼다. 서비스 계정 비밀번호와 OIDC 클라이언트 비밀은 응답에 넣지 않고
+//! `has_bind_password`·`has_client_secret`만 보인다. 영역은 watch로도 내보내지 않는다(비밀을 담고 있다).
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::auth::Role;
 use opl_types::realm::{
-    LdapRealm, Realm, RealmBackend, RealmSpec, RoleMapping, validate_realm_name,
+    LdapRealm, OidcRealm, Realm, RealmBackend, RealmSpec, RoleMapping, validate_realm_name,
 };
 use opl_types::resource::{Resource, ResourceSpec};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,9 @@ use crate::state::AppState;
 /// 그대로 두고(`url`·`bind_dn`·`ca_pem`이 모두 그대로일 때만 — 하나라도 바뀌면 400), 빈 글이면
 /// 지운다. `bind_dn`에는 비밀번호가 있어야 한다(익명 검색은 둘 다 없을 때). `url`·`bind_dn`은 앞뒤
 /// 공백을 떼고 `ca_pem`은 CRLF를 LF로 바꿔 앞뒤 공백을 뗀 뒤 비교·저장한다.
+/// OIDC 영역의 `backend.client_secret`도 같다: 빼면 `issuer`·`client_id`·`ca_pem`이 모두 그대로일 때만
+/// 저장된 값을 두고(저장된 비밀이 없으면 공개 클라이언트로 남는다), 빈 글이면 지운다. `issuer`·`client_id`는
+/// 앞뒤 공백을 떼고 `ca_pem`은 LDAP처럼 다듬는다.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RealmRequest {
@@ -42,7 +45,7 @@ pub struct RealmRequest {
     pub roles: RoleMapping,
 }
 
-/// 응답의 영역. 서비스 계정 비밀번호 대신 있는지만 보인다.
+/// 응답의 영역. 서비스 계정 비밀번호·클라이언트 비밀 대신 있는지만 보인다.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RealmView {
     pub id: Uuid,
@@ -59,6 +62,7 @@ pub struct RealmView {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RealmBackendView {
     Ldap(LdapRealmView),
+    Oidc(OidcRealmView),
 }
 
 /// [`LdapRealm`]에서 `bind_password`를 뺀 것
@@ -79,15 +83,26 @@ pub struct LdapRealmView {
     pub has_bind_password: bool,
 }
 
+/// [`OidcRealm`]에서 `client_secret`을 뺀 것
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct OidcRealmView {
+    pub issuer: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    pub username_claim: String,
+    pub groups_claim: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, default)]
+    pub ca_pem: Option<String>,
+    pub timeout_secs: u64,
+    /// 클라이언트 비밀이 저장되어 있는지(없으면 공개 클라이언트)
+    pub has_client_secret: bool,
+}
+
 impl From<Realm> for RealmView {
     fn from(r: Realm) -> Self {
-        let RealmBackend::Ldap(l) = r.spec.backend;
-        Self {
-            id: r.id,
-            name: r.name,
-            revision: r.revision,
-            display: r.spec.display,
-            backend: RealmBackendView::Ldap(LdapRealmView {
+        let backend = match r.spec.backend {
+            RealmBackend::Ldap(l) => RealmBackendView::Ldap(LdapRealmView {
                 url: l.url,
                 bind_dn: l.bind_dn,
                 base_dn: l.base_dn,
@@ -97,6 +112,23 @@ impl From<Realm> for RealmView {
                 timeout_secs: l.timeout_secs,
                 has_bind_password: l.bind_password.is_some(),
             }),
+            RealmBackend::Oidc(o) => RealmBackendView::Oidc(OidcRealmView {
+                issuer: o.issuer,
+                client_id: o.client_id,
+                scopes: o.scopes,
+                username_claim: o.username_claim,
+                groups_claim: o.groups_claim,
+                ca_pem: o.ca_pem,
+                timeout_secs: o.timeout_secs,
+                has_client_secret: o.client_secret.is_some(),
+            }),
+        };
+        Self {
+            id: r.id,
+            name: r.name,
+            revision: r.revision,
+            display: r.spec.display,
+            backend,
             roles: r.spec.roles,
         }
     }
@@ -104,18 +136,35 @@ impl From<Realm> for RealmView {
 
 /// 요청을 저장할 spec으로. `stored`는 바꿀 때의 지금 값이다(빠진 비밀번호를 채운다).
 fn spec_of(req: &RealmRequest, stored: Option<&RealmSpec>) -> Result<RealmSpec, ApiError> {
-    let RealmBackend::Ldap(mut ldap) = req.backend.clone();
+    let backend = match req.backend.clone() {
+        RealmBackend::Ldap(ldap) => RealmBackend::Ldap(ldap_of(ldap, stored)?),
+        RealmBackend::Oidc(oidc) => RealmBackend::Oidc(oidc_of(oidc, stored)?),
+    };
+    let spec = RealmSpec {
+        display: req.display.clone().filter(|d| !d.trim().is_empty()),
+        backend,
+        roles: req.roles.clone(),
+    };
+    spec.validate()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(spec)
+}
+
+/// CRLF를 LF로 바꾸고 앞뒤 공백을 뗀다.
+fn trim_pem(pem: Option<String>) -> Option<String> {
+    pem.map(|pem| pem.replace("\r\n", "\n").trim().to_string())
+}
+
+fn ldap_of(mut ldap: LdapRealm, stored: Option<&RealmSpec>) -> Result<LdapRealm, ApiError> {
     // 저장·비교 전에 다듬는다: 끝 줄바꿈이 있는 CA 파일과 웹이 다듬어 보낸 같은 CA를 같은 값으로 본다.
     ldap.url = ldap.url.trim().to_string();
     ldap.bind_dn = ldap.bind_dn.map(|dn| dn.trim().to_string());
-    ldap.ca_pem = ldap
-        .ca_pem
-        .map(|pem| pem.replace("\r\n", "\n").trim().to_string());
+    ldap.ca_pem = trim_pem(ldap.ca_pem);
     ldap.bind_password = match ldap.bind_password.take() {
         Some(p) if p.is_empty() => None,
         Some(p) => Some(p),
-        None => match stored.map(stored_ldap) {
-            Some(old) if old.bind_password.is_some() => {
+        None => match stored.map(|s| &s.backend) {
+            Some(RealmBackend::Ldap(old)) if old.bind_password.is_some() => {
                 // 저장된 비밀번호를 다른 서버·계정으로 보내지 않는다.
                 if old.url != ldap.url || old.bind_dn != ldap.bind_dn || old.ca_pem != ldap.ca_pem {
                     return Err(ApiError::bad_request(
@@ -127,19 +176,33 @@ fn spec_of(req: &RealmRequest, stored: Option<&RealmSpec>) -> Result<RealmSpec, 
             _ => None,
         },
     };
-    let spec = RealmSpec {
-        display: req.display.clone().filter(|d| !d.trim().is_empty()),
-        backend: RealmBackend::Ldap(ldap),
-        roles: req.roles.clone(),
-    };
-    spec.validate()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    Ok(spec)
+    Ok(ldap)
 }
 
-fn stored_ldap(spec: &RealmSpec) -> &LdapRealm {
-    let RealmBackend::Ldap(ldap) = &spec.backend;
-    ldap
+fn oidc_of(mut oidc: OidcRealm, stored: Option<&RealmSpec>) -> Result<OidcRealm, ApiError> {
+    oidc.issuer = oidc.issuer.trim().to_string();
+    oidc.client_id = oidc.client_id.trim().to_string();
+    oidc.ca_pem = trim_pem(oidc.ca_pem);
+    oidc.client_secret = match oidc.client_secret.take() {
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(s),
+        None => match stored.map(|s| &s.backend) {
+            Some(RealmBackend::Oidc(old)) if old.client_secret.is_some() => {
+                // 저장된 비밀을 다른 IdP·클라이언트로 보내지 않는다.
+                if old.issuer != oidc.issuer
+                    || old.client_id != oidc.client_id
+                    || old.ca_pem != oidc.ca_pem
+                {
+                    return Err(ApiError::bad_request(
+                        "client_secret must be given again when issuer, client_id or ca_pem changes",
+                    ));
+                }
+                old.client_secret.clone()
+            }
+            _ => None,
+        },
+    };
+    Ok(oidc)
 }
 
 #[utoipa::path(get, path = "/realms", tag = "auth",
@@ -325,6 +388,12 @@ pub async fn test_realm(
 ) -> Result<Json<RealmTestResult>, ApiError> {
     state.authorize(&principal, Action::Operate, RealmSpec::KIND)?;
     let realm = lookup::<RealmSpec>(&state.cluster, &key)?;
+    // OIDC 영역의 시험은 다음 단계에서 더한다.
+    if let RealmBackend::Oidc(_) = realm.spec.backend {
+        return Err(ApiError::bad_request(
+            "testing an OIDC realm is not supported yet",
+        ));
+    }
     Ok(Json(
         crate::ldap::test(&realm.spec, &req.username, &req.password).await,
     ))
@@ -337,6 +406,7 @@ pub enum RealmKind {
     /// 로컬 사용자
     Local,
     Ldap,
+    Oidc,
 }
 
 /// 로그인 화면에 보일 영역
@@ -367,6 +437,7 @@ pub async fn list_login_realms(
         display: r.spec.display,
         kind: match r.spec.backend {
             RealmBackend::Ldap(_) => RealmKind::Ldap,
+            RealmBackend::Oidc(_) => RealmKind::Oidc,
         },
     });
     Ok(Json(std::iter::once(local).chain(others).collect()))
