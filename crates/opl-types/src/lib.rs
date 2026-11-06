@@ -7,6 +7,7 @@ pub mod backup_job;
 pub mod cluster;
 pub mod network;
 pub mod node;
+pub mod realm;
 pub mod resource;
 pub mod runtime;
 pub mod security_group;

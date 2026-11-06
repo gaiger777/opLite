@@ -52,6 +52,7 @@ pub enum Kind {
     BackupJob,
     VmImport,
     Settings,
+    Realm,
 }
 
 impl Kind {
@@ -73,6 +74,7 @@ impl Kind {
             Kind::BackupJob => "backup-job",
             Kind::VmImport => "vm-import",
             Kind::Settings => "settings",
+            Kind::Realm => "realm",
         }
     }
 }
@@ -98,6 +100,12 @@ pub fn validate_name(name: &str) -> Result<(), NameError> {
     "invalid name {0:?}: use 1-63 lowercase letters, digits and '-', not starting or ending with '-'"
 )]
 pub struct NameError(String);
+
+impl NameError {
+    pub(crate) fn new(name: &str) -> Self {
+        Self(name.to_string())
+    }
+}
 
 /// spec 타입과 리소스 종류, status 타입을 묶는다. 클러스터 저장소의 타입 있는 API가 쓴다.
 pub trait ResourceSpec: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {
@@ -144,6 +152,7 @@ mod tests {
             Kind::BackupJob,
             Kind::VmImport,
             Kind::Settings,
+            Kind::Realm,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }

@@ -155,6 +155,7 @@ impl Env {
                 password_hash: hash_password(ADMIN_PASSWORD.into()).await.unwrap(),
                 role: Role::Admin,
                 session_epoch: 0,
+                realm: None,
             },
         );
         cluster.create(&admin).await.unwrap();

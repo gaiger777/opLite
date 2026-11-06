@@ -68,6 +68,7 @@ pub async fn create_cluster(
                 .map_err(|e| anyhow::anyhow!(e.message))?,
             role: Role::Admin,
             session_epoch: 0,
+            realm: None,
         },
     );
     cluster.create(&admin).await?;

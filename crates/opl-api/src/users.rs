@@ -226,6 +226,7 @@ pub async fn create_user(
             password_hash: hash_password(req.password).await?,
             role: req.role,
             session_epoch: 0,
+            realm: None,
         },
     );
     user.revision = state.cluster.create(&user).await?;
