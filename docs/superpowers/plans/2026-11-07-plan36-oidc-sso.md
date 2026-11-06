@@ -4285,6 +4285,8 @@ impl Idp {
             "issuer": inner.issuer,
             "client_id": inner.client_id,
             "ca_pem": self.ca_pem,
+            // macOS에서는 새 시험 CA로 하는 첫 TLS 연결의 인증서 검증이 15초쯤 걸리기도 한다.
+            "timeout_secs": 30,
         });
         if let Some(secret) = &inner.client_secret {
             backend["client_secret"] = json!(secret);
@@ -7943,6 +7945,8 @@ impl Idp {
             "issuer": inner.issuer,
             "client_id": inner.client_id,
             "ca_pem": self.ca_pem,
+            // macOS에서는 새 시험 CA로 하는 첫 TLS 연결의 인증서 검증이 15초쯤 걸리기도 한다.
+            "timeout_secs": 30,
         });
         if let Some(secret) = &inner.client_secret {
             backend["client_secret"] = json!(secret);
