@@ -116,6 +116,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TelemetryCmd,
     },
+    /// 감사 로그(admin만): 모든 노드의 바꾸는 요청·로그인·콘솔 열기를 새 것부터
+    Audit(AuditArgs),
 }
 
 #[derive(Args)]
@@ -1719,6 +1721,162 @@ async fn telemetry(
     Ok(())
 }
 
+#[derive(Args)]
+struct AuditArgs {
+    /// 이 시각부터: `30m`·`1h`·`7d`(지금에서 뺌)나 RFC 3339. 기본은 `--until`의 24시간 전
+    #[arg(long)]
+    since: Option<String>,
+    /// 이 시각까지(RFC 3339). 기본은 지금
+    #[arg(long)]
+    until: Option<String>,
+    /// 사용자 이름(정확히 같은 것)
+    #[arg(long)]
+    user: Option<String>,
+    /// 노드 이름
+    #[arg(long)]
+    node: Option<String>,
+    /// 동작(`POST /vms/{key}`)이나 경로에 든 문자열
+    #[arg(long)]
+    action: Option<String>,
+    /// 최대 개수(1~5000, 기본 200)
+    #[arg(long)]
+    limit: Option<u32>,
+}
+
+/// `--since`: 기간(`30m`·`1h`·`7d`, 초 `s`도)이면 지금(`now_ms`)에서 뺀 유닉스 밀리초, 아니면
+/// 그대로(RFC 3339나 밀리초) 보내 서버가 푼다.
+fn audit_since(s: &str, now_ms: u64) -> String {
+    match audit_duration_ms(s) {
+        Some(ms) => now_ms.saturating_sub(ms).to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// `30m`·`1h`·`7d`(초 `s`도) 같은 기간의 밀리초. 기간이 아니면 None
+fn audit_duration_ms(s: &str) -> Option<u64> {
+    let unit = match s.chars().last()? {
+        's' => 1_000,
+        'm' => 60_000,
+        'h' => 3_600_000,
+        'd' => 86_400_000,
+        _ => return None,
+    };
+    let n = s[..s.len() - 1].parse::<u64>().ok()?;
+    Some(n.saturating_mul(unit))
+}
+
+/// 유닉스 밀리초를 `2026-11-06T09:30:05Z`처럼(UTC)
+fn unix_ms_time(ms: u64) -> String {
+    match time::OffsetDateTime::from_unix_timestamp((ms / 1000) as i64) {
+        Ok(t) => format!(
+            "{}T{:02}:{:02}:{:02}Z",
+            t.date(),
+            t.hour(),
+            t.minute(),
+            t.second()
+        ),
+        Err(_) => ms.to_string(),
+    }
+}
+
+/// `audit`의 표 한 줄
+fn audit_row(e: &Value) -> Vec<String> {
+    // 대상이 없으면 detail(예: `audit.dropped`의 수, 로그인의 `username=…`)
+    let target = match (e["target"]["kind"].as_str(), e["target"]["key"].as_str()) {
+        (Some(kind), Some(key)) => format!("{kind}/{key}"),
+        _ => e["detail"].as_str().unwrap_or("-").to_string(),
+    };
+    vec![
+        e["time"].as_u64().map_or_else(|| "-".into(), unix_ms_time),
+        cell(&e["node"]),
+        cell(&e["user"]),
+        cell(&e["ip"]),
+        cell(&e["action"]),
+        target,
+        cell(&e["status"]),
+    ]
+}
+
+/// `GET /audit`를 부르고 표로 보인다. 읽지 못한 노드, 감사 로그를 끈 노드와 잘림은 표 뒤
+/// `err`(stderr)에 알린다.
+async fn audit(
+    client: &Client,
+    args: AuditArgs,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+    err: &mut dyn Write,
+) -> anyhow::Result<()> {
+    if args.until.is_some()
+        && args
+            .since
+            .as_deref()
+            .is_some_and(|s| audit_duration_ms(s).is_some())
+    {
+        bail!("a relative --since cannot be combined with --until; give a time");
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let query: Vec<(&str, String)> = [
+        ("since", args.since.map(|s| audit_since(&s, now_ms))),
+        ("until", args.until),
+        ("user", args.user),
+        ("node", args.node),
+        ("action", args.action),
+        ("limit", args.limit.map(|n| n.to_string())),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k, v)))
+    .collect();
+    let mut r = client.request(Method::GET, "/audit");
+    if !query.is_empty() {
+        r = r.query(&query);
+    }
+    let resp = client.send(r).await?;
+    if json_out {
+        print_json(out, &resp)?;
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = resp["entries"]
+        .as_array()
+        .map(|a| a.iter().map(audit_row).collect())
+        .unwrap_or_default();
+    table(
+        out,
+        &["TIME", "NODE", "USER", "IP", "ACTION", "TARGET", "STATUS"],
+        &rows,
+    )?;
+    let unreachable: Vec<&str> = resp["unreachable"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !unreachable.is_empty() {
+        writeln!(
+            err,
+            "warning: no audit records from: {}",
+            unreachable.join(", ")
+        )?;
+    }
+    let disabled: Vec<&str> = resp["disabled"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !disabled.is_empty() {
+        writeln!(
+            err,
+            "note: the audit log is disabled on: {}",
+            disabled.join(", ")
+        )?;
+    }
+    if resp["truncated"] == true {
+        writeln!(
+            err,
+            "note: more entries match; narrow the range or raise --limit"
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Role {
     Admin,
@@ -2127,6 +2285,7 @@ where
         Cmd::Settings { cmd } => settings(&client, cmd, json_out, out).await?,
         Cmd::Subscription { cmd } => subscription(&client, cmd, json_out, out).await?,
         Cmd::Telemetry { cmd } => telemetry(&client, cmd, json_out, out).await?,
+        Cmd::Audit(args) => audit(&client, args, json_out, out, &mut std::io::stderr()).await?,
     }
     Ok(())
 }
@@ -6806,6 +6965,128 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             String::from_utf8(out).unwrap(),
             format!("{shown}{shown}{shown}{shown}{preview}")
         );
+    }
+
+    /// `--since`의 기간(`30m`·`1h`·`7d`)은 지금에서 뺀 유닉스 밀리초로, 나머지는 그대로 보낸다.
+    #[test]
+    fn audit_since_turns_durations_into_milliseconds() {
+        let now = 1_762_400_000_000;
+        assert_eq!(audit_since("30m", now), (now - 30 * 60_000).to_string());
+        assert_eq!(audit_since("1h", now), (now - 3_600_000).to_string());
+        assert_eq!(audit_since("7d", now), (now - 7 * 86_400_000).to_string());
+        assert_eq!(audit_since("90s", now), (now - 90_000).to_string());
+        assert_eq!(
+            audit_since("2026-11-06T00:00:00Z", now),
+            "2026-11-06T00:00:00Z"
+        );
+        assert_eq!(audit_since("1762400000000", now), "1762400000000");
+        assert_eq!(audit_since("xd", now), "xd");
+    }
+
+    /// `audit`는 거르기를 쿼리로 보내고 표를 보인다. 읽지 못한 노드와 잘림은 stderr에 알린다.
+    /// `-o json`은 응답 그대로이고 stderr에 쓰지 않는다.
+    #[tokio::test]
+    async fn audit_shows_a_table_and_warnings() {
+        let (client, seen) = fake_api(|_| {
+            json!({
+                "entries": [
+                    { "id": "019a0000-0000-7000-8000-000000000002", "time": 1_762_387_205_123u64,
+                      "node": "node-a", "user": "alice", "user_id": null, "role": "admin",
+                      "auth": "token", "ip": "10.0.0.5", "method": "POST",
+                      "path": "/vms/web-1/actions/start", "action": "POST /vms/{key}/actions/{action}",
+                      "target": { "kind": "vms", "key": "web-1" }, "status": 202,
+                      "duration_ms": 12, "detail": null },
+                    { "id": "019a0000-0000-7000-8000-000000000001", "time": 1_762_387_200_000u64,
+                      "node": "node-b", "user": null, "user_id": null, "role": null,
+                      "auth": "none", "ip": "10.0.0.9", "method": "POST", "path": "/auth/login",
+                      "action": "POST /auth/login", "target": null, "status": 401,
+                      "duration_ms": 3, "detail": "username=bob" },
+                    { "id": "019a0000-0000-7000-8000-000000000000", "time": 1_762_387_100_000u64,
+                      "node": "node-a", "user": "alice", "user_id": null, "role": "admin",
+                      "auth": "session", "ip": "10.0.0.5", "method": "POST", "path": "/auth/logout",
+                      "action": "POST /auth/logout", "target": null, "status": 204,
+                      "duration_ms": 1, "detail": null }
+                ],
+                "unreachable": ["node-c", "node-d"],
+                "disabled": ["node-e"],
+                "truncated": true
+            })
+        })
+        .await;
+        let args = [
+            "oplctl",
+            "audit",
+            "--since",
+            "2026-11-06T00:00:00Z",
+            "--until",
+            "1762400000000",
+            "--user",
+            "alice",
+            "--node",
+            "node-a",
+            "--action",
+            "start",
+            "--limit",
+            "5",
+        ];
+        let Cmd::Audit(a) = Cli::try_parse_from(args).unwrap().cmd else {
+            unreachable!()
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        audit(&client, a, false, &mut out, &mut err).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/audit?since=2026-11-06T00%3A00%3A00Z&until=1762400000000\
+              &user=alice&node=node-a&action=start&limit=5 HTTP/1.1"
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "TIME                  NODE    USER   IP        ACTION                            TARGET        STATUS\n\
+             2025-11-06T00:00:05Z  node-a  alice  10.0.0.5  POST /vms/{key}/actions/{action}  vms/web-1     202\n\
+             2025-11-06T00:00:00Z  node-b  -      10.0.0.9  POST /auth/login                  username=bob  401\n\
+             2025-11-05T23:58:20Z  node-a  alice  10.0.0.5  POST /auth/logout                 -             204\n"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: no audit records from: node-c, node-d\n\
+             note: the audit log is disabled on: node-e\n\
+             note: more entries match; narrow the range or raise --limit\n"
+        );
+
+        // 거르기가 없으면 쿼리도 없다(서버 기본값: 지난 24시간, 200개).
+        let Cmd::Audit(a) = Cli::try_parse_from(["oplctl", "audit"]).unwrap().cmd else {
+            unreachable!()
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        audit(&client, a, true, &mut out, &mut err).await.unwrap();
+        assert_eq!(seen.lock().unwrap()[1], "GET /api/v1/audit HTTP/1.1");
+        let shown: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(shown["unreachable"], json!(["node-c", "node-d"]));
+        assert_eq!(shown["entries"][1]["detail"], "username=bob");
+        assert!(err.is_empty());
+
+        // 기간 --since는 --until과 함께 줄 수 없다(서버에 보내지 않는다).
+        let args = [
+            "oplctl",
+            "audit",
+            "--since",
+            "1h",
+            "--until",
+            "1762400000000",
+        ];
+        let Cmd::Audit(a) = Cli::try_parse_from(args).unwrap().cmd else {
+            unreachable!()
+        };
+        let e = audit(&client, a, false, &mut Vec::new(), &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "a relative --since cannot be combined with --until; give a time"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[test]
