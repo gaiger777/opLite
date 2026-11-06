@@ -65,6 +65,12 @@ fn main() {
             "crate::migration::IncomingMigration",
             "crate::wire::IncomingReply",
         ))
+        .method(json(
+            "read_audit",
+            "ReadAudit",
+            "opl_types::audit::AuditQuery",
+            "crate::audit::AuditReply",
+        ))
         .method(
             Method::builder()
                 .name("uefi_vars")

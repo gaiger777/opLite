@@ -64,13 +64,16 @@ pub struct AuditQuery {
     pub until: u64,
     /// 사용자 이름이 정확히 같은 것
     pub user: Option<String>,
-    /// `action`에 이 문자열이 들어 있는 것
+    /// `action`이나 `path`에 이 문자열이 들어 있는 것(VM 동작은 템플릿이 같아 경로로 가른다)
     pub action: Option<String>,
     /// 돌려줄 최대 개수
     pub limit: u32,
 }
 
 impl AuditQuery {
+    /// `limit`의 최댓값
+    pub const MAX_LIMIT: u32 = 5000;
+
     pub fn matches(&self, entry: &AuditEntry) -> bool {
         (self.since..=self.until).contains(&entry.time)
             && self
@@ -80,8 +83,22 @@ impl AuditQuery {
             && self
                 .action
                 .as_deref()
-                .is_none_or(|a| entry.action.contains(a))
+                .is_none_or(|a| entry.action.contains(a) || entry.path.contains(a))
     }
+}
+
+/// `GET /audit`의 응답: 모든 노드의 항목을 합친 것
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AuditResponse {
+    /// 시간 내림차순
+    pub entries: Vec<AuditEntry>,
+    /// 읽지 못한 노드의 이름(정렬)
+    pub unreachable: Vec<String>,
+    /// 감사 로그를 끈 노드의 이름(정렬)
+    pub disabled: Vec<String>,
+    /// 조건에 맞는 항목이 `limit`보다 많아 잘랐다.
+    pub truncated: bool,
 }
 
 #[cfg(test)]
@@ -145,7 +162,26 @@ mod tests {
             ..query()
         };
         assert!(q.matches(&entry(150, None, "POST /vms/{key}/actions/start")));
-        assert!(!q.matches(&entry(150, None, "POST /auth/login")));
+        let login = AuditEntry {
+            path: "/auth/login".into(),
+            ..entry(150, None, "POST /auth/login")
+        };
+        assert!(!q.matches(&login));
+    }
+
+    #[test]
+    fn action_also_matches_a_substring_of_the_path() {
+        // VM 동작은 action 템플릿이 같아 경로(`/vms/web-1/actions/start`)로 가른다.
+        let q = AuditQuery {
+            action: Some("actions/start".into()),
+            ..query()
+        };
+        assert!(q.matches(&entry(150, None, "POST /vms/{key}/actions/{action}")));
+        let q = AuditQuery {
+            action: Some("actions/stop".into()),
+            ..query()
+        };
+        assert!(!q.matches(&entry(150, None, "POST /vms/{key}/actions/{action}")));
     }
 
     #[test]

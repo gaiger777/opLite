@@ -160,6 +160,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(volumes::resize_volume))
         .routes(routes!(console::console))
         .routes(routes!(watch::watch))
+        .routes(routes!(audit::list_audit))
 }
 
 /// API 문서. 라우터와 같은 정의에서 만들므로 경로가 어긋나지 않는다.

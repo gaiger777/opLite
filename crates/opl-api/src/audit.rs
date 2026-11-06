@@ -2,7 +2,8 @@
 //! (요청이 디스크를 기다리지 않음), 같은 줄을 tracing 대상 `opl_audit`로도 내보낸다.
 //! 파일이 커지면 `audit.log.1`, `.2`… 로 밀고, 읽을 때는 새 파일부터 거꾸로 훑는다.
 //! 항목은 미들웨어 [`layer`]가 바꾸는 요청마다 만든다. 인증 추출기와 핸들러는 요청의
-//! [`AuditSlot`]에 주체와 짧은 설명을 남긴다.
+//! [`AuditSlot`]에 주체와 짧은 설명을 남긴다. `GET /api/v1/audit`는 모든 노드의 감사 로그를
+//! 노드 사이 RPC(`ReadAudit`)로 읽어 합친다.
 
 use std::convert::Infallible;
 use std::fs::{File, OpenOptions};
@@ -14,16 +15,26 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use axum::extract::{FromRequestParts, MatchedPath, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method};
 use axum::middleware::Next;
 use axum::response::Response;
-use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery, AuditTarget};
+use opl_cluster::types::NodeId;
+use opl_peer::AuditSource;
+use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery, AuditResponse, AuditTarget};
+use opl_types::auth::Role;
+use opl_types::node::NodeSpec;
+use serde::Deserialize;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use utoipa::IntoParams;
 use uuid::Uuid;
 
 use crate::auth::Principal;
+use crate::error::{ApiError, Json, Query};
 use crate::limit::ClientIp;
 use crate::state::AppState;
 
@@ -41,6 +52,11 @@ const UNAUTHENTICATED_PER_WINDOW: u32 = 60;
 /// 인증 없는 항목을 세는 IP의 최대 수. 넘치면 가장 오래된 창부터 버린다.
 const UNAUTHENTICATED_IPS: usize = 10_000;
 const FILE_NAME: &str = "audit.log";
+/// 다른 노드의 감사 로그를 읽는 데 기다리는 최대 시간
+const PEER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// 읽기 API의 기본 범위(`until`부터 거슬러)
+const DEFAULT_RANGE_MS: u64 = 24 * 60 * 60 * 1000;
+const DEFAULT_LIMIT: u32 = 200;
 
 /// 감사 로그 설정
 #[derive(Debug, Clone)]
@@ -81,6 +97,11 @@ enum Msg {
 impl AuditLog {
     pub fn disabled() -> Self {
         Self { inner: None }
+    }
+
+    /// 감사 로그를 적는지(`disabled`가 아닌지)
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
     }
 
     /// 디렉터리를 만들고 쓰기 스레드를 띄운다.
@@ -189,6 +210,163 @@ impl AuditLog {
             tracing::warn!("the audit log did not finish writing within {timeout:?}; giving up");
         }
     }
+}
+
+/// 다른 노드가 노드 사이 RPC로 이 노드의 감사 로그를 읽는다.
+#[async_trait]
+impl AuditSource for AuditLog {
+    async fn read(&self, query: AuditQuery) -> Result<Vec<AuditEntry>, String> {
+        AuditLog::read(self, query).await.map_err(|e| e.to_string())
+    }
+
+    fn enabled(&self) -> bool {
+        self.is_enabled()
+    }
+}
+
+/// `GET /audit`의 조건
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct AuditParams {
+    /// 이 시각부터(포함): 유닉스 밀리초나 RFC 3339. 기본은 `until`의 24시간 전
+    pub since: Option<String>,
+    /// 이 시각까지(포함): 유닉스 밀리초나 RFC 3339. 기본은 지금
+    pub until: Option<String>,
+    /// 사용자 이름(정확히 같은 것)
+    pub user: Option<String>,
+    /// 노드 이름(정확히 같은 것)
+    pub node: Option<String>,
+    /// 동작(`POST /vms/{key}`)이나 경로에 들어 있는 문자열
+    pub action: Option<String>,
+    /// 최대 개수(1~5000, 기본 200)
+    pub limit: Option<u32>,
+}
+
+/// 모든 노드의 감사 로그를 새 것부터 읽는다. admin만 읽는다. 읽지 못한 노드는 `unreachable`에,
+/// 감사 로그를 끈 노드는 `disabled`에, `limit`보다 많으면 잘라 `truncated`다.
+#[utoipa::path(get, path = "/audit", tag = "audit",
+    params(AuditParams),
+    responses((status = 200, body = AuditResponse), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn list_audit(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Query(params): Query<AuditParams>,
+) -> Result<Json<AuditResponse>, ApiError> {
+    if principal.role != Role::Admin {
+        return Err(ApiError::forbidden());
+    }
+    let until = match &params.until {
+        Some(s) => parse_time("until", s)?,
+        None => now_ms(),
+    };
+    let since = match &params.since {
+        Some(s) => parse_time("since", s)?,
+        None => until.saturating_sub(DEFAULT_RANGE_MS),
+    };
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
+    if !(1..=AuditQuery::MAX_LIMIT).contains(&limit) {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {}",
+            AuditQuery::MAX_LIMIT
+        )));
+    }
+    let query = AuditQuery {
+        since,
+        until,
+        user: params.user,
+        action: params.action,
+        limit,
+    };
+    // 위트니스는 API가 없어 감사 로그도 없다. Node 리소스가 없는 멤버는 id를 이름으로 쓴다.
+    let nodes = state.cluster.list::<NodeSpec>()?.1;
+    let members = state.cluster.members();
+    let reads = members
+        .voters
+        .iter()
+        .chain(&members.learners)
+        .filter_map(|(id, addr)| {
+            let node = nodes.iter().find(|n| n.id == id.0);
+            if node.is_some_and(|n| n.spec.witness) {
+                return None;
+            }
+            let name = node.map_or_else(|| id.0.to_string(), |n| n.name.clone());
+            if params.node.as_ref().is_some_and(|want| *want != name) {
+                return None;
+            }
+            Some(read_node(&state, *id, addr, name, query.clone()))
+        });
+    let mut entries = Vec::new();
+    let mut unreachable = Vec::new();
+    let mut disabled = Vec::new();
+    for (name, read) in futures_util::future::join_all(reads).await {
+        match read {
+            Ok(Some(read)) => entries.extend(read),
+            Ok(None) => disabled.push(name),
+            Err(e) => {
+                tracing::warn!(node = %name, error = %e, "cannot read the audit log of a node");
+                unreachable.push(name);
+            }
+        }
+    }
+    unreachable.sort();
+    disabled.sort();
+    entries.sort_by_key(|e| std::cmp::Reverse((e.time, e.id)));
+    let truncated = entries.len() > limit as usize;
+    entries.truncate(limit as usize);
+    Ok(Json(AuditResponse {
+        entries,
+        unreachable,
+        disabled,
+        truncated,
+    }))
+}
+
+/// 노드 하나의 감사 로그. 이 노드면 파일을 직접, 다른 노드면 노드 사이 RPC로 읽는다.
+/// 감사 로그를 끈 노드면 None이다.
+async fn read_node(
+    state: &AppState,
+    id: NodeId,
+    addr: &str,
+    name: String,
+    query: AuditQuery,
+) -> (String, Result<Option<Vec<AuditEntry>>, String>) {
+    if id.0 == state.node {
+        if !state.audit.is_enabled() {
+            return (name, Ok(None));
+        }
+        let read = state.audit.read(query).await.map(Some);
+        return (name, read.map_err(|e| e.to_string()));
+    }
+    let Some(peers) = &state.peers else {
+        return (name, Err("no node-to-node connection".into()));
+    };
+    let read = tokio::time::timeout(
+        PEER_READ_TIMEOUT,
+        peers.read_audit(addr, query, PEER_READ_TIMEOUT),
+    )
+    .await;
+    let read = match read {
+        Ok(Ok(entries)) => Ok(entries),
+        Ok(Err(status)) => Err(status.message().to_string()),
+        Err(_) => Err("timed out".into()),
+    };
+    (name, read)
+}
+
+/// 유닉스 밀리초나 RFC 3339 시각
+fn parse_time(field: &str, value: &str) -> Result<u64, ApiError> {
+    if let Ok(ms) = value.parse::<u64>() {
+        return Ok(ms);
+    }
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .and_then(|t| u64::try_from(t.unix_timestamp_nanos() / 1_000_000).ok())
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "{field} must be unix milliseconds or an RFC 3339 time, not {value:?}"
+            ))
+        })
 }
 
 /// 요청 하나의 감사 정보. 미들웨어가 요청 확장에 넣고, 인증 추출기와 핸들러가 채운다.

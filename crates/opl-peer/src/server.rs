@@ -8,6 +8,7 @@ use bytes::Bytes;
 use opl_cluster::Cluster;
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_driver::{DriverError, Hypervisor, uefi_vars_path};
+use opl_types::audit::AuditQuery;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::mpsc;
@@ -16,6 +17,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
+use crate::audit::{AuditReply, AuditSource};
 use crate::firmware::{UefiVarsChunk, UefiVarsRequest};
 use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
 use crate::pki::{NodeTls, node_id_of};
@@ -32,6 +34,7 @@ pub struct PeerService {
     cluster: Arc<Cluster>,
     hv: Option<Arc<dyn Hypervisor>>,
     migrations: Option<Arc<dyn MigrationReceiver>>,
+    audit: Option<Arc<dyn AuditSource>>,
     /// 드라이버의 `state_dir`. UEFI 변수 파일을 여기서 찾아 보낸다.
     state_dir: Option<PathBuf>,
 }
@@ -43,6 +46,7 @@ impl PeerService {
             cluster,
             hv,
             migrations: None,
+            audit: None,
             state_dir: None,
         }
     }
@@ -56,6 +60,12 @@ impl PeerService {
     /// 라이브 마이그레이션을 `receiver`로 받는다. 없으면 받기 요청을 거부한다.
     pub fn with_migrations(mut self, receiver: Arc<dyn MigrationReceiver>) -> Self {
         self.migrations = Some(receiver);
+        self
+    }
+
+    /// 이 노드의 감사 로그를 `source`로 읽어 준다. 없으면 읽기 요청을 거부한다.
+    pub fn with_audit(mut self, source: Arc<dyn AuditSource>) -> Self {
+        self.audit = Some(source);
         self
     }
 
@@ -155,6 +165,21 @@ impl Peer for PeerService {
         Ok(Response::new(
             self.migrations()?.abort(req.into_inner()).await,
         ))
+    }
+
+    async fn read_audit(&self, req: Request<AuditQuery>) -> Result<Response<AuditReply>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .audit
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("this node does not keep an audit log"))?;
+        if !source.enabled() {
+            return Err(Status::failed_precondition("audit log disabled"));
+        }
+        let mut query = req.into_inner();
+        query.limit = query.limit.min(AuditQuery::MAX_LIMIT);
+        let entries = source.read(query).await.map_err(Status::internal)?;
+        Ok(Response::new(AuditReply { entries }))
     }
 
     type UefiVarsStream = ReceiverStream<Result<UefiVarsChunk, Status>>;

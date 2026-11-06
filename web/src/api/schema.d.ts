@@ -1,6 +1,26 @@
 // 생성된 파일이다. 고치지 말고 `pnpm gen:api`로 다시 만든다.
 
 export interface paths {
+    "/audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 모든 노드의 감사 로그를 새 것부터 읽는다. admin만 읽는다. 읽지 못한 노드는 `unreachable`에,
+         *     감사 로그를 끈 노드는 `disabled`에, `limit`보다 많으면 잘라 `truncated`다.
+         */
+        get: operations["list_audit"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/login": {
         parameters: {
             query?: never;
@@ -1143,6 +1163,67 @@ export interface components {
          * @enum {string}
          */
         Arch: "x86_64" | "aarch64";
+        /**
+         * @description 요청을 인증한 방식
+         * @enum {string}
+         */
+        AuditAuth: "session" | "token" | "none";
+        /** @description 감사 로그 한 줄 */
+        AuditEntry: {
+            /** @description `"<METHOD> <라우트 템플릿>"`(예: `POST /vms/{key}/actions/start`) */
+            action: string;
+            auth: components["schemas"]["AuditAuth"];
+            /** @description 핸들러가 남긴 짧은 문자열(비밀은 넣지 않는다) */
+            detail?: string | null;
+            /** Format: int64 */
+            duration_ms: number;
+            /**
+             * Format: uuid
+             * @description UUID v7
+             */
+            id: string;
+            /** @description 클라이언트 IP */
+            ip: string;
+            method: string;
+            /** @description 적은 노드의 이름 */
+            node: string;
+            /** @description 쿼리를 뺀 경로(`/api/v1` 아래) */
+            path: string;
+            role?: components["schemas"]["Role"] | null;
+            /**
+             * Format: int32
+             * @description 응답 상태
+             */
+            status: number;
+            target?: components["schemas"]["AuditTarget"] | null;
+            /**
+             * Format: int64
+             * @description 유닉스 밀리초
+             */
+            time: number;
+            /** @description 사용자 이름. 인증 전이나 실패면 없다. */
+            user?: string | null;
+            /** Format: uuid */
+            user_id?: string | null;
+        };
+        /** @description `GET /audit`의 응답: 모든 노드의 항목을 합친 것 */
+        AuditResponse: {
+            /** @description 감사 로그를 끈 노드의 이름(정렬) */
+            disabled: string[];
+            /** @description 시간 내림차순 */
+            entries: components["schemas"]["AuditEntry"][];
+            /** @description 조건에 맞는 항목이 `limit`보다 많아 잘랐다. */
+            truncated: boolean;
+            /** @description 읽지 못한 노드의 이름(정렬) */
+            unreachable: string[];
+        };
+        /** @description 요청의 대상(라우트 템플릿의 첫 경로 조각과 첫 매개변수 값) */
+        AuditTarget: {
+            /** @description 예: `web-1` */
+            key: string;
+            /** @description 예: `vms` */
+            kind: string;
+        };
         /** @description 백업에 담은 디스크 하나. VM 스펙의 디스크 순서를 따른다. */
         BackupDisk: {
             /** @description 백업 디렉터리 안의 파일 이름(`disk{i}.qcow2`) */
@@ -3729,6 +3810,46 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_audit: {
+        parameters: {
+            query?: {
+                /** @description 이 시각부터(포함): 유닉스 밀리초나 RFC 3339. 기본은 `until`의 24시간 전 */
+                since?: string;
+                /** @description 이 시각까지(포함): 유닉스 밀리초나 RFC 3339. 기본은 지금 */
+                until?: string;
+                /** @description 사용자 이름(정확히 같은 것) */
+                user?: string;
+                /** @description 노드 이름(정확히 같은 것) */
+                node?: string;
+                /** @description 동작(`POST /vms/{key}`)이나 경로에 들어 있는 문자열 */
+                action?: string;
+                /** @description 최대 개수(1~5000, 기본 200) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     login: {
         parameters: {
             query?: never;

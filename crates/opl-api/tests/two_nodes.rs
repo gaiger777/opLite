@@ -1,5 +1,6 @@
 //! 실제 gRPC(mTLS)로 이은 두 노드: 한 노드의 API로 다른 노드에 VM을 띄우고 콘솔을 중계한다.
 //! 라이브 마이그레이션(Mock 하이퍼바이저): 성공, 확정 전 실패의 되돌리기(HA VM 포함), 공유 디스크의 잠금 바꾸기.
+//! 감사 로그: 한 노드의 `GET /audit`가 두 노드의 항목을 합치고, 닿지 않는 노드를 알린다.
 
 mod common;
 
@@ -10,7 +11,8 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use openraft::BasicNode;
 use opl_api::{
-    AppState, IncomingConfig, IncomingMigrations, TaskRunner, UefiVarsFetcher, hash_password,
+    AppState, AuditConfig, AuditLog, IncomingConfig, IncomingMigrations, TaskRunner,
+    UefiVarsFetcher, hash_password,
 };
 use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig};
@@ -48,6 +50,8 @@ const MIGRATION_PORTS: std::ops::RangeInclusive<u16> = 61000..=61009;
 
 struct Node {
     id: Uuid,
+    /// Node 리소스와 감사 로그의 노드 이름
+    name: String,
     addr: String,
     cluster: Arc<Cluster>,
     peers: Arc<Peers>,
@@ -56,6 +60,11 @@ struct Node {
     storage: Arc<FakeStorage>,
     tls: NodeTls,
     listener: Option<TcpListener>,
+    /// 감사 로그를 끈 노드(opld의 `[audit] enabled = false`)
+    audit_off: bool,
+    /// 노드 간 서버를 멈춘다.
+    peer_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    peer_server: Option<tokio::task::JoinHandle<()>>,
     base: String,
     /// reconciler의 HA guard. None이면 펜싱이 꺼진 노드다.
     ha: Option<Arc<HaGuard>>,
@@ -63,7 +72,7 @@ struct Node {
 }
 
 impl Node {
-    async fn open(ca: &ClusterCa, root: &TempDir) -> Node {
+    async fn open(ca: &ClusterCa, root: &TempDir, name: &str) -> Node {
         let id = Uuid::now_v7();
         let (key_pem, csr) = node_key_and_csr().unwrap();
         let tls = NodeTls {
@@ -91,6 +100,7 @@ impl Node {
         );
         Node {
             id,
+            name: name.into(),
             addr,
             cluster,
             peers,
@@ -98,6 +108,9 @@ impl Node {
             storage: Arc::new(FakeStorage::default()),
             tls,
             listener: Some(listener),
+            audit_off: false,
+            peer_stop: None,
+            peer_server: None,
             base: String::new(),
             ha: None,
             _workers: None,
@@ -120,16 +133,33 @@ impl Node {
             },
         );
         let work = root.path().join(format!("{}-work", self.id));
+        // opld처럼 API와 노드 간 서버가 같은 감사 로그를 쓴다.
+        let audit = Arc::new(if self.audit_off {
+            AuditLog::disabled()
+        } else {
+            AuditLog::open(AuditConfig {
+                dir: work.join("audit"),
+                node: self.name.clone(),
+                max_file_size: 1 << 20,
+                max_files: 2,
+            })
+            .unwrap()
+        });
         let service = PeerService::new(self.cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(incoming))
-            .with_uefi_vars(work.join("state"));
+            .with_uefi_vars(work.join("state"))
+            .with_audit(audit.clone());
         let listener = self.listener.take().unwrap();
         let tls = self.tls.clone();
-        tokio::spawn(async move {
-            opl_peer::serve(listener, &tls, service, std::future::pending())
-                .await
-                .unwrap();
-        });
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        self.peer_stop = Some(stop);
+        self.peer_server = Some(tokio::spawn(async move {
+            opl_peer::serve(listener, &tls, service, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        }));
         // UEFI 변수 파일을 가진 노드에서 받아 온다(opld처럼 reconciler와 Task 실행기가 함께 쓴다).
         // 시험의 변수 파일은 모두 템플릿과 같은 6바이트다.
         std::fs::create_dir_all(&work).unwrap();
@@ -158,6 +188,7 @@ impl Node {
         .await;
         let mut state = AppState::new(self.cluster.clone(), self.id, hv, work.join("uploads"));
         state.peers = Some(self.peers.clone());
+        state.audit = audit;
         let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.base = format!("http://{}", api.local_addr().unwrap());
         let app = opl_api::router(Arc::new(state));
@@ -169,20 +200,22 @@ impl Node {
 /// 두 노드를 띄워 클러스터를 만들고 Node 리소스와 관리자를 채운다. 노드 간 서버가 먼저 떠야
 /// 선거가 끝나므로 서버부터 띄운다.
 async fn two_nodes() -> (TempDir, Node, Node) {
-    two_nodes_with(None).await
+    two_nodes_with(None, true).await
 }
 
 /// `ha`가 있으면 A의 reconciler에 넣고 두 노드를 HA 가능 노드(`process`)로 등록한다.
-async fn two_nodes_with(ha: Option<Arc<HaGuard>>) -> (TempDir, Node, Node) {
+/// `b_audit`가 거짓이면 B는 감사 로그를 끈 노드다.
+async fn two_nodes_with(ha: Option<Arc<HaGuard>>, b_audit: bool) -> (TempDir, Node, Node) {
     let ca = ClusterCa::generate("test").unwrap();
     let root = TempDir::new().unwrap();
-    let mut a = Node::open(&ca, &root).await;
-    let mut b = Node::open(&ca, &root).await;
+    let mut a = Node::open(&ca, &root, "node1").await;
+    let mut b = Node::open(&ca, &root, "node2").await;
     let node_ha = ha.as_ref().map(|_| NodeHa {
         fencing: Fencing::Process,
         recover_after_secs: 60,
     });
     a.ha = ha;
+    b.audit_off = !b_audit;
     a.serve(&root).await;
     b.serve(&root).await;
     let members = BTreeMap::from([
@@ -190,9 +223,9 @@ async fn two_nodes_with(ha: Option<Arc<HaGuard>>) -> (TempDir, Node, Node) {
         (NodeId(b.id), BasicNode::new(&b.addr)),
     ]);
     a.cluster.initialize(members).await.unwrap();
-    for (i, node) in [&a, &b].into_iter().enumerate() {
+    for node in [&a, &b] {
         let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
-            format!("node{}", i + 1),
+            node.name.clone(),
             NodeSpec {
                 address: node.base.clone(),
                 maintenance: false,
@@ -622,7 +655,7 @@ async fn ha_vm_on_a(
             watchdog: None,
         },
     );
-    let (root, a, b) = two_nodes_with(Some(guard)).await;
+    let (root, a, b) = two_nodes_with(Some(guard), true).await;
     let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
     let mut req = vm_request("web");
     req["spec"]["node"] = serde_json::json!(a.id);
@@ -919,4 +952,110 @@ async fn failed_migration_makes_shared_disks_exclusive_again() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(lock_calls(&a, volume), ["share", "exclusive"]);
     assert_eq!(lock_calls(&b, volume), ["share", "deactivate"]);
+}
+
+/// `found`가 참이 될 때까지 `GET /audit?{query}`를 다시 부른다(쓰기 스레드와 복제를 기다린다).
+async fn audit_until(
+    admin: &common::Client,
+    query: &str,
+    found: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let start = Instant::now();
+    loop {
+        let (status, body) = admin.get(&format!("/audit?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if found(&body) {
+            return body;
+        }
+        assert!(start.elapsed() < WAIT, "audit: {body:#}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 응답 항목의 노드 이름
+fn audit_nodes(body: &serde_json::Value) -> Vec<&str> {
+    body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["node"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn audit_entries_of_both_nodes_are_merged() {
+    let (_root, a, mut b) = two_nodes().await;
+    // 로그인(세션과 토큰 만들기)이 각 노드의 감사 로그에 적힌다.
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    login_at(&b.base, "admin", ADMIN_PASSWORD).await;
+    let both = |body: &serde_json::Value| {
+        let nodes = audit_nodes(body);
+        nodes.contains(&"node1") && nodes.contains(&"node2")
+    };
+    let body = audit_until(&admin, "action=/tokens", both).await;
+    assert_eq!(body["unreachable"], serde_json::json!([]));
+    assert_eq!(body["disabled"], serde_json::json!([]));
+    assert_eq!(body["truncated"], false);
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{body:#}");
+    // 두 노드의 항목을 합쳐 새 것부터
+    let times: Vec<u64> = entries
+        .iter()
+        .map(|e| e["time"].as_u64().unwrap())
+        .collect();
+    assert!(times[0] >= times[1], "{body:#}");
+    // 노드로 거르면 그 노드만 묻는다. 한 노드가 limit을 넘기면 잘렸다고 알린다.
+    let body = audit_until(&admin, "node=node2", |_| true).await;
+    assert!(
+        !audit_nodes(&body).is_empty() && audit_nodes(&body).iter().all(|n| *n == "node2"),
+        "{body:#}"
+    );
+    let body = audit_until(&admin, "node=node2&limit=1", |_| true).await;
+    assert_eq!(audit_nodes(&body), ["node2"]);
+    assert_eq!(body["truncated"], true);
+
+    // 위트니스는 API가 없어 묻지 않는다(닿지 않는 노드에도 넣지 않는다).
+    let node = a.cluster.get::<NodeSpec>(b.id).unwrap().unwrap();
+    let witness = NodeSpec {
+        witness: true,
+        ..node.spec.clone()
+    };
+    a.cluster
+        .update_spec(b.id, None, node.labels.clone(), &witness)
+        .await
+        .unwrap();
+    let body = audit_until(&admin, "", |body| !audit_nodes(body).contains(&"node2")).await;
+    assert_eq!(body["unreachable"], serde_json::json!([]));
+    a.cluster
+        .update_spec(b.id, None, node.labels.clone(), &node.spec)
+        .await
+        .unwrap();
+    audit_until(&admin, "", |body| audit_nodes(body).contains(&"node2")).await;
+
+    // B의 노드 간 서버를 멈추면 B는 닿지 않는 노드다. A의 항목은 그대로 온다.
+    let _ = b.peer_stop.take().unwrap().send(());
+    b.peer_server.take().unwrap().await.unwrap();
+    let body = audit_until(&admin, "", |body| {
+        body["unreachable"] != serde_json::json!([])
+    })
+    .await;
+    assert_eq!(body["unreachable"], serde_json::json!(["node2"]));
+    let nodes = audit_nodes(&body);
+    assert!(
+        !nodes.is_empty() && nodes.iter().all(|n| *n == "node1"),
+        "{body:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_node_with_the_audit_log_off_is_disabled_not_unreachable() {
+    let (_root, a, _b) = two_nodes_with(None, false).await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let body = audit_until(&admin, "", |body| {
+        audit_nodes(body).contains(&"node1") && body["disabled"] != serde_json::json!([])
+    })
+    .await;
+    assert_eq!(body["disabled"], serde_json::json!(["node2"]));
+    assert_eq!(body["unreachable"], serde_json::json!([]));
+    assert!(audit_nodes(&body).iter().all(|n| *n == "node1"), "{body:#}");
 }

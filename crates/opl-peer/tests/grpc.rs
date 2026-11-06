@@ -11,9 +11,10 @@ use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use opl_peer::{
-    GrpcNetwork, IncomingError, IncomingMigration, MigrateIncomingRequest, MigrationReceiver,
-    NodeMonitor, NodeMonitorConfig, PeerService, Peers, UefiVarsError,
+    AuditSource, GrpcNetwork, IncomingError, IncomingMigration, MigrateIncomingRequest,
+    MigrationReceiver, NodeMonitor, NodeMonitorConfig, PeerService, Peers, UefiVarsError,
 };
+use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
@@ -61,14 +62,15 @@ struct Node {
 
 impl Node {
     async fn start(ca: &ClusterCa, root: &TempDir) -> Node {
-        Self::start_with(ca, root, None).await
+        Self::start_with(ca, root, None, None).await
     }
 
-    /// `migrations`가 있으면 마이그레이션을 그것으로 받는다.
+    /// `migrations`가 있으면 마이그레이션을 그것으로 받고, `audit`이 있으면 감사 로그를 그것으로 읽는다.
     async fn start_with(
         ca: &ClusterCa,
         root: &TempDir,
         migrations: Option<Arc<dyn MigrationReceiver>>,
+        audit: Option<Arc<dyn AuditSource>>,
     ) -> Node {
         let id = NodeId(Uuid::now_v7());
         let tls = tls_for(ca, id);
@@ -96,6 +98,9 @@ impl Node {
                 .with_uefi_vars(&state_dir);
         if let Some(migrations) = migrations {
             service = service.with_migrations(migrations);
+        }
+        if let Some(audit) = audit {
+            service = service.with_audit(audit);
         }
         let (stop, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -165,6 +170,39 @@ impl MigrationReceiver for FakeReceiver {
             .unwrap()
             .push(format!("abort {} {}", req.vm, req.task));
         Ok(())
+    }
+}
+
+/// 받은 조건을 적고 항목 하나를 돌려주는 감사 로그
+#[derive(Default)]
+struct FakeAudit {
+    queries: std::sync::Mutex<Vec<AuditQuery>>,
+}
+
+#[async_trait::async_trait]
+impl AuditSource for FakeAudit {
+    async fn read(&self, query: AuditQuery) -> Result<Vec<AuditEntry>, String> {
+        if query.user.as_deref() == Some("broken") {
+            return Err("cannot read the audit log".into());
+        }
+        self.queries.lock().unwrap().push(query);
+        Ok(vec![AuditEntry {
+            id: Uuid::now_v7(),
+            time: 1_000,
+            node: "n2".into(),
+            user: Some("alice".into()),
+            user_id: None,
+            role: None,
+            auth: AuditAuth::Session,
+            ip: "127.0.0.1".into(),
+            method: "POST".into(),
+            path: "/vms".into(),
+            action: "POST /vms".into(),
+            target: None,
+            status: 201,
+            duration_ms: 2,
+            detail: None,
+        }])
     }
 }
 
@@ -485,7 +523,7 @@ async fn new_leader_does_not_revive_nodes_recorded_offline() {
 async fn migration_requests_reach_the_receiver_of_a_member() {
     let (ca, root, nodes) = start(1).await;
     let receiver = Arc::new(FakeReceiver::default());
-    let target = Node::start_with(&ca, &root, Some(receiver.clone())).await;
+    let target = Node::start_with(&ca, &root, Some(receiver.clone()), None).await;
     nodes[0]
         .cluster
         .request(LeaderRequest::AddLearner {
@@ -637,4 +675,76 @@ async fn uefi_vars_are_fetched_from_a_member() {
         "{err:?}"
     );
     assert!(!root.path().join("outsider.fd").exists());
+}
+
+#[tokio::test]
+async fn audit_logs_are_read_from_a_member() {
+    let (ca, root, nodes) = start(1).await;
+    let audit = Arc::new(FakeAudit::default());
+    let target = Node::start_with(&ca, &root, None, Some(audit.clone())).await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+        })
+        .await
+        .unwrap();
+    let source = nodes[0].id();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(source) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let query = |limit, user: Option<&str>| AuditQuery {
+        since: 10,
+        until: 20_000,
+        user: user.map(Into::into),
+        action: Some("/vms".into()),
+        limit,
+    };
+    let peers = &nodes[0].peers;
+    let entries = peers
+        .read_audit(&target.addr, query(7, None), WAIT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].action, "POST /vms");
+    // 너무 큰 limit은 받는 쪽이 줄인다.
+    peers
+        .read_audit(&target.addr, query(1_000_000, None), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        *audit.queries.lock().unwrap(),
+        [query(7, None), query(AuditQuery::MAX_LIMIT, None)]
+    );
+    // 읽기 실패는 오류로 온다.
+    let err = peers
+        .read_audit(&target.addr, query(7, Some("broken")), WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Internal, "{err:?}");
+
+    // 감사 로그가 없는 노드는 거부한다.
+    let err = target
+        .peers
+        .read_audit(&nodes[0].addr, query(7, None), WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
+    // 멤버가 아닌 노드의 요청은 읽는 쪽에 닿지 않는다.
+    let outsider = Node::start(&ca, &root).await;
+    let err = outsider
+        .peers
+        .read_audit(&target.addr, query(7, None), WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+    assert_eq!(audit.queries.lock().unwrap().len(), 2);
 }

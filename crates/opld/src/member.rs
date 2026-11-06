@@ -303,10 +303,26 @@ impl Member {
                 ports: config.migration.ports.clone(),
             },
         );
+        // API가 적고, 다른 노드가 노드 간 서버로 읽는다.
+        let audit = match config.audit.audit_config(&config.data_dir, &config.name) {
+            Some(audit) => {
+                let dir = audit.dir.clone();
+                match AuditLog::open(audit) {
+                    Ok(audit) => Arc::new(audit),
+                    Err(e) => {
+                        let _ = cluster.shutdown().await;
+                        return Err(anyhow::Error::new(e)
+                            .context(format!("cannot open the audit log in {}", dir.display())));
+                    }
+                }
+            }
+            None => Arc::new(AuditLog::disabled()),
+        };
         // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(incoming.with_firewall(gate.clone())))
-            .with_uefi_vars(config.data_dir.clone());
+            .with_uefi_vars(config.data_dir.clone())
+            .with_audit(audit.clone());
         let peer = serve_peer(peer_listener, &tls, service, exited_tx.clone());
 
         // 여기서 실패하면 노드 간 서버와 저장소를 닫는다.
@@ -336,13 +352,7 @@ impl Member {
             );
             state.peers = Some(peers.clone());
             state.secure_cookies = true;
-            if let Some(audit) = config.audit.audit_config(&config.data_dir, &config.name) {
-                let dir = audit.dir.clone();
-                state.audit =
-                    Arc::new(AuditLog::open(audit).with_context(|| {
-                        format!("cannot open the audit log in {}", dir.display())
-                    })?);
-            }
+            state.audit = audit;
             let created = match password {
                 Some(admin_password) => {
                     let token = issue_join_token(&state, DEFAULT_JOIN_TTL)

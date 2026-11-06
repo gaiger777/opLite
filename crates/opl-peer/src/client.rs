@@ -1,5 +1,5 @@
 //! 다른 노드로 가는 gRPC 클라이언트: Raft 네트워크, 리더 전달, 생존 확인, 콘솔, 마이그레이션 받기,
-//! UEFI 변수 받기.
+//! UEFI 변수 받기, 감사 로그 읽기.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,6 +19,7 @@ use openraft::raft::{
 };
 use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
 use opl_cluster::{ClusterError, Forwarder};
+use opl_types::audit::{AuditEntry, AuditQuery};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -216,6 +217,25 @@ impl Peers {
         req.set_timeout(UEFI_VARS_TIMEOUT);
         let chunks = self.client(addr)?.uefi_vars(req).await?.into_inner();
         crate::firmware::write_file(chunks, dest, expect_len).await
+    }
+}
+
+impl Peers {
+    /// `addr`의 노드의 감사 로그에서 `query`에 맞는 항목을 읽는다(새 것부터, 최대 `limit + 1`개).
+    /// 그 노드가 감사 로그를 껐으면 None이다.
+    pub async fn read_audit(
+        &self,
+        addr: &str,
+        query: AuditQuery,
+        timeout: Duration,
+    ) -> Result<Option<Vec<AuditEntry>>, Status> {
+        let mut req = Request::new(query);
+        req.set_timeout(timeout);
+        match self.client(addr)?.read_audit(req).await {
+            Ok(reply) => Ok(Some(reply.into_inner().entries)),
+            Err(s) if s.code() == Code::FailedPrecondition => Ok(None),
+            Err(s) => Err(s),
+        }
     }
 }
 

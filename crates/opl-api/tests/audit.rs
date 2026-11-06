@@ -1,5 +1,6 @@
 //! 감사 로그 기록: 바꾸는 요청·로그인·로그아웃·콘솔 열기가 누가·어떻게·무엇을과 함께 적히고,
-//! 읽는 요청과 비밀번호는 적히지 않는다.
+//! 읽는 요청과 비밀번호는 적히지 않는다. 읽기 API `GET /audit`: admin만, 시각·사용자·동작·노드
+//! 거르기, limit과 truncated.
 
 mod common;
 
@@ -282,4 +283,165 @@ async fn a_subscription_key_is_recorded_by_its_id() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(entry(&env, "PUT /subscription", 400).await.detail, None);
+}
+
+/// 시각 `time`에 `user`가 `path`로 한 바꾸는 요청
+fn seeded(time: u64, user: &str, path: &str) -> AuditEntry {
+    AuditEntry {
+        id: uuid::Uuid::now_v7(),
+        time,
+        node: String::new(),
+        user: Some(user.into()),
+        user_id: None,
+        role: Some(Role::Operator),
+        auth: AuditAuth::Token,
+        ip: "10.0.0.9".into(),
+        method: "POST".into(),
+        path: path.into(),
+        action: "POST /vms/{key}/actions/{action}".into(),
+        target: target("vms", "web-1"),
+        status: 202,
+        duration_ms: 4,
+        detail: None,
+    }
+}
+
+/// 옛 시각(1~4초)의 항목 넷을 적고 읽힐 때까지 기다린다. 로그인 같은 지금 항목과 섞이지 않는다.
+async fn seed(env: &Env) {
+    for (time, user, path) in [
+        (1_000, "alice", "/vms/web-1/actions/start"),
+        (2_000, "bob", "/vms/web-1/actions/stop"),
+        (3_000, "alice", "/vms/web-1/actions/stop"),
+        (4_000, "alice", "/vms/web-1/actions/reboot"),
+    ] {
+        env.state.audit.record(seeded(time, user, path));
+    }
+    entries_until(env, |es| es.iter().filter(|e| e.time <= 4_000).count() == 4).await;
+}
+
+/// 응답 항목의 시각
+fn times(body: &serde_json::Value) -> Vec<u64> {
+    body["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{body}"))
+        .iter()
+        .map(|e| e["time"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn only_admins_read_the_audit_log() {
+    let env = Env::start().await;
+    seed(&env).await;
+    let admin = env.admin().await;
+    let (status, body) = admin.get("/audit?since=0&until=5000").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(times(&body), [4_000, 3_000, 2_000, 1_000]);
+    assert_eq!(body["entries"][0]["node"], "node1");
+    assert_eq!(body["unreachable"], json!([]));
+    assert_eq!(body["disabled"], json!([]));
+    assert_eq!(body["truncated"], false);
+    for role in ["operator", "viewer"] {
+        let user = env.user(&format!("{role}1"), role).await;
+        let (status, body) = user.get("/audit?since=0&until=5000").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role}: {body}");
+        assert_eq!(body["code"], "forbidden");
+    }
+    let (status, _) = env.anonymous().get("/audit").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_range_takes_milliseconds_or_rfc3339() {
+    let env = Env::start().await;
+    seed(&env).await;
+    let admin = env.admin().await;
+    let (status, body) = admin.get("/audit?since=2000&until=3000").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(times(&body), [3_000, 2_000]);
+    let (status, body) = admin
+        .get("/audit?since=1970-01-01T00:00:01.500Z&until=1970-01-01T01:00:03%2B01:00")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(times(&body), [3_000, 2_000]);
+    // 기본은 지난 24시간이라 옛 항목은 없고 방금 로그인한 것은 있다.
+    let (status, body) = admin.get("/audit").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let recent = times(&body);
+    assert!(
+        !recent.is_empty() && recent.iter().all(|t| *t > 4_000),
+        "{body}"
+    );
+
+    for bad in [
+        "since=yesterday",
+        "until=-5",
+        "since=2026-13-01T00:00:00Z",
+        "limit=0",
+        "limit=5001",
+        "limit=many",
+        "verbose=true",
+    ] {
+        let (status, body) = admin.get(&format!("/audit?{bad}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        assert_eq!(body["code"], "invalid_request", "{bad}");
+    }
+    let (status, _) = admin.get("/audit?limit=5000").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn filters_and_limit_narrow_the_entries() {
+    let env = Env::start().await;
+    seed(&env).await;
+    let admin = env.admin().await;
+    let get = |q: &'static str| {
+        let admin = &admin;
+        async move {
+            let (status, body) = admin.get(&format!("/audit?since=0&until=5000&{q}")).await;
+            assert_eq!(status, StatusCode::OK, "{q}: {body}");
+            body
+        }
+    };
+    assert_eq!(times(&get("user=alice").await), [4_000, 3_000, 1_000]);
+    // 동작은 action이나 경로의 부분 문자열이다(VM 동작은 경로로 가른다).
+    assert_eq!(times(&get("action=actions/stop").await), [3_000, 2_000]);
+    assert_eq!(times(&get("action=%7Baction%7D&user=bob").await), [2_000]);
+    assert_eq!(times(&get("node=node1&user=bob").await), [2_000]);
+    let body = get("node=elsewhere").await;
+    assert_eq!(times(&body), Vec::<u64>::new());
+    assert_eq!(body["unreachable"], json!([]));
+
+    let body = get("limit=2").await;
+    assert_eq!(times(&body), [4_000, 3_000]);
+    assert_eq!(body["truncated"], true);
+    let body = get("limit=4").await;
+    assert_eq!(times(&body).len(), 4);
+    assert_eq!(body["truncated"], false);
+}
+
+#[tokio::test]
+async fn this_node_with_the_audit_log_off_is_listed_as_disabled() {
+    let env = Env::start().await;
+    // 같은 노드의 API를 감사 로그 없이(opld의 `[audit] enabled = false`처럼) 하나 더 띄운다.
+    let hv: std::sync::Arc<dyn opl_driver::Hypervisor> = env.hv.clone();
+    let state = opl_api::AppState::new(
+        env.cluster.clone(),
+        env.node,
+        hv,
+        env.dir.path().join("off"),
+    );
+    assert!(!state.audit.is_enabled());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = opl_api::router(std::sync::Arc::new(state));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    assert!(env.state.audit.is_enabled());
+
+    let admin = common::login_at(&base, "admin", ADMIN_PASSWORD).await;
+    let (status, body) = admin.get("/audit").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["disabled"], json!(["node1"]));
+    assert_eq!(body["unreachable"], json!([]));
+    assert_eq!(body["entries"], json!([]));
 }
