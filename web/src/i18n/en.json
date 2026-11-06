@@ -62,7 +62,10 @@
     "cluster_upgrading": "The cluster is being upgraded: {{message}}",
     "subscription_required": "An active subscription is required for the enterprise channel.",
     "invalid_subscription_key": "The subscription key is not valid: {{message}}",
-    "telemetry_endpoint_required": "Set a telemetry endpoint first. This build has no default endpoint."
+    "telemetry_endpoint_required": "Set a telemetry endpoint first. This build has no default endpoint.",
+    "no_role": "Your directory account has no role in opLite. Ask an administrator to map one of your groups.",
+    "realm_unavailable": "Cannot reach the directory of this realm. Try again later or ask an administrator.",
+    "external_user": "This user signs in through a realm. Change the password in the directory."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -78,6 +81,7 @@
     "tasks": "Tasks",
     "audit": "Audit log",
     "users": "Users",
+    "realms": "Realms",
     "tokens": "API tokens",
     "cluster": "Cluster",
     "settings": "Settings"
@@ -100,7 +104,9 @@
     "username": "Username",
     "password": "Password",
     "submit": "Sign in",
-    "version": "opLite {{version}}"
+    "version": "opLite {{version}}",
+    "realm": "Realm",
+    "localRealm": "Local users"
   },
   "notFound": {
     "title": "Page not found",
@@ -896,6 +902,7 @@
   },
   "users": {
     "role": "Role",
+    "realm": "Realm",
     "you": "(you)",
     "empty": "No users.",
     "roleHint": "Operators change VMs and volumes. Viewers only read. Neither can see accounts.",
@@ -917,6 +924,82 @@
       "selfRole": "Only another administrator can change your role.",
       "selfPassword": "Change your own password from the account menu.",
       "selfDelete": "Only another administrator can delete your account."
+    }
+  },
+  "realms": {
+    "pageHint": "Users of a realm sign in with their directory account as <name>@<realm>. Their role comes from their groups at each sign-in.",
+    "adminOnly": "Only administrators can manage realms.",
+    "empty": "No realms. Only local users can sign in.",
+    "display": "Display name",
+    "displayHint": "Shown on the sign-in page. Leave empty to show the name.",
+    "kind": "Kind",
+    "kinds": {
+      "ldap": "LDAP"
+    },
+    "url": "URL",
+    "urlHint": "ldap:// always uses StartTLS. ldaps:// uses TLS from the start.",
+    "baseDn": "Base DN",
+    "bindDn": "Bind DN",
+    "bindDnHint": "Service account used to find users. Leave empty to search anonymously.",
+    "bindPassword": "Bind password",
+    "bindPasswordSaved": "A password is saved. Leave this empty to keep it.",
+    "clearBindPassword": "Clear the saved password",
+    "userFilter": "User filter",
+    "userFilterHint": "{username} is replaced with the escaped sign-in name.",
+    "groupAttr": "Group attribute",
+    "caPem": "CA certificate (PEM)",
+    "caPemHint": "Trust only this CA for the directory's certificate. Leave empty to use the system roots.",
+    "timeout": "Timeout (seconds)",
+    "groups": "Group to role mapping",
+    "groupsHint": "Group DNs match without regard to case. A user in several groups gets the highest role.",
+    "groupN": "Group {{n}}",
+    "groupRoleN": "Role of group {{n}}",
+    "removeGroupN": "Remove group {{n}}",
+    "addGroup": "Add group",
+    "defaultRole": "Default role",
+    "noDefaultRole": "None (refuse sign-in)",
+    "createTitle": "Create an LDAP realm",
+    "editTitle": "Edit realm {{name}}",
+    "formDescription": "The role is set again from the mapping each time a user signs in.",
+    "editNamed": "Edit {{name}}",
+    "created": "Created realm {{name}}.",
+    "saved": "Saved realm {{name}}.",
+    "deleted": "Deleted realm {{name}}.",
+    "deleteTitle": "Delete realm {{name}}?",
+    "deleteDescription": "Users of this realm can no longer sign in, and their sessions and API tokens stop working. The users stay; creating a realm with the same name lets them in again.",
+    "test": "Test",
+    "testNamed": "Test {{name}}",
+    "testTitle": "Test realm {{name}}",
+    "testDescription": "Checks each step of signing in as a directory user. No user or session is created.",
+    "steps": "Steps",
+    "step": "Step",
+    "result": "Result",
+    "message": "Message",
+    "ok": "OK",
+    "failed": "Failed",
+    "stepNames": {
+      "connect": "Connect",
+      "service_bind": "Service account bind",
+      "search": "Find the user",
+      "user_bind": "User bind",
+      "groups": "Groups"
+    },
+    "dn": "DN",
+    "groupsFound": "Groups",
+    "noRole": "No role: sign-in would be refused.",
+    "errors": {
+      "local": "local is reserved for local users.",
+      "taken": "A realm with this name already exists.",
+      "url": "Use ldap://host[:port] (with StartTLS) or ldaps://host[:port].",
+      "required": "Enter a value.",
+      "userFilter": "Include {username} exactly once.",
+      "bindDn": "Enter a bind DN to use a bind password.",
+      "bindPasswordNeeded": "Enter a bind password for the bind DN, or clear the bind DN to search anonymously.",
+      "bindPasswordAgain": "Enter the bind password again: the URL, bind DN or CA certificate changed.",
+      "clearNeedsNoBindDn": "To clear the saved password, also clear the bind DN.",
+      "clearSaved": "The bind DN is empty: choose \"Clear the saved password\" to search anonymously.",
+      "timeout": "Use a whole number of seconds from 1 to 30.",
+      "group": "Enter a group DN or remove the row."
     }
   },
   "tokens": {

@@ -214,3 +214,32 @@ it("deletes a user after confirming", async () => {
     expect(screen.queryByRole("cell", { name: "kim" })).not.toBeInTheDocument(),
   );
 });
+
+it("shows the realm of each user and no password reset for external users", async () => {
+  const ALICE = {
+    id: "00000000-0000-0000-0000-0000000000a1",
+    name: "alice@corp",
+    realm: "corp",
+    role: "operator",
+    revision: 3,
+  };
+  users([ME, KIM, ALICE]);
+  renderPage(<UsersPage />);
+  const table = await screen.findByRole("table", { name: "Users" });
+  expect(within(table).getByRole("columnheader", { name: "Realm" })).toBeInTheDocument();
+  // 로컬 사용자는 `local`이다.
+  const kim = (await within(table).findByText("kim")).closest("tr")!;
+  expect(within(kim).getByRole("cell", { name: "local" })).toBeInTheDocument();
+  const alice = within(table).getByText("alice@corp").closest("tr")!;
+  expect(within(alice).getByRole("cell", { name: "corp" })).toBeInTheDocument();
+
+  // 외부 사용자의 비밀번호는 디렉터리가 맡는다. 역할 바꾸기와 지우기는 그대로다.
+  await userEvent.click(within(alice).getByRole("button", { name: "Actions for alice@corp" }));
+  expect(await screen.findByRole("menuitem", { name: "Change role" })).toBeInTheDocument();
+  expect(screen.getByRole("menuitem", { name: "Delete" })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Reset password" })).not.toBeInTheDocument();
+  await userEvent.keyboard("{Escape}");
+
+  await userEvent.click(within(kim).getByRole("button", { name: "Actions for kim" }));
+  expect(await screen.findByRole("menuitem", { name: "Reset password" })).toBeInTheDocument();
+});

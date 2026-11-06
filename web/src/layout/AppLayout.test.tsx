@@ -18,6 +18,7 @@ it("shows account pages only to admins", async () => {
   expect(await screen.findByRole("link", { name: "Volumes" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Users" })).toHaveAttribute("href", "/users");
   expect(screen.getByRole("link", { name: "Audit log" })).toHaveAttribute("href", "/audit");
+  expect(screen.getByRole("link", { name: "Realms" })).toHaveAttribute("href", "/realms");
 });
 
 it("hides account pages from other roles", async () => {
@@ -26,6 +27,8 @@ it("hides account pages from other roles", async () => {
   expect(screen.queryByRole("link", { name: "Users" })).not.toBeInTheDocument();
   // 감사 로그도 admin만 읽는다.
   expect(screen.queryByRole("link", { name: "Audit log" })).not.toBeInTheDocument();
+  // 인증 영역도 계정 종류처럼 admin만 다룬다.
+  expect(screen.queryByRole("link", { name: "Realms" })).not.toBeInTheDocument();
   // 보안 그룹과 백업, 백업 작업, 가져오기는 누구나 읽는다.
   expect(screen.getByRole("link", { name: "Security groups" })).toHaveAttribute(
     "href",

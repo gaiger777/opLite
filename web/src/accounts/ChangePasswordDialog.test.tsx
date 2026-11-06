@@ -76,3 +76,11 @@ it("changes the password and signs out", async () => {
   // 스스로 로그아웃했으므로 돌아올 주소(`?next=`)를 붙이지 않는다.
   expect(router.state.location.search).toBe("");
 });
+
+it("does not offer a password change to external users", async () => {
+  // 외부 사용자(`<이름>@<영역>`)의 비밀번호는 디렉터리가 맡는다.
+  renderPage(<AppLayout />, { as: { ...ADMIN, name: "alice@corp", role: "operator" } });
+  await userEvent.click(await screen.findByRole("button", { name: "Account (alice@corp)" }));
+  expect(await screen.findByRole("menuitem", { name: "Sign out" })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Change my password" })).not.toBeInTheDocument();
+});

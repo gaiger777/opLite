@@ -62,7 +62,10 @@
     "cluster_upgrading": "클러스터를 업그레이드하는 중입니다: {{message}}",
     "subscription_required": "enterprise 채널에는 유효한(active) 구독이 필요합니다.",
     "invalid_subscription_key": "구독 키가 올바르지 않습니다: {{message}}",
-    "telemetry_endpoint_required": "먼저 텔레메트리 끝점을 정하세요. 이 빌드에는 기본 끝점이 없습니다."
+    "telemetry_endpoint_required": "먼저 텔레메트리 끝점을 정하세요. 이 빌드에는 기본 끝점이 없습니다.",
+    "no_role": "디렉터리 계정에 opLite 역할이 없습니다. 관리자에게 그룹의 역할 매핑을 요청하세요.",
+    "realm_unavailable": "이 영역의 디렉터리에 연결할 수 없습니다. 잠시 뒤 다시 시도하거나 관리자에게 문의하세요.",
+    "external_user": "영역으로 로그인하는 사용자입니다. 비밀번호는 디렉터리에서 바꾸세요."
   },
   "nav": {
     "dashboard": "대시보드",
@@ -78,6 +81,7 @@
     "tasks": "작업",
     "audit": "감사 로그",
     "users": "사용자",
+    "realms": "인증 영역",
     "tokens": "API 토큰",
     "cluster": "클러스터",
     "settings": "설정"
@@ -100,7 +104,9 @@
     "username": "사용자 이름",
     "password": "비밀번호",
     "submit": "로그인",
-    "version": "opLite {{version}}"
+    "version": "opLite {{version}}",
+    "realm": "인증 영역",
+    "localRealm": "로컬 사용자"
   },
   "notFound": {
     "title": "페이지를 찾을 수 없습니다",
@@ -896,6 +902,7 @@
   },
   "users": {
     "role": "역할",
+    "realm": "영역",
     "you": "(나)",
     "empty": "사용자가 없습니다.",
     "roleHint": "운영자는 VM과 볼륨을 바꾸고, 조회자는 읽기만 합니다. 둘 다 계정은 볼 수 없습니다.",
@@ -917,6 +924,82 @@
       "selfRole": "내 역할은 다른 관리자가 바꿉니다.",
       "selfPassword": "내 비밀번호는 계정 메뉴에서 바꿉니다.",
       "selfDelete": "내 계정은 다른 관리자가 삭제합니다."
+    }
+  },
+  "realms": {
+    "pageHint": "영역의 사용자는 디렉터리 계정으로 로그인하고 <이름>@<영역>이 됩니다. 역할은 로그인할 때마다 그룹으로 정해집니다.",
+    "adminOnly": "인증 영역은 관리자만 관리할 수 있습니다.",
+    "empty": "영역이 없습니다. 로컬 사용자만 로그인합니다.",
+    "display": "표시 이름",
+    "displayHint": "로그인 화면에 보입니다. 비우면 이름이 보입니다.",
+    "kind": "종류",
+    "kinds": {
+      "ldap": "LDAP"
+    },
+    "url": "URL",
+    "urlHint": "ldap://는 늘 StartTLS를 쓰고, ldaps://는 처음부터 TLS를 씁니다.",
+    "baseDn": "기준 DN",
+    "bindDn": "바인드 DN",
+    "bindDnHint": "사용자를 찾을 서비스 계정입니다. 비우면 익명으로 찾습니다.",
+    "bindPassword": "바인드 비밀번호",
+    "bindPasswordSaved": "저장된 비밀번호가 있습니다. 비워 두면 그대로 둡니다.",
+    "clearBindPassword": "저장된 비밀번호 지우기",
+    "userFilter": "사용자 필터",
+    "userFilterHint": "{username}은 이스케이프한 로그인 이름으로 바뀝니다.",
+    "groupAttr": "그룹 속성",
+    "caPem": "CA 인증서(PEM)",
+    "caPemHint": "디렉터리 인증서를 이 CA로만 확인합니다. 비우면 시스템 루트를 씁니다.",
+    "timeout": "시간 제한(초)",
+    "groups": "그룹별 역할",
+    "groupsHint": "그룹 DN은 대소문자를 가리지 않고 비교합니다. 여러 그룹에 속하면 가장 높은 역할을 받습니다.",
+    "groupN": "그룹 {{n}}",
+    "groupRoleN": "그룹 {{n}}의 역할",
+    "removeGroupN": "그룹 {{n}} 빼기",
+    "addGroup": "그룹 더하기",
+    "defaultRole": "기본 역할",
+    "noDefaultRole": "없음(로그인 거절)",
+    "createTitle": "LDAP 영역 만들기",
+    "editTitle": "영역 {{name}} 고치기",
+    "formDescription": "역할은 사용자가 로그인할 때마다 매핑으로 다시 정해집니다.",
+    "editNamed": "{{name}} 고치기",
+    "created": "영역 {{name}}을(를) 만들었습니다.",
+    "saved": "영역 {{name}}을(를) 저장했습니다.",
+    "deleted": "영역 {{name}}을(를) 삭제했습니다.",
+    "deleteTitle": "영역 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "이 영역의 사용자는 더 로그인할 수 없고, 세션과 API 토큰도 멈춥니다. 사용자는 남으며 같은 이름의 영역을 다시 만들면 다시 로그인할 수 있습니다.",
+    "test": "시험",
+    "testNamed": "{{name}} 시험",
+    "testTitle": "영역 {{name}} 시험",
+    "testDescription": "디렉터리 사용자로 로그인하는 단계를 하나씩 확인합니다. 사용자나 세션은 만들지 않습니다.",
+    "steps": "단계",
+    "step": "단계",
+    "result": "결과",
+    "message": "내용",
+    "ok": "성공",
+    "failed": "실패",
+    "stepNames": {
+      "connect": "연결",
+      "service_bind": "서비스 계정 바인드",
+      "search": "사용자 찾기",
+      "user_bind": "사용자 바인드",
+      "groups": "그룹"
+    },
+    "dn": "DN",
+    "groupsFound": "그룹",
+    "noRole": "역할 없음: 로그인이 거절됩니다.",
+    "errors": {
+      "local": "local은 로컬 사용자용으로 예약된 이름입니다.",
+      "taken": "같은 이름의 영역이 이미 있습니다.",
+      "url": "ldap://호스트[:포트](StartTLS) 또는 ldaps://호스트[:포트] 형식으로 쓰세요.",
+      "required": "값을 입력하세요.",
+      "userFilter": "{username}을 정확히 한 번 넣으세요.",
+      "bindDn": "바인드 비밀번호를 쓰려면 바인드 DN을 입력하세요.",
+      "bindPasswordNeeded": "바인드 DN에는 바인드 비밀번호가 필요합니다. 익명으로 찾으려면 바인드 DN을 비우세요.",
+      "bindPasswordAgain": "URL·바인드 DN·CA 인증서를 바꿨으니 바인드 비밀번호를 다시 넣으세요.",
+      "clearNeedsNoBindDn": "저장된 비밀번호를 지우려면 바인드 DN도 비우세요.",
+      "clearSaved": "바인드 DN을 비웠으니 익명으로 찾으려면 \"저장된 비밀번호 지우기\"를 고르세요.",
+      "timeout": "1~30 사이의 정수(초)로 쓰세요.",
+      "group": "그룹 DN을 입력하거나 행을 빼세요."
     }
   },
   "tokens": {

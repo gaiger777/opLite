@@ -6,6 +6,7 @@ import {
   Cpu,
   Database,
   HardDrive,
+  IdCard,
   Import,
   KeyRound,
   Languages,
@@ -70,6 +71,7 @@ const NAV: {
   { to: "/tasks", key: "nav.tasks", icon: ListChecks, end: false },
   { to: "/audit", key: "nav.audit", icon: ScrollText, end: false, admin: true },
   { to: "/users", key: "nav.users", icon: Users, end: false, kind: "user" },
+  { to: "/realms", key: "nav.realms", icon: IdCard, end: false, kind: "realm" },
   { to: "/tokens", key: "nav.tokens", icon: KeyRound, end: false },
   { to: "/cluster", key: "nav.cluster", icon: Boxes, end: false },
   { to: "/settings", key: "nav.settings", icon: Settings, end: false },
@@ -211,10 +213,13 @@ function UserMenu() {
             {me.name} · {t(`roles.${me.role}`)}
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => setChanging(true)}>
-            <Lock />
-            {t("accounts.changePassword")}
-          </DropdownMenuItem>
+          {/* 외부 사용자(이름에 `@<영역>`)의 비밀번호는 영역의 디렉터리가 맡는다. */}
+          {!me.name.includes("@") && (
+            <DropdownMenuItem onSelect={() => setChanging(true)}>
+              <Lock />
+              {t("accounts.changePassword")}
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem onSelect={() => void logout()}>
             <LogOut />
             {t("header.logout")}

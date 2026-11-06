@@ -20,7 +20,8 @@ interface Auth {
   principal: Principal | null | undefined;
   /** 직접 로그아웃했다. 다음 사용자를 앞 사용자의 화면으로 보내지 않도록 돌아올 주소를 남기지 않는다. */
   signedOut: boolean;
-  login(username: string, password: string): Promise<void>;
+  /** `realm`이 없으면 로컬 사용자로 로그인한다. */
+  login(username: string, password: string, realm?: string): Promise<void>;
   logout(): Promise<void>;
 }
 
@@ -70,9 +71,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [clear]);
 
-  const login = useCallback(async (username: string, password: string) => {
+  const login = useCallback(async (username: string, password: string, realm?: string) => {
     const mine = ++epoch.current;
-    await call(api.POST("/auth/login", { body: { username, password } }));
+    await call(api.POST("/auth/login", { body: { username, password, ...(realm && { realm }) } }));
     const p = await call(api.GET("/auth/whoami"));
     if (epoch.current === mine) {
       setSignedOut(false);

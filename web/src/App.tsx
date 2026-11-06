@@ -23,6 +23,7 @@ import { LoginPage } from "@/pages/LoginPage";
 import { NetworksPage } from "@/networks/NetworksPage";
 import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
+import { RealmsPage } from "@/realms/RealmsPage";
 import { SecurityGroupPage } from "@/security-groups/SecurityGroupPage";
 import { SecurityGroupsPage } from "@/security-groups/SecurityGroupsPage";
 import { SettingsPage } from "@/settings/SettingsPage";
@@ -71,6 +72,7 @@ function routes() {
             { path: "tasks", element: <TasksPage /> },
             { path: "audit", element: <AuditPage /> },
             { path: "users", element: <UsersPage /> },
+            { path: "realms", element: <RealmsPage /> },
             { path: "tokens", element: <TokensPage /> },
             { path: "cluster", element: <ClusterPage /> },
             { path: "settings", element: <SettingsPage /> },

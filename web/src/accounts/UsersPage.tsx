@@ -95,6 +95,7 @@ export function UsersPage() {
           <TableRow>
             <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("users.role")}</TableHead>
+            <TableHead>{t("users.realm")}</TableHead>
             <TableHead>
               <span className="sr-only">{t("vms.actions")}</span>
             </TableHead>
@@ -102,7 +103,7 @@ export function UsersPage() {
         </TableHeader>
         <TableBody>
           {(users.data ?? []).length === 0 && (
-            <TableMessage colSpan={3} query={users} empty={t("users.empty")} />
+            <TableMessage colSpan={4} query={users} empty={t("users.empty")} />
           )}
           {(users.data ?? []).map((user) => {
             // 자기 비밀번호는 현재 비밀번호가 필요하므로 계정 메뉴에서 바꾼다. 자기 자신은 지울 수 없다.
@@ -117,6 +118,7 @@ export function UsersPage() {
                   )}
                 </TableCell>
                 <TableCell>{t(`roles.${user.role}`)}</TableCell>
+                <TableCell>{user.realm ?? "local"}</TableCell>
                 <TableCell className="text-right">
                   <DropdownMenu modal={false}>
                     <DropdownMenuTrigger asChild>
@@ -137,12 +139,15 @@ export function UsersPage() {
                       >
                         {t("users.changeRole")}
                       </ReasonMenuItem>
-                      <ReasonMenuItem
-                        reason={self ? "users.reason.selfPassword" : null}
-                        onSelect={() => setDialog({ kind: "password", user })}
-                      >
-                        {t("users.resetPassword")}
-                      </ReasonMenuItem>
+                      {/* 외부 사용자의 비밀번호는 영역의 디렉터리가 맡는다. */}
+                      {!user.realm && (
+                        <ReasonMenuItem
+                          reason={self ? "users.reason.selfPassword" : null}
+                          onSelect={() => setDialog({ kind: "password", user })}
+                        >
+                          {t("users.resetPassword")}
+                        </ReasonMenuItem>
+                      )}
                       <DropdownMenuSeparator />
                       <ReasonMenuItem
                         variant="destructive"
