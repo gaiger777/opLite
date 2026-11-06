@@ -299,7 +299,7 @@ oplctl settings set updates.channel=enterprise   # admin. 구독이 active일 �
   `invalid_subscription_key`이고 이유가 붙는다(`malformed subscription key: …`, `the subscription key signature does
   not match this build`, `the subscription key expired on 2026-01-01`). 키 문자열은 클러스터 설정
   (`Settings.spec.subscription`)에 저장하지만 API(`GET`·`PATCH /api/v1/settings`, watch)로는 내보내지 않는다. 감사
-  로그는 없고 opld 로그에 키 id만 남는다.
+  로그(`detail` `id=<키 id>`, "감사 로그")와 opld 로그에는 키 id만 남는다.
 - **웹.** "설정" 화면의 구독 카드가 상태·고객·수준·노드(사용/한도)·만료일을 보이고, admin은 키를 붙여 넣거나 지운다.
   상태가 `active`가 아니거나 만료 30일 전부터 대시보드 제목 아래에 안내가 보인다(`expired`·`over_limit`는 경고 색,
   그 밖은 정보 색). "7일 동안 숨기기"를 누르면 그 브라우저에서 그 안내만 7일 동안 숨긴다(예: "구독 없음"을 닫은 뒤
@@ -1510,7 +1510,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
-볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기)과 백업 작업, VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업,
+볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기)과 백업 작업, VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업, 감사 로그(admin),
 사용자(admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
@@ -1540,6 +1540,100 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
   로그인해야 한다. 역할만 바꾸면 세션은 그대로다. **API 토큰은 끊기지 않는다.** 토큰이 새었을 수 있으면
   `oplctl token list`·`oplctl token delete`(웹: API 토큰 화면)로 따로 지운다. 열려 있는 콘솔(WebSocket)은 연결할
   때 한 번 인증하므로 비밀번호를 바꿔도 끊기지 않는다.
+
+## 감사 로그
+
+노드마다 그 노드가 받은 바꾸는 API 요청(`POST`·`PUT`·`PATCH`·`DELETE`, 성공·실패와 401·403 포함), 로그인 성공·실패,
+로그아웃, VM 콘솔 열기(`GET /api/v1/vms/{key}/console`)를 한 줄 JSON으로 적는다. 다른 `GET`(감사 로그 읽기도),
+웹 정적 파일, 노드 사이 RPC, 제어 소켓(`cluster init`·`join`·`leave`), 맞는 라우트가 없는 요청은 적지 않는다.
+요청 본문은 적지 않는다.
+
+```bash
+oplctl audit                                     # admin. 모든 노드의 지난 24시간, 새 것부터 200개
+oplctl audit --since 1h --user alice             # --since: 90s·30m·1h·7d(지금부터 거슬러) 또는 RFC 3339
+oplctl audit --since 2026-11-06T00:00:00Z --until 2026-11-07T00:00:00Z --node node1 --limit 1000
+oplctl audit --action web-1                      # 동작이나 경로에 든 문자열(VM 동작은 경로로 가른다)
+# TIME                  NODE   USER   IP        ACTION                            TARGET     STATUS
+# 2026-11-06T09:30:05Z  node1  alice  10.0.0.5  POST /vms/{key}/actions/{action}  vms/web-1     202
+# 2026-11-06T09:29:58Z  node2  -      10.0.0.9  POST /auth/login                  username=bob  401
+oplctl -o json audit --since 7d                  # 응답 그대로(항목의 모든 필드)
+```
+
+- **항목.** `{"id","time","node","user","user_id","role","auth","ip","method","path","action","target","status",
+  "duration_ms","detail"}`. `id`는 UUID v7, `time`은 유닉스 밀리초, `node`는 적은 노드의 이름이다. `user`·`user_id`·
+  `role`은 인증 전이거나 실패하면 `null`, `auth`는 `session`·`token`·`none`(`Authorization: Bearer`가 있으면 인증에
+  실패해도 `token`)이다. `ip`는 시도 제한과 같은 클라이언트 IP(TLS 연결의 주소, "로그인과 세션"), `path`는
+  `/api/v1` 아래의 실제 경로이고 쿼리는 넣지 않는다(쿼리에 비밀이 올 수 있다). `action`은 `"<메서드> <라우트
+  템플릿>"`(예: `POST /vms/{key}/actions/{action}`, `DELETE /users/{key}`, `POST /auth/login`)이라 새 API도 저절로
+  이름을 가진다. `target`은 템플릿의 첫 조각과 첫 매개변수 값(`{"kind":"vms","key":"web-1"}`)이고, 매개변수가 없는
+  경로는 `null`이다. `detail`은 핸들러가 남긴 짧은 문자열이다: 로그인은 `username=<이름>`(이름 형식이 아니면
+  `username=<invalid>` — 비밀번호를 이름 칸에 넣었을 수 있다), 구독 키 넣기는 `id=<키 id>`. 비밀번호·키·토큰은
+  어디에도 넣지 않는다. 로그인에 성공하면 그 사용자, 로그아웃은 세션의 사용자가 `user`다. `path`·`target.key`·
+  `detail`·`user`는 512바이트까지만 적는다(넘으면 글자 경계에서 잘라 끝에 `…`).
+- **파일.** `{data_dir}/audit/audit.log`(패키지는 `/var/lib/opl/audit/audit.log`). 디렉터리는 0700, 파일은 0600이다.
+  요청은 디스크를 기다리지 않는다: 쓰기 스레드가 덧붙이고 1초마다 묶어 `fsync`한다. 줄을 더하면 `max_file_mib`를
+  넘을 때 `audit.log` → `audit.log.1` → `.2` …로 밀고, 지금 파일을 포함해 `max_files`개를 넘는 가장 오래된 것을 지운다.
+  쓰기가 밀려 대기열(1만 개)이 차면 항목을 버리고, 다음 항목 앞에 `"action":"audit.dropped"`, `"detail":"<N> entries
+  dropped"` 항목을 적는다. 인증 없는 항목(인증 실패·로그인 실패·익명, `user`가 `null`)은 IP마다 1분에 60개까지만
+  적고(IPv6는 /64 네트워크 하나로 센다), 넘친 것은 그 1분 창이 끝나고 1초 안에(또는 opld를 멈출 때)
+  `"action":"audit.suppressed"`, `"ip"`(IPv6면 `<네트워크>/64`), `"detail":"<N> unauthenticated requests
+  not recorded since <창 시작 RFC 3339>"` 항목으로 수만 남긴다(IP는 1만 개까지 세고, 넘치면 가장 오래된 것의
+  수를 바로 적고 버린다). 인증된 요청은 한도가 없다. opld가 열 때 디렉터리는 0700, 파일은 0600으로 다시 맞추고,
+  `audit.log`가 심볼릭 링크면 열지 않으며(opld가 시작하지 않음), `max_files`를 줄였으면 넘는 옛 파일을 지운다.
+- **journald.** 같은 JSON을 tracing 대상 `opl_audit`(INFO)로도 내보낸다. 패키지의 opld는 systemd 서비스라 journald에
+  `… INFO opl_audit: {"id":…}` 줄로 남는다(`journalctl -u opld -g opl_audit`). `RUST_LOG`를 바꿀 때는 `opl_audit=info`가
+  남게 한다(파일은 `RUST_LOG`와 상관없다). opld는 로그가 터미널로 갈 때만 색 코드를 넣으므로 journald 줄에는 색 코드가
+  없다(`NO_COLOR`를 따로 줄 필요가 없다). 밖으로 보내려면 rsyslog로 전달한다. Debian 13은 rsyslog가 기본으로 없다
+  (`apt install rsyslog`):
+
+  ```
+  # /etc/rsyslog.d/60-opl-audit.conf
+  # rsyslog가 이미 journald에서 받으면(/var/log/syslog에 opld 줄이 보이면) 다음 module 줄은 뺀다.
+  module(load="imjournal" StateFile="imjournal.state")
+  if $programname == 'opld' and $msg contains 'opl_audit:' then {
+      action(type="omfwd" target="siem.example.com" port="514" protocol="tcp")
+  }
+  ```
+
+  `systemctl restart rsyslog` 뒤 바꾸는 요청 하나를 보내 수집 서버에 줄이 오는지 본다.
+- **읽기.** `GET /api/v1/audit?since&until&user&node&action&limit`(admin만, 다른 역할은 **403**)는 받은 노드가
+  위트니스가 아닌 모든 멤버의 감사 로그를 읽어(자기 파일은 직접, 다른 노드는 노드 사이 RPC로 노드마다 5초 제한)
+  시간 내림차순으로 합친다. `since`·`until`은 유닉스 밀리초나 RFC 3339(기본: 지금까지 24시간, 양 끝 포함), `user`·
+  `node`는 정확히 같은 이름, `action`은 `action`이나 `path`에 든 문자열이다. `limit`은 1~5000(기본 200), 아니거나 시각이
+  틀리면 **400** `invalid_request`다. 응답은 `{"entries":[…],"unreachable":["node3"],"disabled":["node4"],"truncated":false}`:
+  읽지 못한 노드(꺼짐, 제한 시간, 이 기능이 없는 옛 opld)는 `unreachable`에, 감사 로그를 끈(`[audit] enabled = false`)
+  노드는 `disabled`에 이름 순으로, 조건에 맞는 항목이 `limit`보다 많으면 `truncated: true`다. 같은 항목은 한 번만 온다
+  (읽는 중에 회전해도). oplctl은 표 뒤 stderr에 `warning: no audit records from: node3`, `note: the audit log is disabled
+  on: node4`, `note: more entries match; narrow the range or raise --limit`을 쓴다(`-o json`이면 쓰지 않는다). 표의
+  `TARGET`은 대상이 없으면 `detail`(로그인의 `username=…`, `audit.dropped`의 수)이다. 기간 `--since`(`1h` 등)와 `--until`은
+  함께 줄 수 없다(`a relative --since cannot be combined with --until; give a time` — `--since`에 시각을 준다).
+- **웹.** "감사 로그" 메뉴(admin에게만 보인다): 시간 범위(지난 1시간·24시간·7일, 기본 24시간), 사용자·동작 입력(적용을
+  눌러야 거른다), 표(시각은 브라우저의 지역 시간, 대상이 없으면 `detail`, 4xx·5xx 상태는 경고 색), 읽지 못한 노드 경고,
+  감사 로그를 끈 노드 안내와 잘림 안내, 행을 누르면 항목 JSON. 자동으로 다시 읽지 않는다(새로고침 버튼). 다시 읽기가
+  실패하면 마지막 표를 두고 위에 오류를 보인다.
+
+설정(노드마다, 생략하면 아래 기본값):
+
+```toml
+[audit]
+enabled = true       # 끄면 이 노드는 파일도 journald 줄도 남기지 않는다
+max_file_mib = 16    # 한 파일의 최대 크기(MiB, 1~256 — 읽을 때 파일을 통째로 메모리에 올린다)
+max_files = 8        # 지금 파일을 포함해 남기는 파일 수(1 이상). 0이면 opld가 시작하지 않는다
+```
+
+감사 디렉터리를 만들거나 파일을 열지 못하면 opld가 시작하지 않는다. opld를 멈출 때는 API를 닫은 뒤 남은 항목을 쓰고
+`fsync`한다.
+
+- **한계.** 꺼진 노드의 기록은 그 노드가 돌아와야 보이고, 디스크를 잃으면 사라진다(journald 전달로 보완한다). 변조
+  방지(해시 체인·서명)는 없어 노드의 root는 파일을 고칠 수 있다. 롤링 업그레이드 중 옛 opld 노드는 `unreachable`이다.
+  opld가 갑자기 죽으면 대기열에 남은 항목을, 전원이 나가면 마지막 1초쯤을 잃을 수 있다. 버린 항목은 수만 남는다.
+  파일 쓰기가 실패하면(디스크가 참 등) opld 로그에 경고만 남기고 요청은 그대로 처리한다. 리버스 프록시 뒤에서는
+  `ip`가 프록시 주소다. 콘솔은 연 것만 적고 닫은 때와 입력은 적지 않는다. 알림과 날짜로 지우기는 없다(크기와 개수로만
+  지운다). 위트니스 노드는 API가 없어 감사 로그도 없다. 인증 없는 요청은 IP(IPv6는 /64)마다 1분에 60개까지만 적고 나머지는
+  창이 끝나고 1초 안에 적히는 `audit.suppressed`의 수만 남는다(같은 IP에서 많은 로그인 실패가 오면 그 시각·이름은
+  다 남지 않는다). 각 문자열 필드는 512바이트까지만 적는다. 로그인의 사용자 이름 칸에 비밀번호를 잘못 넣으면 이름 형식(1~63자의 영문 소문자·숫자·`-`)이면
+  `username=<그 값>`으로 그대로 적힌다. 감사 로그를 끈 노드는 `disabled`로 보일 뿐 그 노드의 요청은 어디에도 남지 않는다.
+  `max_file_mib`는 256까지이고, 읽을 때 파일 하나를 통째로 메모리에 올린다(한 번 읽기에 최대 `max_file_mib`쯤).
 
 ## 이미지 업로드와 머신 종류
 
