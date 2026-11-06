@@ -1511,7 +1511,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
 볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기)과 백업 작업, VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업, 감사 로그(admin),
-사용자(admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
+사용자(admin), 인증 영역(admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
 
@@ -1541,6 +1541,149 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
   `oplctl token list`·`oplctl token delete`(웹: API 토큰 화면)로 따로 지운다. 열려 있는 콘솔(WebSocket)은 연결할
   때 한 번 인증하므로 비밀번호를 바꿔도 끊기지 않는다.
 
+## 외부 인증(LDAP)
+
+인증 영역(`Realm`)을 만들면 로컬 사용자 말고도 바깥 LDAP 디렉터리(OpenLDAP, Active Directory 등)의 계정으로
+로그인할 수 있다. 영역은 admin만 보고 만들고 고친다(operator·viewer는 읽기도 **403**). 영역 이름은 리소스 이름
+규칙(1~63자의 영문 소문자·숫자·`-`)이고 `local`은 로컬 사용자를 뜻하는 예약 이름이다. UUID로 읽히는 이름(예:
+`0192f0c1-5d2e-7000-8000-000000000000`)도 API가 id로 읽어 이름으로 부를 수 없으므로 **400**이다.
+
+- **외부 사용자.** 영역 `corp`에 `alice`로 처음 로그인하면 opLite 사용자 `alice@corp`가 생긴다(로컬 사용자 `alice`와는
+  다른 사용자다). 이름의 사용자 부분은 소문자로 바꾸고(디렉터리에도 소문자로 찾는다) 1~64자의 `a-z`·`0-9`·`.`·`_`·`-`만
+  된다. 이 형식이 아닌 계정은 로그인할 수 없다(**401**). 비밀번호는 opLite에 저장하지 않고 늘 디렉터리가 확인한다.
+  외부 사용자의 비밀번호를 바꾸려 하면 **400** `external_user`다(웹에는 그 메뉴가 없다). 외부 사용자도 API 토큰을
+  만들 수 있다. 외부 사용자를 지우면(`oplctl user delete alice@corp`) 세션과 토큰이 함께 끝나고, 디렉터리가 받아 주면
+  다음 로그인에 다시 생긴다.
+- **역할 매핑.** 로그인할 때마다 사용자 항목의 그룹 속성(기본 `memberOf`) 값들을 영역의 그룹 → 역할 표와 비교한다.
+  앞뒤 공백을 떼고 ASCII 대소문자만 무시한 문자열 비교다(DN을 정규화하지 않으므로 `cn=ops, dc=example`과
+  `cn=ops,dc=example`은 다르다 — `oplctl realm test`가 보이는 값을 그대로 쓴다). 여러 그룹이 맞으면 가장 높은 역할
+  (admin > operator > viewer), 맞는 것이 없으면 기본 역할, 그것도 없으면 **403** `no_role`("no role is mapped for this
+  user")이다. 정해진 역할이 지금과 다르면 사용자를 고치고 그 사용자의 다른 로그인 세션을 끝낸다(같으면 아무것도 쓰지
+  않는다). admin이 외부 사용자의 역할을 바꿀 수는 있지만 다음 로그인에 매핑으로 다시 정해진다.
+
+```bash
+# OpenLDAP(memberof 오버레이): 서비스 계정으로 찾는다. --group은 <그룹 DN>=<role>(마지막 =에서 나눔, 여러 번)
+oplctl realm add-ldap corp --display "Corp LDAP" \
+  --url ldap://ldap.example.com --base-dn ou=people,dc=example,dc=com \
+  --bind-dn cn=oplite,ou=services,dc=example,dc=com --bind-password-file /root/corp-bind.pw \
+  --ca-file /etc/ssl/certs/corp-ca.pem \
+  --group cn=admins,ou=groups,dc=example,dc=com=admin \
+  --group cn=ops,ou=groups,dc=example,dc=com=operator --default-role viewer
+# Active Directory: sAMAccountName으로 찾는다(그룹은 memberOf 그대로)
+oplctl realm add-ldap ad --url ldaps://dc1.corp.example.com --base-dn "DC=corp,DC=example,DC=com" \
+  --bind-dn "CN=svc-oplite,OU=Service Accounts,DC=corp,DC=example,DC=com" --bind-password-file /root/ad-bind.pw \
+  --user-filter "(&(objectClass=user)(sAMAccountName={username}))" \
+  --group "CN=oplite-admins,OU=Groups,DC=corp,DC=example,DC=com=admin"
+oplctl realm list
+# NAME  DISPLAY    KIND  URL
+# corp  Corp LDAP  ldap  ldap://ldap.example.com
+oplctl realm show corp            # 설정(bind password: set|none, ca: custom (PEM)|system roots, 그룹 표, 기본 역할)
+oplctl realm test corp --user alice   # 비밀번호는 터미널에서 묻는다(--password-file <파일|->)
+# STEP          RESULT  MESSAGE
+# connect       ok      connected to ldap://ldap.example.com with StartTLS
+# service_bind  ok      bound as cn=oplite,ou=services,dc=example,dc=com
+# search        ok      found uid=alice,ou=people,dc=example,dc=com
+# user_bind     ok      bound as uid=alice,ou=people,dc=example,dc=com
+# groups        ok      2 value(s) of memberOf
+# dn: uid=alice,ou=people,dc=example,dc=com
+# groups: cn=admins,ou=groups,dc=example,dc=com, cn=staff,ou=groups,dc=example,dc=com
+# role: admin
+oplctl realm set-ldap corp --timeout 5            # 준 것만 바꾼다(읽은 revision으로 — 그 사이 바뀌었으면 412)
+oplctl realm set-ldap corp --bind-password-file /root/corp-bind.pw   # 새 서비스 계정 비밀번호
+# URL·바인드 DN·CA를 바꿀 때는 비밀번호도 다시 준다(주지 않으면 서버가 400)
+oplctl realm set-ldap corp --url ldaps://ldap2.example.com --bind-password-file /root/corp-bind.pw
+oplctl realm set-ldap corp --clear-bind-dn          # 익명 검색으로(저장된 비밀번호도 지움)
+oplctl realm set-ldap corp --clear-ca --clear-default-role --clear-groups   # 시스템 루트, 기본 역할·그룹 표 없음
+oplctl realm remove corp
+oplctl login --server https://10.0.0.11:8006 --realm corp --user alice   # 기본 --realm local
+```
+
+- **설정 항목**(API `backend`의 필드, oplctl 선택):
+  - `url`(`--url`): `ldap://호스트[:포트]` 또는 `ldaps://호스트[:포트]`. 서버 하나만 쓴다.
+  - `base_dn`(`--base-dn`): 사용자를 찾을 기준 DN(그 아래 전체, subtree).
+  - `bind_dn`·`bind_password`(`--bind-dn`, `--bind-password-file <파일|->`): 사용자를 찾을 서비스 계정. 둘은 함께 있어야
+    한다 — `bind_dn`에 비밀번호가 없거나 빈 글이면 **400**("bind_dn needs bind_password; remove bind_dn for an anonymous
+    search"), 비밀번호만 있어도 **400**이고, 둘 다 없을 때만 익명으로 찾는다. 비밀번호는 API 응답에 없고
+    `has_bind_password`로 있는지만 보인다. 바꾸기(`PUT`)에서 필드를 빼면 저장된 값을 두는데, `url`·`bind_dn`·`ca_pem`이
+    모두 그대로일 때만이다: 하나라도 바꾸면서 빼면 **400** `invalid_request`("bind_password must be given again when url,
+    bind_dn or ca_pem changes" — 저장된 비밀번호를 다른 서버나 계정으로 보내지 않는다). `""`이면 지우므로 `bind_dn`도 함께
+    빼야 한다(`--clear-bind-dn`, 웹은 "저장된 비밀번호 지우기"와 바인드 DN 비우기).
+  - 서버는 저장·비교하기 전에 `url`·`bind_dn`의 앞뒤 공백을 떼고, `ca_pem`은 CRLF를 LF로 바꾼 뒤 앞뒤 공백을 뗀다(만들기·바꾸기
+    모두). 그래서 끝 줄바꿈이 있는 CA 파일(`--ca-file`)로 만든 영역을 웹에서 고쳐도 같은 CA로 보고 비밀번호를 그대로 둔다.
+  - `user_filter`(`--user-filter`, 기본 `(&(objectClass=person)(uid={username}))`): `{username}`이 정확히 한 번 있어야
+    하고, 로그인 이름을 RFC 4515로 이스케이프해 넣는다. Active Directory는 `(&(objectClass=user)(sAMAccountName={username}))`,
+    UPN으로 찾으려면 `(userPrincipalName={username}@corp.example.com)`처럼 쓴다. 로그인할 수 있는 사람을 줄이는 조건도
+    필터에 넣는다(예: AD의 `(memberOf:1.2.840.113556.1.4.1941:=CN=oplite,…)`).
+  - `group_attr`(`--group-attr`, 기본 `memberOf`): 그룹 DN을 담은 사용자 속성. 서비스 계정(또는 익명)이 읽을 수 있어야 한다.
+    OpenLDAP는 memberof 오버레이가 있어야 `memberOf`가 생긴다.
+  - `ca_pem`(`--ca-file`): 서버 인증서를 확인할 CA(PEM). 있으면 그 인증서들만 믿고, 없으면 시스템 루트를 쓴다.
+  - `timeout_secs`(`--timeout`, 기본 10, 1~30): 연결과 LDAP 작업마다의 시간 제한(초). 확인 전체(연결·바인드·검색·바인드)는
+    `timeout_secs × 4 + 1`초(최대 121초) 안에 끝나고, 넘으면 **503**이다(시험 동작은 그 단계가 "timed out").
+  - `display`(`--display`): 로그인 화면에 보일 이름. `roles`: `groups`(`--group`, `set-ldap`에서 주면 표 전체를 바꾼다)와
+    `default`(`--default-role`).
+  - `set-ldap`은 영역을 읽어 준 것만 바꾼다. 없애는 선택은 `--clear-bind-dn`(바인드 DN과 저장된 비밀번호 — 익명 검색),
+    `--clear-ca`(시스템 루트), `--clear-default-role`, `--clear-groups`이고, 같은 값을 정하는 선택과 함께 줄 수 없다.
+    `--clear-bind-password`는 바인드 DN이 남으면 보내지 않고 오류다("--clear-bind-password needs --clear-bind-dn (or give
+    --bind-password-file)"). URL·바인드 DN·CA를 바꾸면서 `--bind-password-file`을 주지 않으면 서버의 **400**을 그대로 보인다.
+  - 나쁜 값(형식이 아닌 URL, 빈 기준 DN, `{username}`이 없거나 둘, 시간 제한 범위 밖, 빈 그룹 DN 등)과 이름 `local`은 **400**
+    `invalid_request`다.
+- **TLS.** 평문으로는 바인드하지 않는다. `ldap://`는 늘 StartTLS를 쓰고(서버가 StartTLS를 하지 못하면 연결 실패),
+  `ldaps://`는 처음부터 TLS다. 서버 인증서는 CA와 **호스트 이름**을 모두 확인한다: URL의 호스트(이름이나 IP)가 인증서의
+  SAN에 있어야 한다. 시스템 루트는 노드의 인증서 저장소(Debian: `ca-certificates`)이고, 읽지 못하면 믿는 루트가 없어 모든
+  연결이 실패한다. 사설 CA면 `--ca-file`을 준다.
+- **로그인 순서.** 빈 비밀번호는 디렉터리에 묻지 않고 거절한다(익명 바인드로 통과하는 것을 막는다). 연결 → 서비스 계정
+  바인드(없으면 생략) → `base_dn` 아래에서 `user_filter`로 찾기(`group_attr`만 읽음, 크기 제한 2·시간 제한 `timeout_secs`;
+  서버가 크기 제한을 지키지 않아도 둘째 항목에서 멈추고 검색을 버린다) → 찾은 항목이 정확히 하나가 아니면(결과 코드 4
+  sizeLimitExceeded도 여럿으로 봄) 실패 → 그 DN과 비밀번호로 바인드 → 그룹 값으로 역할 → 사용자 만들기·고치기 → 세션.
+  끝나면 연결을 끊는다(unbind). 사용자 확인이 자격 증명 실패로 끝나면 시작부터 적어도 300ms 뒤에 답한다. 디렉터리가
+  300ms 안에 답하면 없는 사용자와 틀린 비밀번호의 응답 시간 차가 가려지지만, 그보다 느린 디렉터리에서는 차이가 남을 수
+  있다(시험 동작은 기다리지 않는다).
+- **오류.** 없는 사용자, 여러 항목, 틀린 비밀번호(LDAP 결과 49)는 모두 로컬과 같은 **401** `invalid_credentials`다.
+  연결·TLS 실패, 믿지 않는 인증서, 서비스 계정 바인드·검색 실패, 사용자 바인드의 49가 아닌 실패는 **503**
+  `realm_unavailable`("the directory of realm corp is unavailable")이고 원인은 opld 로그(`journalctl -u opld`)에 경고로
+  남는다. 모르는 영역은 **400** `invalid_request`, 매핑되는 역할이 없으면 **403** `no_role`이다. 롤링 업그레이드 중(옛 opld
+  노드가 있을 때) 영역 로그인과 영역 쓰기는 **409** `cluster_upgrading`이다(로컬 로그인은 된다).
+- **시도 제한.** 로컬 로그인과 같은 기록이고 키는 외부 사용자 이름(`alice@corp`)과 IP다. **401뿐 아니라 403 `no_role`과
+  503 `realm_unavailable`도 실패로 센다**: 디렉터리가 멈춘 동안 되풀이해 로그인하면 잠시 막힐 수 있다. 형식이 아닌 이름은
+  IP만 센다.
+- **감사 로그.** 영역 로그인의 `detail`은 `username=alice realm=corp`이다(이름 형식이 아니면 `<invalid>`). 영역 만들기·고치기·
+  지우기·시험은 다른 바꾸는 요청처럼 적히고, 서비스 계정·사용자 비밀번호는 어디에도 넣지 않는다.
+- **시험 동작.** `oplctl realm test`(웹: 영역의 "시험", API `POST /api/v1/realms/{key}/actions/test {"username","password"}`,
+  admin)는 로그인과 같은 순서를 `connect`·`service_bind`·`search`·`user_bind`·`groups` 단계로 돌려 단계마다 성공·실패와
+  내용, 찾은 DN, 그룹 값, 정해질 역할을 보인다. 실패한 단계에서 멈춘다. 사용자·세션을 만들지 않고 시도 제한에도 세지
+  않으며 비밀번호는 응답에 없다. oplctl은 실패한 단계가 있으면 오류로 끝난다(역할만 없으면 성공 — `role: none`).
+- **웹.** 로그인 화면은 `local` 말고도 영역이 있으면 영역 고르기를 보인다(기본 "로컬 사용자", 영역은 표시 이름이나 이름).
+  "인증 영역" 메뉴(admin에게만, 사용자 다음): 목록(이름, 표시 이름, 종류, URL), LDAP 영역 만들기·고치기(바인드 비밀번호는
+  비워 두면 그대로, "저장된 비밀번호 지우기"로 지움 — 서버와 같은 규칙으로 URL·바인드 DN·CA를 바꾸면 비밀번호를 다시
+  넣으라고(바인드 DN만 비웠으면 "저장된 비밀번호 지우기"를 고르라고), 바인드 DN에 비밀번호가 없거나 지우기에 바인드 DN이
+  남으면 저장 전에 알린다, 그룹 → 역할 표 더하기·빼기,
+  기본 역할), 지우기, 시험 대화상자(단계 표,
+  DN, 그룹, 정해질 역할). 사용자 목록에 영역 열(로컬 사용자는 `local`)이 있다.
+- **API.** `GET`·`POST /api/v1/realms`, `GET`·`PUT`·`DELETE /api/v1/realms/{key}`(`PUT`은 통째로 바꾸고 `If-Match`를 따른다,
+  이름은 바꿀 수 없다), 로그인 전 화면용 `GET /api/v1/auth/realms`(인증 없음, `[{"name","display","kind"}]`, `local`이 먼저이고
+  나머지는 이름 순), `POST /api/v1/auth/login {"username","password","realm"}`(`realm`이 없거나 `local`이면 로컬 로그인,
+  영역 로그인의 `username`은 `@영역` 없는 이름). 영역은 watch로 내보내지 않는다(서비스 계정 비밀번호가 들어 있다).
+- **영역을 지울 때.** 그 영역의 사용자는 로그인할 수 없고(모르는 영역 **400**), 모든 노드에서 그 사용자들의 세션과 API 토큰이
+  다음 요청부터 **401**이다. `alice@corp` 같은 사용자와 토큰은 남으므로 같은 이름의 영역을 다시 만들면 다시 쓸 수 있다
+  — 새 영역의 디렉터리·매핑과 상관없이 **옛 세션(12시간 안)과 토큰이 지울 때의 역할 그대로 되살아난다**(아래 한계).
+  완전히 없애려면 사용자도 지운다. 이미 열린 콘솔(WebSocket)은 끊기지 않는다.
+
+한계:
+
+- 디렉터리는 로그인할 때만 본다. 디렉터리에서 계정을 막거나 지우거나 그룹을 빼도 이미 있는 세션(최대 12시간)과 API 토큰은
+  남고 역할은 다음 로그인에 바뀐다. 바로 막으려면 opLite에서 그 사용자를 지운다(토큰도 함께 지워진다).
+- 그룹은 사용자 항목의 속성 값만 본다. 그룹 항목을 찾는 방식(`posixGroup`의 `memberUid` 등)과 중첩 그룹 풀기(AD의
+  `memberOf`는 직접 속한 그룹만)는 없다. DN은 문자열로만 비교한다.
+- 서버 주소는 하나다(장애 조치·여러 서버 없음). 참조(referral)는 따라가지 않는다. 단순 바인드만 한다(SASL·Kerberos·클라이언트
+  인증서 없음).
+- 서비스 계정 비밀번호는 Raft에 평문으로 있다(구독 키와 같이 노드의 root만 읽는다).
+- 영역을 지우고 같은 이름으로 다시 만들면(다른 디렉터리를 가리켜도) 옛 영역 사용자의 세션과 API 토큰이 지울 때의 역할로
+  다시 동작한다. 영역을 다른 용도로 다시 쓰기 전에는 그 영역의 사용자(`oplctl user list`의 `<사용자>@<영역>`)를 먼저 지운다.
+- 같은 사용자가 거의 동시에 두 번 로그인하고 그 사이 디렉터리의 그룹이 바뀌면, 옛 그룹을 읽은 로그인이 나중에 써서 역할이
+  옛 것으로 되돌아갈 수 있다(드문 경쟁 — 다음 로그인에 바로잡힌다).
+- 사용자 부분이 `a-z`·`0-9`·`.`·`_`·`-`가 아닌 계정(공백·`@`·한글 등)은 로그인할 수 없다. 사용자·그룹 동기화, 외부 사용자의
+  2단계 인증, SSO(OIDC)는 없다.
+
 ## 감사 로그
 
 노드마다 그 노드가 받은 바꾸는 API 요청(`POST`·`PUT`·`PATCH`·`DELETE`, 성공·실패와 401·403 포함), 로그인 성공·실패,
@@ -1567,7 +1710,7 @@ oplctl -o json audit --since 7d                  # 응답 그대로(항목의 �
   템플릿>"`(예: `POST /vms/{key}/actions/{action}`, `DELETE /users/{key}`, `POST /auth/login`)이라 새 API도 저절로
   이름을 가진다. `target`은 템플릿의 첫 조각과 첫 매개변수 값(`{"kind":"vms","key":"web-1"}`)이고, 매개변수가 없는
   경로는 `null`이다. `detail`은 핸들러가 남긴 짧은 문자열이다: 로그인은 `username=<이름>`(이름 형식이 아니면
-  `username=<invalid>` — 비밀번호를 이름 칸에 넣었을 수 있다), 구독 키 넣기는 `id=<키 id>`. 비밀번호·키·토큰은
+  `username=<invalid>` — 비밀번호를 이름 칸에 넣었을 수 있다, 영역 로그인은 뒤에 ` realm=<영역>`), 구독 키 넣기는 `id=<키 id>`. 비밀번호·키·토큰은
   어디에도 넣지 않는다. 로그인에 성공하면 그 사용자, 로그아웃은 세션의 사용자가 `user`다. `path`·`target.key`·
   `detail`·`user`는 512바이트까지만 적는다(넘으면 글자 경계에서 잘라 끝에 `…`).
 - **파일.** `{data_dir}/audit/audit.log`(패키지는 `/var/lib/opl/audit/audit.log`). 디렉터리는 0700, 파일은 0600이다.
@@ -1698,6 +1841,17 @@ sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM_SHAR
 cargo test -p opld --features migration-it --test migration
 # 실제 HA 복구: 한 호스트의 opld 둘(process 펜싱)과 위트니스, 공유 디렉터리 풀(macOS는 TCG로 돈다).
 cargo test -p opld --features ha-it --test ha
+# Linux(Ubuntu·Debian), root: 실제 OpenLDAP. ldap-setup.sh가 이 기계의 slapd 설정과 디렉터리를 지우고 늘 새 데이터베이스로
+# 다시 설정한다(다시 돌려도 된다 — 옛 데이터베이스는 /var/backups로 옮겨짐). 버려도 되는 기계에서만: CI(`CI=true`)가 아니면
+# OPL_LDAP_SETUP_WIPE=1을 주어야 돌고, 없으면 설명을 찍고 끝난다(CI `ldap` 작업).
+# 스크립트와 시험이 같은 값을 읽는다(아래는 CI ldap 작업의 값. 스크립트는 없으면 이 값을 쓰지만 시험은 모두 있어야 한다).
+export OPL_TEST_LDAP_URL=ldaps://127.0.0.1:636 OPL_TEST_LDAP_STARTTLS_URL=ldap://127.0.0.1:389 \
+  OPL_TEST_LDAP_CA=/tmp/opl-test-ldap-ca.pem OPL_TEST_LDAP_BASE_DN=dc=example,dc=com \
+  OPL_TEST_LDAP_BIND_DN=cn=admin,dc=example,dc=com OPL_TEST_LDAP_BIND_PASSWORD=opl-admin-pw \
+  OPL_TEST_LDAP_USER=alice OPL_TEST_LDAP_USER_PASSWORD=alice-pw OPL_TEST_LDAP_OTHER_USER=bob \
+  OPL_TEST_LDAP_OTHER_PASSWORD=bob-pw OPL_TEST_LDAP_GROUP=cn=admins,ou=groups,dc=example,dc=com
+sudo -E OPL_LDAP_SETUP_WIPE=1 sh .github/scripts/ldap-setup.sh
+cargo test -p opl-api --features ldap-it --test ldap_it
 ```
 
 `nfs-it` 시험은 opld가 내보내기를 마운트하고, 그 풀에 볼륨을 만들고 qcow2 스냅샷을 찍고 지운 뒤, 풀을 지우면
