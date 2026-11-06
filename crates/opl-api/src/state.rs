@@ -6,6 +6,7 @@ use opl_driver::Hypervisor;
 use opl_peer::Peers;
 use uuid::Uuid;
 
+use crate::audit::AuditLog;
 use crate::auth::{Authorizer, RoleAuthorizer, Sessions};
 use crate::limit::AttemptLimiter;
 use crate::vm_imports::ImportCredentials;
@@ -31,6 +32,8 @@ pub struct AppState {
     pub(crate) vm_lock: tokio::sync::Mutex<()>,
     /// 이 노드가 받은 ESXi 가져오기의 자격 증명(메모리에만). 같은 노드의 Task 실행기와 나눠 쓴다.
     pub import_credentials: Arc<ImportCredentials>,
+    /// 이 노드의 감사 로그. 기본은 꺼져 있다(opld가 연다).
+    pub audit: Arc<AuditLog>,
 }
 
 impl AppState {
@@ -52,6 +55,7 @@ impl AppState {
             attempts: AttemptLimiter::default(),
             vm_lock: tokio::sync::Mutex::new(()),
             import_credentials: Arc::default(),
+            audit: Arc::new(AuditLog::disabled()),
         }
     }
 }

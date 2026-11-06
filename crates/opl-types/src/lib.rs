@@ -1,5 +1,6 @@
 //! opLite 리소스 모델. 모든 크레이트가 공유하는 타입만 둔다.
 
+pub mod audit;
 pub mod auth;
 pub mod backup;
 pub mod backup_job;

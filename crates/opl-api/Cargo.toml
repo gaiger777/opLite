@@ -23,6 +23,7 @@ hex.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+libc.workspace = true
 opl-cluster.workspace = true
 opl-driver.workspace = true
 opl-peer.workspace = true

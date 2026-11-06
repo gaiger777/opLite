@@ -66,3 +66,4 @@ native-tls = "0.2.18"
 ring = "0.17.14"
 base64 = "0.22.1"
 rust-embed = { version = "8.13.0", features = ["mime-guess", "interpolate-folder-path"] }
+libc = "0.2.191"

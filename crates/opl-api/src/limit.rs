@@ -58,7 +58,7 @@ fn keys(user: &str, ip: IpAddr) -> [Key; 2] {
 
 /// 세는 단위의 IP. IPv4-mapped IPv6는 IPv4로 보고, IPv6는 /64 네트워크 하나로 센다(한 사용자가
 /// 쉽게 바꿔 쓸 수 있는 주소 묶음이다).
-fn counted_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn counted_ip(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
         v4 => v4,

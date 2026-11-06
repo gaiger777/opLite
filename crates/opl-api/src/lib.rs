@@ -3,6 +3,7 @@
 //! API는 원하는 상태(spec)를 Raft에 기록하고 Task를 만들기만 한다. VM을 실제로 움직이는 것은
 //! 각 노드의 reconciler이고, Task의 진행은 대상 노드의 [`TaskRunner`]가 기록한다.
 
+pub mod audit;
 pub mod auth;
 mod backup_jobs;
 mod backups;
@@ -40,6 +41,7 @@ use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+pub use audit::{AuditConfig, AuditLog};
 pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
 pub use backup_jobs::{BackupJobScheduler, BackupJobSchedulerConfig};
 pub use firmware::UefiVarsFetcher;
