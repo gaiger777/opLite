@@ -16686,3 +16686,27 @@ git commit -m "docs: 외부 인증(LDAP) — README \"외부 인증(LDAP)\" 절(
 - 디렉터리가 300ms보다 늦게 답하면 없는 사용자와 틀린 비밀번호의 응답 시간 차가 드러날 수 있다.
 - 같은 사용자의 로그인이 거의 동시에 겹치면 드물게 옛 역할이 다시 쓰일 수 있다.
 - 그 밖의 제한은 설계 문서 §3.6·§9와 README "외부 인증(LDAP)" 절에 있다.
+
+## 실행 후 기록 (2026-11-07)
+
+- **Task 1~7:** `feat/plan35-ldap`에서 계획대로 적용했다. 편집 블록은 모두 그대로 맞았고, Task마다 검증한 스테이지 커밋과 트리가 같았다(생성 파일 제외). Task 3의 `Cargo.lock`도 검증한 것과 같게 나왔다.
+- **1차 리뷰에서 고친 것:**
+  - 바꾸기에서 서비스 계정 비밀번호를 생략하면 URL·bind DN·CA가 그대로일 때만 남긴다. 관리자가 URL을 자기 서버로 바꿔 비밀번호를 빼내지 못하게.
+  - bind DN에는 비밀번호가 있어야 한다(빈 비밀번호 바인드는 RFC 4513의 인증 없는 바인드). 익명 검색은 둘 다 없을 때만.
+  - 검색 결과를 2개에서 끊고 전체 마감을 둔다. 실패 응답은 최소 300ms. Debug에서 비밀을 가린다.
+  - oplctl `set-ldap`의 `--clear-*`, 웹의 저장 전 비밀번호 검사, 그룹 행 접근성, 화면 캡처에서 찾은 역할 칸 너비·빈 값 표시·영역을 이름으로 부르기.
+- **2차 리뷰에서 고친 것:** 서버가 URL·bind DN·CA를 다듬어 저장·비교(끝 줄바꿈 있는 CA 파일), UUID 모양 영역 이름 거절, 시간 제한 1~30초, `ldap-setup.sh`는 `CI=true`나 `OPL_LDAP_SETUP_WIPE=1`에서만.
+- **CI 프로브에서 고친 것:** `ldap-setup.sh`가 늘 다시 설정하게 바꾼 뒤, slapd 설정 스크립트가 지운 debconf 비밀번호 답 때문에 관리자 바인드가 49로 실패했다. 다시 설정 앞에서 답을 다시 넣는다.
+- **불안정한 시험(부하 때, 다시 돌리면 통과):** opl-api `telemetry_reporter.rs` redirects_are_not_followed(Task 4에서 한 번 — 다른 cargo가 같이 돌 때).
+
+**테스트:**
+- macOS `cargo test --workspace` 1343개(Task 5 이후)
+- 웹 시험 515개와 `typecheck`·`lint`·`build`
+- `fmt`·`clippy -D warnings`(모든 기능), shellcheck
+
+Linux CI(프로브)에서 같은 시험과 새 작업 `ldap`(Ubuntu의 실제 slapd로 LDAPS·StartTLS·memberOf 로그인)이 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 계획 36(OIDC SSO)은 같은 `Realm`에 `oidc` 종류를 더하고, 계획 35의 외부 사용자 만들기(`upsert_external`)를 그대로 쓴다.
+- 디렉터리 동기화, 중첩 그룹, 디렉터리에서 지운 사용자의 세션·토큰 즉시 끊기는 넣지 않았다.
