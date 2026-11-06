@@ -23,6 +23,7 @@ mod pools;
 mod web;
 
 use std::fs::File;
+use std::io::IsTerminal;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -56,6 +57,8 @@ async fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,openraft=warn")),
         )
+        // journald나 파일로 갈 때는 색 코드를 넣지 않는다(감사 줄을 그대로 전달할 수 있게).
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
     let args = Args::parse();
     let config = Config::load(&args.config)?;

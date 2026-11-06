@@ -6,12 +6,14 @@ use axum::extract::{Path, State};
 use axum::http::header::SET_COOKIE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use opl_types::audit::AuditAuth;
 use opl_types::auth::{ApiToken, ApiTokenSpec, Role, User, UserSpec};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::audit::AuditNote;
 use crate::auth::{
     Action, Principal, SESSION_COOKIE, SESSION_TTL, dummy_hash, hash_password, new_token,
     session_cookie, verify_password,
@@ -85,11 +87,19 @@ pub struct LoginRequest {
 pub async fn login(
     State(state): State<Arc<AppState>>,
     ClientIp(ip): ClientIp,
+    audit: AuditNote,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    // 이름 형식이 아닌 것은 감사 로그에 넣지 않는다(비밀번호를 잘못 넣었을 수 있다).
+    let name_ok = validate_name(&req.username).is_ok();
+    audit.detail(if name_ok {
+        format!("username={}", req.username)
+    } else {
+        "username=<invalid>".into()
+    });
     // 이름 형식이 아니면 그런 사용자는 있을 수 없다. 해시를 계산하지 않고 IP만 실패로 센다(긴 이름을
     // 기록에 넣지 않는다). 있을 수 없는 이름이라 응답 시간으로 드러나는 것도 없다.
-    if validate_name(&req.username).is_err() {
+    if !name_ok {
         state.attempts.begin_ip(ip)?;
         return Err(wrong_credentials());
     }
@@ -107,6 +117,14 @@ pub async fn login(
         return Err(wrong_credentials());
     };
     state.attempts.success(&req.username, ip, attempt);
+    audit.principal(
+        Principal {
+            user: user.id,
+            name: user.name.clone(),
+            role: user.spec.role,
+        },
+        AuditAuth::Session,
+    );
     let session = state.sessions.create(user.id, user.spec.session_epoch);
     let mut cookie = format!(
         "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
@@ -135,8 +153,18 @@ fn wrong_credentials() -> ApiError {
 #[utoipa::path(post, path = "/auth/logout", tag = "auth", security(()),
     responses((status = 204, description = "Logged out; the session cookie is cleared",
         headers(("set-cookie" = String)))))]
-pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn logout(
+    State(state): State<Arc<AppState>>,
+    audit: AuditNote,
+    headers: HeaderMap,
+) -> Response {
     if let Some(id) = session_cookie(&headers) {
+        // 지우기 전에 세션의 사용자를 감사 로그에 남긴다.
+        if let Some((user, _)) = state.sessions.get(id)
+            && let Ok(Some(principal)) = state.principal_for(user)
+        {
+            audit.principal(principal, AuditAuth::Session);
+        }
         state.sessions.remove(id);
     }
     let mut cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");

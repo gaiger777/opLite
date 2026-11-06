@@ -204,7 +204,7 @@ fn principal_of(u: User) -> Principal {
 }
 
 impl AppState {
-    fn principal_for(&self, user: Uuid) -> Result<Option<Principal>, ApiError> {
+    pub(crate) fn principal_for(&self, user: Uuid) -> Result<Option<Principal>, ApiError> {
         Ok(self.cluster.get::<UserSpec>(user)?.map(principal_of))
     }
 
@@ -274,7 +274,9 @@ impl FromRequestParts<Arc<AppState>> for Principal {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        state.authenticate(parts).await
+        let principal = state.authenticate(parts).await;
+        crate::audit::note_auth(parts, principal.as_ref().ok());
+        principal
     }
 }
 

@@ -1,18 +1,31 @@
 //! 감사 로그. 항목을 채널로 받아 쓰기 스레드가 `{dir}/audit.log`에 한 줄 JSON으로 덧붙이고
 //! (요청이 디스크를 기다리지 않음), 같은 줄을 tracing 대상 `opl_audit`로도 내보낸다.
 //! 파일이 커지면 `audit.log.1`, `.2`… 로 밀고, 읽을 때는 새 파일부터 거꾸로 훑는다.
+//! 항목은 미들웨어 [`layer`]가 바꾸는 요청마다 만든다. 인증 추출기와 핸들러는 요청의
+//! [`AuditSlot`]에 주체와 짧은 설명을 남긴다.
 
+use std::convert::Infallible;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
+use axum::extract::{FromRequestParts, MatchedPath, Request, State};
+use axum::http::header::AUTHORIZATION;
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, Method};
+use axum::middleware::Next;
+use axum::response::Response;
+use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery, AuditTarget};
 use uuid::Uuid;
+
+use crate::auth::Principal;
+use crate::limit::ClientIp;
+use crate::state::AppState;
 
 /// 쓰기 채널의 용량. 가득 차면 항목을 버리고 버린 수를 센다.
 const CHANNEL_CAPACITY: usize = 10_000;
@@ -176,6 +189,139 @@ impl AuditLog {
             tracing::warn!("the audit log did not finish writing within {timeout:?}; giving up");
         }
     }
+}
+
+/// 요청 하나의 감사 정보. 미들웨어가 요청 확장에 넣고, 인증 추출기와 핸들러가 채운다.
+#[derive(Clone, Default)]
+pub(crate) struct AuditSlot(Arc<Mutex<SlotData>>);
+
+#[derive(Default)]
+struct SlotData {
+    principal: Option<Principal>,
+    auth: Option<AuditAuth>,
+    detail: Option<String>,
+}
+
+impl AuditSlot {
+    fn set_principal(&self, principal: Principal, auth: AuditAuth) {
+        let mut data = self.0.lock().unwrap();
+        data.principal = Some(principal);
+        data.auth = Some(auth);
+    }
+}
+
+/// 인증 결과를 요청의 slot에 적는다. 실패해도 Bearer 토큰으로 시도했으면 그것은 남긴다.
+pub(crate) fn note_auth(parts: &Parts, principal: Option<&Principal>) {
+    let Some(slot) = parts.extensions.get::<AuditSlot>() else {
+        return;
+    };
+    let auth = if bearer(&parts.headers) {
+        AuditAuth::Token
+    } else {
+        AuditAuth::Session
+    };
+    match principal {
+        Some(p) => slot.set_principal(p.clone(), auth),
+        None if auth == AuditAuth::Token => slot.0.lock().unwrap().auth = Some(auth),
+        None => {}
+    }
+}
+
+fn bearer(headers: &HeaderMap) -> bool {
+    headers
+        .get(AUTHORIZATION)
+        .is_some_and(|v| v.as_bytes().starts_with(b"Bearer "))
+}
+
+/// 핸들러가 감사 항목에 남기는 것. 미들웨어 없이 불린 라우터에서는 아무것도 하지 않는다.
+pub struct AuditNote(Option<AuditSlot>);
+
+impl AuditNote {
+    /// 짧은 설명(비밀은 넣지 않는다)
+    pub(crate) fn detail(&self, detail: impl Into<String>) {
+        if let Some(slot) = &self.0 {
+            slot.0.lock().unwrap().detail = Some(detail.into());
+        }
+    }
+
+    /// 요청의 주체(로그인·로그아웃처럼 인증 추출기를 쓰지 않는 핸들러)
+    pub(crate) fn principal(&self, principal: Principal, auth: AuditAuth) {
+        if let Some(slot) = &self.0 {
+            slot.set_principal(principal, auth);
+        }
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for AuditNote {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(parts.extensions.get::<AuditSlot>().cloned()))
+    }
+}
+
+/// 라우트가 맞은 요청 가운데 바꾸는 것(GET·HEAD·OPTIONS가 아닌 것)과 콘솔 열기를 적는다.
+pub(crate) async fn layer(
+    State(state): State<Arc<AppState>>,
+    ClientIp(ip): ClientIp,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let Some(template) = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| api_path(m.as_str()).to_string())
+    else {
+        return next.run(req).await;
+    };
+    let method = req.method().clone();
+    let read = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+    if read && template != "/vms/{key}/console" {
+        return next.run(req).await;
+    }
+    let path = api_path(req.uri().path()).to_string();
+    let slot = AuditSlot::default();
+    req.extensions_mut().insert(slot.clone());
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let data = std::mem::take(&mut *slot.0.lock().unwrap());
+    let principal = data.principal;
+    state.audit.record(AuditEntry {
+        id: Uuid::now_v7(),
+        time: now_ms(),
+        // record가 이 노드의 이름으로 채운다.
+        node: String::new(),
+        user: principal.as_ref().map(|p| p.name.clone()),
+        user_id: principal.as_ref().map(|p| p.user),
+        role: principal.as_ref().map(|p| p.role),
+        auth: data.auth.unwrap_or(AuditAuth::None),
+        ip: ip.to_canonical().to_string(),
+        action: format!("{method} {template}"),
+        target: target(&template, &path),
+        method: method.to_string(),
+        path,
+        status: response.status().as_u16(),
+        duration_ms: start.elapsed().as_millis() as u64,
+        detail: data.detail,
+    });
+    response
+}
+
+/// `/api/v1` 아래의 경로
+fn api_path(path: &str) -> &str {
+    path.strip_prefix("/api/v1").unwrap_or(path)
+}
+
+/// 템플릿의 첫 조각과, 템플릿의 첫 `{…}` 자리에 있는 실제 경로 조각. 매개변수가 없으면 None.
+fn target(template: &str, path: &str) -> Option<AuditTarget> {
+    let mut segments = template.split('/').filter(|s| !s.is_empty());
+    let kind = segments.next()?;
+    let index = template.split('/').position(|s| s.starts_with('{'))?;
+    let key = path.split('/').nth(index)?;
+    Some(AuditTarget {
+        kind: kind.into(),
+        key: key.into(),
+    })
 }
 
 /// 쓰기 스레드
@@ -683,6 +829,23 @@ mod tests {
             .unwrap()
             .len() as u64
             + 1
+    }
+
+    #[test]
+    fn target_is_the_first_segment_and_the_first_parameter() {
+        let t = |template, path| target(template, path).map(|t| (t.kind, t.key));
+        assert_eq!(
+            t("/vms/{key}/actions/{action}", "/vms/web-1/actions/start"),
+            Some(("vms".into(), "web-1".into()))
+        );
+        assert_eq!(
+            t("/vms/{key}/snapshots/{name}", "/vms/web-1/snapshots/s1"),
+            Some(("vms".into(), "web-1".into()))
+        );
+        assert_eq!(t("/users", "/users"), None);
+        assert_eq!(t("/auth/login", "/auth/login"), None);
+        assert_eq!(api_path("/api/v1/vms/{key}"), "/vms/{key}");
+        assert_eq!(api_path("/vms"), "/vms");
     }
 
     #[tokio::test]

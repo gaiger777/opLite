@@ -171,12 +171,18 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 pub fn router(state: Arc<AppState>) -> Router {
     let (api, doc) = api().split_for_parts();
     let doc = Arc::new(doc);
-    let api = api.route(
-        "/openapi.json",
-        get(move || {
-            let doc = doc.clone();
-            async move { axum::Json(doc.as_ref().clone()) }
-        }),
-    );
+    // 라우트가 맞은 요청만 감사 로그에 적는다(라우트 템플릿이 동작 이름이다).
+    let api = api
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            audit::layer,
+        ))
+        .route(
+            "/openapi.json",
+            get(move || {
+                let doc = doc.clone();
+                async move { axum::Json(doc.as_ref().clone()) }
+            }),
+        );
     Router::new().nest("/api/v1", api).with_state(state)
 }

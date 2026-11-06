@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use openraft::{BasicNode, ServerState};
 use opl_api::vm_imports::ImportCredentials;
-use opl_api::{AppState, TaskRunner, TaskRunnerConfig, hash_password};
+use opl_api::{AppState, AuditConfig, AuditLog, TaskRunner, TaskRunnerConfig, hash_password};
 use opl_cluster::memnet::MemRouter;
 use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig};
@@ -181,6 +181,16 @@ impl Env {
         .await;
         let mut state = AppState::new(cluster.clone(), node, hv_dyn, dir.path().join("uploads"));
         state.import_credentials = credentials;
+        // 감사 로그는 `{dir}/audit`에 적는다.
+        state.audit = Arc::new(
+            AuditLog::open(AuditConfig {
+                dir: dir.path().join("audit"),
+                node: "node1".into(),
+                max_file_size: 1 << 20,
+                max_files: 2,
+            })
+            .unwrap(),
+        );
         let state = Arc::new(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());

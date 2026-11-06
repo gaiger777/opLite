@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opl_api::{
-    BackupJobSchedulerConfig, ClusterJanitorConfig, SnapshotSchedulerConfig, TelemetryConfig,
-    UpdatesConfig,
+    AuditConfig, BackupJobSchedulerConfig, ClusterJanitorConfig, SnapshotSchedulerConfig,
+    TelemetryConfig, UpdatesConfig,
 };
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
@@ -69,6 +69,8 @@ pub struct Config {
     pub updates: UpdatesSection,
     #[serde(default)]
     pub telemetry: TelemetrySection,
+    #[serde(default)]
+    pub audit: AuditSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -554,6 +556,52 @@ impl TelemetrySection {
     }
 }
 
+/// 감사 로그(`{data_dir}/audit/audit.log`). API를 여는 노드만 쓴다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSection {
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
+    /// 한 파일의 최대 크기(MiB). 넘으면 회전한다.
+    #[serde(default = "default_audit_max_file_mib")]
+    pub max_file_mib: u64,
+    /// 지금 파일을 포함해 남기는 파일 수
+    #[serde(default = "default_audit_max_files")]
+    pub max_files: usize,
+}
+
+impl Default for AuditSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_audit_enabled(),
+            max_file_mib: default_audit_max_file_mib(),
+            max_files: default_audit_max_files(),
+        }
+    }
+}
+
+impl AuditSection {
+    /// API의 감사 로그 설정. 꺼졌으면 None이다.
+    pub fn audit_config(&self, data_dir: &Path, node: &str) -> Option<AuditConfig> {
+        self.enabled.then(|| AuditConfig {
+            dir: data_dir.join("audit"),
+            node: node.into(),
+            max_file_size: self.max_file_mib << 20,
+            max_files: self.max_files,
+        })
+    }
+}
+
+fn default_audit_enabled() -> bool {
+    true
+}
+fn default_audit_max_file_mib() -> u64 {
+    16
+}
+fn default_audit_max_files() -> usize {
+    8
+}
+
 fn default_telemetry_tick() -> Duration {
     Duration::from_secs(60)
 }
@@ -793,6 +841,15 @@ impl Config {
         }
         if self.pools.refresh_secs == 0 {
             anyhow::bail!("pools.refresh_secs must be at least 1");
+        }
+        // 감사 로그를 읽을 때 파일을 통째로 메모리에 올리므로 256 MiB까지만 받는다.
+        if self.audit.max_file_mib == 0
+            || self.audit.max_files == 0
+            || self.audit.max_file_mib > 256
+        {
+            anyhow::bail!(
+                "audit.max_file_mib must be between 1 and 256 and audit.max_files at least 1"
+            );
         }
         if self.ha.fence_after_secs == 0 {
             anyhow::bail!("ha.fence_after_secs must be at least 1");
@@ -1231,6 +1288,37 @@ mod tests {
         assert!(with("").updates.updates_config().is_some());
         assert!(!with("enabled = false").updates.enabled());
         assert!(with("enabled = false").updates.updates_config().is_none());
+    }
+
+    #[test]
+    fn audit_section_defaults_and_rejects_zero() {
+        let c = parse("name = \"n1\"\naddress = \"h\"\ndata_dir = \"/d\"");
+        assert_eq!(c.audit, AuditSection::default());
+        let a = c.audit.audit_config(&c.data_dir, &c.name).unwrap();
+        assert_eq!(a.dir, Path::new("/d/audit"));
+        assert_eq!(a.node, "n1");
+        assert_eq!(a.max_file_size, 16 << 20);
+        assert_eq!(a.max_files, 8);
+
+        let c = parse("name = \"n\"\naddress = \"h\"\n[audit]\nmax_file_mib = 1\nmax_files = 2");
+        c.validate().unwrap();
+        // 읽을 때 파일을 통째로 메모리에 올리므로 256 MiB까지
+        parse("name = \"n\"\naddress = \"h\"\n[audit]\nmax_file_mib = 256")
+            .validate()
+            .unwrap();
+        let a = c.audit.audit_config(&c.data_dir, &c.name).unwrap();
+        assert_eq!((a.max_file_size, a.max_files), (1 << 20, 2));
+        let off = parse("name = \"n\"\naddress = \"h\"\n[audit]\nenabled = false");
+        assert!(off.audit.audit_config(&off.data_dir, &off.name).is_none());
+
+        for bad in ["max_file_mib = 0", "max_files = 0", "max_file_mib = 257"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[audit]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[audit]\ndir = \"/x\"")
+                .is_err()
+        );
     }
 
     #[test]

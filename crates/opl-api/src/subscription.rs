@@ -13,6 +13,7 @@ use opl_types::subscription::{self, SubscriptionInfo};
 use serde::Deserialize;
 use utoipa::ToSchema;
 
+use crate::audit::AuditNote;
 use crate::auth::{Action, Principal};
 use crate::backups::now;
 use crate::error::{ApiError, Json};
@@ -73,6 +74,7 @@ pub async fn get_subscription(
 pub async fn put_subscription(
     State(state): State<Arc<AppState>>,
     principal: Principal,
+    audit: AuditNote,
     Json(req): Json<SubscriptionKey>,
 ) -> Result<Json<SubscriptionInfo>, ApiError> {
     state.authorize(&principal, Action::Write, SettingsSpec::KIND)?;
@@ -91,6 +93,7 @@ pub async fn put_subscription(
     })
     .await?;
     tracing::info!(id = %license.id, "subscription key set");
+    audit.detail(format!("id={}", license.id));
     Ok(Json(info(&state.cluster, &settings)?))
 }
 

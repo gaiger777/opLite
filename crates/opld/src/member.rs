@@ -13,9 +13,9 @@ use axum::serve::ListenerExt;
 use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
-    AppState, BackupJobScheduler, ClusterJanitor, HaManager, HaManagerConfig, IncomingConfig,
-    IncomingMigrations, SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter,
-    UefiVarsFetcher, UpdateAgent, Updates,
+    AppState, AuditLog, BackupJobScheduler, ClusterJanitor, HaManager, HaManagerConfig,
+    IncomingConfig, IncomingMigrations, SnapshotScheduler, TaskRunner, TaskRunnerConfig,
+    TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
@@ -131,6 +131,8 @@ struct Services {
     updates: Option<UpdateAgent>,
     /// 리더가 텔레메트리 보고를 보낸다(설정에서 켰을 때).
     telemetry: TelemetryReporter,
+    /// API가 멈춘 뒤 남은 감사 항목을 쓰고 닫는다.
+    audit: Arc<AuditLog>,
 }
 
 impl Services {
@@ -143,6 +145,7 @@ impl Services {
         {
             self.api.task.abort();
         }
+        self.audit.shutdown().await;
         self.monitor.shutdown().await;
         self.schedule.shutdown().await;
         self.janitor.shutdown().await;
@@ -333,6 +336,13 @@ impl Member {
             );
             state.peers = Some(peers.clone());
             state.secure_cookies = true;
+            if let Some(audit) = config.audit.audit_config(&config.data_dir, &config.name) {
+                let dir = audit.dir.clone();
+                state.audit =
+                    Arc::new(AuditLog::open(audit).with_context(|| {
+                        format!("cannot open the audit log in {}", dir.display())
+                    })?);
+            }
             let created = match password {
                 Some(admin_password) => {
                     let token = issue_join_token(&state, DEFAULT_JOIN_TTL)
@@ -457,6 +467,7 @@ impl Member {
         let backups = BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config());
         let telemetry = TelemetryReporter::spawn(state.clone(), telemetry_config);
         let recovery = HaManager::spawn(state.clone(), HaManagerConfig::default());
+        let audit = state.audit.clone();
         let app = opl_api::router(state).merge(crate::web::router());
         let task = tokio::spawn(async move {
             // 연결 주소(클라이언트 IP)를 시도 제한에 넘긴다. axum은 `TapIo`로 감싼 리스너에
@@ -486,6 +497,7 @@ impl Member {
                 janitor,
                 backups,
                 telemetry,
+                audit,
                 recovery,
                 pools,
                 overlay,
