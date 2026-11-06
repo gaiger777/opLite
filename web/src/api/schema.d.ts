@@ -58,6 +58,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/auth/realms": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 로그인할 수 있는 영역. 로그인 전에 읽는다. `local`이 먼저, 나머지는 이름 순이다. */
+        get: operations["list_login_realms"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/whoami": {
         parameters: {
             query?: never;
@@ -383,6 +400,43 @@ export interface paths {
          */
         post: operations["upgrade_node"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/realms": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_realms"];
+        put?: never;
+        /** 이름은 리소스 이름 규칙이고 `local`은 쓸 수 없다. 나쁜 값은 400 `invalid_request`. */
+        post: operations["create_realm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/realms/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_realm"];
+        /**
+         * 영역을 통째로 바꾼다(`bind_password` 규칙은 [`RealmRequest`]). `If-Match`가 없으면 읽은
+         *     revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다.
+         */
+        put: operations["update_realm"];
+        post?: never;
+        delete: operations["delete_realm"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1612,6 +1666,11 @@ export interface components {
         Fencing: "watchdog" | "process";
         /** @enum {string} */
         Firmware: "bios" | "uefi";
+        /** @description 이 그룹(보통 DN)에 든 사용자는 이 역할 */
+        GroupRole: {
+            group: string;
+            role: components["schemas"]["Role"];
+        };
         /**
          * Format: binary
          * @description 업로드 본문의 문서용 스키마: 바이너리 파일
@@ -1779,11 +1838,61 @@ export interface components {
              */
             weekly: number;
         };
+        /** @description LDAP 디렉터리. `ldap://`는 StartTLS를 반드시 쓰고, `ldaps://`는 처음부터 TLS다. */
+        LdapRealm: {
+            /** @description 사용자를 찾을 기준 DN(subtree) */
+            base_dn: string;
+            /** @description 사용자를 찾을 때 바인드할 서비스 계정. 없으면 익명으로 찾는다. */
+            bind_dn?: string;
+            /** @description 서비스 계정 비밀번호. API는 내보내지 않는다. */
+            bind_password?: string;
+            /** @description 서버 인증서를 확인할 CA(PEM). 없으면 시스템 루트 */
+            ca_pem?: string;
+            /** @description 그룹 DN을 담은 사용자 항목의 속성 */
+            group_attr?: string;
+            /**
+             * Format: int64
+             * @description 연결과 작업마다의 시간 제한(초)
+             */
+            timeout_secs?: number;
+            /** @description `ldap://host[:port]` 또는 `ldaps://host[:port]` */
+            url: string;
+            /** @description 사용자 찾기 필터. `{username}`이 이스케이프된 로그인 이름으로 바뀐다. */
+            user_filter?: string;
+        };
+        /** @description [`LdapRealm`]에서 `bind_password`를 뺀 것 */
+        LdapRealmView: {
+            base_dn: string;
+            bind_dn?: string;
+            ca_pem?: string;
+            group_attr: string;
+            /** @description 서비스 계정 비밀번호가 저장되어 있는지 */
+            has_bind_password: boolean;
+            /** Format: int64 */
+            timeout_secs: number;
+            url: string;
+            user_filter: string;
+        };
         /**
          * @description 구독 수준
          * @enum {string}
          */
         Level: "standard" | "premium";
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_RealmView: {
+            items: {
+                backend: components["schemas"]["RealmBackendView"];
+                display?: string;
+                /** Format: uuid */
+                id: string;
+                name: string;
+                /** Format: int64 */
+                revision: number;
+                roles: components["schemas"]["RoleMapping"];
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_Resource_BackupJobSpec_BackupJobStatus: {
             items: {
@@ -2630,6 +2739,52 @@ export interface components {
         };
         /** @enum {string} */
         Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
+        /** @description 영역이 사용자를 확인하는 방법 */
+        RealmBackend: components["schemas"]["LdapRealm"] & {
+            /** @enum {string} */
+            kind: "ldap";
+        };
+        RealmBackendView: components["schemas"]["LdapRealmView"] & {
+            /** @enum {string} */
+            kind: "ldap";
+        };
+        /**
+         * @description 로그인 화면에 보일 영역의 종류
+         * @enum {string}
+         */
+        RealmKind: "local" | "ldap";
+        /**
+         * @description 영역 만들기·바꾸기 본문. 바꾸기는 통째로 바꾸되, `backend.bind_password`를 빼면 저장된 값을
+         *     그대로 두고(`url`·`bind_dn`·`ca_pem`이 모두 그대로일 때만 — 하나라도 바뀌면 400), 빈 글이면
+         *     지운다. `bind_dn`에는 비밀번호가 있어야 한다(익명 검색은 둘 다 없을 때). `url`·`bind_dn`은 앞뒤
+         *     공백을 떼고 `ca_pem`은 CRLF를 LF로 바꿔 앞뒤 공백을 뗀 뒤 비교·저장한다.
+         */
+        RealmRequest: {
+            backend: components["schemas"]["RealmBackend"];
+            /** @description 로그인 화면에 보일 이름 */
+            display?: string;
+            /** @description 만들 때 필요하다. 바꿀 때 주면 지금 이름과 같아야 한다. */
+            name?: string;
+            roles?: components["schemas"]["RoleMapping"];
+        };
+        /** @description 로그인 화면에 보일 영역 */
+        RealmSummary: {
+            /** @description 없으면 null */
+            display: string | null;
+            kind: components["schemas"]["RealmKind"];
+            name: string;
+        };
+        /** @description 응답의 영역. 서비스 계정 비밀번호 대신 있는지만 보인다. */
+        RealmView: {
+            backend: components["schemas"]["RealmBackendView"];
+            display?: string;
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** Format: int64 */
+            revision: number;
+            roles: components["schemas"]["RoleMapping"];
+        };
         ResizeRequest: {
             /**
              * Format: int64
@@ -3177,6 +3332,12 @@ export interface components {
         };
         /** @enum {string} */
         Role: "admin" | "operator" | "viewer";
+        /** @description 그룹에서 역할 정하기 */
+        RoleMapping: {
+            /** @description 맞는 그룹이 없을 때의 역할. 없으면 로그인을 거절한다. */
+            default?: components["schemas"]["Role"];
+            groups?: components["schemas"]["GroupRole"][];
+        };
         Rule: {
             action: components["schemas"]["Action"];
             direction: components["schemas"]["Direction"];
@@ -3897,6 +4058,33 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_login_realms: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RealmSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
         };
     };
@@ -4655,6 +4843,161 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_realms: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_RealmView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_realm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RealmRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RealmView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_realm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RealmView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_realm: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RealmRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RealmView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_realm: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {

@@ -34,9 +34,13 @@ it("mirrors the server roles", () => {
 it("keeps accounts to admins", () => {
   expect(can("admin", "read", "user")).toBe(true);
   expect(can("admin", "write", "join-token")).toBe(true);
+  expect(can("admin", "write", "realm")).toBe(true);
   for (const role of ["operator", "viewer"] as const) {
     expect(can(role, "read", "user")).toBe(false);
     expect(can(role, "read", "api-token")).toBe(false);
     expect(can(role, "write", "join-token")).toBe(false);
+    // 인증 영역도 계정 종류다(서비스 계정 비밀번호를 다룬다).
+    expect(can(role, "read", "realm")).toBe(false);
+    expect(can(role, "write", "realm")).toBe(false);
   }
 });

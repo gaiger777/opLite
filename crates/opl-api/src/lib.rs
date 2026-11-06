@@ -15,6 +15,7 @@ mod ha;
 mod incoming;
 mod janitor;
 pub mod limit;
+pub mod realms;
 pub mod resources;
 mod schedule;
 pub mod scheduler;
@@ -87,10 +88,17 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(users::login))
         .routes(routes!(users::logout))
         .routes(routes!(users::whoami))
+        .routes(routes!(realms::list_login_realms))
         .routes(routes!(users::list_users, users::create_user))
         .routes(routes!(users::update_user, users::delete_user))
         .routes(routes!(users::list_tokens, users::create_token))
         .routes(routes!(users::delete_token))
+        .routes(routes!(realms::list_realms, realms::create_realm))
+        .routes(routes!(
+            realms::get_realm,
+            realms::update_realm,
+            realms::delete_realm
+        ))
         .routes(routes!(r::list_nodes))
         .routes(routes!(r::get_node, r::update_node, cluster::delete_node))
         .routes(routes!(updates::refresh_updates))

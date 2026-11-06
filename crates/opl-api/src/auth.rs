@@ -51,7 +51,10 @@ pub struct RoleAuthorizer;
 
 impl Authorizer for RoleAuthorizer {
     fn check(&self, principal: &Principal, action: Action, kind: Kind) -> bool {
-        let account = matches!(kind, Kind::User | Kind::ApiToken | Kind::JoinToken);
+        let account = matches!(
+            kind,
+            Kind::User | Kind::ApiToken | Kind::JoinToken | Kind::Realm
+        );
         match principal.role {
             Role::Admin => true,
             Role::Operator => match action {
@@ -299,6 +302,7 @@ mod tests {
         assert!(a.check(&viewer, Action::Read, Kind::Vm));
         assert!(!a.check(&viewer, Action::Operate, Kind::Vm));
         assert!(!a.check(&viewer, Action::Read, Kind::User));
+        assert!(!a.check(&viewer, Action::Read, Kind::Realm));
 
         let op = principal(Role::Operator);
         assert!(a.check(&op, Action::Write, Kind::Vm));
@@ -310,9 +314,13 @@ mod tests {
         assert!(!a.check(&op, Action::Write, Kind::StoragePool));
         assert!(!a.check(&op, Action::Write, Kind::Node));
         assert!(!a.check(&op, Action::Read, Kind::ApiToken));
+        assert!(!a.check(&op, Action::Read, Kind::Realm));
+        assert!(!a.check(&op, Action::Write, Kind::Realm));
 
         let admin = principal(Role::Admin);
         assert!(a.check(&admin, Action::Write, Kind::User));
+        assert!(a.check(&admin, Action::Read, Kind::Realm));
+        assert!(a.check(&admin, Action::Write, Kind::Realm));
     }
 
     #[test]

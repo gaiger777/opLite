@@ -35,22 +35,26 @@ pub struct RealmStatus {}
 
 /// 영역이 사용자를 확인하는 방법
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RealmBackend {
     Ldap(LdapRealm),
 }
 
 /// LDAP 디렉터리. `ldap://`는 StartTLS를 반드시 쓰고, `ldaps://`는 처음부터 TLS다.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct LdapRealm {
     /// `ldap://host[:port]` 또는 `ldaps://host[:port]`
     pub url: String,
     /// 사용자를 찾을 때 바인드할 서비스 계정. 없으면 익명으로 찾는다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub bind_dn: Option<String>,
     /// 서비스 계정 비밀번호. API는 내보내지 않는다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub bind_password: Option<String>,
     /// 사용자를 찾을 기준 DN(subtree)
     pub base_dn: String,
@@ -62,10 +66,27 @@ pub struct LdapRealm {
     pub group_attr: String,
     /// 서버 인증서를 확인할 CA(PEM). 없으면 시스템 루트
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub ca_pem: Option<String>,
     /// 연결과 작업마다의 시간 제한(초)
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+// 서비스 계정 비밀번호가 로그에 나가지 않게 가린다.
+impl std::fmt::Debug for LdapRealm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LdapRealm")
+            .field("url", &self.url)
+            .field("bind_dn", &self.bind_dn)
+            .field("bind_password", &self.bind_password.as_ref().map(|_| "***"))
+            .field("base_dn", &self.base_dn)
+            .field("user_filter", &self.user_filter)
+            .field("group_attr", &self.group_attr)
+            .field("ca_pem", &self.ca_pem)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 /// 사용자 찾기 필터의 기본값
@@ -89,17 +110,20 @@ fn default_timeout_secs() -> u64 {
 
 /// 그룹에서 역할 정하기
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RoleMapping {
     #[serde(default)]
     pub groups: Vec<GroupRole>,
     /// 맞는 그룹이 없을 때의 역할. 없으면 로그인을 거절한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub default: Option<Role>,
 }
 
 /// 이 그룹(보통 DN)에 든 사용자는 이 역할
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GroupRole {
     pub group: String,
@@ -535,6 +559,23 @@ mod tests {
             m.role_for(&groups(&["cn=viewers,dc=x"])),
             Some(Role::Viewer)
         );
+    }
+
+    #[test]
+    fn debug_hides_the_bind_password() {
+        let l = LdapRealm {
+            bind_dn: Some("cn=svc".into()),
+            bind_password: Some("s3cret".into()),
+            ..ldap()
+        };
+        let shown = format!("{l:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains(r#"bind_password: Some("***")"#), "{shown}");
+        assert!(shown.contains(r#"bind_dn: Some("cn=svc")"#), "{shown}");
+        assert!(shown.contains("timeout_secs: 10"), "{shown}");
+        let shown = format!("{:?}", spec(l));
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(format!("{:?}", ldap()).contains("bind_password: None"));
     }
 
     #[test]

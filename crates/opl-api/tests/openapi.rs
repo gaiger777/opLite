@@ -13,6 +13,9 @@ async fn openapi_document_is_served_without_login() {
     let paths = doc["paths"].as_object().unwrap();
     for path in [
         "/auth/login",
+        "/auth/realms",
+        "/realms",
+        "/realms/{key}",
         "/version",
         "/settings",
         "/subscription",
@@ -72,6 +75,14 @@ async fn openapi_document_is_served_without_login() {
         doc["paths"]["/settings"]["patch"]["requestBody"]["content"]["application/json"]["schema"]
             ["$ref"],
         "#/components/schemas/SettingsPatch"
+    );
+    // 영역 응답에는 서비스 계정 비밀번호가 없고 있는지만 보인다. 영역 목록은 로그인 전에 읽는다.
+    let ldap_view = &doc["components"]["schemas"]["LdapRealmView"]["properties"];
+    assert!(ldap_view["bind_password"].is_null(), "{ldap_view}");
+    assert!(ldap_view["has_bind_password"].is_object(), "{ldap_view}");
+    assert_eq!(
+        doc["paths"]["/auth/realms"]["get"]["security"],
+        serde_json::json!([{}])
     );
     // 구독 키 문자열은 설정 스키마에 없고, 상태만 따로 보인다.
     assert!(
