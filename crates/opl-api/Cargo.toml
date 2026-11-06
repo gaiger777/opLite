@@ -10,6 +10,9 @@ repository.workspace = true
 [features]
 # qemu-img로 볼륨을 만드는 API 테스트 (macOS: brew install qemu, Debian/Ubuntu: apt install qemu-utils)
 storage-it = []
+# 실제 OpenLDAP(slapd)로 LDAP 영역을 확인하는 테스트. 디렉터리는 .github/scripts/ldap-setup.sh가 만들고
+# OPL_TEST_LDAP_* 환경 변수로 알린다.
+ldap-it = []
 
 [dependencies]
 argon2.workspace = true

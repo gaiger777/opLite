@@ -101,6 +101,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+    /// 인증 영역(admin만): 바깥 LDAP 디렉터리로 로그인하게 한다.
+    Realm {
+        #[command(subcommand)]
+        cmd: RealmCmd,
+    },
     /// 클러스터 설정(업데이트 채널)
     Settings {
         #[command(subcommand)]
@@ -124,6 +129,9 @@ enum Cmd {
 struct LoginArgs {
     #[arg(long, default_value = "admin")]
     user: String,
+    /// 인증 영역. `local`이 아니면 그 영역의 사용자 이름(`@영역` 없이)으로 로그인한다.
+    #[arg(long, default_value = "local")]
+    realm: String,
     /// 비밀번호가 든 파일. 없으면 터미널에서 묻는다.
     #[arg(long)]
     password_file: Option<PathBuf>,
@@ -1877,7 +1885,7 @@ async fn audit(
     Ok(())
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum Role {
     Admin,
     Operator,
@@ -1918,6 +1926,412 @@ enum TokenCmd {
     Delete {
         token: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RealmCmd {
+    List,
+    /// 영역 설정을 보인다(서비스 계정 비밀번호는 있는지만).
+    Show {
+        name: String,
+    },
+    /// LDAP 영역을 만든다.
+    AddLdap(RealmAdd),
+    /// LDAP 영역을 바꾼다. 준 것만 바꾼다.
+    SetLdap(RealmSet),
+    /// 영역을 지운다. 그 영역 사용자들의 세션과 토큰은 멈춘다.
+    Remove {
+        name: String,
+    },
+    /// 사용자 이름과 비밀번호로 디렉터리를 시험한다(사용자를 만들지 않는다).
+    Test {
+        name: String,
+        /// 영역 안의 사용자 이름(`@영역` 없이)
+        #[arg(long)]
+        user: String,
+        /// 비밀번호가 든 파일(`-`면 표준 입력). 없으면 터미널에서 묻는다.
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Args)]
+struct RealmAdd {
+    name: String,
+    /// `ldap://host[:port]`(StartTLS) 또는 `ldaps://host[:port]`
+    #[arg(long)]
+    url: String,
+    /// 사용자를 찾을 기준 DN
+    #[arg(long)]
+    base_dn: String,
+    #[command(flatten)]
+    ldap: LdapArgs,
+}
+
+#[derive(Args)]
+struct RealmSet {
+    name: String,
+    #[arg(long)]
+    url: Option<String>,
+    #[arg(long)]
+    base_dn: Option<String>,
+    #[command(flatten)]
+    ldap: LdapArgs,
+    /// 저장된 서비스 계정 비밀번호를 지운다. 서비스 계정 DN이 남으면 안 된다(`--clear-bind-dn`).
+    #[arg(long, conflicts_with = "bind_password_file")]
+    clear_bind_password: bool,
+    /// 서비스 계정 DN과 비밀번호를 지운다(익명 검색).
+    #[arg(long, conflicts_with_all = ["bind_dn", "bind_password_file"])]
+    clear_bind_dn: bool,
+    /// CA를 지운다(시스템 루트).
+    #[arg(long, conflicts_with = "ca_file")]
+    clear_ca: bool,
+    /// 기본 역할을 지운다(맞는 그룹이 없으면 로그인 거절).
+    #[arg(long, conflicts_with = "default_role")]
+    clear_default_role: bool,
+    /// 그룹 → 역할 표를 비운다.
+    #[arg(long, conflicts_with = "groups")]
+    clear_groups: bool,
+}
+
+/// `realm add-ldap`과 `set-ldap`의 공통 선택
+#[derive(Args)]
+struct LdapArgs {
+    /// 사용자를 찾을 때 바인드할 서비스 계정. 없으면 익명으로 찾는다.
+    #[arg(long)]
+    bind_dn: Option<String>,
+    /// 서비스 계정 비밀번호가 든 파일(`-`면 표준 입력)
+    #[arg(long)]
+    bind_password_file: Option<PathBuf>,
+    /// 사용자 찾기 필터. `{username}`이 로그인 이름으로 바뀐다.
+    #[arg(long)]
+    user_filter: Option<String>,
+    /// 그룹 DN을 담은 사용자 속성(기본 memberOf)
+    #[arg(long)]
+    group_attr: Option<String>,
+    /// 서버 인증서를 확인할 CA(PEM) 파일. 없으면 시스템 루트
+    #[arg(long)]
+    ca_file: Option<PathBuf>,
+    /// 연결과 작업마다의 시간 제한(초)
+    #[arg(long)]
+    timeout: Option<u64>,
+    /// 로그인 화면에 보일 이름
+    #[arg(long)]
+    display: Option<String>,
+    /// 그룹에 든 사용자의 역할(`<그룹 DN>=<role>`, 여러 번). set-ldap에서 주면 표 전체를 바꾼다.
+    #[arg(long = "group", value_name = "DN=ROLE", value_parser = parse_group_role)]
+    groups: Vec<(String, Role)>,
+    /// 맞는 그룹이 없을 때의 역할. 없으면 그런 사용자의 로그인을 거절한다.
+    #[arg(long, value_enum)]
+    default_role: Option<Role>,
+}
+
+/// `--group`의 `<그룹 DN>=<role>`. DN에 `=`가 있으므로 마지막 `=`에서 나눈다.
+fn parse_group_role(s: &str) -> Result<(String, Role), String> {
+    let (group, role) = s
+        .rsplit_once('=')
+        .ok_or_else(|| format!("invalid group {s:?}: use <group DN>=<role>"))?;
+    let role = Role::from_str(role, true)
+        .map_err(|_| format!("invalid role {role:?} in {s:?}: use admin, operator or viewer"))?;
+    if group.trim().is_empty() {
+        return Err(format!("invalid group {s:?}: use <group DN>=<role>"));
+    }
+    Ok((group.to_string(), role))
+}
+
+/// 파일에서 읽은 영역 값들(서비스 계정 비밀번호, CA)
+#[derive(Default)]
+struct LdapFiles {
+    bind_password: Option<String>,
+    ca_pem: Option<String>,
+}
+
+impl LdapFiles {
+    fn read(args: &LdapArgs) -> anyhow::Result<Self> {
+        Ok(Self {
+            bind_password: args
+                .bind_password_file
+                .as_ref()
+                .map(read_secret_file)
+                .transpose()?,
+            ca_pem: args
+                .ca_file
+                .as_ref()
+                .map(|f| {
+                    std::fs::read_to_string(f)
+                        .with_context(|| format!("cannot read {}", f.display()))
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// 비밀번호 파일(`-`면 표준 입력). 끝의 줄바꿈만 뗀다.
+fn read_secret_file(path: &PathBuf) -> anyhow::Result<String> {
+    if path.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut s)
+            .context("cannot read standard input")?;
+        return Ok(s.trim_end_matches(['\r', '\n']).to_string());
+    }
+    read_password(Some(path), "")
+}
+
+fn group_roles(groups: &[(String, Role)]) -> Value {
+    groups
+        .iter()
+        .map(|(group, role)| json!({ "group": group, "role": value_name(*role) }))
+        .collect()
+}
+
+/// `realm add-ldap`의 `POST /realms` 본문. 주지 않은 선택은 서버 기본값이다.
+fn realm_add_body(args: &RealmAdd, files: LdapFiles) -> Value {
+    let l = &args.ldap;
+    let mut backend = json!({ "kind": "ldap", "url": args.url, "base_dn": args.base_dn });
+    let optional = [
+        ("bind_dn", l.bind_dn.clone().map(Value::from)),
+        ("bind_password", files.bind_password.map(Value::from)),
+        ("user_filter", l.user_filter.clone().map(Value::from)),
+        ("group_attr", l.group_attr.clone().map(Value::from)),
+        ("ca_pem", files.ca_pem.map(Value::from)),
+        ("timeout_secs", l.timeout.map(Value::from)),
+    ];
+    for (key, value) in optional {
+        if let Some(value) = value {
+            backend[key] = value;
+        }
+    }
+    let mut roles = json!({ "groups": group_roles(&l.groups) });
+    if let Some(role) = l.default_role {
+        roles["default"] = json!(value_name(role));
+    }
+    let mut body = json!({ "name": args.name, "backend": backend, "roles": roles });
+    if let Some(display) = &l.display {
+        body["display"] = json!(display);
+    }
+    body
+}
+
+/// `realm set-ldap`의 `PUT /realms/{name}` 본문: 지금 영역(`RealmView`)에 준 것만 바꾼다.
+/// 서비스 계정 비밀번호는 주지 않으면 빼서(서버가 저장된 값을 둔다 — url·bind_dn·CA를 바꾸면
+/// 서버가 400으로 다시 달라고 한다) 보내고, 지울 때는 빈 글이다.
+fn realm_set_body(current: &Value, args: &RealmSet, files: LdapFiles) -> anyhow::Result<Value> {
+    let l = &args.ldap;
+    let mut backend = current["backend"].clone();
+    if let Some(b) = backend.as_object_mut() {
+        b.remove("has_bind_password");
+    }
+    let changes = [
+        ("url", args.url.clone().map(Value::from)),
+        ("base_dn", args.base_dn.clone().map(Value::from)),
+        ("bind_dn", l.bind_dn.clone().map(Value::from)),
+        ("user_filter", l.user_filter.clone().map(Value::from)),
+        ("group_attr", l.group_attr.clone().map(Value::from)),
+        ("ca_pem", files.ca_pem.map(Value::from)),
+        ("timeout_secs", l.timeout.map(Value::from)),
+        (
+            "bind_password",
+            if args.clear_bind_password || args.clear_bind_dn {
+                Some(json!(""))
+            } else {
+                files.bind_password.map(Value::from)
+            },
+        ),
+    ];
+    for (key, value) in changes {
+        if let Some(value) = value {
+            backend[key] = value;
+        }
+    }
+    if let Some(b) = backend.as_object_mut() {
+        if args.clear_bind_dn {
+            b.remove("bind_dn");
+        }
+        if args.clear_ca {
+            b.remove("ca_pem");
+        }
+        // 서비스 계정 DN에는 비밀번호가 있어야 한다.
+        if args.clear_bind_password && b.get("bind_dn").is_some_and(Value::is_string) {
+            anyhow::bail!(
+                "--clear-bind-password needs --clear-bind-dn (or give --bind-password-file)"
+            );
+        }
+    }
+    let mut roles = current["roles"].clone();
+    if !l.groups.is_empty() {
+        roles["groups"] = group_roles(&l.groups);
+    }
+    if args.clear_groups {
+        roles["groups"] = json!([]);
+    }
+    if let Some(role) = l.default_role {
+        roles["default"] = json!(value_name(role));
+    }
+    if args.clear_default_role
+        && let Some(r) = roles.as_object_mut()
+    {
+        r.remove("default");
+    }
+    let mut body = json!({ "backend": backend, "roles": roles });
+    if let Some(display) = l
+        .display
+        .clone()
+        .or_else(|| current["display"].as_str().map(str::to_string))
+    {
+        body["display"] = json!(display);
+    }
+    Ok(body)
+}
+
+/// `realm show`의 `키: 값` 줄
+fn realm_lines(realm: &Value) -> Vec<String> {
+    let b = &realm["backend"];
+    let set = |v: bool| if v { "set" } else { "none" };
+    let mut lines = vec![
+        format!("name: {}", cell(&realm["name"])),
+        format!("display: {}", cell(&realm["display"])),
+        format!("kind: {}", cell(&b["kind"])),
+        format!("url: {}", cell(&b["url"])),
+        format!("base dn: {}", cell(&b["base_dn"])),
+        format!("bind dn: {}", cell(&b["bind_dn"])),
+        format!("bind password: {}", set(b["has_bind_password"] == true)),
+        format!("user filter: {}", cell(&b["user_filter"])),
+        format!("group attribute: {}", cell(&b["group_attr"])),
+        format!(
+            "ca: {}",
+            if b["ca_pem"].is_string() {
+                "custom (PEM)"
+            } else {
+                "system roots"
+            }
+        ),
+        format!("timeout: {}s", cell(&b["timeout_secs"])),
+    ];
+    let groups = realm["roles"]["groups"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if groups.is_empty() {
+        lines.push("groups: none".into());
+    } else {
+        lines.push("groups:".into());
+        for g in &groups {
+            lines.push(format!("  {} = {}", cell(&g["group"]), cell(&g["role"])));
+        }
+    }
+    lines.push(format!(
+        "default role: {}",
+        realm["roles"]["default"].as_str().unwrap_or("none")
+    ));
+    lines
+}
+
+async fn realm(
+    client: &Client,
+    cmd: RealmCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        RealmCmd::List => {
+            let list = client.get("/realms").await?;
+            print_list(
+                out,
+                json_out,
+                &list,
+                &["NAME", "DISPLAY", "KIND", "URL"],
+                |r| {
+                    vec![
+                        cell(&r["name"]),
+                        cell(&r["display"]),
+                        cell(&r["backend"]["kind"]),
+                        cell(&r["backend"]["url"]),
+                    ]
+                },
+            )?;
+        }
+        RealmCmd::Show { name } => {
+            let realm = client.get(&format!("/realms/{name}")).await?;
+            if json_out {
+                print_json(out, &realm)?;
+            } else {
+                for line in realm_lines(&realm) {
+                    writeln!(out, "{line}")?;
+                }
+            }
+        }
+        RealmCmd::AddLdap(args) => {
+            let files = LdapFiles::read(&args.ldap)?;
+            client
+                .post("/realms", &realm_add_body(&args, files))
+                .await?;
+            writeln!(out, "realm {} created", args.name)?;
+        }
+        RealmCmd::SetLdap(args) => {
+            let files = LdapFiles::read(&args.ldap)?;
+            let path = format!("/realms/{}", args.name);
+            let current = client.get(&path).await?;
+            // 읽은 뒤 다른 곳에서 바뀌었으면 412로 멈춘다.
+            let r = client
+                .request(Method::PUT, &path)
+                .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
+                .json(&realm_set_body(&current, &args, files)?);
+            client.send(r).await?;
+            writeln!(out, "realm {} updated", args.name)?;
+        }
+        RealmCmd::Remove { name } => {
+            client.delete(&format!("/realms/{name}")).await?;
+            writeln!(out, "realm {name} removed")?;
+        }
+        RealmCmd::Test {
+            name,
+            user,
+            password_file,
+        } => {
+            let password = match &password_file {
+                Some(f) => read_secret_file(f)?,
+                None => read_password(None, "Password: ")?,
+            };
+            let result = client
+                .post(
+                    &format!("/realms/{name}/actions/test"),
+                    &json!({ "username": user, "password": password }),
+                )
+                .await?;
+            let steps = result["steps"].as_array().cloned().unwrap_or_default();
+            if json_out {
+                print_json(out, &result)?;
+            } else {
+                let rows: Vec<Vec<String>> = steps
+                    .iter()
+                    .map(|s| {
+                        let ok = if s["ok"] == true { "ok" } else { "failed" };
+                        vec![cell(&s["name"]), ok.into(), cell(&s["message"])]
+                    })
+                    .collect();
+                table(out, &["STEP", "RESULT", "MESSAGE"], &rows)?;
+                writeln!(out, "dn: {}", cell(&result["dn"]))?;
+                let groups: Vec<String> = result["groups"]
+                    .as_array()
+                    .map(|a| a.iter().map(cell).collect())
+                    .unwrap_or_default();
+                writeln!(
+                    out,
+                    "groups: {}",
+                    if groups.is_empty() {
+                        "-".into()
+                    } else {
+                        groups.join(", ")
+                    }
+                )?;
+                writeln!(out, "role: {}", result["role"].as_str().unwrap_or("none"))?;
+            }
+            if let Some(failed) = steps.iter().find(|s| s["ok"] != true) {
+                bail!("realm {name}: the {} step failed", cell(&failed["name"]));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `1024`, `512M`, `10G`처럼 쓴다.
@@ -2010,7 +2424,7 @@ where
             same_server.then(|| config.ca_pem.clone()).flatten(),
         )
         .await?;
-        let token = login(&server, args, ca_pem.clone()).await?;
+        let (token, name) = login(&server, args, ca_pem.clone()).await?;
         let previous = config.token.take().zip(config.server.take());
         config.server = Some(server.clone());
         config.token = Some(token.clone());
@@ -2024,7 +2438,7 @@ where
             let client = Client::new(&server, Some(token), ca_pem)?;
             let _ = client.delete(&format!("/tokens/{id}")).await;
         }
-        writeln!(out, "logged in to {server} as {}", args.user)?;
+        writeln!(out, "logged in to {server} as {name}")?;
         return Ok(());
     }
 
@@ -2282,6 +2696,7 @@ where
                 writeln!(out, "token {token} deleted")?;
             }
         },
+        Cmd::Realm { cmd } => realm(&client, cmd, json_out, out).await?,
         Cmd::Settings { cmd } => settings(&client, cmd, json_out, out).await?,
         Cmd::Subscription { cmd } => subscription(&client, cmd, json_out, out).await?,
         Cmd::Telemetry { cmd } => telemetry(&client, cmd, json_out, out).await?,
@@ -3861,14 +4276,23 @@ async fn server_ca(
     }
 }
 
-/// 세션으로 로그인해 이 CLI가 쓸 API 토큰을 만든다. 세션은 바로 닫는다.
-async fn login(server: &str, args: &LoginArgs, ca_pem: Option<String>) -> anyhow::Result<String> {
+/// 세션으로 로그인해 이 CLI가 쓸 API 토큰을 만든다. 세션은 바로 닫는다. 토큰과 서버가 정한
+/// 사용자 이름(영역 사용자는 `<사용자>@<영역>`)을 돌려준다.
+async fn login(
+    server: &str,
+    args: &LoginArgs,
+    ca_pem: Option<String>,
+) -> anyhow::Result<(String, String)> {
     let password = read_password(args.password_file.as_ref(), "Password: ")?;
     let anon = Client::new(server, None, ca_pem)?;
+    let mut body = json!({ "username": args.user, "password": password });
+    if args.realm != opl_types::realm::LOCAL_REALM {
+        body["realm"] = json!(args.realm);
+    }
     let resp = anon
         .http
         .post(anon.url("/auth/login"))
-        .json(&json!({ "username": args.user, "password": password }))
+        .json(&body)
         .send()
         .await
         .with_context(|| format!("cannot reach {server}"))?;
@@ -3883,6 +4307,8 @@ async fn login(server: &str, args: &LoginArgs, ca_pem: Option<String>) -> anyhow
         .and_then(|v| v.split(';').next())
         .context("server did not return a session")?
         .to_string();
+    let user: Value = resp.json().await.unwrap_or_default();
+    let user = user["name"].as_str().unwrap_or(&args.user).to_string();
     let name = format!("oplctl-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let with_cookie = |r: reqwest::RequestBuilder| r.header(reqwest::header::COOKIE, &cookie);
     let created = anon
@@ -3891,10 +4317,11 @@ async fn login(server: &str, args: &LoginArgs, ca_pem: Option<String>) -> anyhow
     let _ = anon
         .send(with_cookie(anon.request(Method::POST, "/auth/logout")))
         .await;
-    created["secret"]
+    let token = created["secret"]
         .as_str()
         .map(str::to_string)
-        .context("server did not return a token")
+        .context("server did not return a token")?;
+    Ok((token, user))
 }
 
 #[cfg(test)]
@@ -7087,6 +7514,588 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             "a relative --since cannot be combined with --until; give a time"
         );
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// `fake_api_bodies`가 남긴 요청
+    #[derive(Debug)]
+    struct SeenRequest {
+        line: String,
+        if_match: Option<String>,
+        body: Value,
+    }
+
+    /// `fake_api`와 같고 요청의 `if-match`와 JSON 본문도 남긴다. 응답에는 세션 쿠키를 붙인다.
+    async fn fake_api_bodies(
+        reply: fn(&str) -> Value,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = vec![0; 4096];
+                // 머리와 content-length만큼의 본문을 다 읽는다.
+                let (head, body) = loop {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "connection closed mid-request");
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break (head.to_string(), body.to_string());
+                    }
+                };
+                let line = head.lines().next().unwrap_or("").to_string();
+                let path = line.split(' ').nth(1).unwrap_or("").to_string();
+                let if_match = head.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("if-match")
+                        .then(|| v.trim().to_string())
+                });
+                log.lock().unwrap().push(SeenRequest {
+                    line,
+                    if_match,
+                    body: serde_json::from_str(&body).unwrap_or(Value::Null),
+                });
+                let body = reply(&path).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nset-cookie: opl_session=s1; Path=/\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        (base, seen)
+    }
+
+    fn realm_cmd(args: &[&str]) -> Result<RealmCmd, clap::Error> {
+        let mut all = vec!["oplctl", "realm"];
+        all.extend_from_slice(args);
+        match Cli::try_parse_from(all)?.cmd {
+            Cmd::Realm { cmd } => Ok(cmd),
+            _ => unreachable!(),
+        }
+    }
+
+    /// `realm add-ldap`은 url·base DN이 필요하고, `--group`은 마지막 `=`에서 나눈다.
+    #[test]
+    fn parses_realm_commands() {
+        let RealmCmd::AddLdap(add) = realm_cmd(&[
+            "add-ldap",
+            "corp",
+            "--url",
+            "ldaps://ldap.example.com",
+            "--base-dn",
+            "dc=example,dc=com",
+            "--group",
+            "cn=admins,dc=example,dc=com=admin",
+            "--group",
+            "cn=staff,dc=example,dc=com=Viewer",
+        ])
+        .unwrap() else {
+            panic!("add-ldap")
+        };
+        assert_eq!(add.ldap.groups.len(), 2);
+        assert_eq!(add.ldap.groups[0].0, "cn=admins,dc=example,dc=com");
+        assert!(matches!(add.ldap.groups[0].1, Role::Admin));
+        assert!(matches!(add.ldap.groups[1].1, Role::Viewer));
+
+        assert_eq!(
+            parse_group_role("cn=a,dc=x=root").unwrap_err(),
+            "invalid role \"root\" in \"cn=a,dc=x=root\": use admin, operator or viewer"
+        );
+        assert!(parse_group_role("admins").is_err());
+        assert!(parse_group_role("=admin").is_err());
+
+        for args in [
+            // url·base DN이 없다.
+            &["add-ldap", "corp", "--url", "ldaps://h"][..],
+            &["add-ldap", "corp", "--base-dn", "dc=x"][..],
+            // 비밀번호를 주면서 지울 수는 없다.
+            &[
+                "set-ldap",
+                "corp",
+                "--clear-bind-password",
+                "--bind-password-file",
+                "f",
+            ][..],
+            // 지우기와 설정은 함께 줄 수 없다.
+            &["set-ldap", "corp", "--clear-bind-dn", "--bind-dn", "cn=x"][..],
+            &[
+                "set-ldap",
+                "corp",
+                "--clear-bind-dn",
+                "--bind-password-file",
+                "f",
+            ][..],
+            &["set-ldap", "corp", "--clear-ca", "--ca-file", "f"][..],
+            &[
+                "set-ldap",
+                "corp",
+                "--clear-default-role",
+                "--default-role",
+                "viewer",
+            ][..],
+            &[
+                "set-ldap",
+                "corp",
+                "--clear-groups",
+                "--group",
+                "cn=x=admin",
+            ][..],
+            &["test", "corp"][..],
+        ] {
+            assert!(realm_cmd(args).is_err(), "{args:?}");
+        }
+        let RealmCmd::Test { user, .. } = realm_cmd(&["test", "corp", "--user", "alice"]).unwrap()
+        else {
+            panic!("test")
+        };
+        assert_eq!(user, "alice");
+    }
+
+    /// `add-ldap`의 본문은 준 것만 담는다(나머지는 서버 기본값).
+    #[test]
+    fn realm_add_body_sends_only_what_is_given() {
+        let RealmCmd::AddLdap(add) = realm_cmd(&[
+            "add-ldap",
+            "corp",
+            "--url",
+            "ldap://ldap.example.com",
+            "--base-dn",
+            "dc=example,dc=com",
+        ])
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            realm_add_body(&add, LdapFiles::default()),
+            json!({
+                "name": "corp",
+                "backend": { "kind": "ldap", "url": "ldap://ldap.example.com", "base_dn": "dc=example,dc=com" },
+                "roles": { "groups": [] }
+            })
+        );
+
+        let RealmCmd::AddLdap(add) = realm_cmd(&[
+            "add-ldap",
+            "corp",
+            "--url",
+            "ldaps://ldap.example.com",
+            "--base-dn",
+            "dc=example,dc=com",
+            "--bind-dn",
+            "cn=svc,dc=example,dc=com",
+            "--user-filter",
+            "(sAMAccountName={username})",
+            "--group-attr",
+            "isMemberOf",
+            "--timeout",
+            "5",
+            "--display",
+            "Corp",
+            "--group",
+            "cn=ops,dc=example,dc=com=operator",
+            "--default-role",
+            "viewer",
+        ])
+        .unwrap() else {
+            unreachable!()
+        };
+        let files = LdapFiles {
+            bind_password: Some("svc-pw".into()),
+            ca_pem: Some("PEM".into()),
+        };
+        assert_eq!(
+            realm_add_body(&add, files),
+            json!({
+                "name": "corp",
+                "display": "Corp",
+                "backend": {
+                    "kind": "ldap", "url": "ldaps://ldap.example.com", "base_dn": "dc=example,dc=com",
+                    "bind_dn": "cn=svc,dc=example,dc=com", "bind_password": "svc-pw",
+                    "user_filter": "(sAMAccountName={username})", "group_attr": "isMemberOf",
+                    "ca_pem": "PEM", "timeout_secs": 5
+                },
+                "roles": {
+                    "groups": [{ "group": "cn=ops,dc=example,dc=com", "role": "operator" }],
+                    "default": "viewer"
+                }
+            })
+        );
+    }
+
+    fn sample_realm() -> Value {
+        json!({
+            "id": "019a0000-0000-7000-8000-000000000001", "name": "corp", "revision": 4,
+            "display": "Corp",
+            "backend": {
+                "kind": "ldap", "url": "ldaps://ldap.example.com", "bind_dn": "cn=svc,dc=example,dc=com",
+                "base_dn": "dc=example,dc=com", "user_filter": "(uid={username})",
+                "group_attr": "memberOf", "timeout_secs": 10, "has_bind_password": true
+            },
+            "roles": {
+                "groups": [{ "group": "cn=admins,dc=example,dc=com", "role": "admin" }],
+                "default": "viewer"
+            }
+        })
+    }
+
+    /// `set-ldap`은 지금 영역에 준 것만 바꾼다. 비밀번호는 주지 않으면 빼고(서버가 둔다),
+    /// `--clear-bind-password`면 빈 글이다. `--group`을 주면 표 전체를 바꾼다.
+    #[test]
+    fn realm_set_body_changes_only_what_is_given() {
+        let RealmCmd::SetLdap(set) = realm_cmd(&["set-ldap", "corp", "--timeout", "3"]).unwrap()
+        else {
+            unreachable!()
+        };
+        let kept = json!({
+            "display": "Corp",
+            "backend": {
+                "kind": "ldap", "url": "ldaps://ldap.example.com", "bind_dn": "cn=svc,dc=example,dc=com",
+                "base_dn": "dc=example,dc=com", "user_filter": "(uid={username})",
+                "group_attr": "memberOf", "timeout_secs": 3
+            },
+            "roles": {
+                "groups": [{ "group": "cn=admins,dc=example,dc=com", "role": "admin" }],
+                "default": "viewer"
+            }
+        });
+        assert_eq!(
+            realm_set_body(&sample_realm(), &set, LdapFiles::default()).unwrap(),
+            kept
+        );
+
+        let RealmCmd::SetLdap(set) = realm_cmd(&[
+            "set-ldap",
+            "corp",
+            "--url",
+            "ldap://other.example.com",
+            "--clear-bind-dn",
+            "--clear-ca",
+            "--group",
+            "cn=ops,dc=example,dc=com=operator",
+            "--default-role",
+            "admin",
+            "--display",
+            "Corporate",
+        ])
+        .unwrap() else {
+            unreachable!()
+        };
+        let mut with_ca = sample_realm();
+        with_ca["backend"]["ca_pem"] = json!("PEM");
+        let body = realm_set_body(&with_ca, &set, LdapFiles::default()).unwrap();
+        assert_eq!(body["display"], "Corporate");
+        assert_eq!(body["backend"]["url"], "ldap://other.example.com");
+        // --clear-bind-dn은 저장된 비밀번호도 지운다.
+        assert_eq!(body["backend"]["bind_password"], "");
+        assert!(body["backend"].get("bind_dn").is_none(), "{body}");
+        assert!(body["backend"].get("ca_pem").is_none(), "{body}");
+        assert_eq!(
+            body["roles"],
+            json!({
+                "groups": [{ "group": "cn=ops,dc=example,dc=com", "role": "operator" }],
+                "default": "admin"
+            })
+        );
+
+        // 새 비밀번호와 CA
+        let RealmCmd::SetLdap(set) = realm_cmd(&["set-ldap", "corp"]).unwrap() else {
+            unreachable!()
+        };
+        let files = LdapFiles {
+            bind_password: Some("new-pw".into()),
+            ca_pem: Some("PEM".into()),
+        };
+        let body = realm_set_body(&sample_realm(), &set, files).unwrap();
+        assert_eq!(body["backend"]["bind_password"], "new-pw");
+        assert_eq!(body["backend"]["ca_pem"], "PEM");
+
+        // 그룹 표와 기본 역할 지우기
+        let RealmCmd::SetLdap(set) =
+            realm_cmd(&["set-ldap", "corp", "--clear-groups", "--clear-default-role"]).unwrap()
+        else {
+            unreachable!()
+        };
+        let body = realm_set_body(&sample_realm(), &set, LdapFiles::default()).unwrap();
+        assert_eq!(body["roles"], json!({ "groups": [] }));
+
+        // 서비스 계정 DN이 남는데 비밀번호만 지울 수는 없다(새 DN을 줘도).
+        for args in [
+            &["set-ldap", "corp", "--clear-bind-password"][..],
+            &[
+                "set-ldap",
+                "corp",
+                "--clear-bind-password",
+                "--bind-dn",
+                "cn=other",
+            ][..],
+        ] {
+            let RealmCmd::SetLdap(set) = realm_cmd(args).unwrap() else {
+                unreachable!()
+            };
+            let e = realm_set_body(&sample_realm(), &set, LdapFiles::default()).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "--clear-bind-password needs --clear-bind-dn (or give --bind-password-file)"
+            );
+        }
+        // DN이 없는 영역이나 DN도 지우면 된다.
+        let mut anon = sample_realm();
+        anon["backend"].as_object_mut().unwrap().remove("bind_dn");
+        let RealmCmd::SetLdap(set) =
+            realm_cmd(&["set-ldap", "corp", "--clear-bind-password"]).unwrap()
+        else {
+            unreachable!()
+        };
+        let body = realm_set_body(&anon, &set, LdapFiles::default()).unwrap();
+        assert_eq!(body["backend"]["bind_password"], "");
+        let RealmCmd::SetLdap(set) = realm_cmd(&[
+            "set-ldap",
+            "corp",
+            "--clear-bind-password",
+            "--clear-bind-dn",
+        ])
+        .unwrap() else {
+            unreachable!()
+        };
+        let body = realm_set_body(&sample_realm(), &set, LdapFiles::default()).unwrap();
+        assert!(body["backend"].get("bind_dn").is_none(), "{body}");
+    }
+
+    /// url·bind_dn·CA를 바꾸면서 비밀번호를 주지 않으면 서버의 400을 그대로 보인다.
+    #[tokio::test]
+    async fn realm_set_shows_the_server_refusal() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (client, seen) = fake_api_status(move |_| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (200, sample_realm())
+            } else {
+                (
+                    400,
+                    json!({
+                        "code": "invalid_request",
+                        "message": "bind_password must be given again when url, bind_dn or ca_pem changes"
+                    }),
+                )
+            }
+        })
+        .await;
+        let e = realm(
+            &client,
+            realm_cmd(&["set-ldap", "corp", "--url", "ldaps://other.example.com"]).unwrap(),
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("bind_password must be given again when url, bind_dn or ca_pem changes"),
+            "{e}"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/realms/corp HTTP/1.1",
+                "PUT /api/v1/realms/corp HTTP/1.1"
+            ]
+        );
+    }
+
+    #[test]
+    fn realm_show_lines() {
+        assert_eq!(
+            realm_lines(&sample_realm()).join("\n"),
+            "name: corp\n\
+             display: Corp\n\
+             kind: ldap\n\
+             url: ldaps://ldap.example.com\n\
+             base dn: dc=example,dc=com\n\
+             bind dn: cn=svc,dc=example,dc=com\n\
+             bind password: set\n\
+             user filter: (uid={username})\n\
+             group attribute: memberOf\n\
+             ca: system roots\n\
+             timeout: 10s\n\
+             groups:\n  cn=admins,dc=example,dc=com = admin\n\
+             default role: viewer"
+        );
+        let mut bare = sample_realm();
+        bare["backend"]["has_bind_password"] = json!(false);
+        bare["backend"]["ca_pem"] = json!("PEM");
+        bare["roles"] = json!({ "groups": [] });
+        let lines = realm_lines(&bare);
+        for line in [
+            "bind password: none",
+            "ca: custom (PEM)",
+            "groups: none",
+            "default role: none",
+        ] {
+            assert!(lines.contains(&line.to_string()), "{line}: {lines:?}");
+        }
+    }
+
+    /// 영역 명령이 부르는 API: 파일의 비밀번호·CA는 본문에, `set-ldap`은 읽은 revision을
+    /// If-Match로, `test`는 단계 표를 보이고 실패한 단계가 있으면 오류다.
+    #[tokio::test]
+    async fn realm_commands_call_the_api() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/realms" => json!({ "revision": 7, "items": [sample_realm()] }),
+            "/api/v1/realms/corp/actions/test" => json!({
+                "steps": [
+                    { "name": "connect", "ok": true, "message": "connected to ldaps://ldap.example.com" },
+                    { "name": "service_bind", "ok": true, "message": "bound as cn=svc,dc=example,dc=com" },
+                    { "name": "search", "ok": true, "message": "found uid=alice,dc=example,dc=com" },
+                    { "name": "user_bind", "ok": true, "message": "the password is correct" },
+                    { "name": "groups", "ok": true, "message": "2 groups" }
+                ],
+                "dn": "uid=alice,dc=example,dc=com",
+                "groups": ["cn=admins,dc=example,dc=com", "cn=staff,dc=example,dc=com"],
+                "role": "admin"
+            }),
+            "/api/v1/realms/broken/actions/test" => json!({
+                "steps": [{ "name": "connect", "ok": false, "message": "connection refused" }],
+                "dn": null, "groups": [], "role": null
+            }),
+            _ => sample_realm(),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("pw");
+        std::fs::write(&secret, "svc-pw\n").unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, "-----BEGIN CERTIFICATE-----\nX\n").unwrap();
+        let (secret, ca) = (secret.to_str().unwrap(), ca.to_str().unwrap());
+
+        let mut out = Vec::new();
+        for args in [
+            &["list"][..],
+            &[
+                "add-ldap",
+                "corp",
+                "--url",
+                "ldaps://ldap.example.com",
+                "--base-dn",
+                "dc=example,dc=com",
+                "--bind-dn",
+                "cn=svc,dc=example,dc=com",
+                "--bind-password-file",
+                secret,
+                "--ca-file",
+                ca,
+            ][..],
+            &["set-ldap", "corp", "--bind-password-file", secret][..],
+            &["remove", "corp"][..],
+            &["test", "corp", "--user", "alice", "--password-file", secret][..],
+        ] {
+            realm(&client, realm_cmd(args).unwrap(), false, &mut out)
+                .await
+                .unwrap();
+        }
+        let e = realm(
+            &client,
+            realm_cmd(&["test", "broken", "--user", "a", "--password-file", secret]).unwrap(),
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.to_string(), "realm broken: the connect step failed");
+
+        let seen = seen.lock().unwrap();
+        let lines: Vec<&str> = seen.iter().map(|r| r.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "GET /api/v1/realms HTTP/1.1",
+                "POST /api/v1/realms HTTP/1.1",
+                "GET /api/v1/realms/corp HTTP/1.1",
+                "PUT /api/v1/realms/corp HTTP/1.1",
+                "DELETE /api/v1/realms/corp HTTP/1.1",
+                "POST /api/v1/realms/corp/actions/test HTTP/1.1",
+                "POST /api/v1/realms/broken/actions/test HTTP/1.1",
+            ]
+        );
+        assert_eq!(seen[1].body["backend"]["bind_password"], "svc-pw");
+        assert_eq!(
+            seen[1].body["backend"]["ca_pem"],
+            "-----BEGIN CERTIFICATE-----\nX\n"
+        );
+        assert_eq!(seen[3].if_match.as_deref(), Some("4"));
+        assert_eq!(seen[3].body["backend"]["bind_password"], "svc-pw");
+        assert!(seen[3].body["backend"].get("has_bind_password").is_none());
+        assert_eq!(
+            seen[5].body,
+            json!({ "username": "alice", "password": "svc-pw" })
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NAME  DISPLAY  KIND  URL\n\
+             corp  Corp     ldap  ldaps://ldap.example.com\n\
+             realm corp created\n\
+             realm corp updated\n\
+             realm corp removed\n\
+             STEP          RESULT  MESSAGE\n\
+             connect       ok      connected to ldaps://ldap.example.com\n\
+             service_bind  ok      bound as cn=svc,dc=example,dc=com\n\
+             search        ok      found uid=alice,dc=example,dc=com\n\
+             user_bind     ok      the password is correct\n\
+             groups        ok      2 groups\n\
+             dn: uid=alice,dc=example,dc=com\n\
+             groups: cn=admins,dc=example,dc=com, cn=staff,dc=example,dc=com\n\
+             role: admin\n"
+        );
+    }
+
+    /// `login --realm`은 로그인 본문에 영역을 넣고(local이면 넣지 않음) 서버가 정한 이름을 돌려준다.
+    #[tokio::test]
+    async fn login_sends_the_realm() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/auth/login" => json!({ "name": "alice@corp", "role": "admin" }),
+            "/api/v1/tokens" => json!({ "secret": "opl_t_s" }),
+            _ => json!({}),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let pw = dir.path().join("pw");
+        std::fs::write(&pw, "alice-pw\n").unwrap();
+        let pw = pw.to_str().unwrap();
+        for (realm, expected) in [(Some("corp"), Some("corp")), (None, None)] {
+            let mut args = vec!["oplctl", "login", "--user", "Alice", "--password-file", pw];
+            if let Some(realm) = realm {
+                args.extend(["--realm", realm]);
+            }
+            let Cmd::Login(args) = Cli::try_parse_from(args).unwrap().cmd else {
+                unreachable!()
+            };
+            assert_eq!(
+                login(&base, &args, None).await.unwrap(),
+                ("opl_t_s".to_string(), "alice@corp".to_string())
+            );
+            let seen = seen.lock().unwrap();
+            let sent = &seen[seen.len() - 3];
+            assert_eq!(sent.line, "POST /api/v1/auth/login HTTP/1.1");
+            assert_eq!(sent.body["username"], "Alice");
+            assert_eq!(sent.body["password"], "alice-pw");
+            assert_eq!(sent.body.get("realm").and_then(Value::as_str), expected);
+        }
     }
 
     #[test]

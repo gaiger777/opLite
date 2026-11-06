@@ -80,7 +80,7 @@ jobs:
       - name: shellcheck
         run: |
           shopt -s globstar
-          shellcheck packaging/**/*.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm
+          shellcheck packaging/**/*.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm .github/scripts/*.sh
       - run: bash packaging/tests/build-deb-test.sh
       - run: bash packaging/tests/build-repo-test.sh
       - run: bash packaging/tests/maint-test.sh
@@ -305,6 +305,39 @@ jobs:
           OPL_TEST_RBD_CONF: /etc/opl-ceph/ceph.conf
           OPL_TEST_LVM_SHARED: oplshared
           OPL_TEST_ISCSI: 127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared
+
+  # LDAP 영역: 실제 OpenLDAP(slapd)에 LDAPS와 ldap://+StartTLS로 사용자 찾기·바인드, memberOf 그룹,
+  # API의 영역 시험 동작과 외부 사용자 로그인. 디렉터리(시험 CA, 사용자 둘, 그룹 하나)는
+  # ldap-setup.sh가 아래 OPL_TEST_LDAP_* 값으로 만든다.
+  ldap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OPL_TEST_LDAP_URL: "ldaps://127.0.0.1:636"
+      OPL_TEST_LDAP_STARTTLS_URL: "ldap://127.0.0.1:389"
+      OPL_TEST_LDAP_CA: /tmp/opl-test-ldap-ca.pem
+      OPL_TEST_LDAP_BASE_DN: "dc=example,dc=com"
+      OPL_TEST_LDAP_BIND_DN: "cn=admin,dc=example,dc=com"
+      OPL_TEST_LDAP_BIND_PASSWORD: opl-admin-pw
+      OPL_TEST_LDAP_USER: alice
+      OPL_TEST_LDAP_USER_PASSWORD: alice-pw
+      OPL_TEST_LDAP_OTHER_USER: bob
+      OPL_TEST_LDAP_OTHER_PASSWORD: bob-pw
+      OPL_TEST_LDAP_GROUP: "cn=admins,ou=groups,dc=example,dc=com"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: OpenSSL headers (native-tls)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+      - name: slapd with LDAPS, StartTLS, two users and a group
+        run: sudo -E sh .github/scripts/ldap-setup.sh
+      - run: cargo test -p opl-api --features ldap-it --test ldap_it
+      - name: slapd log
+        if: failure()
+        run: sudo journalctl -u slapd --no-pager -n 200
 
   deny:
     runs-on: ubuntu-latest
