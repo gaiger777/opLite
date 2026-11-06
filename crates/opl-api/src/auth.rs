@@ -12,6 +12,7 @@ use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
 use axum::http::request::Parts;
 use opl_types::auth::{ApiTokenSpec, Role, User, UserSpec};
+use opl_types::realm::RealmSpec;
 use opl_types::resource::Kind;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -208,7 +209,19 @@ fn principal_of(u: User) -> Principal {
 
 impl AppState {
     pub(crate) fn principal_for(&self, user: Uuid) -> Result<Option<Principal>, ApiError> {
-        Ok(self.cluster.get::<UserSpec>(user)?.map(principal_of))
+        match self.cluster.get::<UserSpec>(user)? {
+            Some(u) if self.realm_exists(&u)? => Ok(Some(principal_of(u))),
+            _ => Ok(None),
+        }
+    }
+
+    /// 외부 사용자의 영역이 있다(로컬 사용자는 늘 참). 영역을 지우면 그 사용자의 세션과 토큰은
+    /// 멈추고, 같은 이름으로 다시 만들면 다시 쓸 수 있다.
+    fn realm_exists(&self, user: &User) -> Result<bool, ApiError> {
+        match &user.spec.realm {
+            Some(realm) => Ok(self.cluster.get_by_name::<RealmSpec>(realm)?.is_some()),
+            None => Ok(true),
+        }
     }
 
     async fn authenticate(&self, parts: &Parts) -> Result<Principal, ApiError> {
@@ -250,6 +263,9 @@ impl AppState {
         // 세션을 만든 뒤 비밀번호가 바뀌었다(다른 노드에서 바뀌었을 수도 있다).
         if user.spec.session_epoch != epoch {
             self.sessions.remove(session);
+            return Err(ApiError::unauthorized());
+        }
+        if !self.realm_exists(&user)? {
             return Err(ApiError::unauthorized());
         }
         Ok(principal_of(user))

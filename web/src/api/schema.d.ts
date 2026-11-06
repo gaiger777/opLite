@@ -33,6 +33,8 @@ export interface paths {
         /**
          * 세션 쿠키를 발급한다. 웹 UI가 쓴다. CLI는 로그인한 뒤 API 토큰을 만들어 쓴다.
          *     실패가 이어지면 잠시 막는다(429 `too_many_attempts`, `Retry-After`).
+         *     LDAP 영역 로그인은 디렉터리로 확인하고 외부 사용자 `<이름>@<영역>`을 만들거나 역할을 고친다.
+         *     모르는 영역은 400, 맞는 역할이 없으면 403 `no_role`, 디렉터리에 닿지 못하면 503 `realm_unavailable`.
          */
         post: operations["login"];
         delete?: never;
@@ -2479,6 +2481,8 @@ export interface components {
                 /** Format: uuid */
                 id: string;
                 name: string;
+                /** @description 외부 사용자의 영역. 로컬 사용자는 없다. */
+                realm?: string;
                 /** Format: int64 */
                 revision: number;
                 role: components["schemas"]["Role"];
@@ -2488,6 +2492,9 @@ export interface components {
         };
         LoginRequest: {
             password: string;
+            /** @description 없거나 `local`이면 로컬 사용자 */
+            realm?: string;
+            /** @description 영역 로그인이면 영역 안의 이름이다(`alice`로 로그인하면 사용자 `alice@<영역>`). */
             username: string;
         };
         /** @description `52:54:00:12:34:56` 형식의 MAC 주소. */
@@ -3841,6 +3848,8 @@ export interface components {
             /** Format: uuid */
             id: string;
             name: string;
+            /** @description 외부 사용자의 영역. 로컬 사용자는 없다. */
+            realm?: string;
             /** Format: int64 */
             revision: number;
             role: components["schemas"]["Role"];

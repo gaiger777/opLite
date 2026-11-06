@@ -96,7 +96,8 @@ struct Quirks {
 
 struct Site {
     mode: Mode,
-    directory: Directory,
+    /// 시험이 도중에 바꿀 수 있다([`FakeLdap::set_groups`]).
+    directory: Mutex<Directory>,
     acceptor: TlsAcceptor,
     stats: Stats,
     quirks: Quirks,
@@ -126,7 +127,7 @@ impl FakeLdap {
         let addr = tcp.local_addr().unwrap();
         let site = Arc::new(Site {
             mode,
-            directory,
+            directory: Mutex::new(directory),
             acceptor: TlsAcceptor::from(Arc::new(config)),
             stats: Stats::default(),
             quirks: Quirks::default(),
@@ -186,6 +187,17 @@ impl FakeLdap {
     /// 지금까지 받은 검색 필터의 등호 조건(`attr=value`)
     pub fn assertions(&self) -> Vec<String> {
         self.site.stats.assertions.lock().unwrap().clone()
+    }
+
+    /// `uid` 사람의 그룹을 바꾼다.
+    pub fn set_groups(&self, uid: &str, groups: &[&str]) {
+        let mut directory = self.site.directory.lock().unwrap();
+        let person = directory
+            .people
+            .iter_mut()
+            .find(|p| p.uid == uid)
+            .expect("person");
+        person.groups = groups.iter().map(|g| g.to_string()).collect();
     }
 }
 
@@ -300,7 +312,7 @@ fn bind(site: &Site, tls: bool, op: StructureTag) -> Tag {
     let _version = parts.next();
     let name = string(parts.next().unwrap());
     let password = string(parts.next().unwrap());
-    let directory = &site.directory;
+    let directory = site.directory.lock().unwrap();
     let ok = (name.is_empty() && password.is_empty())
         || directory
             .service
@@ -337,6 +349,8 @@ fn search(site: &Site, tls: bool, op: StructureTag) -> Vec<Tag> {
     record(&site.stats, &filter);
     let mut replies: Vec<Tag> = site
         .directory
+        .lock()
+        .unwrap()
         .people
         .iter()
         .filter(|p| p.dn.to_ascii_lowercase().ends_with(&base))

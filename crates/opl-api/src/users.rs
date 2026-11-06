@@ -6,8 +6,11 @@ use axum::extract::{Path, State};
 use axum::http::header::SET_COOKIE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use opl_cluster::ClusterError;
+use opl_cluster::types::Rejection;
 use opl_types::audit::AuditAuth;
-use opl_types::auth::{ApiToken, ApiTokenSpec, Role, User, UserSpec};
+use opl_types::auth::{ApiToken, ApiTokenSpec, Role, User, UserSpec, external_name};
+use opl_types::realm::{LOCAL_REALM, RealmBackend, RealmSpec};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -31,6 +34,10 @@ pub struct UserView {
     pub name: String,
     pub revision: u64,
     pub role: Role,
+    /// 외부 사용자의 영역. 로컬 사용자는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, default)]
+    pub realm: Option<String>,
 }
 
 impl From<User> for UserView {
@@ -40,6 +47,7 @@ impl From<User> for UserView {
             name: u.name,
             revision: u.revision,
             role: u.spec.role,
+            realm: u.spec.realm,
         }
     }
 }
@@ -75,12 +83,19 @@ fn check_password(password: &str) -> Result<(), ApiError> {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoginRequest {
+    /// 영역 로그인이면 영역 안의 이름이다(`alice`로 로그인하면 사용자 `alice@<영역>`).
     pub username: String,
     pub password: String,
+    /// 없거나 `local`이면 로컬 사용자
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub realm: Option<String>,
 }
 
 /// 세션 쿠키를 발급한다. 웹 UI가 쓴다. CLI는 로그인한 뒤 API 토큰을 만들어 쓴다.
 /// 실패가 이어지면 잠시 막는다(429 `too_many_attempts`, `Retry-After`).
+/// LDAP 영역 로그인은 디렉터리로 확인하고 외부 사용자 `<이름>@<영역>`을 만들거나 역할을 고친다.
+/// 모르는 영역은 400, 맞는 역할이 없으면 403 `no_role`, 디렉터리에 닿지 못하면 503 `realm_unavailable`.
 #[utoipa::path(post, path = "/auth/login", tag = "auth", security(()),
     request_body = LoginRequest,
     responses((status = 200, body = UserView), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -90,6 +105,41 @@ pub async fn login(
     audit: AuditNote,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    let user = match req.realm.as_deref() {
+        Some(realm) if realm != LOCAL_REALM => login_realm(&state, ip, &audit, &req, realm).await?,
+        _ => login_local(&state, ip, &audit, req).await?,
+    };
+    audit.principal(
+        Principal {
+            user: user.id,
+            name: user.name.clone(),
+            role: user.spec.role,
+        },
+        AuditAuth::Session,
+    );
+    let session = state.sessions.create(user.id, user.spec.session_epoch);
+    let mut cookie = format!(
+        "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+        SESSION_TTL.as_secs()
+    );
+    if state.secure_cookies {
+        cookie.push_str("; Secure");
+    }
+    let mut response = Json(UserView::from(user)).into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(ApiError::internal)?,
+    );
+    Ok(response)
+}
+
+/// 로컬 사용자의 비밀번호를 확인한다.
+async fn login_local(
+    state: &AppState,
+    ip: std::net::IpAddr,
+    audit: &AuditNote,
+    req: LoginRequest,
+) -> Result<User, ApiError> {
     // 이름 형식이 아닌 것은 감사 로그에 넣지 않는다(비밀번호를 잘못 넣었을 수 있다).
     let name_ok = validate_name(&req.username).is_ok();
     audit.detail(if name_ok {
@@ -117,28 +167,123 @@ pub async fn login(
         return Err(wrong_credentials());
     };
     state.attempts.success(&req.username, ip, attempt);
-    audit.principal(
-        Principal {
-            user: user.id,
-            name: user.name.clone(),
-            role: user.spec.role,
+    Ok(user)
+}
+
+/// 영역의 디렉터리로 확인하고 외부 사용자를 만들거나 역할을 맞춘다. 시도 제한의 키는 외부 사용자 이름이다.
+async fn login_realm(
+    state: &AppState,
+    ip: std::net::IpAddr,
+    audit: &AuditNote,
+    req: &LoginRequest,
+    realm: &str,
+) -> Result<User, ApiError> {
+    // 영역 부분이 맞는 아무 이름으로 사용자 부분만 본다.
+    let user_ok = external_name(&req.username, LOCAL_REALM).is_ok();
+    audit.detail(format!(
+        "username={} realm={}",
+        if user_ok {
+            req.username.as_str()
+        } else {
+            "<invalid>"
         },
-        AuditAuth::Session,
-    );
-    let session = state.sessions.create(user.id, user.spec.session_epoch);
-    let mut cookie = format!(
-        "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-        SESSION_TTL.as_secs()
-    );
-    if state.secure_cookies {
-        cookie.push_str("; Secure");
+        if validate_name(realm).is_ok() {
+            realm
+        } else {
+            "<invalid>"
+        },
+    ));
+    let Ok(name) = external_name(&req.username, realm) else {
+        state.attempts.begin_ip(ip)?;
+        return Err(wrong_credentials());
+    };
+    let stored = state
+        .cluster
+        .get_by_name::<RealmSpec>(realm)?
+        .ok_or_else(|| ApiError::bad_request(format!("unknown realm {realm:?}")))?;
+    let attempt = state.attempts.begin(&name, ip)?;
+    let RealmBackend::Ldap(ldap) = &stored.spec.backend;
+    // 디렉터리에는 소문자로 바꾼 이름(외부 사용자 이름의 앞부분)을 묻는다.
+    let username = &name[..name.len() - realm.len() - 1];
+    let found = match crate::ldap::authenticate(ldap, username, &req.password).await {
+        Ok(found) => found,
+        Err(crate::ldap::LdapError::InvalidCredentials) => return Err(wrong_credentials()),
+        Err(crate::ldap::LdapError::Unavailable(reason)) => {
+            tracing::warn!(realm, %reason, "the directory of the realm is unavailable");
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "realm_unavailable",
+                format!("the directory of realm {realm} is unavailable"),
+            ));
+        }
+    };
+    let role = stored.spec.roles.role_for(&found.groups).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "no_role",
+            "no role is mapped for this user",
+        )
+    })?;
+    // 외부 사용자는 옛 노드가 모르는 필드(`realm`)를 쓴다.
+    crate::cluster::require_current(&state.cluster)?;
+    let user = upsert_external(state, &name, realm, role).await?;
+    state.attempts.success(&name, ip, attempt);
+    Ok(user)
+}
+
+/// 외부 사용자를 만들거나 역할을 고친다(역할이 바뀌면 옛 세션을 끊는다). 같으면 쓰지 않는다.
+/// 같은 사용자의 로그인이 겹쳐 진 쪽은 다시 읽어 한 번 더 한다.
+async fn upsert_external(
+    state: &AppState,
+    name: &str,
+    realm: &str,
+    role: Role,
+) -> Result<User, ApiError> {
+    let mut retried = false;
+    loop {
+        let written = match state.cluster.get_by_name::<UserSpec>(name)? {
+            Some(user) if user.spec.role == role => return Ok(user),
+            Some(mut user) => {
+                user.spec.role = role;
+                user.spec.session_epoch += 1;
+                state
+                    .cluster
+                    .update_spec(
+                        user.id,
+                        Some(user.revision),
+                        user.labels.clone(),
+                        &user.spec,
+                    )
+                    .await
+                    .map(|revision| User { revision, ..user })
+            }
+            None => {
+                let user: User = Resource::new(
+                    name,
+                    UserSpec {
+                        password_hash: String::new(),
+                        role,
+                        session_epoch: 0,
+                        realm: Some(realm.into()),
+                    },
+                );
+                state
+                    .cluster
+                    .create(&user)
+                    .await
+                    .map(|revision| User { revision, ..user })
+            }
+        };
+        match written {
+            Ok(user) => return Ok(user),
+            Err(ClusterError::Rejected(
+                Rejection::AlreadyExists { .. }
+                | Rejection::NameTaken { .. }
+                | Rejection::RevisionMismatch { .. },
+            )) if !retried => retried = true,
+            Err(e) => return Err(e.into()),
+        }
     }
-    let mut response = Json(UserView::from(user)).into_response();
-    response.headers_mut().insert(
-        SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(ApiError::internal)?,
-    );
-    Ok(response)
 }
 
 fn wrong_credentials() -> ApiError {
@@ -271,6 +416,13 @@ pub async fn update_user(
     let is_self = user.id == principal.user;
     if !is_self || req.role.is_some() {
         state.authorize(&principal, Action::Write, UserSpec::KIND)?;
+    }
+    if req.password.is_some() && user.spec.realm.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "external_user",
+            "the password of an external user is managed by its realm",
+        ));
     }
     let mut spec = user.spec.clone();
     let password_changed = req.password.is_some();
