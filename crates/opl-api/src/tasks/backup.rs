@@ -372,11 +372,12 @@ pub(super) async fn discard(ctx: &Ctx, task: &Task, id: Uuid, error: &str, unfin
 /// 백업 파일(디렉터리)과 리소스를 지운다. 디렉터리가 이미 없어도 성공이므로 중간에 멈춰도 다시 하면 된다.
 /// 다만 공유가 아닌 풀에서 다른 노드가 쓴 백업(`status.node`)은 여기에 없는 것이 당연하므로 실패다.
 /// 풀이 없어졌으면 파일도 함께 없어진 것으로 보고 리소스만 지운다. 이 백업을 되살리는 Task가 끝나지
-/// 않았으면(다른 노드에서 돌 수 있다) 실패다.
-pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<(), String> {
+/// 않았으면(다른 노드에서 돌 수 있다) 실패다. 파일을 지운 뒤 리소스보다 먼저 원격 사본을 지우고(엔터프라이즈
+/// 설계 §6.2), 지우지 못한 사본이 있어도 원본은 지우고 그 경고를 돌려준다.
+pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<Option<String>, String> {
     use opl_types::task::{TaskOp, TaskSpec};
     let Some(backup) = get_backup(ctx, id)? else {
-        return Ok(());
+        return Ok(None);
     };
     let (_, tasks) = ctx.cluster.list::<TaskSpec>().map_err(|e| e.to_string())?;
     if tasks.iter().any(|t| {
@@ -389,8 +390,9 @@ pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<(), String> {
         .cluster
         .get_by_name::<StoragePoolSpec>(&backup.spec.pool)
         .map_err(|e| e.to_string())?;
-    if pool.is_none() {
+    let dir = if pool.is_none() {
         tracing::warn!(backup = %backup.name, pool = %backup.spec.pool, "storage pool of backup is gone; deleting only the backup");
+        None
     } else {
         let (pool, root) = backup_root(ctx, &backup.spec.pool)?;
         let dir = backup_dir(&root, id);
@@ -403,12 +405,23 @@ pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<(), String> {
         {
             return Err(format!("backup files are on node {node}, not on this node"));
         }
+        Some(dir)
+    };
+    // 원본 파일을 지우지 못하면 원본이 남으므로 원격 사본도 건드리지 않는다.
+    if let Some(dir) = dir {
         remove_dir(&dir).await?;
     }
+    let left = super::replicate::delete_copies(ctx, &backup).await;
     match ctx.cluster.delete::<BackupSpec>(id, None).await {
-        Ok(_) | Err(ClusterError::Rejected(Rejection::NotFound { .. })) => Ok(()),
-        Err(e) => Err(e.to_string()),
+        Ok(_) | Err(ClusterError::Rejected(Rejection::NotFound { .. })) => {}
+        Err(e) => return Err(e.to_string()),
     }
+    Ok((!left.is_empty()).then(|| {
+        format!(
+            "backup deleted, but remote copies may be left: {}",
+            left.join("; ")
+        )
+    }))
 }
 
 /// 백업 디렉터리의 매니페스트를 읽는다. 형식 버전이 다르면 나머지를 읽지 않고 오류다.

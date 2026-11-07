@@ -1548,6 +1548,7 @@ export interface components {
             /** @description 보존 규칙 전체를 이것으로 바꾼다(적지 않은 단위는 0). */
             keep?: components["schemas"]["Keep"];
             pool?: string;
+            replicate?: components["schemas"]["ReplicateTarget"] | null;
             schedule?: components["schemas"]["JobSchedule"];
             vms?: components["schemas"]["VmSelector"];
         };

@@ -140,6 +140,47 @@ pub(super) async fn discard(ctx: &Ctx, id: Uuid, remote: &str, pool: &str, error
     .await;
 }
 
+/// 원격 `remote`(등록한 이름)의 클라이언트
+fn client(ctx: &Ctx, remote: &str) -> Result<RemoteClient, String> {
+    let spec = ctx
+        .cluster
+        .get_by_name::<RemoteSpec>(remote)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("remote {remote:?} not found"))?
+        .spec;
+    RemoteClient::new(&spec.url, &spec.ca_pem, &spec.token)
+        .map_err(|e| remote_error(remote, "connect", e))
+}
+
+/// 원본 백업 `backup`의 원격 사본(id가 있는 것 — 실패로 끝났어도 원격에 받다 만 사본이 있다)을 원격에서
+/// 지운다(원격의 지우기 Task를 요청한다). 404는 이미 지운 것이다. 지우지 못한 사본마다 이유 한 줄을
+/// 돌려준다.
+pub(super) async fn delete_copies(ctx: &Ctx, backup: &Backup) -> Vec<String> {
+    let mut left = Vec::new();
+    for replica in &backup.status.replicas {
+        let Some(copy) = replica.backup else {
+            continue;
+        };
+        if let Err(e) = delete_copy(ctx, &replica.remote, copy).await {
+            tracing::warn!(backup = %backup.name, remote = %replica.remote, copy = %copy, error = %e, "cannot delete remote copy of backup");
+            left.push(e);
+        }
+    }
+    left
+}
+
+async fn delete_copy(ctx: &Ctx, remote: &str, copy: Uuid) -> Result<(), String> {
+    let client = client(ctx, remote)?;
+    let deleting = |e| remote_error(remote, &format!("delete copy {copy}"), e);
+    let (status, body) = call(&client, Method::DELETE, &format!("/backups/{copy}"), None)
+        .await
+        .map_err(deleting)?;
+    match status {
+        200..=299 | 404 => Ok(()),
+        _ => Err(deleting(status_error(status, &body))),
+    }
+}
+
 /// 원격의 오류(사람이 읽을 말)
 fn remote_error(remote: &str, doing: &str, e: RemoteError) -> String {
     format!("cannot {doing} on remote {remote:?}: {e}")
@@ -155,12 +196,7 @@ async fn send(
     checking: bool,
 ) -> Result<Uuid, String> {
     let id = backup.id;
-    let spec = ctx
-        .cluster
-        .get_by_name::<RemoteSpec>(remote)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("remote {remote:?} not found"))?
-        .spec;
+    let client = client(ctx, remote)?;
     if let Some(node) = backup.status.node.filter(|n| *n != ctx.config.node) {
         return Err(format!("backup is stored on node {node}"));
     }
@@ -171,8 +207,6 @@ async fn send(
         return Err("backup manifest does not match the backup record".into());
     }
     let origin = origin(ctx, backup)?;
-    let client = RemoteClient::new(&spec.url, &spec.ca_pem, &spec.token)
-        .map_err(|e| remote_error(remote, "connect", e))?;
 
     let request = json!({
         "name": backup.name,

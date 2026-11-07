@@ -395,7 +395,11 @@ pub(crate) async fn start_backup(
 
 /// 백업 파일을 지울 노드: 파일을 쓴 노드(`status.node`, 공유가 아닌 풀)나 백업 풀을 쓸 수 있는 노드.
 /// 그 노드가 오프라인이면 409 `node_offline`, 풀을 쓸 수 없으면 409 `pool_not_on_node`·`pool_unavailable`.
-fn files_node(state: &AppState, backup: &Backup, pool: &StoragePool) -> Result<Uuid, ApiError> {
+pub(crate) fn files_node(
+    state: &AppState,
+    backup: &Backup,
+    pool: &StoragePool,
+) -> Result<Uuid, ApiError> {
     let Some(node) = backup.status.node else {
         return pool_node(state, pool);
     };
@@ -615,14 +619,28 @@ pub async fn replicate_backup(
     require_current(&state.cluster)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
     let remote = lookup::<RemoteSpec>(&state.cluster, &req.remote)?;
+    let task = start_backup_replicate(&state, &backup, &remote.name, req.pool).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 백업 `backup`을 원격 `remote`의 백업 풀 `pool`로 보낼 Task를 만든다. 오류는 [`replicate_backup`]과
+/// 같다. 복제 API와 백업 작업 스케줄러가 쓴다(권한 검사는 부르는 쪽).
+pub(crate) async fn start_backup_replicate(
+    state: &AppState,
+    backup: &Backup,
+    remote: &str,
+    pool: String,
+) -> Result<Task, ApiError> {
+    require_current(&state.cluster)?;
+    let remote = lookup::<RemoteSpec>(&state.cluster, remote)?;
     if backup.status.phase != BackupPhase::Ready {
         return Err(ApiError::conflict(
             "backup_not_ready",
             format!("backup {:?} is not ready", backup.name),
         ));
     }
-    if backup_tasks(&state, backup.id)?.contains(&"being deleted") {
-        return Err(backup_busy(&backup, "being deleted"));
+    if backup_tasks(state, backup.id)?.contains(&"being deleted") {
+        return Err(backup_busy(backup, "being deleted"));
     }
     let (_, tasks) = state.cluster.list::<TaskSpec>()?;
     if tasks.iter().any(|t| {
@@ -631,16 +649,15 @@ pub async fn replicate_backup(
             && matches!(&t.spec.op, TaskOp::BackupReplicate { remote: r, .. } if *r == remote.name)
     }) {
         return Err(backup_busy(
-            &backup,
+            backup,
             &format!("being replicated to remote {:?}", remote.name),
         ));
     }
-    let pool = find_pool(&state, &backup.spec.pool)?;
-    let node = files_node(&state, &backup, &pool)?;
+    let backup_pool = find_pool(state, &backup.spec.pool)?;
+    let node = files_node(state, backup, &backup_pool)?;
     let op = TaskOp::BackupReplicate {
         remote: remote.name,
-        pool: req.pool,
+        pool,
     };
-    let task = create_task(&state.cluster, op, backup.id, node).await?;
-    Ok((StatusCode::ACCEPTED, Json(task)))
+    create_task(&state.cluster, op, backup.id, node).await
 }

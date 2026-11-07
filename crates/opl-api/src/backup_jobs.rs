@@ -18,8 +18,9 @@ use opl_cluster::types::Rejection;
 use opl_types::backup::{Backup, BackupPhase, BackupSpec, default_backup_name};
 use opl_types::backup_job::{
     BackupJob, BackupJobSpec, BackupJobStatus, JobError, JobRun, JobRunResult, JobSchedule, Keep,
-    VmSelector, next_run, prune,
+    ReplicateTarget, VmSelector, next_run, prune,
 };
+use opl_types::remote::RemoteSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::storage::StoragePoolSpec;
 use opl_types::task::{Task, TaskOp, TaskSpec};
@@ -31,14 +32,18 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
-use crate::backups::{check_backup, now, start_backup, start_backup_delete};
+use crate::backups::{
+    check_backup, files_node, find_pool, now, start_backup, start_backup_delete,
+    start_backup_replicate,
+};
 use crate::cluster::require_current;
 use crate::error::{ApiError, Json};
 use crate::resources::{CreateRequest, check_name, if_match, lookup};
 use crate::state::AppState;
 
 /// 스펙 검증과 풀 검사: 풀이 있고 백업 풀이어야 한다(400). 요일은 주의 순서로 정리한다. 원격 복제를
-/// 켠 작업은 옛 노드가 풀지 못하므로 모든 노드가 이 빌드일 때만 쓴다(409 `cluster_upgrading`).
+/// 켠 작업은 옛 노드가 풀지 못하므로 모든 노드가 이 빌드일 때만 쓰고(409 `cluster_upgrading`), 원격은
+/// 등록돼 있어야 한다(400). 원격의 풀은 보낼 때 원격이 확인한다.
 fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError> {
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -53,8 +58,18 @@ fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError
             pool.name
         )));
     }
-    if spec.replicate.is_some() {
+    if let Some(target) = &spec.replicate {
         require_current(&state.cluster)?;
+        if state
+            .cluster
+            .get_by_name::<RemoteSpec>(&target.remote)?
+            .is_none()
+        {
+            return Err(ApiError::bad_request(format!(
+                "remote {:?} not found",
+                target.remote
+            )));
+        }
     }
     Ok(())
 }
@@ -98,6 +113,19 @@ pub struct BackupJobPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub enabled: Option<bool>,
+    /// 만든 백업을 보낼 원격의 백업 풀. `null`이면 보내지 않는다.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<ReplicateTarget>, nullable, default)]
+    pub replicate: Option<Option<ReplicateTarget>>,
+}
+
+/// 적은 값은 `null`이어도 `Some`이다(적지 않으면 `serde(default)`의 `None`).
+fn present<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
 }
 
 /// 스펙의 주어진 값을 바꾼다. 아무것도 없으면 400. 일정을 바꾸거나 작업을 다시 켜면 다음 실행 시각을
@@ -121,9 +149,10 @@ pub async fn patch_backup_job(
         && req.schedule.is_none()
         && req.keep.is_none()
         && req.enabled.is_none()
+        && req.replicate.is_none()
     {
         return Err(ApiError::bad_request(
-            "give vms, pool, schedule, keep or enabled",
+            "give vms, pool, schedule, keep, enabled or replicate",
         ));
     }
     let expected = if_match(&headers)?;
@@ -153,6 +182,9 @@ pub async fn patch_backup_job(
         }
         if let Some(enabled) = req.enabled {
             spec.enabled = enabled;
+        }
+        if let Some(replicate) = &req.replicate {
+            spec.replicate = replicate.clone();
         }
         check_spec(&state, &mut spec)?;
         if spec == job.spec {
@@ -292,7 +324,7 @@ pub async fn run_backup_job(
 pub struct BackupJobSchedulerConfig {
     /// 작업을 확인하는 간격
     pub tick: Duration,
-    /// 노드마다 동시에 도는 백업 Task의 최대 수. 손으로 요청한 백업도 센다.
+    /// 노드마다 동시에 도는 백업 Task의 최대 수. 손으로 요청한 백업과 복제 Task도 센다.
     pub max_concurrent: usize,
 }
 
@@ -365,11 +397,17 @@ async fn tick(state: &AppState, config: &BackupJobSchedulerConfig) {
         if let Err(e) = advance(state, config, job.clone(), now).await {
             tracing::warn!(job = %job.name, error = %e.message, "cannot advance backup job");
         }
+        if let Err(e) = prune_after_run(state, job.id).await {
+            tracing::warn!(job = %job.name, error = %e.message, "cannot prune backups of job");
+        }
+        if let Err(e) = replicate(state, config, job.id).await {
+            tracing::warn!(job = %job.name, error = %e.message, "cannot replicate backups of job");
+        }
     }
 }
 
 /// 작업 하나를 한 걸음 나아가게 한다: 때가 되면 실행을 시작하고, 큐에서 VM을 꺼내 백업을 요청하고,
-/// 큐가 비고 이번 실행의 백업이 모두 끝났으면 실행을 끝내고 보존 규칙대로 지운다.
+/// 큐가 비고 이번 실행의 백업이 모두 끝났으면 실행을 끝낸다. 보존 규칙대로 지우기는 [`prune_after_run`].
 async fn advance(
     state: &AppState,
     config: &BackupJobSchedulerConfig,
@@ -460,21 +498,167 @@ async fn advance(
     if let Some(last) = &job.status.last_run {
         tracing::info!(job = %job.name, ok = last.ok, failed = last.failed, "backup job run finished");
     }
+    Ok(())
+}
+
+/// 끝난 실행의 보존 정리: 실행이 끝나 있으면 보존 규칙이 지울 백업([`retention`])마다 지우기 Task를
+/// 만든다. 만들지 못한 백업(복제·복원 중이라 `backup_busy` 등)은 tick마다 다시 본다. 실행이 끝난 뒤
+/// 이미 지우기 Task를 만든 백업은 그 Task가 실패했어도 다음 실행이 끝날 때까지 다시 만들지 않는다.
+async fn prune_after_run(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    let cluster = &state.cluster;
+    let Some(job) = cluster.get::<BackupJobSpec>(id)? else {
+        return Ok(());
+    };
+    let Some(last) = job
+        .status
+        .last_run
+        .as_ref()
+        .filter(|_| job.status.run.is_none())
+    else {
+        return Ok(());
+    };
+    let (_, tasks) = cluster.list::<TaskSpec>()?;
+    let (_, backups) = cluster.list::<BackupSpec>()?;
     for id in retention(job.id, &job.spec.keep, &backups) {
         let Some(backup) = backups.iter().find(|b| b.id == id) else {
             continue;
         };
-        // 지우지 못하면(이미 지우는 중 등) 다음 실행이 끝날 때 다시 고른다.
+        let tried = tasks.iter().any(|t| {
+            t.spec.op == TaskOp::BackupDelete
+                && t.spec.target == id
+                && t.id.get_timestamp().map(|ts| ts.to_unix().0) >= Some(last.finished_at)
+        });
+        if tried {
+            continue;
+        }
         match start_backup_delete(state, backup).await {
             Ok(task) => {
                 tracing::info!(job = %job.name, backup = %backup.name, task = %task.id, "pruning backup")
             }
             Err(e) => {
-                tracing::info!(job = %job.name, backup = %backup.name, error = %e.message, "cannot prune backup")
+                tracing::info!(job = %job.name, backup = %backup.name, error = %e.message, "cannot prune backup yet")
             }
         }
     }
     Ok(())
+}
+
+/// 노드의 동시 백업 수에 드는 끝나지 않은 Task: 백업과 복제
+fn occupies(t: &Task) -> bool {
+    matches!(
+        t.spec.op,
+        TaskOp::VmBackup { .. } | TaskOp::BackupReplicate { .. }
+    ) && !t.status.state.is_finished()
+}
+
+/// 원격 복제를 켠 작업 `id`의 백업 가운데 보낼 것([`to_replicate`])의 복제 Task를 만든다. 노드마다
+/// 복제 Task는 하나씩, 백업 Task와 합쳐 `max_concurrent`개까지다. 꺼 둔 작업은 보내지 않는다. 만들지
+/// 못한 백업(노드가 오프라인, 원격이 없어짐 등)은 다음 tick에 다시 본다. 옛 노드가 있으면 만들지 않는다.
+async fn replicate(
+    state: &AppState,
+    config: &BackupJobSchedulerConfig,
+    id: Uuid,
+) -> Result<(), ApiError> {
+    let cluster = &state.cluster;
+    let Some(job) = cluster.get::<BackupJobSpec>(id)? else {
+        return Ok(());
+    };
+    let Some(target) = job.spec.replicate.clone().filter(|_| job.spec.enabled) else {
+        return Ok(());
+    };
+    let (_, tasks) = cluster.list::<TaskSpec>()?;
+    let (_, backups) = cluster.list::<BackupSpec>()?;
+    let candidates = to_replicate(&job, &target, &backups, &tasks);
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // 옛 노드는 복제 Task와 사본 기록을 모른다. 모든 노드가 올라오면 보낸다.
+    if require_current(cluster).is_err() {
+        return Ok(());
+    }
+    let mut running: BTreeMap<Uuid, usize> = BTreeMap::new();
+    let mut replicating: Vec<Uuid> = Vec::new();
+    for t in tasks.iter().filter(|t| occupies(t)) {
+        *running.entry(t.spec.node).or_default() += 1;
+        if matches!(t.spec.op, TaskOp::BackupReplicate { .. }) {
+            replicating.push(t.spec.node);
+        }
+    }
+    for backup in candidates {
+        let node = match find_pool(state, &backup.spec.pool)
+            .and_then(|pool| files_node(state, backup, &pool))
+        {
+            Ok(node) => node,
+            Err(e) => {
+                tracing::info!(job = %job.name, backup = %backup.name, error = %e.message, "cannot replicate backup yet");
+                continue;
+            }
+        };
+        if replicating.contains(&node)
+            || running.get(&node).copied().unwrap_or(0) >= config.max_concurrent
+        {
+            continue;
+        }
+        match start_backup_replicate(state, backup, &target.remote, target.pool.clone()).await {
+            Ok(task) => {
+                tracing::info!(job = %job.name, backup = %backup.name, remote = %target.remote, task = %task.id, "replicating backup");
+                replicating.push(node);
+                *running.entry(node).or_default() += 1;
+            }
+            Err(e) if e.status.is_client_error() => {
+                tracing::info!(job = %job.name, backup = %backup.name, error = %e.message, "cannot replicate backup");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// 작업 `job`의 백업 가운데 원격 `target`으로 보낼 것(만든 순서): `ready`이고, 보존 규칙이 지울 것이
+/// 아니고([`retention`] — 지우기와 겹치지 않게), 그 사본 기록이 없거나 기록이 마지막 실행을 시작하기 전의
+/// 것이다. 그래서 실패한(또는 복제 Task 없이 copying으로 남은) 사본은 실행마다 한 번 더 보내고, ready
+/// 사본도 실행마다 한 번 원격에 있는지 확인한다(복제 Task가 원격에 물어 같은 파일이 있으면 기록 시각만
+/// 고치고, 원격에서 지웠으면 다시 보낸다). 같은 원격으로 복제하는 Task가 끝나지 않은 백업은 뺀다.
+fn to_replicate<'a>(
+    job: &BackupJob,
+    target: &ReplicateTarget,
+    backups: &'a [Backup],
+    tasks: &[Task],
+) -> Vec<&'a Backup> {
+    let started = job
+        .status
+        .run
+        .as_ref()
+        .map(|r| r.started_at)
+        .or(job.status.last_run.as_ref().map(|l| l.started_at))
+        .unwrap_or(0);
+    let replicating = |b: &Backup| {
+        tasks.iter().any(|t| {
+            !t.status.state.is_finished()
+                && t.spec.target == b.id
+                && matches!(&t.spec.op, TaskOp::BackupReplicate { remote, .. } if *remote == target.remote)
+        })
+    };
+    let pruned = retention(job.id, &job.spec.keep, backups);
+    let mut out: Vec<&Backup> = backups
+        .iter()
+        .filter(|b| b.spec.job == Some(job.id) && b.status.phase == BackupPhase::Ready)
+        .filter(|b| !pruned.contains(&b.id))
+        .filter(|b| !replicating(b))
+        .filter(|b| {
+            match b
+                .status
+                .replicas
+                .iter()
+                .find(|r| r.remote == target.remote && r.pool == target.pool)
+            {
+                None => true,
+                Some(r) => r.at < started,
+            }
+        })
+        .collect();
+    out.sort_by_key(|b| b.id);
+    out
 }
 
 /// 큐에서 꺼낸 VM 하나에 한 일
@@ -536,7 +720,7 @@ async fn dispatch(
     };
     let running = tasks
         .iter()
-        .filter(backing_up)
+        .filter(|t| occupies(t))
         .filter(|t| t.spec.node == node)
         .count();
     if running >= config.max_concurrent {
@@ -703,7 +887,7 @@ fn retention(job: Uuid, keep: &Keep, backups: &[Backup]) -> Vec<Uuid> {
 
 #[cfg(test)]
 mod tests {
-    use opl_types::backup::BackupStatus;
+    use opl_types::backup::{BackupReplica, BackupStatus, ReplicaState};
     use opl_types::backup_job::JobSchedule;
     use opl_types::resource::validate_name;
     use opl_types::task::TaskState;
@@ -968,6 +1152,158 @@ mod tests {
         // 실행이 없으면 아무것도 아니다.
         job.status.run = None;
         assert!(!of_this_run(&job, &made_at(NOW, Some(job.id))));
+    }
+
+    /// 사본 기록
+    fn replica(remote: &str, pool: &str, state: ReplicaState, at: u64) -> BackupReplica {
+        BackupReplica {
+            remote: remote.into(),
+            pool: pool.into(),
+            backup: None,
+            state,
+            error: None,
+            at,
+        }
+    }
+
+    #[test]
+    fn replication_picks_ready_backups_without_a_copy_and_retries_failures_once_a_run() {
+        let vm = Uuid::now_v7();
+        let mut job: BackupJob = Resource::new(
+            "nightly",
+            BackupJobSpec {
+                vms: VmSelector::All,
+                pool: "bk".into(),
+                schedule: JobSchedule {
+                    at: "03:00".into(),
+                    days: vec![],
+                },
+                keep: Keep::default(),
+                enabled: true,
+                replicate: None,
+            },
+        );
+        let target = ReplicateTarget {
+            remote: "dr".into(),
+            pool: "far".into(),
+        };
+        // 마지막 실행은 NOW - 60에 시작했다.
+        job.status = running(vec![], vec![], vec![]);
+        let with_id = |mut b: Backup, n: u128, replicas: Vec<BackupReplica>| {
+            b.id = Uuid::from_u128(n);
+            b.status.replicas = replicas;
+            b
+        };
+        let ready = |n, replicas| {
+            with_id(
+                backup("r", vm, Some(job.id), BackupPhase::Ready, Some(1)),
+                n,
+                replicas,
+            )
+        };
+        let fresh = ready(9, vec![]);
+        // 다른 원격·풀의 사본만 있다.
+        let elsewhere = ready(
+            2,
+            vec![
+                replica("other", "far", ReplicaState::Ready, NOW),
+                replica("dr", "near", ReplicaState::Ready, NOW),
+            ],
+        );
+        let failed_before = ready(
+            3,
+            vec![replica("dr", "far", ReplicaState::Failed, NOW - 61)],
+        );
+        let failed_since = ready(
+            4,
+            vec![replica("dr", "far", ReplicaState::Failed, NOW - 60)],
+        );
+        // 실행 전에 ready였던 사본도 실행마다 한 번 원격에 있는지 확인한다.
+        let copied = ready(5, vec![replica("dr", "far", ReplicaState::Ready, 1)]);
+        let copied_since = ready(
+            10,
+            vec![replica("dr", "far", ReplicaState::Ready, NOW - 60)],
+        );
+        // 복제 Task 없이 copying으로 남은 기록은 실패와 같다.
+        let stuck = ready(
+            6,
+            vec![replica("dr", "far", ReplicaState::Copying, NOW - 100)],
+        );
+        let copying = ready(7, vec![]);
+        let pending = with_id(
+            backup("p", vm, Some(job.id), BackupPhase::Pending, None),
+            8,
+            vec![],
+        );
+        let manual = with_id(
+            backup("m", vm, None, BackupPhase::Ready, Some(1)),
+            1,
+            vec![],
+        );
+        let mut sending = task(copying.id, TaskState::Running);
+        sending.spec.op = TaskOp::BackupReplicate {
+            remote: "dr".into(),
+            pool: "far".into(),
+        };
+        sending.spec.target = copying.id;
+        let mut done = sending.clone();
+        done.spec.target = fresh.id;
+        done.status.state = TaskState::Failed;
+        let all = [
+            fresh.clone(),
+            elsewhere.clone(),
+            failed_before.clone(),
+            failed_since,
+            copied.clone(),
+            copied_since,
+            stuck.clone(),
+            copying,
+            pending,
+            manual,
+        ];
+        let ids = |job: &BackupJob| -> Vec<Uuid> {
+            to_replicate(job, &target, &all, &[sending.clone(), done.clone()])
+                .iter()
+                .map(|b| b.id)
+                .collect()
+        };
+        assert_eq!(
+            ids(&job),
+            [
+                elsewhere.id,
+                failed_before.id,
+                copied.id,
+                stuck.id,
+                fresh.id
+            ]
+        );
+        // 실행이 끝났으면 그 실행의 시작이 기준이다.
+        job.status.last_run = Some(JobRunResult {
+            started_at: NOW - 60,
+            finished_at: NOW,
+            ok: 1,
+            failed: 0,
+        });
+        job.status.run = None;
+        assert_eq!(
+            ids(&job),
+            [
+                elsewhere.id,
+                failed_before.id,
+                copied.id,
+                stuck.id,
+                fresh.id
+            ]
+        );
+        // 실행한 적이 없으면 실패를 다시 보내지 않는다.
+        job.status.last_run = None;
+        assert_eq!(ids(&job), [elsewhere.id, fresh.id]);
+        // 보존 규칙이 지울 백업(ready 여덟 가운데 id가 작은 셋)은 보내지 않는다.
+        job.spec.keep = Keep {
+            last: 5,
+            ..Keep::default()
+        };
+        assert_eq!(ids(&job), [fresh.id]);
     }
 
     #[test]

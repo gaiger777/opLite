@@ -632,13 +632,13 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
         }
     };
     match result {
-        Ok(()) => {
+        Ok(warning) => {
             // 예약 오류는 만들기가 성공해야 지운다(보관 삭제의 성공은 만들기 실패를 풀지 않는다).
             let create = matches!(task.spec.op, TaskOp::SnapshotCreate { .. });
             if let Some(vm) = snapshot::scheduled_vm(ctx, &task).filter(|_| create) {
                 snapshot::record_schedule(ctx, vm, None).await;
             }
-            set_status(ctx, task.id, TaskState::Succeeded, None).await
+            set_status(ctx, task.id, TaskState::Succeeded, warning).await
         }
         Err(e) => fail(ctx, &task, e, unfinished).await,
     }
@@ -751,9 +751,10 @@ async fn set_status(ctx: &Ctx, id: Uuid, state: TaskState, error: Option<String>
     }
 }
 
-async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<(), String> {
+/// 성공한 Task가 남길 경고(`error`)가 있으면 `Ok(Some)`이다(지우지 못한 원격 사본).
+async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>, String> {
     let id = task.spec.target;
-    match &task.spec.op {
+    let done = match &task.spec.op {
         TaskOp::VmStart => wait_vm(ctx, id, started).await,
         TaskOp::VmStop => wait_vm(ctx, id, stopped).await,
         TaskOp::VmForceStop => {
@@ -780,7 +781,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<(), String> {
         // 기록 Task는 끝난 상태로 만들어지므로 실행되지 않는다.
         TaskOp::VmHaRecover { .. } => Err("an HA recovery task is a record and is not run".into()),
         TaskOp::VmBackup { backup } => backup::backup(ctx, task, *backup).await,
-        TaskOp::BackupDelete => backup::delete(ctx, id).await,
+        TaskOp::BackupDelete => return backup::delete(ctx, id).await,
         TaskOp::BackupRestore { backup, name, pool } => {
             backup::restore(ctx, task, *backup, name, pool).await
         }
@@ -801,7 +802,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<(), String> {
             }
             None => Err("updates are not enabled on this node".into()),
         },
-    }
+    };
+    done.map(|()| None)
 }
 
 /// VM을 켰다: 원하는 상태와 실제 상태가 모두 running. reconciler가 포기해 원하는 상태를

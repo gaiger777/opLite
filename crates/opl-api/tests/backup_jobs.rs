@@ -7,6 +7,7 @@ use common::{Client, Env, vm_request};
 use opl_types::backup::{Backup, BackupSpec};
 use opl_types::backup_job::{BackupJobSpec, JobRun, JobSchedule, Weekday, next_run};
 use opl_types::node::{NodeSpec, NodeStatus};
+use opl_types::remote::{Remote, RemoteSpec};
 use opl_types::resource::Resource;
 use opl_types::storage::{PoolBackend, StoragePoolSpec};
 use opl_types::vm::VmSpec;
@@ -249,8 +250,96 @@ async fn replicate_is_checked_and_waits_for_every_node_to_run_this_build() {
         .update_status::<NodeSpec>(node.id, &node.status)
         .await
         .unwrap();
+    // 등록하지 않은 원격은 400이다.
+    let got = admin.post("/backup-jobs", with(target.clone())).await;
+    assert_eq!(got.0, StatusCode::BAD_REQUEST, "{}", got.1);
+    assert!(
+        got.1["message"].as_str().unwrap().contains("remote"),
+        "{}",
+        got.1
+    );
+    remote(&env, "dr").await;
     let body = create(&admin, "nightly", with(target.clone())["spec"].clone()).await;
     assert_eq!(body["spec"]["replicate"], target);
+}
+
+/// 원격 `name`을 저장소에 직접 등록한다(연결하지 않는다).
+async fn remote(env: &Env, name: &str) {
+    let remote: Remote = Resource::new(
+        name,
+        RemoteSpec {
+            url: "https://10.0.0.9:8006".into(),
+            ca_fingerprint: format!("sha256:{}", "0".repeat(64)),
+            token: "opl_secret".into(),
+            ca_pem: String::new(),
+        },
+    );
+    env.cluster.create(&remote).await.unwrap();
+}
+
+/// PATCH의 `replicate`: 주면 바꾸고(등록한 원격만), `null`이면 끄고, 없으면 그대로 둔다. 옛 노드가
+/// 남아 있으면 켜지 못한다(409).
+#[tokio::test]
+async fn patch_turns_replication_on_and_off() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    remote(&env, "dr").await;
+    create(&admin, "nightly", nightly()).await;
+    let target = json!({ "remote": "dr", "pool": "backups" });
+
+    let (status, body) = admin
+        .patch("/backup-jobs/nightly", json!({ "replicate": target }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["replicate"], target);
+    // 다른 값을 바꾸면 복제는 그대로다.
+    let (status, body) = admin
+        .patch("/backup-jobs/nightly", json!({ "enabled": false }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["replicate"], target);
+
+    for bad in [
+        json!({ "remote": "nope", "pool": "backups" }),
+        json!({ "remote": "dr", "pool": "Bad" }),
+        json!({ "remote": "dr" }),
+    ] {
+        let got = admin
+            .patch("/backup-jobs/nightly", json!({ "replicate": bad }), None)
+            .await;
+        assert_eq!(got.0, StatusCode::BAD_REQUEST, "{bad} -> {}", got.1);
+    }
+
+    let (status, body) = admin
+        .patch("/backup-jobs/nightly", json!({ "replicate": null }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["spec"].get("replicate").is_none(), "{body}");
+    let job = env
+        .cluster
+        .get_by_name::<BackupJobSpec>("nightly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.spec.replicate, None);
+
+    let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
+        "old",
+        NodeSpec {
+            address: "10.0.0.9:8006".into(),
+            maintenance: false,
+            witness: true,
+        },
+    );
+    node.status.version = Some("0.0.1~old".into());
+    env.cluster.create(&node).await.unwrap();
+    assert_error(
+        &admin
+            .patch("/backup-jobs/nightly", json!({ "replicate": target }), None)
+            .await,
+        StatusCode::CONFLICT,
+        "cluster_upgrading",
+    );
 }
 
 #[tokio::test]
