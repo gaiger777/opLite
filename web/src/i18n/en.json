@@ -66,7 +66,11 @@
     "no_role": "Your directory account has no role in opLite. Ask an administrator to map one of your groups.",
     "realm_unavailable": "Cannot reach the directory of this realm. Try again later or ask an administrator.",
     "external_user": "This user signs in through a realm. Change the password in the directory.",
-    "sso_failed": "Single sign-on failed. Try again, or ask an administrator to check the realm."
+    "sso_failed": "Single sign-on failed. Try again, or ask an administrator to check the realm.",
+    "remote_unreachable": "Cannot reach the remote cluster ({{message}}).",
+    "remote_fingerprint_mismatch": "The remote cluster's CA fingerprint is different. Get the CA again and check it.",
+    "remote_is_local": "That address is this cluster. Add a different cluster.",
+    "remote_unauthorized": "The remote cluster rejected the API token. Check that the token still exists there."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -85,6 +89,7 @@
     "realms": "Realms",
     "tokens": "API tokens",
     "cluster": "Cluster",
+    "remotes": "Remote clusters",
     "settings": "Settings"
   },
   "header": {
@@ -1078,6 +1083,51 @@
     "command": "Command",
     "copyCommand": "Copy the command",
     "commandNote": "Add --socket if opld on the new node does not use /run/opl/opld.sock."
+  },
+  "remotes": {
+    "pageHint": "Other opLite clusters this cluster can see. The status is collected every 30 seconds. What you can do on a remote cluster also depends on the role of the user who owns its API token there.",
+    "empty": "No remote clusters.",
+    "add": "Add",
+    "addTitle": "Add a remote cluster",
+    "addDescription": "Register another opLite cluster with its address, the fingerprint of its CA and an API token created on it.",
+    "editTitle": "Edit remote cluster {{name}}",
+    "editNamed": "Edit {{name}}",
+    "refreshNamed": "Refresh {{name}}",
+    "url": "URL",
+    "urlHint": "https://host[:port] of a node of the remote cluster.",
+    "getCa": "Get the CA",
+    "fingerprint": "CA fingerprint",
+    "confirmFingerprint": "This matches the CA fingerprint on the Cluster page of the remote cluster.",
+    "token": "API token",
+    "tokenHint": "Create it on the API tokens page of the remote cluster. Its user's role there limits what this cluster can do.",
+    "tokenSaved": "A token is saved. Leave this empty to keep it.",
+    "cluster": "Cluster",
+    "version": "Version",
+    "nodes": "Nodes",
+    "nodesValue": "{{online}} / {{total}} online",
+    "vms": "VMs",
+    "vmsValue": "{{running}} / {{total}} running",
+    "cpus": "CPUs",
+    "memory": "Memory",
+    "memoryValue": "{{gib}} GiB",
+    "reachable": "Reachable",
+    "unreachable": "Unreachable",
+    "created": "Added remote cluster {{name}}.",
+    "saved": "Saved remote cluster {{name}}.",
+    "deleted": "Deleted remote cluster {{name}}.",
+    "refreshFailed": "Could not refresh {{name}}: {{error}}",
+    "deleteTitle": "Delete remote cluster {{name}}?",
+    "deleteDescription": "This cluster stops showing it. Nothing changes on the remote cluster, and its API token stays there until you delete it.",
+    "backToList": "Back to remote clusters",
+    "vmsTitle": "Virtual machines on {{name}}",
+    "actionRequested": "{{action}} requested for {{name}} on {{remote}}.",
+    "errors": {
+      "probe": "Could not get the CA: {{error}}",
+      "probeFirst": "Get the CA of this URL first.",
+      "confirm": "Check the fingerprint against the remote cluster and confirm it.",
+      "token": "Enter an API token of the remote cluster.",
+      "tokenAgain": "Enter the API token again: the URL or CA changed."
+    }
   },
   "vmForm": {
     "createTitle": "Create a virtual machine",

@@ -5,6 +5,7 @@ import {
   CalendarClock,
   Cpu,
   Database,
+  Globe,
   HardDrive,
   IdCard,
   Import,
@@ -74,6 +75,7 @@ const NAV: {
   { to: "/realms", key: "nav.realms", icon: IdCard, end: false, kind: "realm" },
   { to: "/tokens", key: "nav.tokens", icon: KeyRound, end: false },
   { to: "/cluster", key: "nav.cluster", icon: Boxes, end: false },
+  { to: "/remotes", key: "nav.remotes", icon: Globe, end: false, kind: "remote" },
   { to: "/settings", key: "nav.settings", icon: Settings, end: false },
 ];
 

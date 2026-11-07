@@ -11,6 +11,7 @@ import type {
   VmImport,
   Volume,
 } from "@/api/types";
+import type { RemoteView } from "@/remotes/remotes";
 import type { PoolState } from "@/storage/pools";
 
 /** 테스트용 VM. 필요한 필드만 바꿔 쓴다. */
@@ -284,3 +285,27 @@ export function esxiImport(
 export const FINGERPRINT = Array.from({ length: 32 }, (_, i) =>
   (i * 7 + 16).toString(16).toUpperCase().padStart(2, "0"),
 ).join(":");
+
+/** 테스트용 원격 클러스터. 기본은 닿는 한 노드 클러스터다. */
+export function remote(name: string, status: Partial<RemoteView["status"]> = {}): RemoteView {
+  return {
+    id: `019a0f3c-0000-7000-8002-${name.padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 1,
+    url: `https://${name}.example:8006`,
+    ca_fingerprint: `sha256:${"ab".repeat(32)}`,
+    token_id: "0192f0c1-5d2e-7000-8000-000000000000",
+    status: {
+      reachable: true,
+      checked_at: 1700000000,
+      error: null,
+      cluster_name: name,
+      version: "0.37.0",
+      nodes: { total: 1, online: 1 },
+      vms: { total: 2, running: 1 },
+      cpus: 8,
+      memory_gib: 32,
+      ...status,
+    },
+  };
+}

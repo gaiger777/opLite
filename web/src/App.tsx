@@ -24,6 +24,8 @@ import { NetworksPage } from "@/networks/NetworksPage";
 import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { RealmsPage } from "@/realms/RealmsPage";
+import { RemotePage } from "@/remotes/RemotePage";
+import { RemotesPage } from "@/remotes/RemotesPage";
 import { SecurityGroupPage } from "@/security-groups/SecurityGroupPage";
 import { SecurityGroupsPage } from "@/security-groups/SecurityGroupsPage";
 import { SettingsPage } from "@/settings/SettingsPage";
@@ -75,6 +77,8 @@ function routes() {
             { path: "realms", element: <RealmsPage /> },
             { path: "tokens", element: <TokensPage /> },
             { path: "cluster", element: <ClusterPage /> },
+            { path: "remotes", element: <RemotesPage /> },
+            { path: "remotes/:name", element: <RemotePage /> },
             { path: "settings", element: <SettingsPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],

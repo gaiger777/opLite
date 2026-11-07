@@ -3020,6 +3020,12 @@ export interface components {
             revision: number;
             roles: components["schemas"]["RoleMapping"];
         };
+        RemoteNodeCounts: {
+            /** Format: int64 */
+            online: number;
+            /** Format: int64 */
+            total: number;
+        };
         RemoteProbe: {
             /** @description 받은 CA 인증서의 지문. 원격 클러스터에서 보이는 지문과 같은지 사람이 확인해야 한다. */
             ca_fingerprint: string;
@@ -3074,7 +3080,7 @@ export interface components {
              */
             memory_gib: number | null;
             /** @default null */
-            nodes: components["schemas"]["NodeCounts"] | null;
+            nodes: components["schemas"]["RemoteNodeCounts"] | null;
             /** @default false */
             reachable: boolean;
             /**
@@ -3083,7 +3089,7 @@ export interface components {
              */
             version: string | null;
             /** @default null */
-            vms: components["schemas"]["VmCounts"] | null;
+            vms: components["schemas"]["RemoteVmCounts"] | null;
         };
         /** @description 응답의 원격. 토큰 대신 토큰의 id만 보인다(원격에서 어느 토큰인지 알아보게). */
         RemoteView: {
@@ -3100,6 +3106,12 @@ export interface components {
              */
             token_id: string | null;
             url: string;
+        };
+        RemoteVmCounts: {
+            /** Format: int64 */
+            running: number;
+            /** Format: int64 */
+            total: number;
         };
         ResizeRequest: {
             /**

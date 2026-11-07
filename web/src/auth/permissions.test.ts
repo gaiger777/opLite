@@ -29,6 +29,10 @@ it("mirrors the server roles", () => {
   expect(can("viewer", "read", "settings")).toBe(true);
   expect(can("operator", "write", "settings")).toBe(false);
   expect(can("admin", "write", "settings")).toBe(true);
+  // 원격 클러스터도 누구나 읽고 admin만 바꾼다(중계로 원격을 바꾸는 요청도).
+  expect(can("viewer", "read", "remote")).toBe(true);
+  expect(can("operator", "write", "remote")).toBe(false);
+  expect(can("admin", "write", "remote")).toBe(true);
 });
 
 it("keeps accounts to admins", () => {

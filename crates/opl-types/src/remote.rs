@@ -67,15 +67,16 @@ pub struct RemoteStatus {
     pub memory_gib: Option<u64>,
 }
 
+// 텔레메트리 보고의 `NodeCounts`와 API 문서의 이름이 겹치지 않게 한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(as = RemoteNodeCounts))]
 pub struct NodeCounts {
     pub total: u64,
     pub online: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(as = RemoteVmCounts))]
 pub struct VmCounts {
     pub total: u64,
     pub running: u64,

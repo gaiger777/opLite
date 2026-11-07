@@ -128,6 +128,22 @@ async fn openapi_document_is_served_without_login() {
         "{}",
         doc["components"]["schemas"]["SettingsPatch"]
     );
+    // 원격 상태의 노드·VM 수는 텔레메트리 보고의 것과 이름이 겹치지 않는다.
+    let schemas = &doc["components"]["schemas"];
+    let remote_status = &schemas["RemoteStatus"]["properties"];
+    assert!(
+        remote_status["nodes"]
+            .to_string()
+            .contains("RemoteNodeCounts"),
+        "{remote_status}"
+    );
+    assert!(
+        remote_status["vms"].to_string().contains("RemoteVmCounts"),
+        "{remote_status}"
+    );
+    assert!(schemas["RemoteNodeCounts"]["properties"]["online"].is_object());
+    assert!(schemas["RemoteVmCounts"]["properties"]["ha"].is_null());
+    assert!(schemas["NodeCounts"]["properties"]["witness"].is_object());
     // 백업 작업의 VM 고르기는 세 객체 중 하나다.
     let selector = &doc["components"]["schemas"]["VmSelector"]["oneOf"];
     assert_eq!(selector.as_array().map(Vec::len), Some(3), "{selector}");
