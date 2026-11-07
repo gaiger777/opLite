@@ -1511,7 +1511,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
 볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기)과 백업 작업, VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업, 감사 로그(admin),
-사용자(admin), 인증 영역(admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
+사용자(admin), 인증 영역(LDAP·OIDC, admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
 
@@ -1544,9 +1544,10 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 ## 외부 인증(LDAP)
 
 인증 영역(`Realm`)을 만들면 로컬 사용자 말고도 바깥 LDAP 디렉터리(OpenLDAP, Active Directory 등)의 계정으로
-로그인할 수 있다. 영역은 admin만 보고 만들고 고친다(operator·viewer는 읽기도 **403**). 영역 이름은 리소스 이름
-규칙(1~63자의 영문 소문자·숫자·`-`)이고 `local`은 로컬 사용자를 뜻하는 예약 이름이다. UUID로 읽히는 이름(예:
-`0192f0c1-5d2e-7000-8000-000000000000`)도 API가 id로 읽어 이름으로 부를 수 없으므로 **400**이다.
+로그인할 수 있다(OpenID Connect IdP로 로그인하는 OIDC 영역은 다음 절 "SSO(OIDC)"). 영역은 admin만 보고
+만들고 고친다(operator·viewer는 읽기도 **403**). 영역 이름은 리소스 이름 규칙(1~63자의 영문 소문자·숫자·`-`)이고
+`local`은 로컬 사용자를 뜻하는 예약 이름이다. UUID로 읽히는 이름(예: `0192f0c1-5d2e-7000-8000-000000000000`)도
+API가 id로 읽어 이름으로 부를 수 없으므로 **400**이다.
 
 - **외부 사용자.** 영역 `corp`에 `alice`로 처음 로그인하면 opLite 사용자 `alice@corp`가 생긴다(로컬 사용자 `alice`와는
   다른 사용자다). 이름의 사용자 부분은 소문자로 바꾸고(디렉터리에도 소문자로 찾는다) 1~64자의 `a-z`·`0-9`·`.`·`_`·`-`만
@@ -1682,12 +1683,205 @@ oplctl login --server https://10.0.0.11:8006 --realm corp --user alice   # 기�
 - 같은 사용자가 거의 동시에 두 번 로그인하고 그 사이 디렉터리의 그룹이 바뀌면, 옛 그룹을 읽은 로그인이 나중에 써서 역할이
   옛 것으로 되돌아갈 수 있다(드문 경쟁 — 다음 로그인에 바로잡힌다).
 - 사용자 부분이 `a-z`·`0-9`·`.`·`_`·`-`가 아닌 계정(공백·`@`·한글 등)은 로그인할 수 없다. 사용자·그룹 동기화, 외부 사용자의
-  2단계 인증, SSO(OIDC)는 없다.
+  2단계 인증은 없다. IdP로 로그인하는 영역은 아래 "SSO(OIDC)".
+
+## SSO(OIDC)
+
+OIDC 영역을 만들면 사용자가 OpenID Connect IdP(Keycloak, Okta, Microsoft Entra ID 등)에서 로그인하고 opLite로
+돌아온다(인가 코드 흐름과 PKCE). 영역의 공통 규칙은 "외부 인증(LDAP)"과 같다: admin만 보고 만들고 고치며, 이름 규칙,
+외부 사용자 `<사용자>@<영역>`, 로그인할 때마다 그룹 → 역할 매핑(앞뒤 공백을 떼고 ASCII 대소문자 무시, 가장 높은 역할,
+기본 역할, 없으면 `no_role`), 역할이 바뀌면 그 사용자의 다른 세션이 끝남, 외부 사용자의 API 토큰, 영역을 지울 때가 모두
+같다. 그룹 값은 그룹 클레임의 문자열이다. OIDC 영역 사용자는 비밀번호로 로그인하지 않는다: `POST /auth/login`에 OIDC
+영역을 주면 이름 모양과 관계없이(이메일 모양 이름도) 늘 **400** `invalid_request`("realm okta signs in through its
+identity provider" — 시도 제한에 세지 않음)다.
+
+- **이름.** OIDC 영역의 사용자 부분은 이름 클레임을 소문자로 바꾼 것이고 1~128자의 `a-z`·`0-9`·`.`·`_`·`+`·`-`와 안쪽
+  `@` 하나까지다(이메일 모양 — 앞뒤가 비어 있지 않음, 공백·`/`·`:`·`=` 없음). 그래서 Okta·Entra ID의 `preferred_username`
+  `Alice@Corp.com`은 그대로 opLite 사용자 `alice@corp.com@okta`가 된다(영역은 마지막 `@` 뒤). LDAP 영역의 규칙(1~64자,
+  `@` 없음)은 그대로다.
+- **IdP 사용자에 묶기.** 외부 사용자를 처음 만들 때 IdP의 사용자(`"<issuer> <sub>"`)를 적어 둔다(`subject`). 뒤에 같은
+  이름으로 로그인한 사람의 `sub`가 다르면(IdP에서 이름을 다른 사람에게 다시 준 경우 등) `sso_failed`로 거절하고 사용자는
+  그대로 둔다(opld 로그에 그 이름과 "subject mismatch"). `subject`가 없는 사용자(이 기능 전에 만들어졌거나 LDAP 영역이었던
+  이름)는 다음 OIDC 로그인의 것을 적는다.
+
+- **IdP에 등록.** IdP에 opLite를 웹 애플리케이션(인가 코드 흐름)으로 등록한다.
+  - 리디렉트 URI는 `https://<브라우저가 연 노드 주소>/api/v1/auth/oidc/callback`이다(예:
+    `https://10.0.0.11:8006/api/v1/auth/oidc/callback`). opld는 로그인을 시작할 때 요청의 `Host` 헤더로 이 주소를 만들므로
+    사용자가 들어오는 주소(노드마다, 이름과 IP도 따로)를 모두 등록한다. 리버스 프록시 뒤라면 프록시가 `Host`로 넘기는
+    주소를 등록한다. 웹의 영역 대화상자가 지금 노드의 값을 복사 버튼과 함께 보이고, `oplctl realm show`는 노드 주소 뒤에
+    붙일 경로(`callback path`)를 보인다.
+  - 클라이언트는 기밀 클라이언트(클라이언트 비밀, 토큰 끝점에 `client_secret_basic`)나 공개 클라이언트(비밀 없음)다.
+    PKCE(S256)는 둘 다 늘 쓴다.
+  - 사용자 이름 클레임(기본 `preferred_username`)은 위 이름 규칙에 맞는 문자열이어야 한다(이메일 모양도 된다). 그룹
+    클레임(기본 `groups`)은 문자열 배열이다(없으면 그룹 없음).
+  - 노드도 IdP에 직접 닿아야 한다(discovery·JWKS·토큰·userinfo 끝점, https만). 브라우저는 IdP와 노드 둘 다에 닿아야 한다.
+
+```bash
+# Keycloak(영역 corp): 클라이언트 oplite(Client authentication 켬 — 끄면 공개 클라이언트), Valid redirect URIs에
+# 위 주소. 클라이언트 범위에 "Group Membership" 매퍼(Token Claim Name groups, Add to ID token 켬, Full group path
+# 끔 — 켜면 값이 /admins 꼴). preferred_username은 Keycloak 사용자 이름 그대로다.
+oplctl realm add-oidc kc --display "Keycloak" \
+  --issuer https://kc.example.com/realms/corp --client-id oplite --client-secret-file /root/kc-secret \
+  --group admins=admin --group ops=operator --default-role viewer
+# Okta(사용자 정의 인가 서버 default): 앱(OIDC Web Application)의 Sign-in redirect URIs에 위 주소. 인가 서버의 Claims에
+# groups(Groups 필터, ID Token·Always). preferred_username은 로그인 이메일이라 사용자는 alice@example.com@okta가 된다.
+oplctl realm add-oidc okta --display "Okta" \
+  --issuer https://example.okta.com/oauth2/default --client-id 0oa1b2c3d4 --client-secret-file /root/okta-secret \
+  --group opl-admins=admin --group opl-operators=operator
+# Microsoft Entra ID: 앱 등록(웹 플랫폼)의 리디렉트 URI에 위 주소, "인증서 및 비밀"의 클라이언트 비밀, "토큰 구성"의
+# 그룹 클레임 추가(보안 그룹 — ID 토큰의 groups에 그룹 개체 ID가 들어간다). preferred_username은 UPN이라 사용자는
+# alice@contoso.com@entra가 된다. 그룹이 200개를 넘는 사용자는 groups 클레임이 오지 않아 그룹이 없다.
+oplctl realm add-oidc entra --issuer https://login.microsoftonline.com/<테넌트 ID>/v2.0 \
+  --client-id <애플리케이션 ID> --client-secret-file /root/entra-secret \
+  --group 5f2c9a1e-0000-4000-8000-000000000001=admin
+oplctl realm list
+# NAME  DISPLAY   KIND  URL
+# kc    Keycloak  oidc  https://kc.example.com/realms/corp
+oplctl realm show kc       # issuer·client id·client secret: set|none·scopes·클레임·ca·timeout과 callback path
+oplctl realm test kc       # OIDC는 사용자·비밀번호 없이 IdP만 확인한다(--user는 경고하고 무시)
+# STEP       RESULT  MESSAGE
+# discovery  ok      issuer https://kc.example.com/realms/corp, authorization endpoint …, token endpoint …
+# jwks       ok      1 RS256 and 0 ES256 signing keys
+oplctl realm set-oidc kc --timeout 5                  # 준 것만 바꾼다(읽은 revision으로 — 그 사이 바뀌었으면 412)
+oplctl realm set-oidc kc --client-secret-file /root/kc-secret   # 새 클라이언트 비밀
+# issuer·client ID·CA를 바꿀 때는 비밀도 다시 준다(주지 않으면 서버가 400)
+oplctl realm set-oidc kc --issuer https://sso.example.com/realms/corp --client-secret-file /root/kc-secret
+oplctl realm set-oidc kc --clear-client-secret        # 공개 클라이언트로(IdP 쪽도 바꾼다)
+oplctl realm set-oidc kc --scope openid --scope profile --scope groups   # scope 목록 전체를 바꾼다
+oplctl realm set-oidc kc --clear-ca --clear-default-role --clear-groups
+```
+
+- **설정 항목**(API `backend`의 필드 — `"kind": "oidc"`, oplctl 선택):
+  - `issuer`(`--issuer`): IdP의 issuer. 호스트가 있는 `https://` URL이고 쿼리·조각·사용자 정보·공백이 없어야 한다.
+    discovery 문서(`<issuer>/.well-known/openid-configuration` — issuer 끝의 `/`는 하나로 합친다)의 `issuer`, ID 토큰의
+    `iss`와 **글자 그대로** 같아야 하므로 끝 `/`까지 IdP가 알리는 대로 쓴다(Keycloak `https://<호스트>/realms/<영역>` —
+    옛 판은 `/auth/realms/<영역>`, Okta `https://<조직>.okta.com/oauth2/default`, Entra ID
+    `https://login.microsoftonline.com/<테넌트 ID>/v2.0`).
+  - `client_id`(`--client-id`): 비어 있으면 안 된다.
+  - `client_secret`(`--client-secret-file <파일|->`): 없으면 공개 클라이언트. API 응답에 없고 `has_client_secret`으로 있는지만
+    보인다. 바꾸기(`PUT`)에서 빼면 저장된 값을 두는데 `issuer`·`client_id`·`ca_pem`이 모두 그대로일 때만이다: 하나라도
+    바꾸면서 빼면 **400** `invalid_request`("client_secret must be given again when issuer, client_id or ca_pem changes" —
+    저장된 비밀을 다른 IdP·클라이언트로 보내지 않는다). 저장된 비밀이 없으면(공개 클라이언트) 이 규칙은 없다. `""`이면
+    지운다(`--clear-client-secret`, 웹은 "저장된 비밀 지우기(공개 클라이언트)").
+  - 서버는 저장·비교 전에 `issuer`·`client_id`의 앞뒤 공백을 떼고 `ca_pem`은 LDAP처럼 다듬는다(CRLF → LF, 앞뒤 공백).
+  - `scopes`(`--scope`, 여러 번, 기본 `openid` `profile` `email`): `openid`가 있어야 하고 값마다 공백 없는 비어 있지 않은 글.
+    authorization 요청에 공백으로 이어 보낸다. `set-oidc`에서 주면 목록 전체를 바꾼다.
+  - `username_claim`(`--username-claim`, 기본 `preferred_username`), `groups_claim`(`--groups-claim`, 기본 `groups`):
+    비어 있으면 안 된다.
+  - `ca_pem`(`--ca-file`): IdP 인증서를 확인할 CA(PEM). 있으면 그 인증서들만 믿고, 없으면 시스템 루트를 쓴다. 호스트
+    이름도 확인한다.
+  - `timeout_secs`(`--timeout`, 기본 10, 1~30): IdP 요청마다의 시간 제한(초).
+  - `display`(`--display`): 로그인 화면 버튼의 이름. `roles`: `groups`(`--group <그룹 클레임 값>=<role>`, 여러 번)와
+    `default`(`--default-role`).
+  - Entra ID 메모: 클레임 변환(예: `ExtractMailPrefix`로 이메일 앞부분만)을 쓰려면 앱 매니페스트에
+    `acceptMappedClaims: true`가 필요하고, 앱 전용 서명 키는 discovery 주소에 `?appid=`가 붙어야 하는데 opLite는
+    `<issuer>/.well-known/openid-configuration`만 읽으므로 맞지 않는다 — 쓰지 않는다. 이메일 모양 이름을 그대로 쓰므로 보통은
+    변환이 필요 없다.
+  - `set-oidc`는 영역을 읽어 준 것만 바꾸고, 없애는 선택은 `--clear-client-secret`·`--clear-ca`·`--clear-default-role`·
+    `--clear-groups`다(같은 값을 정하는 선택과 함께 줄 수 없다). `set-ldap`·`set-oidc`는 종류가 다른 영역을 거절한다
+    ("realm kc is not an LDAP realm (its kind is oidc)"). 나쁜 값은 **400** `invalid_request`다.
+- **흐름.**
+  1. 로그인 화면의 "<표시 이름>(으)로 로그인"이 `GET /api/v1/auth/oidc/<영역>/start`로 간다(페이지 이동). 노드는 IdP의
+     discovery 문서를 읽고(노드 메모리에 10분), 요청의 `Host`로 리디렉트 URI를 만들고, 무작위 `state`·`nonce`·PKCE 검증자와
+     그 리디렉트 URI를 로그인 상태 쿠키에 넣은 뒤 IdP의 authorization endpoint로 302한다(`response_type=code`,
+     `client_id`, `redirect_uri`, `scope`, `state`, `nonce`, `code_challenge`, `code_challenge_method=S256`).
+  2. 사용자가 IdP에서 로그인하면 IdP가 `/api/v1/auth/oidc/callback?code=…&state=…`로 돌려보낸다. IdP는 시작할 때
+     보낸 리디렉트 URI(그 주소)로 돌려보내는데, 상태가 쿠키에 있으므로 그 주소 뒤의 어느 노드가 받아도 된다(노드들 앞의
+     로드 밸런서·DNS 이름).
+  3. 콜백은 쿠키를 확인하고(서명, 10분 안, 쿼리의 `state`와 같음), 인가 응답의 `iss`를 본다(RFC 9207: discovery 문서가
+     `authorization_response_iss_parameter_supported: true`면 있어야 하고, 있으면 늘 issuer와 같아야 한다 — 다른 IdP의
+     응답을 섞는 공격 막기). 토큰 끝점에 코드·쿠키의 `redirect_uri`·`code_verifier`·`client_id`를 폼으로 보내(기밀
+     클라이언트는 `client_secret_basic`) ID 토큰을 받는다. 콜백은 `Host`를 보지 않는다.
+  4. ID 토큰을 확인한다: 서명은 RS256(RSA 2048~8192비트)·ES256(P-256)만이고 `none`·`HS256` 등은 거절, 헤더에 `crit`가
+     있으면 거절, 키는 IdP의 JWKS(노드 메모리에 10분, `use`가 있으면 `sig`만; 모르는 `kid`면 다시 받는데 마지막으로 받은 지
+     10초가 지났을 때만 — IdP 키 교체를 따라감; 다시 받아도 그 `kid`가 없으면 `kid` 없이 내보인 키로 확인), `iss`가 issuer와
+     같음, `aud`에 client ID(여럿이거나 `azp`가 있으면 `azp`가 client ID), `exp`·`iat`·(있으면) `nbf`는 5분 오차, `nonce`가
+     쿠키의 것과 같음, `sub`가 있음.
+  5. 이름·그룹 클레임 가운데 ID 토큰에 없는 것이 있고 IdP에 userinfo 끝점이 있으면 액세스 토큰으로 userinfo를 한 번 읽어
+     빈 것만 채운다(userinfo의 `sub`가 ID 토큰과 다르면 실패). 이름 → `<이름>@<영역>`, 그룹 → 역할, 사용자 만들기·고치기
+     (LDAP과 같음, IdP 사용자에 묶기) → 세션 쿠키(로컬 로그인과 같은 12시간 세션), 로그인 상태 쿠키 지우기 → `/`로 302.
+     로그인 전에 열려던 주소로는 돌아가지 않는다.
+- **IdP 요청.** discovery·JWKS를 받지 못하면 그 실패를 같은 영역(같은 revision)에서 15초 동안 기억해 다시 받지 않고 같은
+  오류를 낸다(막힌 IdP로 요청을 쏟지 않게). 같은 영역을 동시에 여러 로그인이 물어도 한 번만 받는다. IdP 응답 본문은 1 MiB까지만
+  읽는다(넘으면 실패).
+- **쿠키.** 로그인 상태 쿠키 `opl_oidc`의 값은 `{영역, state, nonce, PKCE 검증자, 리디렉트 URI, 만든 시각}` JSON의 base64url과 그 HMAC-SHA256
+  이다. HMAC 키는 클러스터 CA 비밀 키(모든 노드에 있음)에서 HKDF-SHA256(정보 `opl-oidc-state`)으로 만들므로 새로 저장하는
+  값 없이 어느 노드나 같은 키를 얻는다. 속성은 `HttpOnly; Secure; SameSite=Lax; Path=/api/v1/auth/oidc; Max-Age=600`이다
+  (IdP에서 돌아오는 최상위 이동에 쿠키가 가도록 `Lax`). 콜백은 성공·실패 모두 이 쿠키를 지운다. 브라우저가 쿠키를 막으면
+  SSO 로그인은 늘 실패한다.
+- **오류.** 실패하면 `/login?error=<코드>`로 돌아가고 로그인 화면이 문구를 보인다. 원인은 opld 로그에 경고("an OIDC login
+  failed" 또는 "cannot start an OIDC login", `journalctl -u opld`)로 남는다.
+  - `sso_failed`: 쿠키 없음·서명이 틀림·10분 지남·`state` 다름, IdP가 `error`로 돌려보냄(사용자가 거절 등), 인가 응답의
+    `iss`가 다르거나(지원한다는 IdP인데) 없음, 토큰 끝점이 코드를 거절함(4xx `invalid_grant` — 코드가 틀렸거나 이미 썼거나
+    만료), ID 토큰 확인 실패, userinfo가 액세스 토큰을 거절함(401·403), 이름 클레임이 없거나 글이 아니거나 이름 규칙에 맞지
+    않음, 그룹 클레임이 문자열 배열이 아님, userinfo `sub` 다름, 같은 이름의 사용자가 다른 IdP 사용자에 묶여 있음, 시작할 때
+    OIDC 영역이 아니거나 없음, 롤링 업그레이드 중(옛 opld 노드가 있을 때 — LDAP의 409 대신).
+  - `no_role`: 매핑되는 역할이 없음.
+  - `realm_unavailable`: IdP에 닿지 못함(연결·TLS·믿지 않는 인증서·시간 제한) 또는 IdP 끝점(discovery·JWKS·토큰·userinfo)이
+    2xx가 아닌 응답(위의 `invalid_grant`·userinfo 401·403 빼고 — 토큰 끝점의 `invalid_client` 같은 클라이언트 인증 거절도
+    여기다), 시작이나 콜백에서 discovery 문서를 읽지 못하거나 맞지 않음(issuer 다름, https가 아닌 끝점).
+  - 시작 요청의 `Host` 헤더가 없거나 호스트 글자가 아니면 **400**(JSON)이다. 콜백은 `Host`를 보지 않으므로 늘 302이고
+    로그인 상태 쿠키를 지운다.
+- **시도 제한.** OIDC 로그인(시작·콜백)은 로그인 시도 제한을 쓰지 않는다. 맞힐 비밀이 없기 때문이다: `state`는 서명된
+  쿠키와 같아야 하고, 코드는 IdP가 한 번만 받으며 PKCE 검증자에 묶인다. 같은 NAT·프록시 뒤의 정상 실패(쿠키 만료 등)가
+  그 주소의 모든 비밀번호 로그인을 막지 않게 한다.
+- **감사 로그.** 콜백 `GET /auth/oidc/callback`을 적는다(다른 `GET`처럼 빼지 않음). `path`는 쿼리를 뺀
+  `/auth/oidc/callback`이다. `detail`은 성공이면 `realm=kc username=alice`(사용자는 그 외부 사용자), 실패면
+  `realm=kc error=no_role`이고 쿠키를 확인하기 전 실패는 `realm=<unknown>`이다. 실패 원인은 적지 않고 코드만이다(원인은 opld
+  로그). 쿼리(코드·`state`)와 토큰은 어디에도 적지 않는다. 시작은 적지 않는다.
+- **시험 동작.** `oplctl realm test <영역>`(웹: 영역의 "시험", API `POST /api/v1/realms/{key}/actions/test`를 본문 없이)은
+  `discovery`(문서 받기, issuer 같음, 끝점 https)와 `jwks`(쓸 수 있는 RS256·ES256 키 수, 없으면 실패) 단계를 캐시 없이
+  돌린다. 아무도 로그인하지 않으므로 클라이언트 비밀·리디렉트 URI·클레임은 확인하지 않는다 — 처음 한 번은 브라우저로
+  로그인해 본다. LDAP 영역 시험은 `--user`(API `username`·`password`)가 없으면 **400**이다.
+- **웹.** 로그인 화면은 OIDC 영역마다 아이디·비밀번호 폼 아래 "또는" 뒤에 "<표시 이름 또는 이름>(으)로 로그인" 버튼을
+  보이고, 영역 고르기에는 로컬과 LDAP 영역만 있다. "인증 영역" 화면은 만들기에서 종류(LDAP/OIDC)를 고르고(고치기에서는
+  종류를 바꾸지 않음), OIDC 폼(issuer, 클라이언트 ID, 클라이언트 비밀 — 비워 두면 그대로, issuer·클라이언트 ID·CA를
+  바꾸면 다시 넣으라고 알림, scope는 공백으로 나눈 한 줄, 클레임, CA, 시간 제한, 그룹 → 역할, 기본 역할)과 이 노드의
+  리디렉트 URI(복사 버튼), 입력 없는 시험(단계 표)이 있다. 목록의 URL 열은 issuer다.
+- **API.** 영역 API는 LDAP과 같고(`backend`의 `kind`가 `oidc`, 응답은 `has_client_secret`), `GET /api/v1/auth/realms`의
+  `kind`가 `oidc`다. 로그인 흐름은 `GET /api/v1/auth/oidc/{realm}/start`와 `GET /api/v1/auth/oidc/callback`(둘 다 인증
+  없음, 302)이다.
+- **oplctl.** CLI는 브라우저 SSO를 하지 않는다: `oplctl login --realm <OIDC 영역>`은 비밀번호를 묻기 전에 "sign in to kc in
+  the web UI, create an API token there and run `oplctl login --token-file`"로 끝난다(종료 1). SSO 사용자는 웹으로 로그인해
+  API 토큰 화면에서 토큰을 만들고 파일에 넣은 뒤 `oplctl login --token-file`로 저장한다:
+
+  ```bash
+  oplctl login --server https://10.0.0.11:8006 --ca-fingerprint sha256:... --token-file /root/opl-token
+  # logged in to https://10.0.0.11:8006 as alice@example.com@okta
+  ```
+
+  `--token-file <파일|->`(`-`면 표준 입력)는 `--user`·`--realm`·`--password-file`과 함께 줄 수 없다. 서버 CA는 비밀번호 로그인처럼
+  `--ca-fingerprint`로 고정하고(같은 서버에 다시 로그인하면 저장한 CA), 그 토큰으로 `GET /api/v1/auth/whoami`를 불러
+  확인한 뒤(받지 않으면 저장하지 않음) 로그인 정보 파일에 넣는다. 다시 로그인할 때 이전 토큰은 새 토큰과 다르고 이 CLI의
+  비밀번호 로그인이 만든 토큰(이름 `oplctl-…`)일 때만 서버에서 지운다 — `--token-file`로 넣은 웹 토큰은 두므로 필요 없으면
+  웹이나 `oplctl token delete`로 지운다. `oplctl logout`도 같다: login이 만든 토큰(`oplctl-…`)만 서버에서 지우고, 웹에서
+  만든 토큰이면 로컬 설정에서만 지운 뒤 "the token stays valid on the server; delete it in the web UI"라고 알린다.
+
+한계:
+
+- 로그아웃은 opLite 세션만 끝낸다(IdP 로그아웃·RP-initiated·back-channel 로그아웃 없음). IdP에 아직 로그인되어 있으면 다시
+  누르면 바로 들어온다.
+- IdP는 로그인할 때만 본다. IdP에서 계정을 막거나 그룹을 빼도 이미 있는 세션(최대 12시간)과 API 토큰은 남고 역할은 다음
+  로그인에 바뀐다. 바로 막으려면 opLite에서 그 사용자를 지운다.
+- 노드마다 주소가 다르면 IdP에 리디렉트 URI를 주소 수만큼 등록해야 한다. 리버스 프록시 뒤면 프록시가 넘기는 `Host`의 주소가
+  리디렉트 URI가 되고 scheme은 늘 `https`다.
+- 외부 사용자는 처음 로그인한 IdP 사용자(`sub`)에 묶인다: IdP에서 계정을 지우고 같은 이름으로 다시 만들면(새 `sub`) 로그인이
+  `sso_failed`다 — 같은 사람이면 opLite에서 그 사용자를 지운 뒤(토큰도 지워짐) 다시 로그인한다. 영역의 issuer를 바꾸면
+  모든 사용자가 같은 이유로 거절된다. Entra ID는 `sub`가 앱 등록마다 다르므로 앱 등록을 바꾸면(새 `client_id`) `sub`가
+  모두 바뀌어 기존 사용자가 모두 `sso_failed`다 — 그 사용자들을 지워야 한다. `subject`가 없는 옛 사용자는 그 이름으로 처음 OIDC 로그인한 사람에게 묶인다.
+- discovery·JWKS 받기가 실패하면 IdP가 돌아와도 15초 동안은 같은 오류다.
+- discovery·JWKS는 노드마다 10분 둔다: IdP에서 지운 서명 키도 그동안은 그 노드에서 믿는다. 영역을 고치면 바로 새로 받는다.
+- 이름 규칙(1~128자, 공백·한글 등 없음)에 맞지 않는 이름 클레임은 쓸 수 없다. 그룹은 클레임 값만 보고(IdP의 그룹 API를
+  부르지 않음) Entra ID의 그룹 초과(groups 대신 `_claim_names`)는 그룹 없음이다.
+- 클라이언트 인증은 `client_secret_basic`과 공개 클라이언트뿐이다(`client_secret_post`·`private_key_jwt`·mTLS 없음).
+  `response_mode=form_post`, 요청 객체·PAR, 서명 알고리즘 RS256·ES256 밖(PS256·EdDSA 등)과 암호화한 ID 토큰은 없다.
+- 클라이언트 비밀은 Raft에 평문으로 있다(서비스 계정 비밀번호와 같음). oplctl은 브라우저 SSO를 하지 않는다(웹에서 만든 토큰을
+  `oplctl login --token-file`로).
 
 ## 감사 로그
 
 노드마다 그 노드가 받은 바꾸는 API 요청(`POST`·`PUT`·`PATCH`·`DELETE`, 성공·실패와 401·403 포함), 로그인 성공·실패,
-로그아웃, VM 콘솔 열기(`GET /api/v1/vms/{key}/console`)를 한 줄 JSON으로 적는다. 다른 `GET`(감사 로그 읽기도),
+로그아웃, VM 콘솔 열기(`GET /api/v1/vms/{key}/console`), OIDC 로그인 콜백(`GET /api/v1/auth/oidc/callback`)을 한 줄 JSON으로 적는다. 다른 `GET`(감사 로그 읽기도),
 웹 정적 파일, 노드 사이 RPC, 제어 소켓(`cluster init`·`join`·`leave`), 맞는 라우트가 없는 요청은 적지 않는다.
 요청 본문은 적지 않는다.
 
@@ -1710,7 +1904,7 @@ oplctl -o json audit --since 7d                  # 응답 그대로(항목의 �
   템플릿>"`(예: `POST /vms/{key}/actions/{action}`, `DELETE /users/{key}`, `POST /auth/login`)이라 새 API도 저절로
   이름을 가진다. `target`은 템플릿의 첫 조각과 첫 매개변수 값(`{"kind":"vms","key":"web-1"}`)이고, 매개변수가 없는
   경로는 `null`이다. `detail`은 핸들러가 남긴 짧은 문자열이다: 로그인은 `username=<이름>`(이름 형식이 아니면
-  `username=<invalid>` — 비밀번호를 이름 칸에 넣었을 수 있다, 영역 로그인은 뒤에 ` realm=<영역>`), 구독 키 넣기는 `id=<키 id>`. 비밀번호·키·토큰은
+  `username=<invalid>` — 비밀번호를 이름 칸에 넣었을 수 있다, 영역 로그인은 뒤에 ` realm=<영역>`), OIDC 콜백은 `realm=<영역> username=<이름>` 또는 `realm=<영역> error=<코드>`, 구독 키 넣기는 `id=<키 id>`. 비밀번호·키·토큰은
   어디에도 넣지 않는다. 로그인에 성공하면 그 사용자, 로그아웃은 세션의 사용자가 `user`다. `path`·`target.key`·
   `detail`·`user`는 512바이트까지만 적는다(넘으면 글자 경계에서 잘라 끝에 `…`).
 - **파일.** `{data_dir}/audit/audit.log`(패키지는 `/var/lib/opl/audit/audit.log`). 디렉터리는 0700, 파일은 0600이다.
