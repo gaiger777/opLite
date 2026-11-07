@@ -14,8 +14,8 @@ use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
     AppState, AuditLog, BackupJobScheduler, ClusterJanitor, HaManager, HaManagerConfig,
-    IncomingConfig, IncomingMigrations, SnapshotScheduler, TaskRunner, TaskRunnerConfig,
-    TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates,
+    IncomingConfig, IncomingMigrations, RemotePoller, SnapshotScheduler, TaskRunner,
+    TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
@@ -131,6 +131,8 @@ struct Services {
     updates: Option<UpdateAgent>,
     /// 리더가 텔레메트리 보고를 보낸다(설정에서 켰을 때).
     telemetry: TelemetryReporter,
+    /// 리더가 원격 클러스터의 상태를 모은다.
+    remotes: RemotePoller,
     /// API가 멈춘 뒤 남은 감사 항목을 쓰고 닫는다.
     audit: Arc<AuditLog>,
 }
@@ -151,6 +153,7 @@ impl Services {
         self.janitor.shutdown().await;
         self.backups.shutdown().await;
         self.telemetry.shutdown().await;
+        self.remotes.shutdown().await;
         self.recovery.shutdown().await;
         self.pools.shutdown().await;
         if let Some(updates) = self.updates {
@@ -476,6 +479,7 @@ impl Member {
         let janitor = ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config());
         let backups = BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config());
         let telemetry = TelemetryReporter::spawn(state.clone(), telemetry_config);
+        let remotes = RemotePoller::spawn(state.clone(), config.remotes.poller_config());
         let recovery = HaManager::spawn(state.clone(), HaManagerConfig::default());
         let audit = state.audit.clone();
         let app = opl_api::router(state).merge(crate::web::router());
@@ -507,6 +511,7 @@ impl Member {
                 janitor,
                 backups,
                 telemetry,
+                remotes,
                 audit,
                 recovery,
                 pools,

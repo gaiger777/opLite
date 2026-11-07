@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opl_api::{
-    AuditConfig, BackupJobSchedulerConfig, ClusterJanitorConfig, SnapshotSchedulerConfig,
-    TelemetryConfig, UpdatesConfig,
+    AuditConfig, BackupJobSchedulerConfig, ClusterJanitorConfig, RemotePollerConfig,
+    SnapshotSchedulerConfig, TelemetryConfig, UpdatesConfig,
 };
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
@@ -71,6 +71,8 @@ pub struct Config {
     pub telemetry: TelemetrySection,
     #[serde(default)]
     pub audit: AuditSection,
+    #[serde(default)]
+    pub remotes: RemotesSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -554,6 +556,49 @@ impl TelemetrySection {
             ..TelemetryConfig::default()
         })
     }
+}
+
+/// 원격 클러스터 상태 수집(리더). 원격은 API(`/remotes`)로 등록한다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemotesSection {
+    /// 원격마다 상태를 모으는 간격
+    #[serde(
+        default = "default_remotes_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub interval: Duration,
+    /// 모을 때가 됐는지 확인하는 간격
+    #[serde(
+        default = "default_remotes_tick",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub tick: Duration,
+}
+
+impl Default for RemotesSection {
+    fn default() -> Self {
+        Self {
+            interval: default_remotes_interval(),
+            tick: default_remotes_tick(),
+        }
+    }
+}
+
+impl RemotesSection {
+    pub fn poller_config(&self) -> RemotePollerConfig {
+        RemotePollerConfig {
+            tick: self.tick,
+            interval: self.interval,
+        }
+    }
+}
+
+fn default_remotes_interval() -> Duration {
+    Duration::from_secs(30)
+}
+fn default_remotes_tick() -> Duration {
+    Duration::from_secs(5)
 }
 
 /// 감사 로그(`{data_dir}/audit/audit.log`). API를 여는 노드만 쓴다.
@@ -1373,6 +1418,28 @@ mod tests {
             assert!(
                 toml::from_str::<Config>(&format!(
                     "name = \"n\"\naddress = \"h\"\n[telemetry]\n{bad}"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn remotes_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.remotes, RemotesSection::default());
+        let p = c.remotes.poller_config();
+        assert_eq!(p.interval, Duration::from_secs(30));
+        assert_eq!(p.tick, Duration::from_secs(5));
+        let c = parse("name = \"n\"\naddress = \"h\"\n[remotes]\ninterval = \"2s\"\ntick = \"1s\"");
+        let p = c.remotes.poller_config();
+        assert_eq!(p.interval, Duration::from_secs(2));
+        assert_eq!(p.tick, Duration::from_secs(1));
+        for bad in ["interval = \"0s\"", "tick = \"x\"", "url = \"https://h\""] {
+            assert!(
+                toml::from_str::<Config>(&format!(
+                    "name = \"n\"\naddress = \"h\"\n[remotes]\n{bad}"
                 ))
                 .is_err(),
                 "{bad}"

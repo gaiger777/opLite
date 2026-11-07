@@ -509,6 +509,81 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/remotes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_remotes"];
+        put?: never;
+        /** 원격을 확인하고([`verify`]) 저장한 뒤 곧 상태를 한 번 모은다. 나쁜 값은 400 `invalid_request`. */
+        post: operations["create_remote"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/remotes/probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 원격의 CA를 인증서를 검증하지 않고 받아 지문을 돌려준다(웹이 등록 전에 보여 주고 확인받는다).
+         *     30초 안에 받지 못하면 502 `remote_unreachable`.
+         */
+        post: operations["probe_remote"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/remotes/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_remote"];
+        /**
+         * 원격을 통째로 바꾼다(`token` 규칙은 [`RemoteRequest`]). 바뀌면 다시 확인하고 상태를 곧 모은다.
+         *     확인하는 사이에 상태만 바뀌었으면(수집기 따위) 다시 확인하지 않고 새 revision에 쓴다(`If-Match`도
+         *     그대로 통과). spec이 바뀌었으면 `If-Match`가 있으면 412, 없으면 다시 읽어 바꾼다.
+         */
+        put: operations["update_remote"];
+        post?: never;
+        delete: operations["delete_remote"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/remotes/{key}/actions/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 원격 상태를 곧 다시 모아 적고 돌려준다. */
+        post: operations["refresh_remote"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/security-groups": {
         parameters: {
             query?: never;
@@ -1961,6 +2036,26 @@ export interface components {
             revision: number;
         };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_RemoteView: {
+            items: {
+                ca_fingerprint: string;
+                /** Format: uuid */
+                id: string;
+                name: string;
+                /** Format: int64 */
+                revision: number;
+                status: components["schemas"]["RemoteStatus"];
+                /**
+                 * Format: uuid
+                 * @description 저장한 API 토큰의 id
+                 */
+                token_id: string | null;
+                url: string;
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_Resource_BackupJobSpec_BackupJobStatus: {
             items: {
                 /** Format: uuid */
@@ -2924,6 +3019,87 @@ export interface components {
             /** Format: int64 */
             revision: number;
             roles: components["schemas"]["RoleMapping"];
+        };
+        RemoteProbe: {
+            /** @description 받은 CA 인증서의 지문. 원격 클러스터에서 보이는 지문과 같은지 사람이 확인해야 한다. */
+            ca_fingerprint: string;
+            /** @description 정규화한 URL */
+            url: string;
+        };
+        RemoteProbeRequest: {
+            /** @description `https://<호스트>[:포트]` */
+            url: string;
+        };
+        /**
+         * @description 원격 만들기·바꾸기 본문. 바꾸기는 통째로 바꾸되, `token`을 빼면 저장된 토큰을 그대로 둔다
+         *     (`url`·`ca_fingerprint`가 모두 그대로일 때만 — 하나라도 바뀌면 400). 저장하기 전에 원격에 연결해
+         *     CA 지문과 토큰을 확인한다(30초 제한). 확인한 CA 인증서는 저장해 두고 연결할 때 다시 받지 않으며,
+         *     `url`이나 `ca_fingerprint`가 바뀔 때만 다시 받는다.
+         */
+        RemoteRequest: {
+            /** @description 원격 클러스터 CA의 지문(`sha256:<16진수>` — 대문자·`:` 구분도 받는다) */
+            ca_fingerprint: string;
+            /** @description 만들 때 필요하다. 바꿀 때 주면 지금 이름과 같아야 한다. */
+            name?: string;
+            /** @description 원격 클러스터에서 만든 API 토큰. 만들 때 필요하다. */
+            token?: string;
+            /** @description `https://<호스트>[:포트]` */
+            url: string;
+        };
+        /** @description 리더가 주기적으로 모은 원격 클러스터의 상태. 모으지 못하면 `reachable`이 false이고 `error`에 이유가 있다. */
+        RemoteStatus: {
+            /**
+             * Format: int64
+             * @description 상태가 마지막으로 바뀐 시각(유닉스 초). 같은 상태면 다시 쓰지 않으므로 마지막 확인 시각이 아니다.
+             * @default null
+             */
+            checked_at: number | null;
+            /** @default null */
+            cluster_name: string | null;
+            /**
+             * Format: int64
+             * @description 위트니스를 뺀 노드의 CPU 합
+             * @default null
+             */
+            cpus: number | null;
+            /**
+             * @description 닿지 못한 이유
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Format: int64
+             * @description 위트니스를 뺀 노드의 메모리 합(GiB)
+             * @default null
+             */
+            memory_gib: number | null;
+            /** @default null */
+            nodes: components["schemas"]["NodeCounts"] | null;
+            /** @default false */
+            reachable: boolean;
+            /**
+             * @description 노드 버전 가운데 가장 낮은 것
+             * @default null
+             */
+            version: string | null;
+            /** @default null */
+            vms: components["schemas"]["VmCounts"] | null;
+        };
+        /** @description 응답의 원격. 토큰 대신 토큰의 id만 보인다(원격에서 어느 토큰인지 알아보게). */
+        RemoteView: {
+            ca_fingerprint: string;
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** Format: int64 */
+            revision: number;
+            status: components["schemas"]["RemoteStatus"];
+            /**
+             * Format: uuid
+             * @description 저장한 API 토큰의 id
+             */
+            token_id: string | null;
+            url: string;
         };
         ResizeRequest: {
             /**
@@ -5235,6 +5411,246 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RealmTestResult"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_remotes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_RemoteView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_remote: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoteRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoteView"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    probe_remote: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoteProbeRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoteProbe"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_remote: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoteView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_remote: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoteRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoteView"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_remote: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    refresh_remote: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoteView"];
                 };
             };
             "4XX": {

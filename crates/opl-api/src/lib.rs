@@ -20,6 +20,7 @@ pub mod oidc;
 mod oidc_login;
 pub mod realms;
 pub mod remote_client;
+mod remotes;
 pub mod resources;
 mod schedule;
 pub mod scheduler;
@@ -53,6 +54,7 @@ pub use firmware::UefiVarsFetcher;
 pub use ha::{HaManager, HaManagerConfig, RecoveryWriter};
 pub use incoming::{IncomingConfig, IncomingMigrations};
 pub use janitor::{ClusterJanitor, ClusterJanitorConfig};
+pub use remotes::{RemotePoller, RemotePollerConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
@@ -106,6 +108,14 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             realms::delete_realm
         ))
         .routes(routes!(realms::test_realm))
+        .routes(routes!(remotes::list_remotes, remotes::create_remote))
+        .routes(routes!(remotes::probe_remote))
+        .routes(routes!(
+            remotes::get_remote,
+            remotes::update_remote,
+            remotes::delete_remote
+        ))
+        .routes(routes!(remotes::refresh_remote))
         .routes(routes!(r::list_nodes))
         .routes(routes!(r::get_node, r::update_node, cluster::delete_node))
         .routes(routes!(updates::refresh_updates))

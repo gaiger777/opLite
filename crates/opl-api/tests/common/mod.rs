@@ -11,8 +11,10 @@ pub mod ustar;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use axum::serve::ListenerExt;
 use openraft::{BasicNode, ServerState};
 use opl_api::vm_imports::ImportCredentials;
 use opl_api::{AppState, AuditConfig, AuditLog, TaskRunner, TaskRunnerConfig, hash_password};
@@ -25,6 +27,7 @@ use opl_driver::{
 };
 use opl_reconciler::{Reconciler, ReconcilerConfig, ReconcilerHandle, RestartBackoff};
 use opl_types::auth::{Role, UserSpec};
+use opl_types::cluster::ClusterSpec;
 use opl_types::node::{NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -299,6 +302,74 @@ impl Env {
 
     pub async fn pid(&self, id: Uuid) -> Option<u32> {
         self.hv.inspect(id).await.unwrap().map(|s| s.pid)
+    }
+
+    /// 이 클러스터 CA 인증서(PEM)
+    pub fn ca_pem(&self) -> String {
+        let info = self.cluster.list::<ClusterSpec>().unwrap().1.remove(0);
+        info.spec.ca_cert_pem
+    }
+
+    /// 이 클러스터 CA 인증서의 지문(`sha256:…`)
+    pub fn ca_fingerprint(&self) -> String {
+        opl_peer::pki::fingerprint(&self.ca_pem()).unwrap()
+    }
+
+    /// 같은 라우터를 이 클러스터 CA가 `node-x`(127.0.0.1이 아님)로 서명한 인증서로 HTTPS 서비스한다.
+    /// 다른 클러스터가 원격으로 등록할 때 쓴다. `GET /cluster/ca`를 받은 수를 센다. 돌려준 서버를 버리면
+    /// 멈춘다.
+    pub async fn serve_tls(&self) -> TlsServer {
+        let info = self.cluster.list::<ClusterSpec>().unwrap().1.remove(0);
+        let ca = opl_peer::pki::ClusterCa {
+            cert_pem: info.spec.ca_cert_pem,
+            key_pem: info.spec.ca_key_pem,
+        };
+        let (key_pem, csr) = opl_peer::pki::node_key_and_csr().unwrap();
+        let tls = opl_peer::pki::NodeTls {
+            cert_pem: ca.sign_node(&csr, self.node, &["node-x".into()]).unwrap(),
+            ca_pem: ca.cert_pem,
+            key_pem,
+        };
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}", tcp.local_addr().unwrap());
+        let config = opl_peer::tls::api_server_config(&tls).unwrap();
+        // opld처럼 연결 주소를 넘긴다.
+        let listener = opl_peer::tls::TlsListener::new(tcp, config)
+            .unwrap()
+            .tap_io(|_| {});
+        let ca_hits = Arc::new(AtomicUsize::new(0));
+        let hits = ca_hits.clone();
+        let app = opl_api::router(self.state.clone()).layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                if req.uri().path() == "/api/v1/cluster/ca" {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                }
+                next.run(req)
+            },
+        ));
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        TlsServer { url, ca_hits, task }
+    }
+}
+
+/// [`Env::serve_tls`]의 HTTPS 서버. 버리면 새 연결을 받지 않는다.
+pub struct TlsServer {
+    /// `https://127.0.0.1:<포트>`
+    pub url: String,
+    /// `GET /api/v1/cluster/ca`를 받은 수
+    pub ca_hits: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TlsServer {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
