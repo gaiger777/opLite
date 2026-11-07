@@ -373,7 +373,8 @@
     "phase": {
       "pending": "Creating",
       "ready": "Ready",
-      "failed": "Failed"
+      "failed": "Failed",
+      "receiving": "Receiving"
     },
     "pageHint": "Backups of every VM, including VMs that were deleted. Take a backup from the Backups tab of a VM.",
     "create": "Back up now",

@@ -587,8 +587,12 @@ async fn restore_validates_the_request() {
         "not_found",
     );
 
-    // 만드는 중이거나 실패한 백업은 되살리지 못한다.
-    for phase in [BackupPhase::Pending, BackupPhase::Failed] {
+    // 만드는 중이거나 실패했거나 아직 받는 중인 백업은 되살리지 못한다.
+    for phase in [
+        BackupPhase::Pending,
+        BackupPhase::Failed,
+        BackupPhase::Receiving,
+    ] {
         set_phase(&env, id, phase).await;
         assert_error(
             &restore(&admin, "b1", json!({ "name": "web-2", "pool": "local" })).await,
@@ -667,6 +671,7 @@ async fn restore_needs_the_networks_and_security_groups_of_the_backup() {
             pool: "backups".into(),
             vm_spec,
             job: None,
+            origin: None,
         },
     );
     backup.status.phase = BackupPhase::Ready;

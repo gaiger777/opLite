@@ -91,6 +91,12 @@ pub enum TaskOp {
         name: String,
         pool: String,
     },
+    /// 대상 백업(`ready`)을 원격 `remote`의 백업 풀 `pool`에 사본으로 보낸다. 백업 풀을 읽을 수 있는
+    /// 노드에서 돈다.
+    BackupReplicate {
+        remote: String,
+        pool: String,
+    },
     /// 가져오기 `import`를 `run`의 값으로 대상 id(미리 정한 새 VM id)의 새 VM으로 만든다. 가져오기의
     /// 노드(원본이 있는 노드)에서 돈다.
     VmImport {
@@ -278,6 +284,17 @@ mod tests {
                     "backup": backup,
                     "name": "web-2",
                     "pool": "local"
+                }),
+            ),
+            (
+                TaskOp::BackupReplicate {
+                    remote: "dr".into(),
+                    pool: "backups".into(),
+                },
+                serde_json::json!({
+                    "kind": "backup-replicate",
+                    "remote": "dr",
+                    "pool": "backups"
                 }),
             ),
         ] {

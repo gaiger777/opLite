@@ -1426,6 +1426,8 @@ export interface components {
             file: string;
             /** @description 디스크 이름(`disk{i}`) */
             name: string;
+            /** @description 받은 사본이면 받은 파일의 SHA-256(16진수 소문자). 이 클러스터에서 만든 백업이면 뺀다. */
+            sha256?: string;
             /**
              * Format: int64
              * @description 백업 파일 크기
@@ -1460,6 +1462,8 @@ export interface components {
             keep?: components["schemas"]["Keep"];
             /** @description 백업 풀 이름 */
             pool: string;
+            /** @description 만든 백업을 보낼 원격 클러스터의 백업 풀. 없으면 보내지 않는다. */
+            replicate?: components["schemas"]["ReplicateTarget"];
             schedule: components["schemas"]["JobSchedule"];
             /** @description 백업할 VM */
             vms: components["schemas"]["VmSelector"];
@@ -1481,14 +1485,50 @@ export interface components {
             /** @default null */
             run: components["schemas"]["JobRun"] | null;
         };
+        /** @description 받은 사본의 원본: 보낸 클러스터와 그 클러스터의 백업 */
+        BackupOrigin: {
+            /**
+             * Format: uuid
+             * @description 원본 백업 id
+             */
+            backup: string;
+            /** @description 보낸 클러스터 CA의 지문(`sha256:…`). 같은 원본의 사본을 알아보는 데 쓴다. */
+            ca_fingerprint: string;
+            /** @description 보낸 클러스터 이름 */
+            cluster: string;
+            /** @description 원본을 만든 백업 작업 이름. 손으로 만든 백업이면 없다. */
+            job?: string;
+        };
         /** @enum {string} */
-        BackupPhase: "pending" | "ready" | "failed";
+        BackupPhase: "pending" | "ready" | "failed" | "receiving";
+        /** @description 원격 클러스터의 백업 풀에 보낸 사본 하나. (remote, pool)마다 하나다. */
+        BackupReplica: {
+            /**
+             * Format: int64
+             * @description 상태가 바뀐 시각(유닉스 초)
+             */
+            at: number;
+            /**
+             * Format: uuid
+             * @description 원격에 만든 사본의 id. 만들기 전이면 없다.
+             */
+            backup?: string;
+            /** @description 실패한 이유 */
+            error?: string;
+            /** @description 원격의 백업 풀 이름 */
+            pool: string;
+            /** @description 원격 이름 */
+            remote: string;
+            state: components["schemas"]["ReplicaState"];
+        };
         BackupSpec: {
             /**
              * Format: uuid
              * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
              */
             job?: string | null;
+            /** @description 다른 클러스터에서 받은 사본이면 그 원본. 이 클러스터에서 만든 백업이면 없다. */
+            origin?: components["schemas"]["BackupOrigin"];
             /** @description 백업 풀 이름 */
             pool: string;
             /**
@@ -1523,6 +1563,13 @@ export interface components {
             node?: string;
             /** @default pending */
             phase: components["schemas"]["BackupPhase"];
+            /**
+             * Format: int64
+             * @description 받는 중인 사본이 마지막으로 파일을 받은 시각(유닉스 초). 받은 적이 없으면 뺀다.
+             */
+            received_at?: number;
+            /** @description 원격 클러스터에 보낸 사본. 없으면 뺀다. */
+            replicas?: components["schemas"]["BackupReplica"][];
             /**
              * @description UEFI 변수 파일(`vars.fd`)을 담았는지
              * @default false
@@ -1590,6 +1637,8 @@ export interface components {
                 keep?: components["schemas"]["Keep"];
                 /** @description 백업 풀 이름 */
                 pool: string;
+                /** @description 만든 백업을 보낼 원격 클러스터의 백업 풀. 없으면 보내지 않는다. */
+                replicate?: components["schemas"]["ReplicateTarget"];
                 schedule: components["schemas"]["JobSchedule"];
                 /** @description 백업할 VM */
                 vms: components["schemas"]["VmSelector"];
@@ -2079,6 +2128,8 @@ export interface components {
                     keep?: components["schemas"]["Keep"];
                     /** @description 백업 풀 이름 */
                     pool: string;
+                    /** @description 만든 백업을 보낼 원격 클러스터의 백업 풀. 없으면 보내지 않는다. */
+                    replicate?: components["schemas"]["ReplicateTarget"];
                     schedule: components["schemas"]["JobSchedule"];
                     /** @description 백업할 VM */
                     vms: components["schemas"]["VmSelector"];
@@ -2124,6 +2175,8 @@ export interface components {
                      * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
                      */
                     job?: string | null;
+                    /** @description 다른 클러스터에서 받은 사본이면 그 원본. 이 클러스터에서 만든 백업이면 없다. */
+                    origin?: components["schemas"]["BackupOrigin"];
                     /** @description 백업 풀 이름 */
                     pool: string;
                     /**
@@ -2158,6 +2211,13 @@ export interface components {
                     node?: string;
                     /** @default pending */
                     phase: components["schemas"]["BackupPhase"];
+                    /**
+                     * Format: int64
+                     * @description 받는 중인 사본이 마지막으로 파일을 받은 시각(유닉스 초). 받은 적이 없으면 뺀다.
+                     */
+                    received_at?: number;
+                    /** @description 원격 클러스터에 보낸 사본. 없으면 뺀다. */
+                    replicas?: components["schemas"]["BackupReplica"][];
                     /**
                      * @description UEFI 변수 파일(`vars.fd`)을 담았는지
                      * @default false
@@ -3113,6 +3173,15 @@ export interface components {
             /** Format: int64 */
             total: number;
         };
+        /** @enum {string} */
+        ReplicaState: "copying" | "ready" | "failed";
+        /** @description 백업을 보낼 곳: 원격 `remote`의 백업 풀 `pool` */
+        ReplicateTarget: {
+            /** @description 원격의 백업 풀 이름 */
+            pool: string;
+            /** @description 원격 이름 */
+            remote: string;
+        };
         ResizeRequest: {
             /**
              * Format: int64
@@ -3143,6 +3212,8 @@ export interface components {
                 keep?: components["schemas"]["Keep"];
                 /** @description 백업 풀 이름 */
                 pool: string;
+                /** @description 만든 백업을 보낼 원격 클러스터의 백업 풀. 없으면 보내지 않는다. */
+                replicate?: components["schemas"]["ReplicateTarget"];
                 schedule: components["schemas"]["JobSchedule"];
                 /** @description 백업할 VM */
                 vms: components["schemas"]["VmSelector"];
@@ -3184,6 +3255,8 @@ export interface components {
                  * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
                  */
                 job?: string | null;
+                /** @description 다른 클러스터에서 받은 사본이면 그 원본. 이 클러스터에서 만든 백업이면 없다. */
+                origin?: components["schemas"]["BackupOrigin"];
                 /** @description 백업 풀 이름 */
                 pool: string;
                 /**
@@ -3218,6 +3291,13 @@ export interface components {
                 node?: string;
                 /** @default pending */
                 phase: components["schemas"]["BackupPhase"];
+                /**
+                 * Format: int64
+                 * @description 받는 중인 사본이 마지막으로 파일을 받은 시각(유닉스 초). 받은 적이 없으면 뺀다.
+                 */
+                received_at?: number;
+                /** @description 원격 클러스터에 보낸 사본. 없으면 뺀다. */
+                replicas?: components["schemas"]["BackupReplica"][];
                 /**
                  * @description UEFI 변수 파일(`vars.fd`)을 담았는지
                  * @default false
@@ -3940,6 +4020,11 @@ export interface components {
             kind: "backup-restore";
             name: string;
             pool: string;
+        } | {
+            /** @enum {string} */
+            kind: "backup-replicate";
+            pool: string;
+            remote: string;
         } | {
             /** Format: uuid */
             import: string;

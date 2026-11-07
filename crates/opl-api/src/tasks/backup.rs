@@ -132,6 +132,7 @@ async fn export_disks(
             file,
             virtual_bytes: source.size_bytes,
             stored_bytes,
+            sha256: None,
         });
     }
     Ok(out)
@@ -299,6 +300,8 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
         uefi_vars,
         error: None,
         node,
+        replicas: Vec::new(),
+        received_at: None,
     };
     // 다 만든 백업이다. 실패로 끝내면 정리하면서 지우게 되므로 기록될 때까지 다시 시도한다.
     loop {

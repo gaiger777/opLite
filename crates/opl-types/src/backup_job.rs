@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::resource::{Kind, Resource, ResourceSpec};
+use crate::resource::{Kind, Resource, ResourceSpec, validate_name};
 use crate::vm::Vm;
 
 pub type BackupJob = Resource<BackupJobSpec, BackupJobStatus>;
@@ -30,6 +30,21 @@ pub struct BackupJobSpec {
     #[serde(default = "yes")]
     #[cfg_attr(feature = "openapi", schema(default = true))]
     pub enabled: bool,
+    /// 만든 백업을 보낼 원격 클러스터의 백업 풀. 없으면 보내지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub replicate: Option<ReplicateTarget>,
+}
+
+/// 백업을 보낼 곳: 원격 `remote`의 백업 풀 `pool`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ReplicateTarget {
+    /// 원격 이름
+    pub remote: String,
+    /// 원격의 백업 풀 이름
+    pub pool: String,
 }
 
 fn yes() -> bool {
@@ -60,6 +75,14 @@ impl BackupJobSpec {
                 return Err(BackupJobError::DuplicateDay(day.as_str()));
             }
         }
+        if let Some(target) = &self.replicate {
+            if validate_name(&target.remote).is_err() {
+                return Err(BackupJobError::ReplicateRemote(target.remote.clone()));
+            }
+            if validate_name(&target.pool).is_err() {
+                return Err(BackupJobError::ReplicatePool(target.pool.clone()));
+            }
+        }
         Ok(())
     }
 }
@@ -74,6 +97,10 @@ pub enum BackupJobError {
     At,
     #[error("schedule.days lists {0} more than once")]
     DuplicateDay(&'static str),
+    #[error("replicate.remote {0:?} is not a valid remote name")]
+    ReplicateRemote(String),
+    #[error("replicate.pool {0:?} is not a valid storage pool name")]
+    ReplicatePool(String),
 }
 
 /// 백업할 VM 고르기. JSON은 `{"all": true}`, `{"names": [...]}`, `{"labels": {...}}` 중 하나다.
@@ -421,6 +448,70 @@ mod tests {
         );
         assert!(!full.enabled);
         assert_eq!(full.validate(), Ok(()));
+    }
+
+    #[test]
+    fn replicate_round_trips_and_is_left_out_when_off() {
+        // 없으면 빼서 옛 노드가 읽는 모양 그대로다.
+        let s = spec(base()).unwrap();
+        assert_eq!(s.replicate, None);
+        assert!(serde_json::to_value(&s).unwrap().get("replicate").is_none());
+
+        let mut with = base();
+        with["replicate"] = json!({ "remote": "dr", "pool": "backups" });
+        let s = spec(with).unwrap();
+        assert_eq!(
+            s.replicate,
+            Some(ReplicateTarget {
+                remote: "dr".into(),
+                pool: "backups".into()
+            })
+        );
+        assert_eq!(s.validate(), Ok(()));
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            json["replicate"],
+            json!({ "remote": "dr", "pool": "backups" })
+        );
+        assert_eq!(spec(json).unwrap(), s);
+
+        for bad in [
+            json!({ "remote": "dr" }),
+            json!({ "remote": "dr", "pool": "backups", "node": "a" }),
+        ] {
+            let mut j = base();
+            j["replicate"] = bad.clone();
+            assert!(spec(j).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validates_replicate_names() {
+        let with = |remote: &str, pool: &str| {
+            let mut s = spec(base()).unwrap();
+            s.replicate = Some(ReplicateTarget {
+                remote: remote.into(),
+                pool: pool.into(),
+            });
+            s.validate()
+        };
+        assert_eq!(with("dr-1", "backups"), Ok(()));
+        assert_eq!(
+            with("", "backups"),
+            Err(BackupJobError::ReplicateRemote(String::new()))
+        );
+        assert_eq!(
+            with("DR", "backups"),
+            Err(BackupJobError::ReplicateRemote("DR".into()))
+        );
+        assert_eq!(
+            with("dr", "../x"),
+            Err(BackupJobError::ReplicatePool("../x".into()))
+        );
+        assert_eq!(
+            BackupJobError::ReplicatePool("a/b".into()).to_string(),
+            "replicate.pool \"a/b\" is not a valid storage pool name"
+        );
     }
 
     #[test]

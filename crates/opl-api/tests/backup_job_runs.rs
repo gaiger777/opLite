@@ -601,6 +601,7 @@ async fn takes_in_a_backup_of_this_run_left_out_of_the_status() {
             pool: "bk".into(),
             vm_spec: web.spec.clone(),
             job: Some(id),
+            origin: None,
         },
     );
     made.status = BackupStatus {

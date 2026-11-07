@@ -33,6 +33,7 @@ const PHASE_VARIANT = {
   pending: "secondary",
   ready: "default",
   failed: "destructive",
+  receiving: "secondary",
 } as const;
 
 /**

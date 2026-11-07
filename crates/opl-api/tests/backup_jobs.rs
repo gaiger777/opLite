@@ -6,6 +6,7 @@ mod common;
 use common::{Client, Env, vm_request};
 use opl_types::backup::{Backup, BackupSpec};
 use opl_types::backup_job::{BackupJobSpec, JobRun, JobSchedule, Weekday, next_run};
+use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::storage::{PoolBackend, StoragePoolSpec};
 use opl_types::vm::VmSpec;
@@ -200,6 +201,56 @@ async fn create_checks_the_pool_and_the_spec() {
         StatusCode::CONFLICT,
         "name_taken",
     );
+}
+
+/// 원격 복제 대상은 이름 규칙을 따라야 하고(400), 옛 노드가 남아 있으면 쓰지 않는다(409).
+#[tokio::test]
+async fn replicate_is_checked_and_waits_for_every_node_to_run_this_build() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let with = |target: Value| {
+        let mut spec = nightly();
+        spec["replicate"] = target;
+        job("nightly", spec)
+    };
+    for bad in [
+        json!({ "remote": "DR", "pool": "backups" }),
+        json!({ "remote": "dr", "pool": "" }),
+        json!({ "remote": "dr" }),
+    ] {
+        let got = admin.post("/backup-jobs", with(bad.clone())).await;
+        assert_eq!(got.0, StatusCode::BAD_REQUEST, "{bad} -> {}", got.1);
+    }
+
+    let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
+        "old",
+        NodeSpec {
+            address: "10.0.0.9:8006".into(),
+            maintenance: false,
+            witness: true,
+        },
+    );
+    node.status.version = Some("0.0.1~old".into());
+    env.cluster.create(&node).await.unwrap();
+    let target = json!({ "remote": "dr", "pool": "backups" });
+    assert_error(
+        &admin.post("/backup-jobs", with(target.clone())).await,
+        StatusCode::CONFLICT,
+        "cluster_upgrading",
+    );
+    // 복제가 없는 작업은 옛 노드가 읽는 모양 그대로라 그대로 만든다.
+    let body = create(&admin, "plain", nightly()).await;
+    assert!(body["spec"].get("replicate").is_none(), "{body}");
+
+    let mut node = env.cluster.get_by_name::<NodeSpec>("old").unwrap().unwrap();
+    node.status.version = Some(opl_types::version::BUILD.into());
+    env.cluster
+        .update_status::<NodeSpec>(node.id, &node.status)
+        .await
+        .unwrap();
+    let body = create(&admin, "nightly", with(target.clone())["spec"].clone()).await;
+    assert_eq!(body["spec"]["replicate"], target);
 }
 
 #[tokio::test]
@@ -457,6 +508,7 @@ async fn deleting_a_job_keeps_its_backups() {
             pool: "backups".into(),
             vm_spec,
             job: Some(id),
+            origin: None,
         },
     );
     env.cluster.create(&backup).await.unwrap();

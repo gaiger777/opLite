@@ -1327,6 +1327,7 @@ async fn block_tags_of_pending_backups_are_kept_at_startup() {
                 pool: "thin".into(),
                 vm_spec: spec.clone(),
                 job: None,
+                origin: None,
             },
         );
         env.cluster.create(&backup).await.unwrap();

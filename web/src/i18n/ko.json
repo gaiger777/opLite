@@ -373,7 +373,8 @@
     "phase": {
       "pending": "만드는 중",
       "ready": "준비됨",
-      "failed": "실패"
+      "failed": "실패",
+      "receiving": "받는 중"
     },
     "pageHint": "지운 VM의 백업까지 모든 VM의 백업입니다. 백업은 VM 화면의 백업 탭에서 만듭니다.",
     "create": "지금 백업",

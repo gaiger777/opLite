@@ -775,6 +775,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<(), String> {
         TaskOp::BackupRestore { backup, name, pool } => {
             backup::restore(ctx, task, *backup, name, pool).await
         }
+        // 아직 보내는 쪽이 없다. 이 Task를 만드는 API가 없으므로 오지 않는다.
+        TaskOp::BackupReplicate { .. } => Err("backup replication is not supported yet".into()),
         TaskOp::VmImport { import, run } => import::import(ctx, task, *import, run).await,
         TaskOp::VmImportDelete => import::delete(ctx, id).await,
         TaskOp::NodeUpdateCheck => match &ctx.config.updates {

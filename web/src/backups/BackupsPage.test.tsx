@@ -45,6 +45,15 @@ it("names the job that made each backup", async () => {
   expect(await job("web-1")).toHaveTextContent("—");
 });
 
+it("shows a backup still being received and does not restore it", async () => {
+  const copy = backup("web-copy", web, 3, { status: { phase: "receiving" } });
+  mockLists({ vm: [web], backup: [copy] });
+  renderPage(<BackupsPage />);
+  const row = (await screen.findByText("web-copy")).closest("tr")!;
+  expect(row).toHaveTextContent("Receiving");
+  expect(within(row).getByRole("button", { name: "Restore web-copy" })).toBeDisabled();
+});
+
 it("restores a backup as a new VM", async () => {
   mockLists({ vm: [web], backup: [ofGone], "storage-pool": [pool("local"), pool("fast")] });
   let body: unknown;

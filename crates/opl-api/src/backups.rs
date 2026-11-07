@@ -342,6 +342,7 @@ pub(crate) async fn start_backup(
             pool: pool.name.clone(),
             vm_spec: vm.spec.clone(),
             job,
+            origin: None,
         },
     );
     // 같은 이름이 있으면 저장소가 거부한다(409 name_taken).

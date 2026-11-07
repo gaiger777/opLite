@@ -32,11 +32,13 @@ use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
 use crate::backups::{check_backup, now, start_backup, start_backup_delete};
+use crate::cluster::require_current;
 use crate::error::{ApiError, Json};
 use crate::resources::{CreateRequest, check_name, if_match, lookup};
 use crate::state::AppState;
 
-/// 스펙 검증과 풀 검사: 풀이 있고 백업 풀이어야 한다(400). 요일은 주의 순서로 정리한다.
+/// 스펙 검증과 풀 검사: 풀이 있고 백업 풀이어야 한다(400). 요일은 주의 순서로 정리한다. 원격 복제를
+/// 켠 작업은 옛 노드가 풀지 못하므로 모든 노드가 이 빌드일 때만 쓴다(409 `cluster_upgrading`).
 fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError> {
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -50,6 +52,9 @@ fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError
             "storage pool {:?} does not store backups; turn on its backups setting",
             pool.name
         )));
+    }
+    if spec.replicate.is_some() {
+        require_current(&state.cluster)?;
     }
     Ok(())
 }
@@ -746,6 +751,7 @@ mod tests {
                 pool: "bk".into(),
                 vm_spec: vm_spec(),
                 job,
+                origin: None,
             },
         );
         b.status = BackupStatus {
@@ -902,6 +908,7 @@ mod tests {
                 },
                 keep: Keep::default(),
                 enabled: true,
+                replicate: None,
             },
         );
         job.status = running(vec![a, b], vec![], vec![]);
@@ -933,6 +940,7 @@ mod tests {
                 },
                 keep: Keep::default(),
                 enabled: true,
+                replicate: None,
             },
         );
         // 실행은 NOW - 60에 시작했다.
