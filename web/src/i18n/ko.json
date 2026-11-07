@@ -65,7 +65,8 @@
     "telemetry_endpoint_required": "먼저 텔레메트리 끝점을 정하세요. 이 빌드에는 기본 끝점이 없습니다.",
     "no_role": "디렉터리 계정에 opLite 역할이 없습니다. 관리자에게 그룹의 역할 매핑을 요청하세요.",
     "realm_unavailable": "이 영역의 디렉터리에 연결할 수 없습니다. 잠시 뒤 다시 시도하거나 관리자에게 문의하세요.",
-    "external_user": "영역으로 로그인하는 사용자입니다. 비밀번호는 디렉터리에서 바꾸세요."
+    "external_user": "영역으로 로그인하는 사용자입니다. 비밀번호는 디렉터리에서 바꾸세요.",
+    "sso_failed": "SSO 로그인에 실패했습니다. 다시 시도하거나 관리자에게 영역 확인을 요청하세요."
   },
   "nav": {
     "dashboard": "대시보드",
@@ -106,7 +107,13 @@
     "submit": "로그인",
     "version": "opLite {{version}}",
     "realm": "인증 영역",
-    "localRealm": "로컬 사용자"
+    "localRealm": "로컬 사용자",
+    "or": "또는",
+    "sso": {
+      "signIn": "{{name}}(으)로 로그인",
+      "no_role": "IdP 계정에 opLite 역할이 없습니다. 관리자에게 그룹의 역할 매핑을 요청하세요.",
+      "realm_unavailable": "이 영역의 IdP에 연결할 수 없습니다. 잠시 뒤 다시 시도하거나 관리자에게 문의하세요."
+    }
   },
   "notFound": {
     "title": "페이지를 찾을 수 없습니다",
@@ -927,7 +934,7 @@
     }
   },
   "realms": {
-    "pageHint": "영역의 사용자는 디렉터리 계정으로 로그인하고 <이름>@<영역>이 됩니다. 역할은 로그인할 때마다 그룹으로 정해집니다.",
+    "pageHint": "영역의 사용자는 디렉터리(LDAP)나 IdP(OIDC) 계정으로 로그인하고 <이름>@<영역>이 됩니다. 역할은 로그인할 때마다 그룹으로 정해집니다.",
     "adminOnly": "인증 영역은 관리자만 관리할 수 있습니다.",
     "empty": "영역이 없습니다. 로컬 사용자만 로그인합니다.",
     "display": "표시 이름",
@@ -983,7 +990,9 @@
       "service_bind": "서비스 계정 바인드",
       "search": "사용자 찾기",
       "user_bind": "사용자 바인드",
-      "groups": "그룹"
+      "groups": "그룹",
+      "discovery": "Discovery",
+      "jwks": "서명 키"
     },
     "dn": "DN",
     "groupsFound": "그룹",
@@ -1000,8 +1009,30 @@
       "clearNeedsNoBindDn": "저장된 비밀번호를 지우려면 바인드 DN도 비우세요.",
       "clearSaved": "바인드 DN을 비웠으니 익명으로 찾으려면 \"저장된 비밀번호 지우기\"를 고르세요.",
       "timeout": "1~30 사이의 정수(초)로 쓰세요.",
-      "group": "그룹 DN을 입력하거나 행을 빼세요."
-    }
+      "group": "그룹 DN을 입력하거나 행을 빼세요.",
+      "issuer": "쿼리·조각 없이 https://호스트[:포트][/경로] 형식으로 쓰세요.",
+      "scopes": "openid를 넣으세요.",
+      "clientSecretAgain": "issuer·클라이언트 ID·CA 인증서를 바꿨으니 클라이언트 비밀을 다시 넣으세요."
+    },
+    "createOidcTitle": "OIDC 영역 만들기",
+    "issuer": "Issuer",
+    "issuerHint": "IdP가 알리는 그대로의 https:// URL입니다(끝의 / 포함).",
+    "clientId": "클라이언트 ID",
+    "clientSecret": "클라이언트 비밀",
+    "clientSecretHint": "공개 클라이언트(PKCE만)면 비워 두세요.",
+    "clientSecretSaved": "저장된 비밀이 있습니다. 비워 두면 그대로 둡니다.",
+    "clearClientSecret": "저장된 비밀 지우기(공개 클라이언트)",
+    "scopes": "Scope",
+    "scopesHint": "공백으로 나눕니다. openid가 있어야 합니다.",
+    "usernameClaim": "사용자 이름 클레임",
+    "groupsClaim": "그룹 클레임",
+    "groupsClaimHint": "사용자의 그룹을 문자열 목록으로 담은 클레임입니다.",
+    "redirectUri": "리디렉트 URI",
+    "redirectUriHint": "이 주소를 IdP에 등록하세요. 로그인에 쓰는 노드 주소마다 따로 등록해야 합니다. 리버스 프록시 뒤라면 프록시가 Host로 넘기는 주소를 등록하세요.",
+    "copyRedirectUri": "리디렉트 URI 복사",
+    "oidcCaPemHint": "IdP 인증서를 이 CA로만 확인합니다. 비우면 시스템 루트를 씁니다.",
+    "oidcGroupsHint": "그룹 클레임의 값은 대소문자를 가리지 않고 비교합니다. 여러 그룹에 속하면 가장 높은 역할을 받습니다.",
+    "oidcTestDescription": "IdP의 discovery 문서와 서명 키를 확인합니다. 아무도 로그인하지 않습니다."
   },
   "tokens": {
     "owner": "주인",

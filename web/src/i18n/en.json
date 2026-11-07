@@ -65,7 +65,8 @@
     "telemetry_endpoint_required": "Set a telemetry endpoint first. This build has no default endpoint.",
     "no_role": "Your directory account has no role in opLite. Ask an administrator to map one of your groups.",
     "realm_unavailable": "Cannot reach the directory of this realm. Try again later or ask an administrator.",
-    "external_user": "This user signs in through a realm. Change the password in the directory."
+    "external_user": "This user signs in through a realm. Change the password in the directory.",
+    "sso_failed": "Single sign-on failed. Try again, or ask an administrator to check the realm."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -106,7 +107,13 @@
     "submit": "Sign in",
     "version": "opLite {{version}}",
     "realm": "Realm",
-    "localRealm": "Local users"
+    "localRealm": "Local users",
+    "or": "or",
+    "sso": {
+      "signIn": "Sign in with {{name}}",
+      "no_role": "Your account at the identity provider has no role in opLite. Ask an administrator to map one of your groups.",
+      "realm_unavailable": "Cannot reach the identity provider of this realm. Try again later or ask an administrator."
+    }
   },
   "notFound": {
     "title": "Page not found",
@@ -927,7 +934,7 @@
     }
   },
   "realms": {
-    "pageHint": "Users of a realm sign in with their directory account as <name>@<realm>. Their role comes from their groups at each sign-in.",
+    "pageHint": "Users of a realm sign in with their directory (LDAP) or identity provider (OIDC) account as <name>@<realm>. Their role comes from their groups at each sign-in.",
     "adminOnly": "Only administrators can manage realms.",
     "empty": "No realms. Only local users can sign in.",
     "display": "Display name",
@@ -983,7 +990,9 @@
       "service_bind": "Service account bind",
       "search": "Find the user",
       "user_bind": "User bind",
-      "groups": "Groups"
+      "groups": "Groups",
+      "discovery": "Discovery",
+      "jwks": "Signing keys"
     },
     "dn": "DN",
     "groupsFound": "Groups",
@@ -1000,8 +1009,30 @@
       "clearNeedsNoBindDn": "To clear the saved password, also clear the bind DN.",
       "clearSaved": "The bind DN is empty: choose \"Clear the saved password\" to search anonymously.",
       "timeout": "Use a whole number of seconds from 1 to 30.",
-      "group": "Enter a group DN or remove the row."
-    }
+      "group": "Enter a group DN or remove the row.",
+      "issuer": "Use https://host[:port][/path] without a query or fragment.",
+      "scopes": "Include openid.",
+      "clientSecretAgain": "Enter the client secret again: the issuer, client ID or CA certificate changed."
+    },
+    "createOidcTitle": "Create an OIDC realm",
+    "issuer": "Issuer",
+    "issuerHint": "https:// URL exactly as the identity provider reports it, including any trailing slash.",
+    "clientId": "Client ID",
+    "clientSecret": "Client secret",
+    "clientSecretHint": "Leave empty for a public client (PKCE only).",
+    "clientSecretSaved": "A secret is saved. Leave this empty to keep it.",
+    "clearClientSecret": "Clear the saved secret (public client)",
+    "scopes": "Scopes",
+    "scopesHint": "Separated by spaces. openid is required.",
+    "usernameClaim": "Username claim",
+    "groupsClaim": "Groups claim",
+    "groupsClaimHint": "Claim with the user's groups as a list of strings.",
+    "redirectUri": "Redirect URI",
+    "redirectUriHint": "Register this address with the identity provider. Each node address you sign in through needs its own. Behind a reverse proxy, register the address the proxy passes as the Host.",
+    "copyRedirectUri": "Copy the redirect URI",
+    "oidcCaPemHint": "Trust only this CA for the identity provider's certificate. Leave empty to use the system roots.",
+    "oidcGroupsHint": "Group values from the groups claim match without regard to case. A user in several groups gets the highest role.",
+    "oidcTestDescription": "Checks the identity provider's discovery document and signing keys. No one signs in."
   },
   "tokens": {
     "owner": "Owner",

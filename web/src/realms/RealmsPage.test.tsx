@@ -421,3 +421,272 @@ it("tests a realm and shows each step", async () => {
   await user.click(within(dialog).getByRole("button", { name: "Done" }));
   await waitFor(() => expect(dialog).not.toBeInTheDocument());
 });
+
+const OKTA = {
+  id: "00000000-0000-0000-0000-0000000000c3",
+  name: "okta",
+  revision: 9,
+  display: "Okta",
+  backend: {
+    kind: "oidc",
+    issuer: "https://corp.okta.example/oauth2/default",
+    client_id: "oplite",
+    has_client_secret: true,
+    scopes: ["openid", "profile", "email", "groups"],
+    username_claim: "preferred_username",
+    groups_claim: "groups",
+    timeout_secs: 10,
+  },
+  roles: { groups: [{ group: "opl-admins", role: "admin" }] },
+};
+
+it("lists an OIDC realm with its issuer", async () => {
+  realms([OKTA, CORP]);
+  renderPage(<RealmsPage />);
+  const table = await screen.findByRole("table", { name: "Realms" });
+  const row = (await within(table).findByText("okta")).closest("tr")!;
+  expect(
+    within(row)
+      .getAllByRole("cell")
+      .slice(0, 4)
+      .map((c) => c.textContent),
+  ).toEqual(["okta", "Okta", "OIDC", "https://corp.okta.example/oauth2/default"]);
+});
+
+it("creates an OIDC realm and shows the redirect URI to register", async () => {
+  const change = realms([CORP]);
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/realms"), async ({ request }) => {
+      body = await request.json();
+      change([CORP, OKTA]);
+      return HttpResponse.json(OKTA, { status: 201 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<RealmsPage />);
+  await screen.findByText("corp");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  let dialog = await screen.findByRole("dialog", { name: "Create an LDAP realm" });
+  await user.selectOptions(within(dialog).getByLabelText("Kind"), "oidc");
+  dialog = await screen.findByRole("dialog", { name: "Create an OIDC realm" });
+  expect(within(dialog).queryByLabelText("Base DN")).not.toBeInTheDocument();
+  // 서버의 기본값으로 시작한다.
+  expect(within(dialog).getByLabelText("Scopes")).toHaveValue("openid profile email");
+  expect(within(dialog).getByLabelText("Username claim")).toHaveValue("preferred_username");
+  expect(within(dialog).getByLabelText("Groups claim")).toHaveValue("groups");
+  expect(within(dialog).getByLabelText("Timeout (seconds)")).toHaveValue("10");
+  // 이 노드의 콜백 주소를 IdP에 등록하도록 보이고 복사할 수 있다.
+  const uri = `${window.location.origin}/api/v1/auth/oidc/callback`;
+  expect(within(dialog).getByLabelText("Redirect URI")).toHaveValue(uri);
+  expect(within(dialog).getByLabelText("Redirect URI")).toHaveAttribute("readonly");
+  await user.click(within(dialog).getByRole("button", { name: "Copy the redirect URI" }));
+  expect(await navigator.clipboard.readText()).toBe(uri);
+
+  // 서버 검증과 같은 검사: https issuer(쿼리 없음), client ID, openid scope, 클레임 이름.
+  await user.type(within(dialog).getByLabelText("Name"), "okta");
+  await user.type(within(dialog).getByLabelText("Issuer"), "http://corp.okta.example");
+  await user.clear(within(dialog).getByLabelText("Scopes"));
+  await user.type(within(dialog).getByLabelText("Scopes"), "profile email");
+  await user.clear(within(dialog).getByLabelText("Groups claim"));
+  await user.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(
+    within(dialog).getByText("Use https://host[:port][/path] without a query or fragment."),
+  ).toBeVisible();
+  expect(within(dialog).getByLabelText("Client ID")).toHaveAccessibleDescription("Enter a value.");
+  expect(within(dialog).getByText("Include openid.")).toBeVisible();
+  expect(within(dialog).getByLabelText("Groups claim")).toBeInvalid();
+  await user.clear(within(dialog).getByLabelText("Issuer"));
+  await user.type(within(dialog).getByLabelText("Issuer"), "https://corp.okta.example/?x=1");
+  await user.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByLabelText("Issuer")).toBeInvalid();
+  expect(body).toBeUndefined();
+
+  await user.type(within(dialog).getByLabelText("Display name"), "Okta");
+  await user.clear(within(dialog).getByLabelText("Issuer"));
+  await user.type(
+    within(dialog).getByLabelText("Issuer"),
+    "https://corp.okta.example/oauth2/default",
+  );
+  await user.type(within(dialog).getByLabelText("Client ID"), "oplite");
+  await user.type(within(dialog).getByLabelText("Client secret"), "client-secret");
+  await user.clear(within(dialog).getByLabelText("Scopes"));
+  await user.type(within(dialog).getByLabelText("Scopes"), " openid  profile email groups ");
+  await user.type(within(dialog).getByLabelText("Groups claim"), "groups");
+  await user.click(within(dialog).getByRole("button", { name: "Add group" }));
+  await user.type(within(dialog).getByLabelText("Group 1"), "opl-admins");
+  await user.selectOptions(within(dialog).getByLabelText("Role of group 1"), "admin");
+  await user.click(within(dialog).getByRole("button", { name: "Create" }));
+
+  expect(await screen.findByText("Created realm okta.")).toBeInTheDocument();
+  expect(body).toEqual({
+    name: "okta",
+    display: "Okta",
+    backend: {
+      kind: "oidc",
+      issuer: "https://corp.okta.example/oauth2/default",
+      client_id: "oplite",
+      client_secret: "client-secret",
+      scopes: ["openid", "profile", "email", "groups"],
+      username_claim: "preferred_username",
+      groups_claim: "groups",
+      timeout_secs: 10,
+    },
+    roles: { groups: [{ group: "opl-admins", role: "admin" }] },
+  });
+});
+
+it("keeps, replaces or clears the client secret when editing", async () => {
+  realms([OKTA]);
+  const sent: { ifMatch: string | null; body: { backend: Record<string, unknown> } }[] = [];
+  server.use(
+    http.put(apiUrl("/realms/okta"), async ({ request }) => {
+      sent.push({
+        ifMatch: request.headers.get("If-Match"),
+        body: (await request.json()) as { backend: Record<string, unknown> },
+      });
+      return HttpResponse.json(OKTA);
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<RealmsPage />);
+  async function edit() {
+    await user.click(await screen.findByRole("button", { name: "Edit okta" }));
+    return screen.findByRole("dialog", { name: "Edit realm okta" });
+  }
+  async function save(dialog: HTMLElement) {
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+  }
+  const again = "Enter the client secret again: the issuer, client ID or CA certificate changed.";
+
+  // 비워 두면 보내지 않아 저장된 비밀이 남는다. 종류는 고칠 수 없다.
+  let dialog = await edit();
+  expect(within(dialog).queryByLabelText("Kind")).not.toBeInTheDocument();
+  expect(within(dialog).getByLabelText("Issuer")).toHaveValue(
+    "https://corp.okta.example/oauth2/default",
+  );
+  expect(within(dialog).getByLabelText("Scopes")).toHaveValue("openid profile email groups");
+  expect(within(dialog).getByLabelText("Client secret")).toHaveValue("");
+  expect(within(dialog).getByText("A secret is saved. Leave this empty to keep it.")).toBeVisible();
+  await save(dialog);
+  expect(sent[0]!.ifMatch).toBe("9");
+  expect(sent[0]!.body.backend).toEqual({
+    kind: "oidc",
+    issuer: "https://corp.okta.example/oauth2/default",
+    client_id: "oplite",
+    scopes: ["openid", "profile", "email", "groups"],
+    username_claim: "preferred_username",
+    groups_claim: "groups",
+    timeout_secs: 10,
+  });
+
+  // issuer·client ID·CA 가운데 하나라도 바꾸면 비밀을 다시 넣어야 한다(서버의 400과 같은 규칙).
+  for (const [label, value] of [
+    ["Issuer", "https://other.example"],
+    ["Client ID", "other"],
+    ["CA certificate (PEM)", "-----BEGIN CERT"],
+  ] as const) {
+    dialog = await edit();
+    await user.clear(within(dialog).getByLabelText(label));
+    await user.type(within(dialog).getByLabelText(label), value);
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    expect(within(dialog).getByText(again)).toBeVisible();
+    expect(sent).toHaveLength(1);
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+  }
+
+  // 새 비밀과 함께면 보낸다.
+  dialog = await edit();
+  await user.clear(within(dialog).getByLabelText("Client ID"));
+  await user.type(within(dialog).getByLabelText("Client ID"), "other");
+  await user.type(within(dialog).getByLabelText("Client secret"), "new-secret");
+  await save(dialog);
+  expect(sent[1]!.body.backend).toMatchObject({ client_id: "other", client_secret: "new-secret" });
+
+  // 지우기를 고르면 빈 글을 보낸다(공개 클라이언트). 입력은 막히고 바뀐 issuer도 괜찮다.
+  dialog = await edit();
+  await user.click(within(dialog).getByLabelText("Clear the saved secret (public client)"));
+  expect(within(dialog).getByLabelText("Client secret")).toBeDisabled();
+  await user.clear(within(dialog).getByLabelText("Issuer"));
+  await user.type(within(dialog).getByLabelText("Issuer"), "https://other.example");
+  await save(dialog);
+  expect(sent[2]!.body.backend).toMatchObject({
+    issuer: "https://other.example",
+    client_secret: "",
+  });
+});
+
+it("edits a public client without asking for a secret", async () => {
+  const pub = { ...OKTA, backend: { ...OKTA.backend, has_client_secret: false } };
+  realms([pub]);
+  let body: { backend: Record<string, unknown> } | undefined;
+  server.use(
+    http.put(apiUrl("/realms/okta"), async ({ request }) => {
+      body = (await request.json()) as { backend: Record<string, unknown> };
+      return HttpResponse.json(pub);
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<RealmsPage />);
+  await user.click(await screen.findByRole("button", { name: "Edit okta" }));
+  const dialog = await screen.findByRole("dialog", { name: "Edit realm okta" });
+  expect(within(dialog).getByText("Leave empty for a public client (PKCE only).")).toBeVisible();
+  expect(
+    within(dialog).queryByLabelText("Clear the saved secret (public client)"),
+  ).not.toBeInTheDocument();
+  await user.clear(within(dialog).getByLabelText("Issuer"));
+  await user.type(within(dialog).getByLabelText("Issuer"), "https://other.example/");
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(dialog).not.toBeInTheDocument());
+  expect(body!.backend.issuer).toBe("https://other.example/");
+  expect(body!.backend).not.toHaveProperty("client_secret");
+});
+
+it("tests an OIDC realm without asking for a user", async () => {
+  realms([OKTA]);
+  const bodies: string[] = [];
+  server.use(
+    http.post(apiUrl("/realms/okta/actions/test"), async ({ request }) => {
+      bodies.push(await request.text());
+      return HttpResponse.json({
+        steps: [
+          { name: "discovery", ok: true, message: "issuer matches" },
+          { name: "jwks", ok: false, message: "no RS256 or ES256 signing keys" },
+        ],
+        dn: null,
+        groups: [],
+        role: null,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<RealmsPage />);
+  await user.click(await screen.findByRole("button", { name: "Test okta" }));
+  const dialog = await screen.findByRole("dialog", { name: "Test realm okta" });
+  expect(dialog).toHaveTextContent(
+    "Checks the identity provider's discovery document and signing keys. No one signs in.",
+  );
+  expect(within(dialog).queryByLabelText("Username")).not.toBeInTheDocument();
+  expect(within(dialog).queryByLabelText("Password")).not.toBeInTheDocument();
+  await user.click(within(dialog).getByRole("button", { name: "Test" }));
+  const steps = await within(dialog).findByRole("table", { name: "Steps" });
+  expect(
+    within(steps)
+      .getAllByRole("row")
+      .slice(1)
+      .map((r) =>
+        within(r)
+          .getAllByRole("cell")
+          .map((c) => c.textContent),
+      ),
+  ).toEqual([
+    ["Discovery", "OK", "issuer matches"],
+    ["Signing keys", "Failed", "no RS256 or ES256 signing keys"],
+  ]);
+  // 사용자가 없으므로 DN·그룹·역할은 보이지 않는다.
+  expect(within(dialog).queryByText("No role: sign-in would be refused.")).not.toBeInTheDocument();
+  // 본문 없이 부른다.
+  expect(bodies).toEqual([""]);
+});

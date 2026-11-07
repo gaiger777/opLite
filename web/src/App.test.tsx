@@ -167,6 +167,121 @@ it("explains realm sign-in errors", async () => {
   );
 });
 
+it("offers single sign-on for OIDC realms", async () => {
+  signedOut();
+  server.use(
+    http.get(apiUrl("/auth/realms"), () =>
+      HttpResponse.json([
+        { name: "local", display: null, kind: "local" },
+        { name: "corp", display: "Corp directory", kind: "ldap" },
+        { name: "okta", display: "Okta", kind: "oidc" },
+        { name: "keycloak", display: null, kind: "oidc" },
+      ]),
+    ),
+  );
+  window.history.pushState({}, "", "/login");
+  render(<App />);
+  // OIDC 영역은 고르기에 없고 IdP로 가는 링크다(전체 페이지 이동).
+  const realm = await screen.findByLabelText("Realm");
+  expect(
+    within(realm)
+      .getAllByRole("option")
+      .map((o) => o.getAttribute("value")),
+  ).toEqual(["local", "corp"]);
+  expect(screen.getByText("or")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Sign in with Okta" })).toHaveAttribute(
+    "href",
+    "/api/v1/auth/oidc/okta/start",
+  );
+  expect(screen.getByRole("link", { name: "Sign in with keycloak" })).toHaveAttribute(
+    "href",
+    "/api/v1/auth/oidc/keycloak/start",
+  );
+});
+
+it("offers no realm choice when the only other realms are OIDC", async () => {
+  signedOut();
+  server.use(
+    http.get(apiUrl("/auth/realms"), () =>
+      HttpResponse.json([
+        { name: "local", display: null, kind: "local" },
+        { name: "okta", display: "Okta", kind: "oidc" },
+      ]),
+    ),
+  );
+  window.history.pushState({}, "", "/login");
+  render(<App />);
+  expect(await screen.findByRole("link", { name: "Sign in with Okta" })).toBeInTheDocument();
+  // 비밀번호로 로그인하는 영역이 로컬뿐이면 고르지 않는다.
+  expect(screen.queryByLabelText("Realm")).not.toBeInTheDocument();
+});
+
+it("explains why single sign-on failed and clears the code from the address", async () => {
+  signedOut();
+  for (const [code, text] of [
+    [
+      "no_role",
+      "Your account at the identity provider has no role in opLite. Ask an administrator to map one of your groups.",
+    ],
+    [
+      "realm_unavailable",
+      "Cannot reach the identity provider of this realm. Try again later or ask an administrator.",
+    ],
+    ["too_many_attempts", "Too many attempts. Try again later."],
+    ["sso_failed", "Single sign-on failed. Try again, or ask an administrator to check the realm."],
+    // 모르는 코드는 일반 실패로 보인다(주소의 글을 그대로 보이지 않는다).
+    [
+      "<b>boom</b>",
+      "Single sign-on failed. Try again, or ask an administrator to check the realm.",
+    ],
+  ]) {
+    window.history.pushState({}, "", `/login?next=%2Fvms&error=${encodeURIComponent(code!)}`);
+    const { unmount } = render(<App />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(text!);
+    // 다른 값(`next`)은 두고 오류 코드만 지운다.
+    expect(window.location.pathname).toBe("/login");
+    expect(window.location.search).toBe("?next=%2Fvms");
+    unmount();
+  }
+
+  // 비밀번호로 다시 로그인하면 SSO 오류는 사라진다.
+  window.history.pushState({}, "", "/login?error=sso_failed");
+  const user = userEvent.setup();
+  render(<App />);
+  await screen.findByRole("alert");
+  expect(screen.getByLabelText("Password")).not.toHaveAttribute("aria-invalid");
+  await user.type(screen.getByLabelText("Username"), "admin");
+  await user.type(screen.getByLabelText("Password"), "nope");
+  await user.click(screen.getByRole("button", { name: "Sign in" }));
+  await vi.waitFor(() =>
+    expect(screen.getByRole("alert")).toHaveTextContent("Wrong username or password."),
+  );
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
+});
+
+it("reads the session cookie with whoami when single sign-on lands on /", async () => {
+  signedOut();
+  // SSO 콜백이 세션 쿠키(SameSite=Strict)를 놓고 `/`로 보낸다. 앱은 같은 출처의 fetch로 whoami를 읽어
+  // 쿠키가 붙게 한다(credentials가 omit이면 브라우저가 쿠키를 붙이지 않는다).
+  const whoami: Request[] = [];
+  server.use(
+    http.get(apiUrl("/auth/whoami"), ({ request }) => {
+      whoami.push(request);
+      return HttpResponse.json({ ...admin, name: "alice@okta" });
+    }),
+  );
+  window.history.pushState({}, "", "/");
+  render(<App />);
+  expect(await screen.findByRole("heading", { level: 1, name: "Dashboard" })).toBeInTheDocument();
+  expect(window.location.pathname).toBe("/");
+  expect(whoami.length).toBeGreaterThan(0);
+  for (const request of whoami) {
+    expect(new URL(request.url).origin).toBe(window.location.origin);
+    expect(request.credentials).not.toBe("omit");
+  }
+  expect(screen.getByRole("button", { name: "Account (alice@okta)" })).toBeInTheDocument();
+});
+
 it("says when sign-in attempts are throttled", async () => {
   signedOut();
   server.use(

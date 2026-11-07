@@ -9,6 +9,7 @@ import type { Role } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { CopyButton } from "@/components/CopyButton";
 import { Field } from "@/components/Field";
 import { focusBack } from "@/components/focusBack";
 import { FormDialog } from "@/components/FormDialog";
@@ -42,6 +43,7 @@ import {
   type RealmForm,
   type RealmTestResult,
   type RealmView,
+  redirectUri,
   requestOf,
 } from "@/realms/realms";
 
@@ -50,7 +52,7 @@ const ROLES: readonly Role[] = ["admin", "operator", "viewer"];
 type Dialogs = { kind: "create" } | { kind: "edit" | "test"; realm: RealmView };
 
 /**
- * 인증 영역: 목록과 LDAP 영역 만들기·고치기·지우기·시험. admin만 다룬다. 서비스 계정 비밀번호가 있어
+ * 인증 영역: 목록과 LDAP·OIDC 영역 만들기·고치기·지우기·시험. admin만 다룬다. 서비스 계정 비밀번호가 있어
  * watch로 받지 않으므로 화면을 열 때와 바꾼 뒤에 다시 읽는다.
  */
 export function RealmsPage() {
@@ -205,7 +207,7 @@ function RoleOptions() {
   ));
 }
 
-/** LDAP 영역 만들기(`realm`이 null)와 고치기. 열 때만 그린다. */
+/** 영역 만들기(`realm`이 null — 종류를 고른다)와 고치기. 열 때만 그린다. */
 function RealmDialog({
   realm,
   taken,
@@ -230,6 +232,8 @@ function RealmDialog({
     setErrors({});
   };
   const saved = (realm?.backend.kind === "ldap" && realm.backend.has_bind_password) || false;
+  const savedSecret = (realm?.backend.kind === "oidc" && realm.backend.has_client_secret) || false;
+  const oidc = form.kind === "oidc";
 
   async function submit() {
     const found = checkForm(form, realm ? null : taken, realm);
@@ -270,7 +274,11 @@ function RealmDialog({
 
   return (
     <FormDialog
-      title={realm ? t("realms.editTitle", { name: realm.name }) : t("realms.createTitle")}
+      title={
+        realm
+          ? t("realms.editTitle", { name: realm.name })
+          : t(oidc ? "realms.createOidcTitle" : "realms.createTitle")
+      }
       description={t("realms.formDescription")}
       submitLabel={realm ? t("common.save") : t("common.create")}
       returnFocus={returnFocus}
@@ -279,6 +287,23 @@ function RealmDialog({
     >
       {/* 항목이 많으므로 대화상자 안에서 넘긴다. */}
       <div className="-mx-1 flex max-h-[60svh] flex-col gap-4 overflow-y-auto px-1">
+        {/* 종류는 만들 때만 고른다. */}
+        {!realm && (
+          <Field id="realm-kind" label={t("realms.kind")}>
+            <NativeSelect
+              id="realm-kind"
+              className="w-full"
+              value={form.kind}
+              onChange={(e) => {
+                change({ kind: e.target.value as RealmForm["kind"] });
+                setErrors({});
+              }}
+            >
+              <NativeSelectOption value="ldap">{t("realms.kinds.ldap")}</NativeSelectOption>
+              <NativeSelectOption value="oidc">{t("realms.kinds.oidc")}</NativeSelectOption>
+            </NativeSelect>
+          </Field>
+        )}
         <Field id="realm-name" label={t("common.name")} error={errors.name}>
           {(a11y) => (
             <Input
@@ -292,45 +317,113 @@ function RealmDialog({
           )}
         </Field>
         {text("realm-display", "display", t("realms.display"), t("realms.displayHint"))}
-        {text("realm-url", "url", t("realms.url"), t("realms.urlHint"))}
-        {text("realm-base-dn", "baseDn", t("realms.baseDn"))}
-        {text("realm-bind-dn", "bindDn", t("realms.bindDn"), t("realms.bindDnHint"))}
-        <Field
-          id="realm-bind-password"
-          label={t("realms.bindPassword")}
-          error={errors.bindPassword}
-          hint={saved ? t("realms.bindPasswordSaved") : undefined}
-        >
-          {(a11y) => (
-            <Input
+        {oidc ? (
+          <>
+            {text("realm-issuer", "issuer", t("realms.issuer"), t("realms.issuerHint"))}
+            {text("realm-client-id", "clientId", t("realms.clientId"))}
+            <Field
+              id="realm-client-secret"
+              label={t("realms.clientSecret")}
+              error={errors.clientSecret}
+              hint={t(savedSecret ? "realms.clientSecretSaved" : "realms.clientSecretHint")}
+            >
+              {(a11y) => (
+                <Input
+                  id="realm-client-secret"
+                  type="password"
+                  autoComplete="new-password"
+                  disabled={form.clearClientSecret}
+                  value={form.clientSecret}
+                  onChange={(e) => change({ clientSecret: e.target.value })}
+                  {...a11y}
+                />
+              )}
+            </Field>
+            {savedSecret && (
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="realm-clear-secret"
+                  checked={form.clearClientSecret}
+                  onCheckedChange={(on) => change({ clearClientSecret: on === true })}
+                />
+                <Label htmlFor="realm-clear-secret">{t("realms.clearClientSecret")}</Label>
+              </div>
+            )}
+            {text("realm-scopes", "scopes", t("realms.scopes"), t("realms.scopesHint"))}
+            {text("realm-username-claim", "usernameClaim", t("realms.usernameClaim"))}
+            {text(
+              "realm-groups-claim",
+              "groupsClaim",
+              t("realms.groupsClaim"),
+              t("realms.groupsClaimHint"),
+            )}
+            <Field
+              id="realm-redirect-uri"
+              label={t("realms.redirectUri")}
+              hint={t("realms.redirectUriHint")}
+            >
+              {(a11y) => (
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="realm-redirect-uri"
+                    readOnly
+                    className="font-mono text-xs"
+                    value={redirectUri()}
+                    onFocus={(e) => e.target.select()}
+                    {...a11y}
+                  />
+                  <CopyButton text={redirectUri()} label={t("realms.copyRedirectUri")} />
+                </div>
+              )}
+            </Field>
+          </>
+        ) : (
+          <>
+            {text("realm-url", "url", t("realms.url"), t("realms.urlHint"))}
+            {text("realm-base-dn", "baseDn", t("realms.baseDn"))}
+            {text("realm-bind-dn", "bindDn", t("realms.bindDn"), t("realms.bindDnHint"))}
+            <Field
               id="realm-bind-password"
-              type="password"
-              autoComplete="new-password"
-              disabled={form.clearBindPassword}
-              value={form.bindPassword}
-              onChange={(e) => change({ bindPassword: e.target.value })}
-              {...a11y}
-            />
-          )}
-        </Field>
-        {saved && (
-          <div className="flex items-center gap-2">
-            <Checkbox
-              id="realm-clear-password"
-              checked={form.clearBindPassword}
-              onCheckedChange={(on) => change({ clearBindPassword: on === true })}
-            />
-            <Label htmlFor="realm-clear-password">{t("realms.clearBindPassword")}</Label>
-          </div>
+              label={t("realms.bindPassword")}
+              error={errors.bindPassword}
+              hint={saved ? t("realms.bindPasswordSaved") : undefined}
+            >
+              {(a11y) => (
+                <Input
+                  id="realm-bind-password"
+                  type="password"
+                  autoComplete="new-password"
+                  disabled={form.clearBindPassword}
+                  value={form.bindPassword}
+                  onChange={(e) => change({ bindPassword: e.target.value })}
+                  {...a11y}
+                />
+              )}
+            </Field>
+            {saved && (
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="realm-clear-password"
+                  checked={form.clearBindPassword}
+                  onCheckedChange={(on) => change({ clearBindPassword: on === true })}
+                />
+                <Label htmlFor="realm-clear-password">{t("realms.clearBindPassword")}</Label>
+              </div>
+            )}
+            {text(
+              "realm-user-filter",
+              "userFilter",
+              t("realms.userFilter"),
+              t("realms.userFilterHint"),
+            )}
+            {text("realm-group-attr", "groupAttr", t("realms.groupAttr"))}
+          </>
         )}
-        {text(
-          "realm-user-filter",
-          "userFilter",
-          t("realms.userFilter"),
-          t("realms.userFilterHint"),
-        )}
-        {text("realm-group-attr", "groupAttr", t("realms.groupAttr"))}
-        <Field id="realm-ca" label={t("realms.caPem")} hint={t("realms.caPemHint")}>
+        <Field
+          id="realm-ca"
+          label={t("realms.caPem")}
+          hint={t(oidc ? "realms.oidcCaPemHint" : "realms.caPemHint")}
+        >
           {(a11y) => (
             <textarea
               id="realm-ca"
@@ -357,7 +450,9 @@ function RealmDialog({
         </Field>
         <fieldset className="flex flex-col gap-2">
           <legend className="mb-1.5 text-sm font-medium">{t("realms.groups")}</legend>
-          <p className="text-xs text-muted-foreground">{t("realms.groupsHint")}</p>
+          <p className="text-xs text-muted-foreground">
+            {t(oidc ? "realms.oidcGroupsHint" : "realms.groupsHint")}
+          </p>
           {form.groups.map((row, i) => {
             const n = i + 1;
             const error = errors[`group-${i}`];
@@ -371,7 +466,7 @@ function RealmDialog({
                     aria-invalid={error ? true : undefined}
                     aria-describedby={error ? errorId : undefined}
                     spellCheck={false}
-                    placeholder="cn=ops,ou=groups,dc=example,dc=com"
+                    placeholder={oidc ? "opl-operators" : "cn=ops,ou=groups,dc=example,dc=com"}
                     value={row.group}
                     onChange={(e) =>
                       changeGroups(
@@ -440,8 +535,8 @@ function RealmDialog({
 }
 
 /**
- * 영역 시험: 디렉터리 사용자로 단계마다 확인한다. 사용자·세션을 만들지 않는다. 결과를 보이도록 시험한 뒤에도
- * 열어 둔다.
+ * 영역 시험: LDAP은 디렉터리 사용자로 단계마다, OIDC는 입력 없이 IdP의 discovery와 키를 확인한다. 사용자·세션을
+ * 만들지 않는다. 결과를 보이도록 시험한 뒤에도 열어 둔다.
  */
 function TestDialog({
   realm,
@@ -458,6 +553,7 @@ function TestDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<RealmTestResult | null>(null);
+  const oidc = realm.backend.kind === "oidc";
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -468,7 +564,7 @@ function TestDialog({
         await call(
           api.POST("/realms/{key}/actions/test", {
             params: { path: { key: realm.name } },
-            body: { username, password },
+            ...(!oidc && { body: { username, password } }),
           }),
         ),
       );
@@ -486,39 +582,43 @@ function TestDialog({
         <form onSubmit={(e) => void submit(e)} className="flex min-w-0 flex-col gap-4">
           <DialogHeader>
             <DialogTitle>{t("realms.testTitle", { name: realm.name })}</DialogTitle>
-            <DialogDescription>{t("realms.testDescription")}</DialogDescription>
+            <DialogDescription>
+              {t(oidc ? "realms.oidcTestDescription" : "realms.testDescription")}
+            </DialogDescription>
           </DialogHeader>
           {error && (
             <p role="alert" className="text-sm text-destructive">
               {error}
             </p>
           )}
-          <fieldset disabled={busy} className="grid gap-4 sm:grid-cols-2">
-            <Field id="realm-test-username" label={t("login.username")}>
-              <Input
-                id="realm-test-username"
-                autoComplete="off"
-                required
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-              />
-            </Field>
-            <Field id="realm-test-password" label={t("login.password")}>
-              <Input
-                id="realm-test-password"
-                type="password"
-                autoComplete="off"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </Field>
-          </fieldset>
-          {result && <TestResult result={result} />}
+          {!oidc && (
+            <fieldset disabled={busy} className="grid gap-4 sm:grid-cols-2">
+              <Field id="realm-test-username" label={t("login.username")}>
+                <Input
+                  id="realm-test-username"
+                  autoComplete="off"
+                  required
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                />
+              </Field>
+              <Field id="realm-test-password" label={t("login.password")}>
+                <Input
+                  id="realm-test-password"
+                  type="password"
+                  autoComplete="off"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </Field>
+            </fieldset>
+          )}
+          {result && <TestResult result={result} oidc={oidc} />}
           <DialogFooter>
             <Button type="button" variant="outline" disabled={busy} onClick={onClose}>
               {t("common.done")}
             </Button>
-            <Button type="submit" disabled={busy || !username}>
+            <Button type="submit" disabled={busy || (!oidc && !username)}>
               {t("realms.test")}
             </Button>
           </DialogFooter>
@@ -528,7 +628,8 @@ function TestDialog({
   );
 }
 
-function TestResult({ result }: { result: RealmTestResult }) {
+/** 단계 표. LDAP이면 찾은 DN·그룹·정해질 역할도 보인다(OIDC는 사용자가 없다). */
+function TestResult({ result, oidc }: { result: RealmTestResult; oidc: boolean }) {
   const { t } = useTranslation();
   return (
     <div className="flex min-w-0 flex-col gap-3">
@@ -554,26 +655,28 @@ function TestResult({ result }: { result: RealmTestResult }) {
           ))}
         </TableBody>
       </Table>
-      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-        <dt className="text-muted-foreground">{t("realms.dn")}</dt>
-        <dd className={result.dn ? "font-mono text-xs break-all" : undefined}>
-          {result.dn ?? "—"}
-        </dd>
-        <dt className="text-muted-foreground">{t("realms.groupsFound")}</dt>
-        <dd>
-          {result.groups.length === 0 ? (
-            "—"
-          ) : (
-            <ul className="font-mono text-xs break-all">
-              {result.groups.map((g) => (
-                <li key={g}>{g}</li>
-              ))}
-            </ul>
-          )}
-        </dd>
-        <dt className="text-muted-foreground">{t("users.role")}</dt>
-        <dd>{result.role ? t(`roles.${result.role}`) : t("realms.noRole")}</dd>
-      </dl>
+      {!oidc && (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+          <dt className="text-muted-foreground">{t("realms.dn")}</dt>
+          <dd className={result.dn ? "font-mono text-xs break-all" : undefined}>
+            {result.dn ?? "—"}
+          </dd>
+          <dt className="text-muted-foreground">{t("realms.groupsFound")}</dt>
+          <dd>
+            {result.groups.length === 0 ? (
+              "—"
+            ) : (
+              <ul className="font-mono text-xs break-all">
+                {result.groups.map((g) => (
+                  <li key={g}>{g}</li>
+                ))}
+              </ul>
+            )}
+          </dd>
+          <dt className="text-muted-foreground">{t("users.role")}</dt>
+          <dd>{result.role ? t(`roles.${result.role}`) : t("realms.noRole")}</dd>
+        </dl>
+      )}
     </div>
   );
 }
