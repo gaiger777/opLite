@@ -7420,3 +7420,28 @@ git commit -m "docs: 원격 클러스터 — README 새 절 \"원격 클러스�
 - 원격 URL은 한 노드를 가리킨다. 그 노드가 꺼지면 다른 노드가 살아 있어도 unreachable이다.
 - 원격 CA가 바뀌면 `remote set --ca-fingerprint`로 다시 등록한다.
 - 그 밖의 제한은 설계 문서 §5.6·§9와 README "원격 클러스터" 절에 있다.
+
+## 실행 후 기록 (2026-11-08)
+
+- **Task 1~6:** `feat/plan37-remotes`에서 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았다(생성 파일 제외).
+- **1차 리뷰에서 고친 것:**
+  - CA 고정 우회(심각): 노드가 연결할 때마다 검증 없이 CA를 다시 받던 것을 없애고, 등록·바꾸기 때 지문을 확인한 CA PEM(인증서 하나)을 `RemoteSpec.ca_pem`에 저장해 그것만 루트로 쓴다.
+  - 중계 읽기 허용 목록(중요): viewer가 원격의 `users`·`tokens`·`realms`·`audit`·`remotes` 등을 읽지 못하게, 정해진 자원만 로컬 Remote 읽기로 열고 나머지는 admin.
+  - 원격 401은 502 `remote_unauthorized`, 중계 응답에 `nosniff`·CSP, JSON이 아닌 Content-Type은 `application/octet-stream`.
+  - 확인 30초·상태 모으기 10초 시간 제한, 경쟁 때 저장된 행을 다시 읽어 돌려줌, `fetch_ca` 오류 문구에 원격 본문을 옮기지 않음.
+  - oplctl `remote vm … start|stop [--force]`, 표준 입력 토큰은 `--ca-fingerprint`나 `--yes`가 필요.
+- **2차 리뷰에서 고친 것:** probe에도 30초 제한, If-Match PUT은 확인 중 상태만 바뀌었으면 다시 씀(spec이 바뀐 때만 412), viewer HEAD 시험.
+- **불안정한 시험(부하 때, 다시 돌리면 통과):** opld `cluster.rs`의 포트 사용 중(스크래치 검증의 Task 5 시점).
+
+**테스트:**
+- macOS `cargo test --workspace` 1472개(Task 4 이후)
+- 웹 시험 538개와 `typecheck`·`lint`·`build`
+- `fmt`·`clippy -D warnings`(모든 기능)
+
+Linux CI(프로브)에서 같은 시험과 linux-kvm·ldap 작업이 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 계획 38(원격 복제 — 백업을 원격 클러스터로 보내 DR)이 남았다. 이 계획의 `RemoteClient`·`ca_pem`·중계를 쓴다.
+- 원격 클러스터의 CA가 바뀌면 운영자가 `oplctl remote set --ca-fingerprint`로 다시 고정해야 한다(자동 갱신 없음).
+- 원격 쓰기는 VM 시작·정지만 — 그 밖은 원격 클러스터에 직접 로그인해서 한다.

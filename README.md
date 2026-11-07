@@ -2357,3 +2357,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 34: 감사 로그](docs/superpowers/plans/2026-11-06-plan34-audit-log.md)
 - [계획 35: 인증 영역과 LDAP](docs/superpowers/plans/2026-11-06-plan35-ldap-realms.md)
 - [계획 36: OIDC SSO](docs/superpowers/plans/2026-11-07-plan36-oidc-sso.md)
+- [계획 37: 원격 클러스터](docs/superpowers/plans/2026-11-08-plan37-remote-clusters.md)
