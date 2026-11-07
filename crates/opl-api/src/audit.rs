@@ -438,7 +438,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditNote {
     }
 }
 
-/// 라우트가 맞은 요청 가운데 바꾸는 것(GET·HEAD·OPTIONS가 아닌 것)과 콘솔 열기를 적는다.
+/// 라우트가 맞은 요청 가운데 바꾸는 것(GET·HEAD·OPTIONS가 아닌 것)과 콘솔 열기, OIDC 로그인 콜백을 적는다.
 pub(crate) async fn layer(
     State(state): State<Arc<AppState>>,
     ClientIp(ip): ClientIp,
@@ -454,7 +454,7 @@ pub(crate) async fn layer(
     };
     let method = req.method().clone();
     let read = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
-    if read && template != "/vms/{key}/console" {
+    if read && template != "/vms/{key}/console" && template != "/auth/oidc/callback" {
         return next.run(req).await;
     }
     let path = api_path(req.uri().path()).to_string();

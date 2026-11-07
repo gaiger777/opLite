@@ -365,19 +365,21 @@ async fn oidc_realms_are_listed_for_the_login_screen_but_reject_password_logins(
         ])
     );
 
-    // 시도 제한에 세지 않는다(몇 번이든 같은 400).
-    for _ in 0..21 {
-        let got = anonymous
-            .post(
-                "/auth/login",
-                json!({ "username": "alice", "password": "pw", "realm": "okta" }),
-            )
-            .await;
-        assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
-        assert_eq!(
-            got.1["message"],
-            "realm okta signs in through its identity provider"
-        );
+    // 시도 제한에 세지 않는다(몇 번이든 같은 400). LDAP 이름 규칙에 맞지 않는 이메일 모양 이름도 같다.
+    for username in ["alice", "alice@corp.com"] {
+        for _ in 0..21 {
+            let got = anonymous
+                .post(
+                    "/auth/login",
+                    json!({ "username": username, "password": "pw", "realm": "okta" }),
+                )
+                .await;
+            assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+            assert_eq!(
+                got.1["message"],
+                "realm okta signs in through its identity provider"
+            );
+        }
     }
     assert!(
         env.cluster

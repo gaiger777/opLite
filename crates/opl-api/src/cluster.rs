@@ -123,7 +123,7 @@ fn now_secs() -> u64 {
 }
 
 /// 클러스터 정보 리소스. 클러스터를 만들 때 하나 생긴다.
-fn cluster_info(state: &AppState) -> Result<ClusterInfo, ApiError> {
+pub(crate) fn cluster_info(state: &AppState) -> Result<ClusterInfo, ApiError> {
     state
         .cluster
         .list::<ClusterSpec>()?

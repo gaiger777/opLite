@@ -1,6 +1,7 @@
 //! 실제 gRPC(mTLS)로 이은 두 노드: 한 노드의 API로 다른 노드에 VM을 띄우고 콘솔을 중계한다.
 //! 라이브 마이그레이션(Mock 하이퍼바이저): 성공, 확정 전 실패의 되돌리기(HA VM 포함), 공유 디스크의 잠금 바꾸기.
 //! 감사 로그: 한 노드의 `GET /audit`가 두 노드의 항목을 합치고, 닿지 않는 노드를 알린다.
+//! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
 
 mod common;
 
@@ -1060,4 +1061,109 @@ async fn a_node_with_the_audit_log_off_is_disabled_not_unreachable() {
     assert_eq!(body["disabled"], serde_json::json!(["node2"]));
     assert_eq!(body["unreachable"], serde_json::json!([]));
     assert!(audit_nodes(&body).iter().all(|n| *n == "node1"), "{body:#}");
+}
+
+/// `found`가 참이 될 때까지 기다린다(복제를 기다린다).
+async fn until(what: &str, found: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !found() {
+        assert!(start.elapsed() < WAIT, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 한 노드에서 시작한 OIDC 로그인의 콜백이 다른 노드로 와도(같은 주소 뒤의 다른 노드) 끝난다.
+#[tokio::test]
+async fn an_oidc_login_started_on_one_node_finishes_on_the_other() {
+    use opl_types::realm::RealmSpec;
+    let (_root, a, b) = two_nodes().await;
+    // opld가 클러스터를 만들 때처럼 클러스터 정보(CA 키)를 두고, 외부 사용자를 쓰도록 두 노드가 이 빌드를 돈다.
+    common::seed_cluster_info(&a.cluster).await;
+    for node in [&a, &b] {
+        let mut status = a.cluster.get::<NodeSpec>(node.id).unwrap().unwrap().status;
+        status.version = Some(opl_types::version::BUILD.into());
+        a.cluster
+            .update_status::<NodeSpec>(node.id, &status)
+            .await
+            .unwrap();
+    }
+    let idp = common::idp::Idp::start().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (status, body) = admin
+        .post(
+            "/realms",
+            serde_json::json!({
+                "name": "okta",
+                "backend": idp.backend(),
+                "roles": { "groups": [{ "group": "opl-admins", "role": "admin" }] }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    until("B has the realm", || {
+        b.cluster
+            .get_by_name::<RealmSpec>("okta")
+            .unwrap()
+            .is_some()
+    })
+    .await;
+
+    let browser = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let started = browser
+        .get(format!("{}/api/v1/auth/oidc/okta/start", a.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::FOUND);
+    let location = started.headers()["location"].to_str().unwrap().to_string();
+    let cookie = started.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let callback = idp.follow(&location).await;
+    assert!(callback.starts_with(&a.base), "{callback}");
+    // A에서 시작했지만 B가 받는다. 토큰 교환에는 상태 쿠키의 리디렉트 URI(A의 주소)를 쓴다.
+    let resp = browser
+        .get(callback.replacen(&a.base, &b.base, 1))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(resp.headers()["location"], "/");
+    let session = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .find(|c| c.starts_with("opl_session="))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    until("B has the user", || {
+        b.cluster
+            .get_by_name::<UserSpec>("alice@okta")
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    let me: serde_json::Value = browser
+        .get(format!("{}/api/v1/auth/whoami", b.base))
+        .header("cookie", &session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["name"], "alice@okta", "{me}");
+    assert_eq!(me["role"], "admin", "{me}");
 }

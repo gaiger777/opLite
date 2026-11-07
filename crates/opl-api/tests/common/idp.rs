@@ -3,7 +3,8 @@
 //! `redirect_uri?code=..&state=..`로 302), `/token`(코드·PKCE S256·클라이언트 인증을 확인하고
 //! ID 토큰·액세스 토큰), `/jwks`, `/userinfo`를 낸다. 서명 키는 RS256(저장소 견본
 //! `tests/fixtures/oidc-rsa.pk8`, kid `rsa-1`)과 ES256(시험마다 새로, kid `ec-1`)이고 처음엔 RS256으로
-//! 서명한다. 시험이 discovery 문서, 클레임, 서명 키·kid·알고리즘, 공개할 키, userinfo, 실패 응답을 정한다.
+//! 서명한다. 시험이 discovery 문서, 클레임, 서명 키·kid·알고리즘, 공개할 키, userinfo, 실패 응답, 인가 응답의
+//! `iss`(RFC 9207), 큰 JWKS를 정한다.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -142,6 +143,12 @@ struct Inner {
     authorize_error: Option<String>,
     /// `/token`의 실패 응답
     token_failure: Option<(u16, Value)>,
+    /// `/userinfo`의 실패 상태
+    userinfo_failure: Option<u16>,
+    /// `/authorize`가 돌려보낼 때 붙일 `iss`
+    authorize_iss: Option<String>,
+    /// JWKS 문서에 더할 바이트 수와 청크로 보낼지(본문 크기 제한 시험)
+    jwks_padding: Option<(usize, bool)>,
     codes: HashMap<String, Grant>,
     access_tokens: Vec<String>,
     authorize_queries: Vec<HashMap<String, String>>,
@@ -215,6 +222,9 @@ impl Idp {
             }),
             authorize_error: None,
             token_failure: None,
+            userinfo_failure: None,
+            authorize_iss: None,
+            jwks_padding: None,
             codes: HashMap::new(),
             access_tokens: Vec::new(),
             authorize_queries: Vec::new(),
@@ -320,6 +330,21 @@ impl Idp {
         self.inner().token_failure = failure;
     }
 
+    /// `/userinfo`가 `status`로 실패한다(None이면 되돌림).
+    pub fn fail_userinfo(&self, status: Option<u16>) {
+        self.inner().userinfo_failure = status;
+    }
+
+    /// `/authorize`가 돌려보내는 주소에 `iss`를 붙인다(None이면 붙이지 않음).
+    pub fn set_authorize_iss(&self, iss: Option<&str>) {
+        self.inner().authorize_iss = iss.map(str::to_string);
+    }
+
+    /// JWKS 문서에 `bytes`바이트를 더한다. `chunked`면 Content-Length 없이 청크로 보낸다.
+    pub fn pad_jwks(&self, bytes: usize, chunked: bool) {
+        self.inner().jwks_padding = Some((bytes, chunked));
+    }
+
     /// `/authorize`가 받은 쿼리(받은 순서)
     pub fn authorize_queries(&self) -> Vec<HashMap<String, String>> {
         self.inner().authorize_queries.clone()
@@ -339,6 +364,21 @@ impl Idp {
     /// 지금 서명 키로 `claims`에 서명한 ID 토큰
     pub fn id_token(&self, claims: &Value) -> String {
         sign(&self.inner(), claims)
+    }
+
+    /// 브라우저처럼 `/authorize` 주소(opLite `start`의 Location)를 열어 돌려보내는 곳(콜백 주소)을 얻는다.
+    pub async fn follow(&self, authorize_url: &str) -> String {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .tls_certs_only([reqwest::Certificate::from_pem(self.ca_pem.as_bytes()).unwrap()])
+            .build()
+            .unwrap();
+        let resp = http.get(authorize_url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND, "{authorize_url}");
+        resp.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     /// 헤더까지 정해 지금 서명 키로 서명한다(`alg` 거짓말 시험).
@@ -386,7 +426,23 @@ async fn jwks(State(site): State<Site>) -> Response {
         .filter(|k| k.published)
         .map(Key::jwk)
         .collect();
-    axum::Json(json!({ "keys": keys })).into_response()
+    match inner.jwks_padding {
+        None => axum::Json(json!({ "keys": keys })).into_response(),
+        Some((bytes, chunked)) => {
+            let body = json!({ "keys": keys, "padding": "x".repeat(bytes) }).to_string();
+            if !chunked {
+                return ([(header::CONTENT_TYPE, "application/json")], body).into_response();
+            }
+            let (a, b) = body.split_at(body.len() / 2);
+            let chunks = [a.to_string(), b.to_string()].map(Ok::<_, std::io::Error>);
+            let stream = futures_util::stream::iter(chunks);
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn authorize(
@@ -420,12 +476,22 @@ async fn authorize(
         if let Some(state) = query.get("state") {
             pairs.append_pair("state", state);
         }
+        if let Some(iss) = &inner.authorize_iss {
+            pairs.append_pair("iss", iss);
+        }
     }
     (
         StatusCode::FOUND,
         [(header::LOCATION, location.to_string())],
     )
         .into_response()
+}
+
+/// application/x-www-form-urlencoded 값 하나를 푼다.
+fn form_decode(value: &str) -> Option<String> {
+    let uri: axum::http::Uri = format!("/?v={value}").parse().ok()?;
+    let Query(mut query) = Query::<HashMap<String, String>>::try_from_uri(&uri).ok()?;
+    query.remove("v")
 }
 
 fn token_error(status: StatusCode, error: &str) -> Response {
@@ -448,13 +514,19 @@ async fn token(
     if let Some((status, body)) = inner.token_failure.clone() {
         return (StatusCode::from_u16(status).unwrap(), axum::Json(body)).into_response();
     }
-    // 클라이언트 인증: 기밀 클라이언트는 client_secret_basic, 공개 클라이언트는 폼의 client_id
+    // 클라이언트 인증: 기밀 클라이언트는 client_secret_basic(RFC 6749 §2.3.1 — client_id와 비밀을 각각
+    // form-urlencode한 뒤 `id:secret`), 공개 클라이언트는 폼의 client_id
     let client_ok = match &inner.client_secret {
         Some(secret) => authorization
             .as_deref()
             .and_then(|a| a.strip_prefix("Basic "))
             .and_then(|b| STANDARD.decode(b).ok())
-            .is_some_and(|b| b == format!("{}:{secret}", inner.client_id).into_bytes()),
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|pair| {
+                let (id, s) = pair.split_once(':')?;
+                Some((form_decode(id)?, form_decode(s)?))
+            })
+            .is_some_and(|(id, s)| id == inner.client_id && s == *secret),
         None => authorization.is_none() && form.get("client_id") == Some(&inner.client_id),
     };
     if !client_ok {
@@ -516,6 +588,9 @@ fn default_claims(inner: &Inner, nonce: Option<&str>) -> Value {
 
 async fn userinfo(State(site): State<Site>, headers: HeaderMap) -> Response {
     let inner = site.hit("userinfo");
+    if let Some(status) = inner.userinfo_failure {
+        return StatusCode::from_u16(status).unwrap().into_response();
+    }
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

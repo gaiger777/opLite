@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::audit::AuditLog;
 use crate::auth::{Authorizer, RoleAuthorizer, Sessions};
 use crate::limit::AttemptLimiter;
+use crate::oidc::OidcCache;
 use crate::vm_imports::ImportCredentials;
 
 /// 모든 핸들러가 공유하는 노드의 상태.
@@ -34,6 +35,8 @@ pub struct AppState {
     pub import_credentials: Arc<ImportCredentials>,
     /// 이 노드의 감사 로그. 기본은 꺼져 있다(opld가 연다).
     pub audit: Arc<AuditLog>,
+    /// OIDC 영역의 discovery·JWKS(노드 메모리)
+    pub(crate) oidc: OidcCache,
 }
 
 impl AppState {
@@ -56,6 +59,7 @@ impl AppState {
             vm_lock: tokio::sync::Mutex::new(()),
             import_credentials: Arc::default(),
             audit: Arc::new(AuditLog::disabled()),
+            oidc: OidcCache::default(),
         }
     }
 }

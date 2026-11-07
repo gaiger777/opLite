@@ -35,7 +35,8 @@ opl-driver.workspace = true
 opl-peer.workspace = true
 opl-reconciler.workspace = true
 opl-types = { workspace = true, features = ["openapi"] }
-reqwest.workspace = true
+# OIDC 토큰 교환의 폼 본문
+reqwest = { workspace = true, features = ["form"] }
 # OIDC: ID 토큰 서명 확인, 상태 쿠키의 HKDF·HMAC, 무작위 값
 ring.workspace = true
 roxmltree.workspace = true

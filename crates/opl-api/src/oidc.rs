@@ -40,10 +40,11 @@ const STATE_KEY_INFO: &[u8] = b"opl-oidc-state";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OidcError {
-    /// IdP에 닿지 못했다(연결·TLS·시간 제한·2xx가 아닌 응답).
+    /// IdP에 닿지 못했다(연결·TLS·시간 제한·2xx가 아닌 응답 — 아래 것 말고).
     #[error("{0}")]
     Unavailable(String),
-    /// IdP의 응답이나 토큰·쿠키가 맞지 않다.
+    /// IdP의 응답이나 토큰·쿠키가 맞지 않다. 토큰 끝점의 `invalid_grant`와 userinfo의 401·403도
+    /// (IdP가 이 로그인을 거절했다).
     #[error("{0}")]
     Invalid(String),
 }
@@ -64,6 +65,9 @@ pub struct Discovery {
     pub jwks_uri: String,
     #[serde(default)]
     pub userinfo_endpoint: Option<String>,
+    /// RFC 9207: 인가 응답에 `iss`를 넣는다.
+    #[serde(default)]
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 /// JWKS의 서명 키 하나(RS256 또는 ES256)
@@ -110,7 +114,8 @@ pub fn client(realm: &OidcRealm) -> Result<reqwest::Client, OidcError> {
         .map_err(|e| invalid(crate::telemetry::chain(&e)))
 }
 
-/// `url`을 GET해 JSON으로 읽는다. 닿지 못했거나 2xx가 아니면 `Unavailable`.
+/// `url`을 GET해 JSON으로 읽는다. 닿지 못했거나 2xx가 아니면 `Unavailable`. 액세스 토큰(`bearer`)을
+/// 보낸 요청(userinfo)이 401·403이면 IdP가 이 로그인을 거절한 것이므로 `Invalid`.
 pub(crate) async fn get_json(
     client: &reqwest::Client,
     url: &str,
@@ -120,22 +125,120 @@ pub(crate) async fn get_json(
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| OidcError::Unavailable(format!("{url}: {}", crate::telemetry::chain(&e))))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(OidcError::Unavailable(format!("{url}: HTTP {status}")));
+    let response = request.send().await;
+    if bearer.is_some()
+        && let Ok(r) = &response
+        && matches!(
+            r.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        )
+    {
+        return Err(invalid(format!("{url}: HTTP {}", r.status())));
     }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| OidcError::Unavailable(format!("{url}: {}", crate::telemetry::chain(&e))))?;
-    if body.len() > MAX_BODY {
-        return Err(invalid(format!("{url}: response is too large")));
+    read_json(url, response).await
+}
+
+/// IdP 응답을 JSON으로 읽는다. 본문은 `MAX_BODY`까지만 읽는다(Content-Length가 크면 바로, 아니면 읽다가
+/// 넘으면 멈춤). 닿지 못했거나 2xx가 아니면 `Unavailable`(오류 본문의 `error`를 붙임). 다만 4xx의
+/// `invalid_grant`(토큰 끝점 — 코드가 틀렸거나 이미 썼거나 만료)는 `Invalid`.
+async fn read_json(
+    url: &str,
+    response: reqwest::Result<reqwest::Response>,
+) -> Result<Value, OidcError> {
+    let unavailable = |e: reqwest::Error| {
+        OidcError::Unavailable(format!("{url}: {}", crate::telemetry::chain(&e)))
+    };
+    let too_large = || invalid(format!("{url}: response is too large"));
+    let mut response = response.map_err(unavailable)?;
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_BODY as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(unavailable)? {
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        let error = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error")?.as_str().map(str::to_string));
+        let message = format!(
+            "{url}: HTTP {status}{}",
+            error
+                .as_deref()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default()
+        );
+        if status.is_client_error() && error.as_deref() == Some("invalid_grant") {
+            return Err(invalid(message));
+        }
+        return Err(OidcError::Unavailable(message));
     }
     serde_json::from_slice(&body).map_err(|e| invalid(format!("{url}: {e}")))
+}
+
+/// 토큰 끝점의 응답에서 쓰는 값
+#[derive(Deserialize)]
+pub struct Tokens {
+    pub id_token: String,
+    #[serde(default)]
+    pub access_token: Option<String>,
+}
+
+// 토큰이 로그에 나가지 않게 가린다.
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tokens").finish_non_exhaustive()
+    }
+}
+
+/// application/x-www-form-urlencoded 값 하나(client_secret_basic의 client_id와 비밀, RFC 6749 §2.3.1)
+fn form_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 인가 코드를 토큰으로 바꾼다(PKCE 검증자). 폼에는 늘 `client_id`를 넣고, 비밀이 있으면
+/// client_secret_basic(client_id와 비밀을 각각 form-urlencode한 `id:secret`의 Basic 인증)으로 보낸다.
+pub async fn exchange_code(
+    client: &reqwest::Client,
+    realm: &OidcRealm,
+    token_endpoint: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<Tokens, OidcError> {
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", verifier),
+        ("client_id", realm.client_id.as_str()),
+    ];
+    let mut request = client
+        .post(token_endpoint)
+        .header("accept", "application/json")
+        .form(&form);
+    if let Some(secret) = &realm.client_secret {
+        request = request.basic_auth(form_encode(&realm.client_id), Some(form_encode(secret)));
+    }
+    let body = read_json(token_endpoint, request.send().await).await?;
+    serde_json::from_value(body).map_err(|e| invalid(format!("{token_endpoint}: {e}")))
 }
 
 /// discovery 문서 주소. issuer 끝의 `/`는 하나로 합친다.
@@ -631,6 +734,8 @@ pub struct LoginState {
     pub nonce: String,
     /// PKCE 검증자
     pub verifier: String,
+    /// `start`가 IdP에 보낸 리디렉트 URI. 콜백은 이것으로 코드를 바꾼다(콜백의 Host를 보지 않는다).
+    pub redirect_uri: String,
     /// 만든 시각(유닉스 초)
     pub created: i64,
 }
@@ -652,12 +757,13 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 
 impl LoginState {
     /// 영역의 새 로그인 상태(무작위 `state`·`nonce`·검증자)
-    pub fn new(realm: &str, now: i64) -> Self {
+    pub fn new(realm: &str, redirect_uri: &str, now: i64) -> Self {
         Self {
             realm: realm.into(),
             state: random_value(),
             nonce: random_value(),
             verifier: random_value(),
+            redirect_uri: redirect_uri.into(),
             created: now,
         }
     }
@@ -1063,6 +1169,12 @@ mod tests {
     }
 
     #[test]
+    fn client_credentials_are_form_encoded() {
+        assert_eq!(form_encode("oplite"), "oplite");
+        assert_eq!(form_encode("a b+c:d/é*-._~"), "a+b%2Bc%3Ad%2F%C3%A9*-._%7E");
+    }
+
+    #[test]
     fn discovery_url_joins_one_slash() {
         assert_eq!(
             discovery_url("https://idp.example.com/realms/corp/"),
@@ -1077,7 +1189,11 @@ mod tests {
     #[test]
     fn state_cookies_are_signed_and_expire() {
         let key = state_key("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n");
-        let state = LoginState::new("okta", NOW);
+        let state = LoginState::new(
+            "okta",
+            "https://opl.example.com/api/v1/auth/oidc/callback",
+            NOW,
+        );
         assert_ne!(state.state, state.nonce);
         let cookie = state.seal(&key);
         assert_eq!(

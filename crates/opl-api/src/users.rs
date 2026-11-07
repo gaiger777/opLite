@@ -118,6 +118,14 @@ pub async fn login(
         },
         AuditAuth::Session,
     );
+    let cookie = new_session(&state, &user)?;
+    let mut response = Json(UserView::from(user)).into_response();
+    response.headers_mut().insert(SET_COOKIE, cookie);
+    Ok(response)
+}
+
+/// 사용자의 세션을 만들고 그 세션 쿠키(Set-Cookie 값)를 돌려준다.
+pub(crate) fn new_session(state: &AppState, user: &User) -> Result<HeaderValue, ApiError> {
     let session = state.sessions.create(user.id, user.spec.session_epoch);
     let mut cookie = format!(
         "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
@@ -126,12 +134,7 @@ pub async fn login(
     if state.secure_cookies {
         cookie.push_str("; Secure");
     }
-    let mut response = Json(UserView::from(user)).into_response();
-    response.headers_mut().insert(
-        SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(ApiError::internal)?,
-    );
-    Ok(response)
+    HeaderValue::from_str(&cookie).map_err(ApiError::internal)
 }
 
 /// 로컬 사용자의 비밀번호를 확인한다.
@@ -194,22 +197,23 @@ async fn login_realm(
             "<invalid>"
         },
     ));
-    let Ok(name) = external_name(&req.username, realm) else {
-        state.attempts.begin_ip(ip)?;
-        return Err(wrong_credentials());
-    };
-    let stored = state
-        .cluster
-        .get_by_name::<RealmSpec>(realm)?
-        .ok_or_else(|| ApiError::bad_request(format!("unknown realm {realm:?}")))?;
-    let ldap = match &stored.spec.backend {
-        RealmBackend::Ldap(ldap) => ldap,
-        // 비밀번호를 받지 않으므로 시도로 세지 않는다.
-        RealmBackend::Oidc(_) => {
+    // OIDC 영역은 비밀번호를 받지 않는다. 이름 규칙(LDAP)과 관계없이 먼저 400으로 거절하고 시도로 세지 않는다.
+    let stored = state.cluster.get_by_name::<RealmSpec>(realm)?;
+    let ldap = match stored.as_ref().map(|r| &r.spec.backend) {
+        Some(RealmBackend::Ldap(ldap)) => Some(ldap),
+        Some(RealmBackend::Oidc(_)) => {
             return Err(ApiError::bad_request(format!(
                 "realm {realm} signs in through its identity provider"
             )));
         }
+        None => None,
+    };
+    let Ok(name) = external_name(&req.username, realm) else {
+        state.attempts.begin_ip(ip)?;
+        return Err(wrong_credentials());
+    };
+    let (Some(stored), Some(ldap)) = (&stored, ldap) else {
+        return Err(ApiError::bad_request(format!("unknown realm {realm:?}")));
     };
     let attempt = state.attempts.begin(&name, ip)?;
     // 디렉터리에는 소문자로 바꾼 이름(외부 사용자 이름의 앞부분)을 묻는다.
@@ -235,26 +239,50 @@ async fn login_realm(
     })?;
     // 외부 사용자는 옛 노드가 모르는 필드(`realm`)를 쓴다.
     crate::cluster::require_current(&state.cluster)?;
-    let user = upsert_external(state, &name, realm, role).await?;
+    let user = upsert_external(state, &name, realm, role, None).await?;
     state.attempts.success(&name, ip, attempt);
     Ok(user)
 }
 
 /// 외부 사용자를 만들거나 역할을 고친다(역할이 바뀌면 옛 세션을 끊는다). 같으면 쓰지 않는다.
-/// 같은 사용자의 로그인이 겹쳐 진 쪽은 다시 읽어 한 번 더 한다.
-async fn upsert_external(
+/// 같은 사용자의 로그인이 겹쳐 진 쪽은 다시 읽어 한 번 더 한다. LDAP·OIDC 로그인이 함께 쓴다.
+/// OIDC는 `subject`(`"<iss> <sub>"`)를 준다: 만들 때 적고, 이미 다른 subject가 있으면 거절하고(같은 이름을
+/// 다시 쓴 다른 사람), 없으면(옛 데이터) 적는다.
+pub(crate) async fn upsert_external(
     state: &AppState,
     name: &str,
     realm: &str,
     role: Role,
+    subject: Option<&str>,
 ) -> Result<User, ApiError> {
     let mut retried = false;
     loop {
         let written = match state.cluster.get_by_name::<UserSpec>(name)? {
-            Some(user) if user.spec.role == role => return Ok(user),
+            Some(user)
+                if subject.is_some()
+                    && user.spec.subject.is_some()
+                    && user.spec.subject.as_deref() != subject =>
+            {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "subject_mismatch",
+                    format!("subject mismatch: {name} belongs to another identity provider user"),
+                ));
+            }
+            Some(user)
+                if user.spec.role == role
+                    && (subject.is_none() || user.spec.subject.as_deref() == subject) =>
+            {
+                return Ok(user);
+            }
             Some(mut user) => {
-                user.spec.role = role;
-                user.spec.session_epoch += 1;
+                if user.spec.role != role {
+                    user.spec.role = role;
+                    user.spec.session_epoch += 1;
+                }
+                if let Some(subject) = subject {
+                    user.spec.subject = Some(subject.into());
+                }
                 state
                     .cluster
                     .update_spec(
@@ -274,7 +302,7 @@ async fn upsert_external(
                         role,
                         session_epoch: 0,
                         realm: Some(realm.into()),
-                        subject: None,
+                        subject: subject.map(str::to_string),
                     },
                 );
                 state

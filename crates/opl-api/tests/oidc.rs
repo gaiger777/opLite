@@ -1,6 +1,6 @@
 //! OIDC 핵심 모듈과 가짜 IdP: discovery(issuer 다름·http 끝점·믿지 않는 CA 거절, 캐시), JWKS(캐시,
 //! 모르는 kid 뒤 다시 받기, 10초 안에는 다시 받지 않음), 받기 실패 기억과 동시 받기 하나로, 가장 높은
-//! revision, 캐시를 거친 ID 토큰 확인, 영역 시험 동작의 `discovery`·`jwks` 단계.
+//! revision, 응답 크기 제한, 캐시를 거친 ID 토큰 확인, 영역 시험 동작의 `discovery`·`jwks` 단계.
 
 mod common;
 
@@ -250,6 +250,31 @@ async fn unknown_key_ids_refetch_the_jwks_at_most_every_ten_seconds() {
         Err(invalid("no RS256 key with kid rsa-1 in the JWKS"))
     );
     assert_eq!(idp.hits("jwks"), 6);
+}
+
+/// IdP 응답은 1 MiB까지만 읽는다: Content-Length가 크면 바로, 청크면 읽다가 넘을 때 멈춘다.
+#[tokio::test]
+async fn large_responses_are_refused_while_reading() {
+    let idp = Idp::start().await;
+    let realm = realm(&idp);
+    let jwks = format!("{}/jwks", idp.issuer);
+    let too_large = invalid(format!("{jwks}: response is too large"));
+    for chunked in [false, true] {
+        idp.pad_jwks(2 << 20, chunked);
+        let cache = OidcCache::default();
+        assert_eq!(
+            cache.keys(key(), &realm, &jwks, None).await,
+            Err(too_large.clone()),
+            "chunked: {chunked}"
+        );
+        // 1 MiB 안이면 읽는다.
+        idp.pad_jwks(1 << 19, chunked);
+        assert_eq!(
+            cache.keys(key(), &realm, &jwks, None).await.unwrap().len(),
+            2,
+            "chunked: {chunked}"
+        );
+    }
 }
 
 /// 받기 실패는 같은 (영역, revision)에서 15초 동안 기억해 다시 받지 않고 같은 오류를 돌려준다.

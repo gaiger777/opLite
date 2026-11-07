@@ -17,6 +17,7 @@ mod janitor;
 pub mod ldap;
 pub mod limit;
 pub mod oidc;
+mod oidc_login;
 pub mod realms;
 pub mod resources;
 mod schedule;
@@ -91,6 +92,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(users::logout))
         .routes(routes!(users::whoami))
         .routes(routes!(realms::list_login_realms))
+        .routes(routes!(oidc_login::oidc_start))
+        .routes(routes!(oidc_login::oidc_callback))
         .routes(routes!(users::list_users, users::create_user))
         .routes(routes!(users::update_user, users::delete_user))
         .routes(routes!(users::list_tokens, users::create_token))
