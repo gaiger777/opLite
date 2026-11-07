@@ -25365,3 +25365,26 @@ git commit -m "docs: 원격 복제(DR) — README 새 절 \"원격 복제(DR)\"(
 - 보내는 쪽의 operator 토큰은 DR의 백업을 지울 수 있다 — 원본 지우기가 DR로 이어진다. DR 쪽에서 따로 보관하려면 그쪽 백업 작업을 둔다.
 - 받는 쪽 operator는 출처를 내세운 사본을 만들 수 있다(보내는 쪽 확인이 붙지 않게 막는다).
 - 그 밖의 제한은 설계 문서 §6.6·§9와 README "원격 복제(DR)" 절에 있다.
+
+## 실행 후 기록 (2026-11-08)
+
+- **Task 1~7:** `feat/plan38-replication`에서 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았다(생성 파일 제외). Task 5의 두 클러스터 E2E(`qemu-it`)도 이 Mac에서 통과했다.
+- **1차 리뷰에서 고친 것:**
+  - 같은 사본은 출처 CA 지문·원본 id·풀이 모두 같을 때만(다른 풀로 받으면 새 사본).
+  - 받는 쪽: 디스크 크기가 매니페스트와 다르면 400, 풀 공간이 모자라면 507, (백업, 파일)별 잠금(동시 PUT은 409 `backup_busy`), 128 MiB마다 `sync_data`, PUT마다 `received_at`과 해시 기록, `complete`는 지우기 Task가 있으면 409.
+  - 보내는 쪽: 이미 있는 사본은 풀·VM 스펙·디스크·크기를 확인하고, 원격에서 지워진 사본(404)은 처음부터 다시 보낸다. 파일 PUT의 응답 기다림 120초.
+  - 지우기 전파, 웹·문서 보강.
+- **2차 리뷰에서 고친 것:** 보낸 해시를 원본 디스크 기록에 남겨 다음 확인은 GET과 해시 비교로 끝남, 확인이 사본 상태를 흔들지 않음(닿지 못하면 `error`만), 멈춘 업로드 60초, 보존 규칙이 지울 백업은 확인·복제하지 않음.
+- **불안정한 시험(부하 때, 다시 돌리면 통과):** opl-api `two_nodes.rs` an_oidc_login_started_on_one_node_finishes_on_the_other, opld `audit.rs` audit_reads_the_records_of_every_node(Task 1).
+
+**테스트:**
+- macOS `cargo test --workspace` 1518개(Task 5 이후)와 opld `qemu-it` 복제 E2E
+- 웹 시험 548개와 `typecheck`·`lint`·`build`
+- `fmt`·`clippy -D warnings`(모든 기능)
+
+Linux CI(프로브)에서 같은 시험과 linux-kvm·ldap 작업이 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 하위 프로젝트 10(엔터프라이즈: 감사 로그·LDAP·OIDC·원격 클러스터·원격 복제)이 끝났고, 처음 분해한 하위 프로젝트 1~10이 모두 끝났다.
+- 넣지 않은 것: 증분 전송·대역폭 제한·이어 보내기, 디스크 연속 복제(낮은 RPO), 자동 장애 조치, SAML·IdP 로그아웃 연동, 원격 CA 자동 갱신.
