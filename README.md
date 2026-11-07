@@ -1511,7 +1511,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
 볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기)과 백업 작업, VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업, 감사 로그(admin),
-사용자(admin), 인증 영역(LDAP·OIDC, admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
+사용자(admin), 인증 영역(LDAP·OIDC, admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 원격 클러스터(상태 카드, 원격 VM 목록과 동작), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
 
@@ -1904,7 +1904,7 @@ oplctl -o json audit --since 7d                  # 응답 그대로(항목의 �
   템플릿>"`(예: `POST /vms/{key}/actions/{action}`, `DELETE /users/{key}`, `POST /auth/login`)이라 새 API도 저절로
   이름을 가진다. `target`은 템플릿의 첫 조각과 첫 매개변수 값(`{"kind":"vms","key":"web-1"}`)이고, 매개변수가 없는
   경로는 `null`이다. `detail`은 핸들러가 남긴 짧은 문자열이다: 로그인은 `username=<이름>`(이름 형식이 아니면
-  `username=<invalid>` — 비밀번호를 이름 칸에 넣었을 수 있다, 영역 로그인은 뒤에 ` realm=<영역>`), OIDC 콜백은 `realm=<영역> username=<이름>` 또는 `realm=<영역> error=<코드>`, 구독 키 넣기는 `id=<키 id>`. 비밀번호·키·토큰은
+  `username=<invalid>` — 비밀번호를 이름 칸에 넣었을 수 있다, 영역 로그인은 뒤에 ` realm=<영역>`), OIDC 콜백은 `realm=<영역> username=<이름>` 또는 `realm=<영역> error=<코드>`, 원격 클러스터 중계는 `remote=<이름> <메서드> /<경로>`, 구독 키 넣기는 `id=<키 id>`. 비밀번호·키·토큰은
   어디에도 넣지 않는다. 로그인에 성공하면 그 사용자, 로그아웃은 세션의 사용자가 `user`다. `path`·`target.key`·
   `detail`·`user`는 512바이트까지만 적는다(넘으면 글자 경계에서 잘라 끝에 `…`).
 - **파일.** `{data_dir}/audit/audit.log`(패키지는 `/var/lib/opl/audit/audit.log`). 디렉터리는 0700, 파일은 0600이다.
@@ -1971,6 +1971,156 @@ max_files = 8        # 지금 파일을 포함해 남기는 파일 수(1 이상)
   다 남지 않는다). 각 문자열 필드는 512바이트까지만 적는다. 로그인의 사용자 이름 칸에 비밀번호를 잘못 넣으면 이름 형식(1~63자의 영문 소문자·숫자·`-`)이면
   `username=<그 값>`으로 그대로 적힌다. 감사 로그를 끈 노드는 `disabled`로 보일 뿐 그 노드의 요청은 어디에도 남지 않는다.
   `max_file_mib`는 256까지이고, 읽을 때 파일 하나를 통째로 메모리에 올린다(한 번 읽기에 최대 `max_file_mib`쯤).
+
+## 원격 클러스터
+
+다른 opLite 클러스터를 원격(`Remote`)으로 등록하면 이 클러스터에서 그 클러스터의 상태(노드·VM 수, 버전, CPU·메모리)를
+보고, 그 클러스터의 API를 이 클러스터를 거쳐 부를 수 있다(VM 목록, 시작·정지 등). 두 클러스터는 대등하다: 어느 쪽도
+다른 쪽의 멤버가 아니고 Raft를 함께 쓰지 않는다. 서로 보려면 양쪽에서 따로 등록한다.
+
+- **권한은 두 번.** 원격은 이 클러스터의 리소스라 로그인한 누구나(viewer 이상) 보고, admin만 등록·고치기·지우기·새로
+  모으기를 한다(operator도 **403**). 원격 클러스터 쪽에서 할 수 있는 일은 등록할 때 넣은 그 클러스터의 API 토큰 주인의
+  역할이 다시 정한다. 원격 클러스터에서 viewer 사용자로 만든 토큰을 등록하면 이 클러스터의 admin도 그곳에서는 읽기만
+  한다(바꾸는 요청은 원격의 **403**이 그대로 온다). API 토큰은 만든 사용자의 역할을 그대로 가지므로, 원격에 필요한 만큼의
+  역할(VM을 시작·정지하려면 보통 operator — admin 토큰은 쓰지 않는다)로 사용자를 따로 만들고 그 사용자로 토큰을 만든다.
+- **지문으로 믿기.** 원격과의 TLS는 원격 클러스터의 CA 하나만 믿는다(시스템 루트는 쓰지 않는다). 그 CA는 등록할 때
+  원격의 `GET /api/v1/cluster/ca`에서 받아 준 지문(`sha256:…`)과 같고 정확히 인증서 하나인지 확인한 뒤 원격과 함께
+  저장한다(덧붙인 다른 CA를 믿게 되지 않게 둘 이상이면 받지 않는다). 그 뒤로 노드는 연결할 때 CA를 다시 받지 않고 저장한
+  것만 믿는다(재시작한 노드도). 지문은 원격 클러스터 노드의 `oplctl cluster status`(`CA fingerprint:` 줄)나 웹 클러스터
+  화면, `cluster init` 출력에서 확인한다. 호스트 이름은 확인하지 않는다(노드 인증서의 이름은 노드마다 다르므로 그 CA가
+  서명했는지와 기간만 본다). 원격 클러스터의 CA가 바뀌면(클러스터를 새로 만듦) `oplctl remote set <이름> --ca-fingerprint
+  <새 지문> --token-file <파일>`로 고칠 때까지 닿지 않는다.
+- **등록할 때의 확인**(이 순서, 하나라도 실패하면 저장하지 않는다): 입력 검사 **400**(`url`은 `https://<호스트>[:포트]` —
+  경로·쿼리·조각·사용자 정보가 없고 끝 `/`는 뗀다, 지문은 대소문자와 `AB:CD:…` 꼴도 받아 `sha256:<소문자 64자>`로, 토큰은
+  `opl_<id>_<비밀>` 모양, 이름은 리소스 이름 규칙이고 `probe`는 쓸 수 없다) → 롤링 업그레이드 중이면 **409**
+  `cluster_upgrading` → 원격의 CA를 받지 못하면 **502** `remote_unreachable` → 지문이 다르면 **400**
+  `remote_fingerprint_mismatch`(메시지에 받은 지문) → 받은 CA가 이 클러스터의 CA면 **400** `remote_is_local` → 그 CA로
+  연결해 토큰으로 원격의 `GET /api/v1/auth/whoami`를 읽어 **401**이면 **400** `remote_unauthorized`(그 밖의 실패는 **502**
+  `remote_unreachable`) → 저장하고 곧 상태를 한 번 모아(10초 제한) 응답에 넣는다. CA 받기부터 whoami까지 모두 30초 안에
+  끝나야 한다(넘으면 **502** `remote_unreachable` "timed out checking the remote cluster" — `probe`의 CA 받기도 같다).
+  검증 없이 CA를 받는 것(등록·`probe`)은 아무 주소에나 닿으므로 오류에 원격이 준 말을 옮기지 않는다: 2xx가 아니면 HTTP
+  상태 코드만(`HTTP 404: Not Found`), 연결 실패는 `cannot connect`, TLS 실패는 `TLS handshake failed`, 2xx지만 PEM
+  인증서가 아니면 `not an opLite cluster`.
+- **토큰은 나가지 않는다.** 응답에는 토큰 대신 토큰의 id(`token_id` — 원격의 `oplctl token list`·API 토큰 화면에서 어느
+  토큰인지 알아보게)만 있고, 원격은 watch로도 내보내지 않는다(웹은 10초마다 다시 읽는다). 바꾸기(`PUT`)에서 `token`을 빼면
+  `url`·`ca_fingerprint`(정규화한 값)가 모두 그대로일 때만 저장된 토큰을 두고, 하나라도 바뀌면 **400** "token must be given
+  again when url or ca_fingerprint changes"다(저장된 토큰을 다른 곳으로 보내지 않는다). `url`이나 `ca_fingerprint`가 바뀌면
+  등록 때와 같은 확인(CA를 다시 받아 저장)을 하고, 토큰만 바뀌면 저장한 CA로 토큰만 확인한다. 이름은 바꿀 수 없다.
+  `If-Match`가 다르면 **412**지만, 확인하는 사이에 상태만 바뀌었으면(상태 수집이 revision을 올림) 다시 확인하지 않고 새
+  revision에 쓴다 — **412**는 그 사이 spec(주소·지문·토큰)이 바뀐 때만이다. 원격을 지워도 원격 클러스터의 토큰은 남으므로
+  그곳에서 따로 지운다.
+- **노드에서 원격으로.** 원격에 연결하는 것은 브라우저가 아니라 이 클러스터의 노드다(상태는 리더가, 중계는 요청을 받은
+  노드가). 모든 노드가 원격 URL에 닿아야 한다. 연결은 요청마다 새로 열고(HTTP/1.1), 연결·TLS 10초, 요청을 다 보낸 뒤
+  응답 헤더 10초, 본문 조각 사이 60초 제한이며 리다이렉트는 따르지 않는다. CA는 등록 때 저장한 것을 쓴다.
+
+```bash
+# 원격 클러스터(dr)에서: 이 클러스터가 쓸 사용자(읽기만 시키려면 --role viewer)
+oplctl user create prod-link --role operator
+# 그 사용자로 로그인해 API 토큰을 만든다(웹이면 그 사용자로 로그인해 API 토큰 화면에서). 토큰은 다시 볼 수 없다.
+oplctl login --server https://10.0.1.11:8006 --ca-fingerprint sha256:… --user prod-link
+oplctl token create prod > /root/dr-token      # 이 파일을 prod 쪽으로 옮긴다
+oplctl cluster status                          # CA fingerprint: sha256:… — 아래에서 보이는 지문과 비교한다
+
+# 이 클러스터(prod)에서(admin)
+oplctl remote add dr --url https://10.0.1.11:8006 --token-file /root/dr-token
+# the remote cluster CA fingerprint is sha256:3f9a…
+# Is this the CA of the remote cluster? [y/N] y
+# remote dr added (reachable)
+oplctl remote add dr --url https://10.0.1.11:8006 --ca-fingerprint sha256:3f9a… --token-file -   # 지문을 미리 알면
+oplctl remote list
+# NAME  CLUSTER  VERSION  NODES  VMS    STATUS
+# dr    dr       0.37.0   3/3    12/15  reachable
+oplctl remote show dr       # url·ca fingerprint·token id·status·changed at·cluster·version·nodes·vms·cpus·memory
+oplctl remote refresh dr    # 곧 다시 모아 show처럼 보인다(admin)
+oplctl remote vms dr        # 원격의 VM 목록(vm list와 같은 표)
+oplctl remote vm dr start web          # 시작
+oplctl remote vm dr stop web           # ACPI 종료(로컬 vm stop과 같음)
+oplctl remote vm dr stop web --force   # 곧바로 끄기(로컬 vm stop --force와 같음)
+oplctl remote set dr --url https://10.0.1.12:8006 --token-file /root/dr-token   # 주소·지문을 바꾸면 토큰도 다시
+oplctl remote set dr --token-file /root/new-token    # 새 토큰만(주지 않은 것은 그대로, 읽은 revision으로 — 그 사이 다른 admin이 바꿨으면 412)
+oplctl remote remove dr
+```
+
+- **oplctl.** `remote add`에 `--ca-fingerprint`가 없으면 oplctl이 직접(인증서를 검증하지 않고) 원격의 CA를 받아 지문을 보이고,
+  `--yes`면 그대로 믿고, 터미널이면 `[y/N]`로 묻고(`y`·`yes`만 계속), 터미널이 아니면(스크립트) "check the fingerprint
+  (`oplctl cluster status` on a node of the remote cluster) and run again with --ca-fingerprint sha256:…"로 끝난다(종료 1).
+  `--token-file -`이면 표준 입력에서 읽고 앞뒤 공백을 뗀다 — 그때는 표준 입력으로 지문 확인을 물을 수 없으므로
+  `--ca-fingerprint`나 `--yes`가 없으면 토큰을 읽거나 원격에 연결하기 전에 "reading the token from stdin needs
+  --ca-fingerprint or --yes"로 끝난다. `remote vm`은 원격의 Task를 기다리지 않고 "vm web on remote dr: stop requested (task
+  <id>)"(`--force`면 `force stop requested`)만 보인다(결과는 `remote vms`로). `-o json`이면 API 응답 그대로다.
+- **상태 수집.** 리더가 5초마다(`tick`) 모을 때가 된 원격을 찾아, 원격마다 30초마다(`interval`) 원격의 `GET /cluster`,
+  `/nodes`, `/vms`를 읽는다(원격들을 동시에, 각각 10초 제한 — 그래서 원격 토큰은 적어도 viewer여야 한다). 상태는
+  `cluster_name`, `version`(위트니스를 포함한 노드 버전 가운데 가장 낮은 것), `nodes{total, online}`·`cpus`·`memory_gib`
+  (위트니스를 뺀 노드), `vms{total, running}`이다. 읽지 못하면 `reachable: false`와 `error`(이유)만 남고 나머지는 비운다.
+  모은 것이 저장된 것과 같으면 쓰지 않는다(Raft 부하) — 그래서 `checked_at`은 마지막 확인 시각이 아니라 상태가 마지막으로
+  **바뀐** 시각이다(oplctl `changed at`). 리더가 바뀌면 새 리더가 곧 모은다. `oplctl remote refresh`(웹 "새로고침", API
+  `POST /remotes/{key}/actions/refresh`)는 기다리지 않고 지금 모은다(10초 제한). 모은 상태를 적지 못하면(그 사이 수집기가
+  먼저 적음) 모은 것 대신 저장된 원격을 돌려준다(등록·바꾸기의 응답도 같다).
+- **중계.** `/api/v1/remotes/{key}/api/{*path}`(모든 메서드)는 그 원격의 `/api/v1/{path}`로 메서드·쿼리·본문을 저장한
+  토큰(`Authorization: Bearer`)으로 보내고, 상태와 본문을 그대로 흘려 돌려준다(본문 한도 없음 — 업로드·내려받기도 된다).
+  - 권한: 아래 허용 목록의 경로를 `GET`·`HEAD`로 읽는 것은 원격을 읽을 수 있는 누구나(viewer 이상), 그 밖은 메서드와
+    관계없이 이 클러스터의 admin이다. 그다음 원격이 토큰 주인의 역할로 다시 확인한다. 원격 토큰이 읽을 수 있더라도 사용자·
+    토큰·인증 영역·감사 로그·텔레메트리처럼 계정과 보안에 관한 것과 원격의 원격(`remotes` — 중계 사슬)은 이 클러스터의
+    viewer·operator가 읽지 못하게 한다. 첫 조각은 퍼센트 인코딩을 풀어 본다(`%75sers`도 `users`).
+
+    | 경로(`{*path}`) | `GET`·`HEAD` | 그 밖의 메서드 |
+    |---|---|---|
+    | 첫 조각이 `vms`·`volumes`·`storage-pools`·`networks`·`security-groups`·`snapshots`·`backups`·`backup-jobs`·`vm-imports`·`nodes`·`tasks`·`cluster`·`version`·`settings`·`subscription`, 또는 정확히 `auth/whoami` | viewer 이상 | admin |
+    | 그 밖(`users`·`tokens`·`realms`·`audit`·`telemetry`·`remotes`·다른 `auth/*`·모르는 조각) | admin | admin |
+
+  - 보내는 헤더는 `Content-Type`·`Content-Length`·`If-Match`·`Accept`뿐이다(쿠키·`Origin`·원래 `Authorization` 등은 보내지
+    않고 `Host`는 원격 주소). 돌려주는 헤더는 `Content-Type`·`Content-Length`·`ETag`·`Retry-After`·`Content-Disposition`뿐이고,
+    원격이 보낸 HTML·SVG 따위가 이 클러스터 출처의 페이지로 실행되지 않게 `Content-Type`은 `application/json`(매개변수
+    허용)일 때만 그대로, 그 밖(없음 포함)은 `application/octet-stream`으로 하며 늘 `X-Content-Type-Options: nosniff`와
+    `Content-Security-Policy: default-src 'none'; sandbox`를 붙인다.
+  - 경로 조각에 `.`·`..`·빈 조각이 있으면(퍼센트 인코딩 `%2e` 등도) **400** `invalid_request`, `watch`로 시작하는 경로와 VM
+    콘솔(`vms/<VM>/console`, WebSocket)은 **404** `remote_path_unsupported`, 원격에 닿지 못하면(연결·TLS·시간 제한) **502**
+    `remote_unreachable`이다. 원격이 저장된 토큰을 거절하면(**401** — 원격에서 토큰을 지움 등) 본문을 버리고 **502**
+    `remote_unauthorized` "the remote cluster refused the stored token; update it with `oplctl remote set --token-file`"다
+    (이 클러스터의 로그인 문제로 보이지 않게 — oplctl은 이 메시지를 그대로 보이고 웹은 로그아웃하지 않는다). 원격의 그 밖의
+    오류 응답(**403** 포함 **4xx**·**5xx**)은 그대로 온다.
+  - 감사: 중계한 바꾸는 요청은 이 클러스터의 감사 로그에 `action` `"<METHOD> /remotes/{key}/api/{*path}"`, `target`
+    `remotes/<키>`, `detail` `remote=<이름> <METHOD> /<경로>`로 남고, 원격 클러스터의 감사 로그에는 토큰 주인의 요청으로 남는다.
+  - 중계는 API 문서(OpenAPI)에 넣지 않는다(원격 API가 그대로 보이므로). 원격 쪽 API는 원격의 `openapi.json`을 본다.
+- **웹.** "원격 클러스터" 메뉴(모두에게): 원격마다 카드(이름, 연결됨·연결 안 됨, URL, 클러스터 이름, 버전, 노드
+  online/total, VM running/total, CPU, 메모리, 닿지 않으면 오류 문구), 10초마다 다시 읽는다. admin은 추가(이름, URL을 넣고
+  "CA 받기" — 브라우저는 다른 출처를 읽지 못하므로 노드가 받은 지문을 보인다, 지문 확인 체크, API 토큰), 고치기(토큰을
+  비우면 그대로, URL·CA가 바뀌면 다시 넣으라고 알림), 지우기, 새로고침을 한다. 카드의 이름을 누르면 그 원격의 VM 목록
+  (중계 `GET /vms`, 10초마다)이고, admin은 VM마다 시작·정지(ACPI)·강제 정지(확인 뒤)를 요청한다(oplctl `remote vm
+  start|stop [--force]`와 같은 이름, 원격 쪽 Task는 지켜보지 않고 요청했다고만 알린다). 중계의 **401**은 이 클러스터의
+  세션이 끝난 것이므로 다른 화면처럼 로그인으로 돌아간다.
+- **API.** `GET`·`POST /api/v1/remotes`, `GET`·`PUT`(`If-Match` 선택)·`DELETE /api/v1/remotes/{key}`(본문
+  `{"name","url","ca_fingerprint","token"}` — `PUT`의 `name`은 생략하거나 지금 이름), `POST /api/v1/remotes/probe {"url"}`
+  (admin — 인증서를 검증하지 않고 CA를 받아 정규화한 `url`과 `ca_fingerprint`를 돌려준다, 받지 못하거나 30초를 넘으면
+  **502** `remote_unreachable`),
+  `POST /api/v1/remotes/{key}/actions/refresh`(admin), 그리고 위의 중계. 응답은 `{"id","name","revision","url",
+  "ca_fingerprint","token_id","status":{"reachable","checked_at","error","cluster_name","version","nodes":{"total","online"},
+  "vms":{"total","running"},"cpus","memory_gib"}}`이다.
+
+설정(노드마다, 생략하면 아래 기본값 — 리더인 노드의 값을 쓴다):
+
+```toml
+[remotes]
+interval = "30s"   # 원격마다 상태를 모으는 간격
+tick = "5s"        # 모을 때가 된 원격을 찾는 간격
+```
+
+- **한계.**
+  - 원격 토큰은 Raft에 평문으로 있다(구독 키·LDAP 서비스 계정 비밀번호·OIDC 클라이언트 비밀과 같음 — Raft 데이터는 노드의
+    root만 읽는다). 위트니스 노드와 데이터 디렉터리 백업에도 그대로 있다. 이 클러스터의 노드 하나(위트니스 포함)나 그
+    백업을 가진 사람은 원격 클러스터를 그 토큰의 역할로 다룰 수 있으므로, 원격에는 필요한 만큼의 역할(보통 operator)
+    사용자의 토큰을 등록한다.
+  - watch(실시간 갱신)와 VM 콘솔은 중계하지 않는다. 원격 VM은 10초마다 다시 읽어 보이고, 콘솔은 원격 클러스터에 직접 연다.
+  - 원격 URL은 노드 하나의 주소다. 그 노드가 꺼지면 원격의 다른 노드가 살아 있어도 `reachable: false`이므로 주소를 바꾼다
+    (`remote set --url` — 토큰도 다시).
+  - 원격 클러스터의 CA가 바뀌면(클러스터를 새로 만듦) `remote set --ca-fingerprint <새 지문> --token-file`로 고칠 때까지
+    닿지 않는다(노드는 저장한 CA만 믿는다).
+  - `checked_at`은 상태가 바뀐 시각이라 "마지막 확인"을 알 수 없다(`reachable`·`error`만 믿는다). 원격 Task(시작·정지의
+    결과)는 지켜보지 않는다. 원격 쪽 감사 기록은 토큰 주인으로 남아 이 클러스터의 누가 요청했는지는 이 클러스터의 감사
+    로그에만 있다.
+  - 웹의 고치기는 `If-Match` 없이 보낸다(상태 수집이 revision을 올리므로) — 두 admin이 동시에 고치면 나중 것이 남는다.
+  - 중계는 원격의 **401**을 모두 **502** `remote_unauthorized`로 바꾸므로, 토큰 거절이 아닌 401(중계한 `auth/login`에 틀린
+    비밀번호 따위)도 그렇게 보인다. `auth/login`은 허용 목록 밖이라 이 클러스터의 admin만 닿으므로 받아들인 한계다.
 
 ## 이미지 업로드와 머신 종류
 
