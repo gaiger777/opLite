@@ -20847,3 +20847,30 @@ git commit -m "docs: SSO(OIDC) — README 새 절 \"SSO(OIDC)\"(LDAP과 같은 �
 - 로그아웃은 opLite 세션만 끝낸다. IdP에서 사용자를 지워도 이미 있는 세션(최대 12시간)과 API 토큰은 남는다.
 - issuer나 (Entra ID에서) 앱 등록을 바꾸면 모든 `sub`가 바뀌어 기존 사용자가 `sso_failed`가 된다 — 사용자를 지우고 다시 들어온다.
 - 그 밖의 제한은 설계 문서 §4.5·§9와 README "SSO(OIDC)" 절에 있다.
+
+## 실행 후 기록 (2026-11-08)
+
+- **Task 1~6:** `feat/plan36-oidc`에서 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았다(생성 파일 제외; Task 2의 이진 시험 키도 base64로 같은 바이트).
+- **실행 중에 고친 것 (Task 2):** 이 Mac의 저장소 경로에서는 새 시험 CA로 하는 첫 TLS 연결이 15초쯤 걸려, 가짜 IdP 영역의 기본 시간 제한(10초)으로는 OIDC 시험 8개가 시간 초과였다(스크래치 복제본에서는 그렇지 않았다 — 계획 33과 같은 현상). 가짜 IdP의 `timeout_secs`를 30초로 하고 계획 문서를 고쳤다(이 브랜치의 문서 커밋).
+- **1차 리뷰에서 고친 것:**
+  - 외부 사용자를 IdP의 `sub`에 묶는다(`UserSpec.subject`). 이름 클레임이 다른 사람에게 다시 주어져도 계정을 넘겨받지 못한다.
+  - 이메일 모양 이름(`alice@corp.com@okta`, 영역은 마지막 `@`에서 나눔).
+  - 리디렉트 URI를 서명한 상태에 넣어 콜백은 Host를 보지 않는다. 콜백은 시도 제한을 쓰지 않는다(NAT 뒤 정상 실패가 모두의 로그인을 막지 않게).
+  - `invalid_grant`·userinfo 401은 `sso_failed`, RFC 9207 `iss`, 응답 크기를 읽으며 제한, discovery 실패 15초 기억·한 번만 받기, `crit`·`nbf`, 가장 높은 revision 캐시.
+  - `oplctl login --token-file`, `realm test` 출력, 웹 안내 문구.
+- **2차 리뷰에서 고친 것:** OIDC 이름에서 `%` 뺌(URL에서 다른 이름으로 풀려 `oplctl user delete`가 다른 사용자를 지울 수 있었다), oplctl 경로 조각 퍼센트 인코딩, 로그아웃은 oplctl이 만든 토큰만 서버에서 지움, OIDC 영역에 비밀번호 로그인은 늘 400.
+- **CI 프로브에서 고친 것:** 경로 인코딩이 VM 동작의 `stop?mode=force`까지 인코딩해 `vm stop --force`가 404였다(CI의 실제 KVM 백업 시험이 잡음). 동작 부분은 인코딩하지 않는다.
+- **불안정한 시험(부하 때, 다시 돌리면 통과):** opl-api `snapshot_tasks.rs` left_tag_removal_stops_with_the_runner(Task 1), `telemetry_reporter.rs` a_failure_is_recorded_and_retried(Task 3) — 다른 cargo가 같이 돌 때.
+
+**테스트:**
+- macOS `cargo test --workspace` 1413개(Task 4 이후)
+- 웹 시험 524개와 `typecheck`·`lint`·`build`
+- `fmt`·`clippy -D warnings`(모든 기능)
+
+Linux CI(프로브)에서 같은 시험과 linux-kvm·ldap 작업이 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 계획 37(원격 클러스터)·38(원격 복제)이 남았다.
+- 실제 IdP(Keycloak·Okta·Entra ID) 설정 메모는 각 제품 문서로 확인해야 한다.
+- IdP 로그아웃 연동, SAML은 넣지 않았다.
