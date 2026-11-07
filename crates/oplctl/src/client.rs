@@ -50,6 +50,20 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+/// 이름·키를 API 경로의 한 조각으로 넣을 때 쓴다. RFC 3986 unreserved(영문·숫자·`-._~`) 밖은 UTF-8
+/// 바이트마다 `%XX`로 바꾼다(OIDC 사용자 이름의 `+`·`@` 등이 서버에서 같은 이름으로 풀리게).
+pub fn seg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct Client {
     pub base: String,
@@ -188,7 +202,7 @@ impl Client {
         let deadline = Instant::now() + wait;
         loop {
             let poll = self
-                .request(Method::GET, &format!("/tasks/{id}"))
+                .request(Method::GET, &format!("/tasks/{}", seg(id)))
                 .timeout(TASK_POLL_TIMEOUT);
             let task = self.send(poll).await?;
             match task["status"]["state"].as_str() {
@@ -280,6 +294,19 @@ pub async fn local(socket: &Path, path: &str, body: &Value) -> anyhow::Result<Va
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 경로 조각은 RFC 3986 unreserved(영문·숫자·`-._~`) 밖을 모두 퍼센트 인코딩한다(UTF-8 바이트마다).
+    #[test]
+    fn path_segments_are_percent_encoded() {
+        assert_eq!(seg("web-1.a_b~"), "web-1.a_b~");
+        assert_eq!(
+            seg("alice+ops@corp.com@okta"),
+            "alice%2Bops%40corp.com%40okta"
+        );
+        assert_eq!(seg("a b/c?d#e%f"), "a%20b%2Fc%3Fd%23e%25f");
+        assert_eq!(seg("é"), "%C3%A9");
+        assert_eq!(seg(""), "");
+    }
 
     fn cert_pem(name: &str) -> String {
         rcgen::generate_simple_self_signed(vec![name.to_string()])

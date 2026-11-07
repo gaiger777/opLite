@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::client::{
     ApiError, BACKUP_WAIT, Client, IMPORT_WAIT, MIGRATE_WAIT, UPGRADE_WAIT, fetch_ca, fingerprint,
-    local,
+    local, seg,
 };
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
@@ -41,7 +41,7 @@ enum Output {
 enum Cmd {
     /// 로그인해 API 토큰을 만들고 저장한다.
     Login(LoginArgs),
-    /// 저장한 API 토큰을 지운다(서버에서도).
+    /// 저장한 API 토큰을 지운다(login이 만든 토큰 `oplctl-…`이면 서버에서도).
     Logout,
     /// 클러스터 만들기, 노드 합류와 탈퇴, 상태
     Cluster {
@@ -101,7 +101,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
-    /// 인증 영역(admin만): 바깥 LDAP 디렉터리로 로그인하게 한다.
+    /// 인증 영역(admin만): 바깥 LDAP 디렉터리나 OIDC IdP로 로그인하게 한다.
     Realm {
         #[command(subcommand)]
         cmd: RealmCmd,
@@ -127,14 +127,18 @@ enum Cmd {
 
 #[derive(Args)]
 struct LoginArgs {
-    #[arg(long, default_value = "admin")]
+    #[arg(long, default_value = "admin", conflicts_with = "token_file")]
     user: String,
     /// 인증 영역. `local`이 아니면 그 영역의 사용자 이름(`@영역` 없이)으로 로그인한다.
-    #[arg(long, default_value = "local")]
+    #[arg(long, default_value = "local", conflicts_with = "token_file")]
     realm: String,
     /// 비밀번호가 든 파일. 없으면 터미널에서 묻는다.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "token_file")]
     password_file: Option<PathBuf>,
+    /// 웹 UI에서 만든 API 토큰이 든 파일(`-`면 표준 입력). 비밀번호 대신 이 토큰을 확인해 저장한다
+    /// (SSO(OIDC) 사용자).
+    #[arg(long)]
+    token_file: Option<PathBuf>,
     /// HTTPS 서버의 클러스터 CA 지문(`sha256:...`). 처음 로그인할 때 필요하다.
     /// `oplctl cluster init`의 출력이나 다른 노드의 `oplctl cluster status`에서 확인한다.
     #[arg(long)]
@@ -219,7 +223,7 @@ async fn node_upgrade(
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     let task = client
-        .post(&format!("/nodes/{node}/upgrade"), &json!({}))
+        .post(&format!("/nodes/{}/upgrade", seg(node)), &json!({}))
         .await?;
     if wait {
         client.wait_task_for(&task, UPGRADE_WAIT).await?;
@@ -248,11 +252,11 @@ async fn node_updates(
 ) -> anyhow::Result<()> {
     if refresh {
         let task = client
-            .post(&format!("/nodes/{node}/updates/refresh"), &json!({}))
+            .post(&format!("/nodes/{}/updates/refresh", seg(node)), &json!({}))
             .await?;
         client.wait_task(&task).await?;
     }
-    let found = client.get(&format!("/nodes/{node}")).await?;
+    let found = client.get(&format!("/nodes/{}", seg(node))).await?;
     let updates = &found["status"]["updates"];
     if json_out {
         return Ok(print_json(out, updates)?);
@@ -699,7 +703,7 @@ async fn patch_rules(
     group: &str,
     edit: impl FnOnce(&Value) -> anyhow::Result<Vec<Value>>,
 ) -> anyhow::Result<()> {
-    let path = format!("/security-groups/{group}");
+    let path = format!("/security-groups/{}", seg(group));
     let current = client.get(&path).await?;
     let rules = edit(&current)?;
     let r = client
@@ -1931,7 +1935,7 @@ enum TokenCmd {
 #[derive(Subcommand)]
 enum RealmCmd {
     List,
-    /// 영역 설정을 보인다(서비스 계정 비밀번호는 있는지만).
+    /// 영역 설정을 보인다(서비스 계정 비밀번호·클라이언트 비밀은 있는지만).
     Show {
         name: String,
     },
@@ -1939,18 +1943,23 @@ enum RealmCmd {
     AddLdap(RealmAdd),
     /// LDAP 영역을 바꾼다. 준 것만 바꾼다.
     SetLdap(RealmSet),
+    /// OIDC 영역을 만든다. IdP에는 `<노드 주소>/api/v1/auth/oidc/callback`을 리디렉트 URI로 등록한다.
+    AddOidc(RealmAddOidc),
+    /// OIDC 영역을 바꾼다. 준 것만 바꾼다.
+    SetOidc(RealmSetOidc),
     /// 영역을 지운다. 그 영역 사용자들의 세션과 토큰은 멈춘다.
     Remove {
         name: String,
     },
-    /// 사용자 이름과 비밀번호로 디렉터리를 시험한다(사용자를 만들지 않는다).
+    /// 영역을 시험한다(사용자를 만들지 않는다). LDAP은 사용자 이름과 비밀번호로 디렉터리를,
+    /// OIDC는 입력 없이 IdP의 discovery 문서와 키를 확인한다.
     Test {
         name: String,
-        /// 영역 안의 사용자 이름(`@영역` 없이)
+        /// 영역 안의 사용자 이름(`@영역` 없이). LDAP 영역에는 꼭 필요하고, OIDC 영역이면 무시한다(경고).
         #[arg(long)]
-        user: String,
+        user: Option<String>,
         /// 비밀번호가 든 파일(`-`면 표준 입력). 없으면 터미널에서 묻는다.
-        #[arg(long)]
+        #[arg(long, requires = "user")]
         password_file: Option<PathBuf>,
     },
 }
@@ -1992,6 +2001,74 @@ struct RealmSet {
     /// 그룹 → 역할 표를 비운다.
     #[arg(long, conflicts_with = "groups")]
     clear_groups: bool,
+}
+
+#[derive(Args)]
+struct RealmAddOidc {
+    name: String,
+    /// IdP의 issuer(`https://...`). discovery 문서의 `issuer`와 글자 그대로 같아야 한다.
+    #[arg(long)]
+    issuer: String,
+    /// IdP에 등록한 클라이언트 ID
+    #[arg(long)]
+    client_id: String,
+    #[command(flatten)]
+    oidc: OidcArgs,
+}
+
+#[derive(Args)]
+struct RealmSetOidc {
+    name: String,
+    #[arg(long)]
+    issuer: Option<String>,
+    #[arg(long)]
+    client_id: Option<String>,
+    #[command(flatten)]
+    oidc: OidcArgs,
+    /// 저장된 클라이언트 비밀을 지운다(공개 클라이언트).
+    #[arg(long, conflicts_with = "client_secret_file")]
+    clear_client_secret: bool,
+    /// CA를 지운다(시스템 루트).
+    #[arg(long, conflicts_with = "ca_file")]
+    clear_ca: bool,
+    /// 기본 역할을 지운다(맞는 그룹이 없으면 로그인 거절).
+    #[arg(long, conflicts_with = "default_role")]
+    clear_default_role: bool,
+    /// 그룹 → 역할 표를 비운다.
+    #[arg(long, conflicts_with = "groups")]
+    clear_groups: bool,
+}
+
+/// `realm add-oidc`와 `set-oidc`의 공통 선택
+#[derive(Args)]
+struct OidcArgs {
+    /// 클라이언트 비밀이 든 파일(`-`면 표준 입력). 없으면 공개 클라이언트(PKCE만)
+    #[arg(long)]
+    client_secret_file: Option<PathBuf>,
+    /// 요청할 scope(여러 번, `openid`가 있어야 함). set-oidc에서 주면 목록 전체를 바꾼다.
+    #[arg(long = "scope", value_name = "SCOPE")]
+    scopes: Vec<String>,
+    /// 사용자 이름을 담은 클레임(기본 preferred_username)
+    #[arg(long)]
+    username_claim: Option<String>,
+    /// 그룹(문자열 배열)을 담은 클레임(기본 groups)
+    #[arg(long)]
+    groups_claim: Option<String>,
+    /// IdP 인증서를 확인할 CA(PEM) 파일. 없으면 시스템 루트
+    #[arg(long)]
+    ca_file: Option<PathBuf>,
+    /// IdP 요청마다의 시간 제한(초)
+    #[arg(long)]
+    timeout: Option<u64>,
+    /// 로그인 화면에 보일 이름
+    #[arg(long)]
+    display: Option<String>,
+    /// 그룹 클레임 값을 가진 사용자의 역할(`<그룹>=<role>`, 여러 번). set-oidc에서 주면 표 전체를 바꾼다.
+    #[arg(long = "group", value_name = "GROUP=ROLE", value_parser = parse_group_role)]
+    groups: Vec<(String, Role)>,
+    /// 맞는 그룹이 없을 때의 역할. 없으면 그런 사용자의 로그인을 거절한다.
+    #[arg(long, value_enum)]
+    default_role: Option<Role>,
 }
 
 /// `realm add-ldap`과 `set-ldap`의 공통 선택
@@ -2101,21 +2178,179 @@ fn realm_add_body(args: &RealmAdd, files: LdapFiles) -> Value {
             backend[key] = value;
         }
     }
-    let mut roles = json!({ "groups": group_roles(&l.groups) });
-    if let Some(role) = l.default_role {
-        roles["default"] = json!(value_name(role));
-    }
-    let mut body = json!({ "name": args.name, "backend": backend, "roles": roles });
+    let mut body = json!({
+        "name": args.name,
+        "backend": backend,
+        "roles": new_roles(&l.groups, l.default_role)
+    });
     if let Some(display) = &l.display {
         body["display"] = json!(display);
     }
     body
 }
 
+/// 만들 영역의 그룹 → 역할 표와 기본 역할
+fn new_roles(groups: &[(String, Role)], default: Option<Role>) -> Value {
+    let mut roles = json!({ "groups": group_roles(groups) });
+    if let Some(role) = default {
+        roles["default"] = json!(value_name(role));
+    }
+    roles
+}
+
+/// 바꿀 영역의 역할: 지금 표(`current`)에 준 것만 바꾼다.
+fn changed_roles(
+    current: &Value,
+    groups: &[(String, Role)],
+    default: Option<Role>,
+    clear_groups: bool,
+    clear_default_role: bool,
+) -> Value {
+    let mut roles = current.clone();
+    if !groups.is_empty() {
+        roles["groups"] = group_roles(groups);
+    }
+    if clear_groups {
+        roles["groups"] = json!([]);
+    }
+    if let Some(role) = default {
+        roles["default"] = json!(value_name(role));
+    }
+    if clear_default_role && let Some(r) = roles.as_object_mut() {
+        r.remove("default");
+    }
+    roles
+}
+
+/// `set-ldap`·`set-oidc`가 바꿀 영역의 종류가 맞는지
+fn ensure_kind(current: &Value, name: &str, kind: &str) -> anyhow::Result<()> {
+    if current["backend"]["kind"] != kind {
+        anyhow::bail!(
+            "realm {name} is not an {} realm (its kind is {})",
+            kind.to_uppercase(),
+            cell(&current["backend"]["kind"])
+        );
+    }
+    Ok(())
+}
+
+/// 파일에서 읽은 OIDC 영역 값들(클라이언트 비밀, CA)
+#[derive(Default)]
+struct OidcFiles {
+    client_secret: Option<String>,
+    ca_pem: Option<String>,
+}
+
+impl OidcFiles {
+    fn read(args: &OidcArgs) -> anyhow::Result<Self> {
+        Ok(Self {
+            client_secret: args
+                .client_secret_file
+                .as_ref()
+                .map(read_secret_file)
+                .transpose()?,
+            ca_pem: args
+                .ca_file
+                .as_ref()
+                .map(|f| {
+                    std::fs::read_to_string(f)
+                        .with_context(|| format!("cannot read {}", f.display()))
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// `realm add-oidc`·`set-oidc`가 준 선택 값들(이름과 값)
+fn oidc_options(o: &OidcArgs, files: OidcFiles) -> [(&'static str, Option<Value>); 6] {
+    [
+        ("client_secret", files.client_secret.map(Value::from)),
+        (
+            "scopes",
+            (!o.scopes.is_empty()).then(|| Value::from(o.scopes.clone())),
+        ),
+        ("username_claim", o.username_claim.clone().map(Value::from)),
+        ("groups_claim", o.groups_claim.clone().map(Value::from)),
+        ("ca_pem", files.ca_pem.map(Value::from)),
+        ("timeout_secs", o.timeout.map(Value::from)),
+    ]
+}
+
+/// `realm add-oidc`의 `POST /realms` 본문. 주지 않은 선택은 서버 기본값이다.
+fn realm_add_oidc_body(args: &RealmAddOidc, files: OidcFiles) -> Value {
+    let o = &args.oidc;
+    let mut backend = json!({ "kind": "oidc", "issuer": args.issuer, "client_id": args.client_id });
+    for (key, value) in oidc_options(o, files) {
+        if let Some(value) = value {
+            backend[key] = value;
+        }
+    }
+    let mut body = json!({
+        "name": args.name,
+        "backend": backend,
+        "roles": new_roles(&o.groups, o.default_role)
+    });
+    if let Some(display) = &o.display {
+        body["display"] = json!(display);
+    }
+    body
+}
+
+/// `realm set-oidc`의 `PUT /realms/{name}` 본문: 지금 영역(`RealmView`)에 준 것만 바꾼다.
+/// 클라이언트 비밀은 주지 않으면 빼서(서버가 저장된 값을 둔다 — issuer·client_id·CA를 바꾸면
+/// 서버가 400으로 다시 달라고 한다) 보내고, 지울 때는 빈 글이다.
+fn realm_set_oidc_body(
+    current: &Value,
+    args: &RealmSetOidc,
+    files: OidcFiles,
+) -> anyhow::Result<Value> {
+    ensure_kind(current, &args.name, "oidc")?;
+    let o = &args.oidc;
+    let mut backend = current["backend"].clone();
+    if let Some(b) = backend.as_object_mut() {
+        b.remove("has_client_secret");
+    }
+    let mut changes = vec![
+        ("issuer", args.issuer.clone().map(Value::from)),
+        ("client_id", args.client_id.clone().map(Value::from)),
+    ];
+    changes.extend(oidc_options(o, files));
+    if args.clear_client_secret {
+        changes.push(("client_secret", Some(json!(""))));
+    }
+    for (key, value) in changes {
+        if let Some(value) = value {
+            backend[key] = value;
+        }
+    }
+    if args.clear_ca
+        && let Some(b) = backend.as_object_mut()
+    {
+        b.remove("ca_pem");
+    }
+    let roles = changed_roles(
+        &current["roles"],
+        &o.groups,
+        o.default_role,
+        args.clear_groups,
+        args.clear_default_role,
+    );
+    let mut body = json!({ "backend": backend, "roles": roles });
+    if let Some(display) = o
+        .display
+        .clone()
+        .or_else(|| current["display"].as_str().map(str::to_string))
+    {
+        body["display"] = json!(display);
+    }
+    Ok(body)
+}
+
 /// `realm set-ldap`의 `PUT /realms/{name}` 본문: 지금 영역(`RealmView`)에 준 것만 바꾼다.
 /// 서비스 계정 비밀번호는 주지 않으면 빼서(서버가 저장된 값을 둔다 — url·bind_dn·CA를 바꾸면
 /// 서버가 400으로 다시 달라고 한다) 보내고, 지울 때는 빈 글이다.
 fn realm_set_body(current: &Value, args: &RealmSet, files: LdapFiles) -> anyhow::Result<Value> {
+    ensure_kind(current, &args.name, "ldap")?;
     let l = &args.ldap;
     let mut backend = current["backend"].clone();
     if let Some(b) = backend.as_object_mut() {
@@ -2157,21 +2392,13 @@ fn realm_set_body(current: &Value, args: &RealmSet, files: LdapFiles) -> anyhow:
             );
         }
     }
-    let mut roles = current["roles"].clone();
-    if !l.groups.is_empty() {
-        roles["groups"] = group_roles(&l.groups);
-    }
-    if args.clear_groups {
-        roles["groups"] = json!([]);
-    }
-    if let Some(role) = l.default_role {
-        roles["default"] = json!(value_name(role));
-    }
-    if args.clear_default_role
-        && let Some(r) = roles.as_object_mut()
-    {
-        r.remove("default");
-    }
+    let roles = changed_roles(
+        &current["roles"],
+        &l.groups,
+        l.default_role,
+        args.clear_groups,
+        args.clear_default_role,
+    );
     let mut body = json!({ "backend": backend, "roles": roles });
     if let Some(display) = l
         .display
@@ -2183,30 +2410,52 @@ fn realm_set_body(current: &Value, args: &RealmSet, files: LdapFiles) -> anyhow:
     Ok(body)
 }
 
+/// OIDC 영역의 콜백 경로. IdP에는 노드 주소 뒤에 붙여 리디렉트 URI로 등록한다.
+const OIDC_CALLBACK_PATH: &str = "/api/v1/auth/oidc/callback";
+
 /// `realm show`의 `키: 값` 줄
 fn realm_lines(realm: &Value) -> Vec<String> {
     let b = &realm["backend"];
     let set = |v: bool| if v { "set" } else { "none" };
+    let ca = if b["ca_pem"].is_string() {
+        "custom (PEM)"
+    } else {
+        "system roots"
+    };
     let mut lines = vec![
         format!("name: {}", cell(&realm["name"])),
         format!("display: {}", cell(&realm["display"])),
         format!("kind: {}", cell(&b["kind"])),
-        format!("url: {}", cell(&b["url"])),
-        format!("base dn: {}", cell(&b["base_dn"])),
-        format!("bind dn: {}", cell(&b["bind_dn"])),
-        format!("bind password: {}", set(b["has_bind_password"] == true)),
-        format!("user filter: {}", cell(&b["user_filter"])),
-        format!("group attribute: {}", cell(&b["group_attr"])),
-        format!(
-            "ca: {}",
-            if b["ca_pem"].is_string() {
-                "custom (PEM)"
-            } else {
-                "system roots"
-            }
-        ),
-        format!("timeout: {}s", cell(&b["timeout_secs"])),
     ];
+    if b["kind"] == "oidc" {
+        let scopes: Vec<String> = b["scopes"]
+            .as_array()
+            .map(|a| a.iter().map(cell).collect())
+            .unwrap_or_default();
+        lines.extend([
+            format!("issuer: {}", cell(&b["issuer"])),
+            format!("client id: {}", cell(&b["client_id"])),
+            format!("client secret: {}", set(b["has_client_secret"] == true)),
+            format!("scopes: {}", scopes.join(" ")),
+            format!("username claim: {}", cell(&b["username_claim"])),
+            format!("groups claim: {}", cell(&b["groups_claim"])),
+            format!("ca: {ca}"),
+            format!("timeout: {}s", cell(&b["timeout_secs"])),
+            // IdP에는 노드 주소 뒤에 이 경로를 붙여 리디렉트 URI로 등록한다.
+            format!("callback path: {OIDC_CALLBACK_PATH}"),
+        ]);
+    } else {
+        lines.extend([
+            format!("url: {}", cell(&b["url"])),
+            format!("base dn: {}", cell(&b["base_dn"])),
+            format!("bind dn: {}", cell(&b["bind_dn"])),
+            format!("bind password: {}", set(b["has_bind_password"] == true)),
+            format!("user filter: {}", cell(&b["user_filter"])),
+            format!("group attribute: {}", cell(&b["group_attr"])),
+            format!("ca: {ca}"),
+            format!("timeout: {}s", cell(&b["timeout_secs"])),
+        ]);
+    }
     let groups = realm["roles"]["groups"]
         .as_array()
         .cloned()
@@ -2245,13 +2494,18 @@ async fn realm(
                         cell(&r["name"]),
                         cell(&r["display"]),
                         cell(&r["backend"]["kind"]),
-                        cell(&r["backend"]["url"]),
+                        // OIDC 영역은 issuer
+                        cell(if r["backend"]["kind"] == "oidc" {
+                            &r["backend"]["issuer"]
+                        } else {
+                            &r["backend"]["url"]
+                        }),
                     ]
                 },
             )?;
         }
         RealmCmd::Show { name } => {
-            let realm = client.get(&format!("/realms/{name}")).await?;
+            let realm = client.get(&format!("/realms/{}", seg(&name))).await?;
             if json_out {
                 print_json(out, &realm)?;
             } else {
@@ -2269,7 +2523,7 @@ async fn realm(
         }
         RealmCmd::SetLdap(args) => {
             let files = LdapFiles::read(&args.ldap)?;
-            let path = format!("/realms/{}", args.name);
+            let path = format!("/realms/{}", seg(&args.name));
             let current = client.get(&path).await?;
             // 읽은 뒤 다른 곳에서 바뀌었으면 412로 멈춘다.
             let r = client
@@ -2279,8 +2533,27 @@ async fn realm(
             client.send(r).await?;
             writeln!(out, "realm {} updated", args.name)?;
         }
+        RealmCmd::AddOidc(args) => {
+            let files = OidcFiles::read(&args.oidc)?;
+            client
+                .post("/realms", &realm_add_oidc_body(&args, files))
+                .await?;
+            writeln!(out, "realm {} created", args.name)?;
+        }
+        RealmCmd::SetOidc(args) => {
+            let files = OidcFiles::read(&args.oidc)?;
+            let path = format!("/realms/{}", seg(&args.name));
+            let current = client.get(&path).await?;
+            // 읽은 뒤 다른 곳에서 바뀌었으면 412로 멈춘다.
+            let r = client
+                .request(Method::PUT, &path)
+                .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
+                .json(&realm_set_oidc_body(&current, &args, files)?);
+            client.send(r).await?;
+            writeln!(out, "realm {} updated", args.name)?;
+        }
         RealmCmd::Remove { name } => {
-            client.delete(&format!("/realms/{name}")).await?;
+            client.delete(&format!("/realms/{}", seg(&name))).await?;
             writeln!(out, "realm {name} removed")?;
         }
         RealmCmd::Test {
@@ -2288,15 +2561,24 @@ async fn realm(
             user,
             password_file,
         } => {
-            let password = match &password_file {
-                Some(f) => read_secret_file(f)?,
-                None => read_password(None, "Password: ")?,
+            // OIDC 영역은 입력 없이 시험한다(LDAP 영역이면 서버가 사용자를 달라고 한다).
+            let realm = client.get(&format!("/realms/{}", seg(&name))).await?;
+            let kind = realm["backend"]["kind"].as_str().unwrap_or_default();
+            if kind == "oidc" && user.is_some() {
+                eprintln!("warning: --user is ignored for an OIDC realm");
+            }
+            let body = match &user {
+                Some(user) if kind != "oidc" => {
+                    let password = match &password_file {
+                        Some(f) => read_secret_file(f)?,
+                        None => read_password(None, "Password: ")?,
+                    };
+                    json!({ "username": user, "password": password })
+                }
+                _ => json!({}),
             };
             let result = client
-                .post(
-                    &format!("/realms/{name}/actions/test"),
-                    &json!({ "username": user, "password": password }),
-                )
+                .post(&format!("/realms/{}/actions/test", seg(&name)), &body)
                 .await?;
             let steps = result["steps"].as_array().cloned().unwrap_or_default();
             if json_out {
@@ -2310,6 +2592,9 @@ async fn realm(
                     })
                     .collect();
                 table(out, &["STEP", "RESULT", "MESSAGE"], &rows)?;
+            }
+            // 사용자 결과(DN·그룹·역할)는 LDAP 시험에만 있다.
+            if !json_out && kind == "ldap" {
                 writeln!(out, "dn: {}", cell(&result["dn"]))?;
                 let groups: Vec<String> = result["groups"]
                     .as_array()
@@ -2381,7 +2666,7 @@ async fn volume_format(
     match format {
         Some(f) => Ok(f),
         None => {
-            let read = client.get(&format!("/storage-pools/{pool}")).await;
+            let read = client.get(&format!("/storage-pools/{}", seg(pool))).await;
             let pool = read.with_context(|| {
                 format!(
                     "cannot read storage pool {pool:?} to choose a volume format; pass --format"
@@ -2424,19 +2709,25 @@ where
             same_server.then(|| config.ca_pem.clone()).flatten(),
         )
         .await?;
-        let (token, name) = login(&server, args, ca_pem.clone()).await?;
+        let (token, name) = match &args.token_file {
+            Some(file) => token_login(&server, file, ca_pem.clone()).await?,
+            None => login(&server, args, ca_pem.clone()).await?,
+        };
         let previous = config.token.take().zip(config.server.take());
         config.server = Some(server.clone());
         config.token = Some(token.clone());
         config.ca_pem = ca_pem.clone();
         config.save(&config_path)?;
         // 새 토큰을 저장한 뒤, 같은 서버에 다시 로그인했으면 이전 토큰은 서버에서도 지운다(실패해도 무시).
+        // 새 토큰과 같으면 두고, 이 CLI의 login이 만든 토큰(`oplctl-…`)만 지운다(`--token-file`로 넣은
+        // 토큰은 사용자가 웹 UI에서 만든 것이다).
         if let Some((old, old_server)) = previous
+            && old != token
             && old_server.trim_end_matches('/') == server.trim_end_matches('/')
             && let Some(id) = token_id(&old)
         {
-            let client = Client::new(&server, Some(token), ca_pem)?;
-            let _ = client.delete(&format!("/tokens/{id}")).await;
+            let client = Client::new(&server, Some(old), ca_pem)?;
+            remove_login_token(&client, id).await;
         }
         writeln!(out, "logged in to {server} as {name}")?;
         return Ok(());
@@ -2455,13 +2746,20 @@ where
         Cmd::Login(_) => unreachable!(),
         Cmd::Cluster { cmd } => cluster(&client, cmd, json_out, out).await?,
         Cmd::Logout => {
-            if let Some(id) = config.token.as_deref().and_then(token_id) {
-                // 이미 지워진 토큰이어도 로컬에서는 지운다.
-                let _ = client.delete(&format!("/tokens/{id}")).await;
-            }
+            // login이 만든 토큰(`oplctl-…`)만 서버에서 지운다. 이미 지워진 토큰이어도 로컬에서는 지운다.
+            let kept = match config.token.as_deref().and_then(token_id) {
+                Some(id) => remove_login_token(&client, id).await == Some(false),
+                None => false,
+            };
             config.token = None;
             config.save(&config_path)?;
             writeln!(out, "logged out")?;
+            if kept {
+                writeln!(
+                    out,
+                    "the token stays valid on the server; delete it in the web UI"
+                )?;
+            }
         }
         Cmd::Node { cmd } => match cmd {
             NodeCmd::List => {
@@ -2469,7 +2767,7 @@ where
                 print_list(out, json_out, &list, NODE_HEADERS, node_row)?;
             }
             NodeCmd::Get { node } => {
-                print_json(out, &client.get(&format!("/nodes/{node}")).await?)?
+                print_json(out, &client.get(&format!("/nodes/{}", seg(&node))).await?)?
             }
             NodeCmd::Updates { node, refresh } => {
                 node_updates(&client, &node, refresh, json_out, out).await?
@@ -2487,7 +2785,9 @@ where
                 print_list(out, json_out, &list, POOL_HEADERS, |p| pool_row(p, &nodes))?;
             }
             PoolCmd::Get { pool } => {
-                let pool = client.get(&format!("/storage-pools/{pool}")).await?;
+                let pool = client
+                    .get(&format!("/storage-pools/{}", seg(&pool)))
+                    .await?;
                 if json_out {
                     print_json(out, &pool)?;
                 } else {
@@ -2506,14 +2806,16 @@ where
             PoolCmd::Set(set) => {
                 client
                     .patch(
-                        &format!("/storage-pools/{}", set.pool),
+                        &format!("/storage-pools/{}", seg(&set.pool)),
                         &pool_set_body(&set),
                     )
                     .await?;
                 writeln!(out, "storage pool {}: {}", set.pool, pool_set_summary(&set))?;
             }
             PoolCmd::Delete { pool } => {
-                client.delete(&format!("/storage-pools/{pool}")).await?;
+                client
+                    .delete(&format!("/storage-pools/{}", seg(&pool)))
+                    .await?;
                 writeln!(out, "storage pool {pool} deleted")?;
             }
         },
@@ -2522,15 +2824,18 @@ where
                 let list = client.get("/networks").await?;
                 print_list(out, json_out, &list, NETWORK_HEADERS, network_row)?;
             }
-            NetworkCmd::Get { network } => {
-                print_json(out, &client.get(&format!("/networks/{network}")).await?)?
-            }
+            NetworkCmd::Get { network } => print_json(
+                out,
+                &client.get(&format!("/networks/{}", seg(&network))).await?,
+            )?,
             NetworkCmd::Create(c) => {
                 client.post("/networks", &network_create_body(&c)).await?;
                 writeln!(out, "network {} created", c.name)?;
             }
             NetworkCmd::Delete { network } => {
-                client.delete(&format!("/networks/{network}")).await?;
+                client
+                    .delete(&format!("/networks/{}", seg(&network)))
+                    .await?;
                 writeln!(out, "network {network} deleted")?;
             }
         },
@@ -2554,9 +2859,10 @@ where
                     },
                 )?;
             }
-            VolumeCmd::Get { volume } => {
-                print_json(out, &client.get(&format!("/volumes/{volume}")).await?)?
-            }
+            VolumeCmd::Get { volume } => print_json(
+                out,
+                &client.get(&format!("/volumes/{}", seg(&volume))).await?,
+            )?,
             VolumeCmd::Create {
                 name,
                 pool,
@@ -2609,13 +2915,13 @@ where
             VolumeCmd::Resize { volume, size } => {
                 let body = json!({ "size_bytes": size });
                 let task = client
-                    .post(&format!("/volumes/{volume}/resize"), &body)
+                    .post(&format!("/volumes/{}/resize", seg(&volume)), &body)
                     .await?;
                 client.wait_task(&task).await?;
                 writeln!(out, "volume {volume} resized to {}", bytes(&size.into()))?;
             }
             VolumeCmd::Delete { volume } => {
-                let task = client.delete(&format!("/volumes/{volume}")).await?;
+                let task = client.delete(&format!("/volumes/{}", seg(&volume))).await?;
                 client.wait_task(&task).await?;
                 writeln!(out, "volume {volume} deleted")?;
             }
@@ -2636,7 +2942,7 @@ where
                 )?;
             }
             TaskCmd::Get { task } => {
-                print_json(out, &client.get(&format!("/tasks/{task}")).await?)?
+                print_json(out, &client.get(&format!("/tasks/{}", seg(&task))).await?)?
             }
         },
         Cmd::User { cmd } => match cmd {
@@ -2672,11 +2978,11 @@ where
                 };
                 let password = read_password(password_file.as_ref(), "New password: ")?;
                 let body = json!({ "password": password, "current_password": current });
-                client.put(&format!("/users/{name}"), &body).await?;
+                client.put(&format!("/users/{}", seg(&name)), &body).await?;
                 writeln!(out, "password of {name} changed")?;
             }
             UserCmd::Delete { name } => {
-                client.delete(&format!("/users/{name}")).await?;
+                client.delete(&format!("/users/{}", seg(&name))).await?;
                 writeln!(out, "user {name} deleted")?;
             }
         },
@@ -2692,7 +2998,7 @@ where
                 writeln!(out, "{}", cell(&created["secret"]))?;
             }
             TokenCmd::Delete { token } => {
-                client.delete(&format!("/tokens/{token}")).await?;
+                client.delete(&format!("/tokens/{}", seg(&token))).await?;
                 writeln!(out, "token {token} deleted")?;
             }
         },
@@ -2724,7 +3030,9 @@ async fn security_group(
         }
         SecurityGroupCmd::Get { group } => print_json(
             out,
-            &client.get(&format!("/security-groups/{group}")).await?,
+            &client
+                .get(&format!("/security-groups/{}", seg(&group)))
+                .await?,
         )?,
         SecurityGroupCmd::Create {
             name,
@@ -2736,7 +3044,9 @@ async fn security_group(
             writeln!(out, "security group {name} created")?;
         }
         SecurityGroupCmd::Delete { group } => {
-            client.delete(&format!("/security-groups/{group}")).await?;
+            client
+                .delete(&format!("/security-groups/{}", seg(&group)))
+                .await?;
             writeln!(out, "security group {group} deleted")?;
         }
         SecurityGroupCmd::Rule {
@@ -2764,14 +3074,16 @@ async fn backup(
     match cmd {
         BackupCmd::Create { vm, pool, name } => {
             let body = json!({ "pool": pool, "name": name });
-            let task = client.post(&format!("/vms/{vm}/backups"), &body).await?;
+            let task = client
+                .post(&format!("/vms/{}/backups", seg(&vm)), &body)
+                .await?;
             client.wait_task_for(&task, BACKUP_WAIT).await?;
             // 이름을 주지 않았으면 서버가 정한 이름을 읽는다.
             let name = match name {
                 Some(name) => name,
                 None => {
                     let id = cell(&task["spec"]["op"]["backup"]);
-                    cell(&client.get(&format!("/backups/{id}")).await?["name"])
+                    cell(&client.get(&format!("/backups/{}", seg(&id))).await?["name"])
                 }
             };
             writeln!(out, "backup {name} of vm {vm} created")?;
@@ -2784,9 +3096,10 @@ async fn backup(
             let list = client.send(r).await?;
             print_list(out, json_out, &list, BACKUP_HEADERS, backup_row)?;
         }
-        BackupCmd::Get { backup } => {
-            print_json(out, &client.get(&format!("/backups/{backup}")).await?)?
-        }
+        BackupCmd::Get { backup } => print_json(
+            out,
+            &client.get(&format!("/backups/{}", seg(&backup))).await?,
+        )?,
         BackupCmd::Delete { backup, force } => backup_delete(client, &backup, force, out).await?,
         BackupCmd::Restore {
             backup,
@@ -2796,7 +3109,7 @@ async fn backup(
         } => {
             let body = json!({ "name": name, "pool": pool, "node": node });
             let task = client
-                .post(&format!("/backups/{backup}/restore"), &body)
+                .post(&format!("/backups/{}/restore", seg(&backup)), &body)
                 .await?;
             client.wait_task_for(&task, BACKUP_WAIT).await?;
             writeln!(out, "vm {name} restored from backup {backup}")?;
@@ -2812,7 +3125,7 @@ async fn backup_delete(
     force: bool,
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
-    let mut r = client.request(Method::DELETE, &format!("/backups/{backup}"));
+    let mut r = client.request(Method::DELETE, &format!("/backups/{}", seg(backup)));
     if force {
         r = r.query(&[("force", "true")]);
     }
@@ -2879,12 +3192,13 @@ async fn backup_job(
             let list = client.get("/backup-jobs").await?;
             print_list(out, json_out, &list, BACKUP_JOB_HEADERS, backup_job_row)?;
         }
-        BackupJobCmd::Get { job } => {
-            print_json(out, &client.get(&format!("/backup-jobs/{job}")).await?)?
-        }
+        BackupJobCmd::Get { job } => print_json(
+            out,
+            &client.get(&format!("/backup-jobs/{}", seg(&job))).await?,
+        )?,
         BackupJobCmd::Set(args) => {
             // If-Match 없이 보낸다: 스케줄러가 status를 자주 써서 revision이 곧잘 바뀐다.
-            let path = format!("/backup-jobs/{}", args.job);
+            let path = format!("/backup-jobs/{}", seg(&args.job));
             let current = client.get(&path).await?;
             client
                 .patch(&path, &backup_job_set_body(&args, &current))
@@ -2892,12 +3206,14 @@ async fn backup_job(
             writeln!(out, "backup job {} updated", args.job)?;
         }
         BackupJobCmd::Delete { job } => {
-            client.delete(&format!("/backup-jobs/{job}")).await?;
+            client
+                .delete(&format!("/backup-jobs/{}", seg(&job)))
+                .await?;
             writeln!(out, "backup job {job} deleted; its backups are kept")?;
         }
         BackupJobCmd::Run { job } => {
             client
-                .send(client.request(Method::POST, &format!("/backup-jobs/{job}/run")))
+                .send(client.request(Method::POST, &format!("/backup-jobs/{}/run", seg(&job))))
                 .await?;
             writeln!(
                 out,
@@ -3043,7 +3359,7 @@ async fn import(
             })?;
         }
         ImportCmd::Get { import } => {
-            let import = client.get(&format!("/vm-imports/{import}")).await?;
+            let import = client.get(&format!("/vm-imports/{}", seg(&import))).await?;
             if json_out {
                 print_json(out, &import)?;
             } else {
@@ -3059,19 +3375,23 @@ async fn import(
         ImportCmd::Run(args) => {
             // `=` 없는 --net이 있을 때만 원본 네트워크를 읽는다.
             let sources = if args.nets.iter().any(|n| n.source.is_none()) {
-                source_networks(&client.get(&format!("/vm-imports/{}", args.import)).await?)
+                source_networks(
+                    &client
+                        .get(&format!("/vm-imports/{}", seg(&args.import)))
+                        .await?,
+                )
             } else {
                 Vec::new()
             };
             let body = import_run_body(&args, &sources)?;
             let task = client
-                .post(&format!("/vm-imports/{}/run", args.import), &body)
+                .post(&format!("/vm-imports/{}/run", seg(&args.import)), &body)
                 .await?;
             client.wait_task_for(&task, IMPORT_WAIT).await?;
             writeln!(out, "vm {} imported", args.name)?;
         }
         ImportCmd::Delete { import, force } => {
-            let mut r = client.request(Method::DELETE, &format!("/vm-imports/{import}"));
+            let mut r = client.request(Method::DELETE, &format!("/vm-imports/{}", seg(&import)));
             if force {
                 r = r.query(&[("force", "true")]);
             }
@@ -3403,7 +3723,7 @@ async fn cluster(
             if !force {
                 bail!("removing a node cannot be undone; pass --force to confirm");
             }
-            client.delete(&format!("/nodes/{node}")).await?;
+            client.delete(&format!("/nodes/{}", seg(&node))).await?;
             writeln!(out, "node {node} removed from the cluster")?;
         }
     }
@@ -3427,10 +3747,10 @@ async fn vm(
                 vm_row,
             )?;
         }
-        VmCmd::Get { vm } => print_json(out, &client.get(&format!("/vms/{vm}")).await?)?,
+        VmCmd::Get { vm } => print_json(out, &client.get(&format!("/vms/{}", seg(&vm))).await?)?,
         VmCmd::Create(args) => {
             let node = match &args.node {
-                Some(key) => Some(client.get(&format!("/nodes/{key}")).await?),
+                Some(key) => Some(client.get(&format!("/nodes/{}", seg(key))).await?),
                 None => None,
             };
             let machine = match args.machine {
@@ -3505,7 +3825,10 @@ async fn vm(
         VmCmd::Reboot { vm } => act(client, &vm, "reboot", out).await?,
         VmCmd::Migrate { vm, node } => {
             let task = client
-                .post(&format!("/vms/{vm}/migrate"), &json!({ "node": node }))
+                .post(
+                    &format!("/vms/{}/migrate", seg(&vm)),
+                    &json!({ "node": node }),
+                )
                 .await?;
             // 마이그레이션은 일반 Task 제한(10분)보다 오래 걸릴 수 있다.
             client.wait_task_for(&task, MIGRATE_WAIT).await?;
@@ -3515,27 +3838,27 @@ async fn vm(
             if with_snapshots {
                 // 내부 스냅샷은 서로 독립이라 차례는 상관없다. VM을 지울 수 없는데 스냅샷만
                 // 지우지 않도록 먼저 모두 확인한다.
-                let current = client.get(&format!("/vms/{vm}")).await?;
-                let list = client.get(&format!("/vms/{vm}/snapshots")).await?;
+                let current = client.get(&format!("/vms/{}", seg(&vm))).await?;
+                let list = client.get(&format!("/vms/{}/snapshots", seg(&vm))).await?;
                 let mut items = list["items"].as_array().cloned().unwrap_or_default();
                 check_deletable(&vm, &current, &items)?;
                 // 지우는 사이 예약 스냅샷이 새로 생기지 않게 예약을 먼저 끄고 다시 확인한다.
                 if schedule_is_on(&current) {
                     put_schedule(client, &vm, None).await?;
                     writeln!(out, "snapshot schedule of vm {vm} turned off")?;
-                    let current = client.get(&format!("/vms/{vm}")).await?;
-                    let list = client.get(&format!("/vms/{vm}/snapshots")).await?;
+                    let current = client.get(&format!("/vms/{}", seg(&vm))).await?;
+                    let list = client.get(&format!("/vms/{}/snapshots", seg(&vm))).await?;
                     items = list["items"].as_array().cloned().unwrap_or_default();
                     check_deletable(&vm, &current, &items)?;
                 }
                 for s in items {
                     let name = cell(&s["spec"]["name"]);
-                    let path = format!("/vms/{vm}/snapshots/{}", cell(&s["id"]));
+                    let path = format!("/vms/{}/snapshots/{}", seg(&vm), seg(&cell(&s["id"])));
                     client.wait_task(&client.delete(&path).await?).await?;
                     writeln!(out, "snapshot {name} of vm {vm} deleted")?;
                 }
             }
-            client.delete(&format!("/vms/{vm}")).await?;
+            client.delete(&format!("/vms/{}", seg(&vm))).await?;
             writeln!(out, "vm {vm} deleted")?;
         }
         VmCmd::Clone {
@@ -3545,14 +3868,16 @@ async fn vm(
             pool,
         } => {
             let body = json!({ "name": name, "snapshot": snapshot, "pool": pool });
-            let task = client.post(&format!("/vms/{vm}/clone"), &body).await?;
+            let task = client
+                .post(&format!("/vms/{}/clone", seg(&vm)), &body)
+                .await?;
             client.wait_task(&task).await?;
             writeln!(out, "vm {name} cloned from {vm}")?;
         }
         VmCmd::Snapshot { cmd } => snapshot(client, cmd, json_out, out).await?,
         VmCmd::Console { vm, port } => {
             // 콘솔을 열 수 있는지 먼저 확인한다(없는 VM, 권한).
-            client.get(&format!("/vms/{vm}")).await?;
+            client.get(&format!("/vms/{}", seg(&vm))).await?;
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
                 .await
                 .with_context(|| format!("cannot listen on 127.0.0.1:{port}"))?;
@@ -3664,29 +3989,32 @@ async fn snapshot(
                 "description": description.unwrap_or_default(),
                 "memory": no_memory.then_some(false),
             });
-            let task = client.post(&format!("/vms/{vm}/snapshots"), &body).await?;
+            let task = client
+                .post(&format!("/vms/{}/snapshots", seg(&vm)), &body)
+                .await?;
             client.wait_task(&task).await?;
             writeln!(out, "snapshot {name} of vm {vm} created")?;
         }
         SnapshotCmd::List { vm } => {
-            let list = client.get(&format!("/vms/{vm}/snapshots")).await?;
+            let list = client.get(&format!("/vms/{}/snapshots", seg(&vm))).await?;
             if json_out {
                 return print_list(out, true, &list, &[], |_| vec![]);
             }
-            let current = client.get(&format!("/vms/{vm}")).await?["status"]["snapshot"].clone();
+            let current =
+                client.get(&format!("/vms/{}", seg(&vm))).await?["status"]["snapshot"].clone();
             let items = list["items"].as_array().cloned().unwrap_or_default();
             let rows = snapshot_rows(&items, current.as_str());
             table(out, SNAPSHOT_HEADERS, &rows)?;
         }
         SnapshotCmd::Revert { vm, name } => {
-            let path = format!("/vms/{vm}/snapshots/{name}/revert");
+            let path = format!("/vms/{}/snapshots/{}/revert", seg(&vm), seg(&name));
             let task = client.send(client.request(Method::POST, &path)).await?;
             client.wait_task(&task).await?;
             writeln!(out, "vm {vm}: reverted to snapshot {name}")?;
         }
         SnapshotCmd::Delete { vm, name } => {
             let task = client
-                .delete(&format!("/vms/{vm}/snapshots/{name}"))
+                .delete(&format!("/vms/{}/snapshots/{}", seg(&vm), seg(&name)))
                 .await?;
             client.wait_task(&task).await?;
             writeln!(out, "snapshot {name} of vm {vm} deleted")?;
@@ -3703,7 +4031,7 @@ async fn schedule(
     json_out: bool,
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
-    let path = format!("/vms/{}", args.vm);
+    let path = format!("/vms/{}", seg(&args.vm));
     let schedule = schedule_value(&args);
     if schedule.is_none() && !args.off {
         let current = client.get(&path).await?;
@@ -3756,7 +4084,7 @@ async fn put_spec(
     vm: &str,
     body: impl Fn(&Value) -> anyhow::Result<Value>,
 ) -> anyhow::Result<()> {
-    let path = format!("/vms/{vm}");
+    let path = format!("/vms/{}", seg(vm));
     let mut retries = SpecRetries::default();
     loop {
         let current = client.get(&path).await?;
@@ -3920,7 +4248,11 @@ async fn act(
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     let task = client
-        .send(client.request(Method::POST, &format!("/vms/{vm}/actions/{action}")))
+        .send(client.request(
+            Method::POST,
+            // 동작은 이 파일이 정한 값이고 `stop?mode=force`처럼 쿼리를 담으므로 인코딩하지 않는다.
+            &format!("/vms/{}/actions/{action}", seg(vm)),
+        ))
         .await?;
     client.wait_task(&task).await?;
     let verb = action.split('?').next().unwrap_or(action);
@@ -4276,6 +4608,78 @@ async fn server_ca(
     }
 }
 
+/// 이 CLI의 login이 만든 토큰(이름 `oplctl-…`)이면 지운다. 토큰 자신으로 읽고 지운다(실패는 무시).
+/// 지웠으면 `Some(true)`, 다른 토큰(웹 UI에서 만든 것)이라 두었으면 `Some(false)`, 목록을 읽지 못했거나
+/// 목록에 없으면(이미 지워짐) `None`.
+async fn remove_login_token(client: &Client, id: uuid::Uuid) -> Option<bool> {
+    let tokens = client.get("/tokens").await.ok()?;
+    let token = tokens["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|t| t["id"].as_str() == Some(id.to_string().as_str()))?;
+    let made_by_login = token["name"]
+        .as_str()
+        .is_some_and(|n| n.starts_with(LOGIN_TOKEN_PREFIX));
+    if made_by_login {
+        let _ = client.delete(&format!("/tokens/{id}")).await;
+    }
+    Some(made_by_login)
+}
+
+/// 웹 UI에서 만든 API 토큰으로 로그인한다: 그 토큰으로 `GET /auth/whoami`를 불러 확인하고 사용자 이름을
+/// 얻는다. 토큰과 사용자 이름을 돌려준다.
+async fn token_login(
+    server: &str,
+    file: &PathBuf,
+    ca_pem: Option<String>,
+) -> anyhow::Result<(String, String)> {
+    let token = read_secret_file(file)?.trim().to_string();
+    if token.is_empty() {
+        bail!("the token file is empty");
+    }
+    let client = Client::new(server, Some(token.clone()), ca_pem)?;
+    let me = client
+        .get("/auth/whoami")
+        .await
+        .context("the API token was not accepted")?;
+    let name = me["name"]
+        .as_str()
+        .context("server did not return the user")?
+        .to_string();
+    Ok((token, name))
+}
+
+/// OIDC 영역은 브라우저로만 로그인하므로 비밀번호를 묻기 전에 거절한다. 로그인 화면의
+/// 영역 목록(`GET /auth/realms`)을 읽지 못하면 그냥 지나간다(서버가 로그인에서 판단한다).
+async fn oidc_login_refused(anon: &Client, server: &str, realm: &str) -> anyhow::Result<()> {
+    let resp = anon
+        .http
+        .get(anon.url("/auth/realms"))
+        .send()
+        .await
+        .with_context(|| format!("cannot reach {server}"))?;
+    let list: Value = if resp.status().is_success() {
+        resp.json().await.unwrap_or_default()
+    } else {
+        Value::Null
+    };
+    let oidc = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|r| r["name"] == realm && r["kind"] == "oidc");
+    if oidc {
+        bail!(
+            "sign in to {realm} in the web UI, create an API token there and run `oplctl login --token-file`"
+        );
+    }
+    Ok(())
+}
+
+/// `login`이 만드는 API 토큰 이름의 앞부분
+const LOGIN_TOKEN_PREFIX: &str = "oplctl-";
+
 /// 세션으로 로그인해 이 CLI가 쓸 API 토큰을 만든다. 세션은 바로 닫는다. 토큰과 서버가 정한
 /// 사용자 이름(영역 사용자는 `<사용자>@<영역>`)을 돌려준다.
 async fn login(
@@ -4283,8 +4687,11 @@ async fn login(
     args: &LoginArgs,
     ca_pem: Option<String>,
 ) -> anyhow::Result<(String, String)> {
-    let password = read_password(args.password_file.as_ref(), "Password: ")?;
     let anon = Client::new(server, None, ca_pem)?;
+    if args.realm != opl_types::realm::LOCAL_REALM {
+        oidc_login_refused(&anon, server, &args.realm).await?;
+    }
+    let password = read_password(args.password_file.as_ref(), "Password: ")?;
     let mut body = json!({ "username": args.user, "password": password });
     if args.realm != opl_types::realm::LOCAL_REALM {
         body["realm"] = json!(args.realm);
@@ -4309,7 +4716,10 @@ async fn login(
         .to_string();
     let user: Value = resp.json().await.unwrap_or_default();
     let user = user["name"].as_str().unwrap_or(&args.user).to_string();
-    let name = format!("oplctl-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let name = format!(
+        "{LOGIN_TOKEN_PREFIX}{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
     let with_cookie = |r: reqwest::RequestBuilder| r.header(reqwest::header::COOKIE, &cookie);
     let created = anon
         .send(with_cookie(anon.request(Method::POST, "/tokens")).json(&json!({ "name": name })))
@@ -7657,7 +8067,8 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 "--group",
                 "cn=x=admin",
             ][..],
-            &["test", "corp"][..],
+            // 비밀번호 파일은 사용자와 함께
+            &["test", "corp", "--password-file", "f"][..],
         ] {
             assert!(realm_cmd(args).is_err(), "{args:?}");
         }
@@ -7665,7 +8076,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         else {
             panic!("test")
         };
-        assert_eq!(user, "alice");
+        assert_eq!(user.as_deref(), Some("alice"));
     }
 
     /// `add-ldap`의 본문은 준 것만 담는다(나머지는 서버 기본값).
@@ -8029,7 +8440,9 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 "GET /api/v1/realms/corp HTTP/1.1",
                 "PUT /api/v1/realms/corp HTTP/1.1",
                 "DELETE /api/v1/realms/corp HTTP/1.1",
+                "GET /api/v1/realms/corp HTTP/1.1",
                 "POST /api/v1/realms/corp/actions/test HTTP/1.1",
+                "GET /api/v1/realms/broken HTTP/1.1",
                 "POST /api/v1/realms/broken/actions/test HTTP/1.1",
             ]
         );
@@ -8042,7 +8455,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         assert_eq!(seen[3].body["backend"]["bind_password"], "svc-pw");
         assert!(seen[3].body["backend"].get("has_bind_password").is_none());
         assert_eq!(
-            seen[5].body,
+            seen[6].body,
             json!({ "username": "alice", "password": "svc-pw" })
         );
         assert_eq!(
@@ -8096,6 +8509,670 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             assert_eq!(sent.body["password"], "alice-pw");
             assert_eq!(sent.body.get("realm").and_then(Value::as_str), expected);
         }
+    }
+
+    /// `realm add-oidc`는 issuer·client ID가 필요하고, 지우기와 설정은 함께 줄 수 없다.
+    /// `test`는 사용자 없이도 된다(OIDC).
+    #[test]
+    fn parses_oidc_realm_commands() {
+        let RealmCmd::AddOidc(add) = realm_cmd(&[
+            "add-oidc",
+            "okta",
+            "--issuer",
+            "https://idp.example.com",
+            "--client-id",
+            "oplite",
+            "--scope",
+            "openid",
+            "--scope",
+            "groups",
+            "--group",
+            "opl-admins=admin",
+        ])
+        .unwrap() else {
+            panic!("add-oidc")
+        };
+        assert_eq!(add.oidc.scopes, ["openid", "groups"]);
+        assert_eq!(add.oidc.groups[0].0, "opl-admins");
+        assert!(matches!(add.oidc.groups[0].1, Role::Admin));
+
+        for args in [
+            &["add-oidc", "okta", "--issuer", "https://idp"][..],
+            &["add-oidc", "okta", "--client-id", "oplite"][..],
+            &[
+                "set-oidc",
+                "okta",
+                "--clear-client-secret",
+                "--client-secret-file",
+                "f",
+            ][..],
+            &["set-oidc", "okta", "--clear-ca", "--ca-file", "f"][..],
+            &[
+                "set-oidc",
+                "okta",
+                "--clear-default-role",
+                "--default-role",
+                "viewer",
+            ][..],
+            &["set-oidc", "okta", "--clear-groups", "--group", "g=admin"][..],
+        ] {
+            assert!(realm_cmd(args).is_err(), "{args:?}");
+        }
+        let RealmCmd::Test { user, .. } = realm_cmd(&["test", "okta"]).unwrap() else {
+            panic!("test")
+        };
+        assert_eq!(user, None);
+    }
+
+    /// `add-oidc`의 본문은 준 것만 담는다(나머지는 서버 기본값).
+    #[test]
+    fn realm_add_oidc_body_sends_only_what_is_given() {
+        let RealmCmd::AddOidc(add) = realm_cmd(&[
+            "add-oidc",
+            "okta",
+            "--issuer",
+            "https://idp.example.com",
+            "--client-id",
+            "oplite",
+        ])
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            realm_add_oidc_body(&add, OidcFiles::default()),
+            json!({
+                "name": "okta",
+                "backend": { "kind": "oidc", "issuer": "https://idp.example.com", "client_id": "oplite" },
+                "roles": { "groups": [] }
+            })
+        );
+
+        let RealmCmd::AddOidc(add) = realm_cmd(&[
+            "add-oidc",
+            "okta",
+            "--issuer",
+            "https://idp.example.com/oauth2/default",
+            "--client-id",
+            "oplite",
+            "--scope",
+            "openid",
+            "--scope",
+            "groups",
+            "--username-claim",
+            "email",
+            "--groups-claim",
+            "roles",
+            "--timeout",
+            "5",
+            "--display",
+            "Okta",
+            "--group",
+            "opl-ops=operator",
+            "--default-role",
+            "viewer",
+        ])
+        .unwrap() else {
+            unreachable!()
+        };
+        let files = OidcFiles {
+            client_secret: Some("s3cret".into()),
+            ca_pem: Some("PEM".into()),
+        };
+        assert_eq!(
+            realm_add_oidc_body(&add, files),
+            json!({
+                "name": "okta",
+                "display": "Okta",
+                "backend": {
+                    "kind": "oidc", "issuer": "https://idp.example.com/oauth2/default",
+                    "client_id": "oplite", "client_secret": "s3cret", "scopes": ["openid", "groups"],
+                    "username_claim": "email", "groups_claim": "roles", "ca_pem": "PEM",
+                    "timeout_secs": 5
+                },
+                "roles": {
+                    "groups": [{ "group": "opl-ops", "role": "operator" }],
+                    "default": "viewer"
+                }
+            })
+        );
+    }
+
+    fn sample_oidc_realm() -> Value {
+        json!({
+            "id": "019a0000-0000-7000-8000-000000000002", "name": "okta", "revision": 9,
+            "display": "Okta",
+            "backend": {
+                "kind": "oidc", "issuer": "https://idp.example.com", "client_id": "oplite",
+                "scopes": ["openid", "profile", "email"], "username_claim": "preferred_username",
+                "groups_claim": "groups", "timeout_secs": 10, "has_client_secret": true
+            },
+            "roles": {
+                "groups": [{ "group": "opl-admins", "role": "admin" }],
+                "default": "viewer"
+            }
+        })
+    }
+
+    /// `set-oidc`는 지금 영역에 준 것만 바꾼다. 비밀은 주지 않으면 빼고(서버가 둔다),
+    /// `--clear-client-secret`면 빈 글이다. 다른 종류의 영역은 바꾸지 않는다.
+    #[test]
+    fn realm_set_oidc_body_changes_only_what_is_given() {
+        let RealmCmd::SetOidc(set) = realm_cmd(&["set-oidc", "okta", "--timeout", "3"]).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            realm_set_oidc_body(&sample_oidc_realm(), &set, OidcFiles::default()).unwrap(),
+            json!({
+                "display": "Okta",
+                "backend": {
+                    "kind": "oidc", "issuer": "https://idp.example.com", "client_id": "oplite",
+                    "scopes": ["openid", "profile", "email"], "username_claim": "preferred_username",
+                    "groups_claim": "groups", "timeout_secs": 3
+                },
+                "roles": {
+                    "groups": [{ "group": "opl-admins", "role": "admin" }],
+                    "default": "viewer"
+                }
+            })
+        );
+
+        let RealmCmd::SetOidc(set) = realm_cmd(&[
+            "set-oidc",
+            "okta",
+            "--issuer",
+            "https://other.example.com",
+            "--client-id",
+            "opl2",
+            "--scope",
+            "openid",
+            "--username-claim",
+            "email",
+            "--groups-claim",
+            "roles",
+            "--clear-client-secret",
+            "--clear-ca",
+            "--clear-groups",
+            "--clear-default-role",
+            "--display",
+            "Other",
+        ])
+        .unwrap() else {
+            unreachable!()
+        };
+        let mut with_ca = sample_oidc_realm();
+        with_ca["backend"]["ca_pem"] = json!("PEM");
+        assert_eq!(
+            realm_set_oidc_body(&with_ca, &set, OidcFiles::default()).unwrap(),
+            json!({
+                "display": "Other",
+                "backend": {
+                    "kind": "oidc", "issuer": "https://other.example.com", "client_id": "opl2",
+                    "client_secret": "", "scopes": ["openid"], "username_claim": "email",
+                    "groups_claim": "roles", "timeout_secs": 10
+                },
+                "roles": { "groups": [] }
+            })
+        );
+
+        // 새 비밀·CA와 그룹 표
+        let RealmCmd::SetOidc(set) = realm_cmd(&[
+            "set-oidc",
+            "okta",
+            "--group",
+            "opl-ops=operator",
+            "--default-role",
+            "admin",
+        ])
+        .unwrap() else {
+            unreachable!()
+        };
+        let files = OidcFiles {
+            client_secret: Some("new-secret".into()),
+            ca_pem: Some("PEM".into()),
+        };
+        let body = realm_set_oidc_body(&sample_oidc_realm(), &set, files).unwrap();
+        assert_eq!(body["backend"]["client_secret"], "new-secret");
+        assert_eq!(body["backend"]["ca_pem"], "PEM");
+        assert_eq!(
+            body["roles"],
+            json!({
+                "groups": [{ "group": "opl-ops", "role": "operator" }],
+                "default": "admin"
+            })
+        );
+
+        // 종류가 다른 영역
+        let e = realm_set_oidc_body(&sample_realm(), &set, OidcFiles::default()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "realm okta is not an OIDC realm (its kind is ldap)"
+        );
+        let RealmCmd::SetLdap(set) = realm_cmd(&["set-ldap", "corp"]).unwrap() else {
+            unreachable!()
+        };
+        let e = realm_set_body(&sample_oidc_realm(), &set, LdapFiles::default()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "realm corp is not an LDAP realm (its kind is oidc)"
+        );
+    }
+
+    #[test]
+    fn realm_show_lines_for_oidc() {
+        assert_eq!(
+            realm_lines(&sample_oidc_realm()).join("\n"),
+            "name: okta\n\
+             display: Okta\n\
+             kind: oidc\n\
+             issuer: https://idp.example.com\n\
+             client id: oplite\n\
+             client secret: set\n\
+             scopes: openid profile email\n\
+             username claim: preferred_username\n\
+             groups claim: groups\n\
+             ca: system roots\n\
+             timeout: 10s\n\
+             callback path: /api/v1/auth/oidc/callback\n\
+             groups:\n  opl-admins = admin\n\
+             default role: viewer"
+        );
+        let mut public = sample_oidc_realm();
+        public["backend"]["has_client_secret"] = json!(false);
+        public["backend"]["ca_pem"] = json!("PEM");
+        let lines = realm_lines(&public);
+        for line in ["client secret: none", "ca: custom (PEM)"] {
+            assert!(lines.contains(&line.to_string()), "{line}: {lines:?}");
+        }
+    }
+
+    /// OIDC 영역 명령이 부르는 API: 목록의 URL 칸은 issuer, 파일의 비밀·CA는 본문에,
+    /// `set-oidc`는 읽은 revision을 If-Match로, `test`는 영역 종류를 읽고 입력 없이 단계 표만 보인다
+    /// (`--user`를 줘도 비밀번호를 묻지 않고 DN·그룹·역할 줄이 없다).
+    #[tokio::test]
+    async fn realm_oidc_commands_call_the_api() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/realms" => json!({ "revision": 7, "items": [sample_oidc_realm()] }),
+            "/api/v1/realms/okta/actions/test" => json!({
+                "steps": [
+                    { "name": "discovery", "ok": true, "message": "read https://idp.example.com/.well-known/openid-configuration" },
+                    { "name": "jwks", "ok": true, "message": "2 signing keys (RS256 1, ES256 1)" }
+                ],
+                "dn": null, "groups": [], "role": null
+            }),
+            "/api/v1/realms/broken/actions/test" => json!({
+                "steps": [{ "name": "discovery", "ok": false, "message": "issuer differs" }],
+                "dn": null, "groups": [], "role": null
+            }),
+            _ => sample_oidc_realm(),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "s3cret\n").unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, "-----BEGIN CERTIFICATE-----\nX\n").unwrap();
+        let (secret, ca) = (secret.to_str().unwrap(), ca.to_str().unwrap());
+
+        let mut out = Vec::new();
+        for args in [
+            &["list"][..],
+            &[
+                "add-oidc",
+                "okta",
+                "--issuer",
+                "https://idp.example.com",
+                "--client-id",
+                "oplite",
+                "--client-secret-file",
+                secret,
+                "--ca-file",
+                ca,
+            ][..],
+            &["set-oidc", "okta", "--client-secret-file", secret][..],
+            &["test", "okta", "--user", "alice"][..],
+        ] {
+            realm(&client, realm_cmd(args).unwrap(), false, &mut out)
+                .await
+                .unwrap();
+        }
+        let e = realm(
+            &client,
+            realm_cmd(&["test", "broken"]).unwrap(),
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.to_string(), "realm broken: the discovery step failed");
+
+        let seen = seen.lock().unwrap();
+        let lines: Vec<&str> = seen.iter().map(|r| r.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "GET /api/v1/realms HTTP/1.1",
+                "POST /api/v1/realms HTTP/1.1",
+                "GET /api/v1/realms/okta HTTP/1.1",
+                "PUT /api/v1/realms/okta HTTP/1.1",
+                "GET /api/v1/realms/okta HTTP/1.1",
+                "POST /api/v1/realms/okta/actions/test HTTP/1.1",
+                "GET /api/v1/realms/broken HTTP/1.1",
+                "POST /api/v1/realms/broken/actions/test HTTP/1.1",
+            ]
+        );
+        assert_eq!(seen[1].body["backend"]["kind"], "oidc");
+        assert_eq!(seen[1].body["backend"]["client_secret"], "s3cret");
+        assert_eq!(
+            seen[1].body["backend"]["ca_pem"],
+            "-----BEGIN CERTIFICATE-----\nX\n"
+        );
+        assert_eq!(seen[3].if_match.as_deref(), Some("9"));
+        assert_eq!(seen[3].body["backend"]["client_secret"], "s3cret");
+        assert!(seen[3].body["backend"].get("has_client_secret").is_none());
+        assert_eq!(seen[5].body, json!({}));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NAME  DISPLAY  KIND  URL\n\
+             okta  Okta     oidc  https://idp.example.com\n\
+             realm okta created\n\
+             realm okta updated\n\
+             STEP       RESULT  MESSAGE\n\
+             discovery  ok      read https://idp.example.com/.well-known/openid-configuration\n\
+             jwks       ok      2 signing keys (RS256 1, ES256 1)\n"
+        );
+    }
+
+    /// `login --realm <OIDC 영역>`은 비밀번호를 묻기 전에 웹 UI로 보낸다.
+    #[tokio::test]
+    async fn login_refuses_an_oidc_realm() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/auth/realms" => json!([
+                { "name": "local", "display": null, "kind": "local" },
+                { "name": "corp", "display": null, "kind": "ldap" },
+                { "name": "okta", "display": "Okta", "kind": "oidc" }
+            ]),
+            _ => json!({}),
+        })
+        .await;
+        // 비밀번호 파일이 없으므로 묻는다면 터미널이 없어 다른 오류가 난다.
+        let Cmd::Login(args) = Cli::try_parse_from(["oplctl", "login", "--realm", "okta"])
+            .unwrap()
+            .cmd
+        else {
+            unreachable!()
+        };
+        let e = login(&base, &args, None).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "sign in to okta in the web UI, create an API token there and run `oplctl login --token-file`"
+        );
+        let seen = seen.lock().unwrap();
+        let lines: Vec<&str> = seen.iter().map(|r| r.line.as_str()).collect();
+        assert_eq!(lines, ["GET /api/v1/auth/realms HTTP/1.1"]);
+    }
+
+    /// `login --token-file`은 비밀번호 로그인 인자와 함께 줄 수 없다.
+    #[test]
+    fn token_file_login_conflicts_with_password_login() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["oplctl", "login", "--token-file", "t"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).map(|_| ())
+        };
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&["--ca-fingerprint", "sha256:ab"]).is_ok());
+        for extra in [
+            &["--user", "bob"][..],
+            &["--realm", "okta"][..],
+            &["--password-file", "pw"][..],
+        ] {
+            let e = parse(extra).unwrap_err();
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{extra:?}"
+            );
+        }
+    }
+
+    /// `login --token-file`: 토큰으로 whoami를 불러 확인하고 저장한다. 같은 토큰을 다시 넣으면 지우지 않고,
+    /// 이전 토큰은 login이 만든 것(`oplctl-…`)만 지운다. 받지 않는 토큰은 저장하지 않는다.
+    #[tokio::test]
+    async fn token_file_login_checks_and_saves_the_token() {
+        let ids = [
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+        ];
+        let tokens = ids.map(|id| format!("opl_{}_secret", id.simple()));
+        let listed = json!({ "revision": 1, "items": [
+            { "id": ids[0], "name": "laptop", "revision": 1, "user": ids[2] },
+            { "id": ids[1], "name": "oplctl-1a2b3c4d", "revision": 1, "user": ids[2] },
+        ]});
+        let (client, seen) = fake_api_status(move |path| match path {
+            "/api/v1/auth/whoami" => (
+                200,
+                json!({ "name": "alice@corp.com@okta", "role": "admin" }),
+            ),
+            "/api/v1/tokens" => (200, listed.clone()),
+            _ => (200, json!({})),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("oplctl.json");
+        let file = dir.path().join("token");
+        let login_with = async |token: &str| {
+            std::fs::write(&file, format!("{token}\n")).unwrap();
+            let mut out = Vec::new();
+            let args = [
+                "oplctl",
+                "--config",
+                config.to_str().unwrap(),
+                "--server",
+                client.base.as_str(),
+                "login",
+                "--token-file",
+                file.to_str().unwrap(),
+            ];
+            run(args, &mut out)
+                .await
+                .map(|()| String::from_utf8(out).unwrap())
+        };
+        let saved = || CliConfig::load(&config).unwrap().token;
+        let lines = || std::mem::take(&mut *seen.lock().unwrap());
+
+        // 웹 UI에서 만든 토큰(laptop)
+        assert_eq!(
+            login_with(&tokens[0]).await.unwrap(),
+            format!("logged in to {} as alice@corp.com@okta\n", client.base)
+        );
+        assert_eq!(saved().as_deref(), Some(tokens[0].as_str()));
+        assert_eq!(lines(), ["GET /api/v1/auth/whoami HTTP/1.1"]);
+        // 같은 토큰을 다시 넣어도 지우지 않는다.
+        login_with(&tokens[0]).await.unwrap();
+        assert_eq!(lines(), ["GET /api/v1/auth/whoami HTTP/1.1"]);
+        // 다른 토큰: 이전 토큰(laptop)은 login이 만든 것이 아니므로 두다.
+        login_with(&tokens[1]).await.unwrap();
+        assert_eq!(
+            lines(),
+            [
+                "GET /api/v1/auth/whoami HTTP/1.1",
+                "GET /api/v1/tokens HTTP/1.1"
+            ]
+        );
+        // 이전 토큰(oplctl-…)은 지운다.
+        login_with(&tokens[2]).await.unwrap();
+        assert_eq!(
+            lines(),
+            [
+                "GET /api/v1/auth/whoami HTTP/1.1".to_string(),
+                "GET /api/v1/tokens HTTP/1.1".to_string(),
+                format!("DELETE /api/v1/tokens/{} HTTP/1.1", ids[1]),
+            ]
+        );
+        assert_eq!(saved().as_deref(), Some(tokens[2].as_str()));
+    }
+
+    /// 서버가 받지 않는 토큰(401)은 저장하지 않는다.
+    #[tokio::test]
+    async fn token_file_login_does_not_save_a_refused_token() {
+        let (client, seen) = fake_api_status(|_| {
+            (
+                401,
+                json!({ "code": "unauthorized", "message": "invalid token" }),
+            )
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("oplctl.json");
+        let file = dir.path().join("token");
+        std::fs::write(&file, "opl_bad_token\n").unwrap();
+        let args = [
+            "oplctl",
+            "--config",
+            config.to_str().unwrap(),
+            "--server",
+            client.base.as_str(),
+            "login",
+            "--token-file",
+            file.to_str().unwrap(),
+        ];
+        let e = run(args, &mut Vec::new()).await.unwrap_err();
+        assert_eq!(e.to_string(), "the API token was not accepted");
+        assert!(!config.exists());
+        assert_eq!(*seen.lock().unwrap(), ["GET /api/v1/auth/whoami HTTP/1.1"]);
+    }
+
+    /// 시험 서버 쪽에서 경로 조각의 퍼센트 인코딩을 푼다.
+    fn percent_decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' {
+                out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    /// `vm stop --force`는 동작 뒤의 쿼리를 그대로 보낸다(VM 이름만 인코딩).
+    #[tokio::test]
+    async fn vm_stop_force_keeps_the_query() {
+        let (client, seen) =
+            fake_api(|_| json!({ "id": "t1", "status": { "state": "succeeded" } })).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("oplctl.json");
+        let mut out = Vec::new();
+        let args = [
+            "oplctl",
+            "--config",
+            config.to_str().unwrap(),
+            "--server",
+            client.base.as_str(),
+            "vm",
+            "stop",
+            "web 1",
+            "--force",
+        ];
+        run(args, &mut out).await.unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "vm web 1: stop done\n");
+        let lines = seen.lock().unwrap().clone();
+        assert_eq!(
+            lines[0],
+            "POST /api/v1/vms/web%201/actions/stop?mode=force HTTP/1.1"
+        );
+    }
+
+    /// 이름을 경로에 넣을 때 퍼센트 인코딩해, `+`·`@`가 든 OIDC 사용자 이름도 서버에서 같은 이름으로 풀린다.
+    #[tokio::test]
+    async fn user_delete_encodes_the_name_in_the_path() {
+        let (client, seen) = fake_api(|_| json!({})).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("oplctl.json");
+        let name = "alice+ops@corp.com@okta";
+        let mut out = Vec::new();
+        let args = [
+            "oplctl",
+            "--config",
+            config.to_str().unwrap(),
+            "--server",
+            client.base.as_str(),
+            "user",
+            "delete",
+            name,
+        ];
+        run(args, &mut out).await.unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("user {name} deleted\n")
+        );
+        let lines = seen.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            ["DELETE /api/v1/users/alice%2Bops%40corp.com%40okta HTTP/1.1"]
+        );
+        let path = lines[0].split(' ').nth(1).unwrap();
+        assert_eq!(
+            percent_decode(path.strip_prefix("/api/v1/users/").unwrap()),
+            name
+        );
+    }
+
+    /// `logout`은 login이 만든 토큰(`oplctl-…`)만 서버에서 지운다. 웹 UI에서 만든 토큰은 로컬 설정에서만
+    /// 지우고 서버에서는 그대로라고 알린다.
+    #[tokio::test]
+    async fn logout_deletes_only_tokens_made_by_login() {
+        let ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+        let tokens = ids.map(|id| format!("opl_{}_secret", id.simple()));
+        let listed = json!({ "revision": 1, "items": [
+            { "id": ids[0], "name": "laptop", "revision": 1, "user": ids[1] },
+            { "id": ids[1], "name": "oplctl-1a2b3c4d", "revision": 1, "user": ids[1] },
+        ]});
+        let (client, seen) = fake_api_status(move |path| match path {
+            "/api/v1/tokens" => (200, listed.clone()),
+            _ => (200, json!({})),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("oplctl.json");
+        let logout_with = async |token: &str| {
+            CliConfig {
+                server: Some(client.base.clone()),
+                token: Some(token.into()),
+                ca_pem: None,
+            }
+            .save(&config)
+            .unwrap();
+            let mut out = Vec::new();
+            let args = ["oplctl", "--config", config.to_str().unwrap(), "logout"];
+            run(args, &mut out).await.unwrap();
+            assert_eq!(CliConfig::load(&config).unwrap().token, None);
+            String::from_utf8(out).unwrap()
+        };
+        let lines = || std::mem::take(&mut *seen.lock().unwrap());
+
+        // 웹 UI에서 만든 토큰(laptop)은 서버에서 지우지 않는다.
+        assert_eq!(
+            logout_with(&tokens[0]).await,
+            "logged out\nthe token stays valid on the server; delete it in the web UI\n"
+        );
+        assert_eq!(lines(), ["GET /api/v1/tokens HTTP/1.1"]);
+        // login이 만든 토큰은 지운다.
+        assert_eq!(logout_with(&tokens[1]).await, "logged out\n");
+        assert_eq!(
+            lines(),
+            [
+                "GET /api/v1/tokens HTTP/1.1".to_string(),
+                format!("DELETE /api/v1/tokens/{} HTTP/1.1", ids[1]),
+            ]
+        );
     }
 
     #[test]

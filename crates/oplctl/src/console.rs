@@ -8,7 +8,7 @@ use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::client::Client;
+use crate::client::{Client, seg};
 
 /// 연결을 받을 때마다 WebSocket을 하나 연다. 호출자가 멈출 때까지 돈다.
 pub async fn serve(client: Client, vm: String, listener: TcpListener) -> anyhow::Result<()> {
@@ -31,7 +31,7 @@ async fn open(
 ) -> anyhow::Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>>
 {
     let url = client
-        .url(&format!("/vms/{vm}/console"))
+        .url(&format!("/vms/{}/console", seg(vm)))
         .replacen("http", "ws", 1);
     let mut req = url.into_client_request()?;
     if let Some(token) = &client.token {
