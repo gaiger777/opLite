@@ -2,7 +2,8 @@
 //! 유예보다 오래 간 노드의 `pending` Task와 제거된 노드의 끝나지 않은 Task를 실패로 끝내고, 만들
 //! Task 없이 남은 `pending` 스냅샷을 지운다. 실패로 끝낸 Task의 정리(볼륨·태그)는 하지 않는다.
 //! 예약 스냅샷의 만들기·예약 정리의 삭제를 끝냈으면 실행기처럼 `task_failed`로 VM에 남긴다.
-//! 끝난 Task는 기간·개수 기준으로 지운다(웹 정리 설계 §2).
+//! 끝난 Task는 기간·개수 기준으로 지운다(웹 정리 설계 §2). 오래 `receiving`인 백업(보내던 클러스터가
+//! 끝내지 못한 사본)은 지우기 Task를 만들어 파일과 함께 지운다(엔터프라이즈 설계 §6.1).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::backup::{Backup, BackupPhase, BackupSpec};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
@@ -17,6 +19,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::backups::start_backup_delete;
 use crate::schedule::{recorded_vm, set_schedule_error, task_failed};
 use crate::state::AppState;
 
@@ -36,6 +39,9 @@ pub struct ClusterJanitorConfig {
     /// 개수 기준으로는 끝난 것을 처음 본 뒤 이만큼 지난 Task만 지운다. 막 끝난 Task를 기다리는
     /// 쪽(oplctl `wait_task`, 웹 `waitForTask`)이 결과를 읽을 시간이다.
     pub finished_grace: Duration,
+    /// 만든 지, 그리고 마지막으로 파일을 받은 지(`received_at`) 이보다 오래 `receiving`인 백업을 지운다.
+    /// 만든 시각은 UUIDv7 id의 시각이다.
+    pub receiving_max_age: Duration,
 }
 
 /// 한 tick에 지우는 끝난 Task의 최대 수. 나머지는 다음 tick에 지운다.
@@ -50,6 +56,7 @@ impl Default for ClusterJanitorConfig {
             task_max_age: Duration::from_secs(7 * 24 * 3600),
             task_max_finished: 1000,
             finished_grace: Duration::from_secs(600),
+            receiving_max_age: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -233,6 +240,34 @@ fn expired_tasks(
         .collect()
 }
 
+/// 만든 지, 그리고 마지막으로 파일을 받은 지(`received_at`) `receiving_max_age`가 넘은 `receiving` 백업
+/// 가운데 지우는 Task가 없는 것
+fn stale_receiving<'a>(
+    now: SystemTime,
+    config: &ClusterJanitorConfig,
+    backups: &'a [Backup],
+    tasks: &[Task],
+) -> Vec<&'a Backup> {
+    backups
+        .iter()
+        .filter(|b| b.status.phase == BackupPhase::Receiving)
+        .filter(|b| {
+            let received = b.status.received_at.map_or(SystemTime::UNIX_EPOCH, |t| {
+                SystemTime::UNIX_EPOCH + Duration::from_secs(t)
+            });
+            let active = created(b.id).max(received);
+            now.duration_since(active).unwrap_or_default() > config.receiving_max_age
+        })
+        .filter(|b| {
+            !tasks.iter().any(|t| {
+                !t.status.state.is_finished()
+                    && t.spec.op == TaskOp::BackupDelete
+                    && t.spec.target == b.id
+            })
+        })
+        .collect()
+}
+
 /// UUIDv7 id에 담긴 만든 시각. 시각이 없는 id는 가장 오래된 것으로 본다.
 fn created(id: Uuid) -> SystemTime {
     id.get_timestamp().map_or(SystemTime::UNIX_EPOCH, |ts| {
@@ -257,9 +292,10 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
             cluster.list::<NodeSpec>()?.1,
             cluster.list::<TaskSpec>()?.1,
             cluster.list::<SnapshotSpec>()?.1,
+            cluster.list::<BackupSpec>()?.1,
         ))
     })();
-    let Ok((nodes, tasks, snapshots)) = lists else {
+    let Ok((nodes, tasks, snapshots, backups)) = lists else {
         return;
     };
     let ids: BTreeSet<Uuid> = members
@@ -301,6 +337,18 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
         }
         if let Action::FailTask { id, error, .. } = action {
             record_schedule(state, &tasks, &snapshots, id, error).await;
+        }
+    }
+    // 지우기 Task가 파일이 있는 노드에서 파일과 리소스를 지운다. 만들지 못하면(노드가 오프라인 등) 다음
+    // tick에 다시 한다.
+    for backup in stale_receiving(SystemTime::now(), config, &backups, &tasks) {
+        match start_backup_delete(state, backup).await {
+            Ok(task) => {
+                tracing::info!(backup = %backup.name, task = %task.id, "janitor: deleting a backup that stopped receiving")
+            }
+            Err(e) => {
+                tracing::info!(backup = %backup.name, error = %e.message, "janitor: cannot delete a backup that stopped receiving")
+            }
         }
     }
 }
@@ -395,6 +443,7 @@ mod tests {
         task_max_age: Duration::from_secs(7 * 24 * 3600),
         task_max_finished: 1000,
         finished_grace: FINISHED_GRACE,
+        receiving_max_age: Duration::from_secs(24 * 3600),
     };
 
     fn node(online: bool) -> Node {
@@ -899,5 +948,55 @@ mod tests {
         let other = fail(&t, "node x was removed".into());
         let err = apply(&cluster, &other).await.unwrap_err();
         assert!(!written_anyway(&cluster, &other, &err), "{err:?}");
+    }
+
+    /// `ago` 전에 만든 `phase` 백업
+    fn backup_made(now: SystemTime, ago: Duration, phase: BackupPhase) -> Backup {
+        let at = (now - ago).duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        let spec: BackupSpec = serde_json::from_value(serde_json::json!({
+            "vm": Uuid::now_v7(),
+            "vm_name": "web",
+            "pool": "dr",
+            "vm_spec": { "cpu": { "cores": 1 }, "memory_mib": 512, "machine": "virt" }
+        }))
+        .unwrap();
+        let mut b: Backup = Resource::new("b", spec);
+        b.id = Uuid::new_v7(uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            at.as_secs(),
+            at.subsec_nanos(),
+        ));
+        b.status.phase = phase;
+        b
+    }
+
+    #[test]
+    fn backups_receiving_for_too_long_are_deleted_once() {
+        let now = SystemTime::now();
+        let day = Duration::from_secs(24 * 3600);
+        let hour = Duration::from_secs(3600);
+        let stale = backup_made(now, day + hour, BackupPhase::Receiving);
+        let fresh = backup_made(now, day - hour, BackupPhase::Receiving);
+        let ready = backup_made(now, 2 * day, BackupPhase::Ready);
+        let deleting = backup_made(now, 2 * day, BackupPhase::Receiving);
+        // 오래전에 만들었어도 마지막으로 파일을 받은 지 하루가 안 됐으면 남긴다.
+        let mut active = backup_made(now, 2 * day, BackupPhase::Receiving);
+        let recent = (now - hour).duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        active.status.received_at = Some(recent.as_secs());
+        let mut idle = backup_made(now, 3 * day, BackupPhase::Receiving);
+        let old = (now - day - hour)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        idle.status.received_at = Some(old.as_secs());
+        let mut task = task(TaskOp::BackupDelete, Uuid::now_v7(), TaskState::Running);
+        task.spec.target = deleting.id;
+        // 끝난 지우기 Task는 지우는 중이 아니다.
+        let mut done = task.clone();
+        done.spec.target = stale.id;
+        done.status.state = TaskState::Failed;
+        let backups = [stale.clone(), fresh, ready, deleting, active, idle.clone()];
+        let got = stale_receiving(now, &CONFIG, &backups, &[task, done]);
+        let ids: Vec<Uuid> = got.iter().map(|b| b.id).collect();
+        assert_eq!(ids, [stale.id, idle.id]);
     }
 }

@@ -609,6 +609,66 @@ async fn restore_into_a_block_pool_writes_raw_volumes() {
     assert!(get_vm(&env, "web-2").is_some());
 }
 
+/// 다른 클러스터에서 받은 사본은 보통 백업처럼 복원한다: 원본 백업의 매니페스트와 파일을 받기 API로
+/// 보내 받은 사본(매니페스트의 백업 id는 사본의 id)에서 같은 내용의 VM을 만든다.
+#[tokio::test]
+async fn a_received_copy_restores_like_its_original() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env, &admin).await;
+    let b = backed_up(&env, &admin).await;
+    create_pool(&env, "dr", true).await;
+    create_pool(&env, "other", false).await;
+    let source = backup_dir(&env, b.id);
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(source.join(MANIFEST_FILE)).unwrap()).unwrap();
+    let body = json!({
+        "pool": "dr",
+        "manifest": manifest,
+        "origin": { "cluster": "main", "ca_fingerprint": "sha256:00", "backup": b.id }
+    });
+    let (status, got) = admin.post("/backups/receive", body).await;
+    assert_eq!(status, StatusCode::CREATED, "{got}");
+    let copy: Uuid = got["id"].as_str().unwrap().parse().unwrap();
+    for file in ["disk0.qcow2", "disk1.qcow2", "vars.fd"] {
+        let r = admin
+            .http
+            .put(format!("{}/api/v1/backups/{copy}/files/{file}", admin.base))
+            .bearer_auth(admin.token.as_ref().unwrap())
+            .body(std::fs::read(source.join(file)).unwrap());
+        let (status, got) = admin.send(r).await;
+        assert_eq!(status, StatusCode::OK, "{file}: {got}");
+    }
+    let (status, got) = admin
+        .post(&format!("/backups/{copy}/actions/complete"), Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+
+    let task = wait(
+        &admin,
+        admin
+            .post(
+                &format!("/backups/{copy}/restore"),
+                json!({ "name": "web-dr", "pool": "other" }),
+            )
+            .await,
+    )
+    .await;
+    succeeded(&task);
+    let new = get_vm(&env, "web-dr").unwrap();
+    assert_eq!(new.spec.memory_mib, b.spec.vm_spec.memory_mib);
+    for (name, pattern) in [
+        ("web-dr-disk0", "read -P 0xaa 0 64k"),
+        ("web-dr-disk1", "read -P 0x5a 64k 64k"),
+    ] {
+        let volume = get_volume(&env, name).unwrap();
+        let path = pool_dir(&env, "other").join(format!("{}.qcow2", volume.id));
+        assert!(qemu_io(&path, "qcow2", pattern), "{name}");
+    }
+    let vars = uefi_vars_path(&env.dir.path().join("state"), new.id);
+    assert_eq!(std::fs::read(vars).unwrap(), b"uefi variables");
+}
+
 /// 디스크 하나를 복원하지 못하면 그때까지 만든 볼륨(파일과 리소스)을 지우고 VM을 만들지 않는다.
 #[tokio::test]
 async fn failed_restore_removes_the_volumes_it_made() {

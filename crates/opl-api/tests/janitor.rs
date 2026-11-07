@@ -1,7 +1,7 @@
 //! 클러스터 정리 작업: 오프라인 노드의 `pending` 스냅샷 Task가 유예 뒤 실패해 VM 조작이 풀리고
 //! `running` Task는 남는지, 제거된 노드의 Task가 곧바로 실패하는지, 만들 Task 없이 남은 `pending`
 //! 스냅샷을 지우는지, 끝낸 예약 스냅샷 만들기를 `schedule_error`에 남기는지, 끝난 Task를 기간·개수
-//! 기준으로 지우고 끝나지 않은 Task는 남기는지.
+//! 기준으로 지우고 끝나지 않은 Task는 남기는지, 오래 받는 중인 백업을 지우는지.
 
 mod common;
 
@@ -9,9 +9,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use common::{Env, WAIT, vm_request};
 use opl_api::{ClusterJanitor, ClusterJanitorConfig};
+use opl_types::backup::BackupSpec;
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
+use opl_types::storage::{PoolBackend, StoragePoolSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{ScheduleError, VmSpec};
 use reqwest::StatusCode;
@@ -339,4 +341,68 @@ async fn finished_tasks_over_the_limit_go_oldest_first() {
     expected.push(pending.id);
     expected.sort();
     assert_eq!(left, expected);
+}
+
+/// 보내던 쪽이 끝내지 못해 오래 `receiving`인 백업은 지우기 Task로 파일과 함께 지운다. 받은 백업은
+/// 남는다.
+#[tokio::test]
+async fn backups_left_receiving_are_deleted_with_their_files() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let path = env.dir.path().join("dr");
+    std::fs::create_dir_all(&path).unwrap();
+    let pool = Resource::new(
+        "dr",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir { path: path.clone() },
+            nodes: vec![],
+            shared: false,
+            backups: true,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    env.pool_ready("dr").await;
+    let receive = |m: Value| {
+        let admin = admin.clone();
+        async move {
+            let body = serde_json::json!({
+                "pool": "dr",
+                "manifest": m,
+                "origin": { "cluster": "main", "ca_fingerprint": "sha256:00", "backup": m["backup"] }
+            });
+            let (status, got) = admin.post("/backups/receive", body).await;
+            assert_eq!(status, StatusCode::CREATED, "{got}");
+            got["id"].as_str().unwrap().parse::<Uuid>().unwrap()
+        }
+    };
+    let manifest = || {
+        serde_json::json!({
+            "version": 1, "backup": Uuid::now_v7(), "vm": Uuid::now_v7(), "vm_name": "web",
+            "vm_spec": vm_request("web")["spec"], "disks": [], "uefi_vars": false, "created_at": 1
+        })
+    };
+    let left = receive(manifest()).await;
+    let done = receive(manifest()).await;
+    let (status, got) = admin
+        .post(&format!("/backups/{done}/actions/complete"), Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let dir = opl_types::backup::backup_dir(&path, left);
+    assert!(dir.is_dir());
+
+    let janitor = ClusterJanitor::spawn(
+        env.state.clone(),
+        ClusterJanitorConfig {
+            tick: Duration::from_millis(50),
+            receiving_max_age: GRACE,
+            ..ClusterJanitorConfig::default()
+        },
+    );
+    until("receiving backup deleted", || {
+        env.cluster.get::<BackupSpec>(left).unwrap().is_none()
+    })
+    .await;
+    janitor.shutdown().await;
+    assert!(!dir.exists());
+    assert!(env.cluster.get::<BackupSpec>(done).unwrap().is_some());
 }

@@ -81,7 +81,7 @@ pub(crate) fn now() -> u64 {
         .unwrap_or(0)
 }
 
-fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
+pub(crate) fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
     state
         .cluster
         .get_by_name::<StoragePoolSpec>(name)?
@@ -143,6 +143,14 @@ fn backup_busy(backup: &Backup, doing: &str) -> ApiError {
             backup.name
         ),
     )
+}
+
+/// 백업을 지우는 Task가 끝나지 않았으면 409 `backup_busy`. 받는 중인 사본의 완료가 쓴다.
+pub(crate) fn check_not_deleting(state: &AppState, backup: &Backup) -> Result<(), ApiError> {
+    if backup_tasks(state, backup.id)?.contains(&"being deleted") {
+        return Err(backup_busy(backup, "being deleted"));
+    }
+    Ok(())
 }
 
 /// 풀에 백업이 남아 있으면 409 `pool_in_use`. 풀 지우기와 백업 표시 끄기가 쓴다.

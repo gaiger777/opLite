@@ -353,6 +353,7 @@ impl Member {
                 hv.clone(),
                 config.data_dir.join("uploads"),
             );
+            state.mount_root = mount_root.clone();
             state.peers = Some(peers.clone());
             state.secure_cookies = true;
             state.audit = audit;

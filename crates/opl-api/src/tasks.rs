@@ -3,7 +3,7 @@
 //! API는 Task를 저장소에 만들기만 한다. 실행기는 reconciler처럼 목록을 읽고 그 revision부터
 //! 구독하므로, 어느 노드의 API가 만든 Task든 대상 노드에서 실행된다.
 
-mod backup;
+pub(crate) mod backup;
 mod clone;
 mod import;
 mod migrate;

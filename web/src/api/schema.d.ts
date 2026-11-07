@@ -215,6 +215,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/backups/receive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 다른 클러스터의 백업 사본을 받기 시작한다(201): 매니페스트의 VM·스펙·디스크로 `receiving` 백업을
+         *     만들고 백업 풀에 그 디렉터리를 만든다. 풀이 없거나 백업 풀이 아니거나 매니페스트가 올바르지 않으면
+         *     400, 풀을 이 노드에서 쓸 수 없으면 409 `pool_not_on_node`·`pool_unavailable`, 같은 원본(CA 지문과
+         *     원본 id)의 사본이 같은 풀에 있으면 409 `replica_exists`(`details.backup`이 그 id), 풀에 디스크 파일을
+         *     받을 자리가 없으면 507 `insufficient_storage`, 옛 노드가 있으면 409 `cluster_upgrading`.
+         */
+        post: operations["receive_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/backups/{key}": {
         parameters: {
             query?: never;
@@ -233,6 +256,53 @@ export interface paths {
          *     바로 지우고 200이다(파일은 백업 풀에 남는다).
          */
         delete: operations["delete_backup"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backups/{key}/actions/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 받기를 끝낸다(200, 백업): 모든 파일이 있고 디스크 파일 크기가 매니페스트와 같으면 매니페스트를
+         *     (`backup`은 이 클러스터의 백업 id로) 쓰고 `ready`로 바꾼다. 빠지거나 크기가 다른 파일이 있으면 409
+         *     `backup_incomplete`(`details.files`가 그 파일들), 받는 중이 아니면 409 `backup_not_receiving`, 지우는
+         *     Task가 걸려 있으면 409 `backup_busy`.
+         */
+        post: operations["complete_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backups/{key}/files/{file}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 받는 중인 백업의 파일 하나를 받는다(200): `{file}.part`에 쓰고 디스크에 내려 쓴 뒤 이름을 바꾸고,
+         *     받은 내용의 SHA-256과 크기를 돌려주며, 디스크 파일의 해시와 받은 시각(`received_at`)을 백업 상태에
+         *     적는다. 같은 파일을 다시 보내면 덮는다. `file`은 매니페스트의 디스크 파일이나(UEFI 변수가 있으면)
+         *     `vars.fd`여야 하고, `Content-Length`는 디스크 파일이면 매니페스트의 크기, `vars.fd`면 64 MiB까지다
+         *     (400). 본문 조각이 60초 넘게 오지 않으면 받은 것을 버리고 400(멈춘 업로드). `Content-Length`가 없으면
+         *     411, 받는 중이 아니면 409 `backup_not_receiving`, 파일이 다른 노드에 있으면 409 `backup_on_other_node`,
+         *     같은 파일을 받고 있으면 409 `backup_busy`.
+         */
+        put: operations["put_backup_file"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1439,6 +1509,11 @@ export interface components {
              */
             virtual_bytes: number;
         };
+        /**
+         * Format: binary
+         * @description 업로드 본문의 문서용 스키마: 바이너리 파일
+         */
+        BackupFile: string;
         /** @description 리소스만 지운 백업 지우기(`force`)의 응답 */
         BackupForgotten: {
             message: string;
@@ -1484,6 +1559,30 @@ export interface components {
             next_run: number | null;
             /** @default null */
             run: components["schemas"]["JobRun"] | null;
+        };
+        /** @description 백업 디렉터리의 `manifest.json`. opLite 없이도 백업을 알아볼 수 있게 VM 스펙과 디스크 목록을 담는다. */
+        BackupManifest: {
+            /**
+             * Format: uuid
+             * @description 백업 id
+             */
+            backup: string;
+            /**
+             * Format: int64
+             * @description 만든 시각(유닉스 초)
+             */
+            created_at: number;
+            disks: components["schemas"]["BackupDisk"][];
+            uefi_vars: boolean;
+            /**
+             * Format: int32
+             * @description 형식 버전([`MANIFEST_VERSION`])
+             */
+            version: number;
+            /** Format: uuid */
+            vm: string;
+            vm_name: string;
+            vm_spec: components["schemas"]["VmSpec"];
         };
         /** @description 받은 사본의 원본: 보낸 클러스터와 그 클러스터의 백업 */
         BackupOrigin: {
@@ -3079,6 +3178,28 @@ export interface components {
             /** Format: int64 */
             revision: number;
             roles: components["schemas"]["RoleMapping"];
+        };
+        ReceiveRequest: {
+            /** @description 원본 백업의 매니페스트(`manifest.json`) */
+            manifest: components["schemas"]["BackupManifest"];
+            /** @description 받는 쪽 백업 이름. 없으면 `{VM 이름}-{만든 시각}`이고, 겹치면 뒤에 `-2`, `-3`…을 붙인다. */
+            name?: string | null;
+            origin: components["schemas"]["BackupOrigin"];
+            /** @description 받을 백업 풀. 이 노드에서 쓸 수 있어야 한다. */
+            pool: string;
+        };
+        /** @description 받은 파일 */
+        ReceivedFile: {
+            /** @description 받은 내용의 SHA-256(16진수 소문자) */
+            sha256: string;
+            /** Format: int64 */
+            size: number;
+        };
+        /** @description 받기 시작한 백업 */
+        ReceivingBackup: {
+            /** Format: uuid */
+            id: string;
+            name: string;
         };
         RemoteNodeCounts: {
             /** Format: int64 */
@@ -4807,6 +4928,37 @@ export interface operations {
             };
         };
     };
+    receive_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReceiveRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceivingBackup"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_backup: {
         parameters: {
             query?: never;
@@ -4867,6 +5019,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    complete_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupSpec_BackupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_backup_file: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+                /** @description disk file of the manifest or vars.fd */
+                file: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": components["schemas"]["BackupFile"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceivedFile"];
                 };
             };
             "4XX": {

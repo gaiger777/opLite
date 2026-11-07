@@ -32,7 +32,7 @@ use super::snapshot::{
 use super::{Ctx, mark_ready};
 
 /// 백업 디렉터리 안의 UEFI 변수 파일 이름
-pub(super) const VARS_FILE: &str = "vars.fd";
+pub(crate) const VARS_FILE: &str = "vars.fd";
 
 fn get_backup(ctx: &Ctx, id: Uuid) -> Result<Option<Backup>, String> {
     ctx.cluster.get::<BackupSpec>(id).map_err(|e| e.to_string())
@@ -139,13 +139,13 @@ async fn export_disks(
 }
 
 /// 파일이나 디렉터리 `path`를 디스크에 내려 쓴다(fsync). 디렉터리는 그 안의 이름 바꾸기를 남긴다.
-async fn sync_path(path: &Path) -> std::io::Result<()> {
+pub(crate) async fn sync_path(path: &Path) -> std::io::Result<()> {
     tokio::fs::File::open(path).await?.sync_all().await
 }
 
 /// 매니페스트를 `{dir}/manifest.json.part`에 쓰고 디스크에 내려 쓴 뒤 이름을 바꾸고, 디렉터리도 내려
 /// 쓴다. 매니페스트가 있으면 다 쓴 백업이다(디스크 파일은 `qemu-img`가 닫을 때 내려 썼다).
-async fn write_manifest(dir: &Path, manifest: &BackupManifest) -> std::io::Result<()> {
+pub(crate) async fn write_manifest(dir: &Path, manifest: &BackupManifest) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let text = serde_json::to_vec_pretty(manifest).map_err(std::io::Error::other)?;
     let path = dir.join(MANIFEST_FILE);

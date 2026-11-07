@@ -155,6 +155,7 @@ pub struct BackupDisk {
 
 /// 백업 디렉터리의 `manifest.json`. opLite 없이도 백업을 알아볼 수 있게 VM 스펙과 디스크 목록을 담는다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BackupManifest {
     /// 형식 버전([`MANIFEST_VERSION`])
     pub version: u32,

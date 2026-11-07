@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use opl_cluster::Cluster;
 use opl_driver::Hypervisor;
@@ -21,6 +22,9 @@ pub struct AppState {
     pub authorizer: Arc<dyn Authorizer>,
     /// 올린 이미지를 가져오기 전에 잠시 두는 디렉터리. 볼륨 풀과 같은 파일시스템이면 좋다.
     pub upload_dir: PathBuf,
+    /// NFS 풀을 마운트하는 디렉터리(opld의 `{data_dir}/pools`). 다른 클러스터가 보내는 백업 파일을 받을
+    /// 때 백업 풀의 경로를 정한다(`TaskRunnerConfig::mount_root`와 같다).
+    pub mount_root: PathBuf,
     /// 다른 노드에서 도는 VM의 콘솔을 중계할 때 쓴다. 없으면 이 노드의 VM 콘솔만 연다.
     pub peers: Option<Arc<Peers>>,
     /// 세션 쿠키에 `Secure`를 붙인다(HTTPS로 서비스할 때).
@@ -37,6 +41,10 @@ pub struct AppState {
     pub audit: Arc<AuditLog>,
     /// OIDC 영역의 discovery·JWKS(노드 메모리)
     pub(crate) oidc: OidcCache,
+    /// 이 노드가 지금 받고 있는 백업 사본 파일(백업 id, 파일 이름). 같은 파일을 두 요청이 함께 쓰지 않게 한다.
+    pub(crate) receiving_files: std::sync::Mutex<std::collections::HashSet<(Uuid, String)>>,
+    /// 받는 백업 사본 파일의 본문 조각을 기다리는 시간(기본 60초). 넘으면 그 업로드를 끊는다.
+    pub receive_idle_timeout: Duration,
 }
 
 impl AppState {
@@ -52,6 +60,7 @@ impl AppState {
             hv,
             authorizer: Arc::new(RoleAuthorizer),
             upload_dir,
+            mount_root: PathBuf::new(),
             peers: None,
             secure_cookies: false,
             sessions: Sessions::default(),
@@ -60,6 +69,8 @@ impl AppState {
             import_credentials: Arc::default(),
             audit: Arc::new(AuditLog::disabled()),
             oidc: OidcCache::default(),
+            receiving_files: Default::default(),
+            receive_idle_timeout: Duration::from_secs(60),
         }
     }
 }

@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod auth;
 mod backup_jobs;
+mod backup_receive;
 mod backups;
 pub mod cluster;
 mod console;
@@ -170,6 +171,9 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(backups::get_backup, backups::delete_backup))
         .routes(routes!(backups::create_backup))
         .routes(routes!(backups::restore_backup))
+        .routes(routes!(backup_receive::receive_backup))
+        .routes(routes!(backup_receive::put_backup_file))
+        .routes(routes!(backup_receive::complete_backup))
         .routes(routes!(r::list_backup_jobs, backup_jobs::create_backup_job))
         .routes(routes!(
             r::get_backup_job,
