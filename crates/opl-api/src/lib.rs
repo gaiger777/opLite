@@ -171,6 +171,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(backups::get_backup, backups::delete_backup))
         .routes(routes!(backups::create_backup))
         .routes(routes!(backups::restore_backup))
+        .routes(routes!(backups::replicate_backup))
         .routes(routes!(backup_receive::receive_backup))
         .routes(routes!(backup_receive::put_backup_file))
         .routes(routes!(backup_receive::complete_backup))

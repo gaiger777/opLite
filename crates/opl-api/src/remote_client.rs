@@ -29,7 +29,7 @@ use tokio_rustls::client::TlsStream;
 
 /// TCP 연결과 TLS 핸드셰이크의 시간 제한
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// 요청을 다 보낸 뒤 응답 헤더를 기다리는 시간
+/// 요청을 다 보낸 뒤 응답 헤더를 기다리는 기본 시간
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// 본문(보내는 것과 받는 것) 조각 사이의 최대 시간
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -84,7 +84,7 @@ pub async fn fetch_ca(url: &str) -> Result<String, RemoteError> {
         .header(HOST, &target.authority)
         .body(Empty::<Bytes>::new())
         .map_err(invalid)?;
-    let response = send(&target, Arc::new(config), request)
+    let response = send(&target, Arc::new(config), request, HEADER_TIMEOUT)
         .await
         .map_err(plain)?;
     let status = response.status();
@@ -187,14 +187,33 @@ impl RemoteClient {
     }
 
     /// 요청 하나를 보내고 응답을 그대로 돌려준다(상태를 보지 않고 본문 한도도 없다). 본문은 흘려
-    /// 보내고, 보내는 본문과 받는 본문 모두 조각 사이가 60초를 넘으면 끊는다. `headers`에 더해
-    /// `Host`와 `Authorization`(저장한 토큰)을 이 클라이언트가 채운다.
+    /// 보내고, 보내는 본문과 받는 본문 모두 조각 사이가 60초를 넘으면 끊는다. 응답 헤더는 본문을 다
+    /// 보낸 뒤 10초까지 기다린다. `headers`에 더해 `Host`와 `Authorization`(저장한 토큰)을 이
+    /// 클라이언트가 채운다.
     pub async fn request<B>(
         &self,
         method: Method,
         path_and_query: &str,
         headers: HeaderMap,
         body: B,
+    ) -> Result<Response<RemoteBody>, RemoteError>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<BoxError>,
+    {
+        self.request_with_timeout(method, path_and_query, headers, body, HEADER_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::request`]와 같되 응답 헤더를 본문을 다 보낸 뒤 `header_timeout`까지 기다린다. 받는 쪽이
+    /// 큰 파일을 내려 쓰고 답하는 업로드가 쓴다.
+    pub async fn request_with_timeout<B>(
+        &self,
+        method: Method,
+        path_and_query: &str,
+        headers: HeaderMap,
+        body: B,
+        header_timeout: Duration,
     ) -> Result<Response<RemoteBody>, RemoteError>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -213,7 +232,7 @@ impl RemoteClient {
         request
             .headers_mut()
             .insert(AUTHORIZATION, self.authorization.clone());
-        send(&self.target, self.config.clone(), request).await
+        send(&self.target, self.config.clone(), request, header_timeout).await
     }
 }
 
@@ -265,11 +284,12 @@ impl Target {
     }
 }
 
-/// 새 연결을 열어 요청 하나를 보내고 응답 헤더를 기다린다.
+/// 새 연결을 열어 요청 하나를 보내고 응답 헤더를 본문을 다 보낸 뒤 `header_timeout`까지 기다린다.
 async fn send<B>(
     target: &Target,
     config: Arc<ClientConfig>,
     request: Request<B>,
+    header_timeout: Duration,
 ) -> Result<Response<RemoteBody>, RemoteError>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -287,10 +307,10 @@ where
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    // 응답 헤더는 본문을 다 보낸 뒤(또는 보내기를 그만둔 뒤) 10초까지 기다린다.
+    // 응답 헤더는 본문을 다 보낸 뒤(또는 보내기를 그만둔 뒤) `header_timeout`까지 기다린다.
     let header_deadline = async {
         let _ = sent_rx.await;
-        tokio::time::sleep(HEADER_TIMEOUT).await;
+        tokio::time::sleep(header_timeout).await;
     };
     let response = tokio::select! {
         response = sender.send_request(request) => response.map_err(unreachable)?,

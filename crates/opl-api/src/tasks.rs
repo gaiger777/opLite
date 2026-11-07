@@ -7,6 +7,7 @@ pub(crate) mod backup;
 mod clone;
 mod import;
 mod migrate;
+mod replicate;
 mod snapshot;
 
 pub(crate) use clone::volume_name;
@@ -526,8 +527,8 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// VM 전원 Task는 기다리기만 하므로 줄을 두지 않는다. 강제 종료가 앞의 reboot 뒤에 묶이면 안 된다.
 /// 마이그레이션 Task는 VM의 줄에 선다(앞의 스냅샷·복제가 끝난 뒤 옮긴다). 백업 Task도 VM의 줄에
 /// 선다(임시 스냅샷을 찍고 디스크를 읽는다). 백업 지우기와 복원은 그 백업의 줄에 서서 겹치지 않는다
-/// (복원 Task의 대상은 새 VM이다). VM 가져오기와 가져오기 지우기도 그 가져오기의 줄에 선다(가져오기
-/// Task의 대상은 새 VM이다).
+/// (복원 Task의 대상은 새 VM이다). 복제도 그 백업의 줄에 서서 보내는 동안 지우기가 파일을 지우지
+/// 않는다. VM 가져오기와 가져오기 지우기도 그 가져오기의 줄에 선다(가져오기 Task의 대상은 새 VM이다).
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
     match task.spec.op {
@@ -540,7 +541,10 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
             task.spec.op,
             TaskOp::VmClone { .. } | TaskOp::VmMigrate { .. } | TaskOp::VmBackup { .. }
         );
-        let backup_queue = matches!(task.spec.op, TaskOp::BackupDelete | TaskOp::VmImportDelete);
+        let backup_queue = matches!(
+            task.spec.op,
+            TaskOp::BackupDelete | TaskOp::BackupReplicate { .. } | TaskOp::VmImportDelete
+        );
         return (is_volume_op(&task.spec.op)
             || is_snapshot_op(&task.spec.op)
             || vm_queue
@@ -604,13 +608,15 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
     }
     // 시간을 넘겨 버린 작업은 끝나지 않았다(명령이 아직 돌 수 있다). 마이그레이션은 단계마다
     // 시간 제한이 있고(`migration_timeout`, RPC 기한), 확정 쓰기 도중에 버리면 안 되므로 감싸지 않는다.
-    // 백업과 복원, VM 가져오기는 디스크 크기만큼 오래 걸릴 수 있으므로 시간 제한을 두지 않는다(설계 §2.3).
+    // 백업과 복원, 복제, VM 가져오기는 디스크 크기만큼 오래 걸릴 수 있으므로 시간 제한을 두지 않는다
+    // (설계 §2.3, 복제는 원격 클라이언트가 조각 사이 60초를 본다).
     // 업그레이드도 오래 걸릴 수 있고 apt를 중간에 끊으면 더 나쁘다.
     let unlimited = matches!(
         task.spec.op,
         TaskOp::VmMigrate { .. }
             | TaskOp::VmBackup { .. }
             | TaskOp::BackupRestore { .. }
+            | TaskOp::BackupReplicate { .. }
             | TaskOp::VmImport { .. }
             | TaskOp::NodeUpgrade
     );
@@ -652,8 +658,8 @@ async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
 }
 
 /// 실패한 볼륨 생성·가져오기, 스냅샷 만들기, 복제·복원·VM 가져오기의 흔적을 지워 이름을 다시 쓸 수 있게
-/// 한다. 실패한 백업은 디렉터리를 지우고 `failed`와 `error`를 남긴다. 실패한 VM 가져오기는 `ready`로
-/// 돌아가 `error`를 남긴다.
+/// 한다. 실패한 백업은 디렉터리를 지우고 `failed`와 `error`를 남긴다. 실패한 복제는 원본의 사본 기록을
+/// `failed`와 `error`로 바꾼다. 실패한 VM 가져오기는 `ready`로 돌아가 `error`를 남긴다.
 /// 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
 /// 재시작으로 중단) 작업이 아직 돌고 있을 수 있어 태그를 두고 리소스만 지운다(설계 §6 "태그만 남은 경우").
 /// 블록 디스크의 태그는 뒤에서 다시 지운다([`snapshot::remove_unfinished_tags`]).
@@ -674,6 +680,9 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     }
     if let TaskOp::VmBackup { backup } = task.spec.op {
         backup::discard(ctx, task, backup, error, unfinished).await;
+    }
+    if let TaskOp::BackupReplicate { remote, pool } = &task.spec.op {
+        replicate::discard(ctx, task.spec.target, remote, pool, error).await;
     }
     if let TaskOp::VmImport { import, .. } = task.spec.op {
         import::discard(ctx, task, import, error).await;
@@ -775,8 +784,9 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<(), String> {
         TaskOp::BackupRestore { backup, name, pool } => {
             backup::restore(ctx, task, *backup, name, pool).await
         }
-        // 아직 보내는 쪽이 없다. 이 Task를 만드는 API가 없으므로 오지 않는다.
-        TaskOp::BackupReplicate { .. } => Err("backup replication is not supported yet".into()),
+        TaskOp::BackupReplicate { remote, pool } => {
+            replicate::replicate(ctx, id, remote, pool).await
+        }
         TaskOp::VmImport { import, run } => import::import(ctx, task, *import, run).await,
         TaskOp::VmImportDelete => import::delete(ctx, id).await,
         TaskOp::NodeUpdateCheck => match &ctx.config.updates {

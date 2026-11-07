@@ -354,6 +354,45 @@ async fn streams_uploads_and_downloads_both_ways() {
     assert!(body.next().await.is_none());
 }
 
+/// 응답 헤더를 기다리는 시간은 요청마다 줄 수 있다(큰 파일을 받은 쪽이 내려 쓰느라 늦게 답한다).
+#[tokio::test]
+async fn requests_can_wait_longer_or_shorter_for_the_answer() {
+    let server = start().await;
+    let client = client(&server);
+    let started = Instant::now();
+    let err = client
+        .request_with_timeout(
+            Method::GET,
+            "/hang",
+            HeaderMap::new(),
+            Empty::<Bytes>::new(),
+            Duration::from_millis(300),
+        )
+        .await
+        .err()
+        .expect("timed out");
+    assert!(
+        matches!(&err, RemoteError::Unreachable(m) if m.contains("timed out")),
+        "{err:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let response = client
+        .request_with_timeout(
+            Method::GET,
+            "/info",
+            HeaderMap::new(),
+            Empty::<Bytes>::new(),
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn request_returns_any_status_with_its_body() {
     let server = start().await;

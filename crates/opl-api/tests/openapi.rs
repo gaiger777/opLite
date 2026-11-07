@@ -48,6 +48,7 @@ async fn openapi_document_is_served_without_login() {
         "/backups/receive",
         "/backups/{key}/files/{file}",
         "/backups/{key}/actions/complete",
+        "/backups/{key}/actions/replicate",
         "/backup-jobs",
         "/backup-jobs/{key}",
         "/backup-jobs/{key}/run",

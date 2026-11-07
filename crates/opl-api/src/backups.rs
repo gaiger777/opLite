@@ -1,6 +1,6 @@
-//! VM 백업 만들기·목록·읽기·지우기·복원(설계 §2). 만들기는 VM 쓰기, 지우기·복원은 백업 쓰기 권한이다.
-//! 실제 작업은 Task 실행기가 한다: 백업은 VM의 노드, 지우기·복원은 백업 풀을 쓸 수 있는 노드(공유가
-//! 아닌 풀의 백업은 파일을 쓴 노드).
+//! VM 백업 만들기·목록·읽기·지우기·복원(설계 §2)과 원격 클러스터로 복제(엔터프라이즈 설계 §6.2).
+//! 만들기는 VM 쓰기, 지우기·복원·복제는 백업 쓰기 권한이다. 실제 작업은 Task 실행기가 한다: 백업은
+//! VM의 노드, 지우기·복원·복제는 백업 풀을 쓸 수 있는 노드(공유가 아닌 풀의 백업은 파일을 쓴 노드).
 
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use opl_types::backup::{Backup, BackupPhase, BackupSpec, BackupStatus, default_backup_name};
 use opl_types::network::{NetworkSpec, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec};
+use opl_types::remote::RemoteSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, is_shared,
@@ -22,6 +23,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
+use crate::cluster::require_current;
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{List, check_name, lookup};
 use crate::snapshots::{check_disks, check_not_busy};
@@ -48,6 +50,15 @@ pub struct RestoreRequest {
     pub pool: String,
     /// 복원을 실행할 노드(이름이나 id). 없으면 백업 풀과 대상 풀을 함께 쓸 수 있는 노드다.
     pub node: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicateRequest {
+    /// 사본을 보낼 원격 클러스터(이름이나 id)
+    pub remote: String,
+    /// 원격 클러스터의 백업 풀 이름
+    pub pool: String,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -98,7 +109,7 @@ fn first_node(state: &AppState, fits: impl Fn(&Node) -> bool) -> Result<Option<U
         .map(|n| n.id))
 }
 
-/// 백업 `id`를 다루는 끝나지 않은 Task가 하는 일(만들기, 복원, 지우기)
+/// 백업 `id`를 다루는 끝나지 않은 Task가 하는 일(만들기, 복원, 지우기, 복제)
 fn backup_tasks(state: &AppState, id: Uuid) -> Result<Vec<&'static str>, ApiError> {
     let (_, tasks) = state.cluster.list::<TaskSpec>()?;
     Ok(tasks
@@ -108,6 +119,7 @@ fn backup_tasks(state: &AppState, id: Uuid) -> Result<Vec<&'static str>, ApiErro
             TaskOp::VmBackup { backup } if backup == id => Some("being created"),
             TaskOp::BackupRestore { backup, .. } if backup == id => Some("being restored"),
             TaskOp::BackupDelete if t.spec.target == id => Some("being deleted"),
+            TaskOp::BackupReplicate { .. } if t.spec.target == id => Some("being replicated"),
             _ => None,
         })
         .collect())
@@ -437,7 +449,7 @@ pub async fn delete_backup(
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
-/// 백업을 만들거나 되살리거나 지우는 Task가 끝나지 않았으면 409 `backup_busy`
+/// 백업을 만들거나 되살리거나 지우거나 복제하는 Task가 끝나지 않았으면 409 `backup_busy`
 fn check_backup_idle(state: &AppState, backup: &Backup) -> Result<(), ApiError> {
     match backup_tasks(state, backup.id)?.first() {
         Some(doing) => Err(backup_busy(backup, doing)),
@@ -578,5 +590,57 @@ pub async fn restore_backup(
         pool: target.name,
     };
     let task = create_task(&state.cluster, op, Uuid::now_v7(), node).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// `ready` 백업을 원격 클러스터 `remote`의 백업 풀 `pool`에 사본으로 보낼 Task를 돌려준다(202). Task는
+/// 백업 파일이 있는 노드(공유가 아닌 풀은 파일을 쓴 노드)에서 돌고, 원격의 받기 API로 파일을 보내며 원본
+/// `status.replicas`에 결과를 적는다. 원격 쪽 권한은 원격 토큰 주인의 역할이다(백업 쓰기, operator
+/// 이상). 원격이 없으면 404, 백업이 준비되지 않았으면 409 `backup_not_ready`, 지우는 중이거나 같은 원격으로
+/// 복제하는 Task가 끝나지 않았으면 409 `backup_busy`, 파일을 읽을 노드가 없으면 409(`node_offline`,
+/// `pool_unavailable` 등), 옛 노드가 있으면 409 `cluster_upgrading`.
+#[utoipa::path(post, path = "/backups/{key}/actions/replicate", tag = "backups",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = ReplicateRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn replicate_backup(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    Json(req): Json<ReplicateRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    state.authorize(&principal, Action::Write, BackupSpec::KIND)?;
+    check_name(&req.pool)?;
+    // 옛 노드는 복제 Task와 사본 기록을 모른다.
+    require_current(&state.cluster)?;
+    let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    let remote = lookup::<RemoteSpec>(&state.cluster, &req.remote)?;
+    if backup.status.phase != BackupPhase::Ready {
+        return Err(ApiError::conflict(
+            "backup_not_ready",
+            format!("backup {:?} is not ready", backup.name),
+        ));
+    }
+    if backup_tasks(&state, backup.id)?.contains(&"being deleted") {
+        return Err(backup_busy(&backup, "being deleted"));
+    }
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    if tasks.iter().any(|t| {
+        !t.status.state.is_finished()
+            && t.spec.target == backup.id
+            && matches!(&t.spec.op, TaskOp::BackupReplicate { remote: r, .. } if *r == remote.name)
+    }) {
+        return Err(backup_busy(
+            &backup,
+            &format!("being replicated to remote {:?}", remote.name),
+        ));
+    }
+    let pool = find_pool(&state, &backup.spec.pool)?;
+    let node = files_node(&state, &backup, &pool)?;
+    let op = TaskOp::BackupReplicate {
+        remote: remote.name,
+        pool: req.pool,
+    };
+    let task = create_task(&state.cluster, op, backup.id, node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }

@@ -34,7 +34,7 @@ use super::{Ctx, mark_ready};
 /// 백업 디렉터리 안의 UEFI 변수 파일 이름
 pub(crate) const VARS_FILE: &str = "vars.fd";
 
-fn get_backup(ctx: &Ctx, id: Uuid) -> Result<Option<Backup>, String> {
+pub(super) fn get_backup(ctx: &Ctx, id: Uuid) -> Result<Option<Backup>, String> {
     ctx.cluster.get::<BackupSpec>(id).map_err(|e| e.to_string())
 }
 
@@ -72,7 +72,7 @@ pub(super) fn ready_pool(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
 }
 
 /// 백업 풀 `name`과 이 노드에서 그 풀의 루트. 풀이 이 노드에서 준비되지 않았으면 오류다.
-fn backup_root(ctx: &Ctx, name: &str) -> Result<(StoragePool, PathBuf), String> {
+pub(super) fn backup_root(ctx: &Ctx, name: &str) -> Result<(StoragePool, PathBuf), String> {
     let pool = ready_pool(ctx, name)?;
     let root = check_pool_root(&pool, &ctx.config.mount_root)
         .map_err(|e| format!("storage pool {name:?}: {e}"))?;
@@ -412,7 +412,7 @@ pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 }
 
 /// 백업 디렉터리의 매니페스트를 읽는다. 형식 버전이 다르면 나머지를 읽지 않고 오류다.
-async fn read_manifest(dir: &Path) -> Result<BackupManifest, String> {
+pub(super) async fn read_manifest(dir: &Path) -> Result<BackupManifest, String> {
     let text = tokio::fs::read(dir.join(MANIFEST_FILE))
         .await
         .map_err(|e| format!("cannot read backup manifest: {e}"))?;

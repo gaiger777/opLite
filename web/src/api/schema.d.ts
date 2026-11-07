@@ -283,6 +283,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/backups/{key}/actions/replicate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `ready` 백업을 원격 클러스터 `remote`의 백업 풀 `pool`에 사본으로 보낼 Task를 돌려준다(202). Task는
+         *     백업 파일이 있는 노드(공유가 아닌 풀은 파일을 쓴 노드)에서 돌고, 원격의 받기 API로 파일을 보내며 원본
+         *     `status.replicas`에 결과를 적는다. 원격 쪽 권한은 원격 토큰 주인의 역할이다(백업 쓰기, operator
+         *     이상). 원격이 없으면 404, 백업이 준비되지 않았으면 409 `backup_not_ready`, 지우는 중이거나 같은 원격으로
+         *     복제하는 Task가 끝나지 않았으면 409 `backup_busy`, 파일을 읽을 노드가 없으면 409(`node_offline`,
+         *     `pool_unavailable` 등), 옛 노드가 있으면 409 `cluster_upgrading`.
+         */
+        post: operations["replicate_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/backups/{key}/files/{file}": {
         parameters: {
             query?: never;
@@ -3296,6 +3320,12 @@ export interface components {
         };
         /** @enum {string} */
         ReplicaState: "copying" | "ready" | "failed";
+        ReplicateRequest: {
+            /** @description 원격 클러스터의 백업 풀 이름 */
+            pool: string;
+            /** @description 사본을 보낼 원격 클러스터(이름이나 id) */
+            remote: string;
+        };
         /** @description 백업을 보낼 곳: 원격 `remote`의 백업 풀 `pool` */
         ReplicateTarget: {
             /** @description 원격의 백업 풀 이름 */
@@ -5049,6 +5079,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_BackupSpec_BackupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    replicate_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplicateRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
                 };
             };
             "4XX": {

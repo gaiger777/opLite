@@ -319,6 +319,14 @@ impl Env {
     /// 다른 클러스터가 원격으로 등록할 때 쓴다. `GET /cluster/ca`를 받은 수를 센다. 돌려준 서버를 버리면
     /// 멈춘다.
     pub async fn serve_tls(&self) -> TlsServer {
+        self.serve_tls_with(|app| app).await
+    }
+
+    /// [`Env::serve_tls`]와 같되 `tweak`으로 라우터를 바꾼다(가짜 원격 응답 등).
+    pub async fn serve_tls_with(
+        &self,
+        tweak: impl FnOnce(axum::Router) -> axum::Router,
+    ) -> TlsServer {
         let info = self.cluster.list::<ClusterSpec>().unwrap().1.remove(0);
         let ca = opl_peer::pki::ClusterCa {
             cert_pem: info.spec.ca_cert_pem,
@@ -339,7 +347,7 @@ impl Env {
             .tap_io(|_| {});
         let ca_hits = Arc::new(AtomicUsize::new(0));
         let hits = ca_hits.clone();
-        let app = opl_api::router(self.state.clone()).layer(axum::middleware::from_fn(
+        let app = tweak(opl_api::router(self.state.clone())).layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
                 if req.uri().path() == "/api/v1/cluster/ca" {
                     hits.fetch_add(1, Ordering::SeqCst);
