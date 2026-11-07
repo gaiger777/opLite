@@ -52,6 +52,29 @@ it("turns a tracked task's toast into its result", async () => {
   expect(success).not.toHaveBeenCalled();
 });
 
+it("warns when a task succeeded with a warning", async () => {
+  render(
+    <ThemeProvider>
+      <Toaster />
+    </ThemeProvider>,
+  );
+  const warning = vi.spyOn(toast, "warning");
+  trackTask(task("9", "pending"), "Delete web-1");
+  settleTasks(
+    {
+      revision: 2,
+      items: [task("9", "succeeded", "backup deleted, but remote copies may be left: down")],
+    },
+    i18n.t,
+  );
+  expect(
+    await screen.findByText(
+      "Delete web-1: done with a warning. backup deleted, but remote copies may be left: down",
+    ),
+  ).toBeInTheDocument();
+  expect(warning).toHaveBeenCalledOnce();
+});
+
 it("settles a task that finished before it was tracked", async () => {
   const queryClient = createQueryClient();
   queryClient.setQueryData(["list", "task"], { revision: 2, items: [task("2", "succeeded")] });

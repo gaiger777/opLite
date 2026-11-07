@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { BackupJobsPage } from "@/backups/BackupJobsPage";
-import { backupJob, pool } from "@/test/fixtures";
+import { backupJob, pool, remote } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -23,6 +23,20 @@ const running = backupJob("hourly", 2, {
   status: { run: { started_at: 1, queue: ["x", "y"], backups: [] } },
 });
 const off = backupJob("weekly", 3, { spec: { enabled: false } });
+const copying = backupJob("offsite", 4, { spec: { replicate: { remote: "dr", pool: "dr-bk" } } });
+
+/** 원격 dr과 그 백업 풀 dr-bk·dr-bk2(중계) */
+function mockRemotes() {
+  server.use(
+    http.get(apiUrl("/remotes"), () => HttpResponse.json({ revision: 1, items: [remote("dr")] })),
+    http.get(apiUrl("/remotes/dr/api/storage-pools"), () =>
+      HttpResponse.json({
+        revision: 1,
+        items: [pool("dr-bk", { backups: true }), pool("dr-bk2", { backups: true })],
+      }),
+    ),
+  );
+}
 
 function cells(table: HTMLElement, name: string) {
   const headers = within(table).getAllByRole("columnheader");
@@ -58,6 +72,7 @@ it("lists jobs with their schedule, retention and runs in UTC", async () => {
   expect(weekly("VMs")).toHaveTextContent("All VMs");
   expect(weekly("State")).toHaveTextContent("Off");
   expect(weekly("Next run")).toHaveTextContent("—");
+  expect(weekly("Remote copy")).toHaveTextContent("—");
   expect(screen.getByRole("button", { name: "Run weekly now" })).toBeDisabled();
   // 이름 순
   expect(
@@ -67,11 +82,79 @@ it("lists jobs with their schedule, retention and runs in UTC", async () => {
   ).toEqual(["Name", "hourly", "nightly", "weekly"]);
 });
 
+it("shows where a job copies its backups", async () => {
+  mockLists({ "backup-job": [copying] });
+  renderPage(<BackupJobsPage />);
+  const table = await screen.findByRole("table", { name: "Backup jobs" });
+  await within(table).findByText("offsite");
+  expect(cells(table, "offsite")("Remote copy")).toHaveTextContent("dr / dr-bk");
+});
+
+it("creates a job that copies its backups to a remote cluster", async () => {
+  mockLists({ "storage-pool": [pool("bk", { backups: true })] });
+  mockRemotes();
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/backup-jobs"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(copying, { status: 201 });
+    }),
+  );
+  renderPage(<BackupJobsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create backup job" });
+  await userEvent.type(within(dialog).getByLabelText("Name"), "offsite");
+  await userEvent.type(within(dialog).getByLabelText("Time (UTC)"), "03:00");
+  await within(dialog).findByRole("option", { name: "dr" });
+  await userEvent.selectOptions(within(dialog).getByLabelText("Copy to a remote cluster"), "dr");
+  await within(dialog).findByRole("option", { name: "dr-bk2" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(within(dialog).getByText("Choose a storage pool.")).toBeVisible();
+  await userEvent.selectOptions(
+    within(dialog).getByLabelText("Backup pool on the remote cluster"),
+    "dr-bk2",
+  );
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await screen.findByText("Backup job offsite created.")).toBeInTheDocument();
+  expect(body).toMatchObject({
+    name: "offsite",
+    spec: { pool: "bk", replicate: { remote: "dr", pool: "dr-bk2" } },
+  });
+});
+
+it("turns off copying to a remote cluster", async () => {
+  mockLists({ "backup-job": [copying], "storage-pool": [pool("bk", { backups: true })] });
+  mockRemotes();
+  let body: unknown;
+  server.use(
+    http.patch(apiUrl(`/backup-jobs/${copying.id}`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(copying);
+    }),
+  );
+  renderPage(<BackupJobsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Edit offsite" }));
+  const dialog = await screen.findByRole("dialog", { name: "Edit offsite" });
+  expect(within(dialog).getByLabelText("Copy to a remote cluster")).toHaveValue("dr");
+  expect(within(dialog).getByLabelText("Backup pool on the remote cluster")).toHaveValue("dr-bk");
+  await userEvent.selectOptions(
+    within(dialog).getByLabelText("Copy to a remote cluster"),
+    "Do not copy",
+  );
+  expect(
+    within(dialog).queryByLabelText("Backup pool on the remote cluster"),
+  ).not.toBeInTheDocument();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(await screen.findByText("Backup job offsite saved.")).toBeInTheDocument();
+  expect(body).toEqual({ replicate: null });
+});
+
 it("creates a job after checking the form", async () => {
   mockLists({
     "backup-job": [nightly],
     "storage-pool": [pool("local"), pool("bk", { backups: true }), pool("bk2", { backups: true })],
   });
+  mockRemotes();
   let body: unknown;
   server.use(
     http.post(apiUrl("/backup-jobs"), async ({ request }) => {
@@ -121,6 +204,7 @@ it("creates a job after checking the form", async () => {
 
 it("edits a job and sends only what changed", async () => {
   mockLists({ "backup-job": [nightly], "storage-pool": [pool("bk", { backups: true })] });
+  mockRemotes();
   let body: unknown;
   server.use(
     http.patch(apiUrl(`/backup-jobs/${nightly.id}`), async ({ request }) => {

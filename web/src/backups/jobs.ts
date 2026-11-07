@@ -63,6 +63,10 @@ export interface JobForm {
   days: Weekday[];
   keep: Record<KeepUnit, string>;
   enabled: boolean;
+  /** 사본을 보낼 원격. 비면 복제하지 않는다. */
+  replicateRemote: string;
+  /** 원격의 백업 풀 */
+  replicatePool: string;
 }
 
 export function emptyForm(pool: string): JobForm {
@@ -76,6 +80,8 @@ export function emptyForm(pool: string): JobForm {
     days: [],
     keep: { last: "", daily: "", weekly: "", monthly: "" },
     enabled: true,
+    replicateRemote: "",
+    replicatePool: "",
   };
 }
 
@@ -102,6 +108,8 @@ export function formOf(job: BackupJob): JobForm {
       monthly: String(keep?.monthly ?? 0),
     },
     enabled: job.spec.enabled,
+    replicateRemote: job.spec.replicate?.remote ?? "",
+    replicatePool: job.spec.replicate?.pool ?? "",
   };
 }
 
@@ -117,6 +125,9 @@ export function checkForm(form: JobForm, taken: string[] | null): Record<string,
   }
   if (form.pool === "") {
     found.pool = "backups.errors.pool";
+  }
+  if (form.replicateRemote !== "" && form.replicatePool === "") {
+    found.replicatePool = "backups.errors.pool";
   }
   if (form.target === "names" && parseNames(form.names).length === 0) {
     found.names = "backupJobs.errors.names";
@@ -161,10 +172,17 @@ export function specOf(form: JobForm): Spec {
       monthly: count("monthly"),
     },
     enabled: form.enabled,
+    // 복제하지 않으면 필드를 빼서 보낸다.
+    ...(form.replicateRemote !== "" && {
+      replicate: { remote: form.replicateRemote, pool: form.replicatePool },
+    }),
   };
 }
 
-/** 작업에서 바뀐 필드만(`PATCH` 본문). 일정과 보존 규칙은 통째로 보낸다. 요일은 집합으로 비교한다. */
+/**
+ * 작업에서 바뀐 필드만(`PATCH` 본문). 일정과 보존 규칙은 통째로 보낸다. 요일은 집합으로 비교한다. 복제를
+ * 끄면 `replicate: null`이다(빼면 그대로 둔다).
+ */
 export function patchOf(job: BackupJob, spec: Spec): BackupJobPatch {
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
   const keep = (k: Keep | undefined) => KEEP_UNITS.map((unit) => k?.[unit] ?? 0);
@@ -185,6 +203,10 @@ export function patchOf(job: BackupJob, spec: Spec): BackupJobPatch {
   }
   if (job.spec.enabled !== spec.enabled) {
     patch.enabled = spec.enabled;
+  }
+  const target = (r: Spec["replicate"]) => (r ? [r.remote, r.pool] : null);
+  if (!same(target(job.spec.replicate), target(spec.replicate))) {
+    patch.replicate = spec.replicate ?? null;
   }
   return patch;
 }

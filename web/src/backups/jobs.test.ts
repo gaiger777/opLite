@@ -139,3 +139,30 @@ it("sends only what changed", () => {
     ),
   ).toEqual({});
 });
+
+it("copies backups to a remote only when one is chosen", () => {
+  const form = { ...emptyForm("bk"), name: "nightly", at: "03:00" };
+  expect(specOf(form)).not.toHaveProperty("replicate");
+  const copying = { ...form, replicateRemote: "dr", replicatePool: "dr-bk" };
+  expect(checkForm(copying, [])).toEqual({});
+  expect(specOf(copying).replicate).toEqual({ remote: "dr", pool: "dr-bk" });
+  // 원격을 골랐으면 그 백업 풀도 고른다.
+  expect(checkForm({ ...copying, replicatePool: "" }, []).replicatePool).toBe(
+    "backups.errors.pool",
+  );
+
+  const job = backupJob("nightly", 1, { spec: { replicate: { remote: "dr", pool: "dr-bk" } } });
+  expect(formOf(job)).toMatchObject({ replicateRemote: "dr", replicatePool: "dr-bk" });
+  expect(specOf(formOf(job))).toEqual(job.spec);
+  expect(patchOf(job, specOf(formOf(job)))).toEqual({});
+  expect(patchOf(job, specOf({ ...formOf(job), replicatePool: "other" }))).toEqual({
+    replicate: { remote: "dr", pool: "other" },
+  });
+  // 끄면 null을 보낸다(빼면 그대로 둔다).
+  expect(patchOf(job, specOf({ ...formOf(job), replicateRemote: "" }))).toEqual({
+    replicate: null,
+  });
+  expect(patchOf(backupJob("n", 2), specOf(copying))).toMatchObject({
+    replicate: { remote: "dr", pool: "dr-bk" },
+  });
+});

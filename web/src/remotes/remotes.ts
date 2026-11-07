@@ -1,6 +1,6 @@
 import { currentAuthEpoch, NetworkError, reportUnauthorized, toApiError } from "@/api/client";
 import type { components } from "@/api/schema";
-import type { Task, Vm } from "@/api/types";
+import type { StoragePool, Task, Vm } from "@/api/types";
 
 export type RemoteView = components["schemas"]["RemoteView"];
 
@@ -58,6 +58,15 @@ export async function proxy<T>(
 /** 원격의 VM 목록 */
 export async function remoteVms(remote: string, signal?: AbortSignal): Promise<Vm[]> {
   const list = await proxy<{ items: Vm[] }>(remote, "GET", "/vms", signal);
+  return list.items;
+}
+
+/** 원격의 스토리지 풀 목록(백업 사본을 보낼 백업 풀을 고른다) */
+export async function remoteStoragePools(
+  remote: string,
+  signal?: AbortSignal,
+): Promise<StoragePool[]> {
+  const list = await proxy<{ items: StoragePool[] }>(remote, "GET", "/storage-pools", signal);
   return list.items;
 }
 

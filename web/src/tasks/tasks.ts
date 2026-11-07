@@ -53,6 +53,14 @@ export function settleTasks(list: List<Task>, t: TFunction) {
         pending.delete(id);
         toast.info(t("tasks.gone", { label }), { id });
       }
+    } else if (task.status.state === "succeeded" && task.status.error) {
+      // 성공했지만 남긴 경고가 있다(백업 지우기의 "원격 사본이 남았을 수 있음").
+      pending.delete(id);
+      toast.warning(t("tasks.doneWarning", { label, warning: task.status.error }), {
+        id,
+        duration: Infinity,
+        closeButton: true,
+      });
     } else if (task.status.state === "succeeded") {
       pending.delete(id);
       toast.success(t("tasks.done", { label }), { id });
@@ -79,8 +87,14 @@ export function describeTask(
 ): string {
   const op = task.spec.op;
   const from = op.kind === "vm-ha-recover" ? (nodeName(op.from) ?? op.from) : undefined;
+  const remote = op.kind === "backup-replicate" ? op.remote : undefined;
   // 모르는 작업(새 서버)은 번역 키 대신 종류를 그대로 보여 준다.
-  return t(`tasks.op.${op.kind}`, { target, from, defaultValue: `${op.kind} ${target}` });
+  return t(`tasks.op.${op.kind}`, {
+    target,
+    from,
+    remote,
+    defaultValue: `${op.kind} ${target}`,
+  });
 }
 
 /** `waitForTask`가 기다리는 가장 긴 시간. 볼륨 만들기는 보통 몇 초 안에 끝난다. */

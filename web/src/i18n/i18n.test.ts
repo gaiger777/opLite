@@ -64,7 +64,7 @@ it("translates API error codes and falls back to the server message", async () =
     errorMessage(t, new ApiError(409, "firewall_unsupported", 'node "n1" has no firewall')),
   ).toBe("The node has no firewall (nftables) and cannot run VMs with security groups.");
   expect(errorMessage(t, new ApiError(409, "backup_not_ready", 'backup "b" is not ready'))).toBe(
-    "The backup is not ready. Only finished backups can be restored.",
+    "The backup is not ready. Only finished backups can be restored or copied.",
   );
   expect(errorMessage(t, new ApiError(409, "job_disabled", 'backup job "n" is disabled'))).toBe(
     'The backup job is off. Turn on "Run on schedule" first.',

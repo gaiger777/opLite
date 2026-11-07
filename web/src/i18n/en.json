@@ -44,8 +44,8 @@
     "ha_unsupported": "The node has fencing off and cannot run HA VMs.",
     "firewall_unsupported": "The node has no firewall (nftables) and cannot run VMs with security groups.",
     "security_group_in_use": "A VM interface uses this security group. Remove it from the VM first.",
-    "backup_busy": "A task on this backup (backing up, restoring or deleting) is in progress. Try again when it has finished.",
-    "backup_not_ready": "The backup is not ready. Only finished backups can be restored.",
+    "backup_busy": "A task on this backup (backing up, restoring, copying or deleting) is in progress. Try again when it has finished.",
+    "backup_not_ready": "The backup is not ready. Only finished backups can be restored or copied.",
     "job_running": "The backup job is already running. Wait for the run to finish.",
     "job_disabled": "The backup job is off. Turn on \"Run on schedule\" first.",
     "invalid_ova": "The file is not a usable OVA: {{message}}",
@@ -137,6 +137,7 @@
     "emptyFailed": "No failed tasks.",
     "failedOnly": "Failed only",
     "done": "{{label}}: done",
+    "doneWarning": "{{label}}: done with a warning. {{warning}}",
     "failed": "{{label}}: failed. {{error}}",
     "gone": "{{label}}: result is no longer available",
     "state": {
@@ -163,6 +164,7 @@
       "vm-backup": "Back up {{target}}",
       "backup-delete": "Delete backup {{target}}",
       "backup-restore": "Restore a backup as {{target}}",
+      "backup-replicate": "Copy backup {{target}} to {{remote}}",
       "vm-import": "Import VM {{target}}",
       "vm-import-delete": "Delete import {{target}}",
       "node-update-check": "Check updates on {{target}}",
@@ -369,6 +371,26 @@
     "jobDeleted": "Deleted job",
     "created": "Created",
     "size": "Size",
+    "origin": "From {{cluster}}",
+    "originHint": "Copy of backup {{backup}} on cluster {{cluster}}",
+    "originJobHint": "Copy of backup {{backup}} (job {{job}}) on cluster {{cluster}}",
+    "replicas": "Remote copies",
+    "replicaState": {
+      "copying": "Copying",
+      "ready": "Ready",
+      "failed": "Failed"
+    },
+    "replicaTitle": "{{remote}} / {{pool}}: {{state}}",
+    "replicaError": "{{remote}} / {{pool}}: {{error}}",
+    "replicate": "Copy to remote",
+    "replicateNamed": "Copy {{name}} to a remote cluster",
+    "replicateDescription": "Sends the backup files to a backup pool of a remote cluster. The copy there is an ordinary backup that can be restored on that cluster. Deleting this backup deletes the copy too.",
+    "replicateSubmit": "Copy",
+    "remote": "Remote cluster",
+    "chooseRemote": "Choose a remote cluster",
+    "remotePool": "Backup pool on the remote cluster",
+    "noRemotes": "No remote clusters. Add one on the Remote clusters page.",
+    "noRemotePools": "The remote cluster has no storage pool that stores backups.",
     "empty": "No backups.",
     "phase": {
       "pending": "Creating",
@@ -394,7 +416,7 @@
     "choosePool": "Choose a pool",
     "deleteNamed": "Delete backup {{name}}",
     "deleteTitle": "Delete backup {{name}}?",
-    "deleteDescription": "The backup files are removed from the backup pool. This cannot be undone.",
+    "deleteDescription": "The backup files are removed from the backup pool, and the copies sent to remote clusters are deleted too. This cannot be undone.",
     "op": {
       "create": "Back up {{vm}}",
       "restore": "Restore {{backup}} as {{name}}",
@@ -403,7 +425,8 @@
     "errors": {
       "exists": "A backup with this name already exists.",
       "vmExists": "A VM with this name already exists.",
-      "pool": "Choose a storage pool."
+      "pool": "Choose a storage pool.",
+      "remote": "Choose a remote cluster."
     }
   },
   "backupJobs": {
@@ -471,6 +494,10 @@
       "monthly": "Monthly"
     },
     "enabled": "Run on schedule",
+    "replicate": "Remote copy",
+    "replicateLabel": "Copy to a remote cluster",
+    "noReplicate": "Do not copy",
+    "replicateHint": "Each backup the job makes is copied to this backup pool of the remote cluster. Failed copies are tried again at the next run.",
     "created": "Backup job {{name}} created.",
     "saved": "Backup job {{name}} saved.",
     "deleted": "Backup job {{name}} deleted.",

@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import { BackupsPage } from "@/backups/BackupsPage";
 import { resetTasks } from "@/tasks/tasks";
-import { backup, backupJob, pool, task, vm } from "@/test/fixtures";
+import { backup, backupJob, pool, remote, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -53,6 +53,135 @@ it("shows a backup still being received and does not restore it", async () => {
   expect(row).toHaveTextContent("Receiving");
   expect(within(row).getByRole("button", { name: "Restore web-copy" })).toBeDisabled();
 });
+
+it("shows where a received copy came from and the state of remote copies", async () => {
+  const received = backup("web-copy", web, 3, {
+    spec: {
+      origin: {
+        cluster: "prod",
+        ca_fingerprint: `sha256:${"cd".repeat(32)}`,
+        backup: "019a0f3c-0000-7000-8006-0000000000aa",
+        job: "nightly",
+      },
+    },
+  });
+  const copied = backup("web-2", web, 4, {
+    status: {
+      replicas: [
+        { remote: "dr", pool: "dr-bk", state: "ready", at: 1 },
+        { remote: "dr2", pool: "bk", state: "copying", at: 1 },
+        { remote: "dr3", pool: "bk", state: "failed", error: "remote is down", at: 1 },
+      ],
+    },
+  });
+  mockLists({ vm: [web], backup: [ofWeb, received, copied] });
+  renderPage(<BackupsPage />);
+  const table = await screen.findByRole("table", { name: "Backups" });
+  const headers = within(table).getAllByRole("columnheader");
+  const cell = async (name: string, header: string) =>
+    within((await within(table).findByText(name)).closest("tr")!).getAllByRole("cell")[
+      headers.findIndex((h) => h.textContent === header)
+    ]!;
+  const origin = within(await cell("web-copy", "Name")).getByText("From prod");
+  expect(origin).toHaveAttribute(
+    "title",
+    "Copy of backup 019a0f3c-0000-7000-8006-0000000000aa (job nightly) on cluster prod",
+  );
+  // 툴팁 없이도(화면 읽기) 원본 백업 id와 작업이 읽힌다.
+  expect(within(await cell("web-copy", "Name")).getByText(/^Copy of backup/)).toHaveClass(
+    "sr-only",
+  );
+  expect(await cell("web-1", "Name")).not.toHaveTextContent("From");
+
+  const copies = await cell("web-2", "Remote copies");
+  expect(within(copies).getByText("dr").closest("[title]")).toHaveAttribute(
+    "title",
+    "dr / dr-bk: Ready",
+  );
+  expect(within(copies).getByText("dr2").closest("[title]")).toHaveAttribute(
+    "title",
+    "dr2 / bk: Copying",
+  );
+  expect(within(copies).getByText("dr3").closest("[title]")).toHaveAttribute(
+    "title",
+    "dr3 / bk: Failed. remote is down",
+  );
+  // 원격의 풀과 상태는 화면 읽기에도 읽히고, 실패한 사본의 오류는 글로 보인다.
+  expect(within(copies).getByText("dr / dr-bk: Ready")).toHaveClass("sr-only");
+  expect(within(copies).getByText("dr3 / bk: Failed")).toHaveClass("sr-only");
+  expect(within(copies).getByText("dr3 / bk: remote is down")).toBeVisible();
+  expect(within(copies).queryByText(/dr2 \/ bk: .*down/)).not.toBeInTheDocument();
+  expect(await cell("web-1", "Remote copies")).toHaveTextContent("—");
+});
+
+it("copies a ready backup to a backup pool of a remote cluster", async () => {
+  const notReady = backup("web-0", web, 2, { status: { phase: "pending" } });
+  mockLists({ vm: [web], backup: [ofWeb, notReady] });
+  let body: unknown;
+  server.use(
+    http.get(apiUrl("/remotes"), () =>
+      HttpResponse.json({ revision: 1, items: [remote("dr"), remote("dr2")] }),
+    ),
+    // 원격의 풀은 중계로 읽고 백업 풀만 고른다.
+    http.get(apiUrl("/remotes/dr/api/storage-pools"), () =>
+      HttpResponse.json({
+        revision: 1,
+        items: [pool("local"), pool("dr-bk", { backups: true })],
+      }),
+    ),
+    http.post(apiUrl(`/backups/${ofWeb.id}/actions/replicate`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t1", "backup-replicate", ofWeb.id), { status: 202 });
+    }),
+  );
+  renderPage(<BackupsPage />);
+  expect(
+    await screen.findByRole("button", { name: "Copy web-0 to a remote cluster" }),
+  ).toBeDisabled();
+  await userEvent.click(screen.getByRole("button", { name: "Copy web-1 to a remote cluster" }));
+  const dialog = await screen.findByRole("dialog", { name: "Copy web-1 to a remote cluster" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Copy" }));
+  expect(within(dialog).getByText("Choose a remote cluster.")).toBeVisible();
+  await within(dialog).findByRole("option", { name: "dr2" });
+  await userEvent.selectOptions(within(dialog).getByLabelText("Remote cluster"), "dr");
+  const pools = within(dialog).getByLabelText("Backup pool on the remote cluster");
+  await within(dialog).findByRole("option", { name: "dr-bk" });
+  expect(
+    within(pools)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["Choose a pool", "dr-bk"]);
+  await userEvent.click(within(dialog).getByRole("button", { name: "Copy" }));
+  expect(within(dialog).getByText("Choose a storage pool.")).toBeVisible();
+  await userEvent.selectOptions(pools, "dr-bk");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Copy" }));
+  expect(await screen.findByText("Copy backup web-1 to dr")).toBeInTheDocument();
+  expect(body).toEqual({ remote: "dr", pool: "dr-bk" });
+});
+
+it("explains a remote cluster whose pools cannot be read", async () => {
+  mockLists({ vm: [web], backup: [ofWeb] });
+  server.use(
+    http.get(apiUrl("/remotes"), () => HttpResponse.json({ revision: 1, items: [remote("dr")] })),
+    http.get(apiUrl("/remotes/dr/api/storage-pools"), () =>
+      HttpResponse.json(
+        { code: "remote_unreachable", message: "connection refused" },
+        { status: 502 },
+      ),
+    ),
+  );
+  renderPage(<BackupsPage />);
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Copy web-1 to a remote cluster" }),
+  );
+  const dialog = await screen.findByRole("dialog", { name: "Copy web-1 to a remote cluster" });
+  await within(dialog).findByRole("option", { name: "dr" });
+  await userEvent.selectOptions(within(dialog).getByLabelText("Remote cluster"), "dr");
+  // 서버 오류라 두 번 더 읽어 본 뒤(1초·2초 뒤) 보인다.
+  expect(await within(dialog).findByRole("alert", {}, { timeout: 6000 })).toHaveTextContent(
+    "Cannot reach the remote cluster (connection refused).",
+  );
+}, 10_000);
 
 it("restores a backup as a new VM", async () => {
   mockLists({ vm: [web], backup: [ofGone], "storage-pool": [pool("local"), pool("fast")] });
@@ -114,7 +243,7 @@ it("explains a backup that is busy", async () => {
   const dialog = await screen.findByRole("alertdialog", { name: "Delete backup web-1?" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "A task on this backup (backing up, restoring or deleting) is in progress.",
+    "A task on this backup (backing up, restoring, copying or deleting) is in progress.",
   );
 });
 
@@ -123,4 +252,14 @@ it("lets operators restore and delete", async () => {
   renderPage(<BackupsPage />, { as: { ...ADMIN, role: "operator" } });
   expect(await screen.findByRole("button", { name: "Restore web-1" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Delete backup web-1" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Copy web-1 to a remote cluster" })).toBeEnabled();
+});
+
+it("does not let viewers copy backups", async () => {
+  mockLists({ vm: [web], backup: [ofWeb] });
+  renderPage(<BackupsPage />, { as: { ...ADMIN, role: "viewer" } });
+  expect(await screen.findByText("web-1")).toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Copy web-1 to a remote cluster" }),
+  ).not.toBeInTheDocument();
 });

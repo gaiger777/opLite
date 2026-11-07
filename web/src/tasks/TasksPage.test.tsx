@@ -86,6 +86,15 @@ it("names backup tasks by the backup and the VM being restored", async () => {
         },
         status: { state: "running", error: null },
       },
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000004",
+        spec: {
+          op: { kind: "backup-replicate", remote: "dr", pool: "bk" },
+          target: backup,
+          node: "n1",
+        },
+        status: { state: "running", error: null },
+      },
     ],
   });
   renderPage(<TasksPage />);
@@ -95,6 +104,7 @@ it("names backup tasks by the backup and the VM being restored", async () => {
   );
   expect(await screen.findByText("Delete backup web-1")).toBeInTheDocument();
   expect(screen.getByText("Restore a backup as web2")).toBeInTheDocument();
+  expect(screen.getByText("Copy backup web-1 to dr")).toBeInTheDocument();
 });
 
 it("names import tasks by the new VM and the import", async () => {

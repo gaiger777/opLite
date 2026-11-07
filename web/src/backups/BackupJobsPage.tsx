@@ -21,6 +21,7 @@ import {
   specOf,
   WEEKDAYS,
 } from "@/backups/jobs";
+import { RemoteTargetFields } from "@/backups/RemoteTargetFields";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -97,6 +98,7 @@ export function BackupJobsPage() {
             <TableHead>{t("backups.pool")}</TableHead>
             <TableHead>{t("backupJobs.schedule")}</TableHead>
             <TableHead>{t("backupJobs.keep")}</TableHead>
+            <TableHead>{t("backupJobs.replicate")}</TableHead>
             <TableHead>{t("common.state")}</TableHead>
             <TableHead>{t("backupJobs.nextRun")}</TableHead>
             <TableHead>{t("backupJobs.lastRun")}</TableHead>
@@ -109,10 +111,10 @@ export function BackupJobsPage() {
         </TableHeader>
         <TableBody>
           {list.length === 0 && (
-            <TableMessage colSpan={write ? 9 : 8} query={jobs} empty={t("backupJobs.empty")} />
+            <TableMessage colSpan={write ? 10 : 9} query={jobs} empty={t("backupJobs.empty")} />
           )}
           {list.map((job) => {
-            const { vms, schedule, enabled } = job.spec;
+            const { vms, schedule, enabled, replicate } = job.spec;
             const { run: running, last_run: last, next_run: next, errors } = job.status;
             const days = schedule.days ?? [];
             const keep = keepParts(job.spec.keep);
@@ -144,6 +146,7 @@ export function BackupJobsPage() {
                     ? t("backupJobs.keepAll")
                     : keep.map(([unit, n]) => t(`backupJobs.keepUnit.${unit}`, { n })).join(", ")}
                 </TableCell>
+                <TableCell>{replicate ? `${replicate.remote} / ${replicate.pool}` : "—"}</TableCell>
                 <TableCell>
                   {running ? (
                     <>
@@ -441,6 +444,17 @@ function JobDialog({
           <p className="text-xs text-muted-foreground">{t("backupJobs.retentionHint")}</p>
         )}
       </fieldset>
+      <RemoteTargetFields
+        id="job-replicate"
+        label={t("backupJobs.replicateLabel")}
+        none={t("backupJobs.noReplicate")}
+        hint={t("backupJobs.replicateHint")}
+        value={{ remote: form.replicateRemote, pool: form.replicatePool }}
+        errors={{ pool: errors.replicatePool }}
+        onChange={(target) =>
+          change({ replicateRemote: target.remote, replicatePool: target.pool })
+        }
+      />
       <div className="flex items-center gap-2">
         <Checkbox
           id="job-enabled"
