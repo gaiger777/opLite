@@ -587,7 +587,7 @@ fn decode_entities(text: &str) -> String {
 }
 
 /// `%XX`를 푼다(대소문자 무시). 잘못된 것은 그대로 두고, UTF-8이 아니면 손실 변환한다.
-fn percent_decode(text: &str) -> String {
+pub(crate) fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

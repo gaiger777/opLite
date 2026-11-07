@@ -2,9 +2,8 @@
 //! 않는다(노드 인증서의 이름은 노드마다 다르다). CA는 등록할 때 받아 지문을 확인하고 저장한 인증서
 //! 하나다. 요청마다 새 연결을 연다(HTTP/1.1). 리다이렉트는 따르지 않는다(3xx는 그대로 응답).
 
-use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -13,7 +12,7 @@ use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{ACCEPT, AUTHORIZATION, HOST, HeaderMap, HeaderValue};
 use hyper::{Method, Request, Response, Uri};
 use hyper_util::rt::TokioIo;
-use opl_types::remote::{Remote, normalize_url};
+use opl_types::remote::normalize_url;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
@@ -27,7 +26,6 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, Sleep};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
-use uuid::Uuid;
 
 /// TCP 연결과 TLS 핸드셰이크의 시간 제한
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -221,50 +219,6 @@ impl RemoteClient {
 
 /// [`RemoteClient::request`] 응답의 본문(조각 사이 60초 제한)
 pub type RemoteBody = IdleTimeout<Incoming>;
-
-/// 원격마다 받은 CA PEM을 노드 메모리에 둔다. 원격의 revision이 바뀌면 다시 받는다. 지문이 맞는
-/// 것만 둔다.
-#[derive(Default)]
-pub struct CaCache {
-    inner: Mutex<HashMap<Uuid, (u64, String)>>,
-}
-
-impl CaCache {
-    /// 원격의 CA PEM. 없으면 [`fetch_ca`]로 받고 저장한 지문과 비교한다(다르면 [`RemoteError::Tls`]).
-    pub async fn ca_pem(&self, remote: &Remote) -> Result<String, RemoteError> {
-        if let Some(pem) = self.cached(remote) {
-            return Ok(pem);
-        }
-        let pem = fetch_ca(&remote.spec.url).await?;
-        let actual = opl_peer::pki::fingerprint(&pem).map_err(invalid)?;
-        if actual != remote.spec.ca_fingerprint {
-            return Err(RemoteError::Tls(format!(
-                "the remote CA fingerprint is {actual}, expected {}",
-                remote.spec.ca_fingerprint
-            )));
-        }
-        self.lock()
-            .insert(remote.id, (remote.revision, pem.clone()));
-        Ok(pem)
-    }
-
-    /// 확인한 CA로 만든 원격의 클라이언트
-    pub async fn client(&self, remote: &Remote) -> Result<RemoteClient, RemoteError> {
-        let pem = self.ca_pem(remote).await?;
-        RemoteClient::new(&remote.spec.url, &pem, &remote.spec.token)
-    }
-
-    fn cached(&self, remote: &Remote) -> Option<String> {
-        match self.lock().get(&remote.id) {
-            Some((revision, pem)) if *revision == remote.revision => Some(pem.clone()),
-            _ => None,
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, (u64, String)>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
 
 /// 연결할 곳
 struct Target {

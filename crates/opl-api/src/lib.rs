@@ -20,6 +20,7 @@ pub mod oidc;
 mod oidc_login;
 pub mod realms;
 pub mod remote_client;
+mod remote_proxy;
 mod remotes;
 pub mod resources;
 mod schedule;
@@ -116,6 +117,11 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             remotes::delete_remote
         ))
         .routes(routes!(remotes::refresh_remote))
+        // 모든 메서드를 받는 중계는 API 문서에 넣지 않는다.
+        .route(
+            "/remotes/{key}/api/{*path}",
+            axum::routing::any(remote_proxy::proxy),
+        )
         .routes(routes!(r::list_nodes))
         .routes(routes!(r::get_node, r::update_node, cluster::delete_node))
         .routes(routes!(updates::refresh_updates))

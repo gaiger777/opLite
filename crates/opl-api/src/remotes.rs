@@ -93,7 +93,7 @@ impl From<Remote> for RemoteView {
     }
 }
 
-fn remote_unreachable(e: impl std::fmt::Display) -> ApiError {
+pub(crate) fn remote_unreachable(e: impl std::fmt::Display) -> ApiError {
     ApiError::new(StatusCode::BAD_GATEWAY, "remote_unreachable", e.to_string())
 }
 

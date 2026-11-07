@@ -1,5 +1,5 @@
 //! 원격 클러스터 클라이언트: CA 하나만 믿고 이름은 보지 않는 TLS, 검증 없는 CA 받기, 본문 한도,
-//! 리다이렉트 안 따름, 시간 제한, 흘려 보내기, CA 캐시. 시험 CA가 `node-x` 이름으로 서명한 인증서를
+//! 리다이렉트 안 따름, 시간 제한, 흘려 보내기. 시험 CA가 `node-x` 이름으로 서명한 인증서를
 //! 내는 127.0.0.1 HTTPS 서버를 상대로 한다.
 
 use std::convert::Infallible;
@@ -17,9 +17,8 @@ use futures_util::StreamExt;
 use http_body_util::{BodyExt, Empty, StreamBody};
 use hyper::Method;
 use hyper::body::{Bytes, Frame};
-use opl_api::remote_client::{CaCache, RemoteClient, RemoteError, fetch_ca};
+use opl_api::remote_client::{RemoteClient, RemoteError, fetch_ca};
 use opl_peer::pki::{ClusterCa, NodeTls, fingerprint, node_key_and_csr};
-use opl_types::remote::{Remote, RemoteSpec};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -32,7 +31,6 @@ struct Site {
     ca_body: Arc<Mutex<String>>,
     /// `GET /cluster/ca`의 상태(0이면 200)
     ca_status: Arc<AtomicU16>,
-    ca_hits: Arc<AtomicUsize>,
     info_hits: Arc<AtomicUsize>,
     /// `GET /info`가 받은 헤더
     headers: Arc<Mutex<Vec<HeaderMap>>>,
@@ -89,7 +87,6 @@ async fn start() -> Server {
 }
 
 async fn ca_pem(State(site): State<Site>) -> Response {
-    site.ca_hits.fetch_add(1, Ordering::SeqCst);
     let status = match site.ca_status.load(Ordering::SeqCst) {
         0 => StatusCode::OK,
         code => StatusCode::from_u16(code).unwrap(),
@@ -403,49 +400,4 @@ async fn stalled_servers_time_out() {
         (Duration::from_secs(9)..Duration::from_secs(30)).contains(&elapsed),
         "{elapsed:?}"
     );
-}
-
-fn remote(server: &Server, ca_fingerprint: String) -> Remote {
-    let mut r = Remote::new(
-        "dr",
-        RemoteSpec {
-            url: server.url.clone(),
-            ca_fingerprint,
-            token: TOKEN.into(),
-            ca_pem: server.ca_pem.clone(),
-        },
-    );
-    r.revision = 7;
-    r
-}
-
-#[tokio::test]
-async fn ca_cache_keeps_a_matching_ca_per_revision() {
-    let server = start().await;
-    let cache = CaCache::default();
-    let mut r = remote(&server, fingerprint(&server.ca_pem).unwrap());
-
-    for _ in 0..2 {
-        let client = cache.client(&r).await.unwrap();
-        let _: Value = client.get_json("/info").await.unwrap();
-    }
-    assert_eq!(server.site.ca_hits.load(Ordering::SeqCst), 1);
-
-    // revision이 바뀌면 다시 받는다.
-    r.revision = 8;
-    assert_eq!(cache.ca_pem(&r).await.unwrap(), server.ca_pem);
-    assert_eq!(server.site.ca_hits.load(Ordering::SeqCst), 2);
-
-    // 지문이 다르면 쓰지 않고 두지도 않는다.
-    let other = ClusterCa::generate("other").unwrap();
-    let mut wrong = remote(&server, fingerprint(&other.cert_pem).unwrap());
-    wrong.id = uuid::Uuid::now_v7();
-    for _ in 0..2 {
-        let err = cache.client(&wrong).await.unwrap_err();
-        assert!(
-            matches!(&err, RemoteError::Tls(m) if m.contains("fingerprint")),
-            "{err:?}"
-        );
-    }
-    assert_eq!(server.site.ca_hits.load(Ordering::SeqCst), 4);
 }

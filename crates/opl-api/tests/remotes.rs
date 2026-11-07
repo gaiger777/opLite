@@ -1,21 +1,24 @@
 //! 원격 클러스터 API: 원격 역할을 하는 두 번째 `Env`(그 클러스터 CA가 서명한 인증서로 HTTPS 서비스)를
 //! 등록하고 상태를 모으는지, 등록 확인 순서와 오류 코드(지문 틀림·자기 자신·토큰 틀림·꺼진 원격),
 //! 토큰을 내보내지 않음과 PUT의 token 규칙, 권한, 옛 노드 409, `probe`, `refresh`, 상태 수집(바뀔 때만
-//! 쓰기, 원격이 꺼지면 reachable false).
+//! 쓰기, 원격이 꺼지면 reachable false), 중계(`/remotes/{key}/api/{*path}` — 읽기와 VM 동작, 권한,
+//! 원격 쪽 권한, 막힌 경로, 꺼진 원격 502, 감사).
 
 mod common;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Env, TlsServer, vm_request};
+use common::{Env, TlsServer, WAIT, vm_request};
 use opl_api::{RemotePoller, RemotePollerConfig};
+use opl_types::audit::{AuditEntry, AuditQuery, AuditTarget};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::remote::{RemoteSpec, token_id};
 use opl_types::resource::Resource;
 use opl_types::version::BUILD;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn assert_error(got: &(StatusCode, Value), status: StatusCode, code: &str) {
     assert_eq!(got.0, status, "{}", got.1);
@@ -642,4 +645,380 @@ async fn until(why: &str, mut done: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {why}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// 원격 `dr`(admin 토큰)을 등록한 이 클러스터와 그 admin, 원격
+async fn registered() -> (Env, common::Client, Remote) {
+    let local = Env::start().await;
+    let admin = local.admin().await;
+    let r = remote().await;
+    let (status, created) = admin.post("/remotes", body("dr", &r)).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    (local, admin, r)
+}
+
+/// 중계는 원격의 API를 저장한 토큰으로 부르고 상태·본문·쿼리를 그대로 옮긴다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_proxy_reads_and_changes_the_remote() {
+    let (local, admin, r) = registered().await;
+    let remote_admin = r.env.admin().await;
+    let (status, vm) = remote_admin.post("/vms", vm_request("web")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+
+    let (status, vms) = admin.get("/remotes/dr/api/vms").await;
+    assert_eq!(status, StatusCode::OK, "{vms}");
+    let names: Vec<&str> = vms["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["web"]);
+    let resp = admin
+        .http
+        .get(format!("{}/api/v1/remotes/dr/api/vms/web", local.base))
+        .bearer_auth(admin.token.as_ref().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    assert!(resp.headers().get("set-cookie").is_none());
+
+    // 쿼리와 원격의 오류가 그대로 온다.
+    let got = admin
+        .post(
+            "/remotes/dr/api/vms/web/actions/start?mode=force",
+            Value::Null,
+        )
+        .await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    assert!(
+        got.1["message"].as_str().unwrap().contains("mode=force"),
+        "{}",
+        got.1
+    );
+    assert_error(
+        &admin.get("/remotes/dr/api/vms/nope").await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+
+    // VM 동작은 원격에서 실제로 바뀐다.
+    let (status, task) = admin
+        .post("/remotes/dr/api/vms/web/actions/start", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = remote_admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(
+        remote_admin.get("/vms/web").await.1["spec"]["power"],
+        "running"
+    );
+
+    // 원격은 저장한 토큰의 주인으로 본다.
+    let (status, me) = admin.get("/remotes/dr/api/auth/whoami").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["name"], "admin");
+    assert_error(
+        &admin.get("/remotes/nope/api/vms").await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+}
+
+/// GET은 누구나, 그 밖은 admin만. 원격 쪽 권한은 토큰 주인의 역할이 다시 정한다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxied_changes_need_an_admin_here_and_the_token_role_there() {
+    let (local, admin, r) = registered().await;
+    let remote_admin = r.env.admin().await;
+    assert_eq!(
+        remote_admin.post("/vms", vm_request("web")).await.0,
+        StatusCode::CREATED
+    );
+    for role in ["operator", "viewer"] {
+        let client = local.user(role, role).await;
+        let (status, vms) = client.get("/remotes/dr/api/vms").await;
+        assert_eq!(status, StatusCode::OK, "{vms}");
+        for got in [
+            client
+                .post("/remotes/dr/api/vms/web/actions/start", Value::Null)
+                .await,
+            client.delete("/remotes/dr/api/vms/web").await,
+        ] {
+            assert_error(&got, StatusCode::FORBIDDEN, "forbidden");
+        }
+    }
+    assert_eq!(
+        remote_admin.get("/vms/web").await.1["spec"]["power"],
+        "stopped"
+    );
+
+    // 원격의 viewer 토큰으로 등록하면 원격이 403을 돌려준다.
+    let reader = r.env.user("reader", "viewer").await.token.unwrap();
+    let mut req = body("dr-view", &r);
+    req["token"] = json!(reader);
+    assert_eq!(admin.post("/remotes", req).await.0, StatusCode::CREATED);
+    let (status, me) = admin.get("/remotes/dr-view/api/auth/whoami").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["name"], "reader");
+    assert_error(
+        &admin
+            .post("/remotes/dr-view/api/vms/web/actions/start", Value::Null)
+            .await,
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    );
+    assert_eq!(
+        remote_admin.get("/vms/web").await.1["spec"]["power"],
+        "stopped"
+    );
+}
+
+/// 요청줄을 그대로 보낸다(reqwest는 `.`·`..` 조각을 정리해 버린다). 상태와 본문.
+async fn raw_get(env: &Env, token: &str, path: &str) -> (u16, Value) {
+    let addr = env.base.trim_start_matches("http://");
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET /api/v1{path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    tcp.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    tcp.read_to_string(&mut response).await.unwrap();
+    let status = response[9..12].parse().unwrap();
+    let body = response.split_once("\r\n\r\n").unwrap().1;
+    (status, serde_json::from_str(body).unwrap_or(Value::Null))
+}
+
+/// `.`·`..`·빈 조각은 400, watch와 콘솔은 404 `remote_path_unsupported`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_proxy_refuses_dot_empty_watch_and_console_paths() {
+    let (local, admin, _r) = registered().await;
+    let token = admin.token.clone().unwrap();
+    for bad in [
+        "vms/../nodes",
+        "vms/%2e%2E/nodes",
+        "./vms",
+        "%2E",
+        "vms//web",
+        "vms/",
+    ] {
+        let (status, got) = raw_get(&local, &token, &format!("/remotes/dr/api/{bad}")).await;
+        assert_eq!(status, 400, "{bad}: {got}");
+        assert_eq!(got["code"], "invalid_request", "{bad}: {got}");
+    }
+    for unsupported in ["watch", "watch?kinds=vm", "%77atch", "vms/web/console"] {
+        let (status, got) =
+            raw_get(&local, &token, &format!("/remotes/dr/api/{unsupported}")).await;
+        assert_eq!(status, 404, "{unsupported}: {got}");
+        assert_eq!(
+            got["code"], "remote_path_unsupported",
+            "{unsupported}: {got}"
+        );
+    }
+    // 이름에 점이 든 조각은 막지 않는다.
+    let (status, got) = raw_get(&local, &token, "/remotes/dr/api/vms/a.b").await;
+    assert_eq!(status, 404, "{got}");
+    assert_eq!(got["code"], "not_found", "{got}");
+}
+
+/// 원격에 닿지 못하면 502 `remote_unreachable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_proxy_answers_502_when_the_remote_is_down() {
+    let (_local, admin, r) = registered().await;
+    let Remote { env, server, .. } = r;
+    drop(server);
+    for got in [
+        admin.get("/remotes/dr/api/vms").await,
+        admin
+            .post("/remotes/dr/api/vms/web/actions/start", Value::Null)
+            .await,
+    ] {
+        assert_error(&got, StatusCode::BAD_GATEWAY, "remote_unreachable");
+    }
+    drop(env);
+}
+
+/// 중계한 바꾸는 요청은 이 클러스터의 감사 로그에 원격 이름과 경로가 남는다(읽기는 남지 않는다).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxied_changes_are_audited_here() {
+    let (local, admin, r) = registered().await;
+    let remote_admin = r.env.admin().await;
+    assert_eq!(
+        remote_admin.post("/vms", vm_request("web")).await.0,
+        StatusCode::CREATED
+    );
+    assert_eq!(admin.get("/remotes/dr/api/vms").await.0, StatusCode::OK);
+    assert_eq!(
+        admin
+            .post("/remotes/dr/api/vms/web/actions/start", Value::Null)
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    let action = "POST /remotes/{key}/api/{*path}";
+    let start = Instant::now();
+    let entries = loop {
+        let entries: Vec<AuditEntry> = local
+            .state
+            .audit
+            .read(AuditQuery {
+                since: 0,
+                until: u64::MAX,
+                user: None,
+                action: None,
+                limit: 1000,
+            })
+            .await
+            .unwrap();
+        if entries.iter().any(|e| e.action == action) {
+            break entries;
+        }
+        assert!(start.elapsed() < WAIT, "audit entries: {entries:#?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let entry = entries.iter().find(|e| e.action == action).unwrap();
+    assert_eq!(entry.status, 202);
+    assert_eq!(entry.user.as_deref(), Some("admin"));
+    assert_eq!(entry.path, "/remotes/dr/api/vms/web/actions/start");
+    assert_eq!(
+        entry.target,
+        Some(AuditTarget {
+            kind: "remotes".into(),
+            key: "dr".into(),
+        })
+    );
+    assert_eq!(
+        entry.detail.as_deref(),
+        Some("remote=dr POST /vms/web/actions/start")
+    );
+    assert!(
+        !entries.iter().any(|e| e.action.starts_with("GET ")),
+        "{entries:#?}"
+    );
+}
+
+/// 이 클러스터의 admin이 아니면 중계로 읽을 수 있는 것은 허용 목록의 자원과 `auth/whoami`뿐이다(원격
+/// 토큰이 읽을 수 있더라도 사용자·토큰·감사 따위와 원격의 원격은 읽지 못한다).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_admins_read_only_listed_remote_resources() {
+    let (local, admin, _r) = registered().await;
+    let viewer = local.user("viewer", "viewer").await;
+    for path in ["vms", "nodes", "cluster", "version", "auth/whoami"] {
+        let (status, got) = viewer.get(&format!("/remotes/dr/api/{path}")).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {got}");
+    }
+    for path in [
+        "users",
+        "tokens",
+        "realms",
+        "audit",
+        "telemetry",
+        "remotes",
+        "remotes/dr/api/vms",
+        "auth/sessions",
+        "unknown",
+    ] {
+        let got = viewer.get(&format!("/remotes/dr/api/{path}")).await;
+        assert_error(&got, StatusCode::FORBIDDEN, "forbidden");
+    }
+    // 첫 조각은 디코딩해서 본다.
+    let (status, got) = raw_get(
+        &local,
+        viewer.token.as_ref().unwrap(),
+        "/remotes/dr/api/%75sers",
+    )
+    .await;
+    assert_eq!(status, 403, "{got}");
+    // HEAD도 GET과 같다.
+    for (path, status) in [("users", StatusCode::FORBIDDEN), ("vms", StatusCode::OK)] {
+        let resp = viewer
+            .http
+            .head(format!("{}/api/v1/remotes/dr/api/{path}", local.base))
+            .bearer_auth(viewer.token.as_ref().unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), status, "HEAD {path}");
+    }
+    // admin은 원격 토큰이 허락하는 것을 모두 읽는다.
+    for path in ["users", "remotes"] {
+        let (status, got) = admin.get(&format!("/remotes/dr/api/{path}")).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {got}");
+    }
+}
+
+/// 원격이 저장한 토큰을 거절하면(401) 이 클러스터의 로그인 문제로 보이지 않게 502 `remote_unauthorized`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_remote_token_is_a_502() {
+    let (_local, admin, r) = registered().await;
+    let remote_admin = r.env.admin().await;
+    let id = token_id(&r.token).unwrap();
+    let (status, got) = remote_admin.delete(&format!("/tokens/{id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{got}");
+    for got in [
+        admin.get("/remotes/dr/api/vms").await,
+        admin
+            .post("/remotes/dr/api/vms/web/actions/start", Value::Null)
+            .await,
+    ] {
+        assert_error(&got, StatusCode::BAD_GATEWAY, "remote_unauthorized");
+        assert!(
+            got.1["message"]
+                .as_str()
+                .unwrap()
+                .contains("oplctl remote set --token-file"),
+            "{}",
+            got.1
+        );
+    }
+}
+
+/// 중계한 응답은 브라우저가 이 클러스터의 페이지로 실행하지 못하게 한다: JSON이 아니면
+/// `application/octet-stream`, 늘 `nosniff`와 막는 CSP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxied_responses_cannot_run_in_the_browser() {
+    let (local, admin, r) = registered().await;
+    for (path, content_type) in [
+        ("vms", "application/json"),
+        ("cluster/ca", "application/octet-stream"),
+        ("vms/nope", "application/json"),
+    ] {
+        let resp = admin
+            .http
+            .get(format!("{}/api/v1/remotes/dr/api/{path}", local.base))
+            .bearer_auth(admin.token.as_ref().unwrap())
+            .send()
+            .await
+            .unwrap();
+        let headers = resp.headers();
+        assert_eq!(headers["content-type"], content_type, "{path}");
+        assert_eq!(headers["x-content-type-options"], "nosniff", "{path}");
+        assert_eq!(
+            headers["content-security-policy"], "default-src 'none'; sandbox",
+            "{path}"
+        );
+    }
+    let resp = admin
+        .http
+        .get(format!("{}/api/v1/remotes/dr/api/cluster/ca", local.base))
+        .bearer_auth(admin.token.as_ref().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.text().await.unwrap(), r.env.ca_pem());
+}
+
+/// 중계와 상태 모으기는 등록 때 확인해 저장한 CA를 쓴다(노드 메모리에 캐시가 없어도 CA를 다시 받지
+/// 않는다 — 재시작한 노드도 같다).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_proxy_uses_the_stored_ca() {
+    let (_local, admin, r) = registered().await;
+    assert_eq!(hits(&r.server), 1);
+    for _ in 0..2 {
+        assert_eq!(admin.get("/remotes/dr/api/vms").await.0, StatusCode::OK);
+    }
+    let (status, got) = admin.post("/remotes/dr/actions/refresh", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(hits(&r.server), 1);
 }
