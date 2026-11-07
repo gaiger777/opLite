@@ -123,6 +123,12 @@ enum Cmd {
     },
     /// 감사 로그(admin만): 모든 노드의 바꾸는 요청·로그인·콘솔 열기를 새 것부터
     Audit(AuditArgs),
+    /// 원격 클러스터: 다른 opLite 클러스터를 등록해 상태를 모아 보고, 그 클러스터의 API를 이 클러스터를
+    /// 거쳐 부른다(저장한 그 클러스터의 API 토큰으로).
+    Remote {
+        #[command(subcommand)]
+        cmd: RemoteCmd,
+    },
 }
 
 #[derive(Args)]
@@ -1733,6 +1739,317 @@ async fn telemetry(
     Ok(())
 }
 
+#[derive(Subcommand)]
+enum RemoteCmd {
+    /// 원격 클러스터들과 마지막으로 모은 상태(이름, 클러스터, 버전, 노드 online/total, VM running/total)
+    List,
+    /// 원격 하나의 설정과 상태를 보인다(토큰은 id만).
+    Show { name: String },
+    /// 원격을 등록한다(admin). 서버가 그 클러스터에 연결해 CA 지문과 토큰을 확인한다.
+    Add(RemoteAdd),
+    /// 원격을 바꾼다(admin). 준 것만 바꾼다. 주소나 지문을 바꾸면 토큰도 다시 준다.
+    Set(RemoteSet),
+    /// 원격을 지운다(admin). 원격 클러스터의 토큰은 그대로 남는다.
+    Remove { name: String },
+    /// 원격 상태를 곧 다시 모아 보인다(admin).
+    Refresh { name: String },
+    /// 원격 클러스터의 VM 목록(이 클러스터를 거쳐 읽는다)
+    Vms { name: String },
+    /// 원격 클러스터의 VM을 시작하거나(start) 정지한다(stop — 로컬 `vm stop`처럼 ACPI, `--force`면
+    /// 곧바로 끄기). 원격 쪽 권한은 토큰 주인의 역할이 정한다. Task를 기다리지 않는다.
+    Vm {
+        name: String,
+        #[arg(value_enum)]
+        action: RemoteVmAction,
+        vm: String,
+        /// stop에서 ACPI 응답을 기다리지 않고 곧바로 끈다.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Args)]
+struct RemoteAdd {
+    name: String,
+    /// 원격 클러스터 노드의 API 주소(`https://<호스트>[:포트]`)
+    #[arg(long)]
+    url: String,
+    /// 원격 클러스터 CA의 지문(`sha256:...`, 원격 노드의 `oplctl cluster status`). 없으면 CA를 받아
+    /// 지문을 보이고 확인을 묻는다.
+    #[arg(long)]
+    ca_fingerprint: Option<String>,
+    /// 원격 클러스터에서 만든 API 토큰이 든 파일(`-`면 표준 입력 — 그때는 확인을 물을 수 없으므로
+    /// `--ca-fingerprint`나 `--yes`가 필요하다)
+    #[arg(long)]
+    token_file: PathBuf,
+    /// 받은 CA 지문을 묻지 않고 믿는다.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct RemoteSet {
+    name: String,
+    #[arg(long)]
+    url: Option<String>,
+    #[arg(long)]
+    ca_fingerprint: Option<String>,
+    /// 새 API 토큰이 든 파일(`-`면 표준 입력). 주지 않으면 저장된 토큰을 그대로 둔다.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RemoteVmAction {
+    Start,
+    Stop,
+}
+
+/// 원격 VM 동작이 부르는 원격 API의 동작(`/vms/<VM>/actions/<동작>`)과 보일 이름
+fn remote_vm_action(
+    action: RemoteVmAction,
+    force: bool,
+) -> anyhow::Result<(&'static str, &'static str)> {
+    Ok(match (action, force) {
+        (RemoteVmAction::Start, false) => ("start", "start"),
+        (RemoteVmAction::Start, true) => bail!("--force is only for stop"),
+        (RemoteVmAction::Stop, false) => ("stop", "stop"),
+        (RemoteVmAction::Stop, true) => ("stop?mode=force", "force stop"),
+    })
+}
+
+/// 토큰 파일(`-`면 표준 입력)의 토큰. 앞뒤 공백을 뗀다.
+fn read_remote_token(file: &PathBuf) -> anyhow::Result<String> {
+    let token = read_secret_file(file)?.trim().to_string();
+    if token.is_empty() {
+        bail!("the token file is empty");
+    }
+    Ok(token)
+}
+
+/// 받은 CA 지문을 보이고 확인을 받는다. `--yes`면 묻지 않고, 터미널이 아니면 묻지 못하므로
+/// `--ca-fingerprint`로 다시 실행하게 한다.
+fn confirm_fingerprint(
+    actual: &str,
+    yes: bool,
+    terminal: bool,
+    input: &mut dyn std::io::BufRead,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    writeln!(out, "the remote cluster CA fingerprint is {actual}")?;
+    if yes {
+        return Ok(());
+    }
+    if !terminal {
+        bail!(
+            "check the fingerprint (`oplctl cluster status` on a node of the remote cluster) and \
+             run again with --ca-fingerprint {actual}"
+        );
+    }
+    write!(out, "Is this the CA of the remote cluster? [y/N] ")?;
+    out.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        bail!("cancelled");
+    }
+    Ok(())
+}
+
+/// `<a>/<b>` 모양의 수(`online/total` 등). 모르면 `-`.
+fn remote_counts(v: &Value, part: &str) -> String {
+    if v.is_null() {
+        return "-".into();
+    }
+    format!("{}/{}", cell(&v[part]), cell(&v["total"]))
+}
+
+/// 원격의 상태 칸: 닿으면 `reachable`, 아니면 `unreachable: <이유>`
+fn remote_state(status: &Value) -> String {
+    if status["reachable"] == true {
+        "reachable".into()
+    } else {
+        format!("unreachable: {}", cell(&status["error"]))
+    }
+}
+
+/// `remote list`의 열
+const REMOTE_HEADERS: &[&str] = &["NAME", "CLUSTER", "VERSION", "NODES", "VMS", "STATUS"];
+
+/// `remote list`의 한 행
+fn remote_row(r: &Value) -> Vec<String> {
+    let s = &r["status"];
+    vec![
+        cell(&r["name"]),
+        cell(&s["cluster_name"]),
+        cell(&s["version"]),
+        remote_counts(&s["nodes"], "online"),
+        remote_counts(&s["vms"], "running"),
+        remote_state(s),
+    ]
+}
+
+/// `remote show`의 `키: 값` 줄
+fn remote_lines(r: &Value) -> Vec<String> {
+    let s = &r["status"];
+    let checked = match s["checked_at"].as_i64() {
+        Some(at) => unix_time(at),
+        None => "never".into(),
+    };
+    let memory = match s["memory_gib"].as_u64() {
+        Some(gib) => format!("{gib} GiB"),
+        None => "-".into(),
+    };
+    vec![
+        format!("name: {}", cell(&r["name"])),
+        format!("url: {}", cell(&r["url"])),
+        format!("ca fingerprint: {}", cell(&r["ca_fingerprint"])),
+        format!("token id: {}", cell(&r["token_id"])),
+        format!("status: {}", remote_state(s)),
+        format!("changed at: {checked}"),
+        format!("cluster: {}", cell(&s["cluster_name"])),
+        format!("version: {}", cell(&s["version"])),
+        format!("nodes online: {}", remote_counts(&s["nodes"], "online")),
+        format!("vms running: {}", remote_counts(&s["vms"], "running")),
+        format!("cpus: {}", cell(&s["cpus"])),
+        format!("memory: {memory}"),
+    ]
+}
+
+/// `remote set`의 본문: 지금 원격에 준 것만 바꾼다. 토큰을 주지 않으면 빼서 저장된 토큰을 둔다.
+fn remote_set_body(current: &Value, args: &RemoteSet, token: Option<String>) -> Value {
+    let mut body = json!({
+        "url": args.url.as_deref().map_or_else(|| current["url"].clone(), |u| json!(u)),
+        "ca_fingerprint": args
+            .ca_fingerprint
+            .as_deref()
+            .map_or_else(|| current["ca_fingerprint"].clone(), |f| json!(f)),
+    });
+    if let Some(token) = token {
+        body["token"] = json!(token);
+    }
+    body
+}
+
+async fn remote(
+    client: &Client,
+    cmd: RemoteCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let show = |out: &mut (dyn Write + Send), r: &Value| -> anyhow::Result<()> {
+        if json_out {
+            print_json(out, r)?;
+        } else {
+            for line in remote_lines(r) {
+                writeln!(out, "{line}")?;
+            }
+        }
+        Ok(())
+    };
+    match cmd {
+        RemoteCmd::List => {
+            let list = client.get("/remotes").await?;
+            print_list(out, json_out, &list, REMOTE_HEADERS, remote_row)?;
+        }
+        RemoteCmd::Show { name } => {
+            show(out, &client.get(&format!("/remotes/{}", seg(&name))).await?)?
+        }
+        RemoteCmd::Add(args) => {
+            // 표준 입력은 토큰을 읽느라 다 썼으므로 지문 확인을 물을 수 없다.
+            if args.token_file.as_os_str() == "-" && args.ca_fingerprint.is_none() && !args.yes {
+                bail!("reading the token from stdin needs --ca-fingerprint or --yes");
+            }
+            let token = read_remote_token(&args.token_file)?;
+            let fingerprint = match args.ca_fingerprint {
+                Some(f) => f,
+                None => {
+                    let actual = fingerprint(&fetch_ca(&args.url).await?)?;
+                    use std::io::IsTerminal;
+                    let stdin = std::io::stdin();
+                    let terminal = stdin.is_terminal();
+                    confirm_fingerprint(&actual, args.yes, terminal, &mut stdin.lock(), out)?;
+                    actual
+                }
+            };
+            let body = json!({
+                "name": args.name,
+                "url": args.url,
+                "ca_fingerprint": fingerprint,
+                "token": token,
+            });
+            let created = client.post("/remotes", &body).await?;
+            writeln!(
+                out,
+                "remote {} added ({})",
+                args.name,
+                remote_state(&created["status"])
+            )?;
+        }
+        RemoteCmd::Set(args) => {
+            let token = args
+                .token_file
+                .as_ref()
+                .map(read_remote_token)
+                .transpose()?;
+            let path = format!("/remotes/{}", seg(&args.name));
+            let current = client.get(&path).await?;
+            // 읽은 뒤 다른 곳에서 바뀌었으면 412로 멈춘다.
+            let r = client
+                .request(Method::PUT, &path)
+                .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
+                .json(&remote_set_body(&current, &args, token));
+            client.send(r).await?;
+            writeln!(out, "remote {} updated", args.name)?;
+        }
+        RemoteCmd::Remove { name } => {
+            client.delete(&format!("/remotes/{}", seg(&name))).await?;
+            writeln!(out, "remote {name} removed")?;
+        }
+        RemoteCmd::Refresh { name } => {
+            let r = client
+                .post(
+                    &format!("/remotes/{}/actions/refresh", seg(&name)),
+                    &json!({}),
+                )
+                .await?;
+            show(out, &r)?;
+        }
+        RemoteCmd::Vms { name } => {
+            let list = client
+                .get(&format!("/remotes/{}/api/vms", seg(&name)))
+                .await?;
+            print_list(out, json_out, &list, VM_HEADERS, vm_row)?;
+        }
+        RemoteCmd::Vm {
+            name,
+            action,
+            vm,
+            force,
+        } => {
+            let (action, shown) = remote_vm_action(action, force)?;
+            let task = client
+                .send(client.request(
+                    Method::POST,
+                    // 동작은 이 파일이 정한 값이고 쿼리를 담으므로 인코딩하지 않는다.
+                    &format!(
+                        "/remotes/{}/api/vms/{}/actions/{}",
+                        seg(&name),
+                        seg(&vm),
+                        action
+                    ),
+                ))
+                .await?;
+            writeln!(
+                out,
+                "vm {vm} on remote {name}: {shown} requested (task {})",
+                cell(&task["id"])
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Args)]
 struct AuditArgs {
     /// 이 시각부터: `30m`·`1h`·`7d`(지금에서 뺌)나 RFC 3339. 기본은 `--until`의 24시간 전
@@ -3007,6 +3324,7 @@ where
         Cmd::Subscription { cmd } => subscription(&client, cmd, json_out, out).await?,
         Cmd::Telemetry { cmd } => telemetry(&client, cmd, json_out, out).await?,
         Cmd::Audit(args) => audit(&client, args, json_out, out, &mut std::io::stderr()).await?,
+        Cmd::Remote { cmd } => remote(&client, cmd, json_out, out).await?,
     }
     Ok(())
 }
@@ -3739,13 +4057,7 @@ async fn vm(
     match cmd {
         VmCmd::List => {
             let list = client.get("/vms").await?;
-            print_list(
-                out,
-                json_out,
-                &list,
-                &["NAME", "POWER", "PHASE", "NODE", "HA", "PID", "ERROR"],
-                vm_row,
-            )?;
+            print_list(out, json_out, &list, VM_HEADERS, vm_row)?;
         }
         VmCmd::Get { vm } => print_json(out, &client.get(&format!("/vms/{}", seg(&vm))).await?)?,
         VmCmd::Create(args) => {
@@ -3911,6 +4223,9 @@ fn task_row(t: &Value) -> Vec<String> {
         cell(&t["status"]["error"]),
     ]
 }
+
+/// `vm list`의 열
+const VM_HEADERS: &[&str] = &["NAME", "POWER", "PHASE", "NODE", "HA", "PID", "ERROR"];
 
 /// `vm list`의 한 행. 마이그레이션 중이면 NODE에 대상 노드를 붙인다(`A -> B`).
 fn vm_row(v: &Value) -> Vec<String> {
@@ -9179,5 +9494,345 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
     fn cli_definition_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    fn remote_cmd(args: &[&str]) -> Result<RemoteCmd, clap::Error> {
+        let mut all = vec!["oplctl", "remote"];
+        all.extend_from_slice(args);
+        match Cli::try_parse_from(all)?.cmd {
+            Cmd::Remote { cmd } => Ok(cmd),
+            _ => unreachable!(),
+        }
+    }
+
+    /// `remote add`는 주소와 토큰 파일이 필요하다. `remote vm`의 stop은 로컬 `vm stop`처럼 ACPI이고
+    /// `--force`면 곧바로 끈다.
+    #[test]
+    fn parses_remote_commands() {
+        let RemoteCmd::Add(add) = remote_cmd(&[
+            "add",
+            "dr",
+            "--url",
+            "https://10.0.0.5:8443",
+            "--token-file",
+            "-",
+            "--yes",
+        ])
+        .unwrap() else {
+            panic!("not add");
+        };
+        assert_eq!(add.url, "https://10.0.0.5:8443");
+        assert_eq!(add.token_file, PathBuf::from("-"));
+        assert!(add.yes && add.ca_fingerprint.is_none());
+        assert!(remote_cmd(&["add", "dr", "--url", "https://h"]).is_err());
+        assert!(remote_cmd(&["add", "dr", "--token-file", "t"]).is_err());
+        assert!(remote_cmd(&["vm", "dr", "reboot", "web"]).is_err());
+        assert!(remote_cmd(&["vm", "dr", "shutdown", "web"]).is_err());
+        let actions: Vec<_> = [
+            &["start"][..],
+            &["stop"][..],
+            &["stop", "--force"][..],
+            &["start", "--force"][..],
+        ]
+        .iter()
+        .map(|a| {
+            let mut args = vec!["vm", "dr"];
+            args.extend_from_slice(&a[..1]);
+            args.push("web");
+            args.extend_from_slice(&a[1..]);
+            match remote_cmd(&args).unwrap() {
+                RemoteCmd::Vm { action, force, .. } => {
+                    remote_vm_action(action, force).map_err(|e| e.to_string())
+                }
+                _ => unreachable!(),
+            }
+        })
+        .collect();
+        assert_eq!(
+            actions,
+            [
+                Ok(("start", "start")),
+                Ok(("stop", "stop")),
+                Ok(("stop?mode=force", "force stop")),
+                Err("--force is only for stop".to_string()),
+            ]
+        );
+    }
+
+    /// 토큰을 표준 입력으로 받으면 지문 확인을 물을 수 없으므로 `--ca-fingerprint`나 `--yes`가 없으면 곧바로
+    /// 실패한다(표준 입력을 읽거나 원격에 연결하지 않고).
+    #[tokio::test]
+    async fn remote_add_from_stdin_needs_a_fingerprint_or_yes() {
+        let client = Client::new("http://127.0.0.1:1", None, None).unwrap();
+        let args = [
+            "add",
+            "dr",
+            "--url",
+            "https://10.0.0.5:8443",
+            "--token-file",
+            "-",
+        ];
+        let err = remote(&client, remote_cmd(&args).unwrap(), false, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "reading the token from stdin needs --ca-fingerprint or --yes"
+        );
+    }
+
+    /// 원격이 저장한 토큰을 거절하면 중계가 502 `remote_unauthorized`를 주므로 그 메시지를 보이고, 이
+    /// 클러스터에 다시 로그인하라고 하지 않는다.
+    #[tokio::test]
+    async fn a_refused_remote_token_is_not_a_login_problem() {
+        let message = "the remote cluster refused the stored token; update it with `oplctl remote set --token-file`";
+        let (client, _) = fake_api_status(move |_| {
+            (
+                502,
+                json!({ "code": "remote_unauthorized", "message": message }),
+            )
+        })
+        .await;
+        let err = remote(
+            &client,
+            remote_cmd(&["vms", "dr"]).unwrap(),
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, format!("{message} (remote_unauthorized)"));
+        assert!(!err.contains("oplctl login"), "{err}");
+    }
+
+    /// 받은 CA 지문은 보이고, `--yes`가 아니면 터미널에서 묻는다. 터미널이 아니면 지문을 달라고 한다.
+    #[test]
+    fn remote_fingerprint_needs_a_confirmation() {
+        let fp = "sha256:ab";
+        let confirm = |yes: bool, terminal: bool, answer: &str| {
+            let mut out = Vec::new();
+            let r = confirm_fingerprint(fp, yes, terminal, &mut answer.as_bytes(), &mut out);
+            (
+                r.map_err(|e| e.to_string()),
+                String::from_utf8(out).unwrap(),
+            )
+        };
+        let shown = "the remote cluster CA fingerprint is sha256:ab\n";
+        assert_eq!(confirm(true, false, ""), (Ok(()), shown.to_string()));
+        let (r, out) = confirm(false, false, "y\n");
+        assert_eq!(out, shown);
+        assert!(
+            r.unwrap_err()
+                .contains("run again with --ca-fingerprint sha256:ab"),
+            "not a terminal"
+        );
+        let prompt = format!("{shown}Is this the CA of the remote cluster? [y/N] ");
+        assert_eq!(confirm(false, true, "Yes\n"), (Ok(()), prompt.clone()));
+        assert_eq!(
+            confirm(false, true, "\n"),
+            (Err("cancelled".to_string()), prompt)
+        );
+    }
+
+    fn sample_remote() -> Value {
+        json!({
+            "id": "0190b9d4-0000-7000-8000-000000000001",
+            "name": "dr",
+            "revision": 9,
+            "url": "https://10.0.0.5:8443",
+            "ca_fingerprint": "sha256:aa",
+            "token_id": "0190b9d4-0000-7000-8000-000000000002",
+            "status": {
+                "reachable": true,
+                "checked_at": 1_793_000_000,
+                "error": null,
+                "cluster_name": "dr-site",
+                "version": "0.37.0",
+                "nodes": { "total": 3, "online": 2 },
+                "vms": { "total": 5, "running": 4 },
+                "cpus": 48,
+                "memory_gib": 192
+            }
+        })
+    }
+
+    /// 목록의 노드·VM 칸은 `online/total`·`running/total`이고, 닿지 않는 원격은 이유를 보인다.
+    #[test]
+    fn remote_rows_and_lines() {
+        assert_eq!(
+            remote_row(&sample_remote()),
+            ["dr", "dr-site", "0.37.0", "2/3", "4/5", "reachable"]
+        );
+        let down = json!({
+            "name": "old",
+            "status": { "reachable": false, "error": "connection refused" }
+        });
+        assert_eq!(
+            remote_row(&down),
+            ["old", "-", "-", "-", "-", "unreachable: connection refused"]
+        );
+        let lines = remote_lines(&sample_remote());
+        for line in [
+            "url: https://10.0.0.5:8443",
+            "ca fingerprint: sha256:aa",
+            "token id: 0190b9d4-0000-7000-8000-000000000002",
+            "status: reachable",
+            "nodes online: 2/3",
+            "vms running: 4/5",
+            "cpus: 48",
+            "memory: 192 GiB",
+        ] {
+            assert!(lines.contains(&line.to_string()), "{line}: {lines:?}");
+        }
+        assert!(
+            remote_lines(&down).contains(&"changed at: never".to_string()),
+            "{:?}",
+            remote_lines(&down)
+        );
+    }
+
+    /// 원격 명령이 부르는 API: `add`는 토큰 파일과 준 지문을, `set`은 읽은 revision을 If-Match로 하고
+    /// 토큰을 주지 않으면 빼서 보낸다. `vms`·`vm`은 중계 경로로 원격 API를 부른다.
+    #[tokio::test]
+    async fn remote_commands_call_the_api() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/remotes/dr/api/vms" => json!({
+                "revision": 3,
+                "items": [{
+                    "name": "web",
+                    "spec": { "power": "running", "ha": false },
+                    "status": { "phase": "running", "node": "n1", "pid": 42 }
+                }]
+            }),
+            "/api/v1/remotes/dr/api/vms/web/actions/stop?mode=force" => {
+                json!({ "id": "t1", "status": { "state": "pending" } })
+            }
+            _ => sample_remote(),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        let secret = format!("opl_{}_s3cret", uuid::Uuid::now_v7().simple());
+        std::fs::write(&token, format!("{secret}\n")).unwrap();
+        let token = token.to_str().unwrap();
+
+        let mut out = Vec::new();
+        for args in [
+            &[
+                "add",
+                "dr",
+                "--url",
+                "https://10.0.0.5:8443",
+                "--ca-fingerprint",
+                "sha256:aa",
+                "--token-file",
+                token,
+            ][..],
+            &["set", "dr", "--url", "https://10.0.0.6:8443"][..],
+            &["set", "dr", "--token-file", token][..],
+            &["remove", "dr"][..],
+            &["vms", "dr"][..],
+            &["vm", "dr", "stop", "web", "--force"][..],
+        ] {
+            remote(&client, remote_cmd(args).unwrap(), false, &mut out)
+                .await
+                .unwrap();
+        }
+
+        let seen = seen.lock().unwrap();
+        let lines: Vec<&str> = seen.iter().map(|r| r.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "POST /api/v1/remotes HTTP/1.1",
+                "GET /api/v1/remotes/dr HTTP/1.1",
+                "PUT /api/v1/remotes/dr HTTP/1.1",
+                "GET /api/v1/remotes/dr HTTP/1.1",
+                "PUT /api/v1/remotes/dr HTTP/1.1",
+                "DELETE /api/v1/remotes/dr HTTP/1.1",
+                "GET /api/v1/remotes/dr/api/vms HTTP/1.1",
+                "POST /api/v1/remotes/dr/api/vms/web/actions/stop?mode=force HTTP/1.1",
+            ]
+        );
+        assert_eq!(
+            seen[0].body,
+            json!({
+                "name": "dr",
+                "url": "https://10.0.0.5:8443",
+                "ca_fingerprint": "sha256:aa",
+                "token": secret,
+            })
+        );
+        assert_eq!(seen[2].if_match.as_deref(), Some("9"));
+        assert_eq!(
+            seen[2].body,
+            json!({ "url": "https://10.0.0.6:8443", "ca_fingerprint": "sha256:aa" })
+        );
+        assert_eq!(
+            seen[4].body,
+            json!({
+                "url": "https://10.0.0.5:8443",
+                "ca_fingerprint": "sha256:aa",
+                "token": secret,
+            })
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "remote dr added (reachable)\n\
+             remote dr updated\n\
+             remote dr updated\n\
+             remote dr removed\n\
+             NAME  POWER    PHASE    NODE  HA     PID  ERROR\n\
+             web   running  running  n1    false  42   -\n\
+             vm web on remote dr: force stop requested (task t1)\n"
+        );
+    }
+
+    /// `remote list`는 원격마다 한 줄, `show`·`refresh`는 `키: 값` 줄이다.
+    #[tokio::test]
+    async fn remote_list_and_refresh() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/remotes" => json!({ "revision": 9, "items": [sample_remote()] }),
+            _ => sample_remote(),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let mut out = Vec::new();
+        remote(&client, remote_cmd(&["list"]).unwrap(), false, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NAME  CLUSTER  VERSION  NODES  VMS  STATUS\n\
+             dr    dr-site  0.37.0   2/3    4/5  reachable\n"
+        );
+        let mut out = Vec::new();
+        remote(
+            &client,
+            remote_cmd(&["refresh", "dr"]).unwrap(),
+            false,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            remote_lines(&sample_remote()).join("\n") + "\n"
+        );
+        let lines: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.line.clone())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "GET /api/v1/remotes HTTP/1.1",
+                "POST /api/v1/remotes/dr/actions/refresh HTTP/1.1",
+            ]
+        );
     }
 }
