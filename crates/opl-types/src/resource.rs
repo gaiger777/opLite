@@ -53,6 +53,7 @@ pub enum Kind {
     VmImport,
     Settings,
     Realm,
+    Remote,
 }
 
 impl Kind {
@@ -75,6 +76,7 @@ impl Kind {
             Kind::VmImport => "vm-import",
             Kind::Settings => "settings",
             Kind::Realm => "realm",
+            Kind::Remote => "remote",
         }
     }
 }
@@ -153,6 +155,7 @@ mod tests {
             Kind::VmImport,
             Kind::Settings,
             Kind::Realm,
+            Kind::Remote,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }

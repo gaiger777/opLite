@@ -19,6 +19,7 @@ pub mod limit;
 pub mod oidc;
 mod oidc_login;
 pub mod realms;
+pub mod remote_client;
 pub mod resources;
 mod schedule;
 pub mod scheduler;
