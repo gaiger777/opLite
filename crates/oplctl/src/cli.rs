@@ -1060,6 +1060,20 @@ enum BackupCmd {
         #[arg(long)]
         node: Option<String>,
     },
+    /// 백업을 원격 클러스터(`remote add`로 등록)의 백업 풀에 사본으로 보낸다. 원격 쪽 토큰 주인은
+    /// operator 이상이어야 한다.
+    Replicate {
+        backup: String,
+        /// 원격 이름
+        #[arg(long)]
+        remote: String,
+        /// 원격의 백업 풀
+        #[arg(long)]
+        pool: String,
+        /// 복제 Task가 끝날 때까지 기다린다.
+        #[arg(long)]
+        wait: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1154,6 +1168,9 @@ struct BackupJobCreate {
     /// 예약 실행을 꺼 둔 채로 만든다.
     #[arg(long)]
     disabled: bool,
+    /// 작업이 만든 백업을 원격의 백업 풀에 사본으로 보낸다.
+    #[arg(long, value_name = "REMOTE/POOL", value_parser = parse_replicate)]
+    replicate: Option<Value>,
 }
 
 #[derive(Args)]
@@ -1161,6 +1178,7 @@ struct BackupJobCreate {
 #[command(group(ArgGroup::new("change").required(true).multiple(true).args([
     "all", "vms", "labels", "pool", "at", "days",
     "keep_last", "keep_daily", "keep_weekly", "keep_monthly", "enabled",
+    "replicate", "no_replicate",
 ])))]
 struct BackupJobSet {
     job: String,
@@ -1179,6 +1197,22 @@ struct BackupJobSet {
     /// 예약 실행을 켜거나(다음 실행 시각을 지금부터 다시 정한다) 끈다. 진행 중인 실행은 끝까지 간다.
     #[arg(long, value_name = "true|false")]
     enabled: Option<bool>,
+    /// 작업이 만든 백업을 원격의 백업 풀에 사본으로 보낸다.
+    #[arg(long, value_name = "REMOTE/POOL", value_parser = parse_replicate, conflicts_with = "no_replicate")]
+    replicate: Option<Value>,
+    /// 원격 복제를 끈다. 이미 보낸 사본은 남는다.
+    #[arg(long)]
+    no_replicate: bool,
+}
+
+/// `--replicate`의 `REMOTE/POOL`을 `replicate` 값(`{ remote, pool }`)으로
+fn parse_replicate(s: &str) -> Result<Value, String> {
+    match s.split_once('/') {
+        Some((remote, pool)) if !remote.is_empty() && !pool.is_empty() && !pool.contains('/') => {
+            Ok(json!({ "remote": remote, "pool": pool }))
+        }
+        _ => Err(format!("invalid target {s:?}: use REMOTE/POOL")),
+    }
 }
 
 /// `--label`의 `KEY=VALUE`. 값에는 `=`가 있어도 된다.
@@ -1226,7 +1260,7 @@ fn keep_value(args: &KeepArgs, current: &Value) -> Value {
 
 /// `backup-job create`의 요청 본문
 fn backup_job_create_body(args: &BackupJobCreate) -> Value {
-    json!({
+    let mut body = json!({
         "name": args.name,
         "spec": {
             "vms": vms_value(&args.vms),
@@ -1235,7 +1269,12 @@ fn backup_job_create_body(args: &BackupJobCreate) -> Value {
             "keep": keep_value(&args.keep, &Value::Null),
             "enabled": !args.disabled,
         }
-    })
+    });
+    // 복제하지 않으면 보내지 않는다(옛 서버는 모르는 필드를 거절한다).
+    if let Some(replicate) = &args.replicate {
+        body["spec"]["replicate"] = replicate.clone();
+    }
+    body
 }
 
 /// `backup-job set`의 요청 본문(`PATCH /backup-jobs/{key}`). 준 값만 보낸다. 서버는 일정과 보존
@@ -1264,6 +1303,12 @@ fn backup_job_set_body(args: &BackupJobSet, current: &Value) -> Value {
     }
     if let Some(enabled) = args.enabled {
         body["enabled"] = json!(enabled);
+    }
+    // `null`은 복제를 끈다(생략하면 그대로).
+    if let Some(replicate) = &args.replicate {
+        body["replicate"] = replicate.clone();
+    } else if args.no_replicate {
+        body["replicate"] = Value::Null;
     }
     body
 }
@@ -3432,6 +3477,44 @@ async fn backup(
             client.wait_task_for(&task, BACKUP_WAIT).await?;
             writeln!(out, "vm {name} restored from backup {backup}")?;
         }
+        BackupCmd::Replicate {
+            backup,
+            remote,
+            pool,
+            wait,
+        } => backup_replicate(client, &backup, &remote, &pool, wait, out).await?,
+    }
+    Ok(())
+}
+
+/// `backup replicate`: 복제 Task를 만든다. `wait`이면 끝날 때까지 기다리고, 아니면 Task를 따라가는
+/// 방법을 알린다.
+async fn backup_replicate(
+    client: &Client,
+    backup: &str,
+    remote: &str,
+    pool: &str,
+    wait: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let task = client
+        .post(
+            &format!("/backups/{}/actions/replicate", seg(backup)),
+            &json!({ "remote": remote, "pool": pool }),
+        )
+        .await?;
+    if wait {
+        client.wait_task_for(&task, BACKUP_WAIT).await?;
+        writeln!(
+            out,
+            "backup {backup} replicated to pool {pool} of remote {remote}"
+        )?;
+    } else {
+        let id = cell(&task["id"]);
+        writeln!(
+            out,
+            "replication of backup {backup} to remote {remote} started (task {id}); follow it with `oplctl task get {id}`"
+        )?;
     }
     Ok(())
 }
@@ -3451,16 +3534,24 @@ async fn backup_delete(
     if let Some(message) = got["message"].as_str() {
         writeln!(out, "{message}")?;
     } else {
-        client.wait_task(&got).await?;
+        let task = client.wait_task(&got).await?;
         writeln!(out, "backup {backup} deleted")?;
+        // 원격 사본을 지우지 못했으면 성공한 Task에 경고가 남는다.
+        if let Some(warning) = task["status"]["error"].as_str() {
+            writeln!(out, "warning: {warning}")?;
+        }
     }
     Ok(())
 }
 
 /// `backup list`의 열
-const BACKUP_HEADERS: &[&str] = &["NAME", "VM", "POOL", "PHASE", "CREATED", "SIZE"];
+const BACKUP_HEADERS: &[&str] = &[
+    "NAME", "VM", "POOL", "PHASE", "CREATED", "SIZE", "ORIGIN", "REPLICAS",
+];
 
 /// `backup list`의 한 행. VM은 만든 때의 이름이고(VM을 지웠어도 남는다), SIZE는 백업 파일 크기의 합이다.
+/// ORIGIN은 원격에서 받은 사본의 `<보낸 클러스터>/<원본 id 앞 8자>`, REPLICAS는 원격 사본마다
+/// `<원격>:<상태>`다.
 fn backup_row(b: &Value) -> Vec<String> {
     let status = &b["status"];
     let created = status["created_at"]
@@ -3476,6 +3567,19 @@ fn backup_row(b: &Value) -> Vec<String> {
         ),
         _ => "-".into(),
     };
+    let origin = &b["spec"]["origin"];
+    let origin = match origin["backup"].as_str() {
+        Some(id) => format!("{}/{}", cell(&origin["cluster"]), &id[..id.len().min(8)]),
+        None => "-".into(),
+    };
+    let replicas = match status["replicas"].as_array() {
+        Some(r) if !r.is_empty() => r
+            .iter()
+            .map(|r| format!("{}:{}", cell(&r["remote"]), cell(&r["state"])))
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => "-".into(),
+    };
     vec![
         cell(&b["name"]),
         cell(&b["spec"]["vm_name"]),
@@ -3483,6 +3587,8 @@ fn backup_row(b: &Value) -> Vec<String> {
         cell(&status["phase"]),
         created,
         size,
+        origin,
+        replicas,
     ]
 }
 
@@ -5582,11 +5688,31 @@ mod tests {
             BackupCmd::Restore { backup, name, pool, node: Some(node) }
                 if backup == "web-1" && name == "web2" && pool == "local" && node == "n1"
         ));
-        // 백업 풀과 복원의 새 이름·풀은 꼭 준다.
+        assert!(matches!(
+            parse(&["replicate", "web-1", "--remote", "dr", "--pool", "bk"]).unwrap(),
+            BackupCmd::Replicate { backup, remote, pool, wait: false }
+                if backup == "web-1" && remote == "dr" && pool == "bk"
+        ));
+        assert!(matches!(
+            parse(&[
+                "replicate",
+                "web-1",
+                "--remote",
+                "dr",
+                "--pool",
+                "bk",
+                "--wait"
+            ])
+            .unwrap(),
+            BackupCmd::Replicate { wait: true, .. }
+        ));
+        // 백업 풀과 복원의 새 이름·풀, 복제할 원격·풀은 꼭 준다.
         for args in [
             &["create", "web"][..],
             &["restore", "web-1", "--pool", "local"],
             &["restore", "web-1", "--name", "web2"],
+            &["replicate", "web-1", "--pool", "bk"],
+            &["replicate", "web-1", "--remote", "dr"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }
@@ -5613,7 +5739,9 @@ mod tests {
                 "bk",
                 "ready",
                 "2026-11-04 03:00 UTC",
-                "3.5GiB"
+                "3.5GiB",
+                "-",
+                "-"
             ]
         );
         // 만드는 중이거나 실패한 백업은 크기가 없다.
@@ -5621,7 +5749,37 @@ mod tests {
             "name": "b", "spec": { "vm_name": "web", "pool": "bk" },
             "status": { "phase": "pending", "created_at": null, "disks": [] }
         });
-        assert_eq!(backup_row(&pending)[3..], ["pending", "-", "-"]);
+        assert_eq!(backup_row(&pending)[3..6], ["pending", "-", "-"]);
+    }
+
+    #[test]
+    fn backup_list_shows_the_origin_and_replicas() {
+        // 원격에서 받은 사본은 보낸 클러스터와 원본 id 앞 8자
+        let copy = json!({
+            "name": "web-20261104-030000",
+            "spec": {
+                "vm_name": "web", "pool": "bk",
+                "origin": {
+                    "cluster": "prod", "ca_fingerprint": "sha256:aa",
+                    "backup": "019a4f2c-1111-7000-8000-000000000000"
+                }
+            },
+            "status": { "phase": "receiving", "created_at": 1_793_761_200, "disks": [] }
+        });
+        assert_eq!(backup_row(&copy)[6..], ["prod/019a4f2c", "-"]);
+        // 원격 사본마다 원격:상태
+        let original = json!({
+            "name": "web-20261104-030000",
+            "spec": { "vm_name": "web", "pool": "bk" },
+            "status": {
+                "phase": "ready", "created_at": 1_793_761_200, "disks": [],
+                "replicas": [
+                    { "remote": "dr", "pool": "bk", "backup": "019a4f2c-1111-7000-8000-000000000000", "state": "ready", "at": 1 },
+                    { "remote": "far", "pool": "bk", "state": "failed", "error": "boom", "at": 2 }
+                ]
+            }
+        });
+        assert_eq!(backup_row(&original)[6..], ["-", "dr:ready,far:failed"]);
     }
 
     /// `backup-job create`의 인자를 요청 본문으로
@@ -5680,6 +5838,21 @@ mod tests {
             json!({ "last": 0, "daily": 0, "weekly": 0, "monthly": 0 })
         );
         assert_eq!(all["spec"]["enabled"], json!(false));
+        // 복제하지 않으면 `replicate`를 보내지 않는다.
+        assert!(all["spec"].get("replicate").is_none(), "{all}");
+        assert_eq!(
+            backup_job_create(&[
+                "--pool",
+                "bk",
+                "--all",
+                "--at",
+                "03:00",
+                "--replicate",
+                "dr/bk"
+            ])
+            .unwrap()["spec"]["replicate"],
+            json!({ "remote": "dr", "pool": "bk" })
+        );
         assert_eq!(
             backup_job_create(&["--pool", "bk", "--vm", "web", "--vm", "db", "--at", "03:00"])
                 .unwrap()["spec"]["vms"],
@@ -5705,6 +5878,43 @@ mod tests {
                 "03:00",
                 "--keep-last",
                 "-1",
+            ],
+            // 복제 대상은 REMOTE/POOL
+            &[
+                "--pool",
+                "bk",
+                "--all",
+                "--at",
+                "03:00",
+                "--replicate",
+                "dr",
+            ],
+            &[
+                "--pool",
+                "bk",
+                "--all",
+                "--at",
+                "03:00",
+                "--replicate",
+                "dr/",
+            ],
+            &[
+                "--pool",
+                "bk",
+                "--all",
+                "--at",
+                "03:00",
+                "--replicate",
+                "/bk",
+            ],
+            &[
+                "--pool",
+                "bk",
+                "--all",
+                "--at",
+                "03:00",
+                "--replicate",
+                "dr/bk/x",
             ],
         ] {
             assert!(backup_job_create(args).is_err(), "{args:?}");
@@ -5754,12 +5964,23 @@ mod tests {
             set(&["--keep-monthly", "6", "--keep-last", "1"]).unwrap(),
             json!({ "keep": { "last": 1, "daily": 7, "weekly": 0, "monthly": 6 } })
         );
-        // 바꿀 것은 꼭 하나, VM 고르기는 하나만, 사용 여부는 true나 false
+        // 복제는 대상을 주면 바꾸고 --no-replicate면 null(끔)
+        assert_eq!(
+            set(&["--replicate", "dr/bk"]).unwrap(),
+            json!({ "replicate": { "remote": "dr", "pool": "bk" } })
+        );
+        assert_eq!(
+            set(&["--no-replicate"]).unwrap(),
+            json!({ "replicate": null })
+        );
+        // 바꿀 것은 꼭 하나, VM 고르기는 하나만, 사용 여부는 true나 false, 복제는 켜거나 끄거나
         for args in [
             &[][..],
             &["--all", "--vm", "web"],
             &["--enabled"],
             &["--enabled", "yes"],
+            &["--replicate", "dr/bk", "--no-replicate"],
+            &["--replicate", "dr"],
         ] {
             assert!(set(args).is_err(), "{args:?}");
         }
@@ -6313,6 +6534,112 @@ mod tests {
             ]
         );
         assert_eq!(String::from_utf8(out).unwrap(), "backup b1 deleted\n");
+
+        // 원격 사본을 지우지 못했으면 Task의 경고를 보인다.
+        let (client, _) = fake_api(|path| {
+            if path.starts_with("/api/v1/tasks/") {
+                json!({ "id": "t1", "status": {
+                    "state": "succeeded",
+                    "error": "backup deleted, but remote copies may be left: dr: unreachable"
+                } })
+            } else {
+                json!({ "id": "t1", "spec": {}, "status": { "state": "pending" } })
+            }
+        })
+        .await;
+        let mut out = Vec::new();
+        backup_delete(&client, "b1", false, &mut out).await.unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "backup b1 deleted\nwarning: backup deleted, but remote copies may be left: dr: unreachable\n"
+        );
+    }
+
+    /// `backup replicate`는 원격·풀을 본문으로 복제 Task를 만들고 따라가는 방법을 알린다. `--wait`이면
+    /// Task를 기다린다.
+    #[tokio::test]
+    async fn backup_replicate_starts_the_task() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/backups/web-1/actions/replicate" => json!({ "id": "t1" }),
+            _ => json!({ "id": "t1", "status": { "state": "succeeded" } }),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let run = |args: &'static [&'static str]| {
+            let client = client.clone();
+            async move {
+                let Cmd::Backup {
+                    cmd:
+                        BackupCmd::Replicate {
+                            backup,
+                            remote,
+                            pool,
+                            wait,
+                        },
+                } = Cli::try_parse_from(args).unwrap().cmd
+                else {
+                    unreachable!()
+                };
+                let mut out = Vec::new();
+                backup_replicate(&client, &backup, &remote, &pool, wait, &mut out)
+                    .await
+                    .unwrap();
+                String::from_utf8(out).unwrap()
+            }
+        };
+
+        assert_eq!(
+            run(&[
+                "oplctl",
+                "backup",
+                "replicate",
+                "web-1",
+                "--remote",
+                "dr",
+                "--pool",
+                "bk"
+            ])
+            .await,
+            "replication of backup web-1 to remote dr started (task t1); follow it with `oplctl task get t1`\n"
+        );
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(
+                seen[0].line,
+                "POST /api/v1/backups/web-1/actions/replicate HTTP/1.1"
+            );
+            assert_eq!(seen[0].body, json!({ "remote": "dr", "pool": "bk" }));
+        }
+        seen.lock().unwrap().clear();
+        assert_eq!(
+            run(&[
+                "oplctl",
+                "backup",
+                "replicate",
+                "web-1",
+                "--remote",
+                "dr",
+                "--pool",
+                "bk",
+                "--wait"
+            ])
+            .await,
+            "backup web-1 replicated to pool bk of remote dr\n"
+        );
+        let lines: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.line.clone())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "POST /api/v1/backups/web-1/actions/replicate HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1"
+            ]
+        );
     }
 
     /// `backup-job set`은 작업을 읽어 그 값에 맞춰 PATCH하고, `run`은 본문 없이 POST한다.
