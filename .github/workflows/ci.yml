@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +40,7 @@ jobs:
 
   # 웹 UI: 타입 검사, 린트, 단위 테스트, API 타입이 Rust 정의와 같은지, 알려진 취약점, 빌드
   web:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: web
@@ -74,7 +74,7 @@ jobs:
   # 패키징 셸 스크립트: shellcheck, build-deb.sh 버전 확인·키링 시험, build-repo.sh 시험(가짜 apt-ftparchive·gpg),
   # maintainer 스크립트 시험(가짜 systemctl)
   shell:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
@@ -96,7 +96,7 @@ jobs:
   # Debian 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh(.github/actions/build-deb) → Debian 13 컨테이너에서 설치 시험,
   # build-repo.sh로 만든 APT 저장소에서 설치하고 testing 채널의 새 버전을 보는 시험
   package:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-deb
@@ -132,7 +132,7 @@ jobs:
   # 라이브 마이그레이션 E2E는 한 호스트의 opld 둘로 공유 디렉터리·NFS·RBD·공유 LVM 풀 위의 VM을 옮긴다
   # (두 노드의 스코프 이름이 겹치므로 그 시험만 스코프를 끈다).
   linux-kvm:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 55
     # root로 도는 테스트도 runner가 설치한 브라우저를 쓴다.
     env:
@@ -310,7 +310,7 @@ jobs:
   # API의 영역 시험 동작과 외부 사용자 로그인. 디렉터리(시험 CA, 사용자 둘, 그룹 하나)는
   # ldap-setup.sh가 아래 OPL_TEST_LDAP_* 값으로 만든다.
   ldap:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       OPL_TEST_LDAP_URL: "ldaps://127.0.0.1:636"
@@ -340,7 +340,7 @@ jobs:
         run: sudo journalctl -u slapd --no-pager -n 200
 
   deny:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
