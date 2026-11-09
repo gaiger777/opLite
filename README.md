@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제)
+- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -212,9 +212,12 @@ oplctl cluster status                            # 버전이 섞여 있으면 �
 **롤링 순서.** opLite는 노드를 자동으로 돌아가며 올리지 않고 노드를 다시 부팅하지도 않는다. 한 노드씩:
 
 1. `oplctl node updates <노드> --refresh`로 무엇이 바뀌는지 본다.
-2. 커널처럼 다시 부팅해야 하는 업데이트가 있으면 그 노드의 VM을 다른 노드로 옮기고(`vm migrate`) 웹에서 유지보수
-   모드로 둔다.
-3. `oplctl node upgrade <노드> --wait`(다른 노드에 로그인해서). 필요하면 노드를 다시 부팅하고 유지보수 모드를 끈다.
+2. 커널처럼 다시 부팅해야 하는 업데이트가 있으면 `oplctl node drain <노드> --wait`로 노드를 유지보수 모드로 두고
+   VM을 다른 노드로 옮긴다("노드 유지보수와 비우기" — 어느 노드에서 해도 된다). 비우기가 처음 들어간 버전으로 올리는
+   동안은 옛 노드가 비우기를 몰라 쓸 수 없으므로(`cluster_upgrading`) 그때는 VM을 옮기고(`vm migrate`) 유지보수 모드로
+   둔다(`oplctl node maintenance <노드> on` 또는 웹 "유지보수 시작"). 그 뒤의 업그레이드에서는 버전이 섞여도 된다.
+3. `oplctl node upgrade <노드> --wait`(다른 노드에 로그인해서). 필요하면 노드를 다시 부팅하고 유지보수 모드를
+   끈다(`oplctl node maintenance <노드> off`).
 4. `oplctl node list`에서 그 노드의 VERSION과 ONLINE을 확인하고 다음 노드로 간다.
 
 모든 노드가 같은 버전이 될 때까지 `cluster status`와 웹 대시보드에 "nodes run different opLite versions (…); finish
@@ -1149,9 +1152,9 @@ fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나
 - **opld를 멈추면 노드가 재시작될 수 있다.** 정상 종료(SIGTERM) 때 이 노드에 도는 HA VM이 없으면 watchdog를 멈추고
   닫는다(magic close). **도는 HA VM이 있으면 그대로 둔다**(경고 "HA VMs are running; leaving the watchdog armed …") —
   QEMU는 opld 없이도 계속 돌므로, opld가 `watchdog_timeout_secs` 안에 다시 떠 리스를 갱신하지 못하면 노드가
-  재시작된다. 업그레이드·점검으로 opld를 오래 멈출 때는 먼저 HA VM을 끄거나 다른 노드로 옮기거나 `vm set --no-ha`를
-  한다. 펜싱을 `off`로 바꿔 다시 띄운 노드의 이미 도는 HA VM은 끄지 않고 status에 "HA is not available on this
-  node"만 남긴다(멈춘 HA VM은 켜지 않는다).
+  재시작된다. 업그레이드·점검으로 opld를 오래 멈출 때는 먼저 HA VM을 끄거나 다른 노드로 옮기거나(`node drain`, 아래 "노드
+  유지보수와 비우기") `vm set --no-ha`를 한다. 펜싱을 `off`로 바꿔 다시 띄운 노드의 이미 도는 HA VM은 끄지 않고
+  status에 "HA is not available on this node"만 남긴다(멈춘 HA VM은 켜지 않는다).
 - **watchdog 준비(Linux).** 하드웨어 watchdog(`iTCO_wdt`, IPMI 등)가 없으면 `softdog`를 올린다:
   `echo softdog | sudo tee /etc/modules-load.d/softdog.conf && sudo modprobe softdog`.
   `ls /sys/class/watchdog/`와 `cat /sys/class/watchdog/watchdog0/identity`로 장치를 확인한다. watchdog 장치는 한
@@ -1226,6 +1229,80 @@ sudo kill -TERM "$(pidof opld)"; sleep 15; cat /sys/class/watchdog/watchdog0/sta
 #    "fenced: lost the cluster majority"로 꺼지고 Triggered는 없다. 풀면 리스가 돌아와 다시 켜진다.
 sudo modprobe -r softdog                                        # 끝나면
 ```
+
+## 노드 유지보수와 비우기
+
+커널·펌웨어를 올리거나 하드웨어를 손보기 전에 노드를 **유지보수 모드**로 두고 실행 중인 VM을 다른 노드로 옮긴다
+(Proxmox의 노드 유지보수, vSphere의 유지보수 모드와 같은 자리). 유지보수 노드에는 새 VM을 놓지 않는다: 스케줄러의
+자동 배치, HA 복구 대상, 마이그레이션 대상에서 빠진다. **비우기**는 노드를 유지보수로 바꾸고 그 노드의 실행 중인
+VM을 스케줄러가 고른 노드로 하나씩 라이브 마이그레이션한다.
+
+```bash
+oplctl node drain node1 --wait           # 유지보수로 바꾸고 모두 옮길 때까지 기다린다: "node node1 drained"
+oplctl node drain node1                  # 기다리지 않는다: "drain of node1 started (task …); follow it with `oplctl task get …`"
+oplctl node list                         # MAINTENANCE 열
+oplctl node maintenance node1 off        # 유지보수 끝: "node node1: maintenance off"
+oplctl node maintenance node1 on         # VM은 옮기지 않고 배치만 막는다
+```
+
+웹은 노드 화면 행 메뉴의 "노드 비우기…"(확인 대화상자에 옮길 실행 중 VM 수와 로컬 디스크 안내, 그 뒤 작업을
+따라감 — 오프라인·macOS(HVF)·비우는 중인 노드는 이유와 함께 막힘)와 "유지보수 시작/끝"이다. API는 `POST /api/v1/nodes/{key}/drain`(본문 없음, admin, 202와 작업
+`node-drain`)이고, 유지보수 켜기·끄기는 노드 수정 `PUT /api/v1/nodes/{key}`의 `spec.maintenance`(admin, If-Match)다.
+
+**절차.** 한 노드씩:
+
+1. `oplctl node drain <노드> --wait`(어느 노드에서 해도 된다 — 옮기는 일은 비우는 노드의 실행기가 한다). 실패하면
+   옮기지 못한 VM과 이유가 나온다 — 그 VM을 끄거나 손으로 옮긴 뒤 다시 `drain`한다.
+2. 노드를 손본다(업그레이드 `oplctl node upgrade <노드> --wait` — 다른 노드에 로그인해서, 커널 업데이트, 재부팅,
+   하드웨어). 비우기가 성공했으면 그 노드에 HA VM이 없으므로 opld를 멈춰도 watchdog이 꺼져 재시작되지 않는다(위
+   "HA VM과 자기 펜싱").
+3. `oplctl node list`에서 ONLINE을 확인하고 `oplctl node maintenance <노드> off`. 옮긴 VM은 돌아오지 않는다(필요하면
+   `vm migrate`).
+
+- **비우기 요청.** 거절: 노드가 없으면 **404**, 위트니스(`node "X" is a witness node and runs no VMs`)나 오프라인
+  노드(`node "X" is offline; HA recovers the HA VMs of an offline node` — 꺼진 노드의 HA VM은 HA 복구가 맡는다)는
+  **409** `node_unavailable`, 그 노드의 비우기 작업이 끝나지 않았으면 **409** `node_busy`, 비우기를 모르는 노드(위트니스
+  포함)가 남았으면 **409** `cluster_upgrading`("some nodes do not support node drain yet (…); upgrade them first"). 버전이
+  아니라 노드가 등록할 때 적는 기능 표시(`status.features`의 `node-drain`)를 보므로, 비우기가 처음 들어간 버전으로 올리는
+  동안은 못 쓰고(그때는 `vm migrate`와 유지보수 시작으로) 그 뒤의 롤링 업그레이드에서는 버전이 섞여도 된다. 옛 버전
+  리더가 노드 상태를 다시 쓰며 이 표시를 지워도 노드가 1분마다 다시 적으므로 다음 주기에 되살아난다 — 새 버전 노드의
+  이름이 `cluster_upgrading`에 나오면 1분쯤 뒤 다시 하거나 그 노드의 opld를 다시 시작한다. 노드를
+  유지보수로 바꾼 뒤(이미면 그대로) 작업을 만든다. 작업이 실패해도 노드는 유지보수로 남는다.
+- **무엇을, 어떻게.** 비우는 노드의 실행기가 그 노드에 배정되고(`spec.node`) 원하는 상태가 running인 VM을 이름 순서로
+  한 번에 하나씩 옮긴다. VM에 다른 작업(전원·스냅샷·마이그레이션 등)이 있으면 끝나기를 `[migration] timeout`(기본 30분)까지
+  기다린다. 대상은 VM 만들기의 스케줄러와 같은 규칙(온라인, 유지보수·위트니스 아님, 아키텍처·디스크 풀·브리지·방화벽, HA
+  VM이면 HA 가능 노드)을 지나고 macOS(HVF) 노드가 아니며 남은 메모리가 VM 메모리 이상인 노드 가운데 미할당 메모리가 가장
+  많은 노드(같으면 id가 작은 노드)다. 마이그레이션은 `vm migrate`와 같은 확인을 거친 보통의 `vm-migrate` 작업이고(작업
+  목록에 하나씩 보인다), 비우기는 그것이 끝나기를 기다린 뒤(`[migration] timeout`의 두 배와 1분까지 — 넘으면 `migration
+  task did not finish`) 다음 VM으로 간다. 그 사이 VM이 꺼지거나 지워지거나 다른 노드로 갔으면 넘어가고(다시 나타나면
+  세 번까지 다시 보고, 그 뒤에도 다시 나타나면 `busy`), 확인과 작업 만들기 사이에 다른 작업이 끼면 한 번 더 기다려 다시
+  한다. 비우기 작업에는 일반 작업의 시간 제한(600초)이 없다.
+- **성공은 노드가 빈 것이다.** 옮길 VM이 없어도 이 노드로 들어오던 마이그레이션(비우기 전에 시작한 `vm migrate`)이
+  있으면 끝나기를 `[migration] timeout`까지 기다려(넘으면 `busy`) 들어온 VM도 옮긴다. 비우기가 옮긴 VM이 비우기 중에
+  다시 들어오면 한 번 더 옮기지 않고 `moved back during the drain`으로 남긴다.
+- **옮기지 못한 VM.** 디스크가 공유 풀이 아닌 VM(`disks on a local pool`), macOS(HVF) 노드(`hvf node`), 받을 노드가 없음
+  (`no node with capacity`), 바쁨(`busy` — VM의 다른 작업이나 이 노드로 들어오는 마이그레이션이 `[migration] timeout`까지
+  끝나지 않음, 다시 기다린 뒤에도 마이그레이션 작업 만들기가 다른 작업과 겹침, 사라졌다 다시 나타나기를 세 번 넘게 함),
+  마이그레이션 작업이 끝나지 않음(`migration task did not finish`), 다시 들어옴(`moved back during the drain`),
+  마이그레이션 실패(그 작업의 오류)는 그 노드에 남기고 다음 VM으로 간다. 끝에 작업이 "N VM(s) were not moved: db (disks
+  on a local pool), …"로 실패한다(`--wait`면 이 오류와 종료 코드 1). 꺼진 VM은 옮기지 않는다 — 노드에 배정된 채 남고, 켤 때 다른 노드로 간다(아래).
+- **유지보수를 끄면 멈춘다.** 비우기는 VM마다(VM이 자리 잡기를 기다린 뒤 마이그레이션을 시작하기 직전에도, 들어오는
+  마이그레이션을 기다리는 동안에도) 노드를 다시 읽어 유지보수가 끝났으면 "drain stopped: maintenance ended"로
+  실패한다(옮기는 중인 마이그레이션은 끝까지 간다). 그래서 `oplctl node maintenance <노드> off`는 끝나지 않은 비우기가
+  있으면 stderr에 `warning: the running drain of X stops (task T)`를 알리고, 웹은 "유지보수 끝내기" 전에 "끝내면 진행 중인
+  비우기가 멈춥니다"로 묻는다. opld가 비우기 도중 다시 시작하면 작업은 "interrupted"로 실패한다. 노드는 유지보수로
+  남으므로 다시 `drain`하면 남은 VM부터 옮긴다.
+- **유지보수 노드에 고정된 VM 켜기.** 꺼진 VM은 노드 배정을 그대로 두므로, 유지보수 노드에 배정된 꺼진 VM을 켜면
+  스케줄러가 다른 노드를 골라 VM의 노드를 바꾸고 그곳에서 켠다(UEFI 변수는 옛 노드에서 받아 온다(옛 노드가 꺼져
+  있으면 경고 뒤 켜는 노드의 파일·템플릿) — "라이브 마이그레이션"). 고를 노드가 없으면(디스크가 그 노드의 로컬
+  풀에만 있는 등) **409** `node_unavailable`("node "X" is in maintenance and no other node can run this VM; end
+  maintenance first"). 아직 그 노드에서 돌거나 멈추는 중인 VM은
+  옮기지 않는다. VM 만들기·편집에서 유지보수 노드를 새로 고르면 **409** `node_unavailable`("… is in maintenance and
+  cannot take VMs; end maintenance first")이고, 이미 그 노드에 있는 VM의 다른 편집은 막지 않는다.
+- **한계.** 로컬 디스크 VM은 옮기지 못한다(디스크 복사 마이그레이션이 없다 — 끄거나 공유 풀로 옮긴다). 한 번에
+  하나씩 옮기고, 진행률은 각 `vm-migrate` 작업으로 본다. 유지보수가 끝나도 VM을 원래 노드로 되돌리지 않는다. 옮기지
+  못한 VM을 끄는 선택과 롤링 업그레이드 자동화(노드를 차례로 비우고 올리고 재부팅)는 없다. 볼륨 만들기·백업 같은
+  작업의 노드 고르기는 유지보수를 보지 않는다.
 
 ## 백업과 복원
 
@@ -1512,7 +1589,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
-볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기·원격으로 복제)과 백업 작업(원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 죽은 노드 제거), 작업, 감사 로그(admin),
+볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기·원격으로 복제)과 백업 작업(원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 비우기, 죽은 노드 제거), 작업, 감사 로그(admin),
 사용자(admin), 인증 영역(LDAP·OIDC, admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 원격 클러스터(상태 카드, 원격 VM 목록과 동작), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
@@ -2482,6 +2559,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [VMware 가져오기 설계 (하위 프로젝트 8: 계획 29·30)](docs/superpowers/specs/2026-11-04-vmware-import-design.md)
 - [설치·업데이트·구독 설계 (하위 프로젝트 9: 계획 31·32·33)](docs/superpowers/specs/2026-11-05-install-update-subscription-design.md)
 - [엔터프라이즈 설계 (하위 프로젝트 10: 계획 34~38)](docs/superpowers/specs/2026-11-06-enterprise-design.md)
+- [노드 유지보수(노드 비우기) 설계 (하위 프로젝트 11: 계획 39)](docs/superpowers/specs/2026-11-09-node-maintenance-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)
