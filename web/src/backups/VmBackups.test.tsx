@@ -122,3 +122,30 @@ it("hides backup changes from viewers", async () => {
   expect(screen.queryByRole("button", { name: "Back up now" })).not.toBeInTheDocument();
   expect(within(table).queryByRole("button")).not.toBeInTheDocument();
 });
+
+it("asks for an incremental backup when chosen", async () => {
+  mockLists({
+    vm: [web],
+    node: [NODE],
+    "storage-pool": [pool("bk", { backups: true })],
+    backup: [first],
+  });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl(`/vms/${web.id}/backups`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t1", "vm-backup", web.id), { status: 202 });
+    }),
+  );
+  open(web);
+  await userEvent.click(await screen.findByRole("button", { name: "Back up now" }));
+  const dialog = await screen.findByRole("dialog", { name: "Back up web" });
+  const incremental = within(dialog).getByLabelText("Incremental if possible");
+  expect(incremental).not.toBeChecked();
+  // 할 수 없으면 서버가 전체로 한다고 알린다.
+  expect(dialog).toHaveTextContent("A full backup is taken when that is not possible");
+  await userEvent.click(incremental);
+  await userEvent.click(within(dialog).getByRole("button", { name: "Back up now" }));
+  expect(await screen.findByText("Back up web")).toBeInTheDocument();
+  expect(body).toEqual({ pool: "bk", incremental: true });
+});

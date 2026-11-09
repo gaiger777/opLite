@@ -67,6 +67,8 @@ export interface JobForm {
   replicateRemote: string;
   /** 원격의 백업 풀 */
   replicatePool: string;
+  /** 전체 백업 사이에 둘 증분 백업 수. 비거나 0이면 늘 전체다. */
+  fullEvery: string;
 }
 
 export function emptyForm(pool: string): JobForm {
@@ -82,6 +84,7 @@ export function emptyForm(pool: string): JobForm {
     enabled: true,
     replicateRemote: "",
     replicatePool: "",
+    fullEvery: "",
   };
 }
 
@@ -110,6 +113,7 @@ export function formOf(job: BackupJob): JobForm {
     enabled: job.spec.enabled,
     replicateRemote: job.spec.replicate?.remote ?? "",
     replicatePool: job.spec.replicate?.pool ?? "",
+    fullEvery: String(job.spec.full_every ?? 0),
   };
 }
 
@@ -149,6 +153,13 @@ export function checkForm(form: JobForm, taken: string[] | null): Record<string,
   ) {
     found.keep = "backupJobs.errors.keep";
   }
+  const every = form.fullEvery.trim();
+  if (every !== "" && !(/^\d+$/.test(every) && Number(every) <= U32_MAX)) {
+    found.fullEvery = "backupJobs.errors.fullEvery";
+  } else if (Number(every) > 0 && form.replicateRemote !== "") {
+    // 서버는 아직 증분 백업을 복제하지 않는다.
+    found.fullEvery = "backupJobs.errors.fullEveryReplicate";
+  }
   return found;
 }
 
@@ -161,6 +172,7 @@ export function specOf(form: JobForm): Spec {
         ? { names: parseNames(form.names) }
         : { labels: parseLabels(form.labels) ?? {} };
   const count = (unit: KeepUnit) => Number(form.keep[unit].trim() || "0");
+  const fullEvery = Number(form.fullEvery.trim() || "0");
   return {
     vms,
     pool: form.pool,
@@ -176,12 +188,14 @@ export function specOf(form: JobForm): Spec {
     ...(form.replicateRemote !== "" && {
       replicate: { remote: form.replicateRemote, pool: form.replicatePool },
     }),
+    // 0(늘 전체)이면 뺀다. 잘못 적은 값(NaN)도 넣어 두어야 바꾸기 폼이 바뀐 것으로 보고 검사한다.
+    ...(fullEvery !== 0 && { full_every: fullEvery }),
   };
 }
 
 /**
  * 작업에서 바뀐 필드만(`PATCH` 본문). 일정과 보존 규칙은 통째로 보낸다. 요일은 집합으로 비교한다. 복제를
- * 끄면 `replicate: null`이다(빼면 그대로 둔다).
+ * 끄면 `replicate: null`이고, 증분을 끄면 `full_every: 0`이다(빼면 그대로 둔다).
  */
 export function patchOf(job: BackupJob, spec: Spec): BackupJobPatch {
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -207,6 +221,9 @@ export function patchOf(job: BackupJob, spec: Spec): BackupJobPatch {
   const target = (r: Spec["replicate"]) => (r ? [r.remote, r.pool] : null);
   if (!same(target(job.spec.replicate), target(spec.replicate))) {
     patch.replicate = spec.replicate ?? null;
+  }
+  if ((job.spec.full_every ?? 0) !== (spec.full_every ?? 0)) {
+    patch.full_every = spec.full_every ?? 0;
   }
   return patch;
 }

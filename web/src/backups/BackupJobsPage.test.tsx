@@ -281,3 +281,53 @@ it("lets operators change jobs and viewers only read them", async () => {
   expect(screen.queryByRole("button", { name: "Run nightly now" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
 });
+
+it("makes incremental backups between full ones", async () => {
+  const incremental = backupJob("daily", 5, { spec: { full_every: 6 } });
+  mockLists({ "backup-job": [incremental, off], "storage-pool": [pool("bk", { backups: true })] });
+  mockRemotes();
+  let body: unknown;
+  server.use(
+    http.patch(apiUrl(`/backup-jobs/${off.id}`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(off);
+    }),
+  );
+  renderPage(<BackupJobsPage />);
+  const table = await screen.findByRole("table", { name: "Backup jobs" });
+  await within(table).findByText("daily");
+  expect(cells(table, "daily")("Schedule (UTC)")).toHaveTextContent(
+    "Incremental, full after 6 incremental backups",
+  );
+  expect(cells(table, "weekly")("Schedule (UTC)")).not.toHaveTextContent("Incremental");
+
+  await userEvent.click(screen.getByRole("button", { name: "Edit weekly" }));
+  const dialog = await screen.findByRole("dialog", { name: "Edit weekly" });
+  const every = within(dialog).getByLabelText("Incremental backups between full backups");
+  expect(every).toHaveValue("0");
+  await userEvent.clear(every);
+  await userEvent.type(every, "x");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(within(dialog).getByText("Enter a whole number of 0 or more.")).toBeVisible();
+  // 증분 백업은 아직 원격으로 복제하지 못한다.
+  await userEvent.clear(every);
+  await userEvent.type(every, "6");
+  await within(dialog).findByRole("option", { name: "dr" });
+  await userEvent.selectOptions(within(dialog).getByLabelText("Copy to a remote cluster"), "dr");
+  await within(dialog).findByRole("option", { name: "dr-bk" });
+  await userEvent.selectOptions(
+    within(dialog).getByLabelText("Backup pool on the remote cluster"),
+    "dr-bk",
+  );
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(
+    within(dialog).getByText(/Incremental backups cannot be copied to a remote cluster yet/),
+  ).toBeVisible();
+  await userEvent.selectOptions(
+    within(dialog).getByLabelText("Copy to a remote cluster"),
+    "Do not copy",
+  );
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(await screen.findByText("Backup job weekly saved.")).toBeInTheDocument();
+  expect(body).toEqual({ full_every: 6 });
+});

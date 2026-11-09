@@ -13,7 +13,9 @@ import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { trackTask } from "@/tasks/tasks";
 import { isBusy, isStopped } from "@/vms/actions";
@@ -89,6 +91,7 @@ function CreateBackupDialog({
   // 고르지 않았으면 첫 백업 풀이다.
   const pool = chosen ?? pools[0]?.name ?? "";
   const [name, setName] = useState("");
+  const [incremental, setIncremental] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
   async function submit() {
@@ -106,7 +109,8 @@ function CreateBackupDialog({
     const task = await call(
       api.POST("/vms/{key}/backups", {
         params: { path: { key: vm.id } },
-        body: { pool, ...(name !== "" && { name }) },
+        // 증분은 청할 때만 보낸다(옛 서버는 모르는 필드를 거절한다).
+        body: { pool, ...(name !== "" && { name }), ...(incremental && { incremental }) },
       }),
     );
     trackTask(task, t("backups.op.create", { vm: vm.name }));
@@ -155,6 +159,21 @@ function CreateBackupDialog({
           />
         )}
       </Field>
+      {/* 할 수 없으면(꺼진 VM, 첫 백업 등) 서버가 전체로 하고 이유를 백업에 적는다. */}
+      <div className="flex flex-col gap-1.5">
+        <div className="flex items-center gap-2">
+          <Checkbox
+            id="backup-incremental"
+            checked={incremental}
+            aria-describedby="backup-incremental-hint"
+            onCheckedChange={(on) => setIncremental(on === true)}
+          />
+          <Label htmlFor="backup-incremental">{t("backups.incremental")}</Label>
+        </div>
+        <p id="backup-incremental-hint" className="text-xs text-muted-foreground">
+          {t("backups.incrementalHint")}
+        </p>
+      </div>
     </FormDialog>
   );
 }

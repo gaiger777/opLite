@@ -166,3 +166,31 @@ it("copies backups to a remote only when one is chosen", () => {
     replicate: { remote: "dr", pool: "dr-bk" },
   });
 });
+
+it("asks for incremental backups only when full_every is above 0", () => {
+  const form = { ...emptyForm("bk"), name: "nightly", at: "03:00" };
+  // 비우거나 0이면 늘 전체라 보내지 않는다.
+  expect(specOf(form)).not.toHaveProperty("full_every");
+  expect(specOf({ ...form, fullEvery: "0" })).not.toHaveProperty("full_every");
+  expect(specOf({ ...form, fullEvery: "6" }).full_every).toBe(6);
+  for (const n of ["-1", "1.5", "x", "4294967296"]) {
+    expect(checkForm({ ...form, fullEvery: n }, []).fullEvery).toBe("backupJobs.errors.fullEvery");
+  }
+  // 서버처럼 증분 백업의 복제는 아직 거절한다.
+  const copying = { ...form, replicateRemote: "dr", replicatePool: "dr-bk" };
+  expect(checkForm({ ...copying, fullEvery: "6" }, []).fullEvery).toBe(
+    "backupJobs.errors.fullEveryReplicate",
+  );
+  expect(checkForm({ ...copying, fullEvery: "0" }, [])).toEqual({});
+
+  const job = backupJob("nightly", 1, { spec: { full_every: 6 } });
+  expect(formOf(job).fullEvery).toBe("6");
+  expect(formOf(backupJob("n", 2)).fullEvery).toBe("0");
+  expect(specOf(formOf(job))).toEqual(job.spec);
+  expect(patchOf(job, specOf(formOf(job)))).toEqual({});
+  // 0으로 바꾸면 0을 보낸다(빼면 그대로 둔다).
+  expect(patchOf(job, specOf({ ...formOf(job), fullEvery: "" }))).toEqual({ full_every: 0 });
+  expect(patchOf(backupJob("n", 2), specOf({ ...form, fullEvery: "3" }))).toMatchObject({
+    full_every: 3,
+  });
+});

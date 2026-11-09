@@ -114,7 +114,7 @@ export function BackupJobsPage() {
             <TableMessage colSpan={write ? 10 : 9} query={jobs} empty={t("backupJobs.empty")} />
           )}
           {list.map((job) => {
-            const { vms, schedule, enabled, replicate } = job.spec;
+            const { vms, schedule, enabled, replicate, full_every: fullEvery = 0 } = job.spec;
             const { run: running, last_run: last, next_run: next, errors } = job.status;
             const days = schedule.days ?? [];
             const keep = keepParts(job.spec.keep);
@@ -140,6 +140,11 @@ export function BackupJobsPage() {
                     ? t("backupJobs.everyDay")
                     : days.map((d) => t(`backupJobs.day.${d}`)).join(", ")}{" "}
                   {schedule.at}
+                  {fullEvery > 0 && (
+                    <div className="text-xs text-muted-foreground">
+                      {t("backupJobs.fullEveryShort", { count: fullEvery })}
+                    </div>
+                  )}
                 </TableCell>
                 <TableCell>
                   {keep.length === 0
@@ -444,6 +449,23 @@ function JobDialog({
           <p className="text-xs text-muted-foreground">{t("backupJobs.retentionHint")}</p>
         )}
       </fieldset>
+      <Field
+        id="job-full-every"
+        label={t("backupJobs.fullEvery")}
+        error={errors.fullEvery}
+        hint={t("backupJobs.fullEveryHint")}
+      >
+        {(a11y) => (
+          <Input
+            id="job-full-every"
+            inputMode="numeric"
+            placeholder="0"
+            value={form.fullEvery}
+            onChange={(e) => change({ fullEvery: e.target.value })}
+            {...a11y}
+          />
+        )}
+      </Field>
       <RemoteTargetFields
         id="job-replicate"
         label={t("backupJobs.replicateLabel")}

@@ -47,6 +47,7 @@
     "security_group_in_use": "A VM interface uses this security group. Remove it from the VM first.",
     "backup_busy": "A task on this backup (backing up, restoring, copying or deleting) is in progress. Try again when it has finished.",
     "backup_not_ready": "The backup is not ready. Only finished backups can be restored or copied.",
+    "backup_in_use": "Incremental backups are based on this backup. Delete them first, starting from the newest.",
     "job_running": "The backup job is already running. Wait for the run to finish.",
     "job_disabled": "The backup job is off. Turn on \"Run on schedule\" first.",
     "invalid_ova": "The file is not a usable OVA: {{message}}",
@@ -373,6 +374,14 @@
     "jobDeleted": "Deleted job",
     "created": "Created",
     "size": "Size",
+    "type": "Type",
+    "kind": {
+      "full": "Full",
+      "incremental": "Incremental"
+    },
+    "parent": "Parent:",
+    "fullReason": "Why full: {{reason}}",
+    "chainSize": "Chain {{size}}",
     "origin": "From {{cluster}}",
     "originHint": "Copy of backup {{backup}} on cluster {{cluster}}",
     "originJobHint": "Copy of backup {{backup}} (job {{job}}) on cluster {{cluster}}",
@@ -385,6 +394,7 @@
     "replicaTitle": "{{remote}} / {{pool}}: {{state}}",
     "replicaError": "{{remote}} / {{pool}}: {{error}}",
     "replicate": "Copy to remote",
+    "replicateIncremental": "Incremental backups cannot be copied to a remote cluster yet.",
     "replicateNamed": "Copy {{name}} to a remote cluster",
     "replicateDescription": "Sends the backup files to a backup pool of a remote cluster. The copy there is an ordinary backup that can be restored on that cluster. Deleting this backup deletes the copy too.",
     "replicateSubmit": "Copy",
@@ -408,6 +418,8 @@
     "noPools": "No storage pool stores backups. Turn on \"Store backups\" for a directory or NFS pool in Storage pools.",
     "name": "Name (optional)",
     "nameHint": "Leave empty to name it after the VM and the UTC time, such as web-20261104-030000.",
+    "incremental": "Incremental if possible",
+    "incrementalHint": "Copies only the blocks changed since the last backup of this VM in the pool. A full backup is taken when that is not possible, such as when the VM is stopped or has no earlier backup there.",
     "busy": "The VM is starting, stopping or migrating. Back it up when it has settled.",
     "restore": "Restore",
     "restoreNamed": "Restore {{name}}",
@@ -489,6 +501,10 @@
     "daysHint": "Leave every day unchecked to run every day.",
     "retention": "Retention",
     "retentionHint": "Keeps the newest backups (Last), then the newest backup of each day, ISO week and month, counted per VM. Leave all at 0 to keep every backup. Failed backups are deleted after a later success.",
+    "fullEvery": "Incremental backups between full backups",
+    "fullEveryHint": "With 0, every backup is full. With n, backups are incremental where possible and the backup after n incremental ones is full. For example, daily with 6 makes one full and six incremental backups a week.",
+    "fullEveryShort_one": "Incremental, full after {{count}} incremental backup",
+    "fullEveryShort_other": "Incremental, full after {{count}} incremental backups",
     "keepLabel": {
       "last": "Last",
       "daily": "Daily",
@@ -510,7 +526,9 @@
       "names": "Enter at least one VM name.",
       "labels": "Enter at least one KEY=VALUE label.",
       "at": "Enter a time from 00:00 to 23:59.",
-      "keep": "Enter whole numbers of 0 or more."
+      "keep": "Enter whole numbers of 0 or more.",
+      "fullEvery": "Enter a whole number of 0 or more.",
+      "fullEveryReplicate": "Incremental backups cannot be copied to a remote cluster yet. Set this to 0 or do not copy."
     }
   },
   "imports": {

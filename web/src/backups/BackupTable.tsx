@@ -1,5 +1,5 @@
 import { CircleAlert, CircleCheck, LoaderCircle } from "lucide-react";
-import { type RefObject, useRef, useState } from "react";
+import { type RefObject, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -8,12 +8,13 @@ import { useList } from "@/api/live";
 import type { Backup, Task } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
-import { storedBytes } from "@/backups/backups";
+import { chainBytes, storedBytes } from "@/backups/backups";
 import { type RemoteTarget, RemoteTargetFields } from "@/backups/RemoteTargetFields";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { ReasonButton, ReasonList } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -70,7 +71,9 @@ function ReplicaBadge({ replica }: { replica: Replica }) {
 /**
  * 백업 표와 복원·원격 복제·지우기. VM 상세의 백업 탭과 백업 화면이 쓴다. `showVm`이면 VM 열을 보인다(VM을
  * 지웠으면 만든 때의 이름만). 작업 열은 백업을 만든 백업 작업이다(손으로 만든 백업은 비어 있다). 받은 사본은
- * 이름 옆에 보낸 클러스터를, 원격 사본 열은 원격으로 보낸 사본의 상태를 보인다.
+ * 이름 옆에 보낸 클러스터를, 원격 사본 열은 원격으로 보낸 사본의 상태를 보인다. 종류 열은 전체·증분과
+ * 증분의 부모(같은 표의 그 행으로 가는 링크), 증분을 청했는데 전체로 한 이유를 보이고, 증분의 크기 열은 자기
+ * 파일 크기 아래에 복원에 드는 체인 전체 크기를 보인다(부모는 같은 VM의 백업이라 표에 있다).
  */
 export function BackupTable({
   backups,
@@ -94,6 +97,7 @@ export function BackupTable({
   const [deleteOpen, setDeleteOpen] = useState(false);
   // 트리거 없이 연 대화상자는 닫힐 때 포커스를 돌려줄 곳을 모르므로 연 버튼을 기억한다.
   const opener = useRef<HTMLElement | null>(null);
+  const reasonBase = useId();
   // 복원은 새 VM과 볼륨을 만든다(서버는 백업·VM·볼륨 쓰기를 모두 본다).
   const restore =
     can(me.role, "write", "backup") &&
@@ -101,7 +105,7 @@ export function BackupTable({
     can(me.role, "write", "volume");
   const remove = can(me.role, "write", "backup");
   const actions = restore || remove;
-  const columns = 7 + (showVm ? 1 : 0) + (actions ? 1 : 0);
+  const columns = 8 + (showVm ? 1 : 0) + (actions ? 1 : 0);
   const vmById = new Map((vms.data ?? []).map((v) => [v.id, v]));
   const originHint = (origin: NonNullable<Backup["spec"]["origin"]>) =>
     t(origin.job ? "backups.originJobHint" : "backups.originHint", {
@@ -130,6 +134,7 @@ export function BackupTable({
             <TableHead>{t("common.state")}</TableHead>
             <TableHead>{t("backups.created")}</TableHead>
             <TableHead>{t("backups.size")}</TableHead>
+            <TableHead>{t("backups.type")}</TableHead>
             <TableHead>{t("backups.replicas")}</TableHead>
             {actions && (
               <TableHead>
@@ -147,8 +152,14 @@ export function BackupTable({
             const size = storedBytes(backup);
             const { phase, created_at: created, error, replicas = [] } = backup.status;
             const origin = backup.spec.origin;
+            const { parent: parentId, full_reason: fullReason } = backup.status;
+            const parent = parentId ? backups.find((b) => b.id === parentId) : undefined;
+            const chain = parentId ? chainBytes(backup, backups) : undefined;
+            // 증분 백업은 아직 원격으로 복제하지 못한다(서버가 400).
+            const replicateReason = parentId ? "backups.replicateIncremental" : null;
+            const reasons = `${reasonBase}-${backup.id}`;
             return (
-              <TableRow key={backup.id}>
+              <TableRow key={backup.id} id={`backup-${backup.id}`}>
                 <TableCell className="font-medium">
                   {backup.name}
                   {/* 다른 클러스터에서 받은 사본 */}
@@ -186,7 +197,39 @@ export function BackupTable({
                 <TableCell>
                   {created !== null ? formatTime(new Date(created * 1000), i18n.language) : "—"}
                 </TableCell>
-                <TableCell>{size !== undefined ? formatBytes(size) : "—"}</TableCell>
+                <TableCell>
+                  {size !== undefined ? formatBytes(size) : "—"}
+                  {chain !== undefined && (
+                    <div className="text-xs text-muted-foreground">
+                      {t("backups.chainSize", { size: formatBytes(chain) })}
+                    </div>
+                  )}
+                </TableCell>
+                <TableCell>
+                  <Badge variant="outline">
+                    {t(parentId ? "backups.kind.incremental" : "backups.kind.full")}
+                  </Badge>
+                  {parentId && (
+                    <div className="text-xs text-muted-foreground">
+                      {t("backups.parent")}{" "}
+                      {parent ? (
+                        <a
+                          href={`#backup-${parent.id}`}
+                          className="underline-offset-4 hover:underline"
+                        >
+                          {parent.name}
+                        </a>
+                      ) : (
+                        parentId
+                      )}
+                    </div>
+                  )}
+                  {fullReason && (
+                    <div className="max-w-xs text-xs whitespace-normal break-words text-muted-foreground">
+                      {t("backups.fullReason", { reason: fullReason })}
+                    </div>
+                  )}
+                </TableCell>
                 <TableCell>
                   {replicas.length === 0 ? (
                     "—"
@@ -231,21 +274,33 @@ export function BackupTable({
                       </Button>
                     )}
                     {/* 복제 API는 백업 쓰기 권한이다(지우기와 같다). 원격 쪽 권한은 원격 토큰의 역할이다. */}
-                    {remove && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="ml-2"
-                        aria-label={t("backups.replicateNamed", { name: backup.name })}
-                        disabled={phase !== "ready"}
-                        onClick={(e) => {
-                          opener.current = e.currentTarget;
-                          setReplicating(backup);
-                        }}
-                      >
-                        {t("backups.replicate")}
-                      </Button>
-                    )}
+                    {remove &&
+                      (replicateReason ? (
+                        <ReasonButton
+                          variant="outline"
+                          size="sm"
+                          className="ml-2"
+                          aria-label={t("backups.replicateNamed", { name: backup.name })}
+                          reason={replicateReason}
+                          reasons={reasons}
+                        >
+                          {t("backups.replicate")}
+                        </ReasonButton>
+                      ) : (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="ml-2"
+                          aria-label={t("backups.replicateNamed", { name: backup.name })}
+                          disabled={phase !== "ready"}
+                          onClick={(e) => {
+                            opener.current = e.currentTarget;
+                            setReplicating(backup);
+                          }}
+                        >
+                          {t("backups.replicate")}
+                        </Button>
+                      ))}
                     {/* 실패했거나 Task 없이 남은 백업도 지운다. 진행 중인 Task가 있으면 서버가 거절한다. */}
                     {remove && (
                       <Button
@@ -261,6 +316,14 @@ export function BackupTable({
                       >
                         {t("common.delete")}
                       </Button>
+                    )}
+                    {/* 셀은 줄을 바꾸지 않으므로 이유는 좁게 줄을 바꿔 표를 넓히지 않는다. */}
+                    {remove && (
+                      <ReasonList
+                        base={reasons}
+                        reasons={[replicateReason]}
+                        className="ml-auto max-w-xs whitespace-normal"
+                      />
                     )}
                   </TableCell>
                 )}

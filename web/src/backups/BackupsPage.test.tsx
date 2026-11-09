@@ -263,3 +263,84 @@ it("does not let viewers copy backups", async () => {
     screen.queryByRole("button", { name: "Copy web-1 to a remote cluster" }),
   ).not.toBeInTheDocument();
 });
+
+it("shows the type, parent, reason for a full backup and chain size", async () => {
+  const full = backup("web-full", web, 3, {
+    spec: { incremental: true },
+    status: { full_reason: 'no earlier backup of this VM in pool "bk"' },
+  });
+  const inc = backup("web-inc", web, 4, {
+    spec: { incremental: true },
+    status: {
+      parent: full.id,
+      disks: [
+        { name: "disk0", file: "disk0.qcow2", virtual_bytes: 1, stored_bytes: 512 * 1024 ** 2 },
+      ],
+    },
+  });
+  mockLists({ vm: [web], backup: [ofWeb, full, inc] });
+  renderPage(<BackupsPage />);
+  const table = await screen.findByRole("table", { name: "Backups" });
+  const headers = within(table).getAllByRole("columnheader");
+  await within(table).findByText("web-inc");
+  // 부모 링크에도 이름이 있어 행은 이름 열로 찾는다.
+  const row = (name: string) =>
+    within(table)
+      .getAllByRole("row")
+      .find((r) => r.firstChild?.textContent === name)!;
+  const cell = (name: string, header: string) =>
+    within(row(name)).getAllByRole("cell")[headers.findIndex((h) => h.textContent === header)]!;
+  expect(cell("web-1", "Type")).toHaveTextContent(/^Full$/);
+  // 증분을 청했는데 전체로 했으면 그 이유를 보인다.
+  expect(cell("web-full", "Type")).toHaveTextContent(
+    'FullWhy full: no earlier backup of this VM in pool "bk"',
+  );
+  const type = cell("web-inc", "Type");
+  expect(type).toHaveTextContent("IncrementalParent: web-full");
+  // 부모는 같은 표의 그 행으로 간다.
+  const parent = within(type).getByRole("link", { name: "web-full" });
+  expect(parent).toHaveAttribute("href", `#backup-${full.id}`);
+  expect(row("web-full")).toHaveAttribute("id", `backup-${full.id}`);
+  // 증분의 크기는 자기 파일이고, 복원에 드는 체인 전체 크기를 함께 보인다.
+  expect(cell("web-inc", "Size")).toHaveTextContent("512 MiBChain 2 GiB");
+  expect(cell("web-full", "Size")).toHaveTextContent(/^1\.5 GiB$/);
+});
+
+it("does not copy incremental backups to a remote cluster", async () => {
+  const inc = backup("web-inc", web, 3, { status: { parent: ofWeb.id } });
+  mockLists({ vm: [web], backup: [ofWeb, inc] });
+  renderPage(<BackupsPage />);
+  const copy = await screen.findByRole("button", { name: "Copy web-inc to a remote cluster" });
+  expect(copy).toHaveAttribute("aria-disabled", "true");
+  expect(copy).toHaveAccessibleDescription(
+    "Incremental backups cannot be copied to a remote cluster yet.",
+  );
+  await userEvent.click(copy);
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  // 전체 백업은 그대로 복제한다.
+  const full = screen.getByRole("button", { name: "Copy web-1 to a remote cluster" });
+  expect(full).toBeEnabled();
+  expect(full).not.toHaveAttribute("aria-disabled");
+});
+
+it("explains why a parent backup cannot be deleted", async () => {
+  mockLists({ vm: [web], backup: [ofWeb] });
+  server.use(
+    http.delete(apiUrl(`/backups/${ofWeb.id}`), () =>
+      HttpResponse.json(
+        {
+          code: "backup_in_use",
+          message: 'backup "web-1" is the parent of 1 incremental backup(s); delete them first',
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderPage(<BackupsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Delete backup web-1" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "Delete backup web-1?" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "Incremental backups are based on this backup. Delete them first, starting from the newest.",
+  );
+});
