@@ -18,6 +18,7 @@ use opl_types::storage::{VolumePhase, VolumeSpec};
 use opl_types::vm::Arch;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 #[tokio::test]
 async fn create_assigns_mac_and_validates_spec() {
@@ -484,6 +485,128 @@ async fn a_witness_cannot_hold_vms() {
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
     let (_, vm) = admin.get("/vms/web").await;
     assert_eq!(vm["spec"]["node"], env.node.to_string());
+}
+
+/// 실행기도 reconciler도 없는 노드를 저장소에만 만든다(온라인, aarch64).
+async fn add_node(env: &Env, name: &str) -> Uuid {
+    let mut node: Node = Resource::new(
+        name,
+        NodeSpec {
+            address: "127.0.0.2:0".into(),
+            maintenance: false,
+            witness: false,
+        },
+    );
+    node.status.online = true;
+    node.status.memory_mib = 8192;
+    node.status.arch = Some(Arch::Aarch64);
+    env.cluster.create(&node).await.unwrap();
+    node.id
+}
+
+/// 노드의 유지보수 모드를 바꾼다.
+async fn set_maintenance(env: &Env, id: Uuid, maintenance: bool) {
+    let mut node = env.cluster.get::<NodeSpec>(id).unwrap().unwrap();
+    node.spec.maintenance = maintenance;
+    env.cluster
+        .update_spec(id, None, node.labels.clone(), &node.spec)
+        .await
+        .unwrap();
+}
+
+/// 유지보수 노드에 고정된 꺼진 VM을 켜면 스케줄러가 다른 노드를 고른다.
+#[tokio::test]
+async fn a_vm_pinned_to_a_maintenance_node_starts_elsewhere() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_node(&env, "node2").await;
+    let mut req = vm_request("web");
+    req["spec"]["node"] = json!(node2);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    set_maintenance(&env, node2, true).await;
+
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(task["spec"]["node"], env.node.to_string());
+    let (_, vm) = admin.get("/vms/web").await;
+    assert_eq!(vm["spec"]["node"], env.node.to_string());
+    assert_eq!(vm["status"]["phase"], "running");
+}
+
+/// 다른 노드를 고를 수 없으면 409 `node_unavailable`이고 VM은 그대로다.
+#[tokio::test]
+async fn start_fails_when_only_the_maintenance_node_can_run_the_vm() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mut req = vm_request("web");
+    req["spec"]["node"] = json!(env.node);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    set_maintenance(&env, env.node, true).await;
+
+    let (status, body) = admin.post("/vms/web/actions/start", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "node_unavailable");
+    assert_eq!(
+        body["message"],
+        "node \"node1\" is in maintenance and no other node can run this VM; end maintenance first"
+    );
+    let (_, vm) = admin.get("/vms/web").await;
+    assert_eq!(vm["spec"]["node"], env.node.to_string());
+    assert_eq!(vm["spec"]["power"], "stopped");
+}
+
+/// 만들거나 고칠 때 유지보수 노드를 고르면 409 `node_unavailable`이다. 이미 그 노드에 있는 VM의 다른
+/// 고치기는 막지 않고, 그 노드에서 도는 VM을 다시 켜도 옮기지 않는다.
+#[tokio::test]
+async fn a_maintenance_node_cannot_be_chosen() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_node(&env, "node2").await;
+    set_maintenance(&env, node2, true).await;
+
+    let mut req = vm_request("db");
+    req["spec"]["node"] = json!(node2);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "node_unavailable");
+    assert_eq!(
+        body["message"],
+        "node \"node2\" is in maintenance and cannot take VMs; end maintenance first"
+    );
+
+    let (status, vm) = admin.post("/vms", vm_request("web")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let mut spec = vm["spec"].clone();
+    spec["node"] = json!(node2);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "node_unavailable");
+
+    // 이 노드에서 도는 VM: 이 노드가 유지보수가 되어도 고칠 수 있고, start는 옮기지 않는다.
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    set_maintenance(&env, env.node, true).await;
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["memory_mib"] = json!(512);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, vm) = admin.get("/vms/web").await;
+    assert_eq!(vm["spec"]["node"], env.node.to_string());
+    assert_eq!(vm["status"]["phase"], "running");
+
+    // 꺼진 뒤에도 그 노드에 고정된 채로 고칠 수 있다.
+    let task = admin.act("web", "stop").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["memory_mib"] = json!(256);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// HA VM은 HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. HA는 멈춘 VM에서만 켤 수 있다(끄기는 언제든).

@@ -802,6 +802,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             }
             None => Err("updates are not enabled on this node".into()),
         },
+        // 아직 실행하지 않는다(만드는 API가 없다).
+        TaskOp::NodeDrain => Err("node drain is not implemented yet".into()),
     };
     done.map(|()| None)
 }

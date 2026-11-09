@@ -117,11 +117,20 @@ pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(
             ));
         }
     }
+    // 이미 그 노드에 있는 VM(실행 중이거나 고정된 채 꺼진 VM)의 다른 고치기는 유지보수로 막지 않는다.
+    let current = inv
+        .vms
+        .iter()
+        .find(|v| v.id == id)
+        .and_then(|v| v.spec.node);
     if let Some(id) = spec.node {
         let Some(node) = inv.nodes.iter().find(|n| n.id == id) else {
             return Err(ApiError::bad_request(format!("node {id} not found")));
         };
         check_not_witness(node)?;
+        if current != Some(id) {
+            check_not_in_maintenance(node)?;
+        }
         check_ha_capable(node, spec)?;
         check_node_arch(node, spec)?;
         check_firewall(node, spec)?;
@@ -167,6 +176,20 @@ fn check_not_witness(node: &Node) -> Result<(), ApiError> {
         return Err(ApiError::conflict(
             "node_unavailable",
             format!("node {:?} is a witness node and cannot run VMs", node.name),
+        ));
+    }
+    Ok(())
+}
+
+/// 유지보수 노드면 409 `node_unavailable`. 유지보수 노드에는 VM을 새로 놓지 않는다.
+fn check_not_in_maintenance(node: &Node) -> Result<(), ApiError> {
+    if node.spec.maintenance {
+        return Err(ApiError::conflict(
+            "node_unavailable",
+            format!(
+                "node {:?} is in maintenance and cannot take VMs; end maintenance first",
+                node.name
+            ),
         ));
     }
     Ok(())
@@ -432,10 +455,26 @@ pub async fn vm_action(
             let _lock = state.vm_lock.lock().await;
             let vm = modify_spec(&state, id, |spec| {
                 // 고정된 노드는 VM을 고칠 때 확인했지만, 그때 arch를 모르던 노드일 수 있다.
+                // 유지보수 노드에 고정된 꺼진 VM은 다른 노드를 고른다. 아직 그 노드에서 돌거나 멈추는
+                // 중인 VM은 옮기지 않는다.
                 if let Some(node) = spec.node
                     && let Some(node) = state.cluster.get::<NodeSpec>(node)?
                 {
-                    check_node_arch(&node, spec)?;
+                    if node.spec.maintenance && stopped_now(&state, id)? {
+                        let inv = Inventory::load(&state.cluster)?;
+                        let other = schedule(id, spec, &inv).map_err(|_| {
+                            ApiError::conflict(
+                                "node_unavailable",
+                                format!(
+                                    "node {:?} is in maintenance and no other node can run this VM; end maintenance first",
+                                    node.name
+                                ),
+                            )
+                        })?;
+                        spec.node = Some(other);
+                    } else {
+                        check_node_arch(&node, spec)?;
+                    }
                 }
                 if spec.node.is_none() {
                     let inv = Inventory::load(&state.cluster)?;
@@ -483,6 +522,15 @@ pub async fn vm_action(
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
+/// 저장소의 VM이 지금 꺼져 있는지([`is_stopped`]). [`modify_spec`] 안에서 부르면 그 쓰기가 같은 revision을
+/// 확인하므로 읽은 뒤 바뀐 상태로 쓰지 않는다.
+fn stopped_now(state: &AppState, id: Uuid) -> Result<bool, ApiError> {
+    Ok(state
+        .cluster
+        .get::<VmSpec>(id)?
+        .is_some_and(|vm| is_stopped(&vm)))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MigrateRequest {
@@ -506,10 +554,23 @@ pub async fn migrate_vm(
     Json(req): Json<MigrateRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
-    // 두 요청이 함께 검사를 지나 Task를 둘 만들지 않게 한다.
-    let _lock = state.vm_lock.lock().await;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let target = lookup::<NodeSpec>(&state.cluster, &req.node)?;
+    let task = start_migration(&state, vm.id, target.id).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// [`migrate_vm`]의 확인을 하고 VM `vm`을 노드 `target`으로 옮길 `VmMigrate` Task를 원본 노드에 만든다.
+/// 노드 비우기 Task도 쓴다. 오류는 [`migrate_vm`]과 같다.
+pub(crate) async fn start_migration(
+    state: &AppState,
+    vm: Uuid,
+    target: Uuid,
+) -> Result<Task, ApiError> {
+    // 두 요청이 함께 검사를 지나 Task를 둘 만들지 않게 한다.
+    let _lock = state.vm_lock.lock().await;
+    let vm = lookup::<VmSpec>(&state.cluster, &vm.to_string())?;
+    let target = lookup::<NodeSpec>(&state.cluster, &target.to_string())?;
     if vm.spec.node == Some(target.id) {
         return Err(ApiError::bad_request(format!(
             "VM {:?} is already on node {:?}",
@@ -527,10 +588,10 @@ pub async fn migrate_vm(
             format!("VM {:?} is not running", vm.name),
         ));
     };
-    check_not_busy(&state, &vm)?;
-    check_no_snapshot_task(&state, &vm)?;
+    check_not_busy(state, &vm)?;
+    check_no_snapshot_task(state, &vm)?;
     let inv = Inventory::load(&state.cluster)?;
-    check_no_resize_task(&state, &inv, &vm)?;
+    check_no_resize_task(state, &inv, &vm)?;
     for disk in &vm.spec.disks {
         let pool = inv
             .volumes
@@ -583,8 +644,7 @@ pub async fn migrate_vm(
         ));
     }
     let op = TaskOp::VmMigrate { node: target.id };
-    let task = create_task(&state.cluster, op, vm.id, source).await?;
-    Ok((StatusCode::ACCEPTED, Json(task)))
+    create_task(&state.cluster, op, vm.id, source).await
 }
 
 /// VM 디스크의 크기 늘리기 Task가 끝나지 않았으면 409 `vm_busy`. 실행 중인 VM의 디스크는 QMP로

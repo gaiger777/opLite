@@ -4192,6 +4192,9 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "node-upgrade";
+        } | {
+            /** @enum {string} */
+            kind: "node-drain";
         };
         TaskSpec: {
             /**
