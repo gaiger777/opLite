@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료
+- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업(계획 40) 완료·증분 복제(계획 41) 남음
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -1314,18 +1314,22 @@ oplctl pool create bk --nfs nas.lan:/srv/backup --backups    # 백업 풀(디렉
 oplctl pool set local --backups true                         # 있는 dir·NFS 풀을 백업 풀로(false는 끄기)
 oplctl backup create web --pool bk                           # 이름은 web-20261104-030000(UTC)처럼 정해진다
 oplctl backup create web --pool bk --name before-upgrade
+oplctl backup create web --pool bk --incremental             # 할 수 있으면 증분(아래 "증분 백업")
+# backup web-20261105-030000 of vm web created (incremental)     할 수 없었으면 (full: <이유>)
 oplctl backup list                                           # --vm web이면 지금 web인 VM과 web이라는 이름으로 남은(지운 VM) 백업
-# NAME            VM   POOL  PHASE  CREATED               SIZE
-# before-upgrade  web  bk    ready  2026-11-04 03:00 UTC  412.5MiB
-oplctl backup get before-upgrade                             # 디스크별 크기, UEFI 변수, 오류(JSON)
+# NAME                 VM   POOL  PHASE  CREATED               SIZE      TYPE  ORIGIN  REPLICAS
+# before-upgrade       web  bk    ready  2026-11-04 03:00 UTC  412.5MiB  full  -       -
+# web-20261105-030000  web  bk    ready  2026-11-05 03:00 UTC  18.2MiB   incr  -       -
+oplctl backup get before-upgrade                             # 디스크별 크기, UEFI 변수, 오류, 증분이면 부모와 체인(JSON)
 oplctl backup restore before-upgrade --name web2 --pool local   # 새 VM web2(꺼진 채), --node로 노드를 정할 수 있다
 oplctl backup delete before-upgrade                          # 파일과 리소스를 지운다(실패한 백업도)
 ```
 
 웹은 사이드바의 "백업" 화면(모든 백업, VM이 지워진 백업 포함)과 VM 상세의 "백업" 탭(지금 백업, 복원)에서 하고,
 스토리지 풀 화면의 "백업 저장" 스위치로 백업 풀을 정한다. API는 `POST /api/v1/vms/{name}/backups`
-(`{"pool": …, "name": …}`), `GET /api/v1/backups[?vm=]`, `GET`·`DELETE /api/v1/backups/{name}`,
-`POST /api/v1/backups/{name}/restore`(`{"name": …, "pool": …, "node": …}`)이고 만들기·지우기·복원은 작업(Task)을 돌려준다.
+(`{"pool": …, "name": …, "incremental": …}` — `incremental`은 기본 false), `GET /api/v1/backups[?vm=]`,
+`GET`·`DELETE /api/v1/backups/{name}`, `POST /api/v1/backups/{name}/restore`(`{"name": …, "pool": …, "node": …}`)이고
+만들기·지우기·복원은 작업(Task)을 돌려준다.
 `DELETE /api/v1/backups/{name}?force=true`(`oplctl backup delete NAME --force`)는 파일을 지울 노드가 없을 때 리소스만
 지우고 200(`{"message": …}`)이다.
 
@@ -1359,12 +1363,66 @@ oplctl backup delete before-upgrade                          # 파일과 리소�
   지운 뒤 그 이름으로 복원한다.
 - **권한.** 읽기는 모든 사용자, 만들기·지우기·복원은 operator 이상이다(VM이 지워진 백업도 operator가 지운다).
 - **오래 걸린다.** 진행률은 없고 작업에 시간 제한이 없다. `oplctl backup create`·`restore`는 24시간까지 기다리고,
-  그 뒤에도 작업은 돈다(`oplctl task get`). 백업 하나는 디스크 크기만큼 읽고 압축해 쓴다(증분은 없다).
+  그 뒤에도 작업은 돈다(`oplctl task get`). 전체 백업 하나는 디스크 크기만큼 읽고 압축해 쓴다(증분 백업은 바뀐
+  블록만 — 아래).
+
+**증분 백업.** 실행 중인 VM은 QEMU dirty bitmap으로 디스크마다 바뀐 블록을 따라간다. `incremental`(`backup create
+--incremental`, 웹 "지금 백업"의 "증분(가능하면)", 백업 작업의 `full_every`)로 청하면 같은 풀에 있는 그 VM의 바로
+앞 백업을 **부모**로, 그 뒤로 바뀐 블록만 담은 백업을 만든다. 청하지 않으면 지금처럼 전체 백업이다.
+
+- **비트맵 규칙.** 백업이 성공할 때마다(전체든 증분이든, 청하지 않은 백업도) 디스크마다 비트맵 `opl-<백업 id(하이픈
+  없음)>`을 그 백업의 시점에 만들고 다른 `opl-` 비트맵을 지운다. 그래서 VM마다 "마지막으로 성공한 백업 뒤로 바뀐 블록"
+  하나만 있고, 그 백업만 다음 증분의 부모가 된다. 비트맵을 만들지 못해도(경고) 백업은 성공하고 다음은 전체다. 실패한
+  백업은 새 비트맵을 지우고 앞 비트맵을 남긴다(다음 시도도 같은 부모에서 증분). 증분 대상 파일을 닫지 못하면(QEMU가 닫을
+  때 파일의 메타데이터를 쓴다) 그 증분은 실패다. qcow2 디스크(dir·NFS 풀)의 비트맵은 qcow2 파일에 저장돼 VM을 다시 켜도
+  남는다(QEMU가 정상으로 끝날 때 저장한다). 블록 풀 디스크(raw — LVM-thin·ZFS·RBD·공유 LVM(iSCSI))의 비트맵은 QEMU
+  안에만 있어 VM을 다시 켜면 사라지므로 다시 켠 뒤 첫 백업은 전체다. 라이브 마이그레이션은 비트맵을 함께 옮긴다(qcow2의
+  것은 공유 이미지로, raw 디스크의 것은 마이그레이션 스트림으로 — raw 디스크에 비트맵이 있을 때만 QEMU의 `dirty-bitmaps`
+  능력을 켠다). 꺼진 VM을 백업하면 qcow2 디스크에만 비트맵을 둔다. QEMU가 비정상으로 끝나면(SIGKILL, 호스트 장애 — HA
+  복구 포함) qcow2 파일의 비트맵은 inconsistent로 남는다. 그런 비트맵은 쓸 수 없고 마이그레이션·디스크 크기 늘리기를
+  막으므로 opld가 VM을 켤 때(그리고 마이그레이션·실행 중 크기 늘리기 전에) 지운다 — 다음 백업은 전체(`no dirty bitmap on
+  disk{i}`)다. 꺼진 qcow2 디스크의 크기를 늘리면 비트맵도 지운다(크기가 바뀌면 어차피 전체).
+- **꺼진 VM은 늘 전체다.** 증분은 실행 중인 VM만 한다. 그 밖에 증분을 할 수 없으면 오류 없이 전체로 하고 이유를
+  `status.full_reason`(`backup get`, 웹 "전체로 한 이유")에 적는다: `VM is stopped`, `no earlier backup of this VM in
+  pool "P"`, `no dirty bitmap on disk{i}`(그 디스크에 비트맵이 없음 — 블록 풀 VM을 다시 켰거나 디스크를 더함),
+  `dirty bitmap on disk{i} is inconsistent`(비트맵이 기록하지 않거나, 비정상 종료 뒤 지우지 못함 — 비정상 종료·HA
+  복구 뒤에는 VM을 켤 때 지우므로 보통 `no dirty bitmap on disk{i}`가 보인다), `dirty bitmaps do not match a ready
+  backup in pool "P"`(마지막 백업이 다른 풀이거나 지워짐 — 같은 VM을 두 풀에 번갈아 백업하면 늘 전체다), `disks
+  changed since backup "B"`(디스크를 바꾸거나 크기를 늘림), `chain already has N incremental backup(s)`(백업 작업의
+  `full_every`), `some nodes do not support incremental backups yet`(아래 업그레이드), `backup "P" is stored on another
+  node`·`files of backup "P" are missing on this node`(아래 다른 노드의 부모), `backup "P" is being deleted`(부모를 지우는
+  작업이 이미 돌고 있음). 스냅샷 되돌리기는 디스크를 되돌리기 전에 비트맵을 지우므로 그 뒤 첫 백업은 전체다. 증분을
+  만드는 사이 부모가 지워지면 그 증분은 실패하고("parent backup "P" was deleted during the backup") 비트맵을 지워
+  다음은 전체다.
+- **다른 노드의 부모.** 공유가 아닌(디렉터리) 백업 풀의 백업은 쓴 노드에만 있다(`status.node`). VM이 다른 노드로
+  옮겨졌으면 비트맵은 맞아도 부모 파일이 그 노드에 없어 체인을 복원할 수 없으므로 전체로 한다(위 이유). 백업 풀이
+  NFS(공유)면 어느 노드에서나 이어서 증분한다.
+- **체인.** 증분 백업은 부모 없이는 복원할 수 없다. 부모를 거슬러 전체 백업까지가 그 백업의 **체인**이다. 목록의
+  `TYPE`은 `full`·`incr`(웹 "종류" 배지와 "부모:" 링크)이고, 증분의 `SIZE`는 자기 파일 크기다. `backup get`은 증분
+  백업에 `chain: {"backups": [전체부터 이것까지 이름], "stored_bytes": 체인 파일 크기의 합}`을 더하고(다 만들지 않은
+  백업이 체인에 있거나 목록에 없는 조상이 있으면 `stored_bytes`는 없다 — 목록에 없는 조상은 id로 적는다), 웹은 크기
+  아래 "체인 <크기>"를 보인다(같은 경우 보이지 않는다). 복원은 체인의 모든 백업이 같은 풀에 `ready`로 있고 디스크
+  수·크기가 맞아야 한다(아니면 작업 실패 "backup chain is broken: …"). 체인 중간에서도 복원한다(그 시점의 디스크).
+- **지우기는 자식부터.** 다른 백업의 부모인 백업을 지우면 **409** `backup_in_use`("backup "B" is the parent of N
+  incremental backup(s); delete them first", `--force`여도)다. 가장 새 증분부터 지운다. 만드는 중인 증분도 부모를
+  막고, 실패한 증분은 막지 않는다. 병합(체인 줄이기)은 없다.
+- **opLite 밖에서 디스크를 고쳤으면**(VM을 끄고 `qemu-img`·`qemu-io`·`guestfish`로 쓰기, 볼륨 파일 바꾸기) 비트맵이
+  그 쓰기를 모르므로 다음 백업을 `incremental` 없이(전체로) 한다. 그 뒤로는 다시 증분이 맞다. qcow2 디스크에 비트맵이
+  있으면 `qemu-img snapshot -a`(되돌리기)가 "Device has active dirty bitmaps"로 실패한다 — opLite의 스냅샷 되돌리기를
+  쓰거나 먼저 `qemu-img bitmap --remove <파일> opl-<id>`로 지운다(그 뒤 첫 백업은 전체).
+- **업그레이드 중.** 클러스터의 모든 노드(위트니스 포함)에 증분 백업 기능이 있어야 `incremental`을 받는다(아니면
+  **409** `cluster_upgrading`). 기능이 없는 노드가 하나라도 있으면 백업은 비트맵을 만들지 않고 증분 요청은 전체로 한다
+  (옛 노드는 되돌리기 전에 비트맵을 지우지 못하므로). 증분 백업의 복원은 복원하는 노드에 그 기능이 있어야 한다(**409**
+  `cluster_upgrading` "node "X" does not support incremental backups yet; upgrade it first").
+- **원격 복제는 아직 없다.** 증분 백업은 원격으로 복제하지 않는다(**400** `invalid_request` "incremental backups cannot
+  be replicated yet"; 웹은 증분 백업의 "원격으로 복제" 버튼을 이유와 함께 막는다). 백업 작업에 `full_every`와
+  `replicate`를 함께 둘 수 없다(아래 "원격 복제(DR)").
 
 **파일 형식과 opLite 없이 열기.** 백업 하나는 백업 풀 루트의 `backups/{백업 id}/` 디렉터리다(id는 `oplctl backup
 get NAME`의 `id`; NFS 풀이면 NFS 서버의 내보내기 아래 같은 경로). 그 안에 디스크마다 압축 qcow2 `disk0.qcow2`,
 `disk1.qcow2`…(backing file 없음, 스냅샷 없음), UEFI VM이면 변수 파일 `vars.fd`, 그리고 `manifest.json`(형식 버전
-`version: 1`, 백업 id, VM id·이름, VM 스펙 전체, 디스크 목록과 크기, 만든 시각)이 있다. 표준 qcow2라 opLite 없이도 연다:
+`version: 1`, 백업 id, VM id·이름, VM 스펙 전체, 디스크 목록과 크기, 만든 시각)이 있다. 증분 백업의 매니페스트는
+`version: 2`이고 부모 백업 id `parent`가 더 있다. 표준 qcow2라 opLite 없이도 연다:
 
 ```bash
 qemu-img info backups/<id>/disk0.qcow2                                  # 크기 확인
@@ -1373,8 +1431,20 @@ qemu-system-x86_64 -m 2048 -drive file=backups/<id>/disk0.qcow2,snapshot=on   # 
 jq .vm_spec backups/<id>/manifest.json                                 # CPU·메모리·NIC 등 VM 설정
 ```
 
-UEFI VM은 OVMF(arm64는 AAVMF) 코드 파일과 함께 `vars.fd`의 사본을 `-drive if=pflash`로 준다. 다른 형식 버전의
+UEFI VM은 OVMF(arm64는 AAVMF) 코드 파일과 함께 `vars.fd`의 사본을 `-drive if=pflash`로 준다. 형식 버전 1·2가 아닌
 매니페스트는 복원하지 않는다(작업이 실패한다).
+
+증분 백업의 디스크 파일은 바뀐 블록만 담고 헤더에 부모(backing file)가 **없다** — 혼자 열면 바뀌지 않은 곳이 0으로
+보인다. 체인은 `manifest.json`의 `parent`로만 이어지므로, 열 때 `json:` 이미지 옵션으로 부모를 직접 적는다(자식이
+바깥, 맨 끝 전체 백업은 `"backing": null`). 증분이 여럿이면 `backing` 안에 차례로 겹친다:
+
+```bash
+jq -r .parent backups/<증분 id>/manifest.json          # 부모 id(전체 백업이면 null)
+CHAIN='json:{"driver":"qcow2","file":{"driver":"file","filename":"backups/<증분 id>/disk0.qcow2"},
+  "backing":{"driver":"qcow2","file":{"driver":"file","filename":"backups/<전체 id>/disk0.qcow2"},"backing":null}}'
+qemu-img convert -O qcow2 "$CHAIN" disk0-full.qcow2   # 체인을 이미지 하나로(이것을 위처럼 연다)
+qemu-img compare "$CHAIN" disk0-full.qcow2            # Images are identical.
+```
 
 **백업 작업(예약 백업과 보존).** 백업 작업은 정한 VM들을 정한 시각에 백업 풀로 백업하고, 보존 규칙에 맞지 않는
 오래된 백업을 지운다.
@@ -1383,11 +1453,14 @@ UEFI VM은 OVMF(arm64는 AAVMF) 코드 파일과 함께 `vars.fd`의 사본을 `
 oplctl backup-job create nightly --pool bk --all --at 03:00 --keep-daily 7 --keep-weekly 4   # 모든 VM, 매일 03:00 UTC
 oplctl backup-job create prod --pool bk --label tier=prod --at 01:30 --days mon,thu --keep-last 3
 oplctl backup-job create db --pool bk --vm db --vm db2 --at 02:00 --keep-last 2 --keep-monthly 6 --disabled
+oplctl backup-job create weekly-full --pool bk --all --at 03:00 --keep-daily 14 --full-every 6   # 매일 증분, 증분 6개마다 전체
 oplctl backup-job list
-# NAME     POOL  VMS        SCHEDULE              KEEP              ENABLED  NEXT                  LAST
-# nightly  bk    all        daily 03:00 UTC       daily=7,weekly=4  true     2026-11-05 03:00 UTC  2026-11-04 03:00 UTC (12 ok, 1 failed)
+# NAME         POOL  VMS  SCHEDULE                       KEEP              ENABLED  NEXT                  LAST
+# nightly      bk    all  daily 03:00 UTC                daily=7,weekly=4  true     2026-11-05 03:00 UTC  2026-11-04 03:00 UTC (12 ok, 1 failed)
+# weekly-full  bk    all  daily 03:00 UTC, full every 6  daily=14          true     2026-11-05 03:00 UTC  -
 oplctl backup-job get nightly                  # 일정·보존·다음 실행·마지막 실행 결과와 VM별 오류(JSON)
 oplctl backup-job set prod --at 04:00 --keep-last 5 --enabled true   # 준 값만 바꾼다(보존은 준 단위만, 나머지는 그대로)
+oplctl backup-job set prod --full-every 0      # 늘 전체 백업으로
 oplctl backup-job run nightly                  # 지금 실행(스케줄러의 다음 확인 때 시작한다)
 oplctl backup-job delete nightly               # 작업만 지운다. 만든 백업은 남는다
 ```
@@ -1416,14 +1489,27 @@ oplctl backup-job delete nightly               # 작업만 지운다. 만든 백
   건드리지 않는다. 실행이 끝난 뒤에는 스케줄러가 확인할 때마다 보존 규칙을 다시 보므로, 그때 지우지 못한
   백업(복제·복원 중이라 `backup_busy`)은 그 일이 끝나면 지우고, 실행 뒤에 보존 값을 줄이면 다음 확인 때 지운다.
   지우기 Task가 실패한 백업은 다음 실행이 끝날 때 다시 지운다.
+  남는 백업(실패하지 않은 모든 백업 — 다른 작업·손으로 만든 증분도)의 조상은 보존 규칙이 지울 것이어도 남긴다(그
+  체인으로 복원해야 하므로). 지울 것은 자식부터 지우고, 자식이 남아 `backup_in_use`인 부모는 다음 확인 때 지운다.
+  그래서 증분을 쓰면 보존 값보다 백업이 더 남을 수 있다 — 작업이 만든 체인은 `full_every`가 상한이다(수동
+  `--incremental`은 상한 없음).
+- **증분 작업(`full_every`).** `--full-every N`(API `full_every`, 웹 "전체 백업 사이의 증분 백업 수")이 0보다 크면
+  작업은 백업을 증분으로 청하고(위 "증분 백업"), 체인에 증분이 N개 쌓이면 다음은 전체로 해 새 체인을 시작한다(이유
+  `chain already has N incremental backup(s)`). 예: 매일 + `--full-every 6`이면 주마다 전체 하나와 증분 여섯이다. 할 수
+  없으면(꺼진 VM 등) 그 백업만 전체다. 0(기본)이면 늘 전체다. 모든 노드에 증분 백업 기능이 있어야 하고(409
+  `cluster_upgrading`), `--replicate`와 함께 두면 **400**("replicating incremental backups is not supported yet")이다.
+  `backup-job list`의 `SCHEDULE` 칸에는 `, full every N`, 웹 작업 표의 일정 칸에는 "증분, 증분 n개마다 전체"가 보인다.
 - **작업을 지워도 백업은 남는다.** 그 백업은 더는 보존 규칙으로 지워지지 않으니 `oplctl backup delete`로 지운다.
 - 웹은 사이드바 "백업" 아래 "백업 작업" 화면(만들기·편집·지우기·지금 실행, 다음·마지막 실행 시각은 UTC로 표시)에서
   한다. API는 `GET`·`POST /api/v1/backup-jobs`, `GET`·`PATCH`·`DELETE /api/v1/backup-jobs/{name}`,
   `POST /api/v1/backup-jobs/{name}/run`이고, 읽기는 모든 사용자, 쓰기는 operator 이상이다. 스케줄러의 확인 간격은
   `[backup] tick_secs`(기본 60초)다.
 
-- **한계.** 증분·변경 블록 추적, 중복 제거, 암호화, 원격(S3) 저장소, 게스트 에이전트로 얼리기, 파일 단위 복원, 기존
-  VM 덮어쓰기는 없다. 다른 opLite 클러스터로 사본을 보내는 것은 아래 "원격 복제(DR)"다.
+- **한계.** 중복 제거, 암호화, 원격(S3) 저장소, 게스트 에이전트로 얼리기, 파일 단위 복원, 기존 VM 덮어쓰기는 없다.
+  다른 opLite 클러스터로 사본을 보내는 것은 아래 "원격 복제(DR)"다. 증분 백업은: 꺼진 VM은 늘 전체(매일 백업하는
+  꺼진 VM은 매일 전체를 쓴다), 블록 풀 VM은 다시 켠 뒤 첫 백업이 전체, VM마다 비트맵이 하나라 두 풀에 번갈아 백업하면
+  늘 전체, 체인 병합과 중간 백업 지우기 없음, 증분 파일만으로는 복원할 수 없음(opLite 밖에서는 위처럼 체인을 적어
+  연다), 원격 복제 없음(계획 41).
 - **남을 수 있는 것.** 작업을 만들기 전에 실패하거나 작업이 사라져 `pending`에 머문 백업은 저절로 치워지지 않는다 —
   `oplctl backup delete`로 지운다. 실행 중 백업이 임시 스냅샷을 지우지 못하면 qcow2 디스크에 그 태그가 남을 수 있다
   (블록 풀 디스크는 opld가 나중에 지운다; qcow2는 VM을 끄고 `qemu-img snapshot -d <태그> <파일>`). 복원이 볼륨을
@@ -1589,7 +1675,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
-볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·복원·지우기·원격으로 복제)과 백업 작업(원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 비우기, 죽은 노드 제거), 작업, 감사 로그(admin),
+볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·증분·복원·지우기·원격으로 복제)과 백업 작업(증분 주기·원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 비우기, 죽은 노드 제거), 작업, 감사 로그(admin),
 사용자(admin), 인증 영역(LDAP·OIDC, admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 원격 클러스터(상태 카드, 원격 VM 목록과 동작), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `oplctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
@@ -2271,14 +2357,14 @@ oplctl backup-job create nightly --pool bk --all --at 03:00 --keep-daily 7 --rep
 oplctl backup-job set db --replicate dr/dr-bk       # 있는 작업에 켜기(대상 바꾸기도 같다)
 oplctl backup-job set db --no-replicate             # 끄기(이미 보낸 사본은 남는다)
 oplctl backup list
-# NAME                 VM   POOL  PHASE  CREATED               SIZE      ORIGIN  REPLICAS
-# web-20261107-030000  web  bk    ready  2026-11-07 03:00 UTC  412.5MiB  -       dr:ready
+# NAME                 VM   POOL  PHASE  CREATED               SIZE      TYPE  ORIGIN  REPLICAS
+# web-20261107-030000  web  bk    ready  2026-11-07 03:00 UTC  412.5MiB  full  -       dr:ready
 oplctl backup delete web-20261107-030000            # dr의 사본도 지운다
 
 # dr에서
 oplctl backup list
-# NAME                 VM   POOL   PHASE  CREATED               SIZE      ORIGIN         REPLICAS
-# web-20261107-030000  web  dr-bk  ready  2026-11-07 03:00 UTC  412.5MiB  prod/019a5b1c  -
+# NAME                 VM   POOL   PHASE  CREATED               SIZE      TYPE  ORIGIN         REPLICAS
+# web-20261107-030000  web  dr-bk  ready  2026-11-07 03:00 UTC  412.5MiB  full  prod/019a5b1c  -
 ```
 
 - **수동 복제.** `oplctl backup replicate <백업> --remote <원격> --pool <원격의 백업 풀> [--wait]`(API `POST
@@ -2343,6 +2429,9 @@ oplctl backup list
    복원) 한다. prod를 새로 만들었으면 옛 원본이 없어 dr의 옛 사본은 보존 규칙으로 지워지지 않으므로 dr에서 지운다.
 
 - **한계.**
+  - 증분 백업(위 "백업과 복원"의 "증분 백업")은 아직 복제하지 않는다: `backup replicate`는 **400** `invalid_request`
+    ("incremental backups cannot be replicated yet"), 백업 작업은 `full_every`와 `replicate`를 함께 둘 수 없다(**400**).
+    전체 백업만 보낸다.
   - 매번 백업 전체를 보낸다(증분·중복 제거·압축 추가 없음 — 백업 파일 그대로). 대역폭 제한이 없어 큰 백업은 링크를
     채운다(스케줄러는 노드마다 복제 하나). 진행률이 없다.
   - 보내는 동안 멈추면 처음부터 다시 보낸다(파일 단위로 다시 쓴다 — 이어 보내기 없음). 파일 하나를 24시간 넘게
@@ -2560,6 +2649,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [설치·업데이트·구독 설계 (하위 프로젝트 9: 계획 31·32·33)](docs/superpowers/specs/2026-11-05-install-update-subscription-design.md)
 - [엔터프라이즈 설계 (하위 프로젝트 10: 계획 34~38)](docs/superpowers/specs/2026-11-06-enterprise-design.md)
 - [노드 유지보수(노드 비우기) 설계 (하위 프로젝트 11: 계획 39)](docs/superpowers/specs/2026-11-09-node-maintenance-design.md)
+- [증분 백업·증분 복제 설계 (하위 프로젝트 12: 계획 40·41)](docs/superpowers/specs/2026-11-09-incremental-backup-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)
