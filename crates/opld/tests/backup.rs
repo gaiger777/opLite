@@ -352,6 +352,158 @@ async fn stopped_vm_backup_with_raw_disk_restores_both_disks() {
     d.stop();
 }
 
+/// 압축되지 않는 데이터(xorshift) `len` 바이트를 qcow2 파일의 `offset`에 쓴다.
+fn fill_qcow2(d: &Daemon, file: &Path, offset: u64, len: usize) {
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let data: Vec<u8> = (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    let src = d.path("fill.bin");
+    std::fs::write(&src, data).unwrap();
+    let ok = Command::new("qemu-io")
+        .args(["-f", "qcow2", "-c"])
+        .arg(format!("write -s {} {offset} {len}", src.display()))
+        .arg(file)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("run qemu-io")
+        .success();
+    assert!(ok, "qemu-io write to {}", file.display());
+    std::fs::remove_file(&src).unwrap();
+}
+
+/// 실행 중인 VM의 전체 백업 뒤 바뀐 블록만 증분 백업에 담기고, 증분 백업에서 복원한 디스크는 원본과 같다.
+#[tokio::test]
+async fn incremental_backup_of_a_running_vm_restores_the_same_disk() {
+    let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
+    setup(&mut d).await;
+    let c = client(&d);
+    let root = create_volume(&d, "root", "qcow2").await;
+    fill_qcow2(&d, &root, 1 << 20, 4 << 20);
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--start",
+    ])
+    .await
+    .unwrap();
+
+    // 앞 백업이 없으니 첫 백업은 전체다. 이 백업의 비트맵이 디스크에 남는다.
+    let out = d
+        .ctl(&[
+            "backup",
+            "create",
+            "web",
+            "--pool",
+            "bk",
+            "--name",
+            "full",
+            "--incremental",
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        "backup full of vm web created (full: no earlier backup of this VM in pool \"bk\")\n"
+    );
+
+    // 게스트가 없어 VM을 끄고 쓴다. qcow2 디스크의 비트맵은 이미지에 저장돼 이 쓰기도 남는다.
+    // `vm stop --force`도 먼저 QMP `quit`을 보내므로 QEMU가 끝나면서 persistent 비트맵을 저장한다. 10초
+    // 안에 끝나지 않아 SIGKILL로 끝나면 비트맵이 inconsistent로 남아(다시 켤 때 지운다) 아래 증분이
+    // 전체가 되고 이 시험은 실패한다.
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    mark_qcow2(&root, 0xcd);
+    let out = d.ctl(&["vm", "start", "web"]).await.unwrap();
+    assert!(out.contains("vm web: start done"), "{out}");
+
+    let out = d
+        .ctl(&[
+            "backup",
+            "create",
+            "web",
+            "--pool",
+            "bk",
+            "--name",
+            "incr",
+            "--incremental",
+        ])
+        .await
+        .unwrap();
+    assert_eq!(out, "backup incr of vm web created (incremental)\n");
+    let full = c.get("/backups/full").await.unwrap();
+    let incr = d.ctl_json(&["backup", "get", "incr"]).await;
+    assert_eq!(incr["status"]["phase"], "ready", "{incr}");
+    assert_eq!(incr["status"]["parent"], full["id"], "{incr}");
+    assert!(incr["status"]["full_reason"].is_null(), "{incr}");
+    // 증분 파일은 바뀐 64 KiB만 담아 전체 백업(4 MiB)보다 훨씬 작다.
+    let full_bytes = full["status"]["disks"][0]["stored_bytes"].as_u64().unwrap();
+    let incr_bytes = incr["status"]["disks"][0]["stored_bytes"].as_u64().unwrap();
+    assert!(full_bytes > 4 << 20, "{full}");
+    assert!(incr_bytes < 1 << 20, "{incr}");
+    assert_eq!(
+        incr["chain"],
+        json!({ "backups": ["full", "incr"], "stored_bytes": full_bytes + incr_bytes })
+    );
+    let dir = backup_dir(&d, &incr);
+    let disk = dir.join("disk0.qcow2");
+    assert_eq!(std::fs::metadata(&disk).unwrap().len(), incr_bytes);
+    assert!(qemu_img_info(&disk)["backing-filename"].is_null());
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["version"], 2, "{manifest}");
+    assert_eq!(manifest["parent"], full["id"], "{manifest}");
+    let list = d.ctl(&["backup", "list", "--vm", "web"]).await.unwrap();
+    let types: Vec<(&str, &str)> = list
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            (cols[0], cols[cols.len() - 3])
+        })
+        .collect();
+    assert!(types.contains(&("full", "full")), "{list}");
+    assert!(types.contains(&("incr", "incr")), "{list}");
+
+    // 증분 백업에서 복원하면 체인을 열어 원본 디스크와 같다.
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&[
+        "backup", "restore", "incr", "--name", "copy", "--pool", "local",
+    ])
+    .await
+    .unwrap();
+    let copy_file = volume_file(&d, "copy-disk0").await;
+    let same = Command::new("qemu-img")
+        .args(["compare", "-q", "-f", "qcow2", "-F", "qcow2"])
+        .arg(&copy_file)
+        .arg(&root)
+        .status()
+        .expect("run qemu-img")
+        .success();
+    assert!(same, "restored disk differs from the original");
+    assert_eq!(head(&d, &copy_file), vec![0xcd; MARK]);
+
+    // 부모는 증분 백업을 지운 뒤에 지운다.
+    let err = d.ctl(&["backup", "delete", "full"]).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("is the parent of 1 incremental backup(s)"),
+        "{err}"
+    );
+    for name in ["incr", "full"] {
+        d.ctl(&["backup", "delete", name]).await.unwrap();
+    }
+    for vm in ["copy", "web"] {
+        d.ctl(&["vm", "delete", vm]).await.unwrap();
+    }
+    for volume in ["copy-disk0", "root"] {
+        d.ctl(&["volume", "delete", volume]).await.unwrap();
+    }
+    d.stop();
+}
+
 /// 백업 작업 `job`의 실행 하나가 끝날 때까지 기다리고 작업을 돌려준다. `before`는 실행을 요청하기 전의
 /// `last_run`이다.
 async fn wait_job_run(c: &Client, job: &str, before: &Value) -> Value {

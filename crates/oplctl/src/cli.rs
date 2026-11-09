@@ -1127,6 +1127,10 @@ enum BackupCmd {
         /// 생략하면 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC)다.
         #[arg(long)]
         name: Option<String>,
+        /// 할 수 있으면 증분으로(같은 풀의 바로 앞 백업을 부모로 바뀐 블록만) 백업한다. 할 수 없으면
+        /// 전체로 하고 그 이유를 보인다.
+        #[arg(long)]
+        incremental: bool,
     },
     /// 백업 목록. VM을 지운 백업도 보인다.
     List {
@@ -1134,9 +1138,8 @@ enum BackupCmd {
         #[arg(long)]
         vm: Option<String>,
     },
-    Get {
-        backup: String,
-    },
+    /// 백업(JSON). 증분 백업은 `chain`에 전체 백업부터 이 백업까지의 이름과 체인 파일 크기의 합을 더한다.
+    Get { backup: String },
     /// 백업 파일과 기록을 지운다. 실패한 백업도 지운다.
     Delete {
         backup: String,
@@ -1268,6 +1271,9 @@ struct BackupJobCreate {
     /// 작업이 만든 백업을 원격의 백업 풀에 사본으로 보낸다.
     #[arg(long, value_name = "REMOTE/POOL", value_parser = parse_replicate)]
     replicate: Option<Value>,
+    /// 1 이상이면 할 수 있을 때 증분으로 백업하고, 체인의 증분이 N개가 되면 다음은 전체다. 0이면 늘 전체.
+    #[arg(long, value_name = "N")]
+    full_every: Option<u32>,
 }
 
 #[derive(Args)]
@@ -1275,7 +1281,7 @@ struct BackupJobCreate {
 #[command(group(ArgGroup::new("change").required(true).multiple(true).args([
     "all", "vms", "labels", "pool", "at", "days",
     "keep_last", "keep_daily", "keep_weekly", "keep_monthly", "enabled",
-    "replicate", "no_replicate",
+    "replicate", "no_replicate", "full_every",
 ])))]
 struct BackupJobSet {
     job: String,
@@ -1300,6 +1306,9 @@ struct BackupJobSet {
     /// 원격 복제를 끈다. 이미 보낸 사본은 남는다.
     #[arg(long)]
     no_replicate: bool,
+    /// 1 이상이면 할 수 있을 때 증분으로 백업하고, 체인의 증분이 N개가 되면 다음은 전체다. 0이면 늘 전체.
+    #[arg(long, value_name = "N")]
+    full_every: Option<u32>,
 }
 
 /// `--replicate`의 `REMOTE/POOL`을 `replicate` 값(`{ remote, pool }`)으로
@@ -1371,6 +1380,10 @@ fn backup_job_create_body(args: &BackupJobCreate) -> Value {
     if let Some(replicate) = &args.replicate {
         body["spec"]["replicate"] = replicate.clone();
     }
+    // 주지 않으면 보내지 않는다(옛 서버는 모르는 필드를 거절한다).
+    if let Some(full_every) = args.full_every {
+        body["spec"]["full_every"] = json!(full_every);
+    }
     body
 }
 
@@ -1406,6 +1419,9 @@ fn backup_job_set_body(args: &BackupJobSet, current: &Value) -> Value {
         body["replicate"] = replicate.clone();
     } else if args.no_replicate {
         body["replicate"] = Value::Null;
+    }
+    if let Some(full_every) = args.full_every {
+        body["full_every"] = json!(full_every);
     }
     body
 }
@@ -3543,22 +3559,12 @@ async fn backup(
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     match cmd {
-        BackupCmd::Create { vm, pool, name } => {
-            let body = json!({ "pool": pool, "name": name });
-            let task = client
-                .post(&format!("/vms/{}/backups", seg(&vm)), &body)
-                .await?;
-            client.wait_task_for(&task, BACKUP_WAIT).await?;
-            // 이름을 주지 않았으면 서버가 정한 이름을 읽는다.
-            let name = match name {
-                Some(name) => name,
-                None => {
-                    let id = cell(&task["spec"]["op"]["backup"]);
-                    cell(&client.get(&format!("/backups/{}", seg(&id))).await?["name"])
-                }
-            };
-            writeln!(out, "backup {name} of vm {vm} created")?;
-        }
+        BackupCmd::Create {
+            vm,
+            pool,
+            name,
+            incremental,
+        } => backup_create(client, &vm, &pool, name, incremental, out).await?,
         BackupCmd::List { vm } => {
             let mut r = client.request(Method::GET, "/backups");
             if let Some(vm) = &vm {
@@ -3567,10 +3573,13 @@ async fn backup(
             let list = client.send(r).await?;
             print_list(out, json_out, &list, BACKUP_HEADERS, backup_row)?;
         }
-        BackupCmd::Get { backup } => print_json(
-            out,
-            &client.get(&format!("/backups/{}", seg(&backup))).await?,
-        )?,
+        BackupCmd::Get { backup } => {
+            let mut b = client.get(&format!("/backups/{}", seg(&backup))).await?;
+            if b["status"]["parent"].is_string() {
+                b["chain"] = backup_chain(&b, &items(&client.get("/backups").await?));
+            }
+            print_json(out, &b)?
+        }
         BackupCmd::Delete { backup, force } => backup_delete(client, &backup, force, out).await?,
         BackupCmd::Restore {
             backup,
@@ -3593,6 +3602,85 @@ async fn backup(
         } => backup_replicate(client, &backup, &remote, &pool, wait, out).await?,
     }
     Ok(())
+}
+
+/// `backup create`: 백업 Task를 기다린다. 증분을 청했으면 증분이 됐는지, 아니면 전체로 한 이유를 보인다.
+async fn backup_create(
+    client: &Client,
+    vm: &str,
+    pool: &str,
+    name: Option<String>,
+    incremental: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let mut body = json!({ "pool": pool, "name": name });
+    // 청하지 않으면 보내지 않는다(옛 서버는 모르는 필드를 거절한다).
+    if incremental {
+        body["incremental"] = json!(true);
+    }
+    let task = client
+        .post(&format!("/vms/{}/backups", seg(vm)), &body)
+        .await?;
+    client.wait_task_for(&task, BACKUP_WAIT).await?;
+    // 이름을 주지 않았거나 증분을 청했으면 만든 백업을 읽는다.
+    let backup = if name.is_none() || incremental {
+        let id = cell(&task["spec"]["op"]["backup"]);
+        client.get(&format!("/backups/{}", seg(&id))).await?
+    } else {
+        Value::Null
+    };
+    let name = name.unwrap_or_else(|| cell(&backup["name"]));
+    let kind = if !incremental {
+        String::new()
+    } else if backup["status"]["parent"].is_string() {
+        " (incremental)".into()
+    } else {
+        format!(" (full: {})", cell(&backup["status"]["full_reason"]))
+    };
+    writeln!(out, "backup {name} of vm {vm} created{kind}")?;
+    Ok(())
+}
+
+/// 증분 백업의 체인: 전체 백업부터 이 백업까지의 이름과 그 파일 크기의 합. `backups`는 백업 목록이고,
+/// 거기 없는 조상은 id로 적고 거기서 멈춘다(이미 본 백업이 다시 나와도 멈춘다). 체인을 끝까지 따라가지
+/// 못했거나 다 만들지 않은(`ready`가 아닌) 백업이 있으면 크기는 모르므로(부분 합은 보이지 않는다) 이름만
+/// 적는다.
+fn backup_chain(backup: &Value, backups: &[Value]) -> Value {
+    let stored = |b: &Value| -> u64 {
+        b["status"]["disks"].as_array().map_or(0, |disks| {
+            disks
+                .iter()
+                .filter_map(|d| d["stored_bytes"].as_u64())
+                .sum()
+        })
+    };
+    let ready = |b: &Value| b["status"]["phase"] == "ready";
+    let mut names = vec![cell(&backup["name"])];
+    let mut total = stored(backup);
+    let mut sized = ready(backup);
+    let mut seen = std::collections::HashSet::from([backup["id"].clone()]);
+    let mut parent = backup["status"]["parent"].clone();
+    while let Some(id) = parent.as_str() {
+        if !seen.insert(parent.clone()) {
+            sized = false;
+            break;
+        }
+        let Some(b) = backups.iter().find(|b| b["id"] == id) else {
+            names.push(id.to_string());
+            sized = false;
+            break;
+        };
+        names.push(cell(&b["name"]));
+        total += stored(b);
+        sized &= ready(b);
+        parent = b["status"]["parent"].clone();
+    }
+    names.reverse();
+    if sized {
+        json!({ "backups": names, "stored_bytes": total })
+    } else {
+        json!({ "backups": names })
+    }
 }
 
 /// `backup replicate`: 복제 Task를 만든다. `wait`이면 끝날 때까지 기다리고, 아니면 Task를 따라가는
@@ -3654,12 +3742,12 @@ async fn backup_delete(
 
 /// `backup list`의 열
 const BACKUP_HEADERS: &[&str] = &[
-    "NAME", "VM", "POOL", "PHASE", "CREATED", "SIZE", "ORIGIN", "REPLICAS",
+    "NAME", "VM", "POOL", "PHASE", "CREATED", "SIZE", "TYPE", "ORIGIN", "REPLICAS",
 ];
 
-/// `backup list`의 한 행. VM은 만든 때의 이름이고(VM을 지웠어도 남는다), SIZE는 백업 파일 크기의 합이다.
-/// ORIGIN은 원격에서 받은 사본의 `<보낸 클러스터>/<원본 id 앞 8자>`, REPLICAS는 원격 사본마다
-/// `<원격>:<상태>`다.
+/// `backup list`의 한 행. VM은 만든 때의 이름이고(VM을 지웠어도 남는다), SIZE는 백업 파일 크기의 합이다
+/// (증분 백업은 증분 파일만). TYPE은 부모가 있으면 `incr`, 아니면 `full`이다. ORIGIN은 원격에서 받은
+/// 사본의 `<보낸 클러스터>/<원본 id 앞 8자>`, REPLICAS는 원격 사본마다 `<원격>:<상태>`다.
 fn backup_row(b: &Value) -> Vec<String> {
     let status = &b["status"];
     let created = status["created_at"]
@@ -3695,6 +3783,12 @@ fn backup_row(b: &Value) -> Vec<String> {
         cell(&status["phase"]),
         created,
         size,
+        if status["parent"].is_string() {
+            "incr"
+        } else {
+            "full"
+        }
+        .into(),
         origin,
         replicas,
     ]
@@ -3783,7 +3877,10 @@ fn backup_job_row(j: &Value) -> Vec<String> {
         Some(days) if !days.is_empty() => days.iter().map(cell).collect::<Vec<_>>().join(","),
         _ => "daily".to_string(),
     };
-    let schedule = format!("{days} {} UTC", cell(&spec["schedule"]["at"]));
+    let mut schedule = format!("{days} {} UTC", cell(&spec["schedule"]["at"]));
+    if let Some(n) = spec["full_every"].as_u64().filter(|n| *n > 0) {
+        schedule.push_str(&format!(", full every {n}"));
+    }
     let keep: Vec<String> = ["last", "daily", "weekly", "monthly"]
         .iter()
         .filter_map(|unit| match spec["keep"][unit].as_u64() {
@@ -5780,7 +5877,14 @@ mod tests {
         };
         assert!(matches!(
             parse(&["create", "web", "--pool", "bk"]).unwrap(),
-            BackupCmd::Create { vm, pool, name: None } if vm == "web" && pool == "bk"
+            BackupCmd::Create { vm, pool, name: None, incremental: false } if vm == "web" && pool == "bk"
+        ));
+        assert!(matches!(
+            parse(&["create", "web", "--pool", "bk", "--incremental"]).unwrap(),
+            BackupCmd::Create {
+                incremental: true,
+                ..
+            }
         ));
         assert!(matches!(
             parse(&["create", "web", "--pool", "bk", "--name", "before-upgrade"]).unwrap(),
@@ -5848,6 +5952,7 @@ mod tests {
                 "ready",
                 "2026-11-04 03:00 UTC",
                 "3.5GiB",
+                "full",
                 "-",
                 "-"
             ]
@@ -5858,6 +5963,196 @@ mod tests {
             "status": { "phase": "pending", "created_at": null, "disks": [] }
         });
         assert_eq!(backup_row(&pending)[3..6], ["pending", "-", "-"]);
+        // 부모가 있으면 증분이고, 크기는 증분 파일만이다.
+        let incr = json!({
+            "name": "web-2", "spec": { "vm_name": "web", "pool": "bk", "incremental": true },
+            "status": {
+                "phase": "ready", "created_at": 1_793_761_200,
+                "parent": "019a4f2c-1111-7000-8000-000000000000",
+                "disks": [{ "name": "disk0", "stored_bytes": 1u64 << 20 }]
+            }
+        });
+        assert_eq!(backup_row(&incr)[5..7], ["1.0MiB", "incr"]);
+        // 증분을 청했어도 전체로 했으면 전체다.
+        let full = json!({
+            "name": "web-1", "spec": { "vm_name": "web", "pool": "bk", "incremental": true },
+            "status": {
+                "phase": "ready", "created_at": 1_793_761_200,
+                "full_reason": "VM is stopped", "disks": []
+            }
+        });
+        assert_eq!(backup_row(&full)[6], "full");
+    }
+
+    #[test]
+    fn backup_chain_names_the_backups_from_the_full_one() {
+        let backup = |id: &str, name: &str, parent: Option<&str>, bytes: u64| {
+            json!({
+                "id": id, "name": name,
+                "status": { "phase": "ready", "parent": parent, "disks": [
+                    { "name": "disk0", "stored_bytes": bytes },
+                    { "name": "disk1", "stored_bytes": 1 }
+                ] }
+            })
+        };
+        let all = [
+            backup("a", "full", None, 1000),
+            backup("b", "incr-1", Some("a"), 100),
+            backup("c", "incr-2", Some("b"), 10),
+            backup("x", "other", None, 5),
+        ];
+        assert_eq!(
+            backup_chain(&all[2], &all),
+            json!({ "backups": ["full", "incr-1", "incr-2"], "stored_bytes": 1113 })
+        );
+        // 목록에 없는 조상은 id로 적고 멈춘다. 체인 크기는 모른다.
+        assert_eq!(
+            backup_chain(&all[2], &all[1..]),
+            json!({ "backups": ["a", "incr-1", "incr-2"] })
+        );
+        // 다 만들지 않은 백업이 있으면 크기는 적지 않는다.
+        let mut pending = all.clone();
+        pending[0]["status"]["phase"] = json!("failed");
+        assert_eq!(
+            backup_chain(&pending[2], &pending),
+            json!({ "backups": ["full", "incr-1", "incr-2"] })
+        );
+        // 잘못된 목록에서 고리를 이루어도 멈춘다. 전체 백업에 닿지 못했으므로 크기는 모른다.
+        let mut ring = all.clone();
+        ring[0]["status"]["parent"] = json!("c");
+        assert_eq!(
+            backup_chain(&ring[2], &ring),
+            json!({ "backups": ["full", "incr-1", "incr-2"] })
+        );
+    }
+
+    /// `backup get`은 증분 백업에만 백업 목록으로 만든 `chain`을 붙인다.
+    #[tokio::test]
+    async fn backup_get_adds_the_chain_of_incremental_backups() {
+        fn reply(path: &str) -> Value {
+            let full = json!({ "id": "a", "name": "full", "status": { "phase": "ready",
+                "disks": [{ "name": "disk0", "stored_bytes": 1000 }] } });
+            let incr = json!({ "id": "b", "name": "incr", "status": { "phase": "ready",
+                "parent": "a", "disks": [{ "name": "disk0", "stored_bytes": 10 }] } });
+            match path {
+                "/api/v1/backups/incr" => incr,
+                "/api/v1/backups/full" => full,
+                "/api/v1/backups" => json!({ "items": [full, incr] }),
+                _ => json!({}),
+            }
+        }
+        let get = |name: &'static str| async move {
+            let (client, seen) = fake_api(reply).await;
+            let mut out = Vec::new();
+            backup(
+                &client,
+                BackupCmd::Get {
+                    backup: name.into(),
+                },
+                false,
+                &mut out,
+            )
+            .await
+            .unwrap();
+            let paths = seen.lock().unwrap().clone();
+            (serde_json::from_slice::<Value>(&out).unwrap(), paths)
+        };
+        let (incr, paths) = get("incr").await;
+        assert_eq!(
+            incr["chain"],
+            json!({ "backups": ["full", "incr"], "stored_bytes": 1010 })
+        );
+        assert_eq!(
+            paths,
+            [
+                "GET /api/v1/backups/incr HTTP/1.1",
+                "GET /api/v1/backups HTTP/1.1"
+            ]
+        );
+        // 전체 백업에는 체인이 없고 목록도 읽지 않는다.
+        let (full, paths) = get("full").await;
+        assert!(full.get("chain").is_none(), "{full}");
+        assert_eq!(paths, ["GET /api/v1/backups/full HTTP/1.1"]);
+    }
+
+    /// `backup create --incremental`은 `incremental`을 보내고 증분이 됐는지, 아니면 전체로 한 이유를
+    /// 보인다. 청하지 않으면 보내지 않는다.
+    #[tokio::test]
+    async fn backup_create_reports_incremental_or_why_full() {
+        let run = |reply: fn(&str) -> Value, name: Option<&'static str>, incremental: bool| async move {
+            let (base, seen) = fake_api_bodies(reply).await;
+            let client = Client::new(&base, None, None).unwrap();
+            let mut out = Vec::new();
+            backup_create(
+                &client,
+                "web",
+                "bk",
+                name.map(str::to_string),
+                incremental,
+                &mut out,
+            )
+            .await
+            .unwrap();
+            let seen = seen.lock().unwrap();
+            let lines: Vec<String> = seen.iter().map(|r| r.line.clone()).collect();
+            (String::from_utf8(out).unwrap(), lines, seen[0].body.clone())
+        };
+        fn task(path: &str) -> Option<Value> {
+            match path {
+                "/api/v1/vms/web/backups" => {
+                    Some(json!({ "id": "t1", "spec": { "op": { "backup": "b1" } } }))
+                }
+                "/api/v1/tasks/t1" => {
+                    Some(json!({ "id": "t1", "status": { "state": "succeeded" } }))
+                }
+                _ => None,
+            }
+        }
+
+        let (out, lines, body) = run(
+            |path| {
+                task(path).unwrap_or_else(
+                    || json!({ "id": "b1", "name": "web-1", "status": { "parent": "b0" } }),
+                )
+            },
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(out, "backup web-1 of vm web created (incremental)\n");
+        assert_eq!(
+            body,
+            json!({ "pool": "bk", "name": null, "incremental": true })
+        );
+        assert_eq!(
+            lines,
+            [
+                "POST /api/v1/vms/web/backups HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1",
+                "GET /api/v1/backups/b1 HTTP/1.1"
+            ]
+        );
+
+        let (out, _, _) = run(
+            |path| {
+                task(path).unwrap_or_else(|| {
+                    json!({ "id": "b1", "name": "nightly", "status": { "full_reason": "VM is stopped" } })
+                })
+            },
+            Some("nightly"),
+            true,
+        )
+        .await;
+        assert_eq!(
+            out,
+            "backup nightly of vm web created (full: VM is stopped)\n"
+        );
+
+        // 청하지 않고 이름을 주면 백업을 다시 읽지 않는다.
+        let (out, lines, body) = run(|path| task(path).unwrap(), Some("nightly"), false).await;
+        assert_eq!(out, "backup nightly of vm web created\n");
+        assert_eq!(body, json!({ "pool": "bk", "name": "nightly" }));
+        assert_eq!(lines.len(), 2, "{lines:?}");
     }
 
     #[test]
@@ -5874,7 +6169,7 @@ mod tests {
             },
             "status": { "phase": "receiving", "created_at": 1_793_761_200, "disks": [] }
         });
-        assert_eq!(backup_row(&copy)[6..], ["prod/019a4f2c", "-"]);
+        assert_eq!(backup_row(&copy)[7..], ["prod/019a4f2c", "-"]);
         // 원격 사본마다 원격:상태
         let original = json!({
             "name": "web-20261104-030000",
@@ -5887,7 +6182,7 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(backup_row(&original)[6..], ["-", "dr:ready,far:failed"]);
+        assert_eq!(backup_row(&original)[7..], ["-", "dr:ready,far:failed"]);
     }
 
     /// `backup-job create`의 인자를 요청 본문으로
@@ -5965,6 +6260,21 @@ mod tests {
             backup_job_create(&["--pool", "bk", "--vm", "web", "--vm", "db", "--at", "03:00"])
                 .unwrap()["spec"]["vms"],
             json!({ "names": ["web", "db"] })
+        );
+        // 전체 백업 주기는 주었을 때만 보낸다.
+        assert!(all["spec"].get("full_every").is_none(), "{all}");
+        assert_eq!(
+            backup_job_create(&[
+                "--pool",
+                "bk",
+                "--all",
+                "--at",
+                "03:00",
+                "--full-every",
+                "6"
+            ])
+            .unwrap()["spec"]["full_every"],
+            json!(6)
         );
         // VM 고르기는 셋 중 꼭 하나, 풀과 시각은 꼭, 라벨은 KEY=VALUE, 요일은 mon..sun
         for args in [
@@ -6081,6 +6391,15 @@ mod tests {
             set(&["--no-replicate"]).unwrap(),
             json!({ "replicate": null })
         );
+        // 0이면 늘 전체로 돌아간다.
+        assert_eq!(
+            set(&["--full-every", "6"]).unwrap(),
+            json!({ "full_every": 6 })
+        );
+        assert_eq!(
+            set(&["--full-every", "0"]).unwrap(),
+            json!({ "full_every": 0 })
+        );
         // 바꿀 것은 꼭 하나, VM 고르기는 하나만, 사용 여부는 true나 false, 복제는 켜거나 끄거나
         for args in [
             &[][..],
@@ -6089,6 +6408,7 @@ mod tests {
             &["--enabled", "yes"],
             &["--replicate", "dr/bk", "--no-replicate"],
             &["--replicate", "dr"],
+            &["--full-every", "-1"],
         ] {
             assert!(set(args).is_err(), "{args:?}");
         }
@@ -6147,6 +6467,15 @@ mod tests {
         off["status"]["last_run"] = Value::Null;
         assert_eq!(backup_job_row(&off)[2], "all");
         assert_eq!(backup_job_row(&off)[5..], ["false", "-", "-"]);
+        // 증분 백업 작업은 전체 백업 주기를 함께 보인다(0은 늘 전체).
+        let mut incremental = job.clone();
+        incremental["spec"]["full_every"] = json!(6);
+        assert_eq!(
+            backup_job_row(&incremental)[3],
+            "mon,wed 03:00 UTC, full every 6"
+        );
+        incremental["spec"]["full_every"] = json!(0);
+        assert_eq!(backup_job_row(&incremental)[3], "mon,wed 03:00 UTC");
     }
 
     #[test]
