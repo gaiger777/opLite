@@ -23,7 +23,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
-use crate::cluster::require_current;
+use crate::cluster::{require_current, require_feature};
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{List, check_name, lookup};
 use crate::snapshots::{check_disks, check_not_busy};
@@ -39,6 +39,10 @@ pub struct CreateBackupRequest {
     pub pool: String,
     /// 백업 이름(클러스터에서 고유). 없으면 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC)다.
     pub name: Option<String>,
+    /// 할 수 있으면 증분으로(같은 풀의 바로 앞 백업을 부모로 바뀐 블록만) 백업한다. 할 수 없으면
+    /// 전체로 하고 그 이유를 `status.full_reason`에 적는다.
+    #[serde(default)]
+    pub incremental: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -277,6 +281,7 @@ pub async fn get_backup(
 /// 방식이 섞였으면 스냅샷처럼 409 `snapshot_unsupported`), Task를 돌릴 노드에서 백업 풀을 쓸 수 없으면
 /// 409 `pool_not_on_node`·`pool_unavailable`, 돌릴 노드가 없으면 409 `no_node`, 이름이 겹치면 409
 /// `name_taken`. 그사이 풀이 지워졌거나 백업 표시가 꺼졌으면 만든 백업을 지우고 409 `pool_unavailable`.
+/// `incremental`은 증분 백업을 모르는 노드가 있으면 409 `cluster_upgrading`.
 #[utoipa::path(post, path = "/vms/{key}/backups", tag = "backups",
     params(("key" = String, Path, description = "VM id or name")),
     request_body = CreateBackupRequest,
@@ -291,13 +296,16 @@ pub async fn create_backup(
     if let Some(name) = &req.name {
         check_name(name)?;
     }
+    if req.incremental {
+        require_feature(&state.cluster, "incremental-backup")?;
+    }
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let pool = find_pool(&state, &req.pool)?;
     let node = check_backup(&state, &vm, &pool)?;
     let name = req
         .name
         .unwrap_or_else(|| default_backup_name(&vm.name, now()));
-    let task = start_backup(&state, &vm, &pool, node, name, None).await?;
+    let task = start_backup(&state, &vm, &pool, node, name, None, req.incremental).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
@@ -345,6 +353,7 @@ pub(crate) fn check_backup(
 
 /// [`check_backup`]을 거친 VM의 `pending` 백업 `name`을 만들고 노드 `node`에서 그것을 채울 Task를
 /// 돌려준다. 이름이 올바르지 않으면 400. 백업 작업이 만드는 백업은 `job`에 작업 id를 적는다.
+/// `incremental`이면 Task가 할 수 있을 때 증분으로 백업한다.
 pub(crate) async fn start_backup(
     state: &AppState,
     vm: &Vm,
@@ -352,6 +361,7 @@ pub(crate) async fn start_backup(
     node: Uuid,
     name: String,
     job: Option<Uuid>,
+    incremental: bool,
 ) -> Result<Task, ApiError> {
     check_name(&name)?;
     let backup: Backup = Resource::new(
@@ -363,6 +373,7 @@ pub(crate) async fn start_backup(
             vm_spec: vm.spec.clone(),
             job,
             origin: None,
+            incremental,
         },
     );
     // 같은 이름이 있으면 저장소가 거부한다(409 name_taken).

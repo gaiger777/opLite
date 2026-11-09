@@ -727,7 +727,7 @@ async fn dispatch(
         return Ok(Dispatch::Wait);
     }
     let name = backup_name(&vm.name, now(), &backups);
-    match start_backup(state, &vm, &pool, node, name, Some(job.id)).await {
+    match start_backup(state, &vm, &pool, node, name, Some(job.id), false).await {
         Ok(task) => match task.spec.op {
             TaskOp::VmBackup { backup } => Ok(Dispatch::Started(backup)),
             _ => unreachable!("start_backup makes a backup task"),
@@ -936,6 +936,7 @@ mod tests {
                 vm_spec: vm_spec(),
                 job,
                 origin: None,
+                incremental: false,
             },
         );
         b.status = BackupStatus {

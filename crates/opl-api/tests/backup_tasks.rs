@@ -827,3 +827,464 @@ async fn restore_runs_only_on_the_node_holding_the_backup() {
     );
     assert!(get_volume(&env, "web-2-disk0").is_none());
 }
+
+/// 실행 중인 VM `web`: 디스크 둘(qcow2 `root` 4 MiB, qcow2 `data` 2 MiB). 디스크 파일 경로를 돌려준다.
+async fn running_web(env: &Env, admin: &Client) -> (Uuid, Vec<PathBuf>) {
+    create_pool(env, "local", false).await;
+    create_pool(env, "bk", true).await;
+    let root = create_volume(env, admin, "root", 4 * MIB, "qcow2").await;
+    let data = create_volume(env, admin, "data", 2 * MIB, "qcow2").await;
+    let vm = create_vm(admin, "web", &["root", "data"]).await;
+    succeeded(&admin.act("web", "start").await);
+    (vm, vec![root, data])
+}
+
+/// 실행 중인 `web`의 백업 `name`을 요청하고 끝난 Task를 돌려준다. `files`가 있으면 Mock 하이퍼바이저
+/// 대신 그 디스크 파일에 임시 스냅샷 태그를 만들어 둔다(전체 백업이 읽는다).
+async fn backup_running(
+    env: &mut Env,
+    admin: &Client,
+    name: &str,
+    incremental: bool,
+    files: &[PathBuf],
+) -> Value {
+    env.stop_runner().await;
+    let (status, task) = admin
+        .post(
+            "/vms/web/backups",
+            json!({ "pool": "bk", "name": name, "incremental": incremental }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let tag = backup(env, name).unwrap().id.simple().to_string();
+    for file in files {
+        qemu_img(&["snapshot", "-c", &tag, file.to_str().unwrap()]);
+    }
+    env.start_runner().await;
+    admin.wait_task(&task).await
+}
+
+/// VM의 디스크마다 dirty bitmap 이름
+fn bitmaps(env: &Env, vm: Uuid) -> Vec<Vec<String>> {
+    env.hv
+        .bitmaps(vm)
+        .iter()
+        .map(|d| d.iter().map(|b| b.name.clone()).collect())
+        .collect()
+}
+
+/// 두 디스크 모두 비트맵 `name` 하나
+fn both(name: &str) -> Vec<Vec<String>> {
+    vec![vec![name.to_string()]; 2]
+}
+
+fn bitmap(name: &str) -> opl_driver::BitmapInfo {
+    opl_driver::BitmapInfo {
+        name: name.into(),
+        recording: true,
+        inconsistent: false,
+        persistent: true,
+    }
+}
+
+fn manifest(env: &Env, id: Uuid) -> Value {
+    serde_json::from_slice(&std::fs::read(backup_dir(env, id).join(MANIFEST_FILE)).unwrap())
+        .unwrap()
+}
+
+/// 실행 중인 VM의 전체 백업은 임시 스냅샷과 함께 디스크마다 비트맵 `opl-{id}`를 만든다. 증분을 요청하면
+/// 그 비트맵의 백업을 부모로 바뀐 블록만 backing 없는 qcow2에 담고(매니페스트 버전 2와 부모), 비트맵은
+/// 새 백업의 것으로 바뀐다. 증분 위에 다시 증분을 쌓는다.
+#[tokio::test]
+async fn incremental_backup_writes_changed_blocks_after_its_parent() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vm, files) = running_web(&env, &admin).await;
+
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    let b1 = backup(&env, "b1").unwrap();
+    assert_eq!(
+        (b1.status.parent, b1.status.full_reason.as_deref()),
+        (None, None)
+    );
+    let opl_b1 = opl_types::backup::bitmap_name(b1.id);
+    assert_eq!(bitmaps(&env, vm), both(&opl_b1));
+    let m = manifest(&env, b1.id);
+    assert_eq!(m["version"], MANIFEST_VERSION);
+    assert!(m.get("parent").is_none(), "{m}");
+
+    succeeded(&backup_running(&mut env, &admin, "b2", true, &[]).await);
+    let b2 = backup(&env, "b2").unwrap();
+    assert!(b2.spec.incremental);
+    assert_eq!(b2.status.phase, BackupPhase::Ready, "{b2:?}");
+    assert_eq!(
+        (b2.status.parent, b2.status.full_reason.as_deref()),
+        (Some(b1.id), None)
+    );
+    let opl_b2 = opl_types::backup::bitmap_name(b2.id);
+    let dir = backup_dir(&env, b2.id);
+    let calls = env.hv.incremental_backups();
+    let (called_vm, parent, new, targets) = calls.last().unwrap().clone();
+    assert_eq!((called_vm, parent, new), (vm, opl_b1, opl_b2.clone()));
+    let targets: Vec<(String, PathBuf, u64)> = targets
+        .into_iter()
+        .map(|t| (t.node, t.path, t.size))
+        .collect();
+    assert_eq!(
+        targets,
+        [
+            ("disk0".into(), dir.join("disk0.qcow2.part"), 4 * MIB),
+            ("disk1".into(), dir.join("disk1.qcow2.part"), 2 * MIB)
+        ]
+    );
+    // 대상은 이름을 바꿔 둔 backing 없는 qcow2다(Mock은 내용을 쓰지 않는다).
+    for (i, disk) in b2.status.disks.iter().enumerate() {
+        assert_eq!(disk.file, format!("disk{i}.qcow2"));
+        let path = dir.join(&disk.file);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), disk.stored_bytes);
+        let info = info(&path);
+        assert_eq!(info["format"], "qcow2");
+        assert_eq!(info["virtual-size"], disk.virtual_bytes);
+        assert!(info.get("backing-filename").is_none(), "{info}");
+    }
+    assert!(!dir.join("disk0.qcow2.part").exists());
+    let m = manifest(&env, b2.id);
+    assert_eq!(m["version"], 2);
+    assert_eq!(m["parent"], json!(b1.id));
+    assert_eq!(bitmaps(&env, vm), both(&opl_b2));
+
+    succeeded(&backup_running(&mut env, &admin, "b3", true, &[]).await);
+    let b3 = backup(&env, "b3").unwrap();
+    assert_eq!(b3.status.parent, Some(b2.id));
+    // VM은 계속 돈다.
+    let vm = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(vm.status.phase, VmPhase::Running);
+}
+
+/// 증분을 할 수 없으면 전체로 하고 그 이유를 적는다. 전체 백업이 끝나면 비트맵은 새 백업의 것 하나다.
+#[tokio::test]
+async fn incremental_requests_fall_back_to_full_backups_with_a_reason() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vm, files) = running_web(&env, &admin).await;
+    let reason = |env: &Env, name: &str| {
+        let b = backup(env, name).unwrap();
+        assert_eq!(b.status.phase, BackupPhase::Ready, "{b:?}");
+        assert_eq!(b.status.parent, None);
+        b.status.full_reason.unwrap()
+    };
+
+    succeeded(&backup_running(&mut env, &admin, "first", true, &files).await);
+    assert_eq!(
+        reason(&env, "first"),
+        "no earlier backup of this VM in pool \"bk\""
+    );
+    let first = backup(&env, "first").unwrap();
+    let opl_first = opl_types::backup::bitmap_name(first.id);
+    assert_eq!(bitmaps(&env, vm), both(&opl_first));
+    assert_eq!(manifest(&env, first.id)["version"], MANIFEST_VERSION);
+
+    // 디스크마다 정확히 하나, 모두 같은 이름, 믿을 수 있는 비트맵이어야 한다.
+    let cases: Vec<(Vec<Vec<opl_driver::BitmapInfo>>, String)> = vec![
+        (
+            vec![vec![bitmap(&opl_first)], vec![]],
+            "no dirty bitmap on disk1".into(),
+        ),
+        (
+            vec![
+                vec![bitmap(&opl_first)],
+                vec![opl_driver::BitmapInfo {
+                    inconsistent: true,
+                    ..bitmap(&opl_first)
+                }],
+            ],
+            "dirty bitmap on disk1 is inconsistent".into(),
+        ),
+        // 기록하지 않는 비트맵은 바뀐 블록을 모두 담지 않는다.
+        (
+            vec![
+                vec![opl_driver::BitmapInfo {
+                    recording: false,
+                    ..bitmap(&opl_first)
+                }],
+                vec![bitmap(&opl_first)],
+            ],
+            "dirty bitmap on disk0 is inconsistent".into(),
+        ),
+        (
+            vec![vec![bitmap("opl-other")], vec![bitmap("opl-other")]],
+            "dirty bitmaps do not match a ready backup in pool \"bk\"".into(),
+        ),
+        (
+            vec![vec![bitmap(&opl_first)], vec![bitmap("opl-other")]],
+            "dirty bitmaps do not match a ready backup in pool \"bk\"".into(),
+        ),
+        (
+            vec![
+                vec![bitmap(&opl_first), bitmap("opl-other")],
+                vec![bitmap(&opl_first)],
+            ],
+            "dirty bitmaps do not match a ready backup in pool \"bk\"".into(),
+        ),
+    ];
+    for (i, (set, want)) in cases.into_iter().enumerate() {
+        env.hv.set_bitmaps(vm, set);
+        let name = format!("case{i}");
+        succeeded(&backup_running(&mut env, &admin, &name, true, &files).await);
+        assert_eq!(reason(&env, &name), want);
+        // 앞 비트맵은 지우고 이 백업의 것만 남는다.
+        let mine = opl_types::backup::bitmap_name(backup(&env, &name).unwrap().id);
+        assert_eq!(bitmaps(&env, vm), both(&mine));
+    }
+
+    // 부모의 디스크 크기가 다르다(그 뒤 디스크를 늘렸다).
+    let last = backup(&env, "case5").unwrap();
+    let mut status = last.status.clone();
+    status.disks[1].virtual_bytes = MIB;
+    env.cluster
+        .update_status::<BackupSpec>(last.id, &status)
+        .await
+        .unwrap();
+    succeeded(&backup_running(&mut env, &admin, "resized", true, &files).await);
+    assert_eq!(
+        reason(&env, "resized"),
+        "disks changed since backup \"case5\""
+    );
+    // 크기는 같지만 다른 볼륨이다(디스크를 바꿔 끼웠다).
+    let last = backup(&env, "resized").unwrap();
+    let mut spec = last.spec.clone();
+    spec.vm_spec.disks[1].volume = "other".into();
+    env.cluster
+        .update_spec(last.id, Some(last.revision), last.labels.clone(), &spec)
+        .await
+        .unwrap();
+    succeeded(&backup_running(&mut env, &admin, "swapped", true, &files).await);
+    assert_eq!(
+        reason(&env, "swapped"),
+        "disks changed since backup \"resized\""
+    );
+
+    // 증분을 요청하지 않은 전체 백업은 이유를 적지 않는다.
+    succeeded(&backup_running(&mut env, &admin, "plain", false, &files).await);
+    let plain = backup(&env, "plain").unwrap();
+    assert_eq!(plain.status.full_reason, None);
+    assert!(!plain.spec.incremental);
+    assert!(env.hv.incremental_backups().is_empty());
+}
+
+/// 꺼진 VM은 늘 전체로 백업한다. 내보낸 뒤 qcow2 디스크에 그 백업의 비트맵만 남긴다(raw는 그대로).
+#[tokio::test]
+async fn stopped_vm_backups_are_full_and_leave_their_bitmap_on_qcow2_disks() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, root, data) = setup(&env, &admin).await;
+    let disk_bitmaps = |path: &Path| -> Vec<String> {
+        info(path)["format-specific"]["data"]["bitmaps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|b| b["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    for name in ["s1", "s2"] {
+        let task = wait(
+            &admin,
+            admin
+                .post(
+                    "/vms/web/backups",
+                    json!({ "pool": "bk", "name": name, "incremental": true }),
+                )
+                .await,
+        )
+        .await;
+        succeeded(&task);
+        let b = backup(&env, name).unwrap();
+        assert_eq!(b.status.full_reason.as_deref(), Some("VM is stopped"));
+        assert_eq!(b.status.parent, None);
+        assert_eq!(disk_bitmaps(&root), [opl_types::backup::bitmap_name(b.id)]);
+    }
+    assert_eq!(info(&data)["format"], "raw");
+    assert!(env.hv.incremental_backups().is_empty());
+}
+
+/// 증분 백업을 아는 온라인인 다른 노드(실행기 없음)
+async fn current_node(env: &Env, name: &str) -> Uuid {
+    let id = other_node(env, name).await;
+    let mut node = env
+        .cluster
+        .get::<opl_types::node::NodeSpec>(id)
+        .unwrap()
+        .unwrap();
+    node.status.features = opl_types::node::FEATURES
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+    env.cluster
+        .update_status::<opl_types::node::NodeSpec>(id, &node.status)
+        .await
+        .unwrap();
+    id
+}
+
+/// 공유가 아닌 풀에서 부모의 파일은 쓴 노드에만 있다. 부모가 다른 노드에 있거나(VM이 옮겨졌다) 이
+/// 노드에 그 파일이 없으면 비트맵이 맞아도 전체로 한다.
+#[tokio::test]
+async fn parents_must_be_readable_on_this_node() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, files) = running_web(&env, &admin).await;
+    let full_reason = |env: &Env, name: &str| {
+        let b = backup(env, name).unwrap();
+        assert_eq!(
+            (b.status.phase, b.status.parent),
+            (BackupPhase::Ready, None)
+        );
+        b.status.full_reason.unwrap()
+    };
+
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    let b1 = backup(&env, "b1").unwrap();
+    let n2 = current_node(&env, "n2").await;
+    let status = opl_types::backup::BackupStatus {
+        node: Some(n2),
+        ..b1.status.clone()
+    };
+    env.cluster
+        .update_status::<BackupSpec>(b1.id, &status)
+        .await
+        .unwrap();
+    succeeded(&backup_running(&mut env, &admin, "b2", true, &files).await);
+    assert_eq!(
+        full_reason(&env, "b2"),
+        "backup \"b1\" is stored on another node"
+    );
+
+    let b2 = backup(&env, "b2").unwrap();
+    std::fs::remove_file(backup_dir(&env, b2.id).join(MANIFEST_FILE)).unwrap();
+    succeeded(&backup_running(&mut env, &admin, "b3", true, &files).await);
+    assert_eq!(
+        full_reason(&env, "b3"),
+        "files of backup \"b2\" are missing on this node"
+    );
+    assert!(env.hv.incremental_backups().is_empty());
+}
+
+/// 부모를 적기 전에 시작한 부모 지우기(끝나지 않은 BackupDelete Task)가 있으면 전체로 한다.
+#[tokio::test]
+async fn parents_being_deleted_are_not_built_on() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, files) = running_web(&env, &admin).await;
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    let b1 = backup(&env, "b1").unwrap();
+    // 다른 노드의 실행기가 돌리는 중인 지우기
+    let n2 = current_node(&env, "n2").await;
+    let delete = opl_types::task::TaskOp::BackupDelete;
+    put_task(&env, delete, b1.id, n2, TaskState::Running).await;
+
+    succeeded(&backup_running(&mut env, &admin, "b2", true, &files).await);
+    let b2 = backup(&env, "b2").unwrap();
+    assert_eq!(b2.status.phase, BackupPhase::Ready, "{b2:?}");
+    assert_eq!(b2.status.parent, None);
+    assert_eq!(
+        b2.status.full_reason.as_deref(),
+        Some("backup \"b1\" is being deleted")
+    );
+    assert_eq!(manifest(&env, b2.id)["version"], MANIFEST_VERSION);
+    assert!(env.hv.incremental_backups().is_empty());
+}
+
+/// 실행 중인 VM의 백업은 앞선 증분 백업이 남긴 작업을 먼저 치우고(남으면 스냅샷이 실패한다), 실패한
+/// 백업의 정리도 치운다. 스냅샷 만들기도 그렇다.
+#[tokio::test]
+async fn running_vm_backups_and_snapshots_clear_left_backup_jobs() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vm, files) = running_web(&env, &admin).await;
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    assert_eq!(env.hv.leftover_clears(), [vm]);
+
+    env.hv.fail_next_incremental(opl_driver::DriverError::Qmp(
+        opl_qemu::QmpError::JobFailed {
+            id: "opl-backup-0".into(),
+            error: "No space left on device".into(),
+        },
+    ));
+    let task = backup_running(&mut env, &admin, "bad", true, &[]).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(env.hv.leftover_clears(), [vm, vm]);
+
+    succeeded(
+        &wait(
+            &admin,
+            admin
+                .post("/vms/web/snapshots", json!({ "name": "s" }))
+                .await,
+        )
+        .await,
+    );
+    assert_eq!(env.hv.leftover_clears(), [vm, vm, vm]);
+}
+
+/// 실행 중인 qcow2 VM의 전체 백업에서 스냅샷과 함께 비트맵을 만들지 못하면 비트맵 없이 다시 찍어 백업은
+/// 성공한다. 그 백업은 비트맵을 남기지 않으므로 다음 증분 요청은 전체다.
+#[tokio::test]
+async fn full_backups_do_not_fail_on_bitmaps() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vm, files) = running_web(&env, &admin).await;
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    env.hv
+        .fail_next_snapshot(opl_driver::DriverError::Qmp(opl_qemu::QmpError::Command {
+            class: "GenericError".into(),
+            desc: "Bitmap already exists".into(),
+        }));
+    succeeded(&backup_running(&mut env, &admin, "b2", false, &files).await);
+    assert_eq!(backup(&env, "b2").unwrap().status.phase, BackupPhase::Ready);
+    assert_eq!(bitmaps(&env, vm), [Vec::<String>::new(), Vec::new()]);
+    assert!(env.hv.snapshots(vm).is_empty());
+
+    succeeded(&backup_running(&mut env, &admin, "b3", true, &files).await);
+    let b3 = backup(&env, "b3").unwrap();
+    assert_eq!(
+        b3.status.full_reason.as_deref(),
+        Some("no dirty bitmap on disk0")
+    );
+}
+
+/// 증분이 실패하면 새 비트맵은 지워지고 부모의 비트맵이 남아 다음 시도도 그 부모에서 증분이다.
+/// 실행 중인 VM의 전체 백업이 실패하면 새 비트맵만 지우고 앞 비트맵은 남긴다.
+#[tokio::test]
+async fn failed_backups_keep_the_bitmap_of_the_last_good_backup() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vm, files) = running_web(&env, &admin).await;
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    let b1 = backup(&env, "b1").unwrap();
+    let opl_b1 = opl_types::backup::bitmap_name(b1.id);
+
+    env.hv.fail_next_incremental(opl_driver::DriverError::Qmp(
+        opl_qemu::QmpError::JobFailed {
+            id: "opl-backup-1".into(),
+            error: "No space left on device".into(),
+        },
+    ));
+    let task = backup_running(&mut env, &admin, "bad", true, &[]).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(error.contains("incremental backup failed"), "{error}");
+    let bad = backup(&env, "bad").unwrap();
+    assert_eq!(bad.status.phase, BackupPhase::Failed);
+    assert_eq!(bad.status.parent, Some(b1.id));
+    assert!(!backup_dir(&env, bad.id).exists());
+    assert_eq!(bitmaps(&env, vm), both(&opl_b1));
+
+    // 전체 백업: 임시 스냅샷 태그가 디스크에 없어 내보내기가 실패한다.
+    let task = backup_running(&mut env, &admin, "broken", false, &[]).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(bitmaps(&env, vm), both(&opl_b1));
+
+    succeeded(&backup_running(&mut env, &admin, "again", true, &[]).await);
+    assert_eq!(backup(&env, "again").unwrap().status.parent, Some(b1.id));
+}

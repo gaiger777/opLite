@@ -480,7 +480,7 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
             Err(e) => Err(e),
         }
     };
-    let resumed = match take_tags(ctx, &vm, &disks, id, &tag, spec.memory, copy_vars).await {
+    let resumed = match take_tags(ctx, &vm, &disks, id, &tag, spec.memory, None, copy_vars).await {
         Ok(resumed) => resumed,
         Err(e) => {
             if let Some(copy) = vars_copy(ctx, vm_id, id) {
@@ -517,7 +517,12 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
 /// 번에 찍는다(ZFS는 원자적). 찍은 뒤 `copy_vars`로 UEFI 변수를 복사한다. 실패를 확인했으면 만든 태그를
 /// 지운다. 응답을 기다리다 시간이 다 됐으면 작업이 아직 돌 수 있으므로 태그를 두고 실패한다(블록
 /// 스냅샷의 태그는 뒤에서 다시 지운다, [`remove_left_tags`]; `id`는 스냅샷이나 백업의 id). 찍었으면
-/// 블록 스냅샷을 위해 멈춘 VM을 이어서 실행한 결과를 돌려준다.
+/// 블록 스냅샷을 위해 멈춘 VM을 이어서 실행한 결과를 돌려준다. `bitmap`을 주면 실행 중인 VM의 모든
+/// 디스크에 그 이름의 dirty bitmap을 태그와 같은 시점에 만든다(백업, 증분 백업 설계 §3.1: qcow2는 같은
+/// transaction으로, 블록 스냅샷은 VM을 멈춘 동안 — 이것은 만들지 못해도 찍기는 성공이다; qcow2에서
+/// 실패하면 비트맵 없이 한 번 더 찍는다). 실행 중인 VM은 먼저 남은 증분 백업 작업을 치운다(남으면
+/// 내부 스냅샷이 실패한다).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn take_tags<F, Fut>(
     ctx: &Ctx,
     vm: &Vm,
@@ -525,6 +530,7 @@ pub(super) async fn take_tags<F, Fut>(
     id: Uuid,
     tag: &str,
     memory: bool,
+    bitmap: Option<&str>,
     copy_vars: F,
 ) -> Result<Result<(), DriverError>, String>
 where
@@ -534,6 +540,12 @@ where
     let vm_id = vm.id;
     let running = vm.status.phase == VmPhase::Running;
     let block = block_snapshots(disks)?;
+    if running
+        && !disks.is_empty()
+        && let Err(e) = ctx.hv.clear_backup_leftovers(vm_id).await
+    {
+        tracing::warn!(vm = %vm_id, error = %e, "cannot clear backup jobs left on the VM");
+    }
     // 실행 중인 VM의 블록 스냅샷: VM을 멈춰 블록 I/O를 비운 뒤 풀마다 저장소로 찍고, 찍기가
     // 실패해도 반드시 이어서 실행한다(설계 §5). 멈춘 구간은 `PAUSE_LIMIT`을 넘기지 않는다. QEMU가
     // 스스로 멈춘 VM(I/O 오류 등)은 멈추지도 이어서 실행하지도 않는다([`needs_pause`]).
@@ -563,6 +575,12 @@ where
                     .await?;
                 taken.extend(group.into_iter().map(|(v, p)| (v, p)));
             }
+            // 비트맵을 만들지 못해도 스냅샷은 쓸 수 있다. 다음 백업이 전체가 될 뿐이다.
+            if let Some(bitmap) = bitmap.filter(|_| running)
+                && let Err(e) = ctx.hv.add_bitmaps(vm_id, bitmap).await
+            {
+                tracing::warn!(vm = %vm_id, snapshot = %id, error = %e, "cannot add dirty bitmap");
+            }
             Ok(())
         };
         match paused {
@@ -574,6 +592,16 @@ where
     } else if disks.is_empty() {
         // 디스크 없는 VM은 설정만 담는다.
         Ok(())
+    } else if let Some(bitmap) = bitmap {
+        // 비트맵 때문에 백업이 실패하지 않게 비트맵 없이 한 번 더 찍는다(transaction이라 아무것도 만들지
+        // 않았다). 그 백업은 비트맵을 남기지 않아 다음은 전체다.
+        match ctx.hv.snapshot_save_with_bitmap(vm_id, tag, bitmap).await {
+            Err(e) if !e.may_be_in_progress() => {
+                tracing::warn!(vm = %vm_id, snapshot = %id, error = %e, "cannot add dirty bitmap; snapshotting without it");
+                ctx.hv.snapshot_save(vm_id, tag, false).await
+            }
+            r => r,
+        }
     } else {
         ctx.hv.snapshot_save(vm_id, tag, memory).await
     };
@@ -747,6 +775,17 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
         if get_vm(ctx, vm_id)?.spec.power != PowerState::Stopped {
             return Err("VM was started again".into());
         }
+        // 되돌린 디스크에는 증분 백업의 dirty bitmap이 맞지 않는다(다음 백업은 전체). 비트맵이 있으면
+        // qcow2 내부 스냅샷으로 되돌릴 수도 없으므로 되돌리기 전에 지운다(증분 백업 설계 §3.4).
+        ctx.storage
+            .drop_backup_bitmaps(pool, volume.id, volume.spec.format)
+            .await
+            .map_err(|e| {
+                format!(
+                    "cannot remove dirty bitmaps of volume {:?}: {e}",
+                    volume.name
+                )
+            })?;
         ctx.storage
             .snapshot_revert(pool, volume.id, volume.spec.format, &tag)
             .await

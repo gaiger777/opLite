@@ -334,6 +334,53 @@ async fn backup_validates_the_request() {
     );
 }
 
+/// `incremental`은 백업 스펙에 남고(없으면 빠진다), 증분 백업을 모르는 노드가 있으면 409
+/// `cluster_upgrading`이다. 전체 백업은 그대로 받는다.
+#[tokio::test]
+async fn incremental_backups_need_every_node_to_support_them() {
+    let env = env().await;
+    let admin = env.admin().await;
+    setup(&env, &admin).await;
+
+    let id = backup_ok(
+        &admin,
+        "web",
+        json!({ "pool": "backups", "incremental": true }),
+    )
+    .await;
+    let (_, got) = admin.get(&format!("/backups/{id}")).await;
+    assert_eq!(got["spec"]["incremental"], true, "{got}");
+    finish_tasks(&env).await;
+    let id = backup_ok(&admin, "web", json!({ "pool": "backups", "name": "full" })).await;
+    let (_, got) = admin.get(&format!("/backups/{id}")).await;
+    assert!(got["spec"].get("incremental").is_none(), "{got}");
+    finish_tasks(&env).await;
+
+    // 기능 목록이 빈 옛 노드
+    other_node(&env, "old").await;
+    let got = backup(
+        &admin,
+        "web",
+        json!({ "pool": "backups", "name": "incr", "incremental": true }),
+    )
+    .await;
+    assert_eq!(
+        got.1["message"],
+        "some nodes do not support incremental backup yet (old); upgrade them first",
+        "{}",
+        got.1
+    );
+    assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+    let (_, list) = admin.get("/backups").await;
+    assert_eq!(list["items"].as_array().unwrap().len(), 2, "{list}");
+    backup_ok(
+        &admin,
+        "web",
+        json!({ "pool": "backups", "name": "full2", "incremental": false }),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn running_vms_need_disks_that_can_be_snapshotted() {
     let env = env().await;
@@ -672,6 +719,7 @@ async fn restore_needs_the_networks_and_security_groups_of_the_backup() {
             vm_spec,
             job: None,
             origin: None,
+            incremental: false,
         },
     );
     backup.status.phase = BackupPhase::Ready;

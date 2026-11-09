@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
-use opl_driver::{check_pool_root, uefi_vars_path};
+use opl_driver::{BackupTarget, check_pool_root, uefi_vars_path};
 use opl_types::backup::{
-    Backup, BackupDisk, BackupManifest, BackupPhase, BackupSpec, BackupStatus, MANIFEST_FILE,
-    MANIFEST_VERSION, backup_dir,
+    BITMAP_PREFIX, Backup, BackupDisk, BackupManifest, BackupPhase, BackupSpec, BackupStatus,
+    MANIFEST_FILE, MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, bitmap_name,
 };
 use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
@@ -158,12 +158,322 @@ pub(crate) async fn write_manifest(dir: &Path, manifest: &BackupManifest) -> std
     sync_path(dir).await
 }
 
+/// 백업 디렉터리 `dir`에 백업 `id`의 매니페스트가 있는지. 형식 버전은 보지 않는다.
+async fn has_manifest(dir: &Path, id: Uuid) -> bool {
+    let Ok(text) = tokio::fs::read(dir.join(MANIFEST_FILE)).await else {
+        return false;
+    };
+    let backup = serde_json::from_slice::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|m| m.get("backup")?.as_str()?.parse::<Uuid>().ok());
+    backup == Some(id)
+}
+
+/// 부모 `parent`가 없어졌거나 `ready`가 아니거나 지우는 Task가 끝나지 않았으면 전체로 하는 이유. 부모
+/// 지우기는 자식이 적히기 전에 확인을 지났으면 그대로 돈다(백업의 줄에 서므로 VM의 줄과 따로 돈다).
+fn parent_going(ctx: &Ctx, parent: &Backup) -> Result<Option<String>, String> {
+    use opl_types::task::{TaskOp, TaskSpec};
+    let now = get_backup(ctx, parent.id)?;
+    let (_, tasks) = ctx.cluster.list::<TaskSpec>().map_err(|e| e.to_string())?;
+    let deleting = tasks.iter().any(|t| {
+        !t.status.state.is_finished()
+            && t.spec.op == TaskOp::BackupDelete
+            && t.spec.target == parent.id
+    });
+    let ready = now.is_some_and(|b| b.status.phase == BackupPhase::Ready);
+    Ok((!ready || deleting).then(|| format!("backup {:?} is being deleted", parent.name)))
+}
+
+/// 증분 백업의 부모(설계 §3.3)와 디스크마다 지금의 가상 크기
+struct Parent {
+    backup: Backup,
+    sizes: Vec<u64>,
+}
+
+/// 백업 방법
+enum Plan {
+    /// 전체 백업. 증분을 요청했으면 전체로 한 이유
+    Full(Option<String>),
+    Incremental(Box<Parent>),
+}
+
+/// 증분 백업의 부모를 고른다(설계 §3.3). 증분으로 할 수 없으면 `Ok(Err(전체로 하는 이유))`다. 비트맵이나
+/// 볼륨 크기를 읽지 못하면 오류다.
+async fn choose_parent(
+    ctx: &Ctx,
+    backup: &Backup,
+    vm: &Vm,
+    disks: &[(Volume, StoragePool)],
+) -> Result<Result<Parent, String>, String> {
+    if vm.status.phase != VmPhase::Running {
+        return Ok(Err("VM is stopped".into()));
+    }
+    let pool = &backup.spec.pool;
+    let (_, backups) = ctx
+        .cluster
+        .list::<BackupSpec>()
+        .map_err(|e| e.to_string())?;
+    let earlier: Vec<Backup> = backups
+        .into_iter()
+        .filter(|b| {
+            b.id != backup.id
+                && b.spec.vm == vm.id
+                && b.spec.pool == *pool
+                && b.status.phase == BackupPhase::Ready
+        })
+        .collect();
+    if earlier.is_empty() {
+        return Ok(Err(format!(
+            "no earlier backup of this VM in pool {pool:?}"
+        )));
+    }
+    // 디스크마다 `opl-` 비트맵이 정확히 하나이고 모두 같은 이름이어야 한다.
+    let found = ctx
+        .hv
+        .backup_bitmaps(vm.id)
+        .await
+        .map_err(|e| format!("cannot read dirty bitmaps: {e}"))?;
+    let mut name: Option<&str> = None;
+    let mut same = found.len() == disks.len() && !found.is_empty();
+    for disk in &found {
+        let ours: Vec<_> = disk
+            .bitmaps
+            .iter()
+            .filter(|b| b.name.starts_with(BITMAP_PREFIX))
+            .collect();
+        if ours.is_empty() {
+            return Ok(Err(format!("no dirty bitmap on {}", disk.node)));
+        }
+        // 기록하지 않는 비트맵도 바뀐 블록을 모두 담지 않으므로 믿지 않는다.
+        if ours.iter().any(|b| b.inconsistent || !b.recording) {
+            return Ok(Err(format!(
+                "dirty bitmap on {} is inconsistent",
+                disk.node
+            )));
+        }
+        match ours[..] {
+            [one] if *name.get_or_insert(&one.name) == one.name => {}
+            _ => same = false,
+        }
+    }
+    let parent = name
+        .filter(|_| same)
+        .and_then(|name| earlier.into_iter().find(|b| bitmap_name(b.id) == name));
+    let Some(parent) = parent else {
+        return Ok(Err(format!(
+            "dirty bitmaps do not match a ready backup in pool {pool:?}"
+        )));
+    };
+    // 공유가 아닌 풀의 파일은 쓴 노드에만 있다. VM이 다른 노드로 옮겨졌으면 비트맵은 맞아도 체인을
+    // 이 노드에서 복원할 수 없다.
+    if parent.status.node.is_some_and(|n| n != ctx.config.node) {
+        return Ok(Err(format!(
+            "backup {:?} is stored on another node",
+            parent.name
+        )));
+    }
+    let (_, root) = backup_root(ctx, pool)?;
+    if !has_manifest(&backup_dir(&root, parent.id), parent.id).await {
+        return Ok(Err(format!(
+            "files of backup {:?} are missing on this node",
+            parent.name
+        )));
+    }
+    // 디스크가 부모와 같아야 한다: 수, 순서마다 같은 볼륨, 같은 가상 크기.
+    let mut sizes = Vec::with_capacity(disks.len());
+    for (volume, pool) in disks {
+        let info = ctx
+            .storage
+            .volume_info(pool, volume.id, volume.spec.format)
+            .await
+            .map_err(|e| format!("cannot read size of volume {:?}: {e}", volume.name))?;
+        sizes.push(info.virtual_bytes);
+    }
+    let volumes =
+        |spec: &VmSpec| -> Vec<String> { spec.disks.iter().map(|d| d.volume.clone()).collect() };
+    let parent_sizes: Vec<u64> = parent
+        .status
+        .disks
+        .iter()
+        .map(|d| d.virtual_bytes)
+        .collect();
+    if volumes(&parent.spec.vm_spec) != volumes(&vm.spec) || parent_sizes != sizes {
+        return Ok(Err(format!("disks changed since backup {:?}", parent.name)));
+    }
+    Ok(Ok(Parent {
+        backup: parent,
+        sizes,
+    }))
+}
+
+/// 실패한 전체 백업이 실행 중인 VM에 만든 비트맵 `new`를 지운다. 앞 백업의 비트맵(모든 디스크에 같은
+/// 하나)은 남겨 다음 증분이 그대로 쓴다. 그런 것이 없으면 `opl-` 비트맵을 모두 지운다.
+async fn drop_new_bitmap(ctx: &Ctx, vm: Uuid, new: &str) {
+    let disks = match ctx.hv.backup_bitmaps(vm).await {
+        Ok(disks) => disks,
+        Err(e) => {
+            tracing::warn!(vm = %vm, error = %e, "cannot read dirty bitmaps of failed backup");
+            return;
+        }
+    };
+    let mut others = disks.iter().map(|d| {
+        let mut names = d
+            .bitmaps
+            .iter()
+            .filter(|b| b.name.starts_with(BITMAP_PREFIX) && b.name != new)
+            .map(|b| b.name.as_str());
+        match (names.next(), names.next()) {
+            (Some(name), None) => Some(name),
+            _ => None,
+        }
+    });
+    let first = others.next().flatten();
+    let keep = first.filter(|_| others.all(|o| o == first));
+    if let Err(e) = ctx.hv.remove_bitmaps(vm, keep).await {
+        tracing::warn!(vm = %vm, error = %e, "cannot remove dirty bitmap of failed backup");
+    }
+}
+
+/// 전체 백업: 디스크마다 지금(실행 중이면 임시 스냅샷) 내용을 `{dir}/disk{i}.qcow2`로 내보내고 UEFI
+/// 변수를 `vars`로 복사한다. 실행 중이면 임시 스냅샷과 같은 시점에 비트맵 `bitmap`을 만들고, 꺼진 VM은
+/// 내보낸 뒤 qcow2 디스크에 비트맵을 둔다(설계 §3.1). 담은 디스크와 그 시각을 돌려준다.
+async fn full_disks(
+    ctx: &Ctx,
+    vm: &Vm,
+    disks: &[(Volume, StoragePool)],
+    id: Uuid,
+    bitmap: &str,
+    dir: &Path,
+    vars: &Path,
+) -> Result<(Vec<BackupDisk>, u64), String> {
+    use super::snapshot::resume_vm;
+    let running = vm.status.phase == VmPhase::Running;
+    let tag = temp_tag(id);
+    // 실행 중이면 디스크를 임시 스냅샷으로 얼리고 그때의 UEFI 변수를 복사한다.
+    let tagged = running && !disks.is_empty();
+    let resumed = if tagged {
+        take_tags(ctx, vm, disks, id, &tag, false, Some(bitmap), || {
+            copy_vars(ctx, vm, vars)
+        })
+        .await?
+    } else {
+        copy_vars(ctx, vm, vars)
+            .await
+            .map_err(|e| format!("cannot copy UEFI variables: {e}"))?;
+        Ok(())
+    };
+    // 블록 스냅샷을 위해 멈춘 VM을 이어서 실행하지 못했으면 한 번 더 해 본다. 그래도 멈춰 있으면 디스크를
+    // 읽지 않고 실패한다(임시 스냅샷은 아래에서 지운다). 오래 걸리는 내보내기 동안 VM을 멈춰 두지 않는다.
+    let resumed = match resumed {
+        Err(e) => {
+            tracing::warn!(vm = %vm.id, error = %e, "cannot resume VM after the temporary snapshot; retrying");
+            resume_vm(&*ctx.hv, vm.id).await.map_err(|r| {
+                format!(
+                    "cannot resume the VM after its temporary snapshot: {e}; retrying failed: {r}"
+                )
+            })
+        }
+        Ok(()) => Ok(()),
+    };
+    let created_at = now_secs();
+    let exported = match &resumed {
+        Ok(()) => export_disks(ctx, disks, tagged.then_some(&*tag), tagged, dir).await,
+        Err(e) => Err(e.clone()),
+    };
+    // 임시 스냅샷은 결과와 상관없이 지운다. 남으면 공간만 쓴다(블록 디스크는 태그 청소가 지운다).
+    if tagged {
+        let running = !matches!(ctx.hv.inspect(vm.id).await, Ok(None));
+        if let Err(e) = remove_tags(ctx, vm.id, running, &vm.spec, &tag).await {
+            tracing::warn!(backup = %id, error = %e, "cannot remove temporary snapshot of backup");
+        }
+    }
+    let exported = exported?;
+    // 꺼진 VM은 잠금을 쥐고 있어 내보낸 내용이 지금 디스크와 같다. 비트맵을 두지 못하면 다음 증분이
+    // 전체가 될 뿐이다.
+    if !running {
+        for (volume, pool) in disks {
+            if let Err(e) = ctx
+                .storage
+                .set_backup_bitmap(pool, volume.id, volume.spec.format, bitmap)
+                .await
+            {
+                tracing::warn!(backup = %id, volume = %volume.name, error = %e, "cannot set dirty bitmap of backup");
+            }
+        }
+    }
+    Ok((exported, created_at))
+}
+
+/// 증분 백업(설계 §3.5): 디스크마다 backing 없는 빈 qcow2를 만들고 하이퍼바이저가 부모 비트맵 뒤에
+/// 바뀐 블록만 쓰게 한 뒤 `{dir}/disk{i}.qcow2`로 이름을 바꾼다. 쓰기 시작하는 시점에 새 비트맵
+/// `bitmap`이 생기고, 성공하면 부모 비트맵은 지워진다(실패하면 새 비트맵이 지워진다). 담은 디스크와
+/// 그 시각을 돌려준다.
+async fn incremental_disks(
+    ctx: &Ctx,
+    vm: &Vm,
+    parent: &Parent,
+    bitmap: &str,
+    dir: &Path,
+    vars: &Path,
+) -> Result<(Vec<BackupDisk>, u64), String> {
+    copy_vars(ctx, vm, vars)
+        .await
+        .map_err(|e| format!("cannot copy UEFI variables: {e}"))?;
+    let mut targets = Vec::with_capacity(parent.sizes.len());
+    for (i, size) in parent.sizes.iter().enumerate() {
+        let path = dir.join(format!("disk{i}.qcow2.part"));
+        ctx.storage
+            .create_backup_target(&path, *size)
+            .await
+            .map_err(|e| format!("cannot create backup file for disk{i}: {e}"))?;
+        targets.push(BackupTarget {
+            node: format!("disk{i}"),
+            path,
+            size: *size,
+        });
+    }
+    let created_at = now_secs();
+    ctx.hv
+        .incremental_backup(vm.id, &bitmap_name(parent.backup.id), bitmap, &targets)
+        .await
+        .map_err(|e| format!("incremental backup failed: {e}"))?;
+    let mut out = Vec::with_capacity(targets.len());
+    for target in targets {
+        let name = target.node;
+        let file = format!("{name}.qcow2");
+        let dest = dir.join(&file);
+        tokio::fs::rename(&target.path, &dest)
+            .await
+            .map_err(|e| format!("cannot write {file}: {e}"))?;
+        // QEMU는 대상 노드를 닫을 때 플러시했지만 매니페스트처럼 이름 바꾼 파일을 내려 쓴다.
+        sync_path(&dest)
+            .await
+            .map_err(|e| format!("cannot write {file}: {e}"))?;
+        let stored_bytes = tokio::fs::metadata(&dest)
+            .await
+            .map_err(|e| format!("cannot read size of {file}: {e}"))?
+            .len();
+        out.push(BackupDisk {
+            name,
+            file,
+            virtual_bytes: target.size,
+            stored_bytes,
+            sha256: None,
+        });
+    }
+    sync_path(dir)
+        .await
+        .map_err(|e| format!("cannot write backup directory: {e}"))?;
+    Ok((out, created_at))
+}
+
 /// `pending` 백업 `id`를 채운다(설계 §2.3): 백업 풀의 `{루트}/backups/{id}/`에 디스크마다 압축 qcow2,
 /// UEFI 변수, 매니페스트를 쓰고 `ready`로 바꾼다. 실행 중인 VM은 디스크에 메모리 없는 임시 스냅샷을
 /// 찍어 그것을 읽고 끝나면 지운다(스냅샷 리소스는 만들지 않는다). 꺼진 VM은 지금 디스크를 읽는다.
+/// `incremental`을 요청했고 부모를 고를 수 있으면 바뀐 블록만 담는다(증분 백업 설계 §3.3·§3.5). 성공하면
+/// 디스크의 비트맵은 이 백업의 것(`opl-{id}`) 하나만 남는다(§3.1).
 /// 실패하면 실행기의 정리([`discard`])가 디렉터리를 지우고 `failed`로 남긴다.
 pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), String> {
-    use super::snapshot::resume_vm;
     let backup = get_backup(ctx, id)?.ok_or("backup was deleted")?;
     if backup.status.phase != BackupPhase::Pending {
         return Err("backup is not pending".into());
@@ -212,109 +522,143 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             .map_err(|e| e.to_string())?;
     }
 
-    if node.is_some() {
+    let plan = if backup.spec.incremental {
+        match choose_parent(ctx, &backup, &vm, &disks).await? {
+            Ok(parent) => Plan::Incremental(Box::new(parent)),
+            Err(reason) => Plan::Full(Some(reason)),
+        }
+    } else {
+        Plan::Full(None)
+    };
+    let (mut parent, mut full_reason) = match &plan {
+        Plan::Incremental(p) => (Some(p.backup.id), None),
+        Plan::Full(reason) => (None, reason.clone()),
+    };
+    // 부모는 만드는 동안에도 보인다(부모 지우기를 막는다).
+    let record = async |parent: Option<Uuid>, full_reason: Option<String>| {
         let status = BackupStatus {
             node,
+            parent,
+            full_reason,
             ..backup.status.clone()
         };
         ctx.cluster
             .update_status::<BackupSpec>(id, &status)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    };
+    if node.is_some() || parent.is_some() || full_reason.is_some() {
+        record(parent, full_reason.clone()).await?;
     }
-    let dir = backup_dir(&root, id);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| format!("cannot create backup directory: {e}"))?;
-    // 새 디렉터리 이름이 남게 `backups`와(처음 만들었을 수 있으니) 풀 루트도 내려 쓴다.
-    for parent in [root.join("backups"), root.clone()] {
-        sync_path(&parent)
+    // 부모를 적기 전에 시작한 부모 지우기는 막지 못했다. 그런 부모 위에는 쌓지 않는다.
+    let going = match &plan {
+        Plan::Incremental(p) => parent_going(ctx, &p.backup)?,
+        Plan::Full(_) => None,
+    };
+    let plan = match going {
+        Some(reason) => {
+            record(None, Some(reason.clone())).await?;
+            (parent, full_reason) = (None, Some(reason.clone()));
+            Plan::Full(Some(reason))
+        }
+        None => plan,
+    };
+    let bitmap = bitmap_name(id);
+    // 실행 중인 VM의 전체 백업은 임시 스냅샷과 함께 새 비트맵을 만든다. 끝나면 다른 비트맵을 지우고,
+    // 실패하면 새 비트맵만 지운다.
+    let live_bitmap = running && !disks.is_empty() && matches!(plan, Plan::Full(_));
+    let made = async {
+        let dir = backup_dir(&root, id);
+        tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| format!("cannot create backup directory: {e}"))?;
-    }
-    let vars = dir.join(VARS_FILE);
-    let tag = temp_tag(id);
-    // 실행 중이면 디스크를 임시 스냅샷으로 얼리고 그때의 UEFI 변수를 복사한다.
-    let tagged = running && !disks.is_empty();
-    let resumed = if tagged {
-        take_tags(ctx, &vm, &disks, id, &tag, false, || {
-            copy_vars(ctx, &vm, &vars)
-        })
-        .await?
-    } else {
-        copy_vars(ctx, &vm, &vars)
-            .await
-            .map_err(|e| format!("cannot copy UEFI variables: {e}"))?;
-        Ok(())
-    };
-    // 블록 스냅샷을 위해 멈춘 VM을 이어서 실행하지 못했으면 한 번 더 해 본다. 그래도 멈춰 있으면 디스크를
-    // 읽지 않고 실패한다(임시 스냅샷은 아래에서 지운다). 오래 걸리는 내보내기 동안 VM을 멈춰 두지 않는다.
-    let resumed = match resumed {
-        Err(e) => {
-            tracing::warn!(vm = %vm.id, error = %e, "cannot resume VM after the temporary snapshot; retrying");
-            resume_vm(&*ctx.hv, vm.id).await.map_err(|r| {
-                format!(
-                    "cannot resume the VM after its temporary snapshot: {e}; retrying failed: {r}"
-                )
-            })
+        // 새 디렉터리 이름이 남게 `backups`와(처음 만들었을 수 있으니) 풀 루트도 내려 쓴다.
+        for path in [root.join("backups"), root.clone()] {
+            sync_path(&path)
+                .await
+                .map_err(|e| format!("cannot create backup directory: {e}"))?;
         }
-        Ok(()) => Ok(()),
-    };
-    let created_at = now_secs();
-    let exported = match &resumed {
-        Ok(()) => export_disks(ctx, &disks, tagged.then_some(&*tag), tagged, &dir).await,
-        Err(e) => Err(e.clone()),
-    };
-    // 임시 스냅샷은 결과와 상관없이 지운다. 남으면 공간만 쓴다(블록 디스크는 태그 청소가 지운다).
-    if tagged {
-        let running = !matches!(ctx.hv.inspect(vm.id).await, Ok(None));
-        if let Err(e) = remove_tags(ctx, vm.id, running, &vm.spec, &tag).await {
-            tracing::warn!(backup = %id, error = %e, "cannot remove temporary snapshot of backup");
+        let vars = dir.join(VARS_FILE);
+        let (disks, created_at) = match &plan {
+            Plan::Incremental(p) => incremental_disks(ctx, &vm, p, &bitmap, &dir, &vars).await?,
+            Plan::Full(_) => full_disks(ctx, &vm, &disks, id, &bitmap, &dir, &vars).await?,
+        };
+        let uefi_vars = tokio::fs::try_exists(&vars).await.unwrap_or(false);
+        if uefi_vars {
+            sync_path(&vars)
+                .await
+                .map_err(|e| format!("cannot write UEFI variables: {e}"))?;
         }
-    }
-    let disks = exported?;
-    let uefi_vars = tokio::fs::try_exists(&vars).await.unwrap_or(false);
-    if uefi_vars {
-        sync_path(&vars)
+        let manifest = BackupManifest {
+            // 전체 백업은 옛 노드도 읽게 버전 1 그대로다.
+            version: if parent.is_some() {
+                MANIFEST_VERSION_INCREMENTAL
+            } else {
+                MANIFEST_VERSION
+            },
+            backup: id,
+            parent,
+            vm: vm.id,
+            vm_name: vm.name.clone(),
+            vm_spec: vm.spec.clone(),
+            disks: disks.clone(),
+            uefi_vars,
+            created_at,
+        };
+        write_manifest(&dir, &manifest)
             .await
-            .map_err(|e| format!("cannot write UEFI variables: {e}"))?;
-    }
-    let manifest = BackupManifest {
-        version: MANIFEST_VERSION,
-        backup: id,
-        vm: vm.id,
-        vm_name: vm.name.clone(),
-        vm_spec: vm.spec.clone(),
-        disks: disks.clone(),
-        uefi_vars,
-        created_at,
-    };
-    write_manifest(&dir, &manifest)
-        .await
-        .map_err(|e| format!("cannot write manifest: {e}"))?;
+            .map_err(|e| format!("cannot write manifest: {e}"))?;
+        // 그새 부모가 지워졌으면 이 증분은 복원할 수 없다. 새 비트맵도 지워 다음을 전체로 한다.
+        if let Plan::Incremental(p) = &plan
+            && get_backup(ctx, p.backup.id)?.is_none()
+        {
+            if let Err(e) = ctx.hv.remove_bitmaps(vm.id, None).await {
+                tracing::warn!(backup = %id, error = %e, "cannot remove dirty bitmap of failed backup");
+            }
+            return Err(format!(
+                "parent backup {:?} was deleted during the backup",
+                p.backup.name
+            ));
+        }
 
-    let status = BackupStatus {
-        phase: BackupPhase::Ready,
-        created_at: Some(created_at),
-        disks,
-        uefi_vars,
-        error: None,
-        node,
-        replicas: Vec::new(),
-        received_at: None,
-    };
-    // 다 만든 백업이다. 실패로 끝내면 정리하면서 지우게 되므로 기록될 때까지 다시 시도한다.
-    loop {
-        match ctx.cluster.update_status::<BackupSpec>(id, &status).await {
-            Ok(_) => break,
-            Err(ClusterError::Rejected(r)) => return Err(r.to_string()),
-            Err(e) => {
-                tracing::warn!(backup = %id, error = %e, "cannot mark backup ready; will retry");
-                tokio::time::sleep(ctx.config.poll_interval).await;
+        let status = BackupStatus {
+            phase: BackupPhase::Ready,
+            created_at: Some(created_at),
+            disks,
+            uefi_vars,
+            error: None,
+            node,
+            replicas: Vec::new(),
+            received_at: None,
+            parent,
+            full_reason,
+        };
+        // 다 만든 백업이다. 실패로 끝내면 정리하면서 지우게 되므로 기록될 때까지 다시 시도한다.
+        loop {
+            match ctx.cluster.update_status::<BackupSpec>(id, &status).await {
+                Ok(_) => break,
+                Err(ClusterError::Rejected(r)) => return Err(r.to_string()),
+                Err(e) => {
+                    tracing::warn!(backup = %id, error = %e, "cannot mark backup ready; will retry");
+                    tokio::time::sleep(ctx.config.poll_interval).await;
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
+    .await;
+    if live_bitmap && matches!(ctx.hv.inspect(vm.id).await, Ok(Some(_))) {
+        match &made {
+            Ok(()) => {
+                // 남은 앞 비트맵은 다음 증분을 막을 뿐이다(그 백업은 전체로 하고 다시 지운다).
+                if let Err(e) = ctx.hv.remove_bitmaps(vm.id, Some(&bitmap)).await {
+                    tracing::warn!(backup = %id, error = %e, "cannot remove older dirty bitmaps");
+                }
+            }
+            Err(_) => drop_new_bitmap(ctx, vm.id, &bitmap).await,
+        }
+    }
+    made
 }
 
 /// 백업 디렉터리를 지운다. 없으면 이미 지운 것이다.
@@ -327,8 +671,9 @@ async fn remove_dir(dir: &Path) -> Result<(), String> {
 }
 
 /// 실패한 백업 Task의 흔적을 지운다: 아직 `pending`인 백업이면 디렉터리를 지우고 `failed`와 `error`를
-/// 남긴다(리소스는 사용자가 보고 지운다). `unfinished`면(opld가 재시작해 중단) 실행 중인 VM의 디스크에
-/// 남았을 수 있는 임시 스냅샷도 지운다(블록 디스크의 것은 태그 청소도 지운다).
+/// 남긴다(리소스는 사용자가 보고 지운다). VM이 실행 중이면 남았을 수 있는 증분 백업 작업을 치우고,
+/// `unfinished`면(opld가 재시작해 중단) 디스크에 남았을 수 있는 임시 스냅샷도 지운다(블록 디스크의
+/// 것은 태그 청소도 지운다).
 pub(super) async fn discard(ctx: &Ctx, task: &Task, id: Uuid, error: &str, unfinished: bool) {
     let backup = match get_backup(ctx, id) {
         Ok(Some(b)) if b.status.phase == BackupPhase::Pending => b,
@@ -338,12 +683,16 @@ pub(super) async fn discard(ctx: &Ctx, task: &Task, id: Uuid, error: &str, unfin
             return;
         }
     };
-    if unfinished
-        && let Ok(Some(vm)) = ctx.cluster.get::<VmSpec>(task.spec.target)
+    if let Ok(Some(vm)) = ctx.cluster.get::<VmSpec>(task.spec.target)
         && matches!(ctx.hv.inspect(vm.id).await, Ok(Some(_)))
-        && let Err(e) = remove_tags(ctx, vm.id, true, &vm.spec, &temp_tag(id)).await
     {
-        tracing::warn!(backup = %id, error = %e, "cannot remove temporary snapshot of backup");
+        // 증분 백업 작업이 남았으면(opld가 기다리다 죽었다) 다음 스냅샷이 실패한다.
+        if let Err(e) = ctx.hv.clear_backup_leftovers(vm.id).await {
+            tracing::warn!(backup = %id, error = %e, "cannot clear backup jobs of failed backup");
+        }
+        if unfinished && let Err(e) = remove_tags(ctx, vm.id, true, &vm.spec, &temp_tag(id)).await {
+            tracing::warn!(backup = %id, error = %e, "cannot remove temporary snapshot of backup");
+        }
     }
     match backup_root(ctx, &backup.spec.pool) {
         Ok((_, root)) => {

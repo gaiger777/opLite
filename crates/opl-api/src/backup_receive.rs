@@ -211,6 +211,7 @@ pub async fn receive_backup(
             vm_spec: manifest.vm_spec,
             job: None,
             origin: Some(req.origin),
+            incremental: false,
         },
     );
     backup.status = BackupStatus {
@@ -228,6 +229,8 @@ pub async fn receive_backup(
         node: (!is_shared(&pool)).then_some(state.node),
         replicas: Vec::new(),
         received_at: None,
+        parent: None,
+        full_reason: None,
     };
     // 그사이 같은 이름이 생겼으면 저장소가 거부한다(409 name_taken).
     state.cluster.create(&backup).await?;
@@ -536,6 +539,7 @@ pub async fn complete_backup(
         let manifest = BackupManifest {
             version: MANIFEST_VERSION,
             backup: current.id,
+            parent: None,
             vm: current.spec.vm,
             vm_name: current.spec.vm_name.clone(),
             vm_spec: current.spec.vm_spec.clone(),

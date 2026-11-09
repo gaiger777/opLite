@@ -15,11 +15,19 @@ pub type Backup = Resource<BackupSpec, BackupStatus>;
 /// 매니페스트 형식 버전. 다른 버전의 백업은 복원하지 않는다.
 pub const MANIFEST_VERSION: u32 = 1;
 
+/// 증분 백업(부모가 있는 백업)의 매니페스트 형식 버전. 전체 백업은 옛 노드도 읽게 [`MANIFEST_VERSION`]으로 쓴다.
+pub const MANIFEST_VERSION_INCREMENTAL: u32 = 2;
+
 /// 백업 디렉터리 안의 매니페스트 파일 이름
 pub const MANIFEST_FILE: &str = "manifest.json";
 
 /// 증분 백업이 디스크에 두는 dirty bitmap 이름의 접두사. 이 접두사의 비트맵은 opl이 만들고 지운다.
 pub const BITMAP_PREFIX: &str = "opl-";
+
+/// 백업 `backup`의 시점 뒤에 바뀐 블록을 따라가는 dirty bitmap 이름 `opl-{id simple}`
+pub fn bitmap_name(backup: Uuid) -> String {
+    format!("{BITMAP_PREFIX}{}", backup.simple())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -40,6 +48,15 @@ pub struct BackupSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub origin: Option<BackupOrigin>,
+    /// 할 수 있으면 증분으로 백업한다(바로 앞 백업을 부모로 바뀐 블록만). 할 수 없으면 전체로 하고 그
+    /// 이유를 `status.full_reason`에 적는다. false면 뺀다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub incremental: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// 받은 사본의 원본: 보낸 클러스터와 그 클러스터의 백업
@@ -92,6 +109,14 @@ pub struct BackupStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub received_at: Option<u64>,
+    /// 증분 백업의 부모(같은 풀의 바로 앞 백업). 전체 백업이면 뺀다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub parent: Option<Uuid>,
+    /// 증분을 요청했지만 전체로 한 이유. 없으면 뺀다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub full_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -160,10 +185,15 @@ pub struct BackupDisk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BackupManifest {
-    /// 형식 버전([`MANIFEST_VERSION`])
+    /// 형식 버전([`MANIFEST_VERSION`], 증분 백업은 [`MANIFEST_VERSION_INCREMENTAL`])
     pub version: u32,
     /// 백업 id
     pub backup: Uuid,
+    /// 증분 백업의 부모 백업 id. 디스크 파일은 바뀐 블록만 담고, 부모는 헤더가 아니라 여기로만 잇는다.
+    /// 전체 백업이면 뺀다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub parent: Option<Uuid>,
     pub vm: Uuid,
     pub vm_name: String,
     pub vm_spec: VmSpec,
@@ -271,6 +301,8 @@ mod tests {
             node: None,
             replicas: vec![],
             received_at: None,
+            parent: None,
+            full_reason: None,
         };
         assert_eq!(
             serde_json::to_value(&ready).unwrap(),
@@ -450,6 +482,7 @@ mod tests {
         let manifest = BackupManifest {
             version: MANIFEST_VERSION,
             backup: Uuid::now_v7(),
+            parent: None,
             vm: Uuid::now_v7(),
             vm_name: "web".into(),
             vm_spec: vm_spec(),
@@ -473,6 +506,98 @@ mod tests {
             serde_json::from_str::<BackupManifest>(&text).unwrap(),
             manifest
         );
+    }
+
+    /// 증분 요청·부모·전체로 한 이유는 없으면 빼서 옛 노드가 읽는 모양 그대로다.
+    #[test]
+    fn incremental_fields_round_trip_and_are_omitted_when_unset() {
+        let spec: BackupSpec = serde_json::from_value(serde_json::json!({
+            "vm": Uuid::now_v7(),
+            "vm_name": "web",
+            "pool": "backups",
+            "vm_spec": vm_spec()
+        }))
+        .unwrap();
+        assert!(!spec.incremental);
+        assert!(
+            serde_json::to_value(&spec)
+                .unwrap()
+                .get("incremental")
+                .is_none()
+        );
+        let incremental = BackupSpec {
+            incremental: true,
+            ..spec
+        };
+        let json = serde_json::to_value(&incremental).unwrap();
+        assert_eq!(json["incremental"], true);
+        assert_eq!(
+            serde_json::from_value::<BackupSpec>(json).unwrap(),
+            incremental
+        );
+
+        let json = serde_json::to_value(BackupStatus::default()).unwrap();
+        assert!(json.get("parent").is_none(), "{json}");
+        assert!(json.get("full_reason").is_none(), "{json}");
+        let parent = Uuid::now_v7();
+        let child = BackupStatus {
+            parent: Some(parent),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&child).unwrap();
+        assert_eq!(json["parent"], serde_json::json!(parent));
+        assert_eq!(serde_json::from_value::<BackupStatus>(json).unwrap(), child);
+        let full = BackupStatus {
+            full_reason: Some("VM is stopped".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&full).unwrap();
+        assert_eq!(json["full_reason"], "VM is stopped");
+        assert_eq!(serde_json::from_value::<BackupStatus>(json).unwrap(), full);
+    }
+
+    /// 증분 백업의 매니페스트는 버전 2에 부모를 담는다. 전체 백업은 부모를 빼고 버전 1 그대로다.
+    #[test]
+    fn manifests_of_incremental_backups_carry_their_parent() {
+        let full = BackupManifest {
+            version: MANIFEST_VERSION,
+            backup: Uuid::now_v7(),
+            parent: None,
+            vm: Uuid::now_v7(),
+            vm_name: "web".into(),
+            vm_spec: vm_spec(),
+            disks: vec![],
+            uefi_vars: false,
+            created_at: 1_790_000_000,
+        };
+        let json = serde_json::to_value(&full).unwrap();
+        assert!(json.get("parent").is_none(), "{json}");
+        assert_eq!(
+            serde_json::from_value::<BackupManifest>(json).unwrap(),
+            full
+        );
+
+        let parent = full.backup;
+        let child = BackupManifest {
+            version: MANIFEST_VERSION_INCREMENTAL,
+            backup: Uuid::now_v7(),
+            parent: Some(parent),
+            ..full
+        };
+        let json = serde_json::to_value(&child).unwrap();
+        assert_eq!(json["version"], 2);
+        assert_eq!(json["parent"], serde_json::json!(parent));
+        assert_eq!(
+            serde_json::from_value::<BackupManifest>(json).unwrap(),
+            child
+        );
+    }
+
+    #[test]
+    fn bitmap_names_are_the_prefix_and_the_simple_backup_id() {
+        let id: Uuid = "0190a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5b".parse().unwrap();
+        assert_eq!(bitmap_name(id), "opl-0190a2b3c4d57e6f8a9b0c1d2e3f4a5b");
+        assert!(bitmap_name(id).starts_with(BITMAP_PREFIX));
     }
 
     #[test]

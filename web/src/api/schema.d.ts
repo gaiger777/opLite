@@ -1218,6 +1218,7 @@ export interface paths {
          *     방식이 섞였으면 스냅샷처럼 409 `snapshot_unsupported`), Task를 돌릴 노드에서 백업 풀을 쓸 수 없으면
          *     409 `pool_not_on_node`·`pool_unavailable`, 돌릴 노드가 없으면 409 `no_node`, 이름이 겹치면 409
          *     `name_taken`. 그사이 풀이 지워졌거나 백업 표시가 꺼졌으면 만든 백업을 지우고 409 `pool_unavailable`.
+         *     `incremental`은 증분 백업을 모르는 노드가 있으면 409 `cluster_upgrading`.
          */
         post: operations["create_backup"];
         delete?: never;
@@ -1620,10 +1621,16 @@ export interface components {
              */
             created_at: number;
             disks: components["schemas"]["BackupDisk"][];
+            /**
+             * Format: uuid
+             * @description 증분 백업의 부모 백업 id. 디스크 파일은 바뀐 블록만 담고, 부모는 헤더가 아니라 여기로만 잇는다.
+             *     전체 백업이면 뺀다.
+             */
+            parent?: string;
             uefi_vars: boolean;
             /**
              * Format: int32
-             * @description 형식 버전([`MANIFEST_VERSION`])
+             * @description 형식 버전([`MANIFEST_VERSION`], 증분 백업은 [`MANIFEST_VERSION_INCREMENTAL`])
              */
             version: number;
             /** Format: uuid */
@@ -1669,6 +1676,11 @@ export interface components {
         };
         BackupSpec: {
             /**
+             * @description 할 수 있으면 증분으로 백업한다(바로 앞 백업을 부모로 바뀐 블록만). 할 수 없으면 전체로 하고 그
+             *     이유를 `status.full_reason`에 적는다. false면 뺀다.
+             */
+            incremental?: boolean;
+            /**
              * Format: uuid
              * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
              */
@@ -1701,12 +1713,19 @@ export interface components {
              * @default null
              */
             error: string | null;
+            /** @description 증분을 요청했지만 전체로 한 이유. 없으면 뺀다. */
+            full_reason?: string;
             /**
              * Format: uuid
              * @description 파일을 쓴 노드. 공유가 아닌 풀의 백업은 이 노드에만 있으므로 지우기·복원도 이 노드에서 한다.
              *     공유 풀이면 없다.
              */
             node?: string;
+            /**
+             * Format: uuid
+             * @description 증분 백업의 부모(같은 풀의 바로 앞 백업). 전체 백업이면 뺀다.
+             */
+            parent?: string;
             /** @default pending */
             phase: components["schemas"]["BackupPhase"];
             /**
@@ -1763,6 +1782,11 @@ export interface components {
             sockets?: number;
         };
         CreateBackupRequest: {
+            /**
+             * @description 할 수 있으면 증분으로(같은 풀의 바로 앞 백업을 부모로 바뀐 블록만) 백업한다. 할 수 없으면
+             *     전체로 하고 그 이유를 `status.full_reason`에 적는다.
+             */
+            incremental?: boolean;
             /** @description 백업 이름(클러스터에서 고유). 없으면 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC)다. */
             name?: string | null;
             /** @description 백업 풀(`backups`를 켠 풀) */
@@ -2317,6 +2341,11 @@ export interface components {
                 revision: number;
                 spec: {
                     /**
+                     * @description 할 수 있으면 증분으로 백업한다(바로 앞 백업을 부모로 바뀐 블록만). 할 수 없으면 전체로 하고 그
+                     *     이유를 `status.full_reason`에 적는다. false면 뺀다.
+                     */
+                    incremental?: boolean;
+                    /**
                      * Format: uuid
                      * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
                      */
@@ -2349,12 +2378,19 @@ export interface components {
                      * @default null
                      */
                     error: string | null;
+                    /** @description 증분을 요청했지만 전체로 한 이유. 없으면 뺀다. */
+                    full_reason?: string;
                     /**
                      * Format: uuid
                      * @description 파일을 쓴 노드. 공유가 아닌 풀의 백업은 이 노드에만 있으므로 지우기·복원도 이 노드에서 한다.
                      *     공유 풀이면 없다.
                      */
                     node?: string;
+                    /**
+                     * Format: uuid
+                     * @description 증분 백업의 부모(같은 풀의 바로 앞 백업). 전체 백업이면 뺀다.
+                     */
+                    parent?: string;
                     /** @default pending */
                     phase: components["schemas"]["BackupPhase"];
                     /**
@@ -3435,6 +3471,11 @@ export interface components {
             revision: number;
             spec: {
                 /**
+                 * @description 할 수 있으면 증분으로 백업한다(바로 앞 백업을 부모로 바뀐 블록만). 할 수 없으면 전체로 하고 그
+                 *     이유를 `status.full_reason`에 적는다. false면 뺀다.
+                 */
+                incremental?: boolean;
+                /**
                  * Format: uuid
                  * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
                  */
@@ -3467,12 +3508,19 @@ export interface components {
                  * @default null
                  */
                 error: string | null;
+                /** @description 증분을 요청했지만 전체로 한 이유. 없으면 뺀다. */
+                full_reason?: string;
                 /**
                  * Format: uuid
                  * @description 파일을 쓴 노드. 공유가 아닌 풀의 백업은 이 노드에만 있으므로 지우기·복원도 이 노드에서 한다.
                  *     공유 풀이면 없다.
                  */
                 node?: string;
+                /**
+                 * Format: uuid
+                 * @description 증분 백업의 부모(같은 풀의 바로 앞 백업). 전체 백업이면 뺀다.
+                 */
+                parent?: string;
                 /** @default pending */
                 phase: components["schemas"]["BackupPhase"];
                 /**

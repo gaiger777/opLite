@@ -1328,6 +1328,7 @@ async fn block_tags_of_pending_backups_are_kept_at_startup() {
                 vm_spec: spec.clone(),
                 job: None,
                 origin: None,
+                incremental: false,
             },
         );
         env.cluster.create(&backup).await.unwrap();
@@ -1540,12 +1541,21 @@ async fn rbd_disks_snapshot_anywhere_and_revert_to_any_snapshot() {
     let (status, task) = admin.post("/vms/web/snapshots/a/revert", Value::Null).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     succeeded(&admin.wait_task(&task).await);
+    // 디스크마다 증분 백업의 비트맵을 지운 뒤 되돌린다.
     let reverts: Vec<_> = storage
         .calls()
         .into_iter()
-        .filter(|(call, _)| *call == "revert")
+        .filter(|(call, _)| ["revert", "drop_bitmaps"].contains(call))
         .collect();
-    assert_eq!(reverts, [("revert", vols[0]), ("revert", vols[1])]);
+    assert_eq!(
+        reverts,
+        [
+            ("drop_bitmaps", vols[0]),
+            ("revert", vols[0]),
+            ("drop_bitmaps", vols[1]),
+            ("revert", vols[1])
+        ]
+    );
     assert_eq!(storage.tags(vols[1]), [a.as_str(), b.as_str(), "backup"]);
 }
 

@@ -900,6 +900,15 @@ impl Storage for FakeStorage {
         self.record("revert", id).await;
         Ok(())
     }
+    async fn drop_backup_bitmaps(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.record("drop_bitmaps", id).await;
+        Ok(())
+    }
     async fn snapshot_delete(
         &self,
         _: &StoragePool,

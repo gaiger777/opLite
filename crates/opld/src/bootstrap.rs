@@ -482,7 +482,7 @@ pub(crate) mod tests {
         };
         register_node(&cluster, &config, &host).await.unwrap();
         assert_eq!(version().as_deref(), Some(BUILD));
-        assert_eq!(features(), ["node-drain"]);
+        assert_eq!(features(), ["node-drain", "incremental-backup"]);
         update_node_status(&cluster, |status| {
             status.version = Some("0.0.1".into());
             status.features.clear();
@@ -492,7 +492,7 @@ pub(crate) mod tests {
         .unwrap();
         register_node(&cluster, &config, &host).await.unwrap();
         assert_eq!(version().as_deref(), Some(BUILD));
-        assert_eq!(features(), ["node-drain"]);
+        assert_eq!(features(), ["node-drain", "incremental-backup"]);
         cluster.shutdown().await.unwrap();
     }
 
@@ -518,7 +518,7 @@ pub(crate) mod tests {
         .unwrap();
         assert!(node().status.features.is_empty());
         refresh_features(&cluster).await.unwrap();
-        assert_eq!(node().status.features, ["node-drain"]);
+        assert_eq!(node().status.features, ["node-drain", "incremental-backup"]);
         cluster.shutdown().await.unwrap();
     }
 
@@ -583,7 +583,7 @@ pub(crate) mod tests {
                 online: true,
                 arch: Some(Arch::native()),
                 version: Some(BUILD.to_string()),
-                features: vec!["node-drain".into()],
+                features: vec!["node-drain".into(), "incremental-backup".into()],
                 ..NodeStatus::default()
             }
         );

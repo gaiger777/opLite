@@ -74,6 +74,7 @@ async fn ready_backup(env: &Env, name: &str, job: Option<Uuid>) -> Backup {
             vm_spec: serde_json::from_value(spec).unwrap(),
             job,
             origin: None,
+            incremental: false,
         },
     );
     let manifest: BackupManifest = serde_json::from_value(json!({
@@ -101,6 +102,8 @@ async fn ready_backup(env: &Env, name: &str, job: Option<Uuid>) -> Backup {
         node: Some(env.node),
         replicas: vec![],
         received_at: None,
+        parent: None,
+        full_reason: None,
     };
     let dir = source_dir(env, backup.id);
     std::fs::create_dir_all(&dir).unwrap();

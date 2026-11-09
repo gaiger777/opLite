@@ -205,6 +205,47 @@ async fn stopped_vm_snapshot_reverts_disk_size_and_uefi_vars() {
     assert!(!copy.exists());
 }
 
+/// 백업이 남긴 dirty bitmap이 있는 디스크도 되돌린다. 비트맵이 있으면 qcow2 내부 스냅샷으로 되돌릴 수
+/// 없으므로 되돌리기 전에 `opl-` 비트맵을 지운다(되돌린 디스크에는 맞지 않아 다음 백업은 전체다).
+#[tokio::test]
+async fn revert_removes_backup_bitmaps_first() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    create_pool(&env).await;
+    let file = create_volume(&env, &admin, "root").await;
+    create_vm(&admin, "web", &["root"]).await;
+    assert!(qemu_io(&file, "write -P 0xaa 0 64k"));
+    succeeded(
+        &wait(
+            &admin,
+            admin
+                .post("/vms/web/snapshots", json!({ "name": "s1" }))
+                .await,
+        )
+        .await,
+    );
+    assert!(qemu_io(&file, "write -P 0xbb 0 64k"));
+    let bitmap = opl_types::backup::bitmap_name(Uuid::now_v7());
+    qemu_img(&["bitmap", "--add", path_str(&file), &bitmap]);
+
+    succeeded(
+        &wait(
+            &admin,
+            admin
+                .post("/vms/web/snapshots/s1/revert", Value::Null)
+                .await,
+        )
+        .await,
+    );
+    assert!(qemu_io(&file, "read -P 0xaa 0 64k"));
+    let info: Value =
+        serde_json::from_str(&qemu_img(&["info", "-U", "--output=json", path_str(&file)])).unwrap();
+    assert!(
+        info.pointer("/format-specific/data/bitmaps").is_none(),
+        "{info}"
+    );
+}
+
 #[tokio::test]
 async fn memory_snapshot_revert_starts_from_the_saved_state() {
     let env = Env::start().await;
