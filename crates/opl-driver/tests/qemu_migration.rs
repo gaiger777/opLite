@@ -337,10 +337,19 @@ async fn failed_migration_keeps_the_source_running() {
     n.src.stop(vm.id, StopMode::Force).await.unwrap();
 }
 
-/// 이미지에 저장된 dirty bitmap마다 (이름, 플래그)
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// 이미지에 저장된 dirty bitmap마다 (이름, 플래그). 읽기만 하므로 잠금 없이(`-U`) 연다.
 fn image_bitmaps(disk: &Path) -> Vec<(String, Vec<String>)> {
     let out = std::process::Command::new("qemu-img")
-        .args(["info", "--output=json"])
+        .args(["info", "-U", "--output=json"])
         .arg(disk)
         .output()
         .unwrap();
@@ -392,6 +401,15 @@ async fn inconsistent_bitmaps_are_dropped_and_do_not_block_migration() {
     tokio::time::timeout(Duration::from_secs(10), crashed)
         .await
         .unwrap();
+    // Linux에서 pidfile 잠금(POSIX)은 fd를 닫을 때 바로 풀리지만 이미지 잠금(OFD)은 파일의 마지막
+    // 참조가 사라질 때 풀려 Crashed 뒤에도 잠깐 남을 수 있다. 프로세스가 사라질 때까지 기다린다.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while process_exists(pid) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("killed QEMU did not exit within 10s");
     assert_eq!(
         image_bitmaps(&disk),
         [(
