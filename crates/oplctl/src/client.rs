@@ -22,6 +22,10 @@ pub const IMPORT_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 /// 노드 업그레이드 Task를 기다리는 시간. 큰 업그레이드는 오래 걸리므로 Task 실행기는 시간 제한을 두지 않는다.
 pub const UPGRADE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// 노드 비우기 Task를 기다리는 시간. VM마다 마이그레이션(서버 `[migration] timeout`)을 하나씩 하므로 Task
+/// 실행기는 시간 제한을 두지 않는다.
+pub const DRAIN_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Task 조회 요청 하나의 제한 시간. 서버가 응답하지 않아도 전체 기다리기 제한(`TASK_WAIT`)이 지켜지게 한다.
 const TASK_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 

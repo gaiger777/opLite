@@ -2,7 +2,7 @@
 //! 실행 중에 다른 노드로 옮긴다. 확정 뒤 상태, 원본 QEMU 정리, UEFI 변수 파일, 디스크 내용, 마이그레이션
 //! 중의 `vm_busy`, 대상 포트가 막혀 실패하면 원본이 계속 도는지를 본다. 멈춘 UEFI VM을 옮겨 켜면 변수
 //! 파일이 따라가는지도 본다. 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용은 정지한 VM에서
-//! `qemu-io`로 본다.
+//! `qemu-io`로 본다. 노드 비우기(`oplctl node drain --wait`)가 실행 중인 VM을 다른 노드로 옮기는지도 본다.
 //! `cargo test -p opld --features migration-it --test migration`
 //! QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다. 이 Mac에서도 돈다(TCG).
 //!
@@ -510,6 +510,79 @@ async fn uefi_variables_follow_a_stopped_vm() {
     d.ctl(&["vm", "delete", "web"]).await.unwrap();
     d.ctl(&["volume", "delete", "vars-root"]).await.unwrap();
     d.ctl(&["pool", "delete", "vars"]).await.unwrap();
+}
+
+/// `oplctl node drain --wait`: 노드 1을 유지보수로 바꾸고 그 노드에서 도는 VM을 스케줄러가 고른 노드 2로
+/// 라이브 마이그레이션한다. 유지보수를 끈 뒤에도 VM은 노드 2에 남는다.
+#[tokio::test]
+async fn drain_moves_a_running_vm_to_the_other_node() {
+    let p = Pair::new("mig-drain", ["60200-60209", "60210-60219"]).await;
+    let (c, d) = (&p.c[0], &p.d[0]);
+    let target = p.node_id(1).await;
+
+    let shared = tempfile::Builder::new()
+        .prefix("opldrain")
+        .tempdir_in("/tmp")
+        .unwrap();
+    d.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.path().to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    p.wait_pool_ready("shared").await;
+    d.ctl(&[
+        "volume", "create", "root", "--pool", "shared", "--size", "64M",
+    ])
+    .await
+    .unwrap();
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--node", "node1", "--start",
+    ])
+    .await
+    .unwrap();
+    let pid = running_pid(c).await;
+    let id = c.get("/vms/web").await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = d.ctl(&["node", "drain", "node1", "--wait"]).await.unwrap();
+    assert_eq!(out, "node node1 drained\n");
+    let node = c.get("/nodes/node1").await.unwrap();
+    assert_eq!(node["spec"]["maintenance"], true, "{node}");
+    for c in &p.c {
+        let vm = c.get("/vms/web").await.unwrap();
+        assert_eq!(vm["spec"]["node"].as_str(), Some(target.as_str()), "{vm}");
+        assert_eq!(vm["status"]["node"].as_str(), Some(target.as_str()), "{vm}");
+        assert_eq!(vm["status"]["migration"], Value::Null, "{vm}");
+    }
+    let moved = running_pid(&p.c[1]).await;
+    assert_ne!(moved, pid);
+    assert!(alive(moved));
+    eventually("source QEMU stopped", || async {
+        !alive(pid) && !process_with(&vm_run_dir(&p.d[0], &id))
+    })
+    .await;
+
+    let out = d
+        .ctl(&["node", "maintenance", "node1", "off"])
+        .await
+        .unwrap();
+    assert_eq!(out, "node node1: maintenance off\n");
+    let node = c.get("/nodes/node1").await.unwrap();
+    assert_eq!(node["spec"]["maintenance"], false, "{node}");
+    let vm = c.get("/vms/web").await.unwrap();
+    assert_eq!(vm["spec"]["node"].as_str(), Some(target.as_str()), "{vm}");
+
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    d.ctl(&["pool", "delete", "shared"]).await.unwrap();
 }
 
 /// NFS 풀(두 노드가 각자 마운트한다)

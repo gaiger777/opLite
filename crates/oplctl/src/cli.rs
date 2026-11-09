@@ -10,8 +10,8 @@ use reqwest::Method;
 use serde_json::{Value, json};
 
 use crate::client::{
-    ApiError, BACKUP_WAIT, Client, IMPORT_WAIT, MIGRATE_WAIT, UPGRADE_WAIT, fetch_ca, fingerprint,
-    local, seg,
+    ApiError, BACKUP_WAIT, Client, DRAIN_WAIT, IMPORT_WAIT, MIGRATE_WAIT, UPGRADE_WAIT, fetch_ca,
+    fingerprint, local, seg,
 };
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
@@ -218,6 +218,103 @@ enum NodeCmd {
         #[arg(long)]
         wait: bool,
     },
+    /// 노드를 유지보수로 바꾸거나(`on` — 새 VM을 놓지 않는다) 끝낸다(`off`). 도는 VM은 그대로다.
+    Maintenance {
+        node: String,
+        state: Switch,
+    },
+    /// 노드를 유지보수로 바꾸고 실행 중인 VM을 하나씩 다른 노드로 라이브 마이그레이션한다. 로컬 풀
+    /// 디스크 VM은 옮기지 못한다.
+    Drain {
+        node: String,
+        /// 비우기 Task가 끝날 때까지 기다린다. 옮기지 못한 VM이 있으면 실패한다.
+        #[arg(long)]
+        wait: bool,
+    },
+}
+
+/// `node maintenance`의 켜기·끄기
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+/// `node maintenance`: 노드를 읽어 라벨과 spec은 그대로 두고 `maintenance`만 바꿔 그 revision으로
+/// (`If-Match`) 다시 쓴다. 읽은 뒤 status만 바뀌어도 revision이 달라지므로 `revision_mismatch`면 다시 한다.
+/// 끄면 그 노드의 끝나지 않은 비우기가 멈춘다고 `err`(stderr)에 알린다(Task 목록을 읽지 못하면 그 경고).
+async fn node_maintenance(
+    client: &Client,
+    node: &str,
+    on: bool,
+    out: &mut (dyn Write + Send),
+    err: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let path = format!("/nodes/{}", seg(node));
+    let mut retries = SpecRetries::default();
+    let id = loop {
+        let current = client.get(&path).await?;
+        let r = client
+            .request(Method::PUT, &path)
+            .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
+            .json(&spec_update(&current, "maintenance", json!(on)));
+        match client.send(r).await {
+            Err(e) => match retries.next(&e.to_string()) {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => return Err(e),
+            },
+            Ok(_) => break cell(&current["id"]),
+        }
+    };
+    let state = if on { "on" } else { "off" };
+    writeln!(out, "node {node}: maintenance {state}")?;
+    if !on {
+        // 비우기 Task는 유지보수가 끝나면 멈춘다. 유지보수는 이미 꺼졌으므로 찾아보지 못해도 경고만 한다.
+        let tasks = match client.get("/tasks").await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                writeln!(err, "warning: cannot check for a running drain: {e}")?;
+                return Ok(());
+            }
+        };
+        let draining = tasks["items"].as_array().into_iter().flatten().find(|t| {
+            t["spec"]["op"]["kind"] == "node-drain"
+                && cell(&t["spec"]["node"]) == id
+                && !matches!(t["status"]["state"].as_str(), Some("succeeded" | "failed"))
+        });
+        if let Some(task) = draining {
+            writeln!(
+                err,
+                "warning: the running drain of {node} stops (task {})",
+                cell(&task["id"])
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// `node drain`: 비우기 Task를 만든다(노드는 곧바로 유지보수가 된다). `wait`이면 끝날 때까지 기다리고,
+/// 아니면 Task를 따라가는 방법을 알린다.
+async fn node_drain(
+    client: &Client,
+    node: &str,
+    wait: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let task = client
+        .post(&format!("/nodes/{}/drain", seg(node)), &json!({}))
+        .await?;
+    if wait {
+        client.wait_task_for(&task, DRAIN_WAIT).await?;
+        writeln!(out, "node {node} drained")?;
+    } else {
+        let id = cell(&task["id"]);
+        writeln!(
+            out,
+            "drain of {node} started (task {id}); follow it with `oplctl task get {id}`"
+        )?;
+    }
+    Ok(())
 }
 
 /// `node upgrade`: 업그레이드 Task를 만든다. `wait`이면 끝날 때까지 기다리고, 아니면 Task를 따라가는
@@ -3135,6 +3232,17 @@ where
                 node_updates(&client, &node, refresh, json_out, out).await?
             }
             NodeCmd::Upgrade { node, wait } => node_upgrade(&client, &node, wait, out).await?,
+            NodeCmd::Maintenance { node, state } => {
+                node_maintenance(
+                    &client,
+                    &node,
+                    state == Switch::On,
+                    out,
+                    &mut std::io::stderr(),
+                )
+                .await?
+            }
+            NodeCmd::Drain { node, wait } => node_drain(&client, &node, wait, out).await?,
         },
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::List => {
@@ -8167,6 +8275,257 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 "POST /api/v1/nodes/n1/upgrade HTTP/1.1",
                 "GET /api/v1/tasks/t1 HTTP/1.1"
             ]
+        );
+    }
+
+    /// `node maintenance`는 on·off만 받는다. 노드를 읽어 라벨과 spec은 그대로 두고 `maintenance`만 바꿔
+    /// 읽은 revision으로(`If-Match`) 다시 쓴다.
+    #[tokio::test]
+    async fn node_maintenance_puts_the_spec() {
+        let run = |args: &'static [&'static str], base: String| async move {
+            let Cmd::Node {
+                cmd: NodeCmd::Maintenance { node, state },
+            } = Cli::try_parse_from(args).unwrap().cmd
+            else {
+                unreachable!()
+            };
+            let client = Client::new(&base, None, None).unwrap();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            node_maintenance(&client, &node, state == Switch::On, &mut out, &mut err)
+                .await
+                .unwrap();
+            assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+            String::from_utf8(out).unwrap()
+        };
+        for args in [
+            &["oplctl", "node", "maintenance", "n1"][..],
+            &["oplctl", "node", "maintenance", "n1", "yes"][..],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+
+        let (base, seen) = fake_api_bodies(|_| {
+            json!({
+                "name": "n1",
+                "revision": 7,
+                "labels": { "rack": "a" },
+                "spec": { "address": "10.0.0.1:7443", "maintenance": false, "witness": false },
+                "status": { "online": true }
+            })
+        })
+        .await;
+        assert_eq!(
+            run(&["oplctl", "node", "maintenance", "n1", "on"], base.clone()).await,
+            "node n1: maintenance on\n"
+        );
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(seen[0].line, "GET /api/v1/nodes/n1 HTTP/1.1");
+            assert_eq!(seen[1].line, "PUT /api/v1/nodes/n1 HTTP/1.1");
+            assert_eq!(seen[1].if_match.as_deref(), Some("7"));
+            assert_eq!(
+                seen[1].body,
+                json!({
+                    "labels": { "rack": "a" },
+                    "spec": { "address": "10.0.0.1:7443", "maintenance": true, "witness": false }
+                })
+            );
+        }
+        seen.lock().unwrap().clear();
+        assert_eq!(
+            run(&["oplctl", "node", "maintenance", "n1", "off"], base).await,
+            "node n1: maintenance off\n"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[1].body["spec"]["maintenance"], false);
+        // 끄면 그 노드의 비우기 Task를 찾아본다(없으면 경고하지 않는다).
+        assert_eq!(seen[2].line, "GET /api/v1/tasks HTTP/1.1");
+    }
+
+    /// 유지보수를 끄면 그 노드의 끝나지 않은 비우기가 멈춘다고 stderr에 알린다.
+    #[tokio::test]
+    async fn node_maintenance_off_warns_about_a_running_drain() {
+        let (base, _) = fake_api_bodies(|path| {
+            if path == "/api/v1/tasks" {
+                let drain = |id: &str, node: &str, state: &str| {
+                    json!({
+                        "id": id,
+                        "spec": { "op": { "kind": "node-drain" }, "target": node, "node": node },
+                        "status": { "state": state }
+                    })
+                };
+                json!({ "items": [
+                    drain("t1", "id-1", "failed"),
+                    drain("t2", "id-2", "running"),
+                    drain("t3", "id-1", "running"),
+                ] })
+            } else {
+                json!({
+                    "id": "id-1",
+                    "name": "n1",
+                    "revision": 7,
+                    "spec": { "address": "10.0.0.1:7443", "maintenance": true, "witness": false },
+                    "status": { "online": true }
+                })
+            }
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        node_maintenance(&client, "n1", false, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "node n1: maintenance off\n"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: the running drain of n1 stops (task t3)\n"
+        );
+    }
+
+    /// 유지보수는 이미 꺼졌으므로, 비우기 Task를 찾아보지 못해도 경고만 하고 성공한다.
+    #[tokio::test]
+    async fn node_maintenance_off_succeeds_when_tasks_cannot_be_read() {
+        let (client, _) = fake_api_status(|path| {
+            if path == "/api/v1/tasks" {
+                (
+                    500,
+                    json!({ "code": "internal", "message": "tasks unavailable" }),
+                )
+            } else {
+                (
+                    200,
+                    json!({
+                        "id": "id-1",
+                        "name": "n1",
+                        "revision": 7,
+                        "spec": { "address": "10.0.0.1:7443", "maintenance": true, "witness": false },
+                        "status": { "online": true }
+                    }),
+                )
+            }
+        })
+        .await;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        node_maintenance(&client, "n1", false, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "node n1: maintenance off\n"
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.starts_with("warning: cannot check for a running drain: ")
+                && err.contains("tasks unavailable"),
+            "{err}"
+        );
+    }
+
+    /// 읽은 뒤 노드가 바뀌어 PUT이 `revision_mismatch`면 다시 읽어 쓴다.
+    #[tokio::test]
+    async fn node_maintenance_retries_a_revision_mismatch() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (client, seen) = fake_api_status(move |_| {
+            // GET, PUT(409), GET, PUT 차례다.
+            match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                1 => (
+                    409,
+                    json!({ "code": "revision_mismatch", "message": "node n1 changed" }),
+                ),
+                _ => (
+                    200,
+                    json!({
+                        "id": "id-1",
+                        "name": "n1",
+                        "revision": 7,
+                        "spec": { "address": "10.0.0.1:7443", "maintenance": false, "witness": false },
+                        "status": { "online": true }
+                    }),
+                ),
+            }
+        })
+        .await;
+        let mut out = Vec::new();
+        node_maintenance(&client, "n1", true, &mut out, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "node n1: maintenance on\n");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/nodes/n1 HTTP/1.1",
+                "PUT /api/v1/nodes/n1 HTTP/1.1",
+                "GET /api/v1/nodes/n1 HTTP/1.1",
+                "PUT /api/v1/nodes/n1 HTTP/1.1",
+            ]
+        );
+    }
+
+    /// `node drain`은 비우기 Task를 만들고 따라가는 방법을 알린다. `--wait`이면 Task를 기다리고, Task가
+    /// 실패하면(옮기지 못한 VM) 그 오류로 끝난다.
+    #[tokio::test]
+    async fn node_drain_starts_the_task() {
+        let (client, seen) = fake_api(|path| match path {
+            "/api/v1/nodes/n1/drain" => json!({ "id": "t1" }),
+            "/api/v1/nodes/n2/drain" => json!({ "id": "t2" }),
+            "/api/v1/tasks/t2" => json!({ "id": "t2", "status": {
+                "state": "failed",
+                "error": "1 VM(s) were not moved: db (disks on a local pool)"
+            } }),
+            _ => json!({ "id": "t1", "status": { "state": "succeeded" } }),
+        })
+        .await;
+        let run = |args: &'static [&'static str]| {
+            let client = client.clone();
+            async move {
+                let Cmd::Node {
+                    cmd: NodeCmd::Drain { node, wait },
+                } = Cli::try_parse_from(args).unwrap().cmd
+                else {
+                    unreachable!()
+                };
+                let mut out = Vec::new();
+                node_drain(&client, &node, wait, &mut out)
+                    .await
+                    .map(|()| String::from_utf8(out).unwrap())
+            }
+        };
+
+        assert_eq!(
+            run(&["oplctl", "node", "drain", "n1"]).await.unwrap(),
+            "drain of n1 started (task t1); follow it with `oplctl task get t1`\n"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["POST /api/v1/nodes/n1/drain HTTP/1.1"]
+        );
+        seen.lock().unwrap().clear();
+        assert_eq!(
+            run(&["oplctl", "node", "drain", "n1", "--wait"])
+                .await
+                .unwrap(),
+            "node n1 drained\n"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "POST /api/v1/nodes/n1/drain HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1"
+            ]
+        );
+        let err = run(&["oplctl", "node", "drain", "n2", "--wait"])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "task t2 failed: 1 VM(s) were not moved: db (disks on a local pool)"
         );
     }
 
