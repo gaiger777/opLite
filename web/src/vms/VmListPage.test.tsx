@@ -407,6 +407,23 @@ it("names the VM that failed and sums up a bulk action", async () => {
   expect(started).toEqual([db.id]);
 });
 
+it("shows why a VM pinned to a node in maintenance did not start", async () => {
+  mockLists({ vm: [web, db], node: [NODE] });
+  const message =
+    'node "node-a" is in maintenance and no other node can run this VM; end maintenance first';
+  server.use(
+    http.post(apiUrl("/vms/:key/actions/:action"), () =>
+      HttpResponse.json({ code: "node_unavailable", message }, { status: 409 }),
+    ),
+  );
+  renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "db" });
+  await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+  await userEvent.type(screen.getByLabelText("Search by name"), "d");
+  await userEvent.click(within(screen.getByText("1 selected").parentElement!).getByText("Start"));
+  expect(await screen.findByText(`db: The node is unavailable: ${message}`)).toBeInTheDocument();
+});
+
 it("marks HA VMs", async () => {
   const ha = vm("app", "running", { spec: { ...vm("app", "running").spec, ha: true } });
   mockLists({ vm: [web, ha], node: [NODE] });

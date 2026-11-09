@@ -4,8 +4,9 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
-import { api, call } from "@/api/client";
+import { ApiError, api, call } from "@/api/client";
 import { applyEvent, listKey, useList, type List } from "@/api/live";
+import { useTaskIndex } from "@/api/taskIndex";
 import type { Node, Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
@@ -29,14 +30,20 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { errorMessage } from "@/i18n/errors";
+import { codeMessage, errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
 import { PoolStatus } from "@/storage/PoolStatus";
+import { trackTask } from "@/tasks/tasks";
 
 /** 그 노드에 고정했거나 그 노드에서 마지막으로 돈 VM의 수 */
 function vmCount(node: Node, vms: Vm[]): number {
   return vms.filter((vm) => (vm.spec.node ?? vm.status.node) === node.id).length;
+}
+
+/** 비우기가 옮길 VM의 수: 그 노드에 고정돼 켜 둔 VM(서버의 비우기 Task와 같은 기준) */
+function runningCount(node: Node, vms: Vm[]): number {
+  return vms.filter((vm) => vm.spec.node === node.id && vm.spec.power === "running").length;
 }
 
 /** 배지 버튼의 접근 이름에 넣는 확인 상태 */
@@ -77,6 +84,12 @@ export function NodesPage() {
   const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
   const [removing, setRemoving] = useState<Node | null>(null);
   const [showingUpdates, setShowingUpdates] = useState<Node | null>(null);
+  const [draining, setDraining] = useState<Node | null>(null);
+  const [ending, setEnding] = useState<Node | null>(null);
+  const tasks = useTaskIndex();
+  /** 그 노드의 비우기 Task가 끝나지 않았는지 */
+  const isDraining = (node: Node) =>
+    (tasks.get(node.id) ?? []).some((task) => task.spec.op.kind === "node-drain");
   // 메뉴에서 연 대화상자를 닫으면 메뉴 항목이 사라지므로, 메뉴를 연 버튼으로 포커스를 돌린다.
   const trigger = useRef<HTMLButtonElement | null>(null);
   const rememberTrigger = (e: React.SyntheticEvent<HTMLButtonElement>) => {
@@ -227,12 +240,34 @@ export function NodesPage() {
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
                       <DropdownMenuItem
-                        onSelect={() => void setMaintenance(node, !node.spec.maintenance)}
+                        onSelect={() =>
+                          // 유지보수를 끝내면 진행 중인 비우기가 멈추므로 먼저 묻는다.
+                          node.spec.maintenance && isDraining(node)
+                            ? setEnding(node)
+                            : void setMaintenance(node, !node.spec.maintenance)
+                        }
                       >
                         {t(
                           node.spec.maintenance ? "nodes.endMaintenance" : "nodes.startMaintenance",
                         )}
                       </DropdownMenuItem>
+                      {/* 위트니스는 VM을 돌리지 않는다. */}
+                      {!node.spec.witness && (
+                        <ReasonMenuItem
+                          reason={
+                            !node.status.online
+                              ? "nodes.drain.reason.offline"
+                              : node.status.hypervisor === "qemu-hvf"
+                                ? "nodes.drain.reason.hvf"
+                                : isDraining(node)
+                                  ? "nodes.drain.reason.draining"
+                                  : null
+                          }
+                          onSelect={() => setDraining(node)}
+                        >
+                          {t("nodes.drain.menu")}
+                        </ReasonMenuItem>
+                      )}
                       {node.status.updates && (
                         <DropdownMenuItem onSelect={() => setShowingUpdates(node)}>
                           {t("nodes.updates.menu")}
@@ -274,6 +309,47 @@ export function NodesPage() {
           onClose={() => setShowingUpdates(null)}
         />
       )}
+      <ConfirmDialog
+        open={draining !== null}
+        onOpenChange={(open) => !open && setDraining(null)}
+        title={t("nodes.drain.title", { name: draining?.name })}
+        description={t("nodes.drain.description")}
+        confirmLabel={t("nodes.drain.confirm")}
+        returnFocus={trigger}
+        onConfirm={async () => {
+          const node = draining!;
+          try {
+            const task = await call(
+              api.POST("/nodes/{key}/drain", { params: { path: { key: node.id } } }),
+            );
+            trackTask(task, t("tasks.op.node-drain", { target: node.name }));
+          } catch (err) {
+            throw new Error(
+              err instanceof ApiError
+                ? codeMessage(t, err.code, err.message, "nodes.drain.errors")
+                : errorMessage(t, err),
+              { cause: err },
+            );
+          }
+        }}
+      >
+        {/* VM 목록을 다 읽기 전에는 세지 않는다. */}
+        {draining && vms.isSuccess && (
+          <p className="text-sm">
+            {t("nodes.drain.running", { count: runningCount(draining, vms.data) })}
+          </p>
+        )}
+        <p className="text-sm text-muted-foreground">{t("nodes.drain.localNote")}</p>
+      </ConfirmDialog>
+      <ConfirmDialog
+        open={ending !== null}
+        onOpenChange={(open) => !open && setEnding(null)}
+        title={t("nodes.drain.endTitle", { name: ending?.name })}
+        description={t("nodes.drain.endDescription")}
+        confirmLabel={t("nodes.endMaintenance")}
+        returnFocus={trigger}
+        onConfirm={() => setMaintenance(ending!, false)}
+      />
       <ConfirmDialog
         open={removing !== null}
         onOpenChange={(open) => !open && setRemoving(null)}

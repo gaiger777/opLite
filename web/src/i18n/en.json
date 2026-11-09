@@ -37,7 +37,8 @@
     "too_many_attempts": "Too many attempts. Try again later.",
     "machine_arch_mismatch": "The machine type doesn't match the selected node's architecture.",
     "migration_unsupported": "This VM cannot be migrated: {{message}}",
-    "node_unavailable": "The target node is a witness, offline or in maintenance.",
+    "node_unavailable": "The node is unavailable: {{message}}",
+    "node_busy": "The node is already being drained.",
     "no_capacity": "The target node cannot take this VM: {{message}}",
     "task_failed": "Task error: {{message}}",
     "internal": "The server failed: {{message}}",
@@ -168,7 +169,8 @@
       "vm-import": "Import VM {{target}}",
       "vm-import-delete": "Delete import {{target}}",
       "node-update-check": "Check updates on {{target}}",
-      "node-upgrade": "Upgrade {{target}}"
+      "node-upgrade": "Upgrade {{target}}",
+      "node-drain": "Drain {{target}}"
     }
   },
   "pager": {
@@ -881,6 +883,25 @@
     "endMaintenance": "End maintenance",
     "maintenanceOn": "{{name}} is in maintenance.",
     "maintenanceOff": "{{name}} is out of maintenance.",
+    "drain": {
+      "menu": "Drain node…",
+      "title": "Drain {{name}}?",
+      "description": "The node enters maintenance, and its running VMs are live-migrated one at a time to other nodes the scheduler picks. The node stays in maintenance when the drain finishes or fails.",
+      "confirm": "Drain",
+      "running_one": "{{count}} running VM will be moved.",
+      "running_other": "{{count}} running VMs will be moved.",
+      "localNote": "VMs whose disks are on a local pool cannot be moved. They stay on this node, and the drain fails listing them. Stop them or move their disks first.",
+      "reason": {
+        "offline": "The node is offline.",
+        "hvf": "VMs on a macOS node cannot be moved.",
+        "draining": "The node is being drained."
+      },
+      "endTitle": "End maintenance of {{name}}?",
+      "endDescription": "Ending maintenance stops the running drain.",
+      "errors": {
+        "node_unavailable": "This node cannot be drained: {{message}}"
+      }
+    },
     "remove": "Remove from cluster",
     "removeTitle": "Remove {{name}} from the cluster?",
     "removeDescription": "Only for a node that is dead for good. It cannot rejoin with its current data, and VMs assigned to it stay assigned.",

@@ -37,7 +37,8 @@
     "too_many_attempts": "시도가 너무 많습니다. 잠시 뒤에 다시 하세요.",
     "machine_arch_mismatch": "선택한 노드의 아키텍처와 머신 종류가 맞지 않습니다.",
     "migration_unsupported": "이 VM은 마이그레이션할 수 없습니다: {{message}}",
-    "node_unavailable": "대상 노드가 위트니스이거나 오프라인이거나 유지보수 중입니다.",
+    "node_unavailable": "노드를 쓸 수 없습니다: {{message}}",
+    "node_busy": "이 노드는 이미 비우는 중입니다.",
     "no_capacity": "대상 노드가 이 VM을 받을 수 없습니다: {{message}}",
     "task_failed": "작업 오류: {{message}}",
     "internal": "서버 오류: {{message}}",
@@ -168,7 +169,8 @@
       "vm-import": "VM {{target}} 가져오기",
       "vm-import-delete": "가져오기 {{target}} 삭제",
       "node-update-check": "{{target}} 업데이트 확인",
-      "node-upgrade": "{{target}} 업그레이드"
+      "node-upgrade": "{{target}} 업그레이드",
+      "node-drain": "{{target}} 비우기"
     }
   },
   "pager": {
@@ -881,6 +883,25 @@
     "endMaintenance": "유지보수 끝내기",
     "maintenanceOn": "{{name}}을(를) 유지보수 모드로 바꿨습니다.",
     "maintenanceOff": "{{name}}의 유지보수를 끝냈습니다.",
+    "drain": {
+      "menu": "노드 비우기…",
+      "title": "{{name}}을(를) 비울까요?",
+      "description": "노드를 유지보수 모드로 바꾸고, 실행 중인 VM을 스케줄러가 고른 다른 노드로 하나씩 라이브 마이그레이션합니다. 비우기가 끝나거나 실패해도 노드는 유지보수 모드로 남습니다.",
+      "confirm": "비우기",
+      "running_one": "실행 중인 VM {{count}}개를 옮깁니다.",
+      "running_other": "실행 중인 VM {{count}}개를 옮깁니다.",
+      "localNote": "디스크가 로컬 풀에 있는 VM은 옮길 수 없습니다. 이 노드에 그대로 남고, 비우기는 그 VM들을 적어 실패합니다. 먼저 끄거나 디스크를 옮기세요.",
+      "reason": {
+        "offline": "노드가 오프라인입니다.",
+        "hvf": "macOS 노드의 VM은 옮길 수 없습니다.",
+        "draining": "이 노드를 비우는 중입니다."
+      },
+      "endTitle": "{{name}}의 유지보수를 끝낼까요?",
+      "endDescription": "끝내면 진행 중인 비우기가 멈춥니다.",
+      "errors": {
+        "node_unavailable": "이 노드는 비울 수 없습니다: {{message}}"
+      }
+    },
     "remove": "클러스터에서 제거",
     "removeTitle": "{{name}}을(를) 클러스터에서 제거할까요?",
     "removeDescription": "완전히 멈춘 노드에만 쓰세요. 지금 데이터로는 다시 합류할 수 없고, 이 노드에 배정된 VM은 그대로 남습니다.",

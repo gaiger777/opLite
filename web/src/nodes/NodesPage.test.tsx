@@ -448,3 +448,151 @@ it("lets viewers read the updates but not act on them", async () => {
   expect(within(dialog).queryByRole("button", { name: "Check again" })).not.toBeInTheDocument();
   expect(within(dialog).queryByRole("button", { name: "Upgrade" })).not.toBeInTheDocument();
 });
+
+it("drains a node after saying how many running VMs move", async () => {
+  cluster();
+  const other = vm("api", "running", {
+    spec: { ...vm("api", "running").spec, node: "n2" },
+  });
+  mockLists({
+    node: [NODE, { ...DOWN, status: { ...DOWN.status, online: true } }],
+    vm: [vm("web", "running"), vm("db", "running"), vm("old", "stopped"), other],
+  });
+  let posted = 0;
+  server.use(
+    http.post(apiUrl("/nodes/n1/drain"), () => {
+      posted += 1;
+      return HttpResponse.json(task("t1", "node-drain", "n1"), { status: 202 });
+    }),
+  );
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Drain node…" }));
+  const confirm = await screen.findByRole("alertdialog", { name: "Drain node-a?" });
+  // node-a에서 켜 둔 VM 둘만 센다(꺼진 VM과 다른 노드의 VM은 빼고).
+  await vi.waitFor(() => expect(confirm).toHaveTextContent("2 running VMs will be moved"));
+  expect(confirm).toHaveTextContent("VMs whose disks are on a local pool cannot be moved");
+  await userEvent.click(within(confirm).getByRole("button", { name: "Drain" }));
+  expect(await screen.findByText("Drain node-a")).toBeInTheDocument();
+  expect(posted).toBe(1);
+});
+
+it("says why the drain did not start", async () => {
+  cluster();
+  mockLists({ node: [NODE] });
+  server.use(
+    http.post(apiUrl("/nodes/n1/drain"), () =>
+      HttpResponse.json(
+        { code: "node_busy", message: 'node "node-a" is already being drained' },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Drain node…" }));
+  const confirm = await screen.findByRole("alertdialog");
+  await userEvent.click(within(confirm).getByRole("button", { name: "Drain" }));
+  expect(await within(confirm).findByRole("alert")).toHaveTextContent(
+    "The node is already being drained.",
+  );
+});
+
+it("drains only online nodes that run VMs and are not being drained", async () => {
+  cluster();
+  const witness = { ...NODE, id: "n3", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  const draining = {
+    ...task("t1", "node-drain", "n1"),
+    status: { state: "running" as const, error: null },
+  };
+  mockLists({ node: [NODE, DOWN, witness], task: [draining] });
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  const busy = await screen.findByRole("menuitem", { name: "Drain node…" });
+  await vi.waitFor(() => expect(busy).toHaveAttribute("aria-disabled", "true"));
+  expect(busy).toHaveAccessibleDescription("The node is being drained.");
+  await userEvent.keyboard("{Escape}");
+
+  await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
+  const offline = await screen.findByRole("menuitem", { name: "Drain node…" });
+  expect(offline).toHaveAttribute("aria-disabled", "true");
+  expect(offline).toHaveAccessibleDescription("The node is offline.");
+  await userEvent.keyboard("{Escape}");
+
+  // 위트니스는 VM을 돌리지 않는다.
+  await userEvent.click(screen.getByRole("button", { name: "Actions for node-w" }));
+  expect(await screen.findByRole("menuitem", { name: "Enter maintenance" })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Drain node…" })).not.toBeInTheDocument();
+});
+
+it("says why the node cannot be drained", async () => {
+  cluster();
+  mockLists({ node: [NODE] });
+  server.use(
+    http.post(apiUrl("/nodes/n1/drain"), () =>
+      HttpResponse.json(
+        {
+          code: "node_unavailable",
+          message: 'node "node-a" is offline; HA recovers the HA VMs of an offline node',
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Drain node…" }));
+  const confirm = await screen.findByRole("alertdialog");
+  await userEvent.click(within(confirm).getByRole("button", { name: "Drain" }));
+  expect(await within(confirm).findByRole("alert")).toHaveTextContent(
+    'This node cannot be drained: node "node-a" is offline; HA recovers the HA VMs of an offline node',
+  );
+});
+
+it("does not drain a macOS node", async () => {
+  cluster();
+  mockLists({ node: [{ ...NODE, status: { ...NODE.status, hypervisor: "qemu-hvf" } }] });
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  const item = await screen.findByRole("menuitem", { name: "Drain node…" });
+  expect(item).toHaveAttribute("aria-disabled", "true");
+  expect(item).toHaveAccessibleDescription("VMs on a macOS node cannot be moved.");
+});
+
+it("asks before ending maintenance that stops a running drain", async () => {
+  cluster();
+  const node = {
+    ...DOWN,
+    status: { ...DOWN.status, online: true },
+    spec: { ...DOWN.spec, maintenance: true },
+  };
+  const draining = {
+    ...task("t1", "node-drain", "n2"),
+    status: { state: "running" as const, error: null },
+  };
+  mockLists({ node: [node], task: [draining] });
+  const sent: unknown[] = [];
+  server.use(
+    http.put(apiUrl("/nodes/n2"), async ({ request }) => {
+      const body = (await request.json()) as { spec: typeof DOWN.spec };
+      sent.push(body.spec);
+      return HttpResponse.json({ ...node, revision: node.revision + 1, spec: body.spec });
+    }),
+  );
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-b" }));
+  // Task 목록을 읽은 뒤(비우는 중으로 보인 뒤) 고른다.
+  await vi.waitFor(async () =>
+    expect(await screen.findByRole("menuitem", { name: "Drain node…" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    ),
+  );
+  await userEvent.click(screen.getByRole("menuitem", { name: "End maintenance" }));
+  const confirm = await screen.findByRole("alertdialog", { name: "End maintenance of node-b?" });
+  expect(confirm).toHaveTextContent("Ending maintenance stops the running drain.");
+  expect(sent).toEqual([]);
+  await userEvent.click(within(confirm).getByRole("button", { name: "End maintenance" }));
+  await vi.waitFor(() => expect(sent).toEqual([{ address: "10.0.0.1", maintenance: false }]));
+  await vi.waitFor(() => expect(confirm).not.toBeInTheDocument());
+});
