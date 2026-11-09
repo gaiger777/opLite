@@ -36703,3 +36703,30 @@ git commit -m "docs: 증분 백업 — README 백업 절에 \"증분 백업\"(in
 - 같은 VM을 두 풀에 번갈아 백업하면 늘 전체다. 체인 중간 백업은 지울 수 없고 병합은 없다.
 - 증분 백업은 아직 원격으로 복제하지 못한다(계획 41).
 - 그 밖의 제한은 설계 문서 §7·§8과 README "증분 백업" 절에 있다.
+
+## 실행 후 기록 (2026-11-10)
+
+- **Task 1~6:** `feat/plan40-incremental`에서 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았다(생성 파일 제외). Task 1의 opl-driver `qemu-it`·`storage-it`(qemu_driver 14, qemu_migration 3, dir_storage 11)와 Task 4의 opld `qemu-it` backup 4개(켜진 VM 증분 백업 → 복원 디스크 비교)도 이 Mac에서 통과했다.
+- **1차 리뷰에서 고친 것:**
+  - VM이 비정상 종료한 뒤 남은 inconsistent 비트맵이 마이그레이션·크기 바꾸기를 막아서, VM을 켠 뒤·마이그레이션 전·`block_resize` 전에 지우고, 꺼진 상태의 크기 바꾸기는 `opl-` 비트맵을 지운다. 원본에 영구 아닌 `opl-` 비트맵이 있을 때만 `dirty-bitmaps` 마이그레이션 기능을 켠다(대상은 늘 켬).
+  - 부모 백업이 다른 노드에 있거나 이 노드에 파일이 없으면 전체로 돌린다.
+  - 부모를 지우는 중에 증분이 시작되는 경합을 막는다(지우는 중인 부모는 전체로).
+  - 남은 백업 작업·블록 노드를 `take_tags`와 버리기에서 `clear_backup_leftovers`로 치운다(취소 기다림 30초).
+  - oplctl·웹·문서 보강.
+- **2차 리뷰에서 고친 것:** `blockdev-del` 실패를 무시하던 것을 백업 실패로, 시간 제한·취소 경합·오류 가림, 끝난 파일 fsync, 멈추지 않던 시험, 커밋 메시지·README 문구, oplctl 체인 크기 표시.
+- **CI 프로브에서 고친 것:** Ubuntu(QEMU 8.2)에서 `inconsistent_bitmaps_do_not_block_offline_resize_or_restart`가 실패했다. 원인은 Linux의 OFD 이미지 잠금이 SIGKILL 뒤 POSIX pidfile 잠금보다 늦게 풀리는 경합이었다. 시험이 프로세스가 사라질 때까지 기다리고 `qemu-img info -U`를 쓰고 stderr를 보이게 고쳤다. 제품 코드는 이미 `-U`라 그대로다.
+- **불안정한 시험:** Task 실행 중에는 없었다.
+
+**테스트:**
+- macOS `cargo test --workspace` 1573개(Task 4 이후)
+- 웹 시험 562개와 `typecheck`·`lint`·`build`
+- `fmt`·`clippy -D warnings`(모든 기능)
+
+Linux CI(프로브)에서 같은 시험과 linux-kvm·ldap 작업이 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 하위 프로젝트 12의 앞 절반(증분 백업)이 끝났다.
+- 다음: 계획 41 증분 원격 복제(설계 §4). 그때까지 증분 백업의 복제는 400 "incremental backups cannot be replicated yet"로 막혀 있다.
+- 그 다음: 계획 42(하위 프로젝트 13) 디스크까지 복사하는 마이그레이션.
+- 남은 위험: SIGKILL 직후 몇 ms 안에 꺼진 상태의 크기 바꾸기를 부르면 이미지 잠금 오류가 날 수 있다(켜기는 재시도됨).
