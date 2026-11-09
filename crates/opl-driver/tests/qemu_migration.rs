@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use opl_driver::{
-    DriverError, Hypervisor, MigrateOptions, MigrateTarget, QemuConfig, QemuHypervisor,
+    DriverError, EventKind, Hypervisor, MigrateOptions, MigrateTarget, QemuConfig, QemuHypervisor,
     RuntimeStatus, StopMode, migration_tls_dir, write_migration_tls,
 };
 use opl_qemu::{Accel, HostProfile};
@@ -166,7 +166,8 @@ fn opts() -> MigrateOptions {
 #[tokio::test]
 async fn migrates_a_running_vm_over_tls() {
     let n = nodes().await;
-    let vm = spec(create_disk(n.tmp.path()));
+    let disk = create_disk(n.tmp.path());
+    let vm = spec(disk.clone());
     let task = Uuid::now_v7();
     // 원본의 UEFI 변수 파일(템플릿 복사본) 끝에 표식을 남기고 띄운다. 대상은 템플릿으로 시작하므로,
     // 넘겨받은 뒤 대상 파일이 원본과 같으면 QEMU가 pflash 내용을 옮겨 쓴 것이다.
@@ -179,6 +180,8 @@ async fn migrates_a_running_vm_over_tls() {
     std::fs::create_dir_all(src_vars.parent().unwrap()).unwrap();
     std::fs::write(&src_vars, &content).unwrap();
     n.src.start(&vm, None).await.unwrap();
+    // 증분 백업의 비트맵도 넘어간다.
+    n.src.add_bitmaps(vm.id, "opl-a").await.unwrap();
 
     // 같은 QEMU다.
     let version = n.src.running_qemu_version(vm.id).await.unwrap();
@@ -215,6 +218,13 @@ async fn migrates_a_running_vm_over_tls() {
     assert!(!std::fs::read(&dst_vars).unwrap().ends_with(marker));
     n.dst.finish_incoming(vm.id).await.unwrap();
     assert_eq!(status(&n.dst, vm.id).await, Some(RuntimeStatus::Running));
+    let bitmaps = n.dst.backup_bitmaps(vm.id).await.unwrap();
+    let a = &bitmaps[0].bitmaps;
+    assert_eq!(a.len(), 1, "{bitmaps:?}");
+    assert_eq!(
+        (a[0].name.as_str(), a[0].recording, a[0].inconsistent),
+        ("opl-a", true, false)
+    );
     assert!(n.dst.list_incoming().await.unwrap().is_empty());
     // 대상 QEMU가 이어서 실행하면서 pflash(UEFI 변수)를 자기 파일에 원본 내용으로 쓴다. 대상
     // 펌웨어가 곧바로 변수를 더 바꿀 수 있으므로(KVM) 파일 전체가 아니라 원본 표식만 본다.
@@ -250,6 +260,17 @@ async fn migrates_a_running_vm_over_tls() {
     assert_eq!(status(&n.src, vm.id).await, None);
     assert!(!n.dst.stop_migrated(vm.id).await.unwrap());
     n.dst.stop(vm.id, StopMode::Force).await.unwrap();
+    // 대상이 끝날 때 이미지에 저장했다.
+    let out = std::process::Command::new("qemu-img")
+        .args(["info", "--output=json"])
+        .arg(&disk)
+        .output()
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        info["format-specific"]["data"]["bitmaps"][0]["name"], "opl-a",
+        "{info}"
+    );
 }
 
 /// 확정 전에 실패하면 원본은 그대로 돈다. 받는 QEMU는 버린다.
@@ -314,4 +335,129 @@ async fn failed_migration_keeps_the_source_running() {
     n.src.resume(vm.id).await.unwrap();
     assert_eq!(status(&n.src, vm.id).await, Some(RuntimeStatus::Running));
     n.src.stop(vm.id, StopMode::Force).await.unwrap();
+}
+
+/// 이미지에 저장된 dirty bitmap마다 (이름, 플래그)
+fn image_bitmaps(disk: &Path) -> Vec<(String, Vec<String>)> {
+    let out = std::process::Command::new("qemu-img")
+        .args(["info", "--output=json"])
+        .arg(disk)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    info["format-specific"]["data"]["bitmaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|b| {
+            let flags = b["flags"].as_array().into_iter().flatten();
+            (
+                b["name"].as_str().unwrap().to_string(),
+                flags.map(|f| f.as_str().unwrap().to_string()).collect(),
+            )
+        })
+        .collect()
+}
+
+/// QEMU가 비정상으로 끝나 이미지에 inconsistent(in-use)로 남은 증분 백업 비트맵은 다시 켤 때 지운다.
+/// 남으면 `block_resize`와 마이그레이션이 실패한다. qcow2의 비트맵은 공유 이미지로 넘어가므로 능력
+/// `dirty-bitmaps`를 켜지 않고, 그래서 실패한 마이그레이션 뒤에도 비트맵이 in-use로 남지 않는다.
+#[tokio::test]
+async fn inconsistent_bitmaps_are_dropped_and_do_not_block_migration() {
+    let n = nodes().await;
+    let disk = create_disk(n.tmp.path());
+    let vm = spec(disk.clone());
+    n.src.start(&vm, None).await.unwrap();
+    n.src.add_bitmaps(vm.id, "opl-a").await.unwrap();
+    // 끝날 때 이미지에 저장한 비트맵을 다시 연(in-use로 표시한) 채로 QEMU가 죽는다.
+    n.src.stop(vm.id, StopMode::Force).await.unwrap();
+    n.src.start(&vm, None).await.unwrap();
+    let pid = n.src.inspect(vm.id).await.unwrap().unwrap().pid;
+    let mut events = n.src.subscribe();
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    // 모니터가 실행 디렉터리를 치우고 알린다.
+    let crashed = async {
+        loop {
+            let ev = events.recv().await.unwrap();
+            if ev.id == vm.id && ev.kind == EventKind::Crashed {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), crashed)
+        .await
+        .unwrap();
+    assert_eq!(
+        image_bitmaps(&disk),
+        [(
+            "opl-a".to_string(),
+            vec!["in-use".to_string(), "auto".to_string()]
+        )]
+    );
+
+    n.src.start(&vm, None).await.unwrap();
+    let bitmaps = n.src.backup_bitmaps(vm.id).await.unwrap();
+    assert!(bitmaps[0].bitmaps.is_empty(), "{bitmaps:?}");
+    n.src.block_resize(vm.id, 0, 2 << 30).await.unwrap();
+
+    // 보내는 도중에 실패해도(받는 쪽의 메모리 크기가 달라 받지 못한다) 끝날 때 비트맵을 깨끗이
+    // 저장한다.
+    n.src.add_bitmaps(vm.id, "opl-b").await.unwrap();
+    let task = Uuid::now_v7();
+    let other = VmRuntimeSpec {
+        memory_mib: 512,
+        ..vm.clone()
+    };
+    let port = n
+        .dst
+        .start_incoming(&other, task, HOST, 61040..=61059)
+        .await
+        .unwrap();
+    let target = MigrateTarget {
+        host: HOST.into(),
+        port,
+        tls_hostname: HOST.into(),
+    };
+    let err = n.src.migrate(vm.id, &target, &opts()).await.unwrap_err();
+    assert!(matches!(err, DriverError::Migration(_)), "{err:?}");
+    n.dst.stop(vm.id, StopMode::Force).await.unwrap();
+    n.src.stop(vm.id, StopMode::Force).await.unwrap();
+    assert_eq!(
+        image_bitmaps(&disk),
+        [("opl-b".to_string(), vec!["auto".to_string()])]
+    );
+
+    // 비트맵은 공유 이미지로 넘어간다.
+    n.src.start(&vm, None).await.unwrap();
+    let port = n
+        .dst
+        .start_incoming(&vm, task, HOST, 61040..=61059)
+        .await
+        .unwrap();
+    let target = MigrateTarget {
+        host: HOST.into(),
+        port,
+        tls_hostname: HOST.into(),
+    };
+    n.src.migrate(vm.id, &target, &opts()).await.unwrap();
+    n.dst.incoming_wait(vm.id).await.unwrap();
+    n.dst.finish_incoming(vm.id).await.unwrap();
+    assert!(n.src.stop_migrated(vm.id).await.unwrap());
+    let bitmaps = n.dst.backup_bitmaps(vm.id).await.unwrap();
+    let b = &bitmaps[0].bitmaps;
+    assert_eq!(b.len(), 1, "{bitmaps:?}");
+    assert_eq!(
+        (b[0].name.as_str(), b[0].recording, b[0].inconsistent),
+        ("opl-b", true, false)
+    );
+    n.dst.stop(vm.id, StopMode::Force).await.unwrap();
+    assert_eq!(
+        image_bitmaps(&disk),
+        [("opl-b".to_string(), vec!["auto".to_string()])]
+    );
 }

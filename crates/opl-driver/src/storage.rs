@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use opl_types::backup::BITMAP_PREFIX;
 use opl_types::runtime::{DiskKind, ImageFormat, RbdTarget};
 use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
 use serde_json::Value;
@@ -91,6 +92,22 @@ pub trait Storage: Send + Sync {
         src_format: SourceFormat,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError>;
+
+    /// 증분 백업 체인 `chain`(qcow2 백업 파일들, 자식부터 전체 백업까지)을 이미지 하나로 열어 형식
+    /// `format`의 새 볼륨으로 만든다. 부모는 체인의 순서로만 잇는다(파일 헤더의 backing은 보지 않으므로
+    /// 파일마다 `check_import_source`로 먼저 확인한다). 실패하면 만들다 만 볼륨을 남기지 않는다. 기본은
+    /// 지원하지 않는다.
+    async fn import_chain(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _chain: &[PathBuf],
+        _format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        Err(DriverError::InvalidSpec(
+            "this storage cannot import backup chains".into(),
+        ))
+    }
 
     /// `src`가 다른 파일을 참조하지 않는 이미지 하나인지 확인한다(VMDK extent, backing file).
     /// 사용자가 올린 파일을 `import_volume`에 넘기기 전에 부른다.
@@ -297,6 +314,53 @@ pub trait Storage: Send + Sync {
         Err(DriverError::InvalidSpec(
             "this storage cannot export volumes".into(),
         ))
+    }
+
+    /// 증분 백업의 대상으로 backing 없는 빈 qcow2 파일 `dest`(절대 경로)를 가상 크기 `size_bytes`로
+    /// 만든다(있으면 덮어쓴다). 기본은 지원하지 않는다.
+    async fn create_backup_target(
+        &self,
+        _dest: &Path,
+        _size_bytes: u64,
+    ) -> Result<(), DriverError> {
+        Err(DriverError::InvalidSpec(
+            "this storage cannot create backup targets".into(),
+        ))
+    }
+
+    /// 꺼진 볼륨에 증분 백업의 dirty bitmap `name`(지금부터 바뀐 블록)만 남긴다: 이름이 `opl-`로
+    /// 시작하는 다른 비트맵을 지우고 `name`을 새로 만든다. raw 볼륨은 비트맵을 담을 수 없으므로 아무것도
+    /// 하지 않는다. 기본은 raw만 받는다.
+    async fn set_backup_bitmap(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        format: ImageFormat,
+        _name: &str,
+    ) -> Result<(), DriverError> {
+        match format {
+            ImageFormat::Raw => Ok(()),
+            ImageFormat::Qcow2 => Err(DriverError::InvalidSpec(
+                "this storage cannot keep dirty bitmaps".into(),
+            )),
+        }
+    }
+
+    /// 꺼진 볼륨에서 이름이 `opl-`로 시작하는 dirty bitmap을 모두 지운다. 스냅샷으로 되돌리기 전에
+    /// 부른다: 되돌린 디스크의 비트맵은 맞지 않고, 비트맵이 있으면 qcow2의 내부 스냅샷으로 되돌릴 수
+    /// 없다(`Device has active dirty bitmaps`). raw 볼륨은 아무것도 하지 않는다. 기본은 raw만 받는다.
+    async fn drop_backup_bitmaps(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        match format {
+            ImageFormat::Raw => Ok(()),
+            ImageFormat::Qcow2 => Err(DriverError::InvalidSpec(
+                "this storage cannot keep dirty bitmaps".into(),
+            )),
+        }
     }
 }
 
@@ -635,6 +699,119 @@ impl DirStorage {
             other => Ok(other?),
         }
     }
+
+    /// 원본 `src`를 변환해 새 볼륨 파일로 만든다.
+    async fn import_from(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        src: ImportSource<'_>,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        let path = self.file_path(pool, id, format)?;
+        let from = src.args(Some(fmt_name(format)))?;
+        if self.exists(pool, &path).await? {
+            return Err(DriverError::VolumeExists(id));
+        }
+        let mut before = vec!["convert", "-q"];
+        before.extend(from.iter().map(String::as_str));
+        self.write_new(pool, id, &path, &before, &[]).await?;
+        Ok(path)
+    }
+
+    /// 꺼진 qcow2 볼륨의 dirty bitmap 이름들(`qemu-img info`의 `format-specific.data.bitmaps`)
+    async fn bitmaps_at(
+        &self,
+        path: &Path,
+        format: ImageFormat,
+    ) -> Result<Vec<String>, DriverError> {
+        let json = self.info_json(path, format).await?;
+        Ok(json
+            .pointer("/format-specific/data/bitmaps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|b| b.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// `qemu-img bitmap {op} … {name}`. 볼륨을 쓰는 VM이 없어야 한다.
+    async fn bitmap_op(
+        &self,
+        path: &Path,
+        format: ImageFormat,
+        op: &str,
+        name: &str,
+    ) -> Result<(), DriverError> {
+        let opts = image_opts(path, format)?;
+        self.qemu_img(&["bitmap", op, "--image-opts", &opts, name])
+            .await?;
+        Ok(())
+    }
+
+    /// 이름이 `opl-`로 시작하는 dirty bitmap을 모두 지운다.
+    async fn remove_backup_bitmaps(
+        &self,
+        path: &Path,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        for name in self.bitmaps_at(path, format).await? {
+            if name.starts_with(BITMAP_PREFIX) {
+                self.bitmap_op(path, format, "--remove", &name).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 가져올 원본([`Storage::import_volume`], [`Storage::import_chain`])
+#[derive(Debug, Clone, Copy)]
+enum ImportSource<'a> {
+    /// 이미지 파일 하나
+    File(&'a Path, SourceFormat),
+    /// 증분 백업 체인: qcow2 백업 파일들(자식부터 전체 백업까지). 파일 헤더에는 backing이 없다.
+    Chain(&'a [PathBuf]),
+}
+
+impl ImportSource<'_> {
+    /// `qemu-img convert`(`out_format`이 있으면 `-O`)와 `info`가 원본을 여는 인자. 파일은 `-f 형식
+    /// [-O 형식] 경로`, 체인은 `[-O 형식] json:{…}`이다.
+    fn args(&self, out_format: Option<&str>) -> Result<Vec<String>, DriverError> {
+        let out = out_format.map(|f| ["-O".to_string(), f.to_string()]);
+        match *self {
+            ImportSource::File(path, format) => {
+                require_absolute(path)?;
+                let mut args = vec!["-f".to_string(), src_fmt_name(format).to_string()];
+                args.extend(out.into_iter().flatten());
+                args.push(path_str(path)?.to_string());
+                Ok(args)
+            }
+            ImportSource::Chain(files) => {
+                let mut args: Vec<String> = out.into_iter().flatten().collect();
+                args.push(chain_json(files)?);
+                Ok(args)
+            }
+        }
+    }
+}
+
+/// 백업 체인(자식부터)을 이미지 하나로 여는 `json:` 원본. 부모를 `backing`으로 명시하고 맨
+/// 끝(전체 백업)은 `backing: null`이다. 파일 헤더의 backing file은 따르지 않는다.
+fn chain_json(files: &[PathBuf]) -> Result<String, DriverError> {
+    if files.is_empty() {
+        return Err(DriverError::InvalidSpec("backup chain is empty".into()));
+    }
+    let mut image = Value::Null;
+    for file in files.iter().rev() {
+        require_absolute(file)?;
+        image = serde_json::json!({
+            "driver": "qcow2",
+            "file": { "driver": "file", "filename": path_str(file)? },
+            "backing": image,
+        });
+    }
+    Ok(format!("json:{image}"))
 }
 
 /// `qemu-img`를 돌려 표준 출력을 돌려준다. 실패하면 stderr를 담은 `ToolFailed`.
@@ -656,18 +833,10 @@ async fn run_qemu_img(qemu_img: &Path, args: &[&str]) -> Result<Vec<u8>, DriverE
 }
 
 /// 가져올 원본 `src`의 가상 크기(`qemu-img info`). 블록 풀은 이 크기로 볼륨을 만든 뒤 써 넣는다.
-async fn source_virtual_size(
-    qemu_img: &Path,
-    src: &Path,
-    src_format: SourceFormat,
-) -> Result<u64, DriverError> {
-    let args = [
-        "info",
-        "--output=json",
-        "-f",
-        src_fmt_name(src_format),
-        path_str(src)?,
-    ];
+async fn source_virtual_size(qemu_img: &Path, src: ImportSource<'_>) -> Result<u64, DriverError> {
+    let mut args = vec!["info".to_string(), "--output=json".to_string()];
+    args.extend(src.args(None)?);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = tokio::time::timeout(INFO_TIMEOUT, run_qemu_img(qemu_img, &args))
         .await
         .map_err(|_| DriverError::Timeout("qemu-img info"))??;
@@ -955,22 +1124,19 @@ impl Storage for DirStorage {
         src_format: SourceFormat,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        let path = self.file_path(pool, id, format)?;
-        require_absolute(src)?;
-        if self.exists(pool, &path).await? {
-            return Err(DriverError::VolumeExists(id));
-        }
-        let before = [
-            "convert",
-            "-q",
-            "-f",
-            src_fmt_name(src_format),
-            "-O",
-            fmt_name(format),
-            path_str(src)?,
-        ];
-        self.write_new(pool, id, &path, &before, &[]).await?;
-        Ok(path)
+        self.import_from(pool, id, ImportSource::File(src, src_format), format)
+            .await
+    }
+
+    async fn import_chain(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        chain: &[PathBuf],
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.import_from(pool, id, ImportSource::Chain(chain), format)
+            .await
     }
 
     async fn check_import_source(
@@ -1119,6 +1285,11 @@ impl Storage for DirStorage {
         size_bytes: u64,
     ) -> Result<(), DriverError> {
         let path = self.existing_path(pool, id, format).await?;
+        // inconsistent 비트맵(QEMU가 비정상으로 끝났다)이 있으면 qemu-img가 크기를 바꾸지 못한다. 크기가
+        // 바뀐 디스크의 다음 백업은 어차피 전체이므로 증분 백업의 비트맵을 모두 지운다.
+        if format == ImageFormat::Qcow2 {
+            self.remove_backup_bitmaps(&path, format).await?;
+        }
         let size = size_bytes.to_string();
         // --shrink 없이는 qemu-img가 줄이기를 거부한다.
         self.qemu_img(&[
@@ -1196,6 +1367,51 @@ impl Storage for DirStorage {
     ) -> Result<(), DriverError> {
         export_to(&self.qemu_img, src, force_share, dest).await
     }
+
+    async fn create_backup_target(&self, dest: &Path, size_bytes: u64) -> Result<(), DriverError> {
+        create_target(&self.qemu_img, dest, size_bytes).await
+    }
+
+    async fn set_backup_bitmap(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        name: &str,
+    ) -> Result<(), DriverError> {
+        if format == ImageFormat::Raw {
+            return Ok(());
+        }
+        let path = self.existing_path(pool, id, format).await?;
+        // 같은 이름이 남아 있어도(다시 시도) 지운 뒤 새로 만든다.
+        self.remove_backup_bitmaps(&path, format).await?;
+        self.bitmap_op(&path, format, "--add", name).await
+    }
+
+    async fn drop_backup_bitmaps(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        if format == ImageFormat::Raw {
+            return Ok(());
+        }
+        let path = self.existing_path(pool, id, format).await?;
+        self.remove_backup_bitmaps(&path, format).await
+    }
+}
+
+/// [`Storage::create_backup_target`]: `qemu-img create -f qcow2`. 파일시스템 호출은 하지 않는다.
+async fn create_target(qemu_img: &Path, dest: &Path, size_bytes: u64) -> Result<(), DriverError> {
+    require_absolute(dest)?;
+    let size = size_bytes.to_string();
+    run_qemu_img(
+        qemu_img,
+        &["create", "-q", "-f", "qcow2", path_str(dest)?, &size],
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1246,6 +1462,47 @@ mod tests {
             image_opts(Path::new("/pools/a,b/v.qcow2"), ImageFormat::Qcow2).unwrap(),
             "driver=qcow2,file.filename=/pools/a,,b/v.qcow2"
         );
+    }
+
+    #[test]
+    fn chain_json_names_each_parent_as_backing() {
+        let chain = [
+            PathBuf::from("/b/c,x/disk0.qcow2"),
+            PathBuf::from("/b/b/disk0.qcow2"),
+            PathBuf::from("/b/a/disk0.qcow2"),
+        ];
+        let text = chain_json(&chain).unwrap();
+        let json: Value = serde_json::from_str(text.strip_prefix("json:").unwrap()).unwrap();
+        let image = |file: &str, backing: Value| {
+            serde_json::json!({
+                "driver": "qcow2",
+                "file": { "driver": "file", "filename": file },
+                "backing": backing,
+            })
+        };
+        assert_eq!(
+            json,
+            image(
+                "/b/c,x/disk0.qcow2",
+                image("/b/b/disk0.qcow2", image("/b/a/disk0.qcow2", Value::Null))
+            )
+        );
+        assert!(matches!(chain_json(&[]), Err(DriverError::InvalidSpec(_))));
+        assert!(matches!(
+            chain_json(&[PathBuf::from("a.qcow2")]),
+            Err(DriverError::InvalidSpec(_))
+        ));
+        // 파일 원본은 지금과 같은 인자다.
+        let file = ImportSource::File(Path::new("/up/a.vmdk"), SourceFormat::Vmdk);
+        assert_eq!(
+            file.args(Some("raw")).unwrap(),
+            ["-f", "vmdk", "-O", "raw", "/up/a.vmdk"]
+        );
+        assert_eq!(file.args(None).unwrap(), ["-f", "vmdk", "/up/a.vmdk"]);
+        let one = [PathBuf::from("/b/a/disk0.qcow2")];
+        let args = ImportSource::Chain(&one).args(Some("qcow2")).unwrap();
+        assert_eq!(args[..2], ["-O", "qcow2"]);
+        assert!(args[2].starts_with("json:{"), "{args:?}");
     }
 
     #[tokio::test]

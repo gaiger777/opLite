@@ -9,6 +9,6 @@ pub use cmdline::{CmdlineError, build_cmdline, build_incoming_cmdline};
 pub use host::{Accel, HostProfile, kvm_available};
 pub use paths::{PathError, RuntimePaths};
 pub use qmp::{
-    MigrationInfo, MigrationParameters, MigrationState, QmpClient, QmpError, QmpEvent, RunState,
-    TlsEndpoint,
+    BitmapInfo, BlockNode, JobInfo, MigrationInfo, MigrationParameters, MigrationState, QmpClient,
+    QmpError, QmpEvent, RunState, TlsEndpoint, TransactionAction,
 };

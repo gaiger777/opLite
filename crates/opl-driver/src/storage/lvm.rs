@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use super::blockcmd::BlockTool;
 use super::{
-    Capacity, Storage, VolumeInfo, VolumeSource, check_image, convert_from, path_str,
-    require_absolute, run_qemu_img, source_virtual_size, src_fmt_name,
+    Capacity, ImportSource, Storage, VolumeInfo, VolumeSource, check_image, convert_from, path_str,
+    run_qemu_img, source_virtual_size,
 };
 use crate::error::DriverError;
 
@@ -439,6 +439,22 @@ pub struct LvmThinStorage {
 }
 
 impl LvmThinStorage {
+    /// 원본의 가상 크기로 볼륨 LV를 만들고 raw로 변환해 써 넣는다.
+    async fn import_from(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        src: ImportSource<'_>,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        let (vg, thinpool) = Self::target(pool, format)?;
+        let from = src.args(Some("raw"))?;
+        let size = source_virtual_size(&self.qemu_img, src).await?;
+        let dst = self.create_lv(vg, thinpool, id, size).await?;
+        self.fill(vg, id, &dst, &from).await?;
+        Ok(dst.path)
+    }
+
     pub fn new(qemu_img: impl Into<PathBuf>, ops: Arc<dyn LvmOps>) -> Self {
         Self {
             qemu_img: qemu_img.into(),
@@ -705,7 +721,6 @@ impl Storage for LvmThinStorage {
         Ok(self.create_lv(vg, thinpool, id, size_bytes).await?.path)
     }
 
-    /// 원본의 가상 크기로 볼륨 LV를 만들고 raw로 변환해 써 넣는다.
     async fn import_volume(
         &self,
         pool: &StoragePool,
@@ -714,14 +729,19 @@ impl Storage for LvmThinStorage {
         src_format: SourceFormat,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        let (vg, thinpool) = Self::target(pool, format)?;
-        require_absolute(src)?;
-        let src_str = path_str(src)?;
-        let size = source_virtual_size(&self.qemu_img, src, src_format).await?;
-        let dst = self.create_lv(vg, thinpool, id, size).await?;
-        let from = ["-f", src_fmt_name(src_format), "-O", "raw", src_str].map(String::from);
-        self.fill(vg, id, &dst, &from).await?;
-        Ok(dst.path)
+        self.import_from(pool, id, ImportSource::File(src, src_format), format)
+            .await
+    }
+
+    async fn import_chain(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        chain: &[PathBuf],
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.import_from(pool, id, ImportSource::Chain(chain), format)
+            .await
     }
 
     /// 올린 파일만 본다(풀과 상관없다).
@@ -1105,6 +1125,20 @@ impl Drop for Zeroing<'_> {
 }
 
 impl LvmSharedStorage {
+    /// 원본의 가상 크기로 볼륨 LV를 만들고 raw로 변환해 써 넣는다.
+    async fn import_from(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        src: ImportSource<'_>,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        let vg = Self::target(pool, format)?;
+        let from = src.args(Some("raw"))?;
+        let size = source_virtual_size(&self.qemu_img, src).await?;
+        self.fill(vg, id, size, &from).await
+    }
+
     pub fn new(qemu_img: impl Into<PathBuf>, ops: Arc<dyn LvmOps>) -> Self {
         Self {
             qemu_img: qemu_img.into(),
@@ -1279,7 +1313,6 @@ impl Storage for LvmSharedStorage {
         Ok(device_path(&self.dev, vg, &volume_lv(id)))
     }
 
-    /// 원본의 가상 크기로 볼륨 LV를 만들고 raw로 변환해 써 넣는다.
     async fn import_volume(
         &self,
         pool: &StoragePool,
@@ -1288,12 +1321,19 @@ impl Storage for LvmSharedStorage {
         src_format: SourceFormat,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        let vg = Self::target(pool, format)?;
-        require_absolute(src)?;
-        let src_str = path_str(src)?;
-        let size = source_virtual_size(&self.qemu_img, src, src_format).await?;
-        let from = ["-f", src_fmt_name(src_format), "-O", "raw", src_str].map(String::from);
-        self.fill(vg, id, size, &from).await
+        self.import_from(pool, id, ImportSource::File(src, src_format), format)
+            .await
+    }
+
+    async fn import_chain(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        chain: &[PathBuf],
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.import_from(pool, id, ImportSource::Chain(chain), format)
+            .await
     }
 
     /// 올린 파일만 본다(풀과 상관없다).
@@ -2046,6 +2086,64 @@ mod tests {
             "raw volumes",
         );
         assert_eq!(lvm.taken(), Vec::<String>::new());
+    }
+
+    /// 증분 백업 체인은 backing을 명시한 `json:` 원본 하나로 연다.
+    #[tokio::test]
+    async fn imports_a_backup_chain_into_a_new_lv() {
+        let tools = tempfile::tempdir().unwrap();
+        let (lvm, storage) = setup(fake_qemu_img(tools.path(), false));
+        let (p, id) = (lvm_pool(), Uuid::now_v7());
+        let chain = [
+            PathBuf::from("/b/i/disk0.qcow2"),
+            PathBuf::from("/b/f/disk0.qcow2"),
+        ];
+        let path = storage.import_chain(&p, id, &chain, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), [format!("create vg0/tp opl-{id} 1024")]);
+        let args = std::fs::read_to_string(tools.path().join("args")).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(
+            args[..6],
+            ["convert", "-q", "-n", "--target-is-zero", "-O", "raw"]
+        );
+        let json: Value = serde_json::from_str(args[6].strip_prefix("json:").unwrap()).unwrap();
+        assert_eq!(json["file"]["filename"], "/b/i/disk0.qcow2");
+        assert_eq!(json["backing"]["file"]["filename"], "/b/f/disk0.qcow2");
+        assert_eq!(json["backing"]["backing"], Value::Null);
+        assert_eq!(args[7], path.to_str().unwrap());
+
+        // 상대 경로는 받지 않는다.
+        let relative = [PathBuf::from("b/f/disk0.qcow2")];
+        invalid(
+            storage
+                .import_chain(&p, Uuid::now_v7(), &relative, RAW)
+                .await
+                .unwrap_err(),
+            "absolute",
+        );
+        assert_eq!(lvm.taken(), Vec::<String>::new());
+    }
+
+    /// 블록 풀(기본 구현): raw 볼륨은 비트맵을 담을 수 없으므로 할 일이 없다. 백업 대상은 만들지 않는다.
+    #[tokio::test]
+    async fn raw_volumes_keep_no_dirty_bitmaps() {
+        let (lvm, storage) = setup("/nonexistent/qemu-img");
+        let (p, id) = (lvm_pool(), Uuid::now_v7());
+        storage
+            .set_backup_bitmap(&p, id, RAW, "opl-a")
+            .await
+            .unwrap();
+        storage.drop_backup_bitmaps(&p, id, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), Vec::<String>::new());
+        let qcow2 = ImageFormat::Qcow2;
+        let err = storage.set_backup_bitmap(&p, id, qcow2, "opl-a").await;
+        invalid(err.unwrap_err(), "dirty bitmaps");
+        let err = storage.drop_backup_bitmaps(&p, id, qcow2).await;
+        invalid(err.unwrap_err(), "dirty bitmaps");
+        let err = storage
+            .create_backup_target(Path::new("/b/x.part"), 1 << 20)
+            .await;
+        invalid(err.unwrap_err(), "backup targets");
     }
 
     /// 원본의 가상 크기로 LV를 만들고 raw로 변환해 써 넣는다. 실패하면 LV를 지운다.

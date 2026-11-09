@@ -8,8 +8,8 @@ use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
 use uuid::Uuid;
 
 use super::{
-    Capacity, Storage, VolumeInfo, VolumeSource, convert_from, export_to, path_str, rbd,
-    run_qemu_img,
+    Capacity, Storage, VolumeInfo, VolumeSource, convert_from, create_target, export_to, path_str,
+    rbd, run_qemu_img,
 };
 use crate::error::DriverError;
 
@@ -194,6 +194,18 @@ impl Storage for Storages {
     ) -> Result<PathBuf, DriverError> {
         self.backend(pool)?
             .import_volume(pool, id, src, src_format, format)
+            .await
+    }
+
+    async fn import_chain(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        chain: &[PathBuf],
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.backend(pool)?
+            .import_chain(pool, id, chain, format)
             .await
     }
 
@@ -442,6 +454,33 @@ impl Storage for Storages {
     ) -> Result<(), DriverError> {
         export_to(&self.qemu_img, src, force_share, dest).await
     }
+
+    async fn create_backup_target(&self, dest: &Path, size_bytes: u64) -> Result<(), DriverError> {
+        create_target(&self.qemu_img, dest, size_bytes).await
+    }
+
+    async fn set_backup_bitmap(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        name: &str,
+    ) -> Result<(), DriverError> {
+        self.backend(pool)?
+            .set_backup_bitmap(pool, id, format, name)
+            .await
+    }
+
+    async fn drop_backup_bitmaps(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.backend(pool)?
+            .drop_backup_bitmaps(pool, id, format)
+            .await
+    }
 }
 
 /// [`Storage::volume_source`]로 읽을 수 있게 한 복사 원본. `release`로 내놓지 않고 버려지면(복사
@@ -592,6 +631,33 @@ mod tests {
         ) -> Result<PathBuf, DriverError> {
             self.call("import_volume")?;
             Ok(self.dir.join(id.to_string()))
+        }
+        async fn import_chain(
+            &self,
+            _: &StoragePool,
+            id: Uuid,
+            _: &[PathBuf],
+            _: ImageFormat,
+        ) -> Result<PathBuf, DriverError> {
+            self.call("import_chain")?;
+            Ok(self.dir.join(id.to_string()))
+        }
+        async fn set_backup_bitmap(
+            &self,
+            _: &StoragePool,
+            _: Uuid,
+            _: ImageFormat,
+            _: &str,
+        ) -> Result<(), DriverError> {
+            self.call("set_backup_bitmap")
+        }
+        async fn drop_backup_bitmaps(
+            &self,
+            _: &StoragePool,
+            _: Uuid,
+            _: ImageFormat,
+        ) -> Result<(), DriverError> {
+            self.call("drop_backup_bitmaps")
         }
         async fn check_import_source(&self, _: &Path, _: SourceFormat) -> Result<(), DriverError> {
             self.call("check_import_source")
@@ -873,6 +939,15 @@ mod tests {
                 .import_volume(&p, id, src, SourceFormat::Vmdk, f)
                 .await
                 .unwrap();
+            storages
+                .import_chain(&p, id, &[src.to_path_buf()], f)
+                .await
+                .unwrap();
+            storages
+                .set_backup_bitmap(&p, id, f, "opl-a")
+                .await
+                .unwrap();
+            storages.drop_backup_bitmaps(&p, id, f).await.unwrap();
             storages.delete_volume(&p, id, f).await.unwrap();
             storages.activate_volume(&p, id, f).await.unwrap();
             storages.deactivate_volume(&p, id, f).await.unwrap();
@@ -902,6 +977,9 @@ mod tests {
             let methods = [
                 "create_volume",
                 "import_volume",
+                "import_chain",
+                "set_backup_bitmap",
+                "drop_backup_bitmaps",
                 "delete_volume",
                 "activate_volume",
                 "deactivate_volume",

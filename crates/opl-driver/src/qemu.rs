@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_qemu::{
-    HostProfile, MigrationInfo, MigrationParameters, MigrationState, QmpClient, QmpError, QmpEvent,
-    RunState, RuntimePaths, TlsEndpoint, build_cmdline, build_incoming_cmdline,
+    BlockNode, HostProfile, MigrationInfo, MigrationParameters, MigrationState, QmpClient,
+    QmpError, QmpEvent, RunState, RuntimePaths, TlsEndpoint, TransactionAction, build_cmdline,
+    build_incoming_cmdline,
 };
+use opl_types::backup::BITMAP_PREFIX;
 use opl_types::network::tap_prefix;
 use opl_types::runtime::{NicBackend, VmRuntimeSpec};
 use opl_types::vm::Firmware;
@@ -21,7 +23,8 @@ use uuid::Uuid;
 
 use crate::error::DriverError;
 use crate::hypervisor::{
-    ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
+    ActualState, BackupTarget, DiskBitmaps, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus,
+    StopMode,
 };
 use crate::migration::{
     MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, migration_tls_dir, parse_qemu_version,
@@ -60,6 +63,10 @@ const MIGRATION_POLL: Duration = Duration::from_secs(1);
 const INCOMING_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// 시간 제한으로 `migrate_cancel`한 뒤 마이그레이션이 끝나기를 기다리는 한도
 const CANCEL_WAIT: Duration = Duration::from_secs(30);
+/// 증분 백업의 대상 노드와 그 작업 id의 접두사(`opl-backup-{i}`)
+const BACKUP_JOB_PREFIX: &str = "opl-backup-";
+/// 증분 백업 작업 상태를 다시 묻는 간격(`JOB_STATUS_CHANGE` 이벤트를 놓쳐도 이만큼 뒤에 안다)
+const JOB_POLL: Duration = Duration::from_secs(1);
 
 /// VM별 상태 디렉터리 `{state_dir}/vm/{id}`. `state_dir`은 [`QemuConfig::state_dir`]이다.
 pub fn vm_state_dir(state_dir: &Path, id: Uuid) -> PathBuf {
@@ -303,6 +310,7 @@ impl QemuHypervisor {
             // 받기를 마칠 때까지 멈춰 둔다.
             Launch::Incoming { .. } => return Ok(()),
         };
+        remove_inconsistent_bitmaps(&handle.qmp, vm.id).await;
         if let Some(tag) = restore {
             // -S로 멈춘 채 불러온 뒤 cont로 이어서 실행한다. 메모리 상태는 첫 디스크(disk0)에 있다.
             let devices: Vec<String> = (0..vm.disks.len()).map(|i| format!("disk{i}")).collect();
@@ -439,12 +447,14 @@ impl QemuHypervisor {
 
     /// 마이그레이션 TLS 자격 증명(`{state_dir}/migration-tls`)과 능력·매개변수를 정한다. 자격 증명
     /// 객체는 파일을 만들 때 읽으므로, 인증서가 바뀌었을 수 있어 매번 지우고 다시 만든다.
+    /// `dirty_bitmaps`면 dirty bitmap도 넘긴다.
     async fn setup_migration(
         &self,
         qmp: &QmpClient,
         endpoint: TlsEndpoint,
         tls_hostname: Option<&str>,
         bandwidth: Option<u64>,
+        dirty_bitmaps: bool,
     ) -> Result<(), DriverError> {
         // 처음이면 없어서 실패한다.
         let _ = tokio::time::timeout(QMP_TIMEOUT, qmp.object_del(MIGRATION_TLS_ID)).await;
@@ -454,7 +464,13 @@ impl QemuHypervisor {
             tokio::time::timeout(QMP_TIMEOUT, add).await,
             "QMP object-add",
         )?;
-        let caps = qmp.migrate_set_capabilities(&[("events", true), ("auto-converge", true)]);
+        // dirty-bitmaps: 증분 백업의 비트맵을 넘긴다. 양쪽 디스크 노드 이름이 같다(`disk{i}`).
+        let caps = [
+            ("events", true),
+            ("auto-converge", true),
+            ("dirty-bitmaps", dirty_bitmaps),
+        ];
+        let caps = qmp.migrate_set_capabilities(&caps);
         flatten(
             tokio::time::timeout(QMP_TIMEOUT, caps).await,
             "QMP migrate-set-capabilities",
@@ -479,7 +495,8 @@ impl QemuHypervisor {
         ports: RangeInclusive<u16>,
     ) -> Result<u16, DriverError> {
         let handle = self.running_handle(id)?;
-        self.setup_migration(&handle.qmp, TlsEndpoint::Server, None, None)
+        // 받는 쪽은 보내는 쪽이 넘긴 비트맵만 받는다.
+        self.setup_migration(&handle.qmp, TlsEndpoint::Server, None, None, true)
             .await?;
         let _ports = self.incoming_ports.lock().await;
         let Some(port) = pick_port(host, ports.clone()) else {
@@ -697,6 +714,121 @@ impl Hypervisor for QemuHypervisor {
         }
     }
 
+    async fn snapshot_save_with_bitmap(
+        &self,
+        id: Uuid,
+        tag: &str,
+        bitmap: &str,
+    ) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let disks = query_disks(&handle.qmp).await?;
+        let actions: Vec<TransactionAction> = disks
+            .iter()
+            .flat_map(|disk| {
+                [
+                    TransactionAction::SnapshotInternal {
+                        device: disk.node_name.clone(),
+                        name: tag.to_string(),
+                    },
+                    bitmap_add(disk, bitmap),
+                ]
+            })
+            .collect();
+        let r = tokio::time::timeout(SNAPSHOT_TIMEOUT, handle.qmp.transaction(&actions)).await;
+        flatten(r, "QMP transaction")
+    }
+
+    async fn backup_bitmaps(&self, id: Uuid) -> Result<Vec<DiskBitmaps>, DriverError> {
+        let handle = self.running_handle(id)?;
+        let disks = query_disks(&handle.qmp).await?;
+        Ok(disks
+            .into_iter()
+            .map(|disk| DiskBitmaps {
+                node: disk.node_name,
+                bitmaps: disk.bitmaps,
+            })
+            .collect())
+    }
+
+    async fn add_bitmaps(&self, id: Uuid, name: &str) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let disks = query_disks(&handle.qmp).await?;
+        let actions: Vec<TransactionAction> =
+            disks.iter().map(|disk| bitmap_add(disk, name)).collect();
+        let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.transaction(&actions)).await;
+        flatten(r, "QMP transaction")
+    }
+
+    async fn remove_bitmaps(&self, id: Uuid, keep: Option<&str>) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        for disk in query_disks(&handle.qmp).await? {
+            for bitmap in &disk.bitmaps {
+                if !bitmap.name.starts_with(BITMAP_PREFIX) || keep == Some(bitmap.name.as_str()) {
+                    continue;
+                }
+                let remove = handle
+                    .qmp
+                    .block_dirty_bitmap_remove(&disk.node_name, &bitmap.name);
+                flatten(
+                    tokio::time::timeout(QMP_TIMEOUT, remove).await,
+                    "QMP block-dirty-bitmap-remove",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn incremental_backup(
+        &self,
+        id: Uuid,
+        parent: &str,
+        new: &str,
+        targets: &[BackupTarget],
+    ) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        clear_backup_leftovers(qmp).await?;
+        let disks = query_disks(qmp).await?;
+        let nodes: Vec<&str> = disks.iter().map(|d| d.node_name.as_str()).collect();
+        let wanted: Vec<&str> = targets.iter().map(|t| t.node.as_str()).collect();
+        if nodes != wanted {
+            return Err(DriverError::InvalidSpec(format!(
+                "backup targets {wanted:?} do not match the disks {nodes:?} of VM {id}"
+            )));
+        }
+        let mut opened = Vec::new();
+        let mut result = backup_into(qmp, &disks, parent, new, targets, &mut opened).await;
+        // 대상 노드를 닫는다. 닫을 때 QEMU가 이미지 메타데이터(L2)를 쓰고 플러시하므로, 닫지 못하면
+        // 대상 파일이 온전하지 않아 백업 실패다(앞 비트맵을 남겨 다음도 같은 부모에서 증분). 남은 노드는
+        // 다음 증분 백업이 앞서 남은 것으로 치운다.
+        for node in &opened {
+            let del = tokio::time::timeout(SNAPSHOT_TIMEOUT, qmp.blockdev_del(node)).await;
+            if let Err(e) = flatten(del, "QMP blockdev-del") {
+                tracing::warn!(%id, %node, error = %e, "cannot close backup target");
+                result = result.and(Err(e));
+            }
+        }
+        // 성공하면 새 비트맵만, 실패하면 앞 비트맵만 남긴다. 실패했으면 새 비트맵이 없을 수 있다.
+        let stale = if result.is_ok() { parent } else { new };
+        for disk in &disks {
+            let remove = qmp.block_dirty_bitmap_remove(&disk.node_name, stale);
+            let removed = flatten(
+                tokio::time::timeout(QMP_TIMEOUT, remove).await,
+                "QMP block-dirty-bitmap-remove",
+            );
+            if let (Err(e), true) = (removed, result.is_ok()) {
+                tracing::warn!(%id, node = %disk.node_name, bitmap = stale, error = %e,
+                    "cannot remove dirty bitmap");
+            }
+        }
+        result
+    }
+
+    async fn clear_backup_leftovers(&self, id: Uuid) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        clear_backup_leftovers(&handle.qmp).await
+    }
+
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
         let handle = self.running_handle(id)?;
         let devices = query_disk_nodes(&handle.qmp).await?;
@@ -714,6 +846,7 @@ impl Hypervisor for QemuHypervisor {
         size_bytes: u64,
     ) -> Result<(), DriverError> {
         let handle = self.running_handle(id)?;
+        remove_inconsistent_bitmaps(&handle.qmp, id).await;
         let node = format!("disk{disk}");
         let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.block_resize(&node, size_bytes)).await;
         flatten(r, "QMP block_resize")
@@ -885,11 +1018,16 @@ impl Hypervisor for QemuHypervisor {
     ) -> Result<(), DriverError> {
         let handle = self.running_handle(id)?;
         let qmp = &handle.qmp;
+        remove_inconsistent_bitmaps(qmp, id).await;
+        // qcow2의 persistent 비트맵은 공유 이미지로 넘어간다. 능력을 켜면 그것도 스트림으로 보내고,
+        // 마이그레이션이 실패하면 원본 이미지에 in-use로 남아 다음 시작에 inconsistent가 된다.
+        let dirty_bitmaps = volatile_bitmaps(&query_disks(qmp).await?);
         self.setup_migration(
             qmp,
             TlsEndpoint::Client,
             Some(&target.tls_hostname),
             opts.bandwidth,
+            dirty_bitmaps,
         )
         .await?;
         let uri = tcp_uri(&target.host, target.port);
@@ -1001,13 +1139,224 @@ fn disk_nodes(nodes: &serde_json::Value) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|n| n["node-name"].as_str())
-        .filter_map(|name| {
-            let i = name.strip_prefix("disk")?.parse().ok()?;
-            Some((i, name.to_string()))
-        })
+        .filter_map(|name| Some((disk_index(name)?, name.to_string())))
         .collect();
     disks.sort();
     disks.into_iter().map(|(_, name)| name).collect()
+}
+
+/// 이름이 `disk{i}`이면 i
+fn disk_index(name: &str) -> Option<usize> {
+    name.strip_prefix("disk")?.parse().ok()
+}
+
+/// 실행 중인 VM의 디스크 노드(`disk{i}`)를 그 비트맵과 함께 i 순서로 읽는다.
+async fn query_disks(qmp: &QmpClient) -> Result<Vec<BlockNode>, DriverError> {
+    let r = tokio::time::timeout(QMP_TIMEOUT, qmp.query_block_nodes()).await;
+    Ok(disk_block_nodes(flatten(r, "QMP query-named-block-nodes")?))
+}
+
+/// 블록 노드 중 디스크 포맷 노드 `disk{i}`만 i 순서로 고른다.
+fn disk_block_nodes(nodes: Vec<BlockNode>) -> Vec<BlockNode> {
+    let mut disks: Vec<(usize, BlockNode)> = nodes
+        .into_iter()
+        .filter_map(|n| Some((disk_index(&n.node_name)?, n)))
+        .collect();
+    disks.sort_by_key(|(i, _)| *i);
+    disks.into_iter().map(|(_, n)| n).collect()
+}
+
+/// 디스크에 이미지에 저장되지 않는(raw 디스크) `opl-` 비트맵이 있는지. 그런 비트맵만 마이그레이션
+/// 능력 `dirty-bitmaps`로 넘긴다.
+fn volatile_bitmaps(disks: &[BlockNode]) -> bool {
+    disks
+        .iter()
+        .flat_map(|d| &d.bitmaps)
+        .any(|b| b.name.starts_with(BITMAP_PREFIX) && !b.persistent)
+}
+
+/// inconsistent인 `opl-` 비트맵(QEMU가 비정상으로 끝나 이미지에 in-use로 남은 것)을 지운다. 그런
+/// 비트맵이 있으면 마이그레이션과 `block_resize`가 실패한다. 증분 백업은 이미 그 비트맵을 쓰지 않는다
+/// (다음은 전체). 실패는 경고만 남긴다.
+async fn remove_inconsistent_bitmaps(qmp: &QmpClient, id: Uuid) {
+    let disks = match query_disks(qmp).await {
+        Ok(disks) => disks,
+        Err(e) => {
+            tracing::warn!(%id, error = %e, "cannot read dirty bitmaps");
+            return;
+        }
+    };
+    for disk in &disks {
+        for bitmap in &disk.bitmaps {
+            if !bitmap.inconsistent || !bitmap.name.starts_with(BITMAP_PREFIX) {
+                continue;
+            }
+            tracing::warn!(%id, node = %disk.node_name, bitmap = %bitmap.name,
+                "removing inconsistent dirty bitmap");
+            let remove = qmp.block_dirty_bitmap_remove(&disk.node_name, &bitmap.name);
+            if let Err(e) = flatten(
+                tokio::time::timeout(QMP_TIMEOUT, remove).await,
+                "QMP block-dirty-bitmap-remove",
+            ) {
+                tracing::warn!(%id, node = %disk.node_name, bitmap = %bitmap.name, error = %e,
+                    "cannot remove inconsistent dirty bitmap");
+            }
+        }
+    }
+}
+
+/// 디스크에 비트맵 `name`을 만드는 동작. qcow2 디스크의 비트맵만 이미지에 저장한다(raw 이미지는 담을
+/// 수 없다).
+fn bitmap_add(disk: &BlockNode, name: &str) -> TransactionAction {
+    TransactionAction::BitmapAdd {
+        node: disk.node_name.clone(),
+        name: name.to_string(),
+        persistent: disk.driver == "qcow2",
+    }
+}
+
+/// 대상 노드를 열고(연 것은 `opened`에 적는다) 새 비트맵과 백업 작업을 transaction 하나로 시작한 뒤
+/// 작업이 모두 끝나기를 기다려 지운다. 작업이 실패했으면 그 오류다.
+async fn backup_into(
+    qmp: &QmpClient,
+    disks: &[BlockNode],
+    parent: &str,
+    new: &str,
+    targets: &[BackupTarget],
+    opened: &mut Vec<String>,
+) -> Result<(), DriverError> {
+    let mut actions = Vec::new();
+    for ((i, target), disk) in targets.iter().enumerate().zip(disks) {
+        if !target.path.is_absolute() {
+            return Err(DriverError::InvalidSpec(format!(
+                "backup target must be an absolute path: {:?}",
+                target.path
+            )));
+        }
+        let node = format!("{BACKUP_JOB_PREFIX}{i}");
+        let add = qmp.blockdev_add_qcow2(&node, &target.path);
+        flatten(
+            tokio::time::timeout(QMP_TIMEOUT, add).await,
+            "QMP blockdev-add",
+        )?;
+        opened.push(node.clone());
+        actions.push(bitmap_add(disk, new));
+        actions.push(TransactionAction::IncrementalBackup {
+            job_id: node.clone(),
+            device: disk.node_name.clone(),
+            target: node,
+            bitmap: parent.to_string(),
+        });
+    }
+    // blockdev-backup transaction은 게스트의 진행 중인 I/O가 끝나기를 기다린다.
+    let r = tokio::time::timeout(SNAPSHOT_TIMEOUT, qmp.transaction(&actions)).await;
+    flatten(r, "QMP transaction")?;
+    let failed = wait_jobs(qmp, opened).await?;
+    // 작업을 모두 지운다. 작업이 실패했으면 지우기 오류보다 그 오류다.
+    let mut dismissed = Ok(());
+    for job in opened.iter() {
+        let dismiss = tokio::time::timeout(QMP_TIMEOUT, qmp.job_dismiss(job)).await;
+        if let Err(e) = flatten(dismiss, "QMP job-dismiss") {
+            tracing::warn!(%job, error = %e, "cannot dismiss backup job");
+            dismissed = dismissed.and(Err(e));
+        }
+    }
+    match failed {
+        Some((id, error)) => Err(QmpError::JobFailed { id, error }.into()),
+        None => dismissed,
+    }
+}
+
+/// 작업 `ids`가 모두 끝나기(`concluded`)를 기다린다. 하나라도 실패하면 아직 도는 나머지를 취소한다.
+/// 먼저 실패한 작업의 (id, 오류)를 돌려준다(취소한 작업도 오류로 끝난다). 시간 제한은 없다(디스크
+/// 크기만큼 걸린다). QEMU가 답하지 않으면 그 오류다.
+async fn wait_jobs(
+    qmp: &QmpClient,
+    ids: &[String],
+) -> Result<Option<(String, String)>, DriverError> {
+    // 조회와 이벤트 사이에 끝나도 놓치지 않게 먼저 구독한다.
+    let mut events = qmp.subscribe();
+    let mut failed: Option<(String, String)> = None;
+    let mut cancelled = false;
+    loop {
+        let jobs = tokio::time::timeout(QMP_TIMEOUT, qmp.query_jobs()).await;
+        let jobs = flatten(jobs, "QMP query-jobs")?;
+        let mut running = Vec::new();
+        for id in ids {
+            let error = match jobs.iter().find(|j| &j.id == id) {
+                Some(job) if !job.is_concluded() => {
+                    running.push(id);
+                    continue;
+                }
+                Some(job) => job.error.clone(),
+                None => Some("job disappeared".to_string()),
+            };
+            if let (Some(error), None) = (error, &failed) {
+                failed = Some((id.clone(), error));
+            }
+        }
+        if running.is_empty() {
+            return Ok(failed);
+        }
+        if failed.is_some() && !cancelled {
+            cancelled = true;
+            for id in running {
+                let cancel = tokio::time::timeout(QMP_TIMEOUT, qmp.job_cancel(id)).await;
+                if let Err(e) = flatten(cancel, "QMP job-cancel") {
+                    tracing::warn!(job = id, error = %e, "cannot cancel backup job");
+                }
+            }
+        }
+        tokio::select! {
+            ev = events.recv() => {
+                if let Err(RecvError::Closed) = ev {
+                    return Err(QmpError::Disconnected.into());
+                }
+            }
+            _ = tokio::time::sleep(JOB_POLL) => {}
+        }
+    }
+}
+
+/// 앞선 증분 백업이 남긴 작업과 대상 노드(opld가 기다리다 죽었다)를 치운다. 아직 도는 작업은 취소하고
+/// [`CANCEL_WAIT`]까지 끝나기를 기다린다(넘으면 오류 — 스냅샷이 영원히 막히지 않게).
+async fn clear_backup_leftovers(qmp: &QmpClient) -> Result<(), DriverError> {
+    let jobs = tokio::time::timeout(QMP_TIMEOUT, qmp.query_jobs()).await;
+    let jobs = flatten(jobs, "QMP query-jobs")?;
+    let left: Vec<String> = jobs
+        .iter()
+        .filter(|j| j.id.starts_with(BACKUP_JOB_PREFIX))
+        .map(|j| j.id.clone())
+        .collect();
+    if !left.is_empty() {
+        tracing::warn!(jobs = ?left, "clearing backup jobs left by an earlier backup");
+        for job in jobs
+            .iter()
+            .filter(|j| left.contains(&j.id) && !j.is_concluded())
+        {
+            // 그 사이에 끝난 작업은 취소하지 못한다. 끝났는지는 아래에서 기다려 안다.
+            let cancel = tokio::time::timeout(QMP_TIMEOUT, qmp.job_cancel(&job.id)).await;
+            if let Err(e) = flatten(cancel, "QMP job-cancel") {
+                tracing::warn!(job = %job.id, error = %e, "cannot cancel backup job");
+            }
+        }
+        match tokio::time::timeout(CANCEL_WAIT, wait_jobs(qmp, &left)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(DriverError::Timeout("cancelled backup jobs to stop")),
+        };
+        for id in &left {
+            let dismiss = tokio::time::timeout(QMP_TIMEOUT, qmp.job_dismiss(id)).await;
+            flatten(dismiss, "QMP job-dismiss")?;
+        }
+    }
+    let nodes = tokio::time::timeout(QMP_TIMEOUT, qmp.query_block_nodes()).await;
+    for node in flatten(nodes, "QMP query-named-block-nodes")? {
+        if node.node_name.starts_with(BACKUP_JOB_PREFIX) {
+            let del = tokio::time::timeout(QMP_TIMEOUT, qmp.blockdev_del(&node.node_name)).await;
+            flatten(del, "QMP blockdev-del")?;
+        }
+    }
+    Ok(())
 }
 
 /// QMP 작업 명령을 기다린다. 작업의 제한 시간은 이벤트를 기다리는 동안에만 걸리므로, QEMU가
@@ -1230,7 +1579,7 @@ fn remove_if_exists(path: &Path) -> std::io::Result<()> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use opl_qemu::Accel;
+    use opl_qemu::{Accel, BitmapInfo};
     use opl_types::runtime::RuntimeNic;
     use opl_types::vm::{Arch, CpuModel, CpuSpec, MachineType, NicModel};
 
@@ -1417,6 +1766,10 @@ time.sleep(60)
         arguments: Arc<Mutex<Vec<serde_json::Value>>>,
         /// 보내면 서버가 (주어진 이벤트를 먼저 보낸 뒤) 연결을 끊는다.
         hangup: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
+        /// `query-jobs`에 차례로 줄 답. 비면 `[]`이다.
+        jobs: Arc<Mutex<std::collections::VecDeque<serde_json::Value>>>,
+        /// 이 이름의 명령에는 오류로 답한다.
+        failing: Arc<Mutex<Vec<&'static str>>>,
     }
 
     /// QEMU 대신 QMP 소켓을 여는 가짜 서버. greeting과 capabilities 협상까지 처리하고,
@@ -1438,6 +1791,10 @@ time.sleep(60)
         let recorded = commands.clone();
         let args = Arc::new(Mutex::new(Vec::new()));
         let arguments = args.clone();
+        let jobs = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let job_replies = jobs.clone();
+        let failing = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let fail = failing.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
@@ -1477,18 +1834,37 @@ time.sleep(60)
                         "status": "failed", "error-desc": "Connection refused"
                     }),
                     "query-migrate" => serde_json::json!({ "status": migration }),
-                    // 디스크 두 개를 가진 VM의 블록 노드
+                    // 디스크 두 개(qcow2, raw)를 가진 VM의 블록 노드와 비트맵
                     "query-named-block-nodes" => serde_json::json!([
-                        { "node-name": "disk1" },
-                        { "node-name": "disk1-file" },
-                        { "node-name": "disk0" },
-                        { "node-name": "disk0-file" },
+                        { "node-name": "disk1", "drv": "raw", "dirty-bitmaps": [
+                            { "name": "opl-a", "recording": true, "persistent": false },
+                        ] },
+                        { "node-name": "disk1-file", "drv": "file" },
+                        { "node-name": "disk0", "drv": "qcow2", "dirty-bitmaps": [
+                            { "name": "user", "recording": true, "persistent": true },
+                            { "name": "opl-a", "recording": true, "persistent": true },
+                            { "name": "opl-old", "recording": true, "persistent": true,
+                              "inconsistent": true },
+                        ] },
+                        { "node-name": "disk0-file", "drv": "file" },
                     ]),
+                    "query-jobs" => job_replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| serde_json::json!([])),
                     _ => serde_json::json!({}),
+                };
+                let reply = if fail.lock().unwrap().contains(&name.as_str()) {
+                    serde_json::json!({
+                        "error": { "class": "GenericError", "desc": format!("{name} failed") },
+                        "id": cmd["id"]
+                    })
+                } else {
+                    serde_json::json!({ "return": ret, "id": cmd["id"] })
                 };
                 recorded.lock().unwrap().push(name);
                 arguments.lock().unwrap().push(cmd["arguments"].clone());
-                let reply = serde_json::json!({ "return": ret, "id": cmd["id"] });
                 if write
                     .write_all(format!("{reply}\n").as_bytes())
                     .await
@@ -1504,6 +1880,8 @@ time.sleep(60)
             commands,
             arguments: args,
             hangup,
+            jobs,
+            failing,
         }
     }
 
@@ -1654,13 +2032,21 @@ time.sleep(60)
             add["dir"],
             state_dir.join("migration-tls").display().to_string()
         );
+        // raw 디스크(disk1)의 비트맵은 이미지에 없으므로 마이그레이션으로 넘긴다. 쓸 수 없는
+        // inconsistent 비트맵(disk0의 opl-old)은 보내기 전에 지운다(남으면 마이그레이션이 실패한다).
         assert_eq!(
             arguments[at("migrate-set-capabilities")]["capabilities"],
             serde_json::json!([
                 { "capability": "events", "state": true },
-                { "capability": "auto-converge", "state": true }
+                { "capability": "auto-converge", "state": true },
+                { "capability": "dirty-bitmaps", "state": true }
             ])
         );
+        assert_eq!(
+            arguments[at("block-dirty-bitmap-remove")],
+            serde_json::json!({ "node": "disk0", "name": "opl-old" })
+        );
+        assert!(at("block-dirty-bitmap-remove") < at("migrate"));
         assert_eq!(
             arguments[at("migrate-set-parameters")],
             serde_json::json!({
@@ -1922,6 +2308,397 @@ time.sleep(60)
             arguments[at("block_resize")],
             serde_json::json!({ "node-name": "disk1", "size": 2u64 << 30 })
         );
+        // inconsistent 비트맵이 있으면 크기를 바꿀 수 없으므로 먼저 지운다.
+        assert_eq!(
+            arguments[at("block-dirty-bitmap-remove")],
+            serde_json::json!({ "node": "disk0", "name": "opl-old" })
+        );
+        assert!(at("block-dirty-bitmap-remove") < at("block_resize"));
+    }
+
+    /// 마이그레이션 능력 `dirty-bitmaps`는 이미지에 저장되지 않는 `opl-` 비트맵이 있을 때만 켠다. qcow2의
+    /// persistent 비트맵은 공유 이미지로 넘어가고, 능력을 켠 채 실패하면 이미지에 in-use로 남는다.
+    #[test]
+    fn only_volatile_opl_bitmaps_need_bitmap_migration() {
+        let bitmap = |name: &str, persistent: bool| BitmapInfo {
+            name: name.into(),
+            recording: true,
+            inconsistent: false,
+            persistent,
+        };
+        let node = |name: &str, bitmaps: Vec<BitmapInfo>| BlockNode {
+            node_name: name.into(),
+            driver: "qcow2".into(),
+            bitmaps,
+        };
+        assert!(!volatile_bitmaps(&[]));
+        assert!(!volatile_bitmaps(&[
+            node("disk0", vec![bitmap("opl-a", true)]),
+            node("disk1", vec![bitmap("user", false)]),
+        ]));
+        assert!(volatile_bitmaps(&[
+            node("disk0", vec![bitmap("opl-a", true)]),
+            node("disk1", vec![bitmap("opl-a", false)]),
+        ]));
+    }
+
+    #[test]
+    fn disk_block_nodes_are_in_disk_order() {
+        let node = |name: &str| BlockNode {
+            node_name: name.into(),
+            driver: "qcow2".into(),
+            bitmaps: vec![],
+        };
+        let nodes = ["disk10", "disk2-file", "disk2", "opl-backup-0", "disk0"].map(node);
+        let names: Vec<String> = disk_block_nodes(nodes.to_vec())
+            .into_iter()
+            .map(|n| n.node_name)
+            .collect();
+        assert_eq!(names, ["disk0", "disk2", "disk10"]);
+    }
+
+    /// 가짜 QMP에 연결된 실행 중인 VM 하나
+    async fn running_vm(tmp: &Path) -> (QemuHypervisor, Uuid, FakeQmp, tokio::process::Child) {
+        let cfg = config(tmp, PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "running").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        (hv, vm.id, fake, qemu)
+    }
+
+    /// 보낸 명령 중 `names`에 든 것만 (이름, 인자)로
+    fn sent(fake: &FakeQmp, names: &[&str]) -> Vec<(String, serde_json::Value)> {
+        let commands = fake.commands.lock().unwrap().clone();
+        let arguments = fake.arguments.lock().unwrap().clone();
+        commands
+            .into_iter()
+            .zip(arguments)
+            .filter(|(c, _)| names.contains(&c.as_str()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bitmap_ops_use_disk_nodes_and_disk_formats() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+
+        let disks = hv.backup_bitmaps(id).await.unwrap();
+        let nodes: Vec<&str> = disks.iter().map(|d| d.node.as_str()).collect();
+        assert_eq!(nodes, ["disk0", "disk1"]);
+        assert_eq!(disks[0].bitmaps.len(), 3);
+        assert!(disks[0].bitmaps[2].inconsistent);
+        assert!(!disks[1].bitmaps[0].persistent);
+
+        // qcow2 디스크의 비트맵만 persistent다. 스냅샷과 비트맵은 transaction 하나다.
+        hv.snapshot_save_with_bitmap(id, "t", "opl-n")
+            .await
+            .unwrap();
+        hv.add_bitmaps(id, "opl-m").await.unwrap();
+        let transactions = sent(&fake, &["transaction"]);
+        assert_eq!(
+            transactions[0].1["actions"],
+            serde_json::json!([
+                { "type": "blockdev-snapshot-internal-sync", "data": { "device": "disk0", "name": "t" } },
+                { "type": "block-dirty-bitmap-add",
+                  "data": { "node": "disk0", "name": "opl-n", "persistent": true } },
+                { "type": "blockdev-snapshot-internal-sync", "data": { "device": "disk1", "name": "t" } },
+                { "type": "block-dirty-bitmap-add",
+                  "data": { "node": "disk1", "name": "opl-n", "persistent": false } },
+            ])
+        );
+        assert_eq!(
+            transactions[1].1["actions"],
+            serde_json::json!([
+                { "type": "block-dirty-bitmap-add",
+                  "data": { "node": "disk0", "name": "opl-m", "persistent": true } },
+                { "type": "block-dirty-bitmap-add",
+                  "data": { "node": "disk1", "name": "opl-m", "persistent": false } },
+            ])
+        );
+
+        // opl- 비트맵 중 keep이 아닌 것만 지운다(opl이 만들지 않은 비트맵은 그대로).
+        hv.remove_bitmaps(id, Some("opl-a")).await.unwrap();
+        assert_eq!(
+            sent(&fake, &["block-dirty-bitmap-remove"]),
+            [(
+                "block-dirty-bitmap-remove".to_string(),
+                serde_json::json!({ "node": "disk0", "name": "opl-old" })
+            )]
+        );
+    }
+
+    fn job(id: &str, status: &str, error: Option<&str>) -> serde_json::Value {
+        let mut job = serde_json::json!({ "id": id, "type": "backup", "status": status });
+        if let Some(e) = error {
+            job["error"] = serde_json::json!(e);
+        }
+        job
+    }
+
+    fn backup_targets() -> Vec<BackupTarget> {
+        (0..2)
+            .map(|i| BackupTarget {
+                node: format!("disk{i}"),
+                path: PathBuf::from(format!("/b/x/disk{i}.qcow2.part")),
+                size: 1 << 30,
+            })
+            .collect()
+    }
+
+    /// 대상 노드를 열고, 새 비트맵과 백업 작업을 한 transaction으로 시작해 끝을 기다린 뒤 작업을 지우고
+    /// 노드를 닫는다. 성공하면 앞 비트맵을 지운다.
+    #[tokio::test]
+    async fn incremental_backup_runs_one_job_per_disk() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            // 앞선 백업이 남긴 것이 없다.
+            serde_json::json!([]),
+            serde_json::json!([
+                job("opl-backup-0", "concluded", None),
+                job("opl-backup-1", "concluded", None)
+            ]),
+        ]);
+        hv.incremental_backup(id, "opl-a", "opl-n", &backup_targets())
+            .await
+            .unwrap();
+
+        let block = [
+            "blockdev-add",
+            "transaction",
+            "job-dismiss",
+            "blockdev-del",
+            "block-dirty-bitmap-remove",
+            "job-cancel",
+        ];
+        let sent = sent(&fake, &block);
+        let names: Vec<&str> = sent.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "blockdev-add",
+                "blockdev-add",
+                "transaction",
+                "job-dismiss",
+                "job-dismiss",
+                "blockdev-del",
+                "blockdev-del",
+                "block-dirty-bitmap-remove",
+                "block-dirty-bitmap-remove",
+            ]
+        );
+        assert_eq!(
+            sent[1].1,
+            serde_json::json!({
+                "driver": "qcow2", "node-name": "opl-backup-1",
+                "file": { "driver": "file", "filename": "/b/x/disk1.qcow2.part" },
+                "backing": null
+            })
+        );
+        let actions = &sent[2].1["actions"];
+        assert_eq!(
+            actions[0],
+            serde_json::json!({ "type": "block-dirty-bitmap-add",
+                "data": { "node": "disk0", "name": "opl-n", "persistent": true } })
+        );
+        assert_eq!(actions[1]["type"], "blockdev-backup");
+        assert_eq!(actions[1]["data"]["device"], "disk0");
+        assert_eq!(actions[1]["data"]["target"], "opl-backup-0");
+        assert_eq!(actions[1]["data"]["bitmap"], "opl-a");
+        assert_eq!(actions[2]["data"]["persistent"], false);
+        assert_eq!(actions[3]["data"]["job-id"], "opl-backup-1");
+        assert_eq!(sent[3].1, serde_json::json!({ "id": "opl-backup-0" }));
+        assert_eq!(
+            sent[6].1,
+            serde_json::json!({ "node-name": "opl-backup-1" })
+        );
+        assert_eq!(
+            sent[7].1,
+            serde_json::json!({ "node": "disk0", "name": "opl-a" })
+        );
+        assert_eq!(
+            sent[8].1,
+            serde_json::json!({ "node": "disk1", "name": "opl-a" })
+        );
+    }
+
+    /// 작업 하나가 실패하면 나머지를 취소하고, 먼저 실패한 작업의 오류로 끝난다. 새 비트맵을 지운다.
+    #[tokio::test]
+    async fn failed_incremental_backup_cancels_the_other_jobs_and_drops_the_new_bitmap() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                job("opl-backup-0", "concluded", Some("No space left on device")),
+                job("opl-backup-1", "running", None)
+            ]),
+            serde_json::json!([
+                job("opl-backup-0", "concluded", Some("No space left on device")),
+                job("opl-backup-1", "concluded", Some("Operation canceled"))
+            ]),
+        ]);
+        let err = hv
+            .incremental_backup(id, "opl-a", "opl-n", &backup_targets())
+            .await
+            .unwrap_err();
+        match err {
+            DriverError::Qmp(QmpError::JobFailed { id, error }) => {
+                assert_eq!(id, "opl-backup-0");
+                assert_eq!(error, "No space left on device");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let sent = sent(
+            &fake,
+            &[
+                "job-cancel",
+                "job-dismiss",
+                "blockdev-del",
+                "block-dirty-bitmap-remove",
+            ],
+        );
+        let names: Vec<&str> = sent.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "job-cancel",
+                "job-dismiss",
+                "job-dismiss",
+                "blockdev-del",
+                "blockdev-del",
+                "block-dirty-bitmap-remove",
+                "block-dirty-bitmap-remove",
+            ]
+        );
+        assert_eq!(sent[0].1, serde_json::json!({ "id": "opl-backup-1" }));
+        assert_eq!(
+            sent[5].1,
+            serde_json::json!({ "node": "disk0", "name": "opl-n" })
+        );
+    }
+
+    /// 앞선 백업이 남긴 작업(opld가 기다리다 죽음)은 취소하고 지운 뒤에 시작한다. 대상이 디스크와
+    /// 맞지 않으면 아무것도 하지 않는다.
+    #[tokio::test]
+    async fn incremental_backup_clears_leftovers_and_checks_targets() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([
+                job("opl-backup-0", "running", None),
+                job("other", "running", None)
+            ]),
+            serde_json::json!([job("opl-backup-0", "concluded", Some("Operation canceled"))]),
+        ]);
+        let err = hv
+            .incremental_backup(id, "opl-a", "opl-n", &backup_targets()[..1])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        let sent = sent(
+            &fake,
+            &["job-cancel", "job-dismiss", "blockdev-add", "transaction"],
+        );
+        assert_eq!(
+            sent,
+            [
+                (
+                    "job-cancel".to_string(),
+                    serde_json::json!({ "id": "opl-backup-0" })
+                ),
+                (
+                    "job-dismiss".to_string(),
+                    serde_json::json!({ "id": "opl-backup-0" })
+                ),
+            ]
+        );
+    }
+
+    /// 대상 노드를 닫을 때 QEMU가 이미지 메타데이터를 쓰므로, 닫지 못하면 작업이 성공했어도 백업
+    /// 실패다. 앞 비트맵을 남기고 새 비트맵을 지운다(다음도 같은 부모에서 증분).
+    #[tokio::test]
+    async fn incremental_backup_fails_when_a_target_cannot_be_closed() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                job("opl-backup-0", "concluded", None),
+                job("opl-backup-1", "concluded", None)
+            ]),
+        ]);
+        fake.failing.lock().unwrap().push("blockdev-del");
+        let err = hv
+            .incremental_backup(id, "opl-a", "opl-n", &backup_targets())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DriverError::Qmp(QmpError::Command { desc, .. }) if desc == "blockdev-del failed"),
+            "{err:?}"
+        );
+        let sent = sent(&fake, &["blockdev-del", "block-dirty-bitmap-remove"]);
+        let names: Vec<&str> = sent.iter().map(|(c, _)| c.as_str()).collect();
+        // 두 노드를 모두 닫아 본 뒤에 비트맵을 고른다.
+        assert_eq!(
+            names,
+            [
+                "blockdev-del",
+                "blockdev-del",
+                "block-dirty-bitmap-remove",
+                "block-dirty-bitmap-remove",
+            ]
+        );
+        assert_eq!(
+            sent[2].1,
+            serde_json::json!({ "node": "disk0", "name": "opl-n" })
+        );
+        assert_eq!(
+            sent[3].1,
+            serde_json::json!({ "node": "disk1", "name": "opl-n" })
+        );
+    }
+
+    /// 작업이 실패했으면 작업을 지우지 못해도 작업의 오류로 끝난다. 작업을 모두 지워 본다.
+    #[tokio::test]
+    async fn incremental_backup_reports_the_job_error_over_a_dismiss_error() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                job("opl-backup-0", "concluded", Some("No space left on device")),
+                job("opl-backup-1", "concluded", None)
+            ]),
+        ]);
+        fake.failing.lock().unwrap().push("job-dismiss");
+        let err = hv
+            .incremental_backup(id, "opl-a", "opl-n", &backup_targets())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DriverError::Qmp(QmpError::JobFailed { id, .. }) if id == "opl-backup-0"),
+            "{err:?}"
+        );
+        assert_eq!(sent(&fake, &["job-dismiss"]).len(), 2);
+    }
+
+    /// 남은 작업이 취소하기 전에 끝났으면 `job-cancel`이 실패해도 그대로 지운다.
+    #[tokio::test]
+    async fn clearing_leftovers_ignores_jobs_that_ended_before_the_cancel() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([job("opl-backup-0", "running", None)]),
+            serde_json::json!([job("opl-backup-0", "concluded", None)]),
+        ]);
+        fake.failing.lock().unwrap().push("job-cancel");
+        hv.clear_backup_leftovers(id).await.unwrap();
+        let sent = sent(&fake, &["job-cancel", "job-dismiss"]);
+        let names: Vec<&str> = sent.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, ["job-cancel", "job-dismiss"]);
     }
 
     /// 실행 중인데 지금 멈춰 두지 않은 VM의 표시는 남은 것이다(이어서 실행했지만 지우지 못함, 누가

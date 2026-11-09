@@ -148,6 +148,134 @@ pub struct MigrationParameters {
     pub max_bandwidth: Option<u64>,
 }
 
+/// `query-named-block-nodes`의 블록 노드 하나 중 opl이 보는 것
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockNode {
+    pub node_name: String,
+    /// 블록 드라이버(`qcow2`, `raw`, `file` 등)
+    pub driver: String,
+    pub bitmaps: Vec<BitmapInfo>,
+}
+
+/// 블록 노드의 dirty bitmap
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitmapInfo {
+    pub name: String,
+    /// 쓰기를 따라가고 있는지
+    pub recording: bool,
+    /// 저장된 비트맵을 QEMU가 비정상으로 끝난 뒤 열어 믿을 수 없다(쓸 수 없다).
+    pub inconsistent: bool,
+    /// 이미지(qcow2)에 저장돼 QEMU를 다시 켜도 남는지
+    pub persistent: bool,
+}
+
+impl BlockNode {
+    fn parse(v: &Value) -> Result<Self, QmpError> {
+        let text = |k: &str| {
+            v[k].as_str()
+                .map(str::to_string)
+                .ok_or_else(|| QmpError::Protocol(format!("block node without {k}: {v}")))
+        };
+        let flag = |b: &Value, k: &str| b[k].as_bool().unwrap_or(false);
+        let bitmaps = v["dirty-bitmaps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|b| {
+                Ok(BitmapInfo {
+                    name: b["name"].as_str().map(str::to_string).ok_or_else(|| {
+                        QmpError::Protocol(format!("dirty bitmap without name: {b}"))
+                    })?,
+                    recording: flag(b, "recording"),
+                    // QEMU는 inconsistent일 때만 이 항목을 넣는다.
+                    inconsistent: flag(b, "inconsistent"),
+                    persistent: flag(b, "persistent"),
+                })
+            })
+            .collect::<Result<_, QmpError>>()?;
+        Ok(Self {
+            node_name: text("node-name")?,
+            driver: text("drv")?,
+            bitmaps,
+        })
+    }
+}
+
+/// `transaction` 안의 동작 하나. 모두 한 시점에 일어난다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionAction {
+    /// 메모리 없는 내부 스냅샷(`blockdev-snapshot-internal-sync`)
+    SnapshotInternal { device: String, name: String },
+    /// 이 시점 뒤에 바뀐 블록을 따라갈 새 dirty bitmap(`block-dirty-bitmap-add`)
+    BitmapAdd {
+        node: String,
+        name: String,
+        persistent: bool,
+    },
+    /// `bitmap`이 가리키는 바뀐 블록만 `target` 노드에 압축해 쓰는 백업 작업(`blockdev-backup`,
+    /// `sync: bitmap`). 비트맵은 그대로 두고(`bitmap-mode: never`. `sync: incremental`은 `on-success`만
+    /// 받는다), 끝난 작업은 `job-dismiss`할 때까지 남는다.
+    IncrementalBackup {
+        job_id: String,
+        device: String,
+        target: String,
+        bitmap: String,
+    },
+}
+
+impl TransactionAction {
+    fn to_json(&self) -> Value {
+        match self {
+            TransactionAction::SnapshotInternal { device, name } => json!({
+                "type": "blockdev-snapshot-internal-sync",
+                "data": { "device": device, "name": name },
+            }),
+            TransactionAction::BitmapAdd {
+                node,
+                name,
+                persistent,
+            } => json!({
+                "type": "block-dirty-bitmap-add",
+                "data": { "node": node, "name": name, "persistent": persistent },
+            }),
+            TransactionAction::IncrementalBackup {
+                job_id,
+                device,
+                target,
+                bitmap,
+            } => json!({
+                "type": "blockdev-backup",
+                "data": {
+                    "job-id": job_id,
+                    "device": device,
+                    "target": target,
+                    "sync": "bitmap",
+                    "bitmap": bitmap,
+                    "bitmap-mode": "never",
+                    "compress": true,
+                    "auto-dismiss": false,
+                },
+            }),
+        }
+    }
+}
+
+/// `query-jobs`의 작업 하나
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobInfo {
+    pub id: String,
+    /// `created`, `running`, … `concluded`
+    pub status: String,
+    /// 실패했으면(취소 포함) 그 까닭
+    pub error: Option<String>,
+}
+
+impl JobInfo {
+    pub fn is_concluded(&self) -> bool {
+        self.status == "concluded"
+    }
+}
+
 /// 작업이 제한 시간을 넘겼을 때 상태를 묻는 `query-jobs`를 기다리는 시간
 const JOB_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -341,6 +469,96 @@ impl QmpClient {
             })
             .collect();
         self.execute("transaction", Some(json!({ "actions": actions })))
+            .await
+            .map(drop)
+    }
+
+    /// 동작들을 `transaction` 하나로 보낸다. 하나라도 실패하면 아무것도 일어나지 않는다.
+    pub async fn transaction(&self, actions: &[TransactionAction]) -> Result<(), QmpError> {
+        let actions: Vec<Value> = actions.iter().map(TransactionAction::to_json).collect();
+        self.execute("transaction", Some(json!({ "actions": actions })))
+            .await
+            .map(drop)
+    }
+
+    /// 모든 블록 노드와 그 dirty bitmap(`query-named-block-nodes`, backing 노드를 펼치지 않음)
+    pub async fn query_block_nodes(&self) -> Result<Vec<BlockNode>, QmpError> {
+        let ret = self
+            .execute("query-named-block-nodes", Some(json!({ "flat": true })))
+            .await?;
+        ret.as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("query-named-block-nodes: {ret}")))?
+            .iter()
+            .map(BlockNode::parse)
+            .collect()
+    }
+
+    /// 노드 `node`에 dirty bitmap `name`을 만든다. `persistent`면 이미지(qcow2)에 저장된다.
+    pub async fn block_dirty_bitmap_add(
+        &self,
+        node: &str,
+        name: &str,
+        persistent: bool,
+    ) -> Result<(), QmpError> {
+        let args = json!({ "node": node, "name": name, "persistent": persistent });
+        self.execute("block-dirty-bitmap-add", Some(args))
+            .await
+            .map(drop)
+    }
+
+    /// 노드 `node`의 dirty bitmap `name`을 지운다(저장된 것이면 이미지에서도).
+    pub async fn block_dirty_bitmap_remove(&self, node: &str, name: &str) -> Result<(), QmpError> {
+        let args = json!({ "node": node, "name": name });
+        self.execute("block-dirty-bitmap-remove", Some(args))
+            .await
+            .map(drop)
+    }
+
+    /// qcow2 파일 `path`를 backing 없이 블록 노드 `node_name`으로 연다(백업 대상).
+    pub async fn blockdev_add_qcow2(&self, node_name: &str, path: &Path) -> Result<(), QmpError> {
+        let args = json!({
+            "driver": "qcow2",
+            "node-name": node_name,
+            "file": { "driver": "file", "filename": path.display().to_string() },
+            "backing": null,
+        });
+        self.execute("blockdev-add", Some(args)).await.map(drop)
+    }
+
+    /// `blockdev-add`로 연 노드를 닫는다.
+    pub async fn blockdev_del(&self, node_name: &str) -> Result<(), QmpError> {
+        self.execute("blockdev-del", Some(json!({ "node-name": node_name })))
+            .await
+            .map(drop)
+    }
+
+    pub async fn query_jobs(&self) -> Result<Vec<JobInfo>, QmpError> {
+        let ret = self.execute("query-jobs", None).await?;
+        let jobs = ret
+            .as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("query-jobs: {ret}")))?;
+        jobs.iter()
+            .map(|j| match (j["id"].as_str(), j["status"].as_str()) {
+                (Some(id), Some(status)) => Ok(JobInfo {
+                    id: id.to_string(),
+                    status: status.to_string(),
+                    error: j["error"].as_str().map(str::to_string),
+                }),
+                _ => Err(QmpError::Protocol(format!("job without id or status: {j}"))),
+            })
+            .collect()
+    }
+
+    /// 작업을 취소한다. 곧바로 돌아오고, 작업은 오류와 함께 `concluded`가 된다.
+    pub async fn job_cancel(&self, id: &str) -> Result<(), QmpError> {
+        self.execute("job-cancel", Some(json!({ "id": id })))
+            .await
+            .map(drop)
+    }
+
+    /// `concluded`인 작업을 지운다.
+    pub async fn job_dismiss(&self, id: &str) -> Result<(), QmpError> {
+        self.execute("job-dismiss", Some(json!({ "id": id })))
             .await
             .map(drop)
     }
@@ -1328,6 +1546,202 @@ mod tests {
             drop(fake);
         });
         assert!(matches!(info, Err(QmpError::Disconnected)), "{info:?}");
+    }
+
+    /// 명령 하나를 받아 `ret`으로 답하고 그 명령을 돌려준다.
+    async fn reply(fake: &mut FakeQemu, ret: Value) -> Value {
+        let cmd = fake.recv().await;
+        fake.send(json!({ "return": ret, "id": cmd["id"] })).await;
+        cmd
+    }
+
+    /// 증분 백업의 transaction: 디스크마다 새 비트맵과 blockdev-backup이 한 시점에 들어간다.
+    #[tokio::test]
+    async fn transaction_serializes_bitmap_and_backup_actions() {
+        let (client, mut fake, _dir) = setup().await;
+        let actions = [
+            TransactionAction::SnapshotInternal {
+                device: "disk0".into(),
+                name: "t".into(),
+            },
+            TransactionAction::BitmapAdd {
+                node: "disk0".into(),
+                name: "opl-new".into(),
+                persistent: true,
+            },
+            TransactionAction::IncrementalBackup {
+                job_id: "opl-backup-0".into(),
+                device: "disk0".into(),
+                target: "opl-backup-0".into(),
+                bitmap: "opl-old".into(),
+            },
+        ];
+        let (r, cmd) = tokio::join!(client.transaction(&actions), reply(&mut fake, json!({})));
+        r.unwrap();
+        assert_eq!(cmd["execute"], "transaction");
+        assert_eq!(
+            cmd["arguments"]["actions"],
+            json!([
+                { "type": "blockdev-snapshot-internal-sync", "data": { "device": "disk0", "name": "t" } },
+                { "type": "block-dirty-bitmap-add",
+                  "data": { "node": "disk0", "name": "opl-new", "persistent": true } },
+                { "type": "blockdev-backup", "data": {
+                    "job-id": "opl-backup-0", "device": "disk0", "target": "opl-backup-0",
+                    "sync": "bitmap", "bitmap": "opl-old", "bitmap-mode": "never",
+                    "compress": true, "auto-dismiss": false
+                } }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn bitmap_blockdev_and_job_commands_send_their_arguments() {
+        let (client, mut fake, _dir) = setup().await;
+        let (r, cmd) = tokio::join!(
+            client.block_dirty_bitmap_add("disk1", "opl-a", false),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "block-dirty-bitmap-add");
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "node": "disk1", "name": "opl-a", "persistent": false })
+        );
+        let (r, cmd) = tokio::join!(
+            client.block_dirty_bitmap_remove("disk1", "opl-a"),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "block-dirty-bitmap-remove");
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "node": "disk1", "name": "opl-a" })
+        );
+
+        let path = Path::new("/pools/b/backups/x/disk0.qcow2.part");
+        let (r, cmd) = tokio::join!(
+            client.blockdev_add_qcow2("opl-backup-0", path),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "blockdev-add");
+        assert_eq!(
+            cmd["arguments"],
+            json!({
+                "driver": "qcow2", "node-name": "opl-backup-0",
+                "file": { "driver": "file", "filename": "/pools/b/backups/x/disk0.qcow2.part" },
+                "backing": null
+            })
+        );
+        let (r, cmd) = tokio::join!(
+            client.blockdev_del("opl-backup-0"),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "blockdev-del");
+        assert_eq!(cmd["arguments"], json!({ "node-name": "opl-backup-0" }));
+
+        for (name, expect) in [("cancel", "job-cancel"), ("dismiss", "job-dismiss")] {
+            let fut = async {
+                match name {
+                    "cancel" => client.job_cancel("opl-backup-1").await,
+                    _ => client.job_dismiss("opl-backup-1").await,
+                }
+            };
+            let (r, cmd) = tokio::join!(fut, reply(&mut fake, json!({})));
+            r.unwrap();
+            assert_eq!(cmd["execute"], expect);
+            assert_eq!(cmd["arguments"], json!({ "id": "opl-backup-1" }));
+        }
+    }
+
+    #[tokio::test]
+    async fn query_jobs_reads_status_and_error() {
+        let (client, mut fake, _dir) = setup().await;
+        let ret = json!([
+            { "id": "opl-backup-0", "type": "backup", "status": "running",
+              "current-progress": 1, "total-progress": 4 },
+            { "id": "opl-backup-1", "type": "backup", "status": "concluded",
+              "current-progress": 0, "total-progress": 4, "error": "No space left on device" }
+        ]);
+        let (jobs, _) = tokio::join!(client.query_jobs(), reply(&mut fake, ret));
+        let jobs = jobs.unwrap();
+        assert_eq!(
+            jobs,
+            [
+                JobInfo {
+                    id: "opl-backup-0".into(),
+                    status: "running".into(),
+                    error: None
+                },
+                JobInfo {
+                    id: "opl-backup-1".into(),
+                    status: "concluded".into(),
+                    error: Some("No space left on device".into())
+                }
+            ]
+        );
+        assert!(!jobs[0].is_concluded());
+        assert!(jobs[1].is_concluded());
+    }
+
+    /// QEMU 8.2·10의 `query-named-block-nodes`(flat) 모양. `inconsistent`는 참일 때만 온다.
+    #[tokio::test]
+    async fn block_nodes_carry_their_dirty_bitmaps() {
+        let (client, mut fake, _dir) = setup().await;
+        let ret = json!([
+            { "node-name": "disk0", "drv": "qcow2", "ro": false, "file": "/p/a.qcow2",
+              "dirty-bitmaps": [
+                { "name": "opl-a", "recording": true, "persistent": true, "busy": false,
+                  "granularity": 65536, "count": 0 },
+                { "name": "opl-b", "recording": true, "persistent": true, "busy": false,
+                  "granularity": 65536, "count": 4096, "inconsistent": true }
+              ] },
+            { "node-name": "disk0-file", "drv": "file", "ro": false, "file": "/p/a.qcow2" },
+            { "node-name": "disk1", "drv": "raw", "ro": false, "file": "/dev/vg/x",
+              "dirty-bitmaps": [
+                { "name": "opl-a", "recording": false, "persistent": false, "busy": false,
+                  "granularity": 65536, "count": 0 }
+              ] }
+        ]);
+        let (nodes, cmd) = tokio::join!(client.query_block_nodes(), reply(&mut fake, ret));
+        assert_eq!(cmd["execute"], "query-named-block-nodes");
+        assert_eq!(cmd["arguments"], json!({ "flat": true }));
+        let bitmap = |name: &str, recording, inconsistent, persistent| BitmapInfo {
+            name: name.into(),
+            recording,
+            inconsistent,
+            persistent,
+        };
+        assert_eq!(
+            nodes.unwrap(),
+            [
+                BlockNode {
+                    node_name: "disk0".into(),
+                    driver: "qcow2".into(),
+                    bitmaps: vec![
+                        bitmap("opl-a", true, false, true),
+                        bitmap("opl-b", true, true, true)
+                    ],
+                },
+                BlockNode {
+                    node_name: "disk0-file".into(),
+                    driver: "file".into(),
+                    bitmaps: vec![],
+                },
+                BlockNode {
+                    node_name: "disk1".into(),
+                    driver: "raw".into(),
+                    bitmaps: vec![bitmap("opl-a", false, false, false)],
+                },
+            ]
+        );
+
+        let (nodes, _) = tokio::join!(
+            client.query_block_nodes(),
+            reply(&mut fake, json!([{ "node-name": "disk0" }]))
+        );
+        assert!(matches!(nodes, Err(QmpError::Protocol(_))), "{nodes:?}");
     }
 
     #[tokio::test]

@@ -18,6 +18,9 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// 백업 디렉터리 안의 매니페스트 파일 이름
 pub const MANIFEST_FILE: &str = "manifest.json";
 
+/// 증분 백업이 디스크에 두는 dirty bitmap 이름의 접두사. 이 접두사의 비트맵은 opl이 만들고 지운다.
+pub const BITMAP_PREFIX: &str = "opl-";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]

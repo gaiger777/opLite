@@ -815,3 +815,182 @@ async fn export_volume_writes_compressed_qcow2_of_snapshot_or_current_contents()
     files.sort();
     assert_eq!(files, ["disk0.qcow2", "disk1.qcow2"]);
 }
+
+/// qcow2 이미지의 dirty bitmap (이름, 플래그)
+fn bitmaps(path: &Path) -> Vec<(String, Vec<String>)> {
+    let info = image_info(path);
+    info["format-specific"]["data"]["bitmaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|b| {
+            let flags = b["flags"].as_array().unwrap().iter();
+            let flags = flags.map(|f| f.as_str().unwrap().to_string()).collect();
+            (b["name"].as_str().unwrap().to_string(), flags)
+        })
+        .collect()
+}
+
+/// 꺼진 qcow2 볼륨의 증분 백업 비트맵: opl- 비트맵을 하나만 남기고(다른 비트맵은 그대로), 지울 수 있다.
+/// raw 볼륨은 할 일이 없다.
+#[tokio::test]
+async fn backup_bitmaps_of_stopped_volumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = pool(tmp.path());
+    let storages = Storages::new("qemu-img", Arc::new(DirStorage::new("qemu-img", MNT)));
+    let (qcow2, raw) = (ImageFormat::Qcow2, ImageFormat::Raw);
+    let id = Uuid::now_v7();
+    let path = storages
+        .create_volume(&pool, id, 64 * MIB, qcow2)
+        .await
+        .unwrap();
+    qemu_img(&["bitmap", "--add", path.to_str().unwrap(), "user"]);
+
+    storages
+        .set_backup_bitmap(&pool, id, qcow2, "opl-a")
+        .await
+        .unwrap();
+    storages
+        .set_backup_bitmap(&pool, id, qcow2, "opl-b")
+        .await
+        .unwrap();
+    // 다시 해도(같은 이름) 하나다.
+    storages
+        .set_backup_bitmap(&pool, id, qcow2, "opl-b")
+        .await
+        .unwrap();
+    let auto = vec!["auto".to_string()];
+    assert_eq!(
+        bitmaps(&path),
+        [
+            ("user".to_string(), auto.clone()),
+            ("opl-b".to_string(), auto)
+        ]
+    );
+
+    // 지운 뒤에는 스냅샷으로 되돌릴 수 있다(비트맵이 있으면 qemu-img가 거절한다, QEMU 11에서 확인).
+    let tag = Uuid::now_v7().to_string();
+    storages
+        .snapshot_create(&pool, id, qcow2, &tag)
+        .await
+        .unwrap();
+    qemu_img(&["bitmap", "--remove", path.to_str().unwrap(), "user"]);
+    storages
+        .drop_backup_bitmaps(&pool, id, qcow2)
+        .await
+        .unwrap();
+    assert!(bitmaps(&path).is_empty());
+    storages
+        .snapshot_revert(&pool, id, qcow2, &tag)
+        .await
+        .unwrap();
+    // 없어도 성공한다.
+    storages
+        .drop_backup_bitmaps(&pool, id, qcow2)
+        .await
+        .unwrap();
+
+    let raw_id = Uuid::now_v7();
+    storages
+        .create_volume(&pool, raw_id, MIB, raw)
+        .await
+        .unwrap();
+    storages
+        .set_backup_bitmap(&pool, raw_id, raw, "opl-a")
+        .await
+        .unwrap();
+    storages
+        .drop_backup_bitmaps(&pool, raw_id, raw)
+        .await
+        .unwrap();
+    let missing = storages
+        .set_backup_bitmap(&pool, Uuid::now_v7(), qcow2, "opl-a")
+        .await;
+    assert!(
+        matches!(missing, Err(DriverError::VolumeNotFound(_))),
+        "{missing:?}"
+    );
+}
+
+/// 두 이미지의 내용이 같은지(`qemu-img compare`, 형식은 추측)
+fn same_contents(a: &Path, b: &Path) -> bool {
+    std::process::Command::new("qemu-img")
+        .args(["compare", "-q", a.to_str().unwrap(), b.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// 증분 백업 체인 가져오기: 전체 백업과 바뀐 블록만 담은 backing 없는 qcow2를 체인으로 열어 원본과
+/// 같은 새 볼륨(qcow2, raw)을 만든다. 증분 파일만으로는 원본이 아니다.
+#[tokio::test]
+async fn imports_a_backup_chain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src_dir, out, dst_dir) = (
+        tmp.path().join("src"),
+        tmp.path().join("out"),
+        tmp.path().join("dst"),
+    );
+    for dir in [&src_dir, &out, &dst_dir] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let (src_pool, dst_pool) = (pool(&src_dir), pool(&dst_dir));
+    let storages = Storages::new("qemu-img", Arc::new(DirStorage::new("qemu-img", MNT)));
+    let (qcow2, raw) = (ImageFormat::Qcow2, ImageFormat::Raw);
+
+    let src = Uuid::now_v7();
+    let src_path = storages
+        .create_volume(&src_pool, src, 64 * MIB, qcow2)
+        .await
+        .unwrap();
+    assert!(qemu_io(&src_path, "write -P 0xab 0 1M"));
+    let source = storages
+        .volume_source(&src_pool, src, qcow2, None)
+        .await
+        .unwrap();
+    let full = out.join("full.qcow2");
+    storages.export_volume(&source, false, &full).await.unwrap();
+
+    // 바뀐 블록을 원본과 빈 증분 파일에 같이 쓴다(QEMU의 증분 백업처럼).
+    let incr = out.join("incr.qcow2");
+    storages
+        .create_backup_target(&incr, 64 * MIB)
+        .await
+        .unwrap();
+    let info = image_info(&incr);
+    assert_eq!(info["format"], "qcow2");
+    assert_eq!(info["virtual-size"], 64 * MIB);
+    for cmd in ["write -P 0xcd 512k 64k", "write -P 0xef 32M 64k"] {
+        assert!(qemu_io(&src_path, cmd));
+        assert!(qemu_io(&incr, cmd));
+    }
+    for file in [&full, &incr] {
+        storages
+            .check_import_source(file, SourceFormat::Qcow2)
+            .await
+            .unwrap();
+    }
+
+    let chain = [incr.clone(), full.clone()];
+    for format in [qcow2, raw] {
+        let id = Uuid::now_v7();
+        let path = storages
+            .import_chain(&dst_pool, id, &chain, format)
+            .await
+            .unwrap();
+        assert_eq!(path, volume_path(&dst_pool, id, format));
+        assert!(same_contents(&path, &src_path));
+    }
+    assert!(!same_contents(&incr, &src_path));
+    assert!(!same_contents(&full, &src_path));
+
+    // 체인의 파일이 없으면 실패하고 볼륨을 남기지 않는다.
+    let id = Uuid::now_v7();
+    let broken = [incr.clone(), out.join("gone.qcow2")];
+    let err = storages
+        .import_chain(&dst_pool, id, &broken, qcow2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+    assert!(!volume_path(&dst_pool, id, qcow2).exists());
+}

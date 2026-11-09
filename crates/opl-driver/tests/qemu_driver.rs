@@ -6,8 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use opl_driver::{
-    ActualState, EventKind, Hypervisor, HypervisorEvent, QemuConfig, QemuHypervisor, RuntimeStatus,
-    StopMode,
+    ActualState, BackupTarget, DirStorage, EventKind, Hypervisor, HypervisorEvent, QemuConfig,
+    QemuHypervisor, RuntimeStatus, StopMode, Storage, VolumeSource,
 };
 use opl_qemu::HostProfile;
 use opl_types::runtime::{DiskKind, ImageFormat, RuntimeDisk, VmRuntimeSpec};
@@ -452,5 +452,363 @@ async fn qemu_runs_in_its_own_systemd_scope() {
     hv.stop(vm.id, StopMode::Force).await.unwrap();
     // 끝난 스코프가 아직 남아 있어도 시작 전에 지우므로 곧바로 다시 시작할 수 있다.
     hv.start(&vm, None).await.unwrap();
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+}
+
+/// 이미지에 `qemu-io` 명령 하나(꺼진 VM의 디스크에 쓰기, 읽어 확인하기). `read -P`는 패턴이 다르면 실패한다.
+fn qemu_io(path: &Path, cmd: &str) -> bool {
+    std::process::Command::new("qemu-io")
+        .args(["-f", "qcow2", "-c", cmd])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// 디스크 노드마다 비트맵 이름
+async fn bitmap_names(hv: &QemuHypervisor, id: Uuid) -> Vec<Vec<String>> {
+    hv.backup_bitmaps(id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.bitmaps.into_iter().map(|b| b.name).collect())
+        .collect()
+}
+
+/// 증분 백업: 전체 백업의 시점에 만든 비트맵(qcow2라 VM을 껐다 켜도 남는다) 뒤에 바뀐 블록만 증분
+/// 파일에 담기고, 전체·증분 체인을 가져오면 디스크와 같다. 실패하면 앞 비트맵이 남아 다시 할 수 있다.
+#[tokio::test]
+async fn incremental_backup_holds_only_changed_blocks() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let storage = DirStorage::new("qemu-img", tmp.path().join("pools"));
+    let disk = tmp.path().join("disk0.qcow2");
+    let vm = with_qcow2_disk(spec(), &disk);
+    assert!(qemu_io(&disk, "write -P 0xab 0 1M"));
+    hv.start(&vm, None).await.unwrap();
+
+    // 전체 백업: 스냅샷과 비트맵을 한 시점에 만들고 스냅샷을 내보낸다.
+    hv.snapshot_save_with_bitmap(vm.id, "full", "opl-a")
+        .await
+        .unwrap();
+    let disks = hv.backup_bitmaps(vm.id).await.unwrap();
+    assert_eq!(disks.len(), 1);
+    assert_eq!(disks[0].node, "disk0");
+    let a = &disks[0].bitmaps[0];
+    assert_eq!(
+        (a.name.as_str(), a.recording, a.inconsistent, a.persistent),
+        ("opl-a", true, false, true)
+    );
+    let full = tmp.path().join("full.qcow2");
+    let source = VolumeSource {
+        path: disk.clone(),
+        format: ImageFormat::Qcow2,
+        snapshot: Some("full".into()),
+        size_bytes: 1 << 30,
+        rbd: None,
+    };
+    storage.export_volume(&source, true, &full).await.unwrap();
+    hv.snapshot_delete(vm.id, "full").await.unwrap();
+
+    // 게스트가 없으므로 VM을 끄고 쓴다. 저장된 비트맵을 연 qemu-io의 쓰기도 비트맵에 남는다.
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+    assert!(qemu_io(&disk, "write -P 0xcd 512k 64k"));
+    assert!(qemu_io(&disk, "write -P 0xef 600M 64k"));
+    hv.start(&vm, None).await.unwrap();
+    let a = &hv.backup_bitmaps(vm.id).await.unwrap()[0].bitmaps[0];
+    assert_eq!(
+        (a.name.as_str(), a.recording, a.inconsistent),
+        ("opl-a", true, false)
+    );
+
+    // 없는 비트맵에서는 실패하고, 대상 노드를 닫고 비트맵은 그대로다.
+    let incr = tmp.path().join("incr.qcow2");
+    storage.create_backup_target(&incr, 1 << 30).await.unwrap();
+    let targets = [BackupTarget {
+        node: "disk0".into(),
+        path: incr.clone(),
+        size: 1 << 30,
+    }];
+    let err = hv
+        .incremental_backup(vm.id, "opl-x", "opl-b", &targets)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("opl-x"), "{err}");
+    assert_eq!(bitmap_names(&hv, vm.id).await, [["opl-a"]]);
+
+    hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets)
+        .await
+        .unwrap();
+    assert_eq!(bitmap_names(&hv, vm.id).await, [["opl-b"]]);
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+
+    // 증분 파일에는 바뀐 블록만 있다(나머지는 비어 0으로 읽힌다).
+    assert!(qemu_io(&incr, "read -P 0xcd 512k 64k"));
+    assert!(qemu_io(&incr, "read -P 0xef 600M 64k"));
+    assert!(qemu_io(&incr, "read -P 0 0 512k"));
+    assert!(std::fs::metadata(&incr).unwrap().len() < 1 << 20);
+
+    let pools = tmp.path().join("restore");
+    std::fs::create_dir(&pools).unwrap();
+    let pool = opl_types::resource::Resource::new(
+        "restore",
+        opl_types::storage::StoragePoolSpec {
+            backend: opl_types::storage::PoolBackend::Dir { path: pools },
+            nodes: vec![],
+            shared: false,
+            backups: false,
+        },
+    );
+    let restored = storage
+        .import_chain(&pool, Uuid::now_v7(), &[incr, full], ImageFormat::Qcow2)
+        .await
+        .unwrap();
+    let same = std::process::Command::new("qemu-img")
+        .args(["compare", "-q", "-f", "qcow2", "-F", "qcow2"])
+        .args([&restored, &disk])
+        .status()
+        .unwrap();
+    assert!(same.success(), "restored chain differs from the disk");
+
+    // 비트맵 더하기·지우기
+    hv.start(&vm, None).await.unwrap();
+    hv.add_bitmaps(vm.id, "opl-c").await.unwrap();
+    hv.remove_bitmaps(vm.id, Some("opl-c")).await.unwrap();
+    assert_eq!(bitmap_names(&hv, vm.id).await, [["opl-c"]]);
+    hv.remove_bitmaps(vm.id, None).await.unwrap();
+    assert_eq!(bitmap_names(&hv, vm.id).await, [Vec::<String>::new()]);
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+}
+
+/// raw 디스크의 비트맵은 QEMU 안에만 있어 VM을 다시 켜면 사라진다. 바뀐 것이 없으면 증분도 비어 있다.
+#[tokio::test]
+async fn raw_disk_bitmaps_do_not_survive_a_restart() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let storage = DirStorage::new("qemu-img", tmp.path().join("pools"));
+    let disk = tmp.path().join("disk0.raw");
+    std::fs::File::create(&disk)
+        .unwrap()
+        .set_len(64 << 20)
+        .unwrap();
+    let mut vm = spec();
+    vm.disks.push(RuntimeDisk {
+        path: disk,
+        kind: DiskKind::File,
+        rbd: None,
+        format: ImageFormat::Raw,
+        bus: DiskBus::VirtioBlk,
+        boot_order: None,
+    });
+    hv.start(&vm, None).await.unwrap();
+    hv.add_bitmaps(vm.id, "opl-a").await.unwrap();
+    let a = &hv.backup_bitmaps(vm.id).await.unwrap()[0].bitmaps[0];
+    assert_eq!((a.name.as_str(), a.persistent), ("opl-a", false));
+
+    let incr = tmp.path().join("incr.qcow2");
+    storage.create_backup_target(&incr, 64 << 20).await.unwrap();
+    let targets = [BackupTarget {
+        node: "disk0".into(),
+        path: incr.clone(),
+        size: 64 << 20,
+    }];
+    hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets)
+        .await
+        .unwrap();
+    assert_eq!(bitmap_names(&hv, vm.id).await, [["opl-b"]]);
+    assert!(qemu_io(&incr, "read -P 0 0 64M"));
+
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+    hv.start(&vm, None).await.unwrap();
+    assert_eq!(bitmap_names(&hv, vm.id).await, [Vec::<String>::new()]);
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+}
+
+/// QEMU에 SIGTERM을 보내 깨끗이 끝내고(QMP `quit`처럼 비트맵을 이미지에 쓴다) 프로세스가 사라지기를
+/// 기다린다. `StopMode::Force`와 달리 오래 걸려도 SIGKILL을 보내지 않는다.
+async fn stop_cleanly(hv: &QemuHypervisor, id: Uuid) {
+    let pid = hv.inspect(id).await.unwrap().unwrap().pid;
+    let mut rx = hv.subscribe();
+    assert!(signal("-TERM", pid));
+    let stopped = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let ev = rx.recv().await.unwrap();
+            if ev.id == id {
+                return ev.kind;
+            }
+        }
+    })
+    .await
+    .expect("QEMU did not stop within 120s");
+    assert_eq!(
+        stopped,
+        EventKind::Stopped {
+            guest_initiated: false
+        }
+    );
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while process_exists(pid) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("QEMU did not exit within 120s");
+}
+
+/// 증분이 0 쓰기(`write -z`, 할당을 푼 것 포함)와 discard도 담는다: 전체 위에 증분을 덮은 체인이 디스크와
+/// 같다.
+#[tokio::test]
+async fn incremental_backup_holds_zeroed_and_discarded_blocks() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let storage = DirStorage::new("qemu-img", tmp.path().join("pools"));
+    let disk = tmp.path().join("disk0.qcow2");
+    let vm = with_qcow2_disk(spec(), &disk);
+    assert!(qemu_io(&disk, "write -P 0xab 0 4M"));
+    hv.start(&vm, None).await.unwrap();
+    hv.snapshot_save_with_bitmap(vm.id, "full", "opl-a")
+        .await
+        .unwrap();
+    let full = tmp.path().join("full.qcow2");
+    let source = VolumeSource {
+        path: disk.clone(),
+        format: ImageFormat::Qcow2,
+        snapshot: Some("full".into()),
+        size_bytes: 1 << 30,
+        rbd: None,
+    };
+    storage.export_volume(&source, true, &full).await.unwrap();
+    hv.snapshot_delete(vm.id, "full").await.unwrap();
+
+    // 실행 중에 더한 persistent 비트맵은 QEMU가 끝날 때 이미지에 쓴다. Force는 부하가 크면 SIGKILL로
+    // 떨어져 비트맵을 잃으므로 깨끗이 끝낸다.
+    stop_cleanly(&hv, vm.id).await;
+    for cmd in [
+        "write -z 0 64k",
+        "write -z -u 128k 64k",
+        "discard 256k 64k",
+        "write -P 0xcd 512k 64k",
+    ] {
+        assert!(qemu_io(&disk, cmd), "{cmd}");
+    }
+    hv.start(&vm, None).await.unwrap();
+    assert!(
+        bitmap_names(&hv, vm.id).await[0].contains(&"opl-a".to_string()),
+        "bitmap lost — VM was not stopped cleanly"
+    );
+    let incr = tmp.path().join("incr.qcow2");
+    storage.create_backup_target(&incr, 1 << 30).await.unwrap();
+    let targets = [BackupTarget {
+        node: "disk0".into(),
+        path: incr.clone(),
+        size: 1 << 30,
+    }];
+    hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets)
+        .await
+        .unwrap();
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+
+    let pools = tmp.path().join("restore");
+    std::fs::create_dir(&pools).unwrap();
+    let pool = opl_types::resource::Resource::new(
+        "restore",
+        opl_types::storage::StoragePoolSpec {
+            backend: opl_types::storage::PoolBackend::Dir { path: pools },
+            nodes: vec![],
+            shared: false,
+            backups: false,
+        },
+    );
+    let restored = storage
+        .import_chain(&pool, Uuid::now_v7(), &[incr, full], ImageFormat::Qcow2)
+        .await
+        .unwrap();
+    let same = std::process::Command::new("qemu-img")
+        .args(["compare", "-q", "-f", "qcow2", "-F", "qcow2"])
+        .args([&restored, &disk])
+        .status()
+        .unwrap();
+    assert!(same.success(), "restored chain differs from the disk");
+    assert!(qemu_io(&restored, "read -P 0 0 64k"));
+    assert!(qemu_io(&restored, "read -P 0 256k 64k"));
+}
+
+/// QEMU가 비정상으로 끝나 이미지에 inconsistent로 남은 비트맵이 있어도 꺼진 디스크의 크기를 늘린다
+/// (증분 백업의 비트맵을 지운다). 다시 켠 VM에는 그런 비트맵이 남지 않는다.
+#[tokio::test]
+async fn inconsistent_bitmaps_do_not_block_offline_resize_or_restart() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let pools = tmp.path().join("pool");
+    std::fs::create_dir(&pools).unwrap();
+    let pool = opl_types::resource::Resource::new(
+        "pool",
+        opl_types::storage::StoragePoolSpec {
+            backend: opl_types::storage::PoolBackend::Dir {
+                path: pools.clone(),
+            },
+            nodes: vec![],
+            shared: false,
+            backups: false,
+        },
+    );
+    let storage = DirStorage::new("qemu-img", tmp.path().join("mnt"));
+    let id = Uuid::now_v7();
+    let disk = pools.join(format!("{id}.qcow2"));
+    let vm = with_qcow2_disk(spec(), &disk);
+    let mut rx = hv.subscribe();
+    // 깨끗이 끝나면 비트맵을 이미지에 저장하고, 다시 연 QEMU는 그것을 in-use로 표시한 채 쓴다.
+    let crash_with_bitmap = async |name: &str, rx: &mut broadcast::Receiver<HypervisorEvent>| {
+        hv.start(&vm, None).await.unwrap();
+        hv.add_bitmaps(vm.id, name).await.unwrap();
+        hv.stop(vm.id, StopMode::Force).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
+        let pid = hv.inspect(vm.id).await.unwrap().unwrap().pid;
+        assert!(signal("-KILL", pid));
+        while next_event_for(rx, vm.id).await != EventKind::Crashed {}
+        // Linux에서 pidfile 잠금(POSIX)은 fd를 닫을 때 바로 풀리지만 이미지 잠금(OFD)은 파일의 마지막
+        // 참조가 사라질 때 풀려 Crashed 뒤에도 잠깐 남을 수 있다. 프로세스가 사라질 때까지 기다린다.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while process_exists(pid) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("killed QEMU did not exit within 10s");
+    };
+    crash_with_bitmap("opl-a", &mut rx).await;
+    // 이미지에 in-use로 남아 qemu-img도 크기를 바꾸지 못한다.
+    let out = std::process::Command::new("qemu-img")
+        .args(["info", "-U", "--output=json"])
+        .arg(&disk)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "qemu-img info: {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let flags = &info["format-specific"]["data"]["bitmaps"][0]["flags"];
+    assert!(
+        flags
+            .as_array()
+            .is_some_and(|f| f.iter().any(|f| f == "in-use")),
+        "{info}"
+    );
+
+    storage
+        .resize_volume(&pool, id, ImageFormat::Qcow2, 2 << 30)
+        .await
+        .unwrap();
+    assert_eq!(image_info(&disk).1, 2 << 30);
+
+    // 다시 inconsistent 비트맵을 남기고 켠다: 지워진다.
+    crash_with_bitmap("opl-b", &mut rx).await;
+    hv.start(&vm, None).await.unwrap();
+    assert_eq!(bitmap_names(&hv, vm.id).await, [Vec::<String>::new()]);
+    hv.block_resize(vm.id, 0, 3 << 30).await.unwrap();
     hv.stop(vm.id, StopMode::Force).await.unwrap();
 }

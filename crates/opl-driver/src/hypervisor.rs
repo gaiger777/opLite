@@ -2,6 +2,7 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+pub use opl_qemu::BitmapInfo;
 use opl_types::runtime::VmRuntimeSpec;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -52,6 +53,25 @@ pub enum EventKind {
     Crashed,
 }
 
+/// 실행 중인 VM의 디스크 노드 하나와 그 dirty bitmap들
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskBitmaps {
+    /// 디스크 노드 이름(`disk{i}`)
+    pub node: String,
+    pub bitmaps: Vec<BitmapInfo>,
+}
+
+/// 증분 백업([`Hypervisor::incremental_backup`])이 디스크 하나를 쓸 대상
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupTarget {
+    /// 디스크 노드 이름(`disk{i}`)
+    pub node: String,
+    /// 미리 만들어 둔 backing 없는 빈 qcow2 파일(절대 경로)
+    pub path: PathBuf,
+    /// 그 파일의 가상 크기(디스크와 같다)
+    pub size: u64,
+}
+
 /// VM 프로세스 수명을 관리한다. 같은 VM에 대한 호출을 직렬화하는 것은 호출자(reconciler)의 책임이다.
 #[async_trait]
 pub trait Hypervisor: Send + Sync {
@@ -59,7 +79,8 @@ pub trait Hypervisor: Send + Sync {
     ///
     /// `restore`가 있으면 새로 띄운 VM을 실행하기 전에 그 태그의 내부 스냅샷(디스크와 메모리,
     /// 메모리는 첫 디스크)을 불러온다. 불러오지 못하면 VM을 끝내고 오류를 돌려준다.
-    /// 이미 실행 중인 VM에는 쓰지 않는다.
+    /// 이미 실행 중인 VM에는 쓰지 않는다. 새로 띄운 VM의 inconsistent인 `opl-` dirty bitmap(QEMU가
+    /// 비정상으로 끝나 이미지에 남은 것)은 지운다.
     async fn start(&self, vm: &VmRuntimeSpec, restore: Option<&str>) -> Result<(), DriverError>;
 
     /// `Acpi`는 요청만 보내고 바로 돌아온다. `Force`는 프로세스가 끝날 때까지 기다린다.
@@ -80,10 +101,49 @@ pub trait Hypervisor: Send + Sync {
     /// 첫 디스크에 담는다(저장하는 동안 VM이 멈춘다). 아니면 VM을 멈추지 않고 디스크만 찍는다.
     async fn snapshot_save(&self, id: Uuid, tag: &str, memory: bool) -> Result<(), DriverError>;
 
+    /// 메모리 없이 실행 중인 VM의 모든 디스크에 내부 스냅샷 `tag`와 dirty bitmap `bitmap`을 한 시점에
+    /// 만든다(transaction 하나). 비트맵은 qcow2 디스크면 이미지에 저장된다(persistent).
+    async fn snapshot_save_with_bitmap(
+        &self,
+        id: Uuid,
+        tag: &str,
+        bitmap: &str,
+    ) -> Result<(), DriverError>;
+
+    /// 실행 중인 VM의 디스크 노드(`disk{i}`)마다 dirty bitmap들을 디스크 순서로 읽는다.
+    async fn backup_bitmaps(&self, id: Uuid) -> Result<Vec<DiskBitmaps>, DriverError>;
+
+    /// 실행 중인 VM의 모든 디스크에 dirty bitmap `name`을 한 시점에 만든다(qcow2면 persistent).
+    /// VM을 멈춘 동안 블록 풀 스냅샷과 같은 시점을 잡는 데 쓴다.
+    async fn add_bitmaps(&self, id: Uuid, name: &str) -> Result<(), DriverError>;
+
+    /// 실행 중인 VM의 모든 디스크에서 이름이 `opl-`로 시작하는 dirty bitmap 중 `keep`이 아닌 것을
+    /// 모두 지운다.
+    async fn remove_bitmaps(&self, id: Uuid, keep: Option<&str>) -> Result<(), DriverError>;
+
+    /// 실행 중인 VM의 디스크마다 비트맵 `parent` 뒤에 바뀐 블록만 `targets`(디스크 순서)에 압축해
+    /// 쓴다. 쓰기 시작하는 시점에 모든 디스크에 새 비트맵 `new`를 만든다(transaction 하나). 작업이
+    /// 하나라도 실패하면 나머지를 취소한다. 대상 노드는 끝나면 닫는다(닫지 못하면 대상 파일이 온전하지
+    /// 않으므로 실패). 성공하면 `parent`를 지우고, 실패하면 `new`를 지워 `parent`만 남긴다(대상 파일은
+    /// 호출자가 지운다).
+    async fn incremental_backup(
+        &self,
+        id: Uuid,
+        parent: &str,
+        new: &str,
+        targets: &[BackupTarget],
+    ) -> Result<(), DriverError>;
+
+    /// 실행 중인 VM에 앞선 증분 백업이 남긴 작업과 대상 노드(`opl-backup-*`, opld가 기다리다 죽었다)를
+    /// 치운다. 아직 도는 작업은 취소하고 잠시 기다린다(끝나지 않으면 오류). 남은 작업이 있으면 디스크의
+    /// 내부 스냅샷이 실패한다.
+    async fn clear_backup_leftovers(&self, id: Uuid) -> Result<(), DriverError>;
+
     /// 실행 중인 VM의 모든 디스크에서 내부 스냅샷 `tag`를 지운다. 태그가 없어도 성공한다.
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError>;
 
     /// 실행 중인 VM의 `disk`번째 디스크(스펙의 `disks` 순서) 크기를 바꾼다. 게스트가 바로 본다.
+    /// inconsistent인 `opl-` dirty bitmap이 있으면 먼저 지운다(있으면 크기를 바꿀 수 없다).
     async fn block_resize(&self, id: Uuid, disk: usize, size_bytes: u64)
     -> Result<(), DriverError>;
 
@@ -134,10 +194,11 @@ pub trait Hypervisor: Send + Sync {
     /// 않은 채 남은 받는 QEMU를 찾아 끄는 데 쓴다.
     async fn list_incoming(&self) -> Result<Vec<(Uuid, Uuid)>, DriverError>;
 
-    /// 실행 중인 VM을 `target`으로 보낸다(TLS, 능력 `events`·`auto-converge`). 끝날 때까지 기다린다.
-    /// 성공하면 원본은 `postmigrate`로 멈춰 있다([`stop_migrated`](Self::stop_migrated)로 끈다).
-    /// 실패하거나 `opts.timeout`이 지나 취소하면 `Migration` 오류이고 원본은 대개 계속 돈다
-    /// (멈췄으면 [`resume`](Self::resume)으로 이어서 실행한다).
+    /// 실행 중인 VM을 `target`으로 보낸다(TLS, 능력 `events`·`auto-converge`, 이미지에 저장되지 않는
+    /// `opl-` 비트맵이 있으면 `dirty-bitmaps`). 보내기 전에 inconsistent인 `opl-` 비트맵을 지운다. 끝날
+    /// 때까지 기다린다. 성공하면 원본은 `postmigrate`로 멈춰
+    /// 있다([`stop_migrated`](Self::stop_migrated)로 끈다). 실패하거나 `opts.timeout`이 지나 취소하면
+    /// `Migration` 오류이고 원본은 대개 계속 돈다(멈췄으면 [`resume`](Self::resume)으로 이어서 실행한다).
     async fn migrate(
         &self,
         id: Uuid,

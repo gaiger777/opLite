@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use super::blockcmd::BlockTool;
 use super::{
-    Capacity, Storage, VolumeInfo, VolumeSource, check_image, convert_from, path_str,
-    require_absolute, run_qemu_img, source_virtual_size, src_fmt_name,
+    Capacity, ImportSource, Storage, VolumeInfo, VolumeSource, check_image, convert_from, path_str,
+    run_qemu_img, source_virtual_size,
 };
 use crate::error::DriverError;
 
@@ -364,6 +364,22 @@ pub struct ZfsStorage {
 }
 
 impl ZfsStorage {
+    /// 원본의 가상 크기로 zvol을 만들고 raw로 변환해 써 넣는다.
+    async fn import_from(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        src: ImportSource<'_>,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        let dataset = Self::dataset(pool, format)?;
+        let from = src.args(Some("raw"))?;
+        let size = source_virtual_size(&self.qemu_img, src).await?;
+        let dst = self.create_zvol(dataset, id, size).await?;
+        self.fill(dataset, id, &dst, &from).await?;
+        Ok(dst)
+    }
+
     pub fn new(qemu_img: impl Into<PathBuf>, ops: Arc<dyn ZfsOps>) -> Self {
         Self {
             qemu_img: qemu_img.into(),
@@ -589,14 +605,19 @@ impl Storage for ZfsStorage {
         src_format: SourceFormat,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        let dataset = Self::dataset(pool, format)?;
-        require_absolute(src)?;
-        let src_str = path_str(src)?;
-        let size = source_virtual_size(&self.qemu_img, src, src_format).await?;
-        let dst = self.create_zvol(dataset, id, size).await?;
-        let from = ["-f", src_fmt_name(src_format), "-O", "raw", src_str].map(String::from);
-        self.fill(dataset, id, &dst, &from).await?;
-        Ok(dst)
+        self.import_from(pool, id, ImportSource::File(src, src_format), format)
+            .await
+    }
+
+    async fn import_chain(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        chain: &[PathBuf],
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.import_from(pool, id, ImportSource::Chain(chain), format)
+            .await
     }
 
     /// 올린 파일만 본다(풀과 상관없다).

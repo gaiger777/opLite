@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use super::blockcmd::BlockTool;
 use super::{
-    Capacity, Storage, VolumeInfo, VolumeSource, check_image, convert_from, path_str,
-    require_absolute, run_qemu_img, source_virtual_size, src_fmt_name,
+    Capacity, ImportSource, Storage, VolumeInfo, VolumeSource, check_image, convert_from,
+    run_qemu_img, source_virtual_size,
 };
 use crate::error::DriverError;
 
@@ -494,6 +494,22 @@ pub struct RbdStorage {
 }
 
 impl RbdStorage {
+    /// 원본의 가상 크기로 이미지를 만들고 변환해 써 넣는다. 형식은 대상 옵션 문자열 안에 있다.
+    async fn import_from(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        src: ImportSource<'_>,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        let image = Self::target(pool, id, format)?;
+        let from = src.args(None)?;
+        let size = source_virtual_size(&self.qemu_img, src).await?;
+        self.create_image(&image, id, size).await?;
+        self.fill(&image, id, &from).await?;
+        Ok(PathBuf::new())
+    }
+
     pub fn new(qemu_img: impl Into<PathBuf>, ops: Arc<dyn RbdOps>) -> Self {
         Self {
             qemu_img: qemu_img.into(),
@@ -620,14 +636,19 @@ impl Storage for RbdStorage {
         src_format: SourceFormat,
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        let image = Self::target(pool, id, format)?;
-        require_absolute(src)?;
-        let src_str = path_str(src)?;
-        let size = source_virtual_size(&self.qemu_img, src, src_format).await?;
-        self.create_image(&image, id, size).await?;
-        let from = ["-f", src_fmt_name(src_format), src_str].map(String::from);
-        self.fill(&image, id, &from).await?;
-        Ok(PathBuf::new())
+        self.import_from(pool, id, ImportSource::File(src, src_format), format)
+            .await
+    }
+
+    async fn import_chain(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        chain: &[PathBuf],
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.import_from(pool, id, ImportSource::Chain(chain), format)
+            .await
     }
 
     /// 올린 파일만 본다(풀과 상관없다).

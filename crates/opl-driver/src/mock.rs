@@ -6,18 +6,23 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_qemu::QmpError;
-use opl_types::runtime::VmRuntimeSpec;
+use opl_types::backup::BITMAP_PREFIX;
+use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
 use crate::error::DriverError;
 use crate::hypervisor::{
-    ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
+    ActualState, BackupTarget, BitmapInfo, DiskBitmaps, EventKind, Hypervisor, HypervisorEvent,
+    RuntimeStatus, StopMode,
 };
 use crate::migration::{MigrateOptions, MigrateTarget};
 
 /// 따로 정하지 않았을 때 `qemu_version`이 돌려주는 버전
 pub const MOCK_QEMU_VERSION: &str = "8.2.2";
+
+/// `incremental_backup` 호출 한 번: (VM, 앞 비트맵, 새 비트맵, 대상)
+pub type IncrementalCall = (Uuid, String, String, Vec<BackupTarget>);
 
 /// 메모리 안에서만 동작하는 하이퍼바이저. reconciler 테스트에서 장애를 주입하는 데 쓴다.
 pub struct MockHypervisor {
@@ -85,6 +90,17 @@ struct MockState {
     complete_on_cancel: bool,
     /// `migrate`가 이만큼 기다린 뒤에 동작한다.
     migrate_delay: Option<Duration>,
+    /// VM별 디스크 형식(마지막으로 띄운 스펙의 디스크 순서). 비트맵이 persistent인지 정한다.
+    disk_formats: HashMap<Uuid, Vec<ImageFormat>>,
+    /// VM별 디스크마다의 dirty bitmap. 실행 중일 때만 다룬다. VM이 꺼지면 persistent인 것만 남는다
+    /// (qcow2 이미지에 저장된 것처럼).
+    bitmaps: HashMap<Uuid, Vec<Vec<BitmapInfo>>>,
+    /// 다음 `incremental_backup` 한 번을 실패시킬 오류. 실제 드라이버처럼 비트맵은 그대로다.
+    fail_next_incremental: Option<DriverError>,
+    /// `incremental_backup` 호출(실패 포함)
+    incrementals: Vec<IncrementalCall>,
+    /// `clear_backup_leftovers`를 부른 VM(실패 포함)
+    leftover_clears: Vec<Uuid>,
 }
 
 impl Default for MockHypervisor {
@@ -298,6 +314,81 @@ impl MockHypervisor {
         self.state.lock().unwrap().incoming.contains_key(&id)
     }
 
+    /// VM의 디스크마다의 dirty bitmap(꺼져 있어도 남은 것을 본다)
+    pub fn bitmaps(&self, id: Uuid) -> Vec<Vec<BitmapInfo>> {
+        let st = self.state.lock().unwrap();
+        st.bitmaps.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// VM의 디스크마다의 dirty bitmap을 바꾼다(없는 비트맵, 남은 비트맵 등).
+    pub fn set_bitmaps(&self, id: Uuid, bitmaps: Vec<Vec<BitmapInfo>>) {
+        self.state.lock().unwrap().bitmaps.insert(id, bitmaps);
+    }
+
+    /// `disk`번째 디스크의 비트맵 `name`을 QEMU가 비정상으로 끝난 뒤 연 것처럼 inconsistent로 만든다.
+    pub fn set_bitmap_inconsistent(&self, id: Uuid, disk: usize, name: &str) {
+        let mut st = self.state.lock().unwrap();
+        let bitmaps = st.bitmaps.get_mut(&id).and_then(|d| d.get_mut(disk));
+        for b in bitmaps.into_iter().flatten().filter(|b| b.name == name) {
+            b.inconsistent = true;
+        }
+    }
+
+    /// 다음 `incremental_backup` 한 번을 이 오류로 실패시킨다. 비트맵은 그대로 남는다.
+    pub fn fail_next_incremental(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_incremental = Some(err);
+    }
+
+    /// `incremental_backup` 호출(실패 포함)을 순서대로 돌려준다. 대상 파일에는 아무것도 쓰지 않는다.
+    pub fn incremental_backups(&self) -> Vec<IncrementalCall> {
+        self.state.lock().unwrap().incrementals.clone()
+    }
+
+    /// `clear_backup_leftovers`를 부른 VM(실패 포함)을 순서대로 돌려준다.
+    pub fn leftover_clears(&self) -> Vec<Uuid> {
+        self.state.lock().unwrap().leftover_clears.clone()
+    }
+
+    /// 새로 띄운 VM의 디스크 형식을 적고, 디스크 수에 맞춰 비트맵 목록을 늘리거나 줄인다.
+    fn launched(st: &mut MockState, vm: &VmRuntimeSpec) {
+        let formats: Vec<ImageFormat> = vm.disks.iter().map(|d| d.format).collect();
+        st.bitmaps
+            .entry(vm.id)
+            .or_default()
+            .resize(formats.len(), Vec::new());
+        st.disk_formats.insert(vm.id, formats);
+    }
+
+    /// VM이 꺼지면 이미지에 저장되지 않은 비트맵은 사라진다.
+    fn forget_volatile_bitmaps(st: &mut MockState, id: Uuid) {
+        for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
+            disk.retain(|b| b.persistent);
+        }
+    }
+
+    /// 모든 디스크에 비트맵 `name`을 만든다. 하나라도 이미 있으면 아무것도 만들지 않는다(QEMU의
+    /// transaction처럼).
+    fn add_bitmaps_to(st: &mut MockState, id: Uuid, name: &str) -> Result<(), DriverError> {
+        let formats = st.disk_formats.get(&id).cloned().unwrap_or_default();
+        let disks = st.bitmaps.entry(id).or_default();
+        disks.resize(formats.len(), Vec::new());
+        if disks.iter().flatten().any(|b| b.name == name) {
+            return Err(DriverError::Qmp(QmpError::Command {
+                class: "GenericError".into(),
+                desc: format!("Bitmap already exists: {name}"),
+            }));
+        }
+        for (disk, format) in disks.iter_mut().zip(formats) {
+            disk.push(BitmapInfo {
+                name: name.to_string(),
+                recording: true,
+                inconsistent: false,
+                persistent: format == ImageFormat::Qcow2,
+            });
+        }
+        Ok(())
+    }
+
     fn version(st: &MockState) -> String {
         st.qemu_version
             .clone()
@@ -317,6 +408,9 @@ impl MockHypervisor {
 
     fn remove(&self, id: Uuid, kind: EventKind) {
         let mut st = self.state.lock().unwrap();
+        if st.vms.contains_key(&id) {
+            Self::forget_volatile_bitmaps(&mut st, id);
+        }
         st.unresponsive.remove(&id);
         st.paused.remove(&id);
         st.marked.remove(&id);
@@ -379,6 +473,7 @@ impl Hypervisor for MockHypervisor {
             let pid = st.next_pid;
             st.next_pid += 1;
             st.vms.insert(vm.id, pid);
+            Self::launched(&mut st, vm);
         }
         let _ = self.events.send(HypervisorEvent {
             id: vm.id,
@@ -396,6 +491,7 @@ impl Hypervisor for MockHypervisor {
                 return match mode {
                     StopMode::Acpi => Err(DriverError::Timeout("reattach to running QEMU")),
                     StopMode::Force => {
+                        Self::forget_volatile_bitmaps(&mut st, id);
                         st.unresponsive.remove(&id);
                         st.paused.remove(&id);
                         st.incoming.remove(&id);
@@ -469,6 +565,113 @@ impl Hypervisor for MockHypervisor {
             Some(err) => Err(err),
             None => Ok(()),
         }
+    }
+
+    /// `snapshot_save`처럼 태그를 남기고, 주입한 실패가 없으면 비트맵도 만든다.
+    async fn snapshot_save_with_bitmap(
+        &self,
+        id: Uuid,
+        tag: &str,
+        bitmap: &str,
+    ) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        st.snapshots
+            .entry(id)
+            .or_default()
+            .push((tag.to_string(), false));
+        if let Some(err) = st.fail_next_snapshot.take() {
+            return Err(err);
+        }
+        Self::add_bitmaps_to(&mut st, id, bitmap)
+    }
+
+    async fn backup_bitmaps(&self, id: Uuid) -> Result<Vec<DiskBitmaps>, DriverError> {
+        let st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        let disks = st.disk_formats.get(&id).map_or(0, Vec::len);
+        let bitmaps = st.bitmaps.get(&id);
+        Ok((0..disks)
+            .map(|i| DiskBitmaps {
+                node: format!("disk{i}"),
+                bitmaps: bitmaps.and_then(|b| b.get(i)).cloned().unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    async fn add_bitmaps(&self, id: Uuid, name: &str) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        Self::add_bitmaps_to(&mut st, id, name)
+    }
+
+    async fn remove_bitmaps(&self, id: Uuid, keep: Option<&str>) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
+            disk.retain(|b| !b.name.starts_with(BITMAP_PREFIX) || keep == Some(b.name.as_str()));
+        }
+        Ok(())
+    }
+
+    /// 실제 QEMU처럼 디스크마다 `parent`가 있고 inconsistent가 아니어야 한다. 성공하면 `new`를 만들고
+    /// `parent`를 지운다. 대상 파일에는 쓰지 않는다.
+    async fn incremental_backup(
+        &self,
+        id: Uuid,
+        parent: &str,
+        new: &str,
+        targets: &[BackupTarget],
+    ) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.incrementals
+            .push((id, parent.to_string(), new.to_string(), targets.to_vec()));
+        Self::controllable(&st, id)?;
+        let disks = st.disk_formats.get(&id).map_or(0, Vec::len);
+        let wanted: Vec<String> = (0..disks).map(|i| format!("disk{i}")).collect();
+        let nodes: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
+        if nodes != wanted {
+            return Err(DriverError::InvalidSpec(format!(
+                "backup targets {nodes:?} do not match the disks {wanted:?} of VM {id}"
+            )));
+        }
+        let command = |desc: String| {
+            DriverError::Qmp(QmpError::Command {
+                class: "GenericError".into(),
+                desc,
+            })
+        };
+        for i in 0..disks {
+            let found = st
+                .bitmaps
+                .get(&id)
+                .and_then(|d| d.get(i))
+                .and_then(|d| d.iter().find(|b| b.name == parent));
+            match found {
+                None => return Err(command(format!("Bitmap '{parent}' could not be found"))),
+                Some(b) if b.inconsistent => {
+                    return Err(command(format!(
+                        "Bitmap '{parent}' is inconsistent and cannot be used"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(err) = st.fail_next_incremental.take() {
+            return Err(err);
+        }
+        Self::add_bitmaps_to(&mut st, id, new)?;
+        for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
+            disk.retain(|b| b.name != parent);
+        }
+        Ok(())
+    }
+
+    /// 남은 증분 백업 작업은 없다. 호출만 기록한다.
+    async fn clear_backup_leftovers(&self, id: Uuid) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.leftover_clears.push(id);
+        Self::controllable(&st, id)
     }
 
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
@@ -559,6 +762,7 @@ impl Hypervisor for MockHypervisor {
             let pid = st.next_pid;
             st.next_pid += 1;
             st.vms.insert(vm.id, pid);
+            Self::launched(&mut st, vm);
             st.incoming.insert(vm.id, task);
             st.migration_status.insert(vm.id, inmigrate());
         }
@@ -908,6 +1112,158 @@ mod tests {
         assert_eq!(hv.snapshots(vm.id).len(), 1);
         hv.snapshot_delete(vm.id, "s").await.unwrap();
         assert!(hv.snapshots(vm.id).is_empty());
+    }
+
+    /// qcow2 디스크 하나와 raw 디스크 하나를 가진 VM
+    fn spec_with_disks() -> VmRuntimeSpec {
+        use opl_types::runtime::{DiskKind, RuntimeDisk};
+        use opl_types::vm::DiskBus;
+        let disk = |format| RuntimeDisk {
+            path: PathBuf::from("/p/d"),
+            kind: DiskKind::File,
+            rbd: None,
+            format,
+            bus: DiskBus::VirtioBlk,
+            boot_order: None,
+        };
+        VmRuntimeSpec {
+            disks: vec![disk(ImageFormat::Qcow2), disk(ImageFormat::Raw)],
+            ..spec()
+        }
+    }
+
+    fn names(hv: &MockHypervisor, id: Uuid) -> Vec<Vec<String>> {
+        hv.bitmaps(id)
+            .iter()
+            .map(|d| d.iter().map(|b| b.name.clone()).collect())
+            .collect()
+    }
+
+    fn targets() -> Vec<BackupTarget> {
+        (0..2)
+            .map(|i| BackupTarget {
+                node: format!("disk{i}"),
+                path: PathBuf::from(format!("/b/disk{i}.qcow2.part")),
+                size: 1 << 30,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bitmaps_follow_backups_and_only_persistent_ones_survive_a_restart() {
+        let hv = MockHypervisor::default();
+        let vm = spec_with_disks();
+        for res in [
+            hv.add_bitmaps(vm.id, "opl-a").await,
+            hv.remove_bitmaps(vm.id, None).await,
+            hv.snapshot_save_with_bitmap(vm.id, "t", "opl-a").await,
+            hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets())
+                .await,
+            hv.clear_backup_leftovers(vm.id).await,
+        ] {
+            assert!(matches!(res, Err(DriverError::NotRunning(_))), "{res:?}");
+        }
+        assert_eq!(hv.leftover_clears(), [vm.id]);
+        assert!(hv.backup_bitmaps(vm.id).await.is_err());
+
+        hv.start(&vm, None).await.unwrap();
+        // 전체 백업: 스냅샷과 비트맵을 한 시점에. qcow2 디스크의 비트맵만 persistent다.
+        hv.snapshot_save_with_bitmap(vm.id, "t", "opl-a")
+            .await
+            .unwrap();
+        assert_eq!(hv.snapshots(vm.id), [("t".to_string(), false)]);
+        let disks = hv.backup_bitmaps(vm.id).await.unwrap();
+        assert_eq!(disks.len(), 2);
+        assert_eq!(disks[1].node, "disk1");
+        let a = &disks[0].bitmaps[0];
+        assert_eq!(
+            (a.name.as_str(), a.recording, a.inconsistent, a.persistent),
+            ("opl-a", true, false, true)
+        );
+        assert!(!disks[1].bitmaps[0].persistent);
+        // 같은 이름은 다시 만들 수 없다.
+        assert!(hv.add_bitmaps(vm.id, "opl-a").await.is_err());
+
+        // 증분: 성공하면 새 비트맵만 남는다.
+        hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets())
+            .await
+            .unwrap();
+        assert_eq!(names(&hv, vm.id), [["opl-b"], ["opl-b"]]);
+        // 실패하면 그대로다.
+        hv.fail_next_incremental(DriverError::Qmp(QmpError::JobFailed {
+            id: "opl-backup-0".into(),
+            error: "No space left on device".into(),
+        }));
+        assert!(
+            hv.incremental_backup(vm.id, "opl-b", "opl-c", &targets())
+                .await
+                .is_err()
+        );
+        assert_eq!(names(&hv, vm.id), [["opl-b"], ["opl-b"]]);
+        // 없는 비트맵, 디스크와 맞지 않는 대상, inconsistent 비트맵은 실패한다.
+        assert!(
+            hv.incremental_backup(vm.id, "opl-x", "opl-c", &targets())
+                .await
+                .is_err()
+        );
+        assert!(
+            hv.incremental_backup(vm.id, "opl-b", "opl-c", &targets()[..1])
+                .await
+                .is_err()
+        );
+        hv.set_bitmap_inconsistent(vm.id, 1, "opl-b");
+        assert!(hv.backup_bitmaps(vm.id).await.unwrap()[1].bitmaps[0].inconsistent);
+        assert!(
+            hv.incremental_backup(vm.id, "opl-b", "opl-c", &targets())
+                .await
+                .is_err()
+        );
+        assert_eq!(names(&hv, vm.id), [["opl-b"], ["opl-b"]]);
+        // 꺼진 VM에 부른 것까지 모두 기록한다.
+        let calls = hv.incremental_backups();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[1], (vm.id, "opl-a".into(), "opl-b".into(), targets()));
+
+        // opl-로 시작하는 것 중 keep만 남긴다. 다른 비트맵은 건드리지 않는다.
+        hv.set_bitmaps(
+            vm.id,
+            vec![
+                hv.bitmaps(vm.id)[0].clone(),
+                vec![BitmapInfo {
+                    name: "user".into(),
+                    recording: true,
+                    inconsistent: false,
+                    persistent: false,
+                }],
+            ],
+        );
+        hv.add_bitmaps(vm.id, "opl-c").await.unwrap();
+        hv.remove_bitmaps(vm.id, Some("opl-c")).await.unwrap();
+        assert_eq!(names(&hv, vm.id), [vec!["opl-c"], vec!["user", "opl-c"]]);
+
+        // 껐다 켜면 persistent인 것(qcow2 디스크)만 남는다.
+        hv.stop(vm.id, StopMode::Force).await.unwrap();
+        assert_eq!(names(&hv, vm.id), [vec!["opl-c"], vec![]]);
+        hv.start(&vm, None).await.unwrap();
+        let disks = hv.backup_bitmaps(vm.id).await.unwrap();
+        assert_eq!(disks[0].bitmaps[0].name, "opl-c");
+        assert!(disks[1].bitmaps.is_empty());
+        hv.crash(vm.id);
+        assert_eq!(names(&hv, vm.id), [vec!["opl-c"], vec![]]);
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_with_bitmap_adds_no_bitmap() {
+        let hv = MockHypervisor::default();
+        let vm = spec_with_disks();
+        hv.start(&vm, None).await.unwrap();
+        hv.fail_next_snapshot(DriverError::Timeout("QMP transaction"));
+        assert!(
+            hv.snapshot_save_with_bitmap(vm.id, "t", "opl-a")
+                .await
+                .is_err()
+        );
+        assert_eq!(names(&hv, vm.id), [Vec::<String>::new(), vec![]]);
     }
 
     fn target() -> MigrateTarget {

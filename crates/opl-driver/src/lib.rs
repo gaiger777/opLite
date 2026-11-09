@@ -13,13 +13,14 @@ pub mod storage;
 pub use error::DriverError;
 pub use firewall::{Firewall, FirewallNic, Nft, ruleset};
 pub use hypervisor::{
-    ActualState, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
+    ActualState, BackupTarget, BitmapInfo, DiskBitmaps, EventKind, Hypervisor, HypervisorEvent,
+    RuntimeStatus, StopMode,
 };
 pub use migration::{
     MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, migration_tls_dir, tcp_uri,
     write_migration_tls,
 };
-pub use mock::MockHypervisor;
+pub use mock::{IncrementalCall, MockHypervisor};
 pub use net::{HostNet, IpRoute, Overlay, OverlayChanges, Tap};
 pub use opl_types::storage::SourceFormat;
 pub use qemu::{QemuConfig, QemuHypervisor, uefi_vars_path, vm_state_dir};
