@@ -1,5 +1,6 @@
 //! 실제 gRPC(mTLS)로 이은 두 노드: 한 노드의 API로 다른 노드에 VM을 띄우고 콘솔을 중계한다.
 //! 라이브 마이그레이션(Mock 하이퍼바이저): 성공, 확정 전 실패의 되돌리기(HA VM 포함), 공유 디스크의 잠금 바꾸기.
+//! 노드 비우기: 공유 풀 VM은 다른 노드로 옮기고(들어오던 VM도) 로컬 디스크 VM은 남기며, 유지보수가 끝나면 멈춘다.
 //! 감사 로그: 한 노드의 `GET /audit`가 두 노드의 항목을 합치고, 닿지 않는 노드를 알린다.
 //! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
 
@@ -25,7 +26,7 @@ use opl_peer::{GrpcNetwork, PeerService, Peers};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role, UserSpec};
-use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
+use opl_types::node::{FEATURES, Fencing, NodeHa, NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
@@ -176,23 +177,31 @@ impl Node {
         reconciler_config.firmware = Some(firmware.clone());
         reconciler_config.ha = self.ha.clone();
         let reconciler = Reconciler::spawn(self.cluster.clone(), hv.clone(), reconciler_config);
+        let mut state = AppState::new(
+            self.cluster.clone(),
+            self.id,
+            hv.clone(),
+            work.join("uploads"),
+        );
+        state.peers = Some(self.peers.clone());
+        state.audit = audit;
+        let state = Arc::new(state);
         let mut config = runner_config(self.id, &work);
         config.peers = Some(self.peers.clone());
         config.firmware = Some(firmware);
+        // opld처럼 노드 비우기 Task가 API 상태를 쓴다.
+        config.api = Some(state.clone());
         let runner = TaskRunner::spawn(
             self.cluster.clone(),
             storage,
-            hv.clone(),
+            hv,
             reconciler.handle(),
             config,
         )
         .await;
-        let mut state = AppState::new(self.cluster.clone(), self.id, hv, work.join("uploads"));
-        state.peers = Some(self.peers.clone());
-        state.audit = audit;
         let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.base = format!("http://{}", api.local_addr().unwrap());
-        let app = opl_api::router(Arc::new(state));
+        let app = opl_api::router(state);
         tokio::spawn(async move { axum::serve(api, app).await.unwrap() });
         self._workers = Some((reconciler, runner));
     }
@@ -248,6 +257,8 @@ async fn two_nodes_with(ha: Option<Arc<HaGuard>>, b_audit: bool) -> (TempDir, No
             firewall: false,
             version: None,
             updates: None,
+            // 노드가 등록할 때처럼 이 빌드의 기능을 적는다(노드 비우기).
+            features: FEATURES.iter().map(|f| f.to_string()).collect(),
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();
@@ -955,6 +966,178 @@ async fn failed_migration_makes_shared_disks_exclusive_again() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(lock_calls(&a, volume), ["share", "exclusive"]);
     assert_eq!(lock_calls(&b, volume), ["share", "deactivate"]);
+}
+
+/// 디렉터리 풀 `pool`을 만든다. `shared`면 두 노드가 함께 쓰는 풀이다.
+async fn dir_pool(a: &Node, pool: &str, shared: bool) {
+    let pool: StoragePool = Resource::new(
+        pool,
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: format!("/nonexistent/opl-{pool}").into(),
+            },
+            nodes: vec![],
+            shared,
+            backups: false,
+        },
+    );
+    a.cluster.create(&pool).await.unwrap();
+}
+
+/// 노드 `on`에서 도는 VM `name`. 디스크는 풀 `pool`의 볼륨 `{name}-root`다.
+async fn running_vm_on_pool(
+    a: &Node,
+    admin: &common::Client,
+    name: &str,
+    pool: &str,
+    on: Uuid,
+) -> opl_types::vm::Vm {
+    let mut volume: Volume = Resource::new(
+        format!("{name}-root"),
+        VolumeSpec {
+            pool: pool.into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Raw,
+        },
+    );
+    volume.status.node = Some(on);
+    volume.status.phase = VolumePhase::Ready;
+    a.cluster.create(&volume).await.unwrap();
+    let mut req = vm_request(name);
+    req["spec"]["node"] = serde_json::json!(on);
+    req["spec"]["disks"] = serde_json::json!([{ "volume": volume.name, "bus": "virtio-blk" }]);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act(name, "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    a.cluster.get_by_name::<VmSpec>(name).unwrap().unwrap()
+}
+
+/// 노드 `node`를 비우는 Task를 만든다.
+async fn drain(admin: &common::Client, node: &str) -> serde_json::Value {
+    let (status, task) = admin
+        .post(&format!("/nodes/{node}/drain"), serde_json::Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    task
+}
+
+fn node_of(a: &Node, id: Uuid) -> Option<Uuid> {
+    a.cluster.get::<VmSpec>(id).unwrap().unwrap().spec.node
+}
+
+#[tokio::test]
+async fn drain_moves_running_vms_to_the_other_node() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    dir_pool(&a, "nas", true).await;
+    let app1 = running_vm_on_pool(&a, &admin, "app1", "nas", a.id).await;
+    let app2 = running_vm_on_pool(&a, &admin, "app2", "nas", a.id).await;
+
+    // B의 API로 요청해도 비우기 Task는 비울 노드 A에서 돈다.
+    let admin_b = login_at(&b.base, "admin", ADMIN_PASSWORD).await;
+    let task = drain(&admin_b, "node1").await;
+    assert_eq!(task["spec"]["node"], a.id.to_string());
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(node_of(&a, app1.id), Some(b.id));
+    assert_eq!(node_of(&a, app2.id), Some(b.id));
+    // 이름 순으로 하나씩 옮겼다.
+    let moved: Vec<Uuid> = a.hv.migrations().into_iter().map(|(id, _)| id).collect();
+    assert_eq!(moved, [app1.id, app2.id]);
+    for vm in [&app1, &app2] {
+        wait_vm(&b, vm.id, "running on B", |v| {
+            v.status.phase == VmPhase::Running && v.status.node == Some(b.id)
+        })
+        .await;
+    }
+    let node = a.cluster.get::<NodeSpec>(a.id).unwrap().unwrap();
+    assert!(node.spec.maintenance);
+}
+
+#[tokio::test]
+async fn drain_leaves_vms_on_local_pools() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    dir_pool(&a, "nas", true).await;
+    dir_pool(&a, "local", false).await;
+    let app = running_vm_on_pool(&a, &admin, "app", "nas", a.id).await;
+    let db = running_vm_on_pool(&a, &admin, "db", "local", a.id).await;
+
+    let task = admin.wait_task(&drain(&admin, "node1").await).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(
+        task["status"]["error"],
+        "1 VM(s) were not moved: db (disks on a local pool)"
+    );
+    assert_eq!(node_of(&a, app.id), Some(b.id));
+    // 옮기지 못한 VM은 A에서 계속 돈다.
+    let db = a.cluster.get::<VmSpec>(db.id).unwrap().unwrap();
+    assert_eq!(db.spec.node, Some(a.id));
+    assert_eq!(db.status.phase, VmPhase::Running);
+    assert_eq!(
+        runtime_status(&a, db.id).await,
+        Some(RuntimeStatus::Running)
+    );
+}
+
+/// 비우기를 시작할 때 이 노드로 들어오던 VM도 들어온 뒤 옮긴다. 성공하면 노드가 비어 있다.
+#[tokio::test]
+async fn drain_also_moves_a_vm_that_was_coming_in() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    dir_pool(&a, "nas", true).await;
+    let app = running_vm_on_pool(&a, &admin, "app", "nas", b.id).await;
+
+    b.hv.delay_migrations(Duration::from_millis(500));
+    let (status, migrate) = admin
+        .post("/vms/app/migrate", serde_json::json!({ "node": "node1" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{migrate}");
+    let task = drain(&admin, "node1").await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let migrate = admin.wait_task(&migrate).await;
+    assert_eq!(migrate["status"]["state"], "succeeded", "{migrate}");
+    // B → A로 들어온 뒤 비우기가 다시 B로 옮겼다.
+    let moved: Vec<Uuid> = a.hv.migrations().into_iter().map(|(id, _)| id).collect();
+    assert_eq!(moved, [app.id]);
+    assert_eq!(node_of(&a, app.id), Some(b.id));
+}
+
+/// 옮기는 동안 유지보수를 끝내면 그 마이그레이션이 끝난 뒤 멈춘다.
+#[tokio::test]
+async fn ending_maintenance_stops_the_drain() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    dir_pool(&a, "nas", true).await;
+    let app1 = running_vm_on_pool(&a, &admin, "app1", "nas", a.id).await;
+    let app2 = running_vm_on_pool(&a, &admin, "app2", "nas", a.id).await;
+
+    a.hv.delay_migrations(Duration::from_millis(500));
+    let task = drain(&admin, "node1").await;
+    wait_vm(&a, app1.id, "migrating", |v| {
+        v.status.phase == VmPhase::Migrating
+    })
+    .await;
+    let (status, node) = admin.get("/nodes/node1").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    let mut spec = node["spec"].clone();
+    spec["maintenance"] = serde_json::json!(false);
+    let (status, body) = admin
+        .put(
+            "/nodes/node1",
+            serde_json::json!({ "spec": spec }),
+            node["revision"].as_u64(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(task["status"]["error"], "drain stopped: maintenance ended");
+    assert_eq!(node_of(&a, app1.id), Some(b.id));
+    assert_eq!(node_of(&a, app2.id), Some(a.id));
 }
 
 /// `found`가 참이 될 때까지 `GET /audit?{query}`를 다시 부른다(쓰기 스레드와 복제를 기다린다).

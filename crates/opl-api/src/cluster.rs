@@ -405,6 +405,34 @@ pub(crate) fn require_current(cluster: &opl_cluster::Cluster) -> Result<(), ApiE
     upgrading(&mut old)
 }
 
+/// 기능 `feature`([`opl_types::node::FEATURES`])를 적지 않은 노드(위트니스 포함)가 남아 있으면 409
+/// `cluster_upgrading`으로 거절한다. 버전을 비교하지 않으므로 롤링 업그레이드 중(버전이 섞여도)
+/// 모든 노드가 그 기능을 알면 통과한다.
+pub(crate) fn require_feature(
+    cluster: &opl_cluster::Cluster,
+    feature: &str,
+) -> Result<(), ApiError> {
+    let mut old: Vec<String> = cluster
+        .list::<NodeSpec>()?
+        .1
+        .into_iter()
+        .filter(|n| !n.status.features.iter().any(|f| f == feature))
+        .map(|n| n.name)
+        .collect();
+    if old.is_empty() {
+        return Ok(());
+    }
+    old.sort();
+    Err(ApiError::conflict(
+        "cluster_upgrading",
+        format!(
+            "some nodes do not support {} yet ({}); upgrade them first",
+            feature.replace('-', " "),
+            old.join(", ")
+        ),
+    ))
+}
+
 /// 옛 노드 이름들(이름 순)로 `cluster_upgrading`을 만든다. 없으면 통과.
 fn upgrading(old: &mut [String]) -> Result<(), ApiError> {
     if old.is_empty() {

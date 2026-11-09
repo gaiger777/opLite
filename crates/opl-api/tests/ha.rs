@@ -85,6 +85,7 @@ async fn node_with(
         firewall: false,
         version: None,
         updates: None,
+        features: vec![],
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();

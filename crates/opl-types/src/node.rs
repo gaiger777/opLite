@@ -72,7 +72,15 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub updates: Option<NodeUpdates>,
+    /// 이 노드의 opld가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
+    /// 쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub features: Vec<String>,
 }
+
+/// 이 빌드가 아는 기능. 노드가 [`NodeStatus::features`]에 적는다.
+pub const FEATURES: &[&str] = &["node-drain"];
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -279,6 +287,19 @@ mod tests {
             json["updates"]["packages"][1],
             serde_json::json!({ "name": "libnew1", "current": null, "candidate": "1.0-1" })
         );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+    }
+
+    #[test]
+    fn status_features_round_trip_and_are_omitted_when_empty() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("features").is_none(), "{none}");
+        let status = NodeStatus {
+            features: FEATURES.iter().map(|f| f.to_string()).collect(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["features"], serde_json::json!(["node-drain"]));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
 

@@ -500,6 +500,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/nodes/{key}/drain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드를 유지보수로 바꾸고(이미면 그대로), 실행 중인 VM을 하나씩 다른 노드로 라이브 마이그레이션할
+         *     Task(`node-drain`, 그 노드에서 돈다)를 돌려준다(202). Task가 실패해도 노드는 유지보수로 남는다.
+         *     위트니스이거나 오프라인이면 409 `node_unavailable`, 그 노드의 비우기 Task가 끝나지 않았으면 409
+         *     `node_busy`, 비우기를 모르는 노드가 남았으면 409 `cluster_upgrading`.
+         */
+        post: operations["drain_node"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/nodes/{key}/updates/refresh": {
         parameters: {
             query?: never;
@@ -2425,6 +2447,11 @@ export interface components {
                      */
                     cpus: number;
                     /**
+                     * @description 이 노드의 opld가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
+                     *     쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
+                     */
+                    features?: string[];
+                    /**
                      * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
                      *     (위트니스는 늘 false).
                      */
@@ -2923,6 +2950,11 @@ export interface components {
              * @default 0
              */
             cpus: number;
+            /**
+             * @description 이 노드의 opld가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
+             *     쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
+             */
+            features?: string[];
             /**
              * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
              *     (위트니스는 늘 false).
@@ -3524,6 +3556,11 @@ export interface components {
                  * @default 0
                  */
                 cpus: number;
+                /**
+                 * @description 이 노드의 opld가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
+                 *     쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
+                 */
+                features?: string[];
                 /**
                  * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
                  *     (위트니스는 늘 false).
@@ -5546,6 +5583,36 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    drain_node: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
             };
             "4XX": {
                 headers: {

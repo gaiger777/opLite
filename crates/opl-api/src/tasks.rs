@@ -5,6 +5,7 @@
 
 pub(crate) mod backup;
 mod clone;
+mod drain;
 mod import;
 mod migrate;
 mod replicate;
@@ -40,6 +41,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::schedule::task_failed;
 use crate::snapshots::{uses_block_snapshots, vm_placement};
+use crate::state::AppState;
 use crate::updates::Updates;
 use crate::vm_imports::ImportCredentials;
 use crate::vms::is_stopped;
@@ -94,6 +96,9 @@ pub struct TaskRunnerConfig {
     pub import_credentials: Arc<ImportCredentials>,
     /// 이 노드의 업데이트 확인. 없으면(업데이트가 꺼진 노드) 업데이트 확인 Task는 실패한다.
     pub updates: Option<Arc<Updates>>,
+    /// 이 노드의 API 상태. 노드 비우기 Task가 마이그레이션 API와 같은 확인으로 Task를 만들 때 쓴다
+    /// (이 노드의 API와 `vm_lock`을 함께 쓴다). 없으면 비우기 Task는 실패한다.
+    pub api: Option<Arc<AppState>>,
 }
 
 impl TaskRunnerConfig {
@@ -113,6 +118,7 @@ impl TaskRunnerConfig {
             firmware: None,
             import_credentials: Arc::default(),
             updates: None,
+            api: None,
         }
     }
 }
@@ -529,6 +535,7 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// 선다(임시 스냅샷을 찍고 디스크를 읽는다). 백업 지우기와 복원은 그 백업의 줄에 서서 겹치지 않는다
 /// (복원 Task의 대상은 새 VM이다). 복제도 그 백업의 줄에 서서 보내는 동안 지우기가 파일을 지우지
 /// 않는다. VM 가져오기와 가져오기 지우기도 그 가져오기의 줄에 선다(가져오기 Task의 대상은 새 VM이다).
+/// 노드 비우기는 그 노드의 줄에 서서 한 노드를 한 번에 하나만 비운다.
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
     match task.spec.op {
@@ -545,10 +552,12 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
             task.spec.op,
             TaskOp::BackupDelete | TaskOp::BackupReplicate { .. } | TaskOp::VmImportDelete
         );
+        let node_queue = task.spec.op == TaskOp::NodeDrain;
         return (is_volume_op(&task.spec.op)
             || is_snapshot_op(&task.spec.op)
             || vm_queue
-            || backup_queue)
+            || backup_queue
+            || node_queue)
             .then_some(target);
     }
     let Ok(Some(volume)) = ctx.cluster.get::<VolumeSpec>(target) else {
@@ -610,7 +619,8 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
     // 시간 제한이 있고(`migration_timeout`, RPC 기한), 확정 쓰기 도중에 버리면 안 되므로 감싸지 않는다.
     // 백업과 복원, 복제, VM 가져오기는 디스크 크기만큼 오래 걸릴 수 있으므로 시간 제한을 두지 않는다
     // (설계 §2.3, 복제는 원격 클라이언트가 조각 사이 60초를 본다).
-    // 업그레이드도 오래 걸릴 수 있고 apt를 중간에 끊으면 더 나쁘다.
+    // 업그레이드도 오래 걸릴 수 있고 apt를 중간에 끊으면 더 나쁘다. 노드 비우기는 마이그레이션을 여럿
+    // 하므로 VM마다 기다리는 시간만 둔다(`migration_timeout`).
     let unlimited = matches!(
         task.spec.op,
         TaskOp::VmMigrate { .. }
@@ -619,6 +629,7 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             | TaskOp::BackupReplicate { .. }
             | TaskOp::VmImport { .. }
             | TaskOp::NodeUpgrade
+            | TaskOp::NodeDrain
     );
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
@@ -802,8 +813,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             }
             None => Err("updates are not enabled on this node".into()),
         },
-        // 아직 실행하지 않는다(만드는 API가 없다).
-        TaskOp::NodeDrain => Err("node drain is not implemented yet".into()),
+        TaskOp::NodeDrain => drain::drain(ctx, id).await,
     };
     done.map(|()| None)
 }

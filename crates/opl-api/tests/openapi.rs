@@ -28,6 +28,7 @@ async fn openapi_document_is_served_without_login() {
         "/telemetry/reset-id",
         "/nodes/{key}/updates/refresh",
         "/nodes/{key}/upgrade",
+        "/nodes/{key}/drain",
         "/vms",
         "/vms/{key}",
         "/vms/{key}/actions/{action}",

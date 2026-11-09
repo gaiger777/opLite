@@ -50,7 +50,8 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 다시 시작한 노드가 Node 리소스를 다시 기록하는 간격(과반수가 없으면 될 때까지)
 const REGISTER_RETRY: Duration = Duration::from_secs(2);
-/// 노드의 브리지 목록을 다시 확인하는 간격. 관리자가 브리지를 만들면 이만큼 뒤에 스케줄러가 안다.
+/// 노드의 브리지 목록과 기능 표시(위트니스는 기능 표시만)를 다시 확인하는 간격. 관리자가 브리지를 만들면
+/// 이만큼 뒤에 스케줄러가 알고, 옛 버전 리더가 지운 기능 표시는 이만큼 뒤에 되살아난다.
 const BRIDGE_REFRESH: Duration = Duration::from_secs(60);
 /// 다시 시작한 learner가 승격을 다시 요청하는 간격. 실패할 때마다 두 배로 늘려 최대 시간까지 둔다.
 const PROMOTE_RETRY_MIN: Duration = Duration::from_secs(5);
@@ -409,6 +410,9 @@ impl Member {
                     if let Err(e) = bootstrap::refresh_bridges(&cluster, &host).await {
                         tracing::warn!(error = %e, "cannot record bridges");
                     }
+                    if let Err(e) = bootstrap::refresh_features(&cluster).await {
+                        tracing::warn!(error = %e, "cannot record features");
+                    }
                 }
             })
         };
@@ -450,6 +454,9 @@ impl Member {
         runner_config.migration_timeout = config.migration.timeout;
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
+        // 노드 비우기 Task가 이 노드의 API와 같은 확인으로 마이그레이션 Task를 만든다.
+        let state = Arc::new(state);
+        runner_config.api = Some(state.clone());
         // 업데이트 확인은 주기 에이전트와 다시 확인 Task가 함께 쓴다(한 번에 하나만 돈다).
         let updates = config
             .updates
@@ -475,7 +482,6 @@ impl Member {
             "opld is ready"
         );
         let (stop, rx) = oneshot::channel::<()>();
-        let state = Arc::new(state);
         let schedule = SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config());
         let janitor = ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config());
         let backups = BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config());
@@ -578,6 +584,12 @@ impl Member {
                     while let Err(e) = bootstrap::register_witness(&cluster, &config).await {
                         tracing::warn!(error = %e, "cannot register this node; will retry");
                         tokio::time::sleep(REGISTER_RETRY).await;
+                    }
+                }
+                loop {
+                    tokio::time::sleep(BRIDGE_REFRESH).await;
+                    if let Err(e) = bootstrap::refresh_features(&cluster).await {
+                        tracing::warn!(error = %e, "cannot record features");
                     }
                 }
             })

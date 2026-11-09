@@ -28,7 +28,7 @@ use opl_driver::{
 use opl_reconciler::{Reconciler, ReconcilerConfig, ReconcilerHandle, RestartBackoff};
 use opl_types::auth::{Role, UserSpec};
 use opl_types::cluster::ClusterSpec;
-use opl_types::node::{NodeSpec, NodeStatus, PoolState};
+use opl_types::node::{FEATURES, NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
@@ -150,9 +150,11 @@ impl Env {
             firewall: false,
             version: None,
             updates: None,
+            features: vec![],
         };
         // 이 노드는 지금 빌드를 돌린다.
         me.status.version = Some(BUILD.into());
+        me.status.features = FEATURES.iter().map(|f| f.to_string()).collect();
         cluster.create(&me).await.unwrap();
         let admin = Resource::new(
             "admin",
@@ -176,17 +178,12 @@ impl Env {
         let storage: Arc<dyn Storage> = Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT));
         // opld처럼 API와 Task 실행기가 ESXi 자격 증명을 함께 쓴다.
         let credentials: Arc<ImportCredentials> = Arc::default();
-        let mut config = runner_config(node, dir.path());
-        config.import_credentials = credentials.clone();
-        let runner = TaskRunner::spawn(
+        let mut state = AppState::new(
             cluster.clone(),
-            storage,
+            node,
             hv_dyn.clone(),
-            reconciler.handle(),
-            config,
-        )
-        .await;
-        let mut state = AppState::new(cluster.clone(), node, hv_dyn, dir.path().join("uploads"));
+            dir.path().join("uploads"),
+        );
         state.import_credentials = credentials;
         // 감사 로그는 `{dir}/audit`에 적는다.
         state.audit = Arc::new(
@@ -199,6 +196,18 @@ impl Env {
             .unwrap(),
         );
         let state = Arc::new(state);
+        let mut config = runner_config(node, dir.path());
+        config.import_credentials = state.import_credentials.clone();
+        // opld처럼 노드 비우기 Task가 API 상태를 쓴다.
+        config.api = Some(state.clone());
+        let runner = TaskRunner::spawn(
+            cluster.clone(),
+            storage,
+            hv_dyn,
+            reconciler.handle(),
+            config,
+        )
+        .await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let app = opl_api::router(state.clone());
@@ -282,6 +291,7 @@ impl Env {
     ) {
         let mut config = runner_config(self.node, self.dir.path());
         config.import_credentials = self.state.import_credentials.clone();
+        config.api = Some(self.state.clone());
         tweak(&mut config);
         self.runner = Some(
             TaskRunner::spawn(

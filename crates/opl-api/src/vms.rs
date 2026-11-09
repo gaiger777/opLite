@@ -556,21 +556,31 @@ pub async fn migrate_vm(
     state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let target = lookup::<NodeSpec>(&state.cluster, &req.node)?;
-    let task = start_migration(&state, vm.id, target.id).await?;
+    let task = start_migration(&state, vm.id, target.id, None).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
 /// [`migrate_vm`]의 확인을 하고 VM `vm`을 노드 `target`으로 옮길 `VmMigrate` Task를 원본 노드에 만든다.
-/// 노드 비우기 Task도 쓴다. 오류는 [`migrate_vm`]과 같다.
+/// 노드 비우기 Task도 쓴다. 오류는 [`migrate_vm`]과 같다. `source`가 있으면(비우기) VM이 아직 그 노드에
+/// 있는지도 보고, 아니면 409 `vm_moved`다(이미 다른 데로 갔다).
 pub(crate) async fn start_migration(
     state: &AppState,
     vm: Uuid,
     target: Uuid,
+    source: Option<Uuid>,
 ) -> Result<Task, ApiError> {
     // 두 요청이 함께 검사를 지나 Task를 둘 만들지 않게 한다.
     let _lock = state.vm_lock.lock().await;
     let vm = lookup::<VmSpec>(&state.cluster, &vm.to_string())?;
     let target = lookup::<NodeSpec>(&state.cluster, &target.to_string())?;
+    if let Some(source) = source
+        && vm.spec.node != Some(source)
+    {
+        return Err(ApiError::conflict(
+            "vm_moved",
+            format!("VM {:?} is no longer on node {source}", vm.name),
+        ));
+    }
     if vm.spec.node == Some(target.id) {
         return Err(ApiError::bad_request(format!(
             "VM {:?} is already on node {:?}",

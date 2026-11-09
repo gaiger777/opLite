@@ -10,7 +10,7 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_peer::pki::ClusterCa;
 use opl_types::auth::{Role, UserSpec};
 use opl_types::cluster::ClusterSpec;
-use opl_types::node::{NodeSpec, NodeStatus};
+use opl_types::node::{FEATURES, NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::version::BUILD;
 use opl_types::vm::Arch;
@@ -166,10 +166,16 @@ async fn record_node(
                 .updates
                 .enabled()
                 .then(|| status.updates.take().unwrap_or_default()),
+            features: features(),
         };
         true
     })
     .await
+}
+
+/// 이 빌드가 아는 기능([`FEATURES`]). 위트니스도 적는다(새 기능의 API는 모든 노드를 본다).
+fn features() -> Vec<String> {
+    FEATURES.iter().map(|f| f.to_string()).collect()
 }
 
 /// 위트니스의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 아키텍처만 기록한다. VM을 돌리지
@@ -181,6 +187,7 @@ pub async fn register_witness(cluster: &Cluster, config: &Config) -> anyhow::Res
             online: true,
             arch: Some(Arch::native()),
             version: Some(BUILD.to_string()),
+            features: features(),
             ..NodeStatus::default()
         };
         true
@@ -200,6 +207,21 @@ pub async fn refresh_bridges(cluster: &Cluster, host: &Host) -> anyhow::Result<(
         }
         tracing::info!(?bridges, "bridges changed");
         status.bridges = bridges.clone();
+        true
+    })
+    .await
+}
+
+/// 기능 표시가 이 빌드의 목록과 다르면 고쳐 쓴다. 롤링 업그레이드 중 옛 버전 리더가 이 노드의 status를
+/// 다시 쓰면(모르는 `features`를 빼고) 지워지므로 주기적으로 되살린다. 같으면 쓰지 않는다.
+pub async fn refresh_features(cluster: &Cluster) -> anyhow::Result<()> {
+    let features = features();
+    update_node_status(cluster, |status| {
+        if status.features == features {
+            return false;
+        }
+        tracing::info!(?features, "restoring the recorded features");
+        status.features = features.clone();
         true
     })
     .await
@@ -434,7 +456,7 @@ pub(crate) mod tests {
         cluster.shutdown().await.unwrap();
     }
 
-    /// 등록할 때 이 빌드의 버전을 쓴다(옛 버전으로 적힌 값도 바꾼다).
+    /// 등록할 때 이 빌드의 버전과 기능을 쓴다(옛 버전으로 적힌 값도 바꾼다).
     #[tokio::test]
     async fn registration_records_the_build_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -450,16 +472,53 @@ pub(crate) mod tests {
                 .status
                 .version
         };
+        let features = || {
+            cluster
+                .get::<NodeSpec>(id.0)
+                .unwrap()
+                .unwrap()
+                .status
+                .features
+        };
         register_node(&cluster, &config, &host).await.unwrap();
         assert_eq!(version().as_deref(), Some(BUILD));
+        assert_eq!(features(), ["node-drain"]);
         update_node_status(&cluster, |status| {
             status.version = Some("0.0.1".into());
+            status.features.clear();
             true
         })
         .await
         .unwrap();
         register_node(&cluster, &config, &host).await.unwrap();
         assert_eq!(version().as_deref(), Some(BUILD));
+        assert_eq!(features(), ["node-drain"]);
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 옛 버전 리더가 status를 다시 쓰며 지운 기능 표시를 주기 갱신이 되살린다. 같으면 쓰지 않는다.
+    #[tokio::test]
+    async fn refresh_restores_features_erased_by_an_old_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        let node = || cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        register_node(&cluster, &config, &host).await.unwrap();
+        let revision = node().revision;
+        refresh_features(&cluster).await.unwrap();
+        assert_eq!(node().revision, revision);
+        // 옛 리더는 모르는 `features`를 빼고 status를 다시 쓴다.
+        update_node_status(&cluster, |status| {
+            status.features.clear();
+            true
+        })
+        .await
+        .unwrap();
+        assert!(node().status.features.is_empty());
+        refresh_features(&cluster).await.unwrap();
+        assert_eq!(node().status.features, ["node-drain"]);
         cluster.shutdown().await.unwrap();
     }
 
@@ -524,6 +583,7 @@ pub(crate) mod tests {
                 online: true,
                 arch: Some(Arch::native()),
                 version: Some(BUILD.to_string()),
+                features: vec!["node-drain".into()],
                 ..NodeStatus::default()
             }
         );

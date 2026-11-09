@@ -169,6 +169,7 @@ mod tests {
             firewall: false,
             version: None,
             updates: None,
+            features: vec![],
         };
         n
     }
