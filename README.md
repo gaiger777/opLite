@@ -2598,3 +2598,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 36: OIDC SSO](docs/superpowers/plans/2026-11-07-plan36-oidc-sso.md)
 - [계획 37: 원격 클러스터](docs/superpowers/plans/2026-11-08-plan37-remote-clusters.md)
 - [계획 38: 원격 복제(DR)](docs/superpowers/plans/2026-11-08-plan38-remote-replication.md)
+- [계획 39: 노드 유지보수·비우기](docs/superpowers/plans/2026-11-09-plan39-node-drain.md)

@@ -6183,3 +6183,27 @@ git commit -m "docs: 노드 유지보수와 비우기 — README 새 절 \"노�
 - 유지보수가 끝나도 VM을 되돌리지 않는다.
 - 이 기능이 처음 들어간 버전으로 올리는 동안은 비우기를 쓰지 못한다(`vm migrate`와 "유지보수 시작"으로).
 - 그 밖의 제한은 설계 문서 §6·§7과 README "노드 유지보수와 비우기" 절에 있다.
+
+## 실행 후 기록 (2026-11-09)
+
+- **Task 1~5:** `feat/plan39-drain`에서 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았다(생성 파일 제외). Task 3의 두 노드 비우기 E2E(`migration-it`, 실제 QEMU)도 이 Mac에서 통과했다.
+- **1차 리뷰에서 고친 것:**
+  - 새 Task 종류를 `require_current`로 막으면 롤링 업그레이드 중에 쓸 수 없어서, 노드가 지원하는 기능 목록(`NodeStatus.features`, `node-drain`)으로 바꿨다(옛 노드가 있으면 409 `cluster_upgrading`).
+  - 남은 VM이 있어도 성공하던 것을 고쳐, 노드가 비었을 때만 성공한다(들어오는 마이그레이션도 기다림, 비우기 중에 되돌아온 VM도 다시 봄).
+  - 대상 고르기: HVF 노드 빼기, 남은 메모리 ≥ VM 메모리, 남은 메모리가 많은 노드부터. 반복마다 유지보수 여부와 원본 노드를 다시 확인한다. 마이그레이션 기다림 제한은 `migration_timeout*2+60s`.
+  - oplctl 유지보수 끝 경고, 웹 확인 대화상자·HVF 노드 막기, 켜기 오류 메시지, 문서 보강.
+- **2차 리뷰에서 고친 것:** 옛 리더가 기능 목록을 지울 수 있어서 opld가 60초마다 `refresh_features`로 다시 씀(위트니스도), 사라진 VM은 3번까지 다시 보고 `busy`, oplctl이 Task 조회에 실패해도 경고만 하고 0으로 끝냄, 커밋 메시지·README 문구.
+- **불안정한 시험(부하 때, 다시 돌리면 통과):** opld `cluster.rs` a_witness_votes_but_never_leads_or_runs_vms·three_processes_form_a_cluster_that_survives_losing_a_node(Task 1), opld `smoke` 4개 "API did not start"(Task 2).
+
+**테스트:**
+- macOS `cargo test --workspace` 1540개(Task 3 이후)와 opld `migration-it` 3개
+- 웹 시험 555개와 `typecheck`·`lint`·`build`
+- `fmt`·`clippy -D warnings`(모든 기능)
+
+Linux CI(프로브)에서 같은 시험과 linux-kvm·ldap 작업이 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 하위 프로젝트 11(노드 유지보수·비우기)이 끝났다.
+- 다음 후보: 하위 프로젝트 12 증분 백업(QEMU dirty bitmap)과 증분 원격 복제, 하위 프로젝트 13 디스크까지 복사하는 마이그레이션(로컬 디스크 VM 옮기기).
+- 넣지 않은 것: 유지보수가 끝난 뒤 VM 되돌리기, 옮기지 못한 VM 끄기, 롤링 업그레이드 자동화, 동시 여러 마이그레이션.
