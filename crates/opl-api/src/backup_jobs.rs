@@ -7,7 +7,7 @@
 //! 두 스케줄러가 잠깐 겹치거나 상태 쓰기가 실패해도, 이번 실행이 이미 만든 VM의 백업은 다시 만들지 않고
 //! 받아들인다.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,14 +36,16 @@ use crate::backups::{
     check_backup, files_node, find_pool, now, start_backup, start_backup_delete,
     start_backup_replicate,
 };
-use crate::cluster::require_current;
+use crate::cluster::{require_current, require_feature};
 use crate::error::{ApiError, Json};
 use crate::resources::{CreateRequest, check_name, if_match, lookup};
 use crate::state::AppState;
 
 /// 스펙 검증과 풀 검사: 풀이 있고 백업 풀이어야 한다(400). 요일은 주의 순서로 정리한다. 원격 복제를
 /// 켠 작업은 옛 노드가 풀지 못하므로 모든 노드가 이 빌드일 때만 쓰고(409 `cluster_upgrading`), 원격은
-/// 등록돼 있어야 한다(400). 원격의 풀은 보낼 때 원격이 확인한다.
+/// 등록돼 있어야 한다(400). 원격의 풀은 보낼 때 원격이 확인한다. `full_every`(증분 백업)는 모든 노드가
+/// 증분 백업을 알 때만 쓰고(409 `cluster_upgrading`), 증분 백업은 아직 복제하지 않으므로 `replicate`와
+/// 함께 쓰지 못한다(400).
 fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError> {
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -57,6 +59,14 @@ fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError
             "storage pool {:?} does not store backups; turn on its backups setting",
             pool.name
         )));
+    }
+    if spec.full_every > 0 {
+        if spec.replicate.is_some() {
+            return Err(ApiError::bad_request(
+                "replicating incremental backups is not supported yet",
+            ));
+        }
+        require_feature(&state.cluster, "incremental-backup")?;
     }
     if let Some(target) = &spec.replicate {
         require_current(&state.cluster)?;
@@ -117,6 +127,10 @@ pub struct BackupJobPatch {
     #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<ReplicateTarget>, nullable, default)]
     pub replicate: Option<Option<ReplicateTarget>>,
+    /// 전체 백업 사이에 둘 증분 백업 수. 0이면 늘 전체다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub full_every: Option<u32>,
 }
 
 /// 적은 값은 `null`이어도 `Some`이다(적지 않으면 `serde(default)`의 `None`).
@@ -150,9 +164,10 @@ pub async fn patch_backup_job(
         && req.keep.is_none()
         && req.enabled.is_none()
         && req.replicate.is_none()
+        && req.full_every.is_none()
     {
         return Err(ApiError::bad_request(
-            "give vms, pool, schedule, keep, enabled or replicate",
+            "give vms, pool, schedule, keep, enabled, replicate or full_every",
         ));
     }
     let expected = if_match(&headers)?;
@@ -185,6 +200,9 @@ pub async fn patch_backup_job(
         }
         if let Some(replicate) = &req.replicate {
             spec.replicate = replicate.clone();
+        }
+        if let Some(full_every) = req.full_every {
+            spec.full_every = full_every;
         }
         check_spec(&state, &mut spec)?;
         if spec == job.spec {
@@ -614,9 +632,9 @@ async fn replicate(
     Ok(())
 }
 
-/// 작업 `job`의 백업 가운데 원격 `target`으로 보낼 것(만든 순서): `ready`이고, 보존 규칙이 지울 것이
-/// 아니고([`retention`] — 지우기와 겹치지 않게), 그 사본 기록이 없거나 기록이 마지막 실행을 시작하기 전의
-/// 것이다. 그래서 실패한(또는 복제 Task 없이 copying으로 남은) 사본은 실행마다 한 번 더 보내고, ready
+/// 작업 `job`의 백업 가운데 원격 `target`으로 보낼 것(만든 순서): `ready`이고, 증분 백업이 아니고(아직
+/// 보내지 않는다), 보존 규칙이 지울 것이 아니고([`retention`] — 지우기와 겹치지 않게), 그 사본 기록이
+/// 없거나 기록이 마지막 실행을 시작하기 전의 것이다. 그래서 실패한(또는 복제 Task 없이 copying으로 남은) 사본은 실행마다 한 번 더 보내고, ready
 /// 사본도 실행마다 한 번 원격에 있는지 확인한다(복제 Task가 원격에 물어 같은 파일이 있으면 기록 시각만
 /// 고치고, 원격에서 지웠으면 다시 보낸다). 같은 원격으로 복제하는 Task가 끝나지 않은 백업은 뺀다.
 fn to_replicate<'a>(
@@ -643,6 +661,8 @@ fn to_replicate<'a>(
     let mut out: Vec<&Backup> = backups
         .iter()
         .filter(|b| b.spec.job == Some(job.id) && b.status.phase == BackupPhase::Ready)
+        // 증분 백업은 아직 보내지 않는다(작업에 `full_every`가 있던 때의 백업).
+        .filter(|b| b.status.parent.is_none())
         .filter(|b| !pruned.contains(&b.id))
         .filter(|b| !replicating(b))
         .filter(|b| {
@@ -727,7 +747,20 @@ async fn dispatch(
         return Ok(Dispatch::Wait);
     }
     let name = backup_name(&vm.name, now(), &backups);
-    match start_backup(state, &vm, &pool, node, name, Some(job.id), false).await {
+    // `full_every`가 있으면 할 수 있을 때 증분으로, 체인의 증분이 그만큼 쌓이면 전체로 한다.
+    let full_every = Some(job.spec.full_every).filter(|n| *n > 0);
+    let started = start_backup(
+        state,
+        &vm,
+        &pool,
+        node,
+        name,
+        Some(job.id),
+        full_every.is_some(),
+        full_every,
+    )
+    .await;
+    match started {
         Ok(task) => match task.spec.op {
             TaskOp::VmBackup { backup } => Ok(Dispatch::Started(backup)),
             _ => unreachable!("start_backup makes a backup task"),
@@ -860,7 +893,9 @@ fn finish(
 
 /// 작업 `job`의 백업 가운데 지울 것: VM마다 `ready` 백업은 보존 규칙(`prune`)에 맞지 않는 것,
 /// `failed` 백업은 같은 VM의 더 새(id가 큰) `ready` 백업이 있는 것. 다른 작업과 손으로 만든 백업은
-/// 건드리지 않는다.
+/// 건드리지 않는다. 남는 백업(`failed`가 아닌 것, 다른 작업·손으로 만든 것도)의 조상은 그 증분 백업을
+/// 되살리는 데 필요하므로 남기고, 지울 증분 백업은 그 부모보다 먼저 둔다(자식이 있는 부모는 지울 수
+/// 없다, 증분 백업 설계 §3.7).
 fn retention(job: Uuid, keep: &Keep, backups: &[Backup]) -> Vec<Uuid> {
     let mut by_vm: BTreeMap<Uuid, Vec<&Backup>> = BTreeMap::new();
     for b in backups.iter().filter(|b| b.spec.job == Some(job)) {
@@ -882,6 +917,37 @@ fn retention(job: Uuid, keep: &Keep, backups: &[Backup]) -> Vec<Uuid> {
             );
         }
     }
+    let parent_of = |id: Uuid| {
+        backups
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(|b| b.status.parent)
+    };
+    let mut ancestors = HashSet::new();
+    for b in backups
+        .iter()
+        .filter(|b| b.status.phase != BackupPhase::Failed && !out.contains(&b.id))
+    {
+        let mut parent = b.status.parent;
+        while let Some(id) = parent
+            && ancestors.insert(id)
+        {
+            parent = parent_of(id);
+        }
+    }
+    out.retain(|id| !ancestors.contains(id));
+    // 자식부터: 조상이 많은 것이 먼저다.
+    let depth = |id: Uuid| {
+        let mut seen = HashSet::from([id]);
+        let mut parent = parent_of(id);
+        while let Some(p) = parent
+            && seen.insert(p)
+        {
+            parent = parent_of(p);
+        }
+        seen.len()
+    };
+    out.sort_by_key(|id| std::cmp::Reverse(depth(*id)));
     out
 }
 
@@ -937,6 +1003,7 @@ mod tests {
                 job,
                 origin: None,
                 incremental: false,
+                max_chain: None,
             },
         );
         b.status = BackupStatus {
@@ -1094,6 +1161,7 @@ mod tests {
                 keep: Keep::default(),
                 enabled: true,
                 replicate: None,
+                full_every: 0,
             },
         );
         job.status = running(vec![a, b], vec![], vec![]);
@@ -1126,6 +1194,7 @@ mod tests {
                 keep: Keep::default(),
                 enabled: true,
                 replicate: None,
+                full_every: 0,
             },
         );
         // 실행은 NOW - 60에 시작했다.
@@ -1182,6 +1251,7 @@ mod tests {
                 keep: Keep::default(),
                 enabled: true,
                 replicate: None,
+                full_every: 0,
             },
         );
         let target = ReplicateTarget {
@@ -1354,5 +1424,90 @@ mod tests {
         assert_eq!(retention(job, &Keep::default(), &all), [web_failed_old.id]);
         // 성공이 없으면 실패는 남는다.
         assert!(retention(job, &keep, &[web_failed_old, web_failed_new]).is_empty());
+    }
+
+    /// 백업 작업 `job`의 백업 `n`(id가 만든 순서). `parent`가 있으면 그 증분이다.
+    fn link(name: &str, vm: Uuid, job: Option<Uuid>, n: u128, parent: Option<u128>) -> Backup {
+        let mut b = backup(
+            name,
+            vm,
+            job,
+            BackupPhase::Ready,
+            Some(NOW - DAY + n as u64),
+        );
+        b.id = Uuid::from_u128(n);
+        b.status.parent = parent.map(Uuid::from_u128);
+        b
+    }
+
+    #[test]
+    fn retention_keeps_ancestors_of_what_stays_and_deletes_children_first() {
+        let job = Uuid::now_v7();
+        let web = Uuid::now_v7();
+        let keep = Keep {
+            last: 1,
+            ..Keep::default()
+        };
+        let id = Uuid::from_u128;
+        // 체인 둘: 1 ← 2 ← 3, 4 ← 5. 마지막 하나(5)를 남기면 그 부모 4도 남는다.
+        let mut all = vec![
+            link("f1", web, Some(job), 1, None),
+            link("i2", web, Some(job), 2, Some(1)),
+            link("i3", web, Some(job), 3, Some(2)),
+            link("f4", web, Some(job), 4, None),
+            link("i5", web, Some(job), 5, Some(4)),
+        ];
+        assert_eq!(retention(job, &keep, &all), [id(3), id(2), id(1)]);
+
+        // 손으로 만든 증분(작업이 지우지 않는다)이 2에 붙어 있으면 2와 그 조상은 남는다.
+        all.push(link("m6", web, None, 6, Some(2)));
+        assert_eq!(retention(job, &keep, &all), [id(3)]);
+        // 만드는 중인 증분도 부모를 지킨다. 실패한 증분은 지키지 않는다.
+        all.pop();
+        let mut pending = link("p7", web, Some(job), 7, Some(3));
+        pending.status.phase = BackupPhase::Pending;
+        pending.status.created_at = None;
+        all.push(pending);
+        assert!(retention(job, &keep, &all).is_empty());
+        all.pop();
+        let mut failed = link("x8", web, Some(job), 8, Some(3));
+        failed.status.phase = BackupPhase::Failed;
+        failed.status.created_at = None;
+        all.push(failed);
+        assert_eq!(retention(job, &keep, &all), [id(3), id(2), id(1)]);
+    }
+
+    #[test]
+    fn incremental_backups_are_not_replicated() {
+        let vm = Uuid::now_v7();
+        let mut job: BackupJob = Resource::new(
+            "nightly",
+            BackupJobSpec {
+                vms: VmSelector::All,
+                pool: "bk".into(),
+                schedule: JobSchedule {
+                    at: "03:00".into(),
+                    days: vec![],
+                },
+                keep: Keep::default(),
+                enabled: true,
+                replicate: None,
+                full_every: 0,
+            },
+        );
+        job.status = running(vec![], vec![], vec![]);
+        let target = ReplicateTarget {
+            remote: "dr".into(),
+            pool: "far".into(),
+        };
+        let all = [
+            link("f1", vm, Some(job.id), 1, None),
+            link("i2", vm, Some(job.id), 2, Some(1)),
+        ];
+        let ids: Vec<Uuid> = to_replicate(&job, &target, &all, &[])
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, [Uuid::from_u128(1)]);
     }
 }

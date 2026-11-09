@@ -253,7 +253,8 @@ export interface paths {
          *     지우는 Task가 끝나지 않았으면 409 `backup_busy`. Task는 파일이 있는 노드(공유가 아닌 풀은 파일을
          *     쓴 노드, 공유 풀은 백업 풀을 쓸 수 있는 노드)에서 돈다. 풀이 없어졌으면 이 노드의 Task가 리소스만
          *     지운다. 파일을 지울 노드가 없으면 409(`node_offline`, `pool_unavailable` 등)이고, `force`면 리소스만
-         *     바로 지우고 200이다(파일은 백업 풀에 남는다).
+         *     바로 지우고 200이다(파일은 백업 풀에 남는다). 증분 백업(`failed`가 아닌 것)의 부모는 `force`여도 409
+         *     `backup_in_use`다(자식부터 지운다).
          */
         delete: operations["delete_backup"];
         options?: never;
@@ -298,7 +299,7 @@ export interface paths {
          *     `status.replicas`에 결과를 적는다. 원격 쪽 권한은 원격 토큰 주인의 역할이다(백업 쓰기, operator
          *     이상). 원격이 없으면 404, 백업이 준비되지 않았으면 409 `backup_not_ready`, 지우는 중이거나 같은 원격으로
          *     복제하는 Task가 끝나지 않았으면 409 `backup_busy`, 파일을 읽을 노드가 없으면 409(`node_offline`,
-         *     `pool_unavailable` 등), 옛 노드가 있으면 409 `cluster_upgrading`.
+         *     `pool_unavailable` 등), 옛 노드가 있으면 409 `cluster_upgrading`. 증분 백업은 아직 보내지 않는다(400).
          */
         post: operations["replicate_backup"];
         delete?: never;
@@ -347,7 +348,8 @@ export interface paths {
          *     `backup_not_ready`, 지우는 중이면 409 `backup_busy`, 이름이 겹치면 409 `name_taken`. 노드는 `node`나
          *     백업 풀과 대상 풀을 함께 쓸 수 있는 온라인 노드 가운데 이름이 가장 앞선 노드다(없으면 409 `no_node`).
          *     공유가 아닌 풀의 백업은 파일을 쓴 노드(`status.node`)에서만 되살린다: `node`가 다르면 409
-         *     `backup_on_other_node`. 고른 노드가 오프라인이면 409 `node_offline`.
+         *     `backup_on_other_node`. 고른 노드가 오프라인이면 409 `node_offline`. 증분 백업은 고른 노드가 증분 백업을
+         *     알아야 한다(버전 2 매니페스트, 409 `cluster_upgrading`).
          */
         post: operations["restore_backup"];
         delete?: never;
@@ -1568,6 +1570,11 @@ export interface components {
         /** @description 백업 작업에서 바꿀 값. 주어진 필드만 바꾼다. */
         BackupJobPatch: {
             enabled?: boolean;
+            /**
+             * Format: int32
+             * @description 전체 백업 사이에 둘 증분 백업 수. 0이면 늘 전체다.
+             */
+            full_every?: number;
             /** @description 보존 규칙 전체를 이것으로 바꾼다(적지 않은 단위는 0). */
             keep?: components["schemas"]["Keep"];
             pool?: string;
@@ -1581,6 +1588,12 @@ export interface components {
              * @default true
              */
             enabled: boolean;
+            /**
+             * Format: int32
+             * @description 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
+             *     0이면 늘 전체다(뺀다).
+             */
+            full_every?: number;
             /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
             keep?: components["schemas"]["Keep"];
             /** @description 백업 풀 이름 */
@@ -1685,6 +1698,12 @@ export interface components {
              * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
              */
             job?: string | null;
+            /**
+             * Format: int32
+             * @description 증분 체인에 둘 증분 백업 수의 한도(백업 작업의 `full_every`). 부모의 체인에 이미 이만큼 증분이
+             *     있으면 전체로 한다. 없으면 한도가 없다(손으로 만든 백업).
+             */
+            max_chain?: number;
             /** @description 다른 클러스터에서 받은 사본이면 그 원본. 이 클러스터에서 만든 백업이면 없다. */
             origin?: components["schemas"]["BackupOrigin"];
             /** @description 백업 풀 이름 */
@@ -1803,6 +1822,12 @@ export interface components {
                  * @default true
                  */
                 enabled: boolean;
+                /**
+                 * Format: int32
+                 * @description 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
+                 *     0이면 늘 전체다(뺀다).
+                 */
+                full_every?: number;
                 /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
                 keep?: components["schemas"]["Keep"];
                 /** @description 백업 풀 이름 */
@@ -2294,6 +2319,12 @@ export interface components {
                      * @default true
                      */
                     enabled: boolean;
+                    /**
+                     * Format: int32
+                     * @description 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
+                     *     0이면 늘 전체다(뺀다).
+                     */
+                    full_every?: number;
                     /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
                     keep?: components["schemas"]["Keep"];
                     /** @description 백업 풀 이름 */
@@ -2350,6 +2381,12 @@ export interface components {
                      * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
                      */
                     job?: string | null;
+                    /**
+                     * Format: int32
+                     * @description 증분 체인에 둘 증분 백업 수의 한도(백업 작업의 `full_every`). 부모의 체인에 이미 이만큼 증분이
+                     *     있으면 전체로 한다. 없으면 한도가 없다(손으로 만든 백업).
+                     */
+                    max_chain?: number;
                     /** @description 다른 클러스터에서 받은 사본이면 그 원본. 이 클러스터에서 만든 백업이면 없다. */
                     origin?: components["schemas"]["BackupOrigin"];
                     /** @description 백업 풀 이름 */
@@ -3428,6 +3465,12 @@ export interface components {
                  * @default true
                  */
                 enabled: boolean;
+                /**
+                 * Format: int32
+                 * @description 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
+                 *     0이면 늘 전체다(뺀다).
+                 */
+                full_every?: number;
                 /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
                 keep?: components["schemas"]["Keep"];
                 /** @description 백업 풀 이름 */
@@ -3480,6 +3523,12 @@ export interface components {
                  * @description 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
                  */
                 job?: string | null;
+                /**
+                 * Format: int32
+                 * @description 증분 체인에 둘 증분 백업 수의 한도(백업 작업의 `full_every`). 부모의 체인에 이미 이만큼 증분이
+                 *     있으면 전체로 한다. 없으면 한도가 없다(손으로 만든 백업).
+                 */
+                max_chain?: number;
                 /** @description 다른 클러스터에서 받은 사본이면 그 원본. 이 클러스터에서 만든 백업이면 없다. */
                 origin?: components["schemas"]["BackupOrigin"];
                 /** @description 백업 풀 이름 */

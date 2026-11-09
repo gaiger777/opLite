@@ -30,6 +30,7 @@ use super::snapshot::{
     remove_tags, take_tags,
 };
 use super::{Ctx, mark_ready};
+use crate::backups::parent_in_use;
 
 /// 백업 디렉터리 안의 UEFI 변수 파일 이름
 pub(crate) const VARS_FILE: &str = "vars.fd";
@@ -213,8 +214,8 @@ async fn choose_parent(
         .cluster
         .list::<BackupSpec>()
         .map_err(|e| e.to_string())?;
-    let earlier: Vec<Backup> = backups
-        .into_iter()
+    let earlier: Vec<&Backup> = backups
+        .iter()
         .filter(|b| {
             b.id != backup.id
                 && b.spec.vm == vm.id
@@ -258,7 +259,8 @@ async fn choose_parent(
     }
     let parent = name
         .filter(|_| same)
-        .and_then(|name| earlier.into_iter().find(|b| bitmap_name(b.id) == name));
+        .and_then(|name| earlier.into_iter().find(|b| bitmap_name(b.id) == name))
+        .cloned();
     let Some(parent) = parent else {
         return Ok(Err(format!(
             "dirty bitmaps do not match a ready backup in pool {pool:?}"
@@ -300,10 +302,35 @@ async fn choose_parent(
     if volumes(&parent.spec.vm_spec) != volumes(&vm.spec) || parent_sizes != sizes {
         return Ok(Err(format!("disks changed since backup {:?}", parent.name)));
     }
+    // 체인의 증분이 한도(백업 작업의 `full_every`)만큼 쌓였으면 새 체인을 시작한다.
+    if let Some(max) = backup.spec.max_chain {
+        let n = increments(&parent, &backups);
+        if n >= max {
+            return Ok(Err(format!("chain already has {n} incremental backup(s)")));
+        }
+    }
     Ok(Ok(Parent {
         backup: parent,
         sizes,
     }))
+}
+
+/// `backup`에서 부모를 거슬러 전체 백업까지 센 증분 백업 수(`backup`이 증분이면 그것도 센다). 없어진
+/// 부모에서 멈춘다.
+fn increments(backup: &Backup, backups: &[Backup]) -> u32 {
+    let mut n = 0;
+    let mut seen = HashSet::new();
+    let mut parent = backup.status.parent;
+    while let Some(id) = parent
+        && seen.insert(id)
+    {
+        n += 1;
+        parent = backups
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(|b| b.status.parent);
+    }
+    n
 }
 
 /// 실패한 전체 백업이 실행 중인 VM에 만든 비트맵 `new`를 지운다. 앞 백업의 비트맵(모든 디스크에 같은
@@ -335,14 +362,14 @@ async fn drop_new_bitmap(ctx: &Ctx, vm: Uuid, new: &str) {
 }
 
 /// 전체 백업: 디스크마다 지금(실행 중이면 임시 스냅샷) 내용을 `{dir}/disk{i}.qcow2`로 내보내고 UEFI
-/// 변수를 `vars`로 복사한다. 실행 중이면 임시 스냅샷과 같은 시점에 비트맵 `bitmap`을 만들고, 꺼진 VM은
-/// 내보낸 뒤 qcow2 디스크에 비트맵을 둔다(설계 §3.1). 담은 디스크와 그 시각을 돌려준다.
+/// 변수를 `vars`로 복사한다. `bitmap`을 주면 실행 중일 때 임시 스냅샷과 같은 시점에 그 비트맵을 만들고,
+/// 꺼진 VM은 내보낸 뒤 qcow2 디스크에 비트맵을 둔다(설계 §3.1). 담은 디스크와 그 시각을 돌려준다.
 async fn full_disks(
     ctx: &Ctx,
     vm: &Vm,
     disks: &[(Volume, StoragePool)],
     id: Uuid,
-    bitmap: &str,
+    bitmap: Option<&str>,
     dir: &Path,
     vars: &Path,
 ) -> Result<(Vec<BackupDisk>, u64), String> {
@@ -352,7 +379,7 @@ async fn full_disks(
     // 실행 중이면 디스크를 임시 스냅샷으로 얼리고 그때의 UEFI 변수를 복사한다.
     let tagged = running && !disks.is_empty();
     let resumed = if tagged {
-        take_tags(ctx, vm, disks, id, &tag, false, Some(bitmap), || {
+        take_tags(ctx, vm, disks, id, &tag, false, bitmap, || {
             copy_vars(ctx, vm, vars)
         })
         .await?
@@ -390,7 +417,7 @@ async fn full_disks(
     let exported = exported?;
     // 꺼진 VM은 잠금을 쥐고 있어 내보낸 내용이 지금 디스크와 같다. 비트맵을 두지 못하면 다음 증분이
     // 전체가 될 뿐이다.
-    if !running {
+    if let Some(bitmap) = bitmap.filter(|_| !running) {
         for (volume, pool) in disks {
             if let Err(e) = ctx
                 .storage
@@ -522,7 +549,19 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             .map_err(|e| e.to_string())?;
     }
 
-    let plan = if backup.spec.incremental {
+    // 비트맵은 클러스터의 모든 노드가 증분 백업을 알 때만 만든다. 옛 노드는 스냅샷을 되돌리기 전에
+    // 비트맵을 지우지 못해 되돌리기가 깨진다.
+    let bitmaps = crate::cluster::missing_feature(&ctx.cluster, "incremental-backup")
+        .map_err(|e| e.to_string())?
+        .is_empty();
+    let plan = if !bitmaps {
+        Plan::Full(
+            backup
+                .spec
+                .incremental
+                .then(|| "some nodes do not support incremental backups yet".to_string()),
+        )
+    } else if backup.spec.incremental {
         match choose_parent(ctx, &backup, &vm, &disks).await? {
             Ok(parent) => Plan::Incremental(Box::new(parent)),
             Err(reason) => Plan::Full(Some(reason)),
@@ -566,7 +605,7 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
     let bitmap = bitmap_name(id);
     // 실행 중인 VM의 전체 백업은 임시 스냅샷과 함께 새 비트맵을 만든다. 끝나면 다른 비트맵을 지우고,
     // 실패하면 새 비트맵만 지운다.
-    let live_bitmap = running && !disks.is_empty() && matches!(plan, Plan::Full(_));
+    let live_bitmap = bitmaps && running && !disks.is_empty() && matches!(plan, Plan::Full(_));
     let made = async {
         let dir = backup_dir(&root, id);
         tokio::fs::create_dir_all(&dir)
@@ -581,7 +620,10 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
         let vars = dir.join(VARS_FILE);
         let (disks, created_at) = match &plan {
             Plan::Incremental(p) => incremental_disks(ctx, &vm, p, &bitmap, &dir, &vars).await?,
-            Plan::Full(_) => full_disks(ctx, &vm, &disks, id, &bitmap, &dir, &vars).await?,
+            Plan::Full(_) => {
+                let bitmap = bitmaps.then_some(bitmap.as_str());
+                full_disks(ctx, &vm, &disks, id, bitmap, &dir, &vars).await?
+            }
         };
         let uefi_vars = tokio::fs::try_exists(&vars).await.unwrap_or(false);
         if uefi_vars {
@@ -721,8 +763,9 @@ pub(super) async fn discard(ctx: &Ctx, task: &Task, id: Uuid, error: &str, unfin
 /// 백업 파일(디렉터리)과 리소스를 지운다. 디렉터리가 이미 없어도 성공이므로 중간에 멈춰도 다시 하면 된다.
 /// 다만 공유가 아닌 풀에서 다른 노드가 쓴 백업(`status.node`)은 여기에 없는 것이 당연하므로 실패다.
 /// 풀이 없어졌으면 파일도 함께 없어진 것으로 보고 리소스만 지운다. 이 백업을 되살리는 Task가 끝나지
-/// 않았으면(다른 노드에서 돌 수 있다) 실패다. 파일을 지운 뒤 리소스보다 먼저 원격 사본을 지우고(엔터프라이즈
-/// 설계 §6.2), 지우지 못한 사본이 있어도 원본은 지우고 그 경고를 돌려준다.
+/// 않았으면(다른 노드에서 돌 수 있다) 실패다. 증분 백업(`failed`가 아닌 것)의 부모여도 실패다(자식부터
+/// 지운다). 파일을 지운 뒤 리소스보다 먼저 원격 사본을 지우고(엔터프라이즈 설계 §6.2), 지우지 못한
+/// 사본이 있어도 원본은 지우고 그 경고를 돌려준다.
 pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<Option<String>, String> {
     use opl_types::task::{TaskOp, TaskSpec};
     let Some(backup) = get_backup(ctx, id)? else {
@@ -734,6 +777,13 @@ pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<Option<String>, String
             && matches!(t.spec.op, TaskOp::BackupRestore { backup, .. } if backup == id)
     }) {
         return Err("backup is being restored".into());
+    }
+    let (_, backups) = ctx
+        .cluster
+        .list::<BackupSpec>()
+        .map_err(|e| e.to_string())?;
+    if let Some(e) = parent_in_use(&backups, &backup) {
+        return Err(e);
     }
     let pool = ctx
         .cluster
@@ -773,7 +823,8 @@ pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<Option<String>, String
     }))
 }
 
-/// 백업 디렉터리의 매니페스트를 읽는다. 형식 버전이 다르면 나머지를 읽지 않고 오류다.
+/// 백업 디렉터리의 매니페스트를 읽는다. 형식 버전이 1(전체)이나 2(증분)가 아니면 나머지를 읽지 않고
+/// 오류다.
 pub(super) async fn read_manifest(dir: &Path) -> Result<BackupManifest, String> {
     let text = tokio::fs::read(dir.join(MANIFEST_FILE))
         .await
@@ -781,13 +832,77 @@ pub(super) async fn read_manifest(dir: &Path) -> Result<BackupManifest, String> 
     let value: serde_json::Value =
         serde_json::from_slice(&text).map_err(|e| format!("invalid backup manifest: {e}"))?;
     let version = value.get("version").and_then(|v| v.as_u64());
-    if version != Some(MANIFEST_VERSION.into()) {
+    if ![MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL]
+        .iter()
+        .any(|v| version == Some(u64::from(*v)))
+    {
         let version = version.map_or("unknown".into(), |v| v.to_string());
         return Err(format!(
-            "backup manifest version {version} is not supported (this node reads version {MANIFEST_VERSION})"
+            "backup manifest version {version} is not supported (this node reads versions {MANIFEST_VERSION} and {MANIFEST_VERSION_INCREMENTAL})"
         ));
     }
     serde_json::from_value(value).map_err(|e| format!("invalid backup manifest: {e}"))
+}
+
+/// 증분 백업 `backup`(매니페스트 `manifest`)의 조상을 부모부터 전체 백업까지 읽는다: 백업 풀 루트
+/// `root` 안의 디렉터리와 매니페스트. 조상은 모두 같은 풀에 `ready`로 있고 이 노드에서 읽을 수 있으며,
+/// 매니페스트가 그 기록과 맞고, 디스크 수와 가상 크기가 `backup`과 같아야 한다. 아니면 "backup chain is
+/// broken: …"이다. 전체 백업이면 비어 있다.
+async fn read_chain(
+    ctx: &Ctx,
+    backup: &Backup,
+    root: &Path,
+    manifest: &BackupManifest,
+) -> Result<Vec<(PathBuf, BackupManifest)>, String> {
+    let broken = |e: String| format!("backup chain is broken: {e}");
+    let sizes =
+        |m: &BackupManifest| -> Vec<u64> { m.disks.iter().map(|d| d.virtual_bytes).collect() };
+    let mut out = Vec::new();
+    let mut seen = HashSet::from([backup.id]);
+    let mut child = backup.name.clone();
+    let mut parent = backup.status.parent;
+    while let Some(id) = parent {
+        if !seen.insert(id) {
+            return Err(broken(format!("backup {child:?} is its own ancestor")));
+        }
+        let b = get_backup(ctx, id)?
+            .ok_or_else(|| broken(format!("the parent of backup {child:?} was deleted")))?;
+        if b.spec.pool != backup.spec.pool {
+            return Err(broken(format!(
+                "backup {:?} is in another storage pool",
+                b.name
+            )));
+        }
+        if b.status.phase != BackupPhase::Ready {
+            return Err(broken(format!("backup {:?} is not ready", b.name)));
+        }
+        if let Some(node) = b.status.node.filter(|n| *n != ctx.config.node) {
+            return Err(broken(format!(
+                "backup {:?} is stored on node {node}",
+                b.name
+            )));
+        }
+        let dir = backup_dir(root, id);
+        let m = read_manifest(&dir)
+            .await
+            .map_err(|e| broken(format!("backup {:?}: {e}", b.name)))?;
+        if m.backup != id || m.parent != b.status.parent {
+            return Err(broken(format!(
+                "the manifest of backup {:?} does not match its record",
+                b.name
+            )));
+        }
+        if sizes(&m) != sizes(manifest) {
+            return Err(broken(format!(
+                "the disks of backup {:?} do not match backup {:?}",
+                b.name, backup.name
+            )));
+        }
+        parent = b.status.parent;
+        child = b.name;
+        out.push((dir, m));
+    }
+    Ok(out)
 }
 
 /// 백업 디렉터리 `dir` 안의 일반 파일 `file`의 경로. 심볼릭 링크(디렉터리 밖을 가리킬 수 있다)나 다른
@@ -805,7 +920,9 @@ async fn regular_file(dir: &Path, file: &str) -> Result<PathBuf, String> {
 /// 풀 `pool`에 새 볼륨 `{name}-disk{i}`를 만들어 백업 파일을 쓰고(블록 풀이면 raw, 아니면 qcow2),
 /// UEFI 변수를 복사한 뒤 백업 리소스에 적힌 VM 스펙으로 꺼진 VM을 만든다(새 MAC, 노드·예약·HA 없음).
 /// 매니페스트는 그 기록과 같아야 한다. 공유가 아닌 풀의 백업은 파일을 쓴 노드에서만 되살린다.
-/// 실패하면 실행기의 정리(복제와 같은 [`super::clone::discard`])가 만든 볼륨과 변수 사본을 지운다.
+/// 증분 백업은 부모를 거슬러 전체 백업까지의 체인([`read_chain`])을 디스크마다 한 이미지로 연다(증분
+/// 백업 설계 §3.6). 실패하면 실행기의 정리(복제와 같은 [`super::clone::discard`])가 만든 볼륨과 변수
+/// 사본을 지운다.
 pub(super) async fn restore(
     ctx: &Ctx,
     task: &Task,
@@ -834,11 +951,14 @@ pub(super) async fn restore(
     let manifest = read_manifest(&dir).await?;
     let spec = &backup.spec.vm_spec;
     if manifest.backup != id
+        || manifest.parent != backup.status.parent
         || manifest.vm_spec != *spec
         || manifest.disks.len() != spec.disks.len()
     {
         return Err("backup manifest does not match the backup record".into());
     }
+    // 증분 백업의 조상 디렉터리(부모부터)
+    let ancestors = read_chain(ctx, &backup, &root, &manifest).await?;
 
     let (_, volumes) = ctx
         .cluster
@@ -847,20 +967,26 @@ pub(super) async fn restore(
     let mut taken: HashSet<String> = volumes.into_iter().map(|v| v.name).collect();
     let format = copy_format(&source, &target, ImageFormat::Qcow2);
     let mut copies: Vec<Volume> = Vec::with_capacity(manifest.disks.len());
-    for disk in &manifest.disks {
+    for (i, disk) in manifest.disks.iter().enumerate() {
         let failed =
             |e: &dyn std::fmt::Display| format!("cannot restore disk {:?}: {e}", disk.name);
-        // 파일은 백업 디렉터리 바로 안에 있어야 한다. 다른 파일을 참조하는 이미지도 받지 않는다.
-        if Path::new(&disk.file).file_name() != Some(OsStr::new(&disk.file)) {
-            return Err(failed(&format!("invalid file name {:?}", disk.file)));
+        // 체인의 파일(자식부터). 전체 백업이면 하나다.
+        let mut chain = Vec::with_capacity(ancestors.len() + 1);
+        for (dir, m) in
+            std::iter::once((&dir, &manifest)).chain(ancestors.iter().map(|(d, m)| (d, m)))
+        {
+            let file = m.disks[i].file.as_str();
+            // 파일은 백업 디렉터리 바로 안에 있어야 한다. 다른 파일을 참조하는 이미지도 받지 않는다.
+            if Path::new(file).file_name() != Some(OsStr::new(file)) {
+                return Err(failed(&format!("invalid file name {file:?}")));
+            }
+            let file = regular_file(dir, file).await.map_err(|e| failed(&e))?;
+            ctx.storage
+                .check_import_source(&file, SourceFormat::Qcow2)
+                .await
+                .map_err(|e| failed(&e))?;
+            chain.push(file);
         }
-        let file = regular_file(&dir, &disk.file)
-            .await
-            .map_err(|e| failed(&e))?;
-        ctx.storage
-            .check_import_source(&file, SourceFormat::Qcow2)
-            .await
-            .map_err(|e| failed(&e))?;
         let copy_name = volume_name(name, &disk.name, |n| taken.contains(n));
         taken.insert(copy_name.clone());
         let mut copy: Volume = Resource::new(
@@ -878,10 +1004,19 @@ pub(super) async fn restore(
             .create(&copy)
             .await
             .map_err(|e| format!("cannot create volume {:?}: {e}", copy.name))?;
-        ctx.storage
-            .import_volume(&target, copy.id, &file, SourceFormat::Qcow2, format)
-            .await
-            .map_err(|e| failed(&e))?;
+        let imported = match &chain[..] {
+            [file] => {
+                ctx.storage
+                    .import_volume(&target, copy.id, file, SourceFormat::Qcow2, format)
+                    .await
+            }
+            chain => {
+                ctx.storage
+                    .import_chain(&target, copy.id, chain, format)
+                    .await
+            }
+        };
+        imported.map_err(|e| failed(&e))?;
         copies.push(copy);
     }
 

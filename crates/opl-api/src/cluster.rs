@@ -412,17 +412,10 @@ pub(crate) fn require_feature(
     cluster: &opl_cluster::Cluster,
     feature: &str,
 ) -> Result<(), ApiError> {
-    let mut old: Vec<String> = cluster
-        .list::<NodeSpec>()?
-        .1
-        .into_iter()
-        .filter(|n| !n.status.features.iter().any(|f| f == feature))
-        .map(|n| n.name)
-        .collect();
+    let old = missing_feature(cluster, feature)?;
     if old.is_empty() {
         return Ok(());
     }
-    old.sort();
     Err(ApiError::conflict(
         "cluster_upgrading",
         format!(
@@ -431,6 +424,23 @@ pub(crate) fn require_feature(
             old.join(", ")
         ),
     ))
+}
+
+/// 기능 `feature`를 적지 않은 노드(위트니스 포함)의 이름(이름 순). [`require_feature`]와 같은 판단을
+/// Task처럼 API 오류가 아닌 곳에서 쓴다.
+pub(crate) fn missing_feature(
+    cluster: &opl_cluster::Cluster,
+    feature: &str,
+) -> Result<Vec<String>, ClusterError> {
+    let mut old: Vec<String> = cluster
+        .list::<NodeSpec>()?
+        .1
+        .into_iter()
+        .filter(|n| !n.status.features.iter().any(|f| f == feature))
+        .map(|n| n.name)
+        .collect();
+    old.sort();
+    Ok(old)
 }
 
 /// 옛 노드 이름들(이름 순)로 `cluster_upgrading`을 만든다. 없으면 통과.

@@ -253,6 +253,41 @@ async fn a_run_backs_up_the_selected_vms_and_records_the_result() {
     sched.shutdown().await;
 }
 
+/// `full_every`가 있는 작업은 증분으로(체인 한도 `full_every`) 백업을 요청한다. 꺼진 VM은 전체다.
+#[tokio::test]
+async fn jobs_with_full_every_ask_for_incremental_backups() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env, &admin, &[("web", json!({}))]).await;
+    let id = create_job(&admin, "nightly", json!({ "all": true }), json!({}), true).await;
+    let (status, body) = admin
+        .patch("/backup-jobs/nightly", json!({ "full_every": 2 }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sched = scheduler(&env, 2);
+    run_now(&env, &admin, id).await;
+    let backups = wait_backups_done(&env, id).await;
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    let b = &backups[0];
+    assert!(b.spec.incremental);
+    assert_eq!(b.spec.max_chain, Some(2));
+    assert_eq!(b.status.phase, BackupPhase::Ready, "{b:?}");
+    assert_eq!(b.status.full_reason.as_deref(), Some("VM is stopped"));
+
+    // 0이면 지금처럼 늘 전체다.
+    let (status, body) = admin
+        .patch("/backup-jobs/nightly", json!({ "full_every": 0 }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    run_now(&env, &admin, id).await;
+    let backups = wait_backups_done(&env, id).await;
+    assert_eq!(backups.len(), 2, "{backups:?}");
+    assert!(!backups[1].spec.incremental);
+    assert_eq!(backups[1].spec.max_chain, None);
+    assert_eq!(backups[1].status.full_reason, None);
+    sched.shutdown().await;
+}
+
 #[tokio::test]
 async fn limits_backup_tasks_per_node() {
     let mut env = Env::start().await;
@@ -603,6 +638,7 @@ async fn takes_in_a_backup_of_this_run_left_out_of_the_status() {
             job: Some(id),
             origin: None,
             incremental: false,
+            max_chain: None,
         },
     );
     made.status = BackupStatus {

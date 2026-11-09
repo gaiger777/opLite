@@ -212,6 +212,7 @@ pub async fn receive_backup(
             job: None,
             origin: Some(req.origin),
             incremental: false,
+            max_chain: None,
         },
     );
     backup.status = BackupStatus {

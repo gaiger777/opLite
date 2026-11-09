@@ -75,6 +75,7 @@ async fn ready_backup(env: &Env, name: &str, job: Option<Uuid>) -> Backup {
             job,
             origin: None,
             incremental: false,
+            max_chain: None,
         },
     );
     let manifest: BackupManifest = serde_json::from_value(json!({
@@ -700,6 +701,53 @@ async fn replicate_requests_are_checked() {
         StatusCode::CONFLICT,
         "node_offline",
     );
+}
+
+/// 증분 백업(부모가 있는 백업)은 아직 복제하지 않는다: API는 400, 복제 Task도 같은 확인으로 실패하고
+/// 원격에 아무것도 보내지 않는다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_backups_are_not_replicated_yet() {
+    let r = remote().await;
+    let (local, admin) = local_with_remote(&r, "operator").await;
+    let full = ready_backup(&local, "full", None).await;
+    let incr = ready_backup(&local, "incr", None).await;
+    let mut status = get_backup(&local, incr.id).status;
+    status.parent = Some(full.id);
+    local
+        .cluster
+        .update_status::<BackupSpec>(incr.id, &status)
+        .await
+        .unwrap();
+
+    let got = replicate(&admin, "incr").await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    assert_eq!(
+        got.1["message"],
+        "incremental backups cannot be replicated yet"
+    );
+    let mut task: opl_types::task::Task = Resource::new(
+        "",
+        opl_types::task::TaskSpec {
+            op: opl_types::task::TaskOp::BackupReplicate {
+                remote: "dr".into(),
+                pool: "dr".into(),
+            },
+            target: incr.id,
+            node: local.node,
+        },
+    );
+    task.name = task.id.to_string();
+    local.cluster.create(&task).await.unwrap();
+    let task = admin.wait_task(&json!({ "id": task.id })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(
+        task["status"]["error"],
+        "incremental backups cannot be replicated yet"
+    );
+    assert!(r.env.cluster.list::<BackupSpec>().unwrap().1.is_empty());
+    // 전체 백업(부모)은 보낸다.
+    let task = replicate_done(&admin, "full").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
 }
 
 /// `done`이 참이 될 때까지 기다린다.

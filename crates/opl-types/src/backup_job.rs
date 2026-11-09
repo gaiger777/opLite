@@ -34,6 +34,15 @@ pub struct BackupJobSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub replicate: Option<ReplicateTarget>,
+    /// 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
+    /// 0이면 늘 전체다(뺀다).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub full_every: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// 백업을 보낼 곳: 원격 `remote`의 백업 풀 `pool`
@@ -483,6 +492,28 @@ mod tests {
             j["replicate"] = bad.clone();
             assert!(spec(j).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn full_every_round_trips_and_is_left_out_when_zero() {
+        // 0이면 빼서 옛 노드가 읽는 모양 그대로다.
+        let s = spec(base()).unwrap();
+        assert_eq!(s.full_every, 0);
+        assert!(
+            serde_json::to_value(&s)
+                .unwrap()
+                .get("full_every")
+                .is_none()
+        );
+
+        let mut with = base();
+        with["full_every"] = json!(6);
+        let s = spec(with).unwrap();
+        assert_eq!(s.full_every, 6);
+        assert_eq!(s.validate(), Ok(()));
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["full_every"], 6);
+        assert_eq!(spec(json).unwrap(), s);
     }
 
     #[test]

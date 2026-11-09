@@ -305,7 +305,7 @@ pub async fn create_backup(
     let name = req
         .name
         .unwrap_or_else(|| default_backup_name(&vm.name, now()));
-    let task = start_backup(&state, &vm, &pool, node, name, None, req.incremental).await?;
+    let task = start_backup(&state, &vm, &pool, node, name, None, req.incremental, None).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
@@ -353,7 +353,9 @@ pub(crate) fn check_backup(
 
 /// [`check_backup`]을 거친 VM의 `pending` 백업 `name`을 만들고 노드 `node`에서 그것을 채울 Task를
 /// 돌려준다. 이름이 올바르지 않으면 400. 백업 작업이 만드는 백업은 `job`에 작업 id를 적는다.
-/// `incremental`이면 Task가 할 수 있을 때 증분으로 백업한다.
+/// `incremental`이면 Task가 할 수 있을 때 증분으로 백업한다. `max_chain`은 체인에 둘 증분 수의
+/// 한도다(백업 작업의 `full_every`, 손으로 만든 백업은 없음).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_backup(
     state: &AppState,
     vm: &Vm,
@@ -362,6 +364,7 @@ pub(crate) async fn start_backup(
     name: String,
     job: Option<Uuid>,
     incremental: bool,
+    max_chain: Option<u32>,
 ) -> Result<Task, ApiError> {
     check_name(&name)?;
     let backup: Backup = Resource::new(
@@ -374,6 +377,7 @@ pub(crate) async fn start_backup(
             job,
             origin: None,
             incremental,
+            max_chain,
         },
     );
     // 같은 이름이 있으면 저장소가 거부한다(409 name_taken).
@@ -430,7 +434,8 @@ pub(crate) fn files_node(
 /// 지우는 Task가 끝나지 않았으면 409 `backup_busy`. Task는 파일이 있는 노드(공유가 아닌 풀은 파일을
 /// 쓴 노드, 공유 풀은 백업 풀을 쓸 수 있는 노드)에서 돈다. 풀이 없어졌으면 이 노드의 Task가 리소스만
 /// 지운다. 파일을 지울 노드가 없으면 409(`node_offline`, `pool_unavailable` 등)이고, `force`면 리소스만
-/// 바로 지우고 200이다(파일은 백업 풀에 남는다).
+/// 바로 지우고 200이다(파일은 백업 풀에 남는다). 증분 백업(`failed`가 아닌 것)의 부모는 `force`여도 409
+/// `backup_in_use`다(자식부터 지운다).
 #[utoipa::path(delete, path = "/backups/{key}", tag = "backups",
     params(("key" = String, Path, description = "id or name"), DeleteBackupQuery),
     responses(
@@ -448,6 +453,7 @@ pub async fn delete_backup(
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
     if q.force {
         check_backup_idle(&state, &backup)?;
+        check_not_parent(&state, &backup)?;
         if let Err(e) = delete_node(&state, &backup)
             && e.status == StatusCode::CONFLICT
         {
@@ -472,6 +478,30 @@ fn check_backup_idle(state: &AppState, backup: &Backup) -> Result<(), ApiError> 
     }
 }
 
+/// 백업 `backup`을 부모로 둔 증분 백업이 있으면 그 수를 담은 거절 문구. 만드는 중인 증분도 세고
+/// `failed` 증분은 세지 않는다(부모 없이도 지울 수 있다).
+pub(crate) fn parent_in_use(backups: &[Backup], backup: &Backup) -> Option<String> {
+    let n = backups
+        .iter()
+        .filter(|b| b.status.parent == Some(backup.id) && b.status.phase != BackupPhase::Failed)
+        .count();
+    (n > 0).then(|| {
+        format!(
+            "backup {:?} is the parent of {n} incremental backup(s); delete them first",
+            backup.name
+        )
+    })
+}
+
+/// 백업이 증분 백업의 부모이면 409 `backup_in_use`
+fn check_not_parent(state: &AppState, backup: &Backup) -> Result<(), ApiError> {
+    let (_, backups) = state.cluster.list::<BackupSpec>()?;
+    match parent_in_use(&backups, backup) {
+        Some(message) => Err(ApiError::conflict("backup_in_use", message)),
+        None => Ok(()),
+    }
+}
+
 /// 백업 지우기 Task를 돌릴 노드. 풀이 없어졌으면(파일도 함께 없어졌다) 이 노드다.
 fn delete_node(state: &AppState, backup: &Backup) -> Result<Uuid, ApiError> {
     match state
@@ -490,6 +520,7 @@ pub(crate) async fn start_backup_delete(
     backup: &Backup,
 ) -> Result<Task, ApiError> {
     check_backup_idle(state, backup)?;
+    check_not_parent(state, backup)?;
     let node = delete_node(state, backup)?;
     create_task(&state.cluster, TaskOp::BackupDelete, backup.id, node).await
 }
@@ -499,7 +530,8 @@ pub(crate) async fn start_backup_delete(
 /// `backup_not_ready`, 지우는 중이면 409 `backup_busy`, 이름이 겹치면 409 `name_taken`. 노드는 `node`나
 /// 백업 풀과 대상 풀을 함께 쓸 수 있는 온라인 노드 가운데 이름이 가장 앞선 노드다(없으면 409 `no_node`).
 /// 공유가 아닌 풀의 백업은 파일을 쓴 노드(`status.node`)에서만 되살린다: `node`가 다르면 409
-/// `backup_on_other_node`. 고른 노드가 오프라인이면 409 `node_offline`.
+/// `backup_on_other_node`. 고른 노드가 오프라인이면 409 `node_offline`. 증분 백업은 고른 노드가 증분 백업을
+/// 알아야 한다(버전 2 매니페스트, 409 `cluster_upgrading`).
 #[utoipa::path(post, path = "/backups/{key}/restore", tag = "backups",
     params(("key" = String, Path, description = "id or name")),
     request_body = RestoreRequest,
@@ -599,6 +631,21 @@ pub async fn restore_backup(
             )
         })?,
     };
+    if backup.status.parent.is_some() {
+        let n = state
+            .cluster
+            .get::<NodeSpec>(node)?
+            .ok_or_else(|| ApiError::not_found(format!("node {node} not found")))?;
+        if !n.status.features.iter().any(|f| f == "incremental-backup") {
+            return Err(ApiError::conflict(
+                "cluster_upgrading",
+                format!(
+                    "node {:?} does not support incremental backups yet; upgrade it first",
+                    n.name
+                ),
+            ));
+        }
+    }
     let op = TaskOp::BackupRestore {
         backup: backup.id,
         name: req.name,
@@ -613,7 +660,7 @@ pub async fn restore_backup(
 /// `status.replicas`에 결과를 적는다. 원격 쪽 권한은 원격 토큰 주인의 역할이다(백업 쓰기, operator
 /// 이상). 원격이 없으면 404, 백업이 준비되지 않았으면 409 `backup_not_ready`, 지우는 중이거나 같은 원격으로
 /// 복제하는 Task가 끝나지 않았으면 409 `backup_busy`, 파일을 읽을 노드가 없으면 409(`node_offline`,
-/// `pool_unavailable` 등), 옛 노드가 있으면 409 `cluster_upgrading`.
+/// `pool_unavailable` 등), 옛 노드가 있으면 409 `cluster_upgrading`. 증분 백업은 아직 보내지 않는다(400).
 #[utoipa::path(post, path = "/backups/{key}/actions/replicate", tag = "backups",
     params(("key" = String, Path, description = "id or name")),
     request_body = ReplicateRequest,
@@ -644,6 +691,11 @@ pub(crate) async fn start_backup_replicate(
 ) -> Result<Task, ApiError> {
     require_current(&state.cluster)?;
     let remote = lookup::<RemoteSpec>(&state.cluster, remote)?;
+    if backup.status.parent.is_some() {
+        return Err(ApiError::bad_request(
+            "incremental backups cannot be replicated yet",
+        ));
+    }
     if backup.status.phase != BackupPhase::Ready {
         return Err(ApiError::conflict(
             "backup_not_ready",

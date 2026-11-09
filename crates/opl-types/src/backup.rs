@@ -53,6 +53,11 @@ pub struct BackupSpec {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub incremental: bool,
+    /// 증분 체인에 둘 증분 백업 수의 한도(백업 작업의 `full_every`). 부모의 체인에 이미 이만큼 증분이
+    /// 있으면 전체로 한다. 없으면 한도가 없다(손으로 만든 백업).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub max_chain: Option<u32>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -554,6 +559,33 @@ mod tests {
         let json = serde_json::to_value(&full).unwrap();
         assert_eq!(json["full_reason"], "VM is stopped");
         assert_eq!(serde_json::from_value::<BackupStatus>(json).unwrap(), full);
+    }
+
+    /// 체인 한도는 없으면 뺀다(손으로 만든 백업).
+    #[test]
+    fn max_chain_round_trips_and_is_omitted_when_unset() {
+        let spec: BackupSpec = serde_json::from_value(serde_json::json!({
+            "vm": Uuid::now_v7(),
+            "vm_name": "web",
+            "pool": "backups",
+            "vm_spec": vm_spec()
+        }))
+        .unwrap();
+        assert_eq!(spec.max_chain, None);
+        assert!(
+            serde_json::to_value(&spec)
+                .unwrap()
+                .get("max_chain")
+                .is_none()
+        );
+        let limited = BackupSpec {
+            incremental: true,
+            max_chain: Some(6),
+            ..spec
+        };
+        let json = serde_json::to_value(&limited).unwrap();
+        assert_eq!(json["max_chain"], 6);
+        assert_eq!(serde_json::from_value::<BackupSpec>(json).unwrap(), limited);
     }
 
     /// 증분 백업의 매니페스트는 버전 2에 부모를 담는다. 전체 백업은 부모를 빼고 버전 1 그대로다.

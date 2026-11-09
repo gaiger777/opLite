@@ -104,13 +104,17 @@ async fn mismatch(ctx: &Ctx, id: Uuid, remote: &str, pool: &str, error: String) 
     error
 }
 
-/// 백업 `id`를 원격 `remote`의 백업 풀 `pool`에 사본으로 보낸다. 실패하면 실행기의 정리([`discard`])가
+/// 백업 `id`를 원격 `remote`의 백업 풀 `pool`에 사본으로 보낸다. 증분 백업은 보내지 않는다. 실패하면 실행기의 정리([`discard`])가
 /// 사본 기록을 failed로 바꾼다. 기록이 ready인 사본은 확인만 하므로 기록을 ready로 둔다(확인이 실패해도
 /// 이유만 적힌다). 원격에 없거나 다른 사본이면 그때 copying이나 failed로 바꾼다.
 pub(super) async fn replicate(ctx: &Ctx, id: Uuid, remote: &str, pool: &str) -> Result<(), String> {
     let backup = get_backup(ctx, id)?.ok_or("backup was deleted")?;
     if backup.status.phase != BackupPhase::Ready {
         return Err("backup is not ready".into());
+    }
+    // 증분 백업의 복제는 아직 없다(받는 쪽이 부모를 모른다).
+    if backup.status.parent.is_some() {
+        return Err("incremental backups cannot be replicated yet".into());
     }
     let checking = backup.status.replicas.iter().any(|r| {
         r.remote == remote && r.pool == pool && r.state == ReplicaState::Ready && r.backup.is_some()

@@ -720,6 +720,7 @@ async fn restore_needs_the_networks_and_security_groups_of_the_backup() {
             job: None,
             origin: None,
             incremental: false,
+            max_chain: None,
         },
     );
     backup.status.phase = BackupPhase::Ready;
@@ -777,6 +778,104 @@ async fn set_stored(env: &Env, id: Uuid, node: Option<Uuid>) {
         .update_status::<BackupSpec>(id, &status)
         .await
         .unwrap();
+}
+
+/// 증분 백업 `name`(부모 `parent`, 단계 `phase`)을 저장소에 직접 만든다.
+async fn child_backup(env: &Env, name: &str, parent: Uuid, phase: BackupPhase) -> Uuid {
+    let spec = env.cluster.get::<BackupSpec>(parent).unwrap().unwrap().spec;
+    let mut child: Backup = Resource::new(name, spec);
+    env.cluster.create(&child).await.unwrap();
+    child.status = BackupStatus {
+        phase,
+        created_at: Some(2),
+        parent: Some(parent),
+        ..Default::default()
+    };
+    env.cluster
+        .update_status::<BackupSpec>(child.id, &child.status)
+        .await
+        .unwrap();
+    child.id
+}
+
+/// 증분 백업(만드는 중인 것도)의 부모는 지우지 못한다: 409 `backup_in_use`(`force`여도). 실패한 증분은
+/// 세지 않는다.
+#[tokio::test]
+async fn parents_of_incremental_backups_cannot_be_deleted() {
+    let env = env().await;
+    let admin = env.admin().await;
+    let id = ready_backup(&env, &admin).await;
+    let pending = child_backup(&env, "b2", id, BackupPhase::Pending).await;
+    child_backup(&env, "b3", id, BackupPhase::Ready).await;
+    child_backup(&env, "bad", id, BackupPhase::Failed).await;
+
+    for path in ["/backups/b1", "/backups/b1?force=true"] {
+        let got = admin.delete(path).await;
+        assert_error(&got, StatusCode::CONFLICT, "backup_in_use");
+        assert_eq!(
+            got.1["message"],
+            "backup \"b1\" is the parent of 2 incremental backup(s); delete them first"
+        );
+    }
+    env.cluster
+        .delete::<BackupSpec>(pending, None)
+        .await
+        .unwrap();
+    let got = admin.delete("/backups/b1").await;
+    assert_eq!(
+        got.1["message"],
+        "backup \"b1\" is the parent of 1 incremental backup(s); delete them first"
+    );
+    // 자식은 지운다(실패한 자식도).
+    for child in ["b3", "bad"] {
+        let (status, task) = admin.delete(&format!("/backups/{child}")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    }
+    let b3 = env
+        .cluster
+        .get_by_name::<BackupSpec>("b3")
+        .unwrap()
+        .unwrap();
+    env.cluster.delete::<BackupSpec>(b3.id, None).await.unwrap();
+    finish_tasks(&env).await;
+    // 남은 자식은 실패한 것뿐이다.
+    let (status, task) = admin.delete("/backups/b1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+}
+
+/// 증분 백업은 증분 백업을 아는 노드에서만 되살린다(버전 2 매니페스트). 전체 백업은 어느 노드든 된다.
+#[tokio::test]
+async fn incremental_backups_restore_on_nodes_that_know_them() {
+    let env = env().await;
+    let admin = env.admin().await;
+    let id = ready_backup(&env, &admin).await;
+    child_backup(&env, "b2", id, BackupPhase::Ready).await;
+    // 기능 목록이 빈 옛 노드
+    let old = other_node(&env, "old").await;
+    mark_pool_ready(&env.cluster, old, "backups").await;
+    mark_pool_ready(&env.cluster, old, "local").await;
+
+    let got = restore(
+        &admin,
+        "b2",
+        json!({ "name": "web-2", "pool": "local", "node": "old" }),
+    )
+    .await;
+    assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+    assert_eq!(
+        got.1["message"],
+        "node \"old\" does not support incremental backups yet; upgrade it first"
+    );
+    let (status, task) = restore(&admin, "b2", json!({ "name": "web-2", "pool": "local" })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], env.node.to_string());
+    let (status, task) = restore(
+        &admin,
+        "b1",
+        json!({ "name": "web-3", "pool": "local", "node": "old" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
 }
 
 /// 공유가 아닌 백업 풀의 백업은 파일을 쓴 노드(`status.node`)에만 있다. 지우기와 복원은 그 노드에서

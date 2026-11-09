@@ -16,6 +16,7 @@ use common::{Client, Env, FakeStorage, MOUNT_ROOT, vm_request};
 use opl_driver::{DirStorage, uefi_vars_path};
 use opl_types::backup::{
     Backup, BackupManifest, BackupPhase, BackupSpec, MANIFEST_FILE, MANIFEST_VERSION,
+    MANIFEST_VERSION_INCREMENTAL,
 };
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -705,13 +706,13 @@ async fn restore_refuses_another_manifest_version() {
     create_pool(&env, "other", false).await;
     let path = backup_dir(&env, b.id).join(MANIFEST_FILE);
     let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    manifest["version"] = json!(MANIFEST_VERSION + 1);
+    manifest["version"] = json!(MANIFEST_VERSION_INCREMENTAL + 1);
     std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
     let task = restore(&admin, "web-2", "other").await;
     assert_eq!(task["status"]["state"], "failed", "{task}");
     let error = task["status"]["error"].as_str().unwrap();
-    assert!(error.contains("manifest version 2"), "{error}");
+    assert!(error.contains("manifest version 3"), "{error}");
     assert!(get_volume(&env, "web-2-disk0").is_none());
     assert!(get_vm(&env, "web-2").is_none());
 }
@@ -1287,4 +1288,253 @@ async fn failed_backups_keep_the_bitmap_of_the_last_good_backup() {
 
     succeeded(&backup_running(&mut env, &admin, "again", true, &[]).await);
     assert_eq!(backup(&env, "again").unwrap().status.parent, Some(b1.id));
+}
+
+/// 증분 백업의 복원은 부모를 거슬러 전체 백업까지의 체인을 디스크마다 한 이미지로 연다: 전체 백업 위에
+/// 증분마다 바뀐 블록이 덮인다. Mock 하이퍼바이저는 증분 파일에 쓰지 않으므로 QEMU가 썼을 바뀐 블록을
+/// 시험이 쓴다. 조상이 없어졌거나 맞지 않으면 볼륨을 만들기 전에 "backup chain is broken"으로 실패한다.
+#[tokio::test]
+async fn restoring_an_incremental_backup_reads_its_whole_chain() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, files) = running_web(&env, &admin).await;
+    assert!(qemu_io(&files[0], "qcow2", "write -P 0xaa 0 64k"));
+    assert!(qemu_io(&files[1], "qcow2", "write -P 0xbb 0 64k"));
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    succeeded(&backup_running(&mut env, &admin, "b2", true, &[]).await);
+    succeeded(&backup_running(&mut env, &admin, "b3", true, &[]).await);
+    let (b1, b2, b3) = (
+        backup(&env, "b1").unwrap(),
+        backup(&env, "b2").unwrap(),
+        backup(&env, "b3").unwrap(),
+    );
+    assert_eq!(
+        (b2.status.parent, b3.status.parent),
+        (Some(b1.id), Some(b2.id))
+    );
+    let changed = |b: &Backup, disk: usize, cmd: &str| {
+        let path = backup_dir(&env, b.id).join(format!("disk{disk}.qcow2"));
+        assert!(qemu_io(&path, "qcow2", cmd), "{cmd}");
+    };
+    changed(&b2, 0, "write -P 0xcc 64k 64k");
+    // 클러스터(64 KiB) 단위로 쓴다. b3는 b2가 바꾼 블록을 다시 바꾼다.
+    changed(&b3, 0, "write -P 0xdd 64k 64k");
+    changed(&b3, 1, "write -P 0xee 1M 64k");
+    create_pool(&env, "other", false).await;
+    let restore = |b: &'static str, name: &'static str| {
+        let admin = &admin;
+        async move {
+            wait(
+                admin,
+                admin
+                    .post(
+                        &format!("/backups/{b}/restore"),
+                        json!({ "name": name, "pool": "other" }),
+                    )
+                    .await,
+            )
+            .await
+        }
+    };
+    let reads = |name: &str, patterns: &[&str]| {
+        let volume = get_volume(&env, name).unwrap();
+        let path = pool_dir(&env, "other").join(format!("{}.qcow2", volume.id));
+        assert!(info(&path).get("backing-filename").is_none());
+        for pattern in patterns {
+            assert!(qemu_io(&path, "qcow2", pattern), "{name}: {pattern}");
+        }
+    };
+
+    succeeded(&restore("b3", "from-b3").await);
+    reads(
+        "from-b3-disk0",
+        &["read -P 0xaa 0 64k", "read -P 0xdd 64k 64k"],
+    );
+    reads(
+        "from-b3-disk1",
+        &["read -P 0xbb 0 64k", "read -P 0xee 1M 64k"],
+    );
+    succeeded(&restore("b2", "from-b2").await);
+    reads(
+        "from-b2-disk0",
+        &["read -P 0xaa 0 64k", "read -P 0xcc 64k 64k"],
+    );
+    reads("from-b2-disk1", &["read -P 0xbb 0 64k", "read -P 0 1M 64k"]);
+
+    // 조상의 디스크가 맞지 않는다.
+    let path = backup_dir(&env, b1.id).join(MANIFEST_FILE);
+    let good = std::fs::read(&path).unwrap();
+    let mut m: Value = serde_json::from_slice(&good).unwrap();
+    m["disks"][1]["virtual_bytes"] = json!(MIB);
+    std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+    let task = restore("b3", "bad").await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(
+        task["status"]["error"],
+        "backup chain is broken: the disks of backup \"b1\" do not match backup \"b3\""
+    );
+    std::fs::write(&path, good).unwrap();
+    // 부모가 없어졌다.
+    env.cluster.delete::<BackupSpec>(b2.id, None).await.unwrap();
+    let task = restore("b3", "bad").await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(
+        task["status"]["error"],
+        "backup chain is broken: the parent of backup \"b3\" was deleted"
+    );
+    assert!(get_volume(&env, "bad-disk0").is_none());
+    assert!(get_vm(&env, "bad").is_none());
+}
+
+/// 증분 백업의 부모는 지우지 못한다: API는 409 `backup_in_use`, 지우기 Task도 같은 확인으로 실패한다.
+/// 자식부터 지우면 부모도 지운다. 실패한 증분은 부모 지우기를 막지 않는다.
+#[tokio::test]
+async fn parents_of_incremental_backups_are_deleted_after_their_children() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, files) = running_web(&env, &admin).await;
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    succeeded(&backup_running(&mut env, &admin, "b2", true, &[]).await);
+    let b1 = backup(&env, "b1").unwrap();
+    let in_use = "backup \"b1\" is the parent of 1 incremental backup(s); delete them first";
+
+    for path in ["/backups/b1", "/backups/b1?force=true"] {
+        let (status, body) = admin.delete(path).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "backup_in_use", "{body}");
+        assert_eq!(body["message"], in_use);
+    }
+    let delete = opl_types::task::TaskOp::BackupDelete;
+    let task = put_task(&env, delete, b1.id, env.node, TaskState::Pending).await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(task["status"]["error"], in_use);
+    assert!(backup_dir(&env, b1.id).join(MANIFEST_FILE).exists());
+
+    succeeded(&wait(&admin, admin.delete("/backups/b2").await).await);
+    succeeded(&wait(&admin, admin.delete("/backups/b1").await).await);
+    assert!(backup(&env, "b1").is_none());
+
+    // 실패한 증분은 세지 않는다. 부모를 지운 뒤에도 지울 수 있다.
+    succeeded(&backup_running(&mut env, &admin, "b3", false, &files).await);
+    env.hv.fail_next_incremental(opl_driver::DriverError::Qmp(
+        opl_qemu::QmpError::JobFailed {
+            id: "opl-backup-0".into(),
+            error: "No space left on device".into(),
+        },
+    ));
+    let task = backup_running(&mut env, &admin, "bad", true, &[]).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let b3 = backup(&env, "b3").unwrap();
+    assert_eq!(backup(&env, "bad").unwrap().status.parent, Some(b3.id));
+    succeeded(&wait(&admin, admin.delete("/backups/b3").await).await);
+    succeeded(&wait(&admin, admin.delete("/backups/bad").await).await);
+}
+
+/// 실행 중인 `web`의 증분 백업 `name`을 체인 한도 `max_chain`(백업 작업의 `full_every`)으로 만들고 끝난
+/// Task를 돌려준다.
+async fn backup_limited(
+    env: &mut Env,
+    admin: &Client,
+    name: &str,
+    max_chain: u32,
+    files: &[PathBuf],
+) -> Value {
+    env.stop_runner().await;
+    let (status, task) = admin
+        .post(
+            "/vms/web/backups",
+            json!({ "pool": "bk", "name": name, "incremental": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let b = backup(env, name).unwrap();
+    let spec = BackupSpec {
+        max_chain: Some(max_chain),
+        ..b.spec.clone()
+    };
+    env.cluster
+        .update_spec(b.id, Some(b.revision), b.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let tag = b.id.simple().to_string();
+    for file in files {
+        qemu_img(&["snapshot", "-c", &tag, file.to_str().unwrap()]);
+    }
+    env.start_runner().await;
+    admin.wait_task(&task).await
+}
+
+/// 체인의 증분이 한도만큼 쌓였으면 전체로 하고 그 이유를 적는다. 그 전체 백업에서 새 체인이 시작된다.
+#[tokio::test]
+async fn chains_longer_than_the_limit_start_over_with_a_full_backup() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, files) = running_web(&env, &admin).await;
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    let parent = |env: &Env, name: &str| {
+        let b = backup(env, name).unwrap();
+        assert_eq!(b.status.phase, BackupPhase::Ready, "{b:?}");
+        (
+            b.status
+                .parent
+                .map(|p| env.cluster.get::<BackupSpec>(p).unwrap().unwrap().name),
+            b.status.full_reason,
+        )
+    };
+    for (name, want) in [("b2", "b1"), ("b3", "b2")] {
+        succeeded(&backup_limited(&mut env, &admin, name, 2, &files).await);
+        assert_eq!(parent(&env, name), (Some(want.to_string()), None));
+    }
+    succeeded(&backup_limited(&mut env, &admin, "b4", 2, &files).await);
+    assert_eq!(
+        parent(&env, "b4"),
+        (
+            None,
+            Some("chain already has 2 incremental backup(s)".into())
+        )
+    );
+    assert_eq!(backup(&env, "b4").unwrap().spec.max_chain, Some(2));
+    succeeded(&backup_limited(&mut env, &admin, "b5", 2, &files).await);
+    assert_eq!(parent(&env, "b5"), (Some("b4".into()), None));
+}
+
+/// 증분 백업을 모르는 노드가 있으면(롤링 업그레이드 중) 비트맵을 만들지 않는다. 그 노드는 스냅샷을
+/// 되돌리기 전에 비트맵을 지우지 못한다. 그사이 증분 요청은 이유와 함께 전체다.
+#[tokio::test]
+async fn backups_leave_no_bitmaps_while_a_node_does_not_know_them() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vm, files) = running_web(&env, &admin).await;
+    env.stop_runner().await;
+    let (status, task) = admin
+        .post(
+            "/vms/web/backups",
+            json!({ "pool": "bk", "name": "b1", "incremental": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    // 요청한 뒤 옛 노드가 들어왔다(기능 목록이 비었다).
+    other_node(&env, "old").await;
+    let tag = backup(&env, "b1").unwrap().id.simple().to_string();
+    for file in &files {
+        qemu_img(&["snapshot", "-c", &tag, file.to_str().unwrap()]);
+    }
+    env.start_runner().await;
+    succeeded(&admin.wait_task(&task).await);
+    let b1 = backup(&env, "b1").unwrap();
+    assert_eq!(
+        b1.status.full_reason.as_deref(),
+        Some("some nodes do not support incremental backups yet")
+    );
+    assert!(
+        bitmaps(&env, vm).iter().all(|d| d.is_empty()),
+        "{:?}",
+        bitmaps(&env, vm)
+    );
+
+    succeeded(&backup_running(&mut env, &admin, "b2", false, &files).await);
+    assert_eq!(backup(&env, "b2").unwrap().status.full_reason, None);
+    assert!(bitmaps(&env, vm).iter().all(|d| d.is_empty()));
+    assert!(env.hv.incremental_backups().is_empty());
 }
