@@ -16,7 +16,9 @@ use crate::backoff::{FailureTracker, Next};
 use crate::config::ReconcilerConfig;
 use crate::ha::ArmError;
 use crate::reconciler::{Held, Restores};
-use crate::resolve::{ResolveError, running_spec, runtime_spec, set_disks_shared};
+use crate::resolve::{
+    ResolveError, apply_disk_moves, running_spec, runtime_spec, set_disks_shared,
+};
 
 /// 실행 중이던 VM이 사라졌을 때 그 이유를 알리는 종료 이벤트를 기다리는 시간.
 /// 이벤트보다 재동기화가 먼저 오면, 게스트가 스스로 끈 VM을 다시 켰다가 끄게 된다.
@@ -34,6 +36,9 @@ const HA_UNAVAILABLE: &str = "HA is not available on this node";
 const IMAGE_LOCKED: &str = "disk image is locked by another process; retrying";
 /// 방화벽이 없는 노드(nftables 없음, macOS)에서 보안 그룹을 건 NIC가 있는 VM을 켜려 할 때의 오류
 const NO_FIREWALL: &str = "failed to start: firewall: this node has no firewall (nftables)";
+/// 남은 마이그레이션을 취소하지 못해(남은 디스크 미러) 표시를 남긴 채 다시 하는 연속 실패 수. 이만큼
+/// 실패하면 경고 뒤 표시를 지운다([`Worker::clear_migration`]).
+const CANCEL_ATTEMPTS: u32 = 3;
 
 /// 작업자를 깨우는 이유.
 #[derive(Debug)]
@@ -135,6 +140,8 @@ pub(crate) struct Worker {
     fenced: bool,
     /// guard에 도는 HA VM으로 알려 두었다([`Worker::report_running`]).
     ha_running: bool,
+    /// 남은 마이그레이션의 취소가 잇달아 실패한 수([`Worker::clear_migration`])
+    cancel_failures: u32,
     wake_at: Option<Instant>,
 }
 
@@ -167,6 +174,7 @@ impl Worker {
             held_event: None,
             fenced: false,
             ha_running: false,
+            cancel_failures: 0,
             wake_at: None,
         }
     }
@@ -916,12 +924,28 @@ impl Worker {
     /// 끝나지 않은 채 남은 마이그레이션 표시(`Migrating`, `status.migration`)를 지운다. 이 노드의
     /// 마이그레이션 Task가 다루지 않는 VM이므로, 원본 opld가 확정 전에 죽었거나(원본 노드) 확정 뒤
     /// 넘겨받는 중이다(대상 노드). 읽은 revision으로만 쓰므로 그 사이 확정되었으면(남은 확정 쓰기가
-    /// 먼저 적용됨) 쓰지 않고 `None`이다. 쓰고 나면 그 확정은 더는 적용되지 않으므로, 이 노드의 QEMU가
-    /// 아직 보내고 있으면 취소하고(나중에 끝나 원본이 멈추지 않게), 마이그레이션을 보내고 멈춰 있으면
+    /// 먼저 적용됨) 쓰지 않고 `None`이다. 쓰기 전에 이 노드의 QEMU가
+    /// 아직 보내고 있으면 취소하고(나중에 끝나 원본이 멈추지 않게, 남은 디스크 미러도 치운다 — 실패하면
+    /// 표시를 남긴 채 오류로 돌아가 다음에 다시 한다. 다만 QEMU에 붙지 못했거나(`NotAttached`) 이 VM에서
+    /// [`CANCEL_ATTEMPTS`]번 잇달아 실패하면 경고 뒤 표시를 지운다: 남은 미러는 대상의 정리가 받는 QEMU를
+    /// 끄면 실패하고 다음 미러·백업 정리가 치운다. 확정 쓰기는 마이그레이션이 끝난 뒤에만 오므로 끝나지
+    /// 않은 마이그레이션을 취소해도 확정과 겹치지 않는다), 쓰고 나서 마이그레이션을 보내고 멈춰 있으면
     /// (`postmigrate`, 취소하는 사이에 끝난 경우 포함) 이어서 실행한다(HA VM은 reconcile이 리스를 확인한
     /// 뒤에). 대상의 QEMU는 확정 뒤에만
     /// 돌므로 두 QEMU가 함께 돌지 않는다. 다시 읽은 VM을 돌려준다.
-    async fn clear_migration(&self, vm: &Vm) -> Result<Option<Vm>, StepError> {
+    /// 이 노드로 확정된 마이그레이션이 디스크를 복사했으면 표시를 지우기 전에 볼륨 기록을 옮긴
+    /// 위치로 고친다(`apply_disk_moves`, 멱등). 못 고치면 오류로 돌아가 다시 하고, 그동안 디스크를
+    /// 해석하지 않는다.
+    async fn clear_migration(&mut self, vm: &Vm) -> Result<Option<Vm>, StepError> {
+        apply_disk_moves(&self.cluster, vm).await?;
+        if let Err(e) = self.hv.cancel_migration(self.id).await {
+            self.cancel_failures += 1;
+            if !matches!(e, DriverError::NotAttached(_)) && self.cancel_failures < CANCEL_ATTEMPTS {
+                return Err(e.into());
+            }
+            tracing::warn!(vm = %self.id, error = %e, "cannot cancel a migration left behind; clearing its mark anyway (the target's cleanup ends leftover disk mirrors)");
+        }
+        self.cancel_failures = 0;
         let mut status = vm.status.clone();
         status.migration = None;
         if status.phase == VmPhase::Migrating {
@@ -935,7 +959,6 @@ impl Worker {
             Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => return Ok(None),
             r => r?,
         };
-        self.hv.cancel_migration(self.id).await?;
         // HA VM은 reconcile이 리스와 watchdog를 확인한 뒤 이어서 실행한다(이 노드에서 도는 VM의 원본).
         if !vm.spec.ha
             && let Some(state) = self.hv.inspect(self.id).await?

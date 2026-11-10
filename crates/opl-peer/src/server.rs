@@ -141,10 +141,9 @@ impl Peer for PeerService {
         req: Request<MigrateIncomingRequest>,
     ) -> Result<Response<MigrateIncomingReply>, Status> {
         self.authorize(&req)?;
-        let reply = self.migrations()?.incoming(req.into_inner()).await;
-        Ok(Response::new(reply.map(|port| {
-            crate::migration::MigrateIncomingResponse { port }
-        })))
+        Ok(Response::new(
+            self.migrations()?.incoming(req.into_inner()).await,
+        ))
     }
 
     async fn migrate_incoming_wait(

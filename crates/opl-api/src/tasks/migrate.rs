@@ -1,27 +1,35 @@
 //! 라이브 마이그레이션의 원본 쪽 Task(설계 §2의 2~8단계와 실패 되돌리기)와 남은 마이그레이션 QEMU
-//! 정리(설계 §2 "중간에 죽으면").
+//! 정리(설계 §2 "중간에 죽으면"). 노드 로컬 풀의 디스크는 대상 노드에 새로 만든 볼륨으로 미러해
+//! 복사하고, 확정 뒤 볼륨 기록을 옮기고 원본을 지운다(로컬 디스크 마이그레이션 설계 §3.3~§3.7).
 //!
 //! 두 QEMU가 함께 도는 일은 없다: 대상 QEMU는 멈춘 채 받고 확정(`spec.node`를 대상으로 쓰기) 뒤에만
 //! 대상 노드의 reconciler가 이어서 실행한다. 원본은 확정되지 않았다고 확인한 뒤에만 이어서 실행한다.
 //! 확정 쓰기와 되돌리기 쓰기는 같은 revision을 확인하므로 둘 중 하나만 적용된다.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use opl_cluster::ClusterError;
 use opl_cluster::types::{NodeId, Rejection};
-use opl_driver::{MigrateOptions, MigrateTarget, RuntimeStatus};
-use opl_peer::{IncomingMigration, MigrateIncomingRequest, Peers};
+use opl_driver::{
+    MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress, MirrorTarget, RuntimeStatus,
+};
+use opl_peer::{IncomingDisk, IncomingMigration, MigrateIncomingRequest, Peers};
 use opl_reconciler::ReconcilerHandle;
-use opl_reconciler::resolve::set_disks_shared;
-use opl_types::storage::VolumeSpec;
-use opl_types::task::{Task, TaskOp, TaskSpec};
-use opl_types::vm::{Firmware, MigrationStatus, PowerState, Vm, VmPhase, VmSpec};
+use opl_reconciler::resolve::{apply_disk_moves, set_disks_shared};
+use opl_types::node::NodeSpec;
+use opl_types::storage::{StoragePoolSpec, VolumeSpec, pool_state_on};
+use opl_types::task::{Task, TaskOp, TaskProgress, TaskSpec, TaskState, TaskStatus};
+use opl_types::vm::{DiskMove, Firmware, MigrationStatus, PowerState, Vm, VmPhase, VmSpec};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::Ctx;
 use crate::incoming::deactivate_disks;
+use crate::migration_disks::{self, DiskRecord, RecordedVolume, Role};
+use crate::scheduler::{Inventory, disk_moves};
 
 /// 확정 쓰기가 (과반수가 없는 등으로) 실패할 때 다시 시도하는 시간. 지나면 되돌린다.
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -30,12 +38,24 @@ const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// reconciler가 넘겨받으며 마이그레이션 표시를 지우므로 그대로 둔다.
 const RECORD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 디스크 복사량의 합이 이 시간 동안 늘지 않으면 실패한다(끊긴 링크를 일찍 잡는다).
+const DISK_STALL: Duration = Duration::from_secs(10 * 60);
+
+/// 디스크 복사의 진행률을 Task에 쓰는 최소 간격(바뀌었을 때만 쓴다)
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
 fn postmigrate() -> RuntimeStatus {
     RuntimeStatus::Other("postmigrate".into())
 }
 
-/// 실행 중인 VM을 `target` 노드로 옮긴다. 확정 전에 실패하면 원본을 계속 돌리고 실패한다.
-pub(super) async fn migrate(ctx: &Ctx, task: &Task, target: Uuid) -> Result<(), String> {
+/// 실행 중인 VM을 `target` 노드로 옮긴다. 노드 로컬 풀의 디스크는 `pool`(없으면 같은 이름의 풀)에
+/// 복사한다. 확정 전에 실패하면 원본을 계속 돌리고 실패한다.
+pub(super) async fn migrate(
+    ctx: &Ctx,
+    task: &Task,
+    target: Uuid,
+    pool: Option<&str>,
+) -> Result<(), String> {
     let id = task.spec.target;
     let peers = ctx
         .config
@@ -55,7 +75,7 @@ pub(super) async fn migrate(ctx: &Ctx, task: &Task, target: Uuid) -> Result<(), 
     let migration = MigrationStatus {
         node: target,
         task: task.id,
-        disks: vec![],
+        disks: plan_disks(ctx, id, pool)?,
     };
     let _hold = Hold::begin(&ctx.reconciler, id).await;
     let vm = match mark_migrating(ctx, id, &migration).await {
@@ -71,8 +91,9 @@ pub(super) async fn migrate(ctx: &Ctx, task: &Task, target: Uuid) -> Result<(), 
     let sent = match check_no_other_task(ctx, &vm) {
         Err(e) => Err(e),
         // 대상 노드가 받는 동안 디스크를 함께 연다(공유 LVM은 LV 잠금을 공유로).
+        // 로컬 풀의 디스크는 할 일이 없다(공유 LVM만 잠금을 바꾼다).
         Ok(()) => match set_disks_shared(&ctx.cluster, &vm, &*ctx.storage, true).await {
-            Ok(()) => send(ctx, &peers, &addr, &host, id, &migration).await,
+            Ok(()) => send(ctx, &peers, &addr, &host, &vm, &migration).await,
             Err(e) => Err(format!("cannot share the disks with the target node: {e}")),
         },
     };
@@ -128,6 +149,28 @@ fn addr_host(addr: &str) -> Option<&str> {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     (!host.is_empty()).then_some(host)
+}
+
+/// 복사할 디스크 계획(설계 §3.2): 지금의 VM·볼륨·풀 기록과 `pool`로 다시 만든다(API 검사 뒤의 변경을
+/// 따른다).
+fn plan_disks(ctx: &Ctx, id: Uuid, pool: Option<&str>) -> Result<Vec<DiskMove>, String> {
+    let read = |e: ClusterError| format!("cannot read the cluster state: {e}");
+    let vm = ctx
+        .cluster
+        .get::<VmSpec>(id)
+        .map_err(read)?
+        .ok_or("VM was deleted")?;
+    let inv = Inventory::load(&ctx.cluster).map_err(read)?;
+    let pool = match pool {
+        Some(name) => Some(
+            inv.pools
+                .iter()
+                .find(|p| p.name == name)
+                .ok_or_else(|| format!("storage pool {name:?} not found"))?,
+        ),
+        None => None,
+    };
+    Ok(disk_moves(&vm.spec, &inv, pool))
 }
 
 enum Mark {
@@ -216,15 +259,22 @@ fn check_no_other_task(ctx: &Ctx, vm: &Vm) -> Result<(), String> {
     Ok(())
 }
 
-/// 3~5단계: 대상 노드에 받을 준비를 시키고, 보내고, 대상이 다 받았는지 확인한다.
+/// 3~5단계: 대상 노드에 받을 준비를 시키고(복사할 디스크가 있으면 기록하고 공간을 본 뒤 대상에 만들게
+/// 하고 미러로 복사한다), 보내고, 대상이 다 받았는지 확인한다.
 async fn send(
     ctx: &Ctx,
     peers: &Peers,
     addr: &str,
     host: &str,
-    id: Uuid,
+    vm: &Vm,
     migration: &MigrationStatus,
 ) -> Result<(), String> {
+    let id = vm.id;
+    let disks = if migration.disks.is_empty() {
+        Vec::new()
+    } else {
+        prepare_copy(ctx, vm, migration).await?
+    };
     let qemu_version = ctx
         .hv
         .running_qemu_version(id)
@@ -234,21 +284,33 @@ async fn send(
         vm: id,
         task: migration.task,
         qemu_version,
+        disks,
     };
-    let port = peers
+    let reply = peers
         .migrate_incoming(addr, req)
         .await
         .map_err(|e| format!("the target node cannot receive the VM: {e}"))?;
+    let copied = if migration.disks.is_empty() {
+        None
+    } else {
+        let nbd = reply
+            .nbd_port
+            .ok_or("the target node did not export the disks to copy")?;
+        Some(copy_disks(ctx, vm, migration, host, nbd).await?)
+    };
     let target = MigrateTarget {
         host: host.to_string(),
-        port,
+        port: reply.port,
         tls_hostname: host.to_string(),
     };
     let opts = MigrateOptions {
         bandwidth: ctx.config.migration_bandwidth,
         timeout: ctx.config.migration_timeout,
-        switchover_mirrors: false,
+        switchover_mirrors: copied.is_some(),
     };
+    if let Some(copied) = copied {
+        write_progress(ctx, migration.task, "migrating-memory", copied).await;
+    }
     ctx.hv
         .migrate(id, &target, &opts)
         .await
@@ -261,6 +323,194 @@ async fn send(
         .migrate_incoming_wait(addr, incoming)
         .await
         .map_err(|e| format!("the target node did not receive the VM: {e}"))
+}
+
+/// 복사할 디스크의 원본(풀·id·형식)을 이 노드의 기록 파일(`source`)에 쓰고, 대상 풀마다 할당량의 합이
+/// 대상 노드가 알린 남은 공간 이하인지 본다(알리지 않았으면 보지 않는다). 대상에 만들 디스크(원본의
+/// 가상 크기)를 돌려준다.
+async fn prepare_copy(
+    ctx: &Ctx,
+    vm: &Vm,
+    migration: &MigrationStatus,
+) -> Result<Vec<IncomingDisk>, String> {
+    let dir = ctx
+        .config
+        .migration_disks
+        .as_deref()
+        .ok_or("this node cannot record the disks to copy")?;
+    let read = |e: ClusterError| format!("cannot read the cluster state: {e}");
+    let mut record = DiskRecord {
+        vm: vm.id,
+        task: migration.task,
+        role: Role::Source,
+        volumes: Vec::new(),
+    };
+    let mut disks = Vec::new();
+    let mut need: BTreeMap<&str, u64> = BTreeMap::new();
+    for m in &migration.disks {
+        let volume = ctx
+            .cluster
+            .get::<VolumeSpec>(m.volume)
+            .map_err(read)?
+            .ok_or_else(|| format!("volume {} was deleted", m.volume))?;
+        let pool = ctx
+            .cluster
+            .get_by_name::<StoragePoolSpec>(&volume.spec.pool)
+            .map_err(read)?
+            .ok_or_else(|| format!("storage pool {:?} not found", volume.spec.pool))?;
+        let info = ctx
+            .storage
+            .volume_info(&pool, volume.id, volume.spec.format)
+            .await
+            .map_err(|e| format!("cannot read disk {:?}: {e}", volume.name))?;
+        record.volumes.push(RecordedVolume {
+            id: volume.id,
+            pool: volume.spec.pool.clone(),
+            format: volume.spec.format,
+            created: false,
+        });
+        disks.push(IncomingDisk {
+            volume: volume.id,
+            size_bytes: info.virtual_bytes,
+        });
+        *need.entry(&m.pool).or_default() += info.allocated_bytes;
+    }
+    migration_disks::write(dir, &record)
+        .map_err(|e| format!("cannot record the disks to copy: {e}"))?;
+    let node = ctx.cluster.get::<NodeSpec>(migration.node).map_err(read)?;
+    for (name, need) in need {
+        let pool = ctx
+            .cluster
+            .get_by_name::<StoragePoolSpec>(name)
+            .map_err(read)?;
+        if let (Some(node), Some(pool)) = (&node, pool)
+            && let Some(state) = pool_state_on(&pool, node)
+            && need > state.available_bytes
+        {
+            return Err(format!(
+                "not enough space in storage pool {name:?} on node {:?}: need {need}, available {}",
+                node.name, state.available_bytes
+            ));
+        }
+    }
+    Ok(disks)
+}
+
+/// 복사할 디스크마다 대상 노드의 NBD 내보내기(`disk{i}`)로 미러를 시작하고 모두 따라잡기를 기다린다
+/// (설계 §3.4). 대역폭 상한은 디스크 수로 나눈다. 그동안 진행률을 Task에 쓴다. 복사량의 마지막 값을
+/// 돌려준다. 실패하면 드라이버가 미러를 치운다.
+async fn copy_disks(
+    ctx: &Ctx,
+    vm: &Vm,
+    migration: &MigrationStatus,
+    host: &str,
+    nbd: u16,
+) -> Result<MirrorProgress, String> {
+    let read = |e: ClusterError| format!("cannot read the cluster state: {e}");
+    let mut targets = Vec::new();
+    for (i, disk) in vm.spec.disks.iter().enumerate() {
+        let volume = ctx
+            .cluster
+            .get_by_name::<VolumeSpec>(&disk.volume)
+            .map_err(read)?;
+        let Some(m) = volume.and_then(|v| migration.disks.iter().find(|m| m.volume == v.id)) else {
+            continue;
+        };
+        targets.push(MirrorTarget {
+            disk: i,
+            host: host.to_string(),
+            port: nbd,
+            export: format!("disk{i}"),
+            tls_hostname: host.to_string(),
+            format: m.format,
+        });
+    }
+    let (tx, rx) = watch::channel(MirrorProgress::default());
+    let opts = MirrorOptions {
+        speed: ctx
+            .config
+            .migration_bandwidth
+            .map(|b| b / targets.len().max(1) as u64),
+        timeout: ctx.config.migration_disk_timeout,
+        stall: DISK_STALL,
+        progress: Some(tx),
+    };
+    // 미러가 끝나면 opts(보내는 쪽)가 버려져 진행률 쓰기도 끝난다.
+    let mirror = async move { ctx.hv.mirror_disks(vm.id, &targets, &opts).await };
+    let (mirrored, last) = tokio::join!(mirror, report_copy(ctx, migration.task, rx));
+    mirrored.map_err(|e| e.to_string())?;
+    Ok(last)
+}
+
+/// 미러의 진행이 바뀌면 Task에 쓴다(첫 변화는 곧바로, 그 뒤 `PROGRESS_INTERVAL`에 한 번까지). Task가
+/// 이미 끝났으면 그 뒤로 쓰지 않는다. 보내는 쪽이 사라지면 마지막 값을 돌려준다.
+async fn report_copy(
+    ctx: &Ctx,
+    task: Uuid,
+    mut rx: watch::Receiver<MirrorProgress>,
+) -> MirrorProgress {
+    let mut written = None;
+    let mut due = Instant::now();
+    let mut pending = false;
+    let mut reporting = true;
+    loop {
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    return *rx.borrow();
+                }
+                pending = reporting;
+            }
+            () = tokio::time::sleep_until(due), if pending => {
+                pending = false;
+                let now = *rx.borrow_and_update();
+                if written != Some(now) {
+                    reporting = write_progress(ctx, task, "copying-disks", now).await;
+                    written = Some(now);
+                }
+                due = Instant::now() + PROGRESS_INTERVAL;
+            }
+        }
+    }
+}
+
+/// 실행 중인 Task의 진행률을 쓴다(읽은 revision 확인). Task가 이미 `Running`이 아니면(다른 쪽이
+/// 끝냈다) 되살리지 않도록 쓰지 않고 거짓이다. 실패는 경고만 남긴다.
+async fn write_progress(ctx: &Ctx, task: Uuid, stage: &str, progress: MirrorProgress) -> bool {
+    let status = TaskStatus {
+        state: TaskState::Running,
+        error: None,
+        progress: Some(TaskProgress {
+            stage: stage.into(),
+            done_bytes: progress.done_bytes,
+            total_bytes: progress.total_bytes,
+        }),
+    };
+    loop {
+        let current = match ctx.cluster.get::<TaskSpec>(task) {
+            Ok(Some(current)) => current,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(task = %task, error = %e, "cannot record the migration progress");
+                return true;
+            }
+        };
+        if current.status.state != TaskState::Running {
+            return false;
+        }
+        match ctx
+            .cluster
+            .update_status_checked::<TaskSpec>(task, current.revision, &status)
+            .await
+        {
+            Ok(_) => return true,
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+            Err(e) => {
+                tracing::warn!(task = %task, error = %e, "cannot record the migration progress");
+                return true;
+            }
+        }
+    }
 }
 
 /// 6단계: `spec.node`를 대상 노드로 쓴다(revision 확인). 이 쓰기가 적용되면 확정이다. 결과를 모르는
@@ -315,8 +565,9 @@ enum Outcome {
     Committed,
 }
 
-/// 확정 전 실패: 마이그레이션 표시를 지워(읽은 revision 확인) 확정을 막은 뒤 대상의 받는 QEMU를
-/// 끄게 하고, 원본이 아직 보내고 있으면 취소하고(나중에 끝나 원본이 멈추지 않게), 원본이 멈춰
+/// 확정 전 실패: 마이그레이션 표시를 지워(읽은 revision 확인) 확정을 막은 뒤, 원본이 아직 보내고
+/// 있으면 취소하고(나중에 끝나 원본이 멈추지 않게, 남은 디스크 미러도 치운다) 대상의 받는 QEMU를
+/// 끄게 하고(복사하려고 만든 디스크도 지운다), 원본이 멈춰
 /// 있으면(`postmigrate`, `paused`) 이어서 실행한다(못 하면 보류가 풀린 뒤 reconciler가 한다). HA VM은
 /// 여기서 이어서 실행하지 않는다: 보류가 풀린 뒤 reconciler가 리스와 watchdog를 확인하고 이어서 실행한다
 /// (그 사이 리스가 끝났으면 끈다). 디스크는
@@ -366,16 +617,17 @@ async fn roll_back(
             }
         }
     }
+    // 남은 디스크 미러가 대상의 NBD 내보내기를 쥐고 있으면 대상이 받는 QEMU를 끄기 전에 치운다.
+    if let Err(e) = ctx.hv.cancel_migration(id).await {
+        tracing::warn!(vm = %id, error = %e, "cannot cancel the outgoing migration");
+    }
     let incoming = IncomingMigration {
         vm: id,
         task: migration.task,
     };
-    // 닿지 않으면 대상 노드의 정리가 끈다(마이그레이션 표시가 없다).
+    // 닿지 않으면 대상 노드의 정리가 끈다(마이그레이션 표시가 없다). 복사하려고 만든 디스크도 그렇다.
     if let Err(e) = peers.migrate_incoming_abort(addr, incoming).await {
         tracing::warn!(vm = %id, error = %e, "cannot abort the incoming migration on the target node");
-    }
-    if let Err(e) = ctx.hv.cancel_migration(id).await {
-        tracing::warn!(vm = %id, error = %e, "cannot cancel the outgoing migration");
     }
     let resumed = match ctx.hv.inspect(id).await {
         Ok(Some(state))
@@ -387,14 +639,25 @@ async fn roll_back(
         Ok(_) => Ok(()),
         Err(e) => Err(e.to_string()),
     };
+    // 원본 볼륨은 그대로 쓴다.
+    if !migration.disks.is_empty()
+        && let Some(dir) = &ctx.config.migration_disks
+        && let Err(e) = migration_disks::remove(dir, migration.task)
+    {
+        tracing::warn!(vm = %id, error = %e, "cannot remove a migration disk record");
+    }
     Outcome::RolledBack(resumed.err())
 }
 
 /// 7~8단계(확정 뒤): status를 대상 노드의 `Running`으로(UEFI 변수도 대상 노드에) 쓰고, 원본 QEMU를 끄고, 원본 쪽 디스크를
-/// 끈다. 대상 QEMU는 대상 노드의 reconciler가 이어서 실행한다. 실패해도 확정은 끝났으므로 경고만
-/// 남긴다(남은 원본은 정리가 끈다).
+/// 끈다. 디스크를 복사했으면 status를 쓰기 전에 볼륨 기록을 옮기고, 원본 QEMU가 꺼진 뒤 원본 볼륨을
+/// 지운다. 대상 QEMU는 대상 노드의 reconciler가 이어서 실행한다. 실패해도 확정은 끝났으므로 경고만
+/// 남긴다(남은 원본은 정리가 끄고 지운다).
 async fn finish(ctx: &Ctx, id: Uuid, migration: &MigrationStatus) {
     let deadline = Instant::now() + RECORD_TIMEOUT;
+    // 복사한 디스크의 볼륨 기록을 옮긴 위치로 고친 뒤에만 표시를 지운다. 못 고치면 대상 노드의
+    // reconciler가 고치고 지운다.
+    let moved = migration.disks.is_empty() || apply_moves(ctx, id, deadline).await;
     let vm = loop {
         let vm = match ctx.cluster.get::<VmSpec>(id) {
             Ok(Some(vm)) => vm,
@@ -411,7 +674,7 @@ async fn finish(ctx: &Ctx, id: Uuid, migration: &MigrationStatus) {
             }
         };
         // 대상 노드의 reconciler가 이미 넘겨받아 표시를 지웠다.
-        if vm.status.migration.as_ref() != Some(migration) {
+        if vm.status.migration.as_ref() != Some(migration) || !moved {
             break vm;
         }
         let mut status = vm.status.clone();
@@ -442,12 +705,55 @@ async fn finish(ctx: &Ctx, id: Uuid, migration: &MigrationStatus) {
             }
         }
     };
-    stop_source(ctx, &vm).await;
+    // 복사한 디스크의 원본은 볼륨 기록(이제 대상의 풀)이 아니라 기록 파일의 원래 풀에 있다.
+    let copies = recorded(ctx, id, Role::Source, Some(migration.task));
+    // 원본 QEMU가 꺼졌으면 복사한 디스크의 원본 볼륨을 지운다(기록 파일과 볼륨 기록의 위치로 다시
+    // 확인한다). 지우지 못하면 정리가 다시 한다.
+    if stop_source(ctx, &vm, &copies).await
+        && !migration.disks.is_empty()
+        && let Some(dir) = &ctx.config.migration_disks
+    {
+        let records = migration_disks::lock(dir).await;
+        migration_disks::clean_up(
+            &ctx.cluster,
+            &*ctx.storage,
+            &*ctx.hv,
+            ctx.config.node,
+            &records,
+            Some(id),
+            None,
+        )
+        .await;
+    }
+}
+
+/// 확정된 VM의 복사한 디스크의 볼륨 기록을 고친다(`apply_disk_moves`). 결과를 모르는 오류는
+/// `deadline`까지 다시 시도한다. 고쳤으면(또는 대상 노드가 이미 고쳐 표시를 지웠으면) 참이다.
+async fn apply_moves(ctx: &Ctx, id: Uuid, deadline: Instant) -> bool {
+    loop {
+        let applied = match ctx.cluster.get::<VmSpec>(id) {
+            Ok(Some(vm)) => apply_disk_moves(&ctx.cluster, &vm).await,
+            Ok(None) => return false,
+            Err(e) => Err(e),
+        };
+        match applied {
+            Ok(()) => return true,
+            Err(e) if Instant::now() < deadline => {
+                tracing::warn!(vm = %id, error = %e, "cannot move the volume records; will retry");
+                tokio::time::sleep(ctx.config.poll_interval).await;
+            }
+            Err(e) => {
+                tracing::warn!(vm = %id, error = %e, "cannot move the volume records; leaving them to the target node");
+                return false;
+            }
+        }
+    }
 }
 
 /// 마이그레이션을 보내고 멈춘 원본 QEMU(`postmigrate`)를 끄고(탭은 드라이버가 지운다) 이 노드의
-/// 디스크를 끈다. 다른 상태의 QEMU는 끄지 않고, QEMU가 남아 있으면 디스크도 그대로 둔다.
-async fn stop_source(ctx: &Ctx, vm: &Vm) {
+/// 디스크를 끈다(복사한 디스크는 `copies`, 원본 기록 파일의 풀로). 다른 상태의 QEMU는 끄지 않고, QEMU가
+/// 남아 있으면 디스크도 그대로 둔다. QEMU가 없으면 참이다.
+async fn stop_source(ctx: &Ctx, vm: &Vm, copies: &[RecordedVolume]) -> bool {
     let stopped = match ctx.hv.stop_migrated(vm.id).await {
         Ok(true) => true,
         Ok(false) => matches!(ctx.hv.inspect(vm.id).await, Ok(None)),
@@ -457,8 +763,9 @@ async fn stop_source(ctx: &Ctx, vm: &Vm) {
         }
     };
     if stopped {
-        deactivate_disks(&ctx.cluster, &*ctx.storage, vm).await;
+        deactivate_disks(&ctx.cluster, &*ctx.storage, vm, copies).await;
     }
+    stopped
 }
 
 /// 남은 마이그레이션 QEMU를 시작할 때와 그 뒤 `tag_sweep`마다 끈다([`sweep`]). 실행기가 멈추면
@@ -480,6 +787,8 @@ pub(super) async fn sweep_every(ctx: Arc<Ctx>) {
 ///   지워졌어도 끈다.
 ///
 /// 확정 전의 원본(`spec.node`·`status.node`가 이 노드)은 마이그레이션 Task나 reconciler가 다룬다.
+/// 그 뒤 마이그레이션 디스크 기록 파일을 정리 규칙(설계 §3.6)대로 정리한다: 되돌려졌거나 확정 전에
+/// 끝난 마이그레이션이 대상에 만든 볼륨, 확정 뒤 지우지 못한 원본 볼륨을 지운다.
 pub(super) async fn sweep(ctx: &Ctx) {
     let me = ctx.config.node;
     match ctx.hv.list().await {
@@ -499,7 +808,7 @@ pub(super) async fn sweep(ctx: &Ctx) {
                     }
                     Ok(Some(vm)) => {
                         tracing::info!(vm = %vm.id, "stopping the source QEMU of a migration committed elsewhere");
-                        stop_source(ctx, &vm).await;
+                        stop_source(ctx, &vm, &recorded(ctx, vm.id, Role::Source, None)).await;
                     }
                     // 옮긴 뒤 끄고 지웠다. 볼륨은 VM과 함께 지워지지 않지만 이 노드에서 켜진 채
                     // 남은 볼륨은 실행기의 정리가 끈다.
@@ -515,6 +824,38 @@ pub(super) async fn sweep(ctx: &Ctx) {
         }
         Err(e) => tracing::warn!(error = %e, "cannot list VMs on this node"),
     }
+    sweep_incoming(ctx).await;
+    // 남은 QEMU를 끈 뒤 디스크 기록 파일을 정리한다(받기와 겹치지 않게 잠금을 쥐고).
+    if let Some(dir) = &ctx.config.migration_disks {
+        let records = migration_disks::lock(dir).await;
+        migration_disks::clean_up(
+            &ctx.cluster,
+            &*ctx.storage,
+            &*ctx.hv,
+            me,
+            &records,
+            None,
+            None,
+        )
+        .await;
+    }
+}
+
+/// 이 노드의 디스크 기록 가운데 VM `vm`의 `role` 기록(`task`가 있으면 그 Task의 것)이 적은 볼륨들
+fn recorded(ctx: &Ctx, vm: Uuid, role: Role, task: Option<Uuid>) -> Vec<RecordedVolume> {
+    let Some(dir) = &ctx.config.migration_disks else {
+        return Vec::new();
+    };
+    migration_disks::list(dir)
+        .into_iter()
+        .filter(|r| r.vm == vm && r.role == role && task.is_none_or(|t| t == r.task))
+        .flat_map(|r| r.volumes)
+        .collect()
+}
+
+/// [`sweep`]: 확정되지 않은 채 남은 받는 QEMU를 끈다.
+async fn sweep_incoming(ctx: &Ctx) {
+    let me = ctx.config.node;
     let incoming = match ctx.hv.list_incoming().await {
         Ok(ids) => ids,
         Err(e) => {
@@ -556,7 +897,9 @@ pub(super) async fn sweep(ctx: &Ctx) {
             continue;
         }
         if let Some(vm) = &vm {
-            deactivate_disks(&ctx.cluster, &*ctx.storage, vm).await;
+            // 복사하려고 만든 디스크는 기록의 풀(계획의 풀)에 있다.
+            let copies = recorded(ctx, id, Role::Target, Some(task));
+            deactivate_disks(&ctx.cluster, &*ctx.storage, vm, &copies).await;
         }
     }
 }

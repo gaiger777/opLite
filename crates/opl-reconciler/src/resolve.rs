@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DiskLocation, DriverError, Storage, disk_location};
 use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
@@ -14,7 +15,7 @@ use opl_types::storage::{
     pool_state_on,
 };
 use opl_types::task::{TaskOp, TaskSpec, TaskState};
-use opl_types::vm::Vm;
+use opl_types::vm::{DiskMove, Vm};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -85,7 +86,8 @@ pub async fn running_spec(
 }
 
 /// 라이브 마이그레이션을 받을 때의 [`runtime_spec`]. 볼륨을 `activate_volume` 대신
-/// `share_volume`으로 켠다(원본 노드가 아직 쓰고 있다).
+/// `share_volume`으로 켠다(원본 노드가 아직 쓰고 있다). 복사하는 디스크(`status.migration.disks`)는
+/// 이 노드에 새로 만든 볼륨이므로 계획의 풀·형식으로 `activate_volume`한다.
 pub async fn incoming_spec(
     cluster: &Cluster,
     vm: &Vm,
@@ -129,6 +131,47 @@ pub async fn set_disks_shared(
                     pool_name.clone(),
                     e.to_string(),
                 ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// VM이 마이그레이션 계획의 노드로 확정됐으면(`spec.node`가 `status.migration.node`) 계획의 디스크마다
+/// 볼륨 기록을 옮긴 위치로 고친다: 풀·형식이 다르면 spec을, 만든 노드(`status.node`)가 다르면 status를
+/// (둘 다 revision 확인, 그 사이 바뀌었으면 다시 읽어). 이미 고쳤으면 할 일이 없다(멱등). 확정되지
+/// 않은 VM, 계획이 없는 VM, 없어진 볼륨에는 아무것도 하지 않는다.
+pub async fn apply_disk_moves(cluster: &Cluster, vm: &Vm) -> Result<(), ClusterError> {
+    let Some(migration) = &vm.status.migration else {
+        return Ok(());
+    };
+    if vm.spec.node != Some(migration.node) {
+        return Ok(());
+    }
+    for m in &migration.disks {
+        loop {
+            let Some(volume) = cluster.get::<VolumeSpec>(m.volume)? else {
+                break;
+            };
+            let written = if volume.spec.pool != m.pool || volume.spec.format != m.format {
+                let mut spec = volume.spec.clone();
+                spec.pool = m.pool.clone();
+                spec.format = m.format;
+                cluster
+                    .update_spec(volume.id, Some(volume.revision), volume.labels, &spec)
+                    .await
+            } else if volume.status.node != Some(migration.node) {
+                let mut status = volume.status.clone();
+                status.node = Some(migration.node);
+                cluster
+                    .update_status_checked::<VolumeSpec>(volume.id, volume.revision, &status)
+                    .await
+            } else {
+                break;
+            };
+            match written {
+                Ok(_) | Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
     }
@@ -179,11 +222,17 @@ async fn resolve(
 ) -> Result<VmRuntimeSpec, ResolveError> {
     let me = cluster.get::<NodeSpec>(node)?;
     let (_, tasks) = cluster.list::<TaskSpec>()?;
+    // 받는 마이그레이션이 이 노드로 복사하는 디스크
+    let moves: &[DiskMove] = match (&vm.status.migration, how) {
+        (Some(m), Activate::Incoming) => &m.disks,
+        _ => &[],
+    };
     let mut disks = Vec::with_capacity(vm.spec.disks.len());
     for disk in &vm.spec.disks {
         let volume = cluster
             .get_by_name::<VolumeSpec>(&disk.volume)?
             .ok_or_else(|| ResolveError::VolumeNotFound(disk.volume.clone()))?;
+        let moved = moves.iter().find(|m| m.volume == volume.id);
         if how != Activate::Running
             && tasks.iter().any(|t| {
                 t.spec.target == volume.id
@@ -193,7 +242,7 @@ async fn resolve(
         {
             return Err(ResolveError::VolumeResizing(disk.volume.clone()));
         }
-        let pool_name = &volume.spec.pool;
+        let pool_name = moved.map_or(&volume.spec.pool, |m| &m.pool);
         let pool = cluster
             .get_by_name::<StoragePoolSpec>(pool_name)?
             .ok_or_else(|| ResolveError::PoolNotFound(pool_name.clone()))?;
@@ -240,10 +289,12 @@ async fn resolve(
             let error = pool_error_on(&pool, me);
             return Err(ResolveError::PoolUnavailable(pool_name.clone(), error));
         }
-        let format = volume.spec.format;
+        let format = moved.map_or(volume.spec.format, |m| m.format);
         let activation = match how {
-            Activate::Incoming => storage.share_volume(&pool, volume.id, format).await,
-            Activate::Start | Activate::Running => {
+            Activate::Incoming if moved.is_none() => {
+                storage.share_volume(&pool, volume.id, format).await
+            }
+            Activate::Incoming | Activate::Start | Activate::Running => {
                 storage.activate_volume(&pool, volume.id, format).await
             }
         };
@@ -274,7 +325,7 @@ async fn resolve(
             path,
             kind,
             rbd,
-            format: volume.spec.format,
+            format,
             bus: disk.bus,
             boot_order: disk.boot_order,
         });

@@ -11,8 +11,9 @@ use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use opl_peer::{
-    AuditSource, GrpcNetwork, IncomingError, IncomingMigration, MigrateIncomingRequest,
-    MigrationReceiver, NodeMonitor, NodeMonitorConfig, PeerService, Peers, UefiVarsError,
+    AuditSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration,
+    MigrateIncomingRequest, MigrateIncomingResponse, MigrationReceiver, NodeMonitor,
+    NodeMonitorConfig, PeerService, Peers, UefiVarsError,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
 use opl_types::node::{NodeSpec, NodeStatus};
@@ -142,10 +143,13 @@ struct FakeReceiver {
 
 #[async_trait::async_trait]
 impl MigrationReceiver for FakeReceiver {
-    async fn incoming(&self, req: MigrateIncomingRequest) -> Result<u16, IncomingError> {
+    async fn incoming(
+        &self,
+        req: MigrateIncomingRequest,
+    ) -> Result<MigrateIncomingResponse, IncomingError> {
         self.calls.lock().unwrap().push(format!(
-            "incoming {} {} {}",
-            req.vm, req.task, req.qemu_version
+            "incoming {} {} {} {:?}",
+            req.vm, req.task, req.qemu_version, req.disks
         ));
         if req.qemu_version != "8.2.2" {
             return Err(IncomingError::Incompatible(format!(
@@ -153,7 +157,11 @@ impl MigrationReceiver for FakeReceiver {
                 req.qemu_version
             )));
         }
-        Ok(60007)
+        // 복사할 디스크가 있으면 NBD 포트도 연다.
+        Ok(MigrateIncomingResponse {
+            port: 60007,
+            nbd_port: (!req.disks.is_empty()).then_some(60008),
+        })
     }
 
     async fn wait(&self, req: IncomingMigration) -> Result<(), IncomingError> {
@@ -549,14 +557,34 @@ async fn migration_requests_reach_the_receiver_of_a_member() {
         vm,
         task,
         qemu_version: version.into(),
+        disks: vec![],
     };
     assert_eq!(
         peers
             .migrate_incoming(&target.addr, req("8.2.2"))
             .await
             .unwrap(),
-        60007
+        MigrateIncomingResponse {
+            port: 60007,
+            nbd_port: None
+        }
     );
+    // 복사할 디스크는 요청에 실려 가고 NBD 포트가 돌아온다.
+    let disk = IncomingDisk {
+        volume: Uuid::now_v7(),
+        size_bytes: 1 << 30,
+    };
+    let reply = peers
+        .migrate_incoming(
+            &target.addr,
+            MigrateIncomingRequest {
+                disks: vec![disk],
+                ..req("8.2.2")
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.nbd_port, Some(60008));
     // 받는 쪽의 거절과 실패는 그 종류 그대로 온다.
     let err = peers
         .migrate_incoming(&target.addr, req("9.0.0"))
@@ -579,8 +607,9 @@ async fn migration_requests_reach_the_receiver_of_a_member() {
     assert_eq!(
         *receiver.calls.lock().unwrap(),
         [
-            format!("incoming {vm} {task} 8.2.2"),
-            format!("incoming {vm} {task} 9.0.0"),
+            format!("incoming {vm} {task} 8.2.2 []"),
+            format!("incoming {vm} {task} 8.2.2 {:?}", [disk]),
+            format!("incoming {vm} {task} 9.0.0 []"),
             format!("wait {vm} {task}"),
             format!("abort {vm} {task}"),
         ]
@@ -607,7 +636,7 @@ async fn migration_requests_reach_the_receiver_of_a_member() {
         matches!(&err, IncomingError::Unavailable(m) if m.contains("not a member")),
         "{err:?}"
     );
-    assert_eq!(receiver.calls.lock().unwrap().len(), 4);
+    assert_eq!(receiver.calls.lock().unwrap().len(), 5);
 }
 
 #[tokio::test]

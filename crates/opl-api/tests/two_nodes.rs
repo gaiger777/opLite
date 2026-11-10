@@ -1,5 +1,6 @@
 //! 실제 gRPC(mTLS)로 이은 두 노드: 한 노드의 API로 다른 노드에 VM을 띄우고 콘솔을 중계한다.
-//! 라이브 마이그레이션(Mock 하이퍼바이저): 성공, 확정 전 실패의 되돌리기(HA VM 포함), 공유 디스크의 잠금 바꾸기.
+//! 라이브 마이그레이션(Mock 하이퍼바이저): 성공, 확정 전 실패의 되돌리기(HA VM 포함), 공유 디스크의 잠금 바꾸기,
+//! 로컬 디스크 복사(대상에 만들기, 볼륨 기록 옮기기, 원본 지우기, 실패 때 대상 사본 지우기, 되돌아오는 VM).
 //! 노드 비우기: 공유 풀 VM은 다른 노드로 옮기고(들어오던 VM도) 로컬 디스크 VM은 남기며, 유지보수가 끝나면 멈춘다.
 //! 감사 로그: 한 노드의 `GET /audit`가 두 노드의 항목을 합치고, 닿지 않는 노드를 알린다.
 //! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
@@ -18,22 +19,24 @@ use opl_api::{
 };
 use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig};
+use opl_driver::mock::MOCK_MIRROR_BYTES;
 use opl_driver::{
-    DriverError, Hypervisor, MigrateTarget, MockHypervisor, RuntimeStatus, Storage, uefi_vars_path,
+    DriverError, Hypervisor, MigrateTarget, MirrorTarget, MockHypervisor, RuntimeStatus, Storage,
+    uefi_vars_path,
 };
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use opl_peer::{GrpcNetwork, PeerService, Peers};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role, UserSpec};
-use opl_types::node::{FEATURES, Fencing, NodeHa, NodeSpec, NodeStatus};
+use opl_types::node::{FEATURES, Fencing, NodeHa, NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
     PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
 };
-use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
-use opl_types::vm::{Arch, PowerState, VmPhase, VmSpec};
+use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
+use opl_types::vm::{Arch, DiskMove, PowerState, VmPhase, VmSpec};
 use reqwest::StatusCode;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -70,7 +73,10 @@ struct Node {
     base: String,
     /// reconciler의 HA guard. None이면 펜싱이 꺼진 노드다.
     ha: Option<Arc<HaGuard>>,
-    _workers: Option<(Reconciler, TaskRunner)>,
+    reconciler: Option<Reconciler>,
+    runner: Option<TaskRunner>,
+    /// Task 실행기를 다시 띄울 때 쓰는 설정
+    runner_config: Option<opl_api::TaskRunnerConfig>,
 }
 
 impl Node {
@@ -115,7 +121,9 @@ impl Node {
             peer_server: None,
             base: String::new(),
             ha: None,
-            _workers: None,
+            reconciler: None,
+            runner: None,
+            runner_config: None,
         }
     }
 
@@ -123,6 +131,7 @@ impl Node {
     async fn serve(&mut self, root: &TempDir) {
         let hv: Arc<dyn Hypervisor> = self.hv.clone();
         let storage: Arc<dyn Storage> = self.storage.clone();
+        let work = root.path().join(format!("{}-work", self.id));
         let incoming = IncomingMigrations::new(
             self.cluster.clone(),
             hv.clone(),
@@ -132,9 +141,10 @@ impl Node {
                 storage: storage.clone(),
                 listen_host: "127.0.0.1".into(),
                 ports: MIGRATION_PORTS,
+                // Task 실행기(`runner_config`)와 같다.
+                migration_disks: work.join("migration-disks"),
             },
         );
-        let work = root.path().join(format!("{}-work", self.id));
         // opld처럼 API와 노드 간 서버가 같은 감사 로그를 쓴다.
         let audit = Arc::new(if self.audit_off {
             AuditLog::disabled()
@@ -191,19 +201,32 @@ impl Node {
         config.firmware = Some(firmware);
         // opld처럼 노드 비우기 Task가 API 상태를 쓴다.
         config.api = Some(state.clone());
-        let runner = TaskRunner::spawn(
-            self.cluster.clone(),
-            storage,
-            hv,
-            reconciler.handle(),
-            config,
-        )
-        .await;
+        self.reconciler = Some(reconciler);
+        self.runner_config = Some(config);
+        self.start_runner().await;
         let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.base = format!("http://{}", api.local_addr().unwrap());
         let app = opl_api::router(state);
         tokio::spawn(async move { axum::serve(api, app).await.unwrap() });
-        self._workers = Some((reconciler, runner));
+    }
+
+    /// Task 실행기를 멈춘다(opld가 내려간 것처럼 실행 중인 Task도 멈춘다).
+    async fn stop_runner(&mut self) {
+        self.runner.take().unwrap().shutdown().await;
+    }
+
+    /// Task 실행기를 (다시) 띄운다. 시작할 때 남은 마이그레이션을 정리한다.
+    async fn start_runner(&mut self) {
+        self.runner = Some(
+            TaskRunner::spawn(
+                self.cluster.clone(),
+                self.storage.clone(),
+                self.hv.clone(),
+                self.reconciler.as_ref().unwrap().handle(),
+                self.runner_config.clone().unwrap(),
+            )
+            .await,
+        );
     }
 }
 
@@ -555,7 +578,7 @@ async fn running_vm_migrates_to_the_other_node() {
     })
     .await;
     // B의 reconciler가 넘겨받으며 `firmware_node`를 쓰기 전에, 확정 뒤 기록이 B를 쓰는지 본다.
-    let b_reconciler = b._workers.as_ref().unwrap().0.handle();
+    let b_reconciler = b.reconciler.as_ref().unwrap().handle();
     b_reconciler.begin_migration(vm.id).await;
 
     // B의 API로 요청해도 Task는 원본 노드 A에서 돈다.
@@ -975,6 +998,495 @@ async fn failed_migration_makes_shared_disks_exclusive_again() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(lock_calls(&a, volume), ["share", "exclusive"]);
     assert_eq!(lock_calls(&b, volume), ["share", "deactivate"]);
+}
+
+/// 노드마다 따로인 로컬 디스크의 크기
+const LOCAL_SIZE: u64 = 1 << 20;
+
+/// A에서 도는 VM `web`. 디스크는 로컬 디렉터리 풀 `local`(노드마다 따로 있는 같은 이름의 풀)의 볼륨
+/// `root`(qcow2)이고 그 파일은 A에 있다. 볼륨 id를 함께 돌려준다.
+async fn running_vm_with_local_disk(a: &Node, admin: &common::Client) -> (opl_types::vm::Vm, Uuid) {
+    dir_pool(a, "local", false).await;
+    let mut volume: Volume = Resource::new(
+        "root",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: LOCAL_SIZE,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    volume.status.node = Some(a.id);
+    volume.status.phase = VolumePhase::Ready;
+    a.cluster.create(&volume).await.unwrap();
+    a.storage.place(volume.id, LOCAL_SIZE);
+    let mut req = vm_request("web");
+    req["spec"]["node"] = serde_json::json!(a.id);
+    req["spec"]["disks"] = serde_json::json!([{ "volume": "root", "bus": "virtio-blk" }]);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let vm = a.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
+    (vm, volume.id)
+}
+
+/// 노드의 마이그레이션 디스크 기록 파일(`runner_config`의 디렉터리)
+fn disk_record(root: &TempDir, node: &Node, task: &serde_json::Value) -> std::path::PathBuf {
+    root.path()
+        .join(format!("{}-work", node.id))
+        .join("migration-disks")
+        .join(format!("{}.json", task["id"].as_str().unwrap()))
+}
+
+fn volume_of(a: &Node, id: Uuid) -> Volume {
+    a.cluster.get::<VolumeSpec>(id).unwrap().unwrap()
+}
+
+/// 로컬 디스크는 B에 같은 id로 새로 만들어 미러로 복사하고(NBD 포트, 내보내기 `disk0`), 스위치오버에서
+/// 미러를 끝낸다. 확정 뒤 볼륨 기록이 B로 옮겨지고 A의 원본 파일과 기록이 지워진다. 메모리 단계에
+/// 들어가면 Task에 진행률이 보이고 끝나면 지운다.
+#[tokio::test]
+async fn local_disks_are_copied_to_the_other_node() {
+    let (root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (vm, volume) = running_vm_with_local_disk(&a, &admin).await;
+
+    a.hv.delay_migrations(Duration::from_millis(500));
+    let (status, task) = admin
+        .post("/vms/web/migrate", serde_json::json!({ "node": "node2" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let id: Uuid = task["id"].as_str().unwrap().parse().unwrap();
+    let deadline = Instant::now() + WAIT;
+    let progress = loop {
+        let t = a.cluster.get::<TaskSpec>(id).unwrap().unwrap();
+        if let Some(p) = t
+            .status
+            .progress
+            .clone()
+            .filter(|p| p.stage == "migrating-memory")
+        {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "no progress: {:?}", t.status);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(progress.done_bytes, MOCK_MIRROR_BYTES);
+    assert_eq!(progress.total_bytes, MOCK_MIRROR_BYTES);
+    // 복사하는 동안 VM 기록에 계획이 있다.
+    let migration = a
+        .cluster
+        .get::<VmSpec>(vm.id)
+        .unwrap()
+        .unwrap()
+        .status
+        .migration
+        .unwrap();
+    assert_eq!(
+        migration.disks,
+        [DiskMove {
+            volume,
+            pool: "local".into(),
+            format: ImageFormat::Qcow2,
+        }]
+    );
+    assert!(disk_record(&root, &a, &task).exists());
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert!(task["status"].get("progress").is_none(), "{task}");
+
+    assert_eq!(
+        a.hv.mirrors(),
+        [(
+            vm.id,
+            vec![MirrorTarget {
+                disk: 0,
+                host: "127.0.0.1".into(),
+                port: MIGRATION_PORTS.start() + 1,
+                export: "disk0".into(),
+                tls_hostname: "127.0.0.1".into(),
+                format: ImageFormat::Qcow2,
+            }]
+        )]
+    );
+    assert_eq!(a.hv.switchovers(), [vm.id]);
+    let moved = volume_of(&a, volume);
+    assert_eq!(moved.status.node, Some(b.id));
+    assert_eq!(moved.spec.pool, "local");
+    assert_eq!(moved.spec.format, ImageFormat::Qcow2);
+    assert!(b.storage.has_file(volume));
+    assert!(b.storage.deleted().is_empty());
+    assert!(!a.storage.has_file(volume));
+    assert_eq!(a.storage.deleted(), [volume]);
+    assert!(!disk_record(&root, &a, &task).exists());
+    // B의 reconciler가 넘겨받아(NBD 내보내기를 멈추고) 이어서 실행한다.
+    let deadline = Instant::now() + WAIT;
+    while b.hv.is_incoming(vm.id) {
+        assert!(Instant::now() < deadline, "B did not take over the VM");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(b.hv.exports(vm.id).is_empty());
+    assert_eq!(
+        runtime_status(&b, vm.id).await,
+        Some(RuntimeStatus::Running)
+    );
+}
+
+/// `pool`을 주면 로컬 디스크를 B의 그 풀에 만든다. 디스크를 끌 때는 그 노드가 실제로 가진 풀을 쓴다:
+/// B는 계획의 풀, 확정 뒤 A는 원래 풀(볼륨 기록은 이미 B의 풀이다).
+#[tokio::test]
+async fn local_disks_go_to_the_given_pool() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (vm, volume) = running_vm_with_local_disk(&a, &admin).await;
+    dir_pool(&a, "fast", false).await;
+    let pool_of = |node: &Node| -> Vec<String> {
+        let calls = node.storage.deactivations().into_iter();
+        calls
+            .filter(|(_, id)| *id == volume)
+            .map(|(p, _)| p)
+            .collect()
+    };
+
+    // 받기 확인이 실패하면 B는 받으려고 켠 사본을 계획의 풀에서 끈다.
+    b.hv.fail_next_incoming_wait(DriverError::Migration("load of migration failed".into()));
+    let (status, task) = admin
+        .post(
+            "/vms/web/migrate",
+            serde_json::json!({ "node": "node2", "pool": "fast" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(!pool_of(&b).is_empty());
+    assert!(pool_of(&b).iter().all(|p| p == "fast"), "{:?}", pool_of(&b));
+    assert!(pool_of(&a).is_empty());
+
+    let (status, task) = admin
+        .post(
+            "/vms/web/migrate",
+            serde_json::json!({ "node": "node2", "pool": "fast" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["op"]["pool"], "fast");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let moved = volume_of(&a, volume);
+    assert_eq!(moved.spec.pool, "fast");
+    assert_eq!(moved.status.node, Some(b.id));
+    assert!(b.storage.has_file(volume));
+    assert_eq!(a.storage.deleted(), [volume]);
+    assert!(!pool_of(&a).is_empty());
+    assert!(
+        pool_of(&a).iter().all(|p| p == "local"),
+        "{:?}",
+        pool_of(&a)
+    );
+    wait_vm(&b, vm.id, "running on B", |v| {
+        v.status.phase == VmPhase::Running && v.status.node == Some(b.id)
+    })
+    .await;
+}
+
+/// 다음 마이그레이션 하나를 실패하게 한다.
+type Inject<'a> = Box<dyn Fn() + 'a>;
+
+/// 복사하는 마이그레이션이 단계마다 실패한다: VM은 A에서 계속 돌고, 볼륨 기록은 그대로이며, B에
+/// 만든 디스크는 지워진다(B에 이미 있던 같은 볼륨은 지우지 않는다). A의 기록 파일도 지워진다.
+#[tokio::test]
+async fn failed_disk_copies_are_deleted_on_the_target() {
+    let (root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (vm, volume) = running_vm_with_local_disk(&a, &admin).await;
+    let local = a
+        .cluster
+        .get_by_name::<StoragePoolSpec>("local")
+        .unwrap()
+        .unwrap();
+    let set_space = |available: Option<u64>| {
+        let cluster = a.cluster.clone();
+        let (b_id, local_id) = (b.id, local.id);
+        async move {
+            let mut node = cluster.get::<NodeSpec>(b_id).unwrap().unwrap();
+            match available {
+                Some(available_bytes) => node.status.pools.insert(
+                    "local".into(),
+                    PoolState {
+                        pool_id: local_id,
+                        ready: true,
+                        error: None,
+                        total_bytes: 1 << 40,
+                        available_bytes,
+                    },
+                ),
+                None => node.status.pools.remove("local"),
+            };
+            cluster
+                .update_status::<NodeSpec>(b_id, &node.status)
+                .await
+                .unwrap();
+        }
+    };
+
+    // 공간: B가 알린 남은 공간보다 할당량이 크다. B를 부르지 않는다.
+    a.storage.set_allocated(volume, LOCAL_SIZE);
+    set_space(Some(1000)).await;
+    let task = migrate(&admin, "node2").await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(
+        task["status"]["error"],
+        "not enough space in storage pool \"local\" on node \"node2\": need 1048576, available 1000"
+    );
+    assert!(b.storage.deleted().is_empty());
+    assert!(!disk_record(&root, &a, &task).exists());
+    set_space(None).await;
+
+    let failures: [(&str, Inject); 4] = [
+        (
+            "would change size on pool \"local\" (1048576 → 4194304 bytes)",
+            Box::new(|| b.storage.round_creates(4 << 20)),
+        ),
+        (
+            "NBD server closed the connection",
+            Box::new(|| {
+                a.hv.fail_next_mirror(DriverError::Migration(
+                    "disk mirror opl-mirror-0 failed: NBD server closed the connection".into(),
+                ))
+            }),
+        ),
+        (
+            "disk mirror opl-mirror-0 failed: Input/output error",
+            Box::new(|| a.hv.fail_next_switchover("Input/output error")),
+        ),
+        (
+            "load of migration failed",
+            Box::new(|| {
+                b.hv.fail_next_incoming_wait(DriverError::Migration(
+                    "load of migration failed".into(),
+                ))
+            }),
+        ),
+    ];
+    for (n, (why, inject)) in failures.iter().enumerate() {
+        inject();
+        let task = migrate(&admin, "node2").await;
+        b.storage.round_creates(0);
+        assert_eq!(task["status"]["state"], "failed", "{task}");
+        let error = task["status"]["error"].as_str().unwrap();
+        assert!(error.contains(why), "{error}");
+        assert_still_on_a(&a, &b, vm.id).await;
+        assert!(!b.storage.has_file(volume), "{why}");
+        assert_eq!(b.storage.deleted().len(), n + 1, "{why}");
+        assert!(a.storage.has_file(volume));
+        assert!(a.storage.deleted().is_empty());
+        assert!(!disk_record(&root, &a, &task).exists(), "{why}");
+        assert!(!disk_record(&root, &b, &task).exists(), "{why}");
+        let current = volume_of(&a, volume);
+        assert_eq!(current.status.node, Some(a.id));
+        assert_eq!(current.spec.pool, "local");
+        assert!(a.hv.mirroring(vm.id).is_empty());
+    }
+
+    // B에 같은 볼륨이 이미 있다(공유인 풀을 로컬로 설정했다): 그 파일은 지우지 않는다.
+    b.storage.place(volume, LOCAL_SIZE);
+    let task = migrate(&admin, "node2").await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(
+        error.contains(
+            "volume \"root\" already exists on node \"node2\" in pool \"local\"; is the pool really node-local?"
+        ),
+        "{error}"
+    );
+    assert!(b.storage.has_file(volume));
+    assert_eq!(b.storage.deleted().len(), failures.len());
+    assert_still_on_a(&a, &b, vm.id).await;
+    // 다시 하면 된다.
+    let task = admin.act("web", "reboot").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+}
+
+/// A → B로 옮긴 뒤 A의 원본을 지우지 못했다(남은 사본과 기록). VM이 A로 되돌아오면 A가 받기 전에
+/// 기록대로 남은 사본을 지우고 새로 만든다. B는 자기 사본을 지운다.
+#[tokio::test]
+async fn a_vm_coming_back_replaces_the_copy_left_on_its_old_node() {
+    let (root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (vm, volume) = running_vm_with_local_disk(&a, &admin).await;
+
+    a.storage.fail_deletes_unmounted(1);
+    let first = migrate(&admin, "node2").await;
+    assert_eq!(first["status"]["state"], "succeeded", "{first}");
+    assert!(a.storage.has_file(volume));
+    assert!(disk_record(&root, &a, &first).exists());
+    assert_eq!(volume_of(&a, volume).status.node, Some(b.id));
+    wait_vm(&b, vm.id, "running on B", |v| {
+        v.status.phase == VmPhase::Running && v.status.node == Some(b.id)
+    })
+    .await;
+
+    let back = migrate(&admin, "node1").await;
+    assert_eq!(back["status"]["state"], "succeeded", "{back}");
+    assert_eq!(back["spec"]["node"], b.id.to_string());
+    assert_eq!(a.storage.deleted(), [volume]);
+    assert!(a.storage.has_file(volume));
+    assert!(!disk_record(&root, &a, &first).exists());
+    assert!(!b.storage.has_file(volume));
+    assert!(b.storage.deleted().contains(&volume));
+    assert_eq!(volume_of(&a, volume).status.node, Some(a.id));
+    wait_vm(&a, vm.id, "running on A", |v| {
+        v.status.phase == VmPhase::Running && v.status.node == Some(a.id)
+    })
+    .await;
+}
+
+/// 원본이 확정한 뒤 마무리 전에 A의 실행기가 멈췄다(opld가 내려감): B의 reconciler가 넘겨받으며
+/// 볼륨 기록을 B로 고치고 표시를 지운다. A의 실행기가 다시 뜨면 정리가 남은 원본 QEMU를 끄고 기록
+/// 파일대로 원본 볼륨을 지운다. B의 사본은 그대로다.
+#[tokio::test]
+async fn source_stopping_after_the_commit_is_finished_by_both_nodes() {
+    let (root, mut a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (vm, volume) = running_vm_with_local_disk(&a, &admin).await;
+
+    b.hv.hold_next_incoming_wait();
+    let (status, task) = admin
+        .post("/vms/web/migrate", serde_json::json!({ "node": "node2" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    b.hv.incoming_wait_held().await;
+    // 받기를 확인한 원본 Task의 확정 쓰기(`commit`)와 같다. 그 직후 마무리 전에 실행기가 멈춘다.
+    let current = a.cluster.get::<VmSpec>(vm.id).unwrap().unwrap();
+    let mut spec = current.spec.clone();
+    spec.node = Some(b.id);
+    a.cluster
+        .update_spec(vm.id, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    a.stop_runner().await;
+    b.hv.release_incoming_wait();
+
+    wait_vm(&b, vm.id, "taken over by B", |v| {
+        v.status.migration.is_none()
+            && v.status.phase == VmPhase::Running
+            && v.status.node == Some(b.id)
+    })
+    .await;
+    let moved = volume_of(&a, volume);
+    assert_eq!(moved.status.node, Some(b.id));
+    assert_eq!(moved.spec.pool, "local");
+    // A는 아직 원본을 지우지 않았다.
+    assert!(a.storage.has_file(volume));
+    assert!(disk_record(&root, &a, &task).exists());
+
+    a.start_runner().await;
+    until("source volume deleted", || !a.storage.has_file(volume)).await;
+    assert_eq!(a.storage.deleted(), [volume]);
+    assert!(!disk_record(&root, &a, &task).exists());
+    assert_eq!(runtime_status(&a, vm.id).await, None);
+    assert!(b.storage.has_file(volume));
+    assert!(b.storage.deleted().is_empty());
+    assert_eq!(
+        runtime_status(&b, vm.id).await,
+        Some(RuntimeStatus::Running)
+    );
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(error.starts_with("interrupted"), "{error}");
+}
+
+/// 디스크를 복사하는 중에 A의 실행기가 다시 시작했다: Task는 끝나지 않은 것으로 실패하고, A의
+/// reconciler가 남은 미러를 치우고 표시를 지우며 원본은 계속 돈다. B의 정리(시작할 때와 30분마다)가
+/// 받는 QEMU를 끄고 기록 파일대로 만든 사본을 지운다. A의 원본 파일은 그대로다.
+#[tokio::test]
+async fn restarting_the_source_while_copying_rolls_the_migration_back() {
+    let (root, mut a, mut b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (vm, volume) = running_vm_with_local_disk(&a, &admin).await;
+
+    a.hv.hold_next_mirror();
+    let (status, task) = admin
+        .post("/vms/web/migrate", serde_json::json!({ "node": "node2" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    a.hv.mirror_held().await;
+    assert_eq!(a.hv.mirroring(vm.id), [0]);
+    assert!(b.storage.has_file(volume));
+    assert!(b.hv.is_incoming(vm.id));
+
+    a.stop_runner().await;
+    a.start_runner().await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(error.starts_with("interrupted"), "{error}");
+    wait_vm(&a, vm.id, "rolled back on A", |v| {
+        v.status.migration.is_none() && v.status.phase == VmPhase::Running
+    })
+    .await;
+    until("mirror cleared", || a.hv.mirroring(vm.id).is_empty()).await;
+    assert_eq!(
+        runtime_status(&a, vm.id).await,
+        Some(RuntimeStatus::Running)
+    );
+    let current = volume_of(&a, volume);
+    assert_eq!(current.status.node, Some(a.id));
+    assert!(a.storage.has_file(volume));
+    assert!(a.storage.deleted().is_empty());
+
+    b.stop_runner().await;
+    b.start_runner().await;
+    until("copy deleted on B", || !b.storage.has_file(volume)).await;
+    assert_eq!(b.storage.deleted(), [volume]);
+    assert!(!disk_record(&root, &b, &task).exists());
+    assert!(!b.hv.is_incoming(vm.id));
+    assert_eq!(runtime_status(&b, vm.id).await, None);
+    assert!(a.storage.has_file(volume));
+}
+
+/// 복사하는 동안 다른 쪽이 Task를 끝냈으면(실패로 기록) 진행률 쓰기가 Task를 `running`으로 되살리지
+/// 않는다.
+#[tokio::test]
+async fn progress_does_not_revive_a_finished_task() {
+    let (_root, a, _b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    running_vm_with_local_disk(&a, &admin).await;
+
+    a.hv.hold_next_mirror();
+    a.hv.delay_migrations(Duration::from_millis(500));
+    let (status, task) = admin
+        .post("/vms/web/migrate", serde_json::json!({ "node": "node2" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let id: Uuid = task["id"].as_str().unwrap().parse().unwrap();
+    a.hv.mirror_held().await;
+    until("copy progress", || {
+        let t = a.cluster.get::<TaskSpec>(id).unwrap().unwrap();
+        t.status
+            .progress
+            .is_some_and(|p| p.stage == "copying-disks")
+    })
+    .await;
+    let failed = TaskStatus {
+        state: TaskState::Failed,
+        error: Some("ended elsewhere".into()),
+        progress: None,
+    };
+    a.cluster
+        .update_status::<TaskSpec>(id, &failed)
+        .await
+        .unwrap();
+    a.hv.release_mirror();
+    // 복사가 끝나 메모리 단계에 들어가도(보내기는 500ms 걸린다) 쓰지 않는다.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(400) {
+        let t = a.cluster.get::<TaskSpec>(id).unwrap().unwrap();
+        assert_eq!(t.status, failed);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// 디렉터리 풀 `pool`을 만든다. `shared`면 두 노드가 함께 쓰는 풀이다.

@@ -20,8 +20,8 @@ pub use audit::{AuditReply, AuditSource};
 pub use client::{ConsoleError, ConsoleReceiver, ConsoleSender, ConsoleStream, GrpcNetwork, Peers};
 pub use firmware::UefiVarsError;
 pub use migration::{
-    IncomingError, IncomingMigration, MigrateIncomingRequest, MigrateIncomingResponse,
-    MigrationReceiver,
+    IncomingDisk, IncomingError, IncomingMigration, MigrateIncomingRequest,
+    MigrateIncomingResponse, MigrationReceiver,
 };
 pub use monitor::{NodeMonitor, NodeMonitorConfig};
 pub use server::{PeerService, ServeError, serve};

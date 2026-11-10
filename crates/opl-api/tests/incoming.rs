@@ -11,14 +11,16 @@ use common::{Env, FakeStorage, MOUNT_ROOT, vm_request};
 use opl_api::{IncomingConfig, IncomingMigrations};
 use opl_driver::mock::MOCK_QEMU_VERSION;
 use opl_driver::{DriverError, Hypervisor, MigrateOptions, MigrateTarget, RuntimeStatus, Storage};
-use opl_peer::{IncomingError, IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
+use opl_peer::{
+    IncomingDisk, IncomingError, IncomingMigration, MigrateIncomingRequest, MigrationReceiver,
+};
 use opl_reconciler::FirewallGate;
 use opl_types::network::NetworkSpec;
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::storage::{Volume, VolumePhase, VolumeSpec};
-use opl_types::vm::{MigrationStatus, Vm, VmPhase, VmSpec};
+use opl_types::vm::{DiskMove, MigrationStatus, Vm, VmPhase, VmSpec};
 use reqwest::StatusCode;
 use serde_json::json;
 use uuid::Uuid;
@@ -97,6 +99,7 @@ async fn setup() -> Setup {
             storage: storage.clone() as Arc<dyn Storage>,
             listen_host: "127.0.0.1".into(),
             ports: 61000..=61009,
+            migration_disks: env.dir.path().join("migration-disks"),
         },
     );
     Setup {
@@ -136,6 +139,7 @@ impl Setup {
             vm: self.vm,
             task,
             qemu_version: MOCK_QEMU_VERSION.into(),
+            disks: vec![],
         }
     }
 
@@ -159,8 +163,10 @@ async fn receives_waits_and_aborts() {
     let task = Uuid::now_v7();
     s.mark_migrating(s.env.node, task).await;
 
-    let port = s.receiver.incoming(s.request(task)).await.unwrap();
-    assert_eq!(port, 61000);
+    let reply = s.receiver.incoming(s.request(task)).await.unwrap();
+    assert_eq!(reply.port, 61000);
+    // 복사할 디스크가 없으면 NBD 서버를 열지 않는다.
+    assert_eq!(reply.nbd_port, None);
     assert!(s.env.hv.is_incoming(s.vm));
     // 원본이 아직 쓰는 디스크를 공유로 켰다.
     assert_eq!(s.count("share"), 1);
@@ -202,7 +208,7 @@ async fn waits_for_the_migrating_status_to_arrive() {
         s.mark_migrating(s.env.node, task).await;
     };
     let (port, ()) = tokio::join!(incoming, mark);
-    assert_eq!(port.unwrap(), 61000);
+    assert_eq!(port.unwrap().port, 61000);
     assert!(s.env.hv.is_incoming(s.vm));
 }
 
@@ -579,6 +585,7 @@ async fn a_vm_with_security_groups_needs_the_firewall() {
                 storage: s.storage.clone() as Arc<dyn Storage>,
                 listen_host: "127.0.0.1".into(),
                 ports: 61000..=61009,
+                migration_disks: s.env.dir.path().join("migration-disks"),
             },
         )
         .with_firewall(gate.map(|g| Arc::new(g) as Arc<dyn FirewallGate>))
@@ -600,6 +607,467 @@ async fn a_vm_with_security_groups_needs_the_firewall() {
         .incoming(s.request(task))
         .await
         .unwrap();
-    assert_eq!(port, 61000);
+    assert_eq!(port.port, 61000);
     assert!(s.env.hv.is_incoming(s.vm));
+}
+
+/// 원본 노드의 로컬 디스크(복사해 옮기는 디스크)
+const LOCAL_SIZE: u64 = 1 << 20;
+
+impl Setup {
+    /// 로컬 디렉터리 풀 `local`(공유 아님)에 원본 노드의 볼륨 `data`(qcow2)를 만들어 VM의 둘째 디스크로
+    /// 붙인다.
+    async fn local_disk(&self) -> Uuid {
+        let admin = self.env.admin().await;
+        let (status, body) = admin
+            .post(
+                "/storage-pools",
+                json!({
+                    "name": "local",
+                    "spec": {
+                        "backend": { "kind": "dir", "path": self.env.dir.path().join("local") }
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        self.env.pool_ready("local").await;
+        let mut volume: Volume = Resource::new(
+            "data",
+            VolumeSpec {
+                pool: "local".into(),
+                size_bytes: LOCAL_SIZE,
+                format: ImageFormat::Qcow2,
+            },
+        );
+        volume.status.node = Some(self.source);
+        volume.status.phase = VolumePhase::Ready;
+        self.env.cluster.create(&volume).await.unwrap();
+        let mut vm = vm_named(&self.env, "web");
+        vm.spec.disks.push(opl_types::vm::DiskSpec {
+            volume: "data".into(),
+            bus: opl_types::vm::DiskBus::VirtioBlk,
+            boot_order: None,
+        });
+        self.env
+            .cluster
+            .update_spec(vm.id, None, vm.labels.clone(), &vm.spec)
+            .await
+            .unwrap();
+        volume.id
+    }
+
+    /// 원본 노드가 하듯 `Migrating`과 이 노드로 복사할 디스크 `volume`(같은 풀, 같은 형식)을 기록한다.
+    async fn mark_copying(&self, task: Uuid, volume: Uuid) {
+        self.mark_migrating(self.env.node, task).await;
+        let mut vm = self.env.cluster.get::<VmSpec>(self.vm).unwrap().unwrap();
+        vm.status.migration.as_mut().unwrap().disks = vec![DiskMove {
+            volume,
+            pool: "local".into(),
+            format: ImageFormat::Qcow2,
+        }];
+        self.env
+            .cluster
+            .update_status::<VmSpec>(self.vm, &vm.status)
+            .await
+            .unwrap();
+    }
+
+    fn copy_request(&self, task: Uuid, volume: Uuid) -> MigrateIncomingRequest {
+        MigrateIncomingRequest {
+            disks: vec![IncomingDisk {
+                volume,
+                size_bytes: LOCAL_SIZE,
+            }],
+            ..self.request(task)
+        }
+    }
+
+    /// 이 노드의 마이그레이션 디스크 기록 파일
+    fn record(&self, task: Uuid) -> Option<serde_json::Value> {
+        let data = std::fs::read(self.record_path(task)).ok()?;
+        Some(serde_json::from_slice(&data).unwrap())
+    }
+
+    fn record_path(&self, task: Uuid) -> std::path::PathBuf {
+        self.env
+            .dir
+            .path()
+            .join("migration-disks")
+            .join(format!("{task}.json"))
+    }
+
+    /// 받는 쪽처럼 VM `vm`의 Task `task`의 기록 파일(`target`, 풀 `local`의 볼륨 `volume`)을 적는다.
+    fn write_record(&self, vm: Uuid, task: Uuid, volume: Uuid, created: bool) {
+        let record = json!({
+            "vm": vm,
+            "task": task,
+            "role": "target",
+            "volumes": [{ "id": volume, "pool": "local", "format": "qcow2", "created": created }],
+        });
+        std::fs::create_dir_all(self.record_path(task).parent().unwrap()).unwrap();
+        std::fs::write(self.record_path(task), record.to_string()).unwrap();
+    }
+
+    /// 원본이 되돌린 것처럼 마이그레이션 표시를 지운다.
+    async fn roll_back(&self) {
+        let mut vm = self.env.cluster.get::<VmSpec>(self.vm).unwrap().unwrap();
+        vm.status.phase = VmPhase::Running;
+        vm.status.migration = None;
+        self.env
+            .cluster
+            .update_status::<VmSpec>(self.vm, &vm.status)
+            .await
+            .unwrap();
+    }
+}
+
+/// 복사할 디스크: 이 노드에 원본 크기로 만들고 기록 파일에 적은 뒤, 공유하지 않고 켜서 NBD로
+/// 내보낸다(VM의 둘째 디스크). 취소하면 만든 디스크와 기록을 지운다.
+#[tokio::test]
+async fn creates_exports_and_deletes_the_copied_disks() {
+    let s = setup().await;
+    let data = s.local_disk().await;
+    let task = Uuid::now_v7();
+    s.mark_copying(task, data).await;
+
+    let reply = s
+        .receiver
+        .incoming(s.copy_request(task, data))
+        .await
+        .unwrap();
+    assert_eq!(reply.port, 61000);
+    assert_eq!(reply.nbd_port, Some(61001));
+    assert_eq!(s.env.hv.exports(s.vm), [1]);
+    assert!(s.storage.has_file(data));
+    let record = s.record(task).unwrap();
+    assert_eq!(record["role"], "target");
+    assert_eq!(record["vm"], s.vm.to_string());
+    assert_eq!(
+        record["volumes"],
+        json!([{ "id": data, "pool": "local", "format": "qcow2", "created": true }])
+    );
+    // 공유 디스크만 공유로 켰다.
+    assert_eq!(s.count("share"), 1);
+    assert!(!s.storage.calls().contains(&("share", data)));
+
+    // 원본이 되돌린 뒤(표시를 지움) 취소한다.
+    let mut vm = s.env.cluster.get::<VmSpec>(s.vm).unwrap().unwrap();
+    vm.status.phase = VmPhase::Running;
+    vm.status.migration = None;
+    s.env
+        .cluster
+        .update_status::<VmSpec>(s.vm, &vm.status)
+        .await
+        .unwrap();
+    s.receiver
+        .abort(IncomingMigration { vm: s.vm, task })
+        .await
+        .unwrap();
+    assert!(s.env.hv.inspect(s.vm).await.unwrap().is_none());
+    assert_eq!(s.storage.deleted(), [data]);
+    assert!(!s.storage.has_file(data));
+    assert_eq!(s.record(task), None);
+}
+
+/// 요청의 복사할 디스크가 VM의 마이그레이션 계획과 다르면 거절한다(아무것도 만들지 않는다).
+#[tokio::test]
+async fn refuses_disks_that_differ_from_the_migration() {
+    let s = setup().await;
+    let data = s.local_disk().await;
+    let task = Uuid::now_v7();
+    s.mark_copying(task, data).await;
+    for req in [s.request(task), s.copy_request(task, s.volume)] {
+        let err = s.receiver.incoming(req).await.unwrap_err();
+        assert!(
+            matches!(&err, IncomingError::Rejected(m) if m.contains("do not match")),
+            "{err:?}"
+        );
+    }
+    assert!(!s.storage.has_file(data));
+    assert!(!s.env.hv.is_incoming(s.vm));
+    assert_eq!(s.record(task), None);
+}
+
+/// 만든 디스크의 크기가 원본과 다르면(백엔드가 올림) 지우고 실패한다. 이미 있는 볼륨(남의 파일일 수
+/// 있다)은 지우지 않고 실패한다.
+#[tokio::test]
+async fn refuses_a_changed_size_or_an_existing_volume() {
+    let s = setup().await;
+    let data = s.local_disk().await;
+    let task = Uuid::now_v7();
+    s.mark_copying(task, data).await;
+
+    s.storage.round_creates(4 << 20);
+    let err = s
+        .receiver
+        .incoming(s.copy_request(task, data))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        IncomingError::Failed(
+            "disk \"data\" would change size on pool \"local\" (1048576 → 4194304 bytes)".into()
+        )
+    );
+    assert_eq!(s.storage.deleted(), [data]);
+    assert!(!s.storage.has_file(data));
+    assert_eq!(s.record(task), None);
+    assert!(!s.env.hv.is_incoming(s.vm));
+
+    s.storage.round_creates(0);
+    s.storage.place(data, LOCAL_SIZE);
+    let err = s
+        .receiver
+        .incoming(s.copy_request(task, data))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, IncomingError::Failed(m)
+            if m.contains("volume \"data\" already exists on node")
+                && m.ends_with("in pool \"local\"; is the pool really node-local?")),
+        "{err:?}"
+    );
+    assert_eq!(s.storage.deleted(), [data]);
+    assert!(s.storage.has_file(data));
+    assert_eq!(s.record(task), None);
+    assert!(!s.env.hv.is_incoming(s.vm));
+}
+
+/// 받는 QEMU를 띄우지 못하면 만든 디스크를 지운다.
+#[tokio::test]
+async fn failed_start_deletes_the_copied_disks() {
+    let s = setup().await;
+    let data = s.local_disk().await;
+    let task = Uuid::now_v7();
+    s.mark_copying(task, data).await;
+    s.env
+        .hv
+        .fail_next_start(DriverError::Migration("cannot listen".into()));
+    let err = s
+        .receiver
+        .incoming(s.copy_request(task, data))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, IncomingError::Failed(m) if m.contains("cannot listen")),
+        "{err:?}"
+    );
+    assert_eq!(s.storage.deleted(), [data]);
+    assert_eq!(s.record(task), None);
+}
+
+/// 원본이 확정 전에 되돌렸는데(취소가 오지 않았다) 받는 QEMU와 만든 디스크가 남았다: 정리가 QEMU를
+/// 끄고 기록대로 디스크를 지운다. 이 노드로 오는 중이면 그대로 둔다.
+#[tokio::test]
+async fn sweep_deletes_copied_disks_left_behind() {
+    let mut s = setup().await;
+    let data = s.local_disk().await;
+    let task = Uuid::now_v7();
+    s.mark_copying(task, data).await;
+    s.receiver
+        .incoming(s.copy_request(task, data))
+        .await
+        .unwrap();
+    s.sweep_often().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(s.storage.has_file(data));
+    assert!(s.record(task).is_some());
+
+    let mut vm = s.env.cluster.get::<VmSpec>(s.vm).unwrap().unwrap();
+    vm.status.phase = VmPhase::Running;
+    vm.status.migration = None;
+    s.env
+        .cluster
+        .update_status::<VmSpec>(s.vm, &vm.status)
+        .await
+        .unwrap();
+    s.wait_stopped(s.vm).await;
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while s.record(task).is_some() {
+        assert!(std::time::Instant::now() < deadline, "record left");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(s.storage.deleted(), [data]);
+    assert!(!s.storage.has_file(data));
+}
+
+/// 만들기 전에 적은 항목(만들다 멈췄거나 이미 있던 남의 볼륨)은 취소도 정리도 지우지 않고 기록에서만
+/// 뺀다.
+#[tokio::test]
+async fn disks_not_created_here_are_never_deleted() {
+    let mut s = setup().await;
+    let data = s.local_disk().await;
+    let task = Uuid::now_v7();
+    s.mark_copying(task, data).await;
+    s.write_record(s.vm, task, data, false);
+    s.storage.place(data, LOCAL_SIZE);
+    s.roll_back().await;
+    s.receiver
+        .abort(IncomingMigration { vm: s.vm, task })
+        .await
+        .unwrap();
+    assert!(s.storage.has_file(data));
+    assert!(s.storage.deleted().is_empty());
+    assert_eq!(s.record(task), None);
+
+    // 정리도 그렇다(다른 VM의 고아 기록).
+    let orphan = Uuid::now_v7();
+    s.write_record(Uuid::now_v7(), orphan, data, false);
+    s.sweep_often().await;
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while s.record(orphan).is_some() {
+        assert!(std::time::Instant::now() < deadline, "record left");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(s.storage.has_file(data));
+    assert!(s.storage.deleted().is_empty());
+}
+
+/// 복사할 디스크를 만들고 받는 QEMU를 띄우는 동안 정리는 기다린다(막 만든 같은 id의 볼륨을 지우지
+/// 않게 이 노드의 디스크 기록 잠금을 함께 쓴다).
+#[tokio::test]
+async fn sweep_waits_while_disks_are_being_received() {
+    let mut s = setup().await;
+    let data = s.local_disk().await;
+    let task = Uuid::now_v7();
+    s.mark_copying(task, data).await;
+    s.sweep_often().await;
+    // 정리가 지울 다른 VM의 고아 사본
+    let (orphan, orphan_task) = (Uuid::now_v7(), Uuid::now_v7());
+    s.env.hv.hold_next_start();
+    let receiving = s.receiver.incoming(s.copy_request(task, data));
+    let (received, ()) = tokio::join!(receiving, async {
+        s.env.hv.start_held().await;
+        s.storage.place(orphan, LOCAL_SIZE);
+        s.write_record(Uuid::now_v7(), orphan_task, orphan, true);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(s.storage.has_file(orphan), "the sweep did not wait");
+        s.env.hv.release_start();
+    });
+    received.unwrap();
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while s.storage.has_file(orphan) {
+        assert!(std::time::Instant::now() < deadline, "orphan copy left");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(s.record(orphan_task), None);
+    assert!(s.storage.has_file(data));
+    assert!(s.record(task).is_some());
+}
+
+/// 디스크 기록 잠금을 기다리는 사이 원본이 되돌렸으면(표시를 지움) 잠금 뒤 다시 보고 거절한다(되돌려진
+/// 마이그레이션의 볼륨·QEMU를 만들지 않는다).
+#[tokio::test]
+async fn a_migration_rolled_back_while_waiting_for_the_lock_is_refused() {
+    let s = setup().await;
+    let data = s.local_disk().await;
+    let task = Uuid::now_v7();
+    s.mark_copying(task, data).await;
+    s.env.hv.hold_next_start();
+    let first = s.receiver.incoming(s.copy_request(task, data));
+    let (first, second) = tokio::join!(first, async {
+        // 앞의 받기가 잠금을 쥐고 받는 QEMU를 띄우는 중이다.
+        s.env.hv.start_held().await;
+        let second = s.receiver.incoming(s.copy_request(task, data));
+        tokio::pin!(second);
+        let waited = tokio::time::timeout(Duration::from_millis(200), &mut second).await;
+        assert!(waited.is_err(), "did not wait for the lock: {waited:?}");
+        s.roll_back().await;
+        s.env.hv.release_start();
+        second.await
+    });
+    first.unwrap();
+    let err = second.unwrap_err();
+    assert!(
+        matches!(&err, IncomingError::Rejected(m) if m.contains("is not migrating to this node")),
+        "{err:?}"
+    );
+}
+
+/// 원본의 RPC가 끊겨 호출이 버려져도 받기는 끝까지 한다: 만든 디스크의 기록(`created`)과 받는 QEMU가
+/// 함께 남아 원본의 되돌리기와 정리가 치운다. 취소도 그렇다.
+#[tokio::test]
+async fn receiving_and_aborting_finish_when_the_call_is_dropped() {
+    let s = setup().await;
+    let data = s.local_disk().await;
+    let task = Uuid::now_v7();
+    s.mark_copying(task, data).await;
+    s.env.hv.hold_next_start();
+    {
+        let receiving = s.receiver.incoming(s.copy_request(task, data));
+        tokio::select! {
+            r = receiving => panic!("received while held: {r:?}"),
+            () = s.env.hv.start_held() => {}
+        }
+    }
+    s.env.hv.release_start();
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while !s.env.hv.is_incoming(s.vm) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "receiving QEMU not started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(s.record(task).unwrap()["volumes"][0]["created"], true);
+
+    // 다른 받기가 잠금을 쥔 동안 온 취소가 버려져도 잠금 뒤 끝까지 한다.
+    let other = Uuid::now_v7();
+    s.mark_copying(other, data).await;
+    s.env.hv.hold_next_start();
+    let receiving = s.receiver.incoming(s.copy_request(other, data));
+    let (received, ()) = tokio::join!(receiving, async {
+        s.env.hv.start_held().await;
+        s.roll_back().await;
+        let aborting = s.receiver.abort(IncomingMigration {
+            vm: s.vm,
+            task: other,
+        });
+        let waited = tokio::time::timeout(Duration::from_millis(200), aborting).await;
+        assert!(waited.is_err(), "did not wait for the lock: {waited:?}");
+        s.env.hv.release_start();
+    });
+    received.unwrap();
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while s.record(other).is_some() || s.env.hv.is_incoming(s.vm) {
+        assert!(std::time::Instant::now() < deadline, "abort did not finish");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!s.storage.has_file(data));
+}
+
+/// 받기 전 정리가 같은 VM의 옛 사본(같은 볼륨·풀)을 지우지 못해 그 기록이 남았으면 받지 않는다(옛 기록의
+/// 정리가 같은 위치의 새 디스크를 지우지 않게). 다음 받기는 옛 사본을 지우고 받는다.
+#[tokio::test]
+async fn an_earlier_copy_left_in_place_fails_the_receive() {
+    let s = setup().await;
+    let data = s.local_disk().await;
+    let (old, task) = (Uuid::now_v7(), Uuid::now_v7());
+    s.storage.place(data, LOCAL_SIZE);
+    s.write_record(s.vm, old, data, true);
+    s.mark_copying(task, data).await;
+    s.storage.fail_deletes_unmounted(1);
+    let err = s
+        .receiver
+        .incoming(s.copy_request(task, data))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, IncomingError::Failed(m)
+            if m.contains("an earlier copy of disk \"data\" in pool \"local\"")),
+        "{err:?}"
+    );
+    assert!(s.record(old).is_some());
+    assert_eq!(s.record(task), None);
+    assert!(!s.env.hv.is_incoming(s.vm));
+
+    s.receiver
+        .incoming(s.copy_request(task, data))
+        .await
+        .unwrap();
+    assert_eq!(s.storage.deleted(), [data]);
+    assert!(s.storage.has_file(data));
+    assert_eq!(s.record(old), None);
+    assert!(s.record(task).is_some());
 }

@@ -27,7 +27,9 @@ use tonic::{Code, Request, Status, Streaming};
 use uuid::Uuid;
 
 use crate::firmware::{UefiVarsError, UefiVarsRequest};
-use crate::migration::{IncomingError, IncomingMigration, MigrateIncomingRequest};
+use crate::migration::{
+    IncomingError, IncomingMigration, MigrateIncomingRequest, MigrateIncomingResponse,
+};
 use crate::pki::NodeTls;
 use crate::proto::peer_client::PeerClient;
 use crate::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, VM_METADATA};
@@ -152,12 +154,13 @@ impl Peers {
 }
 
 impl Peers {
-    /// `addr`의 노드에 VM을 받을 준비를 시킨다. 받는 QEMU가 연 포트를 돌려준다.
+    /// `addr`의 노드에 VM을 받을 준비를 시킨다. 받는 QEMU가 연 포트(디스크를 복사하면 NBD 포트도)를
+    /// 돌려준다.
     pub async fn migrate_incoming(
         &self,
         addr: &str,
         req: MigrateIncomingRequest,
-    ) -> Result<u16, IncomingError> {
+    ) -> Result<MigrateIncomingResponse, IncomingError> {
         let mut req = Request::new(req);
         req.set_timeout(MIGRATE_INCOMING_TIMEOUT);
         let reply = self
@@ -166,7 +169,7 @@ impl Peers {
             .migrate_incoming(req)
             .await
             .map_err(unreachable)?;
-        reply.into_inner().map(|r| r.port)
+        reply.into_inner()
     }
 
     /// `addr`의 노드에서 받는 QEMU가 받기를 마칠 때까지 기다린다.

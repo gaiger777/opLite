@@ -18,6 +18,7 @@ mod incoming;
 mod janitor;
 pub mod ldap;
 pub mod limit;
+mod migration_disks;
 pub mod oidc;
 mod oidc_login;
 pub mod realms;

@@ -40,6 +40,14 @@ pub struct MockHypervisor {
     start_reached: Notify,
     /// 멈춘 `start`를 놓아준다
     start_released: Notify,
+    /// 멈춘 `mirror_disks`가 들어왔다
+    mirror_reached: Notify,
+    /// 멈춘 `mirror_disks`를 놓아준다
+    mirror_released: Notify,
+    /// 멈춘 `incoming_wait`가 들어왔다
+    incoming_wait_reached: Notify,
+    /// 멈춘 `incoming_wait`를 놓아준다
+    incoming_wait_released: Notify,
 }
 
 #[derive(Default)]
@@ -121,6 +129,12 @@ struct MockState {
     stall_next_mirror: bool,
     /// 다음 스위치오버 한 번에 미러가 이 오류로 끝난다(마이그레이션은 취소된다).
     fail_next_switchover: Option<String>,
+    /// 다음 `mirror_disks` 한 번을 미러를 시작한 채 `release_mirror`까지 멈춘다.
+    hold_next_mirror: bool,
+    /// 다음 `incoming_wait` 한 번을 받기를 마친 뒤 `release_incoming_wait`까지 멈춘다.
+    hold_next_incoming_wait: bool,
+    /// 다음 `cancel_migration`들을 차례로 실패시킬 오류
+    fail_next_cancel: VecDeque<DriverError>,
 }
 
 impl Default for MockHypervisor {
@@ -134,6 +148,10 @@ impl Default for MockHypervisor {
             save_reached: Notify::new(),
             start_reached: Notify::new(),
             start_released: Notify::new(),
+            mirror_reached: Notify::new(),
+            mirror_released: Notify::new(),
+            incoming_wait_reached: Notify::new(),
+            incoming_wait_released: Notify::new(),
         }
     }
 }
@@ -155,8 +173,8 @@ impl MockHypervisor {
         self.state.lock().unwrap().start_delay = Some(delay);
     }
 
-    /// 다음 `start` 한 번을 `release_start`까지 멈춘다. 시작 도중에 일어나는 일을 시간에 기대지 않고
-    /// 흉내 낸다.
+    /// 다음 `start`(또는 `start_incoming`) 한 번을 `release_start`까지 멈춘다. 시작 도중에 일어나는
+    /// 일을 시간에 기대지 않고 흉내 낸다.
     pub fn hold_next_start(&self) {
         self.state.lock().unwrap().hold_next_start = true;
     }
@@ -383,6 +401,44 @@ impl MockHypervisor {
     /// 마이그레이션을 취소하고 미러를 치운 뒤 실패한다(원본은 계속 돈다).
     pub fn fail_next_switchover(&self, error: &str) {
         self.state.lock().unwrap().fail_next_switchover = Some(error.to_string());
+    }
+
+    /// 다음 `mirror_disks` 한 번이 미러를 시작하고(`mirroring`에 보인다) 진행 없이 `release_mirror`까지
+    /// 멈춘다(복사 중에 일어나는 일).
+    pub fn hold_next_mirror(&self) {
+        self.state.lock().unwrap().hold_next_mirror = true;
+    }
+
+    /// 멈춘 `mirror_disks`가 들어올 때까지 기다린다.
+    pub async fn mirror_held(&self) {
+        self.mirror_reached.notified().await;
+    }
+
+    /// 멈춘 `mirror_disks`를 놓아준다.
+    pub fn release_mirror(&self) {
+        self.mirror_released.notify_one();
+    }
+
+    /// 다음 `incoming_wait` 한 번이 받기를 마친 뒤(멈춘 채 받은 QEMU) `release_incoming_wait`까지
+    /// 멈춘다(받기 확인과 확정 사이에 일어나는 일).
+    pub fn hold_next_incoming_wait(&self) {
+        self.state.lock().unwrap().hold_next_incoming_wait = true;
+    }
+
+    /// 멈춘 `incoming_wait`가 들어올 때까지 기다린다.
+    pub async fn incoming_wait_held(&self) {
+        self.incoming_wait_reached.notified().await;
+    }
+
+    /// 멈춘 `incoming_wait`를 놓아준다.
+    pub fn release_incoming_wait(&self) {
+        self.incoming_wait_released.notify_one();
+    }
+
+    /// 다음 `cancel_migration` 한 번을 이 오류로 실패시킨다(아무것도 치우지 않는다). 여러 번 부르면
+    /// 그 수만큼 차례로 실패한다.
+    pub fn fail_next_cancel(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_cancel.push_back(err);
     }
 
     /// `mirror_disks` 호출(실패 포함)을 순서대로 돌려준다. 디스크 내용은 복사하지 않는다.
@@ -812,6 +868,11 @@ impl Hypervisor for MockHypervisor {
         ports: RangeInclusive<u16>,
         exports: &[usize],
     ) -> Result<IncomingPorts, DriverError> {
+        let hold = std::mem::take(&mut self.state.lock().unwrap().hold_next_start);
+        if hold {
+            self.start_reached.notify_one();
+            self.start_released.notified().await;
+        }
         {
             let mut st = self.state.lock().unwrap();
             if st.vms.contains_key(&vm.id) {
@@ -845,19 +906,26 @@ impl Hypervisor for MockHypervisor {
 
     /// 주입한 실패가 없으면 받기를 마친 것으로 본다(멈춘 채).
     async fn incoming_wait(&self, id: Uuid) -> Result<(), DriverError> {
-        let mut st = self.state.lock().unwrap();
-        Self::controllable(&st, id)?;
-        if !st.incoming.contains_key(&id) {
-            return Err(DriverError::Migration(format!(
-                "VM {id} is not receiving a migration"
-            )));
+        let hold = {
+            let mut st = self.state.lock().unwrap();
+            Self::controllable(&st, id)?;
+            if !st.incoming.contains_key(&id) {
+                return Err(DriverError::Migration(format!(
+                    "VM {id} is not receiving a migration"
+                )));
+            }
+            if let Some(err) = st.fail_next_incoming.take() {
+                drop(st);
+                self.remove(id, EventKind::Crashed);
+                return Err(err);
+            }
+            st.migration_status.insert(id, RuntimeStatus::Paused);
+            std::mem::take(&mut st.hold_next_incoming_wait)
+        };
+        if hold {
+            self.incoming_wait_reached.notify_one();
+            self.incoming_wait_released.notified().await;
         }
-        if let Some(err) = st.fail_next_incoming.take() {
-            drop(st);
-            self.remove(id, EventKind::Crashed);
-            return Err(err);
-        }
-        st.migration_status.insert(id, RuntimeStatus::Paused);
         Ok(())
     }
 
@@ -896,19 +964,6 @@ impl Hypervisor for MockHypervisor {
         targets: &[MirrorTarget],
         opts: &MirrorOptions,
     ) -> Result<(), DriverError> {
-        let mut st = self.state.lock().unwrap();
-        st.mirror_calls.push((id, targets.to_vec()));
-        Self::controllable(&st, id)?;
-        st.mirroring.remove(&id);
-        let formats = st.disk_formats.get(&id).cloned().unwrap_or_default();
-        for target in targets {
-            if formats.get(target.disk) == Some(&ImageFormat::Qcow2)
-                && target.format == ImageFormat::Raw
-                && let Some(disk) = st.bitmaps.get_mut(&id).and_then(|d| d.get_mut(target.disk))
-            {
-                disk.retain(|b| !b.name.starts_with(BITMAP_PREFIX));
-            }
-        }
         let total = MOCK_MIRROR_BYTES * targets.len() as u64;
         let send = |done_bytes| {
             if let Some(tx) = &opts.progress {
@@ -918,19 +973,46 @@ impl Hypervisor for MockHypervisor {
                 });
             }
         };
-        send(0);
-        if let Some(err) = st.fail_next_mirror.take() {
-            return Err(err);
-        }
-        if std::mem::take(&mut st.stall_next_mirror) {
-            return Err(DriverError::Migration(format!(
-                "disk copy made no progress for {}",
-                format_duration(opts.stall)
-            )));
+        let hold = {
+            let mut st = self.state.lock().unwrap();
+            st.mirror_calls.push((id, targets.to_vec()));
+            Self::controllable(&st, id)?;
+            st.mirroring.remove(&id);
+            let formats = st.disk_formats.get(&id).cloned().unwrap_or_default();
+            for target in targets {
+                if formats.get(target.disk) == Some(&ImageFormat::Qcow2)
+                    && target.format == ImageFormat::Raw
+                    && let Some(disk) = st.bitmaps.get_mut(&id).and_then(|d| d.get_mut(target.disk))
+                {
+                    disk.retain(|b| !b.name.starts_with(BITMAP_PREFIX));
+                }
+            }
+            send(0);
+            if let Some(err) = st.fail_next_mirror.take() {
+                return Err(err);
+            }
+            if std::mem::take(&mut st.stall_next_mirror) {
+                return Err(DriverError::Migration(format!(
+                    "disk copy made no progress for {}",
+                    format_duration(opts.stall)
+                )));
+            }
+            st.mirroring
+                .insert(id, targets.iter().map(|t| t.disk).collect());
+            std::mem::take(&mut st.hold_next_mirror)
+        };
+        if hold {
+            self.mirror_reached.notify_one();
+            self.mirror_released.notified().await;
+            // 멈춘 사이 치워졌으면(`cancel_migration`) 실제 드라이버처럼 실패한다.
+            if !self.state.lock().unwrap().mirroring.contains_key(&id) {
+                return Err(DriverError::Migration(format!(
+                    "disk mirror opl-mirror-{} disappeared",
+                    targets.first().map_or(0, |t| t.disk)
+                )));
+            }
         }
         send(total);
-        st.mirroring
-            .insert(id, targets.iter().map(|t| t.disk).collect());
         Ok(())
     }
 
@@ -993,6 +1075,9 @@ impl Hypervisor for MockHypervisor {
 
     async fn cancel_migration(&self, id: Uuid) -> Result<(), DriverError> {
         let mut st = self.state.lock().unwrap();
+        if let Some(err) = st.fail_next_cancel.pop_front() {
+            return Err(err);
+        }
         if st.outgoing.remove(&id) && st.complete_on_cancel {
             st.migration_status.insert(id, postmigrate());
         }

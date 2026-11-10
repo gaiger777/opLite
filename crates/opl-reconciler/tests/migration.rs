@@ -6,9 +6,14 @@ mod common;
 use std::time::Duration;
 
 use common::{Env, vm};
-use opl_driver::{Hypervisor, MigrateOptions, MigrateTarget, RuntimeStatus};
-use opl_types::runtime::VmRuntimeSpec;
-use opl_types::vm::{MigrationStatus, PowerState, Vm, VmPhase, VmSpec};
+use opl_driver::{
+    DriverError, Hypervisor, MigrateOptions, MigrateTarget, MirrorOptions, MirrorTarget,
+    RuntimeStatus,
+};
+use opl_types::resource::Resource;
+use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
+use opl_types::storage::{Volume, VolumeSpec};
+use opl_types::vm::{DiskMove, MigrationStatus, PowerState, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
 fn running(v: &Vm) -> bool {
@@ -157,6 +162,54 @@ async fn received_vm_is_continued_after_the_commit() {
     assert!(env.hv.launches().is_empty(), "{:?}", env.hv.launches());
 }
 
+/// 디스크를 복사한 마이그레이션이 이 노드로 확정됐다(원본이 마무리 전에 멈춤): 넘겨받으며 표시를
+/// 지우기 전에 볼륨 기록을 이 노드로 고친다.
+#[tokio::test]
+async fn taking_over_a_copied_disk_moves_the_volume_record_first() {
+    let env = Env::start().await;
+    let source = Uuid::now_v7();
+    let mut volume: Volume = Resource::new(
+        "data",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    volume.status.node = Some(source);
+    env.cluster.create(&volume).await.unwrap();
+    let mut vm = vm("web", source);
+    env.create(&vm).await;
+    let mut status = env.get(vm.id).status;
+    status.phase = VmPhase::Migrating;
+    status.migration = Some(MigrationStatus {
+        node: env.node,
+        task: Uuid::now_v7(),
+        disks: vec![DiskMove {
+            volume: volume.id,
+            pool: "fast".into(),
+            format: ImageFormat::Raw,
+        }],
+    });
+    env.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+
+    let current = env.get(vm.id);
+    vm.spec.node = Some(env.node);
+    env.cluster
+        .update_spec(vm.id, Some(current.revision), current.labels, &vm.spec)
+        .await
+        .unwrap();
+    env.wait(vm.id, "taken over", |v| v.status.migration.is_none())
+        .await;
+    let got = env.cluster.get::<VolumeSpec>(volume.id).unwrap().unwrap();
+    assert_eq!(got.spec.pool, "fast");
+    assert_eq!(got.spec.format, ImageFormat::Raw);
+    assert_eq!(got.status.node, Some(env.node));
+}
+
 /// opld가 마이그레이션을 보내다 확정 전에 죽었는데 QEMU는 아직 보내는 중이다: 작업자가 `Migrating`을
 /// 되돌린 뒤 그 마이그레이션을 취소한다. 나중에 끝나 원본을 멈추지 않는다.
 #[tokio::test]
@@ -179,6 +232,97 @@ async fn active_migration_left_by_a_restart_is_cancelled() {
     env.hv.complete_outgoing(vm.id);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(status_of(&env, vm.id).await, Some(RuntimeStatus::Running));
+}
+
+/// opld가 디스크를 복사하다 확정 전에 죽어 미러가 남았는데 처음에는 치우지 못했다: 표시를 남긴 채 다음에
+/// 다시 해서 미러를 치운 뒤에만 표시를 지운다(지운 뒤에는 다시 보지 않는다).
+#[tokio::test]
+async fn leftover_disk_mirrors_are_cleared_before_the_mark() {
+    let mut env = Env::start().await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    env.stop_reconciler().await;
+    mark_migrating(&env, vm.id, Uuid::now_v7()).await;
+    let target = MirrorTarget {
+        disk: 0,
+        host: "127.0.0.2".into(),
+        port: 60001,
+        export: "disk0".into(),
+        tls_hostname: "127.0.0.2".into(),
+        format: ImageFormat::Qcow2,
+    };
+    let mirror = MirrorOptions {
+        speed: None,
+        timeout: Duration::from_secs(60),
+        stall: Duration::from_secs(60),
+        progress: None,
+    };
+    env.hv
+        .mirror_disks(vm.id, &[target], &mirror)
+        .await
+        .unwrap();
+    env.hv
+        .fail_next_cancel(DriverError::Timeout("QMP block-job-cancel"));
+    env.start_reconciler();
+
+    env.wait(vm.id, "migration rolled back", |v| {
+        running(v) && v.status.migration.is_none()
+    })
+    .await;
+    assert!(env.hv.mirroring(vm.id).is_empty());
+    assert_eq!(status_of(&env, vm.id).await, Some(RuntimeStatus::Running));
+}
+
+/// 남은 미러를 끝내 치우지 못해도 표시를 영원히 남기지 않는다: QEMU에 붙지 못하면 곧바로, 같은 VM에서
+/// 잇달아 실패하면 세 번째에 경고 뒤 표시를 지운다(남은 미러는 대상의 정리가 받는 QEMU를 끄면 실패하고
+/// 다음 미러·백업 정리가 치운다).
+#[tokio::test]
+async fn the_mark_is_cleared_when_mirrors_cannot_be_cleared() {
+    for unattached in [true, false] {
+        let mut env = Env::start().await;
+        let vm = vm("web", env.node);
+        env.create(&vm).await;
+        env.wait(vm.id, "running", running).await;
+
+        env.stop_reconciler().await;
+        mark_migrating(&env, vm.id, Uuid::now_v7()).await;
+        let target = MirrorTarget {
+            disk: 0,
+            host: "127.0.0.2".into(),
+            port: 60001,
+            export: "disk0".into(),
+            tls_hostname: "127.0.0.2".into(),
+            format: ImageFormat::Qcow2,
+        };
+        let mirror = MirrorOptions {
+            speed: None,
+            timeout: Duration::from_secs(60),
+            stall: Duration::from_secs(60),
+            progress: None,
+        };
+        env.hv
+            .mirror_disks(vm.id, &[target], &mirror)
+            .await
+            .unwrap();
+        if unattached {
+            env.hv.fail_next_cancel(DriverError::NotAttached(vm.id));
+        } else {
+            for _ in 0..20 {
+                env.hv
+                    .fail_next_cancel(DriverError::Timeout("QMP block-job-cancel"));
+            }
+        }
+        env.start_reconciler();
+
+        env.wait(vm.id, "migration rolled back", |v| {
+            running(v) && v.status.migration.is_none()
+        })
+        .await;
+        assert_eq!(env.hv.mirroring(vm.id).len(), 1, "unattached: {unattached}");
+        assert_eq!(status_of(&env, vm.id).await, Some(RuntimeStatus::Running));
+    }
 }
 
 /// 취소하는 사이에 마이그레이션이 끝났다(원본은 `postmigrate`): 확정될 수 없으므로 이어서 실행한다.

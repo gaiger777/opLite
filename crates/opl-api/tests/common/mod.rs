@@ -86,6 +86,7 @@ pub fn runner_config(node: Uuid, dir: &Path) -> TaskRunnerConfig {
     config.poll_interval = Duration::from_millis(20);
     config.upload_dir = Some(dir.join("uploads"));
     config.state_dir = Some(dir.join("state"));
+    config.migration_disks = Some(dir.join("migration-disks"));
     config
 }
 
@@ -614,6 +615,17 @@ pub struct FakeStorage {
     slow_deactivates: std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Duration>>,
     /// 남은 횟수만큼 `exclusive_volume`이 일시 오류다(다른 노드가 아직 공유로 켜 두었다).
     held_exclusives: std::sync::Mutex<usize>,
+    /// 이 노드에 있는 볼륨 파일: `create_volume`이 만들고(있으면 `VolumeExists`), `delete_volume`이
+    /// 지운다. `place`로 미리 둔다.
+    files: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    /// `delete_volume`으로 지운 볼륨(차례대로)
+    deleted: std::sync::Mutex<Vec<Uuid>>,
+    /// `create_volume`이 크기를 이 단위로 올린다. 0이면 그대로다.
+    create_unit: std::sync::Mutex<u64>,
+    /// `volume_info`가 알릴 할당량(없으면 0)
+    allocated: std::sync::Mutex<std::collections::HashMap<Uuid, u64>>,
+    /// `deactivate_volume`의 (풀 이름, 볼륨)(차례대로)
+    deactivations: std::sync::Mutex<Vec<(String, Uuid)>>,
 }
 
 impl FakeStorage {
@@ -624,6 +636,38 @@ impl FakeStorage {
     /// `volume_info`가 알릴 크기
     pub fn set_size(&self, id: Uuid, size_bytes: u64) {
         self.sizes.lock().unwrap().insert(id, size_bytes);
+    }
+
+    /// 볼륨 `id`의 파일이 이 노드에 이미 있다(`create_volume`이 `VolumeExists`). `volume_info`가 알릴
+    /// 크기도 정한다.
+    pub fn place(&self, id: Uuid, size_bytes: u64) {
+        self.files.lock().unwrap().insert(id);
+        self.set_size(id, size_bytes);
+    }
+
+    /// 볼륨 `id`의 파일이 이 노드에 있는지
+    pub fn has_file(&self, id: Uuid) -> bool {
+        self.files.lock().unwrap().contains(&id)
+    }
+
+    /// `delete_volume`으로 지운 볼륨(차례대로, 실패 제외)
+    pub fn deleted(&self) -> Vec<Uuid> {
+        self.deleted.lock().unwrap().clone()
+    }
+
+    /// 이후의 `create_volume`이 크기를 `unit` 단위로 올린다(LVM의 extent처럼). 0이면 그대로다.
+    pub fn round_creates(&self, unit: u64) {
+        *self.create_unit.lock().unwrap() = unit;
+    }
+
+    /// `deactivate_volume`의 (풀 이름, 볼륨)(차례대로)
+    pub fn deactivations(&self) -> Vec<(String, Uuid)> {
+        self.deactivations.lock().unwrap().clone()
+    }
+
+    /// `volume_info`가 알릴 할당량
+    pub fn set_allocated(&self, id: Uuid, bytes: u64) {
+        self.allocated.lock().unwrap().insert(id, bytes);
     }
 
     /// 다음 `n`번의 `delete_volume`이 `PoolNotMounted`로 실패한다.
@@ -745,7 +789,11 @@ impl Storage for FakeStorage {
         size_bytes: u64,
         _: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
-        self.set_size(id, size_bytes);
+        if !self.files.lock().unwrap().insert(id) {
+            return Err(DriverError::VolumeExists(id));
+        }
+        let unit = (*self.create_unit.lock().unwrap()).max(1);
+        self.set_size(id, size_bytes.div_ceil(unit) * unit);
         Ok(PathBuf::new())
     }
     /// 호출을 `import`로 적고 형식을 남긴다. 원본 파일은 읽지 않는다.
@@ -767,7 +815,7 @@ impl Storage for FakeStorage {
     async fn delete_volume(
         &self,
         _: &StoragePool,
-        _: Uuid,
+        id: Uuid,
         _: ImageFormat,
     ) -> Result<(), DriverError> {
         let mut left = self.unmounted_deletes.lock().unwrap();
@@ -777,6 +825,8 @@ impl Storage for FakeStorage {
                 "/nonexistent/opl-pools/p".into(),
             ));
         }
+        self.files.lock().unwrap().remove(&id);
+        self.deleted.lock().unwrap().push(id);
         Ok(())
     }
     async fn volume_info(
@@ -787,9 +837,16 @@ impl Storage for FakeStorage {
     ) -> Result<VolumeInfo, DriverError> {
         let size = self.sizes.lock().unwrap().get(&id).copied();
         let virtual_bytes = size.ok_or(DriverError::VolumeNotFound(id))?;
+        let allocated_bytes = self
+            .allocated
+            .lock()
+            .unwrap()
+            .get(&id)
+            .copied()
+            .unwrap_or(0);
         Ok(VolumeInfo {
             virtual_bytes,
-            allocated_bytes: 0,
+            allocated_bytes,
         })
     }
     async fn capacity(&self, _: &StoragePool) -> Result<Capacity, DriverError> {
@@ -806,14 +863,16 @@ impl Storage for FakeStorage {
     ) -> Result<(), DriverError> {
         Ok(())
     }
-    /// 호출을 `deactivate`로 적는다.
+    /// 호출을 `deactivate`로 적는다(풀과 함께 `deactivations`에도).
     async fn deactivate_volume(
         &self,
-        _: &StoragePool,
+        pool: &StoragePool,
         id: Uuid,
         _: ImageFormat,
     ) -> Result<(), DriverError> {
         self.calls.lock().unwrap().push(("deactivate", id));
+        let deactivation = (pool.name.clone(), id);
+        self.deactivations.lock().unwrap().push(deactivation);
         let delay = self.slow_deactivates.lock().unwrap().get(&id).copied();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;

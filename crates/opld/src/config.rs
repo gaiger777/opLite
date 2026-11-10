@@ -280,6 +280,13 @@ pub struct MigrationSection {
         deserialize_with = "deserialize_duration"
     )]
     pub timeout: Duration,
+    /// 노드 로컬 풀의 디스크를 복사하는 마이그레이션에서 디스크 복사가 따라잡기까지의 한도(`"12h"`).
+    /// 메모리 단계는 `timeout`이다.
+    #[serde(
+        default = "default_migration_disk_timeout",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub disk_timeout: Duration,
 }
 
 impl Default for MigrationSection {
@@ -288,6 +295,7 @@ impl Default for MigrationSection {
             ports: default_migration_ports(),
             bandwidth_mib: 0,
             timeout: default_migration_timeout(),
+            disk_timeout: default_migration_disk_timeout(),
         }
     }
 }
@@ -710,6 +718,9 @@ fn default_migration_ports() -> RangeInclusive<u16> {
 fn default_migration_timeout() -> Duration {
     Duration::from_secs(30 * 60)
 }
+fn default_migration_disk_timeout() -> Duration {
+    Duration::from_secs(12 * 3600)
+}
 
 /// `"A-B"`: 0이 아닌 포트 A부터 B까지(A ≤ B)
 fn parse_port_range(s: &str) -> Result<RangeInclusive<u16>, String> {
@@ -1093,6 +1104,7 @@ mod tests {
         assert_eq!(c.migration.ports, 60000..=60099);
         assert_eq!(c.migration.bandwidth_mib, 0);
         assert_eq!(c.migration.timeout, Duration::from_secs(30 * 60));
+        assert_eq!(c.migration.disk_timeout, Duration::from_secs(12 * 3600));
         assert_eq!(c.hypervisor.accel, AccelSetting::Auto);
         assert_eq!(c.hypervisor.systemd_scope, cfg!(target_os = "linux"));
         assert_eq!(
@@ -1641,11 +1653,12 @@ mod tests {
     fn migration_section_parses_ports_and_timeout() {
         let c = parse(
             "name = \"n\"\naddress = \"h\"\n[migration]\nports = \"61000-61009\"\n\
-             bandwidth_mib = 100\ntimeout = \"1h30m\"",
+             bandwidth_mib = 100\ntimeout = \"1h30m\"\ndisk_timeout = \"2h\"",
         );
         assert_eq!(c.migration.ports, 61000..=61009);
         assert_eq!(c.migration.bandwidth_mib, 100);
         assert_eq!(c.migration.timeout, Duration::from_secs(5400));
+        assert_eq!(c.migration.disk_timeout, Duration::from_secs(7200));
         let one = parse(
             "name = \"n\"\naddress = \"h\"\n[migration]\nports = \"60000-60000\"\ntimeout = \"90s\"",
         );
@@ -1662,6 +1675,8 @@ mod tests {
             "timeout = \"500ms\"",
             "timeout = \"m\"",
             "timeout = \"\"",
+            "disk_timeout = \"0s\"",
+            "disk_timeout = \"12\"",
             "bandwidth = 1",
         ] {
             let text = format!("name = \"n\"\naddress = \"h\"\n[migration]\n{bad}");

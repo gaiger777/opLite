@@ -43,6 +43,8 @@ use crate::pools::PoolMounter;
 
 /// 데이터 디렉터리 아래 클러스터 저장소(Raft 로그와 상태)를 두는 디렉터리
 pub const CLUSTER_DIR: &str = "cluster";
+/// 데이터 디렉터리 아래 마이그레이션 디스크 기록 파일을 두는 디렉터리(로컬 디스크 마이그레이션 설계 §3.6)
+const MIGRATION_DISKS_DIR: &str = "migration-disks";
 /// 종료 신호를 받은 뒤 열린 연결(watch, 콘솔)이 끝나기를 기다리는 시간
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 쓰기가 커밋되기를 기다리는 시간. 리더를 잃으면 새 리더를 뽑는 데 보통 선거 제한 시간의 두 배쯤
@@ -305,6 +307,7 @@ impl Member {
                 storage: storage.clone(),
                 listen_host: config.migration_listen_host(),
                 ports: config.migration.ports.clone(),
+                migration_disks: config.data_dir.join(MIGRATION_DISKS_DIR),
             },
         );
         // API가 적고, 다른 노드가 노드 간 서버로 읽는다.
@@ -452,6 +455,9 @@ impl Member {
         runner_config.migration_bandwidth =
             (config.migration.bandwidth_mib > 0).then_some(config.migration.bandwidth_mib << 20);
         runner_config.migration_timeout = config.migration.timeout;
+        runner_config.migration_disk_timeout = config.migration.disk_timeout;
+        // 받는 쪽(IncomingConfig)과 같은 디렉터리다.
+        runner_config.migration_disks = Some(config.data_dir.join(MIGRATION_DISKS_DIR));
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
         // 노드 비우기 Task가 이 노드의 API와 같은 확인으로 마이그레이션 Task를 만든다.

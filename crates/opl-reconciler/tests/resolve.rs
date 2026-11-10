@@ -8,14 +8,16 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use opl_cluster::memnet::MemRouter;
 use opl_driver::{Capacity, DriverError, SourceFormat, Storage, VolumeInfo, VolumeSource};
-use opl_reconciler::resolve::{ResolveError, incoming_spec, runtime_spec, set_disks_shared};
+use opl_reconciler::resolve::{
+    ResolveError, apply_disk_moves, incoming_spec, runtime_spec, set_disks_shared,
+};
 use opl_types::network::{Network, NetworkSpec, Vxlan, tap_name};
 use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{DiskBus, DiskSpec, MacAddr, NicModel, NicSpec, Vm};
+use opl_types::vm::{DiskBus, DiskMove, DiskSpec, MacAddr, MigrationStatus, NicModel, NicSpec, Vm};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -368,6 +370,110 @@ async fn incoming_spec_shares_the_volumes() {
         .unwrap_err();
     assert!(matches!(err, ResolveError::NetworkNotFound(_)), "{err:?}");
     assert_eq!(*storage.deactivated.lock().unwrap(), [root.id, data.id]);
+}
+
+/// 받는 마이그레이션이 복사하는 디스크는 이 노드에 새로 만든 볼륨이다: 계획의 풀·형식으로 켜고
+/// (공유가 아니다) 그 경로·형식을 쓴다. 나머지 디스크는 지금처럼 공유로 켠다.
+#[tokio::test]
+async fn incoming_spec_activates_the_copied_disks_in_the_planned_pool() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    cluster.create(&pool("fast", vec![node])).await.unwrap();
+    let (root, data) = (volume("root", "local"), volume("data", "local"));
+    cluster.create(&root).await.unwrap();
+    cluster.create(&data).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks.push(disk("root"));
+    vm.spec.disks.push(disk("data"));
+    vm.status.migration = Some(MigrationStatus {
+        node,
+        task: Uuid::now_v7(),
+        disks: vec![DiskMove {
+            volume: data.id,
+            pool: "fast".into(),
+            format: ImageFormat::Raw,
+        }],
+    });
+
+    let storage = Activations::default();
+    let spec = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(spec.disks[0].format, ImageFormat::Qcow2);
+    assert_eq!(
+        spec.disks[1].path,
+        PathBuf::from(format!("/pools/fast/{}.raw", data.id))
+    );
+    assert_eq!(spec.disks[1].format, ImageFormat::Raw);
+    assert_eq!(*storage.shared.lock().unwrap(), [(root.id, true)]);
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        [("fast".to_string(), data.id, ImageFormat::Raw)]
+    );
+
+    // 시작(받기가 아님)은 계획을 보지 않는다.
+    let storage = Activations::default();
+    let spec = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(spec.disks[1].format, ImageFormat::Qcow2);
+    assert_eq!(storage.calls.lock().unwrap()[1].0, "local");
+}
+
+/// 계획의 노드로 확정된 VM이면 볼륨 기록(풀·형식·만든 노드)을 옮긴 위치로 고친다. 두 번 해도 같고,
+/// 확정되지 않았으면 고치지 않는다.
+#[tokio::test]
+async fn apply_disk_moves_rewrites_the_volumes_once_committed() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let (source, target) = (Uuid::now_v7(), Uuid::now_v7());
+    let mut root = volume("root", "local");
+    root.status.node = Some(source);
+    let mut data = volume("data", "local");
+    data.status.node = Some(source);
+    cluster.create(&root).await.unwrap();
+    cluster.create(&data).await.unwrap();
+    let mut vm = common::vm("web", source);
+    vm.spec.disks.push(disk("root"));
+    vm.spec.disks.push(disk("data"));
+    vm.status.migration = Some(MigrationStatus {
+        node: target,
+        task: Uuid::now_v7(),
+        disks: vec![
+            DiskMove {
+                volume: root.id,
+                pool: "local".into(),
+                format: ImageFormat::Qcow2,
+            },
+            DiskMove {
+                volume: data.id,
+                pool: "fast".into(),
+                format: ImageFormat::Raw,
+            },
+        ],
+    });
+    let read = |id| cluster.get::<VolumeSpec>(id).unwrap().unwrap();
+
+    // 확정 전에는 그대로다.
+    let before = read(root.id).revision;
+    apply_disk_moves(&cluster, &vm).await.unwrap();
+    assert_eq!(read(root.id).revision, before);
+    assert_eq!(read(data.id).status.node, Some(source));
+
+    vm.spec.node = Some(target);
+    apply_disk_moves(&cluster, &vm).await.unwrap();
+    let (r, d) = (read(root.id), read(data.id));
+    assert_eq!(r.spec, root.spec);
+    assert_eq!(r.status.node, Some(target));
+    assert_eq!(d.spec.pool, "fast");
+    assert_eq!(d.spec.format, ImageFormat::Raw);
+    assert_eq!(d.spec.size_bytes, data.spec.size_bytes);
+    assert_eq!(d.status.node, Some(target));
+    apply_disk_moves(&cluster, &vm).await.unwrap();
+    assert_eq!(read(root.id).revision, r.revision);
+    assert_eq!(read(data.id).revision, d.revision);
 }
 
 /// 디스크마다 공유·배타로 바꾼다. 처음 실패에서 멈추고, 저장소의 일시 오류는 `PoolUnavailable`,

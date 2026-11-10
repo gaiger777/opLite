@@ -88,6 +88,12 @@ pub struct TaskRunnerConfig {
     pub migration_bandwidth: Option<u64>,
     /// 마이그레이션이 이 시간 안에 끝나지 않으면 취소한다. 마이그레이션 Task는 `timeout` 대신 이것을 쓴다.
     pub migration_timeout: Duration,
+    /// 로컬 디스크를 복사하는 마이그레이션에서 디스크 미러가 모두 따라잡기(`ready`)까지의 한도
+    /// (`[migration] disk_timeout`). 메모리 단계는 `migration_timeout`이다.
+    pub migration_disk_timeout: Duration,
+    /// 마이그레이션 디스크 기록 파일의 디렉터리(opld의 `{data_dir}/migration-disks`). 받는 쪽
+    /// (`IncomingConfig::migration_disks`)과 같다. 없으면 로컬 디스크를 복사하는 마이그레이션은 실패한다.
+    pub migration_disks: Option<PathBuf>,
     /// 스냅샷·복제가 UEFI 변수를 복사하기 전에, 변수 파일이 다른 노드에 있으면 받아 온다. 없으면
     /// 이 노드의 파일을 그대로 쓴다.
     pub firmware: Option<Arc<dyn FirmwareFetcher>>,
@@ -115,6 +121,8 @@ impl TaskRunnerConfig {
             peers: None,
             migration_bandwidth: None,
             migration_timeout: Duration::from_secs(30 * 60),
+            migration_disk_timeout: Duration::from_secs(12 * 3600),
+            migration_disks: None,
             firmware: None,
             import_credentials: Arc::default(),
             updates: None,
@@ -793,7 +801,9 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             snapshot,
             pool,
         } => clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
-        TaskOp::VmMigrate { node, .. } => migrate::migrate(ctx, task, *node).await,
+        TaskOp::VmMigrate { node, pool } => {
+            migrate::migrate(ctx, task, *node, pool.as_deref()).await
+        }
         // 기록 Task는 끝난 상태로 만들어지므로 실행되지 않는다.
         TaskOp::VmHaRecover { .. } => Err("an HA recovery task is a record and is not run".into()),
         TaskOp::VmBackup { backup } => backup::backup(ctx, task, *backup).await,
