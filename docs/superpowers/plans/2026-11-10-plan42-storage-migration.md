@@ -29859,3 +29859,28 @@ git commit -m "test(opld): 로컬 디스크 마이그레이션의 실제 시험�
 - 대상 풀은 하나다. 노드 비우기는 같은 이름 풀 규칙만 쓴다. qcow2 → raw로 옮긴 디스크의 비트맵은 지워져 다음 백업이 전체다.
 - `lvm-it`·`zfs-it` 왕복은 Linux CI에서만 돈다. opld E2E는 복사 중 게스트 쓰기를 하지 않는다(opl-driver `qemu-it`가 본다).
 - 그 밖의 제한은 설계 문서 §6·§8과 README "라이브 마이그레이션" 절에 있다.
+
+## 실행 후 기록 (2026-11-11)
+
+- **Task 1~6:** `feat/plan42-storage-migration`에서 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았다(생성 파일 제외). 이 Mac(Homebrew QEMU 11.1, TCG)에서 opl-qemu `qemu-it`, opl-driver `qemu-it` `qemu_migration` 5개(디스크를 미러링하며 옮기기, 복사 실패에서 원본이 계속 돎 포함), opld `migration-it` 5개(디렉터리 풀 a·b 사이 왕복과 진행 줄, 같은 이름 로컬 풀에서 비우기가 VM을 남김)가 통과했다.
+- **1차 리뷰에서 고친 것:**
+  - 정리와 받는 쪽이 같은 기록 파일을 두고 겨루던 것을 기록 디렉터리 잠금으로 막았다.
+  - 만들기 전에 쓴 기록 때문에 남의 디스크를 지울 수 있던 것을 `created` 표시로 막았다.
+  - 두 노드에서 중간에 죽는 경우의 시험을 더했다.
+  - 오래된 사본, 비활성화할 풀, 끝난 Task를 되살리던 진행률, `clear_migration` 순서, 비우기 이유, oplctl stderr, 웹 안내, 문서.
+- **2차 리뷰에서 고친 것:** `NotAttached`나 세 번 연속 실패에서 표시를 지운다, 잠근 뒤 표시를 다시 본다, 받기·중단을 `tokio::spawn`에서 돌린다, `Cleanup::DeleteUnused`, 화면 문구와 커밋 메시지.
+- **CI에서 고친 것:** Linux CI의 rustc 1.99.1 clippy `manual_clear`(scheduler.rs의 `truncate(0)` → `clear()`). 이 Mac의 Homebrew Rust 1.95에는 없는 lint라 테스트 VM(rustc 1.99.1)에서 전체 clippy를 따로 돌려 다른 것이 없음을 확인했다.
+- **불안정한 시험:** 전체 실행에서 부하 때문에 `two_nodes::an_oidc_login_started_on_one_node_finishes_on_the_other`(Task 3)와 `telemetry_reporter::redirects_are_not_followed`(Task 5)가 한 번씩 실패했고, 따로 다시 돌리면 통과했다. 이 계획의 변경과는 관계없다.
+
+**테스트:**
+- macOS `cargo test --workspace` 1642개(Task 5 이후)
+- 웹 시험 572개와 `typecheck`·`lint`·`build`
+- `fmt`·`clippy -D warnings`(모든 기능)
+
+Linux CI(프로브)에서 같은 시험과 linux-kvm(`migrates_a_vm_with_local_disks`, ZFS·LVM thin 풀 왕복)·ldap 작업이 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 하위 프로젝트 13(로컬 디스크 라이브 마이그레이션)이 끝났다.
+- 다음: 계획 43 제품 이름 바꾸기(Orbivisor). 따로 설계 문서를 쓴다.
+- 그 다음: 하위 프로젝트 14(실시간 지표 수집, 대시보드·VM 차트, 3D 클러스터 보기, 끌어 놓는 VM 만들기), Proxmox VE·VMware와 비교해 빠진 기능 더하기.
