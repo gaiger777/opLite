@@ -1138,7 +1138,8 @@ enum BackupCmd {
         #[arg(long)]
         vm: Option<String>,
     },
-    /// 백업(JSON). 증분 백업은 `chain`에 전체 백업부터 이 백업까지의 이름과 체인 파일 크기의 합을 더한다.
+    /// 백업(JSON). 증분 백업은 `chain`에 전체 백업부터 이 백업까지의 이름과 체인 파일 크기의 합, 원격
+    /// 사본마다 체인의 몇 백업이 원격에 있는지(`replicas`의 "k of n copied")를 더한다.
     Get { backup: String },
     /// 백업 파일과 기록을 지운다. 실패한 백업도 지운다.
     Delete {
@@ -3644,7 +3645,9 @@ async fn backup_create(
 /// 증분 백업의 체인: 전체 백업부터 이 백업까지의 이름과 그 파일 크기의 합. `backups`는 백업 목록이고,
 /// 거기 없는 조상은 id로 적고 거기서 멈춘다(이미 본 백업이 다시 나와도 멈춘다). 체인을 끝까지 따라가지
 /// 못했거나 다 만들지 않은(`ready`가 아닌) 백업이 있으면 크기는 모르므로(부분 합은 보이지 않는다) 이름만
-/// 적는다.
+/// 적는다. 체인을 끝까지 따라갔으면 `replicas`에 체인 백업들의 원격 사본 (원격, 풀)마다 체인 n개 가운데
+/// 사본이 ready로 적힌(사본 id가 있는) 백업 k개를 "k of n copied"로 적는다(복제 중이 아니어도 보이는
+/// 상태).
 fn backup_chain(backup: &Value, backups: &[Value]) -> Value {
     let stored = |b: &Value| -> u64 {
         b["status"]["disks"].as_array().map_or(0, |disks| {
@@ -3656,31 +3659,76 @@ fn backup_chain(backup: &Value, backups: &[Value]) -> Value {
     };
     let ready = |b: &Value| b["status"]["phase"] == "ready";
     let mut names = vec![cell(&backup["name"])];
+    let mut members = vec![backup];
     let mut total = stored(backup);
     let mut sized = ready(backup);
+    let mut whole = true;
     let mut seen = std::collections::HashSet::from([backup["id"].clone()]);
     let mut parent = backup["status"]["parent"].clone();
     while let Some(id) = parent.as_str() {
         if !seen.insert(parent.clone()) {
             sized = false;
+            whole = false;
             break;
         }
         let Some(b) = backups.iter().find(|b| b["id"] == id) else {
             names.push(id.to_string());
             sized = false;
+            whole = false;
             break;
         };
         names.push(cell(&b["name"]));
+        members.push(b);
         total += stored(b);
         sized &= ready(b);
         parent = b["status"]["parent"].clone();
     }
     names.reverse();
+    members.reverse();
+    let mut chain = json!({ "backups": names });
     if sized {
-        json!({ "backups": names, "stored_bytes": total })
-    } else {
-        json!({ "backups": names })
+        chain["stored_bytes"] = total.into();
     }
+    // 체인 백업들의 사본 (원격, 풀)을 전체 백업부터 처음 나온 차례로
+    let mut targets: Vec<(&Value, &Value)> = Vec::new();
+    for b in &members {
+        for r in b["status"]["replicas"].as_array().into_iter().flatten() {
+            let target = (&r["remote"], &r["pool"]);
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    if whole && !targets.is_empty() {
+        let sent = |remote: &Value, pool: &Value| {
+            members
+                .iter()
+                .filter(|b| {
+                    b["status"]["replicas"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|r| {
+                            r["remote"] == *remote
+                                && r["pool"] == *pool
+                                && r["state"] == "ready"
+                                && r["backup"].is_string()
+                        })
+                })
+                .count()
+        };
+        chain["replicas"] = targets
+            .iter()
+            .map(|&(remote, pool)| {
+                json!({
+                    "remote": remote,
+                    "pool": pool,
+                    "progress": format!("{} of {} copied", sent(remote, pool), members.len()),
+                })
+            })
+            .collect();
+    }
+    chain
 }
 
 /// `backup replicate`: 복제 Task를 만든다. `wait`이면 끝날 때까지 기다리고, 아니면 Task를 따라가는
@@ -6005,6 +6053,43 @@ mod tests {
             backup_chain(&all[2], &all),
             json!({ "backups": ["full", "incr-1", "incr-2"], "stored_bytes": 1113 })
         );
+        // 원격 사본: (원격, 풀)마다 체인에서 ready이고 사본 id가 있는 백업의 수
+        let copy = |pool: &str, state: &str, backup: Option<&str>| json!({ "remote": "dr", "pool": pool, "state": state, "backup": backup, "at": 1 });
+        let mut sent = all.clone();
+        sent[0]["status"]["replicas"] = json!([
+            copy("bk", "ready", Some("ra")),
+            copy("other", "ready", Some("oa"))
+        ]);
+        sent[1]["status"]["replicas"] = json!([copy("bk", "ready", Some("rb"))]);
+        sent[2]["status"]["replicas"] = json!([
+            copy("bk", "copying", Some("rc")),
+            copy("other", "ready", None)
+        ]);
+        assert_eq!(
+            backup_chain(&sent[2], &sent),
+            json!({
+                "backups": ["full", "incr-1", "incr-2"], "stored_bytes": 1113,
+                "replicas": [
+                    { "remote": "dr", "pool": "bk", "progress": "2 of 3 copied" },
+                    { "remote": "dr", "pool": "other", "progress": "1 of 3 copied" }
+                ]
+            })
+        );
+        // 기록이 이 백업의 실패 기록 하나뿐이어도(진행 중이 아니어도) 상태로 보인다.
+        let mut failed = all.clone();
+        failed[2]["status"]["replicas"] = json!([copy("bk", "failed", Some("rc"))]);
+        assert_eq!(
+            backup_chain(&failed[2], &failed),
+            json!({
+                "backups": ["full", "incr-1", "incr-2"], "stored_bytes": 1113,
+                "replicas": [{ "remote": "dr", "pool": "bk", "progress": "0 of 3 copied" }]
+            })
+        );
+        // 체인을 끝까지 따라가지 못하면 진행은 모른다.
+        assert_eq!(
+            backup_chain(&sent[2], &sent[1..]),
+            json!({ "backups": ["a", "incr-1", "incr-2"] })
+        );
         // 목록에 없는 조상은 id로 적고 멈춘다. 체인 크기는 모른다.
         assert_eq!(
             backup_chain(&all[2], &all[1..]),
@@ -6019,6 +6104,13 @@ mod tests {
         );
         // 잘못된 목록에서 고리를 이루어도 멈춘다. 전체 백업에 닿지 못했으므로 크기는 모른다.
         let mut ring = all.clone();
+        ring[0]["status"]["parent"] = json!("c");
+        assert_eq!(
+            backup_chain(&ring[2], &ring),
+            json!({ "backups": ["full", "incr-1", "incr-2"] })
+        );
+        // 고리면 사본 기록이 있어도 진행은 모른다.
+        let mut ring = sent.clone();
         ring[0]["status"]["parent"] = json!("c");
         assert_eq!(
             backup_chain(&ring[2], &ring),
