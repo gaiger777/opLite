@@ -3,11 +3,12 @@
 
 mod common;
 
-use common::{Client, Env, mark_pool_ready, vm_request};
-use opl_types::node::{Fencing, Node, NodeHa, NodeSpec, NodeStatus};
+use common::{Client, Env, mark_pool_ready, set_pool_state, vm_request};
+use opl_types::node::{FEATURES, Fencing, Node, NodeHa, NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{Volume, VolumePhase, VolumeSpec};
+use opl_types::snapshot::{Snapshot, SnapshotSpec};
+use opl_types::storage::{StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState};
 use opl_types::vm::{Arch, MigrationStatus, VmPhase, VmSpec};
 use reqwest::StatusCode;
@@ -207,7 +208,7 @@ async fn ha_vms_migrate_only_to_ha_capable_nodes() {
 }
 
 #[tokio::test]
-async fn migrate_needs_a_running_vm_on_shared_pools() {
+async fn migrate_needs_a_running_vm() {
     let env = Env::start().await;
     let admin = env.admin().await;
     setup(&env, &admin).await;
@@ -217,16 +218,173 @@ async fn migrate_needs_a_running_vm_on_shared_pools() {
     ready_volume(&env, "local", "data").await;
     create_vm(&env, &admin, "db", "data").await;
     assert_conflict(migrate(&admin, "db", "node2").await, "vm_not_running");
+}
 
-    // 공유가 아닌 풀의 디스크는 대상 노드에서 열 수 없다.
+/// 노드 로컬 풀 `local`의 디스크를 쓰는 VM `db`를 이 노드에서 실행한다(공유 풀 VM `web`도 있다).
+/// `node2`의 id를 돌려준다. `node2`는 아직 디스크 복사 기능을 알리지 않았다.
+async fn setup_local(env: &Env, admin: &Client) -> Uuid {
+    let node2 = setup(env, admin).await;
+    create_pool(env, admin, "local", false).await;
+    ready_volume(env, "local", "data").await;
+    create_vm(env, admin, "db", "data").await;
     let task = admin.act("db", "start").await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    node2
+}
+
+/// 노드가 이 빌드의 기능을 모두 알린 것으로 둔다.
+async fn upgrade(env: &Env, node: Uuid) {
+    edit_node(env, node, |n| {
+        n.status.features = FEATURES.iter().map(|f| f.to_string()).collect()
+    })
+    .await;
+}
+
+/// 노드 로컬 풀의 디스크는 대상 노드의 같은 이름의 풀에 복사한다. 모든 노드가 그 기능을 알아야 한다.
+#[tokio::test]
+async fn local_disks_are_copied_to_the_same_named_pool() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = setup_local(&env, &admin).await;
+
+    // 옛 노드가 있으면 로컬 디스크가 있는 VM은 옮기지 않는다. 공유 풀만의 VM은 그대로 옮긴다.
     let (status, body) = migrate(&admin, "db", "node2").await;
-    assert_conflict((status, body.clone()), "migration_unsupported");
-    assert!(
-        body["message"].as_str().unwrap().contains("\"data\""),
+    assert_eq!(
+        body["message"],
+        "some nodes do not support storage migration yet (node2); upgrade them first",
         "{body}"
     );
+    assert_conflict((status, body), "cluster_upgrading");
+    let (status, task) = migrate(&admin, "web", "node2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
+
+    upgrade(&env, node2).await;
+    // 대상 노드에서 같은 이름의 풀을 쓸 수 없으면 고를 수 없는 노드다.
+    set_pool_state(
+        &env.cluster,
+        node2,
+        "local",
+        PoolState {
+            ready: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, body) = migrate(&admin, "db", "node2").await;
+    assert_eq!(
+        body["message"], "node \"node2\" cannot use storage pool \"local\" for disk \"data\"",
+        "{body}"
+    );
+    assert_conflict((status, body), "no_capacity");
+
+    mark_pool_ready(&env.cluster, node2, "local").await;
+    let (status, task) = migrate(&admin, "db", "node2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    // pool을 주지 않으면 Task에도 없다(옛 모양).
+    assert_eq!(
+        task["spec"]["op"],
+        json!({ "kind": "vm-migrate", "node": node2 })
+    );
+    admin.wait_task(&task).await;
+}
+
+/// `pool`은 노드 로컬 풀의 디스크를 둘 대상 노드의 풀이다.
+#[tokio::test]
+async fn pool_picks_where_local_disks_go() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = setup_local(&env, &admin).await;
+    upgrade(&env, node2).await;
+    let migrate_to = |vm: &'static str, pool: &'static str| {
+        let admin = &admin;
+        async move {
+            admin
+                .post(
+                    &format!("/vms/{vm}/migrate"),
+                    json!({ "node": "node2", "pool": pool }),
+                )
+                .await
+        }
+    };
+
+    // 로컬 디스크가 없는 VM에는 쓸 데가 없다.
+    let (status, body) = migrate_to("web", "local").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(
+        body["message"],
+        "VM \"web\" has no disks on node-local pools; pool applies only to them"
+    );
+    let (status, body) = migrate_to("db", "nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // node2가 쓸 수 없는 풀
+    create_pool(&env, &admin, "fast", false).await;
+    let fast = env
+        .cluster
+        .get_by_name::<StoragePoolSpec>("fast")
+        .unwrap()
+        .unwrap();
+    let mut spec = fast.spec.clone();
+    spec.nodes = vec![env.node];
+    env.cluster
+        .update_spec(fast.id, None, fast.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let (status, body) = migrate_to("db", "fast").await;
+    assert_eq!(
+        body["message"], "node \"node2\" cannot use storage pool \"fast\" for disk \"data\"",
+        "{body}"
+    );
+    assert_conflict((status, body), "no_capacity");
+
+    // 공유 풀로도 옮긴다. Task에 그 풀을 적는다.
+    let (status, task) = migrate_to("db", "nas").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(
+        task["spec"]["op"],
+        json!({ "kind": "vm-migrate", "node": node2, "pool": "nas" })
+    );
+    admin.wait_task(&task).await;
+}
+
+/// 스냅샷은 복사하지 않으므로 스냅샷이 있는 VM의 로컬 디스크는 옮기지 않는다.
+#[tokio::test]
+async fn local_disks_of_a_vm_with_snapshots_are_not_moved() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = setup_local(&env, &admin).await;
+    upgrade(&env, node2).await;
+    for vm in ["db", "web"] {
+        let vm = env.cluster.get_by_name::<VmSpec>(vm).unwrap().unwrap();
+        let mut snapshot: Snapshot = Resource::new(
+            "",
+            SnapshotSpec {
+                vm: vm.id,
+                name: "s1".into(),
+                parent: None,
+                memory: false,
+                description: String::new(),
+                scheduled: false,
+                vm_spec: vm.spec.clone(),
+            },
+        );
+        snapshot.name = snapshot.id.to_string();
+        env.cluster.create(&snapshot).await.unwrap();
+    }
+
+    let (status, body) = migrate(&admin, "db", "node2").await;
+    assert_eq!(
+        body["message"],
+        "VM \"db\" has snapshots and disk \"data\" is on node-local pool \"local\"; snapshots are not copied, delete them first",
+        "{body}"
+    );
+    assert_conflict((status, body), "migration_unsupported");
+    // 공유 풀의 디스크는 복사하지 않으므로 스냅샷이 있어도 된다(지금 그대로).
+    let (status, task) = migrate(&admin, "web", "node2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
 }
 
 #[tokio::test]
@@ -337,6 +495,7 @@ async fn migrating_phase_makes_the_vm_busy() {
     vm.status.migration = Some(MigrationStatus {
         node: env.node,
         task: Uuid::now_v7(),
+        disks: vec![],
     });
     env.cluster
         .update_status::<VmSpec>(vm.id, &vm.status)

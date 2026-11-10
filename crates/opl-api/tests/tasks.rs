@@ -33,6 +33,7 @@ async fn tasks_left_running_by_a_previous_opld_are_failed() {
             task.status = TaskStatus {
                 state: TaskState::Running,
                 error: None,
+                progress: None,
             };
             cluster.create(&task).await.unwrap();
             *slot.lock().unwrap() = Some(task.id);
@@ -262,7 +263,11 @@ async fn vm_with_disks(env: &Env, name: &str, power: PowerState, disks: &[&str])
 async fn task_on(env: &Env, op: TaskOp, target: Uuid, node: Uuid, state: TaskState) {
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
     task.name = task.id.to_string();
-    task.status = TaskStatus { state, error: None };
+    task.status = TaskStatus {
+        state,
+        error: None,
+        progress: None,
+    };
     env.cluster.create(&task).await.unwrap();
 }
 
@@ -349,6 +354,7 @@ async fn volumes_left_active_are_deactivated() {
     moving.status.migration = Some(MigrationStatus {
         node: env.node,
         task: Uuid::now_v7(),
+        disks: vec![],
     });
     env.cluster.create(&moving).await.unwrap();
     env.cluster

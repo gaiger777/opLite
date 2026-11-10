@@ -807,7 +807,16 @@ async fn task_started_alongside_stops_the_migration() {
     ];
     for (op, target, what) in others {
         let other = put_task(&a, op, target, elsewhere).await;
-        let migrate = put_task(&a, TaskOp::VmMigrate { node: b.id }, vm.id, a.id).await;
+        let migrate = put_task(
+            &a,
+            TaskOp::VmMigrate {
+                node: b.id,
+                pool: None,
+            },
+            vm.id,
+            a.id,
+        )
+        .await;
         let task = finished_task(&a, migrate).await;
         assert_eq!(task.status.state, TaskState::Failed, "{:?}", task.status);
         let error = task.status.error.unwrap();

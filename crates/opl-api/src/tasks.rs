@@ -476,7 +476,7 @@ async fn volumes_in_use(ctx: &Ctx) -> Result<(HashSet<Uuid>, HashMap<Uuid, Image
         let used = task_vms.contains(&vm.id)
             || running.iter().any(|r| r.id == vm.id)
             || (vm.spec.node == Some(me) && vm.spec.power == PowerState::Running)
-            || vm.status.migration.is_some_and(|m| m.node == me);
+            || vm.status.migration.as_ref().is_some_and(|m| m.node == me);
         if used {
             in_use.extend(
                 vm.spec
@@ -714,6 +714,7 @@ async fn begin(ctx: &Ctx, id: Uuid) -> bool {
     let running = TaskStatus {
         state: TaskState::Running,
         error: None,
+        progress: None,
     };
     loop {
         let current = match ctx.cluster.get::<TaskSpec>(id) {
@@ -748,7 +749,11 @@ async fn begin(ctx: &Ctx, id: Uuid) -> bool {
 
 /// 저장소에 기록될 때까지 다시 시도한다. 실행기가 멈추면 이 future도 함께 멈춘다.
 async fn set_status(ctx: &Ctx, id: Uuid, state: TaskState, error: Option<String>) {
-    let status = TaskStatus { state, error };
+    let status = TaskStatus {
+        state,
+        error,
+        progress: None,
+    };
     loop {
         match ctx.cluster.update_status::<TaskSpec>(id, &status).await {
             Ok(_) => return,
@@ -788,7 +793,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             snapshot,
             pool,
         } => clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
-        TaskOp::VmMigrate { node } => migrate::migrate(ctx, task, *node).await,
+        TaskOp::VmMigrate { node, .. } => migrate::migrate(ctx, task, *node).await,
         // 기록 Task는 끝난 상태로 만들어지므로 실행되지 않는다.
         TaskOp::VmHaRecover { .. } => Err("an HA recovery task is a record and is not run".into()),
         TaskOp::VmBackup { backup } => backup::backup(ctx, task, *backup).await,

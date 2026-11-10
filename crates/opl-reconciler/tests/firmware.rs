@@ -158,6 +158,7 @@ async fn received_vm_is_not_fetched() {
     vm.status.migration = Some(MigrationStatus {
         node: env.node,
         task: Uuid::now_v7(),
+        disks: vec![],
     });
     env.create(&vm).await;
     let spec = VmRuntimeSpec {

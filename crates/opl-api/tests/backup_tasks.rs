@@ -334,7 +334,11 @@ async fn put_task(
     task.name = task.id.to_string();
     env.cluster.create(&task).await.unwrap();
     if state != TaskState::Pending {
-        let status = TaskStatus { state, error: None };
+        let status = TaskStatus {
+            state,
+            error: None,
+            progress: None,
+        };
         env.cluster
             .update_status::<TaskSpec>(task.id, &status)
             .await
@@ -453,6 +457,7 @@ async fn backup_interrupted_by_a_restart_is_failed_and_cleaned_up() {
     let running = TaskStatus {
         state: TaskState::Running,
         error: None,
+        progress: None,
     };
     env.cluster
         .update_status::<TaskSpec>(task_id, &running)

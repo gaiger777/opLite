@@ -119,7 +119,11 @@ impl Setup {
         let mut vm = self.env.cluster.get::<VmSpec>(self.vm).unwrap().unwrap();
         vm.status.phase = VmPhase::Migrating;
         vm.status.node = Some(self.source);
-        vm.status.migration = Some(MigrationStatus { node, task });
+        vm.status.migration = Some(MigrationStatus {
+            node,
+            task,
+            disks: vec![],
+        });
         self.env
             .cluster
             .update_status::<VmSpec>(self.vm, &vm.status)

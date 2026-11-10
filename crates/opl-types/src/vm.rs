@@ -7,6 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::resource::{Kind, Resource, ResourceSpec};
+use crate::runtime::ImageFormat;
 
 pub type Vm = Resource<VmSpec, VmStatus>;
 
@@ -324,11 +325,26 @@ pub struct VmStatus {
 }
 
 /// 진행 중인 라이브 마이그레이션: 대상 노드와 그 마이그레이션 Task
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct MigrationStatus {
     pub node: Uuid,
     pub task: Uuid,
+    /// 대상 노드로 복사하는 노드 로컬 풀의 디스크. VM이 대상 노드로 확정되면 적용된 것이 된다.
+    /// 비면 빼고 쓰므로 공유 풀만의 마이그레이션은 기록이 옛 모양 그대로다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub disks: Vec<DiskMove>,
+}
+
+/// 마이그레이션이 복사하는 디스크 하나: 볼륨 `volume`을 대상 노드의 풀 `pool`에 `format`으로 만든다.
+/// 원본 풀·형식은 볼륨 기록에 그대로 있다(확정 전에는 바꾸지 않는다).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DiskMove {
+    pub volume: Uuid,
+    pub pool: String,
+    pub format: ImageFormat,
 }
 
 /// 예약 스냅샷이 실패한 이유. `code`는 거절한 API 오류의 code(`vm_busy` 등)이고, Task가 실패했으면
@@ -652,19 +668,43 @@ mod tests {
             migration: Some(MigrationStatus {
                 node: Uuid::now_v7(),
                 task: Uuid::now_v7(),
+                disks: vec![],
             }),
             ..Default::default()
         };
+        let m = st.migration.clone().unwrap();
         let json = serde_json::to_value(&st).unwrap();
         assert_eq!(json["phase"], "migrating");
+        // 복사할 디스크가 없으면 disks를 빼고 쓴다(옛 모양).
         assert_eq!(
             json["migration"],
-            serde_json::json!({
-                "node": st.migration.unwrap().node,
-                "task": st.migration.unwrap().task
-            })
+            serde_json::json!({ "node": m.node, "task": m.task })
         );
         assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
+    }
+
+    #[test]
+    fn migration_status_carries_the_disk_moves() {
+        let volume = Uuid::now_v7();
+        let m = MigrationStatus {
+            node: Uuid::now_v7(),
+            task: Uuid::now_v7(),
+            disks: vec![DiskMove {
+                volume,
+                pool: "fast".into(),
+                format: ImageFormat::Raw,
+            }],
+        };
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "node": m.node,
+                "task": m.task,
+                "disks": [{ "volume": volume, "pool": "fast", "format": "raw" }]
+            })
+        );
+        assert_eq!(serde_json::from_value::<MigrationStatus>(json).unwrap(), m);
     }
 
     #[test]

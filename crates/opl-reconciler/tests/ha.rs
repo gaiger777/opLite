@@ -832,6 +832,7 @@ async fn received_ha_vm_is_continued_only_with_the_lease() {
     status.migration = Some(MigrationStatus {
         node: env.node,
         task: Uuid::now_v7(),
+        disks: vec![],
     });
     env.cluster
         .update_status::<VmSpec>(vm.id, &status)
@@ -903,6 +904,7 @@ async fn ha_source_left_by_a_restart(env: &mut Env) -> (Vm, Option<u32>, Arc<Fak
     status.migration = Some(MigrationStatus {
         node: Uuid::now_v7(),
         task: Uuid::now_v7(),
+        disks: vec![],
     });
     env.cluster
         .update_status::<VmSpec>(vm.id, &status)

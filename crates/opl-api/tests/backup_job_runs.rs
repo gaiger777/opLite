@@ -587,6 +587,7 @@ async fn a_backup_whose_task_ended_unfinished_fails_the_run() {
     let failed = TaskStatus {
         state: TaskState::Failed,
         error: Some("node lost".into()),
+        progress: None,
     };
     env.cluster
         .update_status::<TaskSpec>(task.id, &failed)

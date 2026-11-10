@@ -831,7 +831,10 @@ async fn patch_to_local_needs_vms_on_their_volume_nodes() {
     let mut task = Resource::new(
         "",
         TaskSpec {
-            op: TaskOp::VmMigrate { node: node2 },
+            op: TaskOp::VmMigrate {
+                node: node2,
+                pool: None,
+            },
             target: web.id,
             node: env.node,
         },

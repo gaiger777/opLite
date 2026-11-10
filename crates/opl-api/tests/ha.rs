@@ -183,6 +183,7 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
     status.migration = Some(MigrationStatus {
         node: receiving,
         task: Uuid::now_v7(),
+        disks: vec![],
     });
     env.cluster
         .update_status::<VmSpec>(b.id, &status)
@@ -248,6 +249,7 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
             TaskStatus {
                 state: TaskState::Failed,
                 error: Some("node failed failed; the VM was recovered by HA".into()),
+                progress: None,
             }
         );
     }
@@ -263,6 +265,7 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
     let done = TaskStatus {
         state: TaskState::Succeeded,
         error: None,
+        progress: None,
     };
     let op = TaskOp::VmHaRecover { from: failed };
     assert_eq!(
@@ -440,6 +443,7 @@ async fn fails_a_task_of_the_failed_node_created_before_the_spec_write() {
         TaskStatus {
             state: TaskState::Failed,
             error: Some("node failed failed; the VM was recovered by HA".into()),
+            progress: None,
         }
     );
     manager.shutdown().await;
@@ -643,6 +647,7 @@ async fn finishes_a_spec_write_settled_by_a_new_term() {
         TaskStatus {
             state: TaskState::Failed,
             error: Some("node failed failed; the VM was recovered by HA".into()),
+            progress: None,
         }
     );
     // 한 번만 한다.

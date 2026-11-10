@@ -452,7 +452,11 @@ mod tests {
                 node: Uuid::now_v7(),
             },
         );
-        t.status = TaskStatus { state, error: None };
+        t.status = TaskStatus {
+            state,
+            error: None,
+            progress: None,
+        };
         t
     }
 

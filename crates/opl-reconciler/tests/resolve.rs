@@ -449,7 +449,11 @@ async fn waits_for_resizes_of_its_disks() {
     ] {
         let mut task: Task = Resource::new("", TaskSpec { op, target, node });
         task.name = task.id.to_string();
-        task.status = TaskStatus { state, error: None };
+        task.status = TaskStatus {
+            state,
+            error: None,
+            progress: None,
+        };
         cluster.create(&task).await.unwrap();
     }
     resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
@@ -470,6 +474,7 @@ async fn waits_for_resizes_of_its_disks() {
     let status = TaskStatus {
         state: TaskState::Running,
         error: None,
+        progress: None,
     };
     cluster
         .update_status::<TaskSpec>(task.id, &status)
@@ -490,6 +495,7 @@ async fn waits_for_resizes_of_its_disks() {
     let status = TaskStatus {
         state: TaskState::Succeeded,
         error: None,
+        progress: None,
     };
     cluster
         .update_status::<TaskSpec>(task.id, &status)

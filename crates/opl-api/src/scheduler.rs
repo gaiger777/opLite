@@ -3,11 +3,14 @@
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec, ha_capable};
+use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumeSpec, is_shared, pool_usable_on,
 };
-use opl_types::vm::{PowerState, Vm, VmSpec};
+use opl_types::vm::{DiskMove, PowerState, Vm, VmSpec};
 use uuid::Uuid;
+
+use crate::volumes::block_pool_kind;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
@@ -54,12 +57,15 @@ impl Inventory {
     }
 
     /// 이 VM의 디스크가 있는 풀을 모두 쓸 수 있는 노드인지. 공유가 아닌 풀의 볼륨은 그 파일이 있는
-    /// 노드(볼륨을 만든 노드)에서만 쓸 수 있다.
-    fn reaches_disks(&self, spec: &VmSpec, node: &Node) -> bool {
+    /// 노드(볼륨을 만든 노드)에서만 쓸 수 있다. `moves`의 볼륨(옮길 디스크)은 보지 않는다.
+    fn reaches_disks(&self, spec: &VmSpec, node: &Node, moves: &[DiskMove]) -> bool {
         spec.disks.iter().all(|disk| {
             let Some(volume) = self.volumes.iter().find(|v| v.name == disk.volume) else {
                 return true;
             };
+            if moves.iter().any(|m| m.volume == volume.id) {
+                return true;
+            }
             let Some(pool) = self.pools.iter().find(|p| p.name == volume.spec.pool) else {
                 return true;
             };
@@ -96,6 +102,44 @@ pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode
 
 /// [`schedule`]가 이 노드를 후보로 보는지. 아니면 그 이유다. 메모리는 보지 않는다.
 pub fn node_fits(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), String> {
+    node_fits_with(spec, inv, node, &[])
+}
+
+/// 마이그레이션이 옮길 디스크(노드 로컬 풀의 디스크): 디스크마다 대상 풀(`pool`, 없으면 같은 이름의
+/// 풀)과 대상 형식. 대상 풀이 블록 풀(raw만 담음)이면 raw, 아니면 지금 형식이다. 공유 풀의 디스크와
+/// 볼륨·풀 기록이 없는 디스크는 옮기지 않는다.
+pub fn disk_moves(spec: &VmSpec, inv: &Inventory, pool: Option<&StoragePool>) -> Vec<DiskMove> {
+    spec.disks
+        .iter()
+        .filter_map(|disk| {
+            let volume = inv.volumes.iter().find(|v| v.name == disk.volume)?;
+            let source = inv.pools.iter().find(|p| p.name == volume.spec.pool)?;
+            if is_shared(source) {
+                return None;
+            }
+            let target = pool.unwrap_or(source);
+            let format = if block_pool_kind(target).is_some() {
+                ImageFormat::Raw
+            } else {
+                volume.spec.format
+            };
+            Some(DiskMove {
+                volume: volume.id,
+                pool: target.name.clone(),
+                format,
+            })
+        })
+        .collect()
+}
+
+/// [`node_fits`]와 같되 `moves`의 디스크([`disk_moves`])는 볼륨이 있는 노드 대신 대상 풀을 이 노드에서
+/// 쓸 수 있는지 본다.
+pub fn node_fits_with(
+    spec: &VmSpec,
+    inv: &Inventory,
+    node: &Node,
+    moves: &[DiskMove],
+) -> Result<(), String> {
     let name = &node.name;
     // 위트니스는 투표만 하는 노드다. 다른 조건과 상관없이 VM을 돌리지 않는다.
     if node.spec.witness {
@@ -118,10 +162,28 @@ pub fn node_fits(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), Stri
             "node {name:?} does not have the {arch} architecture of the VM's machine type"
         ));
     }
-    if !inv.reaches_disks(spec, node) {
+    if !inv.reaches_disks(spec, node, moves) {
         return Err(format!(
             "node {name:?} cannot use the storage pools of the VM's disks"
         ));
+    }
+    for m in moves {
+        let usable = inv
+            .pools
+            .iter()
+            .find(|p| p.name == m.pool)
+            .is_some_and(|p| pool_usable_on(p, node));
+        if !usable {
+            let disk = inv
+                .volumes
+                .iter()
+                .find(|v| v.id == m.volume)
+                .map_or_else(|| m.volume.to_string(), |v| v.name.clone());
+            return Err(format!(
+                "node {name:?} cannot use storage pool {:?} for disk {disk:?}",
+                m.pool
+            ));
+        }
     }
     if !inv.has_bridges(spec, node) {
         return Err(format!(
@@ -461,6 +523,111 @@ mod tests {
         assert_eq!(schedule(Uuid::now_v7(), &me, &unknown), Err(NoNode));
         unknown.pools[0] = pool("nas", true);
         assert_eq!(schedule(Uuid::now_v7(), &me, &unknown), Ok(big.id));
+    }
+
+    #[test]
+    fn disk_moves_copy_only_local_disks_to_the_same_or_given_pool() {
+        let node1 = node(4096);
+        let mut me = spec(512, Some(node1.id), PowerState::Running);
+        for name in ["root", "data", "shared"] {
+            me.disks.push(DiskSpec {
+                volume: name.into(),
+                bus: DiskBus::VirtioBlk,
+                boot_order: None,
+            });
+        }
+        let mut raw = volume("data", "local", Some(node1.id));
+        raw.spec.format = ImageFormat::Raw;
+        let root = volume("root", "local", Some(node1.id));
+        let mut thin = pool("thin", false);
+        thin.spec.backend = PoolBackend::LvmThin {
+            vg: "vg0".into(),
+            thinpool: "tp".into(),
+        };
+        let inv = Inventory {
+            nodes: vec![node1],
+            volumes: vec![root.clone(), raw.clone(), volume("shared", "nas", None)],
+            pools: vec![pool("local", false), pool("nas", true), thin.clone()],
+            ..Default::default()
+        };
+        let mv = |v: &Volume, pool: &str, format| DiskMove {
+            volume: v.id,
+            pool: pool.into(),
+            format,
+        };
+        // 공유 풀의 디스크는 옮기지 않는다. 풀을 주지 않으면 같은 이름의 풀, 같은 형식이다.
+        assert_eq!(
+            disk_moves(&me, &inv, None),
+            [
+                mv(&root, "local", ImageFormat::Qcow2),
+                mv(&raw, "local", ImageFormat::Raw)
+            ]
+        );
+        // 블록 풀은 raw만 담는다. 바뀌는 것은 qcow2 → raw뿐이다(파일 풀의 raw는 raw 그대로).
+        assert_eq!(
+            disk_moves(&me, &inv, Some(&thin)),
+            [
+                mv(&root, "thin", ImageFormat::Raw),
+                mv(&raw, "thin", ImageFormat::Raw)
+            ]
+        );
+        let nas = pool("nas", true);
+        assert_eq!(
+            disk_moves(&me, &inv, Some(&nas)),
+            [
+                mv(&root, "nas", ImageFormat::Qcow2),
+                mv(&raw, "nas", ImageFormat::Raw)
+            ]
+        );
+        // 로컬 디스크가 없으면 계획이 비고, 풀을 줘도 그렇다.
+        me.disks.clear();
+        assert_eq!(disk_moves(&me, &inv, Some(&nas)), []);
+    }
+
+    #[test]
+    fn node_fits_with_moves_checks_the_target_pool_instead_of_the_volume_node() {
+        let mut source = node(4096);
+        source.name = "node1".into();
+        let mut target = node(4096);
+        target.name = "node2".into();
+        let mut me = spec(512, Some(source.id), PowerState::Running);
+        me.disks.push(DiskSpec {
+            volume: "root".into(),
+            bus: DiskBus::VirtioBlk,
+            boot_order: Some(1),
+        });
+        let local = pool("local", false);
+        let mut fast = pool("fast", false);
+        fast.spec.nodes = vec![source.id];
+        let root = volume("root", "local", Some(source.id));
+        let mut inv = Inventory {
+            nodes: vec![source.clone(), target.clone()],
+            volumes: vec![root.clone()],
+            pools: vec![local, fast],
+            ..Default::default()
+        };
+        // 옮기지 않으면 로컬 볼륨은 그 파일이 있는 노드에서만 쓸 수 있다.
+        assert_eq!(
+            node_fits(&me, &inv, &target),
+            Err("node \"node2\" cannot use the storage pools of the VM's disks".into())
+        );
+        let moves = disk_moves(&me, &inv, None);
+        assert_eq!(node_fits_with(&me, &inv, &target, &moves), Ok(()));
+        // 대상 풀을 그 노드에서 쓸 수 없으면 그 풀과 디스크를 알린다.
+        inv.nodes[1] = with_pool(target.clone(), &inv.pools[0], false);
+        assert_eq!(
+            node_fits_with(&me, &inv, &inv.nodes[1], &moves),
+            Err("node \"node2\" cannot use storage pool \"local\" for disk \"root\"".into())
+        );
+        let fast = inv.pools[1].clone();
+        let moves = disk_moves(&me, &inv, Some(&fast));
+        assert_eq!(
+            node_fits_with(&me, &inv, &target, &moves),
+            Err("node \"node2\" cannot use storage pool \"fast\" for disk \"root\"".into())
+        );
+        inv.pools[1].spec.nodes.clear();
+        let moves = disk_moves(&me, &inv, Some(&inv.pools[1]));
+        assert_eq!(node_fits_with(&me, &inv, &target, &moves), Ok(()));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use opl_peer::{IncomingError, IncomingMigration, MigrateIncomingRequest, Migrati
 use opl_reconciler::FirewallGate;
 use opl_reconciler::resolve::incoming_spec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
-use opl_types::vm::{MigrationStatus, Vm, VmPhase, VmSpec};
+use opl_types::vm::{Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
 /// 원본 노드가 기록한 `Migrating` 상태가 이 노드에 적용되기를 기다리는 시간. 원본은 상태를 쓴 직후
@@ -74,8 +74,10 @@ impl IncomingMigrations {
         if vm.spec.node == Some(me) {
             return Err(format!("VM {:?} is already on this node", vm.name));
         }
-        let expected = Some(MigrationStatus { node: me, task });
-        if vm.status.phase != VmPhase::Migrating || vm.status.migration != expected {
+        let expected = Some((me, task));
+        if vm.status.phase != VmPhase::Migrating
+            || vm.status.migration.as_ref().map(|m| (m.node, m.task)) != expected
+        {
             return Err(format!(
                 "VM {:?} is not migrating to this node by task {task}",
                 vm.name
@@ -211,7 +213,7 @@ impl MigrationReceiver for IncomingMigrations {
                     vm.name
                 )));
             }
-            if let Some(m) = vm.status.migration
+            if let Some(m) = &vm.status.migration
                 && m.task != req.task
             {
                 return Err(IncomingError::Rejected(format!(

@@ -71,8 +71,14 @@ pub enum TaskOp {
         pool: Option<String>,
     },
     /// 실행 중인 대상 VM을 `node`로 라이브 마이그레이션한다. 원본 노드(VM의 `spec.node`)에서 돈다.
+    /// 노드 로컬 풀의 디스크는 `node`에 새로 만들어 복사한다.
     VmMigrate {
         node: Uuid,
+        /// 로컬 디스크를 둘 `node`의 풀. 없으면 디스크마다 같은 이름의 풀이다. 없으면 빼고 쓰므로
+        /// 옛 노드도 읽는다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        pool: Option<String>,
     },
     /// 리더의 HA 복구 기록: 노드 `from`이 죽어 대상 VM을 Task의 `node`로 옮겼다. 처음부터 끝난
     /// 상태(Succeeded)로 만들고 실행기는 실행하지 않는다.
@@ -121,6 +127,19 @@ pub enum TaskOp {
 pub struct TaskStatus {
     pub state: TaskState,
     pub error: Option<String>,
+    /// 실행 중인 Task의 진행률(지금은 로컬 디스크를 복사하는 마이그레이션만). Task가 끝나면 지운다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub progress: Option<TaskProgress>,
+}
+
+/// Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TaskProgress {
+    pub stage: String,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -243,13 +262,54 @@ mod tests {
     #[test]
     fn migrate_op_is_tagged_by_kind() {
         let node = Uuid::now_v7();
-        let op = TaskOp::VmMigrate { node };
+        // pool이 없으면 옛 노드가 읽는 지금 모양 그대로다.
+        let op = TaskOp::VmMigrate { node, pool: None };
         let json = serde_json::to_value(&op).unwrap();
         assert_eq!(
             json,
             serde_json::json!({ "kind": "vm-migrate", "node": node })
         );
         assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        let op = TaskOp::VmMigrate {
+            node,
+            pool: Some("fast".into()),
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "vm-migrate", "node": node, "pool": "fast" })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+    }
+
+    #[test]
+    fn status_progress_is_written_only_while_known() {
+        let json = serde_json::to_value(TaskStatus::default()).unwrap();
+        assert!(json.get("progress").is_none(), "{json}");
+        // 옛 노드가 쓴 status(진행률 없음)도 읽는다.
+        let st: TaskStatus =
+            serde_json::from_value(serde_json::json!({ "state": "running", "error": null }))
+                .unwrap();
+        assert_eq!(st.progress, None);
+        let st = TaskStatus {
+            state: TaskState::Running,
+            error: None,
+            progress: Some(TaskProgress {
+                stage: "copying-disks".into(),
+                done_bytes: 1 << 30,
+                total_bytes: 4 << 30,
+            }),
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(
+            json["progress"],
+            serde_json::json!({
+                "stage": "copying-disks",
+                "done_bytes": 1u64 << 30,
+                "total_bytes": 4u64 << 30
+            })
+        );
+        assert_eq!(serde_json::from_value::<TaskStatus>(json).unwrap(), st);
     }
 
     #[test]

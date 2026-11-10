@@ -22,6 +22,7 @@ async fn mark_migrating(env: &Env, id: Uuid, node: Uuid) {
     status.migration = Some(MigrationStatus {
         node,
         task: Uuid::now_v7(),
+        disks: vec![],
     });
     env.cluster
         .update_status::<VmSpec>(id, &status)

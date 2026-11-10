@@ -415,7 +415,11 @@ async fn put_task(env: &Env, op: TaskOp, target: Uuid, state: TaskState) -> Valu
     task.name = task.id.to_string();
     env.cluster.create(&task).await.unwrap();
     if state != TaskState::Pending {
-        let status = TaskStatus { state, error: None };
+        let status = TaskStatus {
+            state,
+            error: None,
+            progress: None,
+        };
         env.cluster
             .update_status::<TaskSpec>(task.id, &status)
             .await
@@ -625,6 +629,7 @@ async fn run_and_delete_need_an_idle_import() {
         let status = TaskStatus {
             state: TaskState::Failed,
             error: None,
+            progress: None,
         };
         env.cluster
             .update_status::<TaskSpec>(task.id, &status)

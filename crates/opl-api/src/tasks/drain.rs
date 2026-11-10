@@ -126,13 +126,14 @@ fn incoming(
     let (_, tasks) = ctx.cluster.list::<TaskSpec>().map_err(|e| e.to_string())?;
     let mut ids: Vec<Uuid> = vms
         .iter()
-        .filter(|v| v.status.migration.is_some_and(|m| m.node == node))
+        .filter(|v| v.status.migration.as_ref().is_some_and(|m| m.node == node))
         .map(|v| v.id)
         .chain(
             tasks
                 .iter()
                 .filter(|t| {
-                    t.spec.op == TaskOp::VmMigrate { node } && !t.status.state.is_finished()
+                    matches!(t.spec.op, TaskOp::VmMigrate { node: n, .. } if n == node)
+                        && !t.status.state.is_finished()
                 })
                 .map(|t| t.spec.target),
         )
@@ -204,7 +205,7 @@ async fn move_vm(ctx: &Ctx, state: &AppState, node: Uuid, vm: &Vm) -> Result<Out
     let Some(target) = pick_target(vm, &inv) else {
         return Ok(Outcome::NotMoved("no node with capacity".into()));
     };
-    let task = match start_migration(state, vm.id, target, Some(node)).await {
+    let task = match start_migration(state, vm.id, target, None, Some(node)).await {
         // 확인과 만들기 사이에 다른 Task가 들어왔다. 한 번 더 자리 잡기를 기다려 다시 한다.
         Err(e) if e.code == "vm_busy" => {
             match settle(ctx, node, vm.id).await {
@@ -213,7 +214,7 @@ async fn move_vm(ctx: &Ctx, state: &AppState, node: Uuid, vm: &Vm) -> Result<Out
                 Err(e) => return Ok(Outcome::NotMoved(e)),
             }
             in_maintenance(ctx, node)?;
-            start_migration(state, vm.id, target, Some(node)).await
+            start_migration(state, vm.id, target, None, Some(node)).await
         }
         r => r,
     };

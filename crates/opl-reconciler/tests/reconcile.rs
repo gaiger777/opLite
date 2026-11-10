@@ -1134,6 +1134,7 @@ async fn start_waits_for_a_resize_of_its_disk() {
     let status = TaskStatus {
         state: TaskState::Succeeded,
         error: None,
+        progress: None,
     };
     env.cluster
         .update_status::<TaskSpec>(task.id, &status)
@@ -1285,6 +1286,7 @@ async fn rolled_back_migration_makes_disks_exclusive_again() {
     status.migration = Some(MigrationStatus {
         node: Uuid::now_v7(),
         task: Uuid::now_v7(),
+        disks: vec![],
     });
     env.cluster
         .update_status::<VmSpec>(vm.id, &status)

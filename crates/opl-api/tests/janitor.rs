@@ -129,7 +129,11 @@ async fn task_with_id(
     t.name = t.id.to_string();
     env.cluster.create(&t).await.unwrap();
     if state != TaskState::Pending {
-        t.status = TaskStatus { state, error: None };
+        t.status = TaskStatus {
+            state,
+            error: None,
+            progress: None,
+        };
         env.cluster
             .update_status::<TaskSpec>(t.id, &t.status)
             .await

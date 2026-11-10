@@ -364,6 +364,7 @@ async fn apply(cluster: &Cluster, action: &Action) -> Result<u64, ClusterError> 
             let status = TaskStatus {
                 state: TaskState::Failed,
                 error: Some(error.clone()),
+                progress: None,
             };
             cluster
                 .update_status_checked::<TaskSpec>(*id, *revision, &status)
@@ -472,7 +473,11 @@ mod tests {
             },
         );
         t.revision = 7;
-        t.status = TaskStatus { state, error: None };
+        t.status = TaskStatus {
+            state,
+            error: None,
+            progress: None,
+        };
         t
     }
 
@@ -916,6 +921,7 @@ mod tests {
         let running = TaskStatus {
             state: TaskState::Running,
             error: None,
+            progress: None,
         };
         cluster
             .update_status_checked::<TaskSpec>(t.id, t.revision, &running)

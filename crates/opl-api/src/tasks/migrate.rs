@@ -55,14 +55,15 @@ pub(super) async fn migrate(ctx: &Ctx, task: &Task, target: Uuid) -> Result<(), 
     let migration = MigrationStatus {
         node: target,
         task: task.id,
+        disks: vec![],
     };
     let _hold = Hold::begin(&ctx.reconciler, id).await;
-    let vm = match mark_migrating(ctx, id, migration).await {
+    let vm = match mark_migrating(ctx, id, &migration).await {
         Ok(vm) => vm,
         Err(Mark::Refused(e)) => return Err(e),
         // 기록됐을 수도 있다.
         Err(Mark::Unknown(e)) => {
-            roll_back(ctx, &peers, &addr, id, migration).await;
+            roll_back(ctx, &peers, &addr, id, &migration).await;
             return Err(e);
         }
     };
@@ -71,16 +72,16 @@ pub(super) async fn migrate(ctx: &Ctx, task: &Task, target: Uuid) -> Result<(), 
         Err(e) => Err(e),
         // 대상 노드가 받는 동안 디스크를 함께 연다(공유 LVM은 LV 잠금을 공유로).
         Ok(()) => match set_disks_shared(&ctx.cluster, &vm, &*ctx.storage, true).await {
-            Ok(()) => send(ctx, &peers, &addr, &host, id, migration).await,
+            Ok(()) => send(ctx, &peers, &addr, &host, id, &migration).await,
             Err(e) => Err(format!("cannot share the disks with the target node: {e}")),
         },
     };
     let error = match sent {
-        Ok(()) => commit(ctx, id, migration).await.err(),
+        Ok(()) => commit(ctx, id, &migration).await.err(),
         Err(e) => Some(e),
     };
     if let Some(error) = error {
-        match roll_back(ctx, &peers, &addr, id, migration).await {
+        match roll_back(ctx, &peers, &addr, id, &migration).await {
             Outcome::RolledBack(None) => return Err(error),
             Outcome::RolledBack(Some(resume)) => {
                 return Err(format!(
@@ -91,7 +92,7 @@ pub(super) async fn migrate(ctx: &Ctx, task: &Task, target: Uuid) -> Result<(), 
             Outcome::Committed => {}
         }
     }
-    finish(ctx, id, migration).await;
+    finish(ctx, id, &migration).await;
     Ok(())
 }
 
@@ -138,7 +139,7 @@ enum Mark {
 
 /// 2단계: 이 노드에서 실행 중인 VM인지 다시 보고 `Migrating`과 대상을 기록한다. 기록한 VM(읽은 것)을
 /// 돌려준다.
-async fn mark_migrating(ctx: &Ctx, id: Uuid, migration: MigrationStatus) -> Result<Vm, Mark> {
+async fn mark_migrating(ctx: &Ctx, id: Uuid, migration: &MigrationStatus) -> Result<Vm, Mark> {
     let refused = |e: String| Mark::Refused(e);
     loop {
         let vm = ctx
@@ -163,7 +164,7 @@ async fn mark_migrating(ctx: &Ctx, id: Uuid, migration: MigrationStatus) -> Resu
         }
         let mut status = vm.status.clone();
         status.phase = VmPhase::Migrating;
-        status.migration = Some(migration);
+        status.migration = Some(migration.clone());
         match ctx
             .cluster
             .update_status_checked::<VmSpec>(id, vm.revision, &status)
@@ -222,7 +223,7 @@ async fn send(
     addr: &str,
     host: &str,
     id: Uuid,
-    migration: MigrationStatus,
+    migration: &MigrationStatus,
 ) -> Result<(), String> {
     let qemu_version = ctx
         .hv
@@ -264,7 +265,7 @@ async fn send(
 
 /// 6단계: `spec.node`를 대상 노드로 쓴다(revision 확인). 이 쓰기가 적용되면 확정이다. 결과를 모르는
 /// 오류는 `COMMIT_TIMEOUT` 동안 다시 시도한다(같은 revision 확인이므로 두 번 적용되지 않는다).
-async fn commit(ctx: &Ctx, id: Uuid, migration: MigrationStatus) -> Result<(), String> {
+async fn commit(ctx: &Ctx, id: Uuid, migration: &MigrationStatus) -> Result<(), String> {
     let deadline = Instant::now() + COMMIT_TIMEOUT;
     loop {
         let vm = match ctx.cluster.get::<VmSpec>(id) {
@@ -280,7 +281,8 @@ async fn commit(ctx: &Ctx, id: Uuid, migration: MigrationStatus) -> Result<(), S
         if vm.spec.node == Some(migration.node) {
             return Ok(());
         }
-        if vm.spec.node != Some(ctx.config.node) || vm.status.migration != Some(migration) {
+        if vm.spec.node != Some(ctx.config.node) || vm.status.migration.as_ref() != Some(migration)
+        {
             return Err(format!("VM {:?} changed during the migration", vm.name));
         }
         // 정지 요청이 검사를 지나 마이그레이션 중에 적용됐다. 대상에서 다시 켜지 않는다.
@@ -326,7 +328,7 @@ async fn roll_back(
     peers: &Peers,
     addr: &str,
     id: Uuid,
-    migration: MigrationStatus,
+    migration: &MigrationStatus,
 ) -> Outcome {
     let mut ha = false;
     loop {
@@ -343,7 +345,7 @@ async fn roll_back(
             return Outcome::Committed;
         }
         ha = vm.spec.ha;
-        let current = vm.status.migration == Some(migration);
+        let current = vm.status.migration.as_ref() == Some(migration);
         let revision = vm.revision;
         let mut status = vm.status.clone();
         if !current {
@@ -391,7 +393,7 @@ async fn roll_back(
 /// 7~8단계(확정 뒤): status를 대상 노드의 `Running`으로(UEFI 변수도 대상 노드에) 쓰고, 원본 QEMU를 끄고, 원본 쪽 디스크를
 /// 끈다. 대상 QEMU는 대상 노드의 reconciler가 이어서 실행한다. 실패해도 확정은 끝났으므로 경고만
 /// 남긴다(남은 원본은 정리가 끈다).
-async fn finish(ctx: &Ctx, id: Uuid, migration: MigrationStatus) {
+async fn finish(ctx: &Ctx, id: Uuid, migration: &MigrationStatus) {
     let deadline = Instant::now() + RECORD_TIMEOUT;
     let vm = loop {
         let vm = match ctx.cluster.get::<VmSpec>(id) {
@@ -409,7 +411,7 @@ async fn finish(ctx: &Ctx, id: Uuid, migration: MigrationStatus) {
             }
         };
         // 대상 노드의 reconciler가 이미 넘겨받아 표시를 지웠다.
-        if vm.status.migration != Some(migration) {
+        if vm.status.migration.as_ref() != Some(migration) {
             break vm;
         }
         let mut status = vm.status.clone();
@@ -530,7 +532,11 @@ pub(super) async fn sweep(ctx: &Ctx) {
         };
         if let Some(vm) = &vm
             && (vm.spec.node == Some(me)
-                || vm.status.migration == Some(MigrationStatus { node: me, task }))
+                || vm
+                    .status
+                    .migration
+                    .as_ref()
+                    .is_some_and(|m| m.node == me && m.task == task))
         {
             continue;
         }

@@ -338,7 +338,7 @@ async fn recover_vm(
     failed: &Node,
     vm: &Vm,
 ) -> Result<(), ClusterError> {
-    let migrating = vm.status.migration.map(|m| m.node);
+    let migrating = vm.status.migration.as_ref().map(|m| m.node);
     let now = Instant::now();
     // 스케줄러처럼 미할당 메모리가 가장 많은 노드, 같으면 id가 작은 노드다. 죽은 노드와 마이그레이션을
     // 받던 노드(같은 실행 디렉터리를 쓰는 QEMU가 남아 있을 수 있다)는 빼고, 리스가 살아 있어야 한다.
@@ -426,6 +426,7 @@ async fn fail_task(ctx: Ctx<'_>, task: &Task, error: &str) {
     let status = TaskStatus {
         state: TaskState::Failed,
         error: Some(error.into()),
+        progress: None,
     };
     let mut revision = task.revision;
     for _ in 0..TASK_FAIL_ATTEMPTS {

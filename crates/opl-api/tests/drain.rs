@@ -280,7 +280,13 @@ async fn drain_skips_nodes_that_cannot_take_the_vm() {
         .map(|t| &t.spec.op)
         .filter(|op| matches!(op, TaskOp::VmMigrate { .. }))
         .collect();
-    assert_eq!(migrations, [&TaskOp::VmMigrate { node: small }]);
+    assert_eq!(
+        migrations,
+        [&TaskOp::VmMigrate {
+            node: small,
+            pool: None
+        }]
+    );
 }
 
 /// 끝나지 않은 Task가 있는 VM은 `migration_timeout`까지 기다린 뒤 `busy`로 남긴다.

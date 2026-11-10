@@ -30,6 +30,7 @@ async fn finish_tasks(env: &Env) {
     let done = TaskStatus {
         state: TaskState::Succeeded,
         error: None,
+        progress: None,
     };
     for task in tasks {
         env.cluster

@@ -1283,10 +1283,12 @@ export interface paths {
         put?: never;
         /**
          * 실행 중인 VM을 다른 노드로 라이브 마이그레이션할 Task를 돌려준다(202). Task는 지금 노드의 실행기가
-         *     한다. 디스크가 모두 공유 풀에 있어야 하고, HVF(macOS) 노드는 원본도 대상도 될 수 없다(409
-         *     `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
-         *     HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
-         *     스케줄러가 고를 수 없는 노드(풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
+         *     한다. 노드 로컬 풀의 디스크는 대상 노드의 같은 이름의 풀(`pool`을 주면 그 풀)에 복사한다. 그런 디스크가
+         *     있으면 모든 노드가 디스크 복사를 알아야 하고(409 `cluster_upgrading`) VM에 스냅샷이 없어야 한다(409
+         *     `migration_unsupported`). `pool`을 줬는데 그런 디스크가 없으면 400, 없는 풀이면 404다. HVF(macOS)
+         *     노드는 원본도 대상도 될 수 없다(409 `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나
+         *     유지보수 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
+         *     스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
          */
         post: operations["migrate_vm"];
         delete?: never;
@@ -1968,6 +1970,16 @@ export interface components {
         Direction: "in" | "out";
         /** @enum {string} */
         DiskBus: "virtio-blk" | "sata";
+        /**
+         * @description 마이그레이션이 복사하는 디스크 하나: 볼륨 `volume`을 대상 노드의 풀 `pool`에 `format`으로 만든다.
+         *     원본 풀·형식은 볼륨 기록에 그대로 있다(확정 전에는 바꾸지 않는다).
+         */
+        DiskMove: {
+            format: components["schemas"]["ImageFormat"];
+            pool: string;
+            /** Format: uuid */
+            volume: string;
+        };
         DiskSpec: {
             /** Format: int32 */
             boot_order?: number | null;
@@ -2724,6 +2736,8 @@ export interface components {
                 status: {
                     /** @default null */
                     error: string | null;
+                    /** @description 실행 중인 Task의 진행률(지금은 로컬 디스크를 복사하는 마이그레이션만). Task가 끝나면 지운다. */
+                    progress?: components["schemas"]["TaskProgress"];
                     /** @default pending */
                     state: components["schemas"]["TaskState"];
                 };
@@ -2956,9 +2970,16 @@ export interface components {
         MigrateRequest: {
             /** @description 옮겨 갈 노드(이름이나 id) */
             node: string;
+            /** @description 노드 로컬 풀의 디스크를 복사해 둘 대상 노드의 풀. 없으면 디스크마다 같은 이름의 풀이다. */
+            pool?: string | null;
         };
         /** @description 진행 중인 라이브 마이그레이션: 대상 노드와 그 마이그레이션 Task */
         MigrationStatus: {
+            /**
+             * @description 대상 노드로 복사하는 노드 로컬 풀의 디스크. VM이 대상 노드로 확정되면 적용된 것이 된다.
+             *     비면 빼고 쓰므로 공유 풀만의 마이그레이션은 기록이 옛 모양 그대로다.
+             */
+            disks?: components["schemas"]["DiskMove"][];
             /** Format: uuid */
             node: string;
             /** Format: uuid */
@@ -3870,6 +3891,8 @@ export interface components {
             status: {
                 /** @default null */
                 error: string | null;
+                /** @description 실행 중인 Task의 진행률(지금은 로컬 디스크를 복사하는 마이그레이션만). Task가 끝나면 지운다. */
+                progress?: components["schemas"]["TaskProgress"];
                 /** @default pending */
                 state: components["schemas"]["TaskState"];
             };
@@ -4297,6 +4320,11 @@ export interface components {
             kind: "vm-migrate";
             /** Format: uuid */
             node: string;
+            /**
+             * @description 로컬 디스크를 둘 `node`의 풀. 없으면 디스크마다 같은 이름의 풀이다. 없으면 빼고 쓰므로
+             *     옛 노드도 읽는다.
+             */
+            pool?: string;
         } | {
             /** Format: uuid */
             from: string;
@@ -4341,6 +4369,14 @@ export interface components {
             /** @enum {string} */
             kind: "node-drain";
         };
+        /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
+        TaskProgress: {
+            /** Format: int64 */
+            done_bytes: number;
+            stage: string;
+            /** Format: int64 */
+            total_bytes: number;
+        };
         TaskSpec: {
             /**
              * Format: uuid
@@ -4360,6 +4396,8 @@ export interface components {
         TaskStatus: {
             /** @default null */
             error: string | null;
+            /** @description 실행 중인 Task의 진행률(지금은 로컬 디스크를 복사하는 마이그레이션만). Task가 끝나면 지운다. */
+            progress?: components["schemas"]["TaskProgress"];
             /** @default pending */
             state: components["schemas"]["TaskState"];
         };

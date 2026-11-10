@@ -84,6 +84,7 @@ pub const FEATURES: &[&str] = &[
     "node-drain",
     "incremental-backup",
     "incremental-replication",
+    "storage-migration",
 ];
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
@@ -308,7 +309,8 @@ mod tests {
             serde_json::json!([
                 "node-drain",
                 "incremental-backup",
-                "incremental-replication"
+                "incremental-replication",
+                "storage-migration"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

@@ -11,7 +11,7 @@ use opl_types::network::USER_NETWORK;
 use opl_types::node::{Node, NodeSpec, ha_capable};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
-use opl_types::storage::{VolumePhase, is_shared};
+use opl_types::storage::VolumePhase;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{MacAddr, PowerState, Vm, VmPhase, VmSpec, VmStatus};
 use serde::Deserialize;
@@ -19,9 +19,10 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
+use crate::cluster::require_feature;
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
-use crate::scheduler::{Inventory, node_fits, schedule};
+use crate::scheduler::{Inventory, disk_moves, node_fits_with, schedule};
 use crate::snapshots::{
     check_no_migration, check_no_revert_task, check_no_snapshot_task, check_not_busy,
     check_not_migrating, count_snapshots,
@@ -536,13 +537,18 @@ fn stopped_now(state: &AppState, id: Uuid) -> Result<bool, ApiError> {
 pub struct MigrateRequest {
     /// 옮겨 갈 노드(이름이나 id)
     pub node: String,
+    /// 노드 로컬 풀의 디스크를 복사해 둘 대상 노드의 풀. 없으면 디스크마다 같은 이름의 풀이다.
+    #[serde(default)]
+    pub pool: Option<String>,
 }
 
 /// 실행 중인 VM을 다른 노드로 라이브 마이그레이션할 Task를 돌려준다(202). Task는 지금 노드의 실행기가
-/// 한다. 디스크가 모두 공유 풀에 있어야 하고, HVF(macOS) 노드는 원본도 대상도 될 수 없다(409
-/// `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나 유지보수 중이면 409 `node_unavailable`,
-/// HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
-/// 스케줄러가 고를 수 없는 노드(풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
+/// 한다. 노드 로컬 풀의 디스크는 대상 노드의 같은 이름의 풀(`pool`을 주면 그 풀)에 복사한다. 그런 디스크가
+/// 있으면 모든 노드가 디스크 복사를 알아야 하고(409 `cluster_upgrading`) VM에 스냅샷이 없어야 한다(409
+/// `migration_unsupported`). `pool`을 줬는데 그런 디스크가 없으면 400, 없는 풀이면 404다. HVF(macOS)
+/// 노드는 원본도 대상도 될 수 없다(409 `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나
+/// 유지보수 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
+/// 스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
 #[utoipa::path(post, path = "/vms/{key}/migrate", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
     request_body = MigrateRequest,
@@ -556,17 +562,18 @@ pub async fn migrate_vm(
     state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let target = lookup::<NodeSpec>(&state.cluster, &req.node)?;
-    let task = start_migration(&state, vm.id, target.id, None).await?;
+    let task = start_migration(&state, vm.id, target.id, req.pool, None).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
-/// [`migrate_vm`]의 확인을 하고 VM `vm`을 노드 `target`으로 옮길 `VmMigrate` Task를 원본 노드에 만든다.
-/// 노드 비우기 Task도 쓴다. 오류는 [`migrate_vm`]과 같다. `source`가 있으면(비우기) VM이 아직 그 노드에
-/// 있는지도 보고, 아니면 409 `vm_moved`다(이미 다른 데로 갔다).
+/// [`migrate_vm`]의 확인을 하고 VM `vm`을 노드 `target`(로컬 디스크는 그 노드의 풀 `pool`)으로 옮길
+/// `VmMigrate` Task를 원본 노드에 만든다. 노드 비우기 Task도 쓴다. 오류는 [`migrate_vm`]과 같다. `source`가
+/// 있으면(비우기) VM이 아직 그 노드에 있는지도 보고, 아니면 409 `vm_moved`다(이미 다른 데로 갔다).
 pub(crate) async fn start_migration(
     state: &AppState,
     vm: Uuid,
     target: Uuid,
+    pool: Option<String>,
     source: Option<Uuid>,
 ) -> Result<Task, ApiError> {
     // 두 요청이 함께 검사를 지나 Task를 둘 만들지 않게 한다.
@@ -602,18 +609,33 @@ pub(crate) async fn start_migration(
     check_no_snapshot_task(state, &vm)?;
     let inv = Inventory::load(&state.cluster)?;
     check_no_resize_task(state, &inv, &vm)?;
-    for disk in &vm.spec.disks {
+    // 노드 로컬 풀의 디스크는 대상 노드에 복사한다(같은 이름의 풀 또는 `pool`).
+    let mut moves = disk_moves(&vm.spec, &inv, None);
+    if let Some(name) = &pool {
+        if moves.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "VM {:?} has no disks on node-local pools; pool applies only to them",
+                vm.name
+            )));
+        }
         let pool = inv
-            .volumes
+            .pools
             .iter()
-            .find(|v| v.name == disk.volume)
-            .and_then(|v| inv.pools.iter().find(|p| p.name == v.spec.pool));
-        if !pool.is_some_and(is_shared) {
+            .find(|p| &p.name == name)
+            .ok_or_else(|| ApiError::not_found(format!("storage pool {name:?} not found")))?;
+        moves = disk_moves(&vm.spec, &inv, Some(pool));
+    }
+    if let Some(first) = moves.first() {
+        require_feature(&state.cluster, "storage-migration")?;
+        if count_snapshots(state, vm.id)? > 0 {
+            let volume = inv.volumes.iter().find(|v| v.id == first.volume);
             return Err(ApiError::conflict(
                 "migration_unsupported",
                 format!(
-                    "disk {:?} is not on a shared storage pool; only VMs whose disks are all on shared pools can be migrated",
-                    disk.volume
+                    "VM {:?} has snapshots and disk {:?} is on node-local pool {:?}; snapshots are not copied, delete them first",
+                    vm.name,
+                    volume.map_or("", |v| v.name.as_str()),
+                    volume.map_or("", |v| v.spec.pool.as_str()),
                 ),
             ));
         }
@@ -642,7 +664,8 @@ pub(crate) async fn start_migration(
         ));
     }
     check_node_arch(&target, &vm.spec)?;
-    node_fits(&vm.spec, &inv, &target).map_err(|e| ApiError::conflict("no_capacity", e))?;
+    node_fits_with(&vm.spec, &inv, &target, &moves)
+        .map_err(|e| ApiError::conflict("no_capacity", e))?;
     let free = inv.free_memory_mib(&target, vm.id);
     if free < i64::from(vm.spec.memory_mib) {
         return Err(ApiError::conflict(
@@ -653,7 +676,10 @@ pub(crate) async fn start_migration(
             ),
         ));
     }
-    let op = TaskOp::VmMigrate { node: target.id };
+    let op = TaskOp::VmMigrate {
+        node: target.id,
+        pool,
+    };
     create_task(&state.cluster, op, vm.id, source).await
 }
 
