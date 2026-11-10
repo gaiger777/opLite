@@ -3,12 +3,15 @@
 //! 중의 `vm_busy`, 대상 포트가 막혀 실패하면 원본이 계속 도는지를 본다. 멈춘 UEFI VM을 옮겨 켜면 변수
 //! 파일이 따라가는지도 본다. 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용은 정지한 VM에서
 //! `qemu-io`로 본다. 노드 비우기(`oplctl node drain --wait`)가 실행 중인 VM을 다른 노드로 옮기는지도 본다.
+//! 노드 로컬 디렉터리 풀(노드마다 다른 경로)의 디스크를 복사하며 옮기는지(`--pool`, 진행률, 실패 정리), 같은
+//! 이름의 로컬 풀이 같은 경로라 비우기가 그 VM을 남기는지도 본다.
 //! `cargo test -p opld --features migration-it --test migration`
 //! QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다. 이 Mac에서도 돈다(TCG).
 //!
 //! 공유 풀 시험은 그 풀의 기능을 함께 켜고 그 시험과 같은 환경 변수가 있어야 한다(Linux, root):
 //! `nfs-it`(`OPL_TEST_NFS_EXPORT`), `rbd-it`(`OPL_TEST_RBD`, `client.admin`), `lvm-shared-it`
-//! (`OPL_TEST_LVM_SHARED`, 있으면 `OPL_TEST_ISCSI`).
+//! (`OPL_TEST_LVM_SHARED`, 있으면 `OPL_TEST_ISCSI`). `lvm-it`(`OPL_TEST_LVM`)·`zfs-it`(`OPL_TEST_ZFS`)를 함께
+//! 켜면 로컬 디스크를 디렉터리 풀 → 그 블록 풀(노드 2만) → 디렉터리 풀로 옮긴다(qcow2 → raw → raw).
 //!
 //! 한 호스트의 두 노드는 systemd 스코프 이름(`opl-vm-{id}.scope`)과 브리지 NIC의 탭 이름이 겹치므로
 //! 스코프를 끄고 NIC 없이 띄운다. 공유 LVM의 잠금(lvmlockd)은 호스트 단위이므로 두 노드가 같은 잠금을
@@ -63,11 +66,18 @@ impl Pair {
     /// 노드 `node1`·`node2`를 띄워 클러스터를 만들고 둘 다 로그인한다. `ports`는 각 노드의 마이그레이션
     /// 받기 포트 범위다(같은 파일의 시험이 함께 돌므로 시험마다 다르게 준다).
     async fn new(cluster: &str, ports: [&str; 2]) -> Self {
+        Self::with_migration(cluster, ports, "").await
+    }
+
+    /// `new`와 같고 두 노드의 `[migration]`에 `migration`을 더한다.
+    async fn with_migration(cluster: &str, ports: [&str; 2], migration: &str) -> Self {
         // 디스크에 OS가 없는 UEFI 게스트는 ACPI 종료에 응하지 않을 수 있다.
         let daemon = |name: &str, ports: &str| {
             Daemon::with_hypervisor(
                 name,
-                &format!("[reconciler]\nacpi_timeout_secs = 5\n[migration]\nports = \"{ports}\"\n"),
+                &format!(
+                    "[reconciler]\nacpi_timeout_secs = 5\n[migration]\nports = \"{ports}\"\n{migration}"
+                ),
                 hypervisor(),
             )
         };
@@ -585,6 +595,277 @@ async fn drain_moves_a_running_vm_to_the_other_node() {
     d.ctl(&["pool", "delete", "shared"]).await.unwrap();
 }
 
+/// `run`(마이그레이션을 기다리는 oplctl)이 끝날 때까지 VM `web`의 `vm-migrate` Task가 보인 진행률
+/// (`status.progress`)을 모은다.
+async fn watch_progress(
+    c: &Client,
+    run: impl Future<Output = anyhow::Result<String>>,
+) -> (anyhow::Result<String>, Vec<Value>) {
+    let vm = c.get("/vms/web").await.unwrap()["id"].clone();
+    let mut seen: Vec<Value> = Vec::new();
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            out = &mut run => return (out, seen),
+            () = tokio::time::sleep(Duration::from_millis(200)) => {
+                let tasks = c.get("/tasks").await.unwrap();
+                for t in tasks["items"].as_array().unwrap() {
+                    let progress = &t["status"]["progress"];
+                    if t["spec"]["op"]["kind"] == "vm-migrate"
+                        && t["spec"]["target"] == vm
+                        && !progress.is_null()
+                        && !seen.contains(progress)
+                    {
+                        seen.push(progress.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 노드 `d`의 마이그레이션 디스크 기록 파일 수
+fn disk_records(d: &Daemon) -> usize {
+    std::fs::read_dir(d.data_dir().join("migration-disks")).map_or(0, |dir| dir.count())
+}
+
+/// 볼륨 `root`의 기록이 풀 `pool`(형식 `format`)과 노드 `node`에 있는지 두 노드에서 본다.
+async fn assert_volume_on(p: &Pair, pool: &str, format: &str, node: &str) {
+    for c in &p.c {
+        let volume = c.get("/volumes/root").await.unwrap();
+        assert_eq!(volume["spec"]["pool"], pool, "{volume}");
+        assert_eq!(volume["spec"]["format"], format, "{volume}");
+        assert_eq!(volume["status"]["node"].as_str(), Some(node), "{volume}");
+    }
+}
+
+/// VM `web`이 노드 `node`에 확정되어 돌고 마이그레이션 표시가 없는지 두 노드에서 본다.
+async fn assert_vm_on(p: &Pair, node: &str) {
+    for c in &p.c {
+        let vm = c.get("/vms/web").await.unwrap();
+        assert_eq!(vm["spec"]["node"].as_str(), Some(node), "{vm}");
+        assert_eq!(vm["status"]["node"].as_str(), Some(node), "{vm}");
+        assert_eq!(vm["status"]["migration"], Value::Null, "{vm}");
+    }
+}
+
+/// 노드마다 다른 경로의 로컬 디렉터리 풀(`a`는 노드 1만, `b`는 노드 2만)에 디스크를 둔 VM을, 디스크를
+/// 복사하며 옮긴다(`oplctl vm migrate web node2 --pool b`). 대상의 포트가 모자라 받지 못하면 대상 풀에
+/// 파일이 남지 않고 원본이 계속 돈다. 성공하면 볼륨 기록이 대상 풀·노드로 바뀌고 원본 파일이 지워지며,
+/// 복사와 메모리 단계의 진행률이 Task에 보인다(복사가 몇 초 걸리도록 대역폭을 줄이고 디스크를 채운다).
+/// 그다음 `--pool a`로 되돌아온다. 게스트에 OS가 없으므로 복사 중의 게스트 쓰기는 보지 않고, 마이그레이션
+/// 전후에 꺼진 디스크에 쓴 무늬를 `qemu-io`로 본다.
+#[tokio::test]
+async fn migrates_a_vm_with_local_disks() {
+    // 노드 2의 포트는 둘(마이그레이션과 NBD)뿐이다. 시험이 하나를 막으면 받지 못한다.
+    let p = Pair::with_migration(
+        "mig-local",
+        ["60220-60229", "60230-60231"],
+        "bandwidth_mib = 16\n",
+    )
+    .await;
+    let (c, d) = (&p.c[0], &p.d[0]);
+    let (node1, node2) = (p.node_id(0).await, p.node_id(1).await);
+
+    let dir = |prefix: &str| {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in("/tmp")
+            .unwrap()
+    };
+    let (a, b) = (dir("oplpoola"), dir("oplpoolb"));
+    for (name, path, node) in [("a", &a, &node1), ("b", &b, &node2)] {
+        d.ctl(&[
+            "pool",
+            "create",
+            name,
+            "--path",
+            path.path().to_str().unwrap(),
+            "--node",
+            node,
+        ])
+        .await
+        .unwrap();
+    }
+    p.d[0].wait_pool_ready("a").await;
+    p.d[1].wait_pool_ready("b").await;
+    d.ctl(&["volume", "create", "root", "--pool", "a", "--size", "128M"])
+        .await
+        .unwrap();
+    let volume = c.get("/volumes/root").await.unwrap();
+    let file = format!("{}.qcow2", volume["id"].as_str().unwrap());
+    let (src, dst) = (a.path().join(&file), b.path().join(&file));
+    // 16 MiB/s로 복사에 몇 초 걸린다.
+    assert!(qemu_io(&src, "qcow2", "write -P 0xab 0 96M"));
+
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--node", "node1", "--start",
+    ])
+    .await
+    .unwrap();
+    let pid = running_pid(c).await;
+    let id = c.get("/vms/web").await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 대상이 NBD 서버에 첫 포트를 쓰면 마이그레이션 포트가 남지 않는다. 대상은 만든 볼륨을 지운다.
+    let blocked = TcpListener::bind(("127.0.0.1", 60231)).unwrap();
+    let err = d
+        .ctl(&["vm", "migrate", "web", "node2", "--pool", "b"])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no free migration port in 60230-60231"),
+        "{err}"
+    );
+    assert_vm_on(&p, &node1).await;
+    assert_eq!(running_pid(c).await, pid);
+    assert!(alive(pid));
+    assert_volume_on(&p, "a", "qcow2", &node1).await;
+    assert!(src.exists());
+    assert!(!dst.exists());
+    eventually("receiving QEMU discarded and records removed", || async {
+        !process_with(&vm_run_dir(&p.d[1], &id)) && p.d.iter().all(|d| disk_records(d) == 0)
+    })
+    .await;
+    drop(blocked);
+
+    // 포트가 풀리면 옮긴다. 확정 뒤 원본 파일을 지운다.
+    let (out, progress) =
+        watch_progress(c, d.ctl(&["vm", "migrate", "web", "node2", "--pool", "b"])).await;
+    assert_eq!(out.unwrap(), "vm web: migrated to node2\n");
+    let stages: Vec<&str> = progress
+        .iter()
+        .map(|p| p["stage"].as_str().unwrap())
+        .collect();
+    assert!(stages.contains(&"copying-disks"), "{progress:?}");
+    assert_eq!(stages.last(), Some(&"migrating-memory"), "{progress:?}");
+    assert!(
+        progress
+            .iter()
+            .all(|p| p["done_bytes"].as_u64() <= p["total_bytes"].as_u64()),
+        "{progress:?}"
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|p| p["total_bytes"].as_u64().unwrap() >= 96 << 20),
+        "{progress:?}"
+    );
+    assert_vm_on(&p, &node2).await;
+    assert_volume_on(&p, "b", "qcow2", &node2).await;
+    let moved = running_pid(&p.c[1]).await;
+    assert_ne!(moved, pid);
+    assert!(alive(moved));
+    eventually("source QEMU stopped and source disk deleted", || async {
+        !alive(pid) && !process_with(&vm_run_dir(&p.d[0], &id)) && !src.exists()
+    })
+    .await;
+    assert!(dst.exists());
+    let task = c.get("/tasks").await.unwrap();
+    let task = task["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["spec"]["op"]["kind"] == "vm-migrate" && t["status"]["state"] == "succeeded")
+        .unwrap()
+        .clone();
+    assert_eq!(task["spec"]["op"]["pool"], "b", "{task}");
+    assert_eq!(task["status"]["progress"], Value::Null, "{task}");
+
+    // 복사한 디스크에 원본 내용이 있다. 꺼진 디스크에 더 써 두고 노드 1로 되돌린다.
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&dst, "qcow2", "read -P 0xab 0 96M"));
+    assert!(qemu_io(&dst, "qcow2", "write -P 0xcd 96M 16M"));
+    let out = d.ctl(&["vm", "start", "web"]).await.unwrap();
+    assert!(out.contains("vm web: start done"), "{out}");
+    let out = d
+        .ctl(&["vm", "migrate", "web", "node1", "--pool", "a"])
+        .await
+        .unwrap();
+    assert_eq!(out, "vm web: migrated to node1\n");
+    assert_vm_on(&p, &node1).await;
+    assert_volume_on(&p, "a", "qcow2", &node1).await;
+    eventually("disk deleted on node 2", || async { !dst.exists() }).await;
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&src, "qcow2", "read -P 0xab 0 96M"));
+    assert!(qemu_io(&src, "qcow2", "read -P 0xcd 96M 16M"));
+
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    assert!(!src.exists());
+    d.ctl(&["pool", "delete", "a"]).await.unwrap();
+    d.ctl(&["pool", "delete", "b"]).await.unwrap();
+}
+
+/// 한 호스트의 두 노드는 같은 이름의 로컬 디렉터리 풀이 같은 경로이므로, 비우기가 로컬 디스크 VM을 옮기려
+/// 하면 대상이 같은 볼륨 파일을 보고 거절한다. VM은 원래 노드에서 계속 돌고 그 파일은 지워지지 않는다
+/// (비우기가 로컬 디스크 VM을 옮기는 것은 `opl-api`의 `two_nodes.rs`가 본다).
+#[tokio::test]
+async fn drain_leaves_a_vm_whose_local_disk_the_target_already_has() {
+    let p = Pair::new("mig-drain-local", ["60240-60249", "60250-60259"]).await;
+    let (c, d) = (&p.c[0], &p.d[0]);
+    let node1 = p.node_id(0).await;
+
+    let local = tempfile::Builder::new()
+        .prefix("opldrainl")
+        .tempdir_in("/tmp")
+        .unwrap();
+    d.ctl(&[
+        "pool",
+        "create",
+        "local",
+        "--path",
+        local.path().to_str().unwrap(),
+    ])
+    .await
+    .unwrap();
+    p.wait_pool_ready("local").await;
+    d.ctl(&[
+        "volume", "create", "root", "--pool", "local", "--size", "64M",
+    ])
+    .await
+    .unwrap();
+    let volume = c.get("/volumes/root").await.unwrap();
+    let disk = local
+        .path()
+        .join(format!("{}.qcow2", volume["id"].as_str().unwrap()));
+    assert!(qemu_io(&disk, "qcow2", "write -P 0xab 0 64k"));
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--node", "node1", "--start",
+    ])
+    .await
+    .unwrap();
+    let pid = running_pid(c).await;
+
+    let err = d
+        .ctl(&["node", "drain", "node1", "--wait"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("1 VM(s) were not moved: web ("), "{err}");
+    assert!(
+        err.contains("already exists on node \"node2\" in pool \"local\""),
+        "{err}"
+    );
+    assert_vm_on(&p, &node1).await;
+    assert_eq!(running_pid(c).await, pid);
+    assert!(alive(pid));
+    assert_volume_on(&p, "local", "qcow2", &node1).await;
+    assert!(disk.exists());
+
+    d.ctl(&["node", "maintenance", "node1", "off"])
+        .await
+        .unwrap();
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&disk, "qcow2", "read -P 0xab 0 64k"));
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    d.ctl(&["pool", "delete", "local"]).await.unwrap();
+}
+
 /// NFS 풀(두 노드가 각자 마운트한다)
 #[cfg(all(feature = "nfs-it", target_os = "linux"))]
 #[tokio::test]
@@ -707,4 +988,127 @@ async fn migrates_a_vm_on_a_shared_lvm_pool() {
     d.ctl(&["vm", "delete", "web"]).await.unwrap();
     d.ctl(&["volume", "delete", "mig-root"]).await.unwrap();
     d.ctl(&["pool", "delete", "san"]).await.unwrap();
+}
+
+/// 노드 1만 쓰는 디렉터리 풀 `a`의 qcow2 디스크를 가진 VM을, 노드 2만 쓰는 블록 풀 `blk`(`backend`)로
+/// 디스크를 복사하며 옮기고(raw로 바뀐다) 다시 `a`로 되돌린다(raw 그대로). `dev`는 볼륨 id의 블록 장치
+/// 경로다. 한 호스트의 두 노드가 같은 VG·데이터셋을 보므로 블록 풀은 노드 2에만 둔다.
+#[cfg(all(any(feature = "lvm-it", feature = "zfs-it"), target_os = "linux"))]
+async fn local_round_trip(
+    cluster: &str,
+    ports: [&str; 2],
+    backend: Value,
+    dev: impl Fn(&str) -> PathBuf,
+) {
+    let p = Pair::new(cluster, ports).await;
+    let (c, d) = (&p.c[0], &p.d[0]);
+    let (node1, node2) = (p.node_id(0).await, p.node_id(1).await);
+    let a = tempfile::Builder::new()
+        .prefix("oplpoola")
+        .tempdir_in("/tmp")
+        .unwrap();
+    d.ctl(&[
+        "pool",
+        "create",
+        "a",
+        "--path",
+        a.path().to_str().unwrap(),
+        "--node",
+        &node1,
+    ])
+    .await
+    .unwrap();
+    c.post(
+        "/storage-pools",
+        &json!({ "name": "blk", "spec": { "backend": backend, "nodes": [node2] } }),
+    )
+    .await
+    .unwrap();
+    p.d[0].wait_pool_ready("a").await;
+    p.d[1].wait_pool_ready("blk").await;
+    d.ctl(&["volume", "create", "root", "--pool", "a", "--size", "64M"])
+        .await
+        .unwrap();
+    let id = c.get("/volumes/root").await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (qcow2, raw, dev) = (
+        a.path().join(format!("{id}.qcow2")),
+        a.path().join(format!("{id}.raw")),
+        dev(&id),
+    );
+    assert!(qemu_io(&qcow2, "qcow2", "write -P 0xab 0 1M"));
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--node", "node1", "--start",
+    ])
+    .await
+    .unwrap();
+
+    let out = d
+        .ctl(&["vm", "migrate", "web", "node2", "--pool", "blk"])
+        .await
+        .unwrap();
+    assert_eq!(out, "vm web: migrated to node2\n");
+    assert_vm_on(&p, &node2).await;
+    assert_volume_on(&p, "blk", "raw", &node2).await;
+    eventually("qcow2 file deleted", || async { !qcow2.exists() }).await;
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&dev, "raw", "read -P 0xab 0 1M"));
+    assert!(qemu_io(&dev, "raw", "write -P 0xcd 1M 1M"));
+
+    let out = d.ctl(&["vm", "start", "web"]).await.unwrap();
+    assert!(out.contains("vm web: start done"), "{out}");
+    let out = d
+        .ctl(&["vm", "migrate", "web", "node1", "--pool", "a"])
+        .await
+        .unwrap();
+    assert_eq!(out, "vm web: migrated to node1\n");
+    assert_vm_on(&p, &node1).await;
+    assert_volume_on(&p, "a", "raw", &node1).await;
+    eventually("block device deleted", || async { !dev.exists() }).await;
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&raw, "raw", "read -P 0xab 0 1M"));
+    assert!(qemu_io(&raw, "raw", "read -P 0xcd 1M 1M"));
+
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    assert!(!raw.exists());
+    d.ctl(&["pool", "delete", "a"]).await.unwrap();
+    d.ctl(&["pool", "delete", "blk"]).await.unwrap();
+}
+
+/// 디렉터리 풀 → LVM-thin 풀(`OPL_TEST_LVM`) → 디렉터리 풀
+#[cfg(all(feature = "lvm-it", target_os = "linux"))]
+#[tokio::test]
+async fn migrates_local_disks_through_an_lvm_thin_pool() {
+    let target = std::env::var("OPL_TEST_LVM").expect("OPL_TEST_LVM must name VG/THINPOOL");
+    let (vg, thinpool) = target
+        .split_once('/')
+        .expect("OPL_TEST_LVM must look like VG/THINPOOL");
+    local_round_trip(
+        "mig-lvm-thin",
+        ["60260-60269", "60270-60279"],
+        json!({ "kind": "lvm-thin", "vg": vg, "thinpool": thinpool }),
+        |id| PathBuf::from("/dev").join(vg).join(format!("opl-{id}")),
+    )
+    .await;
+}
+
+/// 디렉터리 풀 → ZFS 풀(`OPL_TEST_ZFS`) → 디렉터리 풀
+#[cfg(all(feature = "zfs-it", target_os = "linux"))]
+#[tokio::test]
+async fn migrates_local_disks_through_a_zfs_pool() {
+    let dataset = std::env::var("OPL_TEST_ZFS").expect("OPL_TEST_ZFS must name POOL/DATASET");
+    local_round_trip(
+        "mig-zfs",
+        ["60280-60289", "60290-60299"],
+        json!({ "kind": "zfs", "dataset": dataset }),
+        |id| {
+            Path::new("/dev/zvol")
+                .join(&dataset)
+                .join(format!("opl-{id}"))
+        },
+    )
+    .await;
 }

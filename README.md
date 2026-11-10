@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료
+- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -990,39 +990,46 @@ oplctl pool get san                                  # 노드별 준비·VG 크�
 
 실행 중인 VM을 멈추지 않고 다른 노드로 옮긴다(`qm migrate`·vMotion). 원본 노드의 작업(Task)이 지휘하고, 메모리는
 두 QEMU가 노드 인증서로 TLS를 맺어 직접 주고받는다. 대상 QEMU는 멈춘 채 받고, 받기를 확인한 뒤 클러스터 기록의
-VM 노드를 대상으로 바꾸는 순간 확정된다. 그 뒤에만 대상에서 VM이 이어서 돈다(두 QEMU가 함께 돌지 않는다).
+VM 노드를 대상으로 바꾸는 순간 확정된다. 그 뒤에만 대상에서 VM이 이어서 돈다(두 QEMU가 함께 돌지 않는다). 공유 풀의
+디스크는 두 노드가 함께 열고, 노드 로컬 풀(공유가 아닌 디렉터리 풀, LVM-thin, ZFS)의 디스크는 대상 노드에 새로 만든
+볼륨으로 복사한다(`qm migrate --online --with-local-disks`·Storage vMotion — 아래 "로컬 디스크 복사").
 
 ```bash
 oplctl vm migrate web node2              # 끝날 때까지 기다린다: "vm web: migrated to node2"
+oplctl vm migrate web node2 --pool fast  # 로컬 디스크를 node2의 풀 fast에 복사한다(없으면 같은 이름의 풀)
 oplctl vm list                           # 옮기는 동안 PHASE migrating, NODE "원본 -> 대상"
 ```
 
-웹은 VM 상세의 "마이그레이션"(실행 중일 때)에서 대상 노드를 고른다. API는 `POST /api/v1/vms/{key}/migrate`
-(`{"node": "이름 또는 id"}`, 운영자 권한, 202와 작업)다.
+웹은 VM 상세의 "마이그레이션"(실행 중일 때)에서 대상 노드를 고른다(로컬 디스크가 있으면 복사할 디스크 목록과
+"대상 풀" — 고른 노드에 같은 이름의 풀이 없으면 대상 풀을 고르게 한다). API는 `POST /api/v1/vms/{key}/migrate`(`{"node": "이름 또는 id", "pool"?: "풀"}`, 운영자 권한, 202와
+작업)다.
 
 ```toml
 # /etc/opl/opld.toml (노드마다, 생략하면 아래 기본값)
 [migration]
 ports = "60000-60099"     # 받는 쪽 QEMU가 듣는 TCP 포트 범위(둘 다 포함)
-bandwidth_mib = 0         # 보내는 대역폭 상한(MiB/s), 0이면 QEMU 기본값
+bandwidth_mib = 0         # 보내는 대역폭 상한(MiB/s), 0이면 QEMU 기본값. 로컬 디스크 복사에도 디스크 수로 나눠 쓴다
 timeout = "30m"           # 이 시간 안에 끝나지 않으면 취소하고 원본을 계속 돌린다("1h30m", "90s")
+disk_timeout = "12h"      # 로컬 디스크 복사가 따라잡기(ready)까지의 한도. 메모리 단계는 timeout을 따로 쓴다
 ```
 
-- **요구 사항.** Linux/KVM 노드끼리만 된다(macOS(HVF) 노드는 원본도 대상도 안 된다). 디스크가 **모두 공유 풀**
-  (NFS, `--shared` 디렉터리 풀, Ceph RBD, 공유 LVM)에 있어야 한다(디스크 복사는 하지 않는다). 두 노드의 **QEMU
+- **요구 사항.** Linux/KVM 노드끼리만 된다(macOS(HVF) 노드는 원본도 대상도 안 된다). 공유 풀(NFS, `--shared`
+  디렉터리 풀, Ceph RBD, 공유 LVM)의 디스크는 그대로 쓰고, 노드 로컬 풀의 디스크는 복사한다(아래). 두 노드의 **QEMU
   버전이 같고 CPU가 같아야** 한다(`-cpu host`. 버전이 다르면 작업이 실패하고, CPU는 확인하지 않으므로 다르면
   실패하거나 게스트가 멈출 수 있다). 모든 노드를 이 기능이 있는 opld로 올린 뒤 쓴다.
 - **방화벽.** 노드 사이에 `[migration] ports` 범위를 연다. 받는 쪽은 `cluster_listen`의 IP(기본 모든 주소)에서
   범위의 빈 포트를 고르고(모두 쓰는 중이면 "no free migration port in …"으로 실패한다), 원본은 대상의 `address`로
-  접속한다.
+  접속한다. 로컬 디스크를 복사하면 범위에서 포트를 둘 쓴다(디스크 복사의 NBD와 메모리).
 - **TLS.** opld가 시작할 때 노드 인증서·키와 클러스터 CA를 `{data_dir}/migration-tls/`(기본
   `/var/lib/opl/migration-tls`, 0700, 키 0600)에 쓰고 QEMU가 그것으로 서로를 확인한다. 이 기능 전에 클러스터에
   들어온 노드의 인증서는 키 용도에 keyEncipherment가 없어 QEMU 8.2 이하에서 TLS가 실패한다(opld가 시작할 때
   경고한다). 그 노드를 클러스터에서 뺐다가 다시 합류시켜 새 인증서를 받는다.
-- **거절(409).** 실행 중이 아님 `vm_not_running`, 공유 풀이 아닌 디스크나 macOS 노드 `migration_unsupported`,
-  대상이 오프라인·유지보수 중 `node_unavailable`, 대상에서 풀·브리지가 준비되지 않았거나 남은 메모리가 모자람
-  `no_capacity`, 다른 작업(스냅샷·되돌리기·크기 늘리기 등) 중 `vm_busy`. 같은 노드면 **400**, 아키텍처가 다르면
-  **400** `machine_arch_mismatch`.
+- **거절(409).** 실행 중이 아님 `vm_not_running`, 로컬 디스크가 있는데 VM에 스냅샷이 있거나 macOS 노드
+  `migration_unsupported`, 로컬 디스크가 있는데 디스크 복사를 모르는 노드(위트니스 포함)가 있음 `cluster_upgrading`,
+  대상이 오프라인·유지보수 중 `node_unavailable`, 대상에서 풀·브리지가 준비되지 않았거나 로컬 디스크의 대상 풀을 그
+  노드에서 쓸 수 없거나("node … cannot use storage pool … for disk …") 남은 메모리가 모자람 `no_capacity`, 다른
+  작업(스냅샷·되돌리기·크기 늘리기 등) 중 `vm_busy`. 같은 노드나 로컬 디스크가 없는데 `pool`을 주면 **400**, 없는
+  `pool`은 **404**, 아키텍처가 다르면 **400** `machine_arch_mismatch`.
 - **옮기는 동안.** VM은 `migrating`이고 켜기·끄기·재시작·스냅샷·복제·편집·지우기가 모두 **409** `vm_busy`다.
   콘솔은 열 수 있다(넘어가는 순간 끊겼다가 대상 노드로 다시 연결된다). 취소는 없다. 수렴하지 않으면 `auto-converge`가 게스트를 늦추고 시간 제한이 지나면 실패한다.
 - **실패.** 확정 전에 실패하면(대상 거절, 연결·TLS 실패, 시간 제한) 대상 QEMU를 끄고 원본이 계속 돈다. 작업
@@ -1040,6 +1047,45 @@ timeout = "30m"           # 이 시간 안에 끝나지 않으면 취소하고 �
   거쳐 간 다른 노드의 변수 파일은 VM을 지워도 그 노드에 남는다.
 - **공유 LVM.** 옮기는 동안 디스크 LV를 공유 잠금(`lvchange -asy`)으로 바꾸고, 대상이 넘겨받은 뒤 다시 배타로
   바꾼다.
+- **로컬 디스크 복사.** 노드 로컬 풀의 디스크는 대상 노드의 같은 풀(그 풀을 대상 노드에서도 쓸 수 있어야 한다 —
+  노드마다 같은 VG·thin pool·데이터셋·디렉터리)에, `--pool`(API `pool`)을 주면 대상 노드의 그 풀에 복사한다(공유
+  풀도 고를 수 있다 — 로컬에서 공유로 옮기며 마이그레이션). 디스크마다 다른 풀은 고를 수 없다. 공유 풀의 디스크는
+  그대로 둔다.
+  - **흐름.** 원본 작업이 대상 풀마다 복사할 디스크의 할당된 크기의 합이 대상 노드가 알린 남은 공간 이하인지
+    보고("not enough space in storage pool …", 대상 노드가 그 풀 상태를 알리지 않았으면 건너뛴다), 대상 노드가 같은
+    볼륨 id로 원본과 같은 가상 크기의 볼륨을 만들어(블록 풀이면 raw, 디렉터리·NFS 풀이면 지금 형식 그대로) 멈춘
+    받는 QEMU에서 TLS NBD로 내보낸다. 원본 QEMU가 디스크마다
+    `blockdev-mirror`로 복사하고(게스트는 계속 돈다 — 복사 중 바뀐 블록도 따라간다), 모두 따라잡으면 메모리를 보낸다.
+    게스트가 멈춘 스위치오버 직전(`pause-before-switchover`)에 미러를 끝내므로 대상 디스크가 원본과 같다. 확정 뒤 볼륨
+    기록(풀·형식·노드)을 대상으로 고치고 원본 노드의 볼륨을 지운다. 볼륨의 이름과 id는 그대로다.
+  - **진행률.** 작업의 `status.progress`(`stage`가 `copying-disks`면 복사한 바이트와 전체, `migrating-memory`)를 첫
+    변화는 곧바로, 그 뒤 바뀌면 5초에 한 번까지 쓴다(작업이 이미 끝났으면 쓰지 않는다). `oplctl vm migrate`는 stderr에
+    `vm web: copying disks 37% (14.8 GiB of 40.0 GiB)`·`vm web: migrating memory`를 알리고 24시간까지 기다린다(넘으면
+    기다리기만 그만두므로 `oplctl task get <ID>`로 본다). 웹은 VM 상세와 작업 목록에 진행률을 보인다. 취소는 없다.
+    복사가 몇 시간 걸릴 수 있고 그동안 VM은 `migrating`이라 끄기·스냅샷·백업이 **409** `vm_busy`다.
+  - **실패.** 공간 부족, 대상 풀이 크기를 올려 게스트가 보는 크기가 바뀜("disk … would change size on pool …"), 대상에
+    같은 볼륨이 이미 있음("volume … already exists on node … in pool …; is the pool really node-local?" — 그 파일은 지우지
+    않는다), 미러 오류, `disk_timeout`("disk copy did not finish within 12h"), 10분 동안 복사량이 늘지 않음("disk copy
+    made no progress for 10m"), 그 밖의 마이그레이션 실패는 확정 전이므로 원본이 계속 돌고 대상이 만든 볼륨을 지운다.
+    노드마다 `{data_dir}/migration-disks/{작업}.json`에 그 노드가 만들거나 지울 볼륨을 적어 두고, opld가 중간에 죽어도
+    다시 뜰 때(그리고 30분마다) 그 기록으로 남은 사본을 지운다(확정 전이면 대상의 사본, 확정 뒤면 원본, 다른 풀로 옮겨
+    온 VM의 옛 풀 사본 — 이것은 VM이 도는 동안에도 지운다). 대상 노드는 만든 볼륨만 지운다 — 만들다 멈췄거나 이미
+    있던 볼륨은 기록에서만 뺀다. 같은 VM의 옛 사본(같은 볼륨·풀)을 지우지 못해 기록이 남았으면 받지 않는다("an
+    earlier copy of disk … in pool … is not cleaned up on this node yet …"). 원본 opld가 복사 중에 죽으면 다시 뜬
+    원본이 남은 미러를 치운 뒤 마이그레이션 표시를 지운다 — QEMU에 붙지 못하거나 세 번 잇달아 치우지 못하면 경고
+    뒤 표시만 지운다(남은 미러는 대상의 정리가 받는 QEMU를 끄면 끝난다).
+  - **스냅샷·비트맵·백업.** 복사는 지금 내용만 옮기므로 로컬 디스크가 있는 VM에 스냅샷이 있으면 옮기지 못한다(먼저
+    지운다). 증분 백업의 dirty bitmap은 함께 옮긴다(qcow2 → raw로 바뀌는 디스크의 비트맵은 지우므로 다음 백업은 전체).
+    백업 파일은 옮기지 않는다 — 백업 풀이 공유면 대상에서 체인을 이어 가고, 원본 노드의 로컬 백업 풀이면 다음 백업이
+    전체다.
+  - **버전.** 모든 노드(위트니스 포함)가 디스크 복사를 아는 opld여야 한다(노드 기능 `storage-migration`, 아니면
+    **409** `cluster_upgrading`). 공유 풀만의 마이그레이션은 롤링 업그레이드 중에도 된다.
+  - **한계.** 취소가 없다(`disk_timeout`이나 10분 정체에서 실패로 끝난다). 대상 풀은 하나다(같은 이름 또는 `pool`).
+    백엔드가 크기를 다르게 올리면(4 MiB 배수가 아닌 디스크를 LVM-thin으로) 옮기지 못한다. 공간 확인은 할당된 크기 기준이라
+    복사 중 원본이 늘면 대상 풀이 차서 실패할 수 있다. 미러는 게스트 쓰기를 기다리지 않으므로(`background`) 쓰기가
+    아주 많은 VM은 스위치오버 때 멈추는 시간이 길어진다. 복사는 클러스터 주소(노드 사이 망)로 간다. 꺼진 VM의 디스크
+    옮기기와 한 노드 안에서 디스크만 다른 풀로 옮기기는 없다. 확정 뒤 원본 볼륨 지우기에 실패하면 다음 정리(30분)까지
+    원본 노드에 남는다.
 
 ## 위트니스 노드
 
@@ -1245,7 +1291,7 @@ oplctl node maintenance node1 off        # 유지보수 끝: "node node1: mainte
 oplctl node maintenance node1 on         # VM은 옮기지 않고 배치만 막는다
 ```
 
-웹은 노드 화면 행 메뉴의 "노드 비우기…"(확인 대화상자에 옮길 실행 중 VM 수와 로컬 디스크 안내, 그 뒤 작업을
+웹은 노드 화면 행 메뉴의 "노드 비우기…"(확인 대화상자에 옮길 실행 중 VM 수와 로컬 디스크 복사 안내, 그 뒤 작업을
 따라감 — 오프라인·macOS(HVF)·비우는 중인 노드는 이유와 함께 막힘)와 "유지보수 시작/끝"이다. API는 `POST /api/v1/nodes/{key}/drain`(본문 없음, admin, 202와 작업
 `node-drain`)이고, 유지보수 켜기·끄기는 노드 수정 `PUT /api/v1/nodes/{key}`의 `spec.maintenance`(admin, If-Match)다.
 
@@ -1272,20 +1318,24 @@ oplctl node maintenance node1 on         # VM은 옮기지 않고 배치만 막�
   한 번에 하나씩 옮긴다. VM에 다른 작업(전원·스냅샷·마이그레이션 등)이 있으면 끝나기를 `[migration] timeout`(기본 30분)까지
   기다린다. 대상은 VM 만들기의 스케줄러와 같은 규칙(온라인, 유지보수·위트니스 아님, 아키텍처·디스크 풀·브리지·방화벽, HA
   VM이면 HA 가능 노드)을 지나고 macOS(HVF) 노드가 아니며 남은 메모리가 VM 메모리 이상인 노드 가운데 미할당 메모리가 가장
-  많은 노드(같으면 id가 작은 노드)다. 마이그레이션은 `vm migrate`와 같은 확인을 거친 보통의 `vm-migrate` 작업이고(작업
-  목록에 하나씩 보인다), 비우기는 그것이 끝나기를 기다린 뒤(`[migration] timeout`의 두 배와 1분까지 — 넘으면 `migration
-  task did not finish`) 다음 VM으로 간다. 그 사이 VM이 꺼지거나 지워지거나 다른 노드로 갔으면 넘어가고(다시 나타나면
+  많은 노드(같으면 id가 작은 노드)다. 로컬 디스크 VM은 그 디스크의 같은 이름의 풀을 쓸 수 있는 노드만 고르고 디스크를
+  그 풀에 복사한다("라이브 마이그레이션"의 "로컬 디스크 복사" — 비우기는 `pool`을 고르지 않는다). 마이그레이션은 `vm
+  migrate`와 같은 확인을 거친 보통의 `vm-migrate` 작업이고(작업 목록에 하나씩 보인다), 비우기는 그것이 끝나기를 기다린
+  뒤(`[migration] timeout`의 두 배와 1분까지, 디스크를 복사하면 `disk_timeout`을 더해서 — 넘으면 `migration task did not
+  finish`) 다음 VM으로 간다. 그 사이 VM이 꺼지거나 지워지거나 다른 노드로 갔으면 넘어가고(다시 나타나면
   세 번까지 다시 보고, 그 뒤에도 다시 나타나면 `busy`), 확인과 작업 만들기 사이에 다른 작업이 끼면 한 번 더 기다려 다시
   한다. 비우기 작업에는 일반 작업의 시간 제한(600초)이 없다.
 - **성공은 노드가 빈 것이다.** 옮길 VM이 없어도 이 노드로 들어오던 마이그레이션(비우기 전에 시작한 `vm migrate`)이
   있으면 끝나기를 `[migration] timeout`까지 기다려(넘으면 `busy`) 들어온 VM도 옮긴다. 비우기가 옮긴 VM이 비우기 중에
   다시 들어오면 한 번 더 옮기지 않고 `moved back during the drain`으로 남긴다.
-- **옮기지 못한 VM.** 디스크가 공유 풀이 아닌 VM(`disks on a local pool`), macOS(HVF) 노드(`hvf node`), 받을 노드가 없음
-  (`no node with capacity`), 바쁨(`busy` — VM의 다른 작업이나 이 노드로 들어오는 마이그레이션이 `[migration] timeout`까지
+- **옮기지 못한 VM.** 로컬 디스크 VM인데 디스크 복사를 모르는 노드가 있음(`disks on a local pool (some nodes do not
+  support storage migration yet)`)이나 스냅샷이 있음(`disks on a local pool and snapshots`), 로컬 디스크의 같은 이름 풀을
+  쓸 수 있는 노드가 없음(`no node can take its local disks` — 디스크 풀만 아니면 받을 노드가 있을 때), macOS(HVF)
+  노드(`hvf node`), 받을 노드가 없음(`no node with capacity`), 바쁨(`busy` — VM의 다른 작업이나 이 노드로 들어오는 마이그레이션이 `[migration] timeout`까지
   끝나지 않음, 다시 기다린 뒤에도 마이그레이션 작업 만들기가 다른 작업과 겹침, 사라졌다 다시 나타나기를 세 번 넘게 함),
   마이그레이션 작업이 끝나지 않음(`migration task did not finish`), 다시 들어옴(`moved back during the drain`),
-  마이그레이션 실패(그 작업의 오류)는 그 노드에 남기고 다음 VM으로 간다. 끝에 작업이 "N VM(s) were not moved: db (disks
-  on a local pool), …"로 실패한다(`--wait`면 이 오류와 종료 코드 1). 꺼진 VM은 옮기지 않는다 — 노드에 배정된 채 남고, 켤 때 다른 노드로 간다(아래).
+  마이그레이션 실패(그 작업의 오류 — 대상 풀의 공간 부족 등)는 그 노드에 남기고 다음 VM으로 간다. 끝에 작업이 "N VM(s)
+  were not moved: db (disks on a local pool and snapshots), …"로 실패한다(`--wait`면 이 오류와 종료 코드 1). 꺼진 VM은 옮기지 않는다 — 노드에 배정된 채 남고, 켤 때 다른 노드로 간다(아래).
 - **유지보수를 끄면 멈춘다.** 비우기는 VM마다(VM이 자리 잡기를 기다린 뒤 마이그레이션을 시작하기 직전에도, 들어오는
   마이그레이션을 기다리는 동안에도) 노드를 다시 읽어 유지보수가 끝났으면 "drain stopped: maintenance ended"로
   실패한다(옮기는 중인 마이그레이션은 끝까지 간다). 그래서 `oplctl node maintenance <노드> off`는 끝나지 않은 비우기가
@@ -1299,8 +1349,8 @@ oplctl node maintenance node1 on         # VM은 옮기지 않고 배치만 막�
   maintenance first"). 아직 그 노드에서 돌거나 멈추는 중인 VM은
   옮기지 않는다. VM 만들기·편집에서 유지보수 노드를 새로 고르면 **409** `node_unavailable`("… is in maintenance and
   cannot take VMs; end maintenance first")이고, 이미 그 노드에 있는 VM의 다른 편집은 막지 않는다.
-- **한계.** 로컬 디스크 VM은 옮기지 못한다(디스크 복사 마이그레이션이 없다 — 끄거나 공유 풀로 옮긴다). 한 번에
-  하나씩 옮기고, 진행률은 각 `vm-migrate` 작업으로 본다. 유지보수가 끝나도 VM을 원래 노드로 되돌리지 않는다. 옮기지
+- **한계.** 로컬 디스크 VM은 같은 이름의 풀로만 옮기고 스냅샷이 있으면 옮기지 못한다. 디스크 복사는 오래 걸릴 수 있다.
+  한 번에 하나씩 옮기고, 진행률은 각 `vm-migrate` 작업으로 본다. 유지보수가 끝나도 VM을 원래 노드로 되돌리지 않는다. 옮기지
   못한 VM을 끄는 선택과 롤링 업그레이드 자동화(노드를 차례로 비우고 올리고 재부팅)는 없다. 볼륨 만들기·백업 같은
   작업의 노드 고르기는 유지보수를 보지 않는다.
 
@@ -2553,8 +2603,9 @@ sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM_SHAR
   cargo test -p opl-driver --features lvm-shared-it --test lvm_shared_storage
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM_SHARED=oplshared \
   OPL_TEST_ISCSI=127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared cargo test -p opld --features lvm-shared-it --test lvm_shared
-# 실제 라이브 마이그레이션: 한 호스트의 opld 둘, 공유 디렉터리 풀(macOS는 TCG로 돈다). nfs-it·rbd-it·lvm-shared-it와
-# 그 환경 변수를 함께 주면(Linux, root) 그 풀로도 옮긴다.
+# 실제 라이브 마이그레이션: 한 호스트의 opld 둘, 공유 디렉터리 풀과 노드마다 다른 경로의 로컬 디렉터리 풀(디스크 복사,
+# macOS는 TCG로 돈다). nfs-it·rbd-it·lvm-shared-it와 그 환경 변수를 함께 주면(Linux, root) 그 풀로도 옮기고, lvm-it·zfs-it와
+# 함께 주면 로컬 디스크를 디렉터리 풀 → LVM-thin·ZFS 풀 → 디렉터리 풀로 옮긴다.
 cargo test -p opld --features migration-it --test migration
 # 실제 HA 복구: 한 호스트의 opld 둘(process 펜싱)과 위트니스, 공유 디렉터리 풀(macOS는 TCG로 돈다).
 cargo test -p opld --features ha-it --test ha
@@ -2697,6 +2748,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [엔터프라이즈 설계 (하위 프로젝트 10: 계획 34~38)](docs/superpowers/specs/2026-11-06-enterprise-design.md)
 - [노드 유지보수(노드 비우기) 설계 (하위 프로젝트 11: 계획 39)](docs/superpowers/specs/2026-11-09-node-maintenance-design.md)
 - [증분 백업·증분 복제 설계 (하위 프로젝트 12: 계획 40·41)](docs/superpowers/specs/2026-11-09-incremental-backup-design.md)
+- [로컬 디스크 라이브 마이그레이션 설계 (하위 프로젝트 13: 계획 42)](docs/superpowers/specs/2026-11-10-storage-migration-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)

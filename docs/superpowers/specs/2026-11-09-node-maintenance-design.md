@@ -8,7 +8,7 @@
 
 | 포함 | 제외 |
 |---|---|
-| 노드 비우기: 유지보수로 바꾸고 실행 중인 VM을 하나씩 다른 노드로 라이브 마이그레이션 | 디스크까지 복사하는 마이그레이션(로컬 디스크 VM은 옮기지 못함) |
+| 노드 비우기: 유지보수로 바꾸고 실행 중인 VM을 하나씩 다른 노드로 라이브 마이그레이션 | 디스크까지 복사하는 마이그레이션(로컬 디스크 VM은 옮기지 못함 — 계획 42에서 됨: 같은 이름의 풀로 복사해 옮김, `2026-11-10-storage-migration-design.md` §3.9) |
 | 대상 노드 자동 고르기(기존 스케줄러) | 유지보수가 끝난 뒤 VM을 원래 노드로 되돌리기 |
 | 유지보수 노드에 고정된 꺼진 VM을 켜면 다른 노드에 놓기 | 옮기지 못한 VM을 끄는 선택 |
 | `oplctl node maintenance on/off`, `oplctl node drain`, 웹 "노드 비우기" | 롤링 업그레이드 자동화, 노드 재부팅 |
@@ -65,7 +65,7 @@ HA VM도 같은 방법으로 옮긴다(스케줄러가 HA 가능 노드만 고�
 
 - `oplctl node maintenance <노드> on|off` (`PUT /nodes/{key}`, If-Match).
 - `oplctl node drain <노드> [--wait]`: `--wait`이면 비우기 Task를 끝까지 따라가고(`migration_timeout` × VM 수를 넘지 않게 넉넉히), 실패하면 Task 오류를 보이고 0이 아닌 값으로 끝낸다.
-- 웹 노드 화면 행 메뉴 "노드 비우기": 확인 대화상자(그 노드의 실행 중 VM 수, 로컬 디스크 VM은 옮기지 못한다는 안내), Task를 따라감. 노드 이름 옆 유지보수 배지는 그대로.
+- 웹 노드 화면 행 메뉴 "노드 비우기": 확인 대화상자(그 노드의 실행 중 VM 수, 로컬 디스크 VM은 옮기지 못한다는 안내 (계획 42에서 바뀜 — `2026-11-10-storage-migration-design.md`)), Task를 따라감. 노드 이름 옆 유지보수 배지는 그대로.
 
 ## 4. 오류
 
@@ -84,8 +84,8 @@ HA VM도 같은 방법으로 옮긴다(스케줄러가 HA 가능 노드만 고�
 
 ## 6. 알려진 한계
 
-- 로컬 디스크 VM은 옮기지 못한다(직접 끄거나 유지보수를 끝냄).
-- 한 번에 하나씩 옮긴다. 진행률은 각 `VmMigrate` Task로 본다(Task에 진행률 필드는 없다).
+- 로컬 디스크 VM은 옮기지 못한다(직접 끄거나 유지보수를 끝냄). 계획 42에서 풂: 같은 이름의 풀을 쓸 수 있는 노드로 디스크를 복사해 옮긴다. 스냅샷이 있거나(`disks on a local pool and snapshots`) 디스크 복사를 모르는 노드가 있거나(`disks on a local pool (some nodes do not support storage migration yet)`) 그런 노드가 없으면(`no node can take its local disks` — 디스크 풀만 아니면 받을 노드가 있을 때, 메모리 등 다른 이유면 `no node with capacity`) 남긴다. 기다리는 한도에 `disk_timeout`을 더한다. 웹 안내는 "로컬 디스크 VM은 같은 이름의 풀이 있는 노드로 디스크를 복사해 옮깁니다(스냅샷이 있으면 옮기지 못합니다)"로 바뀌었다.
+- 한 번에 하나씩 옮긴다. 진행률은 각 `VmMigrate` Task로 본다(Task에 진행률 필드는 없다 — 계획 42에서 `TaskStatus.progress`가 생겨 디스크를 복사하는 마이그레이션 Task가 복사·메모리 단계를 적는다, `2026-11-10-storage-migration-design.md` §3.7).
 - 유지보수가 끝나도 VM을 되돌리지 않는다.
 - 볼륨 만들기·백업 같은 Task의 노드 고르기는 유지보수를 보지 않는다(VM을 돌리지 않는 짧은 작업).
 
@@ -98,6 +98,6 @@ HA VM도 같은 방법으로 옮긴다(스케줄러가 HA 가능 노드만 고�
 - 비우기 Task(`tasks/drain.rs`): §3.2와 같다. 다른 점과 구체: 옮기지 못한 VM은 다시 보지 않는다. 옮길 것이 없어진(꺼짐·지워짐·다른 노드로 감) VM은 다시 나타나면 다시 보되 세 번까지(그 뒤 `busy`), 옮긴 VM이 다시 들어오면 한 번 더 옮기지 않고 `moved back during the drain`(끝이 있게). 성공은 노드가 빈 것이다: 옮길 VM이 없으면 이 노드로 들어오는 마이그레이션(`status.migration`의 대상이 이 노드인 VM, 끝나지 않은 `VmMigrate { node: 이 노드 }` Task)이 끝나기를 최대 `migration_timeout` 기다려(넘으면 그 VM은 `busy`) 다시 반복하므로 들어온 VM도 옮긴다. 기다리기(settle)는 VM이 이 노드에서 실행 중이고 phase `running`이며 `status.migration`이 없고 그 VM을 대상으로 한 끝나지 않은 Task가 없을 때까지(`poll_interval`마다 클러스터에서 다시 읽음, `migration_timeout`을 넘기면 `busy`). 기다린 뒤(마이그레이션을 시작하기 직전)와 들어오는 마이그레이션을 기다리는 동안에도 노드를 다시 읽어 유지보수가 끝났으면 멈춘다. 대상은 `node_fits`를 지나고 `qemu-hvf`가 아니며 `free_memory_mib`가 VM 메모리 이상인 노드 가운데 남은 메모리가 가장 많은 노드(같으면 id가 작은 것, §3.2의 "`schedule`의 첫 결과"가 HVF 노드면 다른 노드를 보지 못하므로). `start_migration`은 원본(이 노드)을 넘겨 부르고, 오류는 `vm_not_running`·`not_found`·`vm_moved`면 넘어가고, `vm_busy`면 한 번 더 기다려 다시 하고 그래도면 `busy`, 나머지(`no_capacity` 포함)는 오류 메시지 그대로. 마이그레이션 Task는 `poll_interval`마다 다시 읽어 끝나기를 기다리고, 읽기가 계속 실패하거나 끝나지 않으면 `migration_timeout`의 두 배 + 1분에서 `migration task did not finish`. 실패 문구는 이름 순 `"N VM(s) were not moved: a (disks on a local pool), b (busy)"`.
 - VM 켜기·고치기(`vms.rs`): `start`는 유지보수 노드에 고정된 VM이 **완전히 꺼져 있을 때만**(`is_stopped`, 같은 revision 확인 쓰기 안에서) `schedule`로 다른 노드를 골라 `spec.node`를 바꾼다. 아직 그 노드에서 돌거나 멈추는 중이면 그대로 둔다. `prepare`(만들기·고치기·스냅샷 되돌리기)는 요청한 노드가 지금 노드와 다를 때만 유지보수를 확인한다(409 `node_unavailable` "node "X" is in maintenance and cannot take VMs; end maintenance first" — §3.3의 "직접 고름"을 "새로 고름"으로 좁힘: 이미 그 노드에 있는 VM의 다른 고치기와 다시 켜기는 막지 않는다).
 - oplctl: `node maintenance <노드> on|off`(GET → 라벨과 spec은 그대로 두고 `spec.maintenance`만 바꿔 읽은 revision으로 If-Match PUT, `revision_mismatch`면 다시 읽어 세 번까지, 출력 `node X: maintenance on`; 끄면 그 노드의 끝나지 않은 `node-drain` Task를 찾아 stderr에 `warning: the running drain of X stops (task T)`, 목록을 읽지 못하면 `warning: cannot check for a running drain: …`만 쓰고 성공), `node drain <노드> [--wait]`(기다리지 않으면 ``drain of X started (task T); follow it with `oplctl task get T` ``, `--wait`이면 `node X drained` 또는 Task 오류와 종료 코드 1). 기다리는 한도는 §3.6의 "`migration_timeout` × VM 수" 대신 고정 `client::DRAIN_WAIT`(24시간)이다 — oplctl은 서버의 `migration_timeout`과 옮길 VM 수를 모른다.
-- 웹(`web/src/nodes/NodesPage.tsx`): 행 메뉴 "노드 비우기…"(노드 쓰기 권한 메뉴, 위트니스는 메뉴 없음, 오프라인·하이퍼바이저 `qemu-hvf`("macOS 노드의 VM은 옮길 수 없습니다")·끝나지 않은 `node-drain` Task가 있으면 이유와 함께 막힘), "유지보수 끝내기"는 끝나지 않은 `node-drain` Task가 있으면 확인 대화상자("끝내면 진행 중인 비우기가 멈춥니다"), 확인 대화상자(`/vms`에서 `spec.node`가 이 노드이고 `spec.power`가 running인 VM 수 — Task와 같은 기준, 로컬 디스크 VM은 옮기지 못하고 비우기가 실패한다는 고정 안내 — VM마다 풀을 따지지 않음), POST 뒤 Task "X 비우기"를 따라감. i18n `nodes.drain.*`·`errors.node_busy`·`tasks.op.node-drain`, ko·en. 일반 문구 `errors.node_unavailable`에 서버 설명을 붙여(`{{message}}`) VM 켜기의 409가 이유를 보인다.
+- 웹(`web/src/nodes/NodesPage.tsx`): 행 메뉴 "노드 비우기…"(노드 쓰기 권한 메뉴, 위트니스는 메뉴 없음, 오프라인·하이퍼바이저 `qemu-hvf`("macOS 노드의 VM은 옮길 수 없습니다")·끝나지 않은 `node-drain` Task가 있으면 이유와 함께 막힘), "유지보수 끝내기"는 끝나지 않은 `node-drain` Task가 있으면 확인 대화상자("끝내면 진행 중인 비우기가 멈춥니다"), 확인 대화상자(`/vms`에서 `spec.node`가 이 노드이고 `spec.power`가 running인 VM 수 — Task와 같은 기준, 로컬 디스크 VM은 옮기지 못하고 비우기가 실패한다는 고정 안내 (계획 42에서 바뀜 — `2026-11-10-storage-migration-design.md`) — VM마다 풀을 따지지 않음), POST 뒤 Task "X 비우기"를 따라감. i18n `nodes.drain.*`·`errors.node_busy`·`tasks.op.node-drain`, ko·en. 일반 문구 `errors.node_unavailable`에 서버 설명을 붙여(`{{message}}`) VM 켜기의 409가 이유를 보인다.
 - 시험: opl-types `TaskOp` JSON; opl-api `tests/vms.rs`(유지보수 노드에 고정된 꺼진 VM이 다른 노드에서 켜짐, 그 노드밖에 없으면 409, 만들기·고치기에서 유지보수 노드를 고르면 409, 실행 중 VM 고치기·다시 켜기는 그대로), `tests/drain.rs`(권한·404·유지보수로 바뀜·Task, 위트니스·오프라인 409, `node_busy`가 `cluster_upgrading`보다 먼저, 기능 없는 노드(위트니스) 409와 옛 버전이어도 기능이 있으면 202, 빈 노드 성공, 옮기지 못한 이유 — 로컬 풀·메모리가 모자란 노드뿐(자리 없음)·HVF, HVF 노드를 건너뛰고 다른 노드로 `VmMigrate`, settle의 `busy` 시간 초과), `tests/two_nodes.rs`(두 노드 실제 mTLS gRPC, 가짜 하이퍼바이저: 공유 풀 VM 둘이 이름 순으로 옮겨지고 성공, 로컬 디스크 VM은 남고 실패 메시지, 비우기를 시작할 때 들어오던 VM도 들어온 뒤 옮김, 옮기는 중 유지보수를 끄면 멈춤); opld 등록이 기능을 적음, 지운 기능 표시를 주기 갱신이 되살림; oplctl 파싱·fake_api(GET → If-Match PUT 본문, `revision_mismatch` 다시 하기, 끄기의 비우기 경고와 Task 목록을 읽지 못할 때의 경고·성공, drain 출력·`--wait` 성공과 실패); opld E2E `tests/migration.rs` `drain_moves_a_running_vm_to_the_other_node`(기능 `migration-it`, 실제 QEMU — macOS는 TCG: 노드 1의 실행 중 VM을 `node drain --wait`로 노드 2에, 원본 QEMU 정리, `maintenance off` 뒤에도 노드 2에 남음); 웹 Vitest(옮길 VM 수와 안내·요청·Task 이름, `node_busy`·`node_unavailable` 오류, 오프라인·macOS·비우는 중 막힘, 위트니스에 메뉴 없음, 비우는 중 유지보수 끝내기 확인, VM 켜기 `node_unavailable` 문구).
 - §5와 다른 점: 고정 VM 켜기 시험은 `two_nodes.rs`가 아니라 `tests/vms.rs`(가짜 노드 기록)에 있다. §4의 `cluster_upgrading`은 "옛 버전 노드"가 아니라 "비우기 기능을 적지 않은 노드"다.
