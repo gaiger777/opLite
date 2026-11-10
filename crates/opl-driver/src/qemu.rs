@@ -64,6 +64,8 @@ const MIGRATION_POLL: Duration = Duration::from_secs(1);
 const INCOMING_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// 시간 제한으로 `migrate_cancel`한 뒤 마이그레이션이 끝나기를 기다리는 한도
 const CANCEL_WAIT: Duration = Duration::from_secs(30);
+/// 마이그레이션이 끝난 뒤 원본이 `finish-migrate`를 벗어났는지 다시 묻는 간격
+const POSTMIGRATE_POLL: Duration = Duration::from_millis(50);
 /// 증분 백업의 대상 노드와 그 작업 id의 접두사(`opl-backup-{i}`)
 const BACKUP_JOB_PREFIX: &str = "opl-backup-";
 /// 증분 백업 작업 상태를 다시 묻는 간격(`JOB_STATUS_CHANGE` 이벤트를 놓쳐도 이만큼 뒤에 안다)
@@ -1138,7 +1140,9 @@ impl Hypervisor for QemuHypervisor {
             info = wait_or_cancel(qmp, id, deadline, opts.timeout, MigrationState::is_finished)
                 .await?;
         }
-        migration_result(info)
+        migration_result(info)?;
+        wait_postmigrate(qmp, id).await;
+        Ok(())
     }
 
     async fn mirror_disks(
@@ -1252,6 +1256,29 @@ fn migration_result(info: MigrationInfo) -> Result<(), DriverError> {
             info.error
                 .unwrap_or_else(|| format!("migration ended as {state:?}")),
         )),
+    }
+}
+
+/// 끝난 마이그레이션의 원본이 `finish-migrate`를 벗어나기를 QMP_TIMEOUT까지 기다린다. QEMU 8.2는
+/// 마이그레이션을 `completed`로 바꾼 뒤에 원본을 `postmigrate`로 바꾼다. 넘기면 경고만 남긴다
+/// (마이그레이션은 끝났고 남은 원본은 주기적 정리가 끈다).
+async fn wait_postmigrate(qmp: &QmpClient, id: Uuid) {
+    let deadline = tokio::time::Instant::now() + QMP_TIMEOUT;
+    loop {
+        let status = tokio::time::timeout(QMP_TIMEOUT, qmp.query_status()).await;
+        match flatten(status, "QMP query-status") {
+            Ok(RunState::Other(s)) if s == "finish-migrate" => {}
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(%id, error = %e, "cannot query the migrated source");
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(%id, "migrated source is still in finish-migrate");
+            return;
+        }
+        tokio::time::sleep(POSTMIGRATE_POLL).await;
     }
 }
 
@@ -2114,6 +2141,8 @@ time.sleep(60)
         hangup: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
         /// `query-jobs`에 차례로 줄 답. 비면 `[]`이다.
         jobs: Arc<Mutex<std::collections::VecDeque<serde_json::Value>>>,
+        /// `query-status`에 차례로 줄 상태. 비면 `status`다.
+        statuses: Arc<Mutex<std::collections::VecDeque<&'static str>>>,
         /// 이 이름의 명령에는 오류로 답한다.
         failing: Arc<Mutex<Vec<&'static str>>>,
         /// `blockdev-add`로 연 NBD 노드(`blockdev-del`이 닫는다). 블록 노드 목록에 드러난다.
@@ -2141,6 +2170,8 @@ time.sleep(60)
         let arguments = args.clone();
         let jobs = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let job_replies = jobs.clone();
+        let statuses = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let status_replies = statuses.clone();
         let failing = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let fail = failing.clone();
         let nbd_nodes = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -2171,6 +2202,7 @@ time.sleep(60)
                 let name = cmd["execute"].as_str().unwrap_or_default().to_string();
                 let ret = match name.as_str() {
                     "query-status" => {
+                        let status = status_replies.lock().unwrap().pop_front().unwrap_or(status);
                         serde_json::json!({ "running": status == "running", "status": status })
                     }
                     "query-version" => serde_json::json!({
@@ -2252,6 +2284,7 @@ time.sleep(60)
             arguments: args,
             hangup,
             jobs,
+            statuses,
             failing,
             nbd_nodes,
         }
@@ -2434,6 +2467,36 @@ time.sleep(60)
             serde_json::json!({ "uri": "tcp:10.0.0.2:60005" })
         );
         assert!(at("migrate") < at("query-migrate"));
+    }
+
+    /// QEMU 8.2는 마이그레이션을 `completed`로 바꾼 뒤에 원본을 `finish-migrate`에서 `postmigrate`로
+    /// 바꾼다. `migrate`는 원본이 `postmigrate`가 된 뒤에 돌아온다.
+    #[tokio::test]
+    async fn migrate_returns_after_source_reaches_postmigrate() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "postmigrate").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        fake.statuses.lock().unwrap().extend([
+            "finish-migrate",
+            "finish-migrate",
+            "finish-migrate",
+        ]);
+        let opts = MigrateOptions {
+            bandwidth: None,
+            timeout: Duration::from_secs(10),
+            switchover_mirrors: false,
+        };
+        hv.migrate(vm.id, &target(), &opts).await.unwrap();
+
+        assert!(fake.statuses.lock().unwrap().is_empty());
+        let commands = fake.commands.lock().unwrap().clone();
+        let at = commands.iter().position(|c| c == "query-migrate").unwrap();
+        let queries = commands[at..].iter().filter(|c| *c == "query-status");
+        assert_eq!(queries.count(), 4, "commands: {commands:?}");
     }
 
     #[tokio::test]
