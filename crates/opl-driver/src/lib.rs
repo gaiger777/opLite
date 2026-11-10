@@ -17,8 +17,8 @@ pub use hypervisor::{
     RuntimeStatus, StopMode,
 };
 pub use migration::{
-    MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, migration_tls_dir, tcp_uri,
-    write_migration_tls,
+    IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
+    MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir, tcp_uri, write_migration_tls,
 };
 pub use mock::{IncrementalCall, MockHypervisor};
 pub use net::{HostNet, IpRoute, Overlay, OverlayChanges, Tap};

@@ -848,7 +848,7 @@ async fn received_ha_vm_is_continued_only_with_the_lease() {
         nics: vec![],
     };
     env.hv
-        .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099)
+        .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])
         .await
         .unwrap();
     env.hv.incoming_wait(vm.id).await.unwrap();
@@ -916,6 +916,7 @@ async fn ha_source_left_by_a_restart(env: &mut Env) -> (Vm, Option<u32>, Arc<Fak
     let opts = opl_driver::MigrateOptions {
         bandwidth: None,
         timeout: Duration::from_secs(60),
+        switchover_mirrors: false,
     };
     env.hv.migrate(vm.id, &target, &opts).await.unwrap();
     let renewer = Arc::new(FakeRenewer(Mutex::new(false)));

@@ -7,13 +7,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_qemu::{
-    BlockNode, HostProfile, MigrationInfo, MigrationParameters, MigrationState, QmpClient,
-    QmpError, QmpEvent, RunState, RuntimePaths, TlsEndpoint, TransactionAction, build_cmdline,
-    build_incoming_cmdline,
+    BlockNode, HostProfile, JobInfo, MigrationInfo, MigrationParameters, MigrationState,
+    NbdBlockdev, QmpClient, QmpError, QmpEvent, RunState, RuntimePaths, TlsEndpoint,
+    TransactionAction, build_cmdline, build_incoming_cmdline,
 };
 use opl_types::backup::BITMAP_PREFIX;
 use opl_types::network::tap_prefix;
-use opl_types::runtime::{NicBackend, VmRuntimeSpec};
+use opl_types::runtime::{ImageFormat, NicBackend, VmRuntimeSpec};
 use opl_types::vm::Firmware;
 use rustix::process::{Flock, FlockOffsetType, FlockType, Pid, Signal, fcntl_getlk, kill_process};
 use tokio::sync::broadcast;
@@ -27,8 +27,9 @@ use crate::hypervisor::{
     StopMode,
 };
 use crate::migration::{
-    MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, migration_tls_dir, parse_qemu_version,
-    pick_port, tcp_uri,
+    IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
+    MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir, parse_qemu_version, pick_port,
+    tcp_uri,
 };
 use crate::net::{HostNet, Tap};
 
@@ -67,6 +68,10 @@ const CANCEL_WAIT: Duration = Duration::from_secs(30);
 const BACKUP_JOB_PREFIX: &str = "opl-backup-";
 /// 증분 백업 작업 상태를 다시 묻는 간격(`JOB_STATUS_CHANGE` 이벤트를 놓쳐도 이만큼 뒤에 안다)
 const JOB_POLL: Duration = Duration::from_secs(1);
+/// 디스크 미러의 작업 id와 그 NBD 대상 노드 이름의 접두사(`opl-mirror-{i}`, i는 디스크 순서 번호)
+const MIRROR_JOB_PREFIX: &str = "opl-mirror-";
+/// 받는 쪽 NBD 내보내기 id의 접두사(`opl-export-{i}`)
+const EXPORT_PREFIX: &str = "opl-export-";
 
 /// VM별 상태 디렉터리 `{state_dir}/vm/{id}`. `state_dir`은 [`QemuConfig::state_dir`]이다.
 pub fn vm_state_dir(state_dir: &Path, id: Uuid) -> PathBuf {
@@ -179,6 +184,20 @@ impl QemuHypervisor {
             }
         }
         Ok(hv)
+    }
+
+    /// 실행 중인 VM에 HMP 명령 한 줄을 보내고 그 출력을 돌려준다(QMP `human-monitor-command`). 시험과
+    /// 진단용이다. 예: 게스트 OS 없이 디스크에 쓰는 `qemu-io -d /machine/peripheral/disk0-dev/virtio-backend
+    /// "write -P 0x44 0 1M"`
+    pub async fn human_monitor_command(&self, id: Uuid, line: &str) -> Result<String, DriverError> {
+        let handle = self.running_handle(id)?;
+        let args = serde_json::json!({ "command-line": line });
+        let hmp = handle.qmp.execute("human-monitor-command", Some(args));
+        let out = flatten(
+            tokio::time::timeout(QMP_TIMEOUT, hmp).await,
+            "QMP human-monitor-command",
+        )?;
+        Ok(out.as_str().unwrap_or_default().to_string())
     }
 
     fn paths(&self, id: Uuid) -> Result<RuntimePaths, DriverError> {
@@ -447,7 +466,8 @@ impl QemuHypervisor {
 
     /// 마이그레이션 TLS 자격 증명(`{state_dir}/migration-tls`)과 능력·매개변수를 정한다. 자격 증명
     /// 객체는 파일을 만들 때 읽으므로, 인증서가 바뀌었을 수 있어 매번 지우고 다시 만든다.
-    /// `dirty_bitmaps`면 dirty bitmap도 넘긴다.
+    /// `dirty_bitmaps`면 dirty bitmap도 넘긴다. `pause_before_switchover`면 스위치오버 직전에
+    /// `pre-switchover`로 기다린다(능력은 QEMU에 남으므로 늘 정한다).
     async fn setup_migration(
         &self,
         qmp: &QmpClient,
@@ -455,6 +475,7 @@ impl QemuHypervisor {
         tls_hostname: Option<&str>,
         bandwidth: Option<u64>,
         dirty_bitmaps: bool,
+        pause_before_switchover: bool,
     ) -> Result<(), DriverError> {
         // 처음이면 없어서 실패한다.
         let _ = tokio::time::timeout(QMP_TIMEOUT, qmp.object_del(MIGRATION_TLS_ID)).await;
@@ -469,6 +490,7 @@ impl QemuHypervisor {
             ("events", true),
             ("auto-converge", true),
             ("dirty-bitmaps", dirty_bitmaps),
+            ("pause-before-switchover", pause_before_switchover),
         ];
         let caps = qmp.migrate_set_capabilities(&caps);
         flatten(
@@ -487,32 +509,66 @@ impl QemuHypervisor {
         )
     }
 
-    /// 띄운 받는 QEMU에 마이그레이션 설정을 하고 빈 포트에서 받기 시작한다.
+    /// 띄운 받는 QEMU에 마이그레이션 설정을 하고, `exports`가 있으면 빈 포트에서 그 디스크들을 TLS
+    /// NBD로 내보낸 뒤, 다른 빈 포트에서 받기 시작한다.
     async fn listen_incoming(
         &self,
         id: Uuid,
         host: &str,
         ports: RangeInclusive<u16>,
-    ) -> Result<u16, DriverError> {
+        exports: &[usize],
+    ) -> Result<IncomingPorts, DriverError> {
         let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
         // 받는 쪽은 보내는 쪽이 넘긴 비트맵만 받는다.
-        self.setup_migration(&handle.qmp, TlsEndpoint::Server, None, None, true)
+        self.setup_migration(qmp, TlsEndpoint::Server, None, None, true, false)
             .await?;
-        let _ports = self.incoming_ports.lock().await;
-        let Some(port) = pick_port(host, ports.clone()) else {
-            return Err(DriverError::Migration(format!(
+        let no_port = || {
+            DriverError::Migration(format!(
                 "no free migration port in {}-{} on {host}",
                 ports.start(),
                 ports.end()
-            )));
+            ))
         };
+        let _ports = self.incoming_ports.lock().await;
+        let mut nbd = None;
+        if !exports.is_empty() {
+            let dir = migration_tls_dir(&self.config.state_dir);
+            let add = qmp.add_tls_creds(NBD_TLS_ID, &dir, TlsEndpoint::Server);
+            flatten(
+                tokio::time::timeout(QMP_TIMEOUT, add).await,
+                "QMP object-add",
+            )?;
+            let port = pick_port(host, ports.clone(), &[]).ok_or_else(no_port)?;
+            let start = qmp.nbd_server_start(host, port, NBD_TLS_ID);
+            flatten(
+                tokio::time::timeout(QMP_TIMEOUT, start).await,
+                "QMP nbd-server-start",
+            )?;
+            // `-incoming defer`로 연 이미지는 비활성이지만 내보내기가 그 노드를 활성화해 쓰기를 받는다.
+            for i in exports {
+                let (export, node) = (format!("{EXPORT_PREFIX}{i}"), format!("disk{i}"));
+                let add = qmp.block_export_add_nbd(&export, &node, &node);
+                flatten(
+                    tokio::time::timeout(QMP_TIMEOUT, add).await,
+                    "QMP block-export-add",
+                )?;
+            }
+            nbd = Some(port);
+        }
+        // NBD 서버가 연 포트는 열 수 없어 건너뛴다(가짜 QMP처럼 열지 않았어도 건너뛴다).
+        let except: Vec<u16> = nbd.into_iter().collect();
+        let port = pick_port(host, ports.clone(), &except).ok_or_else(no_port)?;
         let uri = tcp_uri(host, port);
-        let listen = handle.qmp.migrate_incoming(&uri);
+        let listen = qmp.migrate_incoming(&uri);
         flatten(
             tokio::time::timeout(QMP_TIMEOUT, listen).await,
             "QMP migrate-incoming",
         )?;
-        Ok(port)
+        Ok(IncomingPorts {
+            migration: port,
+            nbd,
+        })
     }
 
     async fn query_state(&self, id: Uuid) -> Result<Option<ActualState>, DriverError> {
@@ -914,7 +970,8 @@ impl Hypervisor for QemuHypervisor {
         task: Uuid,
         listen_host: &str,
         ports: RangeInclusive<u16>,
-    ) -> Result<u16, DriverError> {
+        exports: &[usize],
+    ) -> Result<IncomingPorts, DriverError> {
         let paths = self.paths(vm.id)?;
         if self.handle(vm.id).is_some() || liveness(&paths.pidfile) != Liveness::Dead {
             return Err(DriverError::Migration(format!(
@@ -930,8 +987,11 @@ impl Hypervisor for QemuHypervisor {
             }
             return Err(e);
         }
-        match self.listen_incoming(vm.id, listen_host, ports).await {
-            Ok(port) => Ok(port),
+        match self
+            .listen_incoming(vm.id, listen_host, ports, exports)
+            .await
+        {
+            Ok(ports) => Ok(ports),
             Err(e) => {
                 // QEMU 하나는 한 번만 받을 수 있으므로 버린다.
                 if let Err(stop) = self.stop(vm.id, StopMode::Force).await {
@@ -968,7 +1028,16 @@ impl Hypervisor for QemuHypervisor {
             return Ok(());
         }
         let status = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_status()).await;
-        match flatten(status, "QMP query-status")? {
+        let state = flatten(status, "QMP query-status")?;
+        if matches!(state, RunState::Paused | RunState::Running) {
+            // 디스크 내보내기를 닫는다. 내보낸 디스크가 없었으면 서버도 없어 QEMU 오류다.
+            let stop = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.nbd_server_stop()).await;
+            match flatten(stop, "QMP nbd-server-stop") {
+                Ok(()) | Err(DriverError::Qmp(QmpError::Command { .. })) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        match state {
             RunState::Paused => {
                 tracing::info!(%id, "continuing received VM");
                 let cont = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.cont()).await;
@@ -1019,46 +1088,113 @@ impl Hypervisor for QemuHypervisor {
         let handle = self.running_handle(id)?;
         let qmp = &handle.qmp;
         remove_inconsistent_bitmaps(qmp, id).await;
+        let mirrored = if opts.switchover_mirrors {
+            let mirrored = mirrored_disks(&query_jobs(qmp).await?);
+            if mirrored.is_empty() {
+                return Err(DriverError::Migration(
+                    "no disk mirrors to switch over".into(),
+                ));
+            }
+            mirrored
+        } else {
+            Vec::new()
+        };
         // qcow2의 persistent 비트맵은 공유 이미지로 넘어간다. 능력을 켜면 그것도 스트림으로 보내고,
         // 마이그레이션이 실패하면 원본 이미지에 in-use로 남아 다음 시작에 inconsistent가 된다.
-        let dirty_bitmaps = volatile_bitmaps(&query_disks(qmp).await?);
+        // 미러하는 디스크는 대상이 다른 이미지이므로 persistent 비트맵도 스트림으로 보낸다.
+        let dirty_bitmaps = migrated_bitmaps(&query_disks(qmp).await?, &mirrored);
         self.setup_migration(
             qmp,
             TlsEndpoint::Client,
             Some(&target.tls_hostname),
             opts.bandwidth,
             dirty_bitmaps,
+            opts.switchover_mirrors,
         )
         .await?;
         let uri = tcp_uri(&target.host, target.port);
-        tracing::info!(%id, %uri, "migrating VM");
+        tracing::info!(%id, %uri, mirrors = mirrored.len(), "migrating VM");
         flatten(
             tokio::time::timeout(QMP_TIMEOUT, qmp.migrate(&uri)).await,
             "QMP migrate",
         )?;
-        let info =
-            match tokio::time::timeout(opts.timeout, qmp.wait_migration(MIGRATION_POLL)).await {
-                Ok(r) => r?,
-                Err(_) => {
-                    tracing::warn!(%id, timeout = ?opts.timeout, "migration timed out; cancelling");
-                    let cancel = tokio::time::timeout(QMP_TIMEOUT, qmp.migrate_cancel()).await;
-                    flatten(cancel, "QMP migrate_cancel")?;
-                    let wait = qmp.wait_migration(MIGRATION_POLL);
-                    let info = flatten(
-                        tokio::time::timeout(CANCEL_WAIT, wait).await,
-                        "migration to cancel",
-                    )?;
-                    // 취소하는 사이에 끝났으면 그대로 성공이다.
-                    if info.state != MigrationState::Completed {
-                        return Err(DriverError::Migration(format!(
-                            "did not complete within {:?}; cancelled",
-                            opts.timeout
-                        )));
-                    }
-                    info
+        let deadline = tokio::time::Instant::now() + opts.timeout;
+        let switchover = |s: &MigrationState| {
+            s.is_finished() || (opts.switchover_mirrors && *s == MigrationState::PreSwitchover)
+        };
+        let mut info = wait_or_cancel(qmp, id, deadline, opts.timeout, switchover).await?;
+        if info.state == MigrationState::PreSwitchover {
+            // 게스트가 멈췄고 원본은 아직 블록 장치를 쥐고 있다. 미러를 끝내면 대상이 원본과 같다.
+            if let Err(e) = complete_mirrors(qmp, &mirrored).await {
+                tracing::warn!(%id, error = %e, "disk mirrors failed at switchover; cancelling");
+                cancel_and_wait(qmp).await?;
+                if let Err(clear) = clear_jobs(qmp, &[MIRROR_JOB_PREFIX]).await {
+                    tracing::warn!(%id, error = %clear, "cannot clear disk mirrors");
                 }
-            };
+                return Err(e);
+            }
+            let cont = tokio::time::timeout(QMP_TIMEOUT, qmp.migrate_continue()).await;
+            flatten(cont, "QMP migrate-continue")?;
+            info = wait_or_cancel(qmp, id, deadline, opts.timeout, MigrationState::is_finished)
+                .await?;
+        }
         migration_result(info)
+    }
+
+    async fn mirror_disks(
+        &self,
+        id: Uuid,
+        targets: &[MirrorTarget],
+        opts: &MirrorOptions,
+    ) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        // 앞선 마이그레이션이 남긴 미러와 그 NBD 노드(TLS 객체를 쥔다)를 먼저 치운다.
+        clear_jobs(qmp, &[MIRROR_JOB_PREFIX]).await?;
+        let disks = query_disks(qmp).await?;
+        for target in targets {
+            let Some(disk) = disks.get(target.disk) else {
+                return Err(DriverError::InvalidSpec(format!(
+                    "VM {id} has no disk{}",
+                    target.disk
+                )));
+            };
+            // raw 이미지는 비트맵을 담을 수 없어 qcow2의 persistent 비트맵은 대상에서 사라진다.
+            if disk.driver == "qcow2" && target.format == ImageFormat::Raw {
+                for bitmap in disk
+                    .bitmaps
+                    .iter()
+                    .filter(|b| b.name.starts_with(BITMAP_PREFIX))
+                {
+                    tracing::info!(%id, node = %disk.node_name, bitmap = %bitmap.name,
+                        "removing dirty bitmap of a disk moving to a raw image");
+                    let remove = qmp.block_dirty_bitmap_remove(&disk.node_name, &bitmap.name);
+                    flatten(
+                        tokio::time::timeout(QMP_TIMEOUT, remove).await,
+                        "QMP block-dirty-bitmap-remove",
+                    )?;
+                }
+            }
+        }
+        let _ = tokio::time::timeout(QMP_TIMEOUT, qmp.object_del(NBD_TLS_ID)).await;
+        let dir = migration_tls_dir(&self.config.state_dir);
+        let add = qmp.add_tls_creds(NBD_TLS_ID, &dir, TlsEndpoint::Client);
+        flatten(
+            tokio::time::timeout(QMP_TIMEOUT, add).await,
+            "QMP object-add",
+        )?;
+        let result = start_mirrors(qmp, targets, opts.speed).await;
+        let result = match result {
+            Ok(ids) => wait_mirrors_ready(qmp, &ids, opts).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &result {
+            tracing::warn!(%id, error = %e, "disk copy failed; clearing mirrors");
+            if let Err(clear) = clear_jobs(qmp, &[MIRROR_JOB_PREFIX]).await {
+                tracing::warn!(%id, error = %clear, "cannot clear disk mirrors");
+            }
+        }
+        result
     }
 
     async fn stop_migrated(&self, id: Uuid) -> Result<bool, DriverError> {
@@ -1087,18 +1223,12 @@ impl Hypervisor for QemuHypervisor {
         }
         let info = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_migrate()).await;
         let info = flatten(info, "QMP query-migrate")?;
-        if info.state == MigrationState::None || info.state.is_finished() {
-            return Ok(());
+        if info.state != MigrationState::None && !info.state.is_finished() {
+            tracing::warn!(%id, state = ?info.state, "cancelling an outgoing migration");
+            cancel_and_wait(&handle.qmp).await?;
         }
-        tracing::warn!(%id, state = ?info.state, "cancelling an outgoing migration");
-        let cancel = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.migrate_cancel()).await;
-        flatten(cancel, "QMP migrate_cancel")?;
-        let wait = handle.qmp.wait_migration(MIGRATION_POLL);
-        flatten(
-            tokio::time::timeout(CANCEL_WAIT, wait).await,
-            "migration to cancel",
-        )?;
-        Ok(())
+        // 마이그레이션을 멈춘 뒤 미러를 치운다(디스크 복사 중이거나 실패한 뒤 남은 것).
+        clear_jobs(&handle.qmp, &[MIRROR_JOB_PREFIX]).await
     }
 
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
@@ -1123,6 +1253,209 @@ fn migration_result(info: MigrationInfo) -> Result<(), DriverError> {
                 .unwrap_or_else(|| format!("migration ended as {state:?}")),
         )),
     }
+}
+
+/// 마이그레이션이 `until`인 상태가 되기를 `deadline`까지 기다린다. 넘으면 취소하고 실패다(취소하는
+/// 사이에 끝났으면 그대로 성공).
+async fn wait_or_cancel(
+    qmp: &QmpClient,
+    id: Uuid,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+    until: impl Fn(&MigrationState) -> bool,
+) -> Result<MigrationInfo, DriverError> {
+    let wait = qmp.wait_migration_until(MIGRATION_POLL, until);
+    match tokio::time::timeout_at(deadline, wait).await {
+        Ok(r) => Ok(r?),
+        Err(_) => {
+            tracing::warn!(%id, ?timeout, "migration timed out; cancelling");
+            let info = cancel_and_wait(qmp).await?;
+            if info.state != MigrationState::Completed {
+                return Err(DriverError::Migration(format!(
+                    "did not complete within {timeout:?}; cancelled"
+                )));
+            }
+            Ok(info)
+        }
+    }
+}
+
+/// 보내는 중인 마이그레이션을 취소하고 끝나기를 기다린다.
+async fn cancel_and_wait(qmp: &QmpClient) -> Result<MigrationInfo, DriverError> {
+    let cancel = tokio::time::timeout(QMP_TIMEOUT, qmp.migrate_cancel()).await;
+    flatten(cancel, "QMP migrate_cancel")?;
+    let wait = qmp.wait_migration(MIGRATION_POLL);
+    flatten(
+        tokio::time::timeout(CANCEL_WAIT, wait).await,
+        "migration to cancel",
+    )
+}
+
+async fn query_jobs(qmp: &QmpClient) -> Result<Vec<JobInfo>, DriverError> {
+    flatten(
+        tokio::time::timeout(QMP_TIMEOUT, qmp.query_jobs()).await,
+        "QMP query-jobs",
+    )
+}
+
+/// 미러 작업(`opl-mirror-{i}`)이 있는 디스크 순서 번호
+fn mirrored_disks(jobs: &[JobInfo]) -> Vec<usize> {
+    let mut disks: Vec<usize> = jobs
+        .iter()
+        .filter_map(|j| j.id.strip_prefix(MIRROR_JOB_PREFIX)?.parse().ok())
+        .collect();
+    disks.sort();
+    disks
+}
+
+/// 마이그레이션에 능력 `dirty-bitmaps`가 필요한지: 이미지에 저장되지 않는 `opl-` 비트맵이 있거나, 미러하는
+/// 디스크(`mirrored`, 대상이 다른 이미지다)에 `opl-` 비트맵이 있다.
+fn migrated_bitmaps(disks: &[BlockNode], mirrored: &[usize]) -> bool {
+    volatile_bitmaps(disks)
+        || disks.iter().any(|d| {
+            disk_index(&d.node_name).is_some_and(|i| mirrored.contains(&i))
+                && d.bitmaps.iter().any(|b| b.name.starts_with(BITMAP_PREFIX))
+        })
+}
+
+/// 미러 작업이 실패했다는 오류
+fn mirror_failed(job: &JobInfo) -> DriverError {
+    DriverError::Migration(format!(
+        "disk mirror {} failed: {}",
+        job.id,
+        job.error.as_deref().unwrap_or("it ended early")
+    ))
+}
+
+/// 디스크마다 대상 NBD 노드를 열고 미러 작업을 시작한다. 시작한 작업 id(= 노드 이름)를 돌려준다.
+async fn start_mirrors(
+    qmp: &QmpClient,
+    targets: &[MirrorTarget],
+    speed: Option<u64>,
+) -> Result<Vec<String>, DriverError> {
+    let mut ids = Vec::new();
+    for target in targets {
+        let node = format!("{MIRROR_JOB_PREFIX}{}", target.disk);
+        let nbd = NbdBlockdev {
+            node_name: node.clone(),
+            host: target.host.clone(),
+            port: target.port,
+            export: target.export.clone(),
+            tls_creds: NBD_TLS_ID.into(),
+            tls_hostname: target.tls_hostname.clone(),
+        };
+        let add = tokio::time::timeout(QMP_TIMEOUT, qmp.blockdev_add_nbd(&nbd)).await;
+        flatten(add, "QMP blockdev-add")?;
+        let device = format!("disk{}", target.disk);
+        let mirror = qmp.blockdev_mirror(&node, &device, &node, speed);
+        flatten(
+            tokio::time::timeout(QMP_TIMEOUT, mirror).await,
+            "QMP blockdev-mirror",
+        )?;
+        ids.push(node);
+    }
+    Ok(ids)
+}
+
+/// 미러 작업 `ids`가 모두 `ready`가 되기를 기다리며 진행을 알린다. 작업이 끝났거나(오류) 사라졌거나,
+/// 시간 제한을 넘었거나, 정체하면 실패다(작업은 호출자가 치운다).
+async fn wait_mirrors_ready(
+    qmp: &QmpClient,
+    ids: &[String],
+    opts: &MirrorOptions,
+) -> Result<(), DriverError> {
+    let started = tokio::time::Instant::now();
+    let (mut most, mut moved) = (0, started);
+    // 조회와 이벤트 사이에 바뀌어도 놓치지 않게 먼저 구독한다.
+    let mut events = qmp.subscribe();
+    loop {
+        let jobs = query_jobs(qmp).await?;
+        let mut progress = MirrorProgress::default();
+        let mut ready = true;
+        for id in ids {
+            let job = match jobs.iter().find(|j| &j.id == id) {
+                Some(job) if job.is_concluded() => return Err(mirror_failed(job)),
+                Some(job) => job,
+                None => {
+                    return Err(DriverError::Migration(format!(
+                        "disk mirror {id} disappeared"
+                    )));
+                }
+            };
+            progress.done_bytes += job.current_progress;
+            progress.total_bytes += job.total_progress;
+            ready &= job.is_ready();
+        }
+        if let Some(tx) = &opts.progress {
+            tx.send_if_modified(|p| std::mem::replace(p, progress) != progress);
+        }
+        if ready {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if progress.done_bytes > most {
+            (most, moved) = (progress.done_bytes, now);
+        } else if now - moved >= opts.stall {
+            return Err(DriverError::Migration(format!(
+                "disk copy made no progress for {}",
+                format_duration(opts.stall)
+            )));
+        }
+        if now - started >= opts.timeout {
+            return Err(DriverError::Migration(format!(
+                "disk copy did not finish within {}",
+                format_duration(opts.timeout)
+            )));
+        }
+        tokio::select! {
+            ev = events.recv() => {
+                if let Err(RecvError::Closed) = ev {
+                    return Err(QmpError::Disconnected.into());
+                }
+            }
+            _ = tokio::time::sleep(JOB_POLL) => {}
+        }
+    }
+}
+
+/// 스위치오버 직전(게스트가 멈춤)에 디스크 `mirrored`의 ready 미러를 끝낸다: 이 시점까지 맞춘 뒤 오류
+/// 없이 끝나기를 기다리고 작업과 대상 노드를 지운다. 미러가 이미 끝났거나(오류) 오류로 끝나면 실패다.
+async fn complete_mirrors(qmp: &QmpClient, mirrored: &[usize]) -> Result<(), DriverError> {
+    let ids: Vec<String> = mirrored
+        .iter()
+        .map(|i| format!("{MIRROR_JOB_PREFIX}{i}"))
+        .collect();
+    let jobs = query_jobs(qmp).await?;
+    for id in &ids {
+        match jobs.iter().find(|j| &j.id == id) {
+            Some(job) if job.is_concluded() => return Err(mirror_failed(job)),
+            Some(_) => {}
+            None => {
+                return Err(DriverError::Migration(format!(
+                    "disk mirror {id} disappeared"
+                )));
+            }
+        }
+        let cancel = tokio::time::timeout(QMP_TIMEOUT, qmp.block_job_cancel(id, false)).await;
+        flatten(cancel, "QMP block-job-cancel")?;
+    }
+    let limit = CANCEL_WAIT * ids.len() as u32;
+    let failed = match tokio::time::timeout(limit, wait_jobs(qmp, &ids)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(DriverError::Timeout("disk mirrors to complete")),
+    };
+    if let Some((id, error)) = failed {
+        return Err(DriverError::Migration(format!(
+            "disk mirror {id} failed: {error}"
+        )));
+    }
+    for id in &ids {
+        let dismiss = tokio::time::timeout(QMP_TIMEOUT, qmp.job_dismiss(id)).await;
+        flatten(dismiss, "QMP job-dismiss")?;
+        let del = tokio::time::timeout(QMP_TIMEOUT, qmp.blockdev_del(id)).await;
+        flatten(del, "QMP blockdev-del")?;
+    }
+    Ok(())
 }
 
 /// 실행 중인 VM의 디스크 노드 이름(`disk{i}`)을 디스크 순서로 읽는다. 다시 붙은 VM은 스펙을
@@ -1318,30 +1651,43 @@ async fn wait_jobs(
     }
 }
 
-/// 앞선 증분 백업이 남긴 작업과 대상 노드(opld가 기다리다 죽었다)를 치운다. 아직 도는 작업은 취소하고
-/// [`CANCEL_WAIT`]까지 끝나기를 기다린다(넘으면 오류 — 스냅샷이 영원히 막히지 않게).
+/// 앞선 증분 백업이 남긴 작업과 대상 노드(opld가 기다리다 죽었다)와 남은 디스크 미러를 치운다.
 async fn clear_backup_leftovers(qmp: &QmpClient) -> Result<(), DriverError> {
-    let jobs = tokio::time::timeout(QMP_TIMEOUT, qmp.query_jobs()).await;
-    let jobs = flatten(jobs, "QMP query-jobs")?;
+    clear_jobs(qmp, &[BACKUP_JOB_PREFIX, MIRROR_JOB_PREFIX]).await
+}
+
+/// 이름이 `prefixes` 중 하나로 시작하는 작업과 블록 노드(증분 백업 `opl-backup-*`, 디스크 미러
+/// `opl-mirror-*`)를 치운다. 아직 도는 작업은 취소하고(미러는 ready여도 맞추지 않고 `force`)
+/// [`CANCEL_WAIT`]까지 끝나기를 기다린다(넘으면 오류 — 스냅샷이 영원히 막히지 않게).
+async fn clear_jobs(qmp: &QmpClient, prefixes: &[&str]) -> Result<(), DriverError> {
+    let ours = |name: &str| prefixes.iter().any(|p| name.starts_with(p));
+    let jobs = query_jobs(qmp).await?;
     let left: Vec<String> = jobs
         .iter()
-        .filter(|j| j.id.starts_with(BACKUP_JOB_PREFIX))
+        .filter(|j| ours(&j.id))
         .map(|j| j.id.clone())
         .collect();
     if !left.is_empty() {
-        tracing::warn!(jobs = ?left, "clearing backup jobs left by an earlier backup");
+        tracing::warn!(jobs = ?left, "clearing jobs left by an earlier backup or migration");
         for job in jobs
             .iter()
             .filter(|j| left.contains(&j.id) && !j.is_concluded())
         {
             // 그 사이에 끝난 작업은 취소하지 못한다. 끝났는지는 아래에서 기다려 안다.
-            let cancel = tokio::time::timeout(QMP_TIMEOUT, qmp.job_cancel(&job.id)).await;
+            let cancel = if job.id.starts_with(MIRROR_JOB_PREFIX) {
+                tokio::time::timeout(QMP_TIMEOUT, qmp.block_job_cancel(&job.id, true)).await
+            } else {
+                tokio::time::timeout(QMP_TIMEOUT, qmp.job_cancel(&job.id)).await
+            };
             if let Err(e) = flatten(cancel, "QMP job-cancel") {
-                tracing::warn!(job = %job.id, error = %e, "cannot cancel backup job");
+                tracing::warn!(job = %job.id, error = %e, "cannot cancel job");
             }
         }
         match tokio::time::timeout(CANCEL_WAIT, wait_jobs(qmp, &left)).await {
             Ok(r) => r?,
+            Err(_) if left.iter().any(|j| j.starts_with(MIRROR_JOB_PREFIX)) => {
+                return Err(DriverError::Timeout("cancelled disk mirrors to stop"));
+            }
             Err(_) => return Err(DriverError::Timeout("cancelled backup jobs to stop")),
         };
         for id in &left {
@@ -1351,7 +1697,7 @@ async fn clear_backup_leftovers(qmp: &QmpClient) -> Result<(), DriverError> {
     }
     let nodes = tokio::time::timeout(QMP_TIMEOUT, qmp.query_block_nodes()).await;
     for node in flatten(nodes, "QMP query-named-block-nodes")? {
-        if node.node_name.starts_with(BACKUP_JOB_PREFIX) {
+        if ours(&node.node_name) {
             let del = tokio::time::timeout(QMP_TIMEOUT, qmp.blockdev_del(&node.node_name)).await;
             flatten(del, "QMP blockdev-del")?;
         }
@@ -1770,6 +2116,8 @@ time.sleep(60)
         jobs: Arc<Mutex<std::collections::VecDeque<serde_json::Value>>>,
         /// 이 이름의 명령에는 오류로 답한다.
         failing: Arc<Mutex<Vec<&'static str>>>,
+        /// `blockdev-add`로 연 NBD 노드(`blockdev-del`이 닫는다). 블록 노드 목록에 드러난다.
+        nbd_nodes: Arc<Mutex<Vec<String>>>,
     }
 
     /// QEMU 대신 QMP 소켓을 여는 가짜 서버. greeting과 capabilities 협상까지 처리하고,
@@ -1779,7 +2127,7 @@ time.sleep(60)
     }
 
     /// [`fake_qmp`]에 더해 `query-migrate`에 `migration` 상태로 답한다(`failed`면 `error-desc`도).
-    /// `migrate_cancel`을 받은 뒤에는 `cancelled`로 답한다.
+    /// `migrate_cancel`을 받은 뒤에는 `cancelled`로, `migrate-continue`를 받은 뒤에는 `completed`로 답한다.
     async fn fake_qmp_with(dir: &Path, status: &'static str, migration: &'static str) -> FakeQmp {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -1795,6 +2143,8 @@ time.sleep(60)
         let job_replies = jobs.clone();
         let failing = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let fail = failing.clone();
+        let nbd_nodes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let nbd = nbd_nodes.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
@@ -1830,24 +2180,45 @@ time.sleep(60)
                         migration = "cancelled";
                         serde_json::json!({})
                     }
+                    "migrate-continue" => {
+                        migration = "completed";
+                        serde_json::json!({})
+                    }
+                    "blockdev-add" if cmd["arguments"]["driver"] == "nbd" => {
+                        let node = cmd["arguments"]["node-name"].as_str().unwrap();
+                        nbd.lock().unwrap().push(node.to_string());
+                        serde_json::json!({})
+                    }
+                    "blockdev-del" => {
+                        let node = cmd["arguments"]["node-name"].as_str().unwrap();
+                        nbd.lock().unwrap().retain(|n| n != node);
+                        serde_json::json!({})
+                    }
                     "query-migrate" if migration == "failed" => serde_json::json!({
                         "status": "failed", "error-desc": "Connection refused"
                     }),
                     "query-migrate" => serde_json::json!({ "status": migration }),
-                    // 디스크 두 개(qcow2, raw)를 가진 VM의 블록 노드와 비트맵
-                    "query-named-block-nodes" => serde_json::json!([
-                        { "node-name": "disk1", "drv": "raw", "dirty-bitmaps": [
-                            { "name": "opl-a", "recording": true, "persistent": false },
-                        ] },
-                        { "node-name": "disk1-file", "drv": "file" },
-                        { "node-name": "disk0", "drv": "qcow2", "dirty-bitmaps": [
-                            { "name": "user", "recording": true, "persistent": true },
-                            { "name": "opl-a", "recording": true, "persistent": true },
-                            { "name": "opl-old", "recording": true, "persistent": true,
-                              "inconsistent": true },
-                        ] },
-                        { "node-name": "disk0-file", "drv": "file" },
-                    ]),
+                    // 디스크 두 개(qcow2, raw)를 가진 VM의 블록 노드와 비트맵, 연 NBD 노드
+                    "query-named-block-nodes" => {
+                        let mut nodes = serde_json::json!([
+                            { "node-name": "disk1", "drv": "raw", "dirty-bitmaps": [
+                                { "name": "opl-a", "recording": true, "persistent": false },
+                            ] },
+                            { "node-name": "disk1-file", "drv": "file" },
+                            { "node-name": "disk0", "drv": "qcow2", "dirty-bitmaps": [
+                                { "name": "user", "recording": true, "persistent": true },
+                                { "name": "opl-a", "recording": true, "persistent": true },
+                                { "name": "opl-old", "recording": true, "persistent": true,
+                                  "inconsistent": true },
+                            ] },
+                            { "node-name": "disk0-file", "drv": "file" },
+                        ]);
+                        for node in nbd.lock().unwrap().iter() {
+                            let node = serde_json::json!({ "node-name": node, "drv": "nbd" });
+                            nodes.as_array_mut().unwrap().push(node);
+                        }
+                        nodes
+                    }
                     "query-jobs" => job_replies
                         .lock()
                         .unwrap()
@@ -1882,6 +2253,7 @@ time.sleep(60)
             hangup,
             jobs,
             failing,
+            nbd_nodes,
         }
     }
 
@@ -2014,6 +2386,7 @@ time.sleep(60)
         let opts = MigrateOptions {
             bandwidth: Some(64 << 20),
             timeout: Duration::from_secs(10),
+            switchover_mirrors: false,
         };
         hv.migrate(vm.id, &target(), &opts).await.unwrap();
 
@@ -2034,12 +2407,14 @@ time.sleep(60)
         );
         // raw 디스크(disk1)의 비트맵은 이미지에 없으므로 마이그레이션으로 넘긴다. 쓸 수 없는
         // inconsistent 비트맵(disk0의 opl-old)은 보내기 전에 지운다(남으면 마이그레이션이 실패한다).
+        // 미러가 없으면 스위치오버 전에 멈추지 않는다(능력은 QEMU에 남으므로 늘 끈다).
         assert_eq!(
             arguments[at("migrate-set-capabilities")]["capabilities"],
             serde_json::json!([
                 { "capability": "events", "state": true },
                 { "capability": "auto-converge", "state": true },
-                { "capability": "dirty-bitmaps", "state": true }
+                { "capability": "dirty-bitmaps", "state": true },
+                { "capability": "pause-before-switchover", "state": false }
             ])
         );
         assert_eq!(
@@ -2073,6 +2448,7 @@ time.sleep(60)
         let opts = MigrateOptions {
             bandwidth: None,
             timeout: Duration::from_secs(10),
+            switchover_mirrors: false,
         };
         match hv.migrate(vm.id, &target(), &opts).await.unwrap_err() {
             DriverError::Migration(msg) => assert_eq!(msg, "Connection refused"),
@@ -2093,6 +2469,7 @@ time.sleep(60)
         let opts = MigrateOptions {
             bandwidth: None,
             timeout: Duration::from_millis(200),
+            switchover_mirrors: false,
         };
         let err = hv.migrate(vm.id, &target(), &opts).await.unwrap_err();
         assert!(
@@ -2148,6 +2525,501 @@ time.sleep(60)
         }
     }
 
+    fn mirror_job(id: &str, status: &str, current: u64, error: Option<&str>) -> serde_json::Value {
+        let mut job = serde_json::json!({
+            "id": id, "type": "mirror", "status": status,
+            "current-progress": current, "total-progress": 100
+        });
+        if let Some(error) = error {
+            job["error"] = error.into();
+        }
+        job
+    }
+
+    fn mirror_targets() -> Vec<MirrorTarget> {
+        [(0, ImageFormat::Raw), (1, ImageFormat::Raw)]
+            .map(|(disk, format)| MirrorTarget {
+                disk,
+                host: "10.0.0.2".into(),
+                port: 60007,
+                export: format!("disk{disk}"),
+                tls_hostname: "node-b".into(),
+                format,
+            })
+            .to_vec()
+    }
+
+    fn mirror_opts(
+        timeout: Duration,
+        stall: Duration,
+    ) -> (MirrorOptions, tokio::sync::watch::Receiver<MirrorProgress>) {
+        let (tx, rx) = tokio::sync::watch::channel(MirrorProgress::default());
+        let opts = MirrorOptions {
+            speed: Some(32 << 20),
+            timeout,
+            stall,
+            progress: Some(tx),
+        };
+        (opts, rx)
+    }
+
+    /// 보내는 쪽 복사: 남은 미러 확인 → qcow2를 raw로 옮기는 디스크의 비트맵 지우기 → NBD TLS 객체
+    /// (client) → 디스크마다 TLS NBD 노드와 미러 → 모두 ready. 진행은 미러들의 합이다.
+    #[tokio::test]
+    async fn mirror_disks_starts_one_mirror_per_disk_and_waits_until_ready() {
+        let tmp = short_tempdir();
+        let state_dir = config(tmp.path(), PathBuf::new()).state_dir;
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                mirror_job("opl-mirror-0", "running", 40, None),
+                mirror_job("opl-mirror-1", "ready", 100, None)
+            ]),
+            serde_json::json!([
+                mirror_job("opl-mirror-0", "ready", 100, None),
+                mirror_job("opl-mirror-1", "ready", 100, None)
+            ]),
+        ]);
+        let (opts, rx) = mirror_opts(Duration::from_secs(30), Duration::from_secs(30));
+        hv.mirror_disks(id, &mirror_targets(), &opts).await.unwrap();
+        assert_eq!(
+            *rx.borrow(),
+            MirrorProgress {
+                done_bytes: 200,
+                total_bytes: 200
+            }
+        );
+
+        let sent = sent(
+            &fake,
+            &[
+                "block-dirty-bitmap-remove",
+                "object-del",
+                "object-add",
+                "blockdev-add",
+                "blockdev-mirror",
+            ],
+        );
+        let names: Vec<&str> = sent.iter().map(|(c, _)| c.as_str()).collect();
+        // disk0(qcow2 → raw)의 opl- 비트맵만 지운다. disk1은 raw라 비트맵이 이미지에 없다(스트림으로 간다).
+        assert_eq!(
+            names,
+            [
+                "block-dirty-bitmap-remove",
+                "block-dirty-bitmap-remove",
+                "object-del",
+                "object-add",
+                "blockdev-add",
+                "blockdev-mirror",
+                "blockdev-add",
+                "blockdev-mirror"
+            ]
+        );
+        assert_eq!(
+            sent[0].1,
+            serde_json::json!({ "node": "disk0", "name": "opl-a" })
+        );
+        assert_eq!(
+            sent[1].1,
+            serde_json::json!({ "node": "disk0", "name": "opl-old" })
+        );
+        assert_eq!(sent[2].1, serde_json::json!({ "id": "opl-nbd-tls" }));
+        assert_eq!(sent[3].1["id"], "opl-nbd-tls");
+        assert_eq!(sent[3].1["endpoint"], "client");
+        assert_eq!(sent[3].1["verify-peer"], true);
+        assert_eq!(
+            sent[3].1["dir"],
+            state_dir.join("migration-tls").display().to_string()
+        );
+        assert_eq!(
+            sent[6].1,
+            serde_json::json!({
+                "driver": "nbd", "node-name": "opl-mirror-1",
+                "server": { "type": "inet", "host": "10.0.0.2", "port": "60007" },
+                "export": "disk1", "tls-creds": "opl-nbd-tls", "tls-hostname": "node-b"
+            })
+        );
+        assert_eq!(
+            sent[7].1,
+            serde_json::json!({
+                "job-id": "opl-mirror-1", "device": "disk1", "target": "opl-mirror-1",
+                "sync": "full", "copy-mode": "background", "auto-dismiss": false,
+                "speed": 32u64 << 20
+            })
+        );
+        // 미러는 스위치오버까지 남는다.
+        assert!(
+            !fake
+                .commands
+                .lock()
+                .unwrap()
+                .contains(&"block-job-cancel".to_string())
+        );
+        assert_eq!(
+            *fake.nbd_nodes.lock().unwrap(),
+            ["opl-mirror-0", "opl-mirror-1"]
+        );
+    }
+
+    /// 미러가 실패하거나, 정체하거나, 시간을 넘기면 미러를 모두 치우고 실패한다.
+    #[tokio::test]
+    async fn failed_stalled_or_slow_disk_copy_clears_the_mirrors() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let running = |current| mirror_job("opl-mirror-0", "running", current, None);
+        let canceled = || {
+            serde_json::json!([mirror_job(
+                "opl-mirror-0",
+                "concluded",
+                0,
+                Some("Operation canceled")
+            )])
+        };
+        let targets = &mirror_targets()[..1];
+        let cases = [
+            // 작업 오류(대상 노드가 사라짐)
+            (
+                vec![
+                    serde_json::json!([]),
+                    serde_json::json!([mirror_job(
+                        "opl-mirror-0",
+                        "concluded",
+                        10,
+                        Some("Connection reset by peer")
+                    )]),
+                    serde_json::json!([mirror_job(
+                        "opl-mirror-0",
+                        "concluded",
+                        10,
+                        Some("Connection reset by peer")
+                    )]),
+                    serde_json::json!([mirror_job(
+                        "opl-mirror-0",
+                        "concluded",
+                        10,
+                        Some("Connection reset by peer")
+                    )]),
+                ],
+                (Duration::from_secs(30), Duration::from_secs(30)),
+                "migration failed: disk mirror opl-mirror-0 failed: Connection reset by peer",
+            ),
+            // 복사량이 늘지 않음
+            (
+                vec![
+                    serde_json::json!([]),
+                    serde_json::json!([running(5)]),
+                    serde_json::json!([running(5)]),
+                    serde_json::json!([running(5)]),
+                    canceled(),
+                ],
+                (Duration::from_secs(30), Duration::from_millis(300)),
+                "migration failed: disk copy made no progress for 300ms",
+            ),
+            // 늘지만 시간 안에 끝나지 않음
+            (
+                vec![
+                    serde_json::json!([]),
+                    serde_json::json!([running(5)]),
+                    serde_json::json!([running(6)]),
+                    serde_json::json!([running(7)]),
+                    canceled(),
+                ],
+                (Duration::from_millis(300), Duration::from_secs(30)),
+                "migration failed: disk copy did not finish within 300ms",
+            ),
+        ];
+        for (replies, (timeout, stall), message) in cases {
+            fake.jobs.lock().unwrap().extend(replies);
+            fake.commands.lock().unwrap().clear();
+            fake.arguments.lock().unwrap().clear();
+            let (opts, _rx) = mirror_opts(timeout, stall);
+            let err = hv.mirror_disks(id, targets, &opts).await.unwrap_err();
+            assert_eq!(err.to_string(), message);
+            assert!(!err.is_transient());
+            assert!(fake.jobs.lock().unwrap().is_empty(), "{message}");
+            let sent = sent(&fake, &["block-job-cancel", "job-dismiss", "blockdev-del"]);
+            let names: Vec<&str> = sent.iter().map(|(c, _)| c.as_str()).collect();
+            if message.contains("Connection reset") {
+                // 이미 끝난 작업은 취소하지 않고 지운다.
+                assert_eq!(names, ["job-dismiss", "blockdev-del"]);
+            } else {
+                assert_eq!(names, ["block-job-cancel", "job-dismiss", "blockdev-del"]);
+                assert_eq!(
+                    sent[0].1,
+                    serde_json::json!({ "device": "opl-mirror-0", "force": true })
+                );
+            }
+            assert_eq!(
+                sent.last().unwrap().1,
+                serde_json::json!({ "node-name": "opl-mirror-0" })
+            );
+            assert!(fake.nbd_nodes.lock().unwrap().is_empty());
+        }
+    }
+
+    /// 스위치오버: `pause-before-switchover`로 보내고, `pre-switchover`에서 ready 미러를 맞춰 끝낸 뒤
+    /// 지우고 이어 간다.
+    #[tokio::test]
+    async fn migrate_completes_mirrors_at_pre_switchover() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp_with(&dir, "running", "pre-switchover").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let ready = serde_json::json!([
+            mirror_job("opl-mirror-0", "ready", 100, None),
+            mirror_job("opl-mirror-1", "ready", 100, None)
+        ]);
+        fake.jobs.lock().unwrap().extend([
+            ready.clone(),
+            ready,
+            serde_json::json!([
+                mirror_job("opl-mirror-0", "concluded", 100, None),
+                mirror_job("opl-mirror-1", "concluded", 100, None)
+            ]),
+        ]);
+        let opts = MigrateOptions {
+            bandwidth: None,
+            timeout: Duration::from_secs(10),
+            switchover_mirrors: true,
+        };
+        hv.migrate(vm.id, &target(), &opts).await.unwrap();
+
+        let sent = sent(
+            &fake,
+            &[
+                "migrate-set-capabilities",
+                "migrate",
+                "block-job-cancel",
+                "job-dismiss",
+                "blockdev-del",
+                "migrate-continue",
+                "migrate_cancel",
+            ],
+        );
+        let names: Vec<&str> = sent.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "migrate-set-capabilities",
+                "migrate",
+                "block-job-cancel",
+                "block-job-cancel",
+                "job-dismiss",
+                "blockdev-del",
+                "job-dismiss",
+                "blockdev-del",
+                "migrate-continue"
+            ]
+        );
+        assert_eq!(
+            sent[0].1["capabilities"],
+            serde_json::json!([
+                { "capability": "events", "state": true },
+                { "capability": "auto-converge", "state": true },
+                { "capability": "dirty-bitmaps", "state": true },
+                { "capability": "pause-before-switchover", "state": true }
+            ])
+        );
+        // 게스트가 멈춘 때이므로 맞춰 끝낸다(force가 아니다).
+        assert_eq!(
+            sent[2].1,
+            serde_json::json!({ "device": "opl-mirror-0", "force": false })
+        );
+        assert_eq!(sent[6].1, serde_json::json!({ "id": "opl-mirror-1" }));
+        assert_eq!(
+            sent[7].1,
+            serde_json::json!({ "node-name": "opl-mirror-1" })
+        );
+        assert_eq!(sent[8].1, serde_json::json!({ "state": "pre-switchover" }));
+    }
+
+    /// 스위치오버에서 미러가 오류로 끝나면 마이그레이션을 취소하고 미러를 치운 뒤 실패한다. 미러가 없으면
+    /// 보내지 않는다.
+    #[tokio::test]
+    async fn mirror_error_at_switchover_cancels_the_migration() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp_with(&dir, "running", "pre-switchover").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let opts = MigrateOptions {
+            bandwidth: None,
+            timeout: Duration::from_secs(10),
+            switchover_mirrors: true,
+        };
+        let err = hv.migrate(vm.id, &target(), &opts).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "migration failed: no disk mirrors to switch over"
+        );
+        assert!(
+            !fake
+                .commands
+                .lock()
+                .unwrap()
+                .contains(&"migrate".to_string())
+        );
+
+        let ready = serde_json::json!([
+            mirror_job("opl-mirror-0", "ready", 100, None),
+            mirror_job("opl-mirror-1", "ready", 100, None)
+        ]);
+        let ended = serde_json::json!([
+            mirror_job("opl-mirror-0", "concluded", 100, None),
+            mirror_job("opl-mirror-1", "concluded", 90, Some("Input/output error"))
+        ]);
+        fake.jobs.lock().unwrap().extend([
+            ready.clone(),
+            ready,
+            ended.clone(),
+            ended.clone(),
+            ended,
+        ]);
+        let err = hv.migrate(vm.id, &target(), &opts).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "migration failed: disk mirror opl-mirror-1 failed: Input/output error"
+        );
+        let commands = fake.commands.lock().unwrap().clone();
+        let at = |name: &str| commands.iter().position(|c| c == name).unwrap();
+        assert!(at("block-job-cancel") < at("migrate_cancel"));
+        assert!(at("migrate_cancel") < at("job-dismiss"));
+        assert!(!commands.contains(&"migrate-continue".to_string()));
+        assert!(fake.jobs.lock().unwrap().is_empty());
+    }
+
+    /// 되돌리기는 보내는 중이 아니어도 남은 미러를 force로 취소하고 치운다. 증분 백업 전의 정리도 미러를
+    /// 치운다.
+    #[tokio::test]
+    async fn cancel_migration_and_backup_cleanup_clear_left_mirrors() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        for clear_backup in [false, true] {
+            fake.nbd_nodes.lock().unwrap().push("opl-mirror-1".into());
+            fake.commands.lock().unwrap().clear();
+            fake.arguments.lock().unwrap().clear();
+            fake.jobs.lock().unwrap().extend([
+                serde_json::json!([mirror_job("opl-mirror-1", "ready", 100, None)]),
+                serde_json::json!([mirror_job(
+                    "opl-mirror-1",
+                    "concluded",
+                    100,
+                    Some("Operation canceled")
+                )]),
+            ]);
+            if clear_backup {
+                hv.clear_backup_leftovers(id).await.unwrap();
+            } else {
+                hv.cancel_migration(id).await.unwrap();
+            }
+            let sent = sent(
+                &fake,
+                &[
+                    "migrate_cancel",
+                    "block-job-cancel",
+                    "job-dismiss",
+                    "blockdev-del",
+                ],
+            );
+            assert_eq!(
+                sent,
+                [
+                    (
+                        "block-job-cancel".to_string(),
+                        serde_json::json!({ "device": "opl-mirror-1", "force": true })
+                    ),
+                    (
+                        "job-dismiss".to_string(),
+                        serde_json::json!({ "id": "opl-mirror-1" })
+                    ),
+                    (
+                        "blockdev-del".to_string(),
+                        serde_json::json!({ "node-name": "opl-mirror-1" })
+                    ),
+                ]
+            );
+        }
+    }
+
+    /// 받는 쪽: 내보낼 디스크가 있으면 TLS NBD 서버(받는 쪽 객체, 상대 확인)와 디스크마다 쓰기 가능
+    /// 내보내기를 먼저 열고, 그 포트를 뺀 다른 포트에서 받는다.
+    #[tokio::test]
+    async fn incoming_exports_disks_on_a_second_port() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first = free.local_addr().unwrap().port();
+        drop(free);
+        let ports = hv
+            .listen_incoming(id, "127.0.0.1", first..=first.saturating_add(50), &[0, 1])
+            .await
+            .unwrap();
+        let nbd = ports.nbd.unwrap();
+        assert_ne!(ports.migration, nbd);
+
+        let sent = sent(
+            &fake,
+            &[
+                "migrate-set-capabilities",
+                "object-add",
+                "nbd-server-start",
+                "block-export-add",
+                "migrate-incoming",
+            ],
+        );
+        let names: Vec<&str> = sent.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "object-add",
+                "migrate-set-capabilities",
+                "object-add",
+                "nbd-server-start",
+                "block-export-add",
+                "block-export-add",
+                "migrate-incoming"
+            ]
+        );
+        assert_eq!(sent[2].1["id"], "opl-nbd-tls");
+        assert_eq!(sent[2].1["endpoint"], "server");
+        assert_eq!(sent[2].1["verify-peer"], true);
+        assert_eq!(
+            sent[3].1,
+            serde_json::json!({
+                "addr": { "type": "inet", "data": { "host": "127.0.0.1", "port": nbd.to_string() } },
+                "tls-creds": "opl-nbd-tls"
+            })
+        );
+        assert_eq!(
+            sent[5].1,
+            serde_json::json!({
+                "type": "nbd", "id": "opl-export-1", "node-name": "disk1",
+                "name": "disk1", "writable": true
+            })
+        );
+        assert_eq!(
+            sent[6].1,
+            serde_json::json!({ "uri": format!("tcp:127.0.0.1:{}", ports.migration) })
+        );
+
+        // 내보낼 디스크가 없으면 NBD 서버를 열지 않는다.
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let ports = hv
+            .listen_incoming(id, "127.0.0.1", first..=first.saturating_add(50), &[])
+            .await
+            .unwrap();
+        assert_eq!(ports.nbd, None);
+        let commands = fake.commands.lock().unwrap().clone();
+        assert!(!commands.contains(&"nbd-server-start".to_string()));
+        assert!(!commands.contains(&"block-export-add".to_string()));
+    }
+
     /// 받은 VM은 멈춰 있으면 이어서 실행하고 표시를 지운다. 아직 받는 중이면 건드리지 않는다.
     #[tokio::test]
     async fn finish_incoming_continues_only_received_vms() {
@@ -2187,14 +3059,12 @@ time.sleep(60)
         );
 
         hv.incoming_wait(received.id).await.unwrap();
+        // 디스크를 내보내지 않았으면 NBD 서버가 없어 멈추기가 실패해도 넘겨받는다.
+        fake_a.failing.lock().unwrap().push("nbd-server-stop");
         hv.finish_incoming(received.id).await.unwrap();
-        assert!(
-            fake_a
-                .commands
-                .lock()
-                .unwrap()
-                .contains(&"cont".to_string())
-        );
+        let commands = fake_a.commands.lock().unwrap().clone();
+        let at = |name: &str| commands.iter().position(|c| c == name).unwrap();
+        assert!(at("nbd-server-stop") < at("cont"));
         assert!(!dir_a.join(INCOMING_MARK).exists());
         assert_eq!(
             hv.list_incoming().await.unwrap(),
@@ -2210,13 +3080,10 @@ time.sleep(60)
         let err = hv.finish_incoming(receiving.id).await.unwrap_err();
         assert!(matches!(err, DriverError::Migration(_)), "{err:?}");
         assert!(dir_b.join(INCOMING_MARK).exists());
-        assert!(
-            !fake_b
-                .commands
-                .lock()
-                .unwrap()
-                .contains(&"cont".to_string())
-        );
+        // 아직 받는 중이면 내보내기(원본이 미러하는 중)도 그대로 둔다.
+        let commands = fake_b.commands.lock().unwrap().clone();
+        assert!(!commands.contains(&"cont".to_string()));
+        assert!(!commands.contains(&"nbd-server-stop".to_string()));
     }
 
     /// 보낸 원본(`postmigrate`)이 아니면 끄지 않는다.
@@ -2245,7 +3112,7 @@ time.sleep(60)
         let fake = fake_qmp(&dir, "running").await;
         let hv = QemuHypervisor::new(cfg).await.unwrap();
         let err = hv
-            .start_incoming(&vm, Uuid::now_v7(), "127.0.0.1", 60000..=60099)
+            .start_incoming(&vm, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::Migration(_)), "{err:?}");
@@ -2263,7 +3130,7 @@ time.sleep(60)
             .unwrap();
         let vm = spec();
         let err = hv
-            .start_incoming(&vm, Uuid::now_v7(), "127.0.0.1", 60000..=60099)
+            .start_incoming(&vm, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::StartFailed(_)), "{err:?}");
@@ -2340,6 +3207,47 @@ time.sleep(60)
             node("disk0", vec![bitmap("opl-a", true)]),
             node("disk1", vec![bitmap("opl-a", false)]),
         ]));
+    }
+
+    /// 미러하는 디스크는 대상이 다른 이미지이므로 persistent `opl-` 비트맵도 스트림으로 보낸다.
+    #[test]
+    fn mirrored_disks_need_bitmap_migration() {
+        let bitmap = |name: &str| BitmapInfo {
+            name: name.into(),
+            recording: true,
+            inconsistent: false,
+            persistent: true,
+        };
+        let disks = [
+            BlockNode {
+                node_name: "disk0".into(),
+                driver: "qcow2".into(),
+                bitmaps: vec![bitmap("user")],
+            },
+            BlockNode {
+                node_name: "disk1".into(),
+                driver: "qcow2".into(),
+                bitmaps: vec![bitmap("opl-a")],
+            },
+        ];
+        assert!(!migrated_bitmaps(&disks, &[]));
+        assert!(!migrated_bitmaps(&disks, &[0]));
+        assert!(migrated_bitmaps(&disks, &[1]));
+        let job = |id: &str| JobInfo {
+            id: id.into(),
+            status: "ready".into(),
+            error: None,
+            current_progress: 0,
+            total_progress: 0,
+        };
+        assert_eq!(
+            mirrored_disks(&[
+                job("opl-mirror-2"),
+                job("opl-backup-0"),
+                job("opl-mirror-0")
+            ]),
+            [0, 2]
+        );
     }
 
     #[test]

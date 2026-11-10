@@ -16,10 +16,16 @@ use crate::hypervisor::{
     ActualState, BackupTarget, BitmapInfo, DiskBitmaps, EventKind, Hypervisor, HypervisorEvent,
     RuntimeStatus, StopMode,
 };
-use crate::migration::{MigrateOptions, MigrateTarget};
+use crate::migration::{
+    IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress, MirrorTarget,
+    format_duration,
+};
 
 /// 따로 정하지 않았을 때 `qemu_version`이 돌려주는 버전
 pub const MOCK_QEMU_VERSION: &str = "8.2.2";
+
+/// `mirror_disks`가 디스크 하나마다 복사한 것으로 알리는 바이트(가짜 진행률)
+pub const MOCK_MIRROR_BYTES: u64 = 1 << 30;
 
 /// `incremental_backup` 호출 한 번: (VM, 앞 비트맵, 새 비트맵, 대상)
 pub type IncrementalCall = (Uuid, String, String, Vec<BackupTarget>);
@@ -101,6 +107,20 @@ struct MockState {
     incrementals: Vec<IncrementalCall>,
     /// `clear_backup_leftovers`를 부른 VM(실패 포함)
     leftover_clears: Vec<Uuid>,
+    /// 받는 QEMU가 NBD로 내보내는 디스크(`start_incoming`의 `exports`, `finish_incoming`까지)
+    exports: HashMap<Uuid, Vec<usize>>,
+    /// `mirror_disks` 호출 (VM, 대상). 실패한 호출 포함
+    mirror_calls: Vec<(Uuid, Vec<MirrorTarget>)>,
+    /// ready인 미러가 남은 VM과 그 디스크 순서 번호
+    mirroring: HashMap<Uuid, Vec<usize>>,
+    /// 스위치오버에서 미러를 끝내고 보낸 마이그레이션의 VM
+    switchovers: Vec<Uuid>,
+    /// 다음 `mirror_disks` 한 번을 실패시킬 오류
+    fail_next_mirror: Option<DriverError>,
+    /// 다음 `mirror_disks` 한 번이 복사하지 못하고 정체로 실패한다.
+    stall_next_mirror: bool,
+    /// 다음 스위치오버 한 번에 미러가 이 오류로 끝난다(마이그레이션은 취소된다).
+    fail_next_switchover: Option<String>,
 }
 
 impl Default for MockHypervisor {
@@ -349,6 +369,44 @@ impl MockHypervisor {
         self.state.lock().unwrap().leftover_clears.clone()
     }
 
+    /// 다음 `mirror_disks` 한 번을 이 오류로 실패시킨다. 미러는 남지 않는다.
+    pub fn fail_next_mirror(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_mirror = Some(err);
+    }
+
+    /// 다음 `mirror_disks` 한 번이 진행 없이 정체로 실패한다(`opts.stall`을 기다리지 않고 곧바로).
+    pub fn stall_next_mirror(&self) {
+        self.state.lock().unwrap().stall_next_mirror = true;
+    }
+
+    /// 다음 `switchover_mirrors` 마이그레이션 한 번에서 미러가 `error`로 끝난다. 실제 드라이버처럼
+    /// 마이그레이션을 취소하고 미러를 치운 뒤 실패한다(원본은 계속 돈다).
+    pub fn fail_next_switchover(&self, error: &str) {
+        self.state.lock().unwrap().fail_next_switchover = Some(error.to_string());
+    }
+
+    /// `mirror_disks` 호출(실패 포함)을 순서대로 돌려준다. 디스크 내용은 복사하지 않는다.
+    pub fn mirrors(&self) -> Vec<(Uuid, Vec<MirrorTarget>)> {
+        self.state.lock().unwrap().mirror_calls.clone()
+    }
+
+    /// ready인 미러가 남은 디스크(없으면 빈 목록)
+    pub fn mirroring(&self, id: Uuid) -> Vec<usize> {
+        let st = self.state.lock().unwrap();
+        st.mirroring.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// 스위치오버에서 미러를 끝내고 성공한 마이그레이션의 VM을 순서대로 돌려준다.
+    pub fn switchovers(&self) -> Vec<Uuid> {
+        self.state.lock().unwrap().switchovers.clone()
+    }
+
+    /// 받는 QEMU가 NBD로 내보내는 디스크(없으면 빈 목록)
+    pub fn exports(&self, id: Uuid) -> Vec<usize> {
+        let st = self.state.lock().unwrap();
+        st.exports.get(&id).cloned().unwrap_or_default()
+    }
+
     /// 새로 띄운 VM의 디스크 형식을 적고, 디스크 수에 맞춰 비트맵 목록을 늘리거나 줄인다.
     fn launched(st: &mut MockState, vm: &VmRuntimeSpec) {
         let formats: Vec<ImageFormat> = vm.disks.iter().map(|d| d.format).collect();
@@ -417,6 +475,8 @@ impl MockHypervisor {
         st.incoming.remove(&id);
         st.migration_status.remove(&id);
         st.outgoing.remove(&id);
+        st.exports.remove(&id);
+        st.mirroring.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -667,11 +727,13 @@ impl Hypervisor for MockHypervisor {
         Ok(())
     }
 
-    /// 남은 증분 백업 작업은 없다. 호출만 기록한다.
+    /// 남은 증분 백업 작업은 없다. 호출을 기록하고 남은 미러를 치운다.
     async fn clear_backup_leftovers(&self, id: Uuid) -> Result<(), DriverError> {
         let mut st = self.state.lock().unwrap();
         st.leftover_clears.push(id);
-        Self::controllable(&st, id)
+        Self::controllable(&st, id)?;
+        st.mirroring.remove(&id);
+        Ok(())
     }
 
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
@@ -740,14 +802,16 @@ impl Hypervisor for MockHypervisor {
         Ok(Self::version(&st))
     }
 
-    /// 범위의 첫 포트를 돌려준다. `fail_next_start`로 주입한 오류로 실패할 수 있다.
+    /// 범위의 첫 포트(내보낼 디스크가 있으면 NBD에 그다음 포트)를 돌려준다. `fail_next_start`로 주입한
+    /// 오류로 실패할 수 있다.
     async fn start_incoming(
         &self,
         vm: &VmRuntimeSpec,
         task: Uuid,
         _listen_host: &str,
         ports: RangeInclusive<u16>,
-    ) -> Result<u16, DriverError> {
+        exports: &[usize],
+    ) -> Result<IncomingPorts, DriverError> {
         {
             let mut st = self.state.lock().unwrap();
             if st.vms.contains_key(&vm.id) {
@@ -765,12 +829,18 @@ impl Hypervisor for MockHypervisor {
             Self::launched(&mut st, vm);
             st.incoming.insert(vm.id, task);
             st.migration_status.insert(vm.id, inmigrate());
+            if !exports.is_empty() {
+                st.exports.insert(vm.id, exports.to_vec());
+            }
         }
         let _ = self.events.send(HypervisorEvent {
             id: vm.id,
             kind: EventKind::Started,
         });
-        Ok(*ports.start())
+        Ok(IncomingPorts {
+            migration: *ports.start(),
+            nbd: (!exports.is_empty()).then(|| ports.start() + 1),
+        })
     }
 
     /// 주입한 실패가 없으면 받기를 마친 것으로 본다(멈춘 채).
@@ -804,6 +874,7 @@ impl Hypervisor for MockHypervisor {
         }
         st.incoming.remove(&id);
         st.migration_status.remove(&id);
+        st.exports.remove(&id);
         Ok(())
     }
 
@@ -817,12 +888,58 @@ impl Hypervisor for MockHypervisor {
             .collect())
     }
 
-    /// 주입한 실패가 없으면 원본을 `postmigrate`로 멈춘다.
+    /// 가짜 진행률(디스크마다 [`MOCK_MIRROR_BYTES`])을 알리고 곧바로 모두 ready가 된다. 실제 드라이버처럼
+    /// qcow2 디스크를 raw로 옮기면 그 디스크의 `opl-` 비트맵을 지운다.
+    async fn mirror_disks(
+        &self,
+        id: Uuid,
+        targets: &[MirrorTarget],
+        opts: &MirrorOptions,
+    ) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.mirror_calls.push((id, targets.to_vec()));
+        Self::controllable(&st, id)?;
+        st.mirroring.remove(&id);
+        let formats = st.disk_formats.get(&id).cloned().unwrap_or_default();
+        for target in targets {
+            if formats.get(target.disk) == Some(&ImageFormat::Qcow2)
+                && target.format == ImageFormat::Raw
+                && let Some(disk) = st.bitmaps.get_mut(&id).and_then(|d| d.get_mut(target.disk))
+            {
+                disk.retain(|b| !b.name.starts_with(BITMAP_PREFIX));
+            }
+        }
+        let total = MOCK_MIRROR_BYTES * targets.len() as u64;
+        let send = |done_bytes| {
+            if let Some(tx) = &opts.progress {
+                tx.send_replace(MirrorProgress {
+                    done_bytes,
+                    total_bytes: total,
+                });
+            }
+        };
+        send(0);
+        if let Some(err) = st.fail_next_mirror.take() {
+            return Err(err);
+        }
+        if std::mem::take(&mut st.stall_next_mirror) {
+            return Err(DriverError::Migration(format!(
+                "disk copy made no progress for {}",
+                format_duration(opts.stall)
+            )));
+        }
+        send(total);
+        st.mirroring
+            .insert(id, targets.iter().map(|t| t.disk).collect());
+        Ok(())
+    }
+
+    /// 주입한 실패가 없으면 원본을 `postmigrate`로 멈춘다. `switchover_mirrors`면 남은 미러를 끝낸다.
     async fn migrate(
         &self,
         id: Uuid,
         target: &MigrateTarget,
-        _opts: &MigrateOptions,
+        opts: &MigrateOptions,
     ) -> Result<(), DriverError> {
         let delay = self.state.lock().unwrap().migrate_delay;
         if let Some(delay) = delay {
@@ -831,12 +948,28 @@ impl Hypervisor for MockHypervisor {
         let mut st = self.state.lock().unwrap();
         st.migrations.push((id, target.clone()));
         Self::controllable(&st, id)?;
+        if opts.switchover_mirrors && !st.mirroring.contains_key(&id) {
+            return Err(DriverError::Migration(
+                "no disk mirrors to switch over".into(),
+            ));
+        }
         if let Some(err) = st.fail_next_migrate.take() {
             return Err(err);
         }
         if let Some(err) = st.fail_next_migrate_unfinished.take() {
             st.outgoing.insert(id);
             return Err(err);
+        }
+        if opts.switchover_mirrors {
+            if let Some(error) = st.fail_next_switchover.take() {
+                let disk = st.mirroring.remove(&id).unwrap_or_default();
+                return Err(DriverError::Migration(format!(
+                    "disk mirror opl-mirror-{} failed: {error}",
+                    disk.first().copied().unwrap_or_default()
+                )));
+            }
+            st.mirroring.remove(&id);
+            st.switchovers.push(id);
         }
         st.migration_status.insert(id, postmigrate());
         Ok(())
@@ -863,6 +996,7 @@ impl Hypervisor for MockHypervisor {
         if st.outgoing.remove(&id) && st.complete_on_cancel {
             st.migration_status.insert(id, postmigrate());
         }
+        st.mirroring.remove(&id);
         Ok(())
     }
 
@@ -1278,6 +1412,7 @@ mod tests {
         MigrateOptions {
             bandwidth: None,
             timeout: Duration::from_secs(60),
+            switchover_mirrors: false,
         }
     }
 
@@ -1300,10 +1435,16 @@ mod tests {
 
         let mut events = dst.subscribe();
         let port = dst
-            .start_incoming(&vm, task, "10.0.0.2", 60000..=60099)
+            .start_incoming(&vm, task, "10.0.0.2", 60000..=60099, &[])
             .await
             .unwrap();
-        assert_eq!(port, 60000);
+        assert_eq!(
+            port,
+            IncomingPorts {
+                migration: 60000,
+                nbd: None
+            }
+        );
         assert_eq!(events.recv().await.unwrap().kind, EventKind::Started);
         assert!(dst.is_incoming(vm.id));
         assert_eq!(dst.list_incoming().await.unwrap(), vec![(vm.id, task)]);
@@ -1321,7 +1462,7 @@ mod tests {
         ));
         // 이미 돌고 있는 VM은 받을 수 없다.
         assert!(matches!(
-            src.start_incoming(&vm, task, "10.0.0.1", 60000..=60099)
+            src.start_incoming(&vm, task, "10.0.0.1", 60000..=60099, &[])
                 .await,
             Err(DriverError::Migration(_))
         ));
@@ -1365,7 +1506,7 @@ mod tests {
         assert_eq!(state.status, RuntimeStatus::Running);
 
         // 받기에 실패한 QEMU는 크래시로 끝난다.
-        dst.start_incoming(&vm, task, "10.0.0.2", 60000..=60099)
+        dst.start_incoming(&vm, task, "10.0.0.2", 60000..=60099, &[])
             .await
             .unwrap();
         let mut events = dst.subscribe();
@@ -1377,7 +1518,7 @@ mod tests {
         // 시작 실패를 주입하면 받기도 실패한다.
         dst.fail_next_start(DriverError::StartFailed("boom".into()));
         assert!(matches!(
-            dst.start_incoming(&vm, task, "10.0.0.2", 60000..=60099)
+            dst.start_incoming(&vm, task, "10.0.0.2", 60000..=60099, &[])
                 .await,
             Err(DriverError::StartFailed(_))
         ));
@@ -1434,6 +1575,145 @@ mod tests {
         hv.start_outgoing(vm.id);
         hv.cancel_migration(vm.id).await.unwrap();
         assert_eq!(status(&hv), postmigrate());
+    }
+
+    fn mirror_target(disk: usize, format: ImageFormat) -> MirrorTarget {
+        MirrorTarget {
+            disk,
+            host: "10.0.0.2".into(),
+            port: 60001,
+            export: format!("disk{disk}"),
+            tls_hostname: "10.0.0.2".into(),
+            format,
+        }
+    }
+
+    fn mirror_opts() -> (MirrorOptions, tokio::sync::watch::Receiver<MirrorProgress>) {
+        let (tx, rx) = tokio::sync::watch::channel(MirrorProgress::default());
+        let opts = MirrorOptions {
+            speed: None,
+            timeout: Duration::from_secs(60),
+            stall: Duration::from_secs(600),
+            progress: Some(tx),
+        };
+        (opts, rx)
+    }
+
+    /// 로컬 디스크 마이그레이션: 받는 쪽 내보내기와 NBD 포트, 미러 기록·가짜 진행률·비트맵 규칙,
+    /// 스위치오버
+    #[tokio::test]
+    async fn local_disk_migration_between_two_mocks() {
+        let (src, dst) = (MockHypervisor::default(), MockHypervisor::default());
+        let vm = spec_with_disks();
+        let task = Uuid::now_v7();
+        src.start(&vm, None).await.unwrap();
+        src.add_bitmaps(vm.id, "opl-a").await.unwrap();
+
+        let ports = dst
+            .start_incoming(&vm, task, "10.0.0.2", 60000..=60099, &[0, 1])
+            .await
+            .unwrap();
+        assert_eq!(
+            ports,
+            IncomingPorts {
+                migration: 60000,
+                nbd: Some(60001)
+            }
+        );
+        assert_eq!(dst.exports(vm.id), [0, 1]);
+
+        // 미러 없이 스위치오버를 바라면 실패한다.
+        let switchover = MigrateOptions {
+            switchover_mirrors: true,
+            ..opts()
+        };
+        assert!(src.migrate(vm.id, &target(), &switchover).await.is_err());
+
+        // qcow2 디스크(disk0)를 raw로 옮기면 그 디스크의 opl- 비트맵을 지운다. raw 디스크(disk1)는 그대로.
+        let targets = [
+            mirror_target(0, ImageFormat::Raw),
+            mirror_target(1, ImageFormat::Raw),
+        ];
+        let (mirror, rx) = mirror_opts();
+        src.mirror_disks(vm.id, &targets, &mirror).await.unwrap();
+        assert_eq!(src.mirrors(), vec![(vm.id, targets.to_vec())]);
+        assert_eq!(src.mirroring(vm.id), [0, 1]);
+        assert_eq!(
+            *rx.borrow(),
+            MirrorProgress {
+                done_bytes: 2 * MOCK_MIRROR_BYTES,
+                total_bytes: 2 * MOCK_MIRROR_BYTES
+            }
+        );
+        let bitmaps = src.bitmaps(vm.id);
+        assert!(bitmaps[0].is_empty(), "{bitmaps:?}");
+        assert_eq!(bitmaps[1].len(), 1);
+
+        src.migrate(vm.id, &target(), &switchover).await.unwrap();
+        assert_eq!(src.switchovers(), [vm.id]);
+        assert!(src.mirroring(vm.id).is_empty());
+        dst.incoming_wait(vm.id).await.unwrap();
+        dst.finish_incoming(vm.id).await.unwrap();
+        assert!(dst.exports(vm.id).is_empty());
+        assert!(src.stop_migrated(vm.id).await.unwrap());
+    }
+
+    /// 미러 실패 주입: 복사 실패·정체는 미러를 남기지 않고, 스위치오버의 미러 오류는 마이그레이션을
+    /// 실패시키고 원본은 돈다. 되돌리기(`cancel_migration`)와 VM 끄기는 남은 미러를 치운다.
+    #[tokio::test]
+    async fn mirror_failures_leave_the_source_running() {
+        let hv = MockHypervisor::default();
+        let vm = spec_with_disks();
+        let targets = [mirror_target(1, ImageFormat::Raw)];
+        let (mirror, _rx) = mirror_opts();
+        assert!(matches!(
+            hv.mirror_disks(vm.id, &targets, &mirror).await,
+            Err(DriverError::NotRunning(_))
+        ));
+        hv.start(&vm, None).await.unwrap();
+
+        hv.fail_next_mirror(DriverError::Migration("Connection reset by peer".into()));
+        assert!(hv.mirror_disks(vm.id, &targets, &mirror).await.is_err());
+        assert!(hv.mirroring(vm.id).is_empty());
+        hv.stall_next_mirror();
+        let err = hv.mirror_disks(vm.id, &targets, &mirror).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "migration failed: disk copy made no progress for 10m"
+        );
+        assert!(hv.mirroring(vm.id).is_empty());
+        assert_eq!(hv.mirrors().len(), 3);
+
+        let switchover = MigrateOptions {
+            switchover_mirrors: true,
+            ..opts()
+        };
+        hv.mirror_disks(vm.id, &targets, &mirror).await.unwrap();
+        hv.fail_next_switchover("Input/output error");
+        let err = hv.migrate(vm.id, &target(), &switchover).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "migration failed: disk mirror opl-mirror-1 failed: Input/output error"
+        );
+        assert!(hv.mirroring(vm.id).is_empty());
+        assert!(hv.switchovers().is_empty());
+        let state = hv.inspect(vm.id).await.unwrap().unwrap();
+        assert_eq!(state.status, RuntimeStatus::Running);
+
+        // 메모리 단계가 실패하면 미러가 남고, 되돌리기가 치운다.
+        hv.mirror_disks(vm.id, &targets, &mirror).await.unwrap();
+        hv.fail_next_migrate(DriverError::Migration("Connection refused".into()));
+        assert!(hv.migrate(vm.id, &target(), &switchover).await.is_err());
+        assert_eq!(hv.mirroring(vm.id), [1]);
+        hv.cancel_migration(vm.id).await.unwrap();
+        assert!(hv.mirroring(vm.id).is_empty());
+
+        hv.mirror_disks(vm.id, &targets, &mirror).await.unwrap();
+        hv.clear_backup_leftovers(vm.id).await.unwrap();
+        assert!(hv.mirroring(vm.id).is_empty());
+        hv.mirror_disks(vm.id, &targets, &mirror).await.unwrap();
+        hv.crash(vm.id);
+        assert!(hv.mirroring(vm.id).is_empty());
     }
 
     #[tokio::test]

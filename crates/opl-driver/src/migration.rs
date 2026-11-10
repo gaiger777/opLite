@@ -1,10 +1,13 @@
-//! 라이브 마이그레이션의 하이퍼바이저 밖 준비물: QEMU TLS 자격 증명 파일, 주소, 포트.
+//! 라이브 마이그레이션의 하이퍼바이저 밖 준비물: QEMU TLS 자격 증명 파일, 주소, 포트, 디스크 미러.
 
 use std::io::Write;
 use std::ops::RangeInclusive;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use opl_types::runtime::ImageFormat;
+use tokio::sync::watch;
 
 /// 마이그레이션을 보낼 곳
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,10 +26,79 @@ pub struct MigrateOptions {
     pub bandwidth: Option<u64>,
     /// 이 시간 안에 끝나지 않으면 취소한다(원본은 계속 돈다).
     pub timeout: Duration,
+    /// [`mirror_disks`](crate::Hypervisor::mirror_disks)로 시작한 디스크 미러를 스위치오버 직전
+    /// (`pre-switchover`, 게스트가 멈춘 때)에 끝낸 뒤 이어 간다.
+    pub switchover_mirrors: bool,
+}
+
+/// 받는 QEMU가 연 포트
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncomingPorts {
+    /// 마이그레이션 스트림
+    pub migration: u16,
+    /// 디스크를 내보내는 NBD 서버(내보낼 디스크가 있을 때만)
+    pub nbd: Option<u16>,
+}
+
+/// 원본 디스크 하나를 미러할 곳: 받는 QEMU의 NBD 내보내기
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorTarget {
+    /// 디스크 순서 번호(노드 `disk{i}`)
+    pub disk: usize,
+    /// 받는 노드의 주소
+    pub host: String,
+    /// 받는 QEMU의 NBD 포트([`IncomingPorts::nbd`])
+    pub port: u16,
+    /// 내보내기 이름(`disk{i}`)
+    pub export: String,
+    /// 받는 노드 인증서에서 확인할 이름
+    pub tls_hostname: String,
+    /// 대상 이미지의 형식. qcow2 디스크를 raw로 옮기면 이미지에 저장된 비트맵을 담을 수 없으므로
+    /// 미러 전에 그 디스크의 `opl-` 비트맵을 지운다.
+    pub format: ImageFormat,
+}
+
+/// 미러들의 진행(모든 디스크의 합). 할당된 영역만 세고, 복사 중 쓰기만큼 둘 다 는다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MirrorProgress {
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct MirrorOptions {
+    /// 디스크 하나의 최대 속도(바이트/초). `None`이면 제한 없음
+    pub speed: Option<u64>,
+    /// 모든 미러가 `ready`가 되기까지의 한도
+    pub timeout: Duration,
+    /// 복사량의 합이 이만큼 늘지 않으면 실패한다(끊긴 링크).
+    pub stall: Duration,
+    /// 있으면 진행이 바뀔 때마다 보낸다.
+    pub progress: Option<watch::Sender<MirrorProgress>>,
 }
 
 /// QEMU의 TLS 자격 증명 객체 id. 보내는 쪽과 받는 쪽 모두 이 이름으로 만든다.
 pub const MIGRATION_TLS_ID: &str = "opl-mig-tls";
+/// 디스크 미러(NBD)의 TLS 자격 증명 객체 id. NBD 노드가 쥔 객체는 마이그레이션 설정이 지우고 다시
+/// 만들 수 없으므로 마이그레이션 것과 나눈다.
+pub const NBD_TLS_ID: &str = "opl-nbd-tls";
+
+/// 시간을 설정 파일과 같은 모양(`12h`, `10m`, `1h30m`, `90s`)으로 쓴다.
+pub fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    let mut out = String::new();
+    for (n, unit) in [(h, "h"), (m, "m"), (s, "s")] {
+        if n > 0 {
+            out.push_str(&format!("{n}{unit}"));
+        }
+    }
+    if out.is_empty() {
+        format!("{}ms", d.as_millis())
+    } else {
+        out
+    }
+}
 
 const CA_FILE: &str = "ca-cert.pem";
 /// QEMU `tls-creds-x509`가 읽는 이름. 노드 인증서 하나를 받는 쪽(server)과 보내는 쪽(client)에 같이 쓴다.
@@ -84,12 +156,12 @@ fn socket_addr(host: &str, port: u16) -> String {
     }
 }
 
-/// `ports`에서 `host`에 지금 열 수 있는 첫 포트. 잠깐 열어 보고 닫는다. QEMU의 `migrate-incoming`은
-/// 한 번만 부를 수 있어 포트가 쓰는 중이면 그 QEMU를 버려야 하므로 미리 고른다.
-pub(crate) fn pick_port(host: &str, ports: RangeInclusive<u16>) -> Option<u16> {
-    ports
-        .into_iter()
-        .find(|&port| std::net::TcpListener::bind(socket_addr(host, port)).is_ok())
+/// `ports`에서 `except`가 아니고 `host`에 지금 열 수 있는 첫 포트. 잠깐 열어 보고 닫는다. QEMU의
+/// `migrate-incoming`은 한 번만 부를 수 있어 포트가 쓰는 중이면 그 QEMU를 버려야 하므로 미리 고른다.
+pub(crate) fn pick_port(host: &str, ports: RangeInclusive<u16>, except: &[u16]) -> Option<u16> {
+    ports.into_iter().find(|&port| {
+        !except.contains(&port) && std::net::TcpListener::bind(socket_addr(host, port)).is_ok()
+    })
 }
 
 /// `qemu-system-* --version`의 첫 줄(`QEMU emulator version 8.2.2 (Debian ...)`)에서 버전을 읽는다.
@@ -165,9 +237,20 @@ mod tests {
     fn picks_first_port_that_is_free() {
         let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = busy.local_addr().unwrap().port();
-        assert_eq!(pick_port("127.0.0.1", port..=port), None);
+        assert_eq!(pick_port("127.0.0.1", port..=port, &[]), None);
         drop(busy);
-        assert_eq!(pick_port("127.0.0.1", port..=port), Some(port));
+        assert_eq!(pick_port("127.0.0.1", port..=port, &[]), Some(port));
+        // 이미 고른 포트(아직 열지 않음)는 건너뛴다.
+        assert_eq!(pick_port("127.0.0.1", port..=port, &[port]), None);
+    }
+
+    #[test]
+    fn formats_durations_like_the_config() {
+        assert_eq!(format_duration(Duration::from_secs(600)), "10m");
+        assert_eq!(format_duration(Duration::from_secs(12 * 3600)), "12h");
+        assert_eq!(format_duration(Duration::from_secs(5400)), "1h30m");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m30s");
+        assert_eq!(format_duration(Duration::from_millis(200)), "200ms");
     }
 
     #[test]

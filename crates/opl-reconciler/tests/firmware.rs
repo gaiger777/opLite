@@ -171,7 +171,7 @@ async fn received_vm_is_not_fetched() {
         nics: vec![],
     };
     env.hv
-        .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099)
+        .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])
         .await
         .unwrap();
     env.hv.incoming_wait(vm.id).await.unwrap();

@@ -175,10 +175,11 @@ impl MigrationReceiver for IncomingMigrations {
             .map_err(|e| IncomingError::Failed(e.to_string()))?;
         match self
             .hv
-            .start_incoming(&spec, req.task, &c.listen_host, c.ports.clone())
+            .start_incoming(&spec, req.task, &c.listen_host, c.ports.clone(), &[])
             .await
         {
-            Ok(port) => {
+            Ok(ports) => {
+                let port = ports.migration;
                 tracing::info!(vm = %vm.id, task = %req.task, port, "receiving a live migration");
                 Ok(port)
             }

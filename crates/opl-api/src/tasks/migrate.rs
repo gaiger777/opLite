@@ -246,6 +246,7 @@ async fn send(
     let opts = MigrateOptions {
         bandwidth: ctx.config.migration_bandwidth,
         timeout: ctx.config.migration_timeout,
+        switchover_mirrors: false,
     };
     ctx.hv
         .migrate(id, &target, &opts)

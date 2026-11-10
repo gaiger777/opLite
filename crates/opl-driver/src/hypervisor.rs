@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::error::DriverError;
-use crate::migration::{MigrateOptions, MigrateTarget};
+use crate::migration::{IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions, MirrorTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopMode {
@@ -134,9 +134,9 @@ pub trait Hypervisor: Send + Sync {
         targets: &[BackupTarget],
     ) -> Result<(), DriverError>;
 
-    /// 실행 중인 VM에 앞선 증분 백업이 남긴 작업과 대상 노드(`opl-backup-*`, opld가 기다리다 죽었다)를
-    /// 치운다. 아직 도는 작업은 취소하고 잠시 기다린다(끝나지 않으면 오류). 남은 작업이 있으면 디스크의
-    /// 내부 스냅샷이 실패한다.
+    /// 실행 중인 VM에 앞선 증분 백업이 남긴 작업과 대상 노드(`opl-backup-*`, opld가 기다리다 죽었다)와
+    /// 남은 디스크 미러(`opl-mirror-*`)를 치운다. 아직 도는 작업은 취소하고 잠시 기다린다(끝나지 않으면
+    /// 오류). 남은 작업이 있으면 디스크의 내부 스냅샷이 실패한다.
     async fn clear_backup_leftovers(&self, id: Uuid) -> Result<(), DriverError>;
 
     /// 실행 중인 VM의 모든 디스크에서 내부 스냅샷 `tag`를 지운다. 태그가 없어도 성공한다.
@@ -171,21 +171,24 @@ pub trait Hypervisor: Send + Sync {
     /// 라이브 마이그레이션을 받을 QEMU를 `-incoming defer`로 띄우고, 받는 중 표시(마이그레이션 Task
     /// `task`)를 남기고, TLS
     /// 자격 증명(받는 쪽, 상대 인증서 확인)과 능력을 정한 뒤 `ports`에서 빈 포트로 `listen_host`에서
-    /// 받기 시작한다. 연 포트를 돌려준다. 실패하면 띄운 QEMU를 끈다. 이미 이 노드에서 돌고 있는
-    /// VM이면 실패한다. 받은 뒤에도 멈춰 있다([`finish_incoming`](Self::finish_incoming)이 이어서 실행).
+    /// 받기 시작한다. `exports`(디스크 순서 번호)가 있으면 그 디스크들을 `ports`의 다른 빈 포트에서
+    /// TLS NBD 서버로 쓰기 가능하게 내보낸다(이름 `disk{i}`, 원본이 미러한다). 연 포트를 돌려준다.
+    /// 실패하면 띄운 QEMU를 끈다. 이미 이 노드에서 돌고 있는 VM이면 실패한다. 받은 뒤에도 멈춰
+    /// 있다([`finish_incoming`](Self::finish_incoming)이 이어서 실행).
     async fn start_incoming(
         &self,
         vm: &VmRuntimeSpec,
         task: Uuid,
         listen_host: &str,
         ports: RangeInclusive<u16>,
-    ) -> Result<u16, DriverError>;
+        exports: &[usize],
+    ) -> Result<IncomingPorts, DriverError>;
 
     /// 받는 중인 VM의 마이그레이션이 끝나기를 기다린다. 완료면 성공, 실패했거나 받는 QEMU가
     /// 사라졌으면 `Migration` 오류다. 받는 중 표시가 없는 VM이면 실패한다.
     async fn incoming_wait(&self, id: Uuid) -> Result<(), DriverError>;
 
-    /// 받기를 마친 VM을 넘겨받는다: 멈춰 있으면 이어서 실행하고 받는 중 표시를 지운다. 표시가
+    /// 받기를 마친 VM을 넘겨받는다: NBD 내보내기를 멈추고, 멈춰 있으면 이어서 실행하고 받는 중 표시를 지운다. 표시가
     /// 없으면(이미 넘겨받음) 아무것도 하지 않는다. 아직 받는 중이면 `Migration` 오류다. 마이그레이션이
     /// 확정된 뒤(VM이 이 노드로 옮겨진 뒤)에만 부른다.
     async fn finish_incoming(&self, id: Uuid) -> Result<(), DriverError>;
@@ -194,11 +197,26 @@ pub trait Hypervisor: Send + Sync {
     /// 않은 채 남은 받는 QEMU를 찾아 끄는 데 쓴다.
     async fn list_incoming(&self) -> Result<Vec<(Uuid, Uuid)>, DriverError>;
 
+    /// 실행 중인 VM의 디스크들을 `targets`(받는 QEMU의 NBD 내보내기)로 미러하기 시작하고 모두 `ready`
+    /// (한 번 다 복사하고 원본의 쓰기를 따라감)가 되기를 기다린다. 미러는 그대로 남아
+    /// [`migrate`](Self::migrate)의 `switchover_mirrors`가 끝낸다. 남은 미러는 먼저 치운다. qcow2 디스크를
+    /// raw로 옮기면 미러 전에 그 디스크의 `opl-` 비트맵을 지운다. 작업이 실패하거나, `opts.timeout`이
+    /// 지나거나, `opts.stall` 동안 복사량이 늘지 않으면 미러를 모두 치우고 `Migration` 오류다.
+    async fn mirror_disks(
+        &self,
+        id: Uuid,
+        targets: &[MirrorTarget],
+        opts: &MirrorOptions,
+    ) -> Result<(), DriverError>;
+
     /// 실행 중인 VM을 `target`으로 보낸다(TLS, 능력 `events`·`auto-converge`, 이미지에 저장되지 않는
-    /// `opl-` 비트맵이 있으면 `dirty-bitmaps`). 보내기 전에 inconsistent인 `opl-` 비트맵을 지운다. 끝날
-    /// 때까지 기다린다. 성공하면 원본은 `postmigrate`로 멈춰
+    /// `opl-` 비트맵이나 미러하는 디스크의 `opl-` 비트맵이 있으면 `dirty-bitmaps`). 보내기 전에
+    /// inconsistent인 `opl-` 비트맵을 지운다. 끝날 때까지 기다린다. `opts.switchover_mirrors`면
+    /// `pause-before-switchover`로 보내 게스트가 멈춘 `pre-switchover`에서 미러를 끝내고(대상 디스크가
+    /// 원본과 같아진다) 이어 간다. 미러가 실패했으면 취소한다. 성공하면 원본은 `postmigrate`로 멈춰
     /// 있다([`stop_migrated`](Self::stop_migrated)로 끈다). 실패하거나 `opts.timeout`이 지나 취소하면
     /// `Migration` 오류이고 원본은 대개 계속 돈다(멈췄으면 [`resume`](Self::resume)으로 이어서 실행한다).
+    /// 남은 미러는 [`cancel_migration`](Self::cancel_migration)이 치운다.
     async fn migrate(
         &self,
         id: Uuid,
@@ -213,7 +231,8 @@ pub trait Hypervisor: Send + Sync {
     /// 이 VM이 보내는 중인 마이그레이션을 취소하고 끝날 때까지 기다린다(QMP `migrate_cancel`). 보내는
     /// 중이 아니면(끝났거나, 받는 쪽이거나, VM이 없다) 아무것도 하지 않는다. 취소하는 사이에 끝났으면
     /// 원본은 `postmigrate`로 멈춰 있다. opld가 기다리기를 그만둔 마이그레이션(재시작, 되돌리기)이
-    /// 나중에 끝나 원본을 멈추지 않게 한다.
+    /// 나중에 끝나 원본을 멈추지 않게 한다. 남은 디스크 미러(`opl-mirror-*`)는 보내는 중이 아니어도
+    /// 취소하고 치운다.
     async fn cancel_migration(&self, id: Uuid) -> Result<(), DriverError>;
 
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.

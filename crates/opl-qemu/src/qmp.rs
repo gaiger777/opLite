@@ -181,22 +181,21 @@ impl BlockNode {
                 .ok_or_else(|| QmpError::Protocol(format!("block node without {k}: {v}")))
         };
         let flag = |b: &Value, k: &str| b[k].as_bool().unwrap_or(false);
+        // 이름 없는 비트맵은 블록 작업이 쓰는 것(미러가 바뀐 블록을 따라가는 비트맵)이라 건너뛴다.
         let bitmaps = v["dirty-bitmaps"]
             .as_array()
             .into_iter()
             .flatten()
-            .map(|b| {
-                Ok(BitmapInfo {
-                    name: b["name"].as_str().map(str::to_string).ok_or_else(|| {
-                        QmpError::Protocol(format!("dirty bitmap without name: {b}"))
-                    })?,
+            .filter_map(|b| {
+                Some(BitmapInfo {
+                    name: b["name"].as_str()?.to_string(),
                     recording: flag(b, "recording"),
                     // QEMU는 inconsistent일 때만 이 항목을 넣는다.
                     inconsistent: flag(b, "inconsistent"),
                     persistent: flag(b, "persistent"),
                 })
             })
-            .collect::<Result<_, QmpError>>()?;
+            .collect();
         Ok(Self {
             node_name: text("node-name")?,
             driver: text("drv")?,
@@ -2016,7 +2015,10 @@ mod tests {
             { "node-name": "disk1", "drv": "raw", "ro": false, "file": "/dev/vg/x",
               "dirty-bitmaps": [
                 { "name": "opl-a", "recording": false, "persistent": false, "busy": false,
-                  "granularity": 65536, "count": 0 }
+                  "granularity": 65536, "count": 0 },
+                // 미러 작업이 디스크에 둔 이름 없는 비트맵(QEMU 11.1)
+                { "busy": false, "count": 0, "granularity": 65536, "persistent": false,
+                  "recording": false }
               ] }
         ]);
         let (nodes, cmd) = tokio::join!(client.query_block_nodes(), reply(&mut fake, ret));

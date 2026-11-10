@@ -1,6 +1,7 @@
 //! 실제 QEMU 둘로 한 호스트에서 TLS 라이브 마이그레이션을 하는 드라이버 통합 테스트.
 //! `cargo test -p opl-driver --features qemu-it --test qemu_migration`
 //! 두 하이퍼바이저는 실행·상태 디렉터리가 다른 두 노드를 흉내 내고, 디스크는 같은 파일(공유 풀)이다.
+//! 로컬 디스크 시험은 노드마다 다른 파일이고, 원본이 대상의 NBD 내보내기로 미러한다.
 //! 인증서는 클러스터 PKI(`opl-peer`의 `pki`)와 같은 모양으로 rcgen이 만든다.
 #![cfg(feature = "qemu-it")]
 
@@ -8,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use opl_driver::{
-    DriverError, EventKind, Hypervisor, MigrateOptions, MigrateTarget, QemuConfig, QemuHypervisor,
-    RuntimeStatus, StopMode, migration_tls_dir, write_migration_tls,
+    DriverError, EventKind, Hypervisor, MigrateOptions, MigrateTarget, MirrorOptions,
+    MirrorProgress, MirrorTarget, QemuConfig, QemuHypervisor, RuntimeStatus, StopMode,
+    migration_tls_dir, write_migration_tls,
 };
 use opl_qemu::{Accel, HostProfile};
 use opl_types::runtime::{DiskKind, ImageFormat, RuntimeDisk, VmRuntimeSpec};
@@ -160,6 +162,7 @@ fn opts() -> MigrateOptions {
     MigrateOptions {
         bandwidth: None,
         timeout: Duration::from_secs(120),
+        switchover_mirrors: false,
     }
 }
 
@@ -189,9 +192,10 @@ async fn migrates_a_running_vm_over_tls() {
 
     let port = n
         .dst
-        .start_incoming(&vm, task, HOST, 61000..=61019)
+        .start_incoming(&vm, task, HOST, 61000..=61019, &[])
         .await
-        .unwrap();
+        .unwrap()
+        .migration;
     assert!((61000..=61019).contains(&port));
     assert_eq!(
         status(&n.dst, vm.id).await,
@@ -298,9 +302,10 @@ async fn failed_migration_keeps_the_source_running() {
     // 받는 노드 인증서에 없는 이름: TLS가 실패한다.
     let port = n
         .dst
-        .start_incoming(&vm, task, HOST, 61020..=61039)
+        .start_incoming(&vm, task, HOST, 61020..=61039, &[])
         .await
-        .unwrap();
+        .unwrap()
+        .migration;
     let target = MigrateTarget {
         host: HOST.into(),
         port,
@@ -319,9 +324,10 @@ async fn failed_migration_keeps_the_source_running() {
     // 다시 받고 보내면 된다(원본 QEMU에 TLS 객체를 다시 만든다).
     let port = n
         .dst
-        .start_incoming(&vm, task, HOST, 61020..=61039)
+        .start_incoming(&vm, task, HOST, 61020..=61039, &[])
         .await
-        .unwrap();
+        .unwrap()
+        .migration;
     let target = MigrateTarget {
         host: HOST.into(),
         port,
@@ -433,9 +439,10 @@ async fn inconsistent_bitmaps_are_dropped_and_do_not_block_migration() {
     };
     let port = n
         .dst
-        .start_incoming(&other, task, HOST, 61040..=61059)
+        .start_incoming(&other, task, HOST, 61040..=61059, &[])
         .await
-        .unwrap();
+        .unwrap()
+        .migration;
     let target = MigrateTarget {
         host: HOST.into(),
         port,
@@ -454,9 +461,10 @@ async fn inconsistent_bitmaps_are_dropped_and_do_not_block_migration() {
     n.src.start(&vm, None).await.unwrap();
     let port = n
         .dst
-        .start_incoming(&vm, task, HOST, 61040..=61059)
+        .start_incoming(&vm, task, HOST, 61040..=61059, &[])
         .await
-        .unwrap();
+        .unwrap()
+        .migration;
     let target = MigrateTarget {
         host: HOST.into(),
         port,
@@ -478,4 +486,286 @@ async fn inconsistent_bitmaps_are_dropped_and_do_not_block_migration() {
         image_bitmaps(&disk),
         [("opl-b".to_string(), vec!["auto".to_string()])]
     );
+}
+
+/// 디스크 순서대로 (경로, 형식)인 디스크를 가진 VM. 노드마다 같은 id로 디스크만 다르게 만든다.
+fn spec_with(id: Uuid, disks: &[(PathBuf, ImageFormat)]) -> VmRuntimeSpec {
+    let disk = spec(PathBuf::new()).disks.remove(0);
+    VmRuntimeSpec {
+        id,
+        disks: disks
+            .iter()
+            .enumerate()
+            .map(|(i, (path, format))| RuntimeDisk {
+                path: path.clone(),
+                format: *format,
+                boot_order: (i == 0).then_some(1),
+                ..disk.clone()
+            })
+            .collect(),
+        ..spec(PathBuf::new())
+    }
+}
+
+/// 빈 이미지 `path`(형식 `format`, [`DISK_SIZE`])
+fn create_image(format: &str, path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let out = std::process::Command::new("qemu-img")
+        .args(["create", "-q", "-f", format])
+        .arg(path)
+        .arg(DISK_SIZE)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// 이미지 `path`(형식 `format`)를 `qemu-io`로 읽어 무늬를 확인하거나 쓴다. 읽기는 잠금 없이(`-U`).
+fn qemu_io(format: &str, command: &str, path: &Path) -> String {
+    let mut cmd = std::process::Command::new("qemu-io");
+    if command.starts_with("read") {
+        cmd.args(["-r", "-U"]);
+    }
+    let out = cmd
+        .args(["-f", format, "-c", command])
+        .arg(path)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && !text.contains("Pattern verification failed"),
+        "qemu-io {command} {path:?}: {text}"
+    );
+    text
+}
+
+/// 실행 중인 VM의 `disk`번째 디스크에 게스트가 쓴 것처럼 쓴다(HMP `qemu-io`, 게스트 OS 없음).
+async fn guest_write(hv: &QemuHypervisor, id: Uuid, disk: usize, write: &str) {
+    let line = format!("qemu-io -d /machine/peripheral/disk{disk}-dev/virtio-backend \"{write}\"");
+    let out = hv.human_monitor_command(id, &line).await.unwrap();
+    assert!(!out.contains("rror"), "{line}: {out}");
+}
+
+fn mirror_targets(port: u16, formats: &[ImageFormat], tls_hostname: &str) -> Vec<MirrorTarget> {
+    formats
+        .iter()
+        .enumerate()
+        .map(|(disk, format)| MirrorTarget {
+            disk,
+            host: HOST.into(),
+            port,
+            export: format!("disk{disk}"),
+            tls_hostname: tls_hostname.into(),
+            format: *format,
+        })
+        .collect()
+}
+
+fn mirror_opts(
+    speed: Option<u64>,
+) -> (MirrorOptions, tokio::sync::watch::Receiver<MirrorProgress>) {
+    let (tx, rx) = tokio::sync::watch::channel(MirrorProgress::default());
+    let opts = MirrorOptions {
+        speed,
+        timeout: Duration::from_secs(120),
+        stall: Duration::from_secs(60),
+        progress: Some(tx),
+    };
+    (opts, rx)
+}
+
+const DISK_SIZE: &str = "64M";
+
+/// 로컬 디스크 둘(qcow2 → qcow2, qcow2 → raw)을 대상의 TLS NBD 내보내기로 미러하며 옮긴다. 복사 중과
+/// ready 뒤의 게스트 쓰기도 대상에 있고, 같은 형식 디스크의 비트맵은 대상 qcow2에 저장된다.
+#[tokio::test]
+async fn migrates_local_disks_by_mirroring_them() {
+    let n = nodes().await;
+    let (a, b) = (n.tmp.path().join("a"), n.tmp.path().join("b"));
+    let src_disks = [a.join("d0.qcow2"), a.join("d1.qcow2")];
+    for disk in &src_disks {
+        create_image("qcow2", disk);
+        // 일부만 할당된 디스크(나머지는 성기게 남는다)
+        qemu_io("qcow2", "write -P 0x11 0 4M", disk);
+        qemu_io("qcow2", "write -P 0x22 32M 1M", disk);
+    }
+    let dst_disks = [b.join("d0.qcow2"), b.join("d1.raw")];
+    create_image("qcow2", &dst_disks[0]);
+    create_image("raw", &dst_disks[1]);
+    let id = Uuid::now_v7();
+    let src_vm = spec_with(
+        id,
+        &[
+            (src_disks[0].clone(), ImageFormat::Qcow2),
+            (src_disks[1].clone(), ImageFormat::Qcow2),
+        ],
+    );
+    let formats = [ImageFormat::Qcow2, ImageFormat::Raw];
+    let dst_vm = spec_with(
+        id,
+        &[
+            (dst_disks[0].clone(), formats[0]),
+            (dst_disks[1].clone(), formats[1]),
+        ],
+    );
+    n.src.start(&src_vm, None).await.unwrap();
+    n.src.add_bitmaps(id, "opl-a").await.unwrap();
+
+    let task = Uuid::now_v7();
+    let ports = n
+        .dst
+        .start_incoming(&dst_vm, task, HOST, 61060..=61079, &[0, 1])
+        .await
+        .unwrap();
+    let nbd = ports.nbd.unwrap();
+    assert_ne!(nbd, ports.migration);
+    assert!((61060..=61079).contains(&nbd));
+
+    // 1 MiB/s로 복사하는 동안 게스트가 쓴다.
+    let targets = mirror_targets(nbd, &formats, HOST);
+    let (mirror, rx) = mirror_opts(Some(1 << 20));
+    let (copied, ()) = tokio::join!(n.src.mirror_disks(id, &targets, &mirror), async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        guest_write(&n.src, id, 0, "write -P 0x44 16M 1M").await;
+    });
+    copied.unwrap();
+    let progress = *rx.borrow();
+    assert!(progress.total_bytes >= 10 << 20, "{progress:?}");
+    assert_eq!(progress.done_bytes, progress.total_bytes);
+    // qcow2 → raw로 옮기는 disk1의 비트맵은 미러 전에 지웠다.
+    let bitmaps = n.src.backup_bitmaps(id).await.unwrap();
+    assert_eq!(bitmaps[0].bitmaps.len(), 1, "{bitmaps:?}");
+    assert!(bitmaps[1].bitmaps.is_empty(), "{bitmaps:?}");
+
+    // ready 뒤의 쓰기는 스위치오버에서 맞춘다.
+    guest_write(&n.src, id, 0, "write -P 0x55 20M 64k").await;
+    guest_write(&n.src, id, 1, "write -P 0x66 24M 64k").await;
+    let target = MigrateTarget {
+        host: HOST.into(),
+        port: ports.migration,
+        tls_hostname: HOST.into(),
+    };
+    let opts = MigrateOptions {
+        switchover_mirrors: true,
+        ..opts()
+    };
+    n.src.migrate(id, &target, &opts).await.unwrap();
+    n.dst.incoming_wait(id).await.unwrap();
+    n.dst.finish_incoming(id).await.unwrap();
+    assert_eq!(status(&n.dst, id).await, Some(RuntimeStatus::Running));
+    // 내보내기를 닫았다.
+    assert!(std::net::TcpListener::bind((HOST, nbd)).is_ok());
+    let bitmaps = n.dst.backup_bitmaps(id).await.unwrap();
+    assert_eq!(bitmaps[0].bitmaps.len(), 1, "{bitmaps:?}");
+    assert_eq!(bitmaps[0].bitmaps[0].name, "opl-a");
+    assert!(bitmaps[1].bitmaps.is_empty(), "{bitmaps:?}");
+    assert!(n.src.stop_migrated(id).await.unwrap());
+    n.dst.stop(id, StopMode::Force).await.unwrap();
+
+    for (src, (dst, format)) in src_disks.iter().zip(dst_disks.iter().zip(["qcow2", "raw"])) {
+        let out = std::process::Command::new("qemu-img")
+            .args(["compare", "-U", "-f", "qcow2", "-F", format])
+            .arg(src)
+            .arg(dst)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{src:?} {dst:?}: {out:?}");
+    }
+    for read in [
+        "read -P 0x11 0 4M",
+        "read -P 0x44 16M 1M",
+        "read -P 0x55 20M 64k",
+    ] {
+        qemu_io("qcow2", read, &dst_disks[0]);
+    }
+    qemu_io("raw", "read -P 0x66 24M 64k", &dst_disks[1]);
+    qemu_io("raw", "read -P 0x22 32M 1M", &dst_disks[1]);
+    // 같은 형식 디스크의 비트맵은 대상 qcow2에 저장됐다.
+    assert_eq!(
+        image_bitmaps(&dst_disks[0]),
+        [("opl-a".to_string(), vec!["auto".to_string()])]
+    );
+}
+
+/// 미러하지 못하거나(닫힌 포트, 노드 인증서에 없는 이름) 메모리 단계가 실패해도 원본은 계속 돌고,
+/// 되돌리기가 남은 미러를 치운다.
+#[tokio::test]
+async fn failed_disk_copy_keeps_the_source_running() {
+    let n = nodes().await;
+    let (a, b) = (n.tmp.path().join("a"), n.tmp.path().join("b"));
+    let (src_disk, dst_disk) = (a.join("d0.qcow2"), b.join("d0.qcow2"));
+    for disk in [&src_disk, &dst_disk] {
+        create_image("qcow2", disk);
+    }
+    qemu_io("qcow2", "write -P 0x11 0 1M", &src_disk);
+    let id = Uuid::now_v7();
+    let src_vm = spec_with(id, &[(src_disk.clone(), ImageFormat::Qcow2)]);
+    let dst_vm = spec_with(id, &[(dst_disk.clone(), ImageFormat::Qcow2)]);
+    let formats = [ImageFormat::Qcow2];
+    n.src.start(&src_vm, None).await.unwrap();
+
+    let closed = {
+        let l = std::net::TcpListener::bind((HOST, 0)).unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let (opts, _rx) = mirror_opts(None);
+    let err = n
+        .src
+        .mirror_disks(id, &mirror_targets(closed, &formats, HOST), &opts)
+        .await
+        .unwrap_err();
+    assert!(!err.is_transient(), "{err:?}");
+    assert_eq!(status(&n.src, id).await, Some(RuntimeStatus::Running));
+
+    let task = Uuid::now_v7();
+    let ports = n
+        .dst
+        .start_incoming(&dst_vm, task, HOST, 61080..=61099, &[0])
+        .await
+        .unwrap();
+    let nbd = ports.nbd.unwrap();
+    // 받는 노드 인증서에 없는 이름: TLS가 실패한다.
+    let err = n
+        .src
+        .mirror_disks(id, &mirror_targets(nbd, &formats, "not-the-node"), &opts)
+        .await
+        .unwrap_err();
+    assert!(!err.is_transient(), "{err:?}");
+    assert_eq!(status(&n.src, id).await, Some(RuntimeStatus::Running));
+
+    // 미러가 ready인데 받는 QEMU가 사라지면 메모리 단계가 실패한다. 되돌리기가 미러를 치운다.
+    n.src
+        .mirror_disks(id, &mirror_targets(nbd, &formats, HOST), &opts)
+        .await
+        .unwrap();
+    n.dst.stop(id, StopMode::Force).await.unwrap();
+    let target = MigrateTarget {
+        host: HOST.into(),
+        port: ports.migration,
+        tls_hostname: HOST.into(),
+    };
+    let migrate = MigrateOptions {
+        switchover_mirrors: true,
+        ..opts_short()
+    };
+    let err = n.src.migrate(id, &target, &migrate).await.unwrap_err();
+    assert!(matches!(err, DriverError::Migration(_)), "{err:?}");
+    n.src.cancel_migration(id).await.unwrap();
+    if status(&n.src, id).await != Some(RuntimeStatus::Running) {
+        n.src.resume(id).await.unwrap();
+    }
+    assert_eq!(status(&n.src, id).await, Some(RuntimeStatus::Running));
+    // 미러가 남지 않아 스냅샷이 된다.
+    n.src.snapshot_save(id, "after", false).await.unwrap();
+    n.src.stop(id, StopMode::Force).await.unwrap();
+}
+
+fn opts_short() -> MigrateOptions {
+    MigrateOptions {
+        timeout: Duration::from_secs(30),
+        ..opts()
+    }
 }
