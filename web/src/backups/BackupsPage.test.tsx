@@ -306,21 +306,145 @@ it("shows the type, parent, reason for a full backup and chain size", async () =
   expect(cell("web-full", "Size")).toHaveTextContent(/^1\.5 GiB$/);
 });
 
-it("does not copy incremental backups to a remote cluster", async () => {
-  const inc = backup("web-inc", web, 3, { status: { parent: ofWeb.id } });
-  mockLists({ vm: [web], backup: [ofWeb, inc] });
-  renderPage(<BackupsPage />);
-  const copy = await screen.findByRole("button", { name: "Copy web-inc to a remote cluster" });
-  expect(copy).toHaveAttribute("aria-disabled", "true");
-  expect(copy).toHaveAccessibleDescription(
-    "Incremental backups cannot be copied to a remote cluster yet.",
+it("copies an incremental backup and shows how much of its chain was copied", async () => {
+  const copy = (state: "ready" | "copying" | "failed", backup?: string) => ({
+    remote: "dr",
+    pool: "dr-bk",
+    state,
+    at: 1,
+    ...(backup && { backup }),
+  });
+  const full = backup("web-full", web, 3, {
+    status: { replicas: [copy("ready", "019a0f3c-0000-7000-8002-0000000000a1")] },
+  });
+  const inc = backup("web-inc", web, 4, {
+    spec: { incremental: true },
+    status: { parent: full.id, replicas: [copy("copying")] },
+  });
+  const next = backup("web-inc2", web, 5, {
+    spec: { incremental: true },
+    status: { parent: inc.id },
+  });
+  // 다 보낸 체인
+  const sentFull = backup("web-sent", web, 6, {
+    status: { replicas: [copy("ready", "019a0f3c-0000-7000-8002-0000000000b1")] },
+  });
+  const sentInc = backup("web-sent-inc", web, 7, {
+    spec: { incremental: true },
+    status: {
+      parent: sentFull.id,
+      replicas: [copy("ready", "019a0f3c-0000-7000-8002-0000000000b2")],
+    },
+  });
+  // 이 백업의 실패 기록 하나뿐인 체인(복제 중이 아니어도 보인다)
+  const failedFull = backup("web-failed", web, 8);
+  const failedInc = backup("web-failed-inc", web, 9, {
+    spec: { incremental: true },
+    status: { parent: failedFull.id, replicas: [copy("failed")] },
+  });
+  mockLists({
+    vm: [web],
+    backup: [ofWeb, full, inc, next, sentFull, sentInc, failedFull, failedInc],
+  });
+  let body: unknown;
+  server.use(
+    http.get(apiUrl("/remotes"), () => HttpResponse.json({ revision: 1, items: [remote("dr")] })),
+    http.get(apiUrl("/remotes/dr/api/storage-pools"), () =>
+      HttpResponse.json({ revision: 1, items: [pool("dr-bk", { backups: true })] }),
+    ),
+    http.post(apiUrl(`/backups/${inc.id}/actions/replicate`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t1", "backup-replicate", inc.id), { status: 202 });
+    }),
   );
-  await userEvent.click(copy);
-  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  // 전체 백업은 그대로 복제한다.
-  const full = screen.getByRole("button", { name: "Copy web-1 to a remote cluster" });
-  expect(full).toBeEnabled();
-  expect(full).not.toHaveAttribute("aria-disabled");
+  renderPage(<BackupsPage />);
+  const table = await screen.findByRole("table", { name: "Backups" });
+  const headers = within(table).getAllByRole("columnheader");
+  await within(table).findByText("web-inc2");
+  const row = (name: string) =>
+    within(table)
+      .getAllByRole("row")
+      .find((r) => r.firstChild?.textContent === name)!;
+  const copies = (name: string) =>
+    within(row(name)).getAllByRole("cell")[
+      headers.findIndex((h) => h.textContent === "Remote copies")
+    ]!;
+  // 증분 백업은 원격 사본마다 체인의 몇 백업이 원격에 있는지 보인다(자기 사본 기록이 없어도).
+  expect(
+    within(copies("web-inc")).getByText("dr / dr-bk: 1 of 2 in the chain copied"),
+  ).toBeVisible();
+  expect(copies("web-inc2")).toHaveTextContent(/^dr \/ dr-bk: 1 of 3 in the chain copied$/);
+  expect(
+    within(copies("web-failed-inc")).getByText("dr / dr-bk: 0 of 2 in the chain copied"),
+  ).toBeVisible();
+  // 자기 사본 기록이 없으면 사본 배지 줄(빈 줄)을 그리지 않는다.
+  expect(copies("web-inc2").querySelector(".flex")).toBeNull();
+  // 전체 백업과 다 보낸 체인은 진행을 보이지 않는다.
+  expect(copies("web-full")).not.toHaveTextContent("chain");
+  expect(copies("web-sent-inc")).not.toHaveTextContent("chain");
+
+  // 증분 백업도 복제한다. 설명은 체인의 앞 백업도 보낸다고 알린다.
+  await userEvent.click(screen.getByRole("button", { name: "Copy web-inc to a remote cluster" }));
+  const dialog = await screen.findByRole("dialog", { name: "Copy web-inc to a remote cluster" });
+  expect(dialog).toHaveAccessibleDescription(
+    /An incremental backup is sent with the earlier backups of its chain that the remote cluster does not have yet, starting from the full backup\./,
+  );
+  await within(dialog).findByRole("option", { name: "dr" });
+  await userEvent.selectOptions(within(dialog).getByLabelText("Remote cluster"), "dr");
+  await within(dialog).findByRole("option", { name: "dr-bk" });
+  await userEvent.selectOptions(
+    within(dialog).getByLabelText("Backup pool on the remote cluster"),
+    "dr-bk",
+  );
+  await userEvent.click(within(dialog).getByRole("button", { name: "Copy" }));
+  expect(await screen.findByText("Copy backup web-inc to dr")).toBeInTheDocument();
+  expect(body).toEqual({ remote: "dr", pool: "dr-bk" });
+});
+
+it.each([
+  {
+    // 복제의 backup_busy는 복제 대화상자 전용 문구다.
+    code: "backup_busy",
+    message:
+      'backup "web-1" is being replicated to remote "dr"; try again when the task has finished',
+    shown:
+      'This backup is being deleted, or it or a backup of its chain is being copied to this remote: backup "web-1" is being replicated to remote "dr"; try again when the task has finished',
+  },
+  {
+    // 그 밖의 오류는 전역 errors.<code> 문구다.
+    code: "cluster_upgrading",
+    message: "node n2 does not support incremental-replication yet",
+    shown: "The cluster is being upgraded: node n2 does not support incremental-replication yet",
+  },
+])("explains a copy refused with $code", async ({ code, message, shown }) => {
+  const inc = backup("web-inc", web, 4, {
+    spec: { incremental: true },
+    status: { parent: ofWeb.id },
+  });
+  mockLists({ vm: [web], backup: [ofWeb, inc] });
+  server.use(
+    http.get(apiUrl("/remotes"), () => HttpResponse.json({ revision: 1, items: [remote("dr")] })),
+    http.get(apiUrl("/remotes/dr/api/storage-pools"), () =>
+      HttpResponse.json({ revision: 1, items: [pool("dr-bk", { backups: true })] }),
+    ),
+    http.post(apiUrl(`/backups/${inc.id}/actions/replicate`), () =>
+      HttpResponse.json({ code, message }, { status: 409 }),
+    ),
+  );
+  renderPage(<BackupsPage />);
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Copy web-inc to a remote cluster" }),
+  );
+  const dialog = await screen.findByRole("dialog", { name: "Copy web-inc to a remote cluster" });
+  await within(dialog).findByRole("option", { name: "dr" });
+  await userEvent.selectOptions(within(dialog).getByLabelText("Remote cluster"), "dr");
+  await within(dialog).findByRole("option", { name: "dr-bk" });
+  await userEvent.selectOptions(
+    within(dialog).getByLabelText("Backup pool on the remote cluster"),
+    "dr-bk",
+  );
+  await userEvent.click(within(dialog).getByRole("button", { name: "Copy" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(shown);
 });
 
 it("explains why a parent backup cannot be deleted", async () => {

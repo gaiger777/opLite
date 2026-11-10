@@ -393,11 +393,14 @@
     },
     "replicaTitle": "{{remote}} / {{pool}}: {{state}}",
     "replicaError": "{{remote}} / {{pool}}: {{error}}",
+    "chainSent": "{{remote}} / {{pool}}: 체인 {{total}}개 중 {{sent}}개가 원격에 있음",
     "replicate": "원격으로 복제",
-    "replicateIncremental": "증분 백업은 아직 원격으로 복제하지 못합니다.",
     "replicateNamed": "{{name}}을(를) 원격 클러스터로 복제",
-    "replicateDescription": "백업 파일을 원격 클러스터의 백업 풀로 보냅니다. 그 사본은 원격 클러스터에서 복원할 수 있는 보통 백업입니다. 이 백업을 지우면 사본도 지웁니다.",
+    "replicateDescription": "백업 파일을 원격 클러스터의 백업 풀로 보냅니다. 그 사본은 원격 클러스터에서 복원할 수 있는 보통 백업입니다. 증분 백업은 원격 클러스터에 아직 없는 체인의 앞 백업들과 함께 전체 백업부터 차례로 보냅니다. 이 백업을 지우면 사본도 지웁니다.",
     "replicateSubmit": "복제",
+    "replicateErrors": {
+      "backup_busy": "이 백업을 지우는 중이거나, 이 백업이나 같은 체인의 백업을 이 원격으로 복제하는 중입니다: {{message}}"
+    },
     "remote": "원격 클러스터",
     "chooseRemote": "원격 클러스터를 고르세요",
     "remotePool": "원격 클러스터의 백업 풀",
@@ -527,8 +530,7 @@
       "labels": "KEY=VALUE 라벨을 하나 이상 적으세요.",
       "at": "00:00부터 23:59 사이의 시각을 적으세요.",
       "keep": "0 이상의 정수를 적으세요.",
-      "fullEvery": "0 이상의 정수를 적으세요.",
-      "fullEveryReplicate": "증분 백업은 아직 원격 클러스터로 복제할 수 없습니다. 0으로 두거나 복제하지 마세요."
+      "fullEvery": "0 이상의 정수를 적으세요."
     }
   },
   "imports": {

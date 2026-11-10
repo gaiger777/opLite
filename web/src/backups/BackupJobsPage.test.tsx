@@ -309,7 +309,7 @@ it("makes incremental backups between full ones", async () => {
   await userEvent.type(every, "x");
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
   expect(within(dialog).getByText("Enter a whole number of 0 or more.")).toBeVisible();
-  // 증분 백업은 아직 원격으로 복제하지 못한다.
+  // 증분 백업도 원격으로 복제한다.
   await userEvent.clear(every);
   await userEvent.type(every, "6");
   await within(dialog).findByRole("option", { name: "dr" });
@@ -320,14 +320,6 @@ it("makes incremental backups between full ones", async () => {
     "dr-bk",
   );
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
-  expect(
-    within(dialog).getByText(/Incremental backups cannot be copied to a remote cluster yet/),
-  ).toBeVisible();
-  await userEvent.selectOptions(
-    within(dialog).getByLabelText("Copy to a remote cluster"),
-    "Do not copy",
-  );
-  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
   expect(await screen.findByText("Backup job weekly saved.")).toBeInTheDocument();
-  expect(body).toEqual({ full_every: 6 });
+  expect(body).toEqual({ full_every: 6, replicate: { remote: "dr", pool: "dr-bk" } });
 });

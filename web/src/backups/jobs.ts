@@ -156,9 +156,6 @@ export function checkForm(form: JobForm, taken: string[] | null): Record<string,
   const every = form.fullEvery.trim();
   if (every !== "" && !(/^\d+$/.test(every) && Number(every) <= U32_MAX)) {
     found.fullEvery = "backupJobs.errors.fullEvery";
-  } else if (Number(every) > 0 && form.replicateRemote !== "") {
-    // 서버는 아직 증분 백업을 복제하지 않는다.
-    found.fullEvery = "backupJobs.errors.fullEveryReplicate";
   }
   return found;
 }

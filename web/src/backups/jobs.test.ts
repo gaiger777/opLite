@@ -176,12 +176,13 @@ it("asks for incremental backups only when full_every is above 0", () => {
   for (const n of ["-1", "1.5", "x", "4294967296"]) {
     expect(checkForm({ ...form, fullEvery: n }, []).fullEvery).toBe("backupJobs.errors.fullEvery");
   }
-  // 서버처럼 증분 백업의 복제는 아직 거절한다.
+  // 증분 백업도 원격으로 복제한다(체인째).
   const copying = { ...form, replicateRemote: "dr", replicatePool: "dr-bk" };
-  expect(checkForm({ ...copying, fullEvery: "6" }, []).fullEvery).toBe(
-    "backupJobs.errors.fullEveryReplicate",
-  );
-  expect(checkForm({ ...copying, fullEvery: "0" }, [])).toEqual({});
+  expect(checkForm({ ...copying, fullEvery: "6" }, [])).toEqual({});
+  expect(specOf({ ...copying, fullEvery: "6" })).toMatchObject({
+    full_every: 6,
+    replicate: { remote: "dr", pool: "dr-bk" },
+  });
 
   const job = backupJob("nightly", 1, { spec: { full_every: 6 } });
   expect(formOf(job).fullEvery).toBe("6");

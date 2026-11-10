@@ -393,11 +393,14 @@
     },
     "replicaTitle": "{{remote}} / {{pool}}: {{state}}",
     "replicaError": "{{remote}} / {{pool}}: {{error}}",
+    "chainSent": "{{remote}} / {{pool}}: {{sent}} of {{total}} in the chain copied",
     "replicate": "Copy to remote",
-    "replicateIncremental": "Incremental backups cannot be copied to a remote cluster yet.",
     "replicateNamed": "Copy {{name}} to a remote cluster",
-    "replicateDescription": "Sends the backup files to a backup pool of a remote cluster. The copy there is an ordinary backup that can be restored on that cluster. Deleting this backup deletes the copy too.",
+    "replicateDescription": "Sends the backup files to a backup pool of a remote cluster. The copy there is an ordinary backup that can be restored on that cluster. An incremental backup is sent with the earlier backups of its chain that the remote cluster does not have yet, starting from the full backup. Deleting this backup deletes the copy too.",
     "replicateSubmit": "Copy",
+    "replicateErrors": {
+      "backup_busy": "This backup is being deleted, or it or a backup of its chain is being copied to this remote: {{message}}"
+    },
     "remote": "Remote cluster",
     "chooseRemote": "Choose a remote cluster",
     "remotePool": "Backup pool on the remote cluster",
@@ -527,8 +530,7 @@
       "labels": "Enter at least one KEY=VALUE label.",
       "at": "Enter a time from 00:00 to 23:59.",
       "keep": "Enter whole numbers of 0 or more.",
-      "fullEvery": "Enter a whole number of 0 or more.",
-      "fullEveryReplicate": "Incremental backups cannot be copied to a remote cluster yet. Set this to 0 or do not copy."
+      "fullEvery": "Enter a whole number of 0 or more."
     }
   },
   "imports": {
