@@ -114,7 +114,7 @@ fn first_node(state: &AppState, fits: impl Fn(&Node) -> bool) -> Result<Option<U
 }
 
 /// 백업 `id`를 다루는 끝나지 않은 Task가 하는 일(만들기, 복원, 지우기, 복제)
-fn backup_tasks(state: &AppState, id: Uuid) -> Result<Vec<&'static str>, ApiError> {
+pub(crate) fn backup_tasks(state: &AppState, id: Uuid) -> Result<Vec<&'static str>, ApiError> {
     let (_, tasks) = state.cluster.list::<TaskSpec>()?;
     Ok(tasks
         .iter()

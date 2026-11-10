@@ -1,12 +1,15 @@
 //! 다른 클러스터가 보내는 백업 사본 받기: `POST /backups/receive`가 받는 중인 백업을 만들고,
 //! `PUT /backups/{key}/files/{file}`이 파일을 받아 SHA-256과 크기를 돌려주며, `actions/complete`가
 //! 매니페스트(받는 쪽 id)를 쓰고 `ready`로 바꾼다. 권한, 풀·매니페스트·파일 이름 검사, 같은 원본의
-//! 사본, 받는 중 지우기, 옛 노드.
+//! 사본, 받는 중 지우기, 옛 노드, 증분 사본의 부모 사본.
 
 mod common;
 
 use common::{Client, Env, vm_request};
-use opl_types::backup::{Backup, BackupManifest, BackupPhase, BackupSpec, MANIFEST_FILE};
+use opl_types::backup::{
+    Backup, BackupManifest, BackupPhase, BackupSpec, MANIFEST_FILE, MANIFEST_VERSION,
+    MANIFEST_VERSION_INCREMENTAL,
+};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::storage::{PoolBackend, StoragePoolSpec};
@@ -733,5 +736,329 @@ async fn receive_waits_for_every_node_to_run_this_build() {
             .await,
         StatusCode::CONFLICT,
         "cluster_upgrading",
+    );
+}
+
+/// 받기 요청 `body`로 받기를 시작해 파일을 모두 보내고 완료한 `ready` 사본의 id
+async fn ready_copy(client: &Client, body: Value) -> Uuid {
+    let id = receive_ok(client, body).await;
+    for (file, data) in [
+        ("disk0.qcow2", &b"abc"[..]),
+        ("disk1.qcow2", b"abcde"),
+        ("vars.fd", b"uefi"),
+    ] {
+        assert_eq!(put_file(client, id, file, data).await.0, StatusCode::OK);
+    }
+    let (status, got) = complete(client, id).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    id
+}
+
+/// 증분 백업을 아는 온라인인 다른 노드
+async fn current_node(env: &Env, name: &str) -> Uuid {
+    let id = other_node(env, name).await;
+    let mut node = env.cluster.get::<NodeSpec>(id).unwrap().unwrap();
+    node.status.features = opl_types::node::FEATURES
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+    env.cluster
+        .update_status::<NodeSpec>(id, &node.status)
+        .await
+        .unwrap();
+    id
+}
+
+/// 매니페스트 `parent`의 백업을 부모로 둔 증분 백업의 매니페스트(버전 2)
+fn incremental_manifest(parent: &Value) -> Value {
+    let mut m = manifest();
+    m["version"] = json!(2);
+    m["parent"] = parent["backup"].clone();
+    m["vm"] = parent["vm"].clone();
+    m
+}
+
+/// 받는 쪽 부모 사본이 `copy`인 증분 백업의 받기 요청
+fn incremental_body(m: &Value, copy: Uuid) -> Value {
+    let mut body = receive_body(m);
+    body["parent"] = json!(copy);
+    body
+}
+
+/// 증분 백업은 받는 쪽 부모 사본(`parent`)과 함께 받는다: 받는 중인 사본의 `status.parent`가 그 사본이고,
+/// 완료가 쓴 매니페스트는 버전 2에 자기 id와 부모 사본 id다. 부모 사본은 자식이 있는 동안(받는 중 포함)
+/// 지우지 못한다(409 `backup_in_use`).
+#[tokio::test]
+async fn an_incremental_copy_records_its_parent_copy() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let full = manifest();
+    let parent = ready_copy(&admin, receive_body(&full)).await;
+    let m = incremental_manifest(&full);
+    let id = receive_ok(&admin, incremental_body(&m, parent)).await;
+    let b = get_backup(&env, id).unwrap();
+    assert_eq!(b.status.phase, BackupPhase::Receiving);
+    assert_eq!(b.status.parent, Some(parent));
+    assert_eq!(
+        b.spec.origin.as_ref().unwrap().backup.to_string(),
+        m["backup"].as_str().unwrap()
+    );
+    assert_error(
+        &admin.delete(&format!("/backups/{parent}")).await,
+        StatusCode::CONFLICT,
+        "backup_in_use",
+    );
+
+    for (file, data) in [
+        ("disk0.qcow2", &b"abc"[..]),
+        ("disk1.qcow2", b"abcde"),
+        ("vars.fd", b"uefi"),
+    ] {
+        assert_eq!(put_file(&admin, id, file, data).await.0, StatusCode::OK);
+    }
+    let (status, got) = complete(&admin, id).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["status"]["parent"], parent.to_string());
+    let written: BackupManifest =
+        serde_json::from_slice(&std::fs::read(dir_of(&env, id).join(MANIFEST_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(written.version, MANIFEST_VERSION_INCREMENTAL);
+    assert_eq!(written.backup, id);
+    assert_eq!(written.parent, Some(parent));
+    // 전체 사본의 매니페스트는 그대로 버전 1에 부모가 없다.
+    let written: BackupManifest =
+        serde_json::from_slice(&std::fs::read(dir_of(&env, parent).join(MANIFEST_FILE)).unwrap())
+            .unwrap();
+    assert_eq!((written.version, written.parent), (MANIFEST_VERSION, None));
+    assert_error(
+        &admin.delete(&format!("/backups/{parent}")).await,
+        StatusCode::CONFLICT,
+        "backup_in_use",
+    );
+}
+
+/// 부모 사본이 없거나 맞지 않으면(다른 풀, `ready`가 아님, 다른 CA 지문, 다른 원본, 다른 노드의 파일, 지우는
+/// 중) 409 `replica_parent_missing`이고 `details.parent`가 요청한 id다. 요청의 `parent`와 매니페스트의 버전·
+/// `parent`가 어긋나면 400이다.
+#[tokio::test]
+async fn an_incremental_copy_needs_a_matching_parent_copy() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    dir_pool(&env, "dr2", true, vec![]).await;
+    let full = manifest();
+    let parent = ready_copy(&admin, receive_body(&full)).await;
+    let m = incremental_manifest(&full);
+    let missing = |got: &(StatusCode, Value), copy: Uuid| {
+        assert_error(got, StatusCode::CONFLICT, "replica_parent_missing");
+        assert_eq!(got.1["details"]["parent"], copy.to_string(), "{}", got.1);
+    };
+
+    // 없는 사본
+    let unknown = Uuid::now_v7();
+    let got = admin
+        .post("/backups/receive", incremental_body(&m, unknown))
+        .await;
+    missing(&got, unknown);
+    assert!(
+        got.1["message"]
+            .as_str()
+            .unwrap()
+            .contains("send the parent first"),
+        "{}",
+        got.1
+    );
+    // 다른 풀의 사본
+    let mut body = incremental_body(&m, parent);
+    body["pool"] = json!("dr2");
+    missing(&admin.post("/backups/receive", body).await, parent);
+    // 받는 중인 사본
+    let other = manifest();
+    let receiving = receive_ok(&admin, receive_body(&other)).await;
+    missing(
+        &admin
+            .post(
+                "/backups/receive",
+                incremental_body(&incremental_manifest(&other), receiving),
+            )
+            .await,
+        receiving,
+    );
+    // 다른 클러스터(CA 지문)의 사본
+    let foreign_full = manifest();
+    let mut body = receive_body(&foreign_full);
+    body["origin"]["ca_fingerprint"] = json!(format!("sha256:{}", "cd".repeat(32)));
+    let foreign = ready_copy(&admin, body).await;
+    missing(
+        &admin
+            .post(
+                "/backups/receive",
+                incremental_body(&incremental_manifest(&foreign_full), foreign),
+            )
+            .await,
+        foreign,
+    );
+    // 매니페스트의 부모가 사본의 원본이 아니다.
+    let mut wrong = m.clone();
+    wrong["parent"] = json!(Uuid::now_v7());
+    missing(
+        &admin
+            .post("/backups/receive", incremental_body(&wrong, parent))
+            .await,
+        parent,
+    );
+    // 공유가 아닌 풀에서 사본의 파일이 다른 노드에 있다.
+    let node2 = current_node(&env, "node2").await;
+    let mut b = get_backup(&env, parent).unwrap();
+    b.status.node = Some(node2);
+    env.cluster
+        .update_status::<BackupSpec>(parent, &b.status)
+        .await
+        .unwrap();
+    missing(
+        &admin
+            .post("/backups/receive", incremental_body(&m, parent))
+            .await,
+        parent,
+    );
+    b.status.node = Some(env.node);
+    env.cluster
+        .update_status::<BackupSpec>(parent, &b.status)
+        .await
+        .unwrap();
+
+    // 버전과 parent가 어긋난다.
+    let bad = |edit: &dyn Fn(&mut Value), copy: Option<Uuid>| {
+        let mut m = m.clone();
+        edit(&mut m);
+        match copy {
+            Some(copy) => incremental_body(&m, copy),
+            None => receive_body(&m),
+        }
+    };
+    for body in [
+        bad(&|m| m["version"] = json!(1), Some(parent)),
+        bad(&|m| m["version"] = json!(3), Some(parent)),
+        bad(
+            &|m| {
+                m.as_object_mut().unwrap().remove("parent");
+            },
+            Some(parent),
+        ),
+        bad(&|_| {}, None),
+        bad(&|m| m["version"] = json!(1), None),
+    ] {
+        let got = admin.post("/backups/receive", body.clone()).await;
+        assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let before = env.cluster.list::<BackupSpec>().unwrap().1.len();
+
+    // 지우는 중인 사본
+    env.stop_runner().await;
+    let (status, task) = admin.delete(&format!("/backups/{parent}")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    missing(
+        &admin
+            .post("/backups/receive", incremental_body(&m, parent))
+            .await,
+        parent,
+    );
+    assert_eq!(env.cluster.list::<BackupSpec>().unwrap().1.len(), before);
+    env.start_runner().await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+}
+
+/// 증분 사본은 이 클러스터의 모든 노드가 증분 복제(`incremental-replication`)를 알 때만 받는다(409
+/// `cluster_upgrading`). 증분 백업만 아는 계획 40 노드도 증분 받기를 모른다. 전체 사본은 그대로 받는다.
+#[tokio::test]
+async fn incremental_copies_wait_for_every_node_to_know_incremental_replication() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let full = manifest();
+    let parent = ready_copy(&admin, receive_body(&full)).await;
+    // 증분 백업은 알지만 증분 받기는 모르는 노드(계획 40)
+    let old = other_node(&env, "node2").await;
+    let mut node = env.cluster.get::<NodeSpec>(old).unwrap().unwrap();
+    node.status.features = vec!["node-drain".into(), "incremental-backup".into()];
+    env.cluster
+        .update_status::<NodeSpec>(old, &node.status)
+        .await
+        .unwrap();
+    let got = admin
+        .post(
+            "/backups/receive",
+            incremental_body(&incremental_manifest(&full), parent),
+        )
+        .await;
+    assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+    assert!(
+        got.1["message"]
+            .as_str()
+            .unwrap()
+            .contains("incremental replication"),
+        "{}",
+        got.1
+    );
+    receive_ok(&admin, receive_body(&manifest())).await;
+}
+
+/// 완료할 때도 부모 사본을 다시 본다: 받는 사이 부모 사본이 `ready`가 아니게 됐거나 없어졌으면 409
+/// `replica_parent_missing`(`details.parent`)이고 사본은 받는 중으로 남는다.
+#[tokio::test]
+async fn completing_an_incremental_copy_checks_its_parent_copy_again() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let full = manifest();
+    let parent = ready_copy(&admin, receive_body(&full)).await;
+    let id = receive_ok(
+        &admin,
+        incremental_body(&incremental_manifest(&full), parent),
+    )
+    .await;
+    for (file, data) in [
+        ("disk0.qcow2", &b"abc"[..]),
+        ("disk1.qcow2", b"abcde"),
+        ("vars.fd", b"uefi"),
+    ] {
+        assert_eq!(put_file(&admin, id, file, data).await.0, StatusCode::OK);
+    }
+    let missing = |got: &(StatusCode, Value)| {
+        assert_error(got, StatusCode::CONFLICT, "replica_parent_missing");
+        assert_eq!(got.1["details"]["parent"], parent.to_string(), "{}", got.1);
+        assert!(
+            got.1["message"]
+                .as_str()
+                .unwrap()
+                .contains("send the parent first"),
+            "{}",
+            got.1
+        );
+    };
+
+    // 부모 사본이 ready가 아니다.
+    let mut b = get_backup(&env, parent).unwrap();
+    b.status.phase = BackupPhase::Failed;
+    env.cluster
+        .update_status::<BackupSpec>(parent, &b.status)
+        .await
+        .unwrap();
+    missing(&complete(&admin, id).await);
+    assert_eq!(
+        get_backup(&env, id).unwrap().status.phase,
+        BackupPhase::Receiving
+    );
+    // 부모 사본이 없어졌다.
+    env.cluster
+        .delete::<BackupSpec>(parent, None)
+        .await
+        .unwrap();
+    missing(&complete(&admin, id).await);
+    assert_eq!(
+        get_backup(&env, id).unwrap().status.phase,
+        BackupPhase::Receiving
     );
 }

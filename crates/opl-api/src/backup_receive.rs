@@ -16,7 +16,7 @@ use opl_cluster::types::Rejection;
 use opl_driver::check_pool_root;
 use opl_types::backup::{
     Backup, BackupDisk, BackupManifest, BackupOrigin, BackupPhase, BackupSpec, BackupStatus,
-    MANIFEST_VERSION, backup_dir, default_backup_name,
+    MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, default_backup_name,
 };
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::storage::{StoragePool, is_shared};
@@ -27,8 +27,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
-use crate::backups::{check_not_deleting, find_pool, node_name, now};
-use crate::cluster::require_current;
+use crate::backups::{backup_tasks, check_not_deleting, find_pool, node_name, now};
+use crate::cluster::{require_current, require_feature};
 use crate::error::{ApiError, Json};
 use crate::resources::{check_name, lookup};
 use crate::state::AppState;
@@ -50,6 +50,9 @@ pub struct ReceiveRequest {
     /// 원본 백업의 매니페스트(`manifest.json`)
     pub manifest: BackupManifest,
     pub origin: BackupOrigin,
+    /// 증분 백업이면 받는 쪽(이 클러스터)에 있는 부모 사본의 id. 전체 백업이면 뺀다.
+    #[serde(default)]
+    pub parent: Option<Uuid>,
 }
 
 /// 받기 시작한 백업
@@ -67,13 +70,25 @@ pub struct ReceivedFile {
     pub size: u64,
 }
 
-/// 매니페스트 검사: 이 노드가 읽는 버전, 디스크 수가 VM 스펙과 같고 디스크 `i`가 `disk{i}` 이름과
-/// `disk{i}.qcow2` 파일, VM 이름과 스펙이 올바름. 아니면 400.
-fn check_manifest(m: &BackupManifest) -> Result<(), ApiError> {
-    if m.version != MANIFEST_VERSION {
+/// 매니페스트 검사: 이 노드가 읽는 버전, 부모 사본(`parent`)이 없으면 버전 1에 `parent`가 없고 있으면
+/// 버전 2에 `parent`가 있음, 디스크 수가 VM 스펙과 같고 디스크 `i`가 `disk{i}` 이름과 `disk{i}.qcow2`
+/// 파일, VM 이름과 스펙이 올바름. 아니면 400.
+fn check_manifest(m: &BackupManifest, parent: Option<Uuid>) -> Result<(), ApiError> {
+    if ![MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL].contains(&m.version) {
         return Err(ApiError::bad_request(format!(
-            "backup manifest version {} is not supported (this node reads version {MANIFEST_VERSION})",
+            "backup manifest version {} is not supported (this node reads versions {MANIFEST_VERSION} and {MANIFEST_VERSION_INCREMENTAL})",
             m.version
+        )));
+    }
+    if parent.is_some() {
+        if m.version != MANIFEST_VERSION_INCREMENTAL || m.parent.is_none() {
+            return Err(ApiError::bad_request(format!(
+                "an incremental backup (sent with a parent copy) needs manifest version {MANIFEST_VERSION_INCREMENTAL} with a parent"
+            )));
+        }
+    } else if m.version != MANIFEST_VERSION || m.parent.is_some() {
+        return Err(ApiError::bad_request(format!(
+            "a full backup (sent without a parent copy) needs manifest version {MANIFEST_VERSION} without a parent"
         )));
     }
     validate_name(&m.vm_name)
@@ -131,6 +146,48 @@ fn pool_root(state: &AppState, pool: &StoragePool) -> Result<PathBuf, ApiError> 
     })
 }
 
+/// 증분 백업의 부모 사본 `parent` 확인: 같은 풀에 `ready`이고, 같은 CA 지문의 원본에서 왔고 그 원본이
+/// 매니페스트의 `parent`이고, 공유가 아닌 풀이면 파일이 이 노드에 있고, 지우는 중이 아니어야 한다. 아니면
+/// 409 `replica_parent_missing`(`details.parent`가 그 id).
+fn check_parent_copy(
+    state: &AppState,
+    backups: &[Backup],
+    pool: &StoragePool,
+    parent: Uuid,
+    origin: &BackupOrigin,
+    manifest_parent: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let copy = backups.iter().find(|b| b.id == parent);
+    let matches = match copy {
+        Some(p) => {
+            p.spec.pool == pool.name
+                && p.status.phase == BackupPhase::Ready
+                && p.spec.origin.as_ref().is_some_and(|o| {
+                    o.ca_fingerprint == origin.ca_fingerprint && Some(o.backup) == manifest_parent
+                })
+                && (is_shared(pool) || p.status.node == Some(state.node))
+                && !backup_tasks(state, p.id)?.contains(&"being deleted")
+        }
+        None => false,
+    };
+    if matches {
+        return Ok(());
+    }
+    Err(parent_missing(parent))
+}
+
+/// 409 `replica_parent_missing`: 증분 백업의 부모 사본 `parent`가 없거나 맞지 않는다(`details.parent`).
+fn parent_missing(parent: Uuid) -> ApiError {
+    let mut e = ApiError::conflict(
+        "replica_parent_missing",
+        format!(
+            "the parent copy {parent} of this incremental backup is missing or does not match; send the parent first"
+        ),
+    );
+    e.details = Some(serde_json::json!({ "parent": parent }));
+    e
+}
+
 /// 풀에 매니페스트의 디스크 파일을 받을 자리가 없으면 507 `insufficient_storage`
 fn check_space(root: &FsPath, manifest: &BackupManifest) -> Result<(), ApiError> {
     let need = manifest
@@ -152,7 +209,10 @@ fn check_space(root: &FsPath, manifest: &BackupManifest) -> Result<(), ApiError>
 /// 만들고 백업 풀에 그 디렉터리를 만든다. 풀이 없거나 백업 풀이 아니거나 매니페스트가 올바르지 않으면
 /// 400, 풀을 이 노드에서 쓸 수 없으면 409 `pool_not_on_node`·`pool_unavailable`, 같은 원본(CA 지문과
 /// 원본 id)의 사본이 같은 풀에 있으면 409 `replica_exists`(`details.backup`이 그 id), 풀에 디스크 파일을
-/// 받을 자리가 없으면 507 `insufficient_storage`, 옛 노드가 있으면 409 `cluster_upgrading`.
+/// 받을 자리가 없으면 507 `insufficient_storage`, 옛 노드가 있으면 409 `cluster_upgrading`. 증분 백업은
+/// `parent`로 이 클러스터의 부모 사본을 함께 보낸다: 맞는 부모 사본이 없으면 409
+/// `replica_parent_missing`, 증분 받기(`incremental-replication`)를 모르는 노드가 있으면 409
+/// `cluster_upgrading`.
 #[utoipa::path(post, path = "/backups/receive", tag = "backups",
     request_body = ReceiveRequest,
     responses((status = 201, body = ReceivingBackup), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -167,6 +227,10 @@ pub async fn receive_backup(
     }
     // 옛 노드는 받는 중인 백업과 출처를 모른다.
     require_current(&state.cluster)?;
+    // 계획 40 노드는 증분 백업을 알아도 `parent`가 있는 받기 요청을 모른다.
+    if req.parent.is_some() {
+        require_feature(&state.cluster, "incremental-replication")?;
+    }
     let pool = find_pool(&state, &req.pool)?;
     if !pool.spec.backups {
         return Err(ApiError::bad_request(format!(
@@ -176,7 +240,7 @@ pub async fn receive_backup(
     }
     let root = pool_root(&state, &pool)?;
     let manifest = req.manifest;
-    check_manifest(&manifest)?;
+    check_manifest(&manifest, req.parent)?;
     let (_, backups) = state.cluster.list::<BackupSpec>()?;
     if let Some(copy) = backups.iter().find(|b| {
         // 같은 원본이라도 다른 풀에 받은 것은 다른 사본이다.
@@ -194,6 +258,16 @@ pub async fn receive_backup(
         );
         e.details = Some(serde_json::json!({ "backup": copy.id }));
         return Err(e);
+    }
+    if let Some(parent) = req.parent {
+        check_parent_copy(
+            &state,
+            &backups,
+            &pool,
+            parent,
+            &req.origin,
+            manifest.parent,
+        )?;
     }
     check_space(&root, &manifest)?;
     let taken: HashSet<&str> = backups.iter().map(|b| b.name.as_str()).collect();
@@ -230,7 +304,7 @@ pub async fn receive_backup(
         node: (!is_shared(&pool)).then_some(state.node),
         replicas: Vec::new(),
         received_at: None,
-        parent: None,
+        parent: req.parent,
         full_reason: None,
     };
     // 그사이 같은 이름이 생겼으면 저장소가 거부한다(409 name_taken).
@@ -495,9 +569,10 @@ async fn file_size(path: &FsPath) -> Option<u64> {
 }
 
 /// 받기를 끝낸다(200, 백업): 모든 파일이 있고 디스크 파일 크기가 매니페스트와 같으면 매니페스트를
-/// (`backup`은 이 클러스터의 백업 id로) 쓰고 `ready`로 바꾼다. 빠지거나 크기가 다른 파일이 있으면 409
-/// `backup_incomplete`(`details.files`가 그 파일들), 받는 중이 아니면 409 `backup_not_receiving`, 지우는
-/// Task가 걸려 있으면 409 `backup_busy`.
+/// (`backup`은 이 클러스터의 백업 id로, 증분이면 버전 2에 `parent`는 부모 사본 id로) 쓰고 `ready`로
+/// 바꾼다. 빠지거나 크기가 다른 파일이 있으면 409 `backup_incomplete`(`details.files`가 그 파일들), 받는
+/// 중이 아니면 409 `backup_not_receiving`, 지우는 Task가 걸려 있으면 409 `backup_busy`, 증분 사본의 부모
+/// 사본이 없어졌거나 `ready`가 아니거나 지우는 중이면 409 `replica_parent_missing`.
 #[utoipa::path(post, path = "/backups/{key}/actions/complete", tag = "backups",
     params(("key" = String, Path, description = "id or name")),
     responses(
@@ -532,15 +607,32 @@ pub async fn complete_backup(
         e.details = Some(serde_json::json!({ "files": missing }));
         return Err(e);
     }
+    // 받는 사이 부모 사본이 바뀌었을 수 있다(받기의 확인 뒤).
+    if let Some(parent) = backup.status.parent {
+        let usable = match state.cluster.get::<BackupSpec>(parent)? {
+            Some(p) => {
+                p.status.phase == BackupPhase::Ready
+                    && !backup_tasks(&state, p.id)?.contains(&"being deleted")
+            }
+            None => false,
+        };
+        if !usable {
+            return Err(parent_missing(parent));
+        }
+    }
     // 그사이 받은 파일의 기록을 덮지 않게 읽은 revision에서만 쓰고, 어긋나면 다시 읽은 상태로
     // 매니페스트부터 다시 쓴다.
     let mut current = backup;
     loop {
-        // 복원은 매니페스트의 백업 id가 이 백업의 id인지 확인한다.
+        // 복원은 매니페스트의 백업 id(증분이면 부모 id도)가 이 클러스터의 것인지 확인한다.
         let manifest = BackupManifest {
-            version: MANIFEST_VERSION,
+            version: if current.status.parent.is_some() {
+                MANIFEST_VERSION_INCREMENTAL
+            } else {
+                MANIFEST_VERSION
+            },
             backup: current.id,
-            parent: None,
+            parent: current.status.parent,
             vm: current.spec.vm,
             vm_name: current.spec.vm_name.clone(),
             vm_spec: current.spec.vm_spec.clone(),

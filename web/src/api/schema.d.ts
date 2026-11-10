@@ -229,7 +229,10 @@ export interface paths {
          *     만들고 백업 풀에 그 디렉터리를 만든다. 풀이 없거나 백업 풀이 아니거나 매니페스트가 올바르지 않으면
          *     400, 풀을 이 노드에서 쓸 수 없으면 409 `pool_not_on_node`·`pool_unavailable`, 같은 원본(CA 지문과
          *     원본 id)의 사본이 같은 풀에 있으면 409 `replica_exists`(`details.backup`이 그 id), 풀에 디스크 파일을
-         *     받을 자리가 없으면 507 `insufficient_storage`, 옛 노드가 있으면 409 `cluster_upgrading`.
+         *     받을 자리가 없으면 507 `insufficient_storage`, 옛 노드가 있으면 409 `cluster_upgrading`. 증분 백업은
+         *     `parent`로 이 클러스터의 부모 사본을 함께 보낸다: 맞는 부모 사본이 없으면 409
+         *     `replica_parent_missing`, 증분 받기(`incremental-replication`)를 모르는 노드가 있으면 409
+         *     `cluster_upgrading`.
          */
         post: operations["receive_backup"];
         delete?: never;
@@ -273,9 +276,10 @@ export interface paths {
         put?: never;
         /**
          * 받기를 끝낸다(200, 백업): 모든 파일이 있고 디스크 파일 크기가 매니페스트와 같으면 매니페스트를
-         *     (`backup`은 이 클러스터의 백업 id로) 쓰고 `ready`로 바꾼다. 빠지거나 크기가 다른 파일이 있으면 409
-         *     `backup_incomplete`(`details.files`가 그 파일들), 받는 중이 아니면 409 `backup_not_receiving`, 지우는
-         *     Task가 걸려 있으면 409 `backup_busy`.
+         *     (`backup`은 이 클러스터의 백업 id로, 증분이면 버전 2에 `parent`는 부모 사본 id로) 쓰고 `ready`로
+         *     바꾼다. 빠지거나 크기가 다른 파일이 있으면 409 `backup_incomplete`(`details.files`가 그 파일들), 받는
+         *     중이 아니면 409 `backup_not_receiving`, 지우는 Task가 걸려 있으면 409 `backup_busy`, 증분 사본의 부모
+         *     사본이 없어졌거나 `ready`가 아니거나 지우는 중이면 409 `replica_parent_missing`.
          */
         post: operations["complete_backup"];
         delete?: never;
@@ -3315,6 +3319,11 @@ export interface components {
             /** @description 받는 쪽 백업 이름. 없으면 `{VM 이름}-{만든 시각}`이고, 겹치면 뒤에 `-2`, `-3`…을 붙인다. */
             name?: string | null;
             origin: components["schemas"]["BackupOrigin"];
+            /**
+             * Format: uuid
+             * @description 증분 백업이면 받는 쪽(이 클러스터)에 있는 부모 사본의 id. 전체 백업이면 뺀다.
+             */
+            parent?: string | null;
             /** @description 받을 백업 풀. 이 노드에서 쓸 수 있어야 한다. */
             pool: string;
         };

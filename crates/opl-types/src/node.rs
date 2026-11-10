@@ -80,7 +80,11 @@ pub struct NodeStatus {
 }
 
 /// 이 빌드가 아는 기능. 노드가 [`NodeStatus::features`]에 적는다.
-pub const FEATURES: &[&str] = &["node-drain", "incremental-backup"];
+pub const FEATURES: &[&str] = &[
+    "node-drain",
+    "incremental-backup",
+    "incremental-replication",
+];
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -301,7 +305,11 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(
             json["features"],
-            serde_json::json!(["node-drain", "incremental-backup"])
+            serde_json::json!([
+                "node-drain",
+                "incremental-backup",
+                "incremental-replication"
+            ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
