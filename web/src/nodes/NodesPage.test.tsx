@@ -471,7 +471,9 @@ it("drains a node after saying how many running VMs move", async () => {
   const confirm = await screen.findByRole("alertdialog", { name: "Drain node-a?" });
   // node-a에서 켜 둔 VM 둘만 센다(꺼진 VM과 다른 노드의 VM은 빼고).
   await vi.waitFor(() => expect(confirm).toHaveTextContent("2 running VMs will be moved"));
-  expect(confirm).toHaveTextContent("VMs whose disks are on a local pool cannot be moved");
+  expect(confirm).toHaveTextContent(
+    "VMs with disks on node-local pools are moved by copying their disks to a node with a pool of the same name (VMs with snapshots cannot be moved).",
+  );
   await userEvent.click(within(confirm).getByRole("button", { name: "Drain" }));
   expect(await screen.findByText("Drain node-a")).toBeInTheDocument();
   expect(posted).toBe(1);

@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
+import { describeProgress } from "@/tasks/tasks";
 import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
 import {
   ACTIONS,
@@ -146,6 +147,9 @@ function VmHeader({ vm }: { vm: Vm }) {
     migration && migration.node !== nodeId
       ? nodes.data?.find((n) => n.id === migration.node)
       : undefined;
+  // 옮기는 중이면 그 마이그레이션 Task의 진행률(디스크 복사, 메모리)
+  const migrationTask = migration && vmTasks.find((task) => task.id === migration.task);
+  const progress = migrationTask ? describeProgress(migrationTask, t) : null;
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
   // Task 목록을 아직 모르면 Task 때문에는 막지 않는다(서버에 맡긴다).
@@ -182,6 +186,7 @@ function VmHeader({ vm }: { vm: Vm }) {
             {target ? t("vms.migratingTo", { from: node.name, to: target.name }) : node.name}
           </span>
         )}
+        {progress && <span className="text-sm text-muted-foreground">{progress}</span>}
       </div>
       <div className="flex flex-wrap gap-2">
         {operate && ACTIONS.map(button)}

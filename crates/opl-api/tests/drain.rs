@@ -7,11 +7,12 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Client, Env, MOUNT_ROOT, vm_request};
+use common::{Client, Env, MOUNT_ROOT, set_pool_state, vm_request};
 use opl_driver::DirStorage;
-use opl_types::node::{FEATURES, Node, NodeSpec, NodeStatus};
+use opl_types::node::{FEATURES, Node, NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
+use opl_types::snapshot::{Snapshot, SnapshotSpec};
 use opl_types::storage::{Volume, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
 use opl_types::version::BUILD;
@@ -233,7 +234,7 @@ async fn vms_that_cannot_move_are_reported() {
     assert_eq!(task["status"]["state"], "failed", "{task}");
     assert_eq!(
         task["status"]["error"],
-        "2 VM(s) were not moved: db (disks on a local pool), web (no node with capacity)"
+        "2 VM(s) were not moved: db (no node with capacity), web (no node with capacity)"
     );
     assert!(maintenance(&env, env.node));
 
@@ -248,7 +249,7 @@ async fn vms_that_cannot_move_are_reported() {
     let task = admin.wait_task(&task).await;
     assert_eq!(
         task["status"]["error"],
-        "2 VM(s) were not moved: db (disks on a local pool), web (hvf node)"
+        "2 VM(s) were not moved: db (hvf node), web (hvf node)"
     );
 }
 
@@ -286,6 +287,117 @@ async fn drain_skips_nodes_that_cannot_take_the_vm() {
             node: small,
             pool: None
         }]
+    );
+}
+
+/// 로컬 디스크 VM의 대상은 같은 이름의 풀을 쓸 수 있는 노드 가운데 남은 메모리가 가장 많은 노드다.
+/// 풀을 지정하지 않는다(같은 이름 규칙).
+#[tokio::test]
+async fn local_disk_vms_go_to_a_node_that_can_use_the_same_pool() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "db", "local", false).await;
+    // 메모리가 더 많아도 그 풀이 준비되지 않은 노드는 고르지 않는다.
+    let big = add_node(&env, "big", |n| n.status.memory_mib = 65536).await;
+    set_pool_state(&env.cluster, big, "local", PoolState::default()).await;
+    let small = add_node(&env, "small", |_| {}).await;
+
+    let (status, task) = drain(&admin, "node1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    let migrations: Vec<&TaskOp> = tasks
+        .iter()
+        .map(|t| &t.spec.op)
+        .filter(|op| matches!(op, TaskOp::VmMigrate { .. }))
+        .collect();
+    assert_eq!(
+        migrations,
+        [&TaskOp::VmMigrate {
+            node: small,
+            pool: None
+        }]
+    );
+}
+
+/// 로컬 디스크 VM을 옮기지 못하는 이유: 같은 이름의 풀을 쓸 수 있는 노드가 없음, 디스크 복사를 모르는
+/// 노드(위트니스 포함), 스냅샷.
+#[tokio::test]
+async fn local_disk_vms_that_cannot_move_are_reported() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "db", "local", false).await;
+    let node2 = add_node(&env, "node2", |_| {}).await;
+    set_pool_state(&env.cluster, node2, "local", PoolState::default()).await;
+
+    let error = |task: Value| task["status"]["error"].as_str().unwrap().to_string();
+    let (_, task) = drain(&admin, "node1").await;
+    assert_eq!(
+        error(admin.wait_task(&task).await),
+        "1 VM(s) were not moved: db (no node can take its local disks)"
+    );
+
+    let old = add_node(&env, "old", |n| {
+        n.spec.witness = true;
+        n.status.features.retain(|f| f != "storage-migration");
+    })
+    .await;
+    let (_, task) = drain(&admin, "node1").await;
+    assert_eq!(
+        error(admin.wait_task(&task).await),
+        "1 VM(s) were not moved: db (disks on a local pool (some nodes do not support storage migration yet))"
+    );
+    env.cluster.delete::<NodeSpec>(old, None).await.unwrap();
+
+    let vm = env
+        .cluster
+        .get_by_name::<opl_types::vm::VmSpec>("db")
+        .unwrap()
+        .unwrap();
+    let mut snapshot: Snapshot = Resource::new(
+        "",
+        SnapshotSpec {
+            vm: vm.id,
+            name: "s1".into(),
+            parent: None,
+            memory: false,
+            description: String::new(),
+            scheduled: false,
+            vm_spec: vm.spec.clone(),
+        },
+    );
+    snapshot.name = snapshot.id.to_string();
+    env.cluster.create(&snapshot).await.unwrap();
+    let (_, task) = drain(&admin, "node1").await;
+    assert_eq!(
+        error(admin.wait_task(&task).await),
+        "1 VM(s) were not moved: db (disks on a local pool and snapshots)"
+    );
+}
+
+/// "no node can take its local disks"는 풀 때문일 때만이다: 옮길 디스크를 빼면 받을 노드가 있을 때.
+/// 메모리가 모자란 노드뿐이면 풀과 상관없이 "no node with capacity"다.
+#[tokio::test]
+async fn local_disk_vms_without_room_anywhere_lack_capacity() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "db", "local", false).await;
+    let small = add_node(&env, "small", |n| n.status.memory_mib = 1).await;
+    let error = |task: Value| task["status"]["error"].as_str().unwrap().to_string();
+
+    // 풀은 쓸 수 있지만 메모리가 모자란다.
+    let (_, task) = drain(&admin, "node1").await;
+    assert_eq!(
+        error(admin.wait_task(&task).await),
+        "1 VM(s) were not moved: db (no node with capacity)"
+    );
+    // 풀도 쓸 수 없지만 메모리부터 모자란다.
+    set_pool_state(&env.cluster, small, "local", PoolState::default()).await;
+    let (_, task) = drain(&admin, "node1").await;
+    assert_eq!(
+        error(admin.wait_task(&task).await),
+        "1 VM(s) were not moved: db (no node with capacity)"
     );
 }
 

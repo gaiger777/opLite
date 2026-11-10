@@ -6,15 +6,16 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use opl_types::node::{Node, NodeSpec};
-use opl_types::storage::is_shared;
 use opl_types::task::{TaskOp, TaskSpec, TaskState};
-use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
+use opl_types::vm::{DiskMove, PowerState, Vm, VmPhase, VmSpec};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::Ctx;
+use super::{Ctx, TaskRunnerConfig};
+use crate::cluster::missing_feature;
 use crate::error::ApiError;
-use crate::scheduler::{Inventory, node_fits};
+use crate::scheduler::{Inventory, disk_moves, node_fits_with};
+use crate::snapshots::count_snapshots;
 use crate::state::AppState;
 use crate::vms::start_migration;
 
@@ -188,22 +189,42 @@ async fn move_vm(ctx: &Ctx, state: &AppState, node: Uuid, vm: &Vm) -> Result<Out
         Ok(inv) => inv,
         Err(e) => return Ok(Outcome::NotMoved(e.to_string())),
     };
-    let shared = vm.spec.disks.iter().all(|disk| {
-        inv.volumes
-            .iter()
-            .find(|v| v.name == disk.volume)
-            .and_then(|v| inv.pools.iter().find(|p| p.name == v.spec.pool))
-            .is_some_and(is_shared)
-    });
-    if !shared {
-        return Ok(Outcome::NotMoved("disks on a local pool".into()));
+    // 노드 로컬 풀의 디스크는 대상 노드의 같은 이름 풀로 복사한다(`pool`은 주지 않는다).
+    let moves = disk_moves(&vm.spec, &inv, None);
+    if !moves.is_empty() {
+        let old = match missing_feature(&ctx.cluster, "storage-migration") {
+            Ok(old) => old,
+            Err(e) => return Ok(Outcome::NotMoved(e.to_string())),
+        };
+        if !old.is_empty() {
+            return Ok(Outcome::NotMoved(
+                "disks on a local pool (some nodes do not support storage migration yet)".into(),
+            ));
+        }
+        match count_snapshots(state, vm.id) {
+            Ok(0) => {}
+            Ok(_) => {
+                return Ok(Outcome::NotMoved(
+                    "disks on a local pool and snapshots".into(),
+                ));
+            }
+            Err(e) => return Ok(Outcome::NotMoved(e.message)),
+        }
     }
     // HVF는 이 노드의 hypervisor 이름으로만 알 수 있다(macOS 노드).
     if me.status.hypervisor == HVF {
         return Ok(Outcome::NotMoved("hvf node".into()));
     }
-    let Some(target) = pick_target(vm, &inv) else {
-        return Ok(Outcome::NotMoved("no node with capacity".into()));
+    let Some(target) = pick_target(vm, &inv, &moves) else {
+        // 옮길 디스크가 없었다면(공유 디스크처럼) 받을 노드가 있었으면 풀 때문이다.
+        let reason = if !moves.is_empty()
+            && pick_target(&without_disks(vm, &inv, &moves), &inv, &[]).is_some()
+        {
+            "no node can take its local disks"
+        } else {
+            "no node with capacity"
+        };
+        return Ok(Outcome::NotMoved(reason.into()));
     };
     let task = match start_migration(state, vm.id, target, None, Some(node)).await {
         // 확인과 만들기 사이에 다른 Task가 들어왔다. 한 번 더 자리 잡기를 기다려 다시 한다.
@@ -219,22 +240,39 @@ async fn move_vm(ctx: &Ctx, state: &AppState, node: Uuid, vm: &Vm) -> Result<Out
         r => r,
     };
     match task {
-        Ok(task) => Ok(wait_migration(ctx, task.id).await),
+        Ok(task) => {
+            let wait = migration_wait(&ctx.config, !moves.is_empty());
+            Ok(wait_migration(ctx, task.id, wait).await)
+        }
         Err(e) => Ok(rejected(e)),
     }
 }
 
 /// VM을 받을 수 있는 노드(스케줄러의 조건을 지나고 HVF가 아니며 남은 메모리가 VM 메모리 이상) 가운데
 /// 남은 메모리가 가장 많은 노드. 같으면 id가 작은 노드다. 스케줄러는 유지보수 노드(이 노드)를 고르지
-/// 않는다.
-fn pick_target(vm: &Vm, inv: &Inventory) -> Option<Uuid> {
+/// 않는다. 옮길 디스크(`moves`)가 있으면 그 대상 풀을 쓸 수 있는 노드만이다.
+fn pick_target(vm: &Vm, inv: &Inventory, moves: &[DiskMove]) -> Option<Uuid> {
     inv.nodes
         .iter()
-        .filter(|n| n.status.hypervisor != HVF && node_fits(&vm.spec, inv, n).is_ok())
+        .filter(|n| n.status.hypervisor != HVF && node_fits_with(&vm.spec, inv, n, moves).is_ok())
         .map(|n| (inv.free_memory_mib(n, vm.id), n.id))
         .filter(|(free, _)| *free >= i64::from(vm.spec.memory_mib))
         .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
         .map(|(_, id)| id)
+}
+
+/// 옮길 디스크(`moves`)를 뺀 VM: 그 디스크의 풀을 보지 않고(공유 디스크처럼) 받을 노드를 찾는다.
+fn without_disks(vm: &Vm, inv: &Inventory, moves: &[DiskMove]) -> Vm {
+    let mut vm = vm.clone();
+    vm.spec.disks.retain(|d| {
+        let id = inv
+            .volumes
+            .iter()
+            .find(|v| v.name == d.volume)
+            .map(|v| v.id);
+        !moves.iter().any(|m| Some(m.volume) == id)
+    });
+    vm
 }
 
 /// 마이그레이션 API가 거절한 결과. VM이 꺼졌거나 지워졌거나 이미 다른 노드로 갔으면 옮길 것이 없다.
@@ -246,10 +284,21 @@ fn rejected(e: ApiError) -> Outcome {
     }
 }
 
+/// 마이그레이션 Task를 기다리는 한도: `migration_timeout`의 두 배와 1분. 디스크를 복사하면
+/// (`copies_disks`) `migration_disk_timeout`을 더한다.
+fn migration_wait(config: &TaskRunnerConfig, copies_disks: bool) -> Duration {
+    let wait = config.migration_timeout * 2 + Duration::from_secs(60);
+    if copies_disks {
+        wait + config.migration_disk_timeout
+    } else {
+        wait
+    }
+}
+
 /// 마이그레이션 Task가 끝나기를 기다린다. Task는 단계마다 시간 제한이 있지만, 읽기가 계속 실패하거나
-/// 끝나지 않으면 `migration_timeout`의 두 배와 1분 뒤에 그만 기다린다.
-async fn wait_migration(ctx: &Ctx, task: Uuid) -> Outcome {
-    let deadline = Instant::now() + ctx.config.migration_timeout * 2 + Duration::from_secs(60);
+/// 끝나지 않으면 `wait`([`migration_wait`]) 뒤에 그만 기다린다.
+async fn wait_migration(ctx: &Ctx, task: Uuid, wait: Duration) -> Outcome {
+    let deadline = Instant::now() + wait;
     loop {
         match ctx.cluster.get::<TaskSpec>(task) {
             Ok(Some(t)) if t.status.state == TaskState::Succeeded => return Outcome::Moved,
@@ -293,5 +342,22 @@ async fn settle(ctx: &Ctx, node: Uuid, id: Uuid) -> Result<bool, String> {
             return Err("busy".into());
         }
         tokio::time::sleep(ctx.config.poll_interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waiting_for_a_disk_copy_adds_the_disk_timeout() {
+        let mut config = TaskRunnerConfig::new(Uuid::nil());
+        config.migration_timeout = Duration::from_secs(30 * 60);
+        config.migration_disk_timeout = Duration::from_secs(12 * 3600);
+        assert_eq!(migration_wait(&config, false), Duration::from_secs(61 * 60));
+        assert_eq!(
+            migration_wait(&config, true),
+            Duration::from_secs(12 * 3600 + 61 * 60)
+        );
     }
 }

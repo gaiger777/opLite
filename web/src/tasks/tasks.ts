@@ -97,6 +97,28 @@ export function describeTask(
   });
 }
 
+/** 바이트를 소수 한 자리 GiB 숫자로(`14.8`) */
+function gib(bytes: number): string {
+  return (bytes / 1024 ** 3).toFixed(1);
+}
+
+/**
+ * 실행 중인 Task의 진행률 문구(지금은 로컬 디스크를 복사하는 마이그레이션만): "디스크 복사 37% (14.8/40.0
+ * GiB)", "메모리 옮기는 중". 진행률이 없거나 모르는 단계면 null이다.
+ */
+export function describeProgress(task: Task, t: TFunction): string | null {
+  const progress = task.status.progress;
+  if (progress?.stage === "copying-disks") {
+    const { done_bytes: done, total_bytes: total } = progress;
+    const percent = total > 0 ? Math.floor((Math.min(done, total) * 100) / total) : 0;
+    return t("tasks.progress.copyingDisks", { percent, done: gib(done), total: gib(total) });
+  }
+  if (progress?.stage === "migrating-memory") {
+    return t("tasks.progress.migratingMemory");
+  }
+  return null;
+}
+
 /** `waitForTask`가 기다리는 가장 긴 시간. 볼륨 만들기는 보통 몇 초 안에 끝난다. */
 export const TASK_TIMEOUT_MS = 10 * 60 * 1000;
 

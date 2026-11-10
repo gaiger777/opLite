@@ -5,7 +5,7 @@ import { toast } from "sonner";
 
 import type { Node, Principal, Vm } from "@/api/types";
 import { resetTasks } from "@/tasks/tasks";
-import { NODE, task, vm } from "@/test/fixtures";
+import { NODE, pool, poolState, snapshot, task, vm, volume } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -189,4 +189,212 @@ it("does not offer migration to a stopped VM or a viewer", async () => {
   openDetail(VIEWER);
   expect(await screen.findByRole("heading", { name: "web" })).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Migrate" })).not.toBeInTheDocument();
+});
+
+/** 로컬 디렉터리 풀 `local`의 디스크 `web-root`(16 GiB)로 도는 VM */
+const local = served(
+  vm("web", "running", {
+    spec: {
+      ...web.spec,
+      disks: [{ volume: "web-root", bus: "virtio-blk" }],
+    },
+  }),
+);
+const POOLS = [pool("local"), pool("fast"), pool("nas", { shared: true })];
+
+it("copies disks on node-local pools to the chosen pool", async () => {
+  const nodes = [
+    HERE,
+    node("n2", "node-b"),
+    node("n7", "node-g", { pools: { fast: poolState("fast", { ready: false }) } }),
+  ];
+  mockLists({
+    vm: [local],
+    node: nodes,
+    volume: [volume("web-root", "local")],
+    "storage-pool": POOLS,
+  });
+  const bodies: unknown[] = [];
+  server.use(
+    http.post(apiUrl(`/vms/${local.id}/migrate`), async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(task("t1", "vm-migrate", local.id), { status: 202 });
+    }),
+  );
+  openDetail();
+  await userEvent.click(await screen.findByRole("button", { name: "Migrate" }));
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  expect(await within(dialog).findByText("web-root on local, 16 GiB")).toBeInTheDocument();
+  expect(
+    within(dialog).getByText(
+      "1 disk (16 GiB in total) will be copied. This can take a long time, and the VM cannot be stopped, snapshotted or backed up meanwhile.",
+    ),
+  ).toBeInTheDocument();
+  const pools = within(dialog).getByLabelText("Target pool");
+  const options = () =>
+    within(pools)
+      .getAllByRole("option")
+      .map((o) => o.textContent);
+  // 원본 풀과 같은 이름(`local`)은 기본과 같으므로 따로 두지 않는다.
+  await waitFor(() => expect(options()).toEqual(["Pool with the same name", "fast", "nas"]));
+  // 고른 노드에서 준비되지 않은 풀은 고를 수 없다.
+  await userEvent.selectOptions(within(dialog).getByLabelText("Target node"), "n7");
+  expect(options()).toEqual(["Pool with the same name", "nas"]);
+  await userEvent.selectOptions(within(dialog).getByLabelText("Target node"), "n2");
+  await userEvent.selectOptions(pools, "fast");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Migrate" }));
+  expect(await screen.findByText("Migrate web to node-b")).toBeInTheDocument();
+  expect(bodies).toEqual([{ node: "n2", pool: "fast" }]);
+});
+
+it("asks for a target pool when the chosen node has no pool of the same name", async () => {
+  const nodes = [
+    HERE,
+    node("n2", "node-b", { pools: { local: poolState("local", { ready: false }) } }),
+  ];
+  mockLists({
+    vm: [local],
+    node: nodes,
+    volume: [volume("web-root", "local")],
+    "storage-pool": POOLS,
+  });
+  const bodies: unknown[] = [];
+  server.use(
+    http.post(apiUrl(`/vms/${local.id}/migrate`), async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(task("t1", "vm-migrate", local.id), { status: 202 });
+    }),
+  );
+  openDetail();
+  await userEvent.click(await screen.findByRole("button", { name: "Migrate" }));
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "node-b has no usable local pool. Choose a target pool.",
+  );
+  const submit = within(dialog).getByRole("button", { name: "Migrate" });
+  expect(submit).toBeDisabled();
+  await userEvent.selectOptions(within(dialog).getByLabelText("Target pool"), "fast");
+  expect(within(dialog).queryByText(/has no usable/)).not.toBeInTheDocument();
+  await userEvent.click(submit);
+  expect(await screen.findByText("Migrate web to node-b")).toBeInTheDocument();
+  expect(bodies).toEqual([{ node: "n2", pool: "fast" }]);
+});
+
+it("sends no pool for the same-name pool and offers none without local disks", async () => {
+  mockLists({
+    vm: [local],
+    node: NODES,
+    volume: [volume("web-root", "local")],
+    "storage-pool": POOLS,
+  });
+  const bodies: unknown[] = [];
+  server.use(
+    http.post(apiUrl(`/vms/${local.id}/migrate`), async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(task("t1", "vm-migrate", local.id), { status: 202 });
+    }),
+  );
+  const { unmount } = openDetail();
+  await userEvent.click(await screen.findByRole("button", { name: "Migrate" }));
+  let dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  await within(dialog).findByLabelText("Target pool");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Migrate" }));
+  await waitFor(() => expect(bodies).toEqual([{ node: "n2" }]));
+  unmount();
+
+  // 공유 풀의 디스크는 복사하지 않는다.
+  mockLists({
+    vm: [local],
+    node: NODES,
+    volume: [volume("web-root", "nas")],
+    "storage-pool": POOLS,
+  });
+  openDetail();
+  await userEvent.click(await screen.findByRole("button", { name: "Migrate" }));
+  dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  await waitFor(() => expect(within(dialog).getByLabelText("Target node")).toHaveValue("n2"));
+  expect(within(dialog).queryByLabelText("Target pool")).not.toBeInTheDocument();
+  expect(within(dialog).queryByText(/will be copied/)).not.toBeInTheDocument();
+});
+
+it("does not copy disks of a VM with snapshots", async () => {
+  mockLists({
+    vm: [local],
+    node: NODES,
+    volume: [volume("web-root", "local")],
+    "storage-pool": POOLS,
+    snapshot: [snapshot("s1", local, 1)],
+  });
+  openDetail();
+  await userEvent.click(await screen.findByRole("button", { name: "Migrate" }));
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  expect(
+    await within(dialog).findByText(
+      "VMs with snapshots cannot be migrated with disks on node-local pools. Delete the VM's snapshots first.",
+    ),
+  ).toBeInTheDocument();
+  expect(within(dialog).getByRole("button", { name: "Migrate" })).toBeDisabled();
+});
+
+it("waits for the volume, pool and snapshot lists before migrating", async () => {
+  mockLists({
+    vm: [local],
+    node: NODES,
+    volume: [volume("web-root", "local")],
+    "storage-pool": POOLS,
+  });
+  let release = () => {};
+  const loaded = new Promise<void>((resolve) => (release = resolve));
+  server.use(
+    http.get(apiUrl("/snapshots"), async () => {
+      await loaded;
+      return HttpResponse.json({ revision: 1, items: [snapshot("s1", local, 1)] });
+    }),
+  );
+  openDetail();
+  await userEvent.click(await screen.findByRole("button", { name: "Migrate" }));
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  await within(dialog).findByText("web-root on local, 16 GiB");
+  await waitFor(() => expect(within(dialog).getByLabelText("Target node")).toHaveValue("n2"));
+  const submit = within(dialog).getByRole("button", { name: "Migrate" });
+  expect(submit).toBeDisabled();
+  release();
+  expect(
+    await within(dialog).findByText(/VMs with snapshots cannot be migrated/),
+  ).toBeInTheDocument();
+  expect(submit).toBeDisabled();
+});
+
+it("shows the progress of the migration task", async () => {
+  const migrating = {
+    ...local,
+    status: { ...local.status, phase: "migrating" as const, migration: { node: "n2", task: "t1" } },
+  };
+  const copying = {
+    ...task("t1", "vm-migrate", local.id),
+    status: {
+      state: "running" as const,
+      error: null,
+      progress: {
+        stage: "copying-disks",
+        done_bytes: Math.ceil(0.37 * 40 * 1024 ** 3),
+        total_bytes: 40 * 1024 ** 3,
+      },
+    },
+  };
+  mockLists({ vm: [migrating], node: NODES, task: [copying] });
+  const { unmount } = openDetail();
+  expect(await screen.findByText("Copying disks 37% (14.8/40.0 GiB)")).toBeInTheDocument();
+  unmount();
+
+  const memory = {
+    ...copying,
+    status: {
+      ...copying.status,
+      progress: { ...copying.status.progress, stage: "migrating-memory" },
+    },
+  };
+  mockLists({ vm: [migrating], node: NODES, task: [memory] });
+  openDetail();
+  expect(await screen.findByText("Migrating memory")).toBeInTheDocument();
 });

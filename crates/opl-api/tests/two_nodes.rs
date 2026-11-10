@@ -1,7 +1,8 @@
 //! 실제 gRPC(mTLS)로 이은 두 노드: 한 노드의 API로 다른 노드에 VM을 띄우고 콘솔을 중계한다.
 //! 라이브 마이그레이션(Mock 하이퍼바이저): 성공, 확정 전 실패의 되돌리기(HA VM 포함), 공유 디스크의 잠금 바꾸기,
 //! 로컬 디스크 복사(대상에 만들기, 볼륨 기록 옮기기, 원본 지우기, 실패 때 대상 사본 지우기, 되돌아오는 VM).
-//! 노드 비우기: 공유 풀 VM은 다른 노드로 옮기고(들어오던 VM도) 로컬 디스크 VM은 남기며, 유지보수가 끝나면 멈춘다.
+//! 노드 비우기: VM을 다른 노드로 옮기고(들어오던 VM도, 로컬 디스크 VM은 디스크를 복사해) 스냅샷이 있는 로컬
+//! 디스크 VM은 남기며, 유지보수가 끝나면 멈춘다.
 //! 감사 로그: 한 노드의 `GET /audit`가 두 노드의 항목을 합치고, 닿지 않는 노드를 알린다.
 //! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
 
@@ -1576,30 +1577,72 @@ async fn drain_moves_running_vms_to_the_other_node() {
     assert!(node.spec.maintenance);
 }
 
+/// 로컬 디스크 VM도 B의 같은 이름 풀로 디스크를 복사해 옮긴다(볼륨 기록이 B로 가고 A의 원본이
+/// 지워진다). 스냅샷이 있는 로컬 디스크 VM은 이유와 함께 남아 A에서 계속 돈다.
 #[tokio::test]
-async fn drain_leaves_vms_on_local_pools() {
+async fn drain_moves_vms_with_local_disks() {
     let (_root, a, b) = two_nodes().await;
     let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
     dir_pool(&a, "nas", true).await;
     dir_pool(&a, "local", false).await;
     let app = running_vm_on_pool(&a, &admin, "app", "nas", a.id).await;
     let db = running_vm_on_pool(&a, &admin, "db", "local", a.id).await;
+    let snap = running_vm_on_pool(&a, &admin, "snap", "local", a.id).await;
+    let mut volumes = Vec::new();
+    for name in ["db-root", "snap-root"] {
+        let volume = a.cluster.get_by_name::<VolumeSpec>(name).unwrap().unwrap();
+        a.storage.place(volume.id, 1 << 20);
+        volumes.push(volume.id);
+    }
+    let mut snapshot: opl_types::snapshot::Snapshot = Resource::new(
+        "",
+        opl_types::snapshot::SnapshotSpec {
+            vm: snap.id,
+            name: "s1".into(),
+            parent: None,
+            memory: false,
+            description: String::new(),
+            scheduled: false,
+            vm_spec: snap.spec.clone(),
+        },
+    );
+    snapshot.name = snapshot.id.to_string();
+    a.cluster.create(&snapshot).await.unwrap();
 
     let task = admin.wait_task(&drain(&admin, "node1").await).await;
     assert_eq!(task["status"]["state"], "failed", "{task}");
     assert_eq!(
         task["status"]["error"],
-        "1 VM(s) were not moved: db (disks on a local pool)"
+        "1 VM(s) were not moved: snap (disks on a local pool and snapshots)"
     );
     assert_eq!(node_of(&a, app.id), Some(b.id));
+    assert_eq!(node_of(&a, db.id), Some(b.id));
+    // 같은 이름의 풀로 옮겼다(`pool` 없음).
+    let (_, tasks) = a.cluster.list::<TaskSpec>().unwrap();
+    assert!(tasks.iter().any(|t| t.spec.target == db.id
+        && t.spec.op
+            == TaskOp::VmMigrate {
+                node: b.id,
+                pool: None
+            }));
+    let moved = volume_of(&a, volumes[0]);
+    assert_eq!(moved.status.node, Some(b.id));
+    assert_eq!(moved.spec.pool, "local");
+    assert!(b.storage.has_file(volumes[0]));
+    assert_eq!(a.storage.deleted(), [volumes[0]]);
+    wait_vm(&b, db.id, "running on B", |v| {
+        v.status.phase == VmPhase::Running && v.status.node == Some(b.id)
+    })
+    .await;
     // 옮기지 못한 VM은 A에서 계속 돈다.
-    let db = a.cluster.get::<VmSpec>(db.id).unwrap().unwrap();
-    assert_eq!(db.spec.node, Some(a.id));
-    assert_eq!(db.status.phase, VmPhase::Running);
+    let snap = a.cluster.get::<VmSpec>(snap.id).unwrap().unwrap();
+    assert_eq!(snap.spec.node, Some(a.id));
+    assert_eq!(snap.status.phase, VmPhase::Running);
     assert_eq!(
-        runtime_status(&a, db.id).await,
+        runtime_status(&a, snap.id).await,
         Some(RuntimeStatus::Running)
     );
+    assert!(a.storage.has_file(volumes[1]));
 }
 
 /// 비우기를 시작할 때 이 노드로 들어오던 VM도 들어온 뒤 옮긴다. 성공하면 노드가 비어 있다.

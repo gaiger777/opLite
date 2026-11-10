@@ -211,3 +211,34 @@ it("goes back to the first page when the filter changes", async () => {
   await userEvent.click(screen.getByLabelText("Failed only"));
   expect(screen.getByText("1–50 of 120")).toBeInTheDocument();
 });
+
+it("shows the progress of running tasks", async () => {
+  mockLists({
+    vm: [{ id: VM, name: "web" }],
+    task: [
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000001",
+        spec: { op: { kind: "vm-migrate", node: "n2" }, target: VM, node: "n1" },
+        status: {
+          state: "running",
+          error: null,
+          progress: { stage: "copying-disks", done_bytes: 1024 ** 3, total_bytes: 4 * 1024 ** 3 },
+        },
+      },
+      {
+        id: "019a0f3c-9a10-7000-8000-000000000002",
+        spec: { op: { kind: "vm-migrate", node: "n2" }, target: VM, node: "n1" },
+        status: {
+          state: "running",
+          error: null,
+          progress: { stage: "migrating-memory", done_bytes: 0, total_bytes: 0 },
+        },
+      },
+    ],
+  });
+  renderPage(<TasksPage />);
+  expect(await screen.findByText("Migrating memory")).toBeInTheDocument();
+  const rows = screen.getAllByRole("row");
+  expect(rows[1]).toHaveTextContent("Migrating memory");
+  expect(rows[2]).toHaveTextContent("Copying disks 25% (1.0/4.0 GiB)");
+});

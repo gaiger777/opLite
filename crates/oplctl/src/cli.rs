@@ -933,11 +933,15 @@ enum VmCmd {
     Reboot {
         vm: String,
     },
-    /// 실행 중인 VM을 멈추지 않고 다른 노드로 옮긴다(디스크가 모두 공유 풀에 있어야 한다).
+    /// 실행 중인 VM을 멈추지 않고 다른 노드로 옮긴다. 노드 로컬 풀의 디스크는 대상 노드에 복사한다
+    /// (로컬 디스크가 있는 VM에 스냅샷이 있으면 옮기지 못한다).
     Migrate {
         vm: String,
         /// 대상 노드 이름이나 id
         node: String,
+        /// 노드 로컬 풀의 디스크를 둘 대상 노드의 풀. 없으면 디스크마다 같은 이름의 풀이다.
+        #[arg(long)]
+        pool: Option<String>,
     },
     Delete {
         vm: String,
@@ -4407,6 +4411,90 @@ async fn cluster(
     Ok(())
 }
 
+/// `vm migrate`: 마이그레이션 Task를 만들고 끝나기를 기다린다. `pool`은 줄 때만 보낸다(옛 서버는 모르는
+/// 필드를 거절한다). 기다리는 동안 디스크 복사 진행률과 메모리 단계를 `err`(stderr)에 알린다.
+async fn vm_migrate(
+    client: &Client,
+    vm: &str,
+    node: &str,
+    pool: Option<String>,
+    out: &mut (dyn Write + Send),
+    err: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let mut body = json!({ "node": node });
+    if let Some(pool) = pool {
+        body["pool"] = json!(pool);
+    }
+    let task = client
+        .post(&format!("/vms/{}/migrate", seg(vm)), &body)
+        .await?;
+    // 마이그레이션은 일반 Task 제한(10분)보다 오래 걸릴 수 있다.
+    let mut shown = None;
+    client
+        .wait_task_watch(&task, MIGRATE_WAIT, |t| {
+            // 진행 줄을 쓰지 못해도(stderr가 닫힘) 마이그레이션은 계속 기다린다.
+            if let Some(line) = migrate_progress(vm, &t["status"]["progress"], &mut shown) {
+                let _ = writeln!(err, "{line}");
+            }
+            Ok(())
+        })
+        .await?;
+    writeln!(out, "vm {vm}: migrated to {node}")?;
+    Ok(())
+}
+
+/// 마지막으로 알린 마이그레이션 단계
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrateShown {
+    /// 디스크 복사(퍼센트)
+    Copying(u64),
+    Memory,
+}
+
+/// 마이그레이션 Task의 `progress`에서 알릴 줄. 디스크 복사는 처음과 지난번보다 5퍼센트 포인트 넘게
+/// 바뀌었을 때, 메모리 단계는 들어갈 때 한 번이다.
+fn migrate_progress(
+    vm: &str,
+    progress: &Value,
+    shown: &mut Option<MigrateShown>,
+) -> Option<String> {
+    match progress["stage"].as_str()? {
+        "copying-disks" => {
+            let done = progress["done_bytes"].as_u64().unwrap_or(0);
+            let total = progress["total_bytes"].as_u64().unwrap_or(0);
+            let percent = if total == 0 {
+                0
+            } else {
+                (u128::from(done.min(total)) * 100 / u128::from(total)) as u64
+            };
+            let show = match *shown {
+                None => true,
+                Some(MigrateShown::Copying(last)) => percent.abs_diff(last) > 5,
+                Some(MigrateShown::Memory) => false,
+            };
+            if !show {
+                return None;
+            }
+            *shown = Some(MigrateShown::Copying(percent));
+            Some(format!(
+                "vm {vm}: copying disks {percent}% ({} of {})",
+                gib(done),
+                gib(total)
+            ))
+        }
+        "migrating-memory" if *shown != Some(MigrateShown::Memory) => {
+            *shown = Some(MigrateShown::Memory);
+            Some(format!("vm {vm}: migrating memory"))
+        }
+        _ => None,
+    }
+}
+
+/// 바이트를 소수 한 자리 GiB로(`14.8 GiB`)
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
 async fn vm(
     client: &Client,
     cmd: VmCmd,
@@ -4494,16 +4582,8 @@ async fn vm(
             .await?
         }
         VmCmd::Reboot { vm } => act(client, &vm, "reboot", out).await?,
-        VmCmd::Migrate { vm, node } => {
-            let task = client
-                .post(
-                    &format!("/vms/{}/migrate", seg(&vm)),
-                    &json!({ "node": node }),
-                )
-                .await?;
-            // 마이그레이션은 일반 Task 제한(10분)보다 오래 걸릴 수 있다.
-            client.wait_task_for(&task, MIGRATE_WAIT).await?;
-            writeln!(out, "vm {vm}: migrated to {node}")?;
+        VmCmd::Migrate { vm, node, pool } => {
+            vm_migrate(client, &vm, &node, pool, out, &mut std::io::stderr()).await?
         }
         VmCmd::Delete { vm, with_snapshots } => {
             if with_snapshots {
@@ -5628,9 +5708,136 @@ mod tests {
         let cli = Cli::try_parse_from(["oplctl", "vm", "migrate", "web", "n2"]).unwrap();
         assert!(matches!(
             cli.cmd,
-            Cmd::Vm { cmd: VmCmd::Migrate { vm, node } } if vm == "web" && node == "n2"
+            Cmd::Vm { cmd: VmCmd::Migrate { vm, node, pool: None } } if vm == "web" && node == "n2"
+        ));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "migrate", "web", "n2", "--pool", "fast"])
+            .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Migrate { pool: Some(pool), .. } } if pool == "fast"
         ));
         assert!(Cli::try_parse_from(["oplctl", "vm", "migrate", "web"]).is_err());
+    }
+
+    /// 디스크 복사 진행률은 처음과 5퍼센트 포인트 넘게 바뀔 때, 메모리 단계는 한 번 알린다.
+    #[test]
+    fn migrate_progress_lines() {
+        let progress = |stage: &str, done: u64| json!({ "stage": stage, "done_bytes": done, "total_bytes": 40u64 << 30 });
+        let copying = |done: u64| progress("copying-disks", done);
+        let mut shown = None;
+        let mut lines = Vec::new();
+        for p in [
+            json!(null),
+            copying(0),
+            copying(1 << 30),
+            copying(14_800 << 20),
+            copying(15 << 30),
+            copying(40 << 30),
+            progress("migrating-memory", 40 << 30),
+            json!({ "stage": "migrating-memory" }),
+            copying(40 << 30),
+        ] {
+            lines.extend(migrate_progress("web", &p, &mut shown));
+        }
+        assert_eq!(
+            lines,
+            [
+                "vm web: copying disks 0% (0.0 GiB of 40.0 GiB)",
+                "vm web: copying disks 36% (14.5 GiB of 40.0 GiB)",
+                "vm web: copying disks 100% (40.0 GiB of 40.0 GiB)",
+                "vm web: migrating memory",
+            ]
+        );
+    }
+
+    /// `vm migrate`는 `--pool`을 줄 때만 본문에 넣고, 기다리는 동안 진행률을 stderr에 알린다.
+    #[tokio::test]
+    async fn vm_migrate_sends_the_pool_and_shows_progress() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static POLLS: AtomicUsize = AtomicUsize::new(0);
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/tasks/t1" => {
+                let (stage, done) = match POLLS.fetch_add(1, Ordering::SeqCst) {
+                    0 => ("copying-disks", 0),
+                    1 => ("copying-disks", 1u64 << 30),
+                    2 => ("migrating-memory", 2 << 30),
+                    _ => return json!({ "id": "t1", "status": { "state": "succeeded" } }),
+                };
+                let progress =
+                    json!({ "stage": stage, "done_bytes": done, "total_bytes": 2u64 << 30 });
+                json!({ "id": "t1", "status": { "state": "running", "progress": progress } })
+            }
+            _ => json!({ "id": "t1", "status": { "state": "pending" } }),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        vm_migrate(
+            &client,
+            "web",
+            "n2",
+            Some("fast".into()),
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "vm web: migrated to n2\n");
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "vm web: copying disks 0% (0.0 GiB of 2.0 GiB)\n\
+             vm web: copying disks 50% (1.0 GiB of 2.0 GiB)\n\
+             vm web: migrating memory\n"
+        );
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].line, "POST /api/v1/vms/web/migrate HTTP/1.1");
+            assert_eq!(seen[0].body, json!({ "node": "n2", "pool": "fast" }));
+        }
+
+        // 풀을 주지 않으면 본문에 `pool`이 없다.
+        seen.lock().unwrap().clear();
+        let mut out = Vec::new();
+        vm_migrate(&client, "web", "n2", None, &mut out, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap()[0].body, json!({ "node": "n2" }));
+    }
+
+    /// 진행 줄을 쓰지 못해도(stderr가 닫힘) 마이그레이션이 끝나기를 기다린다.
+    #[tokio::test]
+    async fn vm_migrate_ignores_a_broken_stderr() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static POLLS: AtomicUsize = AtomicUsize::new(0);
+        let (base, _) = fake_api_bodies(|path| match path {
+            "/api/v1/tasks/t1" => match POLLS.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    let progress =
+                        json!({ "stage": "migrating-memory", "done_bytes": 0, "total_bytes": 0 });
+                    json!({ "id": "t1", "status": { "state": "running", "progress": progress } })
+                }
+                _ => json!({ "id": "t1", "status": { "state": "succeeded" } }),
+            },
+            _ => json!({ "id": "t1", "status": { "state": "pending" } }),
+        })
+        .await;
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let client = Client::new(&base, None, None).unwrap();
+        let mut out = Vec::new();
+        vm_migrate(&client, "web", "n2", None, &mut out, &mut Broken)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "vm web: migrated to n2\n");
+        assert!(POLLS.load(Ordering::SeqCst) >= 2);
     }
 
     /// 마이그레이션 중인 VM은 PHASE가 migrating이고 NODE에 대상 노드가 붙는다.

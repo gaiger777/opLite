@@ -17,7 +17,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatTime, uuidTime } from "@/lib/format";
-import { describeTask } from "@/tasks/tasks";
+import { describeProgress, describeTask } from "@/tasks/tasks";
 
 /** 한 페이지에 보일 Task 수. API에 페이지 나누기가 없어 모두 받아 화면에서 나눈다. */
 export const TASK_PAGE_SIZE = 50;
@@ -121,6 +121,7 @@ export function TaskTable({
           const node = nodeById.get(task.spec.node);
           const time = uuidTime(task.id);
           const label = describeTask(task, t, name, (id) => nodeById.get(id)?.name);
+          const progress = describeProgress(task, t);
           return (
             <TableRow key={task.id}>
               <TableCell className="whitespace-nowrap">
@@ -138,6 +139,11 @@ export function TaskTable({
               <TableCell>{node?.name ?? "—"}</TableCell>
               <TableCell>
                 <TaskStateBadge task={task} />
+                {progress && (
+                  <span className="ml-2 text-xs whitespace-nowrap text-muted-foreground">
+                    {progress}
+                  </span>
+                )}
               </TableCell>
               <TableCell>
                 <div className="max-w-md truncate" title={task.status.error ?? undefined}>

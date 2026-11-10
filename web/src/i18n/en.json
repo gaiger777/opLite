@@ -172,6 +172,10 @@
       "node-update-check": "Check updates on {{target}}",
       "node-upgrade": "Upgrade {{target}}",
       "node-drain": "Drain {{target}}"
+    },
+    "progress": {
+      "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
+      "migratingMemory": "Migrating memory"
     }
   },
   "pager": {
@@ -632,11 +636,19 @@
   },
   "migrate": {
     "title": "Migrate {{name}}",
-    "description": "The running VM moves to another node without stopping. Its disks must all be on shared storage pools, and both nodes need the same QEMU version and CPU.",
+    "description": "The running VM moves to another node without stopping. Disks on node-local pools are copied to the target node. Both nodes need the same QEMU version and CPU.",
     "node": "Target node",
     "noTarget": "No other online node with the VM's architecture is available.",
     "submit": "Migrate",
-    "op": "Migrate {{vm}} to {{node}}"
+    "op": "Migrate {{vm}} to {{node}}",
+    "localDisks": "Disks to copy",
+    "localDisk": "{{volume}} on {{pool}}, {{size}}",
+    "pool": "Target pool",
+    "samePool": "Pool with the same name",
+    "copyNote_one": "{{count}} disk ({{size}} in total) will be copied. This can take a long time, and the VM cannot be stopped, snapshotted or backed up meanwhile.",
+    "copyNote_other": "{{count}} disks ({{size}} in total) will be copied. This can take a long time, and the VM cannot be stopped, snapshotted or backed up meanwhile.",
+    "noSamePool": "{{node}} has no usable {{pool}} pool. Choose a target pool.",
+    "snapshots": "VMs with snapshots cannot be migrated with disks on node-local pools. Delete the VM's snapshots first."
   },
   "forms": {
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."
@@ -910,7 +922,7 @@
       "confirm": "Drain",
       "running_one": "{{count}} running VM will be moved.",
       "running_other": "{{count}} running VMs will be moved.",
-      "localNote": "VMs whose disks are on a local pool cannot be moved. They stay on this node, and the drain fails listing them. Stop them or move their disks first.",
+      "localNote": "VMs with disks on node-local pools are moved by copying their disks to a node with a pool of the same name (VMs with snapshots cannot be moved).",
       "reason": {
         "offline": "The node is offline.",
         "hvf": "VMs on a macOS node cannot be moved.",

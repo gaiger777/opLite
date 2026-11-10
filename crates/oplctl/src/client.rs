@@ -10,7 +10,8 @@ use serde_json::Value;
 /// Task가 이보다 오래 끝나지 않으면 기다리기를 그만둔다. Task 실행기의 제한 시간(10분)보다 길다.
 const TASK_WAIT: Duration = Duration::from_secs(15 * 60);
 
-/// 라이브 마이그레이션 Task를 기다리는 시간. 마이그레이션은 서버 설정(`[migration] timeout`)만큼 걸릴 수 있다.
+/// 라이브 마이그레이션 Task를 기다리는 시간. 마이그레이션은 서버 설정(로컬 디스크 복사의
+/// `[migration] disk_timeout`과 메모리의 `timeout`)만큼 걸릴 수 있다.
 pub const MIGRATE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 백업·복원 Task를 기다리는 시간. 디스크를 모두 복사하므로 Task 실행기는 시간 제한을 두지 않는다.
@@ -177,7 +178,7 @@ impl Client {
     /// Task가 끝날 때까지 기다린다. 실패했으면 그 오류를 돌려준다.
     pub async fn wait_task(&self, task: &Value) -> anyhow::Result<Value> {
         let id = task["id"].as_str().context("response has no task id")?;
-        match self.poll_task(id, TASK_WAIT).await? {
+        match self.poll_task(id, TASK_WAIT, |_| Ok(())).await? {
             Ok(task) => Ok(task),
             Err(task) => bail!(
                 "task {id} did not finish in {} minutes (state: {}); is opld running on node {}?",
@@ -190,8 +191,18 @@ impl Client {
 
     /// `wait_task`와 같지만 `wait`만큼 기다린다. 시간이 지나도 Task는 아직 돌고 있을 수 있다.
     pub async fn wait_task_for(&self, task: &Value, wait: Duration) -> anyhow::Result<Value> {
+        self.wait_task_watch(task, wait, |_| Ok(())).await
+    }
+
+    /// `wait_task_for`와 같고 읽은 Task마다 `watch`를 부른다(진행률 알리기).
+    pub async fn wait_task_watch(
+        &self,
+        task: &Value,
+        wait: Duration,
+        watch: impl FnMut(&Value) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Value> {
         let id = task["id"].as_str().context("response has no task id")?;
-        match self.poll_task(id, wait).await? {
+        match self.poll_task(id, wait, watch).await? {
             Ok(task) => Ok(task),
             Err(task) => bail!(
                 "stopped waiting for task {id} after {} minutes (state: {}); it may still be running, see `oplctl task get {id}`",
@@ -202,13 +213,19 @@ impl Client {
     }
 
     /// Task가 끝나면 `Ok(Task)`, 실패하면 오류, `wait`이 지나면 마지막으로 읽은 Task를 `Err`로.
-    async fn poll_task(&self, id: &str, wait: Duration) -> anyhow::Result<Result<Value, Value>> {
+    async fn poll_task(
+        &self,
+        id: &str,
+        wait: Duration,
+        mut watch: impl FnMut(&Value) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Result<Value, Value>> {
         let deadline = Instant::now() + wait;
         loop {
             let poll = self
                 .request(Method::GET, &format!("/tasks/{}", seg(id)))
                 .timeout(TASK_POLL_TIMEOUT);
             let task = self.send(poll).await?;
+            watch(&task)?;
             match task["status"]["state"].as_str() {
                 Some("succeeded") => return Ok(Ok(task)),
                 Some("failed") => bail!(
