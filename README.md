@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업(계획 40) 완료·증분 복제(계획 41) 남음
+- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -1403,6 +1403,8 @@ oplctl backup delete before-upgrade                          # 파일과 리소�
   백업이 체인에 있거나 목록에 없는 조상이 있으면 `stored_bytes`는 없다 — 목록에 없는 조상은 id로 적는다), 웹은 크기
   아래 "체인 <크기>"를 보인다(같은 경우 보이지 않는다). 복원은 체인의 모든 백업이 같은 풀에 `ready`로 있고 디스크
   수·크기가 맞아야 한다(아니면 작업 실패 "backup chain is broken: …"). 체인 중간에서도 복원한다(그 시점의 디스크).
+  체인을 원격으로 복제했으면 `chain.replicas`에 원격 사본마다 원격에 있는 체인 백업 수가 붙는다
+  (아래 "증분 백업 복제"의 "진행").
 - **지우기는 자식부터.** 다른 백업의 부모인 백업을 지우면 **409** `backup_in_use`("backup "B" is the parent of N
   incremental backup(s); delete them first", `--force`여도)다. 가장 새 증분부터 지운다. 만드는 중인 증분도 부모를
   막고, 실패한 증분은 막지 않는다. 병합(체인 줄이기)은 없다.
@@ -1414,9 +1416,9 @@ oplctl backup delete before-upgrade                          # 파일과 리소�
   **409** `cluster_upgrading`). 기능이 없는 노드가 하나라도 있으면 백업은 비트맵을 만들지 않고 증분 요청은 전체로 한다
   (옛 노드는 되돌리기 전에 비트맵을 지우지 못하므로). 증분 백업의 복원은 복원하는 노드에 그 기능이 있어야 한다(**409**
   `cluster_upgrading` "node "X" does not support incremental backups yet; upgrade it first").
-- **원격 복제는 아직 없다.** 증분 백업은 원격으로 복제하지 않는다(**400** `invalid_request` "incremental backups cannot
-  be replicated yet"; 웹은 증분 백업의 "원격으로 복제" 버튼을 이유와 함께 막는다). 백업 작업에 `full_every`와
-  `replicate`를 함께 둘 수 없다(아래 "원격 복제(DR)").
+- **원격 복제.** 증분 백업도 원격으로 복제한다. 복제는 체인을 전체 백업부터 차례로 보내고(prod에 `ready`로 적힌 앞
+  백업은 건너뛴다) 원격의 사본도 같은 부모 링크의 체인이 된다. 백업 작업에 `full_every`와 `replicate`를 함께 둘 수 있다.
+  원격의 모든 노드에 증분 복제 기능이 있어야 한다(아래 "원격 복제(DR)"의 "증분 백업 복제").
 
 **파일 형식과 opLite 없이 열기.** 백업 하나는 백업 풀 루트의 `backups/{백업 id}/` 디렉터리다(id는 `oplctl backup
 get NAME`의 `id`; NFS 풀이면 NFS 서버의 내보내기 아래 같은 경로). 그 안에 디스크마다 압축 qcow2 `disk0.qcow2`,
@@ -1497,7 +1499,7 @@ oplctl backup-job delete nightly               # 작업만 지운다. 만든 백
   작업은 백업을 증분으로 청하고(위 "증분 백업"), 체인에 증분이 N개 쌓이면 다음은 전체로 해 새 체인을 시작한다(이유
   `chain already has N incremental backup(s)`). 예: 매일 + `--full-every 6`이면 주마다 전체 하나와 증분 여섯이다. 할 수
   없으면(꺼진 VM 등) 그 백업만 전체다. 0(기본)이면 늘 전체다. 모든 노드에 증분 백업 기능이 있어야 하고(409
-  `cluster_upgrading`), `--replicate`와 함께 두면 **400**("replicating incremental backups is not supported yet")이다.
+  `cluster_upgrading`), `--replicate`와 함께 두면 증분 백업도 체인 순서로 원격에 보낸다(아래 "원격 복제(DR)").
   `backup-job list`의 `SCHEDULE` 칸에는 `, full every N`, 웹 작업 표의 일정 칸에는 "증분, 증분 n개마다 전체"가 보인다.
 - **작업을 지워도 백업은 남는다.** 그 백업은 더는 보존 규칙으로 지워지지 않으니 `oplctl backup delete`로 지운다.
 - 웹은 사이드바 "백업" 아래 "백업 작업" 화면(만들기·편집·지우기·지금 실행, 다음·마지막 실행 시각은 UTC로 표시)에서
@@ -1509,7 +1511,7 @@ oplctl backup-job delete nightly               # 작업만 지운다. 만든 백
   다른 opLite 클러스터로 사본을 보내는 것은 아래 "원격 복제(DR)"다. 증분 백업은: 꺼진 VM은 늘 전체(매일 백업하는
   꺼진 VM은 매일 전체를 쓴다), 블록 풀 VM은 다시 켠 뒤 첫 백업이 전체, VM마다 비트맵이 하나라 두 풀에 번갈아 백업하면
   늘 전체, 체인 병합과 중간 백업 지우기 없음, 증분 파일만으로는 복원할 수 없음(opLite 밖에서는 위처럼 체인을 적어
-  연다), 원격 복제 없음(계획 41).
+  연다).
 - **남을 수 있는 것.** 작업을 만들기 전에 실패하거나 작업이 사라져 `pending`에 머문 백업은 저절로 치워지지 않는다 —
   `oplctl backup delete`로 지운다. 실행 중 백업이 임시 스냅샷을 지우지 못하면 qcow2 디스크에 그 태그가 남을 수 있다
   (블록 풀 디스크는 opld가 나중에 지운다; qcow2는 VM을 끄고 `qemu-img snapshot -d <태그> <파일>`). 복원이 볼륨을
@@ -2305,7 +2307,8 @@ list`·웹 백업 화면에 보이고, dr에서 복원하고 지운다. 백업 �
   보낸 뒤 그 응답을 120초까지 기다린다(다른 요청은 10초). dr은 파일마다 받은 SHA-256을 사본의 디스크
   (`status.disks[].sha256`)에, 마지막으로 받은 시각을 `status.received_at`에 적고, prod는 맞게 보낸 파일의 SHA-256을
   원본의 디스크(`status.disks[].sha256`)에 적는다. dr은 본문 조각이 60초 넘게 오지 않으면 그 파일을 버린다(멈춘
-  업로드 — 복제 Task는 실패하고 다시 보낼 수 있다). 진행률은 없다.
+  업로드 — 복제 Task는 실패하고 다시 보낼 수 있다). 진행률은 없다(증분 백업은 체인의 몇 백업을 보냈는지만 — 아래
+  "증분 백업 복제").
 - **dr 쪽 준비.**
   - **백업 풀.** 사본을 둘 dr의 백업 풀(`backups`를 켠 dir·NFS 풀). 백업 풀이 아니거나 없으면 dr이 **400**이고,
     남은 공간이 원본 디스크 파일 크기의 합보다 작으면 **507** `insufficient_storage`다.
@@ -2334,17 +2337,17 @@ list`·웹 백업 화면에 보이고, dr에서 복원하고 지운다. 백업 �
   전체를 본다. 이미 `ready`인 사본을 다시 확인하는 동안(아래 "다시 하기") 기록은 `ready` 그대로다: 확인이 성공하면
   `at`만 고치고, dr에 닿지 못하면 `ready`로 둔 채 `error`에 이유를 적는다(복제 Task는 실패, 다음 실행이 다시
   확인한다). dr에 없으면(404) `copying`으로 바꿔 다시 보내고, 다른 사본이거나 해시가 다르면 `failed`다.
-- **다시 하기.** 같은 백업을 같은 원격·풀로 다시 보내면 dr의 사본으로 이어 간다. 복제 Task는 먼저 사본 기록의 id를
-  dr에 묻고(`GET /backups/{id}` — **404**면 dr에서 지운 것이므로 새로 받기부터 한다), 기록이 없으면 받기를 시작해
-  dr이 **409** `replica_exists`로 알려 주는 사본을 읽는다. 그 사본이 이 백업의 사본인지 — 출처의 원본 id, 요청한 풀,
-  VM 스펙, 디스크 이름과 크기, UEFI 변수 — 확인하고, 다르면 "a different backup claims to be the copy of <원본 id> on
-  remote …; delete it there"로 실패한다(dr에서 그 백업을 지운다). 사본이 `ready`면 원본에 적힌 디스크 해시(보낼 때
-  적은 것 — 해시가 없는 옛 백업만 원본 파일을 읽어 계산해 적는다)와 dr이 받은 해시를 비교해 모두 같을 때만 보내지
-  않고 성공하고, 해시가 없거나 다르면 "… is ready but its files do not
-  match …; delete it there and replicate again"으로 실패한다(ready 사본은 파일을 다시 받지 않는다). 아직 `receiving`이면
-  파일을 모두 다시 보낸다(같은 파일·반쯤 받은 `.part`는 덮는다). 보내다 멈춘 사본(`receiving`)은 dr의 정리 작업이
-  만든 지, 그리고 마지막으로 파일을 받은 지 24시간이 지나면 파일과 함께 지운다. 백업 작업은 실행마다 한 번 실패한
-  사본을 다시 보내고 ready 사본도 dr에 있는지 확인한다(아래).
+- **다시 하기.** 같은 백업을 같은 원격·풀로 다시 보내면 dr의 사본으로 이어 간다. 복제 Task는 먼저 사본 기록의 id를 dr에
+  묻고(`GET /backups/{id}` — **404**면 dr에서 지운 것이므로 새로 받기부터 한다), 기록이 없으면 받기를 시작해 dr이
+  **409** `replica_exists`로 알려 주는 사본을 읽는다. 그 사본이 이 백업의 사본인지 — 출처의 원본 id, 요청한 풀, 부모
+  사본(증분이면 dr의 부모 사본 id, 전체면 없음), VM 스펙, 디스크 이름과 크기, UEFI 변수 — 확인하고, 다르면 "a different
+  backup claims to be the copy of <원본 id> on remote …; delete it there"로 실패한다(dr에서 그 백업을 지운다). 사본이
+  `ready`면 원본에 적힌 디스크 해시(보낼 때 적은 것 — 해시가 없는 옛 백업만 원본 파일을 읽어 계산해 적는다)와 dr이 받은
+  해시를 비교해 모두 같을 때만 보내지 않고 성공하고, 해시가 없거나 다르면 "… is ready but its files do not match …;
+  delete it there and replicate again"으로 실패한다(ready 사본은 파일을 다시 받지 않는다). 아직 `receiving`이면 파일을
+  모두 다시 보낸다(같은 파일·반쯤 받은 `.part`는 덮는다). 보내다 멈춘 사본(`receiving`)은 dr의 정리 작업이 만든 지,
+  그리고 마지막으로 파일을 받은 지 24시간이 지나면 파일과 함께 지운다. 백업 작업은 실행마다 한 번 실패한 사본을 다시
+  보내고 ready 사본도 dr에 있는지 확인한다(아래).
 
 ```bash
 # dr에서: 백업 풀(dir 풀이면 prod에 등록한 URL의 노드에), 같은 이름의 네트워크·보안 그룹, operator 토큰(위 "원격 클러스터")
@@ -2369,11 +2372,12 @@ oplctl backup list
 
 - **수동 복제.** `oplctl backup replicate <백업> --remote <원격> --pool <원격의 백업 풀> [--wait]`(API `POST
   /api/v1/backups/{key}/actions/replicate {"remote", "pool"}`, operator 이상, **202** Task). 원격이 등록되지 않았으면
-  **404**, 원본이 `ready`가 아니면 **409** `backup_not_ready`, 지우는 중이거나 같은 원격으로 보내는 Task가 끝나지
-  않았으면 **409** `backup_busy`, 파일이 있는 노드가 오프라인이면 **409** `node_offline`이다. 웹은 백업 표(백업 화면·VM
-  상세의 백업 탭)의 "원격으로 복제" 버튼(ready 백업, operator 이상): 원격을 고르면 그 원격의 백업 풀을 중계(`GET
-  /storage-pools`)로 읽어 고르게 하고, 보낸 뒤 Task를 따라간다. 복제 중인 백업을 지우면 **409** `backup_busy`("being
-  replicated")다(보내는 동안 파일을 지우지 않게).
+  **404**, 원본이 `ready`가 아니면 **409** `backup_not_ready`, 지우는 중이거나 같은 전체 백업에서 시작한 체인의 어느
+  백업이든(이 백업, 조상, 자식, 형제 — 전체 백업이면 그 증분들) 같은 원격으로 보내는 Task가 끝나지 않았으면 **409**
+  `backup_busy`(복제 중인 그 백업의 이름), 파일이 있는 노드가 오프라인이면 **409**
+  `node_offline`이다. 웹은 백업 표(백업 화면·VM 상세의 백업 탭)의 "원격으로 복제" 버튼(ready 백업, operator 이상):
+  원격을 고르면 그 원격의 백업 풀을 중계(`GET /storage-pools`)로 읽어 고르게 하고, 보낸 뒤 Task를 따라간다. 복제 중인
+  백업을 지우면 **409** `backup_busy`("being replicated")다(보내는 동안 파일을 지우지 않게).
 - **작업 복제.** 백업 작업에 `replicate: {"remote", "pool"}`(`backup-job create|set --replicate <원격>/<풀>`, 웹 백업
   작업의 "원격 클러스터로 복제")을 주면, 리더의 스케줄러가 확인할 때마다(`[backup] tick_secs`) 그 작업이 만든 `ready`
   백업 가운데 그 (원격, 풀) 사본 기록이 없는 것을 만든 순서로 복제 Task로 보낸다 — 켜기 전에 만든 그 작업의 백업도
@@ -2386,23 +2390,61 @@ oplctl backup list
   끝날 때 지울 백업이 복제 중이라 지우지 못하면(`backup_busy`) 확인할 때마다 다시 해서 복제 Task가 끝나면 지운다.
   `PATCH /api/v1/backup-jobs/{name}`의 `replicate`는 객체면 바꾸고 `null`이면 끄고 없으면 그대로다
   (`--no-replicate`가 `null`). 등록되지 않은 원격은 **400**이고 원격의 풀은 보낼 때 dr이 확인한다(틀리면 Task 실패).
+  `full_every`가 있는 작업의 증분 백업도 보낸다(아래 "증분 백업 복제" — 만든 순서로 보내므로 증분의 Task는 보통 앞
+  백업이 이미 `ready`라 그 증분 파일만 보낸다).
+- **증분 백업 복제.** 증분 백업 X를 보내면 복제 Task가 X의 체인(위 "백업과 복원"의 "증분 백업" — 전체 백업부터
+  X까지)을 앞에서부터 차례로 본다. X가 아닌 백업은 그 (원격, 풀) 사본 기록이 `ready`이고 사본 id가 있으면 dr에 묻지
+  않고 건너뛰고, 아니면 위와 같이 보낸다. 앞 백업이 끝나야 다음을 보내고, X는 늘 보낸다(이미 `ready`면 위 "다시
+  하기"처럼 확인만). 그래서 체인을 처음 보낼 때는 전체 백업부터 모두, 그 뒤에는 새 증분 파일만 간다. 증분은 dr에 있는
+  부모 사본의 id와 함께 보내고(받기 요청의 `parent`), dr의 사본은 그 부모 사본을 `status.parent`로 가리킨다 — dr에서도
+  보통 증분 백업처럼 체인으로 복원하고(`TYPE`이 `incr`), 부모 사본은 자식 사본이 있는 동안 지울 수 없다(**409**
+  `backup_in_use`). dr이 쓰는 매니페스트는 버전 2이고 `backup`·`parent`가 dr의 id다.
+  - **원격 기능.** 체인에 증분이 있으면 보내기 전에 dr의 `GET /nodes`로 모든 노드(위트니스 포함)에 증분 복제 기능
+    (`incremental-replication`)이 있는지 보고, 없으면(노드 목록이 비어도) Task가 `remote cluster "dr" does not support
+    incremental backups; upgrade it`로 실패한다(dr부터 업그레이드). 계획 40 노드는 증분 백업을 알아도 증분 받기
+    (`parent`가 있는 받기 요청)를 모르므로 업그레이드해야 한다. 전체 백업만 보낼 때는 보지 않는다.
+  - **부모 사본이 없으면 다시 보낸다.** dr에서 부모 사본을 지웠거나 맞지 않으면(같은 풀에 `ready`가 아님, 다른 원본·CA
+    지문, 공유가 아닌 풀의 다른 노드, 지우는 중) dr이 **409** `replica_parent_missing`으로 거절한다(받기 요청, 드물게
+    완료 요청 — 받는 동안 없어짐). Task는 그 부모의 사본 기록을 `failed`로 바꾸고(사본 id는 둔다 — 다음에 dr에 물어 보고
+    없으면 새로 받는다) 체인을 처음부터 한 번 더 본다. 이번에는 `ready`로 적힌 앞 백업도 건너뛰지 않고 위 "다시
+    하기"처럼 dr에 물어 확인하므로(없으면 다시 보낸다) 조상의 사본까지 지웠어도 한 Task가 체인 끝까지 다시 보낸다. 한
+    Task에서 한 번만 하고, 또 거절되면 실패한다.
+  - **실패.** 체인의 백업이 없거나 `ready`가 아니면 "backup chain is broken: …", 앞 백업을 보내지 못하면 `cannot
+    replicate backup "<이름>" of the chain: <이유>`로 실패하고 그 백업과 X의 사본 기록이 `failed`와 이유가 된다(기록이
+    `ready`였으면 — 위 "다시 하기"의 확인 — `ready`로 두고 `error`만 적는다; 다시 복제하면 이미 `ready`인 앞 백업은
+    건너뛴다). 체인 중간 백업이 마지막 `replica_parent_missing`으로 끝나도 그 기록은 `copying`으로 남지 않고 `failed`와
+    이유다. opld가 다시 시작해 Task가 중단되면(`interrupted: …`) 정리가 X와 함께 체인에서 `copying`으로 적힌 앞 백업의
+    기록도 `failed`와 그 이유로 바꾼다(`ready`·`failed` 기록은 그대로). 체인은 같은 풀의 같은 노드에 있으므로(공유가
+    아닌 풀) Task는 X의 노드에서 돈다.
+  - **진행.** Task에 진행 메시지는 없다(opld 로그에 체인 백업마다 한 줄). 대신 체인 백업들의 사본 기록으로 계산한
+    상태를 보인다 — 체인의 어느 백업이든 그 (원격, 풀) 사본 기록이 있으면 복제 중이 아니어도 보인다: `oplctl backup
+    get <증분>`의 `chain.replicas`에 (원격, 풀)마다 `{"remote", "pool", "progress": "k of n copied"}`(체인 n개 가운데
+    원격에 있는 백업 k개 — 그 사본 기록이 `ready`이고 사본 id가 있는 것; 체인을 전체 백업까지 따라갈 수 있을 때만),
+    웹 백업 표의 "원격 사본" 열에 증분이면 "<원격> / <풀>: 체인 n개 중 k개가 원격에 있음"(다 있으면 숨긴다).
 - **지우기 전파.** prod에서 원본을 지우는 Task(`backup delete`, 백업 작업의 보존 규칙)는 원본 파일을 먼저 지우고(지우지
-  못하면 Task가 실패하고 dr은 건드리지 않는다), 그다음 `replicas`의 사본 id가 있는 사본마다(`failed`도 — 받다 만
-  사본이 dr에 있다) dr의 `DELETE /backups/{id}`를 부른다(dr이 지우기 Task를 시작한다 — 끝나기를 기다리지 않는다,
-  **404**는 이미 지운 것으로 성공). dr에 닿지 못하거나 거절하면 원본은 그대로 지우고, Task는 성공하되 `error`에
-  "backup deleted, but remote copies may be left: …" 경고를 남긴다(`oplctl backup delete`는 `warning: …` 줄로, 웹은
-  닫을 때까지 남는 경고 알림으로 보인다). 그 사본은 dr에서 `ORIGIN`으로 찾아 지운다. `backup delete --force`(파일을
-  지울 노드가 없어 리소스만 지움)는 원격을 건드리지 않는다. dr에서 사본을 지우면 백업 작업이 다음 실행에 다시
-  보낸다(위).
+  못하면 Task가 실패하고 dr은 건드리지 않는다), 그다음 `replicas`의 사본 id가 있는 사본마다(`failed`도 — 받다 만 사본이
+  dr에 있다) dr의 `DELETE /backups/{id}`를 부른다(dr이 지우기 Task를 시작한다 — 끝나기를 기다리지 않는다, **404**는 이미
+  지운 것으로 성공). dr에 닿지 못하거나 거절하면 원본은 그대로 지우고, Task는 성공하되 `error`에 "backup deleted, but
+  remote copies may be left: …" 경고를 남긴다(`oplctl backup delete`는 `warning: …` 줄로, 웹은 닫을 때까지 남는 경고
+  알림으로 보인다). 그 사본은 dr에서 `ORIGIN`으로 찾아 지운다. 원본은 자식부터 지우므로 dr의 사본도 자식부터 지워진다.
+  dr이 부모 사본 지우기를 **409** `backup_in_use`로 거절하면(자식 사본의 dr 지우기 Task가 아직 끝나지 않았다) 다시
+  요청하며 60초까지 기다리고, 그래도 거절되면(자식 사본을 지우지 못했다) 같은 경고다 — dr에서 자식부터 지운다. `backup
+  delete --force`(파일을 지울 노드가 없어 리소스만 지움)는 원격을 건드리지 않는다. dr에서 사본을 지우면 백업 작업이 다음
+  실행에 다시 보낸다(위).
 - **업그레이드 중.** 복제·받기·`replicate`가 있는 작업 만들기·고치기는 모든 노드가 이 버전이어야 하고(아니면 **409**
   `cluster_upgrading`), 스케줄러는 모두 올라올 때까지 보내지 않는다. 받는 dr도 이 버전이어야 한다(모르는 필드는
-  **400**).
+  **400**, 증분 백업은 위 "원격 기능").
 - **받기 API(dr 쪽, 백업 쓰기 — operator 이상).** 보통은 prod의 복제 Task만 부른다.
-  - `POST /api/v1/backups/receive {"name"?, "pool", "manifest", "origin"}` → **201** `{"id", "name"}`. 풀이 없거나 백업
-    풀이 아니거나 매니페스트가 올바르지 않으면(형식 버전, VM 이름·스펙, 디스크 수가 스펙과 같고 디스크 i가 `disk{i}`·
-    `disk{i}.qcow2`) **400**, 이 노드에서 풀을 쓸 수 없으면 **409** `pool_not_on_node`·`pool_unavailable`, 같은 원본의
-    사본이 같은 풀에 있으면 **409** `replica_exists`(`details.backup`이 그 id), 풀의 남은 공간이 디스크 파일 크기의
-    합보다 작으면 **507** `insufficient_storage`.
+  - `POST /api/v1/backups/receive {"name"?, "pool", "manifest", "origin", "parent"?}` → **201** `{"id", "name"}`.
+    `parent`는 증분 백업일 때 이 클러스터에 있는 부모 사본의 id다(전체 백업이면 뺀다). 풀이 없거나 백업 풀이 아니거나
+    매니페스트가 올바르지 않으면(형식 버전 — `parent`가 없으면 버전 1에 매니페스트 `parent` 없음, 있으면 버전 2에
+    매니페스트 `parent` 있음 —, VM 이름·스펙, 디스크 수가 스펙과 같고 디스크 i가 `disk{i}`·`disk{i}.qcow2`) **400**, 이
+    노드에서 풀을 쓸 수 없으면 **409** `pool_not_on_node`·`pool_unavailable`, 같은 원본의 사본이 같은 풀에 있으면
+    **409** `replica_exists`(`details.backup`이 그 id), `parent`의 사본이 같은 풀에 `ready`가 아니거나 출처(CA 지문,
+    원본 id가 매니페스트의 `parent`)가 맞지 않거나 공유가 아닌 풀이면 이 노드의 것이 아니거나 지우는 중이면 **409**
+    `replica_parent_missing`(`details.parent`가 그 id), `parent`가 있는데 증분 복제 기능(`incremental-replication`)이
+    없는 노드가 있으면 **409** `cluster_upgrading`, 풀의 남은 공간이 디스크 파일 크기의 합보다 작으면 **507**
+    `insufficient_storage`.
   - `PUT /api/v1/backups/{key}/files/{file}`(본문은 파일 그대로, `Content-Length` 필수 — 없으면 **411**) → **200**
     `{"sha256", "size"}`. `file`은 매니페스트의 디스크 파일이나 UEFI면 `vars.fd`뿐(그 밖은 **400**)이고,
     `Content-Length`는 디스크 파일이면 매니페스트의 `stored_bytes`와 같아야, `vars.fd`면 64 MiB까지다(아니면 본문을
@@ -2412,7 +2454,9 @@ oplctl backup list
     **409** `backup_on_other_node`, 같은 파일을 이 노드가 받고 있으면 **409** `backup_busy`.
   - `POST /api/v1/backups/{key}/actions/complete` → **200** 백업. 디스크 파일의 크기가 매니페스트와 같고 `vars.fd`가
     있어야 한다(아니면 **409** `backup_incomplete`, `details.files`). 지우는 Task가 걸려 있으면 **409** `backup_busy`.
-    `manifest.json`의 `backup`은 dr의 사본 id로 쓴다.
+    증분 사본이면 부모 사본을 다시 보고 없어졌거나 `ready`가 아니거나 지우는 중이면 받기와 같은 **409**
+    `replica_parent_missing`이다. `manifest.json`의 `backup`은 dr의 사본 id로 쓴다(증분이면 버전 2에 `parent`도 dr의 부모
+    사본 id).
   - dr의 감사 로그에는 이 요청들이 토큰 주인의 것으로 남는다. `receiving` 백업은 복원할 수 없고, 지우면 받은 파일도
     지운다.
 
@@ -2429,15 +2473,18 @@ oplctl backup list
    복원) 한다. prod를 새로 만들었으면 옛 원본이 없어 dr의 옛 사본은 보존 규칙으로 지워지지 않으므로 dr에서 지운다.
 
 - **한계.**
-  - 증분 백업(위 "백업과 복원"의 "증분 백업")은 아직 복제하지 않는다: `backup replicate`는 **400** `invalid_request`
-    ("incremental backups cannot be replicated yet"), 백업 작업은 `full_every`와 `replicate`를 함께 둘 수 없다(**400**).
-    전체 백업만 보낸다.
-  - 매번 백업 전체를 보낸다(증분·중복 제거·압축 추가 없음 — 백업 파일 그대로). 대역폭 제한이 없어 큰 백업은 링크를
-    채운다(스케줄러는 노드마다 복제 하나). 진행률이 없다.
+  - 백업 파일을 그대로 보낸다(전체 백업은 디스크 전체, 증분 백업은 바뀐 블록만 — 중복 제거·압축 추가 없음). 증분
+    체인을 처음 보내면 전체 백업부터 모두 간다. 대역폭 제한이 없어 큰 백업은 링크를 채운다(스케줄러는 노드마다 복제
+    하나). 진행률이 없다(증분 체인은 원격에 있는 백업 수만).
+  - 증분 복제의 건너뛰기는 prod의 사본 기록만 믿는다: 앞 백업의 기록이 `ready`면 dr에 묻지 않으므로, dr에서 (자식
+    사본이 없는) 부모 사본을 지웠으면 다음 증분을 보낼 때 dr의 `replica_parent_missing`을 받고서야 알고 체인을 처음부터
+    확인하며 다시 보낸다(한 Task에서 한 번).
   - 보내는 동안 멈추면 처음부터 다시 보낸다(파일 단위로 다시 쓴다 — 이어 보내기 없음). 파일 하나를 24시간 넘게
     보내면(마지막으로 받은 파일 뒤 24시간) dr이 그 `receiving` 사본을 지우므로 그런 복제는 끝나지 못한다.
   - 원본을 지울 때 dr에 닿지 못하거나(꺼짐·토큰 거절) `force`로 지우면 사본이 dr에 남는다. dr에서 사본을 지우면 prod는
     다음 작업 실행(손으로 만든 백업이면 다음 `oplctl backup replicate`)에서야 알고 다시 보낸다.
+  - 원본을 지울 때 dr이 부모 사본 지우기를 `backup_in_use`로 거절하면 사본마다 60초까지 기다리므로, 원격 사본이 많은
+    백업의 지우기 Task는 시간 제한(600초)을 넘을 수 있다(다시 지우면 된다).
   - **prod 쪽 권한이 dr의 백업에 닿는다.** prod에 등록한 operator 토큰은 dr의 모든 백업을 지울 수 있고, prod에서
     원본을 지우면(사용자·보존 규칙) dr의 사본도 곧바로 지워진다 — prod를 빼앗긴 사람이나 실수가 DR 사본까지 없앨 수
     있다(지우기 지연·보관 잠금은 없다). 오래 지켜야 할 것은 dr 쪽에서 따로 보관한다(예: 사본을 복원한 VM을 dr의 백업
