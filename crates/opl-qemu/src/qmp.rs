@@ -82,6 +82,9 @@ pub enum MigrationState {
     Failed,
     Cancelling,
     Cancelled,
+    /// 능력 `pause-before-switchover`로 보낸 마이그레이션이 게스트를 멈추고 블록 장치를 놓기 전에
+    /// 기다리는 상태. `migrate-continue`로 이어 간다.
+    PreSwitchover,
     Other(String),
 }
 
@@ -95,6 +98,7 @@ impl MigrationState {
             Some("failed") => MigrationState::Failed,
             Some("cancelling") => MigrationState::Cancelling,
             Some("cancelled") => MigrationState::Cancelled,
+            Some("pre-switchover") => MigrationState::PreSwitchover,
             Some(other) => MigrationState::Other(other.to_string()),
         }
     }
@@ -264,16 +268,40 @@ impl TransactionAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobInfo {
     pub id: String,
-    /// `created`, `running`, … `concluded`
+    /// `created`, `running`, `ready`, … `concluded`
     pub status: String,
     /// 실패했으면(취소 포함) 그 까닭
     pub error: Option<String>,
+    /// 한 일의 양. 미러는 복사한 바이트이고, 할당되지 않은 영역은 세지 않으며 복사 중 쓰기만큼
+    /// `total_progress`와 함께 는다. 없으면 0.
+    pub current_progress: u64,
+    /// 할 일의 전체 양(늘 수 있다). 없으면 0.
+    pub total_progress: u64,
 }
 
 impl JobInfo {
     pub fn is_concluded(&self) -> bool {
         self.status == "concluded"
     }
+
+    /// 미러가 한 번 다 복사하고 원본의 쓰기를 따라가는 중인지
+    pub fn is_ready(&self) -> bool {
+        self.status == "ready"
+    }
+}
+
+/// NBD 서버의 내보내기에 붙는 블록 노드(`blockdev-add`, `driver: nbd`). 늘 TLS로 붙는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NbdBlockdev {
+    pub node_name: String,
+    pub host: String,
+    pub port: u16,
+    /// 내보내기 이름
+    pub export: String,
+    /// TLS 자격 증명 객체 id(client)
+    pub tls_creds: String,
+    /// 서버 인증서에서 확인할 이름(IP SAN이나 DNS SAN)
+    pub tls_hostname: String,
 }
 
 /// 작업이 제한 시간을 넘겼을 때 상태를 묻는 `query-jobs`를 기다리는 시간
@@ -525,6 +553,82 @@ impl QmpClient {
         self.execute("blockdev-add", Some(args)).await.map(drop)
     }
 
+    /// NBD 서버의 내보내기에 TLS로 붙는 블록 노드를 연다(미러 대상).
+    pub async fn blockdev_add_nbd(&self, nbd: &NbdBlockdev) -> Result<(), QmpError> {
+        let args = json!({
+            "driver": "nbd",
+            "node-name": nbd.node_name,
+            "server": { "type": "inet", "host": nbd.host, "port": nbd.port.to_string() },
+            "export": nbd.export,
+            "tls-creds": nbd.tls_creds,
+            "tls-hostname": nbd.tls_hostname,
+        });
+        self.execute("blockdev-add", Some(args)).await.map(drop)
+    }
+
+    /// 노드 `device`를 노드 `target`으로 복사하는 미러 작업 `job_id`를 시작한다(`sync: full`,
+    /// `copy-mode: background`). 다 복사하면 `ready`가 되어 원본의 쓰기를 따라가고,
+    /// [`block_job_cancel`](Self::block_job_cancel)로 끝낸 뒤 `job-dismiss`할 때까지 남는다.
+    /// `speed`는 바이트/초(없으면 제한 없음).
+    pub async fn blockdev_mirror(
+        &self,
+        job_id: &str,
+        device: &str,
+        target: &str,
+        speed: Option<u64>,
+    ) -> Result<(), QmpError> {
+        let mut args = json!({
+            "job-id": job_id,
+            "device": device,
+            "target": target,
+            "sync": "full",
+            "copy-mode": "background",
+            "auto-dismiss": false,
+        });
+        if let Some(speed) = speed {
+            args["speed"] = json!(speed);
+        }
+        self.execute("blockdev-mirror", Some(args)).await.map(drop)
+    }
+
+    /// `host:port`에서 TLS(`tls_creds`, server)로만 받는 NBD 서버를 띄운다. QEMU 하나에 하나다.
+    pub async fn nbd_server_start(
+        &self,
+        host: &str,
+        port: u16,
+        tls_creds: &str,
+    ) -> Result<(), QmpError> {
+        // addr는 옛 모양(SocketAddressLegacy)이다: 주소가 `data` 안에 들어간다.
+        let args = json!({
+            "addr": { "type": "inet", "data": { "host": host, "port": port.to_string() } },
+            "tls-creds": tls_creds,
+        });
+        self.execute("nbd-server-start", Some(args)).await.map(drop)
+    }
+
+    /// 블록 노드 `node`를 NBD 서버에 이름 `name`으로 쓰기 가능하게 내보낸다(내보내기 id `id`).
+    /// `-incoming defer`로 띄워 아직 비활성인 노드도 활성화해 쓰기를 받는다.
+    pub async fn block_export_add_nbd(
+        &self,
+        id: &str,
+        node: &str,
+        name: &str,
+    ) -> Result<(), QmpError> {
+        let args = json!({
+            "type": "nbd",
+            "id": id,
+            "node-name": node,
+            "name": name,
+            "writable": true,
+        });
+        self.execute("block-export-add", Some(args)).await.map(drop)
+    }
+
+    /// NBD 서버와 그 내보내기를 모두 멈춘다. 서버가 없으면 오류다.
+    pub async fn nbd_server_stop(&self) -> Result<(), QmpError> {
+        self.execute("nbd-server-stop", None).await.map(drop)
+    }
+
     /// `blockdev-add`로 연 노드를 닫는다.
     pub async fn blockdev_del(&self, node_name: &str) -> Result<(), QmpError> {
         self.execute("blockdev-del", Some(json!({ "node-name": node_name })))
@@ -543,6 +647,8 @@ impl QmpClient {
                     id: id.to_string(),
                     status: status.to_string(),
                     error: j["error"].as_str().map(str::to_string),
+                    current_progress: j["current-progress"].as_u64().unwrap_or(0),
+                    total_progress: j["total-progress"].as_u64().unwrap_or(0),
                 }),
                 _ => Err(QmpError::Protocol(format!("job without id or status: {j}"))),
             })
@@ -554,6 +660,18 @@ impl QmpClient {
         self.execute("job-cancel", Some(json!({ "id": id })))
             .await
             .map(drop)
+    }
+
+    /// 블록 작업 `id`를 끝낸다. `ready`인 미러에 `force: false`면 이 시점까지 맞춘 뒤 오류 없이
+    /// `concluded`가 된다(대상이 원본과 같다). `force: true`면 상태와 상관없이 취소하고 작업은
+    /// `Operation canceled` 오류로 끝난다. 곧바로 돌아오므로 끝은 `query-jobs`로 본다.
+    pub async fn block_job_cancel(&self, id: &str, force: bool) -> Result<(), QmpError> {
+        self.execute(
+            "block-job-cancel",
+            Some(json!({ "device": id, "force": force })),
+        )
+        .await
+        .map(drop)
     }
 
     /// `concluded`인 작업을 지운다.
@@ -667,6 +785,16 @@ impl QmpClient {
             .map(drop)
     }
 
+    /// `pre-switchover`에서 기다리는 마이그레이션을 이어 간다(장치 상태를 보내고 끝낸다).
+    pub async fn migrate_continue(&self) -> Result<(), QmpError> {
+        self.execute(
+            "migrate-continue",
+            Some(json!({ "state": "pre-switchover" })),
+        )
+        .await
+        .map(drop)
+    }
+
     /// 진행 중인 마이그레이션을 취소한다. 원본은 계속 돈다.
     pub async fn migrate_cancel(&self) -> Result<(), QmpError> {
         self.execute("migrate_cancel", None).await.map(drop)
@@ -680,11 +808,22 @@ impl QmpClient {
     /// 마이그레이션이 끝난 상태(완료·실패·취소)가 될 때까지 기다린다. `MIGRATION` 이벤트(능력
     /// `events`)를 받거나 `poll`마다 `query-migrate`로 확인한다. 제한 시간은 호출자가 건다.
     pub async fn wait_migration(&self, poll: Duration) -> Result<MigrationInfo, QmpError> {
+        self.wait_migration_until(poll, MigrationState::is_finished)
+            .await
+    }
+
+    /// [`wait_migration`](Self::wait_migration)과 같되 `until`이 참인 상태가 될 때까지 기다린다.
+    /// 예: 끝났거나 `pre-switchover`
+    pub async fn wait_migration_until(
+        &self,
+        poll: Duration,
+        until: impl Fn(&MigrationState) -> bool,
+    ) -> Result<MigrationInfo, QmpError> {
         // 처음 조회와 이벤트 사이에 끝나도 놓치지 않게 먼저 구독한다.
         let mut events = self.subscribe();
         loop {
             let info = self.query_migrate().await?;
-            if info.state.is_finished() {
+            if until(&info.state) {
                 return Ok(info);
             }
             tokio::select! {
@@ -1352,6 +1491,11 @@ mod tests {
                 None,
             ),
             (
+                json!({ "status": "pre-switchover" }),
+                MigrationState::PreSwitchover,
+                None,
+            ),
+            (
                 json!({ "status": "device" }),
                 MigrationState::Other("device".into()),
                 None,
@@ -1369,6 +1513,7 @@ mod tests {
         assert!(MigrationState::Cancelled.is_finished());
         assert!(!MigrationState::Cancelling.is_finished());
         assert!(!MigrationState::None.is_finished());
+        assert!(!MigrationState::PreSwitchover.is_finished());
     }
 
     #[tokio::test]
@@ -1658,11 +1803,15 @@ mod tests {
     #[tokio::test]
     async fn query_jobs_reads_status_and_error() {
         let (client, mut fake, _dir) = setup().await;
+        // QEMU 11.1의 미러 작업 모양(ready 항목은 계획 42의 환경 탐색에서 본 그대로)
         let ret = json!([
             { "id": "opl-backup-0", "type": "backup", "status": "running",
               "current-progress": 1, "total-progress": 4 },
             { "id": "opl-backup-1", "type": "backup", "status": "concluded",
-              "current-progress": 0, "total-progress": 4, "error": "No space left on device" }
+              "current-progress": 0, "total-progress": 4, "error": "No space left on device" },
+            { "current-progress": 7405568, "status": "ready", "total-progress": 7405568,
+              "type": "mirror", "id": "opl-mirror-0" },
+            { "id": "old", "type": "mirror", "status": "created" }
         ]);
         let (jobs, _) = tokio::join!(client.query_jobs(), reply(&mut fake, ret));
         let jobs = jobs.unwrap();
@@ -1672,17 +1821,183 @@ mod tests {
                 JobInfo {
                     id: "opl-backup-0".into(),
                     status: "running".into(),
-                    error: None
+                    error: None,
+                    current_progress: 1,
+                    total_progress: 4,
                 },
                 JobInfo {
                     id: "opl-backup-1".into(),
                     status: "concluded".into(),
-                    error: Some("No space left on device".into())
-                }
+                    error: Some("No space left on device".into()),
+                    current_progress: 0,
+                    total_progress: 4,
+                },
+                JobInfo {
+                    id: "opl-mirror-0".into(),
+                    status: "ready".into(),
+                    error: None,
+                    current_progress: 7405568,
+                    total_progress: 7405568,
+                },
+                // 진행률이 없으면 0
+                JobInfo {
+                    id: "old".into(),
+                    status: "created".into(),
+                    error: None,
+                    current_progress: 0,
+                    total_progress: 0,
+                },
             ]
         );
         assert!(!jobs[0].is_concluded());
         assert!(jobs[1].is_concluded());
+        assert!(!jobs[0].is_ready());
+        assert!(jobs[2].is_ready());
+        assert!(!jobs[2].is_concluded());
+    }
+
+    /// 받는 쪽: TLS NBD 서버, 디스크 노드 내보내기, 서버 멈춤
+    #[tokio::test]
+    async fn nbd_export_commands_send_their_arguments() {
+        let (client, mut fake, _dir) = setup().await;
+        let (r, cmd) = tokio::join!(
+            client.nbd_server_start("10.0.0.2", 60001, "opl-nbd-tls"),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "nbd-server-start");
+        // nbd-server-start의 addr는 옛 모양(SocketAddressLegacy, `data` 안에 주소)이고 포트는 문자열이다.
+        assert_eq!(
+            cmd["arguments"],
+            json!({
+                "addr": { "type": "inet", "data": { "host": "10.0.0.2", "port": "60001" } },
+                "tls-creds": "opl-nbd-tls"
+            })
+        );
+        let (r, cmd) = tokio::join!(
+            client.block_export_add_nbd("opl-export-1", "disk1", "disk1"),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "block-export-add");
+        assert_eq!(
+            cmd["arguments"],
+            json!({
+                "type": "nbd", "id": "opl-export-1", "node-name": "disk1",
+                "name": "disk1", "writable": true
+            })
+        );
+        let (r, cmd) = tokio::join!(client.nbd_server_stop(), reply(&mut fake, json!({})));
+        r.unwrap();
+        assert_eq!(cmd["execute"], "nbd-server-stop");
+        assert!(cmd.get("arguments").is_none(), "{cmd}");
+        // 서버가 없으면 QEMU는 오류로 답한다(QEMU 11.1: "NBD server not running").
+        let (r, ()) = tokio::join!(client.nbd_server_stop(), async {
+            fake.answer(
+                "nbd-server-stop",
+                json!({ "error": { "class": "GenericError", "desc": "NBD server not running" } }),
+            )
+            .await;
+        });
+        assert!(matches!(r, Err(QmpError::Command { .. })), "{r:?}");
+    }
+
+    /// 보내는 쪽: TLS NBD 블록 노드, 미러 작업, 미러 끝내기·취소, 스위치오버 이어 가기
+    #[tokio::test]
+    async fn mirror_commands_send_their_arguments() {
+        let (client, mut fake, _dir) = setup().await;
+        let nbd = NbdBlockdev {
+            node_name: "opl-mirror-0".into(),
+            host: "10.0.0.2".into(),
+            port: 60001,
+            export: "disk0".into(),
+            tls_creds: "opl-nbd-tls".into(),
+            tls_hostname: "10.0.0.2".into(),
+        };
+        let (r, cmd) = tokio::join!(client.blockdev_add_nbd(&nbd), reply(&mut fake, json!({})));
+        r.unwrap();
+        assert_eq!(cmd["execute"], "blockdev-add");
+        assert_eq!(
+            cmd["arguments"],
+            json!({
+                "driver": "nbd", "node-name": "opl-mirror-0",
+                "server": { "type": "inet", "host": "10.0.0.2", "port": "60001" },
+                "export": "disk0", "tls-creds": "opl-nbd-tls", "tls-hostname": "10.0.0.2"
+            })
+        );
+
+        let (r, cmd) = tokio::join!(
+            client.blockdev_mirror("opl-mirror-0", "disk0", "opl-mirror-0", Some(50 << 20)),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "blockdev-mirror");
+        assert_eq!(
+            cmd["arguments"],
+            json!({
+                "job-id": "opl-mirror-0", "device": "disk0", "target": "opl-mirror-0",
+                "sync": "full", "copy-mode": "background", "auto-dismiss": false,
+                "speed": 50u64 << 20
+            })
+        );
+        // 속도 제한이 없으면 speed를 보내지 않는다(QEMU 기본 0 = 제한 없음).
+        let (r, cmd) = tokio::join!(
+            client.blockdev_mirror("opl-mirror-1", "disk1", "opl-mirror-1", None),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert!(cmd["arguments"].get("speed").is_none(), "{cmd}");
+
+        for force in [false, true] {
+            let (r, cmd) = tokio::join!(
+                client.block_job_cancel("opl-mirror-0", force),
+                reply(&mut fake, json!({}))
+            );
+            r.unwrap();
+            assert_eq!(cmd["execute"], "block-job-cancel");
+            assert_eq!(
+                cmd["arguments"],
+                json!({ "device": "opl-mirror-0", "force": force })
+            );
+        }
+
+        let (r, cmd) = tokio::join!(client.migrate_continue(), reply(&mut fake, json!({})));
+        r.unwrap();
+        assert_eq!(cmd["execute"], "migrate-continue");
+        assert_eq!(cmd["arguments"], json!({ "state": "pre-switchover" }));
+    }
+
+    /// `pause-before-switchover`로 보낸 마이그레이션은 `pre-switchover`에서 기다린다. 그 상태에서
+    /// 돌아오는 기다림과, 끝난 상태까지 가는 기다림이 다르다.
+    #[tokio::test]
+    async fn wait_migration_until_stops_at_pre_switchover() {
+        let (client, mut fake, _dir) = setup().await;
+        let until = |s: &MigrationState| s.is_finished() || *s == MigrationState::PreSwitchover;
+        let (info, ()) = tokio::join!(
+            client.wait_migration_until(Duration::from_millis(20), until),
+            async {
+                fake.answer("query-migrate", json!({ "return": { "status": "setup" } }))
+                    .await;
+                fake.answer(
+                    "query-migrate",
+                    json!({ "return": { "status": "pre-switchover" } }),
+                )
+                .await;
+            }
+        );
+        assert_eq!(info.unwrap().state, MigrationState::PreSwitchover);
+        // 실패하면 pre-switchover에 닿지 않아도 돌아온다.
+        let (info, ()) = tokio::join!(
+            client.wait_migration_until(Duration::from_millis(20), until),
+            async {
+                fake.answer(
+                    "query-migrate",
+                    json!({ "return": { "status": "failed", "error-desc": "x" } }),
+                )
+                .await;
+            }
+        );
+        assert_eq!(info.unwrap().state, MigrationState::Failed);
     }
 
     /// QEMU 8.2·10의 `query-named-block-nodes`(flat) 모양. `inconsistent`는 참일 때만 온다.
