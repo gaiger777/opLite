@@ -301,9 +301,11 @@ export interface paths {
          * `ready` 백업을 원격 클러스터 `remote`의 백업 풀 `pool`에 사본으로 보낼 Task를 돌려준다(202). Task는
          *     백업 파일이 있는 노드(공유가 아닌 풀은 파일을 쓴 노드)에서 돌고, 원격의 받기 API로 파일을 보내며 원본
          *     `status.replicas`에 결과를 적는다. 원격 쪽 권한은 원격 토큰 주인의 역할이다(백업 쓰기, operator
-         *     이상). 원격이 없으면 404, 백업이 준비되지 않았으면 409 `backup_not_ready`, 지우는 중이거나 같은 원격으로
-         *     복제하는 Task가 끝나지 않았으면 409 `backup_busy`, 파일을 읽을 노드가 없으면 409(`node_offline`,
-         *     `pool_unavailable` 등), 옛 노드가 있으면 409 `cluster_upgrading`. 증분 백업은 아직 보내지 않는다(400).
+         *     이상). 증분 백업은 체인의 앞 백업(원격에 사본이 없는 것)부터 차례로 보낸다(원격의 모든 노드가 증분
+         *     받기를 알아야 한다). 원격이 없으면 404, 백업이 준비되지 않았으면 409 `backup_not_ready`, 지우는 중이거나
+         *     같은 전체 백업에서 시작한 체인의 어느 백업이든(조상·자식·형제) 같은 원격으로 복제하는 Task가 끝나지
+         *     않았으면 409 `backup_busy`, 파일을 읽을 노드가 없으면 409(`node_offline`, `pool_unavailable` 등), 옛
+         *     노드가 있으면 409 `cluster_upgrading`.
          */
         post: operations["replicate_backup"];
         delete?: never;

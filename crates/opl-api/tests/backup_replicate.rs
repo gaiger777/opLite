@@ -64,23 +64,33 @@ async fn ready_backup(env: &Env, name: &str, job: Option<Uuid>) -> Backup {
         { "volume": "web-root", "bus": "virtio-blk" },
         { "volume": "web-data", "bus": "virtio-blk" }
     ]);
+    let spec = BackupSpec {
+        vm: Uuid::now_v7(),
+        vm_name: "web".into(),
+        pool: "backups".into(),
+        vm_spec: serde_json::from_value(spec).unwrap(),
+        job,
+        origin: None,
+        incremental: false,
+        max_chain: None,
+    };
+    make_backup(env, name, spec, None).await
+}
+
+/// `parent`의 `ready` 증분 백업 `name`(같은 VM, 매니페스트 버전 2)을 직접 만든다.
+async fn incremental_backup(env: &Env, name: &str, parent: &Backup) -> Backup {
+    let mut spec = parent.spec.clone();
+    spec.incremental = true;
+    make_backup(env, name, spec, Some(parent.id)).await
+}
+
+async fn make_backup(env: &Env, name: &str, spec: BackupSpec, parent: Option<Uuid>) -> Backup {
     let files = files();
-    let mut backup: Backup = Resource::new(
-        name,
-        BackupSpec {
-            vm: Uuid::now_v7(),
-            vm_name: "web".into(),
-            pool: "backups".into(),
-            vm_spec: serde_json::from_value(spec).unwrap(),
-            job,
-            origin: None,
-            incremental: false,
-            max_chain: None,
-        },
-    );
+    let mut backup: Backup = Resource::new(name, spec);
     let manifest: BackupManifest = serde_json::from_value(json!({
-        "version": 1,
+        "version": if parent.is_some() { 2 } else { 1 },
         "backup": backup.id,
+        "parent": parent,
         "vm": backup.spec.vm,
         "vm_name": "web",
         "vm_spec": backup.spec.vm_spec,
@@ -103,7 +113,7 @@ async fn ready_backup(env: &Env, name: &str, job: Option<Uuid>) -> Backup {
         node: Some(env.node),
         replicas: vec![],
         received_at: None,
-        parent: None,
+        parent,
         full_reason: None,
     };
     let dir = source_dir(env, backup.id);
@@ -703,50 +713,358 @@ async fn replicate_requests_are_checked() {
     );
 }
 
-/// 증분 백업(부모가 있는 백업)은 아직 복제하지 않는다: API는 400, 복제 Task도 같은 확인으로 실패하고
-/// 원격에 아무것도 보내지 않는다.
+/// 원본 `id`의 사본 기록이 가리키는 원격 사본
+fn copy_of(local: &Env, r: &Remote, id: Uuid) -> Backup {
+    get_backup(
+        &r.env,
+        only_replica(local, id).backup.expect("remote copy id"),
+    )
+}
+
+/// 전체 → 증분 → 증분 체인: 마지막 증분을 복제하면 전체부터 차례로 보내고(원격 사본 id가 그 순서),
+/// 원격 사본의 부모 링크와 매니페스트(버전 2, 원격 쪽 부모 id)가 원본 체인과 같다. 다시 복제하면 ready로
+/// 적힌 조상은 건너뛰고(기록이 그대로) 마지막 증분만 확인한다.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn incremental_backups_are_not_replicated_yet() {
+async fn an_incremental_backup_is_replicated_with_its_chain() {
     let r = remote().await;
     let (local, admin) = local_with_remote(&r, "operator").await;
     let full = ready_backup(&local, "full", None).await;
-    let incr = ready_backup(&local, "incr", None).await;
-    let mut status = get_backup(&local, incr.id).status;
-    status.parent = Some(full.id);
-    local
+    let first = incremental_backup(&local, "incr-1", &full).await;
+    let second = incremental_backup(&local, "incr-2", &first).await;
+
+    let task = replicate_done(&admin, "incr-2").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(r.env.cluster.list::<BackupSpec>().unwrap().1.len(), 3);
+    let copies: Vec<Backup> = [&full, &first, &second]
+        .iter()
+        .map(|b| copy_of(&local, &r, b.id))
+        .collect();
+    for (copy, source) in copies.iter().zip([&full, &first, &second]) {
+        assert_eq!(copy.status.phase, BackupPhase::Ready, "{}", copy.name);
+        assert_eq!(copy.spec.origin.as_ref().unwrap().backup, source.id);
+        assert_eq!(only_replica(&local, source.id).state, ReplicaState::Ready);
+    }
+    assert!(copies[0].id < copies[1].id && copies[1].id < copies[2].id);
+    assert_eq!(copies[0].status.parent, None);
+    assert_eq!(copies[1].status.parent, Some(copies[0].id));
+    assert_eq!(copies[2].status.parent, Some(copies[1].id));
+    let manifest: BackupManifest = serde_json::from_slice(
+        &std::fs::read(replica_dir(&r.env, copies[2].id).join(MANIFEST_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.version, 2);
+    assert_eq!(manifest.backup, copies[2].id);
+    assert_eq!(manifest.parent, Some(copies[1].id));
+
+    let before: Vec<_> = [&full, &first]
+        .iter()
+        .map(|b| only_replica(&local, b.id))
+        .collect();
+    let task = replicate_done(&admin, "incr-2").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let after: Vec<_> = [&full, &first]
+        .iter()
+        .map(|b| only_replica(&local, b.id))
+        .collect();
+    assert_eq!(after, before);
+    assert_eq!(copy_of(&local, &r, second.id).id, copies[2].id);
+    assert_eq!(r.env.cluster.list::<BackupSpec>().unwrap().1.len(), 3);
+}
+
+/// 원격에서 부모 사본을 지웠으면(ready로 적혀 있어 건너뛴다) 다음 증분의 받기가 409
+/// `replica_parent_missing`이고, Task는 부모의 기록을 failed로 바꾸고 체인을 처음부터 한 번 더 본다: 이번에는
+/// ready로 적힌 앞 백업도 원격에 물어 확인하므로(없으면 다시 보낸다) 조상의 사본까지 지웠어도 한 Task가
+/// 체인 끝까지 다시 보낸다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_parent_copy_is_sent_again() {
+    let r = remote().await;
+    let (local, admin) = local_with_remote(&r, "operator").await;
+    let remote_admin = r.env.admin().await;
+    let delete_copy = async |id: Uuid| {
+        let (status, task) = remote_admin.delete(&format!("/backups/{id}")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        let task = remote_admin.wait_task(&task).await;
+        assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    };
+    let full = ready_backup(&local, "full", None).await;
+    let first = incremental_backup(&local, "incr-1", &full).await;
+    let second = incremental_backup(&local, "incr-2", &first).await;
+    let third = incremental_backup(&local, "incr-3", &second).await;
+
+    let task = replicate_done(&admin, "incr-1").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let old = copy_of(&local, &r, first.id).id;
+    delete_copy(old).await;
+
+    let task = replicate_done(&admin, "incr-2").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let again = copy_of(&local, &r, first.id);
+    assert_ne!(again.id, old);
+    assert_eq!(again.status.parent, Some(copy_of(&local, &r, full.id).id));
+    assert_eq!(copy_of(&local, &r, second.id).status.parent, Some(again.id));
+    assert_eq!(r.env.cluster.list::<BackupSpec>().unwrap().1.len(), 3);
+
+    // 증분 둘과 전체의 사본을 모두 지운다(자식부터). 한 Task가 체인을 다시 다 보낸다.
+    delete_copy(copy_of(&local, &r, second.id).id).await;
+    delete_copy(again.id).await;
+    delete_copy(copy_of(&local, &r, full.id).id).await;
+    let task = replicate_done(&admin, "incr-3").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(r.env.cluster.list::<BackupSpec>().unwrap().1.len(), 4);
+    let linked = || {
+        let copies: Vec<Backup> = [&full, &first, &second, &third]
+            .iter()
+            .map(|b| copy_of(&local, &r, b.id))
+            .collect();
+        assert_eq!(copies[0].status.parent, None);
+        for pair in copies.windows(2) {
+            assert_eq!(pair[1].status.parent, Some(pair[0].id));
+        }
+        for b in [&full, &first, &second, &third] {
+            assert_eq!(only_replica(&local, b.id).state, ReplicaState::Ready);
+        }
+        copies
+    };
+    let copies = linked();
+
+    // 체인 넷의 사본을 모두 지워도(마지막 증분도 ready로 적혀 있다) 한 Task가 다시 다 보낸다.
+    for copy in copies.iter().rev() {
+        delete_copy(copy.id).await;
+    }
+    let task = replicate_done(&admin, "incr-3").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(r.env.cluster.list::<BackupSpec>().unwrap().1.len(), 4);
+    let again = linked();
+    for (new, old) in again.iter().zip(&copies) {
+        assert_ne!(new.id, old.id);
+    }
+}
+
+/// 다시 본 체인에서도 원격이 부모 사본을 받지 않으면(여기서는 원격의 전체 사본 파일이 다른 노드에 있다고
+/// 적혀 있다) 실패하고, 그 증분 백업(체인 중간)의 기록은 copying으로 남지 않고 failed와 이유다. 부모들의
+/// 기록은 failed가 되어도 사본 id를 잃지 않는다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_middle_backup_that_cannot_be_sent_is_failed() {
+    let r = remote().await;
+    let (local, admin) = local_with_remote(&r, "operator").await;
+    let remote_admin = r.env.admin().await;
+    let full = ready_backup(&local, "full", None).await;
+    let first = incremental_backup(&local, "incr-1", &full).await;
+    let second = incremental_backup(&local, "incr-2", &first).await;
+    let task = replicate_done(&admin, "incr-2").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    for b in [&second, &first] {
+        let (status, task) = remote_admin
+            .delete(&format!("/backups/{}", copy_of(&local, &r, b.id).id))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        let task = remote_admin.wait_task(&task).await;
+        assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    }
+    let old = only_replica(&local, first.id).backup.unwrap();
+    let full_copy = copy_of(&local, &r, full.id);
+    let mut status = full_copy.status.clone();
+    status.node = Some(Uuid::now_v7());
+    r.env
         .cluster
-        .update_status::<BackupSpec>(incr.id, &status)
+        .update_status::<BackupSpec>(full_copy.id, &status)
         .await
         .unwrap();
 
-    let got = replicate(&admin, "incr").await;
-    assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
-    assert_eq!(
-        got.1["message"],
-        "incremental backups cannot be replicated yet"
-    );
-    let mut task: opl_types::task::Task = Resource::new(
-        "",
-        opl_types::task::TaskSpec {
-            op: opl_types::task::TaskOp::BackupReplicate {
-                remote: "dr".into(),
-                pool: "dr".into(),
+    let task = replicate_done(&admin, "incr-2").await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let middle = only_replica(&local, first.id);
+    assert_eq!(middle.state, ReplicaState::Failed);
+    let error = middle.error.expect("reason");
+    assert!(error.contains("send the parent first"), "{error}");
+    assert_eq!(middle.backup, Some(old));
+    assert_eq!(only_replica(&local, second.id).state, ReplicaState::Failed);
+    // 원격이 받지 않는 부모 사본(전체)의 기록도 failed이지만 사본 id는 그대로다.
+    let parent = only_replica(&local, full.id);
+    assert_eq!(parent.state, ReplicaState::Failed);
+    assert_eq!(parent.backup, Some(full_copy.id));
+}
+
+/// opld가 다시 시작해(실행기 멈춤·다시 시작) 복제 Task가 "interrupted"로 끝나면 정리가 대상 백업의 기록만이
+/// 아니라 보내던 체인 중간 백업의 copying 기록도 failed와 그 이유로 바꾼다. ready로 적힌 앞 백업은 그대로다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_task_fails_the_copying_records_of_its_chain() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // 켜 두면 파일 받기(PUT …/files/…)를 30초 늦추고 그 요청이 왔음을 알리는 원격
+    let hang = Arc::new(AtomicBool::new(false));
+    let reached = Arc::new(AtomicBool::new(false));
+    let (h, got) = (hang.clone(), reached.clone());
+    let r = remote_with(move |app| {
+        app.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let (hang, reached) = (h.clone(), got.clone());
+                async move {
+                    if hang.load(Ordering::SeqCst)
+                        && req.method() == Method::PUT
+                        && req.uri().path().contains("/files/")
+                    {
+                        reached.store(true, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                    next.run(req).await
+                }
             },
-            target: incr.id,
-            node: local.node,
+        ))
+    })
+    .await;
+    let (mut local, admin) = local_with_remote(&r, "operator").await;
+    let full = ready_backup(&local, "full", None).await;
+    let first = incremental_backup(&local, "incr-1", &full).await;
+    let second = incremental_backup(&local, "incr-2", &first).await;
+    let task = replicate_done(&admin, "full").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let ready = only_replica(&local, full.id);
+
+    // 체인 중간(incr-1)의 파일을 보내는 중에 opld가 다시 시작한다.
+    hang.store(true, Ordering::SeqCst);
+    let (status, task) = replicate(&admin, "incr-2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    wait_until("the file of incr-1", || reached.load(Ordering::SeqCst)).await;
+    assert_eq!(only_replica(&local, first.id).state, ReplicaState::Copying);
+    local.stop_runner().await;
+    hang.store(false, Ordering::SeqCst);
+    local.start_runner().await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(error.starts_with("interrupted"), "{error}");
+    for b in [&first, &second] {
+        let replica = only_replica(&local, b.id);
+        assert_eq!(replica.state, ReplicaState::Failed, "{}", b.name);
+        assert_eq!(replica.error.as_deref(), Some(error), "{}", b.name);
+    }
+    assert_eq!(only_replica(&local, full.id), ready);
+}
+
+/// 원격이 증분 사본의 완료를 409 `replica_parent_missing`으로 거절하면(받는 동안 부모 사본이 없어졌다)
+/// 받기의 거절처럼 부모의 기록을 failed로 바꾸고 체인을 한 번 더 본다: 부모 사본을 확인하고 받던 사본을
+/// 이어 가 끝낸다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_parent_copy_at_completion_is_retried() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // 두 번째 완료 요청(증분 사본)을 한 번 409 `replica_parent_missing`으로 답하는 원격
+    let completes = Arc::new(AtomicUsize::new(0));
+    let seen = completes.clone();
+    let r = remote_with(move |app| {
+        app.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let seen = seen.clone();
+                async move {
+                    if req.method() == Method::POST
+                        && req.uri().path().ends_with("/actions/complete")
+                        && seen.fetch_add(1, Ordering::SeqCst) == 1
+                    {
+                        let body = json!({
+                            "code": "replica_parent_missing",
+                            "message": "the parent copy is missing; send the parent first",
+                        });
+                        return axum::response::Response::builder()
+                            .status(StatusCode::CONFLICT)
+                            .header(axum::http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap();
+                    }
+                    next.run(req).await
+                }
+            },
+        ))
+    })
+    .await;
+    let (local, admin) = local_with_remote(&r, "operator").await;
+    let full = ready_backup(&local, "full", None).await;
+    let incr = incremental_backup(&local, "incr", &full).await;
+
+    let task = replicate_done(&admin, "incr").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(completes.load(Ordering::SeqCst), 3);
+    assert_eq!(r.env.cluster.list::<BackupSpec>().unwrap().1.len(), 2);
+    let parent = copy_of(&local, &r, full.id);
+    let copy = copy_of(&local, &r, incr.id);
+    assert_eq!(copy.status.phase, BackupPhase::Ready);
+    assert_eq!(copy.status.parent, Some(parent.id));
+    for b in [&full, &incr] {
+        assert_eq!(only_replica(&local, b.id).state, ReplicaState::Ready);
+    }
+}
+
+/// 증분 백업은 원격의 모든 노드(위트니스 포함)가 증분 받기(`incremental-replication`)를 알아야 보낸다. 증분
+/// 백업만 아는 계획 40 노드가 있으면 아무것도 보내지 않고 실패한다. 전체 백업은 그대로 보낸다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_backups_need_a_remote_that_knows_them() {
+    let r = remote().await;
+    let (local, admin) = local_with_remote(&r, "operator").await;
+    let full = ready_backup(&local, "full", None).await;
+    incremental_backup(&local, "incr", &full).await;
+    // 증분 백업은 알지만 증분 받기는 모르는 원격 노드(계획 40)
+    let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
+        "old",
+        NodeSpec {
+            address: "10.0.0.9:8006".into(),
+            maintenance: false,
+            witness: true,
         },
     );
-    task.name = task.id.to_string();
-    local.cluster.create(&task).await.unwrap();
-    let task = admin.wait_task(&json!({ "id": task.id })).await;
+    node.status.version = Some(opl_types::version::BUILD.into());
+    node.status.features = vec!["node-drain".into(), "incremental-backup".into()];
+    r.env.cluster.create(&node).await.unwrap();
+
+    let task = replicate_done(&admin, "incr").await;
     assert_eq!(task["status"]["state"], "failed", "{task}");
     assert_eq!(
         task["status"]["error"],
-        "incremental backups cannot be replicated yet"
+        "remote cluster \"dr\" does not support incremental backups; upgrade it"
     );
     assert!(r.env.cluster.list::<BackupSpec>().unwrap().1.is_empty());
-    // 전체 백업(부모)은 보낸다.
     let task = replicate_done(&admin, "full").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+}
+
+/// 같은 전체 백업에서 시작한 체인의 어느 백업이든(조상, 자식, 형제) 같은 원격으로 복제하는 Task가 끝나지
+/// 않았으면 복제는 409 `backup_busy`이고 문구는 복제 중인 백업의 이름이다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chain_being_replicated_is_busy() {
+    let r = remote().await;
+    let (mut local, admin) = local_with_remote(&r, "operator").await;
+    let full = ready_backup(&local, "full", None).await;
+    incremental_backup(&local, "incr", &full).await;
+    incremental_backup(&local, "sibling", &full).await;
+
+    local.stop_runner().await;
+    let (status, task) = replicate(&admin, "full").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let got = replicate(&admin, "incr").await;
+    assert_error(&got, StatusCode::CONFLICT, "backup_busy");
+    assert_eq!(
+        got.1["message"],
+        "backup \"full\" is being replicated to remote \"dr\"; try again when the task has finished"
+    );
+    local.start_runner().await;
+    let done = admin.wait_task(&task).await;
+    assert_eq!(done["status"]["state"], "succeeded", "{done}");
+
+    // 자식이 복제 중이면 조상과 형제도 막힌다.
+    local.stop_runner().await;
+    let (status, task) = replicate(&admin, "incr").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    for name in ["full", "sibling"] {
+        let got = replicate(&admin, name).await;
+        assert_error(&got, StatusCode::CONFLICT, "backup_busy");
+        assert_eq!(
+            got.1["message"],
+            "backup \"incr\" is being replicated to remote \"dr\"; try again when the task has finished"
+        );
+    }
+    local.start_runner().await;
+    let done = admin.wait_task(&task).await;
+    assert_eq!(done["status"]["state"], "succeeded", "{done}");
+    let task = replicate_done(&admin, "sibling").await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
 }
 
@@ -1105,6 +1423,61 @@ async fn deleting_a_backup_deletes_its_remote_copy() {
         assert!(!source_dir(&local, source.id).exists());
         wait_until("the remote copy", || !exists(&r.env, copy)).await;
     }
+}
+
+/// 증분 체인을 자식부터 지우면 원격에서 자식 사본의 지우기 Task가 끝나기 전에 부모 사본 지우기가 409
+/// `backup_in_use`일 수 있다: 원본의 지우기 Task가 기다렸다가 다시 요청해 원격 사본이 둘 다 없어진다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_chain_waits_for_the_child_copy_on_the_remote() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // 원격이 답한 DELETE 409 수
+    let refused = Arc::new(AtomicUsize::new(0));
+    let count = refused.clone();
+    let mut r = remote_with(move |app| {
+        app.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let count = count.clone();
+                async move {
+                    let delete = req.method() == Method::DELETE;
+                    let response = next.run(req).await;
+                    if delete && response.status() == StatusCode::CONFLICT {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    response
+                }
+            },
+        ))
+    })
+    .await;
+    let (local, admin) = local_with_remote(&r, "operator").await;
+    let full = ready_backup(&local, "full", None).await;
+    let incr = incremental_backup(&local, "incr", &full).await;
+    let task = replicate_done(&admin, "incr").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let copies = [
+        copy_of(&local, &r, incr.id).id,
+        copy_of(&local, &r, full.id).id,
+    ];
+
+    // 원격의 지우기 Task가 아직 돌지 않는다.
+    r.env.stop_runner().await;
+    let (status, task) = admin.delete("/backups/incr").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (status, task) = admin.delete("/backups/full").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    r.env.start_runner().await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(task["status"]["error"], Value::Null, "{task}");
+    for copy in copies {
+        wait_until("the remote copy", || !exists(&r.env, copy)).await;
+    }
+    // 부모 사본 지우기가 실제로 409를 받고 기다렸다.
+    assert!(refused.load(Ordering::SeqCst) >= 1);
 }
 
 /// 원격 사본을 지우지 못해도 원본은 지우고, Task는 성공하되 그 경고를 오류로 남긴다.

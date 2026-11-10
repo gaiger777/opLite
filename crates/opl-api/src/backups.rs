@@ -2,6 +2,7 @@
 //! 만들기는 VM 쓰기, 지우기·복원·복제는 백업 쓰기 권한이다. 실제 작업은 Task 실행기가 한다: 백업은
 //! VM의 노드, 지우기·복원·복제는 백업 풀을 쓸 수 있는 노드(공유가 아닌 풀의 백업은 파일을 쓴 노드).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -658,9 +659,11 @@ pub async fn restore_backup(
 /// `ready` 백업을 원격 클러스터 `remote`의 백업 풀 `pool`에 사본으로 보낼 Task를 돌려준다(202). Task는
 /// 백업 파일이 있는 노드(공유가 아닌 풀은 파일을 쓴 노드)에서 돌고, 원격의 받기 API로 파일을 보내며 원본
 /// `status.replicas`에 결과를 적는다. 원격 쪽 권한은 원격 토큰 주인의 역할이다(백업 쓰기, operator
-/// 이상). 원격이 없으면 404, 백업이 준비되지 않았으면 409 `backup_not_ready`, 지우는 중이거나 같은 원격으로
-/// 복제하는 Task가 끝나지 않았으면 409 `backup_busy`, 파일을 읽을 노드가 없으면 409(`node_offline`,
-/// `pool_unavailable` 등), 옛 노드가 있으면 409 `cluster_upgrading`. 증분 백업은 아직 보내지 않는다(400).
+/// 이상). 증분 백업은 체인의 앞 백업(원격에 사본이 없는 것)부터 차례로 보낸다(원격의 모든 노드가 증분
+/// 받기를 알아야 한다). 원격이 없으면 404, 백업이 준비되지 않았으면 409 `backup_not_ready`, 지우는 중이거나
+/// 같은 전체 백업에서 시작한 체인의 어느 백업이든(조상·자식·형제) 같은 원격으로 복제하는 Task가 끝나지
+/// 않았으면 409 `backup_busy`, 파일을 읽을 노드가 없으면 409(`node_offline`, `pool_unavailable` 등), 옛
+/// 노드가 있으면 409 `cluster_upgrading`.
 #[utoipa::path(post, path = "/backups/{key}/actions/replicate", tag = "backups",
     params(("key" = String, Path, description = "id or name")),
     request_body = ReplicateRequest,
@@ -681,6 +684,20 @@ pub async fn replicate_backup(
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
+/// 백업 `backup`의 체인 뿌리: `status.parent`를 따라간 전체 백업의 id. 목록에 없는 조상이나 이미 본
+/// 백업(고리)에서 멈추면 그 앞의 백업이다.
+fn chain_root(backups: &HashMap<Uuid, &Backup>, backup: &Backup) -> Uuid {
+    let mut seen = HashSet::from([backup.id]);
+    let mut root = backup;
+    while let Some(parent) = root.status.parent
+        && seen.insert(parent)
+        && let Some(b) = backups.get(&parent)
+    {
+        root = b;
+    }
+    root.id
+}
+
 /// 백업 `backup`을 원격 `remote`의 백업 풀 `pool`로 보낼 Task를 만든다. 오류는 [`replicate_backup`]과
 /// 같다. 복제 API와 백업 작업 스케줄러가 쓴다(권한 검사는 부르는 쪽).
 pub(crate) async fn start_backup_replicate(
@@ -691,11 +708,6 @@ pub(crate) async fn start_backup_replicate(
 ) -> Result<Task, ApiError> {
     require_current(&state.cluster)?;
     let remote = lookup::<RemoteSpec>(&state.cluster, remote)?;
-    if backup.status.parent.is_some() {
-        return Err(ApiError::bad_request(
-            "incremental backups cannot be replicated yet",
-        ));
-    }
     if backup.status.phase != BackupPhase::Ready {
         return Err(ApiError::conflict(
             "backup_not_ready",
@@ -705,14 +717,23 @@ pub(crate) async fn start_backup_replicate(
     if backup_tasks(state, backup.id)?.contains(&"being deleted") {
         return Err(backup_busy(backup, "being deleted"));
     }
+    // 증분 백업의 Task는 체인의 앞 백업도 보내므로 같은 전체 백업에서 시작한 체인(조상·자식·형제)의 어느
+    // 백업이든 같은 원격으로 복제 중이면 안 된다.
     let (_, tasks) = state.cluster.list::<TaskSpec>()?;
-    if tasks.iter().any(|t| {
-        !t.status.state.is_finished()
-            && t.spec.target == backup.id
-            && matches!(&t.spec.op, TaskOp::BackupReplicate { remote: r, .. } if *r == remote.name)
-    }) {
+    let (_, backups) = state.cluster.list::<BackupSpec>()?;
+    let backups: HashMap<Uuid, &Backup> = backups.iter().map(|b| (b.id, b)).collect();
+    let root = chain_root(&backups, backup);
+    if let Some(busy) = tasks
+        .iter()
+        .filter(|t| {
+            !t.status.state.is_finished()
+                && matches!(&t.spec.op, TaskOp::BackupReplicate { remote: r, .. } if *r == remote.name)
+        })
+        .filter_map(|t| backups.get(&t.spec.target))
+        .find(|b| chain_root(&backups, b) == root)
+    {
         return Err(backup_busy(
-            backup,
+            busy,
             &format!("being replicated to remote {:?}", remote.name),
         ));
     }

@@ -263,8 +263,8 @@ async fn replicate_is_checked_and_waits_for_every_node_to_run_this_build() {
     assert_eq!(body["spec"]["replicate"], target);
 }
 
-/// `full_every`: 만들기와 바꾸기에 쓰고 0이면 빠진다. 원격 복제와 함께 쓰지 못하고(400), 증분 백업을
-/// 모르는 노드가 있으면 쓰지 못한다(409 `cluster_upgrading`).
+/// `full_every`: 만들기와 바꾸기에 쓰고 0이면 빠진다. 원격 복제와 함께 쓸 수 있고, 증분 백업을 모르는
+/// 노드가 있으면 쓰지 못한다(409 `cluster_upgrading`).
 #[tokio::test]
 async fn full_every_is_checked_and_needs_every_node_to_know_incremental_backups() {
     let env = Env::start().await;
@@ -286,23 +286,19 @@ async fn full_every_is_checked_and_needs_every_node_to_know_incremental_backups(
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["spec"]["full_every"], 3);
 
-    // 증분 백업은 아직 복제하지 않는다.
+    // 증분 백업을 만드는 작업도 원격으로 복제한다.
     let target = json!({ "remote": "dr", "pool": "backups" });
-    let got = admin
+    let (status, body) = admin
         .patch("/backup-jobs/nightly", json!({ "replicate": target }), None)
         .await;
-    assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
-    assert_eq!(
-        got.1["message"],
-        "replicating incremental backups is not supported yet"
-    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["full_every"], 3);
+    assert_eq!(body["spec"]["replicate"], target);
     let mut with = spec.clone();
     with["replicate"] = target.clone();
-    assert_error(
-        &admin.post("/backup-jobs", job("both", with)).await,
-        StatusCode::BAD_REQUEST,
-        "invalid_request",
-    );
+    let body = create(&admin, "both", with).await;
+    assert_eq!(body["spec"]["full_every"], 6);
+    assert_eq!(body["spec"]["replicate"], target);
 
     // 기능 목록이 빈 옛 노드(이 빌드의 버전)
     let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(

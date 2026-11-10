@@ -44,8 +44,7 @@ use crate::state::AppState;
 /// 스펙 검증과 풀 검사: 풀이 있고 백업 풀이어야 한다(400). 요일은 주의 순서로 정리한다. 원격 복제를
 /// 켠 작업은 옛 노드가 풀지 못하므로 모든 노드가 이 빌드일 때만 쓰고(409 `cluster_upgrading`), 원격은
 /// 등록돼 있어야 한다(400). 원격의 풀은 보낼 때 원격이 확인한다. `full_every`(증분 백업)는 모든 노드가
-/// 증분 백업을 알 때만 쓰고(409 `cluster_upgrading`), 증분 백업은 아직 복제하지 않으므로 `replicate`와
-/// 함께 쓰지 못한다(400).
+/// 증분 백업을 알 때만 쓴다(409 `cluster_upgrading`).
 fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError> {
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -61,11 +60,6 @@ fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError
         )));
     }
     if spec.full_every > 0 {
-        if spec.replicate.is_some() {
-            return Err(ApiError::bad_request(
-                "replicating incremental backups is not supported yet",
-            ));
-        }
         require_feature(&state.cluster, "incremental-backup")?;
     }
     if let Some(target) = &spec.replicate {
@@ -632,8 +626,8 @@ async fn replicate(
     Ok(())
 }
 
-/// 작업 `job`의 백업 가운데 원격 `target`으로 보낼 것(만든 순서): `ready`이고, 증분 백업이 아니고(아직
-/// 보내지 않는다), 보존 규칙이 지울 것이 아니고([`retention`] — 지우기와 겹치지 않게), 그 사본 기록이
+/// 작업 `job`의 백업 가운데 원격 `target`으로 보낼 것(만든 순서): `ready`이고(증분 백업은 복제 Task가
+/// 체인의 앞 백업부터 보낸다), 보존 규칙이 지울 것이 아니고([`retention`] — 지우기와 겹치지 않게), 그 사본 기록이
 /// 없거나 기록이 마지막 실행을 시작하기 전의 것이다. 그래서 실패한(또는 복제 Task 없이 copying으로 남은) 사본은 실행마다 한 번 더 보내고, ready
 /// 사본도 실행마다 한 번 원격에 있는지 확인한다(복제 Task가 원격에 물어 같은 파일이 있으면 기록 시각만
 /// 고치고, 원격에서 지웠으면 다시 보낸다). 같은 원격으로 복제하는 Task가 끝나지 않은 백업은 뺀다.
@@ -661,8 +655,6 @@ fn to_replicate<'a>(
     let mut out: Vec<&Backup> = backups
         .iter()
         .filter(|b| b.spec.job == Some(job.id) && b.status.phase == BackupPhase::Ready)
-        // 증분 백업은 아직 보내지 않는다(작업에 `full_every`가 있던 때의 백업).
-        .filter(|b| b.status.parent.is_none())
         .filter(|b| !pruned.contains(&b.id))
         .filter(|b| !replicating(b))
         .filter(|b| {
@@ -1477,8 +1469,9 @@ mod tests {
         assert_eq!(retention(job, &keep, &all), [id(3), id(2), id(1)]);
     }
 
+    /// 증분 백업도 보낸다(복제 Task가 체인의 앞 백업부터 보낸다).
     #[test]
-    fn incremental_backups_are_not_replicated() {
+    fn incremental_backups_are_replicated() {
         let vm = Uuid::now_v7();
         let mut job: BackupJob = Resource::new(
             "nightly",
@@ -1508,6 +1501,6 @@ mod tests {
             .iter()
             .map(|b| b.id)
             .collect();
-        assert_eq!(ids, [Uuid::from_u128(1)]);
+        assert_eq!(ids, [Uuid::from_u128(1), Uuid::from_u128(2)]);
     }
 }

@@ -670,8 +670,8 @@ async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
 
 /// 실패한 볼륨 생성·가져오기, 스냅샷 만들기, 복제·복원·VM 가져오기의 흔적을 지워 이름을 다시 쓸 수 있게
 /// 한다. 실패한 백업은 디렉터리를 지우고 `failed`와 `error`를 남긴다. 실패한 복제는 원본의 사본 기록을
-/// `failed`와 `error`로 바꾼다. 실패한 VM 가져오기는 `ready`로 돌아가 `error`를 남긴다.
-/// 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
+/// `failed`와 `error`로 바꾼다(체인 앞 백업의 copying 기록도). 실패한 VM 가져오기는 `ready`로 돌아가
+/// `error`를 남긴다. 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
 /// 재시작으로 중단) 작업이 아직 돌고 있을 수 있어 태그를 두고 리소스만 지운다(설계 §6 "태그만 남은 경우").
 /// 블록 디스크의 태그는 뒤에서 다시 지운다([`snapshot::remove_unfinished_tags`]).
 async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
@@ -693,7 +693,7 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
         backup::discard(ctx, task, backup, error, unfinished).await;
     }
     if let TaskOp::BackupReplicate { remote, pool } = &task.spec.op {
-        replicate::discard(ctx, task.spec.target, remote, pool, error).await;
+        replicate::discard_chain(ctx, task.spec.target, remote, pool, error).await;
     }
     if let TaskOp::VmImport { import, .. } = task.spec.op {
         import::discard(ctx, task, import, error).await;
