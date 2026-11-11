@@ -9050,3 +9050,31 @@ git commit -m "test(opld): 굶김 시험과 제어부 가용성 문서"
 - 피어 서버의 연결별 h2·TLS와 리더로 전달되는 큰 쓰기의 암호화는 core에서 돈다.
 - 주 루프(close·leave·join)는 실행기 확인이 보지 못한다.
 - 실제 systemd에서의 재시작 시간·여유는 설계 §11 "배포 뒤 확인" 표로 테스트 VM에서 잰다.
+
+## 실행 후 기록 (2026-11-12)
+
+- **Task 1~4:** `feat/plan45-runtime-isolation`에서 계획대로 적용했다(스크립트로 블록 적용·커밋, Task마다 검증한 스테이지 커밋과 트리 비교). 네 Task를 마친 트리는 리뷰·검증·CI 프로브를 거친 트리와 생성 파일까지 같다(이 계획 문서와 설계 §11 배포 결과 칸만 다름).
+- **1차 리뷰에서 고친 것:**
+  - (치명) 피어 클라이언트 채널이 처음 연 실행기에서 돌아, work·api가 먼저 연 연결이면 리스 갱신·Raft 하트비트가 그 실행기에 기댔다. `Peers::with_runtimes(control, bulk)`로 채널을 둘로 나누고 `Endpoint::executor`로 실행기에 묶었다.
+  - work만 막혀도 systemd가 데몬을 죽여 HA 노드가 재부팅될 수 있었다. `WATCHDOG=1`은 core·api만 보고, 유닛에 `WatchdogSignal=SIGKILL`.
+  - 정족수가 없을 때 시작 정리(고아 Task)가 길어 `Type=notify` 시작 제한에 걸릴 수 있었다. 멤버의 `READY=1`을 `TaskRunner::spawn` 앞으로.
+  - `WATCHDOG_USEC` 따르기, 피어 처리기 panic은 `internal`, `close` 뒤 `arm` 거절, 저장소 스레드 panic 기록, README·§11의 느린 디스크(리더면 클러스터 전체)와 남은 core 부담.
+- **2차 리뷰에서 고친 것:** Raft가 멈추면(저장소 오류 등) 데몬이 끝나 systemd가 다시 띄운다(`Cluster::stopped()` 감시). watchdog 장치를 받으면 바로 한 번 쓰다듬는다. 다시 arm하기까지의 여유 계산을 단계별로 적었다.
+- **이 계획이 드러낸 시험 경합(모두 계획 전부터 있던 시험 코드 문제, 제품 코드는 그대로):** 마이그레이션 되돌리기 시험이 QEMU 재개 전에 상태를 봄, 가져오기·백업 시험의 Task를 `pending`으로 만든 뒤 바꿔 실행기가 시작함, 가짜 apt의 파일 자르고 쓰기 사이를 가짜 systemctl이 읽음. 저장소 쓰기 스레드가 커밋을 응답보다 먼저 보이게 해 틈이 넓어졌다.
+- **CI 프로브에서 고친 것:** macOS 러너에서 watchdog 스레드 시험이 0.3초 안에 세 번 쓰다듬기를 기대해 흔들렸다(두 번). 정해진 시간 대신 조건이 될 때까지(리스 끝 전까지) 기다린다.
+- **CI에서 고친 것(main에 따로):** rustix 1.1.6(RUSTSEC-2026-0486), Ceph를 snap(microceph) 대신 apt 패키지로(snap 스토어 장애).
+- **테스트 VM 배포(svc01·svc02):** 릴리스 빌드를 한 대씩 설치했다. `Type=notify`·`WatchdogUSec=30s`·`WatchdogSignal=9`, 시작 약 11 ms, 스레드 이름 확인, svc01(리더)에 `kill -STOP` → 30.5초 뒤 SIGKILL, 5초 뒤 다시 뜸(합 29.9초), 다른 노드가 리더를 이어받고 20초 안에 회복, svc02의 test-vm QEMU PID 그대로. 정상 동작 중 느린 실행기 경고 없음. HA VM·watchdog 장치가 없어 HA 여유 시험은 못 했다(설계 §11 표).
+
+**테스트:**
+- macOS `cargo test --workspace` 1714개(스테이지별 1694·1706·1713·1714)
+- `starve-it`(굶김·notify), `ha-it`, `migration-it`
+- `fmt`·`clippy -D warnings`(모든 기능), 패키징 셸 시험(`build-deb-test`가 유닛 값 확인)과 shellcheck
+
+Linux CI(프로브)에서 같은 시험과 `starve-it`, linux-kvm·ldap·package·shell 작업.
+
+## 다음 계획으로 넘길 사항
+
+- 테스트 VM에는 watchdog 장치가 없다. HA를 쓰려면 softdog을 올리거나 `[ha] fencing`을 `process`·`off`로 둔다. HA VM이 있는 노드의 다시 arm 여유는 장치를 둔 뒤 잰다.
+- 계획 46(헬스 체크·API 이름·내장 VIP·앞단 프록시): `Liveness`의 마지막 결과(`slow()`)를 헬스에 쓴다. 세션 공유, `trusted_proxies`, `web_origins`, API 노드 역할, 여러 VIP·BGP 모드는 설계 §4에 있다.
+- 피어 대량 전송의 h2·TLS가 core에서 도는 것은 계획 49(다중 링크)에서 대량 전송용 포트로 덜어낸다.
+- openraft 0.9.25의 자기 로그 쓰기 기다림: 계획 47에서 느린 디스크 노드를 투표 멤버에서 빼는 규칙과 openraft 다음 버전을 조사한다.

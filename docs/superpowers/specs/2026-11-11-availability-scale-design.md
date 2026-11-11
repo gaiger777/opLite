@@ -527,12 +527,12 @@ VM에서 손으로 확인하고 결과를 적는다.
 
 | 확인 | 결과 |
 |---|---|
-| `systemctl start opld` 뒤 `active (running)`(미초기화 노드와 멤버 둘 다), `systemctl show opld -p WatchdogUSec`이 30s | 배포 뒤 확인 |
-| `kill -STOP`으로 orbivisord를 세우면 약 30초 뒤 SIGKILL로 끝나고 5초 뒤 다시 뜸, 도는 VM은 그대로 | 배포 뒤 확인 |
-| 위 재시작(SIGKILL부터 리스 갱신까지)이 HA watchdog 제한(30초)보다 짧아 HA VM이 있는 노드가 재부팅되지 않음 | 배포 뒤 확인 |
-| 정족수가 없을 때(다른 노드를 모두 끈 채) `systemctl restart opld`가 `active (running)`이 되기까지의 시간(90초보다 짧음) | 배포 뒤 확인 |
-| VM 수에 따른 다시 arm 시간(VM 수십 개를 띄운 노드에서 SIGKILL부터 `watchdog armed` 로그까지, HA watchdog 제한 30초보다 짧음) | 배포 뒤 확인 |
-| `orbivisor-core`·`-api`·`-work`·`-store`·`-notify`(HA VM이 있으면 `-watchdog`) 스레드(`ps -T -p $(pidof orbivisord)`, 이름은 15자로 잘려 `orbivisor-watch`·`orbivisor-notif`) | 배포 뒤 확인 |
+| `systemctl start opld` 뒤 `active (running)`(미초기화 노드와 멤버 둘 다), `systemctl show opld -p WatchdogUSec`이 30s | 멤버 두 노드에서 확인(2026-11-12): `Type=notify`·`WatchdogUSec=30s`·`WatchdogSignal=9`, Starting→Started 약 11 ms, `WatchdogTimestamp`가 10초마다 바뀜. 미초기화 노드는 실제 프로세스 시험(`notify.rs`)으로만 |
+| `kill -STOP`으로 orbivisord를 세우면 약 30초 뒤 SIGKILL로 끝나고 5초 뒤 다시 뜸, 도는 VM은 그대로 | 확인(svc01, 그때 리더): 마지막 `WATCHDOG=1` 뒤 30.5초에 `Watchdog timeout`·SIGKILL, 5초 뒤 새 프로세스 `Started`(SIGSTOP부터 29.9초). 다른 노드가 리더가 되고 20초 안에 두 노드 온라인, 다른 노드의 VM(QEMU PID) 그대로 |
+| 위 재시작(SIGKILL부터 리스 갱신까지)이 HA watchdog 제한(30초)보다 짧아 HA VM이 있는 노드가 재부팅되지 않음 | 못 함: 테스트 VM에 watchdog 장치(softdog)와 HA VM이 없다. 참고: 프로세스 전체가 멈추면(SIGSTOP) `orbivisor-watchdog`도 멈추므로 HA VM이 있는 노드는 장치 제한에 재부팅되는 것이 맞다(리스를 보장할 수 없음). 이 행은 실행기 하나만 막혀 systemd가 죽인 경우의 여유다 |
+| 정족수가 없을 때(다른 노드를 모두 끈 채) `systemctl restart opld`가 `active (running)`이 되기까지의 시간(90초보다 짧음) | 못 함(두 노드를 다 꺼야 함). 실제 프로세스 시험(`notify.rs`)이 `READY=1`이 고아 정리 전에 오는 것을 본다 |
+| VM 수에 따른 다시 arm 시간(VM 수십 개를 띄운 노드에서 SIGKILL부터 `watchdog armed` 로그까지, HA watchdog 제한 30초보다 짧음) | 못 함(HA VM·장치 없음, VM 하나) |
+| `orbivisor-core`·`-api`·`-work`·`-store`·`-notify`(HA VM이 있으면 `-watchdog`) 스레드(`ps -T -p $(pidof orbivisord)`, 이름은 15자로 잘려 `orbivisor-watch`·`orbivisor-notif`) | 확인: core 2, api 2, work 4(4코어), store, notif. `fencing = watchdog`이면 HA VM이 없어도 `orbivisor-watch` 스레드가 있다(장치는 HA VM을 arm할 때만 연다) |
 
 ## 12. 구현 단계 (계획 45)
 
