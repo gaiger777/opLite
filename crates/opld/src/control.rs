@@ -82,7 +82,7 @@ type Answer = Result<Json<Value>, (StatusCode, Json<Value>)>;
 async fn ask(ctx: &Ctx, make: impl FnOnce(Reply) -> Request) -> Answer {
     let (reply, rx) = oneshot::channel();
     let gone = || {
-        let body = json!({ "message": "opld is shutting down" });
+        let body = json!({ "message": "orbivisord is shutting down" });
         (StatusCode::SERVICE_UNAVAILABLE, Json(body))
     };
     ctx.requests.send(make(reply)).await.map_err(|_| gone())?;
@@ -142,7 +142,10 @@ pub async fn serve(
     }
     if path.exists() {
         if tokio::net::UnixStream::connect(path).await.is_ok() {
-            bail!("{} is in use; is another opld running?", path.display());
+            bail!(
+                "{} is in use; is another orbivisord running?",
+                path.display()
+            );
         }
         std::fs::remove_file(path)?;
     }

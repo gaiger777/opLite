@@ -63,7 +63,7 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub firewall: bool,
-    /// 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None).
+    /// 이 노드에서 도는 orbivisord의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub version: Option<String>,
@@ -72,7 +72,7 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub updates: Option<NodeUpdates>,
-    /// 이 노드의 opld가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
+    /// 이 노드의 orbivisord가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
     /// 쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
@@ -271,7 +271,7 @@ mod tests {
                 checked_at: Some(1_793_000_000),
                 packages: vec![
                     PackageUpdate {
-                        name: "oplite".into(),
+                        name: "orbivisor".into(),
                         current: Some("0.2.0".into()),
                         candidate: "0.2.1".into(),
                     },

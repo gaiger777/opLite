@@ -1,4 +1,4 @@
-//! Raft로 복제되는 opLite 리소스 저장소.
+//! Raft로 복제되는 Orbivisor 리소스 저장소.
 
 mod cluster;
 mod exclusive;

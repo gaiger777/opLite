@@ -1,6 +1,6 @@
 [package]
 name = "opld"
-description = "opLite node daemon"
+description = "Orbivisor node daemon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

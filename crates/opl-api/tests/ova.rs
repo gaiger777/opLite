@@ -94,7 +94,7 @@ fn skips_global_pax_and_directories() {
     let tar = Tar::new()
         .raw(
             header("pax_global_header", b'g', 20),
-            b"20 comment=opLite!!\n",
+            b"20 comment=testing!\n",
         )
         .dir("vm/")
         .file("vm/vm.ovf", b"o")

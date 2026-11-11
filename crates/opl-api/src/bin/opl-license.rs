@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use opl_types::subscription::{self, KeyError, Level, LicensePayload};
 
 #[derive(Parser)]
-#[command(name = "opl-license", version = opl_types::version::BUILD, about = "Issue opLite subscription keys")]
+#[command(name = "opl-license", version = opl_types::version::BUILD, about = "Issue Orbivisor subscription keys")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

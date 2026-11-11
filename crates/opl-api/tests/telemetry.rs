@@ -324,7 +324,7 @@ async fn telemetry_waits_until_every_node_runs_this_build() {
         assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
         assert_eq!(
             got.1["message"],
-            "some nodes run an older opLite (old); finish the upgrade on every node first"
+            "some nodes run an older Orbivisor (old); finish the upgrade on every node first"
         );
     }
     assert!(stored(&env).is_none());

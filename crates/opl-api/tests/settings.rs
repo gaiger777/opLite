@@ -202,7 +202,7 @@ async fn settings_wait_until_every_node_is_upgraded() {
     assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
     assert_eq!(
         got.1["message"],
-        "some nodes run an older opLite (ancient, old); finish the upgrade on every node first"
+        "some nodes run an older Orbivisor (ancient, old); finish the upgrade on every node first"
     );
 
     for old in olds {

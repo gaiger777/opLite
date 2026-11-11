@@ -171,7 +171,7 @@ impl HostNet for IpRoute {
         };
         if foreign_bridges(&out, self.tag.as_deref())?.contains(&tap.bridge) {
             return Err(DriverError::InvalidSpec(format!(
-                "bridge {:?} is not managed by this opLite cluster",
+                "bridge {:?} is not managed by this Orbivisor cluster",
                 tap.bridge
             )));
         }
@@ -434,7 +434,7 @@ fn device_plan(
     for link in [br_link, vx_link].into_iter().flatten() {
         if !mine(link) && !half_made(link) {
             return Err(DriverError::InvalidSpec(format!(
-                "device {:?} exists but is not managed by this opLite cluster",
+                "device {:?} exists but is not managed by this Orbivisor cluster",
                 link.ifname
             )));
         }

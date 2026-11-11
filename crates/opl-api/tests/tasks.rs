@@ -49,7 +49,7 @@ async fn tasks_left_running_by_a_previous_opld_are_failed() {
     assert_eq!(task["status"]["state"], "failed");
     assert_eq!(
         task["status"]["error"],
-        "interrupted: opld restarted while the task was running"
+        "interrupted: orbivisord restarted while the task was running"
     );
 }
 

@@ -94,7 +94,7 @@ pub async fn proxy(
         return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
             "remote_unauthorized",
-            "the remote cluster refused the stored token; update it with `oplctl remote set --token-file`",
+            "the remote cluster refused the stored token; update it with `orbivisorctl remote set --token-file`",
         ));
     }
     let mut out = Response::new(Body::new(body));

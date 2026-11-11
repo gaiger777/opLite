@@ -710,7 +710,7 @@ impl FakeStorage {
         self.fresh_tags.lock().unwrap().push(tag.into());
     }
 
-    /// 볼륨 `id`의 스냅샷 태그를 바꾼다(opLite 밖에서 만든 스냅샷 등).
+    /// 볼륨 `id`의 스냅샷 태그를 바꾼다(Orbivisor 밖에서 만든 스냅샷 등).
     pub fn set_tags(&self, id: Uuid, tags: &[&str]) {
         let tags = tags.iter().map(|t| t.to_string()).collect();
         self.tags.lock().unwrap().insert(id, tags);

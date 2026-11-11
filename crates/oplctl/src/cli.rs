@@ -60,7 +60,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PoolCmd,
     },
-    /// VM NIC가 연결하는 네트워크(노드에 미리 만든 Linux 브리지나 opld가 만드는 VXLAN 네트워크)
+    /// VM NIC가 연결하는 네트워크(노드에 미리 만든 Linux 브리지나 orbivisord가 만드는 VXLAN 네트워크)
     Network {
         #[command(subcommand)]
         cmd: NetworkCmd,
@@ -127,7 +127,7 @@ enum Cmd {
     },
     /// 감사 로그(admin만): 모든 노드의 바꾸는 요청·로그인·콘솔 열기를 새 것부터
     Audit(AuditArgs),
-    /// 원격 클러스터: 다른 opLite 클러스터를 등록해 상태를 모아 보고, 그 클러스터의 API를 이 클러스터를
+    /// 원격 클러스터: 다른 Orbivisor 클러스터를 등록해 상태를 모아 보고, 그 클러스터의 API를 이 클러스터를
     /// 거쳐 부른다(저장한 그 클러스터의 API 토큰으로).
     Remote {
         #[command(subcommand)]
@@ -150,7 +150,7 @@ struct LoginArgs {
     #[arg(long)]
     token_file: Option<PathBuf>,
     /// HTTPS 서버의 클러스터 CA 지문(`sha256:...`). 처음 로그인할 때 필요하다.
-    /// `oplctl cluster init`의 출력이나 다른 노드의 `oplctl cluster status`에서 확인한다.
+    /// `orbivisorctl cluster init`의 출력이나 다른 노드의 `orbivisorctl cluster status`에서 확인한다.
     #[arg(long)]
     ca_fingerprint: Option<String>,
 }
@@ -158,7 +158,7 @@ struct LoginArgs {
 /// 이 기계의 opld에 제어 소켓으로 보내는 명령의 공통 인자
 #[derive(Args)]
 struct LocalArgs {
-    /// opld 제어 소켓
+    /// orbivisord 제어 소켓
     #[arg(long, env = "OPL_SOCKET", default_value = "/run/opl/opld.sock")]
     socket: PathBuf,
 }
@@ -214,7 +214,7 @@ enum NodeCmd {
         #[arg(long)]
         refresh: bool,
     },
-    /// 노드의 패키지를 올린다(`apt-get dist-upgrade`). VM은 계속 돌고 opld가 잠깐 다시 시작한다. 한 번에
+    /// 노드의 패키지를 올린다(`apt-get dist-upgrade`). VM은 계속 돌고 orbivisord가 잠깐 다시 시작한다. 한 번에
     /// 한 노드만 한다.
     Upgrade {
         node: String,
@@ -315,7 +315,7 @@ async fn node_drain(
         let id = cell(&task["id"]);
         writeln!(
             out,
-            "drain of {node} started (task {id}); follow it with `oplctl task get {id}`"
+            "drain of {node} started (task {id}); follow it with `orbivisorctl task get {id}`"
         )?;
     }
     Ok(())
@@ -339,7 +339,7 @@ async fn node_upgrade(
         let id = cell(&task["id"]);
         writeln!(
             out,
-            "upgrade of {node} started (task {id}); follow it with `oplctl task get {id}`"
+            "upgrade of {node} started (task {id}); follow it with `orbivisorctl task get {id}`"
         )?;
     }
     Ok(())
@@ -649,7 +649,7 @@ struct NetworkCreate {
     /// VLAN 태그(1-4094). 브리지가 VLAN-aware(vlan_filtering 1)여야 한다.
     #[arg(long, conflicts_with = "vxlan")]
     vlan: Option<u16>,
-    /// VXLAN 네트워크 식별자(VNI, 1-16777215). opld가 모든 노드에 브리지 oplv<VNI>를 만든다.
+    /// VXLAN 네트워크 식별자(VNI, 1-16777215). orbivisord가 모든 노드에 브리지 oplv<VNI>를 만든다.
     #[arg(long, value_name = "VNI")]
     vxlan: Option<u32>,
     /// VXLAN 네트워크의 MTU(1280-9000, 기본 1450)
@@ -1455,7 +1455,7 @@ enum ImportCmd {
         fingerprint: Option<String>,
     },
     /// ESXi·vCenter의 꺼진 VM을 읽어 VM 설정을 제안받는다. 비밀번호는 `esxi-browse`처럼 받고 연결을
-    /// 받은 노드의 메모리에만 남으므로, 그 opld를 다시 시작하면 가져오기를 다시 만들어야 한다.
+    /// 받은 노드의 메모리에만 남으므로, 그 orbivisord를 다시 시작하면 가져오기를 다시 만들어야 한다.
     Esxi {
         /// 가져오기 이름
         name: String,
@@ -1544,7 +1544,7 @@ struct ImportRunArgs {
     /// 디스크 볼륨을 만들 풀
     #[arg(long)]
     pool: String,
-    /// 원본 네트워크를 opLite 네트워크에 잇는다(예: `"VM Network=lan"`). 원본 NIC의 네트워크마다
+    /// 원본 네트워크를 Orbivisor 네트워크에 잇는다(예: `"VM Network=lan"`). 원본 NIC의 네트워크마다
     /// 준다. 원본 네트워크가 하나면 `NETWORK`만 줘도 된다.
     #[arg(long = "net", value_name = "SOURCE=NETWORK", value_parser = parse_net)]
     nets: Vec<NetArg>,
@@ -1587,7 +1587,7 @@ struct NetArg {
 
 fn parse_net(s: &str) -> Result<NetArg, String> {
     let bad = || format!("invalid network mapping {s:?}: use SOURCE=NETWORK or NETWORK");
-    // 원본 네트워크 이름에 `=`가 있을 수 있다. opLite 네트워크 이름에는 없다.
+    // 원본 네트워크 이름에 `=`가 있을 수 있다. Orbivisor 네트워크 이름에는 없다.
     let (source, network) = match s.rsplit_once('=') {
         Some(("", _)) => return Err(bad()),
         Some((source, network)) => (Some(source.to_string()), network),
@@ -1941,7 +1941,7 @@ struct RemoteAdd {
     /// 원격 클러스터 노드의 API 주소(`https://<호스트>[:포트]`)
     #[arg(long)]
     url: String,
-    /// 원격 클러스터 CA의 지문(`sha256:...`, 원격 노드의 `oplctl cluster status`). 없으면 CA를 받아
+    /// 원격 클러스터 CA의 지문(`sha256:...`, 원격 노드의 `orbivisorctl cluster status`). 없으면 CA를 받아
     /// 지문을 보이고 확인을 묻는다.
     #[arg(long)]
     ca_fingerprint: Option<String>,
@@ -2009,7 +2009,7 @@ fn confirm_fingerprint(
     }
     if !terminal {
         bail!(
-            "check the fingerprint (`oplctl cluster status` on a node of the remote cluster) and \
+            "check the fingerprint (`orbivisorctl cluster status` on a node of the remote cluster) and \
              run again with --ca-fingerprint {actual}"
         );
     }
@@ -3223,7 +3223,7 @@ where
         return done;
     }
 
-    let server = server.context("not logged in; run `oplctl login --server <url>`")?;
+    let server = server.context("not logged in; run `orbivisorctl login --server <url>`")?;
     let client = Client::new(&server, config.token.clone(), config.ca_pem.clone())?;
     let json_out = cli.output == Output::Json;
     match cli.cmd {
@@ -3765,7 +3765,7 @@ async fn backup_replicate(
         let id = cell(&task["id"]);
         writeln!(
             out,
-            "replication of backup {backup} to remote {remote} started (task {id}); follow it with `oplctl task get {id}`"
+            "replication of backup {backup} to remote {remote} started (task {id}); follow it with `orbivisorctl task get {id}`"
         )?;
     }
     Ok(())
@@ -4009,7 +4009,7 @@ async fn import(
             client.upload("/vm-imports/ova", &query, &file).await?;
             writeln!(
                 out,
-                "vm-import {name} uploaded; review it with `oplctl import get {name}`"
+                "vm-import {name} uploaded; review it with `orbivisorctl import get {name}`"
             )?;
         }
         ImportCmd::EsxiBrowse { conn, fingerprint } => {
@@ -4184,7 +4184,7 @@ async fn esxi_create(
         .map_err(esxi_error)?;
     writeln!(
         out,
-        "vm-import {name} created; review it with `oplctl import get {name}`",
+        "vm-import {name} created; review it with `orbivisorctl import get {name}`",
         name = cell(&body["name"])
     )?;
     Ok(())
@@ -4300,7 +4300,7 @@ fn print_import(
             .collect();
         writeln!(out)?;
         table(out, &["DISK", "FILE", "SIZE", "CONTROLLER"], &disks)?;
-        // PROPOSED는 이름이 같아 제안한 opLite 네트워크다.
+        // PROPOSED는 이름이 같아 제안한 Orbivisor 네트워크다.
         let nics: Vec<_> = src["nics"]
             .as_array()
             .into_iter()
@@ -4350,7 +4350,7 @@ async fn cluster_local(
                 writeln!(out, "log in with:")?;
                 writeln!(
                     out,
-                    "  oplctl login --server https://{} --ca-fingerprint {}",
+                    "  orbivisorctl login --server https://{} --ca-fingerprint {}",
                     cell(&r["api_address"]),
                     cell(&r["ca_fingerprint"])
                 )?;
@@ -5154,7 +5154,7 @@ fn print_cluster_status(out: &mut (dyn Write + Send), view: &Value) -> anyhow::R
     if versions.len() > 1 {
         writeln!(
             out,
-            "warning: nodes run different opLite versions ({}); finish the upgrade on every node",
+            "warning: nodes run different Orbivisor versions ({}); finish the upgrade on every node",
             versions.join(", ")
         )?;
     }
@@ -5360,8 +5360,8 @@ async fn server_ca(
             bail!("the server's cluster CA does not match: expected {expected}, got {actual}")
         }
         None => bail!(
-            "the server's cluster CA fingerprint is {actual}; check it (from `oplctl cluster init` \
-             or `oplctl cluster status` on a node you trust) and log in again with --ca-fingerprint {actual}"
+            "the server's cluster CA fingerprint is {actual}; check it (from `orbivisorctl cluster init` \
+             or `orbivisorctl cluster status` on a node you trust) and log in again with --ca-fingerprint {actual}"
         ),
     }
 }
@@ -5429,13 +5429,13 @@ async fn oidc_login_refused(anon: &Client, server: &str, realm: &str) -> anyhow:
         .any(|r| r["name"] == realm && r["kind"] == "oidc");
     if oidc {
         bail!(
-            "sign in to {realm} in the web UI, create an API token there and run `oplctl login --token-file`"
+            "sign in to {realm} in the web UI, create an API token there and run `orbivisorctl login --token-file`"
         );
     }
     Ok(())
 }
 
-/// `login`이 만드는 API 토큰 이름의 앞부분
+/// `login`이 만드는 API 토큰 이름의 앞부분. 비교되는 문자열 — 바꾸지 않는다(`logout`이 옛 CLI가 만든 토큰도 알아보고 지운다).
 const LOGIN_TOKEN_PREFIX: &str = "oplctl-";
 
 /// 세션으로 로그인해 이 CLI가 쓸 API 토큰을 만든다. 세션은 바로 닫는다. 토큰과 서버가 정한
@@ -7340,7 +7340,7 @@ mod tests {
                 "bk"
             ])
             .await,
-            "replication of backup web-1 to remote dr started (task t1); follow it with `oplctl task get t1`\n"
+            "replication of backup web-1 to remote dr started (task t1); follow it with `orbivisorctl task get t1`\n"
         );
         {
             let seen = seen.lock().unwrap();
@@ -7837,7 +7837,7 @@ mod tests {
         ]);
         assert!(
             out.ends_with(
-                "warning: nodes run different opLite versions (0.9.0, 0.10.0~rc1, 0.10.0); \
+                "warning: nodes run different Orbivisor versions (0.9.0, 0.10.0~rc1, 0.10.0); \
                  finish the upgrade on every node\n"
             ),
             "{out}"
@@ -8424,7 +8424,7 @@ warnings:
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "vm-import web01 uploaded; review it with `oplctl import get web01`\n"
+            "vm-import web01 uploaded; review it with `orbivisorctl import get web01`\n"
         );
     }
 
@@ -8729,7 +8729,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "vm-import web01 created; review it with `oplctl import get web01`\n"
+            "vm-import web01 created; review it with `orbivisorctl import get web01`\n"
         );
     }
 
@@ -8772,7 +8772,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                     "status": { "updates": {
                         "checked_at": 1_793_000_000,
                         "packages": [
-                            { "name": "oplite", "current": "0.2.0", "candidate": "0.2.1" },
+                            { "name": "orbivisor", "current": "0.2.0", "candidate": "0.2.1" },
                             { "name": "linux-image-6.12.48+deb13-amd64", "current": null, "candidate": "6.12.48-1" }
                         ],
                         "truncated": true,
@@ -8821,7 +8821,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             text,
             "checked: 2026-10-26 07:33 UTC\n\
              PACKAGE                          CURRENT  CANDIDATE\n\
-             oplite                           0.2.0    0.2.1\n\
+             orbivisor                        0.2.0    0.2.1\n\
              linux-image-6.12.48+deb13-amd64  -        6.12.48-1\n\
              (only the first 2 packages are shown)\n"
         );
@@ -8890,7 +8890,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
 
         assert_eq!(
             run(&["oplctl", "node", "upgrade", "n1"]).await,
-            "upgrade of n1 started (task t1); follow it with `oplctl task get t1`\n"
+            "upgrade of n1 started (task t1); follow it with `orbivisorctl task get t1`\n"
         );
         assert_eq!(
             *seen.lock().unwrap(),
@@ -9132,7 +9132,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
 
         assert_eq!(
             run(&["oplctl", "node", "drain", "n1"]).await.unwrap(),
-            "drain of n1 started (task t1); follow it with `oplctl task get t1`\n"
+            "drain of n1 started (task t1); follow it with `orbivisorctl task get t1`\n"
         );
         assert_eq!(
             *seen.lock().unwrap(),
@@ -10539,7 +10539,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         let e = login(&base, &args, None).await.unwrap_err();
         assert_eq!(
             e.to_string(),
-            "sign in to okta in the web UI, create an API token there and run `oplctl login --token-file`"
+            "sign in to okta in the web UI, create an API token there and run `orbivisorctl login --token-file`"
         );
         let seen = seen.lock().unwrap();
         let lines: Vec<&str> = seen.iter().map(|r| r.line.as_str()).collect();
@@ -10903,7 +10903,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
     /// 클러스터에 다시 로그인하라고 하지 않는다.
     #[tokio::test]
     async fn a_refused_remote_token_is_not_a_login_problem() {
-        let message = "the remote cluster refused the stored token; update it with `oplctl remote set --token-file`";
+        let message = "the remote cluster refused the stored token; update it with `orbivisorctl remote set --token-file`";
         let (client, _) = fake_api_status(move |_| {
             (
                 502,
@@ -10921,7 +10921,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         .unwrap_err()
         .to_string();
         assert_eq!(err, format!("{message} (remote_unauthorized)"));
-        assert!(!err.contains("oplctl login"), "{err}");
+        assert!(!err.contains("orbivisorctl login"), "{err}");
     }
 
     /// 받은 CA 지문은 보이고, `--yes`가 아니면 터미널에서 묻는다. 터미널이 아니면 지문을 달라고 한다.

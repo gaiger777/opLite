@@ -441,7 +441,7 @@ export interface paths {
         get: operations["list_networks"];
         put?: never;
         /**
-         * 노드에 미리 만든 Linux 브리지를 가리키거나 opld가 만드는 VXLAN 네트워크. 이름 `user`는 예약되어 있다.
+         * 노드에 미리 만든 Linux 브리지를 가리키거나 orbivisord가 만드는 VXLAN 네트워크. 이름 `user`는 예약되어 있다.
          *     VNI가 다른 네트워크와 겹치면 409 `vni_in_use`(동시에 만드는 두 요청의 경쟁은 막지 않는다).
          */
         post: operations["create_network"];
@@ -493,13 +493,13 @@ export interface paths {
         };
         get: operations["get_node"];
         /**
-         * 노드의 주소와 유지보수 모드를 바꾼다. 노드 리소스는 opld가 시작할 때 스스로 만든다.
+         * 노드의 주소와 유지보수 모드를 바꾼다. 노드 리소스는 orbivisord가 시작할 때 스스로 만든다.
          *     역할(`witness`)은 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다.
          */
         put: operations["update_node"];
         post?: never;
         /**
-         * 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `oplctl cluster leave`로 뺀다.
+         * 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `orbivisorctl cluster leave`로 뺀다.
          *     그 노드에 배정된 VM은 그대로 남는다.
          */
         delete: operations["delete_node"];
@@ -563,8 +563,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 노드의 패키지를 올릴 Task(`node-upgrade`, 그 노드에서 돈다)를 돌려준다(202). apt는 opld 밖의 일시
-         *     유닛에서 돌므로 VM은 계속 돌고 opld만 잠깐 다시 시작한다. 업데이트를 확인하지 않는 노드면 400
+         * 노드의 패키지를 올릴 Task(`node-upgrade`, 그 노드에서 돈다)를 돌려준다(202). apt는 orbivisord 밖의 일시
+         *     유닛에서 돌므로 VM은 계속 돌고 orbivisord만 잠깐 다시 시작한다. 업데이트를 확인하지 않는 노드면 400
          *     `updates_unsupported`, 오프라인이면 409 `node_offline`, 클러스터 어디든 끝나지 않은 업그레이드가
          *     있으면 409 `upgrade_in_progress`(한 번에 한 노드 — 나머지 노드가 과반수와 서비스를 지킨다), 옛 노드가
          *     남았으면 409 `cluster_upgrading`.
@@ -995,7 +995,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 이 노드의 빌드 버전. 인증 없이 읽는다(로그인 화면과 oplctl이 서버 버전을 본다). */
+        /** 이 노드의 빌드 버전. 인증 없이 읽는다(로그인 화면과 orbivisorctl이 서버 버전을 본다). */
         get: operations["get_version"];
         put?: never;
         post?: never;
@@ -1136,7 +1136,7 @@ export interface paths {
          * `ready` 가져오기를 `run`의 값으로 실행할 Task를 돌려준다(202). Task는 원본이 있는 노드에서 돌고, 대상은
          *     미리 정한 새 VM id다. 실행 Task가 끝나지 않았으면 409 `import_busy`, 이미 가져왔으면 `import_done`(끝난 실행
          *     Task가 VM을 만들었으면 가져오기를 `done`으로 끝내고), 원본을 쓸 수
-         *     없으면 `import_failed`, 원본 노드가 오프라인이면 `node_offline`. 원본 NIC의 네트워크마다 있는 opLite
+         *     없으면 `import_failed`, 원본 노드가 오프라인이면 `node_offline`. 원본 NIC의 네트워크마다 있는 Orbivisor
          *     네트워크로 매핑해야 하고(400), VM 이름과 볼륨 이름 `{name}-disk{i}`가 비어 있어야 한다(409
          *     `name_taken`). 풀은 원본 노드에서 쓸 수 있어야 하고(409 `pool_not_on_node`·`pool_unavailable`), 결과
          *     VM 스펙은 VM 만들기의 검증을 통과해야 한다(400). 원본 MAC을 쓰면 다른 VM과 겹치지 않아야 한다(409
@@ -1629,7 +1629,7 @@ export interface components {
             /** @default null */
             run: components["schemas"]["JobRun"] | null;
         };
-        /** @description 백업 디렉터리의 `manifest.json`. opLite 없이도 백업을 알아볼 수 있게 VM 스펙과 디스크 목록을 담는다. */
+        /** @description 백업 디렉터리의 `manifest.json`. Orbivisor 없이도 백업을 알아볼 수 있게 VM 스펙과 디스크 목록을 담는다. */
         BackupManifest: {
             /**
              * Format: uuid
@@ -1787,7 +1787,7 @@ export interface components {
             snapshot?: string | null;
         };
         ClusterView: {
-            /** @description 클러스터 CA 인증서의 지문. `oplctl login --ca-fingerprint`에 쓴다. */
+            /** @description 클러스터 CA 인증서의 지문. `orbivisorctl login --ca-fingerprint`에 쓴다. */
             ca_fingerprint: string;
             /** Format: uuid */
             leader?: string | null;
@@ -1866,7 +1866,7 @@ export interface components {
                  * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
                  */
                 vlan?: number | null;
-                /** @description opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
+                /** @description orbivisord가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
                 vxlan?: components["schemas"]["Vxlan"];
             };
         };
@@ -1958,7 +1958,7 @@ export interface components {
              * @description 만료 시각(유닉스 초)
              */
             expires_at: number;
-            /** @description 새 노드에서 `oplctl cluster join`에 넘길 URL. 다시 볼 수 없다. */
+            /** @description 새 노드에서 `orbivisorctl cluster join`에 넘길 URL. 다시 볼 수 없다. */
             url: string;
         };
         CreatedToken: {
@@ -2084,7 +2084,7 @@ export interface components {
         ImageFormat: "qcow2" | "raw";
         /** @enum {string} */
         ImportPhase: "ready" | "importing" | "done" | "failed";
-        /** @description opLite VM 설정 제안. 실행할 때 [`ImportRun`]에 없는 값의 기본값이다. */
+        /** @description Orbivisor VM 설정 제안. 실행할 때 [`ImportRun`]에 없는 값의 기본값이다. */
         ImportProposal: {
             /** Format: int32 */
             cores: number;
@@ -2092,7 +2092,7 @@ export interface components {
             firmware: components["schemas"]["Firmware"];
             /** Format: int32 */
             memory_mib: number;
-            /** @description 원본 네트워크 → 이름이 같은 opLite 네트워크(없으면 null, 실행 때 정해야 한다) */
+            /** @description 원본 네트워크 → 이름이 같은 Orbivisor 네트워크(없으면 null, 실행 때 정해야 한다) */
             networks: {
                 [key: string]: string | null;
             };
@@ -2115,7 +2115,7 @@ export interface components {
             memory_mib?: number | null;
             /** @description 만들 VM 이름 */
             name: string;
-            /** @description 원본 네트워크 → opLite 네트워크. 원본 NIC의 네트워크마다 있어야 한다. */
+            /** @description 원본 네트워크 → Orbivisor 네트워크. 원본 NIC의 네트워크마다 있어야 한다. */
             networks?: {
                 [key: string]: string;
             };
@@ -2199,7 +2199,7 @@ export interface components {
             node: string;
             /** @description 조인 URL의 토큰 */
             token: string;
-            /** @description 새 노드의 opld 빌드 버전. 옛 버전 노드는 보내지 않는다. */
+            /** @description 새 노드의 orbivisord 빌드 버전. 옛 버전 노드는 보내지 않는다. */
             version?: string | null;
             /** @description 새 노드가 위트니스(투표만 하고 VM을 돌리지 않는 노드)인지 */
             witness?: boolean;
@@ -2493,7 +2493,7 @@ export interface components {
                      * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
                      */
                     vlan?: number | null;
-                    /** @description opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
+                    /** @description orbivisord가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
                     vxlan?: components["schemas"]["Vxlan"];
                 };
                 status: Record<string, never>;
@@ -2538,7 +2538,7 @@ export interface components {
                      */
                     cpus: number;
                     /**
-                     * @description 이 노드의 opld가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
+                     * @description 이 노드의 orbivisord가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
                      *     쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
                      */
                     features?: string[];
@@ -2579,7 +2579,7 @@ export interface components {
                      *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
                      */
                     updates?: components["schemas"]["NodeUpdates"];
-                    /** @description 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
+                    /** @description 이 노드에서 도는 orbivisord의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
                     version?: string;
                 };
             }[];
@@ -2960,7 +2960,7 @@ export interface components {
             /** @description Node 리소스 이름. 아직 없으면(합류 중) 비어 있다. */
             name?: string | null;
             online: boolean;
-            /** @description 노드의 opld 빌드 버전. 옛 버전 노드이거나 Node가 아직 없으면 null이다. */
+            /** @description 노드의 orbivisord 빌드 버전. 옛 버전 노드이거나 Node가 아직 없으면 null이다. */
             version?: string | null;
             /** @description 투표 멤버인지(아니면 learner) */
             voter: boolean;
@@ -2999,7 +2999,7 @@ export interface components {
              * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
              */
             vlan?: number | null;
-            /** @description opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
+            /** @description orbivisord가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
             vxlan?: components["schemas"]["Vxlan"];
         };
         NetworkStatus: Record<string, never>;
@@ -3051,7 +3051,7 @@ export interface components {
              */
             cpus: number;
             /**
-             * @description 이 노드의 opld가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
+             * @description 이 노드의 orbivisord가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
              *     쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
              */
             features?: string[];
@@ -3092,7 +3092,7 @@ export interface components {
              *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
              */
             updates?: components["schemas"]["NodeUpdates"];
-            /** @description 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
+            /** @description 이 노드에서 도는 orbivisord의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
             version?: string;
         };
         /** @description 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지) */
@@ -3645,7 +3645,7 @@ export interface components {
                  * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
                  */
                 vlan?: number | null;
-                /** @description opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
+                /** @description orbivisord가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
                 vxlan?: components["schemas"]["Vxlan"];
             };
             status: Record<string, never>;
@@ -3686,7 +3686,7 @@ export interface components {
                  */
                 cpus: number;
                 /**
-                 * @description 이 노드의 opld가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
+                 * @description 이 노드의 orbivisord가 아는 기능(예: `node-drain`). 노드가 등록할 때 쓴다(옛 노드는 비어 있다). 새 기능을
                  *     쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
                  */
                 features?: string[];
@@ -3727,7 +3727,7 @@ export interface components {
                  *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
                  */
                 updates?: components["schemas"]["NodeUpdates"];
-                /** @description 이 노드에서 도는 opld의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
+                /** @description 이 노드에서 도는 orbivisord의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
                 version?: string;
             };
         };
@@ -4560,7 +4560,7 @@ export interface components {
             role: components["schemas"]["Role"];
         };
         VersionInfo: {
-            /** @description 이 노드의 opld 빌드 버전 */
+            /** @description 이 노드의 orbivisord 빌드 버전 */
             version: string;
         };
         VmCounts: {

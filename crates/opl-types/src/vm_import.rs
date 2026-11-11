@@ -1,5 +1,5 @@
 //! VM 가져오기. 다른 하이퍼바이저(VMware)에서 내보낸 VM(OVA)을 올린 노드에 두고, 원본 VM에서 읽은
-//! 값([`SourceVm`])으로 opLite VM 설정을 제안([`propose`])한 뒤, 사용자가 고친 값([`ImportRun`])으로
+//! 값([`SourceVm`])으로 Orbivisor VM 설정을 제안([`propose`])한 뒤, 사용자가 고친 값([`ImportRun`])으로
 //! 디스크를 볼륨으로 옮기고 VM을 만든다.
 
 use std::collections::BTreeMap;
@@ -205,7 +205,7 @@ pub struct SourceNic {
     pub mac: Option<MacAddr>,
 }
 
-/// opLite VM 설정 제안. 실행할 때 [`ImportRun`]에 없는 값의 기본값이다.
+/// Orbivisor VM 설정 제안. 실행할 때 [`ImportRun`]에 없는 값의 기본값이다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ImportProposal {
@@ -215,7 +215,7 @@ pub struct ImportProposal {
     pub firmware: Firmware,
     pub disk_bus: DiskBus,
     pub nic_model: NicModel,
-    /// 원본 네트워크 → 이름이 같은 opLite 네트워크(없으면 null, 실행 때 정해야 한다)
+    /// 원본 네트워크 → 이름이 같은 Orbivisor 네트워크(없으면 null, 실행 때 정해야 한다)
     pub networks: BTreeMap<String, Option<String>>,
 }
 
@@ -228,7 +228,7 @@ pub struct ImportRun {
     pub name: String,
     /// 디스크 볼륨을 만들 풀
     pub pool: String,
-    /// 원본 네트워크 → opLite 네트워크. 원본 NIC의 네트워크마다 있어야 한다.
+    /// 원본 네트워크 → Orbivisor 네트워크. 원본 NIC의 네트워크마다 있어야 한다.
     #[serde(default)]
     pub networks: BTreeMap<String, String>,
     #[serde(default)]
@@ -258,7 +258,7 @@ pub fn is_windows(guest_os: &str) -> bool {
     guest_os.to_ascii_lowercase().starts_with("win")
 }
 
-/// 원본 VM으로 opLite VM 설정을 제안한다. `networks`는 지금 있는 opLite 네트워크 이름이다.
+/// 원본 VM으로 Orbivisor VM 설정을 제안한다. `networks`는 지금 있는 Orbivisor 네트워크 이름이다.
 /// 그대로 옮길 수 없는 것은 경고로 돌려준다.
 pub fn propose(src: &SourceVm, networks: &[String]) -> (ImportProposal, Vec<String>) {
     let mut warnings = Vec::new();

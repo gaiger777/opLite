@@ -1,6 +1,6 @@
 [package]
 name = "opl-api"
-description = "REST API, tasks and authentication for opLite"
+description = "REST API, tasks and authentication for Orbivisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

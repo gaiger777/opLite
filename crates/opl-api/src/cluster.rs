@@ -37,7 +37,7 @@ const MAX_JOIN_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const JOIN_TOKEN_PREFIX: &str = "oplj_";
 const JOIN_SCHEME: &str = "opl-join://";
 
-/// `opl-join://<API 주소>?token=<토큰>&ca=<CA 지문>`. `oplctl cluster join`에 그대로 넘긴다.
+/// `opl-join://<API 주소>?token=<토큰>&ca=<CA 지문>`. `orbivisorctl cluster join`에 그대로 넘긴다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinUrl {
     /// 합류 요청을 받을 노드의 API 주소(`host:port`)
@@ -160,14 +160,14 @@ pub struct MemberView {
     pub witness: bool,
     /// 노드의 HA 펜싱. 펜싱이 꺼졌거나 Node가 아직 없으면 null이다.
     pub fencing: Option<Fencing>,
-    /// 노드의 opld 빌드 버전. 옛 버전 노드이거나 Node가 아직 없으면 null이다.
+    /// 노드의 orbivisord 빌드 버전. 옛 버전 노드이거나 Node가 아직 없으면 null이다.
     pub version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ClusterView {
     pub name: String,
-    /// 클러스터 CA 인증서의 지문. `oplctl login --ca-fingerprint`에 쓴다.
+    /// 클러스터 CA 인증서의 지문. `orbivisorctl login --ca-fingerprint`에 쓴다.
     pub ca_fingerprint: String,
     pub leader: Option<Uuid>,
     /// 이 응답을 보낸 노드의 id. 볼륨 업로드처럼 받은 노드에서 처리하는 요청에 쓴다.
@@ -222,11 +222,11 @@ pub async fn get_cluster(
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct VersionInfo {
-    /// 이 노드의 opld 빌드 버전
+    /// 이 노드의 orbivisord 빌드 버전
     pub version: String,
 }
 
-/// 이 노드의 빌드 버전. 인증 없이 읽는다(로그인 화면과 oplctl이 서버 버전을 본다).
+/// 이 노드의 빌드 버전. 인증 없이 읽는다(로그인 화면과 orbivisorctl이 서버 버전을 본다).
 #[utoipa::path(get, path = "/version", tag = "cluster", security(()),
     responses((status = 200, body = VersionInfo)))]
 pub async fn get_version() -> Json<VersionInfo> {
@@ -257,7 +257,7 @@ pub struct JoinTokenRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreatedJoinToken {
-    /// 새 노드에서 `oplctl cluster join`에 넘길 URL. 다시 볼 수 없다.
+    /// 새 노드에서 `orbivisorctl cluster join`에 넘길 URL. 다시 볼 수 없다.
     pub url: String,
     /// 만료 시각(유닉스 초)
     pub expires_at: u64,
@@ -334,7 +334,7 @@ pub struct JoinRequest {
     /// 새 노드가 위트니스(투표만 하고 VM을 돌리지 않는 노드)인지
     #[serde(default)]
     pub witness: bool,
-    /// 새 노드의 opld 빌드 버전. 옛 버전 노드는 보내지 않는다.
+    /// 새 노드의 orbivisord 빌드 버전. 옛 버전 노드는 보내지 않는다.
     #[serde(default)]
     pub version: Option<String>,
 }
@@ -452,7 +452,7 @@ fn upgrading(old: &mut [String]) -> Result<(), ApiError> {
     Err(ApiError::conflict(
         "cluster_upgrading",
         format!(
-            "some nodes run an older opLite ({}); finish the upgrade on every node first",
+            "some nodes run an older Orbivisor ({}); finish the upgrade on every node first",
             old.join(", ")
         ),
     ))
@@ -617,7 +617,7 @@ pub async fn join(
     }))
 }
 
-/// 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `oplctl cluster leave`로 뺀다.
+/// 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `orbivisorctl cluster leave`로 뺀다.
 /// 그 노드에 배정된 VM은 그대로 남는다.
 #[utoipa::path(delete, path = "/nodes/{key}", tag = "nodes",
     params(("key" = String, Path, description = "id or name")),
@@ -633,7 +633,7 @@ pub async fn delete_node(
         return Err(ApiError::conflict(
             "node_online",
             format!(
-                "node {:?} is online; run `oplctl cluster leave` on it instead",
+                "node {:?} is online; run `orbivisorctl cluster leave` on it instead",
                 node.name
             ),
         ));

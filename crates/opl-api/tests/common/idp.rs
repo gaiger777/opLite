@@ -366,7 +366,7 @@ impl Idp {
         sign(&self.inner(), claims)
     }
 
-    /// 브라우저처럼 `/authorize` 주소(opLite `start`의 Location)를 열어 돌려보내는 곳(콜백 주소)을 얻는다.
+    /// 브라우저처럼 `/authorize` 주소(Orbivisor `start`의 Location)를 열어 돌려보내는 곳(콜백 주소)을 얻는다.
     pub async fn follow(&self, authorize_url: &str) -> String {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())

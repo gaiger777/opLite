@@ -967,7 +967,7 @@ async fn a_refused_remote_token_is_a_502() {
             got.1["message"]
                 .as_str()
                 .unwrap()
-                .contains("oplctl remote set --token-file"),
+                .contains("orbivisorctl remote set --token-file"),
             "{}",
             got.1
         );

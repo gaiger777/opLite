@@ -261,7 +261,7 @@ pub fn parse_ovf(xml: &str) -> Result<Ovf, OvaError> {
             14 => warn("floppy drive is not imported".into()),
             15 | 16 => warn("CD-ROM drive is not imported".into()),
             23 => warn("USB controller is not imported".into()),
-            // 화면은 opLite가 따로 붙이고, VMCI는 VMware 전용이다
+            // 화면은 Orbivisor가 따로 붙이고, VMCI는 VMware 전용이다
             24 => {}
             1 if sub_type == "vmware.vmci" => {}
             _ if !element.is_empty() => warn(format!("{element} is not imported")),

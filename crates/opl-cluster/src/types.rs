@@ -122,7 +122,7 @@ pub enum LeaderRequest {
 pub struct Response(pub Result<u64, Rejection>);
 
 openraft::declare_raft_types!(
-    /// opLite의 openraft 타입 설정.
+    /// Orbivisor의 openraft 타입 설정.
     pub TypeConfig:
         D = Command,
         R = Response,

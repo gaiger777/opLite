@@ -1,4 +1,4 @@
-//! opLite REST API 클라이언트.
+//! Orbivisor REST API 클라이언트.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -121,7 +121,7 @@ impl Client {
             return Ok(body);
         }
         if status == StatusCode::UNAUTHORIZED && body["code"] == "unauthorized" {
-            bail!("not logged in or the token is no longer valid; run `oplctl login`");
+            bail!("not logged in or the token is no longer valid; run `orbivisorctl login`");
         }
         match (body["message"].as_str(), body["code"].as_str()) {
             (Some(message), Some(code)) => Err(ApiError {
@@ -181,7 +181,7 @@ impl Client {
         match self.poll_task(id, TASK_WAIT, |_| Ok(())).await? {
             Ok(task) => Ok(task),
             Err(task) => bail!(
-                "task {id} did not finish in {} minutes (state: {}); is opld running on node {}?",
+                "task {id} did not finish in {} minutes (state: {}); is orbivisord running on node {}?",
                 TASK_WAIT.as_secs() / 60,
                 task["status"]["state"].as_str().unwrap_or("unknown"),
                 task["spec"]["node"].as_str().unwrap_or("?")
@@ -205,7 +205,7 @@ impl Client {
         match self.poll_task(id, wait, watch).await? {
             Ok(task) => Ok(task),
             Err(task) => bail!(
-                "stopped waiting for task {id} after {} minutes (state: {}); it may still be running, see `oplctl task get {id}`",
+                "stopped waiting for task {id} after {} minutes (state: {}); it may still be running, see `orbivisorctl task get {id}`",
                 wait.as_secs() / 60,
                 task["status"]["state"].as_str().unwrap_or("unknown"),
             ),
@@ -295,14 +295,19 @@ pub async fn local(socket: &Path, path: &str, body: &Value) -> anyhow::Result<Va
         .json(body)
         .send()
         .await
-        .with_context(|| format!("cannot reach opld at {}; is it running?", socket.display()))?;
+        .with_context(|| {
+            format!(
+                "cannot reach orbivisord at {}; is it running?",
+                socket.display()
+            )
+        })?;
     let status = resp.status();
     if status.is_success() {
         // 일회용 비밀번호 등이 들어 있을 수 있으니 해석 오류를 숨기지 않는다.
         return resp
             .json()
             .await
-            .context("cannot parse the response from opld");
+            .context("cannot parse the response from orbivisord");
     }
     let body: Value = resp.json().await.unwrap_or_default();
     match body["message"].as_str() {
@@ -395,7 +400,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "stopped waiting for task {id} after 0 minutes (state: running); it may still be running, see `oplctl task get {id}`"
+                "stopped waiting for task {id} after 0 minutes (state: running); it may still be running, see `orbivisorctl task get {id}`"
             )
         );
         // 끝난 Task는 그대로 돌려준다.

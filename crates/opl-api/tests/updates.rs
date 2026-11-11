@@ -63,8 +63,8 @@ async fn refresh_runs_a_task_that_records_the_updates() {
     apt.set(
         "simulate.txt",
         "Reading package lists...\n\
-         Inst oplite [0.2.0] (0.2.1 opLite:trixie [amd64])\n\
-         Conf oplite (0.2.1 opLite:trixie [amd64])\n\
+         Inst orbivisor [0.2.0] (0.2.1 opLite:trixie [amd64])\n\
+         Conf orbivisor (0.2.1 opLite:trixie [amd64])\n\
          Inst libnew1 (1.0-1 Debian:13.2/stable [amd64])\n",
     );
     let env = env_with_updates(&apt).await;
@@ -91,7 +91,7 @@ async fn refresh_runs_a_task_that_records_the_updates() {
     assert_eq!(
         updates["packages"],
         json!([
-            { "name": "oplite", "current": "0.2.0", "candidate": "0.2.1" },
+            { "name": "orbivisor", "current": "0.2.0", "candidate": "0.2.1" },
             { "name": "libnew1", "current": null, "candidate": "1.0-1" }
         ])
     );
@@ -289,13 +289,13 @@ async fn the_agent_writes_the_sources_for_the_channel_and_checks() {
     let apt = FakeApt::new();
     apt.set(
         "simulate.txt",
-        "Inst oplite [0.2.0] (0.2.1 opLite:trixie [amd64])\n",
+        "Inst orbivisor [0.2.0] (0.2.1 opLite:trixie [amd64])\n",
     );
     let env = Env::start().await;
     set_node_status(&env, |s| s.updates = Some(NodeUpdates::default())).await;
     let admin = env.admin().await;
     let mut config = apt.config();
-    config.apt_url = "https://apt.example.com/oplite".into();
+    config.apt_url = "https://apt.example.com/orbivisor".into();
     config.first_check = Duration::from_millis(50);
     let sources = config.sources_file.clone();
     let agent = UpdateAgent::spawn(
@@ -311,7 +311,7 @@ async fn the_agent_writes_the_sources_for_the_channel_and_checks() {
         "{text}"
     );
     assert!(
-        text.contains("URIs: https://apt.example.com/oplite\n"),
+        text.contains("URIs: https://apt.example.com/orbivisor\n"),
         "{text}"
     );
     assert!(text.contains("Components: stable\n"), "{text}");
@@ -382,7 +382,7 @@ async fn the_agent_writes_the_apt_credentials_for_the_enterprise_channel() {
     set_node_status(&env, |s| s.updates = Some(NodeUpdates::default())).await;
     let admin = env.admin().await;
     let mut config = apt.config();
-    config.apt_url = "https://apt.example.com:8443/oplite".into();
+    config.apt_url = "https://apt.example.com:8443/orbivisor".into();
     let sources = config.sources_file.clone();
     let auth = config.auth_file.clone();
     let agent = UpdateAgent::spawn(
@@ -849,7 +849,7 @@ async fn a_vanished_unit_without_an_exit_status_was_interrupted() {
         write_log(
             &apt,
             id,
-            "opl-upgrade: start\nUnpacking oplite (0.2.1) ...\n",
+            "opl-upgrade: start\nUnpacking orbivisor (0.2.1) ...\n",
         )
     })
     .await;
@@ -910,7 +910,7 @@ async fn a_vanished_unit_with_a_dpkg_audit_report_was_interrupted() {
         "The following packages are only half configured, probably due to problems\n\
          configuring them the first time.  The configuration should be retried using\n\
          dpkg --configure <package> or the configure menu option in dselect:\n\
-         oplite               opLite virtualization platform\n",
+         orbivisor            Orbivisor virtualization platform\n",
     );
     let (env, task) = resume_upgrade(&apt, |id| write_log(&apt, id, "opl-upgrade: start\n")).await;
     let admin = env.admin().await;

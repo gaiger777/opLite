@@ -1256,8 +1256,8 @@ async fn left_tag_removal_stops_with_the_runner() {
     assert_eq!(storage.tags(zvols[0]).len(), 1);
 }
 
-/// 실행기가 시작하면 이 노드의 블록 풀 볼륨에서 스냅샷 리소스가 없는 opLite 태그(UUID)를 지운다.
-/// 리소스가 있는 태그, opLite 밖의 태그, 다른 노드의 볼륨은 그대로 둔다.
+/// 실행기가 시작하면 이 노드의 블록 풀 볼륨에서 스냅샷 리소스가 없는 Orbivisor 태그(UUID)를 지운다.
+/// 리소스가 있는 태그, Orbivisor 밖의 태그, 다른 노드의 볼륨은 그대로 둔다.
 #[tokio::test]
 async fn block_snapshot_tags_without_snapshots_are_removed_at_startup() {
     let mut env = Env::start().await;
@@ -1609,7 +1609,7 @@ async fn running_vm_zfs_snapshot_takes_each_pool_at_once() {
 }
 
 /// ZFS 디스크는 가장 최근 스냅샷으로만 되돌린다. API가 확인한 뒤에도 디스크에 더 최근 스냅샷이
-/// 있으면(opLite 밖에서 만든 것 등) VM을 끄기 전에 그 이름과 함께 실패한다.
+/// 있으면(Orbivisor 밖에서 만든 것 등) VM을 끄기 전에 그 이름과 함께 실패한다.
 #[tokio::test]
 async fn zfs_revert_checks_the_latest_disk_snapshot_before_stopping() {
     let mut env = Env::start().await;
@@ -1641,19 +1641,19 @@ async fn zfs_revert_checks_the_latest_disk_snapshot_before_stopping() {
         "volume \"z1\" has a more recent snapshot \"autosnap_hourly\"; zfs disks can only \
          revert to the latest snapshot"
     );
-    // opLite의 스냅샷이면 그 이름이다.
+    // Orbivisor의 스냅샷이면 그 이름이다.
     storage.set_tags(zvols[1], &[&b, &a]);
     let error = revert_b().await;
     assert!(error.contains("more recent snapshot \"a\""), "{error}");
-    // UUID 태그인데 스냅샷 자원이 없으면 opld가 뒤에서 치우는 opLite 스냅샷의 남은 것이다.
+    // UUID 태그인데 스냅샷 자원이 없으면 opld가 뒤에서 치우는 Orbivisor 스냅샷의 남은 것이다.
     let leftover = Uuid::now_v7().to_string();
     storage.set_tags(zvols[1], &[&a, &b, &leftover]);
     let error = revert_b().await;
     assert_eq!(
         error,
         format!(
-            "volume \"z1\" has a more recent snapshot {leftover:?} left by an opLite snapshot that \
-             opld removes in the background (retry later or restart opld); zfs disks can only \
+            "volume \"z1\" has a more recent snapshot {leftover:?} left by an Orbivisor snapshot that \
+             orbivisord removes in the background (retry later or restart orbivisord); zfs disks can only \
              revert to the latest snapshot"
         )
     );

@@ -13,7 +13,7 @@
 //!
 //! ```ignore
 //! let apt = FakeApt::new();
-//! apt.set("simulate.txt", "Inst oplite [0.2.0] (0.2.1 opLite:trixie [amd64])\n");
+//! apt.set("simulate.txt", "Inst orbivisor [0.2.0] (0.2.1 opLite:trixie [amd64])\n");
 //! let updates = Arc::new(Updates::new(apt.config()));
 //! ```
 #![allow(dead_code)]

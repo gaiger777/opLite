@@ -1,6 +1,6 @@
 [package]
 name = "oplctl"
-description = "Command-line client for opLite"
+description = "Command-line client for Orbivisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

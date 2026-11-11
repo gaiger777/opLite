@@ -8,10 +8,10 @@ pub const BUILD: &str = match option_env!("OPL_VERSION") {
     _ => env!("CARGO_PKG_VERSION"),
 };
 
-/// opLite APT 저장소의 Debian 배포판(suite)
+/// Orbivisor APT 저장소의 Debian 배포판(suite)
 pub const SUITE: &str = "trixie";
 
-/// 이 빌드에 넣은 opLite APT 저장소 URL(빌드 때 환경 변수 `OPL_APT_URL`). 없으면 빈 문자열이다.
+/// 이 빌드에 넣은 Orbivisor APT 저장소 URL(빌드 때 환경 변수 `OPL_APT_URL`). 없으면 빈 문자열이다.
 pub const APT_URL: &str = match option_env!("OPL_APT_URL") {
     Some(v) => v,
     None => "",

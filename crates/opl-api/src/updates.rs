@@ -1,4 +1,4 @@
-//! 노드의 APT 업데이트: opLite 저장소 소스 파일과 enterprise 채널 인증 파일 관리, 업데이트 확인(`apt-get -s dist-upgrade`),
+//! 노드의 APT 업데이트: Orbivisor 저장소 소스 파일과 enterprise 채널 인증 파일 관리, 업데이트 확인(`apt-get -s dist-upgrade`),
 //! 주기 확인 에이전트, 다시 확인 API(`POST /nodes/{key}/updates/refresh`), 업그레이드(`POST
 //! /nodes/{key}/upgrade`, `systemd-run`의 일시 유닛에서 `apt-get dist-upgrade`).
 
@@ -31,10 +31,11 @@ use crate::state::AppState;
 use crate::tasks::create_task;
 
 /// opld가 쓴 소스·인증 파일의 첫 줄. 이 줄이 없는 파일은 관리자가 직접 관리하는 것으로 보고 건드리지 않는다.
+/// 비교되는 문자열 — 제품 이름이 바뀌어도 바꾸지 않는다(이미 쓴 파일을 알아본다).
 pub const SOURCES_MARK: &str = "# managed by opld; edits are overwritten";
-/// 패키지가 싣는 저장소 공개 키(`UpdatesConfig.keyring`의 기본값)
+/// 패키지가 싣는 저장소 공개 키(`UpdatesConfig.keyring`의 기본값). 패키지가 바뀌어도 경로는 그대로다.
 pub const KEYRING: &str = "/usr/share/keyrings/oplite-archive-keyring.gpg";
-/// enterprise 채널의 APT 인증 파일(`UpdatesConfig.auth_file`의 기본값)
+/// enterprise 채널의 APT 인증 파일(`UpdatesConfig.auth_file`의 기본값). 이미 쓴 파일을 이어 쓰도록 이름은 그대로다.
 pub const AUTH_FILE: &str = "/etc/apt/auth.conf.d/oplite.conf";
 /// `NodeStatus.updates`에 담는 패키지 수의 상한
 pub const MAX_PACKAGES: usize = 500;
@@ -47,8 +48,9 @@ const ERROR_LINES: usize = 5;
 /// 설정 구독을 하지 못했을 때 다시 해 보는 간격
 const RESUBSCRIBE: Duration = Duration::from_secs(10);
 /// 업그레이드 셸이 로그 끝에 남기는 종료 상태 줄의 앞부분. `--collect`로 유닛이 사라진 뒤에도 결과를 안다.
+/// 업그레이드 전후의 데몬이 함께 비교하므로 바꾸지 않는다.
 const EXIT_MARK: &str = "opl-upgrade: exit ";
-/// 업그레이드 셸이 맨 처음 로그에 남기는 줄. 없으면 유닛이 셸을 시작하지 못했다.
+/// 업그레이드 셸이 맨 처음 로그에 남기는 줄. 없으면 유닛이 셸을 시작하지 못했다. 바꾸지 않는다.
 const START_MARK: &str = "opl-upgrade: start";
 /// apt가 다른 apt(무인 업그레이드 등)의 dpkg 잠금을 기다리는 시간(초)
 const LOCK_TIMEOUT: u32 = 600;
@@ -62,7 +64,7 @@ pub struct UpdatesConfig {
     pub check_interval: Duration,
     /// 시작한 뒤 첫 확인까지 기다리는 시간
     pub first_check: Duration,
-    /// opLite APT 저장소 주소. 비면 소스 파일을 쓰지 않는다.
+    /// Orbivisor APT 저장소 주소. 비면 소스 파일을 쓰지 않는다.
     pub apt_url: String,
     /// opld가 관리하는 deb822 소스 파일
     pub sources_file: PathBuf,
@@ -519,7 +521,7 @@ fn parse_inst(line: &str) -> Option<PackageUpdate> {
     })
 }
 
-/// opLite 저장소의 deb822 소스 파일 내용
+/// Orbivisor 저장소의 deb822 소스 파일 내용
 pub(crate) fn sources_contents(url: &str, channel: Channel, keyring: &Path) -> String {
     format!(
         "{SOURCES_MARK}\nTypes: deb\nURIs: {url}\nSuites: {SUITE}\nComponents: {}\nSigned-By: {}\n",
@@ -568,7 +570,7 @@ pub(crate) fn write_sources(
     if !keyring.exists() {
         tracing::warn!(
             keyring = %keyring.display(),
-            "the opLite archive key is missing; not writing the APT sources"
+            "the Orbivisor archive key is missing; not writing the APT sources"
         );
         if old.is_some() {
             std::fs::remove_file(path)?;
@@ -936,8 +938,8 @@ pub async fn refresh_updates(
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
-/// 노드의 패키지를 올릴 Task(`node-upgrade`, 그 노드에서 돈다)를 돌려준다(202). apt는 opld 밖의 일시
-/// 유닛에서 돌므로 VM은 계속 돌고 opld만 잠깐 다시 시작한다. 업데이트를 확인하지 않는 노드면 400
+/// 노드의 패키지를 올릴 Task(`node-upgrade`, 그 노드에서 돈다)를 돌려준다(202). apt는 orbivisord 밖의 일시
+/// 유닛에서 돌므로 VM은 계속 돌고 orbivisord만 잠깐 다시 시작한다. 업데이트를 확인하지 않는 노드면 400
 /// `updates_unsupported`, 오프라인이면 409 `node_offline`, 클러스터 어디든 끝나지 않은 업그레이드가
 /// 있으면 409 `upgrade_in_progress`(한 번에 한 노드 — 나머지 노드가 과반수와 서비스를 지킨다), 옛 노드가
 /// 남았으면 409 `cluster_upgrading`.
@@ -980,7 +982,7 @@ mod tests {
     use super::*;
 
     /// Debian 13에서 `LANG=C apt-get -s -q dist-upgrade`가 내는 모양(보안 업데이트, 새 커널 의존성,
-    /// 지울 패키지, opLite 저장소 패키지가 섞임)
+    /// 지울 패키지, Orbivisor 저장소 패키지가 섞임)
     const SIMULATE: &str = "\
 Reading package lists...
 Building dependency tree...
@@ -991,7 +993,7 @@ The following packages will be REMOVED:
 The following NEW packages will be installed:
   linux-image-6.12.48+deb13-amd64
 The following packages will be upgraded:
-  base-files libc-bin libc6 linux-image-amd64 oplite
+  base-files libc-bin libc6 linux-image-amd64 orbivisor
 5 upgraded, 1 newly installed, 1 to remove and 0 not upgraded.
 Remv libfoo1 [1.2-3]
 Inst base-files [13.8+deb13u1] (13.8+deb13u2 Debian:13.2/stable [amd64])
@@ -1002,10 +1004,10 @@ Conf libc6 (2.41-12+deb13u1 Debian:13.2/stable, Debian-Security:13/stable-securi
 Conf libc-bin (2.41-12+deb13u1 Debian:13.2/stable, Debian-Security:13/stable-security [amd64])
 Inst linux-image-6.12.48+deb13-amd64 (6.12.48-1 Debian:13.2/stable [amd64])
 Inst linux-image-amd64 [6.12.41-1] (6.12.48-1 Debian:13.2/stable [amd64])
-Inst oplite [0.2.0] (1:0.2.1~rc1 opLite:trixie [amd64])
+Inst orbivisor [0.2.0] (1:0.2.1~rc1 opLite:trixie [amd64])
 Conf linux-image-6.12.48+deb13-amd64 (6.12.48-1 Debian:13.2/stable [amd64])
 Conf linux-image-amd64 (6.12.48-1 Debian:13.2/stable [amd64])
-Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
+Conf orbivisor (1:0.2.1~rc1 opLite:trixie [amd64])
 ";
 
     fn pkg(name: &str, current: Option<&str>, candidate: &str) -> PackageUpdate {
@@ -1027,7 +1029,7 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
                 // 새 커널 의존성: 설치된 버전이 없다.
                 pkg("linux-image-6.12.48+deb13-amd64", None, "6.12.48-1"),
                 pkg("linux-image-amd64", Some("6.12.41-1"), "6.12.48-1"),
-                pkg("oplite", Some("0.2.0"), "1:0.2.1~rc1"),
+                pkg("orbivisor", Some("0.2.0"), "1:0.2.1~rc1"),
             ]
         );
         assert!(parse_simulate("").is_empty());
@@ -1151,14 +1153,14 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
     #[test]
     fn exit_status_reads_the_last_mark() {
         assert_eq!(
-            exit_status("Setting up oplite (0.2.1) ...\nopl-upgrade: exit 0\n"),
+            exit_status("Setting up orbivisor (0.2.1) ...\nopl-upgrade: exit 0\n"),
             Some(0)
         );
         assert_eq!(
             exit_status("opl-upgrade: exit 0\nopl-upgrade: exit 100\n"),
             Some(100)
         );
-        assert_eq!(exit_status("Unpacking oplite (0.2.1) ...\n"), None);
+        assert_eq!(exit_status("Unpacking orbivisor (0.2.1) ...\n"), None);
         assert_eq!(exit_status(""), None);
     }
 
@@ -1225,13 +1227,13 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
     fn sources_are_deb822_with_the_mark() {
         assert_eq!(
             sources_contents(
-                "https://apt.example.com/oplite",
+                "https://apt.example.com/orbivisor",
                 Channel::Testing,
                 Path::new(KEYRING)
             ),
             "# managed by opld; edits are overwritten\n\
              Types: deb\n\
-             URIs: https://apt.example.com/oplite\n\
+             URIs: https://apt.example.com/orbivisor\n\
              Suites: trixie\n\
              Components: testing\n\
              Signed-By: /usr/share/keyrings/oplite-archive-keyring.gpg\n"
@@ -1245,7 +1247,7 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
         let path = dir.path().join("oplite.sources");
         let keyring = dir.path().join("keyring.gpg");
         std::fs::write(&keyring, "").unwrap();
-        let url = "https://apt.example.com/oplite";
+        let url = "https://apt.example.com/orbivisor";
         assert_eq!(
             write_sources(&path, url, Channel::Stable, &keyring).unwrap(),
             SourcesOutcome::Written
@@ -1271,7 +1273,7 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
         );
         // 관리 표시가 없는 파일(관리자가 직접 쓴 것)은 그대로 둔다.
         let own =
-            "Types: deb\nURIs: http://mirror.lan/oplite\nSuites: trixie\nComponents: stable\n";
+            "Types: deb\nURIs: http://mirror.lan/orbivisor\nSuites: trixie\nComponents: stable\n";
         std::fs::write(&path, own).unwrap();
         assert_eq!(
             write_sources(&path, url, Channel::Testing, &keyring).unwrap(),
@@ -1299,7 +1301,7 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oplite.sources");
         let keyring = dir.path().join("keyring.gpg");
-        let url = "https://apt.example.com/oplite";
+        let url = "https://apt.example.com/orbivisor";
         assert_eq!(
             write_sources(&path, url, Channel::Stable, &keyring).unwrap(),
             SourcesOutcome::NoKeyring
@@ -1311,7 +1313,7 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
             SourcesOutcome::NoKeyring
         );
         assert!(!path.exists());
-        let own = "Types: deb\nURIs: http://mirror.lan/oplite\n";
+        let own = "Types: deb\nURIs: http://mirror.lan/orbivisor\n";
         std::fs::write(&path, own).unwrap();
         assert_eq!(
             write_sources(&path, url, Channel::Stable, &keyring).unwrap(),
@@ -1364,7 +1366,7 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
     #[test]
     fn auth_contents_need_the_enterprise_channel_and_a_signed_key() {
         let key = dev_key(1_700_000_000 + 86_400);
-        let url = "https://user@apt.example.com:8443/oplite?x#y";
+        let url = "https://user@apt.example.com:8443/orbivisor?x#y";
         let password = hex::encode(Sha256::digest(key.as_bytes()));
         assert_eq!(
             auth_contents(url, &spec(Channel::Enterprise, Some(&key))).unwrap(),
@@ -1399,7 +1401,7 @@ Conf oplite (1:0.2.1~rc1 opLite:trixie [amd64])
             "",
             "apt.example.com",
             "https://",
-            "https:///oplite",
+            "https:///orbivisor",
             "https://apt.exam\u{7}ple.com",
         ] {
             assert_eq!(

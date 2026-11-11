@@ -113,8 +113,8 @@ pub enum TaskOp {
     VmImportDelete,
     /// 대상 노드(Task의 `node`와 같다)의 APT 업데이트를 확인해 Node `status.updates`에 쓴다.
     NodeUpdateCheck,
-    /// 대상 노드(Task의 `node`와 같다)의 패키지를 `apt-get dist-upgrade`로 올린다. opld 밖의 일시
-    /// systemd 유닛에서 돌므로 opld가 다시 시작해도 이어서 지켜본다.
+    /// 대상 노드(Task의 `node`와 같다)의 패키지를 `apt-get dist-upgrade`로 올린다. orbivisord 밖의 일시
+    /// systemd 유닛에서 돌므로 orbivisord가 다시 시작해도 이어서 지켜본다.
     NodeUpgrade,
     /// 대상 노드(Task의 `node`와 같다)를 비운다: 실행 중인 VM을 하나씩 다른 노드로 라이브 마이그레이션한다.
     /// 노드는 API가 먼저 유지보수로 바꾼다.

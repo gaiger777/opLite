@@ -23,7 +23,7 @@ async fn single_node_cluster_serves_cli_over_https_and_survives_restarts() {
     let out = d.init("prod").await;
     assert!(out.contains("cluster prod created"), "{out}");
     assert!(
-        out.contains("oplctl login --server https://127.0.0.1:"),
+        out.contains("orbivisorctl login --server https://127.0.0.1:"),
         "{out}"
     );
     let err = d
@@ -192,7 +192,7 @@ async fn single_node_cluster_serves_cli_over_https_and_survives_restarts() {
 
     d.ctl(&["logout"]).await.unwrap();
     let err = d.ctl(&["vm", "list"]).await.unwrap_err();
-    assert!(err.to_string().contains("oplctl login"), "{err}");
+    assert!(err.to_string().contains("orbivisorctl login"), "{err}");
     d.stop();
 }
 

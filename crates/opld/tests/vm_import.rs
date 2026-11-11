@@ -214,7 +214,7 @@ async fn ova_import_creates_a_stopped_vm_with_the_disk_contents() {
         .unwrap();
     assert_eq!(
         out,
-        "vm-import web01 uploaded; review it with `oplctl import get web01`\n"
+        "vm-import web01 uploaded; review it with `orbivisorctl import get web01`\n"
     );
     let import = d.ctl_json(&["import", "get", "web01"]).await;
     let status = &import["status"];
@@ -446,7 +446,7 @@ async fn create_esxi(d: &Daemon, esxi: &MockEsxi, name: &str) {
         .unwrap();
     assert_eq!(
         out,
-        format!("vm-import {name} created; review it with `oplctl import get {name}`\n")
+        format!("vm-import {name} created; review it with `orbivisorctl import get {name}`\n")
     );
 }
 

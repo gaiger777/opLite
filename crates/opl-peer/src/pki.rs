@@ -59,7 +59,7 @@ impl ClusterCa {
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.distinguished_name.push(
             DnType::CommonName,
-            format!("opLite cluster {cluster_name} CA"),
+            format!("Orbivisor cluster {cluster_name} CA"),
         );
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,

@@ -1,4 +1,4 @@
-//! opLite 노드 데몬. 클러스터 저장소, 노드 간 통신, reconciler, Task 실행기, REST API를 한 프로세스로
+//! Orbivisor 노드 데몬. 클러스터 저장소, 노드 간 통신, reconciler, Task 실행기, REST API를 한 프로세스로
 //! 묶는다.
 //!
 //! 노드 인증서(`{data_dir}/pki`)가 없으면 아직 클러스터에 속하지 않은 노드다. 이때는 제어 소켓만 열고
@@ -92,7 +92,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 None => {
                     tracing::info!(
                         socket = %config.control_socket().display(),
-                        "this node is not in a cluster; waiting for `oplctl cluster init` or `oplctl cluster join`"
+                        "this node is not in a cluster; waiting for `orbivisorctl cluster init` or `orbivisorctl cluster join`"
                     );
                     loop {
                         let req = tokio::select! {
@@ -305,7 +305,7 @@ fn lock_data_dir(dir: &Path) -> anyhow::Result<File> {
     match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(file),
         Err(rustix::io::Errno::WOULDBLOCK) => anyhow::bail!(
-            "{} is locked; is another opld running with this data directory?",
+            "{} is locked; is another orbivisord running with this data directory?",
             path.display()
         ),
         Err(e) => Err(e).with_context(|| format!("cannot lock {}", path.display())),

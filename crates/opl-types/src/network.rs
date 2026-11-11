@@ -28,7 +28,7 @@ pub struct NetworkSpec {
     /// VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vlan: Option<u16>,
-    /// opld가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크
+    /// orbivisord가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub vxlan: Option<Vxlan>,
@@ -171,7 +171,7 @@ pub enum NetworkError {
     BadVni(u32),
     #[error("invalid MTU {0}: use 1280-9000")]
     BadMtu(u16),
-    #[error("bridge name {0:?} is reserved for opLite VXLAN networks")]
+    #[error("bridge name {0:?} is reserved for Orbivisor VXLAN networks")]
     ReservedBridge(String),
 }
 

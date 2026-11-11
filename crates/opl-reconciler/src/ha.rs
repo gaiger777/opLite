@@ -367,7 +367,7 @@ impl HaGuard {
         } else {
             tracing::warn!(
                 vms = state.running.len(),
-                "HA VMs are running; leaving the watchdog armed, so this node restarts unless opld comes back in time"
+                "HA VMs are running; leaving the watchdog armed, so this node restarts unless orbivisord comes back in time"
             );
             drop(watchdog);
         }

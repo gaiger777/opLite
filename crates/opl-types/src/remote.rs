@@ -1,4 +1,4 @@
-//! 원격 클러스터. 다른 opLite 클러스터의 주소, 그 클러스터 CA의 지문과 인증서, 그 클러스터에서 만든 API
+//! 원격 클러스터. 다른 Orbivisor 클러스터의 주소, 그 클러스터 CA의 지문과 인증서, 그 클러스터에서 만든 API
 //! 토큰을 두고, 리더가 상태를 모으며 API가 요청을 중계한다. 두 클러스터는 대등하다(원격 쪽 권한은 토큰 주인이 정한다).
 
 use serde::{Deserialize, Serialize};
@@ -171,7 +171,7 @@ pub enum RemoteSpecError {
     Url,
     #[error("ca_fingerprint must be sha256: followed by 64 hexadecimal digits")]
     Fingerprint,
-    #[error("token must be an opLite API token (opl_<id>_<secret>)")]
+    #[error("token must be an Orbivisor API token (opl_<id>_<secret>)")]
     Token,
 }
 

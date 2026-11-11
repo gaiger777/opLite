@@ -3206,7 +3206,7 @@ mod tests {
         assert!(lvm.lv(&lv).unwrap().active);
     }
 
-    /// 이 노드에서 켜져 있는 볼륨 LV(`opl-{id}`)만 알린다. 꺼진 볼륨 LV와 opLite 밖의 LV는 빼고 LVM
+    /// 이 노드에서 켜져 있는 볼륨 LV(`opl-{id}`)만 알린다. 꺼진 볼륨 LV와 Orbivisor 밖의 LV는 빼고 LVM
     /// 명령은 목록뿐이다.
     #[tokio::test]
     async fn shared_lists_volumes_active_on_this_node() {

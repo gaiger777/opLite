@@ -202,7 +202,7 @@ async fn fetch_ca_reads_the_ca_without_verifying() {
     *server.site.ca_body.lock().unwrap() = "hello".into();
     let err = fetch_ca(&server.url).await.unwrap_err();
     assert!(
-        matches!(&err, RemoteError::Invalid(m) if m.contains("not an opLite cluster")),
+        matches!(&err, RemoteError::Invalid(m) if m.contains("not an Orbivisor cluster")),
         "{err:?}"
     );
 }
@@ -286,7 +286,7 @@ async fn limits_json_bodies_and_reports_error_messages() {
         matches!(&err, RemoteError::Status(404, m) if m == "vm \"web\" not found"),
         "{err:?}"
     );
-    // opLite 오류 본문이 아니면 상태 이름
+    // Orbivisor 오류 본문이 아니면 상태 이름
     let err = client.get_json::<Value>("/nothing-here").await.unwrap_err();
     assert!(
         matches!(&err, RemoteError::Status(404, m) if m == "Not Found"),

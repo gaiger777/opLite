@@ -485,7 +485,7 @@ impl Member {
             node = %node,
             api = %config.listen,
             cluster = %config.cluster_listen,
-            "opld is ready"
+            "orbivisord is ready"
         );
         let (stop, rx) = oneshot::channel::<()>();
         let schedule = SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config());
@@ -603,7 +603,7 @@ impl Member {
         tracing::info!(
             node = %cluster.id(),
             cluster = %config.cluster_listen,
-            "opld is ready as a witness"
+            "orbivisord is ready as a witness"
         );
         Ok(Member {
             config: config.clone(),
@@ -703,7 +703,7 @@ fn check_leave(
     let mut rest = voters.keys().filter(|&&id| id != me).peekable();
     if rest.peek().is_none() {
         anyhow::bail!(
-            "this node is the only voting member; stop opld and remove its data directory instead"
+            "this node is the only voting member; stop orbivisord and remove its data directory instead"
         );
     }
     let witness = |id: &NodeId| nodes.iter().any(|n| n.id == id.0 && n.spec.witness);

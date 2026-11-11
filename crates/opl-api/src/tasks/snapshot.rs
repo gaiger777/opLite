@@ -753,7 +753,7 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
     }
     let tag = id.to_string();
     // ZFS 디스크는 가장 최근 스냅샷으로만 되돌린다. API는 VM의 스냅샷 순서만 보므로, 디스크에
-    // 더 최근 스냅샷(opLite 밖에서 만든 것 등)이 있으면 끄기 전에 그만둔다.
+    // 더 최근 스냅샷(Orbivisor 밖에서 만든 것 등)이 있으면 끄기 전에 그만둔다.
     for (volume, pool) in &disks {
         if block_snapshot_kind(pool) == Some("zfs") {
             check_latest_tag(ctx, volume, pool, &tag, &snapshot.spec.name).await?;
@@ -828,7 +828,7 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
     Ok(())
 }
 
-/// 볼륨의 가장 최근 스냅샷이 `tag`(스냅샷 `name`)인지. 아니면 더 최근 스냅샷의 이름(opLite의
+/// 볼륨의 가장 최근 스냅샷이 `tag`(스냅샷 `name`)인지. 아니면 더 최근 스냅샷의 이름(Orbivisor의
 /// 스냅샷이면 그 이름, 아니면 디스크의 태그)과 함께 오류다. UUID 태그인데 스냅샷 자원이 없으면
 /// opld가 뒤에서 치우는 남은 스냅샷이라고 알린다.
 async fn check_latest_tag(
@@ -853,8 +853,8 @@ async fn check_latest_tag(
         Ok(id) => match get_snapshot(ctx, id)? {
             Some(s) => format!("{:?}", s.spec.name),
             None => format!(
-                "{last:?} left by an opLite snapshot that opld removes in the background (retry \
-                 later or restart opld)"
+                "{last:?} left by an Orbivisor snapshot that orbivisord removes in the background (retry \
+                 later or restart orbivisord)"
             ),
         },
         Err(_) => format!("{last:?}"),

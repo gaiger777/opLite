@@ -1,6 +1,6 @@
 [package]
 name = "opl-cluster"
-description = "Raft-replicated resource store for opLite"
+description = "Raft-replicated resource store for Orbivisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

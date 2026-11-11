@@ -1,4 +1,4 @@
-//! 원격 opLite 클러스터의 HTTPS 클라이언트. TLS는 원격 클러스터 CA 하나만 믿고 호스트 이름은 확인하지
+//! 원격 Orbivisor 클러스터의 HTTPS 클라이언트. TLS는 원격 클러스터 CA 하나만 믿고 호스트 이름은 확인하지
 //! 않는다(노드 인증서의 이름은 노드마다 다르다). CA는 등록할 때 받아 지문을 확인하고 저장한 인증서
 //! 하나다. 요청마다 새 연결을 연다(HTTP/1.1). 리다이렉트는 따르지 않는다(3xx는 그대로 응답).
 
@@ -103,7 +103,7 @@ pub async fn fetch_ca(url: &str) -> Result<String, RemoteError> {
     let pem = String::from_utf8(body)
         .ok()
         .filter(|pem| opl_peer::pki::certs(pem).is_ok())
-        .ok_or_else(|| invalid("the address is not an opLite cluster (no CA certificate)"))?;
+        .ok_or_else(|| invalid("the address is not an Orbivisor cluster (no CA certificate)"))?;
     single_cert(&pem)?;
     Ok(pem)
 }
@@ -357,7 +357,7 @@ async fn success(
             .await?
             .ok_or_else(|| invalid(format!("{what} is larger than {limit} bytes")));
     }
-    // 오류 본문의 `message`(opLite 오류 응답), 없으면 상태 이름
+    // 오류 본문의 `message`(Orbivisor 오류 응답), 없으면 상태 이름
     let message = read_limited(&mut body, MAX_ERROR_BYTES)
         .await
         .ok()

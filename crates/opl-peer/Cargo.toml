@@ -1,6 +1,6 @@
 [package]
 name = "opl-peer"
-description = "Node-to-node communication (gRPC over mTLS) and cluster PKI for opLite"
+description = "Node-to-node communication (gRPC over mTLS) and cluster PKI for Orbivisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

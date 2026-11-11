@@ -457,7 +457,7 @@ fn check_pool_local(state: &AppState, pool: &StoragePool) -> Result<(), ApiError
     Ok(())
 }
 
-/// 노드에 미리 만든 Linux 브리지를 가리키거나 opld가 만드는 VXLAN 네트워크. 이름 `user`는 예약되어 있다.
+/// 노드에 미리 만든 Linux 브리지를 가리키거나 orbivisord가 만드는 VXLAN 네트워크. 이름 `user`는 예약되어 있다.
 /// VNI가 다른 네트워크와 겹치면 409 `vni_in_use`(동시에 만드는 두 요청의 경쟁은 막지 않는다).
 #[utoipa::path(post, path = "/networks", tag = "networks",
     request_body = CreateRequest<NetworkSpec>,
@@ -521,7 +521,7 @@ pub async fn delete_network(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 노드의 주소와 유지보수 모드를 바꾼다. 노드 리소스는 opld가 시작할 때 스스로 만든다.
+/// 노드의 주소와 유지보수 모드를 바꾼다. 노드 리소스는 orbivisord가 시작할 때 스스로 만든다.
 /// 역할(`witness`)은 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다.
 #[utoipa::path(put, path = "/nodes/{key}", tag = "nodes",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),

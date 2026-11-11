@@ -1,6 +1,6 @@
 [package]
 name = "opl-qemu"
-description = "QEMU command line builder and QMP client for opLite"
+description = "QEMU command line builder and QMP client for Orbivisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "opl-driver"
-description = "Hypervisor and storage drivers for opLite"
+description = "Hypervisor and storage drivers for Orbivisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

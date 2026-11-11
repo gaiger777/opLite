@@ -1,4 +1,4 @@
-//! VM 가져오기. 올린 OVA를 읽어([`ova`]·[`ovf`]) 원본 VM을 알아내고 opLite VM 설정을 제안한다.
+//! VM 가져오기. 올린 OVA를 읽어([`ova`]·[`ovf`]) 원본 VM을 알아내고 Orbivisor VM 설정을 제안한다.
 //! 원본은 올린 노드의 `{upload_dir}/imports/{가져오기 id}/source.ova`에 둔다. 실행과 지우기는 그 노드의
 //! Task 실행기가 한다. ESXi·vCenter 데이터스토어의 VM은 `.vmx`·디스크립터를 HTTPS로 읽어([`esxi`]·
 //! [`vmx`]) 같은 리소스를 만들고, 비밀번호는 요청을 받은 노드의 메모리([`ImportCredentials`])에만 둔다.
@@ -51,6 +51,7 @@ use vmx::{MAX_TEXT_BYTES, VmxError};
 /// `/vm-imports/ova`·`/vm-imports/esxi` 경로와 겹치므로 가져오기 이름으로 쓸 수 없다.
 const RESERVED_NAMES: [&str; 2] = ["ova", "esxi"];
 /// 이 노드 메모리에 자격 증명이 없는(opld가 다시 시작했거나 요청이 끊긴) ESXi 가져오기의 오류
+/// 비교되는 문자열 — 바꾸지 않는다. 가져오기 `status.error`에 저장되고 웹이 이 문자열과 같은지 보고 번역한다.
 pub(crate) const CREDENTIALS_LOST: &str = "the ESXi credentials are no longer on this node (opld restarted or the request was interrupted); create the import again";
 /// browse가 `.vmx`를 동시에 읽는 개수
 const BROWSE_CONCURRENCY: usize = 8;
@@ -945,7 +946,7 @@ async fn check_credentials(state: &AppState, import: &VmImport) -> Result<(), Ap
 /// `ready` 가져오기를 `run`의 값으로 실행할 Task를 돌려준다(202). Task는 원본이 있는 노드에서 돌고, 대상은
 /// 미리 정한 새 VM id다. 실행 Task가 끝나지 않았으면 409 `import_busy`, 이미 가져왔으면 `import_done`(끝난 실행
 /// Task가 VM을 만들었으면 가져오기를 `done`으로 끝내고), 원본을 쓸 수
-/// 없으면 `import_failed`, 원본 노드가 오프라인이면 `node_offline`. 원본 NIC의 네트워크마다 있는 opLite
+/// 없으면 `import_failed`, 원본 노드가 오프라인이면 `node_offline`. 원본 NIC의 네트워크마다 있는 Orbivisor
 /// 네트워크로 매핑해야 하고(400), VM 이름과 볼륨 이름 `{name}-disk{i}`가 비어 있어야 한다(409
 /// `name_taken`). 풀은 원본 노드에서 쓸 수 있어야 하고(409 `pool_not_on_node`·`pool_unavailable`), 결과
 /// VM 스펙은 VM 만들기의 검증을 통과해야 한다(400). 원본 MAC을 쓰면 다른 VM과 겹치지 않아야 한다(409
@@ -1292,7 +1293,7 @@ mod tests {
     #[test]
     fn import_spec_falls_back_to_the_proposed_network() {
         let src = source();
-        // 이름이 같은 opLite 네트워크 `Backup`이 있다.
+        // 이름이 같은 Orbivisor 네트워크 `Backup`이 있다.
         let (proposal, _) = propose(&src, &["Backup".to_string()]);
         let spec = import_spec(&src, &proposal, &run(&[("VM Network", "lan")]), &[]).unwrap();
         let networks: Vec<&str> = spec.nics.iter().map(|n| n.network.as_str()).collect();

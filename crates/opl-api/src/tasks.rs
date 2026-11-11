@@ -296,7 +296,7 @@ async fn sweep_block_tags_every(ctx: Arc<Ctx>) {
 /// 시간을 넘긴 블록 스냅샷이 남긴 태그를 지운다: 이 노드가 맡는 블록 풀(LVM-thin, ZFS, RBD) 볼륨의
 /// 태그 중 UUID 모양인데 그 id의 스냅샷 리소스가 없는 것. 스냅샷 Task는 리소스를 만든 뒤 태그를
 /// 찍고 태그를 지운 뒤 리소스를 지우므로 그런 태그는 남은 것이다. 백업의 임시 스냅샷(백업 id의 simple
-/// 문자열)도 같은 모양이므로, 백업 Task가 끝나지 않은 `pending` 백업의 태그는 둔다. opLite 밖에서 만든 태그는 두고,
+/// 문자열)도 같은 모양이므로, 백업 Task가 끝나지 않은 `pending` 백업의 태그는 둔다. Orbivisor 밖에서 만든 태그는 두고,
 /// 스토리지 명령이 느려도 실행기 시작을 막지 않게 뒤에서 돈다.
 ///
 /// 노드 로컬 풀의 볼륨은 그 볼륨을 만든 노드가 맡는다. 공유 풀(RBD)의 볼륨은 어느 노드에서나
@@ -606,7 +606,7 @@ fn start(
             let _ = previous.await;
         }
         if interrupted && task.spec.op != TaskOp::NodeUpgrade {
-            let error = "interrupted: opld restarted while the task was running".to_string();
+            let error = "interrupted: orbivisord restarted while the task was running".to_string();
             fail(&ctx, &task, error, true).await;
         } else {
             execute(&ctx, task, interrupted).await;

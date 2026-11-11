@@ -431,7 +431,7 @@ pub struct UpdatesSection {
         deserialize_with = "deserialize_duration"
     )]
     pub first_check: Duration,
-    /// opLite APT 저장소 주소. 비면 빌드 값(`OPL_APT_URL`), 그것도 비면 소스 파일을 쓰지 않는다.
+    /// Orbivisor APT 저장소 주소. 비면 빌드 값(`OPL_APT_URL`), 그것도 비면 소스 파일을 쓰지 않는다.
     #[serde(default)]
     pub apt_url: String,
     /// opld가 관리하는 deb822 소스 파일
@@ -672,6 +672,7 @@ fn default_first_check() -> Duration {
     Duration::from_secs(60)
 }
 fn default_sources_file() -> PathBuf {
+    // 이미 쓴 소스 파일을 이어 관리하도록 제품 이름이 바뀌어도 그대로 둔다.
     "/etc/apt/sources.list.d/oplite.sources".into()
 }
 fn default_apt_get() -> PathBuf {
@@ -1290,13 +1291,13 @@ mod tests {
 
         let c = parse(
             "name = \"n\"\naddress = \"h\"\n[updates]\nenabled = true\ncheck_interval = \"6h\"\n\
-             first_check = \"1s\"\napt_url = \"https://apt.example.com/oplite\"\n\
+             first_check = \"1s\"\napt_url = \"https://apt.example.com/orbivisor\"\n\
              sources_file = \"/tmp/x.sources\"\napt_get = \"/opt/apt-get\"\npoll = \"1m30s\"",
         );
         let config = c.updates.updates_config().unwrap();
         assert_eq!(config.check_interval, Duration::from_secs(6 * 3600));
         assert_eq!(config.first_check, Duration::from_secs(1));
-        assert_eq!(config.apt_url, "https://apt.example.com/oplite");
+        assert_eq!(config.apt_url, "https://apt.example.com/orbivisor");
         assert_eq!(config.sources_file, Path::new("/tmp/x.sources"));
         assert_eq!(
             config.auth_file,
