@@ -59,6 +59,7 @@ async-trait.workspace = true
 axum.workspace = true
 clap.workspace = true
 hex.workspace = true
+libc.workspace = true
 openraft.workspace = true
 opl-api.workspace = true
 opl-cluster.workspace = true
