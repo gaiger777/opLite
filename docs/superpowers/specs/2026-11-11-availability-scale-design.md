@@ -22,7 +22,7 @@
 | 계획 | 내용 |
 |---|---|
 | 45 | 런타임 격리와 systemd watchdog: HA·Raft·API·작업을 서로 굶기지 않게 실행기를 나누고, Raft 저장소의 동기 쓰기를 비동기 작업자에서 빼고, `Type=notify`와 `WatchdogSec` |
-| 46 | 헬스 체크·API 이름·내장 VIP: `GET /api/v1/health`, 클러스터 설정의 추가 인증서 이름(VIP·DNS), 선택 기능 내장 VIP, README의 HAProxy·keepalived 예 |
+| 46 | 헬스 체크·API 이름·내장 VIP·앞단 프록시: `GET /api/v1/health`, 클러스터 설정의 추가 인증서 이름(VIP·DNS), 선택 기능 내장 VIP, 세션 공유·믿는 프록시·허용 출처·UI 따로 내보내기(쿠버네티스 포털), README의 HAProxy·keepalived·쿠버네티스 예 |
 | 47 | 대규모 1 — 리더 짐 덜기: 투표 멤버 상한(기본 5)과 자동 승격·강등, 장애 영역(`zone`), 리스 갱신의 리더 확인 묶기, 노드 감시를 리스로 바꿈, 모으기 동시성 상한, 규모 시험 틀 |
 | 48 | 대규모 2 — 관찰 노드: 투표·learner가 아닌 노드는 Raft 밖에서 투표 멤버 하나로부터 상태를 스트림으로 받음(리더가 수백 노드에 복제하지 않음) |
 | 49 | 클러스터 통신 다중 링크: 노드마다 주소 여러 개, 끊기면 다음 링크, 인증서 이름 |
@@ -176,9 +176,17 @@
   - 리스를 잃으면 즉시 `ip addr del`한다. 리스가 끝나기 전에 스스로 내려놓으므로 두 노드가 같은 VIP를 갖는 시간이 없다. 리스 만료는 리더 시계로 판단한다.
   - 리더가 바뀌어도 VIP 리스가 살아 있으면 옮기지 않는다(불필요한 이동 없음).
   - macOS는 지원하지 않는다.
+- **앞단 프록시·바깥 포털(사용자 요청 2026-11-11: 웹 포털을 쿠버네티스 pod로 올리고 HAProxy로 API를 부름):**
+  - 지금 제약: 웹은 같은 출처의 `/api/v1`을 부르고, 쿠키 인증 요청은 `Origin`의 호스트가 `Host`와 같아야 한다. 로그인 세션은 그 노드의 메모리에만 있다(API 토큰은 Raft에 있어 모든 노드에서 됨). 감사 기록의 요청 주소는 프록시 주소가 된다.
+  - **세션 공유:** 로그인 세션을 Raft(`Session` 리소스, 만료와 함께)에 두어 어느 노드로 가도 이어진다. 프록시의 고정 연결(sticky)이 필요 없어지고 노드가 죽어도 다시 로그인하지 않는다. 쓰기 부담을 줄이려고 만들기·지우기만 Raft에 쓰고 마지막 사용 시각은 노드 메모리에서 묶어 가끔 쓴다.
+  - **믿는 프록시:** 설정 `[api] trusted_proxies = ["10.0.0.0/8", …]`. 그 주소에서 온 요청만 `X-Forwarded-For`(감사·로그인 제한의 요청 주소)와 `X-Forwarded-Host`·`X-Forwarded-Proto`(같은 출처 검사, OIDC 콜백 주소)를 믿는다.
+  - **허용 출처:** 클러스터 설정 `web_origins: ["https://portal.example.com"]`. 포털이 API와 다른 호스트일 때 그 출처의 쿠키 요청을 받는다(CORS 응답, `SameSite=None; Secure` 쿠키). 기본은 비어 있어 지금처럼 같은 출처만.
+  - **UI 따로 내보내기:** 릴리스마다 웹 정적 파일 묶음(`orbivisor-web-<v>.tar.gz`)과 nginx 컨테이너 예(`packaging/portal/`)를 만든다. 노드의 내장 UI는 설정 `[web] enabled = false`로 끌 수 있다.
+  - **CA 내보내기:** `orbivisorctl cluster ca`가 클러스터 CA 인증서(PEM)를 찍는다(프록시가 노드 인증서를 검증할 때 씀).
 - **README:**
   - HAProxy(TLS 다시 암호화, `option httpchk GET /api/v1/health`, WebSocket 시간 제한)와 keepalived(헬스 체크 스크립트) 예
-  - `api_names` 설정
+  - 쿠버네티스에 포털(nginx)과 HAProxy를 두고 같은 호스트 이름의 `/`는 포털, `/api/`는 노드로 보내는 예
+  - `api_names`, `trusted_proxies`, `web_origins` 설정
   - 내장 VIP
 
 ## 5. 설계 — 계획 47 대규모 1: 리더 짐 덜기
