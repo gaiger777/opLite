@@ -13,8 +13,8 @@ pub mod storage;
 pub use error::DriverError;
 pub use firewall::{Firewall, FirewallNic, Nft, ruleset};
 pub use hypervisor::{
-    ActualState, BackupTarget, BitmapInfo, DiskBitmaps, EventKind, Hypervisor, HypervisorEvent,
-    RuntimeStatus, StopMode,
+    ActualState, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind, Hypervisor,
+    HypervisorEvent, RuntimeStatus, StopMode,
 };
 pub use migration::{
     IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,

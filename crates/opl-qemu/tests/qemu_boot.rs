@@ -177,3 +177,58 @@ async fn snapshot_jobs_and_block_resize() {
         .unwrap();
     assert!(exit.success(), "qemu exited with {exit}");
 }
+
+/// `disk0` 장치(qdev `disk0-dev`)의 blockstats
+async fn disk0_stats(qmp: &QmpClient) -> opl_qemu::BlockStats {
+    let stats = qmp.query_blockstats().await.unwrap();
+    stats
+        .iter()
+        .find(|s| {
+            s.qdev
+                .as_deref()
+                .is_some_and(|q| q.starts_with("/machine/peripheral/disk0-dev"))
+        })
+        .unwrap_or_else(|| panic!("no disk0-dev in {stats:?}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn blockstats_count_writes_to_the_disk() {
+    let host = host();
+    let (_tmp, mut child, paths) = launch(&host).await;
+    let qmp = QmpClient::connect(&paths.qmp_socket).await.unwrap();
+    qmp.cont().await.unwrap();
+
+    let before = disk0_stats(&qmp).await;
+    // -blockdev로 붙인 디스크는 device 이름이 없고 맨 위 노드가 disk0이다.
+    assert_eq!(before.device, "");
+    assert_eq!(before.node_name.as_deref(), Some("disk0"));
+
+    // 게스트 대신 장치의 블록 백엔드에 직접 쓴다. qemu-io의 aio_write는 장치처럼 I/O를 센다.
+    // virtio-blk-pci는 백엔드가 자식 장치 virtio-backend에 있어 그 qdev 경로를 준다.
+    for io in ["aio_write -q 0 64k", "aio_flush"] {
+        let cmd = format!(r#"qemu-io -d /machine/peripheral/disk0-dev/virtio-backend "{io}""#);
+        let out = qmp
+            .execute(
+                "human-monitor-command",
+                Some(serde_json::json!({ "command-line": cmd })),
+            )
+            .await
+            .unwrap();
+        // HMP 오류는 QMP 오류가 아닌 출력 문자열로 온다.
+        assert_eq!(out, "", "{cmd}");
+    }
+    let after = disk0_stats(&qmp).await;
+    assert!(
+        after.wr_bytes >= before.wr_bytes + 65536,
+        "{before:?} -> {after:?}"
+    );
+    assert!(after.wr_operations > before.wr_operations, "{after:?}");
+
+    qmp.quit().await.unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("qemu did not exit within 10s")
+        .unwrap();
+    assert!(exit.success(), "qemu exited with {exit}");
+}

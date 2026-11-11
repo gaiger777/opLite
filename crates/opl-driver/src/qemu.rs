@@ -23,8 +23,8 @@ use uuid::Uuid;
 
 use crate::error::DriverError;
 use crate::hypervisor::{
-    ActualState, BackupTarget, DiskBitmaps, EventKind, Hypervisor, HypervisorEvent, RuntimeStatus,
-    StopMode,
+    ActualState, BackupTarget, DiskBitmaps, DiskCounters, EventKind, Hypervisor, HypervisorEvent,
+    RuntimeStatus, StopMode,
 };
 use crate::migration::{
     IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
@@ -966,6 +966,22 @@ impl Hypervisor for QemuHypervisor {
         flatten(r, "QMP query-version")
     }
 
+    async fn disk_stats(&self, id: Uuid) -> Result<DiskCounters, DriverError> {
+        let handle = self.running_handle(id)?;
+        let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_blockstats()).await;
+        let stats = flatten(r, "QMP query-blockstats")?;
+        // 디스크는 장치 id `disk{i}-dev`로 고른다. 맨 위 노드는 블록 작업 중 필터 노드로 바뀐다.
+        Ok(stats
+            .iter()
+            .filter(|s| s.qdev.as_deref().and_then(disk_device_index).is_some())
+            .fold(DiskCounters::default(), |sum, s| DiskCounters {
+                rd_bytes: sum.rd_bytes + s.rd_bytes,
+                wr_bytes: sum.wr_bytes + s.wr_bytes,
+                rd_operations: sum.rd_operations + s.rd_operations,
+                wr_operations: sum.wr_operations + s.wr_operations,
+            }))
+    }
+
     async fn start_incoming(
         &self,
         vm: &VmRuntimeSpec,
@@ -1508,6 +1524,15 @@ fn disk_nodes(nodes: &serde_json::Value) -> Vec<String> {
 /// 이름이 `disk{i}`이면 i
 fn disk_index(name: &str) -> Option<usize> {
     name.strip_prefix("disk")?.parse().ok()
+}
+
+/// qdev 경로(`/machine/peripheral/disk{i}-dev`, virtio는 그 아래 `/virtio-backend`)가 디스크 장치면 i
+fn disk_device_index(qdev: &str) -> Option<usize> {
+    let id = qdev
+        .strip_prefix("/machine/peripheral/")?
+        .split('/')
+        .next()?;
+    disk_index(id.strip_suffix("-dev")?)
 }
 
 /// 실행 중인 VM의 디스크 노드(`disk{i}`)를 그 비트맵과 함께 i 순서로 읽는다.
@@ -2250,6 +2275,22 @@ time.sleep(60)
                             nodes.as_array_mut().unwrap().push(node);
                         }
                         nodes
+                    }
+                    // 같은 VM의 블록 백엔드: pflash, virtio 디스크, 미러 중이라 맨 위가 필터 노드인
+                    // SATA 디스크
+                    "query-blockstats" => {
+                        let stats = |rd: u64, wr: u64, rd_ops: u64, wr_ops: u64| {
+                            serde_json::json!({ "rd_bytes": rd, "wr_bytes": wr,
+                                "rd_operations": rd_ops, "wr_operations": wr_ops })
+                        };
+                        serde_json::json!([
+                            { "device": "pflash0", "node-name": "#block101",
+                              "stats": stats(1000, 1000, 10, 10) },
+                            { "device": "", "qdev": "/machine/peripheral/disk0-dev/virtio-backend",
+                              "node-name": "disk0", "stats": stats(4096, 1024, 3, 2) },
+                            { "device": "", "qdev": "/machine/peripheral/disk1-dev",
+                              "node-name": "#block202", "stats": stats(100, 200, 1, 4) },
+                        ])
                     }
                     "query-jobs" => job_replies
                         .lock()
@@ -3348,6 +3389,47 @@ time.sleep(60)
             .zip(arguments)
             .filter(|(c, _)| names.contains(&c.as_str()))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn disk_stats_sum_only_the_vm_disks() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+
+        // pflash는 빼고 qdev가 `disk{i}-dev`인 백엔드만 합한다(맨 위 노드 이름과 상관없이).
+        assert_eq!(
+            hv.disk_stats(id).await.unwrap(),
+            DiskCounters {
+                rd_bytes: 4196,
+                wr_bytes: 1224,
+                rd_operations: 4,
+                wr_operations: 6,
+            }
+        );
+        assert_eq!(sent(&fake, &["query-blockstats"]).len(), 1);
+        assert!(matches!(
+            hv.disk_stats(Uuid::now_v7()).await,
+            Err(DriverError::NotRunning(_))
+        ));
+
+        fake.failing.lock().unwrap().push("query-blockstats");
+        assert!(matches!(
+            hv.disk_stats(id).await,
+            Err(DriverError::Qmp(QmpError::Command { .. }))
+        ));
+    }
+
+    #[test]
+    fn disk_device_index_reads_the_qdev_id() {
+        for (qdev, want) in [
+            ("/machine/peripheral/disk0-dev/virtio-backend", Some(0)),
+            ("/machine/peripheral/disk12-dev", Some(12)),
+            ("/machine/peripheral/nic0", None),
+            ("/machine/peripheral/disk0", None),
+            ("/machine/system.flash0", None),
+        ] {
+            assert_eq!(disk_device_index(qdev), want, "{qdev}");
+        }
     }
 
     #[tokio::test]

@@ -72,6 +72,16 @@ pub struct BackupTarget {
     pub size: u64,
 }
 
+/// 실행 중인 VM의 모든 디스크(`disk{i}`)를 합한 I/O 누적 카운터(게스트가 본 것, QMP `query-blockstats`).
+/// QEMU를 다시 켜면 0부터 다시 센다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskCounters {
+    pub rd_bytes: u64,
+    pub wr_bytes: u64,
+    pub rd_operations: u64,
+    pub wr_operations: u64,
+}
+
 /// VM 프로세스 수명을 관리한다. 같은 VM에 대한 호출을 직렬화하는 것은 호출자(reconciler)의 책임이다.
 #[async_trait]
 pub trait Hypervisor: Send + Sync {
@@ -167,6 +177,10 @@ pub trait Hypervisor: Send + Sync {
     /// 실행 중인 VM의 QEMU 버전(`major.minor.micro`, QMP `query-version`). 바이너리를 바꾼 뒤에도
     /// 이미 떠 있는 QEMU의 버전이다.
     async fn running_qemu_version(&self, id: Uuid) -> Result<String, DriverError>;
+
+    /// 실행 중인 VM의 모든 디스크(`disk{i}`)를 합한 I/O 누적 카운터. 지표 측정기가 직전 값과의
+    /// 차이로 비율을 낸다.
+    async fn disk_stats(&self, id: Uuid) -> Result<DiskCounters, DriverError>;
 
     /// 라이브 마이그레이션을 받을 QEMU를 `-incoming defer`로 띄우고, 받는 중 표시(마이그레이션 Task
     /// `task`)를 남기고, TLS

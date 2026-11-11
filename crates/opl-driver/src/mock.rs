@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::error::DriverError;
 use crate::hypervisor::{
-    ActualState, BackupTarget, BitmapInfo, DiskBitmaps, EventKind, Hypervisor, HypervisorEvent,
-    RuntimeStatus, StopMode,
+    ActualState, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind, Hypervisor,
+    HypervisorEvent, RuntimeStatus, StopMode,
 };
 use crate::migration::{
     IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress, MirrorTarget,
@@ -135,6 +135,8 @@ struct MockState {
     hold_next_incoming_wait: bool,
     /// 다음 `cancel_migration`들을 차례로 실패시킬 오류
     fail_next_cancel: VecDeque<DriverError>,
+    /// `set_disk_stats`로 정한 VM별 디스크 카운터. VM이 꺼지면 사라진다(다시 켜면 0).
+    disk_stats: HashMap<Uuid, DiskCounters>,
 }
 
 impl Default for MockHypervisor {
@@ -248,6 +250,11 @@ impl MockHypervisor {
     pub fn snapshots(&self, id: Uuid) -> Vec<(String, bool)> {
         let st = self.state.lock().unwrap();
         st.snapshots.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// 실행 중인 VM의 `disk_stats`가 돌려줄 카운터를 정한다(정하지 않으면 0).
+    pub fn set_disk_stats(&self, id: Uuid, counters: DiskCounters) {
+        self.state.lock().unwrap().disk_stats.insert(id, counters);
     }
 
     /// `block_resize`로 마지막에 바꾼 크기
@@ -533,6 +540,7 @@ impl MockHypervisor {
         st.outgoing.remove(&id);
         st.exports.remove(&id);
         st.mirroring.remove(&id);
+        st.disk_stats.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -858,6 +866,12 @@ impl Hypervisor for MockHypervisor {
         Ok(Self::version(&st))
     }
 
+    async fn disk_stats(&self, id: Uuid) -> Result<DiskCounters, DriverError> {
+        let st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        Ok(st.disk_stats.get(&id).copied().unwrap_or_default())
+    }
+
     /// 범위의 첫 포트(내보낼 디스크가 있으면 NBD에 그다음 포트)를 돌려준다. `fail_next_start`로 주입한
     /// 오류로 실패할 수 있다.
     async fn start_incoming(
@@ -1161,6 +1175,38 @@ mod tests {
             hv.console_endpoint(vm.id).await,
             Err(DriverError::NotRunning(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn disk_stats_return_counters_set_by_the_test() {
+        let hv = MockHypervisor::default();
+        let vm = spec();
+        assert!(matches!(
+            hv.disk_stats(vm.id).await,
+            Err(DriverError::NotRunning(_))
+        ));
+        hv.start(&vm, None).await.unwrap();
+        assert_eq!(hv.disk_stats(vm.id).await.unwrap(), DiskCounters::default());
+
+        let counters = DiskCounters {
+            rd_bytes: 4096,
+            wr_bytes: 512,
+            rd_operations: 2,
+            wr_operations: 1,
+        };
+        hv.set_disk_stats(vm.id, counters);
+        assert_eq!(hv.disk_stats(vm.id).await.unwrap(), counters);
+        hv.set_unresponsive(vm.id, true);
+        assert!(matches!(
+            hv.disk_stats(vm.id).await,
+            Err(DriverError::NotAttached(_))
+        ));
+        hv.set_unresponsive(vm.id, false);
+
+        // 실제 QEMU처럼 다시 켜면 0부터 센다.
+        hv.stop(vm.id, StopMode::Force).await.unwrap();
+        hv.start(&vm, None).await.unwrap();
+        assert_eq!(hv.disk_stats(vm.id).await.unwrap(), DiskCounters::default());
     }
 
     #[tokio::test]

@@ -204,6 +204,41 @@ impl BlockNode {
     }
 }
 
+/// `query-blockstats`의 블록 백엔드 하나와 게스트가 본 I/O 누적 카운터. QEMU를 다시 켜면 0부터다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockStats {
+    /// 백엔드 이름(`-drive`의 이름). `-blockdev`로 붙인 디스크는 빈 문자열이다.
+    pub device: String,
+    /// 붙은 장치의 qdev 경로(`/machine/peripheral/disk0-dev/virtio-backend`). 없으면 None
+    pub qdev: Option<String>,
+    /// 백엔드에 붙은 맨 위 블록 노드(`disk{i}`. 블록 작업 중에는 필터 노드일 수 있다)
+    pub node_name: Option<String>,
+    pub rd_bytes: u64,
+    pub wr_bytes: u64,
+    pub rd_operations: u64,
+    pub wr_operations: u64,
+}
+
+impl BlockStats {
+    fn parse(v: &Value) -> Result<Self, QmpError> {
+        let text = |k: &str| v[k].as_str().map(str::to_string);
+        let count = |k: &str| {
+            v["stats"][k]
+                .as_u64()
+                .ok_or_else(|| QmpError::Protocol(format!("blockstats without {k}: {v}")))
+        };
+        Ok(Self {
+            device: text("device").unwrap_or_default(),
+            qdev: text("qdev"),
+            node_name: text("node-name"),
+            rd_bytes: count("rd_bytes")?,
+            wr_bytes: count("wr_bytes")?,
+            rd_operations: count("rd_operations")?,
+            wr_operations: count("wr_operations")?,
+        })
+    }
+}
+
 /// `transaction` 안의 동작 하나. 모두 한 시점에 일어난다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionAction {
@@ -517,6 +552,16 @@ impl QmpClient {
             .ok_or_else(|| QmpError::Protocol(format!("query-named-block-nodes: {ret}")))?
             .iter()
             .map(BlockNode::parse)
+            .collect()
+    }
+
+    /// 블록 백엔드마다의 I/O 카운터(`query-blockstats`, 아래 노드는 펼치지 않음)
+    pub async fn query_blockstats(&self) -> Result<Vec<BlockStats>, QmpError> {
+        let ret = self.execute("query-blockstats", None).await?;
+        ret.as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("query-blockstats: {ret}")))?
+            .iter()
+            .map(BlockStats::parse)
             .collect()
     }
 
@@ -2059,6 +2104,62 @@ mod tests {
             reply(&mut fake, json!([{ "node-name": "disk0" }]))
         );
         assert!(matches!(nodes, Err(QmpError::Protocol(_))), "{nodes:?}");
+    }
+
+    /// QEMU 8.2·11의 `query-blockstats` 모양: `-blockdev`로 붙인 디스크는 `device`가 비고 `qdev`가
+    /// 장치 경로다. `-drive`로 붙인 pflash는 `device` 이름만 있고 `qdev`가 없다.
+    #[tokio::test]
+    async fn blockstats_read_counters_of_each_backend() {
+        let (client, mut fake, _dir) = setup().await;
+        let stats = |rd: u64, wr: u64, rd_ops: u64, wr_ops: u64| {
+            json!({ "rd_bytes": rd, "wr_bytes": wr, "rd_operations": rd_ops,
+                    "wr_operations": wr_ops, "flush_operations": 0, "idle_time_ns": 1,
+                    "rd_merged": 0, "wr_merged": 0, "account_invalid": true })
+        };
+        let ret = json!([
+            { "device": "pflash0", "node-name": "#block123", "stats": stats(1, 0, 1, 0) },
+            { "device": "", "qdev": "/machine/peripheral/disk0-dev/virtio-backend",
+              "node-name": "disk0", "stats": stats(4096, 512, 8, 1),
+              "parent": { "node-name": "disk0-file", "stats": stats(0, 0, 0, 0) } },
+            { "device": "", "qdev": "/machine/peripheral/disk1-dev", "stats": stats(2, 3, 4, 5) }
+        ]);
+        let (got, cmd) = tokio::join!(client.query_blockstats(), reply(&mut fake, ret));
+        assert_eq!(cmd["execute"], "query-blockstats");
+        let entry =
+            |device: &str, qdev: Option<&str>, node: Option<&str>, c: [u64; 4]| BlockStats {
+                device: device.into(),
+                qdev: qdev.map(Into::into),
+                node_name: node.map(Into::into),
+                rd_bytes: c[0],
+                wr_bytes: c[1],
+                rd_operations: c[2],
+                wr_operations: c[3],
+            };
+        assert_eq!(
+            got.unwrap(),
+            [
+                entry("pflash0", None, Some("#block123"), [1, 0, 1, 0]),
+                entry(
+                    "",
+                    Some("/machine/peripheral/disk0-dev/virtio-backend"),
+                    Some("disk0"),
+                    [4096, 512, 8, 1]
+                ),
+                entry(
+                    "",
+                    Some("/machine/peripheral/disk1-dev"),
+                    None,
+                    [2, 3, 4, 5]
+                ),
+            ]
+        );
+
+        // 카운터가 없으면 프로토콜 오류다.
+        let (got, _) = tokio::join!(
+            client.query_blockstats(),
+            reply(&mut fake, json!([{ "device": "", "stats": {} }]))
+        );
+        assert!(matches!(got, Err(QmpError::Protocol(_))), "{got:?}");
     }
 
     #[tokio::test]
