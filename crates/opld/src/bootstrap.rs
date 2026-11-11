@@ -488,7 +488,8 @@ pub(crate) mod tests {
                 "node-drain",
                 "incremental-backup",
                 "incremental-replication",
-                "storage-migration"
+                "storage-migration",
+                "metrics"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -506,7 +507,8 @@ pub(crate) mod tests {
                 "node-drain",
                 "incremental-backup",
                 "incremental-replication",
-                "storage-migration"
+                "storage-migration",
+                "metrics"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -540,7 +542,8 @@ pub(crate) mod tests {
                 "node-drain",
                 "incremental-backup",
                 "incremental-replication",
-                "storage-migration"
+                "storage-migration",
+                "metrics"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -612,6 +615,7 @@ pub(crate) mod tests {
                     "incremental-backup".into(),
                     "incremental-replication".into(),
                     "storage-migration".into(),
+                    "metrics".into(),
                 ],
                 ..NodeStatus::default()
             }

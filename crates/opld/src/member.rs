@@ -1,5 +1,5 @@
 //! 클러스터 멤버로 도는 노드: 노드 간 서버, 클러스터 저장소, reconciler, Task 실행기, HTTPS API,
-//! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태, VXLAN 장치, VM 방화벽, APT
+//! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태, 사용량 지표, VXLAN 장치, VM 방화벽, APT
 //! 업데이트. 위트니스는 노드 간 서버와 클러스터 저장소, 승격, Node 등록만 띄운다.
 
 use std::collections::BTreeMap;
@@ -38,6 +38,9 @@ use crate::bootstrap;
 use crate::config::Config;
 use crate::firewall::{FirewallAgent, FirewallRules};
 use crate::host::Host;
+use crate::metrics::host as metrics_host;
+use crate::metrics::sampler::MetricsSampler;
+use crate::metrics::store::MetricsStore;
 use crate::overlay::{OverlayAgent, cluster_tag};
 use crate::pools::PoolMounter;
 
@@ -124,6 +127,8 @@ struct Services {
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
     recovery: HaManager,
     pools: PoolMounter,
+    /// 이 노드와 그 VM의 사용량 지표를 잰다.
+    metrics: MetricsSampler,
     /// VXLAN 네트워크의 장치를 맞춘다(호스트 네트워크가 없으면 없다).
     overlay: Option<OverlayAgent>,
     /// VM 방화벽 규칙을 맞춘다(방화벽이 없으면 없다).
@@ -159,6 +164,7 @@ impl Services {
         self.remotes.shutdown().await;
         self.recovery.shutdown().await;
         self.pools.shutdown().await;
+        self.metrics.shutdown().await;
         if let Some(updates) = self.updates {
             updates.shutdown().await;
         }
@@ -443,6 +449,14 @@ impl Member {
             qemu_binary,
             config.pools.refresh(),
         );
+        // 지표는 메모리에만 둔다(Raft에 쓰지 않는다).
+        let metrics = MetricsSampler::spawn(
+            hv.clone(),
+            metrics_host::native(),
+            cluster.clone(),
+            config.data_dir.clone(),
+            Arc::new(MetricsStore::default()),
+        );
         // Task 실행기는 시작할 때 이 노드가 남긴 고아를 지운다. 그것이 끝난 뒤에 API를 연다.
         let mut runner_config = TaskRunnerConfig::new(node);
         runner_config.upload_dir = Some(config.data_dir.join("uploads"));
@@ -528,6 +542,7 @@ impl Member {
                 audit,
                 recovery,
                 pools,
+                metrics,
                 overlay,
                 firewall,
                 ha,

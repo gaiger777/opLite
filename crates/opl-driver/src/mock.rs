@@ -137,6 +137,12 @@ struct MockState {
     fail_next_cancel: VecDeque<DriverError>,
     /// `set_disk_stats`로 정한 VM별 디스크 카운터. VM이 꺼지면 사라진다(다시 켜면 0).
     disk_stats: HashMap<Uuid, DiskCounters>,
+    /// `disk_stats`가 시간 초과로 실패하는 VM. VM이 꺼지면 사라진다.
+    failing_disk_stats: HashSet<Uuid>,
+    /// `list`가 이만큼 기다린 뒤에 답한다.
+    list_delay: Option<Duration>,
+    /// `disk_stats`가 이만큼 기다린 뒤에 답한다.
+    disk_stats_delay: Option<Duration>,
 }
 
 impl Default for MockHypervisor {
@@ -255,6 +261,27 @@ impl MockHypervisor {
     /// 실행 중인 VM의 `disk_stats`가 돌려줄 카운터를 정한다(정하지 않으면 0).
     pub fn set_disk_stats(&self, id: Uuid, counters: DiskCounters) {
         self.state.lock().unwrap().disk_stats.insert(id, counters);
+    }
+
+    /// 실행 중인 VM의 `disk_stats`만 시간 초과로 실패하게 하거나(true) 되돌린다(false). 다른 메서드와
+    /// `list()`의 상태는 그대로다(QMP가 `query-blockstats`에만 늦게 답한 것처럼).
+    pub fn fail_disk_stats(&self, id: Uuid, fail: bool) {
+        let mut st = self.state.lock().unwrap();
+        if fail {
+            st.failing_disk_stats.insert(id);
+        } else {
+            st.failing_disk_stats.remove(&id);
+        }
+    }
+
+    /// 이후 `list`가 이만큼 기다린 뒤에 답한다(응답 없는 VM 때문에 조회가 늦은 것처럼).
+    pub fn delay_lists(&self, delay: Duration) {
+        self.state.lock().unwrap().list_delay = Some(delay);
+    }
+
+    /// 이후 `disk_stats`가 이만큼 기다린 뒤에 답한다(QMP가 늦게 답한 것처럼).
+    pub fn delay_disk_stats(&self, delay: Duration) {
+        self.state.lock().unwrap().disk_stats_delay = Some(delay);
     }
 
     /// `block_resize`로 마지막에 바꾼 크기
@@ -541,6 +568,7 @@ impl MockHypervisor {
         st.exports.remove(&id);
         st.mirroring.remove(&id);
         st.disk_stats.remove(&id);
+        st.failing_disk_stats.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -647,6 +675,10 @@ impl Hypervisor for MockHypervisor {
     }
 
     async fn list(&self) -> Result<Vec<ActualState>, DriverError> {
+        let delay = self.state.lock().unwrap().list_delay;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let st = self.state.lock().unwrap();
         Ok(st
             .vms
@@ -867,8 +899,15 @@ impl Hypervisor for MockHypervisor {
     }
 
     async fn disk_stats(&self, id: Uuid) -> Result<DiskCounters, DriverError> {
+        let delay = self.state.lock().unwrap().disk_stats_delay;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
+        if st.failing_disk_stats.contains(&id) {
+            return Err(DriverError::Timeout("query-blockstats"));
+        }
         Ok(st.disk_stats.get(&id).copied().unwrap_or_default())
     }
 
@@ -1202,8 +1241,17 @@ mod tests {
             Err(DriverError::NotAttached(_))
         ));
         hv.set_unresponsive(vm.id, false);
+        hv.fail_disk_stats(vm.id, true);
+        assert!(matches!(
+            hv.disk_stats(vm.id).await,
+            Err(DriverError::Timeout(_))
+        ));
+        assert_eq!(hv.list().await.unwrap()[0].status, RuntimeStatus::Running);
+        hv.fail_disk_stats(vm.id, false);
+        assert_eq!(hv.disk_stats(vm.id).await.unwrap(), counters);
+        hv.fail_disk_stats(vm.id, true);
 
-        // 실제 QEMU처럼 다시 켜면 0부터 센다.
+        // 실제 QEMU처럼 다시 켜면 0부터 센다(실패시킨 것도 지워진다).
         hv.stop(vm.id, StopMode::Force).await.unwrap();
         hv.start(&vm, None).await.unwrap();
         assert_eq!(hv.disk_stats(vm.id).await.unwrap(), DiskCounters::default());

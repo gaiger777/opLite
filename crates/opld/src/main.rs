@@ -18,8 +18,6 @@ mod firewall;
 mod host;
 mod join;
 mod member;
-// 3단계에서 측정기가 부를 때까지는 시험에서만 컴파일한다(바이너리 크레이트라 pub이어도 쓰지 않으면 dead_code다).
-#[cfg(test)]
 mod metrics;
 mod overlay;
 mod pools;

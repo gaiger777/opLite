@@ -1668,6 +1668,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "futures-util",
  "hex",
  "libc",
  "openraft",
