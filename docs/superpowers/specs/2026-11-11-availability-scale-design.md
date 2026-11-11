@@ -183,6 +183,11 @@
   - **허용 출처:** 클러스터 설정 `web_origins: ["https://portal.example.com"]`. 포털이 API와 다른 호스트일 때 그 출처의 쿠키 요청을 받는다(CORS 응답, `SameSite=None; Secure` 쿠키). 기본은 비어 있어 지금처럼 같은 출처만.
   - **UI 따로 내보내기:** 릴리스마다 웹 정적 파일 묶음(`orbivisor-web-<v>.tar.gz`)과 nginx 컨테이너 예(`packaging/portal/`)를 만든다. 노드의 내장 UI는 설정 `[web] enabled = false`로 끌 수 있다.
   - **CA 내보내기:** `orbivisorctl cluster ca`가 클러스터 CA 인증서(PEM)를 찍는다(프록시가 노드 인증서를 검증할 때 씀).
+  - **API 노드(사용자 질문 2026-11-11: 30대 이상이면 HAProxy가 어느 노드를 불러야 하나):**
+    - 모든 노드가 API를 갖고, 읽기는 받은 노드의 복제본에서, 쓰기는 리더로 전달된다(`Cluster::write`의 forwarder). 그래서 앞단은 노드 몇 대만 부르면 된다.
+    - 노드 스펙 `roles: [api]`(기본: 투표 멤버면 api)로 앞단이 부를 "API 노드"를 정한다. 권장 3~5대, 장애 영역(`zone`)마다 고르게, 관찰 노드(계획 48)·위트니스는 뺀다(관찰 노드는 상태가 한 단계 늦게 온다).
+    - `GET /api/v1/health?ready`는 유지보수(비우기) 중이거나 `api` 역할이 아닌 노드에서 503을 돌려 앞단이 저절로 뺀다. `?live`는 그대로.
+    - `GET /api/v1/cluster/api-endpoints`(인증 필요)와 `orbivisorctl cluster api-endpoints [-o haproxy]`가 API 노드 목록(주소·이름·zone)과 HAProxy `server` 줄을 찍는다. 노드를 더하거나 빼면 다시 만들거나 HAProxy 런타임 API·DNS(`server-template`)로 바꾼다.
 - **README:**
   - HAProxy(TLS 다시 암호화, `option httpchk GET /api/v1/health`, WebSocket 시간 제한)와 keepalived(헬스 체크 스크립트) 예
   - 쿠버네티스에 포털(nginx)과 HAProxy를 두고 같은 호스트 이름의 `/`는 포털, `/api/`는 노드로 보내는 예
