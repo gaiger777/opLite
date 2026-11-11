@@ -1,0 +1,33 @@
+#!/bin/sh
+# oplite postinst. 처음 설치면 opld를 켜고 시작하고, 업그레이드·재설정(abort-remove 등 포함)이면
+# enable돼 있을 때 다시 시작한다(debhelper와 같다).
+# systemd가 돌지 않으면(컨테이너, 설치 프로그램의 chroot) enable(링크 만들기)만 한다.
+set -eu
+
+# 시험(packaging/tests/maint-test.sh)이 바꿀 수 있게 환경 변수로 둔다.
+SYSTEMD_DIR="${OPL_SYSTEMD_DIR:-/run/systemd/system}"
+
+case "$1" in
+configure | abort-remove | abort-deconfigure)
+	# configure의 $2: 이전에 설정한 버전. 비었으면 처음 설치다.
+	first=no
+	if [ "$1" = configure ] && [ -z "${2:-}" ]; then
+		first=yes
+	fi
+	if [ -d "$SYSTEMD_DIR" ]; then
+		systemctl daemon-reload || true
+		if [ "$first" = yes ]; then
+			systemctl enable opld.service || true
+			# 설정(/etc/opl/opld.toml)이 없으면 유닛 조건이 시작을 건너뛴다.
+			systemctl start opld.service || true
+		elif systemctl is-enabled --quiet opld.service; then
+			# VM의 QEMU는 자기 scope에 있어 opld를 다시 시작해도 계속 돈다.
+			systemctl restart opld.service || true
+		fi
+	elif [ "$first" = yes ]; then
+		systemctl enable opld.service || true
+	fi
+	;;
+esac
+
+exit 0

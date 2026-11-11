@@ -26,7 +26,7 @@ done
 case $cmd in
 packages)
 	for f in "$dir"/*.deb; do
-		printf 'Package: oplite\nFilename: %s\n\n' "$f"
+		printf 'Package: orbivisor\nFilename: %s\n\n' "$f"
 	done
 	;;
 release)
@@ -55,8 +55,8 @@ echo signed >"$out"
 EOF
 chmod 0755 "$WORK/fakebin/apt-ftparchive" "$WORK/fakebin/gpg"
 
-printf 'deb1' >"$WORK/oplite_1.0_amd64.deb"
-printf 'deb2' >"$WORK/oplite_1.1_amd64.deb"
+printf 'deb1' >"$WORK/orbivisor_1.0_amd64.deb"
+printf 'deb2' >"$WORK/orbivisor_1.1_amd64.deb"
 R="$WORK/repo"
 D="$R/dists/trixie"
 
@@ -88,12 +88,12 @@ expect_usage() {
 }
 run "$R" stable
 expect_usage "deb가 없으면 사용법"
-run "$R" unstable "$WORK/oplite_1.0_amd64.deb"
+run "$R" unstable "$WORK/orbivisor_1.0_amd64.deb"
 expect_usage "모르는 채널은 거절"
 grep -q 'stable|testing|enterprise' "$WORK/stderr" || fail "채널 거절 문구: $(cat "$WORK/stderr")"
 run "$R" stable "$WORK/missing.deb"
 expect_usage "없는 deb는 거절"
-KEY='' run "$R" stable "$WORK/oplite_1.0_amd64.deb"
+KEY='' run "$R" stable "$WORK/orbivisor_1.0_amd64.deb"
 if [ "$code" -eq 1 ] && [ ! -e "$R" ] && grep -q OPL_REPO_GPG_KEY_ID "$WORK/stderr"; then
 	ok "OPL_REPO_GPG_KEY_ID가 없으면 실패"
 else
@@ -101,8 +101,8 @@ else
 fi
 
 # 첫 채널 stable
-run "$R" stable "$WORK/oplite_1.0_amd64.deb"
-if [ "$code" -eq 0 ] && [ "$(cat "$R/pool/stable/oplite_1.0_amd64.deb")" = deb1 ] &&
+run "$R" stable "$WORK/orbivisor_1.0_amd64.deb"
+if [ "$code" -eq 0 ] && [ "$(cat "$R/pool/stable/orbivisor_1.0_amd64.deb")" = deb1 ] &&
 	[ -f "$D/stable/binary-amd64/Packages" ] && [ -f "$D/Release" ] &&
 	[ -f "$D/InRelease" ] && [ -f "$D/Release.gpg" ]; then
 	ok "stable 레이아웃"
@@ -112,12 +112,13 @@ else
 	find "$R" | sort
 fi
 # Packages의 Filename은 저장소 루트 기준(apt-ftparchive를 저장소 루트에서 돌림)
-if grep -qx 'Filename: pool/stable/oplite_1.0_amd64.deb' "$D/stable/binary-amd64/Packages" &&
+if grep -qx 'Filename: pool/stable/orbivisor_1.0_amd64.deb' "$D/stable/binary-amd64/Packages" &&
 	gunzip -c "$D/stable/binary-amd64/Packages.gz" | cmp -s - "$D/stable/binary-amd64/Packages"; then
 	ok "Packages와 Packages.gz"
 else
 	fail "Packages: $(cat "$D/stable/binary-amd64/Packages" 2>&1)"
 fi
+# Origin·Label은 일부러 opLite에 고정한다(바뀌면 설치된 노드의 apt-get update가 실패한다 — build-repo.sh).
 EXPECTED_RELEASE='Origin=opLite
 Label=opLite
 Suite=trixie
@@ -149,9 +150,9 @@ fi
 
 # 둘째 채널 testing: stable은 그대로, Release는 두 채널을 다시 묶는다.
 cp "$D/stable/binary-amd64/Packages" "$WORK/stable.Packages"
-run "$R" testing "$WORK/oplite_1.1_amd64.deb"
+run "$R" testing "$WORK/orbivisor_1.1_amd64.deb"
 if [ "$code" -eq 0 ] && cmp -s "$WORK/stable.Packages" "$D/stable/binary-amd64/Packages" &&
-	grep -qx 'Filename: pool/testing/oplite_1.1_amd64.deb' "$D/testing/binary-amd64/Packages" &&
+	grep -qx 'Filename: pool/testing/orbivisor_1.1_amd64.deb' "$D/testing/binary-amd64/Packages" &&
 	! grep -q 'pool/stable' "$D/testing/binary-amd64/Packages" &&
 	! grep -q 'packages pool/stable' "$WORK/calls"; then
 	ok "다른 채널의 Packages는 남긴다"
@@ -168,7 +169,7 @@ else
 fi
 
 # 같은 채널에 새 버전: 옛 패키지도 pool에 남고 Packages에 둘 다 있다.
-run "$R" stable "$WORK/oplite_1.1_amd64.deb"
+run "$R" stable "$WORK/orbivisor_1.1_amd64.deb"
 if [ "$code" -eq 0 ] && [ "$(grep -c '^Filename: pool/stable/' "$D/stable/binary-amd64/Packages")" -eq 2 ]; then
 	ok "같은 채널에 더하면 옛 버전도 남는다"
 else
@@ -176,7 +177,7 @@ else
 fi
 
 # enterprise도 채널이다. Components는 stable testing enterprise 순서.
-run "$R" enterprise "$WORK/oplite_1.1_amd64.deb"
+run "$R" enterprise "$WORK/orbivisor_1.1_amd64.deb"
 if [ "$code" -eq 0 ] && grep -qx 'Components=stable testing enterprise' "$D/Release" &&
 	[ "$(tail -n1 "$WORK/stdout")" = "$R" ]; then
 	ok "enterprise 채널"
@@ -186,15 +187,15 @@ fi
 
 # 같은 이름에 내용이 다른 deb는 거절하고, 같은 deb는 넘어간다.
 mkdir -p "$WORK/other"
-printf 'rebuilt' >"$WORK/other/oplite_1.0_amd64.deb"
-run "$R" stable "$WORK/other/oplite_1.0_amd64.deb"
+printf 'rebuilt' >"$WORK/other/orbivisor_1.0_amd64.deb"
+run "$R" stable "$WORK/other/orbivisor_1.0_amd64.deb"
 if [ "$code" -eq 1 ] && grep -q 'version already published: ' "$WORK/stderr" &&
-	[ "$(cat "$R/pool/stable/oplite_1.0_amd64.deb")" = deb1 ] && [ ! -s "$WORK/calls" ]; then
+	[ "$(cat "$R/pool/stable/orbivisor_1.0_amd64.deb")" = deb1 ] && [ ! -s "$WORK/calls" ]; then
 	ok "같은 이름의 다른 deb는 거절"
 else
 	fail "다시 올린 deb: 종료 코드 $code, $(cat "$WORK/stderr")"
 fi
-run "$R" stable "$WORK/oplite_1.0_amd64.deb"
+run "$R" stable "$WORK/orbivisor_1.0_amd64.deb"
 if [ "$code" -eq 0 ]; then
 	ok "같은 deb는 넘어간다"
 else
@@ -213,10 +214,10 @@ unchanged() {
 	done
 	[ ! -e "$R/dists/.trixie.new" ] && [ ! -e "$R/dists/.Release.new" ]
 }
-printf 'deb3' >"$WORK/oplite_1.2_amd64.deb"
+printf 'deb3' >"$WORK/orbivisor_1.2_amd64.deb"
 cp "$WORK/fakebin/gpg" "$WORK/fakebin/gpg.ok"
 printf '#!/bin/sh\nexit 3\n' >"$WORK/fakebin/gpg"
-run "$R" stable "$WORK/oplite_1.2_amd64.deb"
+run "$R" stable "$WORK/orbivisor_1.2_amd64.deb"
 if [ "$code" -ne 0 ] && unchanged; then
 	ok "서명이 실패하면 실패하고 옛 색인과 서명이 남는다"
 else
@@ -228,7 +229,7 @@ cat >"$WORK/fakebin/gpg" <<'EOF'
 for a; do [ "$a" = --detach-sign ] && exit 3; done
 exec sh "$(dirname "$0")/gpg.ok" "$@"
 EOF
-run "$R" stable "$WORK/oplite_1.2_amd64.deb"
+run "$R" stable "$WORK/orbivisor_1.2_amd64.deb"
 if [ "$code" -ne 0 ] && unchanged; then
 	ok "Release.gpg 서명만 실패해도 옛 InRelease가 남는다"
 else

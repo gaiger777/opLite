@@ -1,14 +1,17 @@
-Package: oplite
+Package: orbivisor
 Version: @VERSION@
 Architecture: amd64
-Maintainer: opLite developers <gaiger777@gmail.com>
+Maintainer: Orbivisor developers <gaiger777@gmail.com>
 Installed-Size: @INSTALLED_SIZE@
 Depends: libc6 (>= 2.39), libssl3t64, qemu-system-x86, qemu-utils, ovmf, iproute2, nftables, systemd
 Recommends: nfs-common, lvm2, thin-provisioning-tools, open-iscsi, lvm2-lockd, sanlock, ceph-common
+Breaks: oplite (<< @VERSION@)
+Replaces: oplite (<< @VERSION@)
 Section: admin
 Priority: optional
 Homepage: https://github.com/gaiger777/opLite
-Description: opLite virtualization platform node
- opLite runs QEMU/KVM virtual machines on a cluster of Linux nodes.
- This package installs the node daemon opld (with the web UI), the
- command line tool oplctl and the opld systemd unit.
+Description: Orbivisor virtualization platform node
+ Orbivisor runs QEMU/KVM virtual machines on a cluster of Linux nodes.
+ This package installs the node daemon orbivisord (with the web UI), the
+ command line tool orbivisorctl, the opld systemd unit and the
+ compatibility names opld and oplctl.

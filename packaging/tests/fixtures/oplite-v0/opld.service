@@ -1,0 +1,17 @@
+[Unit]
+Description=opLite node daemon
+Documentation=https://github.com/gaiger777/opLite
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/opl/opld.toml
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/opld --config /etc/opl/opld.toml
+Restart=on-failure
+RestartSec=5
+KillMode=process
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

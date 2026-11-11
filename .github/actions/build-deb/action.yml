@@ -1,12 +1,16 @@
-# Debian 패키지 oplite 만들기: 웹 UI → 릴리스 빌드(opld web-ui, oplctl) → build-deb.sh.
+# Debian 패키지 orbivisor(와 전환 패키지 oplite) 만들기: 웹 UI → 릴리스 빌드(opld web-ui, oplctl 크레이트 —
+# 바이너리 orbivisord, orbivisorctl) → build-deb.sh.
 # ci.yml package 작업과 iso.yml이 같이 쓴다. 저장소를 checkout한 뒤 부른다.
 # 패키지 버전 = 워크스페이스 버전~ci<run 번호>. 바이너리의 --version도 이 값이고, 환경 변수 OPL_VERSION으로 남긴다.
-name: Build oplite deb
-description: Build the web UI, release binaries and the oplite Debian package
+name: Build orbivisor deb
+description: Build the web UI, release binaries and the orbivisor Debian package with the transitional oplite package
 outputs:
   deb:
-    description: Path of the built package (dist/oplite_<version>_amd64.deb)
+    description: Path of the built package (dist/orbivisor_<version>_amd64.deb)
     value: ${{ steps.deb.outputs.path }}
+  transitional:
+    description: Path of the transitional package (dist/oplite_<version>_amd64.deb)
+    value: ${{ steps.deb.outputs.transitional }}
 runs:
   using: composite
   steps:
@@ -44,4 +48,5 @@ runs:
         OPL_DEV_LICENSE: "1"
       run: |
         packaging/deb/build-deb.sh "$OPL_VERSION" dist
-        echo "path=dist/oplite_${OPL_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
+        echo "path=dist/orbivisor_${OPL_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
+        echo "transitional=dist/oplite_${OPL_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"

@@ -1,5 +1,7 @@
 #!/bin/bash
 # maintainer 스크립트(postinst·prerm·postrm)가 인자마다 어떤 systemctl 호출을 하는지 본다.
+# postinst는 처음 설치여도 opld.service가 enable돼 있으면(옛 oplite에서 넘어옴) 다시 시작하고, oplite가
+# 전에 설정된 적이 있으면 처음 설치로 보지 않는다(꺼 둔 opld를 켜지 않음).
 # PATH 앞에 둔 가짜 systemctl이 인자를 한 줄씩 기록한다. bash만 있으면 되고 macOS에서도 돈다.
 # 쓰는 법: bash packaging/tests/maint-test.sh
 set -eu
@@ -16,6 +18,16 @@ echo "$*" >>"$OPL_FAKE_LOG"
 [ "$1" != is-enabled ] || [ "${OPL_FAKE_ENABLED:-yes}" = yes ]
 EOF
 chmod 0755 "$WORK/bin/systemctl"
+# dpkg-query -W -f '${Config-Version}' oplite: OPL_FAKE_OPLITE_CONFIG(옛 oplite를 설정한 버전)가 있으면 그것을
+# 찍고, 없으면 oplite를 모르는 dpkg-query처럼 실패한다. 인자가 postinst가 쓰는 그대로가 아니면(패키지 이름·필드
+# 오타) 종료 코드 2로 끝난다. 기록하지 않는다.
+cat >"$WORK/bin/dpkg-query" <<'EOF'
+#!/bin/sh
+[ "$*" = '-W -f ${Config-Version} oplite' ] || exit 2
+[ -n "${OPL_FAKE_OPLITE_CONFIG:-}" ] || exit 1
+printf '%s' "$OPL_FAKE_OPLITE_CONFIG"
+EOF
+chmod 0755 "$WORK/bin/dpkg-query"
 
 FAILED=0
 
@@ -49,13 +61,32 @@ check() {
 	fi
 }
 
-check "처음 설치(systemd 돎)" yes "daemon-reload
+# 처음 설치: enable돼 있지 않으면 켜고 시작한다.
+OPL_FAKE_ENABLED=no check "처음 설치(systemd 돎)" yes "daemon-reload
+is-enabled --quiet opld.service
 enable opld.service
 start opld.service" postinst configure
 check "처음 설치(systemd 없음: 링크만)" no "enable opld.service" postinst configure
-check "처음 설치(빈 이전 버전)" yes "daemon-reload
+OPL_FAKE_ENABLED=no check "처음 설치(빈 이전 버전)" yes "daemon-reload
+is-enabled --quiet opld.service
 enable opld.service
 start opld.service" postinst configure ""
+# 옛 oplite에서 넘어옴: orbivisor는 처음 설치지만 opld.service가 이미 enable돼 있으면 restart한다.
+check "처음 설치인데 enable돼 있음" yes "daemon-reload
+is-enabled --quiet opld.service
+restart opld.service" postinst configure
+OPL_FAKE_OPLITE_CONFIG=0.1.0 check "oplite에서 넘어옴, enable됨" yes "daemon-reload
+is-enabled --quiet opld.service
+restart opld.service" postinst configure
+# oplite가 전에 설정됐으면 처음 설치가 아니다: 관리자가 꺼 둔 opld는 켜지도 시작하지도 않는다.
+OPL_FAKE_ENABLED=no OPL_FAKE_OPLITE_CONFIG=0.1.0 check "처음 설치, enable 안 됨, oplite가 전에 설정됨" yes "daemon-reload
+is-enabled --quiet opld.service" postinst configure
+OPL_FAKE_OPLITE_CONFIG=0.1.0 check "처음 설치(systemd 없음, oplite가 전에 설정됨, 링크 없음)" no "" postinst configure
+# systemd가 돌지 않을 때 enable 링크가 이미 있으면 다시 enable하지 않는다.
+mkdir -p "$WORK/etc-systemd/multi-user.target.wants"
+ln -sf /usr/lib/systemd/system/opld.service "$WORK/etc-systemd/multi-user.target.wants/opld.service"
+check "처음 설치(systemd 없음, 링크 있음)" no "" postinst configure
+rm -f "$WORK/etc-systemd/multi-user.target.wants/opld.service"
 # 업그레이드·재설정: enable돼 있으면 restart한다(debhelper와 같음). remove 뒤 다시 설치한 경우도 같다.
 check "업그레이드(systemd 돎)" yes "daemon-reload
 is-enabled --quiet opld.service
@@ -135,6 +166,7 @@ echo "$*" >>"$OPL_FAKE_LOG"
 exit 1
 EOF
 check "systemctl 실패를 무시(postinst)" yes "daemon-reload
+is-enabled --quiet opld.service
 enable opld.service
 start opld.service" postinst configure
 check "systemctl 실패를 무시(postrm purge)" yes "disable opld.service

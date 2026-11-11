@@ -6,6 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# 크레이트 이름(-p opld)은 두고 설치하는 바이너리 이름만 제품 이름으로 한다(옛 이름 opld는 패키지의 링크).
+autobins = false
+
+[[bin]]
+name = "orbivisord"
+path = "src/main.rs"
 
 [features]
 # 실제 QEMU로 CLI부터 콘솔, kill -9 뒤 재연결까지 확인하는 E2E 테스트.

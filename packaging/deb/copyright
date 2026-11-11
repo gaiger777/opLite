@@ -1,9 +1,9 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: opLite
+Upstream-Name: Orbivisor
 Source: https://github.com/gaiger777/opLite
 
 Files: *
-Copyright: opLite developers
+Copyright: Orbivisor developers
 License: Apache-2.0
 
 License: Apache-2.0

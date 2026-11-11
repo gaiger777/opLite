@@ -44,7 +44,11 @@ use crate::control::{ControlError, Request, Status};
 use crate::member::{Bootstrap, Member};
 
 #[derive(Parser)]
-#[command(version = opl_types::version::BUILD, about = "opLite node daemon")]
+#[command(
+    name = "orbivisord",
+    version = opl_types::version::BUILD,
+    about = "Orbivisor node daemon"
+)]
 struct Args {
     #[arg(long, default_value = "/etc/opl/opld.toml")]
     config: PathBuf,

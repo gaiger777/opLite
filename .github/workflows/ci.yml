@@ -93,8 +93,9 @@ jobs:
           OPL_SH="busybox sh" OPL_AWK="busybox awk" bash packaging/tests/setup-test.sh
       - run: bash packaging/tests/iso-test.sh
 
-  # Debian 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh(.github/actions/build-deb) → Debian 13 컨테이너에서 설치 시험,
-  # build-repo.sh로 만든 APT 저장소에서 설치하고 testing 채널의 새 버전을 보는 시험
+  # Debian 패키지 orbivisor와 전환 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh(.github/actions/build-deb) →
+  # Debian 13 컨테이너에서 설치 시험, build-repo.sh로 만든 APT 저장소에서 옛 oplite를 설치하고 testing 채널의
+  # orbivisor로 넘어가는 시험
   package:
     runs-on: ubuntu-24.04
     steps:
@@ -104,28 +105,33 @@ jobs:
       - name: Package info and contents
         env:
           DEB: ${{ steps.build.outputs.deb }}
+          TRANS_DEB: ${{ steps.build.outputs.transitional }}
         run: |
-          dpkg-deb --info "$DEB"
-          dpkg-deb --contents "$DEB"
+          for deb in "$DEB" "$TRANS_DEB"; do
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb"
+          done
       - name: Install test in Debian 13
         env:
           DEB: ${{ steps.build.outputs.deb }}
+          TRANS_DEB: ${{ steps.build.outputs.transitional }}
         run: |
           docker run --rm -v "$PWD:/work" debian:13 \
-            bash /work/packaging/tests/deb-test.sh "/work/$DEB"
+            bash /work/packaging/tests/deb-test.sh "/work/$DEB" "/work/$TRANS_DEB"
       - name: APT repository test in Debian 13
         env:
           DEB: ${{ steps.build.outputs.deb }}
+          TRANS_DEB: ${{ steps.build.outputs.transitional }}
         run: |
           docker run --rm -v "$PWD:/work" debian:13 \
-            bash /work/packaging/tests/repo-test.sh "/work/$DEB"
+            bash /work/packaging/tests/repo-test.sh "/work/$DEB" "/work/$TRANS_DEB"
       # 빌드 버전 시험을 OPL_VERSION을 준 빌드로 다시 돌린다(clap 기본 version으로 되돌리면 실패한다).
       - name: Version tests with OPL_VERSION
         run: OPL_VERSION=9.9.9~t cargo test -p opl-types -p opld -p oplctl --lib --test version
       - uses: actions/upload-artifact@v4
         with:
-          name: oplite-deb
-          path: dist/oplite_*_amd64.deb
+          name: orbivisor-deb
+          path: dist/*_amd64.deb
 
   # M7: 실제 KVM으로 VM을 띄우고 NIC를 브리지에 잇는다. tap과 브리지를 만들려면 root가 필요하고,
   # QEMU는 systemd 스코프로 감싼다(OPL_TEST_SYSTEMD). 웹 UI E2E는 브라우저로 같은 opld를 다룬다.

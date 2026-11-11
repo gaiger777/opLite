@@ -1,5 +1,6 @@
 #!/bin/sh
-# opLite APT 저장소의 한 채널에 패키지를 더하고 색인을 다시 만들어 서명한다.
+# Orbivisor APT 저장소의 한 채널에 패키지를 더하고 색인을 다시 만들어 서명한다.
+# 한 판의 orbivisor와 전환 패키지 oplite는 같은 채널에 함께 넘긴다.
 # 쓰는 법: OPL_REPO_GPG_KEY_ID=<키> packaging/repo/build-repo.sh <repo dir> <channel> <deb…>
 # 채널은 stable|testing|enterprise. 레이아웃:
 #   pool/<channel>/*.deb
@@ -86,6 +87,8 @@ for c in $CHANNELS; do
 done
 
 # Release: 색인에 섞이지 않게 STAGE 밖에 만든 뒤 옮긴다.
+# Origin·Label은 제품 이름이 바뀌어도 opLite 그대로다: apt는 이 값이 바뀌면 apt-get update를 오류로 끝내므로
+# (값이 바뀐 것을 따로 받아들여야 함) 이미 설치된 노드의 업데이트 확인이 멈춰 새 판을 받지 못한다.
 (cd "$STAGE" && "$APT_FTPARCHIVE" \
 	-o APT::FTPArchive::Release::Origin=opLite \
 	-o APT::FTPArchive::Release::Label=opLite \

@@ -1,11 +1,17 @@
 #!/bin/sh
-# oplite postinst. 처음 설치면 opld를 켜고 시작하고, 업그레이드·재설정(abort-remove 등 포함)이면
-# enable돼 있을 때 다시 시작한다(debhelper와 같다).
-# systemd가 돌지 않으면(컨테이너, 설치 프로그램의 chroot) enable(링크 만들기)만 한다.
+# orbivisor postinst. opld.service가 enable돼 있으면 다시 시작하고(업그레이드, 옛 oplite에서 넘어옴,
+# 재설정 — abort-remove 등 포함), 아니고 처음 설치면 켜고 시작한다(debhelper와 같다).
+# oplite에서 넘어올 때 orbivisor는 처음 설치($2 빔)지만 유닛은 이미 enable돼 돌고 있어 다시 시작해야
+# 새 바이너리가 돈다. 그래서 처음 설치인지보다 enable돼 있는지를 먼저 본다.
+# oplite가 전에 설정된 적이 있으면($2가 비어도) 처음 설치가 아니다: 관리자가 꺼 둔(disable) opld는
+# 넘어간 뒤에도 켜지 않는다.
+# systemd가 돌지 않으면(컨테이너, 설치 프로그램의 chroot) 처음 설치이고 enable 링크가 없을 때 enable(링크
+# 만들기)만 한다.
 set -eu
 
 # 시험(packaging/tests/maint-test.sh)이 바꿀 수 있게 환경 변수로 둔다.
 SYSTEMD_DIR="${OPL_SYSTEMD_DIR:-/run/systemd/system}"
+SYSTEMD_ETC="${OPL_SYSTEMD_ETC:-/etc/systemd/system}"
 
 case "$1" in
 configure | abort-remove | abort-deconfigure)
@@ -13,18 +19,22 @@ configure | abort-remove | abort-deconfigure)
 	first=no
 	if [ "$1" = configure ] && [ -z "${2:-}" ]; then
 		first=yes
+		# 옛 oplite에서 넘어옴: 그때 oplite V1은 unpack만 된 상태라 Config-Version이 옛 판이다.
+		if [ -n "$(dpkg-query -W -f '${Config-Version}' oplite 2>/dev/null || true)" ]; then
+			first=no
+		fi
 	fi
 	if [ -d "$SYSTEMD_DIR" ]; then
 		systemctl daemon-reload || true
-		if [ "$first" = yes ]; then
+		if systemctl is-enabled --quiet opld.service; then
+			# VM의 QEMU는 자기 scope에 있어 opld를 다시 시작해도 계속 돈다.
+			systemctl restart opld.service || true
+		elif [ "$first" = yes ]; then
 			systemctl enable opld.service || true
 			# 설정(/etc/opl/opld.toml)이 없으면 유닛 조건이 시작을 건너뛴다.
 			systemctl start opld.service || true
-		elif systemctl is-enabled --quiet opld.service; then
-			# VM의 QEMU는 자기 scope에 있어 opld를 다시 시작해도 계속 돈다.
-			systemctl restart opld.service || true
 		fi
-	elif [ "$first" = yes ]; then
+	elif [ "$first" = yes ] && [ ! -L "$SYSTEMD_ETC/multi-user.target.wants/opld.service" ]; then
 		systemctl enable opld.service || true
 	fi
 	;;

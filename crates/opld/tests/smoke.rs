@@ -205,7 +205,7 @@ async fn opld_fails_on_taken_port_before_starting_workers() {
     // 하이퍼바이저 드라이버는 run_dir/vm을 만든다. 포트를 먼저 열면 거기까지 가지 않는다.
     std::fs::remove_dir_all(d.path("run/vm")).unwrap();
     let _taken = std::net::TcpListener::bind(("127.0.0.1", d.port)).unwrap();
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_opld"))
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_orbivisord"))
         .arg("--config")
         .arg(d.path("opld.toml"))
         .stderr(std::process::Stdio::null())
@@ -220,7 +220,7 @@ async fn opld_fails_on_taken_port_before_starting_workers() {
 async fn a_second_opld_on_the_same_socket_refuses_to_start() {
     let mut d = Daemon::new("node1", "");
     d.start().await;
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_opld"))
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_orbivisord"))
         .arg("--config")
         .arg(d.path("opld.toml"))
         .stderr(std::process::Stdio::null())

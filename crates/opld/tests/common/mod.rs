@@ -113,7 +113,7 @@ impl Daemon {
             .append(true)
             .open(self.path("opld.log"))
             .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_opld"))
+        let child = Command::new(env!("CARGO_BIN_EXE_orbivisord"))
             .arg("--config")
             .arg(self.path("opld.toml"))
             .stdout(log.try_clone().unwrap())

@@ -1,7 +1,8 @@
 #!/bin/sh
-# 이미 빌드한 릴리스 바이너리로 Debian 패키지 oplite_<version>_amd64.deb를 만든다.
+# 이미 빌드한 릴리스 바이너리로 Debian 패키지 둘을 만든다: orbivisor_<version>_amd64.deb(실제 패키지)와
+# oplite_<version>_amd64.deb(옛 이름의 빈 전환 패키지 — 설치된 oplite가 dist-upgrade로 orbivisor로 넘어가게 함).
 # 쓰는 법: packaging/deb/build-deb.sh <version> <out dir>
-# 바이너리는 OPL_VERSION=<version>으로 빌드해 둔다(--version이 그 버전이 아니면 실패한다):
+# 바이너리(orbivisord, orbivisorctl)는 OPL_VERSION=<version>으로 빌드해 둔다(--version이 그 버전이 아니면 실패한다):
 #   pnpm -C web build && OPL_VERSION=<version> cargo build --release -p opld --features web-ui -p oplctl
 # 바이너리 위치는 기본 target/release이고 OPL_BIN_DIR로 바꾼다.
 # OPL_APT_KEY(APT 저장소 공개 키 파일, armor가 아닌 gpg --export)가 있으면
@@ -9,7 +10,7 @@
 # 구독 키 공개 키: 바이너리를 OPL_LICENSE_KEYS로 빌드한 정식 패키지는 그 값을 여기에도 준다. 없으면
 # 저장소의 개발 키를 믿는 바이너리이므로 OPL_DEV_LICENSE=1(개발 패키지)일 때만 만든다.
 # OPL_LICENSE_KEYS에는 정규 base64(44자, 32바이트) 항목이 하나 이상 있어야 하고, 개발 키가 들어 있으면
-# 안 되며, opld에 그 값이 그대로 들어 있어야 한다(그 값으로 빌드했는지).
+# 안 되며, orbivisord에 그 값이 그대로 들어 있어야 한다(그 값으로 빌드했는지).
 set -eu
 # 만드는 파일·디렉터리 권한이 호출한 셸의 umask에 휘둘리지 않게 한다.
 umask 022
@@ -64,7 +65,7 @@ if [ -n "${OPL_LICENSE_KEYS:-}" ]; then
 	fi
 fi
 
-for bin in opld oplctl; do
+for bin in orbivisord orbivisorctl; do
 	if [ ! -x "$BIN_DIR/$bin" ]; then
 		echo "build-deb: $BIN_DIR/$bin 이 없다(먼저 릴리스로 빌드한다)" >&2
 		exit 1
@@ -77,9 +78,9 @@ for bin in opld oplctl; do
 		exit 1
 	fi
 done
-# 정식 패키지: opld가 이 OPL_LICENSE_KEYS로 빌드됐는지(빌드 값은 바이너리에 그대로 들어간다)
-if [ -n "${OPL_LICENSE_KEYS:-}" ] && ! grep -qaF -- "$OPL_LICENSE_KEYS" "$BIN_DIR/opld"; then
-	echo "build-deb: opld was not built with this OPL_LICENSE_KEYS" >&2
+# 정식 패키지: orbivisord가 이 OPL_LICENSE_KEYS로 빌드됐는지(빌드 값은 바이너리에 그대로 들어간다)
+if [ -n "${OPL_LICENSE_KEYS:-}" ] && ! grep -qaF -- "$OPL_LICENSE_KEYS" "$BIN_DIR/orbivisord"; then
+	echo "build-deb: orbivisord was not built with this OPL_LICENSE_KEYS" >&2
 	exit 1
 fi
 
@@ -95,37 +96,52 @@ if [ -n "$APT_KEY" ] && head -n 1 "$APT_KEY" | grep -q '^-----BEGIN PGP'; then
 fi
 
 STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
+TRANS=$(mktemp -d)
+trap 'rm -rf "$STAGE" "$TRANS"' EXIT
 # mktemp -d는 0700이다. 패키지 루트(/)의 권한이 되므로 0755로 한다.
-chmod 0755 "$STAGE"
+chmod 0755 "$STAGE" "$TRANS"
 
-# 파일 트리
+# 파일 트리. 옛 이름(opld, oplctl, orbivisord.service의 원래 유닛 opld.service)은 상대 심볼릭 링크다.
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/lib/systemd/system" \
-	"$STAGE/usr/share/oplite" "$STAGE/usr/share/doc/oplite"
-install -m 0755 "$BIN_DIR/opld" "$BIN_DIR/oplctl" "$STAGE/usr/bin/"
+	"$STAGE/usr/share/orbivisor" "$STAGE/usr/share/doc/orbivisor"
+install -m 0755 "$BIN_DIR/orbivisord" "$BIN_DIR/orbivisorctl" "$STAGE/usr/bin/"
+ln -s orbivisord "$STAGE/usr/bin/opld"
+ln -s orbivisorctl "$STAGE/usr/bin/oplctl"
 install -m 0644 "$DEB_DIR/opld.service" "$STAGE/usr/lib/systemd/system/opld.service"
-install -m 0644 "$DEB_DIR/opld.toml.example" "$STAGE/usr/share/oplite/opld.toml.example"
-install -m 0644 "$DEB_DIR/copyright" "$STAGE/usr/share/doc/oplite/copyright"
-# 저장소 공개 키: opld가 쓰는 소스 파일의 Signed-By
+# 별칭: systemctl status|restart orbivisord가 opld.service를 가리킨다.
+ln -s opld.service "$STAGE/usr/lib/systemd/system/orbivisord.service"
+install -m 0644 "$DEB_DIR/opld.toml.example" "$STAGE/usr/share/orbivisor/opld.toml.example"
+install -m 0644 "$DEB_DIR/copyright" "$STAGE/usr/share/doc/orbivisor/copyright"
+# 저장소 공개 키: opld가 쓰는 소스 파일의 Signed-By(경로는 옛 이름 그대로)
 if [ -n "$APT_KEY" ]; then
 	mkdir -p "$STAGE/usr/share/keyrings"
 	install -m 0644 "$APT_KEY" "$STAGE/usr/share/keyrings/oplite-archive-keyring.gpg"
 fi
 
-# DEBIAN: control과 maintainer 스크립트. Installed-Size(KiB)는 DEBIAN을 넣기 전에 잰다.
-INSTALLED_SIZE=$(du -sk "$STAGE" | cut -f1)
-mkdir -p "$STAGE/DEBIAN"
-sed -e "s/@VERSION@/$VERSION/" -e "s/@INSTALLED_SIZE@/$INSTALLED_SIZE/" \
-	"$DEB_DIR/control.in" >"$STAGE/DEBIAN/control"
-chmod 0644 "$STAGE/DEBIAN/control"
-# dpkg --verify가 보는 md5sums(usr 아래 파일, 정렬)
-(cd "$STAGE" && find usr -type f | LC_ALL=C sort | xargs md5sum) >"$STAGE/DEBIAN/md5sums"
-chmod 0644 "$STAGE/DEBIAN/md5sums"
+# 전환 패키지 oplite: 문서 디렉터리의 copyright만, 유지 스크립트 없음.
+mkdir -p "$TRANS/usr/share/doc/oplite"
+install -m 0644 "$DEB_DIR/copyright" "$TRANS/usr/share/doc/oplite/copyright"
+
+# debian_dir <트리> <control.in>: control과 md5sums를 만든다. Installed-Size(KiB)는 DEBIAN을 넣기 전에 잰다.
+debian_dir() {
+	size=$(du -sk "$1" | cut -f1)
+	mkdir -p "$1/DEBIAN"
+	sed -e "s/@VERSION@/$VERSION/g" -e "s/@INSTALLED_SIZE@/$size/" "$2" >"$1/DEBIAN/control"
+	chmod 0644 "$1/DEBIAN/control"
+	# dpkg --verify가 보는 md5sums(usr 아래 파일, 정렬 — 링크는 넣지 않는다)
+	(cd "$1" && find usr -type f | LC_ALL=C sort | xargs md5sum) >"$1/DEBIAN/md5sums"
+	chmod 0644 "$1/DEBIAN/md5sums"
+}
+debian_dir "$STAGE" "$DEB_DIR/control.in"
 for script in postinst prerm postrm; do
 	install -m 0755 "$DEB_DIR/$script" "$STAGE/DEBIAN/$script"
 done
+debian_dir "$TRANS" "$DEB_DIR/oplite.control.in"
 
 mkdir -p "$OUT_DIR"
-DEB="$OUT_DIR/oplite_${VERSION}_amd64.deb"
+DEB="$OUT_DIR/orbivisor_${VERSION}_amd64.deb"
+TRANS_DEB="$OUT_DIR/oplite_${VERSION}_amd64.deb"
 dpkg-deb --build --root-owner-group -Zxz "$STAGE" "$DEB"
+dpkg-deb --build --root-owner-group -Zxz "$TRANS" "$TRANS_DEB"
 echo "$DEB"
+echo "$TRANS_DEB"

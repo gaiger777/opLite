@@ -1,5 +1,5 @@
 #!/bin/sh
-# oplite postrm. /var/lib/opl(Raft 데이터, 풀, 볼륨)과 /etc/opl은 purge여도 지우지 않는다.
+# orbivisor postrm. /var/lib/opl(Raft 데이터, 풀, 볼륨)과 /etc/opl은 purge여도 지우지 않는다.
 # opld가 쓴 APT 소스 파일(첫 줄이 관리 표시)은 지운다: 함께 지워진 저장소 공개 키를 가리켜 apt-get
 # update가 실패한다. 관리자가 직접 쓴 파일은 남긴다.
 set -eu

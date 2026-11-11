@@ -1,5 +1,5 @@
 #!/bin/sh
-# oplite prerm. 지울 때만 opld를 멈춘다(업그레이드는 postinst가 다시 시작한다).
+# orbivisor prerm. 지울 때만 opld를 멈춘다(업그레이드는 postinst가 다시 시작한다).
 # VM의 QEMU는 자기 scope에 있어 계속 돌고, 다시 설치한 opld가 이어 맡는다.
 set -eu
 
