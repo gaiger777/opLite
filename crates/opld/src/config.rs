@@ -73,6 +73,8 @@ pub struct Config {
     pub audit: AuditSection,
     #[serde(default)]
     pub remotes: RemotesSection,
+    #[serde(default)]
+    pub runtime: RuntimeSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -609,6 +611,32 @@ fn default_remotes_tick() -> Duration {
     Duration::from_secs(5)
 }
 
+/// 실행기 크기(설계 §3.1). `core` 실행기는 2로 고정이다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSection {
+    /// API(axum) 실행기의 작업자 스레드 수. 기본은 CPU 수의 절반(최소 2)이다.
+    pub api_threads: Option<usize>,
+    /// reconciler·Task 실행기·스케줄러 등의 실행기의 작업자 스레드 수. 기본은 CPU 수의 절반(최소 2)이다.
+    pub work_threads: Option<usize>,
+}
+
+impl RuntimeSection {
+    pub fn api_threads(&self) -> usize {
+        self.api_threads.unwrap_or_else(default_runtime_threads)
+    }
+
+    pub fn work_threads(&self) -> usize {
+        self.work_threads.unwrap_or_else(default_runtime_threads)
+    }
+}
+
+/// CPU 수의 절반, 최소 2
+fn default_runtime_threads() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cpus / 2).max(2)
+}
+
 /// 감사 로그(`{data_dir}/audit/audit.log`). API를 여는 노드만 쓴다.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -907,6 +935,9 @@ impl Config {
             anyhow::bail!(
                 "audit.max_file_mib must be between 1 and 256 and audit.max_files at least 1"
             );
+        }
+        if self.runtime.api_threads == Some(0) || self.runtime.work_threads == Some(0) {
+            anyhow::bail!("runtime.api_threads and runtime.work_threads must be at least 1");
         }
         if self.ha.fence_after_secs == 0 {
             anyhow::bail!("ha.fence_after_secs must be at least 1");
@@ -1375,6 +1406,30 @@ mod tests {
         }
         assert!(
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[audit]\ndir = \"/x\"")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_section_defaults_to_half_the_cpus_and_rejects_zero() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.runtime, RuntimeSection::default());
+        let cpus = std::thread::available_parallelism().unwrap().get();
+        assert_eq!(c.runtime.api_threads(), (cpus / 2).max(2));
+        assert_eq!(c.runtime.work_threads(), (cpus / 2).max(2));
+
+        let c =
+            parse("name = \"n\"\naddress = \"h\"\n[runtime]\napi_threads = 1\nwork_threads = 6");
+        c.validate().unwrap();
+        assert_eq!((c.runtime.api_threads(), c.runtime.work_threads()), (1, 6));
+
+        for bad in ["api_threads = 0", "work_threads = 0"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[runtime]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        // core는 고정이다.
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[runtime]\ncore_threads = 4")
                 .is_err()
         );
     }

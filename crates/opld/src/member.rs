@@ -43,6 +43,7 @@ use crate::metrics::sampler::MetricsSampler;
 use crate::metrics::store::{MetricsStore, StoreSource};
 use crate::overlay::{OverlayAgent, cluster_tag};
 use crate::pools::PoolMounter;
+use crate::runtime::{Handles, on, run_on};
 
 /// 데이터 디렉터리 아래 클러스터 저장소(Raft 로그와 상태)를 두는 디렉터리
 pub const CLUSTER_DIR: &str = "cluster";
@@ -201,11 +202,16 @@ impl Member {
     /// 노드 인증서를 저장해 도중에 실패하면 이 노드는 계속 미초기화 상태다. `Join`은 이미 learner로
     /// 더해졌으므로 승격을 요청하기 전에 저장한다. 그 뒤에 실패하거나 죽어도 클러스터가 투표 멤버로
     /// 세는 노드가 미초기화로 남지 않고, 다시 시작하면(`Restart`) 승격을 다시 요청한다.
+    ///
+    /// 서비스를 실행기 셋에 나눠 띄운다(설계 §3.1). Raft(openraft 작업은 `Raft::new`를 부른 실행기에
+    /// 생긴다), 노드 간 서버, `HaGuard`, `HaManager`, 노드 감시, 승격은 `rt.core`, API는 `rt.api`, VM·풀을
+    /// 다스리는 일과 스케줄러는 `rt.work`에서 돈다.
     pub async fn start(
         config: &Config,
         node: Uuid,
         tls: NodeTls,
         bootstrap: Bootstrap,
+        rt: &Handles,
     ) -> anyhow::Result<(Self, Option<Created>)> {
         // `[telemetry] ca_file`을 읽지 못하면 아무것도 열기 전에 실패한다.
         let telemetry_config = config.telemetry.telemetry_config()?;
@@ -214,8 +220,9 @@ impl Member {
         let mut cluster_config = ClusterConfig::new(id, cluster_dir(config));
         cluster_config.raft = raft_config(config.witness);
         cluster_config.write_timeout = WRITE_TIMEOUT;
+        let network = GrpcNetwork::new(peers.clone());
         let cluster = Arc::new(
-            Cluster::open(cluster_config, GrpcNetwork::new(peers.clone()))
+            run_on(&rt.core, Cluster::open(cluster_config, network))
                 .await?
                 .with_forwarder(peers.clone()),
         );
@@ -227,7 +234,7 @@ impl Member {
             return Err(e);
         }
         if config.witness {
-            let member = Self::start_witness(config, cluster, peers, tls, bootstrap).await?;
+            let member = Self::start_witness(config, cluster, peers, tls, bootstrap, rt).await?;
             return Ok((member, None));
         }
         // 포트가 이미 쓰이고 있으면 아무것도 띄우기 전에 실패한다.
@@ -264,13 +271,15 @@ impl Member {
         // 워커와 마이그레이션 받기가 VM을 켜기 직전에 규칙을 넣는다. 에이전트는 아래에서 띄운다.
         let firewall = FirewallRules::new(cluster.clone(), config, &host, tag.clone());
         let gate = firewall.clone().map(|f| f as Arc<dyn FirewallGate>);
-        let hv: Arc<dyn Hypervisor> = match QemuHypervisor::new(host.qemu_config(config)).await {
-            Ok(hv) => Arc::new(hv),
-            Err(e) => {
-                let _ = cluster.shutdown().await;
-                return Err(e.into());
-            }
-        };
+        // 살아 있는 VM에 다시 붙으며 띄우는 QMP·모니터 작업이 `work`에 생긴다.
+        let hv: Arc<dyn Hypervisor> =
+            match run_on(&rt.work, QemuHypervisor::new(host.qemu_config(config))).await {
+                Ok(hv) => Arc::new(hv),
+                Err(e) => {
+                    let _ = cluster.shutdown().await;
+                    return Err(e.into());
+                }
+            };
         // QEMU가 마이그레이션 TLS에 쓰는 노드 인증서. 드라이버의 state_dir은 데이터 디렉터리다(host.rs).
         let tls_dir = migration_tls_dir(&config.data_dir);
         if let Err(e) = write_migration_tls(&tls_dir, &tls.ca_pem, &tls.cert_pem, &tls.key_pem) {
@@ -340,7 +349,9 @@ impl Member {
             .with_uefi_vars(config.data_dir.clone())
             .with_audit(audit.clone())
             .with_metrics(metrics_source.clone());
-        let peer = serve_peer(peer_listener, &tls, service, exited_tx.clone());
+        let peer = on(&rt.core, || {
+            serve_peer(peer_listener, &tls, service, exited_tx.clone())
+        });
 
         // 여기서 실패하면 노드 간 서버와 저장소를 닫는다.
         let first_time = !matches!(bootstrap, Bootstrap::Restart);
@@ -402,17 +413,19 @@ impl Member {
         };
 
         // 다시 시작한 노드는 과반수가 없어도 VM을 계속 다스려야 하므로, Node 리소스는 뒤에서 기록한다.
-        let promotion = spawn_promotion(first_time, &cluster, &peers);
+        let promotion = on(&rt.core, || spawn_promotion(first_time, &cluster, &peers));
         // 풀 마운터가 QEMU의 rbd 블록 드라이버를 확인한다.
         let qemu_binary = host.profile.qemu_binary.clone();
         // 받은 UEFI 변수 파일의 크기를 이 노드의 템플릿과 견준다.
         let uefi_vars_template = host.profile.uefi_vars_template.clone();
         // 장치를 만들거나 지우면 곧바로 브리지 목록을 기록한다(아래 주기 갱신을 기다리지 않는다).
-        let overlay = OverlayAgent::spawn(cluster.clone(), config, &host, tag);
-        let firewall = firewall.map(FirewallAgent::spawn);
+        let overlay = on(&rt.work, || {
+            OverlayAgent::spawn(cluster.clone(), config, &host, tag)
+        });
+        let firewall = on(&rt.work, || firewall.map(FirewallAgent::spawn));
         let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
-            tokio::spawn(async move {
+            rt.work.spawn(async move {
                 if !first_time {
                     while let Err(e) = bootstrap::register_node(&cluster, &config, &host).await {
                         tracing::warn!(error = %e, "cannot register this node; will retry");
@@ -444,24 +457,30 @@ impl Member {
         let ha = config
             .ha
             .guard_config()
-            .map(|ha| HaGuard::spawn(cluster.clone(), ha));
+            .map(|ha| on(&rt.core, || HaGuard::spawn(cluster.clone(), ha)));
         reconciler_config.ha = ha.clone();
         reconciler_config.firewall = gate;
-        let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config);
-        let pools = PoolMounter::spawn(
-            cluster.clone(),
-            mount_root.clone(),
-            qemu_binary,
-            config.pools.refresh(),
-        );
+        let reconciler = on(&rt.work, || {
+            Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config)
+        });
+        let pools = on(&rt.work, || {
+            PoolMounter::spawn(
+                cluster.clone(),
+                mount_root.clone(),
+                qemu_binary,
+                config.pools.refresh(),
+            )
+        });
         // 지표는 메모리에만 둔다(Raft에 쓰지 않는다).
-        let metrics = MetricsSampler::spawn(
-            hv.clone(),
-            metrics_host::native(),
-            cluster.clone(),
-            config.data_dir.clone(),
-            metrics_store,
-        );
+        let metrics = on(&rt.work, || {
+            MetricsSampler::spawn(
+                hv.clone(),
+                metrics_host::native(),
+                cluster.clone(),
+                config.data_dir.clone(),
+                metrics_store,
+            )
+        });
         // Task 실행기는 시작할 때 이 노드가 남긴 고아를 지운다. 그것이 끝난 뒤에 API를 연다.
         let mut runner_config = TaskRunnerConfig::new(node);
         runner_config.upload_dir = Some(config.data_dir.join("uploads"));
@@ -488,18 +507,26 @@ impl Member {
             .updates_config()
             .map(|c| Arc::new(Updates::new(c)));
         runner_config.updates = updates.clone();
-        let runner = TaskRunner::spawn(
-            cluster.clone(),
-            storage,
-            hv,
-            reconciler.handle(),
-            runner_config,
+        let runner = run_on(
+            &rt.work,
+            TaskRunner::spawn(
+                cluster.clone(),
+                storage,
+                hv,
+                reconciler.handle(),
+                runner_config,
+            ),
         )
         .await;
-        let monitor = NodeMonitor::spawn(cluster.clone(), peers, NodeMonitorConfig::default());
-        let updates = updates.map(|u| UpdateAgent::spawn(cluster.clone(), node, u));
+        let monitor = on(&rt.core, || {
+            NodeMonitor::spawn(cluster.clone(), peers, NodeMonitorConfig::default())
+        });
+        let updates = on(&rt.work, || {
+            updates.map(|u| UpdateAgent::spawn(cluster.clone(), node, u))
+        });
 
-        let listener = TlsListener::new(api_listener, api_tls)?;
+        // TLS 핸드셰이크 작업이 `api`에 생긴다.
+        let listener = on(&rt.api, || TlsListener::new(api_listener, api_tls))?;
         tracing::info!(
             node = %node,
             api = %config.listen,
@@ -507,15 +534,21 @@ impl Member {
             "orbivisord is ready"
         );
         let (stop, rx) = oneshot::channel::<()>();
-        let schedule = SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config());
-        let janitor = ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config());
-        let backups = BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config());
-        let telemetry = TelemetryReporter::spawn(state.clone(), telemetry_config);
-        let remotes = RemotePoller::spawn(state.clone(), config.remotes.poller_config());
-        let recovery = HaManager::spawn(state.clone(), HaManagerConfig::default());
+        let (schedule, janitor, backups, telemetry, remotes) = on(&rt.work, || {
+            (
+                SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config()),
+                ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config()),
+                BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config()),
+                TelemetryReporter::spawn(state.clone(), telemetry_config),
+                RemotePoller::spawn(state.clone(), config.remotes.poller_config()),
+            )
+        });
+        let recovery = on(&rt.core, || {
+            HaManager::spawn(state.clone(), HaManagerConfig::default())
+        });
         let audit = state.audit.clone();
         let app = opl_api::router(state).merge(crate::web::router());
-        let task = tokio::spawn(async move {
+        let task = rt.api.spawn(async move {
             // 연결 주소(클라이언트 IP)를 시도 제한에 넘긴다. axum은 `TapIo`로 감싼 리스너에
             // `ConnectInfo<SocketAddr>`를 만들어 주므로 아무 일도 하지 않는 tap을 붙인다.
             let listener = listener.tap_io(|_| {});
@@ -568,6 +601,7 @@ impl Member {
         peers: Arc<Peers>,
         tls: NodeTls,
         bootstrap: Bootstrap,
+        rt: &Handles,
     ) -> anyhow::Result<Self> {
         let peer_listener = match TcpListener::bind(config.cluster_listen)
             .await
@@ -582,7 +616,9 @@ impl Member {
         let (exited_tx, exited) = mpsc::channel(2);
         // 마이그레이션과 UEFI 변수는 받지 않는다.
         let service = PeerService::new(cluster.clone(), None);
-        let peer = serve_peer(peer_listener, &tls, service, exited_tx);
+        let peer = on(&rt.core, || {
+            serve_peer(peer_listener, &tls, service, exited_tx)
+        });
         let first_time = !matches!(bootstrap, Bootstrap::Restart);
         let prepared = async {
             match bootstrap {
@@ -602,10 +638,10 @@ impl Member {
             let _ = cluster.shutdown().await;
             return Err(e);
         }
-        let promotion = spawn_promotion(first_time, &cluster, &peers);
+        let promotion = on(&rt.core, || spawn_promotion(first_time, &cluster, &peers));
         let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
-            tokio::spawn(async move {
+            rt.work.spawn(async move {
                 if !first_time {
                     while let Err(e) = bootstrap::register_witness(&cluster, &config).await {
                         tracing::warn!(error = %e, "cannot register this node; will retry");
@@ -904,7 +940,71 @@ fn voter_addr(cluster: &Cluster) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::Runtimes;
     use opl_types::resource::Resource;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// 새 클러스터를 만든 멤버의 서비스가 실행기 셋에 나뉘어 돈다. 부른 쪽의 실행기에는 아무 작업도
+    /// 남지 않고(고르지 않고 띄운 서비스가 없다), 닫으면 세 실행기의 작업이 모두 끝난다.
+    #[test]
+    fn services_run_on_the_three_runtimes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Config = toml::from_str(&format!(
+            "name = \"n1\"\naddress = \"127.0.0.1\"\nlisten = \"127.0.0.1:{}\"\n\
+             cluster_listen = \"127.0.0.1:{}\"\n[hypervisor]\naccel = \"tcg\"\n\
+             systemd_scope = false\n[ha]\nfencing = \"process\"\n[updates]\nenabled = false",
+            free_port(),
+            free_port()
+        ))
+        .unwrap();
+        config.data_dir = dir.path().join("data");
+        config.run_dir = dir.path().join("run");
+        let runtimes = Runtimes::new(2, 2).unwrap();
+        let rt = runtimes.handles();
+        let alive = |h: &tokio::runtime::Handle| h.metrics().num_alive_tasks();
+        // 주 루프 대신 부르는 쪽
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async {
+            let node = Uuid::now_v7();
+            let (ca, tls) = crate::new_cluster_tls(&config, node, "c").unwrap();
+            let bootstrap = Bootstrap::Init {
+                name: "c".into(),
+                ca,
+            };
+            let (member, created) = Member::start(&config, node, tls, bootstrap, &rt)
+                .await
+                .unwrap();
+            assert!(created.is_some());
+            let here = tokio::runtime::Handle::current();
+            assert_eq!(alive(&here), 0, "tasks left on the caller's runtime");
+            for (name, h) in [("core", &rt.core), ("api", &rt.api), ("work", &rt.work)] {
+                assert!(alive(h) > 0, "no task on {name}");
+            }
+            // 빠진 것처럼 닫아 root로 도는 Linux CI에서 만든 방화벽 테이블도 지운다.
+            member.close(true).await.unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while [&rt.core, &rt.api, &rt.work].iter().any(|h| alive(h) > 0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tasks left after close: core {} api {} work {}",
+                alive(&rt.core),
+                alive(&rt.api),
+                alive(&rt.work)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 
     #[test]
     fn a_witness_does_not_stand_for_election() {

@@ -21,6 +21,7 @@ mod member;
 mod metrics;
 mod overlay;
 mod pools;
+mod runtime;
 mod web;
 
 use std::fs::File;
@@ -43,6 +44,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::control::{ControlError, Request, Status};
 use crate::member::{Bootstrap, Member};
+use crate::runtime::{Handles, Runtimes};
 
 #[derive(Parser)]
 #[command(
@@ -55,8 +57,7 @@ struct Args {
     config: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -67,10 +68,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let config = Config::load(&args.config)?;
-    run(config).await
+    // 실행기 셋(설계 §3.1). 주 루프는 주 스레드에서 `core`의 문맥으로 돌고(제어 소켓도 `core`),
+    // 서비스는 `Member::start`가 맞는 실행기에 띄운다.
+    let runtimes = Runtimes::new(config.runtime.api_threads(), config.runtime.work_threads())
+        .context("cannot start the runtimes")?;
+    let rt = runtimes.handles();
+    runtimes.core.block_on(run(config, rt))
 }
 
-async fn run(config: Config) -> anyhow::Result<()> {
+async fn run(config: Config, rt: Handles) -> anyhow::Result<()> {
     prepare_data_dir(&config.data_dir)?;
     // 끝날 때까지 쥐고 있는다.
     let _lock = lock_data_dir(&config.data_dir)?;
@@ -89,7 +95,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
         'node: loop {
             // 멤버가 아니면 init이나 join을 기다린다.
             let mut member = match NodeTls::load(&member::pki_dir(&config))? {
-                Some(tls) => Member::start(&config, node, tls, Bootstrap::Restart).await?.0,
+                Some(tls) => {
+                    Member::start(&config, node, tls, Bootstrap::Restart, &rt)
+                        .await?
+                        .0
+                }
                 None => {
                     tracing::info!(
                         socket = %config.control_socket().display(),
@@ -101,7 +111,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                             req = control.recv() => req,
                         };
                         let Some(req) = req else { return Ok(()) };
-                        if let Some(member) = become_member(&config, node, req).await {
+                        if let Some(member) = become_member(&config, node, req, &rt).await {
                             break member;
                         }
                         // 인증서를 저장한 뒤 실패했으면 이미 멤버(learner)다. 멤버로 다시 띄워 승격을 이어 간다.
@@ -189,7 +199,7 @@ fn read_cluster_name(member: &Member) -> Option<String> {
 }
 
 /// 미초기화 노드가 받은 요청을 처리한다. 멤버가 되면 그 멤버를 돌려준다.
-async fn become_member(config: &Config, node: Uuid, req: Request) -> Option<Member> {
+async fn become_member(config: &Config, node: Uuid, req: Request, rt: &Handles) -> Option<Member> {
     let (bootstrap, tls, reply, cluster) = match req {
         Request::Leave { reply } => {
             let _ = reply.send(Err(ControlError::conflict(
@@ -250,7 +260,7 @@ async fn become_member(config: &Config, node: Uuid, req: Request) -> Option<Memb
             return None;
         }
     }
-    match Member::start(config, node, tls, bootstrap).await {
+    match Member::start(config, node, tls, bootstrap, rt).await {
         Ok((member, created)) => {
             let mut answer = json!({ "cluster": cluster, "node": config.name });
             if let Some(c) = created {
@@ -368,7 +378,17 @@ mod tests {
             cluster_name: "c".into(),
             reply,
         };
-        assert!(become_member(&config, Uuid::now_v7(), req).await.is_none());
+        let current = tokio::runtime::Handle::current();
+        let rt = Handles {
+            core: current.clone(),
+            api: current.clone(),
+            work: current,
+        };
+        assert!(
+            become_member(&config, Uuid::now_v7(), req, &rt)
+                .await
+                .is_none()
+        );
         let e = rx.await.unwrap().unwrap_err();
         assert_eq!(e.status, StatusCode::CONFLICT);
         assert_eq!(
