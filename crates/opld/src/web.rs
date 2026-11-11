@@ -65,8 +65,8 @@ fn serve(files: Files) -> Router {
 
 /// 웹 UI 없이 빌드한 opld의 안내
 fn not_built() -> Response {
-    let page = "<!doctype html><meta charset=\"utf-8\"><title>opLite</title>\
-                <p>This opld was built without the web UI. Build it with \
+    let page = "<!doctype html><meta charset=\"utf-8\"><title>Orbivisor</title>\
+                <p>This orbivisord was built without the web UI. Build it with \
                 <code>pnpm -C web build</code> and the <code>web-ui</code> feature. \
                 The API is at <code>/api/v1</code>.</p>";
     let mut r = (StatusCode::NOT_FOUND, axum::response::Html(page)).into_response();

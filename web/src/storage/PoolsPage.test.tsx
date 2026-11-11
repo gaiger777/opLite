@@ -190,7 +190,7 @@ it("creates a directory pool on shared storage", async () => {
   await userEvent.type(within(dialog).getByLabelText("Directory"), "/mnt/vm");
   const shared = within(dialog).getByRole("checkbox", { name: "Shared storage" });
   expect(shared).toHaveAccessibleDescription(
-    "Check when every node sees the same files at this path, such as an NFS share mounted outside opLite.",
+    "Check when every node sees the same files at this path, such as an NFS share mounted outside Orbivisor.",
   );
   await userEvent.click(shared);
   // NFS 풀은 늘 공유라 고를 것이 없다.

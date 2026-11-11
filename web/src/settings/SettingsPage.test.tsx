@@ -509,7 +509,8 @@ it("shows why the subscription key could not be removed", async () => {
       HttpResponse.json(
         {
           code: "cluster_upgrading",
-          message: "some nodes run an older opLite (node2); finish the upgrade on every node first",
+          message:
+            "some nodes run an older Orbivisor (node2); finish the upgrade on every node first",
         },
         { status: 409 },
       ),
@@ -521,7 +522,7 @@ it("shows why the subscription key could not be removed", async () => {
   const dialog = await screen.findByRole("alertdialog");
   await userEvent.click(within(dialog).getByRole("button", { name: "Remove key" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "The cluster is being upgraded: some nodes run an older opLite (node2)",
+    "The cluster is being upgraded: some nodes run an older Orbivisor (node2)",
   );
   // 지우지 못했으니 그대로다.
   expect(within(section).getByText("Active")).toBeInTheDocument();

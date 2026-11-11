@@ -202,7 +202,7 @@ it("tells how to remove a live node", async () => {
   cluster();
   mockLists({ node: [NODE] });
   renderPage(<NodesPage />);
-  expect(await screen.findByText(/oplctl cluster leave/)).toBeInTheDocument();
+  expect(await screen.findByText(/orbivisorctl cluster leave/)).toBeInTheDocument();
 });
 
 it("hides node changes from operators", async () => {
@@ -212,7 +212,7 @@ it("hides node changes from operators", async () => {
   expect(await screen.findByText("node-a")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Actions for node-a" })).not.toBeInTheDocument();
   // 바꿀 수 없는 사람에게는 유지보수·제거 안내도 보이지 않는다.
-  expect(screen.queryByText(/oplctl cluster leave/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/orbivisorctl cluster leave/)).not.toBeInTheDocument();
   expect(screen.queryByText(/No new VMs are placed/)).not.toBeInTheDocument();
 });
 
@@ -243,7 +243,7 @@ function updatable(extra: Partial<(typeof NODE)["status"]["updates"] & object> =
       updates: {
         checked_at: 1_793_000_000,
         packages: [
-          { name: "oplite", current: "0.9.0", candidate: "0.10.0" },
+          { name: "orbivisor", current: "0.9.0", candidate: "0.10.0" },
           { name: "libfoo1", current: null, candidate: "1.2-3" },
         ],
         error: null,
@@ -310,7 +310,7 @@ it("lists the updates of a node", async () => {
   const rows = within(within(dialog).getByRole("table")).getAllByRole("row");
   expect(rows.map((r) => r.textContent)).toEqual([
     "PackageInstalledCandidate",
-    "oplite0.9.00.10.0",
+    "orbivisor0.9.00.10.0",
     "libfoo1(new)1.2-3",
   ]);
   expect(dialog).toHaveTextContent("Only the first 2 packages are shown.");
@@ -364,7 +364,7 @@ it("checks again and upgrades from the row menu", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Upgrade" }));
   const confirm = await screen.findByRole("alertdialog", { name: "Upgrade node-a?" });
   expect(confirm).toHaveTextContent(
-    "VMs keep running, but opld restarts briefly. Upgrade other nodes after this upgrade finishes.",
+    "VMs keep running, but orbivisord restarts briefly. Upgrade other nodes after this upgrade finishes.",
   );
   await userEvent.click(within(confirm).getByRole("button", { name: "Upgrade" }));
   expect(await screen.findByText("Upgrade node-a")).toBeInTheDocument();
@@ -444,7 +444,7 @@ it("lets viewers read the updates but not act on them", async () => {
   renderPage(<NodesPage />, { as: { ...ADMIN, role: "viewer" } });
   await userEvent.click(await screen.findByRole("button", { name: /^Updates for node-a:/ }));
   const dialog = await screen.findByRole("dialog", { name: "Updates for node-a" });
-  expect(within(dialog).getByText("oplite")).toBeInTheDocument();
+  expect(within(dialog).getByText("orbivisor")).toBeInTheDocument();
   expect(within(dialog).queryByRole("button", { name: "Check again" })).not.toBeInTheDocument();
   expect(within(dialog).queryByRole("button", { name: "Upgrade" })).not.toBeInTheDocument();
 });

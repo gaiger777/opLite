@@ -93,7 +93,7 @@ export function AppLayout() {
   return (
     <div className="flex min-h-svh flex-col md:flex-row">
       <aside className="border-b bg-sidebar text-sidebar-foreground md:w-56 md:border-r md:border-b-0">
-        <div className="px-4 py-3 text-lg font-semibold">opLite</div>
+        <div className="px-4 py-3 text-lg font-semibold">Orbivisor</div>
         <nav className="flex gap-1 overflow-x-auto px-2 pb-2 md:flex-col">
           {nav.map(({ to, key, icon: Icon, end }) => (
             <NavLink

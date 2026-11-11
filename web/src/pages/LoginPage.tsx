@@ -91,7 +91,7 @@ export function LoginPage() {
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle className="text-xl">
-            <h1>opLite</h1>
+            <h1>Orbivisor</h1>
           </CardTitle>
         </CardHeader>
         <CardContent>

@@ -21,7 +21,7 @@
     "not_leader": "The cluster leader is changing. Try again shortly.",
     "network_in_use": "A VM uses this network. Remove its interface first.",
     "vni_in_use": "Another network already uses this VNI.",
-    "node_online": "The node is online. Run oplctl cluster leave on it instead.",
+    "node_online": "The node is online. Run orbivisorctl cluster leave on it instead.",
     "pool_not_on_node": "That storage pool is not available on the node you are connected to.",
     "insufficient_storage": "The node does not have enough free space for this upload.",
     "last_admin": "The last administrator cannot give up the administrator role.",
@@ -58,14 +58,14 @@
     "fingerprint_mismatch": "The ESXi certificate changed since you trusted it. Connect again and check the new fingerprint.",
     "esxi_auth": "ESXi rejected the user name or password. Check them and try again.",
     "esxi_unreachable": "Cannot reach the ESXi host ({{message}}).",
-    "version_too_old": "The node runs an older opLite than the cluster. Upgrade it first: {{message}}",
+    "version_too_old": "The node runs an older Orbivisor than the cluster. Upgrade it first: {{message}}",
     "updates_unsupported": "The node does not check for updates.",
     "upgrade_in_progress": "An upgrade is in progress: {{message}}",
     "cluster_upgrading": "The cluster is being upgraded: {{message}}",
     "subscription_required": "An active subscription is required for the enterprise channel.",
     "invalid_subscription_key": "The subscription key is not valid: {{message}}",
     "telemetry_endpoint_required": "Set a telemetry endpoint first. This build has no default endpoint.",
-    "no_role": "Your directory account has no role in opLite. Ask an administrator to map one of your groups.",
+    "no_role": "Your directory account has no role in Orbivisor. Ask an administrator to map one of your groups.",
     "realm_unavailable": "Cannot reach the directory of this realm. Try again later or ask an administrator.",
     "external_user": "This user signs in through a realm. Change the password in the directory.",
     "sso_failed": "Single sign-on failed. Try again, or ask an administrator to check the realm.",
@@ -112,13 +112,13 @@
     "username": "Username",
     "password": "Password",
     "submit": "Sign in",
-    "version": "opLite {{version}}",
+    "version": "Orbivisor {{version}}",
     "realm": "Realm",
     "localRealm": "Local users",
     "or": "or",
     "sso": {
       "signIn": "Sign in with {{name}}",
-      "no_role": "Your account at the identity provider has no role in opLite. Ask an administrator to map one of your groups.",
+      "no_role": "Your account at the identity provider has no role in Orbivisor. Ask an administrator to map one of your groups.",
       "realm_unavailable": "Cannot reach the identity provider of this realm. Try again later or ask an administrator."
     }
   },
@@ -538,7 +538,7 @@
     }
   },
   "imports": {
-    "pageHint": "Bring VMware VMs into opLite from OVA files or straight from ESXi or vCenter. Review the settings proposed from the source VM, then run the import to create a stopped VM.",
+    "pageHint": "Bring VMware VMs into Orbivisor from OVA files or straight from ESXi or vCenter. Review the settings proposed from the source VM, then run the import to create a stopped VM.",
     "empty": "No imports.",
     "upload": "Upload OVA",
     "uploadTitle": "Upload an OVA",
@@ -580,7 +580,7 @@
     "diskBus": "Disk bus",
     "nicModel": "NIC model",
     "networks": "Network mapping",
-    "networksHint": "Choose an opLite network for each network the source VM uses.",
+    "networksHint": "Choose an Orbivisor network for each network the source VM uses.",
     "chooseNetwork": "Choose a network",
     "keepMacs": "Keep the source MAC addresses",
     "keepMacsHint": "Power off the VMware VM before starting the imported one. Turn this off to give the interfaces new MAC addresses.",
@@ -588,7 +588,7 @@
     "deleteNamed": "Delete import {{name}}",
     "deleteTitle": "Delete import {{name}}?",
     "deleteDescription": "Deletes the import and its files on {{node}}. The source VM and any VM already imported are kept.",
-    "forceHint": "{{error}} To forget the import and leave its files on that node, run oplctl import delete {{name}} --force.",
+    "forceHint": "{{error}} To forget the import and leave its files on that node, run orbivisorctl import delete {{name}} --force.",
     "codes": {
       "node_offline": "The node running the import is offline or has left the cluster.",
       "mac_in_use": "Another VM uses a source MAC address. Turn off \"Keep the source MAC addresses\" to give the interfaces new MAC addresses."
@@ -612,7 +612,7 @@
     },
     "esxi": "Import from ESXi",
     "esxiTitle": "Import from ESXi",
-    "esxiDescription": "The connection is made from the node you are connected to ({{node}}), and the import runs there. The password stays only in that node's memory: if opld restarts there, create the import again.",
+    "esxiDescription": "The connection is made from the node you are connected to ({{node}}), and the import runs there. The password stays only in that node's memory: if orbivisord restarts there, create the import again.",
     "host": "Host",
     "port": "Port",
     "user": "User",
@@ -632,7 +632,7 @@
     "chosenVm": "Source",
     "esxiSource": "ESXi",
     "diskFileEsxi": "File on the datastore",
-    "credentialsLost": "The ESXi password is no longer on this node (opld restarted or the request was interrupted). Delete this import and create it again."
+    "credentialsLost": "The ESXi password is no longer on this node (orbivisord restarted or the request was interrupted). Delete this import and create it again."
   },
   "migrate": {
     "title": "Migrate {{name}}",
@@ -715,13 +715,13 @@
     "createDescription": "Where volumes are kept: a directory on each node, an NFS export that the nodes mount, an LVM thin pool or ZFS dataset on each node, a Ceph RBD pool, or a volume group shared by the nodes.",
     "pathHint": "An absolute path on the nodes.",
     "shared": "Shared storage",
-    "sharedHint": "Check when every node sees the same files at this path, such as an NFS share mounted outside opLite.",
+    "sharedHint": "Check when every node sees the same files at this path, such as an NFS share mounted outside Orbivisor.",
     "sharing": "Sharing",
     "sharedState": "Shared",
     "localState": "Node-local",
     "sharedNamed": "Shared storage: {{name}}",
     "makeSharedTitle": "Make {{name}} shared storage?",
-    "makeSharedDescription": "Only do this when every node of the pool sees the same files at {{path}}, such as an NFS share mounted outside opLite. VMs with disks in the pool can then start on and migrate to any of its nodes.",
+    "makeSharedDescription": "Only do this when every node of the pool sees the same files at {{path}}, such as an NFS share mounted outside Orbivisor. VMs with disks in the pool can then start on and migrate to any of its nodes.",
     "makeLocalTitle": "Make {{name}} node-local?",
     "makeLocalDescription": "Each volume goes back to the node that created it. VMs using the pool's volumes must be on that node and not migrating.",
     "makeShared": "Make shared",
@@ -817,7 +817,7 @@
     },
     "kindHint": {
       "bridge": "A Linux bridge that already exists on the nodes. VMs on this network run only on nodes with the bridge.",
-      "vxlan": "opld creates the bridge oplv<VNI> and a VXLAN device on every node and links them over UDP 4789."
+      "vxlan": "orbivisord creates the bridge oplv<VNI> and a VXLAN device on every node and links them over UDP 4789."
     },
     "bridge": "Bridge",
     "vlanVni": "VLAN/VNI",
@@ -838,7 +838,7 @@
     "createDescription": "Points VM interfaces at a Linux bridge on the nodes or at a VXLAN network that spans the nodes.",
     "created": "Created network {{name}}.",
     "deleteTitle": "Delete network {{name}}?",
-    "deleteDescription": "Bridges you created on the nodes are not changed. For a VXLAN network, opld removes its bridge and VXLAN device from the nodes.",
+    "deleteDescription": "Bridges you created on the nodes are not changed. For a VXLAN network, orbivisord removes its bridge and VXLAN device from the nodes.",
     "deleted": "Deleted network {{name}}.",
     "inUse": "Remove the VM interfaces first.",
     "errors": {
@@ -909,7 +909,7 @@
     "pools": "Storage pools",
     "vms": "VMs",
     "thisNode": "(this node)",
-    "joinNote": "To add a node, issue a join token on the Cluster page and run oplctl cluster join on the new node.",
+    "joinNote": "To add a node, issue a join token on the Cluster page and run orbivisorctl cluster join on the new node.",
     "maintenanceNote": "No new VMs are placed on a node in maintenance. VMs already running there keep running.",
     "startMaintenance": "Enter maintenance",
     "endMaintenance": "End maintenance",
@@ -937,11 +937,11 @@
     "remove": "Remove from cluster",
     "removeTitle": "Remove {{name}} from the cluster?",
     "removeDescription": "Only for a node that is dead for good. It cannot rejoin with its current data, and VMs assigned to it stay assigned.",
-    "removeNote": "Only offline nodes can be removed here. To remove a live node, run oplctl cluster leave on it.",
+    "removeNote": "Only offline nodes can be removed here. To remove a live node, run orbivisorctl cluster leave on it.",
     "removed": "Removed {{name}} from the cluster.",
     "reason": {
       "thisNode": "You are connected through this node.",
-      "online": "The node is online. Run oplctl cluster leave on it."
+      "online": "The node is online. Run orbivisorctl cluster leave on it."
     },
     "fencing": "Fencing",
     "fencingMode": {
@@ -972,7 +972,7 @@
       "upgrade": "Upgrade",
       "upgrading": "Upgrading…",
       "upgradeTitle": "Upgrade {{name}}?",
-      "upgradeDescription": "VMs keep running, but opld restarts briefly. Upgrade other nodes after this upgrade finishes.",
+      "upgradeDescription": "VMs keep running, but orbivisord restarts briefly. Upgrade other nodes after this upgrade finishes.",
       "errors": {
         "node_offline": "The node is offline."
       }
@@ -1124,7 +1124,7 @@
     "owner": "Owner",
     "created": "Created",
     "empty": "No API tokens.",
-    "note": "Scripts and tools use API tokens. A token has the role of its owner. oplctl login makes one for the CLI.",
+    "note": "Scripts and tools use API tokens. A token has the role of its owner. orbivisorctl login makes one for the CLI.",
     "createTitle": "Create an API token",
     "createDescription": "The token acts as you, with your role.",
     "secretTitle": "Token {{name}} was created",
@@ -1152,7 +1152,7 @@
     "clusterAddress": "Cluster address",
     "issue": "Issue a join token",
     "issueTitle": "Issue a join token",
-    "issueDescription": "A new node joins with the token once. Start opld on the new node first.",
+    "issueDescription": "A new node joins with the token once. Start orbivisord on the new node first.",
     "ttl": "Valid for",
     "ttlOption": {
       "3600": "1 hour",
@@ -1163,14 +1163,14 @@
     "issuedDescription": "Run this on the new node before {{time}}. It cannot be shown again.",
     "command": "Command",
     "copyCommand": "Copy the command",
-    "commandNote": "Add --socket if opld on the new node does not use /run/opl/opld.sock."
+    "commandNote": "Add --socket if orbivisord on the new node does not use /run/opl/opld.sock."
   },
   "remotes": {
-    "pageHint": "Other opLite clusters this cluster can see. The status is collected every 30 seconds. What you can do on a remote cluster also depends on the role of the user who owns its API token there.",
+    "pageHint": "Other Orbivisor clusters this cluster can see. The status is collected every 30 seconds. What you can do on a remote cluster also depends on the role of the user who owns its API token there.",
     "empty": "No remote clusters.",
     "add": "Add",
     "addTitle": "Add a remote cluster",
-    "addDescription": "Register another opLite cluster with its address, the fingerprint of its CA and an API token created on it.",
+    "addDescription": "Register another Orbivisor cluster with its address, the fingerprint of its CA and an API token created on it.",
     "editTitle": "Edit remote cluster {{name}}",
     "editNamed": "Edit {{name}}",
     "refreshNamed": "Refresh {{name}}",
@@ -1301,7 +1301,7 @@
     "allTasks": "All tasks",
     "noLeader": "No leader",
     "noNodes": "No nodes.",
-    "mixedVersions": "Nodes run different opLite versions ({{versions}}). Finish the upgrade on every node.",
+    "mixedVersions": "Nodes run different Orbivisor versions ({{versions}}). Finish the upgrade on every node.",
     "subscription": {
       "none": "This cluster has no subscription.",
       "invalid": "The subscription key does not match this build.",
@@ -1315,7 +1315,7 @@
   "settings": {
     "updates": "Updates",
     "channel": "Update channel",
-    "channelHint": "Every node gets opLite packages from this channel. Testing gets new versions before stable.",
+    "channelHint": "Every node gets Orbivisor packages from this channel. Testing gets new versions before stable.",
     "channels": {
       "stable": "Stable",
       "testing": "Testing",

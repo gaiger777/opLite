@@ -80,9 +80,9 @@ it("signs in, returns to the requested page and signs out", async () => {
 
   await screen.findByRole("button", { name: "Sign in" });
   expect(window.location.pathname).toBe("/login");
-  expect(screen.getByRole("heading", { level: 1, name: "opLite" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { level: 1, name: "Orbivisor" })).toBeInTheDocument();
   // 로그인하기 전에도 서버 버전이 보인다.
-  expect(await screen.findByText("opLite 0.9.0~ci7")).toBeInTheDocument();
+  expect(await screen.findByText("Orbivisor 0.9.0~ci7")).toBeInTheDocument();
   // 영역이 로컬뿐이면 고르지 않는다.
   expect(screen.queryByLabelText("Realm")).not.toBeInTheDocument();
   await user.type(screen.getByLabelText("Username"), "admin");
@@ -159,7 +159,7 @@ it("explains realm sign-in errors", async () => {
   await user.type(screen.getByLabelText("Password"), "secret-123");
   await user.click(screen.getByRole("button", { name: "Sign in" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Your directory account has no role in opLite. Ask an administrator to map one of your groups.",
+    "Your directory account has no role in Orbivisor. Ask an administrator to map one of your groups.",
   );
   await user.click(screen.getByRole("button", { name: "Sign in" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -221,7 +221,7 @@ it("explains why single sign-on failed and clears the code from the address", as
   for (const [code, text] of [
     [
       "no_role",
-      "Your account at the identity provider has no role in opLite. Ask an administrator to map one of your groups.",
+      "Your account at the identity provider has no role in Orbivisor. Ask an administrator to map one of your groups.",
     ],
     [
       "realm_unavailable",

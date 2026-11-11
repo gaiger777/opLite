@@ -42,7 +42,7 @@ const TTLS = [3600, 86400, 604800] as const;
 
 /** 새 노드에서 실행할 명령. URL에 `?`와 `&`가 있어 작은따옴표로 감싸고, 안의 `'`는 `'\''`로 바꾼다. */
 export function joinCommand(url: string): string {
-  return `oplctl cluster join '${url.replaceAll("'", "'\\''")}'`;
+  return `orbivisorctl cluster join '${url.replaceAll("'", "'\\''")}'`;
 }
 
 export function ClusterPage() {

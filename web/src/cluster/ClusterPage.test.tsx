@@ -38,11 +38,11 @@ beforeEach(() =>
 
 it("quotes the join URL in the command", () => {
   expect(joinCommand("opl-join://h:8006?token=a&ca=sha256:00")).toBe(
-    "oplctl cluster join 'opl-join://h:8006?token=a&ca=sha256:00'",
+    "orbivisorctl cluster join 'opl-join://h:8006?token=a&ca=sha256:00'",
   );
   // 작은따옴표는 닫고 이스케이프한 뒤 다시 연다.
   expect(joinCommand("opl-join://h:8006?token=a'b")).toBe(
-    "oplctl cluster join 'opl-join://h:8006?token=a'\\''b'",
+    "orbivisorctl cluster join 'opl-join://h:8006?token=a'\\''b'",
   );
 });
 
@@ -95,7 +95,7 @@ it("issues a join token and shows the command once", async () => {
 
   const dialog = await screen.findByRole("dialog", { name: "Join a new node" });
   expect(body).toEqual({ ttl_secs: 86400 });
-  const command = "oplctl cluster join 'opl-join://node-b:8006?token=oplj_x&ca=sha256:00ff'";
+  const command = "orbivisorctl cluster join 'opl-join://node-b:8006?token=oplj_x&ca=sha256:00ff'";
   expect(within(dialog).getByLabelText("Command")).toHaveValue(command);
   expect(within(dialog).getByText(/2030/)).toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "Copy the command" }));

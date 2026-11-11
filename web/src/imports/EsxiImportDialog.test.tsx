@@ -416,6 +416,6 @@ it("shows the ESXi source and explains lost credentials", async () => {
   const row = (await within(table).findByText("web01")).closest("tr")!;
   expect(row).toHaveTextContent("Web 01esxi1.lab / datastore1 / web01/web01.vmx");
   expect(row).toHaveTextContent(
-    "The ESXi password is no longer on this node (opld restarted or the request was interrupted). Delete this import and create it again.",
+    "The ESXi password is no longer on this node (orbivisord restarted or the request was interrupted). Delete this import and create it again.",
   );
 });

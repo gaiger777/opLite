@@ -227,7 +227,7 @@ it("warns while nodes run different versions", async () => {
   server.use(cluster("a"));
   const { unmount } = renderPage(<DashboardPage />);
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Nodes run different opLite versions (0.9.0, 0.10.0~rc1, 0.10.0). Finish the upgrade on every node.",
+    "Nodes run different Orbivisor versions (0.9.0, 0.10.0~rc1, 0.10.0). Finish the upgrade on every node.",
   );
   unmount();
 

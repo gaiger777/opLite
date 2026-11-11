@@ -124,7 +124,7 @@ export interface RunForm {
   firmware: Schemas["Firmware"];
   diskBus: Schemas["DiskBus"];
   nicModel: Schemas["NicModel"];
-  /** 원본 네트워크 → opLite 네트워크(고르지 않았으면 빈 문자열) */
+  /** 원본 네트워크 → Orbivisor 네트워크(고르지 않았으면 빈 문자열) */
   networks: Record<string, string>;
   keepMacs: boolean;
 }

@@ -10,7 +10,7 @@ import { apiUrl, server } from "@/test/server";
 
 const lan = { id: "019a0f3c-0000-7000-8004-000000000001", name: "lan" } as Network;
 
-/** 원본 NIC가 둘이고 그중 "Backup"은 이름이 같은 opLite 네트워크가 없는 가져오기 */
+/** 원본 NIC가 둘이고 그중 "Backup"은 이름이 같은 Orbivisor 네트워크가 없는 가져오기 */
 const web01 = vmImport("web01", 1, {
   source_vm: {
     ...vmImport("web01", 1).status.source_vm!,
@@ -65,7 +65,7 @@ it("shows an ESXi source and explains lost credentials", async () => {
   ).toBeInTheDocument();
   expect(
     screen.getByText(
-      "The source cannot be used: The ESXi password is no longer on this node (opld restarted or the request was interrupted). Delete this import and create it again.",
+      "The source cannot be used: The ESXi password is no longer on this node (orbivisord restarted or the request was interrupted). Delete this import and create it again.",
     ),
   ).toBeInTheDocument();
   const disks = screen.getByRole("table", { name: "Disks" });
@@ -327,7 +327,7 @@ it("deletes the import and goes back to the list", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(
     await within(dialog).findByText(
-      "The node running the import is offline or has left the cluster. To forget the import and leave its files on that node, run oplctl import delete web01 --force.",
+      "The node running the import is offline or has left the cluster. To forget the import and leave its files on that node, run orbivisorctl import delete web01 --force.",
     ),
   ).toBeVisible();
   offline = false;
