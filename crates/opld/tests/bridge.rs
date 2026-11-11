@@ -107,6 +107,18 @@ async fn vm_nics_join_the_bridge_with_their_vlan() {
         "{vlans}"
     );
 
+    // 지표: tap NIC의 카운터로 VM 네트워크 값이 있다(사용자 모드 NIC는 빼고 센다).
+    common::eventually("VM network metrics", || async {
+        let m = d.ctl_json(&["vm", "stats", "web"]).await;
+        m["samples"]
+            .as_array()
+            .and_then(|s| s.last())
+            .is_some_and(|s| {
+                s["net_rx_bps"].as_f64().is_some() && s["net_tx_bps"].as_f64().is_some()
+            })
+    })
+    .await;
+
     // 쓰고 있는 네트워크는 지울 수 없다.
     let err = d.ctl(&["network", "delete", "lan"]).await.unwrap_err();
     assert!(err.to_string().contains("network_in_use"), "{err}");

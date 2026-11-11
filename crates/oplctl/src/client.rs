@@ -55,6 +55,18 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+/// 로그인하지 않았거나 토큰이 더 이상 맞지 않다(401 `unauthorized`). 명령이 오류 타입으로 알아본다.
+#[derive(Debug)]
+pub struct NotLoggedIn;
+
+impl std::fmt::Display for NotLoggedIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not logged in or the token is no longer valid; run `orbivisorctl login`")
+    }
+}
+
+impl std::error::Error for NotLoggedIn {}
+
 /// 이름·키를 API 경로의 한 조각으로 넣을 때 쓴다. RFC 3986 unreserved(영문·숫자·`-._~`) 밖은 UTF-8
 /// 바이트마다 `%XX`로 바꾼다(OIDC 사용자 이름의 `+`·`@` 등이 서버에서 같은 이름으로 풀리게).
 pub fn seg(s: &str) -> String {
@@ -121,7 +133,7 @@ impl Client {
             return Ok(body);
         }
         if status == StatusCode::UNAUTHORIZED && body["code"] == "unauthorized" {
-            bail!("not logged in or the token is no longer valid; run `orbivisorctl login`");
+            return Err(NotLoggedIn.into());
         }
         match (body["message"].as_str(), body["code"].as_str()) {
             (Some(message), Some(code)) => Err(ApiError {

@@ -1413,6 +1413,52 @@ orbivisorctl node maintenance node1 on   # VM은 옮기지 않고 배치만 막�
   못한 VM을 끄는 선택과 롤링 업그레이드 자동화(노드를 차례로 비우고 올리고 재부팅)는 없다. 볼륨 만들기·백업 같은
   작업의 노드 고르기는 유지보수를 보지 않는다.
 
+## 지표
+
+노드마다 5초마다 그 노드와 그 노드에서 도는 VM의 사용량을 재고 메모리에 1시간(시리즈마다 720점) 둔다. Raft에 쓰지
+않고 디스크에도 쓰지 않는다. 다른 노드의 지표는 읽을 때 노드 사이 RPC로 모은다(감사 로그와 같은 방식).
+
+```bash
+orbivisorctl node stats            # 노드마다 마지막 점
+# NODE   TIME                  CPU    MEMORY          DISK READ  DISK WRITE  NET RX     NET TX    DATA FS
+# node1  2026-11-11T06:30:05Z  12.3%  6.1GiB/31.2GiB  0B/s       1.2MiB/s    15.4KiB/s  3.1KiB/s  41.0GiB/468.0GiB
+orbivisorctl vm stats web          # VM의 마지막 점(마이그레이션 앞뒤 노드의 점을 합친 것)
+# TIME                  CPU    MEMORY  DISK READ  DISK WRITE  READ IOPS  WRITE IOPS  NET RX    NET TX
+# 2026-11-11T06:30:05Z  48.7%  1.1GiB  0B/s       512.0KiB/s  0.0        12.4        2.0KiB/s  1.1KiB/s
+orbivisorctl node stats --watch    # 5초마다 새 점만 다시 읽어 새 표를 이어 찍는다(Ctrl-C로 끝냄, vm stats도)
+orbivisorctl -o json vm stats web  # 응답 그대로(남은 모든 점)
+orbivisorctl -o json node stats --watch  # 회차마다 응답 한 줄(JSON Lines)
+```
+
+- **노드 값.** CPU %(모든 코어를 합해 100), 쓰는 메모리/전체(Linux `MemTotal − MemAvailable`, macOS active + wired +
+  compressor), 실제 디스크의 읽기·쓰기 바이트/초(Linux `/proc/diskstats`에서 파티션과 `loop`·`ram`·`zram`·`dm-`·`md`·`nbd`·
+  `zd`·`rbd` 장치를 뺀 합 — LVM·RAID·ZFS 위의 쓰기를 두 번 세지 않는다, macOS는 없음), 실제 NIC의 받기·보내기
+  바이트/초(Linux는 `/sys/class/net/<if>/device`가 있는 장치, macOS는 `en*`), 데이터 디렉터리(`data_dir`)의 파일 시스템
+  사용/전체.
+- **VM 값.** CPU %는 QEMU 프로세스의 CPU 시간을 vCPU 수(sockets × cores)로 나눈 것이라 vCPU가 모두 바쁘면 100이고
+  I/O 스레드 때문에 조금 넘을 수 있다. 메모리는 QEMU 프로세스의 RSS(게스트가 쓰는 양이 아님), 디스크는 QMP
+  `query-blockstats`의 모든 VM 디스크 합(바이트/초와 IOPS), 네트워크는 tap NIC 카운터의 합을 게스트 기준으로 바꾼
+  것이다(받기 = tap의 보내기). 사용자 모드 NIC(`user`)는 tap이 없어 세지 않고, tap NIC가 없으면(macOS) 네트워크는
+  없다. `Running`·`Paused` VM만 잰다.
+- **비율과 빈 값.** 비율은 직전 측정과의 차이를 걸린 시간(단조 시계)으로 나눈다. 첫 측정(orbivisord 시작, VM 시작·붙기,
+  QEMU pid 바뀜, 카운터가 줄어듦)은 기준만 잡으므로 VM의 첫 점은 켠 뒤 5~10초에 생긴다. 읽지 못한 값은 `null`(표는
+  `-`)이다. `query-blockstats`가 1초 안에 답하지 않으면 그 VM의 디스크 값만 `null`이고, 실패 경고는 VM마다 10분에 한 번
+  남는다.
+- **API.** `GET /api/v1/metrics/nodes?since=`(모든 노드, `{"nodes":[{"node","samples"}],"unreachable","unsupported"}`,
+  노드 이름 순), `GET /api/v1/nodes/{key}/metrics?since=`(노드 하나, `{"node","samples"}`), `GET /api/v1/vms/{key}/metrics?since=`
+  (`{"vm","samples","unreachable","unsupported"}` — 위트니스를 뺀 모든 노드에 물어 시각 순으로 합친다). 노드 읽기는 노드
+  읽기 권한, VM 읽기는 VM 읽기 권한(viewer도 된다)이다. `since`는 그 노드 시계의 유닉스 밀리초 `t`이고 그보다 뒤의
+  점만 온다(숫자가 아니면 **400** `invalid_request`). 점의 `t`는 그 노드의 벽시계라 노드 사이 시계 차이가 그대로 보인다.
+  다른 노드는 노드 사이 RPC로 3초까지 기다리고, 꺼진 것으로 기록된 노드는 묻지 않는다. 답하지 않거나 꺼진 노드는
+  `unreachable`, 지표를 모르는 옛 orbivisord는 `unsupported`에 이름이 들어간다(orbivisorctl은 표 뒤 stderr에
+  `warning: no metrics from: …`, `note: these nodes do not report metrics yet: …`를 쓴다). 노드 하나 읽기는 그 노드가
+  꺼졌거나(`node "…" is offline`) 닿지 않으면 **503** `node_unreachable`, 옛 노드면 **409** `cluster_upgrading`,
+  위트니스면 **409** `node_unavailable`이다. 노드 기능 목록(`status.features`)에 `metrics`가 있다.
+- **한계.** orbivisord를 다시 시작하면 그 노드의 기록이 비고, 꺼진 노드의 기록은 읽을 수 없다. 측정 간격(5초)과
+  보관 시간(1시간)은 바꿀 수 없다. Prometheus 내보내기, 경보, 게스트 안의 지표, 디스크·NIC마다 나눈 값은 없다. 웹 차트는
+  다음 계획이다. vCPU 수와 NIC 목록은 지금 VM 스펙에서 읽으므로, 다시 시작해야 적용되는 변경(코어 수, NIC 더하기) 뒤
+  VM을 다시 시작하기 전까지는 CPU %가 새 vCPU 수로 나뉘고 네트워크가 `null`일 수 있다.
+
 ## 백업과 복원
 
 백업은 VM 전체(디스크, UEFI 변수, VM 스펙)를 다른 저장소에 떠 둔 것이다. 스냅샷과 달리 VM 디스크의 저장소를
@@ -2810,6 +2856,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [증분 백업·증분 복제 설계 (하위 프로젝트 12: 계획 40·41)](docs/superpowers/specs/2026-11-09-incremental-backup-design.md)
 - [로컬 디스크 라이브 마이그레이션 설계 (하위 프로젝트 13: 계획 42)](docs/superpowers/specs/2026-11-10-storage-migration-design.md)
 - [제품 이름 Orbivisor로 바꾸기 설계 (계획 43)](docs/superpowers/specs/2026-11-10-rename-orbivisor-design.md)
+- [실시간 지표와 쉬운 화면 설계 (하위 프로젝트 14: 계획 44~47)](docs/superpowers/specs/2026-11-11-monitoring-ui-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)

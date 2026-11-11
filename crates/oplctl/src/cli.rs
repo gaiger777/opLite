@@ -10,8 +10,8 @@ use reqwest::Method;
 use serde_json::{Value, json};
 
 use crate::client::{
-    ApiError, BACKUP_WAIT, Client, DRAIN_WAIT, IMPORT_WAIT, MIGRATE_WAIT, UPGRADE_WAIT, fetch_ca,
-    fingerprint, local, seg,
+    ApiError, BACKUP_WAIT, Client, DRAIN_WAIT, IMPORT_WAIT, MIGRATE_WAIT, NotLoggedIn,
+    UPGRADE_WAIT, fetch_ca, fingerprint, local, seg,
 };
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
@@ -235,6 +235,17 @@ enum NodeCmd {
         #[arg(long)]
         wait: bool,
     },
+    /// 노드마다 마지막 사용량 점(CPU, 메모리, 디스크, 네트워크, 데이터 파일 시스템). `-o json`은 남은 모든
+    /// 점(1시간)이다.
+    Stats(StatsArgs),
+}
+
+/// `node stats`·`vm stats`의 공통 인자
+#[derive(Args)]
+struct StatsArgs {
+    /// 5초마다 다시 읽어 새 표를 이어 찍는다(Ctrl-C로 끝낸다).
+    #[arg(long)]
+    watch: bool,
 }
 
 /// `node maintenance`의 켜기·끄기
@@ -969,6 +980,12 @@ enum VmCmd {
     Snapshot {
         #[command(subcommand)]
         cmd: SnapshotCmd,
+    },
+    /// VM의 마지막 사용량 점(QEMU 프로세스의 CPU·RSS, 디스크, 네트워크). `-o json`은 남은 모든 점(1시간)이다.
+    Stats {
+        vm: String,
+        #[command(flatten)]
+        stats: StatsArgs,
     },
     /// 로컬 포트에서 VNC 연결을 받아 VM 콘솔로 잇는다. Ctrl-C로 끝낸다.
     Console {
@@ -2373,6 +2390,327 @@ async fn audit(
     Ok(())
 }
 
+/// `--watch`가 다시 읽는 간격(측정 간격과 같다)
+const STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// CPU 사용률 칸(`12.3%`)
+fn percent_cell(v: &Value) -> String {
+    v.as_f64()
+        .map_or_else(|| "-".into(), |n| format!("{n:.1}%"))
+}
+
+/// MiB 값을 사람이 읽기 쉽게
+fn mib_cell(v: &Value) -> String {
+    v.as_u64()
+        .map_or_else(|| "-".into(), |n| bytes(&json!(n.saturating_mul(1 << 20))))
+}
+
+/// 사용/전체 MiB 칸(`1.0GiB/4.0GiB`). 둘 중 하나라도 없으면 `-`
+fn mib_pair_cell(used: &Value, total: &Value) -> String {
+    if used.is_null() || total.is_null() {
+        return "-".into();
+    }
+    format!("{}/{}", mib_cell(used), mib_cell(total))
+}
+
+/// 바이트/초 칸(`1.5KiB/s`)
+fn rate_cell(v: &Value) -> String {
+    v.as_f64().map_or_else(
+        || "-".into(),
+        |n| format!("{}/s", bytes(&json!(n.max(0.0).round() as u64))),
+    )
+}
+
+/// 초당 횟수 칸
+fn iops_cell(v: &Value) -> String {
+    v.as_f64().map_or_else(|| "-".into(), |n| format!("{n:.1}"))
+}
+
+/// 점의 측정 시각 칸
+fn sample_time(s: &Value) -> String {
+    s["t"].as_u64().map_or_else(|| "-".into(), unix_ms_time)
+}
+
+/// 지표 요청을 보낸다. `--watch`면 일시 오류는 stderr에 찍고 `None`이다(다음 회차에 다시 읽는다).
+/// 401·403·404(로그인·권한·없는 대상)는 다시 읽어도 같으므로 끝낸다.
+async fn send_stats_request(
+    client: &Client,
+    r: reqwest::RequestBuilder,
+    watch: bool,
+    err: &mut dyn Write,
+) -> anyhow::Result<Option<Value>> {
+    match client.send(r).await {
+        Ok(resp) => Ok(Some(resp)),
+        Err(e) if watch && !ends_stats_watch(&e) => {
+            writeln!(err, "error: {e:#}")?;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `--watch`를 끝내는 오류(401·403·404)
+fn ends_stats_watch(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<NotLoggedIn>().is_some()
+        || e.downcast_ref::<ApiError>().is_some_and(|api| {
+            matches!(
+                api.code.as_str(),
+                "unauthorized" | "forbidden" | "not_found"
+            )
+        })
+}
+
+/// `-o json`: 응답 그대로. `--watch`면 회차마다 한 줄(JSON Lines)이다.
+fn print_stats_json(out: &mut dyn Write, resp: &Value, watch: bool) -> anyhow::Result<()> {
+    if watch {
+        writeln!(out, "{}", serde_json::to_string(resp)?)?;
+    } else {
+        print_json(out, resp)?;
+    }
+    Ok(())
+}
+
+/// 지표 응답의 `unreachable`(답하지 않은 노드)·`unsupported`(옛 노드)를 `err`(stderr)에 알린다.
+fn metrics_warnings(resp: &Value, err: &mut dyn Write) -> std::io::Result<()> {
+    let names = |key: &str| -> Vec<&str> {
+        resp[key]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    };
+    let unreachable = names("unreachable");
+    if !unreachable.is_empty() {
+        writeln!(err, "warning: no metrics from: {}", unreachable.join(", "))?;
+    }
+    let unsupported = names("unsupported");
+    if !unsupported.is_empty() {
+        writeln!(
+            err,
+            "note: these nodes do not report metrics yet: {}",
+            unsupported.join(", ")
+        )?;
+    }
+    Ok(())
+}
+
+/// `node stats`의 열
+const NODE_STATS_HEADERS: &[&str] = &[
+    "NODE",
+    "TIME",
+    "CPU",
+    "MEMORY",
+    "DISK READ",
+    "DISK WRITE",
+    "NET RX",
+    "NET TX",
+    "DATA FS",
+];
+
+/// `node stats`의 한 행. 점이 없으면(`null`) 이름 말고는 모두 `-`다.
+fn node_stats_row(name: &str, s: &Value) -> Vec<String> {
+    vec![
+        name.to_string(),
+        sample_time(s),
+        percent_cell(&s["cpu"]),
+        mib_pair_cell(&s["mem_used_mib"], &s["mem_total_mib"]),
+        rate_cell(&s["disk_read_bps"]),
+        rate_cell(&s["disk_write_bps"]),
+        rate_cell(&s["net_rx_bps"]),
+        rate_cell(&s["net_tx_bps"]),
+        mib_pair_cell(&s["fs_used_mib"], &s["fs_total_mib"]),
+    ]
+}
+
+/// `node stats`가 읽기마다 이어 쓰는 것
+#[derive(Default)]
+struct NodeStatsState {
+    /// 노드 id → 이름
+    names: std::collections::HashMap<String, String>,
+    /// 노드 id → 받은 마지막 점
+    last: std::collections::HashMap<String, Value>,
+    /// 지금까지 응답에 나온 노드 id
+    seen: std::collections::HashSet<String>,
+    /// 지금까지 본 노드 가운데 직전 응답에 빠진 노드 id
+    missing: std::collections::HashSet<String>,
+    /// 다음 읽기의 `since`: 응답에 나온 노드의 마지막 `t` 가운데 가장 이른 것(빠진 노드는 셈에서 뺀다).
+    /// 점이 없는 노드가 있거나 빠졌던 노드가 이번에 돌아왔으면 없음 — 돌아온 노드의 시계가 늦어도 그 줄이
+    /// 멈추지 않게 한 번은 모든 점을 받는다.
+    since: Option<i64>,
+}
+
+/// `node stats`: `GET /metrics/nodes`를 읽어 보인다. `watch`면 5초마다 새 점만 다시 읽어 새 표를 이어 찍는다.
+async fn node_stats(
+    client: &Client,
+    watch: bool,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+    err: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let mut state = NodeStatsState::default();
+    if !json_out {
+        for n in items(&client.get("/nodes").await?) {
+            state.names.insert(cell(&n["id"]), cell(&n["name"]));
+        }
+    }
+    loop {
+        node_stats_round(client, &mut state, watch, json_out, out, err).await?;
+        if !watch {
+            return Ok(());
+        }
+        tokio::time::sleep(STATS_EVERY).await;
+        if !json_out {
+            writeln!(out)?;
+        }
+    }
+}
+
+/// `node stats`의 읽기 한 번. 표는 응답의 노드마다 그 노드의 마지막 점이다(이번에 새 점이 없으면 전에 받은
+/// 점). `-o json`은 응답 그대로이고 stderr에 쓰지 않는다.
+async fn node_stats_round(
+    client: &Client,
+    state: &mut NodeStatsState,
+    watch: bool,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+    err: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let mut r = client.request(Method::GET, "/metrics/nodes");
+    if let Some(since) = state.since {
+        r = r.query(&[("since", since)]);
+    }
+    let Some(resp) = send_stats_request(client, r, watch, err).await? else {
+        return Ok(());
+    };
+    let nodes = resp["nodes"].as_array().cloned().unwrap_or_default();
+    let ids: std::collections::HashSet<String> = nodes.iter().map(|n| cell(&n["node"])).collect();
+    let returned = state.missing.iter().any(|id| ids.contains(id));
+    state.missing = state.seen.difference(&ids).cloned().collect();
+    state.seen.extend(ids);
+    let mut since: Option<Option<i64>> = returned.then_some(None);
+    for n in &nodes {
+        let id = cell(&n["node"]);
+        if let Some(s) = n["samples"].as_array().and_then(|a| a.last()) {
+            state.last.insert(id.clone(), s.clone());
+        }
+        let t = state.last.get(&id).and_then(|s| s["t"].as_i64());
+        since = Some(match since {
+            None => t,
+            Some(m) => m.zip(t).map(|(m, t)| m.min(t)),
+        });
+    }
+    state.since = since.flatten();
+    if json_out {
+        return print_stats_json(out, &resp, watch);
+    }
+    let rows: Vec<Vec<String>> = nodes
+        .iter()
+        .map(|n| {
+            let id = cell(&n["node"]);
+            let name = state.names.get(&id).unwrap_or(&id);
+            node_stats_row(name, state.last.get(&id).unwrap_or(&Value::Null))
+        })
+        .collect();
+    table(out, NODE_STATS_HEADERS, &rows)?;
+    metrics_warnings(&resp, err)?;
+    Ok(())
+}
+
+/// `vm stats`의 열
+const VM_STATS_HEADERS: &[&str] = &[
+    "TIME",
+    "CPU",
+    "MEMORY",
+    "DISK READ",
+    "DISK WRITE",
+    "READ IOPS",
+    "WRITE IOPS",
+    "NET RX",
+    "NET TX",
+];
+
+/// `vm stats`의 한 행
+fn vm_stats_row(s: &Value) -> Vec<String> {
+    vec![
+        sample_time(s),
+        percent_cell(&s["cpu"]),
+        mib_cell(&s["mem_rss_mib"]),
+        rate_cell(&s["disk_read_bps"]),
+        rate_cell(&s["disk_write_bps"]),
+        iops_cell(&s["disk_read_iops"]),
+        iops_cell(&s["disk_write_iops"]),
+        rate_cell(&s["net_rx_bps"]),
+        rate_cell(&s["net_tx_bps"]),
+    ]
+}
+
+/// `vm stats`가 읽기마다 이어 쓰는 것
+#[derive(Default)]
+struct VmStatsState {
+    /// 받은 마지막 점
+    last: Option<Value>,
+    /// 다음 읽기의 `since`(마지막 점의 `t`)
+    since: Option<i64>,
+}
+
+/// `vm stats`: `GET /vms/{key}/metrics`를 읽어 보인다. `watch`면 5초마다 새 점만 다시 읽어 새 표를 이어 찍는다.
+async fn vm_stats(
+    client: &Client,
+    vm: &str,
+    watch: bool,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+    err: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let mut state = VmStatsState::default();
+    loop {
+        vm_stats_round(client, vm, &mut state, watch, json_out, out, err).await?;
+        if !watch {
+            return Ok(());
+        }
+        tokio::time::sleep(STATS_EVERY).await;
+        if !json_out {
+            writeln!(out)?;
+        }
+    }
+}
+
+/// `vm stats`의 읽기 한 번. 표는 마지막 점 한 줄이다(이번에 새 점이 없으면 전에 받은 점). 점이 하나도 없으면
+/// 머리만 찍고 stderr에 알린다. `-o json`은 응답 그대로이고 stderr에 쓰지 않는다.
+async fn vm_stats_round(
+    client: &Client,
+    vm: &str,
+    state: &mut VmStatsState,
+    watch: bool,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+    err: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let mut r = client.request(Method::GET, &format!("/vms/{}/metrics", seg(vm)));
+    if let Some(since) = state.since {
+        r = r.query(&[("since", since)]);
+    }
+    let Some(resp) = send_stats_request(client, r, watch, err).await? else {
+        return Ok(());
+    };
+    if let Some(s) = resp["samples"].as_array().and_then(|a| a.last()) {
+        state.since = s["t"].as_i64();
+        state.last = Some(s.clone());
+    }
+    if json_out {
+        return print_stats_json(out, &resp, watch);
+    }
+    let rows: Vec<Vec<String>> = state.last.iter().map(vm_stats_row).collect();
+    table(out, VM_STATS_HEADERS, &rows)?;
+    metrics_warnings(&resp, err)?;
+    if state.last.is_none() {
+        writeln!(
+            err,
+            "note: no metrics yet; the VM is off or started less than 10 seconds ago"
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Role {
     Admin,
@@ -3268,6 +3606,9 @@ where
                 .await?
             }
             NodeCmd::Drain { node, wait } => node_drain(&client, &node, wait, out).await?,
+            NodeCmd::Stats(stats) => {
+                node_stats(&client, stats.watch, json_out, out, &mut std::io::stderr()).await?
+            }
         },
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::List => {
@@ -4630,6 +4971,17 @@ async fn vm(
             writeln!(out, "vm {name} cloned from {vm}")?;
         }
         VmCmd::Snapshot { cmd } => snapshot(client, cmd, json_out, out).await?,
+        VmCmd::Stats { vm, stats } => {
+            vm_stats(
+                client,
+                &vm,
+                stats.watch,
+                json_out,
+                out,
+                &mut std::io::stderr(),
+            )
+            .await?
+        }
         VmCmd::Console { vm, port } => {
             // 콘솔을 열 수 있는지 먼저 확인한다(없는 VM, 권한).
             client.get(&format!("/vms/{}", seg(&vm))).await?;
@@ -9435,6 +9787,383 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             String::from_utf8(out).unwrap(),
             format!("{shown}{shown}{shown}{shown}{preview}")
         );
+    }
+
+    /// `node stats`의 노드 점 하나
+    fn node_sample(t: u64, cpu: f64) -> Value {
+        json!({
+            "t": t, "cpu": cpu, "mem_used_mib": 1024, "mem_total_mib": 4096,
+            "disk_read_bps": 1536.0, "disk_write_bps": null, "net_rx_bps": 2048.5,
+            "net_tx_bps": 0.0, "fs_used_mib": 10240, "fs_total_mib": 102400
+        })
+    }
+
+    /// `node stats`는 노드마다 마지막 점을 노드 이름으로 보이고, 점이 없는 노드는 `-`다. 읽지 못한 노드와
+    /// 옛 노드는 stderr에 알린다. `-o json`은 응답 그대로(모든 점)이고 노드 목록을 읽지 않는다.
+    #[tokio::test]
+    async fn node_stats_shows_the_last_sample_of_each_node() {
+        let (client, seen) = fake_api(|path| match path {
+            "/api/v1/nodes" => json!({ "items": [
+                { "id": "id-a", "name": "node-a" }, { "id": "id-b", "name": "node-b" }
+            ] }),
+            _ => json!({
+                "nodes": [
+                    { "node": "id-a", "samples": [
+                        node_sample(1_762_387_200_123, 99.0),
+                        node_sample(1_762_387_205_123, 12.345)
+                    ] },
+                    { "node": "id-b", "samples": [] }
+                ],
+                "unreachable": ["node-c"],
+                "unsupported": ["node-d"]
+            }),
+        })
+        .await;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        node_stats(&client, false, false, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/nodes HTTP/1.1",
+                "GET /api/v1/metrics/nodes HTTP/1.1"
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NODE    TIME                  CPU    MEMORY         DISK READ  DISK WRITE  NET RX    NET TX  DATA FS\n\
+             node-a  2025-11-06T00:00:05Z  12.3%  1.0GiB/4.0GiB  1.5KiB/s   -           2.0KiB/s  0B/s    10.0GiB/100.0GiB\n\
+             node-b  -                     -      -              -          -           -         -       -\n"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: no metrics from: node-c\n\
+             note: these nodes do not report metrics yet: node-d\n"
+        );
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        node_stats(&client, false, true, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[2],
+            "GET /api/v1/metrics/nodes HTTP/1.1"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        let shown: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(shown["nodes"][0]["samples"].as_array().unwrap().len(), 2);
+        assert!(err.is_empty());
+    }
+
+    /// `node stats --watch`의 다음 읽기는 모든 노드의 마지막 점 가운데 가장 이른 `t`를 `since`로 보내고,
+    /// 새 점이 없는 노드는 전에 받은 마지막 점을 보인다.
+    #[tokio::test]
+    async fn node_stats_watch_asks_only_for_new_samples() {
+        let (client, seen) = fake_api_status(|path| {
+            let body = if path.contains("since=") {
+                json!({
+                    "nodes": [
+                        { "node": "id-a", "samples": [] },
+                        { "node": "id-b", "samples": [node_sample(1_762_387_215_000, 3.0)] }
+                    ],
+                    "unreachable": [], "unsupported": []
+                })
+            } else {
+                json!({
+                    "nodes": [
+                        { "node": "id-a", "samples": [node_sample(1_762_387_205_000, 1.0)] },
+                        { "node": "id-b", "samples": [node_sample(1_762_387_210_000, 2.0)] }
+                    ],
+                    "unreachable": [], "unsupported": []
+                })
+            };
+            (200, body)
+        })
+        .await;
+        let mut state = NodeStatsState::default();
+        state.names.insert("id-a".into(), "node-a".into());
+        let mut out = Vec::new();
+        node_stats_round(&client, &mut state, true, false, &mut out, &mut Vec::new())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        node_stats_round(&client, &mut state, true, false, &mut out, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/metrics/nodes HTTP/1.1",
+                "GET /api/v1/metrics/nodes?since=1762387205000 HTTP/1.1"
+            ]
+        );
+        let out = String::from_utf8(out).unwrap();
+        let rows: Vec<&str> = out.lines().skip(1).collect();
+        // 이름을 모르는 노드는 id로 보인다.
+        assert!(
+            rows[0].starts_with("node-a  2025-11-06T00:00:05Z  1.0%"),
+            "{out}"
+        );
+        assert!(
+            rows[1].starts_with("id-b    2025-11-06T00:00:15Z  3.0%"),
+            "{out}"
+        );
+        assert_eq!(state.since, Some(1_762_387_205_000));
+    }
+
+    /// `vm stats`는 VM의 마지막 점을 보이고, `--watch`의 다음 읽기는 그 `t`를 `since`로 보낸다. 점이 없으면
+    /// 그 까닭을 stderr에 알린다. `-o json`은 응답 그대로다.
+    #[tokio::test]
+    async fn vm_stats_shows_the_last_sample() {
+        let (client, seen) = fake_api_status(|path| {
+            let samples = if path.contains("since=") {
+                json!([])
+            } else {
+                json!([
+                    { "t": 1_762_387_200_000u64, "cpu": 1.0, "mem_rss_mib": 1, "disk_read_bps": null,
+                      "disk_write_bps": null, "disk_read_iops": null, "disk_write_iops": null,
+                      "net_rx_bps": null, "net_tx_bps": null },
+                    { "t": 1_762_387_205_123u64, "cpu": 104.25, "mem_rss_mib": 300,
+                      "disk_read_bps": 10240.0, "disk_write_bps": 1048576.0, "disk_read_iops": 2.5,
+                      "disk_write_iops": 40.0, "net_rx_bps": null, "net_tx_bps": null }
+                ])
+            };
+            let body = json!({
+                "vm": "019a0000-0000-7000-8000-000000000001",
+                "samples": samples,
+                "unreachable": ["node-c"],
+                "unsupported": []
+            });
+            (200, body)
+        })
+        .await;
+        let mut state = VmStatsState::default();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        vm_stats_round(
+            &client, "web 1", &mut state, true, false, &mut out, &mut err,
+        )
+        .await
+        .unwrap();
+        let table = "TIME                  CPU     MEMORY    DISK READ  DISK WRITE  READ IOPS  WRITE IOPS  NET RX  NET TX\n\
+                     2025-11-06T00:00:05Z  104.2%  300.0MiB  10.0KiB/s  1.0MiB/s    2.5        40.0        -       -\n";
+        assert_eq!(String::from_utf8(out).unwrap(), table);
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: no metrics from: node-c\n"
+        );
+        // 다음 읽기에 새 점이 없으면 마지막 점을 다시 보인다.
+        let mut out = Vec::new();
+        vm_stats_round(
+            &client,
+            "web 1",
+            &mut state,
+            true,
+            false,
+            &mut out,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), table);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/vms/web%201/metrics HTTP/1.1",
+                "GET /api/v1/vms/web%201/metrics?since=1762387205123 HTTP/1.1"
+            ]
+        );
+
+        // 점이 하나도 없다.
+        let mut state = VmStatsState {
+            since: Some(1),
+            ..Default::default()
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        vm_stats_round(&client, "web", &mut state, true, false, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert!(String::from_utf8(err).unwrap().ends_with(
+            "note: no metrics yet; the VM is off or started less than 10 seconds ago\n"
+        ));
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        vm_stats(&client, "web", false, true, &mut out, &mut err)
+            .await
+            .unwrap();
+        let shown: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(shown["samples"].as_array().unwrap().len(), 2);
+        assert!(err.is_empty());
+    }
+
+    /// 지금까지 본 노드가 응답에 빠진(닿지 않음·옛 버전) 동안은 남은 노드로 `since`를 셈하고, 그 노드가
+    /// 돌아온 다음 읽기 한 번만 `since`를 보내지 않는다(돌아온 노드의 시계가 늦으면 그 줄이 멈춘다).
+    #[tokio::test]
+    async fn node_stats_watch_drops_since_once_after_a_missing_node_returns() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (client, seen) = fake_api_status(move |_| {
+            let a = json!({ "node": "id-a", "samples": [node_sample(1_762_387_210_000, 1.0)] });
+            let b = json!({ "node": "id-b", "samples": [node_sample(1_762_387_205_000, 2.0)] });
+            let nodes = match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                1 | 2 => json!([a]),
+                _ => json!([a, b]),
+            };
+            (
+                200,
+                json!({ "nodes": nodes, "unreachable": ["node-b"], "unsupported": [] }),
+            )
+        })
+        .await;
+        let mut state = NodeStatsState::default();
+        for _ in 0..5 {
+            node_stats_round(
+                &client,
+                &mut state,
+                true,
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/metrics/nodes HTTP/1.1",
+                "GET /api/v1/metrics/nodes?since=1762387205000 HTTP/1.1",
+                // id-b가 빠진 동안은 id-a의 마지막 `t`다.
+                "GET /api/v1/metrics/nodes?since=1762387210000 HTTP/1.1",
+                "GET /api/v1/metrics/nodes?since=1762387210000 HTTP/1.1",
+                // id-b가 돌아온 다음 한 번만 `since`가 없다.
+                "GET /api/v1/metrics/nodes HTTP/1.1",
+            ]
+        );
+        assert_eq!(state.since, Some(1_762_387_205_000));
+    }
+
+    /// `--watch`에서 일시 오류는 stderr에 찍고 다음 회차를 계속한다(점은 그대로). 401·403·404는 끝낸다.
+    /// `--watch`가 아니면 오류로 끝난다.
+    #[tokio::test]
+    async fn stats_watch_survives_transient_errors() {
+        let (client, _) = fake_api_status(|path| {
+            let status = path
+                .rsplit_once("since=")
+                .map_or(200, |(_, code)| code.parse().unwrap());
+            let body = match status {
+                200 => json!({
+                    "vm": "019a0000-0000-7000-8000-000000000001",
+                    "samples": [{ "t": 500u64, "cpu": 1.0 }],
+                    "unreachable": [], "unsupported": []
+                }),
+                401 => json!({ "code": "unauthorized", "message": "authentication required" }),
+                403 => json!({ "code": "forbidden", "message": "permission denied" }),
+                404 => json!({ "code": "not_found", "message": "VM web not found" }),
+                _ => json!({ "code": "internal", "message": "boom" }),
+            };
+            (status, body)
+        })
+        .await;
+        // `since`에 상태 코드를 실어 시험 서버가 그 상태로 답하게 한다.
+        let mut state = VmStatsState::default();
+        vm_stats_round(
+            &client,
+            "web",
+            &mut state,
+            true,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        state.since = Some(503);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        vm_stats_round(&client, "web", &mut state, true, false, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(String::from_utf8(err).unwrap(), "error: boom (internal)\n");
+        assert_eq!(state.last.as_ref().unwrap()["t"], 500);
+        assert_eq!(state.since, Some(503));
+        for code in [401, 403, 404] {
+            state.since = Some(code);
+            let e = vm_stats_round(
+                &client,
+                "web",
+                &mut state,
+                true,
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(ends_stats_watch(&e), "{code}: {e:#}");
+        }
+        state.since = Some(503);
+        vm_stats_round(
+            &client,
+            "web",
+            &mut state,
+            false,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        let mut state = NodeStatsState {
+            since: Some(500),
+            ..Default::default()
+        };
+        let mut err = Vec::new();
+        node_stats_round(&client, &mut state, true, false, &mut Vec::new(), &mut err)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(err).unwrap(), "error: boom (internal)\n");
+    }
+
+    /// `-o json --watch`는 회차마다 한 줄 compact JSON(JSON Lines)이다.
+    #[tokio::test]
+    async fn stats_json_watch_prints_one_line_per_round() {
+        let (client, _) = fake_api(|_| {
+            json!({ "nodes": [{ "node": "id-a", "samples": [node_sample(1_000, 1.0)] }],
+                    "unreachable": [], "unsupported": [] })
+        })
+        .await;
+        let mut state = NodeStatsState::default();
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            node_stats_round(&client, &mut state, true, true, &mut out, &mut Vec::new())
+                .await
+                .unwrap();
+        }
+        let out = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        for line in lines {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["nodes"][0]["node"], "id-a");
+        }
+    }
+
+    /// `node stats`·`vm stats`는 `--watch`를 받는다.
+    #[test]
+    fn parses_stats_commands() {
+        let cli = Cli::try_parse_from(["oplctl", "node", "stats", "--watch"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Node {
+                cmd: NodeCmd::Stats(StatsArgs { watch: true })
+            }
+        ));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "stats", "web"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Stats { vm, stats: StatsArgs { watch: false } } } if vm == "web"
+        ));
     }
 
     /// `--since`의 기간(`30m`·`1h`·`7d`)은 지금에서 뺀 유닉스 밀리초로, 나머지는 그대로 보낸다.

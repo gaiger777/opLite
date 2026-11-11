@@ -8,7 +8,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Daemon, free_port};
+use common::{Daemon, eventually, free_port};
 use rustix::process::{Pid, test_kill_process};
 use tokio::io::AsyncReadExt;
 
@@ -66,6 +66,30 @@ async fn cli_creates_vm_opens_console_and_survives_kill_9() {
     assert_eq!(vm["status"]["phase"], "running");
     let pid = vm["status"]["pid"].as_u64().unwrap();
     assert!(alive(pid));
+
+    // 지표: 측정기가 5초마다 재므로 켠 뒤 10초 남짓이면 VM 점이 생긴다(첫 측정은 기준만).
+    eventually("VM metrics", || async {
+        let m = d.ctl_json(&["vm", "stats", "web"]).await;
+        m["samples"].as_array().is_some_and(|s| !s.is_empty())
+    })
+    .await;
+    let m = d.ctl_json(&["vm", "stats", "web"]).await;
+    let s = m["samples"].as_array().unwrap().last().unwrap().clone();
+    assert!(s["cpu"].as_f64().is_some(), "{m}");
+    assert!(s["mem_rss_mib"].as_u64().is_some_and(|n| n > 0), "{m}");
+    assert!(s["disk_write_bps"].as_f64().is_some(), "{m}");
+    assert_eq!(m["unreachable"], serde_json::json!([]), "{m}");
+    let table = d.ctl(&["vm", "stats", "web"]).await.unwrap();
+    assert!(table.starts_with("TIME "), "{table}");
+    assert_eq!(table.lines().count(), 2, "{table}");
+    let nodes = d.ctl_json(&["node", "stats"]).await;
+    let node = &nodes["nodes"][0]["samples"];
+    assert!(node.as_array().is_some_and(|s| !s.is_empty()), "{nodes}");
+    let table = d.ctl(&["node", "stats"]).await.unwrap();
+    assert!(
+        table.lines().nth(1).unwrap().starts_with("node1 "),
+        "{table}"
+    );
 
     // 콘솔: oplctl이 연 로컬 포트로 VNC 서버의 인사말이 온다. 블록을 나가면 콘솔을 닫는다.
     {

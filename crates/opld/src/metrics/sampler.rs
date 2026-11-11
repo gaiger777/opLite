@@ -12,7 +12,7 @@ use futures_util::future::join_all;
 use opl_cluster::Cluster;
 use opl_driver::{DiskCounters, Hypervisor, RuntimeStatus};
 use opl_types::metrics::{NodeSample, VmSample};
-use opl_types::network::tap_name;
+use opl_types::network::{USER_NETWORK, tap_name};
 use opl_types::vm::VmSpec;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -87,9 +87,12 @@ struct NodeCounters {
 #[derive(Debug, Clone, Copy)]
 struct VmCounters {
     pid: u32,
+    /// 프로세스·tap을 읽은 시각(이번 측정의 VM 측정 시작, `disk_stats`를 기다리기 전)
     at: Instant,
     cpu_ns: Option<u64>,
     disk: Option<DiskCounters>,
+    /// `disk_stats`가 답한 시각. QMP 응답은 늦을 수 있어(최대 1초) 디스크 비율은 이 시각의 차이로 나눈다.
+    disk_at: Instant,
     /// 모든 tap의 호스트 쪽 (받은, 보낸) 합
     tap: Option<(u64, u64)>,
 }
@@ -156,12 +159,17 @@ fn vm_sample(
     rss_mib: Option<u64>,
 ) -> Result<VmSample, Decreased> {
     let secs = now.at.duration_since(prev.at).as_secs_f64();
+    let disk_secs = now.disk_at.duration_since(prev.disk_at).as_secs_f64();
     // 바쁜 vCPU 수 × 100. QEMU 프로세스 전체라 100을 조금 넘을 수 있고 자르지 않는다.
     let cpu = rate(prev.cpu_ns, now.cpu_ns, secs)?
         .zip(vcpus.filter(|&n| n > 0))
         .map(|(ns, n)| ns / 1e9 * 100.0 / f64::from(n));
     let disk = |f: fn(&DiskCounters) -> u64| {
-        rate(prev.disk.as_ref().map(f), now.disk.as_ref().map(f), secs)
+        rate(
+            prev.disk.as_ref().map(f),
+            now.disk.as_ref().map(f),
+            disk_secs,
+        )
     };
     let tap =
         |f: fn(&(u64, u64)) -> u64| rate(prev.tap.as_ref().map(f), now.tap.as_ref().map(f), secs);
@@ -207,9 +215,6 @@ struct Sampler {
     /// VM마다 마지막 디스크 실패 경고 시각
     disk_warned: HashMap<Uuid, Option<Instant>>,
     list_warned: Option<Instant>,
-    /// 이번 측정의 VM 점 시각. VM마다 `disk_stats`를 부르기 전이라 QMP 응답이 늦어도 카운터와 맞다(프로세스·tap
-    /// 값은 빨리 읽으므로 같은 시각으로 본다).
-    vm_at: Instant,
 }
 
 impl Sampler {
@@ -230,7 +235,6 @@ impl Sampler {
             vms: HashMap::new(),
             disk_warned: HashMap::new(),
             list_warned: None,
-            vm_at: Instant::now(),
         }
     }
 
@@ -278,8 +282,9 @@ impl Sampler {
             .into_iter()
             .filter(|vm| matches!(vm.status, RuntimeStatus::Running | RuntimeStatus::Paused))
             .collect();
-        // vCPU 수와 NIC 수는 클러스터의 VM 스펙에서 온다(없으면 CPU·네트워크가 `null`).
-        let specs: HashMap<Uuid, (u32, usize)> = self
+        // vCPU 수와 tap NIC 번호는 클러스터의 VM 스펙에서 온다(없으면 CPU·네트워크가 `null`). 사용자
+        // 모드 NIC(`user`)는 tap이 없어 뺀다.
+        let specs: HashMap<Uuid, (u32, Vec<usize>)> = self
             .cluster
             .list::<VmSpec>()
             .map(|(_, vms)| {
@@ -287,22 +292,27 @@ impl Sampler {
                     .map(|vm| {
                         let cpu = &vm.spec.cpu;
                         let vcpus = u32::from(cpu.sockets) * u32::from(cpu.cores);
-                        (vm.id, (vcpus, vm.spec.nics.len()))
+                        let taps = (vm.spec.nics.iter().enumerate())
+                            .filter(|(_, nic)| nic.network != USER_NETWORK)
+                            .map(|(i, _)| i)
+                            .collect();
+                        (vm.id, (vcpus, taps))
                     })
                     .collect()
             })
             .unwrap_or_default();
         // 시각(단조·벽시계)과 마감은 `list()`가 끝난 뒤에 잡는다(QEMU의 `list()`는 VM마다 QMP를 차례로
         // 불러 응답 없는 VM 하나로 늦어질 수 있다).
-        self.vm_at = Instant::now();
+        let at = Instant::now();
         let t = now_ms();
-        let deadline = self.vm_at + VM_TIMEOUT;
+        let deadline = at + VM_TIMEOUT;
         let this = &*self;
         let readings = join_all(running.iter().map(|vm| {
-            let nics = specs.get(&vm.id).map_or(0, |s| s.1);
+            let taps = specs.get(&vm.id).map_or(&[][..], |s| &s.1[..]);
             async move {
                 let reading =
-                    tokio::time::timeout_at(deadline, this.measure_vm(vm.id, vm.pid, nics)).await;
+                    tokio::time::timeout_at(deadline, this.measure_vm(vm.id, vm.pid, taps, at))
+                        .await;
                 (vm.id, reading.ok())
             }
         }))
@@ -332,29 +342,32 @@ impl Sampler {
         }
     }
 
-    async fn measure_vm(&self, id: Uuid, pid: u32, nics: usize) -> VmReading {
+    /// `at`은 이번 측정의 VM 측정 시작 시각이다. 프로세스·tap은 기다리지 않고 곧바로 읽으므로 그 시각으로
+    /// 적고, 디스크는 `disk_stats`의 응답을 기다린 뒤 응답 시각으로 따로 적는다.
+    async fn measure_vm(&self, id: Uuid, pid: u32, taps: &[usize], at: Instant) -> VmReading {
+        let process = self.probe.process(pid);
+        // tap NIC가 없거나(사용자 모드 NIC뿐, NIC 없음) tap 하나라도 읽지 못하면 네트워크는 `null`이다.
+        let tap = (!taps.is_empty())
+            .then(|| {
+                taps.iter().try_fold((0u64, 0u64), |(rx, tx), &i| {
+                    let (r, t) = self.probe.tap_bytes(&tap_name(id, i))?;
+                    Some((rx + r, tx + t))
+                })
+            })
+            .flatten();
         let (disk, disk_error) =
             match tokio::time::timeout(DISK_STATS_TIMEOUT, self.hv.disk_stats(id)).await {
                 Ok(Ok(counters)) => (Some(counters), None),
                 Ok(Err(e)) => (None, Some(e.to_string())),
                 Err(_) => (None, Some("query-blockstats timed out".to_string())),
             };
-        let process = self.probe.process(pid);
-        // tap이 하나라도 없으면(macOS 사용자 모드 NIC, NIC 없음) 네트워크는 `null`이다.
-        let tap = (nics > 0)
-            .then(|| {
-                (0..nics).try_fold((0u64, 0u64), |(rx, tx), i| {
-                    let (r, t) = self.probe.tap_bytes(&tap_name(id, i))?;
-                    Some((rx + r, tx + t))
-                })
-            })
-            .flatten();
         VmReading {
             counters: VmCounters {
                 pid,
-                at: self.vm_at,
+                at,
                 cpu_ns: process.map(|p| p.cpu_ns),
                 disk,
+                disk_at: Instant::now(),
                 tap,
             },
             rss_mib: process.map(|p| p.rss_mib),
@@ -391,6 +404,8 @@ mod tests {
         processes: HashMap<u32, ProcStat>,
         taps: HashMap<String, (u64, u64)>,
         fs: Option<(u64, u64)>,
+        /// `process()`가 불린 시각들
+        process_calls: Vec<Instant>,
     }
 
     impl FakeProbe {
@@ -413,7 +428,9 @@ mod tests {
             self.0.lock().unwrap().nic
         }
         fn process(&self, pid: u32) -> Option<ProcStat> {
-            self.0.lock().unwrap().processes.get(&pid).copied()
+            let mut v = self.0.lock().unwrap();
+            v.process_calls.push(Instant::now());
+            v.processes.get(&pid).copied()
         }
         fn tap_bytes(&self, name: &str) -> Option<(u64, u64)> {
             self.0.lock().unwrap().taps.get(name).copied()
@@ -476,19 +493,27 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// 클러스터에 vCPU 2개, NIC 2개인 VM을 만들고 하이퍼바이저에서 켠다.
+    /// 클러스터에 vCPU 2개, NIC 2개(`lan`)인 VM을 만들고 하이퍼바이저에서 켠다.
     async fn running_vm(f: &Fixture) -> Uuid {
+        running_vm_on(f, &["lan", "lan"]).await
+    }
+
+    /// [`running_vm`]과 같고 NIC마다 네트워크를 정한다.
+    async fn running_vm_on(f: &Fixture, networks: &[&str]) -> Uuid {
         let cpu = CpuSpec {
             sockets: 1,
             cores: 2,
             model: CpuModel::Host,
         };
-        let nic = NicSpec {
-            network: "lan".into(),
-            model: NicModel::Virtio,
-            mac: None,
-            security_groups: vec![],
-        };
+        let nics = networks
+            .iter()
+            .map(|network| NicSpec {
+                network: network.to_string(),
+                model: NicModel::Virtio,
+                mac: None,
+                security_groups: vec![],
+            })
+            .collect();
         let vm = Resource::new(
             "web",
             VmSpec {
@@ -497,7 +522,7 @@ mod tests {
                 firmware: Default::default(),
                 machine: MachineType::Virt,
                 disks: vec![],
-                nics: vec![nic.clone(), nic],
+                nics,
                 power: PowerState::Running,
                 restart: Default::default(),
                 node: None,
@@ -661,6 +686,28 @@ mod tests {
         assert_eq!((s.net_rx_bps, s.net_tx_bps), (Some(1_200.0), Some(400.0)));
     }
 
+    /// 사용자 모드 NIC(`user`)는 tap이 없으므로 빼고 tap NIC만 합한다.
+    #[tokio::test]
+    async fn user_mode_nics_are_left_out_of_the_network_rates() {
+        let mut f = fixture().await;
+        let id = running_vm_on(&f, &["lan", "user"]).await;
+        let only_tap0 = |f: &Fixture| {
+            f.probe.set(|v| {
+                v.taps.remove(&tap_name(id, 1));
+            })
+        };
+        tokio::time::pause();
+        set_vm(&f, id, 0, disk(0, 0), (0, 0));
+        only_tap0(&f);
+        f.sampler.tick().await;
+        tokio::time::advance(INTERVAL).await;
+        set_vm(&f, id, 0, disk(0, 0), (1_000, 3_000));
+        only_tap0(&f);
+        f.sampler.tick().await;
+        let s = vm_samples(&f.store, id).pop().unwrap();
+        assert_eq!((s.net_rx_bps, s.net_tx_bps), (Some(600.0), Some(200.0)));
+    }
+
     #[tokio::test]
     async fn vm_baseline_is_taken_again_when_the_pid_changes_or_a_counter_drops() {
         let mut f = fixture().await;
@@ -780,7 +827,8 @@ mod tests {
         assert!(vm_t - node_t >= 200, "node {node_t}, vm {vm_t}");
     }
 
-    /// 점의 시각은 `disk_stats`를 부르기 전이다. QMP가 늦게 답해도 비율은 측정 간격으로 나눈다.
+    /// 프로세스·tap은 `disk_stats`를 기다리기 전에 읽는다. QMP가 늦게 답해도 CPU 비율은 측정 간격으로,
+    /// 디스크 비율은 응답 시각의 간격으로 나눈다.
     #[tokio::test]
     async fn a_slow_disk_stats_answer_does_not_skew_the_rates() {
         let mut f = fixture().await;
@@ -789,12 +837,44 @@ mod tests {
         set_vm(&f, id, 0, disk(0, 0), (0, 0));
         f.sampler.tick().await;
         tokio::time::advance(INTERVAL).await;
-        set_vm(&f, id, 5_000_000_000, disk(5_000, 5), (0, 0));
+        set_vm(&f, id, 5_000_000_000, disk(5_900, 5), (0, 0));
+        f.hv.delay_disk_stats(Duration::from_millis(900));
+        let started = Instant::now();
+        f.sampler.tick().await;
+        assert_eq!(
+            f.probe.0.lock().unwrap().process_calls.last(),
+            Some(&started)
+        );
+        let s = vm_samples(&f.store, id).pop().unwrap();
+        assert_eq!(s.cpu, Some(50.0));
+        // 디스크 응답은 0초 뒤와 0.9초 뒤라 5.9초 사이의 증가다.
+        assert_near(s.disk_read_bps, 1_000.0);
+    }
+
+    /// QMP 응답 지연이 측정마다 다르면 디스크 비율은 응답 시각의 차이로 나눈다(CPU는 측정 시작의 차이).
+    #[tokio::test]
+    async fn disk_rates_use_the_disk_answer_times() {
+        let mut f = fixture().await;
+        let id = running_vm(&f).await;
+        tokio::time::pause();
+        set_vm(&f, id, 0, disk(0, 0), (0, 0));
         f.hv.delay_disk_stats(Duration::from_millis(900));
         f.sampler.tick().await;
+        // 다음 측정은 처음 측정을 시작하고 5초 뒤다.
+        tokio::time::advance(INTERVAL - Duration::from_millis(900)).await;
+        set_vm(&f, id, 5_000_000_000, disk(4_200, 0), (0, 0));
+        f.hv.delay_disk_stats(Duration::from_millis(100));
+        f.sampler.tick().await;
         let s = vm_samples(&f.store, id).pop().unwrap();
-        assert_eq!(s.disk_read_bps, Some(1_000.0));
-        assert_eq!(s.cpu, Some(50.0));
+        assert_near(s.cpu, 50.0);
+        // 디스크 응답은 0.9초 뒤와 5.1초 뒤다.
+        assert_near(s.disk_read_bps, 1_000.0);
+    }
+
+    /// `want`와 0.1% 안이다(tokio 타이머가 기다림을 밀리초로 올려 시각이 1ms쯤 밀린다).
+    fn assert_near(got: Option<f64>, want: f64) {
+        let got = got.unwrap();
+        assert!((got - want).abs() < want * 1e-3, "{got} != {want}");
     }
 
     #[tokio::test]
