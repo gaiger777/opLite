@@ -26508,3 +26508,31 @@ git commit -m "docs: 제품 이름 Orbivisor — README(제목 Orbivisor, 문장
 - 새 deb 하나만 손으로 설치하면 옛 `oplite`가 지워지며 그동안 opld가 멈추고 `rc` 상태로 남는다. 그것을 purge하면 유닛이 disable된다(README에 안내).
 - GitHub 링크는 저장소 이름을 바꾸기 전까지 `…/opLite`다.
 - 그 밖의 제한은 설계 문서 §6·§8과 README "이름 바꾸기" 절에 있다.
+
+## 실행 후 기록 (2026-11-11)
+
+- **Task 1~5:** `feat/plan43-rename-orbivisor`에서 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았다(생성 파일 제외). 다섯 Task를 마친 트리는 리뷰와 CI 프로브를 거친 트리와 같다(이 계획 문서만 다름).
+- **1차 리뷰에서 고친 것:**
+  - `oplite`에서 넘어올 때 관리자가 disable해 둔 opld를 postinst가 다시 enable하지 않게 했다(처음 설치는 `$2`가 비고 `oplite`의 Config-Version도 빌 때만).
+  - `repo-test.sh`가 `apt-mark showmanual`, `autoremove`, dpkg.log의 순서, 키링 넘겨받기를 확인한다.
+  - OpenAPI 문서 주석의 명령 이름을 `orbivisorctl`로 바꿨다.
+  - `name-test.sh`의 허용 규칙을 좁히고 파일 이름 검사를 더했다.
+  - README: 두 deb를 함께 설치, `autoremove` 안내, disable한 opld는 꺼진 채로 남음. 설계 §8.
+- **2차 리뷰에서 고친 것:** 가짜 `dpkg-query`가 인자를 확인한다. README에 `rc` 상태의 `oplite`를 purge하지 말라는 안내(했다면 `systemctl enable opld`)를 더했다.
+- **CI에서 고친 것:** shell 작업의 shellcheck SC2016(`name-test.sh`의 작은따옴표 안 백틱·`$`는 일부러 쓴 것이라 파일 단위로 끔).
+- **함께 고친 버그:** 프로브의 linux-kvm에서 `migrates_a_running_vm_over_tls`가 두 번 실패했다. QEMU 8.2는 마이그레이션을 completed로 바꾼 뒤에 원본을 finish-migrate에서 postmigrate로 바꿔 `stop_migrated`가 원본을 끄지 못할 수 있었다. main에 `f0e9d60`(원본이 postmigrate가 될 때까지 기다림)으로 고치고 이 계획을 그 위로 옮겼다.
+- **불안정한 시험:** 전체 실행에서 부하 때문에 `oidc`(Task 1, 127.0.0.1 요청 시간 초과)와 `telemetry_reporter`(Task 1~3)가 실패했고, 따로 다시 돌리면 통과했다. 이 계획의 변경과는 관계없다.
+
+**테스트:**
+- macOS `cargo test --workspace` 1642개(스테이지 검증)
+- 웹 시험 572개와 `typecheck`·`lint`·`build`
+- `fmt`·`clippy -D warnings`(모든 기능)
+- 패키징 셸 시험(`maint-test`·`build-deb-test`·`build-repo-test`·`setup-test`·`iso-test`·`name-test`)과 shellcheck
+
+Linux CI(프로브)에서 같은 시험과 Debian 13 업그레이드 시험(`deb-test`·`repo-test`), linux-kvm·ldap·package 작업이 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 제품 이름 바꾸기(계획 43)가 끝났다. 테스트 VM에는 `orbivisord`·`orbivisorctl`과 링크 `opld`·`oplctl`로 다시 배포한다.
+- 다음: 하위 프로젝트 14(실시간 지표 수집, 대시보드·VM 차트, 3D 클러스터 보기, 끌어 놓는 VM 만들기). 지표 수집부터 따로 설계 문서를 쓴다.
+- 그 다음: Proxmox VE·VMware와 비교해 빠진 기능 더하기.
