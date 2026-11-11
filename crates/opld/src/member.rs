@@ -40,7 +40,7 @@ use crate::firewall::{FirewallAgent, FirewallRules};
 use crate::host::Host;
 use crate::metrics::host as metrics_host;
 use crate::metrics::sampler::MetricsSampler;
-use crate::metrics::store::MetricsStore;
+use crate::metrics::store::{MetricsStore, StoreSource};
 use crate::overlay::{OverlayAgent, cluster_tag};
 use crate::pools::PoolMounter;
 
@@ -331,11 +331,15 @@ impl Member {
             }
             None => Arc::new(AuditLog::disabled()),
         };
+        // 측정기가 적고, API와 다른 노드(노드 간 서버)가 읽는다.
+        let metrics_store = Arc::new(MetricsStore::default());
+        let metrics_source = Arc::new(StoreSource::new(node, metrics_store.clone()));
         // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(incoming.with_firewall(gate.clone())))
             .with_uefi_vars(config.data_dir.clone())
-            .with_audit(audit.clone());
+            .with_audit(audit.clone())
+            .with_metrics(metrics_source.clone());
         let peer = serve_peer(peer_listener, &tls, service, exited_tx.clone());
 
         // 여기서 실패하면 노드 간 서버와 저장소를 닫는다.
@@ -367,6 +371,7 @@ impl Member {
             state.peers = Some(peers.clone());
             state.secure_cookies = true;
             state.audit = audit;
+            state.metrics = Some(metrics_source);
             let created = match password {
                 Some(admin_password) => {
                     let token = issue_join_token(&state, DEFAULT_JOIN_TTL)
@@ -455,7 +460,7 @@ impl Member {
             metrics_host::native(),
             cluster.clone(),
             config.data_dir.clone(),
-            Arc::new(MetricsStore::default()),
+            metrics_store,
         );
         // Task 실행기는 시작할 때 이 노드가 남긴 고아를 지운다. 그것이 끝난 뒤에 API를 연다.
         let mut runner_config = TaskRunnerConfig::new(node);

@@ -1,5 +1,5 @@
 //! 다른 노드로 가는 gRPC 클라이언트: Raft 네트워크, 리더 전달, 생존 확인, 콘솔, 마이그레이션 받기,
-//! UEFI 변수 받기, 감사 로그 읽기.
+//! UEFI 변수 받기, 감사 로그 읽기, 지표 읽기.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,6 +20,7 @@ use openraft::raft::{
 use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
 use opl_cluster::{ClusterError, Forwarder};
 use opl_types::audit::{AuditEntry, AuditQuery};
+use opl_types::metrics::MetricsQuery;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -27,6 +28,7 @@ use tonic::{Code, Request, Status, Streaming};
 use uuid::Uuid;
 
 use crate::firmware::{UefiVarsError, UefiVarsRequest};
+use crate::metrics::MetricsReply;
 use crate::migration::{
     IncomingError, IncomingMigration, MigrateIncomingRequest, MigrateIncomingResponse,
 };
@@ -237,6 +239,25 @@ impl Peers {
         match self.client(addr)?.read_audit(req).await {
             Ok(reply) => Ok(Some(reply.into_inner().entries)),
             Err(s) if s.code() == Code::FailedPrecondition => Ok(None),
+            Err(s) => Err(s),
+        }
+    }
+}
+
+impl Peers {
+    /// `addr`의 노드의 메모리에 있는 지표를 읽는다. 그 노드가 지표를 모르면(옛 노드, 지표 소스가 없는
+    /// 노드) None이다.
+    pub async fn read_metrics(
+        &self,
+        addr: &str,
+        query: MetricsQuery,
+        timeout: Duration,
+    ) -> Result<Option<MetricsReply>, Status> {
+        let mut req = Request::new(query);
+        req.set_timeout(timeout);
+        match self.client(addr)?.read_metrics(req).await {
+            Ok(reply) => Ok(Some(reply.into_inner())),
+            Err(s) if s.code() == Code::Unimplemented => Ok(None),
             Err(s) => Err(s),
         }
     }

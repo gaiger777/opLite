@@ -83,6 +83,31 @@ pub struct VmSeries {
     pub samples: Vec<VmSample>,
 }
 
+/// `GET /metrics/nodes`의 응답
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NodeMetricsResponse {
+    /// 읽은 노드마다 하나(노드 이름 순)
+    pub nodes: Vec<NodeSeries>,
+    /// 답하지 않은 노드의 이름(정렬)
+    pub unreachable: Vec<String>,
+    /// 지표를 모르는 옛 노드의 이름(정렬)
+    pub unsupported: Vec<String>,
+}
+
+/// `GET /vms/{key}/metrics`의 응답
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct VmMetricsResponse {
+    pub vm: Uuid,
+    /// 모든 노드에서 잰 점을 시각 순으로 합친 것(마이그레이션 앞뒤가 이어진다)
+    pub samples: Vec<VmSample>,
+    /// 답하지 않은 노드의 이름(정렬)
+    pub unreachable: Vec<String>,
+    /// 지표를 모르는 옛 노드의 이름(정렬)
+    pub unsupported: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

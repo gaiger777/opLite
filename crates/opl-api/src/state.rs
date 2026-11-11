@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use opl_cluster::Cluster;
 use opl_driver::Hypervisor;
-use opl_peer::Peers;
+use opl_peer::{MetricsSource, Peers};
 use uuid::Uuid;
 
 use crate::audit::AuditLog;
@@ -39,6 +39,8 @@ pub struct AppState {
     pub import_credentials: Arc<ImportCredentials>,
     /// 이 노드의 감사 로그. 기본은 꺼져 있다(opld가 연다).
     pub audit: Arc<AuditLog>,
+    /// 이 노드의 지표(opld의 측정기 저장소). 없으면 지표 API가 이 노드를 `unsupported`로 보인다.
+    pub metrics: Option<Arc<dyn MetricsSource>>,
     /// OIDC 영역의 discovery·JWKS(노드 메모리)
     pub(crate) oidc: OidcCache,
     /// 이 노드가 지금 받고 있는 백업 사본 파일(백업 id, 파일 이름). 같은 파일을 두 요청이 함께 쓰지 않게 한다.
@@ -68,6 +70,7 @@ impl AppState {
             vm_lock: tokio::sync::Mutex::new(()),
             import_credentials: Arc::default(),
             audit: Arc::new(AuditLog::disabled()),
+            metrics: None,
             oidc: OidcCache::default(),
             receiving_files: Default::default(),
             receive_idle_timeout: Duration::from_secs(60),

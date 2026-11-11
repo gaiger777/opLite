@@ -431,6 +431,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/metrics/nodes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 모든 노드(위트니스 제외)의 노드 지표. 답하지 않은 노드는 `unreachable`, 지표를 모르는 옛 노드는
+         *     `unsupported`에 이름이 들어간다.
+         */
+        get: operations["list_node_metrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/networks": {
         parameters: {
             query?: never;
@@ -524,6 +544,26 @@ export interface paths {
          *     `node_busy`, 비우기를 모르는 노드가 남았으면 409 `cluster_upgrading`.
          */
         post: operations["drain_node"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{key}/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 노드 하나의 지표. 위트니스면 409 `node_unavailable`, 꺼진 것으로 기록됐거나 닿지 않으면 503
+         *     `node_unreachable`, 지표를 모르는 옛 노드면 409 `cluster_upgrading`.
+         */
+        get: operations["get_node_metrics"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1264,6 +1304,26 @@ export interface paths {
             cookie?: never;
         };
         get: operations["console"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * VM 하나의 지표. 모든 노드(위트니스 제외)에 물어 시각 순으로 합치므로 마이그레이션 앞뒤 기록이
+         *     이어진다. 같은 `t`가 두 노드에서 오면 둘 다 둔다.
+         */
+        get: operations["get_vm_metrics"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3028,6 +3088,59 @@ export interface components {
              */
             recover_after_secs: number;
         };
+        /** @description `GET /metrics/nodes`의 응답 */
+        NodeMetricsResponse: {
+            /** @description 읽은 노드마다 하나(노드 이름 순) */
+            nodes: components["schemas"]["NodeSeries"][];
+            /** @description 답하지 않은 노드의 이름(정렬) */
+            unreachable: string[];
+            /** @description 지표를 모르는 옛 노드의 이름(정렬) */
+            unsupported: string[];
+        };
+        /** @description 노드 점 하나 */
+        NodeSample: {
+            /**
+             * Format: double
+             * @description CPU 사용률 %(모든 코어를 합해 100)
+             */
+            cpu?: number | null;
+            /**
+             * Format: double
+             * @description 실제 디스크의 읽기 바이트/초(macOS는 `null`)
+             */
+            disk_read_bps?: number | null;
+            /** Format: double */
+            disk_write_bps?: number | null;
+            /** Format: int64 */
+            fs_total_mib?: number | null;
+            /**
+             * Format: int64
+             * @description 데이터 디렉터리가 있는 파일 시스템
+             */
+            fs_used_mib?: number | null;
+            /** Format: int64 */
+            mem_total_mib?: number | null;
+            /** Format: int64 */
+            mem_used_mib?: number | null;
+            /**
+             * Format: double
+             * @description 실제 NIC의 받기 바이트/초
+             */
+            net_rx_bps?: number | null;
+            /** Format: double */
+            net_tx_bps?: number | null;
+            /**
+             * Format: int64
+             * @description 측정 시각(그 노드 벽시계의 유닉스 밀리초)
+             */
+            t: number;
+        };
+        /** @description 한 노드의 점들(시각 순) */
+        NodeSeries: {
+            /** Format: uuid */
+            node: string;
+            samples: components["schemas"]["NodeSample"][];
+        };
         NodeSpec: {
             /** @description API 주소 (`host:port`) */
             address: string;
@@ -4609,8 +4722,55 @@ export interface components {
              */
             warnings: string[];
         };
+        /** @description `GET /vms/{key}/metrics`의 응답 */
+        VmMetricsResponse: {
+            /** @description 모든 노드에서 잰 점을 시각 순으로 합친 것(마이그레이션 앞뒤가 이어진다) */
+            samples: components["schemas"]["VmSample"][];
+            /** @description 답하지 않은 노드의 이름(정렬) */
+            unreachable: string[];
+            /** @description 지표를 모르는 옛 노드의 이름(정렬) */
+            unsupported: string[];
+            /** Format: uuid */
+            vm: string;
+        };
         /** @enum {string} */
         VmPhase: "stopped" | "starting" | "running" | "stopping" | "failed" | "migrating";
+        /** @description VM 점 하나 */
+        VmSample: {
+            /**
+             * Format: double
+             * @description vCPU 대비 사용률 %(vCPU가 모두 바쁘면 100). QEMU 프로세스 전체라 100을 조금 넘을 수 있다.
+             */
+            cpu?: number | null;
+            /**
+             * Format: double
+             * @description 모든 디스크를 합한 값
+             */
+            disk_read_bps?: number | null;
+            /** Format: double */
+            disk_read_iops?: number | null;
+            /** Format: double */
+            disk_write_bps?: number | null;
+            /** Format: double */
+            disk_write_iops?: number | null;
+            /**
+             * Format: int64
+             * @description QEMU 프로세스의 RSS
+             */
+            mem_rss_mib?: number | null;
+            /**
+             * Format: double
+             * @description 게스트 기준 받기 바이트/초(tap이 없으면 `null`)
+             */
+            net_rx_bps?: number | null;
+            /** Format: double */
+            net_tx_bps?: number | null;
+            /**
+             * Format: int64
+             * @description 측정 시각(그 노드 벽시계의 유닉스 밀리초)
+             */
+            t: number;
+        };
         VmSelector: {
             all: boolean;
         } | {
@@ -5499,6 +5659,36 @@ export interface operations {
             };
         };
     };
+    list_node_metrics: {
+        parameters: {
+            query?: {
+                /** @description 이 `t`(그 노드 시계의 유닉스 밀리초)보다 뒤의 점만. 없으면 남은 것 모두(1시간) */
+                since?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeMetricsResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_networks: {
         parameters: {
             query?: never;
@@ -5758,6 +5948,47 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_node_metrics: {
+        parameters: {
+            query?: {
+                /** @description 이 `t`(그 노드 시계의 유닉스 밀리초)보다 뒤의 점만. 없으면 남은 것 모두(1시간) */
+                since?: number;
+            };
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeSeries"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "4XX": {
@@ -7632,6 +7863,39 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_vm_metrics: {
+        parameters: {
+            query?: {
+                /** @description 이 `t`(그 노드 시계의 유닉스 밀리초)보다 뒤의 점만. 없으면 남은 것 모두(1시간) */
+                since?: number;
+            };
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VmMetricsResponse"];
+                };
             };
             "4XX": {
                 headers: {

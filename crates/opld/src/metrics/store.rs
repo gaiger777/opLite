@@ -1,11 +1,11 @@
 //! 지표 저장소. 이 노드의 시리즈 하나와 이 노드에서 잰 VM마다 시리즈 하나를 메모리에 둔다.
+//! API와 노드 간 서버는 [`StoreSource`]로 읽는다.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-#[cfg(test)]
-use opl_types::metrics::{MetricsQuery, MetricsScope};
-use opl_types::metrics::{NodeSample, VmSample};
+use opl_peer::{MetricsReply, MetricsSource};
+use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
 use uuid::Uuid;
 
 /// 시리즈마다 두는 점 수(5초 × 1시간). 넘으면 앞을 버린다.
@@ -25,7 +25,6 @@ struct Series {
 }
 
 /// 저장소에서 읽은 점들(시각 순). 노드 id는 읽는 쪽이 붙인다.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricsLocal {
     /// `Nodes`를 물었을 때 이 노드의 점들
@@ -63,8 +62,6 @@ impl MetricsStore {
     }
 
     /// `since`보다 `t`가 큰 점만 돌려준다.
-    // 4단계에서 피어 RPC가 부를 때까지 시험에서만 컴파일한다(바이너리 크레이트라 쓰지 않으면 dead_code다).
-    #[cfg(test)]
     pub fn read(&self, q: &MetricsQuery) -> MetricsLocal {
         let after = |t: i64| q.since.is_none_or(|since| t > since);
         let inner = self.inner.lock().unwrap();
@@ -80,6 +77,39 @@ impl MetricsStore {
                     .get(id)
                     .map(|series| series.iter().filter(|s| after(s.t)).cloned().collect()),
             },
+        }
+    }
+}
+
+/// 이 노드(`node`)의 저장소를 지표 API와 노드 간 서버(`ReadMetrics`)에 읽어 준다.
+pub struct StoreSource {
+    node: Uuid,
+    store: Arc<MetricsStore>,
+}
+
+impl StoreSource {
+    pub fn new(node: Uuid, store: Arc<MetricsStore>) -> Self {
+        Self { node, store }
+    }
+}
+
+impl MetricsSource for StoreSource {
+    fn read(&self, q: &MetricsQuery) -> MetricsReply {
+        let local = self.store.read(q);
+        let vms = match (&q.scope, local.vm) {
+            (MetricsScope::Vm { id }, Some(samples)) => vec![VmSeries {
+                vm: *id,
+                node: self.node,
+                samples,
+            }],
+            _ => vec![],
+        };
+        MetricsReply {
+            node: local.node.map(|samples| NodeSeries {
+                node: self.node,
+                samples,
+            }),
+            vms,
         }
     }
 }
@@ -185,5 +215,30 @@ mod tests {
         // 노드 시리즈는 상한으로만 줄어든다.
         let nodes = store.read(&query(MetricsScope::Nodes, None)).node.unwrap();
         assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn source_names_this_node_and_the_vm() {
+        let store = Arc::new(MetricsStore::default());
+        let (me, id) = (Uuid::now_v7(), Uuid::now_v7());
+        store.push_node(node(1_000));
+        store.push_node(node(2_000));
+        store.push_vm(id, vm(1_000));
+        let source = StoreSource::new(me, store);
+
+        let reply = source.read(&query(MetricsScope::Nodes, Some(1_000)));
+        let series = reply.node.unwrap();
+        assert_eq!(series.node, me);
+        assert_eq!(times(&series.samples, |s| s.t), [2_000]);
+        assert!(reply.vms.is_empty());
+
+        let reply = source.read(&query(MetricsScope::Vm { id }, None));
+        assert_eq!(reply.node, None);
+        assert_eq!(reply.vms.len(), 1);
+        assert_eq!((reply.vms[0].vm, reply.vms[0].node), (id, me));
+        assert_eq!(times(&reply.vms[0].samples, |s| s.t), [1_000]);
+        // 이 노드에서 잰 적이 없는 VM은 시리즈가 없다.
+        let other = source.read(&query(MetricsScope::Vm { id: Uuid::now_v7() }, None));
+        assert!(other.vms.is_empty());
     }
 }

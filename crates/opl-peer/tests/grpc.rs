@@ -11,11 +11,12 @@ use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use opl_peer::{
-    AuditSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration,
-    MigrateIncomingRequest, MigrateIncomingResponse, MigrationReceiver, NodeMonitor,
+    AuditSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration, MetricsReply,
+    MetricsSource, MigrateIncomingRequest, MigrateIncomingResponse, MigrationReceiver, NodeMonitor,
     NodeMonitorConfig, PeerService, Peers, UefiVarsError,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
+use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
@@ -63,15 +64,17 @@ struct Node {
 
 impl Node {
     async fn start(ca: &ClusterCa, root: &TempDir) -> Node {
-        Self::start_with(ca, root, None, None).await
+        Self::start_with(ca, root, None, None, None).await
     }
 
-    /// `migrations`가 있으면 마이그레이션을 그것으로 받고, `audit`이 있으면 감사 로그를 그것으로 읽는다.
+    /// `migrations`가 있으면 마이그레이션을 그것으로 받고, `audit`이 있으면 감사 로그를, `metrics`가
+    /// 있으면 지표를 그것으로 읽는다.
     async fn start_with(
         ca: &ClusterCa,
         root: &TempDir,
         migrations: Option<Arc<dyn MigrationReceiver>>,
         audit: Option<Arc<dyn AuditSource>>,
+        metrics: Option<Arc<dyn MetricsSource>>,
     ) -> Node {
         let id = NodeId(Uuid::now_v7());
         let tls = tls_for(ca, id);
@@ -102,6 +105,9 @@ impl Node {
         }
         if let Some(audit) = audit {
             service = service.with_audit(audit);
+        }
+        if let Some(metrics) = metrics {
+            service = service.with_metrics(metrics);
         }
         let (stop, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -211,6 +217,41 @@ impl AuditSource for FakeAudit {
             duration_ms: 2,
             detail: None,
         }])
+    }
+}
+
+/// 받은 조건을 적고 `since`보다 뒤의 점을 돌려주는 지표(노드 점은 `t` 1000·2000)
+#[derive(Default)]
+struct FakeMetrics {
+    queries: std::sync::Mutex<Vec<MetricsQuery>>,
+}
+
+impl MetricsSource for FakeMetrics {
+    fn read(&self, q: &MetricsQuery) -> MetricsReply {
+        self.queries.lock().unwrap().push(q.clone());
+        let samples = [1_000, 2_000]
+            .into_iter()
+            .filter(|t| q.since.is_none_or(|since| *t > since))
+            .map(|t| NodeSample {
+                t,
+                cpu: Some(12.5),
+                mem_used_mib: Some(100),
+                mem_total_mib: Some(200),
+                disk_read_bps: None,
+                disk_write_bps: None,
+                net_rx_bps: None,
+                net_tx_bps: None,
+                fs_used_mib: None,
+                fs_total_mib: None,
+            })
+            .collect();
+        MetricsReply {
+            node: Some(NodeSeries {
+                node: Uuid::nil(),
+                samples,
+            }),
+            vms: vec![],
+        }
     }
 }
 
@@ -531,7 +572,7 @@ async fn new_leader_does_not_revive_nodes_recorded_offline() {
 async fn migration_requests_reach_the_receiver_of_a_member() {
     let (ca, root, nodes) = start(1).await;
     let receiver = Arc::new(FakeReceiver::default());
-    let target = Node::start_with(&ca, &root, Some(receiver.clone()), None).await;
+    let target = Node::start_with(&ca, &root, Some(receiver.clone()), None, None).await;
     nodes[0]
         .cluster
         .request(LeaderRequest::AddLearner {
@@ -710,7 +751,7 @@ async fn uefi_vars_are_fetched_from_a_member() {
 async fn audit_logs_are_read_from_a_member() {
     let (ca, root, nodes) = start(1).await;
     let audit = Arc::new(FakeAudit::default());
-    let target = Node::start_with(&ca, &root, None, Some(audit.clone())).await;
+    let target = Node::start_with(&ca, &root, None, Some(audit.clone()), None).await;
     nodes[0]
         .cluster
         .request(LeaderRequest::AddLearner {
@@ -776,4 +817,61 @@ async fn audit_logs_are_read_from_a_member() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
     assert_eq!(audit.queries.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn metrics_are_read_from_a_member() {
+    let (ca, root, nodes) = start(1).await;
+    let metrics = Arc::new(FakeMetrics::default());
+    let target = Node::start_with(&ca, &root, None, None, Some(metrics.clone())).await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+        })
+        .await
+        .unwrap();
+    let source = nodes[0].id();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(source) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let query = |since| MetricsQuery {
+        scope: MetricsScope::Nodes,
+        since,
+    };
+    let peers = &nodes[0].peers;
+    let reply = peers
+        .read_metrics(&target.addr, query(Some(1_000)), WAIT)
+        .await
+        .unwrap()
+        .unwrap();
+    let samples = reply.node.unwrap().samples;
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].t, 2_000);
+    assert_eq!(samples[0].cpu, Some(12.5));
+    assert_eq!(*metrics.queries.lock().unwrap(), [query(Some(1_000))]);
+
+    // 지표 소스가 없는 노드(옛 노드처럼)는 None이다.
+    let none = target
+        .peers
+        .read_metrics(&nodes[0].addr, query(None), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+    // 멤버가 아닌 노드의 요청은 읽는 쪽에 닿지 않는다.
+    let outsider = Node::start(&ca, &root).await;
+    let err = outsider
+        .peers
+        .read_metrics(&target.addr, query(None), WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+    assert_eq!(metrics.queries.lock().unwrap().len(), 1);
 }

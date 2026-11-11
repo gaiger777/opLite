@@ -71,6 +71,12 @@ fn main() {
             "opl_types::audit::AuditQuery",
             "crate::audit::AuditReply",
         ))
+        .method(json(
+            "read_metrics",
+            "ReadMetrics",
+            "opl_types::metrics::MetricsQuery",
+            "crate::metrics::MetricsReply",
+        ))
         .method(
             Method::builder()
                 .name("uefi_vars")

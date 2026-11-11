@@ -18,6 +18,7 @@ mod incoming;
 mod janitor;
 pub mod ldap;
 pub mod limit;
+mod metrics;
 mod migration_disks;
 pub mod oidc;
 mod oidc_login;
@@ -130,6 +131,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(updates::refresh_updates))
         .routes(routes!(updates::upgrade_node))
         .routes(routes!(drain::drain_node))
+        .routes(routes!(metrics::get_node_metrics))
+        .routes(routes!(metrics::list_node_metrics))
         .routes(routes!(cluster::get_cluster))
         .routes(routes!(cluster::get_ca))
         .routes(routes!(cluster::get_version))
@@ -162,6 +165,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::get_vm, vms::update_vm, vms::delete_vm))
         .routes(routes!(vms::vm_action))
         .routes(routes!(vms::migrate_vm))
+        .routes(routes!(metrics::get_vm_metrics))
         .routes(routes!(snapshots::list_snapshots))
         .routes(routes!(
             snapshots::list_vm_snapshots,

@@ -9,6 +9,7 @@ use opl_cluster::Cluster;
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_driver::{DriverError, Hypervisor, uefi_vars_path};
 use opl_types::audit::AuditQuery;
+use opl_types::metrics::MetricsQuery;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::mpsc;
@@ -19,6 +20,7 @@ use uuid::Uuid;
 
 use crate::audit::{AuditReply, AuditSource};
 use crate::firmware::{UefiVarsChunk, UefiVarsRequest};
+use crate::metrics::{MetricsReply, MetricsSource};
 use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
 use crate::pki::{NodeTls, node_id_of};
 use crate::proto::peer_server::{Peer, PeerServer};
@@ -35,6 +37,7 @@ pub struct PeerService {
     hv: Option<Arc<dyn Hypervisor>>,
     migrations: Option<Arc<dyn MigrationReceiver>>,
     audit: Option<Arc<dyn AuditSource>>,
+    metrics: Option<Arc<dyn MetricsSource>>,
     /// 드라이버의 `state_dir`. UEFI 변수 파일을 여기서 찾아 보낸다.
     state_dir: Option<PathBuf>,
 }
@@ -47,6 +50,7 @@ impl PeerService {
             hv,
             migrations: None,
             audit: None,
+            metrics: None,
             state_dir: None,
         }
     }
@@ -66,6 +70,12 @@ impl PeerService {
     /// 이 노드의 감사 로그를 `source`로 읽어 준다. 없으면 읽기 요청을 거부한다.
     pub fn with_audit(mut self, source: Arc<dyn AuditSource>) -> Self {
         self.audit = Some(source);
+        self
+    }
+
+    /// 이 노드의 지표를 `source`로 읽어 준다. 없으면 읽기 요청을 `unimplemented`로 거부한다(옛 노드와 같다).
+    pub fn with_metrics(mut self, source: Arc<dyn MetricsSource>) -> Self {
+        self.metrics = Some(source);
         self
     }
 
@@ -179,6 +189,18 @@ impl Peer for PeerService {
         query.limit = query.limit.min(AuditQuery::MAX_LIMIT);
         let entries = source.read(query).await.map_err(Status::internal)?;
         Ok(Response::new(AuditReply { entries }))
+    }
+
+    async fn read_metrics(
+        &self,
+        req: Request<MetricsQuery>,
+    ) -> Result<Response<MetricsReply>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .metrics
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("this node does not keep metrics"))?;
+        Ok(Response::new(source.read(req.get_ref())))
     }
 
     type UefiVarsStream = ReceiverStream<Result<UefiVarsChunk, Status>>;

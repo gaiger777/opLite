@@ -4,6 +4,7 @@
 //! 노드 비우기: VM을 다른 노드로 옮기고(들어오던 VM도, 로컬 디스크 VM은 디스크를 복사해) 스냅샷이 있는 로컬
 //! 디스크 VM은 남기며, 유지보수가 끝나면 멈춘다.
 //! 감사 로그: 한 노드의 `GET /audit`가 두 노드의 항목을 합치고, 닿지 않는 노드를 알린다.
+//! 지표: 한 노드의 지표 API가 다른 노드의 지표를 읽고, 지표를 모르는 노드와 닿지 않는 노드를 알린다.
 //! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
 
 mod common;
@@ -26,10 +27,11 @@ use opl_driver::{
     uefi_vars_path,
 };
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
-use opl_peer::{GrpcNetwork, PeerService, Peers};
+use opl_peer::{GrpcNetwork, MetricsReply, MetricsSource, PeerService, Peers};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role, UserSpec};
+use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
 use opl_types::node::{FEATURES, Fencing, NodeHa, NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -68,6 +70,8 @@ struct Node {
     listener: Option<TcpListener>,
     /// 감사 로그를 끈 노드(opld의 `[audit] enabled = false`)
     audit_off: bool,
+    /// 지표 소스가 없는 노드(지표를 모르는 옛 노드처럼)
+    metrics_off: bool,
     /// 노드 간 서버를 멈춘다.
     peer_stop: Option<tokio::sync::oneshot::Sender<()>>,
     peer_server: Option<tokio::task::JoinHandle<()>>,
@@ -118,6 +122,7 @@ impl Node {
             tls,
             listener: Some(listener),
             audit_off: false,
+            metrics_off: false,
             peer_stop: None,
             peer_server: None,
             base: String::new(),
@@ -158,10 +163,26 @@ impl Node {
             })
             .unwrap()
         });
-        let service = PeerService::new(self.cluster.clone(), Some(hv.clone()))
+        // opld처럼 API와 노드 간 서버가 같은 지표 저장소를 읽는다.
+        let metrics: Option<Arc<dyn MetricsSource>> = (!self.metrics_off).then(|| {
+            // 두 노드의 VM 점 시각이 엇갈려야 합친 뒤의 정렬이 보인다.
+            let vm_times = if self.name == "node1" {
+                vec![1_000, 3_000]
+            } else {
+                vec![2_000]
+            };
+            Arc::new(FakeMetrics {
+                node: self.id,
+                vm_times,
+            }) as Arc<dyn MetricsSource>
+        });
+        let mut service = PeerService::new(self.cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(incoming))
             .with_uefi_vars(work.join("state"))
             .with_audit(audit.clone());
+        if let Some(metrics) = &metrics {
+            service = service.with_metrics(metrics.clone());
+        }
         let listener = self.listener.take().unwrap();
         let tls = self.tls.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -196,6 +217,7 @@ impl Node {
         );
         state.peers = Some(self.peers.clone());
         state.audit = audit;
+        state.metrics = metrics;
         let state = Arc::new(state);
         let mut config = runner_config(self.id, &work);
         config.peers = Some(self.peers.clone());
@@ -234,12 +256,16 @@ impl Node {
 /// 두 노드를 띄워 클러스터를 만들고 Node 리소스와 관리자를 채운다. 노드 간 서버가 먼저 떠야
 /// 선거가 끝나므로 서버부터 띄운다.
 async fn two_nodes() -> (TempDir, Node, Node) {
-    two_nodes_with(None, true).await
+    two_nodes_with(None, true, true).await
 }
 
 /// `ha`가 있으면 A의 reconciler에 넣고 두 노드를 HA 가능 노드(`process`)로 등록한다.
-/// `b_audit`가 거짓이면 B는 감사 로그를 끈 노드다.
-async fn two_nodes_with(ha: Option<Arc<HaGuard>>, b_audit: bool) -> (TempDir, Node, Node) {
+/// `b_audit`가 거짓이면 B는 감사 로그를 끈 노드, `b_metrics`가 거짓이면 지표 소스가 없는 노드다.
+async fn two_nodes_with(
+    ha: Option<Arc<HaGuard>>,
+    b_audit: bool,
+    b_metrics: bool,
+) -> (TempDir, Node, Node) {
     let ca = ClusterCa::generate("test").unwrap();
     let root = TempDir::new().unwrap();
     let mut a = Node::open(&ca, &root, "node1").await;
@@ -250,6 +276,7 @@ async fn two_nodes_with(ha: Option<Arc<HaGuard>>, b_audit: bool) -> (TempDir, No
     });
     a.ha = ha;
     b.audit_off = !b_audit;
+    b.metrics_off = !b_metrics;
     a.serve(&root).await;
     b.serve(&root).await;
     let members = BTreeMap::from([
@@ -693,7 +720,7 @@ async fn ha_vm_on_a(
             watchdog: None,
         },
     );
-    let (root, a, b) = two_nodes_with(Some(guard), true).await;
+    let (root, a, b) = two_nodes_with(Some(guard), true, true).await;
     let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
     let mut req = vm_request("web");
     req["spec"]["node"] = serde_json::json!(a.id);
@@ -1799,7 +1826,7 @@ async fn audit_entries_of_both_nodes_are_merged() {
 
 #[tokio::test]
 async fn a_node_with_the_audit_log_off_is_disabled_not_unreachable() {
-    let (_root, a, _b) = two_nodes_with(None, false).await;
+    let (_root, a, _b) = two_nodes_with(None, false, true).await;
     let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
     let body = audit_until(&admin, "", |body| {
         audit_nodes(body).contains(&"node1") && body["disabled"] != serde_json::json!([])
@@ -1808,6 +1835,242 @@ async fn a_node_with_the_audit_log_off_is_disabled_not_unreachable() {
     assert_eq!(body["disabled"], serde_json::json!(["node2"]));
     assert_eq!(body["unreachable"], serde_json::json!([]));
     assert!(audit_nodes(&body).iter().all(|n| *n == "node1"), "{body:#}");
+}
+
+/// 노드 점은 `t` 1000·2000(CPU는 노드 id의 첫 바이트), VM 점은 어떤 VM이든 `vm_times`.
+struct FakeMetrics {
+    node: Uuid,
+    vm_times: Vec<i64>,
+}
+
+impl MetricsSource for FakeMetrics {
+    fn read(&self, q: &MetricsQuery) -> MetricsReply {
+        let after = |t: &i64| q.since.is_none_or(|since| *t > since);
+        match q.scope {
+            MetricsScope::Nodes => MetricsReply {
+                node: Some(NodeSeries {
+                    node: self.node,
+                    samples: [1_000, 2_000]
+                        .into_iter()
+                        .filter(after)
+                        .map(|t| NodeSample {
+                            t,
+                            cpu: Some(f64::from(self.node.as_bytes()[0])),
+                            mem_used_mib: None,
+                            mem_total_mib: None,
+                            disk_read_bps: None,
+                            disk_write_bps: None,
+                            net_rx_bps: None,
+                            net_tx_bps: None,
+                            fs_used_mib: None,
+                            fs_total_mib: None,
+                        })
+                        .collect(),
+                }),
+                vms: vec![],
+            },
+            MetricsScope::Vm { id } => MetricsReply {
+                node: None,
+                vms: vec![VmSeries {
+                    vm: id,
+                    node: self.node,
+                    samples: (self.vm_times.iter().copied())
+                        .filter(after)
+                        .map(|t| VmSample {
+                            t,
+                            cpu: None,
+                            mem_rss_mib: None,
+                            disk_read_bps: None,
+                            disk_write_bps: None,
+                            disk_read_iops: None,
+                            disk_write_iops: None,
+                            net_rx_bps: None,
+                            net_tx_bps: None,
+                        })
+                        .collect(),
+                }],
+            },
+        }
+    }
+}
+
+/// 응답 노드 시리즈의 노드 id
+fn metrics_nodes(body: &serde_json::Value) -> Vec<Uuid> {
+    body["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| serde_json::from_value(n["node"].clone()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn metrics_of_the_other_node_are_read_over_rpc() {
+    let (_root, a, mut b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (status, body) = admin.get("/metrics/nodes?since=1000").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 노드 이름 순
+    assert_eq!(metrics_nodes(&body), [a.id, b.id], "{body:#}");
+    assert_eq!(body["nodes"][1]["samples"][0]["t"], 2_000);
+    assert_eq!(
+        body["nodes"][1]["samples"][0]["cpu"],
+        f64::from(b.id.as_bytes()[0])
+    );
+    assert_eq!(body["unreachable"], serde_json::json!([]));
+    assert_eq!(body["unsupported"], serde_json::json!([]));
+
+    let (status, body) = admin.get("/nodes/node2/metrics").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["node"], serde_json::json!(b.id));
+    assert_eq!(body["samples"].as_array().unwrap().len(), 2);
+
+    // VM 지표는 두 노드의 점(A 1000·3000, B 2000)을 시각 순으로 합친다.
+    let (status, vm) = admin.post("/vms", vm_request("web")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let (status, body) = admin.get("/vms/web/metrics").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["vm"], vm["id"]);
+    let times: Vec<_> = body["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["t"].as_i64().unwrap())
+        .collect();
+    assert_eq!(times, [1_000, 2_000, 3_000]);
+    let (_, body) = admin.get("/vms/web/metrics?since=3000").await;
+    assert_eq!(body["samples"], serde_json::json!([]));
+
+    // B의 노드 간 서버를 멈추면 B는 닿지 않는 노드다. A의 점은 그대로 온다.
+    let _ = b.peer_stop.take().unwrap().send(());
+    b.peer_server.take().unwrap().await.unwrap();
+    let (status, body) = admin.get("/metrics/nodes").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(metrics_nodes(&body), [a.id]);
+    assert_eq!(body["unreachable"], serde_json::json!(["node2"]));
+    assert_eq!(body["unsupported"], serde_json::json!([]));
+    let (status, body) = admin.get("/vms/web/metrics").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["samples"].as_array().unwrap().len(), 2);
+    assert_eq!(body["unreachable"], serde_json::json!(["node2"]));
+    let (status, body) = admin.get("/nodes/node2/metrics").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "node_unreachable");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("node \"node2\" did not answer: "),
+        "{body}"
+    );
+}
+
+/// B의 Node 리소스를 `name`으로 다시 만든다(이름을 바꾸는 명령이 없다). A가 볼 때까지 기다린다.
+async fn rename_node(a: &Node, id: Uuid, name: &str) {
+    let mut node = a.cluster.get::<NodeSpec>(id).unwrap().unwrap();
+    a.cluster.delete::<NodeSpec>(id, None).await.unwrap();
+    node.name = name.into();
+    a.cluster.create(&node).await.unwrap();
+    until("renamed node", || {
+        a.cluster
+            .get::<NodeSpec>(id)
+            .unwrap()
+            .is_some_and(|n| n.name == name)
+    })
+    .await;
+}
+
+/// 노드 목록은 id가 아니라 이름 순이고, 위트니스로 표시한 구성원은 어디에도 넣지 않는다.
+#[tokio::test]
+async fn node_metrics_are_sorted_by_name_and_witnesses_are_left_out() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    // 나중에 만든 B(id가 더 큼)의 이름이 앞으로 오게 한다.
+    assert!(a.id < b.id);
+    rename_node(&a, b.id, "node0").await;
+    let (status, body) = admin.get("/metrics/nodes").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(metrics_nodes(&body), [b.id, a.id], "{body:#}");
+
+    // 위트니스는 VM을 돌리지 않아 묻지 않는다(Raft 구성원이어도 `nodes`·목록 어디에도 없다).
+    let node = a.cluster.get::<NodeSpec>(b.id).unwrap().unwrap();
+    let witness = NodeSpec {
+        witness: true,
+        ..node.spec.clone()
+    };
+    a.cluster
+        .update_spec(b.id, None, node.labels.clone(), &witness)
+        .await
+        .unwrap();
+    until("witness", || {
+        a.cluster
+            .get::<NodeSpec>(b.id)
+            .unwrap()
+            .is_some_and(|n| n.spec.witness)
+    })
+    .await;
+    let (status, body) = admin.get("/metrics/nodes").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(metrics_nodes(&body), [a.id], "{body:#}");
+    assert_eq!(body["unreachable"], serde_json::json!([]));
+    assert_eq!(body["unsupported"], serde_json::json!([]));
+    admin.post("/vms", vm_request("web")).await;
+    let (_, body) = admin.get("/vms/web/metrics").await;
+    assert_eq!(body["samples"].as_array().unwrap().len(), 2, "{body:#}");
+    assert_eq!(body["unreachable"], serde_json::json!([]));
+    assert_eq!(body["unsupported"], serde_json::json!([]));
+}
+
+/// 꺼진 것으로 기록된 노드는 묻지 않고(연결 제한을 기다리지 않게) 닿지 않는 노드다. B의 서버는 떠 있으므로
+/// 물었다면 B의 점이 왔을 것이다.
+#[tokio::test]
+async fn an_offline_node_is_unreachable_without_being_asked() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let mut node = a.cluster.get::<NodeSpec>(b.id).unwrap().unwrap();
+    node.status.online = false;
+    a.cluster
+        .update_status::<NodeSpec>(b.id, &node.status)
+        .await
+        .unwrap();
+    until("offline", || {
+        a.cluster
+            .get::<NodeSpec>(b.id)
+            .unwrap()
+            .is_some_and(|n| !n.status.online)
+    })
+    .await;
+    let (status, body) = admin.get("/metrics/nodes").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(metrics_nodes(&body), [a.id], "{body:#}");
+    assert_eq!(body["unreachable"], serde_json::json!(["node2"]));
+    assert_eq!(body["unsupported"], serde_json::json!([]));
+    admin.post("/vms", vm_request("web")).await;
+    let (_, body) = admin.get("/vms/web/metrics").await;
+    assert_eq!(body["samples"].as_array().unwrap().len(), 2, "{body:#}");
+    assert_eq!(body["unreachable"], serde_json::json!(["node2"]));
+    let (status, body) = admin.get("/nodes/node2/metrics").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "node_unreachable");
+    assert_eq!(body["message"], "node \"node2\" is offline");
+}
+
+#[tokio::test]
+async fn a_node_without_metrics_is_unsupported_not_unreachable() {
+    let (_root, a, _b) = two_nodes_with(None, true, false).await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (status, body) = admin.get("/metrics/nodes").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(metrics_nodes(&body), [a.id]);
+    assert_eq!(body["unsupported"], serde_json::json!(["node2"]));
+    assert_eq!(body["unreachable"], serde_json::json!([]));
+    let (status, body) = admin.get("/nodes/node2/metrics").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading");
+    assert_eq!(
+        body["message"],
+        "node \"node2\" does not report metrics yet"
+    );
 }
 
 /// `found`가 참이 될 때까지 기다린다(복제를 기다린다).
