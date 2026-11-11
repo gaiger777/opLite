@@ -20561,3 +20561,29 @@ git commit -m "feat(oplctl): 지표 보기 — orbivisorctl node stats(노드마
 - VM CPU·메모리는 QEMU 프로세스 전체 기준이다(게스트가 보는 값이 아님). vCPU 수·NIC 목록은 지금 스펙에서 읽으므로 재시작을 기다리는 스펙 변경 사이에는 어긋날 수 있다.
 - 벽시계가 뒤로 가면 `since` 이어 받기가 잠시 비고, 한 시간 넘게 앞으로 뛰면 VM 시리즈가 한 번 지워진다.
 - 그 밖의 제한은 설계 문서 §6·§11과 README "지표" 절에 있다.
+
+## 실행 후 기록 (2026-11-11)
+
+- **Task 1~5:** `feat/plan44-metrics`에서 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았다(생성 파일 제외). 다섯 Task를 마친 트리는 리뷰와 CI 프로브를 거친 트리와 생성 파일까지 같다(이 계획 문서만 다름). Task 1만 구현 에이전트가 전체 시험을 다시 돌렸고, Task 2~5는 스테이지 검증과 CI 프로브를 믿고 적용·비교만 했다.
+- **1차 리뷰에서 고친 것:**
+  - 응답 없는 VM 하나가 노드의 모든 VM 점을 없애던 것: VM 마감을 `list()`가 끝난 뒤에 잡는다.
+  - 꺼진 노드가 모든 지표 요청을 연결 제한(3초)만큼 늦추던 것: `online == false`인 노드는 부르지 않고 `unreachable`에 넣는다(로그는 debug로).
+  - 프로세스 CPU 시간을 `u128`로 계산한다(오래 돈 큰 VM의 넘침).
+  - 정렬·이름 순서·위트니스 제외 시험, 빠진 노드가 있을 때의 `since` 처리.
+- **2차 리뷰에서 고친 것:** 1차 수정의 시각 때문에 CPU·네트워크 비율이 틀어지던 것. 프로세스·tap은 틱의 시각 `at`으로, 디스크는 `disk_stats` 직전 시각 `disk_at`으로 따로 적는다. VM 점의 `t`는 VM 측정 시작 때 잡는다. `node stats --watch`는 돌아온 노드가 있는 다음 요청 한 번만 `since`를 뺀다. 재시작을 기다리는 스펙 변경 사이의 한계를 문서에 적었다.
+
+**테스트:**
+- macOS `cargo test --workspace` 1690개(스테이지별 1653·1657·1670·1681·1690)
+- 웹 시험 572개와 `typecheck`·`lint`
+- `fmt`·`clippy -D warnings`(모든 기능)
+- 패키징 셸 시험(`maint-test`·`build-deb-test`·`build-repo-test`·`setup-test`·`iso-test`·`name-test`)
+- 실제 QEMU: `opl-qemu` qemu-it(`query-blockstats`와 HMP `qemu-io` 쓰기 뒤 `wr_bytes`), opld e2e
+
+Linux CI(프로브 3회)에서 같은 시험과 linux-kvm(브리지 tap 카운터 시험 포함)·ldap·package·shell 작업이 통과했다.
+
+## 다음 계획으로 넘길 사항
+
+- 지표 수집(계획 44)이 끝났다. 차트·3D·끌어 놓는 VM 만들기(지표 설계 §7~9)는 가용성 뒤로 미루고 번호를 다시 매긴다.
+- 다음: 하위 프로젝트 15 제어부 가용성과 대규모 클러스터(계획 45부터, 실행기 격리와 systemd watchdog). 사용자 요청으로 빠른 HA, 노드 전원 끄기 펜싱, HA 상태 검사(네트워크·스토리지·본딩 포트), 배치 규칙(affinity·anti-affinity와 soft 형태), 최적 배치, VM 무중단 유형 변경이 들어간다.
+- 그 다음: 하위 프로젝트 16 SDN(OVN 백엔드).
+- 테스트 VM에 계획 44를 배포하면 `orbivisorctl node stats`로 실제 Linux 값을 확인한다.
