@@ -99,6 +99,9 @@ pub struct Cluster {
     forwarder: Option<Arc<dyn Forwarder>>,
     /// 리더일 때 받은 HA 리스 갱신(메모리에만 둔다)
     leases: Arc<LeaseTable>,
+    /// 시험이 저장소 스레드를 붙잡아 느린 디스크를 흉내 낸다.
+    #[cfg(test)]
+    writer: crate::writer::StoreWriter,
 }
 
 /// 지금 알고 있는 멤버십. 값은 노드의 Raft 주소다.
@@ -154,6 +157,8 @@ impl Cluster {
             write_timeout: config.write_timeout,
             forwarder: None,
             leases: Arc::default(),
+            #[cfg(test)]
+            writer: store.writer().clone(),
         })
     }
 
@@ -554,6 +559,25 @@ impl Cluster {
             .await
             .map_err(|e| ClusterError::Raft(e.to_string()))
     }
+
+    /// Raft가 멈추면 그 이유와 함께 끝나는 future(저장소를 붙잡지 않는다). 저장소 쓰기가 실패하거나
+    /// 저장소 스레드가 멈추면 openraft가 이 노드의 Raft를 멈춘다(`running_state`가 `Err`). `shutdown`으로
+    /// 멈춰도 끝난다.
+    pub fn stopped(&self) -> impl Future<Output = String> + Send + 'static {
+        let mut rx = self.raft.metrics();
+        async move {
+            loop {
+                let state = rx.borrow_and_update().running_state.clone();
+                if let Err(e) = state {
+                    return e.to_string();
+                }
+                // 보내는 쪽이 사라졌다: Raft 작업이 끝났다(panic 포함).
+                if rx.changed().await.is_err() {
+                    return "the Raft task ended".to_owned();
+                }
+            }
+        }
+    }
 }
 
 fn to_raw<S: ResourceSpec>(r: &Typed<S>) -> Result<RawResource, serde_json::Error> {
@@ -576,4 +600,140 @@ fn from_raw<S: ResourceSpec>(r: RawResource) -> Result<Typed<S>, ClusterError> {
         spec: serde_json::from_value(r.spec)?,
         status: serde_json::from_value(r.status)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use opl_types::runtime::ImageFormat;
+    use opl_types::storage::{Volume, VolumeSpec};
+    use tokio::time::Instant;
+
+    use super::*;
+    use crate::memnet::MemRouter;
+
+    const SLOW_WRITE: Duration = Duration::from_secs(3);
+
+    fn volume(name: &str) -> Volume {
+        Resource::new(
+            name,
+            VolumeSpec {
+                pool: "local".into(),
+                size_bytes: 1 << 30,
+                format: ImageFormat::Qcow2,
+            },
+        )
+    }
+
+    /// 저장소 쓰기가 3초 걸리는 팔로워가 있어도 (작업자 스레드가 하나뿐인) 실행기는 막히지 않는다.
+    /// 리더의 하트비트와 리스 갱신(`confirm_leader` 두 번)은 시간 안에 돌고 리더도 그대로다. 쓰기를
+    /// 실행기 스레드에서 동기로 하면 3초 동안 모든 노드가 멈춘다.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_store_on_a_follower_does_not_stall_heartbeats_or_lease_checks() {
+        let root = tempfile::TempDir::new().unwrap();
+        let router = MemRouter::default();
+        let mut nodes = BTreeMap::new();
+        for i in 1..=3u64 {
+            let id = NodeId::from(i);
+            let mut config = ClusterConfig::new(id, root.path().join(i.to_string()));
+            config.raft = openraft::Config {
+                heartbeat_interval: 50,
+                election_timeout_min: 1000,
+                election_timeout_max: 2000,
+                ..Default::default()
+            };
+            let cluster = Cluster::open(config, router.network(id)).await.unwrap();
+            router.register(id, &cluster);
+            nodes.insert(id, cluster);
+        }
+        let members = (1..=3u64)
+            .map(|i| (NodeId::from(i), BasicNode::new(format!("node-{i}"))))
+            .collect();
+        let first = &nodes[&NodeId::from(1)];
+        first.initialize(members).await.unwrap();
+        let leader = loop {
+            if let Some(l) = first.raft().metrics().borrow().current_leader
+                && nodes.values().all(|n| n.members().leader == Some(l))
+            {
+                break l;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let term = nodes[&leader].raft().metrics().borrow().current_term;
+        let slow = *nodes.keys().find(|id| **id != leader).unwrap();
+        // openraft 0.9의 Raft 루프는 자기 로그 쓰기가 끝나기를 기다리므로 느린 노드의 루프는 3초 멈추고,
+        // 그 뒤 선거에 나설 수 있다. 여기서 보는 것은 실행기와 다른 노드라 선거는 끈다.
+        nodes[&slow].raft().runtime_config().elect(false);
+
+        // 느린 팔로워의 저장소 스레드를 3초 붙잡은 뒤 쓴다. 리더와 다른 팔로워로 커밋된다.
+        nodes[&slow]
+            .writer
+            .submit(|_| std::thread::sleep(SLOW_WRITE))
+            .unwrap();
+        let stalled = Instant::now();
+        let v = volume("v");
+        let index = nodes[&leader].create(&v).await.unwrap();
+        assert!(stalled.elapsed() < Duration::from_millis(500));
+        let mut rounds = 0;
+        while stalled.elapsed() < SLOW_WRITE {
+            let started = Instant::now();
+            nodes[&leader]
+                .renew_lease(Duration::from_millis(500))
+                .await
+                .unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "{:?}",
+                started.elapsed()
+            );
+            rounds += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(rounds >= 5, "{rounds}");
+        let m = nodes[&leader].raft().metrics().borrow().clone();
+        assert_eq!((m.current_leader, m.current_term), (Some(leader), term));
+        // 느린 팔로워도 붙잡힌 뒤에 차례대로 따라온다.
+        nodes[&slow]
+            .raft()
+            .wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(Some(index), "slow follower caught up")
+            .await
+            .unwrap();
+        assert!(nodes[&slow].get::<VolumeSpec>(v.id).unwrap().is_some());
+        for node in nodes.values() {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// 저장소 쓰기가 panic해 저장소 스레드가 멈추면 다음 쓰기에서 openraft가 Raft를 멈추고
+    /// `stopped`가 그 이유와 함께 끝난다.
+    #[tokio::test]
+    async fn stopped_ends_when_a_store_write_panics() {
+        let root = tempfile::TempDir::new().unwrap();
+        let router = MemRouter::default();
+        let id = NodeId::from(1u64);
+        let cluster = Cluster::open(ClusterConfig::new(id, root.path()), router.network(id))
+            .await
+            .unwrap();
+        router.register(id, &cluster);
+        cluster
+            .initialize(BTreeMap::from([(id, BasicNode::new("node-1"))]))
+            .await
+            .unwrap();
+        cluster.create(&volume("a")).await.unwrap();
+        let stopped = cluster.stopped();
+        tokio::pin!(stopped);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut stopped)
+                .await
+                .is_err()
+        );
+
+        cluster.writer.submit(|_| panic!("store bug")).unwrap();
+        assert!(cluster.create(&volume("b")).await.is_err());
+        let why = tokio::time::timeout(Duration::from_secs(10), stopped)
+            .await
+            .unwrap();
+        assert!(why.contains("the store thread has stopped"), "{why}");
+        let _ = cluster.shutdown().await;
+    }
 }

@@ -84,7 +84,12 @@ async fn held_vm_is_left_alone_until_the_migration_ends() {
         })
         .await;
     assert_eq!(got.spec.node, Some(env.node));
-    assert_eq!(status_of(&env, vm.id).await, Some(RuntimeStatus::Running));
+    // 작업자는 표시를 지운 뒤에 이어서 실행한다.
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while status_of(&env, vm.id).await != Some(RuntimeStatus::Running) {
+        assert!(std::time::Instant::now() < deadline, "source not resumed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// opld가 마이그레이션을 보내다 확정 전에 죽고 다시 떴다: `begin_migration`이 없으므로 작업자가
@@ -107,7 +112,12 @@ async fn migration_left_by_a_restart_is_rolled_back() {
         })
         .await;
     assert_eq!(got.status.pid, pid);
-    assert_eq!(status_of(&env, vm.id).await, Some(RuntimeStatus::Running));
+    // 작업자는 표시를 지운 뒤에 이어서 실행한다.
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while status_of(&env, vm.id).await != Some(RuntimeStatus::Running) {
+        assert!(std::time::Instant::now() < deadline, "source not resumed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// 마이그레이션이 이 노드로 확정됐다: 받는 중 표시가 있는 멈춘 QEMU를 이어서 실행하고 표시를 지운다.

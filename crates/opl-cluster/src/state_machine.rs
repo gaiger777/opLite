@@ -18,6 +18,7 @@ use crate::store::{
 };
 use crate::types::{Command, NodeId, RawResource, Rejection, Response, TypeConfig};
 use crate::watch::{WatchEvent, WatchHub};
+use crate::writer::StoreWriter;
 
 type Membership = StoredMembership<NodeId, openraft::BasicNode>;
 type Meta = SnapshotMeta<NodeId, openraft::BasicNode>;
@@ -36,16 +37,17 @@ struct SnapshotData {
 }
 
 /// 리소스 상태 머신. 엔트리 묶음 하나를 redb 트랜잭션 하나로 적용하므로
-/// 리소스와 `last_applied`는 항상 함께 기록된다.
+/// 리소스와 `last_applied`는 항상 함께 기록된다. 쓰기는 저장소 스레드에서 돈다.
 #[derive(Clone)]
 pub struct StateMachine {
     db: Arc<Database>,
     watch: Arc<WatchHub>,
+    writer: StoreWriter,
 }
 
 impl StateMachine {
-    pub(crate) fn new(db: Arc<Database>, watch: Arc<WatchHub>) -> Self {
-        Self { db, watch }
+    pub(crate) fn new(db: Arc<Database>, watch: Arc<WatchHub>, writer: StoreWriter) -> Self {
+        Self { db, watch, writer }
     }
 
     fn read_applied(&self) -> Result<(Option<LogId<NodeId>>, Membership), StoreError> {
@@ -58,12 +60,12 @@ impl StateMachine {
     }
 
     fn apply_entries(
-        &self,
+        db: &Database,
         entries: Vec<Entry<TypeConfig>>,
     ) -> Result<(Vec<Response>, Vec<WatchEvent>), StoreError> {
         let mut responses = Vec::with_capacity(entries.len());
         let mut events = Vec::new();
-        let txn = self.db.begin_write()?;
+        let txn = db.begin_write()?;
         {
             let mut meta = txn.open_table(META)?;
             let mut objects = txn.open_table(OBJECTS)?;
@@ -95,9 +97,9 @@ impl StateMachine {
         Ok((responses, events))
     }
 
-    /// 한 읽기 트랜잭션에서 상태 전체를 떠서 스냅샷을 만들고 저장한다.
-    fn build(&self) -> Result<Snapshot<TypeConfig>, StoreError> {
-        let txn = self.db.begin_read()?;
+    /// 한 읽기 트랜잭션에서 상태 전체를 떠서 스냅샷 본문을 만든다. 저장은 부른 쪽이 한다.
+    fn snapshot_data(db: &Database) -> Result<(Meta, Vec<u8>), StoreError> {
+        let txn = db.begin_read()?;
         let meta_table = txn.open_table(META)?;
         let last_log_id: Option<LogId<NodeId>> = get_json(&meta_table, KEY_LAST_APPLIED)?;
         let last_membership: Membership =
@@ -123,18 +125,14 @@ impl StateMachine {
             last_log_id,
             last_membership,
         };
-        self.save_snapshot(&meta, &data)?;
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(data)),
-        })
+        Ok((meta, data))
     }
 
     /// 스냅샷을 저장한다. 이미 저장된 스냅샷이 같거나 더 새로우면 그대로 둔다.
     /// openraft는 스냅샷 빌드를 별도 태스크에서 돌리므로, 느린 빌드가 끝나기 전에
     /// 더 새 스냅샷이 설치될 수 있다.
-    fn save_snapshot(&self, meta: &Meta, data: &[u8]) -> Result<(), StoreError> {
-        let txn = self.db.begin_write()?;
+    fn save_snapshot(db: &Database, meta: &Meta, data: &[u8]) -> Result<(), StoreError> {
+        let txn = db.begin_write()?;
         {
             let mut table = txn.open_table(META)?;
             if let Some(existing) = get_json::<Meta>(&table, KEY_SNAPSHOT_META)?
@@ -166,7 +164,7 @@ impl StateMachine {
     }
 
     /// 리소스 전체를 스냅샷 내용으로 바꾼다. 리소스, 적용 위치, 스냅샷을 한 트랜잭션에 기록한다.
-    fn install(&self, meta: &Meta, data: Vec<u8>) -> Result<(), StoreError> {
+    fn install(db: &Database, meta: &Meta, data: Vec<u8>) -> Result<(), StoreError> {
         let header: SnapshotHeader = serde_json::from_slice(&data)?;
         if header.schema_version != SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema {
@@ -174,7 +172,7 @@ impl StateMachine {
             });
         }
         let snapshot: SnapshotData = serde_json::from_slice(&data)?;
-        let txn = self.db.begin_write()?;
+        let txn = db.begin_write()?;
         {
             let mut objects = txn.open_table(OBJECTS)?;
             let mut names = txn.open_table(NAMES)?;
@@ -363,9 +361,22 @@ fn check_exclusive(
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
+    /// 큰 읽기는 `spawn_blocking`에서, 저장은 저장소 스레드에서 한다.
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        self.build()
-            .map_err(|e| StorageIOError::write_snapshot(None, &e).into())
+        let db = self.db.clone();
+        let (meta, data) = tokio::task::spawn_blocking(move || Self::snapshot_data(&db))
+            .await
+            .map_err(|e| StorageIOError::write_snapshot(None, &e))?
+            .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
+        let (meta, data) = self
+            .writer
+            .run(move |db| Self::save_snapshot(db, &meta, &data).map(|()| (meta, data)))
+            .await
+            .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
+        Ok(Snapshot {
+            meta,
+            snapshot: Box::new(Cursor::new(data)),
+        })
     }
 }
 
@@ -384,8 +395,11 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        let entries: Vec<_> = entries.into_iter().collect();
         let (responses, events) = self
-            .apply_entries(entries.into_iter().collect())
+            .writer
+            .run(move |db| Self::apply_entries(db, entries))
+            .await
             .map_err(|e| StorageIOError::write_state_machine(&e))?;
         self.watch.publish(events);
         Ok(responses)
@@ -406,7 +420,10 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         meta: &Meta,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
-        self.install(meta, snapshot.into_inner())
+        let (m, data) = (meta.clone(), snapshot.into_inner());
+        self.writer
+            .run(move |db| Self::install(db, &m, data))
+            .await
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         self.watch.reset(meta.last_log_id.map_or(0, |l| l.index));
         Ok(())
@@ -443,8 +460,8 @@ mod tests {
     fn older_snapshot_does_not_replace_newer_one() {
         let dir = tempfile::TempDir::new().unwrap();
         let sm = Store::open(&dir.path().join("db")).unwrap().state_machine();
-        sm.save_snapshot(&meta_at(10), b"new").unwrap();
-        sm.save_snapshot(&meta_at(5), b"old").unwrap();
+        StateMachine::save_snapshot(&sm.db, &meta_at(10), b"new").unwrap();
+        StateMachine::save_snapshot(&sm.db, &meta_at(5), b"old").unwrap();
 
         let snap = sm.current_snapshot().unwrap().unwrap();
         assert_eq!(snap.meta, meta_at(10));
@@ -458,7 +475,7 @@ mod tests {
         // 미래 형식은 본문 구조도 다를 수 있다. 헤더만 보고 거부해야 한다.
         let data = br#"{"schema_version": 99, "objects": {"format": "v99"}}"#.to_vec();
         assert!(matches!(
-            sm.install(&meta_at(3), data),
+            StateMachine::install(&sm.db, &meta_at(3), data),
             Err(StoreError::UnsupportedSchema { found: 99 })
         ));
     }

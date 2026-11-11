@@ -10,6 +10,7 @@ mod state_machine;
 pub mod store;
 pub mod types;
 pub mod watch;
+mod writer;
 
 pub use cluster::{Cluster, ClusterConfig, ClusterError, DB_FILE, Members, Typed};
 pub use leader::{CATCH_UP_TIMEOUT, Forwarder, LeaderError};

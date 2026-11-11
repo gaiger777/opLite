@@ -1,9 +1,13 @@
 //! 실행기 셋(설계 §3.1). API·작업이 바빠도 Raft 하트비트와 HA 리스 갱신이 늦지 않게 서로 다른
 //! 작업자 스레드에서 돌린다.
 //!
-//! - `core`(2개, `orbivisor-core`): Raft, 노드 간 서버, `HaGuard`, `HaManager`, 노드 감시
+//! - `core`(2개, `orbivisor-core`): Raft, 노드 간 서버(Raft·리스 요청), `HaGuard`, `HaManager`, 노드 감시
 //! - `api`(`orbivisor-api`): HTTPS API
-//! - `work`(`orbivisor-work`): reconciler, Task 실행기, 스케줄러, 정리, 지표, 풀, 텔레메트리 등
+//! - `work`(`orbivisor-work`): reconciler, Task 실행기, 스케줄러, 정리, 지표, 풀, 텔레메트리, 노드 간
+//!   서버가 받은 그 밖의 요청(마이그레이션 받기, 콘솔 중계 등)
+//!
+//! 이 밖에 OS 스레드 둘이 있다: watchdog 쓰다듬기(`orbivisor-watchdog`, `HaGuard`)와 redb 쓰기
+//! (`orbivisor-store`, 클러스터 저장소).
 //!
 //! 실행기 사이 호출은 `Arc`로 나눈 객체의 메서드이고, tokio의 채널·`Notify`·`watch`는 실행기를
 //! 넘어 동작한다.

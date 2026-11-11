@@ -95,7 +95,10 @@ impl FakeApt {
 
     /// 상태 파일을 쓴다.
     pub fn set(&self, name: &str, contents: &str) {
-        std::fs::write(self.path(name), contents).unwrap();
+        // 가짜 명령이 자르고 쓰는 사이의 빈 파일을 읽지 않게 임시 파일을 쓴 뒤 바꿔 끼운다.
+        let tmp = self.path(&format!("{name}.tmp"));
+        std::fs::write(&tmp, contents).unwrap();
+        std::fs::rename(&tmp, self.path(name)).unwrap();
     }
 
     /// 가짜 `apt-get`이 받은 호출(`LANG=<값> <인자…>`)

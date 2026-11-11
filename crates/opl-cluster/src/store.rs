@@ -13,6 +13,7 @@ use crate::log_store::LogStore;
 use crate::state_machine::StateMachine;
 use crate::types::RawResource;
 use crate::watch::WatchHub;
+use crate::writer::StoreWriter;
 
 /// 저장 형식 버전. redb 파일과 스냅샷에 기록한다. 형식이 바뀌면 올리고 마이그레이션을 추가한다.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -43,6 +44,12 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("unsupported schema version {found} (this build supports {SCHEMA_VERSION})")]
     UnsupportedSchema { found: u32 },
+    #[error("cannot start the store thread: {0}")]
+    Thread(std::io::Error),
+    #[error("the store thread has stopped")]
+    WriterStopped,
+    #[error("a store write panicked")]
+    WriterPanicked,
 }
 
 macro_rules! from_redb {
@@ -63,9 +70,11 @@ from_redb!(
 );
 
 /// 노드 하나의 저장소. `log_store()`와 `state_machine()`을 openraft에 넘긴다.
+/// 쓰기 트랜잭션은 저장소 스레드(`orbivisor-store`)에서 돈다.
 pub struct Store {
     db: Arc<Database>,
     watch: Arc<WatchHub>,
+    writer: StoreWriter,
 }
 
 impl Store {
@@ -88,18 +97,25 @@ impl Store {
         txn.commit()?;
         let db = Arc::new(db);
         let applied = last_applied_index(&db)?;
+        let writer = StoreWriter::spawn(&db)?;
         Ok(Self {
             db,
             watch: Arc::new(WatchHub::new(applied)),
+            writer,
         })
     }
 
     pub fn log_store(&self) -> LogStore {
-        LogStore::new(self.db.clone())
+        LogStore::new(self.db.clone(), self.writer.clone())
     }
 
     pub fn state_machine(&self) -> StateMachine {
-        StateMachine::new(self.db.clone(), self.watch.clone())
+        StateMachine::new(self.db.clone(), self.watch.clone(), self.writer.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writer(&self) -> &StoreWriter {
+        &self.writer
     }
 
     pub(crate) fn db(&self) -> &Arc<Database> {

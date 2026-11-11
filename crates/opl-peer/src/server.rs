@@ -12,6 +12,7 @@ use opl_types::audit::AuditQuery;
 use opl_types::metrics::MetricsQuery;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -40,6 +41,9 @@ pub struct PeerService {
     metrics: Option<Arc<dyn MetricsSource>>,
     /// 드라이버의 `state_dir`. UEFI 변수 파일을 여기서 찾아 보낸다.
     state_dir: Option<PathBuf>,
+    /// Raft·리스가 아닌 처리(마이그레이션 받기, 콘솔 중계, UEFI 변수·감사 로그·지표 읽기)를 돌릴
+    /// 실행기. 없으면 서버의 실행기에서 돈다.
+    work: Option<Handle>,
 }
 
 impl PeerService {
@@ -52,7 +56,15 @@ impl PeerService {
             audit: None,
             metrics: None,
             state_dir: None,
+            work: None,
         }
+    }
+
+    /// Raft·리스가 아닌 처리를 `work` 실행기에서 돌린다. 그 처리가 띄우는 작업(받은 VM의 QMP·모니터,
+    /// 콘솔 중계, 파일 보내기)도 그 실행기에 생긴다.
+    pub fn with_work(mut self, work: Handle) -> Self {
+        self.work = Some(work);
+        self
     }
 
     /// 드라이버의 `state_dir`에 있는 VM의 UEFI 변수 파일을 보낸다. 없으면 보내기 요청을 거부한다.
@@ -79,10 +91,36 @@ impl PeerService {
         self
     }
 
-    fn migrations(&self) -> Result<&dyn MigrationReceiver, Status> {
+    fn migrations(&self) -> Result<Arc<dyn MigrationReceiver>, Status> {
         self.migrations
-            .as_deref()
+            .clone()
             .ok_or_else(|| Status::unimplemented("this node does not receive migrations"))
+    }
+
+    /// `fut`을 `work` 실행기(없으면 여기)에서 돌리고 기다린다. 처리가 panic하면 다시 던지지 않고
+    /// 로그를 남기고 `internal`로 답한다(같은 h2 연결의 Raft RPC를 함께 끊지 않게).
+    async fn offload<F>(&self, fut: F) -> Result<F::Output, Status>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let Some(work) = &self.work else {
+            return Ok(fut.await);
+        };
+        match work.spawn(fut).await {
+            Ok(output) => Ok(output),
+            Err(e) if e.is_panic() => {
+                let panic = e.into_panic();
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|m| m.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                tracing::error!(panic = %message, "a peer request handler panicked");
+                Err(Status::internal("the request handler panicked"))
+            }
+            Err(_) => Err(Status::unavailable("this node is shutting down")),
+        }
     }
 
     fn authorize<T>(&self, req: &Request<T>) -> Result<(), Status> {
@@ -151,9 +189,11 @@ impl Peer for PeerService {
         req: Request<MigrateIncomingRequest>,
     ) -> Result<Response<MigrateIncomingReply>, Status> {
         self.authorize(&req)?;
-        Ok(Response::new(
-            self.migrations()?.incoming(req.into_inner()).await,
-        ))
+        let (receiver, req) = (self.migrations()?, req.into_inner());
+        let reply = self
+            .offload(async move { receiver.incoming(req).await })
+            .await?;
+        Ok(Response::new(reply))
     }
 
     async fn migrate_incoming_wait(
@@ -161,9 +201,11 @@ impl Peer for PeerService {
         req: Request<IncomingMigration>,
     ) -> Result<Response<IncomingReply>, Status> {
         self.authorize(&req)?;
-        Ok(Response::new(
-            self.migrations()?.wait(req.into_inner()).await,
-        ))
+        let (receiver, req) = (self.migrations()?, req.into_inner());
+        let reply = self
+            .offload(async move { receiver.wait(req).await })
+            .await?;
+        Ok(Response::new(reply))
     }
 
     async fn migrate_incoming_abort(
@@ -171,23 +213,28 @@ impl Peer for PeerService {
         req: Request<IncomingMigration>,
     ) -> Result<Response<IncomingReply>, Status> {
         self.authorize(&req)?;
-        Ok(Response::new(
-            self.migrations()?.abort(req.into_inner()).await,
-        ))
+        let (receiver, req) = (self.migrations()?, req.into_inner());
+        let reply = self
+            .offload(async move { receiver.abort(req).await })
+            .await?;
+        Ok(Response::new(reply))
     }
 
     async fn read_audit(&self, req: Request<AuditQuery>) -> Result<Response<AuditReply>, Status> {
         self.authorize(&req)?;
         let source = self
             .audit
-            .as_ref()
+            .clone()
             .ok_or_else(|| Status::unimplemented("this node does not keep an audit log"))?;
         if !source.enabled() {
             return Err(Status::failed_precondition("audit log disabled"));
         }
         let mut query = req.into_inner();
         query.limit = query.limit.min(AuditQuery::MAX_LIMIT);
-        let entries = source.read(query).await.map_err(Status::internal)?;
+        let entries = self
+            .offload(async move { source.read(query).await })
+            .await?
+            .map_err(Status::internal)?;
         Ok(Response::new(AuditReply { entries }))
     }
 
@@ -198,9 +245,11 @@ impl Peer for PeerService {
         self.authorize(&req)?;
         let source = self
             .metrics
-            .as_ref()
+            .clone()
             .ok_or_else(|| Status::unimplemented("this node does not keep metrics"))?;
-        Ok(Response::new(source.read(req.get_ref())))
+        let query = req.into_inner();
+        let reply = self.offload(async move { source.read(&query) }).await?;
+        Ok(Response::new(reply))
     }
 
     type UefiVarsStream = ReceiverStream<Result<UefiVarsChunk, Status>>;
@@ -212,25 +261,30 @@ impl Peer for PeerService {
         self.authorize(&req)?;
         let dir = self
             .state_dir
-            .as_ref()
+            .clone()
             .ok_or_else(|| Status::unimplemented("this node does not serve UEFI variables"))?;
         let vm = req.into_inner().vm;
-        let file = match tokio::fs::File::open(uefi_vars_path(dir, vm)).await {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Status::not_found(format!(
-                    "no UEFI variables for VM {vm} on this node"
-                )));
-            }
-            Err(e) => {
-                return Err(Status::internal(format!(
-                    "cannot open the UEFI variables of VM {vm}: {e}"
-                )));
-            }
-        };
-        let (tx, rx) = mpsc::channel(4);
-        tokio::spawn(crate::firmware::send_file(file, tx));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let stream = self
+            .offload(async move {
+                let file = match tokio::fs::File::open(uefi_vars_path(&dir, vm)).await {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(Status::not_found(format!(
+                            "no UEFI variables for VM {vm} on this node"
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(Status::internal(format!(
+                            "cannot open the UEFI variables of VM {vm}: {e}"
+                        )));
+                    }
+                };
+                let (tx, rx) = mpsc::channel(4);
+                tokio::spawn(crate::firmware::send_file(file, tx));
+                Ok(ReceiverStream::new(rx))
+            })
+            .await??;
+        Ok(Response::new(stream))
     }
 
     type ConsoleStream = ReceiverStream<Result<Bytes, Status>>;
@@ -248,20 +302,28 @@ impl Peer for PeerService {
             .ok_or_else(|| Status::invalid_argument("missing VM id"))?;
         let hv = self
             .hv
-            .as_ref()
+            .clone()
             .ok_or_else(|| Status::unimplemented("this node does not serve consoles"))?;
-        let not_running = || Status::failed_precondition(format!("VM {vm} is not running here"));
-        let path = match hv.console_endpoint(vm).await {
-            Ok(path) => path,
-            Err(DriverError::NotRunning(_)) => return Err(not_running()),
-            Err(e) => return Err(Status::internal(e.to_string())),
-        };
-        let vnc = UnixStream::connect(&path)
-            .await
-            .map_err(|_| not_running())?;
-        let (tx, rx) = mpsc::channel(16);
-        tokio::spawn(bridge(req.into_inner(), vnc, tx));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let inbound = req.into_inner();
+        // VNC 소켓은 연 실행기에 묶이므로 연결과 중계를 함께 work에서 한다.
+        let stream = self
+            .offload(async move {
+                let not_running =
+                    || Status::failed_precondition(format!("VM {vm} is not running here"));
+                let path = match hv.console_endpoint(vm).await {
+                    Ok(path) => path,
+                    Err(DriverError::NotRunning(_)) => return Err(not_running()),
+                    Err(e) => return Err(Status::internal(e.to_string())),
+                };
+                let vnc = UnixStream::connect(&path)
+                    .await
+                    .map_err(|_| not_running())?;
+                let (tx, rx) = mpsc::channel(16);
+                tokio::spawn(bridge(inbound, vnc, tx));
+                Ok(ReceiverStream::new(rx))
+            })
+            .await??;
+        Ok(Response::new(stream))
     }
 }
 

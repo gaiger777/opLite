@@ -1,10 +1,13 @@
 //! 노드 쪽 HA 펜싱(`HaGuard`). 리더에게 리스를 갱신하고, 리스가 살아 있는지(`fresh`)와 끝났는지
 //! (`stale`)를 알려 주고, watchdog 장치를 쓰다듬는다. 규칙은 설계 문서
-//! (2026-11-02-ha-fencing-witness-design.md) §3.2·§3.3을 따른다.
+//! (2026-11-02-ha-fencing-witness-design.md) §3.2·§3.3을 따른다. 쓰다듬기는 실행기가 막혀도 멈추지
+//! 않게 전용 스레드(`orbivisor-watchdog`)에서 한다(2026-11-11-availability-scale-design.md §3.1).
 
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,7 +15,7 @@ use async_trait::async_trait;
 use opl_cluster::{Cluster, ClusterError};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 /// watchdog를 쓰다듬는 간격
@@ -198,6 +201,8 @@ pub enum ArmError {
     Open(io::Error),
     #[error("the watchdog device is unusable: {0}")]
     Rejected(String),
+    #[error("the HA guard is closed")]
+    Closed,
 }
 
 struct State {
@@ -205,7 +210,9 @@ struct State {
     last_renewed: Option<Instant>,
     /// 이 노드에서 도는 HA VM
     running: HashSet<Uuid>,
-    watchdog: Option<Box<dyn Watchdog>>,
+    /// 연 watchdog 장치(장치는 쓰다듬기 스레드가 쥔다). 안쪽은 장치가 제한 시간을 받아들이지 않은
+    /// 이유다. None이면 아직 열지 않았다.
+    watchdog: Option<Option<String>>,
 }
 
 struct Shared {
@@ -216,9 +223,37 @@ struct Shared {
     tx: watch::Sender<LeaseState>,
     /// 갱신에 성공하면 알린다(상태가 바뀔 다음 시각이 늦춰진다).
     renewed: Notify,
+    /// 쓰다듬기 스레드가 잠금 없이 읽는 값들. 시각은 `epoch`에서 지난 밀리초 + 1이고 0은 갱신 없음이다.
+    epoch: std::time::Instant,
+    renewed_at: AtomicU64,
+    /// 이 노드에서 도는 HA VM이 있다(`State::running`이 비지 않았다).
+    running_any: AtomicBool,
 }
 
 impl Shared {
+    /// 쓰다듬기 스레드가 보는 `fresh`. 실행기가 막혀 갱신 루프가 돌지 않아도 스레드가 스스로 시간을
+    /// 재어 판단한다. 갱신 루프가 이 시각을 async 시각보다 먼저 재고 밀리초를 버림하므로 `lease`의
+    /// `fresh`보다 늦게 끝나지 않는다.
+    fn fresh_for_ping(&self) -> bool {
+        match self.renewed_at.load(Ordering::Acquire) {
+            0 => false,
+            at => self.epoch.elapsed() < Duration::from_millis(at - 1) + self.fence_after,
+        }
+    }
+
+    /// 성공한 갱신을 보내기 전 시각(`sent`)을 쓰다듬기 스레드에 알린다.
+    fn record_renewal(&self, sent: std::time::Instant) {
+        let at = u64::try_from(sent.saturating_duration_since(self.epoch).as_millis())
+            .unwrap_or(u64::MAX - 1)
+            + 1;
+        self.renewed_at.fetch_max(at, Ordering::AcqRel);
+    }
+
+    fn set_running_any(&self, state: &State) {
+        self.running_any
+            .store(!state.running.is_empty(), Ordering::Release);
+    }
+
     fn lease(&self, state: &State, now: Instant) -> LeaseState {
         let fresh = state
             .last_renewed
@@ -253,11 +288,24 @@ pub struct HaGuard {
     shared: Arc<Shared>,
     opener: Option<Arc<dyn WatchdogOpener>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// 쓰다듬기 스레드. watchdog 장치를 쓸 때(`opener`가 있을 때)만 띄운다.
+    pinger: Mutex<Option<Pinger>>,
+}
+
+/// 쓰다듬기 스레드. 연 장치를 `tx`로 받고, `tx`가 닫히면 쥔 장치를 돌려주며 끝난다.
+struct Pinger {
+    tx: mpsc::Sender<Box<dyn Watchdog>>,
+    thread: std::thread::JoinHandle<Option<Box<dyn Watchdog>>>,
 }
 
 impl HaGuard {
     /// 지금을 기준점으로 삼고 곧바로 첫 갱신을 보낸다.
     pub fn spawn(renewer: Arc<dyn LeaseRenewer>, config: HaConfig) -> Arc<Self> {
+        Self::start(renewer, config, PING_INTERVAL)
+    }
+
+    /// [`spawn`](Self::spawn). 시험은 쓰다듬기 간격을 줄인다.
+    fn start(renewer: Arc<dyn LeaseRenewer>, config: HaConfig, ping: Duration) -> Arc<Self> {
         let (tx, _) = watch::channel(LeaseState::default());
         let shared = Arc::new(Shared {
             start: Instant::now(),
@@ -269,15 +317,28 @@ impl HaGuard {
             }),
             tx,
             renewed: Notify::new(),
+            epoch: std::time::Instant::now(),
+            renewed_at: AtomicU64::new(0),
+            running_any: AtomicBool::new(false),
         });
         let tasks = vec![
             tokio::spawn(renew_loop(shared.clone(), renewer, config.renew_interval)),
             tokio::spawn(watch_loop(shared.clone())),
         ];
+        let pinger = config.watchdog.is_some().then(|| {
+            let (tx, rx) = mpsc::channel();
+            let shared = shared.clone();
+            let thread = std::thread::Builder::new()
+                .name("orbivisor-watchdog".into())
+                .spawn(move || ping_loop(&shared, &rx, ping))
+                .expect("cannot start the watchdog thread");
+            Pinger { tx, thread }
+        });
         Arc::new(Self {
             shared,
             opener: config.watchdog,
             tasks: Mutex::new(tasks),
+            pinger: Mutex::new(pinger),
         })
     }
 
@@ -304,15 +365,21 @@ impl HaGuard {
     /// HA VM을 켜거나 도는 HA VM에 붙기 전에 watchdog를 연다(이미 열었으면 그대로). 리스가 지금 살아
     /// 있을 때(`fresh`)만 성공한다. 이전 프로세스가 켜 둔 타이머를 새 리스 없이 늘리면 안 된다.
     /// watchdog가 없으면(`process`) 리스만 본다. 제한 시간을 받아들이지 않은 장치는 쥔 채(다시 열지
-    /// 않는다) 실패한다.
+    /// 않는다) 실패한다. 닫은 뒤에는 장치를 열지 않는다(쓰다듬을 스레드가 없어 연 장치가 그냥 닫히면
+    /// 타이머가 돌아 노드가 재시작된다).
     pub fn arm(&self) -> Result<(), ArmError> {
         let mut state = self.shared.state.lock().unwrap();
         if !self.shared.lease(&state, Instant::now()).fresh {
             return Err(ArmError::NotFresh);
         }
         if let (Some(opener), None) = (&self.opener, &state.watchdog) {
+            let pinger = self.pinger.lock().unwrap();
+            let Some(pinger) = &*pinger else {
+                return Err(ArmError::Closed);
+            };
             let watchdog = opener.open().map_err(ArmError::Open)?;
-            match watchdog.rejected() {
+            let rejected = watchdog.rejected().map(str::to_owned);
+            match &rejected {
                 Some(reason) => {
                     tracing::warn!(
                         reason,
@@ -321,9 +388,11 @@ impl HaGuard {
                 }
                 None => tracing::info!("watchdog armed"),
             }
-            state.watchdog = Some(watchdog);
+            // 장치는 쓰다듬기 스레드에 넘긴다. 잠금을 쥐고 있으므로 그 사이에 닫히지 않는다.
+            let _ = pinger.tx.send(watchdog);
+            state.watchdog = Some(rejected);
         }
-        match state.watchdog.as_ref().and_then(|w| w.rejected()) {
+        match state.watchdog.as_ref().and_then(Option::as_deref) {
             Some(reason) => Err(ArmError::Rejected(reason.to_owned())),
             None => Ok(()),
         }
@@ -337,17 +406,15 @@ impl HaGuard {
         } else {
             state.running.remove(&vm);
         }
+        self.shared.set_running_any(&state);
     }
 
     /// 도는 HA VM 가운데 `keep`에 없는 것을 뺀다. 작업자가 없어 아무도 빼지 않는 VM(옮겨 간 뒤 멈춘
     /// 원본 등)을 reconciler가 정리한다.
     pub fn retain_running(&self, keep: &HashSet<Uuid>) {
-        self.shared
-            .state
-            .lock()
-            .unwrap()
-            .running
-            .retain(|vm| keep.contains(vm));
+        let mut state = self.shared.state.lock().unwrap();
+        state.running.retain(|vm| keep.contains(vm));
+        self.shared.set_running_any(&state);
     }
 
     /// 갱신과 쓰다듬기를 멈춘다. 도는 HA VM이 없으면 watchdog를 magic close로 멈추고 닫는다. 있으면
@@ -356,17 +423,22 @@ impl HaGuard {
         for task in self.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
-        let mut state = self.shared.state.lock().unwrap();
-        let Some(watchdog) = state.watchdog.take() else {
+        let Some(pinger) = self.pinger.lock().unwrap().take() else {
             return;
         };
-        if state.running.is_empty() {
+        // 스레드를 멈추고 쥐던 장치를 돌려받는다. 장치에는 잠금을 놓고 쓴다.
+        drop(pinger.tx);
+        let Some(watchdog) = pinger.thread.join().ok().flatten() else {
+            return;
+        };
+        let running = self.shared.state.lock().unwrap().running.len();
+        if running == 0 {
             if let Err(e) = watchdog.magic_close() {
                 tracing::warn!(error = %e, "cannot stop the watchdog");
             }
         } else {
             tracing::warn!(
-                vms = state.running.len(),
+                vms = running,
                 "HA VMs are running; leaving the watchdog armed, so this node restarts unless orbivisord comes back in time"
             );
             drop(watchdog);
@@ -375,10 +447,12 @@ impl HaGuard {
 }
 
 impl Drop for HaGuard {
+    /// 작업을 멈추고 쓰다듬기 스레드를 닫는다(기다리지 않는다). 장치는 magic close 없이 닫힌다.
     fn drop(&mut self) {
         for task in self.tasks.get_mut().unwrap().drain(..) {
             task.abort();
         }
+        self.pinger.get_mut().unwrap().take();
     }
 }
 
@@ -387,7 +461,10 @@ async fn renew_loop(shared: Arc<Shared>, renewer: Arc<dyn LeaseRenewer>, interva
     let limit = interval * 2;
     let mut failing = false;
     loop {
-        // 보내기 전에 잰다. 리더가 받은 시각은 이보다 늦다(설계 §3.2).
+        // 보내기 전에 잰다. 리더가 받은 시각은 이보다 늦다(설계 §3.2). 쓰다듬기 스레드의 시각을 먼저
+        // 재어 그 마감이 `lease`의 마감보다 늦지 않게 한다(`from_std`는 시간을 멈춘 시험의 시계와 달라
+        // 쓰지 않는다).
+        let sent_clock = std::time::Instant::now();
         let sent = Instant::now();
         let result = tokio::time::timeout(limit, renewer.renew_lease(limit))
             .await
@@ -398,6 +475,7 @@ async fn renew_loop(shared: Arc<Shared>, renewer: Arc<dyn LeaseRenewer>, interva
                     let mut state = shared.state.lock().unwrap();
                     state.last_renewed = Some(state.last_renewed.map_or(sent, |s| s.max(sent)));
                 }
+                shared.record_renewal(sent_clock);
                 shared.publish();
                 shared.renewed.notify_one();
                 if failing {
@@ -416,12 +494,8 @@ async fn renew_loop(shared: Arc<Shared>, renewer: Arc<dyn LeaseRenewer>, interva
     }
 }
 
-/// 리스 상태가 바뀌는 때에 알리고, 1초마다 watchdog를 쓰다듬는다. 리스가 살아 있거나 도는 HA VM이
-/// 없을 때만 쓰다듬는다.
+/// 리스 상태가 바뀌는 때에 알린다.
 async fn watch_loop(shared: Arc<Shared>) {
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut holding = false;
     loop {
         let next = shared.publish();
         tokio::select! {
@@ -432,23 +506,37 @@ async fn watch_loop(shared: Arc<Shared>) {
                 }
             } => {}
             () = shared.renewed.notified() => {}
-            _ = ping.tick() => {
-                let mut guard = shared.state.lock().unwrap();
-                let state = &mut *guard;
-                let fresh = shared.lease(state, Instant::now()).fresh;
-                let Some(watchdog) = state.watchdog.as_mut() else {
-                    continue;
-                };
-                if fresh || state.running.is_empty() {
-                    holding = false;
-                    if let Err(e) = watchdog.ping() {
-                        tracing::warn!(error = %e, "cannot ping the watchdog");
-                    }
-                } else if !holding {
-                    holding = true;
-                    tracing::warn!("HA lease lost with HA VMs running; no longer pinging the watchdog");
-                }
+        }
+    }
+}
+
+/// 쓰다듬기 스레드. `interval`마다 watchdog를 쓰다듬는다. 리스가 살아 있거나 도는 HA VM이 없을 때만
+/// 쓰다듬는다. 잠금 없이 원자값만 읽는다. `rx`가 닫히면 쥔 장치를 돌려주고 끝난다.
+fn ping_loop(
+    shared: &Shared,
+    rx: &mpsc::Receiver<Box<dyn Watchdog>>,
+    interval: Duration,
+) -> Option<Box<dyn Watchdog>> {
+    let mut watchdog: Option<Box<dyn Watchdog>> = None;
+    let mut holding = false;
+    loop {
+        match rx.recv_timeout(interval) {
+            // 새 장치는 한 간격을 기다리지 않고 곧바로 한 번 쓰다듬는다(규칙은 같다).
+            Ok(opened) => watchdog = Some(opened),
+            Err(RecvTimeoutError::Disconnected) => return watchdog,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        let Some(watchdog) = watchdog.as_mut() else {
+            continue;
+        };
+        if shared.fresh_for_ping() || !shared.running_any.load(Ordering::Acquire) {
+            holding = false;
+            if let Err(e) = watchdog.ping() {
+                tracing::warn!(error = %e, "cannot ping the watchdog");
             }
+        } else if !holding {
+            holding = true;
+            tracing::warn!("HA lease lost with HA VMs running; no longer pinging the watchdog");
         }
     }
 }
@@ -707,6 +795,19 @@ mod tests {
         g.close();
     }
 
+    /// 닫은 뒤에는 리스가 살아 있어도 watchdog를 열지 않는다.
+    #[tokio::test(start_paused = true)]
+    async fn arm_after_close_does_not_open_the_watchdog() {
+        let renewer = FakeRenewer::new(true);
+        let watchdog = Arc::new(FakeWatchdog::default());
+        let g = guard(&renewer, Some(&watchdog));
+        g.subscribe().wait_for(|s| s.fresh).await.unwrap();
+        g.close();
+        assert!(g.fresh());
+        assert!(matches!(g.arm(), Err(ArmError::Closed)));
+        assert!(watchdog.log().is_empty());
+    }
+
     /// watchdog가 없으면(process) 갱신했는지만 본다.
     #[tokio::test(start_paused = true)]
     async fn arm_without_a_watchdog_only_needs_a_renewal() {
@@ -719,32 +820,148 @@ mod tests {
         g.close();
     }
 
-    /// 리스가 살아 있거나 도는 HA VM이 없을 때만 1초마다 쓰다듬는다.
-    #[tokio::test(start_paused = true)]
+    /// 쓰다듬기 스레드를 쓰는 시험의 짧은 시간들(실제 시간으로 돈다)
+    const PING: Duration = Duration::from_millis(50);
+    const SHORT_FENCE: Duration = Duration::from_millis(2000);
+
+    /// 실제 시간으로 짧게 도는 `HaGuard`
+    fn quick_guard(renewer: &Arc<FakeRenewer>, watchdog: Arc<dyn WatchdogOpener>) -> Arc<HaGuard> {
+        HaGuard::start(
+            renewer.clone(),
+            HaConfig {
+                fence_after: SHORT_FENCE,
+                renew_interval: Duration::from_millis(100),
+                watchdog: Some(watchdog),
+            },
+            PING,
+        )
+    }
+
+    /// 리스가 살아 있거나 도는 HA VM이 없을 때만 쓰다듬는다.
+    #[tokio::test]
     async fn pings_only_while_fresh_or_without_running_ha_vms() {
         let renewer = FakeRenewer::new(true);
         let watchdog = Arc::new(FakeWatchdog::default());
-        let g = guard(&renewer, Some(&watchdog));
-        tokio::time::sleep(MS).await;
+        let g = quick_guard(&renewer, watchdog.clone());
+        let mut rx = g.subscribe();
+        rx.wait_for(|s| s.fresh).await.unwrap();
         g.arm().unwrap();
         let vm = Uuid::new_v4();
         g.set_running(vm, true);
         // 리스가 살아 있으면 HA VM이 돌아도 쓰다듬는다.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(PING * 10).await;
         let pinged = watchdog.count("ping");
-        assert!((4..=6).contains(&pinged), "{pinged}");
+        assert!(pinged >= 3, "{pinged}");
         // 리스가 끝나면 HA VM이 도는 동안 쓰다듬지 않는다.
         renewer.set_ok(false);
-        let mut rx = g.subscribe();
         rx.wait_for(|s| !s.fresh).await.unwrap();
+        tokio::time::sleep(PING * 2).await;
         let before = watchdog.count("ping");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(PING * 10).await;
         assert_eq!(watchdog.count("ping"), before);
         // 도는 HA VM이 없으면 리스가 없어도 쓰다듬는다.
         g.set_running(vm, false);
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(PING * 10).await;
         assert!(watchdog.count("ping") >= before + 2);
         g.close();
+    }
+
+    /// 받은 장치는 쓰다듬기 간격을 기다리지 않고 곧바로 한 번 쓰다듬는다.
+    #[tokio::test]
+    async fn a_new_watchdog_is_pinged_at_once() {
+        let renewer = FakeRenewer::new(true);
+        let watchdog = Arc::new(FakeWatchdog::default());
+        let g = HaGuard::start(
+            renewer.clone(),
+            HaConfig {
+                fence_after: SHORT_FENCE,
+                renew_interval: Duration::from_millis(100),
+                watchdog: Some(watchdog.clone()),
+            },
+            Duration::from_secs(3600),
+        );
+        g.subscribe().wait_for(|s| s.fresh).await.unwrap();
+        g.arm().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while watchdog.count("ping") == 0 {
+            assert!(std::time::Instant::now() < deadline, "not pinged");
+            tokio::time::sleep(PING).await;
+        }
+        assert_eq!(watchdog.log(), ["open", "ping"]);
+        g.close();
+    }
+
+    /// 장치 대신 파일 끝에 쓰고, 쓴 스레드의 이름을 적는다.
+    struct FileWatchdog {
+        path: PathBuf,
+        threads: Arc<Mutex<HashSet<String>>>,
+    }
+
+    struct FileDevice(std::fs::File, Arc<Mutex<HashSet<String>>>);
+
+    impl Watchdog for FileDevice {
+        fn ping(&mut self) -> io::Result<()> {
+            let name = std::thread::current().name().unwrap_or_default().to_owned();
+            self.1.lock().unwrap().insert(name);
+            io::Write::write_all(&mut self.0, b"\0")
+        }
+
+        fn magic_close(mut self: Box<Self>) -> io::Result<()> {
+            io::Write::write_all(&mut self.0, b"V")
+        }
+    }
+
+    impl WatchdogOpener for FileWatchdog {
+        fn open(&self) -> io::Result<Box<dyn Watchdog>> {
+            let file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
+            Ok(Box::new(FileDevice(file, self.threads.clone())))
+        }
+    }
+
+    /// 실행기가 막혀 갱신 루프가 돌지 않아도 쓰다듬기 스레드는 계속 쓰다듬고, 스스로 시간을 재어
+    /// 리스가 끝나면(HA VM이 도는 동안) 멈춘다.
+    #[tokio::test]
+    async fn the_watchdog_thread_pings_while_the_runtime_is_blocked() {
+        let renewer = FakeRenewer::new(true);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let threads = Arc::new(Mutex::new(HashSet::new()));
+        let g = quick_guard(
+            &renewer,
+            Arc::new(FileWatchdog {
+                path: file.path().into(),
+                threads: threads.clone(),
+            }),
+        );
+        g.subscribe().wait_for(|s| s.fresh).await.unwrap();
+        g.arm().unwrap();
+        g.set_running(Uuid::new_v4(), true);
+        let written = || std::fs::read(file.path()).unwrap();
+
+        // 이 시험의 실행기(스레드 하나)를 막는다. 마지막 갱신은 막기 전이다.
+        let blocked = std::time::Instant::now();
+        // 느린 CI에서도 되게 정해진 시간 대신 세 번 쓰다듬을 때까지(리스가 끝나기 전까지만) 막은 채 기다린다.
+        let early = loop {
+            let w = written();
+            if w.len() >= 3 || blocked.elapsed() >= SHORT_FENCE / 2 {
+                break w;
+            }
+            std::thread::sleep(PING);
+        };
+        assert!(early.len() >= 3, "{early:?}");
+        std::thread::sleep(
+            (blocked + SHORT_FENCE + PING * 8).saturating_duration_since(std::time::Instant::now()),
+        );
+        let late = written();
+        std::thread::sleep(PING * 6);
+        assert_eq!(written(), late);
+        assert!(late.iter().all(|b| *b == 0));
+        assert_eq!(
+            *threads.lock().unwrap(),
+            HashSet::from(["orbivisor-watchdog".to_owned()])
+        );
+        // 도는 HA VM이 있으므로 닫아도 magic close를 하지 않는다.
+        g.close();
+        assert_eq!(written(), late);
     }
 
     /// 정상 종료 때 도는 HA VM이 없으면 magic close를 한다.
@@ -784,21 +1001,21 @@ mod tests {
     /// 제한 시간을 받아들이지 않은 장치도 닫지 않고 쥔다: 그냥 닫으면 커널 타이머가 남아 나중에 노드가
     /// 재시작된다. HA VM에는 쓰지 않고(`arm` 실패, 다시 열지 않는다) 평소 규칙대로 쓰다듬으며, 정상 종료
     /// 때 도는 HA VM이 없으면 magic close로 멈춘다.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_rejected_watchdog_is_held_pinged_and_magic_closed() {
         let renewer = FakeRenewer::new(true);
         let watchdog = Arc::new(FakeWatchdog::default());
         *watchdog.reject.lock().unwrap() = Some("the device chose 60s");
-        let g = guard(&renewer, Some(&watchdog));
-        tokio::time::sleep(MS).await;
+        let g = quick_guard(&renewer, watchdog.clone());
+        g.subscribe().wait_for(|s| s.fresh).await.unwrap();
         let Err(e) = g.arm() else {
             panic!("armed a rejected watchdog");
         };
         assert!(matches!(e, ArmError::Rejected(_)), "{e:?}");
         assert!(e.to_string().contains("the device chose 60s"), "{e}");
         assert!(matches!(g.arm(), Err(ArmError::Rejected(_))));
-        assert_eq!(watchdog.log(), ["open"]);
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(watchdog.count("open"), 1);
+        tokio::time::sleep(PING * 10).await;
         assert!(watchdog.count("ping") >= 2);
         g.close();
         let log = watchdog.log();

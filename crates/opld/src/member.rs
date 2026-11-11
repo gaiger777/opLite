@@ -193,7 +193,9 @@ pub struct Member {
     services: Option<Services>,
     register: JoinHandle<()>,
     promotion: JoinHandle<()>,
-    /// 서버 태스크가 끝나면 그 이유가 온다.
+    /// Raft가 멈추면 `exited`로 알린다. 정상 종료는 저장소를 닫기 전에 이것부터 멈춘다.
+    raft_watch: JoinHandle<()>,
+    /// 서버 태스크가 끝나거나 Raft가 멈추면 그 이유가 온다.
     exited: mpsc::Receiver<String>,
 }
 
@@ -205,7 +207,8 @@ impl Member {
     ///
     /// 서비스를 실행기 셋에 나눠 띄운다(설계 §3.1). Raft(openraft 작업은 `Raft::new`를 부른 실행기에
     /// 생긴다), 노드 간 서버, `HaGuard`, `HaManager`, 노드 감시, 승격은 `rt.core`, API는 `rt.api`, VM·풀을
-    /// 다스리는 일과 스케줄러는 `rt.work`에서 돈다.
+    /// 다스리는 일과 스케줄러는 `rt.work`에서 돈다. 노드 간 서버가 받은 Raft·리스가 아닌 요청(마이그레이션
+    /// 받기, 콘솔 중계, UEFI 변수·감사 로그·지표 읽기)도 `rt.work`에서 돈다.
     pub async fn start(
         config: &Config,
         node: Uuid,
@@ -216,7 +219,9 @@ impl Member {
         // `[telemetry] ca_file`을 읽지 못하면 아무것도 열기 전에 실패한다.
         let telemetry_config = config.telemetry.telemetry_config()?;
         let id = NodeId(node);
-        let peers = Arc::new(Peers::new(&tls));
+        // Raft·리스 전달·ping 채널의 연결 작업은 core, 콘솔·마이그레이션·감사·지표 채널의 것은 work에서
+        // 돈다(처음 연 쪽 실행기와 관계없이).
+        let peers = Arc::new(Peers::new(&tls).with_runtimes(rt.core.clone(), rt.work.clone()));
         let mut cluster_config = ClusterConfig::new(id, cluster_dir(config));
         cluster_config.raft = raft_config(config.witness);
         cluster_config.write_timeout = WRITE_TIMEOUT;
@@ -311,7 +316,8 @@ impl Member {
                 .with_rbd(Arc::new(rbd))
                 .with_lvm_shared(Arc::new(lvm_shared)),
         );
-        let (exited_tx, exited) = mpsc::channel(2);
+        // API 서버, 노드 간 서버, Raft 감시가 보낸다.
+        let (exited_tx, exited) = mpsc::channel(3);
         // 받는 VM은 원본 노드에 배정된 채이므로 reconciler 없이 받는다.
         let incoming = IncomingMigrations::new(
             cluster.clone(),
@@ -348,7 +354,8 @@ impl Member {
             .with_migrations(Arc::new(incoming.with_firewall(gate.clone())))
             .with_uefi_vars(config.data_dir.clone())
             .with_audit(audit.clone())
-            .with_metrics(metrics_source.clone());
+            .with_metrics(metrics_source.clone())
+            .with_work(rt.work.clone());
         let peer = on(&rt.core, || {
             serve_peer(peer_listener, &tls, service, exited_tx.clone())
         });
@@ -414,6 +421,7 @@ impl Member {
 
         // 다시 시작한 노드는 과반수가 없어도 VM을 계속 다스려야 하므로, Node 리소스는 뒤에서 기록한다.
         let promotion = on(&rt.core, || spawn_promotion(first_time, &cluster, &peers));
+        let raft_watch = on(&rt.core, || watch_raft(&cluster, exited_tx.clone()));
         // 풀 마운터가 QEMU의 rbd 블록 드라이버를 확인한다.
         let qemu_binary = host.profile.qemu_binary.clone();
         // 받은 UEFI 변수 파일의 크기를 이 노드의 템플릿과 견준다.
@@ -588,6 +596,7 @@ impl Member {
             }),
             register,
             promotion,
+            raft_watch,
             exited,
         };
         Ok((member, created))
@@ -617,7 +626,7 @@ impl Member {
         // 마이그레이션과 UEFI 변수는 받지 않는다.
         let service = PeerService::new(cluster.clone(), None);
         let peer = on(&rt.core, || {
-            serve_peer(peer_listener, &tls, service, exited_tx)
+            serve_peer(peer_listener, &tls, service, exited_tx.clone())
         });
         let first_time = !matches!(bootstrap, Bootstrap::Restart);
         let prepared = async {
@@ -639,6 +648,7 @@ impl Member {
             return Err(e);
         }
         let promotion = on(&rt.core, || spawn_promotion(first_time, &cluster, &peers));
+        let raft_watch = on(&rt.core, || watch_raft(&cluster, exited_tx));
         let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
             rt.work.spawn(async move {
@@ -668,6 +678,7 @@ impl Member {
             services: None,
             register,
             promotion,
+            raft_watch,
             exited,
         })
     }
@@ -715,6 +726,8 @@ impl Member {
     /// 모든 것을 멈춘다. `left`면 클러스터에서 빠진 것이므로 클러스터 저장소와 노드 인증서를 지운다.
     /// 아니면 오프라인으로 기록한다. 실행 중인 VM은 그대로 둔다.
     pub async fn close(mut self, left: bool) -> anyhow::Result<()> {
+        // 아래에서 저장소를 닫아 Raft가 멈춰도 실패로 알리지 않는다.
+        self.raft_watch.abort();
         if let Some(services) = self.services.take() {
             services.shutdown(left).await;
         }
@@ -790,6 +803,17 @@ fn serve_peer(
         r
     });
     Server { stop, task }
+}
+
+/// Raft가 멈추면(저장소 쓰기 실패나 저장소 스레드 멈춤으로 openraft가 멈춘 경우) 그 이유를 `exited`로
+/// 보낸다. 주 루프가 0이 아닌 코드로 끝나고 systemd(`Restart=on-failure`)가 다시 띄운다. 그러지 않으면
+/// HA VM이 없는 노드는 API만 답하는 채로 남는다.
+fn watch_raft(cluster: &Cluster, exited: mpsc::Sender<String>) -> JoinHandle<()> {
+    let stopped = cluster.stopped();
+    tokio::spawn(async move {
+        let why = stopped.await;
+        let _ = exited.send(format!("Raft stopped: {why}")).await;
+    })
 }
 
 /// 다시 시작한 노드는 투표 멤버가 될 때까지 승격을 다시 요청한다. 처음 멤버가 된 노드는 이미 했다.
@@ -951,11 +975,8 @@ mod tests {
             .port()
     }
 
-    /// 새 클러스터를 만든 멤버의 서비스가 실행기 셋에 나뉘어 돈다. 부른 쪽의 실행기에는 아무 작업도
-    /// 남지 않고(고르지 않고 띄운 서비스가 없다), 닫으면 세 실행기의 작업이 모두 끝난다.
-    #[test]
-    fn services_run_on_the_three_runtimes() {
-        let dir = tempfile::tempdir().unwrap();
+    /// `dir` 아래에 데이터를 두는 단일 노드 멤버의 설정
+    fn member_config(dir: &std::path::Path) -> Config {
         let mut config: Config = toml::from_str(&format!(
             "name = \"n1\"\naddress = \"127.0.0.1\"\nlisten = \"127.0.0.1:{}\"\n\
              cluster_listen = \"127.0.0.1:{}\"\n[hypervisor]\naccel = \"tcg\"\n\
@@ -964,8 +985,17 @@ mod tests {
             free_port()
         ))
         .unwrap();
-        config.data_dir = dir.path().join("data");
-        config.run_dir = dir.path().join("run");
+        config.data_dir = dir.join("data");
+        config.run_dir = dir.join("run");
+        config
+    }
+
+    /// 새 클러스터를 만든 멤버의 서비스가 실행기 셋에 나뉘어 돈다. 부른 쪽의 실행기에는 아무 작업도
+    /// 남지 않고(고르지 않고 띄운 서비스가 없다), 닫으면 세 실행기의 작업이 모두 끝난다.
+    #[test]
+    fn services_run_on_the_three_runtimes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = member_config(dir.path());
         let runtimes = Runtimes::new(2, 2).unwrap();
         let rt = runtimes.handles();
         let alive = |h: &tokio::runtime::Handle| h.metrics().num_alive_tasks();
@@ -1004,6 +1034,42 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Raft가 멈추면 API와 노드 간 서버가 돌아도 `failed`가 그 이유와 함께 끝난다(여기서는 저장소를
+    /// 바깥에서 닫는다. 저장소 쓰기가 panic해 openraft가 멈추는 경우는 opl-cluster 시험이 본다).
+    #[test]
+    fn failed_ends_when_raft_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = member_config(dir.path());
+        let runtimes = Runtimes::new(2, 2).unwrap();
+        let rt = runtimes.handles();
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async {
+            let node = Uuid::now_v7();
+            let (ca, tls) = crate::new_cluster_tls(&config, node, "c").unwrap();
+            let bootstrap = Bootstrap::Init {
+                name: "c".into(),
+                ca,
+            };
+            let (mut member, _) = Member::start(&config, node, tls, bootstrap, &rt)
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), member.failed())
+                    .await
+                    .is_err()
+            );
+            member.cluster().shutdown().await.unwrap();
+            let e = tokio::time::timeout(Duration::from_secs(10), member.failed())
+                .await
+                .unwrap();
+            assert!(e.to_string().starts_with("Raft stopped: "), "{e}");
+            let _ = member.close(true).await;
+        });
     }
 
     #[test]

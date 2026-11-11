@@ -64,17 +64,18 @@ struct Node {
 
 impl Node {
     async fn start(ca: &ClusterCa, root: &TempDir) -> Node {
-        Self::start_with(ca, root, None, None, None).await
+        Self::start_with(ca, root, None, None, None, None).await
     }
 
     /// `migrations`가 있으면 마이그레이션을 그것으로 받고, `audit`이 있으면 감사 로그를, `metrics`가
-    /// 있으면 지표를 그것으로 읽는다.
+    /// 있으면 지표를 그것으로 읽는다. `work`가 있으면 Raft·리스가 아닌 처리를 그 실행기에서 돌린다.
     async fn start_with(
         ca: &ClusterCa,
         root: &TempDir,
         migrations: Option<Arc<dyn MigrationReceiver>>,
         audit: Option<Arc<dyn AuditSource>>,
         metrics: Option<Arc<dyn MetricsSource>>,
+        work: Option<tokio::runtime::Handle>,
     ) -> Node {
         let id = NodeId(Uuid::now_v7());
         let tls = tls_for(ca, id);
@@ -108,6 +109,9 @@ impl Node {
         }
         if let Some(metrics) = metrics {
             service = service.with_metrics(metrics);
+        }
+        if let Some(work) = work {
+            service = service.with_work(work);
         }
         let (stop, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -346,6 +350,63 @@ async fn strangers_and_non_members_are_refused() {
     );
 }
 
+/// 시험이 실패해도 따로 만든 실행기를 끝낸다(async 문맥에서 그냥 놓으면 panic한다).
+struct Background(Option<tokio::runtime::Runtime>);
+
+impl Background {
+    fn new() -> Self {
+        Self::of(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn of(rt: tokio::runtime::Runtime) -> Self {
+        Self(Some(rt))
+    }
+
+    fn handle(&self) -> &tokio::runtime::Handle {
+        self.0.as_ref().unwrap().handle()
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+/// 실행기를 받은 `Peers`의 control 채널은 처음 연 실행기가 끝나도 된다(채널의 연결 작업이 받은
+/// control 실행기에서 돈다). 실행기를 주지 않으면 처음 연 실행기와 함께 채널이 멈춘다.
+#[tokio::test]
+async fn control_channels_outlive_the_runtime_that_opened_them() {
+    let (ca, _root, nodes) = start(1).await;
+    let control = tokio::runtime::Handle::current();
+    let bulk = Background::new();
+    let peers = Arc::new(
+        Peers::new(&tls_for(&ca, nodes[0].id())).with_runtimes(control, bulk.handle().clone()),
+    );
+    let addr = nodes[0].addr.clone();
+
+    // 따로 만든 실행기(work·api에 해당)가 먼저 채널을 열고 끝난다.
+    let first = Background::new();
+    let opened = {
+        let (peers, addr) = (peers.clone(), addr.clone());
+        first
+            .handle()
+            .spawn(async move { peers.ping(&addr, WAIT).await })
+    };
+    assert_eq!(opened.await.unwrap().unwrap(), nodes[0].id());
+    drop(first);
+
+    assert_eq!(peers.ping(&addr, WAIT).await.unwrap(), nodes[0].id());
+}
+
 #[tokio::test]
 async fn a_new_node_joins_as_learner_then_voter() {
     let (ca, root, mut nodes) = start(1).await;
@@ -572,7 +633,7 @@ async fn new_leader_does_not_revive_nodes_recorded_offline() {
 async fn migration_requests_reach_the_receiver_of_a_member() {
     let (ca, root, nodes) = start(1).await;
     let receiver = Arc::new(FakeReceiver::default());
-    let target = Node::start_with(&ca, &root, Some(receiver.clone()), None, None).await;
+    let target = Node::start_with(&ca, &root, Some(receiver.clone()), None, None, None).await;
     nodes[0]
         .cluster
         .request(LeaderRequest::AddLearner {
@@ -680,6 +741,164 @@ async fn migration_requests_reach_the_receiver_of_a_member() {
     assert_eq!(receiver.calls.lock().unwrap().len(), 5);
 }
 
+/// 받는 처리가 돈 스레드와, 그 처리가 띄운 작업(받은 VM의 QMP·모니터에 해당)이 돈 스레드를 적는다.
+#[derive(Default)]
+struct ThreadReceiver {
+    threads: std::sync::Mutex<Vec<String>>,
+}
+
+fn thread_name() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[async_trait::async_trait]
+impl MigrationReceiver for ThreadReceiver {
+    async fn incoming(
+        &self,
+        _req: MigrateIncomingRequest,
+    ) -> Result<MigrateIncomingResponse, IncomingError> {
+        let spawned = tokio::spawn(async { thread_name() }).await.unwrap();
+        self.threads
+            .lock()
+            .unwrap()
+            .extend([thread_name(), spawned]);
+        Ok(MigrateIncomingResponse {
+            port: 60007,
+            nbd_port: None,
+        })
+    }
+
+    async fn wait(&self, _req: IncomingMigration) -> Result<(), IncomingError> {
+        Ok(())
+    }
+
+    async fn abort(&self, _req: IncomingMigration) -> Result<(), IncomingError> {
+        Ok(())
+    }
+}
+
+/// `work` 실행기를 받은 노드 간 서버는 마이그레이션 받기를 그 실행기에서 돌린다. 받는 처리가 띄운
+/// 작업도 그 실행기에 생긴다(노드 간 서버의 실행기에는 Raft·리스만 남는다).
+#[tokio::test]
+async fn incoming_migrations_run_on_the_work_runtime() {
+    let work = Background::of(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("peer-work")
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let (ca, root, nodes) = start(1).await;
+    let receiver = Arc::new(ThreadReceiver::default());
+    let target = Node::start_with(
+        &ca,
+        &root,
+        Some(receiver.clone()),
+        None,
+        None,
+        Some(work.handle().clone()),
+    )
+    .await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+        })
+        .await
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(nodes[0].id()) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let req = MigrateIncomingRequest {
+        vm: Uuid::now_v7(),
+        task: Uuid::now_v7(),
+        qemu_version: "8.2.2".into(),
+        disks: vec![],
+    };
+    nodes[0]
+        .peers
+        .migrate_incoming(&target.addr, req)
+        .await
+        .unwrap();
+    assert_eq!(
+        *receiver.threads.lock().unwrap(),
+        ["peer-work", "peer-work"]
+    );
+}
+
+/// 받는 처리가 panic한다.
+struct PanickingReceiver;
+
+#[async_trait::async_trait]
+impl MigrationReceiver for PanickingReceiver {
+    async fn incoming(
+        &self,
+        _req: MigrateIncomingRequest,
+    ) -> Result<MigrateIncomingResponse, IncomingError> {
+        panic!("receiver bug");
+    }
+
+    async fn wait(&self, _req: IncomingMigration) -> Result<(), IncomingError> {
+        Ok(())
+    }
+
+    async fn abort(&self, _req: IncomingMigration) -> Result<(), IncomingError> {
+        Ok(())
+    }
+}
+
+/// `work` 실행기에서 돈 처리가 panic하면 그 요청만 `internal`로 답하고 서버는 계속 답한다.
+#[tokio::test]
+async fn a_panicking_handler_answers_internal() {
+    let work = Background::new();
+    let ca = ClusterCa::generate("test").unwrap();
+    let root = TempDir::new().unwrap();
+    let node = Node::start_with(
+        &ca,
+        &root,
+        Some(Arc::new(PanickingReceiver)),
+        None,
+        None,
+        Some(work.handle().clone()),
+    )
+    .await;
+    let members = BTreeMap::from([(node.id(), BasicNode::new(&node.addr))]);
+    node.cluster.initialize(members).await.unwrap();
+    let nodes = [node];
+    wait_leader(&nodes).await;
+
+    let req = MigrateIncomingRequest {
+        vm: Uuid::now_v7(),
+        task: Uuid::now_v7(),
+        qemu_version: "8.2.2".into(),
+        disks: vec![],
+    };
+    let err = nodes[0]
+        .peers
+        .migrate_incoming(&nodes[0].addr, req)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, IncomingError::Unavailable(m) if m.contains("panicked")),
+        "{err:?}"
+    );
+    assert_eq!(
+        nodes[0].peers.ping(&nodes[0].addr, WAIT).await.unwrap(),
+        nodes[0].id()
+    );
+}
+
 #[tokio::test]
 async fn uefi_vars_are_fetched_from_a_member() {
     let (ca, root, nodes) = start(2).await;
@@ -751,7 +970,7 @@ async fn uefi_vars_are_fetched_from_a_member() {
 async fn audit_logs_are_read_from_a_member() {
     let (ca, root, nodes) = start(1).await;
     let audit = Arc::new(FakeAudit::default());
-    let target = Node::start_with(&ca, &root, None, Some(audit.clone()), None).await;
+    let target = Node::start_with(&ca, &root, None, Some(audit.clone()), None, None).await;
     nodes[0]
         .cluster
         .request(LeaderRequest::AddLearner {
@@ -823,7 +1042,7 @@ async fn audit_logs_are_read_from_a_member() {
 async fn metrics_are_read_from_a_member() {
     let (ca, root, nodes) = start(1).await;
     let metrics = Arc::new(FakeMetrics::default());
-    let target = Node::start_with(&ca, &root, None, None, Some(metrics.clone())).await;
+    let target = Node::start_with(&ca, &root, None, None, Some(metrics.clone()), None).await;
     nodes[0]
         .cluster
         .request(LeaderRequest::AddLearner {

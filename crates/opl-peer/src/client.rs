@@ -2,6 +2,7 @@
 //! UEFI 변수 받기, 감사 로그 읽기, 지표 읽기.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,6 +22,7 @@ use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
 use opl_cluster::{ClusterError, Forwarder};
 use opl_types::audit::{AuditEntry, AuditQuery};
 use opl_types::metrics::MetricsQuery;
+use tokio::runtime::Handle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -60,9 +62,36 @@ const UEFI_VARS_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 다른 노드로 가는 연결. 주소마다 채널 하나를 만들어 다시 쓴다(끊기면 tonic이 다시 잇는다).
 /// 연결할 때 이 노드의 인증서를 내밀고, 상대 인증서는 클러스터 CA로 확인한다.
+///
+/// 실행기를 주면(`with_runtimes`) 주소마다 채널을 둘 둔다. Raft·리더 전달(리스 갱신과 쓰기 전달)·ping은
+/// control 채널, 콘솔·마이그레이션 보내기·UEFI 변수·감사 로그·지표 읽기는 bulk 채널이고, 채널의 연결
+/// 작업은 부른 쪽 실행기와 관계없이 그 채널의 실행기에서 돈다. 주지 않으면 채널 하나를 처음 부른
+/// 쪽 실행기에서 돌린다.
 pub struct Peers {
     tls: ClientTlsConfig,
-    channels: Mutex<HashMap<String, Channel>>,
+    channels: Mutex<HashMap<(Lane, String), Channel>>,
+    /// control·bulk 채널의 연결 작업을 돌릴 실행기
+    runtimes: Option<(Handle, Handle)>,
+}
+
+/// 채널의 쓰임
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Lane {
+    Control,
+    Bulk,
+}
+
+/// tonic 채널의 작업(요청 버퍼, h2 연결)을 정한 실행기에 띄운다.
+#[derive(Clone)]
+struct OnRuntime(Handle);
+
+impl<F> hyper::rt::Executor<F> for OnRuntime
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        self.0.spawn(fut);
+    }
 }
 
 impl Peers {
@@ -72,24 +101,49 @@ impl Peers {
                 .ca_certificate(Certificate::from_pem(&tls.ca_pem))
                 .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem)),
             channels: Mutex::new(HashMap::new()),
+            runtimes: None,
         }
     }
 
+    /// control 채널의 연결 작업은 `control`, bulk 채널의 것은 `bulk` 실행기에서 돌린다.
+    pub fn with_runtimes(mut self, control: Handle, bulk: Handle) -> Self {
+        self.runtimes = Some((control, bulk));
+        self
+    }
+
     fn client(&self, addr: &str) -> Result<PeerClient<Channel>, Status> {
+        self.client_on(Lane::Control, addr)
+    }
+
+    fn bulk_client(&self, addr: &str) -> Result<PeerClient<Channel>, Status> {
+        self.client_on(Lane::Bulk, addr)
+    }
+
+    fn client_on(&self, lane: Lane, addr: &str) -> Result<PeerClient<Channel>, Status> {
+        let (lane, executor) = match &self.runtimes {
+            Some((control, bulk)) => match lane {
+                Lane::Control => (lane, Some(control.clone())),
+                Lane::Bulk => (lane, Some(bulk.clone())),
+            },
+            None => (Lane::Control, None),
+        };
         let mut channels = self.channels.lock().unwrap();
-        let channel = match channels.get(addr) {
+        let channel = match channels.get(&(lane, addr.to_string())) {
             Some(channel) => channel.clone(),
             None => {
-                let channel = Endpoint::from_shared(format!("https://{addr}"))
+                let mut endpoint = Endpoint::from_shared(format!("https://{addr}"))
                     .and_then(|e| e.tls_config(self.tls.clone()))
                     .map_err(|e| Status::invalid_argument(format!("bad address {addr}: {e}")))?
                     .connect_timeout(CONNECT_TIMEOUT)
                     .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
                     .keep_alive_timeout(KEEPALIVE_TIMEOUT)
                     .keep_alive_while_idle(true)
-                    .tcp_keepalive(Some(KEEPALIVE_INTERVAL))
-                    .connect_lazy();
-                channels.insert(addr.to_string(), channel.clone());
+                    .tcp_keepalive(Some(KEEPALIVE_INTERVAL));
+                if let Some(handle) = executor {
+                    endpoint = endpoint.executor(OnRuntime(handle));
+                }
+                let channel = endpoint.connect_lazy();
+                channels.insert((lane, addr.to_string()), channel.clone());
                 channel
             }
         };
@@ -142,7 +196,7 @@ impl Peers {
             _ => ConsoleError::Unavailable(s.message().to_string()),
         };
         let inbound = self
-            .client(addr)
+            .bulk_client(addr)
             .map_err(unavailable)?
             .console(req)
             .await
@@ -166,7 +220,7 @@ impl Peers {
         let mut req = Request::new(req);
         req.set_timeout(MIGRATE_INCOMING_TIMEOUT);
         let reply = self
-            .client(addr)
+            .bulk_client(addr)
             .map_err(unreachable)?
             .migrate_incoming(req)
             .await
@@ -182,7 +236,7 @@ impl Peers {
     ) -> Result<(), IncomingError> {
         let mut req = Request::new(migration);
         req.set_timeout(MIGRATE_INCOMING_WAIT_TIMEOUT);
-        self.client(addr)
+        self.bulk_client(addr)
             .map_err(unreachable)?
             .migrate_incoming_wait(req)
             .await
@@ -198,7 +252,7 @@ impl Peers {
     ) -> Result<(), IncomingError> {
         let mut req = Request::new(migration);
         req.set_timeout(MIGRATE_INCOMING_ABORT_TIMEOUT);
-        self.client(addr)
+        self.bulk_client(addr)
             .map_err(unreachable)?
             .migrate_incoming_abort(req)
             .await
@@ -220,7 +274,7 @@ impl Peers {
     ) -> Result<u64, UefiVarsError> {
         let mut req = Request::new(UefiVarsRequest { vm });
         req.set_timeout(UEFI_VARS_TIMEOUT);
-        let chunks = self.client(addr)?.uefi_vars(req).await?.into_inner();
+        let chunks = self.bulk_client(addr)?.uefi_vars(req).await?.into_inner();
         crate::firmware::write_file(chunks, dest, expect_len).await
     }
 }
@@ -236,7 +290,7 @@ impl Peers {
     ) -> Result<Option<Vec<AuditEntry>>, Status> {
         let mut req = Request::new(query);
         req.set_timeout(timeout);
-        match self.client(addr)?.read_audit(req).await {
+        match self.bulk_client(addr)?.read_audit(req).await {
             Ok(reply) => Ok(Some(reply.into_inner().entries)),
             Err(s) if s.code() == Code::FailedPrecondition => Ok(None),
             Err(s) => Err(s),
@@ -255,7 +309,7 @@ impl Peers {
     ) -> Result<Option<MetricsReply>, Status> {
         let mut req = Request::new(query);
         req.set_timeout(timeout);
-        match self.client(addr)?.read_metrics(req).await {
+        match self.bulk_client(addr)?.read_metrics(req).await {
             Ok(reply) => Ok(Some(reply.into_inner())),
             Err(s) if s.code() == Code::Unimplemented => Ok(None),
             Err(s) => Err(s),

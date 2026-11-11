@@ -402,7 +402,8 @@ async fn set_phase(env: &Env, name: &str, phase: ImportPhase) {
         .unwrap();
 }
 
-/// Task를 저장소에 직접 만든다(API의 검사 없이).
+/// Task를 저장소에 직접 만든다(API의 검사 없이). `state`로 바로 만든다. `pending`으로 만든 뒤 바꾸면
+/// 그사이 실행기가 Task를 시작해 그 정리가 가져오기를 바꿀 수 있다.
 async fn put_task(env: &Env, op: TaskOp, target: Uuid, state: TaskState) -> Value {
     let mut task: opl_types::task::Task = Resource::new(
         "",
@@ -413,18 +414,12 @@ async fn put_task(env: &Env, op: TaskOp, target: Uuid, state: TaskState) -> Valu
         },
     );
     task.name = task.id.to_string();
+    task.status = TaskStatus {
+        state,
+        error: None,
+        progress: None,
+    };
     env.cluster.create(&task).await.unwrap();
-    if state != TaskState::Pending {
-        let status = TaskStatus {
-            state,
-            error: None,
-            progress: None,
-        };
-        env.cluster
-            .update_status::<TaskSpec>(task.id, &status)
-            .await
-            .unwrap();
-    }
     json!({ "id": task.id })
 }
 

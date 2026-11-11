@@ -323,6 +323,7 @@ async fn other_node(env: &Env, name: &str) -> Uuid {
 }
 
 /// Task를 저장소에 직접 만든다(API의 검사 없이). `state`가 `Running`이면 이미 돌고 있는 것처럼 둔다.
+/// `state`로 바로 만든다. `pending`으로 만든 뒤 바꾸면 그사이 실행기가 Task를 시작할 수 있다.
 async fn put_task(
     env: &Env,
     op: opl_types::task::TaskOp,
@@ -332,18 +333,12 @@ async fn put_task(
 ) -> Value {
     let mut task: opl_types::task::Task = Resource::new("", TaskSpec { op, target, node });
     task.name = task.id.to_string();
+    task.status = TaskStatus {
+        state,
+        error: None,
+        progress: None,
+    };
     env.cluster.create(&task).await.unwrap();
-    if state != TaskState::Pending {
-        let status = TaskStatus {
-            state,
-            error: None,
-            progress: None,
-        };
-        env.cluster
-            .update_status::<TaskSpec>(task.id, &status)
-            .await
-            .unwrap();
-    }
     json!({ "id": task.id })
 }
 
