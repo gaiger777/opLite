@@ -72,7 +72,7 @@ jobs:
       - run: pnpm build
 
   # 패키징 셸 스크립트: shellcheck, build-deb.sh 버전 확인·키링 시험, build-repo.sh 시험(가짜 apt-ftparchive·gpg),
-  # maintainer 스크립트 시험(가짜 systemctl)
+  # maintainer 스크립트 시험(가짜 systemctl), 옛 제품 이름(oplite)이 허용 목록 밖에 남지 않았는지(name-test.sh)
   shell:
     runs-on: ubuntu-24.04
     steps:
@@ -81,11 +81,12 @@ jobs:
         run: |
           shopt -s globstar
           shellcheck packaging/**/*.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm .github/scripts/*.sh
+      - run: bash packaging/tests/name-test.sh
       - run: bash packaging/tests/build-deb-test.sh
       - run: bash packaging/tests/build-repo-test.sh
       - run: bash packaging/tests/maint-test.sh
       - run: bash packaging/tests/setup-test.sh
-      # 설치 프로그램 환경(busybox sh·awk)에서 oplite-setup.sh 함수가 같은 결과를 내는지
+      # 설치 프로그램 환경(busybox sh·awk)에서 orbivisor-setup.sh 함수가 같은 결과를 내는지
       - name: setup-test with busybox
         run: |
           sudo apt-get update

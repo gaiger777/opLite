@@ -1,7 +1,7 @@
 name: ISO
 
 # 설치 ISO E2E: 패키지 → netinst(debian.lock) → build-iso.sh --unattended → KVM으로 무인 설치 →
-# 디스크로 부팅 → 첫 부팅 cluster init 출력(직렬 콘솔)으로 oplctl login·node list(VERSION이 빌드 버전)·node get.
+# 디스크로 부팅 → 첫 부팅 cluster init 출력(직렬 콘솔)으로 orbivisorctl login·node list(VERSION이 빌드 버전)·node get.
 # BIOS(isolinux 메뉴)와 UEFI(OVMF, grub 메뉴) 두 경로를 따로 돌린다.
 # 오래 걸리므로(설치에 미러가 필요하다) PR마다 돌리지 않는다.
 on:
@@ -85,13 +85,13 @@ jobs:
           echo "NETINST=$iso" >> "$GITHUB_ENV"
       - name: Build the unattended ISO
         run: |
-          packaging/iso/build-iso.sh --netinst "$NETINST" --deb "$DEB" --out "$RUNNER_TEMP/oplite.iso" --unattended
-          ls -l "$RUNNER_TEMP/oplite.iso"
+          packaging/iso/build-iso.sh --netinst "$NETINST" --deb "$DEB" --out "$RUNNER_TEMP/orbivisor.iso" --unattended
+          ls -l "$RUNNER_TEMP/orbivisor.iso"
         env:
           DEB: ${{ steps.build.outputs.deb }}
       # 설치가 끝나면 preseed가 전원을 끄고(-no-reboot) QEMU가 끝난다. QEMU를 백그라운드로 띄우고 30초마다 본다:
-      # 끝났으면 다음 단계, 직렬 로그에 oplite-setup 실패가 보이거나 40분이 지나면 실패.
-      # 실패하면 QEMU 모니터로 화면(install-screen.ppm, 아티팩트)을 남기고 직렬 로그의 oplite-setup: 줄을 보인다.
+      # 끝났으면 다음 단계, 직렬 로그에 orbivisor-setup 실패가 보이거나 40분이 지나면 실패.
+      # 실패하면 QEMU 모니터로 화면(install-screen.ppm, 아티팩트)을 남기고 직렬 로그의 orbivisor-setup: 줄을 보인다.
       - name: Unattended install
         working-directory: ${{ runner.temp }}
         run: |
@@ -99,7 +99,7 @@ jobs:
           # FW_ARGS는 UEFI일 때만 있고 단어로 나눠 쓴다.
           # shellcheck disable=SC2086
           qemu-system-x86_64 -enable-kvm -m 4096 -smp 2 ${FW_ARGS:-} \
-            -drive file=disk.qcow2,if=virtio -cdrom oplite.iso -boot d \
+            -drive file=disk.qcow2,if=virtio -cdrom orbivisor.iso -boot d \
             -serial file:install.log -display none \
             -monitor unix:"$RUNNER_TEMP/mon.sock",server,nowait \
             -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -no-reboot &
@@ -114,14 +114,14 @@ jobs:
           time.sleep(3)
           s.close()
           EOF
-            grep -a 'oplite-setup:' install.log || true
+            grep -a 'orbivisor-setup:' install.log || true
             kill "$qemu" 2>/dev/null || true
             exit 1
           }
           start=$(date +%s)
           while kill -0 "$qemu" 2>/dev/null; do
-            if grep -aq 'oplite-setup: FAILED' install.log 2>/dev/null; then
-              fail "oplite-setup(late_command)이 실패했다"
+            if grep -aq 'orbivisor-setup: FAILED' install.log 2>/dev/null; then
+              fail "orbivisor-setup(late_command)이 실패했다"
             fi
             if [ $(($(date +%s) - start)) -ge 2400 ]; then
               fail "40분 안에 설치가 끝나지 않았다"
@@ -130,7 +130,7 @@ jobs:
           done
           code=0
           wait "$qemu" || code=$?
-          grep -a 'oplite-setup:' install.log || true
+          grep -a 'orbivisor-setup:' install.log || true
           if [ "$code" != 0 ]; then
             echo "QEMU가 $code로 끝났다" >&2
             exit 1
@@ -144,20 +144,20 @@ jobs:
             -serial file:boot.log -display none \
             -netdev user,id=n0,hostfwd=tcp::18006-:8006 -device virtio-net-pci,netdev=n0 \
             -daemonize -pidfile qemu.pid
-      # oplite-ci-init.service가 첫 부팅에 cluster init 출력을 직렬 콘솔에 쓴다.
+      # orbivisor-ci-init.service가 첫 부팅에 cluster init 출력을 직렬 콘솔에 쓴다.
       - name: Wait for cluster init
         timeout-minutes: 15
         working-directory: ${{ runner.temp }}
         run: |
           # CA 지문 다음 줄(join URL)까지 나오면 지문 줄이 다 쓰인 것이다.
-          # 그동안 QEMU가 죽거나 init이 실패하면(oplctl의 error: 줄, 유닛 실패) 바로 실패한다.
+          # 그동안 QEMU가 죽거나 init이 실패하면(orbivisorctl의 error: 줄, 유닛 실패) 바로 실패한다.
           until grep -q 'join URL for the next node' boot.log 2>/dev/null; do
             if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
               echo "QEMU가 끝났다" >&2
               tail -n 50 boot.log >&2 || true
               exit 1
             fi
-            if tr -d '\r' < boot.log 2>/dev/null | grep -E '^error: |Failed to start .*opLite CI first-boot' >&2; then
+            if tr -d '\r' < boot.log 2>/dev/null | grep -E '^error: |Failed to start .*Orbivisor CI first-boot' >&2; then
               echo "첫 부팅 cluster init이 실패했다" >&2
               exit 1
             fi
@@ -171,12 +171,12 @@ jobs:
           fi
           echo "CA_FINGERPRINT=$fp" >> "$GITHUB_ENV"
           printf '%s\n' "$pw" > admin-password
-      - name: oplctl login, node list, node get
+      - name: orbivisorctl login, node list, node get
         timeout-minutes: 8
         env:
           OPL_CONFIG: ${{ runner.temp }}/oplctl.json
         run: |
-          oplctl=target/release/oplctl
+          oplctl=target/release/orbivisorctl
           # init 직후 API가 HTTPS로 다시 열릴 때까지 잠깐 걸릴 수 있다.
           until $oplctl login --server https://127.0.0.1:18006 --ca-fingerprint "$CA_FINGERPRINT" \
             --password-file "$RUNNER_TEMP/admin-password"; do sleep 5; done

@@ -1,5 +1,0 @@
-opLite: https://\4{vmbr0}:8006/ (web UI and API, after the node is in a cluster)
-  First node:  oplctl cluster init --name <cluster-name>
-  Other nodes: on a logged-in client run `oplctl cluster join-token`,
-               then here run `oplctl cluster join '<opl-join://... URL>'`
-

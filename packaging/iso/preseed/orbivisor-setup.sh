@@ -1,20 +1,20 @@
 #!/bin/sh
 # 설치 ISO의 preseed/late_command가 설치 프로그램 환경(busybox sh)에서 돌린다.
-#   sh /cdrom/preseed/oplite-setup.sh /target
-# oplite 패키지(와 ifupdown2, isc-dhcp-client)를 설치하고, 기본 경로 인터페이스를 브리지 vmbr0으로 옮기고,
-# /etc/opl/opld.toml과 콘솔 로그인 안내(/etc/issue.d/oplite.issue)를 쓴다. 로그: <target>/root/oplite-setup.log
-# 단계마다 시작·끝(실패면 출력 끝 30줄)을 설치 환경의 콘솔(무인 설치에서는 직렬)에도 "oplite-setup: "로 쓴다.
-# OPLITE_SETUP_LIB=1로 source하면 함수만 정의한다(packaging/tests/setup-test.sh).
+#   sh /cdrom/preseed/orbivisor-setup.sh /target
+# orbivisor 패키지(와 ifupdown2, isc-dhcp-client)를 설치하고, 기본 경로 인터페이스를 브리지 vmbr0으로 옮기고,
+# /etc/opl/opld.toml과 콘솔 로그인 안내(/etc/issue.d/orbivisor.issue)를 쓴다. 로그: <target>/root/orbivisor-setup.log
+# 단계마다 시작·끝(실패면 출력 끝 30줄)을 설치 환경의 콘솔(무인 설치에서는 직렬)에도 "orbivisor-setup: "로 쓴다.
+# OPL_SETUP_LIB=1로 source하면 함수만 정의한다(packaging/tests/setup-test.sh).
 set -eu
 
-CDROM=${OPLITE_CDROM:-/cdrom}
+CDROM=${OPL_CDROM:-/cdrom}
 # 단계 시작·끝을 쓰는 콘솔과 단계 출력을 잠시 두는 파일. 시험이 바꾼다.
-CONSOLE=${OPLITE_CONSOLE:-/dev/console}
-STEP_OUT="${TMPDIR:-/tmp}/oplite-setup.step"
+CONSOLE=${OPL_CONSOLE:-/dev/console}
+STEP_OUT="${TMPDIR:-/tmp}/orbivisor-setup.step"
 STEP_NAME=""
 # 설치 프로그램 환경의 루트. late_command(finish-install 07preseed)는 netcfg가 interfaces·hostname을
 # /target으로 복사하는 단계(55netcfg-copy-config)보다 먼저 돌므로 원본은 이쪽에 있다. 시험이 바꾼다.
-INSTALLER_ROOT=${OPLITE_INSTALLER_ROOT:-}
+INSTALLER_ROOT=${OPL_INSTALLER_ROOT:-}
 
 # default_nic <interfaces>: 기본 경로 인터페이스(inet dhcp 또는 gateway가 있는 inet 블록, lo 빼고 첫 번째).
 # 그런 블록이 없으면 lo가 아닌 첫 inet static 블록(게이트웨이 없는 고정 주소).
@@ -118,7 +118,7 @@ valid_name() {
 # name이 규칙에 맞지 않거나 address가 비면 그 줄을 주석으로 둔다(opld는 설정 오류로 멈춘다).
 write_opld_toml() {
 	{
-		echo '# Written by the opLite installer. Example with all settings: /usr/share/oplite/opld.toml.example'
+		echo '# Written by the Orbivisor installer. Example with all settings: /usr/share/orbivisor/opld.toml.example'
 		echo '# The address cannot change once this node is in a cluster (it is in the node certificate). Reserve the DHCP address or use a static one; before cluster init/join you may still edit it.'
 		if valid_name "$2"; then
 			echo "name = \"$2\""
@@ -141,22 +141,22 @@ write_opld_toml() {
 # write_issue <out>: 콘솔 로그인 화면 안내(영어 ASCII). \4{vmbr0}는 agetty가 vmbr0의 IPv4 주소로 바꾼다.
 write_issue() {
 	cat >"$1" <<'EOF'
-opLite: https://\4{vmbr0}:8006/ (web UI and API, after the node is in a cluster)
-  First node:  oplctl cluster init --name <cluster-name>
-  Other nodes: on a logged-in client run `oplctl cluster join-token`,
-               then here run `oplctl cluster join '<opl-join://... URL>'`
+Orbivisor: https://\4{vmbr0}:8006/ (web UI and API, after the node is in a cluster)
+  First node:  orbivisorctl cluster init --name <cluster-name>
+  Other nodes: on a logged-in client run `orbivisorctl cluster join-token`,
+               then here run `orbivisorctl cluster join '<opl-join://... URL>'`
 
 EOF
 }
 
 log() {
-	echo "oplite-setup: $*"
+	echo "orbivisor-setup: $*"
 }
 
 # say <문구>: 로그와 설치 환경 콘솔에 쓴다(영어 ASCII). 콘솔에 쓰지 못해도 무시한다.
 say() {
-	echo "oplite-setup: $*"
-	{ echo "oplite-setup: $*" >>"$CONSOLE"; } 2>/dev/null || true
+	echo "orbivisor-setup: $*"
+	{ echo "orbivisor-setup: $*" >>"$CONSOLE"; } 2>/dev/null || true
 }
 
 # step <이름> <명령...>: 단계 시작·끝을 로그와 콘솔에 쓰고 명령 출력은 로그에 남긴다. 명령은 이 셸에서 돌아
@@ -184,28 +184,28 @@ on_exit() {
 	{ tail -n 30 "$STEP_OUT" >>"$CONSOLE"; } 2>/dev/null || true
 }
 
-# install_package <target>: CD의 oplite 패키지를 대상 시스템에 설치한다(의존성은 미러에서).
+# install_package <target>: CD의 orbivisor 패키지를 대상 시스템에 설치한다(의존성은 미러에서).
 # apt-get은 질문 없이(noninteractive, conffile은 기본값) stdin 없이 돈다. in-target의 stdin은 설치 프로그램의
 # debconf 통로라 dpkg·apt가 거기서 답을 기다리면 무인 설치가 멈춘다. 출력은 --pass-stdout으로 이 로그에 남긴다.
 # 그동안 대상에 policy-rc.d(exit 101)를 두어 패키지(ifupdown2 등)가 서비스를 시작하지 못하게 한다.
 install_package() {
-	mkdir -p "$1/var/cache/oplite"
+	mkdir -p "$1/var/cache/orbivisor"
 	if [ -d "$1/run/systemd/system" ]; then
-		log "$1/run/systemd/system이 있다: oplite postinst가 opld를 시작하려 할 수 있다"
+		log "$1/run/systemd/system이 있다: orbivisor postinst가 opld를 시작하려 할 수 있다"
 	fi
-	for deb in "$CDROM"/oplite/oplite_*.deb; do
+	for deb in "$CDROM"/orbivisor/orbivisor_*.deb; do
 		[ -f "$deb" ] || {
-			log "패키지가 없다: $CDROM/oplite/oplite_*.deb"
+			log "패키지가 없다: $CDROM/orbivisor/orbivisor_*.deb"
 			return 1
 		}
-		cp "$deb" "$1/var/cache/oplite/"
+		cp "$deb" "$1/var/cache/orbivisor/"
 		log "설치: $(basename "$deb")"
 		mkdir -p "$1/usr/sbin"
 		printf '#!/bin/sh\nexit 101\n' >"$1/usr/sbin/policy-rc.d"
 		chmod 0755 "$1/usr/sbin/policy-rc.d"
 		code=0
 		# isc-dhcp-client: ifupdown2가 vmbr0의 DHCP에 dhclient를 쓴다.
-		in-target --pass-stdout sh -c "DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install ifupdown2 isc-dhcp-client /var/cache/oplite/$(basename "$deb") </dev/null 2>&1" || code=$?
+		in-target --pass-stdout sh -c "DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install ifupdown2 isc-dhcp-client /var/cache/orbivisor/$(basename "$deb") </dev/null 2>&1" || code=$?
 		rm -f "$1/usr/sbin/policy-rc.d"
 		[ "$code" -eq 0 ] || return "$code"
 	done
@@ -227,17 +227,17 @@ setup_network() {
 	log "원래 $src:"
 	cat "$src"
 	code=0
-	convert_interfaces "$src" "$src.oplite" || code=$?
+	convert_interfaces "$src" "$src.orbivisor" || code=$?
 	if [ "$code" -ne 0 ]; then
-		rm -f "$src.oplite"
+		rm -f "$src.orbivisor"
 		log "기본 경로 인터페이스를 찾지 못해 interfaces를 바꾸지 않았다"
 		return 0
 	fi
 	NIC=$(default_nic "$src")
 	mkdir -p "$1/etc/network" "$INSTALLER_ROOT/etc/network"
-	cp "$src.oplite" "$target_ifaces"
-	cp "$src.oplite" "$installer_ifaces"
-	rm -f "$src.oplite"
+	cp "$src.orbivisor" "$target_ifaces"
+	cp "$src.orbivisor" "$installer_ifaces"
+	rm -f "$src.orbivisor"
 	log "$NIC 을 vmbr0으로 옮겼다($target_ifaces, $installer_ifaces):"
 	cat "$target_ifaces"
 }
@@ -271,22 +271,22 @@ write_config() {
 	cat "$1/etc/opl/opld.toml"
 
 	mkdir -p "$1/etc/issue.d"
-	write_issue "$1/etc/issue.d/oplite.issue"
+	write_issue "$1/etc/issue.d/orbivisor.issue"
 }
 
 # enable_ci_init <target>: 시험 ISO(--unattended)면 첫 부팅에 cluster init을 하는 유닛을 켠다.
 enable_ci_init() {
-	if [ -f "$CDROM/preseed/oplite-ci-init.service" ]; then
-		cp "$CDROM/preseed/oplite-ci-init.service" "$1/etc/systemd/system/"
-		in-target systemctl enable oplite-ci-init.service
-		log "oplite-ci-init.service를 켰다"
+	if [ -f "$CDROM/preseed/orbivisor-ci-init.service" ]; then
+		cp "$CDROM/preseed/orbivisor-ci-init.service" "$1/etc/systemd/system/"
+		in-target systemctl enable orbivisor-ci-init.service
+		log "orbivisor-ci-init.service를 켰다"
 	fi
 }
 
 main() {
 	target=$1
 	mkdir -p "$target/root"
-	exec >>"$target/root/oplite-setup.log" 2>&1
+	exec >>"$target/root/orbivisor-setup.log" 2>&1
 	trap 'on_exit $?' EXIT
 	log "시작 $(date)"
 
@@ -299,7 +299,7 @@ main() {
 	log "끝"
 }
 
-if [ "${OPLITE_SETUP_LIB:-}" = 1 ]; then
+if [ "${OPL_SETUP_LIB:-}" = 1 ]; then
 	return 0
 fi
 main "$@"

@@ -57,7 +57,7 @@ preseed() {
 	debconf-set-selections <<SEL
 slapd slapd/no_configuration boolean false
 slapd slapd/domain string $DOMAIN
-slapd shared/organization string opLite test
+slapd shared/organization string Orbivisor test
 slapd slapd/password1 password $BIND_PASSWORD
 slapd slapd/password2 password $BIND_PASSWORD
 slapd slapd/purge_database boolean true
@@ -110,7 +110,7 @@ distinguished_name = dn
 prompt = no
 x509_extensions = v3_ca
 [dn]
-CN = opLite test LDAP CA
+CN = Orbivisor test LDAP CA
 [v3_ca]
 basicConstraints = critical,CA:TRUE
 keyUsage = critical,keyCertSign,cRLSign

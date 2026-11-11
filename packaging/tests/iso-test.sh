@@ -10,7 +10,7 @@ ISO_FIXTURES="$(cd "$(dirname "$0")/fixtures/iso" && pwd)"
 
 # 함수만 정의한다(ISO는 만들지 않는다). trap보다 먼저 해서 source 실패가 종료 코드로 남게 한다.
 # shellcheck source=packaging/iso/build-iso.sh
-OPLITE_ISO_LIB=1 . "$ISO_DIR/build-iso.sh"
+OPL_ISO_LIB=1 . "$ISO_DIR/build-iso.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -24,9 +24,9 @@ fail() {
 }
 
 printf 'netinst' >"$WORK/netinst.iso"
-printf 'deb' >"$WORK/oplite_0.1.0_amd64.deb"
+printf 'deb' >"$WORK/orbivisor_0.1.0_amd64.deb"
 N="$WORK/netinst.iso"
-D="$WORK/oplite_0.1.0_amd64.deb"
+D="$WORK/orbivisor_0.1.0_amd64.deb"
 O="$WORK/out.iso"
 
 # args_exit <이름> <기대 종료 코드> <인자...>: parse_args를 서브셸에서 돌려 종료 코드를 본다.
@@ -44,12 +44,15 @@ args_exit "--out 빠짐" 2 --netinst "$N" --deb "$D"
 args_exit "값 없는 --netinst" 2 --deb "$D" --out "$O" --netinst
 args_exit "모르는 인자" 2 --netinst "$N" --deb "$D" --out "$O" --skip-hash
 args_exit "없는 netinst 파일" 1 --netinst "$WORK/none.iso" --deb "$D" --out "$O"
-args_exit "없는 deb 파일" 1 --netinst "$N" --deb "$WORK/oplite_9.9.9_amd64.deb" --out "$O"
-# --deb는 build-deb.sh가 만든 이름(oplite_<version>_amd64.deb)이어야 한다.
+args_exit "없는 deb 파일" 1 --netinst "$N" --deb "$WORK/orbivisor_9.9.9_amd64.deb" --out "$O"
+# --deb는 build-deb.sh가 만든 이름(orbivisor_<version>_amd64.deb)이어야 한다.
 printf 'deb' >"$WORK/other.deb"
-printf 'deb' >"$WORK/oplite_0.1.0_arm64.deb"
-args_exit "deb 이름이 oplite_가 아님" 2 --netinst "$N" --deb "$WORK/other.deb" --out "$O"
-args_exit "deb 이름이 amd64가 아님" 2 --netinst "$N" --deb "$WORK/oplite_0.1.0_arm64.deb" --out "$O"
+printf 'deb' >"$WORK/orbivisor_0.1.0_arm64.deb"
+args_exit "deb 이름이 orbivisor_가 아님" 2 --netinst "$N" --deb "$WORK/other.deb" --out "$O"
+args_exit "deb 이름이 amd64가 아님" 2 --netinst "$N" --deb "$WORK/orbivisor_0.1.0_arm64.deb" --out "$O"
+# 전환 패키지 oplite는 새 설치에 필요 없어 ISO에 넣지 않는다.
+printf 'deb' >"$WORK/oplite_0.1.0_amd64.deb"
+args_exit "deb 이름이 전환 패키지 oplite_" 2 --netinst "$N" --deb "$WORK/oplite_0.1.0_amd64.deb" --out "$O"
 args_exit "맞음" 0 --netinst "$N" --deb "$D" --out "$O"
 args_exit "맞음(--unattended)" 0 --unattended --netinst "$N" --deb "$D" --out "$O"
 
@@ -121,22 +124,22 @@ fi
 # md5sum.txt: 있던 경로는 합을 바꾸고 없던 경로는 끝에 더한다. 다른 줄은 그대로다.
 mkdir -p "$WORK/md5/boot/grub" "$WORK/md5/preseed"
 echo new-grub >"$WORK/md5/boot/grub/grub.cfg"
-echo seed >"$WORK/md5/preseed/oplite.cfg"
+echo seed >"$WORK/md5/preseed/orbivisor.cfg"
 printf '%s  ./README.txt\n%s  ./boot/grub/grub.cfg\n%s  ./pool/a.deb\n' \
 	11111111111111111111111111111111 22222222222222222222222222222222 33333333333333333333333333333333 \
 	>"$WORK/md5/md5sum.txt"
-md5_update "$WORK/md5" boot/grub/grub.cfg preseed/oplite.cfg
-printf '%s  ./README.txt\n%s  ./boot/grub/grub.cfg\n%s  ./pool/a.deb\n%s  ./preseed/oplite.cfg\n' \
+md5_update "$WORK/md5" boot/grub/grub.cfg preseed/orbivisor.cfg
+printf '%s  ./README.txt\n%s  ./boot/grub/grub.cfg\n%s  ./pool/a.deb\n%s  ./preseed/orbivisor.cfg\n' \
 	11111111111111111111111111111111 "$(md5_file "$WORK/md5/boot/grub/grub.cfg")" \
-	33333333333333333333333333333333 "$(md5_file "$WORK/md5/preseed/oplite.cfg")" >"$WORK/md5-want.txt"
+	33333333333333333333333333333333 "$(md5_file "$WORK/md5/preseed/orbivisor.cfg")" >"$WORK/md5-want.txt"
 if diff -u "$WORK/md5-want.txt" "$WORK/md5/md5sum.txt"; then ok "md5sum.txt 갱신"; else fail "md5sum.txt 갱신"; fi
 
 # sha256sum.txt도 같은 방식이다.
 printf '%s  ./README.txt\n%s  ./boot/grub/grub.cfg\n' "$(printf '1%.0s' $(seq 64))" "$(printf '2%.0s' $(seq 64))" \
 	>"$WORK/md5/sha256sum.txt"
-sha256_update "$WORK/md5" boot/grub/grub.cfg preseed/oplite.cfg
-printf '%s  ./README.txt\n%s  ./boot/grub/grub.cfg\n%s  ./preseed/oplite.cfg\n' "$(printf '1%.0s' $(seq 64))" \
-	"$(sha256_file "$WORK/md5/boot/grub/grub.cfg")" "$(sha256_file "$WORK/md5/preseed/oplite.cfg")" >"$WORK/sha-want.txt"
+sha256_update "$WORK/md5" boot/grub/grub.cfg preseed/orbivisor.cfg
+printf '%s  ./README.txt\n%s  ./boot/grub/grub.cfg\n%s  ./preseed/orbivisor.cfg\n' "$(printf '1%.0s' $(seq 64))" \
+	"$(sha256_file "$WORK/md5/boot/grub/grub.cfg")" "$(sha256_file "$WORK/md5/preseed/orbivisor.cfg")" >"$WORK/sha-want.txt"
 if diff -u "$WORK/sha-want.txt" "$WORK/md5/sha256sum.txt"; then ok "sha256sum.txt 갱신"; else fail "sha256sum.txt 갱신"; fi
 
 # main을 가짜 xorriso·sha256sum으로 돌린다. 가짜 sha256sum은 netinst에는 저장소 debian.lock의 해시를 낸다.
@@ -212,8 +215,8 @@ for f in isolinux/txt.cfg isolinux/gtk.cfg isolinux/isolinux.cfg boot/grub/grub.
 done
 if [[ $extract_line == "-osirrox on -indev $N "* ]] &&
 	[[ $repack_line == "-indev $N -outdev $O "* ]] &&
-	[[ $repack_line == *"/iso/oplite /oplite -map "*"/iso/preseed /preseed "* ]] &&
-	[[ $repack_line == *" -boot_image any replay "* ]] &&
+	[[ $repack_line == *"/iso/orbivisor /orbivisor -map "*"/iso/preseed /preseed "* ]] &&
+	[[ $repack_line == *" -boot_image any replay -volid ORBIVISOR"* ]] &&
 	[[ $repack_line != *"/iso / "* ]]; then
 	ok "main 다시 묶기 인자"
 else
@@ -231,8 +234,8 @@ sums_want() {
 	local f
 	sed '/boot\/grub\/grub.cfg$/d' "$WORK/isoroot/$1"
 	echo "$("$2" "$WORK/isoout/boot/grub/grub.cfg")  ./boot/grub/grub.cfg"
-	for f in oplite/oplite_0.1.0_amd64.deb preseed/oplite.cfg preseed/oplite-setup.sh preseed/unattended.cfg \
-		preseed/oplite-ci-init.service; do
+	for f in orbivisor/orbivisor_0.1.0_amd64.deb preseed/orbivisor.cfg preseed/orbivisor-setup.sh preseed/unattended.cfg \
+		preseed/orbivisor-ci-init.service; do
 		echo "$("$2" "$WORK/isoout/$f")  ./$f"
 	done
 }
