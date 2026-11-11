@@ -19,6 +19,7 @@ mod host;
 mod join;
 mod member;
 mod metrics;
+mod notify;
 mod overlay;
 mod pools;
 mod runtime;
@@ -44,6 +45,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::control::{ControlError, Request, Status};
 use crate::member::{Bootstrap, Member};
+use crate::notify::{Liveness, Notifier};
 use crate::runtime::{Handles, Runtimes};
 
 #[derive(Parser)]
@@ -73,10 +75,13 @@ fn main() -> anyhow::Result<()> {
     let runtimes = Runtimes::new(config.runtime.api_threads(), config.runtime.work_threads())
         .context("cannot start the runtimes")?;
     let rt = runtimes.handles();
-    runtimes.core.block_on(run(config, rt))
+    // systemd 알림(설계 §3.3). 실행기 확인 스레드는 실행기보다 먼저 멈춘다(선언의 역순으로 놓임).
+    let notifier = Notifier::from_env();
+    let _liveness = Liveness::spawn(rt.clone(), notifier.clone());
+    runtimes.core.block_on(run(config, rt, notifier))
 }
 
-async fn run(config: Config, rt: Handles) -> anyhow::Result<()> {
+async fn run(config: Config, rt: Handles, notifier: Notifier) -> anyhow::Result<()> {
     prepare_data_dir(&config.data_dir)?;
     // 끝날 때까지 쥐고 있는다.
     let _lock = lock_data_dir(&config.data_dir)?;
@@ -101,6 +106,8 @@ async fn run(config: Config, rt: Handles) -> anyhow::Result<()> {
                         .0
                 }
                 None => {
+                    // 미초기화 노드는 제어 소켓을 열었으면 시작이 끝난 것이다.
+                    notifier.notify("READY=1");
                     tracing::info!(
                         socket = %config.control_socket().display(),
                         "this node is not in a cluster; waiting for `orbivisorctl cluster init` or `orbivisorctl cluster join`"
@@ -121,6 +128,8 @@ async fn run(config: Config, rt: Handles) -> anyhow::Result<()> {
                     }
                 }
             };
+            // API가 듣기 시작했다(위트니스는 노드 간 서버).
+            notifier.notify("READY=1");
             let mut cluster_name = read_cluster_name(&member);
             {
                 let mut s = status.lock().unwrap();

@@ -21,6 +21,8 @@ pub struct Daemon {
     pub admin_password: Option<String>,
     pub ca_fingerprint: Option<String>,
     pub join_url: Option<String>,
+    /// 있으면 opld에 `NOTIFY_SOCKET`으로 준다(systemd 알림 시험).
+    pub notify_socket: Option<PathBuf>,
 }
 
 /// 비어 있는 포트를 하나 고른다.
@@ -74,6 +76,7 @@ impl Daemon {
             admin_password: None,
             ca_fingerprint: None,
             join_url: None,
+            notify_socket: None,
         }
     }
 
@@ -113,13 +116,17 @@ impl Daemon {
             .append(true)
             .open(self.path("opld.log"))
             .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_orbivisord"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orbivisord"));
+        command
             .arg("--config")
             .arg(self.path("opld.toml"))
             .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+            .stderr(log);
+        match &self.notify_socket {
+            Some(path) => command.env("NOTIFY_SOCKET", path),
+            None => command.env_remove("NOTIFY_SOCKET"),
+        };
+        let child = command.spawn().unwrap();
         self.child = Some(child);
         let member = self.data_dir().join("pki").exists();
         self.wait_until(|status| status.is_some_and(|s| !member || s["state"] == "member"))

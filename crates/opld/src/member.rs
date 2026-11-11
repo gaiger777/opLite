@@ -41,6 +41,7 @@ use crate::host::Host;
 use crate::metrics::host as metrics_host;
 use crate::metrics::sampler::MetricsSampler;
 use crate::metrics::store::{MetricsStore, StoreSource};
+use crate::notify::Notifier;
 use crate::overlay::{OverlayAgent, cluster_tag};
 use crate::pools::PoolMounter;
 use crate::runtime::{Handles, on, run_on};
@@ -515,6 +516,10 @@ impl Member {
             .updates_config()
             .map(|c| Arc::new(Updates::new(c)));
         runner_config.updates = updates.clone();
+        // Task 실행기의 고아 정리는 쓰기마다 10초까지 기다리므로 정족수 없이 다시 켤 때 systemd의 시작
+        // 제한(90초)을 넘길 수 있다. 정리는 API보다 먼저 끝나야 하므로(API가 막 받는 업로드 파일을
+        // 고아로 지우지 않게) 뒤로 미루지 않고 READY=1을 그 전에 보낸다(API가 뜬 뒤 다시 보낸다).
+        Notifier::from_env().notify("READY=1");
         let runner = run_on(
             &rt.work,
             TaskRunner::spawn(

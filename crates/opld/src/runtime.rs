@@ -6,8 +6,8 @@
 //! - `work`(`orbivisor-work`): reconciler, Task 실행기, 스케줄러, 정리, 지표, 풀, 텔레메트리, 노드 간
 //!   서버가 받은 그 밖의 요청(마이그레이션 받기, 콘솔 중계 등)
 //!
-//! 이 밖에 OS 스레드 둘이 있다: watchdog 쓰다듬기(`orbivisor-watchdog`, `HaGuard`)와 redb 쓰기
-//! (`orbivisor-store`, 클러스터 저장소).
+//! 이 밖에 OS 스레드 셋이 있다: watchdog 쓰다듬기(`orbivisor-watchdog`, `HaGuard`), redb 쓰기
+//! (`orbivisor-store`, 클러스터 저장소)와 실행기 확인·systemd 알림(`orbivisor-notify`).
 //!
 //! 실행기 사이 호출은 `Arc`로 나눈 객체의 메서드이고, tokio의 채널·`Notify`·`watch`는 실행기를
 //! 넘어 동작한다.

@@ -6,7 +6,13 @@ Wants=network-online.target
 ConditionPathExists=/etc/opl/opld.toml
 
 [Service]
-Type=simple
+# 시작이 끝나면 READY=1을, core·api 실행기가 답하는 동안 10초마다 WATCHDOG=1을 보낸다. 30초 넘게
+# 없으면 systemd가 SIGKILL로 끝내고 다시 띄운다(코어 덤프로 늦지 않게, 진단은 늦은 회차의 경고 로그.
+# KillMode=process라 VM은 그대로 돈다).
+Type=notify
+NotifyAccess=main
+WatchdogSec=30s
+WatchdogSignal=SIGKILL
 ExecStart=/usr/bin/orbivisord --config /etc/opl/opld.toml
 Restart=on-failure
 RestartSec=5

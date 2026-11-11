@@ -87,6 +87,15 @@ if [ -f "$UNIT_DIR/opld.service" ] && [ ! -L "$UNIT_DIR/opld.service" ] &&
 else
 	fail "유닛: $(ls -l "$UNIT_DIR" 2>&1)"
 fi
+# systemd 알림(설계 §3.3): 시작이 끝나면 READY=1, core·api가 답하는 동안 WATCHDOG=1(없으면 SIGKILL). 시작 제한은 기본(90초).
+if grep -qx 'Type=notify' "$UNIT_DIR/opld.service" && grep -qx 'NotifyAccess=main' "$UNIT_DIR/opld.service" &&
+	grep -qx 'WatchdogSec=30s' "$UNIT_DIR/opld.service" && grep -qx 'WatchdogSignal=SIGKILL' "$UNIT_DIR/opld.service" &&
+	grep -qx 'Restart=on-failure' "$UNIT_DIR/opld.service" &&
+	grep -qx 'KillMode=process' "$UNIT_DIR/opld.service" && ! grep -q '^TimeoutStartSec=' "$UNIT_DIR/opld.service"; then
+	ok "유닛은 Type=notify·WatchdogSec=30s·WatchdogSignal=SIGKILL·NotifyAccess=main"
+else
+	fail "유닛 systemd 알림: $(cat "$UNIT_DIR/opld.service")"
+fi
 if [ -f "$T/usr/share/orbivisor/opld.toml.example" ] && [ -f "$T/usr/share/doc/orbivisor/copyright" ] &&
 	[ ! -e "$T/usr/share/oplite" ] && [ ! -e "$T/usr/share/doc/oplite" ]; then
 	ok "공유 파일은 /usr/share/orbivisor"
