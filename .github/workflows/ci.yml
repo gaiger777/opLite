@@ -203,37 +203,49 @@ jobs:
           sudo zfs list -r opltestz
           zfs version
           sudo zpool status opltestz
-      # RBD 풀 시험이 이미지를 만들 Ceph 풀 `rbd`. microceph로 노드 하나짜리 Ceph(루프 파일 OSD 하나,
-      # 복제 1)를 띄운다. ceph-common의 rbd·ceph와 QEMU(qemu-block-extra의 librbd)가 Ceph 기본 위치에서
-      # 읽도록 microceph의 ceph.conf와 키링을 /etc/ceph에 둔다. 제한된 사용자 시험을 위해 네임스페이스
-      # `rbd/opl`과 사용자 `client.opltest`(caps `profile rbd`)를 만들고, 그 키링은 Ceph 기본 위치가 아닌
-      # /etc/opl-ceph에 두어 그곳의 ceph.conf로만 찾게 한다.
-      - name: Ceph (microceph) with an rbd pool
+      # RBD 풀 시험이 이미지를 만들 Ceph 풀 `rbd`. Ubuntu apt 패키지(ceph 19.2)로 노드 하나짜리 Ceph(모니터·
+      # 매니저 하나, 4G 성긴 파일 위 BlueStore OSD 하나, 복제 1)를 손으로 띄운다(snap 스토어가 러너에서
+      # 닿지 않을 때가 있어 microceph를 쓰지 않는다). ceph-common의 rbd·ceph와 QEMU(qemu-block-extra의
+      # librbd)가 읽도록 ceph.conf와 관리자 키링을 Ceph 기본 위치 /etc/ceph에 둔다. 제한된 사용자 시험을
+      # 위해 네임스페이스 `rbd/opl`과 사용자 `client.opltest`(caps `profile rbd`)를 만들고, 그 키링은 Ceph
+      # 기본 위치가 아닌 /etc/opl-ceph에 두어 그곳의 ceph.conf로만 찾게 한다.
+      - name: Ceph (apt, single node) with an rbd pool
         timeout-minutes: 15
         run: |
           sudo apt-get update
-          sudo apt-get install -y ceph-common qemu-block-extra jq
-          # snap 스토어가 가끔 닿지 않아(러너 쪽 장애) 30초 간격으로 다섯 번까지 다시 해 본다.
-          for i in 1 2 3 4 5; do
-            if sudo snap install microceph --channel squid/stable; then break; fi
-            if [ "$i" = 5 ]; then exit 1; fi
-            sleep 30
-          done
-          sudo snap refresh --hold microceph
-          # microceph의 별칭(/snap/bin/rbd·ceph 등)은 snap에 갇힌 클라이언트라 /etc/opl-ceph와 시험의
-          # /tmp(snap 전용 /tmp)를 보지 못한다. 시험은 `sudo -E env "PATH=$PATH"`로 돌고 러너의 PATH는
-          # /snap/bin이 /usr/bin보다 앞이므로 별칭을 없애 ceph-common의 명령을 쓰게 한다.
-          snap aliases microceph
-          if snap aliases microceph | grep -q '^microceph\.'; then sudo snap unalias microceph; fi
-          sudo env "PATH=$PATH" sh -c 'echo "PATH=$PATH"; command -v rbd ceph qemu-img qemu-io'
-          test "$(sudo env "PATH=$PATH" sh -c 'command -v rbd')" = /usr/bin/rbd
-          test "$(sudo env "PATH=$PATH" sh -c 'command -v ceph')" = /usr/bin/ceph
-          sudo microceph cluster bootstrap
+          sudo apt-get install -y ceph-mon ceph-mgr ceph-osd ceph-common qemu-block-extra jq uuid-runtime
+          # 모니터·매니저·OSD를 모두 이 호스트의 127.0.0.1에 묶는다. 복제 1을 허용하고 CRUSH 장애 도메인을
+          # OSD로 둔다(호스트가 하나뿐이다).
+          FSID=$(uuidgen)
+          HOST=$(hostname -s)
           sudo mkdir -p /etc/ceph
-          sudo ln -sf /var/snap/microceph/current/conf/ceph.conf /etc/ceph/ceph.conf
-          sudo ls -l /var/snap/microceph/current/conf
-          sudo sh -c 'ln -sf /var/snap/microceph/current/conf/*.keyring /etc/ceph/'
-          ls -l /etc/ceph
+          sudo tee /etc/ceph/ceph.conf >/dev/null <<CONF
+          [global]
+          fsid = $FSID
+          mon_initial_members = $HOST
+          mon_host = [v2:127.0.0.1:3300,v1:127.0.0.1:6789]
+          public_addr = 127.0.0.1
+          cluster_addr = 127.0.0.1
+          auth_cluster_required = cephx
+          auth_service_required = cephx
+          auth_client_required = cephx
+          osd_pool_default_size = 1
+          osd_pool_default_min_size = 1
+          mon_allow_pool_size_one = true
+          osd_crush_chooseleaf_type = 0
+          mon_warn_on_insecure_global_id_reclaim_allowed = false
+          CONF
+          # 모니터: 키링(mon., client.admin)과 monmap을 만들어 저장소를 초기화한다.
+          sudo ceph-authtool --create-keyring /etc/ceph/ceph.client.admin.keyring --gen-key -n client.admin \
+            --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow *' --cap mgr 'allow *'
+          sudo ceph-authtool --create-keyring /var/lib/ceph/tmp/ceph.mon.keyring --gen-key -n mon. --cap mon 'allow *'
+          sudo ceph-authtool /var/lib/ceph/tmp/ceph.mon.keyring --import-keyring /etc/ceph/ceph.client.admin.keyring
+          sudo monmaptool --create --addv "$HOST" '[v2:127.0.0.1:3300,v1:127.0.0.1:6789]' --fsid "$FSID" /var/lib/ceph/tmp/monmap
+          sudo chown ceph:ceph /var/lib/ceph/tmp/ceph.mon.keyring /var/lib/ceph/tmp/monmap
+          sudo -u ceph mkdir -p "/var/lib/ceph/mon/ceph-$HOST"
+          sudo -u ceph ceph-mon --mkfs -i "$HOST" --monmap /var/lib/ceph/tmp/monmap --keyring /var/lib/ceph/tmp/ceph.mon.keyring
+          sudo rm -f /var/lib/ceph/tmp/ceph.mon.keyring /var/lib/ceph/tmp/monmap
+          sudo systemctl start "ceph-mon@$HOST"
           trap 'sudo ceph -s || true' EXIT
           # 조건이 맞을 때까지 5초마다, 최대 10분 기다린다.
           wait_for() {
@@ -243,10 +255,23 @@ jobs:
             done
             return 1
           }
-          sudo ceph config set global mon_allow_pool_size_one true
-          sudo ceph config set global osd_pool_default_size 1
-          sudo microceph disk add loop,4G,1
+          wait_for sudo timeout 10 ceph mon stat
+          # 매니저(PG 상태와 `ceph df`가 매니저를 거친다).
+          sudo -u ceph mkdir -p "/var/lib/ceph/mgr/ceph-$HOST"
+          sudo ceph auth get-or-create "mgr.$HOST" mon 'allow profile mgr' osd 'allow *' mds 'allow *' \
+            | sudo -u ceph tee "/var/lib/ceph/mgr/ceph-$HOST/keyring" >/dev/null
+          sudo systemctl start "ceph-mgr@$HOST"
+          # OSD 하나: 블록 장치 대신 4G 성긴 파일 위의 BlueStore.
+          OSD_UUID=$(uuidgen)
+          OSD_ID=$(sudo ceph osd new "$OSD_UUID")
+          sudo -u ceph mkdir -p "/var/lib/ceph/osd/ceph-$OSD_ID"
+          sudo ceph auth get-or-create "osd.$OSD_ID" mon 'allow profile osd' mgr 'allow profile osd' osd 'allow *' \
+            | sudo -u ceph tee "/var/lib/ceph/osd/ceph-$OSD_ID/keyring" >/dev/null
+          sudo -u ceph truncate -s 4G "/var/lib/ceph/osd/ceph-$OSD_ID/block"
+          sudo -u ceph ceph-osd -i "$OSD_ID" --mkfs --osd-uuid "$OSD_UUID" --osd-objectstore bluestore
+          sudo systemctl start "ceph-osd@$OSD_ID"
           wait_for sh -c 'sudo ceph osd stat | grep -q " 1 up"'
+          wait_for sh -c 'sudo ceph mgr stat --format json | jq -e .available'
           sudo ceph osd pool create rbd 32
           sudo ceph osd pool set rbd size 1 --yes-i-really-mean-it
           sudo ceph osd pool set .mgr size 1 --yes-i-really-mean-it || true
