@@ -93,7 +93,7 @@ async fn ask(ctx: &Ctx, make: impl FnOnce(Reply) -> Request) -> Answer {
 }
 
 fn router(ctx: Ctx) -> Router {
-    Router::new()
+    let router = Router::new()
         .route(
             "/v1/status",
             get(|State(ctx): State<Ctx>| async move {
@@ -125,8 +125,10 @@ fn router(ctx: Ctx) -> Router {
             post(|State(ctx): State<Ctx>| async move {
                 ask(&ctx, |reply| Request::Leave { reply }).await
             }),
-        )
-        .with_state(ctx)
+        );
+    #[cfg(feature = "starve-it")]
+    let router = router.merge(crate::starve::routes());
+    router.with_state(ctx)
 }
 
 /// 제어 소켓을 연다. 다른 opld가 이미 쓰고 있으면 실패한다. 이전 opld가 남긴 소켓 파일은 지운다.

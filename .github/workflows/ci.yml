@@ -29,6 +29,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      # 시험 빌드에만 있는 고리로 리더의 api 실행기를 막는 굶김 시험(QEMU 없음)
+      - run: cargo test -p opld --features starve-it --test starve
       - name: Storage integration tests (qemu-img)
         if: runner.os == 'Linux'
         run: |

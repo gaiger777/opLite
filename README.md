@@ -519,6 +519,9 @@ address = "10.0.0.11"
 # max_concurrent = 2      # 노드마다 동시에 도는 백업 작업(Task)의 최대 수
 # [pools]
 # refresh_secs = 15         # 노드별 풀 상태를 확인하는 간격(초, NFS 마운트 포함)
+# [runtime]
+# api_threads = 4           # API 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)
+# work_threads = 4          # VM·작업 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)
 TOML
 sudo orbivisord --config /etc/opl/opld.toml &
 sudo orbivisorctl cluster init --name prod
@@ -1334,6 +1337,65 @@ sudo kill -TERM "$(pidof orbivisord)"; sleep 15; cat /sys/class/watchdog/watchdo
 #    "fenced: lost the cluster majority"로 꺼지고 Triggered는 없다. 풀면 리스가 돌아와 다시 켜진다.
 sudo modprobe -r softdog                                        # 끝나면
 ```
+
+## 제어부 가용성
+
+API·작업·느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰 멀쩡한 노드가 펜싱되지 않게, orbivisord는 한
+프로세스 안에서 일을 서로 다른 스레드에 나눈다([설계 문서](docs/superpowers/specs/2026-11-11-availability-scale-design.md) §3·§11).
+
+| 실행기·스레드 | 스레드 이름 | 도는 것 |
+|---|---|---|
+| `core`(2개 고정) | `orbivisor-core` | Raft, 노드 간 서버(모든 연결의 TLS·HTTP/2 처리와 Raft·리스·전달 요청), 다른 노드로 가는 Raft·리스·전달 연결, HA 리스 갱신, HA 복구(리더), 노드 감시, 제어 소켓 |
+| `api` | `orbivisor-api` | HTTPS API(웹 콘솔·watch 포함) |
+| `work` | `orbivisor-work` | reconciler, 작업(Task) 실행기, 스케줄러, 정리, 지표, 풀, 텔레메트리, 원격 확인, 업데이트, 노드 간 서버가 받은 무거운 요청의 처리기(들어오는 마이그레이션, 콘솔 중계, UEFI 변수, 감사 로그·지표 읽기), 다른 노드로 가는 콘솔·마이그레이션·감사·지표 연결 |
+| OS 스레드 | `orbivisor-watchdog` | HA watchdog 장치 쓰다듬기(1초마다, 실행기가 막혀도 리스 규칙대로) |
+| OS 스레드 | `orbivisor-store` | 클러스터 저장소(redb)의 쓰기와 fsync, 차례대로 하나씩 |
+| OS 스레드 | `orbivisor-notify` | 실행기 확인과 systemd 알림 |
+
+```toml
+# /etc/opl/opld.toml (노드마다, 생략하면 아래 기본값)
+[runtime]
+# api_threads = 4     # api 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)
+# work_threads = 4    # work 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)
+```
+
+- **노드 간 연결.** 노드 간 서버의 연결마다의 TLS·HTTP/2 처리는 `core`에서 돈다. 그래서 콘솔의 VNC 바이트와
+  UEFI 변수 조각을 틀에 넣고 암호화하는 일은 `core` 스레드가 하고, `work`에서는 그 요청의 처리기만 돈다. 팔로어가
+  리더에게 전달하는 큰 API 쓰기도 `core`의 연결로 가므로 `core`에서 암호화된다. 다른
+  노드로 가는 연결은 둘로 나눈다: Raft·리스 갱신·리더 전달·생존 확인은 `core`의 연결, 콘솔·마이그레이션 보내기·UEFI
+  변수·감사 로그·지표 읽기는 `work`의 연결이다(처음 연 쪽 실행기와 관계없이). 대량 전송용 포트를 따로 두는 것은
+  다중 링크(계획 49)에서 다룬다.
+- **systemd watchdog.** 유닛(`opld.service`)은 `Type=notify`, `NotifyAccess=main`, `WatchdogSec=30s`,
+  `WatchdogSignal=SIGKILL`이다. orbivisord는 시작이 끝나면 `READY=1`을 보낸다(클러스터에 속하지 않은 노드는 제어
+  소켓을 열었을 때, 멤버는 작업 실행기가 이전 프로세스의 고아를 정리하기 직전과 API가 듣기 시작했을 때, 위트니스는
+  노드 간 서버가 떴을 때). 고아 정리는 정족수가 없으면 지우기마다 10초까지 기다리므로, 클러스터 전체를 다시 켤 때
+  시작 제한(90초)에 걸리지 않게 그 전에 보낸다. `orbivisor-notify` 스레드가 10초(`WATCHDOG_USEC`의 1/3, 1초~10초)마다
+  세 실행기에 빈 작업을 보내 `core`와 `api`가 2초(간격의 절반이 더 짧으면 그만큼) 안에 돌리면 `WATCHDOG=1`을 보낸다.
+  늦으면 보내지 않고 경고("runtimes did not run a task within 2s; not petting the systemd watchdog", 늦은 실행기
+  이름)를 남긴다. `work`만 늦으면 경고("…; still petting the systemd watchdog")만 남기고 계속 보낸다(데몬을 다시
+  띄우는 동안 HA VM이 있는 노드가 재부팅될 수 있으므로 리스와 API가 도는 한 끄지 않는다). `core`나 `api`가 20초 넘게
+  막히면 쓰다듬기가 30초 넘게 끊겨 systemd가 orbivisord를 SIGKILL로 끝내고(코어 덤프로 늦어지지 않게, 진단은 경고
+  로그로) 5초 뒤 다시 띄운다(`Restart=on-failure`). `KillMode=process`라 VM은 그대로 돌고, 다시 뜬 orbivisord가 VM에
+  다시 붙는다. `systemctl status opld`가 `activating`에 머물면 `READY=1`이 아직 오지 않은 것이다(로그를 본다).
+- **HA watchdog과의 관계.** HA watchdog 장치(노드 재시작)는 HA VM이 도는데 리스를 잃었을 때의 것이고, systemd
+  watchdog(데몬 재시작)은 데몬이 멈췄을 때의 것이다. 데몬이 다시 시작되는 동안 HA VM이 있으면 장치 쓰다듬기도
+  멈춘다(죽은 프로세스가 닫은 장치의 타이머는 그대로 돈다). 새 프로세스가 장치를 다시 열면(arm) Linux 드라이버가
+  타이머를 다시 시작하므로, 마지막 쓰다듬기부터 다시 arm하기까지가 `watchdog_timeout_secs`(기본 30초)보다 짧아야
+  노드가 재시작되지 않는다. 그 사이에 드는 것: `RestartSec`(5초), 프로세스 시작과 클러스터 저장소 열기, 도는 VM마다
+  차례로 QMP에 다시 붙기(VM 수에 비례, 붙지 못하는 VM은 하나에 5초까지), 첫 리스 갱신(리더가 있어야 한다),
+  reconciler가 도는 HA VM에 붙으며 하는 arm. VM이 많은 노드는 배포 뒤 이 시간을 재 본다.
+- **Raft가 멈추면.** 저장소 쓰기가 실패하거나 저장소 스레드가 멈춰 Raft(openraft)가 멈추면 orbivisord는
+  "Raft stopped: …"로 0이 아닌 코드로 끝나고 systemd가 다시 띄운다(API만 답하는 채로 남지 않는다).
+- **느린 디스크.** 저장소 쓰기는 `orbivisor-store` 스레드에서 하므로 fsync가 실행기 스레드를 막지 않는다. 다만
+  Raft(openraft)는 자기 로그 쓰기가 끝나기를 기다리므로, 디스크가 아주 느린 노드의 Raft 루프는 멈춘다. 그 노드가
+  팔로어면 그 노드만 멈칫하고(선거를 시작할 수 있다) 다른 노드는 영향을 받지 않는다. 그 노드가 **리더**면 리더의
+  Raft 루프가 멈춰 리스 갱신에 필요한 리더 확인(`confirm_leader`)이 실패하므로 **모든 노드의 리스 갱신이 실패**하고,
+  다른 노드가 선거로 리더가 된 뒤에 회복한다.
+- **끄기.** 장애를 조사하느라 systemd watchdog을 잠시 끄려면 `systemctl edit opld`로 `[Service]`에 `WatchdogSec=0`을
+  둔다.
+- **시험.** `cargo test -p opld --features starve-it --test starve`가 opld 셋의 리더의 `api` 실행기를 15초 동안 막고
+  그동안 리더·임기가 그대로이고 모든 노드의 리스 나이가 3초 미만이며 `WATCHDOG=1`이 멈추는지 본다. `starve-it`
+  기능은 시험 빌드에만 있는 고리(`[test] block_api_ms`, 제어 소켓의 `/v1/test/…`)를 넣으므로 배포 빌드에 켜지 않는다.
 
 ## 노드 유지보수와 비우기
 
@@ -2683,6 +2745,7 @@ cargo test -p opld --features qemu-it --test e2e                    # E2E: CLI �
 cargo test -p opld --features qemu-it --test backup                 # E2E: 실행 중 백업 → VM 지우기 → 복원(qemu-img, qemu-io 필요)
 cargo test -p opld --features qemu-it --test vm_import              # E2E: OVA 올리기 → 제안 → 가져오기 → 볼륨 내용(qemu-img 필요)
 cargo test -p opld --test cluster                                   # E2E: orbivisord 프로세스 3개로 클러스터 구성
+cargo test -p opld --features starve-it --test starve              # E2E: 리더의 API 실행기를 막아도 리스·Raft 리더 그대로
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN, 이름공간 사이 VXLAN, nft 방화벽(nftables·python3 필요)
@@ -2857,6 +2920,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [로컬 디스크 라이브 마이그레이션 설계 (하위 프로젝트 13: 계획 42)](docs/superpowers/specs/2026-11-10-storage-migration-design.md)
 - [제품 이름 Orbivisor로 바꾸기 설계 (계획 43)](docs/superpowers/specs/2026-11-10-rename-orbivisor-design.md)
 - [실시간 지표와 쉬운 화면 설계 (하위 프로젝트 14: 계획 44~47)](docs/superpowers/specs/2026-11-11-monitoring-ui-design.md)
+- [제어부 가용성과 대규모 클러스터 설계 (하위 프로젝트 15: 계획 45~56)](docs/superpowers/specs/2026-11-11-availability-scale-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)

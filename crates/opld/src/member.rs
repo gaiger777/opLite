@@ -692,7 +692,13 @@ impl Member {
         &self.cluster
     }
 
-    /// API 서버나 노드 간 서버가 스스로 멈추면 끝난다.
+    /// 시험 고리가 쥐는 클러스터 저장소(약한 참조라 닫힌 저장소를 붙잡지 않는다)
+    #[cfg(feature = "starve-it")]
+    pub fn cluster_weak(&self) -> std::sync::Weak<Cluster> {
+        Arc::downgrade(&self.cluster)
+    }
+
+    /// API 서버나 노드 간 서버가 스스로 멈추거나 Raft가 멈추면 끝난다.
     pub async fn failed(&mut self) -> anyhow::Error {
         match self.exited.recv().await {
             Some(why) => anyhow::anyhow!(why),

@@ -12,3 +12,6 @@ address = "10.0.0.11"
 # max_concurrent = 2      # 노드마다 동시에 도는 백업 작업(Task)의 최대 수
 # [pools]
 # refresh_secs = 15         # 노드별 풀 상태를 확인하는 간격(초, NFS 마운트 포함)
+# [runtime]
+# api_threads = 4           # API 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)
+# work_threads = 4          # VM·작업 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)

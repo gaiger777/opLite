@@ -413,7 +413,126 @@
 
 ## 11. 구현(계획 45)
 
-계획 45 구현 뒤에 채운다.
+§12의 네 단계를 커밋 넷으로 했다. 설계 §3과 다르거나 설계가 정하지 않아 정한 것을 적는다.
+
+**실행기 셋(§3.1).**
+- `opld/src/runtime.rs`: `Runtimes::new(api_threads, work_threads)`, 복제할 수 있는 `Handles { core, api, work }`,
+  `runtime::on(&Handle, || …)`(그 실행기의 문맥에서 동기로 띄움), `runtime::run_on(&Handle, fut)`(그 실행기에서 돌리고
+  기다림). `main`은 `#[tokio::main]` 대신 `runtimes.core.block_on(run(…))`이라 주 루프가 띄우는 작업과 **제어 소켓은
+  `core`**다. 다만 주 루프 자신(close·leave·join을 기다리고 부르는 곳)은 `core` 작업자가 아닌 **주 스레드의
+  `block_on`**에서 돌므로 `Liveness`의 실행기 확인이 보지 못한다(주 루프가 막혀도 `WATCHDOG=1`은 계속 간다).
+- 설정 `[runtime] api_threads`·`work_threads`(기본 CPU 수의 절반, 최소 2, 0은 거부). `core`는 `CORE_THREADS` = 2.
+- 배치는 표대로이고 설계가 적지 않은 것은 이렇게 두었다: TLS 받기·핸드셰이크는 `api`, `QemuHypervisor::new`(다시
+  붙는 QMP·모니터 작업)·업데이트·VXLAN·방화벽·Node 등록 루프는 `work`, 승격은 `core`.
+- **피어 gRPC 서버를 나눔(설계와 다름).** 설계는 피어 서버 전체를 `core`에 두었지만, 그러면 들어오는 라이브
+  마이그레이션(받은 VM의 QMP·모니터 작업까지), 콘솔 VNC 중계, UEFI 변수 보내기가 `core`에서 돈다.
+  `PeerService::with_work(Handle)`로 이것들과 감사 로그·지표 읽기를 `work`에서 돌리고, Raft·리스·전달·ping만
+  `core`에 남겼다. 위트니스는 `work` 핸들을 넘기지 않는다(그런 요청을 받지 않는다). 처리기에서 panic하면 다시
+  던지지 않고 오류 로그와 `internal`로 답한다(같은 HTTP/2 연결의 Raft RPC를 함께 끊지 않게).
+- **남은 `core` 부담.** 나눈 것은 처리기뿐이다. 노드 간 서버의 연결마다의 TLS·HTTP/2 작업은 `core`에 있어서 콘솔
+  VNC 바이트·UEFI 변수 조각을 틀에 넣고 암호화하는 일은 `core` 스레드가 한다. 팔로어가 리더에게 전달하는 큰 API
+  쓰기도 control 연결(`core`)로 가므로 `core`에서 암호화된다. 대량 전송용 포트를 따로 두는 것은 다중 링크(계획
+  49)에서 다룬다.
+- **다른 노드로 가는 연결도 나눔(설계가 정하지 않음).** tonic 채널은 연결 작업(요청 버퍼, HTTP/2 연결)을 처음
+  부른 쪽 실행기에 띄우므로, `work`의 Node 등록이나 `api`의 지표 모으기가 먼저 연 연결이면 Raft 하트비트와 리스
+  갱신 전달이 그 실행기에 기댄다. `Peers::with_runtimes(control, bulk)`가 주소마다 채널을 둘 두고
+  `Endpoint::executor`로 연결 작업을 정한 실행기에 띄운다: Raft(`GrpcNetwork`)·리더 전달(리스 갱신, 쓰기 전달)·ping은
+  control(`core`), 콘솔·마이그레이션 보내기·UEFI 변수·감사 로그·지표 읽기는 bulk(`work`). 실행기를 주지 않으면(시험,
+  oplctl) 채널 하나를 처음 부른 쪽에서 돌린다. 시험은 따로 만든 실행기가 먼저 연 control 채널이 그 실행기가 끝난
+  뒤에도 되는지 본다.
+- 배치 시험은 스레드 이름이 아니라 실행기별 남은 작업 수로 본다: 따로 만든 current-thread 실행기에서 단일 노드
+  멤버를 띄우면 부른 쪽에 남은 작업이 0이고 세 실행기 모두 작업이 있으며, 닫으면 10초 안에 모두 0이다. 스레드
+  이름은 `runtime.rs` 시험이 본다.
+
+**watchdog 스레드와 저장소 스레드(§3.1·§3.2).**
+- `HaGuard`: watchdog 장치를 쓸 때만 OS 스레드 `orbivisor-watchdog`을 띄운다. 스레드는 잠금 없이
+  `AtomicU64`(마지막으로 성공한 갱신을 보내기 전 시각)와 `AtomicBool`(HA VM 있음)을 읽고 **스스로 시간을 재어**
+  `fresh`를 계산한다(실행기가 멈춰 갱신 루프가 돌지 않아도 리스가 끝나면 규칙대로 쓰다듬기를 멈춤). 닫을 때
+  스레드에서 장치를 돌려받아 잠금 밖에서 magic close한다.
+- opl-cluster `writer.rs` `StoreWriter`: OS 스레드 `orbivisor-store` 하나, `run()`은 결과를 `oneshot`으로 기다리고
+  `submit()`은 기다리지 않는다. 스레드는 데이터베이스를 약한 참조로 쥐어 저장소를 놓으면 닫힌다. 오류
+  `StoreError::Thread`·`WriterStopped`·`WriterPanicked`. 쓰기가 panic하면 그 쓰기는 `WriterPanicked`이고 오류 로그를
+  남긴 뒤 스레드를 멈춘다(메모리의 Raft 상태가 디스크와 어긋났을 수 있으므로 계속 쓰지 않는다. 뒤의 쓰기는
+  `WriterStopped`이고 openraft가 그 노드의 Raft를 멈춘다).
+- **Raft 멈춤 감시.** openraft가 Raft를 멈춰도(`metrics().running_state`가 `Err`) 아무도 보지 않으면 HA VM이 없는
+  노드는 API만 답하는 좀비로 남는다. `Cluster::stopped()`(Raft가 멈추면 이유와 함께 끝나는 future)를
+  `Member::start`·`start_witness`가 `core`의 작은 감시 작업으로 기다리다 `"Raft stopped: …"`를 서버가 멈출 때와 같은
+  채널로 보낸다. 주 루프가 0이 아닌 코드로 끝나고 `Restart=on-failure`가 다시 띄운다. `close`는 저장소를 닫기 전에
+  감시를 멈춰 정상 종료는 알리지 않는다. 시험: 저장소 쓰기를 panic시키면 `stopped`가 저장소 오류로 끝남(opl-cluster,
+  `#[cfg(test)]` 훅), 멤버의 저장소를 닫으면 `failed`가 `"Raft stopped: "`로 끝남(opld).
+- `orbivisor-watchdog` 스레드는 새 장치를 받으면 한 간격을 기다리지 않고 곧바로 한 번 쓰다듬는다(규칙은 같다).
+- `HaGuard::close` 뒤의 `arm()`은 장치를 열지 않고 `ArmError::Closed`다(쓰다듬을 스레드가 없어 연 장치가 그냥 닫히면
+  타이머가 돈다). 갱신 루프는 쓰다듬기 스레드가 쓰는 시각을 async 시각보다 먼저 재어 스레드의 마감이 `lease`의
+  마감보다 늦지 않다.
+- `append`는 **커밋 뒤에** 돌아오고 `LogFlushed` 콜백도 저장소 스레드가 커밋 뒤에 부른다. openraft 0.9.25는
+  `append`가 돌아온 직후 그 엔트리를 읽을 수 있어야 하기 때문이다. `save_committed`는 기다리지 않고 큐에 넣는다.
+  스냅샷을 만드는 큰 읽기는 `spawn_blocking`이다.
+- **"쓰기가 늦으면 Raft 커밋이 늦어질 뿐"은 완전히 맞지 않는다.** openraft 0.9.25의 Raft 루프는 자기 로그 쓰기를
+  기다린다. 그래서 한 노드의 디스크가 느리면 그 노드의 Raft 루프가 멈춘다. 저장소 스레드는 fsync가 실행기 스레드를
+  막지 않게 할 뿐이다. 느린 노드가 팔로어면 그 노드만 멈칫한다(선거를 시작할 수 있다). **리더**면 리더의 Raft 루프가
+  멈춰 리스 갱신의 리더 확인(`confirm_leader`)이 실패하므로 모든 노드의 리스 갱신이 실패하고, 하트비트가 끊긴
+  팔로어가 선거로 새 리더를 뽑은 뒤 회복한다. 저장소 지연 시험은 느린 팔로워의 선거를 끄고(그 노드의 Raft 루프는
+  멈추므로) 리더의 쓰기와 리스 갱신(`confirm_leader`)이 500 ms 안에 돌고 리더·임기가 그대로인지 본다.
+
+**systemd 알림(§3.3).**
+- `opld/src/notify.rs`: `Notifier::from_env()`·`notify(state)`(`$NOTIFY_SOCKET`, `@`는 Linux 추상 소켓, 없거나 비면
+  아무것도 안 함, 보내기 실패는 경고), `Liveness::spawn(Handles, Notifier)`. 확인은 OS 스레드 **`orbivisor-notify`**
+  (설계는 이름을 정하지 않았다)가 시작 때 한 번, 그 뒤 10초마다 한다. 늦은 실행기 이름을 경고로 남기고, 마지막
+  회차의 결과는 `Liveness::slow()`로 읽는다(계획 46 헬스 체크가 쓴다). systemd가 `WATCHDOG_USEC`을 주면 간격은 그
+  1/3(1초~10초), 기한은 2초와 간격의 절반 중 짧은 것이다.
+- **`work`가 늦으면 쓰다듬기를 멈추지 않는다(설계와 다름).** `WATCHDOG=1`은 `core`와 `api`가 답한 회차에 보내고,
+  `work`만 늦으면 경고만 남긴다. systemd가 데몬을 끝내면 새 프로세스가 HA watchdog 장치의 제한 시간 안에 다시
+  arm해야 하는데, VM·작업이 바쁜 것만으로 그 위험을 지지 않는다. 유닛은 `WatchdogSignal=SIGKILL`이다(기본
+  SIGABRT의 코어 덤프가 재시작을 늦추지 않게, 진단은 느린 회차의 경고 로그로).
+- **여유 계산.** HA VM이 도는 노드에서 `api`가 막혀 systemd가 데몬을 끝내는 경우, 리스 갱신(`core`)은 돌고 있으므로
+  `orbivisor-watchdog`이 죽기 직전까지 장치를 쓰다듬는다. 그 뒤 장치 제한 30초 안에 `RestartSec` 5초, 시작, 첫 리스
+  갱신과 arm이 끝나야 한다(남는 시간 약 25초 − 시작·리스 갱신 시간). 죽은 프로세스가 닫은 장치의 타이머는 그대로
+  돌고, 새 프로세스가 장치를 다시 열면 Linux watchdog 드라이버가 타이머를 다시 시작한다(열 때 `start`, 이미 돌면
+  `ping`). 그래서 마감은 마지막 쓰다듬기에서 30초이고, 그 안에 차례로 `RestartSec`, 프로세스 시작, `Cluster::open`,
+  `QemuHypervisor::new`(도는 VM마다 차례로 QMP에 다시 붙음, VM 수에 비례하고 붙지 못하는 VM은 하나에
+  `ATTACH_TIMEOUT` 5초까지), `HaGuard::spawn`의 첫 리스 갱신(리더가 있어야 한다), reconciler 작업자의 `attach_ha`
+  (`arm`)가 끝나야 한다. `core`가 막힌 경우는 리스 갱신도 멈추므로
+  `fence_after` 뒤 쓰다듬기가 멈추고, systemd는 마지막 `WATCHDOG=1`에서 30초 뒤(막힌 때에서 최대 30초 + 확인 간격
+  10초) 데몬을 끝낸다. 이때 장치 제한(30초)에서 `WatchdogSec`의 30초를 빼면 여유가 없으므로 노드 재시작은 리스를
+  잃은 노드의 펜싱으로 본다. 그래서 `work`만 늦을 때는 끝내지 않고, 끝낼 때는 SIGKILL로 바로 끝낸다.
+- **`READY=1`을 보내는 때(§3.3 본문의 "API가 듣기 시작하면"을 바로잡음).** 클러스터에 속하지 않은 노드는 API가 없으므로
+  제어 소켓을 열었을 때, 멤버는 Task 실행기가 이전 프로세스의 고아를 정리하기 직전과 `Member::start`가 돌아온 뒤(API가
+  들음, init·join·다시 시작마다 다시 보내도 해가 없다), 위트니스는 노드 간 서버가 떴을 때다. 고아 정리(`sweep_orphans`)는
+  정족수가 없으면 지우기·상태 쓰기마다 10초까지 기다리므로, 클러스터 전체를 다시 켤 때 `Type=notify`의 시작 제한(90초)을
+  넘겨 systemd가 다시 띄울 수 있다. 정리를 Task 실행기의 뒤 작업으로 옮기지 않은 것은 업로드 파일과 가져오기 디렉터리
+  정리가 revision으로 거르지 않고 "API를 띄우기 전"에 기대기 때문이다(API가 막 받는 업로드를 고아로 지울 수 있다). `STOPPING=1`은 보내지 않는다. `NOTIFY_SOCKET`은 환경에서 지우지
+  않는다(`NotifyAccess=main`이라 QEMU 같은 자식이 보내도 systemd가 무시한다).
+- 유닛 `Type=notify`·`NotifyAccess=main`·`WatchdogSec=30s`, `TimeoutStartSec`은 기본 그대로. `build-deb-test.sh`가
+  유닛 값을 확인한다.
+- `runtime::run_on`은 작업이 취소되면(실행기가 끝날 때) `JoinError::into_panic`에서 panic한다. 대상 실행기가 먼저
+  끝날 수 있는 곳에서는 쓰지 않는다(문서 주석). 실행기 확인은 `run_on`을 쓰지 않고 채널로 기다리므로 문제가 없다.
+
+**굶김 시험(§3.4).**
+- 시험 전용 기능 `starve-it`(opld). 켜면 설정 `[test] block_api_ms`와 제어 소켓(`core`)의 숨은 경로 둘이 생긴다:
+  `POST /v1/test/block-api`(`api` 실행기의 작업자 수만큼 작업을 보내 모두 `block_api_ms` 동안 동기 sleep, 모두 막힌
+  뒤 답함)와 `GET /v1/test/raft`(이 노드가 아는 리더·임기와, 리더면 노드별 리스 나이). 배포 빌드는 `[test]`를
+  모르는 키로 거부하고 경로도 없다. 설계는 막기를 설정만으로 적었지만, 클러스터를 다 만든 뒤 막아야 하므로
+  제어 소켓 요청으로 시작한다.
+- **리스 나이는 `cluster status`에 없다(설계와 다름).** 리스 표는 리더의 메모리에만 있고 API로 내보내지 않는다.
+  API를 바꾸지 않고 시험 경로로 읽는다(사용자에게 보이는 리스 나이는 계획 46의 헬스 체크·계획 47의 리스 기반
+  노드 감시에서 정한다).
+- 시험 `opld/tests/starve.rs`(CI `check` 작업의 Linux·macOS에서 돈다): opld 셋(`fencing = "process"`,
+  `fence_after_secs = 10`이라 갱신 간격 1초), 리더 node1의 `api`를 **15초**(설계는 10초) 막는다. 10초 간격·2초
+  기한의 실행기 확인이 적어도 한 번은 막힌 동안에 들게 하려는 것이다. 그동안 리더의 API는 답하지 않고, 리더·
+  임기가 그대로이며, 세 노드의 리스 나이가 3초 미만이고, node2의 API로 한 쓰기가 커밋되고, `WATCHDOG=1`이 오지
+  않는다. 풀리면 API와 `WATCHDOG=1`이 돌아오고 로그에 `api`가 늦었다는 경고가 있다.
+
+**배포 뒤 확인(테스트 VM, UTM).** 실제 systemd로 띄우는 시험은 CI에 없다(§3.4). 패키지를 설치한 Debian 13
+VM에서 손으로 확인하고 결과를 적는다.
+
+| 확인 | 결과 |
+|---|---|
+| `systemctl start opld` 뒤 `active (running)`(미초기화 노드와 멤버 둘 다), `systemctl show opld -p WatchdogUSec`이 30s | 배포 뒤 확인 |
+| `kill -STOP`으로 orbivisord를 세우면 약 30초 뒤 SIGKILL로 끝나고 5초 뒤 다시 뜸, 도는 VM은 그대로 | 배포 뒤 확인 |
+| 위 재시작(SIGKILL부터 리스 갱신까지)이 HA watchdog 제한(30초)보다 짧아 HA VM이 있는 노드가 재부팅되지 않음 | 배포 뒤 확인 |
+| 정족수가 없을 때(다른 노드를 모두 끈 채) `systemctl restart opld`가 `active (running)`이 되기까지의 시간(90초보다 짧음) | 배포 뒤 확인 |
+| VM 수에 따른 다시 arm 시간(VM 수십 개를 띄운 노드에서 SIGKILL부터 `watchdog armed` 로그까지, HA watchdog 제한 30초보다 짧음) | 배포 뒤 확인 |
+| `orbivisor-core`·`-api`·`-work`·`-store`·`-notify`(HA VM이 있으면 `-watchdog`) 스레드(`ps -T -p $(pidof orbivisord)`, 이름은 15자로 잘려 `orbivisor-watch`·`orbivisor-notif`) | 배포 뒤 확인 |
 
 ## 12. 구현 단계 (계획 45)
 

@@ -23,6 +23,8 @@ mod notify;
 mod overlay;
 mod pools;
 mod runtime;
+#[cfg(feature = "starve-it")]
+mod starve;
 mod web;
 
 use std::fs::File;
@@ -75,6 +77,8 @@ fn main() -> anyhow::Result<()> {
     let runtimes = Runtimes::new(config.runtime.api_threads(), config.runtime.work_threads())
         .context("cannot start the runtimes")?;
     let rt = runtimes.handles();
+    #[cfg(feature = "starve-it")]
+    starve::install(rt.api.clone(), config.test.block_api());
     // systemd 알림(설계 §3.3). 실행기 확인 스레드는 실행기보다 먼저 멈춘다(선언의 역순으로 놓임).
     let notifier = Notifier::from_env();
     let _liveness = Liveness::spawn(rt.clone(), notifier.clone());
@@ -130,6 +134,8 @@ async fn run(config: Config, rt: Handles, notifier: Notifier) -> anyhow::Result<
             };
             // API가 듣기 시작했다(위트니스는 노드 간 서버).
             notifier.notify("READY=1");
+            #[cfg(feature = "starve-it")]
+            starve::set_cluster(member.cluster_weak());
             let mut cluster_name = read_cluster_name(&member);
             {
                 let mut s = status.lock().unwrap();

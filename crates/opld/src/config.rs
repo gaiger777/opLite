@@ -75,6 +75,10 @@ pub struct Config {
     pub remotes: RemotesSection,
     #[serde(default)]
     pub runtime: RuntimeSection,
+    /// 시험 빌드(`starve-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
+    #[cfg(feature = "starve-it")]
+    #[serde(default)]
+    pub test: TestSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -635,6 +639,23 @@ impl RuntimeSection {
 fn default_runtime_threads() -> usize {
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
     (cpus / 2).max(2)
+}
+
+/// 굶김 시험의 고리(설계 §3.4, 시험 빌드에만)
+#[cfg(feature = "starve-it")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestSection {
+    /// 제어 소켓의 `POST /v1/test/block-api`가 `api` 실행기의 작업자를 모두 막는 시간(밀리초)
+    #[serde(default)]
+    pub block_api_ms: u64,
+}
+
+#[cfg(feature = "starve-it")]
+impl TestSection {
+    pub fn block_api(&self) -> Duration {
+        Duration::from_millis(self.block_api_ms)
+    }
 }
 
 /// 감사 로그(`{data_dir}/audit/audit.log`). API를 여는 노드만 쓴다.
@@ -1432,6 +1453,17 @@ mod tests {
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[runtime]\ncore_threads = 4")
                 .is_err()
         );
+    }
+
+    /// `[test]`는 시험 빌드에만 있다.
+    #[test]
+    fn the_test_section_exists_only_in_starve_builds() {
+        let parsed =
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[test]\nblock_api_ms = 15000");
+        #[cfg(feature = "starve-it")]
+        assert_eq!(parsed.unwrap().test.block_api(), Duration::from_secs(15));
+        #[cfg(not(feature = "starve-it"))]
+        assert!(parsed.is_err());
     }
 
     #[test]
