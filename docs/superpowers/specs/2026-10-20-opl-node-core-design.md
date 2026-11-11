@@ -57,6 +57,8 @@ opLite는 Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼
 
 구현: 하위 프로젝트 13은 라이브 마이그레이션·노드 유지보수 설계가 넣지 않은 것으로 남긴 "디스크까지 복사하는 마이그레이션"을 채운다. 계획 42(로컬 디스크 라이브 마이그레이션: 노드 로컬 풀의 디스크를 대상 노드의 같은 이름의 풀이나 요청의 `pool`에 같은 볼륨 id로 새로 만들고(블록 풀이면 raw) 멈춘 받는 QEMU가 TLS NBD로 내보내며, 원본 QEMU가 `blockdev-mirror`로 복사하고 모두 따라잡으면 `pause-before-switchover`의 `pre-switchover`에서 미러를 끝낸 뒤 메모리 스위치오버, 확정 뒤 `apply_disk_moves`로 볼륨 기록(풀·형식·노드)을 고치고 원본 볼륨을 지움, 노드마다 `{data_dir}/migration-disks` 기록 파일로 실패·중단 뒤 남은 사본 정리, 공간·크기·이미 있음 확인, `[migration] disk_timeout`과 10분 정체, Task 진행률 `TaskStatus.progress`, 비트맵을 함께 옮김(qcow2 → raw면 지움), 스냅샷이 있으면 409, 새 노드 기능 `storage-migration`, 노드 비우기가 로컬 디스크 VM도 옮김; `oplctl vm migrate --pool`과 진행 줄, 웹 대화상자의 복사할 디스크·대상 풀·진행률, README, 실제 QEMU 두 노드 시험, 완료)로 했다(`2026-11-10-storage-migration-design.md`). 하위 프로젝트 13은 끝났다. 꺼진 VM의 디스크 옮기기, 한 노드 안의 디스크 옮기기, 디스크마다 다른 대상 풀, 스냅샷 복사, 마이그레이션 취소는 넣지 않았다.
 
+메모(계획 43): 제품 이름이 opLite에서 Orbivisor로 바뀌었다(`2026-11-10-rename-orbivisor-design.md`). 패키지는 `orbivisor`, 바이너리는 `orbivisord`·`orbivisorctl`(옛 이름 `opld`·`oplctl`은 패키지의 링크)이다. 이 문서와 지난 설계·계획 문서의 opLite·opld·oplctl은 고쳐 쓰지 않는다: opld·oplctl은 지금도 크레이트 이름이고, 유닛 `opld.service`·`/etc/opl/opld.toml`·`/var/lib/opl` 같은 내부 이름도 그대로다.
+
 ### 1.2 검토했지만 채택하지 않은 대안
 
 - **중앙 관리 서버 + 경량 에이전트 (vCenter 방식):** 관리 서버 자체의 HA를 따로 풀어야 하고 설치 단계가 늘어난다. 이 복잡함이 VMware를 떠나는 이유 중 하나다.
