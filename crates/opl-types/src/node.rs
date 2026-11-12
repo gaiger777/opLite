@@ -120,6 +120,7 @@ pub const FEATURES: &[&str] = &[
     "shared-sessions",
     "vip",
     "lease-liveness",
+    "voter-limit",
 ];
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
@@ -396,7 +397,8 @@ mod tests {
                 "node-roles",
                 "shared-sessions",
                 "vip",
-                "lease-liveness"
+                "lease-liveness",
+                "voter-limit"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

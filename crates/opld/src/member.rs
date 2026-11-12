@@ -2,7 +2,7 @@
 //! 노드 감시, 예약 스냅샷, 클러스터 정리, HA 복구, 노드별 풀 상태, 사용량 지표, VXLAN 장치, VM 방화벽, APT
 //! 업데이트. 위트니스는 노드 간 서버와 클러스터 저장소, 승격, Node 등록만 띄운다.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,7 +19,10 @@ use opl_api::{
     UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
-use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
+use opl_cluster::{
+    CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Members, Typed, VoterKeeper,
+    VoterKeeperConfig, leader_manages_voters,
+};
 use opl_driver::{
     DirStorage, Hypervisor, IpVip, LvmSharedStorage, LvmThinStorage, QemuHypervisor, RbdStorage,
     Storage, Storages, SystemLvm, SystemRbd, SystemZfs, VipRecord, ZfsStorage, migration_tls_dir,
@@ -130,6 +133,8 @@ struct Services {
     reconciler: Reconciler,
     runner: TaskRunner,
     monitor: NodeMonitor,
+    /// 리더가 투표 멤버를 상한(클러스터 설정 `voters`)에 맞춘다.
+    voter_keeper: VoterKeeper,
     schedule: SnapshotScheduler,
     janitor: ClusterJanitor,
     /// 리더가 백업 작업을 실행한다.
@@ -178,6 +183,7 @@ impl Services {
             api_cert.shutdown().await;
         }
         self.monitor.shutdown().await;
+        self.voter_keeper.shutdown().await;
         self.schedule.shutdown().await;
         self.janitor.shutdown().await;
         self.backups.shutdown().await;
@@ -401,7 +407,9 @@ impl Member {
                 }
                 Bootstrap::Join { via } => {
                     tls.save(&pki_dir(config))?;
-                    promote(&cluster, &peers, Some(&via)).await?;
+                    if !leader_picks_voters_after_join(&cluster).await {
+                        promote(&cluster, &peers, Some(&via)).await?;
+                    }
                     bootstrap::register_node(&cluster, config, &host).await?;
                 }
             }
@@ -456,7 +464,9 @@ impl Member {
         };
 
         // 다시 시작한 노드는 과반수가 없어도 VM을 계속 다스려야 하므로, Node 리소스는 뒤에서 기록한다.
-        let promotion = on(&rt.core, || spawn_promotion(first_time, &cluster, &peers));
+        let promotion = on(&rt.core, || {
+            spawn_promotion(first_time, false, &cluster, &peers)
+        });
         let raft_watch = on(&rt.core, || watch_raft(&cluster, exited_tx.clone()));
         // 풀 마운터가 QEMU의 rbd 블록 드라이버를 확인한다.
         let qemu_binary = host.profile.qemu_binary.clone();
@@ -574,6 +584,9 @@ impl Member {
         let monitor = on(&rt.core, || {
             NodeMonitor::spawn(cluster.clone(), peers, NodeMonitorConfig::default())
         });
+        let voter_keeper = on(&rt.core, || {
+            VoterKeeper::spawn(cluster.clone(), VoterKeeperConfig::default())
+        });
         let updates = on(&rt.work, || {
             updates.map(|u| UpdateAgent::spawn(cluster.clone(), node, u))
         });
@@ -648,6 +661,7 @@ impl Member {
                 reconciler,
                 runner,
                 monitor,
+                voter_keeper,
                 schedule,
                 janitor,
                 backups,
@@ -718,7 +732,9 @@ impl Member {
             let _ = cluster.shutdown().await;
             return Err(e);
         }
-        let promotion = on(&rt.core, || spawn_promotion(first_time, &cluster, &peers));
+        let promotion = on(&rt.core, || {
+            spawn_promotion(first_time, true, &cluster, &peers)
+        });
         let raft_watch = on(&rt.core, || watch_raft(&cluster, exited_tx));
         // 위트니스는 HA 펜싱이 없으므로 생존 표시로만 리스를 갱신한다.
         let liveness = on(&rt.core, || renew_liveness(cluster.clone(), LIVENESS_RENEW));
@@ -900,13 +916,77 @@ fn watch_raft(cluster: &Cluster, exited: mpsc::Sender<String>) -> JoinHandle<()>
     })
 }
 
-/// 다시 시작한 노드는 투표 멤버가 될 때까지 승격을 다시 요청한다. 처음 멤버가 된 노드는 이미 했다.
-fn spawn_promotion(first_time: bool, cluster: &Arc<Cluster>, peers: &Arc<Peers>) -> JoinHandle<()> {
+/// 다시 시작한 노드는 투표 멤버가 될 때까지 승격을 다시 요청한다(리더가 투표 멤버를 고르면 위트니스만).
+/// 처음 멤버가 된 노드는 이미 했다.
+fn spawn_promotion(
+    first_time: bool,
+    witness: bool,
+    cluster: &Arc<Cluster>,
+    peers: &Arc<Peers>,
+) -> JoinHandle<()> {
     if first_time {
         return tokio::spawn(async {});
     }
     let (cluster, peers) = (cluster.clone(), peers.clone());
-    tokio::spawn(async move { promote_until_voter(&cluster, &peers).await })
+    tokio::spawn(async move { promote_until_voter(&cluster, &peers, witness).await })
+}
+
+/// 리더의 `VoterKeeper`가 투표 멤버를 고르는지(이 노드의 저장소로 본다). 그러면 위트니스가 아닌 노드는 승격을
+/// 요청하지 않고 learner로 기다린다. 옛 노드가 남았으면 지금처럼 스스로 승격을 요청한다(옛 리더에는
+/// `VoterKeeper`가 없다).
+fn leader_picks_voters(cluster: &Cluster) -> bool {
+    let Ok((_, nodes)) = cluster.list::<NodeSpec>() else {
+        return false;
+    };
+    picks_voters(cluster.id(), &cluster.members(), nodes)
+}
+
+/// 이 노드(`me`) 말고 다른 멤버가 있고, 키퍼와 같은 규칙([`leader_manages_voters`])으로 막는 멤버가 없다. 노드는
+/// 리더의 리스 표를 모르므로 이 임기에 갱신한 멤버가 없다고 본다: 키퍼보다 덜 막지 않아, 키퍼가 움직이는데 이
+/// 노드가 스스로 승격하는 일(승격·강등 반복)은 없다.
+fn picks_voters(me: NodeId, members: &Members, nodes: Vec<Typed<NodeSpec>>) -> bool {
+    let voters: BTreeSet<NodeId> = members.voters.keys().copied().collect();
+    let others: Vec<NodeId> = members
+        .voters
+        .keys()
+        .chain(members.learners.keys())
+        .copied()
+        .filter(|id| *id != me)
+        .collect();
+    let nodes = nodes.into_iter().map(|n| (NodeId(n.id), n)).collect();
+    !others.is_empty() && leader_manages_voters(others, &voters, &nodes, &BTreeMap::new())
+}
+
+/// 합류한 노드가 승격을 요청하지 않아도 되는지. 이 노드를 더한 멤버십까지 저장소에 적용되기를(앞서 합류한
+/// 노드들의 Node 리소스가 보이기를) 잠시 기다린 뒤 [`leader_picks_voters`]로 본다. 기다리다 말면 지금처럼
+/// 요청한다(상한을 넘으면 리더가 다시 내린다).
+async fn leader_picks_voters_after_join(cluster: &Cluster) -> bool {
+    let id = cluster.id();
+    let applied = cluster
+        .raft()
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |m| membership_applied(m, id),
+            "this node's membership applied",
+        )
+        .await
+        .is_ok();
+    let picks = applied && leader_picks_voters(cluster);
+    if picks {
+        tracing::info!(
+            "the leader picks the voting members; staying a learner until it promotes this node"
+        );
+    }
+    picks
+}
+
+/// 멤버십에 `id`가 있고 그 멤버십까지 저장소에 적용했다(그 전에 더한 노드들의 Node 리소스가 보인다).
+fn membership_applied(m: &openraft::RaftMetrics<NodeId, BasicNode>, id: NodeId) -> bool {
+    m.membership_config
+        .membership()
+        .nodes()
+        .any(|(n, _)| *n == id)
+        && m.last_applied.map(|l| l.index) >= m.membership_config.log_id().map(|l| l.index)
 }
 
 /// 클러스터 저장소(Raft 로그와 상태)를 지운다. 없으면 그대로 성공한다.
@@ -919,21 +999,18 @@ pub fn remove_cluster_data(config: &Config) -> std::io::Result<()> {
 }
 
 /// 합류하다 투표 멤버가 되기 전에 멈춘 노드는 learner로 남아 있다. 다시 시작하면 투표 멤버가 될
-/// 때까지, 또는 클러스터에서 빠진 것을 알 때까지 승격을 다시 요청한다.
-async fn promote_until_voter(cluster: &Cluster, peers: &Peers) {
+/// 때까지, 또는 클러스터에서 빠진 것을 알 때까지 승격을 다시 요청한다. 리더가 투표 멤버를 고르면
+/// ([`leader_picks_voters`]) 위트니스가 아닌 노드는 요청하지 않고 learner로 남는다.
+async fn promote_until_voter(cluster: &Cluster, peers: &Peers, witness: bool) {
     let id = cluster.id();
-    // 저장한 멤버십이 지표에 반영되기를 기다린다. 합류 직후 죽었으면 리더가 보내 줄 때까지 모른다.
+    // 저장한 멤버십이 지표에 반영되고 저장소에 적용되기를 기다린다. 합류 직후 죽었으면 리더가 보내 줄 때까지
+    // 모른다(적용해야 다른 노드의 Node 리소스로 리더가 투표 멤버를 고르는지 안다).
     while cluster
         .raft()
         .wait(Some(Duration::from_secs(10)))
         .metrics(
-            |m| {
-                m.membership_config
-                    .membership()
-                    .nodes()
-                    .any(|(n, _)| *n == id)
-            },
-            "this node is in the membership",
+            |m| membership_applied(m, id),
+            "this node's membership applied",
         )
         .await
         .is_err()
@@ -954,6 +1031,13 @@ async fn promote_until_voter(cluster: &Cluster, peers: &Peers) {
         }
         if !members.learners.contains_key(&id) {
             tracing::info!("this node was removed from the cluster; not asking to be promoted");
+            return;
+        }
+        // 위트니스는 늘 투표 멤버라 스스로 요청한다.
+        if !witness && leader_picks_voters(cluster) {
+            tracing::info!(
+                "the leader picks the voting members; staying a learner until it promotes this node"
+            );
             return;
         }
         tracing::info!("this node is not a voting member yet; asking to be promoted");
@@ -1154,6 +1238,50 @@ mod tests {
             assert!(e.to_string().starts_with("Raft stopped: "), "{e}");
             let _ = member.close(true).await;
         });
+    }
+
+    /// 가입·재시작한 노드가 스스로 승격을 요청할지는 키퍼와 같은 규칙이다: 합류하자마자 죽어 등록하지 못한
+    /// learner(기능·버전 없는 Node 기록이나 Node 기록 없음)가 있어도 리더가 고른다고 본다(키퍼가 움직이는데 이
+    /// 노드가 스스로 올라가면 키퍼가 다시 내려 반복한다). 기능을 모르는 투표 멤버·옛 노드가 있으면 스스로 요청한다.
+    #[test]
+    fn a_joining_node_follows_the_keepers_rule() {
+        let id = |n: u128| NodeId(Uuid::from_u128(n));
+        let node = |n: u128, features: &[&str], version: Option<&str>| {
+            let mut node: Typed<NodeSpec> = Resource::new(
+                format!("n{n}"),
+                NodeSpec {
+                    address: format!("h{n}:8006"),
+                    maintenance: false,
+                    witness: false,
+                    roles: None,
+                },
+            );
+            node.id = id(n).0;
+            node.status.features = features.iter().map(|f| f.to_string()).collect();
+            node.status.version = version.map(str::to_string);
+            node
+        };
+        let members = |voters: &[u128], learners: &[u128]| Members {
+            leader: Some(id(1)),
+            voters: voters.iter().map(|n| (id(*n), String::new())).collect(),
+            learners: learners.iter().map(|n| (id(*n), String::new())).collect(),
+        };
+        let limit = opl_cluster::VOTER_LIMIT;
+        let ok = || node(1, &[limit], Some("0.3.0"));
+        // 나(4)와 등록 못 한 learner(5: 기능·버전 없음, 6: Node 기록 없음)
+        let nodes = vec![ok(), node(2, &[limit], None), node(5, &[], None)];
+        assert!(picks_voters(
+            id(4),
+            &members(&[1, 2], &[4, 5, 6]),
+            nodes.clone()
+        ));
+        // 옛 learner(버전이 있다)는 막는다.
+        let old = vec![ok(), node(2, &[limit], None), node(5, &[], Some("0.2.0"))];
+        assert!(!picks_voters(id(4), &members(&[1, 2], &[4, 5]), old));
+        // 기능을 모르는 투표 멤버는 등록하지 않았어도 막는다.
+        assert!(!picks_voters(id(4), &members(&[1, 2, 5], &[4]), nodes));
+        // 혼자면 스스로 요청한다.
+        assert!(!picks_voters(id(4), &members(&[], &[4]), vec![]));
     }
 
     #[test]

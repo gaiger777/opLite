@@ -38,6 +38,27 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub api_names: Vec<String>,
+    /// 투표 멤버 상한: 3, 5, 7 가운데 하나. 없으면 5이고, 쓰지 않아 옛 노드도 설정을 계속 푼다. 위트니스도
+    /// 센다. 노드가 이보다 적으면 모두 투표 멤버다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(nullable = false, default, minimum = 3, maximum = 7)
+    )]
+    pub voters: Option<u8>,
+}
+
+/// 투표 멤버 상한의 기본값
+pub const DEFAULT_VOTERS: u8 = 5;
+/// 고를 수 있는 투표 멤버 상한(홀수라 표가 갈리지 않는다)
+pub const VOTER_LIMITS: [u8; 3] = [3, 5, 7];
+
+impl SettingsSpec {
+    /// 투표 멤버 상한. 없거나 고를 수 없는 값이면 기본값이다.
+    pub fn voter_limit(&self) -> usize {
+        let n = self.voters.filter(|n| VOTER_LIMITS.contains(n));
+        usize::from(n.unwrap_or(DEFAULT_VOTERS))
+    }
 }
 
 impl ResourceSpec for SettingsSpec {
@@ -173,6 +194,7 @@ mod tests {
             telemetry: TelemetrySettings::default(),
             web_origins: vec![],
             api_names: vec![],
+            voters: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -228,6 +250,31 @@ mod tests {
                 .get("api_names")
                 .is_none()
         );
+    }
+
+    /// 투표 멤버 상한도 없으면 쓰지 않고, 없거나 고를 수 없는 값이면 5다.
+    #[test]
+    fn voters_are_written_only_when_set() {
+        assert_eq!(SettingsSpec::default().voter_limit(), 5);
+        let spec = SettingsSpec {
+            voters: Some(3),
+            ..SettingsSpec::default()
+        };
+        assert_eq!(spec.voter_limit(), 3);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["voters"], 3);
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+        assert!(
+            serde_json::to_value(SettingsSpec::default())
+                .unwrap()
+                .get("voters")
+                .is_none()
+        );
+        let odd = SettingsSpec {
+            voters: Some(4),
+            ..SettingsSpec::default()
+        };
+        assert_eq!(odd.voter_limit(), 5);
     }
 
     /// 텔레메트리도 기본값(꺼짐, 끝점 없음, 상태 없음)이면 계획 32 모양 그대로 쓴다.

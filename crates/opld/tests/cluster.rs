@@ -24,6 +24,11 @@ async fn voters(d: &Daemon) -> usize {
         .count()
 }
 
+/// 합류한 노드는 learner로 시작하고 리더의 `VoterKeeper`가 올린다. 투표 멤버가 `n`이 되기를 기다린다.
+async fn wait_voters(d: &Daemon, n: usize) {
+    eventually(&format!("{n} voters"), || async { voters(d).await == n }).await;
+}
+
 #[tokio::test]
 async fn three_processes_form_a_cluster_that_survives_losing_a_node() {
     let mut nodes = vec![
@@ -51,7 +56,7 @@ async fn three_processes_form_a_cluster_that_survives_losing_a_node() {
     for d in &nodes[1..] {
         d.login_with(&password, &fp).await;
     }
-    assert_eq!(voters(&nodes[0]).await, 3);
+    wait_voters(&nodes[0], 3).await;
     eventually("all nodes online", || async {
         members(&nodes[0]).await.iter().all(|m| m["online"] == true)
     })
@@ -133,7 +138,7 @@ async fn three_processes_form_a_cluster_that_survives_losing_a_node() {
     assert!(!nodes[b].data_dir().join("pki").exists());
     let url = nodes[a].ctl(&["cluster", "join-token"]).await.unwrap();
     nodes[b].join(url.trim()).await.unwrap();
-    assert_eq!(voters(&nodes[a]).await, 2);
+    wait_voters(&nodes[a], 2).await;
     // 다시 합류한 노드도 그동안의 기록을 받는다.
     nodes[b].login_with(&password, &fp).await;
     nodes[b].ctl(&["pool", "get", "after"]).await.unwrap();
@@ -189,7 +194,7 @@ async fn a_witness_votes_but_never_leads_or_runs_vms() {
     assert!(std::net::TcpStream::connect(("127.0.0.1", w.port)).is_err());
 
     // 투표 멤버 셋 중 하나가 위트니스다. 일반 노드가 둘이니 경고가 없다.
-    assert_eq!(voters(&nodes[0]).await, 3);
+    wait_voters(&nodes[0], 3).await;
     eventually("all members online", || async {
         members(&nodes[0]).await.iter().all(|m| m["online"] == true)
     })

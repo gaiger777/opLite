@@ -175,7 +175,24 @@ pub(crate) async fn execute(
             } else {
                 return Ok(m.last_applied.map_or(0, |l| l.index));
             };
-            retry_in_progress(timeout, || raft.change_membership(change.clone(), false)).await
+            let deadline = tokio::time::Instant::now() + timeout;
+            let index =
+                retry_in_progress(timeout, || raft.change_membership(change.clone(), false))
+                    .await?;
+            // 두 단계 변경의 두 번째 단계보다 VoterKeeper가 joint를 먼저 마무리했으면(learner로 남긴다) 두 번째
+            // 단계는 할 일이 없어 이 노드가 learner로 남는다. 다시 읽어 지운다.
+            let m = raft.metrics().borrow().clone();
+            if !m
+                .membership_config
+                .membership()
+                .learner_ids()
+                .any(|v| v == id)
+            {
+                return Ok(index);
+            }
+            let change = ChangeMembers::RemoveNodes(BTreeSet::from([id]));
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            retry_in_progress(remaining, || raft.change_membership(change.clone(), false)).await
         }
     }
 }

@@ -9,7 +9,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::{
-    Channel, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus, TelemetrySettings,
+    Channel, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus, TelemetrySettings, VOTER_LIMITS,
 };
 use opl_types::subscription::SubscriptionState;
 use opl_types::version::TELEMETRY_URL;
@@ -57,6 +57,11 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub api_names: Option<Vec<String>>,
+    /// 투표 멤버 상한: 3, 5, 7 가운데 하나(위트니스도 센다). 리더가 learner를 올리거나 투표 멤버를 learner로 내려
+    /// 맞춘다.
+    #[serde(default)]
+    #[schema(nullable = false, default, minimum = 3, maximum = 7)]
+    pub voters: Option<u8>,
 }
 
 /// API 이름은 이만큼까지 둔다.
@@ -266,10 +271,18 @@ pub async fn patch_settings(
         && req.telemetry.is_none()
         && req.web_origins.is_none()
         && req.api_names.is_none()
+        && req.voters.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins or api_names",
+            "give updates, telemetry, web_origins, api_names or voters",
         ));
+    }
+    if let Some(n) = req.voters
+        && !VOTER_LIMITS.contains(&n)
+    {
+        return Err(ApiError::bad_request(format!(
+            "voters must be 3, 5 or 7 (got {n})"
+        )));
     }
     let origins = req.web_origins.as_deref().map(web_origins).transpose()?;
     let names = req.api_names.as_deref().map(api_names).transpose()?;
@@ -281,9 +294,10 @@ pub async fn patch_settings(
     crate::cluster::require_upgraded(&state.cluster)?;
     let channel = req.updates.and_then(|u| u.channel);
     let enterprise = channel == Some(Channel::Enterprise);
-    // 옛 노드는 enterprise 채널과 텔레메트리·허용 출처·API 이름 필드를 풀지 못한다.
+    // 옛 노드는 enterprise 채널과 텔레메트리·허용 출처·API 이름·투표 멤버 상한 필드를 풀지 못한다.
     if enterprise
         || req.telemetry.is_some()
+        || req.voters.is_some()
         || origins.as_ref().is_some_and(|o| !o.is_empty())
         || names.as_ref().is_some_and(|n| !n.is_empty())
     {
@@ -316,6 +330,9 @@ pub async fn patch_settings(
         }
         if let Some(names) = &names {
             spec.api_names = names.clone();
+        }
+        if let Some(n) = req.voters {
+            spec.voters = Some(n);
         }
         Ok(())
     })

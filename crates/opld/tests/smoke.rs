@@ -273,7 +273,8 @@ async fn a_node_killed_right_after_joining_becomes_a_voter_when_restarted() {
         .iter()
         .any(|m| m["voter"] == false);
 
-    // 다시 띄우면 멤버로 뜨고, 승격을 다시 요청해 투표 멤버가 된다.
+    // 다시 띄우면 멤버로 뜨고 투표 멤버가 된다. 모든 노드가 `voter-limit`를 알므로 스스로 요청하지 않고
+    // 리더의 `VoterKeeper`가 올린다.
     d2.start().await;
     common::eventually("node2 to become a voter", || async {
         let view = d1.ctl_json(&["cluster", "status"]).await;
@@ -282,7 +283,11 @@ async fn a_node_killed_right_after_joining_becomes_a_voter_when_restarted() {
     })
     .await;
     if was_learner {
-        assert!(d2.log().contains("asking to be promoted"), "{}", d2.log());
+        assert!(
+            d2.log().contains("the leader picks the voting members"),
+            "{}",
+            d2.log()
+        );
     }
     d2.stop();
 }

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use opl_cluster::types::{NodeId, Rejection};
-use opl_cluster::{Cluster, ClusterError};
+use opl_cluster::{Cluster, ClusterError, ZONE_LABEL};
 use opl_peer::pki::ClusterCa;
 use opl_types::auth::{Role, UserSpec};
 use opl_types::cluster::ClusterSpec;
@@ -96,10 +96,13 @@ pub fn check_role(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
     }
 }
 
-/// 이 노드의 Node 리소스가 없으면 만들고(역할은 설정의 `witness`), 있으면 주소만 맞춘다.
+/// 이 노드의 Node 리소스가 없으면 만들고(역할은 설정의 `witness`), 있으면 주소와 zone 레이블(`[node] zone`이
+/// 있을 때만)을 맞춘다.
 async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
     let NodeId(id) = cluster.id();
     let address = config.api_address();
+    // 앞뒤 공백은 잘라 적는다(`" rack-a"`와 `"rack-a"`를 다른 zone으로 보지 않게).
+    let zone = config.node.zone.as_deref().map(str::trim);
     match cluster.get::<NodeSpec>(id)? {
         None => {
             let mut node = Resource::new(
@@ -112,14 +115,26 @@ async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
                 },
             );
             node.id = id;
+            if let Some(zone) = zone {
+                node.labels.insert(ZONE_LABEL.into(), zone.to_string());
+            }
             cluster.create(&node).await?;
         }
-        Some(node) if node.spec.address != address => {
+        Some(node)
+            if node.spec.address != address
+                || zone.is_some_and(|z| {
+                    node.labels.get(ZONE_LABEL).map(String::as_str) != Some(z)
+                }) =>
+        {
+            let mut labels = node.labels;
+            if let Some(zone) = zone {
+                labels.insert(ZONE_LABEL.into(), zone.to_string());
+            }
             let spec = NodeSpec {
                 address,
                 ..node.spec
             };
-            cluster.update_spec(id, None, node.labels, &spec).await?;
+            cluster.update_spec(id, None, labels, &spec).await?;
         }
         Some(_) => {}
     }
@@ -430,6 +445,38 @@ pub(crate) mod tests {
         cluster.shutdown().await.unwrap();
     }
 
+    /// `[node] zone`을 노드 레이블 `zone`으로 적는다. 다른 레이블은 그대로 두고, zone이 없으면 레이블을
+    /// 건드리지 않는다(API로 둔 zone).
+    #[tokio::test]
+    async fn registration_records_the_zone_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let mut config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        let labels = || cluster.get::<NodeSpec>(id.0).unwrap().unwrap().labels;
+        config.node.zone = Some("rack-a".into());
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(labels().get("zone").map(String::as_str), Some("rack-a"));
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        let mut other = node.labels.clone();
+        other.insert("owner".into(), "ops".into());
+        cluster
+            .update_spec(id.0, None, other, &node.spec)
+            .await
+            .unwrap();
+        // 앞뒤 공백은 잘라 적는다.
+        config.node.zone = Some(" rack-b ".into());
+        register_node(&cluster, &config, &host).await.unwrap();
+        let got = labels();
+        assert_eq!(got.get("zone").map(String::as_str), Some("rack-b"));
+        assert_eq!(got.get("owner").map(String::as_str), Some("ops"));
+        config.node.zone = None;
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(labels(), got);
+        cluster.shutdown().await.unwrap();
+    }
+
     /// 방화벽(nftables)이 있는지 기록하고, 다시 등록하면 그때의 값으로 바꾼다.
     #[tokio::test]
     async fn registration_records_the_firewall() {
@@ -494,7 +541,8 @@ pub(crate) mod tests {
                 "node-roles",
                 "shared-sessions",
                 "vip",
-                "lease-liveness"
+                "lease-liveness",
+                "voter-limit"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -517,7 +565,8 @@ pub(crate) mod tests {
                 "node-roles",
                 "shared-sessions",
                 "vip",
-                "lease-liveness"
+                "lease-liveness",
+                "voter-limit"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -556,7 +605,8 @@ pub(crate) mod tests {
                 "node-roles",
                 "shared-sessions",
                 "vip",
-                "lease-liveness"
+                "lease-liveness",
+                "voter-limit"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -633,6 +683,7 @@ pub(crate) mod tests {
                     "shared-sessions".into(),
                     "vip".into(),
                     "lease-liveness".into(),
+                    "voter-limit".into(),
                 ],
                 ..NodeStatus::default()
             }

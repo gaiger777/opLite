@@ -217,3 +217,34 @@ async fn settings_wait_until_every_node_is_upgraded() {
     let (status, got) = admin.patch("/settings", body, None).await;
     assert_eq!(status, StatusCode::OK, "{got}");
 }
+
+/// 투표 멤버 상한은 3·5·7만 받고, 준 값을 적는다(없으면 적지 않는다).
+#[tokio::test]
+async fn voters_are_three_five_or_seven() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    for bad in [json!(0), json!(4), json!(9), json!("5"), json!(-1)] {
+        let got = admin
+            .patch("/settings", json!({ "voters": bad }), None)
+            .await;
+        assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let (status, got) = admin.patch("/settings", json!({ "voters": 3 }), None).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["spec"]["voters"], 3);
+    let stored = env
+        .cluster
+        .get_by_name::<SettingsSpec>(SETTINGS_NAME)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.spec.voter_limit(), 3);
+    // 다른 키만 바꾸면 그대로다.
+    let (_, got) = admin
+        .patch(
+            "/settings",
+            json!({ "updates": { "channel": "testing" } }),
+            None,
+        )
+        .await;
+    assert_eq!(got["spec"]["voters"], 3);
+}

@@ -11,6 +11,7 @@ mod state_machine;
 pub mod store;
 pub mod types;
 mod vip;
+mod voters;
 pub mod watch;
 mod writer;
 
@@ -21,3 +22,4 @@ pub use lease::Leases;
 pub use log_store::LogStore;
 pub use state_machine::StateMachine;
 pub use vip::{VipLeases, VipRenewal};
+pub use voters::{VOTER_LIMIT, VoterKeeper, VoterKeeperConfig, ZONE_LABEL, leader_manages_voters};

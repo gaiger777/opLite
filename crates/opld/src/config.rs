@@ -83,6 +83,8 @@ pub struct Config {
     pub vip: VipSection,
     #[serde(default)]
     pub web: WebSection,
+    #[serde(default)]
+    pub node: NodeSection,
     /// 시험 빌드(`starve-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
     #[cfg(feature = "starve-it")]
     #[serde(default)]
@@ -694,6 +696,15 @@ fn default_web_enabled() -> bool {
     true
 }
 
+/// 이 노드에 대한 것
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSection {
+    /// 장애 영역(랙·전원·방 이름). 등록할 때 노드 레이블 `zone`으로 적고, 리더가 투표 멤버를 고를 때 서로 다른
+    /// zone을 먼저 고른다. 앞뒤 공백은 잘라 적는다. 없으면 레이블을 건드리지 않는다(API로 둔 레이블은 그대로).
+    pub zone: Option<String>,
+}
+
 /// 실행기 크기(설계 §3.1). `core` 실행기는 2로 고정이다.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1076,6 +1087,9 @@ impl Config {
             anyhow::bail!("network.underlay must not be an unspecified address (got {ip})");
         }
         self.validate_vip(linux)?;
+        if self.node.zone.as_ref().is_some_and(|z| z.trim().is_empty()) {
+            anyhow::bail!("node.zone must not be empty");
+        }
         // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
         if self.listen.port() == self.cluster_listen.port() {
             anyhow::bail!(
@@ -1648,6 +1662,21 @@ mod tests {
         std::fs::write(&path, "data_dir = 5").unwrap();
         assert!(Config::data_dir_of(&path).is_err());
         assert!(Config::data_dir_of(&dir.path().join("none")).is_err());
+    }
+
+    #[test]
+    fn node_zone() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.node.zone, None);
+        let c = parse("name = \"n\"\naddress = \"h\"\n[node]\nzone = \"rack-a\"");
+        assert_eq!(c.node.zone.as_deref(), Some("rack-a"));
+        c.validate().unwrap();
+        let c = parse("name = \"n\"\naddress = \"h\"\n[node]\nzone = \" \"");
+        assert!(c.validate().unwrap_err().to_string().contains("node.zone"));
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[node]\nrack = \"a\"")
+                .is_err()
+        );
     }
 
     #[test]

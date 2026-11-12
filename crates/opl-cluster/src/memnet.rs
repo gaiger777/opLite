@@ -28,6 +28,8 @@ struct Routes {
     isolated: HashSet<NodeId>,
     /// Raft RPC만 끊긴 노드. 리더 전달은 된다.
     raft_blocked: HashSet<NodeId>,
+    /// 보낸 Raft RPC는 닿지만 답을 받지 못하는 노드
+    replies_lost: HashSet<NodeId>,
 }
 
 /// 노드 등록부. 등록되지 않았거나 격리된 노드로 가는 RPC는 `Unreachable`이 된다.
@@ -75,10 +77,17 @@ impl MemRouter {
         self.routes.lock().unwrap().raft_blocked.insert(id);
     }
 
+    /// 그 노드가 보낸 Raft RPC는 상대가 처리하지만 답은 사라진다(리더가 보낸 항목을 팔로워는 받았는데 리더는
+    /// 커밋을 모른다).
+    pub fn lose_replies(&self, id: NodeId) {
+        self.routes.lock().unwrap().replies_lost.insert(id);
+    }
+
     pub fn heal(&self, id: NodeId) {
         let mut routes = self.routes.lock().unwrap();
         routes.isolated.remove(&id);
         routes.raft_blocked.remove(&id);
+        routes.replies_lost.remove(&id);
     }
 
     fn route(&self, from: NodeId, to: NodeId) -> Result<LeaderCtx, Unreachable> {
@@ -93,13 +102,18 @@ impl MemRouter {
             .ok_or_else(|| unreachable("not registered"))
     }
 
-    fn raft_route(&self, from: NodeId, to: NodeId) -> Result<Raft<TypeConfig>, Unreachable> {
+    /// 받는 노드의 Raft와, 답을 버려야 하는지
+    fn raft_route(
+        &self,
+        from: NodeId,
+        to: NodeId,
+    ) -> Result<(Raft<TypeConfig>, bool), Unreachable> {
         let ctx = self.route(from, to)?;
         let routes = self.routes.lock().unwrap();
         if routes.raft_blocked.contains(&from) || routes.raft_blocked.contains(&to) {
             return Err(unreachable("raft blocked"));
         }
-        Ok(ctx.raft)
+        Ok((ctx.raft, routes.replies_lost.contains(&from)))
     }
 }
 
@@ -160,10 +174,16 @@ impl RaftNetwork<TypeConfig> for MemConnection {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> RpcResult<AppendEntriesResponse<NodeId>> {
-        let raft = self.router.raft_route(self.from, self.target)?;
-        raft.append_entries(rpc)
+        let (raft, lost) = self.router.raft_route(self.from, self.target)?;
+        let result = raft
+            .append_entries(rpc)
             .await
-            .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+            .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)));
+        // 받은 쪽은 처리했지만 보낸 쪽은 답을 받지 못한다.
+        if lost {
+            return Err(unreachable("reply lost").into());
+        }
+        result
     }
 
     async fn install_snapshot(
@@ -171,10 +191,16 @@ impl RaftNetwork<TypeConfig> for MemConnection {
         rpc: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
     ) -> RpcResult<InstallSnapshotResponse<NodeId>, InstallSnapshotError> {
-        let raft = self.router.raft_route(self.from, self.target)?;
-        raft.install_snapshot(rpc)
+        let (raft, lost) = self.router.raft_route(self.from, self.target)?;
+        let result = raft
+            .install_snapshot(rpc)
             .await
-            .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+            .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)));
+        // 받은 쪽은 처리했지만 보낸 쪽은 답을 받지 못한다.
+        if lost {
+            return Err(unreachable("reply lost").into());
+        }
+        result
     }
 
     async fn vote(
@@ -182,9 +208,15 @@ impl RaftNetwork<TypeConfig> for MemConnection {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> RpcResult<VoteResponse<NodeId>> {
-        let raft = self.router.raft_route(self.from, self.target)?;
-        raft.vote(rpc)
+        let (raft, lost) = self.router.raft_route(self.from, self.target)?;
+        let result = raft
+            .vote(rpc)
             .await
-            .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+            .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)));
+        // 받은 쪽은 처리했지만 보낸 쪽은 답을 받지 못한다.
+        if lost {
+            return Err(unreachable("reply lost").into());
+        }
+        result
     }
 }

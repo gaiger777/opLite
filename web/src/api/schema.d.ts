@@ -4008,6 +4008,12 @@ export interface components {
                 telemetry?: components["schemas"]["TelemetrySettings"];
                 updates?: components["schemas"]["UpdateSettings"];
                 /**
+                 * Format: int32
+                 * @description 투표 멤버 상한: 3, 5, 7 가운데 하나. 없으면 5이고, 쓰지 않아 옛 노드도 설정을 계속 푼다. 위트니스도
+                 *     센다. 노드가 이보다 적으면 모두 투표 멤버다.
+                 */
+                voters?: number;
+                /**
                  * @description 쿠키 요청을 받는 다른 출처(`https://portal.example.com`). 따로 띄운 웹 포털이 API를 부를 때 쓴다.
                  *     비어 있으면 같은 출처만 받고, 쓰지 않아 옛 노드도 설정을 계속 푼다.
                  */
@@ -4361,6 +4367,12 @@ export interface components {
             telemetry?: components["schemas"]["TelemetryPatch"];
             updates?: components["schemas"]["UpdateSettingsPatch"];
             /**
+             * Format: int32
+             * @description 투표 멤버 상한: 3, 5, 7 가운데 하나(위트니스도 센다). 리더가 learner를 올리거나 투표 멤버를 learner로 내려
+             *     맞춘다.
+             */
+            voters?: number;
+            /**
              * @description 쿠키 요청을 받는 다른 출처(`https://portal.example.com`) 전체. `[]`는 지워 같은 출처만 받는다.
              *     `https://`만 받는다(개발용 `http://localhost`·`127.0.0.1`·`[::1]`은 예외).
              */
@@ -4375,6 +4387,12 @@ export interface components {
             /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
             telemetry?: components["schemas"]["TelemetrySettings"];
             updates?: components["schemas"]["UpdateSettings"];
+            /**
+             * Format: int32
+             * @description 투표 멤버 상한: 3, 5, 7 가운데 하나. 없으면 5이고, 쓰지 않아 옛 노드도 설정을 계속 푼다. 위트니스도
+             *     센다. 노드가 이보다 적으면 모두 투표 멤버다.
+             */
+            voters?: number;
             /**
              * @description 쿠키 요청을 받는 다른 출처(`https://portal.example.com`). 따로 띄운 웹 포털이 API를 부를 때 쓴다.
              *     비어 있으면 같은 출처만 받고, 쓰지 않아 옛 노드도 설정을 계속 푼다.

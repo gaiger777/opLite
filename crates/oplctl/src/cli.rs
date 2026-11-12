@@ -1724,17 +1724,18 @@ enum SettingsCmd {
     /// 설정을 `키: 값` 줄로 보인다.
     Get,
     /// 설정을 바꾼다. 키: `updates.channel`(stable|testing|enterprise), `web_origins`(쿠키 요청을 받는 다른
-    /// 출처, 쉼표로 여럿, 비우면 같은 출처만), `api_names`(노드 API 인증서에 더할 DNS 이름·IP, 쉼표로 여럿)
+    /// 출처, 쉼표로 여럿, 비우면 같은 출처만), `api_names`(노드 API 인증서에 더할 DNS 이름·IP, 쉼표로 여럿),
+    /// `voters`(투표 멤버 상한 3|5|7, 위트니스도 센다)
     Set {
         /// 예: `updates.channel=testing`, `web_origins=https://portal.example.com`,
-        /// `api_names=orbivisor.example.com,192.168.0.200`
+        /// `api_names=orbivisor.example.com,192.168.0.200`, `voters=3`
         #[arg(required = true, value_name = "KEY=VALUE")]
         values: Vec<String>,
     },
 }
 
 /// `settings set`이 아는 키
-const SETTING_KEYS: &[&str] = &["updates.channel", "web_origins", "api_names"];
+const SETTING_KEYS: &[&str] = &["updates.channel", "web_origins", "api_names", "voters"];
 
 /// `settings set`의 요청 본문(`PATCH /settings`). 준 키만 보낸다.
 fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
@@ -1752,6 +1753,13 @@ fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
                     .filter(|o| !o.is_empty())
                     .collect();
                 body[key] = json!(list);
+            }
+            "voters" => {
+                let n: u8 = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("voters must be 3, 5 or 7 (got {v:?})"))?;
+                body["voters"] = json!(n);
             }
             _ => bail!("unknown setting {key}; known: {}", SETTING_KEYS.join(", ")),
         }
@@ -3661,10 +3669,7 @@ where
             }
         }
         Cmd::Node { cmd } => match cmd {
-            NodeCmd::List => {
-                let list = client.get("/nodes").await?;
-                print_list(out, json_out, &list, NODE_HEADERS, node_row)?;
-            }
+            NodeCmd::List => node_list(&client, json_out, out).await?,
             NodeCmd::Get { node } => {
                 print_json(out, &client.get(&format!("/nodes/{}", seg(&node))).await?)?
             }
@@ -5520,12 +5525,31 @@ const NODE_HEADERS: &[&str] = &[
     "MEMORY",
     "MAINTENANCE",
     "WITNESS",
+    "VOTER",
     "ROLES",
     "FENCING",
 ];
 
-/// `node list`의 한 행
-fn node_row(n: &Value) -> Vec<String> {
+/// `node list`. 투표 멤버인지는 클러스터 멤버십(`GET /cluster`)에 있다. 그것을 읽지 못해도(과반 없음 등) 목록은
+/// 보이고 VOTER는 `-`다.
+async fn node_list(
+    client: &Client,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let list = client.get("/nodes").await?;
+    let cluster = if json_out {
+        Value::Null
+    } else {
+        client.get("/cluster").await.unwrap_or(Value::Null)
+    };
+    print_list(out, json_out, &list, NODE_HEADERS, |n| {
+        node_row(n, &cluster)
+    })
+}
+
+/// `node list`의 한 행. `cluster`는 `GET /cluster`의 답이다(투표 멤버인지).
+fn node_row(n: &Value, cluster: &Value) -> Vec<String> {
     vec![
         cell(&n["name"]),
         cell(&n["id"]),
@@ -5540,6 +5564,11 @@ fn node_row(n: &Value) -> Vec<String> {
         cell(&n["spec"]["maintenance"]),
         // 옛 서버는 보내지 않는다 — 일반 노드다.
         (n["spec"]["witness"] == true).to_string(),
+        // 멤버십에 없으면(빠지는 중) `-`다.
+        cluster["members"]
+            .as_array()
+            .and_then(|m| m.iter().find(|m| m["id"] == n["id"]))
+            .map_or_else(|| "-".into(), |m| (m["voter"] == true).to_string()),
         node_roles_cell(&n["spec"]),
         // 펜싱이 꺼진 노드(옛 서버도)는 `ha`가 없다.
         cell(&n["status"]["ha"]["fencing"]),
@@ -8211,9 +8240,15 @@ mod tests {
         a["status"]["version"] = json!("0.2.0");
         let mut none = node("none", Some(false));
         none["spec"]["roles"] = json!([]);
+        // a·w는 투표 멤버, old는 learner, none은 멤버십에 없다.
+        let cluster = json!({ "members": [
+            { "id": "id-a", "voter": true },
+            { "id": "id-w", "voter": true },
+            { "id": "id-old", "voter": false },
+        ] });
         let rows: Vec<_> = [a, node("w", Some(true)), node("old", None), none]
             .iter()
-            .map(node_row)
+            .map(|n| node_row(n, &cluster))
             .collect();
         let mut out = Vec::new();
         table(&mut out, NODE_HEADERS, &rows).unwrap();
@@ -8221,11 +8256,11 @@ mod tests {
         // underlay가 없는 노드(위트니스, 옛 서버)는 `-`다. 역할이 없으면 기본 역할(위트니스는 없음)이다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  ROLES  FENCING\n\
-             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    api    watchdog\n\
-             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     -      -\n\
-             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    api    -\n\
-             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -\n"
+            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  VOTER  ROLES  FENCING\n\
+             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    true   api    watchdog\n\
+             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     true   -      -\n\
+             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    false  api    -\n\
+             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -      -\n"
         );
     }
 
@@ -9605,6 +9640,37 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         assert!(err.to_string().contains("only for"), "{err}");
     }
 
+    /// `GET /cluster`가 실패해도 `node list`는 목록을 보이고 VOTER는 `-`다.
+    #[tokio::test]
+    async fn node_list_survives_a_failing_cluster_view() {
+        let (client, seen) = fake_api_status(|path| {
+            if path == "/api/v1/cluster" {
+                (503, json!({ "error": "no quorum" }))
+            } else {
+                (
+                    200,
+                    json!({ "items": [{
+                        "id": "id-a",
+                        "name": "a",
+                        "spec": { "address": "10.0.0.1:8006", "maintenance": false, "witness": false },
+                        "status": { "online": true, "cpus": 4, "memory_mib": 1024 },
+                    }] }),
+                )
+            }
+        })
+        .await;
+        let mut out = Vec::new();
+        node_list(&client, false, &mut out).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let row: Vec<&str> = text.lines().nth(1).unwrap().split_whitespace().collect();
+        let voter = NODE_HEADERS.iter().position(|h| *h == "VOTER").unwrap();
+        assert_eq!(row[voter], "-", "{text}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["GET /api/v1/nodes HTTP/1.1", "GET /api/v1/cluster HTTP/1.1"]
+        );
+    }
+
     /// 유지보수를 끄면 그 노드의 끝나지 않은 비우기가 멈춘다고 stderr에 알린다.
     #[tokio::test]
     async fn node_maintenance_off_warns_about_a_running_drain() {
@@ -9811,10 +9877,16 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             settings_set_body(&["api_names=orbivisor.example.com, 192.168.0.200".into()]).unwrap(),
             json!({ "api_names": ["orbivisor.example.com", "192.168.0.200"] })
         );
+        assert_eq!(
+            settings_set_body(&["voters=3".into()]).unwrap(),
+            json!({ "voters": 3 })
+        );
+        let err = settings_set_body(&["voters=five".into()]).unwrap_err();
+        assert_eq!(err.to_string(), "voters must be 3, 5 or 7 (got \"five\")");
         let err = settings_set_body(&["updates.mirror=x".into()]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names"
+            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters"
         );
         let err = settings_set_body(&["updates.channel".into()]).unwrap_err();
         assert_eq!(
