@@ -57048,3 +57048,30 @@ git commit -m "feat(opld): 내장 VIP·UI 따로 내보내기·문서 — [vip],
 - 다른 호스트의 포털에서 OIDC 로그인 뒤에는 API 호스트로 돌아간다.
 - 헬스의 적용 지연은 추정이라 리더보다 뒤처진 노드를 늘 잡지는 못한다.
 - `[api] tls_cert`는 시작 때만 읽는다(갱신 뒤 재시작).
+
+## 실행 후 기록 (2026-11-12)
+
+- **Task 1~5:** `feat/plan46-health-vip-proxy`에서 스크립트로 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았고(생성 파일 포함), 다섯 Task를 마친 트리는 리뷰·검증·CI 프로브를 거친 트리와 같다(이 계획 문서와 설계 §13 배포 결과 칸만 다름).
+- **1차 리뷰에서 고친 것:**
+  - (치명) `VipHolder` 쓰기에 기능 확인이 없어 롤링 업그레이드 중 옛 노드가 로그를 읽지 못해 클러스터의 Raft 쓰기가 멈출 수 있었다 → 노드 기능 `vip`.
+  - 남은 VIP: `{data_dir}/vips` 기록, 시작 때 정리, `orbivisord --release-vips`와 유닛 `ExecStopPost`. 늦게 깬 에이전트는 갱신보다 먼저 뗀다. ARP 3번.
+  - 세션: 사용자마다 32개, 다른 노드의 메모리 세션 로그아웃("로그아웃 표시").
+  - API 인증서를 노드 신원과 떼기(ServerAuth만, CN `orbivisor-api`), 관리자 인증서 `[api] tls_cert`·`tls_key`, README에 클러스터 CA를 브라우저에 넣지 말 것.
+  - 헬스 `?live`는 늘 200, 로그인 없는 헬스는 `{status, failed}`만, 로그아웃 출처 검사, 교차 사이트 쓰기 `Sec-Fetch-Site` 검사, `web_origins`는 https만(localhost 예외), 문서.
+- **2차 리뷰에서 고친 것:** `web_origins`를 두면 `orbivisorctl login`이 깨지던 것(브라우저 헤더가 있을 때만 거절), 로그아웃 표시 남용(IP별 제한, 상한 2,000), `orbivisorctl login --system-ca`, `--release-vips`는 데이터 디렉터리 잠금을 쥔 데몬이 있으면 아무것도 안 함, 밖에서 지워진 VIP를 5번에 한 번 다시 붙임, 내려놓을 때 ARP 멈춤, 없는 인터페이스 기록 정리, `ExecStopPost`에 `--config`.
+- **스테이지 3에서 고친 가용성 회귀:** 세션 공유로 정족수가 없으면 로그인이 안 되던 것을 그 노드의 메모리 세션으로 물러나게 했다.
+- **CI·검증 중 고친 시험(제품 코드는 그대로):** `ip -j`가 주소 없는 인터페이스에서 `addr_info`를 빼는 것, 웹 UI를 넣은 빌드의 UI 끄기 시험, VIP 실제 프로세스 시험이 다시 띤 노드가 따라잡기 전에 다른 노드를 죽여 리더가 없던 것(헬스 200까지 기다림), 두 노드 마이그레이션 되돌리기 시험이 B의 복제본이 따라잡기 전에 B의 실행기를 다시 시작하던 것.
+- **테스트 VM 배포(svc01·svc02):** 릴리스 빌드를 한 대씩 설치했다. 유닛 `ExecStopPost` 적용, 헬스(로그인 없는 짧은 응답, `roles none`이면 503, `?live` 200), `api-endpoints -o haproxy`, 세션 공유(한 노드 로그인 → 다른 노드 API, 다른 노드 로그아웃 → 두 노드 401), `api_names`(2초 안에 재시작 없이 SAN 반영, 비우면 원래대로), `cluster ca`, 스레드·저널. svc02의 test-vm QEMU PID 그대로. 내장 VIP는 LAN 주소 충돌을 피해 테스트 VM에서 하지 않았다(Linux CI `net-it`가 확인).
+
+**테스트:**
+- macOS `cargo test --workspace` 1796개(스테이지별 1730·1744·1760·1770·1796), 웹 시험 572개와 typecheck·lint
+- `ha-it`, `fmt`·`clippy -D warnings`(모든 기능), 패키징 셸 시험(`build-deb-test`·`portal-test`·`name-test`)과 shellcheck
+
+Linux CI(프로브)에서 같은 시험과 VIP `net-it`(dummy 인터페이스로 붙이기·떼기, 두 노드에서 한 노드만 갖기·옮겨 가기·kill -9 뒤 정리), linux-kvm·ldap·package·shell 작업.
+
+## 다음 계획으로 넘길 사항
+
+- 테스트 VM에서 실제 HAProxy·keepalived·내장 VIP 확인(설계 §13 표의 "아직" 칸). VIP는 LAN에서 비어 있는 주소를 정해 해야 한다.
+- 프로브에서 한 번씩 실패하고 다시 돌리면 통과한 시험 둘을 조사한다: `two_nodes.rs`의 `a_vm_coming_back_replaces_the_copy_left_on_its_old_node`("VM is not running"), `opld/tests/snapshots.rs`의 실행 중 스냅샷(QMP `query-jobs`가 작업이 끝난 뒤 응답하지 않음 — 실제 QEMU 문제일 수 있음).
+- 정족수가 돌아오면 메모리 세션을 Raft로 옮기기, 이름 제한이 있는 중간 CA, `tls_cert` 다시 읽기.
+- 다음: 계획 47(대규모 1 — 투표 멤버 상한, 장애 영역, 리스 확인 묶기, 리스로 노드 감시, 모으기 동시성 상한, 규모 시험). VIP 갱신의 `confirm_leader`도 함께 묶는다.

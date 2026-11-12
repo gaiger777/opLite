@@ -674,8 +674,8 @@ VM에서 손으로 확인하고 결과를 적는다.
 
 | 확인 | 결과 |
 |---|---|
-| 내장 VIP: 주인 노드의 전원을 끈 뒤 다른 노드가 VIP를 갖기까지(`ping -i 0.2 <VIP>`가 끊긴 시간, 3~4초 기대) | 아직 |
+| 내장 VIP: 주인 노드의 전원을 끈 뒤 다른 노드가 VIP를 갖기까지(`ping -i 0.2 <VIP>`가 끊긴 시간, 3~4초 기대) | 아직: 테스트 VM은 실제 LAN이라 주소 충돌을 피해 하지 않음. Linux CI `net-it`(dummy 인터페이스)에서 kill -9 뒤 첫 노드로 돌아오기까지 7.5~8.9초(재선출 포함) |
 | 내장 VIP: `systemctl stop opld` 뒤 옮겨 가기까지, 주인의 cluster_listen을 막았을 때 주인이 스스로 떼는지(`ip addr`) | 아직 |
 | 내장 VIP: 이웃(다른 호스트)의 ARP 캐시가 새 주인의 MAC으로 바뀌는지(`ip neigh`, `arping` 있음·없음) | 아직 |
-| HAProxy: `option httpchk GET /api/v1/health`로 유지보수·`roles none` 노드가 DOWN이 되고(약 `inter × fall`) 돌아오면 UP | 아직 |
-| HAProxy 뒤에서 로그인·콘솔(WebSocket)·노드 하나를 끈 뒤에도 세션이 이어지는지, 감사 로그의 요청 주소가 클라이언트 주소인지 | 아직 |
+| HAProxy: `option httpchk GET /api/v1/health`로 유지보수·`roles none` 노드가 DOWN이 되고(약 `inter × fall`) 돌아오면 UP | 일부(2026-11-12, 테스트 VM): HAProxy 없이 `curl`로 헬스가 로그인 없이 `{status, failed}` 200, `roles none`이면 503 `failed: ["role"]`(`?live`는 200), `default`로 돌리면 200. `cluster api-endpoints -o haproxy` 출력 확인. 실제 HAProxy는 아직 |
+| HAProxy 뒤에서 로그인·콘솔(WebSocket)·노드 하나를 끈 뒤에도 세션이 이어지는지, 감사 로그의 요청 주소가 클라이언트 주소인지 | 일부(테스트 VM): svc01에서 로그인한 쿠키로 svc02 API 200, svc02에서 로그아웃하면 두 노드 모두 401. `api_names`를 넣으면 2초 안에 재시작 없이 두 노드가 그 SAN(CN `orbivisor-api`)으로, 비우면 원래 인증서로. HAProxy·콘솔·감사 주소는 아직 |
