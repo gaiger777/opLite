@@ -454,6 +454,7 @@ mod tests {
                 address: "h:1".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         n.status = NodeStatus {

@@ -639,6 +639,7 @@ mod tests {
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         let mut pool = StoragePool::new("p", nfs("nas", "/srv/vm", None));
@@ -807,6 +808,7 @@ mod tests {
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         // 디렉터리 풀과 달리 상태를 알리기 전에는 쓸 수 없다.
@@ -935,6 +937,7 @@ mod tests {
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         assert!(!pool_usable_on(&pool, &node));
@@ -1085,6 +1088,7 @@ mod tests {
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         // 디렉터리 풀과 달리 준비됐다는 상태가 있어야 쓸 수 있다.
@@ -1247,6 +1251,7 @@ mod tests {
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         assert!(!pool_usable_on(&pool, &node));

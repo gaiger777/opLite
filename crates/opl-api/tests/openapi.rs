@@ -22,6 +22,8 @@ async fn openapi_document_is_served_without_login() {
         "/remotes/{key}",
         "/remotes/{key}/actions/refresh",
         "/version",
+        "/health",
+        "/cluster/api-endpoints",
         "/settings",
         "/subscription",
         "/telemetry/preview",
@@ -194,6 +196,18 @@ async fn openapi_document_is_served_without_login() {
         None => body,
     };
     assert_eq!(schema["format"], "binary", "{body}");
+    // 헬스 체크는 인증 없이 부르고 503도 같은 모양이다.
+    let health = &doc["paths"]["/health"]["get"];
+    assert_eq!(health["security"], serde_json::json!([{}]));
+    assert_eq!(
+        health["responses"]["503"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/Health"
+    );
+    // 로그인하지 않으면 `status`·`failed`만 오므로 나머지는 선택 필드다.
+    assert_eq!(
+        doc["components"]["schemas"]["Health"]["required"],
+        serde_json::json!(["status", "failed"])
+    );
     // 로그인은 인증 없이 부른다.
     assert_eq!(
         doc["paths"]["/auth/login"]["post"]["security"],

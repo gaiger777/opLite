@@ -368,6 +368,7 @@ async fn volume_tasks_go_to_the_lowest_ready_node(backend: Value) {
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     low.id = Uuid::nil();
@@ -428,6 +429,7 @@ async fn volume_tasks_never_go_to_a_witness() {
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     witness.id = Uuid::nil();
@@ -524,6 +526,7 @@ async fn other_node(env: &Env, name: &str, online: bool, pools: &[&str]) -> Uuid
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     node.status.online = online;

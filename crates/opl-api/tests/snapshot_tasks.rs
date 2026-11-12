@@ -1310,6 +1310,7 @@ async fn block_tags_of_pending_backups_are_kept_at_startup() {
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     n2.status.online = true;
@@ -1454,6 +1455,7 @@ async fn shared_block_pool_tags_are_removed_by_one_usable_node_at_startup() {
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     low.id = Uuid::nil();

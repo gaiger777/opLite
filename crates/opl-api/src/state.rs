@@ -5,10 +5,12 @@ use std::time::Duration;
 use opl_cluster::Cluster;
 use opl_driver::Hypervisor;
 use opl_peer::{MetricsSource, Peers};
+use opl_reconciler::HaGuard;
 use uuid::Uuid;
 
 use crate::audit::AuditLog;
 use crate::auth::{Authorizer, RoleAuthorizer, Sessions};
+use crate::health::RuntimeProbe;
 use crate::limit::AttemptLimiter;
 use crate::oidc::OidcCache;
 use crate::vm_imports::ImportCredentials;
@@ -47,6 +49,10 @@ pub struct AppState {
     pub(crate) receiving_files: std::sync::Mutex<std::collections::HashSet<(Uuid, String)>>,
     /// 받는 백업 사본 파일의 본문 조각을 기다리는 시간(기본 60초). 넘으면 그 업로드를 끊는다.
     pub receive_idle_timeout: Duration,
+    /// 이 노드의 HA 리스(펜싱이 꺼졌으면 없다). 헬스 체크가 본다.
+    pub ha: Option<Arc<HaGuard>>,
+    /// 실행기 확인(opld의 `Liveness`). 없으면 헬스 체크가 실행기를 보지 않는다.
+    pub runtimes: Option<Arc<dyn RuntimeProbe>>,
 }
 
 impl AppState {
@@ -74,6 +80,8 @@ impl AppState {
             oidc: OidcCache::default(),
             receiving_files: Default::default(),
             receive_idle_timeout: Duration::from_secs(60),
+            ha: None,
+            runtimes: None,
         }
     }
 }

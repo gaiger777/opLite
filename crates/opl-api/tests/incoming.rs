@@ -46,6 +46,7 @@ async fn setup() -> Setup {
             address: "127.0.0.2:0".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     env.cluster.create(&source).await.unwrap();

@@ -116,6 +116,7 @@ async fn add_node(env: &Env, name: &str, witness: bool) {
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness,
+            roles: None,
         },
     );
     env.cluster.create(&r).await.unwrap();

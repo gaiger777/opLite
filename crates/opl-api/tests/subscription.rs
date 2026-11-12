@@ -55,6 +55,7 @@ async fn add_node(env: &Env, name: &str, witness: bool, version: Option<&str>) {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness,
+            roles: None,
         },
     );
     node.status.version = version.map(Into::into);

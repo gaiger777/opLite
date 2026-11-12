@@ -291,6 +291,7 @@ async fn two_nodes_with(
                 address: node.base.clone(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         r.id = node.id;
@@ -1465,6 +1466,11 @@ async fn restarting_the_source_while_copying_rolls_the_migration_back() {
     assert!(a.storage.has_file(volume));
     assert!(a.storage.deleted().is_empty());
 
+    // B의 정리는 B의 복제본을 읽는다: 되돌림이 B에 복제된 뒤 다시 시작한다(아니면 다음 정리는 30분 뒤).
+    wait_vm(&b, vm.id, "rolled back on B", |v| {
+        v.status.migration.is_none()
+    })
+    .await;
     b.stop_runner().await;
     b.start_runner().await;
     until("copy deleted on B", || !b.storage.has_file(volume)).await;

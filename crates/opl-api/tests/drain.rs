@@ -29,6 +29,7 @@ async fn add_node(env: &Env, name: &str, edit: impl FnOnce(&mut Node)) -> Uuid {
             address: "127.0.0.2:0".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     node.status = NodeStatus {

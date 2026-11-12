@@ -123,6 +123,7 @@ async fn other_node(env: &Env, name: &str) -> Uuid {
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     node.status.online = true;
@@ -726,6 +727,7 @@ async fn receive_waits_for_every_node_to_run_this_build() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     node.status.version = Some("0.0.1~old".into());

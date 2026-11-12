@@ -294,6 +294,7 @@ async fn a_node_older_than_the_cluster_is_refused() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     witness.status.version = Some("1.1.0".into());

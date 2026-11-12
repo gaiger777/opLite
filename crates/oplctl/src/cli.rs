@@ -39,6 +39,8 @@ struct Cli {
 enum Output {
     Table,
     Json,
+    /// HAProxy `server` 줄(`cluster api-endpoints`만)
+    Haproxy,
 }
 
 #[derive(Subcommand)]
@@ -186,6 +188,8 @@ enum ClusterCmd {
     },
     /// 클러스터 이름, CA 지문, 멤버
     Status,
+    /// 앞단(로드 밸런서)이 부를 API 노드(`api` 역할)의 이름·주소·zone. `-o haproxy`면 HAProxy `server` 줄
+    ApiEndpoints,
     /// 새 노드를 더할 조인 URL을 만든다. 한 번만 쓸 수 있다.
     JoinToken {
         /// 유효 시간(초)
@@ -227,6 +231,13 @@ enum NodeCmd {
         node: String,
         state: Switch,
     },
+    /// 노드의 역할을 바꾼다. `api`(앞단이 부르는 API 노드), `none`(역할 없음), `default`(기본: 위트니스가
+    /// 아니면 `api`). API 노드가 아니면 헬스 체크(`GET /api/v1/health`)가 503이다.
+    Roles {
+        node: String,
+        /// `api`, `none`, `default`
+        roles: String,
+    },
     /// 노드를 유지보수로 바꾸고 실행 중인 VM을 하나씩 다른 노드로 라이브 마이그레이션한다. 로컬 풀
     /// 디스크 VM은 옮기지 못한다.
     Drain {
@@ -265,22 +276,7 @@ async fn node_maintenance(
     out: &mut (dyn Write + Send),
     err: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let path = format!("/nodes/{}", seg(node));
-    let mut retries = SpecRetries::default();
-    let id = loop {
-        let current = client.get(&path).await?;
-        let r = client
-            .request(Method::PUT, &path)
-            .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
-            .json(&spec_update(&current, "maintenance", json!(on)));
-        match client.send(r).await {
-            Err(e) => match retries.next(&e.to_string()) {
-                Some(delay) => tokio::time::sleep(delay).await,
-                None => return Err(e),
-            },
-            Ok(_) => break cell(&current["id"]),
-        }
-    };
+    let id = put_node_spec(client, node, "maintenance", json!(on)).await?;
     let state = if on { "on" } else { "off" };
     writeln!(out, "node {node}: maintenance {state}")?;
     if !on {
@@ -305,6 +301,55 @@ async fn node_maintenance(
             )?;
         }
     }
+    Ok(())
+}
+
+/// 노드를 읽어 라벨과 spec은 그대로 두고 spec 필드 `field`만 바꿔 그 revision으로(`If-Match`) 다시 쓴다.
+/// 읽은 뒤 status만 바뀌어도 revision이 달라지므로 `revision_mismatch`면 다시 한다. 노드 id를 돌려준다.
+async fn put_node_spec(
+    client: &Client,
+    node: &str,
+    field: &str,
+    value: Value,
+) -> anyhow::Result<String> {
+    let path = format!("/nodes/{}", seg(node));
+    let mut retries = SpecRetries::default();
+    loop {
+        let current = client.get(&path).await?;
+        let r = client
+            .request(Method::PUT, &path)
+            .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
+            .json(&spec_update(&current, field, value.clone()));
+        match client.send(r).await {
+            Err(e) => match retries.next(&e.to_string()) {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => return Err(e),
+            },
+            Ok(_) => return Ok(cell(&current["id"])),
+        }
+    }
+}
+
+/// `node roles`의 인자를 spec의 `roles` 값으로: `default`는 null(기본 역할), `none`은 빈 목록, `api`는 `["api"]`
+fn roles_value(roles: &str) -> anyhow::Result<Value> {
+    match roles {
+        "default" => Ok(Value::Null),
+        "none" => Ok(json!([])),
+        "api" => Ok(json!(["api"])),
+        other => bail!("unknown roles {other:?}: use api, none or default"),
+    }
+}
+
+/// `node roles`: 노드의 `roles`만 바꾼다.
+async fn node_roles(
+    client: &Client,
+    node: &str,
+    roles: &str,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let value = roles_value(roles)?;
+    put_node_spec(client, node, "roles", value).await?;
+    writeln!(out, "node {node}: roles {roles}")?;
     Ok(())
 }
 
@@ -3517,6 +3562,16 @@ where
     T: Into<OsString> + Clone,
 {
     let cli = Cli::try_parse_from(args)?;
+    if cli.output == Output::Haproxy
+        && !matches!(
+            cli.cmd,
+            Cmd::Cluster {
+                cmd: ClusterCmd::ApiEndpoints
+            }
+        )
+    {
+        bail!("-o haproxy is only for `orbivisorctl cluster api-endpoints`");
+    }
     let config_path = cli.config.clone().unwrap_or_else(default_path);
     let mut config = CliConfig::load(&config_path)?;
     let server = cli.server.clone().or(config.server.clone());
@@ -3566,7 +3621,7 @@ where
     let json_out = cli.output == Output::Json;
     match cli.cmd {
         Cmd::Login(_) => unreachable!(),
-        Cmd::Cluster { cmd } => cluster(&client, cmd, json_out, out).await?,
+        Cmd::Cluster { cmd } => cluster(&client, cmd, cli.output, out).await?,
         Cmd::Logout => {
             // login이 만든 토큰(`oplctl-…`)만 서버에서 지운다. 이미 지워진 토큰이어도 로컬에서는 지운다.
             let kept = match config.token.as_deref().and_then(token_id) {
@@ -3605,6 +3660,7 @@ where
                 )
                 .await?
             }
+            NodeCmd::Roles { node, roles } => node_roles(&client, &node, &roles, out).await?,
             NodeCmd::Drain { node, wait } => node_drain(&client, &node, wait, out).await?,
             NodeCmd::Stats(stats) => {
                 node_stats(&client, stats.watch, json_out, out, &mut std::io::stderr()).await?
@@ -4720,13 +4776,34 @@ async fn cluster_local(
     }
 }
 
+/// HAProxy가 노드 인증서를 확인할 클러스터 CA 파일(`GET /api/v1/cluster/ca`로 받는다)
+const HAPROXY_CA_FILE: &str = "/etc/haproxy/orbivisor-ca.pem";
+
+/// `cluster api-endpoints -o haproxy`: API 노드마다 HAProxy `server` 줄(TLS로 다시 암호화하고 클러스터 CA로
+/// 확인, 헬스 체크는 backend의 `option httpchk GET /api/v1/health`)
+fn haproxy_servers(list: &Value) -> Vec<String> {
+    list["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            format!(
+                "server {} {} check ssl verify required ca-file {HAPROXY_CA_FILE}",
+                cell(&e["name"]),
+                cell(&e["address"])
+            )
+        })
+        .collect()
+}
+
 /// 로그인한 서버의 API로 보내는 클러스터 명령
 async fn cluster(
     client: &Client,
     cmd: ClusterCmd,
-    json_out: bool,
+    output: Output,
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
+    let json_out = output == Output::Json;
     match cmd {
         ClusterCmd::Init { .. } | ClusterCmd::Join { .. } | ClusterCmd::Leave { .. } => {
             unreachable!("handled by cluster_local")
@@ -4738,6 +4815,18 @@ async fn cluster(
                 return Ok(());
             }
             print_cluster_status(out, &view)?;
+        }
+        ClusterCmd::ApiEndpoints => {
+            let list = client.get("/cluster/api-endpoints").await?;
+            if output == Output::Haproxy {
+                for line in haproxy_servers(&list) {
+                    writeln!(out, "{line}")?;
+                }
+            } else {
+                print_list(out, json_out, &list, &["NAME", "ADDRESS", "ZONE"], |e| {
+                    vec![cell(&e["name"]), cell(&e["address"]), cell(&e["zone"])]
+                })?;
+            }
         }
         ClusterCmd::JoinToken { ttl } => {
             let created = client
@@ -5399,6 +5488,7 @@ const NODE_HEADERS: &[&str] = &[
     "MEMORY",
     "MAINTENANCE",
     "WITNESS",
+    "ROLES",
     "FENCING",
 ];
 
@@ -5418,9 +5508,24 @@ fn node_row(n: &Value) -> Vec<String> {
         cell(&n["spec"]["maintenance"]),
         // 옛 서버는 보내지 않는다 — 일반 노드다.
         (n["spec"]["witness"] == true).to_string(),
+        node_roles_cell(&n["spec"]),
         // 펜싱이 꺼진 노드(옛 서버도)는 `ha`가 없다.
         cell(&n["status"]["ha"]["fencing"]),
     ]
+}
+
+/// 노드의 역할(쉼표로). `roles`가 없으면 기본(위트니스가 아니면 `api`)이고, 없으면 `-`다.
+fn node_roles_cell(spec: &Value) -> String {
+    let roles: Vec<String> = match spec["roles"].as_array() {
+        Some(roles) => roles.iter().map(cell).collect(),
+        None if spec["witness"] == true => Vec::new(),
+        None => vec!["api".into()],
+    };
+    if roles.is_empty() {
+        "-".into()
+    } else {
+        roles.join(",")
+    }
 }
 
 /// `network list`의 열
@@ -8066,20 +8171,23 @@ mod tests {
         a["status"]["ha"] = json!({ "fencing": "watchdog", "recover_after_secs": 65 });
         a["status"]["underlay"] = json!("10.0.0.1");
         a["status"]["version"] = json!("0.2.0");
-        let rows: Vec<_> = [a, node("w", Some(true)), node("old", None)]
+        let mut none = node("none", Some(false));
+        none["spec"]["roles"] = json!([]);
+        let rows: Vec<_> = [a, node("w", Some(true)), node("old", None), none]
             .iter()
             .map(node_row)
             .collect();
         let mut out = Vec::new();
         table(&mut out, NODE_HEADERS, &rows).unwrap();
         // 옛 서버는 witness를 보내지 않는다 — 일반 노드다. 펜싱이 꺼진 노드는 `ha`가 없다.
-        // underlay가 없는 노드(위트니스, 옛 서버)는 `-`다.
+        // underlay가 없는 노드(위트니스, 옛 서버)는 `-`다. 역할이 없으면 기본 역할(위트니스는 없음)이다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME  ID      ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  FENCING\n\
-             a     id-a    10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    watchdog\n\
-             w     id-w    10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     -\n\
-             old   id-old  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -\n"
+            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  ROLES  FENCING\n\
+             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    api    watchdog\n\
+             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     -      -\n\
+             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    api    -\n\
+             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -\n"
         );
     }
 
@@ -9326,6 +9434,109 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         assert_eq!(seen[1].body["spec"]["maintenance"], false);
         // 끄면 그 노드의 비우기 Task를 찾아본다(없으면 경고하지 않는다).
         assert_eq!(seen[2].line, "GET /api/v1/tasks HTTP/1.1");
+    }
+
+    /// `node roles`는 api·none·default만 받고, 노드의 spec에서 `roles`만 바꿔(default는 null) 다시 쓴다.
+    #[tokio::test]
+    async fn node_roles_puts_the_spec() {
+        assert!(roles_value("observer").is_err());
+        let (base, seen) = fake_api_bodies(|_| {
+            json!({
+                "name": "n1",
+                "revision": 3,
+                "spec": { "address": "10.0.0.1:7443", "maintenance": false, "witness": false },
+                "status": { "online": true }
+            })
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        for (arg, want) in [
+            ("none", json!([])),
+            ("api", json!(["api"])),
+            ("default", Value::Null),
+        ] {
+            seen.lock().unwrap().clear();
+            let Cmd::Node {
+                cmd: NodeCmd::Roles { node, roles },
+            } = Cli::try_parse_from(["oplctl", "node", "roles", "n1", arg])
+                .unwrap()
+                .cmd
+            else {
+                unreachable!()
+            };
+            let mut out = Vec::new();
+            node_roles(&client, &node, &roles, &mut out).await.unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("node n1: roles {arg}\n")
+            );
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[1].line, "PUT /api/v1/nodes/n1 HTTP/1.1");
+            assert_eq!(seen[1].if_match.as_deref(), Some("3"));
+            assert_eq!(
+                seen[1].body,
+                json!({
+                    "labels": {},
+                    "spec": {
+                        "address": "10.0.0.1:7443", "maintenance": false, "witness": false,
+                        "roles": want
+                    }
+                }),
+                "{arg}"
+            );
+        }
+        let err = node_roles(&client, "n1", "web", &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("use api, none or default"),
+            "{err}"
+        );
+    }
+
+    /// `cluster api-endpoints`는 표, JSON, HAProxy `server` 줄로 찍는다. `-o haproxy`는 이 명령에만 쓴다.
+    #[tokio::test]
+    async fn api_endpoints_print_a_table_json_or_haproxy_servers() {
+        let (client, seen) = fake_api(|_| {
+            json!({ "items": [
+                { "name": "n1", "address": "10.0.0.1:8006", "zone": "rack-a" },
+                { "name": "n2", "address": "[fd00::2]:8006", "zone": null },
+            ] })
+        })
+        .await;
+        let print = |output: Output| {
+            let client = client.clone();
+            async move {
+                let mut out = Vec::new();
+                cluster(&client, ClusterCmd::ApiEndpoints, output, &mut out)
+                    .await
+                    .unwrap();
+                String::from_utf8(out).unwrap()
+            }
+        };
+        assert_eq!(
+            print(Output::Table).await,
+            "NAME  ADDRESS         ZONE\n\
+             n1    10.0.0.1:8006   rack-a\n\
+             n2    [fd00::2]:8006  -\n"
+        );
+        let json: Value = serde_json::from_str(&print(Output::Json).await).unwrap();
+        assert_eq!(json[1]["address"], "[fd00::2]:8006");
+        assert_eq!(
+            print(Output::Haproxy).await,
+            "server n1 10.0.0.1:8006 check ssl verify required ca-file /etc/haproxy/orbivisor-ca.pem\n\
+             server n2 [fd00::2]:8006 check ssl verify required ca-file /etc/haproxy/orbivisor-ca.pem\n"
+        );
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|l| l == "GET /api/v1/cluster/api-endpoints HTTP/1.1")
+        );
+        let err = run(["oplctl", "-o", "haproxy", "node", "list"], &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("only for"), "{err}");
     }
 
     /// 유지보수를 끄면 그 노드의 끝나지 않은 비우기가 멈춘다고 stderr에 알린다.

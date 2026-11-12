@@ -10,7 +10,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError, Typed};
 use opl_types::backup_job::{BackupJobSpec, BackupJobStatus};
 use opl_types::network::{Network, NetworkSpec, NetworkStatus, USER_NETWORK};
-use opl_types::node::{Node, NodeSpec, NodeStatus};
+use opl_types::node::{Node, NodeRole, NodeSpec, NodeStatus};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::security_group::{SecurityGroupSpec, SecurityGroupStatus};
 use opl_types::storage::{
@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
 use crate::backups::check_no_backups;
+use crate::cluster::require_feature;
 use crate::error::{ApiError, Json};
 use crate::state::AppState;
 
@@ -521,8 +522,9 @@ pub async fn delete_network(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 노드의 주소와 유지보수 모드를 바꾼다. 노드 리소스는 orbivisord가 시작할 때 스스로 만든다.
-/// 역할(`witness`)은 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다.
+/// 노드의 주소, 유지보수 모드, 역할(`roles`)을 바꾼다. 노드 리소스는 orbivisord가 시작할 때 스스로 만든다.
+/// 위트니스 여부(`witness`)는 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다. 위트니스는 API가
+/// 없으므로 `api` 역할을 줄 수 없다. `roles`를 적으려면 모든 노드가 그 필드를 알아야 한다(`node-roles`).
 #[utoipa::path(put, path = "/nodes/{key}", tag = "nodes",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<NodeSpec>,
@@ -536,10 +538,21 @@ pub async fn update_node(
 ) -> Result<Json<Node>, ApiError> {
     state.authorize(&principal, Action::Write, NodeSpec::KIND)?;
     let node = lookup::<NodeSpec>(&state.cluster, &key)?;
-    let spec = NodeSpec {
+    let mut spec = NodeSpec {
         witness: node.spec.witness,
         ..req.spec
     };
+    if let Some(roles) = &mut spec.roles {
+        roles.sort();
+        roles.dedup();
+        if spec.witness && roles.contains(&NodeRole::Api) {
+            return Err(ApiError::bad_request(
+                "a witness has no API; it cannot have the api role",
+            ));
+        }
+        // 옛 노드는 `roles`가 든 Node를 풀지 못한다.
+        require_feature(&state.cluster, "node-roles")?;
+    }
     state
         .cluster
         .update_spec(node.id, if_match(&headers)?, req.labels, &spec)

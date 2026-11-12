@@ -44,6 +44,7 @@ async fn other_node(env: &Env, name: &str, online: bool) -> Uuid {
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     env.cluster.create(&node).await.unwrap();

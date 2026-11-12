@@ -67,6 +67,7 @@ async fn node_with(
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     node.status = NodeStatus {

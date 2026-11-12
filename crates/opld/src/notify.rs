@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use opl_api::RuntimeProbe;
+
 use crate::runtime::Handles;
 
 /// 실행기 확인 간격(`WATCHDOG_USEC`이 없을 때)
@@ -96,7 +98,17 @@ pub struct Liveness {
     stop: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
     /// 마지막 회차에 늦은 실행기
-    slow: Arc<Mutex<Vec<&'static str>>>,
+    slow: LastCheck,
+}
+
+/// 마지막 확인 회차에 늦은 실행기. 헬스 체크(`opl_api::health`)가 읽는다.
+#[derive(Clone, Default)]
+pub struct LastCheck(Arc<Mutex<Vec<&'static str>>>);
+
+impl RuntimeProbe for LastCheck {
+    fn slow(&self) -> Vec<&'static str> {
+        self.0.lock().unwrap().clone()
+    }
 }
 
 impl Liveness {
@@ -109,14 +121,14 @@ impl Liveness {
 
     fn start(rt: Handles, notifier: Notifier, interval: Duration, deadline: Duration) -> Self {
         let (stop, rx) = mpsc::channel();
-        let last = Arc::new(Mutex::new(Vec::new()));
+        let last = LastCheck::default();
         let slow_out = last.clone();
         let thread = std::thread::Builder::new()
             .name("orbivisor-notify".into())
             .spawn(move || {
                 loop {
                     let slow = check(&rt, deadline);
-                    *last.lock().unwrap() = slow.clone();
+                    *last.0.lock().unwrap() = slow.clone();
                     if slow.iter().all(|name| *name == "work") {
                         notifier.notify("WATCHDOG=1");
                     }
@@ -144,9 +156,14 @@ impl Liveness {
         }
     }
 
-    /// 마지막 회차에 마감 안에 답하지 않은 실행기(`core`·`api`·`work`). 계획 46의 헬스가 읽는다.
+    /// 마지막 회차에 마감 안에 답하지 않은 실행기(`core`·`api`·`work`)
     pub fn slow(&self) -> Vec<&'static str> {
-        self.slow.lock().unwrap().clone()
+        self.slow.slow()
+    }
+
+    /// 마지막 회차의 결과를 읽는 핸들. 헬스 체크에 넘긴다.
+    pub fn last_check(&self) -> LastCheck {
+        self.slow.clone()
     }
 }
 

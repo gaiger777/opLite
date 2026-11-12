@@ -2,6 +2,7 @@
 
 mod cluster;
 mod exclusive;
+mod health;
 mod leader;
 mod lease;
 mod log_store;
@@ -13,6 +14,7 @@ pub mod watch;
 mod writer;
 
 pub use cluster::{Cluster, ClusterConfig, ClusterError, DB_FILE, Members, Typed};
+pub use health::{QUORUM_ACK_MAX, RaftHealth};
 pub use leader::{CATCH_UP_TIMEOUT, Forwarder, LeaderError};
 pub use lease::Leases;
 pub use log_store::LogStore;

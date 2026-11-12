@@ -334,6 +334,7 @@ async fn oidc_realms_need_admins_and_nodes_that_run_this_build() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     node.status.version = Some("0.0.1~old".into());
@@ -761,6 +762,7 @@ async fn realms_wait_until_every_node_runs_this_build() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     node.status.version = Some("0.0.1~old".into());

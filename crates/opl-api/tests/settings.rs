@@ -192,6 +192,7 @@ async fn settings_wait_until_every_node_is_upgraded() {
                 address: "10.0.0.9:8006".into(),
                 maintenance: false,
                 witness: true,
+                roles: None,
             },
         );
         env.cluster.create(&old).await.unwrap();

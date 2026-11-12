@@ -559,6 +559,7 @@ async fn nfs_disk_on_a_node_without_nfs_powers_off() {
             address: "a".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     me.id = env.node;
@@ -625,6 +626,7 @@ async fn unavailable_pool_is_retried_without_powering_off() {
             address: "a".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     me.id = env.node;

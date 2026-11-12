@@ -134,6 +134,7 @@ impl Env {
                 address: "127.0.0.1:0".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         me.id = node;

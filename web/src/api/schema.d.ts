@@ -381,6 +381,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/cluster/api-endpoints": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `api` 역할 노드(기본: 위트니스가 아닌 노드)의 API 주소. 앞단은 이 노드들을 부르고
+         *     `GET /health`로 준비되지 않은 노드를 뺀다.
+         */
+        get: operations["list_api_endpoints"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cluster/ca": {
         parameters: {
             query?: never;
@@ -425,6 +445,26 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["create_join_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 이 노드의 헬스. 인증 없이 읽는다. `?live`는 언제나 200, 기본(`?ready`)은 실패한 확인이 있으면 503이다.
+         *     로그인하지 않았으면 `status`·`failed`만 답한다.
+         */
+        get: operations["get_health"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -513,8 +553,9 @@ export interface paths {
         };
         get: operations["get_node"];
         /**
-         * 노드의 주소와 유지보수 모드를 바꾼다. 노드 리소스는 orbivisord가 시작할 때 스스로 만든다.
-         *     역할(`witness`)은 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다.
+         * 노드의 주소, 유지보수 모드, 역할(`roles`)을 바꾼다. 노드 리소스는 orbivisord가 시작할 때 스스로 만든다.
+         *     위트니스 여부(`witness`)는 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다. 위트니스는 API가
+         *     없으므로 `api` 역할을 줄 수 없다. `roles`를 적으려면 모든 노드가 그 필드를 알아야 한다(`node-roles`).
          */
         put: operations["update_node"];
         post?: never;
@@ -1541,6 +1582,19 @@ export interface components {
     schemas: {
         /** @enum {string} */
         Action: "accept" | "drop";
+        /** @description 앞단(로드 밸런서)이 부를 API 노드 하나 */
+        ApiEndpoint: {
+            /** @description API 주소(`host:port`) */
+            address: string;
+            /** @description Node 리소스 이름 */
+            name: string;
+            /** @description 장애 영역(노드 레이블 `zone`). 없으면 null이다. */
+            zone?: string | null;
+        };
+        ApiEndpoints: {
+            /** @description 이름 순 */
+            items: components["schemas"]["ApiEndpoint"][];
+        };
         /**
          * @description CPU 아키텍처. 노드가 등록할 때 기록하고, 머신 타입마다 하나로 정해진다.
          * @enum {string}
@@ -2136,6 +2190,44 @@ export interface components {
             role: components["schemas"]["Role"];
         };
         /**
+         * @description 헬스 체크 결과. 200과 503이 같은 모양이다. `status`·`failed` 밖의 필드는 로그인(세션·토큰)한 요청에만
+         *     있다.
+         */
+        Health: {
+            /** @description `api` 역할 노드인지 */
+            api?: boolean | null;
+            /**
+             * Format: int64
+             * @description 이 노드 로그의 엔트리를 적용하지 못한 채 지난 시간(밀리초)
+             */
+            apply_lag_ms?: number | null;
+            /** @description 실패한 확인. `?live`면 언제나 비어 있다. */
+            failed: components["schemas"]["HealthCheck"][];
+            /**
+             * Format: uuid
+             * @description 이 노드가 아는 리더(모르면 없다)
+             */
+            leader?: string | null;
+            lease?: components["schemas"]["LeaseHealth"] | null;
+            maintenance?: boolean | null;
+            /**
+             * Format: uuid
+             * @description 이 노드의 id
+             */
+            node?: string | null;
+            /** @description 리더를 알고, 이 노드가 리더면 과반수가 최근 답했다. */
+            quorum?: boolean | null;
+            runtimes?: components["schemas"]["RuntimeHealth"] | null;
+            status: components["schemas"]["HealthStatus"];
+        };
+        /**
+         * @description 실패할 수 있는 확인 하나
+         * @enum {string}
+         */
+        HealthCheck: "quorum" | "apply_lag" | "lease" | "runtimes" | "maintenance" | "role";
+        /** @enum {string} */
+        HealthStatus: "ok" | "unavailable";
+        /**
          * Format: binary
          * @description 업로드 본문의 문서용 스키마: 바이너리 파일
          */
@@ -2337,6 +2429,11 @@ export interface components {
             url: string;
             user_filter: string;
         };
+        /**
+         * @description 이 노드의 HA 리스
+         * @enum {string}
+         */
+        LeaseHealth: "fresh" | "expired" | "none";
         /**
          * @description 구독 수준
          * @enum {string}
@@ -2580,6 +2677,11 @@ export interface components {
                     address: string;
                     /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
                     maintenance?: boolean;
+                    /**
+                     * @description 이 노드의 역할. 없으면 기본 역할(위트니스가 아니면 `api`)이다. 옛 노드는 이 필드를 모르므로 기본이면
+                     *     쓰지 않는다.
+                     */
+                    roles?: components["schemas"]["NodeRole"][];
                     /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
                     witness?: boolean;
                 };
@@ -3097,6 +3199,11 @@ export interface components {
             /** @description 지표를 모르는 옛 노드의 이름(정렬) */
             unsupported: string[];
         };
+        /**
+         * @description 노드의 역할
+         * @enum {string}
+         */
+        NodeRole: "api";
         /** @description 노드 점 하나 */
         NodeSample: {
             /**
@@ -3146,6 +3253,11 @@ export interface components {
             address: string;
             /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
             maintenance?: boolean;
+            /**
+             * @description 이 노드의 역할. 없으면 기본 역할(위트니스가 아니면 `api`)이다. 옛 노드는 이 필드를 모르므로 기본이면
+             *     쓰지 않는다.
+             */
+            roles?: components["schemas"]["NodeRole"][];
             /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
             witness?: boolean;
         };
@@ -3781,6 +3893,11 @@ export interface components {
                 address: string;
                 /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
                 maintenance?: boolean;
+                /**
+                 * @description 이 노드의 역할. 없으면 기본 역할(위트니스가 아니면 `api`)이다. 옛 노드는 이 필드를 모르므로 기본이면
+                 *     쓰지 않는다.
+                 */
+                roles?: components["schemas"]["NodeRole"][];
                 /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
                 witness?: boolean;
             };
@@ -4195,6 +4312,11 @@ export interface components {
              */
             remote?: string;
         };
+        /**
+         * @description 마지막 실행기 확인에서 `core`·`api`가 제때 답했는지(`work`만 늦으면 `ok`)
+         * @enum {string}
+         */
+        RuntimeHealth: "ok" | "slow";
         /**
          * @description 예약 스냅샷이 실패한 이유. `code`는 거절한 API 오류의 code(`vm_busy` 등)이고, Task가 실패했으면
          *     `task_failed`다. 옛 상태의 문자열은 `{ code: "unknown", message: <문자열> }`로 읽는다.
@@ -4619,6 +4741,11 @@ export interface components {
                 address: string;
                 /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
                 maintenance?: boolean;
+                /**
+                 * @description 이 노드의 역할. 없으면 기본 역할(위트니스가 아니면 `api`)이다. 옛 노드는 이 필드를 모르므로 기본이면
+                 *     쓰지 않는다.
+                 */
+                roles?: components["schemas"]["NodeRole"][];
                 /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
                 witness?: boolean;
             };
@@ -5569,6 +5696,33 @@ export interface operations {
             };
         };
     };
+    list_api_endpoints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiEndpoints"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_ca: {
         parameters: {
             query?: never;
@@ -5655,6 +5809,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_health: {
+        parameters: {
+            query?: {
+                /** @description 있으면(값은 보지 않는다) 프로세스가 답하는지만 본다(언제나 200). */
+                live?: string;
+                /** @description 있으면(값은 보지 않는다) 준비됐는지 본다. 기본이다. */
+                ready?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Health"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Health"];
                 };
             };
         };

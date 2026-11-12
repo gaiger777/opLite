@@ -220,6 +220,48 @@ pub async fn get_cluster(
     }))
 }
 
+/// 앞단(로드 밸런서)이 부를 API 노드 하나
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ApiEndpoint {
+    /// Node 리소스 이름
+    pub name: String,
+    /// API 주소(`host:port`)
+    pub address: String,
+    /// 장애 영역(노드 레이블 `zone`). 없으면 null이다.
+    pub zone: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ApiEndpoints {
+    /// 이름 순
+    pub items: Vec<ApiEndpoint>,
+}
+
+/// `api` 역할 노드(기본: 위트니스가 아닌 노드)의 API 주소. 앞단은 이 노드들을 부르고
+/// `GET /health`로 준비되지 않은 노드를 뺀다.
+#[utoipa::path(get, path = "/cluster/api-endpoints", tag = "cluster",
+    responses((status = 200, body = ApiEndpoints), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn list_api_endpoints(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+) -> Result<Json<ApiEndpoints>, ApiError> {
+    state.authorize(&principal, Action::Read, NodeSpec::KIND)?;
+    let mut items: Vec<ApiEndpoint> = state
+        .cluster
+        .list::<NodeSpec>()?
+        .1
+        .into_iter()
+        .filter(|n| n.spec.is_api())
+        .map(|n| ApiEndpoint {
+            zone: n.labels.get("zone").cloned(),
+            name: n.name,
+            address: n.spec.address,
+        })
+        .collect();
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(ApiEndpoints { items }))
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct VersionInfo {
     /// 이 노드의 orbivisord 빌드 버전
@@ -567,6 +609,7 @@ pub async fn join(
         address: req.address.clone(),
         maintenance: false,
         witness: req.witness,
+        roles: None,
     };
     match state.cluster.get::<NodeSpec>(req.node)? {
         Some(node) => {

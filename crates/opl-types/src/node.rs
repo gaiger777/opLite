@@ -22,6 +22,36 @@ pub struct NodeSpec {
     /// 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다.
     #[serde(default)]
     pub witness: bool,
+    /// 이 노드의 역할. 없으면 기본 역할(위트니스가 아니면 `api`)이다. 옛 노드는 이 필드를 모르므로 기본이면
+    /// 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub roles: Option<Vec<NodeRole>>,
+}
+
+/// 노드의 역할
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    /// 앞단(로드 밸런서·VIP)이 부르는 API 노드. 헬스 체크(`?ready`)는 이 역할이 없으면 503이다.
+    Api,
+}
+
+impl NodeSpec {
+    /// 이 노드의 역할. 정하지 않았으면 위트니스가 아닌 노드는 `api`, 위트니스는 없음이다.
+    pub fn roles(&self) -> Vec<NodeRole> {
+        match &self.roles {
+            Some(roles) => roles.clone(),
+            None if self.witness => Vec::new(),
+            None => vec![NodeRole::Api],
+        }
+    }
+
+    /// API 노드인지(위트니스는 API가 없으므로 늘 아니다)
+    pub fn is_api(&self) -> bool {
+        !self.witness && self.roles().contains(&NodeRole::Api)
+    }
 }
 
 impl ResourceSpec for NodeSpec {
@@ -86,6 +116,7 @@ pub const FEATURES: &[&str] = &[
     "incremental-replication",
     "storage-migration",
     "metrics",
+    "node-roles",
 ];
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
@@ -186,6 +217,52 @@ mod tests {
         let status: NodeStatus = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(status, NodeStatus::default());
         assert_eq!(status.ha, None);
+    }
+
+    #[test]
+    fn roles_default_to_api_unless_witness_and_are_omitted_when_unset() {
+        let spec: NodeSpec =
+            serde_json::from_value(serde_json::json!({ "address": "10.0.0.1:8006" })).unwrap();
+        assert_eq!(spec.roles, None);
+        assert_eq!(spec.roles(), [NodeRole::Api]);
+        assert!(spec.is_api());
+        // 기본이면 쓰지 않는다(옛 노드가 읽을 수 있게).
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(json.get("roles").is_none(), "{json}");
+        let witness = NodeSpec {
+            witness: true,
+            ..spec.clone()
+        };
+        assert!(witness.roles().is_empty());
+        assert!(!witness.is_api());
+
+        let none = NodeSpec {
+            roles: Some(vec![]),
+            ..spec.clone()
+        };
+        assert!(!none.is_api());
+        let json = serde_json::to_value(&none).unwrap();
+        assert_eq!(json["roles"], serde_json::json!([]));
+        let api: NodeSpec = serde_json::from_value(
+            serde_json::json!({ "address": "10.0.0.1:8006", "roles": ["api"] }),
+        )
+        .unwrap();
+        assert_eq!(api.roles, Some(vec![NodeRole::Api]));
+        assert!(api.is_api());
+        // 위트니스는 `api`를 적어도 API 노드가 아니다.
+        assert!(
+            !NodeSpec {
+                witness: true,
+                ..api
+            }
+            .is_api()
+        );
+        assert!(
+            serde_json::from_value::<NodeSpec>(
+                serde_json::json!({ "address": "a", "roles": ["observer"] })
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -312,7 +389,8 @@ mod tests {
                 "incremental-backup",
                 "incremental-replication",
                 "storage-migration",
-                "metrics"
+                "metrics",
+                "node-roles"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -326,6 +404,7 @@ mod tests {
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         assert!(!ha_capable(&node));

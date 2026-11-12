@@ -680,6 +680,7 @@ async fn replicate_requests_are_checked() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     node.status.online = true;
@@ -1009,6 +1010,7 @@ async fn incremental_backups_need_a_remote_that_knows_them() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     node.status.version = Some(opl_types::version::BUILD.into());

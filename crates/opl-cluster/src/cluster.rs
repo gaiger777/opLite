@@ -9,6 +9,7 @@ use opl_types::resource::{Kind, Resource, ResourceSpec};
 use redb::Database;
 use uuid::Uuid;
 
+use crate::health::{ApplyLag, QUORUM_ACK_MAX, RaftHealth};
 use crate::leader::{self, Forwarder, LeaderCtx};
 use crate::lease::{LeaseTable, Leases};
 use crate::store::{Store, StoreError, get_object, get_object_by_name, list_objects};
@@ -99,6 +100,8 @@ pub struct Cluster {
     forwarder: Option<Arc<dyn Forwarder>>,
     /// 리더일 때 받은 HA 리스 갱신(메모리에만 둔다)
     leases: Arc<LeaseTable>,
+    /// 헬스 체크가 보는 적용 지연
+    apply_lag: std::sync::Mutex<ApplyLag>,
     /// 시험이 저장소 스레드를 붙잡아 느린 디스크를 흉내 낸다.
     #[cfg(test)]
     writer: crate::writer::StoreWriter,
@@ -157,6 +160,7 @@ impl Cluster {
             write_timeout: config.write_timeout,
             forwarder: None,
             leases: Arc::default(),
+            apply_lag: Default::default(),
             #[cfg(test)]
             writer: store.writer().clone(),
         })
@@ -508,6 +512,28 @@ impl Cluster {
             list.insert(*id, node.addr.clone());
         }
         out
+    }
+
+    /// 헬스 체크가 보는 이 노드의 Raft 상태. 부를 때마다 적용 지연을 다시 잰다([`RaftHealth`]).
+    pub fn health(&self) -> RaftHealth {
+        let m = self.raft.metrics().borrow().clone();
+        let apply_lag = self.apply_lag.lock().unwrap().observe(
+            m.last_log_index,
+            m.last_applied.map(|l| l.index),
+            std::time::Instant::now(),
+        );
+        let quorum = match m.current_leader {
+            None => false,
+            Some(leader) if leader == self.id => m
+                .millis_since_quorum_ack
+                .is_some_and(|ms| Duration::from_millis(ms) <= QUORUM_ACK_MAX),
+            Some(_) => true,
+        };
+        RaftHealth {
+            leader: m.current_leader,
+            quorum,
+            apply_lag,
+        }
     }
 
     /// 로컬 상태 머신에서 읽는다. 팔로워에서는 최신 커밋이 아직 반영되지 않았을 수 있다.

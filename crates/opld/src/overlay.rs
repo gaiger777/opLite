@@ -311,6 +311,7 @@ mod tests {
                 address: format!("{name}:8006"),
                 maintenance: false,
                 witness,
+                roles: None,
             },
         );
         node.status = NodeStatus {

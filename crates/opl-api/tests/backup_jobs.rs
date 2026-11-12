@@ -230,6 +230,7 @@ async fn replicate_is_checked_and_waits_for_every_node_to_run_this_build() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     node.status.version = Some("0.0.1~old".into());
@@ -307,6 +308,7 @@ async fn full_every_is_checked_and_needs_every_node_to_know_incremental_backups(
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     node.status.version = Some(opl_types::version::BUILD.into());
@@ -396,6 +398,7 @@ async fn patch_turns_replication_on_and_off() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     node.status.version = Some("0.0.1~old".into());

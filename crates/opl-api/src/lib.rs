@@ -14,6 +14,7 @@ mod drain;
 pub mod error;
 mod firmware;
 mod ha;
+pub mod health;
 mod incoming;
 mod janitor;
 pub mod ldap;
@@ -57,6 +58,7 @@ pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
 pub use backup_jobs::{BackupJobScheduler, BackupJobSchedulerConfig};
 pub use firmware::UefiVarsFetcher;
 pub use ha::{HaManager, HaManagerConfig, RecoveryWriter};
+pub use health::RuntimeProbe;
 pub use incoming::{IncomingConfig, IncomingMigrations};
 pub use janitor::{ClusterJanitor, ClusterJanitorConfig};
 pub use remotes::{RemotePoller, RemotePollerConfig};
@@ -136,6 +138,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(cluster::get_cluster))
         .routes(routes!(cluster::get_ca))
         .routes(routes!(cluster::get_version))
+        .routes(routes!(health::get_health))
+        .routes(routes!(cluster::list_api_endpoints))
         .routes(routes!(cluster::create_join_token))
         .routes(routes!(cluster::join))
         .routes(routes!(settings::get_settings, settings::patch_settings))

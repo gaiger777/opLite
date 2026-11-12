@@ -216,6 +216,7 @@ mod tests {
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         n.status = NodeStatus {

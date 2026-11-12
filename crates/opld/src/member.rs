@@ -14,7 +14,7 @@ use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
     AppState, AuditLog, BackupJobScheduler, ClusterJanitor, HaManager, HaManagerConfig,
-    IncomingConfig, IncomingMigrations, RemotePoller, SnapshotScheduler, TaskRunner,
+    IncomingConfig, IncomingMigrations, RemotePoller, RuntimeProbe, SnapshotScheduler, TaskRunner,
     TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
@@ -210,12 +210,15 @@ impl Member {
     /// 생긴다), 노드 간 서버, `HaGuard`, `HaManager`, 노드 감시, 승격은 `rt.core`, API는 `rt.api`, VM·풀을
     /// 다스리는 일과 스케줄러는 `rt.work`에서 돈다. 노드 간 서버가 받은 Raft·리스가 아닌 요청(마이그레이션
     /// 받기, 콘솔 중계, UEFI 변수·감사 로그·지표 읽기)도 `rt.work`에서 돈다.
+    ///
+    /// `runtimes`는 실행기 확인(`Liveness`)의 마지막 결과로, 헬스 체크(`GET /api/v1/health`)가 본다.
     pub async fn start(
         config: &Config,
         node: Uuid,
         tls: NodeTls,
         bootstrap: Bootstrap,
         rt: &Handles,
+        runtimes: Option<Arc<dyn RuntimeProbe>>,
     ) -> anyhow::Result<(Self, Option<Created>)> {
         // `[telemetry] ca_file`을 읽지 못하면 아무것도 열기 전에 실패한다.
         let telemetry_config = config.telemetry.telemetry_config()?;
@@ -391,6 +394,8 @@ impl Member {
             state.secure_cookies = true;
             state.audit = audit;
             state.metrics = Some(metrics_source);
+            // 헬스 체크가 실행기 확인과 HA 리스(아래에서 띄운 뒤)를 본다.
+            state.runtimes = runtimes;
             let created = match password {
                 Some(admin_password) => {
                     let token = issue_join_token(&state, DEFAULT_JOIN_TTL)
@@ -410,7 +415,7 @@ impl Member {
             }
             anyhow::Ok((state, created, api_tls))
         };
-        let (state, created, api_tls) = match prepared.await {
+        let (mut state, created, api_tls) = match prepared.await {
             Ok(prepared) => prepared,
             Err(e) => {
                 let _ = peer.stop.send(());
@@ -468,6 +473,7 @@ impl Member {
             .guard_config()
             .map(|ha| on(&rt.core, || HaGuard::spawn(cluster.clone(), ha)));
         reconciler_config.ha = ha.clone();
+        state.ha = ha.clone();
         reconciler_config.firewall = gate;
         let reconciler = on(&rt.work, || {
             Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config)
@@ -1022,7 +1028,7 @@ mod tests {
                 name: "c".into(),
                 ca,
             };
-            let (member, created) = Member::start(&config, node, tls, bootstrap, &rt)
+            let (member, created) = Member::start(&config, node, tls, bootstrap, &rt, None)
                 .await
                 .unwrap();
             assert!(created.is_some());
@@ -1066,7 +1072,7 @@ mod tests {
                 name: "c".into(),
                 ca,
             };
-            let (mut member, _) = Member::start(&config, node, tls, bootstrap, &rt)
+            let (mut member, _) = Member::start(&config, node, tls, bootstrap, &rt, None)
                 .await
                 .unwrap();
             assert!(
@@ -1099,6 +1105,7 @@ mod tests {
                     address: "h:8006".into(),
                     maintenance: false,
                     witness,
+                    roles: None,
                 },
             );
             node.id = Uuid::now_v7();

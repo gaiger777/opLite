@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
+use opl_api::RuntimeProbe;
 use opl_api::cluster::JoinUrl;
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use serde_json::json;
@@ -81,11 +82,17 @@ fn main() -> anyhow::Result<()> {
     starve::install(rt.api.clone(), config.test.block_api());
     // systemd 알림(설계 §3.3). 실행기 확인 스레드는 실행기보다 먼저 멈춘다(선언의 역순으로 놓임).
     let notifier = Notifier::from_env();
-    let _liveness = Liveness::spawn(rt.clone(), notifier.clone());
-    runtimes.core.block_on(run(config, rt, notifier))
+    let liveness = Liveness::spawn(rt.clone(), notifier.clone());
+    let probe: Arc<dyn RuntimeProbe> = Arc::new(liveness.last_check());
+    runtimes.core.block_on(run(config, rt, notifier, probe))
 }
 
-async fn run(config: Config, rt: Handles, notifier: Notifier) -> anyhow::Result<()> {
+async fn run(
+    config: Config,
+    rt: Handles,
+    notifier: Notifier,
+    probe: Arc<dyn RuntimeProbe>,
+) -> anyhow::Result<()> {
     prepare_data_dir(&config.data_dir)?;
     // 끝날 때까지 쥐고 있는다.
     let _lock = lock_data_dir(&config.data_dir)?;
@@ -105,7 +112,7 @@ async fn run(config: Config, rt: Handles, notifier: Notifier) -> anyhow::Result<
             // 멤버가 아니면 init이나 join을 기다린다.
             let mut member = match NodeTls::load(&member::pki_dir(&config))? {
                 Some(tls) => {
-                    Member::start(&config, node, tls, Bootstrap::Restart, &rt)
+                    Member::start(&config, node, tls, Bootstrap::Restart, &rt, Some(probe.clone()))
                         .await?
                         .0
                 }
@@ -122,7 +129,7 @@ async fn run(config: Config, rt: Handles, notifier: Notifier) -> anyhow::Result<
                             req = control.recv() => req,
                         };
                         let Some(req) = req else { return Ok(()) };
-                        if let Some(member) = become_member(&config, node, req, &rt).await {
+                        if let Some(member) = become_member(&config, node, req, &rt, &probe).await {
                             break member;
                         }
                         // 인증서를 저장한 뒤 실패했으면 이미 멤버(learner)다. 멤버로 다시 띄워 승격을 이어 간다.
@@ -214,7 +221,13 @@ fn read_cluster_name(member: &Member) -> Option<String> {
 }
 
 /// 미초기화 노드가 받은 요청을 처리한다. 멤버가 되면 그 멤버를 돌려준다.
-async fn become_member(config: &Config, node: Uuid, req: Request, rt: &Handles) -> Option<Member> {
+async fn become_member(
+    config: &Config,
+    node: Uuid,
+    req: Request,
+    rt: &Handles,
+    probe: &Arc<dyn RuntimeProbe>,
+) -> Option<Member> {
     let (bootstrap, tls, reply, cluster) = match req {
         Request::Leave { reply } => {
             let _ = reply.send(Err(ControlError::conflict(
@@ -275,7 +288,7 @@ async fn become_member(config: &Config, node: Uuid, req: Request, rt: &Handles) 
             return None;
         }
     }
-    match Member::start(config, node, tls, bootstrap, rt).await {
+    match Member::start(config, node, tls, bootstrap, rt, Some(probe.clone())).await {
         Ok((member, created)) => {
             let mut answer = json!({ "cluster": cluster, "node": config.name });
             if let Some(c) = created {
@@ -399,8 +412,9 @@ mod tests {
             api: current.clone(),
             work: current,
         };
+        let probe: Arc<dyn RuntimeProbe> = Arc::new(notify::LastCheck::default());
         assert!(
-            become_member(&config, Uuid::now_v7(), req, &rt)
+            become_member(&config, Uuid::now_v7(), req, &rt, &probe)
                 .await
                 .is_none()
         );

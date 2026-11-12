@@ -1380,6 +1380,7 @@ mod tests {
                 address: "h:8006".into(),
                 maintenance: false,
                 witness: false,
+                roles: None,
             },
         );
         me.id = node;

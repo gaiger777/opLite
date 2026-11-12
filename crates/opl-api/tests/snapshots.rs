@@ -968,6 +968,7 @@ async fn resize_only_grows_and_runs_where_the_volume_is_used() {
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,
+            roles: None,
         },
     );
     env.cluster.create(&node).await.unwrap();

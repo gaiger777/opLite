@@ -108,6 +108,7 @@ async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
                     address,
                     maintenance: false,
                     witness: config.witness,
+                    roles: None,
                 },
             );
             node.id = id;
@@ -489,7 +490,8 @@ pub(crate) mod tests {
                 "incremental-backup",
                 "incremental-replication",
                 "storage-migration",
-                "metrics"
+                "metrics",
+                "node-roles"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -508,7 +510,8 @@ pub(crate) mod tests {
                 "incremental-backup",
                 "incremental-replication",
                 "storage-migration",
-                "metrics"
+                "metrics",
+                "node-roles"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -543,7 +546,8 @@ pub(crate) mod tests {
                 "incremental-backup",
                 "incremental-replication",
                 "storage-migration",
-                "metrics"
+                "metrics",
+                "node-roles"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -616,6 +620,7 @@ pub(crate) mod tests {
                     "incremental-replication".into(),
                     "storage-migration".into(),
                     "metrics".into(),
+                    "node-roles".into(),
                 ],
                 ..NodeStatus::default()
             }

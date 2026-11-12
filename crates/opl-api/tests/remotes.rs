@@ -340,6 +340,7 @@ async fn remotes_wait_until_every_node_runs_this_build() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     node.status.version = Some("0.0.1~old".into());

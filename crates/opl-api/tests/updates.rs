@@ -222,6 +222,7 @@ async fn refresh_waits_until_every_node_is_upgraded() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     env.cluster.create(&old).await.unwrap();
@@ -729,6 +730,7 @@ async fn upgrade_checks_the_node_the_caller_and_other_upgrades() {
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,
+            roles: None,
         },
     );
     env.cluster.create(&old).await.unwrap();

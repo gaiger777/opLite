@@ -62,6 +62,7 @@ async fn add_node(
             address: "10.9.8.7:8006".into(),
             maintenance: false,
             witness,
+            roles: None,
         },
     );
     node.status.version = version.map(Into::into);

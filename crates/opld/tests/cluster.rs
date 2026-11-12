@@ -210,6 +210,18 @@ async fn a_witness_votes_but_never_leads_or_runs_vms() {
     assert!(!status.contains("warning"), "{status}");
     let node = nodes[0].ctl_json(&["node", "get", "wit"]).await;
     assert_eq!(node["spec"]["witness"], true, "{node}");
+    // API 노드 목록에 위트니스는 없고, 두 일반 노드의 API는 준비됐다.
+    let endpoints = nodes[0].ctl_json(&["cluster", "api-endpoints"]).await;
+    let names: Vec<&str> = endpoints
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["node-a", "node-b"]);
+    for d in &nodes {
+        eventually("ready", || async { health(d, "").await.0 == 200 }).await;
+    }
 
     // 위트니스에 VM을 둘 수 없다.
     let err = nodes[0]
@@ -275,4 +287,79 @@ async fn a_witness_votes_but_never_leads_or_runs_vms() {
 
     nodes[1 - dead].stop();
     w.stop();
+}
+
+/// `GET /api/v1/health`의 상태 코드와 본문(로그인했으면 그 토큰으로 — 전체 본문)
+async fn health(d: &Daemon, query: &str) -> (u16, Value) {
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(d.path("oplctl.json")).unwrap()).unwrap();
+    let client = oplctl::Client::new(
+        &d.server(),
+        config["token"].as_str().map(str::to_string),
+        config["ca_pem"].as_str().map(str::to_string),
+    )
+    .unwrap();
+    let resp = client
+        .request(reqwest::Method::GET, &format!("/health{query}"))
+        .send()
+        .await
+        .unwrap();
+    (resp.status().as_u16(), resp.json().await.unwrap())
+}
+
+/// 계획 46: 헬스 체크는 HA 리스(`process` 펜싱)·실행기 확인·역할·유지보수를 보고, `?live`는 늘 200이다.
+/// API 노드 목록과 HAProxy `server` 줄은 `api` 역할 노드만 담는다.
+#[tokio::test]
+async fn health_and_api_endpoints_follow_roles_and_maintenance() {
+    let mut d = Daemon::new(
+        "node1",
+        "[ha]\nfencing = \"process\"\nfence_after_secs = 10\n",
+    );
+    d.start().await;
+    d.init("prod").await;
+    d.login().await;
+    eventually("ready", || async { health(&d, "").await.0 == 200 }).await;
+    let (_, body) = health(&d, "?ready").await;
+    assert_eq!(body["lease"], "fresh", "{body}");
+    assert_eq!(body["runtimes"], "ok", "{body}");
+    assert_eq!(body["quorum"], true, "{body}");
+    assert_eq!(body["failed"], serde_json::json!([]), "{body}");
+
+    let haproxy = d
+        .ctl(&["-o", "haproxy", "cluster", "api-endpoints"])
+        .await
+        .unwrap();
+    assert_eq!(
+        haproxy,
+        format!(
+            "server node1 127.0.0.1:{} check ssl verify required ca-file /etc/haproxy/orbivisor-ca.pem\n",
+            d.port
+        )
+    );
+
+    // 역할을 비우면 앞단에서 빠진다.
+    d.ctl(&["node", "roles", "node1", "none"]).await.unwrap();
+    let (status, body) = health(&d, "").await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["failed"], serde_json::json!(["role"]), "{body}");
+    assert_eq!(health(&d, "?live").await.0, 200);
+    let endpoints = d.ctl_json(&["cluster", "api-endpoints"]).await;
+    assert_eq!(endpoints, serde_json::json!([]));
+    let list = d.ctl(&["node", "list"]).await.unwrap();
+    assert!(list.contains("ROLES"), "{list}");
+    d.ctl(&["node", "roles", "node1", "default"]).await.unwrap();
+    assert_eq!(health(&d, "").await.0, 200);
+
+    // 유지보수 중이면 준비되지 않았다.
+    d.ctl(&["node", "maintenance", "node1", "on"])
+        .await
+        .unwrap();
+    let (status, body) = health(&d, "").await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["failed"], serde_json::json!(["maintenance"]), "{body}");
+    d.ctl(&["node", "maintenance", "node1", "off"])
+        .await
+        .unwrap();
+    assert_eq!(health(&d, "").await.0, 200);
+    d.stop();
 }
