@@ -13,7 +13,7 @@ use opl_types::resource::Kind;
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::ClusterError;
-use crate::lease::LeaseTable;
+use crate::lease::{ConfirmBatch, LeaseTable};
 use crate::types::{LeaderRequest, NodeId, Rejection, Response, TypeConfig};
 use crate::vip::VipTable;
 
@@ -89,10 +89,11 @@ impl From<LeaderError> for ClusterError {
     }
 }
 
-/// 리더로서 요청을 처리하는 데 쓰는 것: Raft와 리스 표(HA·VIP)
+/// 리더로서 요청을 처리하는 데 쓰는 것: Raft, 리스 표(HA·VIP)와 그 둘이 함께 쓰는 리더 확인
 #[derive(Clone)]
 pub(crate) struct LeaderCtx {
     pub(crate) raft: Raft<TypeConfig>,
+    pub(crate) confirm: ConfirmBatch,
     pub(crate) leases: Arc<LeaseTable>,
     pub(crate) vips: Arc<VipTable>,
 }
@@ -106,8 +107,14 @@ pub(crate) async fn execute(
 ) -> Result<u64, ClusterError> {
     let raft = &ctx.raft;
     match req {
-        LeaderRequest::RenewLease { node } => ctx.leases.renew(raft, node, timeout).await,
-        LeaderRequest::RenewVip { node, vips } => ctx.vips.renew(raft, node, vips, timeout).await,
+        LeaderRequest::RenewLease { node } => {
+            ctx.leases.renew(raft, &ctx.confirm, node, timeout).await
+        }
+        LeaderRequest::RenewVip { node, vips } => {
+            ctx.vips
+                .renew(raft, &ctx.confirm, node, vips, timeout)
+                .await
+        }
         LeaderRequest::Write { command } => {
             let resp = tokio::time::timeout(timeout, raft.client_write(command))
                 .await

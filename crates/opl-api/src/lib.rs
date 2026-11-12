@@ -13,6 +13,7 @@ pub mod cluster;
 mod console;
 mod drain;
 pub mod error;
+mod fan_out;
 mod firmware;
 mod ha;
 pub mod health;

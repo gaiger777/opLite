@@ -299,7 +299,7 @@ pub async fn list_audit(
     let mut entries = Vec::new();
     let mut unreachable = Vec::new();
     let mut disabled = Vec::new();
-    for (name, read) in futures_util::future::join_all(reads).await {
+    for (name, read) in crate::fan_out::gather(reads.collect()).await {
         match read {
             Ok(Some(read)) => entries.extend(read),
             Ok(None) => disabled.push(name),

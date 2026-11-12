@@ -10,7 +10,7 @@ use tokio::time::Instant;
 
 use crate::cluster::ClusterError;
 use crate::leader::not_leader;
-use crate::lease::confirm_leader;
+use crate::lease::ConfirmBatch;
 use crate::types::{NodeId, Rejection, TypeConfig};
 
 /// 노드 하나의 마지막 VIP 갱신
@@ -49,6 +49,7 @@ impl VipTable {
     pub(crate) async fn renew(
         &self,
         raft: &Raft<TypeConfig>,
+        confirm: &ConfirmBatch,
         node: NodeId,
         vips: Vec<String>,
         timeout: Duration,
@@ -61,7 +62,7 @@ impl VipTable {
             m.current_term
         };
         let deadline = Instant::now() + timeout;
-        confirm_leader(raft, deadline).await?;
+        confirm.confirm(deadline).await?;
         {
             let mut inner = self.inner.lock().unwrap();
             let m = raft.metrics().borrow().clone();
@@ -83,7 +84,7 @@ impl VipTable {
                 },
             );
         }
-        let read = confirm_leader(raft, deadline).await?;
+        let read = confirm.confirm(deadline).await?;
         Ok(read.map_or(0, |l| l.index))
     }
 

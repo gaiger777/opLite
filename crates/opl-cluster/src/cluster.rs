@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::health::{ApplyLag, QUORUM_ACK_MAX, RaftHealth};
 use crate::leader::{self, Forwarder, LeaderCtx};
-use crate::lease::{LeaseTable, Leases};
+use crate::lease::{ConfirmBatch, LeaseTable, Leases};
 use crate::store::{Store, StoreError, get_object, get_object_by_name, list_objects};
 use crate::types::{Command, LeaderRequest, NodeId, RawResource, Rejection, TypeConfig};
 use crate::vip::{VipLeases, VipTable};
@@ -103,6 +103,8 @@ pub struct Cluster {
     leases: Arc<LeaseTable>,
     /// 리더일 때 받은 VIP 리스 갱신(메모리에만 둔다)
     vips: Arc<VipTable>,
+    /// 두 리스 표가 함께 쓰는 리더 확인
+    confirm: ConfirmBatch,
     /// 헬스 체크가 보는 적용 지연
     apply_lag: std::sync::Mutex<ApplyLag>,
     /// 시험이 저장소 스레드를 붙잡아 느린 디스크를 흉내 낸다.
@@ -157,6 +159,7 @@ impl Cluster {
         .map_err(|e| ClusterError::Raft(e.to_string()))?;
         Ok(Self {
             id: config.node_id,
+            confirm: ConfirmBatch::for_raft(raft.clone()),
             raft,
             db: store.db().clone(),
             watch: store.watch_hub().clone(),
@@ -456,6 +459,7 @@ impl Cluster {
     pub(crate) fn leader_ctx(&self) -> LeaderCtx {
         LeaderCtx {
             raft: self.raft.clone(),
+            confirm: self.confirm.clone(),
             leases: self.leases.clone(),
             vips: self.vips.clone(),
         }

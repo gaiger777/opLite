@@ -69,7 +69,7 @@ async fn read_node(state: &AppState, id: NodeId, addr: &str, query: MetricsQuery
     }
 }
 
-/// 위트니스를 뺀 모든 멤버에게 `query`를 묻는다. (노드 id, 이름, 결과)를 돌려준다. Node 리소스가 없는
+/// 위트니스를 뺀 모든 멤버에게 `query`를 묻는다(동시에 `FAN_OUT`개까지). (노드 id, 이름, 결과)를 돌려준다. Node 리소스가 없는
 /// 멤버는 id를 이름으로 쓴다. 꺼진 것으로 기록된 다른 노드는 묻지 않고 닿지 않는 노드로 둔다.
 async fn read_all(
     state: &AppState,
@@ -98,7 +98,7 @@ async fn read_all(
                 (*id, name, read)
             })
         });
-    Ok(futures_util::future::join_all(reads).await)
+    Ok(crate::fan_out::gather(reads.collect()).await)
 }
 
 /// 닿지 않거나 옛 노드면 이름을 목록에 넣고 None, 읽었으면 그 응답

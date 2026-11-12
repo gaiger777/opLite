@@ -1,4 +1,5 @@
-//! 리더의 HA 리스 표: 갱신, 고립된 노드와 리더, 펜싱 중 거부, 임기가 바뀌면 비우기.
+//! 리더의 HA 리스 표: 갱신, 고립된 노드와 리더, 펜싱 중 거부, 임기가 바뀌면 비우기, 동시 갱신(HA·VIP)의
+//! 리더 확인 묶기.
 
 mod common;
 
@@ -96,6 +97,61 @@ async fn isolated_leader_cannot_renew_its_own_lease() {
     );
     assert!(tc.get(leader).renew_lease(SHORT).await.is_err());
     assert_eq!(tc.get(leader).leases().renewed[&leader], first);
+}
+
+/// 모든 노드가 HA·VIP 리스를 한꺼번에 갱신해도(리더 확인을 함께 써도) 모두 성공하고 모두 적힌다.
+#[tokio::test]
+async fn concurrent_lease_and_vip_renewals_all_succeed() {
+    let tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let ids: Vec<_> = tc.nodes.keys().copied().collect();
+    let (a, b, c) = (tc.get(ids[0]), tc.get(ids[1]), tc.get(ids[2]));
+    let vip = || vec!["10.0.0.1".to_string()];
+
+    let before = Instant::now();
+    for _ in 0..5 {
+        let r = tokio::join!(
+            a.renew_lease(WAIT),
+            b.renew_lease(WAIT),
+            c.renew_lease(WAIT),
+            a.renew_vip(vip(), WAIT),
+            b.renew_vip(vip(), WAIT),
+            c.renew_vip(vip(), WAIT),
+        );
+        for res in [r.0, r.1, r.2, r.3, r.4, r.5] {
+            res.unwrap();
+        }
+    }
+    let leases = tc.get(leader).leases();
+    let vips = tc.get(leader).vip_leases();
+    for id in ids {
+        assert!(leases.renewed[&id] >= before, "{leases:?}");
+        assert!(vips.renewed[&id].at >= before, "{vips:?}");
+    }
+}
+
+/// 과반수와 끊긴 리더에게 한꺼번에 온 갱신은 함께 쓴 확인이 실패하므로 모두 실패한다.
+#[tokio::test]
+async fn concurrent_renewals_on_an_isolated_leader_all_fail() {
+    let tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    tc.get(leader).renew_lease(WAIT).await.unwrap();
+    let first = tc.get(leader).leases().renewed[&leader];
+
+    tc.router.isolate(leader);
+    let l = tc.get(leader);
+    let vip = || vec!["10.0.0.1".to_string()];
+    let r = tokio::join!(
+        l.renew_lease(SHORT),
+        l.renew_lease(SHORT),
+        l.renew_vip(vip(), SHORT),
+        l.renew_vip(vip(), SHORT),
+    );
+    for res in [r.0, r.1, r.2, r.3] {
+        assert!(res.is_err(), "{res:?}");
+    }
+    assert_eq!(tc.get(leader).leases().renewed[&leader], first);
+    assert!(!tc.get(leader).vip_leases().renewed.contains_key(&leader));
 }
 
 #[tokio::test]
