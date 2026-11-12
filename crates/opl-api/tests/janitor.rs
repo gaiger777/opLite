@@ -1,7 +1,7 @@
 //! 클러스터 정리 작업: 오프라인 노드의 `pending` 스냅샷 Task가 유예 뒤 실패해 VM 조작이 풀리고
 //! `running` Task는 남는지, 제거된 노드의 Task가 곧바로 실패하는지, 만들 Task 없이 남은 `pending`
 //! 스냅샷을 지우는지, 끝낸 예약 스냅샷 만들기를 `schedule_error`에 남기는지, 끝난 Task를 기간·개수
-//! 기준으로 지우고 끝나지 않은 Task는 남기는지, 오래 받는 중인 백업을 지우는지.
+//! 기준으로 지우고 끝나지 않은 Task는 남기는지, 오래 받는 중인 백업을 지우는지, 끝난 세션을 지우는지.
 
 mod common;
 
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use common::{Env, WAIT, vm_request};
 use opl_api::{ClusterJanitor, ClusterJanitorConfig};
+use opl_types::auth::{Session, SessionSpec, UserSpec};
 use opl_types::backup::BackupSpec;
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
@@ -410,4 +411,42 @@ async fn backups_left_receiving_are_deleted_with_their_files() {
     janitor.shutdown().await;
     assert!(!dir.exists());
     assert!(env.cluster.get::<BackupSpec>(done).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn expired_sessions_are_deleted() {
+    let env = Env::start().await;
+    let admin = env
+        .cluster
+        .get_by_name::<UserSpec>("admin")
+        .unwrap()
+        .unwrap();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let session = |name: &str, expires_at: u64| {
+        Resource::new(
+            name,
+            SessionSpec {
+                user: admin.id,
+                epoch: admin.spec.session_epoch,
+                expires_at,
+            },
+        )
+    };
+    let expired: Session = session("expired", now - 1);
+    let live: Session = session("live", now + 3600);
+    env.cluster.create(&expired).await.unwrap();
+    env.cluster.create(&live).await.unwrap();
+    let janitor = fast_janitor(&env);
+    until("expired session deleted", || {
+        env.cluster
+            .get::<SessionSpec>(expired.id)
+            .unwrap()
+            .is_none()
+    })
+    .await;
+    assert!(env.cluster.get::<SessionSpec>(live.id).unwrap().is_some());
+    janitor.shutdown().await;
 }

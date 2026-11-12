@@ -256,7 +256,7 @@ pub async fn oidc_callback(
                 AuditAuth::Session,
             );
             audit.detail(format!("realm={} username={username}", login.realm));
-            let session = crate::users::new_session(&state, &user)?;
+            let session = crate::users::new_session(&state, &user).await?;
             Ok(redirect("/", [session, state_cookie(&state, "", 0)]))
         }
         Err(f) => Ok(failure(&state, &audit, Some(&login.realm), f)),

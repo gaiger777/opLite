@@ -54,6 +54,7 @@ pub enum Kind {
     Settings,
     Realm,
     Remote,
+    Session,
 }
 
 impl Kind {
@@ -77,6 +78,7 @@ impl Kind {
             Kind::Settings => "settings",
             Kind::Realm => "realm",
             Kind::Remote => "remote",
+            Kind::Session => "session",
         }
     }
 }
@@ -156,6 +158,7 @@ mod tests {
             Kind::Settings,
             Kind::Realm,
             Kind::Remote,
+            Kind::Session,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }

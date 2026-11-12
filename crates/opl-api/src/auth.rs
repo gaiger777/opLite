@@ -1,8 +1,9 @@
 //! 인증(로컬 사용자, 세션 쿠키, API 토큰)과 권한 확인.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
@@ -11,7 +12,9 @@ use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
 use axum::http::request::Parts;
-use opl_types::auth::{ApiTokenSpec, Role, User, UserSpec};
+use opl_cluster::ClusterError;
+use opl_cluster::types::Rejection;
+use opl_types::auth::{ApiTokenSpec, Role, Session, SessionSpec, SessionStatus, User, UserSpec};
 use opl_types::realm::RealmSpec;
 use opl_types::resource::Kind;
 use serde::Serialize;
@@ -23,6 +26,15 @@ use crate::state::AppState;
 
 pub const SESSION_COOKIE: &str = "opl_session";
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
+/// 세션의 마지막 사용 시각을 다시 적기까지의 간격. 요청마다 Raft에 쓰지 않으려고 묶는다.
+pub const SESSION_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
+/// 모든 노드가 이 기능을 알면 세션을 Raft에 둔다(옛 노드는 `session` 종류를 풀지 못한다).
+pub const SHARED_SESSIONS: &str = "shared-sessions";
+/// 한 사용자의 Raft 세션 상한. 넘으면 가장 오래된 것부터 지운다.
+pub const MAX_USER_SESSIONS: usize = 32;
+/// 로그아웃 표시(다른 노드의 메모리 세션을 끝내려고 Raft에 남기는 만료된 `Session`)의 상한. 로그아웃은
+/// 인증 없이 부르므로 아무 쿠키로 표시를 쌓지 못하게 한다(IP마다는 로그인 실패 제한으로 센다).
+const MAX_LOGOUT_MARKS: usize = 2_000;
 const TOKEN_PREFIX: &str = "opl_";
 
 /// 인증된 요청의 주체. 요청마다 저장소의 User에서 다시 읽으므로 역할 변경과 삭제가 곧바로 반영된다.
@@ -54,7 +66,7 @@ impl Authorizer for RoleAuthorizer {
     fn check(&self, principal: &Principal, action: Action, kind: Kind) -> bool {
         let account = matches!(
             kind,
-            Kind::User | Kind::ApiToken | Kind::JoinToken | Kind::Realm
+            Kind::User | Kind::ApiToken | Kind::JoinToken | Kind::Realm | Kind::Session
         );
         match principal.role {
             Role::Admin => true,
@@ -142,11 +154,14 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
             == 0
 }
 
-/// 노드 메모리에만 두는 세션. opld가 재시작하면 다시 로그인한다.
+/// 이 노드 메모리의 세션 기록. 세션은 보통 Raft의 `Session` 리소스에 두고(모든 노드가 본다), 옛 노드가
+/// 남은 클러스터(롤링 업그레이드 중)에서는 여기 둔다. 메모리 세션은 opld가 재시작하면 다시 로그인한다.
 /// 만들 때 사용자의 세션 세대를 함께 둔다(다른 노드에서 비밀번호가 바뀌면 끊으려고).
 #[derive(Default)]
 pub struct Sessions {
     inner: Mutex<HashMap<String, (Uuid, u64, Instant)>>,
+    /// 이 노드가 마지막 사용 시각을 적으러 보낸 Raft 세션과 보낸 때
+    touched: Mutex<HashMap<Uuid, Instant>>,
 }
 
 impl Sessions {
@@ -174,6 +189,42 @@ impl Sessions {
     /// 사용자의 세션을 모두 끝낸다(비밀번호를 바꿨을 때).
     pub fn remove_user(&self, user: Uuid) {
         self.inner.lock().unwrap().retain(|_, (u, _, _)| *u != user);
+    }
+
+    /// Raft 세션 `id`의 마지막 사용 시각을 지금 적을 차례면 참이고 보낸 것으로 적는다. 이 노드에서
+    /// [`SESSION_TOUCH_INTERVAL`]에 한 번까지다(같은 세션의 동시 요청이 함께 쓰지 않게).
+    fn touch_due(&self, id: Uuid, now: Instant) -> bool {
+        let mut map = self.touched.lock().unwrap();
+        map.retain(|_, at| now.duration_since(*at) < SESSION_TOUCH_INTERVAL);
+        if map.contains_key(&id) {
+            return false;
+        }
+        map.insert(id, now);
+        true
+    }
+}
+
+/// 쿠키로 찾은 세션
+struct FoundSession {
+    user: Uuid,
+    /// 만들 때 사용자의 세션 세대
+    epoch: u64,
+    /// Raft 세션이면 그 리소스(메모리 세션은 None)
+    shared: Option<Session>,
+}
+
+pub(crate) fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// 지우려던 것이 이미 없으면 지운 것으로 본다.
+fn deleted(result: Result<u64, ClusterError>) -> Result<(), ApiError> {
+    match result {
+        Ok(_) | Err(ClusterError::Rejected(Rejection::NotFound { .. })) => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -208,6 +259,181 @@ fn principal_of(u: User) -> Principal {
 }
 
 impl AppState {
+    /// 사용자의 세션을 만들고 쿠키 값을 돌려준다. 모든 노드가 [`SHARED_SESSIONS`]를 알면 Raft에 두고
+    /// (쿠키 값은 해시만), 아니면 이 노드 메모리에 둔다.
+    pub(crate) async fn create_session(&self, user: &User) -> Result<String, ApiError> {
+        if !crate::cluster::missing_feature(&self.cluster, SHARED_SESSIONS)?.is_empty() {
+            return Ok(self.sessions.create(user.id, user.spec.session_epoch));
+        }
+        let cookie = random_hex(32);
+        let now = unix_now();
+        self.limit_user_sessions(user.id).await?;
+        let mut session = Session::new(
+            sha256_hex(&cookie),
+            SessionSpec {
+                user: user.id,
+                epoch: user.spec.session_epoch,
+                expires_at: now + SESSION_TTL.as_secs(),
+            },
+        );
+        session.status.last_used = now;
+        // 이 노드에 적용될 때까지 기다리므로 곧바로 쓸 수 있다.
+        self.cluster.create(&session).await?;
+        Ok(cookie)
+    }
+
+    /// 쿠키의 세션. 메모리에 없으면 Raft에서 찾는다. 끝난 세션은 없는 것과 같다. 메모리 세션도 같은
+    /// 이름의 끝난 Raft 세션(다른 노드의 로그아웃 표시)이 있으면 끝난 것이다.
+    fn find_session(&self, cookie: &str) -> Result<Option<FoundSession>, ApiError> {
+        if let Some((user, epoch)) = self.sessions.get(cookie) {
+            if self
+                .cluster
+                .get_by_name::<SessionSpec>(&sha256_hex(cookie))?
+                .is_some_and(|s| s.spec.expires_at <= unix_now())
+            {
+                self.sessions.remove(cookie);
+                return Ok(None);
+            }
+            return Ok(Some(FoundSession {
+                user,
+                epoch,
+                shared: None,
+            }));
+        }
+        Ok(self
+            .cluster
+            .get_by_name::<SessionSpec>(&sha256_hex(cookie))?
+            .filter(|s| s.spec.expires_at > unix_now())
+            .map(|s| FoundSession {
+                user: s.spec.user,
+                epoch: s.spec.epoch,
+                shared: Some(s),
+            }))
+    }
+
+    /// 쿠키 세션의 사용자(감사 로그용). 없거나 읽지 못하면 None
+    pub(crate) fn session_user(&self, cookie: &str) -> Option<Uuid> {
+        self.find_session(cookie).ok().flatten().map(|s| s.user)
+    }
+
+    /// Raft 세션의 마지막 사용 시각을 가끔 적는다. 기다리지 않는다(그사이 지워졌으면 그대로 둔다).
+    fn touch_session(&self, session: &Session) {
+        let now = unix_now();
+        if now < session.status.last_used + SESSION_TOUCH_INTERVAL.as_secs()
+            || !self.sessions.touch_due(session.id, Instant::now())
+        {
+            return;
+        }
+        let cluster = self.cluster.clone();
+        let id = session.id;
+        tokio::spawn(async move {
+            let status = SessionStatus { last_used: now };
+            if let Err(e) = cluster.update_status::<SessionSpec>(id, &status).await {
+                tracing::debug!(session = %id, error = %e, "session last use not recorded");
+            }
+        });
+    }
+
+    /// 쿠키의 세션을 끝낸다(메모리와 Raft 모두). 어디에도 없으면 다른 노드의 메모리 세션일 수 있으므로
+    /// 로그아웃 표시를 남긴다([`AppState::mark_logged_out`]). `ip`는 요청한 클라이언트다.
+    pub(crate) async fn end_session(&self, cookie: &str, ip: IpAddr) -> Result<(), ApiError> {
+        let local = self.sessions.get(cookie).is_some();
+        self.sessions.remove(cookie);
+        match self
+            .cluster
+            .get_by_name::<SessionSpec>(&sha256_hex(cookie))?
+        {
+            Some(s) if s.spec.expires_at > unix_now() => {
+                deleted(self.cluster.delete::<SessionSpec>(s.id, None).await)?;
+            }
+            // 이미 끝났다(로그아웃 표시는 정리 작업이 때가 되면 지운다).
+            Some(_) => {}
+            None if !local => self.mark_logged_out(cookie, ip).await,
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// 다른 노드의 메모리 세션(옛 노드가 남았거나 정족수가 없을 때 만든 것)을 끝내려고, 쿠키 해시 이름으로
+    /// 이미 끝난 `Session`(주인 없음, 만료 지금)을 Raft에 쓴다. 그 노드는 메모리 세션을 쓸 때마다 이것을
+    /// 보고 거절한다. 쓰지 못하면(정족수 없음 등) 경고만 한다. 표시를 쓰는 로그아웃은 클라이언트 IP의
+    /// 로그인 실패로 세고, 막혔으면 쓰지 않는다(로그아웃은 그래도 성공으로 답해 알려 주지 않는다).
+    async fn mark_logged_out(&self, cookie: &str, ip: IpAddr) {
+        // 이 노드가 만드는 쿠키 모양(32바이트 hex)만
+        if cookie.len() != 64 || !cookie.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return;
+        }
+        let shared = crate::cluster::missing_feature(&self.cluster, SHARED_SESSIONS)
+            .is_ok_and(|missing| missing.is_empty());
+        if !shared {
+            return;
+        }
+        if !self.cluster.health().quorum {
+            tracing::warn!("the cluster has no quorum; a session on another node is not ended");
+            return;
+        }
+        let marks = self.cluster.list::<SessionSpec>().map(|(_, sessions)| {
+            sessions
+                .iter()
+                .filter(|s| s.spec.user == Uuid::nil())
+                .count()
+        });
+        if marks.as_ref().is_ok_and(|n| *n >= MAX_LOGOUT_MARKS) {
+            tracing::warn!("too many logout marks; a session on another node is not ended");
+            return;
+        }
+        if self.attempts.begin_ip(ip).is_err() {
+            tracing::debug!(%ip, "too many logouts of unknown sessions; no logout mark");
+            return;
+        }
+        let mark = Session::new(
+            sha256_hex(cookie),
+            SessionSpec {
+                user: Uuid::nil(),
+                epoch: 0,
+                expires_at: unix_now(),
+            },
+        );
+        match self.cluster.create(&mark).await {
+            Ok(_) | Err(ClusterError::Rejected(Rejection::NameTaken { .. })) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot mark the session logged out; a session on another node is not ended");
+            }
+        }
+    }
+
+    /// 사용자의 Raft 세션이 [`MAX_USER_SESSIONS`]개 이상이면 가장 오래된 것부터 지워 새 세션 자리를
+    /// 만든다. 지우지 못하면 경고만 한다.
+    async fn limit_user_sessions(&self, user: Uuid) -> Result<(), ApiError> {
+        let (_, sessions) = self.cluster.list::<SessionSpec>()?;
+        let mut mine: Vec<Session> = sessions
+            .into_iter()
+            .filter(|s| s.spec.user == user)
+            .collect();
+        if mine.len() < MAX_USER_SESSIONS {
+            return Ok(());
+        }
+        // 만료 시각이 이른 것이 먼저 만든 것이다.
+        mine.sort_by_key(|s| s.spec.expires_at);
+        let extra = mine.len() + 1 - MAX_USER_SESSIONS;
+        for s in mine.into_iter().take(extra) {
+            if let Err(e) = deleted(self.cluster.delete::<SessionSpec>(s.id, None).await) {
+                tracing::warn!(%user, error = ?e, "cannot delete an old session");
+            }
+        }
+        Ok(())
+    }
+
+    /// 사용자의 세션을 모두 끝낸다(비밀번호를 바꿨거나 사용자를 지웠을 때).
+    pub(crate) async fn end_user_sessions(&self, user: Uuid) -> Result<(), ApiError> {
+        self.sessions.remove_user(user);
+        let (_, sessions) = self.cluster.list::<SessionSpec>()?;
+        for s in sessions.into_iter().filter(|s| s.spec.user == user) {
+            deleted(self.cluster.delete::<SessionSpec>(s.id, None).await)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn principal_for(&self, user: Uuid) -> Result<Option<Principal>, ApiError> {
         match self.cluster.get::<UserSpec>(user)? {
             Some(u) if self.realm_exists(&u)? => Ok(Some(principal_of(u))),
@@ -244,9 +470,8 @@ impl AppState {
                 .ok_or_else(ApiError::unauthorized);
         }
         let session = session_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
-        let (user, epoch) = self
-            .sessions
-            .get(session)
+        let found = self
+            .find_session(session)?
             .ok_or_else(ApiError::unauthorized)?;
         // 쿠키는 브라우저가 알아서 붙이므로, 다른 출처의 페이지가 보낸 요청(WebSocket 포함)은 받지 않는다.
         if !same_origin(&parts.headers) {
@@ -258,15 +483,19 @@ impl AppState {
         }
         let user = self
             .cluster
-            .get::<UserSpec>(user)?
+            .get::<UserSpec>(found.user)?
             .ok_or_else(ApiError::unauthorized)?;
-        // 세션을 만든 뒤 비밀번호가 바뀌었다(다른 노드에서 바뀌었을 수도 있다).
-        if user.spec.session_epoch != epoch {
+        // 세션을 만든 뒤 비밀번호가 바뀌었다(다른 노드에서 바뀌었을 수도 있다). Raft 세션은 리더의
+        // 정리 작업이 지운다.
+        if user.spec.session_epoch != found.epoch {
             self.sessions.remove(session);
             return Err(ApiError::unauthorized());
         }
         if !self.realm_exists(&user)? {
             return Err(ApiError::unauthorized());
+        }
+        if let Some(shared) = &found.shared {
+            self.touch_session(shared);
         }
         Ok(principal_of(user))
     }
@@ -381,6 +610,17 @@ mod tests {
         s.remove_user(user);
         assert_eq!((s.get(&a), s.get(&b)), (None, None));
         assert!(s.get(&other).is_some());
+    }
+
+    #[test]
+    fn session_use_is_recorded_at_most_once_per_interval() {
+        let s = Sessions::default();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let start = Instant::now();
+        assert!(s.touch_due(a, start));
+        assert!(!s.touch_due(a, start + Duration::from_secs(1)));
+        assert!(s.touch_due(b, start + Duration::from_secs(1)));
+        assert!(s.touch_due(a, start + SESSION_TOUCH_INTERVAL));
     }
 
     #[test]

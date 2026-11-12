@@ -53,7 +53,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 세션을 끝내고 브라우저의 세션 쿠키를 지운다. */
+        /**
+         * 세션을 끝내고(모든 노드에서) 브라우저의 세션 쿠키를 지운다. 클러스터가 세션을 지우지 못하면
+         *     (리더 없음 등) 5XX이고 쿠키는 그대로다.
+         */
         post: operations["logout"];
         delete?: never;
         options?: never;
@@ -5098,6 +5101,14 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
         };
     };

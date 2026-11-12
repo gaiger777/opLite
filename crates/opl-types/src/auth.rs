@@ -7,6 +7,9 @@ use crate::resource::{Kind, NameError, Resource, ResourceSpec, validate_name};
 pub type User = Resource<UserSpec, UserStatus>;
 /// API 토큰. 리소스 이름은 사용자가 붙인 이름이다. 비밀 값은 해시만 저장한다.
 pub type ApiToken = Resource<ApiTokenSpec, ApiTokenStatus>;
+/// 로그인 세션(웹 UI의 쿠키). 리소스 이름은 쿠키 값의 SHA-256(16진수)이라 원문은 저장하지 않는다.
+/// 모든 노드가 같은 세션을 본다(앞단 프록시가 어느 노드로 보내도 이어진다).
+pub type Session = Resource<SessionSpec, SessionStatus>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -130,9 +133,52 @@ impl ResourceSpec for ApiTokenSpec {
 #[serde(default)]
 pub struct ApiTokenStatus {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSpec {
+    /// 세션 주인(User id)
+    pub user: Uuid,
+    /// 만들 때 사용자의 `session_epoch`. 다르면 세션이 끊긴다.
+    pub epoch: u64,
+    /// 끝나는 시각(유닉스 초). 지나면 쓸 수 없고 리더의 정리 작업이 지운다.
+    pub expires_at: u64,
+}
+
+impl ResourceSpec for SessionSpec {
+    const KIND: Kind = Kind::Session;
+    type Status = SessionStatus;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SessionStatus {
+    /// 마지막으로 쓴 시각(유닉스 초). 노드가 가끔(최대 1분에 한 번) 적으므로 그만큼 늦을 수 있다.
+    pub last_used: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_storage_format_is_stable() {
+        let user = Uuid::from_u128(1);
+        let spec = SessionSpec {
+            user,
+            epoch: 2,
+            expires_at: 100,
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "user": user.to_string(), "epoch": 2, "expires_at": 100 })
+        );
+        assert_eq!(serde_json::from_value::<SessionSpec>(json).unwrap(), spec);
+        assert_eq!(SessionSpec::KIND, Kind::Session);
+        assert_eq!(serde_json::to_value(Kind::Session).unwrap(), "session");
+        let status: SessionStatus = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(status.last_used, 0);
+    }
 
     #[test]
     fn user_session_epoch_defaults_to_zero() {

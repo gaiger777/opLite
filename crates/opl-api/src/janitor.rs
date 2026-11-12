@@ -4,6 +4,7 @@
 //! 예약 스냅샷의 만들기·예약 정리의 삭제를 끝냈으면 실행기처럼 `task_failed`로 VM에 남긴다.
 //! 끝난 Task는 기간·개수 기준으로 지운다(웹 정리 설계 §2). 오래 `receiving`인 백업(보내던 클러스터가
 //! 끝내지 못한 사본)은 지우기 Task를 만들어 파일과 함께 지운다(엔터프라이즈 설계 §6.1).
+//! 끝났거나 쓸 수 없게 된(주인이 없거나 비밀번호가 바뀐) 로그인 세션을 지운다(가용성 설계 §4).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::auth::{Session, SessionSpec, User, UserSpec};
 use opl_types::backup::{Backup, BackupPhase, BackupSpec};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
@@ -19,6 +21,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::auth::SESSION_TTL;
 use crate::backups::start_backup_delete;
 use crate::schedule::{recorded_vm, set_schedule_error, task_failed};
 use crate::state::AppState;
@@ -127,6 +130,10 @@ enum Action {
         revision: u64,
     },
     DeleteTask {
+        id: Uuid,
+        revision: u64,
+    },
+    DeleteSession {
         id: Uuid,
         revision: u64,
     },
@@ -240,6 +247,27 @@ fn expired_tasks(
         .collect()
 }
 
+/// 지울 세션을 최대 `limit`개 고른다: 끝난 것(`expires_at`이 `now`(유닉스 초) 이하), 주인이 없는 것,
+/// 만든 뒤 주인의 세션 세대가 바뀐 것. 로그아웃 표시(주인이 nil)는 그것이 끝내려던 메모리 세션이 끝날
+/// 때까지(표시 뒤 [`SESSION_TTL`]) 둔다.
+fn stale_sessions(now: u64, sessions: &[Session], users: &[User], limit: usize) -> Vec<Action> {
+    let epochs: HashMap<Uuid, u64> = users.iter().map(|u| (u.id, u.spec.session_epoch)).collect();
+    sessions
+        .iter()
+        .filter(|s| {
+            if s.spec.user == Uuid::nil() {
+                return s.spec.expires_at + SESSION_TTL.as_secs() <= now;
+            }
+            s.spec.expires_at <= now || epochs.get(&s.spec.user) != Some(&s.spec.epoch)
+        })
+        .take(limit)
+        .map(|s| Action::DeleteSession {
+            id: s.id,
+            revision: s.revision,
+        })
+        .collect()
+}
+
 /// 만든 지, 그리고 마지막으로 파일을 받은 지(`received_at`) `receiving_max_age`가 넘은 `receiving` 백업
 /// 가운데 지우는 Task가 없는 것
 fn stale_receiving<'a>(
@@ -293,9 +321,11 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
             cluster.list::<TaskSpec>()?.1,
             cluster.list::<SnapshotSpec>()?.1,
             cluster.list::<BackupSpec>()?.1,
+            cluster.list::<SessionSpec>()?.1,
+            cluster.list::<UserSpec>()?.1,
         ))
     })();
-    let Ok((nodes, tasks, snapshots, backups)) = lists else {
+    let Ok((nodes, tasks, snapshots, backups, sessions, users)) = lists else {
         return;
     };
     let ids: BTreeSet<Uuid> = members
@@ -314,9 +344,15 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
         seen,
         TASK_DELETES_PER_TICK,
     ));
+    actions.extend(stale_sessions(
+        crate::auth::unix_now(),
+        &sessions,
+        &users,
+        TASK_DELETES_PER_TICK,
+    ));
     let mut skip_deletes = false;
     for action in actions {
-        if skip_deletes && matches!(action, Action::DeleteTask { .. }) {
+        if skip_deletes && is_delete(&action) {
             continue;
         }
         let result = apply(cluster, &action).await;
@@ -376,14 +412,25 @@ async fn apply(cluster: &Cluster, action: &Action) -> Result<u64, ClusterError> 
         Action::DeleteTask { id, revision } => {
             cluster.delete::<TaskSpec>(*id, Some(*revision)).await
         }
+        Action::DeleteSession { id, revision } => {
+            cluster.delete::<SessionSpec>(*id, Some(*revision)).await
+        }
     }
 }
 
-/// 끝난 Task 지우기가 거부(그사이 바뀜·없어짐)가 아닌 오류(시간 초과, 리더 아님 등)로 실패했으면
+/// 끝난 Task·세션 지우기가 거부(그사이 바뀜·없어짐)가 아닌 오류(시간 초과, 리더 아님 등)로 실패했으면
 /// 클러스터가 쓰기를 받지 못하는 것이므로 이 tick의 남은 지우기는 건너뛴다(한 tick에 최대
 /// `TASK_DELETES_PER_TICK`번 기다리지 않게).
 fn stops_deletes(action: &Action, err: &ClusterError) -> bool {
-    matches!(action, Action::DeleteTask { .. }) && !matches!(err, ClusterError::Rejected(_))
+    is_delete(action) && !matches!(err, ClusterError::Rejected(_))
+}
+
+/// 많이 몰릴 수 있는 지우기(끝난 Task, 세션)
+fn is_delete(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::DeleteTask { .. } | Action::DeleteSession { .. }
+    )
 }
 
 /// 실패 쓰기가 `RevisionMismatch`로 거부됐어도 앞선 시도의 응답만 잃은 자기 쓰기일 수 있다(전달
@@ -1005,5 +1052,70 @@ mod tests {
         let got = stale_receiving(now, &CONFIG, &backups, &[task, done]);
         let ids: Vec<Uuid> = got.iter().map(|b| b.id).collect();
         assert_eq!(ids, [stale.id, idle.id]);
+    }
+
+    fn user(epoch: u64) -> User {
+        Resource::new(
+            "u",
+            UserSpec {
+                password_hash: "h".into(),
+                role: opl_types::auth::Role::Viewer,
+                session_epoch: epoch,
+                realm: None,
+                subject: None,
+            },
+        )
+    }
+
+    fn session(user: Uuid, epoch: u64, expires_at: u64) -> Session {
+        let mut s: Session = Resource::new(
+            "h",
+            SessionSpec {
+                user,
+                epoch,
+                expires_at,
+            },
+        );
+        s.revision = 5;
+        s
+    }
+
+    #[test]
+    fn expired_orphaned_and_old_epoch_sessions_go() {
+        let alice = user(2);
+        let live = session(alice.id, 2, 101);
+        let expired = session(alice.id, 2, 100);
+        let old_epoch = session(alice.id, 1, 200);
+        let orphan = session(Uuid::now_v7(), 0, 200);
+        let sessions = [live, expired.clone(), old_epoch.clone(), orphan.clone()];
+        let users = [alice];
+        let del = |s: &Session| Action::DeleteSession {
+            id: s.id,
+            revision: 5,
+        };
+        assert_eq!(
+            stale_sessions(100, &sessions, &users, 200),
+            vec![del(&expired), del(&old_epoch), del(&orphan)]
+        );
+        assert_eq!(
+            stale_sessions(100, &sessions, &users, 1),
+            vec![del(&expired)]
+        );
+    }
+
+    /// 로그아웃 표시(주인 nil, 표시한 때에 끝남)는 그 뒤 세션 수명이 지나야 지운다.
+    #[test]
+    fn logout_marks_stay_for_a_session_lifetime() {
+        let ttl = SESSION_TTL.as_secs();
+        let mark = session(Uuid::nil(), 0, 100);
+        let sessions = [mark.clone()];
+        assert!(stale_sessions(100 + ttl - 1, &sessions, &[], 200).is_empty());
+        assert_eq!(
+            stale_sessions(100 + ttl, &sessions, &[], 200),
+            vec![Action::DeleteSession {
+                id: mark.id,
+                revision: 5
+            }]
+        );
     }
 }

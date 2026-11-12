@@ -6,6 +6,7 @@
 //! 감사 로그: 한 노드의 `GET /audit`가 두 노드의 항목을 합치고, 닿지 않는 노드를 알린다.
 //! 지표: 한 노드의 지표 API가 다른 노드의 지표를 읽고, 지표를 모르는 노드와 닿지 않는 노드를 알린다.
 //! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
+//! 세션: 한 노드에서 만든 로그인 세션을 다른 노드가 받고, 로그아웃이 두 노드에 반영된다.
 
 mod common;
 
@@ -2182,4 +2183,55 @@ async fn an_oidc_login_started_on_one_node_finishes_on_the_other() {
         .unwrap();
     assert_eq!(me["name"], "alice@okta", "{me}");
     assert_eq!(me["role"], "admin", "{me}");
+}
+
+/// `base`에서 쿠키 `cookie`로 whoami를 부른 상태
+async fn whoami_status(base: &str, cookie: &str) -> StatusCode {
+    reqwest::Client::new()
+        .get(format!("{base}/api/v1/auth/whoami"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// 세션은 Raft에 있어 한 노드에서 로그인하면 다른 노드에서도 되고, 로그아웃도 모든 노드에 반영된다.
+#[tokio::test]
+async fn a_session_made_on_one_node_works_on_the_other() {
+    let (_root, a, b) = two_nodes().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{}/api/v1/auth/login", a.base))
+        .json(&serde_json::json!({ "username": "admin", "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = resp.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    // B에는 곧 적용된다.
+    let deadline = Instant::now() + WAIT;
+    while whoami_status(&b.base, &cookie).await != StatusCode::OK {
+        assert!(Instant::now() < deadline, "session not usable on B");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let resp = http
+        .post(format!("{}/api/v1/auth/logout", b.base))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let deadline = Instant::now() + WAIT;
+    while whoami_status(&a.base, &cookie).await != StatusCode::UNAUTHORIZED {
+        assert!(Instant::now() < deadline, "session still usable on A");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

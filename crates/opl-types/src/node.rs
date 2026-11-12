@@ -117,6 +117,7 @@ pub const FEATURES: &[&str] = &[
     "storage-migration",
     "metrics",
     "node-roles",
+    "shared-sessions",
 ];
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
@@ -390,7 +391,8 @@ mod tests {
                 "incremental-replication",
                 "storage-migration",
                 "metrics",
-                "node-roles"
+                "node-roles",
+                "shared-sessions"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

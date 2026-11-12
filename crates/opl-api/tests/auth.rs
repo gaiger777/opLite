@@ -1,13 +1,18 @@
-//! 로그인, 세션, API 토큰, 역할 권한.
+//! 로그인, 세션(Raft에 두어 모든 노드가 본다), API 토큰, 역할 권한.
 
 mod common;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
-use common::{ADMIN_PASSWORD, Env};
+use common::{ADMIN_PASSWORD, Env, WAIT};
 use opl_api::AppState;
+use opl_types::auth::{Session, SessionSpec, SessionStatus, UserSpec};
+use opl_types::node::{FEATURES, NodeSpec, NodeStatus};
+use opl_types::resource::Resource;
 use reqwest::StatusCode;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 #[tokio::test]
 async fn requests_without_credentials_are_rejected() {
@@ -515,4 +520,302 @@ async fn password_change_ends_sessions_on_other_nodes() {
     let (status, body) = whoami_with_cookie(&b, &cookie).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["role"], "operator");
+}
+
+fn sessions(env: &Env) -> Vec<Session> {
+    env.cluster.list::<SessionSpec>().unwrap().1
+}
+
+/// 쿠키 `opl_session=<값>`의 값
+fn cookie_value(cookie: &str) -> &str {
+    cookie.strip_prefix("opl_session=").unwrap()
+}
+
+async fn logout_at(base: &str, cookie: &str) -> StatusCode {
+    reqwest::Client::new()
+        .post(format!("{base}/api/v1/auth/logout"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn sessions_live_in_the_cluster_and_work_on_every_node() {
+    let env = Env::start().await;
+    let b = serve_another_node(&env).await;
+
+    // 노드 A에서 만든 세션으로 노드 B(메모리가 따로)에 요청한다.
+    let cookie = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    let (status, body) = whoami_with_cookie(&b, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "admin");
+    // Raft에는 쿠키 값의 해시만 있다.
+    let stored = sessions(&env);
+    assert_eq!(stored.len(), 1);
+    let value = cookie_value(&cookie);
+    assert_eq!(
+        stored[0].name,
+        hex::encode(Sha256::digest(value.as_bytes()))
+    );
+    assert!(!serde_json::to_string(&stored[0]).unwrap().contains(value));
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let ttl = stored[0].spec.expires_at - now;
+    assert!((12 * 3600 - 60..=12 * 3600).contains(&ttl), "{ttl}");
+
+    // B에서 로그아웃하면 A에서도 끝난다.
+    assert_eq!(logout_at(&b, &cookie).await, StatusCode::NO_CONTENT);
+    assert!(sessions(&env).is_empty());
+    assert_eq!(
+        whoami_with_cookie(&env.base, &cookie).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // 이미 끝난 세션의 로그아웃도 된다.
+    assert_eq!(logout_at(&env.base, &cookie).await, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn expired_sessions_are_rejected_everywhere() {
+    let env = Env::start().await;
+    let b = serve_another_node(&env).await;
+    let cookie = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    let session = sessions(&env).remove(0);
+    let spec = SessionSpec {
+        expires_at: session.spec.expires_at - 13 * 3600,
+        ..session.spec
+    };
+    env.cluster
+        .update_spec(session.id, None, session.labels, &spec)
+        .await
+        .unwrap();
+    for base in [&env.base, &b] {
+        assert_eq!(
+            whoami_with_cookie(base, &cookie).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn last_use_is_recorded_in_the_cluster() {
+    let env = Env::start().await;
+    let cookie = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    let session = sessions(&env).remove(0);
+    // 만들 때 적고, 1분 안에 다시 쓰면 적지 않는다.
+    assert!(session.status.last_used > 0);
+    assert_eq!(
+        whoami_with_cookie(&env.base, &cookie).await.0,
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(sessions(&env)[0].revision, session.revision);
+
+    // 오래전에 쓴 세션이면 다음 요청이 적는다(기다리지 않고 뒤에서).
+    env.cluster
+        .update_status::<SessionSpec>(session.id, &SessionStatus { last_used: 1 })
+        .await
+        .unwrap();
+    assert_eq!(
+        whoami_with_cookie(&env.base, &cookie).await.0,
+        StatusCode::OK
+    );
+    let deadline = Instant::now() + WAIT;
+    while sessions(&env)[0].status.last_used < session.status.last_used {
+        assert!(Instant::now() < deadline, "last use not recorded");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn password_change_and_user_deletion_delete_their_sessions() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let alice = env.user("alice", "viewer").await;
+    env.user("bob", "viewer").await;
+    let before = sessions(&env).len();
+    cookie_login(&env.base, "alice", "password-1").await;
+    cookie_login(&env.base, "bob", "password-1").await;
+    assert_eq!(sessions(&env).len(), before + 2);
+
+    let (status, body) = alice
+        .put(
+            "/users/alice",
+            json!({ "password": "new-password", "current_password": "password-1" }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let users = |env: &Env| {
+        sessions(env)
+            .into_iter()
+            .map(|s| s.spec.user)
+            .collect::<Vec<_>>()
+    };
+    let alice_id = env
+        .cluster
+        .get_by_name::<UserSpec>("alice")
+        .unwrap()
+        .unwrap()
+        .id;
+    let bob_id = env
+        .cluster
+        .get_by_name::<UserSpec>("bob")
+        .unwrap()
+        .unwrap()
+        .id;
+    assert!(!users(&env).contains(&alice_id));
+    assert!(users(&env).contains(&bob_id));
+
+    let (status, body) = admin.delete("/users/bob").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!users(&env).contains(&bob_id));
+}
+
+/// 한 사용자의 Raft 세션은 32개까지이고, 넘으면 가장 오래된 것부터 지운다.
+#[tokio::test]
+async fn a_user_keeps_at_most_32_sessions() {
+    let env = Env::start().await;
+    let admin = env
+        .cluster
+        .get_by_name::<UserSpec>("admin")
+        .unwrap()
+        .unwrap();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // 오래된 세션 32개(앞의 것일수록 일찍 끝난다)
+    for i in 0..32u64 {
+        let session = Session::new(
+            format!("{i:064x}"),
+            SessionSpec {
+                user: admin.id,
+                epoch: admin.spec.session_epoch,
+                expires_at: now + 3600 + i,
+            },
+        );
+        env.cluster.create(&session).await.unwrap();
+    }
+    let cookie = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    let mine: Vec<Session> = sessions(&env)
+        .into_iter()
+        .filter(|s| s.spec.user == admin.id)
+        .collect();
+    assert_eq!(mine.len(), 32);
+    // 가장 오래된 것이 지워지고 새 세션이 남았다.
+    assert!(!mine.iter().any(|s| s.name == format!("{:064x}", 0)));
+    assert!(mine.iter().any(|s| s.name == format!("{:064x}", 1)));
+    assert_eq!(
+        whoami_with_cookie(&env.base, &cookie).await.0,
+        StatusCode::OK
+    );
+}
+
+/// 다른 노드의 메모리 세션(옛 노드가 남았을 때 만든 것)도 이 노드의 로그아웃으로 끝난다: 이 노드는 Raft에
+/// 로그아웃 표시를 남기고, 그 노드는 메모리 세션을 쓸 때 그 표시를 보고 거절한다.
+#[tokio::test]
+async fn logging_out_on_another_node_ends_a_node_local_session() {
+    let env = Env::start().await;
+    let mut old = Resource::new(
+        "old",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    old.status = NodeStatus {
+        features: FEATURES
+            .iter()
+            .filter(|f| **f != "shared-sessions")
+            .map(|f| f.to_string())
+            .collect(),
+        ..Default::default()
+    };
+    env.cluster.create(&old).await.unwrap();
+    let b = serve_another_node(&env).await;
+    // 노드 A의 메모리 세션
+    let cookie = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    assert!(sessions(&env).is_empty());
+    // 옛 노드가 업그레이드된 뒤 노드 B에서 로그아웃한다.
+    let status = NodeStatus {
+        features: FEATURES.iter().map(|f| f.to_string()).collect(),
+        ..Default::default()
+    };
+    env.cluster
+        .update_status::<NodeSpec>(old.id, &status)
+        .await
+        .unwrap();
+    assert_eq!(logout_at(&b, &cookie).await, StatusCode::NO_CONTENT);
+    let marks = sessions(&env);
+    assert_eq!(marks.len(), 1);
+    assert_eq!(
+        marks[0].name,
+        hex::encode(Sha256::digest(cookie_value(&cookie).as_bytes()))
+    );
+    assert_eq!(
+        whoami_with_cookie(&env.base, &cookie).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // 표시는 다시 로그아웃해도 그대로다(정리 작업이 때가 되면 지운다).
+    assert_eq!(logout_at(&b, &cookie).await, StatusCode::NO_CONTENT);
+    assert_eq!(sessions(&env).len(), 1);
+}
+
+/// 로그아웃 표시는 로그인 실패처럼 IP마다 세어, 한 IP가 아무 쿠키로 표시를 쌓지 못한다. 막혀도 로그아웃은
+/// 204다(알려 주지 않는다).
+#[tokio::test]
+async fn logout_marks_from_one_address_are_limited() {
+    let env = Env::start().await;
+    for i in 0..30u32 {
+        let cookie = format!("opl_session={i:064x}");
+        assert_eq!(logout_at(&env.base, &cookie).await, StatusCode::NO_CONTENT);
+    }
+    assert_eq!(sessions(&env).len(), opl_api::limit::IP_FAILURES as usize);
+}
+
+#[tokio::test]
+async fn sessions_stay_on_the_node_while_a_node_is_not_upgraded() {
+    let env = Env::start().await;
+    // 세션 공유를 모르는 옛 노드가 남았다.
+    let mut old = Resource::new(
+        "old",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    old.status = NodeStatus {
+        features: FEATURES
+            .iter()
+            .filter(|f| **f != "shared-sessions")
+            .map(|f| f.to_string())
+            .collect(),
+        ..Default::default()
+    };
+    env.cluster.create(&old).await.unwrap();
+    let b = serve_another_node(&env).await;
+
+    let cookie = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    assert!(sessions(&env).is_empty());
+    assert_eq!(
+        whoami_with_cookie(&env.base, &cookie).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        whoami_with_cookie(&b, &cookie).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(logout_at(&env.base, &cookie).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        whoami_with_cookie(&env.base, &cookie).await.0,
+        StatusCode::UNAUTHORIZED
+    );
 }

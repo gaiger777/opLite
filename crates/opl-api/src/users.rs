@@ -118,15 +118,15 @@ pub async fn login(
         },
         AuditAuth::Session,
     );
-    let cookie = new_session(&state, &user)?;
+    let cookie = new_session(&state, &user).await?;
     let mut response = Json(UserView::from(user)).into_response();
     response.headers_mut().insert(SET_COOKIE, cookie);
     Ok(response)
 }
 
 /// 사용자의 세션을 만들고 그 세션 쿠키(Set-Cookie 값)를 돌려준다.
-pub(crate) fn new_session(state: &AppState, user: &User) -> Result<HeaderValue, ApiError> {
-    let session = state.sessions.create(user.id, user.spec.session_epoch);
+pub(crate) async fn new_session(state: &AppState, user: &User) -> Result<HeaderValue, ApiError> {
+    let session = state.create_session(user).await?;
     let mut cookie = format!(
         "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
         SESSION_TTL.as_secs()
@@ -332,23 +332,28 @@ fn wrong_credentials() -> ApiError {
     )
 }
 
-/// 세션을 끝내고 브라우저의 세션 쿠키를 지운다.
+/// 세션을 끝내고(모든 노드에서) 브라우저의 세션 쿠키를 지운다. 클러스터가 세션을 지우지 못하면
+/// (리더 없음 등) 5XX이고 쿠키는 그대로다.
 #[utoipa::path(post, path = "/auth/logout", tag = "auth", security(()),
     responses((status = 204, description = "Logged out; the session cookie is cleared",
-        headers(("set-cookie" = String)))))]
+        headers(("set-cookie" = String))),
+        (status = "5XX", body = crate::error::ErrorBody)))]
 pub async fn logout(
+    ClientIp(ip): ClientIp,
     State(state): State<Arc<AppState>>,
     audit: AuditNote,
     headers: HeaderMap,
 ) -> Response {
     if let Some(id) = session_cookie(&headers) {
         // 지우기 전에 세션의 사용자를 감사 로그에 남긴다.
-        if let Some((user, _)) = state.sessions.get(id)
+        if let Some(user) = state.session_user(id)
             && let Ok(Some(principal)) = state.principal_for(user)
         {
             audit.principal(principal, AuditAuth::Session);
         }
-        state.sessions.remove(id);
+        if let Err(e) = state.end_session(id, ip).await {
+            return e.into_response();
+        }
     }
     let mut cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
     if state.secure_cookies {
@@ -500,8 +505,9 @@ pub async fn update_user(
         .cluster
         .update_spec(user.id, Some(user.revision), user.labels, &spec)
         .await?;
-    if password_changed {
-        state.sessions.remove_user(user.id);
+    // 세션 세대가 이미 옛 세션을 막는다. 지우지 못한 Raft 세션은 리더의 정리 작업이 지운다.
+    if password_changed && let Err(e) = state.end_user_sessions(user.id).await {
+        tracing::warn!(user = %user.name, error = %e.message, "old sessions not deleted");
     }
     Ok(Json(
         lookup::<UserSpec>(&state.cluster, &user.id.to_string())?.into(),
@@ -530,6 +536,10 @@ pub async fn delete_user(
     let (_, tokens) = state.cluster.list::<ApiTokenSpec>()?;
     for token in tokens.into_iter().filter(|t| t.spec.user == user.id) {
         state.cluster.delete::<ApiTokenSpec>(token.id, None).await?;
+    }
+    // 세션도 주인을 다시 읽으므로 이미 쓸 수 없다. 지우지 못한 것은 리더의 정리 작업이 지운다.
+    if let Err(e) = state.end_user_sessions(user.id).await {
+        tracing::warn!(user = %user.name, error = %e.message, "sessions not deleted");
     }
     Ok(StatusCode::NO_CONTENT)
 }
