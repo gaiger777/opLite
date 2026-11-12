@@ -363,3 +363,98 @@ async fn health_and_api_endpoints_follow_roles_and_maintenance() {
     assert_eq!(health(&d, "").await.0, 200);
     d.stop();
 }
+
+/// 계획 46: `[api] tls_cert`·`tls_key`(관리자 인증서)가 있으면 API 리스너가 그것을 그대로 쓴다(클러스터
+/// CA로 다시 발급하지 않는다). 파일을 읽지 못하면 opld가 시작하지 못한다.
+#[tokio::test]
+async fn an_admin_certificate_is_served_as_is() {
+    const NAME: &str = "api.corp.example";
+    let files = tempfile::tempdir().unwrap();
+    let corp = opl_peer::pki::ClusterCa::generate("corp").unwrap();
+    let (key_pem, csr) = opl_peer::pki::node_key_and_csr().unwrap();
+    let cert_pem = corp.sign_api(&csr, &[NAME.into()]).unwrap();
+    let (cert, key) = (files.path().join("api.crt"), files.path().join("api.key"));
+    std::fs::write(&cert, cert_pem).unwrap();
+    std::fs::write(&key, key_pem).unwrap();
+    let mut d = Daemon::new(
+        "node1",
+        &format!(
+            "[api]\ntls_cert = {:?}\ntls_key = {:?}",
+            cert.display().to_string(),
+            key.display().to_string()
+        ),
+    );
+    d.start().await;
+    d.init("prod").await;
+    let resp = live_by_name(&d, &corp.cert_pem, NAME).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    d.stop();
+
+    std::fs::remove_file(&key).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_orbivisord"))
+        .arg("--config")
+        .arg(d.path("opld.toml"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + common::WAIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("opld started without its API key");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert!(!status.success());
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
+    assert!(err.contains("api.key"), "{err}");
+}
+
+/// 클러스터 CA로 확인하며 `https://<name>:<포트>`(127.0.0.1로 풂)의 `?live` 헬스 체크를 부른다.
+async fn live_by_name(d: &Daemon, ca_pem: &str, name: &str) -> reqwest::Result<reqwest::Response> {
+    reqwest::Client::builder()
+        .tls_certs_only([reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()])
+        .resolve(name, ([127, 0, 0, 1], d.port).into())
+        .build()
+        .unwrap()
+        .get(format!("https://{name}:{}/api/v1/health?live", d.port))
+        .send()
+        .await
+}
+
+/// 계획 46: 클러스터 설정 `api_names`를 바꾸면 노드가 API 인증서를 다시 서명해 다시 시작하지 않고 그
+/// 이름으로 확인되게 한다. 다시 시작해도 그 이름을 쓴다.
+#[tokio::test]
+async fn api_names_are_served_by_the_api_listener() {
+    const NAME: &str = "orbivisor.example.com";
+    let mut d = Daemon::new("node1", "");
+    d.start().await;
+    d.init("prod").await;
+    d.login().await;
+    let ca = d.ctl(&["cluster", "ca"]).await.unwrap();
+    assert!(live_by_name(&d, &ca, NAME).await.is_err());
+
+    d.ctl(&["settings", "set", &format!("api_names={NAME}")])
+        .await
+        .unwrap();
+    eventually("the API name", || async {
+        live_by_name(&d, &ca, NAME).await.is_ok()
+    })
+    .await;
+    // 노드 주소는 그대로 확인된다.
+    assert_eq!(health(&d, "?live").await.0, 200);
+
+    d.stop();
+    d.start().await;
+    eventually("the API name after a restart", || async {
+        live_by_name(&d, &ca, NAME).await.is_ok()
+    })
+    .await;
+    d.stop();
+}

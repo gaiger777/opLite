@@ -3999,6 +3999,11 @@ export interface components {
              */
             revision: number;
             spec: {
+                /**
+                 * @description 앞단·VIP에서 API를 부르는 이름(DNS 이름·IP). 각 노드가 자기 API 인증서에 더한다(피어 인증서는 그대로).
+                 *     비어 있으면 쓰지 않는다.
+                 */
+                api_names?: string[];
                 /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
                 telemetry?: components["schemas"]["TelemetrySettings"];
                 updates?: components["schemas"]["UpdateSettings"];
@@ -4351,6 +4356,8 @@ export interface components {
         SecurityGroupStatus: Record<string, never>;
         /** @description 설정에서 바꿀 값. 주어진 필드만 바꾼다. */
         SettingsPatch: {
+            /** @description 노드 API 인증서에 더할 이름(DNS 이름·IP) 전체. `[]`는 지워 노드 이름만 쓴다. */
+            api_names?: string[];
             telemetry?: components["schemas"]["TelemetryPatch"];
             updates?: components["schemas"]["UpdateSettingsPatch"];
             /**
@@ -4360,6 +4367,11 @@ export interface components {
             web_origins?: string[];
         };
         SettingsSpec: {
+            /**
+             * @description 앞단·VIP에서 API를 부르는 이름(DNS 이름·IP). 각 노드가 자기 API 인증서에 더한다(피어 인증서는 그대로).
+             *     비어 있으면 쓰지 않는다.
+             */
+            api_names?: string[];
             /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
             telemetry?: components["schemas"]["TelemetrySettings"];
             updates?: components["schemas"]["UpdateSettings"];

@@ -9,7 +9,7 @@ use openraft::{BasicNode, ServerState};
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
-use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
+use opl_peer::pki::{ClusterCa, NodeTls, api_cert, node_key_and_csr};
 use opl_peer::{
     AuditSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration, MetricsReply,
     MetricsSource, MigrateIncomingRequest, MigrateIncomingResponse, MigrationReceiver, NodeMonitor,
@@ -348,6 +348,15 @@ async fn strangers_and_non_members_are_refused() {
         nodes[0].peers.ping(&nodes[0].addr, WAIT).await.unwrap(),
         nodes[0].id()
     );
+    // 멤버의 API 인증서(서버 인증만, 노드 id 없음)로는 피어가 되지 못한다.
+    let member = tls_for(&ca, nodes[0].id());
+    let (api_pem, api_key) = api_cert(&ca, &member.cert_pem, &[]).unwrap();
+    let api = Peers::new(&NodeTls {
+        ca_pem: ca.cert_pem.clone(),
+        cert_pem: api_pem,
+        key_pem: api_key,
+    });
+    assert!(api.ping(&nodes[0].addr, WAIT).await.is_err());
 }
 
 /// 시험이 실패해도 따로 만든 실행기를 끝낸다(async 문맥에서 그냥 놓으면 panic한다).

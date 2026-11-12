@@ -13,9 +13,10 @@ use axum::serve::ListenerExt;
 use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
-    AppState, AuditLog, BackupJobScheduler, ClusterJanitor, HaManager, HaManagerConfig,
-    IncomingConfig, IncomingMigrations, RemotePoller, RuntimeProbe, SnapshotScheduler, TaskRunner,
-    TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates,
+    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, ClusterJanitor, HaManager,
+    HaManagerConfig, IncomingConfig, IncomingMigrations, RemotePoller, RuntimeProbe,
+    SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher,
+    UpdateAgent, Updates,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
@@ -24,7 +25,7 @@ use opl_driver::{
     Storages, SystemLvm, SystemRbd, SystemZfs, ZfsStorage, migration_tls_dir, write_migration_tls,
 };
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
-use opl_peer::tls::{TlsListener, api_server_config};
+use opl_peer::tls::{ApiCert, TlsListener, api_server_config_with};
 use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers};
 use opl_reconciler::{FirewallGate, FirmwareFetcher, HaGuard, Reconciler, ReconcilerConfig};
 use opl_types::node::NodeSpec;
@@ -119,6 +120,9 @@ struct Server<E> {
 /// 위트니스가 띄우지 않는 것: HTTPS API와 VM·풀을 다스리는 일, 리더의 일
 struct Services {
     api: Server<std::io::Error>,
+    /// API 이름(클러스터 설정 `api_names`)을 API 인증서에 더한다(관리자 인증서 `[api] tls_cert`를 쓰면
+    /// 없다).
+    api_cert: Option<ApiCertAgent>,
     reconciler: Reconciler,
     runner: TaskRunner,
     monitor: NodeMonitor,
@@ -158,6 +162,9 @@ impl Services {
             self.api.task.abort();
         }
         self.audit.shutdown().await;
+        if let Some(api_cert) = self.api_cert {
+            api_cert.shutdown().await;
+        }
         self.monitor.shutdown().await;
         self.schedule.shutdown().await;
         self.janitor.shutdown().await;
@@ -410,13 +417,20 @@ impl Member {
                 }
                 None => None,
             };
-            let api_tls = api_server_config(&tls)?;
+            // API 리스너는 관리자 인증서(`[api] tls_cert`)나 노드 인증서로 시작한다. 노드 인증서면 API
+            // 이름(클러스터 설정 `api_names`)이 있을 때 아래 `ApiCertAgent`가 열기 전에 바꿔 끼운다.
+            let api_cert = match config.api.read_tls()? {
+                Some((cert_pem, key_pem)) => ApiCert::new(&cert_pem, &key_pem)
+                    .map_err(|e| anyhow::anyhow!("api.tls_cert/api.tls_key: {e}"))?,
+                None => ApiCert::new(&tls.cert_pem, &tls.key_pem)?,
+            };
+            let api_tls = api_server_config_with(api_cert.clone())?;
             if init {
                 tls.save(&pki_dir(config))?;
             }
-            anyhow::Ok((state, created, api_tls))
+            anyhow::Ok((state, created, api_cert, api_tls))
         };
-        let (mut state, created, api_tls) = match prepared.await {
+        let (mut state, created, api_cert, api_tls) = match prepared.await {
             Ok(prepared) => prepared,
             Err(e) => {
                 let _ = peer.stop.send(());
@@ -545,6 +559,11 @@ impl Member {
             updates.map(|u| UpdateAgent::spawn(cluster.clone(), node, u))
         });
 
+        let api_cert = config.api.tls_cert.is_none().then(|| {
+            on(&rt.work, || {
+                ApiCertAgent::spawn(cluster.clone(), tls.clone(), api_cert)
+            })
+        });
         // TLS 핸드셰이크 작업이 `api`에 생긴다.
         let listener = on(&rt.api, || TlsListener::new(api_listener, api_tls))?;
         tracing::info!(
@@ -589,6 +608,7 @@ impl Member {
             peer,
             services: Some(Services {
                 api: Server { stop, task },
+                api_cert,
                 reconciler,
                 runner,
                 monitor,

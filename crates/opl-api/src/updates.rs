@@ -859,7 +859,7 @@ fn other_upgrade(cluster: &Cluster, task: Uuid) -> Option<String> {
 
 /// 설정이 바뀔 때까지 기다린다. 구독이 끊기면(뒤처짐, 스냅샷 설치) 구독을 버리고 돌아가 다시
 /// 맞추게 한다. 구독이 없으면 잠시 뒤 돌아가 다시 구독하게 한다.
-async fn settings_changed(watch: &mut Option<Watch>) {
+pub(crate) async fn settings_changed(watch: &mut Option<Watch>) {
     let Some(w) = watch else {
         return tokio::time::sleep(RESUBSCRIBE).await;
     };

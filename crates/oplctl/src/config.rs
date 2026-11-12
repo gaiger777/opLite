@@ -13,6 +13,10 @@ pub struct CliConfig {
     /// 서버의 클러스터 CA 인증서(PEM). HTTPS 서버는 이 CA로만 확인한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_pem: Option<String>,
+    /// 서버 인증서를 클러스터 CA 대신 OS 신뢰 저장소로 확인한다(`login --system-ca`, 관리자 인증서
+    /// `[api] tls_cert`를 둔 노드). 이때 `ca_pem`은 없다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system_ca: bool,
 }
 
 pub fn default_path() -> PathBuf {
@@ -67,6 +71,7 @@ mod tests {
             server: Some("http://127.0.0.1:8006".into()),
             token: Some("opl_x_y".into()),
             ca_pem: Some("CA".into()),
+            system_ca: false,
         };
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{}").unwrap();
@@ -75,5 +80,35 @@ mod tests {
         assert_eq!(CliConfig::load(&path).unwrap(), config);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// `system_ca`는 참일 때만 적고, 없는 옛 파일은 거짓으로 읽는다.
+    #[test]
+    fn system_ca_is_saved_only_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oplctl.json");
+        let config = CliConfig {
+            server: Some("https://api.example.com".into()),
+            token: Some("opl_x_y".into()),
+            ca_pem: None,
+            system_ca: true,
+        };
+        config.save(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["system_ca"], true);
+        assert_eq!(CliConfig::load(&path).unwrap(), config);
+        CliConfig {
+            system_ca: false,
+            ..config
+        }
+        .save(&path)
+        .unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("system_ca")
+        );
+        assert!(!CliConfig::load(&path).unwrap().system_ca);
     }
 }

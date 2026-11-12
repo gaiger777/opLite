@@ -53,6 +53,55 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub web_origins: Option<Vec<String>>,
+    /// 노드 API 인증서에 더할 이름(DNS 이름·IP) 전체. `[]`는 지워 노드 이름만 쓴다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub api_names: Option<Vec<String>>,
+}
+
+/// API 이름은 이만큼까지 둔다.
+const MAX_API_NAMES: usize = 32;
+
+/// API 이름(DNS 이름이나 IP)을 비교할 모양으로 바꾼다: IP는 표준 표기, 이름은 소문자. 와일드카드·포트·
+/// 숫자만 있는 이름은 None.
+pub(crate) fn normalize_api_name(name: &str) -> Option<String> {
+    if let Ok(ip) = name.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string());
+    }
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_suffix('.').unwrap_or(&name);
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    // 숫자로만 된 끝 라벨은 IP로 잘못 쓴 것이다(`10.0.0`).
+    let ok = name.len() <= 253
+        && name.split('.').all(label_ok)
+        && !name.rsplit('.').next()?.bytes().all(|b| b.is_ascii_digit());
+    ok.then(|| name.to_string())
+}
+
+/// API 이름 목록을 검사하고 비교할 모양으로 바꾼다(겹친 것은 하나로).
+fn api_names(names: &[String]) -> Result<Vec<String>, ApiError> {
+    if names.len() > MAX_API_NAMES {
+        return Err(ApiError::bad_request(format!(
+            "api_names can have at most {MAX_API_NAMES} names"
+        )));
+    }
+    let mut out = Vec::new();
+    for name in names {
+        let normalized = normalize_api_name(name).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "api_names: {name:?} is not a DNS name or an IP address"
+            ))
+        })?;
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
 }
 
 /// 허용 출처는 이만큼까지 둔다.
@@ -213,12 +262,17 @@ pub async fn patch_settings(
     Json(req): Json<SettingsPatch>,
 ) -> Result<Json<Settings>, ApiError> {
     state.authorize(&principal, Action::Write, SettingsSpec::KIND)?;
-    if req.updates.is_none() && req.telemetry.is_none() && req.web_origins.is_none() {
+    if req.updates.is_none()
+        && req.telemetry.is_none()
+        && req.web_origins.is_none()
+        && req.api_names.is_none()
+    {
         return Err(ApiError::bad_request(
-            "give updates, telemetry or web_origins",
+            "give updates, telemetry, web_origins or api_names",
         ));
     }
     let origins = req.web_origins.as_deref().map(web_origins).transpose()?;
+    let names = req.api_names.as_deref().map(api_names).transpose()?;
     if let Some(endpoint) = req.telemetry.as_ref().and_then(|t| t.endpoint.as_deref())
         && !endpoint.is_empty()
     {
@@ -227,8 +281,12 @@ pub async fn patch_settings(
     crate::cluster::require_upgraded(&state.cluster)?;
     let channel = req.updates.and_then(|u| u.channel);
     let enterprise = channel == Some(Channel::Enterprise);
-    // 옛 노드는 enterprise 채널과 텔레메트리·허용 출처 필드를 풀지 못한다.
-    if enterprise || req.telemetry.is_some() || origins.as_ref().is_some_and(|o| !o.is_empty()) {
+    // 옛 노드는 enterprise 채널과 텔레메트리·허용 출처·API 이름 필드를 풀지 못한다.
+    if enterprise
+        || req.telemetry.is_some()
+        || origins.as_ref().is_some_and(|o| !o.is_empty())
+        || names.as_ref().is_some_and(|n| !n.is_empty())
+    {
         crate::cluster::require_current(&state.cluster)?;
     }
     let used = if enterprise {
@@ -255,6 +313,9 @@ pub async fn patch_settings(
         }
         if let Some(origins) = &origins {
             spec.web_origins = origins.clone();
+        }
+        if let Some(names) = &names {
+            spec.api_names = names.clone();
         }
         Ok(())
     })
@@ -454,6 +515,52 @@ mod tests {
         ] {
             assert_eq!(normalize_origin(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn api_names_are_dns_names_or_ips() {
+        for (given, normalized) in [
+            ("orbivisor.example.com", "orbivisor.example.com"),
+            ("Orbivisor.Example.COM.", "orbivisor.example.com"),
+            ("orbivisor", "orbivisor"),
+            ("api-1.example.com", "api-1.example.com"),
+            ("192.168.0.200", "192.168.0.200"),
+            ("FD00:0::1", "fd00::1"),
+        ] {
+            assert_eq!(
+                normalize_api_name(given).as_deref(),
+                Some(normalized),
+                "{given}"
+            );
+        }
+        for bad in [
+            "",
+            ".",
+            "*.example.com",
+            "orbivisor.example.com:8006",
+            "-a.example.com",
+            "a-.example.com",
+            "a..example.com",
+            "a_b.example.com",
+            "10.0.0",
+            "999.1.1.1",
+            "[fd00::1]",
+            "https://orbivisor.example.com",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(normalize_api_name(bad), None, "{bad:?}");
+        }
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            api_names(&list(&["A.example", "a.example", "10.0.0.1"])).unwrap(),
+            list(&["a.example", "10.0.0.1"])
+        );
+        assert!(api_names(&list(&["a.example", "*.example"])).is_err());
+        let many: Vec<String> = (0..=MAX_API_NAMES)
+            .map(|i| format!("n{i}.example"))
+            .collect();
+        assert!(api_names(&many).is_err());
+        assert!(api_names(&many[..MAX_API_NAMES]).is_ok());
     }
 
     #[test]

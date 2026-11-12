@@ -155,6 +155,10 @@ struct LoginArgs {
     /// `orbivisorctl cluster init`의 출력이나 다른 노드의 `orbivisorctl cluster status`에서 확인한다.
     #[arg(long)]
     ca_fingerprint: Option<String>,
+    /// 서버 인증서를 클러스터 CA 대신 OS 신뢰 저장소로 확인한다(관리자 인증서 `[api] tls_cert`를 둔 노드,
+    /// 공인 인증서로 끝내는 프록시). 저장해 다음 명령도 같게 한다.
+    #[arg(long, conflicts_with = "ca_fingerprint")]
+    system_ca: bool,
 }
 
 /// 이 기계의 opld에 제어 소켓으로 보내는 명령의 공통 인자
@@ -1720,16 +1724,17 @@ enum SettingsCmd {
     /// 설정을 `키: 값` 줄로 보인다.
     Get,
     /// 설정을 바꾼다. 키: `updates.channel`(stable|testing|enterprise), `web_origins`(쿠키 요청을 받는 다른
-    /// 출처, 쉼표로 여럿, 비우면 같은 출처만)
+    /// 출처, 쉼표로 여럿, 비우면 같은 출처만), `api_names`(노드 API 인증서에 더할 DNS 이름·IP, 쉼표로 여럿)
     Set {
-        /// 예: `updates.channel=testing`, `web_origins=https://portal.example.com`
+        /// 예: `updates.channel=testing`, `web_origins=https://portal.example.com`,
+        /// `api_names=orbivisor.example.com,192.168.0.200`
         #[arg(required = true, value_name = "KEY=VALUE")]
         values: Vec<String>,
     },
 }
 
 /// `settings set`이 아는 키
-const SETTING_KEYS: &[&str] = &["updates.channel", "web_origins"];
+const SETTING_KEYS: &[&str] = &["updates.channel", "web_origins", "api_names"];
 
 /// `settings set`의 요청 본문(`PATCH /settings`). 준 키만 보낸다.
 fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
@@ -1740,13 +1745,13 @@ fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
         };
         match key {
             "updates.channel" => body["updates"]["channel"] = json!(v),
-            "web_origins" => {
-                let origins: Vec<&str> = v
+            "web_origins" | "api_names" => {
+                let list: Vec<&str> = v
                     .split(',')
                     .map(str::trim)
                     .filter(|o| !o.is_empty())
                     .collect();
-                body["web_origins"] = json!(origins);
+                body[key] = json!(list);
             }
             _ => bail!("unknown setting {key}; known: {}", SETTING_KEYS.join(", ")),
         }
@@ -3591,12 +3596,17 @@ where
         let server = server.context("--server is required for the first login")?;
         let same_server = config.server.as_deref().map(|s| s.trim_end_matches('/'))
             == Some(server.trim_end_matches('/'));
-        let ca_pem = server_ca(
-            &server,
-            args,
-            same_server.then(|| config.ca_pem.clone()).flatten(),
-        )
-        .await?;
+        let system_ca = login_system_ca(args, same_server && config.system_ca);
+        let ca_pem = if system_ca {
+            None
+        } else {
+            server_ca(
+                &server,
+                args,
+                same_server.then(|| config.ca_pem.clone()).flatten(),
+            )
+            .await?
+        };
         let (token, name) = match &args.token_file {
             Some(file) => token_login(&server, file, ca_pem.clone()).await?,
             None => login(&server, args, ca_pem.clone()).await?,
@@ -3605,6 +3615,7 @@ where
         config.server = Some(server.clone());
         config.token = Some(token.clone());
         config.ca_pem = ca_pem.clone();
+        config.system_ca = system_ca;
         config.save(&config_path)?;
         // 새 토큰을 저장한 뒤, 같은 서버에 다시 로그인했으면 이전 토큰은 서버에서도 지운다(실패해도 무시).
         // 새 토큰과 같으면 두고, 이 CLI의 login이 만든 토큰(`oplctl-…`)만 지운다(`--token-file`로 넣은
@@ -5813,6 +5824,12 @@ fn token_id(token: &str) -> Option<uuid::Uuid> {
 /// `--server`가 HTTPS인가. 스킴은 대소문자를 가리지 않으므로 URL로 해석해 확인한다.
 fn is_https(server: &str) -> bool {
     reqwest::Url::parse(server).is_ok_and(|u| u.scheme() == "https")
+}
+
+/// 로그인이 서버 인증서를 OS 신뢰 저장소로 확인하는지: `--system-ca`이거나, 지문 없이 다시 로그인하는 같은
+/// 서버에 지난번 그렇게 로그인했다(`saved`). `--ca-fingerprint`를 주면 클러스터 CA로 돌아간다.
+fn login_system_ca(args: &LoginArgs, saved: bool) -> bool {
+    args.system_ca || (saved && args.ca_fingerprint.is_none())
 }
 
 /// HTTPS 서버의 클러스터 CA. 처음이면 받아서 `--ca-fingerprint`와 맞는지 확인한다. 같은 서버에
@@ -9790,10 +9807,14 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             settings_set_body(&["web_origins=".into()]).unwrap(),
             json!({ "web_origins": [] })
         );
+        assert_eq!(
+            settings_set_body(&["api_names=orbivisor.example.com, 192.168.0.200".into()]).unwrap(),
+            json!({ "api_names": ["orbivisor.example.com", "192.168.0.200"] })
+        );
         let err = settings_set_body(&["updates.mirror=x".into()]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting updates.mirror; known: updates.channel, web_origins"
+            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names"
         );
         let err = settings_set_body(&["updates.channel".into()]).unwrap_err();
         assert_eq!(
@@ -11569,6 +11590,63 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         }
     }
 
+    /// `login --system-ca`: 클러스터 CA를 받지 않고(핀 없음, OS 신뢰 저장소) 그 방식을 저장한다. 같은
+    /// 서버에 다시 로그인하면 그대로, `--ca-fingerprint`나 다른 서버면 클러스터 CA로 돌아간다.
+    #[tokio::test]
+    async fn system_ca_login_is_remembered() {
+        let login_args = |extra: &[&str]| {
+            let mut args = vec!["oplctl", "login"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().cmd {
+                Cmd::Login(a) => a,
+                _ => unreachable!(),
+            }
+        };
+        assert!(login_system_ca(&login_args(&["--system-ca"]), false));
+        assert!(login_system_ca(&login_args(&[]), true));
+        assert!(!login_system_ca(&login_args(&[]), false));
+        assert!(!login_system_ca(
+            &login_args(&["--ca-fingerprint", "sha256:ab"]),
+            true
+        ));
+        let both = ["oplctl", "login", "--system-ca", "--ca-fingerprint", "x"];
+        assert_eq!(
+            Cli::try_parse_from(both).map(|_| ()).unwrap_err().kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+
+        let reply = |path: &str| match path {
+            "/api/v1/auth/whoami" => (200, json!({ "name": "admin", "role": "admin" })),
+            _ => (200, json!({ "revision": 1, "items": [] })),
+        };
+        let (client, _) = fake_api_status(reply).await;
+        let (other, _) = fake_api_status(reply).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("oplctl.json");
+        let file = dir.path().join("token");
+        std::fs::write(&file, "opl_x_y\n").unwrap();
+        let login_to = async |server: &str, extra: &[&str]| {
+            let mut args = vec![
+                "oplctl",
+                "--config",
+                config.to_str().unwrap(),
+                "--server",
+                server,
+                "login",
+                "--token-file",
+                file.to_str().unwrap(),
+            ];
+            args.extend_from_slice(extra);
+            run(args, &mut Vec::new()).await.unwrap();
+            CliConfig::load(&config).unwrap()
+        };
+        let saved = login_to(&client.base, &["--system-ca"]).await;
+        assert!(saved.system_ca);
+        assert_eq!(saved.ca_pem, None);
+        assert!(login_to(&client.base, &[]).await.system_ca);
+        assert!(!login_to(&other.base, &[]).await.system_ca);
+    }
+
     /// `login --token-file`: 토큰으로 whoami를 불러 확인하고 저장한다. 같은 토큰을 다시 넣으면 지우지 않고,
     /// 이전 토큰은 login이 만든 것(`oplctl-…`)만 지운다. 받지 않는 토큰은 저장하지 않는다.
     #[tokio::test]
@@ -11779,6 +11857,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 server: Some(client.base.clone()),
                 token: Some(token.into()),
                 ca_pem: None,
+                system_ca: false,
             }
             .save(&config)
             .unwrap();

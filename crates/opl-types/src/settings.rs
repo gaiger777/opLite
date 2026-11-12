@@ -33,6 +33,11 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub web_origins: Vec<String>,
+    /// 앞단·VIP에서 API를 부르는 이름(DNS 이름·IP). 각 노드가 자기 API 인증서에 더한다(피어 인증서는 그대로).
+    /// 비어 있으면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub api_names: Vec<String>,
 }
 
 impl ResourceSpec for SettingsSpec {
@@ -167,6 +172,7 @@ mod tests {
             subscription: None,
             telemetry: TelemetrySettings::default(),
             web_origins: vec![],
+            api_names: vec![],
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -201,6 +207,27 @@ mod tests {
             serde_json::json!(["https://portal.example.com"])
         );
         assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+    }
+
+    /// API 이름도 비어 있으면 쓰지 않는다.
+    #[test]
+    fn api_names_are_written_only_when_set() {
+        let spec = SettingsSpec {
+            api_names: vec!["orbivisor.example.com".into(), "192.168.0.200".into()],
+            ..SettingsSpec::default()
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["api_names"],
+            serde_json::json!(["orbivisor.example.com", "192.168.0.200"])
+        );
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+        assert!(
+            serde_json::to_value(SettingsSpec::default())
+                .unwrap()
+                .get("api_names")
+                .is_none()
+        );
     }
 
     /// 텔레메트리도 기본값(꺼짐, 끝점 없음, 상태 없음)이면 계획 32 모양 그대로 쓴다.

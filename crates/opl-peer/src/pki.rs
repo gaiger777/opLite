@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::io::Write;
+use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -16,12 +17,16 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use x509_parser::extensions::GeneralName;
 
 /// CA 인증서의 유효 기간(일)
 const CA_DAYS: i64 = 365 * 20;
 /// 노드 인증서의 유효 기간(일). macOS는 유효 기간이 825일을 넘는 TLS 서버 인증서를 거부한다
 /// (시작 하루 전부터 유효하므로 하루를 뺀다). 만료 전에 갱신해야 한다.
 const NODE_DAYS: i64 = 824;
+
+/// API 인증서([`api_cert`])의 CN
+pub const API_CERT_CN: &str = "orbivisor-api";
 
 /// 데이터 디렉터리 아래 노드 TLS 자료를 두는 디렉터리
 pub const PKI_DIR: &str = "pki";
@@ -82,20 +87,46 @@ impl ClusterCa {
         node: Uuid,
         sans: &[String],
     ) -> Result<String, PkiError> {
+        self.sign(
+            csr_pem,
+            &node.to_string(),
+            sans,
+            vec![
+                ExtendedKeyUsagePurpose::ServerAuth,
+                ExtendedKeyUsagePurpose::ClientAuth,
+            ],
+        )
+    }
+
+    /// 외부 API의 CSR에 서명한다. 서버 인증만 되고 CN은 노드 id가 아니므로([`API_CERT_CN`]) 키가 새어도 노드
+    /// 간 mTLS에 쓸 수 없다.
+    pub fn sign_api(&self, csr_pem: &str, sans: &[String]) -> Result<String, PkiError> {
+        self.sign(
+            csr_pem,
+            API_CERT_CN,
+            sans,
+            vec![ExtendedKeyUsagePurpose::ServerAuth],
+        )
+    }
+
+    fn sign(
+        &self,
+        csr_pem: &str,
+        common_name: &str,
+        sans: &[String],
+        extended_key_usages: Vec<ExtendedKeyUsagePurpose>,
+    ) -> Result<String, PkiError> {
         let csr = CertificateSigningRequestParams::from_pem(csr_pem)?;
         let mut params = CertificateParams::new(sans.to_vec())?;
         params
             .distinguished_name
-            .push(DnType::CommonName, node.to_string());
+            .push(DnType::CommonName, common_name);
         // QEMU 8.2(GnuTLS)는 키 용도가 critical이면 마이그레이션 TLS에 keyEncipherment도 요구한다.
         params.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-        params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
+        params.extended_key_usages = extended_key_usages;
         set_validity(&mut params, NODE_DAYS);
         params.serial_number = Some(random_serial());
         let issuer = Issuer::from_ca_cert_pem(&self.cert_pem, KeyPair::from_pem(&self.key_pem)?)?;
@@ -164,6 +195,49 @@ pub fn allows_key_encipherment(cert_pem: &str) -> Result<bool, PkiError> {
         Ok(None) => Ok(true),
         Err(e) => Err(PkiError::Pem(e.to_string())),
     }
+}
+
+/// 인증서(PEM)의 대체 이름(DNS 이름과 IP)을 인증서에 적힌 순서대로 돌려준다.
+pub fn cert_names(cert_pem: &str) -> Result<Vec<String>, PkiError> {
+    let der = first_cert(cert_pem)?;
+    let (_, cert) =
+        x509_parser::parse_x509_certificate(&der).map_err(|e| PkiError::Pem(e.to_string()))?;
+    let sans = cert
+        .subject_alternative_name()
+        .map_err(|e| PkiError::Pem(e.to_string()))?;
+    let mut names = Vec::new();
+    for name in sans.iter().flat_map(|s| &s.value.general_names) {
+        match name {
+            GeneralName::DNSName(dns) => names.push(dns.to_string()),
+            GeneralName::IPAddress(bytes) => {
+                if let Ok(v4) = <[u8; 4]>::try_from(*bytes) {
+                    names.push(IpAddr::from(v4).to_string());
+                } else if let Ok(v6) = <[u8; 16]>::try_from(*bytes) {
+                    names.push(IpAddr::from(v6).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(names)
+}
+
+/// 외부 API 인증서와 키(PEM)를 새로 만든다. 이름은 노드 인증서의 이름에 `extra`를 더한 것이다(겹친 것은
+/// 하나로). 서버 인증만 되고 노드 id를 담지 않는다([`ClusterCa::sign_api`]). 노드 간 mTLS는 노드 인증서를
+/// 그대로 쓴다.
+pub fn api_cert(
+    ca: &ClusterCa,
+    node_cert_pem: &str,
+    extra: &[String],
+) -> Result<(String, String), PkiError> {
+    let mut names = cert_names(node_cert_pem)?;
+    for name in extra {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    let (key_pem, csr) = node_key_and_csr()?;
+    Ok((ca.sign_api(&csr, &names)?, key_pem))
 }
 
 /// 노드 인증서(DER)의 CN에 담긴 노드 id
@@ -298,6 +372,42 @@ mod tests {
         let pem = any.self_signed(&key).unwrap().pem();
         assert!(allows_key_encipherment(&pem).unwrap());
         assert!(allows_key_encipherment("not a cert").is_err());
+    }
+
+    #[test]
+    fn api_cert_adds_names_to_those_of_the_node_cert() {
+        let ca = ClusterCa::generate("prod").unwrap();
+        let node = Uuid::now_v7();
+        let (_, csr) = node_key_and_csr().unwrap();
+        let node_pem = ca
+            .sign_node(
+                &csr,
+                node,
+                &["node-a".into(), "10.0.0.5".into(), "::1".into()],
+            )
+            .unwrap();
+        assert_eq!(
+            cert_names(&node_pem).unwrap(),
+            ["node-a", "10.0.0.5", "::1"]
+        );
+        let extra = ["orbivisor.example.com".to_string(), "10.0.0.5".into()];
+        let (cert_pem, key_pem) = api_cert(&ca, &node_pem, &extra).unwrap();
+        assert_eq!(
+            cert_names(&cert_pem).unwrap(),
+            ["node-a", "10.0.0.5", "::1", "orbivisor.example.com"]
+        );
+        // 새 키. 노드 id가 없고 서버 인증만 된다(피어 인증서로 쓰지 못한다).
+        assert!(key_pem.contains("PRIVATE KEY"));
+        let der = first_cert(&cert_pem).unwrap();
+        assert_eq!(node_id_of(&der), None);
+        let usage = |der: &[u8]| {
+            let (_, cert) = x509_parser::parse_x509_certificate(der).unwrap();
+            let eku = cert.extended_key_usage().unwrap().unwrap().value;
+            (eku.server_auth, eku.client_auth)
+        };
+        assert_eq!(usage(&der), (true, false));
+        assert_eq!(usage(&first_cert(&node_pem).unwrap()), (true, true));
+        assert!(cert_names("not a cert").is_err());
     }
 
     #[test]

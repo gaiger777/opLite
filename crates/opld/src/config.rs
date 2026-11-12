@@ -627,6 +627,25 @@ pub struct ApiSection {
     /// 출처 검사, OIDC 콜백 주소)를 믿는다. 비어 있으면 아무 헤더도 믿지 않는다.
     #[serde(default)]
     pub trusted_proxies: Vec<Cidr>,
+    /// 관리자가 준 API 인증서(PEM, 중간 인증서를 이어 붙여도 됨)와 키 파일. 둘 다 있어야 하고, 있으면 API
+    /// 리스너가 이것을 쓰며 클러스터 CA로 API 인증서를 다시 발급하지 않는다(`api_names`를 따르지 않음).
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+}
+
+impl ApiSection {
+    /// 관리자가 준 API 인증서와 키(PEM). 없으면 None, 읽지 못하면 오류다.
+    pub fn read_tls(&self) -> anyhow::Result<Option<(String, String)>> {
+        let (Some(cert), Some(key)) = (&self.tls_cert, &self.tls_key) else {
+            return Ok(None);
+        };
+        let read = |path: &PathBuf| {
+            std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("cannot read the API TLS file {}: {e}", path.display())
+            })
+        };
+        Ok(Some((read(cert)?, read(key)?)))
+    }
 }
 
 /// 실행기 크기(설계 §3.1). `core` 실행기는 2로 고정이다.
@@ -973,6 +992,9 @@ impl Config {
         }
         if self.runtime.api_threads == Some(0) || self.runtime.work_threads == Some(0) {
             anyhow::bail!("runtime.api_threads and runtime.work_threads must be at least 1");
+        }
+        if self.api.tls_cert.is_some() != self.api.tls_key.is_some() {
+            anyhow::bail!("api.tls_cert and api.tls_key must be given together");
         }
         if self.ha.fence_after_secs == 0 {
             anyhow::bail!("ha.fence_after_secs must be at least 1");
@@ -1467,6 +1489,36 @@ mod tests {
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[runtime]\ncore_threads = 4")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn api_tls_files_go_together() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert!(c.api.read_tls().unwrap().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("api.crt");
+        let key = dir.path().join("api.key");
+        std::fs::write(&cert, "CERT").unwrap();
+        std::fs::write(&key, "KEY").unwrap();
+        let text = |files: &str| format!("name = \"n\"\naddress = \"h\"\n[api]\n{files}");
+        let both = format!(
+            "tls_cert = {:?}\ntls_key = {:?}",
+            cert.display().to_string(),
+            key.display().to_string()
+        );
+        let c = parse(&text(&both));
+        c.validate().unwrap();
+        assert_eq!(
+            c.api.read_tls().unwrap(),
+            Some(("CERT".to_string(), "KEY".to_string()))
+        );
+        let only = format!("tls_cert = {:?}", cert.display().to_string());
+        let err = parse(&text(&only)).validate().unwrap_err().to_string();
+        assert!(err.contains("together"), "{err}");
+        // 읽지 못하면 오류
+        std::fs::remove_file(&key).unwrap();
+        let err = parse(&text(&both)).api.read_tls().unwrap_err().to_string();
+        assert!(err.contains("api.key"), "{err}");
     }
 
     #[test]
