@@ -31,6 +31,15 @@ jobs:
       - run: cargo test --workspace
       # 시험 빌드에만 있는 고리로 리더의 api 실행기를 막는 굶김 시험(QEMU 없음)
       - run: cargo test -p opld --features starve-it --test starve
+      # 노드 100개(투표 5, 나머지 learner)를 한 프로세스에 띄워 리더 RPC(확인 묶기 비율 포함)·쓰기 p99·노드 추가·
+      # 리더 장애를 잰다(설계 §5·§14, 개발 Mac에서 15초쯤)
+      - name: Scale test (100 nodes in one process)
+        run: cargo test -p opl-cluster --features scale-it --test scale -- --nocapture
+        timeout-minutes: 10
+        env:
+          OPL_SCALE_NODES: 100
+          # 코어 3~4개 러너에서 노드 100개의 쓰기가 CPU에 묶여 흔들린다. 쓰기 p99 기준만 늦춘다(README, 설계 §14).
+          OPL_SCALE_P99_MS: 200
       - name: Storage integration tests (qemu-img)
         if: runner.os == 'Linux'
         run: |

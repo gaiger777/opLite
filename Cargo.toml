@@ -69,3 +69,8 @@ rust-embed = { version = "8.13.0", features = ["mime-guess", "interpolate-folder
 libc = "0.2.191"
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 lber = "0.5.1"
+
+# 시험 빌드에서도 redb는 최적화한다. 최적화하지 않으면 커밋마다 페이지를 0으로 채우는 데 시간을 써서 노드를
+# 수백 개 띄우는 규모 시험(opl-cluster scale-it)의 쓰기 지연을 그것이 차지한다.
+[profile.dev.package.redb]
+opt-level = 3

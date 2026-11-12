@@ -38,6 +38,10 @@ pub struct ClusterConfig {
     pub raft: openraft::Config,
     /// 쓰기가 커밋되기를 기다리는 최대 시간. 과반수가 없으면 이 시간 뒤 `Timeout`이 된다.
     pub write_timeout: Duration,
+    /// 저장소를 파일 대신 메모리에 둔다(`data_dir`을 쓰지 않음, 다시 열면 비어 있음). 시험용(규모 시험)이다:
+    /// 껐다 켜면 Raft 로그와 투표가 사라져 실제 노드에서는 안전하지 않다.
+    #[doc(hidden)]
+    pub in_memory: bool,
 }
 
 impl ClusterConfig {
@@ -47,6 +51,7 @@ impl ClusterConfig {
             data_dir: data_dir.into(),
             raft: openraft::Config::default(),
             write_timeout: Duration::from_secs(5),
+            in_memory: false,
         }
     }
 }
@@ -140,8 +145,15 @@ impl Cluster {
     where
         N: RaftNetworkFactory<TypeConfig>,
     {
-        std::fs::create_dir_all(&config.data_dir)?;
-        let store = Store::open(&config.data_dir.join(DB_FILE))?;
+        let store = if config.in_memory {
+            tracing::warn!(
+                "the cluster store is in memory (test only): the Raft log and votes are lost on restart"
+            );
+            Store::open_in_memory()?
+        } else {
+            std::fs::create_dir_all(&config.data_dir)?;
+            Store::open(&config.data_dir.join(DB_FILE))?
+        };
         let raft_config = Arc::new(
             config
                 .raft

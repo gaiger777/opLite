@@ -294,3 +294,32 @@ async fn a_snapshot_name_is_unique_within_its_vm() {
     c.create(&snapshot(vm_b, "before")).await.unwrap();
     c.create(&snapshot(vm_a, "after")).await.unwrap();
 }
+
+/// `in_memory` 저장소는 데이터 디렉터리를 만들지 않고 쓰기·읽기가 된다(규모 시험).
+#[tokio::test]
+async fn in_memory_store_does_not_touch_the_data_dir() {
+    let root = tempfile::TempDir::new().unwrap();
+    let dir = root.path().join("node-1");
+    let mut config = opl_cluster::ClusterConfig::new(node(1), &dir);
+    config.raft = common::raft_config();
+    config.in_memory = true;
+    let c = opl_cluster::Cluster::open(
+        config,
+        opl_cluster::memnet::MemRouter::default().network(node(1)),
+    )
+    .await
+    .unwrap();
+    c.initialize(BTreeMap::from([(node(1), common::addr(1))]))
+        .await
+        .unwrap();
+    c.raft()
+        .wait(Some(WAIT))
+        .state(openraft::ServerState::Leader, "leader")
+        .await
+        .unwrap();
+    let v = volume("disk-a");
+    c.create(&v).await.unwrap();
+    assert!(c.get::<VolumeSpec>(v.id).unwrap().is_some());
+    assert!(!dir.exists());
+    c.shutdown().await.unwrap();
+}

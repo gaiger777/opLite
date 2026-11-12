@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use opl_types::resource::Kind;
+use redb::backends::InMemoryBackend;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -80,7 +81,16 @@ pub struct Store {
 impl Store {
     /// 파일이 없으면 만들고, 있으면 스키마 버전을 확인한다.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = Database::create(path)?;
+        Self::init(Database::create(path)?)
+    }
+
+    /// 메모리에만 두는 저장소(fsync 없음, 닫으면 사라짐). 시험용이다: 규모 시험이 한 디스크에 노드 수백 개의
+    /// fsync가 몰리지 않게 모든 노드(투표 멤버도)에 쓴다(실제 노드는 디스크가 따로다).
+    pub fn open_in_memory() -> Result<Self, StoreError> {
+        Self::init(Database::builder().create_with_backend(InMemoryBackend::new())?)
+    }
+
+    fn init(db: Database) -> Result<Self, StoreError> {
         let txn = db.begin_write()?;
         {
             txn.open_table(LOG)?;
