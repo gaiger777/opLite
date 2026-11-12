@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료
+- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료, 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험(계획 47) 완료
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -3323,3 +3323,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 44: 지표 수집](docs/superpowers/plans/2026-11-11-plan44-metrics.md)
 - [계획 45: 실행기 격리와 systemd watchdog](docs/superpowers/plans/2026-11-12-plan45-runtime-isolation.md)
 - [계획 46: 헬스 체크·API 이름·내장 VIP·앞단 프록시](docs/superpowers/plans/2026-11-12-plan46-health-vip-proxy.md)
+- [계획 47: 규모 1 — 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험](docs/superpowers/plans/2026-11-12-plan47-scale-1.md)
