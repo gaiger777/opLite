@@ -1357,6 +1357,13 @@ async fn a_vm_coming_back_replaces_the_copy_left_on_its_old_node() {
         v.status.phase == VmPhase::Running && v.status.node == Some(b.id)
     })
     .await;
+    // A가 status를 Running(B)으로 쓴 뒤에도 B의 reconciler가 받은 QEMU를 이어서 실행하기 전에는
+    // 멈춰 있다. 그 사이에 되돌리면 B의 Task가 실행 중이 아닌 VM으로 거절한다.
+    let deadline = Instant::now() + WAIT;
+    while runtime_status(&b, vm.id).await != Some(RuntimeStatus::Running) {
+        assert!(Instant::now() < deadline, "B did not continue the VM");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let back = migrate(&admin, "node1").await;
     assert_eq!(back["status"]["state"], "succeeded", "{back}");
