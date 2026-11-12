@@ -25,7 +25,7 @@ pub use migration::{
     IncomingDisk, IncomingError, IncomingMigration, MigrateIncomingRequest,
     MigrateIncomingResponse, MigrationReceiver,
 };
-pub use monitor::{NodeMonitor, NodeMonitorConfig};
+pub use monitor::{LEASE_LIVENESS, NodeMonitor, NodeMonitorConfig, renew_liveness};
 pub use server::{PeerService, ServeError, serve};
 
 /// 생성된 gRPC 클라이언트와 서버. 생성 코드가 단위 구조체 코덱을 `default()`로 만든다.

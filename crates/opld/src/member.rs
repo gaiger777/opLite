@@ -27,7 +27,7 @@ use opl_driver::{
 };
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{ApiCert, TlsListener, api_server_config_with};
-use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers};
+use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers, renew_liveness};
 use opl_reconciler::{FirewallGate, FirmwareFetcher, HaGuard, Reconciler, ReconcilerConfig};
 use opl_types::node::NodeSpec;
 use opl_types::vm::VmSpec;
@@ -59,6 +59,9 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 다시 시작한 노드가 Node 리소스를 다시 기록하는 간격(과반수가 없으면 될 때까지)
 const REGISTER_RETRY: Duration = Duration::from_secs(2);
+/// HA 펜싱을 쓰지 않는 노드(펜싱을 끈 노드, 위트니스)가 생존 표시로 리스를 갱신하는 간격. `HaGuard`의
+/// 가장 긴 갱신 간격과 같다(리더는 10초 넘게 갱신이 없으면 오프라인으로 본다).
+const LIVENESS_RENEW: Duration = Duration::from_secs(2);
 /// 노드의 브리지 목록과 기능 표시(위트니스는 기능 표시만)를 다시 확인하는 간격. 관리자가 브리지를 만들면
 /// 이만큼 뒤에 스케줄러가 알고, 옛 버전 리더가 지운 기능 표시는 이만큼 뒤에 되살아난다.
 const BRIDGE_REFRESH: Duration = Duration::from_secs(60);
@@ -211,6 +214,8 @@ pub struct Member {
     services: Option<Services>,
     register: JoinHandle<()>,
     promotion: JoinHandle<()>,
+    /// 생존 표시로만 리스를 갱신한다(HA 펜싱을 쓰는 노드는 `HaGuard`가 갱신하므로 없다).
+    liveness: Option<JoinHandle<()>>,
     /// Raft가 멈추면 `exited`로 알린다. 정상 종료는 저장소를 닫기 전에 이것부터 멈춘다.
     raft_watch: JoinHandle<()>,
     /// 서버 태스크가 끝나거나 Raft가 멈추면 그 이유가 온다.
@@ -497,6 +502,10 @@ impl Member {
             .ha
             .guard_config()
             .map(|ha| on(&rt.core, || HaGuard::spawn(cluster.clone(), ha)));
+        // 펜싱이 꺼져 있어도 리더가 생존을 리스로 보도록 갱신만 한다.
+        let liveness = ha
+            .is_none()
+            .then(|| on(&rt.core, || renew_liveness(cluster.clone(), LIVENESS_RENEW)));
         reconciler_config.ha = ha.clone();
         state.ha = ha.clone();
         reconciler_config.firewall = gate;
@@ -657,6 +666,7 @@ impl Member {
             }),
             register,
             promotion,
+            liveness,
             raft_watch,
             exited,
         };
@@ -710,6 +720,8 @@ impl Member {
         }
         let promotion = on(&rt.core, || spawn_promotion(first_time, &cluster, &peers));
         let raft_watch = on(&rt.core, || watch_raft(&cluster, exited_tx));
+        // 위트니스는 HA 펜싱이 없으므로 생존 표시로만 리스를 갱신한다.
+        let liveness = on(&rt.core, || renew_liveness(cluster.clone(), LIVENESS_RENEW));
         let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
             rt.work.spawn(async move {
@@ -739,6 +751,7 @@ impl Member {
             services: None,
             register,
             promotion,
+            liveness: Some(liveness),
             raft_watch,
             exited,
         })
@@ -800,6 +813,10 @@ impl Member {
         }
         self.register.abort();
         self.promotion.abort();
+        // 오프라인으로 기록한 뒤의 갱신이 다시 온라인으로 만들지 않게 먼저 멈춘다.
+        if let Some(liveness) = &self.liveness {
+            liveness.abort();
+        }
         if !left {
             bootstrap::mark_offline(&self.cluster).await;
         }

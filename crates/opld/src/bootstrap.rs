@@ -493,7 +493,8 @@ pub(crate) mod tests {
                 "metrics",
                 "node-roles",
                 "shared-sessions",
-                "vip"
+                "vip",
+                "lease-liveness"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -515,7 +516,8 @@ pub(crate) mod tests {
                 "metrics",
                 "node-roles",
                 "shared-sessions",
-                "vip"
+                "vip",
+                "lease-liveness"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -553,7 +555,8 @@ pub(crate) mod tests {
                 "metrics",
                 "node-roles",
                 "shared-sessions",
-                "vip"
+                "vip",
+                "lease-liveness"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -629,6 +632,7 @@ pub(crate) mod tests {
                     "node-roles".into(),
                     "shared-sessions".into(),
                     "vip".into(),
+                    "lease-liveness".into(),
                 ],
                 ..NodeStatus::default()
             }

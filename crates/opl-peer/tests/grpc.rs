@@ -11,9 +11,10 @@ use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, api_cert, node_key_and_csr};
 use opl_peer::{
-    AuditSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration, MetricsReply,
-    MetricsSource, MigrateIncomingRequest, MigrateIncomingResponse, MigrationReceiver, NodeMonitor,
-    NodeMonitorConfig, PeerService, Peers, UefiVarsError,
+    AuditSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration, LEASE_LIVENESS,
+    MetricsReply, MetricsSource, MigrateIncomingRequest, MigrateIncomingResponse,
+    MigrationReceiver, NodeMonitor, NodeMonitorConfig, PeerService, Peers, UefiVarsError,
+    renew_liveness,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries};
@@ -634,6 +635,220 @@ async fn new_leader_does_not_revive_nodes_recorded_offline() {
             "new leader revived a node recorded offline"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for m in monitors {
+        m.shutdown().await;
+    }
+}
+
+/// 노드 리소스를 기록한다. `lease`면 그 노드가 [`LEASE_LIVENESS`]를 안다고 적는다.
+async fn register_nodes(
+    nodes: &[Node],
+    online: impl Fn(NodeId) -> bool,
+    lease: impl Fn(usize) -> bool,
+) {
+    for (i, node) in nodes.iter().enumerate() {
+        let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
+            format!("node-{i}"),
+            NodeSpec {
+                address: node.addr.clone(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        r.id = node.id().0;
+        r.status.online = online(node.id());
+        if lease(i) {
+            r.status.features = vec![LEASE_LIVENESS.into()];
+        }
+        nodes[0].cluster.create(&r).await.unwrap();
+    }
+}
+
+fn recorded_online(cluster: &Cluster, id: NodeId) -> bool {
+    cluster
+        .get::<NodeSpec>(id.0)
+        .unwrap()
+        .unwrap()
+        .status
+        .online
+}
+
+async fn wait_online(cluster: &Cluster, id: NodeId, want: bool) {
+    let deadline = Instant::now() + WAIT;
+    while recorded_online(cluster, id) != want {
+        assert!(
+            Instant::now() < deadline,
+            "node {id} never became online={want}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+const LIVENESS_RENEW: Duration = Duration::from_millis(200);
+
+/// 모든 노드가 리스로 생존을 알리면 리더는 ping이 아니라 리스를 본다: 핑에 답하는 노드도 갱신을 멈추면
+/// 오프라인, 다시 갱신하면 온라인이다. 펜싱 없이 생존 표시로만 갱신하는 노드도 온라인으로 남는다.
+#[tokio::test]
+async fn with_lease_liveness_the_leader_follows_renewals_not_pings() {
+    let (_ca, _root, nodes) = start(3).await;
+    let leader = wait_leader(&nodes).await;
+    // 팔로워 하나는 오프라인으로 시작해, 갱신하면 온라인이 되는지 본다.
+    register_nodes(&nodes, |id| id == leader, |_| true).await;
+    let config = NodeMonitorConfig {
+        interval: Duration::from_millis(300),
+        offline_after: Duration::from_secs(3),
+    };
+    let monitors: Vec<NodeMonitor> = nodes
+        .iter()
+        .map(|n| NodeMonitor::spawn(n.cluster.clone(), n.peers.clone(), config.clone()))
+        .collect();
+    let mut renewers: Vec<_> = nodes
+        .iter()
+        .map(|n| renew_liveness(n.cluster.clone(), LIVENESS_RENEW))
+        .collect();
+    let leader_cluster = nodes
+        .iter()
+        .find(|n| n.id() == leader)
+        .unwrap()
+        .cluster
+        .clone();
+    let follower = nodes.iter().position(|n| n.id() != leader).unwrap();
+    let follower_id = nodes[follower].id();
+    let other = nodes
+        .iter()
+        .position(|n| n.id() != leader && n.id() != follower_id)
+        .unwrap();
+    wait_online(&leader_cluster, follower_id, true).await;
+
+    // 노드는 그대로 돌고(핑에 답한다) 갱신만 멈춘다.
+    renewers[follower].abort();
+    wait_online(&leader_cluster, follower_id, false).await;
+    assert!(recorded_online(&leader_cluster, nodes[other].id()));
+    renewers[follower] = renew_liveness(nodes[follower].cluster.clone(), LIVENESS_RENEW);
+    wait_online(&leader_cluster, follower_id, true).await;
+
+    // 정상 종료처럼 갱신을 멈추고 스스로 오프라인으로 기록하면, 리스가 아직 살아 있어도 다시 온라인이
+    // 되지 않는다.
+    renewers[follower].abort();
+    let mut status = nodes[follower]
+        .cluster
+        .get::<NodeSpec>(follower_id.0)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.online = false;
+    nodes[follower]
+        .cluster
+        .update_status::<NodeSpec>(follower_id.0, &status)
+        .await
+        .unwrap();
+    wait_online(&leader_cluster, follower_id, false).await;
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        assert!(
+            !recorded_online(&leader_cluster, follower_id),
+            "a node that marked itself offline came back on an old renewal"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    renewers[follower] = renew_liveness(nodes[follower].cluster.clone(), LIVENESS_RENEW);
+    wait_online(&leader_cluster, follower_id, true).await;
+    assert!(recorded_online(&leader_cluster, leader));
+
+    for r in renewers {
+        r.abort();
+    }
+    for m in monitors {
+        m.shutdown().await;
+    }
+}
+
+/// 리스 생존을 모르는 옛 노드가 남았으면 지금처럼 ping으로 본다: 아무도 갱신하지 않아도 핑에 답하는
+/// 노드는 온라인으로 남고, 멈춘 노드는 오프라인이 된다.
+#[tokio::test]
+async fn a_cluster_with_an_old_node_keeps_pinging() {
+    let (_ca, _root, mut nodes) = start(3).await;
+    let leader = wait_leader(&nodes).await;
+    let old = nodes.iter().position(|n| n.id() != leader).unwrap();
+    register_nodes(&nodes, |_| true, |i| i != old).await;
+    let config = NodeMonitorConfig {
+        interval: Duration::from_millis(300),
+        offline_after: Duration::from_secs(3),
+    };
+    let monitors: Vec<NodeMonitor> = nodes
+        .iter()
+        .map(|n| NodeMonitor::spawn(n.cluster.clone(), n.peers.clone(), config.clone()))
+        .collect();
+    let leader_cluster = nodes
+        .iter()
+        .find(|n| n.id() == leader)
+        .unwrap()
+        .cluster
+        .clone();
+    // `offline_after`보다 오래 지켜본다(리스로 보면 갱신이 없어 오프라인이 된다).
+    let until = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < until {
+        for n in &nodes {
+            assert!(
+                recorded_online(&leader_cluster, n.id()),
+                "node {} went offline without a lease in a mixed cluster",
+                n.id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let stopped = nodes.iter().position(|n| n.id() != leader).unwrap();
+    let stopped_id = nodes[stopped].id();
+    nodes[stopped].stop().await;
+    wait_online(&leader_cluster, stopped_id, false).await;
+    for m in monitors {
+        m.shutdown().await;
+    }
+}
+
+/// 멤버가 아닌 노드의 남은 기록(클러스터에서 빠진 옛 노드)은 리스 생존을 몰라도 리스 감시를 막지 않는다: 핑에
+/// 답하는 노드도 갱신을 멈추면 오프라인이 된다.
+#[tokio::test]
+async fn a_leftover_record_of_a_removed_node_does_not_keep_pinging() {
+    let (_ca, _root, nodes) = start(3).await;
+    let leader = wait_leader(&nodes).await;
+    register_nodes(&nodes, |_| true, |_| true).await;
+    let gone: Resource<NodeSpec, NodeStatus> = Resource::new(
+        "gone",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    nodes[0].cluster.create(&gone).await.unwrap();
+    let config = NodeMonitorConfig {
+        interval: Duration::from_millis(300),
+        offline_after: Duration::from_secs(3),
+    };
+    let monitors: Vec<NodeMonitor> = nodes
+        .iter()
+        .map(|n| NodeMonitor::spawn(n.cluster.clone(), n.peers.clone(), config.clone()))
+        .collect();
+    let renewers: Vec<_> = nodes
+        .iter()
+        .map(|n| renew_liveness(n.cluster.clone(), LIVENESS_RENEW))
+        .collect();
+    let leader_cluster = nodes
+        .iter()
+        .find(|n| n.id() == leader)
+        .unwrap()
+        .cluster
+        .clone();
+    let follower = nodes.iter().position(|n| n.id() != leader).unwrap();
+    // 노드는 그대로 돌고(핑에 답한다) 갱신만 멈춘다. ping으로 보면 온라인으로 남는다.
+    renewers[follower].abort();
+    wait_online(&leader_cluster, nodes[follower].id(), false).await;
+    for r in renewers {
+        r.abort();
     }
     for m in monitors {
         m.shutdown().await;
