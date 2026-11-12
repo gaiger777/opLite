@@ -492,7 +492,8 @@ pub(crate) mod tests {
                 "storage-migration",
                 "metrics",
                 "node-roles",
-                "shared-sessions"
+                "shared-sessions",
+                "vip"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -513,7 +514,8 @@ pub(crate) mod tests {
                 "storage-migration",
                 "metrics",
                 "node-roles",
-                "shared-sessions"
+                "shared-sessions",
+                "vip"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -550,7 +552,8 @@ pub(crate) mod tests {
                 "storage-migration",
                 "metrics",
                 "node-roles",
-                "shared-sessions"
+                "shared-sessions",
+                "vip"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -625,6 +628,7 @@ pub(crate) mod tests {
                     "metrics".into(),
                     "node-roles".into(),
                     "shared-sessions".into(),
+                    "vip".into(),
                 ],
                 ..NodeStatus::default()
             }

@@ -60,6 +60,10 @@ use crate::runtime::{Handles, Runtimes};
 struct Args {
     #[arg(long, default_value = "/etc/opl/opld.toml")]
     config: PathBuf,
+    /// 지난 프로세스가 붙인 채 남긴 내장 VIP(`{data_dir}/vips`의 기록)를 떼고 끝낸다(systemd
+    /// `ExecStopPost`). 오류가 있어도 0으로 끝난다(재시작을 막지 않게).
+    #[arg(long)]
+    release_vips: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -72,6 +76,10 @@ fn main() -> anyhow::Result<()> {
         .with_ansi(std::io::stdout().is_terminal())
         .init();
     let args = Args::parse();
+    if args.release_vips {
+        release_vips_and_exit(&args.config);
+        return Ok(());
+    }
     let config = Config::load(&args.config)?;
     // 실행기 셋(설계 §3.1). 주 루프는 주 스레드에서 `core`의 문맥으로 돌고(제어 소켓도 `core`),
     // 서비스는 `Member::start`가 맞는 실행기에 띄운다.
@@ -96,6 +104,8 @@ async fn run(
     prepare_data_dir(&config.data_dir)?;
     // 끝날 때까지 쥐고 있는다.
     let _lock = lock_data_dir(&config.data_dir)?;
+    // 지난 프로세스가 붙인 채 죽은 VIP는 리스를 받기 전에 쥐면 안 되므로 지금 설정과 관계없이 뗀다.
+    release_vips(&config.data_dir).await;
     let node = bootstrap::node_id(&config.data_dir)?;
     let status = Arc::new(Mutex::new(Status {
         node,
@@ -313,6 +323,42 @@ async fn become_member(
             let _ = reply.send(Err(ControlError::failed(e)));
             None
         }
+    }
+}
+
+/// `data_dir`에 기록된 VIP를 뗀다. 떼지 못하면 경고한다(기록은 남아 다음에 다시 뗀다).
+async fn release_vips(data_dir: &Path) {
+    let record = opl_driver::VipRecord::in_dir(data_dir);
+    match opl_driver::release_recorded(&record, &opl_driver::IpVip::default()).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "removed VIPs left by the previous process"),
+        Err(e) => tracing::warn!(error = %e, "cannot remove VIPs left by the previous process"),
+    }
+}
+
+/// `--release-vips`: 설정의 `data_dir`만 읽어 기록된 VIP를 뗀다. 설정·네트워크 오류는 경고만 한다.
+/// 데이터 디렉터리 잠금을 쥔 프로세스(돌고 있는 orbivisord)가 있으면 그 VIP이므로 아무것도 떼지 않는다.
+fn release_vips_and_exit(config: &Path) {
+    let data_dir = match Config::data_dir_of(config) {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read data_dir; no VIPs removed");
+            return;
+        }
+    };
+    let _lock = match lock_data_dir(&data_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::warn!(error = %e, "no VIPs removed");
+            return;
+        }
+    };
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(release_vips(&data_dir)),
+        Err(e) => tracing::warn!(error = %e, "cannot start a runtime; no VIPs removed"),
     }
 }
 

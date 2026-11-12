@@ -16,13 +16,14 @@ use opl_api::{
     ApiCertAgent, AppState, AuditLog, BackupJobScheduler, ClusterJanitor, HaManager,
     HaManagerConfig, IncomingConfig, IncomingMigrations, RemotePoller, RuntimeProbe,
     SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher,
-    UpdateAgent, Updates,
+    UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Typed};
 use opl_driver::{
-    DirStorage, Hypervisor, LvmSharedStorage, LvmThinStorage, QemuHypervisor, RbdStorage, Storage,
-    Storages, SystemLvm, SystemRbd, SystemZfs, ZfsStorage, migration_tls_dir, write_migration_tls,
+    DirStorage, Hypervisor, IpVip, LvmSharedStorage, LvmThinStorage, QemuHypervisor, RbdStorage,
+    Storage, Storages, SystemLvm, SystemRbd, SystemZfs, VipRecord, ZfsStorage, migration_tls_dir,
+    write_migration_tls,
 };
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
 use opl_peer::tls::{ApiCert, TlsListener, api_server_config_with};
@@ -132,6 +133,10 @@ struct Services {
     backups: BackupJobScheduler,
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
     recovery: HaManager,
+    /// 리더가 내장 VIP의 주인을 정한다(이 노드의 `[vip]`과 상관없다).
+    vip_manager: VipManager,
+    /// 이 노드의 VIP 리스를 갱신하고 VIP를 붙인다(`[vip]`이 없으면 없다).
+    vip: Option<VipAgent>,
     pools: PoolMounter,
     /// 이 노드와 그 VM의 사용량 지표를 잰다.
     metrics: MetricsSampler,
@@ -154,6 +159,10 @@ struct Services {
 impl Services {
     /// `left`면 클러스터에서 빠진 것이다(VXLAN 장치와 방화벽 테이블을 지운다).
     async fn shutdown(mut self, left: bool) {
+        // VIP를 먼저 떼어 앞단이 다른 노드로 옮겨 가게 한다.
+        if let Some(vip) = self.vip {
+            vip.shutdown().await;
+        }
         let _ = self.api.stop.send(());
         if tokio::time::timeout(DRAIN_TIMEOUT, &mut self.api.task)
             .await
@@ -172,6 +181,7 @@ impl Services {
         self.telemetry.shutdown().await;
         self.remotes.shutdown().await;
         self.recovery.shutdown().await;
+        self.vip_manager.shutdown().await;
         self.pools.shutdown().await;
         self.metrics.shutdown().await;
         if let Some(updates) = self.updates {
@@ -585,8 +595,25 @@ impl Member {
         let recovery = on(&rt.core, || {
             HaManager::spawn(state.clone(), HaManagerConfig::default())
         });
+        // VIP 리스 갱신과 떼기는 HA 리스처럼 core에서 돈다(api·work가 바빠도 제때 뗀다).
+        let vip_manager = on(&rt.core, || {
+            VipManager::spawn(cluster.clone(), VipManagerConfig::default())
+        });
+        let vip = config.vip.agent_config().map(|mut c| {
+            // 붙인 VIP를 적어 두면 이 프로세스가 죽어도 다음 시작과 `--release-vips`가 뗀다.
+            c.record = Some(VipRecord::in_dir(&config.data_dir));
+            on(&rt.core, || {
+                VipAgent::spawn(state.clone(), Arc::new(IpVip::default()), c)
+            })
+        });
         let audit = state.audit.clone();
-        let app = opl_api::router(state).merge(crate::web::router());
+        let app = opl_api::router(state);
+        // 내장 UI를 끄면 API만 연다(UI는 따로 둔 포털이 준다).
+        let app = if config.web.enabled {
+            app.merge(crate::web::router())
+        } else {
+            app
+        };
         let task = rt.api.spawn(async move {
             // 연결 주소(클라이언트 IP)를 시도 제한에 넘긴다. axum은 `TapIo`로 감싼 리스너에
             // `ConnectInfo<SocketAddr>`를 만들어 주므로 아무 일도 하지 않는 tap을 붙인다.
@@ -619,6 +646,8 @@ impl Member {
                 remotes,
                 audit,
                 recovery,
+                vip_manager,
+                vip,
                 pools,
                 metrics,
                 overlay,

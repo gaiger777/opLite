@@ -14,6 +14,7 @@ use crate::leader::{self, Forwarder, LeaderCtx};
 use crate::lease::{LeaseTable, Leases};
 use crate::store::{Store, StoreError, get_object, get_object_by_name, list_objects};
 use crate::types::{Command, LeaderRequest, NodeId, RawResource, Rejection, TypeConfig};
+use crate::vip::{VipLeases, VipTable};
 use crate::watch::{Watch, WatchError, WatchHub};
 
 /// spec 타입 `S`의 리소스.
@@ -100,6 +101,8 @@ pub struct Cluster {
     forwarder: Option<Arc<dyn Forwarder>>,
     /// 리더일 때 받은 HA 리스 갱신(메모리에만 둔다)
     leases: Arc<LeaseTable>,
+    /// 리더일 때 받은 VIP 리스 갱신(메모리에만 둔다)
+    vips: Arc<VipTable>,
     /// 헬스 체크가 보는 적용 지연
     apply_lag: std::sync::Mutex<ApplyLag>,
     /// 시험이 저장소 스레드를 붙잡아 느린 디스크를 흉내 낸다.
@@ -160,6 +163,7 @@ impl Cluster {
             write_timeout: config.write_timeout,
             forwarder: None,
             leases: Arc::default(),
+            vips: Arc::default(),
             apply_lag: Default::default(),
             #[cfg(test)]
             writer: store.writer().clone(),
@@ -453,6 +457,7 @@ impl Cluster {
         LeaderCtx {
             raft: self.raft.clone(),
             leases: self.leases.clone(),
+            vips: self.vips.clone(),
         }
     }
 
@@ -474,6 +479,50 @@ impl Cluster {
             .await
             .map_err(|_| ClusterError::Timeout)?;
         Ok(())
+    }
+
+    /// 이 노드의 VIP 리스를 갱신한다(`vips`는 이 노드가 가질 수 있는 VIP 주소). 규칙은 `renew_lease`와
+    /// 같다: 성공하면 리더가 돌려준 적용 인덱스까지 이 노드에도 적용되어 있어, 곧바로 읽은 `VipHolder`에
+    /// 그때까지 리더가 정한 주인이 보인다. 호출자는 보내기 전에 시각을 재고 그 시각부터 리스를 센다.
+    pub async fn renew_vip(
+        &self,
+        vips: Vec<String>,
+        timeout: Duration,
+    ) -> Result<(), ClusterError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let index = self
+            .request_within(
+                LeaderRequest::RenewVip {
+                    node: self.id,
+                    vips,
+                },
+                timeout,
+            )
+            .await?;
+        self.raft
+            .wait(Some(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ))
+            .applied_index_at_least(Some(index), "VIP renewal applied")
+            .await
+            .map_err(|_| ClusterError::Timeout)?;
+        Ok(())
+    }
+
+    /// 리더가 지금 임기에 받은 VIP 리스 갱신. 리더에서만 뜻이 있다.
+    pub fn vip_leases(&self) -> VipLeases {
+        self.vips.leases(&self.raft)
+    }
+
+    /// `node`의 VIP 갱신을 `end_vip_fence`까지 `Rejection::Fenced`로 거부한다. 리더가 그 노드의 VIP를
+    /// 다른 노드로 옮기기 전에 표시하고, 표시한 뒤 `vip_leases`를 다시 읽어 여전히 끝났는지 확인한다.
+    pub fn begin_vip_fence(&self, node: NodeId) {
+        self.vips.begin_fence(node);
+    }
+
+    /// VIP 펜싱 표시를 지운다. 옮기는 쓰기의 결과를 안 뒤에 부른다.
+    pub fn end_vip_fence(&self, node: NodeId) {
+        self.vips.end_fence(node);
     }
 
     /// 리더가 지금 임기에 받은 리스 갱신. 리더에서만 뜻이 있다(리더인지는 `read_barrier`로 확인한다).

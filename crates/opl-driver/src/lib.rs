@@ -9,6 +9,7 @@ pub mod mounts;
 pub mod net;
 pub mod qemu;
 pub mod storage;
+pub mod vip;
 
 pub use error::DriverError;
 pub use firewall::{Firewall, FirewallNic, Nft, ruleset};
@@ -31,3 +32,4 @@ pub use storage::{
     ZfsSpace, ZfsStorage, ZvolInfo, check_pool_root, disk_location, parse_ceph_df, parse_lvs,
     parse_vgs, parse_zfs_dataset, pool_root,
 };
+pub use vip::{IpVip, VipAddress, VipNet, VipRecord, release_recorded};

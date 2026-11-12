@@ -114,6 +114,13 @@ pub enum LeaderRequest {
     RenewLease {
         node: NodeId,
     },
+    /// 노드의 VIP 리스를 갱신한다(설계 §4 내장 VIP). `vips`는 이 노드가 가질 수 있는 VIP 주소(IP)다.
+    /// 헬스 체크가 200인 노드만 보낸다. 리더는 `RenewLease`처럼 과반수의 리더인지 확인한 뒤 받은 시각을
+    /// 적고 자기가 적용한 마지막 로그 인덱스를 돌려준다. 로그에는 아무것도 쓰지 않는다.
+    RenewVip {
+        node: NodeId,
+        vips: Vec<String>,
+    },
 }
 
 /// 명령 적용 결과. 성공하면 새 revision(커밋된 로그 인덱스)을 담는다.
@@ -272,6 +279,22 @@ mod tests {
         let value = serde_json::to_value(&r).unwrap();
         assert_eq!(value, json!({"reason": "fenced", "node": node.to_string()}));
         assert_eq!(serde_json::from_value::<Rejection>(value).unwrap(), r);
+    }
+
+    /// 노드 사이로 오가는 형식이다. VIP 리스 갱신.
+    #[test]
+    fn vip_lease_wire_format_is_stable() {
+        let node = NodeId::from(2);
+        let req = LeaderRequest::RenewVip {
+            node,
+            vips: vec!["192.168.0.200".into()],
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value,
+            json!({"op": "renew-vip", "node": node.to_string(), "vips": ["192.168.0.200"]})
+        );
+        assert_eq!(serde_json::from_value::<LeaderRequest>(value).unwrap(), req);
     }
 
     #[test]

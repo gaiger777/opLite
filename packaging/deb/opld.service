@@ -14,6 +14,8 @@ NotifyAccess=main
 WatchdogSec=30s
 WatchdogSignal=SIGKILL
 ExecStart=/usr/bin/orbivisord --config /etc/opl/opld.toml
+# 프로세스가 죽어(SIGKILL 등) 떼지 못한 내장 VIP를 뗀다(늘 0으로 끝난다).
+ExecStopPost=/usr/bin/orbivisord --config /etc/opl/opld.toml --release-vips
 Restart=on-failure
 RestartSec=5
 KillMode=process

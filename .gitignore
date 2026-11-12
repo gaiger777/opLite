@@ -3,3 +3,4 @@
 *.pending-snap
 *.snap.new
 .superpowers/
+/packaging/portal/*.tar.gz

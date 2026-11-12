@@ -540,3 +540,142 @@ VM에서 손으로 확인하고 결과를 적는다.
 2. **watchdog 스레드와 저장소 스레드:** `HaGuard`의 쓰다듬기 스레드(원자값), redb 쓰기 스레드, 저장소 지연 시험
 3. **systemd 알림:** `sd_notify`(`READY=1`, 실행기 확인 뒤 `WATCHDOG=1`), 유닛 `Type=notify`·`WatchdogSec`, 패키징 시험
 4. **굶김 시험과 문서:** 시험 빌드의 실행기 막기, opld 실제 프로세스 굶김 시험, README "제어부 가용성" 절, 이 문서 §11
+
+## 13. 구현(계획 46)
+
+다섯 단계를 커밋 다섯으로 했다(1 헬스 체크와 API 노드 역할, 2 세션 공유, 3 믿는 프록시와 허용 출처, 4 API 이름과
+인증서 다시 발급, 5 내장 VIP·UI 따로 내보내기·문서). 설계 §4와 다르거나 설계가 정하지 않아 정한 것을 적는다.
+
+**헬스 체크와 API 노드(§4).**
+- 응답은 `{status, node, leader, quorum, apply_lag_ms, lease: fresh|expired|none, runtimes: ok|slow, maintenance,
+  api, failed: [quorum|apply_lag|lease|runtimes|maintenance|role]}`이다. `?live`는 늘 200이고(저장소를 읽지 못해도)
+  `failed`가 비어 있다. 로그인하지 않은 요청에는 `{status, failed}`만 답한다(나머지는 OpenAPI에서 선택 필드, 로그인한
+  세션·토큰이면 전체).
+- **적용 지연은 어림이다(설계와 다름).** openraft 0.9는 팔로어에 리더의 커밋 인덱스를 알려 주지 않는다. 그래서
+  "이 노드 로그에 보인 항목이 적용되지 않은 채 지난 시간"을 잰다(`Cluster::health()`, 5초 넘으면 실패). 리더는
+  `millis_since_quorum_ack` ≤ 5초여야 `quorum`이다.
+- 노드 스펙 `roles: Option<Vec<NodeRole>>`(없으면 기본: 위트니스가 아니면 `api`, 기본이면 쓰지 않아 옛 노드가 읽음).
+  설계의 "투표 멤버면 api"는 지금 모든 비위트니스가 투표 멤버라 같다. 바꾸려면 모든 노드가 기능 `node-roles`를
+  보고해야 한다(아니면 409 `cluster_upgrading`). 위트니스는 `api`가 될 수 없다.
+- `GET /cluster/api-endpoints`의 zone은 노드 레이블 `zone`이다. `orbivisorctl cluster api-endpoints -o haproxy`의
+  `server` 줄은 `check ssl verify required ca-file /etc/haproxy/orbivisor-ca.pem`이다(`-o haproxy`는 이 명령에만).
+
+**세션 공유(§4).**
+- `Session` 리소스(`SessionSpec { user, epoch, expires_at }`, `SessionStatus { last_used }`), 이름은 쿠키 값의
+  SHA-256 hex(원문은 Raft에 없다). 계정 종류라 관리자만 읽고 API로 내보내지 않으며 watch하지 않는다.
+- 만들기·지우기는 Raft 쓰기, 마지막 사용 시각은 세션마다 노드에서 60초에 한 번까지 뒤에서 쓴다. 리더의 정리 작업이
+  만료·주인 없음·세대(epoch) 지남을 한 번에 200개까지 지운다. 인증은 노드 메모리 먼저, 그다음 Raft다.
+- 기능 `shared-sessions`가 없는 노드가 남았으면(롤링 업그레이드) 지금처럼 노드 메모리 세션이다.
+- 한 사용자의 Raft 세션은 32개까지다(만들기 전에 만료가 이른 것부터 지운다).
+- **다른 노드의 메모리 세션 로그아웃.** 로그아웃한 쿠키가 이 노드의 메모리·Raft 어디에도 없으면 다른 노드의 메모리
+  세션일 수 있으므로 그 해시 이름으로 이미 끝난 `Session`(주인 nil, 만료 지금)을 "로그아웃 표시"로 쓴다(모든 노드가
+  `shared-sessions`를 알고 정족수가 있을 때만, 쿠키 모양이 맞을 때만, 표시 2천 개까지, 못 쓰면 경고). 표시를 쓰는
+  로그아웃은 IP별 로그인 실패 제한(`AttemptLimiter::begin_ip`)에 실패로 세고, 막혔으면 표시 없이 쿠키만 지운다(204,
+  알려 주지 않음). 메모리 세션은
+  쓸 때마다 같은 이름의 끝난 Raft 세션이 있으면 거절하고 지운다. 정리 작업은 표시를 세션 수명(12시간) 뒤 지운다.
+- 알려진 한계: 정족수 없는 소수 쪽 노드는 그 노드의 옛 사용자 정보로 로그인을 받는다(바뀐 비밀번호가 따라잡을 때까지).
+  로그인 시도 제한은 노드마다 따로 센다(README).
+- **정족수 없는 로그인(가용성 회귀 고침).** 세션 만들기가 Raft 쓰기라 정족수가 없으면 로그인이 503이 되었다(전에는
+  로컬 사용자 로그인이 정족수 없이 됐다). 정족수가 없거나(`health().quorum` false) 쓰기가 `Timeout`·`Unreachable`·
+  `NotLeader`면 그 노드의 메모리 세션으로 로그인한다(경고 로그, 그 세션은 그 노드에서만).
+
+**믿는 프록시와 허용 출처(§4).**
+- `[api] trusted_proxies`(CIDR). `X-Forwarded-For`는 오른쪽부터 보며 믿지 않는 첫 주소, `X-Forwarded-Host`·
+  `X-Forwarded-Proto`는 맨 오른쪽 값을 쓴다.
+- `web_origins`(관리자, 32개까지, 소문자·기본 포트 뺌). 비우지 않으려면 모든 노드가 현재 빌드여야 한다. CORS는
+  preflight 204, 메서드 GET·POST·PUT·PATCH·DELETE, max-age 600, Expose-Headers 없음이다. 허용 출처에서 온
+  로그인·로그아웃만 세션 쿠키를 `SameSite=None; Secure`로 준다. 허용 출처는 `https://`만(개발용 `http://localhost`·
+  `127.0.0.1`·`[::1]`은 예외).
+- 로그아웃도 쿠키 요청과 같은 출처 검사를 한다. 허용 출처를 쓰면(쿠키가 `SameSite=None`일 수 있음) 쿠키로 인증한
+  GET·HEAD가 아닌 요청과 WebSocket 업그레이드가 `Origin` 없이 `Sec-Fetch-Site`가 있는데 `same-origin`·`same-site`·
+  `none`이 아니면 거절한다(`Origin` 없는 다른 사이트 요청을 막는다). 그 헤더를 보내는 브라우저는 쓰기에 `Origin`도
+  보내므로, 둘 다 없는 비브라우저 클라이언트(orbivisorctl 쿠키 로그인 → `POST /tokens` → 로그아웃, curl)는 통과한다.
+- **남은 것.** 다른 호스트의 포털에서 OIDC로 로그인하면 끝난 뒤 API 호스트의 `/`로 돌아간다(같은 호스트 이름 구성은
+  영향 없음). README에 적었다.
+
+**API 이름(§4).**
+- `api_names`(관리자, 32개까지, IP는 표준형, DNS는 소문자·끝 점 뺌, 와일드카드·포트·괄호·숫자뿐인 끝 라벨 거절).
+- **다시 발급은 노드가 스스로 한다.** 노드 인증서는 합류 요청을 받은 노드가 Raft의 클러스터 정보에 있는 CA 키로
+  CSR에 서명한다. 같은 방법으로 각 노드의 `ApiCertAgent`가 새 키와 CSR을 만들어 `ClusterCa::sign_api`로 자기 API
+  인증서를 서명한다(이름: 노드 인증서의 이름 + `api_names`, 다른 노드에 요청하지 않음). API 인증서는 메모리에만 둔다
+  (다시 시작하면 리스너를 열기 전에 다시 만든다). 설정이 바뀌면 곧바로, 실패하면 10초마다 다시 한다.
+- **API 인증서는 노드 신원과 뗀다.** 서버 인증 EKU만 두고 CN은 `orbivisor-api`다. 피어 mTLS는 클라이언트 인증 EKU와
+  CN의 노드 id를 보므로 API 키가 새어도 피어 인증서로 쓰지 못한다(시험: API 인증서로 피어 연결이 거절됨). `api_names`가
+  비면 리스너는 예전처럼 노드 인증서를 쓴다.
+- **관리자 인증서.** opld 설정 `[api] tls_cert`·`tls_key`(PEM, 둘 다)가 있으면 API 리스너가 그것을 쓰고(중간 인증서를
+  이어 붙여도 됨) `ApiCertAgent`를 띄우지 않는다. 읽지 못하면 시작 오류다. 클러스터 CA는 모든 노드에 키가 있고 이름
+  제한이 없으므로 브라우저·OS 신뢰 저장소에 넣지 말고, 브라우저용으로는 HAProxy에서 공인 인증서로 끝내거나 이것을
+  쓴다고 README에 적었다. 이름 제한이 있는 중간 CA는 뒤 계획으로 미뤘다. 파일은 시작할 때만 읽는다(갱신 뒤
+  `systemctl restart opld`, README). `orbivisorctl login --system-ca`는 클러스터 CA를 핀으로 두지 않고 OS 신뢰
+  저장소로 서버를 확인하며(클라이언트가 이미 native-tls라 핀이 없으면 OS 저장소, 새 의존성 없음) 설정 파일의
+  `system_ca`로 다음 명령도 같게 한다.
+
+**내장 VIP(§4).**
+- **Raft에는 주인만 둔다(설계와 다름).** 설계는 `VipHolder { node, until }`을 Raft에 두었지만, 그러면 VIP마다 1초에
+  한 번 Raft 쓰기가 생기고 노드가 `until`(리더 벽시계)을 자기 시계와 비교할 수 없다. HA 리스와 같은 모양으로 나눴다:
+  Raft의 `VipHolder` 리소스(`Kind::VipHolder`, 이름은 VIP의 IP, `VipHolderSpec { node }`)는 주인이 바뀔 때만 리더가
+  쓰고, 리스는 리더 메모리의 VIP 리스 표(`VipLeases { term, renewed: NodeId → VipRenewal { at, vips } }`)에 있다.
+- **갱신.** 노드는 헬스 체크(`?ready`)가 200일 때만 1초마다 `LeaderRequest::RenewVip { node, vips }`를 보낸다(`vips`는
+  그 노드의 `[vip] addresses`의 IP). 리더는 `RenewLease`처럼 과반수의 리더인지 확인하고 받은 시각을 적고 자기 적용
+  인덱스를 돌려준다. 노드는 그 인덱스까지 적용된 뒤(`Cluster::renew_vip`) 보내기 전에 잰 시각에서 `3초 − 0.5초`까지
+  VIP를 쥔다. 갱신 제한 시간은 그 마감까지라 답이 늦으면 마감에 뗀다. 헬스가 503이면 곧바로 뗀다.
+- **배정(`VipManager`, 리더).** 1초마다(HA 복구처럼 장벽 뒤에 읽음) 리스가 살아 있는 노드(마지막 갱신에서 3초 미만,
+  기준점은 그 임기에서 리더인 것을 처음 본 때)를 후보로 `plan`한다: 주인이 쥐었을 수 있으면(리스가 살아 있고 그 VIP를
+  알렸거나, 리더가 된 지 3초가 안 되어 아직 갱신이 없음) 그대로, 아니면 그 VIP를 가질 수 있는 후보 가운데 VIP가 가장
+  적은 노드(같으면 id가 작은 노드). 옛 주인에게서 옮길 때는 옛 주인의 VIP 갱신을 막고(`begin_vip_fence`, `Fenced`로
+  거부) 리스를 다시 본 뒤 쓴다. 쓰기의 결과를 알면(`Ok`·`Rejected`·`NotLeader`) 풀고, 모르면 그 쓰기가 보이거나
+  임기가 바뀔 때까지 쥔다. 그래서 펜싱이 풀린 뒤의 갱신이 돌려주는 인덱스에 옮긴 결과가 들어 있다.
+- 설계의 "리더가 고르는 후보는 `api` 역할·헬스 200"은 노드가 헬스 200일 때만 갱신하는 것으로 했다(리더는 노드의
+  헬스를 직접 보지 못한다).
+- **VIP 여러 개.** 각 노드가 가질 수 있는 VIP는 그 노드의 설정이 정한다(갱신에 실어 보냄). 모든 API 노드에 같게 두는
+  것을 권한다.
+- **노드 쪽(`VipAgent`).** `core` 실행기에서 돈다(api·work가 바빠도 제때 뗀다). 시작할 때 설정의 VIP를 모두 뗀다
+  (kill -9로 죽은 지난 프로세스가 남긴 것). 붙이기는 `ip addr add <vip>/<prefix> dev <interface>`(이미 있으면 성공),
+  떼기는 `ip addr del`(없으면 성공), 알림은 `arping -U -c 3 -I <interface> <ip>`(세 번)를 기다리지 않고 띄운다(실패는
+  경고). VIP마다 알림 작업을 쥐고 떼면 멈춘다(늦은 알림이 새 주인을 가리지 않게). 정상 종료는 API보다 먼저 VIP를
+  뗀다. 패키지는 `iputils-arping`을 Recommends로 둔다. 루프 맨 앞에서 리스 마감이 이미 지났으면(늦게 깸) 갱신보다 먼저
+  VIP를 떼고, 마감까지 남은 시간이 없으면 갱신하지 않는다. 갱신 5번에 한 번 쥔 VIP를 다시 `add`해(`VipNet::add`는
+  새로 붙였으면 true) 밖에서(`ifreload`·브리지 다시 시작·networkd) 지워진 주소를 되살리고 다시 알린다.
+- **업그레이드.** 노드 기능 `vip`을 더했다. `VipManager`는 모든 노드(위트니스 포함)가 `vip`을 보고할 때만
+  `VipHolder`를 쓴다(옛 노드는 `vip-holder` 로그 항목을 풀지 못해 리더가 바뀌면 모든 Raft 쓰기가 멈춘다). 에이전트도
+  기능이 모자라면 경고하고 갱신하지 않는다.
+- **남은 VIP 정리.** 붙인 VIP(인터페이스, 주소/접두 길이)를 `{data_dir}/vips`에 붙이기 전에 적고(적지 못하면 붙이지
+  않음) 뗀 뒤 지운다(새 파일에 써서 바꿔 끼움). opld는 시작할 때 `Member::start` 전에 기록의 모든 주소를 지금 설정과
+  관계없이 기록한 접두 길이 그대로 뗀다(접두 길이가 달라 `del`이 "Cannot assign requested address"로 실패하고 성공으로
+  넘어가는 일이 없다). 유닛의 `ExecStopPost=/usr/bin/orbivisord --config /etc/opl/opld.toml --release-vips`가 SIGKILL
+  뒤에도 같은 일을 한다(설정의 `data_dir`만 읽고, 설정·네트워크 오류도 0으로 끝나 재시작을 막지 않는다). 데이터 디렉터리
+  잠금(`opld.lock`)을 막지 않고 잡아 보고, 다른 프로세스(돌고 있는 데몬)가 쥐고 있으면 아무것도 떼지 않는다. 인터페이스가
+  없어(`Cannot find device`) 떼지 못한 항목은 경고하고 기록에서 뺀다.
+- 설정 `[vip] addresses = ["a.b.c.d/nn", …]`(IPv4만, 접두사가 없으면 /32), `interface`. Linux가 아니거나 위트니스이거나
+  `interface`가 없거나 같은 IP가 두 번이면 설정 오류다. IPv6 VIP는 gratuitous ARP 대신 이웃 광고가 필요해 뺐다.
+- **알려진 한계.** 두 노드가 같은 VIP를 갖지 않는 것은 orbivisord가 도는 동안의 성질이다. 겹칠 수 있는 때: kill -9·
+  SIGKILL로 죽은 뒤 재시작이나 `ExecStopPost`가 떼기까지, 프로세스·VM이 멈춘 뒤 watchdog SIGKILL까지, 호스트 절전
+  중(리스 마감을 재는 단조 시계가 멈춘다). 설정에서 주소를 뺀 경우는 기록으로 뗀다. 헬스의 적용 지연은 리더보다
+  뒤처진 노드를 잡지 못하는 어림이고, 실행기 확인이 한 번 늦으면 10초 동안 503이 되어 VIP가 옮겨 갈 수 있다. VIP 갱신은
+  갱신마다 리더가 `confirm_leader`를 하므로 노드 수의 제곱만큼 메시지가 든다(계획 47의 리스 확인 묶기에서 함께 줄인다).
+  설정에서 뺀 VIP의 `VipHolder`는 남는다(해롭지 않음). BGP 모드(§4)는 계획 49 뒤다.
+- 시험: `plan`·`wanted`·`renew_limit`·주소 파싱·명령 인자·VIP 기록은 단위 시험(macOS에서도 돈다), opl-cluster VIP 리스
+  표(갱신·고립·펜싱), opl-api `VipManager`·`VipAgent`(가짜 노드 갱신과 가짜 `VipNet`, 리스 2초 — 바쁜 CI에서 갱신이
+  잠깐 밀려도 "옮기지 않음"이 깨지지 않게; 옛 노드가 있으면 쓰지 않음, 늦게 깨면 먼저 뗌, 기록), `--release-vips`가
+  오류에도 0으로 끝남(opld 프로세스), Linux CI(root, `net-it`)에서 opl-driver가 이름공간의 dummy 인터페이스에 붙이고
+  떼기, opld 둘과 위트니스가 각자의 dummy 인터페이스로 VIP를 두 노드가 함께 갖는 때가 없고(헬스가 잠깐 503이 되어
+  주인이 한 번 바뀌는 것은 받아들인다) 멈추면 옮겨 가고 kill -9 뒤 남은 VIP를 다시 시작할 때와 프로세스 없이
+  `--release-vips`로 떼기.
+
+**UI 따로 내보내기(§4).**
+- 설정 `[web] enabled = false`면 API 라우터만 연다(`/api/` 밖은 404, 보안 헤더 없음).
+- `packaging/portal/build-web.sh <version> <out dir>`가 `web/dist`(또는 `OPL_WEB_DIST`)로 `orbivisor-web-<version>.tar.gz`
+  (안은 `orbivisor-web-<version>/`, 소유자 0)를 만든다. `nginx.conf`(노드와 같은 보안 헤더, `/assets/` 오래 캐시,
+  화면 주소는 `index.html`, `/api/`는 404)와 `Dockerfile`(nginx-unprivileged, 8080) 예. 릴리스 작업 흐름이 아직
+  없으므로 묶음은 이 스크립트로 만든다. `packaging/tests/portal-test.sh`가 CI shell 작업에서 돈다.
+
+**배포 뒤 확인(테스트 VM, UTM).** CI는 한 호스트의 dummy 인터페이스로만 VIP를 본다. 실제 L2에서 손으로 확인하고
+결과를 적는다.
+
+| 확인 | 결과 |
+|---|---|
+| 내장 VIP: 주인 노드의 전원을 끈 뒤 다른 노드가 VIP를 갖기까지(`ping -i 0.2 <VIP>`가 끊긴 시간, 3~4초 기대) | 아직 |
+| 내장 VIP: `systemctl stop opld` 뒤 옮겨 가기까지, 주인의 cluster_listen을 막았을 때 주인이 스스로 떼는지(`ip addr`) | 아직 |
+| 내장 VIP: 이웃(다른 호스트)의 ARP 캐시가 새 주인의 MAC으로 바뀌는지(`ip neigh`, `arping` 있음·없음) | 아직 |
+| HAProxy: `option httpchk GET /api/v1/health`로 유지보수·`roles none` 노드가 DOWN이 되고(약 `inter × fall`) 돌아오면 UP | 아직 |
+| HAProxy 뒤에서 로그인·콘솔(WebSocket)·노드 하나를 끈 뒤에도 세션이 이어지는지, 감사 로그의 요청 주소가 클라이언트 주소인지 | 아직 |

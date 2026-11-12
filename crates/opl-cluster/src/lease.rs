@@ -107,7 +107,7 @@ impl LeaseTable {
 
 /// 과반수에게 아직 리더인지 확인하고, 그 시점의 커밋 인덱스까지 적용되기를 기다린다.
 /// `deadline`까지 끝나지 않으면 `Timeout`이다.
-async fn confirm_leader(
+pub(crate) async fn confirm_leader(
     raft: &Raft<TypeConfig>,
     deadline: Instant,
 ) -> Result<Option<LogId<NodeId>>, ClusterError> {

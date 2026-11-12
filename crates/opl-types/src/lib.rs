@@ -19,5 +19,6 @@ pub mod storage;
 pub mod subscription;
 pub mod task;
 pub mod version;
+pub mod vip;
 pub mod vm;
 pub mod vm_import;

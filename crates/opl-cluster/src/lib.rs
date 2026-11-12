@@ -10,6 +10,7 @@ pub mod memnet;
 mod state_machine;
 pub mod store;
 pub mod types;
+mod vip;
 pub mod watch;
 mod writer;
 
@@ -19,3 +20,4 @@ pub use leader::{CATCH_UP_TIMEOUT, Forwarder, LeaderError};
 pub use lease::Leases;
 pub use log_store::LogStore;
 pub use state_machine::StateMachine;
+pub use vip::{VipLeases, VipRenewal};

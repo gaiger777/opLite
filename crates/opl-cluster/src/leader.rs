@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::cluster::ClusterError;
 use crate::lease::LeaseTable;
 use crate::types::{LeaderRequest, NodeId, Rejection, Response, TypeConfig};
+use crate::vip::VipTable;
 
 /// learner가 로그를 따라잡기를 기다리는 최대 시간. 스냅샷을 받아야 하면 오래 걸린다.
 pub const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -88,11 +89,12 @@ impl From<LeaderError> for ClusterError {
     }
 }
 
-/// 리더로서 요청을 처리하는 데 쓰는 것: Raft와 리스 표
+/// 리더로서 요청을 처리하는 데 쓰는 것: Raft와 리스 표(HA·VIP)
 #[derive(Clone)]
 pub(crate) struct LeaderCtx {
     pub(crate) raft: Raft<TypeConfig>,
     pub(crate) leases: Arc<LeaseTable>,
+    pub(crate) vips: Arc<VipTable>,
 }
 
 /// 이 노드가 리더라고 보고 요청을 처리한다. 리더가 아니면 `NotLeader`다. 성공하면 커밋된 로그 인덱스
@@ -105,6 +107,7 @@ pub(crate) async fn execute(
     let raft = &ctx.raft;
     match req {
         LeaderRequest::RenewLease { node } => ctx.leases.renew(raft, node, timeout).await,
+        LeaderRequest::RenewVip { node, vips } => ctx.vips.renew(raft, node, vips, timeout).await,
         LeaderRequest::Write { command } => {
             let resp = tokio::time::timeout(timeout, raft.client_write(command))
                 .await

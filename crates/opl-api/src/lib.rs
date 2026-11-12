@@ -41,6 +41,7 @@ mod tasks;
 mod telemetry;
 mod updates;
 pub mod users;
+pub mod vip;
 pub mod vm_imports;
 mod vms;
 mod volumes;
@@ -70,6 +71,7 @@ pub use state::AppState;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
 pub use telemetry::{TelemetryConfig, TelemetryReporter};
 pub use updates::{AUTH_FILE, KEYRING, UpdateAgent, Updates, UpdatesConfig};
+pub use vip::{VipAgent, VipAgentConfig, VipManager, VipManagerConfig};
 
 use crate::resources as r;
 

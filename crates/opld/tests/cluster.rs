@@ -458,3 +458,45 @@ async fn api_names_are_served_by_the_api_listener() {
     .await;
     d.stop();
 }
+
+/// `/`(웹 UI 자리)의 상태 코드와 CSP 헤더 유무. 클러스터 CA로 확인한다.
+async fn root_page(d: &Daemon, ca_pem: &str) -> (u16, bool) {
+    let resp = reqwest::Client::builder()
+        .tls_certs_only([reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()])
+        .build()
+        .unwrap()
+        .get(format!("{}/", d.server()))
+        .send()
+        .await
+        .unwrap();
+    (
+        resp.status().as_u16(),
+        resp.headers().contains_key("content-security-policy"),
+    )
+}
+
+/// 계획 46: `[web] enabled = false`면 API만 열고 내장 웹 UI(시험 빌드는 안내 페이지)를 주지 않는다.
+#[tokio::test]
+async fn the_built_in_web_ui_can_be_turned_off() {
+    let mut on = Daemon::new("node1", "");
+    on.start().await;
+    on.init("prod").await;
+    on.login().await;
+    let ca = on.ctl(&["cluster", "ca"]).await.unwrap();
+    // 웹 UI를 넣은 빌드(`web-ui`, CI의 `web-it`)는 UI를, 아니면 보안 헤더를 붙인 안내 페이지(404)를 준다.
+    let (status, csp) = root_page(&on, &ca).await;
+    assert!(csp);
+    if !cfg!(feature = "web-ui") {
+        assert_eq!(status, 404);
+    }
+    on.stop();
+
+    let mut off = Daemon::new("node1", "[web]\nenabled = false\n");
+    off.start().await;
+    off.init("prod").await;
+    off.login().await;
+    let ca = off.ctl(&["cluster", "ca"]).await.unwrap();
+    assert_eq!(root_page(&off, &ca).await, (404, false));
+    assert_eq!(health(&off, "").await.0, 200);
+    off.stop();
+}

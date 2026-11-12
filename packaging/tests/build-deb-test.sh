@@ -96,6 +96,12 @@ if grep -qx 'Type=notify' "$UNIT_DIR/opld.service" && grep -qx 'NotifyAccess=mai
 else
 	fail "유닛 systemd 알림: $(cat "$UNIT_DIR/opld.service")"
 fi
+# 내장 VIP(계획 46): 죽은 프로세스가 남긴 VIP를 멈춘 뒤 뗀다(SIGKILL 뒤에도 돈다).
+if grep -qx 'ExecStopPost=/usr/bin/orbivisord --config /etc/opl/opld.toml --release-vips' "$UNIT_DIR/opld.service"; then
+	ok "유닛은 ExecStopPost로 남은 VIP를 뗀다"
+else
+	fail "유닛 ExecStopPost: $(grep ExecStop "$UNIT_DIR/opld.service")"
+fi
 if [ -f "$T/usr/share/orbivisor/opld.toml.example" ] && [ -f "$T/usr/share/doc/orbivisor/copyright" ] &&
 	[ ! -e "$T/usr/share/oplite" ] && [ ! -e "$T/usr/share/doc/oplite" ]; then
 	ok "공유 파일은 /usr/share/orbivisor"

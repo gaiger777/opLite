@@ -86,6 +86,7 @@ jobs:
       - run: bash packaging/tests/name-test.sh
       - run: bash packaging/tests/build-deb-test.sh
       - run: bash packaging/tests/build-repo-test.sh
+      - run: bash packaging/tests/portal-test.sh
       - run: bash packaging/tests/maint-test.sh
       - run: bash packaging/tests/setup-test.sh
       # 설치 프로그램 환경(busybox sh·awk)에서 orbivisor-setup.sh 함수가 같은 결과를 내는지

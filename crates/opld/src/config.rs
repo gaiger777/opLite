@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use opl_api::{
     AuditConfig, BackupJobSchedulerConfig, ClusterJanitorConfig, RemotePollerConfig,
-    SnapshotSchedulerConfig, TelemetryConfig, UpdatesConfig,
+    SnapshotSchedulerConfig, TelemetryConfig, UpdatesConfig, VipAgentConfig,
 };
+use opl_driver::VipAddress;
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
 use opl_reconciler::ha::{DeviceWatchdog, WatchdogOpener};
@@ -78,6 +79,10 @@ pub struct Config {
     pub runtime: RuntimeSection,
     #[serde(default)]
     pub api: ApiSection,
+    #[serde(default)]
+    pub vip: VipSection,
+    #[serde(default)]
+    pub web: WebSection,
     /// 시험 빌드(`starve-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
     #[cfg(feature = "starve-it")]
     #[serde(default)]
@@ -648,6 +653,47 @@ impl ApiSection {
     }
 }
 
+/// 내장 VIP(설계 §4, Linux만). 이 노드가 가질 수 있는 VIP다. 리더가 VIP마다 헬스 체크가 200인 노드 하나를
+/// 골라 주고, 그 노드가 `interface`에 붙인다. 모든 API 노드에 같게 둔다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VipSection {
+    /// VIP(`"192.168.0.200/24"`, IPv4). 접두사는 인터페이스에 붙일 때 쓴다(없으면 `/32`).
+    #[serde(default)]
+    pub addresses: Vec<VipAddress>,
+    /// VIP를 붙일 인터페이스(예: `eth0`, `vmbr0`)
+    pub interface: Option<String>,
+}
+
+impl VipSection {
+    /// VIP 에이전트 설정. VIP가 없으면 None이다.
+    pub fn agent_config(&self) -> Option<VipAgentConfig> {
+        let interface = self.interface.as_ref()?;
+        (!self.addresses.is_empty())
+            .then(|| VipAgentConfig::new(interface.clone(), self.addresses.clone()))
+    }
+}
+
+/// 내장 웹 UI. 끄면 API(`/api/`)만 열고 UI는 따로 둔 포털(`packaging/portal/`)이 준다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSection {
+    #[serde(default = "default_web_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for WebSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_web_enabled(),
+        }
+    }
+}
+
+fn default_web_enabled() -> bool {
+    true
+}
+
 /// 실행기 크기(설계 §3.1). `core` 실행기는 2로 고정이다.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -914,6 +960,18 @@ fn with_port(host: &str, port: u16) -> String {
 }
 
 impl Config {
+    /// 설정 파일에서 `data_dir`만 읽는다(없으면 기본값). 나머지가 틀려도 된다(`--release-vips`).
+    pub fn data_dir_of(path: &Path) -> anyhow::Result<PathBuf> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        let table: toml::Table = toml::from_str(&text)?;
+        match table.get("data_dir") {
+            Some(toml::Value::String(dir)) => Ok(dir.into()),
+            Some(_) => anyhow::bail!("data_dir must be a path"),
+            None => Ok(default_data_dir()),
+        }
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
@@ -1017,12 +1075,42 @@ impl Config {
         {
             anyhow::bail!("network.underlay must not be an unspecified address (got {ip})");
         }
+        self.validate_vip(linux)?;
         // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
         if self.listen.port() == self.cluster_listen.port() {
             anyhow::bail!(
                 "listen and cluster_listen must use different ports (got {} for both)",
                 self.listen.port()
             );
+        }
+        Ok(())
+    }
+
+    /// `[vip]`: Linux만, 위트니스는 안 됨, 인터페이스가 있어야 하고 같은 IP를 두 번 쓰지 않는다.
+    fn validate_vip(&self, linux: bool) -> anyhow::Result<()> {
+        let vip = &self.vip;
+        if vip.addresses.is_empty() {
+            return Ok(());
+        }
+        if !linux {
+            anyhow::bail!("vip.addresses needs Linux");
+        }
+        if self.witness {
+            anyhow::bail!("a witness has no API and cannot hold a VIP; remove [vip]");
+        }
+        let ok = vip.interface.as_deref().is_some_and(|i| {
+            (1..=15).contains(&i.len())
+                && i.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+        });
+        if !ok {
+            anyhow::bail!("vip.interface must name the network interface for vip.addresses");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for a in &vip.addresses {
+            if !seen.insert(a.ip) {
+                anyhow::bail!("vip.addresses lists {} more than once", a.ip);
+            }
         }
         Ok(())
     }
@@ -1537,6 +1625,70 @@ mod tests {
         assert_eq!(shown, ["10.0.0.0/8", "fd00::/8", "192.0.2.10/32"]);
         for bad in ["\"10.0.0.1/8\"", "\"proxy.lan\"", "\"10.0.0.0/33\""] {
             let text = format!("name = \"n\"\naddress = \"h\"\n[api]\ntrusted_proxies = [{bad}]");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn data_dir_is_read_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opld.toml");
+        // 다른 키가 틀려도 data_dir만 읽는다.
+        std::fs::write(
+            &path,
+            "data_dir = \"/d\"\nunknown = 1\n[vip]\naddresses = 5",
+        )
+        .unwrap();
+        assert_eq!(Config::data_dir_of(&path).unwrap(), Path::new("/d"));
+        std::fs::write(&path, "name = \"n\"").unwrap();
+        assert_eq!(
+            Config::data_dir_of(&path).unwrap(),
+            Path::new("/var/lib/opl")
+        );
+        std::fs::write(&path, "data_dir = 5").unwrap();
+        assert!(Config::data_dir_of(&path).is_err());
+        assert!(Config::data_dir_of(&dir.path().join("none")).is_err());
+    }
+
+    #[test]
+    fn vip_and_web_sections() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert!(c.vip.addresses.is_empty());
+        assert!(c.vip.agent_config().is_none());
+        assert!(c.web.enabled);
+        c.validate().unwrap();
+
+        let text = "name = \"n\"\naddress = \"h\"\n[vip]\naddresses = [\"192.168.0.200/24\", \"192.168.0.201\"]\ninterface = \"eth0\"\n[web]\nenabled = false";
+        let c = parse(text);
+        assert!(!c.web.enabled);
+        let agent = c.vip.agent_config().unwrap();
+        assert_eq!(agent.interface, "eth0");
+        let shown: Vec<String> = agent.addresses.iter().map(|a| a.to_string()).collect();
+        assert_eq!(shown, ["192.168.0.200/24", "192.168.0.201/32"]);
+        // macOS는 VIP를 지원하지 않는다.
+        assert_eq!(c.validate().is_ok(), cfg!(target_os = "linux"));
+        if cfg!(target_os = "linux") {
+            let with = |extra: &str| {
+                let c: Config = toml::from_str(&format!(
+                    "name = \"n\"\naddress = \"h\"\n{extra}\n[vip]\naddresses = [\"10.0.0.5/24\"]"
+                ))
+                .unwrap();
+                c.validate()
+            };
+            assert!(with("").is_err(), "no interface");
+            assert!(with("witness = true").is_err());
+            let mut dup = parse(text);
+            dup.vip.addresses.push("192.168.0.200/25".parse().unwrap());
+            assert!(dup.validate().is_err());
+            let mut bad = parse(text);
+            bad.vip.interface = Some("eth 0".into());
+            assert!(bad.validate().is_err());
+        } else {
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("needs Linux"), "{err}");
+        }
+        for bad in ["\"fd00::1/64\"", "\"10.0.0.5/0\"", "\"eth0\""] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[vip]\naddresses = [{bad}]");
             assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
         }
     }

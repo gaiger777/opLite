@@ -1397,6 +1397,295 @@ API·작업·느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰
   그동안 리더·임기가 그대로이고 모든 노드의 리스 나이가 3초 미만이며 `WATCHDOG=1`이 멈추는지 본다. `starve-it`
   기능은 시험 빌드에만 있는 고리(`[test] block_api_ms`, 제어 소켓의 `/v1/test/…`)를 넣으므로 배포 빌드에 켜지 않는다.
 
+## 앞단 프록시와 VIP (API 가용성)
+
+모든 노드가 같은 API를 연다: 읽기는 받은 노드의 복제본에서, 쓰기는 리더로 전달된다. 그래서 브라우저·CLI·자동화가
+한 노드 주소 대신 **로드 밸런서(HAProxy 등)나 VIP**를 부르게 하면 노드 하나가 죽어도 API가 이어진다. 이 절의 기능은
+그 앞단을 위한 것이다([설계 문서](docs/superpowers/specs/2026-11-11-availability-scale-design.md) §4·§13).
+
+### 헬스 체크
+
+`GET /api/v1/health`는 인증 없이 부른다. 기본(`?ready`)은 이 노드에 요청을 보내도 되는지 보고 200이나 503(같은 모양,
+실패한 확인은 `failed`)으로 답한다. `?live`는 프로세스가 답하는지만 보고 늘 200이다(쿠버네티스의 liveness). 로그인하지
+않은 요청에는 `status`·`failed`만 답하고, 로그인(세션·API 토큰)하면 노드 id·리더 같은 자세한 상태도 답한다.
+
+```bash
+curl -s --cacert ca.pem https://node1:8006/api/v1/health
+# {"status":"ok","failed":[]}
+curl -s --cacert ca.pem -H "Authorization: Bearer $TOKEN" https://node1:8006/api/v1/health
+# {"status":"ok","node":"…","leader":"…","quorum":true,"apply_lag_ms":0,"lease":"none",
+#  "runtimes":"ok","maintenance":false,"api":true,"failed":[]}
+curl -s --cacert ca.pem 'https://node1:8006/api/v1/health?live'
+```
+
+| `failed` 항목 | 뜻 |
+|---|---|
+| `quorum` | 리더를 모르거나, 리더인데 과반수가 5초 넘게 답하지 않았다 |
+| `apply_lag` | 이 노드가 받은 로그를 5초 넘게 적용하지 못했다(어림: 리더보다 뒤처져 아직 받지 못한 로그는 보지 못한다) |
+| `lease` | HA 펜싱(`[ha] fencing`)을 쓰는데 리스가 fresh가 아니다 |
+| `runtimes` | 마지막 실행기 확인(10초마다)에서 `core`나 `api`가 늦었다("제어부 가용성"). 한 번 늦으면 다음 확인까지 10초 동안 503이다 |
+| `maintenance` | 노드가 유지보수(비우기) 중이다 |
+| `role` | 노드가 `api` 역할이 아니다 |
+
+### API 노드
+
+앞단이 부를 노드를 노드 역할 `api`로 정한다. 기본은 위트니스가 아닌 모든 노드다. 노드가 많으면 장애 영역마다
+고르게 3~5대만 두고 나머지는 `none`으로 둔다(그 노드의 `?ready`가 503이 되어 앞단이 저절로 뺀다). 역할을 바꾸려면
+모든 노드가 이 판 이상이어야 한다.
+
+```bash
+orbivisorctl node roles node4 none      # "node node4: roles none"
+orbivisorctl node roles node4 api
+orbivisorctl node roles node4 default   # 기본으로(위트니스가 아니면 api)
+orbivisorctl node list                  # ROLES 열
+orbivisorctl cluster api-endpoints      # NAME ADDRESS ZONE(노드 레이블 zone, 없으면 -)
+orbivisorctl cluster api-endpoints -o haproxy
+# server node1 10.0.0.11:8006 check ssl verify required ca-file /etc/haproxy/orbivisor-ca.pem
+# server node2 10.0.0.12:8006 check ssl verify required ca-file /etc/haproxy/orbivisor-ca.pem
+orbivisorctl cluster ca > /etc/haproxy/orbivisor-ca.pem   # 클러스터 CA(PEM). 프록시가 노드 인증서를 확인한다
+```
+
+노드를 더하거나 빼면 `-o haproxy`로 다시 만들어 넣는다(또는 HAProxy 런타임 API·DNS `server-template`). API는
+`GET /api/v1/cluster/api-endpoints`(로그인 필요)다.
+
+### 세션 공유
+
+웹 로그인 세션은 Raft(클러스터 저장소)에 있어 앞단이 어느 노드로 보내도 이어진다. 고정 연결(sticky)이 필요 없고, 노드가
+죽어도 다시 로그인하지 않는다. 저장하는 것은 쿠키 값의 SHA-256뿐이다. 로그아웃·만료·비밀번호 변경·사용자 비활성화는
+모든 노드에 곧바로 반영된다. 정족수가 없을 때(장애 중)는 로컬 사용자 로그인이 그 노드에서만 쓰는 세션으로 된다(경고 로그).
+한 사용자의 세션은 32개까지이고, 넘으면 가장 오래된 세션이 끝난다. 그 노드에서만 쓰는 세션(정족수가 없을 때나 옛 노드가
+남았을 때 만든 것)을 다른 노드에서 로그아웃하면 Raft에 로그아웃 표시를 남겨 그 노드에서도 끝난다(표시는 12시간 뒤 지운다).
+로그아웃은 인증 없이 부르므로 표시는 2,000개까지이고, 표시를 쓰는 로그아웃(어디서도 찾지 못한 쿠키)은 로그인 실패처럼
+IP마다 센다. 막힌 IP의 로그아웃은 표시 없이 쿠키만 지운다(응답은 그대로 204).
+
+알려진 한계:
+- 정족수가 없는 소수 쪽 노드는 그 노드가 가진 옛 사용자 정보로 로그인을 받는다. 다른 쪽에서 비밀번호를 바꿨거나 사용자를
+  비활성화했어도 그 노드가 따라잡을 때까지는 옛 비밀번호로 로그인된다(그 세션은 그 노드에서만).
+- 로그인 시도 제한([로그인과 세션](#로그인과-세션))은 노드마다 따로 센다. 앞단이 요청을 여러 노드로 나누면 노드 수만큼 더
+  시도할 수 있다.
+
+### 믿는 프록시와 허용 출처
+
+프록시 뒤에서는 연결 주소가 프록시라서 감사 로그와 로그인 시도 제한이 프록시 주소를 본다. 믿는 프록시를 적으면 그
+주소에서 온 요청의 `X-Forwarded-For`(클라이언트 주소, 오른쪽부터 믿지 않는 첫 주소)와 `X-Forwarded-Host`·
+`X-Forwarded-Proto`(같은 출처 검사, OIDC 콜백 주소)를 믿는다. 적지 않으면 아무 헤더도 믿지 않는다.
+
+```toml
+# /etc/opl/opld.toml (API 노드마다)
+[api]
+trusted_proxies = ["10.0.0.0/24", "192.0.2.10"]
+```
+
+웹 포털을 API와 **다른 호스트 이름**에 두면 그 출처를 허용 출처로 적는다(관리자). 그 출처의 쿠키 요청에 CORS로 답하고,
+그 출처에서 로그인하면 세션 쿠키가 `SameSite=None; Secure`다. 비우면 지금처럼 같은 출처만이다. 비우지 않으려면 모든
+노드가 이 판 이상이어야 한다. 허용 출처는 `https://`만 된다(개발용 `http://localhost`·`127.0.0.1`·`[::1]`은 예외).
+허용 출처를 쓰면 쿠키가 다른 사이트의 요청에도 붙을 수 있으므로, 쿠키로 인증한 쓰기 요청(GET·HEAD가 아님)과 WebSocket이
+`Origin` 없이 `Sec-Fetch-Site`로 다른 사이트(`same-origin`·`same-site`·`none`이 아님)라고 알리면 받지 않는다. 그 헤더를
+보내는 브라우저는 쓰기에 `Origin`도 보내므로, 둘 다 없는 브라우저 밖의 클라이언트(`orbivisorctl login`, curl)는 그대로
+된다. 로그아웃도 같은 출처나 허용 출처에서만 받는다.
+
+```bash
+orbivisorctl settings set web_origins=https://portal.example.com
+orbivisorctl settings set web_origins=          # 같은 출처만
+```
+
+다른 호스트의 포털에서 OIDC로 로그인하면 로그인이 끝난 뒤 API 호스트의 `/`로 돌아간다(포털로 돌아가지 않는다). 포털과
+API를 같은 호스트 이름에 두면(아래 쿠버네티스 예) 이 문제가 없다.
+
+### API 이름
+
+앞단·VIP의 이름(DNS 이름·IP)을 API 인증서에 더한다(관리자). 노드마다 클러스터 CA로 API 인증서를 다시 서명해 끊김 없이
+바꿔 끼운다(노드 간 mTLS 인증서는 그대로). API 인증서는 서버 인증만 되고 CN이 `orbivisor-api`라 키가 새어도 노드 간
+mTLS에 쓸 수 없다. **내장 VIP 주소도 여기에 넣어야** 클러스터 CA를 믿는 클라이언트가 VIP로 TLS 확인을 통과한다.
+
+```bash
+orbivisorctl settings set api_names=orbivisor.example.com,192.168.0.200
+orbivisorctl settings set api_names=            # 노드 인증서로 돌아감
+```
+
+`api_names`는 HAProxy·keepalived·내부 클라이언트(`orbivisorctl` 등)가 클러스터 CA를 핀으로 쓸 때를 위한 것이다.
+**클러스터 CA를 브라우저나 OS 신뢰 저장소에 넣지 않는다.** 모든 노드가 그 CA 키를 갖고 있고 이름 제한이 없어, 노드 하나가
+뚫리면 아무 사이트의 인증서나 만들 수 있다. 브라우저용으로는 HAProxy에서 공인 인증서로 TLS를 끝내거나(아래 예), 노드에
+관리자 인증서(공인·사내 CA)를 둔다.
+
+```toml
+# /etc/opl/opld.toml (API 노드마다)
+[api]
+tls_cert = "/etc/opl/api.crt"   # PEM, 중간 인증서를 이어 붙여도 된다
+tls_key = "/etc/opl/api.key"    # 둘 다 있어야 한다
+```
+
+관리자 인증서가 있으면 API 리스너가 그것을 쓰고 `api_names`로 다시 발급하지 않는다(파일을 읽지 못하면 시작하지 못한다).
+파일은 시작할 때만 읽는다. 인증서를 갱신하면(certbot 등) `systemctl restart opld`로 다시 읽게 한다(VM은 그대로 돈다,
+갱신 훅 예: certbot `--deploy-hook "systemctl restart opld"`).
+
+`orbivisorctl`은 처음 로그인할 때 클러스터 CA를 받아 핀으로 둔다. 관리자 인증서를 둔 노드(또는 공인 인증서로 끝내는
+프록시)에는 `--system-ca`로 로그인한다. 그러면 클러스터 CA 대신 OS 신뢰 저장소로 서버를 확인하고, 그 방식을 설정 파일에
+저장해 다음 명령과 같은 서버에 다시 로그인할 때도 쓴다(`--ca-fingerprint`로 로그인하면 클러스터 CA로 돌아간다).
+
+```bash
+orbivisorctl login --server https://orbivisor.example.com --system-ca
+```
+
+### 내장 VIP (Linux)
+
+로드 밸런서 없이 VIP 하나(또는 여럿)를 API 노드 사이로 옮겨 다니게 한다. 같은 L2 서브넷 안에서만 된다.
+
+```toml
+# /etc/opl/opld.toml (VIP를 가질 API 노드마다 같게)
+[vip]
+addresses = ["192.168.0.200/24"]   # 여럿이면 VIP마다 다른 노드가 갖는다(DNS에 모두 적어 짐을 나눈다)
+interface = "vmbr0"                # VIP를 붙일 인터페이스
+```
+
+- 리더가 VIP마다 주인을 정해 클러스터 저장소에 적는다(`?ready`가 200인 `api` 노드 가운데, VIP가 가장 적은 노드).
+  주인은 1초마다 리더에게 VIP 리스(3초)를 갱신하고 `ip addr add`와 gratuitous ARP 세 번(`arping -U -c 3`, 패키지
+  `iputils-arping`, 없으면 경고만 하고 이웃의 ARP 캐시가 늦게 바뀐다)으로 알린다. VIP를 떼면 아직 끝나지 않은 알림도
+  멈춘다.
+- 주인은 5초마다 쥔 VIP를 다시 붙여 본다. `ifreload`·브리지 다시 시작·networkd 다시 읽기 등으로 인터페이스에서 지워졌으면
+  다시 붙이고(경고 로그) 다시 알린다.
+- 주인이 준비되지 않으면(헬스 503) 곧바로 떼고, 리더와 끊기면 리스가 끝나기 0.5초 전에 스스로 뗀다(멈췄다 늦게 깨면
+  갱신하기 전에 먼저 뗀다). 리더는 리스가 끝난 뒤에야(리더 시계) 다른 노드에 주므로 **orbivisord가 도는 동안에는** 두
+  노드가 같은 VIP를 갖지 않는다(겹칠 수 있는 경우는 아래 알려진 한계). 주인이 죽으면 약 3~4초 뒤 옮겨 간다.
+- 주인이 살아 있으면 리더가 바뀌거나 노드가 더해져도 옮기지 않는다. 새 리더는 리더가 된 뒤 3초 동안 옮기지 않는다.
+- 붙인 VIP는 `/var/lib/opl/vips`(`data_dir`)에 적어 둔다. `systemctl stop`은 VIP를 먼저 뗀다. orbivisord가 kill -9·
+  watchdog SIGKILL 등으로 죽으면 VIP가 인터페이스에 남고, systemd의 `ExecStopPost=/usr/bin/orbivisord --config
+  /etc/opl/opld.toml --release-vips`가 기록한 VIP를 뗀다(다시 시작할 때도 리스를 받기 전에 지금 설정과 관계없이 뗀다).
+  `--release-vips`는 데이터 디렉터리 잠금을 쥔 orbivisord가 돌고 있으면 아무것도 떼지 않는다. 인터페이스가 없어져 뗄 수
+  없는 기록은 경고하고 지운다.
+- 모든 노드(위트니스 포함)가 이 판 이상이어야 VIP를 쓴다(옛 노드는 VIP 주인 기록을 읽지 못한다). 업그레이드 중에는
+  경고만 하고 VIP를 붙이지 않는다.
+- IPv4만 된다. macOS·위트니스는 `[vip]`을 쓸 수 없다(시작할 때 설정 오류). VIP 주소를 `api_names`에 넣는다.
+- keepalived를 쓰면 같은 주소를 `[vip]`에 두지 않는다.
+
+알려진 한계(내장 VIP):
+- 두 노드가 같은 VIP를 잠깐 함께 가질 수 있다: orbivisord가 kill -9·SIGKILL로 죽은 뒤 `ExecStopPost`(또는 재시작)가
+  떼기 전까지, 프로세스나 VM(노드가 VM이면)이 멈춘 뒤 watchdog이 SIGKILL하기까지, 호스트가 절전한 동안(리스 마감을 재는
+  단조 시계가 절전 중 멈춘다). `[vip] addresses`에서 뺀 주소는 기록(`vips`)으로 뗀다.
+- 헬스 체크의 `apply_lag`는 어림이라 리더보다 뒤처진 노드를 잡지 못한다. 실행기 확인이 한 번 늦으면 헬스가 10초 동안
+  503이 되어 VIP가 다른 노드로 옮겨 갈 수 있다.
+- VIP 리스 갱신마다 리더가 과반수의 리더인지 확인하므로(`confirm_leader`) 노드 수의 제곱만큼 메시지가 든다(계획 47의 리스
+  확인 묶기에서 함께 줄인다).
+- 설정에서 VIP를 빼도 클러스터 저장소의 그 VIP 주인 기록(`VipHolder`)은 남는다(해롭지 않다).
+
+### 내장 웹 UI 끄기
+
+웹 UI를 따로 둔 포털(nginx)이 주면 노드는 API만 연다.
+
+```toml
+[web]
+enabled = false     # 기본 true. 끄면 /api/ 밖의 경로는 404
+```
+
+웹 정적 파일 묶음과 포털 컨테이너 예는 `packaging/portal/`에 있다.
+
+```bash
+V=0.1.0   # 노드 패키지와 같은 버전
+pnpm -C web build
+packaging/portal/build-web.sh "$V" packaging/portal        # packaging/portal/orbivisor-web-$V.tar.gz
+docker build --build-arg VERSION="$V" -t "orbivisor-portal:$V" packaging/portal   # nginx(비root), 8080
+```
+
+### 예: HAProxy
+
+TLS를 HAProxy에서 끝내고 노드로 다시 암호화해 보낸다. 노드에는 `[api] trusted_proxies`에 HAProxy 주소를 적고, 앞단의
+이름은 `api_names`에 넣는다(HAProxy가 노드 인증서의 이름을 확인하지 않으면 없어도 된다).
+
+```haproxy
+# /etc/haproxy/haproxy.cfg
+defaults
+    mode http
+    timeout connect 5s
+    timeout client  60s
+    timeout server  60s
+    timeout tunnel  1h          # 콘솔(WebSocket)·watch 스트림
+frontend orbivisor
+    bind :443 ssl crt /etc/haproxy/orbivisor.example.com.pem
+    option forwardfor
+    http-request set-header X-Forwarded-Proto https
+    http-request set-header X-Forwarded-Host %[req.hdr(host)]
+    default_backend orbivisor_api
+backend orbivisor_api
+    balance leastconn
+    option httpchk GET /api/v1/health
+    http-check expect status 200
+    default-server inter 2s fall 2 rise 2
+    # orbivisorctl cluster api-endpoints -o haproxy
+    server node1 10.0.0.11:8006 check ssl verify required ca-file /etc/haproxy/orbivisor-ca.pem
+    server node2 10.0.0.12:8006 check ssl verify required ca-file /etc/haproxy/orbivisor-ca.pem
+    server node3 10.0.0.13:8006 check ssl verify required ca-file /etc/haproxy/orbivisor-ca.pem
+```
+
+### 예: keepalived
+
+내장 VIP 대신 keepalived로 VIP를 둘 때. 헬스 체크가 실패한 노드는 우선순위를 잃어 VIP를 넘긴다.
+
+```conf
+# /etc/keepalived/keepalived.conf (API 노드마다, priority만 다르게)
+vrrp_script orbivisor_ready {
+    # 노드 인증서에는 127.0.0.1도 들어 있다. listen을 바꿨으면 그 주소로 부른다.
+    script "/usr/bin/curl -sf --max-time 2 --cacert /var/lib/opl/pki/ca.crt https://127.0.0.1:8006/api/v1/health"
+    interval 2
+    fall 2
+    rise 2
+    weight -50
+}
+vrrp_instance orbivisor {
+    interface vmbr0
+    virtual_router_id 46
+    priority 100
+    advert_int 1
+    virtual_ipaddress {
+        192.168.0.200/24
+    }
+    track_script {
+        orbivisor_ready
+    }
+}
+```
+
+### 예: 쿠버네티스(포털 nginx + HAProxy)
+
+포털(nginx) pod가 웹 UI를 주고, 같은 호스트 이름의 `/`는 포털, `/api/`는 노드로 보낸다(같은 출처라 `web_origins`가
+필요 없다). 노드에는 `[web] enabled = false`와 HAProxy pod 주소 범위의 `trusted_proxies`를 둔다.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: orbivisor-portal}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: orbivisor-portal}}
+  template:
+    metadata: {labels: {app: orbivisor-portal}}
+    spec:
+      containers:
+        - name: nginx
+          image: registry.example.com/orbivisor-portal:0.1.0   # packaging/portal/Dockerfile
+          ports: [{containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: orbivisor-portal}
+spec:
+  selector: {app: orbivisor-portal}
+  ports: [{port: 8080, targetPort: 8080}]
+```
+
+```haproxy
+# HAProxy(쿠버네티스 안의 Deployment, ConfigMap) — 위 HAProxy 예의 frontend에 경로 나눔만 더한다
+frontend orbivisor
+    bind :443 ssl crt /etc/haproxy/tls/orbivisor.example.com.pem
+    option forwardfor
+    http-request set-header X-Forwarded-Proto https
+    use_backend orbivisor_api if { path_beg /api/ }
+    default_backend orbivisor_portal
+backend orbivisor_portal
+    server portal orbivisor-portal.default.svc.cluster.local:8080 check
+# backend orbivisor_api는 위 HAProxy 예와 같다(노드 주소는 클러스터 밖의 노드 IP)
+```
+
 ## 노드 유지보수와 비우기
 
 커널·펌웨어를 올리거나 하드웨어를 손보기 전에 노드를 **유지보수 모드**로 두고 실행 중인 VM을 다른 노드로 옮긴다
@@ -1918,8 +2207,10 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
   계정으로 로그인해 IP의 실패 수를 지울 수 없다). 맞는 로그인이 IP를 새로 잠그지는 않는다. 마지막 실패 뒤 15분이 넘게 지나면 기록이 지워진다. IPv6 주소는
   /64 단위로 센다. 자기 비밀번호를 바꿀 때의 현재
   비밀번호 확인도 같은 기록으로 센다. 노드마다 따로 세고, orbivisord를 다시 시작하면 기록이 사라진다.
-- **프록시 뒤.** IP는 TLS 연결의 주소다(`X-Forwarded-For`는 보지 않는다). 리버스 프록시 뒤에 두면 모든 요청이
-  프록시 IP로 보이므로, 한 사람이 20번 틀리면 프록시를 거치는 모든 사용자가 함께 막힌다.
+- **프록시 뒤.** IP는 연결의 주소다. 리버스 프록시 뒤에 두면 모든 요청이 프록시 IP로 보이므로, 한 사람이 20번 틀리면
+  프록시를 거치는 모든 사용자가 함께 막힌다. `[api] trusted_proxies`에 프록시 주소를 적으면 그 프록시가 보낸
+  `X-Forwarded-For`의 클라이언트 주소로 센다([믿는 프록시와 허용 출처](#믿는-프록시와-허용-출처)). 믿지 않는 주소에서 온
+  `X-Forwarded-For`는 보지 않는다.
 - **비밀번호 변경.** 비밀번호를 바꾸면(본인이든 admin이든) 모든 노드에서 그 사용자의 로그인 세션이 끝나 다시
   로그인해야 한다. 역할만 바꾸면 세션은 그대로다. **API 토큰은 끊기지 않는다.** 토큰이 새었을 수 있으면
   `orbivisorctl token list`·`orbivisorctl token delete`(웹: API 토큰 화면)로 따로 지운다. 열려 있는 콘솔(WebSocket)은 연결할

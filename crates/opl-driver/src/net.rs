@@ -263,7 +263,7 @@ impl HostNet for IpRoute {
 type Command = (&'static str, Vec<String>);
 
 /// 이름공간이 있으면 인자 앞에 `-n NAME`을 붙인다(`ip`와 `bridge` 모두 받는다).
-fn netns_args(netns: Option<&str>, a: &[impl AsRef<str>]) -> Vec<String> {
+pub(crate) fn netns_args(netns: Option<&str>, a: &[impl AsRef<str>]) -> Vec<String> {
     let mut out = Vec::with_capacity(a.len() + 2);
     if let Some(ns) = netns {
         out.extend(["-n".to_string(), ns.to_string()]);
@@ -664,7 +664,10 @@ fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
 
-async fn run(program: &'static str, args: &[impl AsRef<str>]) -> Result<String, DriverError> {
+pub(crate) async fn run(
+    program: &'static str,
+    args: &[impl AsRef<str>],
+) -> Result<String, DriverError> {
     let output = tokio::process::Command::new(program)
         .args(args.iter().map(AsRef::as_ref))
         .output()
