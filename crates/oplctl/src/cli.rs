@@ -188,6 +188,8 @@ enum ClusterCmd {
     },
     /// 클러스터 이름, CA 지문, 멤버
     Status,
+    /// 클러스터 CA 인증서(PEM). 앞단 프록시가 노드 인증서를 확인할 때 쓴다.
+    Ca,
     /// 앞단(로드 밸런서)이 부를 API 노드(`api` 역할)의 이름·주소·zone. `-o haproxy`면 HAProxy `server` 줄
     ApiEndpoints,
     /// 새 노드를 더할 조인 URL을 만든다. 한 번만 쓸 수 있다.
@@ -1717,16 +1719,17 @@ enum TaskCmd {
 enum SettingsCmd {
     /// 설정을 `키: 값` 줄로 보인다.
     Get,
-    /// 설정을 바꾼다. 키: `updates.channel`(stable|testing|enterprise)
+    /// 설정을 바꾼다. 키: `updates.channel`(stable|testing|enterprise), `web_origins`(쿠키 요청을 받는 다른
+    /// 출처, 쉼표로 여럿, 비우면 같은 출처만)
     Set {
-        /// 예: `updates.channel=testing`
+        /// 예: `updates.channel=testing`, `web_origins=https://portal.example.com`
         #[arg(required = true, value_name = "KEY=VALUE")]
         values: Vec<String>,
     },
 }
 
 /// `settings set`이 아는 키
-const SETTING_KEYS: &[&str] = &["updates.channel"];
+const SETTING_KEYS: &[&str] = &["updates.channel", "web_origins"];
 
 /// `settings set`의 요청 본문(`PATCH /settings`). 준 키만 보낸다.
 fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
@@ -1737,6 +1740,14 @@ fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
         };
         match key {
             "updates.channel" => body["updates"]["channel"] = json!(v),
+            "web_origins" => {
+                let origins: Vec<&str> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|o| !o.is_empty())
+                    .collect();
+                body["web_origins"] = json!(origins);
+            }
             _ => bail!("unknown setting {key}; known: {}", SETTING_KEYS.join(", ")),
         }
     }
@@ -4815,6 +4826,16 @@ async fn cluster(
                 return Ok(());
             }
             print_cluster_status(out, &view)?;
+        }
+        ClusterCmd::Ca => {
+            let pem = client.get("/cluster/ca").await?;
+            let pem = pem
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("the server did not send a PEM certificate"))?;
+            write!(out, "{pem}")?;
+            if !pem.ends_with('\n') {
+                writeln!(out)?;
+            }
         }
         ClusterCmd::ApiEndpoints => {
             let list = client.get("/cluster/api-endpoints").await?;
@@ -9494,6 +9515,34 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         );
     }
 
+    /// `cluster ca`는 `GET /cluster/ca`의 PEM을 그대로 찍는다(끝 줄바꿈 하나).
+    #[tokio::test]
+    async fn cluster_ca_prints_the_pem() {
+        let (client, seen) =
+            fake_api(|_| json!("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n"))
+                .await;
+        let mut out = Vec::new();
+        cluster(&client, ClusterCmd::Ca, Output::Table, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["GET /api/v1/cluster/ca HTTP/1.1"]
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["oplctl", "cluster", "ca"])
+                .unwrap()
+                .cmd,
+            Cmd::Cluster {
+                cmd: ClusterCmd::Ca
+            }
+        ));
+    }
+
     /// `cluster api-endpoints`는 표, JSON, HAProxy `server` 줄로 찍는다. `-o haproxy`는 이 명령에만 쓴다.
     #[tokio::test]
     async fn api_endpoints_print_a_table_json_or_haproxy_servers() {
@@ -9731,10 +9780,20 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             settings_set_body(&["updates.channel=testing".into()]).unwrap(),
             json!({ "updates": { "channel": "testing" } })
         );
+        assert_eq!(
+            settings_set_body(&["web_origins=https://a.example, https://b.example".into()])
+                .unwrap(),
+            json!({ "web_origins": ["https://a.example", "https://b.example"] })
+        );
+        // 비우면 같은 출처만
+        assert_eq!(
+            settings_set_body(&["web_origins=".into()]).unwrap(),
+            json!({ "web_origins": [] })
+        );
         let err = settings_set_body(&["updates.mirror=x".into()]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting updates.mirror; known: updates.channel"
+            "unknown setting updates.mirror; known: updates.channel, web_origins"
         );
         let err = settings_set_body(&["updates.channel".into()]).unwrap_err();
         assert_eq!(

@@ -177,13 +177,19 @@ fn too_many_attempts(wait: Duration) -> ApiError {
     e
 }
 
-/// 요청한 클라이언트의 IP(연결 주소). 연결 주소가 없으면(라우터를 바로 부를 때) `0.0.0.0` 하나로 센다.
+/// 요청한 클라이언트의 IP(연결 주소, 믿는 프록시를 거쳤으면 `X-Forwarded-For`의 주소). 연결 주소가
+/// 없으면(라우터를 바로 부를 때) `0.0.0.0` 하나로 센다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIp(pub IpAddr);
 
 impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
     type Rejection = Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        // 믿는 프록시를 거친 요청이면 프록시 층이 정해 두었다.
+        if let Some(client) = parts.extensions.get::<ClientIp>() {
+            return Ok(*client);
+        }
         Ok(ClientIp(
             parts
                 .extensions

@@ -6,6 +6,7 @@ use opl_cluster::Cluster;
 use opl_driver::Hypervisor;
 use opl_peer::{MetricsSource, Peers};
 use opl_reconciler::HaGuard;
+use opl_types::security_group::Cidr;
 use uuid::Uuid;
 
 use crate::audit::AuditLog;
@@ -31,6 +32,9 @@ pub struct AppState {
     pub peers: Option<Arc<Peers>>,
     /// 세션 쿠키에 `Secure`를 붙인다(HTTPS로 서비스할 때).
     pub secure_cookies: bool,
+    /// 믿는 프록시(opld `[api] trusted_proxies`). 이 주소에서 온 요청만 `X-Forwarded-For`·`-Host`·
+    /// `-Proto`를 믿는다.
+    pub trusted_proxies: Vec<Cidr>,
     pub(crate) sessions: Sessions,
     /// 로그인과 현재 비밀번호 확인의 실패 기록(노드마다 따로)
     pub(crate) attempts: AttemptLimiter,
@@ -71,6 +75,7 @@ impl AppState {
             mount_root: PathBuf::new(),
             peers: None,
             secure_cookies: false,
+            trusted_proxies: Vec::new(),
             sessions: Sessions::default(),
             attempts: AttemptLimiter::default(),
             vm_lock: tokio::sync::Mutex::new(()),

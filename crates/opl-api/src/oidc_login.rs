@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{COOKIE, HOST, LOCATION, SET_COOKIE};
@@ -22,6 +23,7 @@ use crate::audit::AuditNote;
 use crate::auth::Principal;
 use crate::error::ApiError;
 use crate::oidc::{self, LoginState, OidcError, RealmKey, STATE_COOKIE, STATE_TTL_SECS};
+use crate::proxy::ForwardedProto;
 use crate::state::AppState;
 
 /// 콜백 경로. 노드 주소 앞에 붙여 IdP에 리디렉트 URI로 등록한다.
@@ -106,22 +108,19 @@ fn state_cookie(state: &AppState, value: &str, max_age: u64) -> HeaderValue {
     HeaderValue::from_str(&cookie).expect("ASCII cookie")
 }
 
-/// 이 요청이 온 주소의 콜백 URI. scheme은 `secure_cookies`면 https, 아니면 http(시험)다.
+/// 이 요청이 온 주소의 콜백 URI. Host는 믿는 프록시가 알린 `X-Forwarded-Host`일 수 있다. scheme은 믿는
+/// 프록시가 알린 것(`proto`), 없으면 `secure_cookies`면 https, 아니면 http(시험)다.
 /// Host 헤더가 없거나 호스트·포트 글자가 아닌 것이 있으면 None.
-fn redirect_uri(state: &AppState, headers: &HeaderMap) -> Option<String> {
+fn redirect_uri(state: &AppState, headers: &HeaderMap, proto: Option<&str>) -> Option<String> {
     let host = headers.get(HOST)?.to_str().ok()?;
-    let valid = !host.is_empty()
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'));
-    if !valid {
+    if !crate::proxy::valid_host(host) {
         return None;
     }
-    let scheme = if state.secure_cookies {
+    let scheme = proto.unwrap_or(if state.secure_cookies {
         "https"
     } else {
         "http"
-    };
+    });
     Some(format!("{scheme}://{host}{CALLBACK_PATH}"))
 }
 
@@ -163,9 +162,11 @@ fn state_key(state: &AppState) -> Result<ring::hmac::Key, Failed> {
 pub async fn oidc_start(
     State(state): State<Arc<AppState>>,
     Path(realm): Path<String>,
+    proto: Option<Extension<ForwardedProto>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let redirect_uri = redirect_uri(&state, &headers).ok_or_else(no_host)?;
+    let proto = proto.map(|Extension(p)| p.0);
+    let redirect_uri = redirect_uri(&state, &headers, proto).ok_or_else(no_host)?;
     match begin(&state, &realm, &redirect_uri).await {
         Ok((location, cookie)) => Ok(redirect(
             &location,
@@ -256,7 +257,8 @@ pub async fn oidc_callback(
                 AuditAuth::Session,
             );
             audit.detail(format!("realm={} username={username}", login.realm));
-            let session = crate::users::new_session(&state, &user).await?;
+            // IdP에서 돌아온 탐색이라 출처가 없다.
+            let session = crate::users::new_session(&state, &user, false).await?;
             Ok(redirect("/", [session, state_cookie(&state, "", 0)]))
         }
         Err(f) => Ok(failure(&state, &audit, Some(&login.realm), f)),

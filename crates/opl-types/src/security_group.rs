@@ -204,23 +204,36 @@ impl Cidr {
         }
     }
 
-    fn check(self) -> Result<(), RuleError> {
+    /// 접두사 밖(호스트) 비트의 마스크. 128비트를 모두 밀면 넘치므로 그때는 전부.
+    fn host_mask(self) -> u128 {
         let max = Self::max_prefix(self.addr);
-        if self.prefix > max {
-            return Err(RuleError::BadCidr(self.to_string()));
-        }
-        // 접두사 밖(호스트) 비트의 마스크. 128비트를 모두 밀면 넘치므로 그때는 전부.
-        let host_mask = 1u128
+        1u128
             .checked_shl(u32::from(max - self.prefix))
-            .map_or(u128::MAX, |b| b - 1);
-        let bits = match self.addr {
+            .map_or(u128::MAX, |b| b - 1)
+    }
+
+    fn bits(addr: IpAddr) -> u128 {
+        match addr {
             IpAddr::V4(a) => u128::from(u32::from(a)),
             IpAddr::V6(a) => u128::from(a),
-        };
-        if bits & host_mask != 0 {
+        }
+    }
+
+    fn check(self) -> Result<(), RuleError> {
+        if self.prefix > Self::max_prefix(self.addr) {
+            return Err(RuleError::BadCidr(self.to_string()));
+        }
+        if Self::bits(self.addr) & self.host_mask() != 0 {
             return Err(RuleError::HostBits(self.to_string()));
         }
         Ok(())
+    }
+
+    /// `ip`가 이 범위 안에 있다. IPv4에 대응한 IPv6 주소(`::ffff:a.b.c.d`)는 IPv4로 본다.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        ip.is_ipv4() == self.addr.is_ipv4()
+            && Self::bits(ip) & !self.host_mask() == Self::bits(self.addr)
     }
 }
 
@@ -430,6 +443,28 @@ mod tests {
         }
         assert!(serde_json::from_value::<PortRange>(json!(22)).is_err());
         assert!(serde_json::from_value::<PortRange>(json!("0")).is_err());
+    }
+
+    #[test]
+    fn cidrs_contain_addresses_in_their_prefix() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let c: Cidr = "10.0.0.0/8".parse().unwrap();
+        assert!(c.contains(ip("10.0.0.0")));
+        assert!(c.contains(ip("10.255.255.255")));
+        assert!(!c.contains(ip("11.0.0.0")));
+        assert!(!c.contains(ip("::a00:1")));
+        // IPv6 소켓으로 받은 IPv4 연결
+        assert!(c.contains(ip("::ffff:10.1.2.3")));
+        let one: Cidr = "192.168.1.5".parse().unwrap();
+        assert!(one.contains(ip("192.168.1.5")));
+        assert!(!one.contains(ip("192.168.1.4")));
+        let all: Cidr = "0.0.0.0/0".parse().unwrap();
+        assert!(all.contains(ip("1.2.3.4")));
+        assert!(!all.contains(ip("2001:db8::1")));
+        let v6: Cidr = "2001:db8::/32".parse().unwrap();
+        assert!(v6.contains(ip("2001:db8:ffff::1")));
+        assert!(!v6.contains(ip("2001:db9::1")));
+        assert!("::/0".parse::<Cidr>().unwrap().contains(ip("fe80::1")));
     }
 
     #[test]

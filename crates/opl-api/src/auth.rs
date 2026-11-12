@@ -237,17 +237,23 @@ pub(crate) fn session_cookie(headers: &HeaderMap) -> Option<&str> {
         .find_map(|c| c.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='))
 }
 
-/// `Origin`이 없거나(브라우저 밖의 클라이언트) `Host`와 같다.
-fn same_origin(headers: &HeaderMap) -> bool {
+/// `Origin`이 없거나(브라우저 밖의 클라이언트) `Host`와 같다. 믿는 프록시가 scheme(`proto`)을 알렸으면
+/// scheme도 같아야 한다.
+pub(crate) fn same_origin(headers: &HeaderMap, proto: Option<&str>) -> bool {
     let Some(origin) = headers.get(ORIGIN) else {
         return true;
     };
     let origin = origin.to_str().unwrap_or_default();
-    let origin_host = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"));
-    let host = headers.get(HOST).and_then(|h| h.to_str().ok());
-    origin_host.is_some() && origin_host == host
+    let Some((scheme, origin_host)) = origin
+        .split_once("://")
+        .filter(|(scheme, _)| matches!(*scheme, "http" | "https"))
+    else {
+        return false;
+    };
+    if proto.is_some_and(|p| p != scheme) {
+        return false;
+    }
+    headers.get(HOST).and_then(|h| h.to_str().ok()) == Some(origin_host)
 }
 
 fn principal_of(u: User) -> Principal {
@@ -261,8 +267,13 @@ fn principal_of(u: User) -> Principal {
 impl AppState {
     /// 사용자의 세션을 만들고 쿠키 값을 돌려준다. 모든 노드가 [`SHARED_SESSIONS`]를 알면 Raft에 두고
     /// (쿠키 값은 해시만), 아니면 이 노드 메모리에 둔다.
+    /// 정족수가 없거나 쓰기가 리더에 닿지 못하면 이 노드 메모리에 둔다(장애 때도 관리자가 들어와 상태를 본다).
     pub(crate) async fn create_session(&self, user: &User) -> Result<String, ApiError> {
         if !crate::cluster::missing_feature(&self.cluster, SHARED_SESSIONS)?.is_empty() {
+            return Ok(self.sessions.create(user.id, user.spec.session_epoch));
+        }
+        if !self.cluster.health().quorum {
+            tracing::warn!(user = %user.name, "the cluster has no quorum; the session works only on this node");
             return Ok(self.sessions.create(user.id, user.spec.session_epoch));
         }
         let cookie = random_hex(32);
@@ -278,8 +289,19 @@ impl AppState {
         );
         session.status.last_used = now;
         // 이 노드에 적용될 때까지 기다리므로 곧바로 쓸 수 있다.
-        self.cluster.create(&session).await?;
-        Ok(cookie)
+        match self.cluster.create(&session).await {
+            Ok(_) => Ok(cookie),
+            Err(
+                e @ (ClusterError::Timeout
+                | ClusterError::Unreachable(_)
+                | ClusterError::NotLeader { .. }),
+            ) => {
+                // 쓰기가 나중에 커밋돼도 그 세션의 쿠키는 아무도 모르고, 정리 작업이 만료 뒤 지운다.
+                tracing::warn!(user = %user.name, error = %e, "cannot write the session to the cluster; it works only on this node");
+                Ok(self.sessions.create(user.id, user.spec.session_epoch))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// 쿠키의 세션. 메모리에 없으면 Raft에서 찾는다. 끝난 세션은 없는 것과 같다. 메모리 세션도 같은
@@ -473,14 +495,7 @@ impl AppState {
         let found = self
             .find_session(session)?
             .ok_or_else(ApiError::unauthorized)?;
-        // 쿠키는 브라우저가 알아서 붙이므로, 다른 출처의 페이지가 보낸 요청(WebSocket 포함)은 받지 않는다.
-        if !same_origin(&parts.headers) {
-            return Err(ApiError::new(
-                axum::http::StatusCode::FORBIDDEN,
-                "cross_origin",
-                "cookie-authenticated requests must come from the same origin",
-            ));
-        }
+        self.check_cookie_origin(parts)?;
         let user = self
             .cluster
             .get::<UserSpec>(found.user)?
@@ -498,6 +513,34 @@ impl AppState {
             self.touch_session(shared);
         }
         Ok(principal_of(user))
+    }
+
+    /// 쿠키는 브라우저가 알아서 붙이므로, 다른 출처의 페이지가 보낸 쿠키 요청(WebSocket 포함)은 받지 않는다
+    /// (403). 허용 출처(클러스터 설정 `web_origins`)는 받는다. 허용 출처를 쓰면 쿠키가 `SameSite=None`일 수
+    /// 있으므로, `Origin`이 없는 쓰기 요청·WebSocket 업그레이드는 `Sec-Fetch-Site`가 다른 사이트라고 알리면
+    /// 받지 않는다(둘 다 없는 브라우저 밖의 클라이언트는 받는다).
+    pub(crate) fn check_cookie_origin(&self, parts: &Parts) -> Result<(), ApiError> {
+        let cross = || {
+            ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "cross_origin",
+                "cookie-authenticated requests must come from the same origin",
+            )
+        };
+        if !same_origin(&parts.headers, crate::proxy::forwarded_proto(parts))
+            && !crate::proxy::from_web_origin(parts)
+        {
+            return Err(cross());
+        }
+        if crate::proxy::unsafe_without_origin(parts)
+            && !crate::settings::current(&self.cluster)?
+                .spec
+                .web_origins
+                .is_empty()
+        {
+            return Err(cross());
+        }
+        Ok(())
     }
 
     /// 권한이 없으면 403
@@ -632,15 +675,26 @@ mod tests {
             }
             h
         }
-        assert!(same_origin(&headers(&[("host", "127.0.0.1:8006")])));
-        assert!(same_origin(&headers(&[
+        assert!(same_origin(&headers(&[("host", "127.0.0.1:8006")]), None));
+        let same = headers(&[
             ("host", "127.0.0.1:8006"),
-            ("origin", "http://127.0.0.1:8006")
-        ])));
-        assert!(!same_origin(&headers(&[
-            ("host", "127.0.0.1:8006"),
-            ("origin", "http://127.0.0.1:9000")
-        ])));
-        assert!(!same_origin(&headers(&[("origin", "null")])));
+            ("origin", "http://127.0.0.1:8006"),
+        ]);
+        assert!(same_origin(&same, None));
+        // 믿는 프록시가 알린 scheme과도 맞아야 한다.
+        assert!(same_origin(&same, Some("http")));
+        assert!(!same_origin(&same, Some("https")));
+        assert!(!same_origin(
+            &headers(&[
+                ("host", "127.0.0.1:8006"),
+                ("origin", "http://127.0.0.1:9000")
+            ]),
+            None
+        ));
+        assert!(!same_origin(&headers(&[("origin", "null")]), None));
+        assert!(!same_origin(
+            &headers(&[("host", "a"), ("origin", "ftp://a")]),
+            None
+        ));
     }
 }

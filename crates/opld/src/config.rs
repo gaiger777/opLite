@@ -12,6 +12,7 @@ use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
 use opl_reconciler::ha::{DeviceWatchdog, WatchdogOpener};
 use opl_types::node::{Fencing, NodeHa};
+use opl_types::security_group::Cidr;
 use serde::Deserialize;
 
 /// `opld --config <path>`로 읽는 TOML 설정.
@@ -75,6 +76,8 @@ pub struct Config {
     pub remotes: RemotesSection,
     #[serde(default)]
     pub runtime: RuntimeSection,
+    #[serde(default)]
+    pub api: ApiSection,
     /// 시험 빌드(`starve-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
     #[cfg(feature = "starve-it")]
     #[serde(default)]
@@ -613,6 +616,17 @@ fn default_remotes_interval() -> Duration {
 }
 fn default_remotes_tick() -> Duration {
     Duration::from_secs(5)
+}
+
+/// API(HTTPS)를 앞단 프록시 뒤에 둘 때. 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSection {
+    /// 믿는 프록시의 주소 범위(`"10.0.0.0/8"`, `"fd00::/8"`, `"192.0.2.10"`). 이 주소에서 온 요청만
+    /// `X-Forwarded-For`(감사 로그·로그인 제한의 요청 주소)와 `X-Forwarded-Host`·`X-Forwarded-Proto`(같은
+    /// 출처 검사, OIDC 콜백 주소)를 믿는다. 비어 있으면 아무 헤더도 믿지 않는다.
+    #[serde(default)]
+    pub trusted_proxies: Vec<Cidr>,
 }
 
 /// 실행기 크기(설계 §3.1). `core` 실행기는 2로 고정이다.
@@ -1453,6 +1467,26 @@ mod tests {
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[runtime]\ncore_threads = 4")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn api_section_lists_trusted_proxies() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert!(c.api.trusted_proxies.is_empty());
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[api]\ntrusted_proxies = [\"10.0.0.0/8\", \"fd00::/8\", \"192.0.2.10\"]",
+        );
+        let shown: Vec<String> = c
+            .api
+            .trusted_proxies
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(shown, ["10.0.0.0/8", "fd00::/8", "192.0.2.10/32"]);
+        for bad in ["\"10.0.0.1/8\"", "\"proxy.lan\"", "\"10.0.0.0/33\""] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[api]\ntrusted_proxies = [{bad}]");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
     }
 
     /// `[test]`는 시험 빌드에만 있다.

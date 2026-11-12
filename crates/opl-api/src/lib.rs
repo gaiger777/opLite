@@ -23,6 +23,7 @@ mod metrics;
 mod migration_disks;
 pub mod oidc;
 mod oidc_login;
+pub mod proxy;
 pub mod realms;
 pub mod remote_client;
 mod remote_proxy;
@@ -232,5 +233,12 @@ pub fn router(state: Arc<AppState>) -> Router {
                 async move { axum::Json(doc.as_ref().clone()) }
             }),
         );
-    Router::new().nest("/api/v1", api).with_state(state)
+    // 믿는 프록시의 헤더와 허용 출처(CORS)는 라우트를 찾기 전에 본다(preflight는 라우트가 없다).
+    Router::new()
+        .nest("/api/v1", api)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            proxy::layer,
+        ))
+        .with_state(state)
 }

@@ -4002,6 +4002,11 @@ export interface components {
                 /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
                 telemetry?: components["schemas"]["TelemetrySettings"];
                 updates?: components["schemas"]["UpdateSettings"];
+                /**
+                 * @description 쿠키 요청을 받는 다른 출처(`https://portal.example.com`). 따로 띄운 웹 포털이 API를 부를 때 쓴다.
+                 *     비어 있으면 같은 출처만 받고, 쓰지 않아 옛 노드도 설정을 계속 푼다.
+                 */
+                web_origins?: string[];
             };
             status: {
                 /** @description 텔레메트리 상태. 처음 켤 때 생기고, 없으면 쓰지 않는다. */
@@ -4348,11 +4353,21 @@ export interface components {
         SettingsPatch: {
             telemetry?: components["schemas"]["TelemetryPatch"];
             updates?: components["schemas"]["UpdateSettingsPatch"];
+            /**
+             * @description 쿠키 요청을 받는 다른 출처(`https://portal.example.com`) 전체. `[]`는 지워 같은 출처만 받는다.
+             *     `https://`만 받는다(개발용 `http://localhost`·`127.0.0.1`·`[::1]`은 예외).
+             */
+            web_origins?: string[];
         };
         SettingsSpec: {
             /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
             telemetry?: components["schemas"]["TelemetrySettings"];
             updates?: components["schemas"]["UpdateSettings"];
+            /**
+             * @description 쿠키 요청을 받는 다른 출처(`https://portal.example.com`). 따로 띄운 웹 포털이 API를 부를 때 쓴다.
+             *     비어 있으면 같은 출처만 받고, 쓰지 않아 옛 노드도 설정을 계속 푼다.
+             */
+            web_origins?: string[];
         };
         SettingsStatus: {
             /** @description 텔레메트리 상태. 처음 켤 때 생기고, 없으면 쓰지 않는다. */

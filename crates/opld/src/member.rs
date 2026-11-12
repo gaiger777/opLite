@@ -392,6 +392,7 @@ impl Member {
             state.mount_root = mount_root.clone();
             state.peers = Some(peers.clone());
             state.secure_cookies = true;
+            state.trusted_proxies = config.api.trusted_proxies.clone();
             state.audit = audit;
             state.metrics = Some(metrics_source);
             // 헬스 체크가 실행기 확인과 HA 리스(아래에서 띄운 뒤)를 본다.

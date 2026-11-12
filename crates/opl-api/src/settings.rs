@@ -48,6 +48,74 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub telemetry: Option<TelemetryPatch>,
+    /// 쿠키 요청을 받는 다른 출처(`https://portal.example.com`) 전체. `[]`는 지워 같은 출처만 받는다.
+    /// `https://`만 받는다(개발용 `http://localhost`·`127.0.0.1`·`[::1]`은 예외).
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub web_origins: Option<Vec<String>>,
+}
+
+/// 허용 출처는 이만큼까지 둔다.
+const MAX_WEB_ORIGINS: usize = 32;
+
+/// 출처(`scheme://host[:port]`)를 비교할 모양으로 바꾼다: 소문자로, 기본 포트(443·80)는 뺀다(브라우저의
+/// `Origin`처럼). http(s)가 아니거나 경로·사용자 정보가 있으면 None.
+pub(crate) fn normalize_origin(origin: &str) -> Option<String> {
+    let lower = origin.to_ascii_lowercase();
+    let (scheme, authority) = lower.split_once("://")?;
+    let default_port = match scheme {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return None,
+    };
+    if authority.contains(['/', '?', '#', '@']) {
+        return None;
+    }
+    let parsed: axum::http::uri::Authority = authority.parse().ok()?;
+    if parsed.host().is_empty() {
+        return None;
+    }
+    let authority = authority.strip_suffix(default_port).unwrap_or(authority);
+    Some(format!("{scheme}://{authority}"))
+}
+
+/// 허용 출처로 둘 수 있다: `https://`, 또는 개발용 `http://localhost`·`127.0.0.1`·`[::1]`(포트는 아무것).
+/// `normalized`는 [`normalize_origin`]의 결과다.
+fn secure_origin(normalized: &str) -> bool {
+    if normalized.starts_with("https://") {
+        return true;
+    }
+    normalized
+        .strip_prefix("http://")
+        .and_then(|a| a.parse::<axum::http::uri::Authority>().ok())
+        .is_some_and(|a| matches!(a.host(), "localhost" | "127.0.0.1" | "[::1]"))
+}
+
+/// 허용 출처 목록을 검사하고 비교할 모양으로 바꾼다(겹친 것은 하나로). 쿠키를 `SameSite=None; Secure`로
+/// 주므로 `https://`만 받는다(개발용 루프백 `http://`는 예외).
+fn web_origins(origins: &[String]) -> Result<Vec<String>, ApiError> {
+    if origins.len() > MAX_WEB_ORIGINS {
+        return Err(ApiError::bad_request(format!(
+            "web_origins can have at most {MAX_WEB_ORIGINS} origins"
+        )));
+    }
+    let mut out = Vec::new();
+    for origin in origins {
+        let normalized = normalize_origin(origin).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "web_origins: {origin:?} is not an origin like https://portal.example.com"
+            ))
+        })?;
+        if !secure_origin(&normalized) {
+            return Err(ApiError::bad_request(format!(
+                "web_origins: {origin:?} must use https:// (http:// only for localhost)"
+            )));
+        }
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -145,9 +213,12 @@ pub async fn patch_settings(
     Json(req): Json<SettingsPatch>,
 ) -> Result<Json<Settings>, ApiError> {
     state.authorize(&principal, Action::Write, SettingsSpec::KIND)?;
-    if req.updates.is_none() && req.telemetry.is_none() {
-        return Err(ApiError::bad_request("give updates or telemetry"));
+    if req.updates.is_none() && req.telemetry.is_none() && req.web_origins.is_none() {
+        return Err(ApiError::bad_request(
+            "give updates, telemetry or web_origins",
+        ));
     }
+    let origins = req.web_origins.as_deref().map(web_origins).transpose()?;
     if let Some(endpoint) = req.telemetry.as_ref().and_then(|t| t.endpoint.as_deref())
         && !endpoint.is_empty()
     {
@@ -156,8 +227,8 @@ pub async fn patch_settings(
     crate::cluster::require_upgraded(&state.cluster)?;
     let channel = req.updates.and_then(|u| u.channel);
     let enterprise = channel == Some(Channel::Enterprise);
-    // 옛 노드는 enterprise 채널과 텔레메트리 필드를 풀지 못한다.
-    if enterprise || req.telemetry.is_some() {
+    // 옛 노드는 enterprise 채널과 텔레메트리·허용 출처 필드를 풀지 못한다.
+    if enterprise || req.telemetry.is_some() || origins.as_ref().is_some_and(|o| !o.is_empty()) {
         crate::cluster::require_current(&state.cluster)?;
     }
     let used = if enterprise {
@@ -181,6 +252,9 @@ pub async fn patch_settings(
         }
         if let Some(telemetry) = &req.telemetry {
             apply_telemetry(&mut spec.telemetry, telemetry)?;
+        }
+        if let Some(origins) = &origins {
+            spec.web_origins = origins.clone();
         }
         Ok(())
     })
@@ -337,4 +411,83 @@ pub(crate) async fn write(
         "busy",
         "the settings kept changing while being updated; try again",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origins_are_compared_in_browser_form() {
+        for (given, normalized) in [
+            ("https://portal.example.com", "https://portal.example.com"),
+            ("HTTPS://Portal.Example.COM", "https://portal.example.com"),
+            (
+                "https://portal.example.com:443",
+                "https://portal.example.com",
+            ),
+            ("http://10.0.0.1:80", "http://10.0.0.1"),
+            (
+                "https://portal.example.com:8443",
+                "https://portal.example.com:8443",
+            ),
+            ("http://[fd00::1]:8080", "http://[fd00::1]:8080"),
+            ("https://[fd00::1]:443", "https://[fd00::1]"),
+        ] {
+            assert_eq!(
+                normalize_origin(given).as_deref(),
+                Some(normalized),
+                "{given}"
+            );
+        }
+        for bad in [
+            "",
+            "portal.example.com",
+            "ftp://portal.example.com",
+            "https://",
+            "https://portal.example.com/",
+            "https://portal.example.com/ui",
+            "https://u@portal.example.com",
+            "https://portal.example.com?x",
+            "https://a b",
+            "null",
+        ] {
+            assert_eq!(normalize_origin(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn web_origins_are_checked_and_deduplicated() {
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            web_origins(&list(&[
+                "https://a.example",
+                "HTTPS://A.example:443",
+                "http://localhost:5173"
+            ]))
+            .unwrap(),
+            list(&["https://a.example", "http://localhost:5173"])
+        );
+        assert!(web_origins(&list(&["https://a.example/"])).is_err());
+        // http는 루프백만
+        for ok in [
+            "http://localhost",
+            "http://127.0.0.1:8080",
+            "http://[::1]:3000",
+        ] {
+            assert!(web_origins(&list(&[ok])).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://b",
+            "http://10.0.0.1",
+            "http://localhost.example.com",
+        ] {
+            assert!(web_origins(&list(&[bad])).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (0..=MAX_WEB_ORIGINS)
+            .map(|i| format!("https://p{i}.example"))
+            .collect();
+        assert!(web_origins(&many).is_err());
+        assert!(web_origins(&many[..MAX_WEB_ORIGINS]).is_ok());
+    }
 }

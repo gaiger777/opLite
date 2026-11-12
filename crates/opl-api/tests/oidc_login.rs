@@ -1,7 +1,7 @@
 //! OIDC 로그인 흐름(가짜 IdP): `start`의 리디렉트와 상태 쿠키, 콜백의 쿠키 확인(없음·state 다름·만료·
 //! 변조), 상태에 담은 리디렉트 URI, IdP 오류, 인가 응답의 iss(RFC 9207), 토큰 끝점·userinfo 실패, ID
 //! 토큰과 userinfo의 클레임, 그룹 → 역할, 이름 규칙(이메일 모양), sub 묶기, 공개 클라이언트,
-//! client_secret_basic, 두 번째 로그인과 역할 바뀜, 감사 로그, 시도 제한을 쓰지 않음.
+//! client_secret_basic, 두 번째 로그인과 역할 바뀜, 감사 로그, 시도 제한을 쓰지 않음, 믿는 프록시 뒤의 콜백 주소.
 
 mod common;
 
@@ -761,4 +761,54 @@ async fn failed_callbacks_do_not_block_logins() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// 믿는 프록시 뒤에서는 그 프록시가 알린 호스트·scheme이 콜백 주소다. 믿지 않는 연결의 헤더는 보지 않는다.
+#[tokio::test]
+async fn behind_a_trusted_proxy_the_callback_uses_the_forwarded_host() {
+    let (env, _idp) = setup().await;
+    let mut state = opl_api::AppState::new(
+        env.cluster.clone(),
+        env.node,
+        env.hv.clone(),
+        env.dir.path().join("uploads"),
+    );
+    state.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxied = format!("http://{}", listener.local_addr().unwrap());
+    let app = opl_api::router(std::sync::Arc::new(state));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let redirect_uri = |base: String| {
+        let http = http.clone();
+        async move {
+            let resp = http
+                .get(format!("{base}/api/v1/auth/oidc/okta/start"))
+                .header("x-forwarded-host", "orbivisor.example.com")
+                .header("x-forwarded-proto", "https")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FOUND);
+            query(resp.headers()["location"].to_str().unwrap())["redirect_uri"].clone()
+        }
+    };
+    assert_eq!(
+        redirect_uri(proxied).await,
+        format!("https://orbivisor.example.com{CALLBACK}")
+    );
+    assert_eq!(
+        redirect_uri(env.base.clone()).await,
+        format!("{}{CALLBACK}", env.base)
+    );
 }

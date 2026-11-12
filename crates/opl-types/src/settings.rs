@@ -28,6 +28,11 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "TelemetrySettings::is_default")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub telemetry: TelemetrySettings,
+    /// 쿠키 요청을 받는 다른 출처(`https://portal.example.com`). 따로 띄운 웹 포털이 API를 부를 때 쓴다.
+    /// 비어 있으면 같은 출처만 받고, 쓰지 않아 옛 노드도 설정을 계속 푼다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub web_origins: Vec<String>,
 }
 
 impl ResourceSpec for SettingsSpec {
@@ -161,6 +166,7 @@ mod tests {
             },
             subscription: None,
             telemetry: TelemetrySettings::default(),
+            web_origins: vec![],
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -174,6 +180,25 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({ "updates": { "channel": "testing" }, "subscription": "opl1.a.b" })
+        );
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+    }
+
+    /// 허용 출처도 비어 있으면 쓰지 않는다.
+    #[test]
+    fn web_origins_are_written_only_when_set() {
+        assert_eq!(
+            serde_json::to_value(SettingsSpec::default()).unwrap(),
+            serde_json::json!({ "updates": { "channel": "stable" } })
+        );
+        let spec = SettingsSpec {
+            web_origins: vec!["https://portal.example.com".into()],
+            ..SettingsSpec::default()
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["web_origins"],
+            serde_json::json!(["https://portal.example.com"])
         );
         assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
     }

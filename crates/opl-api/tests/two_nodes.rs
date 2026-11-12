@@ -6,7 +6,8 @@
 //! 감사 로그: 한 노드의 `GET /audit`가 두 노드의 항목을 합치고, 닿지 않는 노드를 알린다.
 //! 지표: 한 노드의 지표 API가 다른 노드의 지표를 읽고, 지표를 모르는 노드와 닿지 않는 노드를 알린다.
 //! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
-//! 세션: 한 노드에서 만든 로그인 세션을 다른 노드가 받고, 로그아웃이 두 노드에 반영된다.
+//! 세션: 한 노드에서 만든 로그인 세션을 다른 노드가 받고, 로그아웃이 두 노드에 반영된다. 정족수가 없으면
+//! 로그인 세션을 그 노드 메모리에 둔다.
 
 mod common;
 
@@ -31,7 +32,7 @@ use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use opl_peer::{GrpcNetwork, MetricsReply, MetricsSource, PeerService, Peers};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
-use opl_types::auth::{Role, UserSpec};
+use opl_types::auth::{Role, SessionSpec, UserSpec};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
 use opl_types::node::{FEATURES, Fencing, NodeHa, NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
@@ -2234,4 +2235,47 @@ async fn a_session_made_on_one_node_works_on_the_other() {
         assert!(Instant::now() < deadline, "session still usable on A");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// 정족수가 없으면 로그인 세션을 그 노드 메모리에 둔다. 장애 때도 관리자가 들어와 상태를 읽는다.
+#[tokio::test]
+async fn login_works_without_quorum_on_the_node_left() {
+    let (_root, mut a, mut b) = two_nodes().await;
+    // 리더를 내리면 남은 노드는 리더를 잃는다.
+    let (down, left) = if a.cluster.health().leader == Some(NodeId(a.id)) {
+        (&mut a, &mut b)
+    } else {
+        (&mut b, &mut a)
+    };
+    let _ = down.peer_stop.take().unwrap().send(());
+    down.cluster.shutdown().await.unwrap();
+    until("quorum lost", || !left.cluster.health().quorum).await;
+
+    let started = Instant::now();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/auth/login", left.base))
+        .json(&serde_json::json!({ "username": "admin", "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // 쓰기 제한 시간(30초)을 기다리지 않는다.
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let cookie = resp.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(whoami_status(&left.base, &cookie).await, StatusCode::OK);
+    let resp = reqwest::Client::new()
+        .get(format!("{}/api/v1/vms", left.base))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // 세션은 클러스터에 없다(그 노드에서만 된다).
+    assert!(left.cluster.list::<SessionSpec>().unwrap().1.is_empty());
 }
