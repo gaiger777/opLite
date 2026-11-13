@@ -24,6 +24,7 @@ use opl_cluster::{
     ClusterError, Failure, FollowClient, FollowFrame, Forwarder, LinkBook, LinkSelector, Pick,
 };
 use opl_types::audit::{AuditEntry, AuditQuery};
+use opl_types::fence::FenceMethodStatus;
 use opl_types::metrics::MetricsQuery;
 use tokio::runtime::Handle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -32,6 +33,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tonic::{Code, Request, Status, Streaming};
 use uuid::Uuid;
 
+use crate::fence::FenceStatusRequest;
 use crate::firmware::{UefiVarsError, UefiVarsRequest};
 use crate::metrics::MetricsReply;
 use crate::migration::{
@@ -584,6 +586,32 @@ impl Peers {
             .await;
         match reply {
             Ok(reply) => Ok(Some(reply.into_inner())),
+            Err(s) if s.code() == Code::Unimplemented => Ok(None),
+            Err(s) => Err(s),
+        }
+    }
+}
+
+impl Peers {
+    /// 노드 `via`(첫 링크 `addr`)에게 노드 `node`의 전원을 `node`의 펜싱 방법으로 읽어 달라고 한다. `via`가 이
+    /// RPC를 모르면(옛 노드) None이다. `via`가 `node`나 그 `NodeFence`를 모르면 `failed_precondition`이다.
+    pub async fn fence_status(
+        &self,
+        via: NodeId,
+        addr: &str,
+        node: Uuid,
+        timeout: Duration,
+    ) -> Result<Option<Vec<FenceMethodStatus>>, Status> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(FenceStatusRequest { node });
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(via));
+                async move { within(timeout, client.fence_status(req)).await }
+            })
+            .await;
+        match reply {
+            Ok(reply) => Ok(Some(reply.into_inner().methods)),
             Err(s) if s.code() == Code::Unimplemented => Ok(None),
             Err(s) => Err(s),
         }

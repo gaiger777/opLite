@@ -14,13 +14,14 @@ use opl_cluster::{Cluster, ClusterConfig, FollowClient, FollowFrame, Forwarder, 
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, api_cert, node_key_and_csr};
 use opl_peer::{
-    AuditSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration, LEASE_LIVENESS,
-    MetricsReply, MetricsSource, MigrateIncomingRequest, MigrateIncomingResponse,
+    AuditSource, FenceSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration,
+    LEASE_LIVENESS, MetricsReply, MetricsSource, MigrateIncomingRequest, MigrateIncomingResponse,
     MigrationReceiver, NodeMonitor, NodeMonitorConfig, PeerService, Peers, UefiVarsError,
     renew_liveness,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
+use opl_types::fence::{FenceKind, FenceMethodStatus, Power};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
@@ -69,11 +70,12 @@ struct Node {
 
 impl Node {
     async fn start(ca: &ClusterCa, root: &TempDir) -> Node {
-        Self::start_with(ca, root, None, None, None, None).await
+        Self::start_with(ca, root, None, None, None, None, None).await
     }
 
     /// `migrations`가 있으면 마이그레이션을 그것으로 받고, `audit`이 있으면 감사 로그를, `metrics`가
-    /// 있으면 지표를 그것으로 읽는다. `work`가 있으면 Raft·리스가 아닌 처리를 그 실행기에서 돌린다.
+    /// 있으면 지표를 그것으로 읽는다. `work`가 있으면 Raft·리스가 아닌 처리를 그 실행기에서 돌린다. `fence`가 있으면
+    /// 다른 노드의 전원을 그것으로 읽는다.
     async fn start_with(
         ca: &ClusterCa,
         root: &TempDir,
@@ -81,6 +83,7 @@ impl Node {
         audit: Option<Arc<dyn AuditSource>>,
         metrics: Option<Arc<dyn MetricsSource>>,
         work: Option<tokio::runtime::Handle>,
+        fence: Option<Arc<dyn FenceSource>>,
     ) -> Node {
         let id = NodeId(Uuid::now_v7());
         let tls = tls_for(ca, id);
@@ -117,6 +120,9 @@ impl Node {
         }
         if let Some(work) = work {
             service = service.with_work(work);
+        }
+        if let Some(fence) = fence {
+            service = service.with_fence(fence);
         }
         let (stop, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -881,7 +887,7 @@ async fn a_leftover_record_of_a_removed_node_does_not_keep_pinging() {
 async fn migration_requests_reach_the_receiver_of_a_member() {
     let (ca, root, nodes) = start(1).await;
     let receiver = Arc::new(FakeReceiver::default());
-    let target = Node::start_with(&ca, &root, Some(receiver.clone()), None, None, None).await;
+    let target = Node::start_with(&ca, &root, Some(receiver.clone()), None, None, None, None).await;
     nodes[0]
         .cluster
         .request(LeaderRequest::AddLearner {
@@ -1050,6 +1056,7 @@ async fn incoming_migrations_run_on_the_work_runtime() {
         None,
         None,
         Some(work.handle().clone()),
+        None,
     )
     .await;
     nodes[0]
@@ -1121,6 +1128,7 @@ async fn a_panicking_handler_answers_internal() {
         None,
         None,
         Some(work.handle().clone()),
+        None,
     )
     .await;
     let members = BTreeMap::from([(node.id(), OrbNode::single(&node.addr))]);
@@ -1230,7 +1238,7 @@ async fn uefi_vars_are_fetched_from_a_member() {
 async fn audit_logs_are_read_from_a_member() {
     let (ca, root, nodes) = start(1).await;
     let audit = Arc::new(FakeAudit::default());
-    let target = Node::start_with(&ca, &root, None, Some(audit.clone()), None, None).await;
+    let target = Node::start_with(&ca, &root, None, Some(audit.clone()), None, None, None).await;
     nodes[0]
         .cluster
         .request(LeaderRequest::AddLearner {
@@ -1303,7 +1311,7 @@ async fn audit_logs_are_read_from_a_member() {
 async fn metrics_are_read_from_a_member() {
     let (ca, root, nodes) = start(1).await;
     let metrics = Arc::new(FakeMetrics::default());
-    let target = Node::start_with(&ca, &root, None, None, Some(metrics.clone()), None).await;
+    let target = Node::start_with(&ca, &root, None, None, Some(metrics.clone()), None, None).await;
     nodes[0]
         .cluster
         .request(LeaderRequest::AddLearner {
@@ -1355,6 +1363,93 @@ async fn metrics_are_read_from_a_member() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
     assert_eq!(metrics.queries.lock().unwrap().len(), 1);
+}
+
+/// 받은 노드 id를 적고, 아는 노드면 방법 하나의 결과를 돌려주는 전원 읽기
+#[derive(Default)]
+struct FakeFence {
+    asked: std::sync::Mutex<Vec<Uuid>>,
+}
+
+#[async_trait::async_trait]
+impl FenceSource for FakeFence {
+    async fn status(&self, node: Uuid) -> Result<Vec<FenceMethodStatus>, String> {
+        self.asked.lock().unwrap().push(node);
+        if node == Uuid::nil() {
+            return Err(format!("node {node} has no power fencing"));
+        }
+        Ok(vec![FenceMethodStatus {
+            kind: FenceKind::Ipmi,
+            power: Power::On,
+            error: None,
+        }])
+    }
+}
+
+#[tokio::test]
+async fn fence_status_is_read_by_a_member() {
+    let (ca, root, nodes) = start(1).await;
+    let fence = Arc::new(FakeFence::default());
+    let target = Node::start_with(&ca, &root, None, None, None, None, Some(fence.clone())).await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+            addrs: vec![],
+        })
+        .await
+        .unwrap();
+    let source = nodes[0].id();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(source) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let peers = &nodes[0].peers;
+    let asked = source.0;
+    let methods = peers
+        .fence_status(target.id(), &target.addr, asked, WAIT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        methods,
+        [FenceMethodStatus {
+            kind: FenceKind::Ipmi,
+            power: Power::On,
+            error: None,
+        }]
+    );
+    // 읽는 쪽의 오류는 `failed_precondition`이다.
+    let err = peers
+        .fence_status(target.id(), &target.addr, Uuid::nil(), WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert!(err.message().contains("no power fencing"), "{err:?}");
+    assert_eq!(*fence.asked.lock().unwrap(), [asked, Uuid::nil()]);
+
+    // 전원 읽기가 없는 노드(옛 노드처럼)는 None이다.
+    let none = target
+        .peers
+        .fence_status(nodes[0].id(), &nodes[0].addr, asked, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+    // 멤버가 아닌 노드의 요청은 읽는 쪽에 닿지 않는다.
+    let outsider = Node::start(&ca, &root).await;
+    let err = outsider
+        .peers
+        .fence_status(target.id(), &target.addr, asked, WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+    assert_eq!(fence.asked.lock().unwrap().len(), 2);
 }
 
 /// 리더가 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`)을 `observers`(id, 클러스터 주소)로 바꾼다(없으면

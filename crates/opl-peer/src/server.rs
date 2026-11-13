@@ -23,6 +23,7 @@ use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
 use crate::audit::{AuditReply, AuditSource};
+use crate::fence::{FenceSource, FenceStatusReply, FenceStatusRequest};
 use crate::firmware::{UefiVarsChunk, UefiVarsRequest};
 use crate::metrics::{MetricsReply, MetricsSource};
 use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
@@ -45,6 +46,7 @@ pub struct PeerService {
     migrations: Option<Arc<dyn MigrationReceiver>>,
     audit: Option<Arc<dyn AuditSource>>,
     metrics: Option<Arc<dyn MetricsSource>>,
+    fence: Option<Arc<dyn FenceSource>>,
     /// 드라이버의 `state_dir`. UEFI 변수 파일을 여기서 찾아 보낸다.
     state_dir: Option<PathBuf>,
     /// Raft·리스가 아닌 처리(마이그레이션 받기, 콘솔 중계, UEFI 변수·감사 로그·지표 읽기)를 돌릴
@@ -61,6 +63,7 @@ impl PeerService {
             migrations: None,
             audit: None,
             metrics: None,
+            fence: None,
             state_dir: None,
             work: None,
         }
@@ -94,6 +97,13 @@ impl PeerService {
     /// 이 노드의 지표를 `source`로 읽어 준다. 없으면 읽기 요청을 `unimplemented`로 거부한다(옛 노드와 같다).
     pub fn with_metrics(mut self, source: Arc<dyn MetricsSource>) -> Self {
         self.metrics = Some(source);
+        self
+    }
+
+    /// 다른 노드의 전원을 그 노드의 펜싱 방법으로 `source`가 읽어 준다. 없으면 `unimplemented`로 거부한다(옛 노드와
+    /// 같다).
+    pub fn with_fence(mut self, source: Arc<dyn FenceSource>) -> Self {
+        self.fence = Some(source);
         self
     }
 
@@ -280,6 +290,23 @@ impl Peer for PeerService {
         let query = req.into_inner();
         let reply = self.offload(async move { source.read(&query) }).await?;
         Ok(Response::new(reply))
+    }
+
+    async fn fence_status(
+        &self,
+        req: Request<FenceStatusRequest>,
+    ) -> Result<Response<FenceStatusReply>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .fence
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not check power fencing"))?;
+        let node = req.into_inner().node;
+        let methods = self
+            .offload(async move { source.status(node).await })
+            .await?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(FenceStatusReply { methods }))
     }
 
     type UefiVarsStream = ReceiverStream<Result<UefiVarsChunk, Status>>;

@@ -791,6 +791,8 @@ pub async fn delete_node(
         Ok(_) | Err(ClusterError::Rejected(_)) => {}
         Err(e) => return Err(e.into()),
     }
+    // 노드의 전원 끄기 펜싱 설정(BMC 비밀번호)도 남기지 않는다.
+    crate::node_fence::delete_with_node(&state, &node).await?;
     tracing::info!(node = %node.name, "node removed from the cluster");
     Ok(StatusCode::NO_CONTENT)
 }

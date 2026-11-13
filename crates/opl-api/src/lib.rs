@@ -24,10 +24,12 @@ pub mod ldap;
 pub mod limit;
 mod metrics;
 mod migration_disks;
+mod node_fence;
 pub mod oidc;
 mod oidc_login;
 pub mod placement;
 mod placement_rules;
+pub mod power_fence;
 pub mod proxy;
 pub mod realms;
 pub mod remote_client;
@@ -71,6 +73,7 @@ pub use ha::{HaManager, HaManagerConfig, RecoveryWriter};
 pub use health::RuntimeProbe;
 pub use incoming::{IncomingConfig, IncomingMigrations};
 pub use janitor::{ClusterJanitor, ClusterJanitorConfig};
+pub use power_fence::{FenceStatusSource, Fencer, PowerFence, PowerOff, power_off};
 pub use remotes::{RemotePoller, RemotePollerConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
@@ -151,6 +154,12 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(updates::upgrade_node))
         .routes(routes!(drain::drain_node))
         .routes(routes!(drain::unfreeze_node))
+        .routes(routes!(
+            node_fence::get_node_fence,
+            node_fence::put_node_fence,
+            node_fence::delete_node_fence
+        ))
+        .routes(routes!(node_fence::test_node_fence))
         .routes(routes!(metrics::get_node_metrics))
         .routes(routes!(metrics::list_node_metrics))
         .routes(routes!(cluster::get_cluster))

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opl_api::{
-    AuditConfig, BackupJobSchedulerConfig, ClusterJanitorConfig, RemotePollerConfig,
+    AuditConfig, BackupJobSchedulerConfig, ClusterJanitorConfig, Fencer, RemotePollerConfig,
     SnapshotSchedulerConfig, TelemetryConfig, UpdatesConfig, VipAgentConfig,
 };
 use opl_driver::VipAddress;
@@ -342,6 +342,9 @@ pub struct HaSection {
     /// 마지막으로 성공한 리스 갱신 뒤 이만큼 지나면 HA VM을 끈다(초). 없으면 프로필 값이다.
     #[serde(default)]
     pub fence_after_secs: Option<u64>,
+    /// 전원 끄기 펜싱의 IPMI 방법이 부르는 `ipmitool`(리더가 노드를 끌 때와 `fence-test`·이웃 확인에 쓴다)
+    #[serde(default = "default_ipmitool")]
+    pub ipmitool: PathBuf,
 }
 
 impl Default for HaSection {
@@ -352,6 +355,7 @@ impl Default for HaSection {
             watchdog_device: default_watchdog_device(),
             watchdog_timeout_secs: None,
             fence_after_secs: None,
+            ipmitool: default_ipmitool(),
         }
     }
 }
@@ -408,6 +412,14 @@ impl HaSection {
     /// 실제 `fence_after_secs`: 적은 값, 없으면 프로필 값
     pub fn fence_after_secs(&self) -> u64 {
         self.fence_after_secs.unwrap_or(self.profile.times().0)
+    }
+
+    /// 노드 전원 끄기 펜싱의 실행기
+    pub fn fencer(&self) -> Fencer {
+        Fencer {
+            ipmitool: self.ipmitool.clone(),
+            ..Fencer::default()
+        }
     }
 
     /// 실제 `watchdog_timeout_secs`: 적은 값, 없으면 프로필 값
@@ -916,6 +928,10 @@ pub fn ha_warnings(config: &Config, notify: bool) -> Vec<String> {
         ));
     }
     warnings
+}
+
+fn default_ipmitool() -> PathBuf {
+    "ipmitool".into()
 }
 
 fn default_watchdog_device() -> PathBuf {
@@ -2188,6 +2204,22 @@ mod tests {
             parse("name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nprofile = \"safe\"");
         c.validate().unwrap();
         assert_eq!(ha("fencing = \"off\"\nprofile = \"safe\"").node_ha(), None);
+    }
+
+    /// 전원 끄기 펜싱의 `ipmitool`은 PATH의 것이 기본이고 바꿀 수 있다(펜싱이 꺼진 노드도 이웃 확인에 쓴다).
+    #[test]
+    fn ha_ipmitool_defaults_to_the_path() {
+        let ha = |text: &str| parse(&format!("name = \"n\"\naddress = \"h\"\n{text}")).ha;
+        assert_eq!(ha("").fencer().ipmitool, PathBuf::from("ipmitool"));
+        let custom = ha("[ha]\nfencing = \"off\"\nipmitool = \"/opt/ipmi/bin/ipmitool\"");
+        assert_eq!(
+            custom.fencer().ipmitool,
+            PathBuf::from("/opt/ipmi/bin/ipmitool")
+        );
+        assert_eq!(
+            custom.fencer().timeout,
+            opl_api::power_fence::FENCE_CALL_TIMEOUT
+        );
     }
 
     /// 짧은 시간으로 펜싱하면 다중 링크가 없을 때, watchdog인데 systemd 밖일 때 경고한다. `safe`·30초 이상,

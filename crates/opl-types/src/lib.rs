@@ -5,6 +5,7 @@ pub mod auth;
 pub mod backup;
 pub mod backup_job;
 pub mod cluster;
+pub mod fence;
 pub mod host;
 pub mod metrics;
 pub mod network;

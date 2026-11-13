@@ -58,6 +58,7 @@ pub enum Kind {
     VipHolder,
     HaGroup,
     PlacementRule,
+    NodeFence,
 }
 
 impl Kind {
@@ -85,6 +86,7 @@ impl Kind {
             Kind::VipHolder => "vip-holder",
             Kind::HaGroup => "ha-group",
             Kind::PlacementRule => "placement-rule",
+            Kind::NodeFence => "node-fence",
         }
     }
 }
@@ -168,6 +170,7 @@ mod tests {
             Kind::VipHolder,
             Kind::HaGroup,
             Kind::PlacementRule,
+            Kind::NodeFence,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }

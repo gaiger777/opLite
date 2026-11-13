@@ -632,6 +632,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/nodes/{key}/fence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 노드의 전원 끄기 펜싱 설정. 없으면 404. */
+        get: operations["get_node_fence"];
+        /**
+         * 노드의 전원 끄기 펜싱 방법(1~4개, 차례로 해 본다)을 통째로 둔다. 비밀번호(`password`)를 빼면 같은 종류·주소·
+         *     사용자의 저장된 값을 두고(주소나 사용자를 바꾸면 다시 줘야 한다 — 400), 빈 글이면 지운다. 위트니스는 400, 모든
+         *     노드가 `fast-ha`를 알아야 한다(409 `cluster_upgrading`).
+         */
+        put: operations["put_node_fence"];
+        post?: never;
+        /** 노드의 전원 끄기 펜싱을 지운다(리더는 watchdog만 기다린다). 없으면 404. */
+        delete: operations["delete_node_fence"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{key}/fence-test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드의 펜싱 방법마다 전원을 읽는다(전원은 건드리지 않는다). 이 API 노드가 그 노드가 아니면 스스로 읽고, 그
+         *     노드면 이웃(온라인·`fast-ha`인 다른 노드 가운데 id 순으로 다음)에게 노드 사이 RPC로 부탁한다. 이웃이 없으면
+         *     409 `no_fence_checker`, 이웃이 답하지 않으면 502 `fence_check_failed`.
+         */
+        post: operations["test_node_fence"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/nodes/{key}/metrics": {
         parameters: {
             query?: never;
@@ -2016,6 +2060,16 @@ export interface components {
              */
             node: string;
         };
+        /**
+         * @description 리더 노드에서 `/bin/sh -c`로 돌리는 명령. 환경 변수 `ORBIVISOR_NODE_NAME`·`ORBIVISOR_NODE_ID`·
+         *     `ORBIVISOR_NODE_ADDRESS`(노드 API 주소의 호스트)가 끌 노드를 알린다.
+         */
+        CommandFence: {
+            /** @description 노드를 끈다. 0이 아닌 종료는 실패다. */
+            off: string;
+            /** @description 첫 줄에 `off`나 `on`을 찍는다(그 밖은 모름). */
+            status: string;
+        };
         /** @enum {string} */
         CpuModel: "host" | "max";
         CpuSpec: {
@@ -2338,6 +2392,47 @@ export interface components {
             vmx: string;
         };
         /**
+         * @description 방법의 종류
+         * @enum {string}
+         */
+        FenceKind: "ipmi" | "redfish" | "command";
+        /** @description 노드를 끄는 방법 하나 */
+        FenceMethod: (components["schemas"]["IpmiFence"] & {
+            /** @enum {string} */
+            kind: "ipmi";
+        }) | (components["schemas"]["RedfishFence"] & {
+            /** @enum {string} */
+            kind: "redfish";
+        }) | (components["schemas"]["CommandFence"] & {
+            /** @enum {string} */
+            kind: "command";
+        });
+        /** @description 방법 하나로 전원을 읽은 결과(`fence-test`, 이웃 확인) */
+        FenceMethodStatus: {
+            /** @description 읽지 못한 이유 */
+            error?: string;
+            kind: components["schemas"]["FenceKind"];
+            /** @description 읽지 못했으면 `unknown` */
+            power: components["schemas"]["Power"];
+        };
+        FenceMethodView: (components["schemas"]["IpmiFenceView"] & {
+            /** @enum {string} */
+            kind: "ipmi";
+        }) | (components["schemas"]["RedfishFenceView"] & {
+            /** @enum {string} */
+            kind: "redfish";
+        }) | (components["schemas"]["CommandFence"] & {
+            /** @enum {string} */
+            kind: "command";
+        });
+        /** @description `fence-test`의 결과 */
+        FenceTestResult: {
+            /** @description 전원을 읽은 노드의 이름(시험하는 노드 자신이면 이웃) */
+            checked_by: string;
+            /** @description 방법마다의 결과(방법 순서) */
+            methods: components["schemas"]["FenceMethodStatus"][];
+        };
+        /**
          * @description 리스를 잃은 노드가 HA VM을 끄는 방법
          * @enum {string}
          */
@@ -2500,6 +2595,37 @@ export interface components {
         } | {
             /** @description ESXi·vCenter 데이터스토어의 VM. 비밀번호는 여기에 없다(받은 노드의 메모리에만 둔다). */
             esxi: components["schemas"]["EsxiSource"];
+        };
+        /**
+         * @description `ipmitool [-I lanplus] -H address -p port -U user -E chassis power off|status`. 비밀번호는 명령 인자가 아니라
+         *     `IPMI_PASSWORD` 환경 변수로 넘긴다.
+         */
+        IpmiFence: {
+            /** @description BMC 주소(호스트 이름이나 IP) */
+            address: string;
+            /**
+             * @description IPMI 2.0(`-I lanplus`)
+             * @default true
+             */
+            lanplus: boolean;
+            /** @description BMC 비밀번호. API는 내보내지 않는다. */
+            password?: string;
+            /**
+             * Format: int32
+             * @default 623
+             */
+            port: number;
+            user: string;
+        };
+        /** @description [`IpmiFence`]에서 `password`를 뺀 것 */
+        IpmiFenceView: {
+            address: string;
+            /** @description 비밀번호가 저장되어 있는지 */
+            has_password: boolean;
+            lanplus: boolean;
+            /** Format: int32 */
+            port: number;
+            user: string;
         };
         /** @description 노드가 로그인할 iSCSI 타깃 */
         IscsiTarget: {
@@ -3515,6 +3641,19 @@ export interface components {
             /** Format: int64 */
             witness: number;
         };
+        /** @description 노드를 끄는 방법들. 앞의 것부터 해 보고, 꺼진 것을 확인하지 못하면 다음 것을 한다. */
+        NodeFenceSpec: {
+            /** @description 1~4개 */
+            methods: components["schemas"]["FenceMethod"][];
+        };
+        /** @description 응답의 펜싱 설정. 비밀번호 대신 있는지만 보인다. */
+        NodeFenceView: {
+            methods: components["schemas"]["FenceMethodView"][];
+            /** @description 노드 이름 */
+            node: string;
+            /** Format: int64 */
+            revision: number;
+        };
         /** @description 노드가 등록할 때 쓰는 HA 펜싱 설정 */
         NodeHa: {
             /**
@@ -3864,6 +4003,11 @@ export interface components {
              */
             total_bytes: number;
         };
+        /**
+         * @description 방법으로 읽은 노드의 전원
+         * @enum {string}
+         */
+        Power: "on" | "off" | "unknown";
         /** @enum {string} */
         PowerState: "running" | "stopped";
         /** @description 인증된 요청의 주체. 요청마다 저장소의 User에서 다시 읽으므로 역할 변경과 삭제가 곧바로 반영된다. */
@@ -3981,6 +4125,30 @@ export interface components {
             /** Format: uuid */
             id: string;
             name: string;
+        };
+        /** @description Redfish BMC. Basic 인증으로 `ComputerSystem.Reset`(`ForceOff`)을 부르고 `PowerState`로 확인한다. */
+        RedfishFence: {
+            /** @description BMC 인증서를 확인할 CA(PEM). 없으면 시스템 루트 */
+            ca_pem?: string;
+            /** @description BMC 인증서를 확인하지 않는다(자체 서명 인증서). */
+            insecure?: boolean;
+            /** @description BMC 비밀번호. API는 내보내지 않는다. */
+            password?: string;
+            /** @description `/redfish/v1/Systems/<id>`의 id. 없으면 시스템이 하나일 때 그것을 쓴다. */
+            system_id?: string;
+            /** @description `https://bmc[:port]`(`http://`도 된다) */
+            url: string;
+            user: string;
+        };
+        /** @description [`RedfishFence`]에서 `password`를 뺀 것 */
+        RedfishFenceView: {
+            ca_pem?: string;
+            /** @description 비밀번호가 저장되어 있는지 */
+            has_password: boolean;
+            insecure: boolean;
+            system_id?: string;
+            url: string;
+            user: string;
         };
         RemoteNodeCounts: {
             /** Format: int64 */
@@ -6988,6 +7156,133 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_node_fence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeFenceView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_node_fence: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NodeFenceSpec"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeFenceView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_node_fence: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    test_node_fence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FenceTestResult"];
                 };
             };
             "4XX": {

@@ -12,10 +12,10 @@ use anyhow::Context;
 use axum::serve::ListenerExt;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
-    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, ClusterJanitor, HaManager,
-    HaManagerConfig, IncomingConfig, IncomingMigrations, RemotePoller, RuntimeProbe,
-    SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher,
-    UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
+    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, ClusterJanitor, FenceStatusSource,
+    HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations, PowerFence, RemotePoller,
+    RuntimeProbe, SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter,
+    UefiVarsFetcher, UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
@@ -454,12 +454,19 @@ impl Member {
         // 측정기가 적고, API와 다른 노드(노드 간 서버)가 읽는다.
         let metrics_store = Arc::new(MetricsStore::default());
         let metrics_source = Arc::new(StoreSource::new(node, metrics_store.clone()));
+        // 전원 끄기 펜싱: API(`fence-test`)와 다른 노드의 이웃 확인이 쓴다.
+        let fence: Arc<dyn PowerFence> = Arc::new(config.ha.fencer());
+        let fence_source = Arc::new(FenceStatusSource {
+            cluster: cluster.clone(),
+            fence: fence.clone(),
+        });
         // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(incoming.with_firewall(gate.clone())))
             .with_uefi_vars(config.data_dir.clone())
             .with_audit(audit.clone())
             .with_metrics(metrics_source.clone())
+            .with_fence(fence_source)
             .with_work(rt.work.clone());
         let peer = on(&rt.core, || {
             serve_peer(peer_listener, &tls, service, exited_tx.clone())
@@ -498,6 +505,7 @@ impl Member {
             state.trusted_proxies = config.api.trusted_proxies.clone();
             state.audit = audit;
             state.metrics = Some(metrics_source);
+            state.fence = fence;
             // 헬스 체크가 실행기 확인과 HA 리스(아래에서 띄운 뒤)를 본다.
             state.runtimes = runtimes;
             let created = match password {

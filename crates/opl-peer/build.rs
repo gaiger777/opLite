@@ -77,6 +77,12 @@ fn main() {
             "opl_types::metrics::MetricsQuery",
             "crate::metrics::MetricsReply",
         ))
+        .method(json(
+            "fence_status",
+            "FenceStatus",
+            "crate::fence::FenceStatusRequest",
+            "crate::fence::FenceStatusReply",
+        ))
         .method(
             Method::builder()
                 .name("uefi_vars")

@@ -14,6 +14,7 @@ use crate::auth::{Authorizer, RoleAuthorizer, Sessions};
 use crate::health::RuntimeProbe;
 use crate::limit::AttemptLimiter;
 use crate::oidc::OidcCache;
+use crate::power_fence::{Fencer, PowerFence};
 use crate::vm_imports::ImportCredentials;
 
 /// 모든 핸들러가 공유하는 노드의 상태.
@@ -57,6 +58,8 @@ pub struct AppState {
     pub ha: Option<Arc<HaGuard>>,
     /// 실행기 확인(opld의 `Liveness`). 없으면 헬스 체크가 실행기를 보지 않는다.
     pub runtimes: Option<Arc<dyn RuntimeProbe>>,
+    /// 노드 전원 끄기 펜싱의 실행기(`fence-test`, 리더의 끄기). 기본은 PATH의 `ipmitool`을 쓰는 [`Fencer`]다.
+    pub fence: Arc<dyn PowerFence>,
 }
 
 impl AppState {
@@ -87,6 +90,7 @@ impl AppState {
             receive_idle_timeout: Duration::from_secs(60),
             ha: None,
             runtimes: None,
+            fence: Arc::new(Fencer::default()),
         }
     }
 }

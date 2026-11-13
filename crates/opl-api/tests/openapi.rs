@@ -31,6 +31,8 @@ async fn openapi_document_is_served_without_login() {
         "/nodes/{key}/updates/refresh",
         "/nodes/{key}/upgrade",
         "/nodes/{key}/drain",
+        "/nodes/{key}/fence",
+        "/nodes/{key}/fence-test",
         "/nodes/{key}/metrics",
         "/metrics/nodes",
         "/vms/{key}/metrics",
@@ -102,6 +104,12 @@ async fn openapi_document_is_served_without_login() {
     let oidc_view = &doc["components"]["schemas"]["OidcRealmView"]["properties"];
     assert!(oidc_view["client_secret"].is_null(), "{oidc_view}");
     assert!(oidc_view["has_client_secret"].is_object(), "{oidc_view}");
+    // 펜싱 응답에도 BMC 비밀번호가 없다.
+    for view in ["IpmiFenceView", "RedfishFenceView"] {
+        let props = &doc["components"]["schemas"][view]["properties"];
+        assert!(props["password"].is_null(), "{props}");
+        assert!(props["has_password"].is_object(), "{props}");
+    }
     assert_eq!(
         doc["paths"]["/auth/realms"]["get"]["security"],
         serde_json::json!([{}])

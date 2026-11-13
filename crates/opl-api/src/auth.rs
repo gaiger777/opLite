@@ -64,9 +64,15 @@ pub struct RoleAuthorizer;
 
 impl Authorizer for RoleAuthorizer {
     fn check(&self, principal: &Principal, action: Action, kind: Kind) -> bool {
+        // 계정과 비밀을 담은 종류(전원 끄기 펜싱의 BMC 비밀번호)는 admin만 읽는다.
         let account = matches!(
             kind,
-            Kind::User | Kind::ApiToken | Kind::JoinToken | Kind::Realm | Kind::Session
+            Kind::User
+                | Kind::ApiToken
+                | Kind::JoinToken
+                | Kind::Realm
+                | Kind::Session
+                | Kind::NodeFence
         );
         match principal.role {
             Role::Admin => true,
@@ -622,6 +628,13 @@ mod tests {
         assert!(a.check(&admin, Action::Write, Kind::User));
         assert!(a.check(&admin, Action::Read, Kind::Realm));
         assert!(a.check(&admin, Action::Write, Kind::Realm));
+
+        // 전원 끄기 펜싱(BMC 비밀번호)은 admin만 읽고 바꾼다.
+        assert!(!a.check(&viewer, Action::Read, Kind::NodeFence));
+        assert!(!a.check(&op, Action::Read, Kind::NodeFence));
+        assert!(!a.check(&op, Action::Operate, Kind::NodeFence));
+        assert!(a.check(&admin, Action::Read, Kind::NodeFence));
+        assert!(a.check(&admin, Action::Write, Kind::NodeFence));
     }
 
     #[test]

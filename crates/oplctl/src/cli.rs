@@ -282,6 +282,169 @@ enum NodeCmd {
     Unfreeze {
         node: String,
     },
+    /// 노드의 전원 끄기 펜싱(IPMI·Redfish·명령). 리더가 리스를 잃은 노드를 끄고 꺼진 것을 확인하면 watchdog를
+    /// 기다리지 않고 HA VM을 옮긴다. admin만 다룬다.
+    Fence {
+        #[command(subcommand)]
+        cmd: FenceCmd,
+    },
+    /// 노드의 펜싱 방법마다 전원을 읽는다(전원은 건드리지 않는다). 그 노드에 연결한 API면 이웃 노드가 읽는다.
+    FenceTest {
+        node: String,
+    },
+}
+
+/// `node fence`
+#[derive(Subcommand)]
+enum FenceCmd {
+    /// 방법들을 보인다(비밀번호는 저장되어 있는지만).
+    Get { node: String },
+    /// 방법들을 통째로 둔다. 파일은 `{"methods": [...]}` JSON(`-`면 표준 입력, `get --json`의 출력도 된다 — 그
+    /// `revision`이 있으면 `If-Match`로 보낸다)이다.
+    /// 방법의 `password`를 빼면 같은 종류·주소·사용자의 저장된 비밀번호를 쓰고, 빈 글이면 지운다.
+    Set {
+        node: String,
+        #[arg(short = 'f', long = "file", value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// 펜싱을 지운다(리더는 watchdog만 기다린다).
+    Delete { node: String },
+}
+
+/// `node fence get`의 열
+const FENCE_HEADERS: &[&str] = &["#", "KIND", "TARGET", "USER", "PASSWORD"];
+
+/// `node fence get`의 행: 방법마다 종류, 대상(IPMI `주소:포트`, Redfish URL[`#시스템`], 명령은 `off`), 사용자,
+/// 비밀번호가 저장되어 있는지(`set`)
+fn fence_rows(view: &Value) -> Vec<Vec<String>> {
+    let methods = view["methods"].as_array().cloned().unwrap_or_default();
+    methods
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let target = match m["kind"].as_str() {
+                Some("ipmi") => format!("{}:{}", cell(&m["address"]), cell(&m["port"])),
+                Some("redfish") => match m["system_id"].as_str() {
+                    Some(id) => format!("{}#{id}", cell(&m["url"])),
+                    None => cell(&m["url"]),
+                },
+                _ => cell(&m["off"]),
+            };
+            let password = if m["has_password"] == json!(true) {
+                "set"
+            } else {
+                "-"
+            };
+            vec![
+                (i + 1).to_string(),
+                cell(&m["kind"]),
+                target,
+                cell(&m["user"]),
+                password.into(),
+            ]
+        })
+        .collect()
+}
+
+/// `node fence set -f`의 본문. `node fence get --json`의 출력도 받도록 그 읽기 전용 필드(`node`·`revision`, 방법의
+/// `has_password`)를 뺀다.
+fn fence_body(mut body: Value) -> Value {
+    if let Some(top) = body.as_object_mut() {
+        top.remove("node");
+        top.remove("revision");
+    }
+    if let Some(methods) = body["methods"].as_array_mut() {
+        for m in methods.iter_mut().filter_map(Value::as_object_mut) {
+            m.remove("has_password");
+        }
+    }
+    body
+}
+
+/// `node fence set -f`의 파일(`-`면 표준 입력)
+fn read_fence_file(path: &PathBuf) -> anyhow::Result<Value> {
+    let text = if path.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut s)
+            .context("cannot read standard input")?;
+        s
+    } else {
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?
+    };
+    serde_json::from_str(&text).with_context(|| format!("{} is not JSON", path.display()))
+}
+
+/// `node fence get|set|delete`
+async fn node_fence(
+    client: &Client,
+    cmd: FenceCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        FenceCmd::Get { node } => {
+            let view = client.get(&format!("/nodes/{}/fence", seg(&node))).await?;
+            if json_out {
+                print_json(out, &view)?;
+            } else {
+                table(out, FENCE_HEADERS, &fence_rows(&view))?;
+            }
+        }
+        FenceCmd::Set { node, file } => {
+            let file = read_fence_file(&file)?;
+            let mut r = client
+                .request(Method::PUT, &format!("/nodes/{}/fence", seg(&node)))
+                .json(&fence_body(file.clone()));
+            // `get --json`의 출력이면 읽은 revision으로 쓴다(그 사이 바뀌었으면 412).
+            if let Some(revision) = file.get("revision").filter(|r| !r.is_null()) {
+                r = r.header(reqwest::header::IF_MATCH, cell(revision));
+            }
+            let view = client.send(r).await?;
+            let n = view["methods"].as_array().map_or(0, Vec::len);
+            writeln!(out, "node {node}: power fencing set ({n} methods)")?;
+        }
+        FenceCmd::Delete { node } => {
+            client
+                .delete(&format!("/nodes/{}/fence", seg(&node)))
+                .await?;
+            writeln!(out, "node {node}: power fencing removed")?;
+        }
+    }
+    Ok(())
+}
+
+/// `node fence-test`의 열
+const FENCE_TEST_HEADERS: &[&str] = &["#", "KIND", "POWER", "ERROR"];
+
+/// `node fence-test`: 읽은 노드와 방법마다의 전원·오류
+async fn node_fence_test(
+    client: &Client,
+    node: &str,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let result = client
+        .post(&format!("/nodes/{}/fence-test", seg(node)), &json!({}))
+        .await?;
+    if json_out {
+        return Ok(print_json(out, &result)?);
+    }
+    writeln!(out, "checked by {}", cell(&result["checked_by"]))?;
+    let methods = result["methods"].as_array().cloned().unwrap_or_default();
+    let rows: Vec<Vec<String>> = methods
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            vec![
+                (i + 1).to_string(),
+                cell(&m["kind"]),
+                cell(&m["power"]),
+                cell(&m["error"]),
+            ]
+        })
+        .collect();
+    table(out, FENCE_TEST_HEADERS, &rows)?;
+    Ok(())
 }
 
 /// `node stats`·`vm stats`의 공통 인자
@@ -4222,6 +4385,8 @@ where
                 node_stats(&client, stats.watch, json_out, out, &mut std::io::stderr()).await?
             }
             NodeCmd::Unfreeze { node } => node_unfreeze(&client, &node, out).await?,
+            NodeCmd::Fence { cmd } => node_fence(&client, cmd, json_out, out).await?,
+            NodeCmd::FenceTest { node } => node_fence_test(&client, &node, json_out, out).await?,
         },
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::List => {
@@ -9201,6 +9366,174 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             ["POST /api/v1/nodes/n1/unfreeze HTTP/1.1"]
+        );
+    }
+
+    /// `node fence set -f`는 파일을 그대로 PUT하고, `get`은 비밀번호 없이 표로 보인다.
+    #[tokio::test]
+    async fn node_fence_puts_the_file_and_shows_methods() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("fence.json");
+        std::fs::write(
+            &file,
+            r#"{"methods": [{"kind": "ipmi", "address": "10.0.0.9", "user": "admin", "password": "pw"}]}"#,
+        )
+        .unwrap();
+        let view = json!({ "node": "n1", "revision": 7, "methods": [
+            { "kind": "ipmi", "address": "10.0.0.9", "port": 623, "user": "admin", "lanplus": true, "has_password": true },
+            { "kind": "redfish", "url": "https://bmc", "user": "root", "system_id": "1", "insecure": false, "has_password": false },
+            { "kind": "command", "off": "pdu off 3", "status": "pdu status 3" },
+        ]});
+        assert_eq!(
+            fence_rows(&view),
+            [
+                ["1", "ipmi", "10.0.0.9:623", "admin", "set"],
+                ["2", "redfish", "https://bmc#1", "root", "-"],
+                ["3", "command", "pdu off 3", "-", "-"],
+            ]
+        );
+        let (client, seen) =
+            fake_api(|_| json!({ "node": "n1", "methods": [{ "kind": "ipmi" }] })).await;
+        let argv = [
+            "oplctl",
+            "node",
+            "fence",
+            "set",
+            "n1",
+            "-f",
+            file.to_str().unwrap(),
+        ];
+        let Cmd::Node {
+            cmd: NodeCmd::Fence { cmd },
+        } = Cli::try_parse_from(argv).unwrap().cmd
+        else {
+            unreachable!()
+        };
+        let mut out = Vec::new();
+        node_fence(&client, cmd, false, &mut out).await.unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "node n1: power fencing set (1 methods)\n"
+        );
+        for (argv, expected) in [
+            (
+                vec!["oplctl", "node", "fence", "get", "n1"],
+                "GET /api/v1/nodes/n1/fence HTTP/1.1",
+            ),
+            (
+                vec!["oplctl", "node", "fence", "delete", "n1"],
+                "DELETE /api/v1/nodes/n1/fence HTTP/1.1",
+            ),
+        ] {
+            let Cmd::Node {
+                cmd: NodeCmd::Fence { cmd },
+            } = Cli::try_parse_from(argv).unwrap().cmd
+            else {
+                unreachable!()
+            };
+            node_fence(&client, cmd, false, &mut Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(seen.lock().unwrap().last().unwrap(), expected);
+        }
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            "PUT /api/v1/nodes/n1/fence HTTP/1.1"
+        );
+        // 파일은 꼭 줘야 한다.
+        assert!(Cli::try_parse_from(["oplctl", "node", "fence", "set", "n1"]).is_err());
+    }
+
+    /// 파일에 `revision`이 있으면(`get --json`의 출력) `If-Match`로 보내고 본문에서는 뺀다. 없으면 보내지 않는다.
+    #[tokio::test]
+    async fn node_fence_set_sends_the_revision_of_the_file_as_if_match() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (base, seen) =
+            fake_api_bodies(|_| json!({ "node": "n1", "methods": [{ "kind": "ipmi" }] })).await;
+        let client = Client::new(&base, None, None).unwrap();
+        for (text, expected) in [
+            (
+                r#"{"node": "n1", "revision": 7, "methods": [{"kind": "command", "off": "o", "status": "s"}]}"#,
+                Some("7"),
+            ),
+            (
+                r#"{"methods": [{"kind": "command", "off": "o", "status": "s"}]}"#,
+                None,
+            ),
+        ] {
+            let file = dir.path().join("fence.json");
+            std::fs::write(&file, text).unwrap();
+            let cmd = FenceCmd::Set {
+                node: "n1".into(),
+                file,
+            };
+            node_fence(&client, cmd, false, &mut Vec::new())
+                .await
+                .unwrap();
+            let seen = seen.lock().unwrap();
+            let last = seen.last().unwrap();
+            assert_eq!(last.line, "PUT /api/v1/nodes/n1/fence HTTP/1.1");
+            assert_eq!(last.if_match.as_deref(), expected, "{text}");
+            assert_eq!(
+                last.body,
+                json!({ "methods": [{ "kind": "command", "off": "o", "status": "s" }] })
+            );
+        }
+    }
+
+    /// `node fence get --json`의 출력을 그대로 `set -f`에 줄 수 있다: 읽기 전용 필드는 빼고 보낸다.
+    #[test]
+    fn fence_body_drops_the_read_only_fields_of_get() {
+        let view = json!({ "node": "n1", "revision": 7, "methods": [
+            { "kind": "ipmi", "address": "10.0.0.9", "port": 623, "user": "admin", "lanplus": true, "has_password": true },
+            { "kind": "command", "off": "pdu off 3", "status": "pdu status 3" },
+        ]});
+        assert_eq!(
+            fence_body(view),
+            json!({ "methods": [
+                { "kind": "ipmi", "address": "10.0.0.9", "port": 623, "user": "admin", "lanplus": true },
+                { "kind": "command", "off": "pdu off 3", "status": "pdu status 3" },
+            ]})
+        );
+        let file = json!({ "methods": [{ "kind": "ipmi", "address": "a", "user": "u", "password": "pw" }] });
+        assert_eq!(fence_body(file.clone()), file);
+    }
+
+    #[tokio::test]
+    async fn node_fence_test_shows_the_power_of_each_method() {
+        let (client, seen) = fake_api(|_| {
+            json!({ "checked_by": "n2", "methods": [
+                { "kind": "ipmi", "power": "on" },
+                { "kind": "command", "power": "unknown", "error": "exit status: 2" },
+            ]})
+        })
+        .await;
+        let Cmd::Node {
+            cmd: NodeCmd::FenceTest { node },
+        } = Cli::try_parse_from(["oplctl", "node", "fence-test", "n1"])
+            .unwrap()
+            .cmd
+        else {
+            unreachable!()
+        };
+        let mut out = Vec::new();
+        node_fence_test(&client, &node, false, &mut out)
+            .await
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "checked by n2");
+        assert_eq!(
+            lines[2].split_whitespace().collect::<Vec<_>>(),
+            ["1", "ipmi", "on", "-"]
+        );
+        assert_eq!(
+            lines[3].split_whitespace().collect::<Vec<_>>(),
+            ["2", "command", "unknown", "exit", "status:", "2"]
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["POST /api/v1/nodes/n1/fence-test HTTP/1.1"]
         );
     }
 
