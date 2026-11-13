@@ -135,6 +135,7 @@ impl Harness {
         let m = self.nodes[&leader]
             .cluster
             .raft()
+            .unwrap()
             .metrics()
             .borrow()
             .clone();
@@ -328,7 +329,13 @@ async fn nothing_changes_without_a_majority() {
     // 오프라인(2초)이 지나도 리더가 아는 멤버십은 그대로다(두 단계 변경도 시작하지 않는다).
     let deadline = Instant::now() + Duration::from_secs(4);
     while Instant::now() < deadline {
-        let m = h.nodes[&leader].cluster.raft().metrics().borrow().clone();
+        let m = h.nodes[&leader]
+            .cluster
+            .raft()
+            .unwrap()
+            .metrics()
+            .borrow()
+            .clone();
         let membership = m.membership_config.membership();
         assert_eq!(membership.get_joint_config().len(), 1);
         assert_eq!(membership.voter_ids().collect::<BTreeSet<_>>(), before);
@@ -354,7 +361,13 @@ async fn an_offline_voter_without_a_replacement_stays_a_voter() {
     // 오프라인(2초)이 지나도 그대로다.
     let deadline = Instant::now() + Duration::from_secs(4);
     while Instant::now() < deadline {
-        let m = h.nodes[&leader].cluster.raft().metrics().borrow().clone();
+        let m = h.nodes[&leader]
+            .cluster
+            .raft()
+            .unwrap()
+            .metrics()
+            .borrow()
+            .clone();
         let membership = m.membership_config.membership();
         assert_eq!(membership.get_joint_config().len(), 1);
         assert_eq!(membership.voter_ids().collect::<BTreeSet<_>>(), before);
@@ -382,7 +395,13 @@ async fn a_new_leader_finishes_a_joint_change_left_by_the_old_one() {
     let followers: Vec<NodeId> = voters.iter().copied().filter(|v| *v != leader).collect();
     // 앞선 변경(내리기)이 모든 노드에 적용되기를 기다린다. 아니면 리더가 그 커밋을 모른 채 다음 변경을 거절한다.
     let config_index = |id: &NodeId| {
-        let m = h.nodes[id].cluster.raft().metrics().borrow().clone();
+        let m = h.nodes[id]
+            .cluster
+            .raft()
+            .unwrap()
+            .metrics()
+            .borrow()
+            .clone();
         let index = m.membership_config.log_id().map(|l| l.index);
         (index, m.last_applied.map(|l| l.index) >= index)
     };
@@ -393,14 +412,20 @@ async fn a_new_leader_finishes_a_joint_change_left_by_the_old_one() {
     .await;
     // 리더가 보낸 항목은 닿지만 답이 사라져 리더는 joint의 커밋을 모르고 두 번째 단계를 내지 않는다.
     h.router.lose_replies(leader);
-    let raft = h.nodes[&leader].cluster.raft().clone();
+    let raft = h.nodes[&leader].cluster.raft().unwrap().clone();
     let change = tokio::spawn(async move {
         let add = ChangeMembers::AddVoterIds(BTreeSet::from([learner]));
         let _ = raft.change_membership(add, true).await;
     });
     eventually("the followers have the joint config", || async {
         followers.iter().all(|f| {
-            let m = h.nodes[f].cluster.raft().metrics().borrow().clone();
+            let m = h.nodes[f]
+                .cluster
+                .raft()
+                .unwrap()
+                .metrics()
+                .borrow()
+                .clone();
             m.membership_config.log_id().map(|l| l.index) > before
                 && m.membership_config.membership().get_joint_config().len() == 2
         })
@@ -556,6 +581,7 @@ async fn a_learner_that_never_registered_does_not_stop_the_keeper() {
     h.nodes[&leader]
         .cluster
         .raft()
+        .unwrap()
         .add_learner(ghost, BasicNode::new("node-9"), false)
         .await
         .unwrap();

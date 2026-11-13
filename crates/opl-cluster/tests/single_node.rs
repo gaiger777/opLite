@@ -313,6 +313,7 @@ async fn in_memory_store_does_not_touch_the_data_dir() {
         .await
         .unwrap();
     c.raft()
+        .unwrap()
         .wait(Some(WAIT))
         .state(openraft::ServerState::Leader, "leader")
         .await

@@ -164,6 +164,7 @@ impl TestCluster {
     fn settled_leader(&self, ids: &[NodeId]) -> Option<NodeId> {
         let leader = self.nodes[&ids[0]]
             .raft()
+            .unwrap()
             .metrics()
             .borrow()
             .current_leader?;
@@ -171,11 +172,23 @@ impl TestCluster {
             return None;
         }
         for id in ids {
-            if self.nodes[id].raft().metrics().borrow().current_leader != Some(leader) {
+            if self.nodes[id]
+                .raft()
+                .unwrap()
+                .metrics()
+                .borrow()
+                .current_leader
+                != Some(leader)
+            {
                 return None;
             }
         }
-        let m = self.nodes[&leader].raft().metrics().borrow().clone();
+        let m = self.nodes[&leader]
+            .raft()
+            .unwrap()
+            .metrics()
+            .borrow()
+            .clone();
         let applied = m.last_applied.map(|l| l.index);
         (m.state == ServerState::Leader && applied.is_some() && applied >= m.last_log_index)
             .then_some(leader)
@@ -185,6 +198,7 @@ impl TestCluster {
     pub async fn wait_applied(&self, id: NodeId, index: u64) {
         self.nodes[&id]
             .raft()
+            .unwrap()
             .wait(Some(WAIT))
             .applied_index_at_least(Some(index), "wait_applied")
             .await

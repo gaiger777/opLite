@@ -288,7 +288,12 @@ async fn run(
 }
 
 async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) {
-    let m = cluster.raft().metrics().borrow().clone();
+    // Raft 구성원이 아니면 리더일 수 없다.
+    let Some(raft) = cluster.raft() else {
+        *state = State::default();
+        return;
+    };
+    let m = raft.metrics().borrow().clone();
     if m.state != ServerState::Leader {
         *state = State::default();
         return;
@@ -402,7 +407,7 @@ async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) 
         return;
     }
     state.unfinished = true;
-    match change_members(cluster.raft(), changes, config.change_timeout).await {
+    match change_members(&raft, changes, config.change_timeout).await {
         Outcome::Done => {
             state.unfinished = false;
             tracing::info!(limit, "{done}");
@@ -448,7 +453,10 @@ async fn finish_joint(
     // 아무도 더하지 않는 승격은 joint를 그 마지막(새) 구성 하나로 만든다(openraft 0.9.25 `Membership::change`의
     // `AddVoterIds`: 새 투표 멤버 = 마지막 구성 ∪ {}, `find_coherent`는 그것을 품은 joint에서 uniform을 준다).
     let finish = ChangeMembers::AddVoterIds(BTreeSet::new());
-    match change_members(cluster.raft(), finish, config.change_timeout).await {
+    let Some(raft) = cluster.raft() else {
+        return;
+    };
+    match change_members(&raft, finish, config.change_timeout).await {
         Outcome::Done => {
             state.unfinished = false;
             state.joint = None;
@@ -467,7 +475,10 @@ async fn finish_joint(
 
 /// 지금도 리더이고 멤버십 구성이 `m`(계획을 세운 지표)의 것 그대로다.
 fn same_config(cluster: &Cluster, m: &RaftMetrics<NodeId, BasicNode>) -> bool {
-    let now = cluster.raft().metrics().borrow().clone();
+    let Some(raft) = cluster.raft() else {
+        return false;
+    };
+    let now = raft.metrics().borrow().clone();
     now.state == ServerState::Leader
         && now.current_term == m.current_term
         && now.membership_config.log_id() == m.membership_config.log_id()

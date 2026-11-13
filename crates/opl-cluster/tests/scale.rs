@@ -266,7 +266,7 @@ impl Harness {
     /// `ids` 가운데 리더가 되어 자기 임기의 빈 항목까지 적용한 노드
     fn settled_leader(&self, ids: &[NodeId]) -> Option<NodeId> {
         ids.iter().copied().find(|id| {
-            let m = self.get(*id).raft().metrics().borrow().clone();
+            let m = self.get(*id).raft().unwrap().metrics().borrow().clone();
             let applied = m.last_applied.map(|l| l.index);
             m.state == ServerState::Leader && applied.is_some() && applied >= m.last_log_index
         })
@@ -480,7 +480,7 @@ async fn hundreds_of_nodes_do_not_slow_the_leader() {
     let elected = loop {
         let leading = rest
             .iter()
-            .any(|id| h.get(*id).raft().metrics().borrow().state == ServerState::Leader);
+            .any(|id| h.get(*id).raft().unwrap().metrics().borrow().state == ServerState::Leader);
         if leading {
             break t.elapsed();
         }

@@ -962,8 +962,10 @@ fn picks_voters(me: NodeId, members: &Members, nodes: Vec<Typed<NodeSpec>>) -> b
 /// 요청한다(상한을 넘으면 리더가 다시 내린다).
 async fn leader_picks_voters_after_join(cluster: &Cluster) -> bool {
     let id = cluster.id();
-    let applied = cluster
-        .raft()
+    let Some(raft) = cluster.raft() else {
+        return false;
+    };
+    let applied = raft
         .wait(Some(Duration::from_secs(10)))
         .metrics(
             |m| membership_applied(m, id),
@@ -1003,10 +1005,13 @@ pub fn remove_cluster_data(config: &Config) -> std::io::Result<()> {
 /// ([`leader_picks_voters`]) 위트니스가 아닌 노드는 요청하지 않고 learner로 남는다.
 async fn promote_until_voter(cluster: &Cluster, peers: &Peers, witness: bool) {
     let id = cluster.id();
+    // Raft 구성원이 아니면 올릴 것이 없다.
+    let Some(raft) = cluster.raft() else {
+        return;
+    };
     // 저장한 멤버십이 지표에 반영되고 저장소에 적용되기를 기다린다. 합류 직후 죽었으면 리더가 보내 줄 때까지
     // 모른다(적용해야 다른 노드의 Node 리소스로 리더가 투표 멤버를 고르는지 안다).
-    while cluster
-        .raft()
+    while raft
         .wait(Some(Duration::from_secs(10)))
         .metrics(
             |m| membership_applied(m, id),
@@ -1105,6 +1110,7 @@ async fn promote(cluster: &Cluster, peers: &Peers, via: Option<&str>) -> anyhow:
     }
     cluster
         .raft()
+        .context("this node is not a Raft member")?
         .wait(Some(Duration::from_secs(30)))
         .metrics(
             |m| {

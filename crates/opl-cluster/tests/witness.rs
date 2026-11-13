@@ -19,7 +19,7 @@ async fn witnesses_never_become_leader() {
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
         for id in [node(2), node(3)] {
-            let state = tc.get(id).raft().metrics().borrow().state;
+            let state = tc.get(id).raft().unwrap().metrics().borrow().state;
             assert_eq!(state, ServerState::Follower, "{id} stood for election");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -84,6 +84,7 @@ pub async fn wait_leader(cluster: &Cluster) {
     let id = cluster.id();
     cluster
         .raft()
+        .unwrap()
         .wait(Some(WAIT))
         .metrics(
             |m| m.state == ServerState::Leader && m.current_leader == Some(id),

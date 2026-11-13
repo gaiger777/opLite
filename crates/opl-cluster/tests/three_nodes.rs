@@ -76,7 +76,7 @@ async fn isolated_leader_cannot_commit_and_its_write_is_discarded() {
     let tc = TestCluster::start_with(3, raft_config(), Duration::from_secs(1)).await;
     let old = tc.leader().await;
 
-    let last_log_index = |id| tc.get(id).raft().metrics().borrow().last_log_index;
+    let last_log_index = |id| tc.get(id).raft().unwrap().metrics().borrow().last_log_index;
     let before = last_log_index(old);
 
     tc.router.isolate(old);
@@ -128,6 +128,7 @@ async fn new_node_catches_up_from_snapshot() {
     let purged = tc
         .get(leader)
         .raft()
+        .unwrap()
         .wait(Some(common::WAIT))
         .metrics(
             |m| m.purged.is_some_and(|p| p.index > 1),
@@ -152,7 +153,7 @@ async fn new_node_catches_up_from_snapshot() {
         assert!(tc.get(n4).get::<VolumeSpec>(*id).unwrap().is_some());
     }
     // 지워진 로그는 스냅샷으로만 받을 수 있다.
-    let snapshot = tc.get(n4).raft().metrics().borrow().snapshot;
+    let snapshot = tc.get(n4).raft().unwrap().metrics().borrow().snapshot;
     assert!(
         snapshot.is_some_and(|s| s.index >= purged.index),
         "learner snapshot {snapshot:?} does not cover purged {purged:?}"

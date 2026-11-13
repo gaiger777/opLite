@@ -122,6 +122,7 @@ impl Env {
             .unwrap();
         cluster
             .raft()
+            .unwrap()
             .wait(Some(WAIT))
             .metrics(|m| m.state == ServerState::Leader, "leader")
             .await

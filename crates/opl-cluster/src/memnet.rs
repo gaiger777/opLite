@@ -15,8 +15,8 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Raft};
 
-use crate::cluster::{Cluster, ClusterError};
-use crate::leader::{self, Forwarder, LeaderCtx};
+use crate::cluster::{Cluster, ClusterError, NodeHandle};
+use crate::leader::{self, Forwarder};
 use crate::types::{LeaderRequest, NodeId, TypeConfig};
 
 /// 전달받은 요청을 리더가 처리하는 최대 시간
@@ -24,7 +24,8 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct Routes {
-    nodes: HashMap<NodeId, LeaderCtx>,
+    /// 노드의 백엔드. RPC를 보낼 때마다 지금 백엔드를 읽는다.
+    nodes: HashMap<NodeId, NodeHandle>,
     isolated: HashSet<NodeId>,
     /// Raft RPC만 끊긴 노드. 리더 전달은 된다.
     raft_blocked: HashSet<NodeId>,
@@ -60,7 +61,7 @@ impl MemRouter {
             .lock()
             .unwrap()
             .nodes
-            .insert(id, cluster.leader_ctx());
+            .insert(id, cluster.node_handle());
     }
 
     pub fn unregister(&self, id: NodeId) {
@@ -90,7 +91,7 @@ impl MemRouter {
         routes.replies_lost.remove(&id);
     }
 
-    fn route(&self, from: NodeId, to: NodeId) -> Result<LeaderCtx, Unreachable> {
+    fn route(&self, from: NodeId, to: NodeId) -> Result<NodeHandle, Unreachable> {
         let routes = self.routes.lock().unwrap();
         if routes.isolated.contains(&from) || routes.isolated.contains(&to) {
             return Err(unreachable("isolated"));
@@ -108,12 +109,18 @@ impl MemRouter {
         from: NodeId,
         to: NodeId,
     ) -> Result<(Raft<TypeConfig>, bool), Unreachable> {
-        let ctx = self.route(from, to)?;
-        let routes = self.routes.lock().unwrap();
-        if routes.raft_blocked.contains(&from) || routes.raft_blocked.contains(&to) {
-            return Err(unreachable("raft blocked"));
-        }
-        Ok((ctx.raft, routes.replies_lost.contains(&from)))
+        let node = self.route(from, to)?;
+        let lost = {
+            let routes = self.routes.lock().unwrap();
+            if routes.raft_blocked.contains(&from) || routes.raft_blocked.contains(&to) {
+                return Err(unreachable("raft blocked"));
+            }
+            routes.replies_lost.contains(&from)
+        };
+        let raft = node
+            .raft()
+            .ok_or_else(|| unreachable("not a Raft member"))?;
+        Ok((raft, lost))
     }
 }
 
@@ -134,11 +141,11 @@ impl Forwarder for MemForwarder {
         _addr: &str,
         req: LeaderRequest,
     ) -> Result<u64, ClusterError> {
-        let ctx = self
+        let node = self
             .router
             .route(self.from, leader)
             .map_err(|e| ClusterError::Unreachable(e.to_string()))?;
-        leader::execute(&ctx, req, FORWARD_TIMEOUT).await
+        leader::execute(&node.leader_ctx(), req, FORWARD_TIMEOUT).await
     }
 }
 

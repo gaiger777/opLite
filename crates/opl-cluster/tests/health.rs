@@ -52,7 +52,7 @@ async fn an_isolated_leader_loses_quorum() {
     // 과반수의 답은 끊기기 전에 마지막으로 왔으므로 끊긴 뒤 `QUORUM_ACK_MAX`보다 일찍 잃지 않는다.
     assert!(isolated.elapsed() >= QUORUM_ACK_MAX - Duration::from_millis(500));
     assert_eq!(
-        tc.get(leader).raft().metrics().borrow().state,
+        tc.get(leader).raft().unwrap().metrics().borrow().state,
         ServerState::Leader
     );
 }

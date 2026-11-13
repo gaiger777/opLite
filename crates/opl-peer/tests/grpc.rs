@@ -282,12 +282,12 @@ async fn wait_leader(nodes: &[Node]) -> NodeId {
     loop {
         let leaders: Vec<_> = nodes
             .iter()
-            .map(|n| n.cluster.raft().metrics().borrow().current_leader)
+            .map(|n| n.cluster.raft().unwrap().metrics().borrow().current_leader)
             .collect();
         if let Some(Some(leader)) = leaders.first()
             && leaders.iter().all(|l| *l == Some(*leader))
             && let Some(node) = nodes.iter().find(|n| n.id() == *leader)
-            && node.cluster.raft().metrics().borrow().state == ServerState::Leader
+            && node.cluster.raft().unwrap().metrics().borrow().state == ServerState::Leader
         {
             return *leader;
         }
@@ -433,6 +433,7 @@ async fn a_new_node_joins_as_learner_then_voter() {
         .unwrap();
     new.cluster
         .raft()
+        .unwrap()
         .wait(Some(WAIT))
         .applied_index_at_least(Some(rev), "learner caught up")
         .await

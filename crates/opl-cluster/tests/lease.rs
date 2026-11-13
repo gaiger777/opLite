@@ -20,7 +20,7 @@ fn follower_of(tc: &TestCluster, leader: NodeId) -> NodeId {
 }
 
 fn term(tc: &TestCluster, id: NodeId) -> u64 {
-    tc.get(id).raft().metrics().borrow().current_term
+    tc.get(id).raft().unwrap().metrics().borrow().current_term
 }
 
 #[tokio::test]
@@ -92,7 +92,7 @@ async fn isolated_leader_cannot_renew_its_own_lease() {
 
     tc.router.isolate(leader);
     assert_eq!(
-        tc.get(leader).raft().metrics().borrow().state,
+        tc.get(leader).raft().unwrap().metrics().borrow().state,
         ServerState::Leader
     );
     assert!(tc.get(leader).renew_lease(SHORT).await.is_err());
@@ -189,14 +189,21 @@ async fn table_is_cleared_when_the_term_changes() {
     assert!(tc.get(a).leases().renewed.contains_key(&b));
 
     // 선거에 나설 수 있는 노드를 하나씩만 두어 리더를 a → b → a로 정해서 바꾼다.
-    tc.get(c).raft().runtime_config().elect(false);
+    tc.get(c).raft().unwrap().runtime_config().elect(false);
     tc.router.isolate(a);
     assert_eq!(tc.leader_among(&[b, c]).await, b);
-    tc.get(b).raft().runtime_config().elect(false);
+    tc.get(b).raft().unwrap().runtime_config().elect(false);
     tc.router.heal(a);
     // a가 b의 로그를 받아야 c가 a에게 투표한다.
     assert_eq!(tc.leader().await, b);
-    let last = tc.get(b).raft().metrics().borrow().last_log_index.unwrap();
+    let last = tc
+        .get(b)
+        .raft()
+        .unwrap()
+        .metrics()
+        .borrow()
+        .last_log_index
+        .unwrap();
     tc.wait_applied(a, last).await;
     tc.router.isolate(b);
     assert_eq!(tc.leader_among(&[a, c]).await, a);

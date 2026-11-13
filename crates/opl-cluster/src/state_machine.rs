@@ -17,7 +17,7 @@ use crate::store::{
     OBJECTS, SCHEMA_VERSION, StoreError, get_json, put_json,
 };
 use crate::types::{Command, NodeId, RawResource, Rejection, Response, TypeConfig};
-use crate::watch::{WatchEvent, WatchHub};
+use crate::watch::{FeedBatch, WatchEvent, WatchHub};
 use crate::writer::StoreWriter;
 
 type Membership = StoredMembership<NodeId, openraft::BasicNode>;
@@ -62,9 +62,11 @@ impl StateMachine {
     fn apply_entries(
         db: &Database,
         entries: Vec<Entry<TypeConfig>>,
-    ) -> Result<(Vec<Response>, Vec<WatchEvent>), StoreError> {
+    ) -> Result<(Vec<Response>, Option<FeedBatch>), StoreError> {
         let mut responses = Vec::with_capacity(entries.len());
         let mut events = Vec::new();
+        let mut applied = None;
+        let mut membership = None;
         let txn = db.begin_write()?;
         {
             let mut meta = txn.open_table(META)?;
@@ -75,11 +77,9 @@ impl StateMachine {
                 let result = match entry.payload {
                     EntryPayload::Blank => Ok(index),
                     EntryPayload::Membership(m) => {
-                        put_json(
-                            &mut meta,
-                            KEY_LAST_MEMBERSHIP,
-                            &Membership::new(Some(entry.log_id), m),
-                        )?;
+                        let m = Membership::new(Some(entry.log_id), m);
+                        put_json(&mut meta, KEY_LAST_MEMBERSHIP, &m)?;
+                        membership = Some(m);
                         Ok(index)
                     }
                     EntryPayload::Normal(cmd) => {
@@ -90,11 +90,18 @@ impl StateMachine {
                     }
                 };
                 put_json(&mut meta, KEY_LAST_APPLIED, &entry.log_id)?;
+                applied = Some(entry.log_id);
                 responses.push(Response(result));
             }
         }
         txn.commit()?;
-        Ok((responses, events))
+        // 이벤트가 없는 묶음도 적용 위치를 알린다.
+        let batch = applied.map(|applied| FeedBatch {
+            events,
+            applied,
+            membership,
+        });
+        Ok((responses, batch))
     }
 
     /// 한 읽기 트랜잭션에서 상태 전체를 떠서 스냅샷 본문을 만든다. 저장은 부른 쪽이 한다.
@@ -396,12 +403,14 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         I::IntoIter: OptionalSend,
     {
         let entries: Vec<_> = entries.into_iter().collect();
-        let (responses, events) = self
+        let (responses, batch) = self
             .writer
             .run(move |db| Self::apply_entries(db, entries))
             .await
             .map_err(|e| StorageIOError::write_state_machine(&e))?;
-        self.watch.publish(events);
+        if let Some(batch) = batch {
+            self.watch.publish(batch);
+        }
         Ok(responses)
     }
 

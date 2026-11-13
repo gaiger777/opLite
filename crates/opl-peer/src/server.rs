@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use openraft::Raft;
 use opl_cluster::Cluster;
-use opl_cluster::types::{LeaderRequest, NodeId};
+use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
 use opl_driver::{DriverError, Hypervisor, uefi_vars_path};
 use opl_types::audit::AuditQuery;
 use opl_types::metrics::MetricsQuery;
@@ -123,6 +124,13 @@ impl PeerService {
         }
     }
 
+    /// 이 노드의 Raft. Raft 구성원이 아니면 Raft RPC를 받지 않는다.
+    fn raft(&self) -> Result<Raft<TypeConfig>, Status> {
+        self.cluster
+            .raft()
+            .ok_or_else(|| Status::failed_precondition("this node is not a Raft member"))
+    }
+
     fn authorize<T>(&self, req: &Request<T>) -> Result<(), Status> {
         let certs = req
             .peer_certs()
@@ -150,7 +158,7 @@ impl Peer for PeerService {
         req: Request<AppendEntriesRequest>,
     ) -> Result<Response<AppendEntriesReply>, Status> {
         self.authorize(&req)?;
-        let reply = self.cluster.raft().append_entries(req.into_inner()).await;
+        let reply = self.raft()?.append_entries(req.into_inner()).await;
         Ok(Response::new(reply))
     }
 
@@ -159,13 +167,13 @@ impl Peer for PeerService {
         req: Request<InstallSnapshotRequest>,
     ) -> Result<Response<InstallSnapshotReply>, Status> {
         self.authorize(&req)?;
-        let reply = self.cluster.raft().install_snapshot(req.into_inner()).await;
+        let reply = self.raft()?.install_snapshot(req.into_inner()).await;
         Ok(Response::new(reply))
     }
 
     async fn vote(&self, req: Request<VoteRequest>) -> Result<Response<VoteReply>, Status> {
         self.authorize(&req)?;
-        let reply = self.cluster.raft().vote(req.into_inner()).await;
+        let reply = self.raft()?.vote(req.into_inner()).await;
         Ok(Response::new(reply))
     }
 

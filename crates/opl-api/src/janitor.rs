@@ -951,6 +951,7 @@ mod tests {
             .unwrap();
         cluster
             .raft()
+            .unwrap()
             .wait(Some(Duration::from_secs(10)))
             .metrics(|m| m.state == openraft::ServerState::Leader, "leader")
             .await

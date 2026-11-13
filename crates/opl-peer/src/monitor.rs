@@ -152,7 +152,9 @@ async fn tick(cluster: &Cluster, peers: &Arc<Peers>, config: &NodeMonitorConfig,
         .map(|n| n.name.as_str())
         .collect();
     let by_lease = old.is_empty();
-    let term = cluster.raft().metrics().borrow().current_term;
+    let term = cluster
+        .raft()
+        .map_or(0, |raft| raft.metrics().borrow().current_term);
     if !by_lease && seen.warned != Some(term) {
         seen.warned = Some(term);
         tracing::warn!(

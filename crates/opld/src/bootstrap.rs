@@ -355,6 +355,7 @@ pub(crate) mod tests {
         cluster.initialize(members).await.unwrap();
         cluster
             .raft()
+            .unwrap()
             .wait(Some(Duration::from_secs(10)))
             .metrics(|m| m.state == ServerState::Leader, "leader")
             .await

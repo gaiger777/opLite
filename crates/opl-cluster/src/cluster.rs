@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{BasicNode, Raft, RaftNetworkFactory};
 use opl_types::resource::{Kind, Resource, ResourceSpec};
-use redb::Database;
 use uuid::Uuid;
 
 use crate::health::{ApplyLag, QUORUM_ACK_MAX, RaftHealth};
@@ -15,7 +14,7 @@ use crate::lease::{ConfirmBatch, LeaseTable, Leases};
 use crate::store::{Store, StoreError, get_object, get_object_by_name, list_objects};
 use crate::types::{Command, LeaderRequest, NodeId, RawResource, Rejection, TypeConfig};
 use crate::vip::{VipLeases, VipTable};
-use crate::watch::{Watch, WatchError, WatchHub};
+use crate::watch::{Watch, WatchError};
 
 /// spec 타입 `S`의 리소스.
 pub type Typed<S> = Resource<S, <S as ResourceSpec>::Status>;
@@ -99,22 +98,56 @@ impl From<RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>> for ClusterErr
 /// 노드 하나의 클러스터 저장소. 쓰기는 Raft로 복제하고, 읽기는 로컬 상태 머신에서 한다.
 pub struct Cluster {
     id: NodeId,
-    raft: Raft<TypeConfig>,
-    db: Arc<Database>,
-    watch: Arc<WatchHub>,
+    store: Store,
+    node: NodeHandle,
     write_timeout: Duration,
     forwarder: Option<Arc<dyn Forwarder>>,
+    /// 헬스 체크가 보는 적용 지연
+    apply_lag: std::sync::Mutex<ApplyLag>,
+}
+
+/// 이 노드가 클러스터에 무엇으로 참여하는지
+#[derive(Clone)]
+pub(crate) enum Backend {
+    /// Raft 구성원(투표 멤버·learner). `confirm`은 두 리스 표가 함께 쓰는 리더 확인이다.
+    Member {
+        raft: Raft<TypeConfig>,
+        confirm: ConfirmBatch,
+    },
+}
+
+/// 노드의 지금 백엔드와 리더로서 받은 리스 표. memnet은 이것을 등록해 두고 RPC를 보낼 때마다 지금 백엔드를
+/// 읽는다(백엔드가 바뀌어도 맞는 곳으로 간다).
+#[derive(Clone)]
+pub(crate) struct NodeHandle {
+    backend: Arc<RwLock<Backend>>,
     /// 리더일 때 받은 HA 리스 갱신(메모리에만 둔다)
     leases: Arc<LeaseTable>,
     /// 리더일 때 받은 VIP 리스 갱신(메모리에만 둔다)
     vips: Arc<VipTable>,
-    /// 두 리스 표가 함께 쓰는 리더 확인
-    confirm: ConfirmBatch,
-    /// 헬스 체크가 보는 적용 지연
-    apply_lag: std::sync::Mutex<ApplyLag>,
-    /// 시험이 저장소 스레드를 붙잡아 느린 디스크를 흉내 낸다.
-    #[cfg(test)]
-    writer: crate::writer::StoreWriter,
+}
+
+impl NodeHandle {
+    fn backend(&self) -> Backend {
+        self.backend.read().unwrap().clone()
+    }
+
+    /// Raft 구성원이면 그 Raft
+    pub(crate) fn raft(&self) -> Option<Raft<TypeConfig>> {
+        match self.backend() {
+            Backend::Member { raft, .. } => Some(raft),
+        }
+    }
+
+    pub(crate) fn leader_ctx(&self) -> LeaderCtx {
+        let Backend::Member { raft, confirm } = self.backend();
+        LeaderCtx {
+            raft,
+            confirm,
+            leases: self.leases.clone(),
+            vips: self.vips.clone(),
+        }
+    }
 }
 
 /// 지금 알고 있는 멤버십. 값은 노드의 Raft 주소다.
@@ -171,17 +204,18 @@ impl Cluster {
         .map_err(|e| ClusterError::Raft(e.to_string()))?;
         Ok(Self {
             id: config.node_id,
-            confirm: ConfirmBatch::for_raft(raft.clone()),
-            raft,
-            db: store.db().clone(),
-            watch: store.watch_hub().clone(),
+            store,
+            node: NodeHandle {
+                backend: Arc::new(RwLock::new(Backend::Member {
+                    confirm: ConfirmBatch::for_raft(raft.clone()),
+                    raft,
+                })),
+                leases: Arc::default(),
+                vips: Arc::default(),
+            },
             write_timeout: config.write_timeout,
             forwarder: None,
-            leases: Arc::default(),
-            vips: Arc::default(),
             apply_lag: Default::default(),
-            #[cfg(test)]
-            writer: store.writer().clone(),
         })
     }
 
@@ -195,9 +229,34 @@ impl Cluster {
         self.id
     }
 
-    /// 네트워크 계층이 받은 RPC를 넘기고, 테스트가 메트릭을 볼 때 쓴다.
-    pub fn raft(&self) -> &Raft<TypeConfig> {
-        &self.raft
+    /// 네트워크 계층이 받은 RPC를 넘기고, 테스트가 메트릭을 볼 때 쓴다. Raft 구성원이 아니면 `None`이다.
+    pub fn raft(&self) -> Option<Raft<TypeConfig>> {
+        self.node.raft()
+    }
+
+    /// 이 노드의 Raft(구성원인 백엔드)
+    fn member(&self) -> Raft<TypeConfig> {
+        let Backend::Member { raft, .. } = self.node.backend();
+        raft
+    }
+
+    /// 이 노드의 저장소에 적용한 마지막 인덱스(revision). blank·멤버십·거부된 명령도 올린다.
+    pub fn revision(&self) -> u64 {
+        self.store.watch_hub().revision()
+    }
+
+    /// 이 노드의 저장소가 `revision`까지 적용하기를 기다린다. 적용한 인덱스를 돌려주고, `timeout` 안에
+    /// 안 되면 `Timeout`이다.
+    pub async fn wait_revision(
+        &self,
+        revision: u64,
+        timeout: Duration,
+    ) -> Result<u64, ClusterError> {
+        let mut rx = self.store.watch_hub().applied();
+        match tokio::time::timeout(timeout, rx.wait_for(|a| *a >= revision)).await {
+            Ok(Ok(applied)) => Ok(*applied),
+            Ok(Err(_)) | Err(_) => Err(ClusterError::Timeout),
+        }
     }
 
     /// 새 클러스터를 만든다. 첫 노드에서 한 번만 부른다.
@@ -205,7 +264,7 @@ impl Cluster {
         &self,
         members: BTreeMap<NodeId, BasicNode>,
     ) -> Result<(), ClusterError> {
-        self.raft
+        self.member()
             .initialize(members)
             .await
             .map_err(|e| ClusterError::Raft(e.to_string()))
@@ -215,9 +274,12 @@ impl Cluster {
     /// `write_timeout` 안에 끝나지 않으면 `Timeout`이다. 이때도 learner 추가는 나중에
     /// 커밋될 수 있고, 커밋되면 리더는 계속 따라잡게 한다.
     pub async fn add_learner(&self, id: NodeId, node: BasicNode) -> Result<(), ClusterError> {
-        tokio::time::timeout(self.write_timeout, self.raft.add_learner(id, node, true))
-            .await
-            .map_err(|_| ClusterError::Timeout)??;
+        tokio::time::timeout(
+            self.write_timeout,
+            self.member().add_learner(id, node, true),
+        )
+        .await
+        .map_err(|_| ClusterError::Timeout)??;
         Ok(())
     }
 
@@ -226,7 +288,7 @@ impl Cluster {
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<(), ClusterError> {
         tokio::time::timeout(
             self.write_timeout,
-            self.raft.change_membership(voters, true),
+            self.member().change_membership(voters, true),
         )
         .await
         .map_err(|_| ClusterError::Timeout)??;
@@ -362,11 +424,10 @@ impl Cluster {
                         }
                         Ok(Ok(index)) => {
                             let _ = self
-                                .raft
-                                .wait(Some(
+                                .wait_revision(
+                                    index,
                                     deadline.saturating_duration_since(tokio::time::Instant::now()),
-                                ))
-                                .applied_index_at_least(Some(index), "forwarded request")
+                                )
                                 .await;
                             Ok(index)
                         }
@@ -444,21 +505,18 @@ impl Cluster {
         present: bool,
         deadline: tokio::time::Instant,
     ) -> Result<u64, ClusterError> {
-        let db = self.db.clone();
-        let metrics = self
-            .raft
-            .wait(Some(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            ))
-            .metrics(
-                move |_| get_object(&db, kind, id).is_ok_and(|r| r.is_some() == present),
-                "retried request applied",
-            )
-            .await
-            .map_err(|_| ClusterError::Timeout)?;
-        match get_object(&self.db, kind, id)? {
+        let db = self.store.db();
+        let mut rx = self.store.watch_hub().applied();
+        tokio::time::timeout_at(
+            deadline,
+            rx.wait_for(|_| get_object(db, kind, id).is_ok_and(|r| r.is_some() == present)),
+        )
+        .await
+        .map_err(|_| ClusterError::Timeout)?
+        .map_err(|_| ClusterError::Timeout)?;
+        match get_object(db, kind, id)? {
             Some(r) if present => Ok(r.revision),
-            _ => Ok(metrics.last_applied.map_or(0, |l| l.index)),
+            _ => Ok(self.revision()),
         }
     }
 
@@ -469,12 +527,12 @@ impl Cluster {
     }
 
     pub(crate) fn leader_ctx(&self) -> LeaderCtx {
-        LeaderCtx {
-            raft: self.raft.clone(),
-            confirm: self.confirm.clone(),
-            leases: self.leases.clone(),
-            vips: self.vips.clone(),
-        }
+        self.node.leader_ctx()
+    }
+
+    /// memnet이 등록해 두는 이 노드의 백엔드와 리스 표
+    pub(crate) fn node_handle(&self) -> NodeHandle {
+        self.node.clone()
     }
 
     /// 이 노드의 HA 리스를 갱신한다. 리더가 과반수의 리더인지 확인하고 갱신을 적은 뒤, 리더가 돌려준
@@ -487,13 +545,11 @@ impl Cluster {
             .request_within(LeaderRequest::RenewLease { node: self.id }, timeout)
             .await?;
         // 전달 경로의 적용 기다림은 제한 시간이 지나도 성공으로 돌려주므로 여기서 다시 확인한다.
-        self.raft
-            .wait(Some(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            ))
-            .applied_index_at_least(Some(index), "lease renewal applied")
-            .await
-            .map_err(|_| ClusterError::Timeout)?;
+        self.wait_revision(
+            index,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await?;
         Ok(())
     }
 
@@ -515,52 +571,50 @@ impl Cluster {
                 timeout,
             )
             .await?;
-        self.raft
-            .wait(Some(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            ))
-            .applied_index_at_least(Some(index), "VIP renewal applied")
-            .await
-            .map_err(|_| ClusterError::Timeout)?;
+        self.wait_revision(
+            index,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await?;
         Ok(())
     }
 
     /// 리더가 지금 임기에 받은 VIP 리스 갱신. 리더에서만 뜻이 있다.
     pub fn vip_leases(&self) -> VipLeases {
-        self.vips.leases(&self.raft)
+        self.node.vips.leases(&self.member())
     }
 
     /// `node`의 VIP 갱신을 `end_vip_fence`까지 `Rejection::Fenced`로 거부한다. 리더가 그 노드의 VIP를
     /// 다른 노드로 옮기기 전에 표시하고, 표시한 뒤 `vip_leases`를 다시 읽어 여전히 끝났는지 확인한다.
     pub fn begin_vip_fence(&self, node: NodeId) {
-        self.vips.begin_fence(node);
+        self.node.vips.begin_fence(node);
     }
 
     /// VIP 펜싱 표시를 지운다. 옮기는 쓰기의 결과를 안 뒤에 부른다.
     pub fn end_vip_fence(&self, node: NodeId) {
-        self.vips.end_fence(node);
+        self.node.vips.end_fence(node);
     }
 
     /// 리더가 지금 임기에 받은 리스 갱신. 리더에서만 뜻이 있다(리더인지는 `read_barrier`로 확인한다).
     pub fn leases(&self) -> Leases {
-        self.leases.leases(&self.raft)
+        self.node.leases.leases(&self.member())
     }
 
     /// `node`를 펜싱 중으로 표시한다. `end_fence`까지 그 노드의 갱신은 `Rejection::Fenced`로
     /// 거부된다. 표시하기 직전에 받은 갱신이 있을 수 있으므로, 표시한 뒤 `leases`를 다시 읽어
     /// 그 노드의 리스가 여전히 끝났는지 확인하고 나서 복구한다.
     pub fn begin_fence(&self, node: NodeId) {
-        self.leases.begin_fence(node);
+        self.node.leases.begin_fence(node);
     }
 
     /// 펜싱 중 표시를 지운다. 복구 쓰기가 끝난(리더에 적용된) 뒤에 부른다.
     pub fn end_fence(&self, node: NodeId) {
-        self.leases.end_fence(node);
+        self.node.leases.end_fence(node);
     }
 
     /// 이 노드가 아는 멤버십과 리더
     pub fn members(&self) -> Members {
-        let m = self.raft.metrics().borrow().clone();
+        let m = self.member().metrics().borrow().clone();
         let membership = m.membership_config.membership();
         let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
         let mut out = Members {
@@ -581,7 +635,7 @@ impl Cluster {
 
     /// 헬스 체크가 보는 이 노드의 Raft 상태. 부를 때마다 적용 지연을 다시 잰다([`RaftHealth`]).
     pub fn health(&self) -> RaftHealth {
-        let m = self.raft.metrics().borrow().clone();
+        let m = self.member().metrics().borrow().clone();
         let apply_lag = self.apply_lag.lock().unwrap().observe(
             m.last_log_index,
             m.last_applied.map(|l| l.index),
@@ -604,21 +658,23 @@ impl Cluster {
     /// 로컬 상태 머신에서 읽는다. 팔로워에서는 최신 커밋이 아직 반영되지 않았을 수 있다.
     /// 최신 값이 필요하면 먼저 `read_barrier`를 부른다.
     pub fn get<S: ResourceSpec>(&self, id: Uuid) -> Result<Option<Typed<S>>, ClusterError> {
-        get_object(&self.db, S::KIND, id)?.map(from_raw).transpose()
+        get_object(self.store.db(), S::KIND, id)?
+            .map(from_raw)
+            .transpose()
     }
 
     pub fn get_by_name<S: ResourceSpec>(
         &self,
         name: &str,
     ) -> Result<Option<Typed<S>>, ClusterError> {
-        get_object_by_name(&self.db, S::KIND, name)?
+        get_object_by_name(self.store.db(), S::KIND, name)?
             .map(from_raw)
             .transpose()
     }
 
     /// 한 종류의 리소스 전체와 그 목록의 revision. `watch(revision)`으로 이어서 구독한다.
     pub fn list<S: ResourceSpec>(&self) -> Result<(u64, Vec<Typed<S>>), ClusterError> {
-        let (revision, raw) = list_objects(&self.db, S::KIND)?;
+        let (revision, raw) = list_objects(self.store.db(), S::KIND)?;
         let items = raw.into_iter().map(from_raw).collect::<Result<_, _>>()?;
         Ok((revision, items))
     }
@@ -627,7 +683,7 @@ impl Cluster {
     /// 기다린다(선형화 읽기). 리더에서만 쓸 수 있다. 팔로워와 learner에서는 리더 정보를 담은
     /// `NotLeader`를 돌려준다.
     pub async fn read_barrier(&self) -> Result<(), ClusterError> {
-        match self.raft.ensure_linearizable().await {
+        match self.member().ensure_linearizable().await {
             Ok(_) => Ok(()),
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                 Err(ClusterError::NotLeader {
@@ -641,11 +697,11 @@ impl Cluster {
 
     /// `since` 이후에 커밋된 변경을 구독한다.
     pub fn watch(&self, since: u64) -> Result<Watch, WatchError> {
-        self.watch.subscribe(since)
+        self.store.watch_hub().subscribe(since)
     }
 
     pub async fn shutdown(&self) -> Result<(), ClusterError> {
-        self.raft
+        self.member()
             .shutdown()
             .await
             .map_err(|e| ClusterError::Raft(e.to_string()))
@@ -655,7 +711,7 @@ impl Cluster {
     /// 저장소 스레드가 멈추면 openraft가 이 노드의 Raft를 멈춘다(`running_state`가 `Err`). `shutdown`으로
     /// 멈춰도 끝난다.
     pub fn stopped(&self) -> impl Future<Output = String> + Send + 'static {
-        let mut rx = self.raft.metrics();
+        let mut rx = self.member().metrics();
         async move {
             loop {
                 let state = rx.borrow_and_update().running_state.clone();
@@ -701,6 +757,7 @@ mod tests {
 
     use super::*;
     use crate::memnet::MemRouter;
+    use crate::watch::FeedItem;
 
     const SLOW_WRITE: Duration = Duration::from_secs(3);
 
@@ -742,22 +799,28 @@ mod tests {
         let first = &nodes[&NodeId::from(1)];
         first.initialize(members).await.unwrap();
         let leader = loop {
-            if let Some(l) = first.raft().metrics().borrow().current_leader
+            if let Some(l) = first.raft().unwrap().metrics().borrow().current_leader
                 && nodes.values().all(|n| n.members().leader == Some(l))
             {
                 break l;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        let term = nodes[&leader].raft().metrics().borrow().current_term;
+        let term = nodes[&leader]
+            .raft()
+            .unwrap()
+            .metrics()
+            .borrow()
+            .current_term;
         let slow = *nodes.keys().find(|id| **id != leader).unwrap();
         // openraft 0.9의 Raft 루프는 자기 로그 쓰기가 끝나기를 기다리므로 느린 노드의 루프는 3초 멈추고,
         // 그 뒤 선거에 나설 수 있다. 여기서 보는 것은 실행기와 다른 노드라 선거는 끈다.
-        nodes[&slow].raft().runtime_config().elect(false);
+        nodes[&slow].raft().unwrap().runtime_config().elect(false);
 
         // 느린 팔로워의 저장소 스레드를 3초 붙잡은 뒤 쓴다. 리더와 다른 팔로워로 커밋된다.
         nodes[&slow]
-            .writer
+            .store
+            .writer()
             .submit(|_| std::thread::sleep(SLOW_WRITE))
             .unwrap();
         let stalled = Instant::now();
@@ -780,11 +843,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(rounds >= 5, "{rounds}");
-        let m = nodes[&leader].raft().metrics().borrow().clone();
+        let m = nodes[&leader].raft().unwrap().metrics().borrow().clone();
         assert_eq!((m.current_leader, m.current_term), (Some(leader), term));
         // 느린 팔로워도 붙잡힌 뒤에 차례대로 따라온다.
         nodes[&slow]
             .raft()
+            .unwrap()
             .wait(Some(Duration::from_secs(10)))
             .applied_index_at_least(Some(index), "slow follower caught up")
             .await
@@ -819,12 +883,113 @@ mod tests {
                 .is_err()
         );
 
-        cluster.writer.submit(|_| panic!("store bug")).unwrap();
+        cluster
+            .store
+            .writer()
+            .submit(|_| panic!("store bug"))
+            .unwrap();
         assert!(cluster.create(&volume("b")).await.is_err());
         let why = tokio::time::timeout(Duration::from_secs(10), stopped)
             .await
             .unwrap();
         assert!(why.contains("the store thread has stopped"), "{why}");
         let _ = cluster.shutdown().await;
+    }
+
+    async fn open_node(router: &MemRouter, root: &std::path::Path, i: u64) -> Cluster {
+        let id = NodeId::from(i);
+        let cluster = Cluster::open(
+            ClusterConfig::new(id, root.join(i.to_string())),
+            router.network(id),
+        )
+        .await
+        .unwrap();
+        router.register(id, &cluster);
+        cluster
+    }
+
+    /// 적용 리비전은 이벤트가 없는 항목(초기 멤버십, 리더의 blank)에서도 오르고, 그 리비전을 기다리는 쪽이
+    /// 풀린다. 오지 않는 리비전은 제한 시간에 `Timeout`이다.
+    #[tokio::test]
+    async fn wait_revision_follows_entries_without_events_and_times_out() {
+        let root = tempfile::TempDir::new().unwrap();
+        let router = MemRouter::default();
+        let node = open_node(&router, root.path(), 1).await;
+        assert_eq!(node.revision(), 0);
+        node.initialize(BTreeMap::from([(node.id(), BasicNode::new("node-1"))]))
+            .await
+            .unwrap();
+        // 멤버십(0)과 blank(1)뿐이라 리소스 변경은 없다.
+        assert!(
+            node.wait_revision(1, Duration::from_secs(10))
+                .await
+                .unwrap()
+                >= 1
+        );
+        let (revision, volumes) = node.list::<VolumeSpec>().unwrap();
+        assert!(volumes.is_empty());
+        assert_eq!(revision, node.revision());
+
+        let next = node.revision() + 1;
+        let started = Instant::now();
+        assert!(matches!(
+            node.wait_revision(next, Duration::from_millis(200)).await,
+            Err(ClusterError::Timeout)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+
+        // 기다리는 중에 적용되면 풀린다.
+        let v = volume("a");
+        let (waited, written) = tokio::join!(
+            node.wait_revision(next, Duration::from_secs(5)),
+            node.create(&v)
+        );
+        assert_eq!(waited.unwrap(), written.unwrap());
+        node.shutdown().await.unwrap();
+    }
+
+    /// 피드는 멤버십 항목처럼 이벤트가 없는 항목도 적용 표시(와 멤버십)로 싣는다. learner의 적용 리비전도
+    /// 이벤트 없이 리더를 따라온다.
+    #[tokio::test]
+    async fn feed_marks_membership_entries_without_events() {
+        let root = tempfile::TempDir::new().unwrap();
+        let router = MemRouter::default();
+        let leader = open_node(&router, root.path(), 1).await;
+        leader
+            .initialize(BTreeMap::from([(leader.id(), BasicNode::new("node-1"))]))
+            .await
+            .unwrap();
+        leader
+            .wait_revision(1, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let learner = open_node(&router, root.path(), 2).await;
+        let mut feed = leader.store.watch_hub().feed(leader.revision()).unwrap();
+        leader
+            .add_learner(learner.id(), BasicNode::new("node-2"))
+            .await
+            .unwrap();
+
+        let FeedItem::Batch(batch) = feed.next().await.unwrap() else {
+            panic!("expected a batch");
+        };
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.applied.index, leader.revision());
+        let membership = batch.membership.as_ref().expect("a membership entry");
+        assert!(
+            membership
+                .membership()
+                .learner_ids()
+                .any(|id| id == learner.id())
+        );
+        assert_eq!(
+            learner
+                .wait_revision(leader.revision(), Duration::from_secs(10))
+                .await
+                .unwrap(),
+            leader.revision()
+        );
+        learner.shutdown().await.unwrap();
+        leader.shutdown().await.unwrap();
     }
 }
