@@ -10,7 +10,7 @@ use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{PowerState, VmHa, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{GuestWatch, PowerState, VmHa, VmPhase, VmSpec, VmStatus};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -779,6 +779,97 @@ async fn revert_checks_the_current_ha_policy_not_the_snapshot_one() {
     let mut spec = snap.spec.clone();
     spec.vm_spec.ha = Some(VmHa {
         group: Some("gone".into()),
+        ..Default::default()
+    });
+    env.cluster
+        .update_spec(snap.id, Some(snap.revision), snap.labels.clone(), &spec)
+        .await
+        .unwrap();
+    mark_ready(&env, snap.id).await;
+    finish_tasks(&env).await;
+    let (status, body) = admin
+        .post("/vms/web/snapshots/s1/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+/// 메모리 스냅샷은 게스트 감시(QGA 채널 장치)의 있음/없음이 스냅샷 때와 같아야 되돌린다(409 `snapshot_mismatch`).
+#[tokio::test]
+async fn a_memory_snapshot_reverts_only_with_the_same_guest_watch() {
+    let env = env().await;
+    let admin = env.admin().await;
+    pool(&env, vec![]).await;
+    volume(&env, "root", ImageFormat::Qcow2).await;
+    let vm = vm_with_disks(&admin, "web", &["root"]).await;
+    admin
+        .post("/vms/web/snapshots", json!({ "name": "s1" }))
+        .await;
+    let snap = snapshot_of(&env, vm, "s1").await;
+    mark_ready(&env, snap.id).await;
+    finish_tasks(&env).await;
+    let watched = Some(VmHa {
+        guest_watch: Some(GuestWatch { timeout_secs: 60 }),
+        ..Default::default()
+    });
+    let set_snapshot = |memory: bool, ha: Option<VmHa>| {
+        let env = &env;
+        async move {
+            let snap = snapshot_of(env, vm, "s1").await;
+            let mut spec = snap.spec.clone();
+            spec.memory = memory;
+            spec.vm_spec.ha = ha;
+            env.cluster
+                .update_spec(snap.id, Some(snap.revision), snap.labels.clone(), &spec)
+                .await
+                .unwrap();
+        }
+    };
+    let revert = || admin.post("/vms/web/snapshots/s1/revert", Value::Null);
+    let expect_mismatch = |(status, body): (StatusCode, Value), then: &str| {
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "snapshot_mismatch", "{body}");
+        let wanted = format!("set guest_watch to match the snapshot ({then}) before reverting");
+        assert!(
+            body["message"].as_str().unwrap().contains(&wanted),
+            "{body}"
+        );
+    };
+
+    // 스냅샷 때는 감시가 있었고 지금은 없다.
+    set_snapshot(true, watched.clone()).await;
+    expect_mismatch(revert().await, "on");
+    // 지금은 감시가 있고 스냅샷 때는 없었다.
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    let mut spec = current.spec.clone();
+    spec.ha = watched.clone();
+    env.cluster
+        .update_spec(vm, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    set_snapshot(true, None).await;
+    expect_mismatch(revert().await, "off");
+    // 같으면 되돌린다.
+    set_snapshot(true, watched).await;
+    let (status, body) = revert().await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+/// 메모리가 없는 스냅샷은 게스트 감시가 달라도 되돌린다(다시 켤 때 지금 정책으로 장치를 단다).
+#[tokio::test]
+async fn a_disk_only_snapshot_reverts_with_another_guest_watch() {
+    let env = env().await;
+    let admin = env.admin().await;
+    pool(&env, vec![]).await;
+    volume(&env, "root", ImageFormat::Qcow2).await;
+    let vm = vm_with_disks(&admin, "web", &["root"]).await;
+    admin
+        .post("/vms/web/snapshots", json!({ "name": "s1" }))
+        .await;
+    let snap = snapshot_of(&env, vm, "s1").await;
+    let mut spec = snap.spec.clone();
+    assert!(!spec.memory);
+    spec.vm_spec.ha = Some(VmHa {
+        guest_watch: Some(GuestWatch { timeout_secs: 60 }),
         ..Default::default()
     });
     env.cluster

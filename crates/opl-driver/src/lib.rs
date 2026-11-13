@@ -21,7 +21,7 @@ pub use migration::{
     IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
     MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir, tcp_uri, write_migration_tls,
 };
-pub use mock::{IncrementalCall, MockHypervisor};
+pub use mock::{GuestAnswer, IncrementalCall, MockHypervisor};
 pub use net::{HostNet, IpRoute, Overlay, OverlayChanges, Tap};
 pub use opl_types::storage::SourceFormat;
 pub use qemu::{QemuConfig, QemuHypervisor, uefi_vars_path, vm_state_dir};

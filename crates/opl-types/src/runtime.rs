@@ -17,6 +17,10 @@ pub struct VmRuntimeSpec {
     pub machine: MachineType,
     pub disks: Vec<RuntimeDisk>,
     pub nics: Vec<RuntimeNic>,
+    /// 게스트 에이전트(QGA) 채널을 단다(`ha.guest_watch`가 있는 VM만). 장치가 바뀌므로 받는 쪽도 같은 값이어야
+    /// 마이그레이션된다.
+    #[serde(default)]
+    pub guest_agent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

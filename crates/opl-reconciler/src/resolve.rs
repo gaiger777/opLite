@@ -360,5 +360,11 @@ async fn resolve(
         machine: vm.spec.machine,
         disks,
         nics,
+        // `ha.guest_watch`가 있는 VM만 게스트 에이전트 채널을 단다(API는 멈춘 VM에서만 켜고 끈다).
+        guest_agent: vm
+            .spec
+            .ha
+            .as_ref()
+            .is_some_and(|ha| ha.guest_watch.is_some()),
     })
 }

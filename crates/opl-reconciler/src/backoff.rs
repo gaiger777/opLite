@@ -48,6 +48,20 @@ impl FailureTracker {
         Next::RetryAfter(rule.initial.saturating_mul(factor).min(rule.max))
     }
 
+    /// [`FailureTracker::record_up_to`]와 같되 `window` 안의 첫 실패는 기다리지 않는다(HA VM의 같은 노드 빠른
+    /// 재시작). 둘째부터는 같은 백오프다.
+    pub(crate) fn record_first_free(
+        &mut self,
+        now: Instant,
+        rule: &RestartBackoff,
+        max_failures: usize,
+    ) -> Next {
+        match self.record_up_to(now, rule, max_failures) {
+            Next::RetryAfter(_) if self.failures.len() == 1 => Next::RetryAfter(Duration::ZERO),
+            next => next,
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         self.failures.clear();
     }
@@ -101,6 +115,23 @@ mod tests {
             t.record_up_to(now + Duration::from_secs(600), &rule(), 2),
             Next::RetryAfter(Duration::from_secs(1))
         );
+    }
+
+    #[test]
+    fn the_first_failure_in_the_window_retries_at_once() {
+        let mut t = FailureTracker::default();
+        let now = Instant::now();
+        let next = |t: &mut FailureTracker, at| t.record_first_free(at, &rule(), 3);
+        assert_eq!(next(&mut t, now), Next::RetryAfter(Duration::ZERO));
+        // 둘째는 지금 백오프(`initial * 2`)다.
+        assert_eq!(next(&mut t, now), Next::RetryAfter(Duration::from_secs(2)));
+        assert_eq!(next(&mut t, now), Next::GiveUp);
+        // 포기 뒤나 창이 지난 뒤의 첫 실패는 다시 곧바로다.
+        assert_eq!(next(&mut t, now), Next::RetryAfter(Duration::ZERO));
+        let later = now + Duration::from_secs(600);
+        assert_eq!(next(&mut t, later), Next::RetryAfter(Duration::ZERO));
+        // 한도 1이면 첫 실패에 포기한다.
+        assert_eq!(t.record_first_free(later, &rule(), 1), Next::GiveUp);
     }
 
     #[test]

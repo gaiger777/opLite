@@ -43,6 +43,7 @@ fn spec(id: Uuid, disk: PathBuf) -> VmRuntimeSpec {
             model: NicModel::Virtio,
             backend: NicBackend::User,
         }],
+        guest_agent: false,
     }
 }
 

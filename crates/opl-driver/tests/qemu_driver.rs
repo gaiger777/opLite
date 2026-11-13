@@ -42,6 +42,7 @@ fn spec() -> VmRuntimeSpec {
         machine: Arch::native().machine(),
         disks: vec![],
         nics: vec![],
+        guest_agent: false,
     }
 }
 
@@ -98,6 +99,36 @@ async fn start_inspect_and_force_stop() {
             .join("uefi-vars.fd")
             .exists()
     );
+}
+
+/// 게스트 감시를 켠 VM은 게스트 에이전트(QGA) 채널을 달고 뜬다(QEMU가 장치 인자를 받는다). 게스트 OS가 없어
+/// `guest_ping`은 3초 기다린 뒤 false다. 채널 없이 띄운 VM은 오류다.
+#[tokio::test]
+async fn guest_agent_channel_without_a_guest_does_not_answer() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let plain = spec();
+    let watched = VmRuntimeSpec {
+        guest_agent: true,
+        ..spec()
+    };
+    hv.start(&plain, None).await.unwrap();
+    hv.start(&watched, None).await.unwrap();
+
+    assert!(hv.guest_ping(plain.id).await.is_err());
+    let asked = std::time::Instant::now();
+    assert!(!hv.guest_ping(watched.id).await.unwrap());
+    assert!(
+        asked.elapsed() >= Duration::from_secs(2),
+        "{:?}",
+        asked.elapsed()
+    );
+    // 다시 불러도 같다(앞 연결이 남긴 것이 없다).
+    assert!(!hv.guest_ping(watched.id).await.unwrap());
+
+    hv.stop(plain.id, StopMode::Force).await.unwrap();
+    hv.stop(watched.id, StopMode::Force).await.unwrap();
+    assert_eq!(hv.guest_ping(watched.id).await.ok(), None);
 }
 
 #[tokio::test]

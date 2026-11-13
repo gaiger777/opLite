@@ -98,6 +98,7 @@ fn spec(bridge: &str) -> VmRuntimeSpec {
                 mtu: None,
             },
         }],
+        guest_agent: false,
     }
 }
 

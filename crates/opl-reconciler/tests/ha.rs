@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use common::{Env, vm};
 use opl_cluster::ClusterError;
 use opl_driver::{
-    Capacity, DriverError, Hypervisor, RuntimeStatus, SourceFormat, Storage, VolumeInfo,
-    VolumeSource,
+    Capacity, DriverError, EventKind, GuestAnswer, Hypervisor, RuntimeStatus, SourceFormat,
+    Storage, VolumeInfo, VolumeSource,
 };
 use opl_reconciler::ha::{LeaseRenewer, Watchdog, WatchdogOpener};
 use opl_reconciler::{FirmwareError, FirmwareFetcher, HaConfig, HaGuard, ReconcilerConfig};
@@ -24,8 +24,8 @@ use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::vm::{
-    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, Vm, VmHa, VmHaStatus, VmPhase,
-    VmSpec, VmStatus,
+    DiskBus, DiskSpec, GuestWatch, MigrationStatus, PowerState, RestartPolicy, Vm, VmHa,
+    VmHaStatus, VmPhase, VmSpec, VmStatus,
 };
 use uuid::Uuid;
 
@@ -849,6 +849,7 @@ async fn received_ha_vm_is_continued_only_with_the_lease() {
         machine: vm.spec.machine,
         disks: vec![],
         nics: vec![],
+        guest_agent: false,
     };
     env.hv
         .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])
@@ -1149,5 +1150,203 @@ async fn restarting_clears_the_relocation_request_and_the_ha_error() {
             relocated_from: Some(from),
             ..Default::default()
         })
+    );
+}
+
+/// 같은 노드 빠른 재시작: HA VM의 창 안 첫 크래시는 백오프(여기서는 3초)를 기다리지 않고 곧바로 다시 켠다.
+/// 둘째부터는 지금 백오프다.
+#[tokio::test]
+async fn first_crash_of_an_ha_vm_restarts_at_once() {
+    let (env, _ha) = start_full(
+        true,
+        Duration::from_secs(60),
+        |_| {},
+        |c| {
+            c.restart.initial = Duration::from_secs(3);
+            c.restart.max = Duration::from_secs(3);
+        },
+    )
+    .await;
+    let mut vm = ha_vm("web", env.node);
+    vm.spec.ha = Some(VmHa {
+        max_restart: 2,
+        ..Default::default()
+    });
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    let crashed = std::time::Instant::now();
+    crash_and_restart(&env, vm.id).await;
+    assert!(
+        crashed.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        crashed.elapsed()
+    );
+    assert_eq!(launches_of(&env, vm.id), 2);
+
+    env.hv.crash(vm.id);
+    env.wait(vm.id, "backoff", |v| {
+        error_is(v, "VM crashed; retrying in 3s")
+    })
+    .await;
+    assert_eq!(launches_of(&env, vm.id), 2);
+}
+
+/// 게스트 감시(`timeout_secs`)를 켠 HA VM
+fn watched_vm(name: &str, node: Uuid, timeout_secs: u32) -> Vm {
+    let mut vm = ha_vm(name, node);
+    vm.spec.ha = Some(VmHa {
+        guest_watch: Some(GuestWatch { timeout_secs }),
+        ..Default::default()
+    });
+    vm
+}
+
+/// `id`의 게스트 에이전트를 몇 번 더 부를 때까지 기다린다.
+async fn wait_pings(env: &Env, id: Uuid, more: usize) {
+    let want = env.hv.guest_pings(id) + more;
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while env.hv.guest_pings(id) < want {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "guest agent not pinged"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 게스트 감시가 없는 VM의 에이전트는 부르지 않는다. 감시하는 VM이라도 이 QEMU에서 답한 적이 없는 에이전트
+/// (게스트 OS·에이전트 없음)는 시간이 넘어도 다시 켜지 않는다.
+#[tokio::test]
+async fn guest_agents_that_never_answered_are_not_watched() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let plain = ha_vm("plain", env.node);
+    let watched = watched_vm("watched", env.node, 1);
+    env.create(&plain).await;
+    env.create(&watched).await;
+    env.wait(plain.id, "running", running).await;
+    env.wait(watched.id, "running", running).await;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(env.hv.guest_pings(plain.id), 0);
+    assert!(env.hv.guest_pings(watched.id) > 5);
+    assert_eq!(launches_of(&env, watched.id), 1);
+    assert!(running(&env.get(watched.id)));
+}
+
+/// 답하던 에이전트가 `timeout_secs` 넘게 답하지 않으면 강제로 끄고 다시 켜며 크래시 한 번으로 센다. 새 QEMU의
+/// 에이전트는 다시 답할 때까지 감시하지 않고, 답한 뒤 또 멈추면 `max_restart`(1)를 넘어 옮겨 달라고 한다.
+#[tokio::test]
+async fn hung_guest_is_restarted_and_counted_as_a_crash() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let vm = watched_vm("web", env.node, 1);
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Ok);
+    env.create(&vm).await;
+    let first = env.wait(vm.id, "running", running).await.status.pid;
+    wait_pings(&env, vm.id, 2).await;
+
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Hang);
+    let hung = std::time::Instant::now();
+    env.wait(vm.id, "restarted", |v| running(v) && v.status.pid != first)
+        .await;
+    assert!(
+        hung.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        hung.elapsed()
+    );
+    assert_eq!(launches_of(&env, vm.id), 2);
+
+    // 새 QEMU의 에이전트는 아직 답하지 않았다.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(launches_of(&env, vm.id), 2);
+
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Ok);
+    wait_pings(&env, vm.id, 2).await;
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Hang);
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(got.status.phase, VmPhase::Failed);
+    assert_eq!(
+        got.status.last_error.as_deref(),
+        Some("VM crashed 2 times on this node; asking HA to move it")
+    );
+    assert_eq!(launches_of(&env, vm.id), 2);
+    assert_eq!(env.pid(vm.id).await, None);
+}
+
+/// 일시 정지한 동안은 감시 시간을 세지 않는다: 이어서 실행한 때부터 다시 센다.
+#[tokio::test]
+async fn paused_time_does_not_count_against_the_guest() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let vm = watched_vm("web", env.node, 1);
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Ok);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    wait_pings(&env, vm.id, 2).await;
+
+    env.hv.pause(vm.id).await.unwrap();
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Hang);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(launches_of(&env, vm.id), 1);
+
+    let resumed = std::time::Instant::now();
+    env.hv.resume(vm.id).await.unwrap();
+    env.wait(vm.id, "restarted", |_| launches_of(&env, vm.id) == 2)
+        .await;
+    assert!(
+        resumed.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        resumed.elapsed()
+    );
+}
+
+/// 게스트가 다시 부팅하면(QMP `RESET`, 종료 시작의 `SHUTDOWN`) 에이전트가 다시 답할 때까지 감시하지 않는다. 다시
+/// 답한 뒤에는 멈추면 다시 켠다.
+#[tokio::test]
+async fn a_rebooting_guest_is_not_watched_until_its_agent_answers_again() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let vm = watched_vm("web", env.node, 1);
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Ok);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    wait_pings(&env, vm.id, 2).await;
+
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Hang);
+    env.hv.guest_event(vm.id, EventKind::Reset);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(launches_of(&env, vm.id), 1);
+    assert!(running(&env.get(vm.id)));
+
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Ok);
+    wait_pings(&env, vm.id, 2).await;
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Hang);
+    env.wait(vm.id, "restarted", |_| launches_of(&env, vm.id) == 2)
+        .await;
+}
+
+/// 일시 정지·재개 이벤트(QMP `STOP`·`RESUME`)마다 답이 없는 시간을 다시 센다(확인 사이에 멈췄다 이어 간 것을
+/// 놓쳐도).
+#[tokio::test]
+async fn pause_events_restart_the_guest_watch_clock() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let vm = watched_vm("web", env.node, 1);
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Ok);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    wait_pings(&env, vm.id, 2).await;
+
+    env.hv.set_guest_agent(vm.id, GuestAnswer::Hang);
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        env.hv.guest_event(vm.id, EventKind::PauseChanged);
+    }
+    assert_eq!(launches_of(&env, vm.id), 1);
+    let last = std::time::Instant::now();
+    env.wait(vm.id, "restarted", |_| launches_of(&env, vm.id) == 2)
+        .await;
+    assert!(
+        last.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        last.elapsed()
     );
 }

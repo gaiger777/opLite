@@ -3,6 +3,7 @@
 pub mod cmdline;
 pub mod host;
 pub mod paths;
+pub mod qga;
 pub mod qmp;
 
 pub use cmdline::{CmdlineError, build_cmdline, build_incoming_cmdline};

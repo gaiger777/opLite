@@ -46,6 +46,8 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// SHUTDOWN 뒤 연결이 끊겼을 때 런타임 디렉터리를 지우려고 프로세스 종료를 잠깐 기다리는 한도.
 /// QEMU는 소켓을 닫고 곧 끝나지만, 플러시가 길면 디렉터리는 다음 launch/new()에 맡기고 종료를 바로 알린다.
 const SHUTDOWN_EXIT_WAIT: Duration = Duration::from_secs(1);
+/// 게스트 에이전트의 `guest-ping`을 기다리는 시간
+const GUEST_PING_TIMEOUT: Duration = Duration::from_secs(3);
 /// 내부 스냅샷(저장·불러오기·삭제) 하나를 기다리는 한도. 메모리 스냅샷은 메모리 크기만큼 걸린다.
 /// Task 한도(600초)보다 짧아야 Task가 먼저 끊기지 않고 이 오류(작업이 남아 있을 수 있음)를 받는다.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(540);
@@ -227,6 +229,8 @@ impl QemuHypervisor {
         let qmp = QmpClient::connect(&paths.qmp_socket).await?;
         let pid = read_pid(&paths.pidfile)?;
         let rx = qmp.subscribe();
+        // 게스트 에이전트 채널을 단 VM(소켓이 있다)만 게스트 이벤트(재부팅·일시 정지)를 알린다.
+        let guest_events = paths.qga_socket.exists();
         // 잠금을 쥔 채로 모니터를 띄우고 등록한다. 모니터가 곧바로 연결 끊김을 보더라도
         // 등록이 끝난 뒤에야 해제할 수 있으므로 죽은 핸들이 남지 않는다.
         // 같은 이유로 Started도 이 인스턴스의 Stopped/Crashed보다 항상 먼저 나간다.
@@ -234,6 +238,7 @@ impl QemuHypervisor {
         let monitor = tokio::spawn(monitor(
             id,
             rx,
+            guest_events,
             Arc::downgrade(&self.vms),
             self.events.clone(),
             paths.clone(),
@@ -270,7 +275,7 @@ impl QemuHypervisor {
         }
         // 호출자가 pidfile 잠금이 풀린 것(= QEMU 없음)을 확인했으므로 남은 소켓은 지워도 된다.
         // 이전 인스턴스가 남긴 pidfile은 새 QEMU가 잠그고 다시 쓴다.
-        for sock in [&paths.qmp_socket, &paths.vnc_socket] {
+        for sock in [&paths.qmp_socket, &paths.vnc_socket, &paths.qga_socket] {
             remove_if_exists(sock)?;
         }
 
@@ -978,6 +983,18 @@ impl Hypervisor for QemuHypervisor {
                 rd_operations: sum.rd_operations + s.rd_operations,
                 wr_operations: sum.wr_operations + s.wr_operations,
             }))
+    }
+
+    async fn guest_ping(&self, id: Uuid) -> Result<bool, DriverError> {
+        let handle = self.running_handle(id)?;
+        let sock = handle.paths.qga_socket.clone();
+        drop(handle);
+        if !sock.exists() {
+            return Err(DriverError::InvalidSpec(format!(
+                "VM {id} has no guest agent channel"
+            )));
+        }
+        Ok(opl_qemu::qga::ping(&sock, GUEST_PING_TIMEOUT).await?)
     }
 
     async fn start_incoming(
@@ -1768,9 +1785,11 @@ async fn job(
 }
 
 /// QMP 연결이 끊길 때까지 이벤트를 지켜보다가, 종료 종류를 판정해 알리고 런타임 파일을 정리한다.
+/// `guest_events`면 그 사이 게스트의 재부팅·종료 시작(`Reset`)과 일시 정지·재개(`PauseChanged`)도 알린다.
 async fn monitor(
     id: Uuid,
     mut rx: broadcast::Receiver<QmpEvent>,
+    guest_events: bool,
     // Weak: 맵이 핸들을, 핸들이 이 태스크를 소유하므로 강한 참조를 쥐면 순환이 생겨
     // 드라이버를 내려도 QMP 연결이 닫히지 않는다.
     vms: Weak<Mutex<HashMap<Uuid, Arc<VmHandle>>>>,
@@ -1779,11 +1798,19 @@ async fn monitor(
     net: Option<Arc<dyn HostNet>>,
 ) {
     let mut guest_initiated = None;
+    let guest = |kind| {
+        if guest_events {
+            let _ = events.send(HypervisorEvent { id, kind });
+        }
+    };
     loop {
         match rx.recv().await {
             Ok(ev) if ev.event == "SHUTDOWN" => {
                 guest_initiated = Some(ev.data["guest"].as_bool().unwrap_or(false));
+                guest(EventKind::Reset);
             }
+            Ok(ev) if ev.event == "RESET" => guest(EventKind::Reset),
+            Ok(ev) if ev.event == "STOP" || ev.event == "RESUME" => guest(EventKind::PauseChanged),
             Ok(_) | Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => break,
         }
@@ -2028,6 +2055,7 @@ mod tests {
             machine: MachineType::Virt,
             disks: vec![],
             nics: vec![],
+            guest_agent: false,
         }
     }
 
@@ -4037,6 +4065,46 @@ time.sleep(60)
         // 살아 있는 VM이므로 파일을 지우거나 종료로 알리면 안 된다. 이후 start()가 다시 붙는다.
         assert!(dir.join("qemu.pid").exists());
         assert!(rx.try_recv().is_err());
+    }
+
+    /// 게스트 에이전트 채널을 단 VM(`qga.sock`이 있다)만 게스트의 재부팅(QMP `RESET`)을 알린다.
+    #[tokio::test]
+    async fn guest_resets_are_reported_only_for_vms_with_a_guest_agent() {
+        for agent in [true, false] {
+            let tmp = short_tempdir();
+            let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+            let vm = spec();
+            let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+            let _qemu = hold_pidfile(&dir).await;
+            let fake = fake_qmp(&dir, "running").await;
+            if agent {
+                std::fs::write(dir.join("qga.sock"), "").unwrap();
+            }
+            let hv = QemuHypervisor::new(cfg).await.unwrap();
+            let mut rx = hv.subscribe();
+
+            let reset = serde_json::json!({
+                "event": "RESET",
+                "data": { "guest": true, "reason": "guest-reset" },
+                "timestamp": { "seconds": 0, "microseconds": 0 }
+            });
+            fake.hangup.send(Some(reset)).unwrap();
+            // 연결이 끊긴 뒤에도 QEMU는 살아 있으므로 등록만 풀고 종료로 알리지 않는다.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while hv.handle(vm.id).is_some() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("VM was not unregistered");
+            let got = rx.try_recv().ok();
+            let want = agent.then_some(HypervisorEvent {
+                id: vm.id,
+                kind: EventKind::Reset,
+            });
+            assert_eq!(got, want, "agent: {agent}");
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

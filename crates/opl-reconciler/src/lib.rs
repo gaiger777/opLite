@@ -12,7 +12,7 @@ mod reconciler;
 pub mod resolve;
 mod worker;
 
-pub use config::{ReconcilerConfig, RestartBackoff};
+pub use config::{GUEST_PING_INTERVAL, ReconcilerConfig, RestartBackoff};
 pub use firewall::FirewallGate;
 pub use firmware::{FirmwareError, FirmwareFetcher};
 pub use ha::{HaConfig, HaGuard};

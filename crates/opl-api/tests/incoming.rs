@@ -441,6 +441,7 @@ async fn sweep_stops_a_source_qemu_committed_elsewhere() {
         machine: vm.spec.machine,
         disks: vec![],
         nics: vec![],
+        guest_agent: false,
     };
     s.env.hv.start(&spec, None).await.unwrap();
     s.env.hv.migrate(vm.id, &target, &opts).await.unwrap();
@@ -486,6 +487,7 @@ async fn sweep_stops_a_source_qemu_of_a_deleted_vm() {
         machine: vm.spec.machine,
         disks: vec![],
         nics: vec![],
+        guest_agent: false,
     };
     s.env.hv.start(&spec, None).await.unwrap();
     s.env.hv.migrate(spec.id, &target, &opts).await.unwrap();

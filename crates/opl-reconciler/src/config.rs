@@ -9,6 +9,9 @@ use crate::firmware::FirmwareFetcher;
 use crate::ha::HaGuard;
 use uuid::Uuid;
 
+/// 게스트 감시가 게스트 에이전트를 부르는 기본 간격
+pub const GUEST_PING_INTERVAL: Duration = Duration::from_secs(5);
+
 /// reconciler 설정. 기본값은 설계 문서 5.3절을 따른다.
 #[derive(Clone)]
 pub struct ReconcilerConfig {
@@ -26,6 +29,8 @@ pub struct ReconcilerConfig {
     /// 과반수가 없어 status를 못 쓰는 동안에도 이 간격으로 다시 쓴다.
     pub retry_interval: Duration,
     pub restart: RestartBackoff,
+    /// 게스트 감시(`ha.guest_watch`)가 게스트 에이전트에 `guest-ping`을 보내는 간격
+    pub guest_ping_interval: Duration,
     /// 다른 노드에 있는 UEFI 변수 파일을 받아 온다. 없으면 받지 않고 이 노드의 파일로 켠다.
     pub firmware: Option<Arc<dyn FirmwareFetcher>>,
     /// 이 노드의 HA 리스와 watchdog. None이면 펜싱이 꺼져 있어 HA VM을 켜지 않는다.
@@ -59,6 +64,7 @@ impl ReconcilerConfig {
                 max_failures: 5,
                 window: Duration::from_secs(600),
             },
+            guest_ping_interval: GUEST_PING_INTERVAL,
             firmware: None,
             ha: None,
             firewall: None,

@@ -12,6 +12,8 @@ pub struct RuntimePaths {
     pub dir: PathBuf,
     pub qmp_socket: PathBuf,
     pub vnc_socket: PathBuf,
+    /// 게스트 에이전트(QGA) 채널. `guest_agent`인 VM만 QEMU가 만든다.
+    pub qga_socket: PathBuf,
     pub pidfile: PathBuf,
     pub uefi_vars: PathBuf,
 }
@@ -29,11 +31,12 @@ impl RuntimePaths {
         let paths = Self {
             qmp_socket: dir.join("qmp.sock"),
             vnc_socket: dir.join("vnc.sock"),
+            qga_socket: dir.join("qga.sock"),
             pidfile: dir.join("qemu.pid"),
             uefi_vars: dir.join("uefi-vars.fd"),
             dir,
         };
-        for sock in [&paths.qmp_socket, &paths.vnc_socket] {
+        for sock in [&paths.qmp_socket, &paths.vnc_socket, &paths.qga_socket] {
             let len = sock.as_os_str().len();
             if len > MAX_SOCKET_PATH {
                 return Err(PathError {
@@ -58,6 +61,7 @@ mod tests {
         assert_eq!(p.dir, Path::new(dir));
         assert_eq!(p.qmp_socket, Path::new(dir).join("qmp.sock"));
         assert_eq!(p.vnc_socket, Path::new(dir).join("vnc.sock"));
+        assert_eq!(p.qga_socket, Path::new(dir).join("qga.sock"));
         assert_eq!(p.pidfile, Path::new(dir).join("qemu.pid"));
         assert_eq!(p.uefi_vars, Path::new(dir).join("uefi-vars.fd"));
     }
@@ -67,5 +71,18 @@ mod tests {
         let long = Path::new("/").join("x".repeat(60));
         let err = RuntimePaths::new(&long, Uuid::nil()).unwrap_err();
         assert!(err.len > MAX_SOCKET_PATH);
+    }
+
+    /// 소켓 이름 가운데 가장 긴 것도 검사한다: `qga.sock`까지 들어가는 길이만 받는다.
+    #[test]
+    fn checks_every_socket_path() {
+        // `{run}/vm/{uuid}/` 뒤에 소켓 이름(8바이트)이 붙는다.
+        let fixed = "/vm/".len() + 36 + "/qga.sock".len();
+        let fits = Path::new("/").join("x".repeat(MAX_SOCKET_PATH - fixed - 1));
+        let p = RuntimePaths::new(&fits, Uuid::nil()).unwrap();
+        assert_eq!(p.qga_socket.as_os_str().len(), MAX_SOCKET_PATH);
+        let over = Path::new("/").join("x".repeat(MAX_SOCKET_PATH - fixed));
+        let err = RuntimePaths::new(&over, Uuid::nil()).unwrap_err();
+        assert_eq!(err.len, MAX_SOCKET_PATH + 1);
     }
 }

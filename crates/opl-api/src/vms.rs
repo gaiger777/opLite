@@ -434,6 +434,18 @@ pub async fn update_vm(
                 ),
             ));
         }
+        // 게스트 에이전트 채널은 `guest_watch`가 있는 VM에만 다는 장치다. 실행 중에 켜거나 끄면 도는 QEMU와
+        // 어긋나 라이브 마이그레이션(비우기·종료·되돌아가기·옮기기)이 장치 차이로 실패한다. 시간만 바꾸기는 된다.
+        let watched = |s: &VmSpec| s.ha.as_ref().is_some_and(|ha| ha.guest_watch.is_some());
+        if watched(&spec) != watched(&current.spec) && !is_stopped(&current) {
+            return Err(ApiError::conflict(
+                "vm_running",
+                format!(
+                    "cannot turn guest_watch on or off for VM {:?} while it is running; guest_watch can be turned on or off only while the VM is stopped",
+                    current.name
+                ),
+            ));
+        }
         match state
             .cluster
             .update_spec(

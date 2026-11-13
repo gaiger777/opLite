@@ -537,6 +537,7 @@ pub async fn revert_snapshot(
     let snapshot = find_snapshot(&state, &vm, &name)?;
     check_ready(&snapshot)?;
     check_zfs_latest(&state, &vm, &snapshot)?;
+    check_guest_watch(&vm, &snapshot)?;
     // 되돌린 스펙을 VM 수정처럼 검증한다. 노드는 지금 것을 유지하고, 시작은 Task가 한다. HA는 Task가
     // 지금 것을 지키므로(스냅샷의 HA는 쓰지 않는다) 지금 것으로 검증한다.
     let mut reverted = vm.clone();
@@ -550,6 +551,27 @@ pub async fn revert_snapshot(
     };
     let task = create_task(&state.cluster, op, vm.id, vm_node(&state, &vm)).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 메모리 스냅샷은 찍을 때의 장치로만 이어 켤 수 있다. 되돌리기는 지금 HA 정책을 지키므로 게스트 감시
+/// (`ha.guest_watch`, QGA 채널 장치)의 있음/없음이 스냅샷 때와 다르면 `snapshot-load`가 실패한다(409
+/// `snapshot_mismatch`).
+fn check_guest_watch(vm: &Vm, snapshot: &Snapshot) -> Result<(), ApiError> {
+    let watched = |s: &VmSpec| s.ha.as_ref().is_some_and(|ha| ha.guest_watch.is_some());
+    let then = watched(&snapshot.spec.vm_spec);
+    if !snapshot.spec.memory || then == watched(&vm.spec) {
+        return Ok(());
+    }
+    Err(ApiError::conflict(
+        "snapshot_mismatch",
+        format!(
+            "snapshot {:?} of VM {:?} holds the memory state with guest_watch {}; set guest_watch to match the snapshot ({}) before reverting",
+            snapshot.spec.name,
+            vm.name,
+            if then { "on" } else { "off" },
+            if then { "on" } else { "off" },
+        ),
+    ))
 }
 
 /// 스냅샷을 지울 Task를 돌려준다(202). 자식은 지운 스냅샷의 부모로 옮겨 붙는다.

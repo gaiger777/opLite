@@ -550,6 +550,7 @@ mod tests {
                 machine: MachineType::Virt,
                 disks: vec![],
                 nics: vec![],
+                guest_agent: false,
             },
             None,
         )

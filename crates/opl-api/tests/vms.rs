@@ -1172,6 +1172,94 @@ async fn ha_vms_start_only_within_the_ha_reserve() {
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
 }
 
+/// 게스트 감시(QGA 장치)는 멈춘 VM에서만 켜고 끈다(실행 중에 바꾸면 라이브 마이그레이션이 장치 차이로 실패한다).
+/// 시간만 바꾸기는 실행 중에도 된다.
+#[tokio::test]
+async fn guest_watch_is_turned_on_or_off_only_while_stopped() {
+    struct Renewed;
+    #[async_trait]
+    impl LeaseRenewer for Renewed {
+        async fn renew_lease(&self, _timeout: Duration) -> Result<(), ClusterError> {
+            Ok(())
+        }
+    }
+    let env = Env::start_with(
+        |c| {
+            c.ha = Some(HaGuard::spawn(
+                Arc::new(Renewed),
+                HaConfig {
+                    fence_after: Duration::from_secs(30),
+                    renew_interval: Duration::from_secs(1),
+                    watchdog: None,
+                },
+            ))
+        },
+        |_| async {},
+    )
+    .await;
+    let admin = env.admin().await;
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.ha = Some(NodeHa {
+        fencing: Fencing::Process,
+        recover_after_secs: 12,
+        fence_after_secs: Some(10),
+    });
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let mut req = vm_request("web");
+    req["spec"]["ha"] = json!({ "guest_watch": { "timeout_secs": 60 } });
+    let (code, body) = admin.post("/vms", req).await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["ha"]["guest_watch"]["timeout_secs"] = json!(120);
+    let (code, body) = admin
+        .put("/vms/web", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    // 감시를 끄는 것도, HA를 통째로 끄는 것도 장치를 바꾼다.
+    for ha in [json!(true), json!(false)] {
+        spec["ha"] = ha;
+        let (code, body) = admin
+            .put("/vms/web", json!({ "spec": spec.clone() }), None)
+            .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "vm_running");
+        assert_eq!(
+            body["message"],
+            "cannot turn guest_watch on or off for VM \"web\" while it is running; guest_watch can be turned on or off only while the VM is stopped"
+        );
+    }
+    let task = admin.act("web", "stop").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["ha"] = json!(true);
+    let (code, body) = admin
+        .put("/vms/web", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    // 켜진 VM에 감시를 켜는 것도 막는다.
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["ha"] = json!({ "guest_watch": {} });
+    let (code, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_running");
+}
+
 #[tokio::test]
 async fn update_checks_if_match_revision() {
     let env = Env::start().await;

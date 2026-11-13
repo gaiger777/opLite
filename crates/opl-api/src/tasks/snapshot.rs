@@ -1007,6 +1007,7 @@ mod tests {
             machine: MachineType::Q35,
             disks: vec![],
             nics: vec![],
+            guest_agent: false,
         };
         hv.start(&vm, None).await.unwrap();
         hv.pause(id).await.unwrap();

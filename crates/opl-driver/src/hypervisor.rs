@@ -51,6 +51,18 @@ pub enum EventKind {
     },
     /// 종료 이벤트 없이 프로세스가 사라졌다.
     Crashed,
+    /// 게스트가 다시 부팅했거나(QMP `RESET`) 꺼지기 시작했다(QEMU가 살아 있는 채 받은 `SHUTDOWN`). 게스트 에이전트가
+    /// 한동안 답하지 않는다. 게스트 에이전트 채널을 단 VM만 알린다.
+    Reset,
+    /// VM이 멈췄거나(QMP `STOP`) 다시 돌기 시작했다(`RESUME`). 게스트 에이전트 채널을 단 VM만 알린다.
+    PauseChanged,
+}
+
+impl EventKind {
+    /// QEMU가 끝나지 않는 이벤트(게스트 감시만 쓴다)
+    pub fn is_guest(self) -> bool {
+        matches!(self, EventKind::Reset | EventKind::PauseChanged)
+    }
 }
 
 /// 실행 중인 VM의 디스크 노드 하나와 그 dirty bitmap들
@@ -181,6 +193,10 @@ pub trait Hypervisor: Send + Sync {
     /// 실행 중인 VM의 모든 디스크(`disk{i}`)를 합한 I/O 누적 카운터. 지표 측정기가 직전 값과의
     /// 차이로 비율을 낸다.
     async fn disk_stats(&self, id: Uuid) -> Result<DiskCounters, DriverError>;
+
+    /// 실행 중인 VM의 게스트 에이전트에 `guest-ping`을 보낸다(QGA 채널, 3초). 답하면 true, 답이 없으면
+    /// false(게스트 에이전트가 없거나 멈춤). 채널 없이 띄운 VM(`guest_agent`가 아님)이면 오류다.
+    async fn guest_ping(&self, id: Uuid) -> Result<bool, DriverError>;
 
     /// 라이브 마이그레이션을 받을 QEMU를 `-incoming defer`로 띄우고, 받는 중 표시(마이그레이션 Task
     /// `task`)를 남기고, TLS

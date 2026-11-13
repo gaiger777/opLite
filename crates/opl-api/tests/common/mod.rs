@@ -25,7 +25,9 @@ use opl_driver::{
     Capacity, DirStorage, DriverError, Hypervisor, MockHypervisor, Storage, VolumeInfo,
     VolumeSource,
 };
-use opl_reconciler::{Reconciler, ReconcilerConfig, ReconcilerHandle, RestartBackoff};
+use opl_reconciler::{
+    GUEST_PING_INTERVAL, Reconciler, ReconcilerConfig, ReconcilerHandle, RestartBackoff,
+};
 use opl_types::auth::{Role, UserSpec};
 use opl_types::cluster::ClusterSpec;
 use opl_types::node::{FEATURES, NodeSpec, NodeStatus, PoolState};
@@ -76,6 +78,7 @@ pub fn reconciler_config(node: Uuid) -> ReconcilerConfig {
             max_failures: 3,
             window: Duration::from_secs(60),
         },
+        guest_ping_interval: GUEST_PING_INTERVAL,
         firmware: None,
         ha: None,
         firewall: None,

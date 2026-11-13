@@ -147,6 +147,22 @@ pub fn build_cmdline(
         a.opt("-device", dev);
     }
 
+    // 게스트 에이전트 채널은 NIC 뒤에 단다(앞 장치들의 PCI 주소가 그대로다). 감시하는 VM만 단다.
+    if spec.guest_agent {
+        a.opt(
+            "-chardev",
+            format!(
+                "socket,id=qga0,path={},server=on,wait=off",
+                esc_path(&paths.qga_socket)
+            ),
+        );
+        a.opt("-device", "virtio-serial-pci,id=qgaser".to_string());
+        a.opt(
+            "-device",
+            "virtserialport,bus=qgaser.0,chardev=qga0,name=org.qemu.guest_agent.0".to_string(),
+        );
+    }
+
     a.opt("-vnc", format!("unix:{}", esc_path(&paths.vnc_socket)));
     a.opt(
         "-qmp",
@@ -302,6 +318,7 @@ mod tests {
                     backend: NicBackend::User,
                 },
             ],
+            guest_agent: false,
         }
     }
 
@@ -373,6 +390,36 @@ mod tests {
             &"virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56,id=nic0,host_mtu=1450".to_string()
         ));
         assert!(args.contains(&"e1000e,netdev=net1,mac=52:54:00:12:34:57,id=nic1".to_string()));
+    }
+
+    /// 게스트 감시를 켠 VM만 QGA 채널(소켓 서버, virtio-serial 포트)을 단다. 받는 쪽도 같다. aarch64(virt)도
+    /// PCI 장치를 쓴다.
+    #[test]
+    fn guest_agent_adds_a_qga_channel() {
+        let qga = [
+            "-chardev",
+            "socket,id=qga0,path=/run/opl/vm/00000000-0000-0000-0000-000000000000/qga.sock,server=on,wait=off",
+            "-device",
+            "virtio-serial-pci,id=qgaser",
+            "-device",
+            "virtserialport,bus=qgaser.0,chardev=qga0,name=org.qemu.guest_agent.0",
+        ];
+        for (spec, host) in [(x86_spec(), x86_host()), (mac_spec(), mac_host())] {
+            let without = build_cmdline(&spec, &host, &paths()).unwrap();
+            assert!(!without.iter().any(|a| a.contains("qga")), "{without:?}");
+            let watched = VmRuntimeSpec {
+                guest_agent: true,
+                ..spec
+            };
+            let with = build_cmdline(&watched, &host, &paths()).unwrap();
+            let at = with.iter().position(|a| a == "-chardev").unwrap();
+            assert_eq!(with[at..at + qga.len()], qga);
+            // 앞 장치(디스크·NIC)의 순서는 그대로이고 채널만 끼어든다.
+            assert_eq!(with[..at], without[..at]);
+            assert_eq!(with[at + qga.len()..], without[at..]);
+            let incoming = build_incoming_cmdline(&watched, &host, &paths()).unwrap();
+            assert_eq!(incoming[..with.len()], with[..]);
+        }
     }
 
     #[test]

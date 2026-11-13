@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
-use opl_driver::{DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
+use opl_driver::{ActualState, DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
 use opl_types::node::{HA_PLACEMENT, NodeSpec};
 use opl_types::runtime::VmRuntimeSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
@@ -86,6 +86,19 @@ enum ContinueError {
     Changed(Option<Box<Vm>>),
 }
 
+/// 게스트 감시(`ha.guest_watch`)의 상태. 이 QEMU(`pid`)에서 에이전트가 한 번이라도 답한 뒤에야 센다.
+struct GuestAgent {
+    /// 감시하는 QEMU. 바뀌면(새로 띄움) 처음부터 다시 본다.
+    pid: u32,
+    /// 이 QEMU에서 에이전트가 한 번이라도 답했다. 게스트가 다시 부팅하면(`Reset`) 지운다.
+    answered_once: bool,
+    /// 답이 없는 시간을 세는 기준(마지막 답). None이면 다음 확인부터 센다(일시 정지·재개 이벤트·마이그레이션 보류
+    /// 뒤).
+    seen_at: Option<Instant>,
+    /// 다음으로 에이전트를 부를 때
+    next_ping: Instant,
+}
+
 #[derive(Debug, thiserror::Error)]
 enum StepError {
     #[error(transparent)]
@@ -148,6 +161,8 @@ pub(crate) struct Worker {
     ha_running: bool,
     /// 남은 마이그레이션의 취소가 잇달아 실패한 수([`Worker::clear_migration`])
     cancel_failures: u32,
+    /// 게스트 감시 상태([`Worker::guest_hung`]). 감시하지 않거나 QEMU가 없으면 None.
+    agent: Option<GuestAgent>,
     wake_at: Option<Instant>,
 }
 
@@ -182,6 +197,7 @@ impl Worker {
             fenced: false,
             ha_running: false,
             cancel_failures: 0,
+            agent: None,
             wake_at: None,
         }
     }
@@ -247,8 +263,14 @@ impl Worker {
         // 마이그레이션 Task가 status와 QEMU를 다룬다. 끝나면(`end_migration`) 다시 깨운다. 그동안
         // QEMU가 끝났으면(크래시 등) 보류가 풀린 뒤 그 이벤트대로 다룬다(재시작 정책).
         if self.held.lock().unwrap().contains(&self.id) {
-            if let Trigger::Event(kind) = trigger {
+            if let Trigger::Event(kind) = trigger
+                && !self.guest_event(kind)
+            {
                 self.held_event = Some(kind);
+            }
+            // 마이그레이션 Task가 다루는 동안은 게스트 감시 시간을 세지 않는다.
+            if let Some(agent) = &mut self.agent {
+                agent.seen_at = None;
             }
             return Ok(());
         }
@@ -299,7 +321,25 @@ impl Worker {
         self.write_power_off(vm).await
     }
 
+    /// 게스트 이벤트를 게스트 감시에 반영한다(게스트 이벤트였으면 true). 재부팅·종료 시작(`Reset`)이면 에이전트가
+    /// 다시 답할 때까지 감시하지 않고, 일시 정지·재개(`PauseChanged`)면 답이 없는 시간을 다음 확인부터 다시 센다.
+    fn guest_event(&mut self, kind: EventKind) -> bool {
+        if !kind.is_guest() {
+            return false;
+        }
+        if let Some(agent) = &mut self.agent {
+            if kind == EventKind::Reset {
+                agent.answered_once = false;
+            }
+            agent.seen_at = None;
+        }
+        true
+    }
+
     fn on_event(&mut self, vm: &Vm, kind: EventKind) {
+        if self.guest_event(kind) {
+            return;
+        }
         let now = Instant::now();
         if kind != EventKind::Started {
             self.was_running = false;
@@ -307,7 +347,7 @@ impl Worker {
             self.stop_requested = None;
         }
         let requested = match kind {
-            EventKind::Started => return,
+            EventKind::Started | EventKind::Reset | EventKind::PauseChanged => return,
             EventKind::Stopped { .. } | EventKind::Crashed => self
                 .stopped_by_us
                 .take()
@@ -333,11 +373,11 @@ impl Worker {
             } => {}
             // HA VM(`started`)은 재시작 정책과 관계없이 다시 켜고, 횟수를 넘으면 옮겨 달라고 한다.
             EventKind::Crashed => match (self.ha_restarts(vm), vm.spec.restart) {
-                (Some(max), _) => self.record_crash(max),
+                (Some(max), _) => self.record_crash(max, "VM crashed"),
                 (None, RestartPolicy::Never) => self.power_off = Some(Some("VM crashed".into())),
                 (None, RestartPolicy::OnFailure) => self.record_failure("VM crashed".into()),
             },
-            EventKind::Started => {}
+            EventKind::Started | EventKind::Reset | EventKind::PauseChanged => {}
         }
     }
 
@@ -448,13 +488,18 @@ impl Worker {
         ha_placement_everywhere(&self.cluster).then_some(ha.max_restart)
     }
 
-    /// HA VM의 크래시를 센다. `window` 안에서 `max`번 넘게 크래시하면 다시 켜지 않고 옮겨 달라고 한다.
-    fn record_crash(&mut self, max: u8) {
+    /// HA VM의 크래시를 센다. `window` 안의 첫 크래시는 기다리지 않고 곧바로 다시 켠다(같은 노드 빠른 재시작),
+    /// 둘째부터는 백오프다. `max`번 넘게 크래시하면 다시 켜지 않고 옮겨 달라고 한다.
+    fn record_crash(&mut self, max: u8, reason: &str) {
         let now = Instant::now();
         let limit = usize::from(max) + 1;
-        match self.failures.record_up_to(now, &self.config.restart, limit) {
+        match self
+            .failures
+            .record_first_free(now, &self.config.restart, limit)
+        {
+            Next::RetryAfter(delay) if delay.is_zero() => self.backoff = None,
             Next::RetryAfter(delay) => {
-                self.backoff = Some((now + delay, format!("VM crashed; retrying in {delay:?}")));
+                self.backoff = Some((now + delay, format!("{reason}; retrying in {delay:?}")));
             }
             Next::GiveUp => {
                 tracing::warn!(vm = %self.id, crashes = limit, "HA VM crashed too often on this node; asking HA to move it");
@@ -464,6 +509,78 @@ impl Worker {
                 ));
             }
         }
+    }
+
+    /// 게스트 감시: `started` HA VM의 정책에 `guest_watch`가 있으면 도는 VM의 게스트 에이전트를
+    /// `guest_ping_interval`마다 부른다. 이 QEMU에서 한 번 답한 에이전트가 정책의 시간 넘게 답하지 않으면 true다
+    /// (다시 켤 때). VM이 실행 중(`running`)이 아닌 동안(일시 정지·스냅샷·마이그레이션)은 세지 않는다. 채널이 없는
+    /// VM(실행 중에 감시를 켬)은 부르기가 실패하므로 감시하지 않는다.
+    async fn guest_hung(&mut self, vm: &Vm, state: &ActualState) -> bool {
+        let Some(limit) = guest_watch(vm) else {
+            self.agent = None;
+            return false;
+        };
+        let now = Instant::now();
+        let mut agent = self
+            .agent
+            .take()
+            .filter(|a| a.pid == state.pid)
+            .unwrap_or(GuestAgent {
+                pid: state.pid,
+                answered_once: false,
+                seen_at: None,
+                next_ping: now,
+            });
+        let mut hung = false;
+        if state.status != RuntimeStatus::Running {
+            agent.seen_at = None;
+        }
+        if now >= agent.next_ping {
+            agent.next_ping = now + self.config.guest_ping_interval;
+            if state.status == RuntimeStatus::Running {
+                let answered = match self.hv.guest_ping(self.id).await {
+                    Ok(answered) => answered,
+                    Err(e) => {
+                        tracing::debug!(vm = %self.id, error = %e, "cannot ping the guest agent");
+                        false
+                    }
+                };
+                let now = Instant::now();
+                if answered {
+                    agent.answered_once = true;
+                    agent.seen_at = Some(now);
+                } else if agent.answered_once {
+                    let since = *agent.seen_at.get_or_insert(now);
+                    hung = now.duration_since(since) >= limit;
+                }
+            }
+        }
+        self.wake(agent.next_ping);
+        self.agent = Some(agent);
+        hung
+    }
+
+    /// 게스트가 멈췄다: 강제로 끄고 크래시 한 번으로 센다(창 안 첫 번째면 곧바로 다시 켜고, `max_restart`를
+    /// 넘으면 다른 노드로 옮겨 달라고 한다). 우리가 요청한 종료로 표시해 뒤따르는 종료 이벤트는 세지 않는다.
+    async fn restart_hung(&mut self, vm: &Vm, mut status: VmStatus) -> Result<VmStatus, StepError> {
+        let secs = guest_watch(vm).unwrap_or_default().as_secs();
+        tracing::warn!(vm = %self.id, secs, "guest agent stopped answering; restarting the VM");
+        let reason = format!("guest agent did not answer for {secs}s");
+        self.stopped_by_us = Some(Instant::now());
+        self.stop_requested = None;
+        self.force_requested = false;
+        self.hv.stop(self.id, StopMode::Force).await?;
+        self.was_running = false;
+        self.agent = None;
+        match self.ha_restarts(vm) {
+            Some(max) => self.record_crash(max, &reason),
+            None => self.record_failure(reason.clone()),
+        }
+        status.phase = VmPhase::Starting;
+        status.pid = None;
+        status.last_error = Some(format!("{reason}; restarting"));
+        self.wake(Instant::now());
+        Ok(status)
     }
 
     /// 원하는 상태를 향해 한 걸음 움직이고, 기록해야 할 status를 돌려준다. 그 전에 status를 먼저
@@ -491,6 +608,9 @@ impl Worker {
             actual = self.hv.inspect(self.id).await?;
         }
         self.report_running(vm, actual.is_some());
+        if actual.is_none() {
+            self.agent = None;
+        }
         let mut status = vm.status.clone();
         status.node = Some(self.config.node);
         let now = Instant::now();
@@ -574,6 +694,9 @@ impl Worker {
                 }
                 if vm.spec.ha_active() && status.last_error.is_none() {
                     self.attach_ha(&mut status);
+                }
+                if self.guest_hung(vm, &state).await {
+                    return self.restart_hung(vm, status).await;
                 }
             }
             // 방금까지 돌던 VM이 사라졌다. 왜 꺼졌는지(게스트 종료, 크래시) 이벤트로 안 뒤에 움직인다.
@@ -1187,6 +1310,17 @@ fn merge_ha(
         ha.error = mine.error.clone();
     }
     (ha != VmHaStatus::default()).then_some(ha)
+}
+
+/// `started` HA VM의 게스트 감시 시간(`ha.guest_watch`). 없으면 감시하지 않는다.
+fn guest_watch(vm: &Vm) -> Option<Duration> {
+    let ha = vm
+        .spec
+        .ha
+        .as_ref()
+        .filter(|ha| ha.state == HaState::Started)?;
+    ha.guest_watch
+        .map(|w| Duration::from_secs(u64::from(w.timeout_secs)))
 }
 
 /// 모든 노드(위트니스·관찰 노드 포함)가 `ha-placement`를 알린다. 읽지 못하면 아니라고 본다.

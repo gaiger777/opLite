@@ -206,7 +206,7 @@ impl Dispatcher {
                             if !self.notify(ev.id, Trigger::Event(ev.kind)) {
                                 tracing::debug!(vm = %ev.id, "event for a VM not assigned to this node");
                                 // 옮겨 간 HA VM의 원본처럼 작업자가 물러난 뒤 멈춘 QEMU다.
-                                if ev.kind != EventKind::Started
+                                if matches!(ev.kind, EventKind::Stopped { .. } | EventKind::Crashed)
                                     && let Some(guard) = &self.config.ha
                                 {
                                     guard.set_running(ev.id, false);

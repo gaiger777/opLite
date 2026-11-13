@@ -135,6 +135,7 @@ fn spec(disk: PathBuf) -> VmRuntimeSpec {
             boot_order: Some(1),
         }],
         nics: vec![],
+        guest_agent: false,
     }
 }
 

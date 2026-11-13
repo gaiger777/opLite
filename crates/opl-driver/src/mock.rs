@@ -30,6 +30,17 @@ pub const MOCK_MIRROR_BYTES: u64 = 1 << 30;
 /// `incremental_backup` 호출 한 번: (VM, 앞 비트맵, 새 비트맵, 대상)
 pub type IncrementalCall = (Uuid, String, String, Vec<BackupTarget>);
 
+/// 게스트 에이전트가 `guest_ping`에 어떻게 답하는지([`MockHypervisor::set_guest_agent`])
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestAnswer {
+    /// 채널이 없다(오류).
+    None,
+    /// 답한다(true).
+    Ok,
+    /// 답하지 않는다(false, 게스트 에이전트 없음·멈춤).
+    Hang,
+}
+
 /// 메모리 안에서만 동작하는 하이퍼바이저. reconciler 테스트에서 장애를 주입하는 데 쓴다.
 pub struct MockHypervisor {
     state: Mutex<MockState>,
@@ -143,6 +154,12 @@ struct MockState {
     list_delay: Option<Duration>,
     /// `disk_stats`가 이만큼 기다린 뒤에 답한다.
     disk_stats_delay: Option<Duration>,
+    /// 게스트 에이전트 채널(`guest_agent`)을 달고 띄운 VM. VM이 꺼지면 사라진다.
+    guest_channels: HashSet<Uuid>,
+    /// `set_guest_agent`로 정한 VM별 답. 다시 켜도 남는다.
+    guest_answers: HashMap<Uuid, GuestAnswer>,
+    /// `guest_ping` 호출(실패 포함)
+    guest_pings: Vec<Uuid>,
 }
 
 impl Default for MockHypervisor {
@@ -224,6 +241,13 @@ impl MockHypervisor {
         );
     }
 
+    /// 도는 VM의 게스트가 다시 부팅하거나(`Reset`) 멈췄다 다시 돈 것(`PauseChanged`)처럼 이벤트만 보낸다(VM은
+    /// 그대로 돈다).
+    pub fn guest_event(&self, id: Uuid, kind: EventKind) {
+        assert!(kind.is_guest(), "{kind:?} is not a guest event");
+        let _ = self.events.send(HypervisorEvent { id, kind });
+    }
+
     /// 프로세스가 비정상 종료한 것처럼 만든다.
     pub fn crash(&self, id: Uuid) {
         self.remove(id, EventKind::Crashed);
@@ -282,6 +306,18 @@ impl MockHypervisor {
     /// 이후 `disk_stats`가 이만큼 기다린 뒤에 답한다(QMP가 늦게 답한 것처럼).
     pub fn delay_disk_stats(&self, delay: Duration) {
         self.state.lock().unwrap().disk_stats_delay = Some(delay);
+    }
+
+    /// 이후 이 VM의 `guest_ping`이 `answer`대로 답한다(다시 켜도 그대로). 정하지 않으면 채널을 달고 띄운
+    /// VM은 `Hang`(게스트 OS 없음), 아니면 `None`이다.
+    pub fn set_guest_agent(&self, id: Uuid, answer: GuestAnswer) {
+        self.state.lock().unwrap().guest_answers.insert(id, answer);
+    }
+
+    /// 이 VM에 부른 `guest_ping` 수(실패 포함)
+    pub fn guest_pings(&self, id: Uuid) -> usize {
+        let st = self.state.lock().unwrap();
+        st.guest_pings.iter().filter(|vm| **vm == id).count()
     }
 
     /// `block_resize`로 마지막에 바꾼 크기
@@ -505,6 +541,11 @@ impl MockHypervisor {
             .or_default()
             .resize(formats.len(), Vec::new());
         st.disk_formats.insert(vm.id, formats);
+        if vm.guest_agent {
+            st.guest_channels.insert(vm.id);
+        } else {
+            st.guest_channels.remove(&vm.id);
+        }
     }
 
     /// VM이 꺼지면 이미지에 저장되지 않은 비트맵은 사라진다.
@@ -569,6 +610,7 @@ impl MockHypervisor {
         st.mirroring.remove(&id);
         st.disk_stats.remove(&id);
         st.failing_disk_stats.remove(&id);
+        st.guest_channels.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -649,6 +691,7 @@ impl Hypervisor for MockHypervisor {
                         st.incoming.remove(&id);
                         st.migration_status.remove(&id);
                         st.outgoing.remove(&id);
+                        st.guest_channels.remove(&id);
                         st.vms.remove(&id);
                         Ok(())
                     }
@@ -913,6 +956,25 @@ impl Hypervisor for MockHypervisor {
 
     /// 범위의 첫 포트(내보낼 디스크가 있으면 NBD에 그다음 포트)를 돌려준다. `fail_next_start`로 주입한
     /// 오류로 실패할 수 있다.
+    async fn guest_ping(&self, id: Uuid) -> Result<bool, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.guest_pings.push(id);
+        Self::controllable(&st, id)?;
+        let channel = st.guest_channels.contains(&id);
+        let answer = st.guest_answers.get(&id).copied();
+        match answer.unwrap_or(if channel {
+            GuestAnswer::Hang
+        } else {
+            GuestAnswer::None
+        }) {
+            GuestAnswer::None => Err(DriverError::InvalidSpec(format!(
+                "VM {id} has no guest agent channel"
+            ))),
+            GuestAnswer::Ok => Ok(true),
+            GuestAnswer::Hang => Ok(false),
+        }
+    }
+
     async fn start_incoming(
         &self,
         vm: &VmRuntimeSpec,
@@ -1171,7 +1233,32 @@ mod tests {
             machine: MachineType::Virt,
             disks: vec![],
             nics: vec![],
+            guest_agent: false,
         }
+    }
+
+    /// 채널 없이 띄운 VM은 오류, 채널을 단 VM은 정한 대로 답한다(정하지 않으면 답하지 않음). 꺼진 VM은 오류다.
+    #[tokio::test]
+    async fn guest_ping_follows_the_channel_and_the_set_answer() {
+        let hv = MockHypervisor::default();
+        let plain = spec();
+        let watched = VmRuntimeSpec {
+            guest_agent: true,
+            ..spec()
+        };
+        assert!(hv.guest_ping(watched.id).await.is_err());
+        hv.start(&plain, None).await.unwrap();
+        hv.start(&watched, None).await.unwrap();
+        assert!(hv.guest_ping(plain.id).await.is_err());
+        assert!(!hv.guest_ping(watched.id).await.unwrap());
+        hv.set_guest_agent(watched.id, GuestAnswer::Ok);
+        assert!(hv.guest_ping(watched.id).await.unwrap());
+        hv.set_guest_agent(watched.id, GuestAnswer::Hang);
+        assert!(!hv.guest_ping(watched.id).await.unwrap());
+        hv.set_guest_agent(watched.id, GuestAnswer::None);
+        assert!(hv.guest_ping(watched.id).await.is_err());
+        assert_eq!(hv.guest_pings(watched.id), 5);
+        assert_eq!(hv.guest_pings(plain.id), 1);
     }
 
     #[tokio::test]

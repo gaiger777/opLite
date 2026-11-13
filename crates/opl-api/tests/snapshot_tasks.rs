@@ -995,6 +995,7 @@ async fn running_block_vm(env: &Env, admin: &Client, name: &str, disks: &[&str])
         machine: current.spec.machine,
         disks: vec![],
         nics: vec![],
+        guest_agent: false,
     };
     env.hv.start(&runtime, None).await.unwrap();
     let mut spec = current.spec.clone();

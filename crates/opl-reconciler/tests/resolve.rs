@@ -17,7 +17,9 @@ use opl_types::resource::Resource;
 use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{DiskBus, DiskMove, DiskSpec, MacAddr, MigrationStatus, NicModel, NicSpec, Vm};
+use opl_types::vm::{
+    DiskBus, DiskMove, DiskSpec, GuestWatch, MacAddr, MigrationStatus, NicModel, NicSpec, Vm, VmHa,
+};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -294,6 +296,43 @@ async fn resolves_volumes_to_pool_paths_and_user_network() {
             backend: NicBackend::User,
         }]
     );
+}
+
+/// 게스트 감시(`ha.guest_watch`)가 있는 VM만 게스트 에이전트 채널을 단다. 받는 쪽도 같은 규칙이다.
+#[tokio::test]
+async fn only_guest_watched_vms_get_a_guest_agent_channel() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let mut vm = common::vm("web", node);
+    assert!(
+        !resolve(&cluster, &vm, node, Path::new(MNT))
+            .await
+            .unwrap()
+            .guest_agent
+    );
+    vm.spec.ha = Some(VmHa::default());
+    assert!(
+        !resolve(&cluster, &vm, node, Path::new(MNT))
+            .await
+            .unwrap()
+            .guest_agent
+    );
+    vm.spec.ha = Some(VmHa {
+        guest_watch: Some(GuestWatch::default()),
+        ..Default::default()
+    });
+    assert!(
+        resolve(&cluster, &vm, node, Path::new(MNT))
+            .await
+            .unwrap()
+            .guest_agent
+    );
+    let storage = Activations::default();
+    let incoming = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert!(incoming.guest_agent);
 }
 
 /// 풀다가 실패하면 그때까지 활성화한 볼륨을 끈다(VM을 시작하지 않으니 켜 둘 까닭이 없다).
