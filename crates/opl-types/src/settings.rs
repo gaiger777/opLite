@@ -51,7 +51,47 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub shutdown_policy: Option<ShutdownPolicy>,
+    /// HA 복구를 위해 비워 두는 용량. 없으면 예약하지 않고(`none`), 쓰지 않아 옛 노드도 설정을 계속 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub ha_reserve: Option<HaReserve>,
+    /// 리더가 HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32). 없으면 4이고 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(nullable = false, default, minimum = 1, maximum = 32)
+    )]
+    pub ha_start_concurrency: Option<u8>,
 }
+
+/// HA 용량 예약: HA 가능 노드의 메모리 가운데 복구 자리로 비워 두는 몫.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum HaReserve {
+    /// 메모리가 가장 큰 노드 N대(1~8)만큼
+    Nodes(u8),
+    /// 전체 메모리의 P%(1~90)
+    Percent(u8),
+}
+
+/// HA 용량 예약의 범위
+pub const MAX_HA_RESERVE_NODES: u8 = 8;
+pub const MAX_HA_RESERVE_PERCENT: u8 = 90;
+
+impl HaReserve {
+    /// 범위(노드 1~8, 백분율 1~90) 안인지
+    pub fn valid(self) -> bool {
+        match self {
+            HaReserve::Nodes(n) => (1..=MAX_HA_RESERVE_NODES).contains(&n),
+            HaReserve::Percent(p) => (1..=MAX_HA_RESERVE_PERCENT).contains(&p),
+        }
+    }
+}
+
+/// 대상 노드당 동시 시작 수의 기본값과 최댓값
+pub const DEFAULT_HA_START_CONCURRENCY: u8 = 4;
+pub const MAX_HA_START_CONCURRENCY: u8 = 32;
 
 /// 노드 정상 종료 정책(설계 §8). `systemctl stop`·업그레이드 재시작이 아니라 호스트가 꺼지는 중일 때만 쓴다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +135,14 @@ impl SettingsSpec {
     /// 노드 정상 종료 정책. 없으면 `conditional`이다.
     pub fn shutdown_policy(&self) -> ShutdownPolicy {
         self.shutdown_policy.unwrap_or_default()
+    }
+
+    /// 대상 노드당 동시 시작 수. 없거나 범위 밖이면 기본값(4)이다.
+    pub fn ha_start_concurrency(&self) -> usize {
+        let n = self
+            .ha_start_concurrency
+            .filter(|n| (1..=MAX_HA_START_CONCURRENCY).contains(n));
+        usize::from(n.unwrap_or(DEFAULT_HA_START_CONCURRENCY))
     }
 }
 
@@ -233,6 +281,8 @@ mod tests {
             api_names: vec![],
             voters: None,
             shutdown_policy: None,
+            ha_reserve: None,
+            ha_start_concurrency: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -345,6 +395,46 @@ mod tests {
         }
         assert!(serde_json::from_str::<SettingsSpec>(r#"{"shutdown_policy":"Freeze"}"#).is_err());
         assert!(serde_json::from_str::<SettingsSpec>(r#"{"shutdown_policy":"ignore"}"#).is_err());
+    }
+
+    /// HA 용량 예약·동시 시작도 없으면 쓰지 않는다. 예약은 `{"nodes": N}`이나 `{"percent": P}`다.
+    #[test]
+    fn ha_reserve_and_start_concurrency_are_written_only_when_set() {
+        let none = serde_json::to_value(SettingsSpec::default()).unwrap();
+        assert!(none.get("ha_reserve").is_none(), "{none}");
+        assert!(none.get("ha_start_concurrency").is_none(), "{none}");
+        assert_eq!(SettingsSpec::default().ha_start_concurrency(), 4);
+
+        let spec = SettingsSpec {
+            ha_reserve: Some(HaReserve::Nodes(1)),
+            ha_start_concurrency: Some(2),
+            ..SettingsSpec::default()
+        };
+        assert_eq!(spec.ha_start_concurrency(), 2);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["ha_reserve"], serde_json::json!({ "nodes": 1 }));
+        assert_eq!(json["ha_start_concurrency"], 2);
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+
+        let spec: SettingsSpec = serde_json::from_str(r#"{"ha_reserve":{"percent":25}}"#).unwrap();
+        assert_eq!(spec.ha_reserve, Some(HaReserve::Percent(25)));
+        for bad in [
+            r#"{"ha_reserve":"none"}"#,
+            r#"{"ha_reserve":{"nodes":1,"percent":2}}"#,
+            r#"{"ha_reserve":{"hosts":1}}"#,
+        ] {
+            assert!(serde_json::from_str::<SettingsSpec>(bad).is_err(), "{bad}");
+        }
+
+        assert!(HaReserve::Nodes(1).valid() && HaReserve::Nodes(8).valid());
+        assert!(!HaReserve::Nodes(0).valid() && !HaReserve::Nodes(9).valid());
+        assert!(HaReserve::Percent(1).valid() && HaReserve::Percent(90).valid());
+        assert!(!HaReserve::Percent(0).valid() && !HaReserve::Percent(91).valid());
+        let odd = SettingsSpec {
+            ha_start_concurrency: Some(0),
+            ..SettingsSpec::default()
+        };
+        assert_eq!(odd.ha_start_concurrency(), 4);
     }
 
     /// 텔레메트리도 기본값(꺼짐, 끝점 없음, 상태 없음)이면 계획 32 모양 그대로 쓴다.

@@ -69,6 +69,9 @@ export interface VmFormValues {
   haGroup: string;
   maxRestart: string;
   maxRelocate: string;
+  /** 복구 우선순위와 게스트 감시. 고칠 때 그대로 둔다. */
+  haPriority: number;
+  guestWatch: Schemas["GuestWatch"] | null;
   /** 만든 뒤 곧바로 시작한다(만들 때만). */
   start: boolean;
 }
@@ -164,7 +167,10 @@ export function fromVm(vm: Vm): VmFormValues {
 /** 정책(없으면 null)의 폼 값. 정책이 없으면 기본 정책의 값을 채워 둔다. */
 function haFields(
   policy: Schemas["VmHa"] | null,
-): Pick<VmFormValues, "ha" | "haState" | "haGroup" | "maxRestart" | "maxRelocate"> {
+): Pick<
+  VmFormValues,
+  "ha" | "haState" | "haGroup" | "maxRestart" | "maxRelocate" | "haPriority" | "guestWatch"
+> {
   const p = policy ?? DEFAULT_HA;
   return {
     ha: policy !== null,
@@ -172,6 +178,8 @@ function haFields(
     haGroup: p.group ?? "",
     maxRestart: String(p.max_restart),
     maxRelocate: String(p.max_relocate),
+    haPriority: p.priority,
+    guestWatch: p.guest_watch ?? null,
   };
 }
 
@@ -321,6 +329,8 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
             ...(v.haGroup !== "" && { group: v.haGroup }),
             max_restart: Number(v.maxRestart),
             max_relocate: Number(v.maxRelocate),
+            priority: v.haPriority,
+            ...(v.guestWatch && { guest_watch: v.guestWatch }),
           }
         : null,
     ),

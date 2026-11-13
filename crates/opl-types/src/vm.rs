@@ -61,6 +61,22 @@ pub struct VmHa {
     pub max_restart: u8,
     /// 다른 노드로 옮기는 횟수. 넘으면 `error` 상태로 둔다.
     pub max_relocate: u8,
+    /// 복구 순서(0~100, 클수록 먼저). 기본(50)이면 쓰지 않아 계획 50 노드도 정책을 푼다.
+    #[serde(skip_serializing_if = "is_default_priority")]
+    #[cfg_attr(feature = "openapi", schema(default = 50, minimum = 0, maximum = 100))]
+    pub priority: u8,
+    /// 게스트 에이전트 감시. 없으면 쓰지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub guest_watch: Option<GuestWatch>,
+}
+
+/// HA 우선순위의 기본값과 최댓값
+pub const DEFAULT_HA_PRIORITY: u8 = 50;
+pub const MAX_HA_PRIORITY: u8 = 100;
+
+fn is_default_priority(priority: &u8) -> bool {
+    *priority == DEFAULT_HA_PRIORITY
 }
 
 impl Default for VmHa {
@@ -70,8 +86,48 @@ impl Default for VmHa {
             group: None,
             max_restart: 1,
             max_relocate: 1,
+            priority: DEFAULT_HA_PRIORITY,
+            guest_watch: None,
         }
     }
+}
+
+impl VmHa {
+    /// 계획 51의 필드(기본이 아닌 우선순위·게스트 감시)를 쓰는지. 그러면 모든 노드가 `fast-ha`를 알아야 한다.
+    pub fn uses_fast_ha(&self) -> bool {
+        self.priority != DEFAULT_HA_PRIORITY || self.guest_watch.is_some()
+    }
+}
+
+/// 게스트 감시 시간 제한의 범위와 기본값(초). 최솟값은 놓친 재부팅(QMP `RESET`)에서도 게스트가 다시 뜨기를
+/// 기다릴 만큼 둔다.
+pub const MIN_GUEST_WATCH_SECS: u32 = 30;
+pub const MAX_GUEST_WATCH_SECS: u32 = 3600;
+pub const DEFAULT_GUEST_WATCH_SECS: u32 = 60;
+
+/// 게스트 에이전트(QGA) 감시: 한 번 답한 에이전트가 `timeout_secs` 동안 답하지 않으면 VM을 강제로 다시 켠다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GuestWatch {
+    #[serde(default = "default_guest_watch_secs")]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(default = 60, minimum = 30, maximum = 3600)
+    )]
+    pub timeout_secs: u32,
+}
+
+impl Default for GuestWatch {
+    fn default() -> Self {
+        GuestWatch {
+            timeout_secs: DEFAULT_GUEST_WATCH_SECS,
+        }
+    }
+}
+
+fn default_guest_watch_secs() -> u32 {
+    DEFAULT_GUEST_WATCH_SECS
 }
 
 /// HA가 VM을 어떻게 다루는지.
@@ -202,6 +258,16 @@ impl VmSpec {
         {
             return Err(ValidationError::HaCount);
         }
+        if let Some(ha) = &self.ha {
+            if ha.priority > MAX_HA_PRIORITY {
+                return Err(ValidationError::HaPriority);
+            }
+            if ha.guest_watch.is_some_and(|w| {
+                !(MIN_GUEST_WATCH_SECS..=MAX_GUEST_WATCH_SECS).contains(&w.timeout_secs)
+            }) {
+                return Err(ValidationError::GuestWatch);
+            }
+        }
         Ok(())
     }
 
@@ -242,6 +308,12 @@ pub enum ValidationError {
     DuplicateSecurityGroup(usize, String),
     #[error("ha.max_restart and ha.max_relocate must be between 0 and {MAX_HA_COUNT}")]
     HaCount,
+    #[error("ha.priority must be between 0 and {MAX_HA_PRIORITY}")]
+    HaPriority,
+    #[error(
+        "ha.guest_watch.timeout_secs must be between {MIN_GUEST_WATCH_SECS} and {MAX_GUEST_WATCH_SECS}"
+    )]
+    GuestWatch,
 }
 
 /// 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다.
@@ -923,6 +995,7 @@ mod tests {
             group: Some("rack-a".into()),
             max_restart: 3,
             max_relocate: 0,
+            ..Default::default()
         });
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(
@@ -967,7 +1040,9 @@ mod tests {
         assert_eq!(serde_json::to_value(&spec).unwrap()["ha"], true);
 
         for bad in [
-            serde_json::json!({ "state": "started", "priority": 1 }),
+            serde_json::json!({ "state": "started", "weight": 1 }),
+            serde_json::json!({ "guest_watch": { "timeout_secs": 60, "interval": 5 } }),
+            serde_json::json!({ "priority": "high" }),
             serde_json::json!({ "state": "paused" }),
             serde_json::json!("yes"),
             serde_json::json!(1),
@@ -979,6 +1054,94 @@ mod tests {
                 "{bad} should be rejected"
             );
         }
+    }
+
+    /// 계획 50 노드가 쓴 그룹 정책 객체는 바이트까지 그대로 읽고 쓴다(새 필드가 기본값이면 쓰지 않는다).
+    #[test]
+    fn plan50_policy_object_round_trips_byte_for_byte() {
+        let old = OLD_VM_JSON.replace(
+            r#""ha":false"#,
+            r#""ha":{"state":"started","group":"rack-a","max_restart":1,"max_relocate":1}"#,
+        );
+        let spec: VmSpec = serde_json::from_str(&old).unwrap();
+        let ha = spec.ha.clone().unwrap();
+        assert_eq!(ha.priority, DEFAULT_HA_PRIORITY);
+        assert_eq!(ha.guest_watch, None);
+        assert!(!ha.uses_fast_ha());
+        assert_eq!(serde_json::to_string(&spec).unwrap(), old);
+    }
+
+    /// 우선순위·게스트 감시는 기본이 아니면 객체에 나타나고 다시 읽힌다. 기본 정책은 그대로 `true`다.
+    #[test]
+    fn priority_and_guest_watch_are_written_only_when_set() {
+        let mut spec = sample();
+        spec.ha = Some(VmHa {
+            priority: DEFAULT_HA_PRIORITY,
+            guest_watch: None,
+            ..Default::default()
+        });
+        assert_eq!(serde_json::to_value(&spec).unwrap()["ha"], true);
+
+        spec.ha = Some(VmHa {
+            priority: 80,
+            ..Default::default()
+        });
+        assert!(spec.ha.as_ref().unwrap().uses_fast_ha());
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["ha"],
+            serde_json::json!({ "state": "started", "max_restart": 1, "max_relocate": 1, "priority": 80 })
+        );
+        assert_eq!(serde_json::from_value::<VmSpec>(json).unwrap(), spec);
+
+        spec.ha = Some(VmHa {
+            guest_watch: Some(GuestWatch { timeout_secs: 120 }),
+            ..Default::default()
+        });
+        assert!(spec.ha.as_ref().unwrap().uses_fast_ha());
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["ha"],
+            serde_json::json!({
+                "state": "started",
+                "max_restart": 1,
+                "max_relocate": 1,
+                "guest_watch": { "timeout_secs": 120 }
+            })
+        );
+        assert_eq!(serde_json::from_value::<VmSpec>(json).unwrap(), spec);
+
+        // 빈 감시 객체는 기본 60초다.
+        let mut json = sample_json();
+        json["ha"] = serde_json::json!({ "guest_watch": {} });
+        let ha = serde_json::from_value::<VmSpec>(json).unwrap().ha.unwrap();
+        assert_eq!(ha.guest_watch, Some(GuestWatch { timeout_secs: 60 }));
+    }
+
+    #[test]
+    fn validate_checks_priority_and_guest_watch() {
+        let with = |priority, timeout_secs: Option<u32>| {
+            let mut s = sample();
+            s.ha = Some(VmHa {
+                priority,
+                guest_watch: timeout_secs.map(|timeout_secs| GuestWatch { timeout_secs }),
+                ..Default::default()
+            });
+            s.validate()
+        };
+        assert_eq!(with(0, None), Ok(()));
+        assert_eq!(with(MAX_HA_PRIORITY, Some(30)), Ok(()));
+        assert_eq!(with(50, Some(3600)), Ok(()));
+        assert_eq!(
+            with(MAX_HA_PRIORITY + 1, None),
+            Err(ValidationError::HaPriority)
+        );
+        assert_eq!(with(50, Some(29)), Err(ValidationError::GuestWatch));
+        assert_eq!(with(50, Some(3601)), Err(ValidationError::GuestWatch));
+        assert_eq!(
+            ValidationError::GuestWatch.to_string(),
+            "ha.guest_watch.timeout_secs must be between 30 and 3600"
+        );
     }
 
     #[test]

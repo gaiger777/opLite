@@ -704,7 +704,8 @@ pub(crate) mod tests {
                 "voter-limit",
                 "observer",
                 "multi-link",
-                "ha-placement"
+                "ha-placement",
+                "fast-ha"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -731,7 +732,8 @@ pub(crate) mod tests {
                 "voter-limit",
                 "observer",
                 "multi-link",
-                "ha-placement"
+                "ha-placement",
+                "fast-ha"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -777,7 +779,8 @@ pub(crate) mod tests {
                 "voter-limit",
                 "observer",
                 "multi-link",
-                "ha-placement"
+                "ha-placement",
+                "fast-ha"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -890,6 +893,7 @@ pub(crate) mod tests {
                     "observer".into(),
                     "multi-link".into(),
                     "ha-placement".into(),
+                    "fast-ha".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

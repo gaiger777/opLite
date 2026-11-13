@@ -3,9 +3,9 @@
 mod common;
 
 use common::Env;
-use opl_types::node::NodeSpec;
+use opl_types::node::{FAST_HA, NodeSpec};
 use opl_types::resource::Resource;
-use opl_types::settings::{Channel, SETTINGS_NAME, SettingsSpec, ShutdownPolicy};
+use opl_types::settings::{Channel, HaReserve, SETTINGS_NAME, SettingsSpec, ShutdownPolicy};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -310,4 +310,91 @@ async fn shutdown_policy_is_written_unless_default_and_waits_for_the_feature() {
         got.1
     );
     assert_eq!(stored().shutdown_policy, None);
+}
+
+/// HA 용량 예약과 동시 시작: 범위 밖은 400, 기본값·`"none"`은 적지 않고, `fast-ha`를 모르는 노드가 있으면 409다.
+#[tokio::test]
+async fn ha_reserve_and_start_concurrency_are_checked_and_wait_for_the_feature() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    for bad in [
+        json!({ "ha_reserve": { "nodes": 0 } }),
+        json!({ "ha_reserve": { "nodes": 9 } }),
+        json!({ "ha_reserve": { "percent": 0 } }),
+        json!({ "ha_reserve": { "percent": 91 } }),
+        json!({ "ha_reserve": "all" }),
+        json!({ "ha_reserve": { "hosts": 1 } }),
+        json!({ "ha_start_concurrency": 0 }),
+        json!({ "ha_start_concurrency": 33 }),
+    ] {
+        let got = admin.patch("/settings", bad.clone(), None).await;
+        assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let stored = || {
+        env.cluster
+            .get_by_name::<SettingsSpec>(SETTINGS_NAME)
+            .unwrap()
+            .unwrap()
+            .spec
+    };
+    let (status, got) = admin
+        .patch(
+            "/settings",
+            json!({ "ha_reserve": { "nodes": 1 }, "ha_start_concurrency": 2 }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["spec"]["ha_reserve"], json!({ "nodes": 1 }));
+    assert_eq!(got["spec"]["ha_start_concurrency"], 2);
+    assert_eq!(stored().ha_reserve, Some(HaReserve::Nodes(1)));
+    assert_eq!(stored().ha_start_concurrency(), 2);
+    let (_, got) = admin
+        .patch(
+            "/settings",
+            json!({ "ha_reserve": { "percent": 30 } }),
+            None,
+        )
+        .await;
+    assert_eq!(got["spec"]["ha_reserve"], json!({ "percent": 30 }));
+    assert_eq!(got["spec"]["ha_start_concurrency"], 2);
+    // `"none"`과 기본값(4)은 필드를 뺀다.
+    let (status, got) = admin
+        .patch(
+            "/settings",
+            json!({ "ha_reserve": "none", "ha_start_concurrency": 4 }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(got["spec"].get("ha_reserve").is_none(), "{got}");
+    assert!(got["spec"].get("ha_start_concurrency").is_none(), "{got}");
+    assert_eq!(stored().ha_reserve, None);
+    assert_eq!(stored().ha_start_concurrency, None);
+
+    // `fast-ha`를 모르는 노드가 있으면 거절한다.
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.features.retain(|f| f != FAST_HA);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    for body in [
+        json!({ "ha_reserve": { "nodes": 1 } }),
+        json!({ "ha_start_concurrency": 8 }),
+    ] {
+        let got = admin.patch("/settings", body, None).await;
+        assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+        assert!(
+            got.1["message"].as_str().unwrap().contains("fast ha"),
+            "{}",
+            got.1
+        );
+    }
+    assert_eq!(stored().ha_reserve, None);
 }

@@ -169,10 +169,14 @@ pub const FEATURES: &[&str] = &[
     "observer",
     "multi-link",
     HA_PLACEMENT,
+    FAST_HA,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
 pub const HA_PLACEMENT: &str = "ha-placement";
+
+/// 빠른 HA(계획 51): VM 우선순위·게스트 감시, HA 용량 예약·동시 시작 설정, 전원 끄기 펜싱. 모든 노드가 알릴 때만 쓴다.
+pub const FAST_HA: &str = "fast-ha";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -469,7 +473,8 @@ mod tests {
                 "voter-limit",
                 "observer",
                 "multi-link",
-                "ha-placement"
+                "ha-placement",
+                "fast-ha"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

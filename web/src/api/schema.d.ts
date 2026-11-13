@@ -2349,6 +2349,14 @@ export interface components {
             group: string;
             role: components["schemas"]["Role"];
         };
+        /** @description 게스트 에이전트(QGA) 감시: 한 번 답한 에이전트가 `timeout_secs` 동안 답하지 않으면 VM을 강제로 다시 켠다. */
+        GuestWatch: {
+            /**
+             * Format: int32
+             * @default 60
+             */
+            timeout_secs: number;
+        };
         /** @description HA 그룹의 노드 하나 */
         HaGroupNode: {
             /** @description 노드 이름 */
@@ -2369,6 +2377,27 @@ export interface components {
             restricted?: boolean;
         };
         HaGroupStatus: Record<string, never>;
+        /** @description HA 용량 예약: HA 가능 노드의 메모리 가운데 복구 자리로 비워 두는 몫. */
+        HaReserve: {
+            /**
+             * Format: int32
+             * @description 메모리가 가장 큰 노드 N대(1~8)만큼
+             */
+            nodes: number;
+        } | {
+            /**
+             * Format: int32
+             * @description 전체 메모리의 P%(1~90)
+             */
+            percent: number;
+        };
+        /**
+         * @description 예약을 지운다.
+         * @enum {string}
+         */
+        HaReserveOff: "none";
+        /** @description HA 용량 예약 바꾸기: `"none"`이나 예약 */
+        HaReservePatch: components["schemas"]["HaReserveOff"] | components["schemas"]["HaReserve"];
         /** @description API 문서의 `ha` 모양: 옛 bool이나 정책 객체. 읽고 쓰기는 `VmSpec.ha`의 손으로 쓴 serde가 한다. */
         HaSetting: boolean | components["schemas"]["VmHa"];
         /**
@@ -4448,6 +4477,13 @@ export interface components {
                  *     비어 있으면 쓰지 않는다.
                  */
                 api_names?: string[];
+                /** @description HA 복구를 위해 비워 두는 용량. 없으면 예약하지 않고(`none`), 쓰지 않아 옛 노드도 설정을 계속 푼다. */
+                ha_reserve?: components["schemas"]["HaReserve"];
+                /**
+                 * Format: int32
+                 * @description 리더가 HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32). 없으면 4이고 쓰지 않는다.
+                 */
+                ha_start_concurrency?: number;
                 /**
                  * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. 없으면 `conditional`이고, 쓰지 않아
                  *     옛 노드도 설정을 계속 푼다.
@@ -4826,6 +4862,16 @@ export interface components {
             /** @description 노드 API 인증서에 더할 이름(DNS 이름·IP) 전체. `[]`는 지워 노드 이름만 쓴다. */
             api_names?: string[];
             /**
+             * @description HA 복구를 위해 비워 둘 용량: `{"nodes": N}`(메모리가 가장 큰 노드 N대, 1~8), `{"percent": P}`(1~90),
+             *     `"none"`(예약 없음). HA VM을 켤 때 넘으면 409 `ha_capacity`다.
+             */
+            ha_reserve?: components["schemas"]["HaReservePatch"];
+            /**
+             * Format: int32
+             * @description HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32, 기본 4)
+             */
+            ha_start_concurrency?: number;
+            /**
              * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. `conditional`(기본: 재부팅이면
              *     `freeze`, 끄기면 `failover`), `freeze`, `failover`, `migrate`. `systemctl stop`에는 쓰지 않는다.
              */
@@ -4850,6 +4896,13 @@ export interface components {
              *     비어 있으면 쓰지 않는다.
              */
             api_names?: string[];
+            /** @description HA 복구를 위해 비워 두는 용량. 없으면 예약하지 않고(`none`), 쓰지 않아 옛 노드도 설정을 계속 푼다. */
+            ha_reserve?: components["schemas"]["HaReserve"];
+            /**
+             * Format: int32
+             * @description 리더가 HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32). 없으면 4이고 쓰지 않는다.
+             */
+            ha_start_concurrency?: number;
             /**
              * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. 없으면 `conditional`이고, 쓰지 않아
              *     옛 노드도 설정을 계속 푼다.
@@ -5405,6 +5458,8 @@ export interface components {
         VmHa: {
             /** @description HA 그룹 이름. 없으면 그룹 없이 아무 노드로 복구한다. */
             group?: string;
+            /** @description 게스트 에이전트 감시. 없으면 쓰지 않는다. */
+            guest_watch?: components["schemas"]["GuestWatch"];
             /**
              * Format: int32
              * @description 다른 노드로 옮기는 횟수. 넘으면 `error` 상태로 둔다.
@@ -5417,6 +5472,12 @@ export interface components {
              * @default 1
              */
             max_restart: number;
+            /**
+             * Format: int32
+             * @description 복구 순서(0~100, 클수록 먼저). 기본(50)이면 쓰지 않아 계획 50 노드도 정책을 푼다.
+             * @default 50
+             */
+            priority: number;
             /** @default started */
             state: components["schemas"]["HaState"];
         };

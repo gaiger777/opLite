@@ -8,13 +8,13 @@ use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::network::USER_NETWORK;
-use opl_types::node::{HA_PLACEMENT, Node, NodeSpec, ha_capable};
+use opl_types::node::{FAST_HA, HA_PLACEMENT, Node, NodeSpec, ha_capable};
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
 use opl_types::storage::VolumePhase;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
-use opl_types::vm::{MacAddr, PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{HaState, MacAddr, PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus};
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -25,7 +25,9 @@ use crate::cluster::require_feature;
 use crate::error::{ApiError, Json, Query};
 use crate::placement::{Assign, hard_violations};
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
-use crate::scheduler::{Inventory, ScheduleError, disk_moves, node_fits_with, schedule};
+use crate::scheduler::{
+    HaCapacity, Inventory, ScheduleError, disk_moves, ha_capacity, node_fits_with, schedule,
+};
 use crate::snapshots::{
     check_no_migration, check_no_revert_task, check_no_snapshot_task, check_not_busy,
     check_not_migrating, count_snapshots,
@@ -65,6 +67,31 @@ fn schedule_error(e: ScheduleError) -> ApiError {
     }
 }
 
+/// HA 용량 예약을 넘으면 409 `ha_capacity`(`details`에 MiB 단위 셈)
+fn ha_capacity_error(vm: &Vm, c: HaCapacity) -> ApiError {
+    let free = c.capacity_mib.saturating_sub(c.reserve_mib + c.used_mib);
+    let mut e = ApiError::conflict(
+        "ha_capacity",
+        format!(
+            "starting HA VM {:?} ({} MiB) would use capacity reserved for HA recovery: {free} MiB left of {} MiB ({} MiB reserved, {} MiB used)",
+            vm.name, c.need_mib, c.capacity_mib, c.reserve_mib, c.used_mib
+        ),
+    );
+    e.details = Some(serde_json::json!({
+        "capacity_mib": c.capacity_mib,
+        "reserve_mib": c.reserve_mib,
+        "used_mib": c.used_mib,
+        "need_mib": c.need_mib,
+    }));
+    e
+}
+
+/// 이 VM을 켜도 HA 용량 예약이 남는지 본다(아니면 409 `ha_capacity`).
+fn check_ha_capacity(state: &AppState, inv: &Inventory, vm: &Vm) -> Result<(), ApiError> {
+    let settings = crate::settings::current(&state.cluster)?.spec;
+    ha_capacity(inv, &settings, vm).map_err(|c| ha_capacity_error(vm, c))
+}
+
 /// 저장하기 전에 VM의 spec을 검증하고 채운다: 빠진 MAC 할당, 참조 확인, 필요하면 노드 배치.
 /// `vm`은 저장할 모양이다(id·이름·레이블은 배치 규칙에 쓰고, 자기 자신의 MAC과 디스크는 충돌로 보지 않는다).
 pub(crate) fn prepare(state: &AppState, vm: &mut Vm) -> Result<(), ApiError> {
@@ -99,6 +126,10 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm) -> Result<(), ApiError> {
     // 기본과 다른 HA 정책은 객체로 저장되어 옛 노드가 VM을 읽지 못한다.
     if spec.ha.as_ref().is_some_and(|ha| *ha != VmHa::default()) {
         require_feature(&state.cluster, HA_PLACEMENT)?;
+    }
+    // 우선순위·게스트 감시는 계획 50 노드도 풀지 못한다.
+    if spec.ha.as_ref().is_some_and(VmHa::uses_fast_ha) {
+        require_feature(&state.cluster, FAST_HA)?;
     }
     if let Some(group) = spec.ha.as_ref().and_then(|ha| ha.group.as_ref())
         && !inv.groups.iter().any(|g| &g.name == group)
@@ -184,6 +215,19 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm) -> Result<(), ApiError> {
     }
     if vm.spec.power == PowerState::Running && vm.spec.node.is_none() {
         vm.spec.node = Some(schedule(vm, &inv).map_err(schedule_error)?);
+    }
+    // 켜진 채 만들거나, 켜진 채로 바꾸거나 메모리를 늘리면 HA 용량 예약을 본다. 이미 켜진 HA VM의 다른
+    // 고치기는 예약이 넘친 때(노드 장애 뒤)에도 막지 않는다.
+    let started = |v: &Vm| {
+        v.spec.power == PowerState::Running
+            && v.spec
+                .ha
+                .as_ref()
+                .is_some_and(|ha| ha.state == HaState::Started)
+    };
+    let adds = current.is_none_or(|c| !started(c) || c.spec.memory_mib < vm.spec.memory_mib);
+    if started(vm) && adds {
+        check_ha_capacity(state, &inv, vm)?;
     }
     Ok(())
 }
@@ -551,6 +595,11 @@ pub async fn vm_action(
                 if spec.node.is_none() {
                     let inv = Inventory::load(&state.cluster)?;
                     spec.node = Some(schedule(&me, &inv).map_err(schedule_error)?);
+                }
+                // 이미 켜기로 된 VM은 자리를 더 쓰지 않는다.
+                if spec.power != PowerState::Running {
+                    me.spec = spec.clone();
+                    check_ha_capacity(&state, &Inventory::load(&state.cluster)?, &me)?;
                 }
                 spec.power = PowerState::Running;
                 Ok(())

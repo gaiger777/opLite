@@ -277,7 +277,7 @@ it("shows the HA policy, broken placement rules and the HA error", async () => {
   const db = vm("db", "stopped", {
     spec: {
       ...vm("db", "stopped").spec,
-      ha: { state: "stopped", group: "rack", max_restart: 2, max_relocate: 0 },
+      ha: { state: "stopped", group: "rack", max_restart: 2, max_relocate: 0, priority: 50 },
     },
     status: {
       ...vm("db", "stopped").status,

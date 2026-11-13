@@ -764,6 +764,43 @@ async fn an_ha_policy_object_is_kept_only_when_every_node_knows_it() {
     assert_eq!(ha, Some(VmHa::default()));
 }
 
+/// 우선순위·게스트 감시는 `fast-ha`를 모르는 노드가 있으면 버리고 나머지 정책은 지킨다.
+#[tokio::test]
+async fn fast_ha_policy_fields_are_kept_only_when_every_node_knows_them() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let policy = json!({ "group": "g", "priority": 90, "guest_watch": { "timeout_secs": 30 } });
+    let with_policy = || {
+        let mut m = manifest();
+        m["vm_spec"]["ha"] = policy.clone();
+        m
+    };
+    let id = receive_ok(&admin, receive_body(&with_policy())).await;
+    let ha = get_backup(&env, id).unwrap().spec.vm_spec.ha.unwrap();
+    assert_eq!(ha.priority, 90);
+    assert!(ha.guest_watch.is_some());
+    // 계획 50 노드: `ha-placement`는 알지만 `fast-ha`는 모른다.
+    let old = current_node(&env, "plan50").await;
+    let mut node = env.cluster.get::<NodeSpec>(old).unwrap().unwrap();
+    node.status
+        .features
+        .retain(|f| f != opl_types::node::FAST_HA);
+    env.cluster
+        .update_status::<NodeSpec>(old, &node.status)
+        .await
+        .unwrap();
+    let id = receive_ok(&admin, receive_body(&with_policy())).await;
+    let ha = get_backup(&env, id).unwrap().spec.vm_spec.ha.unwrap();
+    assert_eq!(
+        ha,
+        VmHa {
+            group: Some("g".into()),
+            ..Default::default()
+        }
+    );
+}
+
 /// 받기 요청 `body`로 받기를 시작해 파일을 모두 보내고 완료한 `ready` 사본의 id
 async fn ready_copy(client: &Client, body: Value) -> Uuid {
     let id = receive_ok(client, body).await;

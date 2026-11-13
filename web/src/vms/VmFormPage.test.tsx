@@ -708,11 +708,20 @@ it("sets the HA state, group and counts", async () => {
     group: "rack",
     max_restart: 3,
     max_relocate: 1,
+    priority: 50,
   });
 });
 
 it("keeps the HA policy of a VM when other fields change", async () => {
-  const policy = { state: "stopped", group: "gone", max_restart: 0, max_relocate: 2 } as const;
+  // 폼에 칸이 없는 우선순위·게스트 감시도 그대로 보낸다.
+  const policy = {
+    state: "stopped",
+    group: "gone",
+    max_restart: 0,
+    max_relocate: 2,
+    priority: 80,
+    guest_watch: { timeout_secs: 30 },
+  } as const;
   const app = vm("app", "stopped", { spec: { ...vm("app", "stopped").spec, ha: policy } });
   mockLists({ vm: [app], node: [FENCED] });
   let body: { spec: { ha: unknown; memory_mib: number } } | undefined;
@@ -735,7 +744,7 @@ it("keeps the HA policy of a VM when other fields change", async () => {
 });
 
 it("keeps a running VM with ignored HA from activating HA", async () => {
-  const policy = { state: "ignored", max_restart: 1, max_relocate: 1 } as const;
+  const policy = { state: "ignored", max_restart: 1, max_relocate: 1, priority: 50 } as const;
   const app = vm("app", "running", { spec: { ...vm("app", "running").spec, ha: policy } });
   mockLists({ vm: [app], node: [FENCED] });
   renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });

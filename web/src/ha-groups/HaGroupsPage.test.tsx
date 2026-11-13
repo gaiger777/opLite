@@ -31,7 +31,7 @@ const plain = haGroup("plain", 2, { nodes: [{ node: "node-c", priority: 0 }] });
 const db = vm("db", "running", {
   spec: {
     ...vm("db", "running").spec,
-    ha: { state: "started", group: "rack", max_restart: 1, max_relocate: 1 },
+    ha: { state: "started", group: "rack", max_restart: 1, max_relocate: 1, priority: 50 },
   },
 });
 

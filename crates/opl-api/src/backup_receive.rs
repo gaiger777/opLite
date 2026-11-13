@@ -18,7 +18,7 @@ use opl_types::backup::{
     Backup, BackupDisk, BackupManifest, BackupOrigin, BackupPhase, BackupSpec, BackupStatus,
     MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, default_backup_name,
 };
-use opl_types::node::HA_PLACEMENT;
+use opl_types::node::{FAST_HA, HA_PLACEMENT};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::storage::{StoragePool, is_shared};
 use opl_types::vm::VmHa;
@@ -243,6 +243,14 @@ pub async fn receive_backup(
     let root = pool_root(&state, &pool)?;
     let mut manifest = req.manifest;
     check_manifest(&manifest, req.parent)?;
+    // 계획 50 노드는 우선순위·게스트 감시를 풀지 못한다: 그 둘은 기본값으로 둔다.
+    if let Some(ha) = manifest.vm_spec.ha.as_mut()
+        && ha.uses_fast_ha()
+        && !missing_feature(&state.cluster, FAST_HA)?.is_empty()
+    {
+        ha.priority = VmHa::default().priority;
+        ha.guest_watch = None;
+    }
     // 옛 노드는 기본이 아닌 HA 정책 객체를 풀지 못한다: HA는 켠 채 정책 세부(그룹·횟수·상태)는 버린다.
     if manifest
         .vm_spec

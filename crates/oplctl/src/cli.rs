@@ -1069,6 +1069,16 @@ struct HaPolicy {
     /// 다른 노드로 옮기는 횟수(0~10, 기본 1). 넘으면 끄고 오류로 둔다.
     #[arg(long)]
     max_relocate: Option<u8>,
+    /// 복구 우선순위(0~100, 기본 50). 클수록 먼저 다른 노드에서 켠다.
+    #[arg(long)]
+    ha_priority: Option<u8>,
+    /// 게스트 에이전트 감시: 한 번 답한 에이전트가 이 초(30~3600) 동안 답하지 않으면 VM을 다시 켠다.
+    /// 다음 시작부터 적용되고 게스트에 qemu-guest-agent가 있어야 한다.
+    #[arg(long, value_name = "SECS")]
+    guest_watch: Option<u32>,
+    /// 게스트 에이전트 감시를 끈다.
+    #[arg(long, conflicts_with = "guest_watch")]
+    no_guest_watch: bool,
 }
 
 impl HaPolicy {
@@ -1096,6 +1106,15 @@ impl HaPolicy {
         }
         if let Some(n) = self.max_relocate {
             policy.insert("max_relocate".into(), json!(n));
+        }
+        if let Some(n) = self.ha_priority {
+            policy.insert("priority".into(), json!(n));
+        }
+        if let Some(secs) = self.guest_watch {
+            policy.insert("guest_watch".into(), json!({ "timeout_secs": secs }));
+        }
+        if self.no_guest_watch {
+            policy.remove("guest_watch");
         }
         if policy.is_empty() {
             json!(true)
@@ -1262,7 +1281,8 @@ fn nic_body(nic: &NicArg) -> Value {
 
 #[derive(Args)]
 #[command(group(ArgGroup::new("change").required(true).multiple(true).args([
-    "ha", "no_ha", "ha_state", "ha_group", "max_restart", "max_relocate"
+    "ha", "no_ha", "ha_state", "ha_group", "max_restart", "max_relocate", "ha_priority",
+    "guest_watch", "no_guest_watch"
 ])))]
 struct VmSet {
     vm: String,
@@ -1271,7 +1291,10 @@ struct VmSet {
     #[arg(long)]
     ha: bool,
     /// HA를 끈다.
-    #[arg(long, conflicts_with_all = ["ha", "ha_state", "ha_group", "max_restart", "max_relocate"])]
+    #[arg(long, conflicts_with_all = [
+        "ha", "ha_state", "ha_group", "max_restart", "max_relocate", "ha_priority", "guest_watch",
+        "no_guest_watch"
+    ])]
     no_ha: bool,
     #[command(flatten)]
     policy: HaPolicy,
@@ -2189,10 +2212,12 @@ enum SettingsCmd {
     /// 설정을 바꾼다. 키: `updates.channel`(stable|testing|enterprise), `web_origins`(쿠키 요청을 받는 다른
     /// 출처, 쉼표로 여럿, 비우면 같은 출처만), `api_names`(노드 API 인증서에 더할 DNS 이름·IP, 쉼표로 여럿),
     /// `voters`(투표 멤버 상한 3|5|7, 위트니스도 센다), `shutdown_policy`(호스트가 꺼질 때 HA VM:
-    /// conditional|freeze|failover|migrate)
+    /// conditional|freeze|failover|migrate), `ha_reserve`(HA 복구 자리로 비워 둘 용량:
+    /// none|nodes:N|percent:P), `ha_start_concurrency`(HA 복구 때 대상 노드당 동시 시작 수 1~32, 기본 4)
     Set {
         /// 예: `updates.channel=testing`, `web_origins=https://portal.example.com`,
-        /// `api_names=orbivisor.example.com,192.168.0.200`, `voters=3`, `shutdown_policy=migrate`
+        /// `api_names=orbivisor.example.com,192.168.0.200`, `voters=3`, `shutdown_policy=migrate`,
+        /// `ha_reserve=nodes:1`, `ha_start_concurrency=8`
         #[arg(required = true, value_name = "KEY=VALUE")]
         values: Vec<String>,
     },
@@ -2205,7 +2230,25 @@ const SETTING_KEYS: &[&str] = &[
     "api_names",
     "voters",
     "shutdown_policy",
+    "ha_reserve",
+    "ha_start_concurrency",
 ];
+
+/// `ha_reserve` 값: `none`, `nodes:N`, `percent:P`. 범위는 API가 본다.
+fn ha_reserve_value(v: &str) -> anyhow::Result<Value> {
+    let bad = || anyhow::anyhow!("ha_reserve must be none, nodes:N or percent:P (got {v:?})");
+    let v = v.trim();
+    if v == "none" {
+        return Ok(json!("none"));
+    }
+    let (kind, n) = v.split_once(':').ok_or_else(bad)?;
+    let n: u8 = n.trim().parse().map_err(|_| bad())?;
+    match kind.trim() {
+        "nodes" => Ok(json!({ "nodes": n })),
+        "percent" => Ok(json!({ "percent": n })),
+        _ => Err(bad()),
+    }
+}
 
 /// `settings set`의 요청 본문(`PATCH /settings`). 준 키만 보낸다.
 fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
@@ -2232,6 +2275,13 @@ fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
                 body["voters"] = json!(n);
             }
             "shutdown_policy" => body["shutdown_policy"] = json!(v.trim()),
+            "ha_reserve" => body["ha_reserve"] = ha_reserve_value(v)?,
+            "ha_start_concurrency" => {
+                let n: u8 = v.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("ha_start_concurrency must be a number 1-32 (got {v:?})")
+                })?;
+                body["ha_start_concurrency"] = json!(n);
+            }
             _ => bail!("unknown setting {key}; known: {}", SETTING_KEYS.join(", ")),
         }
     }
@@ -6908,6 +6958,7 @@ mod tests {
                 ha_group: Some("rack".into()),
                 max_restart: Some(3),
                 max_relocate: Some(0),
+                ..Default::default()
             }
         );
         let cli = Cli::try_parse_from(["oplctl", "vm", "set", "web", "--ha", "--max-restart", "2"])
@@ -6981,6 +7032,65 @@ mod tests {
             json!({ "group": "rack" })
         );
         assert_eq!(HaPolicy::default().apply(&Value::Null), json!(true));
+    }
+
+    /// `--ha-priority`·`--guest-watch`·`--no-guest-watch`는 정책 객체의 그 값만 바꾼다.
+    #[test]
+    fn priority_and_guest_watch_flags_change_the_policy() {
+        let set = |args: &[&str]| -> VmSet {
+            let mut argv = vec!["oplctl", "vm", "set", "web"];
+            argv.extend(args);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Vm { cmd: VmCmd::Set(s) } => s,
+                _ => panic!("not vm set"),
+            }
+        };
+        assert_eq!(
+            ha_set(
+                &json!(true),
+                &set(&["--ha-priority", "80", "--guest-watch", "120"])
+            ),
+            json!({ "priority": 80, "guest_watch": { "timeout_secs": 120 } })
+        );
+        let watched = json!({ "group": "rack", "guest_watch": { "timeout_secs": 60 } });
+        assert_eq!(
+            ha_set(&watched, &set(&["--no-guest-watch"])),
+            json!({ "group": "rack" })
+        );
+        assert_eq!(
+            ha_set(&json!(true), &set(&["--no-guest-watch"])),
+            json!(true)
+        );
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "create",
+            "web",
+            "--ha-priority",
+            "90",
+            "--guest-watch",
+            "30",
+        ])
+        .unwrap();
+        let Cmd::Vm {
+            cmd: VmCmd::Create(c),
+        } = cli.cmd
+        else {
+            panic!("not vm create");
+        };
+        assert_eq!(
+            c.policy.apply(&Value::Null),
+            json!({ "priority": 90, "guest_watch": { "timeout_secs": 30 } })
+        );
+        for bad in [
+            &["--guest-watch", "30", "--no-guest-watch"][..],
+            &["--no-ha", "--ha-priority", "1"],
+            &["--ha-priority", "high"],
+        ] {
+            let mut argv = vec!["oplctl", "vm", "set", "web"];
+            argv.extend(bad);
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -10755,12 +10865,42 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             settings_set_body(&["shutdown_policy=migrate".into()]).unwrap(),
             json!({ "shutdown_policy": "migrate" })
         );
+        assert_eq!(
+            settings_set_body(&["ha_reserve=nodes:1".into(), "ha_start_concurrency=8".into()])
+                .unwrap(),
+            json!({ "ha_reserve": { "nodes": 1 }, "ha_start_concurrency": 8 })
+        );
+        assert_eq!(
+            settings_set_body(&["ha_reserve=percent:25".into()]).unwrap(),
+            json!({ "ha_reserve": { "percent": 25 } })
+        );
+        assert_eq!(
+            settings_set_body(&["ha_reserve=none".into()]).unwrap(),
+            json!({ "ha_reserve": "none" })
+        );
+        for bad in [
+            "ha_reserve=hosts:1",
+            "ha_reserve=nodes",
+            "ha_reserve=nodes:x",
+        ] {
+            let err = settings_set_body(&[bad.into()]).unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("ha_reserve must be none, nodes:N or percent:P"),
+                "{err}"
+            );
+        }
+        let err = settings_set_body(&["ha_start_concurrency=many".into()]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ha_start_concurrency must be a number 1-32 (got \"many\")"
+        );
         let err = settings_set_body(&["voters=five".into()]).unwrap_err();
         assert_eq!(err.to_string(), "voters must be 3, 5 or 7 (got \"five\")");
         let err = settings_set_body(&["updates.mirror=x".into()]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters, shutdown_policy"
+            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency"
         );
         let err = settings_set_body(&["updates.channel".into()]).unwrap_err();
         assert_eq!(

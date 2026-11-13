@@ -7,11 +7,12 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::node::HA_PLACEMENT;
+use opl_types::node::{FAST_HA, HA_PLACEMENT};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::{
-    Channel, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus, ShutdownPolicy,
-    TelemetrySettings, VOTER_LIMITS,
+    Channel, DEFAULT_HA_START_CONCURRENCY, HaReserve, MAX_HA_RESERVE_NODES, MAX_HA_RESERVE_PERCENT,
+    MAX_HA_START_CONCURRENCY, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus,
+    ShutdownPolicy, TelemetrySettings, VOTER_LIMITS,
 };
 use opl_types::subscription::SubscriptionState;
 use opl_types::version::TELEMETRY_URL;
@@ -69,6 +70,30 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub shutdown_policy: Option<ShutdownPolicy>,
+    /// HA 복구를 위해 비워 둘 용량: `{"nodes": N}`(메모리가 가장 큰 노드 N대, 1~8), `{"percent": P}`(1~90),
+    /// `"none"`(예약 없음). HA VM을 켤 때 넘으면 409 `ha_capacity`다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub ha_reserve: Option<HaReservePatch>,
+    /// HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32, 기본 4)
+    #[serde(default)]
+    #[schema(nullable = false, default, minimum = 1, maximum = 32)]
+    pub ha_start_concurrency: Option<u8>,
+}
+
+/// HA 용량 예약 바꾸기: `"none"`이나 예약
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum HaReservePatch {
+    Off(HaReserveOff),
+    Set(HaReserve),
+}
+
+/// 예약을 지운다.
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum HaReserveOff {
+    None,
 }
 
 /// API 이름은 이만큼까지 둔다.
@@ -280,10 +305,26 @@ pub async fn patch_settings(
         && req.api_names.is_none()
         && req.voters.is_none()
         && req.shutdown_policy.is_none()
+        && req.ha_reserve.is_none()
+        && req.ha_start_concurrency.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins, api_names, voters or shutdown_policy",
+            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve or ha_start_concurrency",
         ));
+    }
+    if let Some(HaReservePatch::Set(r)) = req.ha_reserve
+        && !r.valid()
+    {
+        return Err(ApiError::bad_request(format!(
+            "ha_reserve must be nodes 1-{MAX_HA_RESERVE_NODES}, percent 1-{MAX_HA_RESERVE_PERCENT} or \"none\""
+        )));
+    }
+    if let Some(n) = req.ha_start_concurrency
+        && !(1..=MAX_HA_START_CONCURRENCY).contains(&n)
+    {
+        return Err(ApiError::bad_request(format!(
+            "ha_start_concurrency must be between 1 and {MAX_HA_START_CONCURRENCY} (got {n})"
+        )));
     }
     if let Some(n) = req.voters
         && !VOTER_LIMITS.contains(&n)
@@ -314,6 +355,10 @@ pub async fn patch_settings(
     // 옛 노드는 종료 정책 필드를 풀지 못한다(버전이 섞여도 모든 노드가 알면 된다).
     if req.shutdown_policy.is_some() {
         crate::cluster::require_feature(&state.cluster, HA_PLACEMENT)?;
+    }
+    // 옛 노드는 HA 용량 예약·동시 시작 필드를 풀지 못한다.
+    if req.ha_reserve.is_some() || req.ha_start_concurrency.is_some() {
+        crate::cluster::require_feature(&state.cluster, FAST_HA)?;
     }
     let used = if enterprise {
         crate::subscription::used_nodes(&state.cluster)?
@@ -349,6 +394,15 @@ pub async fn patch_settings(
         // 기본(`conditional`)은 쓰지 않는다.
         if let Some(policy) = req.shutdown_policy {
             spec.shutdown_policy = (policy != ShutdownPolicy::Conditional).then_some(policy);
+        }
+        match req.ha_reserve {
+            Some(HaReservePatch::Off(HaReserveOff::None)) => spec.ha_reserve = None,
+            Some(HaReservePatch::Set(r)) => spec.ha_reserve = Some(r),
+            None => {}
+        }
+        // 기본(4)은 쓰지 않는다.
+        if let Some(n) = req.ha_start_concurrency {
+            spec.ha_start_concurrency = (n != DEFAULT_HA_START_CONCURRENCY).then_some(n);
         }
         Ok(())
     })

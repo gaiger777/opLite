@@ -4,13 +4,14 @@ use std::collections::BTreeSet;
 
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
-use opl_types::node::{Node, NodeSpec, ha_capable};
+use opl_types::node::{Node, NodeSpec, ShutdownAction, ha_capable};
 use opl_types::placement::{HaGroup, HaGroupSpec, PlacementRule, PlacementRuleSpec};
 use opl_types::runtime::ImageFormat;
+use opl_types::settings::{HaReserve, SettingsSpec};
 use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumeSpec, is_shared, pool_usable_on,
 };
-use opl_types::vm::{DiskMove, PowerState, Vm, VmSpec};
+use opl_types::vm::{DiskMove, HaState, PowerState, Vm, VmSpec};
 use uuid::Uuid;
 
 use crate::placement::{self, Assign};
@@ -232,6 +233,91 @@ pub fn node_fits_with(
         ));
     }
     Ok(())
+}
+
+/// HA 용량 예약을 넘는다: 예약을 뺀 메모리에 이 VM이 들어가지 않는다(MiB).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaCapacity {
+    /// HA 가능·온라인·유지보수 아님·종료 표시 없는 노드의 메모리 합
+    pub capacity_mib: u64,
+    /// 복구 자리로 비워 두는 몫
+    pub reserve_mib: u64,
+    /// 그 노드들에 자리 잡은 다른 VM(켜진 것, HA 아닌 것도)과 유지보수·종료 중 노드에서 곧 옮겨 올 HA VM의
+    /// 메모리 합
+    pub used_mib: u64,
+    /// 이 VM의 메모리
+    pub need_mib: u64,
+}
+
+/// HA를 켠(`started`) VM을 켜도 HA 용량 예약(설정 `ha_reserve`)이 남는지 메모리 합으로 본다(조합은 보지
+/// 않는다). 예약이 없거나 HA로 켜지 않는 VM은 늘 통과한다. 대상 노드는 HA 가능·온라인·유지보수 아님·종료
+/// 표시 없는 노드이고, `used`는 그 노드들에 놓인 켜진 VM(이 VM 빼고, 마이그레이션 중이면 원본에 한 번)과
+/// 유지보수(비우기)·종료 중인(얼리기 빼고) HA 가능 노드에 놓인 켜진 `started` HA VM(곧 대상 노드로 온다)이다.
+pub fn ha_capacity(inv: &Inventory, settings: &SettingsSpec, vm: &Vm) -> Result<(), HaCapacity> {
+    let Some(reserve) = settings.ha_reserve else {
+        return Ok(());
+    };
+    if !vm
+        .spec
+        .ha
+        .as_ref()
+        .is_some_and(|ha| ha.state == HaState::Started)
+    {
+        return Ok(());
+    }
+    let targets: Vec<&Node> = inv
+        .nodes
+        .iter()
+        .filter(|n| {
+            ha_capable(n) && n.status.online && !n.spec.maintenance && n.status.shutdown.is_none()
+        })
+        .collect();
+    let capacity_mib: u64 = targets.iter().map(|n| n.status.memory_mib).sum();
+    let reserve_mib = match reserve {
+        HaReserve::Nodes(count) => {
+            let mut sizes: Vec<u64> = targets.iter().map(|n| n.status.memory_mib).collect();
+            sizes.sort_unstable_by(|a, b| b.cmp(a));
+            sizes.into_iter().take(usize::from(count)).sum()
+        }
+        HaReserve::Percent(p) => capacity_mib * u64::from(p) / 100,
+    };
+    let leaving = |id: Uuid| {
+        inv.nodes.iter().any(|n| {
+            n.id == id
+                && ha_capable(n)
+                && (n.spec.maintenance
+                    || n.status
+                        .shutdown
+                        .is_some_and(|s| s.action != ShutdownAction::Freeze))
+        })
+    };
+    let started = |v: &Vm| {
+        v.spec
+            .ha
+            .as_ref()
+            .is_some_and(|ha| ha.state == HaState::Started)
+    };
+    let used_mib: u64 = inv
+        .vms
+        .iter()
+        .filter(|v| v.id != vm.id && v.spec.power == PowerState::Running)
+        .filter(|v| {
+            v.spec
+                .node
+                .is_some_and(|id| targets.iter().any(|n| n.id == id) || (started(v) && leaving(id)))
+        })
+        .map(|v| u64::from(v.spec.memory_mib))
+        .sum();
+    let need_mib = u64::from(vm.spec.memory_mib);
+    if used_mib + need_mib <= capacity_mib.saturating_sub(reserve_mib) {
+        return Ok(());
+    }
+    Err(HaCapacity {
+        capacity_mib,
+        reserve_mib,
+        used_mib,
+        need_mib,
+    })
 }
 
 #[cfg(test)]
@@ -547,6 +633,251 @@ mod tests {
         );
         inv.nodes.pop();
         assert_eq!(sched(&me, &inv), Err(NoNode));
+    }
+
+    fn ha_node(memory_mib: u64) -> Node {
+        let mut n = node(memory_mib);
+        n.status.ha = Some(NodeHa {
+            fencing: Fencing::Process,
+            recover_after_secs: 12,
+            fence_after_secs: Some(10),
+        });
+        n
+    }
+
+    fn placed(memory_mib: u32, node: &Node, ha: bool) -> Vm {
+        let mut s = spec(memory_mib, Some(node.id), PowerState::Running);
+        s.ha = ha.then(VmHa::default);
+        Resource::new("other", s)
+    }
+
+    fn reserve(r: Option<HaReserve>) -> SettingsSpec {
+        SettingsSpec {
+            ha_reserve: r,
+            ..SettingsSpec::default()
+        }
+    }
+
+    #[test]
+    fn ha_capacity_passes_without_a_reservation_or_for_non_ha_vms() {
+        let a = ha_node(1000);
+        let inv = Inventory {
+            nodes: vec![a.clone()],
+            vms: vec![placed(1000, &a, false)],
+            ..Default::default()
+        };
+        let mut me: Vm = Resource::new("me", spec(4000, None, PowerState::Running));
+        me.spec.ha = Some(VmHa::default());
+        assert_eq!(ha_capacity(&inv, &reserve(None), &me), Ok(()));
+        // HA가 아니거나 `stopped`·`ignored` 정책이면 예약을 보지 않는다.
+        let nodes = reserve(Some(HaReserve::Nodes(1)));
+        assert!(ha_capacity(&inv, &nodes, &me).is_err());
+        for ha in [
+            None,
+            Some(VmHa {
+                state: HaState::Stopped,
+                ..Default::default()
+            }),
+            Some(VmHa {
+                state: HaState::Ignored,
+                ..Default::default()
+            }),
+        ] {
+            me.spec.ha = ha;
+            assert_eq!(ha_capacity(&inv, &nodes, &me), Ok(()));
+        }
+    }
+
+    #[test]
+    fn ha_capacity_reserves_the_largest_nodes_or_a_percentage() {
+        let a = ha_node(4000);
+        let b = ha_node(2000);
+        let c = ha_node(2000);
+        // HA 아닌 VM도 자리를 차지한다.
+        let inv = Inventory {
+            nodes: vec![a.clone(), b.clone(), c.clone()],
+            vms: vec![placed(1000, &b, false), placed(1000, &c, true)],
+            ..Default::default()
+        };
+        let mut me: Vm = Resource::new("me", spec(2000, None, PowerState::Running));
+        me.spec.ha = Some(VmHa::default());
+        // 8000 - 가장 큰 4000 = 4000: 2000 + 2000이 들어간다.
+        let one = reserve(Some(HaReserve::Nodes(1)));
+        assert_eq!(ha_capacity(&inv, &one, &me), Ok(()));
+        me.spec.memory_mib = 2001;
+        assert_eq!(
+            ha_capacity(&inv, &one, &me),
+            Err(HaCapacity {
+                capacity_mib: 8000,
+                reserve_mib: 4000,
+                used_mib: 2000,
+                need_mib: 2001,
+            })
+        );
+        // 두 대: 4000 + 2000을 비운다.
+        me.spec.memory_mib = 1;
+        let two = reserve(Some(HaReserve::Nodes(2)));
+        assert_eq!(ha_capacity(&inv, &two, &me).unwrap_err().reserve_mib, 6000);
+        // 노드보다 많이 예약하면 아무것도 켜지 않는다.
+        let many = reserve(Some(HaReserve::Nodes(8)));
+        assert_eq!(ha_capacity(&inv, &many, &me).unwrap_err().reserve_mib, 8000);
+        // 25% = 2000: 8000 - 2000 - 2000 = 4000까지
+        let quarter = reserve(Some(HaReserve::Percent(25)));
+        me.spec.memory_mib = 4000;
+        assert_eq!(ha_capacity(&inv, &quarter, &me), Ok(()));
+        me.spec.memory_mib = 4001;
+        assert_eq!(
+            ha_capacity(&inv, &quarter, &me).unwrap_err().reserve_mib,
+            2000
+        );
+        // 이 VM이 이미 자리를 잡고 있어도 한 번만 센다.
+        let mut inv = inv;
+        me.spec.memory_mib = 2000;
+        me.spec.node = Some(a.id);
+        inv.vms.push(me.clone());
+        assert_eq!(ha_capacity(&inv, &one, &me), Ok(()));
+    }
+
+    #[test]
+    fn ha_capacity_counts_only_usable_ha_nodes() {
+        let a = ha_node(4000);
+        let mut maintenance = ha_node(4000);
+        maintenance.spec.maintenance = true;
+        let mut offline = ha_node(4000);
+        offline.status.online = false;
+        let mut witness = ha_node(4000);
+        witness.spec.witness = true;
+        let mut shutting = ha_node(4000);
+        shutting.status.shutdown = Some(NodeShutdown {
+            action: ShutdownAction::Failover,
+            maintenance: false,
+            at: 1,
+        });
+        let plain = node(64000);
+        let inv = Inventory {
+            nodes: vec![
+                a.clone(),
+                maintenance.clone(),
+                offline.clone(),
+                witness,
+                shutting,
+                plain.clone(),
+            ],
+            // 쓸 수 없는 노드에 놓인 VM은 `used`에 들지 않는다. 꺼진 VM도 세지 않는다.
+            vms: vec![
+                placed(3000, &maintenance, false),
+                placed(3000, &plain, false),
+                Resource::new("off", spec(3000, Some(a.id), PowerState::Stopped)),
+                placed(1000, &a, false),
+            ],
+            ..Default::default()
+        };
+        let mut me: Vm = Resource::new("me", spec(1000, None, PowerState::Running));
+        me.spec.ha = Some(VmHa::default());
+        let half = reserve(Some(HaReserve::Percent(50)));
+        assert_eq!(ha_capacity(&inv, &half, &me), Ok(()));
+        me.spec.memory_mib = 1001;
+        assert_eq!(
+            ha_capacity(&inv, &half, &me),
+            Err(HaCapacity {
+                capacity_mib: 4000,
+                reserve_mib: 2000,
+                used_mib: 1000,
+                need_mib: 1001,
+            })
+        );
+    }
+
+    /// 유지보수(비우기)·종료 중인 노드의 켜진 `started` HA VM은 곧 대상 노드로 오므로 `used`에 센다. 그 노드는
+    /// `capacity`에 들지 않고, 그 노드의 HA 아닌 VM·`stopped` 정책 VM·꺼진 VM, 얼리는 노드와 오프라인 노드의 VM은
+    /// 세지 않는다.
+    #[test]
+    fn ha_capacity_counts_ha_vms_leaving_maintenance_or_shutting_down_nodes() {
+        let a = ha_node(8000);
+        let mut maintenance = ha_node(4000);
+        maintenance.spec.maintenance = true;
+        let mut shutting = ha_node(4000);
+        shutting.status.shutdown = Some(NodeShutdown {
+            action: ShutdownAction::Migrate,
+            maintenance: true,
+            at: 1,
+        });
+        let mut offline = ha_node(4000);
+        offline.status.online = false;
+        let mut freezing = ha_node(4000);
+        freezing.status.shutdown = Some(NodeShutdown {
+            action: ShutdownAction::Freeze,
+            maintenance: false,
+            at: 1,
+        });
+        let mut parked = placed(500, &maintenance, true);
+        parked.spec.ha = Some(VmHa {
+            state: HaState::Stopped,
+            ..Default::default()
+        });
+        let inv = Inventory {
+            nodes: vec![
+                a.clone(),
+                maintenance.clone(),
+                shutting.clone(),
+                offline.clone(),
+                freezing.clone(),
+            ],
+            vms: vec![
+                placed(1000, &maintenance, true),
+                placed(2000, &shutting, true),
+                placed(3000, &maintenance, false),
+                parked,
+                Resource::new("off", {
+                    let mut s = spec(3000, Some(shutting.id), PowerState::Stopped);
+                    s.ha = Some(VmHa::default());
+                    s
+                }),
+                placed(3000, &offline, true),
+                placed(3000, &freezing, true),
+            ],
+            ..Default::default()
+        };
+        let mut me: Vm = Resource::new("me", spec(1000, None, PowerState::Running));
+        me.spec.ha = Some(VmHa::default());
+        // 8000 - 25% 2000 - 옮겨 올 1000 + 2000 = 3000이 남는다.
+        let quarter = reserve(Some(HaReserve::Percent(25)));
+        assert_eq!(ha_capacity(&inv, &quarter, &me), Ok(()));
+        me.spec.memory_mib = 3001;
+        assert_eq!(
+            ha_capacity(&inv, &quarter, &me),
+            Err(HaCapacity {
+                capacity_mib: 8000,
+                reserve_mib: 2000,
+                used_mib: 3000,
+                need_mib: 3001,
+            })
+        );
+    }
+
+    /// 마이그레이션 중인 VM은 원본 노드(`spec.node`)에서 한 번만 센다.
+    #[test]
+    fn ha_capacity_counts_a_migrating_vm_once() {
+        let a = ha_node(4000);
+        let b = ha_node(4000);
+        let mut moving = placed(2000, &a, true);
+        moving.status.migration = Some(opl_types::vm::MigrationStatus {
+            node: b.id,
+            task: Uuid::nil(),
+            disks: vec![],
+        });
+        let inv = Inventory {
+            nodes: vec![a.clone(), b.clone()],
+            vms: vec![moving],
+            ..Default::default()
+        };
+        let mut me: Vm = Resource::new("me", spec(2000, None, PowerState::Running));
+        me.spec.ha = Some(VmHa::default());
+        // 8000 - 4000 예약 - 2000 = 2000이 남는다.
+        let one = reserve(Some(HaReserve::Nodes(1)));
+        assert_eq!(ha_capacity(&inv, &one, &me), Ok(()));
+        me.spec.memory_mib = 2001;
+        assert_eq!(ha_capacity(&inv, &one, &me).unwrap_err().used_mib, 2000);
     }
 
     #[test]

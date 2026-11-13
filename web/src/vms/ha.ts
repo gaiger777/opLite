@@ -2,7 +2,7 @@ import type { components } from "@/api/schema";
 import type { VmHa, VmSpec } from "@/api/types";
 
 /** 서버의 기본 정책(`VmHa::default`). 옛 `ha: true`와 같다. */
-export const DEFAULT_HA: VmHa = { state: "started", max_restart: 1, max_relocate: 1 };
+export const DEFAULT_HA: VmHa = { state: "started", max_restart: 1, max_relocate: 1, priority: 50 };
 /** 서버의 `MAX_HA_COUNT`: `max_restart`·`max_relocate`의 최댓값 */
 export const MAX_HA_COUNT = 10;
 
@@ -36,10 +36,12 @@ export function haSetting(policy: VmHa | null): components["schemas"]["HaSetting
     policy.state === DEFAULT_HA.state &&
     !policy.group &&
     policy.max_restart === DEFAULT_HA.max_restart &&
-    policy.max_relocate === DEFAULT_HA.max_relocate;
+    policy.max_relocate === DEFAULT_HA.max_relocate &&
+    policy.priority === DEFAULT_HA.priority &&
+    !policy.guest_watch;
   if (isDefault) {
     return true;
   }
-  const { group, ...rest } = policy;
-  return group ? { ...rest, group } : rest;
+  const { group, guest_watch, ...rest } = policy;
+  return { ...rest, ...(group && { group }), ...(guest_watch && { guest_watch }) };
 }

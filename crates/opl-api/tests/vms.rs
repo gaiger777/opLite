@@ -11,7 +11,7 @@ use opl_cluster::ClusterError;
 use opl_driver::DriverError;
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
-use opl_types::node::{Fencing, HA_PLACEMENT, Node, NodeHa, NodeSpec};
+use opl_types::node::{FAST_HA, Fencing, HA_PLACEMENT, Node, NodeHa, NodeSpec};
 use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -973,6 +973,203 @@ async fn ha_policy_objects_wait_for_all_nodes() {
         body["spec"]["ha"],
         json!({ "state": "stopped", "max_restart": 3, "max_relocate": 1 })
     );
+}
+
+/// 우선순위·게스트 감시는 모든 노드가 `fast-ha`를 알 때만 받는다. 범위 밖은 기능보다 먼저 400이다.
+#[tokio::test]
+async fn priority_and_guest_watch_wait_for_all_nodes() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let set_fast_ha = |on: bool| {
+        let cluster = env.cluster.clone();
+        let node = env.node;
+        async move {
+            let mut status = cluster.get::<NodeSpec>(node).unwrap().unwrap().status;
+            status.features.retain(|f| f != FAST_HA);
+            if on {
+                status.features.push(FAST_HA.into());
+            }
+            cluster
+                .update_status::<NodeSpec>(node, &status)
+                .await
+                .unwrap();
+        }
+    };
+    set_fast_ha(false).await;
+
+    let mut req = vm_request("web");
+    // 계획 50 모양(그룹 없는 기본이 아닌 정책)은 그대로 받는다.
+    req["spec"]["ha"] = json!({ "max_restart": 2, "priority": 50 });
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["spec"]["ha"],
+        json!({ "state": "started", "max_restart": 2, "max_relocate": 1 })
+    );
+
+    for (name, ha) in [
+        ("p", json!({ "priority": 80 })),
+        ("g", json!({ "guest_watch": { "timeout_secs": 30 } })),
+    ] {
+        req["name"] = json!(name);
+        req["spec"]["ha"] = ha;
+        let (status, body) = admin.post("/vms", req.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "cluster_upgrading");
+        assert!(
+            body["message"].as_str().unwrap().contains("fast ha"),
+            "{body}"
+        );
+    }
+    for (ha, message) in [
+        (
+            json!({ "priority": 101 }),
+            "ha.priority must be between 0 and 100",
+        ),
+        (
+            json!({ "guest_watch": { "timeout_secs": 5 } }),
+            "ha.guest_watch.timeout_secs must be between 30 and 3600",
+        ),
+    ] {
+        req["spec"]["ha"] = ha;
+        let (status, body) = admin.post("/vms", req.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["message"], message);
+    }
+
+    set_fast_ha(true).await;
+    req["name"] = json!("db");
+    req["spec"]["ha"] = json!({ "priority": 80, "guest_watch": {} });
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["spec"]["ha"],
+        json!({
+            "state": "started",
+            "max_restart": 1,
+            "max_relocate": 1,
+            "priority": 80,
+            "guest_watch": { "timeout_secs": 60 }
+        })
+    );
+}
+
+/// HA 용량 예약: HA VM을 켜는 요청(켜진 채 만들기·켜기)은 예약을 남겨야 하고(409 `ha_capacity`), HA 아닌 VM과
+/// 이미 켜진 HA VM의 다른 고치기는 막지 않는다.
+#[tokio::test]
+async fn ha_vms_start_only_within_the_ha_reserve() {
+    struct Renewed;
+    #[async_trait]
+    impl LeaseRenewer for Renewed {
+        async fn renew_lease(&self, _timeout: Duration) -> Result<(), ClusterError> {
+            Ok(())
+        }
+    }
+    let env = Env::start_with(
+        |c| {
+            c.ha = Some(HaGuard::spawn(
+                Arc::new(Renewed),
+                HaConfig {
+                    fence_after: Duration::from_secs(30),
+                    renew_interval: Duration::from_secs(1),
+                    watchdog: None,
+                },
+            ))
+        },
+        |_| async {},
+    )
+    .await;
+    let admin = env.admin().await;
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.ha = Some(NodeHa {
+        fencing: Fencing::Process,
+        recover_after_secs: 12,
+        fence_after_secs: Some(10),
+    });
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    // 노드 8192 MiB의 절반을 비워 둔다.
+    let (code, body) = admin
+        .patch(
+            "/settings",
+            json!({ "ha_reserve": { "percent": 50 } }),
+            None,
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    let ha_vm = |name: &str, memory: u32, running: bool| {
+        let mut req = vm_request(name);
+        req["spec"]["ha"] = json!(true);
+        req["spec"]["memory_mib"] = json!(memory);
+        if running {
+            req["spec"]["power"] = json!("running");
+        }
+        req
+    };
+    let (code, body) = admin.post("/vms", ha_vm("a", 4096, false)).await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let task = admin.act("a", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    let details = json!({
+        "capacity_mib": 8192,
+        "reserve_mib": 4096,
+        "used_mib": 4096,
+        "need_mib": 256
+    });
+    let (code, body) = admin.post("/vms", ha_vm("b", 256, true)).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "ha_capacity");
+    assert_eq!(body["details"], details);
+    let (code, body) = admin.post("/vms", ha_vm("b", 256, false)).await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (code, body) = admin.post("/vms/b/actions/start", Value::Null).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "ha_capacity");
+    assert_eq!(body["details"], details);
+    assert_eq!(
+        body["message"],
+        "starting HA VM \"b\" (256 MiB) would use capacity reserved for HA recovery: 0 MiB left of 8192 MiB (4096 MiB reserved, 4096 MiB used)"
+    );
+    let (_, vm) = admin.get("/vms/b").await;
+    assert_eq!(vm["spec"]["power"], "stopped");
+
+    // HA 아닌 VM은 예약을 보지 않지만 자리는 차지한다.
+    let mut plain = vm_request("c");
+    plain["spec"]["power"] = json!("running");
+    let (code, body) = admin.post("/vms", plain).await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    // 이미 켜진 HA VM의 다른 고치기는 넘친 뒤에도 된다. 메모리를 늘리면 예약을 본다.
+    let (_, vm) = admin.get("/vms/a").await;
+    let mut spec = vm["spec"].clone();
+    spec["restart"] = json!("on-failure");
+    let (code, body) = admin
+        .put("/vms/a", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    spec["memory_mib"] = json!(4352);
+    let (code, body) = admin.put("/vms/a", json!({ "spec": spec }), None).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "ha_capacity");
+    // 이미 켜기로 된 VM의 start는 다시 보지 않는다.
+    let task = admin.act("a", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    // 예약을 지우면 켤 수 있다.
+    let (code, body) = admin
+        .patch("/settings", json!({ "ha_reserve": "none" }), None)
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let task = admin.act("b", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
 }
 
 #[tokio::test]
