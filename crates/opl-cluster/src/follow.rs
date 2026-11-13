@@ -98,7 +98,7 @@ impl FollowFrame {
 
     /// 이 프레임이 바꾼 클러스터 정보의 관찰 노드 목록(프레임 안의 마지막 것). 클러스터 정보를 싣지 않으면 `None`이다.
     /// 지운 관찰 노드의 열린 스트림이 목록에서 빠지는 프레임부터 받지 않게 한다(목록 캐시의 갱신을 기다리지 않고).
-    pub fn observers(&self) -> Option<BTreeMap<NodeId, String>> {
+    pub fn observers(&self) -> Option<BTreeMap<NodeId, OrbNode>> {
         let events = match self {
             FollowFrame::Batch { events, .. } | FollowFrame::BatchPart { events } => events,
             FollowFrame::SnapshotPart { objects } => {
@@ -503,6 +503,7 @@ mod tests {
                     .iter()
                     .map(|id| (id.0, format!("node-{id}")))
                     .collect(),
+                ..Default::default()
             })
             .unwrap();
             r
@@ -561,6 +562,7 @@ mod tests {
                 .iter()
                 .map(|id| (id.0, format!("node-{id}")))
                 .collect(),
+            ..ClusterStatus::default()
         };
         let mut info: ClusterInfo = Resource::new(
             "test",

@@ -250,7 +250,7 @@ fn observers(db: &Database) -> Result<std::collections::BTreeMap<NodeId, String>
         .unwrap_or_default())
 }
 
-/// 클러스터 정보의 관찰 노드 목록에서 `id`를 뺀다. 목록에 없으면 `None`, 뺐으면 그 쓰기의 인덱스다. 다른 쓰기와
+/// 클러스터 정보의 관찰 노드 목록(과 그 링크)에서 `id`를 뺀다. 목록에 없으면 `None`, 뺐으면 그 쓰기의 인덱스다. 다른 쓰기와
 /// 겹치면(revision 불일치, 리더가 아직 적용하지 않은 쓰기) 다시 읽어 `deadline`까지 다시 한다.
 async fn unlist_observer(
     ctx: &LeaderCtx,
@@ -264,6 +264,7 @@ async fn unlist_observer(
         if status.observers.remove(&id.0).is_none() {
             return Ok(None);
         }
+        status.observer_links.remove(&id.0);
         let command = Command::UpdateStatusIf {
             kind: Kind::Cluster,
             id: info.id,

@@ -484,6 +484,7 @@ async fn a_learner_listed_as_an_observer_while_catching_up_is_not_promoted() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let status = ClusterStatus {
             observers: [(n4.0, "node-4".to_string())].into(),
+            ..ClusterStatus::default()
         };
         c.update_status::<ClusterSpec>(info.id, &status)
             .await

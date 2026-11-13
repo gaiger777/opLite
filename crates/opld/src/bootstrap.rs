@@ -273,16 +273,19 @@ pub async fn refresh_bridges(cluster: &Cluster, host: &Host) -> anyhow::Result<(
     .await
 }
 
-/// 기능 표시가 이 빌드의 목록과 다르면 고쳐 쓴다. 롤링 업그레이드 중 옛 버전 리더가 이 노드의 status를
-/// 다시 쓰면(모르는 `features`를 빼고) 지워지므로 주기적으로 되살린다. 같으면 쓰지 않는다.
-pub async fn refresh_features(cluster: &Cluster) -> anyhow::Result<()> {
+/// 기능 표시와 클러스터 링크가 이 빌드의 목록·설정과 다르면 고쳐 쓴다. 롤링 업그레이드 중 옛 버전 리더가 이
+/// 노드의 status를 다시 쓰면(모르는 `features`·`cluster_addresses`를 빼고) 지워지므로 주기적으로 되살린다. 같으면
+/// 쓰지 않는다.
+pub async fn refresh_features(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
     let features = features();
+    let links = announced_links(config);
     update_node_status(cluster, |status| {
-        if status.features == features {
+        if status.features == features && status.cluster_addresses == links {
             return false;
         }
-        tracing::info!(?features, "restoring the recorded features");
+        tracing::info!(?features, ?links, "restoring the recorded features");
         status.features = features.clone();
+        status.cluster_addresses = links.clone();
         true
     })
     .await
@@ -659,7 +662,8 @@ pub(crate) mod tests {
                 "vip",
                 "lease-liveness",
                 "voter-limit",
-                "observer"
+                "observer",
+                "multi-link"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -684,13 +688,14 @@ pub(crate) mod tests {
                 "vip",
                 "lease-liveness",
                 "voter-limit",
-                "observer"
+                "observer",
+                "multi-link"
             ]
         );
         cluster.shutdown().await.unwrap();
     }
 
-    /// 옛 버전 리더가 status를 다시 쓰며 지운 기능 표시를 주기 갱신이 되살린다. 같으면 쓰지 않는다.
+    /// 옛 버전 리더가 status를 다시 쓰며 지운 기능 표시와 클러스터 링크를 주기 갱신이 되살린다. 같으면 쓰지 않는다.
     #[tokio::test]
     async fn refresh_restores_features_erased_by_an_old_leader() {
         let dir = tempfile::tempdir().unwrap();
@@ -701,17 +706,20 @@ pub(crate) mod tests {
         let node = || cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
         register_node(&cluster, &config, &host).await.unwrap();
         let revision = node().revision;
-        refresh_features(&cluster).await.unwrap();
+        refresh_features(&cluster, &config).await.unwrap();
         assert_eq!(node().revision, revision);
-        // 옛 리더는 모르는 `features`를 빼고 status를 다시 쓴다.
+        // 옛 리더는 모르는 `features`·`cluster_addresses`를 빼고 status를 다시 쓴다.
         update_node_status(&cluster, |status| {
             status.features.clear();
+            status.cluster_addresses.clear();
             true
         })
         .await
         .unwrap();
         assert!(node().status.features.is_empty());
-        refresh_features(&cluster).await.unwrap();
+        refresh_features(&cluster, &config).await.unwrap();
+        assert_eq!(node().status.cluster_addresses, config.cluster_links());
+        assert!(!node().status.cluster_addresses.is_empty());
         assert_eq!(
             node().status.features,
             [
@@ -725,9 +733,42 @@ pub(crate) mod tests {
                 "vip",
                 "lease-liveness",
                 "voter-limit",
-                "observer"
+                "observer",
+                "multi-link"
             ]
         );
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 주기 갱신도 노드 인증서에 이름이 있는 링크만 되살린다.
+    #[tokio::test]
+    async fn refresh_restores_only_links_named_in_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let mut config = test_config();
+        config.data_dir = dir.path().join("data");
+        config.cluster_addresses = vec!["10.0.0.1".into(), "10.1.0.1".into()];
+        let ca = ClusterCa::generate("t").unwrap();
+        let (key_pem, csr) = opl_peer::pki::node_key_and_csr().unwrap();
+        NodeTls {
+            ca_pem: ca.cert_pem.clone(),
+            cert_pem: ca.sign_node(&csr, id.0, &["10.0.0.1".into()]).unwrap(),
+            key_pem,
+        }
+        .save(&pki_dir(&config))
+        .unwrap();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        register_node(&cluster, &config, &host).await.unwrap();
+        update_node_status(&cluster, |status| {
+            status.cluster_addresses = vec!["10.0.0.1:8007".into(), "10.1.0.1:8007".into()];
+            true
+        })
+        .await
+        .unwrap();
+        refresh_features(&cluster, &config).await.unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert_eq!(node.status.cluster_addresses, ["10.0.0.1:8007"]);
         cluster.shutdown().await.unwrap();
     }
 
@@ -804,6 +845,7 @@ pub(crate) mod tests {
                     "lease-liveness".into(),
                     "voter-limit".into(),
                     "observer".into(),
+                    "multi-link".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

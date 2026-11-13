@@ -557,7 +557,7 @@ impl Member {
                     if let Err(e) = bootstrap::refresh_bridges(&cluster, &host).await {
                         tracing::warn!(error = %e, "cannot record bridges");
                     }
-                    if let Err(e) = bootstrap::refresh_features(&cluster).await {
+                    if let Err(e) = bootstrap::refresh_features(&cluster, &config).await {
                         tracing::warn!(error = %e, "cannot record features");
                     }
                 }
@@ -819,7 +819,7 @@ impl Member {
                 }
                 loop {
                     tokio::time::sleep(BRIDGE_REFRESH).await;
-                    if let Err(e) = bootstrap::refresh_features(&cluster).await {
+                    if let Err(e) = bootstrap::refresh_features(&cluster, &config).await {
                         tracing::warn!(error = %e, "cannot record features");
                     }
                 }

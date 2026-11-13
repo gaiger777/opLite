@@ -14,8 +14,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
-use opl_cluster::ClusterError;
 use opl_cluster::types::{LeaderRequest, NodeId};
+use opl_cluster::{ClusterError, MULTI_LINK};
 use opl_peer::pki::{ClusterCa, fingerprint};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, JoinToken, JoinTokenSpec};
 use opl_types::host::{same_link, valid_host};
@@ -582,9 +582,9 @@ pub async fn join(
     // 옛 노드는 여러 링크의 멤버십을 첫 링크 하나로 읽으므로 모든 노드가 링크를 알 때만 받는다. 다시 합류하는
     // 노드 자신의 옛 기록(등록 전이면 기능이 비어 있다)은 세지 않는다.
     if links.len() > 1 {
-        let mut old = missing_feature(&state.cluster, "multi-link")?;
+        let mut old = missing_feature(&state.cluster, MULTI_LINK)?;
         old.retain(|name| *name != req.name);
-        lacking_feature("multi-link", &old)?;
+        lacking_feature(MULTI_LINK, &old)?;
     }
     if req.node.is_nil() {
         return Err(ApiError::bad_request("node id must not be nil"));

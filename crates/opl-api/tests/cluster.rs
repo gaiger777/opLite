@@ -216,6 +216,7 @@ async fn a_rejoining_observer_is_treated_like_a_learner() {
     let info = &infos[0];
     let status = ClusterStatus {
         observers: [(node, "10.0.0.7:8007".to_string())].into(),
+        ..ClusterStatus::default()
     };
     env.cluster
         .update_status::<ClusterSpec>(info.id, &status)
@@ -497,10 +498,13 @@ async fn hosts_must_be_ips_or_host_names() {
     );
 }
 
-/// 노드의 기록된 기능에 `feature`를 더한다(이 빌드가 아직 적지 않는 기능).
-async fn add_feature(env: &Env, node: Uuid, feature: &str) {
+/// 노드의 기록된 기능에서 `feature`를 더하거나(`on`) 뺀다(옛 노드).
+async fn set_feature(env: &Env, node: Uuid, feature: &str, on: bool) {
     let mut status = env.cluster.get::<NodeSpec>(node).unwrap().unwrap().status;
-    status.features.push(feature.into());
+    status.features.retain(|f| f != feature);
+    if on {
+        status.features.push(feature.into());
+    }
     env.cluster
         .update_status::<NodeSpec>(node, &status)
         .await
@@ -516,12 +520,13 @@ async fn a_node_joins_with_several_links() {
     let links = vec!["10.0.0.7:8007".to_string(), "10.1.0.7:8007".into()];
     let (mut req, node) = join_request(&new_token(&env).await, "node2");
     req.cluster_addresses = links.clone();
+    set_feature(&env, env.node, "multi-link", false).await;
     let (status, body) = anon.post("/cluster/join", json!(req.clone())).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "cluster_upgrading");
     assert!(env.cluster.members().learners.is_empty());
 
-    add_feature(&env, env.node, "multi-link").await;
+    set_feature(&env, env.node, "multi-link", true).await;
     let (status, body) = anon.post("/cluster/join", json!(req)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(

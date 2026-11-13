@@ -335,7 +335,8 @@ async fn wait_members(c: &opl_cluster::Cluster, what: &str, cond: impl Fn(&Membe
 }
 
 /// 클러스터 정보의 관찰 노드(`ClusterStatus.observers`)는 멤버 목록에 들어가 주소를 찾을 수 있다. Raft 구성원과
-/// 겹치면(내리는 중) 구성원으로 센다. 다시 연 노드는 저장소에서 바로 읽는다.
+/// 겹치면(내리는 중) 구성원으로 센다. 관찰 노드의 링크(`observer_links`)는 링크 책과 `Members.links`에 들어간다.
+/// 다시 연 노드는 저장소에서 바로 읽는다.
 #[tokio::test]
 async fn members_include_the_observers_in_the_cluster_info() {
     let mut tc = TestCluster::start(1).await;
@@ -353,6 +354,8 @@ async fn members_include_the_observers_in_the_cluster_info() {
     assert!(!c.members().contains(observer));
 
     info.status.observers = BTreeMap::from([(observer.0, "node-9".into()), (me.0, "stale".into())]);
+    let links = vec!["node-9".to_string(), "node-9b".to_string()];
+    info.status.observer_links = BTreeMap::from([(observer.0, links.clone())]);
     c.update_status::<ClusterSpec>(info.id, &info.status)
         .await
         .unwrap();
@@ -360,6 +363,8 @@ async fn members_include_the_observers_in_the_cluster_info() {
     let members = c.members();
     assert_eq!(members.addr(observer), Some("node-9"));
     assert_eq!(members.observers.len(), 1);
+    assert_eq!(members.links[&observer], links);
+    assert_eq!(c.link_book().links("node-9"), links);
     assert_eq!(
         members.addr(me),
         members.voters.get(&me).map(String::as_str)
@@ -369,10 +374,12 @@ async fn members_include_the_observers_in_the_cluster_info() {
     tc.open(me).await;
     let c = tc.get(me);
     assert_eq!(c.members().addr(observer), Some("node-9"));
+    assert_eq!(c.link_book().links("node-9"), links);
 
     c.update_status::<ClusterSpec>(info.id, &ClusterStatus::default())
         .await
         .unwrap();
     wait_members(c, "the observer is gone", |m| !m.contains(observer)).await;
     assert_eq!(c.members().addr(observer), None);
+    assert_eq!(c.link_book().links("node-9"), ["node-9"]);
 }

@@ -14,6 +14,9 @@
 //! `RoleKeeper`가 보고 관찰 노드가 된다) 다음 틱에 멤버십에서 뺀다(`RemoveNodes`). 올리기는 learner로 더한 뒤
 //! 목록에서 뺀다(그 사이 끊기면 "목록에 있는 learner"라 다시 내려간다: 어느 쪽이든 목록과 멤버십 가운데 한 곳에는
 //! 남는다). 투표 멤버는 목록에 두지 않는다(있으면 목록에서 뺀다).
+//!
+//! 링크 맞추기(설계 §7): 바꿀 멤버십이 없으면 노드가 적은 클러스터 링크(`NodeStatus.cluster_addresses`)와 다른
+//! 노드 하나를 고쳐 쓴다(Raft 구성원은 `SetNodes`, 관찰 노드는 목록의 `observer_links`). [`link_fix`]가 고른다.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -23,13 +26,14 @@ use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
 use openraft::raft::ClientWriteResponse;
 use openraft::{ChangeMembers, LogId, Raft, RaftMetrics, ServerState};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
+use opl_types::host::same_link;
 use opl_types::node::{Node, NodeSpec};
 use opl_types::settings::{SETTINGS_NAME, SettingsSpec};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::cluster::{Cluster, ClusterError};
+use crate::cluster::{Cluster, ClusterError, observer_nodes};
 use crate::types::{NodeId, OrbNode, TypeConfig};
 
 /// 이 기능을 아는 노드는 투표 멤버 승격을 리더의 `VoterKeeper`에 맡긴다. 모든 노드가 알면 리더가 상한을 지킨다.
@@ -37,6 +41,9 @@ pub const VOTER_LIMIT: &str = "voter-limit";
 
 /// 이 기능을 아는 노드는 관찰 노드가 될 수 있다(설계 §6). 모든 노드가 알 때만 키퍼가 learner를 관찰 노드로 내린다.
 pub const OBSERVER: &str = "observer";
+
+/// 이 기능을 아는 노드는 여러 클러스터 링크를 안다(설계 §7). 모든 노드가 알 때만 키퍼가 링크를 맞춘다.
+pub const MULTI_LINK: &str = "multi-link";
 
 /// 투표 멤버 밖에 learner로 남기는 건강한 노드 수(위트니스 제외). 나머지는 관찰 노드다. 투표 멤버가 죽으면 이것이
 /// 먼저 올라가고, 줄면 관찰 노드를 learner로 올린다.
@@ -323,6 +330,8 @@ struct State {
     warned: Option<u64>,
     /// 관찰 노드 목록에 있는 learner(내려가는 중)를 처음 본 시각
     listed_since: BTreeMap<NodeId, Instant>,
+    /// 다른 노드의 링크와 겹쳐 맞추지 않는다고 경고한 (노드, 그 링크를 가진 노드)
+    link_clashes: BTreeSet<(NodeId, NodeId)>,
 }
 
 async fn run(
@@ -414,15 +423,9 @@ async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) 
         return;
     };
     let info = infos.into_iter().next();
-    let listed: BTreeMap<NodeId, String> = info
+    let listed: BTreeMap<NodeId, OrbNode> = info
         .as_ref()
-        .map(|i| {
-            i.status
-                .observers
-                .iter()
-                .map(|(id, addr)| (NodeId(*id), addr.clone()))
-                .collect()
-        })
+        .map(|i| observer_nodes(i.status.clone()))
         .unwrap_or_default();
     state.listed_since.retain(|id, _| listed.contains_key(id));
     if let Some(info) = &info
@@ -478,6 +481,20 @@ async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) 
     });
     let settling = age(since) < config.healthy_within;
     let Some(change) = plan(cluster.id(), &members, limit, settling, observers_ready) else {
+        // 바꿀 멤버십이 없을 때만 링크를 맞춘다(살아 있는 과반이 없으면 쓰기가 끝나지 않는다).
+        if alive_majority(&members, &voters) {
+            sync_links(
+                cluster,
+                config,
+                state,
+                &m,
+                info.as_ref(),
+                &listed,
+                &nodes,
+                &name,
+            )
+            .await;
+        }
         return;
     };
     // 계획은 장벽·목록 읽기 전의 지표로 세웠다. 그 사이 구성이 바뀌었으면(다른 변경, 리더 교체) 다음 틱에 다시 세운다.
@@ -507,7 +524,7 @@ async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) 
                 return;
             };
             let mut next = listed.clone();
-            next.insert(id, node.addr().to_string());
+            next.insert(id, node.clone());
             match write_observers(cluster, info, next).await {
                 Ok(_) => tracing::info!("moving {} out of Raft as an observer", name(id)),
                 Err(e) => tracing::warn!(error = %e, ?change, "cannot list an observer"),
@@ -547,7 +564,7 @@ async fn fix_listed(
     raft: &Raft<TypeConfig>,
     m: &RaftMetrics<NodeId, OrbNode>,
     info: &ClusterInfo,
-    listed: &BTreeMap<NodeId, String>,
+    listed: &BTreeMap<NodeId, OrbNode>,
     voters: &BTreeSet<NodeId>,
     name: &impl Fn(NodeId) -> String,
 ) -> bool {
@@ -560,7 +577,7 @@ async fn fix_listed(
         let next = listed
             .iter()
             .filter(|(id, _)| !voters.contains(id))
-            .map(|(id, addr)| (*id, addr.clone()))
+            .map(|(id, node)| (*id, node.clone()))
             .collect();
         match write_observers(cluster, info, next).await {
             Ok(_) => tracing::warn!(
@@ -612,22 +629,22 @@ async fn fix_listed(
     true
 }
 
-/// 관찰 노드를 learner로 더한 뒤 목록에서 뺀다. 목록에서 빼지 못하면 다음 틱에 "목록에 있는 learner"로 보여 다시
-/// 관찰 노드가 된다(목록과 멤버십 어느 쪽에도 없는 노드는 생기지 않는다).
+/// 관찰 노드를 목록의 링크 그대로 learner로 더한 뒤 목록에서 뺀다. 목록에서 빼지 못하면 다음 틱에 "목록에 있는
+/// learner"로 보여 다시 관찰 노드가 된다(목록과 멤버십 어느 쪽에도 없는 노드는 생기지 않는다).
 async fn return_observer(
     cluster: &Cluster,
     config: &VoterKeeperConfig,
     raft: &Raft<TypeConfig>,
     id: NodeId,
-    listed: &BTreeMap<NodeId, String>,
+    listed: &BTreeMap<NodeId, OrbNode>,
     name: &impl Fn(NodeId) -> String,
 ) {
-    let Some(addr) = listed.get(&id) else {
+    let Some(node) = listed.get(&id) else {
         return;
     };
     let added = tokio::time::timeout(
         config.change_timeout,
-        raft.add_learner(id, OrbNode::single(addr.clone()), false),
+        raft.add_learner(id, node.clone(), false),
     )
     .await;
     match outcome(added) {
@@ -645,12 +662,7 @@ async fn return_observer(
     let Some(info) = infos.into_iter().next() else {
         return;
     };
-    let mut next: BTreeMap<NodeId, String> = info
-        .status
-        .observers
-        .iter()
-        .map(|(id, addr)| (NodeId(*id), addr.clone()))
-        .collect();
+    let mut next = observer_nodes(info.status.clone());
     next.remove(&id);
     match write_observers(cluster, &info, next).await {
         Ok(_) => tracing::info!("added the observer {} back as a learner", name(id)),
@@ -658,16 +670,22 @@ async fn return_observer(
     }
 }
 
-/// 클러스터 정보의 관찰 노드 목록을 `observers`로 바꾼다(읽은 뒤 다른 쪽이 썼으면 `RevisionMismatch`).
+/// 클러스터 정보의 관찰 노드 목록을 `observers`로 바꾼다(읽은 뒤 다른 쪽이 썼으면 `RevisionMismatch`). 링크가 둘
+/// 이상인 관찰 노드만 `observer_links`에 링크 목록을 쓴다.
 async fn write_observers(
     cluster: &Cluster,
     info: &ClusterInfo,
-    observers: BTreeMap<NodeId, String>,
+    observers: BTreeMap<NodeId, OrbNode>,
 ) -> Result<u64, ClusterError> {
     let status = ClusterStatus {
         observers: observers
+            .iter()
+            .map(|(id, node)| (id.0, node.addr().to_string()))
+            .collect(),
+        observer_links: observers
             .into_iter()
-            .map(|(id, addr)| (id.0, addr))
+            .filter(|(_, node)| node.addrs.len() > 1)
+            .map(|(id, node)| (id.0, node.addrs))
             .collect(),
     };
     cluster
@@ -731,6 +749,142 @@ async fn finish_joint(
                 state.finish_warned = log_id;
                 tracing::warn!(error = %e, "cannot finish an interrupted change of the voting members");
             }
+        }
+    }
+}
+
+/// 링크를 맞출 노드 하나(id 순으로 처음 것)와 그 노드의 새 값: 노드가 적은 링크(`NodeStatus.cluster_addresses`)가
+/// `current`(멤버십과 관찰 노드 목록의 노드 값)와 다른 노드. 적은 링크가 비었으면(등록 전, 옛 기록) 그대로 둔다.
+/// 모든 노드(위트니스·관찰 노드 포함)가 [`MULTI_LINK`]를 알릴 때만 고른다: 옛 노드는 링크 목록을 첫 링크 하나로
+/// 읽고, 옛 리더는 멤버십을 다시 쓰며 링크를 떨어뜨린다. 첫 링크가 바뀌는 것(우선 링크를 새 망으로)도 고른다.
+/// 적은 링크가 다른 노드의 링크와 겹치는 노드는 건너뛴다([`link_clashes`]).
+pub(crate) fn link_fix(
+    current: &BTreeMap<NodeId, OrbNode>,
+    nodes: &BTreeMap<NodeId, Node>,
+) -> Option<(NodeId, OrbNode)> {
+    let ready = current.keys().all(|id| {
+        nodes
+            .get(id)
+            .is_some_and(|n| n.status.features.iter().any(|f| f == MULTI_LINK))
+    });
+    if !ready {
+        return None;
+    }
+    current.iter().find_map(|(id, node)| {
+        let wanted = &nodes.get(id)?.status.cluster_addresses;
+        (!wanted.is_empty() && *wanted != node.addrs && clash(*id, wanted, current).is_none())
+            .then(|| (*id, OrbNode::new(wanted.clone())))
+    })
+}
+
+/// 적은 링크가 다른 노드의 지금 링크와 겹치는 (노드, 그 링크를 가진 노드). 그대로 쓰면 그 다른 노드에 갈 Raft
+/// RPC·리더 요청을 이 노드가 받게 된다(오타, 다시 쓴 IP).
+pub(crate) fn link_clashes(
+    current: &BTreeMap<NodeId, OrbNode>,
+    nodes: &BTreeMap<NodeId, Node>,
+) -> BTreeSet<(NodeId, NodeId)> {
+    current
+        .iter()
+        .filter_map(|(id, node)| {
+            let wanted = &nodes.get(id)?.status.cluster_addresses;
+            if wanted.is_empty() || *wanted == node.addrs {
+                return None;
+            }
+            Some((*id, clash(*id, wanted, current)?))
+        })
+        .collect()
+}
+
+/// `wanted`의 링크를 이미 쓰는 `id` 아닌 노드
+fn clash(id: NodeId, wanted: &[String], current: &BTreeMap<NodeId, OrbNode>) -> Option<NodeId> {
+    current.iter().find_map(|(other, node)| {
+        (*other != id
+            && node
+                .addrs
+                .iter()
+                .any(|have| wanted.iter().any(|w| same_link(have, w))))
+        .then_some(*other)
+    })
+}
+
+/// [`link_fix`]가 고른 노드의 링크를 고쳐 쓴다: Raft 구성원은 노드 값만 바꾸는 `SetNodes`(투표 멤버가 그대로라
+/// openraft 0.9.25는 joint 없이 한 항목으로 커밋한다), 관찰 노드는 목록(`observer_links`, 첫 링크가 바뀌면
+/// `observers`의 값도). 앞선 멤버십 변경이 커밋 중이면(`Busy`) 다음 틱에 다시 본다.
+#[allow(clippy::too_many_arguments)]
+async fn sync_links(
+    cluster: &Cluster,
+    config: &VoterKeeperConfig,
+    state: &mut State,
+    m: &RaftMetrics<NodeId, OrbNode>,
+    info: Option<&ClusterInfo>,
+    listed: &BTreeMap<NodeId, OrbNode>,
+    nodes: &BTreeMap<NodeId, Node>,
+    name: &impl Fn(NodeId) -> String,
+) {
+    let membership = m.membership_config.membership();
+    // 목록과 멤버십에 다 있으면(내려가는 중) 멤버십의 것
+    let mut current = listed.clone();
+    current.extend(membership.nodes().map(|(id, node)| (*id, node.clone())));
+    // 겹치는 링크는 맞추지 않고 처음 볼 때 한 번 경고한다.
+    let clashes = link_clashes(&current, nodes);
+    for (id, other) in clashes.difference(&state.link_clashes) {
+        tracing::warn!(
+            node = %name(*id),
+            other = %name(*other),
+            "not updating the cluster links of a node: they include a link of another node"
+        );
+    }
+    state.link_clashes = clashes;
+    let Some((id, node)) = link_fix(&current, nodes) else {
+        return;
+    };
+    let links = node.to_string();
+    if membership.get_node(&id).is_none() {
+        let Some(info) = info else {
+            return;
+        };
+        let mut next = listed.clone();
+        next.insert(id, node);
+        match write_observers(cluster, info, next).await {
+            Ok(_) => {
+                tracing::info!(%links, "updated the cluster links of the observer {}", name(id))
+            }
+            Err(e) => tracing::warn!(error = %e, node = %name(id), "cannot update observer links"),
+        }
+        return;
+    }
+    // 계획은 장벽·목록 읽기 전의 지표로 세웠다(`tick`과 같이).
+    let Some(raft) = cluster.raft() else {
+        return;
+    };
+    if !same_config(cluster, m) {
+        return;
+    }
+    let was_voter = membership.voter_ids().any(|v| v == id);
+    let change = ChangeMembers::SetNodes(BTreeMap::from([(id, node)]));
+    match change_members(&raft, change, config.change_timeout).await {
+        Outcome::Done => {
+            tracing::info!(%links, "updated the cluster links of {}", name(id));
+            // `same_config`와 이 변경 사이에 노드 제거(`Remove`)가 커밋됐으면 openraft의 `SetNodes`(없는 노드는
+            // 더한다)가 그 노드를 learner로 되살린다. 투표 멤버였는데 아니거나 Node 기록이 없으면 알리기만 한다.
+            let now_voter = raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .any(|v| v == id);
+            let recorded = matches!(cluster.get::<NodeSpec>(id.0), Ok(Some(_)));
+            if (was_voter && !now_voter) || !recorded {
+                tracing::warn!(
+                    node = %name(id),
+                    "updated the cluster links of a node that was removed meanwhile; it may be back as a learner"
+                );
+            }
+        }
+        Outcome::Busy => {}
+        Outcome::Failed(e) => {
+            tracing::warn!(error = %e, node = %name(id), "cannot update the cluster links")
         }
     }
 }
@@ -1276,5 +1430,88 @@ mod tests {
     #[test]
     fn the_feature_is_listed() {
         assert!(opl_types::node::FEATURES.contains(&VOTER_LIMIT));
+        assert!(opl_types::node::FEATURES.contains(&MULTI_LINK));
+    }
+
+    /// 노드 `n`의 Node 기록: 적은 링크 `links`, 기능 `multi-link`
+    fn linked(n: u64, links: &[&str]) -> (NodeId, Node) {
+        let (id, mut node) = node(n, &[VOTER_LIMIT, MULTI_LINK], Some("0.3.0"));
+        node.status.cluster_addresses = links.iter().map(|l| l.to_string()).collect();
+        (id, node)
+    }
+
+    /// 적은 링크가 다른 노드의 링크(같은 주소의 다른 표기 포함)와 겹치는 노드는 맞추지 않고 다음 노드를 고른다.
+    #[test]
+    fn link_fix_skips_links_of_other_nodes() {
+        let current: BTreeMap<NodeId, OrbNode> = BTreeMap::from([
+            (id(1), OrbNode::single("10.0.0.1:8007")),
+            (id(2), OrbNode::single("[fd00::2]:8007")),
+            (id(3), OrbNode::single("10.0.0.3:8007")),
+        ]);
+        let nodes: BTreeMap<NodeId, Node> = [
+            linked(1, &["10.0.0.1:8007", "[fd00:0::2]:8007"]),
+            linked(2, &["[fd00::2]:8007"]),
+            linked(3, &["10.0.0.3:8007", "10.1.0.3:8007"]),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            link_fix(&current, &nodes),
+            Some((id(3), OrbNode::new(["10.0.0.3:8007", "10.1.0.3:8007"])))
+        );
+        assert_eq!(
+            link_clashes(&current, &nodes),
+            BTreeSet::from([(id(1), id(2))])
+        );
+    }
+
+    /// 링크 맞추기는 적은 링크가 노드 값과 다른 노드를 한 번에 하나(id 순) 고르고, 적은 링크가 비었으면 그대로
+    /// 두며, `multi-link`를 모르는 노드가 하나라도 있으면(관찰 노드 포함) 아무것도 고르지 않는다.
+    #[test]
+    fn link_fix_picks_one_node_at_a_time() {
+        let mut current: BTreeMap<NodeId, OrbNode> = BTreeMap::from([
+            (id(1), OrbNode::single("a1")),
+            (id(2), OrbNode::single("a2")),
+            (id(3), OrbNode::new(["a3", "b3"])),
+        ]);
+        let mut nodes: BTreeMap<NodeId, Node> = [
+            linked(1, &["a1"]),
+            linked(2, &["a2", "b2"]),
+            linked(3, &["a3", "b3"]),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            link_fix(&current, &nodes),
+            Some((id(2), OrbNode::new(["a2", "b2"])))
+        );
+        nodes.extend([linked(1, &["a1", "b1"])]);
+        assert_eq!(
+            link_fix(&current, &nodes),
+            Some((id(1), OrbNode::new(["a1", "b1"])))
+        );
+        current.insert(id(1), OrbNode::new(["a1", "b1"]));
+        current.insert(id(2), OrbNode::new(["a2", "b2"]));
+        assert_eq!(link_fix(&current, &nodes), None);
+        // 순서를 바꾸면 첫 링크도 바꾼다.
+        nodes.extend([linked(3, &["b3", "a3"])]);
+        assert_eq!(
+            link_fix(&current, &nodes),
+            Some((id(3), OrbNode::new(["b3", "a3"])))
+        );
+        // 적은 링크가 없으면(등록 전, 옛 기록) 그대로 둔다.
+        nodes.extend([linked(3, &[])]);
+        assert_eq!(link_fix(&current, &nodes), None);
+        // 관찰 노드 4가 기능을 모르면(또는 Node 기록이 없으면) 아무것도 고르지 않는다.
+        nodes.extend([linked(1, &["c1"])]);
+        current.insert(id(4), OrbNode::single("a4"));
+        assert_eq!(link_fix(&current, &nodes), None);
+        nodes.extend([node(4, &[VOTER_LIMIT], Some("0.2.0"))]);
+        assert_eq!(link_fix(&current, &nodes), None);
+        nodes.extend([linked(4, &["a4"])]);
+        assert_eq!(
+            link_fix(&current, &nodes),
+            Some((id(1), OrbNode::single("c1")))
+        );
     }
 }

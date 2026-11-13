@@ -45,6 +45,10 @@ pub struct ClusterStatus {
     /// 옛 노드는 모르는 필드를 무시한다.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub observers: BTreeMap<Uuid, String>,
+    /// 링크가 둘 이상인 관찰 노드의 클러스터 링크(앞이 우선, 첫 것이 `observers`의 값). 없는 관찰 노드는
+    /// `observers`의 주소 하나다. 옛 노드는 모르는 필드를 무시하고 첫 링크만 쓴다.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub observer_links: BTreeMap<Uuid, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,9 +85,21 @@ mod tests {
             ClusterStatus::default()
         );
         let id = Uuid::from_u128(7);
-        let status = ClusterStatus {
+        let mut status = ClusterStatus {
             observers: BTreeMap::from([(id, "node-7:8007".to_string())]),
+            ..ClusterStatus::default()
         };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("observer_links"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ClusterStatus>(&json).unwrap(),
+            status
+        );
+        // 링크가 둘 이상인 관찰 노드만 링크 목록을 더 쓴다.
+        status.observer_links = BTreeMap::from([(
+            id,
+            vec!["node-7:8007".to_string(), "node-7b:8007".to_string()],
+        )]);
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(
             serde_json::from_str::<ClusterStatus>(&json).unwrap(),

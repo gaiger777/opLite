@@ -1365,6 +1365,7 @@ async fn set_observers(leader: &Node, observers: &[(NodeId, String)]) {
             .iter()
             .map(|(id, addr)| (id.0, addr.clone()))
             .collect(),
+        ..ClusterStatus::default()
     };
     match leader.cluster.list::<ClusterSpec>().unwrap().1.first() {
         Some(info) => {

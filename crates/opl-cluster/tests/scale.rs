@@ -543,6 +543,7 @@ async fn hundreds_of_nodes_do_not_slow_the_leader() {
         observers: (MEMBERS + 1..=n)
             .map(|i| (NodeId::from(i).0, format!("node-{i}")))
             .collect(),
+        ..ClusterStatus::default()
     };
     h.get(leader).create(&info).await.unwrap();
     for i in 1..=n {

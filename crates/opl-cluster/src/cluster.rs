@@ -142,9 +142,10 @@ pub struct Cluster {
     epoch: tokio::sync::watch::Sender<u64>,
     /// 헬스 체크가 보는 적용 지연
     apply_lag: std::sync::Mutex<ApplyLag>,
-    /// 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`). `Kind::Cluster` 변경으로 갱신한다.
-    observers: Arc<RwLock<BTreeMap<NodeId, String>>>,
-    /// 노드마다의 클러스터 링크(적용된 멤버십의 `OrbNode`). 관찰 노드 목록과 함께 고친다.
+    /// 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`와 그 링크 `observer_links`). `Kind::Cluster`
+    /// 변경으로 갱신한다.
+    observers: Arc<RwLock<BTreeMap<NodeId, OrbNode>>>,
+    /// 노드마다의 클러스터 링크(적용된 멤버십의 `OrbNode`와 관찰 노드 목록의 링크). 둘이 바뀔 때 함께 고친다.
     link_book: Arc<LinkBook>,
     /// memnet이 이 노드의 링크 선택에 쓰는 우선 링크 재시도 간격
     link_retry: Duration,
@@ -1018,16 +1019,11 @@ impl Cluster {
             out.links.insert(*id, node.addrs.clone());
         }
         // 내리는 중(목록에 쓰고 아직 멤버십에서 빼기 전)인 노드는 Raft 구성원으로 센다.
-        out.observers = self
-            .observers
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(id, _)| membership.get_node(id).is_none())
-            .map(|(id, addr)| (*id, addr.clone()))
-            .collect();
-        for (id, addr) in &out.observers {
-            out.links.insert(*id, vec![addr.clone()]);
+        for (id, node) in self.observers.read().unwrap().iter() {
+            if membership.get_node(id).is_none() {
+                out.observers.insert(*id, node.addr().to_string());
+                out.links.insert(*id, node.addrs.clone());
+            }
         }
         out
     }
@@ -1319,12 +1315,12 @@ fn track_observers(
     db: &Arc<Database>,
     hub: &Arc<WatchHub>,
     book: &Arc<LinkBook>,
-) -> Arc<RwLock<BTreeMap<NodeId, String>>> {
+) -> Arc<RwLock<BTreeMap<NodeId, OrbNode>>> {
     let cache = Arc::new(RwLock::new(BTreeMap::new()));
     // 구독한 뒤 읽어야 그 사이의 변경을 놓치지 않는다.
     let feed = hub.feed(hub.revision()).ok();
-    *cache.write().unwrap() = read_observers(db);
-    read_links(db, book);
+    let mut members = Vec::new();
+    read_links(db, &cache, book, &mut members);
     let (db, hub, weak, book) = (
         Arc::downgrade(db),
         Arc::downgrade(hub),
@@ -1335,7 +1331,7 @@ fn track_observers(
         let mut feed = feed;
         loop {
             if let Some(mut f) = feed.take()
-                && !follow_observers(&mut f, &weak, &book).await
+                && !follow_observers(&mut f, &weak, &book, &mut members).await
             {
                 return;
             }
@@ -1345,8 +1341,7 @@ fn track_observers(
                 return;
             };
             feed = hub.feed(hub.revision()).ok();
-            *cache.write().unwrap() = read_observers(&db);
-            read_links(&db, &book);
+            read_links(&db, &cache, &book, &mut members);
             if feed.is_none() {
                 tokio::time::sleep(RETRY_INTERVAL).await;
             }
@@ -1355,12 +1350,13 @@ fn track_observers(
     cache
 }
 
-/// 피드의 `Kind::Cluster` 변경으로 목록을, 멤버십 변경으로 링크를 고친다. 다시 읽어야 하면(`Reset`·`Lagged`)
-/// `true`, 끝나야 하면(저장소가 닫힘, 목록이 사라짐) `false`다.
+/// 피드의 `Kind::Cluster` 변경으로 목록을, 멤버십 변경으로 멤버십의 노드(`members`)를 고치고 링크 책을 다시
+/// 만든다. 다시 읽어야 하면(`Reset`·`Lagged`) `true`, 끝나야 하면(저장소가 닫힘, 목록이 사라짐) `false`다.
 async fn follow_observers(
     feed: &mut Feed,
-    cache: &Weak<RwLock<BTreeMap<NodeId, String>>>,
+    cache: &Weak<RwLock<BTreeMap<NodeId, OrbNode>>>,
     book: &LinkBook,
+    members: &mut Vec<OrbNode>,
 ) -> bool {
     loop {
         let batch = match feed.next().await {
@@ -1370,11 +1366,17 @@ async fn follow_observers(
             }
             Err(WatchError::Closed) => return false,
         };
-        if cache.strong_count() == 0 {
+        let Some(cache) = cache.upgrade() else {
             return false;
-        }
+        };
+        let mut changed = false;
         if let Some(m) = &batch.membership {
-            book.replace(m.membership().nodes().map(|(_, node)| node));
+            *members = m
+                .membership()
+                .nodes()
+                .map(|(_, node)| node.clone())
+                .collect();
+            changed = true;
         }
         for event in &batch.events {
             let observers = match event {
@@ -1388,24 +1390,45 @@ async fn follow_observers(
                 } => BTreeMap::new(),
                 _ => continue,
             };
-            let Some(cache) = cache.upgrade() else {
-                return false;
-            };
             *cache.write().unwrap() = observers;
+            changed = true;
+        }
+        if changed {
+            fill_book(book, members, &cache.read().unwrap());
         }
     }
 }
 
-/// 저장소에 적용된 멤버십의 링크로 `book`을 고친다.
-fn read_links(db: &Database, book: &LinkBook) {
+/// 저장소의 관찰 노드 목록과 적용된 멤버십으로 `cache`·`members`·`book`을 고친다. 멤버십을 읽지 못하면 앞의
+/// `members`를 그대로 쓴다.
+fn read_links(
+    db: &Database,
+    cache: &RwLock<BTreeMap<NodeId, OrbNode>>,
+    book: &LinkBook,
+    members: &mut Vec<OrbNode>,
+) {
     match read_membership(db) {
-        Ok(m) => book.replace(m.membership().nodes().map(|(_, node)| node)),
+        Ok(m) => {
+            *members = m
+                .membership()
+                .nodes()
+                .map(|(_, node)| node.clone())
+                .collect()
+        }
         Err(e) => tracing::warn!(error = %e, "cannot read the stored membership"),
     }
+    let observers = read_observers(db);
+    fill_book(book, members, &observers);
+    *cache.write().unwrap() = observers;
+}
+
+/// 링크 책을 멤버십의 노드와 관찰 노드로 다시 만든다(둘에 다 있으면 멤버십의 것).
+fn fill_book(book: &LinkBook, members: &[OrbNode], observers: &BTreeMap<NodeId, OrbNode>) {
+    book.replace(observers.values().chain(members));
 }
 
 /// 저장소의 클러스터 정보에 적힌 관찰 노드
-fn read_observers(db: &Database) -> BTreeMap<NodeId, String> {
+fn read_observers(db: &Database) -> BTreeMap<NodeId, OrbNode> {
     match list_objects(db, Kind::Cluster) {
         Ok((_, list)) => list.first().map(observers_of).unwrap_or_default(),
         Err(e) => {
@@ -1415,18 +1438,30 @@ fn read_observers(db: &Database) -> BTreeMap<NodeId, String> {
     }
 }
 
-pub(crate) fn observers_of(info: &RawResource) -> BTreeMap<NodeId, String> {
+/// 클러스터 정보의 관찰 노드와 그 링크
+pub(crate) fn observers_of(info: &RawResource) -> BTreeMap<NodeId, OrbNode> {
     match serde_json::from_value::<ClusterStatus>(info.status.clone()) {
-        Ok(status) => status
-            .observers
-            .into_iter()
-            .map(|(id, addr)| (NodeId(id), addr))
-            .collect(),
+        Ok(status) => observer_nodes(status),
         Err(e) => {
             tracing::warn!(error = %e, "cannot read the observers in the cluster info");
             BTreeMap::new()
         }
     }
+}
+
+/// 관찰 노드 목록의 노드 값: `observer_links`에 링크 목록이 있으면 그것, 없으면 `observers`의 주소 하나
+pub(crate) fn observer_nodes(mut status: ClusterStatus) -> BTreeMap<NodeId, OrbNode> {
+    status
+        .observers
+        .into_iter()
+        .map(|(id, addr)| {
+            let node = match status.observer_links.remove(&id) {
+                Some(links) if !links.is_empty() => OrbNode::new(links),
+                _ => OrbNode::single(addr),
+            };
+            (NodeId(id), node)
+        })
+        .collect()
 }
 
 fn open_store(config: &ClusterConfig) -> Result<Store, ClusterError> {
