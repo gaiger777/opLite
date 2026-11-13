@@ -162,6 +162,14 @@ pub fn node_key_and_csr() -> Result<(String, String), PkiError> {
     Ok((key.serialize_pem(), csr.pem()?))
 }
 
+/// 이미 있는 노드 키(PEM)의 CSR(PEM). 같은 키로 인증서를 다시 받을 때(이름을 더할 때) 쓴다.
+pub fn csr_for_key(key_pem: &str) -> Result<String, PkiError> {
+    let key = KeyPair::from_pem(key_pem)?;
+    Ok(CertificateParams::default()
+        .serialize_request(&key)?
+        .pem()?)
+}
+
 /// PEM의 첫 인증서
 pub fn first_cert(pem: &str) -> Result<CertificateDer<'static>, PkiError> {
     CertificateDer::from_pem_slice(pem.as_bytes()).map_err(|e| PkiError::Pem(e.to_string()))
@@ -307,6 +315,25 @@ impl NodeTls {
             _ => Path::new("."),
         };
         std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    /// `dir`(이미 저장한 노드 TLS 자료)의 노드 인증서만 `cert_pem`으로 바꾼다. 옆 임시 파일에 다 쓴 뒤 이름을
+    /// 바꾸므로 도중에 죽어도 옛 인증서나 새 인증서 하나가 남는다.
+    pub fn save_cert(dir: &Path, cert_pem: &str) -> Result<(), PkiError> {
+        let tmp = dir.join(format!("{CERT_FILE}.tmp"));
+        if tmp.exists() {
+            std::fs::remove_file(&tmp)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&tmp)?;
+        file.write_all(cert_pem.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, dir.join(CERT_FILE))?;
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
 }
@@ -467,6 +494,43 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         // 이미 있으면 덮어쓰지 않는다.
         assert!(tls.save(&pki).is_err());
+    }
+
+    /// 같은 키로 이름을 더해 다시 서명한다: 공개키와 CN(노드 id)은 그대로다.
+    #[test]
+    fn a_node_cert_is_signed_again_for_the_same_key() {
+        let ca = ClusterCa::generate("prod").unwrap();
+        let node = Uuid::now_v7();
+        let (key_pem, csr) = node_key_and_csr().unwrap();
+        let old = ca.sign_node(&csr, node, &["10.0.0.5".into()]).unwrap();
+        let csr = csr_for_key(&key_pem).unwrap();
+        let names = ["10.0.0.5".to_string(), "10.1.0.5".into()];
+        let new = ca.sign_node(&csr, node, &names).unwrap();
+        assert_eq!(cert_names(&new).unwrap(), names);
+        let public_key = |pem: &str| {
+            let der = first_cert(pem).unwrap();
+            let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+            cert.public_key().raw.to_vec()
+        };
+        assert_eq!(public_key(&new), public_key(&old));
+        assert_eq!(node_id_of(&first_cert(&new).unwrap()), Some(node));
+        assert!(csr_for_key("not a key").is_err());
+    }
+
+    #[test]
+    fn save_cert_replaces_only_the_node_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = dir.path().join(PKI_DIR);
+        let ca = ClusterCa::generate("prod").unwrap();
+        let tls = node_tls(&ca, Uuid::now_v7());
+        tls.save(&pki).unwrap();
+        let other = node_tls(&ca, Uuid::now_v7());
+        NodeTls::save_cert(&pki, &other.cert_pem).unwrap();
+        let back = NodeTls::load(&pki).unwrap().unwrap();
+        assert_eq!(back.cert_pem, other.cert_pem);
+        assert_eq!(back.key_pem, tls.key_pem);
+        assert_eq!(back.ca_pem, tls.ca_pem);
+        assert!(!pki.join(format!("{CERT_FILE}.tmp")).exists());
     }
 
     #[test]

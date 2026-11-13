@@ -2341,8 +2341,13 @@ export interface components {
         JoinRequest: {
             /** @description 새 노드의 API 주소(`host:port`) */
             address: string;
-            /** @description 새 노드의 노드 간 통신 주소(`host:port`) */
+            /** @description 새 노드의 노드 간 통신 주소(`host:port`, 첫 링크) */
             cluster_address: string;
+            /**
+             * @description 새 노드의 모든 노드 간 통신 링크(`host:port`, 앞이 우선, 첫 것이 `cluster_address`). 링크가 둘 이상일
+             *     때만 보낸다(옛 노드는 이 필드를 모른다).
+             */
+            cluster_addresses?: string[];
             /** @description 새 노드가 만든 키의 CSR(PEM) */
             csr_pem: string;
             /** @description 새 노드의 이름 */
@@ -2700,6 +2705,11 @@ export interface components {
                      * @default []
                      */
                     bridges: components["schemas"]["BridgeInfo"][];
+                    /**
+                     * @description 이 노드가 원하는 클러스터 링크(`host:port`, 앞이 우선). 노드가 등록할 때 설정의 `cluster_addresses`로
+                     *     쓴다(옛 노드는 비어 있다). 리더가 Raft 멤버십의 링크를 이것에 맞춘다.
+                     */
+                    cluster_addresses?: string[];
                     /**
                      * Format: int32
                      * @default 0
@@ -3282,6 +3292,11 @@ export interface components {
              * @default []
              */
             bridges: components["schemas"]["BridgeInfo"][];
+            /**
+             * @description 이 노드가 원하는 클러스터 링크(`host:port`, 앞이 우선). 노드가 등록할 때 설정의 `cluster_addresses`로
+             *     쓴다(옛 노드는 비어 있다). 리더가 Raft 멤버십의 링크를 이것에 맞춘다.
+             */
+            cluster_addresses?: string[];
             /**
              * Format: int32
              * @default 0
@@ -3922,6 +3937,11 @@ export interface components {
                  * @default []
                  */
                 bridges: components["schemas"]["BridgeInfo"][];
+                /**
+                 * @description 이 노드가 원하는 클러스터 링크(`host:port`, 앞이 우선). 노드가 등록할 때 설정의 `cluster_addresses`로
+                 *     쓴다(옛 노드는 비어 있다). 리더가 Raft 멤버십의 링크를 이것에 맞춘다.
+                 */
+                cluster_addresses?: string[];
                 /**
                  * Format: int32
                  * @default 0

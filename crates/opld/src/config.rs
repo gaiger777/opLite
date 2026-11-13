@@ -35,6 +35,11 @@ pub struct Config {
     /// 노드 간 통신(gRPC over mTLS)을 받을 소켓 주소
     #[serde(default = "default_cluster_listen")]
     pub cluster_listen: SocketAddr,
+    /// 다른 노드가 이 노드의 노드 간 통신에 닿는 호스트들(IP나 DNS 이름, 포트 없이, 앞이 우선). 포트는
+    /// `cluster_listen`의 포트다. 첫 링크가 끊기면 다음 링크로 넘어간다. 없거나 비면 `address` 하나다. 모두
+    /// 노드 인증서에 들어간다.
+    #[serde(default)]
+    pub cluster_addresses: Vec<String>,
     /// `oplctl cluster init|join|leave`를 받는 유닉스 소켓. 기본은 `{run_dir}/opld.sock`이다.
     /// opld를 실행한 사용자만 쓸 수 있다(0600).
     pub control_socket: Option<PathBuf>,
@@ -962,6 +967,18 @@ fn default_pools_refresh_secs() -> u64 {
     15
 }
 
+/// 다른 노드가 닿을 호스트(`key`의 값)인지: 포트 없는 IP나 호스트 이름. 0.0.0.0이나 ::은 안 된다. 규칙은 API 합류
+/// 검사와 같다([`opl_types::host::valid_host`]).
+fn check_host(key: &str, host: &str) -> anyhow::Result<()> {
+    if host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
+        anyhow::bail!("{key} must not be an unspecified address (got {host:?})");
+    }
+    if !opl_types::host::valid_host(host) {
+        anyhow::bail!("{key} must be an IP address or a host name without a port (got {host:?})");
+    }
+    Ok(())
+}
+
 /// `host:port`. IPv6 주소는 대괄호로 감싼다.
 fn with_port(host: &str, port: u16) -> String {
     match host.parse::<IpAddr>() {
@@ -993,23 +1010,15 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         opl_types::resource::validate_name(&self.name)?;
-        let address = &self.address;
-        let ok = !address.is_empty()
-            && (address.parse::<IpAddr>().is_ok()
-                || address
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.'));
-        if !ok {
-            anyhow::bail!(
-                "address must be an IP address or a host name without a port (got {address:?})"
-            );
-        }
-        // 다른 노드가 닿을 주소이므로 0.0.0.0이나 ::은 안 된다.
-        if address
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.is_unspecified())
-        {
-            anyhow::bail!("address must not be an unspecified address (got {address:?})");
+        check_host("address", &self.address)?;
+        for (i, host) in self.cluster_addresses.iter().enumerate() {
+            check_host("cluster_addresses", host)?;
+            if self.cluster_addresses[..i]
+                .iter()
+                .any(|h| opl_types::host::same_host(h, host))
+            {
+                anyhow::bail!("cluster_addresses must not repeat a host (got {host:?} twice)");
+            }
         }
         for (key, addr) in [
             ("listen", self.listen),
@@ -1159,9 +1168,38 @@ impl Config {
         with_port(&self.address, self.listen.port())
     }
 
-    /// 클러스터에 알리는 노드 간 통신 주소(Raft 멤버십의 노드 주소)
+    /// 클러스터에 알리는 노드 간 통신 주소(Raft 멤버십의 노드 주소): 첫 링크
     pub fn cluster_address(&self) -> String {
-        with_port(&self.address, self.cluster_listen.port())
+        with_port(self.cluster_hosts()[0], self.cluster_listen.port())
+    }
+
+    /// 노드 간 통신 링크(`host:port`, 앞이 우선): `cluster_addresses`, 없으면 `address` 하나
+    pub fn cluster_links(&self) -> Vec<String> {
+        self.cluster_hosts()
+            .into_iter()
+            .map(|host| with_port(host, self.cluster_listen.port()))
+            .collect()
+    }
+
+    /// 링크의 호스트들(늘 하나 이상, [`cluster_links`](Self::cluster_links)와 같은 순서)
+    pub fn cluster_hosts(&self) -> Vec<&str> {
+        if self.cluster_addresses.is_empty() {
+            vec![self.address.as_str()]
+        } else {
+            self.cluster_addresses.iter().map(String::as_str).collect()
+        }
+    }
+
+    /// 링크가 여럿인데 `cluster_listen`이 한 주소만 들으면 시작할 때 낼 경고. 다른 링크로 오는 연결을 받지
+    /// 못할 수 있다.
+    pub fn links_warning(&self) -> Option<String> {
+        (self.cluster_links().len() > 1 && !self.cluster_listen.ip().is_unspecified()).then(|| {
+            format!(
+                "cluster_addresses has several links but cluster_listen ({}) listens on one address; \
+                 use 0.0.0.0 or :: to accept every link",
+                self.cluster_listen
+            )
+        })
     }
 
     /// 마이그레이션을 받는 QEMU가 들을 호스트: 노드 간 통신을 받는 IP(`cluster_listen`, 기본
@@ -1171,12 +1209,13 @@ impl Config {
         self.cluster_listen.ip().to_string()
     }
 
-    /// 노드 인증서의 이름: 알리는 호스트와 같은 기계에서 쓰는 이름
+    /// 노드 인증서의 이름: 알리는 호스트, 모든 링크의 호스트, 같은 기계에서 쓰는 이름(겹친 것은 하나로)
     pub fn cert_names(&self) -> Vec<String> {
         let mut names = vec![self.address.clone()];
-        for local in ["localhost", "127.0.0.1", "::1"] {
-            if self.address != local {
-                names.push(local.into());
+        let hosts = self.cluster_hosts();
+        for name in hosts.into_iter().chain(["localhost", "127.0.0.1", "::1"]) {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.into());
             }
         }
         names
@@ -1340,6 +1379,85 @@ mod tests {
         assert_eq!(with("n", "::1").api_address(), "[::1]:8006");
         for bad in ["0.0.0.0", "::"] {
             assert!(with("node1", bad).validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cluster_links_default_to_the_address_and_keep_their_order() {
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"");
+        assert_eq!(c.cluster_links(), ["10.0.0.5:8007"]);
+        assert_eq!(c.links_warning(), None);
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"\ncluster_addresses = []");
+        assert_eq!(c.cluster_links(), ["10.0.0.5:8007"]);
+        // `address`가 목록에 없어도 된다. 첫 링크가 알리는 클러스터 주소다.
+        let c = parse(
+            "name = \"n\"\naddress = \"node1.lan\"\ncluster_listen = \"0.0.0.0:9007\"\n\
+             cluster_addresses = [\"10.1.0.5\", \"fd00::5\", \"10.0.0.5\"]",
+        );
+        c.validate().unwrap();
+        assert_eq!(
+            c.cluster_links(),
+            ["10.1.0.5:9007", "[fd00::5]:9007", "10.0.0.5:9007"]
+        );
+        assert_eq!(c.cluster_address(), "10.1.0.5:9007");
+        assert_eq!(c.api_address(), "node1.lan:8006");
+        assert_eq!(c.links_warning(), None);
+        assert_eq!(
+            c.cert_names(),
+            [
+                "node1.lan",
+                "10.1.0.5",
+                "fd00::5",
+                "10.0.0.5",
+                "localhost",
+                "127.0.0.1",
+                "::1"
+            ]
+        );
+        // 한 주소만 들으면 경고한다(막지는 않는다).
+        let c = Config {
+            cluster_listen: "10.1.0.5:9007".parse().unwrap(),
+            ..c
+        };
+        c.validate().unwrap();
+        assert!(c.links_warning().unwrap().contains("10.1.0.5:9007"));
+    }
+
+    #[test]
+    fn cert_names_do_not_repeat_hosts() {
+        let c = parse(
+            "name = \"n\"\naddress = \"127.0.0.1\"\ncluster_addresses = [\"127.0.0.2\", \"127.0.0.1\"]",
+        );
+        assert_eq!(
+            c.cert_names(),
+            ["127.0.0.1", "127.0.0.2", "localhost", "::1"]
+        );
+    }
+
+    #[test]
+    fn validates_cluster_addresses() {
+        let with = |hosts: &[&str]| Config {
+            cluster_addresses: hosts.iter().map(|h| h.to_string()).collect(),
+            ..parse("name = \"n\"\naddress = \"h\"")
+        };
+        assert!(with(&["10.0.0.5", "node1-b.lan", "::1"]).validate().is_ok());
+        for bad in [
+            &["10.0.0.5:8007"][..],
+            &["[::1]"],
+            &[""],
+            &["a b"],
+            &["0.0.0.0"],
+            &["::"],
+            &["10.0.0.5", "10.0.0.5"],
+            // 같은 주소의 다른 표기, 대소문자만 다른 이름
+            &["fd00::5", "fd00:0::5"],
+            &["node1.lan", "NODE1.lan"],
+            // API 합류가 받지 않는 호스트
+            &["224.0.0.1"],
+            &["node1.lan."],
+            &["-a.lan"],
+        ] {
+            assert!(with(bad).validate().is_err(), "{bad:?}");
         }
     }
 

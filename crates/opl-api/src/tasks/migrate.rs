@@ -62,16 +62,12 @@ pub(super) async fn migrate(
         .peers
         .clone()
         .ok_or("this node cannot reach other nodes")?;
-    // 대상 노드에는 클러스터 주소의 호스트(opld `address`)로 접속한다. 같은 이름이 노드 인증서에 있다.
     let addr = ctx
         .cluster
         .members()
         .addr(NodeId(target))
         .map(str::to_string)
         .ok_or_else(|| format!("node {target} is not a cluster member"))?;
-    let host = addr_host(&addr)
-        .ok_or_else(|| format!("cannot tell the host of node address {addr:?}"))?
-        .to_string();
     let migration = MigrationStatus {
         node: target,
         task: task.id,
@@ -93,7 +89,7 @@ pub(super) async fn migrate(
         // 대상 노드가 받는 동안 디스크를 함께 연다(공유 LVM은 LV 잠금을 공유로).
         // 로컬 풀의 디스크는 할 일이 없다(공유 LVM만 잠금을 바꾼다).
         Ok(()) => match set_disks_shared(&ctx.cluster, &vm, &*ctx.storage, true).await {
-            Ok(()) => send(ctx, &peers, &addr, &host, &vm, &migration).await,
+            Ok(()) => send(ctx, &peers, &addr, &vm, &migration).await,
             Err(e) => Err(format!("cannot share the disks with the target node: {e}")),
         },
     };
@@ -265,7 +261,6 @@ async fn send(
     ctx: &Ctx,
     peers: &Peers,
     addr: &str,
-    host: &str,
     vm: &Vm,
     migration: &MigrationStatus,
 ) -> Result<(), String> {
@@ -290,6 +285,11 @@ async fn send(
         .migrate_incoming(addr, req)
         .await
         .map_err(|e| format!("the target node cannot receive the VM: {e}"))?;
+    // 대상 노드에는 받을 준비 요청이 닿은 클러스터 링크(그 노드에 지금 쓰는 링크; 첫 링크가 끊겼으면 다른 링크)의
+    // 호스트로 접속한다. 요청 전에 읽으면 아직 모르는 죽은 첫 링크일 수 있다. 모든 링크의 이름이 노드 인증서에 있다.
+    let link = peers.active_link(addr);
+    let host =
+        addr_host(&link).ok_or_else(|| format!("cannot tell the host of node address {link:?}"))?;
     let copied = if migration.disks.is_empty() {
         None
     } else {

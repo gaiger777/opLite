@@ -3,13 +3,15 @@
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::Context;
 use opl_cluster::types::{NodeId, Rejection};
 use opl_cluster::{Cluster, ClusterError, ZONE_LABEL};
-use opl_peer::pki::ClusterCa;
+use opl_peer::pki::{ClusterCa, NodeTls, cert_names};
 use opl_types::auth::{Role, UserSpec};
 use opl_types::cluster::ClusterSpec;
+use opl_types::host::same_host;
 use opl_types::node::{FEATURES, NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::version::BUILD;
@@ -18,6 +20,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::host::Host;
+use crate::member::pki_dir;
 
 pub const NODE_ID_FILE: &str = "node-id";
 const NODE_ID_TMP_FILE: &str = "node-id.tmp";
@@ -183,6 +186,7 @@ async fn record_node(
                 .enabled()
                 .then(|| status.updates.take().unwrap_or_default()),
             features: features(),
+            cluster_addresses: announced_links(config),
         };
         true
     })
@@ -192,6 +196,46 @@ async fn record_node(
 /// 이 빌드가 아는 기능([`FEATURES`]). 위트니스도 적는다(새 기능의 API는 모든 노드를 본다).
 fn features() -> Vec<String> {
     FEATURES.iter().map(|f| f.to_string()).collect()
+}
+
+/// 알릴 클러스터 링크: 설정의 링크 가운데 호스트가 지금 노드 인증서의 이름에 있는 것. 다시 서명하지 못해 이름이
+/// 빠진 링크로는 다른 노드가 TLS로 닿지 못하므로 알리지 않고 경고한다(빠진 링크가 바뀔 때만, `refresh_features`가
+/// 주기적으로 부른다). 인증서를 읽지 못하면 모두 알린다.
+pub(crate) fn announced_links(config: &Config) -> Vec<String> {
+    let links = config.cluster_links();
+    let names = match NodeTls::load(&pki_dir(config)) {
+        Ok(Some(tls)) => cert_names(&tls.cert_pem).ok(),
+        _ => None,
+    };
+    let Some(names) = names else {
+        return links;
+    };
+    let (named, missing): (Vec<_>, Vec<_>) = config
+        .cluster_hosts()
+        .into_iter()
+        .zip(links)
+        .partition(|(host, _)| names.iter().any(|n| same_host(n, host)));
+    let missing: Vec<_> = missing.into_iter().map(|(_, link)| link).collect();
+    if newly_missing(&MISSING_LINKS, &missing) {
+        tracing::warn!(
+            ?missing,
+            "the node certificate does not name these cluster links; not announcing them"
+        );
+    }
+    named.into_iter().map(|(_, link)| link).collect()
+}
+
+/// 마지막으로 본 알리지 않는 링크([`announced_links`])
+static MISSING_LINKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 알리지 않는 링크 `missing`이 있고 `last`(지난번에 본 것)와 다르면 true다. `last`를 `missing`으로 바꾼다.
+fn newly_missing(last: &Mutex<Vec<String>>, missing: &[String]) -> bool {
+    let mut last = last.lock().unwrap();
+    let changed = *last != missing;
+    if changed {
+        *last = missing.to_vec();
+    }
+    changed && !missing.is_empty()
 }
 
 /// 위트니스의 Node 리소스를 만들거나 주소를 맞추고, 온라인 상태와 아키텍처만 기록한다. VM을 돌리지
@@ -204,6 +248,7 @@ pub async fn register_witness(cluster: &Cluster, config: &Config) -> anyhow::Res
             arch: Some(Arch::native()),
             version: Some(BUILD.to_string()),
             features: features(),
+            cluster_addresses: announced_links(config),
             ..NodeStatus::default()
         };
         true
@@ -387,6 +432,75 @@ pub(crate) mod tests {
             assert_eq!(node.status.arch, Some(arch));
         }
         cluster.shutdown().await.unwrap();
+    }
+
+    /// 설정의 클러스터 링크(없으면 `address` 하나)를 기록하고, 설정을 바꿔 다시 등록하면 그 값으로 바꾼다.
+    #[tokio::test]
+    async fn registration_records_the_cluster_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let mut config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        let links = || {
+            let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+            node.status.cluster_addresses
+        };
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(links(), ["10.0.0.1:8007"]);
+        config.cluster_addresses = vec!["10.1.0.1".into(), "10.0.0.1".into()];
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(links(), ["10.1.0.1:8007", "10.0.0.1:8007"]);
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 노드 인증서에 이름이 없는 링크(다시 서명 실패)는 알리지 않는다. 이름은 값으로 비교한다.
+    #[tokio::test]
+    async fn registration_announces_only_links_named_in_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let mut config = test_config();
+        config.data_dir = dir.path().join("data");
+        config.cluster_addresses = vec!["fd00::1".into(), "10.1.0.1".into(), "10.0.0.1".into()];
+        let ca = ClusterCa::generate("t").unwrap();
+        let (key_pem, csr) = opl_peer::pki::node_key_and_csr().unwrap();
+        let names = ["10.0.0.1".to_string(), "fd00:0::1".into()];
+        NodeTls {
+            ca_pem: ca.cert_pem.clone(),
+            cert_pem: ca.sign_node(&csr, id.0, &names).unwrap(),
+            key_pem,
+        }
+        .save(&pki_dir(&config))
+        .unwrap();
+        assert_eq!(
+            announced_links(&config),
+            ["[fd00::1]:8007", "10.0.0.1:8007"]
+        );
+
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        register_node(&cluster, &config, &host).await.unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert_eq!(
+            node.status.cluster_addresses,
+            ["[fd00::1]:8007", "10.0.0.1:8007"]
+        );
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 알리지 않는 링크의 경고는 그 집합이 바뀔 때만 한다(같은 것을 주기적으로 되풀이하지 않음).
+    #[test]
+    fn missing_links_are_warned_only_when_they_change() {
+        let last = Mutex::new(Vec::new());
+        let a = ["10.1.0.1:8007".to_string()];
+        let ab = ["10.1.0.1:8007".to_string(), "10.2.0.1:8007".into()];
+        assert!(!newly_missing(&last, &[]));
+        assert!(newly_missing(&last, &a));
+        assert!(!newly_missing(&last, &a));
+        assert!(newly_missing(&last, &ab));
+        assert!(!newly_missing(&last, &ab));
+        assert!(!newly_missing(&last, &[]));
+        assert!(newly_missing(&last, &a));
     }
 
     /// `[ha]`의 펜싱을 기록하고, 설정을 바꿔 다시 등록하면 그 값으로 바꾼다. `off`면 없다.
@@ -691,6 +805,7 @@ pub(crate) mod tests {
                     "voter-limit".into(),
                     "observer".into(),
                 ],
+                cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()
             }
         );

@@ -5,7 +5,7 @@ mod common;
 use common::Env;
 use opl_api::cluster::{JoinRequest, JoinUrl};
 use opl_cluster::types::NodeId;
-use opl_peer::pki::{fingerprint, first_cert, node_id_of, node_key_and_csr};
+use opl_peer::pki::{cert_names, fingerprint, first_cert, node_id_of, node_key_and_csr};
 use opl_types::cluster::{ClusterSpec, ClusterStatus, JoinTokenSpec};
 use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
@@ -90,6 +90,7 @@ fn join_request(token: &str, name: &str) -> (JoinRequest, Uuid) {
             name: name.to_string(),
             address: "10.0.0.7:8006".into(),
             cluster_address: "10.0.0.7:8007".into(),
+            cluster_addresses: vec![],
             csr_pem,
             witness: false,
             version: Some(BUILD.into()),
@@ -280,7 +281,9 @@ async fn a_witness_joins_as_a_witness() {
     assert_eq!(witness_of(witness), true, "{view}");
     assert_eq!(witness_of(env.node), false, "{view}");
 
-    let (req, node) = join_request(&new_token(&env).await, "node2");
+    let (mut req, node) = join_request(&new_token(&env).await, "node2");
+    // 다른 노드의 링크로는 합류하지 못한다.
+    req.cluster_address = "10.0.0.8:8007".into();
     let mut body = json!(req);
     body.as_object_mut().unwrap().remove("witness");
     let (status, body) = anon.post("/cluster/join", body).await;
@@ -373,6 +376,7 @@ async fn a_node_older_than_the_cluster_is_refused() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let (mut req, node3) = join_request(&new_token(&env).await, "node3");
     req.version = Some("1:0.1".into());
+    req.cluster_address = "10.0.0.8:8007".into();
     let (status, body) = anon.post("/cluster/join", json!(req)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (mut req, _) = join_request(&new_token(&env).await, "node4");
@@ -459,7 +463,8 @@ async fn only_the_same_offline_node_rejoins() {
         env.cluster.get::<NodeSpec>(node).unwrap().unwrap().name,
         "node2"
     );
-    let (req, _) = join_request(&token, "node3");
+    let (mut req, _) = join_request(&token, "node3");
+    req.cluster_address = "10.0.0.8:8007".into();
     let (status, body) = anon.post("/cluster/join", json!(req)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
@@ -490,6 +495,145 @@ async fn hosts_must_be_ips_or_host_names() {
         anon.post("/cluster/join", json!(req)).await.0,
         StatusCode::OK
     );
+}
+
+/// 노드의 기록된 기능에 `feature`를 더한다(이 빌드가 아직 적지 않는 기능).
+async fn add_feature(env: &Env, node: Uuid, feature: &str) {
+    let mut status = env.cluster.get::<NodeSpec>(node).unwrap().unwrap().status;
+    status.features.push(feature.into());
+    env.cluster
+        .update_status::<NodeSpec>(node, &status)
+        .await
+        .unwrap();
+}
+
+/// 여러 링크로 합류: 모든 노드가 `multi-link`를 적었을 때만 받고(아니면 토큰을 쓰지 않고 409), 링크 목록 전체가
+/// 멤버십과 인증서 이름에 들어간다. 다시 합류할 때 링크 목록이 바뀌면(첫 링크가 같아도) 그 목록으로 다시 더한다.
+#[tokio::test]
+async fn a_node_joins_with_several_links() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    let links = vec!["10.0.0.7:8007".to_string(), "10.1.0.7:8007".into()];
+    let (mut req, node) = join_request(&new_token(&env).await, "node2");
+    req.cluster_addresses = links.clone();
+    let (status, body) = anon.post("/cluster/join", json!(req.clone())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading");
+    assert!(env.cluster.members().learners.is_empty());
+
+    add_feature(&env, env.node, "multi-link").await;
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        cert_names(body["cert_pem"].as_str().unwrap()).unwrap(),
+        ["10.0.0.7", "10.1.0.7", "localhost", "127.0.0.1", "::1"]
+    );
+    let members = env.cluster.members();
+    assert_eq!(members.addr(NodeId(node)), Some("10.0.0.7:8007"));
+    assert_eq!(members.links[&NodeId(node)], links);
+
+    // 첫 링크는 그대로, 둘째 링크만 바꿔 다시 합류한다. 등록 전의 자기 기록(기능 없음)은 세지 않는다.
+    mark_offline(&env, node).await;
+    let mut req = join_request(&new_token(&env).await, "node2").0;
+    req.node = node;
+    req.cluster_addresses = vec!["10.0.0.7:8007".into(), "10.2.0.7:8007".into()];
+    let (status, body) = anon.post("/cluster/join", json!(req.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let members = env.cluster.members();
+    assert_eq!(members.learners.len(), 1);
+    assert_eq!(members.links[&NodeId(node)], req.cluster_addresses);
+    // 기록된 링크도 이번 것이다(옛 링크가 남으면 리더의 링크 맞추기가 멤버십을 되돌린다).
+    let recorded = env.cluster.get::<NodeSpec>(node).unwrap().unwrap();
+    assert_eq!(recorded.status.cluster_addresses, req.cluster_addresses);
+}
+
+/// 다른 노드의 링크(같은 주소의 다른 표기 포함)로는 합류하지 못한다(그 노드에 갈 호출을 받게 된다).
+#[tokio::test]
+async fn a_link_of_another_node_is_refused() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    let (mut req, _) = join_request(&new_token(&env).await, "node2");
+    req.cluster_address = "[fd00::7]:8007".into();
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let token = new_token(&env).await;
+    let (mut req, _) = join_request(&token, "node3");
+    req.address = "10.0.0.8:8006".into();
+    req.cluster_address = "[fd00:0::7]:8007".into();
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("already a link"),
+        "{body}"
+    );
+    assert_eq!(env.cluster.members().learners.len(), 1);
+    // 토큰은 쓰지 않았다.
+    let (mut req, _) = join_request(&token, "node3");
+    req.cluster_address = "[fd00::8]:8007".into();
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 다른 노드가 원하는(Node 기록의 `cluster_addresses`, 아직 멤버십에 없는) 링크로도 합류하지 못한다.
+#[tokio::test]
+async fn a_link_another_node_wants_is_refused() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    let mut node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    let mine = env.cluster.members().voters[&NodeId(env.node)].clone();
+    node.status.cluster_addresses = vec![mine, "10.9.0.1:8007".into()];
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &node.status)
+        .await
+        .unwrap();
+
+    let (mut req, _) = join_request(&new_token(&env).await, "node2");
+    req.cluster_address = "10.9.0.1:8007".into();
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("already a link"),
+        "{body}"
+    );
+    assert!(env.cluster.members().learners.is_empty());
+}
+
+/// 링크 목록은 첫 것이 `cluster_address`이고 겹치지 않으며 모두 SAN에 넣을 수 있는 호스트여야 한다(기능 검사보다
+/// 먼저 본다).
+#[tokio::test]
+async fn links_must_start_with_the_cluster_address() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    let token = new_token(&env).await;
+    for links in [
+        ["10.1.0.7:8007", "10.0.0.7:8007"],
+        ["10.0.0.7:8007", "10.0.0.7:8007"],
+        ["10.0.0.7:8007", "evil host/x:8007"],
+        ["10.0.0.7:8007", "10.1.0.7"],
+    ] {
+        let (mut req, _) = join_request(&token, "node2");
+        req.cluster_addresses = links.iter().map(|l| l.to_string()).collect();
+        let (status, body) = anon.post("/cluster/join", json!(req)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{links:?}: {body}");
+        assert_eq!(body["code"], "invalid_request");
+    }
+    // 겹침은 값으로 본다(IP는 같은 주소, 이름은 대소문자 없이).
+    for links in [
+        ["[fd00::7]:8007", "[fd00:0::7]:8007"],
+        ["node2.lan:8007", "NODE2.lan:8007"],
+    ] {
+        let (mut req, _) = join_request(&token, "node2");
+        req.cluster_address = links[0].into();
+        req.cluster_addresses = links.iter().map(|l| l.to_string()).collect();
+        let (status, body) = anon.post("/cluster/join", json!(req)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{links:?}: {body}");
+    }
+    // 링크 하나만 적으면 옛 요청과 같다(기능이 필요 없다).
+    let (mut req, _) = join_request(&token, "node2");
+    req.cluster_addresses = vec!["10.0.0.7:8007".into()];
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

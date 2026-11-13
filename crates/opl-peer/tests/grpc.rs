@@ -448,6 +448,7 @@ async fn a_new_node_joins_as_learner_then_voter() {
         .request(LeaderRequest::AddLearner {
             id: new.id(),
             addr: new.addr.clone(),
+            addrs: vec![],
         })
         .await
         .unwrap();
@@ -886,6 +887,7 @@ async fn migration_requests_reach_the_receiver_of_a_member() {
         .request(LeaderRequest::AddLearner {
             id: target.id(),
             addr: target.addr.clone(),
+            addrs: vec![],
         })
         .await
         .unwrap();
@@ -1055,6 +1057,7 @@ async fn incoming_migrations_run_on_the_work_runtime() {
         .request(LeaderRequest::AddLearner {
             id: target.id(),
             addr: target.addr.clone(),
+            addrs: vec![],
         })
         .await
         .unwrap();
@@ -1233,6 +1236,7 @@ async fn audit_logs_are_read_from_a_member() {
         .request(LeaderRequest::AddLearner {
             id: target.id(),
             addr: target.addr.clone(),
+            addrs: vec![],
         })
         .await
         .unwrap();
@@ -1305,6 +1309,7 @@ async fn metrics_are_read_from_a_member() {
         .request(LeaderRequest::AddLearner {
             id: target.id(),
             addr: target.addr.clone(),
+            addrs: vec![],
         })
         .await
         .unwrap();
@@ -1393,6 +1398,7 @@ async fn start_observer(ca: &ClusterCa, root: &TempDir, leader: &Node) -> Node {
         .request(LeaderRequest::AddLearner {
             id,
             addr: learner.addr.clone(),
+            addrs: vec![],
         })
         .await
         .unwrap();

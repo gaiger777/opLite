@@ -210,6 +210,7 @@ async fn membership_changes_go_through_any_member() {
         .request(LeaderRequest::AddLearner {
             id: n4,
             addr: addr(4).addr().to_string(),
+            addrs: vec![],
         })
         .await
         .unwrap();

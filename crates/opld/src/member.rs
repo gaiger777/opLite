@@ -27,10 +27,12 @@ use opl_driver::{
     Storage, Storages, SystemLvm, SystemRbd, SystemZfs, VipRecord, ZfsStorage, migration_tls_dir,
     write_migration_tls,
 };
-use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, fingerprint};
+use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, cert_names, csr_for_key, fingerprint};
 use opl_peer::tls::{ApiCert, TlsListener, api_server_config_with};
 use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers, renew_liveness};
 use opl_reconciler::{FirewallGate, FirmwareFetcher, HaGuard, Reconciler, ReconcilerConfig};
+use opl_types::cluster::ClusterSpec;
+use opl_types::host::same_host;
 use opl_types::node::NodeSpec;
 use opl_types::vm::VmSpec;
 use tokio::net::TcpListener;
@@ -77,6 +79,45 @@ pub fn pki_dir(config: &Config) -> PathBuf {
 
 pub fn cluster_dir(config: &Config) -> PathBuf {
     config.data_dir.join(CLUSTER_DIR)
+}
+
+/// 노드 인증서에 설정의 이름([`Config::cert_names`], 모든 링크의 호스트)이 빠졌으면 저장소의 클러스터 CA로 같은
+/// 키에 다시 서명해(옛 이름에 빠진 이름을 더해) `pki` 디렉터리에 저장하고 새 TLS 자료를 돌려준다. 빠진 것이
+/// 없으면 `None`. 클러스터 CA를 아직 모르면(막 합류한 노드) 경고하고 `None`.
+fn resign_node_cert(
+    cluster: &Cluster,
+    config: &Config,
+    node: Uuid,
+    tls: &NodeTls,
+) -> anyhow::Result<Option<NodeTls>> {
+    let mut names = cert_names(&tls.cert_pem)?;
+    let missing: Vec<String> = config
+        .cert_names()
+        .into_iter()
+        .filter(|want| !names.iter().any(|have| same_host(have, want)))
+        .collect();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    let Some(info) = cluster.list::<ClusterSpec>()?.1.into_iter().next() else {
+        tracing::warn!(
+            ?missing,
+            "the node certificate lacks some cluster addresses but the cluster CA is not known yet"
+        );
+        return Ok(None);
+    };
+    let ca = ClusterCa {
+        cert_pem: info.spec.ca_cert_pem,
+        key_pem: info.spec.ca_key_pem,
+    };
+    names.extend(missing.iter().cloned());
+    let cert_pem = ca.sign_node(&csr_for_key(&tls.key_pem)?, node, &names)?;
+    NodeTls::save_cert(&pki_dir(config), &cert_pem)?;
+    tracing::info!(added = ?missing, "node certificate signed again with the new names");
+    Ok(Some(NodeTls {
+        cert_pem,
+        ..tls.clone()
+    }))
 }
 
 /// 멤버가 되는 방법
@@ -270,6 +311,20 @@ impl Member {
         );
         // 노드 간 호출이 멤버십의 링크로 넘어가기를 한다(관찰 노드·위트니스 포함).
         peers.set_link_book(cluster.link_book());
+        // 설정에 더한 링크의 이름이 노드 인증서에 없으면 다시 서명해 그것으로 서버를 띄운다. 클라이언트 신원
+        // (`peers`)은 옛 인증서 그대로다(이름이 아니라 CA와 CN의 노드 id로 확인된다).
+        let tls = if matches!(bootstrap, Bootstrap::Restart) {
+            match resign_node_cert(&cluster, config, node, &tls) {
+                Ok(Some(new)) => new,
+                Ok(None) => tls,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot sign the node certificate again for the new names");
+                    tls
+                }
+            }
+        } else {
+            tls
+        };
         // 역할은 합류할 때 정해진다. 설정만 바꿔 다시 시작하면 아무것도 띄우지 않는다.
         if matches!(bootstrap, Bootstrap::Restart)
             && let Err(e) = bootstrap::check_role(&cluster, config)
@@ -407,7 +462,7 @@ impl Member {
             match bootstrap {
                 Bootstrap::Restart => {}
                 Bootstrap::Init { name, ca } => {
-                    let me = OrbNode::single(config.cluster_address());
+                    let me = OrbNode::new(config.cluster_links());
                     cluster.initialize(BTreeMap::from([(id, me)])).await?;
                     password =
                         Some(bootstrap::create_cluster(&cluster, config, &host, &name, &ca).await?);
@@ -1275,6 +1330,70 @@ mod tests {
                 .unwrap();
             assert!(e.to_string().starts_with("Raft stopped: "), "{e}");
             let _ = member.close(true).await;
+        });
+    }
+
+    /// 링크를 더해 다시 시작하면 노드 인증서를 같은 키로 다시 서명해(옛 이름에 새 링크의 호스트를 더해) 저장하고,
+    /// 그 뒤의 시작은 다시 서명하지 않는다.
+    #[test]
+    fn a_restart_with_new_links_signs_the_node_cert_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = member_config(dir.path());
+        let runtimes = Runtimes::new(2, 2).unwrap();
+        let rt = runtimes.handles();
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async {
+            let node = Uuid::now_v7();
+            let (ca, tls) = crate::new_cluster_tls(&config, node, "c").unwrap();
+            let old = tls.cert_pem.clone();
+            let key_pem = tls.key_pem.clone();
+            let bootstrap = Bootstrap::Init {
+                name: "c".into(),
+                ca,
+            };
+            let (member, _) = Member::start(&config, node, tls, bootstrap, &rt, None)
+                .await
+                .unwrap();
+            member.close(false).await.unwrap();
+            assert_eq!(cert_names(&old).unwrap(), ["127.0.0.1", "localhost", "::1"]);
+
+            let config = Config {
+                cluster_addresses: vec!["127.0.0.2".into(), "127.0.0.1".into()],
+                ..config
+            };
+            let restart = |config: Config| {
+                let rt = rt.clone();
+                async move {
+                    let tls = NodeTls::load(&pki_dir(&config)).unwrap().unwrap();
+                    let (member, _) =
+                        Member::start(&config, node, tls, Bootstrap::Restart, &rt, None)
+                            .await
+                            .unwrap();
+                    member.close(false).await.unwrap();
+                    NodeTls::load(&pki_dir(&config)).unwrap().unwrap()
+                }
+            };
+            let saved = restart(config.clone()).await;
+            assert_eq!(
+                cert_names(&saved.cert_pem).unwrap(),
+                ["127.0.0.1", "localhost", "::1", "127.0.0.2"]
+            );
+            let der = opl_peer::pki::first_cert(&saved.cert_pem).unwrap();
+            assert_eq!(opl_peer::pki::node_id_of(&der), Some(node));
+            // 같은 키다(공개키가 같은 것은 opl-peer `pki` 시험이 본다).
+            assert_eq!(saved.key_pem, key_pem);
+            // 이름이 다 있으면 다시 서명하지 않는다.
+            let again = restart(config.clone()).await;
+            assert_eq!(again.cert_pem, saved.cert_pem);
+            // 빠진 것처럼 닫아 root로 도는 Linux CI에서 만든 방화벽 테이블도 지운다.
+            let tls = NodeTls::load(&pki_dir(&config)).unwrap().unwrap();
+            let (member, _) = Member::start(&config, node, tls, Bootstrap::Restart, &rt, None)
+                .await
+                .unwrap();
+            member.close(true).await.unwrap();
         });
     }
 

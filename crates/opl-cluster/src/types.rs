@@ -99,7 +99,12 @@ pub enum LeaderRequest {
     /// 노드를 learner로 더한다. 따라잡기를 기다리지 않는다.
     AddLearner {
         id: NodeId,
+        /// 첫 링크
         addr: String,
+        /// 모든 링크(앞이 우선, 첫 것이 `addr`). 링크가 하나면 비운다(옛 형식 그대로). 옛 리더는 이것을
+        /// 모르고 `addr` 하나로 더한다.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        addrs: Vec<String>,
     },
     /// learner가 로그를 따라잡으면 투표 멤버로 올린다.
     AddVoter {
@@ -421,6 +426,32 @@ mod tests {
         let value = serde_json::to_value(&r).unwrap();
         assert_eq!(value, json!({"reason": "fenced", "node": node.to_string()}));
         assert_eq!(serde_json::from_value::<Rejection>(value).unwrap(), r);
+    }
+
+    /// 노드 사이로 오가는 형식이다. learner 더하기: 링크가 하나면 옛 형식 그대로, 여럿이면 `addrs`를 더한다.
+    #[test]
+    fn add_learner_wire_format_is_stable() {
+        let id = NodeId::from(4);
+        let one = LeaderRequest::AddLearner {
+            id,
+            addr: "a:8007".into(),
+            addrs: vec![],
+        };
+        let old = json!({"op": "add-learner", "id": id.to_string(), "addr": "a:8007"});
+        assert_eq!(serde_json::to_value(&one).unwrap(), old);
+        assert_eq!(serde_json::from_value::<LeaderRequest>(old).unwrap(), one);
+        let two = LeaderRequest::AddLearner {
+            id,
+            addr: "a:8007".into(),
+            addrs: vec!["a:8007".into(), "b:8007".into()],
+        };
+        let value = serde_json::to_value(&two).unwrap();
+        assert_eq!(
+            value,
+            json!({"op": "add-learner", "id": id.to_string(), "addr": "a:8007",
+                   "addrs": ["a:8007", "b:8007"]})
+        );
+        assert_eq!(serde_json::from_value::<LeaderRequest>(value).unwrap(), two);
     }
 
     /// 노드 사이로 오가는 형식이다. VIP 리스 갱신.

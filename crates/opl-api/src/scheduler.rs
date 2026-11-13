@@ -233,6 +233,7 @@ mod tests {
             version: None,
             updates: None,
             features: vec![],
+            cluster_addresses: vec![],
         };
         n
     }

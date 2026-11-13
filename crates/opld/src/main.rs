@@ -101,6 +101,9 @@ async fn run(
     notifier: Notifier,
     probe: Arc<dyn RuntimeProbe>,
 ) -> anyhow::Result<()> {
+    if let Some(warning) = config.links_warning() {
+        tracing::warn!("{warning}");
+    }
     prepare_data_dir(&config.data_dir)?;
     // 끝날 때까지 쥐고 있는다.
     let _lock = lock_data_dir(&config.data_dir)?;

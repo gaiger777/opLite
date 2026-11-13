@@ -127,11 +127,9 @@ pub(crate) async fn execute(
             let Response(result) = resp.data;
             Ok(result?)
         }
-        LeaderRequest::AddLearner { id, addr } => {
-            retry_in_progress(timeout, || {
-                raft.add_learner(id, OrbNode::single(addr.clone()), false)
-            })
-            .await
+        LeaderRequest::AddLearner { id, addr, addrs } => {
+            let node = learner_node(addr, addrs);
+            retry_in_progress(timeout, || raft.add_learner(id, node.clone(), false)).await
         }
         LeaderRequest::AddVoter { id } => {
             let m = raft.metrics().borrow().clone();
@@ -332,5 +330,32 @@ pub(crate) fn not_leader(m: &RaftMetrics<NodeId, OrbNode>) -> ClusterError {
     ClusterError::NotLeader {
         leader_id: m.current_leader,
         leader_addr,
+    }
+}
+
+/// `AddLearner`의 노드 값: 링크 목록이 있으면 그것, 없으면(링크 하나, 옛 노드) `addr` 하나
+fn learner_node(addr: String, addrs: Vec<String>) -> OrbNode {
+    if addrs.is_empty() {
+        OrbNode::single(addr)
+    } else {
+        OrbNode::new(addrs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn learner_node_uses_every_link() {
+        assert_eq!(
+            learner_node("a:8007".into(), vec![]),
+            OrbNode::single("a:8007")
+        );
+        let links = vec!["a:8007".to_string(), "b:8007".to_string()];
+        assert_eq!(
+            learner_node("a:8007".into(), links.clone()),
+            OrbNode::new(links)
+        );
     }
 }

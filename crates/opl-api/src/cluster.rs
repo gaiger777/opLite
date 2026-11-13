@@ -6,7 +6,6 @@
 //! `voter-limit`를 알면 위트니스만 요청하고, 다른 노드는 리더의 `VoterKeeper`가 상한까지 올린다).
 
 use std::fmt;
-use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,6 +18,7 @@ use opl_cluster::ClusterError;
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_peer::pki::{ClusterCa, fingerprint};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, JoinToken, JoinTokenSpec};
+use opl_types::host::{same_link, valid_host};
 use opl_types::node::{Fencing, NodeSpec, NodeStatus};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::version;
@@ -97,24 +97,6 @@ pub fn host_of(address: &str) -> Option<&str> {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     (!host.is_empty()).then_some(host)
-}
-
-/// 인증서 SAN에 넣을 수 있는 호스트인지. 특수 주소가 아닌 IP나 RFC 1123 호스트 이름(와일드카드, 끝의 점 없이)
-fn valid_host(host: &str) -> bool {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
-        return !ip.is_unspecified() && !ip.is_multicast() && !broadcast;
-    }
-    host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
 }
 
 fn now_secs() -> u64 {
@@ -390,8 +372,12 @@ pub struct JoinRequest {
     pub name: String,
     /// 새 노드의 API 주소(`host:port`)
     pub address: String,
-    /// 새 노드의 노드 간 통신 주소(`host:port`)
+    /// 새 노드의 노드 간 통신 주소(`host:port`, 첫 링크)
     pub cluster_address: String,
+    /// 새 노드의 모든 노드 간 통신 링크(`host:port`, 앞이 우선, 첫 것이 `cluster_address`). 링크가 둘 이상일
+    /// 때만 보낸다(옛 노드는 이 필드를 모른다).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_addresses: Vec<String>,
     /// 새 노드가 만든 키의 CSR(PEM)
     pub csr_pem: String,
     /// 새 노드가 위트니스(투표만 하고 VM을 돌리지 않는 노드)인지
@@ -476,7 +462,11 @@ pub(crate) fn require_feature(
     cluster: &opl_cluster::Cluster,
     feature: &str,
 ) -> Result<(), ApiError> {
-    let old = missing_feature(cluster, feature)?;
+    lacking_feature(feature, &missing_feature(cluster, feature)?)
+}
+
+/// `old`(기능 `feature`를 적지 않은 노드 이름)가 있으면 409 `cluster_upgrading`
+fn lacking_feature(feature: &str, old: &[String]) -> Result<(), ApiError> {
     if old.is_empty() {
         return Ok(());
     }
@@ -557,14 +547,45 @@ pub async fn join(
 
     check_version(&state, req.node, req.version.as_deref())?;
     check_name(&req.name)?;
-    let (Some(api_host), Some(cluster_host)) = (
+    // 링크 목록: 보낸 것, 없으면(링크 하나, 옛 노드) `cluster_address` 하나
+    let links = if req.cluster_addresses.is_empty() {
+        vec![req.cluster_address.clone()]
+    } else {
+        req.cluster_addresses.clone()
+    };
+    let cluster_hosts: Option<Vec<&str>> = links
+        .iter()
+        .map(|link| host_of(link).filter(|h| valid_host(h)))
+        .collect();
+    let (Some(api_host), Some(cluster_hosts)) = (
         host_of(&req.address).filter(|h| valid_host(h)),
-        host_of(&req.cluster_address).filter(|h| valid_host(h)),
+        cluster_hosts,
     ) else {
         return Err(ApiError::bad_request(
-            "address and cluster_address must be host:port with an IP address or a host name",
+            "address, cluster_address and cluster_addresses must be host:port with an IP address or a host name",
         ));
     };
+    if links[0] != req.cluster_address {
+        return Err(ApiError::bad_request(
+            "the first of cluster_addresses must be cluster_address",
+        ));
+    }
+    if links
+        .iter()
+        .enumerate()
+        .any(|(i, l)| links[..i].iter().any(|o| same_link(o, l)))
+    {
+        return Err(ApiError::bad_request(
+            "cluster_addresses must not repeat an address",
+        ));
+    }
+    // 옛 노드는 여러 링크의 멤버십을 첫 링크 하나로 읽으므로 모든 노드가 링크를 알 때만 받는다. 다시 합류하는
+    // 노드 자신의 옛 기록(등록 전이면 기능이 비어 있다)은 세지 않는다.
+    if links.len() > 1 {
+        let mut old = missing_feature(&state.cluster, "multi-link")?;
+        old.retain(|name| *name != req.name);
+        lacking_feature("multi-link", &old)?;
+    }
     if req.node.is_nil() {
         return Err(ApiError::bad_request("node id must not be nil"));
     }
@@ -577,6 +598,14 @@ pub async fn join(
         .get(&NodeId(req.node))
         .or_else(|| members.observers.get(&NodeId(req.node)))
         .cloned();
+    // 그 learner·관찰 노드의 지금 링크 목록
+    let learner_links = learner_addr.as_ref().map(|addr| {
+        members
+            .links
+            .get(&NodeId(req.node))
+            .cloned()
+            .unwrap_or_else(|| vec![addr.clone()])
+    });
     let rejoin_ok = || -> Result<bool, ApiError> {
         Ok(state
             .cluster
@@ -597,13 +626,38 @@ pub async fn join(
             format!("node name {:?} is already taken", req.name),
         ));
     }
+    // 다른 노드(구성원·관찰 노드)의 링크는 받지 않는다(오타, 다시 쓴 IP): 그 노드에 갈 Raft RPC·리더 요청을 이
+    // 노드가 받게 된다. 다른 노드가 원하는(Node 기록의, 링크 맞추기가 아직 멤버십에 넣지 않은) 링크도 본다.
+    let (_, records) = state.cluster.list::<NodeSpec>()?;
+    let wanted = records
+        .into_iter()
+        .map(|n| (NodeId(n.id), n.status.cluster_addresses));
+    if let Some((other, link)) = members
+        .links
+        .clone()
+        .into_iter()
+        .chain(wanted)
+        .filter(|(id, _)| *id != NodeId(req.node))
+        .find_map(|(id, theirs)| {
+            let link = links
+                .iter()
+                .find(|l| theirs.iter().any(|t| same_link(t, l)))?;
+            Some((id, link))
+        })
+    {
+        return Err(ApiError::bad_request(format!(
+            "cluster link {link} is already a link of node {other}"
+        )));
+    }
     let info = cluster_info(&state)?;
     let via = via_voter(&state.cluster.members(), NodeId(state.node))
         .ok_or_else(|| ApiError::internal("this node knows no voter"))?;
 
     let mut sans = vec![api_host.to_string()];
-    if cluster_host != api_host {
-        sans.push(cluster_host.to_string());
+    for host in cluster_hosts {
+        if !sans.iter().any(|s| s == host) {
+            sans.push(host.to_string());
+        }
     }
     sans.extend(["localhost".into(), "127.0.0.1".into(), "::1".into()]);
     let ca = ClusterCa {
@@ -640,9 +694,11 @@ pub async fn join(
                 .cluster
                 .update_spec(node.id, None, node.labels, &spec)
                 .await?;
+            // 링크는 이번 합류의 것으로 둔다. 옛 값이 남으면 리더의 링크 맞추기가 멤버십을 옛 링크로 되돌린다.
             let status = NodeStatus {
                 online: true,
                 version: req.version.clone(),
+                cluster_addresses: links.clone(),
                 ..node.status
             };
             state
@@ -658,8 +714,8 @@ pub async fn join(
             state.cluster.create(&node).await?;
         }
     }
-    // add_learner는 이미 있는 노드의 주소를 바꾸지 않으므로, 주소가 바뀐 learner는 먼저 뺀다.
-    if learner_addr.is_some_and(|addr| addr != req.cluster_address) {
+    // add_learner는 이미 있는 노드의 주소를 바꾸지 않으므로, 링크가 바뀐 learner는 먼저 뺀다.
+    if learner_links.is_some_and(|old| old != links) {
         state
             .cluster
             .request(LeaderRequest::Remove {
@@ -672,6 +728,8 @@ pub async fn join(
         .request(LeaderRequest::AddLearner {
             id: NodeId(req.node),
             addr: req.cluster_address.clone(),
+            // 링크 하나면 옛 형식 그대로 보낸다.
+            addrs: if links.len() > 1 { links } else { Vec::new() },
         })
         .await?;
     tracing::info!(node = %req.name, id = %req.node, "node joined as learner");
@@ -778,6 +836,30 @@ mod tests {
         }
     }
 
+    /// 옛 노드가 보내는 합류 요청(`cluster_addresses` 없음)을 읽고, 링크가 하나면 그 필드 없이 쓴다(옛 API 노드는
+    /// 모르는 필드를 거절한다).
+    #[test]
+    fn join_request_without_links_is_the_old_shape() {
+        let node = Uuid::now_v7();
+        let old = serde_json::json!({
+            "token": "t", "node": node, "name": "n2", "address": "10.0.0.7:8006",
+            "cluster_address": "10.0.0.7:8007", "csr_pem": "csr", "witness": false,
+            "version": "1.0.0"
+        });
+        let req: JoinRequest = serde_json::from_value(old.clone()).unwrap();
+        assert!(req.cluster_addresses.is_empty());
+        assert_eq!(serde_json::to_value(&req).unwrap(), old);
+        let two = JoinRequest {
+            cluster_addresses: vec!["10.0.0.7:8007".into(), "10.1.0.7:8007".into()],
+            ..req
+        };
+        let value = serde_json::to_value(&two).unwrap();
+        assert_eq!(
+            value["cluster_addresses"],
+            serde_json::json!(["10.0.0.7:8007", "10.1.0.7:8007"])
+        );
+    }
+
     #[test]
     fn host_of_handles_v6_and_names() {
         assert_eq!(host_of("10.0.0.5:8006"), Some("10.0.0.5"));
@@ -786,33 +868,6 @@ mod tests {
         assert_eq!(host_of("node1.lan"), None);
         assert_eq!(host_of(":8006"), None);
         assert_eq!(host_of("h:port"), None);
-    }
-
-    #[test]
-    fn valid_host_accepts_ips_and_host_names_only() {
-        for good in ["node1.example", "localhost", "10.0.0.5", "::1", "a-b.c1"] {
-            assert!(valid_host(good), "{good}");
-        }
-        let long_label = format!("{}.example", "a".repeat(64));
-        let long_name = vec!["a".repeat(63); 4].join(".");
-        for bad in [
-            "*.corp.example",
-            "evil host/x",
-            "0.0.0.0",
-            "::",
-            "224.0.0.1",
-            "ff02::1",
-            "255.255.255.255",
-            &long_label,
-            &long_name,
-            "-a.example",
-            "a-.example",
-            "node1.example.",
-            "a..b",
-            "노드.example",
-        ] {
-            assert!(!valid_host(bad), "{bad}");
-        }
         assert_eq!(host_of("[::1]:8006").filter(|h| valid_host(h)), Some("::1"));
     }
 }

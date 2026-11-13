@@ -17,6 +17,24 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// 검증 없이 받는 CA 본문의 최대 크기
 const CA_MAX_BYTES: usize = 64 * 1024;
 
+/// 합류 요청에 실을 링크 목록: 링크가 둘 이상일 때만(링크 하나면 옛 요청 그대로라 옛 노드도 받는다)
+fn join_links(config: &Config) -> Vec<String> {
+    let links = config.cluster_links();
+    if links.len() > 1 { links } else { Vec::new() }
+}
+
+/// 합류 거절 메시지. 옛 API 노드는 모르는 `cluster_addresses`(여러 링크로 합류)를 거절하므로 먼저 올리라고 알린다.
+fn refusal(message: &str) -> String {
+    if message.contains("unknown field") && message.contains("cluster_addresses") {
+        format!(
+            "the node at the join URL runs an older version that does not know several cluster links; \
+             upgrade every node first ({message})"
+        )
+    } else {
+        message.to_string()
+    }
+}
+
 /// 받아들여진 합류
 pub struct Joined {
     pub cluster: String,
@@ -83,6 +101,7 @@ pub async fn request(config: &Config, node: Uuid, url: &JoinUrl) -> anyhow::Resu
             name: config.name.clone(),
             address: config.api_address(),
             cluster_address: config.cluster_address(),
+            cluster_addresses: join_links(config),
             csr_pem,
             witness: config.witness,
             version: Some(opl_types::version::BUILD.to_string()),
@@ -94,7 +113,7 @@ pub async fn request(config: &Config, node: Uuid, url: &JoinUrl) -> anyhow::Resu
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         bail!(
             "join refused: {}",
-            body["message"].as_str().unwrap_or("unknown error")
+            refusal(body["message"].as_str().unwrap_or("unknown error"))
         );
     }
     let joined: JoinResponse = resp.json().await?;
@@ -107,4 +126,35 @@ pub async fn request(config: &Config, node: Uuid, url: &JoinUrl) -> anyhow::Resu
         },
         via: joined.via,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_sends_the_links_only_when_there_are_several() {
+        let config: Config = toml::from_str("name = \"n\"\naddress = \"10.0.0.5\"").unwrap();
+        assert!(join_links(&config).is_empty());
+        let config = Config {
+            cluster_addresses: vec!["10.0.0.5".into(), "10.1.0.5".into()],
+            ..config
+        };
+        assert_eq!(join_links(&config), ["10.0.0.5:8007", "10.1.0.5:8007"]);
+    }
+
+    #[test]
+    fn an_old_api_node_refusing_the_links_asks_to_upgrade() {
+        let old =
+            "invalid JSON body: unknown field `cluster_addresses`, expected one of `token`, `node`";
+        assert!(
+            refusal(old).contains("upgrade every node first"),
+            "{}",
+            refusal(old)
+        );
+        assert_eq!(
+            refusal("invalid or expired join token"),
+            "invalid or expired join token"
+        );
+    }
 }

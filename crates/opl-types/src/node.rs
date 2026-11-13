@@ -107,6 +107,11 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub features: Vec<String>,
+    /// 이 노드가 원하는 클러스터 링크(`host:port`, 앞이 우선). 노드가 등록할 때 설정의 `cluster_addresses`로
+    /// 쓴다(옛 노드는 비어 있다). 리더가 Raft 멤버십의 링크를 이것에 맞춘다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub cluster_addresses: Vec<String>,
 }
 
 /// 이 빌드가 아는 기능. 노드가 [`NodeStatus::features`]에 적는다.
@@ -402,6 +407,25 @@ mod tests {
                 "voter-limit",
                 "observer"
             ])
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+    }
+
+    #[test]
+    fn status_cluster_addresses_round_trip_and_are_omitted_when_empty() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("cluster_addresses").is_none(), "{none}");
+        // 옛 노드가 쓴 status(필드 없음)도 읽는다.
+        let old: NodeStatus = serde_json::from_value(serde_json::json!({"online": true})).unwrap();
+        assert!(old.cluster_addresses.is_empty());
+        let status = NodeStatus {
+            cluster_addresses: vec!["10.0.0.5:8007".into(), "10.1.0.5:8007".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["cluster_addresses"],
+            serde_json::json!(["10.0.0.5:8007", "10.1.0.5:8007"])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
