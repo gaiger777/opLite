@@ -369,7 +369,7 @@ mod tests {
                 restart: Default::default(),
                 node: Some(node),
                 snapshot_schedule: None,
-                ha: false,
+                ha: None,
             },
         )
     }

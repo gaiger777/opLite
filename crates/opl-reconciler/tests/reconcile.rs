@@ -20,8 +20,8 @@ use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
-    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, ScheduleError, VmPhase, VmSpec,
-    VmStatus,
+    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, ScheduleError, VmHaStatus,
+    VmPhase, VmSpec, VmStatus,
 };
 use uuid::Uuid;
 
@@ -49,6 +49,8 @@ async fn starts_assigned_vm_and_records_status() {
             migration: None,
             // UEFI VM은 켠 노드가 변수 파일을 가진다.
             firmware_node: Some(env.node),
+            rule_violations: vec![],
+            ha: None,
         }
     );
 }
@@ -361,6 +363,50 @@ async fn power_off_keeps_current_snapshot() {
         .await;
     assert_eq!(got.status.snapshot, Some(snapshot));
     assert_eq!(got.status.schedule_error, Some(busy()));
+}
+
+/// 리더가 쓰는 위반과 HA 기록은 작업자가 VM을 읽고 status를 쓰는 사이에 바뀌어도 덮지 않는다.
+#[tokio::test]
+async fn status_writes_keep_rule_violations_and_ha_record() {
+    let env = Env::start().await;
+    let mut vm = vm("web", env.node);
+    vm.spec.power = PowerState::Stopped;
+    env.create(&vm).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+
+    // 작업자가 VM을 읽고 시작하는 사이에 쓴다.
+    env.hv.delay_starts(Duration::from_millis(300));
+    env.set_power(vm.id, PowerState::Running).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let current = env.get(vm.id);
+    assert_ne!(current.status.phase, VmPhase::Running);
+    let record = VmHaStatus {
+        relocations: vec![100],
+        error: Some("gave up".into()),
+        ..Default::default()
+    };
+    let mut status = current.status.clone();
+    status.rule_violations = vec!["keep-apart".into()];
+    status.ha = Some(record.clone());
+    env.cluster
+        .update_status_checked::<VmSpec>(vm.id, current.revision, &status)
+        .await
+        .unwrap();
+
+    let got = env.wait(vm.id, "running", running).await;
+    assert_eq!(got.status.rule_violations, ["keep-apart"]);
+    assert_eq!(got.status.ha, Some(record.clone()));
+
+    // 끄면서 쓰는 status도 지킨다.
+    env.hv.guest_shutdown(vm.id);
+    let got = env
+        .wait(vm.id, "powered off", |v| {
+            v.spec.power == PowerState::Stopped && v.status.phase == VmPhase::Stopped
+        })
+        .await;
+    assert_eq!(got.status.rule_violations, ["keep-apart"]);
+    assert_eq!(got.status.ha, Some(record));
 }
 
 #[tokio::test]

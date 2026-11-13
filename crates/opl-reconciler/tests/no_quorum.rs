@@ -13,7 +13,7 @@ use opl_cluster::types::{NodeId, OrbNode};
 use opl_driver::{Hypervisor, MockHypervisor};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard, Reconciler};
-use opl_types::vm::{RestartPolicy, VmPhase, VmSpec};
+use opl_types::vm::{RestartPolicy, VmHa, VmPhase, VmSpec};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -153,7 +153,7 @@ async fn ha_vm_is_not_restarted_without_recording_starting() {
     let reconciler = Reconciler::spawn(c1.clone(), dyn_hv, config);
     let mut vm = vm("web", n1.0);
     vm.spec.restart = RestartPolicy::OnFailure;
-    vm.spec.ha = true;
+    vm.spec.ha = Some(VmHa::default());
     c1.create(&vm).await.unwrap();
     let before = wait_vm(&c1, vm.id, "running", |v| {
         v.status.phase == VmPhase::Running

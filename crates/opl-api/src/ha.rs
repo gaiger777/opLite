@@ -445,7 +445,7 @@ async fn fail_task(ctx: Ctx<'_>, task: &Task, error: &str) {
 
 /// 노드 `node`에 배정된 HA VM으로 실행하기로 된 것
 fn recoverable(vm: &Vm, node: Uuid) -> bool {
-    vm.spec.node == Some(node) && vm.spec.ha && vm.spec.power == PowerState::Running
+    vm.spec.node == Some(node) && vm.spec.ha_active() && vm.spec.power == PowerState::Running
 }
 
 /// 노드의 마지막 리스 갱신(없으면 기준점 b) 뒤 지난 시간

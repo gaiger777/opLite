@@ -536,7 +536,7 @@ async fn restore_makes_a_stopped_vm_from_the_backup() {
     let old = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
     assert_eq!(new.spec.power, PowerState::Stopped);
     assert_eq!(new.spec.node, None);
-    assert!(!new.spec.ha);
+    assert_eq!(new.spec.ha, None);
     assert_eq!(new.spec.memory_mib, old.spec.memory_mib);
     let disks: Vec<&str> = new.spec.disks.iter().map(|d| d.volume.as_str()).collect();
     assert_eq!(disks, ["web-2-disk0", "web-2-disk1"]);

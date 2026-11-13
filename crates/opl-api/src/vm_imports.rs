@@ -796,7 +796,7 @@ pub(crate) fn import_spec(
         restart: RestartPolicy::Never,
         node: None,
         snapshot_schedule: None,
-        ha: false,
+        ha: None,
     })
 }
 

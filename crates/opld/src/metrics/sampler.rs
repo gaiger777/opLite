@@ -527,7 +527,7 @@ mod tests {
                 restart: Default::default(),
                 node: None,
                 snapshot_schedule: None,
-                ha: false,
+                ha: None,
             },
         );
         f.cluster.create(&vm).await.unwrap();

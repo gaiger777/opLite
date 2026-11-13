@@ -2024,8 +2024,11 @@ export interface components {
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
-                /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
-                ha?: boolean;
+                /**
+                 * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
+                 *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
+                 */
+                ha?: components["schemas"]["HaSetting"];
                 machine: components["schemas"]["MachineType"];
                 /** Format: int32 */
                 memory_mib: number;
@@ -2192,6 +2195,13 @@ export interface components {
             group: string;
             role: components["schemas"]["Role"];
         };
+        /** @description API 문서의 `ha` 모양: 옛 bool이나 정책 객체. 읽고 쓰기는 `VmSpec.ha`의 손으로 쓴 serde가 한다. */
+        HaSetting: boolean | components["schemas"]["VmHa"];
+        /**
+         * @description HA가 VM을 어떻게 다루는지.
+         * @enum {string}
+         */
+        HaState: "started" | "stopped" | "ignored";
         /**
          * @description 헬스 체크 결과. 200과 503이 같은 모양이다. `status`·`failed` 밖의 필드는 로그인(세션·토큰)한 요청에만
          *     있다.
@@ -2988,8 +2998,11 @@ export interface components {
                     cpu: components["schemas"]["CpuSpec"];
                     disks?: components["schemas"]["DiskSpec"][];
                     firmware?: components["schemas"]["Firmware"];
-                    /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
-                    ha?: boolean;
+                    /**
+                     * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
+                     *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
+                     */
+                    ha?: components["schemas"]["HaSetting"];
                     machine: components["schemas"]["MachineType"];
                     /** Format: int32 */
                     memory_mib: number;
@@ -3011,6 +3024,8 @@ export interface components {
                      *     다른 노드에서 켤 때 이 노드에서 변수를 받아 온다. BIOS VM은 늘 없다.
                      */
                     firmware_node?: string;
+                    /** @description HA 재시작·옮기기 기록. 기록이 없으면 빼고 쓴다. */
+                    ha?: components["schemas"]["VmHaStatus"];
                     /** @default null */
                     last_error: string | null;
                     /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
@@ -3027,6 +3042,8 @@ export interface components {
                      * @default null
                      */
                     pid: number | null;
+                    /** @description 지금 배치가 어기는 배치 규칙의 이름. 리더의 HA 관리자가 쓴다. */
+                    rule_violations?: string[];
                     /** @default null */
                     schedule_error: components["schemas"]["ScheduleError"] | null;
                     /**
@@ -4237,8 +4254,11 @@ export interface components {
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
-                /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
-                ha?: boolean;
+                /**
+                 * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
+                 *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
+                 */
+                ha?: components["schemas"]["HaSetting"];
                 machine: components["schemas"]["MachineType"];
                 /** Format: int32 */
                 memory_mib: number;
@@ -4260,6 +4280,8 @@ export interface components {
                  *     다른 노드에서 켤 때 이 노드에서 변수를 받아 온다. BIOS VM은 늘 없다.
                  */
                 firmware_node?: string;
+                /** @description HA 재시작·옮기기 기록. 기록이 없으면 빼고 쓴다. */
+                ha?: components["schemas"]["VmHaStatus"];
                 /** @default null */
                 last_error: string | null;
                 /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
@@ -4276,6 +4298,8 @@ export interface components {
                  * @default null
                  */
                 pid: number | null;
+                /** @description 지금 배치가 어기는 배치 규칙의 이름. 리더의 HA 관리자가 쓴다. */
+                rule_violations?: string[];
                 /** @default null */
                 schedule_error: components["schemas"]["ScheduleError"] | null;
                 /**
@@ -4838,8 +4862,11 @@ export interface components {
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
-                /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
-                ha?: boolean;
+                /**
+                 * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
+                 *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
+                 */
+                ha?: components["schemas"]["HaSetting"];
                 machine: components["schemas"]["MachineType"];
                 /** Format: int32 */
                 memory_mib: number;
@@ -4895,6 +4922,40 @@ export interface components {
             running: number;
             /** Format: int64 */
             total: number;
+        };
+        /** @description VM의 HA 정책. */
+        VmHa: {
+            /** @description HA 그룹 이름. 없으면 그룹 없이 아무 노드로 복구한다. */
+            group?: string;
+            /**
+             * Format: int32
+             * @description 다른 노드로 옮기는 횟수. 넘으면 `error` 상태로 둔다.
+             * @default 1
+             */
+            max_relocate: number;
+            /**
+             * Format: int32
+             * @description 같은 노드에서 다시 켜는 횟수. 넘으면 다른 노드로 옮긴다.
+             * @default 1
+             */
+            max_restart: number;
+            /** @default started */
+            state: components["schemas"]["HaState"];
+        };
+        /** @description HA 재시작·옮기기 기록 */
+        VmHaStatus: {
+            /** @description HA가 이 VM을 놓거나 옮기지 못한 이유. */
+            error?: string;
+            /**
+             * Format: uuid
+             * @description 재시작 횟수를 넘겨 이 노드에서 다른 노드로 옮겨 달라는 요청. reconciler가 쓴다.
+             */
+            relocate_from?: string;
+            /**
+             * @description 창 안에서 다른 노드로 옮긴 때(유닉스 초).
+             * @default []
+             */
+            relocations: number[];
         };
         /** @description 리소스만 지운 가져오기 지우기(`force`)의 응답 */
         VmImportForgotten: {
@@ -4991,8 +5052,11 @@ export interface components {
             cpu: components["schemas"]["CpuSpec"];
             disks?: components["schemas"]["DiskSpec"][];
             firmware?: components["schemas"]["Firmware"];
-            /** @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다. */
-            ha?: boolean;
+            /**
+             * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
+             *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
+             */
+            ha?: components["schemas"]["HaSetting"];
             machine: components["schemas"]["MachineType"];
             /** Format: int32 */
             memory_mib: number;
@@ -5014,6 +5078,8 @@ export interface components {
              *     다른 노드에서 켤 때 이 노드에서 변수를 받아 온다. BIOS VM은 늘 없다.
              */
             firmware_node?: string;
+            /** @description HA 재시작·옮기기 기록. 기록이 없으면 빼고 쓴다. */
+            ha?: components["schemas"]["VmHaStatus"];
             /** @default null */
             last_error: string | null;
             /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
@@ -5030,6 +5096,8 @@ export interface components {
              * @default null
              */
             pid: number | null;
+            /** @description 지금 배치가 어기는 배치 규칙의 이름. 리더의 HA 관리자가 쓴다. */
+            rule_violations?: string[];
             /** @default null */
             schedule_error: components["schemas"]["ScheduleError"] | null;
             /**

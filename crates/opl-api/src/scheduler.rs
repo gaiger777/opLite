@@ -151,7 +151,7 @@ pub fn node_fits_with(
     if node.spec.maintenance {
         return Err(format!("node {name:?} is in maintenance"));
     }
-    if spec.ha && !ha_capable(node) {
+    if spec.ha_active() && !ha_capable(node) {
         return Err(format!(
             "node {name:?} does not support HA (fencing is off)"
         ));
@@ -205,7 +205,7 @@ mod tests {
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
     use opl_types::storage::PoolBackend;
-    use opl_types::vm::{Arch, CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec};
+    use opl_types::vm::{Arch, CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec, VmHa};
 
     use super::*;
 
@@ -292,7 +292,7 @@ mod tests {
             restart: Default::default(),
             node,
             snapshot_schedule: None,
-            ha: false,
+            ha: None,
         }
     }
 
@@ -396,7 +396,7 @@ mod tests {
         };
         let mut me = spec(512, None, PowerState::Running);
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(off.id));
-        me.ha = true;
+        me.ha = Some(VmHa::default());
         assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(fenced.id));
         assert_eq!(
             node_fits(&me, &inv, &off),

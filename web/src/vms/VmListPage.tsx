@@ -34,6 +34,7 @@ import {
 import { formatMib } from "@/lib/format";
 import { readPref, writePref } from "@/lib/prefs";
 import { useVmActions } from "@/vms/actions";
+import { haEnabled } from "@/vms/ha";
 import { VmMenu } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
@@ -118,7 +119,7 @@ export function VmListPage() {
             >
               {row.original.name}
             </Link>
-            {row.original.spec.ha && (
+            {haEnabled(row.original.spec) && (
               <Badge variant="outline" className="ml-2">
                 {t("vms.ha")}
               </Badge>

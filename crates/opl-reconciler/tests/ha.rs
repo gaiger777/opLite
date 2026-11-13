@@ -23,7 +23,7 @@ use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::vm::{
-    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, Vm, VmPhase, VmSpec,
+    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, Vm, VmHa, VmPhase, VmSpec,
 };
 use uuid::Uuid;
 
@@ -320,7 +320,7 @@ async fn start_full(
 
 fn ha_vm(name: &str, node: Uuid) -> Vm {
     let mut vm = vm(name, node);
-    vm.spec.ha = true;
+    vm.spec.ha = Some(VmHa::default());
     vm
 }
 
@@ -493,7 +493,7 @@ async fn running_ha_vm_on_a_node_without_fencing_is_left_running() {
     let pid = env.wait(vm.id, "running", running).await.status.pid;
 
     let current = env.get(vm.id);
-    vm.spec.ha = true;
+    vm.spec.ha = Some(VmHa::default());
     env.cluster
         .update_spec(vm.id, Some(current.revision), current.labels, &vm.spec)
         .await
@@ -568,14 +568,14 @@ async fn running_ha_vm_arms_the_watchdog_once_the_lease_is_fresh() {
     let pid = env.wait(vm.id, "running", running).await.status.pid;
 
     let current = env.get(vm.id);
-    vm.spec.ha = true;
+    vm.spec.ha = Some(VmHa::default());
     env.cluster
         .update_spec(vm.id, Some(current.revision), current.labels, &vm.spec)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let got = env.get(vm.id);
-    assert!(got.spec.ha);
+    assert!(got.spec.ha_active());
     assert_eq!(got.status.phase, VmPhase::Running);
     assert_eq!(got.status.last_error, None);
     assert_eq!(ha.watchdog.count("open"), 0);
@@ -975,7 +975,7 @@ async fn waiting_ha_source_is_resumed_when_ha_is_turned_off() {
 
     let current = env.get(vm.id);
     let mut spec = current.spec.clone();
-    spec.ha = false;
+    spec.ha = None;
     env.cluster
         .update_spec(vm.id, Some(current.revision), current.labels, &spec)
         .await

@@ -1040,7 +1040,7 @@ pub(super) async fn restore(
     for (disk, copy) in new.spec.disks.iter_mut().zip(&copies) {
         disk.volume = copy.name.clone();
     }
-    new.spec.ha = false;
+    new.spec.ha = None;
     // 되살린 VM은 MAC을 새로 받는다.
     for nic in &mut new.spec.nics {
         nic.mac = None;

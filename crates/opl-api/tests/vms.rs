@@ -729,6 +729,45 @@ async fn ha_vms_need_an_ha_capable_node() {
     assert_eq!(body["code"], "ha_unsupported");
 }
 
+/// 기본 HA 정책은 옛 `true`로 저장되지만, 기본과 다른 정책 객체는 모든 노드가 `ha-placement`를 알 때만 받는다.
+#[tokio::test]
+async fn ha_policy_objects_wait_for_all_nodes() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mut req = vm_request("web");
+    req["spec"]["ha"] = json!({});
+    let (status, vm) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["ha"], true);
+
+    req["name"] = json!("db");
+    req["spec"]["ha"] = json!({ "group": "rack-a", "max_restart": 3 });
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading");
+
+    // 범위 밖 횟수는 기능보다 먼저 400이다.
+    req["spec"]["ha"] = json!({ "max_relocate": 11 });
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["message"],
+        "ha.max_restart and ha.max_relocate must be between 0 and 10"
+    );
+
+    let mut spec = vm["spec"].clone();
+    spec["ha"] = json!({ "state": "ignored" });
+    let (status, body) = admin
+        .put("/vms/web", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading");
+    spec["ha"] = json!(false);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["ha"], false);
+}
+
 #[tokio::test]
 async fn update_checks_if_match_revision() {
     let env = Env::start().await;

@@ -336,7 +336,7 @@ impl Worker {
     /// 노드에서 켤 수 있다. 우리가 요청한 종료로 표시하므로 실패로 세지 않고 원하는 상태도 바꾸지
     /// 않는다. 원하는 상태가 stopped여도 끈다(끄는 중에 과반수 쪽에서 다시 running으로 바뀌었을 수 있다).
     async fn fence(&mut self, vm: &Vm) -> Result<(), StepError> {
-        if !vm.spec.ha || !self.config.ha.as_ref().is_some_and(|g| g.stale()) {
+        if !vm.spec.ha_active() || !self.config.ha.as_ref().is_some_and(|g| g.stale()) {
             return Ok(());
         }
         if self.hv.inspect(self.id).await?.is_none() {
@@ -388,7 +388,7 @@ impl Worker {
     /// 있어야 한다. 안 되면 status에 남길 이유를 돌려주고, 펜싱이 있는 노드면 잠시 뒤 다시 본다
     /// (실패로 세지 않는다). 리스가 바뀌면 reconciler가 따로 깨운다.
     fn ha_blocked(&mut self, vm: &Vm) -> Option<String> {
-        if !vm.spec.ha {
+        if !vm.spec.ha_active() {
             return None;
         }
         let Some(guard) = &self.config.ha else {
@@ -409,7 +409,7 @@ impl Worker {
     /// 이 노드에서 HA VM이 도는지 guard에 알린다.
     fn report_running(&mut self, vm: &Vm, running: bool) {
         if let Some(guard) = &self.config.ha {
-            self.ha_running = vm.spec.ha && running;
+            self.ha_running = vm.spec.ha_active() && running;
             guard.set_running(self.id, self.ha_running);
         }
     }
@@ -533,7 +533,7 @@ impl Worker {
                 if self.disks_shared && status.last_error.is_none() {
                     self.exclusive_disks(vm).await;
                 }
-                if vm.spec.ha && status.last_error.is_none() {
+                if vm.spec.ha_active() && status.last_error.is_none() {
                     self.attach_ha(&mut status);
                 }
             }
@@ -662,7 +662,7 @@ impl Worker {
                     Some(current) => *vm = current,
                     None => return Ok(Some(status.clone())),
                 },
-                Err(e) if vm.spec.ha => return Err(e),
+                Err(e) if vm.spec.ha_active() => return Err(e),
                 Err(e) => {
                     tracing::warn!(vm = %self.id, error = %e, "cannot record starting phase; restarting anyway");
                 }
@@ -804,7 +804,7 @@ impl Worker {
     /// 인덱스까지 이 노드에 적용되어 있으므로 과반수 쪽의 쓰기(다른 노드로의 복구 등)를 본다. HA가 아닌
     /// VM은 늘 `Go`다.
     fn ha_recheck(&self, vm: &Vm) -> Result<Recheck, ClusterError> {
-        if !vm.spec.ha {
+        if !vm.spec.ha_active() {
             return Ok(Recheck::Go);
         }
         if !self.config.ha.as_ref().is_some_and(|g| g.fresh()) {
@@ -960,7 +960,7 @@ impl Worker {
             r => r?,
         };
         // HA VM은 reconcile이 리스와 watchdog를 확인한 뒤 이어서 실행한다(이 노드에서 도는 VM의 원본).
-        if !vm.spec.ha
+        if !vm.spec.ha_active()
             && let Some(state) = self.hv.inspect(self.id).await?
             && state.status == postmigrate()
         {
@@ -1019,14 +1019,20 @@ impl Worker {
     /// `vm`을 읽은 뒤 계산한 status를 기록한다. `snapshot`(현재 스냅샷 위치)과 `schedule_error`는
     /// Task 실행기·예약 작업이 쓰는 값이므로 저장소의 것을 지킨다: revision을 확인하며 쓰고, 그 사이
     /// 누가 썼으면 다시 읽어 그 값으로 다시 쓴다. `firmware_node`도 이 작업자가 바꾸지 않았으면
-    /// 저장소의 것을 지킨다(스냅샷 되돌리기가 쓴다). 나머지 필드는 전처럼 이 작업자가 계산한 값으로 덮는다.
+    /// 저장소의 것을 지킨다(스냅샷 되돌리기가 쓴다). `rule_violations`는 리더가 쓰므로 늘, `ha`(HA 기록)는
+    /// 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다. 나머지 필드는 전처럼 이 작업자가 계산한 값으로 덮는다.
     async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
         let keep_firmware = status.firmware_node == vm.status.firmware_node;
+        let keep_ha = status.ha == vm.status.ha;
         loop {
             status.snapshot = vm.status.snapshot;
             status.schedule_error = vm.status.schedule_error.clone();
             if keep_firmware {
                 status.firmware_node = vm.status.firmware_node;
+            }
+            status.rule_violations = vm.status.rule_violations.clone();
+            if keep_ha {
+                status.ha = vm.status.ha.clone();
             }
             match self
                 .cluster
@@ -1075,6 +1081,8 @@ impl Worker {
             schedule_error: vm.status.schedule_error.clone(),
             migration: None,
             firmware_node: vm.status.firmware_node,
+            rule_violations: vm.status.rule_violations.clone(),
+            ha: vm.status.ha.clone(),
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

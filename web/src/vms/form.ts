@@ -1,6 +1,7 @@
 import type { components } from "@/api/schema";
 import type { Node, Vm, VmSpec } from "@/api/types";
 import { MAX_NIC_SECURITY_GROUPS } from "@/security-groups/rules";
+import { haEnabled } from "@/vms/ha";
 
 type Schemas = components["schemas"];
 
@@ -149,7 +150,7 @@ export function fromVm(vm: Vm): VmFormValues {
           memory: s.snapshot_schedule.memory ?? false,
         }
       : { every: "off", keep: "7", memory: false },
-    ha: s.ha ?? false,
+    ha: haEnabled(s),
     start: false,
   };
 }

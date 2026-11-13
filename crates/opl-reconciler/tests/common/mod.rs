@@ -123,7 +123,7 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
             restart: Default::default(),
             node: Some(node),
             snapshot_schedule: None,
-            ha: false,
+            ha: None,
         },
     )
 }

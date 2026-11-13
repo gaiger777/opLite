@@ -175,7 +175,7 @@ pub(crate) async fn build_report(
                 .iter()
                 .filter(|v| v.status.phase == VmPhase::Running)
                 .count() as u64,
-            ha: vms.iter().filter(|v| v.spec.ha).count() as u64,
+            ha: vms.iter().filter(|v| v.spec.ha_active()).count() as u64,
         },
         pools,
         networks,

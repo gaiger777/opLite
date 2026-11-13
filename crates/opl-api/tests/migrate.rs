@@ -10,7 +10,7 @@ use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
 use opl_types::storage::{StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState};
-use opl_types::vm::{Arch, MigrationStatus, VmPhase, VmSpec};
+use opl_types::vm::{Arch, MigrationStatus, VmHa, VmPhase, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -189,7 +189,7 @@ async fn ha_vms_migrate_only_to_ha_capable_nodes() {
     edit_node(&env, env.node, |n| n.status.ha = ha).await;
     // API는 실행 중인 VM의 HA를 켜지 않으므로 저장소에 바로 쓴다.
     let mut vm = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
-    vm.spec.ha = true;
+    vm.spec.ha = Some(VmHa::default());
     env.cluster
         .update_spec(vm.id, None, vm.labels, &vm.spec)
         .await

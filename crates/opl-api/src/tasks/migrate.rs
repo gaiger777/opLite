@@ -595,7 +595,7 @@ async fn roll_back(
         if vm.spec.node == Some(migration.node) {
             return Outcome::Committed;
         }
-        ha = vm.spec.ha;
+        ha = vm.spec.ha_active();
         let current = vm.status.migration.as_ref() == Some(migration);
         let revision = vm.revision;
         let mut status = vm.status.clone();

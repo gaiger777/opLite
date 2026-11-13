@@ -13,7 +13,7 @@ use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
 use opl_types::storage::VolumePhase;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
-use opl_types::vm::{MacAddr, PowerState, Vm, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{MacAddr, PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus};
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -75,6 +75,10 @@ pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(
     }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // 기본과 다른 HA 정책은 객체로 저장되어 옛 노드가 VM을 읽지 못한다.
+    if spec.ha.as_ref().is_some_and(|ha| *ha != VmHa::default()) {
+        require_feature(&state.cluster, "ha-placement")?;
+    }
 
     for nic in spec.nics.iter().filter(|n| n.network != USER_NETWORK) {
         if !inv.networks.iter().any(|n| n.name == nic.network) {
@@ -198,7 +202,7 @@ fn check_not_in_maintenance(node: &Node) -> Result<(), ApiError> {
 
 /// HA VM인데 노드가 HA 가능 노드(펜싱이 켜진 노드)가 아니면 409 `ha_unsupported`.
 fn check_ha_capable(node: &Node, spec: &VmSpec) -> Result<(), ApiError> {
-    if spec.ha && !ha_capable(node) {
+    if spec.ha_active() && !ha_capable(node) {
         return Err(ApiError::conflict(
             "ha_unsupported",
             format!(
@@ -334,7 +338,7 @@ pub async fn update_vm(
             ));
         }
         // 노드가 과반수와 끊긴 동안 켜면 그 노드는 HA인 줄 모르고 펜싱하지 않는다. 끄기는 언제든.
-        if spec.ha && !current.spec.ha && !is_stopped(&current) {
+        if spec.ha_active() && !current.spec.ha_active() && !is_stopped(&current) {
             return Err(ApiError::conflict(
                 "vm_running",
                 format!(

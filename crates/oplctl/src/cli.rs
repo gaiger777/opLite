@@ -5160,11 +5160,23 @@ fn vm_row(v: &Value) -> Vec<String> {
         cell(&v["spec"]["power"]),
         cell(&v["status"]["phase"]),
         node,
-        // 옛 서버는 보내지 않는다 — HA VM이 아니다.
-        (v["spec"]["ha"] == true).to_string(),
+        ha_cell(&v["spec"]["ha"]),
         cell(&v["status"]["pid"]),
         cell(&v["status"]["last_error"]),
     ]
+}
+
+/// `vm list`의 HA 열: 옛 bool은 `true`/`false`, 정책 객체는 그 `state`(없으면 기본 `started`).
+fn ha_cell(ha: &Value) -> String {
+    match ha {
+        Value::Object(policy) => policy
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("started")
+            .to_string(),
+        // 옛 서버는 보내지 않는다 — HA VM이 아니다.
+        _ => (*ha == true).to_string(),
+    }
 }
 
 /// `--machine`이 없을 때의 머신: 지정 노드의 arch, 아니면 arch를 아는 노드가 모두 같은 arch.
@@ -6407,6 +6419,11 @@ mod tests {
         // HA VM
         vm["spec"]["ha"] = json!(true);
         assert_eq!(vm_row(&vm)[4], "true");
+        // 정책 객체는 state를 보인다.
+        vm["spec"]["ha"] = json!({ "state": "ignored", "max_restart": 1, "max_relocate": 1 });
+        assert_eq!(vm_row(&vm)[4], "ignored");
+        vm["spec"]["ha"] = json!({ "group": "rack-a" });
+        assert_eq!(vm_row(&vm)[4], "started");
     }
 
     #[test]

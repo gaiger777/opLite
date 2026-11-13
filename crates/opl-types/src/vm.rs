@@ -38,8 +38,104 @@ pub struct VmSpec {
     #[serde(default)]
     pub snapshot_schedule: Option<SnapshotSchedule>,
     /// HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
-    #[serde(default)]
-    pub ha: bool,
+    /// JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
+    #[serde(default, with = "ha_compat")]
+    #[cfg_attr(feature = "openapi", schema(value_type = HaSetting))]
+    pub ha: Option<VmHa>,
+}
+
+/// 재시작·옮기기 횟수의 최댓값.
+pub const MAX_HA_COUNT: u8 = 10;
+
+/// VM의 HA 정책.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, default)]
+pub struct VmHa {
+    pub state: HaState,
+    /// HA 그룹 이름. 없으면 그룹 없이 아무 노드로 복구한다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub group: Option<String>,
+    /// 같은 노드에서 다시 켜는 횟수. 넘으면 다른 노드로 옮긴다.
+    pub max_restart: u8,
+    /// 다른 노드로 옮기는 횟수. 넘으면 `error` 상태로 둔다.
+    pub max_relocate: u8,
+}
+
+impl Default for VmHa {
+    fn default() -> Self {
+        VmHa {
+            state: HaState::Started,
+            group: None,
+            max_restart: 1,
+            max_relocate: 1,
+        }
+    }
+}
+
+/// HA가 VM을 어떻게 다루는지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum HaState {
+    /// 노드 장애 때 다른 노드에서 켠다.
+    #[default]
+    Started,
+    /// 노드 장애 때 다른 노드로 옮기기만 하고 켜지 않는다.
+    Stopped,
+    /// HA를 잠시 끈다(설정은 남김).
+    Ignored,
+}
+
+/// API 문서의 `ha` 모양: 옛 bool이나 정책 객체. 읽고 쓰기는 `VmSpec.ha`의 손으로 쓴 serde가 한다.
+#[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum HaSetting {
+    Enabled(bool),
+    Policy(VmHa),
+}
+
+/// `ha`의 JSON: 없음은 `false`, 기본 정책은 `true`, 그 밖은 객체로 써서 옛 노드가 옛 VM을 읽는다.
+mod ha_compat {
+    use std::fmt;
+
+    use serde::de::{self, MapAccess, Visitor};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{HaSetting, VmHa};
+
+    pub fn serialize<S: Serializer>(ha: &Option<VmHa>, s: S) -> Result<S::Ok, S::Error> {
+        match ha {
+            None => HaSetting::Enabled(false),
+            Some(ha) if *ha == VmHa::default() => HaSetting::Enabled(true),
+            Some(ha) => HaSetting::Policy(ha.clone()),
+        }
+        .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<VmHa>, D::Error> {
+        struct HaVisitor;
+
+        impl<'de> Visitor<'de> for HaVisitor {
+            type Value = Option<VmHa>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a boolean or an HA policy object")
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(v.then(VmHa::default))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                VmHa::deserialize(de::value::MapAccessDeserializer::new(map)).map(Some)
+            }
+        }
+
+        d.deserialize_any(HaVisitor)
+    }
 }
 
 impl ResourceSpec for VmSpec {
@@ -101,7 +197,19 @@ impl VmSpec {
         {
             return Err(ValidationError::ScheduleKeep);
         }
+        if let Some(ha) = &self.ha
+            && (ha.max_restart > MAX_HA_COUNT || ha.max_relocate > MAX_HA_COUNT)
+        {
+            return Err(ValidationError::HaCount);
+        }
         Ok(())
+    }
+
+    /// HA가 이 VM을 다루는지(정책이 있고 `ignored`가 아님). 펜싱·HA 가능 노드 조건·복구가 이것을 본다.
+    pub fn ha_active(&self) -> bool {
+        self.ha
+            .as_ref()
+            .is_some_and(|ha| ha.state != HaState::Ignored)
     }
 
     /// 보안 그룹을 건(방화벽이 켜진) NIC가 있는지. 이런 VM은 방화벽이 있는 노드에서만 돈다.
@@ -132,6 +240,8 @@ pub enum ValidationError {
     TooManySecurityGroups(usize),
     #[error("nics[{0}]: security group {1:?} is listed more than once")]
     DuplicateSecurityGroup(usize, String),
+    #[error("ha.max_restart and ha.max_relocate must be between 0 and {MAX_HA_COUNT}")]
+    HaCount,
 }
 
 /// 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다.
@@ -322,6 +432,32 @@ pub struct VmStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub firmware_node: Option<Uuid>,
+    /// 지금 배치가 어기는 배치 규칙의 이름. 리더의 HA 관리자가 쓴다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub rule_violations: Vec<String>,
+    /// HA 재시작·옮기기 기록. 기록이 없으면 빼고 쓴다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub ha: Option<VmHaStatus>,
+}
+
+/// HA 재시작·옮기기 기록
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(default)]
+pub struct VmHaStatus {
+    /// 재시작 횟수를 넘겨 이 노드에서 다른 노드로 옮겨 달라는 요청. reconciler가 쓴다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub relocate_from: Option<Uuid>,
+    /// 창 안에서 다른 노드로 옮긴 때(유닉스 초).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relocations: Vec<u64>,
+    /// HA가 이 VM을 놓거나 옮기지 못한 이유.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
 }
 
 /// 진행 중인 라이브 마이그레이션: 대상 노드와 그 마이그레이션 Task
@@ -503,7 +639,7 @@ mod tests {
         assert_eq!(spec.restart, RestartPolicy::OnFailure);
         assert_eq!(spec.node, None);
         assert_eq!(spec.snapshot_schedule, None);
-        assert!(!spec.ha);
+        assert_eq!(spec.ha, None);
     }
 
     #[test]
@@ -733,6 +869,189 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&st).unwrap()["schedule_error"],
             serde_json::json!({ "code": "unknown", "message": "VM web is busy" })
+        );
+    }
+
+    // 이 계획 전(bf40f46)에 쓴 VM의 JSON 그대로.
+    const OLD_VM_JSON: &str = r#"{"cpu":{"sockets":1,"cores":4,"model":"host"},"memory_mib":8192,"firmware":"uefi","machine":"q35","disks":[{"volume":"web-01-root","bus":"virtio-blk","boot_order":1}],"nics":[{"network":"lan","model":"virtio","mac":"52:54:00:12:34:56"}],"power":"running","restart":"on-failure","node":"0193a6f2-7c4e-7d1a-9b3e-2f4c5d6e7f80","snapshot_schedule":null,"ha":false}"#;
+
+    #[test]
+    fn ha_reads_old_bools() {
+        let mut json = sample_json();
+        json["ha"] = false.into();
+        assert_eq!(
+            serde_json::from_value::<VmSpec>(json.clone()).unwrap().ha,
+            None
+        );
+        json["ha"] = true.into();
+        assert_eq!(
+            serde_json::from_value::<VmSpec>(json).unwrap().ha,
+            Some(VmHa::default())
+        );
+        // 필드가 없으면 HA가 아니다.
+        assert_eq!(sample().ha, None);
+    }
+
+    #[test]
+    fn old_vm_json_round_trips_byte_for_byte() {
+        let spec: VmSpec = serde_json::from_str(OLD_VM_JSON).unwrap();
+        assert_eq!(spec.ha, None);
+        assert_eq!(serde_json::to_string(&spec).unwrap(), OLD_VM_JSON);
+        let old_ha = OLD_VM_JSON.replace(r#""ha":false"#, r#""ha":true"#);
+        let spec: VmSpec = serde_json::from_str(&old_ha).unwrap();
+        assert_eq!(spec.ha, Some(VmHa::default()));
+        assert_eq!(serde_json::to_string(&spec).unwrap(), old_ha);
+    }
+
+    #[test]
+    fn ha_writes_none_as_false_and_default_as_true() {
+        let mut spec = sample();
+        assert_eq!(serde_json::to_value(&spec).unwrap()["ha"], false);
+        spec.ha = Some(VmHa::default());
+        assert_eq!(serde_json::to_value(&spec).unwrap()["ha"], true);
+    }
+
+    #[test]
+    fn ha_policy_object_round_trips() {
+        let mut spec = sample();
+        spec.ha = Some(VmHa {
+            state: HaState::Stopped,
+            group: Some("rack-a".into()),
+            max_restart: 3,
+            max_relocate: 0,
+        });
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["ha"],
+            serde_json::json!({
+                "state": "stopped",
+                "group": "rack-a",
+                "max_restart": 3,
+                "max_relocate": 0
+            })
+        );
+        assert_eq!(serde_json::from_value::<VmSpec>(json).unwrap(), spec);
+
+        // 기본과 하나만 달라도 객체로 쓴다. 그룹이 없으면 빼고 쓴다.
+        spec.ha = Some(VmHa {
+            state: HaState::Ignored,
+            ..Default::default()
+        });
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["ha"],
+            serde_json::json!({ "state": "ignored", "max_restart": 1, "max_relocate": 1 })
+        );
+        assert_eq!(serde_json::from_value::<VmSpec>(json).unwrap(), spec);
+    }
+
+    #[test]
+    fn ha_object_fills_missing_fields_and_rejects_unknown() {
+        let mut json = sample_json();
+        json["ha"] = serde_json::json!({ "group": "g" });
+        assert_eq!(
+            serde_json::from_value::<VmSpec>(json.clone()).unwrap().ha,
+            Some(VmHa {
+                group: Some("g".into()),
+                ..Default::default()
+            })
+        );
+        // 빈 객체는 기본 정책이고 다시 쓰면 true다.
+        json["ha"] = serde_json::json!({});
+        let spec: VmSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(spec.ha, Some(VmHa::default()));
+        assert_eq!(serde_json::to_value(&spec).unwrap()["ha"], true);
+
+        for bad in [
+            serde_json::json!({ "state": "started", "priority": 1 }),
+            serde_json::json!({ "state": "paused" }),
+            serde_json::json!("yes"),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            json["ha"] = bad.clone();
+            assert!(
+                serde_json::from_value::<VmSpec>(json.clone()).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_checks_ha_counts() {
+        let with = |max_restart, max_relocate| {
+            let mut s = sample();
+            s.ha = Some(VmHa {
+                max_restart,
+                max_relocate,
+                ..Default::default()
+            });
+            s.validate()
+        };
+        assert_eq!(with(0, 0), Ok(()));
+        assert_eq!(with(MAX_HA_COUNT, MAX_HA_COUNT), Ok(()));
+        assert_eq!(with(MAX_HA_COUNT + 1, 1), Err(ValidationError::HaCount));
+        assert_eq!(with(1, MAX_HA_COUNT + 1), Err(ValidationError::HaCount));
+    }
+
+    #[test]
+    fn ha_active_ignores_ignored_state() {
+        let mut s = sample();
+        assert!(!s.ha_active());
+        for (state, active) in [
+            (HaState::Started, true),
+            (HaState::Stopped, true),
+            (HaState::Ignored, false),
+        ] {
+            s.ha = Some(VmHa {
+                state,
+                ..Default::default()
+            });
+            assert_eq!(s.ha_active(), active, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn status_ha_fields_are_written_only_when_set() {
+        // 비어 있으면 옛 모양 그대로다.
+        let old = serde_json::json!({
+            "phase": "running",
+            "node": null,
+            "pid": 7,
+            "last_error": null,
+            "snapshot": null,
+            "schedule_error": null
+        });
+        let st: VmStatus = serde_json::from_value(old.clone()).unwrap();
+        assert!(st.rule_violations.is_empty());
+        assert_eq!(st.ha, None);
+        assert_eq!(serde_json::to_value(&st).unwrap(), old);
+
+        let node = Uuid::now_v7();
+        let st = VmStatus {
+            rule_violations: vec!["keep-apart".into()],
+            ha: Some(VmHaStatus {
+                relocate_from: Some(node),
+                relocations: vec![100, 200],
+                error: Some("gave up after 1 relocations".into()),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(json["rule_violations"], serde_json::json!(["keep-apart"]));
+        assert_eq!(
+            json["ha"],
+            serde_json::json!({
+                "relocate_from": node,
+                "relocations": [100, 200],
+                "error": "gave up after 1 relocations"
+            })
+        );
+        assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
+        // 빈 기록의 필드는 빼고 쓴다.
+        assert_eq!(
+            serde_json::to_value(VmHaStatus::default()).unwrap(),
+            serde_json::json!({})
         );
     }
 

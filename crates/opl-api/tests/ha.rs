@@ -20,7 +20,7 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
 use opl_types::resource::{Kind, Resource};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{Arch, MigrationStatus, PowerState, Vm, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{Arch, MigrationStatus, PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus};
 use uuid::Uuid;
 
 fn fast_manager(env: &Env) -> HaManager {
@@ -100,7 +100,7 @@ async fn vm(env: &Env, name: &str, node: Uuid, ha: bool, power: PowerState) -> V
     spec.memory_mib = 2048;
     spec.nics.clear();
     spec.node = Some(node);
-    spec.ha = ha;
+    spec.ha = ha.then(VmHa::default);
     spec.power = power;
     let mut vm: Vm = Resource::new(name, spec);
     if power == PowerState::Running {

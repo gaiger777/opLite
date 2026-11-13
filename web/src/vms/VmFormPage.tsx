@@ -15,6 +15,7 @@ import { isStopped } from "@/vms/actions";
 import { defaultMachine, emptyForm, fromVm, validate, type VmFormValues } from "@/vms/form";
 import { DisksSection } from "@/vms/form/DisksSection";
 import { GeneralSection } from "@/vms/form/GeneralSection";
+import { haEnabled } from "@/vms/ha";
 import { NicsSection } from "@/vms/form/NicsSection";
 import { ScheduleSection } from "@/vms/form/ScheduleSection";
 import { createVm, createVolume, isConflict, updateVm } from "@/vms/form/submit";
@@ -182,7 +183,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           nodes={nodes.data}
           creating={creating}
           locked={locked}
-          haLocked={locked && !vm?.spec.ha}
+          haLocked={locked && !(vm && haEnabled(vm.spec))}
           autoMachine={creating && !machineChosen}
           onMachineChosen={() => setMachineChosen(true)}
         />
