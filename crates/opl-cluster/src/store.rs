@@ -123,7 +123,6 @@ impl Store {
         StateMachine::new(self.db.clone(), self.watch.clone(), self.writer.clone())
     }
 
-    #[cfg(test)]
     pub(crate) fn writer(&self) -> &StoreWriter {
         &self.writer
     }

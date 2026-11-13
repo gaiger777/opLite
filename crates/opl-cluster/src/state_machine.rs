@@ -22,6 +22,8 @@ use crate::writer::StoreWriter;
 
 type Membership = StoredMembership<NodeId, openraft::BasicNode>;
 type Meta = SnapshotMeta<NodeId, openraft::BasicNode>;
+/// 상태 전체의 리소스(스냅샷 본문)
+pub(crate) type Objects = Vec<(Kind, RawResource)>;
 
 /// 스냅샷 본문의 머리. 본문 전체를 읽기 전에 형식 버전부터 확인한다.
 #[derive(Deserialize)]
@@ -106,19 +108,7 @@ impl StateMachine {
 
     /// 한 읽기 트랜잭션에서 상태 전체를 떠서 스냅샷 본문을 만든다. 저장은 부른 쪽이 한다.
     fn snapshot_data(db: &Database) -> Result<(Meta, Vec<u8>), StoreError> {
-        let txn = db.begin_read()?;
-        let meta_table = txn.open_table(META)?;
-        let last_log_id: Option<LogId<NodeId>> = get_json(&meta_table, KEY_LAST_APPLIED)?;
-        let last_membership: Membership =
-            get_json(&meta_table, KEY_LAST_MEMBERSHIP)?.unwrap_or_default();
-        let mut objects = Vec::new();
-        for item in txn.open_table(OBJECTS)?.iter()? {
-            let (key, value) = item?;
-            let kind: Kind = serde_json::from_value(key.value().0.into())?;
-            objects.push((kind, serde_json::from_slice(value.value())?));
-        }
-        drop(txn);
-
+        let (last_log_id, last_membership, objects) = snapshot_objects(db)?;
         let data = serde_json::to_vec(&SnapshotData {
             schema_version: SCHEMA_VERSION,
             objects,
@@ -204,6 +194,92 @@ impl StateMachine {
         txn.commit()?;
         Ok(())
     }
+}
+
+/// 한 읽기 트랜잭션에서 뜬 상태 전체: 적용 위치, 멤버십, 리소스.
+pub(crate) fn snapshot_objects(
+    db: &Database,
+) -> Result<(Option<LogId<NodeId>>, Membership, Objects), StoreError> {
+    let txn = db.begin_read()?;
+    let meta_table = txn.open_table(META)?;
+    let last_log_id: Option<LogId<NodeId>> = get_json(&meta_table, KEY_LAST_APPLIED)?;
+    let last_membership: Membership =
+        get_json(&meta_table, KEY_LAST_MEMBERSHIP)?.unwrap_or_default();
+    let mut objects = Vec::new();
+    for item in txn.open_table(OBJECTS)?.iter()? {
+        let (key, value) = item?;
+        let kind: Kind = serde_json::from_value(key.value().0.into())?;
+        objects.push((kind, serde_json::from_slice(value.value())?));
+    }
+    Ok((last_log_id, last_membership, objects))
+}
+
+/// 관찰 노드가 Follow로 받은 스냅샷(리소스 전체)을 `StateMachine::install`로 설치한다.
+pub(crate) fn install_objects(
+    db: &Database,
+    applied: Option<LogId<NodeId>>,
+    membership: Membership,
+    objects: Objects,
+) -> Result<(), StoreError> {
+    let data = serde_json::to_vec(&SnapshotData {
+        schema_version: SCHEMA_VERSION,
+        objects,
+    })?;
+    let meta = Meta {
+        snapshot_id: format!(
+            "{}-{}",
+            applied.map_or(0, |l| l.index),
+            Uuid::new_v4().simple()
+        ),
+        last_log_id: applied,
+        last_membership: membership,
+    };
+    StateMachine::install(db, &meta, data)
+}
+
+/// 관찰 노드가 Follow로 받은 적용 묶음을 쓴다. 리소스·이름, `last_applied`, 멤버십을 한 쓰기 트랜잭션에 기록한다.
+/// 같은 묶음을 로컬 구독자에게 내는 것(`WatchHub::publish`)은 부른 쪽이 커밋 뒤에 한다.
+pub(crate) fn apply_feed(db: &Database, batch: &FeedBatch) -> Result<(), StoreError> {
+    let txn = db.begin_write()?;
+    {
+        let mut objects = txn.open_table(OBJECTS)?;
+        let mut names = txn.open_table(NAMES)?;
+        for event in &batch.events {
+            match event {
+                WatchEvent::Put { kind, resource } => {
+                    let key = (kind.as_str(), resource.id.as_u128());
+                    // 이름이 바뀐 리소스면 옛 이름 색인을 지운다.
+                    let old: Option<RawResource> = match objects.get(key)? {
+                        Some(v) => Some(serde_json::from_slice(v.value())?),
+                        None => None,
+                    };
+                    if let Some(old) = old
+                        && old.name != resource.name
+                    {
+                        names.remove((kind.as_str(), old.name.as_str()))?;
+                    }
+                    objects.insert(key, serde_json::to_vec(resource)?.as_slice())?;
+                    names.insert(
+                        (kind.as_str(), resource.name.as_str()),
+                        resource.id.as_u128(),
+                    )?;
+                }
+                WatchEvent::Deleted { kind, resource, .. } => {
+                    objects.remove((kind.as_str(), resource.id.as_u128()))?;
+                    names.remove((kind.as_str(), resource.name.as_str()))?;
+                }
+                // 피드 묶음에는 오지 않는다(스냅샷 설치는 `install_objects`).
+                WatchEvent::Reset { .. } => {}
+            }
+        }
+        let mut meta = txn.open_table(META)?;
+        put_json(&mut meta, KEY_LAST_APPLIED, &batch.applied)?;
+        if let Some(m) = &batch.membership {
+            put_json(&mut meta, KEY_LAST_MEMBERSHIP, m)?;
+        }
+    }
+    txn.commit()?;
+    Ok(())
 }
 
 /// 명령 하나를 적용한다. 거부는 결정적이므로 모든 노드가 같은 결과를 낸다.

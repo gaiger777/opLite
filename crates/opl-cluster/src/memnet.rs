@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-
+use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -16,6 +17,7 @@ use openraft::raft::{
 use openraft::{BasicNode, Raft};
 
 use crate::cluster::{Cluster, ClusterError, NodeHandle};
+use crate::follow::{FollowClient, FollowFrame};
 use crate::leader::{self, Forwarder};
 use crate::types::{LeaderRequest, NodeId, TypeConfig};
 
@@ -31,6 +33,8 @@ struct Routes {
     raft_blocked: HashSet<NodeId>,
     /// 보낸 Raft RPC는 닿지만 답을 받지 못하는 노드
     replies_lost: HashSet<NodeId>,
+    /// 노드에 건 Follow 수
+    follows: HashMap<NodeId, usize>,
 }
 
 /// 노드 등록부. 등록되지 않았거나 격리된 노드로 가는 RPC는 `Unreachable`이 된다.
@@ -51,6 +55,14 @@ impl MemRouter {
     /// `from` 노드가 쓸 리더 전달자. `Cluster::with_forwarder`에 넘긴다.
     pub fn forwarder(&self, from: NodeId) -> Arc<MemForwarder> {
         Arc::new(MemForwarder {
+            from,
+            router: self.clone(),
+        })
+    }
+
+    /// `from` 노드(관찰 노드)가 쓸 Follow 통로. `Cluster::open_observer`에 넘긴다.
+    pub fn follower(&self, from: NodeId) -> Arc<MemFollow> {
+        Arc::new(MemFollow {
             from,
             router: self.clone(),
         })
@@ -82,6 +94,17 @@ impl MemRouter {
     /// 커밋을 모른다).
     pub fn lose_replies(&self, id: NodeId) {
         self.routes.lock().unwrap().replies_lost.insert(id);
+    }
+
+    /// 노드 `to`에 건 Follow 수
+    pub fn follows(&self, to: NodeId) -> usize {
+        self.routes
+            .lock()
+            .unwrap()
+            .follows
+            .get(&to)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn heal(&self, id: NodeId) {
@@ -145,7 +168,45 @@ impl Forwarder for MemForwarder {
             .router
             .route(self.from, leader)
             .map_err(|e| ClusterError::Unreachable(e.to_string()))?;
-        leader::execute(&node.leader_ctx(), req, FORWARD_TIMEOUT).await
+        match node.leader_ctx() {
+            Some(ctx) => leader::execute(&ctx, req, FORWARD_TIMEOUT).await,
+            None => Err(node.not_leader()),
+        }
+    }
+}
+
+pub struct MemFollow {
+    from: NodeId,
+    router: MemRouter,
+}
+
+#[async_trait]
+impl FollowClient for MemFollow {
+    async fn follow(
+        &self,
+        to: NodeId,
+        _addr: &str,
+        since: u64,
+    ) -> Result<BoxStream<'static, Result<FollowFrame, ClusterError>>, ClusterError> {
+        *self
+            .router
+            .routes
+            .lock()
+            .unwrap()
+            .follows
+            .entry(to)
+            .or_default() += 1;
+        let node = self
+            .router
+            .route(self.from, to)
+            .map_err(|e| ClusterError::Unreachable(e.to_string()))?;
+        let frames = node.follow(self.from, since)?;
+        // 프레임마다 길을 다시 본다. 두 노드 가운데 하나가 격리되거나 등록이 풀리면 연결이 끊긴 것처럼 끝난다.
+        let (router, from) = (self.router.clone(), self.from);
+        Ok(frames
+            .take_while(move |_| std::future::ready(router.route(from, to).is_ok()))
+            .map(Ok)
+            .boxed())
     }
 }
 

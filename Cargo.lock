@@ -1524,6 +1524,7 @@ name = "opl-cluster"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "openraft",
  "opl-types",
  "redb",

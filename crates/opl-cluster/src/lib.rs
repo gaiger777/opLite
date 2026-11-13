@@ -2,11 +2,13 @@
 
 mod cluster;
 mod exclusive;
+mod follow;
 mod health;
 mod leader;
 mod lease;
 mod log_store;
 pub mod memnet;
+mod replica;
 mod state_machine;
 pub mod store;
 pub mod types;
@@ -16,6 +18,7 @@ pub mod watch;
 mod writer;
 
 pub use cluster::{Cluster, ClusterConfig, ClusterError, DB_FILE, Members, Typed};
+pub use follow::{FollowClient, FollowFrame, NodeRole, PROGRESS_INTERVAL};
 pub use health::{QUORUM_ACK_MAX, RaftHealth};
 pub use leader::{CATCH_UP_TIMEOUT, Forwarder, LeaderError};
 pub use lease::Leases;

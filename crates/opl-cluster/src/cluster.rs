@@ -3,18 +3,23 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use futures_util::future::Either;
+use futures_util::stream::BoxStream;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{BasicNode, Raft, RaftNetworkFactory};
 use opl_types::resource::{Kind, Resource, ResourceSpec};
+use redb::Database;
 use uuid::Uuid;
 
+use crate::follow::{self, FollowClient, FollowFrame};
 use crate::health::{ApplyLag, QUORUM_ACK_MAX, RaftHealth};
 use crate::leader::{self, Forwarder, LeaderCtx};
 use crate::lease::{ConfirmBatch, LeaseTable, Leases};
+use crate::replica::Replica;
 use crate::store::{Store, StoreError, get_object, get_object_by_name, list_objects};
 use crate::types::{Command, LeaderRequest, NodeId, RawResource, Rejection, TypeConfig};
 use crate::vip::{VipLeases, VipTable};
-use crate::watch::{Watch, WatchError};
+use crate::watch::{Watch, WatchError, WatchHub};
 
 /// spec 타입 `S`의 리소스.
 pub type Typed<S> = Resource<S, <S as ResourceSpec>::Status>;
@@ -114,12 +119,18 @@ pub(crate) enum Backend {
         raft: Raft<TypeConfig>,
         confirm: ConfirmBatch,
     },
+    /// Raft 밖에서 투표 멤버 하나를 따르는 관찰 노드(설계 §6)
+    Observer(Replica),
 }
 
 /// 노드의 지금 백엔드와 리더로서 받은 리스 표. memnet은 이것을 등록해 두고 RPC를 보낼 때마다 지금 백엔드를
 /// 읽는다(백엔드가 바뀌어도 맞는 곳으로 간다).
 #[derive(Clone)]
 pub(crate) struct NodeHandle {
+    id: NodeId,
+    /// Follow를 받을 때 읽는 저장소와 적용 묶음
+    db: Arc<Database>,
+    hub: Arc<WatchHub>,
     backend: Arc<RwLock<Backend>>,
     /// 리더일 때 받은 HA 리스 갱신(메모리에만 둔다)
     leases: Arc<LeaseTable>,
@@ -128,7 +139,19 @@ pub(crate) struct NodeHandle {
 }
 
 impl NodeHandle {
-    fn backend(&self) -> Backend {
+    pub(crate) fn id(&self) -> NodeId {
+        self.id
+    }
+
+    pub(crate) fn db(&self) -> &Arc<Database> {
+        &self.db
+    }
+
+    pub(crate) fn hub(&self) -> &Arc<WatchHub> {
+        &self.hub
+    }
+
+    pub(crate) fn backend(&self) -> Backend {
         self.backend.read().unwrap().clone()
     }
 
@@ -136,17 +159,37 @@ impl NodeHandle {
     pub(crate) fn raft(&self) -> Option<Raft<TypeConfig>> {
         match self.backend() {
             Backend::Member { raft, .. } => Some(raft),
+            Backend::Observer(_) => None,
         }
     }
 
-    pub(crate) fn leader_ctx(&self) -> LeaderCtx {
-        let Backend::Member { raft, confirm } = self.backend();
-        LeaderCtx {
-            raft,
-            confirm,
-            leases: self.leases.clone(),
-            vips: self.vips.clone(),
+    /// 리더로서 요청을 처리할 것. 관찰 노드는 리더가 될 수 없어 `None`이다.
+    pub(crate) fn leader_ctx(&self) -> Option<LeaderCtx> {
+        match self.backend() {
+            Backend::Member { raft, confirm } => Some(LeaderCtx {
+                raft,
+                confirm,
+                leases: self.leases.clone(),
+                vips: self.vips.clone(),
+            }),
+            Backend::Observer(_) => None,
         }
+    }
+
+    /// 이 노드가 아는 리더로 만든 `NotLeader`
+    pub(crate) fn not_leader(&self) -> ClusterError {
+        match self.backend() {
+            Backend::Member { raft, .. } => leader::not_leader(&raft.metrics().borrow()),
+            Backend::Observer(replica) => replica.not_leader(),
+        }
+    }
+
+    pub(crate) fn follow(
+        &self,
+        caller: NodeId,
+        since: u64,
+    ) -> Result<BoxStream<'static, FollowFrame>, ClusterError> {
+        follow::serve(self.clone(), caller, since)
     }
 }
 
@@ -178,15 +221,7 @@ impl Cluster {
     where
         N: RaftNetworkFactory<TypeConfig>,
     {
-        let store = if config.in_memory {
-            tracing::warn!(
-                "the cluster store is in memory (test only): the Raft log and votes are lost on restart"
-            );
-            Store::open_in_memory()?
-        } else {
-            std::fs::create_dir_all(&config.data_dir)?;
-            Store::open(&config.data_dir.join(DB_FILE))?
-        };
+        let store = open_store(&config)?;
         let raft_config = Arc::new(
             config
                 .raft
@@ -202,21 +237,50 @@ impl Cluster {
         )
         .await
         .map_err(|e| ClusterError::Raft(e.to_string()))?;
-        Ok(Self {
-            id: config.node_id,
+        let backend = Backend::Member {
+            confirm: ConfirmBatch::for_raft(raft.clone()),
+            raft,
+        };
+        Ok(Self::assemble(
+            config.node_id,
+            config.write_timeout,
             store,
+            backend,
+        ))
+    }
+
+    /// 저장소를 열고 관찰 노드로 시작한다(Raft를 띄우지 않음). 저장소의 멤버십에서 투표 멤버를 골라 `follow`로
+    /// 붙고, 저장소의 적용 위치부터 이어 받는다. 쓰기와 리스 갱신은 `with_forwarder`의 전달자로 리더에 보낸다.
+    pub async fn open_observer(
+        config: ClusterConfig,
+        follow: Arc<dyn FollowClient>,
+    ) -> Result<Self, ClusterError> {
+        let store = open_store(&config)?;
+        let replica = Replica::start(config.node_id, &store, follow)?;
+        Ok(Self::assemble(
+            config.node_id,
+            config.write_timeout,
+            store,
+            Backend::Observer(replica),
+        ))
+    }
+
+    fn assemble(id: NodeId, write_timeout: Duration, store: Store, backend: Backend) -> Self {
+        Self {
+            id,
             node: NodeHandle {
-                backend: Arc::new(RwLock::new(Backend::Member {
-                    confirm: ConfirmBatch::for_raft(raft.clone()),
-                    raft,
-                })),
+                id,
+                db: store.db().clone(),
+                hub: store.watch_hub().clone(),
+                backend: Arc::new(RwLock::new(backend)),
                 leases: Arc::default(),
                 vips: Arc::default(),
             },
-            write_timeout: config.write_timeout,
+            store,
+            write_timeout,
             forwarder: None,
             apply_lag: Default::default(),
-        })
+        }
     }
 
     /// 팔로워가 받은 쓰기와 멤버십 변경을 이것으로 리더에 전달한다. 없으면 `NotLeader`를 돌려준다.
@@ -234,10 +298,17 @@ impl Cluster {
         self.node.raft()
     }
 
-    /// 이 노드의 Raft(구성원인 백엔드)
-    fn member(&self) -> Raft<TypeConfig> {
-        let Backend::Member { raft, .. } = self.node.backend();
-        raft
+    /// 이 노드의 Raft(구성원인 백엔드). 관찰 노드면 아는 리더를 담은 `NotLeader`다.
+    fn member(&self) -> Result<Raft<TypeConfig>, ClusterError> {
+        self.node.raft().ok_or_else(|| self.node.not_leader())
+    }
+
+    /// 관찰 노드면 그 복제본
+    fn replica(&self) -> Option<Replica> {
+        match self.node.backend() {
+            Backend::Member { .. } => None,
+            Backend::Observer(replica) => Some(replica),
+        }
     }
 
     /// 이 노드의 저장소에 적용한 마지막 인덱스(revision). blank·멤버십·거부된 명령도 올린다.
@@ -264,7 +335,7 @@ impl Cluster {
         &self,
         members: BTreeMap<NodeId, BasicNode>,
     ) -> Result<(), ClusterError> {
-        self.member()
+        self.member()?
             .initialize(members)
             .await
             .map_err(|e| ClusterError::Raft(e.to_string()))
@@ -276,7 +347,7 @@ impl Cluster {
     pub async fn add_learner(&self, id: NodeId, node: BasicNode) -> Result<(), ClusterError> {
         tokio::time::timeout(
             self.write_timeout,
-            self.member().add_learner(id, node, true),
+            self.member()?.add_learner(id, node, true),
         )
         .await
         .map_err(|_| ClusterError::Timeout)??;
@@ -288,7 +359,7 @@ impl Cluster {
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<(), ClusterError> {
         tokio::time::timeout(
             self.write_timeout,
-            self.member().change_membership(voters, true),
+            self.member()?.change_membership(voters, true),
         )
         .await
         .map_err(|_| ClusterError::Timeout)??;
@@ -389,7 +460,7 @@ impl Cluster {
         let mut maybe_applied = false;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let result = match leader::execute(&self.leader_ctx(), req.clone(), remaining).await {
+            let result = match self.execute_local(req.clone(), remaining).await {
                 Err(ClusterError::NotLeader {
                     leader_id: Some(leader),
                     leader_addr: Some(addr),
@@ -423,12 +494,22 @@ impl Cluster {
                             Ok(index)
                         }
                         Ok(Ok(index)) => {
-                            let _ = self
-                                .wait_revision(
-                                    index,
-                                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                                )
-                                .await;
+                            let replica = self.replica();
+                            let mut wait =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            if let Some(replica) = &replica {
+                                replica.heard_from_leader(index);
+                                // 남은 시간보다 조금 일찍 그만둔다: 부른 쪽이 같은 제한 시간으로 이 future를 버리기
+                                // 전에(리스 갱신) 아래에서 다른 투표 멤버로 옮기게.
+                                wait -= wait / 10;
+                            }
+                            let applied = self.wait_revision(index, wait).await;
+                            // 관찰 노드가 붙은 투표 멤버가 리더를 따라가지 못한다. 다른 투표 멤버로 옮긴다.
+                            if applied.is_err()
+                                && let Some(replica) = &replica
+                            {
+                                replica.follow_another();
+                            }
                             Ok(index)
                         }
                         // 연결하지 못한 것과 보낸 뒤 끊긴 것을 구분할 수 없어 둘 다 적용됐을 수 있다고 본다.
@@ -523,11 +604,24 @@ impl Cluster {
     /// 이 노드가 리더로서 요청을 처리한다. 노드 간 네트워크가 다른 노드에서 전달받은 요청을 넘긴다.
     /// 리더가 아니면 `NotLeader`다(다시 전달하지 않는다).
     pub async fn execute_as_leader(&self, req: LeaderRequest) -> Result<u64, ClusterError> {
-        leader::execute(&self.leader_ctx(), req, self.write_timeout).await
+        self.execute_local(req, self.write_timeout).await
     }
 
-    pub(crate) fn leader_ctx(&self) -> LeaderCtx {
-        self.node.leader_ctx()
+    /// 이 노드에서 리더로서 처리한다. 관찰 노드는 리더가 될 수 없어 아는 리더를 담은 `NotLeader`다(전달할 곳).
+    async fn execute_local(
+        &self,
+        req: LeaderRequest,
+        timeout: Duration,
+    ) -> Result<u64, ClusterError> {
+        match self.node.leader_ctx() {
+            Some(ctx) => leader::execute(&ctx, req, timeout).await,
+            None => Err(self.node.not_leader()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
     }
 
     /// memnet이 등록해 두는 이 노드의 백엔드와 리스 표
@@ -581,7 +675,10 @@ impl Cluster {
 
     /// 리더가 지금 임기에 받은 VIP 리스 갱신. 리더에서만 뜻이 있다.
     pub fn vip_leases(&self) -> VipLeases {
-        self.node.vips.leases(&self.member())
+        match self.node.raft() {
+            Some(raft) => self.node.vips.leases(&raft),
+            None => VipLeases::default(),
+        }
     }
 
     /// `node`의 VIP 갱신을 `end_vip_fence`까지 `Rejection::Fenced`로 거부한다. 리더가 그 노드의 VIP를
@@ -597,7 +694,10 @@ impl Cluster {
 
     /// 리더가 지금 임기에 받은 리스 갱신. 리더에서만 뜻이 있다(리더인지는 `read_barrier`로 확인한다).
     pub fn leases(&self) -> Leases {
-        self.node.leases.leases(&self.member())
+        match self.node.raft() {
+            Some(raft) => self.node.leases.leases(&raft),
+            None => Leases::default(),
+        }
     }
 
     /// `node`를 펜싱 중으로 표시한다. `end_fence`까지 그 노드의 갱신은 `Rejection::Fenced`로
@@ -613,12 +713,27 @@ impl Cluster {
     }
 
     /// 이 노드가 아는 멤버십과 리더
+    /// 관찰 노드는 저장소에 적용된 멤버십과 붙은 노드가 알린 리더다.
     pub fn members(&self) -> Members {
-        let m = self.member().metrics().borrow().clone();
-        let membership = m.membership_config.membership();
+        let (leader, membership) = match self.node.backend() {
+            Backend::Member { raft, .. } => {
+                let m = raft.metrics().borrow().clone();
+                (m.current_leader, m.membership_config.membership().clone())
+            }
+            Backend::Observer(replica) => (
+                replica.leader().map(|(id, _)| id),
+                replica
+                    .membership()
+                    .map(|m| m.membership().clone())
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "cannot read the stored membership");
+                        Default::default()
+                    }),
+            ),
+        };
         let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
         let mut out = Members {
-            leader: m.current_leader,
+            leader,
             voters: BTreeMap::new(),
             learners: BTreeMap::new(),
         };
@@ -634,8 +749,30 @@ impl Cluster {
     }
 
     /// 헬스 체크가 보는 이 노드의 Raft 상태. 부를 때마다 적용 지연을 다시 잰다([`RaftHealth`]).
+    /// 관찰 노드는 붙은 노드의 진행이 [`QUORUM_ACK_MAX`] 안에 왔고 리더를 알면 `quorum`이고, 적용 지연은 붙은
+    /// 노드가 알린 적용 인덱스나 리더가 돌려준 인덱스(전달한 쓰기·리스 갱신) 가운데 큰 것을 아직 적용하지 못한 시간이다.
     pub fn health(&self) -> RaftHealth {
-        let m = self.member().metrics().borrow().clone();
+        let raft = match self.node.backend() {
+            Backend::Member { raft, .. } => raft,
+            Backend::Observer(replica) => {
+                let status = replica.status();
+                let apply_lag = self.apply_lag.lock().unwrap().observe(
+                    Some(status.upstream_applied.max(status.leader_applied)),
+                    Some(self.revision()),
+                    std::time::Instant::now(),
+                );
+                let leader = status.leader.map(|(id, _)| id);
+                return RaftHealth {
+                    leader,
+                    quorum: leader.is_some()
+                        && status
+                            .last_progress
+                            .is_some_and(|t| t.elapsed() <= QUORUM_ACK_MAX),
+                    apply_lag,
+                };
+            }
+        };
+        let m = raft.metrics().borrow().clone();
         let apply_lag = self.apply_lag.lock().unwrap().observe(
             m.last_log_index,
             m.last_applied.map(|l| l.index),
@@ -683,7 +820,7 @@ impl Cluster {
     /// 기다린다(선형화 읽기). 리더에서만 쓸 수 있다. 팔로워와 learner에서는 리더 정보를 담은
     /// `NotLeader`를 돌려준다.
     pub async fn read_barrier(&self) -> Result<(), ClusterError> {
-        match self.member().ensure_linearizable().await {
+        match self.member()?.ensure_linearizable().await {
             Ok(_) => Ok(()),
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                 Err(ClusterError::NotLeader {
@@ -700,8 +837,23 @@ impl Cluster {
         self.store.watch_hub().subscribe(since)
     }
 
+    /// 관찰 노드가 투표 멤버에게서 받는 스트림을 이 노드가 만든다(설계 §6). `since` 뒤의 적용 묶음과 1초마다
+    /// 진행을 보내고, `since`가 보관한 기록보다 오래면 스냅샷부터 보낸다. 이 노드가 Raft 구성원이 아니면 `Hello`만
+    /// 보내고 닫는다.
+    pub fn follow(
+        &self,
+        caller: NodeId,
+        since: u64,
+    ) -> Result<BoxStream<'static, FollowFrame>, ClusterError> {
+        self.node.follow(caller, since)
+    }
+
     pub async fn shutdown(&self) -> Result<(), ClusterError> {
-        self.member()
+        if let Some(replica) = self.replica() {
+            replica.shutdown().await;
+            return Ok(());
+        }
+        self.member()?
             .shutdown()
             .await
             .map_err(|e| ClusterError::Raft(e.to_string()))
@@ -710,9 +862,19 @@ impl Cluster {
     /// Raft가 멈추면 그 이유와 함께 끝나는 future(저장소를 붙잡지 않는다). 저장소 쓰기가 실패하거나
     /// 저장소 스레드가 멈추면 openraft가 이 노드의 Raft를 멈춘다(`running_state`가 `Err`). `shutdown`으로
     /// 멈춰도 끝난다.
+    /// 관찰 노드는 `shutdown`하면 끝난다.
     pub fn stopped(&self) -> impl Future<Output = String> + Send + 'static {
-        let mut rx = self.member().metrics();
-        async move {
+        let mut rx = match self.node.backend() {
+            Backend::Member { raft, .. } => raft.metrics(),
+            Backend::Observer(replica) => {
+                let mut stopped = replica.stopped();
+                return Either::Right(async move {
+                    let _ = stopped.wait_for(|s| *s).await;
+                    "the replica stopped".to_owned()
+                });
+            }
+        };
+        Either::Left(async move {
             loop {
                 let state = rx.borrow_and_update().running_state.clone();
                 if let Err(e) = state {
@@ -723,7 +885,19 @@ impl Cluster {
                     return "the Raft task ended".to_owned();
                 }
             }
-        }
+        })
+    }
+}
+
+fn open_store(config: &ClusterConfig) -> Result<Store, ClusterError> {
+    if config.in_memory {
+        tracing::warn!(
+            "the cluster store is in memory (test only): the Raft log and votes are lost on restart"
+        );
+        Ok(Store::open_in_memory()?)
+    } else {
+        std::fs::create_dir_all(&config.data_dir)?;
+        Ok(Store::open(&config.data_dir.join(DB_FILE))?)
     }
 }
 

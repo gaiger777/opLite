@@ -13,6 +13,7 @@ scale-it = []
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 openraft.workspace = true
 opl-types.workspace = true
 redb.workspace = true
