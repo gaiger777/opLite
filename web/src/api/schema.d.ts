@@ -5353,6 +5353,11 @@ export interface components {
              */
             relocate_from?: string;
             /**
+             * Format: uuid
+             * @description 마지막으로 옮겨 떠난 노드. 그 노드로 되돌아가면 옮기기 한 번으로 센다.
+             */
+            relocated_from?: string;
+            /**
              * @description 창 안에서 다른 노드로 옮긴 때(유닉스 초).
              * @default []
              */

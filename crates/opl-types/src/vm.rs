@@ -454,6 +454,10 @@ pub struct VmHaStatus {
     /// 창 안에서 다른 노드로 옮긴 때(유닉스 초).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub relocations: Vec<u64>,
+    /// 마지막으로 옮겨 떠난 노드. 그 노드로 되돌아가면 옮기기 한 번으로 센다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub relocated_from: Option<Uuid>,
     /// HA가 이 VM을 놓거나 옮기지 못한 이유.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
@@ -1033,6 +1037,7 @@ mod tests {
             ha: Some(VmHaStatus {
                 relocate_from: Some(node),
                 relocations: vec![100, 200],
+                relocated_from: Some(node),
                 error: Some("gave up after 1 relocations".into()),
             }),
             ..Default::default()
@@ -1044,6 +1049,7 @@ mod tests {
             serde_json::json!({
                 "relocate_from": node,
                 "relocations": [100, 200],
+                "relocated_from": node,
                 "error": "gave up after 1 relocations"
             })
         );

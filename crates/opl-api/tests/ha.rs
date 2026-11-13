@@ -26,7 +26,7 @@ use opl_types::placement::{
 use opl_types::resource::{Kind, Resource};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
-    Arch, HaState, MigrationStatus, PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus,
+    Arch, HaState, MigrationStatus, PowerState, Vm, VmHa, VmHaStatus, VmPhase, VmSpec, VmStatus,
 };
 use uuid::Uuid;
 
@@ -1065,6 +1065,8 @@ async fn fails_back_to_a_preferred_node_that_stayed_alive() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(migrate_tasks(&env), vec![(a.id, low, high)]);
     assert_eq!(get(&env, b.id).spec.node, Some(low));
+    // 옮겨 떠난 노드가 아닌 곳(노드 장애 복구 뒤 등)으로의 되돌아가기는 옮기기로 세지 않는다.
+    assert_eq!(get(&env, a.id).status.ha, None);
     renewer.abort();
     manager.shutdown().await;
 }
@@ -1160,5 +1162,269 @@ async fn rule_violations_appear_and_disappear() {
             .all(|id| get(&env, *id).status.rule_violations == ["spread"])
     })
     .await;
+    manager.shutdown().await;
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// 노드 `node`의 reconciler가 재시작 횟수를 넘긴 VM을 옮겨 달라고 한 것처럼 status를 쓴다.
+async fn ask_relocate(env: &Env, id: Uuid, node: Uuid) {
+    let mut status = get(env, id).status;
+    status.phase = VmPhase::Failed;
+    status.node = Some(node);
+    status.pid = None;
+    status.last_error = Some("VM crashed 2 times on this node; asking HA to move it".into());
+    let mut ha = status.ha.unwrap_or_default();
+    ha.relocate_from = Some(node);
+    status.ha = Some(ha);
+    env.cluster
+        .update_status::<VmSpec>(id, &status)
+        .await
+        .unwrap();
+}
+
+/// 옮겨 달라는 요청을 받으면 그 노드를 뺀 곳으로 옮기고 옮긴 기록을 하나 더한다. 받은 노드에서 다시 요청하면
+/// 창 안에서 이미 `max_relocate`(1)번 옮겼으므로 옮기지 않고 끈다(`error`). 사용자가 다시 켜도 리더는 다시
+/// 끄지 않는다(오류 표시는 받은 노드의 reconciler가 켤 때 지운다).
+#[tokio::test]
+async fn relocates_a_vm_that_failed_too_often_then_gives_up() {
+    let env = Env::start().await;
+    let from = node(&env, "from", 64000, Some(60)).await;
+    let spare = node(&env, "spare", 8192, Some(60)).await;
+    // 다른 노드의 리스는 살아 있지만 요청이 없는 VM은 그대로다.
+    let quiet = vm(&env, "quiet", from, true, PowerState::Running).await;
+    let a = vm(&env, "a-vm", from, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    let start = unix_now();
+    ask_relocate(&env, a.id, from).await;
+    eventually("relocated", || get(&env, a.id).spec.node == Some(spare)).await;
+    let moved = get(&env, a.id);
+    assert_eq!(moved.spec.power, PowerState::Running);
+    assert_eq!(moved.status.phase, VmPhase::Stopped);
+    assert_eq!(moved.status.node, None);
+    assert_eq!(
+        moved.status.last_error.as_deref(),
+        Some("relocating: the VM failed too often on node from")
+    );
+    let ha = moved.status.ha.clone().unwrap();
+    // 받은 노드가 켤 때까지 요청을 남긴다.
+    assert_eq!(ha.relocate_from, Some(from));
+    assert_eq!(ha.relocations.len(), 1);
+    assert!(ha.relocations[0] >= start && ha.relocations[0] <= unix_now());
+    assert_eq!(ha.relocated_from, Some(from));
+    assert_eq!(ha.error, None);
+    assert_eq!(get(&env, quiet.id).spec.node, Some(from));
+
+    // 받은 노드에서 켠 뒤(요청을 지움) 다시 크래시해 옮겨 달라고 한다.
+    let mut status = get(&env, a.id).status;
+    status.phase = VmPhase::Running;
+    status.node = Some(spare);
+    status.ha.as_mut().unwrap().relocate_from = None;
+    env.cluster
+        .update_status::<VmSpec>(a.id, &status)
+        .await
+        .unwrap();
+    ask_relocate(&env, a.id, spare).await;
+    eventually("gave up", || {
+        get(&env, a.id).status.ha.is_some_and(|h| h.error.is_some())
+    })
+    .await;
+    let failed = get(&env, a.id);
+    assert_eq!(failed.spec.node, Some(spare));
+    assert_eq!(failed.spec.power, PowerState::Stopped);
+    assert_eq!(failed.status.phase, VmPhase::Failed);
+    assert_eq!(
+        failed.status.last_error.as_deref(),
+        Some("HA gave up after 1 relocations")
+    );
+    assert_eq!(
+        failed.status.ha.as_ref().unwrap(),
+        &VmHaStatus {
+            relocate_from: None,
+            relocations: ha.relocations.clone(),
+            relocated_from: Some(from),
+            error: Some("gave up after 1 relocations".into()),
+        }
+    );
+
+    // 사용자가 다시 켠다: 요청이 없으므로 리더는 그대로 둔다.
+    let current = get(&env, a.id);
+    let mut spec = current.spec.clone();
+    spec.power = PowerState::Running;
+    env.cluster
+        .update_spec(a.id, Some(current.revision), current.labels, &spec)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let restarted = get(&env, a.id);
+    assert_eq!(restarted.spec.power, PowerState::Running);
+    assert_eq!(restarted.spec.node, Some(spare));
+    manager.shutdown().await;
+}
+
+/// 재시작 횟수를 넘겨 그룹의 더 우선인 노드에서 옮겨 온 VM은 옮기기 창 안에서 그 노드로 되돌아가지 않는다.
+#[tokio::test]
+async fn a_relocated_vm_does_not_fail_back_within_the_window() {
+    let env = Env::start().await;
+    let a = node(&env, "a", 8192, Some(60)).await;
+    let b = node(&env, "b", 8192, Some(60)).await;
+    group(&env, "g", &[("a", 2), ("b", 1)], false, false).await;
+    let moved = vm_ha(&env, "moved", b, in_group("g"), PowerState::Running).await;
+    let mut status = moved.status.clone();
+    status.ha = Some(VmHaStatus {
+        relocations: vec![unix_now()],
+        ..Default::default()
+    });
+    env.cluster
+        .update_status::<VmSpec>(moved.id, &status)
+        .await
+        .unwrap();
+    let renewer = keep_alive(&env, a);
+    let manager = failback_manager(&env, Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(migrate_tasks(&env).is_empty());
+    renewer.abort();
+    manager.shutdown().await;
+}
+
+/// 창이 지나 옮겨 떠난 노드로 되돌아가면 옮기기 한 번으로 센다. 그 노드에서 다시 크래시하면 창 안에서
+/// 이미 `max_relocate`(1)번 옮겼으므로 옮기지 않고 끈다(되돌아가기와 옮기기가 창마다 끝없이 돌지 않는다).
+#[tokio::test]
+async fn failing_back_to_the_node_it_left_counts_as_a_relocation() {
+    let env = Env::start().await;
+    let a = node(&env, "a", 8192, Some(60)).await;
+    let b = node(&env, "b", 8192, Some(60)).await;
+    group(&env, "g", &[("a", 2), ("b", 1)], false, false).await;
+    let moved = vm_ha(&env, "moved", b, in_group("g"), PowerState::Running).await;
+    // a에서 옮겨 온 지 창(600초)보다 오래 지났다.
+    let old = unix_now() - 700;
+    let mut status = moved.status.clone();
+    status.ha = Some(VmHaStatus {
+        relocations: vec![old],
+        relocated_from: Some(a),
+        ..Default::default()
+    });
+    env.cluster
+        .update_status::<VmSpec>(moved.id, &status)
+        .await
+        .unwrap();
+    let renewer = keep_alive(&env, a);
+    let start = unix_now();
+    let manager = failback_manager(&env, Duration::from_millis(200));
+    eventually("failback task", || !migrate_tasks(&env).is_empty()).await;
+    assert_eq!(migrate_tasks(&env)[0], (moved.id, b, a));
+    eventually("failback counted", || {
+        get(&env, moved.id)
+            .status
+            .ha
+            .is_some_and(|h| h.relocations.iter().any(|at| *at >= start))
+    })
+    .await;
+    let ha = get(&env, moved.id).status.ha.unwrap();
+    assert_eq!(ha.relocations.len(), 1);
+    assert_eq!(ha.relocated_from, None);
+
+    // 마이그레이션이 끝난 것처럼 a에서 실행 중으로 쓰고, a에서 다시 크래시해 옮겨 달라고 한다.
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    let task = tasks
+        .iter()
+        .find(|t| matches!(t.spec.op, TaskOp::VmMigrate { .. }))
+        .unwrap()
+        .id;
+    let done = TaskStatus {
+        state: TaskState::Succeeded,
+        error: None,
+        progress: None,
+    };
+    env.cluster
+        .update_status::<TaskSpec>(task, &done)
+        .await
+        .unwrap();
+    let current = get(&env, moved.id);
+    let mut spec = current.spec.clone();
+    spec.node = Some(a);
+    env.cluster
+        .update_spec(moved.id, Some(current.revision), current.labels, &spec)
+        .await
+        .unwrap();
+    let mut status = get(&env, moved.id).status;
+    status.phase = VmPhase::Running;
+    status.node = Some(a);
+    status.migration = None;
+    env.cluster
+        .update_status::<VmSpec>(moved.id, &status)
+        .await
+        .unwrap();
+    ask_relocate(&env, moved.id, a).await;
+    eventually("gave up", || {
+        get(&env, moved.id)
+            .status
+            .ha
+            .is_some_and(|h| h.error.is_some())
+    })
+    .await;
+    let failed = get(&env, moved.id);
+    assert_eq!(failed.spec.node, Some(a));
+    assert_eq!(failed.spec.power, PowerState::Stopped);
+    assert_eq!(failed.status.phase, VmPhase::Failed);
+    renewer.abort();
+    manager.shutdown().await;
+}
+
+/// 창 밖의 옮긴 기록은 버리고 세지 않는다. `max_relocate` 0이면 첫 요청에 끈다.
+#[tokio::test]
+async fn relocations_outside_the_window_are_dropped() {
+    let env = Env::start().await;
+    let from = node(&env, "from", 64000, Some(60)).await;
+    let spare = node(&env, "spare", 8192, Some(60)).await;
+    let a = vm(&env, "a-vm", from, true, PowerState::Running).await;
+    let never = vm_ha(
+        &env,
+        "never",
+        from,
+        Some(VmHa {
+            max_relocate: 0,
+            ..Default::default()
+        }),
+        PowerState::Running,
+    )
+    .await;
+    let old = unix_now() - 3600;
+    let mut status = a.status.clone();
+    status.ha = Some(VmHaStatus {
+        relocations: vec![old],
+        ..Default::default()
+    });
+    env.cluster
+        .update_status::<VmSpec>(a.id, &status)
+        .await
+        .unwrap();
+    let manager = fast_manager(&env);
+    ask_relocate(&env, a.id, from).await;
+    ask_relocate(&env, never.id, from).await;
+    eventually("relocated", || get(&env, a.id).spec.node == Some(spare)).await;
+    let relocations = get(&env, a.id).status.ha.unwrap().relocations;
+    assert_eq!(relocations.len(), 1);
+    assert_ne!(relocations[0], old);
+    // spec을 먼저 쓰고 status에 오류를 쓴다.
+    eventually("gave up", || {
+        get(&env, never.id)
+            .status
+            .ha
+            .is_some_and(|h| h.error.is_some())
+    })
+    .await;
+    let failed = get(&env, never.id);
+    assert_eq!(failed.spec.power, PowerState::Stopped);
+    assert_eq!(failed.spec.node, Some(from));
+    assert_eq!(
+        failed.status.ha.and_then(|h| h.error).as_deref(),
+        Some("gave up after 0 relocations")
+    );
     manager.shutdown().await;
 }

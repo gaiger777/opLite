@@ -4,9 +4,12 @@ use std::time::Duration;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
+use opl_types::node::{HA_PLACEMENT, NodeSpec};
 use opl_types::runtime::VmRuntimeSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
-use opl_types::vm::{Firmware, PowerState, RestartPolicy, Vm, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{
+    Firmware, HaState, PowerState, RestartPolicy, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -121,6 +124,9 @@ pub(crate) struct Worker {
     /// spec.power를 stopped로 바꿔야 한다(게스트 종료, 재시작 포기). 안쪽 값은 status에 남길 오류다.
     /// 쓰기에 실패하면 남겨 두었다가 다음 단계에서 다시 쓴다.
     power_off: Option<Option<String>>,
+    /// HA VM이 이 노드에서 `max_restart`보다 많이 크래시했다. 다시 켜지 않고 리더에게 다른 노드로 옮겨 달라고
+    /// 한다(`status.ha.relocate_from`). 안쪽 값은 status에 남길 오류다. 요청이 저장소에 보이면 지운다.
+    relocate: Option<String>,
     /// 마지막으로 조회했을 때 VM이 실행 중이었는지
     was_running: bool,
     /// 사라진 VM의 종료 이벤트를 이 시각까지 기다린다.
@@ -167,6 +173,7 @@ impl Worker {
             failures: FailureTracker::default(),
             backoff: None,
             power_off: None,
+            relocate: None,
             was_running: false,
             awaiting_event: None,
             disks_active: false,
@@ -324,9 +331,11 @@ impl Worker {
             EventKind::Stopped {
                 guest_initiated: false,
             } => {}
-            EventKind::Crashed => match vm.spec.restart {
-                RestartPolicy::Never => self.power_off = Some(Some("VM crashed".into())),
-                RestartPolicy::OnFailure => self.record_failure("VM crashed".into()),
+            // HA VM(`started`)은 재시작 정책과 관계없이 다시 켜고, 횟수를 넘으면 옮겨 달라고 한다.
+            EventKind::Crashed => match (self.ha_restarts(vm), vm.spec.restart) {
+                (Some(max), _) => self.record_crash(max),
+                (None, RestartPolicy::Never) => self.power_off = Some(Some("VM crashed".into())),
+                (None, RestartPolicy::OnFailure) => self.record_failure("VM crashed".into()),
             },
             EventKind::Started => {}
         }
@@ -423,6 +432,36 @@ impl Worker {
             Next::GiveUp => {
                 let n = self.config.restart.max_failures;
                 self.power_off = Some(Some(format!("{reason}; gave up after {n} failures")));
+            }
+        }
+    }
+
+    /// 크래시한 이 VM을 HA 정책으로 다시 켤 때 그 `max_restart`. `started` HA VM이고 모든 노드가
+    /// `ha-placement`를 알릴 때만이다(옛 리더는 `relocate_from`을 모른다). 아니면 재시작 정책을 따른다.
+    /// 노드 목록은 크래시 때만 읽는다.
+    fn ha_restarts(&self, vm: &Vm) -> Option<u8> {
+        let ha = vm
+            .spec
+            .ha
+            .as_ref()
+            .filter(|ha| ha.state == HaState::Started)?;
+        ha_placement_everywhere(&self.cluster).then_some(ha.max_restart)
+    }
+
+    /// HA VM의 크래시를 센다. `window` 안에서 `max`번 넘게 크래시하면 다시 켜지 않고 옮겨 달라고 한다.
+    fn record_crash(&mut self, max: u8) {
+        let now = Instant::now();
+        let limit = usize::from(max) + 1;
+        match self.failures.record_up_to(now, &self.config.restart, limit) {
+            Next::RetryAfter(delay) => {
+                self.backoff = Some((now + delay, format!("VM crashed; retrying in {delay:?}")));
+            }
+            Next::GiveUp => {
+                tracing::warn!(vm = %self.id, crashes = limit, "HA VM crashed too often on this node; asking HA to move it");
+                self.backoff = None;
+                self.relocate = Some(format!(
+                    "VM crashed {limit} times on this node; asking HA to move it"
+                ));
             }
         }
     }
@@ -548,6 +587,30 @@ impl Worker {
                 self.awaiting_event = None;
                 self.force_requested = false;
                 self.deactivate_disks(vm).await;
+                // 옮겨 달라고 했다. 리더가 옮기거나(spec의 노드), 포기하거나(power stopped), 사용자가 끌
+                // 때까지 켜지 않는다. 저장소에 요청이 있으면 리더가 쓴 status를 덮지 않는다.
+                let node = self.config.node;
+                if vm.status.ha.as_ref().and_then(|ha| ha.relocate_from) == Some(node) {
+                    self.relocate = None;
+                    self.backoff = None;
+                    return Ok(vm.status.clone());
+                }
+                if let Some(error) = self.relocate.clone() {
+                    self.backoff = None;
+                    status.phase = VmPhase::Failed;
+                    status.pid = None;
+                    status.last_error = Some(error);
+                    status.ha = Some(VmHaStatus {
+                        relocate_from: Some(node),
+                        ..status.ha.unwrap_or_default()
+                    });
+                    return Ok(status);
+                }
+                // 다시 켠다: 지난 옮기기 요청과 HA 오류를 지운다(옮긴 기록은 남긴다).
+                clear_ha(&mut status, |ha| {
+                    ha.relocate_from = None;
+                    ha.error = None;
+                });
                 if self.backoff.as_ref().is_some_and(|(at, _)| *at <= now) {
                     self.backoff = None;
                 }
@@ -582,6 +645,7 @@ impl Worker {
             }
             (PowerState::Stopped, Some(state)) => {
                 self.backoff = None;
+                self.relocate = None;
                 match self.stop_requested {
                     _ if self.force_requested => {
                         self.hv.stop(self.id, StopMode::Force).await?;
@@ -622,7 +686,10 @@ impl Worker {
                 self.awaiting_event = None;
                 self.deactivate_disks(vm).await;
                 self.backoff = None;
+                self.relocate = None;
                 self.failures.clear();
+                // 꺼진 VM은 옮길 것이 없다. HA 오류는 사용자가 다시 켤 때까지 보인다.
+                clear_ha(&mut status, |ha| ha.relocate_from = None);
                 // 포기해서 멈춘 VM은 사용자가 다시 시작할 때까지 Failed로 남긴다.
                 if status.phase != VmPhase::Failed {
                     status.phase = VmPhase::Stopped;
@@ -1020,10 +1087,12 @@ impl Worker {
     /// Task 실행기·예약 작업이 쓰는 값이므로 저장소의 것을 지킨다: revision을 확인하며 쓰고, 그 사이
     /// 누가 썼으면 다시 읽어 그 값으로 다시 쓴다. `firmware_node`도 이 작업자가 바꾸지 않았으면
     /// 저장소의 것을 지킨다(스냅샷 되돌리기가 쓴다). `rule_violations`는 리더가 쓰므로 늘, `ha`(HA 기록)는
-    /// 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다. 나머지 필드는 전처럼 이 작업자가 계산한 값으로 덮는다.
+    /// 이 작업자가 바꾼 필드만 저장소의 값 위에 다시 적용한다([`merge_ha`]). 나머지 필드는 전처럼 이 작업자가
+    /// 계산한 값으로 덮는다.
     async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
         let keep_firmware = status.firmware_node == vm.status.firmware_node;
-        let keep_ha = status.ha == vm.status.ha;
+        let read_ha = vm.status.ha.clone().unwrap_or_default();
+        let mine = status.ha.clone().unwrap_or_default();
         loop {
             status.snapshot = vm.status.snapshot;
             status.schedule_error = vm.status.schedule_error.clone();
@@ -1031,9 +1100,7 @@ impl Worker {
                 status.firmware_node = vm.status.firmware_node;
             }
             status.rule_violations = vm.status.rule_violations.clone();
-            if keep_ha {
-                status.ha = vm.status.ha.clone();
-            }
+            status.ha = merge_ha(&read_ha, &mine, vm.status.ha.clone());
             match self
                 .cluster
                 .update_status_checked::<VmSpec>(self.id, vm.revision, &status)
@@ -1092,6 +1159,93 @@ impl Worker {
     }
 }
 
+/// status의 HA 기록을 고친다. 기본값이 되면 기록을 뺀다.
+fn clear_ha(status: &mut VmStatus, change: impl FnOnce(&mut VmHaStatus)) {
+    if let Some(ha) = status.ha.as_mut() {
+        change(ha);
+        if *ha == VmHaStatus::default() {
+            status.ha = None;
+        }
+    }
+}
+
+/// 처음 읽은 HA 기록 `read`에서 이 작업자가 바꾼 필드(`mine`과 다른 필드)만 저장소의 값 `stored` 위에 다시
+/// 적용한다. 그 사이 리더가 쓴 값(포기한 오류 문구 등)은 이 작업자가 그 필드를 바꾸지 않았으면 남는다.
+fn merge_ha(
+    read: &VmHaStatus,
+    mine: &VmHaStatus,
+    stored: Option<VmHaStatus>,
+) -> Option<VmHaStatus> {
+    let mut ha = stored.unwrap_or_default();
+    if mine.relocate_from != read.relocate_from {
+        ha.relocate_from = mine.relocate_from;
+    }
+    if mine.relocations != read.relocations {
+        ha.relocations = mine.relocations.clone();
+    }
+    if mine.error != read.error {
+        ha.error = mine.error.clone();
+    }
+    (ha != VmHaStatus::default()).then_some(ha)
+}
+
+/// 모든 노드(위트니스·관찰 노드 포함)가 `ha-placement`를 알린다. 읽지 못하면 아니라고 본다.
+fn ha_placement_everywhere(cluster: &Cluster) -> bool {
+    cluster.list::<NodeSpec>().is_ok_and(|(_, nodes)| {
+        nodes
+            .iter()
+            .all(|n| n.status.features.iter().any(|f| f == HA_PLACEMENT))
+    })
+}
+
 fn postmigrate() -> RuntimeStatus {
     RuntimeStatus::Other("postmigrate".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 리더가 포기하며 오류를 쓴 사이 이 작업자가 꺼진 VM의 요청만 지웠으면 리더의 오류와 기록을 지킨다.
+    #[test]
+    fn merging_ha_reapplies_only_the_fields_this_worker_changed() {
+        let node = Uuid::now_v7();
+        let read = VmHaStatus {
+            relocate_from: Some(node),
+            relocations: vec![10],
+            relocated_from: None,
+            error: None,
+        };
+        let mine = VmHaStatus {
+            relocate_from: None,
+            ..read.clone()
+        };
+        let leader = VmHaStatus {
+            relocate_from: None,
+            relocations: vec![10],
+            relocated_from: Some(Uuid::now_v7()),
+            error: Some("gave up after 1 relocations".into()),
+        };
+        assert_eq!(
+            merge_ha(&read, &mine, Some(leader.clone())),
+            Some(leader.clone())
+        );
+        // 처음 쓸 때(저장소가 읽은 그대로)는 이 작업자의 값이다.
+        assert_eq!(
+            merge_ha(&read, &mine, Some(read.clone())),
+            Some(mine.clone())
+        );
+        // 이 작업자가 바꾸지 않았으면 저장소의 값 그대로다(없으면 없음).
+        assert_eq!(merge_ha(&read, &read, Some(leader.clone())), Some(leader));
+        assert_eq!(merge_ha(&read, &read, None), None);
+        // 모두 기본으로 돌아가면 쓰지 않는다.
+        let empty = VmHaStatus {
+            relocate_from: Some(node),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_ha(&empty, &VmHaStatus::default(), Some(empty.clone())),
+            None
+        );
+    }
 }

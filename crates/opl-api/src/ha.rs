@@ -5,7 +5,8 @@
 //!
 //! 대상은 배치 규칙과 HA 그룹([`crate::placement`])을 따른다(설계 §8). 복구할 노드가 없을 때는 그룹의 더
 //! 우선인 노드로 되돌아가고(라이브 마이그레이션, 한 번에 하나), 틱마다 자리 잡은 VM의 규칙 위반
-//! (`rule_violations`)을 고친다.
+//! (`rule_violations`)을 고친다. 재시작 횟수를 넘긴 VM(`status.ha.relocate_from`)은 다른 노드로 옮기고,
+//! 창 안에서 `max_relocate`번 옮겼으면 끈다.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use opl_cluster::types::{Command, LeaderRequest, NodeId};
+use opl_cluster::types::{Command, LeaderRequest, NodeId, Rejection};
 use opl_cluster::{Cluster, ClusterError, Leases, Typed};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::{Resource, ResourceSpec};
@@ -24,6 +25,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::auth::unix_now;
 use crate::placement::{self, Assign, Candidate};
 use crate::scheduler::{Inventory, node_fits};
 use crate::state::AppState;
@@ -31,6 +33,9 @@ use crate::vms::{RuleCheck, start_migration};
 
 /// 옮길 노드를 찾지 못한 HA VM의 `last_error`
 const NO_NODE: &str = "HA cannot find a node for this VM";
+
+/// 옮긴 기록(`status.ha.relocations`)을 세는 창. reconciler가 재시작을 세는 창(`restart.window`)과 같다.
+const RELOCATE_WINDOW: Duration = Duration::from_secs(600);
 
 /// 실행 중인 다른 쪽(그 노드의 실행기, 정리 작업)과 엇갈려 Task를 실패로 끝내지 못했을 때 다시 읽는 횟수
 const TASK_FAIL_ATTEMPTS: usize = 3;
@@ -204,8 +209,17 @@ async fn tick(
             unknown.insert(node, u);
         }
     }
-    // 옮긴 뒤의 자리로 위반을 센다.
     let inv = if recovering {
+        match Inventory::load(cluster) {
+            Ok(inv) => inv,
+            Err(_) => return,
+        }
+    } else {
+        inv
+    };
+    let relocated = relocate(ctx, &inv, &leases, now, b).await;
+    // 옮긴 뒤의 자리로 위반을 센다.
+    let inv = if relocated {
         match Inventory::load(cluster) {
             Ok(inv) => inv,
             Err(_) => return,
@@ -404,51 +418,20 @@ async fn recover_vm(
     // 리스가 살아 있어야 한다.
     let eligible =
         |n: &Node| n.id != failed.id && Some(n.id) != migrating && alive(now, b, leases, n);
-    let target = match pick(vm, inv, assign, eligible) {
-        Pick::Node(target) => target,
-        Pick::Violating(target, rules) => {
-            tracing::warn!(vm = %vm.name, rules = ?rules, "HA recovery breaks placement rules that allow it (ha_may_violate)");
-            target
-        }
-        Pick::NoNode => {
-            if vm.status.last_error.as_deref() != Some(NO_NODE) {
-                let status = VmStatus {
-                    last_error: Some(NO_NODE.into()),
-                    ..vm.status.clone()
-                };
-                update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await?;
-                tracing::warn!(vm = %vm.name, "HA cannot find a node for the VM");
-            }
-            return Ok(());
-        }
-        Pick::Blocked(rules) => {
-            let error = format!(
-                "HA cannot place this VM: placement rule {}",
-                rules.join(", ")
-            );
-            let ha = vm.status.ha.clone().unwrap_or_default();
-            if vm.status.last_error.as_ref() != Some(&error) || ha.error.as_ref() != Some(&error) {
-                let status = VmStatus {
-                    last_error: Some(error.clone()),
-                    ha: Some(VmHaStatus {
-                        error: Some(error),
-                        ..ha
-                    }),
-                    ..vm.status.clone()
-                };
-                update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await?;
-                tracing::warn!(vm = %vm.name, rules = ?rules, "placement rules leave no node for the HA VM");
-            }
-            return Ok(());
-        }
+    let Some(target) = placed(ctx, vm, pick(vm, inv, assign, eligible)).await? else {
+        return Ok(());
     };
     // 노드를 바꾸기 전에 실행 상태를 지운다. 사이에 리더가 바뀌면 새 리더가 다시 한다(아직 그 노드).
-    // 놓지 못한 이유(`ha.error`)는 지운다.
+    // 놓지 못한 이유(`ha.error`)와 옮겨 달라는 요청은 지운다(노드 장애 복구는 옮긴 횟수에 세지 않는다).
     let ha = vm
         .status
         .ha
         .clone()
-        .map(|ha| VmHaStatus { error: None, ..ha })
+        .map(|ha| VmHaStatus {
+            error: None,
+            relocate_from: None,
+            ..ha
+        })
         .filter(|ha| *ha != VmHaStatus::default());
     let status = VmStatus {
         phase: VmPhase::Stopped,
@@ -486,6 +469,206 @@ async fn recover_vm(
     }
     finish(ctx, vm, failed, target).await;
     Ok(())
+}
+
+/// 창 안에서 이미 `max_relocate`번 옮긴 VM을 끈다(`error`): spec power를 Stopped로 쓴 뒤 status에 phase
+/// Failed와 `ha.error`를 쓰고 요청을 지운다. spec을 먼저 쓴다: 요청을 먼저 지우면 그 노드가 spec을 쓰기 전에
+/// 다시 켤 수 있다. 그 사이 그 노드가 꺼진 VM의 요청을 지우며 status를 썼으면 다시 읽어 쓴다. 그 사이 리더를
+/// 잃으면 오류 표시 없이 꺼진 채 남는다(안전한 쪽).
+async fn give_up(ctx: Ctx<'_>, vm: &Vm, from: &Node, ha: VmHaStatus) -> Result<(), ClusterError> {
+    let error = format!("gave up after {} relocations", ha.relocations.len());
+    tracing::warn!(vm = %vm.name, node = %from.name, error = %error, "HA VM keeps failing; leaving it stopped");
+    let mut spec = vm.spec.clone();
+    spec.power = PowerState::Stopped;
+    let mut revision = write(ctx, spec_command(vm, vm.revision, &spec)?).await?;
+    let mut current = vm.status.clone();
+    for _ in 0..TASK_FAIL_ATTEMPTS {
+        let status = VmStatus {
+            phase: VmPhase::Failed,
+            pid: None,
+            last_error: Some(format!("HA {error}")),
+            ha: Some(VmHaStatus {
+                relocate_from: None,
+                error: Some(error.clone()),
+                ..ha.clone()
+            }),
+            ..current
+        };
+        match update_status_checked::<VmSpec>(ctx, vm.id, revision, &status).await {
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {
+                match ctx.cluster.get::<VmSpec>(vm.id)? {
+                    Some(v)
+                        if v.spec.power == PowerState::Stopped && v.spec.node == vm.spec.node =>
+                    {
+                        revision = v.revision;
+                        current = v.status;
+                    }
+                    // 사용자가 다시 켰거나 옮겼다.
+                    _ => return Ok(()),
+                }
+            }
+            r => return r.map(|_| ()),
+        }
+    }
+    Ok(())
+}
+
+/// [`pick`]의 결과에서 옮길 노드. 놓을 곳이 없으면 그 이유를 status에 남기고(같으면 다시 쓰지 않는다)
+/// None이다.
+async fn placed(ctx: Ctx<'_>, vm: &Vm, pick: Pick) -> Result<Option<Uuid>, ClusterError> {
+    match pick {
+        Pick::Node(target) => Ok(Some(target)),
+        Pick::Violating(target, rules) => {
+            tracing::warn!(vm = %vm.name, rules = ?rules, "HA recovery breaks placement rules that allow it (ha_may_violate)");
+            Ok(Some(target))
+        }
+        Pick::NoNode => {
+            if vm.status.last_error.as_deref() != Some(NO_NODE) {
+                let status = VmStatus {
+                    last_error: Some(NO_NODE.into()),
+                    ..vm.status.clone()
+                };
+                update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await?;
+                tracing::warn!(vm = %vm.name, "HA cannot find a node for the VM");
+            }
+            Ok(None)
+        }
+        Pick::Blocked(rules) => {
+            let error = format!(
+                "HA cannot place this VM: placement rule {}",
+                rules.join(", ")
+            );
+            let ha = vm.status.ha.clone().unwrap_or_default();
+            if vm.status.last_error.as_ref() != Some(&error) || ha.error.as_ref() != Some(&error) {
+                let status = VmStatus {
+                    last_error: Some(error.clone()),
+                    ha: Some(VmHaStatus {
+                        error: Some(error),
+                        ..ha
+                    }),
+                    ..vm.status.clone()
+                };
+                update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await?;
+                tracing::warn!(vm = %vm.name, rules = ?rules, "placement rules leave no node for the HA VM");
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// 옮겨 달라고 한 노드: 재시작 횟수를 넘긴 HA VM이 아직 그 노드에 배정되어 있고 켜져 있다.
+fn relocating(vm: &Vm) -> Option<Uuid> {
+    let from = vm.status.ha.as_ref()?.relocate_from?;
+    (vm.spec.node == Some(from) && vm.spec.power == PowerState::Running && vm.spec.ha_active())
+        .then_some(from)
+}
+
+/// 옮기기 창 안에서 다른 노드로 옮긴 기록이 있는 VM
+fn relocated_recently(vm: &Vm, unix: u64) -> bool {
+    vm.status.ha.as_ref().is_some_and(|ha| {
+        ha.relocations
+            .iter()
+            .any(|at| at.saturating_add(RELOCATE_WINDOW.as_secs()) > unix)
+    })
+}
+
+/// 재시작 횟수를 넘겨 옮겨 달라고 한 HA VM(이름 순)을 그 노드를 뺀 곳으로 옮긴다(복구와 같은 순서·쓰기:
+/// status를 먼저 쓰고 spec의 노드를 바꾼다). 창 안에서 이미 `max_relocate`번 옮겼으면 옮기지 않고 끈다
+/// ([`give_up`]). 그 노드가 살아 있을 때만 한다(죽었으면 복구가 옮긴다). 그 노드의 reconciler는 요청이
+/// 있는 동안 VM을 켜지 않고 status도 쓰지 않으므로 펜싱하지 않는다. 쓰기는 revision을 확인하므로 결과를
+/// 모르면 다음 tick에 다시 읽어 남은 단계를 한다: 옮기는 status(`node` 없음)를 이미 썼으면 기록을 다시
+/// 세지 않고 spec만 쓴다. 옮기거나 껐으면 true.
+async fn relocate(
+    ctx: Ctx<'_>,
+    inv: &Inventory,
+    leases: &Leases,
+    now: Instant,
+    b: Instant,
+) -> bool {
+    let mut vms: Vec<(&Vm, &Node)> = inv
+        .vms
+        .iter()
+        .filter_map(|vm| {
+            let from = relocating(vm)?;
+            let node = inv.nodes.iter().find(|n| n.id == from)?;
+            alive(now, b, leases, node).then_some((vm, node))
+        })
+        .collect();
+    vms.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    let mut assign = Assign::default();
+    let mut changed = false;
+    for (vm, from) in vms {
+        match relocate_vm(ctx, inv, &mut assign, leases, now, b, vm, from).await {
+            Ok(done) => changed |= done,
+            Err(e) => {
+                tracing::info!(vm = %vm.name, error = %e, "cannot relocate HA VM; will retry");
+            }
+        }
+    }
+    changed
+}
+
+/// VM 하나를 옮기거나 끈다([`relocate`]). 옮기거나 껐으면 true.
+#[allow(clippy::too_many_arguments)]
+async fn relocate_vm(
+    ctx: Ctx<'_>,
+    inv: &Inventory,
+    assign: &mut Assign,
+    leases: &Leases,
+    now: Instant,
+    b: Instant,
+    vm: &Vm,
+    from: &Node,
+) -> Result<bool, ClusterError> {
+    let policy = vm.spec.ha.clone().unwrap_or_default();
+    let mut ha = vm.status.ha.clone().unwrap_or_default();
+    // 옮기는 status를 이미 썼다(spec 쓰기만 남았다).
+    let prepared = vm.status.node.is_none();
+    let mut revision = vm.revision;
+    if !prepared {
+        let unix = unix_now();
+        ha.relocations
+            .retain(|at| at.saturating_add(RELOCATE_WINDOW.as_secs()) > unix);
+        if ha.relocations.len() >= usize::from(policy.max_relocate) {
+            give_up(ctx, vm, from, ha).await?;
+            return Ok(true);
+        }
+        ha.relocations.push(unix);
+        ha.relocated_from = Some(from.id);
+    }
+    let migrating = vm.status.migration.as_ref().map(|m| m.node);
+    let eligible =
+        |n: &Node| n.id != from.id && Some(n.id) != migrating && alive(now, b, leases, n);
+    let Some(target) = placed(ctx, vm, pick(vm, inv, assign, eligible)).await? else {
+        return Ok(false);
+    };
+    if !prepared {
+        // 요청(`relocate_from`)은 남긴다: spec을 바꾸기 전에 그 노드가 다시 켜지 않게. 받은 노드가 켤 때 지운다.
+        let status = VmStatus {
+            phase: VmPhase::Stopped,
+            node: None,
+            pid: None,
+            migration: None,
+            last_error: Some(format!(
+                "relocating: the VM failed too often on node {}",
+                from.name
+            )),
+            ha: Some(VmHaStatus { error: None, ..ha }),
+            ..vm.status.clone()
+        };
+        revision = update_status_checked::<VmSpec>(ctx, vm.id, revision, &status).await?;
+    }
+    let mut spec = vm.spec.clone();
+    spec.node = Some(target);
+    if policy.state == HaState::Stopped {
+        spec.power = PowerState::Stopped;
+    }
+    write(ctx, spec_command(vm, revision, &spec)?).await?;
+    tracing::warn!(vm = %vm.name, from = %from.name, to = %target, "relocated HA VM that failed too often");
+    if spec.power == PowerState::Running {
+        assign.place(vm.id, target);
+    }
+    Ok(true)
 }
 
 /// [`pick`]의 결과
@@ -643,7 +826,7 @@ impl Failback {
 /// 되돌아가기: 진행 중인 되돌아가기 Task가 없으면 실행 중인 HA VM(이름 순) 가운데 그룹의 더 우선인 노드가
 /// 있는 첫 VM을 그 노드로 라이브 마이그레이션한다(규칙을 지킨다). 거절되면 VM마다 한 번 로그를 남기고
 /// 다음 VM을 본다(유지보수·HVF 노드, affinity 상대가 있는 VM 등은 `start_migration`이 거절한다). 거절된
-/// VM은 [`FAILBACK_RETRY`] 뒤에 다시 본다.
+/// VM은 [`FAILBACK_RETRY`] 뒤에 다시 본다. 옮겨 떠난 노드로 되돌아가면 옮기기 한 번으로 센다([`count_failback`]).
 async fn fail_back(
     ctx: Ctx<'_>,
     failback: &mut Failback,
@@ -665,6 +848,7 @@ async fn fail_back(
             Ok(None) => failback.task = None,
         }
     }
+    let unix = unix_now();
     let mut vms: Vec<&Vm> = inv
         .vms
         .iter()
@@ -672,6 +856,8 @@ async fn fail_back(
         .filter(|vm| vm.status.phase == VmPhase::Running && vm.status.migration.is_none())
         .filter(|vm| !failback.failed.contains(&vm.id))
         .filter(|vm| !failback.waiting(vm.id, now))
+        // 재시작 횟수를 넘겨 옮겨 온 VM은 옮기기 창 안에서 되돌리지 않는다(그 노드에서 다시 크래시하면 error다).
+        .filter(|vm| !relocated_recently(vm, unix))
         .collect();
     vms.sort_by(|a, b| a.name.cmp(&b.name));
     for vm in vms {
@@ -692,12 +878,42 @@ async fn fail_back(
                 tracing::info!(vm = %vm.name, node = %target, task = %task.id, "HA failback: migrating the VM to a preferred node of its group");
                 failback.task = Some(task.id);
                 failback.refused.remove(&vm.id);
+                if vm.status.ha.as_ref().and_then(|ha| ha.relocated_from) == Some(target) {
+                    count_failback(ctx, vm, unix).await;
+                }
                 return;
             }
             Err(e) => {
                 if failback.refused.insert(vm.id, now).is_none() {
                     tracing::info!(vm = %vm.name, node = %target, error = %e.message, "HA failback refused");
                 }
+            }
+        }
+    }
+}
+
+/// 옮겨 떠난 노드(`relocated_from`)로의 되돌아가기를 옮기기 한 번으로 센다: 창 밖 기록을 버리고 지금 시각을
+/// 더하고 `relocated_from`을 지운다. 그 노드에서 다시 크래시하면 `max_relocate`에 닿는다(되돌아가기와
+/// 옮기기가 창마다 끝없이 돌지 않게). 마이그레이션 Task와 엇갈리면 다시 읽어 쓴다.
+async fn count_failback(ctx: Ctx<'_>, vm: &Vm, unix: u64) {
+    for _ in 0..TASK_FAIL_ATTEMPTS {
+        // 마이그레이션 시작이 status를 썼으므로 다시 읽는다.
+        let Ok(Some(current)) = ctx.cluster.get::<VmSpec>(vm.id) else {
+            return;
+        };
+        let mut ha = current.status.ha.clone().unwrap_or_default();
+        ha.relocations
+            .retain(|at| at.saturating_add(RELOCATE_WINDOW.as_secs()) > unix);
+        ha.relocations.push(unix);
+        ha.relocated_from = None;
+        let status = VmStatus {
+            ha: Some(ha),
+            ..current.status.clone()
+        };
+        match update_status_checked::<VmSpec>(ctx, vm.id, current.revision, &status).await {
+            Ok(_) => return,
+            Err(e) => {
+                tracing::info!(vm = %vm.name, error = %e, "cannot count HA failback as a relocation");
             }
         }
     }
@@ -876,6 +1092,16 @@ struct Ctx<'a> {
 
 async fn write(ctx: Ctx<'_>, command: Command) -> Result<u64, ClusterError> {
     ctx.writer.write(ctx.cluster, command).await
+}
+
+fn spec_command(vm: &Vm, expected_revision: u64, spec: &VmSpec) -> Result<Command, ClusterError> {
+    Ok(Command::UpdateSpec {
+        kind: VmSpec::KIND,
+        id: vm.id,
+        expected_revision: Some(expected_revision),
+        labels: vm.labels.clone(),
+        spec: serde_json::to_value(spec)?,
+    })
 }
 
 fn status_command<S: ResourceSpec>(

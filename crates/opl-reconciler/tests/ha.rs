@@ -19,11 +19,13 @@ use opl_driver::{
 };
 use opl_reconciler::ha::{LeaseRenewer, Watchdog, WatchdogOpener};
 use opl_reconciler::{FirmwareError, FirmwareFetcher, HaConfig, HaGuard, ReconcilerConfig};
+use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::vm::{
-    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, Vm, VmHa, VmPhase, VmSpec,
+    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, Vm, VmHa, VmHaStatus, VmPhase,
+    VmSpec, VmStatus,
 };
 use uuid::Uuid;
 
@@ -991,4 +993,161 @@ async fn waiting_ha_source_is_resumed_when_ha_is_turned_off() {
         Some(RuntimeStatus::Running)
     );
     assert_eq!(env.hv.launches().len(), 1, "{:?}", env.hv.launches());
+}
+
+/// 크래시 뒤 다시 켜질 때까지 기다린다(새 pid).
+async fn crash_and_restart(env: &Env, id: Uuid) -> Vm {
+    let before = env.get(id).status.pid;
+    env.hv.crash(id);
+    env.wait(id, "restarted", |v| running(v) && v.status.pid != before)
+        .await
+}
+
+/// 옮겨 달라는 요청을 기다린다.
+async fn wait_relocate(env: &Env, id: Uuid) -> Vm {
+    let node = env.node;
+    env.wait(id, "relocate request", |v| {
+        v.status.ha.as_ref().and_then(|h| h.relocate_from) == Some(node)
+    })
+    .await
+}
+
+/// HA VM(`started`)은 `restart = never`여도 크래시 뒤 다시 켜고, `max_restart`(1)를 넘는 두 번째 크래시에는
+/// 켜지 않고 리더에게 옮겨 달라고 한다(phase Failed, 원하는 상태는 그대로).
+#[tokio::test]
+async fn ha_vm_crashing_past_max_restart_asks_to_be_relocated() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let mut vm = ha_vm("web", env.node);
+    vm.spec.restart = RestartPolicy::Never;
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+
+    let got = crash_and_restart(&env, vm.id).await;
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(got.status.ha, None);
+    assert_eq!(launches_of(&env, vm.id), 2);
+
+    env.hv.crash(vm.id);
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(got.status.phase, VmPhase::Failed);
+    assert_eq!(got.status.pid, None);
+    assert_eq!(
+        got.status.last_error.as_deref(),
+        Some("VM crashed 2 times on this node; asking HA to move it")
+    );
+    // 요청한 VM은 다시 켜지 않는다.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(launches_of(&env, vm.id), 2);
+    assert_eq!(env.pid(vm.id).await, None);
+    assert_eq!(env.get(vm.id).revision, got.revision);
+}
+
+/// `max_restart` 0이면 첫 크래시에 옮겨 달라고 한다.
+#[tokio::test]
+async fn max_restart_zero_asks_to_be_relocated_on_the_first_crash() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let mut vm = ha_vm("web", env.node);
+    vm.spec.ha = Some(VmHa {
+        max_restart: 0,
+        ..Default::default()
+    });
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    env.hv.crash(vm.id);
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.status.phase, VmPhase::Failed);
+    assert_eq!(launches_of(&env, vm.id), 1);
+}
+
+/// `ha-placement`를 모르는 노드가 있으면 지금처럼 재시작 정책을 따른다(옛 리더는 요청을 모른다).
+#[tokio::test]
+async fn with_an_old_node_ha_vm_crashes_follow_the_restart_policy() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let old: Node = Resource::new(
+        "old",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    env.cluster.create(&old).await.unwrap();
+    let mut vm = ha_vm("web", env.node);
+    vm.spec.ha = Some(VmHa {
+        max_restart: 0,
+        ..Default::default()
+    });
+    vm.spec.restart = RestartPolicy::Never;
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    env.hv.crash(vm.id);
+    let got = env
+        .wait(vm.id, "failed", |v| v.status.phase == VmPhase::Failed)
+        .await;
+    assert_eq!(got.spec.power, PowerState::Stopped);
+    assert_eq!(got.status.last_error.as_deref(), Some("VM crashed"));
+    assert_eq!(got.status.ha, None);
+}
+
+/// 게스트가 스스로 끈 HA VM은 지금처럼 끈다(크래시가 아니다).
+#[tokio::test]
+async fn guest_shutdown_of_an_ha_vm_powers_it_off() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let vm = ha_vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    env.hv.guest_shutdown(vm.id);
+    let got = env
+        .wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    assert_eq!(got.spec.power, PowerState::Stopped);
+    assert_eq!(got.status.ha, None);
+    assert_eq!(launches_of(&env, vm.id), 1);
+}
+
+/// 끈 VM의 옮기기 요청은 지우고(HA 오류는 남김), 다시 켜면 HA 오류도 지운다. 옮긴 기록은 남는다.
+#[tokio::test]
+async fn restarting_clears_the_relocation_request_and_the_ha_error() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let mut vm = ha_vm("web", env.node);
+    let from = Uuid::now_v7();
+    vm.spec.power = PowerState::Stopped;
+    vm.status = VmStatus {
+        phase: VmPhase::Failed,
+        node: Some(env.node),
+        ha: Some(VmHaStatus {
+            relocate_from: Some(env.node),
+            relocations: vec![100],
+            relocated_from: Some(from),
+            error: Some("gave up after 1 relocations".into()),
+        }),
+        ..Default::default()
+    };
+    env.create(&vm).await;
+    let got = env
+        .wait(vm.id, "request cleared", |v| {
+            v.status
+                .ha
+                .as_ref()
+                .is_some_and(|h| h.relocate_from.is_none())
+        })
+        .await;
+    assert_eq!(got.status.phase, VmPhase::Failed);
+    assert_eq!(
+        got.status.ha.as_ref().and_then(|h| h.error.as_deref()),
+        Some("gave up after 1 relocations")
+    );
+
+    env.set_power(vm.id, PowerState::Running).await;
+    let got = env.wait(vm.id, "running", running).await;
+    assert_eq!(
+        got.status.ha,
+        Some(VmHaStatus {
+            relocations: vec![100],
+            relocated_from: Some(from),
+            ..Default::default()
+        })
+    );
 }

@@ -2,7 +2,8 @@
 //! 도는 HA VM과 HA 아닌 VM을 둔 채 A의 opld와 그 QEMU들을 kill -9 한다. 리더가 A의 리스가 끝난 것을 보고
 //! HA VM만 노드 B로 옮겨 켜는지(기록 Task `vm-ha-recover`), A를 다시 띄워도 그 VM을 건드리지 않는지 본다.
 //! HA 그룹 {A:1, B:2}의 VM이 B에 놓이고, B가 죽으면 A로 복구됐다가 B가 돌아오면 라이브 마이그레이션으로
-//! 되돌아가는지도 본다(이 Mac에서는 TCG).
+//! 되돌아가는지도 본다(이 Mac에서는 TCG). A에서 두 번 크래시한(`max_restart` 1을 넘은) HA VM이 B로 옮겨
+//! 켜지는지도 본다.
 //! `cargo test -p opld --features ha-it --test ha`
 //! QEMU(`qemu-it`와 같다)와 qemu-img가 필요하다. 이 Mac에서도 돈다.
 //!
@@ -391,6 +392,112 @@ async fn an_ha_vm_recovers_to_the_next_group_node_and_fails_back() {
     assert_eq!(migrations[0]["spec"]["op"]["node"], id_b.as_str());
     // 원본 QEMU는 마이그레이션 뒤 끝난다.
     eventually("source QEMU gone", || async { !alive(recovered_pid) }).await;
+
+    a.ctl(&["vm", "stop", "db", "--force"]).await.unwrap();
+    a.ctl(&["vm", "delete", "db"]).await.unwrap();
+    a.ctl(&["volume", "delete", "db-root"]).await.unwrap();
+    a.ctl(&["pool", "delete", "shared"]).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_ha_vm_crashing_past_max_restart_is_relocated_to_another_node() {
+    // 기본 정책(`max_restart` 1): A의 QEMU가 한 번 죽으면 A에서 다시 켜고, 두 번째에는 A의 reconciler가 옮겨
+    // 달라고 해 리더가 B로 옮겨 켠다. 노드 장애가 아니므로 A는 살아 있다.
+    let daemon = |name: &str| Daemon::with_hypervisor(name, CONFIG, "systemd_scope = false");
+    let mut a = daemon("node-a");
+    let mut b = daemon("node-b");
+    let mut w = Daemon::witness("wit");
+    a.start().await;
+    b.start().await;
+    w.start().await;
+    a.init("ha-rl").await;
+    a.login().await;
+    let url = a.join_url.clone().unwrap();
+    b.join(&url).await.unwrap();
+    b.login_with(
+        a.admin_password.as_deref().unwrap(),
+        a.ca_fingerprint.as_deref().unwrap(),
+    )
+    .await;
+    let url = a.ctl(&["cluster", "join-token"]).await.unwrap();
+    w.join(url.trim()).await.unwrap();
+    let ca = client(&a);
+    eventually("both nodes online and HA capable", || async {
+        let nodes = ca.get("/nodes").await.unwrap();
+        let nodes = nodes["items"].as_array().unwrap().clone();
+        nodes.len() == 3
+            && nodes.iter().all(|n| n["status"]["online"] == true)
+            && nodes
+                .iter()
+                .filter(|n| n["spec"]["witness"] != true)
+                .all(|n| n["status"]["ha"]["fencing"] == "process")
+    })
+    .await;
+    let (id_a, id_b) = (node_id(&ca, "node-a").await, node_id(&ca, "node-b").await);
+
+    let shared = tempfile::Builder::new()
+        .prefix("oplharl")
+        .tempdir_in("/tmp")
+        .unwrap();
+    a.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.path().to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    a.wait_pool_ready("shared").await;
+    b.wait_pool_ready("shared").await;
+    a.ctl(&[
+        "volume", "create", "db-root", "--pool", "shared", "--size", "64M",
+    ])
+    .await
+    .unwrap();
+    a.ctl(&[
+        "vm", "create", "db", "--memory", "256", "--disk", "db-root", "--node", "node-a", "--ha",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    let first = running_pid(&ca, "db", &id_a).await;
+
+    // 첫 크래시: A에서 다시 켠다.
+    kill_qemu(first).await;
+    let deadline = Instant::now() + RECOVER_WAIT;
+    let second = loop {
+        let pid = running_pid(&ca, "db", &id_a).await;
+        if pid != first {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "db not restarted on node A");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    // 두 번째 크래시: B로 옮겨 켜고 옮긴 기록을 하나 남긴다.
+    kill_qemu(second).await;
+    eventually_within("HA VM relocated to node B", RECOVER_WAIT, || async {
+        let Ok(vm) = ca.get("/vms/db").await else {
+            return false;
+        };
+        vm["spec"]["node"] == id_b.as_str()
+            && vm["status"]["phase"] == "running"
+            && vm["status"]["node"] == id_b.as_str()
+    })
+    .await;
+    let vm = ca.get("/vms/db").await.unwrap();
+    assert_eq!(vm["spec"]["power"], "running", "{vm}");
+    assert_eq!(
+        vm["status"]["ha"]["relocations"].as_array().map(Vec::len),
+        Some(1),
+        "{vm}"
+    );
+    assert!(vm["status"]["ha"].get("relocate_from").is_none(), "{vm}");
+    assert!(vm["status"]["ha"].get("error").is_none(), "{vm}");
+    let pid = running_pid(&ca, "db", &id_b).await;
+    assert!(alive(pid));
 
     a.ctl(&["vm", "stop", "db", "--force"]).await.unwrap();
     a.ctl(&["vm", "delete", "db"]).await.unwrap();

@@ -21,6 +21,17 @@ impl FailureTracker {
     /// 실패를 기록하고 다음 행동을 정한다. n번째 실패 뒤에는 `initial * 2^(n-1)`(최대 `max`)만큼
     /// 기다리고, `window` 안에서 `max_failures`번째 실패면 포기한다.
     pub(crate) fn record(&mut self, now: Instant, rule: &RestartBackoff) -> Next {
+        self.record_up_to(now, rule, rule.max_failures)
+    }
+
+    /// [`FailureTracker::record`]와 같되 `window` 안에서 `max_failures`번째 실패면 포기한다(HA VM의
+    /// `max_restart` + 1).
+    pub(crate) fn record_up_to(
+        &mut self,
+        now: Instant,
+        rule: &RestartBackoff,
+        max_failures: usize,
+    ) -> Next {
         while let Some(&first) = self.failures.front() {
             if now.duration_since(first) < rule.window {
                 break;
@@ -29,7 +40,7 @@ impl FailureTracker {
         }
         self.failures.push_back(now);
         let n = self.failures.len();
-        if n >= rule.max_failures {
+        if n >= max_failures {
             self.failures.clear();
             return Next::GiveUp;
         }
@@ -68,6 +79,26 @@ mod tests {
         // 포기하면 기록을 비우므로 다시 처음부터 센다.
         assert_eq!(
             t.record(now, &rule()),
+            Next::RetryAfter(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn gives_up_at_the_given_limit() {
+        let mut t = FailureTracker::default();
+        let now = Instant::now();
+        // 한도 1이면 첫 실패에 포기한다.
+        assert_eq!(t.record_up_to(now, &rule(), 1), Next::GiveUp);
+        // 한도 2: 한 번 다시 시도하고 두 번째에 포기한다.
+        assert_eq!(
+            t.record_up_to(now, &rule(), 2),
+            Next::RetryAfter(Duration::from_secs(1))
+        );
+        assert_eq!(t.record_up_to(now, &rule(), 2), Next::GiveUp);
+        // 창 밖의 실패는 세지 않는다.
+        t.record_up_to(now, &rule(), 2);
+        assert_eq!(
+            t.record_up_to(now + Duration::from_secs(600), &rule(), 2),
             Next::RetryAfter(Duration::from_secs(1))
         );
     }
