@@ -537,11 +537,14 @@ pub async fn revert_snapshot(
     let snapshot = find_snapshot(&state, &vm, &name)?;
     check_ready(&snapshot)?;
     check_zfs_latest(&state, &vm, &snapshot)?;
-    // 되돌린 스펙을 VM 수정처럼 검증한다. 노드는 지금 것을 유지하고, 시작은 Task가 한다.
-    let mut spec = snapshot.spec.vm_spec.clone();
-    spec.node = vm.spec.node;
-    spec.power = PowerState::Stopped;
-    prepare(&state, vm.id, &mut spec)?;
+    // 되돌린 스펙을 VM 수정처럼 검증한다. 노드는 지금 것을 유지하고, 시작은 Task가 한다. HA는 Task가
+    // 지금 것을 지키므로(스냅샷의 HA는 쓰지 않는다) 지금 것으로 검증한다.
+    let mut reverted = vm.clone();
+    reverted.spec = snapshot.spec.vm_spec.clone();
+    reverted.spec.node = vm.spec.node;
+    reverted.spec.power = PowerState::Stopped;
+    reverted.spec.ha = vm.spec.ha.clone();
+    prepare(&state, &mut reverted)?;
     let op = TaskOp::SnapshotRevert {
         snapshot: snapshot.id,
     };

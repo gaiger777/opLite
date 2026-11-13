@@ -1,5 +1,7 @@
 //! `spec.node`가 비어 있는 VM을 시작할 때 노드를 고른다(설계 3.3).
 
+use std::collections::BTreeSet;
+
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec, ha_capable};
@@ -11,13 +13,21 @@ use opl_types::storage::{
 use opl_types::vm::{DiskMove, PowerState, Vm, VmSpec};
 use uuid::Uuid;
 
+use crate::placement::{self, Assign};
 use crate::volumes::block_pool_kind;
 
+/// [`schedule`]가 노드를 고르지 못한 이유
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error(
-    "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, has a firewall (nftables) for VMs with security groups and, for an HA VM, has HA fencing)"
-)]
-pub struct NoNode;
+pub enum ScheduleError {
+    /// 노드 조건([`node_fits`])에 맞는 노드가 없다.
+    #[error(
+        "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, has a firewall (nftables) for VMs with security groups and, for an HA VM, has HA fencing)"
+    )]
+    NoNode,
+    /// 노드 조건에 맞는 노드는 있지만 모두 이 hard 규칙(이름 순)을 어긴다.
+    #[error("placement rules leave no node for this VM: {}", .0.join(", "))]
+    PlacementRule(Vec<String>),
+}
 
 /// 스케줄러가 보는 클러스터 상태
 #[derive(Debug, Default)]
@@ -94,16 +104,32 @@ impl Inventory {
 }
 
 /// 위트니스가 아니고 온라인이고 유지보수 중이 아니며 머신 타입의 아키텍처이고 디스크의 풀을 쓸 수 있고 네트워크의 브리지가 있는 노드
-/// (HA VM이면 HA 가능 노드, 보안 그룹을 건 NIC가 있으면 방화벽이 있는 노드) 가운데 미할당 메모리가 가장 많은 노드를 고른다. 같으면 id가 작은 노드다. 메모리가 모자라도 고른다(오버커밋 정책은
-/// 범위 밖). arch를 모르는 노드(옛 버전)는 고르지 않는다.
-pub fn schedule(vm: Uuid, spec: &VmSpec, inv: &Inventory) -> Result<Uuid, NoNode> {
-    inv.nodes
+/// (HA VM이면 HA 가능 노드, 보안 그룹을 건 NIC가 있으면 방화벽이 있는 노드) 가운데 hard 배치 규칙을 어기지 않는 노드를
+/// [`placement::compare`] 순서(HA 그룹 우선순위 → soft 벌점 → 미할당 메모리 → id)로 고른다. 메모리가 모자라도 고른다
+/// (오버커밋 정책은 범위 밖). arch를 모르는 노드(옛 버전)는 고르지 않는다. 저장소의 이 VM(같은 id)은 자리로 세지 않는다.
+pub fn schedule(vm: &Vm, inv: &Inventory) -> Result<Uuid, ScheduleError> {
+    let assign = Assign::default();
+    match placement::best(&placement::candidates(vm, inv, &assign)) {
+        Some(c) => Ok(c.node),
+        None => Err(blocked(vm, inv, &assign)),
+    }
+}
+
+/// 놓을 노드가 없을 때의 이유: 노드 조건에 맞는 노드가 있으면 그 노드들에서 어기는 hard 규칙이다.
+pub fn blocked(vm: &Vm, inv: &Inventory, assign: &Assign) -> ScheduleError {
+    let fits: Vec<&Node> = inv
+        .nodes
         .iter()
-        .filter(|n| node_fits(spec, inv, n).is_ok())
-        .map(|n| (inv.free_memory_mib(n, vm), n.id))
-        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
-        .map(|(_, id)| id)
-        .ok_or(NoNode)
+        .filter(|n| node_fits(&vm.spec, inv, n).is_ok())
+        .collect();
+    if fits.is_empty() {
+        return ScheduleError::NoNode;
+    }
+    let rules: BTreeSet<String> = fits
+        .into_iter()
+        .flat_map(|n| placement::hard_violations(vm, n, inv, assign))
+        .collect();
+    ScheduleError::PlacementRule(rules.into_iter().collect())
 }
 
 /// [`schedule`]가 이 노드를 후보로 보는지. 아니면 그 이유다. 메모리는 보지 않는다.
@@ -208,12 +234,19 @@ pub fn node_fits_with(
 mod tests {
     use opl_types::network::Vxlan;
     use opl_types::node::{BridgeInfo, Fencing, NodeHa, NodeStatus, PoolState};
+    use opl_types::placement::RuleKind;
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
     use opl_types::storage::PoolBackend;
     use opl_types::vm::{Arch, CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec, VmHa};
 
+    use super::ScheduleError::NoNode;
     use super::*;
+
+    /// 이 spec을 가진 새 VM(규칙에 들지 않는 이름)의 노드를 고른다.
+    fn sched(spec: &VmSpec, inv: &Inventory) -> Result<Uuid, ScheduleError> {
+        schedule(&Resource::new("me", spec.clone()), inv)
+    }
 
     fn node(memory_mib: u64) -> Node {
         let mut n = Resource::new(
@@ -310,7 +343,7 @@ mod tests {
             ..Default::default()
         };
         let me = spec(1024, None, PowerState::Running);
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(a.id));
+        assert_eq!(sched(&me, &inv), Ok(a.id));
 
         // a에 6 GiB를 쓰는 VM이 돌면 b가 더 비어 있다. 꺼진 VM은 세지 않는다.
         inv.vms.push(Resource::new(
@@ -321,7 +354,101 @@ mod tests {
             "off",
             spec(6144, Some(b.id), PowerState::Stopped),
         ));
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(b.id));
+        assert_eq!(sched(&me, &inv), Ok(b.id));
+    }
+
+    fn rule(name: &str, kind: RuleKind, vms: &[&str], nodes: &[&str]) -> PlacementRule {
+        Resource::new(
+            name,
+            PlacementRuleSpec {
+                kind,
+                vms: vms.iter().map(|v| v.to_string()).collect(),
+                vm_tag: None,
+                nodes: nodes.iter().map(|n| n.to_string()).collect(),
+                node_tag: None,
+                weight: None,
+                enabled: true,
+                ha_may_violate: false,
+            },
+        )
+    }
+
+    #[test]
+    fn hard_rules_steer_the_choice_and_name_the_rules_when_no_node_is_left() {
+        let mut big = node(8192);
+        big.name = "big".into();
+        let mut small = node(4096);
+        small.name = "small".into();
+        let mut inv = Inventory {
+            nodes: vec![big.clone(), small.clone()],
+            ..Default::default()
+        };
+        let me: Vm = Resource::new("me", spec(512, None, PowerState::Running));
+        assert_eq!(schedule(&me, &inv), Ok(big.id));
+
+        // anti-affinity 상대가 big에서 돌면 메모리가 적어도 small로 간다.
+        inv.vms.push(Resource::new(
+            "peer",
+            spec(512, Some(big.id), PowerState::Running),
+        ));
+        inv.rules = vec![rule("apart", RuleKind::AntiAffinity, &["me", "peer"], &[])];
+        assert_eq!(schedule(&me, &inv), Ok(small.id));
+        // small도 막히면 두 노드에서 어긴 규칙의 이름이다.
+        inv.rules.push(rule(
+            "not-small",
+            RuleKind::NodeAntiAffinity,
+            &["me"],
+            &["small"],
+        ));
+        assert_eq!(
+            schedule(&me, &inv),
+            Err(ScheduleError::PlacementRule(vec![
+                "apart".into(),
+                "not-small".into()
+            ]))
+        );
+        assert_eq!(
+            schedule(&me, &inv).unwrap_err().to_string(),
+            "placement rules leave no node for this VM: apart, not-small"
+        );
+        // 노드 조건이 먼저다: 조건에 맞는 노드가 없으면 규칙과 상관없이 NoNode.
+        let mut offline = inv.nodes.clone();
+        offline.iter_mut().for_each(|n| n.status.online = false);
+        let dark = Inventory {
+            nodes: offline,
+            vms: inv.vms.clone(),
+            rules: inv.rules.clone(),
+            ..Default::default()
+        };
+        assert_eq!(schedule(&me, &dark), Err(NoNode));
+        // 조건에 맞지 않는 노드의 규칙 위반은 이유에 넣지 않는다.
+        inv.nodes[1].status.online = false;
+        assert_eq!(
+            schedule(&me, &inv),
+            Err(ScheduleError::PlacementRule(vec!["apart".into()]))
+        );
+
+        // soft 규칙은 벌점이라 어길 수밖에 없으면 어기고 고른다.
+        inv.nodes[1].status.online = true;
+        inv.rules = vec![
+            rule(
+                "avoid-big",
+                RuleKind::SoftNodeAntiAffinity,
+                &["me"],
+                &["big"],
+            ),
+            rule(
+                "avoid-small",
+                RuleKind::SoftNodeAntiAffinity,
+                &["me"],
+                &["small"],
+            ),
+        ];
+        inv.rules[0].spec.weight = Some(10);
+        inv.rules[1].spec.weight = Some(20);
+        assert_eq!(schedule(&me, &inv), Ok(big.id));
+        inv.rules[0].spec.weight = Some(30);
+        assert_eq!(schedule(&me, &inv), Ok(small.id));
     }
 
     #[test]
@@ -367,10 +494,10 @@ mod tests {
             bus: DiskBus::VirtioBlk,
             boot_order: Some(1),
         });
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(near.id));
+        assert_eq!(sched(&me, &inv), Ok(near.id));
 
         let empty = Inventory::default();
-        assert_eq!(schedule(Uuid::now_v7(), &me, &empty), Err(NoNode));
+        assert_eq!(sched(&me, &empty), Err(NoNode));
     }
 
     #[test]
@@ -384,9 +511,9 @@ mod tests {
             ..Default::default()
         };
         let me = spec(512, None, PowerState::Running);
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(small.id));
+        assert_eq!(sched(&me, &inv), Ok(small.id));
         inv.nodes.pop();
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+        assert_eq!(sched(&me, &inv), Err(NoNode));
     }
 
     #[test]
@@ -403,15 +530,15 @@ mod tests {
             ..Default::default()
         };
         let mut me = spec(512, None, PowerState::Running);
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(off.id));
+        assert_eq!(sched(&me, &inv), Ok(off.id));
         me.ha = Some(VmHa::default());
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(fenced.id));
+        assert_eq!(sched(&me, &inv), Ok(fenced.id));
         assert_eq!(
             node_fits(&me, &inv, &off),
             Err("node \"n\" does not support HA (fencing is off)".into())
         );
         inv.nodes.pop();
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+        assert_eq!(sched(&me, &inv), Err(NoNode));
     }
 
     #[test]
@@ -446,9 +573,9 @@ mod tests {
             mac: None,
             security_groups: Vec::new(),
         }];
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(bare.id));
+        assert_eq!(sched(&me, &inv), Ok(bare.id));
         me.nics[0].security_groups = vec!["web".into()];
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(guarded.id));
+        assert_eq!(sched(&me, &inv), Ok(guarded.id));
         assert_eq!(
             node_fits(&me, &inv, &inv.nodes[0]),
             Err(
@@ -457,7 +584,7 @@ mod tests {
             )
         );
         inv.nodes.pop();
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+        assert_eq!(sched(&me, &inv), Err(NoNode));
     }
 
     #[test]
@@ -488,14 +615,14 @@ mod tests {
             volume("root", "local", Some(small.id)),
             [true; 3],
         );
-        assert_eq!(schedule(Uuid::now_v7(), &me, &local), Ok(small.id));
+        assert_eq!(sched(&me, &local), Ok(small.id));
         // 그 노드에서 풀이 준비되지 않았으면 갈 곳이 없다.
         let local = inv(
             pool("local", false),
             volume("root", "local", Some(small.id)),
             [true, true, false],
         );
-        assert_eq!(schedule(Uuid::now_v7(), &me, &local), Err(NoNode));
+        assert_eq!(sched(&me, &local), Err(NoNode));
 
         // 공유 풀은 준비된 노드 가운데 메모리가 가장 많은 노드로 간다.
         let shared = inv(
@@ -503,7 +630,7 @@ mod tests {
             volume("root", "nas", Some(small.id)),
             [false, true, true],
         );
-        assert_eq!(schedule(Uuid::now_v7(), &me, &shared), Ok(mid.id));
+        assert_eq!(sched(&me, &shared), Ok(mid.id));
         // RBD 풀은 `shared` 값과 상관없이 공유다. 볼륨을 만든 노드에 묶이지 않는다.
         let mut ceph = pool("ceph", false);
         ceph.spec.backend = PoolBackend::Rbd {
@@ -517,7 +644,7 @@ mod tests {
             volume("root", "ceph", Some(small.id)),
             [false, true, true],
         );
-        assert_eq!(schedule(Uuid::now_v7(), &me, &rbd), Ok(mid.id));
+        assert_eq!(sched(&me, &rbd), Ok(mid.id));
         // 상태를 알리지 않은 노드(옛 노드, 첫 새로 고침 전)는 NFS 풀에는 후보가 아니고, 디렉터리
         // 풀에는 후보다.
         let mut nfs = pool("nas", true);
@@ -530,9 +657,9 @@ mod tests {
         for n in &mut unknown.nodes {
             n.status.pools.clear();
         }
-        assert_eq!(schedule(Uuid::now_v7(), &me, &unknown), Err(NoNode));
+        assert_eq!(sched(&me, &unknown), Err(NoNode));
         unknown.pools[0] = pool("nas", true);
-        assert_eq!(schedule(Uuid::now_v7(), &me, &unknown), Ok(big.id));
+        assert_eq!(sched(&me, &unknown), Ok(big.id));
     }
 
     #[test]
@@ -676,13 +803,13 @@ mod tests {
         };
         let mut me = spec(512, None, PowerState::Running);
         me.nics = vec![nic("user"), nic("lan")];
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(plain.id));
+        assert_eq!(sched(&me, &inv), Ok(plain.id));
         // VLAN을 쓰려면 VLAN-aware 브리지가 있어야 한다.
         me.nics.push(nic("dmz"));
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(aware.id));
+        assert_eq!(sched(&me, &inv), Ok(aware.id));
         // 없는 네트워크는 어디서도 돌 수 없다.
         me.nics.push(nic("gone"));
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+        assert_eq!(sched(&me, &inv), Err(NoNode));
     }
 
     #[test]
@@ -716,7 +843,7 @@ mod tests {
             mac: None,
             security_groups: Vec::new(),
         }];
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(ready.id));
+        assert_eq!(sched(&me, &inv), Ok(ready.id));
     }
 
     #[test]
@@ -738,14 +865,14 @@ mod tests {
         };
         // virt는 aarch64 노드에서만 돈다. arch를 모르는 노드(옛 버전)는 후보가 아니다.
         let mut me = spec(512, None, PowerState::Running);
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(arm.id));
+        assert_eq!(sched(&me, &inv), Ok(arm.id));
         me.machine = MachineType::Q35;
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Ok(x86.id));
+        assert_eq!(sched(&me, &inv), Ok(x86.id));
         let inv = Inventory {
             nodes: vec![arm],
             ..Default::default()
         };
-        assert_eq!(schedule(Uuid::now_v7(), &me, &inv), Err(NoNode));
+        assert_eq!(sched(&me, &inv), Err(NoNode));
     }
 
     #[test]

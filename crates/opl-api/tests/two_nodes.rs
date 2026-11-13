@@ -34,6 +34,7 @@ use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role, SessionSpec, UserSpec};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
 use opl_types::node::{FEATURES, Fencing, NodeHa, NodeSpec, NodeStatus, PoolState};
+use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
@@ -1709,6 +1710,46 @@ async fn drain_also_moves_a_vm_that_was_coming_in() {
     let moved: Vec<Uuid> = a.hv.migrations().into_iter().map(|(id, _)| id).collect();
     assert_eq!(moved, [app.id]);
     assert_eq!(node_of(&a, app.id), Some(b.id));
+}
+
+/// hard affinity 묶음의 앞 구성원이 옮겨진 뒤 짝의 마이그레이션이 실패하면 짝은 남고 묶음은 갈라진 채다
+/// (앞 구성원을 되돌리지 않는다).
+#[tokio::test]
+async fn a_partner_whose_migration_fails_stays_behind() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    dir_pool(&a, "nas", true).await;
+    let db = running_vm_on_pool(&a, &admin, "db", "nas", a.id).await;
+    let web = running_vm_on_pool(&a, &admin, "web", "nas", a.id).await;
+    let rule: PlacementRule = Resource::new(
+        "together",
+        PlacementRuleSpec {
+            kind: RuleKind::Affinity,
+            vms: vec!["db".into(), "web".into()],
+            vm_tag: None,
+            nodes: vec![],
+            node_tag: None,
+            weight: None,
+            enabled: true,
+            ha_may_violate: false,
+        },
+    );
+    a.cluster.create(&rule).await.unwrap();
+
+    // 보내기를 늦춰, 앞 구성원(db)이 옮겨진 뒤 짝(web)의 보내기가 실패하게 한다.
+    a.hv.delay_migrations(Duration::from_millis(300));
+    let task = drain(&admin, "node1").await;
+    until("db moved", || node_of(&a, db.id) == Some(b.id)).await;
+    a.hv.fail_next_migrate(DriverError::Migration("connection reset".into()));
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("1 VM(s) were not moved: web (") && error.contains("connection reset"),
+        "{error}"
+    );
+    assert_eq!(node_of(&a, db.id), Some(b.id));
+    assert_eq!(node_of(&a, web.id), Some(a.id));
 }
 
 /// 옮기는 동안 유지보수를 끝내면 그 마이그레이션이 끝난 뒤 멈춘다.

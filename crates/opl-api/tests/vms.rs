@@ -12,10 +12,11 @@ use opl_driver::DriverError;
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
 use opl_types::node::{Fencing, HA_PLACEMENT, Node, NodeHa, NodeSpec};
+use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{VolumePhase, VolumeSpec};
-use opl_types::vm::Arch;
+use opl_types::vm::{Arch, PowerState, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -727,6 +728,178 @@ async fn ha_vms_need_an_ha_capable_node() {
     let (code, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
     assert_eq!(code, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "ha_unsupported");
+}
+
+/// 배치 규칙을 저장소에 바로 만든다(시험 노드는 `ha-placement`를 알리지 않는다).
+async fn add_rule(env: &Env, name: &str, kind: RuleKind, vms: &[&str], nodes: &[&str]) {
+    let rule: PlacementRule = Resource::new(
+        name,
+        PlacementRuleSpec {
+            kind,
+            vms: vms.iter().map(|v| v.to_string()).collect(),
+            vm_tag: None,
+            nodes: nodes.iter().map(|n| n.to_string()).collect(),
+            node_tag: None,
+            weight: None,
+            enabled: true,
+            ha_may_violate: false,
+        },
+    );
+    env.cluster.create(&rule).await.unwrap();
+}
+
+/// 409 `placement_rule`과 `details.rules`를 확인한다.
+fn assert_placement_rule((status, body): (StatusCode, Value), rules: &[&str]) {
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "placement_rule", "{body}");
+    assert_eq!(body["details"]["rules"], json!(rules), "{body}");
+}
+
+/// 켜진 채 만들면 스케줄러가 hard 규칙을 지킨다: anti-affinity 상대가 도는 노드는 메모리가 더 많아도 피한다.
+/// soft 규칙은 어길 수밖에 없으면 어기고 만든다.
+#[tokio::test]
+async fn running_creation_follows_placement_rules() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_node(&env, "node2").await;
+    let mut node = env.cluster.get::<NodeSpec>(node2).unwrap().unwrap();
+    node.status.memory_mib = 4096;
+    env.cluster
+        .update_status::<NodeSpec>(node2, &node.status)
+        .await
+        .unwrap();
+    let mut req = vm_request("web");
+    req["spec"]["node"] = json!(env.node);
+    admin.post("/vms", req).await;
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    let running = |name: &str| {
+        let mut req = vm_request(name);
+        req["spec"]["power"] = json!("running");
+        req
+    };
+    // 규칙이 없으면 미할당 메모리가 많은 이 노드다.
+    let (status, vm) = admin.post("/vms", running("free")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["node"], env.node.to_string());
+
+    add_rule(&env, "apart", RuleKind::AntiAffinity, &["web", "db"], &[]).await;
+    let (status, vm) = admin.post("/vms", running("db")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["node"], node2.to_string());
+
+    // 갈 곳이 없으면 409 placement_rule. 노드 조건부터 맞지 않으면 지금처럼 no_node다.
+    add_rule(
+        &env,
+        "apart2",
+        RuleKind::AntiAffinity,
+        &["db", "cache"],
+        &[],
+    )
+    .await;
+    add_rule(
+        &env,
+        "with-web",
+        RuleKind::AntiAffinity,
+        &["web", "cache"],
+        &[],
+    )
+    .await;
+    assert_placement_rule(
+        admin.post("/vms", running("cache")).await,
+        &["apart2", "with-web"],
+    );
+    let mut x86 = running("cache");
+    x86["spec"]["machine"] = json!("q35");
+    let (status, body) = admin.post("/vms", x86).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "no_node");
+
+    add_rule(
+        &env,
+        "avoid-all",
+        RuleKind::SoftNodeAntiAffinity,
+        &["soft"],
+        &["node1", "node2"],
+    )
+    .await;
+    let (status, vm) = admin.post("/vms", running("soft")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+}
+
+/// `node-affinity` 밖의 노드를 직접 준 켜진 생성·수정은 409다. 꺼진 VM은 그 노드에 고정할 수 있고, 시작하면
+/// 규칙에 맞는 노드로 옮겨 켜며, 그런 노드가 없으면 409다. 이미 그 노드에서 도는 VM은 옮기거나 막지 않는다.
+#[tokio::test]
+async fn a_node_outside_node_affinity_is_refused_or_replaced_at_start() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_node(&env, "node2").await;
+    add_rule(&env, "only-n2", RuleKind::NodeAffinity, &["db"], &["node2"]).await;
+
+    let mut req = vm_request("db");
+    req["spec"]["node"] = json!(env.node);
+    req["spec"]["power"] = json!("running");
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(
+        body["message"],
+        "VM \"db\" on node \"node1\" breaks placement rules: only-n2"
+    );
+    assert_placement_rule((status, body), &["only-n2"]);
+
+    // 꺼진 채로는 고정할 수 있다. 켜는 수정은 409다.
+    req["spec"]["power"] = json!("stopped");
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let mut spec = vm["spec"].clone();
+    spec["power"] = json!("running");
+    assert_placement_rule(
+        admin.put("/vms/db", json!({ "spec": spec }), None).await,
+        &["only-n2"],
+    );
+
+    // 시작은 규칙에 맞는 노드를 고른다(실행기가 없는 노드라 Task는 끝나지 않는다).
+    let (status, task) = admin.post("/vms/db/actions/start", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], node2.to_string());
+    let (_, vm) = admin.get("/vms/db").await;
+    assert_eq!(vm["spec"]["node"], node2.to_string());
+
+    // 규칙에 맞는 노드가 없으면 시작은 409이고 VM은 그대로다.
+    let mut vm = env.cluster.get_by_name::<VmSpec>("db").unwrap().unwrap();
+    vm.spec.node = Some(env.node);
+    vm.spec.power = PowerState::Stopped;
+    env.cluster
+        .update_spec(vm.id, None, vm.labels.clone(), &vm.spec)
+        .await
+        .unwrap();
+    set_maintenance(&env, node2, true).await;
+    let (status, body) = admin.post("/vms/db/actions/start", Value::Null).await;
+    assert_eq!(
+        body["message"],
+        "node \"node1\" breaks placement rules of VM \"db\" and no other node can run it: only-n2"
+    );
+    assert_placement_rule((status, body), &["only-n2"]);
+    let (_, vm) = admin.get("/vms/db").await;
+    assert_eq!(vm["spec"]["node"], env.node.to_string());
+    assert_eq!(vm["spec"]["power"], "stopped");
+
+    // 이미 이 노드에서 도는 VM은 나중에 생긴 규칙을 어겨도 고치고 다시 켤 수 있다.
+    let mut req = vm_request("web");
+    req["spec"]["node"] = json!(env.node);
+    admin.post("/vms", req).await;
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    add_rule(&env, "web-n2", RuleKind::NodeAffinity, &["web"], &["node2"]).await;
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["memory_mib"] = json!(512);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, vm) = admin.get("/vms/web").await;
+    assert_eq!(vm["spec"]["node"], env.node.to_string());
 }
 
 /// 기본 HA 정책은 옛 `true`로 저장되지만, 기본과 다른 정책 객체는 모든 노드가 `ha-placement`를 알 때만 받는다.

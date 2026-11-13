@@ -3,8 +3,10 @@
 
 mod common;
 
-use common::{Client, Env, mark_pool_ready, set_pool_state, vm_request};
+use common::{Client, Env, WAIT, mark_pool_ready, set_pool_state, vm_request};
+use opl_types::audit::AuditQuery;
 use opl_types::node::{FEATURES, Fencing, Node, NodeHa, NodeSpec, NodeStatus, PoolState};
+use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
@@ -578,4 +580,123 @@ async fn migrate_waits_for_snapshot_and_resize_tasks() {
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{snapshot}");
     assert_conflict(migrate(&admin, "web", "node2").await, "vm_busy");
+}
+
+/// 이 노드의 감사 로그에서 `action`과 `status`가 같은 항목의 detail(쓰기 스레드가 곧 적는다)
+async fn audit_detail(env: &Env, action: &str, status: u16) -> Option<String> {
+    let start = std::time::Instant::now();
+    loop {
+        let entries = env
+            .state
+            .audit
+            .read(AuditQuery {
+                since: 0,
+                until: u64::MAX,
+                user: None,
+                action: None,
+                limit: 1000,
+            })
+            .await
+            .unwrap();
+        if let Some(e) = entries
+            .iter()
+            .find(|e| e.action == action && e.status == status)
+        {
+            return e.detail.clone();
+        }
+        assert!(start.elapsed() < WAIT, "audit entries: {entries:#?}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 배치 규칙을 저장소에 바로 만든다(시험 노드는 `ha-placement`를 알리지 않는다).
+async fn add_rule(env: &Env, name: &str, kind: RuleKind, vms: &[&str], nodes: &[&str]) {
+    let rule: PlacementRule = Resource::new(
+        name,
+        PlacementRuleSpec {
+            kind,
+            vms: vms.iter().map(|v| v.to_string()).collect(),
+            vm_tag: None,
+            nodes: nodes.iter().map(|n| n.to_string()).collect(),
+            node_tag: None,
+            weight: None,
+            enabled: true,
+            ha_may_violate: false,
+        },
+    );
+    env.cluster.create(&rule).await.unwrap();
+}
+
+/// 409 `placement_rule`과 `details.rules`를 확인한다.
+fn assert_placement_rule((status, body): (StatusCode, Value), rules: &[&str]) {
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "placement_rule", "{body}");
+    assert_eq!(body["details"]["rules"], json!(rules), "{body}");
+}
+
+/// hard 배치 규칙을 어기는 대상으로는 옮기지 않는다(409 `placement_rule`). 관리자만 `force`로 넘을 수 있고,
+/// 넘은 규칙이 감사 기록에 남는다. 노드 조건은 `force`로도 넘지 않는다.
+#[tokio::test]
+async fn hard_rules_refuse_the_target_unless_an_admin_forces_it() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let operator = env.user("operator", "operator").await;
+    let node2 = setup(&env, &admin).await;
+    add_rule(
+        &env,
+        "never",
+        RuleKind::NodeAntiAffinity,
+        &["web"],
+        &["node2"],
+    )
+    .await;
+
+    let (status, body) = migrate(&admin, "web", "node2").await;
+    assert_eq!(
+        body["message"],
+        "moving VM \"web\" to node \"node2\" breaks placement rules: never (VMs kept together by an affinity rule move together only when their node is drained)"
+    );
+    assert_placement_rule((status, body), &["never"]);
+    assert_placement_rule(migrate(&operator, "web", "node2").await, &["never"]);
+
+    let force = json!({ "node": "node2", "force": true });
+    let (status, body) = operator.post("/vms/web/migrate", force.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, task) = admin.post("/vms/web/migrate", force.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(
+        task["spec"]["op"],
+        json!({ "kind": "vm-migrate", "node": node2 })
+    );
+    admin.wait_task(&task).await;
+    assert_eq!(
+        audit_detail(&env, "POST /vms/{key}/migrate", 202).await,
+        Some("force rules=never".into())
+    );
+
+    // 노드 조건(유지보수)은 force로도 넘지 않는다.
+    edit_node(&env, node2, |n| n.spec.maintenance = true).await;
+    let (status, body) = admin.post("/vms/web/migrate", force).await;
+    assert_conflict((status, body), "node_unavailable");
+}
+
+/// 자리 잡은 hard affinity 상대가 있는 VM은 혼자 옮기지 않는다. 상대가 꺼지면 옮길 수 있다.
+#[tokio::test]
+async fn a_vm_with_a_running_affinity_partner_does_not_move_alone() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env, &admin).await;
+    let mut req = vm_request("db");
+    req["spec"]["node"] = json!(env.node);
+    admin.post("/vms", req).await;
+    let task = admin.act("db", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    add_rule(&env, "together", RuleKind::Affinity, &["web", "db"], &[]).await;
+
+    assert_placement_rule(migrate(&admin, "web", "node2").await, &["together"]);
+    let task = admin.act("db", "stop").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (status, task) = migrate(&admin, "web", "node2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
 }

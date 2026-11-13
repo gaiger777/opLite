@@ -1,8 +1,9 @@
 //! 노드 비우기 Task(설계 §3.2): 비울 노드의 실행 중인 VM을 이름 순으로 하나씩 다른 노드로 라이브
 //! 마이그레이션한다. 옮기지 못한 VM은 건너뛰고 끝에 이유와 함께 실패로 알린다. 이 노드로 들어오던
-//! 마이그레이션은 끝나기를 기다려 그 VM도 옮기므로, 성공하면 노드가 비어 있다.
+//! 마이그레이션은 끝나기를 기다려 그 VM도 옮기므로, 성공하면 노드가 비어 있다. hard `affinity`로 묶인 VM은
+//! 묶음 전체를 받을 수 있는 노드로 차례로 옮긴다(첫 VM이 간 뒤 나머지는 규칙 때문에 그 노드로만 간다).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use opl_types::node::{Node, NodeSpec};
@@ -14,10 +15,11 @@ use uuid::Uuid;
 use super::{Ctx, TaskRunnerConfig};
 use crate::cluster::missing_feature;
 use crate::error::ApiError;
+use crate::placement::{self, Assign, affinity_partners, hard_violations};
 use crate::scheduler::{Inventory, disk_moves, node_fits_with};
 use crate::snapshots::count_snapshots;
 use crate::state::AppState;
-use crate::vms::start_migration;
+use crate::vms::{RuleCheck, start_migration};
 
 /// VM 하나를 옮겨 본 결과
 enum Outcome {
@@ -26,6 +28,9 @@ enum Outcome {
     Gone,
     /// 옮기지 못했다(이유)
     NotMoved(String),
+    /// 묶음의 한 구성원 때문에 묶음 전체를 옮기지 못했다(상대들 id·이름·이유, 이 VM의 이유). 막은 구성원이
+    /// 아닌 구성원의 이유는 `affinity partner <막은 구성원>: <이유>`다.
+    BundleNotMoved(Vec<(Uuid, String, String)>, String),
 }
 
 /// 옮길 것이 없어졌다가 이 노드에 다시 나타난 VM을 다시 보는 횟수. 그 뒤에도 다시 나타나면 `busy`로
@@ -70,7 +75,7 @@ pub(super) async fn drain(ctx: &Ctx, node: Uuid) -> Result<(), String> {
         } else if gone.get(&vm.id).is_some_and(|n| *n >= MAX_GONE) {
             Some("busy".to_string())
         } else {
-            match move_vm(ctx, &state, node, &vm).await? {
+            match move_vm(ctx, &state, node, &vm, &not_moved).await? {
                 Outcome::Moved => {
                     moved.insert(vm.id);
                     None
@@ -80,6 +85,12 @@ pub(super) async fn drain(ctx: &Ctx, node: Uuid) -> Result<(), String> {
                     None
                 }
                 Outcome::NotMoved(reason) => Some(reason),
+                Outcome::BundleNotMoved(partners, reason) => {
+                    for (id, name, why) in partners {
+                        not_moved.insert(id, (name, why));
+                    }
+                    Some(reason)
+                }
             }
         };
         if let Some(reason) = reason {
@@ -177,8 +188,15 @@ async fn wait_for_incoming(
 }
 
 /// VM 하나를 다른 노드로 옮기고 그 마이그레이션 Task가 끝나기를 기다린다. 기다리는 동안 유지보수가
-/// 끝나면 옮기지 않고 비우기를 멈추는 오류다.
-async fn move_vm(ctx: &Ctx, state: &AppState, node: Uuid, vm: &Vm) -> Result<Outcome, String> {
+/// 끝나면 옮기지 않고 비우기를 멈추는 오류다. 이미 옮기지 못한 VM(`not_moved`)이 묶음에 있으면 옮기지 않는다
+/// (묶음이 갈라지지 않게).
+async fn move_vm(
+    ctx: &Ctx,
+    state: &AppState,
+    node: Uuid,
+    vm: &Vm,
+    not_moved: &HashMap<Uuid, (String, String)>,
+) -> Result<Outcome, String> {
     match settle(ctx, node, vm.id).await {
         Ok(true) => {}
         Ok(false) => return Ok(Outcome::Gone),
@@ -189,44 +207,69 @@ async fn move_vm(ctx: &Ctx, state: &AppState, node: Uuid, vm: &Vm) -> Result<Out
         Ok(inv) => inv,
         Err(e) => return Ok(Outcome::NotMoved(e.to_string())),
     };
-    // 노드 로컬 풀의 디스크는 대상 노드의 같은 이름 풀로 복사한다(`pool`은 주지 않는다).
-    let moves = disk_moves(&vm.spec, &inv, None);
-    if !moves.is_empty() {
-        let old = match missing_feature(&ctx.cluster, "storage-migration") {
-            Ok(old) => old,
-            Err(e) => return Ok(Outcome::NotMoved(e.to_string())),
-        };
-        if !old.is_empty() {
-            return Ok(Outcome::NotMoved(
-                "disks on a local pool (some nodes do not support storage migration yet)".into(),
-            ));
-        }
-        match count_snapshots(state, vm.id) {
-            Ok(0) => {}
-            Ok(_) => {
-                return Ok(Outcome::NotMoved(
-                    "disks on a local pool and snapshots".into(),
-                ));
+    // 함께 옮길 묶음(첫째가 이 VM)과 구성원마다 옮길 디스크. 노드 로컬 풀의 디스크는 대상 노드의 같은 이름
+    // 풀로 복사한다(`pool`은 주지 않는다).
+    let bundle = bundle(vm, node, &inv);
+    if let Some(partner) = bundle[1..].iter().find(|v| not_moved.contains_key(&v.id)) {
+        return Ok(Outcome::NotMoved(format!(
+            "affinity partner {} could not move",
+            partner.name
+        )));
+    }
+    let all_moves: Vec<Vec<DiskMove>> = bundle
+        .iter()
+        .map(|v| disk_moves(&v.spec, &inv, None))
+        .collect();
+    let moves = all_moves[0].clone();
+    // 디스크를 옮길 수 없는 구성원이 하나라도 있으면 묶음 전체를 옮기지 않는다.
+    if let Some((blocker, reason)) = disks_blocked(ctx, state, &bundle, &all_moves) {
+        let why = |i: usize| {
+            if i == blocker {
+                reason.clone()
+            } else {
+                format!("affinity partner {}: {reason}", bundle[blocker].name)
             }
-            Err(e) => return Ok(Outcome::NotMoved(e.message)),
-        }
+        };
+        let partners = bundle
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, v)| (v.id, v.name.clone(), why(i)))
+            .collect();
+        return Ok(Outcome::BundleNotMoved(partners, why(0)));
     }
     // HVF는 이 노드의 hypervisor 이름으로만 알 수 있다(macOS 노드).
     if me.status.hypervisor == HVF {
         return Ok(Outcome::NotMoved("hvf node".into()));
     }
-    let Some(target) = pick_target(vm, &inv, &moves) else {
-        // 옮길 디스크가 없었다면(공유 디스크처럼) 받을 노드가 있었으면 풀 때문이다.
-        let reason = if !moves.is_empty()
-            && pick_target(&without_disks(vm, &inv, &moves), &inv, &[]).is_some()
-        {
-            "no node can take its local disks"
-        } else {
-            "no node with capacity"
-        };
-        return Ok(Outcome::NotMoved(reason.into()));
+    let target = match pick_target(&bundle, &inv, &all_moves) {
+        Ok(target) => target,
+        Err(rules) if !rules.is_empty() => {
+            return Ok(Outcome::NotMoved(format!(
+                "placement rule {}",
+                rules.join(", ")
+            )));
+        }
+        Err(_) => {
+            // 옮길 디스크가 없었다면(공유 디스크처럼) 받을 노드가 있었으면 풀 때문이다.
+            let stripped: Vec<Vm> = bundle
+                .iter()
+                .zip(&all_moves)
+                .map(|(v, m)| without_disks(v, &inv, m))
+                .collect();
+            let reason = if all_moves.iter().any(|m| !m.is_empty())
+                && pick_target(&stripped, &inv, &vec![Vec::new(); stripped.len()]).is_ok()
+            {
+                "no node can take its local disks"
+            } else {
+                "no node with capacity"
+            };
+            return Ok(Outcome::NotMoved(reason.into()));
+        }
     };
-    let task = match start_migration(state, vm.id, target, None, Some(node)).await {
+    // 묶음의 나머지는 아직 이 노드에 있지만 대상 노드로 함께 간다고 보고 규칙을 본다.
+    let rules = RuleCheck::Group(bundle[1..].iter().map(|v| v.id).collect());
+    let task = match start_migration(state, vm.id, target, None, Some(node), rules.clone()).await {
         // 확인과 만들기 사이에 다른 Task가 들어왔다. 한 번 더 자리 잡기를 기다려 다시 한다.
         Err(e) if e.code == "vm_busy" => {
             match settle(ctx, node, vm.id).await {
@@ -235,12 +278,12 @@ async fn move_vm(ctx: &Ctx, state: &AppState, node: Uuid, vm: &Vm) -> Result<Out
                 Err(e) => return Ok(Outcome::NotMoved(e)),
             }
             in_maintenance(ctx, node)?;
-            start_migration(state, vm.id, target, None, Some(node)).await
+            start_migration(state, vm.id, target, None, Some(node), rules).await
         }
         r => r,
     };
     match task {
-        Ok(task) => {
+        Ok((task, _)) => {
             let wait = migration_wait(&ctx.config, !moves.is_empty());
             Ok(wait_migration(ctx, task.id, wait).await)
         }
@@ -248,17 +291,110 @@ async fn move_vm(ctx: &Ctx, state: &AppState, node: Uuid, vm: &Vm) -> Result<Out
     }
 }
 
-/// VM을 받을 수 있는 노드(스케줄러의 조건을 지나고 HVF가 아니며 남은 메모리가 VM 메모리 이상) 가운데
-/// 남은 메모리가 가장 많은 노드. 같으면 id가 작은 노드다. 스케줄러는 유지보수 노드(이 노드)를 고르지
-/// 않는다. 옮길 디스크(`moves`)가 있으면 그 대상 풀을 쓸 수 있는 노드만이다.
-fn pick_target(vm: &Vm, inv: &Inventory, moves: &[DiskMove]) -> Option<Uuid> {
-    inv.nodes
-        .iter()
-        .filter(|n| n.status.hypervisor != HVF && node_fits_with(&vm.spec, inv, n, moves).is_ok())
-        .map(|n| (inv.free_memory_mib(n, vm.id), n.id))
-        .filter(|(free, _)| *free >= i64::from(vm.spec.memory_mib))
-        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
-        .map(|(_, id)| id)
+/// 묶음의 어느 구성원이라도 노드 로컬 풀의 디스크(`all_moves[i]`)를 옮길 수 없으면 그 구성원의 순번과 이유:
+/// 옮길 디스크가 있는데 저장소 마이그레이션을 모르는 노드가 있거나(옮길 디스크가 있는 첫 구성원) 그 구성원에
+/// 스냅샷이 있다.
+fn disks_blocked(
+    ctx: &Ctx,
+    state: &AppState,
+    bundle: &[Vm],
+    all_moves: &[Vec<DiskMove>],
+) -> Option<(usize, String)> {
+    let first = all_moves.iter().position(|m| !m.is_empty())?;
+    match missing_feature(&ctx.cluster, "storage-migration") {
+        Ok(old) if old.is_empty() => {}
+        Ok(_) => {
+            return Some((
+                first,
+                "disks on a local pool (some nodes do not support storage migration yet)".into(),
+            ));
+        }
+        Err(e) => return Some((first, e.to_string())),
+    }
+    for (i, (member, moves)) in bundle.iter().zip(all_moves).enumerate() {
+        if moves.is_empty() {
+            continue;
+        }
+        match count_snapshots(state, member.id) {
+            Ok(0) => {}
+            Ok(_) => return Some((i, "disks on a local pool and snapshots".into())),
+            Err(e) => return Some((i, e.message)),
+        }
+    }
+    None
+}
+
+/// 옮길 VM과, 노드 `node`에서 도는 그 VM의 hard `affinity` 상대(추이적). 첫째가 `vm`이다.
+fn bundle(vm: &Vm, node: Uuid, inv: &Inventory) -> Vec<Vm> {
+    let mut found = vec![vm.clone()];
+    let mut i = 0;
+    while i < found.len() {
+        let next: Vec<Vm> = affinity_partners(&found[i], inv)
+            .into_iter()
+            .filter(|v| v.spec.node == Some(node) && v.spec.power == PowerState::Running)
+            .filter(|v| !found.iter().any(|f| f.id == v.id))
+            .cloned()
+            .collect();
+        found.extend(next);
+        i += 1;
+    }
+    found
+}
+
+/// 묶음(`bundle`, 첫째가 옮길 VM)을 함께 받을 노드: HVF가 아니고, 모든 구성원이 스케줄러의 조건(옮길 디스크
+/// `moves[i]`가 있으면 그 대상 풀)을 지나고, 남은 메모리가 묶음 메모리의 합 이상이며, 묶음을 그 노드에 둔
+/// [`Assign`]으로 hard 배치 규칙을 어기지 않는 노드 가운데 [`placement::compare`] 순서(첫 VM의 HA 그룹
+/// 우선순위 → 구성원 soft 벌점의 합 → 남은 메모리 → id)로 가장 나은 노드. 스케줄러는 유지보수 노드(이 노드)를
+/// 고르지 않는다. 없으면 조건·메모리는 맞는데 막은 hard 규칙의 이름(이름 순)이다. 규칙에 맞는 노드가 메모리
+/// 때문에만 막혔으면(앞 구성원이 옮겨 간 노드에 자리가 없음 등) 규칙이 아니라 자리 탓이므로 비어 있다.
+fn pick_target(
+    bundle: &[Vm],
+    inv: &Inventory,
+    moves: &[Vec<DiskMove>],
+) -> Result<Uuid, Vec<String>> {
+    let lead = &bundle[0];
+    let mut blocked = BTreeSet::new();
+    // 노드 조건과 hard 규칙에는 맞는데 메모리가 모자란 노드가 있다.
+    let mut no_room = false;
+    let mut found = Vec::new();
+    for n in inv.nodes.iter().filter(|n| n.status.hypervisor != HVF) {
+        let fits = bundle
+            .iter()
+            .zip(moves)
+            .all(|(v, m)| node_fits_with(&v.spec, inv, n, m).is_ok());
+        if !fits {
+            continue;
+        }
+        let mut assign = Assign::default();
+        for v in bundle {
+            assign.place(v.id, n.id);
+        }
+        // 다른 구성원은 이 노드에 있다고 본 남은 메모리
+        let mut candidate = placement::score(lead, n, inv, &assign);
+        let broken: Vec<String> = bundle
+            .iter()
+            .flat_map(|v| hard_violations(v, n, inv, &assign))
+            .collect();
+        if candidate.free_mib < i64::from(lead.spec.memory_mib) {
+            no_room |= broken.is_empty();
+            continue;
+        }
+        if !broken.is_empty() {
+            blocked.extend(broken);
+            continue;
+        }
+        candidate.penalty = bundle
+            .iter()
+            .map(|v| placement::score(v, n, inv, &assign).penalty)
+            .sum();
+        found.push(candidate);
+    }
+    if no_room {
+        blocked.clear();
+    }
+    placement::best(&found)
+        .map(|c| c.node)
+        .ok_or_else(|| blocked.into_iter().collect())
 }
 
 /// 옮길 디스크(`moves`)를 뺀 VM: 그 디스크의 풀을 보지 않고(공유 디스크처럼) 받을 노드를 찾는다.

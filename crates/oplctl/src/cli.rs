@@ -1021,6 +1021,69 @@ enum Restart {
     OnFailure,
 }
 
+/// VM의 HA 상태(`ha.state`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HaStateArg {
+    /// 노드가 죽으면 다른 노드에서 켠다(기본).
+    Started,
+    /// 노드가 죽으면 다른 노드로 옮기기만 하고 켜지 않는다.
+    Stopped,
+    /// HA를 잠시 끈다(정책은 남긴다).
+    Ignored,
+}
+
+/// `vm create|set`의 HA 정책 값. 하나라도 주면 HA VM이 되고 정책 객체를 보낸다(모든 노드가 업그레이드돼야
+/// 함). 주지 않은 값은 지금 값(새 VM은 기본)이다.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Args)]
+struct HaPolicy {
+    /// HA 상태
+    #[arg(long, value_enum)]
+    ha_state: Option<HaStateArg>,
+    /// HA 그룹 이름(`""`이면 그룹에서 뺀다)
+    #[arg(long)]
+    ha_group: Option<String>,
+    /// 같은 노드에서 다시 켜는 횟수(0~10, 기본 1). 넘으면 다른 노드로 옮긴다.
+    #[arg(long)]
+    max_restart: Option<u8>,
+    /// 다른 노드로 옮기는 횟수(0~10, 기본 1). 넘으면 끄고 오류로 둔다.
+    #[arg(long)]
+    max_relocate: Option<u8>,
+}
+
+impl HaPolicy {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 지금 `ha`(옛 bool이나 정책 객체)에 준 값만 바꾼 `ha`. 모두 기본이면 옛 모양 `true`다.
+    fn apply(&self, current: &Value) -> Value {
+        let mut policy = current.as_object().cloned().unwrap_or_default();
+        if let Some(state) = self.ha_state {
+            policy.insert("state".into(), json!(value_name(state)));
+        }
+        match self.ha_group.as_deref() {
+            Some("") => {
+                policy.remove("group");
+            }
+            Some(group) => {
+                policy.insert("group".into(), json!(group));
+            }
+            None => {}
+        }
+        if let Some(n) = self.max_restart {
+            policy.insert("max_restart".into(), json!(n));
+        }
+        if let Some(n) = self.max_relocate {
+            policy.insert("max_relocate".into(), json!(n));
+        }
+        if policy.is_empty() {
+            json!(true)
+        } else {
+            Value::Object(policy)
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum VmCmd {
     List,
@@ -1058,6 +1121,9 @@ enum VmCmd {
         /// 노드 로컬 풀의 디스크를 둘 대상 노드의 풀. 없으면 디스크마다 같은 이름의 풀이다.
         #[arg(long)]
         pool: Option<String>,
+        /// hard 배치 규칙을 넘어 옮긴다(관리자만, 감사 기록에 남음). 노드 조건과 메모리는 그대로 본다.
+        #[arg(long)]
+        force: bool,
     },
     Delete {
         vm: String,
@@ -1130,6 +1196,8 @@ struct VmCreate {
     /// HA VM: 노드가 펜싱되면 다른 노드에서 켠다. 펜싱이 켜진 노드에서만 돈다.
     #[arg(long)]
     ha: bool,
+    #[command(flatten)]
+    policy: HaPolicy,
 }
 
 /// `--nic`으로 받은 네트워크와 보안 그룹
@@ -1172,15 +1240,38 @@ fn nic_body(nic: &NicArg) -> Value {
 }
 
 #[derive(Args)]
-#[command(group(ArgGroup::new("change").required(true).args(["ha", "no_ha"])))]
+#[command(group(ArgGroup::new("change").required(true).multiple(true).args([
+    "ha", "no_ha", "ha_state", "ha_group", "max_restart", "max_relocate"
+])))]
 struct VmSet {
     vm: String,
-    /// HA VM으로 만든다. VM이 멈춰 있어야 하고 VM의 노드가 펜싱이 켜진 노드여야 한다.
+    /// HA VM으로 만든다(이미 HA면 정책은 그대로, 잠시 끈 `ignored`는 `started`로). VM이 멈춰 있어야 하고 VM의
+    /// 노드가 펜싱이 켜진 노드여야 한다.
     #[arg(long)]
     ha: bool,
     /// HA를 끈다.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["ha", "ha_state", "ha_group", "max_restart", "max_relocate"])]
     no_ha: bool,
+    #[command(flatten)]
+    policy: HaPolicy,
+}
+
+/// `vm set`의 새 `ha`: `--no-ha`면 끔, 정책 값이 없으면(`--ha`만) 이미 HA인 정책은 그대로 두고 아니면 `true`,
+/// 정책 값이 있으면 지금 정책에 그 값만 바꾼다. `--ha`는 잠시 끈(`ignored`) 정책을 `started`로 다시 켠다.
+fn ha_set(current: &Value, args: &VmSet) -> Value {
+    let mut ha = if args.no_ha {
+        json!(false)
+    } else if args.policy.is_empty() && current.is_object() {
+        current.clone()
+    } else if args.policy.is_empty() {
+        json!(true)
+    } else {
+        args.policy.apply(current)
+    };
+    if args.ha && args.policy.ha_state.is_none() && ha["state"] == "ignored" {
+        ha["state"] = json!("started");
+    }
+    ha
 }
 
 #[derive(Subcommand)]
@@ -5361,19 +5452,23 @@ async fn cluster(
     Ok(())
 }
 
-/// `vm migrate`: 마이그레이션 Task를 만들고 끝나기를 기다린다. `pool`은 줄 때만 보낸다(옛 서버는 모르는
-/// 필드를 거절한다). 기다리는 동안 디스크 복사 진행률과 메모리 단계를 `err`(stderr)에 알린다.
+/// `vm migrate`: 마이그레이션 Task를 만들고 끝나기를 기다린다. `pool`과 `force`는 줄 때만 보낸다(옛 서버는
+/// 모르는 필드를 거절한다). 기다리는 동안 디스크 복사 진행률과 메모리 단계를 `err`(stderr)에 알린다.
 async fn vm_migrate(
     client: &Client,
     vm: &str,
     node: &str,
     pool: Option<String>,
+    force: bool,
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     let mut body = json!({ "node": node });
     if let Some(pool) = pool {
         body["pool"] = json!(pool);
+    }
+    if force {
+        body["force"] = json!(true);
     }
     let task = client
         .post(&format!("/vms/{}/migrate", seg(vm)), &body)
@@ -5492,7 +5587,11 @@ async fn vm(
                     "nics": nics,
                     "restart": value_name(args.restart),
                     "node": node,
-                    "ha": args.ha,
+                    "ha": if args.policy.is_empty() {
+                        json!(args.ha)
+                    } else {
+                        args.policy.apply(&Value::Null)
+                    },
                 }
             });
             client.post("/vms", &body).await?;
@@ -5502,8 +5601,19 @@ async fn vm(
             }
         }
         VmCmd::Set(args) => {
-            put_spec_field(client, &args.vm, "ha", json!(args.ha)).await?;
-            let state = if args.ha { "on" } else { "off" };
+            put_spec(client, &args.vm, |current| {
+                Ok(spec_update(
+                    current,
+                    "ha",
+                    ha_set(&current["spec"]["ha"], &args),
+                ))
+            })
+            .await?;
+            let state = match args.policy.ha_state {
+                _ if args.no_ha => "off".to_string(),
+                Some(state) => value_name(state),
+                None => "on".to_string(),
+            };
             writeln!(out, "vm {}: HA {state}", args.vm)?;
         }
         VmCmd::NicSg { vm, index, groups } => {
@@ -5532,9 +5642,12 @@ async fn vm(
             .await?
         }
         VmCmd::Reboot { vm } => act(client, &vm, "reboot", out).await?,
-        VmCmd::Migrate { vm, node, pool } => {
-            vm_migrate(client, &vm, &node, pool, out, &mut std::io::stderr()).await?
-        }
+        VmCmd::Migrate {
+            vm,
+            node,
+            pool,
+            force,
+        } => vm_migrate(client, &vm, &node, pool, force, out, &mut std::io::stderr()).await?,
         VmCmd::Delete { vm, with_snapshots } => {
             if with_snapshots {
                 // 내부 스냅샷은 서로 독립이라 차례는 상관없다. VM을 지울 수 없는데 스냅샷만
@@ -6707,7 +6820,7 @@ mod tests {
         let cli = Cli::try_parse_from(["oplctl", "vm", "set", "web", "--ha"]).unwrap();
         assert!(matches!(
             cli.cmd,
-            Cmd::Vm { cmd: VmCmd::Set(VmSet { vm, ha: true, no_ha: false }) } if vm == "web"
+            Cmd::Vm { cmd: VmCmd::Set(VmSet { vm, ha: true, no_ha: false, .. }) } if vm == "web"
         ));
         let cli = Cli::try_parse_from(["oplctl", "vm", "set", "web", "--no-ha"]).unwrap();
         assert!(matches!(
@@ -6723,6 +6836,109 @@ mod tests {
         // 바꿀 것이 하나는 있어야 하고, 둘을 함께 줄 수 없다.
         assert!(Cli::try_parse_from(["oplctl", "vm", "set", "web"]).is_err());
         assert!(Cli::try_parse_from(["oplctl", "vm", "set", "web", "--ha", "--no-ha"]).is_err());
+
+        // 정책 값은 HA 켜기와 함께 줄 수 있고, 끄기와는 함께 줄 수 없다.
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "create",
+            "web",
+            "--ha-state",
+            "stopped",
+            "--ha-group",
+            "rack",
+            "--max-restart",
+            "3",
+            "--max-relocate",
+            "0",
+        ])
+        .unwrap();
+        let Cmd::Vm {
+            cmd: VmCmd::Create(c),
+        } = cli.cmd
+        else {
+            panic!("not vm create");
+        };
+        assert_eq!(
+            c.policy,
+            HaPolicy {
+                ha_state: Some(HaStateArg::Stopped),
+                ha_group: Some("rack".into()),
+                max_restart: Some(3),
+                max_relocate: Some(0),
+            }
+        );
+        let cli = Cli::try_parse_from(["oplctl", "vm", "set", "web", "--ha", "--max-restart", "2"])
+            .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm {
+                cmd: VmCmd::Set(VmSet {
+                    ha: true,
+                    policy: HaPolicy {
+                        max_restart: Some(2),
+                        ..
+                    },
+                    ..
+                })
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["oplctl", "vm", "set", "web", "--ha-state", "ignored"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["oplctl", "vm", "set", "web", "--no-ha", "--ha-group", "g"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["oplctl", "vm", "set", "web", "--ha-state", "on"]).is_err());
+    }
+
+    /// `vm create|set`이 보내는 `ha`: 정책 값이 없으면 옛 bool, 있으면 지금 정책에 그 값만 바꾼 객체.
+    #[test]
+    fn ha_values_keep_the_old_shape_unless_a_policy_is_given() {
+        let set = |args: &[&str]| -> VmSet {
+            let mut argv = vec!["oplctl", "vm", "set", "web"];
+            argv.extend(args);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Vm { cmd: VmCmd::Set(s) } => s,
+                _ => panic!("not vm set"),
+            }
+        };
+        let policy =
+            json!({ "state": "stopped", "group": "rack", "max_restart": 3, "max_relocate": 1 });
+        assert_eq!(ha_set(&json!(false), &set(&["--ha"])), json!(true));
+        // 이미 HA면 `--ha`는 정책을 그대로 둔다.
+        assert_eq!(ha_set(&policy, &set(&["--ha"])), policy);
+        assert_eq!(ha_set(&policy, &set(&["--no-ha"])), json!(false));
+        // 잠시 끈 정책은 `--ha`가 다시 켠다(나머지 정책은 그대로). `--ha-state`를 주면 그 값이다.
+        let ignored = json!({ "state": "ignored", "group": "rack" });
+        assert_eq!(
+            ha_set(&ignored, &set(&["--ha"])),
+            json!({ "state": "started", "group": "rack" })
+        );
+        assert_eq!(
+            ha_set(&ignored, &set(&["--ha", "--max-restart", "2"])),
+            json!({ "state": "started", "group": "rack", "max_restart": 2 })
+        );
+        assert_eq!(
+            ha_set(&ignored, &set(&["--ha", "--ha-state", "ignored"])),
+            ignored
+        );
+        // 준 값만 바꾸고, 그룹은 `""`로 뺀다.
+        assert_eq!(
+            ha_set(&policy, &set(&["--ha-state", "started", "--ha-group", ""])),
+            json!({ "state": "started", "max_restart": 3, "max_relocate": 1 })
+        );
+        // 꺼진 VM에 정책 값을 주면 그 값만 담은 정책으로 켠다.
+        assert_eq!(
+            ha_set(&json!(false), &set(&["--max-relocate", "2"])),
+            json!({ "max_relocate": 2 })
+        );
+        assert_eq!(
+            ha_set(&json!(true), &set(&["--ha-group", "rack"])),
+            json!({ "group": "rack" })
+        );
+        assert_eq!(HaPolicy::default().apply(&Value::Null), json!(true));
     }
 
     #[test]
@@ -6730,7 +6946,14 @@ mod tests {
         let cli = Cli::try_parse_from(["oplctl", "vm", "migrate", "web", "n2"]).unwrap();
         assert!(matches!(
             cli.cmd,
-            Cmd::Vm { cmd: VmCmd::Migrate { vm, node, pool: None } } if vm == "web" && node == "n2"
+            Cmd::Vm { cmd: VmCmd::Migrate { vm, node, pool: None, force: false } } if vm == "web" && node == "n2"
+        ));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "migrate", "web", "n2", "--force"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm {
+                cmd: VmCmd::Migrate { force: true, .. }
+            }
         ));
         let cli = Cli::try_parse_from(["oplctl", "vm", "migrate", "web", "n2", "--pool", "fast"])
             .unwrap();
@@ -6800,6 +7023,7 @@ mod tests {
             "web",
             "n2",
             Some("fast".into()),
+            false,
             &mut out,
             &mut err,
         )
@@ -6821,10 +7045,28 @@ mod tests {
         // 풀을 주지 않으면 본문에 `pool`이 없다.
         seen.lock().unwrap().clear();
         let mut out = Vec::new();
-        vm_migrate(&client, "web", "n2", None, &mut out, &mut Vec::new())
+        vm_migrate(&client, "web", "n2", None, false, &mut out, &mut Vec::new())
             .await
             .unwrap();
         assert_eq!(seen.lock().unwrap()[0].body, json!({ "node": "n2" }));
+
+        // `--force`는 줄 때만 보낸다.
+        seen.lock().unwrap().clear();
+        vm_migrate(
+            &client,
+            "web",
+            "n2",
+            None,
+            true,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].body,
+            json!({ "node": "n2", "force": true })
+        );
     }
 
     /// 진행 줄을 쓰지 못해도(stderr가 닫힘) 마이그레이션이 끝나기를 기다린다.
@@ -6855,7 +7097,7 @@ mod tests {
         }
         let client = Client::new(&base, None, None).unwrap();
         let mut out = Vec::new();
-        vm_migrate(&client, "web", "n2", None, &mut out, &mut Broken)
+        vm_migrate(&client, "web", "n2", None, false, &mut out, &mut Broken)
             .await
             .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "vm web: migrated to n2\n");

@@ -84,15 +84,20 @@ pub fn candidates(vm: &Vm, inv: &Inventory, assign: &Assign) -> Vec<Candidate> {
         .iter()
         .filter(|n| node_fits(&vm.spec, inv, n).is_ok())
         .filter(|n| hard_violations(vm, n, inv, assign).is_empty())
-        .map(|n| Candidate {
-            node: n.id,
-            priority: group(vm, inv).and_then(|g| g.spec.priority(&n.name)),
-            penalty: soft(vm, n, inv, assign).0,
-            free_mib: free_mib(vm, n, inv, assign),
-        })
+        .map(|n| score(vm, n, inv, assign))
         .collect();
     found.sort_by(compare);
     found
+}
+
+/// VM을 이 노드에 둘 때의 점수(노드 조건과 hard 규칙은 보지 않는다). 비우기가 묶음의 대상을 고를 때도 쓴다.
+pub fn score(vm: &Vm, node: &Node, inv: &Inventory, assign: &Assign) -> Candidate {
+    Candidate {
+        node: node.id,
+        priority: group(vm, inv).and_then(|g| g.spec.priority(&node.name)),
+        penalty: soft(vm, node, inv, assign).0,
+        free_mib: free_mib(vm, node, inv, assign),
+    }
 }
 
 /// VM을 이 노드에 두면 어기는 hard 규칙의 이름(이름 순). restricted HA 그룹 밖이면 `ha-group:<이름>`.
@@ -151,6 +156,18 @@ fn soft(vm: &Vm, node: &Node, inv: &Inventory, assign: &Assign) -> (u32, Vec<Str
         }
     }
     (total, names.into_iter().collect())
+}
+
+/// 켜진 hard `affinity` 규칙으로 이 VM과 묶인 다른 VM(바로 이웃만, 자리와 상관없이)
+pub fn affinity_partners<'a>(vm: &Vm, inv: &'a Inventory) -> Vec<&'a Vm> {
+    let rules: Vec<&PlacementRule> = rules_of(vm, inv)
+        .filter(|r| r.spec.kind == RuleKind::Affinity)
+        .collect();
+    inv.vms
+        .iter()
+        .filter(|v| v.id != vm.id)
+        .filter(|v| rules.iter().any(|r| r.spec.has_vm(&v.name, &v.labels)))
+        .collect()
 }
 
 /// 이 VM이 든 켜진 규칙

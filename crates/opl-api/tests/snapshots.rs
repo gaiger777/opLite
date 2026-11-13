@@ -10,7 +10,7 @@ use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{PowerState, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{PowerState, VmHa, VmPhase, VmSpec, VmStatus};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -761,6 +761,36 @@ async fn revert_and_delete_need_a_ready_snapshot() {
     let (status, body) = admin.delete("/vms/web/snapshots/s1").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "vm_busy");
+}
+
+/// 되돌리기는 스냅샷 때의 HA 정책을 쓰지 않으므로(지금 것을 지킴) 그것으로 검사하지 않는다: 스냅샷이 그새
+/// 지워진 HA 그룹을 가리켜도 되돌린다.
+#[tokio::test]
+async fn revert_checks_the_current_ha_policy_not_the_snapshot_one() {
+    let env = env().await;
+    let admin = env.admin().await;
+    pool(&env, vec![]).await;
+    volume(&env, "root", ImageFormat::Qcow2).await;
+    let vm = vm_with_disks(&admin, "web", &["root"]).await;
+    admin
+        .post("/vms/web/snapshots", json!({ "name": "s1" }))
+        .await;
+    let snap = snapshot_of(&env, vm, "s1").await;
+    let mut spec = snap.spec.clone();
+    spec.vm_spec.ha = Some(VmHa {
+        group: Some("gone".into()),
+        ..Default::default()
+    });
+    env.cluster
+        .update_spec(snap.id, Some(snap.revision), snap.labels.clone(), &spec)
+        .await
+        .unwrap();
+    mark_ready(&env, snap.id).await;
+    finish_tasks(&env).await;
+    let (status, body) = admin
+        .post("/vms/web/snapshots/s1/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 }
 
 /// 만들기·되돌리기·삭제 요청이 모두 `vm_busy`로 거절되는지.

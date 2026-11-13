@@ -1469,7 +1469,9 @@ export interface paths {
          *     `migration_unsupported`). `pool`을 줬는데 그런 디스크가 없으면 400, 없는 풀이면 404다. HVF(macOS)
          *     노드는 원본도 대상도 될 수 없다(409 `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나
          *     유지보수 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
-         *     스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다.
+         *     스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다. 대상 노드가 hard
+         *     배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
+         *     (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`).
          */
         post: operations["migrate_vm"];
         delete?: never;
@@ -3402,6 +3404,11 @@ export interface components {
             witness: boolean;
         };
         MigrateRequest: {
+            /**
+             * @description hard 배치 규칙(restricted HA 그룹 포함)을 넘어 옮긴다. 노드 조건과 메모리는 그대로 본다. 배치 규칙을
+             *     쓸 수 있는 사용자(관리자)만이다(아니면 403). 넘은 규칙은 감사 기록에 남는다.
+             */
+            force?: boolean;
             /** @description 옮겨 갈 노드(이름이나 id) */
             node: string;
             /** @description 노드 로컬 풀의 디스크를 복사해 둘 대상 노드의 풀. 없으면 디스크마다 같은 이름의 풀이다. */

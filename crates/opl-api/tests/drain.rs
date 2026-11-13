@@ -10,13 +10,14 @@ use std::time::Duration;
 use common::{Client, Env, MOUNT_ROOT, set_pool_state, vm_request};
 use opl_driver::DirStorage;
 use opl_types::node::{FEATURES, Node, NodeSpec, NodeStatus, PoolState};
+use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
 use opl_types::storage::{Volume, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
 use opl_types::version::BUILD;
-use opl_types::vm::Arch;
+use opl_types::vm::{Arch, PowerState, Vm, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -439,4 +440,186 @@ async fn a_vm_that_stays_busy_is_reported() {
         task["status"]["error"],
         "1 VM(s) were not moved: web (busy)"
     );
+}
+
+/// 배치 규칙을 저장소에 바로 만든다.
+async fn add_rule(env: &Env, name: &str, kind: RuleKind, vms: &[&str], nodes: &[&str]) {
+    let rule: PlacementRule = Resource::new(
+        name,
+        PlacementRuleSpec {
+            kind,
+            vms: vms.iter().map(|v| v.to_string()).collect(),
+            vm_tag: None,
+            nodes: nodes.iter().map(|n| n.to_string()).collect(),
+            node_tag: None,
+            weight: None,
+            enabled: true,
+            ha_may_violate: false,
+        },
+    );
+    env.cluster.create(&rule).await.unwrap();
+}
+
+/// 비우기가 만든 마이그레이션 Task의 (VM 이름, 대상 노드), 이름 순
+fn migrations(env: &Env) -> Vec<(String, Uuid)> {
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    let (_, vms) = env.cluster.list::<VmSpec>().unwrap();
+    let mut found: Vec<(String, Uuid)> = tasks
+        .iter()
+        .filter_map(|t| match t.spec.op {
+            TaskOp::VmMigrate { node, .. } => {
+                let vm = vms.iter().find(|v| v.id == t.spec.target).unwrap();
+                Some((vm.name.clone(), node))
+            }
+            _ => None,
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// 비우기는 hard anti-affinity를 지킨다: 상대가 도는 노드는 메모리가 더 많아도 고르지 않는다.
+#[tokio::test]
+async fn drain_keeps_anti_affinity() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "web", "nas", true).await;
+    let big = add_node(&env, "big", |n| n.status.memory_mib = 65536).await;
+    let small = add_node(&env, "small", |_| {}).await;
+    // 실행기가 없는 노드에서 도는 VM을 저장소에 바로 둔다.
+    let mut cache: Vm = Resource::new(
+        "cache",
+        serde_json::from_value(vm_request("cache")["spec"].clone()).unwrap(),
+    );
+    cache.spec.node = Some(big);
+    cache.spec.power = PowerState::Running;
+    env.cluster.create(&cache).await.unwrap();
+    add_rule(
+        &env,
+        "apart",
+        RuleKind::AntiAffinity,
+        &["web", "cache"],
+        &[],
+    )
+    .await;
+
+    let (status, task) = drain(&admin, "node1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
+    assert_eq!(migrations(&env), [("web".to_string(), small)]);
+}
+
+/// hard affinity로 묶인 VM은 묶음 전체를 받을 수 있는 같은 노드로 간다: 한 구성원이 `node-affinity`로 묶인
+/// 노드면 메모리가 더 많은 노드를 두고 그리로 간다. 첫 VM이 옮겨지지 못하면 상대는 혼자 옮기지 않는다.
+#[tokio::test]
+async fn drain_moves_an_affinity_bundle_to_one_node() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "web", "nas", true).await;
+    running_vm(&env, &admin, "db", "nas2", true).await;
+    add_node(&env, "big", |n| n.status.memory_mib = 65536).await;
+    let b = add_node(&env, "b", |_| {}).await;
+    add_rule(&env, "db-on-b", RuleKind::NodeAffinity, &["db"], &["b"]).await;
+    add_rule(&env, "together", RuleKind::Affinity, &["web", "db"], &[]).await;
+
+    let (status, task) = drain(&admin, "node1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    // 시험 노드는 다른 노드에 닿지 못해 마이그레이션 Task가 실패한다.
+    assert_eq!(
+        task["status"]["error"],
+        "2 VM(s) were not moved: db (this node cannot reach other nodes), web (affinity partner db could not move)"
+    );
+    assert_eq!(migrations(&env), [("db".to_string(), b)]);
+}
+
+/// 묶음의 어느 구성원이라도 디스크를 옮길 수 없으면(로컬 풀 디스크와 스냅샷) 첫 VM도 옮기지 않고 묶음 전체를
+/// 남긴다. 막은 구성원은 그 이유로, 나머지는 `affinity partner <막은 구성원>: <이유>`로 남긴다.
+#[tokio::test]
+async fn drain_keeps_a_bundle_whose_partner_cannot_move_its_disks() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "db", "nas", true).await;
+    running_vm(&env, &admin, "web", "local", false).await;
+    add_node(&env, "node2", |_| {}).await;
+    add_rule(&env, "together", RuleKind::Affinity, &["db", "web"], &[]).await;
+    let web = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
+    let mut snapshot: Snapshot = Resource::new(
+        "",
+        SnapshotSpec {
+            vm: web.id,
+            name: "s1".into(),
+            parent: None,
+            memory: false,
+            description: String::new(),
+            scheduled: false,
+            vm_spec: web.spec.clone(),
+        },
+    );
+    snapshot.name = snapshot.id.to_string();
+    env.cluster.create(&snapshot).await.unwrap();
+
+    let (status, task) = drain(&admin, "node1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(
+        task["status"]["error"],
+        "2 VM(s) were not moved: db (affinity partner web: disks on a local pool and snapshots), web (disks on a local pool and snapshots)"
+    );
+    assert_eq!(migrations(&env), []);
+}
+
+/// 앞 구성원이 이미 옮겨 간 노드(규칙에 맞는 유일한 노드)에 자리가 없으면 혼자 남은 짝은 규칙이 아니라 자리
+/// 탓(`no node with capacity`)으로 남긴다. 다른 노드는 메모리가 넉넉해도 affinity 때문에 고르지 않는다.
+#[tokio::test]
+async fn a_partner_left_behind_without_room_lacks_capacity() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "web", "nas", true).await;
+    add_node(&env, "big", |n| n.status.memory_mib = 65536).await;
+    let b = add_node(&env, "b", |n| n.status.memory_mib = 384).await;
+    // 실행기가 없는 노드 b로 먼저 옮겨 간 짝을 저장소에 바로 둔다.
+    let mut db: Vm = Resource::new(
+        "db",
+        serde_json::from_value(vm_request("db")["spec"].clone()).unwrap(),
+    );
+    db.spec.node = Some(b);
+    db.spec.power = PowerState::Running;
+    env.cluster.create(&db).await.unwrap();
+    add_rule(&env, "together", RuleKind::Affinity, &["web", "db"], &[]).await;
+
+    let (status, task) = drain(&admin, "node1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(
+        task["status"]["error"],
+        "1 VM(s) were not moved: web (no node with capacity)"
+    );
+    assert_eq!(migrations(&env), []);
+}
+
+/// hard 규칙 때문에 받을 노드가 없으면 그 규칙을 이유로 남긴다.
+#[tokio::test]
+async fn drain_reports_the_rules_that_leave_no_node() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "web", "nas", true).await;
+    add_node(&env, "node2", |_| {}).await;
+    add_rule(
+        &env,
+        "never",
+        RuleKind::NodeAntiAffinity,
+        &["web"],
+        &["node2"],
+    )
+    .await;
+
+    let (status, task) = drain(&admin, "node1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(
+        task["status"]["error"],
+        "1 VM(s) were not moved: web (placement rule never)"
+    );
+    assert_eq!(migrations(&env), []);
 }

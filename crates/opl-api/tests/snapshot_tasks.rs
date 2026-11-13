@@ -16,7 +16,7 @@ use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
 use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{Arch, PowerState, VmHa, VmPhase, VmSpec};
+use opl_types::vm::{Arch, HaState, PowerState, VmHa, VmPhase, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -271,11 +271,16 @@ async fn revert_keeps_the_current_ha() {
     assert_eq!(get(&env, vm, "cfg").spec.vm_spec.ha, None);
 
     // 시험 노드는 HA 가능 노드가 아니므로 API를 거치지 않고 바꾼다(reconciler의 status 쓰기와
-    // 부딪치면 다시 읽어 쓴다).
+    // 부딪치면 다시 읽어 쓴다). 되돌리기는 지금 `ha`로 검증하므로 HA 가능 노드가 필요 없는 잠시 끈
+    // 정책(`ignored`)을 둔다.
+    let policy = VmHa {
+        state: HaState::Ignored,
+        ..Default::default()
+    };
     loop {
         let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
         let mut spec = current.spec.clone();
-        spec.ha = Some(VmHa::default());
+        spec.ha = Some(policy.clone());
         match env
             .cluster
             .update_spec(vm, Some(current.revision), current.labels, &spec)
@@ -293,13 +298,9 @@ async fn revert_keeps_the_current_ha() {
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     succeeded(&admin.wait_task(&task).await);
-    assert!(
-        env.cluster
-            .get::<VmSpec>(vm)
-            .unwrap()
-            .unwrap()
-            .spec
-            .ha_active()
+    assert_eq!(
+        env.cluster.get::<VmSpec>(vm).unwrap().unwrap().spec.ha,
+        Some(policy)
     );
 }
 
