@@ -209,7 +209,7 @@ async fn membership_changes_go_through_any_member() {
     tc.get(follower)
         .request(LeaderRequest::AddLearner {
             id: n4,
-            addr: addr(4).addr,
+            addr: addr(4).addr().to_string(),
         })
         .await
         .unwrap();

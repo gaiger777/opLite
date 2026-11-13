@@ -4,10 +4,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use openraft::{BasicNode, ServerState};
+use openraft::ServerState;
 use opl_cluster::memnet::MemRouter;
 use opl_cluster::store::StoreError;
-use opl_cluster::types::NodeId;
+use opl_cluster::types::{NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig, ClusterError};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -206,6 +206,6 @@ impl TestCluster {
     }
 }
 
-pub fn addr(n: u64) -> BasicNode {
-    BasicNode::new(format!("node-{n}"))
+pub fn addr(n: u64) -> OrbNode {
+    OrbNode::single(format!("node-{n}"))
 }

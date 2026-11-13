@@ -276,7 +276,7 @@ pub(crate) async fn confirm_leader(
         Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f)))) => {
             Err(ClusterError::NotLeader {
                 leader_id: f.leader_id,
-                leader_addr: f.leader_node.map(|n| n.addr),
+                leader_addr: f.leader_node.map(|n| n.addr().to_string()),
             })
         }
         Ok(Err(e)) => Err(ClusterError::Raft(e.to_string())),

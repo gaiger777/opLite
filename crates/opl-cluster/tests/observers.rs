@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use opl_cluster::memnet::MemRouter;
 use opl_cluster::store::{NodeMode, StoreError};
-use opl_cluster::types::NodeId;
+use opl_cluster::types::{NodeId, OrbNode};
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{
     Cluster, ClusterConfig, ClusterError, OBSERVER, RoleKeeper, RoleKeeperConfig, VOTER_LIMIT,
@@ -90,7 +90,7 @@ impl Harness {
             h.open(i).await;
         }
         let voters = (1..=5)
-            .map(|i| (id(i), openraft::BasicNode::new(format!("node-{i}"))))
+            .map(|i| (id(i), OrbNode::single(format!("node-{i}"))))
             .collect();
         h.get(1).initialize(voters).await.unwrap();
         eventually("a leader", || async { h.leader().is_some() }).await;
@@ -109,7 +109,7 @@ impl Harness {
         for i in 6..=n {
             let leader = h.leader_cluster();
             leader
-                .add_learner(id(i), openraft::BasicNode::new(format!("node-{i}")))
+                .add_learner(id(i), OrbNode::single(format!("node-{i}")))
                 .await
                 .unwrap();
         }

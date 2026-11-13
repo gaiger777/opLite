@@ -17,12 +17,12 @@ use crate::store::{
     KEY_LAST_APPLIED, KEY_LAST_MEMBERSHIP, KEY_SNAPSHOT_DATA, KEY_SNAPSHOT_META, META, NAMES,
     OBJECTS, SCHEMA_VERSION, StoreError, get_json, put_json,
 };
-use crate::types::{Command, NodeId, RawResource, Rejection, Response, TypeConfig};
+use crate::types::{Command, NodeId, OrbNode, RawResource, Rejection, Response, TypeConfig};
 use crate::watch::{FeedBatch, WatchEvent, WatchHub};
 use crate::writer::StoreWriter;
 
-type Membership = StoredMembership<NodeId, openraft::BasicNode>;
-type Meta = SnapshotMeta<NodeId, openraft::BasicNode>;
+type Membership = StoredMembership<NodeId, OrbNode>;
+type Meta = SnapshotMeta<NodeId, OrbNode>;
 /// 상태 전체의 리소스(스냅샷 본문)
 pub(crate) type Objects = Vec<(Kind, RawResource)>;
 

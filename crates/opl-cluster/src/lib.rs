@@ -26,6 +26,7 @@ pub use lease::Leases;
 pub use log_store::LogStore;
 pub use roles::{RoleKeeper, RoleKeeperConfig};
 pub use state_machine::StateMachine;
+pub use types::OrbNode;
 pub use vip::{VipLeases, VipRenewal};
 pub use voters::{
     OBSERVER, STANDBY_LEARNERS, VOTER_LIMIT, VoterKeeper, VoterKeeperConfig, ZONE_LABEL,

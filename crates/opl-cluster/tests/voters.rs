@@ -8,9 +8,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::{BasicNode, ChangeMembers};
+use openraft::ChangeMembers;
 use opl_cluster::memnet::MemRouter;
-use opl_cluster::types::{LeaderRequest, NodeId};
+use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
     Cluster, ClusterConfig, Members, VOTER_LIMIT, VoterKeeper, VoterKeeperConfig, ZONE_LABEL,
 };
@@ -93,12 +93,7 @@ impl Harness {
             );
         }
         let members = (1..=n)
-            .map(|i| {
-                (
-                    NodeId::from(i),
-                    openraft::BasicNode::new(format!("node-{i}")),
-                )
-            })
+            .map(|i| (NodeId::from(i), OrbNode::single(format!("node-{i}"))))
             .collect();
         nodes[&NodeId::from(1)]
             .cluster
@@ -582,7 +577,7 @@ async fn a_learner_that_never_registered_does_not_stop_the_keeper() {
         .cluster
         .raft()
         .unwrap()
-        .add_learner(ghost, BasicNode::new("node-9"), false)
+        .add_learner(ghost, OrbNode::single("node-9"), false)
         .await
         .unwrap();
     // 상한을 다섯으로 올리면 살아 있는 learner를 다시 올린다.

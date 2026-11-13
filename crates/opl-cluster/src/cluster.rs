@@ -7,7 +7,7 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
-use openraft::{BasicNode, Raft, RaftMetrics, RaftNetworkFactory};
+use openraft::{Raft, RaftMetrics, RaftNetworkFactory};
 use opl_types::cluster::ClusterStatus;
 use opl_types::resource::{Kind, Resource, ResourceSpec};
 use redb::Database;
@@ -24,7 +24,7 @@ use crate::store::{
     NodeMode, Store, StoreError, enter_observer_mode, get_object, get_object_by_name, list_objects,
     read_dropped_log, read_node_mode, write_node_mode,
 };
-use crate::types::{Command, LeaderRequest, NodeId, RawResource, Rejection, TypeConfig};
+use crate::types::{Command, LeaderRequest, NodeId, OrbNode, RawResource, Rejection, TypeConfig};
 use crate::vip::{VipLeases, VipTable};
 use crate::watch::{Feed, FeedItem, Watch, WatchError, WatchEvent, WatchHub};
 
@@ -100,12 +100,12 @@ pub enum ClusterError {
     Encoding(#[from] serde_json::Error),
 }
 
-impl From<RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>> for ClusterError {
-    fn from(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> Self {
+impl From<RaftError<NodeId, ClientWriteError<NodeId, OrbNode>>> for ClusterError {
+    fn from(e: RaftError<NodeId, ClientWriteError<NodeId, OrbNode>>) -> Self {
         match e {
             RaftError::APIError(ClientWriteError::ForwardToLeader(f)) => ClusterError::NotLeader {
                 leader_id: f.leader_id,
-                leader_addr: f.leader_node.map(|n| n.addr),
+                leader_addr: f.leader_node.map(|n| n.addr().to_string()),
             },
             other => ClusterError::Raft(other.to_string()),
         }
@@ -584,10 +584,7 @@ impl Cluster {
     }
 
     /// 새 클러스터를 만든다. 첫 노드에서 한 번만 부른다.
-    pub async fn initialize(
-        &self,
-        members: BTreeMap<NodeId, BasicNode>,
-    ) -> Result<(), ClusterError> {
+    pub async fn initialize(&self, members: BTreeMap<NodeId, OrbNode>) -> Result<(), ClusterError> {
         self.member()?
             .initialize(members)
             .await
@@ -597,7 +594,7 @@ impl Cluster {
     /// 노드를 learner로 추가하고 로그를 따라잡을 때까지 기다린다. 리더에서 부른다.
     /// `write_timeout` 안에 끝나지 않으면 `Timeout`이다. 이때도 learner 추가는 나중에
     /// 커밋될 수 있고, 커밋되면 리더는 계속 따라잡게 한다.
-    pub async fn add_learner(&self, id: NodeId, node: BasicNode) -> Result<(), ClusterError> {
+    pub async fn add_learner(&self, id: NodeId, node: OrbNode) -> Result<(), ClusterError> {
         tokio::time::timeout(
             self.write_timeout,
             self.member()?.add_learner(id, node, true),
@@ -999,7 +996,7 @@ impl Cluster {
             } else {
                 &mut out.learners
             };
-            list.insert(*id, node.addr.clone());
+            list.insert(*id, node.addr().to_string());
         }
         // 내리는 중(목록에 쓰고 아직 멤버십에서 빼기 전)인 노드는 Raft 구성원으로 센다.
         out.observers = self
@@ -1112,7 +1109,7 @@ impl Cluster {
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                 Err(ClusterError::NotLeader {
                     leader_id: f.leader_id,
-                    leader_addr: f.leader_node.map(|n| n.addr),
+                    leader_addr: f.leader_node.map(|n| n.addr().to_string()),
                 })
             }
             Err(e) => Err(ClusterError::Raft(e.to_string())),
@@ -1233,7 +1230,7 @@ impl Drop for Transition<'_> {
 /// 이 노드가 Raft를 끄고 로그를 지워도 되는지: 어느 구성(joint의 두 구성)에서도 투표 멤버가 아니고, 그 멤버십이
 /// 커밋·적용됐다(적용 위치 안). 커밋되지 않은 멤버십이 이 노드를 내린 것이면, 그것이 잘려 이 노드가 다시 투표
 /// 멤버가 될 수 있다(그때 지운 로그로 투표하면 커밋된 항목을 잃을 수 있다).
-fn may_leave_raft(m: &RaftMetrics<NodeId, BasicNode>, id: NodeId) -> Result<(), String> {
+fn may_leave_raft(m: &RaftMetrics<NodeId, OrbNode>, id: NodeId) -> Result<(), String> {
     if m.membership_config
         .membership()
         .voter_ids()
@@ -1469,7 +1466,7 @@ mod tests {
             nodes.insert(id, cluster);
         }
         let members = (1..=3u64)
-            .map(|i| (NodeId::from(i), BasicNode::new(format!("node-{i}"))))
+            .map(|i| (NodeId::from(i), OrbNode::single(format!("node-{i}"))))
             .collect();
         let first = &nodes[&NodeId::from(1)];
         first.initialize(members).await.unwrap();
@@ -1546,7 +1543,7 @@ mod tests {
             .unwrap();
         router.register(id, &cluster);
         cluster
-            .initialize(BTreeMap::from([(id, BasicNode::new("node-1"))]))
+            .initialize(BTreeMap::from([(id, OrbNode::single("node-1"))]))
             .await
             .unwrap();
         cluster.create(&volume("a")).await.unwrap();
@@ -1605,7 +1602,7 @@ mod tests {
         let router = MemRouter::default();
         let node = open_node(&router, root.path(), 1).await;
         assert_eq!(node.revision(), 0);
-        node.initialize(BTreeMap::from([(node.id(), BasicNode::new("node-1"))]))
+        node.initialize(BTreeMap::from([(node.id(), OrbNode::single("node-1"))]))
             .await
             .unwrap();
         // 멤버십(0)과 blank(1)뿐이라 리소스 변경은 없다.
@@ -1649,7 +1646,7 @@ mod tests {
         let router = MemRouter::default();
         let leader = open_node(&router, root.path(), 1).await;
         leader
-            .initialize(BTreeMap::from([(leader.id(), BasicNode::new("node-1"))]))
+            .initialize(BTreeMap::from([(leader.id(), OrbNode::single("node-1"))]))
             .await
             .unwrap();
         leader
@@ -1668,7 +1665,7 @@ mod tests {
         learner.write_timeout = Duration::from_secs(10);
         router.register(id, &learner);
         leader
-            .add_learner(id, BasicNode::new("node-2"))
+            .add_learner(id, OrbNode::single("node-2"))
             .await
             .unwrap();
         leader.create(&volume("a")).await.unwrap();
@@ -1756,7 +1753,7 @@ mod tests {
         let router = MemRouter::default();
         let leader = open_node(&router, root.path(), 1).await;
         leader
-            .initialize(BTreeMap::from([(leader.id(), BasicNode::new("node-1"))]))
+            .initialize(BTreeMap::from([(leader.id(), OrbNode::single("node-1"))]))
             .await
             .unwrap();
         let id = NodeId::from(2u64);
@@ -1770,7 +1767,7 @@ mod tests {
         .with_forwarder(router.forwarder(id));
         router.register(id, &learner);
         leader
-            .add_learner(id, BasicNode::new("node-2"))
+            .add_learner(id, OrbNode::single("node-2"))
             .await
             .unwrap();
         leader.create(&volume("a")).await.unwrap();
@@ -1826,7 +1823,7 @@ mod tests {
         let router = MemRouter::default();
         let leader = open_node(&router, root.path(), 1).await;
         leader
-            .initialize(BTreeMap::from([(leader.id(), BasicNode::new("node-1"))]))
+            .initialize(BTreeMap::from([(leader.id(), OrbNode::single("node-1"))]))
             .await
             .unwrap();
         let id = NodeId::from(2u64);
@@ -1839,7 +1836,7 @@ mod tests {
         .unwrap();
         router.register(id, &learner);
         leader
-            .add_learner(id, BasicNode::new("node-2"))
+            .add_learner(id, OrbNode::single("node-2"))
             .await
             .unwrap();
         learner
@@ -1871,7 +1868,7 @@ mod tests {
         let router = MemRouter::default();
         let leader = open_node(&router, root.path(), 1).await;
         leader
-            .initialize(BTreeMap::from([(leader.id(), BasicNode::new("node-1"))]))
+            .initialize(BTreeMap::from([(leader.id(), OrbNode::single("node-1"))]))
             .await
             .unwrap();
         leader
@@ -1881,7 +1878,7 @@ mod tests {
         let learner = open_node(&router, root.path(), 2).await;
         let mut feed = leader.store.watch_hub().feed(leader.revision()).unwrap();
         leader
-            .add_learner(learner.id(), BasicNode::new("node-2"))
+            .add_learner(learner.id(), OrbNode::single("node-2"))
             .await
             .unwrap();
 

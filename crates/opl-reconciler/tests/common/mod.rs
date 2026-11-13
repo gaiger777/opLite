@@ -6,10 +6,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use openraft::{BasicNode, ServerState};
+use openraft::ServerState;
 use opl_cluster::memnet::MemRouter;
 use opl_cluster::store::StoreError;
-use opl_cluster::types::NodeId;
+use opl_cluster::types::{NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig, ClusterError};
 use opl_driver::{DirStorage, Hypervisor, MockHypervisor};
 use opl_reconciler::{Reconciler, ReconcilerConfig, ReconcilerHandle, RestartBackoff};
@@ -98,7 +98,7 @@ pub async fn wait_leader(cluster: &Cluster) {
 pub async fn single_node(router: &MemRouter, dir: &Path) -> Arc<Cluster> {
     let id = NodeId(Uuid::now_v7());
     let cluster = open_node(router, id, dir, raft_config(), Duration::from_secs(5)).await;
-    let members = BTreeMap::from([(id, BasicNode::new(id.to_string()))]);
+    let members = BTreeMap::from([(id, OrbNode::single(id.to_string()))]);
     cluster.initialize(members).await.unwrap();
     wait_leader(&cluster).await;
     cluster

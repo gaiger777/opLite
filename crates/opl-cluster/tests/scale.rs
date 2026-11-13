@@ -23,15 +23,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
+use openraft::ServerState;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, ServerState};
 use opl_cluster::memnet::{MemConnection, MemFollow, MemForwarder, MemNetwork, MemRouter};
-use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
+use opl_cluster::types::{LeaderRequest, NodeId, OrbNode, TypeConfig};
 use opl_cluster::{
     Cluster, ClusterConfig, ClusterError, FollowClient, FollowFrame, Forwarder, OBSERVER,
     RoleKeeper, RoleKeeperConfig, STANDBY_LEARNERS, Typed, VOTER_LIMIT, VoterKeeper,
@@ -142,7 +142,7 @@ struct Counting {
 impl RaftNetworkFactory<TypeConfig> for Counting {
     type Network = CountingConnection;
 
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> CountingConnection {
+    async fn new_client(&mut self, target: NodeId, node: &OrbNode) -> CountingConnection {
         CountingConnection {
             inner: self.inner.new_client(target, node).await,
             from: self.from,
@@ -175,7 +175,7 @@ impl CountingConnection {
 }
 
 type RpcResult<T, E = openraft::error::Infallible> =
-    Result<T, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>;
+    Result<T, RPCError<NodeId, OrbNode, RaftError<NodeId, E>>>;
 
 impl RaftNetwork<TypeConfig> for CountingConnection {
     async fn append_entries(
@@ -521,13 +521,13 @@ async fn hundreds_of_nodes_do_not_slow_the_leader() {
     }
     let voters: Vec<NodeId> = (1..=VOTERS).map(NodeId::from).collect();
     let members = (1..=VOTERS)
-        .map(|i| (NodeId::from(i), BasicNode::new(format!("node-{i}"))))
+        .map(|i| (NodeId::from(i), OrbNode::single(format!("node-{i}"))))
         .collect();
     h.get(voters[0]).initialize(members).await.unwrap();
     let leader = h.wait_leader(&voters, Duration::from_secs(10)).await;
     for i in VOTERS + 1..=MEMBERS {
         h.get(leader)
-            .add_learner(NodeId::from(i), BasicNode::new(format!("node-{i}")))
+            .add_learner(NodeId::from(i), OrbNode::single(format!("node-{i}")))
             .await
             .unwrap();
     }
@@ -637,7 +637,10 @@ async fn hundreds_of_nodes_do_not_slow_the_leader() {
     h.open(added, false).await;
     let t = Instant::now();
     h.get(leader)
-        .add_learner(NodeId::from(added), BasicNode::new(format!("node-{added}")))
+        .add_learner(
+            NodeId::from(added),
+            OrbNode::single(format!("node-{added}")),
+        )
         .await
         .unwrap();
     let add = t.elapsed();

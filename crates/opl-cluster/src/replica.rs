@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
-use openraft::{BasicNode, StoredMembership};
+use openraft::StoredMembership;
 use redb::{Database, ReadableDatabase};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -19,11 +19,11 @@ use crate::follow::{FollowClient, FollowFrame};
 use crate::health::ApplyLag;
 use crate::state_machine::{Objects, apply_feed, install_objects};
 use crate::store::{KEY_LAST_MEMBERSHIP, META, Store, StoreError, get_json};
-use crate::types::NodeId;
+use crate::types::{NodeId, OrbNode};
 use crate::watch::{FeedBatch, WatchHub};
 use crate::writer::StoreWriter;
 
-type Membership = StoredMembership<NodeId, BasicNode>;
+type Membership = StoredMembership<NodeId, OrbNode>;
 
 /// 붙은 노드에서 이만큼 아무 프레임도 오지 않으면 끊고 다시 붙는다(서버는 1초마다 `Progress`를 보낸다).
 pub(crate) const FOLLOW_STALL: Duration = Duration::from_secs(3);
@@ -468,7 +468,7 @@ fn read_membership(db: &Database) -> Result<Membership, StoreError> {
 fn voter_addrs(m: &Membership) -> BTreeMap<NodeId, String> {
     let m = m.membership();
     m.voter_ids()
-        .filter_map(|id| m.get_node(&id).map(|n| (id, n.addr.clone())))
+        .filter_map(|id| m.get_node(&id).map(|n| (id, n.addr().to_string())))
         .collect()
 }
 
@@ -477,7 +477,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use openraft::BasicNode;
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
     use opl_types::storage::{Volume, VolumeSpec};
@@ -557,7 +556,7 @@ mod tests {
                 net.voters.insert(id, c);
             }
             let members = (1..=3u64)
-                .map(|i| (NodeId::from(i), BasicNode::new(format!("node-{i}"))))
+                .map(|i| (NodeId::from(i), OrbNode::single(format!("node-{i}"))))
                 .collect();
             net.voters[&NodeId::from(1)]
                 .initialize(members)
@@ -594,7 +593,7 @@ mod tests {
                 .unwrap();
             self.router.register(id, &learner);
             self.leader()
-                .add_learner(id, BasicNode::new(format!("node-{i}")))
+                .add_learner(id, OrbNode::single(format!("node-{i}")))
                 .await
                 .unwrap();
             self.leader()

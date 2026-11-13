@@ -763,7 +763,7 @@ mod tests {
     async fn one_node_cluster(dir: &std::path::Path) -> Cluster {
         use opl_cluster::ClusterConfig;
         use opl_cluster::memnet::MemRouter;
-        use opl_cluster::types::NodeId;
+        use opl_cluster::types::{NodeId, OrbNode};
 
         let router = MemRouter::default();
         let id = NodeId(Uuid::now_v7());
@@ -774,7 +774,7 @@ mod tests {
         cluster
             .initialize(std::collections::BTreeMap::from([(
                 id,
-                openraft::BasicNode::new(id.to_string()),
+                OrbNode::single(id.to_string()),
             )]))
             .await
             .unwrap();

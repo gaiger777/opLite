@@ -16,12 +16,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use openraft::BasicNode;
 use opl_api::{
     AppState, AuditConfig, AuditLog, IncomingConfig, IncomingMigrations, TaskRunner,
     UefiVarsFetcher, hash_password,
 };
-use opl_cluster::types::NodeId;
+use opl_cluster::types::{NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::mock::MOCK_MIRROR_BYTES;
 use opl_driver::{
@@ -282,8 +281,8 @@ async fn two_nodes_with(
     a.serve(&root).await;
     b.serve(&root).await;
     let members = BTreeMap::from([
-        (NodeId(a.id), BasicNode::new(&a.addr)),
-        (NodeId(b.id), BasicNode::new(&b.addr)),
+        (NodeId(a.id), OrbNode::single(&a.addr)),
+        (NodeId(b.id), OrbNode::single(&b.addr)),
     ]);
     a.cluster.initialize(members).await.unwrap();
     for node in [&a, &b] {

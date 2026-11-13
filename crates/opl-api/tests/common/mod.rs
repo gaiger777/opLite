@@ -15,11 +15,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::serve::ListenerExt;
-use openraft::{BasicNode, ServerState};
+use openraft::ServerState;
 use opl_api::vm_imports::ImportCredentials;
 use opl_api::{AppState, AuditConfig, AuditLog, TaskRunner, TaskRunnerConfig, hash_password};
 use opl_cluster::memnet::MemRouter;
-use opl_cluster::types::NodeId;
+use opl_cluster::types::{NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::{
     Capacity, DirStorage, DriverError, Hypervisor, MockHypervisor, Storage, VolumeInfo,
@@ -119,7 +119,7 @@ impl Env {
         let cluster = Arc::new(Cluster::open(config, router.network(id)).await.unwrap());
         router.register(id, &cluster);
         cluster
-            .initialize(BTreeMap::from([(id, BasicNode::new(id.to_string()))]))
+            .initialize(BTreeMap::from([(id, OrbNode::single(id.to_string()))]))
             .await
             .unwrap();
         cluster

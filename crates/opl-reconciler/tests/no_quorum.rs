@@ -8,9 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{WAIT, open_node, raft_config, vm, wait_leader, wait_vm};
-use openraft::BasicNode;
 use opl_cluster::memnet::MemRouter;
-use opl_cluster::types::NodeId;
+use opl_cluster::types::{NodeId, OrbNode};
 use opl_driver::{Hypervisor, MockHypervisor};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard, Reconciler};
@@ -46,7 +45,7 @@ async fn vm_is_restarted_without_quorum_and_status_catches_up() {
         write_timeout,
     )
     .await;
-    let members = BTreeMap::from([(n1, BasicNode::new("n1")), (n2, BasicNode::new("n2"))]);
+    let members = BTreeMap::from([(n1, OrbNode::single("n1")), (n2, OrbNode::single("n2"))]);
     c1.initialize(members).await.unwrap();
     wait_leader(&c1).await;
 
@@ -135,7 +134,7 @@ async fn ha_vm_is_not_restarted_without_recording_starting() {
         write_timeout,
     )
     .await;
-    let members = BTreeMap::from([(n1, BasicNode::new("n1")), (n2, BasicNode::new("n2"))]);
+    let members = BTreeMap::from([(n1, OrbNode::single("n1")), (n2, OrbNode::single("n2"))]);
     c1.initialize(members).await.unwrap();
     wait_leader(&c1).await;
 

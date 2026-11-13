@@ -3,12 +3,12 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use openraft::{BasicNode, LogId, StoredMembership};
+use openraft::{LogId, StoredMembership};
 use opl_types::resource::Kind;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
-use crate::types::{NodeId, RawResource};
+use crate::types::{NodeId, OrbNode, RawResource};
 
 /// 메모리에 보관하는 최근 적용 묶음 수. 이보다 오래된 `since`는 `Expired`가 된다.
 pub const HISTORY: usize = 1024;
@@ -58,7 +58,7 @@ pub struct FeedBatch {
     /// 묶음의 마지막 항목
     pub applied: LogId<NodeId>,
     /// 묶음에 든 마지막 멤버십 변경
-    pub membership: Option<StoredMembership<NodeId, BasicNode>>,
+    pub membership: Option<StoredMembership<NodeId, OrbNode>>,
 }
 
 /// 피드 구독이 받는 것

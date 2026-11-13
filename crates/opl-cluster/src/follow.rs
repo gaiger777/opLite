@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream};
-use openraft::{BasicNode, LogId, RaftMetrics, StoredMembership};
+use openraft::{LogId, RaftMetrics, StoredMembership};
 use opl_types::resource::Kind;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::cluster::{Backend, Cluster, ClusterError, NodeHandle, observers_of};
 use crate::state_machine::snapshot_objects;
-use crate::types::{NodeId, RawResource};
+use crate::types::{NodeId, OrbNode, RawResource};
 use crate::watch::{Feed, FeedBatch, FeedItem, WatchError, WatchEvent};
 
 /// 서버가 이만큼마다 `Progress`를 보낸다. 관찰 노드는 이것으로 연결이 살아 있는지 안다.
@@ -57,7 +57,7 @@ pub enum FollowFrame {
     /// 스냅샷 끝. 상태 전체를 앞 조각들로 바꾼다(구독자에게는 `Reset`).
     SnapshotEnd {
         applied: Option<LogId<NodeId>>,
-        membership: StoredMembership<NodeId, BasicNode>,
+        membership: StoredMembership<NodeId, OrbNode>,
     },
     /// 큰 묶음의 앞부분 이벤트(메시지 한도 때문에 나눔). 뒤따르는 `Batch`와 함께 한 번에 적용한다.
     BatchPart { events: Vec<WatchEvent> },
@@ -66,7 +66,7 @@ pub enum FollowFrame {
     Batch {
         events: Vec<WatchEvent>,
         applied: LogId<NodeId>,
-        membership: Option<StoredMembership<NodeId, BasicNode>>,
+        membership: Option<StoredMembership<NodeId, OrbNode>>,
     },
     /// 서버가 적용한 위치와 서버가 아는 리더
     Progress {
@@ -224,7 +224,7 @@ fn hello(node: &NodeHandle, caller: NodeId) -> Result<(FollowFrame, bool), Clust
             let membership = m.membership_config.membership().clone();
             let leader = m
                 .current_leader
-                .and_then(|l| membership.get_node(&l).map(|n| (l, n.addr.clone())));
+                .and_then(|l| membership.get_node(&l).map(|n| (l, n.addr().to_string())));
             let member = membership.get_node(&node.id()).is_some();
             (membership, leader, member)
         }
@@ -236,7 +236,7 @@ fn hello(node: &NodeHandle, caller: NodeId) -> Result<(FollowFrame, bool), Clust
     };
     let voters: BTreeMap<NodeId, String> = membership
         .voter_ids()
-        .filter_map(|id| membership.get_node(&id).map(|n| (id, n.addr.clone())))
+        .filter_map(|id| membership.get_node(&id).map(|n| (id, n.addr().to_string())))
         .collect();
     let role = if voters.contains_key(&caller) {
         NodeRole::Voter
@@ -297,7 +297,7 @@ async fn stream_changes(
     }
 }
 
-type Metrics = tokio::sync::watch::Receiver<RaftMetrics<NodeId, BasicNode>>;
+type Metrics = tokio::sync::watch::Receiver<RaftMetrics<NodeId, OrbNode>>;
 
 /// 이 노드가 적용한 위치와 아는 리더. 이 노드의 Raft가 멈췄거나 구성원에서 빠졌으면 오류다.
 fn progress(node: &NodeHandle, metrics: &mut Metrics) -> Result<FollowFrame, String> {
@@ -317,7 +317,7 @@ fn progress(node: &NodeHandle, metrics: &mut Metrics) -> Result<FollowFrame, Str
         leader: m.current_leader,
         leader_addr: m
             .current_leader
-            .and_then(|l| membership.get_node(&l).map(|n| n.addr.clone())),
+            .and_then(|l| membership.get_node(&l).map(|n| n.addr().to_string())),
     })
 }
 
@@ -552,7 +552,7 @@ mod tests {
         config.in_memory = true;
         let c = Cluster::open(config, router.network(id)).await.unwrap();
         router.register(id, &c);
-        c.initialize(BTreeMap::from([(id, BasicNode::new("node-1"))]))
+        c.initialize(BTreeMap::from([(id, OrbNode::single("node-1"))]))
             .await
             .unwrap();
         let observer = NodeId::from(9u64);

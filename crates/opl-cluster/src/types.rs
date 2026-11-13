@@ -128,13 +128,83 @@ pub enum LeaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response(pub Result<u64, Rejection>);
 
+/// Raft 구성원 노드 값. 노드에 닿는 클러스터 링크들(`host:port`)이고 앞이 우선이다(설계 §7).
+///
+/// 저장 형식이다(로그·스냅샷·노드 간 gRPC). 늘 `addr`(첫 링크)를 쓰고 링크가 둘 이상일 때만
+/// `addrs`를 더 쓴다. 링크 하나면 `openraft::BasicNode`와 바이트까지 같고, 옛 노드는 여러 링크
+/// 항목을 첫 링크 하나로 읽는다.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrbNode {
+    pub addrs: Vec<String>,
+}
+
+impl OrbNode {
+    pub fn new<S: Into<String>>(addrs: impl IntoIterator<Item = S>) -> Self {
+        Self {
+            addrs: addrs.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// 링크 하나인 노드.
+    pub fn single(addr: impl Into<String>) -> Self {
+        Self {
+            addrs: vec![addr.into()],
+        }
+    }
+
+    /// 첫 링크. 이 계획 전의 "그 노드의 주소" 자리다. 링크가 없으면 `""`.
+    pub fn addr(&self) -> &str {
+        self.addrs.first().map_or("", String::as_str)
+    }
+}
+
+impl fmt::Display for OrbNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.addrs.join(","))
+    }
+}
+
+impl Serialize for OrbNode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let many = self.addrs.len() > 1;
+        let mut st = serializer.serialize_struct("OrbNode", if many { 2 } else { 1 })?;
+        st.serialize_field("addr", self.addr())?;
+        if many {
+            st.serialize_field("addrs", &self.addrs)?;
+        }
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for OrbNode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            addr: String,
+            #[serde(default)]
+            addrs: Vec<String>,
+        }
+        let w = Wire::deserialize(deserializer)?;
+        if !w.addrs.is_empty() {
+            return Ok(Self { addrs: w.addrs });
+        }
+        // 빈 `addr`는 링크 없음(`Default`)으로 읽어 쓰고 읽기가 같은 값이 되게 한다.
+        if w.addr.is_empty() {
+            return Ok(Self::default());
+        }
+        Ok(Self::single(w.addr))
+    }
+}
+
 openraft::declare_raft_types!(
     /// Orbivisor의 openraft 타입 설정.
     pub TypeConfig:
         D = Command,
         R = Response,
         NodeId = NodeId,
-        Node = openraft::BasicNode,
+        Node = OrbNode,
 );
 
 #[cfg(test)]
@@ -223,6 +293,78 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<Command>(value).unwrap(), cmd);
+    }
+
+    /// 노드 값은 저장 형식이다. 링크 하나는 `BasicNode`와 같고 옛 형식도 읽는다(계획 49).
+    #[test]
+    fn orb_node_storage_format() {
+        let old: OrbNode = serde_json::from_value(json!({"addr": "a:8007"})).unwrap();
+        assert_eq!(old, OrbNode::single("a:8007"));
+        assert_eq!(old.addr(), "a:8007");
+        assert_eq!(
+            serde_json::to_string(&OrbNode::single("a:8007")).unwrap(),
+            r#"{"addr":"a:8007"}"#
+        );
+
+        let two = OrbNode::new(["a", "b"]);
+        let text = serde_json::to_string(&two).unwrap();
+        assert_eq!(text, r#"{"addr":"a","addrs":["a","b"]}"#);
+        assert_eq!(serde_json::from_str::<OrbNode>(&text).unwrap(), two);
+        assert_eq!(two.to_string(), "a,b");
+        // 옛 노드(openraft `BasicNode`)는 첫 링크 하나로 읽는다.
+        let basic: openraft::BasicNode = serde_json::from_str(&text).unwrap();
+        assert_eq!(basic.addr, "a");
+
+        let empty: OrbNode = serde_json::from_value(json!({"addr": "a", "addrs": []})).unwrap();
+        assert_eq!(empty, OrbNode::single("a"));
+        assert_eq!(OrbNode::default().addr(), "");
+        let none = serde_json::to_string(&OrbNode::default()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<OrbNode>(&none).unwrap(),
+            OrbNode::default()
+        );
+    }
+
+    /// 계획 48(ebb8f75)까지 `BasicNode`로 쓴 멤버십 로그 항목·`StoredMembership`·스냅샷 메타를
+    /// 새 노드 타입으로 읽는다.
+    #[test]
+    fn basic_node_membership_formats_still_read() {
+        let n1 = NodeId::from(1);
+        let n2 = NodeId::from(2);
+        let want = BTreeMap::from([
+            (n1, OrbNode::single("10.0.0.1:8007")),
+            (n2, OrbNode::single("10.0.0.2:8007")),
+        ]);
+        let nodes_of = |m: &openraft::Membership<NodeId, OrbNode>| {
+            m.nodes()
+                .map(|(id, n)| (*id, n.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let membership = r#"{"configs":[["00000000-0000-0000-0000-000000000001"]],"nodes":{"00000000-0000-0000-0000-000000000001":{"addr":"10.0.0.1:8007"},"00000000-0000-0000-0000-000000000002":{"addr":"10.0.0.2:8007"}}}"#;
+        let log_id = r#"{"leader_id":{"term":3,"node_id":"00000000-0000-0000-0000-000000000001"},"index":7}"#;
+
+        let entry_text =
+            format!(r#"{{"log_id":{log_id},"payload":{{"Membership":{membership}}}}}"#);
+        let entry: openraft::Entry<TypeConfig> = serde_json::from_str(&entry_text).unwrap();
+        assert_eq!(entry.log_id.index, 7);
+        let openraft::EntryPayload::Membership(m) = &entry.payload else {
+            panic!("not a membership entry: {entry:?}");
+        };
+        assert_eq!(nodes_of(m), want);
+        // 링크 하나는 쓴 바이트도 같다.
+        assert_eq!(serde_json::to_string(&entry).unwrap(), entry_text);
+
+        let stored = format!(r#"{{"log_id":{log_id},"membership":{membership}}}"#);
+        let stored: openraft::StoredMembership<NodeId, OrbNode> =
+            serde_json::from_str(&stored).unwrap();
+        assert_eq!(nodes_of(stored.membership()), want);
+
+        let meta = format!(
+            r#"{{"last_log_id":{log_id},"last_membership":{{"log_id":{log_id},"membership":{membership}}},"snapshot_id":"7-abc"}}"#
+        );
+        let meta: openraft::SnapshotMeta<NodeId, OrbNode> = serde_json::from_str(&meta).unwrap();
+        assert_eq!(meta.snapshot_id, "7-abc");
+        assert_eq!(nodes_of(meta.last_membership.membership()), want);
     }
 
     /// 확인하지 않는 status 쓰기는 예전 형식 그대로다. 확인하는 쓰기는 새 명령이다.

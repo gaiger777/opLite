@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::VoteRequest;
-use openraft::{BasicNode, ServerState, Vote};
-use opl_cluster::types::{LeaderRequest, NodeId};
+use openraft::{ServerState, Vote};
+use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig, FollowClient, FollowFrame, NodeRole};
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, api_cert, node_key_and_csr};
@@ -274,7 +274,7 @@ async fn start(n: usize) -> (ClusterCa, TempDir, Vec<Node>) {
     }
     let members: BTreeMap<_, _> = nodes
         .iter()
-        .map(|n| (n.id(), BasicNode::new(&n.addr)))
+        .map(|n| (n.id(), OrbNode::single(&n.addr)))
         .collect();
     nodes[0].cluster.initialize(members).await.unwrap();
     wait_leader(&nodes).await;
@@ -1104,7 +1104,7 @@ async fn a_panicking_handler_answers_internal() {
         Some(work.handle().clone()),
     )
     .await;
-    let members = BTreeMap::from([(node.id(), BasicNode::new(&node.addr))]);
+    let members = BTreeMap::from([(node.id(), OrbNode::single(&node.addr))]);
     node.cluster.initialize(members).await.unwrap();
     let nodes = [node];
     wait_leader(&nodes).await;
@@ -1501,7 +1501,7 @@ async fn observers_are_peers_but_not_raft_members() {
 
     // 관찰 노드에 온 Raft RPC
     let mut raft = GrpcNetwork::new(nodes[0].peers.clone())
-        .new_client(observer.id(), &BasicNode::new(&observer.addr))
+        .new_client(observer.id(), &OrbNode::single(&observer.addr))
         .await;
     let err = raft
         .vote(

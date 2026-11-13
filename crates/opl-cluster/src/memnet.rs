@@ -8,18 +8,18 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use openraft::Raft;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, Raft};
 
 use crate::cluster::{Cluster, ClusterError, NodeHandle};
 use crate::follow::{FollowClient, FollowFrame};
 use crate::leader::{self, Forwarder};
-use crate::types::{LeaderRequest, NodeId, TypeConfig};
+use crate::types::{LeaderRequest, NodeId, OrbNode, TypeConfig};
 
 /// 전달받은 요청을 리더가 처리하는 최대 시간
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -263,7 +263,7 @@ pub struct MemNetwork {
 impl RaftNetworkFactory<TypeConfig> for MemNetwork {
     type Network = MemConnection;
 
-    async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> MemConnection {
+    async fn new_client(&mut self, target: NodeId, _node: &OrbNode) -> MemConnection {
         MemConnection {
             from: self.from,
             target,
@@ -279,7 +279,7 @@ pub struct MemConnection {
 }
 
 type RpcResult<T, E = openraft::error::Infallible> =
-    Result<T, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>;
+    Result<T, RPCError<NodeId, OrbNode, RaftError<NodeId, E>>>;
 
 impl RaftNetwork<TypeConfig> for MemConnection {
     async fn append_entries(

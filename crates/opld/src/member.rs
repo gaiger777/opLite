@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::serve::ListenerExt;
-use openraft::BasicNode;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
     ApiCertAgent, AppState, AuditLog, BackupJobScheduler, ClusterJanitor, HaManager,
@@ -18,7 +17,7 @@ use opl_api::{
     SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher,
     UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
 };
-use opl_cluster::types::{LeaderRequest, NodeId};
+use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
     CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Members, RoleKeeper, RoleKeeperConfig,
     Typed, VoterKeeper, VoterKeeperConfig, leader_manages_voters,
@@ -406,7 +405,7 @@ impl Member {
             match bootstrap {
                 Bootstrap::Restart => {}
                 Bootstrap::Init { name, ca } => {
-                    let me = BasicNode::new(config.cluster_address());
+                    let me = OrbNode::single(config.cluster_address());
                     cluster.initialize(BTreeMap::from([(id, me)])).await?;
                     password =
                         Some(bootstrap::create_cluster(&cluster, config, &host, &name, &ca).await?);
@@ -1002,7 +1001,7 @@ async fn leader_picks_voters_after_join(cluster: &Cluster) -> bool {
 }
 
 /// 멤버십에 `id`가 있고 그 멤버십까지 저장소에 적용했다(그 전에 더한 노드들의 Node 리소스가 보인다).
-fn membership_applied(m: &openraft::RaftMetrics<NodeId, BasicNode>, id: NodeId) -> bool {
+fn membership_applied(m: &openraft::RaftMetrics<NodeId, OrbNode>, id: NodeId) -> bool {
     m.membership_config
         .membership()
         .nodes()

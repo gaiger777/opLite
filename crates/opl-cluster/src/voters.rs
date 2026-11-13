@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
 use openraft::raft::ClientWriteResponse;
-use openraft::{BasicNode, ChangeMembers, LogId, Raft, RaftMetrics, ServerState};
+use openraft::{ChangeMembers, LogId, Raft, RaftMetrics, ServerState};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::settings::{SETTINGS_NAME, SettingsSpec};
@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::cluster::{Cluster, ClusterError};
-use crate::types::{NodeId, TypeConfig};
+use crate::types::{NodeId, OrbNode, TypeConfig};
 
 /// 이 기능을 아는 노드는 투표 멤버 승격을 리더의 `VoterKeeper`에 맡긴다. 모든 노드가 알면 리더가 상한을 지킨다.
 pub const VOTER_LIMIT: &str = "voter-limit";
@@ -507,7 +507,7 @@ async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) 
                 return;
             };
             let mut next = listed.clone();
-            next.insert(id, node.addr.clone());
+            next.insert(id, node.addr().to_string());
             match write_observers(cluster, info, next).await {
                 Ok(_) => tracing::info!("moving {} out of Raft as an observer", name(id)),
                 Err(e) => tracing::warn!(error = %e, ?change, "cannot list an observer"),
@@ -545,7 +545,7 @@ async fn fix_listed(
     config: &VoterKeeperConfig,
     state: &mut State,
     raft: &Raft<TypeConfig>,
-    m: &RaftMetrics<NodeId, BasicNode>,
+    m: &RaftMetrics<NodeId, OrbNode>,
     info: &ClusterInfo,
     listed: &BTreeMap<NodeId, String>,
     voters: &BTreeSet<NodeId>,
@@ -627,7 +627,7 @@ async fn return_observer(
     };
     let added = tokio::time::timeout(
         config.change_timeout,
-        raft.add_learner(id, BasicNode::new(addr.clone()), false),
+        raft.add_learner(id, OrbNode::single(addr.clone()), false),
     )
     .await;
     match outcome(added) {
@@ -676,7 +676,7 @@ async fn write_observers(
 }
 
 /// 리더가 그 노드에 복제했다고 아는 마지막 로그 인덱스
-fn matched(m: &RaftMetrics<NodeId, BasicNode>, id: NodeId) -> Option<u64> {
+fn matched(m: &RaftMetrics<NodeId, OrbNode>, id: NodeId) -> Option<u64> {
     m.replication
         .as_ref()
         .and_then(|r| r.get(&id).copied().flatten())
@@ -694,7 +694,7 @@ async fn finish_joint(
     cluster: &Cluster,
     config: &VoterKeeperConfig,
     state: &mut State,
-    m: &RaftMetrics<NodeId, BasicNode>,
+    m: &RaftMetrics<NodeId, OrbNode>,
 ) {
     let log_id = *m.membership_config.log_id();
     let now = Instant::now();
@@ -736,7 +736,7 @@ async fn finish_joint(
 }
 
 /// 지금도 리더이고 멤버십 구성이 `m`(계획을 세운 지표)의 것 그대로다.
-fn same_config(cluster: &Cluster, m: &RaftMetrics<NodeId, BasicNode>) -> bool {
+fn same_config(cluster: &Cluster, m: &RaftMetrics<NodeId, OrbNode>) -> bool {
     let Some(raft) = cluster.raft() else {
         return false;
     };
@@ -758,14 +758,14 @@ enum Outcome {
 /// 투표 멤버를 바꾼다. 빠진 투표 멤버는 learner로 남긴다(`retain`).
 async fn change_members(
     raft: &Raft<TypeConfig>,
-    changes: ChangeMembers<NodeId, BasicNode>,
+    changes: ChangeMembers<NodeId, OrbNode>,
     timeout: Duration,
 ) -> Outcome {
     outcome(tokio::time::timeout(timeout, raft.change_membership(changes, true)).await)
 }
 
 type MembershipResult = Result<
-    Result<ClientWriteResponse<TypeConfig>, RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>>,
+    Result<ClientWriteResponse<TypeConfig>, RaftError<NodeId, ClientWriteError<NodeId, OrbNode>>>,
     tokio::time::error::Elapsed,
 >;
 
@@ -781,7 +781,7 @@ fn outcome(result: MembershipResult) -> Outcome {
 }
 
 /// learner가 리더의 마지막 로그를 거의 따라잡았는지(리더의 복제 지표)
-fn caught_up(m: &RaftMetrics<NodeId, openraft::BasicNode>, id: NodeId) -> bool {
+fn caught_up(m: &RaftMetrics<NodeId, OrbNode>, id: NodeId) -> bool {
     let matched = m
         .replication
         .as_ref()

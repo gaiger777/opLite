@@ -289,9 +289,10 @@ pub(crate) mod tests {
 
     use super::*;
     use async_trait::async_trait;
-    use openraft::{BasicNode, ServerState};
+    use openraft::ServerState;
     use opl_cluster::ClusterConfig;
     use opl_cluster::memnet::MemRouter;
+    use opl_cluster::types::OrbNode;
     use opl_driver::{DriverError, Firewall, HostNet, Overlay, OverlayChanges, Tap};
     use opl_types::node::{BridgeInfo, Fencing, NodeHa, NodeUpdates, PoolState};
 
@@ -351,7 +352,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         router.register(id, &cluster);
-        let members = BTreeMap::from([(id, BasicNode::new(id.to_string()))]);
+        let members = BTreeMap::from([(id, OrbNode::single(id.to_string()))]);
         cluster.initialize(members).await.unwrap();
         cluster
             .raft()

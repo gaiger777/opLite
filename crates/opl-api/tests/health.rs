@@ -6,9 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{Client, Env, WAIT};
-use openraft::BasicNode;
 use opl_api::{AppState, RuntimeProbe};
-use opl_cluster::types::NodeId;
+use opl_cluster::types::{NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig, ClusterError};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
@@ -360,7 +359,7 @@ async fn start_observer(env: &Env) -> Arc<Cluster> {
         .unwrap();
     env.router.register(id, &learner);
     env.cluster
-        .add_learner(id, BasicNode::new(&addr))
+        .add_learner(id, OrbNode::single(&addr))
         .await
         .unwrap();
     let mut info = env.cluster.list::<ClusterSpec>().unwrap().1.remove(0);

@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
-use openraft::BasicNode;
 use openraft::error::{
     InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
 };
@@ -20,7 +19,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
+use opl_cluster::types::{LeaderRequest, NodeId, OrbNode, TypeConfig};
 use opl_cluster::{ClusterError, FollowClient, FollowFrame, Forwarder};
 use opl_types::audit::{AuditEntry, AuditQuery};
 use opl_types::metrics::MetricsQuery;
@@ -414,7 +413,7 @@ impl Forwarder for Peers {
     }
 }
 
-/// gRPC로 가는 Raft 네트워크. `Cluster::open`에 넘긴다. `BasicNode.addr`는 노드의 클러스터 주소다.
+/// gRPC로 가는 Raft 네트워크. `Cluster::open`에 넘긴다. `OrbNode::addr()`(첫 링크)는 노드의 클러스터 주소다.
 #[derive(Clone)]
 pub struct GrpcNetwork {
     peers: Arc<Peers>,
@@ -429,10 +428,10 @@ impl GrpcNetwork {
 impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
     type Network = GrpcConnection;
 
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> GrpcConnection {
+    async fn new_client(&mut self, target: NodeId, node: &OrbNode) -> GrpcConnection {
         GrpcConnection {
             target,
-            addr: node.addr.clone(),
+            addr: node.addr().to_string(),
             peers: self.peers.clone(),
         }
     }
@@ -445,11 +444,11 @@ pub struct GrpcConnection {
 }
 
 type RpcResult<T, E = openraft::error::Infallible> =
-    Result<T, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>;
+    Result<T, RPCError<NodeId, OrbNode, RaftError<NodeId, E>>>;
 
 /// 연결하지 못한 것과 권한이 없는 것(멤버에서 빠진 노드)은 `Unreachable`로 돌려 openraft가 잠시
 /// 쉬었다가 다시 시도하게 한다.
-fn rpc_error<E: std::error::Error>(s: Status) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>> {
+fn rpc_error<E: std::error::Error>(s: Status) -> RPCError<NodeId, OrbNode, RaftError<NodeId, E>> {
     if matches!(
         s.code(),
         Code::Unavailable | Code::PermissionDenied | Code::Unauthenticated

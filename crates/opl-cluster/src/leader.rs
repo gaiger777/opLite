@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
 use openraft::raft::ClientWriteResponse;
-use openraft::{BasicNode, ChangeMembers, Raft, RaftMetrics};
+use openraft::{ChangeMembers, Raft, RaftMetrics};
 use opl_types::cluster::ClusterStatus;
 use opl_types::resource::Kind;
 use redb::Database;
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::cluster::ClusterError;
 use crate::lease::{ConfirmBatch, LeaseTable};
 use crate::store::list_objects;
-use crate::types::{Command, LeaderRequest, NodeId, Rejection, Response, TypeConfig};
+use crate::types::{Command, LeaderRequest, NodeId, OrbNode, Rejection, Response, TypeConfig};
 use crate::vip::VipTable;
 
 /// learner가 로그를 따라잡기를 기다리는 최대 시간. 스냅샷을 받아야 하면 오래 걸린다.
@@ -129,7 +129,7 @@ pub(crate) async fn execute(
         }
         LeaderRequest::AddLearner { id, addr } => {
             retry_in_progress(timeout, || {
-                raft.add_learner(id, BasicNode::new(addr.clone()), false)
+                raft.add_learner(id, OrbNode::single(addr.clone()), false)
             })
             .await
         }
@@ -195,7 +195,7 @@ pub(crate) async fn execute(
 /// 노드를 멤버십에서 뺀다(learner로 남기지 않는다). 멤버십에 없으면 `None`이다.
 async fn remove_member(
     raft: &Raft<TypeConfig>,
-    m: &RaftMetrics<NodeId, BasicNode>,
+    m: &RaftMetrics<NodeId, OrbNode>,
     id: NodeId,
     deadline: tokio::time::Instant,
 ) -> Result<Option<u64>, ClusterError> {
@@ -296,7 +296,7 @@ where
     Fut: Future<
         Output = Result<
             ClientWriteResponse<TypeConfig>,
-            RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>,
+            RaftError<NodeId, ClientWriteError<NodeId, OrbNode>>,
         >,
     >,
 {
@@ -322,12 +322,12 @@ where
 
 /// 이 노드가 아는 리더와 그 주소로 `NotLeader`를 만든다. openraft의 `change_membership`은
 /// 리더인지 보기 전에 변경을 검사하므로, 팔로워에서는 `ForwardToLeader` 대신 검사 오류가 날 수 있다.
-pub(crate) fn not_leader(m: &RaftMetrics<NodeId, BasicNode>) -> ClusterError {
+pub(crate) fn not_leader(m: &RaftMetrics<NodeId, OrbNode>) -> ClusterError {
     let leader_addr = m.current_leader.and_then(|l| {
         m.membership_config
             .membership()
             .get_node(&l)
-            .map(|n| n.addr.clone())
+            .map(|n| n.addr().to_string())
     });
     ClusterError::NotLeader {
         leader_id: m.current_leader,
