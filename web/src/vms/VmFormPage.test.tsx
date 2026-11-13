@@ -712,8 +712,42 @@ it("sets the HA state, group and counts", async () => {
   });
 });
 
+it("sets the recovery priority and the guest watch", async () => {
+  const bodies = editStoppedApp();
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("switch", { name: "High availability (HA)" }));
+  const priority = screen.getByLabelText("Recovery priority");
+  expect(priority).toHaveValue(50);
+  await user.clear(priority);
+  await user.type(priority, "101");
+  // 초 칸은 감시를 켤 때만 보인다(기본 60초).
+  expect(screen.queryByLabelText("Seconds without an answer")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("switch", { name: "Restart when the guest hangs" }));
+  const secs = screen.getByLabelText("Seconds without an answer");
+  expect(secs).toHaveValue(60);
+  await user.clear(secs);
+  await user.type(secs, "5");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  expect(screen.getByText("From 0 to 100.")).toBeInTheDocument();
+  expect(screen.getByText("From 30 to 3600 seconds.")).toBeInTheDocument();
+  expect(bodies).toHaveLength(0);
+  await user.clear(priority);
+  await user.type(priority, "90");
+  await user.clear(secs);
+  await user.type(secs, "30");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  expect(bodies[0]?.spec.ha).toEqual({
+    state: "started",
+    max_restart: 1,
+    max_relocate: 1,
+    priority: 90,
+    guest_watch: { timeout_secs: 30 },
+  });
+});
+
 it("keeps the HA policy of a VM when other fields change", async () => {
-  // 폼에 칸이 없는 우선순위·게스트 감시도 그대로 보낸다.
+  // 고치지 않은 우선순위·게스트 감시도 그대로 보낸다.
   const policy = {
     state: "stopped",
     group: "gone",

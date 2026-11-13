@@ -1328,3 +1328,204 @@ VM에서 손으로 확인하고 결과를 적는다.
   ACPI 종료.
 - 웹은 새 watch 종류 두 개를 늘 읽으므로, 앞단 프록시가 업그레이드 중 옛 API 노드로 요청을 보내면 그 노드의 404로 실시간
   연결이 다시 시도를 되풀이한다(같은 노드의 내장 웹 UI는 해당 없음; 이전 계획의 새 종류도 같았다).
+
+## 18. 구현(계획 51)
+
+일곱 단계를 커밋 일곱으로 했다(1 빠른 리스 프로필과 복구 시간 측정, 2 HA 정책 필드·클러스터 설정과 HA 용량 예약, 3 우선순위·
+병렬 복구와 미리 고른 복구 노드, 4 펜싱 설정 `NodeFence`·전원 끄기 실행기·`fence-test`, 5 리더의 전원 끄기 펜싱과 이웃 확인,
+6 같은 노드 빠른 재시작과 게스트 멈춤 감지, 7 웹·문서). 설계 §8.1과 다르거나 설계가 정하지 않아 정한 것을 적는다.
+
+**프로필과 경고(단계 1).**
+- opld `[ha] profile = "fast"|"safe"`(기본 `fast`): `fast` = `fence_after_secs` 10·`watchdog_timeout_secs` 10, `safe` = 30·30(옛
+  값). 두 값은 `Option<u64>`이고 적으면 프로필을 이긴다(`HaSection::fence_after_secs()`·`watchdog_timeout_secs()`가 실제 값).
+  `RECOVER_MARGIN_SECS` 5 → 2(두 프로필 모두). 갱신 간격 규칙(`fence_after/10`, 0.2~2초)은 그대로라 `fast`면 1초. 그래서
+  `recover_after`는 `fast` watchdog 22초·process 12초, `safe` 62초(process 32초). **업그레이드하면 `[ha]`를 적지 않은 노드가
+  `fast`가 된다**(README에 적고 옛 동작은 `profile = "safe"`).
+- 설계의 "둘 중 하나를 끈 설정"의 뜻: 계획 45 실행기 격리는 끄는 설정이 없어 늘 켜진 것으로 본다. 실제 `fence_after`가 30초
+  미만이고 펜싱이 켜졌을 때 (a) 클러스터 링크가 하나(`cluster_links().len() < 2`, 계획 49를 안 씀), (b) `fencing = "watchdog"`인데
+  `NOTIFY_SOCKET`이 없음(systemd 밖)이면 시작 로그에 `warn`하고 `profile = "safe"`를 권한다(`opld::config::ha_warnings`, 시작은
+  막지 않음).
+- `NodeHa.fence_after_secs: Option<u64>`(비면 쓰지 않음, 계획 51 노드인지와 리더의 전원 끄기 시점에 씀).
+- 유닛: `RestartSec=5` → `2`, `[Unit] StartLimitIntervalSec=60`·`StartLimitBurst=10`(2초 간격이 기본 시작 제한 10초 5번에 걸리지
+  않게). systemd `WatchdogSec=30s`는 그대로다 — `core`가 `fence_after`(10초)보다 오래 막히면 리스가 먼저 끝나 HA 펜싱이 데몬 재시작보다
+  먼저 온다. 장치 제한 10초에서 데몬 재시작이 다시 arm하기까지의 여유는 `RestartSec`을 빼고 약 8초다(README "HA watchdog과의 관계").
+- 시험 고리: opl-peer 기능 `fault-it`(전역 `AtomicBool`, 켜지면 `Peers`의 모든 보내기와 `PeerService::authorize`의 모든 받기가
+  `unavailable`, `opl_peer::fault::{isolate, heal, isolated}`), `ha-it` 빌드의 제어 소켓 `POST /v1/test/isolate`·`/v1/test/heal`.
+  실제 프로세스를 망에서 떼는 방법이 없어서다.
+- **잰 복구 시간**(`ha-it` `recovery_takes_at_most_25s_with_the_default_profile`, 이 Mac, `fast` + process 펜싱, 디스크 없는 VM,
+  리스 끊김부터 대상 노드 QEMU 시작까지): kill -9 12.3초, 망 끊기(`isolate`) 12.4초, SIGSTOP 12.8초. 시험은 25초 이하를 본다.
+  회차마다 리더가 아닌 노드를 장애 노드로 고르고 VM을 새로 만든다(같은 호스트의 공유 디렉터리 디스크는 SIGSTOP한 QEMU가 이미지
+  잠금을 쥐어 다른 노드가 켤 수 없으므로 디스크 없는 VM). 전원 끄기 펜싱 시험(단계 5)은 `recover_after`를 310초로 늘린 노드를
+  망에서 떼어 `fence_after`(10초) + 끄기·확인 뒤 옮기는지 본다.
+
+**정책 필드와 클러스터 설정(단계 2).**
+- `VmHa.priority: u8`(0~100, 기본 50, 클수록 먼저)와 `VmHa.guest_watch: Option<GuestWatch { timeout_secs: u32 }>`(30~3600, 기본 60
+  — 리뷰 뒤 최솟값 10 → 30). 둘 다 **기본값이면 쓰지 않아** 기본 정책은 계속 `true`, 계획 50의 정책 객체는 바이트까지 그대로다. 범위 밖은
+  `ValidationError::HaPriority`·`GuestWatch`(400), 기본이 아니면 `require_feature(FAST_HA)`(409 `cluster_upgrading`).
+- 기능 이름 `fast-ha`(`FEATURES` 끝, `opl_types::node::FAST_HA`) 하나가 이 계획의 새 모양을 모두 가린다: 기본이 아닌
+  `ha.priority`·`ha.guest_watch`, 설정 `ha_reserve`·`ha_start_concurrency`, 새 종류 `NodeFence` 쓰기, 기록 Task `node-power-off`,
+  이웃 확인 RPC 부르기. `NodeHa.fence_after_secs`·`NodeStatus.fence_check`는 옛 노드가 무시하므로 가리지 않는다. 받은 백업의
+  `vm_spec`은 `fast-ha`를 모르는 노드가 있으면 우선순위·감시만 기본으로 낮춘다.
+- **용량 예약은 클러스터 설정이다**(설계는 위치를 정하지 않음): `SettingsSpec.ha_reserve: Option<HaReserve::{Nodes(1~8), Percent(1~90)}>`
+  (없음 = `none`, 쓰지 않음)와 `ha_start_concurrency: Option<u8>`(1~32, 없으면 4, 쓰지 않음). 리더가 쓰는 값이라 노드마다의
+  `[ha]`가 아니다. `SettingsPatch`의 `ha_reserve`는 `"none"`으로 지운다.
+- **용량 셈(설계와 다름).** 설계는 "노드 N대가 죽어도 모든 HA VM이 들어갈 자리"였으나 조합을 다 보지 않고 메모리 합으로 센다
+  (VMware 백분율 방식): 대상 노드 = HA 가능·온라인·유지보수 아님·종료 표시 없음, `capacity` = 그 노드들의 메모리 합, `reserve` =
+  `nodes: N`이면 가장 큰 N대의 합(N이 노드 수보다 크면 전부), `percent: P`면 `capacity × P / 100`, `used` = 그 노드들에 자리 잡은
+  **모든** VM(HA 아닌 VM 포함, 마이그레이션 중이면 원본 한 번)의 메모리 합. `started` HA VM을 켜는 요청만 `used + vm ≤ capacity −
+  reserve`를 보고 넘으면 409 `ha_capacity`(`details { capacity_mib, reserve_mib, used_mib, need_mib }`): 켠 채 만들기, 꺼진 →
+  켜짐 고치기, 켜진 HA VM 메모리 늘리기, 꺼진 VM start. **마이그레이션("옮기기")은 합이 바뀌지 않아 보지 않는다**(설계와 다름),
+  HA 복구·되돌아가기도 보지 않는다. 함수 `opl_api::scheduler::ha_capacity(inv, settings, vm) -> Result<(), HaCapacity>`(단위 시험).
+
+**우선순위·병렬 복구와 미리 고른 노드(단계 3).**
+- `recover_node`가 VM을 `priority` 높은 것 → 이름 순으로 옮긴다(`recovery_order`). 대상 노드마다 "이 리더가 옮겼고 아직 그
+  노드에서 `Running`이 아닌" VM이 `ha_start_concurrency`개면 그 노드로는 더 옮기지 않는다. 미리 고른 대상이 상한이면 그 자리에서
+  `pick`으로 다시 고르고(다른 노드가 나오면 그리로 옮긴다), 고른 노드가 상한이면 다음 후보 노드는 쓰지 않는다(그 VM은 죽은
+  노드에 남아 다음 틱에 다시 본다 — 그 노드에서 순서를 지킴). 진행 중 기록은 리더 메모리 `Starting { target → { vm → 옮긴 때 } }`이고
+  그 노드에서 Running, 다른 노드·꺼짐, 120초(`HA_START_TIMEOUT`)면 뺀다. 리더가 바뀌면 비어 한 번 넘칠 수 있다(받아들임).
+  상한은 틱마다 설정에서 읽고 읽지 못하면 그 틱은 복구하지 않는다.
+- 미리 고르기: 복구할 노드가 없는 틱에서 `HaManagerConfig.plan_every`(10초)마다 노드 N마다 `Assign`에서 N의 VM을 빼고 N의
+  `recoverable` VM을 같은 순서로 `pick`(eligible = N 아님·리스 살아 있음, `placement::best` — 계획 53이 점수를 바꾸면 따라감)해
+  `Plans { at, targets }`(메모리, Raft 아님)에 둔다. 복구 때 계획이 있고(30초 = `plan_every`×3보다 새 것) 그 대상이 지금도
+  eligible·`node_fits`·`hard_violations` 없음·상한에 걸리지 않음이면 그대로 쓰고, 아니면 그 자리에서 `pick`. debug 로그에 계획을
+  쓴 수·다시 고른 수. 설계의 "복구 때 스케줄링 계산을 기다리지 않는다"는 지금 규모에서 `pick` 자체가 밀리초라 시간 차이는 작고,
+  주로 같은 결과를 미리 확인해 두는 자리다(계획 53의 무거운 점수 함수에서 의미가 커짐).
+
+**펜싱 설정과 실행기(단계 4).**
+- **자리 — 새 종류 `NodeFence`(설계와 다름).** 설계는 노드 스펙 `fence`였으나 `NodeSpec`이 `deny_unknown_fields`라 옛 노드가
+  Node 기록을 풀지 못해 노드 목록 전체가 깨진다(계획 50 노드 태그와 같은 문제). `Kind::NodeFence`(`node-fence`, id = 노드 id,
+  이름 = 노드 이름), `NodeFenceSpec { methods: Vec<FenceMethod> }`(1~4개, `deny_unknown_fields`), `FenceMethod::{Ipmi, Redfish,
+  Command}`(`kind`로 나뉨). 노드 삭제가 함께 지운다(있을 때만).
+- **비밀값 — `password_secret` 대신 `password`(설계와 다름).** 따로 된 비밀 저장소가 없어 realm·원격과 같은 지금 방식: 스펙에
+  그대로 두되 API는 내보내지 않고 `has_password`만, watch로도 내보내지 않고 `Debug`가 가린다. `PUT`에서 빼면 같은 종류·주소·
+  사용자의 저장된 값을 유지(대상을 바꾸고 빼면 400), 빈 글이면 지운다. 읽기·쓰기 모두 관리자, 위트니스는 400, 쓰기는
+  `require_feature(FAST_HA)`.
+- 방법: `ipmi { address, port = 623, user, password, lanplus = true }` → `ipmitool [-I lanplus] -H -p -U -E chassis power
+  off|status`(비밀번호는 `IPMI_PASSWORD`), "Chassis Power is off"면 꺼짐. `redfish { url, user, password, system_id?, ca_pem?,
+  insecure = false }` → Basic 인증, `system_id`가 없으면 `/redfish/v1/Systems`의 멤버가 하나일 때 그것, `ForceOff`, `PowerState`;
+  `http://`도 받음(가짜 서버 시험). `command { off, status }` → `/bin/sh -c`, 환경 `ORBIVISOR_NODE_NAME`·`_ID`·`_ADDRESS`, `status`의
+  첫 줄이 `off`/`on`(그 밖은 모름).
+- 실행기 `opl_api::power_fence`: 트레이트 `PowerFence { off, status }`, 실제 `Fencer { ipmitool, timeout }`(명령·HTTP 하나 15초
+  `FENCE_CALL_TIMEOUT`, `kill_on_drop`), `power_off(fence, node, spec) -> PowerOff::{Off { method }, Failed(Vec<String>)}`(방법을
+  차례로: off → 1초마다 status를 15초 `FENCE_CONFIRM_TIMEOUT`까지 → 꺼짐이면 끝, 아니면 다음), `check(…)`. `AppState.fence`, opld
+  `[ha] ipmitool`(기본 PATH의 `ipmitool`). 새 크레이트 없이 `reqwest`·`tokio::process`.
+- API `GET|PUT|DELETE /nodes/{key}/fence`(응답 `NodeFenceView`), `POST /nodes/{key}/fence-test`(→ `{ checked_by, methods }`, API
+  노드가 그 노드가 아니면 스스로, 그 노드면 이웃 RPC; 409 `no_fence_checker`, 502 `fence_check_failed`). 피어 RPC `FenceStatus`
+  (`FenceSource`, `PeerService::with_fence`, `work` 실행기; 옛 노드는 None).
+- 걱정이던 `command` 방법의 손자 프로세스는 리뷰 뒤 프로세스 그룹으로 끝낸다(아래).
+
+**리더의 전원 끄기와 이웃 확인(단계 5).**
+- `HaManager`의 메모리 시도 기록(노드 → 시작·임기·결과). 틱에서 노드가 HA 가능·`NodeFence` 있음·`NodeHa.fence_after_secs`가 있음
+  (계획 51 노드)·얼리지 않음·켜기로 된(`spec.power == Running`) HA 활성 VM 있음·`lease_age ≥ fence_after`면 한 번 `power_off`를 따로 `tokio::spawn`한다(틱을
+  막지 않음). `Off`면 확인 시각을 적고 노드는 "꺼짐 확인 뒤 받은 갱신이 없으면" 죽은 것으로 본다 — `dead()`가 `expired`
+  (`lease_age ≥ recover_after`) `|| (확인됨 && 마지막 갱신 < 확인 시각)`이고 `recover_node`의 다시 보기도 같다. `Failed`면 warn과 기록 Task,
+  이 임기에는 다시 시도하지 않고 `recover_after`(watchdog 기다림)로 물러난다. 리스가 다시 살아나면 기록을 지우고, 임기가 바뀌거나
+  리더를 잃으면 비운다. 끄는 중·끈 노드는 복구 대상·미리 고르기·동시 시작 계산에서 뺀다.
+- 기록 Task `TaskOp::NodePowerOff { method: Option<FenceKind>, reason }`(target = 노드, `succeeded`/`failed`, 실패 이유는
+  `status.error`에 `; `로, 실행하지 않음), 모든 노드가 `fast-ha`일 때만 쓴다.
+- `HaManager::power_off(node, reason)`(pub, 채널로 루프에 넣음): 계획 52의 상태 검사가 부르고 확인되면 같은 경로로 복구된다.
+  자기 자신·`NodeFence` 없는 노드·이 임기에 이미 시도한 노드면 로그만, 리더가 아니면 버린다. 이 계획에서는 opl-api 시험만
+  부른다.
+- 이웃 확인: opld `FenceWatch`(`work`)가 등록 뒤 곧바로, 그 뒤 1시간(`FENCE_CHECK_INTERVAL`)마다, 자기 `NodeFence` revision이
+  바뀌면(60초마다 봄) 이웃 하나(`opl_types::fence::neighbour`: 온라인·위트니스 아님·`fast-ha`인 다른 노드 가운데 id 순으로 다음,
+  끝이면 처음)에게 RPC를 보내 `NodeStatus.fence_check: Option<FenceCheck { at, by, error }>`에 `UpdateStatusIf`로 쓴다. 모든 방법이
+  읽지 못했으면 `error`가 있고 이것이 `fence_unreachable`(`NodeStatus::fence_unreachable()`)다. 이웃이 답하지 않으면 기록 없이
+  1분 뒤 다시. `NodeFence`가 없으면 `None`, 이웃이 없으면 확인하지 않음. 등록(`record_node`)은 이 필드를 지킨다. 설계는
+  "시작 때"였으나 등록 뒤(노드 목록·피어가 있어야 함)다.
+- 시험 고리 `[test] recover_margin_secs`(그 노드의 `recover_after`를 늘려 전원 끄기가 기다림 없이 복구하는지 봄).
+
+**같은 노드 빠른 재시작과 게스트 감시(단계 6).**
+- `started` HA VM의 창 안 첫 크래시는 지연 0으로 다시 켠다(`FailureTracker::record_first_free`, 둘째부터 지금 백오프). 설계의
+  "1초 안에"는 감지(QMP 이벤트) + 0초다. 시험은 `MockHypervisor`와 멈춘 시간으로 "크래시 → 시작 호출 < 1초".
+- `guest_watch`가 있는 VM만 QGA 채널을 단다(`VmRuntimeSpec.guest_agent`, `resolve.rs`의 공통 함수, 받는 쪽 같음): `-chardev
+  socket,id=qga0,path=<run>/vm/<id>/qga.sock,server=on,wait=off -device virtio-serial-pci,id=qgaser -device
+  virtserialport,bus=qgaser.0,chardev=qga0,name=org.qemu.guest_agent.0`(두 아키텍처 모두 `virtio-serial-pci`, NIC 뒤·`-vnc` 앞).
+  모든 VM에 달면 장치가 바뀌어 옛 노드와의 마이그레이션이 깨지기 때문이다. 같은 까닭으로 감시는 멈춘 VM에서만 켜고 끈다(리뷰 뒤,
+  아래).
+- `opl_qemu::qga::ping(path, timeout)`(`guest-sync-delimited` 뒤 `guest-ping`), `Hypervisor::guest_ping(id) -> Result<bool>`(QEMU
+  3초, 채널 없으면 `InvalidSpec`), `MockHypervisor::set_guest_agent(id, GuestAnswer)`. 작업자가 `started`+`guest_watch` VM이 QMP
+  `running`일 때만 `ReconcilerConfig.guest_ping_interval`(5초)마다 부르고, 이 QEMU에서 한 번 답한 뒤에야 감시한다(메모리). 마지막
+  답에서 `timeout_secs`가 넘으면 `last_error = "guest agent did not answer for Ns; restarting"`, 강제 끄기 = 크래시 한 번
+  (`max_restart`를 넘으면 계획 50의 옮기기). 일시 정지·마이그레이션 중에는 세지 않고, pid가 바뀌거나 꺼지면 초기화한다.
+
+**보이기(단계 7).**
+- CLI(단계 2~5): `settings set ha_reserve=none|nodes:N|percent:P`·`ha_start_concurrency=N`, `vm create|set --ha-priority N
+  --guest-watch SECS|--no-guest-watch`, `node fence get|set -f FILE(- = stdin)|delete <node>`, `node fence-test <node>`,
+  `node list`의 `FENCE` 열(`-`·`ok`·`unreachable`).
+- 웹: 노드 화면 "펜싱" 열 아래 `status.ha.recover_after_secs`("N초 뒤 복구")와 `fence_check.error`가 있으면 "전원 펜싱 닿지
+  않음" 배지(제목에 이유). 노드 메뉴 "전원 끄기 펜싱…"(위트니스 제외, admin — 노드 쓰기 권한이 admin뿐): 방법 목록 더하기·빼기·
+  위아래, 종류별 칸, 비밀번호는 비우면 저장된 값 유지(`has_password`면 안내), 저장 `PUT`(연 설정의 revision으로 If-Match), "펜싱
+  지우기" `DELETE`, "시험" = `fence-test` 결과 표(저장된 설정만 시험하므로 고친 뒤에는 막음, 404면 빈 목록으로 시작). 지우기는
+  확인 대화상자 없이 곧바로다(설정만 지우고 다시 만들 수 있음). VM 폼 HA 절에 "복구 우선순위"(0~100)·"게스트가 멈추면 다시
+  켜기"(스위치 + 초, 30~3600, 끄면 초는 남김)와 폼 검증, VM 상세 요약에 "HA 복구 우선순위"·"게스트 에이전트 감시". 설정 "HA 용량"
+  절(예약 없음·가장 큰 노드 N대·메모리 P%, 대상 노드당 동시 시작 — 저장은 두 값을 함께 보냄). `ha_capacity`는 `errorMessage`가
+  `details`로 "… {need}가 필요한데 예약 {reserve}를 빼면 {capacity} 가운데 {free}만 남았습니다." 문구를 만든다(`details`가 없으면
+  앞 문장만). Task 이름 `node-power-off`, `nodes.fence.errors`의 `no_fence_checker`·`fence_check_failed` 문구.
+- README "HA VM과 자기 펜싱": 프로필·기본값 표, 업그레이드 때 기본이 바뀌는 것, 시작 경고 두 가지, 갱신 1초, 전원 끄기 펜싱(종류·
+  환경 변수·`ipmitool`·비밀값·순서·실패하면 watchdog 기다림·리더가 BMC에 닿아야 함·이웃 확인·`fence-test`), 우선순위·동시 시작·
+  미리 고른 노드, 용량 예약(셈, HA 아닌 VM도 셈, 마이그레이션 안 봄), 같은 노드 빠른 재시작, 게스트 감시. "제어부 가용성"의
+  `RestartSec=2`와 장치 제한 10초 안의 다시 arm 여유. 30·30·65초가 적힌 곳을 고쳤다.
+- `ha-it` `an_ha_vm_recovers_to_the_next_group_node_and_fails_back`의 정리 단계가 되돌아가기 마이그레이션 Task가 끝나기 전에
+  `vm stop`을 보내 `vm_busy`로 한 번 실패했다 — VM이 B에서 돈 뒤에도 그 Task가 `succeeded`가 될 때까지 기다리게 했다(시험만).
+
+**1차 리뷰 뒤 고친 것.**
+- 리스 값을 키운 노드(`fast` → `safe`, process → watchdog, 펜싱을 새로 켬)는 키운 `NodeHa`를 노드 기록에 쓰기 전에는 `HaGuard`가
+  `arm`을 거절한다(`ArmError::Unrecorded` — HA VM을 켜거나 붙이지 않고 다시 본다, `opld::bootstrap::ha_raised`; 2차 리뷰 뒤로는
+  `status.ha`만 먼저 쓰면 풂 — 아래).
+  리더가 옛 짧은 `recover_after`로 옮기는 동안 이 노드가 HA VM을 이어 돌리지 않게 한다. 같거나 작아지면 지금처럼.
+- 게스트 감시: QMP `RESET`과 QEMU가 산 채 받은 `SHUTDOWN`을 `EventKind::Reset`으로, `STOP`·`RESUME`을 `EventKind::PauseChanged`로
+  알린다(QGA 소켓이 있는 VM만 — 다른 VM의 이벤트 흐름은 그대로). 작업자는 `Reset`이면 `answered_once`를 지우고(에이전트가 다시 답할
+  때까지 감시 안 함) 둘 다 `seen_at`을 비운다. 놓친 이벤트에 대비해 최솟값 30초. 게스트 이벤트는 마이그레이션 보류 중의 이벤트
+  자리를 덮지 않고, 작업자 없는 VM의 HA 실행 표시도 바꾸지 않는다.
+- 켜진 VM의 수정에서 `guest_watch`의 있음/없음이 바뀌면 409 `vm_running`(HA를 통째로 끄는 것도 — 장치가 바뀐다; 감시를 둔 채
+  HA만 멈추려면 `state: ignored`). 시간만 바꾸기는 된다.
+- 전원 끄기는 켜기로 된 HA 활성 VM이 있는 노드만(꺼진 `state: stopped` VM만 있는 노드는 `recover_after` 뒤 자리만 옮김). 끄기
+  요청이 실패해도 같은 방법으로 상태를 한 번 읽어 `Off`면 꺼진 것(이미 꺼진 노드에 409를 주는 BMC, 끊긴 호스트).
+- 미리 고르기 계산은 `spawn_blocking`(복제한 `Inventory`·`Leases`)으로 core 실행기 밖에서 하고 결과는 다음 틱에 받는다(계산 중엔
+  새로 시작하지 않음, `Planner`). 노드별 사용 메모리를 계획 한 번에 미리 세는 것은 `placement` 공용 함수를 바꿔야 해 하지 않았다.
+- 명령(ipmitool·command)은 자기 프로세스 그룹(`process_group(0)`)에서 돌고, 제한 시간으로 버려지면 그룹째 `killpg(SIGKILL)`한다.
+  끝남은 `wait()`로 보고 출력은 그 뒤 1초만 기다린다(파이프를 쥔 백그라운드 자식). `PR_SET_PDEATHSIG`는 쓰지 않았다 — `pre_exec`
+  (unsafe)가 필요하고, tokio에서는 부른 스레드가 끝날 때 신호가 가며, 직계 자식만 덮는다.
+- Redfish: 프록시 환경 변수를 따르지 않음(`no_proxy`), URL에 자격 증명이면 400, `Members[].@odata.id`가 `url`과 다른 출처면 오류.
+  `command` 방법의 실패 출력은 오류(작업·`fence_check`·`fence-test`)에 담지 않고 종료 상태만(출력은 경고 로그). 오류 문구는 2차
+  리뷰 뒤 더 줄였다(아래).
+- 이웃 확인이 3번 이어 실패하면 `fence_check.error = "no neighbour could check the fence: …"`(`by`는 빈 글). 부탁할 이웃이 없는
+  것은 세지 않는다.
+- `ha_capacity`의 `used`에 유지보수(비우기)·종료 중(얼리기 빼고) HA 가능 노드의 켜진 `started` HA VM을 센다(곧 옮겨 옴).
+- 복구 로그는 실제로 옮긴 틱에만 warn(아니면 debug). 웹 펜싱 대화상자 "저장된 비밀번호 지우기", `node fence set -f`가 `get --json`
+  출력을 받음. README: `command`가 어디서 도는지(`off` 리더, `status` 이웃·API 노드·리더), 재시작 여유의 `ExecStopPost`, process
+  펜싱 여유 2초, 게스트 재부팅.
+
+**2차 리뷰 뒤 고친 것.**
+- 리스 값을 키운 노드는 전체 등록(`register_node`, underlay 이름 풀기 포함)을 기다리지 않고 `status.ha`만 먼저 쓴 뒤
+  붙들기를 푼다(`opld::bootstrap::record_raised_ha`, 시도마다 2초 제한, 0.5초마다 다시). 등록의 underlay 이름 풀기에도 2초
+  제한. 이전 프로세스가 켜 둔 watchdog을 다시 arm하지 못한 채 등록이 DNS에 묶여 호스트가 재시작되지 않게 한다.
+- 복구·미리 고르기 대상은 리스 나이 < 그 노드의 `fence_after`(알리지 않는 옛 노드는 `recover_after`)인 노드만(`ready`). 두 노드가
+  함께 죽고 한쪽만 꺼짐을 확인했을 때 다른 죽은 노드(아직 `recover_after` 전)로 옮기지 않는다.
+- 리스 만료 전원 끄기는 리더 자신의 리스(`leases.renewed[me]`)가 `fence_after`보다 새로울 때만 한다 — 갱신 기록이 없으면 끄지
+  않는다(리더 쪽 문제로 갱신이 멈추면 모든 노드의 리스가 함께 끝나 보임). 한 임기에 끄기를 시작하는 노드는 HA 가능 노드의 소수
+  (`(n - 1) / 2`, 적어도 1)까지(`power_off(node, reason)` 요청도 셈), 넘으면 경고 한 번 뒤 watchdog 기다림.
+- 끄기 실패가 watchdog 기다림으로 이미 옮긴 뒤에 오면 경고·기록 Task 오류가 "power off failed; the node's VMs were already
+  recovered after the watchdog wait: …".
+- 메모리 스냅샷의 `guest_watch` 있음/없음이 지금과 다르면 되돌리기를 409 `snapshot_mismatch`로 거절(QGA 장치가 달라
+  `snapshot-load`가 실패하므로).
+- `command` 방법은 자식 환경을 비우고 `PATH`와 `ORBIVISOR_NODE_*`만 넘긴다. 이 방법이 admin에게 모든 노드의 root 명령 실행을 주는
+  셈임을 README에 적었다.
+- Redfish `system_id`는 `[A-Za-z0-9._-]`만(`.`·`..` 거절), `url`은 scheme·호스트·포트뿐(경로·쿼리·조각 400, `FenceError::UrlPath`).
+- 실행기 오류(`fence_check.error`·`node-power-off` Task·`fence-test`)는 방법 종류와 일반 이유만: `ipmitool`·`command`는 종료 상태,
+  Redfish는 HTTP 상태나 "connection failed"·"timed out", 시스템 찾기 오류도 BMC 호스트 없이. 호스트·stderr는 경고 로그에만.
+  `fence-test`(admin 전용)도 같은 실행기라 같은 문구다(자세한 것은 그 노드의 로그).
+- 비밀번호 유지 조건(포트, Redfish `ca_pem`·`insecure`)을 400 문구와 README에, `oplctl node fence set -f`가 입력 파일의 `revision`을
+  `If-Match`로 보낸다. README에 `ha_capacity` 거절 경우(켜진 VM의 HA를 `started`로)와 전원 끄기 시간(방법 하나 최대 약 45초,
+  watchdog 기다림과 나란히)을 더했다.
+
+**남은 것.**
+- 리스 갱신이 1초로 늘어 커진 리더 부하로 계획 47의 규모 시험 표를 다시 잰다. 미리 고르기 계산(HA VM × 노드 × VM)의 시간도
+  svc01 규모 시험 뒤 잰다.
+- 복구 우선순위는 한 노드 안에서만 지킨다 — 여러 노드가 함께 죽으면 노드 순서대로 옮긴다.
+- 게스트 감시의 `guest_ping`(최대 3초)은 그 VM의 작업자를 붙잡는다(그동안 그 VM의 다른 맞추기가 늦다).
+- 리뷰가 짚은 CI의 `fault-it`(`isolate`) 시험 문제는 건너뛰었다(이 계획의 검증은 `ha-it`을 Mac에서 돌림).
+- 계획 52의 상태 검사 → `HaManager::power_off`, 계획 53 점수로 미리 고른 노드, 꺼진 `started` HA VM의 노드 옮기기, 종료
+  failover의 빠른 복구.
+- 실제 BMC(IPMI·Redfish)와 진짜 watchdog 10초에서의 데몬 재시작 여유는 자동 시험이 없다(가짜 `ipmitool`·Redfish 서버·
+  `process` 펜싱만).

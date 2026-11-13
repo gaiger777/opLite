@@ -592,3 +592,75 @@ it("says the cluster is upgrading when old nodes do not know shutdown policies",
     "The cluster is being upgraded: node n2 does not support ha-placement yet",
   );
 });
+
+it("reserves HA capacity and sets the concurrent starts", async () => {
+  const sent: unknown[] = [];
+  server.use(
+    http.get(apiUrl("/settings"), () => HttpResponse.json(DEFAULT)),
+    http.patch(apiUrl("/settings"), async ({ request }) => {
+      const body = (await request.json()) as {
+        ha_reserve: { nodes: number };
+        ha_start_concurrency: number;
+      };
+      sent.push(body);
+      return HttpResponse.json({
+        ...DEFAULT,
+        revision: 5,
+        spec: {
+          ...DEFAULT.spec,
+          ha_reserve: body.ha_reserve,
+          ha_start_concurrency: body.ha_start_concurrency,
+        },
+      });
+    }),
+  );
+  renderPage(<SettingsPage />);
+  // 저장하지 않은 기본: 예약 없음, 동시 시작 4
+  const reserve = await screen.findByLabelText("Capacity reserved for HA recovery");
+  expect(reserve).toHaveValue("none");
+  const concurrency = screen.getByLabelText("Concurrent starts per target node");
+  expect(concurrency).toHaveValue(4);
+  const save = screen.getByRole("button", { name: "Save HA capacity" });
+  expect(save).toBeDisabled();
+  await userEvent.selectOptions(reserve, "nodes");
+  const nodes = screen.getByLabelText("Nodes (1–8)");
+  await userEvent.clear(nodes);
+  await userEvent.type(nodes, "9");
+  await userEvent.clear(concurrency);
+  await userEvent.type(concurrency, "0");
+  await userEvent.click(save);
+  expect(screen.getByText("From 1 to 8.")).toBeInTheDocument();
+  expect(screen.getByText("From 1 to 32.")).toBeInTheDocument();
+  expect(sent).toEqual([]);
+  await userEvent.clear(nodes);
+  await userEvent.type(nodes, "1");
+  await userEvent.clear(concurrency);
+  await userEvent.type(concurrency, "8");
+  await userEvent.click(save);
+  await vi.waitFor(() =>
+    expect(sent).toEqual([{ ha_reserve: { nodes: 1 }, ha_start_concurrency: 8 }]),
+  );
+  await vi.waitFor(() =>
+    expect(screen.getByRole("button", { name: "Save HA capacity" })).toBeDisabled(),
+  );
+  expect(screen.getByLabelText("Capacity reserved for HA recovery")).toHaveValue("nodes");
+});
+
+it("clears the HA capacity reserve with none", async () => {
+  const sent: unknown[] = [];
+  const saved = { ...DEFAULT, spec: { ...DEFAULT.spec, ha_reserve: { percent: 25 } } };
+  server.use(
+    http.get(apiUrl("/settings"), () => HttpResponse.json(saved)),
+    http.patch(apiUrl("/settings"), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json({ ...DEFAULT, revision: 6 });
+    }),
+  );
+  renderPage(<SettingsPage />);
+  const reserve = await screen.findByLabelText("Capacity reserved for HA recovery");
+  expect(reserve).toHaveValue("percent");
+  expect(screen.getByLabelText("Percent (1–90)")).toHaveValue(25);
+  await userEvent.selectOptions(reserve, "none");
+  await userEvent.click(screen.getByRole("button", { name: "Save HA capacity" }));
+  await vi.waitFor(() => expect(sent).toEqual([{ ha_reserve: "none", ha_start_concurrency: 4 }]));
+});

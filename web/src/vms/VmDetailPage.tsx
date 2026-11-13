@@ -286,6 +286,14 @@ function Summary({ vm }: { vm: Vm }) {
         )}
       </Field>
       {ha && <Field label={t("vms.haGroup")}>{ha.group ?? "—"}</Field>}
+      {ha && <Field label={t("vms.haPriority")}>{ha.priority}</Field>}
+      {ha && (
+        <Field label={t("vms.guestWatch")}>
+          {ha.guest_watch
+            ? t("vms.guestWatchSecs", { secs: ha.guest_watch.timeout_secs })
+            : t("vms.haOff")}
+        </Field>
+      )}
       {/* 리더가 계산한 배치 규칙 위반(켜진 VM만) */}
       <Field label={t("vms.ruleViolations")}>
         {violations.length > 0 ? (

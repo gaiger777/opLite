@@ -8,7 +8,12 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Switch } from "@/components/ui/switch";
 import { defaultMachine, haActive, haUnavailable, type VmFormValues } from "@/vms/form";
-import { MAX_HA_COUNT } from "@/vms/ha";
+import {
+  MAX_GUEST_WATCH_SECS,
+  MAX_HA_COUNT,
+  MAX_HA_PRIORITY,
+  MIN_GUEST_WATCH_SECS,
+} from "@/vms/ha";
 
 const HA_STATES: VmFormValues["haState"][] = ["started", "stopped", "ignored"];
 
@@ -272,6 +277,58 @@ export function GeneralSection({
                 />
               )}
             </Field>
+            <Field
+              id="vm-ha-priority"
+              label={t("vmForm.haPriority")}
+              error={errors.haPriority}
+              hint={t("vmForm.haPriorityHint")}
+            >
+              {(a11y) => (
+                <Input
+                  id="vm-ha-priority"
+                  {...a11y}
+                  type="number"
+                  min={0}
+                  max={MAX_HA_PRIORITY}
+                  value={values.haPriority}
+                  onChange={(e) => onChange({ haPriority: e.target.value })}
+                />
+              )}
+            </Field>
+            <div className="flex flex-col gap-1.5 sm:col-span-2">
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="vm-guest-watch"
+                  aria-describedby="vm-guest-watch-hint"
+                  checked={values.guestWatch}
+                  onCheckedChange={(guestWatch) => onChange({ guestWatch })}
+                />
+                <Label htmlFor="vm-guest-watch">{t("vmForm.guestWatch")}</Label>
+              </div>
+              <p id="vm-guest-watch-hint" className="text-xs text-muted-foreground">
+                {t("vmForm.guestWatchHint")}
+              </p>
+            </div>
+            {values.guestWatch && (
+              <Field
+                id="vm-guest-watch-secs"
+                label={t("vmForm.guestWatchSecs")}
+                error={errors.guestWatchSecs}
+                hint={t("vmForm.guestWatchSecsHint")}
+              >
+                {(a11y) => (
+                  <Input
+                    id="vm-guest-watch-secs"
+                    {...a11y}
+                    type="number"
+                    min={MIN_GUEST_WATCH_SECS}
+                    max={MAX_GUEST_WATCH_SECS}
+                    value={values.guestWatchSecs}
+                    onChange={(e) => onChange({ guestWatchSecs: e.target.value })}
+                  />
+                )}
+              </Field>
+            )}
           </>
         )}
       </CardContent>

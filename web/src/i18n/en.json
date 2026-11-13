@@ -75,7 +75,8 @@
     "remote_unauthorized": "The remote cluster rejected the API token. Check that the token still exists there.",
     "placement_rule": "Placement rules leave no node for this VM: {{message}}",
     "rule_conflict": "The rule contradicts other placement rules: {{message}}",
-    "group_in_use": "The HA group is in use. Take the VMs out of the group first: {{message}}"
+    "group_in_use": "The HA group is in use. Take the VMs out of the group first: {{message}}",
+    "ha_capacity": "Starting this HA VM would use memory reserved for HA recovery."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -176,7 +177,8 @@
       "vm-import-delete": "Delete import {{target}}",
       "node-update-check": "Check updates on {{target}}",
       "node-upgrade": "Upgrade {{target}}",
-      "node-drain": "Drain {{target}}"
+      "node-drain": "Drain {{target}}",
+      "node-power-off": "Power off {{target}} (fencing)"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -309,7 +311,11 @@
     "haGroup": "HA group",
     "ruleViolations": "Broken placement rules",
     "haError": "HA error",
-    "haPolicy": "High availability"
+    "haPolicy": "High availability",
+    "haCapacityDetail": "It needs {{need}}, but only {{free}} of {{capacity}} is left outside the {{reserve}} reserve.",
+    "haPriority": "HA recovery priority",
+    "guestWatch": "Guest agent watch",
+    "guestWatchSecs": "Restart after {{secs}} s without an answer"
   },
   "snapshots": {
     "created": "Created",
@@ -1015,6 +1021,63 @@
       "errors": {
         "node_online": "The node is online again; it clears the mark itself."
       }
+    },
+    "recoverAfter": "Recovers after {{secs}} s",
+    "fenceUnreachable": "Power fence unreachable",
+    "fence": {
+      "menu": "Power-off fencing…",
+      "title": "Power-off fencing of {{name}}",
+      "description": "When the node stops renewing its lease, the leader powers it off with these methods, in order, and recovers its HA VMs without waiting for the watchdog. If every method fails, it waits as before.",
+      "none": "No methods. The leader waits for the watchdog before recovering.",
+      "add": "Add a method",
+      "note": "The leader powers nodes off, and neighbour nodes (regular checks), the testing node and the leader read the power, so every node must reach the BMC. IPMI needs ipmitool on every node. Commands get ORBIVISOR_NODE_NAME, ORBIVISOR_NODE_ID and ORBIVISOR_NODE_ADDRESS.",
+      "remove": "Remove fencing",
+      "test": "Test",
+      "saved": "Saved the power-off fencing of {{name}}.",
+      "removed": "Removed the power-off fencing of {{name}}.",
+      "method": "Method {{n}}",
+      "kind": "Method {{n}}",
+      "kinds": {
+        "ipmi": "IPMI",
+        "redfish": "Redfish",
+        "command": "Command"
+      },
+      "moveUp": "Move method {{n}} up",
+      "moveDown": "Move method {{n}} down",
+      "removeMethod": "Remove method {{n}}",
+      "address": "BMC address",
+      "port": "Port",
+      "user": "User",
+      "password": "Password",
+      "passwordSaved": "A password is saved. Leave empty to keep it.",
+      "clearPassword": "Clear the saved password",
+      "lanplus": "IPMI 2.0 (lanplus)",
+      "url": "BMC URL",
+      "systemId": "System ID",
+      "systemIdHint": "Empty: the only system of the BMC.",
+      "caPem": "BMC CA certificate (PEM)",
+      "insecure": "Do not verify the BMC certificate",
+      "off": "Power-off command",
+      "offHint": "Runs with /bin/sh -c on the leader. A non-zero exit fails.",
+      "status": "Status command",
+      "statusHint": "Prints off or on on its first line. Runs on neighbour nodes, the testing node and the leader.",
+      "checkedBy": "Read by {{name}}. The power was not changed.",
+      "testResult": "Test result",
+      "kindColumn": "Method",
+      "power": "Power",
+      "error": "Error",
+      "powerState": {
+        "on": "On",
+        "off": "Off",
+        "unknown": "Unknown"
+      },
+      "errors": {
+        "required": "Enter a value.",
+        "port": "From 1 to 65535.",
+        "url": "Start with http:// or https://.",
+        "no_fence_checker": "No other online node can read this node's power. Test it from another node.",
+        "fence_check_failed": "The neighbour node did not answer: {{message}}"
+      }
     }
   },
   "accounts": {
@@ -1293,7 +1356,9 @@
       "macDuplicate": "Each interface needs a different MAC address.",
       "keep": "From 1 to 100.",
       "securityGroups": "Choose at most 8 security groups.",
-      "haCount": "From 0 to 10."
+      "haCount": "From 0 to 10.",
+      "haPriority": "From 0 to 100.",
+      "guestWatch": "From 30 to 3600 seconds."
     },
     "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",
@@ -1322,7 +1387,13 @@
     "maxRestart": "Restarts on the same node",
     "maxRestartHint": "From 0 to 10 within 10 minutes. After that, HA moves the VM to another node.",
     "maxRelocate": "Moves to other nodes",
-    "maxRelocateHint": "From 0 to 10 within 10 minutes. After that, HA stops the VM and shows an error; start it again to clear it."
+    "maxRelocateHint": "From 0 to 10 within 10 minutes. After that, HA stops the VM and shows an error; start it again to clear it.",
+    "haPriority": "Recovery priority",
+    "haPriorityHint": "From 0 to 100. When a node fails, HA restarts VMs with higher priority first.",
+    "guestWatch": "Restart when the guest hangs",
+    "guestWatchHint": "Pings the QEMU guest agent (qemu-guest-agent must run in the guest). Once it has answered, no answer for the time below force-restarts the VM. After a guest reboot it waits until the agent answers again. Can be turned on or off only while the VM is stopped.",
+    "guestWatchSecs": "Seconds without an answer",
+    "guestWatchSecsHint": "From 30 to 3600."
   },
   "console": {
     "connecting": "Connecting…",
@@ -1448,6 +1519,28 @@
       },
       "note": "Applies only when the host reboots or powers off. Stopping or upgrading orbivisord leaves the VMs running.",
       "save": "Save policy"
+    },
+    "ha": {
+      "title": "HA capacity",
+      "reserve": "Capacity reserved for HA recovery",
+      "reserveHint": "Memory of HA-capable nodes kept free for recovery. Starting an HA VM that would use it is refused. All running VMs count; migrations are not checked.",
+      "reserveKind": {
+        "none": "None",
+        "nodes": "Largest nodes",
+        "percent": "Percent of memory"
+      },
+      "amount": {
+        "nodes": "Nodes (1–8)",
+        "percent": "Percent (1–90)"
+      },
+      "concurrency": "Concurrent starts per target node",
+      "concurrencyHint": "How many HA VMs the leader starts at once on one node during recovery (1–32, default 4).",
+      "save": "Save HA capacity",
+      "errors": {
+        "nodes": "From 1 to 8.",
+        "percent": "From 1 to 90.",
+        "concurrency": "From 1 to 32."
+      }
     }
   },
   "audit": {

@@ -5,6 +5,12 @@ import type { VmHa, VmSpec } from "@/api/types";
 export const DEFAULT_HA: VmHa = { state: "started", max_restart: 1, max_relocate: 1, priority: 50 };
 /** 서버의 `MAX_HA_COUNT`: `max_restart`·`max_relocate`의 최댓값 */
 export const MAX_HA_COUNT = 10;
+/** 서버의 `MAX_HA_PRIORITY`: 복구 우선순위의 최댓값 */
+export const MAX_HA_PRIORITY = 100;
+/** 서버의 게스트 감시 시간 범위와 기본값(초) */
+export const MIN_GUEST_WATCH_SECS = 30;
+export const MAX_GUEST_WATCH_SECS = 3600;
+export const DEFAULT_GUEST_WATCH_SECS = 60;
 
 /** 서버의 `VmSpec::ha_active`: HA 정책이 있고(옛 `true`나 객체) `ignored`가 아닌지. */
 export function haEnabled(spec: Pick<VmSpec, "ha">): boolean {

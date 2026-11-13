@@ -292,8 +292,30 @@ it("shows the HA policy, broken placement rules and the HA error", async () => {
     "Stopped (moves, stays off)Restarts 2, moves 0",
   );
   expect(summary("HA group")).toHaveTextContent("rack");
+  expect(summary("HA recovery priority")).toHaveTextContent("50");
+  expect(summary("Guest agent watch")).toHaveTextContent("Off");
   expect(summary("Broken placement rules")).toHaveTextContent("spread, ha-group:rack");
   expect(summary("HA error")).toHaveTextContent("HA gave up after 1 relocations");
+});
+
+it("shows the recovery priority and the guest watch", async () => {
+  const db = vm("db", "running", {
+    spec: {
+      ...vm("db", "running").spec,
+      ha: {
+        state: "started",
+        max_restart: 1,
+        max_relocate: 1,
+        priority: 90,
+        guest_watch: { timeout_secs: 30 },
+      },
+    },
+  });
+  mockLists({ vm: [db], node: [NODE] });
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/db" });
+  expect(await screen.findByRole("heading", { name: "db" })).toBeInTheDocument();
+  expect(summary("HA recovery priority")).toHaveTextContent("90");
+  expect(summary("Guest agent watch")).toHaveTextContent("Restart after 30 s without an answer");
 });
 
 it("shows a VM without HA plainly", async () => {
@@ -302,6 +324,7 @@ it("shows a VM without HA plainly", async () => {
   expect(await screen.findByRole("heading", { name: "web" })).toBeInTheDocument();
   expect(summary("High availability")).toHaveTextContent("Off");
   expect(screen.queryByText("HA group", { selector: "dt" })).not.toBeInTheDocument();
+  expect(screen.queryByText("Guest agent watch", { selector: "dt" })).not.toBeInTheDocument();
   expect(summary("Broken placement rules")).toHaveTextContent("—");
   expect(screen.queryByText("HA error", { selector: "dt" })).not.toBeInTheDocument();
 });

@@ -1207,16 +1207,26 @@ orbivisorctl vm create web --memory 1024 --disk root --ha --restart on-failure -
 orbivisorctl vm set web --no-ha      # 끄기. 실행 중이어도 된다.
 orbivisorctl vm set web --ha         # 켜기. VM이 멈춰 있을 때만 된다(실행 중이면 409 vm_running).
 orbivisorctl vm list                 # HA 열(true/false)
-orbivisorctl node list               # FENCING 열: watchdog · process · -(꺼짐)
+orbivisorctl node list               # FENCING 열: watchdog · process · -(꺼짐), FENCE 열: ok · unreachable · -
 orbivisorctl cluster status          # 멤버마다 FENCING 열
-orbivisorctl task list               # 복구 기록: OP "vm-ha-recover (from <죽은 노드 id>)"
+orbivisorctl task list               # 복구 기록: OP "vm-ha-recover (from <죽은 노드 id>)", 전원 끄기 "node-power-off"
+orbivisorctl node fence set node2 -f fence.json   # 전원 끄기 펜싱(아래, admin). -f - 이면 표준 입력
+orbivisorctl node fence get node2                 # 방법들(비밀번호는 저장되어 있는지만)
+orbivisorctl node fence delete node2
+orbivisorctl node fence-test node2                # 방법마다 전원 읽기(전원은 건드리지 않음)
+orbivisorctl vm set web --ha-priority 80 --guest-watch 60   # 복구 우선순위, 게스트 멈춤 감지(--no-guest-watch)
+orbivisorctl settings set ha_reserve=nodes:1      # HA 용량 예약: none | nodes:N | percent:P
+orbivisorctl settings set ha_start_concurrency=8  # 복구 때 대상 노드당 동시 시작(기본 4)
 ```
 
 웹은 VM 만들기·편집의 "고가용성(HA)" 스위치(그 노드의 펜싱이 꺼져 있거나, 실행 중이고 HA가 꺼진 VM이면 이유와
-함께 켜기를 막는다), VM 목록·상세의 HA 배지, 노드·클러스터·대시보드 노드 표의 "펜싱" 열, 작업 목록의
-"web HA 복구 (노드 node-a에서)"다. API는 VM `spec.ha`(생성·`PUT /api/v1/vms/{key}`),
-Node `status.ha`(`{"fencing": "watchdog"|"process", "recover_after_secs": …}`, 펜싱이 꺼져 있으면 없다),
-`GET /api/v1/cluster`의 멤버 `fencing`(꺼져 있으면 null)이다. HA 그룹·상태·재시작과 옮기기 횟수·배치 규칙·호스트 종료
+함께 켜기를 막는다)와 그 아래 "복구 우선순위"·"게스트가 멈추면 다시 켜기", VM 목록·상세의 HA 배지(상세 요약에 우선순위·게스트
+에이전트 감시), 노드·클러스터·대시보드 노드 표의 "펜싱" 열(노드 화면은 그 아래 "N초 뒤 복구"와 "전원 펜싱 닿지 않음" 배지),
+노드 메뉴의 "전원 끄기 펜싱…"(admin, 방법 더하기·빼기·순서, 저장, "시험", "펜싱 지우기"), 설정의 "HA 용량", 작업 목록의
+"web HA 복구 (노드 node-a에서)"·"node-b 전원 끄기(펜싱)"다. API는 VM `spec.ha`(생성·`PUT /api/v1/vms/{key}`),
+Node `status.ha`(`{"fencing": "watchdog"|"process", "recover_after_secs": …, "fence_after_secs": …}`, 펜싱이 꺼져 있으면
+없다)·`status.fence_check`, `GET|PUT|DELETE /api/v1/nodes/{key}/fence`·`POST /api/v1/nodes/{key}/fence-test`, 설정
+`ha_reserve`·`ha_start_concurrency`, `GET /api/v1/cluster`의 멤버 `fencing`(꺼져 있으면 null)이다. HA 그룹·상태·재시작과 옮기기 횟수·배치 규칙·호스트 종료
 정책은 아래 "배치 규칙과 HA 정책"이다(같은 노드의 크래시 재시작도 거기서 정한다 — 옛 노드가 남은 동안은 `restart`가 정하므로
 `on-failure`를 권한다).
 
@@ -1224,25 +1234,49 @@ Node `status.ha`(`{"fencing": "watchdog"|"process", "recover_after_secs": …}`,
 # /etc/opl/opld.toml (노드마다, 생략하면 아래 기본값)
 [ha]
 fencing = "watchdog"              # watchdog | process | off (기본: Linux watchdog, macOS off)
+profile = "fast"                  # fast(10·10초) | safe(30·30초, 계획 51 전의 값)
 watchdog_device = "/dev/watchdog" # Linux watchdog 장치(하드웨어 또는 softdog)
-watchdog_timeout_secs = 30        # 장치에 정하는 제한 시간(5~3600초, WDIOC_SETTIMEOUT)
-fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나면 HA VM을 끈다(1초 이상)
+# watchdog_timeout_secs = 10      # 장치에 정하는 제한 시간(5~3600초, WDIOC_SETTIMEOUT). 적으면 프로필을 이긴다.
+# fence_after_secs = 10           # 마지막 리스 갱신 뒤 이만큼 지나면 HA VM을 끈다(1초 이상). 적으면 프로필을 이긴다.
+ipmitool = "ipmitool"             # 전원 끄기 펜싱의 IPMI 방법이 부르는 실행 파일(아래)
 ```
+
+- **프로필과 기본값.** `profile`은 `fence_after_secs`·`watchdog_timeout_secs`를 함께 정하고, 둘 중 적은 값은 프로필을
+  이긴다. 리더가 기다리는 `recover_after_secs`는 `fence_after_secs + watchdog_timeout_secs(watchdog일 때) + 2`다.
+
+  | 프로필 | `fence_after_secs` | `watchdog_timeout_secs` | 리스 갱신 | `recover_after_secs`(watchdog) | (process) |
+  |---|---|---|---|---|---|
+  | `fast`(기본) | 10 | 10 | 1초 | 22초 | 12초 |
+  | `safe` | 30 | 30 | 2초 | 62초 | 32초 |
+
+  **업그레이드하면 `[ha]`에 `profile`도 두 값도 적지 않은 노드는 `fast`가 된다**(계획 51 전에는 30·30초, 복구 65초).
+  짧은 리스는 잠깐의 망 끊김이나 멈칫한 데몬에도 펜싱한다. 클러스터 망이 불안하거나 아래 경고가 뜨면 옛 동작
+  `profile = "safe"`를 둔다. 실제로 잰 복구 시간(이 Mac, `fast` + process 펜싱, 디스크 없는 VM): kill -9 약 12초, 망 끊기 약
+  12초, SIGSTOP 약 13초(리스 끊김부터 다른 노드의 QEMU 시작까지, 게스트 부팅은 따로). 값을 키워(`fast` → `safe` 등) 다시 띄운
+  노드는 새 값을 노드 기록(`status.ha`)에 쓰기 전에는 HA VM을 켜거나 도는 HA VM에 붙지 않는다(리더가 옛 짧은
+  `recover_after_secs`로 옮기지 않게). 이 기록은 전체 등록(이름 풀기 등)을 기다리지 않고 `status.ha`만 먼저 쓰며, 쓰지
+  못하면 0.5초마다 다시 한다(한 번에 2초까지) — 이전 프로세스가 켜 둔 watchdog이 그 사이 노드를 재시작하지 않게.
+- **시작 경고.** 펜싱이 켜졌고 실제 `fence_after_secs`가 30초 미만인데 (1) 클러스터 링크가 하나뿐이거나(`cluster_addresses`가
+  둘 이상이 아님, 아래 "클러스터 통신 다중 링크") (2) `fencing = "watchdog"`인데 systemd 밖에서 돌면(`NOTIFY_SOCKET` 없음 —
+  `Type=notify`·`WatchdogSec`의 데몬 감시가 없음) 시작 로그에 경고하고 `profile = "safe"`를 권한다. 시작은 막지 않는다.
+  실행기 격리(위 "제어부 가용성")는 끌 수 없어 늘 켜진 것으로 본다.
 
 - **펜싱 방식.** `watchdog`: orbivisord가 HA VM을 끄고, orbivisord가 멈추면 watchdog가 노드를 재시작한다(운영용). `process`:
   orbivisord가 끄는 것만 한다 — orbivisord가 죽거나 멈추면 아무것도 끄지 않으므로 **시험·개발용**이다(macOS 노드도 쓸 수 있다).
+  `process`의 여유는 2초다(`recover_after_secs` = `fence_after_secs + 2`, 계획 51 전에는 5초): 리스를 잃은 노드가 그 2초 안에
+  HA VM을 끄지 못하면 리더가 옮긴 VM과 함께 돌 수 있다.
   `off`: 이 노드는 HA VM을 돌리지 않는다. Linux가 아니면 `watchdog`는 설정 오류다. 위트니스는 `[ha]`를 쓰지 않는다.
 - **HA 가능 노드.** 위트니스가 아니고 펜싱이 켜진 노드만 HA VM을 돌린다. HA VM의 노드(`--node`, 편집)나
   마이그레이션 대상이 펜싱이 꺼진 노드면 **409** `ha_unsupported`, 노드를 정하지 않은 HA VM은 스케줄러가 HA 가능
   노드만 고른다(없으면 **409** `no_node`). 노드는 등록할 때마다 `[ha]`를 `status.ha`에 쓴다. `recover_after_secs`는
-  `fence_after_secs + watchdog_timeout_secs(watchdog일 때) + 5`(기본 65초)로, 리더가 이만큼 기다린 뒤 옮긴다.
+  `fence_after_secs + watchdog_timeout_secs(watchdog일 때) + 2`(기본 22초)로, 리더가 이만큼 기다린 뒤 옮긴다.
 - **HA는 멈춘 VM에서만 켠다.** 만들 때 `--ha`는 그대로 되지만, 이미 있는 VM의 HA를 켜는 수정(`vm set --ha`, 웹
   편집, `PUT`의 `ha` false → true)은 VM이 멈춰 있을 때만 된다(원하는 상태가 stopped이고 phase가 stopped·failed).
   아니면 **409** `vm_running`("cannot turn on HA for VM "web" while it is running; turn on HA while the VM is
   stopped"). 끄기는 언제든 된다. 노드가 과반수와 끊긴 동안 실행 중인 VM의 HA를 켜면 그 노드는 HA인 줄 모르고
   끄지 않는데 리더는 그 VM을 다른 노드에서 켜 둘이 함께 돌 수 있기 때문이다. 실행 중인 VM은 정지하고 HA를 켠 뒤
   다시 시작한다.
-- **리스.** 갱신 간격은 `fence_after_secs`의 10분의 1(0.2초 이상 2초 이하, 기본 2초)이다. 리더는 아직 과반수의
+- **리스.** 갱신 간격은 `fence_after_secs`의 10분의 1(0.2초 이상 2초 이하, 기본 1초, `safe`는 2초)이다. 리더는 아직 과반수의
   리더인지 확인한 뒤에만 갱신을 받아 준다. 그래서 과반수와 끊긴 노드는 물론, 고립된 리더 자신도 갱신하지 못한다.
   리스는 orbivisord가 시작한 때부터 센다(다시 시작한 직후 곧바로 끄지 않는다).
 - **리스를 잃으면.** `fence_after_secs`가 지나면 그 노드의 HA VM을 강제로 끈다(실패로 세지 않고 원하는 상태는
@@ -1279,20 +1313,31 @@ fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나
 
 **복구.** 리더(위트니스가 아닌 노드)가 1초마다 노드의 리스를 보고 다음 노드의 HA VM을 옮긴다.
 
-- **언제.** 리스를 마지막으로 갱신한 뒤 그 노드의 `recover_after_secs`(기본 65초)가 지난 노드. 리스는 리더의
+- **언제.** 리스를 마지막으로 갱신한 뒤 그 노드의 `recover_after_secs`(기본 22초, process 12초)가 지난 노드, 또는 리더가
+  전원을 끄고 꺼진 것을 확인한 노드(아래 "전원 끄기 펜싱"). 리스는 리더의
   메모리에만 있으므로 리더가 바뀌면 새 리더는 리더가 된 때부터 다시 센다. 그래서 노드가 죽고 VM이 다른 노드에서
   켜지기까지는 대략 `recover_after_secs` + 1초에 부팅 시간이다. 리더도 함께 죽었으면 선거 시간이 더해지고, 디스크
-  잠금이 남아 있으면(아래) 그만큼 더 걸린다. `fencing = "process"`, `fence_after_secs = 2`(recover_after 7초)인
+  잠금이 남아 있으면(아래) 그만큼 더 걸린다. `fencing = "process"`, `fence_after_secs = 2`(recover_after 4초)인
   자동 시험에서는 수십 초다. 펜싱이 꺼진 노드(`status.ha` 없음)의 VM은 옮기지 않는다.
-- **무엇을.** 그 노드에 배정되고(`spec.node`) HA이고 원하는 상태가 running인 VM을 이름 순서로 옮긴다. 게스트가
+- **무엇을.** 그 노드에 배정되고(`spec.node`) HA이고 원하는 상태가 running인 VM을 복구 우선순위(`ha.priority`, 0~100,
+  기본 50)가 높은 것부터, 같으면 이름 순서로 옮긴다. 게스트가
   스스로 끄거나 사용자가 정지한 VM, HA 아닌 VM은 그 노드에 남는다. 옮기는 동안 리더는 그 노드의 리스 갱신을
   거부한다(펜싱 중 표시) — 그 노드가 돌아와 낡은 배정을 보고 VM을 켜지 않게 하려는 것이다. 복구 기록의 결과를
   모르면(시간 초과 — 나중에 커밋될 수 있다) 결과를 알 때까지 같은 기록을 다시 보내며 거부를 이어 가고, 리더가
   바뀌면 푼다.
 - **어디로.** 스케줄러와 같은 규칙(온라인, 유지보수 아님, 위트니스 아님, 아키텍처·디스크 풀·브리지, 미할당 메모리가
   가장 많은 노드 — HA 그룹 우선순위와 배치 규칙이 먼저다, 아래 "배치 규칙과 HA 정책")에 더해 HA 가능 노드이고 리스가
-  살아 있는 노드다. 죽은 노드와 진행 중이던 마이그레이션의 대상 노드는 뺀다. 여러 VM을 옮기면 앞서 옮긴 VM의 메모리도 센다. 그런 노드가 없으면 VM은 그대로 두고 status에
+  그 노드의 `fence_after_secs`(계획 51 전 노드는 `recover_after_secs`)보다 새로운 노드다 — 함께 죽어 아직 옮길 때가 되지
+  않은 노드로는 옮기지 않는다. 죽은 노드와 진행 중이던 마이그레이션의 대상 노드, 전원을 끄는 중이거나 끈 노드는 뺀다. 여러 VM을 옮기면 앞서 옮긴 VM의 메모리도 센다. 그런 노드가 없으면 VM은 그대로 두고 status에
   "HA cannot find a node for this VM"만 남긴 뒤 1초마다 다시 본다.
+- **미리 고른 노드.** 복구할 노드가 없을 때 리더가 10초마다 노드마다 "이 노드가 죽으면" 그 노드의 HA VM을 같은 순서·규칙으로
+  어디에 둘지 미리 계산해 둔다(리더 메모리, 30초 넘은 계산은 쓰지 않음). 복구 때 미리 고른 노드가 지금도 리스가 살아 있고 조건·
+  hard 규칙에 맞으면 그대로 쓰고, 아니면 그 자리에서 다시 고른다(로그 debug에 쓴 수·다시 고른 수).
+- **동시 시작.** 한 대상 노드에 시작이 몰려 디스크가 막히지 않게, 이 리더가 그 노드로 옮겼고 아직 켜지지 않은 VM이 클러스터
+  설정 `ha_start_concurrency`(1~32, 기본 4)개면 그 노드로는 더 옮기지 않는다. 미리 고른 노드가 상한이면 그 자리에서 다시
+  고르고(다른 노드가 나오면 그리로 옮긴다), 고른 노드가 상한이면 다음 VM은 죽은 노드에 남았다가 다음 틱에 다시 본다(그
+  노드에서 우선순위 순서가 지켜지게 다음 후보로 돌리지 않는다). 옮긴 VM은 그 노드에서 켜지거나 다른 노드로 가거나 꺼지거나
+  120초가 지나면 세지 않는다. 리더가 바뀌면 처음부터 센다.
 - **어떻게.** status를 먼저 비우고(phase stopped, "recovering: node node-a failed") 그 다음 `spec.node`를 대상
   노드로 바꾼다(둘 다 revision 검사, 그 사이 바뀌었으면 1초 뒤 다시). 대상 노드의 reconciler가 평소처럼 새로
   켠다. 죽은 노드가 맡았던 그 VM의 끝나지 않은 작업은 "node node-a failed; the VM was recovered by HA"로 실패
@@ -1315,6 +1360,105 @@ fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나
   펜싱 노드는 orbivisord만 멈추면(QEMU는 남음) HA VM을 끄지 못하므로 복구가 VM을 둘 돌게 할 수 있다(시험·개발용).
   복구 도중 리더가 다른 노드로 바뀌면 죽은 노드에 남은 그 VM의 작업 실패 처리와 기록 작업 `vm-ha-recover`가 빠질 수
   있다(VM은 옮겨진다). 끝나지 않은 작업은 그 노드가 돌아오거나 제거될 때 정리된다.
+
+**전원 끄기 펜싱(선택).** 노드마다 BMC나 명령으로 전원을 끄는 방법(1~4개)을 두면, 리더는 그 노드의 리스가 그 노드의
+`fence_after_secs`(기본 10초)를 넘게 끊겼을 때 방법을 차례로 써서 전원을 끄고, 꺼진 것을 확인하면 watchdog 제한을
+기다리지 않고 곧바로 HA VM을 옮긴다(Proxmox·Pacemaker의 대역 외 펜싱). 노드가 죽고 다른 노드에서 VM이 켜지기까지 약
+10초 + 끄기·확인 시간이다. 방법 하나에 최대 약 45초(끄기 15초, 확인 15초, 마지막 상태 읽기 15초)가 걸릴 수 있고, 그동안에도
+watchdog 기다림(`recover_after_secs`)은 나란히 흐른다 — 끄기가 그보다 늦으면 watchdog 기다림으로 먼저 옮긴다.
+
+```json
+{"methods": [
+  {"kind": "ipmi", "address": "10.0.10.12", "user": "admin", "password": "…"},
+  {"kind": "redfish", "url": "https://bmc-node2.example.com", "user": "root", "password": "…", "system_id": "1"},
+  {"kind": "command", "off": "pdu-ctl off \"$ORBIVISOR_NODE_NAME\"", "status": "pdu-ctl status \"$ORBIVISOR_NODE_NAME\""}
+]}
+```
+
+- **종류.** `ipmi { address, port = 623, user, password, lanplus = true }`는 `ipmitool [-I lanplus] -H … -p … -U … -E chassis
+  power off`로 끄고 `chassis power status`가 "Chassis Power is off"면 꺼진 것이다(비밀번호는 명령 인자가 아니라
+  `IPMI_PASSWORD` 환경 변수로 넘긴다). **IPMI를 쓰면 모든 노드에 `ipmitool`이 있어야 한다**(어느 노드가 리더가 될지 모른다,
+  `apt install ipmitool`, 경로는 `[ha] ipmitool`). `redfish { url, user, password, system_id?, ca_pem?, insecure = false }`는 Basic
+  인증으로 `ComputerSystem.Reset`(`ForceOff`)을 부르고 `PowerState`가 `Off`면 꺼진 것이다. `system_id`가 없으면
+  `/redfish/v1/Systems`의 시스템이 하나일 때 그것을 쓴다(여럿이면 오류, 시스템이 `url`과 다른 scheme·호스트·포트를 가리켜도
+  오류). `http://`도 받는다. `url`은 scheme·호스트·포트뿐이다 — 사용자·비밀번호(`https://u:pw@bmc`, `user`·`password`에
+  둔다)나 경로·쿼리·조각을 넣으면 **400**이다. `system_id`는 영문자·숫자·`.`·`_`·`-`만(`.`·`..`는 안 됨, **400**). Redfish
+  요청은 프록시 환경 변수(`HTTPS_PROXY` 등)를 따르지 않는다. `command { off, status }`는 `/bin/sh -c`로 돌리고(`off`는 리더, `status`는 이웃 노드의 정기 확인·`fence-test`를 받은 API 노드·리더) 환경 변수
+  `ORBIVISOR_NODE_NAME`·`ORBIVISOR_NODE_ID`·`ORBIVISOR_NODE_ADDRESS`(노드 API 주소의 호스트)로 끌 노드를 알린다. 명령의
+  환경은 비우고 `PATH`와 이 셋만 넘긴다(orbivisord의 환경 변수는 넘기지 않는다). `off`는 0으로 끝나야 하고 `status`는 첫 줄에
+  `off`나 `on`을 찍는다(그 밖은 모름). 명령은 자기 프로세스 그룹에서 돌고 제한 시간을 넘기면 띄운 자식까지 끝낸다. 명령이
+  끝나면 백그라운드로 남긴 자식은 기다리지 않는다. PDU의 SNMP, iLO·iDRAC 전용 도구, 가상 환경의 API를 이것으로 부른다.
+- **`command`는 root 명령이다.** `command` 방법은 리더·이웃 노드 등 **모든 노드에서 orbivisord 권한(root)으로 도는 셸 명령**이다.
+  펜싱을 쓸 수 있는 admin은 모든 노드에서 root로 명령을 실행할 수 있는 셈이므로 admin 계정을 그만큼 아낀다.
+- **오류 문구.** 모든 뷰어가 읽는 오류(작업 `node-power-off`, `status.fence_check`)에는 방법 종류와 일반 이유만 남긴다 —
+  `ipmitool`·`command`는 종료 상태, Redfish는 HTTP 상태나 "connection failed"·"timed out", 시간 초과는 "timed out after
+  15s". BMC 주소·호스트와 명령 출력(비밀을 담을 수 있다)은 그 노드의 경고 로그에만 남는다(`fence-test`도 같은 문구).
+- **순서와 실패.** 앞 방법부터: 끄기(명령·HTTP 하나 15초 제한) → 1초마다 상태를 15초까지 → 꺼졌으면 끝, 아니면 다음 방법.
+  끄기 요청이 실패해도(이미 꺼진 노드에 409를 주는 BMC 등) 그 방법으로 상태를 한 번 읽어 꺼져 있으면 꺼진 것으로 본다.
+  모두 실패하면 경고 로그와 실패한 작업 `node-power-off`(이유는 작업 오류에)를 남기고 이 리더는 그 노드를 다시 끄지 않으며
+  평소처럼 `recover_after_secs`(watchdog)를 기다린다 — 안전 쪽으로 물러난다. 실패가 그 기다림으로 이미 옮긴 뒤에 오면 오류가
+  "power off failed; the node's VMs were already recovered after the watchdog wait: …"다. 성공하면 성공한 작업 `node-power-off`(방법)를
+  남긴다. 리더는 꺼진 것을 확인한 뒤 그 노드에서 받은 리스 갱신이 없을 때만 복구하고, 그 노드의 리스가 다시 살아나면 기록을
+  지운다(다시 장애가 나면 다시 끈다). 켜기로 된 HA VM이 없는 노드(꺼진 `state: stopped` VM만 있으면 `recover_after_secs` 뒤
+  자리만 옮긴다), 얼린 노드, 계획 51 전 버전의 노드는 끄지 않는다. 리더가 바뀌면
+  새 리더가 처음부터 다시 본다.
+- **리더 쪽 문제에 대비.** 리더는 자기 리스도 그 노드의 `fence_after_secs`보다 새로울 때만 리스가 끝난 노드를 끈다(리더의 갱신이
+  멈추면 모든 노드의 리스가 함께 끝나 보이므로). 또 한 임기에 끄기를 시작하는 노드는 HA 가능 노드의 소수(`(n - 1) / 2`, 적어도
+  1대 — 3·4대면 1대, 5대면 2대)까지다(요청받은 끄기도 센다). 넘는 노드는 경고 로그를 남기고 watchdog 기다림으로 옮긴다.
+- **다른 노드가 BMC에 닿아야 한다.** 끄는 것은 리더(위트니스가 아닌, 그 노드가 아닌 노드)이고, 전원 읽기는 이웃 노드(정기
+  확인)·`fence-test`를 받은 API 노드·리더가 한다. 어느 노드가 리더가 될지 모르므로 모든 노드가 BMC에 닿아야 한다. BMC
+  관리망이 노드마다 따로라 다른 노드에서 닿지 않으면 쓸 수 없다.
+- **이웃 확인과 `fence_unreachable`.** 각 노드는 등록한 뒤 곧바로, 그 뒤 1시간마다, 자기 펜싱 설정이 바뀌면(1분마다 본다)
+  이웃 노드 하나(온라인·위트니스 아님·이 버전인 다른 노드 가운데 id 순으로 다음)에게 노드 간 RPC로 자기 방법들의 전원 읽기를
+  부탁해 결과를 `status.fence_check { at, by, error }`에 쓴다. 모든 방법이 읽지 못했으면 `error`가 있고 이것이
+  `fence_unreachable` 경고다(`node list`의 FENCE `unreachable`, 웹의 "전원 펜싱 닿지 않음" 배지 — 마우스를 올리면 이유).
+  이웃이 답하지 않으면 기록하지 않고 1분 뒤 다시 하고, 3번 이어 답하지 않으면 `error`에 "no neighbour could check the fence:
+  …"를 써 오래된 결과가 남지 않게 한다. 펜싱이 없으면 `fence_check`도 없다.
+- **`fence-test`.** `orbivisorctl node fence-test <노드>`(웹 "시험", admin)는 저장된 방법마다 전원을 읽기만 한다(끄지 않는다).
+  연결한 API 노드가 그 노드가 아니면 스스로, 그 노드면 이웃에게 부탁해 읽는다(이웃이 없으면 **409** `no_fence_checker`, 답하지
+  않으면 **502** `fence_check_failed`).
+- **설정과 비밀번호.** 펜싱은 노드마다의 리소스(`node-fence`, 이름 = 노드 이름)이고 읽기·쓰기 모두 admin만, 위트니스는
+  **400**, 쓰기는 모든 노드가 이 버전이어야 한다(**409** `cluster_upgrading`). `PUT`은 목록을 통째로 둔다. 비밀번호는 클러스터
+  저장소에 그대로 두되 API·watch·로그가 내보내지 않고 `has_password`만 보인다. `PUT`에서 `password`를 빼면 같은 종류에 IPMI는
+  주소·포트·사용자, Redfish는 `url`·`user`·`ca_pem`·`insecure`가 모두 같은 저장된 방법의 값을 두고(하나라도 바꾸면 다시 줘야
+  한다 — **400**), 빈 글이면 지운다(웹 "저장된 비밀번호 지우기"). `node fence set -f`는 `node fence get --json`의 출력도
+  받는다(`node`·`revision`·`has_password`는 빼고 보내고, `revision`이 있으면 `If-Match`로 보내 그 사이 바뀌었으면 **412**).
+  노드를 제거하면 함께 지워진다.
+
+**HA 용량 예약.** 클러스터 설정 `ha_reserve`를 두면 HA VM을 켤 때 장애 뒤 복구할 자리가 남는지 본다(VMware HA admission
+control의 백분율 방식).
+
+- **셈(메모리).** 대상 노드 = HA 가능·온라인·유지보수 아님·종료 표시 없음. 용량 = 그 노드들의 메모리 합, 예약 = `nodes:N`이면
+  메모리가 가장 큰 N대의 합(1~8, 노드 수보다 크면 전부), `percent:P`면 용량의 P%(1~90), 사용 = 그 노드들에 자리 잡은
+  **모든** VM(켜진 VM, HA 아닌 VM 포함, 마이그레이션 중이면 원본 한 번)과 유지보수(비우기)·종료 중(얼리기 빼고)인 HA 가능
+  노드의 켜진 `started` HA VM(곧 대상 노드로 온다)의 메모리 합. 노드 조합을 다 따지지 않는다 — 실제 복구는
+  노드마다의 남은 메모리로 놓으므로 조각나면 합으로는 남아도 못 놓을 수 있다.
+- **언제 거절.** `started` HA VM을 켜는 요청 — 켠 채 만들기, 꺼진 VM을 켜짐으로 고치기, 켜진 VM의 HA를 `started`로 바꾸기
+  (`stopped`·`ignored`에서), 켜진 HA VM의 메모리 늘리기, 꺼진 VM 시작 — 에서 사용 + 그 VM > 용량 − 예약이면 **409** `ha_capacity`(`details { capacity_mib, reserve_mib, used_mib, need_mib }`,
+  웹은 "이 HA VM을 켜면 HA 복구용으로 비워 둔 메모리를 씁니다. …"). 마이그레이션은 합이 바뀌지 않아 보지 않고, HA 복구·
+  되돌아가기도 보지 않는다. 이미 넘친 클러스터에서 도는 VM을 끄지는 않는다.
+- **설정.** `orbivisorctl settings set ha_reserve=none|nodes:N|percent:P`, 웹 설정의 "HA 용량". 기본(`none`)은 저장하지 않고,
+  바꾸려면 모든 노드가 이 버전이어야 한다.
+
+**같은 노드 빠른 재시작과 게스트 감시.**
+
+- **빠른 재시작.** `started` HA VM의 QEMU가 죽으면(크래시, kill) 그 노드의 reconciler가 재시작 창(10분) 안의 첫 크래시는
+  기다림 없이 곧바로 다시 켠다(둘째부터는 지금의 백오프, `max_restart`를 넘으면 다른 노드로 — 위 "배치 규칙과 HA 정책").
+- **게스트 감시(`ha.guest_watch`, VMware VM Monitoring).** `vm set --guest-watch SECS`(30~3600, 웹 "게스트가 멈추면 다시 켜기")를 둔
+  VM은 QEMU 게스트 에이전트 채널(virtio-serial `org.qemu.guest_agent.0`)을 달고, VM이 돌 때 5초마다 `guest-ping`을 보낸다.
+  이 QEMU에서 에이전트가 **한 번이라도 답한 뒤** 그 초 넘게 답하지 않으면 last_error "guest agent did not answer for Ns;
+  restarting"을 남기고 강제로 끈 뒤 다시 켠다(크래시 한 번으로 센다). 게스트에 `qemu-guest-agent`가 돌아야 하고, 답한 적 없는
+  VM은 감시하지 않는다. 일시 정지·마이그레이션 중에는 세지 않고, 일시 정지·재개 이벤트(QMP `STOP`·`RESUME`)마다 다시 센다.
+- **재부팅.** 게스트가 다시 부팅하거나(QMP `RESET`) 꺼지기 시작하면(`SHUTDOWN`) 에이전트가 다시 답할 때까지 감시하지 않는다
+  (부팅 중의 침묵을 멈춤으로 보지 않는다). 이벤트를 놓쳐도 부팅을 기다리도록 최솟값을 30초로 둔다.
+- **메모리 스냅샷.** 감시 채널은 장치이므로 메모리를 담은 스냅샷은 찍을 때와 감시 있음/없음이 같아야 되돌린다(아니면 **409**
+  `snapshot_mismatch` "set guest_watch to match the snapshot (on|off) before reverting" — VM을 멈추고 감시를 맞춘 뒤 되돌린다).
+- **켜고 끄기는 멈춘 VM에서.** 채널은 감시를 켠 VM에만 단다(모든 VM에 달면 장치가 바뀌어 옛 노드와의 마이그레이션이 깨진다).
+  그래서 실행 중인 VM의 수정에서 감시의 있음/없음이 바뀌면(감시를 켜거나 끄기, 감시를 둔 VM의 HA 끄기) **409** `vm_running`
+  ("cannot turn guest_watch on or off for VM "web" while it is running; guest_watch can be turned on or off only while the VM
+  is stopped")이다 — 도는 QEMU와 장치가 달라지면 비우기·종료·되돌아가기·옮기기의 라이브 마이그레이션이 실패한다. 시간만
+  바꾸기는 실행 중에도 된다. 감시를 둔 채 HA만 멈추려면 `state: ignored`를 쓴다. 우선순위·감시를 기본이 아닌 값으로 두려면
+  모든 노드가 이 버전이어야 한다(**409** `cluster_upgrading`).
 
 **수동 watchdog 시험(Linux, root, 직접 할 때만 — 자동 시험·CI는 진짜 watchdog를 쓰지 않는다).** 버려도 되는 시험
 노드에서 한다. `soft_noboot=1`이면 softdog는 제한 시간이 지나도 재시작하지 않고 커널 로그에
@@ -1425,7 +1569,8 @@ Node `status.shutdown`과 `POST /api/v1/nodes/{key}/unfreeze`다.
   않는다. 그룹 없는 HA VM은 되돌아가지 않는다.
 
 **HA 정책(`ha`).** `ha`는 옛 bool(`true`/`false`)이나 객체 `{ "state": "started"|"stopped"|"ignored", "group": …,
-"max_restart": 1, "max_relocate": 1 }`(빠진 값은 기본, 횟수는 0~10)다. 정책이 기본과 같으면 저장할 때 `true`로 쓰므로 단순
+"max_restart": 1, "max_relocate": 1, "priority": 50, "guest_watch": { "timeout_secs": 60 } }`(빠진 값은 기본, 횟수는 0~10,
+`priority`·`guest_watch`는 위 "HA VM과 자기 펜싱")다. 정책이 기본과 같으면 저장할 때 `true`로 쓰므로 단순
 HA VM과 이 버전 전의 VM은 바이트까지 옛 모양이고, `--ha`/`--no-ha`와 웹의 HA 스위치는 그대로다. 기본과 다른 객체는 모든
 노드를 올린 뒤에만 쓸 수 있다.
 
@@ -1471,7 +1616,7 @@ HA VM과 이 버전 전의 VM은 바이트까지 옛 모양이고, `--ha`/`--no-
   옮겨지지 않고 꺼졌다가 노드가 돌아오면 그 노드에서 다시 켜진다**(전에는 리더가 `recover_after_secs` 뒤 다른 노드로 복구했다).
   재부팅 동안 HA VM을 계속 돌리려면 먼저 `node drain`하거나 `shutdown_policy=migrate`, 예전처럼 옮기려면 `failover`로 둔다.
 
-**한계.** 위반을 바로잡는 균형 조정과 묶음 옮기기 API(뒤 계획), 미리 고른 복구 노드와 종료 failover의 빠른 복구(뒤 계획),
+**한계.** 위반을 바로잡는 균형 조정과 묶음 옮기기 API(뒤 계획), 종료 failover의 빠른 복구,
 꺼진 `started` HA VM의 노드 옮기기, 호스트 종료 때 HA 아닌 VM의 ACPI 종료는 없다. 리스·`failback` 30초는 리더의 메모리에만
 있으므로 리더가 바뀌면 다시 센다.
 
@@ -1512,15 +1657,21 @@ API·작업·느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰
   이름)를 남긴다. `work`만 늦으면 경고("…; still petting the systemd watchdog")만 남기고 계속 보낸다(데몬을 다시
   띄우는 동안 HA VM이 있는 노드가 재부팅될 수 있으므로 리스와 API가 도는 한 끄지 않는다). `core`나 `api`가 20초 넘게
   막히면 쓰다듬기가 30초 넘게 끊겨 systemd가 orbivisord를 SIGKILL로 끝내고(코어 덤프로 늦어지지 않게, 진단은 경고
-  로그로) 5초 뒤 다시 띄운다(`Restart=on-failure`). `KillMode=process`라 VM은 그대로 돌고, 다시 뜬 orbivisord가 VM에
+  로그로) 2초 뒤 다시 띄운다(`Restart=on-failure`, `RestartSec=2`. 60초에 10번까지 — `StartLimitIntervalSec=60`·
+  `StartLimitBurst=10`). `KillMode=process`라 VM은 그대로 돌고, 다시 뜬 orbivisord가 VM에
   다시 붙는다. `systemctl status opld`가 `activating`에 머물면 `READY=1`이 아직 오지 않은 것이다(로그를 본다).
 - **HA watchdog과의 관계.** HA watchdog 장치(노드 재시작)는 HA VM이 도는데 리스를 잃었을 때의 것이고, systemd
   watchdog(데몬 재시작)은 데몬이 멈췄을 때의 것이다. 데몬이 다시 시작되는 동안 HA VM이 있으면 장치 쓰다듬기도
   멈춘다(죽은 프로세스가 닫은 장치의 타이머는 그대로 돈다). 새 프로세스가 장치를 다시 열면(arm) Linux 드라이버가
-  타이머를 다시 시작하므로, 마지막 쓰다듬기부터 다시 arm하기까지가 `watchdog_timeout_secs`(기본 30초)보다 짧아야
-  노드가 재시작되지 않는다. 그 사이에 드는 것: `RestartSec`(5초), 프로세스 시작과 클러스터 저장소 열기, 도는 VM마다
+  타이머를 다시 시작하므로, 마지막 쓰다듬기부터 다시 arm하기까지가 `watchdog_timeout_secs`(기본 `fast` 10초, `safe` 30초)보다
+  짧아야 노드가 재시작되지 않는다. 그 사이에 드는 것: 죽은 프로세스 뒤의 `ExecStopPost`(`orbivisord --release-vips`, VIP 떼기),
+  `RestartSec`(2초), 프로세스 시작과 클러스터 저장소 열기, 도는 VM마다
   차례로 QMP에 다시 붙기(VM 수에 비례, 붙지 못하는 VM은 하나에 5초까지), 첫 리스 갱신(리더가 있어야 한다),
-  reconciler가 도는 HA VM에 붙으며 하는 arm. VM이 많은 노드는 배포 뒤 이 시간을 재 본다.
+  reconciler가 도는 HA VM에 붙으며 하는 arm. `fast`에서는 `RestartSec`을 빼면 약 8초가 남고 나머지가 그 안에 들어야 하므로 HA VM이
+  많은 노드는 배포 뒤 이
+  시간을 재 보고, 넘으면 `profile = "safe"`(또는 `watchdog_timeout_secs`만 늘림)를 둔다. systemd의 `WatchdogSec=30s`는 그대로다 —
+  `core`가 `fence_after_secs`(10초)보다 오래 막히면 리스가 먼저 끝나 HA VM 펜싱(장치 제한 10초 뒤 노드 재시작)이 데몬 재시작보다
+  먼저 온다.
 - **Raft가 멈추면.** 저장소 쓰기가 실패하거나 저장소 스레드가 멈춰 Raft(openraft)가 멈추면 orbivisord는
   "Raft stopped: …"로 0이 아닌 코드로 끝나고 systemd가 다시 띄운다(API만 답하는 채로 남지 않는다).
 - **느린 디스크.** 저장소 쓰기는 `orbivisor-store` 스레드에서 하므로 fsync가 실행기 스레드를 막지 않는다. 다만
@@ -2489,7 +2640,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
-볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·증분·복원·지우기·원격으로 복제)과 백업 작업(증분 주기·원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 비우기, 레이블, 얼림 풀기, 죽은 노드 제거), HA 그룹과 배치 규칙, 작업, 감사 로그(admin),
+볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·증분·복원·지우기·원격으로 복제)과 백업 작업(증분 주기·원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 비우기, 레이블, 얼림 풀기, 전원 끄기 펜싱과 시험, 죽은 노드 제거), HA 그룹과 배치 규칙, HA 용량 예약, 작업, 감사 로그(admin),
 사용자(admin), 인증 영역(LDAP·OIDC, admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 원격 클러스터(상태 카드, 원격 VM 목록과 동작), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `orbivisorctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.

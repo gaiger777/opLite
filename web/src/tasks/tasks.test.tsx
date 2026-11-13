@@ -139,6 +139,18 @@ it("names the failed node of an HA recovery", () => {
   expect(describeTask(recover, i18n.t, "web", name)).toBe("HA recovery of web (from node node-a)");
 });
 
+it("names the power-off of a fenced node", () => {
+  const off = {
+    ...task("5", "succeeded"),
+    spec: {
+      op: { kind: "node-power-off", method: "ipmi", reason: "lease expired" },
+      target: "id-b",
+      node: "id-a",
+    },
+  } as Task;
+  expect(describeTask(off, i18n.t, "node-b")).toBe("Power off node-b (fencing)");
+});
+
 it("waits for a task and rejects with its error when it fails", async () => {
   const queryClient = createQueryClient();
   const id = task("5", "pending").id;

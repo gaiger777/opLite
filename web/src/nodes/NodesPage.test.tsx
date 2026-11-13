@@ -84,19 +84,35 @@ it("shows how each node fences", async () => {
   cluster();
   const fenced = {
     ...NODE,
-    status: { ...NODE.status, ha: { fencing: "watchdog" as const, recover_after_secs: 65 } },
+    status: {
+      ...NODE.status,
+      ha: { fencing: "watchdog" as const, recover_after_secs: 22, fence_after_secs: 10 },
+    },
   };
-  mockLists({ node: [fenced, DOWN] });
+  // 이웃이 전원을 읽지 못한 노드는 경고 배지가 붙는다.
+  const unreachable = {
+    ...DOWN,
+    status: {
+      ...DOWN.status,
+      fence_check: { at: 1_800_000_000, by: "node-a", error: "ipmi: connection timed out" },
+    },
+  };
+  mockLists({ node: [fenced, unreachable] });
   renderPage(<NodesPage />);
   const table = await screen.findByRole("table", { name: "Nodes" });
   const a = (await within(table).findByText("node-a")).closest("tr")!;
   const column = within(table)
     .getAllByRole("columnheader")
     .findIndex((h) => h.textContent === "Fencing");
-  expect(within(a).getAllByRole("cell")[column]).toHaveTextContent("Watchdog");
+  expect(within(a).getAllByRole("cell")[column]).toHaveTextContent("WatchdogRecovers after 22 s");
+  expect(within(a).queryByText("Power fence unreachable")).not.toBeInTheDocument();
   // 펜싱이 꺼진 노드는 `ha`가 없다.
   const b = within(table).getByText("node-b").closest("tr")!;
   expect(within(b).getAllByRole("cell")[column]).toHaveTextContent("—");
+  expect(within(b).getByText("Power fence unreachable")).toHaveAttribute(
+    "title",
+    "ipmi: connection timed out",
+  );
 });
 
 it("shows the state of each pool on the node", async () => {
@@ -729,4 +745,193 @@ it("marks a frozen node and unfreezes it", async () => {
   expect(
     await screen.findByText("node-b unfrozen. Its HA VMs are recovered on other nodes."),
   ).toBeInTheDocument();
+});
+
+it("sets up power-off fencing for a node, then tests it", async () => {
+  cluster();
+  const witness = { ...NODE, id: "n3", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  mockLists({ node: [NODE, DOWN, witness] });
+  const put: { ifMatch: string | null; body: unknown }[] = [];
+  server.use(
+    http.get(apiUrl("/nodes/n2/fence"), () =>
+      HttpResponse.json({ code: "not_found", message: "no fencing" }, { status: 404 }),
+    ),
+    http.put(apiUrl("/nodes/n2/fence"), async ({ request }) => {
+      const body = (await request.json()) as { methods: { kind: string }[] };
+      put.push({ ifMatch: request.headers.get("If-Match"), body });
+      return HttpResponse.json({
+        node: "node-b",
+        revision: 3,
+        methods: [
+          { kind: "command", off: "pdu off b", status: "pdu status b" },
+          {
+            kind: "ipmi",
+            address: "10.0.0.12",
+            port: 623,
+            user: "admin",
+            has_password: true,
+            lanplus: true,
+          },
+        ],
+      });
+    }),
+    http.post(apiUrl("/nodes/n2/fence-test"), () =>
+      HttpResponse.json({
+        checked_by: "node-a",
+        methods: [
+          { kind: "command", power: "on" },
+          { kind: "ipmi", power: "unknown", error: "connection timed out" },
+        ],
+      }),
+    ),
+  );
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  await within(table).findByText("node-w");
+  // 위트니스는 HA VM을 돌리지 않아 펜싱하지 않는다.
+  await userEvent.click(screen.getByRole("button", { name: "Actions for node-w" }));
+  expect(await screen.findByRole("menuitem", { name: "Edit labels" })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Power-off fencing…" })).not.toBeInTheDocument();
+  await userEvent.keyboard("{Escape}");
+  await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Power-off fencing…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Power-off fencing of node-b" });
+  expect(await within(dialog).findByText(/No methods/)).toBeInTheDocument();
+  expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
+  // 저장된 설정이 없으면 시험·지우기가 없다.
+  expect(within(dialog).queryByRole("button", { name: "Test" })).not.toBeInTheDocument();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Add a method" }));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Add a method" }));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(within(dialog).getAllByText("Enter a value.")).toHaveLength(4);
+  expect(put).toEqual([]);
+  const first = within(dialog).getByRole("listitem", { name: "Method 1" });
+  await userEvent.type(within(first).getByLabelText("BMC address"), "10.0.0.12");
+  await userEvent.type(within(first).getByLabelText("User"), "admin");
+  await userEvent.type(within(first).getByLabelText("Password"), "s3cret");
+  const second = within(dialog).getByRole("listitem", { name: "Method 2" });
+  await userEvent.selectOptions(within(second).getByLabelText("Method 2"), "command");
+  await userEvent.type(within(second).getByLabelText("Power-off command"), "pdu off b");
+  await userEvent.type(within(second).getByLabelText("Status command"), "pdu status b");
+  await userEvent.click(within(second).getByRole("button", { name: "Move method 2 up" }));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(await screen.findByText("Saved the power-off fencing of node-b.")).toBeInTheDocument();
+  expect(put).toEqual([
+    {
+      ifMatch: null,
+      body: {
+        methods: [
+          { kind: "command", off: "pdu off b", status: "pdu status b" },
+          {
+            kind: "ipmi",
+            address: "10.0.0.12",
+            port: 623,
+            user: "admin",
+            lanplus: true,
+            password: "s3cret",
+          },
+        ],
+      },
+    },
+  ]);
+  // 저장한 뒤에는 시험할 수 있고, 저장된 비밀번호는 비워 두면 그대로 둔다.
+  expect(within(dialog).getByText("A password is saved. Leave empty to keep it.")).toBeVisible();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Test" }));
+  const result = await within(dialog).findByRole("table", { name: "Test result" });
+  expect(within(dialog).getByText("Read by node-a. The power was not changed.")).toBeVisible();
+  const rows = within(result).getAllByRole("row");
+  expect(rows[1]).toHaveTextContent("1CommandOn");
+  expect(rows[2]).toHaveTextContent("2IPMIUnknownconnection timed out");
+});
+
+it("keeps the saved password and removes power-off fencing", async () => {
+  cluster();
+  mockLists({ node: [NODE, DOWN] });
+  const saved = {
+    node: "node-b",
+    revision: 7,
+    methods: [
+      {
+        kind: "redfish",
+        url: "https://bmc-b",
+        user: "root",
+        has_password: true,
+        insecure: false,
+      },
+    ],
+  };
+  const put: { ifMatch: string | null; body: unknown }[] = [];
+  const deleted: (string | null)[] = [];
+  server.use(
+    http.get(apiUrl("/nodes/n2/fence"), () => HttpResponse.json(saved)),
+    http.put(apiUrl("/nodes/n2/fence"), async ({ request }) => {
+      put.push({ ifMatch: request.headers.get("If-Match"), body: await request.json() });
+      return HttpResponse.json({ ...saved, revision: 8 });
+    }),
+    http.delete(apiUrl("/nodes/n2/fence"), ({ request }) => {
+      deleted.push(request.headers.get("If-Match"));
+      return new HttpResponse(null, { status: 204 });
+    }),
+    http.post(apiUrl("/nodes/n2/fence-test"), () =>
+      HttpResponse.json(
+        { code: "no_fence_checker", message: "no other online node" },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderPage(<NodesPage />);
+  await screen.findByRole("table", { name: "Nodes" });
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-b" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Power-off fencing…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Power-off fencing of node-b" });
+  expect(await within(dialog).findByLabelText("BMC URL")).toHaveValue("https://bmc-b");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Test" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "No other online node can read this node's power.",
+  );
+  await userEvent.type(within(dialog).getByLabelText("System ID"), "1");
+  // 고친 뒤에는 저장된 설정과 달라 시험하지 않는다.
+  expect(within(dialog).getByRole("button", { name: "Test" })).toBeDisabled();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  await vi.waitFor(() =>
+    expect(put).toEqual([
+      {
+        ifMatch: "7",
+        body: {
+          methods: [
+            {
+              kind: "redfish",
+              url: "https://bmc-b",
+              user: "root",
+              insecure: false,
+              system_id: "1",
+            },
+          ],
+        },
+      },
+    ]),
+  );
+  // 저장된 비밀번호를 지우면 빈 글을 보낸다.
+  await userEvent.click(within(dialog).getByLabelText("Clear the saved password"));
+  expect(within(dialog).getByLabelText("Password")).toBeDisabled();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  await vi.waitFor(() => expect(put).toHaveLength(2));
+  expect(put[1]).toEqual({
+    ifMatch: "8",
+    body: {
+      methods: [
+        {
+          kind: "redfish",
+          url: "https://bmc-b",
+          user: "root",
+          insecure: false,
+          password: "",
+        },
+      ],
+    },
+  });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Remove fencing" }));
+  expect(await screen.findByText("Removed the power-off fencing of node-b.")).toBeInTheDocument();
+  expect(deleted).toEqual(["8"]);
+  expect(within(dialog).getByText(/No methods/)).toBeInTheDocument();
 });

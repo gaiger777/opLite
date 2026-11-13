@@ -1,7 +1,16 @@
 import type { components } from "@/api/schema";
 import type { Node, Vm, VmSpec } from "@/api/types";
 import { MAX_NIC_SECURITY_GROUPS } from "@/security-groups/rules";
-import { DEFAULT_HA, haPolicy, haSetting, MAX_HA_COUNT } from "@/vms/ha";
+import {
+  DEFAULT_GUEST_WATCH_SECS,
+  DEFAULT_HA,
+  haPolicy,
+  haSetting,
+  MAX_GUEST_WATCH_SECS,
+  MAX_HA_COUNT,
+  MAX_HA_PRIORITY,
+  MIN_GUEST_WATCH_SECS,
+} from "@/vms/ha";
 
 type Schemas = components["schemas"];
 
@@ -69,9 +78,11 @@ export interface VmFormValues {
   haGroup: string;
   maxRestart: string;
   maxRelocate: string;
-  /** 복구 우선순위와 게스트 감시. 고칠 때 그대로 둔다. */
-  haPriority: number;
-  guestWatch: Schemas["GuestWatch"] | null;
+  /** 복구 우선순위(0~100, 클수록 먼저) */
+  haPriority: string;
+  /** 게스트 에이전트 감시를 켠다. 끄더라도 초는 남겨 다시 켤 때 쓴다. */
+  guestWatch: boolean;
+  guestWatchSecs: string;
   /** 만든 뒤 곧바로 시작한다(만들 때만). */
   start: boolean;
 }
@@ -169,7 +180,14 @@ function haFields(
   policy: Schemas["VmHa"] | null,
 ): Pick<
   VmFormValues,
-  "ha" | "haState" | "haGroup" | "maxRestart" | "maxRelocate" | "haPriority" | "guestWatch"
+  | "ha"
+  | "haState"
+  | "haGroup"
+  | "maxRestart"
+  | "maxRelocate"
+  | "haPriority"
+  | "guestWatch"
+  | "guestWatchSecs"
 > {
   const p = policy ?? DEFAULT_HA;
   return {
@@ -178,8 +196,9 @@ function haFields(
     haGroup: p.group ?? "",
     maxRestart: String(p.max_restart),
     maxRelocate: String(p.max_relocate),
-    haPriority: p.priority,
-    guestWatch: p.guest_watch ?? null,
+    haPriority: String(p.priority),
+    guestWatch: p.guest_watch != null,
+    guestWatchSecs: String(p.guest_watch?.timeout_secs ?? DEFAULT_GUEST_WATCH_SECS),
   };
 }
 
@@ -289,6 +308,16 @@ export function validate(
         errors[field] = "vmForm.errors.haCount";
       }
     }
+    if (!/^\d+$/.test(v.haPriority) || !intIn(v.haPriority, 0, MAX_HA_PRIORITY)) {
+      errors.haPriority = "vmForm.errors.haPriority";
+    }
+    if (
+      v.guestWatch &&
+      (!/^\d+$/.test(v.guestWatchSecs) ||
+        !intIn(v.guestWatchSecs, MIN_GUEST_WATCH_SECS, MAX_GUEST_WATCH_SECS))
+    ) {
+      errors.guestWatchSecs = "vmForm.errors.guestWatch";
+    }
   }
   return errors;
 }
@@ -329,8 +358,8 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
             ...(v.haGroup !== "" && { group: v.haGroup }),
             max_restart: Number(v.maxRestart),
             max_relocate: Number(v.maxRelocate),
-            priority: v.haPriority,
-            ...(v.guestWatch && { guest_watch: v.guestWatch }),
+            priority: Number(v.haPriority),
+            ...(v.guestWatch && { guest_watch: { timeout_secs: Number(v.guestWatchSecs) } }),
           }
         : null,
     ),

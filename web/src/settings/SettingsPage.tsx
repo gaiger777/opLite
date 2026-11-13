@@ -11,6 +11,7 @@ import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { HaSection } from "@/settings/HaSection";
 import { patchSettings, settingsError } from "@/settings/save";
 import { ShutdownSection } from "@/settings/ShutdownSection";
 import { SubscriptionSection } from "@/settings/SubscriptionSection";
@@ -102,6 +103,7 @@ export function SettingsPage() {
         )}
       </form>
       <ShutdownSection write={write} />
+      <HaSection write={write} />
       <TelemetrySection write={write} />
     </div>
   );

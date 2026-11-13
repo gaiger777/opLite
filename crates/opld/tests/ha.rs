@@ -396,6 +396,14 @@ async fn an_ha_vm_recovers_to_the_next_group_node_and_fails_back() {
     assert_eq!(migrations[0]["spec"]["op"]["node"], id_b.as_str());
     // 원본 QEMU는 마이그레이션 뒤 끝난다.
     eventually("source QEMU gone", || async { !alive(recovered_pid) }).await;
+    // VM이 B에서 돌아도 Task가 끝나기 전에는 멈추기가 vm_busy다.
+    let migration = format!("/tasks/{}", migrations[0]["id"].as_str().unwrap());
+    eventually("failback migration task finished", || async {
+        ca.get(&migration)
+            .await
+            .is_ok_and(|t| t["status"]["state"] == "succeeded")
+    })
+    .await;
 
     a.ctl(&["vm", "stop", "db", "--force"]).await.unwrap();
     a.ctl(&["vm", "delete", "db"]).await.unwrap();

@@ -36,6 +36,7 @@ import {
 } from "@/components/ui/table";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
+import { NodeFenceDialog } from "@/nodes/NodeFenceDialog";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
 import { PoolStatus } from "@/storage/PoolStatus";
 import { trackTask } from "@/tasks/tasks";
@@ -105,6 +106,7 @@ export function NodesPage() {
   const [ending, setEnding] = useState<Node | null>(null);
   const [labeling, setLabeling] = useState<Node | null>(null);
   const [unfreezing, setUnfreezing] = useState<Node | null>(null);
+  const [fencing, setFencing] = useState<Node | null>(null);
   const tasks = useTaskIndex();
   /** 그 노드의 비우기 Task가 끝나지 않았는지 */
   const isDraining = (node: Node) =>
@@ -223,7 +225,23 @@ export function NodesPage() {
               <TableCell>{node.status.arch ?? "—"}</TableCell>
               {/* 펜싱이 꺼진 노드(위트니스 포함)는 HA VM을 돌리지 않는다. */}
               <TableCell>
-                {node.status.ha ? t(`nodes.fencingMode.${node.status.ha.fencing}`) : "—"}
+                {node.status.ha ? (
+                  <>
+                    {t(`nodes.fencingMode.${node.status.ha.fencing}`)}
+                    {/* `[ha] profile`이 정한, 리더가 이 노드의 HA VM을 옮기기까지의 시간 */}
+                    <span className="block text-xs text-muted-foreground">
+                      {t("nodes.recoverAfter", { secs: node.status.ha.recover_after_secs })}
+                    </span>
+                  </>
+                ) : (
+                  "—"
+                )}
+                {/* 이웃 노드가 이 노드의 BMC·명령으로 전원을 읽지 못했다. */}
+                {node.status.fence_check?.error && (
+                  <Badge variant="destructive" title={node.status.fence_check.error}>
+                    {t("nodes.fenceUnreachable")}
+                  </Badge>
+                )}
               </TableCell>
               <TableCell>{node.status.cpus}</TableCell>
               <TableCell>{formatCapacity(node.status.memory_mib)}</TableCell>
@@ -300,6 +318,12 @@ export function NodesPage() {
                       <DropdownMenuItem onSelect={() => setLabeling(node)}>
                         {t("nodes.labelsMenu")}
                       </DropdownMenuItem>
+                      {/* 위트니스는 HA VM을 돌리지 않아 끌 일이 없다. */}
+                      {!node.spec.witness && (
+                        <DropdownMenuItem onSelect={() => setFencing(node)}>
+                          {t("nodes.fence.menu")}
+                        </DropdownMenuItem>
+                      )}
                       {isFrozen(node) && (
                         <DropdownMenuItem onSelect={() => setUnfreezing(node)}>
                           {t("nodes.unfreeze.menu")}
@@ -382,6 +406,9 @@ export function NodesPage() {
         returnFocus={trigger}
         onConfirm={() => setMaintenance(ending!, false)}
       />
+      {fencing && (
+        <NodeFenceDialog node={fencing} returnFocus={trigger} onClose={() => setFencing(null)} />
+      )}
       {labeling && (
         <LabelsDialog node={labeling} returnFocus={trigger} onClose={() => setLabeling(null)} />
       )}

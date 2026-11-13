@@ -75,6 +75,14 @@ it("translates API error codes and falls back to the server message", async () =
   expect(
     errorMessage(t, new ApiError(409, "placement_rule", 'node "b" breaks placement rules: spread')),
   ).toBe('Placement rules leave no node for this VM: node "b" breaks placement rules: spread');
+  // HA 용량 예약은 서버의 셈으로 남은 자리를 알린다(details가 없으면 앞 문장만).
+  const capacity = { capacity_mib: 16384, reserve_mib: 8192, used_mib: 7168, need_mib: 2048 };
+  expect(errorMessage(t, new ApiError(409, "ha_capacity", "x", capacity))).toBe(
+    "Starting this HA VM would use memory reserved for HA recovery. It needs 2 GiB, but only 1 GiB of 16 GiB is left outside the 8 GiB reserve.",
+  );
+  expect(errorMessage(t, new ApiError(409, "ha_capacity", "x"))).toBe(
+    "Starting this HA VM would use memory reserved for HA recovery.",
+  );
   expect(errorMessage(t, new ApiError(400, "invalid_request", "memory_mib must be > 0"))).toBe(
     "memory_mib must be > 0",
   );
