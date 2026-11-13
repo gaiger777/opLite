@@ -148,13 +148,16 @@ impl Replica {
         self.inner.leave_upstream.send_modify(|n| *n += 1);
     }
 
-    /// 복제 작업을 멈춘다.
+    /// 복제 작업을 멈춘다. 작업이 저장소 스레드에 넣어 둔 적용(작업을 멈춰도 저장소 스레드는 한다)까지 끝난 뒤
+    /// 돌아오므로, 그 뒤에 읽은 리비전은 저장소와 같고 더 움직이지 않는다.
     pub(crate) async fn shutdown(&self) {
         let task = self.inner.task.lock().unwrap().take();
         if let Some(task) = task {
             task.abort();
             let _ = task.await;
         }
+        // 저장소 스레드는 넣은 차례대로 하므로 빈 쓰기가 끝나면 앞서 넣은 적용도 끝났다(스레드가 멈췄으면 남은 것이 없다).
+        let _ = self.inner.writer.run(|_| Ok(())).await;
         self.inner.stopped.send_replace(true);
     }
 
@@ -397,10 +400,15 @@ impl Inner {
             );
             return Ok(());
         }
+        // 구독자에게 알리는 것도 저장소 스레드의 쓰기 안에서 한다(전환의 쓰기와 차례가 어긋나지 않게).
+        let hub = self.hub.clone();
         self.writer
-            .run(move |db| install_objects(db, applied, membership, objects))
+            .run(move |db| {
+                install_objects(db, applied, membership, objects)?;
+                hub.reset(revision);
+                Ok(())
+            })
             .await?;
-        self.hub.reset(revision);
         let mut status = self.status.lock().unwrap();
         status.upstream_applied = status.upstream_applied.max(revision);
         if !voters.is_empty() {
@@ -418,20 +426,23 @@ impl Inner {
         // 내지도 않는다(옛 값으로 되돌리거나 감시에 두 번 보이지 않게). 적용 위치는 묶음의 것이다.
         let applied_here = self.hub.revision();
         batch.events.retain(|e| e.revision() > applied_here);
-        let batch = self
-            .writer
-            .run(move |db| apply_feed(db, &batch).map(|()| batch))
+        let (applied, voters) = (
+            batch.applied.index,
+            batch.membership.as_ref().map(voter_addrs),
+        );
+        let hub = self.hub.clone();
+        self.writer
+            .run(move |db| {
+                apply_feed(db, &batch)?;
+                hub.publish(batch);
+                Ok(())
+            })
             .await?;
         let mut status = self.status.lock().unwrap();
-        status.upstream_applied = status.upstream_applied.max(batch.applied.index);
-        if let Some(m) = &batch.membership {
-            let voters = voter_addrs(m);
-            if !voters.is_empty() {
-                status.voters = voters;
-            }
+        status.upstream_applied = status.upstream_applied.max(applied);
+        if let Some(voters) = voters.filter(|v| !v.is_empty()) {
+            status.voters = voters;
         }
-        drop(status);
-        self.hub.publish(batch);
         Ok(())
     }
 }
@@ -589,8 +600,12 @@ mod tests {
             learner.shutdown().await.unwrap();
             drop(learner);
             let observer = loop {
-                match Cluster::open_observer(config(&self.root, i, false), self.router.follower(id))
-                    .await
+                match Cluster::open_observer(
+                    config(&self.root, i, false),
+                    self.router.network(id),
+                    self.router.follower(id),
+                )
+                .await
                 {
                     Err(ClusterError::Store(StoreError::Db(redb::Error::DatabaseAlreadyOpen))) => {
                         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -734,6 +749,47 @@ mod tests {
             ),
             "{frames:?}"
         );
+        net.shutdown().await;
+    }
+
+    /// `shutdown`은 복제 작업이 저장소 스레드에 넣어 둔 적용까지 끝난 뒤 돌아온다: 멈춘 뒤 읽은 리비전이 저장소와 같고
+    /// 그 뒤로 움직이지 않는다.
+    #[tokio::test]
+    async fn shutdown_waits_for_a_queued_apply() {
+        let net = Net::start(1).await;
+        let o = net.observer(0);
+        let r = replica(o);
+        net.sync().await;
+        wait_until("attached", || r.status().upstream.is_some()).await;
+        // 저장소 스레드를 붙잡아 다음 적용이 줄을 서게 한다.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        o.store()
+            .writer()
+            .submit(move |_| {
+                let _ = held.recv();
+            })
+            .unwrap();
+        let written = net.leader().create(&volume("queued")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            release.send(()).unwrap();
+        });
+        r.shutdown().await;
+        let stopped_at = o.revision();
+        releaser.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(o.revision(), stopped_at);
+        assert!(stopped_at >= written);
+        let stored: Option<openraft::LogId<NodeId>> = {
+            let txn = o.store().db().begin_read().unwrap();
+            get_json(
+                &txn.open_table(META).unwrap(),
+                crate::store::KEY_LAST_APPLIED,
+            )
+            .unwrap()
+        };
+        assert_eq!(stored.map(|l| l.index), Some(stopped_at));
         net.shutdown().await;
     }
 
@@ -952,9 +1008,16 @@ mod tests {
         }
         txn.commit().unwrap();
         drop(store);
+        let router = MemRouter::default();
         let script = Arc::new(script);
         loop {
-            match Cluster::open_observer(config.clone(), script.clone()).await {
+            match Cluster::open_observer(
+                config.clone(),
+                router.network(NodeId::from(9)),
+                script.clone(),
+            )
+            .await
+            {
                 Err(ClusterError::Store(StoreError::Db(redb::Error::DatabaseAlreadyOpen))) => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }

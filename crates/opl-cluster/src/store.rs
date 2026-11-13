@@ -6,8 +6,8 @@ use std::sync::Arc;
 use opl_types::resource::Kind;
 use redb::backends::InMemoryBackend;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::log_store::LogStore;
@@ -36,6 +36,22 @@ pub(crate) const KEY_LAST_APPLIED: &str = "last_applied";
 pub(crate) const KEY_LAST_MEMBERSHIP: &str = "last_membership";
 pub(crate) const KEY_SNAPSHOT_META: &str = "snapshot_meta";
 pub(crate) const KEY_SNAPSHOT_DATA: &str = "snapshot_data";
+/// 이 노드가 무엇으로 참여하는지([`NodeMode`]). 없으면 `Member`다(계획 48 전의 저장소).
+pub(crate) const KEY_NODE_MODE: &str = "node_mode";
+/// 관찰 노드가 되며 지운 Raft 로그의 마지막 인덱스(지금까지 가장 큰 것). 다시 Raft를 띄우기 전에 여기까지 적용한다
+/// ([`enter_observer_mode`]).
+pub(crate) const KEY_DROPPED_LOG: &str = "dropped_log";
+
+/// 저장소를 어떤 백엔드로 여는지(설계 §6)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeMode {
+    /// Raft 구성원(투표 멤버·learner)으로 Raft를 띄운다.
+    #[default]
+    Member,
+    /// Raft 밖의 관찰 노드로 투표 멤버 하나를 따른다. Raft 로그는 비어 있다.
+    Observer,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -51,6 +67,9 @@ pub enum StoreError {
     WriterStopped,
     #[error("a store write panicked")]
     WriterPanicked,
+    /// 계획된 전환(관찰 노드 ↔ 멤버)으로 물러난 Raft의 상태 머신이 쓰려 했다.
+    #[error("the state machine was retired by a mode change")]
+    Retired,
 }
 
 macro_rules! from_redb {
@@ -160,6 +179,55 @@ fn last_applied_index(db: &Database) -> Result<u64, StoreError> {
     let meta = txn.open_table(META)?;
     let applied: Option<openraft::LogId<crate::types::NodeId>> = get_json(&meta, KEY_LAST_APPLIED)?;
     Ok(applied.map_or(0, |l| l.index))
+}
+
+/// 저장된 모드. 없으면 `Member`다.
+pub(crate) fn read_node_mode(db: &Database) -> Result<NodeMode, StoreError> {
+    let txn = db.begin_read()?;
+    let meta = txn.open_table(META)?;
+    Ok(get_json(&meta, KEY_NODE_MODE)?.unwrap_or_default())
+}
+
+/// 관찰 노드가 된다: 한 트랜잭션에서 모드를 `Observer`로 적고 Raft 로그와 저장된 커밋 위치를 지운다. 투표(vote)는
+/// 남긴다(다시 투표 멤버가 되어도 같은 임기에 두 번 투표하지 않게). 상태 머신(리소스·`last_applied`·멤버십·스냅샷)은
+/// 그대로라 복제본이 그 적용 위치부터 이어 받는다. 커밋 위치를 지우는 것은 다시 Raft를 띄울 때 openraft가 지운
+/// 로그를 다시 적용하려 하지 않게 하려는 것이다(없으면 적용 위치를 커밋으로 본다).
+///
+/// 지운 로그의 마지막 인덱스는 `KEY_DROPPED_LOG`에 남긴다. 리더는 이 노드가 받았다고 답한 로그까지를 진행
+/// (`matching`)으로 쥐고, 이 노드가 멤버십에서 빠지기 전에 관찰 노드가 되면 그 진행을 그대로 쥔다. 다시 Raft를 띄운
+/// 이 노드의 로그(적용 위치까지)가 그보다 짧으면 openraft 0.9.25 리더가 그것을 로그가 뒤로 간 것으로 본다(디버그
+/// 빌드는 `follower log reversion` panic, 그 밖에는 이 노드가 따라잡지 못할 수 있다).
+pub(crate) fn enter_observer_mode(db: &Database) -> Result<(), StoreError> {
+    let txn = db.begin_write()?;
+    {
+        let mut meta = txn.open_table(META)?;
+        put_json(&mut meta, KEY_NODE_MODE, &NodeMode::Observer)?;
+        meta.remove(KEY_COMMITTED)?;
+        let mut log = txn.open_table(LOG)?;
+        let last = log.last()?.map_or(0, |(index, _)| index.value());
+        let dropped = get_json::<u64>(&meta, KEY_DROPPED_LOG)?
+            .unwrap_or(0)
+            .max(last);
+        put_json(&mut meta, KEY_DROPPED_LOG, &dropped)?;
+        log.retain(|_, _| false)?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// 관찰 노드가 되며 지운 Raft 로그의 마지막 인덱스. 지운 적이 없으면 0이다.
+pub(crate) fn read_dropped_log(db: &Database) -> Result<u64, StoreError> {
+    let txn = db.begin_read()?;
+    let meta = txn.open_table(META)?;
+    Ok(get_json(&meta, KEY_DROPPED_LOG)?.unwrap_or(0))
+}
+
+/// 모드를 적는다.
+pub(crate) fn write_node_mode(db: &Database, mode: NodeMode) -> Result<(), StoreError> {
+    let txn = db.begin_write()?;
+    put_json(&mut txn.open_table(META)?, KEY_NODE_MODE, &mode)?;
+    txn.commit()?;
+    Ok(())
 }
 
 pub(crate) fn get_object(

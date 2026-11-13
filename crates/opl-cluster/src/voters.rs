@@ -8,24 +8,39 @@
 //!
 //! openraft의 멤버십 변경은 joint를 커밋한 뒤 uniform을 제안하는 두 단계라, 그 사이에 끊기면(시간 초과, 리더
 //! 교체) joint가 남는다. 키퍼는 남은 joint를 마무리한다.
+//!
+//! 관찰 노드(설계 §6): 투표 멤버와 대기 learner([`STANDBY_LEARNERS`]) 밖의 노드는 Raft 밖의 관찰 노드다. 키퍼는
+//! 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`)을 쓴다. 내리기는 목록에 더한 뒤(노드의
+//! `RoleKeeper`가 보고 관찰 노드가 된다) 다음 틱에 멤버십에서 뺀다(`RemoveNodes`). 올리기는 learner로 더한 뒤
+//! 목록에서 뺀다(그 사이 끊기면 "목록에 있는 learner"라 다시 내려간다: 어느 쪽이든 목록과 멤버십 가운데 한 곳에는
+//! 남는다). 투표 멤버는 목록에 두지 않는다(있으면 목록에서 뺀다).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
+use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, ChangeMembers, LogId, Raft, RaftMetrics, ServerState};
+use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::settings::{SETTINGS_NAME, SettingsSpec};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::cluster::Cluster;
+use crate::cluster::{Cluster, ClusterError};
 use crate::types::{NodeId, TypeConfig};
 
 /// 이 기능을 아는 노드는 투표 멤버 승격을 리더의 `VoterKeeper`에 맡긴다. 모든 노드가 알면 리더가 상한을 지킨다.
 pub const VOTER_LIMIT: &str = "voter-limit";
+
+/// 이 기능을 아는 노드는 관찰 노드가 될 수 있다(설계 §6). 모든 노드가 알 때만 키퍼가 learner를 관찰 노드로 내린다.
+pub const OBSERVER: &str = "observer";
+
+/// 투표 멤버 밖에 learner로 남기는 건강한 노드 수(위트니스 제외). 나머지는 관찰 노드다. 투표 멤버가 죽으면 이것이
+/// 먼저 올라가고, 줄면 관찰 노드를 learner로 올린다.
+pub const STANDBY_LEARNERS: usize = 2;
 
 /// 장애 영역을 적는 노드 레이블(노드 설정 `[node] zone`)
 pub const ZONE_LABEL: &str = "zone";
@@ -97,6 +112,8 @@ pub(crate) struct Member {
     pub(crate) offline: bool,
     /// learner가 로그를 따라잡았다(투표 멤버는 늘 참).
     pub(crate) caught_up: bool,
+    /// Raft 밖의 관찰 노드(클러스터 정보의 목록에 있다)
+    pub(crate) observer: bool,
 }
 
 /// 멤버십 변경 하나
@@ -108,6 +125,10 @@ pub(crate) enum Change {
     Demote(NodeId),
     /// 투표 멤버 `out`을 learner로 내리고 learner `by`를 올린다(변경 한 번).
     Replace { out: NodeId, by: NodeId },
+    /// learner를 관찰 노드로 내린다(목록에 더한다. 멤버십에서 빼는 것은 다음 틱).
+    ToObserver(NodeId),
+    /// 관찰 노드를 learner로 올린다(learner로 더한 뒤 목록에서 뺀다).
+    ToLearner(NodeId),
 }
 
 impl Change {
@@ -125,6 +146,7 @@ impl Change {
                 after.remove(&out);
                 after.insert(by);
             }
+            Change::ToObserver(_) | Change::ToLearner(_) => {}
         }
         after
     }
@@ -138,16 +160,23 @@ impl Change {
 /// 4. `limit`만큼이면 오프라인 투표 멤버를 올릴 수 있는 learner로 바꾼다(변경 한 번). 그런 learner가 없으면
 ///    그대로 둔다: 내리기만 하면 투표 멤버가 줄어 하나만 더 죽어도 정족수가 깨진다(노드 둘과 위트니스에서 하나가
 ///    오래 꺼진 뒤 다른 하나가 죽는 경우). 노드가 상한 이하면 모두 투표 멤버로 남는다.
+/// 5. 관찰 노드(설계 §6, 새 임기의 처음에는 하지 않음): 투표 멤버가 상한보다 적은데 올릴 learner가 없거나, 건강한
+///    대기 learner(위트니스가 아닌 비투표 구성원)가 [`STANDBY_LEARNERS`]보다 적으면 건강한 관찰 노드 하나를
+///    learner로 올린다(투표 멤버가 적은 zone의 것 먼저). 대기 learner가 그보다 많고 모든 노드가 [`OBSERVER`]를
+///    알면(`observers_ready`) 건강한 대기 learner 하나를 관찰 노드로 내린다(대기 learner가 많은 zone의 것, 따라잡지
+///    못한 것, 나중에 들어온 것 순). 오프라인 투표 멤버가 있으면 내리지 않는다.
 ///
-/// 위트니스와 리더는 내리지 않는다. 바꾸기 전이나 뒤의 투표 멤버에서 살아 있는 것이 과반이 아니면 바꾸지 않는다.
+/// 위트니스와 리더는 내리지 않는다. 투표 멤버는 관찰 노드로 내리지 않는다. 바꾸기 전이나 뒤의 투표 멤버에서 살아
+/// 있는 것이 과반이 아니면 바꾸지 않는다.
 pub(crate) fn plan(
     leader: NodeId,
     members: &[Member],
     limit: usize,
     settling: bool,
+    observers_ready: bool,
 ) -> Option<Change> {
     let voters: Vec<&Member> = members.iter().filter(|m| m.voter).collect();
-    let change = pick(leader, members, &voters, limit, settling)?;
+    let change = pick(leader, members, &voters, limit, settling, observers_ready)?;
     let before: BTreeSet<NodeId> = voters.iter().map(|m| m.id).collect();
     let after = change.voters_after(&before);
     (alive_majority(members, &before) && alive_majority(members, &after)).then_some(change)
@@ -168,9 +197,10 @@ fn pick(
     voters: &[&Member],
     limit: usize,
     settling: bool,
+    observers_ready: bool,
 ) -> Option<Change> {
     let demotable = |m: &&Member| !m.witness && m.id != leader;
-    let promotable = |m: &&Member| !m.voter && m.healthy && m.caught_up;
+    let promotable = |m: &&Member| !m.voter && !m.observer && m.healthy && m.caught_up;
     if let Some(m) = members.iter().filter(promotable).find(|m| m.witness) {
         return Some(Change::Promote(m.id));
     }
@@ -189,8 +219,15 @@ fn pick(
             .min_by_key(|m| (in_zone(&m.zone, except), m.id))
             .map(|m| m.id)
     };
+    // learner로 올릴 관찰 노드: 건강한 것 가운데 투표 멤버가 적은 zone의 것, 같으면 id가 작은 것. 새 임기의
+    // 처음에는 건강 정보가 없어 올리지 않는다.
+    let returning = members
+        .iter()
+        .filter(|m| m.observer && m.healthy && !settling)
+        .min_by_key(|m| (in_zone(&m.zone, None), m.id))
+        .map(|m| Change::ToLearner(m.id));
     if voters.len() < limit {
-        return best(None).map(Change::Promote);
+        return best(None).map(Change::Promote).or(returning);
     }
     if voters.len() > limit {
         if settling {
@@ -207,12 +244,32 @@ fn pick(
         })?;
         return Some(Change::Demote(m.id));
     }
-    let dead = voters
+    let dead = voters.iter().copied().filter(demotable).find(|m| m.offline);
+    if let Some(dead) = dead
+        && let Some(by) = best(Some(dead.id))
+    {
+        return Some(Change::Replace { out: dead.id, by });
+    }
+    if settling {
+        return None;
+    }
+    // 대기 learner: 건강한 비투표 Raft 구성원(위트니스는 늘 투표 멤버로 올라가므로 세지 않는다)
+    let standby: Vec<&Member> = members
         .iter()
-        .copied()
-        .filter(demotable)
-        .find(|m| m.offline)?;
-    best(Some(dead.id)).map(|by| Change::Replace { out: dead.id, by })
+        .filter(|m| !m.voter && !m.observer && !m.witness && m.healthy)
+        .collect();
+    if standby.len() < STANDBY_LEARNERS {
+        return returning;
+    }
+    if standby.len() > STANDBY_LEARNERS && observers_ready && dead.is_none() {
+        let in_standby_zone =
+            |zone: &Option<String>| standby.iter().filter(|s| s.zone == *zone).count();
+        return standby
+            .iter()
+            .max_by_key(|m| (in_standby_zone(&m.zone), !m.caught_up, m.id))
+            .map(|m| Change::ToObserver(m.id));
+    }
+    None
 }
 
 /// [`VOTER_LIMIT`]를 보고하지 않아 키퍼를 막는 멤버. 합류하자마자 죽어 등록하지 못한 learner(Node 기록이 없거나
@@ -264,6 +321,8 @@ struct State {
     finish_warned: Option<LogId<NodeId>>,
     /// 키퍼를 막는 멤버를 경고한 임기(임기마다 한 번)
     warned: Option<u64>,
+    /// 관찰 노드 목록에 있는 learner(내려가는 중)를 처음 본 시각
+    listed_since: BTreeMap<NodeId, Instant>,
 }
 
 async fn run(
@@ -350,13 +409,44 @@ async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) 
         Ok(settings) => settings.map(|s| s.spec).unwrap_or_default().voter_limit(),
         Err(_) => return,
     };
+    // 클러스터 정보의 관찰 노드 목록(클러스터 정보가 없으면 관찰 노드를 둘 곳이 없다)
+    let Ok((_, infos)) = cluster.list::<ClusterSpec>() else {
+        return;
+    };
+    let info = infos.into_iter().next();
+    let listed: BTreeMap<NodeId, String> = info
+        .as_ref()
+        .map(|i| {
+            i.status
+                .observers
+                .iter()
+                .map(|(id, addr)| (NodeId(*id), addr.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    state.listed_since.retain(|id, _| listed.contains_key(id));
+    if let Some(info) = &info
+        && fix_listed(
+            cluster, config, state, &raft, &m, info, &listed, &voters, &name,
+        )
+        .await
+    {
+        return;
+    }
     let now = Instant::now();
     let age = |at: Instant| now.saturating_duration_since(at);
+    let observers = listed
+        .keys()
+        .copied()
+        .filter(|id| membership.get_node(id).is_none());
     let members: Vec<Member> = membership
         .nodes()
-        .map(|(&id, _)| {
+        .map(|(&id, _)| id)
+        .chain(observers)
+        .map(|id| {
             let node = nodes.get(&id);
             let voter = voters.contains(&id);
+            let observer = membership.get_node(&id).is_none();
             let me = id == cluster.id();
             let renewed = leases.renewed.get(&id).copied();
             let last = if me {
@@ -375,14 +465,25 @@ async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) 
                 // 기준점의 유예 없이 이 임기에 실제로 받은 갱신으로만 본다.
                 alive: me || renewed.is_some_and(|at| age(at) < config.alive_within),
                 offline: last.is_none_or(|at| age(at) >= config.offline_after),
-                caught_up: voter || caught_up(&m, id),
+                caught_up: voter || (!observer && caught_up(&m, id)),
+                observer,
             }
         })
         .collect();
+    // 모든 멤버와 관찰 노드가 관찰 노드 기능을 알 때만 learner를 내린다(옛 노드는 목록을 모른다).
+    let observers_ready = members.iter().all(|member| {
+        nodes
+            .get(&member.id)
+            .is_some_and(|n| n.status.features.iter().any(|f| f == OBSERVER))
+    });
     let settling = age(since) < config.healthy_within;
-    let Some(change) = plan(cluster.id(), &members, limit, settling) else {
+    let Some(change) = plan(cluster.id(), &members, limit, settling, observers_ready) else {
         return;
     };
+    // 계획은 장벽·목록 읽기 전의 지표로 세웠다. 그 사이 구성이 바뀌었으면(다른 변경, 리더 교체) 다음 틱에 다시 세운다.
+    if !same_config(cluster, &m) {
+        return;
+    }
     let (changes, done) = match change {
         Change::Promote(id) => (
             ChangeMembers::AddVoterIds(BTreeSet::from([id])),
@@ -401,11 +502,23 @@ async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) 
                 name(by)
             ),
         ),
+        Change::ToObserver(id) => {
+            let (Some(info), Some(node)) = (&info, membership.get_node(&id)) else {
+                return;
+            };
+            let mut next = listed.clone();
+            next.insert(id, node.addr.clone());
+            match write_observers(cluster, info, next).await {
+                Ok(_) => tracing::info!("moving {} out of Raft as an observer", name(id)),
+                Err(e) => tracing::warn!(error = %e, ?change, "cannot list an observer"),
+            }
+            return;
+        }
+        Change::ToLearner(id) => {
+            return_observer(cluster, config, &raft, id, &listed, &name).await;
+            return;
+        }
     };
-    // 계획은 장벽·목록 읽기 전의 지표로 세웠다. 그 사이 구성이 바뀌었으면(다른 변경, 리더 교체) 다음 틱에 다시 세운다.
-    if !same_config(cluster, &m) {
-        return;
-    }
     state.unfinished = true;
     match change_members(&raft, changes, config.change_timeout).await {
         Outcome::Done => {
@@ -419,6 +532,155 @@ async fn tick(cluster: &Cluster, config: &VoterKeeperConfig, state: &mut State) 
             tracing::warn!(error = %e, ?change, "cannot change the voting members")
         }
     }
+}
+
+/// 목록과 멤버십이 겹친 것을 고친다. 무언가 했거나 기다려야 하면 `true`(이번 틱에는 다른 것을 하지 않는다).
+/// - 목록에 있는 투표 멤버는 목록에서 뺀다(투표 멤버는 관찰 노드로 내리지 않는다).
+/// - 목록에 있는 learner(내려가는 중)는 그 노드가 목록을 받을 시간(간격 두 번, 리더가 목록 쓰기까지 복제했거나
+///   `change_timeout`이 지남)을 준 뒤 멤버십에서 뺀다(`RemoveNodes`, openraft는 투표 멤버를 이것으로 빼지 않는다).
+///   꺼져 있어 목록을 받지 못한 노드는 다시 켜졌을 때 `RoleKeeper`의 대비책이 관찰 노드로 만든다.
+#[allow(clippy::too_many_arguments)]
+async fn fix_listed(
+    cluster: &Cluster,
+    config: &VoterKeeperConfig,
+    state: &mut State,
+    raft: &Raft<TypeConfig>,
+    m: &RaftMetrics<NodeId, BasicNode>,
+    info: &ClusterInfo,
+    listed: &BTreeMap<NodeId, String>,
+    voters: &BTreeSet<NodeId>,
+    name: &impl Fn(NodeId) -> String,
+) -> bool {
+    let stray: Vec<NodeId> = listed
+        .keys()
+        .copied()
+        .filter(|id| voters.contains(id))
+        .collect();
+    if !stray.is_empty() {
+        let next = listed
+            .iter()
+            .filter(|(id, _)| !voters.contains(id))
+            .map(|(id, addr)| (*id, addr.clone()))
+            .collect();
+        match write_observers(cluster, info, next).await {
+            Ok(_) => tracing::warn!(
+                nodes = %stray.iter().map(|id| name(*id)).collect::<Vec<_>>().join(","),
+                "voting members were listed as observers; unlisted them"
+            ),
+            Err(e) => tracing::warn!(error = %e, "cannot unlist voting members from the observers"),
+        }
+        return true;
+    }
+    let membership = m.membership_config.membership();
+    let pending: Vec<NodeId> = listed
+        .keys()
+        .copied()
+        .filter(|id| membership.get_node(id).is_some())
+        .collect();
+    if pending.is_empty() {
+        return false;
+    }
+    let now = Instant::now();
+    let ready: BTreeSet<NodeId> = pending
+        .into_iter()
+        .filter(|id| {
+            let waited =
+                now.saturating_duration_since(*state.listed_since.entry(*id).or_insert(now));
+            waited >= config.interval * 2
+                && (matched(m, *id) >= Some(info.revision) || waited >= config.change_timeout)
+        })
+        .collect();
+    if ready.is_empty() || !same_config(cluster, m) {
+        return true;
+    }
+    let names: Vec<String> = ready.iter().map(|id| name(*id)).collect();
+    match change_members(
+        raft,
+        ChangeMembers::RemoveNodes(ready),
+        config.change_timeout,
+    )
+    .await
+    {
+        Outcome::Done => {
+            tracing::info!(nodes = %names.join(","), "moved learners out of Raft as observers")
+        }
+        Outcome::Busy => {}
+        Outcome::Failed(e) => {
+            tracing::warn!(error = %e, nodes = %names.join(","), "cannot move learners out of Raft")
+        }
+    }
+    true
+}
+
+/// 관찰 노드를 learner로 더한 뒤 목록에서 뺀다. 목록에서 빼지 못하면 다음 틱에 "목록에 있는 learner"로 보여 다시
+/// 관찰 노드가 된다(목록과 멤버십 어느 쪽에도 없는 노드는 생기지 않는다).
+async fn return_observer(
+    cluster: &Cluster,
+    config: &VoterKeeperConfig,
+    raft: &Raft<TypeConfig>,
+    id: NodeId,
+    listed: &BTreeMap<NodeId, String>,
+    name: &impl Fn(NodeId) -> String,
+) {
+    let Some(addr) = listed.get(&id) else {
+        return;
+    };
+    let added = tokio::time::timeout(
+        config.change_timeout,
+        raft.add_learner(id, BasicNode::new(addr.clone()), false),
+    )
+    .await;
+    match outcome(added) {
+        Outcome::Done => {}
+        Outcome::Busy => return,
+        Outcome::Failed(e) => {
+            tracing::warn!(error = %e, node = %name(id), "cannot add an observer back as a learner");
+            return;
+        }
+    }
+    // learner를 더한 쓰기는 이 노드(리더)에 적용된 뒤 돌아온다. 목록은 그 뒤에 다시 읽는다.
+    let Ok((_, infos)) = cluster.list::<ClusterSpec>() else {
+        return;
+    };
+    let Some(info) = infos.into_iter().next() else {
+        return;
+    };
+    let mut next: BTreeMap<NodeId, String> = info
+        .status
+        .observers
+        .iter()
+        .map(|(id, addr)| (NodeId(*id), addr.clone()))
+        .collect();
+    next.remove(&id);
+    match write_observers(cluster, &info, next).await {
+        Ok(_) => tracing::info!("added the observer {} back as a learner", name(id)),
+        Err(e) => tracing::warn!(error = %e, node = %name(id), "cannot unlist an observer"),
+    }
+}
+
+/// 클러스터 정보의 관찰 노드 목록을 `observers`로 바꾼다(읽은 뒤 다른 쪽이 썼으면 `RevisionMismatch`).
+async fn write_observers(
+    cluster: &Cluster,
+    info: &ClusterInfo,
+    observers: BTreeMap<NodeId, String>,
+) -> Result<u64, ClusterError> {
+    let status = ClusterStatus {
+        observers: observers
+            .into_iter()
+            .map(|(id, addr)| (id.0, addr))
+            .collect(),
+    };
+    cluster
+        .update_status_checked::<ClusterSpec>(info.id, info.revision, &status)
+        .await
+}
+
+/// 리더가 그 노드에 복제했다고 아는 마지막 로그 인덱스
+fn matched(m: &RaftMetrics<NodeId, BasicNode>, id: NodeId) -> Option<u64> {
+    m.replication
+        .as_ref()
+        .and_then(|r| r.get(&id).copied().flatten())
+        .map(|l| l.index)
 }
 
 /// 두 단계 변경의 첫 단계(joint)까지만 된 구성을 uniform으로 마무리한다. 다른 쪽의 변경이 곧 두 번째 단계를
@@ -499,7 +761,16 @@ async fn change_members(
     changes: ChangeMembers<NodeId, BasicNode>,
     timeout: Duration,
 ) -> Outcome {
-    match tokio::time::timeout(timeout, raft.change_membership(changes, true)).await {
+    outcome(tokio::time::timeout(timeout, raft.change_membership(changes, true)).await)
+}
+
+type MembershipResult = Result<
+    Result<ClientWriteResponse<TypeConfig>, RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>>,
+    tokio::time::error::Elapsed,
+>;
+
+fn outcome(result: MembershipResult) -> Outcome {
+    match result {
         Err(_) => Outcome::Failed("timed out".into()),
         Ok(Ok(_)) => Outcome::Done,
         Ok(Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(
@@ -537,6 +808,7 @@ mod tests {
             alive: true,
             offline: false,
             caught_up: true,
+            observer: false,
         }
     }
 
@@ -562,36 +834,36 @@ mod tests {
         ];
         // zone b·없음에 투표 멤버가 없다. 같으면 id가 작은 것.
         assert_eq!(
-            plan(id(1), &members, 5, false),
+            plan(id(1), &members, 5, false, false),
             Some(Change::Promote(id(4)))
         );
         members[3].voter = true;
         assert_eq!(
-            plan(id(1), &members, 5, false),
+            plan(id(1), &members, 5, false, false),
             Some(Change::Promote(id(5)))
         );
         members[4].voter = true;
         assert_eq!(
-            plan(id(1), &members, 5, false),
+            plan(id(1), &members, 5, false, false),
             Some(Change::Promote(id(3)))
         );
         members[2].voter = true;
-        assert_eq!(plan(id(1), &members, 5, false), None);
+        assert_eq!(plan(id(1), &members, 5, false, false), None);
         // 노드가 상한보다 적으면 모두 투표 멤버다.
-        assert_eq!(plan(id(1), &members, 7, false), None);
+        assert_eq!(plan(id(1), &members, 7, false, false), None);
     }
 
     #[test]
     fn only_healthy_caught_up_learners_are_promoted() {
         let mut members = vec![member(1, true, None), member(2, false, None)];
         members[1].healthy = false;
-        assert_eq!(plan(id(1), &members, 5, false), None);
+        assert_eq!(plan(id(1), &members, 5, false, false), None);
         members[1].healthy = true;
         members[1].caught_up = false;
-        assert_eq!(plan(id(1), &members, 5, false), None);
+        assert_eq!(plan(id(1), &members, 5, false, false), None);
         members[1].caught_up = true;
         assert_eq!(
-            plan(id(1), &members, 5, false),
+            plan(id(1), &members, 5, false, false),
             Some(Change::Promote(id(2)))
         );
     }
@@ -608,17 +880,26 @@ mod tests {
             member(7, true, Some("c")),
         ];
         // zone a가 셋으로 가장 많다. 리더(3)는 빼고 id가 큰 것.
-        assert_eq!(plan(id(3), &members, 5, false), Some(Change::Demote(id(2))));
+        assert_eq!(
+            plan(id(3), &members, 5, false, false),
+            Some(Change::Demote(id(2)))
+        );
         members[1].voter = false;
         // 이제 모든 zone이 둘이다. 건강하지 않은 것 먼저.
         members[3].healthy = false;
-        assert_eq!(plan(id(3), &members, 5, false), Some(Change::Demote(id(4))));
+        assert_eq!(
+            plan(id(3), &members, 5, false, false),
+            Some(Change::Demote(id(4)))
+        );
         members[3].healthy = true;
         // 위트니스는 내리지 않는다.
         members[6].witness = true;
-        assert_eq!(plan(id(3), &members, 5, false), Some(Change::Demote(id(6))));
+        assert_eq!(
+            plan(id(3), &members, 5, false, false),
+            Some(Change::Demote(id(6)))
+        );
         // 새 임기의 처음에는 개수 때문에 내리지 않는다.
-        assert_eq!(plan(id(3), &members, 5, true), None);
+        assert_eq!(plan(id(3), &members, 5, true, false), None);
     }
 
     #[test]
@@ -631,11 +912,14 @@ mod tests {
         ];
         members[3].witness = true;
         assert_eq!(
-            plan(id(1), &members, 3, false),
+            plan(id(1), &members, 3, false, false),
             Some(Change::Promote(id(4)))
         );
         members[3].voter = true;
-        assert_eq!(plan(id(1), &members, 3, false), Some(Change::Demote(id(3))));
+        assert_eq!(
+            plan(id(1), &members, 3, false, false),
+            Some(Change::Demote(id(3)))
+        );
     }
 
     /// 상한만큼의 투표 멤버 가운데 하나가 오프라인이면 learner 하나로 한 번에 바꾼다(빠진 zone의 것 먼저).
@@ -650,7 +934,7 @@ mod tests {
         ];
         dead(&mut members[2]);
         assert_eq!(
-            plan(id(1), &members, 3, false),
+            plan(id(1), &members, 3, false, false),
             Some(Change::Replace {
                 out: id(3),
                 by: id(5)
@@ -658,12 +942,12 @@ mod tests {
         );
         // 오프라인 위트니스는 바꾸지 않는다.
         members[2].witness = true;
-        assert_eq!(plan(id(1), &members, 3, false), None);
+        assert_eq!(plan(id(1), &members, 3, false, false), None);
         // 올릴 수 있는 learner가 없으면 그대로 둔다.
         members[2].witness = false;
         members[3].healthy = false;
         members[4].caught_up = false;
-        assert_eq!(plan(id(1), &members, 3, false), None);
+        assert_eq!(plan(id(1), &members, 3, false, false), None);
     }
 
     /// 노드 여섯·상한 다섯에서 죽은 투표 멤버는 남은 learner로 한 번에 바뀐다.
@@ -672,7 +956,7 @@ mod tests {
         let mut members: Vec<Member> = (1..=6).map(|i| member(i, i <= 5, None)).collect();
         dead(&mut members[4]);
         assert_eq!(
-            plan(id(1), &members, 5, false),
+            plan(id(1), &members, 5, false, false),
             Some(Change::Replace {
                 out: id(5),
                 by: id(6)
@@ -692,12 +976,12 @@ mod tests {
         ];
         members[2].witness = true;
         dead(&mut members[1]);
-        assert_eq!(plan(id(1), &members, 5, false), None);
-        assert_eq!(plan(id(1), &members, 3, false), None);
+        assert_eq!(plan(id(1), &members, 5, false, false), None);
+        assert_eq!(plan(id(1), &members, 3, false, false), None);
         // 노드 셋
         members[2].witness = false;
-        assert_eq!(plan(id(1), &members, 5, false), None);
-        assert_eq!(plan(id(1), &members, 3, false), None);
+        assert_eq!(plan(id(1), &members, 5, false, false), None);
+        assert_eq!(plan(id(1), &members, 3, false, false), None);
     }
 
     #[test]
@@ -713,11 +997,11 @@ mod tests {
         for m in &mut members[2..5] {
             dead(m);
         }
-        assert_eq!(plan(id(1), &members, 5, false), None);
+        assert_eq!(plan(id(1), &members, 5, false, false), None);
         // 셋이 살아 있으면(과반) 오프라인 하나를 learner로 바꿀 수 있다(바꾼 뒤 다섯 중 넷이 살아 있다).
         members[2] = member(3, true, None);
         assert_eq!(
-            plan(id(1), &members, 5, false),
+            plan(id(1), &members, 5, false, false),
             Some(Change::Replace {
                 out: id(4),
                 by: id(6)
@@ -737,11 +1021,14 @@ mod tests {
             m.healthy = false;
             m.alive = false;
         }
-        assert_eq!(plan(id(1), &members, 3, false), None);
+        assert_eq!(plan(id(1), &members, 3, false, false), None);
         // 위트니스 하나가 살아 있으면 내릴 수 있다.
         members[3].healthy = true;
         members[3].alive = true;
-        assert_eq!(plan(id(1), &members, 3, false), Some(Change::Demote(id(3))));
+        assert_eq!(
+            plan(id(1), &members, 3, false, false),
+            Some(Change::Demote(id(3)))
+        );
     }
 
     /// 새 리더는 리스 표가 비어 투표 멤버를 기준점에 갱신한 것으로 쳐 건강하다고 본다. 과반은 그 유예 없이
@@ -760,13 +1047,165 @@ mod tests {
             m.alive = false;
         }
         // 새 임기의 처음에는 내리지 않는다.
-        assert_eq!(plan(id(1), &members, 3, true), None);
+        assert_eq!(plan(id(1), &members, 3, true, false), None);
         // 그 뒤에는 살아 있지 않은 것을 먼저 내린다(살아 있는 2·3을 내리면 넷 중 둘만 살아 있다).
-        assert_eq!(plan(id(1), &members, 3, false), Some(Change::Demote(id(5))));
+        assert_eq!(
+            plan(id(1), &members, 3, false, false),
+            Some(Change::Demote(id(5)))
+        );
         // 살아 있는 투표 멤버만 남은 후보라면 과반이 깨지므로 내리지 않는다.
         members[3].witness = true;
         members[4].witness = true;
-        assert_eq!(plan(id(1), &members, 3, false), None);
+        assert_eq!(plan(id(1), &members, 3, false, false), None);
+    }
+
+    /// Raft 밖의 관찰 노드
+    fn observer(n: u64, zone: Option<&str>) -> Member {
+        Member {
+            observer: true,
+            caught_up: false,
+            ..member(n, false, zone)
+        }
+    }
+
+    /// 투표 멤버 다섯(1..=5)과 learner `learners`
+    fn five_voters_and(learners: &[u64]) -> Vec<Member> {
+        (1..=5)
+            .map(|i| member(i, true, None))
+            .chain(learners.iter().map(|&i| member(i, false, None)))
+            .collect()
+    }
+
+    /// 대기 learner가 둘보다 많으면 모든 노드가 기능을 알 때만 하나를 관찰 노드로 내린다(대기 learner가 많은 zone의
+    /// 것, 나중에 들어온 것). 건강하지 않은 learner와 위트니스는 세지도 내리지도 않고, 새 임기의 처음에는 하지 않는다.
+    #[test]
+    fn extra_standby_learners_become_observers() {
+        let mut members = five_voters_and(&[6, 7, 8]);
+        assert_eq!(plan(id(1), &members, 5, false, false), None);
+        assert_eq!(
+            plan(id(1), &members, 5, false, true),
+            Some(Change::ToObserver(id(8)))
+        );
+        assert_eq!(plan(id(1), &members, 5, true, true), None);
+        // zone a에 대기 learner가 둘이면 그 가운데 나중 것
+        members[5].zone = Some("a".into());
+        members[6].zone = Some("a".into());
+        assert_eq!(
+            plan(id(1), &members, 5, false, true),
+            Some(Change::ToObserver(id(7)))
+        );
+        // 건강하지 않은 learner는 대기로 세지 않는다(둘만 남아 아무것도 하지 않는다).
+        members[7].healthy = false;
+        assert_eq!(plan(id(1), &members, 5, false, true), None);
+        // 위트니스 learner는 먼저 투표 멤버로 올린다(관찰 노드로 내리지 않는다).
+        members[7].healthy = true;
+        members[7].witness = true;
+        assert_eq!(
+            plan(id(1), &members, 5, false, true),
+            Some(Change::Promote(id(8)))
+        );
+        // 오프라인 투표 멤버가 있으면(바꿀 learner가 따라잡는 중) 내리지 않는다.
+        let mut members = five_voters_and(&[6, 7, 8]);
+        dead(&mut members[4]);
+        for m in &mut members[5..] {
+            m.caught_up = false;
+        }
+        assert_eq!(plan(id(1), &members, 5, false, true), None);
+    }
+
+    /// 대기 learner가 둘보다 적거나 투표 멤버가 모자란데 올릴 learner가 없으면 건강한 관찰 노드를 learner로 올린다
+    /// (투표 멤버가 적은 zone의 것 먼저). 새 임기의 처음에는 하지 않는다.
+    #[test]
+    fn observers_come_back_as_learners_when_standbys_run_short() {
+        let mut members = five_voters_and(&[6]);
+        members.push(observer(7, None));
+        members.push(observer(8, Some("b")));
+        // 투표 멤버는 모두 zone 없음이다. zone b의 관찰 노드가 먼저.
+        assert_eq!(
+            plan(id(1), &members, 5, false, true),
+            Some(Change::ToLearner(id(8)))
+        );
+        assert_eq!(plan(id(1), &members, 5, true, true), None);
+        // 건강하지 않은 관찰 노드는 올리지 않는다.
+        members[7].healthy = false;
+        assert_eq!(
+            plan(id(1), &members, 5, false, true),
+            Some(Change::ToLearner(id(7)))
+        );
+        // 대기 learner가 둘이면 그대로다.
+        members[6].observer = false;
+        members[6].caught_up = true;
+        assert_eq!(plan(id(1), &members, 5, false, true), None);
+        // 투표 멤버가 상한보다 적은데 올릴 learner가 없다(따라잡는 중이 아니라 아예 없다).
+        let members = vec![
+            member(1, true, None),
+            member(2, true, None),
+            member(3, true, None),
+            observer(4, None),
+        ];
+        assert_eq!(
+            plan(id(1), &members, 5, false, false),
+            Some(Change::ToLearner(id(4)))
+        );
+    }
+
+    /// 죽은 투표 멤버를 대기 learner로 바꾸면 대기가 줄어 관찰 노드가 learner로 올라온다(그 뒤 다시 죽은 투표
+    /// 멤버가 생기면 그것이 올라간다).
+    #[test]
+    fn a_dead_voter_pulls_an_observer_through_learner_to_voter() {
+        let mut members = five_voters_and(&[6, 7]);
+        members.push(observer(8, Some("z")));
+        dead(&mut members[4]);
+        assert_eq!(
+            plan(id(1), &members, 5, false, true),
+            Some(Change::Replace {
+                out: id(5),
+                by: id(6)
+            })
+        );
+        // 바꾼 뒤: 5는 죽은 learner, 6은 투표 멤버. 건강한 대기는 7 하나.
+        members[4].voter = false;
+        members[5].voter = true;
+        assert_eq!(
+            plan(id(1), &members, 5, false, true),
+            Some(Change::ToLearner(id(8)))
+        );
+        // 8이 learner로 따라잡은 뒤 투표 멤버 하나가 더 죽으면 zone이 다른 8이 올라간다.
+        members[7].observer = false;
+        members[7].caught_up = true;
+        dead(&mut members[3]);
+        assert_eq!(
+            plan(id(1), &members, 5, false, true),
+            Some(Change::Replace {
+                out: id(4),
+                by: id(8)
+            })
+        );
+    }
+
+    /// 어떤 경우에도 투표 멤버를 관찰 노드로 내리지 않는다.
+    #[test]
+    fn voters_never_become_observers() {
+        for n in 1..=9u64 {
+            for voters in 1..=n {
+                for limit in [3, 5, 7] {
+                    for settling in [false, true] {
+                        let members: Vec<Member> =
+                            (1..=n).map(|i| member(i, i <= voters, None)).collect();
+                        if let Some(Change::ToObserver(id)) =
+                            plan(NodeId::from(1), &members, limit, settling, true)
+                        {
+                            assert!(!members.iter().any(|m| m.id == id && m.voter));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_observer_feature_is_listed() {
+        assert!(opl_types::node::FEATURES.contains(&OBSERVER));
     }
 
     fn node(n: u64, features: &[&str], version: Option<&str>) -> (NodeId, Node) {

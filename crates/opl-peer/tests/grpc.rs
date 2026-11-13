@@ -1379,11 +1379,14 @@ async fn start_observer(ca: &ClusterCa, root: &TempDir, leader: &Node) -> Node {
     let tls = tls_for(ca, id);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    // 목록에 적은 뒤 멤버십에서 뺀다(그 사이에도 거절되지 않게).
+    // 목록에 적은 뒤 멤버십에서 뺀다(그 사이에도 거절되지 않게). 리더의 키퍼처럼 `RemoveNodes`로 뺀다
+    // (`LeaderRequest::Remove`는 노드를 지우는 것이라 목록에서도 뺀다).
     set_observers(leader, &[(id, addr.clone())]).await;
     leader
         .cluster
-        .request(LeaderRequest::Remove { id })
+        .raft()
+        .unwrap()
+        .change_membership(openraft::ChangeMembers::RemoveNodes([id].into()), false)
         .await
         .unwrap();
 
@@ -1393,7 +1396,13 @@ async fn start_observer(ca: &ClusterCa, root: &TempDir, leader: &Node) -> Node {
     // learner의 저장소 작업이 아직 파일을 쥐고 있으면 잠시 뒤 다시 연다.
     let deadline = Instant::now() + WAIT;
     let cluster = loop {
-        match Cluster::open_observer(config.clone(), peers.clone()).await {
+        match Cluster::open_observer(
+            config.clone(),
+            GrpcNetwork::new(peers.clone()),
+            peers.clone(),
+        )
+        .await
+        {
             Err(opl_cluster::ClusterError::Store(_)) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

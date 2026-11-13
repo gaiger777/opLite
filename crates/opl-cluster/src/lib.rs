@@ -9,6 +9,7 @@ mod lease;
 mod log_store;
 pub mod memnet;
 mod replica;
+mod roles;
 mod state_machine;
 pub mod store;
 pub mod types;
@@ -23,6 +24,10 @@ pub use health::{QUORUM_ACK_MAX, RaftHealth};
 pub use leader::{CATCH_UP_TIMEOUT, Forwarder, LeaderError};
 pub use lease::Leases;
 pub use log_store::LogStore;
+pub use roles::{RoleKeeper, RoleKeeperConfig};
 pub use state_machine::StateMachine;
 pub use vip::{VipLeases, VipRenewal};
-pub use voters::{VOTER_LIMIT, VoterKeeper, VoterKeeperConfig, ZONE_LABEL, leader_manages_voters};
+pub use voters::{
+    OBSERVER, STANDBY_LEARNERS, VOTER_LIMIT, VoterKeeper, VoterKeeperConfig, ZONE_LABEL,
+    leader_manages_voters,
+};

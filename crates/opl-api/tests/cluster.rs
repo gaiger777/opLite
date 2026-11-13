@@ -6,7 +6,7 @@ use common::Env;
 use opl_api::cluster::{JoinRequest, JoinUrl};
 use opl_cluster::types::NodeId;
 use opl_peer::pki::{fingerprint, first_cert, node_id_of, node_key_and_csr};
-use opl_types::cluster::JoinTokenSpec;
+use opl_types::cluster::{ClusterSpec, ClusterStatus, JoinTokenSpec};
 use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::version::BUILD;
@@ -197,6 +197,60 @@ async fn a_rejoining_learner_gets_its_new_cluster_address() {
     let joined = env.cluster.get::<NodeSpec>(node).unwrap().unwrap();
     assert_eq!(joined.spec.address, "10.0.0.8:8006");
     assert!(joined.status.online);
+}
+
+/// 관찰 노드(Raft 밖, 클러스터 정보의 목록에 있음)도 learner처럼 다시 합류한다: 온라인이면 id를 가로챌 수 없고,
+/// 오프라인이면 새 주소로 learner가 되며 목록에서 빠진다.
+#[tokio::test]
+async fn a_rejoining_observer_is_treated_like_a_learner() {
+    let env = Env::start().await;
+    let anon = env.anonymous();
+    let (req, node) = join_request(&new_token(&env).await, "node2");
+    assert_eq!(
+        anon.post("/cluster/join", json!(req)).await.0,
+        StatusCode::OK
+    );
+    // 키퍼가 관찰 노드로 내린 것처럼: 목록에 쓰고 멤버십에서 뺀다.
+    let (_, infos) = env.cluster.list::<ClusterSpec>().unwrap();
+    let info = &infos[0];
+    let status = ClusterStatus {
+        observers: [(node, "10.0.0.7:8007".to_string())].into(),
+    };
+    env.cluster
+        .update_status::<ClusterSpec>(info.id, &status)
+        .await
+        .unwrap();
+    env.cluster
+        .request(opl_cluster::types::LeaderRequest::Remove { id: NodeId(node) })
+        .await
+        .unwrap();
+    // `Remove`는 목록에서도 뺀다. 다시 목록에 둔다(멤버십 밖의 관찰 노드).
+    env.cluster
+        .update_status::<ClusterSpec>(info.id, &status)
+        .await
+        .unwrap();
+    assert!(env.cluster.members().observers.contains_key(&NodeId(node)));
+
+    let mut req = join_request(&new_token(&env).await, "node2").0;
+    req.node = node;
+    req.address = "10.0.0.8:8006".into();
+    req.cluster_address = "10.0.0.8:8007".into();
+    let (status, body) = anon.post("/cluster/join", json!(req.clone())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "already_member");
+
+    mark_offline(&env, node).await;
+    req.token = new_token(&env).await;
+    let (status, body) = anon.post("/cluster/join", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let members = env.cluster.members();
+    assert_eq!(
+        members.learners.get(&NodeId(node)).map(String::as_str),
+        Some("10.0.0.8:8007")
+    );
+    assert!(members.observers.is_empty());
+    let (_, infos) = env.cluster.list::<ClusterSpec>().unwrap();
+    assert!(infos[0].status.observers.is_empty());
 }
 
 /// 합류 요청의 `witness`가 Node의 역할이 된다. 적지 않으면 일반 노드다. 역할은 노드를 고쳐도

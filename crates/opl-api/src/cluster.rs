@@ -571,7 +571,12 @@ pub async fn join(
     // learner이면 합류하다 멈춘 노드다. 같은 이름의 오프라인 노드만 새 토큰으로 다시 합류할 수 있다.
     // 그래야 토큰을 가진 쪽이 승격을 기다리는 살아 있는 노드의 id를 가로채지 못한다.
     let members = state.cluster.members();
-    let learner_addr = members.learners.get(&NodeId(req.node)).cloned();
+    // 관찰 노드도 learner처럼 본다(같은 이름의 오프라인 노드만 다시 합류하고, 주소가 바뀌었으면 먼저 뺀다).
+    let learner_addr = members
+        .learners
+        .get(&NodeId(req.node))
+        .or_else(|| members.observers.get(&NodeId(req.node)))
+        .cloned();
     let rejoin_ok = || -> Result<bool, ApiError> {
         Ok(state
             .cluster

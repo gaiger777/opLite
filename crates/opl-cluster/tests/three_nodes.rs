@@ -453,3 +453,52 @@ async fn concurrent_membership_changes_wait_for_each_other() {
     let members = c.members();
     assert!(members.voters.contains_key(&n4) && members.voters.contains_key(&n5));
 }
+
+/// 승격(`AddVoter`)은 learner가 따라잡기를 기다린 뒤 바로 앞에서 관찰 노드 목록을 다시 본다: 기다리는 사이 목록에
+/// 적힌 노드(관찰 노드로 내려가며 로그를 지운다)는 올리지 않는다.
+#[tokio::test]
+async fn a_learner_listed_as_an_observer_while_catching_up_is_not_promoted() {
+    use opl_types::cluster::{ClusterSpec, ClusterStatus};
+    use opl_types::resource::Resource;
+
+    let mut tc = TestCluster::start(3).await;
+    let leader = tc.leader().await;
+    let n4 = node(4);
+    tc.open(n4).await;
+    tc.get(leader).add_learner(n4, addr(4)).await.unwrap();
+    let info = Resource::new(
+        "c",
+        ClusterSpec {
+            ca_cert_pem: "CERT".into(),
+            ca_key_pem: "KEY".into(),
+        },
+    );
+    tc.get(leader).create(&info).await.unwrap();
+
+    // learner가 따라잡지 못하는 동안 승격을 요청하고, 그 사이 목록에 적는다.
+    tc.router.block_raft(n4);
+    tc.get(leader).create(&volume("unseen")).await.unwrap();
+    let c = tc.get(leader);
+    let list_then_heal = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let status = ClusterStatus {
+            observers: [(n4.0, "node-4".to_string())].into(),
+        };
+        c.update_status::<ClusterSpec>(info.id, &status)
+            .await
+            .unwrap();
+        tc.router.heal(n4);
+    };
+    let (promoted, ()) = tokio::join!(
+        c.execute_as_leader(LeaderRequest::AddVoter { id: n4 }),
+        list_then_heal
+    );
+    assert!(
+        matches!(
+            promoted,
+            Err(ClusterError::Rejected(Rejection::NotFound { .. }))
+        ),
+        "{promoted:?}"
+    );
+    assert!(!c.members().voters.contains_key(&n4));
+}

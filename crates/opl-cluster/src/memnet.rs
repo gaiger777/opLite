@@ -254,6 +254,7 @@ impl FollowClient for MemFollow {
     }
 }
 
+#[derive(Clone)]
 pub struct MemNetwork {
     from: NodeId,
     router: MemRouter,

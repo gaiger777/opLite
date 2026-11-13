@@ -1,5 +1,6 @@
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use openraft::storage::RaftStateMachine;
 use openraft::{
@@ -39,17 +40,31 @@ struct SnapshotData {
 }
 
 /// 리소스 상태 머신. 엔트리 묶음 하나를 redb 트랜잭션 하나로 적용하므로
-/// 리소스와 `last_applied`는 항상 함께 기록된다. 쓰기는 저장소 스레드에서 돈다.
+/// 리소스와 `last_applied`는 항상 함께 기록된다. 쓰기는 저장소 스레드에서 돈다. 적용 묶음을 구독자에게 내는
+/// 것도 같은 저장소 스레드의 쓰기 안에서 해, 저장소와 적용 리비전의 차례가 다른 쓰기(전환)와 어긋나지 않는다.
 #[derive(Clone)]
 pub struct StateMachine {
     db: Arc<Database>,
     watch: Arc<WatchHub>,
     writer: StoreWriter,
+    /// 이 상태 머신을 쓰는 Raft가 계획된 전환으로 물러났다. openraft는 `shutdown` 뒤에도 상태 머신 작업이 남은
+    /// 적용을 마저 할 수 있어, 전환이 저장소 스레드에서 이것을 세운 뒤의 적용·설치는 쓰지 않고 `Retired`다.
+    retired: Arc<AtomicBool>,
 }
 
 impl StateMachine {
     pub(crate) fn new(db: Arc<Database>, watch: Arc<WatchHub>, writer: StoreWriter) -> Self {
-        Self { db, watch, writer }
+        Self {
+            db,
+            watch,
+            writer,
+            retired: Arc::default(),
+        }
+    }
+
+    /// 전환이 저장소 스레드의 쓰기 안에서 세우는 표시
+    pub(crate) fn retired_flag(&self) -> Arc<AtomicBool> {
+        self.retired.clone()
     }
 
     fn read_applied(&self) -> Result<(Option<LogId<NodeId>>, Membership), StoreError> {
@@ -212,6 +227,13 @@ pub(crate) fn snapshot_objects(
         objects.push((kind, serde_json::from_slice(value.value())?));
     }
     Ok((last_log_id, last_membership, objects))
+}
+
+/// 지금 상태 전체를 스냅샷으로 저장한다(이미 저장된 스냅샷이 같거나 더 새로우면 그대로). 관찰 노드가 다시 Raft를
+/// 띄우기 전에 부른다: 지운 로그 대신 openraft가 뒤처진 노드에 보낼 스냅샷이 적용 위치까지 있어야 한다.
+pub(crate) fn save_current_snapshot(db: &Database) -> Result<(), StoreError> {
+    let (meta, data) = StateMachine::snapshot_data(db)?;
+    StateMachine::save_snapshot(db, &meta, &data)
 }
 
 /// 관찰 노드가 Follow로 받은 스냅샷(리소스 전체)을 `StateMachine::install`로 설치한다.
@@ -479,14 +501,21 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         I::IntoIter: OptionalSend,
     {
         let entries: Vec<_> = entries.into_iter().collect();
-        let (responses, batch) = self
+        let (watch, retired) = (self.watch.clone(), self.retired.clone());
+        let responses = self
             .writer
-            .run(move |db| Self::apply_entries(db, entries))
+            .run(move |db| {
+                if retired.load(Ordering::SeqCst) {
+                    return Err(StoreError::Retired);
+                }
+                let (responses, batch) = Self::apply_entries(db, entries)?;
+                if let Some(batch) = batch {
+                    watch.publish(batch);
+                }
+                Ok(responses)
+            })
             .await
             .map_err(|e| StorageIOError::write_state_machine(&e))?;
-        if let Some(batch) = batch {
-            self.watch.publish(batch);
-        }
         Ok(responses)
     }
 
@@ -506,11 +535,18 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let (m, data) = (meta.clone(), snapshot.into_inner());
+        let (watch, retired) = (self.watch.clone(), self.retired.clone());
         self.writer
-            .run(move |db| Self::install(db, &m, data))
+            .run(move |db| {
+                if retired.load(Ordering::SeqCst) {
+                    return Err(StoreError::Retired);
+                }
+                Self::install(db, &m, data)?;
+                watch.reset(m.last_log_id.map_or(0, |l| l.index));
+                Ok(())
+            })
             .await
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
-        self.watch.reset(meta.last_log_id.map_or(0, |l| l.index));
         Ok(())
     }
 

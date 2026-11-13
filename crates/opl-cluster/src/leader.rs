@@ -9,12 +9,15 @@ use async_trait::async_trait;
 use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
 use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, ChangeMembers, Raft, RaftMetrics};
+use opl_types::cluster::ClusterStatus;
 use opl_types::resource::Kind;
+use redb::Database;
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::ClusterError;
 use crate::lease::{ConfirmBatch, LeaseTable};
-use crate::types::{LeaderRequest, NodeId, Rejection, Response, TypeConfig};
+use crate::store::list_objects;
+use crate::types::{Command, LeaderRequest, NodeId, Rejection, Response, TypeConfig};
 use crate::vip::VipTable;
 
 /// learner가 로그를 따라잡기를 기다리는 최대 시간. 스냅샷을 받아야 하면 오래 걸린다.
@@ -94,6 +97,8 @@ impl From<LeaderError> for ClusterError {
 pub(crate) struct LeaderCtx {
     pub(crate) raft: Raft<TypeConfig>,
     pub(crate) confirm: ConfirmBatch,
+    /// 이 노드의 저장소(클러스터 정보의 관찰 노드 목록을 읽는다)
+    pub(crate) db: Arc<Database>,
     pub(crate) leases: Arc<LeaseTable>,
     pub(crate) vips: Arc<VipTable>,
 }
@@ -138,8 +143,10 @@ pub(crate) async fn execute(
             if membership.voter_ids().any(|v| v == id) {
                 return Ok(m.last_applied.map_or(0, |l| l.index));
             }
-            // learner가 아니면(빠졌거나 더한 적이 없으면) 따라잡기를 기다리지 않고 바로 거부한다.
-            if membership.get_node(&id).is_none() {
+            // learner가 아니면(빠졌거나 더한 적이 없으면) 따라잡기를 기다리지 않고 바로 거부한다. 관찰 노드 목록에
+            // 있는 learner(관찰 노드로 내려가는 중)도 올리지 않는다(내려가며 로그를 지우는 노드가 투표 멤버가 되면 안
+            // 된다).
+            if membership.get_node(&id).is_none() || observers(&ctx.db)?.contains_key(&id) {
                 return Err(ClusterError::Rejected(Rejection::NotFound {
                     kind: Kind::Node,
                     id: id.0,
@@ -159,6 +166,13 @@ pub(crate) async fn execute(
                 )
                 .await
                 .map_err(|_| ClusterError::Timeout)?;
+            // 기다리는 사이 키퍼가 이 노드를 관찰 노드 목록에 적었을 수 있다(내려가며 로그를 지운다). 바로 앞에서 다시 본다.
+            if observers(&ctx.db)?.contains_key(&id) {
+                return Err(ClusterError::Rejected(Rejection::NotFound {
+                    kind: Kind::Node,
+                    id: id.0,
+                }));
+            }
             let change = ChangeMembers::AddVoterIds(BTreeSet::from([id]));
             retry_in_progress(timeout, || raft.change_membership(change.clone(), false)).await
         }
@@ -167,32 +181,109 @@ pub(crate) async fn execute(
             if m.state != openraft::ServerState::Leader {
                 return Err(not_leader(&m));
             }
-            let membership = m.membership_config.membership();
-            let change = if membership.voter_ids().any(|v| v == id) {
-                ChangeMembers::RemoveVoters(BTreeSet::from([id]))
-            } else if membership.learner_ids().any(|v| v == id) {
-                ChangeMembers::RemoveNodes(BTreeSet::from([id]))
-            } else {
-                return Ok(m.last_applied.map_or(0, |l| l.index));
-            };
             let deadline = tokio::time::Instant::now() + timeout;
-            let index =
-                retry_in_progress(timeout, || raft.change_membership(change.clone(), false))
-                    .await?;
-            // 두 단계 변경의 두 번째 단계보다 VoterKeeper가 joint를 먼저 마무리했으면(learner로 남긴다) 두 번째
-            // 단계는 할 일이 없어 이 노드가 learner로 남는다. 다시 읽어 지운다.
-            let m = raft.metrics().borrow().clone();
-            if !m
-                .membership_config
-                .membership()
-                .learner_ids()
-                .any(|v| v == id)
+            let index = remove_member(raft, &m, id, deadline).await?;
+            // 관찰 노드 목록에서도 뺀다(멤버십에서 먼저 빼야 키퍼가 목록에서만 빠진 learner를 보지 않는다).
+            let unlisted = unlist_observer(ctx, id, deadline).await?;
+            Ok(unlisted
+                .or(index)
+                .unwrap_or_else(|| m.last_applied.map_or(0, |l| l.index)))
+        }
+    }
+}
+
+/// 노드를 멤버십에서 뺀다(learner로 남기지 않는다). 멤버십에 없으면 `None`이다.
+async fn remove_member(
+    raft: &Raft<TypeConfig>,
+    m: &RaftMetrics<NodeId, BasicNode>,
+    id: NodeId,
+    deadline: tokio::time::Instant,
+) -> Result<Option<u64>, ClusterError> {
+    let membership = m.membership_config.membership();
+    let change = if membership.voter_ids().any(|v| v == id) {
+        ChangeMembers::RemoveVoters(BTreeSet::from([id]))
+    } else if membership.learner_ids().any(|v| v == id) {
+        ChangeMembers::RemoveNodes(BTreeSet::from([id]))
+    } else {
+        return Ok(None);
+    };
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let index =
+        retry_in_progress(remaining, || raft.change_membership(change.clone(), false)).await?;
+    // 두 단계 변경의 두 번째 단계보다 VoterKeeper가 joint를 먼저 마무리했으면(learner로 남긴다) 두 번째
+    // 단계는 할 일이 없어 이 노드가 learner로 남는다. 다시 읽어 지운다.
+    let m = raft.metrics().borrow().clone();
+    if !m
+        .membership_config
+        .membership()
+        .learner_ids()
+        .any(|v| v == id)
+    {
+        return Ok(Some(index));
+    }
+    let change = ChangeMembers::RemoveNodes(BTreeSet::from([id]));
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    retry_in_progress(remaining, || raft.change_membership(change.clone(), false))
+        .await
+        .map(Some)
+}
+
+/// 이 노드의 저장소에 있는 클러스터 정보와 그 관찰 노드 목록(클러스터 정보가 없으면 `None`)
+fn cluster_info(
+    db: &Database,
+) -> Result<Option<(crate::types::RawResource, ClusterStatus)>, ClusterError> {
+    let Some(info) = list_objects(db, Kind::Cluster)?.1.into_iter().next() else {
+        return Ok(None);
+    };
+    let status = serde_json::from_value(info.status.clone())?;
+    Ok(Some((info, status)))
+}
+
+/// 클러스터 정보의 관찰 노드 목록
+fn observers(db: &Database) -> Result<std::collections::BTreeMap<NodeId, String>, ClusterError> {
+    Ok(cluster_info(db)?
+        .map(|(_, status)| {
+            status
+                .observers
+                .into_iter()
+                .map(|(id, addr)| (NodeId(id), addr))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// 클러스터 정보의 관찰 노드 목록에서 `id`를 뺀다. 목록에 없으면 `None`, 뺐으면 그 쓰기의 인덱스다. 다른 쓰기와
+/// 겹치면(revision 불일치, 리더가 아직 적용하지 않은 쓰기) 다시 읽어 `deadline`까지 다시 한다.
+async fn unlist_observer(
+    ctx: &LeaderCtx,
+    id: NodeId,
+    deadline: tokio::time::Instant,
+) -> Result<Option<u64>, ClusterError> {
+    loop {
+        let Some((info, mut status)) = cluster_info(&ctx.db)? else {
+            return Ok(None);
+        };
+        if status.observers.remove(&id.0).is_none() {
+            return Ok(None);
+        }
+        let command = Command::UpdateStatusIf {
+            kind: Kind::Cluster,
+            id: info.id,
+            expected_revision: info.revision,
+            status: serde_json::to_value(&status)?,
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let resp = tokio::time::timeout(remaining, ctx.raft.client_write(command))
+            .await
+            .map_err(|_| ClusterError::Timeout)??;
+        match resp.data.0 {
+            Ok(index) => return Ok(Some(index)),
+            Err(Rejection::RevisionMismatch { .. })
+                if tokio::time::Instant::now() + IN_PROGRESS_RETRY_INTERVAL < deadline =>
             {
-                return Ok(index);
+                tokio::time::sleep(IN_PROGRESS_RETRY_INTERVAL).await;
             }
-            let change = ChangeMembers::RemoveNodes(BTreeSet::from([id]));
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            retry_in_progress(remaining, || raft.change_membership(change.clone(), false)).await
+            Err(rejection) => return Err(rejection.into()),
         }
     }
 }

@@ -8,7 +8,7 @@ use std::time::Duration;
 use common::{Client, Env, WAIT};
 use openraft::BasicNode;
 use opl_api::{AppState, RuntimeProbe};
-use opl_cluster::types::{LeaderRequest, NodeId};
+use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterConfig, ClusterError};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
@@ -369,8 +369,12 @@ async fn start_observer(env: &Env) -> Arc<Cluster> {
         .update_status::<ClusterSpec>(info.id, &info.status)
         .await
         .unwrap();
+    // 리더의 키퍼처럼 목록에 적은 뒤 `RemoveNodes`로 뺀다(`LeaderRequest::Remove`는 노드를 지우는 것이라 목록에서도
+    // 뺀다).
     env.cluster
-        .request(LeaderRequest::Remove { id })
+        .raft()
+        .unwrap()
+        .change_membership(openraft::ChangeMembers::RemoveNodes([id].into()), false)
         .await
         .unwrap();
     env.router.unregister(id);
@@ -378,7 +382,13 @@ async fn start_observer(env: &Env) -> Arc<Cluster> {
     drop(learner);
     let deadline = std::time::Instant::now() + WAIT;
     let observer = loop {
-        match Cluster::open_observer(config.clone(), env.router.follower(id)).await {
+        match Cluster::open_observer(
+            config.clone(),
+            env.router.network(id),
+            env.router.follower(id),
+        )
+        .await
+        {
             Err(ClusterError::Store(_)) if std::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

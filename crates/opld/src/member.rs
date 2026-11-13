@@ -20,8 +20,8 @@ use opl_api::{
 };
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_cluster::{
-    CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Members, Typed, VoterKeeper,
-    VoterKeeperConfig, leader_manages_voters,
+    CATCH_UP_TIMEOUT, Cluster, ClusterConfig, ClusterError, Members, RoleKeeper, RoleKeeperConfig,
+    Typed, VoterKeeper, VoterKeeperConfig, leader_manages_voters,
 };
 use opl_driver::{
     DirStorage, Hypervisor, IpVip, LvmSharedStorage, LvmThinStorage, QemuHypervisor, RbdStorage,
@@ -220,6 +220,8 @@ pub struct Member {
     services: Option<Services>,
     register: JoinHandle<()>,
     promotion: JoinHandle<()>,
+    /// 이 노드의 역할(관찰 노드 ↔ 멤버)을 클러스터 정보의 관찰 노드 목록에 맞춘다.
+    roles: RoleKeeper,
     /// 생존 표시로만 리스를 갱신한다(HA 펜싱을 쓰는 노드는 `HaGuard`가 갱신하므로 없다).
     liveness: Option<JoinHandle<()>>,
     /// Raft가 멈추면 `exited`로 알린다. 정상 종료는 저장소를 닫기 전에 이것부터 멈춘다.
@@ -258,10 +260,14 @@ impl Member {
         cluster_config.raft = raft_config(config.witness);
         cluster_config.write_timeout = WRITE_TIMEOUT;
         let network = GrpcNetwork::new(peers.clone());
+        // 저장소에 적힌 모드로 연다: 관찰 노드로 내려간 노드는 Raft 없이 투표 멤버 하나를 따른다(설계 §6).
         let cluster = Arc::new(
-            run_on(&rt.core, Cluster::open(cluster_config, network))
-                .await?
-                .with_forwarder(peers.clone()),
+            run_on(
+                &rt.core,
+                Cluster::open_node(cluster_config, network, peers.clone()),
+            )
+            .await?
+            .with_forwarder(peers.clone()),
         );
         // 역할은 합류할 때 정해진다. 설정만 바꿔 다시 시작하면 아무것도 띄우지 않는다.
         if matches!(bootstrap, Bootstrap::Restart)
@@ -466,6 +472,10 @@ impl Member {
         // 다시 시작한 노드는 과반수가 없어도 VM을 계속 다스려야 하므로, Node 리소스는 뒤에서 기록한다.
         let promotion = on(&rt.core, || {
             spawn_promotion(first_time, false, &cluster, &peers)
+        });
+        // 전환은 Raft를 다시 띄우므로 core에서 돈다.
+        let roles = on(&rt.core, || {
+            RoleKeeper::spawn(cluster.clone(), RoleKeeperConfig::default())
         });
         let raft_watch = on(&rt.core, || watch_raft(&cluster, exited_tx.clone()));
         // 풀 마운터가 QEMU의 rbd 블록 드라이버를 확인한다.
@@ -680,6 +690,7 @@ impl Member {
             }),
             register,
             promotion,
+            roles,
             liveness,
             raft_watch,
             exited,
@@ -735,6 +746,9 @@ impl Member {
         let promotion = on(&rt.core, || {
             spawn_promotion(first_time, true, &cluster, &peers)
         });
+        let roles = on(&rt.core, || {
+            RoleKeeper::spawn(cluster.clone(), RoleKeeperConfig::default())
+        });
         let raft_watch = on(&rt.core, || watch_raft(&cluster, exited_tx));
         // 위트니스는 HA 펜싱이 없으므로 생존 표시로만 리스를 갱신한다.
         let liveness = on(&rt.core, || renew_liveness(cluster.clone(), LIVENESS_RENEW));
@@ -767,6 +781,7 @@ impl Member {
             services: None,
             register,
             promotion,
+            roles,
             liveness: Some(liveness),
             raft_watch,
             exited,
@@ -824,6 +839,8 @@ impl Member {
     pub async fn close(mut self, left: bool) -> anyhow::Result<()> {
         // 아래에서 저장소를 닫아 Raft가 멈춰도 실패로 알리지 않는다.
         self.raft_watch.abort();
+        // 역할 전환을 먼저 멈춘다(진행 중인 전환은 끝까지 간다).
+        self.roles.shutdown().await;
         if let Some(services) = self.services.take() {
             services.shutdown(left).await;
         }
@@ -962,8 +979,10 @@ fn picks_voters(me: NodeId, members: &Members, nodes: Vec<Typed<NodeSpec>>) -> b
 /// 요청한다(상한을 넘으면 리더가 다시 내린다).
 async fn leader_picks_voters_after_join(cluster: &Cluster) -> bool {
     let id = cluster.id();
+    // 관찰 노드는 리더의 키퍼만 올린다(스스로 요청하지 않는다).
     let Some(raft) = cluster.raft() else {
-        return false;
+        tracing::info!("this node is an observer; the leader picks the voting members");
+        return true;
     };
     let applied = raft
         .wait(Some(Duration::from_secs(10)))
@@ -1005,22 +1024,34 @@ pub fn remove_cluster_data(config: &Config) -> std::io::Result<()> {
 /// ([`leader_picks_voters`]) 위트니스가 아닌 노드는 요청하지 않고 learner로 남는다.
 async fn promote_until_voter(cluster: &Cluster, peers: &Peers, witness: bool) {
     let id = cluster.id();
-    // Raft 구성원이 아니면 올릴 것이 없다.
-    let Some(raft) = cluster.raft() else {
-        return;
-    };
     // 저장한 멤버십이 지표에 반영되고 저장소에 적용되기를 기다린다. 합류 직후 죽었으면 리더가 보내 줄 때까지
-    // 모른다(적용해야 다른 노드의 Node 리소스로 리더가 투표 멤버를 고르는지 안다).
-    while raft
-        .wait(Some(Duration::from_secs(10)))
-        .metrics(
-            |m| membership_applied(m, id),
-            "this node's membership applied",
-        )
-        .await
-        .is_err()
-    {
-        tracing::info!("this node is not in the cluster membership it knows yet; still waiting");
+    // 모른다(적용해야 다른 노드의 Node 리소스로 리더가 투표 멤버를 고르는지 안다). 그 사이 관찰 노드로 바뀌면
+    // Raft가 바뀌므로 매번 다시 읽는다.
+    loop {
+        // 관찰 노드(Raft 구성원이 아님)는 리더의 키퍼가 learner로, 그 뒤 투표 멤버로 올린다.
+        let Some(raft) = cluster.raft() else {
+            tracing::info!("this node is an observer; the leader picks the voting members");
+            return;
+        };
+        match raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |m| membership_applied(m, id),
+                "this node's membership applied",
+            )
+            .await
+        {
+            Ok(_) => break,
+            // 전환으로 꺼진 Raft다. 새 백엔드를 다시 읽는다.
+            Err(openraft::metrics::WaitError::ShuttingDown) => {
+                tokio::time::sleep(PROMOTE_RETRY_MIN).await;
+            }
+            Err(openraft::metrics::WaitError::Timeout(..)) => {
+                tracing::info!(
+                    "this node is not in the cluster membership it knows yet; still waiting"
+                );
+            }
+        }
     }
     let mut retry = PROMOTE_RETRY_MIN;
     let mut asked = false;

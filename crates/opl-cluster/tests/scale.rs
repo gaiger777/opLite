@@ -90,6 +90,7 @@ struct Counter {
 type Counters = Arc<HashMap<NodeId, Counter>>;
 
 /// 보낸 Raft RPC를 세는 네트워크
+#[derive(Clone)]
 struct Counting {
     inner: MemNetwork,
     from: NodeId,
