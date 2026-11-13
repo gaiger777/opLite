@@ -2,7 +2,7 @@
 //! `core`·`api` 실행기가 빈 작업을 제때 돌리는 동안 `WATCHDOG=1`을 보낸다. 둘 중 하나가 20초 넘게
 //! 막히면 쓰다듬기가 멈춰 systemd가 데몬을 끝내고(`WatchdogSignal=SIGKILL`) 다시 띄운다
 //! (`KillMode=process`라 VM은 그대로 돈다). `work`가 늦으면 경고만 남긴다: 데몬을 다시 띄우는 동안
-//! HA watchdog 장치의 제한 시간(30초)을 넘기면 노드가 재부팅되므로, 리스와 API가 도는 한 끄지 않는다.
+//! HA watchdog 장치의 제한 시간(기본 10초)을 넘기면 노드가 재부팅되므로, 리스와 API가 도는 한 끄지 않는다.
 //!
 //! `$NOTIFY_SOCKET`(유닉스 데이터그램, `@`로 시작하면 Linux 추상 소켓)에 직접 쓴다. 변수가 없으면
 //! (시험·macOS·systemd 밖) 아무것도 보내지 않는다.
@@ -60,6 +60,11 @@ impl Notifier {
                 }
             });
         Self { addr }
+    }
+
+    /// systemd에 알릴 곳(`$NOTIFY_SOCKET`)이 있는지
+    pub fn enabled(&self) -> bool {
+        self.addr.is_some()
     }
 
     /// `state`(예: `READY=1`)를 보낸다. 실패하면 경고만 남긴다.
@@ -239,14 +244,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notify");
         let socket = UnixDatagram::bind(&path).unwrap();
-        Notifier::new(Some(path.as_os_str())).notify("READY=1");
+        let notifier = Notifier::new(Some(path.as_os_str()));
+        assert!(notifier.enabled());
+        notifier.notify("READY=1");
         assert_eq!(
             recv(&socket, Duration::from_secs(1)).as_deref(),
             Some("READY=1")
         );
         // 변수가 없거나 비었거나 받는 쪽이 없으면 보내지 않는다(실패해도 돌아온다).
         for none in [None, Some(OsStr::new(""))] {
-            assert!(Notifier::new(none).addr.is_none());
+            assert!(!Notifier::new(none).enabled());
         }
         Notifier::new(Some(dir.path().join("missing").as_os_str())).notify("READY=1");
     }

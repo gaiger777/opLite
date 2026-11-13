@@ -190,6 +190,7 @@ async fn ha_vms_migrate_only_to_ha_capable_nodes() {
     let ha = Some(NodeHa {
         fencing: Fencing::Process,
         recover_after_secs: 7,
+        fence_after_secs: None,
     });
     edit_node(&env, env.node, |n| n.status.ha = ha).await;
     // API는 실행 중인 VM의 HA를 켜지 않으므로 저장소에 바로 쓴다.

@@ -3488,6 +3488,11 @@ export interface components {
         };
         /** @description 노드가 등록할 때 쓰는 HA 펜싱 설정 */
         NodeHa: {
+            /**
+             * Format: int64
+             * @description 리스가 이만큼 끊기면 이 노드가 스스로 HA VM을 끈다(초, `[ha]`의 실제 값). 계획 51 전 노드는 없다.
+             */
+            fence_after_secs?: number | null;
             fencing: components["schemas"]["Fencing"];
             /**
              * Format: int64

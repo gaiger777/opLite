@@ -33,6 +33,7 @@ async fn cluster_view_and_ca() {
     node.status.ha = Some(NodeHa {
         fencing: Fencing::Watchdog,
         recover_after_secs: 65,
+        fence_after_secs: None,
     });
     env.cluster
         .update_status::<NodeSpec>(env.node, &node.status)

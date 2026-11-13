@@ -554,14 +554,15 @@ pub(crate) mod tests {
         let mut host = Host::from_config(&config, "t").unwrap();
         host.net = None;
         config.ha.fencing = FencingSetting::Process;
-        config.ha.fence_after_secs = 2;
+        config.ha.fence_after_secs = Some(2);
         register_node(&cluster, &config, &host).await.unwrap();
         let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
         assert_eq!(
             node.status.ha,
             Some(NodeHa {
                 fencing: Fencing::Process,
-                recover_after_secs: 7,
+                recover_after_secs: 4,
+                fence_after_secs: Some(2),
             })
         );
         config.ha.fencing = FencingSetting::Off;

@@ -5,7 +5,7 @@
 //! 되돌아가는지도 본다(이 Mac에서는 TCG). A에서 두 번 크래시한(`max_restart` 1을 넘은) HA VM이 B로 옮겨
 //! 켜지는지도 본다. 호스트 종료 정책: 끄기 + `failover`면 A가 끝나기 전에 HA VM을 끄고 B에서 켜는지, 재부팅 +
 //! 기본(`conditional`)이면 얼려 두었다가 A가 돌아와 켜는지, 끄기 + `migrate`면 비우기로 미리 옮기는지 본다
-//! (`[test] host_shutdown`).
+//! (`[test] host_shutdown`). 기본(`fast`) 프로필에서 kill -9·망 끊기·SIGSTOP 뒤 복구 시간이 25초 이하인지 잰다.
 //! `cargo test -p opld --features ha-it --test ha`
 //! QEMU(`qemu-it`와 같다)와 qemu-img가 필요하다. 이 Mac에서도 돈다.
 //!
@@ -24,7 +24,7 @@ use oplctl::Client;
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use serde_json::Value;
 
-/// 복구를 기다리는 시간. A의 recover_after(fence_after 2초 + 여유 5초 = 7초), 리더 선거, 대상 노드의
+/// 복구를 기다리는 시간. A의 recover_after(fence_after 2초 + 여유 2초 = 4초), 리더 선거, 대상 노드의
 /// QEMU 시작(CI의 KVM, 이 Mac의 HVF·TCG)을 넉넉히 덮는다.
 const RECOVER_WAIT: Duration = Duration::from_secs(180);
 
@@ -510,12 +510,17 @@ async fn an_ha_vm_crashing_past_max_restart_is_relocated_to_another_node() {
 /// 노드 A(설정 `extra_a`가 더해짐)·B와 위트니스로 클러스터를 만들고 두 노드가 HA를 돌릴 수 있을 때까지
 /// 기다린다. A가 처음 노드이고 로그인돼 있다.
 async fn ha_cluster(name: &str, extra_a: &str) -> (Daemon, Daemon, Daemon) {
+    ha_cluster_with(name, CONFIG, extra_a).await
+}
+
+/// [`ha_cluster`]와 같고 두 노드의 설정이 `config`다.
+async fn ha_cluster_with(name: &str, config: &str, extra_a: &str) -> (Daemon, Daemon, Daemon) {
     let mut a = Daemon::with_hypervisor(
         "node-a",
-        &format!("{CONFIG}{extra_a}"),
+        &format!("{config}{extra_a}"),
         "systemd_scope = false",
     );
-    let mut b = Daemon::with_hypervisor("node-b", CONFIG, "systemd_scope = false");
+    let mut b = Daemon::with_hypervisor("node-b", config, "systemd_scope = false");
     let mut w = Daemon::witness("wit");
     a.start().await;
     b.start().await;
@@ -642,7 +647,7 @@ async fn a_host_reboot_with_the_default_policy_freezes_the_ha_vm_on_its_node() {
     })
     .await;
 
-    // recover_after(7초)와 리더 선거를 넉넉히 넘겨도 그대로다.
+    // recover_after(4초)와 리더 선거를 넉넉히 넘겨도 그대로다.
     let until = Instant::now() + Duration::from_secs(25);
     while Instant::now() < until {
         let vm = cb.get("/vms/db").await.unwrap();
@@ -799,4 +804,147 @@ async fn a_host_poweroff_with_migrate_drains_the_node_before_stopping() {
     b.ctl(&["vm", "delete", "db"]).await.unwrap();
     b.ctl(&["volume", "delete", "db-root"]).await.unwrap();
     b.ctl(&["pool", "delete", "shared"]).await.unwrap();
+}
+
+/// 기본(`fast`) 프로필의 노드: 프로세스 펜싱만 정한다(리스 10초, recover_after 10 + 2 = 12초, 갱신 1초).
+const FAST_CONFIG: &str = "[reconciler]\nacpi_timeout_secs = 5\n[ha]\nfencing = \"process\"\n";
+
+/// 기본 프로필에서 노드 장애부터 다른 노드에서 VM이 켜지기까지의 한도(설계 §8.1)
+const FAST_RECOVERY: Duration = Duration::from_secs(25);
+
+/// 제어 소켓의 시험 고리(`POST /v1/test/…`)를 부른다.
+async fn test_hook(d: &Daemon, path: &str) {
+    let http = reqwest::Client::builder()
+        .unix_socket(d.path("opld.sock"))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = http
+        .post(format!("http://opld/v1/test/{path}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "{path}");
+}
+
+/// pid에 신호를 보낸다.
+fn signal(pid: u64, sig: Signal) {
+    kill_process(Pid::from_raw(pid as i32).unwrap(), sig).unwrap();
+}
+
+#[tokio::test]
+async fn recovery_takes_at_most_25s_with_the_default_profile() {
+    // 리더가 아닌 노드에서 도는 HA VM을 세 가지 장애에서 리더가 다른 노드로 옮겨 켜기까지 잰다. 리스 갱신이 끊긴
+    // 뒤 recover_after(12초) + 리더의 틱 + QEMU 시작이다. 디스크 없는 VM을 쓴다: 같은 호스트의 공유 디렉터리
+    // 디스크는 SIGSTOP한 QEMU가 이미지 잠금을 쥐고 있어 다른 노드가 켤 수 없다(실제로는 다른 호스트라 펜싱된
+    // 노드의 잠금이 남지 않는다). 장애 뒤 다시 이어진 노드의 리더가 바뀔 수 있으므로 회차마다 리더가 아닌
+    // 노드를 장애 노드로 고른다(위트니스는 리더가 되지 않는다).
+    let (a, b, _w) = ha_cluster_with("ha-fast", FAST_CONFIG, "").await;
+    let mut nodes = [a, b];
+    let clients = [client(&nodes[0]), client(&nodes[1])];
+    let ids = [
+        node_id(&clients[0], "node-a").await,
+        node_id(&clients[0], "node-b").await,
+    ];
+    let mut took = Vec::new();
+    for (round, fault) in ["kill -9", "isolate", "SIGSTOP"].into_iter().enumerate() {
+        let deadline = Instant::now() + RECOVER_WAIT;
+        let leader = loop {
+            if let Ok(c) = clients[0].get("/cluster").await
+                && let Some(leader) = c["leader"].as_str()
+            {
+                break leader.to_string();
+            }
+            assert!(Instant::now() < deadline, "no leader");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let survivor = ids.iter().position(|id| *id == leader).unwrap();
+        let victim = 1 - survivor;
+        let (cs, sid, vid) = (&clients[survivor], &ids[survivor], &ids[victim]);
+        let vname = nodes[victim].name.clone();
+        let vm = format!("fast{round}");
+        nodes[survivor]
+            .ctl(&[
+                "vm", "create", &vm, "--memory", "256", "--node", &vname, "--ha", "--start",
+            ])
+            .await
+            .unwrap();
+        let qemu = running_pid(cs, &vm, vid).await;
+        let opld = u64::from(nodes[victim].pid().unwrap());
+
+        let start = Instant::now();
+        match fault {
+            // 노드가 죽는다: opld를 먼저(QEMU를 다시 띄우지 않게), 그 다음 그 QEMU
+            "kill -9" => {
+                nodes[victim].kill();
+                kill_qemu(qemu).await;
+            }
+            // 노드 간 통신만 끊긴다: 장애 노드가 리스를 잃고 스스로 QEMU를 끈다.
+            "isolate" => test_hook(&nodes[victim], "isolate").await,
+            // 노드가 멈춘다(opld와 QEMU 모두)
+            _ => {
+                signal(opld, Signal::STOP);
+                signal(qemu, Signal::STOP);
+            }
+        }
+        let deadline = start + RECOVER_WAIT;
+        loop {
+            if let Ok(v) = cs.get(&format!("/vms/{vm}")).await
+                && v["spec"]["node"] == sid.as_str()
+                && v["status"]["phase"] == "running"
+                && v["status"]["node"] == sid.as_str()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{fault}: {vm} did not start on the other node"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let elapsed = start.elapsed();
+        eprintln!("HA recovery after {fault} of {vname}: {elapsed:?}");
+        took.push((fault, elapsed));
+
+        // 장애 노드를 되살린다. 리스를 잃은 노드는 이어진 뒤에도 옛 QEMU를 끈 채 둔다.
+        match fault {
+            "kill -9" => nodes[victim].start().await,
+            "isolate" => {
+                eventually("the isolated node fenced its QEMU", || async {
+                    !alive(qemu)
+                })
+                .await;
+                test_hook(&nodes[victim], "heal").await;
+            }
+            _ => {
+                signal(opld, Signal::CONT);
+                signal(qemu, Signal::CONT);
+                eventually_within("the resumed node fenced its QEMU", RECOVER_WAIT, || async {
+                    !alive(qemu)
+                })
+                .await;
+            }
+        }
+        eventually_within("the failed node back online", RECOVER_WAIT, || async {
+            let Ok(node) = cs.get(&format!("/nodes/{vname}")).await else {
+                return false;
+            };
+            node["status"]["online"] == true && node["status"]["ha"]["fencing"] == "process"
+        })
+        .await;
+        assert!(!alive(qemu));
+        let v = cs.get(&format!("/vms/{vm}")).await.unwrap();
+        assert_eq!(v["spec"]["node"], sid.as_str(), "{v}");
+        nodes[survivor]
+            .ctl(&["vm", "stop", &vm, "--force"])
+            .await
+            .unwrap();
+        nodes[survivor].ctl(&["vm", "delete", &vm]).await.unwrap();
+    }
+    for (fault, elapsed) in took {
+        assert!(
+            elapsed <= FAST_RECOVERY,
+            "recovery after {fault} took {elapsed:?}"
+        );
+    }
 }

@@ -343,6 +343,8 @@ impl Peers {
 
     /// 링크 `addr`로 가는 채널의 클라이언트
     fn channel(&self, lane: Lane, addr: &str) -> Result<PeerClient<Channel>, Status> {
+        #[cfg(feature = "fault-it")]
+        crate::fault::check_send()?;
         let (lane, executor) = match &self.runtimes {
             Some((control, bulk)) => match lane {
                 Lane::Control => (lane, Some(control.clone())),

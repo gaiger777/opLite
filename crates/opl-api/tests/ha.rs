@@ -103,6 +103,7 @@ async fn node_with(
         ha: recover_after.map(|secs| NodeHa {
             fencing: Fencing::Process,
             recover_after_secs: secs,
+            fence_after_secs: None,
         }),
         underlay: None,
         firewall: false,

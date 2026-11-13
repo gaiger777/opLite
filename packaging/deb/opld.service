@@ -4,6 +4,9 @@ Documentation=https://github.com/gaiger777/opLite
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/opl/opld.toml
+# 2초마다 다시 띄우므로 기본 시작 제한(10초에 5번)보다 넉넉히 둔다.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 # 시작이 끝나면 READY=1을, core·api 실행기가 답하는 동안 10초마다 WATCHDOG=1을 보낸다. 30초 넘게
@@ -17,7 +20,8 @@ ExecStart=/usr/bin/orbivisord --config /etc/opl/opld.toml
 # 프로세스가 죽어(SIGKILL 등) 떼지 못한 내장 VIP를 뗀다(늘 0으로 끝난다).
 ExecStopPost=/usr/bin/orbivisord --config /etc/opl/opld.toml --release-vips
 Restart=on-failure
-RestartSec=5
+# 죽은 데몬이 HA watchdog 장치의 제한 시간(기본 10초) 안에 다시 떠서 쓰다듬도록 짧게 둔다.
+RestartSec=2
 KillMode=process
 # 호스트가 꺼질 때 종료 정책(migrate는 비우기를 10분까지 기다린 뒤 HA VM을 끈다)이 끝날 시간. VM 스코프는
 # Before=opld.service라 opld가 끝난 뒤에 멈춘다.

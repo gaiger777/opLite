@@ -212,6 +212,9 @@ pub struct NodeHa {
     pub fencing: Fencing,
     /// 마지막 리스 갱신 뒤 이만큼 지나면 이 노드의 HA VM이 꺼졌다고 보고 리더가 옮긴다(초).
     pub recover_after_secs: u64,
+    /// 리스가 이만큼 끊기면 이 노드가 스스로 HA VM을 끈다(초, `[ha]`의 실제 값). 계획 51 전 노드는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_after_secs: Option<u64>,
 }
 
 /// 리스를 잃은 노드가 HA VM을 끄는 방법
@@ -328,13 +331,27 @@ mod tests {
             ha: Some(NodeHa {
                 fencing: Fencing::Watchdog,
                 recover_after_secs: 65,
+                fence_after_secs: None,
             }),
             ..Default::default()
         };
+        // 옛 노드의 기록(`fence_after_secs` 없음)은 그대로 쓰고 읽는다.
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(
             json["ha"],
             serde_json::json!({ "fencing": "watchdog", "recover_after_secs": 65 })
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+        let mut status = status;
+        status.ha = Some(NodeHa {
+            fencing: Fencing::Watchdog,
+            recover_after_secs: 22,
+            fence_after_secs: Some(10),
+        });
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["ha"],
+            serde_json::json!({ "fencing": "watchdog", "recover_after_secs": 22, "fence_after_secs": 10 })
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
         assert_eq!(
@@ -531,6 +548,7 @@ mod tests {
         node.status.ha = Some(NodeHa {
             fencing: Fencing::Process,
             recover_after_secs: 7,
+            fence_after_secs: None,
         });
         assert!(ha_capable(&node));
         node.spec.witness = true;

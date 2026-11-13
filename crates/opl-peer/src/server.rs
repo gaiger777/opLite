@@ -140,6 +140,8 @@ impl PeerService {
     /// [`TARGET_METADATA`]가 이 노드가 아님)도 `permission_denied`이고 이 노드의 id를 실어 답한다(옛 노드는 대상을
     /// 싣지 않으므로 받는다).
     fn authorize<T>(&self, req: &Request<T>) -> Result<NodeId, Status> {
+        #[cfg(feature = "fault-it")]
+        crate::fault::check_receive()?;
         let certs = req
             .peer_certs()
             .ok_or_else(|| Status::unauthenticated("client certificate required"))?;

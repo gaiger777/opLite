@@ -51,7 +51,8 @@ web-it = ["qemu-it", "web-ui"]
 migration-it = []
 # 한 호스트의 opld 둘(프로세스 펜싱)과 위트니스로 죽은 노드의 HA VM을 리더가 다른 노드에서 켜는지 보는
 # E2E. qemu-it의 준비물과 qemu-img가 필요하다.
-ha-it = []
+# 제어 소켓의 `POST /v1/test/isolate`·`/v1/test/heal`로 노드 간 통신을 끊고 잇는다(opl-peer `fault-it`).
+ha-it = ["opl-peer/fault-it"]
 # 시험 빌드에만 있는 굶김 시험 고리: 설정 `[test] block_api_ms`와 제어 소켓의 `POST /v1/test/block-api`
 # (`api` 실행기의 작업자를 모두 막음)·`GET /v1/test/raft`(리더·임기·리스 나이). 배포 빌드에는 넣지 않는다.
 # opld 셋으로 리더의 `api` 실행기를 막아도 HA 리스와 Raft 리더가 그대로인지 보는 시험(QEMU 없음).

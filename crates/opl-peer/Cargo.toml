@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# 시험 빌드에만: 이 프로세스의 노드 간 보내기·받기를 모두 끊는 고리(`fault::isolate`·`heal`). opld `ha-it`가 켠다.
+fault-it = []
+
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true

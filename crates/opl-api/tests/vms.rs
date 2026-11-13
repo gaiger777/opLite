@@ -676,6 +676,7 @@ async fn ha_vms_need_an_ha_capable_node() {
     status.ha = Some(NodeHa {
         fencing: Fencing::Process,
         recover_after_secs: 7,
+        fence_after_secs: None,
     });
     env.cluster
         .update_status::<NodeSpec>(env.node, &status)

@@ -275,6 +275,7 @@ async fn two_nodes_with(
     let node_ha = ha.as_ref().map(|_| NodeHa {
         fencing: Fencing::Process,
         recover_after_secs: 60,
+        fence_after_secs: None,
     });
     a.ha = ha;
     b.audit_off = !b_audit;

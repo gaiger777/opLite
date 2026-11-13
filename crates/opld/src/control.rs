@@ -128,6 +128,8 @@ fn router(ctx: Ctx) -> Router {
         );
     #[cfg(feature = "starve-it")]
     let router = router.merge(crate::starve::routes());
+    #[cfg(feature = "ha-it")]
+    let router = router.merge(crate::fault::routes());
     router.with_state(ctx)
 }
 

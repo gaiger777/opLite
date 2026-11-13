@@ -330,24 +330,49 @@ pub struct HaSection {
     /// macOS `off`다.
     #[serde(default)]
     pub fencing: FencingSetting,
+    /// 시간 묶음(설계 §8.1): `fast`(기본, 10초·10초)나 `safe`(30초·30초). 아래 값을 적으면 그것이 이긴다.
+    #[serde(default)]
+    pub profile: HaProfile,
     /// Linux watchdog 장치(하드웨어 또는 `softdog`)
     #[serde(default = "default_watchdog_device")]
     pub watchdog_device: PathBuf,
-    /// 장치에 정하는 제한 시간(초, `WDIOC_SETTIMEOUT`)
-    #[serde(default = "default_watchdog_timeout_secs")]
-    pub watchdog_timeout_secs: u64,
-    /// 마지막으로 성공한 리스 갱신 뒤 이만큼 지나면 HA VM을 끈다(초).
-    #[serde(default = "default_fence_after_secs")]
-    pub fence_after_secs: u64,
+    /// 장치에 정하는 제한 시간(초, `WDIOC_SETTIMEOUT`). 없으면 프로필 값이다.
+    #[serde(default)]
+    pub watchdog_timeout_secs: Option<u64>,
+    /// 마지막으로 성공한 리스 갱신 뒤 이만큼 지나면 HA VM을 끈다(초). 없으면 프로필 값이다.
+    #[serde(default)]
+    pub fence_after_secs: Option<u64>,
 }
 
 impl Default for HaSection {
     fn default() -> Self {
         Self {
             fencing: FencingSetting::default(),
+            profile: HaProfile::default(),
             watchdog_device: default_watchdog_device(),
-            watchdog_timeout_secs: default_watchdog_timeout_secs(),
-            fence_after_secs: default_fence_after_secs(),
+            watchdog_timeout_secs: None,
+            fence_after_secs: None,
+        }
+    }
+}
+
+/// `[ha] profile`: 리스와 watchdog 시간의 묶음
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HaProfile {
+    /// 리스 10초·watchdog 10초(복구 약 22초)
+    #[default]
+    Fast,
+    /// 리스 30초·watchdog 30초(복구 약 62초, 계획 50까지의 기본값)
+    Safe,
+}
+
+impl HaProfile {
+    /// (`fence_after_secs`, `watchdog_timeout_secs`)
+    fn times(self) -> (u64, u64) {
+        match self {
+            Self::Fast => (10, 10),
+            Self::Safe => (30, 30),
         }
     }
 }
@@ -375,29 +400,42 @@ const MIN_WATCHDOG_TIMEOUT_SECS: u64 = 5;
 /// `watchdog_timeout_secs`의 상한(1시간)
 const MAX_WATCHDOG_TIMEOUT_SECS: u64 = 3600;
 /// 리더가 옮기기 전에 더 기다리는 여유(초)
-const RECOVER_MARGIN_SECS: u64 = 5;
+const RECOVER_MARGIN_SECS: u64 = 2;
+/// 이보다 짧은 `fence_after`면 시작할 때 HA 경고를 본다(옛 기본값, `profile = "safe"`).
+const SAFE_FENCE_AFTER_SECS: u64 = 30;
 
 impl HaSection {
+    /// 실제 `fence_after_secs`: 적은 값, 없으면 프로필 값
+    pub fn fence_after_secs(&self) -> u64 {
+        self.fence_after_secs.unwrap_or(self.profile.times().0)
+    }
+
+    /// 실제 `watchdog_timeout_secs`: 적은 값, 없으면 프로필 값
+    pub fn watchdog_timeout_secs(&self) -> u64 {
+        self.watchdog_timeout_secs.unwrap_or(self.profile.times().1)
+    }
+
     /// 등록할 때 쓰는 이 노드의 HA 설정. 펜싱이 꺼져 있으면 None이다.
     pub fn node_ha(&self) -> Option<NodeHa> {
         let (fencing, watchdog) = match self.fencing {
             FencingSetting::Off => return None,
-            FencingSetting::Watchdog => (Fencing::Watchdog, self.watchdog_timeout_secs),
+            FencingSetting::Watchdog => (Fencing::Watchdog, self.watchdog_timeout_secs()),
             FencingSetting::Process => (Fencing::Process, 0),
         };
         Some(NodeHa {
             fencing,
             recover_after_secs: self
-                .fence_after_secs
+                .fence_after_secs()
                 .saturating_add(watchdog)
                 .saturating_add(RECOVER_MARGIN_SECS),
+            fence_after_secs: Some(self.fence_after_secs()),
         })
     }
 }
 
 impl HaSection {
     pub fn fence_after(&self) -> Duration {
-        Duration::from_secs(self.fence_after_secs)
+        Duration::from_secs(self.fence_after_secs())
     }
 
     /// 리스 갱신 간격: `fence_after`의 10분의 1을 0.2초 이상 2초 이하로 자른 값
@@ -411,7 +449,7 @@ impl HaSection {
             FencingSetting::Off => return None,
             FencingSetting::Watchdog => Some(Arc::new(DeviceWatchdog {
                 path: self.watchdog_device.clone(),
-                timeout_secs: self.watchdog_timeout_secs,
+                timeout_secs: self.watchdog_timeout_secs(),
             })),
             FencingSetting::Process => None,
         };
@@ -851,14 +889,37 @@ pub enum UnderlaySource<'a> {
     Lookup(&'a str),
 }
 
+/// 짧은 HA 시간(`fence_after` < 30초)으로 펜싱하는 노드가 시작할 때 낼 경고(설계 §8.1). 멀쩡한 노드의 잘못된
+/// 펜싱을 막는 것 가운데 끈 것이 있으면 하나씩: 클러스터 링크가 하나(계획 49 다중 링크를 안 씀), watchdog
+/// 펜싱인데 systemd 밖에서 돎(`NOTIFY_SOCKET` 없음 — 멈춘 데몬을 제한 시간 안에 다시 띄울 것이 없다). 실행기
+/// 격리(계획 45)는 끌 수 없으므로 보지 않는다. `notify`는 `NOTIFY_SOCKET`이 있는지다.
+pub fn ha_warnings(config: &Config, notify: bool) -> Vec<String> {
+    let ha = &config.ha;
+    let fence_after = ha.fence_after_secs();
+    if config.witness || ha.fencing == FencingSetting::Off || fence_after >= SAFE_FENCE_AFTER_SECS {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    if config.cluster_links().len() < 2 {
+        warnings.push(format!(
+            "HA fences after {fence_after}s without a lease but this node has a single cluster link; \
+             a short network outage can fence a healthy node. Add a second link (cluster_addresses) \
+             or set [ha] profile = \"safe\""
+        ));
+    }
+    if ha.fencing == FencingSetting::Watchdog && !notify {
+        warnings.push(format!(
+            "HA watchdog fencing with a {}s timeout but orbivisord runs outside systemd (no NOTIFY_SOCKET); \
+             nothing restarts a stuck daemon before the watchdog resets the host. Run it as the systemd \
+             unit or set [ha] profile = \"safe\"",
+            ha.watchdog_timeout_secs()
+        ));
+    }
+    warnings
+}
+
 fn default_watchdog_device() -> PathBuf {
     "/dev/watchdog".into()
-}
-fn default_watchdog_timeout_secs() -> u64 {
-    30
-}
-fn default_fence_after_secs() -> u64 {
-    30
 }
 
 fn default_migration_ports() -> RangeInclusive<u16> {
@@ -1078,12 +1139,12 @@ impl Config {
         if self.api.tls_cert.is_some() != self.api.tls_key.is_some() {
             anyhow::bail!("api.tls_cert and api.tls_key must be given together");
         }
-        if self.ha.fence_after_secs == 0 {
+        if self.ha.fence_after_secs() == 0 {
             anyhow::bail!("ha.fence_after_secs must be at least 1");
         }
         if self.ha.fencing == FencingSetting::Watchdog {
             if !(MIN_WATCHDOG_TIMEOUT_SECS..=MAX_WATCHDOG_TIMEOUT_SECS)
-                .contains(&self.ha.watchdog_timeout_secs)
+                .contains(&self.ha.watchdog_timeout_secs())
             {
                 anyhow::bail!(
                     "ha.watchdog_timeout_secs must be between {MIN_WATCHDOG_TIMEOUT_SECS} and {MAX_WATCHDOG_TIMEOUT_SECS}"
@@ -2019,16 +2080,20 @@ mod tests {
         let c = parse("name = \"n\"\naddress = \"h\"");
         c.validate().unwrap();
         assert_eq!(c.ha.watchdog_device, Path::new("/dev/watchdog"));
-        assert_eq!(c.ha.watchdog_timeout_secs, 30);
-        assert_eq!(c.ha.fence_after_secs, 30);
-        assert_eq!(c.ha.fence_after(), Duration::from_secs(30));
+        // `[ha]`가 없으면 `fast` 프로필이다.
+        assert_eq!(c.ha.profile, HaProfile::Fast);
+        assert_eq!(c.ha.watchdog_timeout_secs(), 10);
+        assert_eq!(c.ha.fence_after_secs(), 10);
+        assert_eq!(c.ha.fence_after(), Duration::from_secs(10));
+        assert_eq!(c.ha.renew_interval(), Duration::from_secs(1));
         if cfg!(target_os = "linux") {
             assert_eq!(c.ha.fencing, FencingSetting::Watchdog);
             assert_eq!(
                 c.ha.node_ha(),
                 Some(NodeHa {
                     fencing: Fencing::Watchdog,
-                    recover_after_secs: 65,
+                    recover_after_secs: 22,
+                    fence_after_secs: Some(10),
                 })
             );
         } else {
@@ -2048,7 +2113,8 @@ mod tests {
             c.ha.node_ha(),
             Some(NodeHa {
                 fencing: Fencing::Process,
-                recover_after_secs: 7,
+                recover_after_secs: 4,
+                fence_after_secs: Some(2),
             })
         );
         let c = parse("name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"off\"");
@@ -2063,15 +2129,127 @@ mod tests {
             c.ha.node_ha(),
             Some(NodeHa {
                 fencing: Fencing::Watchdog,
-                recover_after_secs: 35,
+                recover_after_secs: 32,
+                fence_after_secs: Some(20),
             })
         );
         // watchdog 장치는 Linux에만 있다.
         assert_eq!(c.validate().is_ok(), cfg!(target_os = "linux"));
-        for bad in ["fencing = \"ipmi\"", "fence_after = 1"] {
+        for bad in [
+            "fencing = \"ipmi\"",
+            "fence_after = 1",
+            "profile = \"fastest\"",
+        ] {
             let text = format!("name = \"n\"\naddress = \"h\"\n[ha]\n{bad}");
             assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
         }
+    }
+
+    /// 프로필의 시간과 `recover_after`(fence_after + watchdog(watchdog 펜싱만) + 2초). 적은 값이 프로필을 이긴다.
+    #[test]
+    fn ha_profiles_set_the_times_and_explicit_values_win() {
+        let ha = |text: &str| parse(&format!("name = \"n\"\naddress = \"h\"\n[ha]\n{text}")).ha;
+        let recover = |h: &HaSection| h.node_ha().unwrap().recover_after_secs;
+        let fast = ha("fencing = \"watchdog\"");
+        assert_eq!(fast.profile, HaProfile::Fast);
+        assert_eq!(
+            (fast.fence_after_secs(), fast.watchdog_timeout_secs()),
+            (10, 10)
+        );
+        assert_eq!(recover(&fast), 22);
+        assert_eq!(fast.renew_interval(), Duration::from_secs(1));
+        assert_eq!(recover(&ha("fencing = \"process\"")), 12);
+        let safe = ha("fencing = \"watchdog\"\nprofile = \"safe\"");
+        assert_eq!(safe.profile, HaProfile::Safe);
+        assert_eq!(
+            (safe.fence_after_secs(), safe.watchdog_timeout_secs()),
+            (30, 30)
+        );
+        assert_eq!(recover(&safe), 62);
+        assert_eq!(safe.renew_interval(), Duration::from_secs(2));
+        assert_eq!(
+            safe.node_ha().unwrap().fence_after_secs,
+            Some(30),
+            "the node records its fence_after"
+        );
+        let mixed = ha("fencing = \"watchdog\"\nprofile = \"safe\"\nfence_after_secs = 5");
+        assert_eq!(
+            (mixed.fence_after_secs(), mixed.watchdog_timeout_secs()),
+            (5, 30)
+        );
+        assert_eq!(recover(&mixed), 37);
+        let mixed = ha("fencing = \"watchdog\"\nwatchdog_timeout_secs = 20");
+        assert_eq!(
+            (mixed.fence_after_secs(), mixed.watchdog_timeout_secs()),
+            (10, 20)
+        );
+        // safe의 watchdog 30초도 범위 안이고, 펜싱이 꺼지면 시간과 관계없이 없다.
+        let c =
+            parse("name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nprofile = \"safe\"");
+        c.validate().unwrap();
+        assert_eq!(ha("fencing = \"off\"\nprofile = \"safe\"").node_ha(), None);
+    }
+
+    /// 짧은 시간으로 펜싱하면 다중 링크가 없을 때, watchdog인데 systemd 밖일 때 경고한다. `safe`·30초 이상,
+    /// 펜싱 꺼짐, 위트니스는 경고하지 않는다.
+    #[test]
+    fn ha_warnings_flag_fast_fencing_without_safeguards() {
+        let one = "name = \"n\"\naddress = \"h\"\n";
+        let two =
+            "name = \"n\"\naddress = \"h\"\ncluster_addresses = [\"10.1.0.1\", \"10.2.0.1\"]\n";
+        let warnings = |base: &str, ha: &str, notify: bool| {
+            let c = parse(&format!("{base}[ha]\n{ha}"));
+            let w = ha_warnings(&c, notify);
+            (
+                w.iter().any(|w| w.contains("single cluster link")),
+                w.iter().any(|w| w.contains("NOTIFY_SOCKET")),
+                w.len(),
+            )
+        };
+        let watchdog = "fencing = \"watchdog\"";
+        let process = "fencing = \"process\"";
+        for (base, ha, notify, want) in [
+            (one, watchdog, true, (true, false, 1)),
+            (one, watchdog, false, (true, true, 2)),
+            (two, watchdog, true, (false, false, 0)),
+            (two, watchdog, false, (false, true, 1)),
+            (one, process, false, (true, false, 1)),
+            (two, process, false, (false, false, 0)),
+            (
+                one,
+                "fencing = \"watchdog\"\nprofile = \"safe\"",
+                false,
+                (false, false, 0),
+            ),
+            (
+                one,
+                "fencing = \"watchdog\"\nfence_after_secs = 30",
+                false,
+                (false, false, 0),
+            ),
+            (
+                one,
+                "fencing = \"watchdog\"\nprofile = \"safe\"\nfence_after_secs = 29",
+                false,
+                (true, true, 2),
+            ),
+            (one, "fencing = \"off\"", false, (false, false, 0)),
+        ] {
+            assert_eq!(
+                warnings(base, ha, notify),
+                want,
+                "{base}{ha} notify={notify}"
+            );
+        }
+        let c = parse(&format!("{one}witness = true\n[ha]\n{watchdog}"));
+        assert!(ha_warnings(&c, false).is_empty());
+        // 경고는 safe 프로필을 권한다.
+        let c = parse(&format!("{one}[ha]\n{watchdog}"));
+        assert!(
+            ha_warnings(&c, false)
+                .iter()
+                .all(|w| w.contains("profile = \"safe\""))
+        );
     }
 
     #[test]
@@ -2117,7 +2295,7 @@ mod tests {
     fn guard_config_follows_the_fencing() {
         let mut ha = HaSection {
             fencing: FencingSetting::Off,
-            fence_after_secs: 5,
+            fence_after_secs: Some(5),
             ..HaSection::default()
         };
         assert!(ha.guard_config().is_none());
@@ -2132,9 +2310,9 @@ mod tests {
 
     #[test]
     fn renew_interval_is_a_tenth_of_fence_after_within_bounds() {
-        let interval = |fence_after_secs| {
+        let interval = |secs| {
             HaSection {
-                fence_after_secs,
+                fence_after_secs: Some(secs),
                 ..HaSection::default()
             }
             .renew_interval()

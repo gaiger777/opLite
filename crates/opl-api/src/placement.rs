@@ -364,6 +364,7 @@ mod tests {
             ha: Some(NodeHa {
                 fencing: Fencing::Process,
                 recover_after_secs: 7,
+                fence_after_secs: None,
             }),
             ..Default::default()
         };

@@ -8,6 +8,8 @@
 pub mod audit;
 mod client;
 mod codec;
+#[cfg(feature = "fault-it")]
+pub mod fault;
 pub mod firmware;
 pub mod metrics;
 pub mod migration;

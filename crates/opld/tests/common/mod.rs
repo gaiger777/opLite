@@ -244,6 +244,11 @@ impl Daemon {
         self.child.is_some()
     }
 
+    /// 돌고 있는 opld의 pid
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
     /// kill -9
     pub fn kill(&mut self) {
         let mut child = self.child.take().unwrap();

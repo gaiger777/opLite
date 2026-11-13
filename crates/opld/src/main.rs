@@ -14,6 +14,8 @@
 mod bootstrap;
 mod config;
 mod control;
+#[cfg(feature = "ha-it")]
+mod fault;
 mod firewall;
 mod host;
 mod join;
@@ -103,6 +105,9 @@ async fn run(
     probe: Arc<dyn RuntimeProbe>,
 ) -> anyhow::Result<()> {
     if let Some(warning) = config.links_warning() {
+        tracing::warn!("{warning}");
+    }
+    for warning in config::ha_warnings(&config, notifier.enabled()) {
         tracing::warn!("{warning}");
     }
     prepare_data_dir(&config.data_dir)?;

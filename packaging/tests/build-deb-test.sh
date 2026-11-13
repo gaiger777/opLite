@@ -96,6 +96,13 @@ if grep -qx 'Type=notify' "$UNIT_DIR/opld.service" && grep -qx 'NotifyAccess=mai
 else
 	fail "유닛 systemd 알림: $(cat "$UNIT_DIR/opld.service")"
 fi
+# 빠른 HA(계획 51): 장치 제한 10초 안에 다시 뜨도록 2초 뒤 다시 띄우고, 그만큼 시작 제한을 늘린다.
+if grep -qx 'RestartSec=2' "$UNIT_DIR/opld.service" && grep -qx 'StartLimitIntervalSec=60' "$UNIT_DIR/opld.service" &&
+	grep -qx 'StartLimitBurst=10' "$UNIT_DIR/opld.service"; then
+	ok "유닛은 RestartSec=2·StartLimitIntervalSec=60·StartLimitBurst=10"
+else
+	fail "유닛 다시 띄우기: $(grep -E '^(Restart|StartLimit)' "$UNIT_DIR/opld.service")"
+fi
 # 내장 VIP(계획 46): 죽은 프로세스가 남긴 VIP를 멈춘 뒤 뗀다(SIGKILL 뒤에도 돈다).
 if grep -qx 'ExecStopPost=/usr/bin/orbivisord --config /etc/opl/opld.toml --release-vips' "$UNIT_DIR/opld.service"; then
 	ok "유닛은 ExecStopPost로 남은 VIP를 뗀다"
