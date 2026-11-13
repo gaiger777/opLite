@@ -69100,3 +69100,32 @@ git commit -m "feat(web): HA 그룹·배치 규칙 화면, VM HA 정책·노드 
 - 이 계획 전에 띄운 VM의 스코프에는 종료 순서가 없다(다시 켜야 붙는다). `TimeoutStopSec=15min`은 보통 `systemctl stop`에도 적용된다.
 - 옮기기 창은 고정 600초, 재시작 창은 노드 설정이다.
 - 업그레이드 뒤 기본 `conditional` 때문에 호스트 재부팅 동안 HA VM은 그 노드에 얼려 있다가 돌아오면 다시 켜진다(예전에는 다른 노드에서 복구).
+
+## 실행 후 기록 (2026-11-14)
+
+- **Task 1~7:** `feat/plan50-ha-placement`에서 스크립트로 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았고(생성 파일 포함), 일곱 Task를 마친 트리는 리뷰·검증을 거친 트리와 같다.
+- **1차 리뷰에서 고친 것:**
+  - 종료 중인 노드를 배치 후보에서 빼지 않던 것 → `node_fits_with`가 "is shutting down"으로 거절.
+  - 막 옮겨 간 VM이 곧바로 원래 노드로 되돌아가던 것 → `RELOCATE_WINDOW` 안에서는 되돌아가지 않음.
+  - 비우기가 묶음의 첫 VM만 디스크 막힘을 보던 것, 첫 VM이 실패한 뒤 짝만 옮기던 것 → 묶음 전체를 보고 함께 남김.
+  - 그 밖: 배치 규칙 만들기 잠금, 스냅샷 되돌리기의 `ha`, 없는 그룹을 가리키는 복제, 거절된 되돌아가기의 60초 대기, `vm set --ha`와 `ignored`, 노드 레이블 revision, `soft-reboot`, 스코프 `After=`, 받기에서 정책 낮추기, reconciler `merge_ha`.
+- **2차 리뷰에서 고친 것:** 되돌아가기와 옮기기가 10분마다 되풀이될 수 있던 것(`relocated_from`, 그 노드로 되돌아가기를 옮기기 한 번으로 셈), 종료 표시 전에 등록 멈추기, 종료 중 노드로의 마이그레이션은 409 `node_unavailable`, 비우기 이유 문구, 레이블 덮어쓰기 방지, 문서.
+- **검증 위치:** 일반 시험은 svc01, 시스템을 바꾸는 작업은 GitHub 프로브(linux-kvm에서 `OPL_TEST_SYSTEMD=1`로 QEMU 스코프의 `Before=opld.service`·`After=` 확인), macOS·웹·셸·cargo-deny·`ha-it`(6개)은 이 Mac.
+- **Mac 스테이지별 시험의 포트 경합:** S1·S2·S5에서 `crates/opld/tests/cluster.rs`의 프로세스 시험이 한 번씩 "Address already in use"로 실패했다(시험이 고른 빈 포트를 다른 시험이 먼저 잡음). 이 계획과 무관하고 다른 스테이지와 svc01에서는 통과했다.
+- **svc01 규모 시험(노드 100):** 묶기 비율 0.34, 쓰기 p99 4.6 ms, 관찰 노드 지연 p99 5.2 ms, 관찰 노드 다시 붙기 0.21~1.13초, 새 리더 3.3초(계획 49와 같은 수준).
+- **테스트 VM 배포(svc01·svc02):** svc02 → svc01 순서로 설치했다. 새 `opld.service`(`TimeoutStopSec=15min` 한 줄)를 넣고 `daemon-reload`. 두 노드 모두 `ha-placement` 기능을 보고하고, HA 그룹·배치 규칙 API를 만들기·읽기·지우기로 확인했다(남긴 것 없음). `shutdown_policy`는 설정하지 않아 기본 `conditional`. test-vm의 `ha`는 옛 `false` 그대로(revision 74), QEMU PID 그대로이며, 업그레이드 전에 켠 VM이라 스코프에 `Before=opld.service`가 아직 없다(다음에 켤 때 붙음). 헬스 `ok`, 웹은 새 빌드, 저널에 ERROR 없음.
+
+**테스트:**
+- macOS `cargo test --workspace` 2028개(스테이지별 1935·1971·1994·2005·2006·2028·2028), 웹 시험 597개와 typecheck·lint, 패키징 셸 시험, `cargo-deny`, `ha-it` 6개
+- svc01(Linux) `fmt`·`clippy -D warnings`(모든 기능)·`cargo test --workspace`·starve·규모 시험 노드 100·storage-it, 합계 2090개 통과
+
+GitHub 프로브에서 linux-kvm·ldap·package 작업.
+
+## 다음 계획으로 넘길 사항
+
+- `vm_lock`이 API 노드마다라 다른 노드로 보낸 모순 규칙의 동시 생성은 아직 가능하다(리더로 모으거나 Raft 조건부 쓰기로).
+- 종료 표시 전 등록 멈추기의 경합은 실제로 재현하지 않았다.
+- 노드 태그는 노드 레이블이다. 규칙이 쓰는 레이블을 바꿀 때 경고하기는 아직 없다.
+- 테스트 VM의 test-vm은 HA가 아니다. HA 그룹·되돌아가기·종료 정책을 실제 노드에서 보는 것은 다음 배포 기회에(계획 51의 복구 시간 측정과 함께).
+- 계획 47~49에서 넘긴 것은 그대로.
+- 다음: 계획 51(빠른 HA와 노드 전원 끄기).
