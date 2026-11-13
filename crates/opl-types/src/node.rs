@@ -112,6 +112,46 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub cluster_addresses: Vec<String>,
+    /// 호스트가 꺼지는 중이라 이 노드가 종료 정책대로 정리하며 남긴 표시. 노드가 다시 등록할 때 지운다. 리더는
+    /// `freeze` 표시가 있는 오프라인 노드의 HA VM을 옮기지 않는다(옛 노드는 이 필드를 무시한다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub shutdown: Option<NodeShutdown>,
+}
+
+/// 호스트 종료 때 노드가 남긴 표시(설계 §8 노드 정상 종료 정책)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NodeShutdown {
+    pub action: ShutdownAction,
+    /// 정책(`migrate`)이 노드를 유지보수로 바꿨다. 다시 등록할 때 유지보수를 끈다.
+    #[serde(default)]
+    pub maintenance: bool,
+    /// 표시를 남긴 시각(유닉스 초)
+    pub at: u64,
+}
+
+/// 호스트 종료 때 노드가 한 일
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ShutdownAction {
+    /// HA VM을 끄고 이 노드에 묶어 둔다. 리더가 옮기지 않는다.
+    Freeze,
+    /// HA VM을 끄고 리더가 다른 노드에서 켜게 둔다.
+    Failover,
+    /// 비우기로 VM을 옮긴 뒤 남은 HA VM은 `failover`처럼 끈다.
+    Migrate,
+}
+
+impl NodeStatus {
+    /// 얼린 노드: `freeze` 표시를 남기고 오프라인이다. 리더가 HA VM을 옮기지 않는다.
+    pub fn frozen(&self) -> bool {
+        !self.online
+            && self
+                .shutdown
+                .is_some_and(|s| s.action == ShutdownAction::Freeze)
+    }
 }
 
 /// 이 빌드가 아는 기능. 노드가 [`NodeStatus::features`]에 적는다.
@@ -435,6 +475,45 @@ mod tests {
             serde_json::json!(["10.0.0.5:8007", "10.1.0.5:8007"])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+    }
+
+    /// 종료 표시는 없으면 쓰지 않고, 얼린 노드는 `freeze` 표시가 있는 오프라인 노드뿐이다.
+    #[test]
+    fn status_shutdown_round_trips_and_freezes_only_offline_nodes() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("shutdown").is_none(), "{none}");
+        let mut status = NodeStatus {
+            online: true,
+            shutdown: Some(NodeShutdown {
+                action: ShutdownAction::Freeze,
+                maintenance: false,
+                at: 1_793_000_000,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["shutdown"],
+            serde_json::json!({ "action": "freeze", "maintenance": false, "at": 1_793_000_000u64 })
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+        assert!(!status.frozen());
+        status.online = false;
+        assert!(status.frozen());
+        for action in [ShutdownAction::Failover, ShutdownAction::Migrate] {
+            status.shutdown = Some(NodeShutdown {
+                action,
+                maintenance: true,
+                at: 1,
+            });
+            assert!(!status.frozen());
+        }
+        status.shutdown = None;
+        assert!(!status.frozen());
+        assert_eq!(
+            serde_json::to_value(ShutdownAction::Migrate).unwrap(),
+            "migrate"
+        );
     }
 
     #[test]

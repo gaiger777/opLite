@@ -6,7 +6,8 @@
 //! 대상은 배치 규칙과 HA 그룹([`crate::placement`])을 따른다(설계 §8). 복구할 노드가 없을 때는 그룹의 더
 //! 우선인 노드로 되돌아가고(라이브 마이그레이션, 한 번에 하나), 틱마다 자리 잡은 VM의 규칙 위반
 //! (`rule_violations`)을 고친다. 재시작 횟수를 넘긴 VM(`status.ha.relocate_from`)은 다른 노드로 옮기고,
-//! 창 안에서 `max_relocate`번 옮겼으면 끈다.
+//! 창 안에서 `max_relocate`번 옮겼으면 끈다. 호스트 종료 정책 `freeze`로 얼린 오프라인 노드의 HA VM은 옮기지
+//! 않는다(그 노드가 돌아와 켠다, `POST /nodes/{key}/unfreeze`가 표시를 지우면 옮긴다).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -199,6 +200,8 @@ async fn tick(
         .nodes
         .iter()
         .filter(|n| n.id != me && !unknown.contains_key(&n.id))
+        // 호스트 종료 정책으로 얼린 노드의 HA VM은 그 노드가 돌아와 켠다.
+        .filter(|n| !n.status.frozen())
         .filter(|n| expired(now, b, &leases, n))
         .filter(|n| inv.vms.iter().any(|vm| recoverable(vm, n.id)))
         .map(|n| n.id)
@@ -354,7 +357,7 @@ async fn recover_node(ctx: Ctx<'_>, term: u64, b: Instant, node: Uuid) -> Option
         return None;
     };
     let failed = inv.nodes.iter().find(|n| n.id == node).cloned()?;
-    if !expired(Instant::now(), b, &leases, &failed) {
+    if !expired(Instant::now(), b, &leases, &failed) || failed.status.frozen() {
         return None;
     }
     let mut vms: Vec<Vm> = inv

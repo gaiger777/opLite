@@ -24,8 +24,8 @@ use opl_cluster::{
 };
 use opl_driver::{
     DirStorage, Hypervisor, IpVip, LvmSharedStorage, LvmThinStorage, QemuHypervisor, RbdStorage,
-    Storage, Storages, SystemLvm, SystemRbd, SystemZfs, VipRecord, ZfsStorage, migration_tls_dir,
-    write_migration_tls,
+    StopMode, Storage, Storages, SystemLvm, SystemRbd, SystemZfs, VipRecord, ZfsStorage,
+    migration_tls_dir, write_migration_tls,
 };
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, cert_names, csr_for_key, fingerprint};
 use opl_peer::tls::{ApiCert, TlsListener, api_server_config_with};
@@ -33,7 +33,9 @@ use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers, 
 use opl_reconciler::{FirewallGate, FirmwareFetcher, HaGuard, Reconciler, ReconcilerConfig};
 use opl_types::cluster::ClusterSpec;
 use opl_types::host::same_host;
-use opl_types::node::NodeSpec;
+use opl_types::node::{NodeShutdown, NodeSpec, ShutdownAction};
+use opl_types::settings::{SETTINGS_NAME, SettingsSpec};
+use opl_types::task::TaskSpec;
 use opl_types::vm::VmSpec;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -51,6 +53,7 @@ use crate::notify::Notifier;
 use crate::overlay::{OverlayAgent, cluster_tag};
 use crate::pools::PoolMounter;
 use crate::runtime::{Handles, on, run_on};
+use crate::shutdown;
 
 /// 데이터 디렉터리 아래 클러스터 저장소(Raft 로그와 상태)를 두는 디렉터리
 pub const CLUSTER_DIR: &str = "cluster";
@@ -202,6 +205,10 @@ struct Services {
     remotes: RemotePoller,
     /// API가 멈춘 뒤 남은 감사 항목을 쓰고 닫는다.
     audit: Arc<AuditLog>,
+    /// 호스트 종료 정책이 쓴다(비우기 시작, 이 노드의 HA VM 끄기).
+    state: Arc<AppState>,
+    /// 호스트 종료 정책이 이 노드의 HA VM을 끄라고 했으면 ACPI 종료를 기다리는 시간
+    stop_ha_vms: Option<Duration>,
 }
 
 impl Services {
@@ -241,6 +248,10 @@ impl Services {
         }
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
+        // 작업자가 다시 켜지 않게 reconciler를 멈춘 뒤, 도는 HA VM 목록을 닫기(`ha.close()`) 전에 끈다.
+        if let Some(acpi_timeout) = self.stop_ha_vms {
+            stop_ha_vms(&self.state, self.ha.as_deref(), acpi_timeout).await;
+        }
         // 작업자가 모두 멈춘 뒤에 멈춰야 테이블을 지운 뒤 시작 직전 확인이 다시 넣지 않는다.
         if let Some(firewall) = self.firewall {
             firewall.shutdown(left).await;
@@ -695,6 +706,7 @@ impl Member {
             })
         });
         let audit = state.audit.clone();
+        let services_state = state.clone();
         let app = opl_api::router(state);
         // 내장 UI를 끄면 API만 연다(UI는 따로 둔 포털이 준다).
         let app = if config.web.enabled {
@@ -743,6 +755,8 @@ impl Member {
                 firewall,
                 ha,
                 updates,
+                state: services_state,
+                stop_ha_vms: None,
             }),
             register,
             promotion,
@@ -890,6 +904,67 @@ impl Member {
         Ok(())
     }
 
+    /// 종료 신호를 받았을 때 `close` 전에 부른다. 호스트가 꺼지는 중(재부팅·전원 끄기)이면 클러스터 설정의
+    /// 종료 정책대로 표시(`NodeStatus.shutdown`)를 쓰고, `migrate`면 비우기 Task가 끝나거나
+    /// [`SHUTDOWN_MIGRATE_LIMIT`]이 될 때까지 기다린다(API와 실행기가 도는 동안). 그 뒤 `close`가 reconciler를
+    /// 멈추고 이 노드의 HA VM을 끈다. 표시를 쓰지 못하면(과반수 없음) 경고하고 `failover`처럼 끈다. 호스트 종료가
+    /// 아니거나(`systemctl stop`, 업그레이드 재시작) 위트니스면 아무것도 하지 않는다.
+    pub async fn prepare_shutdown(&mut self) {
+        let Some(services) = self.services.as_mut() else {
+            return;
+        };
+        // 과반수 없이 시작해 등록을 다시 하던 작업이 아래 표시를 쓴 뒤 성공하면 표시를 지우고 유지보수도 끈다.
+        // 표시를 쓰기 전에 멈추고 끝날 때까지 기다린다(`close`가 다시 abort해도 된다).
+        self.register.abort();
+        let _ = (&mut self.register).await;
+        #[cfg(any(feature = "starve-it", feature = "ha-it"))]
+        let faked = self.config.test.host_shutdown;
+        #[cfg(not(any(feature = "starve-it", feature = "ha-it")))]
+        let faked = None;
+        let host = match faked {
+            Some(host) => host,
+            None => shutdown::detect().await,
+        };
+        let policy = self
+            .cluster
+            .get_by_name::<SettingsSpec>(SETTINGS_NAME)
+            .ok()
+            .flatten()
+            .map(|s| s.spec.shutdown_policy())
+            .unwrap_or_default();
+        let Some(action) = shutdown::action(policy, host) else {
+            tracing::info!("shutting down; running VMs keep running");
+            return;
+        };
+        tracing::warn!(
+            ?host,
+            policy = policy.as_str(),
+            ?action,
+            "the host is shutting down"
+        );
+        services.stop_ha_vms = Some(self.config.reconciler.acpi_timeout());
+        let me = self.cluster.id().0;
+        let maintenance = action == ShutdownAction::Migrate
+            && self
+                .cluster
+                .get::<NodeSpec>(me)
+                .ok()
+                .flatten()
+                .is_some_and(|n| !n.spec.maintenance);
+        let mark = NodeShutdown {
+            action,
+            maintenance,
+            at: unix_now(),
+        };
+        if let Err(e) = bootstrap::mark_shutdown(&self.cluster, mark).await {
+            tracing::warn!(error = %e, "cannot record the host shutdown; stopping the HA VMs for failover");
+            return;
+        }
+        if action == ShutdownAction::Migrate {
+            migrate_away(&services.state, me).await;
+        }
+    }
+
     /// 모든 것을 멈춘다. `left`면 클러스터에서 빠진 것이므로 클러스터 저장소와 노드 인증서를 지운다.
     /// 아니면 오프라인으로 기록한다. 실행 중인 VM은 그대로 둔다.
     pub async fn close(mut self, left: bool) -> anyhow::Result<()> {
@@ -931,6 +1006,107 @@ impl Member {
         }
         shutdown?;
         Ok(())
+    }
+}
+
+/// 호스트 종료 정책 `migrate`가 비우기 Task를 기다리는 시간. 넘으면 남은 HA VM은 `failover`처럼 끈다.
+pub const SHUTDOWN_MIGRATE_LIMIT: Duration = Duration::from_secs(600);
+/// 비우기 Task를 다시 읽는 간격
+const SHUTDOWN_MIGRATE_POLL: Duration = Duration::from_secs(1);
+
+/// 지금 시각(유닉스 초)
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// 이 노드를 비운다(유지보수로 바꾸고 비우기 Task). Task가 끝나거나 [`SHUTDOWN_MIGRATE_LIMIT`]이 될 때까지
+/// 기다린다. 실패하면 경고만 한다.
+async fn migrate_away(state: &AppState, me: Uuid) {
+    let task = match opl_api::start_drain(state, &me.to_string()).await {
+        Ok(task) => task,
+        Err(e) => {
+            tracing::warn!(error = %e.message, "cannot drain this node before the host shutdown");
+            return;
+        }
+    };
+    tracing::info!(task = %task.id, "draining this node before the host shutdown");
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_MIGRATE_LIMIT;
+    loop {
+        match state.cluster.get::<TaskSpec>(task.id) {
+            Ok(Some(t)) if t.status.state.is_finished() => {
+                match t.status.error {
+                    Some(error) => {
+                        tracing::warn!(error, "the drain before the host shutdown failed")
+                    }
+                    None => tracing::info!("drained this node before the host shutdown"),
+                }
+                return;
+            }
+            Ok(None) => return,
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!("the drain before the host shutdown did not finish in time");
+            return;
+        }
+        tokio::time::sleep(SHUTDOWN_MIGRATE_POLL).await;
+    }
+}
+
+/// 이 노드에서 도는 활성 HA VM을 끈다(호스트 종료 정책). 모두에게 ACPI 종료를 보내고 `acpi_timeout` 안에
+/// 꺼지지 않으면 강제로 끈다. spec은 그대로라(`freeze`면 돌아와 다시 켜고, 아니면 리더가 옮긴다) 도는 HA VM
+/// 목록에서만 뺀다(watchdog를 magic close로 닫게).
+async fn stop_ha_vms(state: &AppState, ha: Option<&HaGuard>, acpi_timeout: Duration) {
+    let vms = match state.cluster.list::<VmSpec>() {
+        Ok((_, vms)) => vms,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot list VMs to stop the HA VMs");
+            return;
+        }
+    };
+    let mut running = Vec::new();
+    for vm in vms
+        .iter()
+        .filter(|vm| vm.spec.node == Some(state.node) && vm.spec.ha_active())
+    {
+        if matches!(state.hv.inspect(vm.id).await, Ok(Some(_))) {
+            running.push(vm);
+        }
+    }
+    if running.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = running.iter().map(|vm| vm.name.as_str()).collect();
+    tracing::warn!(vms = ?names, "stopping the HA VMs for the host shutdown");
+    for vm in &running {
+        if let Err(e) = state.hv.stop(vm.id, StopMode::Acpi).await {
+            tracing::warn!(vm = %vm.name, error = %e, "cannot send the ACPI shutdown");
+        }
+    }
+    let deadline = tokio::time::Instant::now() + acpi_timeout;
+    loop {
+        let mut left = false;
+        for vm in &running {
+            left |= !matches!(state.hv.inspect(vm.id).await, Ok(None));
+        }
+        if !left || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for vm in &running {
+        if !matches!(state.hv.inspect(vm.id).await, Ok(None)) {
+            tracing::warn!(vm = %vm.name, "the HA VM did not shut down in time; force stopping it");
+            if let Err(e) = state.hv.stop(vm.id, StopMode::Force).await {
+                tracing::warn!(vm = %vm.name, error = %e, "cannot force stop the HA VM");
+                continue;
+            }
+        }
+        if let Some(ha) = ha {
+            ha.set_running(vm.id, false);
+        }
     }
 }
 

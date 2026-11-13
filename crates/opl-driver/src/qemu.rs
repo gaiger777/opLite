@@ -287,10 +287,8 @@ impl QemuHypervisor {
         self.create_taps(vm).await?;
         let mut cmd = if self.config.systemd_scope {
             clear_stale_scope(vm.id).await;
-            // 스코프는 QEMU가 끝날 때까지 남는다. --collect: 실패로 끝나도 남기지 않는다.
             let mut cmd = tokio::process::Command::new("systemd-run");
-            cmd.args(["--scope", "--quiet", "--collect"])
-                .arg(format!("--unit=opl-vm-{}", vm.id))
+            cmd.args(scope_args(vm.id))
                 .arg("--")
                 .arg(&self.config.host.qemu_binary);
             cmd
@@ -1849,6 +1847,21 @@ async fn delete_taps(net: Option<&dyn HostNet>, id: Uuid) -> bool {
     true
 }
 
+/// QEMU를 감싸는 `systemd-run`의 인자(`--` 앞). 스코프는 QEMU가 끝날 때까지 남고, `--collect`면 실패로
+/// 끝나도 남기지 않는다. `Before=opld.service`: 멈출 때는 순서가 거꾸로라 호스트가 꺼질 때 opld가 끝난 뒤에
+/// 스코프가 멈춘다(종료 정책이 VM이 살아 있을 때 돈다). `After=network-online.target remote-fs.target`: 망과
+/// 원격 파일시스템보다 먼저 멈춘다(NFS·iSCSI 디스크를 쓰는 QEMU가 망이 끊긴 뒤에 남지 않게).
+fn scope_args(id: Uuid) -> Vec<String> {
+    vec![
+        "--scope".into(),
+        "--quiet".into(),
+        "--collect".into(),
+        format!("--unit=opl-vm-{id}"),
+        "--property=Before=opld.service".into(),
+        "--property=After=network-online.target remote-fs.target".into(),
+    ]
+}
+
 /// 끝난 QEMU의 `--collect` 스코프는 systemd가 비동기로 회수하므로, 곧바로 다시 띄우면
 /// systemd-run이 "Unit ... already exists"로 실패한다. 호출자가 이전 QEMU가 없음을 확인했으므로
 /// 남은 스코프를 멈추고 실패 기록을 지운다. 오류와 출력은 무시한다.
@@ -2083,6 +2096,24 @@ mod tests {
         }
         assert!(err.is_transient());
         assert!(!tmp.path().join("run/vm").join(vm.id.to_string()).exists());
+    }
+
+    /// VM 스코프는 opld보다 먼저 시작한 것으로 묶여(`Before=opld.service`) 호스트가 꺼질 때 opld 뒤에 멈추고,
+    /// 망·원격 파일시스템보다는 먼저 멈춘다.
+    #[test]
+    fn the_vm_scope_is_ordered_before_opld() {
+        let id = Uuid::nil();
+        assert_eq!(
+            scope_args(id),
+            [
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--unit=opl-vm-00000000-0000-0000-0000-000000000000",
+                "--property=Before=opld.service",
+                "--property=After=network-online.target remote-fs.target",
+            ]
+        );
     }
 
     #[test]

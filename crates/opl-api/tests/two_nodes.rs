@@ -314,6 +314,7 @@ async fn two_nodes_with(
             // 노드가 등록할 때처럼 이 빌드의 기능을 적는다(노드 비우기).
             features: FEATURES.iter().map(|f| f.to_string()).collect(),
             cluster_addresses: vec![],
+            shutdown: None,
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();

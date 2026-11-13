@@ -1,5 +1,6 @@
 //! 노드 비우기 API(설계 §3.1). 노드를 유지보수로 바꾸고 비우기 Task를 그 노드에 만든다. 옮기는 일은
-//! 그 노드의 실행기가 한다(`tasks::drain`).
+//! 그 노드의 실행기가 한다(`tasks::drain`). 호스트 종료 정책 `migrate`도 같은 일을 한다([`start_drain`]).
+//! 얼린 노드 풀기(`POST /nodes/{key}/unfreeze`)도 여기 있다.
 
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
-use opl_types::node::NodeSpec;
+use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 
@@ -30,7 +31,14 @@ pub async fn drain_node(
     Path(key): Path<String>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Write, NodeSpec::KIND)?;
-    let node = lookup::<NodeSpec>(&state.cluster, &key)?;
+    let task = start_drain(&state, &key).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 노드 `key`(id나 이름)를 유지보수로 바꾸고 비우기 Task를 만든다. [`drain_node`]의 확인과 오류가 같다
+/// (권한은 보지 않는다). 호스트 종료 정책 `migrate`가 자기 노드에 부른다.
+pub async fn start_drain(state: &AppState, key: &str) -> Result<Task, ApiError> {
+    let node = lookup::<NodeSpec>(&state.cluster, key)?;
     if node.spec.witness {
         return Err(ApiError::conflict(
             "node_unavailable",
@@ -61,9 +69,55 @@ pub async fn drain_node(
     }
     // 롤링 업그레이드 중(버전이 섞여도) 모든 노드가 비우기 Task를 알면 된다.
     crate::cluster::require_feature(&state.cluster, "node-drain")?;
-    set_maintenance(&state, &key).await?;
-    let task = create_task(&state.cluster, TaskOp::NodeDrain, node.id, node.id).await?;
-    Ok((StatusCode::ACCEPTED, Json(task)))
+    set_maintenance(state, key).await?;
+    create_task(&state.cluster, TaskOp::NodeDrain, node.id, node.id).await
+}
+
+/// 얼린 노드(호스트 종료 정책 `freeze`로 HA VM을 끄고 꺼진 노드)의 표시를 지워, 리더가 평소대로 그 노드의
+/// HA VM을 다른 노드로 옮기게 한다. 돌아오지 않는 노드에 쓴다. 표시가 없으면 그대로 돌려준다. 온라인이면
+/// 409 `node_online`(돌아온 노드는 등록하며 스스로 지운다).
+#[utoipa::path(post, path = "/nodes/{key}/unfreeze", tag = "nodes",
+    params(("key" = String, Path, description = "node id or name")),
+    responses((status = 200, body = Resource<NodeSpec, opl_types::node::NodeStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn unfreeze_node(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+) -> Result<Json<Node>, ApiError> {
+    state.authorize(&principal, Action::Write, NodeSpec::KIND)?;
+    for _ in 0..10 {
+        let node = lookup::<NodeSpec>(&state.cluster, &key)?;
+        if node.status.online {
+            return Err(ApiError::conflict(
+                "node_online",
+                format!(
+                    "node {:?} is online; it clears its shutdown mark itself",
+                    node.name
+                ),
+            ));
+        }
+        let Some(mark) = node.status.shutdown else {
+            return Ok(Json(node));
+        };
+        let mut status = node.status.clone();
+        status.shutdown = None;
+        match state
+            .cluster
+            .update_status_checked::<NodeSpec>(node.id, node.revision, &status)
+            .await
+        {
+            Ok(_) => {
+                tracing::warn!(node = %node.name, action = ?mark.action, "shutdown mark cleared; HA recovers the node's VMs");
+                return Ok(Json(lookup::<NodeSpec>(&state.cluster, &key)?));
+            }
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "busy",
+        "the node kept changing while being updated; try again",
+    ))
 }
 
 /// 노드의 `maintenance`를 참으로 쓴다(revision 확인). 다른 쓰기와 부딪치면 다시 읽어 쓴다.

@@ -90,8 +90,8 @@ pub struct Config {
     pub web: WebSection,
     #[serde(default)]
     pub node: NodeSection,
-    /// 시험 빌드(`starve-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
-    #[cfg(feature = "starve-it")]
+    /// 시험 빌드(`starve-it`·`ha-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
+    #[cfg(any(feature = "starve-it", feature = "ha-it"))]
     #[serde(default)]
     pub test: TestSection,
 }
@@ -736,14 +736,18 @@ fn default_runtime_threads() -> usize {
     (cpus / 2).max(2)
 }
 
-/// 굶김 시험의 고리(설계 §3.4, 시험 빌드에만)
-#[cfg(feature = "starve-it")]
+/// 시험 고리(시험 빌드에만): 굶김 시험(설계 §3.4)과 호스트 종료 정책 시험
+#[cfg(any(feature = "starve-it", feature = "ha-it"))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestSection {
     /// 제어 소켓의 `POST /v1/test/block-api`가 `api` 실행기의 작업자를 모두 막는 시간(밀리초)
+    #[cfg(feature = "starve-it")]
     #[serde(default)]
     pub block_api_ms: u64,
+    /// 종료 신호를 받았을 때 systemd에 묻지 않고 이 호스트 종료로 본다(`reboot`·`poweroff`).
+    #[serde(default)]
+    pub host_shutdown: Option<crate::shutdown::HostShutdown>,
 }
 
 #[cfg(feature = "starve-it")]
@@ -1848,6 +1852,27 @@ mod tests {
         #[cfg(feature = "starve-it")]
         assert_eq!(parsed.unwrap().test.block_api(), Duration::from_secs(15));
         #[cfg(not(feature = "starve-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] host_shutdown`은 `starve-it`·`ha-it` 빌드에만 있다.
+    #[test]
+    fn the_test_section_fakes_a_host_shutdown_only_in_test_builds() {
+        let parsed = toml::from_str::<Config>(
+            "name = \"n\"\naddress = \"h\"\n[test]\nhost_shutdown = \"reboot\"",
+        );
+        #[cfg(any(feature = "starve-it", feature = "ha-it"))]
+        {
+            assert_eq!(
+                parsed.unwrap().test.host_shutdown,
+                Some(crate::shutdown::HostShutdown::Reboot)
+            );
+            assert_eq!(
+                parse("name = \"n\"\naddress = \"h\"").test.host_shutdown,
+                None
+            );
+        }
+        #[cfg(not(any(feature = "starve-it", feature = "ha-it")))]
         assert!(parsed.is_err());
     }
 

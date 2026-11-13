@@ -7,9 +7,11 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::node::HA_PLACEMENT;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::{
-    Channel, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus, TelemetrySettings, VOTER_LIMITS,
+    Channel, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus, ShutdownPolicy,
+    TelemetrySettings, VOTER_LIMITS,
 };
 use opl_types::subscription::SubscriptionState;
 use opl_types::version::TELEMETRY_URL;
@@ -62,6 +64,11 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default, minimum = 3, maximum = 7)]
     pub voters: Option<u8>,
+    /// 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. `conditional`(기본: 재부팅이면
+    /// `freeze`, 끄기면 `failover`), `freeze`, `failover`, `migrate`. `systemctl stop`에는 쓰지 않는다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub shutdown_policy: Option<ShutdownPolicy>,
 }
 
 /// API 이름은 이만큼까지 둔다.
@@ -272,9 +279,10 @@ pub async fn patch_settings(
         && req.web_origins.is_none()
         && req.api_names.is_none()
         && req.voters.is_none()
+        && req.shutdown_policy.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins, api_names or voters",
+            "give updates, telemetry, web_origins, api_names, voters or shutdown_policy",
         ));
     }
     if let Some(n) = req.voters
@@ -302,6 +310,10 @@ pub async fn patch_settings(
         || names.as_ref().is_some_and(|n| !n.is_empty())
     {
         crate::cluster::require_current(&state.cluster)?;
+    }
+    // 옛 노드는 종료 정책 필드를 풀지 못한다(버전이 섞여도 모든 노드가 알면 된다).
+    if req.shutdown_policy.is_some() {
+        crate::cluster::require_feature(&state.cluster, HA_PLACEMENT)?;
     }
     let used = if enterprise {
         crate::subscription::used_nodes(&state.cluster)?
@@ -333,6 +345,10 @@ pub async fn patch_settings(
         }
         if let Some(n) = req.voters {
             spec.voters = Some(n);
+        }
+        // 기본(`conditional`)은 쓰지 않는다.
+        if let Some(policy) = req.shutdown_policy {
+            spec.shutdown_policy = (policy != ShutdownPolicy::Conditional).then_some(policy);
         }
         Ok(())
     })

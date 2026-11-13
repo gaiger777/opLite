@@ -46,6 +46,38 @@ pub struct SettingsSpec {
         schema(nullable = false, default, minimum = 3, maximum = 7)
     )]
     pub voters: Option<u8>,
+    /// 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. 없으면 `conditional`이고, 쓰지 않아
+    /// 옛 노드도 설정을 계속 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub shutdown_policy: Option<ShutdownPolicy>,
+}
+
+/// 노드 정상 종료 정책(설계 §8). `systemctl stop`·업그레이드 재시작이 아니라 호스트가 꺼지는 중일 때만 쓴다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ShutdownPolicy {
+    /// 재부팅이면 `freeze`, 전원 끄기면 `failover`
+    #[default]
+    Conditional,
+    /// HA VM을 끄고 그 노드에 묶어 둔다(돌아오면 그 노드에서 다시 켠다).
+    Freeze,
+    /// HA VM을 끄고 리더가 다른 노드에서 켠다.
+    Failover,
+    /// 비우기로 VM을 미리 다른 노드로 옮긴다(남은 HA VM은 `failover`처럼).
+    Migrate,
+}
+
+impl ShutdownPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShutdownPolicy::Conditional => "conditional",
+            ShutdownPolicy::Freeze => "freeze",
+            ShutdownPolicy::Failover => "failover",
+            ShutdownPolicy::Migrate => "migrate",
+        }
+    }
 }
 
 /// 투표 멤버 상한의 기본값
@@ -58,6 +90,11 @@ impl SettingsSpec {
     pub fn voter_limit(&self) -> usize {
         let n = self.voters.filter(|n| VOTER_LIMITS.contains(n));
         usize::from(n.unwrap_or(DEFAULT_VOTERS))
+    }
+
+    /// 노드 정상 종료 정책. 없으면 `conditional`이다.
+    pub fn shutdown_policy(&self) -> ShutdownPolicy {
+        self.shutdown_policy.unwrap_or_default()
     }
 }
 
@@ -195,6 +232,7 @@ mod tests {
             web_origins: vec![],
             api_names: vec![],
             voters: None,
+            shutdown_policy: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -275,6 +313,38 @@ mod tests {
             ..SettingsSpec::default()
         };
         assert_eq!(odd.voter_limit(), 5);
+    }
+
+    /// 종료 정책도 없으면 쓰지 않고 `conditional`이다. 값은 소문자다.
+    #[test]
+    fn shutdown_policy_is_written_only_when_set() {
+        assert_eq!(
+            SettingsSpec::default().shutdown_policy(),
+            ShutdownPolicy::Conditional
+        );
+        assert!(
+            serde_json::to_value(SettingsSpec::default())
+                .unwrap()
+                .get("shutdown_policy")
+                .is_none()
+        );
+        for policy in [
+            ShutdownPolicy::Conditional,
+            ShutdownPolicy::Freeze,
+            ShutdownPolicy::Failover,
+            ShutdownPolicy::Migrate,
+        ] {
+            let spec = SettingsSpec {
+                shutdown_policy: Some(policy),
+                ..SettingsSpec::default()
+            };
+            let json = serde_json::to_value(&spec).unwrap();
+            assert_eq!(json["shutdown_policy"], policy.as_str());
+            let back = serde_json::from_value::<SettingsSpec>(json).unwrap();
+            assert_eq!(back.shutdown_policy(), policy);
+        }
+        assert!(serde_json::from_str::<SettingsSpec>(r#"{"shutdown_policy":"Freeze"}"#).is_err());
+        assert!(serde_json::from_str::<SettingsSpec>(r#"{"shutdown_policy":"ignore"}"#).is_err());
     }
 
     /// 텔레메트리도 기본값(꺼짐, 끝점 없음, 상태 없음)이면 계획 32 모양 그대로 쓴다.

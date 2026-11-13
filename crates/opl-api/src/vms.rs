@@ -631,7 +631,7 @@ pub(crate) enum RuleCheck {
 /// 있으면 모든 노드가 디스크 복사를 알아야 하고(409 `cluster_upgrading`) VM에 스냅샷이 없어야 한다(409
 /// `migration_unsupported`). `pool`을 줬는데 그런 디스크가 없으면 400, 없는 풀이면 404다. HVF(macOS)
 /// 노드는 원본도 대상도 될 수 없다(409 `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나
-/// 유지보수 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
+/// 유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
 /// 스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다. 대상 노드가 hard
 /// 배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
 /// (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`).
@@ -760,6 +760,12 @@ pub(crate) async fn start_migration(
         return Err(ApiError::conflict(
             "node_unavailable",
             format!("node {:?} is offline or in maintenance", target.name),
+        ));
+    }
+    if target.status.shutdown.is_some() {
+        return Err(ApiError::conflict(
+            "node_unavailable",
+            format!("node {:?} is shutting down", target.name),
         ));
     }
     check_node_arch(&target, &vm.spec)?;

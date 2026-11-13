@@ -433,7 +433,8 @@ async fn image_locked_by_another_qemu_is_transient() {
     b.stop(other.id, StopMode::Force).await.unwrap();
 }
 
-/// `OPL_TEST_SYSTEMD=1`(systemd가 있는 Linux)일 때만 확인한다: QEMU가 VM 전용 스코프에서 돈다.
+/// `OPL_TEST_SYSTEMD=1`(systemd가 있는 Linux)일 때만 확인한다: QEMU가 VM 전용 스코프에서 돌고, 그 스코프는
+/// `opld.service` 앞에 묶였다.
 #[tokio::test]
 async fn qemu_runs_in_its_own_systemd_scope() {
     if std::env::var_os("OPL_TEST_SYSTEMD").is_none() {
@@ -448,6 +449,18 @@ async fn qemu_runs_in_its_own_systemd_scope() {
     assert!(
         cgroup.contains(&format!("opl-vm-{}.scope", vm.id)),
         "{cgroup}"
+    );
+    // 호스트가 꺼질 때 opld가 먼저 끝나도록 스코프가 opld.service 앞에 묶였다.
+    let show = std::process::Command::new("systemctl")
+        .args(["show", "-p", "Before", &format!("opl-vm-{}.scope", vm.id)])
+        .output()
+        .unwrap();
+    let before = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        before
+            .split_whitespace()
+            .any(|u| u.ends_with("opld.service")),
+        "{before}"
     );
     hv.stop(vm.id, StopMode::Force).await.unwrap();
     // 끝난 스코프가 아직 남아 있어도 시작 전에 지우므로 곧바로 다시 시작할 수 있다.

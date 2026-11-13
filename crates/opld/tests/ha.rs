@@ -3,7 +3,9 @@
 //! HA VM만 노드 B로 옮겨 켜는지(기록 Task `vm-ha-recover`), A를 다시 띄워도 그 VM을 건드리지 않는지 본다.
 //! HA 그룹 {A:1, B:2}의 VM이 B에 놓이고, B가 죽으면 A로 복구됐다가 B가 돌아오면 라이브 마이그레이션으로
 //! 되돌아가는지도 본다(이 Mac에서는 TCG). A에서 두 번 크래시한(`max_restart` 1을 넘은) HA VM이 B로 옮겨
-//! 켜지는지도 본다.
+//! 켜지는지도 본다. 호스트 종료 정책: 끄기 + `failover`면 A가 끝나기 전에 HA VM을 끄고 B에서 켜는지, 재부팅 +
+//! 기본(`conditional`)이면 얼려 두었다가 A가 돌아와 켜는지, 끄기 + `migrate`면 비우기로 미리 옮기는지 본다
+//! (`[test] host_shutdown`).
 //! `cargo test -p opld --features ha-it --test ha`
 //! QEMU(`qemu-it`와 같다)와 qemu-img가 필요하다. 이 Mac에서도 돈다.
 //!
@@ -503,4 +505,298 @@ async fn an_ha_vm_crashing_past_max_restart_is_relocated_to_another_node() {
     a.ctl(&["vm", "delete", "db"]).await.unwrap();
     a.ctl(&["volume", "delete", "db-root"]).await.unwrap();
     a.ctl(&["pool", "delete", "shared"]).await.unwrap();
+}
+
+/// 노드 A(설정 `extra_a`가 더해짐)·B와 위트니스로 클러스터를 만들고 두 노드가 HA를 돌릴 수 있을 때까지
+/// 기다린다. A가 처음 노드이고 로그인돼 있다.
+async fn ha_cluster(name: &str, extra_a: &str) -> (Daemon, Daemon, Daemon) {
+    let mut a = Daemon::with_hypervisor(
+        "node-a",
+        &format!("{CONFIG}{extra_a}"),
+        "systemd_scope = false",
+    );
+    let mut b = Daemon::with_hypervisor("node-b", CONFIG, "systemd_scope = false");
+    let mut w = Daemon::witness("wit");
+    a.start().await;
+    b.start().await;
+    w.start().await;
+    a.init(name).await;
+    a.login().await;
+    let url = a.join_url.clone().unwrap();
+    b.join(&url).await.unwrap();
+    b.login_with(
+        a.admin_password.as_deref().unwrap(),
+        a.ca_fingerprint.as_deref().unwrap(),
+    )
+    .await;
+    let url = a.ctl(&["cluster", "join-token"]).await.unwrap();
+    w.join(url.trim()).await.unwrap();
+    let ca = client(&a);
+    eventually("both nodes online and HA capable", || async {
+        let nodes = ca.get("/nodes").await.unwrap();
+        let nodes = nodes["items"].as_array().unwrap().clone();
+        nodes.len() == 3
+            && nodes.iter().all(|n| n["status"]["online"] == true)
+            && nodes
+                .iter()
+                .filter(|n| n["spec"]["witness"] != true)
+                .all(|n| n["status"]["ha"]["fencing"] == "process")
+    })
+    .await;
+    (a, b, w)
+}
+
+#[tokio::test]
+async fn a_host_poweroff_with_failover_stops_the_ha_vm_and_another_node_runs_it() {
+    // 호스트 끄기(`[test] host_shutdown`) + `failover`: A가 끝나기 전에 HA VM만 끄고, 리더가 B에서 켠다. HA 아닌
+    // VM은 그대로 돈다.
+    let (mut a, b, _w) = ha_cluster("ha-off", "[test]\nhost_shutdown = \"poweroff\"\n").await;
+    let (ca, cb) = (client(&a), client(&b));
+    let (id_a, id_b) = (node_id(&ca, "node-a").await, node_id(&ca, "node-b").await);
+    a.ctl(&["settings", "set", "shutdown_policy=failover"])
+        .await
+        .unwrap();
+    let shared = tempfile::Builder::new()
+        .prefix("oplhaoff")
+        .tempdir_in("/tmp")
+        .unwrap();
+    a.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.path().to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    a.wait_pool_ready("shared").await;
+    b.wait_pool_ready("shared").await;
+    a.ctl(&[
+        "volume", "create", "db-root", "--pool", "shared", "--size", "64M",
+    ])
+    .await
+    .unwrap();
+    a.ctl(&[
+        "vm", "create", "db", "--memory", "256", "--disk", "db-root", "--node", "node-a", "--ha",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    a.ctl(&[
+        "vm", "create", "plain", "--memory", "256", "--node", "node-a", "--start",
+    ])
+    .await
+    .unwrap();
+    let db_pid = running_pid(&ca, "db", &id_a).await;
+    let plain_pid = running_pid(&ca, "plain", &id_a).await;
+
+    // SIGTERM: A가 끝났을 때 HA VM의 QEMU는 이미 꺼졌다.
+    a.stop();
+    assert!(!alive(db_pid), "the HA VM still runs after node A stopped");
+    assert!(alive(plain_pid));
+    eventually("node A marked failover and offline", || async {
+        let node = cb.get("/nodes/node-a").await.unwrap();
+        node["status"]["shutdown"]["action"] == "failover" && node["status"]["online"] == false
+    })
+    .await;
+
+    eventually_within("HA VM running on node B", RECOVER_WAIT, || async {
+        let Ok(vm) = cb.get("/vms/db").await else {
+            return false;
+        };
+        vm["spec"]["node"] == id_b.as_str()
+            && vm["status"]["phase"] == "running"
+            && vm["status"]["node"] == id_b.as_str()
+    })
+    .await;
+    let plain = cb.get("/vms/plain").await.unwrap();
+    assert_eq!(plain["spec"]["node"], id_a.as_str(), "{plain}");
+
+    kill_qemu(plain_pid).await;
+    b.ctl(&["vm", "stop", "db", "--force"]).await.unwrap();
+    b.ctl(&["vm", "delete", "db"]).await.unwrap();
+    b.ctl(&["volume", "delete", "db-root"]).await.unwrap();
+    b.ctl(&["pool", "delete", "shared"]).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_host_reboot_with_the_default_policy_freezes_the_ha_vm_on_its_node() {
+    // 호스트 재부팅 + 기본 정책(`conditional` → `freeze`): A가 HA VM을 끄고 얼린 표시를 남긴다. 리더는
+    // `recover_after`가 지나도 옮기지 않고, A가 돌아오면 A에서 다시 켠다.
+    let (mut a, b, _w) = ha_cluster("ha-reboot", "[test]\nhost_shutdown = \"reboot\"\n").await;
+    let (ca, cb) = (client(&a), client(&b));
+    let id_a = node_id(&ca, "node-a").await;
+    a.ctl(&[
+        "vm", "create", "db", "--memory", "256", "--node", "node-a", "--ha", "--start",
+    ])
+    .await
+    .unwrap();
+    let db_pid = running_pid(&ca, "db", &id_a).await;
+
+    a.stop();
+    assert!(!alive(db_pid), "the HA VM still runs after node A stopped");
+    eventually("node A frozen and offline", || async {
+        let node = cb.get("/nodes/node-a").await.unwrap();
+        node["status"]["shutdown"]["action"] == "freeze" && node["status"]["online"] == false
+    })
+    .await;
+
+    // recover_after(7초)와 리더 선거를 넉넉히 넘겨도 그대로다.
+    let until = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < until {
+        let vm = cb.get("/vms/db").await.unwrap();
+        assert_eq!(vm["spec"]["node"], id_a.as_str(), "{vm}");
+        assert_eq!(vm["spec"]["power"], "running", "{vm}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let tasks = cb.get("/tasks").await.unwrap();
+    assert!(
+        !tasks["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["spec"]["op"]["kind"] == "vm-ha-recover"),
+        "{tasks}"
+    );
+
+    // A가 돌아오면 표시를 지우고 A에서 다시 켠다.
+    // (꺼질 때 reconciler가 멈춰 있어 status는 옛 pid를 담고 있다.)
+    a.start().await;
+    let deadline = Instant::now() + RECOVER_WAIT;
+    let pid = loop {
+        let pid = running_pid(&cb, "db", &id_a).await;
+        if pid != db_pid {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "db not started again on node A");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(alive(pid));
+    let node = cb.get("/nodes/node-a").await.unwrap();
+    assert!(node["status"].get("shutdown").is_none(), "{node}");
+
+    a.ctl(&["vm", "stop", "db", "--force"]).await.unwrap();
+    a.ctl(&["vm", "delete", "db"]).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_host_poweroff_with_migrate_drains_the_node_before_stopping() {
+    // 호스트 끄기 + `migrate`: A가 끝나기 전에 유지보수로 바꾸고 비우기로 HA VM을 B로 라이브 마이그레이션한다.
+    // A가 돌아오면 정책이 켠 유지보수를 끈다(이 Mac에서는 TCG).
+    let daemon = |name: &str, extra: &str, ports: &str| {
+        Daemon::with_hypervisor(
+            name,
+            &format!("{CONFIG}{extra}[migration]\nports = \"{ports}\"\n"),
+            migrating_hypervisor(),
+        )
+    };
+    let mut a = daemon(
+        "node-a",
+        "[test]\nhost_shutdown = \"poweroff\"\n",
+        "49650-49659",
+    );
+    let mut b = daemon("node-b", "", "49660-49669");
+    let mut w = Daemon::witness("wit");
+    a.start().await;
+    b.start().await;
+    w.start().await;
+    a.init("ha-mig").await;
+    a.login().await;
+    let url = a.join_url.clone().unwrap();
+    b.join(&url).await.unwrap();
+    b.login_with(
+        a.admin_password.as_deref().unwrap(),
+        a.ca_fingerprint.as_deref().unwrap(),
+    )
+    .await;
+    let url = a.ctl(&["cluster", "join-token"]).await.unwrap();
+    w.join(url.trim()).await.unwrap();
+    let (ca, cb) = (client(&a), client(&b));
+    eventually("both nodes online and HA capable", || async {
+        let nodes = ca.get("/nodes").await.unwrap();
+        let nodes = nodes["items"].as_array().unwrap().clone();
+        nodes.len() == 3
+            && nodes.iter().all(|n| n["status"]["online"] == true)
+            && nodes
+                .iter()
+                .filter(|n| n["spec"]["witness"] != true)
+                .all(|n| n["status"]["ha"]["fencing"] == "process")
+    })
+    .await;
+    let (id_a, id_b) = (node_id(&ca, "node-a").await, node_id(&ca, "node-b").await);
+    a.ctl(&["settings", "set", "shutdown_policy=migrate"])
+        .await
+        .unwrap();
+    let shared = tempfile::Builder::new()
+        .prefix("oplhamig")
+        .tempdir_in("/tmp")
+        .unwrap();
+    a.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.path().to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    a.wait_pool_ready("shared").await;
+    b.wait_pool_ready("shared").await;
+    a.ctl(&[
+        "volume", "create", "db-root", "--pool", "shared", "--size", "64M",
+    ])
+    .await
+    .unwrap();
+    a.ctl(&[
+        "vm", "create", "db", "--memory", "256", "--disk", "db-root", "--node", "node-a", "--ha",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    let db_pid = running_pid(&ca, "db", &id_a).await;
+
+    // SIGTERM: A가 끝나기 전에 HA VM이 B로 옮겨 가 돈다(복구가 아니라 마이그레이션).
+    a.stop();
+    assert!(!alive(db_pid));
+    eventually("HA VM assigned to node B", || async {
+        cb.get("/vms/db").await.unwrap()["spec"]["node"] == id_b.as_str()
+    })
+    .await;
+    let pid = running_pid(&cb, "db", &id_b).await;
+    assert!(alive(pid));
+    let tasks = cb.get("/tasks").await.unwrap();
+    let kinds: Vec<&Value> = tasks["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| &t["spec"]["op"]["kind"])
+        .collect();
+    assert!(kinds.iter().any(|k| *k == "node-drain"), "{tasks}");
+    assert!(kinds.iter().any(|k| *k == "vm-migrate"), "{tasks}");
+    assert!(!kinds.iter().any(|k| *k == "vm-ha-recover"), "{tasks}");
+    eventually("node A marked migrate and in maintenance", || async {
+        let node = cb.get("/nodes/node-a").await.unwrap();
+        node["status"]["shutdown"]["action"] == "migrate"
+            && node["status"]["shutdown"]["maintenance"] == true
+            && node["spec"]["maintenance"] == true
+            && node["status"]["online"] == false
+    })
+    .await;
+
+    // A가 돌아오면 표시를 지우고 정책이 켠 유지보수를 끈다.
+    a.start().await;
+    eventually("node A back without maintenance", || async {
+        let node = cb.get("/nodes/node-a").await.unwrap();
+        node["status"]["online"] == true
+            && node["spec"]["maintenance"] == false
+            && node["status"].get("shutdown").is_none()
+    })
+    .await;
+
+    b.ctl(&["vm", "stop", "db", "--force"]).await.unwrap();
+    b.ctl(&["vm", "delete", "db"]).await.unwrap();
+    b.ctl(&["volume", "delete", "db-root"]).await.unwrap();
+    b.ctl(&["pool", "delete", "shared"]).await.unwrap();
 }

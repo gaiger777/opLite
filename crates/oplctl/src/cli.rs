@@ -277,6 +277,11 @@ enum NodeCmd {
     /// 노드마다 마지막 사용량 점(CPU, 메모리, 디스크, 네트워크, 데이터 파일 시스템). `-o json`은 남은 모든
     /// 점(1시간)이다.
     Stats(StatsArgs),
+    /// 얼린 노드(호스트 종료 정책 `freeze`로 HA VM을 끄고 꺼진 노드)의 표시를 지워 리더가 그 HA VM을 다른 노드로
+    /// 옮기게 한다. 돌아오지 않는 노드에 쓴다(오프라인일 때만).
+    Unfreeze {
+        node: String,
+    },
 }
 
 /// `node stats`·`vm stats`의 공통 인자
@@ -430,6 +435,22 @@ async fn node_drain(
             "drain of {node} started (task {id}); follow it with `orbivisorctl task get {id}`"
         )?;
     }
+    Ok(())
+}
+
+/// `node unfreeze`: 얼린 노드의 호스트 종료 표시를 지운다.
+async fn node_unfreeze(
+    client: &Client,
+    node: &str,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    client
+        .post(&format!("/nodes/{}/unfreeze", seg(node)), &json!({}))
+        .await?;
+    writeln!(
+        out,
+        "node {node}: shutdown mark cleared; HA moves its VMs to other nodes"
+    )?;
     Ok(())
 }
 
@@ -2167,17 +2188,24 @@ enum SettingsCmd {
     Get,
     /// 설정을 바꾼다. 키: `updates.channel`(stable|testing|enterprise), `web_origins`(쿠키 요청을 받는 다른
     /// 출처, 쉼표로 여럿, 비우면 같은 출처만), `api_names`(노드 API 인증서에 더할 DNS 이름·IP, 쉼표로 여럿),
-    /// `voters`(투표 멤버 상한 3|5|7, 위트니스도 센다)
+    /// `voters`(투표 멤버 상한 3|5|7, 위트니스도 센다), `shutdown_policy`(호스트가 꺼질 때 HA VM:
+    /// conditional|freeze|failover|migrate)
     Set {
         /// 예: `updates.channel=testing`, `web_origins=https://portal.example.com`,
-        /// `api_names=orbivisor.example.com,192.168.0.200`, `voters=3`
+        /// `api_names=orbivisor.example.com,192.168.0.200`, `voters=3`, `shutdown_policy=migrate`
         #[arg(required = true, value_name = "KEY=VALUE")]
         values: Vec<String>,
     },
 }
 
 /// `settings set`이 아는 키
-const SETTING_KEYS: &[&str] = &["updates.channel", "web_origins", "api_names", "voters"];
+const SETTING_KEYS: &[&str] = &[
+    "updates.channel",
+    "web_origins",
+    "api_names",
+    "voters",
+    "shutdown_policy",
+];
 
 /// `settings set`의 요청 본문(`PATCH /settings`). 준 키만 보낸다.
 fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
@@ -2203,6 +2231,7 @@ fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
                     .map_err(|_| anyhow::anyhow!("voters must be 3, 5 or 7 (got {v:?})"))?;
                 body["voters"] = json!(n);
             }
+            "shutdown_policy" => body["shutdown_policy"] = json!(v.trim()),
             _ => bail!("unknown setting {key}; known: {}", SETTING_KEYS.join(", ")),
         }
     }
@@ -4142,6 +4171,7 @@ where
             NodeCmd::Stats(stats) => {
                 node_stats(&client, stats.watch, json_out, out, &mut std::io::stderr()).await?
             }
+            NodeCmd::Unfreeze { node } => node_unfreeze(&client, &node, out).await?,
         },
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::List => {
@@ -6132,6 +6162,7 @@ const NODE_HEADERS: &[&str] = &[
     "VOTER",
     "ROLES",
     "FENCING",
+    "SHUTDOWN",
 ];
 
 /// `node list`. 투표 멤버인지는 클러스터 멤버십(`GET /cluster`)에 있다. 그것을 읽지 못해도(과반 없음 등) 목록은
@@ -6176,7 +6207,18 @@ fn node_row(n: &Value, cluster: &Value) -> Vec<String> {
         node_roles_cell(&n["spec"]),
         // 펜싱이 꺼진 노드(옛 서버도)는 `ha`가 없다.
         cell(&n["status"]["ha"]["fencing"]),
+        node_shutdown_cell(&n["status"]),
     ]
+}
+
+/// 호스트 종료 표시. 오프라인인 `freeze`는 얼린 노드(`frozen`, `node unfreeze`로 푼다)이고, 표시가 없으면 `-`다.
+fn node_shutdown_cell(status: &Value) -> String {
+    let action = &status["shutdown"]["action"];
+    match action.as_str() {
+        Some("freeze") if status["online"] != true => "frozen".into(),
+        Some(_) => cell(action),
+        None => "-".into(),
+    }
 }
 
 /// 노드의 역할(쉼표로). `roles`가 없으면 기본(위트니스가 아니면 `api`)이고, 없으면 `-`다.
@@ -8997,11 +9039,58 @@ mod tests {
         // underlay가 없는 노드(위트니스, 옛 서버)는 `-`다. 역할이 없으면 기본 역할(위트니스는 없음)이다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  VOTER  ROLES  FENCING\n\
-             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    true   api    watchdog\n\
-             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     true   -      -\n\
-             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    false  api    -\n\
-             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -      -\n"
+            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  VOTER  ROLES  FENCING   SHUTDOWN\n\
+             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    true   api    watchdog  -\n\
+             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     true   -      -         -\n\
+             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    false  api    -         -\n\
+             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -      -         -\n"
+        );
+    }
+
+    /// 호스트 종료 표시: 오프라인인 `freeze`만 얼린 노드다.
+    #[test]
+    fn node_list_shows_frozen_nodes() {
+        let status = |online: bool, action: Option<&str>| {
+            let mut s = json!({ "online": online });
+            if let Some(a) = action {
+                s["shutdown"] = json!({ "action": a, "maintenance": false, "at": 1 });
+            }
+            s
+        };
+        assert_eq!(node_shutdown_cell(&status(false, Some("freeze"))), "frozen");
+        assert_eq!(node_shutdown_cell(&status(true, Some("freeze"))), "freeze");
+        assert_eq!(
+            node_shutdown_cell(&status(false, Some("failover"))),
+            "failover"
+        );
+        assert_eq!(
+            node_shutdown_cell(&status(false, Some("migrate"))),
+            "migrate"
+        );
+        assert_eq!(node_shutdown_cell(&status(false, None)), "-");
+    }
+
+    /// `node unfreeze`는 노드의 풀기 경로를 부른다.
+    #[tokio::test]
+    async fn node_unfreeze_posts_to_the_node() {
+        let (client, seen) = fake_api(|_| json!({ "id": "n1" })).await;
+        let Cmd::Node {
+            cmd: NodeCmd::Unfreeze { node },
+        } = Cli::try_parse_from(["oplctl", "node", "unfreeze", "n1"])
+            .unwrap()
+            .cmd
+        else {
+            unreachable!()
+        };
+        let mut out = Vec::new();
+        node_unfreeze(&client, &node, &mut out).await.unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "node n1: shutdown mark cleared; HA moves its VMs to other nodes\n"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["POST /api/v1/nodes/n1/unfreeze HTTP/1.1"]
         );
     }
 
@@ -10662,12 +10751,16 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             settings_set_body(&["voters=3".into()]).unwrap(),
             json!({ "voters": 3 })
         );
+        assert_eq!(
+            settings_set_body(&["shutdown_policy=migrate".into()]).unwrap(),
+            json!({ "shutdown_policy": "migrate" })
+        );
         let err = settings_set_body(&["voters=five".into()]).unwrap_err();
         assert_eq!(err.to_string(), "voters must be 3, 5 or 7 (got \"five\")");
         let err = settings_set_body(&["updates.mirror=x".into()]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters"
+            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters, shutdown_policy"
         );
         let err = settings_set_body(&["updates.channel".into()]).unwrap_err();
         assert_eq!(

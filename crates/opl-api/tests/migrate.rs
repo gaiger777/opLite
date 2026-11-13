@@ -5,7 +5,9 @@ mod common;
 
 use common::{Client, Env, WAIT, mark_pool_ready, set_pool_state, vm_request};
 use opl_types::audit::AuditQuery;
-use opl_types::node::{FEATURES, Fencing, Node, NodeHa, NodeSpec, NodeStatus, PoolState};
+use opl_types::node::{
+    FEATURES, Fencing, Node, NodeHa, NodeShutdown, NodeSpec, NodeStatus, PoolState, ShutdownAction,
+};
 use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -43,6 +45,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
         updates: None,
         features: vec![],
         cluster_addresses: vec![],
+        shutdown: None,
     };
     env.cluster.create(&node).await.unwrap();
     node.id
@@ -420,6 +423,19 @@ async fn migrate_checks_the_nodes() {
     .await;
     assert_conflict(migrate(&admin, "web", "node2").await, "node_unavailable");
     edit_node(&env, node2, |n| n.spec.maintenance = false).await;
+    // 호스트가 꺼지는 중인 노드(종료 표시)도 받지 않는다.
+    edit_node(&env, node2, |n| {
+        n.status.shutdown = Some(NodeShutdown {
+            action: ShutdownAction::Failover,
+            maintenance: false,
+            at: 1,
+        })
+    })
+    .await;
+    let (status, body) = migrate(&admin, "web", "node2").await;
+    assert_eq!(body["message"], "node \"node2\" is shutting down", "{body}");
+    assert_conflict((status, body), "node_unavailable");
+    edit_node(&env, node2, |n| n.status.shutdown = None).await;
     // 위트니스는 VM을 받지 않는다.
     edit_node(&env, node2, |n| n.spec.witness = true).await;
     let (status, body) = migrate(&admin, "web", "node2").await;

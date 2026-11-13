@@ -65,6 +65,7 @@ pub use api_cert::{ApiCertAgent, ApiCertError};
 pub use audit::{AuditConfig, AuditLog};
 pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
 pub use backup_jobs::{BackupJobScheduler, BackupJobSchedulerConfig};
+pub use drain::start_drain;
 pub use firmware::UefiVarsFetcher;
 pub use ha::{HaManager, HaManagerConfig, RecoveryWriter};
 pub use health::RuntimeProbe;
@@ -149,6 +150,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(updates::refresh_updates))
         .routes(routes!(updates::upgrade_node))
         .routes(routes!(drain::drain_node))
+        .routes(routes!(drain::unfreeze_node))
         .routes(routes!(metrics::get_node_metrics))
         .routes(routes!(metrics::list_node_metrics))
         .routes(routes!(cluster::get_cluster))

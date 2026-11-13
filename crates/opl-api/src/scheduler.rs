@@ -183,6 +183,10 @@ pub fn node_fits_with(
     if node.spec.maintenance {
         return Err(format!("node {name:?} is in maintenance"));
     }
+    // 호스트 종료 중인 노드는 `mark_offline`까지 온라인·리스가 살아 있다. 다시 등록하면 표시가 지워진다.
+    if node.status.shutdown.is_some() {
+        return Err(format!("node {name:?} is shutting down"));
+    }
     if spec.ha_active() && !ha_capable(node) {
         return Err(format!(
             "node {name:?} does not support HA (fencing is off)"
@@ -233,7 +237,9 @@ pub fn node_fits_with(
 #[cfg(test)]
 mod tests {
     use opl_types::network::Vxlan;
-    use opl_types::node::{BridgeInfo, Fencing, NodeHa, NodeStatus, PoolState};
+    use opl_types::node::{
+        BridgeInfo, Fencing, NodeHa, NodeShutdown, NodeStatus, PoolState, ShutdownAction,
+    };
     use opl_types::placement::RuleKind;
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
@@ -273,6 +279,7 @@ mod tests {
             updates: None,
             features: vec![],
             cluster_addresses: vec![],
+            shutdown: None,
         };
         n
     }
@@ -913,6 +920,16 @@ mod tests {
         assert_eq!(
             node_fits(&me, &inv, &maint),
             Err("node \"n\" is in maintenance".into())
+        );
+        let mut closing = ready.clone();
+        closing.status.shutdown = Some(NodeShutdown {
+            action: ShutdownAction::Freeze,
+            maintenance: false,
+            at: 1,
+        });
+        assert_eq!(
+            node_fits(&me, &inv, &closing),
+            Err("node \"n\" is shutting down".into())
         );
         // 위트니스는 다른 조건보다 먼저 거절한다.
         let mut witness = offline.clone();

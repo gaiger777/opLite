@@ -102,6 +102,12 @@ if grep -qx 'ExecStopPost=/usr/bin/orbivisord --config /etc/opl/opld.toml --rele
 else
 	fail "유닛 ExecStopPost: $(grep ExecStop "$UNIT_DIR/opld.service")"
 fi
+# 노드 정상 종료 정책(계획 50): 비우기(10분)와 HA VM 끄기를 마칠 시간
+if grep -qx 'TimeoutStopSec=15min' "$UNIT_DIR/opld.service"; then
+	ok "유닛은 TimeoutStopSec=15min"
+else
+	fail "유닛 TimeoutStopSec: $(grep Timeout "$UNIT_DIR/opld.service")"
+fi
 if [ -f "$T/usr/share/orbivisor/opld.toml.example" ] && [ -f "$T/usr/share/doc/orbivisor/copyright" ] &&
 	[ ! -e "$T/usr/share/oplite" ] && [ ! -e "$T/usr/share/doc/oplite" ]; then
 	ok "공유 파일은 /usr/share/orbivisor"

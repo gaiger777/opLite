@@ -652,6 +652,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/nodes/{key}/unfreeze": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 얼린 노드(호스트 종료 정책 `freeze`로 HA VM을 끄고 꺼진 노드)의 표시를 지워, 리더가 평소대로 그 노드의
+         *     HA VM을 다른 노드로 옮기게 한다. 돌아오지 않는 노드에 쓴다. 표시가 없으면 그대로 돌려준다. 온라인이면
+         *     409 `node_online`(돌아온 노드는 등록하며 스스로 지운다).
+         */
+        post: operations["unfreeze_node"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/nodes/{key}/updates/refresh": {
         parameters: {
             query?: never;
@@ -1468,7 +1489,7 @@ export interface paths {
          *     있으면 모든 노드가 디스크 복사를 알아야 하고(409 `cluster_upgrading`) VM에 스냅샷이 없어야 한다(409
          *     `migration_unsupported`). `pool`을 줬는데 그런 디스크가 없으면 400, 없는 풀이면 404다. HVF(macOS)
          *     노드는 원본도 대상도 될 수 없다(409 `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나
-         *     유지보수 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
+         *     유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
          *     스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다. 대상 노드가 hard
          *     배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
          *     (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`).
@@ -2938,6 +2959,11 @@ export interface components {
                         [key: string]: components["schemas"]["PoolState"];
                     };
                     /**
+                     * @description 호스트가 꺼지는 중이라 이 노드가 종료 정책대로 정리하며 남긴 표시. 노드가 다시 등록할 때 지운다. 리더는
+                     *     `freeze` 표시가 있는 오프라인 노드의 HA VM을 옮기지 않는다(옛 노드는 이 필드를 무시한다).
+                     */
+                    shutdown?: components["schemas"]["NodeShutdown"];
+                    /**
                      * Format: ip
                      * @description VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
                      *     None).
@@ -3527,6 +3553,17 @@ export interface components {
             node: string;
             samples: components["schemas"]["NodeSample"][];
         };
+        /** @description 호스트 종료 때 노드가 남긴 표시(설계 §8 노드 정상 종료 정책) */
+        NodeShutdown: {
+            action: components["schemas"]["ShutdownAction"];
+            /**
+             * Format: int64
+             * @description 표시를 남긴 시각(유닉스 초)
+             */
+            at: number;
+            /** @description 정책(`migrate`)이 노드를 유지보수로 바꿨다. 다시 등록할 때 유지보수를 끈다. */
+            maintenance?: boolean;
+        };
         NodeSpec: {
             /** @description API 주소 (`host:port`) */
             address: string;
@@ -3590,6 +3627,11 @@ export interface components {
             pools: {
                 [key: string]: components["schemas"]["PoolState"];
             };
+            /**
+             * @description 호스트가 꺼지는 중이라 이 노드가 종료 정책대로 정리하며 남긴 표시. 노드가 다시 등록할 때 지운다. 리더는
+             *     `freeze` 표시가 있는 오프라인 노드의 HA VM을 옮기지 않는다(옛 노드는 이 필드를 무시한다).
+             */
+            shutdown?: components["schemas"]["NodeShutdown"];
             /**
              * Format: ip
              * @description VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
@@ -4294,6 +4336,11 @@ export interface components {
                     [key: string]: components["schemas"]["PoolState"];
                 };
                 /**
+                 * @description 호스트가 꺼지는 중이라 이 노드가 종료 정책대로 정리하며 남긴 표시. 노드가 다시 등록할 때 지운다. 리더는
+                 *     `freeze` 표시가 있는 오프라인 노드의 HA VM을 옮기지 않는다(옛 노드는 이 필드를 무시한다).
+                 */
+                shutdown?: components["schemas"]["NodeShutdown"];
+                /**
                  * Format: ip
                  * @description VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
                  *     None).
@@ -4396,6 +4443,11 @@ export interface components {
                  *     비어 있으면 쓰지 않는다.
                  */
                 api_names?: string[];
+                /**
+                 * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. 없으면 `conditional`이고, 쓰지 않아
+                 *     옛 노드도 설정을 계속 푼다.
+                 */
+                shutdown_policy?: components["schemas"]["ShutdownPolicy"];
                 /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
                 telemetry?: components["schemas"]["TelemetrySettings"];
                 updates?: components["schemas"]["UpdateSettings"];
@@ -4768,6 +4820,11 @@ export interface components {
         SettingsPatch: {
             /** @description 노드 API 인증서에 더할 이름(DNS 이름·IP) 전체. `[]`는 지워 노드 이름만 쓴다. */
             api_names?: string[];
+            /**
+             * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. `conditional`(기본: 재부팅이면
+             *     `freeze`, 끄기면 `failover`), `freeze`, `failover`, `migrate`. `systemctl stop`에는 쓰지 않는다.
+             */
+            shutdown_policy?: components["schemas"]["ShutdownPolicy"];
             telemetry?: components["schemas"]["TelemetryPatch"];
             updates?: components["schemas"]["UpdateSettingsPatch"];
             /**
@@ -4788,6 +4845,11 @@ export interface components {
              *     비어 있으면 쓰지 않는다.
              */
             api_names?: string[];
+            /**
+             * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. 없으면 `conditional`이고, 쓰지 않아
+             *     옛 노드도 설정을 계속 푼다.
+             */
+            shutdown_policy?: components["schemas"]["ShutdownPolicy"];
             /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
             telemetry?: components["schemas"]["TelemetrySettings"];
             updates?: components["schemas"]["UpdateSettings"];
@@ -4807,6 +4869,16 @@ export interface components {
             /** @description 텔레메트리 상태. 처음 켤 때 생기고, 없으면 쓰지 않는다. */
             telemetry?: components["schemas"]["TelemetryStatus"];
         };
+        /**
+         * @description 호스트 종료 때 노드가 한 일
+         * @enum {string}
+         */
+        ShutdownAction: "freeze" | "failover" | "migrate";
+        /**
+         * @description 노드 정상 종료 정책(설계 §8). `systemctl stop`·업그레이드 재시작이 아니라 호스트가 꺼지는 중일 때만 쓴다.
+         * @enum {string}
+         */
+        ShutdownPolicy: "conditional" | "freeze" | "failover" | "migrate";
         /** @enum {string} */
         SnapshotPhase: "pending" | "ready";
         /** @description 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다. */
@@ -6891,6 +6963,36 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    unfreeze_node: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_NodeSpec_NodeStatus"];
                 };
             };
             "4XX": {

@@ -5,7 +5,7 @@ mod common;
 use common::Env;
 use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
-use opl_types::settings::{Channel, SETTINGS_NAME, SettingsSpec};
+use opl_types::settings::{Channel, SETTINGS_NAME, SettingsSpec, ShutdownPolicy};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -247,4 +247,67 @@ async fn voters_are_three_five_or_seven() {
         )
         .await;
     assert_eq!(got["spec"]["voters"], 3);
+}
+
+/// 종료 정책은 네 값만 받고, 기본(`conditional`)은 적지 않는다. `ha-placement`를 모르는 노드가 있으면 409다.
+#[tokio::test]
+async fn shutdown_policy_is_written_unless_default_and_waits_for_the_feature() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    for bad in [json!("Freeze"), json!("ignore"), json!(1)] {
+        let got = admin
+            .patch("/settings", json!({ "shutdown_policy": bad }), None)
+            .await;
+        assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let (status, got) = admin
+        .patch("/settings", json!({ "shutdown_policy": "migrate" }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["spec"]["shutdown_policy"], "migrate");
+    let stored = || {
+        env.cluster
+            .get_by_name::<SettingsSpec>(SETTINGS_NAME)
+            .unwrap()
+            .unwrap()
+            .spec
+    };
+    assert_eq!(stored().shutdown_policy(), ShutdownPolicy::Migrate);
+    // 다른 키만 바꾸면 그대로다.
+    let (_, got) = admin.patch("/settings", json!({ "voters": 3 }), None).await;
+    assert_eq!(got["spec"]["shutdown_policy"], "migrate");
+    // 기본으로 돌리면 필드가 빠진다(옛 모양).
+    let (status, got) = admin
+        .patch(
+            "/settings",
+            json!({ "shutdown_policy": "conditional" }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(got["spec"].get("shutdown_policy").is_none(), "{got}");
+    assert_eq!(stored().shutdown_policy, None);
+
+    // 버전은 같지만 기능을 적지 않은 노드(옛 위트니스)가 있으면 거절한다.
+    let mut old: opl_types::node::Node = Resource::new(
+        "old",
+        NodeSpec {
+            address: "10.0.0.9:8006".into(),
+            maintenance: false,
+            witness: true,
+            roles: None,
+        },
+    );
+    old.status.version = Some(opl_types::version::BUILD.into());
+    env.cluster.create(&old).await.unwrap();
+    let got = admin
+        .patch("/settings", json!({ "shutdown_policy": "freeze" }), None)
+        .await;
+    assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+    assert!(
+        got.1["message"].as_str().unwrap().contains("ha placement"),
+        "{}",
+        got.1
+    );
+    assert_eq!(stored().shutdown_policy, None);
 }

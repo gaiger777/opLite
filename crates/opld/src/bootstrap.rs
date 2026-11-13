@@ -12,7 +12,7 @@ use opl_peer::pki::{ClusterCa, NodeTls, cert_names};
 use opl_types::auth::{Role, UserSpec};
 use opl_types::cluster::ClusterSpec;
 use opl_types::host::same_host;
-use opl_types::node::{FEATURES, NodeSpec, NodeStatus};
+use opl_types::node::{FEATURES, NodeShutdown, NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::version::BUILD;
 use opl_types::vm::Arch;
@@ -159,6 +159,7 @@ async fn record_node(
     underlay: Option<IpAddr>,
 ) -> anyhow::Result<()> {
     ensure_node(cluster, config).await?;
+    end_shutdown_maintenance(cluster).await?;
     let bridges = host.bridges().await;
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
     let memory_mib = crate::host::memory_mib();
@@ -187,7 +188,45 @@ async fn record_node(
                 .then(|| status.updates.take().unwrap_or_default()),
             features: features(),
             cluster_addresses: announced_links(config),
+            // 다시 시작했으니 지난 호스트 종료 표시는 지운다(얼린 노드가 풀린다).
+            shutdown: None,
         };
+        true
+    })
+    .await
+}
+
+/// 지난 호스트 종료 때 정책(`migrate`)이 켠 유지보수를 끈다. 관리자가 켠 유지보수(표시의 `maintenance`가
+/// false)는 그대로 둔다. 표시는 등록이 지운다.
+async fn end_shutdown_maintenance(cluster: &Cluster) -> anyhow::Result<()> {
+    let NodeId(id) = cluster.id();
+    loop {
+        let Some(node) = cluster.get::<NodeSpec>(id)? else {
+            return Ok(());
+        };
+        if !node.spec.maintenance || !node.status.shutdown.is_some_and(|s| s.maintenance) {
+            return Ok(());
+        }
+        tracing::info!("ending the maintenance the last host shutdown turned on");
+        let spec = NodeSpec {
+            maintenance: false,
+            ..node.spec
+        };
+        match cluster
+            .update_spec(id, Some(node.revision), node.labels, &spec)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// 호스트 종료 표시를 쓴다(과반수가 없으면 쓰기 제한 시간 뒤 실패).
+pub async fn mark_shutdown(cluster: &Cluster, shutdown: NodeShutdown) -> anyhow::Result<()> {
+    update_node_status(cluster, |status| {
+        status.shutdown = Some(shutdown);
         true
     })
     .await
@@ -342,7 +381,7 @@ pub(crate) mod tests {
     use opl_cluster::memnet::MemRouter;
     use opl_cluster::types::OrbNode;
     use opl_driver::{DriverError, Firewall, HostNet, Overlay, OverlayChanges, Tap};
-    use opl_types::node::{BridgeInfo, Fencing, NodeHa, NodeUpdates, PoolState};
+    use opl_types::node::{BridgeInfo, Fencing, NodeHa, NodeUpdates, PoolState, ShutdownAction};
 
     use crate::config::FencingSetting;
 
@@ -899,6 +938,53 @@ pub(crate) mod tests {
             err.contains("joined as a non-witness node but opld.toml says witness = true"),
             "{err}"
         );
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 다시 등록하면 호스트 종료 표시를 지우고, 표시가 켠 유지보수만 끈다(관리자가 켠 것은 둔다).
+    #[tokio::test]
+    async fn registration_clears_the_shutdown_mark_and_its_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        register_node(&cluster, &config, &host).await.unwrap();
+        let set_maintenance = |on: bool| {
+            let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+            let spec = NodeSpec {
+                maintenance: on,
+                ..node.spec
+            };
+            let cluster = &cluster;
+            async move {
+                cluster
+                    .update_spec(id.0, None, node.labels, &spec)
+                    .await
+                    .unwrap();
+            }
+        };
+        let node = || cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        for (by_policy, kept) in [(true, false), (false, true)] {
+            set_maintenance(true).await;
+            mark_shutdown(
+                &cluster,
+                NodeShutdown {
+                    action: ShutdownAction::Migrate,
+                    maintenance: by_policy,
+                    at: 7,
+                },
+            )
+            .await
+            .unwrap();
+            mark_offline(&cluster).await;
+            assert_eq!(node().status.shutdown.unwrap().at, 7);
+            register_node(&cluster, &config, &host).await.unwrap();
+            let after = node();
+            assert_eq!(after.status.shutdown, None);
+            assert!(after.status.online);
+            assert_eq!(after.spec.maintenance, kept, "set by policy: {by_policy}");
+        }
         cluster.shutdown().await.unwrap();
     }
 

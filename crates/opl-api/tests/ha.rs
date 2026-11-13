@@ -5,7 +5,7 @@
 //! 읽는지, 결과를 모르는 복구 쓰기 뒤에는 결과를 알 때까지 펜싱을 쥐는지(임기가 바뀌면 풀고 남은 단계를
 //! 하는지), 쓰기 오류 뒤에는 펜싱을 푸는지. 배치 규칙과 HA 그룹(그룹 우선순위, restricted, affinity·
 //! anti-affinity, 막는 hard 규칙과 `ha_may_violate`), `state: stopped`·`ignored`, 그룹의 더 우선인 노드로
-//! 되돌아가기, `rule_violations` 갱신.
+//! 되돌아가기, `rule_violations` 갱신. 호스트 종료 정책으로 얼린 노드는 풀기 전까지 옮기지 않는다.
 
 mod common;
 
@@ -19,7 +19,7 @@ use opl_api::{HaManager, HaManagerConfig, RecoveryWriter};
 use opl_cluster::types::{Command, LeaderRequest, NodeId, Rejection};
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
+use opl_types::node::{Fencing, NodeHa, NodeShutdown, NodeSpec, NodeStatus, ShutdownAction};
 use opl_types::placement::{
     HaGroupNode, HaGroupSpec, HaGroupStatus, PlacementRuleSpec, PlacementRuleStatus, RuleKind,
 };
@@ -28,6 +28,8 @@ use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
     Arch, HaState, MigrationStatus, PowerState, Vm, VmHa, VmHaStatus, VmPhase, VmSpec, VmStatus,
 };
+use reqwest::StatusCode;
+use serde_json::json;
 use uuid::Uuid;
 
 fn fast_manager(env: &Env) -> HaManager {
@@ -108,6 +110,7 @@ async fn node_with(
         updates: None,
         features: vec![],
         cluster_addresses: vec![],
+        shutdown: None,
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();
@@ -1426,5 +1429,73 @@ async fn relocations_outside_the_window_are_dropped() {
         failed.status.ha.and_then(|h| h.error).as_deref(),
         Some("gave up after 0 relocations")
     );
+    manager.shutdown().await;
+}
+
+/// 호스트 종료 정책 `freeze`로 얼린 오프라인 노드의 HA VM은 `recover_after`가 지나도 옮기지 않는다
+/// (`failover` 표시면 평소대로 옮긴다). `POST /nodes/{key}/unfreeze`가 표시를 지우면 옮긴다. 온라인 노드는 409,
+/// 운영자는 403이다.
+#[tokio::test]
+async fn a_frozen_offline_node_is_not_recovered_until_unfrozen() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let marked = |action: ShutdownAction| {
+        move |n: &mut Resource<NodeSpec, NodeStatus>| {
+            n.status.online = false;
+            n.status.shutdown = Some(NodeShutdown {
+                action,
+                maintenance: false,
+                at: 1,
+            });
+        }
+    };
+    let frozen = node_with(
+        &env,
+        "frozen",
+        8192,
+        Some(1),
+        marked(ShutdownAction::Freeze),
+    )
+    .await;
+    let failover = node_with(
+        &env,
+        "failover",
+        8192,
+        Some(1),
+        marked(ShutdownAction::Failover),
+    )
+    .await;
+    let spare = node(&env, "spare", 64000, Some(60)).await;
+    let a = vm(&env, "a-vm", frozen, true, PowerState::Running).await;
+    let b = vm(&env, "b-vm", failover, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    eventually("failover node recovered", || {
+        get(&env, b.id).spec.node == Some(spare)
+    })
+    .await;
+    // recover_after(1초)를 여러 번 넘겨도 얼린 노드의 VM은 그대로다.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(get(&env, a.id), a);
+    assert_eq!(recover_tasks(&env).len(), 1);
+
+    let operator = env.user("op", "operator").await;
+    let (status, got) = operator.post("/nodes/frozen/unfreeze", json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{got}");
+    let (status, got) = admin.post("/nodes/spare/unfreeze", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{got}");
+    assert_eq!(got["code"], "node_online", "{got}");
+
+    let (status, got) = admin.post("/nodes/frozen/unfreeze", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(got["status"].get("shutdown").is_none(), "{got}");
+    assert_eq!(got["status"]["online"], false, "{got}");
+    eventually("frozen node recovered after unfreeze", || {
+        get(&env, a.id).spec.node == Some(spare)
+    })
+    .await;
+    // 표시가 없으면 그대로 돌려준다.
+    let (status, again) = admin.post("/nodes/frozen/unfreeze", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["revision"], got["revision"]);
     manager.shutdown().await;
 }

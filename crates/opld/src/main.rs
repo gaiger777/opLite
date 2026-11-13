@@ -23,6 +23,7 @@ mod notify;
 mod overlay;
 mod pools;
 mod runtime;
+mod shutdown;
 #[cfg(feature = "starve-it")]
 mod starve;
 mod web;
@@ -166,7 +167,8 @@ async fn run(
             let left = loop {
                 tokio::select! {
                     () = &mut shutdown => {
-                        tracing::info!("shutting down; running VMs keep running");
+                        // 호스트가 꺼지는 중이면 종료 정책대로 준비한다(아니면 VM은 그대로 돈다).
+                        member.prepare_shutdown().await;
                         member.close(false).await?;
                         return Ok(());
                     }

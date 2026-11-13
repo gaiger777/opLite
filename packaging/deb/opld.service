@@ -19,6 +19,9 @@ ExecStopPost=/usr/bin/orbivisord --config /etc/opl/opld.toml --release-vips
 Restart=on-failure
 RestartSec=5
 KillMode=process
+# 호스트가 꺼질 때 종료 정책(migrate는 비우기를 10분까지 기다린 뒤 HA VM을 끈다)이 끝날 시간. VM 스코프는
+# Before=opld.service라 opld가 끝난 뒤에 멈춘다.
+TimeoutStopSec=15min
 LimitNOFILE=1048576
 
 [Install]
