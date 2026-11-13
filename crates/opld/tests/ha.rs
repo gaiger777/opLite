@@ -1,6 +1,8 @@
 //! 실제 HA 복구: 한 호스트의 opld 둘(`[ha] fencing = "process"`)과 위트니스로 클러스터를 만들고, 노드 A에서
 //! 도는 HA VM과 HA 아닌 VM을 둔 채 A의 opld와 그 QEMU들을 kill -9 한다. 리더가 A의 리스가 끝난 것을 보고
 //! HA VM만 노드 B로 옮겨 켜는지(기록 Task `vm-ha-recover`), A를 다시 띄워도 그 VM을 건드리지 않는지 본다.
+//! HA 그룹 {A:1, B:2}의 VM이 B에 놓이고, B가 죽으면 A로 복구됐다가 B가 돌아오면 라이브 마이그레이션으로
+//! 되돌아가는지도 본다(이 Mac에서는 TCG).
 //! `cargo test -p opld --features ha-it --test ha`
 //! QEMU(`qemu-it`와 같다)와 qemu-img가 필요하다. 이 Mac에서도 돈다.
 //!
@@ -254,4 +256,144 @@ async fn the_leader_restarts_an_ha_vm_of_a_dead_node_on_another_node() {
     b.ctl(&["vm", "delete", "plain"]).await.unwrap();
     b.ctl(&["volume", "delete", "db-root"]).await.unwrap();
     b.ctl(&["pool", "delete", "shared"]).await.unwrap();
+}
+
+/// 되돌아가기 시험 노드의 `[hypervisor]`. HVF(macOS)는 마이그레이션을 거절하므로 이 Mac에서는 TCG다.
+fn migrating_hypervisor() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "systemd_scope = false\naccel = \"tcg\""
+    } else {
+        "systemd_scope = false"
+    }
+}
+
+#[tokio::test]
+async fn an_ha_vm_recovers_to_the_next_group_node_and_fails_back() {
+    // 그룹 {A:1, B:2}의 HA VM은 B에 놓인다. B가 죽으면 A로 복구되고, B가 돌아와 리더가 30초 넘게 리스를
+    // 본 뒤 B로 라이브 마이그레이션해 되돌아간다.
+    let daemon = |name: &str, ports: &str| {
+        Daemon::with_hypervisor(
+            name,
+            &format!("{CONFIG}[migration]\nports = \"{ports}\"\n"),
+            migrating_hypervisor(),
+        )
+    };
+    let mut a = daemon("node-a", "49630-49639");
+    let mut b = daemon("node-b", "49640-49649");
+    let mut w = Daemon::witness("wit");
+    a.start().await;
+    b.start().await;
+    w.start().await;
+    a.init("ha-fb").await;
+    a.login().await;
+    let url = a.join_url.clone().unwrap();
+    b.join(&url).await.unwrap();
+    b.login_with(
+        a.admin_password.as_deref().unwrap(),
+        a.ca_fingerprint.as_deref().unwrap(),
+    )
+    .await;
+    let url = a.ctl(&["cluster", "join-token"]).await.unwrap();
+    w.join(url.trim()).await.unwrap();
+    let ca = client(&a);
+    eventually("both nodes online and HA capable", || async {
+        let nodes = ca.get("/nodes").await.unwrap();
+        let nodes = nodes["items"].as_array().unwrap().clone();
+        nodes.len() == 3
+            && nodes.iter().all(|n| n["status"]["online"] == true)
+            && nodes
+                .iter()
+                .filter(|n| n["spec"]["witness"] != true)
+                .all(|n| n["status"]["ha"]["fencing"] == "process")
+    })
+    .await;
+    let (id_a, id_b) = (node_id(&ca, "node-a").await, node_id(&ca, "node-b").await);
+
+    let shared = tempfile::Builder::new()
+        .prefix("oplhafb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    a.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.path().to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    a.wait_pool_ready("shared").await;
+    b.wait_pool_ready("shared").await;
+    a.ctl(&[
+        "volume", "create", "db-root", "--pool", "shared", "--size", "64M",
+    ])
+    .await
+    .unwrap();
+    a.ctl(&[
+        "ha-group", "create", "g", "--node", "node-a:1", "--node", "node-b:2",
+    ])
+    .await
+    .unwrap();
+    // 노드를 주지 않으면 스케줄러가 그룹 우선순위가 높은 B를 고른다.
+    a.ctl(&[
+        "vm",
+        "create",
+        "db",
+        "--memory",
+        "256",
+        "--disk",
+        "db-root",
+        "--ha-group",
+        "g",
+        "--restart",
+        "on-failure",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    let db_pid = running_pid(&ca, "db", &id_b).await;
+
+    // B가 죽는다: A(위트니스와 과반수)가 A로 복구한다.
+    b.kill();
+    kill_qemu(db_pid).await;
+    eventually_within("HA VM running on node A", RECOVER_WAIT, || async {
+        let Ok(vm) = ca.get("/vms/db").await else {
+            return false;
+        };
+        vm["spec"]["node"] == id_a.as_str()
+            && vm["status"]["phase"] == "running"
+            && vm["status"]["node"] == id_a.as_str()
+    })
+    .await;
+    let recovered_pid = running_pid(&ca, "db", &id_a).await;
+
+    // B가 돌아오면 30초 뒤 리더가 B로 라이브 마이그레이션한다.
+    b.start().await;
+    eventually_within("HA VM failed back to node B", RECOVER_WAIT, || async {
+        let Ok(vm) = ca.get("/vms/db").await else {
+            return false;
+        };
+        vm["spec"]["node"] == id_b.as_str()
+            && vm["status"]["phase"] == "running"
+            && vm["status"]["node"] == id_b.as_str()
+    })
+    .await;
+    let tasks = ca.get("/tasks").await.unwrap();
+    let migrations: Vec<&Value> = tasks["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["spec"]["op"]["kind"] == "vm-migrate")
+        .collect();
+    assert_eq!(migrations.len(), 1, "{tasks}");
+    assert_eq!(migrations[0]["spec"]["node"], id_a.as_str());
+    assert_eq!(migrations[0]["spec"]["op"]["node"], id_b.as_str());
+    // 원본 QEMU는 마이그레이션 뒤 끝난다.
+    eventually("source QEMU gone", || async { !alive(recovered_pid) }).await;
+
+    a.ctl(&["vm", "stop", "db", "--force"]).await.unwrap();
+    a.ctl(&["vm", "delete", "db"]).await.unwrap();
+    a.ctl(&["volume", "delete", "db-root"]).await.unwrap();
+    a.ctl(&["pool", "delete", "shared"]).await.unwrap();
 }

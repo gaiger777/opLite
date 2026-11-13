@@ -3,7 +3,9 @@
 //! status를 spec보다 먼저 쓰는지, 그 노드의 Task를 실패로 끝내고 기록 Task를 남기는지, 대상이 없을
 //! 때, 리스가 살아 있는 노드는 옮기지 않는지, 펜싱 표시가 늘 지워지는지, Task 목록을 spec 쓰기 뒤에
 //! 읽는지, 결과를 모르는 복구 쓰기 뒤에는 결과를 알 때까지 펜싱을 쥐는지(임기가 바뀌면 풀고 남은 단계를
-//! 하는지), 쓰기 오류 뒤에는 펜싱을 푸는지.
+//! 하는지), 쓰기 오류 뒤에는 펜싱을 푸는지. 배치 규칙과 HA 그룹(그룹 우선순위, restricted, affinity·
+//! anti-affinity, 막는 hard 규칙과 `ha_may_violate`), `state: stopped`·`ignored`, 그룹의 더 우선인 노드로
+//! 되돌아가기, `rule_violations` 갱신.
 
 mod common;
 
@@ -18,9 +20,14 @@ use opl_cluster::types::{Command, LeaderRequest, NodeId, Rejection};
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
+use opl_types::placement::{
+    HaGroupNode, HaGroupSpec, HaGroupStatus, PlacementRuleSpec, PlacementRuleStatus, RuleKind,
+};
 use opl_types::resource::{Kind, Resource};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{Arch, MigrationStatus, PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{
+    Arch, HaState, MigrationStatus, PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus,
+};
 use uuid::Uuid;
 
 fn fast_manager(env: &Env) -> HaManager {
@@ -28,6 +35,7 @@ fn fast_manager(env: &Env) -> HaManager {
         env.state.clone(),
         HaManagerConfig {
             tick: Duration::from_millis(100),
+            ..Default::default()
         },
     )
 }
@@ -37,8 +45,20 @@ fn manager_with(env: &Env, writer: Arc<dyn RecoveryWriter>) -> HaManager {
         env.state.clone(),
         HaManagerConfig {
             tick: Duration::from_millis(100),
+            ..Default::default()
         },
         writer,
+    )
+}
+
+/// 되돌아가기 전에 노드가 `failback_after` 동안 살아 있어야 하는 관리자
+fn failback_manager(env: &Env, failback_after: Duration) -> HaManager {
+    HaManager::spawn(
+        env.state.clone(),
+        HaManagerConfig {
+            tick: Duration::from_millis(100),
+            failback_after,
+        },
     )
 }
 
@@ -96,11 +116,16 @@ async fn node_with(
 
 /// 노드 `node`에 배정된 VM을 직접 만든다. 실행 중이면 status도 그 노드에서 도는 것으로 둔다.
 async fn vm(env: &Env, name: &str, node: Uuid, ha: bool, power: PowerState) -> Vm {
+    vm_ha(env, name, node, ha.then(VmHa::default), power).await
+}
+
+/// [`vm`]과 같되 HA 정책을 준다.
+async fn vm_ha(env: &Env, name: &str, node: Uuid, ha: Option<VmHa>, power: PowerState) -> Vm {
     let mut spec: VmSpec = serde_json::from_value(vm_request(name)["spec"].clone()).unwrap();
     spec.memory_mib = 2048;
     spec.nics.clear();
     spec.node = Some(node);
-    spec.ha = ha.then(VmHa::default);
+    spec.ha = ha;
     spec.power = power;
     let mut vm: Vm = Resource::new(name, spec);
     if power == PowerState::Running {
@@ -737,4 +762,403 @@ async fn ends_the_fence_after_a_rejected_write() {
         })
     })
     .await;
+}
+
+/// HA 그룹을 저장소에 직접 만든다(노드 이름과 우선순위).
+async fn group(env: &Env, name: &str, nodes: &[(&str, u32)], restricted: bool, nofailback: bool) {
+    let g: Resource<HaGroupSpec, HaGroupStatus> = Resource::new(
+        name,
+        HaGroupSpec {
+            nodes: nodes
+                .iter()
+                .map(|(node, priority)| HaGroupNode {
+                    node: node.to_string(),
+                    priority: *priority,
+                })
+                .collect(),
+            restricted,
+            nofailback,
+        },
+    );
+    env.cluster.create(&g).await.unwrap();
+}
+
+/// 배치 규칙을 저장소에 직접 만든다(VM 이름과 노드 이름).
+async fn rule(env: &Env, name: &str, kind: RuleKind, vms: &[&str], nodes: &[&str]) -> Uuid {
+    rule_with(env, name, kind, vms, nodes, |_| {}).await
+}
+
+async fn rule_with(
+    env: &Env,
+    name: &str,
+    kind: RuleKind,
+    vms: &[&str],
+    nodes: &[&str],
+    tweak: impl FnOnce(&mut PlacementRuleSpec),
+) -> Uuid {
+    let mut spec = PlacementRuleSpec {
+        kind,
+        vms: vms.iter().map(|v| v.to_string()).collect(),
+        vm_tag: None,
+        nodes: nodes.iter().map(|n| n.to_string()).collect(),
+        node_tag: None,
+        weight: None,
+        enabled: true,
+        ha_may_violate: false,
+    };
+    tweak(&mut spec);
+    let r: Resource<PlacementRuleSpec, PlacementRuleStatus> = Resource::new(name, spec);
+    env.cluster.create(&r).await.unwrap();
+    r.id
+}
+
+/// 그룹 `name`의 기본 HA 정책
+fn in_group(name: &str) -> Option<VmHa> {
+    Some(VmHa {
+        group: Some(name.into()),
+        ..Default::default()
+    })
+}
+
+fn with_state(state: HaState) -> Option<VmHa> {
+    Some(VmHa {
+        state,
+        ..Default::default()
+    })
+}
+
+/// 멈출 때까지 이 노드의 리스를 갱신한다(펜싱 중이면 거부돼도 계속한다).
+fn keep_alive(env: &Env, node: Uuid) -> tokio::task::JoinHandle<()> {
+    let cluster = env.cluster.clone();
+    tokio::spawn(async move {
+        loop {
+            let _ = renew(&cluster, node).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+}
+
+/// 실행하기로 된 마이그레이션 Task들(대상 VM, 원본 노드, 대상 노드)
+fn migrate_tasks(env: &Env) -> Vec<(Uuid, Uuid, Uuid)> {
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    tasks
+        .into_iter()
+        .filter_map(|t| match t.spec.op {
+            TaskOp::VmMigrate { node, .. } => Some((t.spec.target, t.spec.node, node)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn recovers_to_the_highest_priority_node_of_the_group() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    // 메모리로는 low·other가 낫지만 그룹 우선순위가 먼저다. 그룹이 없는 VM은 메모리로 고른다.
+    node(&env, "low", 16000, Some(60)).await;
+    let high = node(&env, "high", 4096, Some(60)).await;
+    let other = node(&env, "other", 64000, Some(60)).await;
+    group(
+        &env,
+        "g",
+        &[("failed", 10), ("low", 1), ("high", 5)],
+        false,
+        false,
+    )
+    .await;
+    let a = vm_ha(&env, "a-vm", failed, in_group("g"), PowerState::Running).await;
+    let b = vm(&env, "b-vm", failed, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    eventually("HA VMs moved", || recover_tasks(&env).len() == 2).await;
+    assert_eq!(get(&env, a.id).spec.node, Some(high));
+    assert_eq!(get(&env, b.id).spec.node, Some(other));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_restricted_group_waits_for_its_own_node() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    // 그룹의 다른 노드는 리스가 끝났고, 그룹 밖 노드만 살아 있다.
+    let member = node(&env, "member", 8192, Some(1)).await;
+    node(&env, "outside", 64000, Some(60)).await;
+    group(&env, "g", &[("failed", 2), ("member", 1)], true, false).await;
+    let a = vm_ha(&env, "a-vm", failed, in_group("g"), PowerState::Running).await;
+    let manager = fast_manager(&env);
+    let error = "HA cannot place this VM: placement rule ha-group:g";
+    eventually("error recorded", || {
+        get(&env, a.id).status.last_error.as_deref() == Some(error)
+    })
+    .await;
+    let blocked = get(&env, a.id);
+    assert_eq!(blocked.spec, a.spec);
+    assert_eq!(
+        blocked.status.ha.as_ref().and_then(|h| h.error.as_deref()),
+        Some(error)
+    );
+    // 같은 오류는 다시 쓰지 않는다.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(get(&env, a.id).revision, blocked.revision);
+    assert!(recover_tasks(&env).is_empty());
+
+    // 그룹 노드가 살아나면 그리로 옮기고 오류를 지운다.
+    let renewer = keep_alive(&env, member);
+    eventually("HA VM moved", || get(&env, a.id).spec.node == Some(member)).await;
+    let moved = get(&env, a.id);
+    assert_eq!(moved.spec.power, PowerState::Running);
+    assert_eq!(moved.status.ha, None);
+    assert_eq!(
+        moved.status.last_error.as_deref(),
+        Some("recovering: node failed failed")
+    );
+    renewer.abort();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn anti_affinity_recovers_two_vms_to_different_nodes() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    // 규칙이 없으면 둘 다 메모리가 많은 n1로 간다.
+    let n1 = node(&env, "n1", 16000, Some(60)).await;
+    let n2 = node(&env, "n2", 8000, Some(60)).await;
+    rule(
+        &env,
+        "apart",
+        RuleKind::AntiAffinity,
+        &["a-vm", "b-vm"],
+        &[],
+    )
+    .await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let b = vm(&env, "b-vm", failed, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    eventually("HA VMs moved", || recover_tasks(&env).len() == 2).await;
+    assert_eq!(get(&env, a.id).spec.node, Some(n1));
+    assert_eq!(get(&env, b.id).spec.node, Some(n2));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn affinity_recovers_two_vms_to_the_same_node() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    // 규칙이 없으면 a-vm은 n1, b-vm은 남은 메모리가 많은 n2로 간다.
+    let n1 = node(&env, "n1", 5000, Some(60)).await;
+    node(&env, "n2", 4500, Some(60)).await;
+    rule(&env, "together", RuleKind::Affinity, &["a-vm", "b-vm"], &[]).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let b = vm(&env, "b-vm", failed, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    eventually("HA VMs moved", || recover_tasks(&env).len() == 2).await;
+    assert_eq!(get(&env, a.id).spec.node, Some(n1));
+    assert_eq!(get(&env, b.id).spec.node, Some(n1));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hard_rule_blocks_recovery_unless_it_may_be_violated() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    let spare = node(&env, "spare", 64000, Some(60)).await;
+    rule(
+        &env,
+        "keep-off",
+        RuleKind::NodeAntiAffinity,
+        &["a-vm"],
+        &["spare"],
+    )
+    .await;
+    rule_with(
+        &env,
+        "may",
+        RuleKind::NodeAntiAffinity,
+        &["b-vm"],
+        &["spare"],
+        |r| r.ha_may_violate = true,
+    )
+    .await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let b = vm(&env, "b-vm", failed, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    // 어겨도 되는 규칙만 막으면 어기고 켜며 위반으로 보인다.
+    eventually("b-vm moved with a violation", || {
+        let b = get(&env, b.id);
+        b.spec.node == Some(spare) && b.status.rule_violations == ["may"]
+    })
+    .await;
+    assert_eq!(get(&env, b.id).spec.power, PowerState::Running);
+    // 막는 규칙이 있으면 켜지 않고 이유를 남긴다.
+    let error = "HA cannot place this VM: placement rule keep-off";
+    eventually("a-vm blocked", || {
+        get(&env, a.id).status.last_error.as_deref() == Some(error)
+    })
+    .await;
+    let blocked = get(&env, a.id);
+    assert_eq!(blocked.spec, a.spec);
+    assert_eq!(
+        blocked.status.ha.as_ref().and_then(|h| h.error.as_deref()),
+        Some(error)
+    );
+    assert_eq!(recover_tasks(&env).len(), 1);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stopped_ha_vm_moves_without_starting_and_an_ignored_one_stays() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    let spare = node(&env, "spare", 64000, Some(60)).await;
+    let on = vm_ha(
+        &env,
+        "on",
+        failed,
+        with_state(HaState::Stopped),
+        PowerState::Running,
+    )
+    .await;
+    let off = vm_ha(
+        &env,
+        "off",
+        failed,
+        with_state(HaState::Stopped),
+        PowerState::Stopped,
+    )
+    .await;
+    let ignored = vm_ha(
+        &env,
+        "ign",
+        failed,
+        with_state(HaState::Ignored),
+        PowerState::Running,
+    )
+    .await;
+    let manager = fast_manager(&env);
+    eventually("stopped HA VMs moved", || recover_tasks(&env).len() == 2).await;
+    for id in [on.id, off.id] {
+        let moved = get(&env, id);
+        assert_eq!(moved.spec.node, Some(spare));
+        assert_eq!(moved.spec.power, PowerState::Stopped);
+        assert_eq!(moved.status.phase, VmPhase::Stopped);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(get(&env, ignored.id), ignored);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn fails_back_to_a_preferred_node_that_stayed_alive() {
+    let env = Env::start().await;
+    // low는 기준점부터 리스가 살아 있는 것으로 본다(recover_after 60초). high는 리스를 갱신한다.
+    let low = node(&env, "low", 8192, Some(60)).await;
+    let high = node(&env, "high", 8192, Some(60)).await;
+    group(&env, "g", &[("low", 1), ("high", 5)], false, false).await;
+    let a = vm_ha(&env, "a-vm", low, in_group("g"), PowerState::Running).await;
+    let b = vm_ha(&env, "b-vm", low, in_group("g"), PowerState::Running).await;
+    let renewer = keep_alive(&env, high);
+    let manager = failback_manager(&env, Duration::from_secs(3));
+    // failback_after 전에는 옮기지 않는다.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(migrate_tasks(&env).is_empty());
+    eventually("failback task", || !migrate_tasks(&env).is_empty()).await;
+    // 한 번에 하나: 첫 VM(이름 순)의 Task가 끝나지 않는 동안 다른 Task를 만들지 않는다.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(migrate_tasks(&env), vec![(a.id, low, high)]);
+    assert_eq!(get(&env, b.id).spec.node, Some(low));
+    renewer.abort();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn does_not_fail_back_without_a_group_or_with_nofailback() {
+    let env = Env::start().await;
+    let low = node(&env, "low", 8192, Some(60)).await;
+    let high = node(&env, "high", 8192, Some(60)).await;
+    group(&env, "g", &[("low", 1), ("high", 5)], false, true).await;
+    vm_ha(&env, "a-vm", low, in_group("g"), PowerState::Running).await;
+    vm(&env, "b-vm", low, true, PowerState::Running).await;
+    let renewer = keep_alive(&env, high);
+    let manager = failback_manager(&env, Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(migrate_tasks(&env).is_empty());
+    renewer.abort();
+    manager.shutdown().await;
+}
+
+/// 거절된 되돌아가기는 거절 이유가 사라져도 1초마다 다시 하지 않는다(60초 뒤에 다시 본다).
+#[tokio::test]
+async fn a_refused_failback_is_not_retried_every_tick() {
+    let env = Env::start().await;
+    let low = node(&env, "low", 8192, Some(60)).await;
+    let high = node(&env, "high", 8192, Some(60)).await;
+    group(&env, "g", &[("low", 1), ("high", 5)], false, false).await;
+    let a = vm_ha(&env, "a-vm", low, in_group("g"), PowerState::Running).await;
+    // 끝나지 않은 켜기 Task가 있으면 마이그레이션은 거절된다(vm_busy).
+    let busy = pending_task(&env.cluster, a.id, low).await;
+    let renewer = keep_alive(&env, high);
+    let manager = failback_manager(&env, Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(migrate_tasks(&env).is_empty());
+    let done = TaskStatus {
+        state: TaskState::Succeeded,
+        error: None,
+        progress: None,
+    };
+    env.cluster
+        .update_status::<TaskSpec>(busy, &done)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(migrate_tasks(&env).is_empty());
+    renewer.abort();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn rule_violations_appear_and_disappear() {
+    let env = Env::start().await;
+    let n1 = node(&env, "n1", 8192, Some(60)).await;
+    let a = vm(&env, "a-vm", n1, false, PowerState::Running).await;
+    let b = vm(&env, "b-vm", n1, false, PowerState::Running).await;
+    let off = vm(&env, "off", n1, false, PowerState::Stopped).await;
+    let apart = rule(
+        &env,
+        "apart",
+        RuleKind::AntiAffinity,
+        &["a-vm", "b-vm", "off"],
+        &[],
+    )
+    .await;
+    rule(
+        &env,
+        "spread",
+        RuleKind::SoftAntiAffinity,
+        &["a-vm", "b-vm"],
+        &[],
+    )
+    .await;
+    let manager = fast_manager(&env);
+    eventually("violations shown", || {
+        [a.id, b.id]
+            .iter()
+            .all(|id| get(&env, *id).status.rule_violations == ["apart", "spread"])
+    })
+    .await;
+    // 꺼진 VM은 자리 잡지 않아 위반이 없다.
+    assert!(get(&env, off.id).status.rule_violations.is_empty());
+    let shown = get(&env, a.id).revision;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(get(&env, a.id).revision, shown);
+    // 규칙을 지우면 위반이 사라진다.
+    env.cluster
+        .delete::<PlacementRuleSpec>(apart, None)
+        .await
+        .unwrap();
+    eventually("hard violation gone", || {
+        [a.id, b.id]
+            .iter()
+            .all(|id| get(&env, *id).status.rule_violations == ["spread"])
+    })
+    .await;
+    manager.shutdown().await;
 }
