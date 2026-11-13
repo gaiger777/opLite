@@ -8,6 +8,11 @@
 //! (`rule_violations`)을 고친다. 재시작 횟수를 넘긴 VM(`status.ha.relocate_from`)은 다른 노드로 옮기고,
 //! 창 안에서 `max_relocate`번 옮겼으면 끈다. 호스트 종료 정책 `freeze`로 얼린 오프라인 노드의 HA VM은 옮기지
 //! 않는다(그 노드가 돌아와 켠다, `POST /nodes/{key}/unfreeze`가 표시를 지우면 옮긴다).
+//!
+//! 복구는 우선순위(`ha.priority`) 높은 VM부터, 같으면 이름 순이다. 대상 노드마다 이 리더가 옮겼고 아직
+//! 켜지지 않은 VM이 `ha_start_concurrency`개면 그 노드로는 더 옮기지 않는다(그 VM은 다음 틱에 다시 본다).
+//! 복구할 노드가 없을 때 `plan_every`마다 노드마다 "그 노드가 죽으면" 옮길 대상을 미리 골라 두고, 복구 때
+//! 그 대상이 지금도 맞으면 그대로 쓴다(설계 §8.1).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,7 +25,9 @@ use opl_cluster::{Cluster, ClusterError, Leases, Typed};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{HaState, PowerState, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{
+    DEFAULT_HA_PRIORITY, HaState, PowerState, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus,
+};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -41,12 +48,17 @@ const RELOCATE_WINDOW: Duration = Duration::from_secs(600);
 /// 실행 중인 다른 쪽(그 노드의 실행기, 정리 작업)과 엇갈려 Task를 실패로 끝내지 못했을 때 다시 읽는 횟수
 const TASK_FAIL_ATTEMPTS: usize = 3;
 
+/// 옮긴 VM이 대상 노드에서 켜지기를 기다리는 시간. 지나면 동시 시작 수에서 뺀다.
+const HA_START_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Debug, Clone)]
 pub struct HaManagerConfig {
     /// 리스를 확인하는 간격
     pub tick: Duration,
     /// 그룹의 더 우선인 노드로 되돌아가기 전에 이 리더가 그 노드의 리스가 살아 있음을 본 시간
     pub failback_after: Duration,
+    /// 노드마다 복구 대상을 미리 고르는 간격. 이보다 세 배 넘게 오래된 계획은 쓰지 않는다.
+    pub plan_every: Duration,
 }
 
 impl Default for HaManagerConfig {
@@ -54,6 +66,7 @@ impl Default for HaManagerConfig {
         Self {
             tick: Duration::from_secs(1),
             failback_after: Duration::from_secs(30),
+            plan_every: Duration::from_secs(10),
         }
     }
 }
@@ -125,6 +138,146 @@ struct Failback {
     failed: BTreeSet<Uuid>,
 }
 
+/// 대상 노드마다 이 리더가 옮겼고 아직 그 노드에서 켜지지 않은 VM과 옮긴 때. 리더 자리를 잃으면 비운다
+/// (새 리더는 빈 표로 시작해 한 번 상한을 넘을 수 있다).
+#[derive(Debug, Default)]
+struct Starting(BTreeMap<Uuid, BTreeMap<Uuid, Instant>>);
+
+impl Starting {
+    /// 그 노드에서 켜졌거나, 다른 노드로 갔거나, 꺼졌거나, 없어졌거나, [`HA_START_TIMEOUT`]이 지난 VM을 뺀다.
+    fn prune(&mut self, inv: &Inventory, now: Instant) {
+        for (target, vms) in &mut self.0 {
+            vms.retain(|id, at| {
+                now.saturating_duration_since(*at) < HA_START_TIMEOUT
+                    && inv
+                        .vms
+                        .iter()
+                        .find(|vm| vm.id == *id)
+                        .is_some_and(|vm| starting_on(vm, *target))
+            });
+        }
+        self.0.retain(|_, vms| !vms.is_empty());
+    }
+
+    /// 이 노드로 옮겨 켜지기를 기다리는 VM이 `limit`개 이상이다.
+    fn full(&self, target: Uuid, limit: usize) -> bool {
+        self.0.get(&target).map_or(0, BTreeMap::len) >= limit
+    }
+
+    fn add(&mut self, target: Uuid, vm: Uuid, now: Instant) {
+        self.0.entry(target).or_default().insert(vm, now);
+    }
+}
+
+/// 노드 `target`으로 옮긴 VM이 아직 거기서 켜지기를 기다린다.
+fn starting_on(vm: &Vm, target: Uuid) -> bool {
+    vm.spec.node == Some(target)
+        && vm.spec.power == PowerState::Running
+        && !(vm.status.phase == VmPhase::Running && vm.status.node == Some(target))
+}
+
+/// 미리 고른 복구 노드: 노드마다 "그 노드가 죽으면" VM마다 옮길 노드. 리더 메모리에만 있다(Raft 아님).
+#[derive(Debug, Default)]
+struct Plans {
+    /// 계산한 때
+    at: Option<Instant>,
+    /// 노드 → VM → 대상 노드
+    targets: BTreeMap<Uuid, BTreeMap<Uuid, Uuid>>,
+}
+
+impl Plans {
+    /// 다시 계산할 때다.
+    fn due(&self, now: Instant, every: Duration) -> bool {
+        self.at
+            .is_none_or(|at| now.saturating_duration_since(at) >= every)
+    }
+
+    /// 노드 `node`의 계획. 없거나 `every`의 세 배보다 오래됐으면 None.
+    fn of(&self, node: Uuid, now: Instant, every: Duration) -> Option<&BTreeMap<Uuid, Uuid>> {
+        let at = self.at?;
+        (now.saturating_duration_since(at) <= every * 3)
+            .then(|| self.targets.get(&node))
+            .flatten()
+    }
+}
+
+/// 노드마다 그 노드가 지금 죽으면 HA VM을 옮길 노드를 고른다: 그 노드의 VM을 모두 자리에서 빼고, 옮길 VM을
+/// 복구 순서([`recovery_order`])로 [`pick`]해 앞 VM의 자리를 다음 VM에 센다(복구와 같은 셈).
+fn plan(inv: &Inventory, leases: &Leases, now: Instant, b: Instant) -> Plans {
+    let mut targets = BTreeMap::new();
+    for node in inv.nodes.iter().filter(|n| n.status.ha.is_some()) {
+        let mut vms: Vec<&Vm> = inv
+            .vms
+            .iter()
+            .filter(|vm| recoverable(vm, node.id))
+            .collect();
+        if vms.is_empty() {
+            continue;
+        }
+        vms.sort_by(|a, b| recovery_order(a, b));
+        let mut assign = Assign::default();
+        for vm in inv.vms.iter().filter(|vm| vm.spec.node == Some(node.id)) {
+            assign.unplace(vm.id);
+        }
+        let mut chosen = BTreeMap::new();
+        for vm in vms {
+            let migrating = vm.status.migration.as_ref().map(|m| m.node);
+            let eligible =
+                |n: &Node| n.id != node.id && Some(n.id) != migrating && alive(now, b, leases, n);
+            let target = match pick(vm, inv, &assign, eligible) {
+                Pick::Node(t) | Pick::Violating(t, _) => t,
+                Pick::NoNode | Pick::Blocked(_) => continue,
+            };
+            chosen.insert(vm.id, target);
+            if !stays_stopped(vm) {
+                assign.place(vm.id, target);
+            }
+        }
+        targets.insert(node.id, chosen);
+    }
+    Plans {
+        at: Some(now),
+        targets,
+    }
+}
+
+/// 복구 순서: `ha.priority`가 높은 VM이 먼저, 같으면 이름 순
+fn recovery_order(a: &Vm, b: &Vm) -> Ordering {
+    priority(b)
+        .cmp(&priority(a))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+fn priority(vm: &Vm) -> u8 {
+    vm.spec
+        .ha
+        .as_ref()
+        .map_or(DEFAULT_HA_PRIORITY, |ha| ha.priority)
+}
+
+/// `state: stopped`인 HA VM: 옮기되 켜지 않는다.
+fn stays_stopped(vm: &Vm) -> bool {
+    vm.spec
+        .ha
+        .as_ref()
+        .is_some_and(|ha| ha.state == HaState::Stopped)
+}
+
+/// 한 노드를 복구하는 동안 쓰는 것: 그 노드의 계획, 대상 노드마다의 진행 중 시작과 상한, 셈(로그)
+struct Queue<'a> {
+    plan: Option<&'a BTreeMap<Uuid, Uuid>>,
+    starting: &'a mut Starting,
+    limit: usize,
+    /// 계획대로 옮긴 수
+    planned: usize,
+    /// 계획이 없거나 맞지 않아 다시 고른 수
+    repicked: usize,
+    /// 대상 노드가 상한에 걸려 다음 틱으로 미룬 수
+    waiting: usize,
+    /// 이 틱에 옮긴 VM의 이름(로그)
+    moved: Vec<String>,
+}
+
 /// 결과를 모른 채 임기 변경으로 정리한 spec 쓰기. 이 노드가 리더일 때 VM이 `to`로 가 있으면 남은 단계를
 /// 한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +297,8 @@ async fn run(
     let mut unknown = Unknowns::new();
     let mut moved: Vec<Moved> = vec![];
     let mut failback = Failback::default();
+    let mut starting = Starting::default();
+    let mut plans = Plans::default();
     let mut interval = tokio::time::interval(config.tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -161,11 +316,12 @@ async fn run(
         };
         tokio::select! {
             _ = &mut shutdown => return,
-            _ = tick(ctx, &config, &mut base, &mut unknown, &mut moved, &mut failback) => {}
+            _ = tick(ctx, &config, &mut base, &mut unknown, &mut moved, &mut failback, &mut starting, &mut plans) => {}
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     ctx: Ctx<'_>,
     config: &HaManagerConfig,
@@ -173,6 +329,8 @@ async fn tick(
     unknown: &mut Unknowns,
     moved: &mut Vec<Moved>,
     failback: &mut Failback,
+    starting: &mut Starting,
+    plans: &mut Plans,
 ) {
     let cluster = ctx.cluster;
     for node in settled_by_term(unknown, ctx.writer.term(cluster), moved) {
@@ -181,6 +339,8 @@ async fn tick(
     if cluster.members().leader != Some(cluster.id()) {
         *base = None;
         *failback = Failback::default();
+        *starting = Starting::default();
+        *plans = Plans::default();
         return;
     }
     // 새 리더는 이전 커밋을 아직 적용하지 않았을 수 있으므로 장벽 뒤에 읽는다.
@@ -207,8 +367,13 @@ async fn tick(
         .map(|n| n.id)
         .collect();
     let recovering = !failed.is_empty();
+    starting.prune(&inv, now);
+    if !recovering && plans.due(now, config.plan_every) {
+        *plans = plan(&inv, &leases, now, b);
+    }
     for node in failed {
-        if let Some(u) = recover_node(ctx, leases.term, b, node).await {
+        let plan = plans.of(node, now, config.plan_every);
+        if let Some(u) = recover_node(ctx, leases.term, b, node, plan, starting).await {
             unknown.insert(node, u);
         }
     }
@@ -343,9 +508,17 @@ fn settled(result: &Result<u64, ClusterError>) -> bool {
     )
 }
 
-/// 노드 `node`를 펜싱 중으로 표시하고, 리스가 여전히 끝났으면 그 HA VM을 이름 순서로 옮긴다.
-/// 결과를 모르는 쓰기가 생기면 펜싱 표시를 지우지 않고 그 쓰기를 돌려준다.
-async fn recover_node(ctx: Ctx<'_>, term: u64, b: Instant, node: Uuid) -> Option<Unknown> {
+/// 노드 `node`를 펜싱 중으로 표시하고, 리스가 여전히 끝났으면 그 HA VM을 [`recovery_order`]로 옮긴다
+/// (대상은 `plan`이 맞으면 그것, 아니면 그 자리에서 고른다). 대상 노드가 동시 시작 상한에 걸린 VM은 다음
+/// 틱으로 미룬다. 결과를 모르는 쓰기가 생기면 펜싱 표시를 지우지 않고 그 쓰기를 돌려준다.
+async fn recover_node(
+    ctx: Ctx<'_>,
+    term: u64,
+    b: Instant,
+    node: Uuid,
+    plan: Option<&BTreeMap<Uuid, Uuid>>,
+    starting: &mut Starting,
+) -> Option<Unknown> {
     let cluster = ctx.cluster;
     let mut fence = Fence::begin(cluster, node);
     // 표시하기 직전에 받은 갱신이 있을 수 있으므로 표시한 뒤 다시 본다.
@@ -360,15 +533,25 @@ async fn recover_node(ctx: Ctx<'_>, term: u64, b: Instant, node: Uuid) -> Option
     if !expired(Instant::now(), b, &leases, &failed) || failed.status.frozen() {
         return None;
     }
+    let Ok(settings) = crate::settings::current(cluster) else {
+        return None;
+    };
+    let mut queue = Queue {
+        plan,
+        starting,
+        limit: settings.spec.ha_start_concurrency(),
+        planned: 0,
+        repicked: 0,
+        waiting: 0,
+        moved: vec![],
+    };
     let mut vms: Vec<Vm> = inv
         .vms
         .iter()
         .filter(|vm| recoverable(vm, node))
         .cloned()
         .collect();
-    vms.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: Vec<&str> = vms.iter().map(|vm| vm.name.as_str()).collect();
-    tracing::warn!(node = %failed.name, vms = ?names, "recovering HA VMs from a failed node");
+    vms.sort_by(recovery_order);
     // 죽은 노드의 VM은 펜싱으로 꺼졌으므로 자리로 세지 않는다. 옮긴 VM은 새 자리로 센다(같은 노드의 affinity
     // 상대는 먼저 옮긴 VM을 따라간다).
     let mut assign = Assign::default();
@@ -376,7 +559,18 @@ async fn recover_node(ctx: Ctx<'_>, term: u64, b: Instant, node: Uuid) -> Option
         assign.unplace(vm.id);
     }
     for vm in &vms {
-        let result = recover_vm(ctx, &mut fence, &inv, &mut assign, &leases, b, &failed, vm).await;
+        let result = recover_vm(
+            ctx,
+            &mut fence,
+            &inv,
+            &mut assign,
+            &mut queue,
+            &leases,
+            b,
+            &failed,
+            vm,
+        )
+        .await;
         if let Some((command, moved_to)) = fence.unknown.take() {
             tracing::warn!(vm = %vm.name, result = ?result, "HA recovery write has no result; keeping the node fenced");
             return Some(Unknown {
@@ -399,6 +593,13 @@ async fn recover_node(ctx: Ctx<'_>, term: u64, b: Instant, node: Uuid) -> Option
             }
         }
     }
+    // 동시 시작 상한·놓을 노드를 기다리는 동안은 틱마다 다시 보므로 실제로 옮긴 틱에만 알린다.
+    if queue.moved.is_empty() {
+        tracing::debug!(node = %failed.name, waiting = queue.waiting, "HA VMs of a failed node are waiting to be recovered");
+    } else {
+        tracing::warn!(node = %failed.name, vms = ?queue.moved, "recovered HA VMs from a failed node");
+    }
+    tracing::debug!(node = %failed.name, planned = queue.planned, repicked = queue.repicked, waiting = queue.waiting, "HA recovery targets");
     None
 }
 
@@ -410,6 +611,7 @@ async fn recover_vm(
     fence: &mut Fence<'_>,
     inv: &Inventory,
     assign: &mut Assign,
+    queue: &mut Queue<'_>,
     leases: &Leases,
     b: Instant,
     failed: &Node,
@@ -421,9 +623,37 @@ async fn recover_vm(
     // 리스가 살아 있어야 한다.
     let eligible =
         |n: &Node| n.id != failed.id && Some(n.id) != migrating && alive(now, b, leases, n);
-    let Some(target) = placed(ctx, vm, pick(vm, inv, assign, eligible)).await? else {
+    let starts = !stays_stopped(vm);
+    let limit = queue.limit;
+    let full = |starting: &Starting, t: Uuid| starts && starting.full(t, limit);
+    // 미리 고른 대상이 지금도 조건·hard 규칙에 맞고 상한에 걸리지 않으면 그대로 쓴다.
+    let planned = queue
+        .plan
+        .and_then(|p| p.get(&vm.id))
+        .and_then(|t| inv.nodes.iter().find(|n| n.id == *t))
+        .filter(|n| eligible(n) && node_fits(&vm.spec, inv, n).is_ok())
+        .filter(|n| placement::hard_violations(vm, n, inv, assign).is_empty())
+        .filter(|n| !full(queue.starting, n.id))
+        .map(|n| n.id);
+    let choice = match planned {
+        Some(t) => {
+            queue.planned += 1;
+            Pick::Node(t)
+        }
+        None => {
+            queue.repicked += 1;
+            pick(vm, inv, assign, eligible)
+        }
+    };
+    let Some(target) = placed(ctx, vm, choice).await? else {
         return Ok(());
     };
+    // 미리 고른 대상이 상한이면 위에서 다시 골랐다(다른 노드가 나오면 그리로 옮긴다). 고른 노드가 상한이면 다음
+    // 후보는 쓰지 않고 다음 틱에 다시 본다(그 노드에서 순서가 지켜지게).
+    if full(queue.starting, target) {
+        queue.waiting += 1;
+        return Ok(());
+    }
     // 노드를 바꾸기 전에 실행 상태를 지운다. 사이에 리더가 바뀌면 새 리더가 다시 한다(아직 그 노드).
     // 놓지 못한 이유(`ha.error`)와 옮겨 달라는 요청은 지운다(노드 장애 복구는 옮긴 횟수에 세지 않는다).
     let ha = vm
@@ -449,11 +679,7 @@ async fn recover_vm(
     let revision = fence.write(ctx, command, None).await?;
     let mut spec = vm.spec.clone();
     spec.node = Some(target);
-    if spec
-        .ha
-        .as_ref()
-        .is_some_and(|ha| ha.state == HaState::Stopped)
-    {
+    if stays_stopped(vm) {
         spec.power = PowerState::Stopped;
     }
     let command = Command::UpdateSpec {
@@ -464,8 +690,10 @@ async fn recover_vm(
         spec: serde_json::to_value(&spec)?,
     };
     fence.write(ctx, command, Some(target)).await?;
+    queue.moved.push(vm.name.clone());
     // 다음 VM의 규칙과 미할당 메모리에 센다.
     if spec.power == PowerState::Running {
+        queue.starting.add(target, vm.id, Instant::now());
         assign.place(vm.id, target);
     } else {
         assign.unplace(vm.id);
@@ -977,14 +1205,9 @@ async fn fail_task(ctx: Ctx<'_>, task: &Task, error: &str) {
 
 /// 노드 `node`에 배정된 HA VM으로 실행하기로 된 것. `state: stopped`는 꺼져 있어도 노드를 옮긴다.
 fn recoverable(vm: &Vm, node: Uuid) -> bool {
-    let stopped = vm
-        .spec
-        .ha
-        .as_ref()
-        .is_some_and(|ha| ha.state == HaState::Stopped);
     vm.spec.node == Some(node)
         && vm.spec.ha_active()
-        && (vm.spec.power == PowerState::Running || stopped)
+        && (vm.spec.power == PowerState::Running || stays_stopped(vm))
 }
 
 /// 노드의 마지막 리스 갱신(없으면 기준점 b) 뒤 지난 시간
@@ -1140,6 +1363,7 @@ async fn create<S: ResourceSpec>(ctx: Ctx<'_>, resource: &Typed<S>) -> Result<u6
 #[cfg(test)]
 mod tests {
     use opl_cluster::types::Rejection;
+    use opl_types::vm::{CpuSpec, MachineType, VmHa};
 
     use super::*;
 
@@ -1216,6 +1440,132 @@ mod tests {
         assert!(!settled(&Err(ClusterError::Timeout)));
         assert!(!settled(&Err(ClusterError::Raft("shutting down".into()))));
         assert!(!settled(&Err(ClusterError::Unreachable("x".into()))));
+    }
+
+    fn vm(name: &str, priority: Option<u8>, node: Uuid) -> Vm {
+        Resource::new(
+            name,
+            VmSpec {
+                cpu: CpuSpec {
+                    sockets: 1,
+                    cores: 1,
+                    model: Default::default(),
+                },
+                memory_mib: 1024,
+                firmware: Default::default(),
+                machine: MachineType::Virt,
+                disks: vec![],
+                nics: vec![],
+                power: PowerState::Running,
+                restart: Default::default(),
+                node: Some(node),
+                snapshot_schedule: None,
+                ha: priority.map(|priority| VmHa {
+                    priority,
+                    ..Default::default()
+                }),
+            },
+        )
+    }
+
+    fn inventory(vms: Vec<Vm>) -> Inventory {
+        Inventory {
+            nodes: vec![],
+            vms,
+            volumes: vec![],
+            pools: vec![],
+            networks: vec![],
+            rules: vec![],
+            groups: vec![],
+        }
+    }
+
+    #[test]
+    fn recovery_order_is_priority_then_name() {
+        let node = Uuid::now_v7();
+        let mut vms = [
+            vm("b", Some(50), node),
+            vm("a", Some(10), node),
+            vm("d", Some(90), node),
+            // 정책이 `true`인 VM(기본 50)
+            vm("c", None, node),
+            vm("e", Some(90), node),
+        ];
+        vms.sort_by(recovery_order);
+        let names: Vec<&str> = vms.iter().map(|vm| vm.name.as_str()).collect();
+        assert_eq!(names, ["d", "e", "b", "c", "a"]);
+    }
+
+    #[test]
+    fn starting_vms_leave_when_running_moved_stopped_gone_or_timed_out() {
+        let (target, other) = (Uuid::now_v7(), Uuid::now_v7());
+        let t0 = Instant::now();
+        let t1 = t0 + HA_START_TIMEOUT;
+        let waiting = vm("waiting", None, target);
+        let mut running = vm("running", None, target);
+        running.status.phase = VmPhase::Running;
+        running.status.node = Some(target);
+        // 다른 노드에서 실행 중이라고 남은 status는 아직 기다린다.
+        let mut stale = vm("stale", None, target);
+        stale.status.phase = VmPhase::Running;
+        stale.status.node = Some(other);
+        let moved = vm("moved", None, other);
+        let mut off = vm("off", None, target);
+        off.spec.power = PowerState::Stopped;
+        let late = vm("late", None, target);
+        let gone = Uuid::now_v7();
+        let mut starting = Starting::default();
+        for v in [&waiting, &running, &stale, &moved, &off] {
+            starting.add(target, v.id, t1);
+        }
+        starting.add(target, gone, t1);
+        starting.add(target, late.id, t0);
+        assert!(starting.full(target, 7));
+        let inv = inventory(vec![
+            waiting.clone(),
+            running,
+            stale.clone(),
+            moved,
+            off,
+            late,
+        ]);
+        starting.prune(&inv, t1);
+        let left: Vec<Uuid> = starting.0[&target].keys().copied().collect();
+        let mut expected = vec![waiting.id, stale.id];
+        expected.sort();
+        assert_eq!(left, expected);
+        assert!(starting.full(target, 2));
+        assert!(!starting.full(target, 3));
+        assert!(!starting.full(other, 1));
+        // 120초가 지나면 기다리던 VM도 빠지고 빈 노드는 지운다.
+        starting.prune(&inv, t1 + HA_START_TIMEOUT);
+        assert!(starting.0.is_empty());
+    }
+
+    #[test]
+    fn plans_are_made_again_after_plan_every_and_not_used_when_old() {
+        let every = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let (node, vm_id, target) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let mut plans = Plans::default();
+        assert!(plans.due(t0, every));
+        assert!(plans.of(node, t0, every).is_none());
+        plans = Plans {
+            at: Some(t0),
+            targets: BTreeMap::from([(node, BTreeMap::from([(vm_id, target)]))]),
+        };
+        assert!(!plans.due(t0 + Duration::from_secs(9), every));
+        assert!(plans.due(t0 + every, every));
+        assert_eq!(
+            plans.of(node, t0 + every * 3, every).unwrap()[&vm_id],
+            target
+        );
+        assert!(
+            plans
+                .of(node, t0 + every * 3 + Duration::from_secs(1), every)
+                .is_none()
+        );
+        assert!(plans.of(Uuid::now_v7(), t0, every).is_none());
     }
 
     #[test]

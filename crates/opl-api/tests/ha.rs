@@ -6,11 +6,12 @@
 //! 하는지), 쓰기 오류 뒤에는 펜싱을 푸는지. 배치 규칙과 HA 그룹(그룹 우선순위, restricted, affinity·
 //! anti-affinity, 막는 hard 규칙과 `ha_may_violate`), `state: stopped`·`ignored`, 그룹의 더 우선인 노드로
 //! 되돌아가기, `rule_violations` 갱신. 호스트 종료 정책으로 얼린 노드는 풀기 전까지 옮기지 않는다.
+//! 우선순위 순서, 대상 노드마다의 동시 시작 상한(`ha_start_concurrency`), 미리 고른 복구 노드.
 
 mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ use opl_types::placement::{
     HaGroupNode, HaGroupSpec, HaGroupStatus, PlacementRuleSpec, PlacementRuleStatus, RuleKind,
 };
 use opl_types::resource::{Kind, Resource};
+use opl_types::settings::{SETTINGS_NAME, Settings, SettingsSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
     Arch, HaState, MigrationStatus, PowerState, Vm, VmHa, VmHaStatus, VmPhase, VmSpec, VmStatus,
@@ -60,6 +62,7 @@ fn failback_manager(env: &Env, failback_after: Duration) -> HaManager {
         HaManagerConfig {
             tick: Duration::from_millis(100),
             failback_after,
+            ..Default::default()
         },
     )
 }
@@ -1499,4 +1502,201 @@ async fn a_frozen_offline_node_is_not_recovered_until_unfrozen() {
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(again["revision"], got["revision"]);
     manager.shutdown().await;
+}
+
+/// spec 쓰기(VM을 옮기는 쓰기)의 VM 순서를 적는 쓰기 경로
+#[derive(Default)]
+struct Recording {
+    moved: Mutex<Vec<Uuid>>,
+}
+
+#[async_trait]
+impl RecoveryWriter for Recording {
+    async fn write(&self, cluster: &Cluster, command: Command) -> Result<u64, ClusterError> {
+        let id = match &command {
+            Command::UpdateSpec {
+                kind: Kind::Vm, id, ..
+            } => Some(*id),
+            _ => None,
+        };
+        let result = leader_write(cluster, command).await;
+        if let (Some(id), Ok(_)) = (id, &result) {
+            self.moved.lock().unwrap().push(id);
+        }
+        result
+    }
+}
+
+/// 우선순위 `priority`의 기본 HA 정책
+fn with_priority(priority: u8) -> Option<VmHa> {
+    Some(VmHa {
+        priority,
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn recovers_higher_priority_vms_first_then_by_name() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    node(&env, "spare", 64000, Some(60)).await;
+    let low = vm_ha(
+        &env,
+        "a-low",
+        failed,
+        with_priority(10),
+        PowerState::Running,
+    )
+    .await;
+    let high = vm_ha(
+        &env,
+        "z-high",
+        failed,
+        with_priority(90),
+        PowerState::Running,
+    )
+    .await;
+    let c = vm(&env, "c-vm", failed, true, PowerState::Running).await;
+    let b = vm(&env, "b-vm", failed, true, PowerState::Running).await;
+    let writer = Arc::new(Recording::default());
+    let manager = manager_with(&env, writer.clone());
+    eventually("HA VMs moved", || recover_tasks(&env).len() == 4).await;
+    // 우선순위가 높은 것 → 같으면(기본 50) 이름 순
+    assert_eq!(
+        *writer.moved.lock().unwrap(),
+        vec![high.id, b.id, c.id, low.id]
+    );
+    manager.shutdown().await;
+}
+
+/// 이 VM이 노드 `node`에서 실행 중이라고 status에 쓴다(그 노드의 reconciler 대신).
+async fn mark_running(env: &Env, id: Uuid, node: Uuid) {
+    let mut status = get(env, id).status;
+    status.phase = VmPhase::Running;
+    status.node = Some(node);
+    env.cluster
+        .update_status::<VmSpec>(id, &status)
+        .await
+        .unwrap();
+}
+
+/// 클러스터 설정의 대상 노드당 동시 시작 수를 바꾼다.
+async fn set_start_concurrency(env: &Env, n: u8) {
+    let spec = SettingsSpec {
+        ha_start_concurrency: Some(n),
+        ..Default::default()
+    };
+    match env
+        .cluster
+        .get_by_name::<SettingsSpec>(SETTINGS_NAME)
+        .unwrap()
+    {
+        Some(s) => {
+            env.cluster
+                .update_spec(s.id, Some(s.revision), s.labels, &spec)
+                .await
+                .unwrap();
+        }
+        None => {
+            let s: Settings = Resource::new(SETTINGS_NAME, spec);
+            env.cluster.create(&s).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn starts_at_most_the_concurrency_limit_on_one_target_node() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    let spare = node(&env, "spare", 64000, Some(60)).await;
+    let mut vms = vec![];
+    for i in 1..=6 {
+        vms.push(vm(&env, &format!("vm-{i}"), failed, true, PowerState::Running).await);
+    }
+    let moved = |env: &Env| -> Vec<Uuid> {
+        vms.iter()
+            .filter(|v| get(env, v.id).spec.node == Some(spare))
+            .map(|v| v.id)
+            .collect()
+    };
+    let manager = fast_manager(&env);
+    // 기본 상한 4: 이름 순으로 넷만 옮기고, 나머지는 죽은 노드에 남아 기다린다.
+    eventually("four moved", || moved(&env).len() == 4).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ids: Vec<Uuid> = vms.iter().map(|v| v.id).collect();
+    assert_eq!(moved(&env), ids[..4]);
+    assert_eq!(get(&env, ids[4]).spec.node, Some(failed));
+
+    // 하나가 그 노드에서 켜지면 다음 하나를 옮긴다.
+    mark_running(&env, ids[0], spare).await;
+    eventually("fifth moved", || moved(&env).len() == 5).await;
+    assert_eq!(moved(&env), ids[..5]);
+
+    // 상한을 2로 줄이면 진행 중(vm-2~5, 넷)이 2 아래로 내려가야 옮긴다.
+    set_start_concurrency(&env, 2).await;
+    mark_running(&env, ids[1], spare).await;
+    mark_running(&env, ids[2], spare).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(moved(&env).len(), 5);
+    mark_running(&env, ids[3], spare).await;
+    eventually("sixth moved", || moved(&env).len() == 6).await;
+    manager.shutdown().await;
+}
+
+/// 미리 고른 복구 노드 시험: `failed`(리스 3초)의 a-vm은 처음 틱에 메모리가 많은 x로 계획된다. 1초 뒤
+/// `change`가 상태를 바꾸고, 리스가 끝나면 옮긴 노드를 돌려준다.
+async fn recovered_after_planning(change: impl AsyncFnOnce(&Env, Uuid)) -> (Uuid, Uuid, Uuid) {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(3)).await;
+    let x = node(&env, "x", 5000, Some(60)).await;
+    let y = node(&env, "y", 4096, Some(60)).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    change(&env, x).await;
+    eventually("HA VM moved", || get(&env, a.id).spec.node != Some(failed)).await;
+    let to = get(&env, a.id).spec.node.unwrap();
+    manager.shutdown().await;
+    (to, x, y)
+}
+
+#[tokio::test]
+async fn recovers_to_the_target_chosen_before_the_failure() {
+    // 계획 뒤 x에 다른 VM이 놓여 지금 고르면 y가 낫지만, 계획한 x가 여전히 맞으므로 그대로 쓴다.
+    let (to, x, _) = recovered_after_planning(async |env: &Env, x: Uuid| {
+        vm(env, "filler", x, false, PowerState::Running).await;
+    })
+    .await;
+    assert_eq!(to, x);
+}
+
+#[tokio::test]
+async fn a_planned_target_in_maintenance_is_picked_again() {
+    let (to, _, y) = recovered_after_planning(async |env: &Env, x: Uuid| {
+        let n = env.cluster.get::<NodeSpec>(x).unwrap().unwrap();
+        let mut spec = n.spec.clone();
+        spec.maintenance = true;
+        env.cluster
+            .update_spec(x, Some(n.revision), n.labels, &spec)
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(to, y);
+}
+
+#[tokio::test]
+async fn a_hard_rule_made_after_planning_is_followed() {
+    let (to, _, y) = recovered_after_planning(async |env: &Env, _: Uuid| {
+        rule(
+            env,
+            "keep-off",
+            RuleKind::NodeAntiAffinity,
+            &["a-vm"],
+            &["x"],
+        )
+        .await;
+    })
+    .await;
+    assert_eq!(to, y);
 }
