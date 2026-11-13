@@ -530,3 +530,96 @@ async fn only_offline_nodes_are_removed() {
     assert!(!env.cluster.members().contains(NodeId(node)));
     assert_eq!(admin.get("/nodes/node2").await.0, StatusCode::NOT_FOUND);
 }
+
+/// 모든 응답에 답한 노드의 적용 리비전(`Orbivisor-Revision`)이 붙는다. `Orbivisor-Min-Revision`을 주면 그 리비전까지
+/// 적용한 뒤 답하고, 5초 안에 안 되면 503 `revision_unavailable`이다.
+#[tokio::test]
+async fn reads_wait_for_the_min_revision_header() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let get = |min: Option<String>| {
+        let mut r = admin
+            .http
+            .get(format!("{}/api/v1/volumes", admin.base))
+            .bearer_auth(admin.token.as_deref().unwrap());
+        if let Some(min) = min {
+            r = r.header("Orbivisor-Min-Revision", min);
+        }
+        r.send()
+    };
+    let revision = |resp: &reqwest::Response| -> u64 {
+        resp.headers()["orbivisor-revision"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let resp = get(None).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let now = revision(&resp);
+    assert!(now >= 1 && now <= env.cluster.revision());
+
+    // 아직 적용하지 않은 리비전: 쓰기가 적용되면 답한다.
+    let want = env.cluster.revision() + 1;
+    let cluster = env.cluster.clone();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cluster
+            .create(&Resource::new(
+                "late",
+                opl_types::storage::VolumeSpec {
+                    pool: "local".into(),
+                    size_bytes: 1 << 20,
+                    format: opl_types::runtime::ImageFormat::Qcow2,
+                },
+            ))
+            .await
+            .unwrap()
+    });
+    let resp = get(Some(want.to_string())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(revision(&resp) >= want);
+    writer.await.unwrap();
+
+    let resp = get(Some("soon".into())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let far = env.cluster.revision() + 1_000_000;
+    let started = std::time::Instant::now();
+    let resp = get(Some(far.to_string())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(4));
+    assert!(revision(&resp) < far);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "revision_unavailable", "{body}");
+    // 헬스도 헤더의 오류를 짧은 응답으로 바꾸지 않고 그대로 돌려준다.
+    let resp = admin
+        .http
+        .get(format!("{}/api/v1/health", admin.base))
+        .bearer_auth(admin.token.as_deref().unwrap())
+        .header("Orbivisor-Min-Revision", "soon")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 인증되지 않은 요청은 기다리지 않고(곧바로 401) 리비전도 알려 주지 않는다.
+    let started = std::time::Instant::now();
+    let resp = admin
+        .http
+        .get(format!("{}/api/v1/volumes", admin.base))
+        .header("Orbivisor-Min-Revision", far.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(resp.headers().get("orbivisor-revision").is_none());
+    let resp = admin
+        .http
+        .get(format!("{}/api/v1/openapi.json", admin.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("orbivisor-revision").is_none());
+}

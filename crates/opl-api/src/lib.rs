@@ -31,6 +31,7 @@ pub mod remote_client;
 mod remote_proxy;
 mod remotes;
 pub mod resources;
+pub mod revision;
 mod schedule;
 pub mod scheduler;
 mod security_groups;
@@ -78,7 +79,13 @@ use crate::resources as r;
 
 #[derive(OpenApi)]
 #[openapi(
-    info(title = "Orbivisor API", description = "Orbivisor REST API (`/api/v1`)"),
+    info(
+        title = "Orbivisor API",
+        description = "Orbivisor REST API (`/api/v1`). Every authenticated response carries `Orbivisor-Revision`, \
+            the revision the answering node had applied when it answered. An authenticated request with \
+            `Orbivisor-Min-Revision: <revision>` is answered once the node has applied that revision (503 \
+            `revision_unavailable` after 5 seconds); pass the `revision` of a resource written elsewhere to read it."
+    ),
     servers((url = "/api/v1")),
     modifiers(&Security),
     security(("token" = []), ("session" = [])),
@@ -237,7 +244,11 @@ pub fn router(state: Arc<AppState>) -> Router {
                 let doc = doc.clone();
                 async move { axum::Json(doc.as_ref().clone()) }
             }),
-        );
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            revision::layer,
+        ));
     // 믿는 프록시의 헤더와 허용 출처(CORS)는 라우트를 찾기 전에 본다(preflight는 라우트가 없다).
     Router::new()
         .nest("/api/v1", api)

@@ -35,6 +35,10 @@ struct Routes {
     replies_lost: HashSet<NodeId>,
     /// 노드에 건 Follow 수
     follows: HashMap<NodeId, usize>,
+    /// Follow 프레임을 받지 못하고 멈춘 노드(풀면 이어 받는다)
+    follow_paused: HashSet<NodeId>,
+    /// 스냅샷 조각을 하나마다 이만큼 늦게 받는 노드
+    slow_snapshots: HashMap<NodeId, Duration>,
 }
 
 /// 노드 등록부. 등록되지 않았거나 격리된 노드로 가는 RPC는 `Unreachable`이 된다.
@@ -96,6 +100,16 @@ impl MemRouter {
         self.routes.lock().unwrap().replies_lost.insert(id);
     }
 
+    /// 그 노드가 받는 Follow 프레임을 멈춘다(연결은 그대로, 풀면 이어 받는다). 프레임이 늦게 오는 관찰 노드.
+    pub fn pause_follow(&self, id: NodeId) {
+        self.routes.lock().unwrap().follow_paused.insert(id);
+    }
+
+    /// 그 노드가 받는 스냅샷 조각을 하나마다 `delay`씩 늦춘다(다른 프레임은 그대로). 스냅샷이 오래 걸리는 관찰 노드.
+    pub fn slow_snapshots(&self, id: NodeId, delay: Duration) {
+        self.routes.lock().unwrap().slow_snapshots.insert(id, delay);
+    }
+
     /// 노드 `to`에 건 Follow 수
     pub fn follows(&self, to: NodeId) -> usize {
         self.routes
@@ -112,6 +126,28 @@ impl MemRouter {
         routes.isolated.remove(&id);
         routes.raft_blocked.remove(&id);
         routes.replies_lost.remove(&id);
+        routes.follow_paused.remove(&id);
+        routes.slow_snapshots.remove(&id);
+    }
+
+    /// `to`가 받을 Follow 프레임을 멈춘 동안, 또는 늦춘 스냅샷 조각이면 그만큼 붙잡는다.
+    async fn hold_frame(&self, to: NodeId, frame: &FollowFrame) {
+        let started = tokio::time::Instant::now();
+        loop {
+            let hold = {
+                let routes = self.routes.lock().unwrap();
+                routes.follow_paused.contains(&to)
+                    || (matches!(frame, FollowFrame::SnapshotPart { .. })
+                        && routes
+                            .slow_snapshots
+                            .get(&to)
+                            .is_some_and(|d| started.elapsed() < *d))
+            };
+            if !hold {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     fn route(&self, from: NodeId, to: NodeId) -> Result<NodeHandle, Unreachable> {
@@ -203,7 +239,15 @@ impl FollowClient for MemFollow {
         let frames = node.follow(self.from, since)?;
         // 프레임마다 길을 다시 본다. 두 노드 가운데 하나가 격리되거나 등록이 풀리면 연결이 끊긴 것처럼 끝난다.
         let (router, from) = (self.router.clone(), self.from);
+        let held = router.clone();
         Ok(frames
+            .then(move |frame| {
+                let router = held.clone();
+                async move {
+                    router.hold_frame(from, &frame).await;
+                    frame
+                }
+            })
             .take_while(move |_| std::future::ready(router.route(from, to).is_ok()))
             .map(Ok)
             .boxed())

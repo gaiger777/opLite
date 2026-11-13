@@ -1,5 +1,5 @@
-//! 다른 노드로 가는 gRPC 클라이언트: Raft 네트워크, 리더 전달, 생존 확인, 콘솔, 마이그레이션 받기,
-//! UEFI 변수 받기, 감사 로그 읽기, 지표 읽기.
+//! 다른 노드로 가는 gRPC 클라이언트: Raft 네트워크, 리더 전달, 생존 확인, 관찰 노드의 Follow, 콘솔,
+//! 마이그레이션 받기, UEFI 변수 받기, 감사 로그 읽기, 지표 읽기.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use openraft::BasicNode;
 use openraft::error::{
     InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
@@ -19,7 +21,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
-use opl_cluster::{ClusterError, Forwarder};
+use opl_cluster::{ClusterError, FollowClient, FollowFrame, Forwarder};
 use opl_types::audit::{AuditEntry, AuditQuery};
 use opl_types::metrics::MetricsQuery;
 use tokio::runtime::Handle;
@@ -36,6 +38,7 @@ use crate::migration::{
 };
 use crate::pki::NodeTls;
 use crate::proto::peer_client::PeerClient;
+use crate::wire::FollowRequest;
 use crate::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, VM_METADATA};
 
 /// 연결을 맺기까지 기다리는 최대 시간
@@ -63,7 +66,7 @@ const UEFI_VARS_TIMEOUT: Duration = Duration::from_secs(60);
 /// 다른 노드로 가는 연결. 주소마다 채널 하나를 만들어 다시 쓴다(끊기면 tonic이 다시 잇는다).
 /// 연결할 때 이 노드의 인증서를 내밀고, 상대 인증서는 클러스터 CA로 확인한다.
 ///
-/// 실행기를 주면(`with_runtimes`) 주소마다 채널을 둘 둔다. Raft·리더 전달(리스 갱신과 쓰기 전달)·ping은
+/// 실행기를 주면(`with_runtimes`) 주소마다 채널을 둘 둔다. Raft·리더 전달(리스 갱신과 쓰기 전달)·ping·Follow는
 /// control 채널, 콘솔·마이그레이션 보내기·UEFI 변수·감사 로그·지표 읽기는 bulk 채널이고, 채널의 연결
 /// 작업은 부른 쪽 실행기와 관계없이 그 채널의 실행기에서 돈다. 주지 않으면 채널 하나를 처음 부른
 /// 쪽 실행기에서 돌린다.
@@ -374,6 +377,28 @@ impl ConsoleReceiver {
     /// VNC가 보낸 다음 바이트. 연결이 끝났으면 `None`이다.
     pub async fn recv(&mut self) -> Option<Bytes> {
         self.inbound.message().await.ok().flatten()
+    }
+}
+
+/// 관찰 노드가 투표 멤버에 거는 Follow(control 채널). 제한 시간 없이 이어지고, 끊긴 연결은 keepalive가, 멈춘
+/// 스트림은 복제본이(진행 3초 없음) 알아챈다.
+#[async_trait]
+impl FollowClient for Peers {
+    async fn follow(
+        &self,
+        _to: NodeId,
+        addr: &str,
+        since: u64,
+    ) -> Result<BoxStream<'static, Result<FollowFrame, ClusterError>>, ClusterError> {
+        let unreachable = |s: Status| ClusterError::Unreachable(s.message().to_string());
+        let frames = self
+            .client(addr)
+            .map_err(unreachable)?
+            .follow(FollowRequest { since })
+            .await
+            .map_err(unreachable)?
+            .into_inner();
+        Ok(frames.map(move |f| f.map_err(unreachable)).boxed())
     }
 }
 

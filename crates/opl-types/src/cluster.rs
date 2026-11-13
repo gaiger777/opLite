@@ -1,8 +1,11 @@
 //! 클러스터 자체의 정보와 노드 합류 토큰. 클러스터를 만들고 노드를 더할 때만 쓴다.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+
+use uuid::Uuid;
 
 use crate::resource::{Kind, Resource, ResourceSpec};
 
@@ -37,7 +40,12 @@ impl ResourceSpec for ClusterSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
-pub struct ClusterStatus {}
+pub struct ClusterStatus {
+    /// Raft 밖에서 투표 멤버 하나를 따르는 관찰 노드(노드 id → 클러스터 주소). 리더의 `VoterKeeper`만 쓴다.
+    /// 옛 노드는 모르는 필드를 무시한다.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub observers: BTreeMap<Uuid, String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +68,28 @@ pub struct JoinTokenStatus {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 관찰 노드가 없으면 옛 모양(`{}`) 그대로 쓰고, 옛 모양도 읽는다.
+    #[test]
+    fn observers_are_optional_in_the_status() {
+        assert_eq!(
+            serde_json::to_string(&ClusterStatus::default()).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ClusterStatus>("{}").unwrap(),
+            ClusterStatus::default()
+        );
+        let id = Uuid::from_u128(7);
+        let status = ClusterStatus {
+            observers: BTreeMap::from([(id, "node-7:8007".to_string())]),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ClusterStatus>(&json).unwrap(),
+            status
+        );
+    }
 
     #[test]
     fn debug_hides_the_ca_key() {

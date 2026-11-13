@@ -144,6 +144,18 @@ fn ca_fingerprint(info: &ClusterInfo) -> Result<String, ApiError> {
     fingerprint(&info.spec.ca_cert_pem).map_err(ApiError::internal)
 }
 
+/// 노드가 클러스터에 무엇으로 참여하는지
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberRole {
+    /// Raft 투표 멤버
+    Voter,
+    /// Raft learner(투표하지 않음, 대기·따라잡는 중)
+    Learner,
+    /// Raft 밖에서 투표 멤버 하나를 따르는 관찰 노드
+    Observer,
+}
+
 /// 클러스터 멤버 한 노드
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct MemberView {
@@ -154,8 +166,9 @@ pub struct MemberView {
     pub address: Option<String>,
     /// 노드 간 통신 주소
     pub cluster_address: String,
-    /// 투표 멤버인지(아니면 learner)
+    /// 투표 멤버인지(`role`이 `voter`)
     pub voter: bool,
+    pub role: MemberRole,
     pub online: bool,
     /// 위트니스 노드인지(VM을 돌리지 않는 투표 멤버)
     pub witness: bool,
@@ -176,7 +189,7 @@ pub struct ClusterView {
     pub members: Vec<MemberView>,
 }
 
-/// 클러스터 이름, CA 지문, 멤버(이 노드가 아는 Raft 멤버십)
+/// 클러스터 이름, CA 지문, 멤버(이 노드가 아는 Raft 멤버십과 관찰 노드)
 #[utoipa::path(get, path = "/cluster", tag = "cluster",
     responses((status = 200, body = ClusterView), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn get_cluster(
@@ -187,14 +200,15 @@ pub async fn get_cluster(
     let info = cluster_info(&state)?;
     let members = state.cluster.members();
     let nodes = state.cluster.list::<NodeSpec>()?.1;
-    let view = |id: NodeId, addr: &String, voter: bool| {
+    let view = |id: NodeId, addr: &String, role: MemberRole| {
         let node = nodes.iter().find(|n| n.id == id.0);
         MemberView {
             id: id.0,
             name: node.map(|n| n.name.clone()),
             address: node.map(|n| n.spec.address.clone()),
             cluster_address: addr.clone(),
-            voter,
+            voter: role == MemberRole::Voter,
+            role,
             online: node.is_some_and(|n| n.status.online),
             witness: node.is_some_and(|n| n.spec.witness),
             fencing: node.and_then(|n| n.status.ha).map(|ha| ha.fencing),
@@ -204,13 +218,19 @@ pub async fn get_cluster(
     let mut list: Vec<MemberView> = members
         .voters
         .iter()
-        .map(|(id, addr)| view(*id, addr, true))
+        .map(|(id, addr)| view(*id, addr, MemberRole::Voter))
         .collect();
     list.extend(
         members
             .learners
             .iter()
-            .map(|(id, addr)| view(*id, addr, false)),
+            .map(|(id, addr)| view(*id, addr, MemberRole::Learner)),
+    );
+    list.extend(
+        members
+            .observers
+            .iter()
+            .map(|(id, addr)| view(*id, addr, MemberRole::Observer)),
     );
     Ok(Json(ClusterView {
         name: info.name.clone(),
@@ -388,7 +408,8 @@ pub struct JoinResponse {
     pub ca_pem: String,
     /// 새 노드의 인증서(PEM)
     pub cert_pem: String,
-    /// 이 노드의 노드 간 통신 주소. 새 노드는 여기로 승격을 요청한다.
+    /// 투표 멤버의 노드 간 통신 주소(이 노드가 투표 멤버면 이 노드, 아니면 리더나 다른 투표 멤버). 새 노드는
+    /// 여기로 승격을 요청한다.
     pub via: String,
 }
 
@@ -572,12 +593,8 @@ pub async fn join(
         ));
     }
     let info = cluster_info(&state)?;
-    let me = state
-        .cluster
-        .members()
-        .addr(NodeId(state.node))
-        .map(str::to_string)
-        .ok_or_else(|| ApiError::internal("this node is not in the membership it knows"))?;
+    let via = via_voter(&state.cluster.members(), NodeId(state.node))
+        .ok_or_else(|| ApiError::internal("this node knows no voter"))?;
 
     let mut sans = vec![api_host.to_string()];
     if cluster_host != api_host {
@@ -657,8 +674,20 @@ pub async fn join(
         cluster: info.name,
         ca_pem: info.spec.ca_cert_pem,
         cert_pem,
-        via: me,
+        via,
     }))
+}
+
+/// 새 노드가 승격을 요청할 투표 멤버의 주소: 이 노드가 투표 멤버면 이 노드, 아니면(learner·관찰 노드) 아는 리더,
+/// 모르면 아무 투표 멤버
+fn via_voter(members: &opl_cluster::Members, me: NodeId) -> Option<String> {
+    let leader = members.leader.and_then(|l| members.voters.get(&l));
+    members
+        .voters
+        .get(&me)
+        .or(leader)
+        .or_else(|| members.voters.values().next())
+        .cloned()
 }
 
 /// 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `orbivisorctl cluster leave`로 뺀다.
@@ -699,6 +728,28 @@ pub async fn delete_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_via_is_a_voter() {
+        let id = |n: u64| NodeId::from(n);
+        let addrs = |ids: &[u64]| -> std::collections::BTreeMap<NodeId, String> {
+            ids.iter().map(|n| (id(*n), format!("node-{n}"))).collect()
+        };
+        let members = opl_cluster::Members {
+            leader: Some(id(2)),
+            voters: addrs(&[1, 2, 3]),
+            learners: addrs(&[4]),
+            observers: addrs(&[5]),
+        };
+        assert_eq!(via_voter(&members, id(3)).as_deref(), Some("node-3"));
+        assert_eq!(via_voter(&members, id(4)).as_deref(), Some("node-2"));
+        assert_eq!(via_voter(&members, id(5)).as_deref(), Some("node-2"));
+        let leaderless = opl_cluster::Members {
+            leader: None,
+            ..members
+        };
+        assert_eq!(via_voter(&leaderless, id(5)).as_deref(), Some("node-1"));
+    }
 
     #[test]
     fn join_url_round_trips() {

@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use futures_util::future::Either;
 use futures_util::stream::BoxStream;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{BasicNode, Raft, RaftNetworkFactory};
+use opl_types::cluster::ClusterStatus;
 use opl_types::resource::{Kind, Resource, ResourceSpec};
 use redb::Database;
 use uuid::Uuid;
@@ -19,7 +20,7 @@ use crate::replica::Replica;
 use crate::store::{Store, StoreError, get_object, get_object_by_name, list_objects};
 use crate::types::{Command, LeaderRequest, NodeId, RawResource, Rejection, TypeConfig};
 use crate::vip::{VipLeases, VipTable};
-use crate::watch::{Watch, WatchError, WatchHub};
+use crate::watch::{Feed, FeedItem, Watch, WatchError, WatchEvent, WatchHub};
 
 /// spec 타입 `S`의 리소스.
 pub type Typed<S> = Resource<S, <S as ResourceSpec>::Status>;
@@ -109,6 +110,8 @@ pub struct Cluster {
     forwarder: Option<Arc<dyn Forwarder>>,
     /// 헬스 체크가 보는 적용 지연
     apply_lag: std::sync::Mutex<ApplyLag>,
+    /// 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`). `Kind::Cluster` 변경으로 갱신한다.
+    observers: Arc<RwLock<BTreeMap<NodeId, String>>>,
 }
 
 /// 이 노드가 클러스터에 무엇으로 참여하는지
@@ -131,6 +134,8 @@ pub(crate) struct NodeHandle {
     /// Follow를 받을 때 읽는 저장소와 적용 묶음
     db: Arc<Database>,
     hub: Arc<WatchHub>,
+    /// Follow 스트림들이 함께 쓰는, 마지막 묶음을 나눈 프레임
+    batch_frames: Arc<follow::BatchFrames>,
     backend: Arc<RwLock<Backend>>,
     /// 리더일 때 받은 HA 리스 갱신(메모리에만 둔다)
     leases: Arc<LeaseTable>,
@@ -149,6 +154,10 @@ impl NodeHandle {
 
     pub(crate) fn hub(&self) -> &Arc<WatchHub> {
         &self.hub
+    }
+
+    pub(crate) fn batch_frames(&self) -> &follow::BatchFrames {
+        &self.batch_frames
     }
 
     pub(crate) fn backend(&self) -> Backend {
@@ -199,17 +208,24 @@ pub struct Members {
     pub leader: Option<NodeId>,
     pub voters: BTreeMap<NodeId, String>,
     pub learners: BTreeMap<NodeId, String>,
+    /// Raft 밖의 관찰 노드(클러스터 정보의 `observers` 가운데 Raft 구성원이 아닌 것)
+    pub observers: BTreeMap<NodeId, String>,
 }
 
 impl Members {
+    /// 클러스터의 노드인지(투표 멤버·learner·관찰 노드)
     pub fn contains(&self, id: NodeId) -> bool {
-        self.voters.contains_key(&id) || self.learners.contains_key(&id)
+        self.voters.contains_key(&id)
+            || self.learners.contains_key(&id)
+            || self.observers.contains_key(&id)
     }
 
+    /// 노드의 클러스터 주소(관찰 노드 포함)
     pub fn addr(&self, id: NodeId) -> Option<&str> {
         self.voters
             .get(&id)
             .or_else(|| self.learners.get(&id))
+            .or_else(|| self.observers.get(&id))
             .map(String::as_str)
     }
 }
@@ -266,12 +282,14 @@ impl Cluster {
     }
 
     fn assemble(id: NodeId, write_timeout: Duration, store: Store, backend: Backend) -> Self {
+        let observers = track_observers(store.db(), store.watch_hub());
         Self {
             id,
             node: NodeHandle {
                 id,
                 db: store.db().clone(),
                 hub: store.watch_hub().clone(),
+                batch_frames: Arc::default(),
                 backend: Arc::new(RwLock::new(backend)),
                 leases: Arc::default(),
                 vips: Arc::default(),
@@ -280,6 +298,7 @@ impl Cluster {
             write_timeout,
             forwarder: None,
             apply_lag: Default::default(),
+            observers,
         }
     }
 
@@ -328,6 +347,19 @@ impl Cluster {
             Ok(Ok(applied)) => Ok(*applied),
             Ok(Err(_)) | Err(_) => Err(ClusterError::Timeout),
         }
+    }
+
+    /// 이 노드가 있다고 아는 가장 큰 리비전(적용한 것보다 작지 않다): 멤버는 받은 로그의 마지막 인덱스, 관찰 노드는
+    /// 붙은 노드가 알렸거나 리더가 돌려준 인덱스다. 곧 적용될 리비전이라 기다릴 만하다.
+    pub fn known_revision(&self) -> u64 {
+        let known = match self.node.backend() {
+            Backend::Member { raft, .. } => raft.metrics().borrow().last_log_index.unwrap_or(0),
+            Backend::Observer(replica) => {
+                let status = replica.status();
+                status.upstream_applied.max(status.leader_applied)
+            }
+        };
+        known.max(self.revision())
     }
 
     /// 새 클러스터를 만든다. 첫 노드에서 한 번만 부른다.
@@ -736,6 +768,7 @@ impl Cluster {
             leader,
             voters: BTreeMap::new(),
             learners: BTreeMap::new(),
+            observers: BTreeMap::new(),
         };
         for (id, node) in membership.nodes() {
             let list = if voters.contains(id) {
@@ -745,7 +778,38 @@ impl Cluster {
             };
             list.insert(*id, node.addr.clone());
         }
+        // 내리는 중(목록에 쓰고 아직 멤버십에서 빼기 전)인 노드는 Raft 구성원으로 센다.
+        out.observers = self
+            .observers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| membership.get_node(id).is_none())
+            .map(|(id, addr)| (*id, addr.clone()))
+            .collect();
         out
+    }
+
+    /// `id`가 이 노드가 아는 클러스터 노드(멤버십이나 관찰 노드 목록)인지. [`Cluster::members`]의 `contains`와 같되
+    /// 목록을 만들지 않아 열린 Follow 스트림이 프레임마다 볼 수 있다.
+    pub fn knows_node(&self, id: NodeId) -> bool {
+        self.in_membership(id) || self.observers.read().unwrap().contains_key(&id)
+    }
+
+    /// `id`가 이 노드가 아는 Raft 멤버십(투표 멤버·learner)에 있는지
+    pub fn in_membership(&self, id: NodeId) -> bool {
+        match self.node.backend() {
+            Backend::Member { raft, .. } => raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .get_node(&id)
+                .is_some(),
+            Backend::Observer(replica) => replica
+                .membership()
+                .is_ok_and(|m| m.membership().get_node(&id).is_some()),
+        }
     }
 
     /// 헬스 체크가 보는 이 노드의 Raft 상태. 부를 때마다 적용 지연을 다시 잰다([`RaftHealth`]).
@@ -886,6 +950,103 @@ impl Cluster {
                 }
             }
         })
+    }
+}
+
+/// 클러스터 정보의 관찰 노드 목록을 읽어 두고, `Kind::Cluster` 변경을 따라 고치는 작업을 띄운다. 작업은
+/// 저장소가 닫히거나(피드가 `Closed`) 목록을 쥔 `Cluster`가 사라지면 끝난다.
+fn track_observers(
+    db: &Arc<Database>,
+    hub: &Arc<WatchHub>,
+) -> Arc<RwLock<BTreeMap<NodeId, String>>> {
+    let cache = Arc::new(RwLock::new(BTreeMap::new()));
+    // 구독한 뒤 읽어야 그 사이의 변경을 놓치지 않는다.
+    let feed = hub.feed(hub.revision()).ok();
+    *cache.write().unwrap() = read_observers(db);
+    let (db, hub, weak) = (
+        Arc::downgrade(db),
+        Arc::downgrade(hub),
+        Arc::downgrade(&cache),
+    );
+    tokio::spawn(async move {
+        let mut feed = feed;
+        loop {
+            if let Some(mut f) = feed.take()
+                && !follow_observers(&mut f, &weak).await
+            {
+                return;
+            }
+            // 처음이거나, 스냅샷 설치(`Reset`)·`Lagged` 뒤: 다시 구독하고 저장소에서 다시 읽는다.
+            let (Some(db), Some(hub), Some(cache)) = (db.upgrade(), hub.upgrade(), weak.upgrade())
+            else {
+                return;
+            };
+            feed = hub.feed(hub.revision()).ok();
+            *cache.write().unwrap() = read_observers(&db);
+            if feed.is_none() {
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            }
+        }
+    });
+    cache
+}
+
+/// 피드의 `Kind::Cluster` 변경으로 목록을 고친다. 다시 읽어야 하면(`Reset`·`Lagged`) `true`, 끝나야 하면
+/// (저장소가 닫힘, 목록이 사라짐) `false`다.
+async fn follow_observers(feed: &mut Feed, cache: &Weak<RwLock<BTreeMap<NodeId, String>>>) -> bool {
+    loop {
+        let batch = match feed.next().await {
+            Ok(FeedItem::Batch(batch)) => batch,
+            Ok(FeedItem::Reset { .. }) | Err(WatchError::Lagged | WatchError::Expired { .. }) => {
+                return true;
+            }
+            Err(WatchError::Closed) => return false,
+        };
+        if cache.strong_count() == 0 {
+            return false;
+        }
+        for event in &batch.events {
+            let observers = match event {
+                WatchEvent::Put {
+                    kind: Kind::Cluster,
+                    resource,
+                } => observers_of(resource),
+                WatchEvent::Deleted {
+                    kind: Kind::Cluster,
+                    ..
+                } => BTreeMap::new(),
+                _ => continue,
+            };
+            let Some(cache) = cache.upgrade() else {
+                return false;
+            };
+            *cache.write().unwrap() = observers;
+        }
+    }
+}
+
+/// 저장소의 클러스터 정보에 적힌 관찰 노드
+fn read_observers(db: &Database) -> BTreeMap<NodeId, String> {
+    match list_objects(db, Kind::Cluster) {
+        Ok((_, list)) => list.first().map(observers_of).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the cluster info");
+            BTreeMap::new()
+        }
+    }
+}
+
+pub(crate) fn observers_of(info: &RawResource) -> BTreeMap<NodeId, String> {
+    match serde_json::from_value::<ClusterStatus>(info.status.clone()) {
+        Ok(status) => status
+            .observers
+            .into_iter()
+            .map(|(id, addr)| (NodeId(id), addr))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the observers in the cluster info");
+            BTreeMap::new()
+        }
     }
 }
 

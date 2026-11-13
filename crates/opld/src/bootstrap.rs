@@ -543,7 +543,8 @@ pub(crate) mod tests {
                 "shared-sessions",
                 "vip",
                 "lease-liveness",
-                "voter-limit"
+                "voter-limit",
+                "observer"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -567,7 +568,8 @@ pub(crate) mod tests {
                 "shared-sessions",
                 "vip",
                 "lease-liveness",
-                "voter-limit"
+                "voter-limit",
+                "observer"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -607,7 +609,8 @@ pub(crate) mod tests {
                 "shared-sessions",
                 "vip",
                 "lease-liveness",
-                "voter-limit"
+                "voter-limit",
+                "observer"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -685,6 +688,7 @@ pub(crate) mod tests {
                     "vip".into(),
                     "lease-liveness".into(),
                     "voter-limit".into(),
+                    "observer".into(),
                 ],
                 ..NodeStatus::default()
             }

@@ -565,9 +565,18 @@ impl FromRequestParts<Arc<AppState>> for Principal {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let principal = state.authenticate(parts).await;
+        let mut principal = state.authenticate(parts).await;
+        // `Orbivisor-Min-Revision`의 리비전까지 기다렸으면 다시 인증한다(다른 노드에서 막 만든 자격 증명은 받고,
+        // 기다리는 사이 폐기된 것은 받지 않는다).
+        let waited = crate::revision::wait_for(state, parts, principal.is_ok()).await;
+        if let Ok(true) = waited {
+            principal = state.authenticate(parts).await;
+        }
         crate::audit::note_auth(parts, principal.as_ref().ok());
-        principal
+        let principal = principal?;
+        crate::revision::authenticated(parts);
+        waited?;
+        Ok(principal)
     }
 }
 

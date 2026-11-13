@@ -31,8 +31,8 @@ pub(crate) const FOLLOW_STALL: Duration = Duration::from_secs(3);
 /// 다시 붙기 전에 쉬는 시간
 const RECONNECT_DELAY: Duration = Duration::from_millis(100);
 
-/// 리더가 돌려준 인덱스(전달한 쓰기·리스 갱신)를 이보다 오래 적용하지 못하면 붙은 노드가 뒤처진 것으로 보고 다른
-/// 투표 멤버로 옮긴다(살아 있어 `Progress`는 오지만 로그를 받지 못하는 노드).
+/// 리더가 돌려준 인덱스(전달한 쓰기·리스 갱신)를 붙은 노드가 이보다 오래 알리지 않으면(`Progress`·묶음의 적용 위치)
+/// 뒤처진 것으로 보고 다른 투표 멤버로 옮긴다(살아 있어 `Progress`는 오지만 로그를 받지 못하는 노드).
 pub(crate) const UPSTREAM_LAG_MAX: Duration = Duration::from_secs(3);
 
 /// 연결 하나가 끝난 까닭
@@ -235,7 +235,11 @@ impl Inner {
             }
         };
         let mut parts = Vec::new();
-        // 리더가 돌려준 인덱스를 이 노드에서 적용하지 못한 시간(붙을 때마다 새로 잰다)
+        // 스냅샷 조각을 받는 중이다(첫 `SnapshotPart`부터 `SnapshotEnd`까지).
+        let mut in_snapshot = false;
+        // 다음 `Batch`와 한 번에 적용할 나눠 온 묶음의 앞부분
+        let mut batch_parts = Vec::new();
+        // 리더가 돌려준 인덱스를 붙은 노드가 알리지 않은 시간(붙을 때마다, 스냅샷을 설치할 때마다 새로 잰다)
         let mut lag = ApplyLag::default();
         let mut leave = self.leave_upstream.subscribe();
         leave.borrow_and_update();
@@ -243,21 +247,21 @@ impl Inner {
             if may_move && self.upstream_is_leader(to) {
                 return Outcome::Move;
             }
-            let leader_applied = self.status.lock().unwrap().leader_applied;
-            if lag.observe(
-                Some(leader_applied),
-                Some(self.hub.revision()),
-                Instant::now(),
-            ) > UPSTREAM_LAG_MAX
-            {
-                tracing::warn!(upstream = %to, leader_applied, "the followed node lags behind the leader; following another");
+            // 스냅샷이나 나눈 묶음을 받는 동안은 붙은 노드가 알린 적용이 움직이지 않는다(스냅샷이 오래 걸려도 끊지 않게).
+            let receiving = in_snapshot || !batch_parts.is_empty();
+            if !receiving && self.upstream_lag(&mut lag) > UPSTREAM_LAG_MAX {
+                tracing::warn!(upstream = %to, "the followed node lags behind the leader; following another");
                 return Outcome::Lagging;
             }
             let next = tokio::select! {
                 next = tokio::time::timeout(FOLLOW_STALL, frames.next()) => next,
-                _ = leave.changed() => {
-                    tracing::warn!(upstream = %to, "a forwarded request was not applied in time; following another");
-                    return Outcome::Lagging;
+                _ = leave.changed(), if !receiving => {
+                    // 붙은 노드는 리더의 인덱스를 알렸는데 이 노드가 늦게 적용하는 것이면 머문다.
+                    if self.upstream_behind() {
+                        tracing::warn!(upstream = %to, "a forwarded request was not applied in time; following another");
+                        return Outcome::Lagging;
+                    }
+                    continue;
                 }
             };
             let frame = match next {
@@ -272,6 +276,19 @@ impl Inner {
                     return ended(progressed);
                 }
             };
+            // 스냅샷 조각은 `SnapshotEnd`까지, 나눈 묶음은 `Batch`까지 이어 와야 한다(서버는 그 사이에 다른 프레임을
+            // 넣지 않는다). 아니면 모은 것을 버리고 다시 붙는다.
+            let in_order = match frame {
+                FollowFrame::SnapshotPart { .. } | FollowFrame::SnapshotEnd { .. } => {
+                    batch_parts.is_empty()
+                }
+                FollowFrame::BatchPart { .. } | FollowFrame::Batch { .. } => !in_snapshot,
+                FollowFrame::Hello { .. } | FollowFrame::Progress { .. } => !receiving,
+            };
+            if !in_order {
+                tracing::warn!(upstream = %to, "the followed node sent frames out of order; following again");
+                return ended(progressed);
+            }
             let result = match frame {
                 FollowFrame::Hello { leader, voters, .. } => {
                     let mut status = self.status.lock().unwrap();
@@ -283,23 +300,35 @@ impl Inner {
                     continue;
                 }
                 FollowFrame::SnapshotPart { objects } => {
+                    in_snapshot = true;
                     parts.extend(objects);
-                    continue;
+                    Ok(())
+                }
+                FollowFrame::BatchPart { events } => {
+                    batch_parts.extend(events);
+                    Ok(())
                 }
                 FollowFrame::SnapshotEnd {
                     applied,
                     membership,
                 } => {
-                    self.install(applied, membership, std::mem::take(&mut parts))
-                        .await
+                    in_snapshot = false;
+                    let result = self
+                        .install(applied, membership, std::mem::take(&mut parts))
+                        .await;
+                    // 설치하는 동안 늦은 전달 기다림이나 지연은 붙은 노드 탓이 아니다. 새로 잰다.
+                    lag = ApplyLag::default();
+                    leave.borrow_and_update();
+                    result
                 }
                 FollowFrame::Batch {
                     events,
                     applied,
                     membership,
                 } => {
+                    batch_parts.extend(events);
                     self.apply(FeedBatch {
-                        events,
+                        events: std::mem::take(&mut batch_parts),
                         applied,
                         membership,
                     })
@@ -323,6 +352,23 @@ impl Inner {
             progressed = true;
             self.status.lock().unwrap().last_progress = Some(Instant::now());
         }
+    }
+
+    /// 리더가 돌려준 인덱스를 붙은 노드가 알리지 않은 시간(이 노드의 적용이 아니라 붙은 노드가 알린 적용으로 잰다:
+    /// 이 노드의 디스크가 느린 것을 붙은 노드 탓으로 돌리지 않게)
+    fn upstream_lag(&self, lag: &mut ApplyLag) -> Duration {
+        let status = self.status.lock().unwrap();
+        lag.observe(
+            Some(status.leader_applied),
+            Some(status.upstream_applied),
+            Instant::now(),
+        )
+    }
+
+    /// 붙은 노드가 알린 적용이 리더가 돌려준 인덱스보다 뒤다.
+    fn upstream_behind(&self) -> bool {
+        let status = self.status.lock().unwrap();
+        status.upstream_applied < status.leader_applied
     }
 
     /// 붙은 노드가 리더이고 붙을 다른 투표 멤버가 있다.
@@ -1182,6 +1228,136 @@ mod tests {
         }
         assert_ne!(r.status().upstream, Some(upstream));
         net.router.heal(upstream);
+        net.shutdown().await;
+    }
+
+    /// 나눠 온 묶음(`BatchPart`… `Batch`)은 마지막 프레임에서 한 번에 적용한다. 그 전에 끊기면 앞부분은 버린다.
+    #[tokio::test]
+    async fn split_batches_are_applied_at_once() {
+        let root = TempDir::new().unwrap();
+        let (a, b, c) = (raw("a", 11), raw("b", 12), raw("c", 13));
+        let snapshot = FollowFrame::SnapshotEnd {
+            applied: Some(log_id(10)),
+            membership: Default::default(),
+        };
+        let script = Scripted::default()
+            // 앞부분만 오고 멈춘 뒤(진행 없음으로) 끊긴다.
+            .then(
+                vec![
+                    hello(),
+                    snapshot,
+                    FollowFrame::BatchPart {
+                        events: vec![put(&a)],
+                    },
+                ],
+                true,
+            )
+            .then(
+                vec![
+                    hello(),
+                    FollowFrame::BatchPart {
+                        events: vec![put(&a)],
+                    },
+                    FollowFrame::BatchPart {
+                        events: vec![put(&b)],
+                    },
+                    FollowFrame::Batch {
+                        events: vec![put(&c)],
+                        applied: log_id(13),
+                        membership: None,
+                    },
+                ],
+                true,
+            );
+        let o = scripted_observer(&root, script).await;
+        o.wait_revision(10, WAIT).await.unwrap();
+        let mut w = o.watch(10).unwrap();
+        // 앞부분만으로는 적용하지 않는다.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(o.revision(), 10);
+        assert!(o.get::<VolumeSpec>(a.id).unwrap().is_none());
+        o.wait_revision(13, WAIT).await.unwrap();
+        let revisions: Vec<u64> = drain(&mut w).await.iter().map(|e| e.revision()).collect();
+        assert_eq!(revisions, [11, 12, 13]);
+        for r in [&a, &b, &c] {
+            assert!(o.get::<VolumeSpec>(r.id).unwrap().is_some());
+        }
+        o.shutdown().await.unwrap();
+    }
+
+    /// 나눈 묶음 사이에 다른 프레임이 오면(서버는 그러지 않는다) 모은 앞부분을 버리고 다시 붙는다.
+    #[tokio::test]
+    async fn frames_out_of_order_drop_the_parts_and_reconnect() {
+        let root = TempDir::new().unwrap();
+        let (a, b) = (raw("a", 11), raw("b", 12));
+        let script = Scripted::default()
+            .then(
+                vec![
+                    hello(),
+                    FollowFrame::SnapshotEnd {
+                        applied: Some(log_id(10)),
+                        membership: Default::default(),
+                    },
+                    FollowFrame::BatchPart {
+                        events: vec![put(&a)],
+                    },
+                    FollowFrame::SnapshotEnd {
+                        applied: Some(log_id(10)),
+                        membership: Default::default(),
+                    },
+                    FollowFrame::Batch {
+                        events: vec![put(&b)],
+                        applied: log_id(12),
+                        membership: None,
+                    },
+                ],
+                true,
+            )
+            .then(
+                vec![
+                    hello(),
+                    FollowFrame::Batch {
+                        events: vec![put(&a), put(&b)],
+                        applied: log_id(12),
+                        membership: None,
+                    },
+                ],
+                true,
+            );
+        let o = scripted_observer(&root, script).await;
+        o.wait_revision(10, WAIT).await.unwrap();
+        let mut w = o.watch(10).unwrap();
+        o.wait_revision(12, WAIT).await.unwrap();
+        let revisions: Vec<u64> = drain(&mut w).await.iter().map(|e| e.revision()).collect();
+        assert_eq!(revisions, [11, 12]);
+        assert!(replica(&o).status().reconnects >= 1);
+        o.shutdown().await.unwrap();
+    }
+
+    /// 스냅샷으로 따라잡는 관찰 노드는 스냅샷이 `UPSTREAM_LAG_MAX`보다 오래 걸려도(조각마다 1초) 리스 갱신이 도는
+    /// 동안(리더가 돌려준 인덱스, 시간 초과한 적용 기다림) 붙은 노드를 버리지 않고 끝까지 받아 따라잡는다.
+    #[tokio::test]
+    async fn a_slow_snapshot_catch_up_is_not_cut_off_by_lag_checks() {
+        let net = Net::start(1).await;
+        let o = net.observer(0);
+        let revision = net.sync().await;
+        net.router.isolate(o.id());
+        net.write_past_history(revision).await;
+        let target = net.leader().revision();
+        net.router.heal(o.id());
+        net.router.slow_snapshots(o.id(), Duration::from_secs(1));
+        let renew = async {
+            loop {
+                let _ = o.renew_lease(Duration::from_secs(1)).await;
+            }
+        };
+        tokio::select! {
+            _ = renew => unreachable!(),
+            caught_up = o.wait_revision(target, Duration::from_secs(40)) => {
+                caught_up.expect("the observer never finished the snapshot");
+            }
+        }
+        o.renew_lease(Duration::from_secs(5)).await.unwrap();
         net.shutdown().await;
     }
 }

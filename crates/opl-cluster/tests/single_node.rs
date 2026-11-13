@@ -3,10 +3,11 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::{TestCluster, WAIT, node, volume};
-use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_cluster::watch::{Watch, WatchError, WatchEvent};
-use opl_types::resource::Kind;
+use opl_cluster::{ClusterError, Members};
+use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
+use opl_types::resource::{Kind, Resource};
 use opl_types::storage::{VolumeSpec, VolumeStatus};
 
 #[tokio::test]
@@ -323,4 +324,55 @@ async fn in_memory_store_does_not_touch_the_data_dir() {
     assert!(c.get::<VolumeSpec>(v.id).unwrap().is_some());
     assert!(!dir.exists());
     c.shutdown().await.unwrap();
+}
+
+async fn wait_members(c: &opl_cluster::Cluster, what: &str, cond: impl Fn(&Members) -> bool) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while !cond(&c.members()) {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 클러스터 정보의 관찰 노드(`ClusterStatus.observers`)는 멤버 목록에 들어가 주소를 찾을 수 있다. Raft 구성원과
+/// 겹치면(내리는 중) 구성원으로 센다. 다시 연 노드는 저장소에서 바로 읽는다.
+#[tokio::test]
+async fn members_include_the_observers_in_the_cluster_info() {
+    let mut tc = TestCluster::start(1).await;
+    let me = node(1);
+    let observer = node(9);
+    let c = tc.get(me);
+    let mut info: ClusterInfo = Resource::new(
+        "test",
+        ClusterSpec {
+            ca_cert_pem: String::new(),
+            ca_key_pem: String::new(),
+        },
+    );
+    c.create(&info).await.unwrap();
+    assert!(!c.members().contains(observer));
+
+    info.status.observers = BTreeMap::from([(observer.0, "node-9".into()), (me.0, "stale".into())]);
+    c.update_status::<ClusterSpec>(info.id, &info.status)
+        .await
+        .unwrap();
+    wait_members(c, "the observer is listed", |m| m.contains(observer)).await;
+    let members = c.members();
+    assert_eq!(members.addr(observer), Some("node-9"));
+    assert_eq!(members.observers.len(), 1);
+    assert_eq!(
+        members.addr(me),
+        members.voters.get(&me).map(String::as_str)
+    );
+
+    tc.stop(me).await;
+    tc.open(me).await;
+    let c = tc.get(me);
+    assert_eq!(c.members().addr(observer), Some("node-9"));
+
+    c.update_status::<ClusterSpec>(info.id, &ClusterStatus::default())
+        .await
+        .unwrap();
+    wait_members(c, "the observer is gone", |m| !m.contains(observer)).await;
+    assert_eq!(c.members().addr(observer), None);
 }

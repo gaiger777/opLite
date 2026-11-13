@@ -81,6 +81,7 @@ async fn read_all(
         .voters
         .iter()
         .chain(&members.learners)
+        .chain(&members.observers)
         .filter_map(|(id, addr)| {
             let node = nodes.iter().find(|n| n.id == id.0);
             if node.is_some_and(|n| n.spec.witness) {
@@ -198,6 +199,7 @@ pub async fn get_node_metrics(
         .voters
         .iter()
         .chain(&members.learners)
+        .chain(&members.observers)
         .find(|(id, _)| id.0 == node.id)
     else {
         return Err(unreachable("not a cluster member"));

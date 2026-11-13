@@ -6,10 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{Client, Env, WAIT};
+use openraft::BasicNode;
 use opl_api::{AppState, RuntimeProbe};
-use opl_cluster::ClusterError;
+use opl_cluster::types::{LeaderRequest, NodeId};
+use opl_cluster::{Cluster, ClusterConfig, ClusterError};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
+use opl_types::cluster::ClusterSpec;
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use reqwest::StatusCode;
@@ -338,4 +341,221 @@ async fn roles_are_checked_and_need_every_node_to_know_them() {
         set_spec(&viewer, "roles", Value::Null).await.0,
         StatusCode::FORBIDDEN
     );
+}
+
+/// 관찰 노드를 더한다. 실제 길처럼 learner로 가입해 따라잡은 뒤 클러스터 정보의 관찰 노드 목록에 적히고 멤버십에서
+/// 빠진다. 같은 저장소로 관찰 노드로 다시 열려 투표 멤버(`env`의 노드)를 따르고, Node 리소스(`api` 역할)가 있다.
+async fn start_observer(env: &Env) -> Arc<Cluster> {
+    let id = NodeId(Uuid::now_v7());
+    let addr = format!("observer-{id}");
+    let mut config = ClusterConfig::new(id, env.dir.path().join("observer"));
+    config.raft = openraft::Config {
+        heartbeat_interval: 50,
+        election_timeout_min: 300,
+        election_timeout_max: 600,
+        ..Default::default()
+    };
+    let learner = Cluster::open(config.clone(), env.router.network(id))
+        .await
+        .unwrap();
+    env.router.register(id, &learner);
+    env.cluster
+        .add_learner(id, BasicNode::new(&addr))
+        .await
+        .unwrap();
+    let mut info = env.cluster.list::<ClusterSpec>().unwrap().1.remove(0);
+    info.status.observers.insert(id.0, addr);
+    env.cluster
+        .update_status::<ClusterSpec>(info.id, &info.status)
+        .await
+        .unwrap();
+    env.cluster
+        .request(LeaderRequest::Remove { id })
+        .await
+        .unwrap();
+    env.router.unregister(id);
+    learner.shutdown().await.unwrap();
+    drop(learner);
+    let deadline = std::time::Instant::now() + WAIT;
+    let observer = loop {
+        match Cluster::open_observer(config.clone(), env.router.follower(id)).await {
+            Err(ClusterError::Store(_)) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => break other.unwrap(),
+        }
+    };
+    let observer = Arc::new(observer.with_forwarder(env.router.forwarder(id)));
+    env.router.register(id, &observer);
+    let mut node = Resource::new(
+        "observer",
+        NodeSpec {
+            address: "127.0.0.1:0".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    node.id = id.0;
+    let revision = env.cluster.create(&node).await.unwrap();
+    observer.wait_revision(revision, WAIT).await.unwrap();
+    observer
+}
+
+/// `cluster`(다른 노드)로 API를 따로 서비스한다(관리자 토큰을 쓰는 클라이언트).
+async fn serve_node(env: &Env, cluster: Arc<Cluster>) -> Client {
+    let node = cluster.id().0;
+    let state = AppState::new(
+        cluster,
+        node,
+        env.hv.clone(),
+        env.dir.path().join(format!("uploads-{node}")),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = opl_api::router(Arc::new(state));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    Client {
+        base,
+        http: reqwest::Client::new(),
+        token: env.admin().await.token,
+    }
+}
+
+/// 관찰 노드는 붙은 투표 멤버의 진행이 5초 안에 오고 리더를 알면 준비됐고(200), 끊기면 `quorum`으로 503이다.
+/// 관찰 노드도 클러스터 멤버로(`role: observer`) 보인다.
+#[tokio::test]
+async fn an_observer_is_ready_while_it_follows_a_voter() {
+    let env = Env::start().await;
+    let observer = start_observer(&env).await;
+    let id = observer.id();
+    let client = serve_node(&env, observer.clone()).await;
+    // 관리자 토큰이 관찰 노드에 복제될 때까지
+    observer
+        .wait_revision(env.cluster.revision(), WAIT)
+        .await
+        .unwrap();
+    let (status, body) = client.get("/health").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["node"], id.0.to_string());
+    assert_eq!(body["leader"], env.node.to_string());
+    assert_eq!(body["quorum"], true);
+
+    for c in [&client, &env.admin().await] {
+        let (status, view) = c.get("/cluster").await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        let me = view["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id.0.to_string())
+            .unwrap_or_else(|| panic!("the observer is not listed: {view}"))
+            .clone();
+        assert_eq!(me["role"], "observer", "{view}");
+        assert_eq!(me["voter"], false);
+        assert_eq!(me["name"], "observer");
+        assert_eq!(me["cluster_address"], format!("observer-{id}"));
+        assert_eq!(view["members"][0]["role"], "voter", "{view}");
+    }
+
+    env.router.isolate(id);
+    let anon = Client {
+        token: None,
+        ..client
+    };
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let (status, body) = anon.get("/health").await;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert_eq!(failed(&body), ["quorum"], "{body}");
+            break;
+        }
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(std::time::Instant::now() < deadline, "still ready: {body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    observer.shutdown().await.unwrap();
+}
+
+/// `Orbivisor-Min-Revision`은 다른 노드에서 만든 자격 증명에도 쓰인다: 이 노드가 아직 적용하지 않은 토큰도 그
+/// 리비전을 주면 적용한 뒤 다시 인증해 받는다(관찰 노드는 리더가 돌려준 인덱스로 그 리비전이 있음을 안다). 기다리는
+/// 사이 지운 토큰은 받지 않는다. 이 노드가 있다고 모르는 리비전이면 인증되지 않은 요청은 기다리지 않는다.
+#[tokio::test]
+async fn min_revision_covers_credentials_made_on_another_node() {
+    let env = Env::start().await;
+    let observer = start_observer(&env).await;
+    let client = serve_node(&env, observer.clone()).await;
+    let doomed = env.admin().await.token.unwrap();
+    observer
+        .wait_revision(env.cluster.revision(), WAIT)
+        .await
+        .unwrap();
+    let get = |token: &str, min: Option<u64>| {
+        let mut r = client
+            .http
+            .get(format!("{}/api/v1/volumes", client.base))
+            .bearer_auth(token);
+        if let Some(min) = min {
+            r = r.header("Orbivisor-Min-Revision", min.to_string());
+        }
+        r.send()
+    };
+    assert_eq!(get(&doomed, None).await.unwrap().status(), StatusCode::OK);
+
+    // 관찰 노드가 프레임을 받지 못하는 동안 리더에서 토큰 하나를 만들고 하나를 지운다.
+    env.router.pause_follow(observer.id());
+    let fresh = env.admin().await;
+    let doomed_id = doomed
+        .strip_prefix("opl_")
+        .and_then(|t| t.split('_').next())
+        .unwrap();
+    let (status, body) = fresh.delete(&format!("/tokens/{doomed_id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let fresh = fresh.token.unwrap();
+    let revision = env.cluster.revision();
+    assert_eq!(
+        get(&fresh, None).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(get(&doomed, None).await.unwrap().status(), StatusCode::OK);
+    // 관찰 노드가 그 리비전을 모르면 인증되지 않은 요청은 기다리지 않는다.
+    let started = std::time::Instant::now();
+    let resp = get(&fresh, Some(revision)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // 리스 갱신이 리더의 인덱스를 알려 관찰 노드가 그 리비전이 있음을 안다.
+    let renewal = {
+        let observer = observer.clone();
+        tokio::spawn(async move { observer.renew_lease(WAIT).await })
+    };
+    let deadline = std::time::Instant::now() + WAIT;
+    while observer.known_revision() < revision {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the revision stayed unknown"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(observer.revision() < revision);
+    let resume = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        env.router.heal(observer.id());
+    };
+    let (made, deleted, ()) = tokio::join!(
+        get(&fresh, Some(revision)),
+        get(&doomed, Some(revision)),
+        resume
+    );
+    assert_eq!(made.unwrap().status(), StatusCode::OK);
+    assert_eq!(deleted.unwrap().status(), StatusCode::UNAUTHORIZED);
+    renewal.await.unwrap().unwrap();
+    observer.shutdown().await.unwrap();
 }

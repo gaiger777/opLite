@@ -139,7 +139,7 @@ enum Action {
     },
 }
 
-/// 지금 할 일을 정하고 `seen`을 고친다. `members`는 Raft 멤버십의 노드다. 노드 목록에도 멤버십에도
+/// 지금 할 일을 정하고 `seen`을 고친다. `members`는 Raft 멤버십과 관찰 노드다. 노드 목록에도 멤버십에도
 /// 없는 노드를 제거된 것으로 본다(멤버가 되고 노드를 등록하기 전인 노드는 제거된 것이 아니다).
 fn decide(
     now: Instant,
@@ -332,6 +332,7 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
         .voters
         .keys()
         .chain(members.learners.keys())
+        .chain(members.observers.keys())
         .map(|id| id.0)
         .collect();
     let now = Instant::now();

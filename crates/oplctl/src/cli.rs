@@ -5632,12 +5632,15 @@ fn print_cluster_status(out: &mut (dyn Write + Send), view: &Value) -> anyhow::R
                 cell(&m["name"]),
                 cell(&m["id"]),
                 cell(&m["address"]),
-                if m["voter"] == true {
-                    "voter"
-                } else {
-                    "learner"
-                }
-                .into(),
+                // 옛 서버는 `role`을 보내지 않는다(투표 멤버가 아니면 learner).
+                m["role"]
+                    .as_str()
+                    .unwrap_or(if m["voter"] == true {
+                        "voter"
+                    } else {
+                        "learner"
+                    })
+                    .into(),
                 cell(&m["online"]),
                 (&m["id"] == leader).to_string(),
                 (m["witness"] == true).to_string(),
@@ -8332,6 +8335,46 @@ mod tests {
             old,
         ]);
         assert!(!out.contains("warning"), "{out}");
+    }
+
+    /// ROLE은 서버가 보낸 `role`(관찰 노드 포함)이고, `role`이 없는 옛 서버는 `voter`로 voter·learner를 가린다.
+    #[test]
+    fn cluster_status_shows_observers() {
+        let member = |name: &str, voter: bool, role: Option<&str>| {
+            let mut m = json!({
+                "id": format!("id-{name}"),
+                "name": name,
+                "address": format!("{name}:8006"),
+                "cluster_address": format!("{name}:8007"),
+                "voter": voter,
+                "online": true,
+                "witness": false,
+            });
+            if let Some(role) = role {
+                m["role"] = json!(role);
+            }
+            m
+        };
+        let view = json!({
+            "name": "lab",
+            "ca_fingerprint": "ab:cd",
+            "leader": "id-a",
+            "node": "id-a",
+            "members": [
+                member("a", true, Some("voter")),
+                member("b", true, Some("voter")),
+                member("c", true, Some("voter")),
+                member("l", false, Some("learner")),
+                member("o", false, Some("observer")),
+                member("x", false, None),
+            ],
+        });
+        let mut out = Vec::new();
+        print_cluster_status(&mut out, &view).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("o     id-o  o:8006   observer  true"), "{out}");
+        assert!(out.contains("l     id-l  l:8006   learner   true"), "{out}");
+        assert!(out.contains("x     id-x  x:8006   learner   true"), "{out}");
     }
 
     /// 버전을 아는 멤버의 버전이 둘 이상이면 낮은 것부터 한 번씩 적어 경고한다. 모르는 멤버는 세지 않는다.

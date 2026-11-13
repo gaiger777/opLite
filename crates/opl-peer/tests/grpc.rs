@@ -5,9 +5,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use openraft::{BasicNode, ServerState};
+use futures_util::StreamExt;
+use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+use openraft::raft::VoteRequest;
+use openraft::{BasicNode, ServerState, Vote};
 use opl_cluster::types::{LeaderRequest, NodeId};
-use opl_cluster::{Cluster, ClusterConfig};
+use opl_cluster::{Cluster, ClusterConfig, FollowClient, FollowFrame, NodeRole};
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, api_cert, node_key_and_csr};
 use opl_peer::{
@@ -17,6 +20,7 @@ use opl_peer::{
     renew_liveness,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
+use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
@@ -1320,4 +1324,266 @@ async fn metrics_are_read_from_a_member() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
     assert_eq!(metrics.queries.lock().unwrap().len(), 1);
+}
+
+/// 리더가 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`)을 `observers`(id, 클러스터 주소)로 바꾼다(없으면
+/// 정보를 만든다).
+async fn set_observers(leader: &Node, observers: &[(NodeId, String)]) {
+    let status = ClusterStatus {
+        observers: observers
+            .iter()
+            .map(|(id, addr)| (id.0, addr.clone()))
+            .collect(),
+    };
+    match leader.cluster.list::<ClusterSpec>().unwrap().1.first() {
+        Some(info) => {
+            leader
+                .cluster
+                .update_status::<ClusterSpec>(info.id, &status)
+                .await
+                .unwrap();
+        }
+        None => {
+            let mut info: ClusterInfo = Resource::new(
+                "test",
+                ClusterSpec {
+                    ca_cert_pem: String::new(),
+                    ca_key_pem: String::new(),
+                },
+            );
+            info.status = status;
+            leader.cluster.create(&info).await.unwrap();
+        }
+    }
+}
+
+/// 관찰 노드를 띄운다. 실제 길처럼 learner로 가입해 따라잡은 뒤 관찰 노드 목록에 적히고 멤버십에서 빠진다. 같은
+/// 저장소로 관찰 노드로 다시 열려 gRPC Follow로 투표 멤버를 따르고, 쓰기는 gRPC로 리더에 전달한다.
+async fn start_observer(ca: &ClusterCa, root: &TempDir, leader: &Node) -> Node {
+    let mut learner = Node::start(ca, root).await;
+    let id = learner.id();
+    let joined = leader
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id,
+            addr: learner.addr.clone(),
+        })
+        .await
+        .unwrap();
+    // `AddLearner`는 learner가 받기를 기다리지 않는다. 자기를 더한 멤버십까지 적용하기 전에 멈추면 관찰 노드의
+    // 저장소에 따를 투표 멤버가 없다(느린 CI에서 그랬다).
+    learner.cluster.wait_revision(joined, WAIT).await.unwrap();
+    learner.stop().await;
+    drop(learner);
+
+    let tls = tls_for(ca, id);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    // 목록에 적은 뒤 멤버십에서 뺀다(그 사이에도 거절되지 않게).
+    set_observers(leader, &[(id, addr.clone())]).await;
+    leader
+        .cluster
+        .request(LeaderRequest::Remove { id })
+        .await
+        .unwrap();
+
+    let peers = Arc::new(Peers::new(&tls));
+    let mut config = ClusterConfig::new(id, root.path().join(id.to_string()));
+    config.write_timeout = WAIT;
+    // learner의 저장소 작업이 아직 파일을 쥐고 있으면 잠시 뒤 다시 연다.
+    let deadline = Instant::now() + WAIT;
+    let cluster = loop {
+        match Cluster::open_observer(config.clone(), peers.clone()).await {
+            Err(opl_cluster::ClusterError::Store(_)) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => break other.unwrap(),
+        }
+    };
+    let cluster = Arc::new(cluster.with_forwarder(peers.clone()));
+    let hv = Arc::new(MockHypervisor::default());
+    let service = PeerService::new(cluster.clone(), Some(hv.clone() as Arc<dyn Hypervisor>));
+    let (stop, rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        opl_peer::serve(listener, &tls, service, async {
+            let _ = rx.await;
+        })
+        .await
+        .unwrap();
+    });
+    Node {
+        addr,
+        cluster,
+        peers,
+        hv,
+        state_dir: root.path().join(format!("{id}-state")),
+        stop: Some(stop),
+        server: Some(server),
+    }
+}
+
+async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 관찰 노드는 mTLS gRPC Follow로 투표 멤버의 상태를 받아 읽기에 답하고, 쓰기는 리더로 전달해 자기 쓰기를 바로 읽는다.
+#[tokio::test]
+async fn an_observer_follows_a_voter_over_grpc() {
+    let (ca, root, nodes) = start(1).await;
+    let before = volume("before");
+    nodes[0].cluster.create(&before).await.unwrap();
+    let observer = start_observer(&ca, &root, &nodes[0]).await;
+    let o = &observer.cluster;
+    assert!(o.raft().is_none());
+    o.wait_revision(nodes[0].cluster.revision(), WAIT)
+        .await
+        .unwrap();
+    assert!(o.get::<VolumeSpec>(before.id).unwrap().is_some());
+
+    let after = volume("after");
+    let revision = nodes[0].cluster.create(&after).await.unwrap();
+    o.wait_revision(revision, WAIT).await.unwrap();
+    assert!(o.get::<VolumeSpec>(after.id).unwrap().is_some());
+
+    let mine = volume("mine");
+    let revision = o.create(&mine).await.unwrap();
+    assert!(o.revision() >= revision);
+    assert!(o.get::<VolumeSpec>(mine.id).unwrap().is_some());
+    assert!(
+        nodes[0]
+            .cluster
+            .get::<VolumeSpec>(mine.id)
+            .unwrap()
+            .is_some()
+    );
+    o.renew_lease(WAIT).await.unwrap();
+    wait_for("the observer knows the leader", || o.health().quorum).await;
+    assert_eq!(o.members().leader, Some(nodes[0].id()));
+    // 관찰 노드끼리도, 투표 멤버도 관찰 노드를 클러스터 노드로 안다(주소 찾기).
+    wait_for("the leader lists the observer", || {
+        nodes[0].cluster.members().addr(observer.id()) == Some(observer.addr.as_str())
+    })
+    .await;
+    assert_eq!(
+        o.members().addr(observer.id()),
+        Some(observer.addr.as_str())
+    );
+}
+
+/// 관찰 노드 목록에 든 노드는 피어로 받고, 목록에서도 빠진 노드는 거절한다. 관찰 노드는 Raft RPC를 받지 않고,
+/// 관찰 노드에 건 Follow는 `Hello`만 오고 닫힌다.
+#[tokio::test]
+async fn observers_are_peers_but_not_raft_members() {
+    let (ca, root, nodes) = start(1).await;
+    let observer = start_observer(&ca, &root, &nodes[0]).await;
+    let leader_addr = nodes[0].addr.clone();
+    assert_eq!(
+        observer.peers.ping(&leader_addr, WAIT).await.unwrap(),
+        nodes[0].id()
+    );
+    assert_eq!(
+        nodes[0].peers.ping(&observer.addr, WAIT).await.unwrap(),
+        observer.id()
+    );
+
+    // 관찰 노드에 온 Raft RPC
+    let mut raft = GrpcNetwork::new(nodes[0].peers.clone())
+        .new_client(observer.id(), &BasicNode::new(&observer.addr))
+        .await;
+    let err = raft
+        .vote(
+            VoteRequest::new(Vote::new(1, nodes[0].id()), None),
+            RPCOption::new(WAIT),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not a Raft member"), "{err}");
+
+    // 관찰 노드에 건 Follow: 부른 쪽(투표 멤버)의 역할만 알리고 닫는다.
+    let frames: Vec<FollowFrame> =
+        FollowClient::follow(nodes[0].peers.as_ref(), observer.id(), &observer.addr, 0)
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+            .await;
+    assert!(
+        matches!(
+            frames.as_slice(),
+            [FollowFrame::Hello {
+                role: NodeRole::Voter,
+                ..
+            }]
+        ),
+        "{frames:?}"
+    );
+
+    // 목록에서 빼면(지운 노드) 거절한다.
+    set_observers(&nodes[0], &[]).await;
+    wait_for("the observer is unlisted", || {
+        !nodes[0].cluster.members().contains(observer.id())
+    })
+    .await;
+    let err = observer.peers.ping(&leader_addr, WAIT).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err}");
+    let err =
+        match FollowClient::follow(observer.peers.as_ref(), nodes[0].id(), &leader_addr, 0).await {
+            Ok(_) => panic!("a removed node may follow"),
+            Err(e) => e,
+        };
+    assert!(err.to_string().contains("not a member"), "{err}");
+}
+
+/// 열린 Follow 스트림도 다시 허가한다: 관찰 노드 목록과 멤버십 모두에서 빠진 노드(지운 노드)의 스트림은 끊긴다(그
+/// 뒤의 쓰기, CA 키 같은 비밀을 받지 못한다). 목록 캐시가 갱신되기를 기다리지 않고 곧바로 써도, 목록에서 빼는 묶음부터
+/// 받지 못한다.
+#[tokio::test]
+async fn a_removed_observer_stops_receiving_the_feed() {
+    let (ca, root, nodes) = start(1).await;
+    let observer = start_observer(&ca, &root, &nodes[0]).await;
+    let mut frames = FollowClient::follow(
+        observer.peers.as_ref(),
+        nodes[0].id(),
+        &nodes[0].addr,
+        nodes[0].cluster.revision(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        frames.next().await,
+        Some(Ok(FollowFrame::Hello { .. }))
+    ));
+    assert!(matches!(
+        tokio::time::timeout(WAIT, frames.next()).await.unwrap(),
+        Some(Ok(FollowFrame::Progress { .. }))
+    ));
+
+    set_observers(&nodes[0], &[]).await;
+    // 목록에서 뺀 쓰기와 그 뒤에 쓴 것은 받지 못하고 스트림이 끝난다.
+    let secret = volume("after-removal");
+    nodes[0].cluster.create(&secret).await.unwrap();
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), frames.collect::<Vec<_>>())
+        .await
+        .expect("the stream of a removed observer was not closed");
+    for frame in rest.into_iter().flatten() {
+        assert!(
+            frame
+                .observers()
+                .is_none_or(|o| o.contains_key(&observer.id())),
+            "a removed observer received its removal: {frame:?}"
+        );
+        if let FollowFrame::Batch { events, .. } = frame {
+            assert!(
+                events.iter().all(|e| !matches!(
+                    e,
+                    opl_cluster::watch::WatchEvent::Put { resource, .. } if resource.id == secret.id
+                )),
+                "a removed observer received a later write"
+            );
+        }
+    }
 }

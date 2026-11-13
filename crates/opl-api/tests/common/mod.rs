@@ -52,6 +52,8 @@ pub struct Env {
     pub dir: TempDir,
     /// API 서버의 상태. 예약 작업처럼 상태를 받는 반복 작업을 띄울 때 쓴다.
     pub state: Arc<AppState>,
+    /// 클러스터의 시험망. 노드(관찰 노드 등)를 더할 때 쓴다.
+    pub router: MemRouter,
     reconciler: Option<Reconciler>,
     runner: Option<TaskRunner>,
     server: tokio::task::JoinHandle<()>,
@@ -230,6 +232,7 @@ impl Env {
             base,
             dir,
             state,
+            router,
             reconciler: Some(reconciler),
             runner: Some(runner),
             server,

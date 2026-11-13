@@ -140,6 +140,11 @@ pub async fn get_health(
     principal: Result<Principal, ApiError>,
     Query(q): Query<HealthQuery>,
 ) -> Result<(StatusCode, Json<Health>), ApiError> {
+    // `Orbivisor-Min-Revision`의 오류(400·503)는 짧은 응답으로 바꾸지 않고 그대로 돌려준다.
+    let principal = match principal {
+        Err(e) if crate::revision::rejected(&e) => return Err(e),
+        principal => principal,
+    };
     let live = q.live.is_some() && q.ready.is_none();
     let mut health = check(&state, live)?;
     if principal.is_err() {

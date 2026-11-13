@@ -3,6 +3,7 @@
 use openraft::error::{InstallSnapshotError, RaftError};
 use opl_cluster::LeaderError;
 use opl_cluster::types::{NodeId, TypeConfig};
+use serde::{Deserialize, Serialize};
 
 use crate::migration::{IncomingError, MigrateIncomingResponse};
 
@@ -23,3 +24,9 @@ pub type Empty = ();
 pub type MigrateIncomingReply = Result<MigrateIncomingResponse, IncomingError>;
 /// 받기 확인·취소의 결과
 pub type IncomingReply = Result<(), IncomingError>;
+
+/// 관찰 노드가 투표 멤버에 거는 Follow. `since` 뒤의 상태를 받는다(`opl_cluster::FollowFrame` 스트림).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowRequest {
+    pub since: u64,
+}

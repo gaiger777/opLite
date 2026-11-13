@@ -5,9 +5,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use openraft::Raft;
-use opl_cluster::Cluster;
 use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
+use opl_cluster::{Cluster, FollowFrame, FollowGate};
 use opl_driver::{DriverError, Hypervisor, uefi_vars_path};
 use opl_types::audit::AuditQuery;
 use opl_types::metrics::MetricsQuery;
@@ -27,13 +29,14 @@ use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationRecei
 use crate::pki::{NodeTls, node_id_of};
 use crate::proto::peer_server::{Peer, PeerServer};
 use crate::wire::{
-    AppendEntriesReply, AppendEntriesRequest, IncomingReply, InstallSnapshotReply,
+    AppendEntriesReply, AppendEntriesRequest, FollowRequest, IncomingReply, InstallSnapshotReply,
     InstallSnapshotRequest, LeaderReply, MigrateIncomingReply, VoteReply, VoteRequest,
 };
 use crate::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, VM_METADATA};
 
-/// 다른 노드가 부르는 서비스. 상대 인증서의 노드 id가 이 노드가 아는 멤버여야 한다. 아직 멤버십을
-/// 받지 못한 노드(막 합류하는 중)는 클러스터 CA가 서명한 인증서면 받는다.
+/// 다른 노드가 부르는 서비스. 상대 인증서의 노드 id가 이 노드가 아는 멤버(투표 멤버·learner·관찰 노드)여야
+/// 한다. 아직 멤버십을 받지 못한 노드(막 합류하는 중)는 클러스터 CA가 서명한 인증서면 받는다. 관찰 노드는
+/// Raft RPC를 받지 않는다(`failed_precondition`).
 pub struct PeerService {
     cluster: Arc<Cluster>,
     hv: Option<Arc<dyn Hypervisor>>,
@@ -131,7 +134,8 @@ impl PeerService {
             .ok_or_else(|| Status::failed_precondition("this node is not a Raft member"))
     }
 
-    fn authorize<T>(&self, req: &Request<T>) -> Result<(), Status> {
+    /// 부른 노드의 id. 클러스터에서 빠진 노드는 `permission_denied`다.
+    fn authorize<T>(&self, req: &Request<T>) -> Result<NodeId, Status> {
         let certs = req
             .peer_certs()
             .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
@@ -142,7 +146,7 @@ impl PeerService {
         let members = self.cluster.members();
         let uninitialized = members.voters.is_empty() && members.learners.is_empty();
         if uninitialized || members.contains(NodeId(id)) {
-            Ok(())
+            Ok(NodeId(id))
         } else {
             Err(Status::permission_denied(format!(
                 "node {id} is not a member of this cluster"
@@ -293,6 +297,32 @@ impl Peer for PeerService {
             })
             .await??;
         Ok(Response::new(stream))
+    }
+
+    type FollowStream = BoxStream<'static, Result<FollowFrame, Status>>;
+
+    /// 관찰 노드에 이 노드의 상태를 스트림으로 보낸다. 리스 갱신처럼 Raft 쪽 일이라 `work`로 넘기지 않는다.
+    async fn follow(
+        &self,
+        req: Request<FollowRequest>,
+    ) -> Result<Response<Self::FollowStream>, Status> {
+        let caller = self.authorize(&req)?;
+        let frames = self
+            .cluster
+            .follow(caller, req.into_inner().since)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        // 열린 스트림도 프레임마다 다시 허가한다: 지운 노드(멤버십과 관찰 노드 목록 모두에서 빠짐)는 그 뒤의 쓰기를
+        // 받지 못하고 스트림이 끝난다(목록에서 빼는 프레임부터, `FollowGate`).
+        let cluster = Arc::downgrade(&self.cluster);
+        let mut gate = FollowGate::new(caller);
+        let frames = frames.take_while(move |frame| {
+            let admitted = cluster.upgrade().is_some_and(|c| gate.admits(&c, frame));
+            if !admitted {
+                tracing::info!(%caller, "closing the follow stream of a node removed from the cluster");
+            }
+            std::future::ready(admitted)
+        });
+        Ok(Response::new(frames.map(Ok).boxed()))
     }
 
     type ConsoleStream = ReceiverStream<Result<Bytes, Status>>;

@@ -1271,6 +1271,7 @@ mod tests {
             leader: Some(id(1)),
             voters: voters.iter().map(|n| (id(*n), String::new())).collect(),
             learners: learners.iter().map(|n| (id(*n), String::new())).collect(),
+            observers: Default::default(),
         };
         let limit = opl_cluster::VOTER_LIMIT;
         let ok = || node(1, &[limit], Some("0.3.0"));

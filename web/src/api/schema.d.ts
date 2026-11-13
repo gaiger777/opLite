@@ -374,7 +374,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 클러스터 이름, CA 지문, 멤버(이 노드가 아는 Raft 멤버십) */
+        /** 클러스터 이름, CA 지문, 멤버(이 노드가 아는 Raft 멤버십과 관찰 노드) */
         get: operations["get_cluster"];
         put?: never;
         post?: never;
@@ -2364,7 +2364,10 @@ export interface components {
             /** @description 새 노드의 인증서(PEM) */
             cert_pem: string;
             cluster: string;
-            /** @description 이 노드의 노드 간 통신 주소. 새 노드는 여기로 승격을 요청한다. */
+            /**
+             * @description 투표 멤버의 노드 간 통신 주소(이 노드가 투표 멤버면 이 노드, 아니면 리더나 다른 투표 멤버). 새 노드는
+             *     여기로 승격을 요청한다.
+             */
             via: string;
         };
         JoinTokenRequest: {
@@ -3113,6 +3116,11 @@ export interface components {
         MacAddr: string;
         /** @enum {string} */
         MachineType: "q35" | "virt";
+        /**
+         * @description 노드가 클러스터에 무엇으로 참여하는지
+         * @enum {string}
+         */
+        MemberRole: "voter" | "learner" | "observer";
         /** @description 클러스터 멤버 한 노드 */
         MemberView: {
             /** @description API 주소 */
@@ -3125,9 +3133,10 @@ export interface components {
             /** @description Node 리소스 이름. 아직 없으면(합류 중) 비어 있다. */
             name?: string | null;
             online: boolean;
+            role: components["schemas"]["MemberRole"];
             /** @description 노드의 orbivisord 빌드 버전. 옛 버전 노드이거나 Node가 아직 없으면 null이다. */
             version?: string | null;
-            /** @description 투표 멤버인지(아니면 learner) */
+            /** @description 투표 멤버인지(`role`이 `voter`) */
             voter: boolean;
             /** @description 위트니스 노드인지(VM을 돌리지 않는 투표 멤버) */
             witness: boolean;

@@ -18,7 +18,7 @@ pub mod watch;
 mod writer;
 
 pub use cluster::{Cluster, ClusterConfig, ClusterError, DB_FILE, Members, Typed};
-pub use follow::{FollowClient, FollowFrame, NodeRole, PROGRESS_INTERVAL};
+pub use follow::{FollowClient, FollowFrame, FollowGate, NodeRole, PROGRESS_INTERVAL};
 pub use health::{QUORUM_ACK_MAX, RaftHealth};
 pub use leader::{CATCH_UP_TIMEOUT, Forwarder, LeaderError};
 pub use lease::Leases;
