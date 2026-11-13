@@ -2,11 +2,13 @@
 //! 이어지고, 죽은 노드를 빼고, 노드가 떠났다가 다시 합류한다. QEMU는 쓰지 않는다.
 //! 계획 22: 일반 노드 둘과 위트니스로 만든 클러스터는 리더를 잃어도 남은 일반 노드가 리더가 된다.
 //! 위트니스는 다시 시작해도 위트니스이고, 위트니스만 남기는 탈퇴는 거부한다.
+//! 계획 49: 우선 링크가 죽은 노드들도 둘째 링크로 클러스터를 이루고, 링크를 더해 다시 시작하면 인증서와
+//! 멤버십이 따라온다.
 
 mod common;
 
 use common::{Daemon, eventually};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// `oplctl cluster status`의 멤버
 async fn members(d: &Daemon) -> Vec<Value> {
@@ -504,4 +506,134 @@ async fn the_built_in_web_ui_can_be_turned_off() {
     assert_eq!(root_page(&off, &ca).await, (404, false));
     assert_eq!(health(&off, "").await.0, 200);
     off.stop();
+}
+
+/// 우선 링크 127.0.0.2는 아무도 듣지 않는다(Mac에서는 응답 없이 시간 초과, Linux에서는 거절). 노드 간 서버는
+/// 127.0.0.1에서만 들으므로 모든 노드 사이 통신이 둘째 링크로 넘어가야 한다.
+const DEAD_FIRST_LINK: &str = "cluster_addresses = [\"127.0.0.2\", \"127.0.0.1\"]";
+
+/// `DEAD_FIRST_LINK` 설정의 노드 간 링크(앞이 우선)
+fn links(d: &Daemon) -> Vec<String> {
+    vec![
+        format!("127.0.0.2:{}", d.cluster_port),
+        format!("127.0.0.1:{}", d.cluster_port),
+    ]
+}
+
+/// 노드 인증서의 이름
+fn node_cert_names(d: &Daemon) -> Vec<String> {
+    let pem = std::fs::read_to_string(d.data_dir().join("pki").join("node.crt")).unwrap();
+    opl_peer::pki::cert_names(&pem).unwrap()
+}
+
+/// 계획 49: 세 노드가 우선 링크가 죽은 채로 클러스터를 이루고(합류·승격·쓰기 전달), 리더를 kill -9 해도
+/// 남은 둘이 둘째 링크로 새 리더를 뽑아 쓰기를 잇는다. 멤버마다 모든 링크가 보이고 인증서에 모든 링크 이름이 있다.
+#[tokio::test]
+async fn nodes_whose_first_link_is_dead_form_a_cluster_over_the_second() {
+    let mut nodes = vec![
+        Daemon::new("node1", DEAD_FIRST_LINK),
+        Daemon::new("node2", DEAD_FIRST_LINK),
+        Daemon::new("node3", DEAD_FIRST_LINK),
+    ];
+    for d in &mut nodes {
+        d.start().await;
+    }
+    nodes[0].init("prod").await;
+    let password = nodes[0].admin_password.clone().unwrap();
+    let fp = nodes[0].ca_fingerprint.clone().unwrap();
+    nodes[0].login().await;
+    for i in 1..3 {
+        let url = nodes[0].ctl(&["cluster", "join-token"]).await.unwrap();
+        nodes[i].join(url.trim()).await.unwrap();
+        nodes[i].login_with(&password, &fp).await;
+    }
+    wait_voters(&nodes[0], 3).await;
+    eventually("all nodes online", || async {
+        members(&nodes[0]).await.iter().all(|m| m["online"] == true)
+    })
+    .await;
+    let view = members(&nodes[0]).await;
+    for d in &nodes {
+        let m = view
+            .iter()
+            .find(|m| m["name"] == d.name.as_str())
+            .unwrap_or_else(|| panic!("{} is not listed: {view:?}", d.name));
+        assert_eq!(m["cluster_address"], links(d)[0], "{m}");
+        assert_eq!(m["cluster_addresses"], json!(links(d)), "{m}");
+        assert!(
+            node_cert_names(d).iter().any(|n| n == "127.0.0.2"),
+            "{}: {:?}",
+            d.name,
+            node_cert_names(d)
+        );
+    }
+
+    // 팔로워로 쓰면 리더로 전달된다.
+    for (i, d) in nodes.iter().enumerate() {
+        let pool = d.path("pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        d.ctl(&[
+            "pool",
+            "create",
+            &format!("pool{i}"),
+            "--path",
+            pool.to_str().unwrap(),
+        ])
+        .await
+        .unwrap();
+    }
+
+    let leader = leader_name(&nodes[0]).await.unwrap();
+    let dead = nodes.iter().position(|d| d.name == leader).unwrap();
+    nodes[dead].kill();
+    let alive: Vec<usize> = (0..3).filter(|i| *i != dead).collect();
+    let (a, b) = (alive[0], alive[1]);
+    eventually("a new leader", || async {
+        leader_name(&nodes[a])
+            .await
+            .is_some_and(|name| name != leader)
+    })
+    .await;
+    let pool = nodes[a].path("pool-after");
+    std::fs::create_dir_all(&pool).unwrap();
+    nodes[a]
+        .ctl(&["pool", "create", "after", "--path", pool.to_str().unwrap()])
+        .await
+        .unwrap();
+    eventually("node b sees the pool", || async {
+        nodes[b].ctl(&["pool", "get", "after"]).await.is_ok()
+    })
+    .await;
+
+    nodes[a].stop();
+    nodes[b].stop();
+}
+
+/// 계획 49: 링크 하나로 만든 노드에 `cluster_addresses`를 더해 다시 시작하면 같은 키로 인증서를 다시 받고, 리더가
+/// 멤버십의 링크를 노드가 적은 목록으로 고친다.
+#[tokio::test]
+async fn adding_links_and_restarting_updates_the_certificate_and_the_membership() {
+    let mut d = Daemon::new("node1", "");
+    d.start().await;
+    d.init("prod").await;
+    d.login().await;
+    assert!(!node_cert_names(&d).iter().any(|n| n == "127.0.0.2"));
+    let key = std::fs::read_to_string(d.data_dir().join("pki").join("node.key")).unwrap();
+    let single = vec![format!("127.0.0.1:{}", d.cluster_port)];
+    assert_eq!(members(&d).await[0]["cluster_addresses"], json!(single));
+    d.stop();
+
+    let config = std::fs::read_to_string(d.path("opld.toml")).unwrap();
+    std::fs::write(d.path("opld.toml"), format!("{DEAD_FIRST_LINK}\n{config}")).unwrap();
+    d.start().await;
+    assert!(node_cert_names(&d).iter().any(|n| n == "127.0.0.2"));
+    assert_eq!(
+        std::fs::read_to_string(d.data_dir().join("pki").join("node.key")).unwrap(),
+        key
+    );
+    eventually("the membership has both links", || async {
+        members(&d).await[0]["cluster_addresses"] == json!(links(&d))
+    })
+    .await;
+    d.stop();
 }

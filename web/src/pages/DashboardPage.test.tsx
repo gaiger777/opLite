@@ -55,7 +55,13 @@ const cluster = (leader: string | null, members: { id: string; name?: string | n
       ca_fingerprint: "x",
       leader,
       node: "n1",
-      members: members.map((m) => ({ cluster_address: "a", online: true, voter: true, ...m })),
+      members: members.map((m) => ({
+        cluster_address: "a",
+        cluster_addresses: ["a"],
+        online: true,
+        voter: true,
+        ...m,
+      })),
     }),
   );
 

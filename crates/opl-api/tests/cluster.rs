@@ -536,6 +536,17 @@ async fn a_node_joins_with_several_links() {
     let members = env.cluster.members();
     assert_eq!(members.addr(NodeId(node)), Some("10.0.0.7:8007"));
     assert_eq!(members.links[&NodeId(node)], links);
+    let (status, view) = env.admin().await.get("/cluster").await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let me = view["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == node.to_string())
+        .unwrap_or_else(|| panic!("the node is not listed: {view}"))
+        .clone();
+    assert_eq!(me["cluster_address"], "10.0.0.7:8007");
+    assert_eq!(me["cluster_addresses"], json!(links));
 
     // 첫 링크는 그대로, 둘째 링크만 바꿔 다시 합류한다. 등록 전의 자기 기록(기능 없음)은 세지 않는다.
     mark_offline(&env, node).await;

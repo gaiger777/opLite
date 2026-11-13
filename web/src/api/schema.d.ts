@@ -3135,8 +3135,10 @@ export interface components {
         MemberView: {
             /** @description API 주소 */
             address?: string | null;
-            /** @description 노드 간 통신 주소 */
+            /** @description 노드 간 통신 주소(우선 링크) */
             cluster_address: string;
+            /** @description 노드 간 통신 링크 모두(앞이 우선, 첫 것이 `cluster_address`) */
+            cluster_addresses: string[];
             fencing?: components["schemas"]["Fencing"] | null;
             /** Format: uuid */
             id: string;

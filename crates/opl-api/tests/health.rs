@@ -471,6 +471,7 @@ async fn an_observer_is_ready_while_it_follows_a_voter() {
         assert_eq!(me["voter"], false);
         assert_eq!(me["name"], "observer");
         assert_eq!(me["cluster_address"], format!("observer-{id}"));
+        assert_eq!(me["cluster_addresses"], json!([format!("observer-{id}")]));
         assert_eq!(view["members"][0]["role"], "voter", "{view}");
     }
 

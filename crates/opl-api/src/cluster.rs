@@ -146,8 +146,10 @@ pub struct MemberView {
     pub name: Option<String>,
     /// API 주소
     pub address: Option<String>,
-    /// 노드 간 통신 주소
+    /// 노드 간 통신 주소(우선 링크)
     pub cluster_address: String,
+    /// 노드 간 통신 링크 모두(앞이 우선, 첫 것이 `cluster_address`)
+    pub cluster_addresses: Vec<String>,
     /// 투표 멤버인지(`role`이 `voter`)
     pub voter: bool,
     pub role: MemberRole,
@@ -189,6 +191,11 @@ pub async fn get_cluster(
             name: node.map(|n| n.name.clone()),
             address: node.map(|n| n.spec.address.clone()),
             cluster_address: addr.clone(),
+            cluster_addresses: members
+                .links
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| vec![addr.clone()]),
             voter: role == MemberRole::Voter,
             role,
             online: node.is_some_and(|n| n.status.online),

@@ -2027,3 +2027,30 @@ async fn a_silent_link_times_out_and_the_preferred_link_comes_back() {
     let _ = stop.send(());
     revived.await.unwrap();
 }
+
+/// 연결에 답하지 않는 우선 링크(127.0.0.2: Mac에서는 SYN에 답이 없고 Linux에서는 거절)로 전달한 쓰기는 연결 제한
+/// 시간이 전달자의 시도 제한 시간(3초)보다 짧아 연결 실패로 끝나고, 같은 시도 안에서 둘째 링크로 다시 가 성공한다.
+/// 쓰기처럼 연결 실패만 세는 요청밖에 보내지 않는 노드(막 합류해 등록하는 노드)도 넘어간다.
+#[tokio::test]
+async fn a_forwarded_write_fails_over_from_a_link_that_never_connects() {
+    let (ca, _root, nodes) = start(1).await;
+    let (id, server) = (nodes[0].id(), nodes[0].addr.clone());
+    let port = closed_port().await.rsplit_once(':').unwrap().1.to_string();
+    let first = format!("127.0.0.2:{port}");
+    let book = Arc::new(opl_cluster::LinkBook::default());
+    book.replace([&OrbNode::new([first.clone(), server.clone()])]);
+    let peers = Peers::new(&tls_for(&ca, id));
+    peers.set_link_book(book);
+
+    let remove = LeaderRequest::Remove {
+        id: NodeId(Uuid::now_v7()),
+    };
+    let attempt =
+        tokio::time::timeout(Duration::from_secs(3), peers.leader_request(&first, remove)).await;
+    assert!(matches!(attempt, Ok(Ok(_))), "{attempt:?}");
+    assert_eq!(peers.active_link(&first), server);
+    peers
+        .leader_request(&first, LeaderRequest::RenewLease { node: id })
+        .await
+        .unwrap();
+}

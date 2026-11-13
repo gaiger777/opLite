@@ -135,7 +135,15 @@ export function ClusterPage() {
                 </TableCell>
                 <TableCell>{m.fencing ? t(`nodes.fencingMode.${m.fencing}`) : "—"}</TableCell>
                 <TableCell className="font-mono text-xs">{m.address ?? "—"}</TableCell>
-                <TableCell className="font-mono text-xs">{m.cluster_address}</TableCell>
+                <TableCell className="font-mono text-xs">
+                  {m.cluster_address}
+                  {/* 둘째 링크부터(넘어갈 링크)는 우선 링크 아래 작게 */}
+                  {m.cluster_addresses.slice(1).map((link) => (
+                    <div key={link} className="text-muted-foreground">
+                      {link}
+                    </div>
+                  ))}
+                </TableCell>
               </TableRow>
             ))}
           </TableBody>

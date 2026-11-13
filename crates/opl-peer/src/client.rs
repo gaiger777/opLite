@@ -44,8 +44,10 @@ use crate::{
     KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, TARGET_METADATA, VM_METADATA,
 };
 
-/// 연결을 맺기까지 기다리는 최대 시간
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 연결을 맺기까지 기다리는 최대 시간. 전달자가 쓰기 한 번을 기다리는 시간(`opl_cluster`의 3초)보다 짧아야
+/// 답 없는 링크로 보낸 쓰기가 버려지기 전에 연결 실패로 끝나, 같은 시도 안에서 다음 링크로 다시 간다(쓰기는 연결
+/// 실패만 센다).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 리더 요청 하나를 기다리는 최대 시간. 리더가 AddVoter에서 새 노드를 따라잡게 기다리는 시간
 /// (`opl_cluster::CATCH_UP_TIMEOUT`, 60초)에 쓰기 시간을 더한 것보다 길어야 한다.

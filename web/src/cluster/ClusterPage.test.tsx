@@ -11,6 +11,7 @@ const member = (id: string, name: string | null, extra = {}) => ({
   name,
   address: `${name}:8006`,
   cluster_address: `${name}:8007`,
+  cluster_addresses: [`${name}:8007`],
   voter: true,
   role: "voter",
   online: true,
@@ -27,7 +28,10 @@ beforeEach(() =>
         leader: "n1",
         node: "n2",
         members: [
-          member("n1", "node-a", { fencing: "watchdog" }),
+          member("n1", "node-a", {
+            fencing: "watchdog",
+            cluster_addresses: ["node-a:8007", "10.1.0.11:8007"],
+          }),
           member("n2", "node-b", { fencing: null }),
           member("n3", null, { voter: false, role: "learner", online: false, address: null }),
           member("n4", "witness-w", { witness: true }),
@@ -78,6 +82,14 @@ it("shows the CA and the members", async () => {
   expect(fencing("node-a")).toHaveTextContent("Watchdog");
   expect(fencing("node-b")).toHaveTextContent("—");
   expect(fencing("witness-w")).toHaveTextContent("—");
+  // 클러스터 주소는 우선 링크이고 둘째 링크부터 그 아래 보인다.
+  const links = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Cluster address");
+  const linksOf = (name: string) =>
+    within(within(table).getByText(name).closest("tr")!).getAllByRole("cell")[links];
+  expect(linksOf("node-a")).toHaveTextContent("node-a:800710.1.0.11:8007");
+  expect(linksOf("node-b")).toHaveTextContent(/^node-b:8007$/);
   expect(screen.queryByRole("button", { name: "Issue a join token" })).not.toBeInTheDocument();
 });
 

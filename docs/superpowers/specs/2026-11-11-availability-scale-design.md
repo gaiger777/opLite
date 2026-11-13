@@ -1010,3 +1010,173 @@ VM에서 손으로 확인하고 결과를 적는다.
   관찰 노드인 채 투표 멤버가 될 수 있다(키퍼가 목록에서 빼면 다시 멤버가 된다 — 그동안 투표 멤버 하나가 응답하지
   않는다).
 - 리스 갱신을 투표 멤버가 묶어 리더에 전달하기, 처음부터 관찰 노드로 가입하기, 대기 learner 수를 설정으로 두기.
+
+## 16. 구현(계획 49)
+
+다섯 단계를 커밋 다섯으로 했다(1 `OrbNode`와 TypeConfig, 2 링크 고르기와 넘어가기, 3 노드 설정·인증서·합류, 4 링크
+맞추기와 `multi-link`, 5 API·웹·실제 프로세스 시험·문서). 설계 §7과 다르거나 설계가 정하지 않아 정한 것을 적는다.
+
+**노드 타입(`OrbNode`).**
+- `OrbNode { addrs: Vec<String> }`(각 항목 `host:port`, 앞이 우선)이고 serde는 손으로 썼다: 늘 `addr`(= `addrs[0]`)를
+  쓰고 링크가 둘 이상일 때만 `addrs`를 더 쓴다. 링크 하나면 `BasicNode`와 바이트까지 같아 이미 쓴 로그·스냅샷과 옛
+  노드가 그대로다. openraft 0.9.25의 `BasicNode`는 `deny_unknown_fields`가 없어 옛 노드는 여러 링크 항목을 첫 링크
+  하나로 읽는다. 읽을 때는 `addrs`가 있고 비지 않으면 그것, 아니면 `[addr]`(빈 `addr`이고 `addrs`도 없으면 링크 없는
+  `default()`). 계획 48 형식으로 쓴 멤버십 로그 항목·`StoredMembership`·스냅샷 메타의 고정 JSON을 읽는 시험이 있다.
+- `OrbNode::addr()`(첫 링크)가 이 계획 전의 "그 노드의 주소"다. 주소 문자열을 받는 기존 API(`Members`의 값,
+  `NotLeader.leader_addr`, `Forwarder`, `FollowClient`, `Peers`의 `addr: &str`, `ClusterStatus.observers`의 값)는 바꾸지
+  않고 첫 링크를 노드의 열쇠로 쓴다. 링크 목록은 `Members.links`와 링크 책이 따로 싣는다.
+- 설계는 "`multi-link` 기능으로 가린다"였다. 노드 타입 자체는 가리지 않고(링크 하나면 형식이 같으므로) 여러 링크를
+  멤버십에 넣는 일(링크 맞추기, 여러 링크로 합류)만 가린다.
+
+**링크 목록의 출처.**
+- Raft 구성원은 멤버십의 `OrbNode.addrs`, 관찰 노드는 새 `ClusterStatus.observer_links: BTreeMap<Uuid, Vec<String>>`
+  (링크가 둘 이상인 관찰 노드만, 비면 쓰지 않음, 옛 노드는 무시; OpenAPI에는 없음)다. 노드가 원하는 링크는 새
+  `NodeStatus.cluster_addresses`(`host:port`, 등록 때 노드가 링크 하나여도 씀)다. `NodeSpec`은 `deny_unknown_fields`라
+  건드리지 않았다. 옛 리더가 Node status를 다시 쓰며 `cluster_addresses`를 떨어뜨리면 `refresh_features`가 되살린다.
+  등록·`refresh_features`는 호스트가 지금 노드 인증서의 이름에 있는 링크만 적는다(`announced_links`; 다시 서명이 실패해
+  이름이 빠진 링크로는 다른 노드가 TLS로 닿지 못하므로 경고만, 리뷰; 경고는 빠진 링크 집합이 바뀔 때만 — `refresh_features`가
+  60초마다 부르므로, 2차 리뷰). 다시 합류하면 API가 그 노드의 기록을 새 링크로
+  둔다(옛 값이 남으면 링크 맞추기가 멤버십을 옛 링크로 되돌렸다, 리뷰).
+- `initialize`(새 클러스터)와 `AddLearner`(합류)는 받은 링크를 그대로 쓴다(`LeaderRequest::AddLearner.addrs`, 링크
+  하나면 생략해 옛 형식 그대로; 옛 리더는 모르는 필드를 무시하고 첫 링크만 쓴다). 첫 링크가 죽어 있으면 learner가
+  로그를 받지 못해 등록·링크 맞추기까지 갈 수 없으므로 합류에서 바로 실어야 한다.
+- `Cluster::link_book()`(첫 링크 → 링크 목록, 링크 하나인 노드는 넣지 않음)은 적용된 멤버십과 관찰 노드 목록으로
+  `track_observers`가 고친다(`FeedBatch.membership`이 있을 때, Reset·Lagged 뒤 다시 읽을 때, 목록이 바뀔 때). opld는
+  `open_node` 뒤 `peers.set_link_book(cluster.link_book())`을 부른다(관찰 노드·위트니스 포함). Raft의 `GrpcConnection`은
+  책을 붙이면 책의 목록을, 붙이기 전에는 `new_client`가 받은 `OrbNode.addrs`를 쓴다(책을 붙이기 전에도 여러 링크).
+  처음에는 늘 `OrbNode.addrs`를 썼는데, 멤버십이 바뀌는 사이 책(적용된 멤버십)과 목록이 달라 같은 노드의 선택 상태가
+  호출마다 처음부터 다시 세어졌다(리뷰). 그래서 로그의 멤버십에만 있는 새 링크는 적용된 뒤에 쓰인다.
+
+**넘어가기 규칙(`opl-cluster/src/links.rs`, Peers와 memnet이 함께 씀).**
+- 첫 링크를 열쇠로 노드마다 `{ links, active, last_ok, timeouts, switched_at, trial }`이다(`LinkSelector`). 연결
+  실패(`Connect`)면 곧바로, 제한 시간 초과(`Timeout`)면 지금 링크에서 연속 두 번이거나 그 링크의 마지막 성공(또는 그
+  링크로 넘어온 때)에서 400 ms(`LINK_DEAD_AFTER`)가 지났을 때(먼저인 것) 다음 링크로 넘어가고, 모두 실패하면 돌아가며
+  시도한다. 처음에는 "마지막 성공에서 1초"였는데, 하트비트 200 ms를 더하면 조용히 죽은 링크에서 1.2~1.4초 동안 따르는
+  노드에 하트비트가 없어 선거 제한 시간(1~2초)에 걸렸다(pre-vote가 없어 리더가 물러남, 리뷰). **넘어가기 상한
+  (`LINK_DEAD_AFTER` + 하트비트 간격)은 `election_timeout_min − heartbeat_interval`보다 짧아야 한다**(400 + 200 = 600 ms <
+  1000 − 200 = 800 ms). 하트비트 하나가 늦은 살아 있는 링크(초과 한 번, 400 ms 안)는 버리지 않는다.
+- 우선 링크가 아닌 동안 30초(`LINK_RETRY`)마다 다음 호출 **하나**를 우선 링크로 보내고(시험 호출) 성공하면 돌아오며
+  실패하면 머물러 다시 잰다. 시험 호출은 control 채널의 짧은 호출(`Counts::All`: Raft RPC·ping·리스 갱신·Follow 열기)만
+  보낸다(`LinkSelector::current`; 처음에는 콘솔·마이그레이션·쓰기도 시험 호출이 될 수 있어 죽은 우선 링크에서 오래
+  걸렸다, 리뷰). 우선 링크로 돌아가는 것은 시험 호출의 성공이거나 지금 링크로 넘어온(마지막 시험을 보낸) 뒤 보낸 호출의
+  성공일 때만이다(`Pick.sent`; 넘어가기 전에 보낸 호출의 늦은 성공이 죽은 링크로 되돌리던 것, 리뷰). 따로 도는 링크
+  ping은 두지 않았다(memnet과 같은 코드로 시험하려고).
+- **연결 실패는 같은 호출 안에서 다시 보낸다(리뷰).** Peers는 요청이 나가지 않았음이 확실한 호출만 다시 고른 다른
+  링크로 한 번 더 보낸다(`not_sent`): 상태의 오류 원인 사슬에 `tonic::ConnectError`(TCP 연결·TLS 핸드셰이크 실패, 연결
+  제한 시간 포함)가 있을 때, 링크로 채널을 만들지 못했을 때, 아래의 다른 노드 거절. 시험 호출이든 아니든 같다(시험
+  호출이 실패해도 그 호출은 지금 링크로 성공한다). 처음에는 모든 `Unavailable`을 다시 보냈는데, tonic 0.14.6은 이미
+  보낸 진행 중 호출도 keepalive ping 만료(`hyper::Error::is_timeout`)면 `Unavailable`로 끝내므로(`status.rs`
+  `from_hyper_error`) 받은 쓰기가 두 번 갈 수 있었다(2차 리뷰). `tonic::transport::Error`는 채널의 모든 오류(보낸 뒤의 h2·IO
+  오류 포함)를 감싸 쓰지 않았다. 링크 고르기에는 지금처럼 모든 `Unavailable`을 연결 실패로 센다(다음 호출은 다음 링크).
+  시험: 쓰기를 받고 답을 버리며 연결은 열어 두는 중계 → keepalive 만료 뒤 오류, 둘째 링크로 연결 없음
+  (`a_sent_write_that_loses_its_connection_is_not_sent_again`, 약 30초). 제한 시간 초과는 상대가 받았을 수 있어 다시
+  보내지 않는다. 요청 스트림을 한 번만 보낼 수 있는 콘솔은 다시 보내지 않는다. 서버가 내려가는 중이라 답한
+  `Unavailable`("shutting down")은 연결 실패로 세지만 다시 보내지 않는다. memnet은 다시 보내지 않는다(끊긴 링크는 연결
+  실패로 넘기기만).
+- 넘어가면 `warn`, 돌아오면 `info` 로그다. 헬스·지표에는 내지 않는다(계획 52의 관리망 검사와 함께 나중).
+- 시간은 `tokio::time::Instant`(멈춘 시계 단위 시험). `ClusterConfig.link_retry`·`Peers::with_link_retry`는 시험 전용이다
+  (memnet 시험 2.5초).
+
+**Peers(opl-peer)가 실패를 보는 곳.**
+- 채널 캐시는 `(Lane, 링크)`마다다(링크를 바꾸면 다른 TCP 연결). 호출마다 링크를 고르고 결과를 공통 도우미(`Attempt`)로
+  알린다: `Unavailable`은 연결 실패, `DeadlineExceeded`·`Cancelled`(tonic 자기 제한 시간)는 초과, `Unknown`·`Internal`은
+  세지 않음, 결과 없이 버려진 호출(부른 쪽의 `timeout`)은 가드가 초과로 센다. openraft가 다른 까닭(복제 스트림 다시
+  만들기)으로 버린 호출도 초과로 세지만 "연속 두 번 또는 400 ms" 기준이 대개 가린다.
+- **대상 노드 확인(리뷰).** 노드 A의 링크에 B의 주소가 들어가면(오타, 다시 쓴 IP) 리더가 A에게 보낼 append·vote를 B가
+  받아 이중으로 셀 수 있었다. 대상 id를 아는 호출(Raft RPC의 `GrpcConnection`, 리더 전달·리스 갱신의 `Forwarder`, Follow)은
+  gRPC 메타데이터 `orbivisor-target: <노드 uuid>`를 싣고, 서버는 있으면 자기 id와 비교해 다르면 처리하지 않고
+  `permission_denied`로 답하며 같은 키에 자기 id를 싣는다(옛 노드는 싣지 않으므로 받는다). 클라이언트는 그 답을 연결
+  실패로 세어 다음 링크로 다시 보낸다. ping(생존 확인 모니터)과 bulk 호출 가운데 부르는 곳이 id를 아는 `uefi_vars`·
+  `read_audit`·`read_metrics`도 싣는다(2차 리뷰: 싣지 않은 ping이 다른 노드의 답으로 잘못된 링크를 성공으로 셌다). 싣지
+  않는 것: opld의 `AddVoter` 요청(대상 id를 모름), 마이그레이션 준비·기다리기·취소와 콘솔(부르는 곳이 주소만 넘김).
+  설정 쪽에서도 막는다: 합류는 다른 구성원·관찰 노드의 링크와 겹치는 링크를 400으로, 링크 맞추기는 그런 노드를 건너뛰고
+  한 번 경고한다(`link_clashes`).
+- 초과까지 세는 것: Raft RPC(openraft `hard_ttl`, `append_entries`는 하트비트 간격 200 ms), ping, `RenewLease`·`RenewVip`
+  (gRPC 제한 시간을 90초에서 3초 `LEASE_RPC_TIMEOUT`로 — HA 리스 갱신의 바깥 `timeout`은 `fence_after`가 20초 이상이면
+  4초라 Peers가 초과를 보고, 더 짧은 `fence_after`면 바깥이 먼저 버려 가드가 초과로 센다), Follow
+  열기(응답 헤더까지 3초 `FOLLOW_OPEN_TIMEOUT`). 쓰기·`AddVoter` 같은 긴 리더 요청은 연결 실패만 센다(따라잡기 60초를
+  실패로 보지 않게).
+- ping과 리더 요청은 Peers 안에서도 제한 시간(`within`)으로 끝낸다: 연결은 받고 답하지 않는 리스너에서 TLS
+  핸드셰이크가 tonic 제한 시간 밖에서 멈췄다.
+- **연결 제한 시간 3초 → 2초(단계 5).** 실제 프로세스 시험에서 우선 링크가 SYN에 답하지 않는 macOS(127.0.0.2)의 막
+  합류한 노드가 등록 쓰기를 전달하지 못해 합류가 실패했다. 쓰기 전달은 연결 실패만 세는데, 전달자의 시도 제한 시간
+  (`FORWARD_ATTEMPT_TIMEOUT` 3초)과 연결 제한 시간(3초)이 같아 연결 실패가 나기 전에 시도가 버려졌고(버려진 긴 요청은
+  세지 않음) 같은 링크로 다시 보내기만 되풀이했다. 합류 직후의 노드는 아직 리스 갱신·ping을 보내지 않아 다른 호출로도
+  넘어가지 못했다. 연결 제한 시간을 2초로 줄여 답 없는 링크가 시도 안에서 연결 실패(`Unavailable`)로 끝나게 했고,
+  리뷰 뒤로는 그 쓰기가 같은 시도 안에서 둘째 링크로 다시 가 성공한다(`opl-peer/tests/grpc.rs`의
+  `a_forwarded_write_fails_over_from_a_link_that_never_connects`, 연결 제한 시간이 3초면 실패). 연결은 받지만
+  TLS 핸드셰이크에서 멈추는 링크로 보낸 쓰기는 여전히 넘어가지 못한다(실제 끊긴 망은 연결을 받지 않고, 리스 갱신·ping이
+  같은 노드의 링크를 넘기므로 남겨 둠). 그런 링크는 연결 실패만 세는 호출(쓰기·`AddVoter`·bulk 호출)로는 실패로
+  세어지지 않는다(제한 시간 초과를 세지 않음) — 초과까지 세는 control 채널의 짧은 호출(Raft·ping·리스 갱신·Follow
+  열기)이 넘긴다.
+- 이미 기다리던 긴 요청은 죽은 연결에서 keepalive(10초 + 20초)까지 걸릴 수 있다(다음 호출은 새 링크).
+
+**memnet.** 노드를 링크와 함께 등록하고(멤버십의 `OrbNode`로 링크 → 노드), `MemRouter::cut_link(from, link)`·`sent(link)`
+(그 링크로 간 RPC 수), `heal(id)`이 끊긴 링크도 푼다. `MemForwarder`·`MemFollow`는 보내는 노드의 링크 책, `MemConnection`
+(Raft)은 링크 책이 아니라 `new_client`가 받은 멤버십의 `OrbNode.addrs`에서 보내는 노드의 `LinkSelector`로 링크를 고르고
+끊긴 링크면 연결 실패다(Peers의 `GrpcConnection`과 달리 책을 읽지 않음). memnet은 같은 호출 안에서 다시 보내지 않는다.
+
+**링크 맞추기와 `multi-link`.**
+- 노드 기능 `multi-link`(`FEATURES` 끝, `opl_cluster::MULTI_LINK`). 리더의 `VoterKeeper` 틱에서 joint가 아니고 `plan`이
+  바꿀 것이 없고 살아 있는 투표 멤버가 과반일 때, 모든 Node(위트니스·관찰 노드 포함)가 Node 기록과 `multi-link`를 가질
+  때만, NodeId 순으로 한 틱에 한 노드(`link_fix`): Raft 구성원의 `addrs`가 그 노드의 `status.cluster_addresses`(비지 않을
+  때)와 다르면 `change_membership(SetNodes { id: OrbNode }, false)`(`change_timeout` 안, 앞선 변경이 커밋 중이면 다음 틱),
+  관찰 노드면 `observer_links`를 `UpdateStatusIf`로 고친다(첫 링크가 바뀌면 `observers` 값도). 첫 링크를 바꾸는 것도
+  허용한다 — 같은 노드 id이고 그 노드가 스스로 적은 값이라 openraft가 경고하는 "다른 노드를 가리키는 주소 바꾸기"가
+  아니다. 그래서 업그레이드 뒤 설정의 링크가 멤버십 주소와 다른 기존 노드(예: `address`를 바꾸고 다시 시작한 노드)는 첫
+  링크도 바뀐다(README의 업그레이드 주의).
+- openraft 0.9.25의 `SetNodes`는 투표 멤버 집합이 그대로라 joint 없이 항목 하나로 커밋한다(`membership.rs`의
+  `Membership::change` — `SetNodes`는 노드 값만 바꾸고 구성은 그대로 둔다). 그래서 `same_config`·`finish_joint`와 부딪히지 않는다
+  (joint 구성이 생기지 않음). 멤버십이 바뀌면 리더가 복제 스트림을 다시 만들며 `new_client`를 새 노드 값으로 부른다.
+- 좁은 경합(2차 리뷰): openraft의 `SetNodes`는 멤버십에 없는 노드를 더한다. 키퍼가 `same_config`를 본 뒤
+  `change_membership`이 커밋되기 전에 노드 제거(`Remove`, API의 노드 삭제·`leave`)가 먼저 커밋되면 막 지운 노드가 learner로
+  되살아날 수 있다. 키퍼는 `Done` 뒤 그 노드가 투표 멤버였는데 아니게 됐거나 Node 기록이 없으면 warn("updated the cluster
+  links of a node that was removed meanwhile")만 한다. 되살아난 learner를 저절로 지우는 고아 정리는 없어 그 경고를 보고
+  손으로 다시 뺀다(Node 기록 삭제가 `Remove` 뒤라 그 사이에 본 경우는 경고도 놓칠 수 있다).
+- 키퍼의 `ToObserver`는 `addrs`를 `observer_links`에, learner로 되돌리기(`return_observer`)는 `observer_links`(없으면
+  `observers` 값 하나)로 `OrbNode`를 만든다. `LeaderRequest::Remove`는 `observer_links`에서도 뺀다. `observer_nodes(status)`가
+  관찰 노드 캐시·링크 책·`Members.links`에 관찰 노드의 실제 링크를 준다.
+
+**설정·인증서·합류.**
+- opld 최상위 `cluster_addresses`(호스트만, 포트·중복·잘못된 모양 거절; 호스트 규칙은 API 합류와 같은
+  `opl_types::host::valid_host`이고 중복은 값으로 — IP는 같은 주소, 이름은 대소문자 없이, 리뷰. `address`도 같은 규칙이라
+  끝의 점·멀티캐스트 같은 값은 이제 거절되어 그런 `address`로 돌던 노드는 업그레이드 뒤 시작하지 않는다 — README
+  업그레이드 주의에 올리기 전에 확인하라고 적었다, 2차 리뷰), `Config::cluster_links()`(없거나 비면
+  `[address:포트]`), `cluster_address()`는 첫 링크, `cert_names()`는 `address`·모든 링크 호스트·localhost 셋.
+  `cluster_listen`이 `0.0.0.0`·`::`가 아닌데 링크가 둘 이상이면 시작 로그에 경고만(시험이 일부러 그렇게 쓴다).
+- 합류: opld `join.rs`는 링크가 둘 이상일 때만 `JoinRequest.cluster_addresses`를 보낸다(옛 API 노드의
+  `deny_unknown_fields`를 건드리지 않게). API는 첫 것이 `cluster_address`와 같고 겹치지 않으며 모두 SAN에 넣을 수 있는
+  호스트인지 보고(아니면 400), 둘 이상이면 `multi-link`를 요구한다(409 `cluster_upgrading`; 다시 합류하는 노드 자신의 옛
+  Node 기록은 세지 않음). 겹침은 값으로 보고(`same_link`), 다른 노드의 링크와 겹치면 400이다(이미 멤버·이름 검사 뒤).
+  다른 노드의 Node 기록이 원하는(`status.cluster_addresses`, 링크 맞추기가 아직 멤버십에 넣지 않은) 링크와 겹쳐도 400이다(2차
+  리뷰). 다시 합류 때 주소 비교는 링크 목록 전체다. 옛 API 노드는 `cluster_addresses`를 모르는 필드로 거절하므로, opld는 그
+  거절을 "모든 노드를 먼저 올리라"는 메시지로 바꿔 보인다.
+- 다시 서명: opld가 Restart에서 저장소를 연 뒤·노드 간 서버를 띄우기 전에(위트니스 포함) 노드 인증서에 빠진 이름이
+  있으면 저장소의 클러스터 CA로 **같은 키**에 새로 서명해(`pki::csr_for_key`) `pki` 디렉터리에 저장하고 서버·마이그레이션
+  TLS·API 인증서에 쓴다. CA가 아직 없거나 실패하면 경고만. 클라이언트 신원은 옛 인증서 그대로다(이름이 아니라 CA와 CN의
+  노드 id로 확인됨).
+- 마이그레이션의 QEMU 스트림 호스트는 대상 노드의 지금 링크(`Peers::active_link(addr)`)의 호스트다. 받을 준비 요청
+  (`migrate_incoming`)이 성공한 뒤에 읽는다(그 전에는 아직 죽은 줄 모르는 첫 링크일 수 있었다, 리뷰; 그 요청은 연결
+  실패면 다른 링크로 다시 가므로 성공한 뒤의 지금 링크는 닿은 링크다).
+
+**보이기(단계 5).** API `MemberView.cluster_addresses`(모든 링크, 첫 것 = `cluster_address`; `Members.links`에 없으면
+`[cluster_address]`), `orbivisorctl cluster status` 표는 그대로(`-o json`에 보임), 웹 클러스터 화면은 클러스터 주소 아래에
+둘째 링크부터 작게.
+
+**실제 프로세스 시험(`opld/tests/cluster.rs`).**
+- 세 노드가 `cluster_addresses = ["127.0.0.2", "127.0.0.1"]`, `cluster_listen = "127.0.0.1:{port}"`로 우선 링크가 죽은 채
+  init·합류·승격·쓰기 전달을 하고, 모든 멤버의 `cluster_addresses`가 두 링크이며 노드 인증서에 127.0.0.2가 있고, 리더 kill -9
+  뒤 남은 둘이 새 리더를 뽑아 쓰기를 잇는다. macOS의 lo0에는 127.0.0.1만 있어 127.0.0.2로의 연결은 응답 없이 시간
+  초과이고, Linux는 127/8 전체가 로컬이라 듣지 않는 포트는 곧바로 거절이다. 두 OS 모두 sudo 없이 "죽은 우선 링크"를
+  본다(시험 약 25초, macOS). 합류 때 리더의 첫 `append_entries`들은 200 ms에 끊기다 1초 안팎에 둘째 링크로 넘어갔다(리뷰 뒤의 규칙으로는 연속
+  두 번째 초과, 약 400 ms).
+- 링크 하나로 만든 노드에 `cluster_addresses`를 더해 다시 시작하면 인증서가 같은 키로 다시 서명되고(127.0.0.2 포함)
+  리더(그 노드 자신)가 멤버십을 두 링크로 고친다.
+- 링크를 도중에 끊고 되살리는 것은 memnet(`opl-cluster/tests/links.rs`: 모든 노드 사이 첫 링크를 끊어도 리더·쓰기·리스
+  갱신·관찰 노드 Follow가 계속, 리더를 죽이면 둘째 링크로 새 리더, 풀면 재시도 간격 뒤 첫 링크로, 링크 맞추기의 여러
+  경우)과 gRPC(`opl-peer/tests/grpc.rs`: 닫힌 포트·받고 답하지 않는 리스너·SYN에 답 없는 주소) 시험이 본다.
+
+**남은 것.**
+- 링크 상태를 헬스·지표·웹에 보이기(계획 52의 관리망 검사와 함께), 링크별 백그라운드 ping, 대량 전송(콘솔·마이그레이션
+  준비)용 링크를 따로 고르기.
+- TLS 핸드셰이크에서 멈추는 링크로 보낸 긴 리더 요청은 다른 호출이 링크를 넘길 때까지 넘어가지 못한다.
