@@ -58,7 +58,7 @@ async fn read_node(state: &AppState, id: NodeId, addr: &str, query: MetricsQuery
     };
     let read = tokio::time::timeout(
         PEER_READ_TIMEOUT,
-        peers.read_metrics(addr, query, PEER_READ_TIMEOUT),
+        peers.read_metrics(id, addr, query, PEER_READ_TIMEOUT),
     )
     .await;
     match read {

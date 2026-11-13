@@ -66,7 +66,13 @@ impl FirmwareFetcher for UefiVarsFetcher {
             })?
             .len();
         self.peers
-            .uefi_vars(&addr, vm, &uefi_vars_path(&self.state_dir, vm), Some(len))
+            .uefi_vars(
+                NodeId(node),
+                &addr,
+                vm,
+                &uefi_vars_path(&self.state_dir, vm),
+                Some(len),
+            )
             .await
             .map(|_| ())
             .map_err(|e| FirmwareError(e.to_string()))

@@ -281,7 +281,7 @@ async fn by_pings(
                 // 그 주소에 이제 다른 노드가 있을 수 있으므로 응답한 노드가 대상인지 본다.
                 Some(addr) => Some(
                     peers
-                        .ping(&addr, timeout)
+                        .ping(target, &addr, timeout)
                         .await
                         .is_ok_and(|id| id == target),
                 ),

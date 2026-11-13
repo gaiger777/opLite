@@ -32,7 +32,9 @@ use crate::wire::{
     AppendEntriesReply, AppendEntriesRequest, FollowRequest, IncomingReply, InstallSnapshotReply,
     InstallSnapshotRequest, LeaderReply, MigrateIncomingReply, VoteReply, VoteRequest,
 };
-use crate::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, VM_METADATA};
+use crate::{
+    KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, TARGET_METADATA, VM_METADATA,
+};
 
 /// 다른 노드가 부르는 서비스. 상대 인증서의 노드 id가 이 노드가 아는 멤버(투표 멤버·learner·관찰 노드)여야
 /// 한다. 아직 멤버십을 받지 못한 노드(막 합류하는 중)는 클러스터 CA가 서명한 인증서면 받는다. 관찰 노드는
@@ -134,7 +136,9 @@ impl PeerService {
             .ok_or_else(|| Status::failed_precondition("this node is not a Raft member"))
     }
 
-    /// 부른 노드의 id. 클러스터에서 빠진 노드는 `permission_denied`다.
+    /// 부른 노드의 id. 클러스터에서 빠진 노드는 `permission_denied`다. 다른 노드에 보낸 호출(대상 id
+    /// [`TARGET_METADATA`]가 이 노드가 아님)도 `permission_denied`이고 이 노드의 id를 실어 답한다(옛 노드는 대상을
+    /// 싣지 않으므로 받는다).
     fn authorize<T>(&self, req: &Request<T>) -> Result<NodeId, Status> {
         let certs = req
             .peer_certs()
@@ -143,6 +147,18 @@ impl PeerService {
             .first()
             .and_then(|c| node_id_of(c))
             .ok_or_else(|| Status::unauthenticated("certificate does not name a node"))?;
+        if let Some(target) = req.metadata().get(TARGET_METADATA) {
+            let me = self.cluster.id();
+            if target.to_str().ok().and_then(|t| Uuid::try_parse(t).ok()) != Some(me.0) {
+                let mut status = Status::permission_denied(format!(
+                    "this is node {me}, not {target:?}; a cluster link points to the wrong node"
+                ));
+                if let Ok(value) = me.0.to_string().parse() {
+                    status.metadata_mut().insert(TARGET_METADATA, value);
+                }
+                return Err(status);
+            }
+        }
         let members = self.cluster.members();
         let uninitialized = members.voters.is_empty() && members.learners.is_empty();
         if uninitialized || members.contains(NodeId(id)) {

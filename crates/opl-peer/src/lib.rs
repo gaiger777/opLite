@@ -37,6 +37,10 @@ mod proto {
 /// 콘솔 스트림에서 VM id를 담는 메타데이터 키
 pub const VM_METADATA: &str = "opl-vm";
 
+/// 호출이 가려는 노드의 id를 담는 메타데이터 키. 받는 노드는 이것이 자기 id가 아니면(다른 노드를 가리키는 링크)
+/// 처리하지 않고 `permission_denied`로 답하며 같은 키에 자기 id를 싣는다. 보내는 쪽은 그것을 링크 실패로 센다.
+pub const TARGET_METADATA: &str = "orbivisor-target";
+
 /// 한 메시지의 최대 크기. Raft 로그 묶음과 스냅샷 조각을 JSON으로 보내므로 기본값(4MiB)보다 크게 둔다.
 pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
 

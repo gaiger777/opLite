@@ -17,8 +17,9 @@ use crate::follow::{self, FollowClient, FollowFrame, NodeRole};
 use crate::health::{ApplyLag, QUORUM_ACK_MAX, RaftHealth};
 use crate::leader::{self, Forwarder, LeaderCtx};
 use crate::lease::{ConfirmBatch, LeaseTable, Leases};
+use crate::links::{LINK_RETRY, LinkBook};
 use crate::log_store::LogStore;
-use crate::replica::Replica;
+use crate::replica::{Replica, read_membership};
 use crate::state_machine::{StateMachine, save_current_snapshot};
 use crate::store::{
     NodeMode, Store, StoreError, enter_observer_mode, get_object, get_object_by_name, list_objects,
@@ -57,6 +58,9 @@ pub struct ClusterConfig {
     /// 시험이 노드를 learner로 따라잡게 하지 않고 빈 저장소로 바로 관찰 노드로 연다)이다.
     #[doc(hidden)]
     pub follow_seed: BTreeMap<NodeId, String>,
+    /// 우선 링크가 아닌 동안 우선 링크를 다시 시도하는 간격(memnet이 쓴다, 기본 [`LINK_RETRY`]). 시험용이다.
+    #[doc(hidden)]
+    pub link_retry: Duration,
 }
 
 impl ClusterConfig {
@@ -68,6 +72,7 @@ impl ClusterConfig {
             write_timeout: Duration::from_secs(5),
             in_memory: false,
             follow_seed: BTreeMap::new(),
+            link_retry: LINK_RETRY,
         }
     }
 }
@@ -139,6 +144,10 @@ pub struct Cluster {
     apply_lag: std::sync::Mutex<ApplyLag>,
     /// 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`). `Kind::Cluster` 변경으로 갱신한다.
     observers: Arc<RwLock<BTreeMap<NodeId, String>>>,
+    /// 노드마다의 클러스터 링크(적용된 멤버십의 `OrbNode`). 관찰 노드 목록과 함께 고친다.
+    link_book: Arc<LinkBook>,
+    /// memnet이 이 노드의 링크 선택에 쓰는 우선 링크 재시도 간격
+    link_retry: Duration,
 }
 
 /// 이 노드가 클러스터에 무엇으로 참여하는지
@@ -232,7 +241,7 @@ impl NodeHandle {
     }
 }
 
-/// 지금 알고 있는 멤버십. 값은 노드의 Raft 주소다.
+/// 지금 알고 있는 멤버십. 값은 노드의 Raft 주소(첫 링크)다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Members {
     pub leader: Option<NodeId>,
@@ -240,6 +249,8 @@ pub struct Members {
     pub learners: BTreeMap<NodeId, String>,
     /// Raft 밖의 관찰 노드(클러스터 정보의 `observers` 가운데 Raft 구성원이 아닌 것)
     pub observers: BTreeMap<NodeId, String>,
+    /// 위 모든 노드의 클러스터 링크(앞이 우선, 첫 것이 위의 주소)
+    pub links: BTreeMap<NodeId, Vec<String>>,
 }
 
 impl Members {
@@ -331,25 +342,20 @@ impl Cluster {
                 start_member(&start_raft, &store).await?
             }
         };
-        let mut cluster = Self::assemble(
-            config.node_id,
-            config.write_timeout,
-            store,
-            backend,
-            start_raft,
-        );
+        let mut cluster = Self::assemble(&config, store, backend, start_raft);
         cluster.follow = follow;
         Ok(cluster)
     }
 
     fn assemble(
-        id: NodeId,
-        write_timeout: Duration,
+        config: &ClusterConfig,
         store: Store,
         backend: Backend,
         start_raft: StartRaft,
     ) -> Self {
-        let observers = track_observers(store.db(), store.watch_hub());
+        let id = config.node_id;
+        let link_book = Arc::new(LinkBook::default());
+        let observers = track_observers(store.db(), store.watch_hub(), &link_book);
         Self {
             id,
             node: NodeHandle {
@@ -362,7 +368,7 @@ impl Cluster {
                 vips: Arc::default(),
             },
             store,
-            write_timeout,
+            write_timeout: config.write_timeout,
             forwarder: None,
             start_raft,
             follow: None,
@@ -370,6 +376,8 @@ impl Cluster {
             epoch: tokio::sync::watch::channel(0).0,
             apply_lag: Default::default(),
             observers,
+            link_book,
+            link_retry: config.link_retry,
         }
     }
 
@@ -381,6 +389,15 @@ impl Cluster {
 
     pub fn id(&self) -> NodeId {
         self.id
+    }
+
+    /// 노드마다의 클러스터 링크. 노드 간 연결(`Peers::set_link_book`)이 노드의 첫 링크로 링크 목록을 찾는다.
+    pub fn link_book(&self) -> Arc<LinkBook> {
+        self.link_book.clone()
+    }
+
+    pub(crate) fn link_retry(&self) -> Duration {
+        self.link_retry
     }
 
     /// 네트워크 계층이 받은 RPC를 넘기고, 테스트가 메트릭을 볼 때 쓴다. Raft 구성원이 아니면 `None`이다.
@@ -989,6 +1006,7 @@ impl Cluster {
             voters: BTreeMap::new(),
             learners: BTreeMap::new(),
             observers: BTreeMap::new(),
+            links: BTreeMap::new(),
         };
         for (id, node) in membership.nodes() {
             let list = if voters.contains(id) {
@@ -997,6 +1015,7 @@ impl Cluster {
                 &mut out.learners
             };
             list.insert(*id, node.addr().to_string());
+            out.links.insert(*id, node.addrs.clone());
         }
         // 내리는 중(목록에 쓰고 아직 멤버십에서 빼기 전)인 노드는 Raft 구성원으로 센다.
         out.observers = self
@@ -1007,6 +1026,9 @@ impl Cluster {
             .filter(|(id, _)| membership.get_node(id).is_none())
             .map(|(id, addr)| (*id, addr.clone()))
             .collect();
+        for (id, addr) in &out.observers {
+            out.links.insert(*id, vec![addr.clone()]);
+        }
         out
     }
 
@@ -1290,26 +1312,30 @@ where
     }))
 }
 
-/// 클러스터 정보의 관찰 노드 목록을 읽어 두고, `Kind::Cluster` 변경을 따라 고치는 작업을 띄운다. 작업은
-/// 저장소가 닫히거나(피드가 `Closed`) 목록을 쥔 `Cluster`가 사라지면 끝난다.
+/// 클러스터 정보의 관찰 노드 목록과 적용된 멤버십의 링크(`book`)를 읽어 두고, `Kind::Cluster` 변경과 멤버십
+/// 변경을 따라 고치는 작업을 띄운다. 작업은 저장소가 닫히거나(피드가 `Closed`) 목록을 쥔 `Cluster`가 사라지면
+/// 끝난다.
 fn track_observers(
     db: &Arc<Database>,
     hub: &Arc<WatchHub>,
+    book: &Arc<LinkBook>,
 ) -> Arc<RwLock<BTreeMap<NodeId, String>>> {
     let cache = Arc::new(RwLock::new(BTreeMap::new()));
     // 구독한 뒤 읽어야 그 사이의 변경을 놓치지 않는다.
     let feed = hub.feed(hub.revision()).ok();
     *cache.write().unwrap() = read_observers(db);
-    let (db, hub, weak) = (
+    read_links(db, book);
+    let (db, hub, weak, book) = (
         Arc::downgrade(db),
         Arc::downgrade(hub),
         Arc::downgrade(&cache),
+        book.clone(),
     );
     tokio::spawn(async move {
         let mut feed = feed;
         loop {
             if let Some(mut f) = feed.take()
-                && !follow_observers(&mut f, &weak).await
+                && !follow_observers(&mut f, &weak, &book).await
             {
                 return;
             }
@@ -1320,6 +1346,7 @@ fn track_observers(
             };
             feed = hub.feed(hub.revision()).ok();
             *cache.write().unwrap() = read_observers(&db);
+            read_links(&db, &book);
             if feed.is_none() {
                 tokio::time::sleep(RETRY_INTERVAL).await;
             }
@@ -1328,9 +1355,13 @@ fn track_observers(
     cache
 }
 
-/// 피드의 `Kind::Cluster` 변경으로 목록을 고친다. 다시 읽어야 하면(`Reset`·`Lagged`) `true`, 끝나야 하면
-/// (저장소가 닫힘, 목록이 사라짐) `false`다.
-async fn follow_observers(feed: &mut Feed, cache: &Weak<RwLock<BTreeMap<NodeId, String>>>) -> bool {
+/// 피드의 `Kind::Cluster` 변경으로 목록을, 멤버십 변경으로 링크를 고친다. 다시 읽어야 하면(`Reset`·`Lagged`)
+/// `true`, 끝나야 하면(저장소가 닫힘, 목록이 사라짐) `false`다.
+async fn follow_observers(
+    feed: &mut Feed,
+    cache: &Weak<RwLock<BTreeMap<NodeId, String>>>,
+    book: &LinkBook,
+) -> bool {
     loop {
         let batch = match feed.next().await {
             Ok(FeedItem::Batch(batch)) => batch,
@@ -1341,6 +1372,9 @@ async fn follow_observers(feed: &mut Feed, cache: &Weak<RwLock<BTreeMap<NodeId, 
         };
         if cache.strong_count() == 0 {
             return false;
+        }
+        if let Some(m) = &batch.membership {
+            book.replace(m.membership().nodes().map(|(_, node)| node));
         }
         for event in &batch.events {
             let observers = match event {
@@ -1359,6 +1393,14 @@ async fn follow_observers(feed: &mut Feed, cache: &Weak<RwLock<BTreeMap<NodeId, 
             };
             *cache.write().unwrap() = observers;
         }
+    }
+}
+
+/// 저장소에 적용된 멤버십의 링크로 `book`을 고친다.
+fn read_links(db: &Database, book: &LinkBook) {
+    match read_membership(db) {
+        Ok(m) => book.replace(m.membership().nodes().map(|(_, node)| node)),
+        Err(e) => tracing::warn!(error = %e, "cannot read the stored membership"),
     }
 }
 

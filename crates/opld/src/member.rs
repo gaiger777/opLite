@@ -268,6 +268,8 @@ impl Member {
             .await?
             .with_forwarder(peers.clone()),
         );
+        // 노드 간 호출이 멤버십의 링크로 넘어가기를 한다(관찰 노드·위트니스 포함).
+        peers.set_link_book(cluster.link_book());
         // 역할은 합류할 때 정해진다. 설정만 바꿔 다시 시작하면 아무것도 띄우지 않는다.
         if matches!(bootstrap, Bootstrap::Restart)
             && let Err(e) = bootstrap::check_role(&cluster, config)
@@ -1302,6 +1304,7 @@ mod tests {
             voters: voters.iter().map(|n| (id(*n), String::new())).collect(),
             learners: learners.iter().map(|n| (id(*n), String::new())).collect(),
             observers: Default::default(),
+            links: Default::default(),
         };
         let limit = opl_cluster::VOTER_LIMIT;
         let ok = || node(1, &[limit], Some("0.3.0"));

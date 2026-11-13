@@ -745,6 +745,7 @@ mod tests {
             voters: addrs(&[1, 2, 3]),
             learners: addrs(&[4]),
             observers: addrs(&[5]),
+            links: Default::default(),
         };
         assert_eq!(via_voter(&members, id(3)).as_deref(), Some("node-3"));
         assert_eq!(via_voter(&members, id(4)).as_deref(), Some("node-2"));

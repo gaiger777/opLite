@@ -6,6 +6,7 @@ mod follow;
 mod health;
 mod leader;
 mod lease;
+pub mod links;
 mod log_store;
 pub mod memnet;
 mod replica;
@@ -23,6 +24,7 @@ pub use follow::{FollowClient, FollowFrame, FollowGate, NodeRole, PROGRESS_INTER
 pub use health::{QUORUM_ACK_MAX, RaftHealth};
 pub use leader::{CATCH_UP_TIMEOUT, Forwarder, LeaderError};
 pub use lease::Leases;
+pub use links::{Failure, LINK_DEAD_AFTER, LINK_RETRY, LinkBook, LinkSelector, Pick};
 pub use log_store::LogStore;
 pub use roles::{RoleKeeper, RoleKeeperConfig};
 pub use state_machine::StateMachine;

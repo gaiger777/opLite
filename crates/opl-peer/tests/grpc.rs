@@ -10,7 +10,7 @@ use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::VoteRequest;
 use openraft::{ServerState, Vote};
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
-use opl_cluster::{Cluster, ClusterConfig, FollowClient, FollowFrame, NodeRole};
+use opl_cluster::{Cluster, ClusterConfig, FollowClient, FollowFrame, Forwarder, NodeRole};
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, api_cert, node_key_and_csr};
 use opl_peer::{
@@ -337,10 +337,19 @@ async fn strangers_and_non_members_are_refused() {
     // 다른 CA의 인증서로는 TLS 연결이 맺어지지 않는다.
     let other = ClusterCa::generate("other").unwrap();
     let stranger = Peers::new(&tls_for(&other, NodeId(Uuid::now_v7())));
-    assert!(stranger.ping(&nodes[0].addr, WAIT).await.is_err());
+    assert!(
+        stranger
+            .ping(nodes[0].id(), &nodes[0].addr, WAIT)
+            .await
+            .is_err()
+    );
     // 같은 CA라도 멤버가 아니면 거부한다(제거된 노드).
     let outsider = Node::start(&ca, &root).await;
-    let err = outsider.peers.ping(&nodes[0].addr, WAIT).await.unwrap_err();
+    let err = outsider
+        .peers
+        .ping(nodes[0].id(), &nodes[0].addr, WAIT)
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err}");
     let err = outsider
         .peers
@@ -350,7 +359,11 @@ async fn strangers_and_non_members_are_refused() {
     assert!(err.to_string().contains("not a member"), "{err}");
     // 멤버는 된다.
     assert_eq!(
-        nodes[0].peers.ping(&nodes[0].addr, WAIT).await.unwrap(),
+        nodes[0]
+            .peers
+            .ping(nodes[0].id(), &nodes[0].addr, WAIT)
+            .await
+            .unwrap(),
         nodes[0].id()
     );
     // 멤버의 API 인증서(서버 인증만, 노드 id 없음)로는 피어가 되지 못한다.
@@ -361,7 +374,7 @@ async fn strangers_and_non_members_are_refused() {
         cert_pem: api_pem,
         key_pem: api_key,
     });
-    assert!(api.ping(&nodes[0].addr, WAIT).await.is_err());
+    assert!(api.ping(nodes[0].id(), &nodes[0].addr, WAIT).await.is_err());
 }
 
 /// 시험이 실패해도 따로 만든 실행기를 끝낸다(async 문맥에서 그냥 놓으면 panic한다).
@@ -410,15 +423,18 @@ async fn control_channels_outlive_the_runtime_that_opened_them() {
     // 따로 만든 실행기(work·api에 해당)가 먼저 채널을 열고 끝난다.
     let first = Background::new();
     let opened = {
-        let (peers, addr) = (peers.clone(), addr.clone());
+        let (peers, addr, id) = (peers.clone(), addr.clone(), nodes[0].id());
         first
             .handle()
-            .spawn(async move { peers.ping(&addr, WAIT).await })
+            .spawn(async move { peers.ping(id, &addr, WAIT).await })
     };
     assert_eq!(opened.await.unwrap().unwrap(), nodes[0].id());
     drop(first);
 
-    assert_eq!(peers.ping(&addr, WAIT).await.unwrap(), nodes[0].id());
+    assert_eq!(
+        peers.ping(nodes[0].id(), &addr, WAIT).await.unwrap(),
+        nodes[0].id()
+    );
 }
 
 #[tokio::test]
@@ -1125,7 +1141,11 @@ async fn a_panicking_handler_answers_internal() {
         "{err:?}"
     );
     assert_eq!(
-        nodes[0].peers.ping(&nodes[0].addr, WAIT).await.unwrap(),
+        nodes[0]
+            .peers
+            .ping(nodes[0].id(), &nodes[0].addr, WAIT)
+            .await
+            .unwrap(),
         nodes[0].id()
     );
 }
@@ -1150,7 +1170,7 @@ async fn uefi_vars_are_fetched_from_a_member() {
     std::fs::write(&dest, b"stale").unwrap();
     let len = to
         .peers
-        .uefi_vars(&from.addr, vm, &dest, None)
+        .uefi_vars(from.id(), &from.addr, vm, &dest, None)
         .await
         .unwrap();
     assert_eq!(len, vars.len() as u64);
@@ -1159,14 +1179,14 @@ async fn uefi_vars_are_fetched_from_a_member() {
     // 0만 있는 파일, 빈 파일도 크기 그대로 온다.
     std::fs::write(&src, vec![0u8; chunk + 1]).unwrap();
     to.peers
-        .uefi_vars(&from.addr, vm, &dest, None)
+        .uefi_vars(from.id(), &from.addr, vm, &dest, None)
         .await
         .unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), vec![0u8; chunk + 1]);
     std::fs::write(&src, b"").unwrap();
     assert_eq!(
         to.peers
-            .uefi_vars(&from.addr, vm, &dest, None)
+            .uefi_vars(from.id(), &from.addr, vm, &dest, None)
             .await
             .unwrap(),
         0
@@ -1177,7 +1197,7 @@ async fn uefi_vars_are_fetched_from_a_member() {
     std::fs::write(&dest, b"kept").unwrap();
     let err = to
         .peers
-        .uefi_vars(&from.addr, Uuid::now_v7(), &dest, None)
+        .uefi_vars(from.id(), &from.addr, Uuid::now_v7(), &dest, None)
         .await
         .unwrap_err();
     assert_eq!(err, UefiVarsError::NotFound);
@@ -1187,7 +1207,13 @@ async fn uefi_vars_are_fetched_from_a_member() {
     let outsider = Node::start(&ca, &root).await;
     let err = outsider
         .peers
-        .uefi_vars(&from.addr, vm, &root.path().join("outsider.fd"), None)
+        .uefi_vars(
+            from.id(),
+            &from.addr,
+            vm,
+            &root.path().join("outsider.fd"),
+            None,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1229,7 +1255,7 @@ async fn audit_logs_are_read_from_a_member() {
     };
     let peers = &nodes[0].peers;
     let entries = peers
-        .read_audit(&target.addr, query(7, None), WAIT)
+        .read_audit(target.id(), &target.addr, query(7, None), WAIT)
         .await
         .unwrap()
         .unwrap();
@@ -1237,7 +1263,7 @@ async fn audit_logs_are_read_from_a_member() {
     assert_eq!(entries[0].action, "POST /vms");
     // 너무 큰 limit은 받는 쪽이 줄인다.
     peers
-        .read_audit(&target.addr, query(1_000_000, None), WAIT)
+        .read_audit(target.id(), &target.addr, query(1_000_000, None), WAIT)
         .await
         .unwrap();
     assert_eq!(
@@ -1246,7 +1272,7 @@ async fn audit_logs_are_read_from_a_member() {
     );
     // 읽기 실패는 오류로 온다.
     let err = peers
-        .read_audit(&target.addr, query(7, Some("broken")), WAIT)
+        .read_audit(target.id(), &target.addr, query(7, Some("broken")), WAIT)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Internal, "{err:?}");
@@ -1254,7 +1280,7 @@ async fn audit_logs_are_read_from_a_member() {
     // 감사 로그가 없는 노드는 거부한다.
     let err = target
         .peers
-        .read_audit(&nodes[0].addr, query(7, None), WAIT)
+        .read_audit(nodes[0].id(), &nodes[0].addr, query(7, None), WAIT)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
@@ -1262,7 +1288,7 @@ async fn audit_logs_are_read_from_a_member() {
     let outsider = Node::start(&ca, &root).await;
     let err = outsider
         .peers
-        .read_audit(&target.addr, query(7, None), WAIT)
+        .read_audit(target.id(), &target.addr, query(7, None), WAIT)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
@@ -1298,7 +1324,7 @@ async fn metrics_are_read_from_a_member() {
     };
     let peers = &nodes[0].peers;
     let reply = peers
-        .read_metrics(&target.addr, query(Some(1_000)), WAIT)
+        .read_metrics(target.id(), &target.addr, query(Some(1_000)), WAIT)
         .await
         .unwrap()
         .unwrap();
@@ -1311,7 +1337,7 @@ async fn metrics_are_read_from_a_member() {
     // 지표 소스가 없는 노드(옛 노드처럼)는 None이다.
     let none = target
         .peers
-        .read_metrics(&nodes[0].addr, query(None), WAIT)
+        .read_metrics(nodes[0].id(), &nodes[0].addr, query(None), WAIT)
         .await
         .unwrap();
     assert_eq!(none, None);
@@ -1319,7 +1345,7 @@ async fn metrics_are_read_from_a_member() {
     let outsider = Node::start(&ca, &root).await;
     let err = outsider
         .peers
-        .read_metrics(&target.addr, query(None), WAIT)
+        .read_metrics(target.id(), &target.addr, query(None), WAIT)
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
@@ -1491,11 +1517,19 @@ async fn observers_are_peers_but_not_raft_members() {
     let observer = start_observer(&ca, &root, &nodes[0]).await;
     let leader_addr = nodes[0].addr.clone();
     assert_eq!(
-        observer.peers.ping(&leader_addr, WAIT).await.unwrap(),
+        observer
+            .peers
+            .ping(nodes[0].id(), &leader_addr, WAIT)
+            .await
+            .unwrap(),
         nodes[0].id()
     );
     assert_eq!(
-        nodes[0].peers.ping(&observer.addr, WAIT).await.unwrap(),
+        nodes[0]
+            .peers
+            .ping(observer.id(), &observer.addr, WAIT)
+            .await
+            .unwrap(),
         observer.id()
     );
 
@@ -1537,7 +1571,11 @@ async fn observers_are_peers_but_not_raft_members() {
         !nodes[0].cluster.members().contains(observer.id())
     })
     .await;
-    let err = observer.peers.ping(&leader_addr, WAIT).await.unwrap_err();
+    let err = observer
+        .peers
+        .ping(nodes[0].id(), &leader_addr, WAIT)
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err}");
     let err =
         match FollowClient::follow(observer.peers.as_ref(), nodes[0].id(), &leader_addr, 0).await {
@@ -1595,4 +1633,390 @@ async fn a_removed_observer_stops_receiving_the_feed() {
             );
         }
     }
+}
+
+/// 닫힌 포트(연결은 곧바로 거절된다)
+async fn closed_port() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+/// 연결을 받고 아무것도 답하지 않는 리스너. 멈추면 받은 연결도 닫는다.
+struct Blackhole(tokio::task::JoinHandle<()>);
+
+impl Blackhole {
+    fn start(listener: TcpListener) -> Self {
+        Self(tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        }))
+    }
+
+    /// 리스너와 받은 연결을 닫는다(그 포트에 다시 bind할 수 있다).
+    async fn stop(self) {
+        self.0.abort();
+        let _ = self.0.await;
+    }
+}
+
+/// 받고 답하지 않는 첫 링크로 보낸 짧은 호출(Raft 하트비트처럼 200 ms 제한 시간)은 연속 두 번 넘기면 1초 안에
+/// 둘째 링크로 간다(선거 제한 시간 전에).
+#[tokio::test]
+async fn short_calls_leave_a_silent_link_within_a_second() {
+    let (ca, _root, nodes) = start(1).await;
+    let (id, server) = (nodes[0].id(), nodes[0].addr.clone());
+    let hole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = hole.local_addr().unwrap().to_string();
+    let hole = Blackhole::start(hole);
+    let book = Arc::new(opl_cluster::LinkBook::default());
+    book.replace([&OrbNode::new([first.clone(), server.clone()])]);
+    let peers = Peers::new(&tls_for(&ca, id));
+    peers.set_link_book(book);
+
+    let started = Instant::now();
+    while peers.active_link(&first) == first {
+        assert!(started.elapsed() < WAIT);
+        let _ = peers.ping(id, &first, Duration::from_millis(200)).await;
+    }
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(1), "{took:?}");
+    assert_eq!(peers.active_link(&first), server);
+    assert_eq!(peers.ping(id, &first, WAIT).await.unwrap(), id);
+    hole.stop().await;
+}
+
+/// 링크가 다른 노드를 가리키면(노드 A의 첫 링크가 B의 주소) 대상 id를 실은 호출(리더 전달·Raft RPC·ping·bulk)을 B가
+/// 거절하고, 보내는 쪽은 그것을 링크 실패로 세어 A의 다음 링크로 다시 보낸다. 대상 id가 다른 호출은 처리하지
+/// 않는다.
+#[tokio::test]
+async fn a_link_to_another_node_is_refused_and_skipped() {
+    let (ca, _root, nodes) = start(2).await;
+    let leader = wait_leader(&nodes).await;
+    let a = nodes.iter().find(|n| n.id() == leader).unwrap();
+    let b = nodes.iter().find(|n| n.id() != leader).unwrap();
+    let wrong = OrbNode::new([b.addr.clone(), a.addr.clone()]);
+    let book = Arc::new(opl_cluster::LinkBook::default());
+    book.replace([&wrong]);
+    let peers = Arc::new(Peers::new(&tls_for(&ca, b.id())));
+    peers.set_link_book(book.clone());
+
+    let renew = LeaderRequest::RenewLease { node: b.id() };
+    Forwarder::forward(peers.as_ref(), a.id(), &b.addr, renew)
+        .await
+        .unwrap();
+    assert_eq!(peers.active_link(&b.addr), a.addr);
+
+    // ping과 bulk 호출(지표 읽기)도 대상 id를 싣는다.
+    let pinging = Peers::new(&tls_for(&ca, b.id()));
+    pinging.set_link_book(book.clone());
+    assert_eq!(pinging.ping(a.id(), &b.addr, WAIT).await.unwrap(), a.id());
+    assert_eq!(pinging.active_link(&b.addr), a.addr);
+    let reading = Peers::new(&tls_for(&ca, b.id()));
+    reading.set_link_book(book);
+    let query = MetricsQuery {
+        scope: MetricsScope::Nodes,
+        since: None,
+    };
+    let reply = reading.read_metrics(a.id(), &b.addr, query, WAIT).await;
+    assert!(reply.unwrap().is_none());
+    assert_eq!(reading.active_link(&b.addr), a.addr);
+
+    // Raft RPC도 대상 id를 싣는다(링크 책이 없는 Peers).
+    let raft_only = Arc::new(Peers::new(&tls_for(&ca, b.id())));
+    let mut conn = GrpcNetwork::new(raft_only.clone())
+        .new_client(a.id(), &wrong)
+        .await;
+    conn.vote(
+        VoteRequest::new(Vote::new(0, b.id()), None),
+        RPCOption::new(Duration::from_secs(3)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(raft_only.active_link(&b.addr), a.addr);
+
+    // 링크가 하나뿐이면 다시 보낼 곳이 없어 거절이 그대로 온다.
+    let mut lone = GrpcNetwork::new(raft_only.clone())
+        .new_client(a.id(), &OrbNode::single(&b.addr))
+        .await;
+    let err = lone
+        .vote(
+            VoteRequest::new(Vote::new(0, b.id()), None),
+            RPCOption::new(Duration::from_secs(3)),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("wrong node"), "{err}");
+}
+
+/// 연결하지 못한 bulk 호출도 같은 호출 안에서 둘째 링크로 다시 보내고, 시험 호출은 control 채널의 짧은 호출만이라
+/// 재시도 간격이 지나도 bulk 호출은 답 없는 우선 링크로 가지 않는다.
+#[tokio::test]
+async fn bulk_calls_retry_on_the_next_link_and_never_try_the_preferred_one() {
+    let (ca, _root, nodes) = start(1).await;
+    let (id, server) = (nodes[0].id(), nodes[0].addr.clone());
+    let first = closed_port().await;
+    let book = Arc::new(opl_cluster::LinkBook::default());
+    book.replace([&OrbNode::new([first.clone(), server.clone()])]);
+    let retry = Duration::from_millis(300);
+    let peers = Peers::new(&tls_for(&ca, id)).with_link_retry(retry);
+    peers.set_link_book(book);
+
+    let query = MetricsQuery {
+        scope: MetricsScope::Nodes,
+        since: None,
+    };
+    // 이 노드는 지표를 모른다(옛 노드처럼 None).
+    let reply = peers
+        .read_metrics(id, &first, query.clone(), WAIT)
+        .await
+        .unwrap();
+    assert!(reply.is_none());
+    assert_eq!(peers.active_link(&first), server);
+
+    // 우선 링크가 받고 답하지 않게 되고 재시도 간격이 지나도, bulk 호출은 지금 링크로 곧바로 답을 받는다.
+    let hole = Blackhole::start(TcpListener::bind(&first).await.unwrap());
+    tokio::time::sleep(retry * 2).await;
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        peers.read_metrics(id, &first, query, WAIT),
+    )
+    .await
+    .expect("a bulk call went to the silent preferred link");
+    assert!(reply.unwrap().is_none());
+    hole.stop().await;
+}
+
+/// 주소로 쓸 수 없는 링크는 연결 실패로 세어 다음 링크로 넘어가고, 시험 호출도 거기서 끝난다.
+#[tokio::test]
+async fn a_link_that_is_not_an_address_is_skipped() {
+    let (ca, _root, nodes) = start(1).await;
+    let (id, server) = (nodes[0].id(), nodes[0].addr.clone());
+    let first = "not an address:1".to_string();
+    let book = Arc::new(opl_cluster::LinkBook::default());
+    book.replace([&OrbNode::new([first.clone(), server.clone()])]);
+    let retry = Duration::from_millis(200);
+    let peers = Peers::new(&tls_for(&ca, id)).with_link_retry(retry);
+    peers.set_link_book(book);
+
+    assert_eq!(peers.ping(id, &first, WAIT).await.unwrap(), id);
+    assert_eq!(peers.active_link(&first), server);
+    tokio::time::sleep(retry * 2).await;
+    // 시험 호출이 실패해도 다음 링크로 다시 보내 답을 받는다.
+    assert_eq!(peers.ping(id, &first, WAIT).await.unwrap(), id);
+    assert_eq!(peers.active_link(&first), server);
+}
+
+/// 받은 연결을 `to`로 잇는 TCP 중계. 연결 수를 세고, 얼리면(`freeze`) 보내는 쪽의 바이트는 계속 넘기고 받는 쪽으로
+/// 오는 답은 버린다(받고 답하지 않는 서버, 연결은 열어 둠).
+struct Relay {
+    addr: String,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    frozen: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Relay {
+    async fn start(to: String) -> Self {
+        use std::sync::atomic::Ordering;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (count, freeze) = (accepted.clone(), frozen.clone());
+        let task = tokio::spawn(async move {
+            let mut conns = tokio::task::JoinSet::new();
+            while let Ok((client, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let (to, freeze) = (to.clone(), freeze.clone());
+                conns.spawn(async move {
+                    let upstream = tokio::net::TcpStream::connect(&to).await.unwrap();
+                    let (mut client_rx, mut client_tx) = client.into_split();
+                    let (mut up_rx, mut up_tx) = upstream.into_split();
+                    let sending = async move {
+                        let _ = tokio::io::copy(&mut client_rx, &mut up_tx).await;
+                    };
+                    let answering = async move {
+                        let mut buf = [0u8; 16 << 10];
+                        loop {
+                            match up_rx.read(&mut buf).await {
+                                Ok(n) if n > 0 => {
+                                    if !freeze.load(Ordering::SeqCst)
+                                        && client_tx.write_all(&buf[..n]).await.is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                // 얼린 뒤 서버가 닫아도 받는 쪽 연결은 열어 둔다.
+                                _ if freeze.load(Ordering::SeqCst) => std::future::pending().await,
+                                _ => return,
+                            }
+                        }
+                    };
+                    tokio::join!(sending, answering);
+                });
+            }
+        });
+        Self {
+            addr,
+            accepted,
+            frozen,
+            task,
+        }
+    }
+
+    fn freeze(&self) {
+        self.frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// 이미 보낸 쓰기가 연결에서 답을 받지 못하고 `Unavailable`로 끝나면(답하지 않는 연결의 keepalive ping 만료, 약 30초)
+/// 받았을 수 있으므로 다른 링크로 다시 보내지 않는다. 링크 선택에는 연결 실패로 세어 다음 호출은 둘째 링크로 간다.
+#[tokio::test]
+async fn a_sent_write_that_loses_its_connection_is_not_sent_again() {
+    let (ca, _root, nodes) = start(1).await;
+    let (id, server) = (nodes[0].id(), nodes[0].addr.clone());
+    let first = Relay::start(server.clone()).await;
+    let second = Relay::start(server).await;
+    let book = Arc::new(opl_cluster::LinkBook::default());
+    book.replace([&OrbNode::new([first.addr.clone(), second.addr.clone()])]);
+    let peers = Peers::new(&tls_for(&ca, id));
+    peers.set_link_book(book);
+    assert_eq!(peers.ping(id, &first.addr, WAIT).await.unwrap(), id);
+
+    first.freeze();
+    let remove = LeaderRequest::Remove {
+        id: NodeId(Uuid::now_v7()),
+    };
+    let started = Instant::now();
+    let err = peers.leader_request(&first.addr, remove).await.unwrap_err();
+    assert!(
+        matches!(err, opl_cluster::ClusterError::Unreachable(_)),
+        "{err:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(60), "{err:?}");
+    assert_eq!(second.accepted(), 0, "the write was sent again");
+    assert_eq!(first.accepted(), 1);
+    assert_eq!(peers.active_link(&first.addr), second.addr);
+    peers
+        .leader_request(&first.addr, LeaderRequest::RenewLease { node: id })
+        .await
+        .unwrap();
+}
+
+/// 노드의 링크가 `[닫힌 포트, 서버]`면 첫 호출이 연결 실패로 같은 호출 안에서 둘째 링크로 다시 가고, 그 뒤의 ping·
+/// 리더 요청·Follow·Raft RPC가 둘째 링크로 간다. Raft는 링크 책 없이도 멤버십의 링크로 넘어가고, 책이 있으면 책의
+/// 목록을 쓴다(다른 호출과 같은 선택).
+#[tokio::test]
+async fn calls_fail_over_to_the_second_link() {
+    let (ca, _root, nodes) = start(1).await;
+    let (id, server) = (nodes[0].id(), nodes[0].addr.clone());
+    let first = closed_port().await;
+    let node = OrbNode::new([first.clone(), server.clone()]);
+    let book = Arc::new(opl_cluster::LinkBook::default());
+    book.replace([&node]);
+    let peers = Arc::new(Peers::new(&tls_for(&ca, id)));
+    peers.set_link_book(book);
+    assert_eq!(peers.active_link(&first), first);
+
+    assert_eq!(peers.ping(id, &first, WAIT).await.unwrap(), id);
+    assert_eq!(peers.active_link(&first), server);
+    assert_eq!(peers.ping(id, &first, WAIT).await.unwrap(), id);
+    peers
+        .leader_request(&first, LeaderRequest::RenewLease { node: id })
+        .await
+        .unwrap();
+    let mut frames = FollowClient::follow(peers.as_ref(), id, &first, 0)
+        .await
+        .unwrap();
+    assert!(matches!(
+        frames.next().await,
+        Some(Ok(FollowFrame::Hello { .. }))
+    ));
+
+    let vote = || VoteRequest::new(Vote::new(0, id), None);
+    let option = || RPCOption::new(Duration::from_secs(3));
+    // 책이 있으면 Raft도 책의 링크를 쓴다(로그의 멤버십이 아직 링크 하나여도 지금 링크 그대로).
+    let mut conn = GrpcNetwork::new(peers.clone())
+        .new_client(id, &OrbNode::single(&first))
+        .await;
+    conn.vote(vote(), option()).await.unwrap();
+    assert_eq!(peers.active_link(&first), server);
+
+    // 링크 책이 없는 Peers의 Raft도 멤버십의 링크로 넘어간다.
+    let raft_only = Arc::new(Peers::new(&tls_for(&ca, id)));
+    let mut conn = GrpcNetwork::new(raft_only.clone())
+        .new_client(id, &node)
+        .await;
+    conn.vote(vote(), option()).await.unwrap();
+    assert_eq!(raft_only.active_link(&first), server);
+    conn.vote(vote(), option()).await.unwrap();
+}
+
+/// 받고 답하지 않는 우선 링크로 보낸 리스 갱신은 3초 제한 시간에 넘어가고 다음 갱신은 둘째 링크로 성공한다. 우선
+/// 링크에 서버가 다시 뜨면 재시도 간격 뒤의 시험 호출로 돌아온다.
+#[tokio::test]
+async fn a_silent_link_times_out_and_the_preferred_link_comes_back() {
+    let (ca, _root, nodes) = start(1).await;
+    let (id, server) = (nodes[0].id(), nodes[0].addr.clone());
+    let hole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = hole.local_addr().unwrap().to_string();
+    let hole = Blackhole::start(hole);
+    let book = Arc::new(opl_cluster::LinkBook::default());
+    book.replace([&OrbNode::new([first.clone(), server.clone()])]);
+    let retry = Duration::from_secs(2);
+    let peers = Peers::new(&tls_for(&ca, id)).with_link_retry(retry);
+    peers.set_link_book(book);
+
+    let started = Instant::now();
+    let renew = || LeaderRequest::RenewLease { node: id };
+    assert!(peers.leader_request(&first, renew()).await.is_err());
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(2500) && took < Duration::from_secs(10),
+        "{took:?}"
+    );
+    assert_eq!(peers.active_link(&first), server);
+    peers.leader_request(&first, renew()).await.unwrap();
+
+    // 우선 링크에 같은 노드의 서버를 띄운다.
+    hole.stop().await;
+    let listener = TcpListener::bind(&first).await.unwrap();
+    let tls = tls_for(&ca, id);
+    let service = PeerService::new(nodes[0].cluster.clone(), None);
+    let (stop, rx) = oneshot::channel::<()>();
+    let revived = tokio::spawn(async move {
+        opl_peer::serve(listener, &tls, service, async {
+            let _ = rx.await;
+        })
+        .await
+        .unwrap();
+    });
+    // 재시도 간격 전에는 둘째 링크에 머문다.
+    peers.leader_request(&first, renew()).await.unwrap();
+    assert_eq!(peers.active_link(&first), server);
+    let deadline = Instant::now() + WAIT;
+    while peers.active_link(&first) != first {
+        assert!(
+            Instant::now() < deadline,
+            "did not return to the preferred link"
+        );
+        let _ = peers.leader_request(&first, renew()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(started.elapsed() >= retry);
+    peers.leader_request(&first, renew()).await.unwrap();
+    let _ = stop.send(());
+    revived.await.unwrap();
 }

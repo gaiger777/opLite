@@ -459,7 +459,7 @@ fn rendezvous(me: NodeId, voter: NodeId) -> u64 {
     h.finish()
 }
 
-fn read_membership(db: &Database) -> Result<Membership, StoreError> {
+pub(crate) fn read_membership(db: &Database) -> Result<Membership, StoreError> {
     let txn = db.begin_read()?;
     let meta = txn.open_table(META)?;
     Ok(get_json(&meta, KEY_LAST_MEMBERSHIP)?.unwrap_or_default())
