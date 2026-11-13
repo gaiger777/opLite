@@ -16,6 +16,7 @@ mod config;
 mod control;
 #[cfg(feature = "ha-it")]
 mod fault;
+mod fence_watch;
 mod firewall;
 mod host;
 mod join;

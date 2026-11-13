@@ -4,15 +4,17 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context;
 use opl_cluster::types::{NodeId, Rejection};
 use opl_cluster::{Cluster, ClusterError, ZONE_LABEL};
 use opl_peer::pki::{ClusterCa, NodeTls, cert_names};
+use opl_reconciler::HaGuard;
 use opl_types::auth::{Role, UserSpec};
 use opl_types::cluster::ClusterSpec;
 use opl_types::host::same_host;
-use opl_types::node::{FEATURES, NodeShutdown, NodeSpec, NodeStatus};
+use opl_types::node::{FEATURES, NodeHa, NodeShutdown, NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::version::BUILD;
 use opl_types::vm::Arch;
@@ -24,6 +26,9 @@ use crate::member::pki_dir;
 
 pub const NODE_ID_FILE: &str = "node-id";
 const NODE_ID_TMP_FILE: &str = "node-id.tmp";
+/// 키운 HA 값 기록([`record_raised_ha`]) 한 번의 제한 시간과 다시 해 보는 간격
+const HA_RECORD_TIMEOUT: Duration = Duration::from_secs(2);
+const HA_RECORD_RETRY: Duration = Duration::from_millis(500);
 
 /// 처음 시작할 때 만든 노드 id를 계속 쓴다. Raft 노드 id이자 Node 리소스 id다.
 pub fn node_id(data_dir: &Path) -> anyhow::Result<Uuid> {
@@ -151,6 +156,46 @@ pub async fn register_node(cluster: &Cluster, config: &Config, host: &Host) -> a
     record_node(cluster, config, host, underlay).await
 }
 
+/// 이 노드에 설정한 HA 값(`configured`, [`Config::node_ha`])이 기록된 값(`stored`)보다 크다: 리더가 등록 전까지
+/// 기록된 값으로 일찍 복구할 수 있다. 펜싱을 새로 켰거나 `recover_after`(watchdog 포함)·`fence_after` 가운데
+/// 하나라도 커졌으면 true다. 펜싱을 껐거나 같거나 작아졌으면 false다.
+pub fn ha_raised(stored: Option<&NodeHa>, configured: Option<&NodeHa>) -> bool {
+    let Some(configured) = configured else {
+        return false;
+    };
+    let Some(stored) = stored else {
+        return true;
+    };
+    configured.recover_after_secs > stored.recover_after_secs
+        || configured.fence_after_secs.unwrap_or(0) > stored.fence_after_secs.unwrap_or(0)
+}
+
+/// 키운 HA 값(`status.ha`)만 먼저 기록하고 `guard`의 붙들기([`HaGuard::hold_until_recorded`])를 푼다. 전체 등록
+/// ([`register_node`])은 이름 풀기·브리지 읽기로 오래 걸릴 수 있고, 그동안 `arm`하지 못하면 이전 프로세스가 켜 둔
+/// watchdog을 아무도 쓰다듬지 않아 호스트가 재시작된다. 그래서 `status.ha` 하나만 짧게(시도마다
+/// [`HA_RECORD_TIMEOUT`], [`HA_RECORD_RETRY`]마다) 쓸 때까지 다시 한다.
+pub async fn record_raised_ha(cluster: &Cluster, config: &Config, guard: &HaGuard) {
+    let ha = config.node_ha();
+    loop {
+        let write = update_node_status(cluster, |status| {
+            if status.ha == ha {
+                return false;
+            }
+            status.ha = ha;
+            true
+        });
+        match tokio::time::timeout(HA_RECORD_TIMEOUT, write).await {
+            Ok(Ok(())) => break,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "cannot record the longer HA timings; will retry")
+            }
+            Err(_) => tracing::warn!("recording the longer HA timings timed out; will retry"),
+        }
+        tokio::time::sleep(HA_RECORD_RETRY).await;
+    }
+    guard.recorded();
+}
+
 /// `register_node`의 기록. `underlay`는 정한 underlay다(None이면 풀지 못한 것).
 async fn record_node(
     cluster: &Cluster,
@@ -175,7 +220,7 @@ async fn record_node(
             // 풀 상태는 풀 새로 고침이 쓴다. 이미 적힌 것을 지우지 않는다.
             pools: std::mem::take(&mut status.pools),
             // 펜싱이 꺼져 있으면 None이라 리더가 이 노드의 HA VM을 옮기지 않는다.
-            ha: config.ha.node_ha(),
+            ha: config.node_ha(),
             // 이름을 풀지 못하면(설정·IP 리터럴이 아님) 기록된 값을 지킨다(잠깐 DNS가 안 된다고
             // VXLAN 네트워크를 잃지 않게).
             underlay: underlay.or(status.underlay),
@@ -190,6 +235,8 @@ async fn record_node(
             cluster_addresses: announced_links(config),
             // 다시 시작했으니 지난 호스트 종료 표시는 지운다(얼린 노드가 풀린다).
             shutdown: None,
+            // 이웃 확인 결과는 `FenceWatch`가 쓴다. 지우지 않는다.
+            fence_check: status.fence_check.take(),
         };
         true
     })
@@ -344,7 +391,7 @@ pub async fn mark_offline(cluster: &Cluster) {
 
 /// 이 노드의 status를 `change`로 고쳐 쓴다(`false`면 쓰지 않는다). status의 다른 필드는 다른
 /// 작업(풀 새로 고침)도 쓰므로 revision을 확인하며 쓰고, 그 사이 누가 썼으면 다시 읽어 다시 고친다.
-async fn update_node_status(
+pub(crate) async fn update_node_status(
     cluster: &Cluster,
     mut change: impl FnMut(&mut NodeStatus) -> bool,
 ) -> anyhow::Result<()> {
@@ -783,6 +830,92 @@ pub(crate) mod tests {
                 "fast-ha"
             ]
         );
+        cluster.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn ha_raised_only_when_the_configured_timings_grow() {
+        use opl_types::node::Fencing;
+        let ha = |fencing, fence_after: Option<u64>, recover_after| NodeHa {
+            fencing,
+            recover_after_secs: recover_after,
+            fence_after_secs: fence_after,
+        };
+        let fast = ha(Fencing::Watchdog, Some(10), 22);
+        let safe = ha(Fencing::Watchdog, Some(30), 62);
+        // fast → safe, 펜싱을 새로 켬, 계획 51 전 기록(fence_after 없음)
+        assert!(ha_raised(Some(&fast), Some(&safe)));
+        assert!(ha_raised(None, Some(&fast)));
+        assert!(ha_raised(
+            Some(&ha(Fencing::Watchdog, None, 22)),
+            Some(&fast)
+        ));
+        // process → watchdog(recover_after만 커짐)
+        assert!(ha_raised(
+            Some(&ha(Fencing::Process, Some(10), 12)),
+            Some(&fast)
+        ));
+        // 같거나 작아짐, 펜싱을 끔
+        assert!(!ha_raised(Some(&fast), Some(&fast)));
+        assert!(!ha_raised(Some(&safe), Some(&fast)));
+        assert!(!ha_raised(Some(&fast), None));
+        assert!(!ha_raised(None, None));
+    }
+
+    /// 키운 HA 값은 `status.ha` 하나만 써서 붙들기를 푼다: 전체 등록(이름 풀기·브리지 읽기·온라인 표시)을
+    /// 기다리지 않는다.
+    #[tokio::test]
+    async fn raised_ha_timings_are_recorded_alone_and_release_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let cluster = Arc::new(cluster);
+        let config: Config = toml::from_str(
+            "name = \"n\"\naddress = \"10.0.0.1\"\n[hypervisor]\naccel = \"tcg\"\nsystemd_scope = false\n[ha]\nfencing = \"process\"",
+        )
+        .unwrap();
+        ensure_node(&cluster, &config).await.unwrap();
+        let guard = HaGuard::spawn(cluster.clone(), config.ha.guard_config().unwrap());
+        guard.subscribe().wait_for(|s| s.fresh).await.unwrap();
+        guard.hold_until_recorded();
+        assert!(matches!(
+            guard.arm(),
+            Err(opl_reconciler::ha::ArmError::Unrecorded)
+        ));
+        record_raised_ha(&cluster, &config, &guard).await;
+        guard.arm().unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert_eq!(node.status.ha, config.node_ha());
+        assert!(config.node_ha().is_some());
+        // 등록의 다른 기록은 아직 없다.
+        assert!(!node.status.online);
+        assert_eq!(node.status.version, None);
+        guard.close();
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 다시 등록해도 이웃 확인 결과(`fence_check`, `FenceWatch`가 쓴다)를 지우지 않는다.
+    #[tokio::test]
+    async fn registration_keeps_the_fence_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        register_node(&cluster, &config, &host).await.unwrap();
+        let check = opl_types::node::FenceCheck {
+            at: 7,
+            by: "n2".into(),
+            error: Some("ipmi: timed out".into()),
+        };
+        update_node_status(&cluster, |status| {
+            status.fence_check = Some(check.clone());
+            true
+        })
+        .await
+        .unwrap();
+        register_node(&cluster, &config, &host).await.unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert_eq!(node.status.fence_check, Some(check));
         cluster.shutdown().await.unwrap();
     }
 

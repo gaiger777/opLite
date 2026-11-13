@@ -69,7 +69,7 @@ pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
 pub use backup_jobs::{BackupJobScheduler, BackupJobSchedulerConfig};
 pub use drain::start_drain;
 pub use firmware::UefiVarsFetcher;
-pub use ha::{HaManager, HaManagerConfig, RecoveryWriter};
+pub use ha::{HaManager, HaManagerConfig, LEASE_EXPIRED, RecoveryWriter};
 pub use health::RuntimeProbe;
 pub use incoming::{IncomingConfig, IncomingMigrations};
 pub use janitor::{ClusterJanitor, ClusterJanitorConfig};

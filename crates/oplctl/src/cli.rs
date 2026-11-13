@@ -6377,6 +6377,7 @@ const NODE_HEADERS: &[&str] = &[
     "VOTER",
     "ROLES",
     "FENCING",
+    "FENCE",
     "SHUTDOWN",
 ];
 
@@ -6422,8 +6423,22 @@ fn node_row(n: &Value, cluster: &Value) -> Vec<String> {
         node_roles_cell(&n["spec"]),
         // 펜싱이 꺼진 노드(옛 서버도)는 `ha`가 없다.
         cell(&n["status"]["ha"]["fencing"]),
+        node_fence_cell(&n["status"]),
         node_shutdown_cell(&n["status"]),
     ]
+}
+
+/// 전원 끄기 펜싱의 이웃 확인: 확인한 적이 없으면(펜싱 없음, 옛 서버) `-`, 모든 방법이 전원을 읽지 못했으면
+/// `unreachable`, 아니면 `ok`다.
+fn node_fence_cell(status: &Value) -> String {
+    let check = &status["fence_check"];
+    if check.is_null() {
+        "-".into()
+    } else if check["error"].is_null() {
+        "ok".into()
+    } else {
+        "unreachable".into()
+    }
 }
 
 /// 호스트 종료 표시. 오프라인인 `freeze`는 얼린 노드(`frozen`, `node unfreeze`로 푼다)이고, 표시가 없으면 `-`다.
@@ -9296,8 +9311,10 @@ mod tests {
         a["status"]["ha"] = json!({ "fencing": "watchdog", "recover_after_secs": 65 });
         a["status"]["underlay"] = json!("10.0.0.1");
         a["status"]["version"] = json!("0.2.0");
+        a["status"]["fence_check"] = json!({ "at": 1, "by": "old" });
         let mut none = node("none", Some(false));
         none["spec"]["roles"] = json!([]);
+        none["status"]["fence_check"] = json!({ "at": 1, "by": "a", "error": "ipmi: timed out" });
         // a·w는 투표 멤버, old는 learner, none은 멤버십에 없다.
         let cluster = json!({ "members": [
             { "id": "id-a", "voter": true },
@@ -9314,11 +9331,11 @@ mod tests {
         // underlay가 없는 노드(위트니스, 옛 서버)는 `-`다. 역할이 없으면 기본 역할(위트니스는 없음)이다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  VOTER  ROLES  FENCING   SHUTDOWN\n\
-             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    true   api    watchdog  -\n\
-             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     true   -      -         -\n\
-             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    false  api    -         -\n\
-             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -      -         -\n"
+            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  VOTER  ROLES  FENCING   FENCE        SHUTDOWN\n\
+             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    true   api    watchdog  ok           -\n\
+             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     true   -      -         -            -\n\
+             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    false  api    -         -            -\n\
+             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -      -         unreachable  -\n"
         );
     }
 

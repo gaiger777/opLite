@@ -13,6 +13,10 @@
 //! 켜지지 않은 VM이 `ha_start_concurrency`개면 그 노드로는 더 옮기지 않는다(그 VM은 다음 틱에 다시 본다).
 //! 복구할 노드가 없을 때 `plan_every`마다 노드마다 "그 노드가 죽으면" 옮길 대상을 미리 골라 두고, 복구 때
 //! 그 대상이 지금도 맞으면 그대로 쓴다(설계 §8.1).
+//!
+//! 전원 끄기 펜싱(설계 §8.1): 리스가 `fence_after`보다 오래 끝났고 `NodeFence`가 있는 노드(HA VM이 있는 계획 51
+//! 노드)를 그 방법으로 한 번 끈다. 꺼짐을 확인했고 그 뒤 받은 갱신이 없으면 `recover_after`를 기다리지 않고
+//! 복구한다. 끄지 못하면 이 임기에는 다시 하지 않고 `recover_after`(watchdog)를 기다린다.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,19 +26,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opl_cluster::types::{Command, LeaderRequest, NodeId, Rejection};
 use opl_cluster::{Cluster, ClusterError, Leases, Typed};
-use opl_types::node::{Node, NodeSpec};
+use opl_types::fence::NodeFenceSpec;
+use opl_types::node::{FAST_HA, Node, NodeSpec, ha_capable};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
     DEFAULT_HA_PRIORITY, HaState, PowerState, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::auth::unix_now;
 use crate::placement::{self, Assign, Candidate};
+use crate::power_fence::{PowerFence, PowerOff, power_off};
 use crate::scheduler::{Inventory, node_fits};
 use crate::state::AppState;
 use crate::vms::{RuleCheck, start_migration};
@@ -50,6 +56,13 @@ const TASK_FAIL_ATTEMPTS: usize = 3;
 
 /// 옮긴 VM이 대상 노드에서 켜지기를 기다리는 시간. 지나면 동시 시작 수에서 뺀다.
 const HA_START_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 리스가 `fence_after`보다 오래 끝나 리더가 노드를 끈 이유(기록 Task의 `reason`)
+pub const LEASE_EXPIRED: &str = "lease expired";
+
+/// 끄기가 실패했지만 그사이 watchdog 기다림으로 HA VM을 이미 옮겼다(경고·기록 Task의 오류).
+const ALREADY_RECOVERED: &str =
+    "power off failed; the node's VMs were already recovered after the watchdog wait";
 
 #[derive(Debug, Clone)]
 pub struct HaManagerConfig {
@@ -75,9 +88,12 @@ impl Default for HaManagerConfig {
 pub struct HaManager {
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<()>,
+    /// [`HaManager::power_off`]의 요청(노드, 이유)
+    requests: mpsc::UnboundedSender<(Uuid, String)>,
 }
 
 impl HaManager {
+    /// 노드를 끌 때 `state.fence`를 쓴다.
     pub fn spawn(state: Arc<AppState>, config: HaManagerConfig) -> Self {
         Self::spawn_with_writer(state, config, Arc::new(LeaderWriter))
     }
@@ -88,11 +104,41 @@ impl HaManager {
         config: HaManagerConfig,
         writer: Arc<dyn RecoveryWriter>,
     ) -> Self {
+        let fence = state.fence.clone();
+        Self::start(state, config, writer, fence)
+    }
+
+    /// 전원 끄기 실행기를 바꿔 끼워 띄운다(시험).
+    pub fn spawn_with_fence(
+        state: Arc<AppState>,
+        config: HaManagerConfig,
+        fence: Arc<dyn PowerFence>,
+    ) -> Self {
+        Self::start(state, config, Arc::new(LeaderWriter), fence)
+    }
+
+    fn start(
+        state: Arc<AppState>,
+        config: HaManagerConfig,
+        writer: Arc<dyn RecoveryWriter>,
+        fence: Arc<dyn PowerFence>,
+    ) -> Self {
         let (shutdown, rx) = oneshot::channel();
+        let (requests, wanted) = mpsc::unbounded_channel();
+        let power = PowerFencing::new(fence, wanted);
         Self {
             shutdown,
-            task: tokio::spawn(run(state, config, writer, rx)),
+            task: tokio::spawn(run(state, config, writer, power, rx)),
+            requests,
         }
+    }
+
+    /// 노드 `node`를 전원 끄기 펜싱으로 끄라고 한다(리스가 살아 있어도). 이 노드가 리더면 다음 틱에 그 노드의
+    /// `NodeFence` 방법으로 끄고, 꺼짐을 확인하면 리스가 끝난 노드처럼 HA VM을 옮긴다. 리더가 아니거나, 그
+    /// 노드가 이 노드이거나, `NodeFence`가 없거나, 이 임기에 이미 끄는 중이거나 끈 노드면 하지 않는다. 리스가 끝난
+    /// 노드와 함께 한 임기에 HA 가능 노드의 소수(`(n - 1) / 2`, 적어도 1)까지만 끈다.
+    pub fn power_off(&self, node: Uuid, reason: impl Into<String>) {
+        let _ = self.requests.send((node, reason.into()));
     }
 
     pub async fn shutdown(self) {
@@ -185,6 +231,36 @@ struct Plans {
     targets: BTreeMap<Uuid, BTreeMap<Uuid, Uuid>>,
 }
 
+/// 미리 고르기 계산([`plan`])은 HA VM × 노드 × VM만큼 걸리므로 core 실행기 밖(`spawn_blocking`)에서 한다. 결과는
+/// 다음 틱에 받고, 계산 중에는 새로 시작하지 않는다. 리더 자리를 잃으면 버린다(계산은 끝까지 가지만 결과를 버린다).
+#[derive(Default)]
+struct Planner(Option<JoinHandle<Plans>>);
+
+impl Planner {
+    /// 끝난 계산의 결과. 계산 중이거나 시작하지 않았으면 None이다.
+    async fn finished(&mut self) -> Option<Plans> {
+        if !self.0.as_ref()?.is_finished() {
+            return None;
+        }
+        match self.0.take()?.await {
+            Ok(plans) => Some(plans),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot choose HA recovery targets in advance");
+                None
+            }
+        }
+    }
+
+    /// 계산 중이 아니면 `compute`를 시작한다(시작했으면 true).
+    fn start(&mut self, compute: impl FnOnce() -> Plans + Send + 'static) -> bool {
+        if self.0.is_some() {
+            return false;
+        }
+        self.0 = Some(tokio::task::spawn_blocking(compute));
+        true
+    }
+}
+
 impl Plans {
     /// 다시 계산할 때다.
     fn due(&self, now: Instant, every: Duration) -> bool {
@@ -201,9 +277,187 @@ impl Plans {
     }
 }
 
+/// 이 리더가 노드를 끄는 시도의 결과
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// 끄는 중
+    Running,
+    /// 이때 꺼짐을 확인했다.
+    Off(Instant),
+    /// 이때 모든 방법이 실패했다.
+    Failed(Instant),
+}
+
+/// 노드 하나를 끄는 시도
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Attempt {
+    /// 결과를 이 시도와 짝짓는 번호
+    id: u64,
+    /// 시작한 임기
+    term: u64,
+    reason: String,
+    outcome: Outcome,
+}
+
+/// 노드마다 이 리더의 끄기 시도. 노드마다 한 번만 하고(실패해도 이 임기에는 다시 하지 않는다), 그 노드가 끝난
+/// 뒤 리스를 다시 갱신하면 지운다.
+#[derive(Debug, Default)]
+struct Attempts(BTreeMap<Uuid, Attempt>);
+
+impl Attempts {
+    /// 꺼짐을 확인했고 그 뒤 받은 갱신이 없으면 확인한 때
+    fn confirmed_off(&self, node: Uuid, leases: &Leases) -> Option<Instant> {
+        match self.0.get(&node)?.outcome {
+            Outcome::Off(at) if renewed_after(leases, node, at).is_none() => Some(at),
+            _ => None,
+        }
+    }
+
+    /// 끝난 시도 뒤 리스를 다시 갱신한 노드(다시 켜졌거나 이어졌다)와 다른 임기의 시도를 지운다.
+    fn forget_revived(&mut self, leases: &Leases) {
+        self.0.retain(|node, a| {
+            a.term == leases.term
+                && match a.outcome {
+                    Outcome::Running => true,
+                    Outcome::Off(at) | Outcome::Failed(at) => {
+                        renewed_after(leases, *node, at).is_none()
+                    }
+                }
+        });
+    }
+
+    /// 끄는 중이거나 끈 노드(복구 대상으로 고르지 않는다)
+    fn down(&self) -> BTreeSet<Uuid> {
+        self.0.keys().copied().collect()
+    }
+}
+
+/// 노드가 `at` 뒤에 리스를 갱신했으면 그 때
+fn renewed_after(leases: &Leases, node: Uuid, at: Instant) -> Option<Instant> {
+    leases
+        .renewed
+        .get(&NodeId(node))
+        .copied()
+        .filter(|renewed| *renewed > at)
+}
+
+/// 끄기 작업이 끝나 보낸 결과
+struct Done {
+    node: Uuid,
+    id: u64,
+    result: PowerOff,
+    /// 결과가 나온 때
+    at: Instant,
+}
+
+/// 한 임기에 끄기를 시작한 노드 수. 리더 쪽 문제(리스 갱신이 멈춤 등)로 여러 건강한 노드를 한꺼번에 끄지 않게
+/// HA 가능 노드의 소수(`(n - 1) / 2`, 적어도 1)까지만 끈다.
+#[derive(Debug, Default)]
+struct Budget {
+    term: u64,
+    started: usize,
+    /// 상한에 걸려 끄지 않은 노드(경고는 한 번)
+    capped: BTreeSet<Uuid>,
+}
+
+impl Budget {
+    /// 임기가 바뀌었으면 처음부터 센다.
+    fn begin(&mut self, term: u64) {
+        if self.term != term {
+            *self = Budget {
+                term,
+                ..Budget::default()
+            };
+        }
+    }
+
+    /// 노드 하나를 더 끌 수 있으면 센다. 넘으면 false다.
+    fn take(&mut self, limit: usize) -> bool {
+        if self.started >= limit {
+            return false;
+        }
+        self.started += 1;
+        true
+    }
+}
+
+/// 한 임기에 끌 수 있는 노드 수: HA 가능 노드 `n`의 소수(`(n - 1) / 2`, 적어도 1)
+fn power_off_limit(inv: &Inventory) -> usize {
+    let n = inv.nodes.iter().filter(|n| ha_capable(n)).count();
+    (n.saturating_sub(1) / 2).max(1)
+}
+
+/// 리더의 전원 끄기 펜싱 상태. 끄기는 따로 띄운 작업에서 하고(틱을 막지 않는다) 결과는 다음 틱에 받는다. 리더
+/// 자리를 잃으면 시도를 비운다(진행 중인 끄기는 끝까지 가지만 결과는 버린다).
+struct PowerFencing {
+    fence: Arc<dyn PowerFence>,
+    attempts: Attempts,
+    budget: Budget,
+    next: u64,
+    done_tx: mpsc::UnboundedSender<Done>,
+    done_rx: mpsc::UnboundedReceiver<Done>,
+    requests: mpsc::UnboundedReceiver<(Uuid, String)>,
+}
+
+impl PowerFencing {
+    fn new(fence: Arc<dyn PowerFence>, requests: mpsc::UnboundedReceiver<(Uuid, String)>) -> Self {
+        let (done_tx, done_rx) = mpsc::unbounded_channel();
+        Self {
+            fence,
+            attempts: Attempts::default(),
+            budget: Budget::default(),
+            next: 0,
+            done_tx,
+            done_rx,
+            requests,
+        }
+    }
+
+    /// 리더가 아니다: 시도와 요청을 버린다.
+    fn reset(&mut self) {
+        self.attempts = Attempts::default();
+        self.budget = Budget::default();
+        while let Ok((node, reason)) = self.requests.try_recv() {
+            tracing::info!(node = %node, reason = %reason, "not the leader; ignoring a power-off request");
+        }
+    }
+
+    /// 노드 `node`를 `spec`의 방법으로 끄기 시작한다.
+    fn start(&mut self, node: Node, spec: NodeFenceSpec, reason: String, term: u64) {
+        self.next += 1;
+        let id = self.next;
+        tracing::warn!(node = %node.name, reason = %reason, "powering off a node (power fencing)");
+        self.attempts.0.insert(
+            node.id,
+            Attempt {
+                id,
+                term,
+                reason,
+                outcome: Outcome::Running,
+            },
+        );
+        let (fence, tx) = (self.fence.clone(), self.done_tx.clone());
+        tokio::spawn(async move {
+            let result = power_off(fence.as_ref(), &node, &spec).await;
+            let _ = tx.send(Done {
+                node: node.id,
+                id,
+                result,
+                at: Instant::now(),
+            });
+        });
+    }
+}
+
 /// 노드마다 그 노드가 지금 죽으면 HA VM을 옮길 노드를 고른다: 그 노드의 VM을 모두 자리에서 빼고, 옮길 VM을
 /// 복구 순서([`recovery_order`])로 [`pick`]해 앞 VM의 자리를 다음 VM에 센다(복구와 같은 셈).
-fn plan(inv: &Inventory, leases: &Leases, now: Instant, b: Instant) -> Plans {
+fn plan(
+    inv: &Inventory,
+    leases: &Leases,
+    now: Instant,
+    b: Instant,
+    down: &BTreeSet<Uuid>,
+) -> Plans {
     let mut targets = BTreeMap::new();
     for node in inv.nodes.iter().filter(|n| n.status.ha.is_some()) {
         let mut vms: Vec<&Vm> = inv
@@ -222,8 +476,12 @@ fn plan(inv: &Inventory, leases: &Leases, now: Instant, b: Instant) -> Plans {
         let mut chosen = BTreeMap::new();
         for vm in vms {
             let migrating = vm.status.migration.as_ref().map(|m| m.node);
-            let eligible =
-                |n: &Node| n.id != node.id && Some(n.id) != migrating && alive(now, b, leases, n);
+            let eligible = |n: &Node| {
+                n.id != node.id
+                    && Some(n.id) != migrating
+                    && !down.contains(&n.id)
+                    && ready(now, b, leases, n)
+            };
             let target = match pick(vm, inv, &assign, eligible) {
                 Pick::Node(t) | Pick::Violating(t, _) => t,
                 Pick::NoNode | Pick::Blocked(_) => continue,
@@ -266,6 +524,8 @@ fn stays_stopped(vm: &Vm) -> bool {
 /// 한 노드를 복구하는 동안 쓰는 것: 그 노드의 계획, 대상 노드마다의 진행 중 시작과 상한, 셈(로그)
 struct Queue<'a> {
     plan: Option<&'a BTreeMap<Uuid, Uuid>>,
+    /// 끄는 중이거나 끈 노드(대상으로 고르지 않는다)
+    down: &'a BTreeSet<Uuid>,
     starting: &'a mut Starting,
     limit: usize,
     /// 계획대로 옮긴 수
@@ -291,6 +551,7 @@ async fn run(
     state: Arc<AppState>,
     config: HaManagerConfig,
     writer: Arc<dyn RecoveryWriter>,
+    mut power: PowerFencing,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut base: Base = None;
@@ -299,6 +560,7 @@ async fn run(
     let mut failback = Failback::default();
     let mut starting = Starting::default();
     let mut plans = Plans::default();
+    let mut planner = Planner::default();
     let mut interval = tokio::time::interval(config.tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -316,7 +578,7 @@ async fn run(
         };
         tokio::select! {
             _ = &mut shutdown => return,
-            _ = tick(ctx, &config, &mut base, &mut unknown, &mut moved, &mut failback, &mut starting, &mut plans) => {}
+            _ = tick(ctx, &config, &mut base, &mut unknown, &mut moved, &mut failback, &mut starting, &mut plans, &mut planner, &mut power) => {}
         }
     }
 }
@@ -331,6 +593,8 @@ async fn tick(
     failback: &mut Failback,
     starting: &mut Starting,
     plans: &mut Plans,
+    planner: &mut Planner,
+    power: &mut PowerFencing,
 ) {
     let cluster = ctx.cluster;
     for node in settled_by_term(unknown, ctx.writer.term(cluster), moved) {
@@ -341,6 +605,8 @@ async fn tick(
         *failback = Failback::default();
         *starting = Starting::default();
         *plans = Plans::default();
+        *planner = Planner::default();
+        power.reset();
         return;
     }
     // 새 리더는 이전 커밋을 아직 적용하지 않았을 수 있으므로 장벽 뒤에 읽는다.
@@ -356,24 +622,41 @@ async fn tick(
         return;
     };
     let me = cluster.id().0;
+    fence_power(ctx, power, &inv, &leases, now, b, unknown).await;
     let failed: Vec<Uuid> = inv
         .nodes
         .iter()
         .filter(|n| n.id != me && !unknown.contains_key(&n.id))
         // 호스트 종료 정책으로 얼린 노드의 HA VM은 그 노드가 돌아와 켠다.
         .filter(|n| !n.status.frozen())
-        .filter(|n| expired(now, b, &leases, n))
+        .filter(|n| dead(now, b, &leases, n, &power.attempts))
         .filter(|n| inv.vms.iter().any(|vm| recoverable(vm, n.id)))
         .map(|n| n.id)
         .collect();
     let recovering = !failed.is_empty();
+    let down = power.attempts.down();
     starting.prune(&inv, now);
+    if let Some(done) = planner.finished().await {
+        *plans = done;
+    }
     if !recovering && plans.due(now, config.plan_every) {
-        *plans = plan(&inv, &leases, now, b);
+        let (inv, leases, down) = (inv.clone(), leases.clone(), down.clone());
+        planner.start(move || plan(&inv, &leases, now, b, &down));
     }
     for node in failed {
         let plan = plans.of(node, now, config.plan_every);
-        if let Some(u) = recover_node(ctx, leases.term, b, node, plan, starting).await {
+        let recovered = recover_node(
+            ctx,
+            leases.term,
+            b,
+            node,
+            plan,
+            starting,
+            &power.attempts,
+            &down,
+        )
+        .await;
+        if let Some(u) = recovered {
             unknown.insert(node, u);
         }
     }
@@ -508,9 +791,172 @@ fn settled(result: &Result<u64, ClusterError>) -> bool {
     )
 }
 
-/// 노드 `node`를 펜싱 중으로 표시하고, 리스가 여전히 끝났으면 그 HA VM을 [`recovery_order`]로 옮긴다
-/// (대상은 `plan`이 맞으면 그것, 아니면 그 자리에서 고른다). 대상 노드가 동시 시작 상한에 걸린 VM은 다음
-/// 틱으로 미룬다. 결과를 모르는 쓰기가 생기면 펜싱 표시를 지우지 않고 그 쓰기를 돌려준다.
+/// 전원 끄기 펜싱 한 틱: 끝난 끄기의 결과를 받아 기록하고, 다시 갱신한 노드의 시도를 지운 뒤, 요청받은 노드와
+/// 끌 노드를 끄기 시작한다. 끌 노드는 HA 가능하고 `fence_after`를 알리며(계획 51 노드) 얼리지 않았고 켜기로 된
+/// HA VM이 있으며 리스가 `fence_after`보다 오래 끝났고 결과를 모르는 복구 쓰기가 없는 노드다(이 리더의 리스가
+/// `fence_after`보다 새로울 때만, 리스를 갱신한 적이 없으면 끄지 않는다). 둘 다 `NodeFence`가 있어야 하고, 한 임기에
+/// [`power_off_limit`]개까지만 끈다(넘으면 watchdog 기다림).
+async fn fence_power(
+    ctx: Ctx<'_>,
+    power: &mut PowerFencing,
+    inv: &Inventory,
+    leases: &Leases,
+    now: Instant,
+    b: Instant,
+    unknown: &Unknowns,
+) {
+    while let Ok(done) = power.done_rx.try_recv() {
+        let Some(attempt) = power
+            .attempts
+            .0
+            .get_mut(&done.node)
+            .filter(|a| a.id == done.id && a.outcome == Outcome::Running)
+        else {
+            continue;
+        };
+        let name = inv
+            .nodes
+            .iter()
+            .find(|n| n.id == done.node)
+            .map_or_else(|| done.node.to_string(), |n| n.name.clone());
+        // 끄기가 오래 걸려 그사이 watchdog 기다림(`recover_after`)으로 HA VM을 이미 옮겼다.
+        let recovered = !inv.vms.iter().any(|vm| recoverable(vm, done.node));
+        match &done.result {
+            PowerOff::Off { method } => {
+                attempt.outcome = Outcome::Off(done.at);
+                tracing::warn!(node = %name, method = method.as_str(), "powered off the node; recovering its HA VMs");
+            }
+            PowerOff::Failed(errors) => {
+                attempt.outcome = Outcome::Failed(done.at);
+                if recovered {
+                    tracing::warn!(node = %name, errors = ?errors, "{ALREADY_RECOVERED}");
+                } else {
+                    tracing::warn!(node = %name, errors = ?errors, "cannot power off the node; waiting for recover_after instead");
+                }
+            }
+        }
+        let reason = attempt.reason.clone();
+        record_power_off(ctx, done.node, reason, &done.result, recovered).await;
+    }
+    power.attempts.forget_revived(leases);
+    power.budget.begin(leases.term);
+    let me = ctx.cluster.id().0;
+    let mut wanted: Vec<(Uuid, String)> = vec![];
+    while let Ok(request) = power.requests.try_recv() {
+        wanted.push(request);
+    }
+    // 이 리더의 리스도 갱신되고 있어야 한다: 리더 쪽 문제로 갱신이 멈췄으면 모든 노드의 리스가 함께 끝나 보인다.
+    let my_age = leases
+        .renewed
+        .get(&NodeId(me))
+        .map(|renewed| now.saturating_duration_since(*renewed));
+    for n in &inv.nodes {
+        let Some(after) = n.status.ha.and_then(|ha| ha.fence_after_secs) else {
+            continue;
+        };
+        let after = Duration::from_secs(after);
+        if n.id != me
+            && my_age.is_some_and(|age| age < after)
+            && ha_capable(n)
+            && !n.status.frozen()
+            && !unknown.contains_key(&n.id)
+            && !power.attempts.0.contains_key(&n.id)
+            && lease_age(now, b, leases, n.id) >= after
+            && inv.vms.iter().any(|vm| runs_ha(vm, n.id))
+        {
+            wanted.push((n.id, LEASE_EXPIRED.into()));
+        }
+    }
+    if wanted.is_empty() {
+        return;
+    }
+    let fences = match ctx.cluster.list::<NodeFenceSpec>() {
+        Ok((_, fences)) => fences,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read power fencing settings");
+            return;
+        }
+    };
+    let limit = power_off_limit(inv);
+    for (node, reason) in wanted {
+        let requested = reason != LEASE_EXPIRED;
+        let Some(target) = inv.nodes.iter().find(|n| n.id == node) else {
+            tracing::warn!(node = %node, "cannot power off an unknown node");
+            continue;
+        };
+        if node == me || power.attempts.0.contains_key(&node) {
+            if requested {
+                tracing::info!(node = %target.name, reason = %reason, "not powering off the node: it is this node or was already powered off");
+            }
+            continue;
+        }
+        let Some(fence) = fences.iter().find(|f| f.id == node) else {
+            if requested {
+                tracing::warn!(node = %target.name, reason = %reason, "cannot power off the node: it has no power fencing");
+            }
+            continue;
+        };
+        if !power.budget.take(limit) {
+            if power.budget.capped.insert(node) {
+                tracing::warn!(node = %target.name, reason = %reason, limit, "not powering off the node: too many nodes were powered off in this term; waiting for recover_after instead");
+            }
+            continue;
+        }
+        power.start(target.clone(), fence.spec.clone(), reason, leases.term);
+    }
+}
+
+/// 끄기의 기록 Task(`node-power-off`)를 남긴다. 옛 노드가 이 Task를 풀지 못하므로 모든 노드가 `fast-ha`일 때만
+/// 쓴다. `recovered`면 실패가 HA VM을 이미 옮긴 뒤에 왔다(오류 앞에 그것을 적는다).
+async fn record_power_off(
+    ctx: Ctx<'_>,
+    node: Uuid,
+    reason: String,
+    result: &PowerOff,
+    recovered: bool,
+) {
+    match crate::cluster::missing_feature(ctx.cluster, FAST_HA) {
+        Ok(old) if old.is_empty() => {}
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(node = %node, error = %e, "cannot record the node power-off task");
+            return;
+        }
+    }
+    let (method, state, error) = match result {
+        PowerOff::Off { method } => (Some(*method), TaskState::Succeeded, None),
+        PowerOff::Failed(errors) if recovered => (
+            None,
+            TaskState::Failed,
+            Some(format!("{ALREADY_RECOVERED}: {}", errors.join("; "))),
+        ),
+        PowerOff::Failed(errors) => (None, TaskState::Failed, Some(errors.join("; "))),
+    };
+    let mut record: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::NodePowerOff { method, reason },
+            target: node,
+            node,
+        },
+    );
+    record.name = record.id.to_string();
+    // 실행기는 끝난 Task를 실행하지 않는다.
+    record.status = TaskStatus {
+        state,
+        error,
+        progress: None,
+    };
+    if let Err(e) = create(ctx, &record).await {
+        tracing::warn!(node = %node, error = %e, "cannot record the node power-off task");
+    }
+}
+
+/// 노드 `node`를 펜싱 중으로 표시하고, 리스가 여전히 끝났거나 꺼짐을 확인한 그대로면([`dead`]) 그 HA VM을
+/// [`recovery_order`]로 옮긴다 (대상은 `plan`이 맞고 동시 시작 상한에 걸리지 않으면 그것, 아니면 그 자리에서
+/// 고른다 — 다른 노드가 나오면 그리로). 고른 노드가 상한에 걸린 VM은 다음 틱으로 미룬다. 결과를 모르는 쓰기가
+/// 생기면 펜싱 표시를 지우지 않고 그 쓰기를 돌려준다.
+#[allow(clippy::too_many_arguments)]
 async fn recover_node(
     ctx: Ctx<'_>,
     term: u64,
@@ -518,6 +964,8 @@ async fn recover_node(
     node: Uuid,
     plan: Option<&BTreeMap<Uuid, Uuid>>,
     starting: &mut Starting,
+    attempts: &Attempts,
+    down: &BTreeSet<Uuid>,
 ) -> Option<Unknown> {
     let cluster = ctx.cluster;
     let mut fence = Fence::begin(cluster, node);
@@ -530,7 +978,7 @@ async fn recover_node(
         return None;
     };
     let failed = inv.nodes.iter().find(|n| n.id == node).cloned()?;
-    if !expired(Instant::now(), b, &leases, &failed) || failed.status.frozen() {
+    if !dead(Instant::now(), b, &leases, &failed, attempts) || failed.status.frozen() {
         return None;
     }
     let Ok(settings) = crate::settings::current(cluster) else {
@@ -538,6 +986,7 @@ async fn recover_node(
     };
     let mut queue = Queue {
         plan,
+        down,
         starting,
         limit: settings.spec.ha_start_concurrency(),
         planned: 0,
@@ -621,8 +1070,12 @@ async fn recover_vm(
     let now = Instant::now();
     // 죽은 노드와 마이그레이션을 받던 노드(같은 실행 디렉터리를 쓰는 QEMU가 남아 있을 수 있다)는 빼고,
     // 리스가 살아 있어야 한다.
-    let eligible =
-        |n: &Node| n.id != failed.id && Some(n.id) != migrating && alive(now, b, leases, n);
+    let eligible = |n: &Node| {
+        n.id != failed.id
+            && Some(n.id) != migrating
+            && !queue.down.contains(&n.id)
+            && ready(now, b, leases, n)
+    };
     let starts = !stays_stopped(vm);
     let limit = queue.limit;
     let full = |starting: &Starting, t: Uuid| starts && starting.full(t, limit);
@@ -1203,6 +1656,12 @@ async fn fail_task(ctx: Ctx<'_>, task: &Task, error: &str) {
     }
 }
 
+/// 노드 `node`에서 켜져 있기로 된 HA VM. 이런 VM이 없는 노드는 전원을 끄지 않는다(꺼진 `state: stopped` VM은
+/// `recover_after` 뒤 자리만 옮긴다).
+fn runs_ha(vm: &Vm, node: Uuid) -> bool {
+    vm.spec.node == Some(node) && vm.spec.ha_active() && vm.spec.power == PowerState::Running
+}
+
 /// 노드 `node`에 배정된 HA VM으로 실행하기로 된 것. `state: stopped`는 꺼져 있어도 노드를 옮긴다.
 fn recoverable(vm: &Vm, node: Uuid) -> bool {
     vm.spec.node == Some(node)
@@ -1223,6 +1682,21 @@ fn lease_age(now: Instant, b: Instant, leases: &Leases, node: Uuid) -> Duration 
 fn expired(now: Instant, b: Instant, leases: &Leases, node: &Node) -> bool {
     node.status.ha.is_some_and(|ha| {
         lease_age(now, b, leases, node.id) >= Duration::from_secs(ha.recover_after_secs)
+    })
+}
+
+/// 죽은 것으로 보는 노드: 리스가 `recover_after`보다 오래 끝났거나([`expired`]), 이 리더가 끄고 꺼짐을 확인한 뒤
+/// 받은 갱신이 없다.
+fn dead(now: Instant, b: Instant, leases: &Leases, node: &Node, attempts: &Attempts) -> bool {
+    expired(now, b, leases, node) || attempts.confirmed_off(node.id, leases).is_some()
+}
+
+/// 복구·미리 고르기의 대상이 될 수 있는 노드: HA 가능 노드이고 리스가 `fence_after`(알리지 않는 계획 51 전 노드는
+/// `recover_after`)보다 새롭다. 함께 죽어 아직 `recover_after`가 지나지 않은 노드로 옮기지 않는다.
+fn ready(now: Instant, b: Instant, leases: &Leases, node: &Node) -> bool {
+    node.status.ha.is_some_and(|ha| {
+        let fresh = ha.fence_after_secs.unwrap_or(ha.recover_after_secs);
+        lease_age(now, b, leases, node.id) < Duration::from_secs(fresh)
     })
 }
 
@@ -1566,6 +2040,88 @@ mod tests {
                 .is_none()
         );
         assert!(plans.of(Uuid::now_v7(), t0, every).is_none());
+    }
+
+    /// 계획 계산은 실행기 밖에서 하고, 끝나기 전에는 겹쳐 시작하지 않는다. 결과는 끝난 뒤에 받는다.
+    #[tokio::test]
+    async fn planning_runs_off_the_runtime_one_at_a_time() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let mut planner = Planner::default();
+        assert!(planner.finished().await.is_none());
+        let at = Instant::now();
+        assert!(planner.start(move || {
+            wait.recv().unwrap();
+            Plans {
+                at: Some(at),
+                targets: BTreeMap::new(),
+            }
+        }));
+        // 계산 중에는 새로 시작하지 않고 결과도 없다.
+        assert!(!planner.start(|| panic!("started twice")));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(planner.finished().await.is_none());
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let plans = loop {
+            if let Some(plans) = planner.finished().await {
+                break plans;
+            }
+            assert!(std::time::Instant::now() < deadline, "plan never finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(plans.at, Some(at));
+        // 끝났으니 다시 시작할 수 있다.
+        assert!(planner.start(Plans::default));
+    }
+
+    fn attempt(term: u64, outcome: Outcome) -> Attempt {
+        Attempt {
+            id: 1,
+            term,
+            reason: LEASE_EXPIRED.into(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn a_node_is_dead_once_its_power_off_is_confirmed_until_it_renews_again() {
+        let (off, failed, running, other) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let t0 = Instant::now();
+        let confirmed = t0 + Duration::from_secs(5);
+        let mut attempts = Attempts(BTreeMap::from([
+            (off, attempt(3, Outcome::Off(confirmed))),
+            (failed, attempt(3, Outcome::Failed(confirmed))),
+            (running, attempt(3, Outcome::Running)),
+        ]));
+        // 끄기 전에 받은 갱신은 상관없다.
+        let mut leases = Leases {
+            term: 3,
+            renewed: BTreeMap::from([(NodeId(off), t0), (NodeId(failed), t0)]),
+        };
+        assert_eq!(attempts.confirmed_off(off, &leases), Some(confirmed));
+        assert_eq!(attempts.confirmed_off(failed, &leases), None);
+        assert_eq!(attempts.confirmed_off(running, &leases), None);
+        assert_eq!(attempts.confirmed_off(other, &leases), None);
+        attempts.forget_revived(&leases);
+        assert_eq!(attempts.down(), BTreeSet::from([off, failed, running]));
+        // 꺼짐을 확인한 뒤 갱신이 오면(다시 켜졌다) 죽은 것으로 보지 않고 시도를 지운다. 실패한 노드도 다시
+        // 갱신하면 지워 다음에 다시 끌 수 있다.
+        let later = confirmed + Duration::from_millis(1);
+        leases.renewed.insert(NodeId(off), later);
+        leases.renewed.insert(NodeId(failed), later);
+        leases.renewed.insert(NodeId(running), later);
+        assert_eq!(attempts.confirmed_off(off, &leases), None);
+        attempts.forget_revived(&leases);
+        assert_eq!(attempts.down(), BTreeSet::from([running]));
+        // 임기가 바뀌면 지운다.
+        leases.term = 4;
+        attempts.forget_revived(&leases);
+        assert!(attempts.0.is_empty());
     }
 
     #[test]

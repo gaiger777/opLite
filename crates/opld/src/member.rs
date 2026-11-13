@@ -44,6 +44,7 @@ use uuid::Uuid;
 
 use crate::bootstrap;
 use crate::config::Config;
+use crate::fence_watch::FenceWatch;
 use crate::firewall::{FirewallAgent, FirewallRules};
 use crate::host::Host;
 use crate::metrics::host as metrics_host;
@@ -184,6 +185,8 @@ struct Services {
     backups: BackupJobScheduler,
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
     recovery: HaManager,
+    /// 이 노드의 전원 끄기 펜싱을 이웃이 읽을 수 있는지 확인한다.
+    fence_watch: FenceWatch,
     /// 리더가 내장 VIP의 주인을 정한다(이 노드의 `[vip]`과 상관없다).
     vip_manager: VipManager,
     /// 이 노드의 VIP 리스를 갱신하고 VIP를 붙인다(`[vip]`이 없으면 없다).
@@ -237,6 +240,7 @@ impl Services {
         self.telemetry.shutdown().await;
         self.remotes.shutdown().await;
         self.recovery.shutdown().await;
+        self.fence_watch.shutdown().await;
         self.vip_manager.shutdown().await;
         self.pools.shutdown().await;
         self.metrics.shutdown().await;
@@ -562,10 +566,46 @@ impl Member {
             OverlayAgent::spawn(cluster.clone(), config, &host, tag)
         });
         let firewall = on(&rt.work, || firewall.map(FirewallAgent::spawn));
+        let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
+        reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
+        // 다른 노드에 있는 UEFI 변수 파일을 노드 사이 RPC로 받아 온다(시작, 스냅샷, 복제).
+        let firmware: Arc<dyn FirmwareFetcher> = Arc::new(UefiVarsFetcher::new(
+            cluster.clone(),
+            peers.clone(),
+            config.data_dir.clone(),
+            uefi_vars_template,
+        ));
+        reconciler_config.firmware = Some(firmware.clone());
+        // 펜싱이 켜져 있으면 지금부터 리스를 갱신한다(지금이 stale을 세는 기준점이다).
+        let ha = config
+            .ha
+            .guard_config()
+            .map(|ha| on(&rt.core, || HaGuard::spawn(cluster.clone(), ha)));
+        // 리스 값을 키웠으면(`safe`로 바꿈 등) 리더는 등록 전까지 옛 `recover_after`로 복구한다. 새 값을 기록하기
+        // 전에는 HA VM을 켜거나 붙이지 않는다(기록을 읽지 못하면 키운 것으로 본다). 기록은 전체 등록을 기다리지 않고
+        // `status.ha`만 먼저 쓴다.
+        let held = match &ha {
+            Some(guard) if !first_time => {
+                let stored = cluster.get::<NodeSpec>(node).ok().flatten();
+                let raised = bootstrap::ha_raised(
+                    stored.and_then(|n| n.status.ha).as_ref(),
+                    config.node_ha().as_ref(),
+                );
+                if raised {
+                    tracing::info!("HA timings grew; HA VMs wait until this node records them");
+                    guard.hold_until_recorded();
+                }
+                raised.then(|| guard.clone())
+            }
+            _ => None,
+        };
         let register = {
             let (cluster, config) = (cluster.clone(), config.clone());
             rt.work.spawn(async move {
                 if !first_time {
+                    if let Some(guard) = held {
+                        bootstrap::record_raised_ha(&cluster, &config, &guard).await;
+                    }
                     while let Err(e) = bootstrap::register_node(&cluster, &config, &host).await {
                         tracing::warn!(error = %e, "cannot register this node; will retry");
                         tokio::time::sleep(REGISTER_RETRY).await;
@@ -582,21 +622,6 @@ impl Member {
                 }
             })
         };
-        let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
-        reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
-        // 다른 노드에 있는 UEFI 변수 파일을 노드 사이 RPC로 받아 온다(시작, 스냅샷, 복제).
-        let firmware: Arc<dyn FirmwareFetcher> = Arc::new(UefiVarsFetcher::new(
-            cluster.clone(),
-            peers.clone(),
-            config.data_dir.clone(),
-            uefi_vars_template,
-        ));
-        reconciler_config.firmware = Some(firmware.clone());
-        // 펜싱이 켜져 있으면 지금부터 리스를 갱신한다(지금이 stale을 세는 기준점이다).
-        let ha = config
-            .ha
-            .guard_config()
-            .map(|ha| on(&rt.core, || HaGuard::spawn(cluster.clone(), ha)));
         // 펜싱이 꺼져 있어도 리더가 생존을 리스로 보도록 갱신만 한다.
         let liveness = ha
             .is_none()
@@ -666,6 +691,9 @@ impl Member {
             ),
         )
         .await;
+        let fence_watch = on(&rt.work, || {
+            FenceWatch::spawn(cluster.clone(), peers.clone(), node)
+        });
         let monitor = on(&rt.core, || {
             NodeMonitor::spawn(cluster.clone(), peers, NodeMonitorConfig::default())
         });
@@ -755,6 +783,7 @@ impl Member {
                 remotes,
                 audit,
                 recovery,
+                fence_watch,
                 vip_manager,
                 vip,
                 pools,

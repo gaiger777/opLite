@@ -203,6 +203,8 @@ pub enum ArmError {
     Rejected(String),
     #[error("the HA guard is closed")]
     Closed,
+    #[error("waiting until this node records its longer HA timings")]
+    Unrecorded,
 }
 
 struct State {
@@ -290,6 +292,8 @@ pub struct HaGuard {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// 쓰다듬기 스레드. watchdog 장치를 쓸 때(`opener`가 있을 때)만 띄운다.
     pinger: Mutex<Option<Pinger>>,
+    /// 키운 HA 값을 노드 기록에 쓰기 전이다([`HaGuard::hold_until_recorded`]).
+    unrecorded: AtomicBool,
 }
 
 /// 쓰다듬기 스레드. 연 장치를 `tx`로 받고, `tx`가 닫히면 쥔 장치를 돌려주며 끝난다.
@@ -339,7 +343,19 @@ impl HaGuard {
             opener: config.watchdog,
             tasks: Mutex::new(tasks),
             pinger: Mutex::new(pinger),
+            unrecorded: AtomicBool::new(false),
         })
+    }
+
+    /// 이 노드가 리스 값을 키워(`fence_after`·watchdog) 노드 기록의 값이 아직 작다: 리더가 그 값으로 일찍 복구할 수
+    /// 있으므로 [`recorded`](Self::recorded)까지 `arm`이 거절한다(HA VM을 켜거나 붙이지 않는다).
+    pub fn hold_until_recorded(&self) {
+        self.unrecorded.store(true, Ordering::Release);
+    }
+
+    /// 키운 HA 값을 노드 기록에 썼다. 다시 `arm`할 수 있다.
+    pub fn recorded(&self) {
+        self.unrecorded.store(false, Ordering::Release);
     }
 
     pub fn state(&self) -> LeaseState {
@@ -371,6 +387,9 @@ impl HaGuard {
         let mut state = self.shared.state.lock().unwrap();
         if !self.shared.lease(&state, Instant::now()).fresh {
             return Err(ArmError::NotFresh);
+        }
+        if self.unrecorded.load(Ordering::Acquire) {
+            return Err(ArmError::Unrecorded);
         }
         if let (Some(opener), None) = (&self.opener, &state.watchdog) {
             let pinger = self.pinger.lock().unwrap();
@@ -806,6 +825,22 @@ mod tests {
         assert!(g.fresh());
         assert!(matches!(g.arm(), Err(ArmError::Closed)));
         assert!(watchdog.log().is_empty());
+    }
+
+    /// 키운 HA 값을 기록하기 전에는 리스가 살아 있어도 watchdog를 열지 않고 거절한다. 기록한 뒤에는 연다.
+    #[tokio::test(start_paused = true)]
+    async fn arm_waits_until_longer_timings_are_recorded() {
+        let renewer = FakeRenewer::new(true);
+        let watchdog = Arc::new(FakeWatchdog::default());
+        let g = guard(&renewer, Some(&watchdog));
+        g.hold_until_recorded();
+        g.subscribe().wait_for(|s| s.fresh).await.unwrap();
+        assert!(matches!(g.arm(), Err(ArmError::Unrecorded)));
+        assert!(watchdog.log().is_empty());
+        g.recorded();
+        g.arm().unwrap();
+        assert_eq!(watchdog.count("open"), 1);
+        g.close();
     }
 
     /// watchdog가 없으면(process) 갱신했는지만 본다.

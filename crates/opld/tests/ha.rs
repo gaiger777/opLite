@@ -6,6 +6,8 @@
 //! 켜지는지도 본다. 호스트 종료 정책: 끄기 + `failover`면 A가 끝나기 전에 HA VM을 끄고 B에서 켜는지, 재부팅 +
 //! 기본(`conditional`)이면 얼려 두었다가 A가 돌아와 켜는지, 끄기 + `migrate`면 비우기로 미리 옮기는지 본다
 //! (`[test] host_shutdown`). 기본(`fast`) 프로필에서 kill -9·망 끊기·SIGSTOP 뒤 복구 시간이 25초 이하인지 잰다.
+//! 전원 끄기 펜싱(명령 방법)으로 끈 노드의 HA VM을 `recover_after`(`[test] recover_margin_secs`로 늘림)를 기다리지
+//! 않고 복구하는지 본다.
 //! `cargo test -p opld --features ha-it --test ha`
 //! QEMU(`qemu-it`와 같다)와 qemu-img가 필요하다. 이 Mac에서도 돈다.
 //!
@@ -947,4 +949,99 @@ async fn recovery_takes_at_most_25s_with_the_default_profile() {
             "recovery after {fault} took {elapsed:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_power_fence_command_recovers_without_waiting_for_recover_after() {
+    // 두 노드가 알리는 recover_after는 10 + 300 = 310초다. 리더가 아닌 노드를 망에서 떼면 리더가 fence_after(10초)
+    // 뒤 그 노드의 명령 방법으로 끄고(그 노드의 opld와 QEMU를 kill -9) 꺼짐을 확인한 뒤 곧바로 옮긴다.
+    let config = format!("{FAST_CONFIG}[test]\nrecover_margin_secs = 300\n");
+    let (a, b, _w) = ha_cluster_with("ha-power", &config, "").await;
+    let mut nodes = [a, b];
+    let ca = client(&nodes[0]);
+    let ids = [node_id(&ca, "node-a").await, node_id(&ca, "node-b").await];
+    let node = ca.get("/nodes/node-a").await.unwrap();
+    assert_eq!(node["status"]["ha"]["recover_after_secs"], 310, "{node}");
+    let deadline = Instant::now() + RECOVER_WAIT;
+    let leader = loop {
+        if let Ok(c) = ca.get("/cluster").await
+            && let Some(leader) = c["leader"].as_str()
+        {
+            break leader.to_string();
+        }
+        assert!(Instant::now() < deadline, "no leader");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let survivor = ids.iter().position(|id| *id == leader).unwrap();
+    let victim = 1 - survivor;
+    let cs = client(&nodes[survivor]);
+    let (sid, vid) = (&ids[survivor], &ids[victim]);
+    let vname = nodes[victim].name.clone();
+    nodes[survivor]
+        .ctl(&[
+            "vm", "create", "pf", "--memory", "256", "--node", &vname, "--ha", "--start",
+        ])
+        .await
+        .unwrap();
+    let qemu = running_pid(&cs, "pf", vid).await;
+    let opld = nodes[victim].pid().unwrap();
+
+    // 끄기: 그 노드의 opld와 QEMU를 kill -9 하고 표시 파일을 만든다. 전원은 표시 파일이 있으면 off다.
+    let dir = tempfile::tempdir().unwrap();
+    let mark = dir.path().join("off");
+    let fence = serde_json::json!({ "methods": [{
+        "kind": "command",
+        "off": format!("kill -9 {opld} 2>/dev/null; kill -9 {qemu} 2>/dev/null; touch {}", mark.display()),
+        "status": format!("if [ -f {} ]; then echo off; else echo on; fi", mark.display()),
+    }] });
+    let file = dir.path().join("fence.json");
+    std::fs::write(&file, fence.to_string()).unwrap();
+    nodes[survivor]
+        .ctl(&["node", "fence", "set", &vname, "-f", file.to_str().unwrap()])
+        .await
+        .unwrap();
+
+    let start = Instant::now();
+    test_hook(&nodes[victim], "isolate").await;
+    let deadline = start + Duration::from_secs(60);
+    loop {
+        if let Ok(v) = cs.get("/vms/pf").await
+            && v["spec"]["node"] == sid.as_str()
+            && v["status"]["phase"] == "running"
+            && v["status"]["node"] == sid.as_str()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pf did not start on the other node within 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!(
+        "HA recovery with power fencing of {vname}: {:?}",
+        start.elapsed()
+    );
+    // 끄기 명령이 돌았다(opld는 이 시험의 자식이라 거두기 전까지 남아 보인다).
+    assert!(mark.exists());
+    assert!(!alive(qemu));
+    let tasks = cs.get("/tasks").await.unwrap();
+    let power_off: Vec<&Value> = tasks["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["spec"]["op"]["kind"] == "node-power-off")
+        .collect();
+    assert_eq!(power_off.len(), 1, "{tasks}");
+    assert_eq!(power_off[0]["spec"]["target"], vid.as_str());
+    assert_eq!(power_off[0]["spec"]["op"]["method"], "command");
+    assert_eq!(power_off[0]["spec"]["op"]["reason"], "lease expired");
+    assert_eq!(power_off[0]["status"]["state"], "succeeded");
+    // 끈 노드의 opld는 이미 끝났다(거둔다).
+    nodes[victim].kill();
+    nodes[survivor]
+        .ctl(&["vm", "stop", "pf", "--force"])
+        .await
+        .unwrap();
+    nodes[survivor].ctl(&["vm", "delete", "pf"]).await.unwrap();
 }

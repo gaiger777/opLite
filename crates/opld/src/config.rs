@@ -445,6 +445,21 @@ impl HaSection {
     }
 }
 
+impl Config {
+    /// 등록할 때 쓰는 이 노드의 HA 설정([`HaSection::node_ha`]). 시험 빌드(`ha-it`)는 `[test]
+    /// recover_margin_secs`로 여유를 바꾼다.
+    pub fn node_ha(&self) -> Option<NodeHa> {
+        #[cfg(feature = "ha-it")]
+        if let Some(margin) = self.test.recover_margin_secs {
+            return self.ha.node_ha().map(|ha| NodeHa {
+                recover_after_secs: ha.recover_after_secs - RECOVER_MARGIN_SECS + margin,
+                ..ha
+            });
+        }
+        self.ha.node_ha()
+    }
+}
+
 impl HaSection {
     pub fn fence_after(&self) -> Duration {
         Duration::from_secs(self.fence_after_secs())
@@ -798,6 +813,11 @@ pub struct TestSection {
     /// 종료 신호를 받았을 때 systemd에 묻지 않고 이 호스트 종료로 본다(`reboot`·`poweroff`).
     #[serde(default)]
     pub host_shutdown: Option<crate::shutdown::HostShutdown>,
+    /// 등록할 때 알리는 `recover_after_secs`의 여유(초, 기본 2). 늘리면 리더가 리스를 기다리는 대신 전원 끄기
+    /// 펜싱으로 복구하는지 볼 수 있다.
+    #[cfg(feature = "ha-it")]
+    #[serde(default)]
+    pub recover_margin_secs: Option<u64>,
 }
 
 #[cfg(feature = "starve-it")]
@@ -1323,7 +1343,8 @@ impl Config {
         .await
     }
 
-    /// `underlay`와 같되 이름 풀기(`lookup`)를 받는다(시험이 DNS에 기대지 않게).
+    /// `underlay`와 같되 이름 풀기(`lookup`)를 받는다(시험이 DNS에 기대지 않게). 이름 풀기는
+    /// [`UNDERLAY_LOOKUP_TIMEOUT`]까지만 기다린다(등록이 DNS에 묶이지 않게).
     async fn underlay_with<F, Fut>(&self, lookup: F) -> Option<IpAddr>
     where
         F: FnOnce(String) -> Fut,
@@ -1333,7 +1354,10 @@ impl Config {
             UnderlaySource::Ip(ip) => return Some(ip),
             UnderlaySource::Lookup(host) => host,
         };
-        match lookup(host.to_string()).await {
+        let found = tokio::time::timeout(UNDERLAY_LOOKUP_TIMEOUT, lookup(host.to_string()))
+            .await
+            .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
+        match found {
             Ok(addrs) => match pick_underlay(addrs) {
                 Some(ip) => Some(ip),
                 None => {
@@ -1361,6 +1385,9 @@ impl Config {
             .unwrap_or_else(|| self.run_dir.join("opld.sock"))
     }
 }
+
+/// underlay 이름 풀기([`Config::underlay`])를 기다리는 최대 시간
+const UNDERLAY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 이름을 푼 주소 가운데 underlay로 쓸 것. 다른 노드가 닿을 수 없는 loopback·link-local·미지정 주소는
 /// 빼고(예: `/etc/hosts`의 `127.0.1.1`), IPv4를 먼저, 없으면 IPv6의 첫 주소다.
@@ -1932,6 +1959,22 @@ mod tests {
         assert!(parsed.is_err());
     }
 
+    /// `[test] recover_margin_secs`는 `ha-it` 빌드에만 있고 알리는 `recover_after_secs`의 여유를 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_recover_margin_only_in_ha_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\n";
+        assert_eq!(parse(text).node_ha().unwrap().recover_after_secs, 12);
+        let parsed = toml::from_str::<Config>(&format!("{text}[test]\nrecover_margin_secs = 300"));
+        #[cfg(feature = "ha-it")]
+        {
+            let ha = parsed.unwrap().node_ha().unwrap();
+            assert_eq!(ha.recover_after_secs, 310);
+            assert_eq!(ha.fence_after_secs, Some(10));
+        }
+        #[cfg(not(feature = "ha-it"))]
+        assert!(parsed.is_err());
+    }
+
     /// `[test] host_shutdown`은 `starve-it`·`ha-it` 빌드에만 있다.
     #[test]
     fn the_test_section_fakes_a_host_shutdown_only_in_test_builds() {
@@ -2483,5 +2526,15 @@ mod tests {
                 .await,
             None
         );
+    }
+
+    /// 이름 풀기가 답하지 않으면 2초 뒤 풀지 못한 것으로 본다(등록이 DNS에 묶이지 않게).
+    #[tokio::test(start_paused = true)]
+    async fn underlay_gives_up_a_slow_lookup() {
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"");
+        let started = tokio::time::Instant::now();
+        let hang = |_: String| std::future::pending::<std::io::Result<Vec<IpAddr>>>();
+        assert_eq!(c.underlay_with(hang).await, None);
+        assert_eq!(started.elapsed(), UNDERLAY_LOOKUP_TIMEOUT);
     }
 }

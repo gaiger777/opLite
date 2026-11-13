@@ -2391,6 +2391,18 @@ export interface components {
             /** @description 데이터스토어 안의 `.vmx` 경로(`web01/web01.vmx`) */
             vmx: string;
         };
+        /** @description 이웃 노드의 전원 읽기 결과(설계 §8.1). `error`가 있으면 모든 방법이 실패한 것이다(`fence_unreachable`). */
+        FenceCheck: {
+            /**
+             * Format: int64
+             * @description 읽은 시각(유닉스 초)
+             */
+            at: number;
+            /** @description 읽은 이웃 노드의 이름 */
+            by: string;
+            /** @description 모든 방법이 전원을 읽지 못한 이유(방법마다 `"<종류>: <이유>"`를 `; `로). 하나라도 읽었으면 None */
+            error?: string;
+        };
         /**
          * @description 방법의 종류
          * @enum {string}
@@ -3088,6 +3100,11 @@ export interface components {
                      */
                     features?: string[];
                     /**
+                     * @description 이웃 노드가 이 노드의 전원 끄기 펜싱 방법으로 전원을 읽어 본 마지막 결과. 이 노드가 쓴다(`NodeFence`가
+                     *     없으면 None). 옛 노드는 이 필드를 무시한다.
+                     */
+                    fence_check?: components["schemas"]["FenceCheck"];
+                    /**
                      * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
                      *     (위트니스는 늘 false).
                      */
@@ -3774,6 +3791,11 @@ export interface components {
              *     쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
              */
             features?: string[];
+            /**
+             * @description 이웃 노드가 이 노드의 전원 끄기 펜싱 방법으로 전원을 읽어 본 마지막 결과. 이 노드가 쓴다(`NodeFence`가
+             *     없으면 None). 옛 노드는 이 필드를 무시한다.
+             */
+            fence_check?: components["schemas"]["FenceCheck"];
             /**
              * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
              *     (위트니스는 늘 false).
@@ -4511,6 +4533,11 @@ export interface components {
                  *     쓰는 API는 모든 노드가 그 기능을 적었는지 본다(버전이 섞여도 된다).
                  */
                 features?: string[];
+                /**
+                 * @description 이웃 노드가 이 노드의 전원 끄기 펜싱 방법으로 전원을 읽어 본 마지막 결과. 이 노드가 쓴다(`NodeFence`가
+                 *     없으면 None). 옛 노드는 이 필드를 무시한다.
+                 */
+                fence_check?: components["schemas"]["FenceCheck"];
                 /**
                  * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
                  *     (위트니스는 늘 false).
@@ -5353,6 +5380,11 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "node-drain";
+        } | {
+            /** @enum {string} */
+            kind: "node-power-off";
+            method?: components["schemas"]["FenceKind"];
+            reason: string;
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {

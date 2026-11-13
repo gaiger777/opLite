@@ -316,6 +316,7 @@ async fn two_nodes_with(
             features: FEATURES.iter().map(|f| f.to_string()).collect(),
             cluster_addresses: vec![],
             shutdown: None,
+            fence_check: None,
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();

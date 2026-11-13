@@ -117,6 +117,25 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub shutdown: Option<NodeShutdown>,
+    /// 이웃 노드가 이 노드의 전원 끄기 펜싱 방법으로 전원을 읽어 본 마지막 결과. 이 노드가 쓴다(`NodeFence`가
+    /// 없으면 None). 옛 노드는 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub fence_check: Option<FenceCheck>,
+}
+
+/// 이웃 노드의 전원 읽기 결과(설계 §8.1). `error`가 있으면 모든 방법이 실패한 것이다(`fence_unreachable`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct FenceCheck {
+    /// 읽은 시각(유닉스 초)
+    pub at: u64,
+    /// 읽은 이웃 노드의 이름
+    pub by: String,
+    /// 모든 방법이 전원을 읽지 못한 이유(방법마다 `"<종류>: <이유>"`를 `; `로). 하나라도 읽었으면 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
 }
 
 /// 호스트 종료 때 노드가 남긴 표시(설계 §8 노드 정상 종료 정책)
@@ -145,6 +164,11 @@ pub enum ShutdownAction {
 }
 
 impl NodeStatus {
+    /// 이웃이 이 노드의 펜싱 방법으로 전원을 읽지 못했다(리더가 이 노드를 끌 수 없을 수 있다).
+    pub fn fence_unreachable(&self) -> bool {
+        self.fence_check.as_ref().is_some_and(|c| c.error.is_some())
+    }
+
     /// 얼린 노드: `freeze` 표시를 남기고 오프라인이다. 리더가 HA VM을 옮기지 않는다.
     pub fn frozen(&self) -> bool {
         !self.online
@@ -362,6 +386,34 @@ mod tests {
             serde_json::to_value(Fencing::Process).unwrap(),
             serde_json::json!("process")
         );
+    }
+
+    #[test]
+    fn status_fence_check_round_trips_and_marks_unreachable_fencing() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("fence_check").is_none(), "{none}");
+        assert!(!NodeStatus::default().fence_unreachable());
+        let ok = NodeStatus {
+            fence_check: Some(FenceCheck {
+                at: 7,
+                by: "node2".into(),
+                error: None,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&ok).unwrap();
+        assert_eq!(
+            json["fence_check"],
+            serde_json::json!({ "at": 7, "by": "node2" })
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), ok);
+        assert!(!ok.fence_unreachable());
+        let mut bad = ok;
+        bad.fence_check.as_mut().unwrap().error = Some("ipmi: timed out".into());
+        assert!(bad.fence_unreachable());
+        let json = serde_json::to_value(&bad).unwrap();
+        assert_eq!(json["fence_check"]["error"], "ipmi: timed out");
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), bad);
     }
 
     #[test]

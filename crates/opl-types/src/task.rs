@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::fence::FenceKind;
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::storage::SourceFormat;
 use crate::vm_import::ImportRun;
@@ -119,6 +120,15 @@ pub enum TaskOp {
     /// 대상 노드(Task의 `node`와 같다)를 비운다: 실행 중인 VM을 하나씩 다른 노드로 라이브 마이그레이션한다.
     /// 노드는 API가 먼저 유지보수로 바꾼다.
     NodeDrain,
+    /// 리더의 전원 끄기 펜싱 기록: 대상 노드(Task의 `node`와 같다)를 `reason` 때문에 껐다(`succeeded`, 끈 방법
+    /// `method`) 또는 끄지 못했다(`failed`, 방법마다의 이유는 status `error`). 끝난 상태로 만들고 실행기는
+    /// 실행하지 않는다.
+    NodePowerOff {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        method: Option<FenceKind>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -322,6 +332,31 @@ mod tests {
             serde_json::json!({ "kind": "vm-ha-recover", "from": from })
         );
         assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+    }
+
+    #[test]
+    fn node_power_off_op_is_tagged_by_kind() {
+        let op = TaskOp::NodePowerOff {
+            method: Some(FenceKind::Ipmi),
+            reason: "lease expired".into(),
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "node-power-off", "method": "ipmi", "reason": "lease expired" })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        // 끄지 못했으면 방법이 없다.
+        let failed = TaskOp::NodePowerOff {
+            method: None,
+            reason: "lease expired".into(),
+        };
+        let json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "node-power-off", "reason": "lease expired" })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), failed);
     }
 
     #[test]

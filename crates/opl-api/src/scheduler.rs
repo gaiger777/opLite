@@ -31,7 +31,7 @@ pub enum ScheduleError {
 }
 
 /// 스케줄러가 보는 클러스터 상태
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Inventory {
     pub nodes: Vec<Node>,
     pub vms: Vec<Vm>,
@@ -366,6 +366,7 @@ mod tests {
             features: vec![],
             cluster_addresses: vec![],
             shutdown: None,
+            fence_check: None,
         };
         n
     }

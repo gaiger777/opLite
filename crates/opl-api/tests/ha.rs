@@ -7,6 +7,8 @@
 //! anti-affinity, 막는 hard 규칙과 `ha_may_violate`), `state: stopped`·`ignored`, 그룹의 더 우선인 노드로
 //! 되돌아가기, `rule_violations` 갱신. 호스트 종료 정책으로 얼린 노드는 풀기 전까지 옮기지 않는다.
 //! 우선순위 순서, 대상 노드마다의 동시 시작 상한(`ha_start_concurrency`), 미리 고른 복구 노드.
+//! 전원 끄기 펜싱(가짜 `PowerFence`): `fence_after`가 지난 노드를 한 번 끄고 꺼짐을 확인하면 `recover_after` 전에
+//! 복구하는지, 끄지 못하면 `recover_after`를 기다리는지, 끄지 않을 노드, 요청받은 끄기, 기록 Task.
 
 mod common;
 
@@ -16,11 +18,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::{Env, WAIT, vm_request};
-use opl_api::{HaManager, HaManagerConfig, RecoveryWriter};
+use opl_api::{HaManager, HaManagerConfig, LEASE_EXPIRED, PowerFence, RecoveryWriter};
 use opl_cluster::types::{Command, LeaderRequest, NodeId, Rejection};
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::node::{Fencing, NodeHa, NodeShutdown, NodeSpec, NodeStatus, ShutdownAction};
+use opl_types::fence::{CommandFence, FenceKind, FenceMethod, NodeFenceSpec, Power};
+use opl_types::node::{
+    FEATURES, Fencing, Node, NodeHa, NodeShutdown, NodeSpec, NodeStatus, ShutdownAction,
+};
 use opl_types::placement::{
     HaGroupNode, HaGroupSpec, HaGroupStatus, PlacementRuleSpec, PlacementRuleStatus, RuleKind,
 };
@@ -115,6 +120,7 @@ async fn node_with(
         features: vec![],
         cluster_addresses: vec![],
         shutdown: None,
+        fence_check: None,
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();
@@ -1699,4 +1705,415 @@ async fn a_hard_rule_made_after_planning_is_followed() {
     })
     .await;
     assert_eq!(to, y);
+}
+
+/// 가짜 전원 끄기 실행기: 명령 방법의 `off`가 `fail`이면 끄기가 실패하고(`slow-fail`은 4초 뒤 실패), 아니면 그 노드가
+/// 꺼진다(그 뒤 `status`가 off). 끄기 호출(노드 이름, `off`, 때)을 적는다.
+#[derive(Default)]
+struct FakeFence {
+    calls: Mutex<Vec<(String, String, std::time::Instant)>>,
+    off: Mutex<Vec<Uuid>>,
+}
+
+impl FakeFence {
+    fn calls(&self) -> Vec<(String, String)> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(node, off, _)| (node.clone(), off.clone()))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl PowerFence for FakeFence {
+    async fn off(&self, node: &Node, method: &FenceMethod) -> Result<(), String> {
+        let FenceMethod::Command(c) = method else {
+            panic!("unexpected method {method:?}");
+        };
+        self.calls.lock().unwrap().push((
+            node.name.clone(),
+            c.off.clone(),
+            std::time::Instant::now(),
+        ));
+        if c.off == "slow-fail" {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        }
+        if c.off.ends_with("fail") {
+            return Err("BMC unreachable".into());
+        }
+        self.off.lock().unwrap().push(node.id);
+        Ok(())
+    }
+
+    async fn status(&self, node: &Node, _: &FenceMethod) -> Result<Power, String> {
+        Ok(if self.off.lock().unwrap().contains(&node.id) {
+            Power::Off
+        } else {
+            Power::On
+        })
+    }
+}
+
+fn fence_manager(env: &Env, fence: Arc<FakeFence>) -> HaManager {
+    HaManager::spawn_with_fence(
+        env.state.clone(),
+        HaManagerConfig {
+            tick: Duration::from_millis(100),
+            ..Default::default()
+        },
+        fence,
+    )
+}
+
+/// 계획 51 노드: 리스가 `fence_after`초 끊기면 HA VM을 끄고 `recover_after`초 뒤 리더가 옮긴다. 모든 기능을 안다.
+async fn fast_node(env: &Env, name: &str, fence_after: Option<u64>, recover_after: u64) -> Uuid {
+    fast_node_with(env, name, fence_after, recover_after, |_| {}).await
+}
+
+async fn fast_node_with(
+    env: &Env,
+    name: &str,
+    fence_after: Option<u64>,
+    recover_after: u64,
+    tweak: impl FnOnce(&mut Resource<NodeSpec, NodeStatus>),
+) -> Uuid {
+    node_with(env, name, 8192, Some(recover_after), |n| {
+        n.status.ha.as_mut().unwrap().fence_after_secs = fence_after;
+        n.status.features = FEATURES.iter().map(|f| f.to_string()).collect();
+        tweak(n);
+    })
+    .await
+}
+
+/// 노드 `node`(이름 `name`)의 전원 끄기 펜싱: 명령 방법들(`off`마다 하나)
+async fn fence_node(env: &Env, node: Uuid, name: &str, offs: &[&str]) {
+    let mut fence = Resource::new(
+        name,
+        NodeFenceSpec {
+            methods: offs
+                .iter()
+                .map(|off| {
+                    FenceMethod::Command(CommandFence {
+                        off: off.to_string(),
+                        status: "echo on".into(),
+                    })
+                })
+                .collect(),
+        },
+    );
+    fence.id = node;
+    env.cluster.create(&fence).await.unwrap();
+}
+
+/// 기록 Task `node-power-off`(대상 노드, op, status)
+fn power_off_tasks(env: &Env) -> Vec<(Uuid, TaskOp, TaskStatus)> {
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    tasks
+        .into_iter()
+        .filter(|t| matches!(t.spec.op, TaskOp::NodePowerOff { .. }))
+        .map(|t| {
+            assert_eq!(t.spec.node, t.spec.target);
+            (t.spec.target, t.spec.op, t.status)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn powers_off_a_node_past_fence_after_once_and_recovers_without_waiting() {
+    let env = Env::start().await;
+    // recover_after(600초)를 기다리면 시험이 끝나지 않는다.
+    let failed = fast_node(&env, "failed", Some(1), 600).await;
+    let spare = fast_node(&env, "spare", Some(1), 600).await;
+    // 리더 자신과 대상 노드의 리스는 살아 있다.
+    keep_alive(&env, env.node);
+    keep_alive(&env, spare);
+    // 첫 방법은 실패하고 둘째가 끈다.
+    fence_node(&env, failed, "failed", &["fail", "ok"]).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    eventually("HA VM moved", || get(&env, a.id).spec.node == Some(spare)).await;
+    eventually("record tasks", || {
+        recover_tasks(&env).len() == 1 && power_off_tasks(&env).len() == 1
+    })
+    .await;
+    assert_eq!(
+        power_off_tasks(&env),
+        vec![(
+            failed,
+            TaskOp::NodePowerOff {
+                method: Some(FenceKind::Command),
+                reason: LEASE_EXPIRED.into(),
+            },
+            TaskStatus {
+                state: TaskState::Succeeded,
+                error: None,
+                progress: None,
+            }
+        )]
+    );
+    // 같은 임기에 다시 끄지 않는다. VM이 없는 spare는 끄지 않는다(펜싱도 없다).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fence.calls(),
+        [
+            ("failed".into(), "fail".into()),
+            ("failed".into(), "ok".into())
+        ]
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_power_off_waits_for_recover_after_and_is_not_retried() {
+    let env = Env::start().await;
+    let failed = fast_node(&env, "failed", Some(1), 4).await;
+    let spare = fast_node(&env, "spare", Some(1), 600).await;
+    keep_alive(&env, env.node);
+    keep_alive(&env, spare);
+    fence_node(&env, failed, "failed", &["fail", "fail"]).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let fence = Arc::new(FakeFence::default());
+    let started = std::time::Instant::now();
+    let manager = fence_manager(&env, fence.clone());
+    eventually("power-off failed", || power_off_tasks(&env).len() == 1).await;
+    let (target, op, status) = power_off_tasks(&env).remove(0);
+    assert_eq!(target, failed);
+    assert_eq!(
+        op,
+        TaskOp::NodePowerOff {
+            method: None,
+            reason: LEASE_EXPIRED.into()
+        }
+    );
+    assert_eq!(status.state, TaskState::Failed);
+    assert_eq!(
+        status.error.as_deref(),
+        Some("command: BMC unreachable; command: BMC unreachable")
+    );
+    // recover_after(4초)가 지나야 옮긴다.
+    eventually("HA VM moved", || get(&env, a.id).spec.node != Some(failed)).await;
+    assert!(started.elapsed() >= Duration::from_secs(4));
+    assert_eq!(fence.calls().len(), 2);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn does_not_power_off_nodes_without_fencing_old_frozen_or_without_ha_vms() {
+    let env = Env::start().await;
+    let nofence = fast_node(&env, "nofence", Some(1), 600).await;
+    // 계획 51 전 노드는 `fence_after_secs`를 알리지 않는다.
+    let old = fast_node(&env, "old", None, 600).await;
+    let frozen = fast_node_with(&env, "frozen", Some(1), 600, |n| {
+        n.status.online = false;
+        n.status.shutdown = Some(NodeShutdown {
+            action: ShutdownAction::Freeze,
+            maintenance: false,
+            at: 1,
+        });
+    })
+    .await;
+    let empty = fast_node(&env, "empty", Some(1), 600).await;
+    let parked = fast_node(&env, "parked", Some(1), 600).await;
+    fast_node(&env, "spare", Some(1), 600).await;
+    for (id, name) in [
+        (old, "old"),
+        (frozen, "frozen"),
+        (empty, "empty"),
+        (parked, "parked"),
+    ] {
+        fence_node(&env, id, name, &["ok"]).await;
+    }
+    let mut vms = vec![];
+    for (name, node) in [("v-nofence", nofence), ("v-old", old), ("v-frozen", frozen)] {
+        vms.push((vm(&env, name, node, true, PowerState::Running).await, node));
+    }
+    // HA가 아니거나 꺼진 VM만 있다.
+    vm(&env, "plain", empty, false, PowerState::Running).await;
+    vm(&env, "off", empty, true, PowerState::Stopped).await;
+    // 꺼진 `state: stopped` HA VM만 있다(`recover_after` 뒤 자리만 옮긴다).
+    let stopped = VmHa {
+        state: HaState::Stopped,
+        ..Default::default()
+    };
+    let p = vm_ha(&env, "v-parked", parked, Some(stopped), PowerState::Stopped).await;
+    vms.push((p, parked));
+    keep_alive(&env, env.node);
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(fence.calls().is_empty(), "{:?}", fence.calls());
+    for (vm, node) in vms {
+        assert_eq!(get(&env, vm.id).spec.node, Some(node), "{}", vm.name);
+    }
+    assert!(power_off_tasks(&env).is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_new_leader_powers_off_fence_after_from_its_base() {
+    // 이 리더는 리스를 받은 적이 없으므로 처음 리더임을 본 때부터 `fence_after`(2초)를 센다.
+    let env = Env::start().await;
+    let failed = fast_node(&env, "failed", Some(2), 600).await;
+    let spare = fast_node(&env, "spare", Some(2), 600).await;
+    keep_alive(&env, env.node);
+    keep_alive(&env, spare);
+    fence_node(&env, failed, "failed", &["ok"]).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let fence = Arc::new(FakeFence::default());
+    let started = std::time::Instant::now();
+    let manager = fence_manager(&env, fence.clone());
+    eventually("HA VM moved", || get(&env, a.id).spec.node != Some(failed)).await;
+    let calls = fence.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].2.duration_since(started) >= Duration::from_secs(2));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_requested_power_off_recovers_a_node_whose_lease_is_alive() {
+    let env = Env::start().await;
+    let failed = fast_node(&env, "failed", Some(600), 600).await;
+    let spare = fast_node(&env, "spare", Some(600), 600).await;
+    let nofence = fast_node(&env, "nofence", Some(600), 600).await;
+    fence_node(&env, failed, "failed", &["ok"]).await;
+    // 이 노드 자신은 끄지 않는다.
+    fence_node(&env, env.node, "node1", &["ok"]).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let b = vm(&env, "b-vm", nofence, true, PowerState::Running).await;
+    renew(&env.cluster, failed).await.unwrap();
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    manager.power_off(env.node, "health check failed");
+    manager.power_off(nofence, "health check failed");
+    manager.power_off(failed, "health check failed");
+    eventually("HA VM moved", || get(&env, a.id).spec.node == Some(spare)).await;
+    eventually("record task", || power_off_tasks(&env).len() == 1).await;
+    assert_eq!(
+        power_off_tasks(&env)[0].1,
+        TaskOp::NodePowerOff {
+            method: Some(FenceKind::Command),
+            reason: "health check failed".into(),
+        }
+    );
+    assert_eq!(fence.calls(), [("failed".into(), "ok".into())]);
+    assert_eq!(get(&env, b.id).spec.node, Some(nofence));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn no_power_off_task_is_recorded_while_an_old_node_remains() {
+    let env = Env::start().await;
+    let failed = fast_node(&env, "failed", Some(1), 600).await;
+    // `fast-ha`를 모르는 노드가 있으면 기록 Task를 쓰지 않는다(그 노드가 풀지 못한다).
+    node(&env, "spare", 8192, Some(600)).await;
+    keep_alive(&env, env.node);
+    fence_node(&env, failed, "failed", &["ok"]).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    eventually("HA VM moved", || get(&env, a.id).spec.node != Some(failed)).await;
+    assert_eq!(fence.calls().len(), 1);
+    assert!(power_off_tasks(&env).is_empty());
+    manager.shutdown().await;
+}
+
+/// 함께 죽은 노드(리스가 `fence_after`보다 오래 끊겼지만 아직 `recover_after` 전)로는 옮기지 않는다. 그 노드의 리스가
+/// 살아나면 그리로 옮긴다.
+#[tokio::test]
+async fn does_not_recover_to_a_node_that_died_too() {
+    let env = Env::start().await;
+    let failed = fast_node(&env, "failed", Some(1), 600).await;
+    // 함께 죽었고 끌 방법이 없다(`recover_after`까지 기다린다).
+    let other = fast_node(&env, "other", Some(1), 600).await;
+    fence_node(&env, failed, "failed", &["ok"]).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    keep_alive(&env, env.node);
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    eventually("powered off", || power_off_tasks(&env).len() == 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(get(&env, a.id).spec.node, Some(failed));
+    keep_alive(&env, other);
+    eventually("HA VM moved", || get(&env, a.id).spec.node == Some(other)).await;
+    manager.shutdown().await;
+}
+
+/// 이 리더의 리스가 `fence_after`보다 오래 갱신되지 않았으면(리더 쪽 문제) 리스가 끝난 노드를 끄지 않는다. 리더가
+/// 다시 갱신하면 끈다.
+#[tokio::test]
+async fn a_leader_with_a_stale_lease_powers_off_nobody() {
+    let env = Env::start().await;
+    let failed = fast_node(&env, "failed", Some(1), 600).await;
+    let spare = fast_node(&env, "spare", Some(1), 600).await;
+    keep_alive(&env, spare);
+    fence_node(&env, failed, "failed", &["ok"]).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    // 리더는 한 번 갱신하고 멈춘다.
+    renew(&env.cluster, env.node).await.unwrap();
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(fence.calls().is_empty(), "{:?}", fence.calls());
+    assert_eq!(get(&env, a.id).spec.node, Some(failed));
+    keep_alive(&env, env.node);
+    eventually("HA VM moved", || get(&env, a.id).spec.node == Some(spare)).await;
+    assert_eq!(fence.calls(), [("failed".into(), "ok".into())]);
+    manager.shutdown().await;
+}
+
+/// 한 임기에 HA 가능 노드의 소수(4대면 1대)까지만 끈다. 요청받은 끄기도 같은 상한을 센다.
+#[tokio::test]
+async fn powers_off_at_most_a_minority_of_the_nodes_in_a_term() {
+    let env = Env::start().await;
+    let f1 = fast_node(&env, "f1", Some(1), 600).await;
+    let f2 = fast_node(&env, "f2", Some(1), 600).await;
+    for (id, name) in [(f1, "f1"), (f2, "f2")] {
+        fence_node(&env, id, name, &["ok"]).await;
+        vm(&env, &format!("{name}-vm"), id, true, PowerState::Running).await;
+    }
+    for name in ["s1", "s2"] {
+        let spare = fast_node(&env, name, Some(1), 600).await;
+        keep_alive(&env, spare);
+    }
+    keep_alive(&env, env.node);
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    eventually("one node powered off", || fence.calls().len() == 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(fence.calls().len(), 1, "{:?}", fence.calls());
+    let first = fence.calls()[0].0.clone();
+    let rest = if first == "f1" { f2 } else { f1 };
+    manager.power_off(rest, "health check failed");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(fence.calls().len(), 1, "{:?}", fence.calls());
+    manager.shutdown().await;
+}
+
+/// 끄기가 실패한 결과가 watchdog 기다림(`recover_after`)으로 이미 옮긴 뒤에 오면 기록 Task가 그렇게 말한다.
+#[tokio::test]
+async fn a_power_off_failing_after_the_watchdog_wait_says_the_vms_were_recovered() {
+    let env = Env::start().await;
+    let failed = fast_node(&env, "failed", Some(1), 3).await;
+    let spare = fast_node(&env, "spare", Some(1), 600).await;
+    keep_alive(&env, env.node);
+    keep_alive(&env, spare);
+    fence_node(&env, failed, "failed", &["slow-fail"]).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    eventually("HA VM moved", || get(&env, a.id).spec.node == Some(spare)).await;
+    assert!(power_off_tasks(&env).is_empty());
+    eventually("power-off failed", || power_off_tasks(&env).len() == 1).await;
+    let (_, _, status) = power_off_tasks(&env).remove(0);
+    assert_eq!(status.state, TaskState::Failed);
+    assert_eq!(
+        status.error.as_deref(),
+        Some(
+            "power off failed; the node's VMs were already recovered after the watchdog wait: command: BMC unreachable"
+        )
+    );
+    manager.shutdown().await;
 }

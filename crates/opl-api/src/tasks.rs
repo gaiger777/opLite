@@ -806,6 +806,9 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         }
         // 기록 Task는 끝난 상태로 만들어지므로 실행되지 않는다.
         TaskOp::VmHaRecover { .. } => Err("an HA recovery task is a record and is not run".into()),
+        TaskOp::NodePowerOff { .. } => {
+            Err("a node power-off task is a record and is not run".into())
+        }
         TaskOp::VmBackup { backup } => backup::backup(ctx, task, *backup).await,
         TaskOp::BackupDelete => return backup::delete(ctx, id).await,
         TaskOp::BackupRestore { backup, name, pool } => {
