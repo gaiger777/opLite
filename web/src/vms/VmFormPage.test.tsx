@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import type { List } from "@/api/live";
 import type { Task } from "@/api/types";
-import { NODE, pool, securityGroup, task, vm, volume } from "@/test/fixtures";
+import { haGroup, NODE, pool, securityGroup, task, vm, volume } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
@@ -659,4 +659,91 @@ it("says when no node has fencing on", async () => {
   renderPage(<VmCreatePage />, { path: "/vms/-new" });
   expect(await screen.findByRole("switch", { name: "High availability (HA)" })).toBeDisabled();
   expect(screen.getByText("No node has fencing on, so HA VMs cannot run.")).toBeInTheDocument();
+});
+
+/** HA 가능 노드의 멈춘 VM app을 편집하는 화면. 보낸 본문을 모은다. */
+function editStoppedApp() {
+  mockLists({ vm: [vm("app", "stopped")], node: [FENCED], "ha-group": [haGroup("rack", 1)] });
+  const bodies: { spec: { ha: unknown } }[] = [];
+  server.use(
+    http.put(apiUrl(`/vms/${vm("app", "stopped").id}`), async ({ request }) => {
+      bodies.push((await request.json()) as (typeof bodies)[number]);
+      return HttpResponse.json(vm("app", "stopped"));
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });
+  return bodies;
+}
+
+it("sends the default HA policy as the old true", async () => {
+  const bodies = editStoppedApp();
+  const user = userEvent.setup();
+  // 정책의 값은 HA를 켤 때만 보인다.
+  expect(screen.queryByLabelText("HA state")).not.toBeInTheDocument();
+  await user.click(await screen.findByRole("switch", { name: "High availability (HA)" }));
+  expect(screen.getByLabelText("HA state")).toHaveValue("started");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  // 기본 정책은 옛 모양 그대로다(옛 노드가 남아도 저장된다).
+  expect(bodies[0]?.spec.ha).toBe(true);
+});
+
+it("sets the HA state, group and counts", async () => {
+  const bodies = editStoppedApp();
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("switch", { name: "High availability (HA)" }));
+  await user.selectOptions(screen.getByLabelText("HA state"), "stopped");
+  await user.selectOptions(await screen.findByLabelText("HA group"), "rack");
+  const restarts = screen.getByLabelText("Restarts on the same node");
+  await user.clear(restarts);
+  await user.type(restarts, "11");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  expect(screen.getByText("From 0 to 10.")).toBeInTheDocument();
+  await user.clear(restarts);
+  await user.type(restarts, "3");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  expect(bodies[0]?.spec.ha).toEqual({
+    state: "stopped",
+    group: "rack",
+    max_restart: 3,
+    max_relocate: 1,
+  });
+});
+
+it("keeps the HA policy of a VM when other fields change", async () => {
+  const policy = { state: "stopped", group: "gone", max_restart: 0, max_relocate: 2 } as const;
+  const app = vm("app", "stopped", { spec: { ...vm("app", "stopped").spec, ha: policy } });
+  mockLists({ vm: [app], node: [FENCED] });
+  let body: { spec: { ha: unknown; memory_mib: number } } | undefined;
+  server.use(
+    http.put(apiUrl(`/vms/${app.id}`), async ({ request }) => {
+      body = (await request.json()) as typeof body;
+      return HttpResponse.json(app);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });
+  const user = userEvent.setup();
+  // 지운 그룹도 고른 값으로 보인다.
+  expect(await screen.findByLabelText("HA group")).toHaveValue("gone");
+  const memory = screen.getByLabelText("Memory (MiB)");
+  await user.clear(memory);
+  await user.type(memory, "4096");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(body?.spec.memory_mib).toBe(4096));
+  expect(body?.spec.ha).toEqual(policy);
+});
+
+it("keeps a running VM with ignored HA from activating HA", async () => {
+  const policy = { state: "ignored", max_restart: 1, max_relocate: 1 } as const;
+  const app = vm("app", "running", { spec: { ...vm("app", "running").spec, ha: policy } });
+  mockLists({ vm: [app], node: [FENCED] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });
+  const state = await screen.findByLabelText("HA state");
+  expect(state).toHaveValue("ignored");
+  expect(within(state).getByRole("option", { name: "Started" })).toBeDisabled();
+  expect(within(state).getByRole("option", { name: "Ignored (paused)" })).toBeEnabled();
+  expect(screen.getByText("Turn on HA while the VM is stopped.")).toHaveClass(
+    "text-muted-foreground",
+  );
 });

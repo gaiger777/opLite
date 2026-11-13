@@ -1180,3 +1180,151 @@ VM에서 손으로 확인하고 결과를 적는다.
 - 링크 상태를 헬스·지표·웹에 보이기(계획 52의 관리망 검사와 함께), 링크별 백그라운드 ping, 대량 전송(콘솔·마이그레이션
   준비)용 링크를 따로 고르기.
 - TLS 핸드셰이크에서 멈추는 링크로 보낸 긴 리더 요청은 다른 호출이 링크를 넘길 때까지 넘어가지 못한다.
+
+## 17. 구현(계획 50)
+
+일곱 단계를 커밋 일곱으로 했다(1 `ha` 구조와 호환, 2 배치 함수와 HA 그룹·배치 규칙 API, 3 규칙 강제 — 생성·시작·마이그레이션·
+비우기, 4 HA 복구·되돌아가기·`rule_violations`, 5 재시작·옮기기 횟수, 6 노드 정상 종료 정책, 7 웹·문서). 설계 §8과 다르거나
+설계가 정하지 않아 정한 것을 적는다.
+
+**`ha` 모양과 호환(단계 1).**
+- `VmSpec`은 `deny_unknown_fields`이고 저장소는 읽을 때 타입으로 풀므로(목록 하나가 실패하면 전체가 오류) 새 모양을 옛 노드가
+  읽지 못하면 그 VM이 든 목록이 모두 깨진다. 그래서 `VmSpec.ha: Option<VmHa>`의 serde를 손으로 썼다(`ha_compat`): 읽기는
+  `false` → 없음, `true` → 기본 정책, 객체 → 그 값(객체 안은 `deny_unknown_fields`, 빠진 값은 기본 — `{}`도 기본 정책). 쓰기는
+  없음 → `false`, 기본 정책 → `true`, 아니면 객체. 이 계획 전의 VM과 단순 HA VM은 바이트까지 옛 모양이다.
+- `VmHa { state: HaState(started|stopped|ignored), group, max_restart, max_relocate }`(횟수 0~10, `MAX_HA_COUNT`, 기본 1·1,
+  `ValidationError::HaCount`). OpenAPI는 `HaSetting = oneOf [boolean, VmHa]`이고 웹은 둘 다 읽는다(`haEnabled`·`haPolicy`).
+- `VmSpec::ha_active()`(정책이 있고 `ignored`가 아님)가 옛 `spec.ha`의 자리다: 펜싱, HA 가능 노드 조건, 복구 대상, 백업·
+  스냅샷·마이그레이션 등의 HA 분기. 없음·`ignored` → `started`·`stopped`는 HA 켜기와 같아 VM이 멈춰 있을 때만(409 `vm_running`).
+- 기본과 다른 객체는 `require_feature("ha-placement")`(409 `cluster_upgrading`). 기능 `ha-placement`(`FEATURES` 끝,
+  `opl_types::node::HA_PLACEMENT`)는 새 종류 쓰기, 기본이 아닌 `ha`, `shutdown_policy`, reconciler의 옮기기 요청이 본다.
+- `VmStatus.rule_violations`·`VmStatus.ha: Option<VmHaStatus { relocate_from, relocations, relocated_from, error }>`(비면 쓰지 않음)는
+  `deny_unknown_fields`가 없어 가리지 않는다. reconciler `write_status`는 `rule_violations`를 늘 저장소 값에서, `ha`는 이
+  작업자가 바꾸지 않았으면 저장소 값에서 옮겨 쓰고(`keep_ha`) `write_power_off`도 지킨다.
+
+**`state`의 뜻.** 켜고 끄기는 지금처럼 `spec.power` 하나다(둘을 두면 어긋난다). `started` = 지금의 HA, `stopped` = 노드 장애
+때 옮기기만 하고 켜지 않음(복구 spec 쓰기에서 `power = Stopped`, 꺼진 `stopped` VM도 옮김 — Proxmox `stopped`와 같은 결과),
+`ignored` = HA를 잠시 끔(펜싱·복구·횟수·HA 가능 노드 조건 모두 없음, 설정은 남김).
+
+**HA 그룹·배치 규칙(단계 2).**
+- 새 종류 `Kind::HaGroup`(`ha-group`, `HaGroupSpec { nodes: [{ node, priority 0~1000 }], restricted, nofailback }`)과
+  `Kind::PlacementRule`(`placement-rule`, `PlacementRuleSpec { kind, vms | vm_tag, nodes | node_tag, weight 1~100(soft만, 없으면
+  50), enabled(기본 true), ha_may_violate(hard만) }`). 둘 다 `deny_unknown_fields`, 이름은 리소스 이름, 쓰기는 관리자만(운영자
+  목록에 넣지 않음), 읽기는 모두. API `/ha-groups`·`/placement-rules`(목록·조회·`POST`·통째로 바꾸는 `PUT`·`DELETE`), watch
+  종류, 원격 중계 허용 목록에 더했다. 만들기·고치기는 `require_feature`, 삭제는 기능을 보지 않는다.
+- **노드 태그는 노드 레이블이다(설계와 다름).** 설계는 "노드에 `tags`"였으나 `NodeSpec`이 `deny_unknown_fields`라 필드를 더하면
+  옛 노드가 Node 기록을 풀지 못한다. 노드 레이블(`Resource.labels`, `[node] zone`이 `zone`이 됨)을 태그로 쓰고 `vm_tag`·`node_tag`는
+  `"key=value"` 하나(`parse_tag`, 그 레이블 값이 같은 것)다. CLI `node label`, 웹 노드 화면의 레이블 편집을 더했다.
+- 검증(400): VM은 `vms`/`vm_tag` 중 하나(이름 목록이면 VM끼리 규칙은 둘 이상), VM끼리 규칙은 노드를 주지 않음, 노드 규칙은
+  `nodes`/`node_tag` 중 하나, 규칙의 `nodes`·그룹 노드는 있는 노드여야 함. 규칙의 VM 이름은 아직 없어도 된다. VM의 `ha.group`은
+  있는 그룹이어야 하고(400), VM이 쓰는 그룹 삭제는 409 `group_in_use`.
+- 공용 함수(`opl-api/src/placement.rs`): `Assign { place, unplace }`(자리 덮어쓰기), `Candidate { node, priority, penalty,
+  free_mib }`, `candidates(&Vm, &Inventory, &Assign)`(노드 조건·hard 통과만, 나은 것부터), `best`, `compare`(그룹 우선순위 →
+  벌점 → 미할당 메모리 → id), `score`, `hard_violations`(restricted 그룹 밖이면 `ha-group:<이름>`), `soft_violations`,
+  `affinity_partners`, `conflicts`. "자리 잡은 VM" = `spec.power == Running`이고 `spec.node`가 있는 VM, 마이그레이션 중이면
+  원본과 대상 둘 다. HA 그룹 우선순위는 `ha_active()` VM에만 쓴다. `Inventory`가 규칙·그룹도 읽는다.
+- 모순(422 `rule_conflict`, `details.rules`): 켜진 hard 규칙만, 태그는 지금 레이블로 풀어 (a) 같은 두 VM이 `affinity` 묶음
+  (추이적)과 `anti-affinity`에 함께, (b) 한 `affinity` 묶음의 허용 노드가 빔. 새(고친) 규칙이 든 모순만 거절한다(이미 있던
+  모순으로 다른 규칙 저장을 막지 않음). 그 뒤 레이블이 바뀌어 생긴 모순은 놓을 곳 없음(409)·위반으로 보인다.
+
+**강제(단계 3).**
+- `scheduler::schedule(&Vm, &Inventory) -> Result<Uuid, ScheduleError::{NoNode, PlacementRule(규칙)}>`: 노드 조건부터 맞는
+  노드가 없으면 `no_node`, 조건은 맞는데 hard 규칙 때문이면 409 `placement_rule`(`details.rules`). `prepare`·`schedule`은
+  `VmSpec` 대신 VM(이름·레이블 필요)을 받는다.
+- 노드를 준 켜진 VM의 생성·수정은 그 노드가 hard 규칙을 어기면 409(이미 그 노드에 자리 잡은 VM의 다른 고치기는 막지 않음),
+  규칙을 어기는 노드에 붙은 꺼진 VM의 시작은 다른 노드를 고른다(유지보수 때와 같이, 없으면 409).
+- 마이그레이션 `start_migration(…, RuleCheck::{Enforce, Force, Group(묶음)})`: 노드 조건·메모리 뒤 hard 규칙, 자리 잡은 hard
+  affinity 상대가 있으면 혼자 옮기지 못함. `MigrateRequest.force`는 배치 규칙 쓰기 권한(관리자)만이고 감사 detail
+  `force rules=<이름들>`. 비우기는 한 번에 첫 VM 하나를 그 노드의 affinity 묶음(추이적)과 함께, 묶음 전체를 받을 노드(메모리 합,
+  묶음을 둔 `Assign`으로 hard 검사)로 옮기고, 받을 곳이 없으면 `placement rule …`로 남긴다. 규칙에 맞는 노드가 메모리 때문에만
+  막혔으면(앞 구성원이 옮겨 간 노드에 자리가 없는 짝) 규칙이 아니라 `no node with capacity`다(2차 리뷰). 디스크 막힘(저장소
+  마이그레이션 기능·스냅샷)은 묶음의 모든 구성원에서 보고 하나라도 막히면 묶음 전체를 남기며(막은 구성원은 그 이유, 나머지는
+  `affinity partner X: <이유>`, 2차 리뷰), 이미 옮기지 못한 VM이 묶음에 있으면 나머지도 `affinity partner X could not move`로
+  옮기지 않는다(1차 리뷰). 앞 구성원이 옮겨진 뒤 마이그레이션이 실패한 구성원은 남고(앞 구성원을 되돌리지 않음) 갈라짐은
+  `rule_violations`에 보인다(two_nodes 시험). 배치 규칙 만들기·고치기는 VM 만들기와 같은 `vm_lock`
+  안에서 검사하고 쓴다 — `vm_lock`은 API 노드마다라 서로 다른 API 노드로 보낸 모순 규칙의 동시 만들기는 여전히 둘 다 저장될 수
+  있다(그 뒤 놓을 곳 없음·위반으로 보임). 스냅샷 되돌리기는 지금 VM의 `ha`로 검증하고(Task가 지금 것을 지킴), 복제·복원·가져오기가
+  만드는 VM의 `ha.group`이 지워진 그룹이면 그룹만 빼고 경고한다. 그룹 확인과 VM 쓰기 사이에 그룹이 지워지는 좁은 경합은 남는다
+  (그 VM은 그룹 없는 VM처럼 다뤄져 해롭지 않다). 받은 백업의 `vm_spec`에 기본이 아닌 `ha`가 있고 `ha-placement`를 모르는
+  노드가 있으면 `true`(기본 정책)로 낮춰 저장한다. `orbivisorctl vm set --ha`는 `ignored` 정책을 `started`로 다시 켠다.
+
+**HA 복구·되돌아가기·`rule_violations`(단계 4).**
+- 복구 대상은 `placement::candidates` 순서(그룹 우선순위 → 벌점 → 메모리) + 리스가 살아 있는 노드, 죽은 노드·받던 마이그레이션
+  노드 제외. 죽은 노드의 VM은 자리로 세지 않고, 앞에서 옮긴 VM은 `Assign`으로 다음 VM의 규칙·메모리에 센다(같은 죽은 노드의
+  affinity 상대는 첫 VM을 따라감). hard 규칙에 막히면 켜지 않고 `last_error`·`ha.error`("HA cannot place this VM: placement
+  rule …")를 남기고 틱마다 다시 본다. 막는 규칙이 모두 `ha_may_violate`면 위반이 가장 적은 노드에 켜고 warn. 옮기면 `ha.error`를
+  지운다.
+- 되돌아가기(`fail_back`): 복구할 노드와 결과 모르는 쓰기가 없을 때, 더 높은 그룹 우선순위·hard 통과·`failback_after`(기본
+  30초, `HaManagerConfig.failback_after`) 넘게 리스가 산 노드로 `start_migration(RuleCheck::Enforce)`. 클러스터에 Task 하나,
+  끝나기를 기다리고, 실패한 VM은 이 리더가 다시 하지 않는다. `start_migration`이 거절한 VM은 60초(`FAILBACK_RETRY`) 뒤에 다시
+  보고, 옮기기 창 안에 `relocations` 기록이 있는 VM(재시작 횟수를 넘겨 옮겨 온 VM)은 되돌리지 않는다(1차 리뷰). 창이 지나
+  `relocated_from`(옮기기가 기록과 함께 쓰는, 마지막으로 옮겨 떠난 노드 — Proxmox `failed_nodes`와 비슷)으로 되돌아가면
+  마이그레이션 Task를 만든 뒤 옮기기 한 번으로 센다(`relocations`에 지금 시각, `relocated_from` 지움 — 되돌아간 노드에서 다시
+  크래시하면 기본값에서 `error`, 2차 리뷰). 다른 노드로의 되돌아가기는 세지 않는다. 리스를 처음 본 때는 리더의 메모리에만 있어 리더가 바뀌면 다시 센다.
+- `rule_violations`: 리더의 `HaManager` 틱마다 자리 잡은 VM의 hard·soft 위반을 계산해 바뀐 VM만 `UpdateStatusIf`(충돌은 다음
+  틱). 꺼진 VM은 비운다.
+- 실제 프로세스 시험(`ha-it`): 그룹 `{A:1, B:2}`의 HA VM이 B에 놓이고 B를 kill -9 하면 A로 복구, B를 다시 띄우면 되돌아감
+  (마이그레이션 포트 49630-49649, HVF면 되돌아가기 부분은 건너뜀).
+
+**재시작·옮기기 횟수(단계 5).**
+- reconciler: `started` HA VM의 크래시는 `restart` 정책과 관계없이 다시 켠다(게스트가 스스로 끈 것은 끔). 기존 창(600초)
+  안의 크래시가 `max_restart`를 넘으면 `status.ha.relocate_from = 이 노드`·phase Failed를 쓰고, 요청이 저장소에 있는 동안 켜지
+  않고 리더의 status를 덮지 않는다. 꺼지면 요청을 지우고 다시 켤 때 `ha.error`도 지운다. 모든 노드가 `ha-placement`일 때만
+  (`ha_placement_everywhere`, 크래시 때 노드 목록을 읽음 — 옛 리더는 `relocate_from`을 모름), 아니면 지금의 백오프·포기.
+  `FailureTracker::record_up_to`.
+- 리더: 원본 리스가 살아 있을 때만(죽은 노드면 노드 장애 복구가 맡음) 그 노드를 뺀 `candidates`로 옮기고(펜싱 없이 status 뒤
+  spec, `relocate_from`은 받은 노드가 켤 때 지움) `relocations`(유닉스 초, 600초 창)에 더한다. 창 안에서 이미 `max_relocate`번이면
+  spec `power = Stopped`를 먼저 쓴 뒤 status Failed·`ha.error = "gave up after N relocations"`(spec을 먼저: 요청을 먼저 지우면
+  그 노드가 다시 켤 수 있음). 노드 장애 복구는 요청을 지우고 세지 않는다. 사용자 재시작은 `relocations`를 지우지 않는다(창이
+  지나면 사라짐).
+- 옮기기 창(`RELOCATE_WINDOW`)은 리더의 고정 600초, 재시작 창은 각 노드 reconciler의 재시작 백오프 창(`restart.window`, 기본
+  600초)이다. reconciler의 status 다시 쓰기는 이 작업자가 바꾼 `ha` 필드만 저장된 값 위에 다시 적용한다(`merge_ha` — 그 사이
+  리더가 쓴 포기 오류를 덮지 않음, 1차 리뷰).
+- `ha-it`: A의 HA VM QEMU를 두 번 kill → B로 옮겨 켜짐.
+
+**노드 정상 종료 정책(단계 6).**
+- `SettingsSpec.shutdown_policy: Option<ShutdownPolicy>`(`conditional`은 `None`으로 저장, 바꿀 때 `require_feature`),
+  `NodeStatus.shutdown: Option<NodeShutdown { action, maintenance, at }>`, `NodeStatus::frozen()`(freeze 표시 + 오프라인).
+- 판별은 opld `shutdown.rs`: SIGTERM 때 `systemctl list-jobs --no-legend --plain`(5초 제한)에서 `reboot.target`·`kexec.target`·
+  `soft-reboot.target`의 start 작업이면 재부팅, `poweroff.target`·`halt.target`(또는 `shutdown.target`만)이면 끄기, 없거나 실패하면(macOS 포함) 호스트
+  종료 아님. `systemctl stop`·업그레이드 재시작은 지금 그대로다.
+- `Member::prepare_shutdown()`(`close` 전, API·실행기가 도는 동안): 표시를 쓰고, `migrate`면 유지보수로 바꾸고
+  (`maintenance: true`) 비우기 Task를 `SHUTDOWN_MIGRATE_LIMIT`(600초)까지 기다린다. `Services::shutdown`은 reconciler를 멈춘 뒤·
+  `ha.close()` 전에 이 노드의 활성 HA VM을 ACPI(`acpi_timeout`) → 강제로 끄고 `set_running(false)`(spec은 그대로 Running). 표시
+  쓰기가 실패하면 경고하고 failover처럼 끈다. 리더는 얼린 노드를 복구하지 않는다(틱 필터와 `recover_node` 두 곳). 다시 등록할 때
+  표시를 지우고 정책이 켠 유지보수만 끈다(노드가 꺼진 동안 관리자가 다시 켠 유지보수도 표시가 `maintenance: true`면 끈다 —
+  README). `POST /nodes/{key}/unfreeze`(관리자, 온라인이면 409 `node_online`). 표시가 있는 노드는 `node_fits_with`가 거절한다
+  ("is shutting down": freeze·failover는 `mark_offline`까지 온라인·리스가 살아 있어 복구·옮기기·되돌아가기·비우기·스케줄 대상이
+  되던 것, 1차 리뷰). 그런 노드로의 마이그레이션은 409 `no_capacity`가 아니라 `node_unavailable`이다. `prepare_shutdown`은 표시를
+  쓰기 전에 등록 작업을 멈추고 기다린다(과반수 없이 시작해 재시도하던 등록이 뒤늦게 성공해 표시를 지우고 유지보수를 끄지 않게,
+  2차 리뷰).
+- systemd: QEMU 스코프에 `--property=Before=opld.service`(멈출 때는 역순이라 opld가 끝난 뒤 스코프가 멈춤 — 정책이 VM이 살아
+  있을 때 돈다)와 `--property=After=network-online.target remote-fs.target`(망·원격 파일시스템보다 먼저 멈춤),
+  `opld.service`에 `TimeoutStopSec=15min`(보통의 `systemctl stop`·`restart`에도 적용 — README). 스코프의 `Before`는 Linux CI(`OPL_TEST_SYSTEMD=1`)의 `systemctl show -p
+  Before`가 본다(macOS에서는 확인하지 못함). 이 계획 전에 켠 VM의 스코프에는 속성이 없다(다시 켜야 적용, README).
+- 시험 고리 `[test] host_shutdown = "reboot"|"poweroff"`(`starve-it`·`ha-it` 빌드)가 판별을 대신한다. `ha-it`: poweroff +
+  `failover`면 A가 끝나기 전에 HA VM이 꺼지고 B에서 켜짐, reboot + 기본이면 `recover_after`가 지나도 복구 안 됨·A가 돌아오면
+  A에서 켜짐.
+
+**보이기(단계 7).**
+- CLI: `ha-group list|get|create|set|delete`(`--node NAME[:PRIORITY]`), `placement-rule list|get|create|set|enable|disable|delete`,
+  `vm create|set`의 `--ha-state`·`--ha-group`·`--max-restart`·`--max-relocate`(하나라도 주면 정책 객체, 모두 기본이면 `true`),
+  `vm migrate --force`, `node label`, `node unfreeze`, `node list` SHUTDOWN 열, `settings set shutdown_policy=…`.
+- 웹: "HA 그룹"(노드마다 체크와 우선순위)·"배치 규칙"(종류, VM 이름·레이블, 노드 체크·레이블, 벌점, `ha_may_violate`, 켜기) 화면은
+  백업 작업 화면 모양이고 누구나 읽고 admin만 바꾼다(422·409는 `errors.rule_conflict`·`group_in_use`·`placement_rule` 문구).
+  watch 종류 `ha-group`·`placement-rule`을 늘 구독한다. VM 폼의 HA 절은 스위치(정책 있음) 아래 상태·그룹·횟수를 보이고
+  `haSetting`이 서버와 같이 기본 정책을 `true`로 보낸다 — 단계 1~6 사이 웹 폼이 정책 객체를 bool로 덮던 것이 없어졌다. 실행 중이고
+  HA가 활성이 아닌 VM은 상태 고르기에서 `started`·`stopped`가 막힌다. VM 상세 요약에 고가용성(상태·횟수)·HA 그룹·어긴 배치
+  규칙·HA 오류. 마이그레이션 대화상자의 "배치 규칙 무시"는 배치 규칙 쓰기 권한(admin)에게만 보이는 체크(`force: true`).
+  노드 화면에 레이블 열과 "레이블 편집"(`PUT /nodes/{key}`의 `labels`, 저장할 때 실시간 목록의 revision으로 If-Match, 연 사이
+  레이블이 바뀌었으면 저장하지 않고 다시 열라는 오류 — 2차 리뷰), "얼림" 배지(`frozen()`과 같은 조건)와
+  "얼림 풀기", 설정에 "호스트 종료 때 HA VM".
+- README "배치 규칙과 HA 정책" 절과 HA·비우기·웹 UI 절의 고친 문장. 기본 `conditional` 때문에 업그레이드 뒤 노드를 재부팅하면
+  HA VM이 다른 노드로 옮겨지지 않고 그 노드에서 다시 켜지는 동작 변화를 적었다.
+
+**남은 것.**
+- 균형 조정기의 위반 바로잡기와 묶음 옮기기 API(계획 53 — `Candidate.free_mib` 자리를 부하 점수로 바꾸고 같은 함수를 부름),
+  미리 고른 복구 노드와 종료 failover의 빠른 복구(계획 51), 꺼진 `started` HA VM의 노드 옮기기, 호스트 종료 때 HA 아닌 VM의
+  ACPI 종료.
+- 웹은 새 watch 종류 두 개를 늘 읽으므로, 앞단 프록시가 업그레이드 중 옛 API 노드로 요청을 보내면 그 노드의 404로 실시간
+  연결이 다시 시도를 되풀이한다(같은 노드의 내장 웹 UI는 해당 없음; 이전 계획의 새 종류도 같았다).

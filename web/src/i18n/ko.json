@@ -72,7 +72,10 @@
     "remote_unreachable": "원격 클러스터에 닿지 못했습니다({{message}}).",
     "remote_fingerprint_mismatch": "원격 클러스터의 CA 지문이 다릅니다. CA를 다시 받아 확인하세요.",
     "remote_is_local": "그 주소는 이 클러스터입니다. 다른 클러스터를 추가하세요.",
-    "remote_unauthorized": "원격 클러스터가 API 토큰을 거절했습니다. 그곳에 토큰이 아직 있는지 확인하세요."
+    "remote_unauthorized": "원격 클러스터가 API 토큰을 거절했습니다. 그곳에 토큰이 아직 있는지 확인하세요.",
+    "placement_rule": "배치 규칙 때문에 이 VM을 놓을 노드가 없습니다: {{message}}",
+    "rule_conflict": "다른 배치 규칙과 모순되는 규칙입니다: {{message}}",
+    "group_in_use": "VM이 쓰고 있는 HA 그룹입니다. 먼저 VM을 그룹에서 빼세요: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -92,7 +95,9 @@
     "tokens": "API 토큰",
     "cluster": "클러스터",
     "remotes": "원격 클러스터",
-    "settings": "설정"
+    "settings": "설정",
+    "haGroups": "HA 그룹",
+    "placementRules": "배치 규칙"
   },
   "header": {
     "language": "언어",
@@ -293,7 +298,18 @@
     "bulkSummary": "{{action}}: {{done}}개 요청, {{failed}}개 실패, {{skipped}}개 건너뜀.",
     "noDisks": "디스크가 없습니다.",
     "noNics": "네트워크 인터페이스가 없습니다.",
-    "ha": "HA"
+    "ha": "HA",
+    "haOff": "꺼짐",
+    "haState": {
+      "started": "켬",
+      "stopped": "끔(옮기되 켜지 않음)",
+      "ignored": "무시(잠시 끔)"
+    },
+    "haCounts": "재시작 {{restart}}번, 옮기기 {{relocate}}번",
+    "haGroup": "HA 그룹",
+    "ruleViolations": "어긴 배치 규칙",
+    "haError": "HA 오류",
+    "haPolicy": "고가용성"
   },
   "snapshots": {
     "created": "만든 시각",
@@ -648,7 +664,9 @@
     "copyNote_one": "디스크 {{count}}개(모두 {{size}})를 복사합니다. 오래 걸릴 수 있고 그동안 VM을 끄거나 스냅샷·백업할 수 없습니다.",
     "copyNote_other": "디스크 {{count}}개(모두 {{size}})를 복사합니다. 오래 걸릴 수 있고 그동안 VM을 끄거나 스냅샷·백업할 수 없습니다.",
     "noSamePool": "{{node}}에는 쓸 수 있는 {{pool}} 풀이 없습니다. 대상 풀을 고르세요.",
-    "snapshots": "스냅샷이 있는 VM은 노드 로컬 풀의 디스크를 복사해 옮길 수 없습니다. 먼저 VM의 스냅샷을 지우세요."
+    "snapshots": "스냅샷이 있는 VM은 노드 로컬 풀의 디스크를 복사해 옮길 수 없습니다. 먼저 VM의 스냅샷을 지우세요.",
+    "force": "배치 규칙 무시",
+    "forceHint": "반드시 배치 규칙이나 그룹 노드만 쓰는 HA 그룹을 어겨도 옮깁니다. 노드 조건과 메모리는 그대로 봅니다. 어긴 규칙은 감사 로그에 남습니다."
   },
   "forms": {
     "name": "소문자·숫자·-로 1–63자, -로 시작하거나 끝날 수 없습니다."
@@ -976,6 +994,27 @@
       "errors": {
         "node_offline": "노드가 오프라인입니다."
       }
+    },
+    "labels": "레이블",
+    "labelsMenu": "레이블 편집",
+    "labelsTitle": "{{name}}의 레이블",
+    "labelsDescription": "배치 규칙은 레이블(node_tag, 예: zone=rack-a)로 노드를 고릅니다. zone 레이블은 노드 설정의 [node] zone을 따릅니다.",
+    "labelsHint": "KEY=VALUE를 쉼표로 나눕니다. 비우면 모두 지웁니다.",
+    "labelsSaved": "{{name}}의 레이블을 저장했습니다.",
+    "errors": {
+      "labels": "KEY=VALUE를 쉼표로 나눠 적으세요.",
+      "labelsChanged": "이 노드의 레이블이 다른 곳에서 바뀌었습니다. 대화 상자를 닫고 다시 여세요."
+    },
+    "frozen": "얼림",
+    "unfreeze": {
+      "menu": "얼림 풀기",
+      "title": "{{name}}의 얼림을 풀까요?",
+      "description": "호스트 재부팅 때문에 노드가 HA VM을 끄고 꺼졌으므로 HA는 노드가 돌아오기를 기다립니다. 돌아오지 않을 노드면 얼림을 푸세요: 리더가 죽은 노드처럼 그 HA VM을 다른 노드에서 복구합니다.",
+      "confirm": "얼림 풀기",
+      "done": "{{name}}의 얼림을 풀었습니다. HA VM을 다른 노드에서 복구합니다.",
+      "errors": {
+        "node_online": "노드가 다시 온라인입니다. 노드가 스스로 표시를 지웁니다."
+      }
     }
   },
   "accounts": {
@@ -1253,7 +1292,8 @@
       "macMulticast": "멀티캐스트 주소(첫 바이트가 홀수)는 쓸 수 없습니다.",
       "macDuplicate": "인터페이스마다 다른 MAC 주소여야 합니다.",
       "keep": "1에서 100 사이여야 합니다.",
-      "securityGroups": "보안 그룹은 8개까지 고를 수 있습니다."
+      "securityGroups": "보안 그룹은 8개까지 고를 수 있습니다.",
+      "haCount": "0~10입니다."
     },
     "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}",
     "schedule": "예약 스냅샷",
@@ -1269,7 +1309,20 @@
     "haHint": "펜싱이 켜진 노드에서만 돕니다. 노드가 클러스터 과반과 끊기면 그 노드가 VM을 끕니다.",
     "haNodeOff": "{{node}}의 펜싱이 꺼져 있어 HA VM을 돌릴 수 없습니다.",
     "haNoNode": "펜싱이 켜진 노드가 없어 HA VM을 돌릴 수 없습니다.",
-    "haRunning": "HA는 VM이 멈춰 있을 때 켤 수 있습니다."
+    "haRunning": "HA는 VM이 멈춰 있을 때 켤 수 있습니다.",
+    "haState": "HA 상태",
+    "haStateHint": {
+      "started": "노드가 죽으면 HA가 다른 노드에서 VM을 켭니다.",
+      "stopped": "노드가 죽으면 HA가 VM을 다른 노드로 옮기기만 하고 켜지 않습니다.",
+      "ignored": "HA가 이 VM을 잠시 다루지 않습니다: 펜싱·복구·횟수 세기를 하지 않습니다. 설정은 남습니다."
+    },
+    "haGroup": "HA 그룹",
+    "haGroupHint": "그룹 노드에 우선순위가 높은 노드부터 복구합니다.",
+    "haNoGroup": "그룹 없음",
+    "maxRestart": "같은 노드에서 다시 켜기",
+    "maxRestartHint": "10분 안에 0~10번. 넘으면 HA가 VM을 다른 노드로 옮깁니다.",
+    "maxRelocate": "다른 노드로 옮기기",
+    "maxRelocateHint": "10분 안에 0~10번. 넘으면 HA가 VM을 끄고 오류를 보입니다. 다시 시작하면 오류가 지워집니다."
   },
   "console": {
     "connecting": "연결 중…",
@@ -1377,6 +1430,24 @@
       "enabled": "텔레메트리를 켰습니다.",
       "disabled": "텔레메트리를 껐습니다.",
       "idReset": "보고 ID를 새로 만들었습니다."
+    },
+    "shutdown": {
+      "title": "호스트 종료 때 HA VM",
+      "policy": "정책",
+      "policies": {
+        "conditional": "조건부(기본)",
+        "freeze": "얼림",
+        "failover": "다른 노드로",
+        "migrate": "미리 옮기기"
+      },
+      "hint": {
+        "conditional": "재부팅이면 얼림, 전원 끄기면 다른 노드로.",
+        "freeze": "그 노드의 HA VM을 끄고, 노드가 돌아오면 같은 노드에서 켭니다. 그동안 HA가 옮기지 않습니다.",
+        "failover": "그 노드의 HA VM을 끄고, 평소의 복구 대기 뒤 HA가 다른 노드에서 켭니다.",
+        "migrate": "먼저 그 노드의 VM을 라이브 마이그레이션으로 옮기고(노드 비우기, 10분까지), 남은 HA VM은 다른 노드로."
+      },
+      "note": "호스트가 재부팅하거나 꺼질 때만 씁니다. orbivisord를 멈추거나 업그레이드하면 VM은 계속 돕니다.",
+      "save": "정책 저장"
     }
   },
   "audit": {
@@ -1401,5 +1472,102 @@
     "disabled": "다음 노드는 감사 로그가 꺼져 있습니다: {{nodes}}",
     "truncated": "최근 {{count}}개만 보입니다. 더 있으니 범위나 거르기를 좁히세요.",
     "entryTitle": "감사 항목"
+  },
+  "haGroups": {
+    "pageHint": "그룹의 HA VM은 그룹 노드에 우선순위가 높은 노드부터 놓이고 복구됩니다. 우선순위가 더 높은 노드가 돌아오면 실행 중인 VM은 라이브 마이그레이션으로 그 노드에 되돌아갑니다(되돌아가지 않음이 아니면).",
+    "empty": "HA 그룹이 없습니다.",
+    "nodes": "노드와 우선순위",
+    "options": "옵션",
+    "vms": "VM",
+    "nodePriority": "{{node}} ({{n}})",
+    "restricted": "그룹 노드만",
+    "nofailback": "되돌아가지 않음",
+    "editNamed": "HA 그룹 {{name}} 편집",
+    "deleteNamed": "HA 그룹 {{name}} 삭제",
+    "deleteTitle": "HA 그룹 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "그룹을 쓰는 VM이 없어야 합니다. 이미 놓인 VM은 그대로 둡니다.",
+    "deleted": "HA 그룹 {{name}}을(를) 삭제했습니다.",
+    "createTitle": "HA 그룹 만들기",
+    "editTitle": "{{name}} 편집",
+    "dialogDescription": "HA VM은 HA 설정에서 그룹을 고릅니다. 이미 놓인 VM은 옮기지 않습니다.",
+    "saved": "HA 그룹 {{name}}을(를) 저장했습니다.",
+    "created": "HA 그룹 {{name}}을(를) 만들었습니다.",
+    "priorityOf": "{{node}}의 우선순위",
+    "nodesHint": "우선순위는 0~1000이고 클수록 먼저입니다. 비우면 0입니다.",
+    "restrictedLabel": "그룹 노드에만 놓기",
+    "restrictedHint": "VM을 그룹 밖 노드에 놓지 않습니다. 받을 그룹 노드가 없으면 HA는 VM을 켜지 않고 이유를 보입니다.",
+    "nofailbackLabel": "되돌아가지 않음",
+    "nofailbackHint": "우선순위가 더 높은 노드가 돌아와도 VM을 되돌리지 않습니다.",
+    "errors": {
+      "exists": "같은 이름의 HA 그룹이 있습니다.",
+      "nodes": "노드를 하나 이상 고르세요.",
+      "priority": "우선순위는 0~1000의 정수입니다."
+    }
+  },
+  "placementRules": {
+    "pageHint": "모든 VM이 어디서 돌지 정하는 규칙입니다. 반드시(hard) 규칙은 지켜야 합니다: 어기게 되는 VM 만들기·시작·마이그레이션은 거절됩니다. 되도록(soft) 규칙은 할 수 있으면 지킵니다. 리더가 어긴 규칙을 VM마다 보여 줍니다. 규칙을 더해도 이미 놓인 VM은 옮기지 않습니다.",
+    "empty": "배치 규칙이 없습니다.",
+    "kind": "규칙",
+    "vms": "VM",
+    "nodes": "노드",
+    "weight": "벌점",
+    "state": {
+      "enabled": "켜짐",
+      "disabled": "꺼짐"
+    },
+    "haMayViolateShort": "HA는 어길 수 있음",
+    "editNamed": "배치 규칙 {{name}} 편집",
+    "deleteNamed": "배치 규칙 {{name}} 삭제",
+    "deleteTitle": "배치 규칙 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "VM은 지금 자리에 그대로 둡니다.",
+    "deleted": "배치 규칙 {{name}}을(를) 삭제했습니다.",
+    "createTitle": "배치 규칙 만들기",
+    "editTitle": "{{name}} 편집",
+    "dialogDescription": "서로 모순되는 반드시 규칙은 거절됩니다. 노드는 노드 레이블(예: zone=rack-a)로도 고릅니다.",
+    "saved": "배치 규칙 {{name}}을(를) 저장했습니다.",
+    "created": "배치 규칙 {{name}}을(를) 만들었습니다.",
+    "kinds": {
+      "affinity": "같은 노드(반드시)",
+      "anti-affinity": "다른 노드(반드시)",
+      "soft-affinity": "되도록 같은 노드",
+      "soft-anti-affinity": "되도록 다른 노드",
+      "node-affinity": "이 노드들에서만(반드시)",
+      "node-anti-affinity": "이 노드들은 안 됨(반드시)",
+      "soft-node-affinity": "되도록 이 노드들에서",
+      "soft-node-anti-affinity": "되도록 이 노드들을 피함"
+    },
+    "kindHint": {
+      "affinity": "VM들이 늘 한 노드에서 돌고 함께 옮깁니다. 하나만 마이그레이션할 수 없습니다.",
+      "anti-affinity": "VM들 가운데 둘이 같은 노드에서 돌지 않습니다.",
+      "soft-affinity": "VM들을 한 노드에 두려 합니다. 다른 노드의 VM마다 벌점이 붙습니다.",
+      "soft-anti-affinity": "VM들을 서로 다른 노드에 두려 합니다. 같은 노드의 다른 VM마다 벌점이 붙습니다.",
+      "node-affinity": "VM들이 고른 노드에서만 돕니다.",
+      "node-anti-affinity": "VM들이 고른 노드에서는 돌지 않습니다.",
+      "soft-node-affinity": "고른 노드를 먼저 고릅니다. 다른 노드면 벌점이 붙습니다.",
+      "soft-node-anti-affinity": "고른 노드를 피합니다. 고른 노드면 벌점이 붙습니다."
+    },
+    "vmBy": "VM 고르기",
+    "byNames": "이름으로",
+    "byLabel": "레이블로",
+    "vmNames": "VM 이름",
+    "vmNamesHint": "이름을 쉼표로 나눕니다. 나중에 만들 VM의 이름도 적을 수 있습니다.",
+    "vmTag": "VM 레이블",
+    "vmTagHint": "KEY=VALUE(예: app=web). 이 레이블을 가진 모든 VM입니다.",
+    "nodeBy": "노드 고르기",
+    "nodeTag": "노드 레이블",
+    "nodeTagHint": "KEY=VALUE(예: zone=rack-a). 노드 레이블은 노드 화면에서 고칩니다.",
+    "weightHint": "1~100. 비우면 50입니다. 클수록 더 중요합니다.",
+    "haMayViolate": "HA 복구는 이 규칙을 어길 수 있음",
+    "haMayViolateHint": "규칙을 어겨야만 HA가 VM을 복구할 수 있으면 그래도 켜고 어긴 규칙을 보입니다. 아니면 VM은 꺼진 채로 둡니다.",
+    "enabled": "켜기(끈 규칙은 없는 것으로 봅니다)",
+    "errors": {
+      "exists": "같은 이름의 배치 규칙이 있습니다.",
+      "tag": "KEY=VALUE 꼴로 적으세요(예: zone=rack-a).",
+      "twoVms": "VM을 둘 이상 적으세요.",
+      "oneVm": "VM을 하나 이상 적으세요.",
+      "vmNames": "올바른 VM 이름을 겹치지 않게 적으세요.",
+      "nodes": "노드를 하나 이상 고르세요.",
+      "weight": "1~100입니다."
+    }
   }
 }

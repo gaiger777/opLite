@@ -72,6 +72,9 @@ it("translates API error codes and falls back to the server message", async () =
   expect(errorMessage(t, new ApiError(400, "invalid_ova", "the OVA has no .ovf file"))).toBe(
     "The file is not a usable OVA: the OVA has no .ovf file",
   );
+  expect(
+    errorMessage(t, new ApiError(409, "placement_rule", 'node "b" breaks placement rules: spread')),
+  ).toBe('Placement rules leave no node for this VM: node "b" breaks placement rules: spread');
   expect(errorMessage(t, new ApiError(400, "invalid_request", "memory_mib must be > 0"))).toBe(
     "memory_mib must be > 0",
   );

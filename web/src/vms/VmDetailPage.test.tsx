@@ -267,3 +267,41 @@ it("marks an HA VM", async () => {
   expect(await screen.findByRole("heading", { name: "app" })).toBeInTheDocument();
   expect(screen.getByText("HA")).toBeInTheDocument();
 });
+
+/** 요약의 값(이름표 `label` 아래) */
+function summary(label: string) {
+  return screen.getByText(label, { selector: "dt" }).closest("div")!;
+}
+
+it("shows the HA policy, broken placement rules and the HA error", async () => {
+  const db = vm("db", "stopped", {
+    spec: {
+      ...vm("db", "stopped").spec,
+      ha: { state: "stopped", group: "rack", max_restart: 2, max_relocate: 0 },
+    },
+    status: {
+      ...vm("db", "stopped").status,
+      rule_violations: ["spread", "ha-group:rack"],
+      ha: { relocations: [], error: "HA gave up after 1 relocations" },
+    },
+  });
+  mockLists({ vm: [db], node: [NODE] });
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/db" });
+  expect(await screen.findByRole("heading", { name: "db" })).toBeInTheDocument();
+  expect(summary("High availability")).toHaveTextContent(
+    "Stopped (moves, stays off)Restarts 2, moves 0",
+  );
+  expect(summary("HA group")).toHaveTextContent("rack");
+  expect(summary("Broken placement rules")).toHaveTextContent("spread, ha-group:rack");
+  expect(summary("HA error")).toHaveTextContent("HA gave up after 1 relocations");
+});
+
+it("shows a VM without HA plainly", async () => {
+  mockLists({ vm: [web], node: [NODE] });
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  expect(await screen.findByRole("heading", { name: "web" })).toBeInTheDocument();
+  expect(summary("High availability")).toHaveTextContent("Off");
+  expect(screen.queryByText("HA group", { selector: "dt" })).not.toBeInTheDocument();
+  expect(summary("Broken placement rules")).toHaveTextContent("—");
+  expect(screen.queryByText("HA error", { selector: "dt" })).not.toBeInTheDocument();
+});

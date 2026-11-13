@@ -16,6 +16,8 @@ export const KINDS: WatchKind[] = [
   "backup",
   "backup-job",
   "vm-import",
+  "ha-group",
+  "placement-rule",
 ];
 
 /**
@@ -80,6 +82,10 @@ export async function fetchList<K extends WatchKind>(kind: K): Promise<List<Reso
         return call(api.GET("/backup-jobs"));
       case "vm-import":
         return call(api.GET("/vm-imports"));
+      case "ha-group":
+        return call(api.GET("/ha-groups"));
+      case "placement-rule":
+        return call(api.GET("/placement-rules"));
     }
   })();
   return list as List<Resources[K]>;

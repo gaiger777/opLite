@@ -12,6 +12,7 @@ import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { patchSettings, settingsError } from "@/settings/save";
+import { ShutdownSection } from "@/settings/ShutdownSection";
 import { SubscriptionSection } from "@/settings/SubscriptionSection";
 import { TelemetrySection } from "@/settings/TelemetrySection";
 
@@ -100,6 +101,7 @@ export function SettingsPage() {
           <p className="text-sm text-muted-foreground">{t("settings.adminOnly")}</p>
         )}
       </form>
+      <ShutdownSection write={write} />
       <TelemetrySection write={write} />
     </div>
   );

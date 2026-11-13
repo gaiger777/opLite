@@ -24,6 +24,8 @@ const PATHS: Record<WatchKind, string> = {
   backup: "/backups",
   "backup-job": "/backup-jobs",
   "vm-import": "/vm-imports",
+  "ha-group": "/ha-groups",
+  "placement-rule": "/placement-rules",
 };
 
 /** 목록 API의 응답을 정한다. 주지 않은 종류는 빈 목록이다. */

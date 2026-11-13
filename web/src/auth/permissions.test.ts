@@ -25,6 +25,12 @@ it("mirrors the server roles", () => {
   expect(can("viewer", "read", "vm-import")).toBe(true);
   expect(can("viewer", "write", "vm-import")).toBe(false);
   expect(can("operator", "write", "vm-import")).toBe(true);
+  // HA 그룹과 배치 규칙은 누구나 읽고 admin만 바꾼다(마이그레이션의 force도 배치 규칙 쓰기 권한이다).
+  expect(can("viewer", "read", "ha-group")).toBe(true);
+  expect(can("operator", "write", "ha-group")).toBe(false);
+  expect(can("viewer", "read", "placement-rule")).toBe(true);
+  expect(can("operator", "write", "placement-rule")).toBe(false);
+  expect(can("admin", "write", "placement-rule")).toBe(true);
   // 클러스터 설정은 누구나 읽고 admin만 바꾼다.
   expect(can("viewer", "read", "settings")).toBe(true);
   expect(can("operator", "write", "settings")).toBe(false);

@@ -1,7 +1,9 @@
 import type {
   Backup,
   BackupJob,
+  HaGroup,
   Node,
+  PlacementRule,
   Rule,
   SecurityGroup,
   Snapshot,
@@ -201,6 +203,42 @@ export function backupJob(
       ...extra.spec,
     },
     status: { next_run: 1_793_761_200, run: null, last_run: null, errors: [], ...extra.status },
+  };
+}
+
+/** 테스트용 HA 그룹: node-a(우선순위 2)와 node-b(1) */
+export function haGroup(name: string, n: number, spec: Partial<HaGroup["spec"]> = {}): HaGroup {
+  return {
+    id: `019a0f3c-0000-7000-8009-${String(n).padStart(12, "0")}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: {
+      nodes: [
+        { node: "node-a", priority: 2 },
+        { node: "node-b", priority: 1 },
+      ],
+      restricted: false,
+      nofailback: false,
+      ...spec,
+    },
+    status: {},
+  };
+}
+
+/** 테스트용 배치 규칙: 켜진 `anti-affinity`(VM web1·web2) */
+export function placementRule(
+  name: string,
+  n: number,
+  spec: Partial<PlacementRule["spec"]> = {},
+): PlacementRule {
+  return {
+    id: `019a0f3c-0000-7000-800a-${String(n).padStart(12, "0")}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: { kind: "anti-affinity", vms: ["web1", "web2"], enabled: true, ...spec },
+    status: {},
   };
 }
 

@@ -14,6 +14,7 @@ import { BackupJobsPage } from "@/backups/BackupJobsPage";
 import { BackupsPage } from "@/backups/BackupsPage";
 import { ClusterPage } from "@/cluster/ClusterPage";
 import { Toaster } from "@/components/ui/sonner";
+import { HaGroupsPage } from "@/ha-groups/HaGroupsPage";
 import { ImportPage } from "@/imports/ImportPage";
 import { ImportsPage } from "@/imports/ImportsPage";
 import { AppLayout } from "@/layout/AppLayout";
@@ -23,6 +24,7 @@ import { LoginPage } from "@/pages/LoginPage";
 import { NetworksPage } from "@/networks/NetworksPage";
 import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
+import { PlacementRulesPage } from "@/placement/PlacementRulesPage";
 import { RealmsPage } from "@/realms/RealmsPage";
 import { RemotePage } from "@/remotes/RemotePage";
 import { RemotesPage } from "@/remotes/RemotesPage";
@@ -71,6 +73,8 @@ function routes() {
             { path: "security-groups", element: <SecurityGroupsPage /> },
             { path: "security-groups/:name", element: <SecurityGroupPage /> },
             { path: "nodes", element: <NodesPage /> },
+            { path: "ha-groups", element: <HaGroupsPage /> },
+            { path: "placement-rules", element: <PlacementRulesPage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "audit", element: <AuditPage /> },
             { path: "users", element: <UsersPage /> },

@@ -26,6 +26,12 @@ export type SubscriptionInfo = Schemas["SubscriptionInfo"];
 export type SubscriptionState = Schemas["SubscriptionState"];
 export type TelemetryReport = Schemas["TelemetryReport"];
 export type AuditEntry = Schemas["AuditEntry"];
+export type HaGroup = Schemas["Resource_HaGroupSpec_HaGroupStatus"];
+export type PlacementRule = Schemas["Resource_PlacementRuleSpec_PlacementRuleStatus"];
+export type RuleKind = Schemas["RuleKind"];
+export type VmHa = Schemas["VmHa"];
+export type HaState = Schemas["HaState"];
+export type ShutdownPolicy = Schemas["ShutdownPolicy"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =
@@ -39,7 +45,9 @@ export type WatchKind =
   | "security-group"
   | "backup"
   | "backup-job"
-  | "vm-import";
+  | "vm-import"
+  | "ha-group"
+  | "placement-rule";
 
 /** 종류별 리소스 */
 export interface Resources {
@@ -54,4 +62,6 @@ export interface Resources {
   backup: Backup;
   "backup-job": BackupJob;
   "vm-import": VmImport;
+  "ha-group": HaGroup;
+  "placement-rule": PlacementRule;
 }

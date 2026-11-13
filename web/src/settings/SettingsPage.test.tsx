@@ -543,3 +543,52 @@ it("says why the telemetry report could not be shown", async () => {
   );
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
+
+it("changes the shutdown policy and shows the default when none is saved", async () => {
+  const sent: unknown[] = [];
+  server.use(
+    http.get(apiUrl("/settings"), () => HttpResponse.json(DEFAULT)),
+    http.patch(apiUrl("/settings"), async ({ request }) => {
+      const body = (await request.json()) as { shutdown_policy: string };
+      sent.push(body);
+      return HttpResponse.json({
+        ...DEFAULT,
+        revision: 4,
+        spec: { ...DEFAULT.spec, shutdown_policy: body.shutdown_policy },
+      });
+    }),
+  );
+  renderPage(<SettingsPage />);
+  const policy = await screen.findByLabelText("Policy");
+  // 기본(conditional)은 저장하지 않으므로 없으면 기본이다.
+  expect(policy).toHaveValue("conditional");
+  expect(screen.getByText("Freeze on reboot, fail over on power off.")).toBeInTheDocument();
+  const save = screen.getByRole("button", { name: "Save policy" });
+  expect(save).toBeDisabled();
+  await userEvent.selectOptions(policy, "migrate");
+  await userEvent.click(save);
+  await vi.waitFor(() => expect(sent).toEqual([{ shutdown_policy: "migrate" }]));
+  // 응답을 바로 보여 준다.
+  await vi.waitFor(() =>
+    expect(screen.getByRole("button", { name: "Save policy" })).toBeDisabled(),
+  );
+  expect(screen.getByLabelText("Policy")).toHaveValue("migrate");
+});
+
+it("says the cluster is upgrading when old nodes do not know shutdown policies", async () => {
+  server.use(
+    http.get(apiUrl("/settings"), () => HttpResponse.json(DEFAULT)),
+    http.patch(apiUrl("/settings"), () =>
+      HttpResponse.json(
+        { code: "cluster_upgrading", message: "node n2 does not support ha-placement yet" },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderPage(<SettingsPage />);
+  await userEvent.selectOptions(await screen.findByLabelText("Policy"), "freeze");
+  await userEvent.click(screen.getByRole("button", { name: "Save policy" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "The cluster is being upgraded: node n2 does not support ha-placement yet",
+  );
+});

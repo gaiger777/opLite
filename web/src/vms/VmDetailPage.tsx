@@ -32,7 +32,7 @@ import {
   type VmAction,
   type VmOperation,
 } from "@/vms/actions";
-import { haEnabled } from "@/vms/ha";
+import { haEnabled, haPolicy } from "@/vms/ha";
 import { VmConsole } from "@/vms/lazyConsole";
 import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -257,6 +257,9 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 function Summary({ vm }: { vm: Vm }) {
   const { t, i18n } = useTranslation();
   const { cpu } = vm.spec;
+  const ha = haPolicy(vm.spec);
+  const violations = vm.status.rule_violations ?? [];
+  const haError = vm.status.ha?.error;
   return (
     <dl className="grid grid-cols-1 gap-4 pt-2 sm:grid-cols-2 lg:grid-cols-3">
       <Field label={t("vms.cpu")}>
@@ -274,6 +277,28 @@ function Summary({ vm }: { vm: Vm }) {
       <Field label={t("vms.pid")}>{vm.status.pid ?? "—"}</Field>
       <Field label={t("vms.created")}>{formatTime(uuidTime(vm.id), i18n.language)}</Field>
       <Field label={t("vms.lastError")}>{vm.status.last_error ?? "—"}</Field>
+      <Field label={t("vms.haPolicy")}>
+        {ha ? t(`vms.haState.${ha.state}`) : t("vms.haOff")}
+        {ha && (
+          <span className="block text-xs text-muted-foreground">
+            {t("vms.haCounts", { restart: ha.max_restart, relocate: ha.max_relocate })}
+          </span>
+        )}
+      </Field>
+      {ha && <Field label={t("vms.haGroup")}>{ha.group ?? "—"}</Field>}
+      {/* 리더가 계산한 배치 규칙 위반(켜진 VM만) */}
+      <Field label={t("vms.ruleViolations")}>
+        {violations.length > 0 ? (
+          <span className="text-amber-700 dark:text-amber-400">{violations.join(", ")}</span>
+        ) : (
+          "—"
+        )}
+      </Field>
+      {haError && (
+        <Field label={t("vms.haError")}>
+          <span className="text-destructive">{haError}</span>
+        </Field>
+      )}
     </dl>
   );
 }

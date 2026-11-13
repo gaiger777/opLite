@@ -6,9 +6,13 @@ import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Node, StoragePool, Vm, Volume } from "@/api/types";
+import { usePrincipal } from "@/auth/AuthProvider";
+import { can } from "@/auth/permissions";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { formatBytes } from "@/lib/format";
 import { isShared, poolsUsableOn } from "@/storage/pools";
@@ -68,6 +72,10 @@ export function VmMigrateDialog({
   returnFocus?: RefObject<HTMLElement | null>;
 }) {
   const { t } = useTranslation();
+  const me = usePrincipal();
+  // 배치 규칙을 넘는 것은 규칙을 쓸 수 있는 사용자(admin)만이다(서버도 403으로 막는다).
+  const mayForce = can(me.role, "write", "placement-rule");
+  const [force, setForce] = useState(false);
   const nodes = useList("node");
   const volumes = useList("volume");
   const pools = useList("storage-pool");
@@ -105,7 +113,11 @@ export function VmMigrateDialog({
     const task = await call(
       api.POST("/vms/{key}/migrate", {
         params: { path: { key: vm.id } },
-        body: disks.length > 0 && pool ? { node: target.id, pool } : { node: target.id },
+        body: {
+          node: target.id,
+          ...(disks.length > 0 && pool !== "" && { pool }),
+          ...(force && { force: true }),
+        },
       }),
     );
     trackTask(task, t("migrate.op", { vm: vm.name, node: target.name }));
@@ -194,6 +206,19 @@ export function VmMigrateDialog({
               : t("migrate.copyNote", { count: disks.length, size: formatBytes(copySize) })}
           </p>
         </>
+      )}
+      {mayForce && (
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="migrate-force"
+              checked={force}
+              onCheckedChange={(on) => setForce(on === true)}
+            />
+            <Label htmlFor="migrate-force">{t("migrate.force")}</Label>
+          </div>
+          <p className="text-xs text-muted-foreground">{t("migrate.forceHint")}</p>
+        </div>
       )}
     </FormDialog>
   );

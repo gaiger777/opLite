@@ -11,6 +11,7 @@ import {
   Import,
   KeyRound,
   Languages,
+  Layers,
   LayoutDashboard,
   ListChecks,
   Lock,
@@ -25,6 +26,7 @@ import {
   Sun,
   User,
   Users,
+  Waypoints,
   type LucideIcon,
 } from "lucide-react";
 import { useRef, useState } from "react";
@@ -69,6 +71,8 @@ const NAV: {
   { to: "/networks", key: "nav.networks", icon: Network, end: false },
   { to: "/security-groups", key: "nav.securityGroups", icon: Shield, end: false },
   { to: "/nodes", key: "nav.nodes", icon: Cpu, end: false },
+  { to: "/ha-groups", key: "nav.haGroups", icon: Layers, end: false },
+  { to: "/placement-rules", key: "nav.placementRules", icon: Waypoints, end: false },
   { to: "/tasks", key: "nav.tasks", icon: ListChecks, end: false },
   { to: "/audit", key: "nav.audit", icon: ScrollText, end: false, admin: true },
   { to: "/users", key: "nav.users", icon: Users, end: false, kind: "user" },

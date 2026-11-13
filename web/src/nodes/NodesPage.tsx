@@ -10,7 +10,10 @@ import { useTaskIndex } from "@/api/taskIndex";
 import type { Node, Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
+import { parseLabels } from "@/backups/jobs";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { Field } from "@/components/Field";
+import { FormDialog } from "@/components/FormDialog";
 import { ReasonMenuItem } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
@@ -22,6 +25,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
 import {
   Table,
   TableBody,
@@ -44,6 +48,19 @@ function vmCount(node: Node, vms: Vm[]): number {
 /** 비우기가 옮길 VM의 수: 그 노드에 고정돼 켜 둔 VM(서버의 비우기 Task와 같은 기준) */
 function runningCount(node: Node, vms: Vm[]): number {
   return vms.filter((vm) => vm.spec.node === node.id && vm.spec.power === "running").length;
+}
+
+/** 서버의 `NodeStatus::frozen`: 종료 정책 `freeze`로 꺼진 채 돌아오지 않은 노드. 리더가 HA VM을 옮기지 않는다. */
+function isFrozen(node: Node): boolean {
+  return !node.status.online && node.status.shutdown?.action === "freeze";
+}
+
+/** 레이블을 `KEY=VALUE, …`로(키 순서) */
+function labelText(labels: Node["labels"]): string {
+  return Object.entries(labels ?? {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join(", ");
 }
 
 /** 배지 버튼의 접근 이름에 넣는 확인 상태 */
@@ -86,6 +103,8 @@ export function NodesPage() {
   const [showingUpdates, setShowingUpdates] = useState<Node | null>(null);
   const [draining, setDraining] = useState<Node | null>(null);
   const [ending, setEnding] = useState<Node | null>(null);
+  const [labeling, setLabeling] = useState<Node | null>(null);
+  const [unfreezing, setUnfreezing] = useState<Node | null>(null);
   const tasks = useTaskIndex();
   /** 그 노드의 비우기 Task가 끝나지 않았는지 */
   const isDraining = (node: Node) =>
@@ -140,6 +159,7 @@ export function NodesPage() {
             <TableHead>{t("nodes.memory")}</TableHead>
             <TableHead>{t("nodes.bridges")}</TableHead>
             <TableHead>{t("nodes.pools")}</TableHead>
+            <TableHead>{t("nodes.labels")}</TableHead>
             <TableHead>{t("nodes.vms")}</TableHead>
             {write && (
               <TableHead>
@@ -150,7 +170,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 15 : 14} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 16 : 15} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -169,6 +189,8 @@ export function NodesPage() {
                     <Badge variant="outline">{t("dashboard.maintenance")}</Badge>
                   )}
                   {node.spec.witness && <Badge variant="outline">{t("dashboard.witness")}</Badge>}
+                  {/* 리더는 얼린 노드의 HA VM을 옮기지 않는다(돌아오면 그 노드에서 켠다). */}
+                  {isFrozen(node) && <Badge variant="secondary">{t("nodes.frozen")}</Badge>}
                 </div>
               </TableCell>
               <TableCell className="font-mono text-xs">{node.spec.address}</TableCell>
@@ -222,6 +244,8 @@ export function NodesPage() {
                         />
                       ))}
               </TableCell>
+              {/* 배치 규칙의 노드 태그(`zone=rack-a`)가 보는 레이블 */}
+              <TableCell className="font-mono text-xs">{labelText(node.labels) || "—"}</TableCell>
               {/* VM 목록을 다 읽기 전에는 모른다. */}
               <TableCell>{vms.isSuccess ? vmCount(node, vms.data) : "—"}</TableCell>
               {write && (
@@ -271,6 +295,14 @@ export function NodesPage() {
                       {node.status.updates && (
                         <DropdownMenuItem onSelect={() => setShowingUpdates(node)}>
                           {t("nodes.updates.menu")}
+                        </DropdownMenuItem>
+                      )}
+                      <DropdownMenuItem onSelect={() => setLabeling(node)}>
+                        {t("nodes.labelsMenu")}
+                      </DropdownMenuItem>
+                      {isFrozen(node) && (
+                        <DropdownMenuItem onSelect={() => setUnfreezing(node)}>
+                          {t("nodes.unfreeze.menu")}
                         </DropdownMenuItem>
                       )}
                       <DropdownMenuSeparator />
@@ -350,6 +382,31 @@ export function NodesPage() {
         returnFocus={trigger}
         onConfirm={() => setMaintenance(ending!, false)}
       />
+      {labeling && (
+        <LabelsDialog node={labeling} returnFocus={trigger} onClose={() => setLabeling(null)} />
+      )}
+      <ConfirmDialog
+        open={unfreezing !== null}
+        onOpenChange={(open) => !open && setUnfreezing(null)}
+        title={t("nodes.unfreeze.title", { name: unfreezing?.name })}
+        description={t("nodes.unfreeze.description")}
+        confirmLabel={t("nodes.unfreeze.confirm")}
+        returnFocus={trigger}
+        onConfirm={async () => {
+          const node = unfreezing!;
+          try {
+            await call(api.POST("/nodes/{key}/unfreeze", { params: { path: { key: node.id } } }));
+          } catch (err) {
+            throw new Error(
+              err instanceof ApiError
+                ? codeMessage(t, err.code, err.message, "nodes.unfreeze.errors")
+                : errorMessage(t, err),
+              { cause: err },
+            );
+          }
+          toast.success(t("nodes.unfreeze.done", { name: node.name }));
+        }}
+      />
       <ConfirmDialog
         open={removing !== null}
         onOpenChange={(open) => !open && setRemoving(null)}
@@ -365,5 +422,74 @@ export function NodesPage() {
         }}
       />
     </div>
+  );
+}
+
+/** 노드 레이블 고치기. 열 때만 그린다. 배치 규칙의 `node_tag`(예: `zone=rack-a`)가 이 레이블을 본다. */
+function LabelsDialog({
+  node,
+  returnFocus,
+  onClose,
+}: {
+  node: Node;
+  returnFocus: React.RefObject<HTMLElement | null>;
+  onClose(): void;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [text, setText] = useState(() => labelText(node.labels));
+  const [error, setError] = useState<string | undefined>();
+  const parsed = parseLabels(text);
+  const unchanged = parsed !== null && labelText(parsed) === labelText(node.labels);
+
+  async function submit() {
+    if (parsed === null) {
+      setError("nodes.errors.labels");
+      return false;
+    }
+    // 노드 status가 자주 바뀌어 revision이 오르므로 연 때가 아니라 저장할 때의 실시간 목록에 있는 노드로 쓴다.
+    const current =
+      queryClient.getQueryData<List<Node>>(listKey("node"))?.items.find((n) => n.id === node.id) ??
+      node;
+    // 연 사이 다른 곳에서 레이블이 바뀌었으면 덮지 않는다.
+    if (labelText(current.labels) !== labelText(node.labels)) {
+      setError("nodes.errors.labelsChanged");
+      return false;
+    }
+    const updated = await call(
+      api.PUT("/nodes/{key}", {
+        params: { path: { key: node.id }, header: { "If-Match": current.revision } },
+        body: { labels: parsed, spec: current.spec },
+      }),
+    );
+    queryClient.setQueryData<List<Node>>(
+      listKey("node"),
+      (list) => list && applyEvent(list, { type: "put", kind: "node", resource: updated }),
+    );
+    toast.success(t("nodes.labelsSaved", { name: node.name }));
+  }
+
+  return (
+    <FormDialog
+      title={t("nodes.labelsTitle", { name: node.name })}
+      description={t("nodes.labelsDescription")}
+      submitLabel={t("common.save")}
+      submitDisabled={unchanged}
+      returnFocus={returnFocus}
+      onClose={onClose}
+      onSubmit={submit}
+    >
+      <Field id="node-labels" label={t("nodes.labels")} error={error} hint={t("nodes.labelsHint")}>
+        {(a11y) => (
+          <Input
+            id="node-labels"
+            placeholder="zone=rack-a, ssd=true"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            {...a11y}
+          />
+        )}
+      </Field>
+    </FormDialog>
   );
 }

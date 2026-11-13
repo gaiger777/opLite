@@ -45,6 +45,8 @@ function signedOut() {
       "/backups",
       "/backup-jobs",
       "/vm-imports",
+      "/ha-groups",
+      "/placement-rules",
     ].map((path) => http.get(apiUrl(path), () => HttpResponse.json({ revision: 1, items: [] }))),
     ws.link(`ws://${window.location.host}/api/v1/watch`).addEventListener("connection", () => {}),
     http.get(apiUrl("/version"), () => HttpResponse.json({ version: "0.9.0~ci7" })),

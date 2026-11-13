@@ -54,6 +54,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const networks = useList("network");
   const securityGroups = useList("security-group");
   const volumes = useList("volume");
+  const groups = useList("ha-group");
   const [values, setValues] = useState(initial);
   const [revision, setRevision] = useState(vm?.revision);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -181,6 +182,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           errors={errors}
           onChange={change}
           nodes={nodes.data}
+          groups={groups.data?.map((g) => g.name).sort()}
           creating={creating}
           locked={locked}
           haLocked={locked && !(vm && haEnabled(vm.spec))}

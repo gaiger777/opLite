@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import type { Node, Principal, Vm } from "@/api/types";
 import { resetTasks } from "@/tasks/tasks";
 import { NODE, pool, poolState, snapshot, task, vm, volume } from "@/test/fixtures";
-import { mockLists, renderPage } from "@/test/render";
+import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
 import { migrationTargets } from "@/vms/VmMigrateDialog";
@@ -397,4 +397,48 @@ it("shows the progress of the migration task", async () => {
   mockLists({ vm: [migrating], node: NODES, task: [memory] });
   openDetail();
   expect(await screen.findByText("Migrating memory")).toBeInTheDocument();
+});
+
+it("lets an admin ignore placement rules after the server refuses", async () => {
+  mockLists({ vm: [web], node: NODES });
+  const bodies: unknown[] = [];
+  server.use(
+    http.post(apiUrl(`/vms/${web.id}/migrate`), async ({ request }) => {
+      const body = (await request.json()) as { force?: boolean };
+      bodies.push(body);
+      return body.force
+        ? HttpResponse.json(task("t1", "vm-migrate", web.id), { status: 202 })
+        : HttpResponse.json(
+            {
+              code: "placement_rule",
+              message: 'node "node-b" breaks placement rules: spread',
+              details: { rules: ["spread"] },
+            },
+            { status: 409 },
+          );
+    }),
+  );
+  openDetail(ADMIN);
+  await userEvent.click(await screen.findByRole("button", { name: "Migrate" }));
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  await waitFor(() => expect(within(dialog).getByLabelText("Target node")).toHaveValue("n2"));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Migrate" }));
+  expect(
+    await within(dialog).findByText(
+      'Placement rules leave no node for this VM: node "node-b" breaks placement rules: spread',
+    ),
+  ).toBeInTheDocument();
+  await userEvent.click(within(dialog).getByLabelText("Ignore placement rules"));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Migrate" }));
+  expect(await screen.findByText("Migrate web to node-b")).toBeInTheDocument();
+  expect(bodies).toEqual([{ node: "n2" }, { node: "n2", force: true }]);
+});
+
+it("does not offer ignoring placement rules to operators", async () => {
+  mockLists({ vm: [web], node: NODES });
+  openDetail(OPERATOR);
+  await userEvent.click(await screen.findByRole("button", { name: "Migrate" }));
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  await waitFor(() => expect(within(dialog).getByLabelText("Target node")).toHaveValue("n2"));
+  expect(within(dialog).queryByLabelText("Ignore placement rules")).not.toBeInTheDocument();
 });

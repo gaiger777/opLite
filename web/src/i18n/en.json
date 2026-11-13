@@ -72,7 +72,10 @@
     "remote_unreachable": "Cannot reach the remote cluster ({{message}}).",
     "remote_fingerprint_mismatch": "The remote cluster's CA fingerprint is different. Get the CA again and check it.",
     "remote_is_local": "That address is this cluster. Add a different cluster.",
-    "remote_unauthorized": "The remote cluster rejected the API token. Check that the token still exists there."
+    "remote_unauthorized": "The remote cluster rejected the API token. Check that the token still exists there.",
+    "placement_rule": "Placement rules leave no node for this VM: {{message}}",
+    "rule_conflict": "The rule contradicts other placement rules: {{message}}",
+    "group_in_use": "The HA group is in use. Take the VMs out of the group first: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -92,7 +95,9 @@
     "tokens": "API tokens",
     "cluster": "Cluster",
     "remotes": "Remote clusters",
-    "settings": "Settings"
+    "settings": "Settings",
+    "haGroups": "HA groups",
+    "placementRules": "Placement rules"
   },
   "header": {
     "language": "Language",
@@ -293,7 +298,18 @@
     "bulkSummary": "{{action}}: {{done}} requested, {{failed}} failed, {{skipped}} skipped.",
     "noDisks": "No disks.",
     "noNics": "No network interfaces.",
-    "ha": "HA"
+    "ha": "HA",
+    "haOff": "Off",
+    "haState": {
+      "started": "Started",
+      "stopped": "Stopped (moves, stays off)",
+      "ignored": "Ignored (paused)"
+    },
+    "haCounts": "Restarts {{restart}}, moves {{relocate}}",
+    "haGroup": "HA group",
+    "ruleViolations": "Broken placement rules",
+    "haError": "HA error",
+    "haPolicy": "High availability"
   },
   "snapshots": {
     "created": "Created",
@@ -648,7 +664,9 @@
     "copyNote_one": "{{count}} disk ({{size}} in total) will be copied. This can take a long time, and the VM cannot be stopped, snapshotted or backed up meanwhile.",
     "copyNote_other": "{{count}} disks ({{size}} in total) will be copied. This can take a long time, and the VM cannot be stopped, snapshotted or backed up meanwhile.",
     "noSamePool": "{{node}} has no usable {{pool}} pool. Choose a target pool.",
-    "snapshots": "VMs with snapshots cannot be migrated with disks on node-local pools. Delete the VM's snapshots first."
+    "snapshots": "VMs with snapshots cannot be migrated with disks on node-local pools. Delete the VM's snapshots first.",
+    "force": "Ignore placement rules",
+    "forceHint": "Moves the VM even if it breaks hard placement rules or a restricted HA group. Node checks and memory still apply. The audit log records the broken rules."
   },
   "forms": {
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."
@@ -976,6 +994,27 @@
       "errors": {
         "node_offline": "The node is offline."
       }
+    },
+    "labels": "Labels",
+    "labelsMenu": "Edit labels",
+    "labelsTitle": "Labels of {{name}}",
+    "labelsDescription": "Placement rules choose nodes by label (node_tag), such as zone=rack-a. The zone label follows [node] zone in the node's configuration.",
+    "labelsHint": "KEY=VALUE pairs separated by commas. Leave empty to remove all.",
+    "labelsSaved": "Labels of {{name}} saved.",
+    "errors": {
+      "labels": "Use KEY=VALUE pairs separated by commas.",
+      "labelsChanged": "The labels of this node changed elsewhere. Close this dialog and open it again."
+    },
+    "frozen": "Frozen",
+    "unfreeze": {
+      "menu": "Unfreeze",
+      "title": "Unfreeze {{name}}?",
+      "description": "The node turned its HA VMs off for a host reboot, so HA waits for it to come back. If it will not come back, unfreeze it: the leader then recovers its HA VMs on other nodes as for a failed node.",
+      "confirm": "Unfreeze",
+      "done": "{{name}} unfrozen. Its HA VMs are recovered on other nodes.",
+      "errors": {
+        "node_online": "The node is online again; it clears the mark itself."
+      }
     }
   },
   "accounts": {
@@ -1253,7 +1292,8 @@
       "macMulticast": "A multicast address (odd first byte) cannot be used.",
       "macDuplicate": "Each interface needs a different MAC address.",
       "keep": "From 1 to 100.",
-      "securityGroups": "Choose at most 8 security groups."
+      "securityGroups": "Choose at most 8 security groups.",
+      "haCount": "From 0 to 10."
     },
     "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",
@@ -1269,7 +1309,20 @@
     "haHint": "Runs only on nodes with fencing on. If its node loses the cluster majority, the node stops the VM.",
     "haNodeOff": "{{node}} has fencing off and cannot run HA VMs.",
     "haNoNode": "No node has fencing on, so HA VMs cannot run.",
-    "haRunning": "Turn on HA while the VM is stopped."
+    "haRunning": "Turn on HA while the VM is stopped.",
+    "haState": "HA state",
+    "haStateHint": {
+      "started": "If its node fails, HA starts the VM on another node.",
+      "stopped": "If its node fails, HA moves the VM to another node but leaves it off.",
+      "ignored": "HA leaves the VM alone for now: no fencing, recovery or counting. The settings are kept."
+    },
+    "haGroup": "HA group",
+    "haGroupHint": "Recovers on the group's nodes, higher priority first.",
+    "haNoGroup": "No group",
+    "maxRestart": "Restarts on the same node",
+    "maxRestartHint": "From 0 to 10 within 10 minutes. After that, HA moves the VM to another node.",
+    "maxRelocate": "Moves to other nodes",
+    "maxRelocateHint": "From 0 to 10 within 10 minutes. After that, HA stops the VM and shows an error; start it again to clear it."
   },
   "console": {
     "connecting": "Connecting…",
@@ -1377,6 +1430,24 @@
       "enabled": "Telemetry turned on.",
       "disabled": "Telemetry turned off.",
       "idReset": "New report ID made."
+    },
+    "shutdown": {
+      "title": "HA VMs on host shutdown",
+      "policy": "Policy",
+      "policies": {
+        "conditional": "Conditional (default)",
+        "freeze": "Freeze",
+        "failover": "Fail over",
+        "migrate": "Migrate"
+      },
+      "hint": {
+        "conditional": "Freeze on reboot, fail over on power off.",
+        "freeze": "Turn the node's HA VMs off and start them on the same node when it comes back. HA does not move them meanwhile.",
+        "failover": "Turn the node's HA VMs off; HA starts them on other nodes after the usual recovery wait.",
+        "migrate": "Live-migrate the node's VMs away first (node drain, up to 10 minutes), then fail over the remaining HA VMs."
+      },
+      "note": "Applies only when the host reboots or powers off. Stopping or upgrading orbivisord leaves the VMs running.",
+      "save": "Save policy"
     }
   },
   "audit": {
@@ -1401,5 +1472,102 @@
     "disabled": "The audit log is turned off on these nodes: {{nodes}}",
     "truncated": "Showing the newest {{count}} entries. More match; narrow the range or the filters.",
     "entryTitle": "Audit entry"
+  },
+  "haGroups": {
+    "pageHint": "HA VMs in a group are placed and recovered on the group's nodes, higher priority first. When a higher-priority node comes back, a running VM moves back to it by live migration unless the group has No failback.",
+    "empty": "No HA groups.",
+    "nodes": "Nodes and priority",
+    "options": "Options",
+    "vms": "VMs",
+    "nodePriority": "{{node}} ({{n}})",
+    "restricted": "Restricted",
+    "nofailback": "No failback",
+    "editNamed": "Edit HA group {{name}}",
+    "deleteNamed": "Delete HA group {{name}}",
+    "deleteTitle": "Delete HA group {{name}}?",
+    "deleteDescription": "VMs must not use the group. Placed VMs stay where they are.",
+    "deleted": "HA group {{name}} deleted.",
+    "createTitle": "Create HA group",
+    "editTitle": "Edit {{name}}",
+    "dialogDescription": "HA VMs choose a group in their HA settings. VMs that are already placed are not moved.",
+    "saved": "HA group {{name}} saved.",
+    "created": "HA group {{name}} created.",
+    "priorityOf": "Priority of {{node}}",
+    "nodesHint": "Priority from 0 to 1000; higher goes first. Empty means 0.",
+    "restrictedLabel": "Only on the group's nodes",
+    "restrictedHint": "Never place the VMs outside the group. If no group node can take a VM, HA leaves it off and shows why.",
+    "nofailbackLabel": "No failback",
+    "nofailbackHint": "Do not move VMs back when a higher-priority node comes back.",
+    "errors": {
+      "exists": "An HA group with this name already exists.",
+      "nodes": "Choose at least one node.",
+      "priority": "Priorities are whole numbers from 0 to 1000."
+    }
+  },
+  "placementRules": {
+    "pageHint": "Rules for where VMs run, for all VMs. Hard rules must hold: creating, starting or migrating a VM that would break one is refused. Soft rules are kept when possible. The leader shows broken rules on each VM. VMs already placed are not moved when you add a rule.",
+    "empty": "No placement rules.",
+    "kind": "Rule",
+    "vms": "VMs",
+    "nodes": "Nodes",
+    "weight": "Weight",
+    "state": {
+      "enabled": "On",
+      "disabled": "Off"
+    },
+    "haMayViolateShort": "HA may break",
+    "editNamed": "Edit placement rule {{name}}",
+    "deleteNamed": "Delete placement rule {{name}}",
+    "deleteTitle": "Delete placement rule {{name}}?",
+    "deleteDescription": "VMs stay where they are.",
+    "deleted": "Placement rule {{name}} deleted.",
+    "createTitle": "Create placement rule",
+    "editTitle": "Edit {{name}}",
+    "dialogDescription": "Hard rules that contradict each other are refused. Node labels (such as zone=rack-a) can choose nodes.",
+    "saved": "Placement rule {{name}} saved.",
+    "created": "Placement rule {{name}} created.",
+    "kinds": {
+      "affinity": "Same node (hard)",
+      "anti-affinity": "Different nodes (hard)",
+      "soft-affinity": "Same node if possible",
+      "soft-anti-affinity": "Different nodes if possible",
+      "node-affinity": "Only on these nodes (hard)",
+      "node-anti-affinity": "Never on these nodes (hard)",
+      "soft-node-affinity": "On these nodes if possible",
+      "soft-node-anti-affinity": "Away from these nodes if possible"
+    },
+    "kindHint": {
+      "affinity": "The VMs always run on one node and move together; one of them alone cannot be migrated.",
+      "anti-affinity": "No two of the VMs run on the same node.",
+      "soft-affinity": "Prefers one node for the VMs; each VM elsewhere adds the weight.",
+      "soft-anti-affinity": "Prefers different nodes; each other VM on the same node adds the weight.",
+      "node-affinity": "The VMs run only on the chosen nodes.",
+      "node-anti-affinity": "The VMs never run on the chosen nodes.",
+      "soft-node-affinity": "Prefers the chosen nodes; another node adds the weight.",
+      "soft-node-anti-affinity": "Avoids the chosen nodes; a chosen node adds the weight."
+    },
+    "vmBy": "Choose VMs",
+    "byNames": "By name",
+    "byLabel": "By label",
+    "vmNames": "VM names",
+    "vmNamesHint": "Separate names with commas. VMs you create later may be named here.",
+    "vmTag": "VM label",
+    "vmTagHint": "KEY=VALUE, such as app=web. Every VM with this label.",
+    "nodeBy": "Choose nodes",
+    "nodeTag": "Node label",
+    "nodeTagHint": "KEY=VALUE, such as zone=rack-a. Set node labels on the Nodes page.",
+    "weightHint": "From 1 to 100. Empty means 50. A higher weight matters more.",
+    "haMayViolate": "HA recovery may break this rule",
+    "haMayViolateHint": "If HA can recover a VM only by breaking the rule, it starts the VM anyway and shows the broken rule. Otherwise the VM stays off.",
+    "enabled": "On (an off rule is ignored)",
+    "errors": {
+      "exists": "A placement rule with this name already exists.",
+      "tag": "Use KEY=VALUE, such as zone=rack-a.",
+      "twoVms": "Name at least two VMs.",
+      "oneVm": "Name at least one VM.",
+      "vmNames": "Use valid VM names, each once.",
+      "nodes": "Choose at least one node.",
+      "weight": "From 1 to 100."
+    }
   }
 }

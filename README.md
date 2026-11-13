@@ -1216,8 +1216,9 @@ orbivisorctl task list               # 복구 기록: OP "vm-ha-recover (from <�
 함께 켜기를 막는다), VM 목록·상세의 HA 배지, 노드·클러스터·대시보드 노드 표의 "펜싱" 열, 작업 목록의
 "web HA 복구 (노드 node-a에서)"다. API는 VM `spec.ha`(생성·`PUT /api/v1/vms/{key}`),
 Node `status.ha`(`{"fencing": "watchdog"|"process", "recover_after_secs": …}`, 펜싱이 꺼져 있으면 없다),
-`GET /api/v1/cluster`의 멤버 `fencing`(꺼져 있으면 null)이다. 같은 노드에서의 크래시 재시작은 지금처럼
-`restart`가 정하므로 HA VM에는 `on-failure`를 권한다.
+`GET /api/v1/cluster`의 멤버 `fencing`(꺼져 있으면 null)이다. HA 그룹·상태·재시작과 옮기기 횟수·배치 규칙·호스트 종료
+정책은 아래 "배치 규칙과 HA 정책"이다(같은 노드의 크래시 재시작도 거기서 정한다 — 옛 노드가 남은 동안은 `restart`가 정하므로
+`on-failure`를 권한다).
 
 ```toml
 # /etc/opl/opld.toml (노드마다, 생략하면 아래 기본값)
@@ -1260,7 +1261,7 @@ fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나
 - **orbivisord를 멈추면 노드가 재시작될 수 있다.** 정상 종료(SIGTERM) 때 이 노드에 도는 HA VM이 없으면 watchdog를 멈추고
   닫는다(magic close). **도는 HA VM이 있으면 그대로 둔다**(경고 "HA VMs are running; leaving the watchdog armed …") —
   QEMU는 orbivisord 없이도 계속 돌므로, orbivisord가 `watchdog_timeout_secs` 안에 다시 떠 리스를 갱신하지 못하면 노드가
-  재시작된다. 업그레이드·점검으로 orbivisord를 오래 멈출 때는 먼저 HA VM을 끄거나 다른 노드로 옮기거나(`node drain`, 아래 "노드
+  재시작된다(호스트 재부팅·전원 끄기 때는 종료 정책이 HA VM을 먼저 끈다 — 아래 "배치 규칙과 HA 정책"). 업그레이드·점검으로 orbivisord를 오래 멈출 때는 먼저 HA VM을 끄거나 다른 노드로 옮기거나(`node drain`, 아래 "노드
   유지보수와 비우기") `vm set --no-ha`를 한다. 펜싱을 `off`로 바꿔 다시 띄운 노드의 이미 도는 HA VM은 끄지 않고
   status에 "HA is not available on this node"만 남긴다(멈춘 HA VM은 켜지 않는다).
 - **watchdog 준비(Linux).** 하드웨어 watchdog(`iTCO_wdt`, IPMI 등)가 없으면 `softdog`를 올린다:
@@ -1289,8 +1290,8 @@ fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나
   모르면(시간 초과 — 나중에 커밋될 수 있다) 결과를 알 때까지 같은 기록을 다시 보내며 거부를 이어 가고, 리더가
   바뀌면 푼다.
 - **어디로.** 스케줄러와 같은 규칙(온라인, 유지보수 아님, 위트니스 아님, 아키텍처·디스크 풀·브리지, 미할당 메모리가
-  가장 많은 노드)에 더해 HA 가능 노드이고 리스가 살아 있는 노드다. 죽은 노드와 진행 중이던 마이그레이션의 대상
-  노드는 뺀다. 여러 VM을 옮기면 앞서 옮긴 VM의 메모리도 센다. 그런 노드가 없으면 VM은 그대로 두고 status에
+  가장 많은 노드 — HA 그룹 우선순위와 배치 규칙이 먼저다, 아래 "배치 규칙과 HA 정책")에 더해 HA 가능 노드이고 리스가
+  살아 있는 노드다. 죽은 노드와 진행 중이던 마이그레이션의 대상 노드는 뺀다. 여러 VM을 옮기면 앞서 옮긴 VM의 메모리도 센다. 그런 노드가 없으면 VM은 그대로 두고 status에
   "HA cannot find a node for this VM"만 남긴 뒤 1초마다 다시 본다.
 - **어떻게.** status를 먼저 비우고(phase stopped, "recovering: node node-a failed") 그 다음 `spec.node`를 대상
   노드로 바꾼다(둘 다 revision 검사, 그 사이 바뀌었으면 1초 뒤 다시). 대상 노드의 reconciler가 평소처럼 새로
@@ -1305,7 +1306,8 @@ fence_after_secs = 30             # 마지막 리스 갱신 뒤 이만큼 지나
 - **죽은 노드가 돌아오면.** 펜싱 중 표시가 풀린 뒤의 첫 리스 갱신이 복구 기록까지 적용된 뒤에야 HA VM을 켜므로,
   옮겨 간 VM은 이미 다른 노드의 것으로 보고 켜지 않는다(낡은 기록으로 status를 덮지도 않는다). 그 노드의 실행기는
   실패 처리된 작업을 다시 하지 않는다. 그 노드에 남은 HA 아닌 VM은 평소처럼 그 노드가 다시 맞춘다. 옮긴 VM은
-  원래 노드로 되돌아가지 않는다(필요하면 마이그레이션한다).
+  원래 노드로 되돌아가지 않는다(필요하면 마이그레이션한다). HA 그룹의 VM은 우선순위가 더 높은 그룹 노드로 되돌아간다
+  (아래 "배치 규칙과 HA 정책"의 되돌아가기).
 - **한계.** 죽은 노드에만 있던 UEFI 변수는 잃는다 — 대상 노드는 변수를 그 노드에서 받으려다 실패하면 경고를 남기고
   자기 노드의 옛 파일(없으면 템플릿)로 켠다. HA 아닌 VM은 노드가 돌아올 때까지 그 노드에 묶여 있다. Ceph RBD에는
   디스크 잠금이 없어 펜싱만 믿는다(Orbivisor는 RBD 배타 잠금·blocklist를 쓰지 않는다). NFSv3에서는 죽은 노드의 잠금이
@@ -1337,6 +1339,141 @@ sudo kill -TERM "$(pidof orbivisord)"; sleep 15; cat /sys/class/watchdog/watchdo
 #    "fenced: lost the cluster majority"로 꺼지고 Triggered는 없다. 풀면 리스가 돌아와 다시 켜진다.
 sudo modprobe -r softdog                                        # 끝나면
 ```
+
+## 배치 규칙과 HA 정책
+
+VM을 어느 노드에 둘지 정하는 **배치 규칙**과, HA VM을 어디로 복구하고 몇 번까지 다시 켤지 정하는 **HA 정책**(HA 그룹,
+상태, 재시작·옮기기 횟수)이다(Proxmox HA의 그룹·규칙·`max_restart`/`max_relocate`, vSphere DRS의 VM-VM·VM-호스트 규칙과
+같은 자리). 처음 놓기(만들기·시작), 마이그레이션, 비우기, HA 복구가 같은 조건·점수 함수를 쓴다. 객체 모양의 `ha`,
+HA 그룹·배치 규칙 만들기·고치기, 종료 정책 바꾸기는 **모든 노드(위트니스·관찰 노드 포함)가 이 버전**이어야 한다(아니면
+**409** `cluster_upgrading` — 노드가 알리는 기능 `ha-placement`를 본다).
+
+```bash
+# 배치 규칙: hard(affinity, anti-affinity, node-affinity, node-anti-affinity)와 soft-(벌점)
+orbivisorctl placement-rule create spread --kind anti-affinity --vm web1 --vm web2
+orbivisorctl placement-rule create db-rack --kind node-affinity --vm-tag app=db --node-tag zone=rack-a --ha-may-violate
+orbivisorctl placement-rule create near --kind soft-affinity --vm app --vm cache --weight 80
+orbivisorctl placement-rule list | get | set | enable | disable | delete
+orbivisorctl node label node1 zone=rack-a ssd=true [--rm KEY]   # 노드 태그 = 노드 레이블
+# HA 그룹과 VM의 HA 정책
+orbivisorctl ha-group create rack-a --node node1:2 --node node2:1 [--restricted] [--nofailback]
+orbivisorctl vm set db --ha-group rack-a --ha-state started --max-restart 2 --max-relocate 1
+orbivisorctl vm migrate db node3 --force          # 관리자만: hard 규칙을 넘어 옮김(감사 기록)
+orbivisorctl vm get db                            # status.rule_violations, status.ha
+# 호스트 종료 정책
+orbivisorctl settings set shutdown_policy=conditional|freeze|failover|migrate
+orbivisorctl node unfreeze node2                  # 돌아오지 않는 얼린 노드
+```
+
+웹은 "HA 그룹"·"배치 규칙" 화면(목록·만들기·편집·삭제, 누구나 읽고 admin만 바꿈), VM 만들기·편집의 HA 절(상태·그룹·횟수),
+VM 상세 요약의 고가용성·HA 그룹·어긴 배치 규칙·HA 오류, 마이그레이션 대화상자의 "배치 규칙 무시"(admin), 노드 화면의
+"레이블" 열과 "레이블 편집"(연 사이 다른 곳에서 레이블이 바뀌었으면 저장하지 않고 다시 열라고 알림)·"얼림" 배지·"얼림 풀기", 설정의 "호스트 종료 때 HA VM"이다. API는 `/api/v1/ha-groups`,
+`/api/v1/placement-rules`(목록·조회·만들기 `POST`·통째로 바꾸기 `PUT`(If-Match)·`DELETE`, watch 종류 `ha-group`·`placement-rule`),
+VM `spec.ha`, `status.rule_violations`·`status.ha`, `POST /api/v1/vms/{key}/migrate`의 `force`, 설정 `shutdown_policy`,
+Node `status.shutdown`과 `POST /api/v1/nodes/{key}/unfreeze`다.
+
+**배치 규칙.** 이름(리소스 이름)과 `kind`, VM(`vms` 이름 목록 또는 `vm_tag`), VM과 노드 규칙이면 노드(`nodes` 또는
+`node_tag`), soft 규칙의 `weight`(1~100, 없으면 50), `enabled`(기본 켬, 끈 규칙은 없는 것으로 봄), hard 규칙의
+`ha_may_violate`다. 모든 VM(HA 아닌 VM 포함)에 적용된다.
+
+- **종류.** `affinity`(반드시 같은 노드), `anti-affinity`(반드시 서로 다른 노드), `node-affinity`(반드시 이 노드들 중),
+  `node-anti-affinity`(이 노드들은 안 됨), 그리고 각각의 `soft-` 형태(되도록). VM끼리 규칙은 VM이 둘 이상이고 노드를 주지
+  않는다. 이름으로 적은 VM은 아직 없어도 된다(나중에 만들 VM). 나쁜 모양은 **400**.
+- **태그는 레이블이다.** `vm_tag`·`node_tag`는 `key=value` 하나이고 그 레이블 값이 같은 VM·노드를 고른다. 노드에는 따로
+  `tags`가 없고 노드 레이블을 쓴다 — `[node] zone`(대규모 클러스터)은 레이블 `zone`이 되므로 `--node-tag zone=rack-a`로
+  장애 영역을 고른다. 노드 레이블은 `orbivisorctl node label`, 웹 노드 화면, `PUT /api/v1/nodes/{key}`의 `labels`로 고친다
+  (`zone`은 설정에 있으면 노드가 등록할 때 설정 값으로 되돌린다).
+- **자리.** 원하는 상태가 running이고 노드가 정해진 VM이 그 노드를 차지한다(라이브 마이그레이션 중이면 원본과 대상 둘
+  다). 꺼진 VM은 세지 않는다.
+- **hard 규칙은 조건이다.** 만들기(켠 채)·수정·시작·마이그레이션이 노드 조건(온라인·유지보수·아키텍처·풀·브리지·방화벽·HA
+  가능)은 맞는데 hard 규칙 때문에 놓을 노드가 없으면 **409** `placement_rule`(`details.rules`에 규칙 이름), 노드 조건부터
+  맞는 노드가 없으면 지금처럼 **409** `no_node`다. 노드를 직접 준 요청(`--node`, 마이그레이션 대상)이 규칙을 어기면 409,
+  규칙을 어기는 노드에 붙어 있는 꺼진 VM을 켜면 다른 노드를 고른다(없으면 409). 규칙을 새로 만들어도 이미 놓인 VM은
+  옮기지 않는다 — 어긴 규칙이 VM 상태에 보인다.
+- **soft 규칙은 벌점이다.** `soft-affinity`는 다른 노드에 있는 구성원마다, `soft-anti-affinity`는 같은 노드의 구성원마다,
+  soft 노드 규칙은 어기면 `weight`. 노드 고르기 순서는 hard 규칙 통과 → HA 그룹 우선순위(그룹 VM만) → 벌점이 적은 노드 →
+  미할당 메모리가 많은 노드 → id가 작은 노드다. 어길 수밖에 없으면 어기고 놓는다.
+- **모순은 422.** 켜진 hard 규칙끼리 같은 두 VM이 `affinity`(이어진 묶음, 추이적)와 `anti-affinity`에 함께 있거나 한
+  `affinity` 묶음이 허용하는 노드(`node-affinity`의 교집합 − `node-anti-affinity`)가 비면 만들기·고치기를 **422**
+  `rule_conflict`(`details.rules`)로 거절한다. 태그는 지금의 레이블로 푼다 — 그 뒤 레이블을 바꿔 생긴 모순은 놓을 곳
+  없음(409)이나 위반으로 보인다.
+- **affinity 묶음은 함께 옮긴다.** 자리 잡은 hard `affinity` 상대가 있는 VM 하나만 옮기는 마이그레이션은 **409**
+  `placement_rule`이다. 비우기는 옮길 VM과 같은 노드의 hard affinity 상대를 한 묶음으로 보고 묶음 전체가 들어가는 노드(메모리는
+  합)를 골라 차례로 옮긴다(중간의 잠깐 위반은 받아들인다). 규칙 때문에 받을 곳이 없으면 그 VM들은 `placement rule …`로
+  남는다(규칙에 맞는 노드가 메모리 때문에만 막혔으면 — 앞 구성원이 옮겨 간 노드에 자리가 없는 짝 등 — `no node with capacity`).
+  한 구성원이라도 디스크를 옮길 수 없으면(로컬 풀 디스크와 스냅샷, 디스크 복사를 모르는 노드) 묶음 전체를 남긴다 — 막은 구성원은
+  그 이유로, 나머지는 `affinity partner X: <이유>`로. 먼저 옮기던 구성원이 옮겨지지 못하면 나머지는 혼자 옮기지 않는다
+  (`affinity partner X could not move`). 앞 구성원이 옮겨진 뒤 마이그레이션이 실패한 구성원은 그 노드에 남고(앞 구성원을
+  되돌리지 않는다) 갈라진 묶음은 `rule_violations`에 보인다.
+- **`--force`.** 관리자(배치 규칙 쓰기 권한)는 마이그레이션의 `force`로 hard 규칙(restricted 그룹 포함)을 넘을 수 있다.
+  노드 조건과 메모리는 그대로 본다. 다른 역할은 **403**이고, 넘은 규칙은 감사 기록 detail `force rules=<이름들>`에 남는다.
+- **`rule_violations`.** 리더가 1초마다 자리 잡은 VM의 hard·soft 위반을 계산해 바뀐 VM의 `status.rule_violations`(규칙
+  이름, restricted 그룹 밖이면 `ha-group:<그룹>`)만 쓴다. 꺼진 VM은 비운다. 위반을 저절로 바로잡는 균형 조정은 아직 없다.
+
+**HA 그룹.** `nodes: [{ node, priority }]`(0~1000, 클수록 먼저), `restricted`, `nofailback`. HA VM은 `ha.group`으로 그룹을
+쓴다(없는 그룹이면 **400**, VM이 쓰는 그룹 삭제는 **409** `group_in_use`).
+
+- 그룹 VM은 처음 놓기·복구·비우기에서 우선순위가 높은 그룹 노드를 먼저 고르고, 그룹 밖 노드는 가장 낮다. `restricted`면
+  그룹 밖 노드에 놓지 않는다(놓을 곳이 없으면 켜지 않는다).
+- **되돌아가기(failback).** 그룹이 있고 `nofailback`이 아닌 실행 중 HA VM이 지금 노드보다 우선순위가 높은 그룹 노드(리더가
+  30초 넘게 리스가 살아 있는 것을 본, 조건·hard 규칙에 맞는 노드)를 가지면 리더가 그 노드로 라이브 마이그레이션 작업을 만든다.
+  클러스터에 한 번에 하나이고 끝나기를 기다린다. 거절되면(유지보수 노드, macOS(HVF), 로컬 디스크 등) 그 VM은 60초 뒤에 다시
+  보고(로그는 한 번), 마이그레이션 작업이 실패한 VM은 이 리더가 다시 하지 않는다. 재시작 횟수를 넘겨 옮겨 온 VM은 옮기기 창(10분)
+  안에서는 되돌아가지 않는다(옮겨 온 노드로 돌려보내면 다시 크래시해 `error`가 될 수 있다). 창이 지나 옮겨 떠난 노드
+  (`status.ha.relocated_from`)로 되돌아가면 옮기기 한 번으로 센다 — 그 노드에서 다시 크래시하면 기본값(`max_relocate` 1)에서
+  `error`로 끝난다(되돌아가기와 옮기기가 10분마다 끝없이 돌지 않게). 다른 노드로의 되돌아가기(노드 장애 복구 뒤 등)는 세지
+  않는다. 그룹 없는 HA VM은 되돌아가지 않는다.
+
+**HA 정책(`ha`).** `ha`는 옛 bool(`true`/`false`)이나 객체 `{ "state": "started"|"stopped"|"ignored", "group": …,
+"max_restart": 1, "max_relocate": 1 }`(빠진 값은 기본, 횟수는 0~10)다. 정책이 기본과 같으면 저장할 때 `true`로 쓰므로 단순
+HA VM과 이 버전 전의 VM은 바이트까지 옛 모양이고, `--ha`/`--no-ha`와 웹의 HA 스위치는 그대로다. 기본과 다른 객체는 모든
+노드를 올린 뒤에만 쓸 수 있다.
+
+- **상태.** 켜고 끄기는 지금처럼 `spec.power` 하나다. `started`: 지금의 HA(노드 장애 때 다른 노드에서 켬, 횟수).
+  `stopped`: 노드 장애 때 다른 노드로 옮기기만 하고 켜지 않는다(꺼진 VM도 옮긴다). `ignored`: HA를 잠시 끈다 — 펜싱·복구·횟수를
+  하지 않고 HA 가능 노드 조건도 없다(설정은 남는다). 없음·`ignored`에서 `started`·`stopped`로 바꾸는 것은 HA 켜기와 같아 VM이
+  멈춰 있을 때만 된다(**409** `vm_running`).
+- **재시작·옮기기 횟수.** `started` HA VM의 크래시는 `restart` 정책과 관계없이 다시 켠다(게스트가 스스로 끄면 꺼진 채 둔다).
+  같은 노드에서 10분 안의 크래시가 `max_restart`를 넘으면 그 노드는 더 켜지 않고 `status.ha.relocate_from`으로 옮겨 달라고
+  하며, 리더가 그 노드를 뺀 노드로 옮기고 `status.ha.relocations`(옮긴 시각, 10분 창)에 더한다. 창 안에서 이미
+  `max_relocate`번 옮겼으면 원하는 상태를 stopped로, phase를 failed로 두고 `status.ha.error`("gave up after N relocations")를
+  남긴다(`error` 상태) — 원인을 고친 뒤 VM을 다시 시작하면 지워진다. 노드 장애 복구는 횟수에 세지 않는다. 옛 노드가 남아
+  있으면 이 동작 대신 지금의 재시작 정책·백오프다. 옮기기 창은 리더의 고정 600초이고, 재시작 창은 각 노드 reconciler의
+  재시작 백오프 창(기본 600초)이다.
+- **복구가 막히면.** hard 규칙 때문에 놓을 곳이 없으면 켜지 않고 `status.ha.error`와 last_error
+  "HA cannot place this VM: placement rule …"을 남긴 채 1초마다 다시 본다(자리가 나면 옮기고 지운다). 막는 규칙이 모두
+  `ha_may_violate`면 위반이 가장 적은 노드에 켜고 경고 로그와 `rule_violations`를 남긴다. 같은 죽은 노드의 VM은 앞에서
+  옮긴 VM을 다음 VM의 규칙·메모리에 센다(affinity 상대는 첫 VM을 따라간다).
+
+**노드 정상 종료 정책.** 클러스터 설정 `shutdown_policy`(기본 `conditional`)는 **호스트가 꺼지는 중(재부팅·전원 끄기)일
+때만** 움직인다. `systemctl stop opld`·업그레이드 재시작은 지금 그대로(VM 계속 돎, 위 watchdog 경고)다.
+
+- **판별.** orbivisord가 SIGTERM을 받으면 `systemctl list-jobs`를 보아 `reboot.target`·`kexec.target`·`soft-reboot.target`의
+  시작 작업이면 재부팅, `poweroff.target`·`halt.target`(또는 `shutdown.target`만)이면 끄기, 없거나 명령이 실패하면(macOS 포함)
+  호스트 종료가 아니다(Proxmox `pve-ha-lrm`과 같은 방식).
+- **정책.** `conditional` = 재부팅이면 `freeze`, 끄기면 `failover`. `freeze`: 노드가 `status.shutdown` 표시를 남기고 이
+  노드의 실행 중 HA VM을 ACPI(`[reconciler] acpi_timeout_secs`, 기본 60초) 뒤 강제로 끈다(원하는 상태는 running 그대로라
+  돌아오면 그 노드에서 다시 켠다). 리더는 이 표시가 있고 오프라인인 **얼린** 노드의 HA VM을 옮기지 않는다. 표시가 있는
+  노드는 꺼지기 전에도 복구·옮기기·되돌아가기·비우기·처음 놓기의 대상이 아니다(다시 등록하면 표시가 지워진다). `failover`:
+  같은 방법으로 끄고 끝난다 — 리더가 평소처럼 `recover_after_secs` 뒤 다른 노드에서 켠다. `migrate`: 노드를 유지보수로 바꾸고
+  비우기를 시작해 끝나거나 10분이 될 때까지 기다린 뒤 남은 HA VM을 failover처럼 끈다. 표시를 쓰지 못하면(과반 없음) 경고하고
+  failover처럼 끈다.
+- **돌아오면.** 다시 등록할 때 표시를 지우고, `migrate`가 켠 유지보수만 끈다 — 노드가 꺼진 동안 관리자가 유지보수를 다시
+  켰어도 표시가 `migrate`가 유지보수를 켠 것이면 등록이 끄므로, 계속 유지보수로 두려면 돌아온 뒤 다시 켠다. 돌아오지 않을 얼린 노드는
+  `orbivisorctl node unfreeze`(웹 "얼림 풀기", admin, 오프라인일 때만 — 아니면 **409** `node_online`)로 표시를 지우면 리더가
+  죽은 노드처럼 복구한다.
+- **systemd.** 정책이 VM이 살아 있을 때 돌도록 QEMU 스코프가 `Before=opld.service`를 갖고(멈출 때는 역순이라 orbivisord가 먼저
+  끝난다) 망·원격 파일시스템보다는 먼저 멈추도록 `After=network-online.target remote-fs.target`도 갖는다. 유닛은
+  `TimeoutStopSec=15min`이다 — 이 한도는 보통의 `systemctl stop`·`restart`에도 적용되어, 멈추지 않는 orbivisord를 systemd가
+  강제로 끝내기까지 기다리는 시간도 15분이다. **이 버전 전에 켠 VM의 스코프에는 이 순서가 없으므로** 호스트 종료 때 orbivisord와
+  함께 SIGTERM을 받는다 — VM을 한 번 껐다 켜야 순서가 붙는다(라이브 마이그레이션으로 다른 노드에 옮겨도 된다).
+- **업그레이드 뒤 동작 변화.** 기본 `conditional` 때문에 업그레이드 뒤에는 **노드를 재부팅하면 그 노드의 HA VM이 다른 노드로
+  옮겨지지 않고 꺼졌다가 노드가 돌아오면 그 노드에서 다시 켜진다**(전에는 리더가 `recover_after_secs` 뒤 다른 노드로 복구했다).
+  재부팅 동안 HA VM을 계속 돌리려면 먼저 `node drain`하거나 `shutdown_policy=migrate`, 예전처럼 옮기려면 `failover`로 둔다.
+
+**한계.** 위반을 바로잡는 균형 조정과 묶음 옮기기 API(뒤 계획), 미리 고른 복구 노드와 종료 failover의 빠른 복구(뒤 계획),
+꺼진 `started` HA VM의 노드 옮기기, 호스트 종료 때 HA 아닌 VM의 ACPI 종료는 없다. 리스·`failback` 30초는 리더의 메모리에만
+있으므로 리더가 바뀌면 다시 센다.
 
 ## 제어부 가용성
 
@@ -1912,7 +2049,8 @@ orbivisorctl node maintenance node1 on   # VM은 옮기지 않고 배치만 막�
   노드(`hvf node`), 받을 노드가 없음(`no node with capacity`), 바쁨(`busy` — VM의 다른 작업이나 이 노드로 들어오는 마이그레이션이 `[migration] timeout`까지
   끝나지 않음, 다시 기다린 뒤에도 마이그레이션 작업 만들기가 다른 작업과 겹침, 사라졌다 다시 나타나기를 세 번 넘게 함),
   마이그레이션 작업이 끝나지 않음(`migration task did not finish`), 다시 들어옴(`moved back during the drain`),
-  마이그레이션 실패(그 작업의 오류 — 대상 풀의 공간 부족 등)는 그 노드에 남기고 다음 VM으로 간다. 끝에 작업이 "N VM(s)
+  배치 규칙 때문에 받을 노드가 없음(`placement rule …` — hard affinity로 묶인 같은 노드의 VM은 묶음 전체를 받을 노드로 함께
+  옮긴다, "배치 규칙과 HA 정책"), 마이그레이션 실패(그 작업의 오류 — 대상 풀의 공간 부족 등)는 그 노드에 남기고 다음 VM으로 간다. 끝에 작업이 "N VM(s)
   were not moved: db (disks on a local pool and snapshots), …"로 실패한다(`--wait`면 이 오류와 종료 코드 1). 꺼진 VM은 옮기지 않는다 — 노드에 배정된 채 남고, 켤 때 다른 노드로 간다(아래).
 - **유지보수를 끄면 멈춘다.** 비우기는 VM마다(VM이 자리 잡기를 기다린 뒤 마이그레이션을 시작하기 직전에도, 들어오는
   마이그레이션을 기다리는 동안에도) 노드를 다시 읽어 유지보수가 끝났으면 "drain stopped: maintenance ended"로
@@ -2351,7 +2489,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
-볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·증분·복원·지우기·원격으로 복제)과 백업 작업(증분 주기·원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 비우기, 죽은 노드 제거), 작업, 감사 로그(admin),
+볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·증분·복원·지우기·원격으로 복제)과 백업 작업(증분 주기·원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 비우기, 레이블, 얼림 풀기, 죽은 노드 제거), HA 그룹과 배치 규칙, 작업, 감사 로그(admin),
 사용자(admin), 인증 영역(LDAP·OIDC, admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 원격 클러스터(상태 카드, 원격 VM 목록과 동작), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `orbivisorctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.

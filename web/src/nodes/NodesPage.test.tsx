@@ -1,7 +1,9 @@
-import { screen, within } from "@testing-library/react";
+import { act, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
+import { applyEvent, listKey, type List } from "@/api/live";
+import type { Node } from "@/api/types";
 import { NodesPage } from "@/nodes/NodesPage";
 import { NODE, poolState, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
@@ -597,4 +599,134 @@ it("asks before ending maintenance that stops a running drain", async () => {
   await userEvent.click(within(confirm).getByRole("button", { name: "End maintenance" }));
   await vi.waitFor(() => expect(sent).toEqual([{ address: "10.0.0.1", maintenance: false }]));
   await vi.waitFor(() => expect(confirm).not.toBeInTheDocument());
+});
+
+it("edits node labels with the revision of the node when saving", async () => {
+  cluster();
+  const labeled = { ...DOWN, labels: { zone: "rack-a" } };
+  mockLists({ node: [NODE, labeled] });
+  const sent: { ifMatch: string | null; body: unknown }[] = [];
+  server.use(
+    http.put(apiUrl("/nodes/n2"), async ({ request }) => {
+      const body = (await request.json()) as { labels: Record<string, string> };
+      sent.push({ ifMatch: request.headers.get("If-Match"), body });
+      return HttpResponse.json({ ...labeled, revision: 10, labels: body.labels });
+    }),
+  );
+  const { queryClient } = renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  await within(table).findByText("node-b");
+  const labelsColumn = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Labels");
+  const row = (name: string) => within(table).getByText(name).closest("tr")!;
+  expect(within(row("node-b")).getAllByRole("cell")[labelsColumn]).toHaveTextContent("zone=rack-a");
+  expect(within(row("node-a")).getAllByRole("cell")[labelsColumn]).toHaveTextContent("—");
+  await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Edit labels" }));
+  const dialog = await screen.findByRole("dialog", { name: "Labels of node-b" });
+  const input = within(dialog).getByLabelText("Labels");
+  expect(input).toHaveValue("zone=rack-a");
+  expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
+  await userEvent.type(input, ", ssd");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(within(dialog).getByText("Use KEY=VALUE pairs separated by commas.")).toBeVisible();
+  await userEvent.type(input, "=true");
+  // 대화 상자를 연 사이 노드 status가 바뀌어 revision이 올랐다.
+  const bumped = { ...labeled, revision: 9, status: { ...labeled.status, cpus: 16 } };
+  act(() => {
+    queryClient.setQueryData<List<Node>>(
+      listKey("node"),
+      (list) => list && applyEvent(list, { type: "put", kind: "node", resource: bumped }),
+    );
+  });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(await screen.findByText("Labels of node-b saved.")).toBeInTheDocument();
+  expect(sent).toEqual([
+    { ifMatch: "9", body: { labels: { zone: "rack-a", ssd: "true" }, spec: DOWN.spec } },
+  ]);
+  // 응답을 곧바로 목록에 반영한다.
+  expect(within(row("node-b")).getAllByRole("cell")[labelsColumn]).toHaveTextContent(
+    "ssd=true, zone=rack-a",
+  );
+});
+
+it("does not overwrite node labels changed while the dialog was open", async () => {
+  cluster();
+  const labeled = { ...DOWN, labels: { zone: "rack-a" } };
+  mockLists({ node: [NODE, labeled] });
+  const sent: unknown[] = [];
+  server.use(
+    http.put(apiUrl("/nodes/n2"), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json(labeled);
+    }),
+  );
+  const { queryClient } = renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  await within(table).findByText("node-b");
+  await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Edit labels" }));
+  const dialog = await screen.findByRole("dialog", { name: "Labels of node-b" });
+  await userEvent.type(within(dialog).getByLabelText("Labels"), ", ssd=true");
+  // 대화 상자를 연 사이 다른 곳에서 레이블을 바꿨다.
+  const relabeled = { ...labeled, revision: 9, labels: { zone: "rack-b" } };
+  act(() => {
+    queryClient.setQueryData<List<Node>>(
+      listKey("node"),
+      (list) => list && applyEvent(list, { type: "put", kind: "node", resource: relabeled }),
+    );
+  });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(
+    within(dialog).getByText(
+      "The labels of this node changed elsewhere. Close this dialog and open it again.",
+    ),
+  ).toBeVisible();
+  expect(sent).toEqual([]);
+});
+
+it("marks a frozen node and unfreezes it", async () => {
+  cluster();
+  const frozen = {
+    ...DOWN,
+    status: { ...DOWN.status, shutdown: { action: "freeze" as const, at: 1_800_000_000 } },
+  };
+  // 켜져 있는 노드의 표시는 얼림이 아니다(곧 스스로 지운다).
+  const back = {
+    ...NODE,
+    status: { ...NODE.status, shutdown: { action: "freeze" as const, at: 1_800_000_000 } },
+  };
+  mockLists({ node: [back, frozen] });
+  let unfrozen = 0;
+  server.use(
+    http.post(apiUrl("/nodes/n2/unfreeze"), () => {
+      unfrozen += 1;
+      return unfrozen === 1
+        ? HttpResponse.json(
+            { code: "node_online", message: 'node "node-b" is online' },
+            { status: 409 },
+          )
+        : HttpResponse.json(DOWN);
+    }),
+  );
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  expect((await within(table).findByText("node-b")).closest("tr")).toHaveTextContent("Frozen");
+  expect(within(table).getByText("node-a").closest("tr")).not.toHaveTextContent("Frozen");
+  await userEvent.click(screen.getByRole("button", { name: "Actions for node-a" }));
+  expect(await screen.findByRole("menuitem", { name: "Edit labels" })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Unfreeze" })).not.toBeInTheDocument();
+  await userEvent.keyboard("{Escape}");
+  await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Unfreeze" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "Unfreeze node-b?" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Unfreeze" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "The node is online again; it clears the mark itself.",
+  );
+  await userEvent.click(within(dialog).getByRole("button", { name: "Unfreeze" }));
+  expect(
+    await screen.findByText("node-b unfrozen. Its HA VMs are recovered on other nodes."),
+  ).toBeInTheDocument();
 });

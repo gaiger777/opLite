@@ -1,7 +1,7 @@
 import type { components } from "@/api/schema";
 import type { Node, Vm, VmSpec } from "@/api/types";
 import { MAX_NIC_SECURITY_GROUPS } from "@/security-groups/rules";
-import { haEnabled } from "@/vms/ha";
+import { DEFAULT_HA, haPolicy, haSetting, MAX_HA_COUNT } from "@/vms/ha";
 
 type Schemas = components["schemas"];
 
@@ -61,8 +61,14 @@ export interface VmFormValues {
   node: string;
   restart: Schemas["RestartPolicy"];
   snapshotSchedule: ScheduleRow;
-  /** HA VM: 펜싱이 켜진 노드에서만 돈다. */
+  /** HA 정책이 있다(`ignored`가 아니면 펜싱이 켜진 노드에서만 돈다). */
   ha: boolean;
+  /** HA 정책의 값. HA를 꺼도 남겨 두어 다시 켤 때 쓴다. */
+  haState: Schemas["HaState"];
+  /** HA 그룹 이름. 비면 그룹 없음 */
+  haGroup: string;
+  maxRestart: string;
+  maxRelocate: string;
   /** 만든 뒤 곧바로 시작한다(만들 때만). */
   start: boolean;
 }
@@ -112,7 +118,7 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     node: "",
     restart: "never",
     snapshotSchedule: { every: "off", keep: "7", memory: false },
-    ha: false,
+    ...haFields(null),
     start: true,
   };
 }
@@ -150,9 +156,28 @@ export function fromVm(vm: Vm): VmFormValues {
           memory: s.snapshot_schedule.memory ?? false,
         }
       : { every: "off", keep: "7", memory: false },
-    ha: haEnabled(s),
+    ...haFields(haPolicy(s)),
     start: false,
   };
+}
+
+/** 정책(없으면 null)의 폼 값. 정책이 없으면 기본 정책의 값을 채워 둔다. */
+function haFields(
+  policy: Schemas["VmHa"] | null,
+): Pick<VmFormValues, "ha" | "haState" | "haGroup" | "maxRestart" | "maxRelocate"> {
+  const p = policy ?? DEFAULT_HA;
+  return {
+    ha: policy !== null,
+    haState: p.state,
+    haGroup: p.group ?? "",
+    maxRestart: String(p.max_restart),
+    maxRelocate: String(p.max_relocate),
+  };
+}
+
+/** 폼이 HA를 활성으로 두는지(서버의 `ha_active`: 정책이 있고 `ignored`가 아님) */
+export function haActive(v: Pick<VmFormValues, "ha" | "haState">): boolean {
+  return v.ha && v.haState !== "ignored";
 }
 
 /** 서버의 리소스 이름 규칙에 맞는지. id(UUID)처럼 보이는 이름은 id와 헷갈리므로 받지 않는다. */
@@ -247,6 +272,16 @@ export function validate(
   if (schedule.every !== "off" && !intIn(schedule.keep, 1, MAX_SCHEDULE_KEEP)) {
     errors["schedule.keep"] = "vmForm.errors.keep";
   }
+  if (v.ha) {
+    for (const [field, value] of [
+      ["maxRestart", v.maxRestart],
+      ["maxRelocate", v.maxRelocate],
+    ] as const) {
+      if (!/^\d+$/.test(value) || !intIn(value, 0, MAX_HA_COUNT)) {
+        errors[field] = "vmForm.errors.haCount";
+      }
+    }
+  }
   return errors;
 }
 
@@ -279,7 +314,16 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
             keep: Number(v.snapshotSchedule.keep),
             memory: v.snapshotSchedule.memory,
           },
-    ha: v.ha,
+    ha: haSetting(
+      v.ha
+        ? {
+            state: v.haState,
+            ...(v.haGroup !== "" && { group: v.haGroup }),
+            max_restart: Number(v.maxRestart),
+            max_relocate: Number(v.maxRelocate),
+          }
+        : null,
+    ),
   };
 }
 
