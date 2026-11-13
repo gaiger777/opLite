@@ -12,6 +12,7 @@ const member = (id: string, name: string | null, extra = {}) => ({
   address: `${name}:8006`,
   cluster_address: `${name}:8007`,
   voter: true,
+  role: "voter",
   online: true,
   witness: false,
   ...extra,
@@ -28,8 +29,9 @@ beforeEach(() =>
         members: [
           member("n1", "node-a", { fencing: "watchdog" }),
           member("n2", "node-b", { fencing: null }),
-          member("n3", null, { voter: false, online: false, address: null }),
+          member("n3", null, { voter: false, role: "learner", online: false, address: null }),
           member("n4", "witness-w", { witness: true }),
+          member("n5", "node-o", { voter: false, role: "observer" }),
         ],
       }),
     ),
@@ -60,6 +62,10 @@ it("shows the CA and the members", async () => {
   const joining = within(table).getByText("n3").closest("tr")!;
   expect(joining).toHaveTextContent("Learner");
   expect(joining).toHaveTextContent("Offline");
+  // 관찰 노드(Raft 밖에서 투표 멤버를 따름)는 learner와 따로 보인다.
+  const observer = within(table).getByText("node-o").closest("tr")!;
+  expect(observer).toHaveTextContent("Observer");
+  expect(observer).not.toHaveTextContent("Learner");
   // 위트니스는 역할 옆에 배지가 붙는다.
   expect(within(table).getByText("witness-w").closest("tr")).toHaveTextContent("VoterWitness");
   expect(within(table).queryAllByText("Witness")).toHaveLength(1);

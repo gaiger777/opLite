@@ -126,9 +126,7 @@ export function ClusterPage() {
                   </Badge>
                 </TableCell>
                 <TableCell>
-                  {m.id === leader
-                    ? t("cluster.leader")
-                    : t(m.voter ? "cluster.voter" : "cluster.learner")}
+                  {m.id === leader ? t("cluster.leader") : t(`cluster.${m.role}`)}
                   {m.witness && (
                     <Badge variant="outline" className="ml-2">
                       {t("dashboard.witness")}

@@ -8,8 +8,8 @@ use std::sync::Arc;
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
-    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_HEADERS,
-    ACCESS_CONTROL_REQUEST_METHOD, HOST, ORIGIN, UPGRADE, VARY,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
+    ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, HOST, ORIGIN, UPGRADE, VARY,
 };
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -19,6 +19,7 @@ use opl_types::security_group::Cidr;
 
 use crate::auth::same_origin;
 use crate::limit::ClientIp;
+use crate::revision::REVISION;
 use crate::state::AppState;
 
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
@@ -232,7 +233,13 @@ pub(crate) async fn layer(
     }
     req.extensions_mut().insert(AllowedOrigin);
     let mut response = next.run(req).await;
-    cors_headers(response.headers_mut(), origin);
+    let headers = response.headers_mut();
+    cors_headers(headers, origin);
+    // 다른 출처의 스크립트는 노출한 헤더만 읽는다. 응답의 리비전을 다음 읽기의 최소 리비전으로 쓰게 한다.
+    headers.insert(
+        ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_name(REVISION),
+    );
     response
 }
 

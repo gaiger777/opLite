@@ -53,6 +53,10 @@ pub struct ClusterConfig {
     /// 껐다 켜면 Raft 로그와 투표가 사라져 실제 노드에서는 안전하지 않다.
     #[doc(hidden)]
     pub in_memory: bool,
+    /// 저장소의 멤버십에 투표 멤버가 없을 때 관찰 노드가 붙을 투표 멤버(노드 id → 클러스터 주소). 시험용(규모
+    /// 시험이 노드를 learner로 따라잡게 하지 않고 빈 저장소로 바로 관찰 노드로 연다)이다.
+    #[doc(hidden)]
+    pub follow_seed: BTreeMap<NodeId, String>,
 }
 
 impl ClusterConfig {
@@ -63,6 +67,7 @@ impl ClusterConfig {
             raft: openraft::Config::default(),
             write_timeout: Duration::from_secs(5),
             in_memory: false,
+            follow_seed: BTreeMap::new(),
         }
     }
 }
@@ -314,7 +319,12 @@ impl Cluster {
         let backend = match (mode, &follow) {
             (NodeMode::Observer, Some(follow)) => {
                 store.writer().run(enter_observer_mode).await?;
-                Backend::Observer(Replica::start(config.node_id, &store, follow.clone())?)
+                Backend::Observer(Replica::start(
+                    config.node_id,
+                    &store,
+                    follow.clone(),
+                    &config.follow_seed,
+                )?)
             }
             _ => {
                 store.writer().run(prepare_member).await?;
@@ -461,7 +471,7 @@ impl Cluster {
                 enter_observer_mode(db)
             })
             .await?;
-        let replica = Replica::start(self.id, &self.store, follow)?;
+        let replica = Replica::start(self.id, &self.store, follow, &BTreeMap::new())?;
         // 적용 지연은 백엔드마다 다른 것을 잰다(Raft 로그 대 붙은 노드·리더의 인덱스).
         *self.apply_lag.lock().unwrap() = ApplyLag::default();
         *self.node.backend.write().unwrap() = Backend::Observer(replica);
@@ -515,7 +525,7 @@ impl Cluster {
                 let follow = self.follow.clone().ok_or_else(|| {
                     ClusterError::Raft("this node cannot follow a voting member".into())
                 })?;
-                let replica = Replica::start(self.id, &self.store, follow)?;
+                let replica = Replica::start(self.id, &self.store, follow, &BTreeMap::new())?;
                 *self.node.backend.write().unwrap() = Backend::Observer(replica);
                 Err(e)
             }

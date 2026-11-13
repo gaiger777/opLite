@@ -87,14 +87,19 @@ pub(crate) struct Status {
 }
 
 impl Replica {
-    /// 저장소의 멤버십에서 후보를 읽고 복제 작업을 띄운다. 저장소의 적용 위치(`revision`)부터 이어 받는다.
+    /// 저장소의 멤버십에서 후보를 읽고 복제 작업을 띄운다(멤버십에 투표 멤버가 없으면 `seed`). 저장소의 적용
+    /// 위치(`revision`)부터 이어 받는다.
     pub(crate) fn start(
         id: NodeId,
         store: &Store,
         follow: Arc<dyn FollowClient>,
+        seed: &BTreeMap<NodeId, String>,
     ) -> Result<Self, StoreError> {
         let db = store.db().clone();
-        let voters = voter_addrs(&read_membership(&db)?);
+        let mut voters = voter_addrs(&read_membership(&db)?);
+        if voters.is_empty() {
+            voters.clone_from(seed);
+        }
         let inner = Arc::new(Inner {
             id,
             db,
@@ -894,6 +899,32 @@ mod tests {
         net.shutdown().await;
     }
 
+    /// 빈 저장소로 바로 연 관찰 노드는 설정의 `follow_seed`(투표 멤버)에 붙어 스냅샷부터 받는다(규모 시험).
+    #[tokio::test]
+    async fn a_fresh_observer_follows_the_seed_voters() {
+        let mut net = Net::start(0).await;
+        net.settled_leader().await;
+        let v = volume("before");
+        net.leader().create(&v).await.unwrap();
+        let id = NodeId::from(9);
+        let mut config = config(&net.root, 9, true);
+        config.follow_seed = (1..=3u64)
+            .map(|i| (NodeId::from(i), format!("node-{i}")))
+            .collect();
+        let o = Cluster::open_observer(config, net.router.network(id), net.router.follower(id))
+            .await
+            .unwrap()
+            .with_forwarder(net.router.forwarder(id));
+        net.router.register(id, &o);
+        net.observers.insert(id, o);
+        let revision = net.sync().await;
+        let o = net.observer(0);
+        assert_eq!(o.revision(), revision);
+        assert!(o.get::<VolumeSpec>(v.id).unwrap().is_some());
+        assert_eq!(o.members().voters.len(), 3);
+        net.shutdown().await;
+    }
+
     /// 관찰 노드의 감시 이벤트는 투표 멤버의 것과 같다(같은 묶음을 그대로 낸다).
     #[tokio::test]
     async fn observer_watch_events_match_the_voter() {
@@ -989,41 +1020,15 @@ mod tests {
         }
     }
 
-    /// 대본대로 받는 관찰 노드(투표 멤버 1만 든 멤버십을 둔 빈 저장소라 그 노드를 따른다)
+    /// 대본대로 받는 관찰 노드(빈 메모리 저장소, 투표 멤버 1을 따른다)
     async fn scripted_observer(root: &TempDir, script: Scripted) -> Cluster {
-        let config = config(root, 9, false);
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let store = Store::open(&config.data_dir.join(crate::cluster::DB_FILE)).unwrap();
-        let membership = Membership::new(
-            None,
-            openraft::Membership::new(
-                vec![[NodeId::from(1)].into()],
-                BTreeMap::from([(NodeId::from(1), BasicNode::new("node-1"))]),
-            ),
-        );
-        let txn = store.db().begin_write().unwrap();
-        {
-            let mut meta = txn.open_table(META).unwrap();
-            crate::store::put_json(&mut meta, KEY_LAST_MEMBERSHIP, &membership).unwrap();
-        }
-        txn.commit().unwrap();
-        drop(store);
         let router = MemRouter::default();
-        let script = Arc::new(script);
-        loop {
-            match Cluster::open_observer(
-                config.clone(),
-                router.network(NodeId::from(9)),
-                script.clone(),
-            )
+        let id = NodeId::from(9);
+        let mut config = config(root, 9, true);
+        config.follow_seed = BTreeMap::from([(NodeId::from(1), "node-1".into())]);
+        Cluster::open_observer(config, router.network(id), Arc::new(script))
             .await
-            {
-                Err(ClusterError::Store(StoreError::Db(redb::Error::DatabaseAlreadyOpen))) => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                other => break other.unwrap(),
-            }
-        }
+            .unwrap()
     }
 
     /// 감시에서 더 오지 않을 때까지 받은 이벤트의 리비전
