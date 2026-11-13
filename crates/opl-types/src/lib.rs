@@ -9,6 +9,7 @@ pub mod host;
 pub mod metrics;
 pub mod network;
 pub mod node;
+pub mod placement;
 pub mod realm;
 pub mod remote;
 pub mod resource;

@@ -11,7 +11,7 @@ use opl_cluster::ClusterError;
 use opl_driver::DriverError;
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
-use opl_types::node::{Fencing, Node, NodeHa, NodeSpec};
+use opl_types::node::{Fencing, HA_PLACEMENT, Node, NodeHa, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{VolumePhase, VolumeSpec};
@@ -734,6 +734,19 @@ async fn ha_vms_need_an_ha_capable_node() {
 async fn ha_policy_objects_wait_for_all_nodes() {
     let env = Env::start().await;
     let admin = env.admin().await;
+    // 옛 노드 흉내: 이 노드의 `ha-placement` 표시를 지운다.
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.features.retain(|f| f != HA_PLACEMENT);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+
     let mut req = vm_request("web");
     req["spec"]["ha"] = json!({});
     let (status, vm) = admin.post("/vms", req.clone()).await;
@@ -741,14 +754,15 @@ async fn ha_policy_objects_wait_for_all_nodes() {
     assert_eq!(vm["spec"]["ha"], true);
 
     req["name"] = json!("db");
-    req["spec"]["ha"] = json!({ "group": "rack-a", "max_restart": 3 });
+    req["spec"]["ha"] = json!({ "state": "stopped", "max_restart": 3 });
     let (status, body) = admin.post("/vms", req.clone()).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "cluster_upgrading");
 
     // 범위 밖 횟수는 기능보다 먼저 400이다.
-    req["spec"]["ha"] = json!({ "max_relocate": 11 });
-    let (status, body) = admin.post("/vms", req).await;
+    let mut bad = req.clone();
+    bad["spec"]["ha"] = json!({ "max_relocate": 11 });
+    let (status, body) = admin.post("/vms", bad).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(
         body["message"],
@@ -766,6 +780,25 @@ async fn ha_policy_objects_wait_for_all_nodes() {
     let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["spec"]["ha"], false);
+
+    // 모든 노드가 알면 정책 객체를 객체로 저장한다.
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.features.push(HA_PLACEMENT.into());
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["spec"]["ha"],
+        json!({ "state": "stopped", "max_restart": 3, "max_relocate": 1 })
+    );
 }
 
 #[tokio::test]

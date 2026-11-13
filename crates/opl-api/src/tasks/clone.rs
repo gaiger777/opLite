@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use opl_cluster::ClusterError;
 use opl_driver::uefi_vars_path;
 use opl_types::node::NodeSpec;
+use opl_types::placement::HaGroupSpec;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::SnapshotPhase;
@@ -247,6 +248,19 @@ pub(super) async fn create_vm(ctx: &Ctx, task: &Task, mut new: Vm) -> Result<(),
     new.spec.node = None;
     new.spec.power = PowerState::Stopped;
     new.spec.snapshot_schedule = None;
+    // 원본(또는 스냅샷)이 가리키던 HA 그룹이 그새 지워졌으면 그룹만 빼고 정책은 남긴다.
+    if let Some(group) = new.spec.ha.as_ref().and_then(|ha| ha.group.clone())
+        && ctx
+            .cluster
+            .get_by_name::<HaGroupSpec>(&group)
+            .map_err(|e| e.to_string())?
+            .is_none()
+    {
+        tracing::warn!(vm = %name, group = %group, "the HA group of the new VM no longer exists; leaving the VM without a group");
+        if let Some(ha) = new.spec.ha.as_mut() {
+            ha.group = None;
+        }
+    }
     // 이름이나 MAC이 그새 쓰였으면 저장소가 거부한다.
     if let Err(e) = ctx.cluster.create(&new).await {
         // 나중에 만들어질 수도 있으면 새 VM이 볼륨을 쓸 수 있으므로 지우지 않고 남긴다(설계 §11).

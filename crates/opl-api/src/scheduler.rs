@@ -3,6 +3,7 @@
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec, ha_capable};
+use opl_types::placement::{HaGroup, HaGroupSpec, PlacementRule, PlacementRuleSpec};
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumeSpec, is_shared, pool_usable_on,
@@ -26,6 +27,9 @@ pub struct Inventory {
     pub volumes: Vec<Volume>,
     pub pools: Vec<StoragePool>,
     pub networks: Vec<Network>,
+    /// 배치 규칙과 HA 그룹([`crate::placement`])
+    pub rules: Vec<PlacementRule>,
+    pub groups: Vec<HaGroup>,
 }
 
 impl Inventory {
@@ -36,6 +40,8 @@ impl Inventory {
             volumes: cluster.list::<VolumeSpec>()?.1,
             pools: cluster.list::<StoragePoolSpec>()?.1,
             networks: cluster.list::<NetworkSpec>()?.1,
+            rules: cluster.list::<PlacementRuleSpec>()?.1,
+            groups: cluster.list::<HaGroupSpec>()?.1,
         })
     }
 
@@ -352,6 +358,8 @@ mod tests {
             volumes: vec![volume],
             pools: vec![pool],
             networks: vec![],
+            rules: vec![],
+            groups: vec![],
         };
         let mut me = spec(512, None, PowerState::Running);
         me.disks.push(DiskSpec {

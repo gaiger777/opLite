@@ -9,12 +9,13 @@ use std::time::Duration;
 use common::{Client, Env, FakeStorage, vm_request};
 use opl_driver::uefi_vars_path;
 use opl_types::node::PoolState;
+use opl_types::placement::{HaGroupNode, HaGroupSpec, HaGroupStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -595,6 +596,51 @@ async fn clone_copies_disks_into_a_new_stopped_vm() {
         std::fs::read(uefi_vars_path(&state_dir(&env), copy.id)).unwrap(),
         b"vars-1"
     );
+}
+
+/// 복제본은 원본의 HA 정책을 받는다. 가리키던 HA 그룹이 그새 지워졌으면 그룹만 빼고 정책은 남긴다.
+#[tokio::test]
+async fn a_clone_drops_an_ha_group_that_no_longer_exists() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool(&env, "local", vec![]).await;
+    let root = volume(&env, "root").await;
+    fake_storage(&mut env, &[root]).await;
+    let group: Resource<HaGroupSpec, HaGroupStatus> = Resource::new(
+        "g",
+        HaGroupSpec {
+            nodes: vec![HaGroupNode {
+                node: "node1".into(),
+                priority: 1,
+            }],
+            restricted: false,
+            nofailback: false,
+        },
+    );
+    env.cluster.create(&group).await.unwrap();
+    let mut req = vm_request("web");
+    req["spec"]["disks"] = json!([{ "volume": "root", "bus": "virtio-blk" }]);
+    req["spec"]["ha"] = json!({ "group": "g", "max_restart": 3 });
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let policy = |group: Option<&str>| VmHa {
+        group: group.map(Into::into),
+        max_restart: 3,
+        ..Default::default()
+    };
+
+    succeeded(&clone_and_wait(&admin, "web", json!({ "name": "web-2" })).await);
+    assert_eq!(
+        get_vm(&env, "web-2").unwrap().spec.ha,
+        Some(policy(Some("g")))
+    );
+    // 원본이 쓰는 그룹은 API로 지울 수 없으므로 저장소에서 지운다(그룹을 가리키던 스냅샷에서 복제하는 경우와 같다).
+    env.cluster
+        .delete::<HaGroupSpec>(group.id, None)
+        .await
+        .unwrap();
+    succeeded(&clone_and_wait(&admin, "web", json!({ "name": "web-3" })).await);
+    assert_eq!(get_vm(&env, "web-3").unwrap().spec.ha, Some(policy(None)));
 }
 
 #[tokio::test]

@@ -16,6 +16,7 @@ pub mod error;
 mod fan_out;
 mod firmware;
 mod ha;
+mod ha_groups;
 pub mod health;
 mod incoming;
 mod janitor;
@@ -25,6 +26,8 @@ mod metrics;
 mod migration_disks;
 pub mod oidc;
 mod oidc_login;
+pub mod placement;
+mod placement_rules;
 pub mod proxy;
 pub mod realms;
 pub mod remote_client;
@@ -175,6 +178,21 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             r::get_security_group,
             security_groups::patch_security_group,
             security_groups::delete_security_group
+        ))
+        .routes(routes!(r::list_ha_groups, ha_groups::create_ha_group))
+        .routes(routes!(
+            r::get_ha_group,
+            ha_groups::update_ha_group,
+            ha_groups::delete_ha_group
+        ))
+        .routes(routes!(
+            r::list_placement_rules,
+            placement_rules::create_placement_rule
+        ))
+        .routes(routes!(
+            r::get_placement_rule,
+            placement_rules::update_placement_rule,
+            placement_rules::delete_placement_rule
         ))
         .routes(routes!(r::list_tasks))
         .routes(routes!(r::get_task))

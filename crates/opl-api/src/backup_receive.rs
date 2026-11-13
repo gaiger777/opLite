@@ -18,8 +18,10 @@ use opl_types::backup::{
     Backup, BackupDisk, BackupManifest, BackupOrigin, BackupPhase, BackupSpec, BackupStatus,
     MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, default_backup_name,
 };
+use opl_types::node::HA_PLACEMENT;
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::storage::{StoragePool, is_shared};
+use opl_types::vm::VmHa;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -28,7 +30,7 @@ use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
 use crate::backups::{backup_tasks, check_not_deleting, find_pool, node_name, now};
-use crate::cluster::{require_current, require_feature};
+use crate::cluster::{missing_feature, require_current, require_feature};
 use crate::error::{ApiError, Json};
 use crate::resources::{check_name, lookup};
 use crate::state::AppState;
@@ -239,8 +241,18 @@ pub async fn receive_backup(
         )));
     }
     let root = pool_root(&state, &pool)?;
-    let manifest = req.manifest;
+    let mut manifest = req.manifest;
     check_manifest(&manifest, req.parent)?;
+    // 옛 노드는 기본이 아닌 HA 정책 객체를 풀지 못한다: HA는 켠 채 정책 세부(그룹·횟수·상태)는 버린다.
+    if manifest
+        .vm_spec
+        .ha
+        .as_ref()
+        .is_some_and(|ha| *ha != VmHa::default())
+        && !missing_feature(&state.cluster, HA_PLACEMENT)?.is_empty()
+    {
+        manifest.vm_spec.ha = Some(VmHa::default());
+    }
     let (_, backups) = state.cluster.list::<BackupSpec>()?;
     if let Some(copy) = backups.iter().find(|b| {
         // 같은 원본이라도 다른 풀에 받은 것은 다른 사본이다.

@@ -80,6 +80,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: VmCmd,
     },
+    /// HA 그룹: HA VM을 놓고 복구할 노드와 우선순위
+    HaGroup {
+        #[command(subcommand)]
+        cmd: HaGroupCmd,
+    },
+    /// 배치 규칙: VM끼리(같은 노드·다른 노드)나 VM과 노드(이 노드들 중·이 노드들은 안 됨). hard 규칙은
+    /// 조건이고 soft 규칙은 벌점이다.
+    PlacementRule {
+        #[command(subcommand)]
+        cmd: PlacementRuleCmd,
+    },
     /// VM 백업(백업 풀에 담은 디스크 복사본과 VM 설정)과 복원
     Backup {
         #[command(subcommand)]
@@ -244,6 +255,17 @@ enum NodeCmd {
         /// `api`, `none`, `default`
         roles: String,
     },
+    /// 노드 레이블을 더하거나 바꾸고(`KEY=VALUE`) 지운다(`--rm KEY`). 배치 규칙의 `node_tag`(예:
+    /// `zone=rack-a`)가 이 레이블을 본다.
+    #[command(group(ArgGroup::new("change").required(true).multiple(true).args(["labels", "remove"])))]
+    Label {
+        node: String,
+        #[arg(value_name = "KEY=VALUE", value_parser = parse_label)]
+        labels: Vec<(String, String)>,
+        /// 지울 레이블 키(여러 번 줄 수 있다)
+        #[arg(long = "rm", value_name = "KEY")]
+        remove: Vec<String>,
+    },
     /// 노드를 유지보수로 바꾸고 실행 중인 VM을 하나씩 다른 노드로 라이브 마이그레이션한다. 로컬 풀
     /// 디스크 VM은 옮기지 못한다.
     Drain {
@@ -318,6 +340,18 @@ async fn put_node_spec(
     field: &str,
     value: Value,
 ) -> anyhow::Result<String> {
+    put_node(client, node, |current| {
+        spec_update(current, field, value.clone())
+    })
+    .await
+}
+
+/// [`put_node_spec`]처럼 다시 쓰되 본문(라벨과 spec)을 `body`(읽은 노드 → 본문)로 만든다.
+async fn put_node(
+    client: &Client,
+    node: &str,
+    body: impl Fn(&Value) -> Value,
+) -> anyhow::Result<String> {
     let path = format!("/nodes/{}", seg(node));
     let mut retries = SpecRetries::default();
     loop {
@@ -325,7 +359,7 @@ async fn put_node_spec(
         let r = client
             .request(Method::PUT, &path)
             .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
-            .json(&spec_update(&current, field, value.clone()));
+            .json(&body(&current));
         match client.send(r).await {
             Err(e) => match retries.next(&e.to_string()) {
                 Some(delay) => tokio::time::sleep(delay).await,
@@ -334,6 +368,22 @@ async fn put_node_spec(
             Ok(_) => return Ok(cell(&current["id"])),
         }
     }
+}
+
+/// `node label`의 본문: 읽은 노드의 spec은 그대로 두고 레이블에 `set`을 더하거나 바꾸고 `remove`의 키를 지운다.
+fn node_labels_update(node: &Value, set: &[(String, String)], remove: &[String]) -> Value {
+    let mut labels = node
+        .get("labels")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in set {
+        labels.insert(key.clone(), json!(value));
+    }
+    for key in remove {
+        labels.remove(key);
+    }
+    json!({ "labels": labels, "spec": node["spec"] })
 }
 
 /// `node roles`의 인자를 spec의 `roles` 값으로: `default`는 null(기본 역할), `none`은 빈 목록, `api`는 `["api"]`
@@ -1501,6 +1551,307 @@ fn backup_job_set_body(args: &BackupJobSet, current: &Value) -> Value {
         body["full_every"] = json!(full_every);
     }
     body
+}
+
+#[derive(Subcommand)]
+enum HaGroupCmd {
+    List,
+    Get {
+        group: String,
+    },
+    /// HA 그룹을 만든다. HA VM은 `ha.group`으로 쓰고, 우선순위가 큰 노드에 먼저 놓인다.
+    Create {
+        name: String,
+        /// 그룹 노드와 우선순위(0~1000, 클수록 먼저, 기본 0). 여러 번 준다.
+        #[arg(long = "node", value_name = "NAME[:PRIORITY]", required = true, value_parser = parse_group_node)]
+        nodes: Vec<Value>,
+        /// 그룹 밖 노드에는 놓지 않는다.
+        #[arg(long)]
+        restricted: bool,
+        /// 우선순위가 더 높은 노드가 돌아와도 되돌아가지 않는다.
+        #[arg(long)]
+        nofailback: bool,
+    },
+    /// 준 값만 바꾼다. `--node`를 주면 노드 목록 전체를 바꾼다.
+    Set(HaGroupSet),
+    /// 그룹을 지운다. 그룹을 쓰는 VM이 없어야 한다.
+    Delete {
+        group: String,
+    },
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("change").required(true).multiple(true).args(["nodes", "restricted", "nofailback"])))]
+struct HaGroupSet {
+    group: String,
+    /// 그룹 노드와 우선순위(여러 번 준다). 주면 노드 목록 전체를 바꾼다.
+    #[arg(long = "node", value_name = "NAME[:PRIORITY]", value_parser = parse_group_node)]
+    nodes: Vec<Value>,
+    #[arg(long, value_name = "true|false")]
+    restricted: Option<bool>,
+    #[arg(long, value_name = "true|false")]
+    nofailback: Option<bool>,
+}
+
+/// `--node`의 `NAME[:PRIORITY]`를 그룹 노드 값(`{ node, priority }`)으로
+fn parse_group_node(s: &str) -> Result<Value, String> {
+    let (node, priority) = match s.split_once(':') {
+        Some((node, priority)) => (
+            node,
+            priority
+                .parse::<u32>()
+                .map_err(|_| format!("invalid priority in {s:?}: use NAME[:PRIORITY]"))?,
+        ),
+        None => (s, 0),
+    };
+    if node.is_empty() {
+        return Err(format!("invalid node {s:?}: use NAME[:PRIORITY]"));
+    }
+    Ok(json!({ "node": node, "priority": priority }))
+}
+
+/// `ha-group set`의 새 spec: 준 값만 `current`(읽은 그룹)에서 바꾼다.
+fn ha_group_set_spec(args: &HaGroupSet, current: &Value) -> Value {
+    let mut spec = current["spec"].clone();
+    if !args.nodes.is_empty() {
+        spec["nodes"] = json!(args.nodes);
+    }
+    if let Some(restricted) = args.restricted {
+        spec["restricted"] = json!(restricted);
+    }
+    if let Some(nofailback) = args.nofailback {
+        spec["nofailback"] = json!(nofailback);
+    }
+    spec
+}
+
+/// `ha-group list`의 열
+const HA_GROUP_HEADERS: &[&str] = &["NAME", "NODES", "RESTRICTED", "NOFAILBACK"];
+
+/// `ha-group list`의 한 행. 노드는 `이름:우선순위`.
+fn ha_group_row(g: &Value) -> Vec<String> {
+    let nodes: Vec<String> = g["spec"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|n| {
+            format!(
+                "{}:{}",
+                cell(&n["node"]),
+                n["priority"].as_u64().unwrap_or(0)
+            )
+        })
+        .collect();
+    vec![
+        cell(&g["name"]),
+        nodes.join(","),
+        cell(&g["spec"]["restricted"]),
+        cell(&g["spec"]["nofailback"]),
+    ]
+}
+
+#[derive(Subcommand)]
+enum PlacementRuleCmd {
+    List,
+    Get {
+        rule: String,
+    },
+    /// 배치 규칙을 만든다. hard 규칙(`affinity`, `anti-affinity`, `node-affinity`, `node-anti-affinity`)은
+    /// 조건이고 `soft-` 규칙은 벌점(`--weight`)이다. 이미 놓인 VM은 옮기지 않는다.
+    Create(Box<PlacementRuleCreate>),
+    /// 준 값만 바꾼다. `--kind`를 바꾸면 그 종류에 없는 값(노드, weight, ha-may-violate)은 뺀다.
+    Set(Box<PlacementRuleSet>),
+    /// 규칙을 켠다.
+    Enable {
+        rule: String,
+    },
+    /// 규칙을 끈다(없는 것으로 본다).
+    Disable {
+        rule: String,
+    },
+    Delete {
+        rule: String,
+    },
+}
+
+/// 배치 규칙의 종류
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RuleKindArg {
+    Affinity,
+    AntiAffinity,
+    SoftAffinity,
+    SoftAntiAffinity,
+    NodeAffinity,
+    NodeAntiAffinity,
+    SoftNodeAffinity,
+    SoftNodeAntiAffinity,
+}
+
+impl RuleKindArg {
+    fn is_hard(self) -> bool {
+        !value_name(self).starts_with("soft-")
+    }
+
+    fn is_vm_rule(self) -> bool {
+        !value_name(self).contains("node")
+    }
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("vm_selector").required(true).args(["vms", "vm_tag"])))]
+#[command(group(ArgGroup::new("node_selector").args(["nodes", "node_tag"])))]
+struct PlacementRuleCreate {
+    name: String,
+    #[arg(long, value_enum)]
+    kind: RuleKindArg,
+    /// 규칙의 VM(여러 번 준다, 아직 없는 VM이어도 된다)
+    #[arg(long = "vm", value_name = "NAME")]
+    vms: Vec<String>,
+    /// 이 레이블을 가진 VM들
+    #[arg(long, value_name = "KEY=VALUE")]
+    vm_tag: Option<String>,
+    /// VM과 노드 규칙의 노드(여러 번 준다)
+    #[arg(long = "node", value_name = "NAME")]
+    nodes: Vec<String>,
+    /// 이 레이블을 가진 노드들(예: `zone=rack-a`)
+    #[arg(long, value_name = "KEY=VALUE")]
+    node_tag: Option<String>,
+    /// soft 규칙의 벌점(1~100, 기본 50)
+    #[arg(long, value_name = "1-100")]
+    weight: Option<u8>,
+    /// hard 규칙만: HA 복구가 지킬 수 없으면 어기고 켠다.
+    #[arg(long)]
+    ha_may_violate: bool,
+    /// 꺼 둔 채로 만든다.
+    #[arg(long)]
+    disabled: bool,
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("vm_selector").args(["vms", "vm_tag"])))]
+#[command(group(ArgGroup::new("node_selector").args(["nodes", "node_tag"])))]
+#[command(group(ArgGroup::new("change").required(true).multiple(true).args([
+    "kind", "vms", "vm_tag", "nodes", "node_tag", "weight", "ha_may_violate",
+])))]
+struct PlacementRuleSet {
+    rule: String,
+    #[arg(long, value_enum)]
+    kind: Option<RuleKindArg>,
+    /// VM 목록 전체를 바꾼다(태그 대신).
+    #[arg(long = "vm", value_name = "NAME")]
+    vms: Vec<String>,
+    #[arg(long, value_name = "KEY=VALUE")]
+    vm_tag: Option<String>,
+    /// 노드 목록 전체를 바꾼다(태그 대신).
+    #[arg(long = "node", value_name = "NAME")]
+    nodes: Vec<String>,
+    #[arg(long, value_name = "KEY=VALUE")]
+    node_tag: Option<String>,
+    #[arg(long, value_name = "1-100")]
+    weight: Option<u8>,
+    #[arg(long, value_name = "true|false")]
+    ha_may_violate: Option<bool>,
+}
+
+/// `placement-rule create`의 요청 본문. 주지 않은 값은 보내지 않는다.
+fn placement_rule_create_body(args: &PlacementRuleCreate) -> Value {
+    let mut spec = json!({ "kind": value_name(args.kind), "enabled": !args.disabled });
+    if let Some(tag) = &args.vm_tag {
+        spec["vm_tag"] = json!(tag);
+    } else {
+        spec["vms"] = json!(args.vms);
+    }
+    if let Some(tag) = &args.node_tag {
+        spec["node_tag"] = json!(tag);
+    } else if !args.nodes.is_empty() {
+        spec["nodes"] = json!(args.nodes);
+    }
+    if let Some(weight) = args.weight {
+        spec["weight"] = json!(weight);
+    }
+    if args.ha_may_violate {
+        spec["ha_may_violate"] = json!(true);
+    }
+    json!({ "name": args.name, "spec": spec })
+}
+
+/// `placement-rule set`의 새 spec: 준 값만 `current`(읽은 규칙)에서 바꾼다. 목록과 태그는 둘 중 하나만
+/// 남긴다. 종류를 바꾸면 그 종류에 없는 값을 뺀다.
+fn placement_rule_set_spec(args: &PlacementRuleSet, current: &Value) -> Value {
+    let mut spec = current["spec"].clone();
+    let Some(obj) = spec.as_object_mut() else {
+        return spec;
+    };
+    if let Some(kind) = args.kind {
+        obj.insert("kind".into(), json!(value_name(kind)));
+        if kind.is_vm_rule() {
+            obj.remove("nodes");
+            obj.remove("node_tag");
+        }
+        if kind.is_hard() {
+            obj.remove("weight");
+        } else {
+            obj.remove("ha_may_violate");
+        }
+    }
+    if !args.vms.is_empty() {
+        obj.insert("vms".into(), json!(args.vms));
+        obj.remove("vm_tag");
+    } else if let Some(tag) = &args.vm_tag {
+        obj.insert("vm_tag".into(), json!(tag));
+        obj.remove("vms");
+    }
+    if !args.nodes.is_empty() {
+        obj.insert("nodes".into(), json!(args.nodes));
+        obj.remove("node_tag");
+    } else if let Some(tag) = &args.node_tag {
+        obj.insert("node_tag".into(), json!(tag));
+        obj.remove("nodes");
+    }
+    if let Some(weight) = args.weight {
+        obj.insert("weight".into(), json!(weight));
+    }
+    if let Some(on) = args.ha_may_violate {
+        obj.insert("ha_may_violate".into(), json!(on));
+    }
+    spec
+}
+
+/// `placement-rule list`의 열
+const PLACEMENT_RULE_HEADERS: &[&str] = &["NAME", "KIND", "VMS", "NODES", "WEIGHT", "ENABLED"];
+
+/// 이름 목록(`a,b`)이나 태그(`tag:k=v`), 둘 다 없으면 `-`
+fn names_or_tag(list: &Value, tag: &Value) -> String {
+    if let Some(tag) = tag.as_str() {
+        return format!("tag:{tag}");
+    }
+    let names: Vec<String> = list.as_array().into_iter().flatten().map(cell).collect();
+    if names.is_empty() {
+        "-".into()
+    } else {
+        names.join(",")
+    }
+}
+
+/// `placement-rule list`의 한 행. hard 규칙의 weight는 `-`, soft 규칙은 없으면 50.
+fn placement_rule_row(r: &Value) -> Vec<String> {
+    let spec = &r["spec"];
+    let soft = spec["kind"]
+        .as_str()
+        .is_some_and(|k| k.starts_with("soft-"));
+    let weight = if soft {
+        spec["weight"].as_u64().unwrap_or(50).to_string()
+    } else {
+        "-".into()
+    };
+    vec![
+        cell(&r["name"]),
+        cell(&spec["kind"]),
+        names_or_tag(&spec["vms"], &spec["vm_tag"]),
+        names_or_tag(&spec["nodes"], &spec["node_tag"]),
+        weight,
+        cell(&spec["enabled"]),
+    ]
 }
 
 #[derive(Subcommand)]
@@ -3688,6 +4039,14 @@ where
                 .await?
             }
             NodeCmd::Roles { node, roles } => node_roles(&client, &node, &roles, out).await?,
+            NodeCmd::Label {
+                node,
+                labels,
+                remove,
+            } => {
+                put_node(&client, &node, |n| node_labels_update(n, &labels, &remove)).await?;
+                writeln!(out, "node {node}: labels updated")?;
+            }
             NodeCmd::Drain { node, wait } => node_drain(&client, &node, wait, out).await?,
             NodeCmd::Stats(stats) => {
                 node_stats(&client, stats.watch, json_out, out, &mut std::io::stderr()).await?
@@ -3846,6 +4205,8 @@ where
             }
         },
         Cmd::Vm { cmd } => vm(&client, cmd, json_out, out).await?,
+        Cmd::HaGroup { cmd } => ha_group(&client, cmd, json_out, out).await?,
+        Cmd::PlacementRule { cmd } => placement_rule(&client, cmd, json_out, out).await?,
         Cmd::Backup { cmd } => backup(&client, cmd, json_out, out).await?,
         Cmd::BackupJob { cmd } => backup_job(&client, cmd, json_out, out).await?,
         Cmd::Import { cmd } => import(&client, cmd, json_out, out).await?,
@@ -4328,6 +4689,124 @@ async fn backup_job(
         }
     }
     Ok(())
+}
+
+/// 리소스를 읽어 `edit`(읽은 리소스 → 새 spec)으로 바꾼 spec을 라벨과 함께 읽은 revision으로(`If-Match`) 다시
+/// 쓴다(`UpdateRequest` 전체 바꾸기). HA 그룹·배치 규칙은 status를 쓰지 않으므로 다시 하지 않는다.
+async fn replace_spec(
+    client: &Client,
+    path: &str,
+    edit: impl FnOnce(&Value) -> Value,
+) -> anyhow::Result<Value> {
+    let current = client.get(path).await?;
+    let labels = current.get("labels").cloned().unwrap_or_else(|| json!({}));
+    let body = json!({ "labels": labels, "spec": edit(&current) });
+    client
+        .send(
+            client
+                .request(Method::PUT, path)
+                .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
+                .json(&body),
+        )
+        .await
+}
+
+async fn ha_group(
+    client: &Client,
+    cmd: HaGroupCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        HaGroupCmd::List => {
+            let list = client.get("/ha-groups").await?;
+            print_list(out, json_out, &list, HA_GROUP_HEADERS, ha_group_row)?;
+        }
+        HaGroupCmd::Get { group } => print_json(
+            out,
+            &client.get(&format!("/ha-groups/{}", seg(&group))).await?,
+        )?,
+        HaGroupCmd::Create {
+            name,
+            nodes,
+            restricted,
+            nofailback,
+        } => {
+            let body = json!({
+                "name": name,
+                "spec": { "nodes": nodes, "restricted": restricted, "nofailback": nofailback }
+            });
+            client.post("/ha-groups", &body).await?;
+            writeln!(out, "HA group {name} created")?;
+        }
+        HaGroupCmd::Set(args) => {
+            let path = format!("/ha-groups/{}", seg(&args.group));
+            replace_spec(client, &path, |g| ha_group_set_spec(&args, g)).await?;
+            writeln!(out, "HA group {} updated", args.group)?;
+        }
+        HaGroupCmd::Delete { group } => {
+            client
+                .delete(&format!("/ha-groups/{}", seg(&group)))
+                .await?;
+            writeln!(out, "HA group {group} deleted")?;
+        }
+    }
+    Ok(())
+}
+
+async fn placement_rule(
+    client: &Client,
+    cmd: PlacementRuleCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let path = |rule: &str| format!("/placement-rules/{}", seg(rule));
+    match cmd {
+        PlacementRuleCmd::List => {
+            let list = client.get("/placement-rules").await?;
+            print_list(
+                out,
+                json_out,
+                &list,
+                PLACEMENT_RULE_HEADERS,
+                placement_rule_row,
+            )?;
+        }
+        PlacementRuleCmd::Get { rule } => print_json(out, &client.get(&path(&rule)).await?)?,
+        PlacementRuleCmd::Create(args) => {
+            client
+                .post("/placement-rules", &placement_rule_create_body(&args))
+                .await?;
+            writeln!(out, "placement rule {} created", args.name)?;
+        }
+        PlacementRuleCmd::Set(args) => {
+            replace_spec(client, &path(&args.rule), |r| {
+                placement_rule_set_spec(&args, r)
+            })
+            .await?;
+            writeln!(out, "placement rule {} updated", args.rule)?;
+        }
+        PlacementRuleCmd::Enable { rule } => {
+            replace_spec(client, &path(&rule), |r| with_enabled(r, true)).await?;
+            writeln!(out, "placement rule {rule} enabled")?;
+        }
+        PlacementRuleCmd::Disable { rule } => {
+            replace_spec(client, &path(&rule), |r| with_enabled(r, false)).await?;
+            writeln!(out, "placement rule {rule} disabled")?;
+        }
+        PlacementRuleCmd::Delete { rule } => {
+            client.delete(&path(&rule)).await?;
+            writeln!(out, "placement rule {rule} deleted")?;
+        }
+    }
+    Ok(())
+}
+
+/// 읽은 규칙의 spec에서 `enabled`만 바꾼다.
+fn with_enabled(rule: &Value, on: bool) -> Value {
+    let mut spec = rule["spec"].clone();
+    spec["enabled"] = json!(on);
+    spec
 }
 
 /// `backup-job list`의 열
@@ -12361,6 +12840,362 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 "GET /api/v1/remotes HTTP/1.1",
                 "POST /api/v1/remotes/dr/actions/refresh HTTP/1.1",
             ]
+        );
+    }
+
+    /// `--node NAME[:PRIORITY]`는 우선순위가 없으면 0이다.
+    #[test]
+    fn group_nodes_take_an_optional_priority() {
+        assert_eq!(
+            parse_group_node("n1").unwrap(),
+            json!({ "node": "n1", "priority": 0 })
+        );
+        assert_eq!(
+            parse_group_node("n2:500").unwrap(),
+            json!({ "node": "n2", "priority": 500 })
+        );
+        for bad in ["n1:x", "n1:-1", ":5", ""] {
+            assert!(parse_group_node(bad).is_err(), "{bad}");
+        }
+        // 만들 때 노드가 하나는 있어야 하고, 고칠 때는 바꿀 값이 있어야 한다.
+        assert!(Cli::try_parse_from(["oplctl", "ha-group", "create", "g"]).is_err());
+        assert!(Cli::try_parse_from(["oplctl", "ha-group", "set", "g"]).is_err());
+    }
+
+    /// `ha-group create`는 그대로 보내고, `set`은 읽은 그룹에서 준 값만 바꿔 읽은 revision으로 PUT한다.
+    #[tokio::test]
+    async fn ha_group_create_and_set_send_the_spec() {
+        let (base, seen) = fake_api_bodies(|_| {
+            json!({
+                "name": "rack-a",
+                "revision": 4,
+                "labels": { "team": "a" },
+                "spec": { "nodes": [{ "node": "n1", "priority": 0 }], "restricted": false, "nofailback": true },
+                "status": {}
+            })
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let run = |argv: &'static [&'static str]| {
+            let client = &client;
+            async move {
+                let Cmd::HaGroup { cmd } = Cli::try_parse_from(argv).unwrap().cmd else {
+                    unreachable!()
+                };
+                let mut out = Vec::new();
+                ha_group(client, cmd, false, &mut out).await.unwrap();
+                String::from_utf8(out).unwrap()
+            }
+        };
+        assert_eq!(
+            run(&[
+                "oplctl",
+                "ha-group",
+                "create",
+                "rack-a",
+                "--node",
+                "n1:2",
+                "--node",
+                "n2",
+                "--restricted",
+            ])
+            .await,
+            "HA group rack-a created\n"
+        );
+        assert_eq!(
+            run(&[
+                "oplctl",
+                "ha-group",
+                "set",
+                "rack-a",
+                "--restricted",
+                "true"
+            ])
+            .await,
+            "HA group rack-a updated\n"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].line, "POST /api/v1/ha-groups HTTP/1.1");
+        assert_eq!(
+            seen[0].body,
+            json!({
+                "name": "rack-a",
+                "spec": {
+                    "nodes": [{ "node": "n1", "priority": 2 }, { "node": "n2", "priority": 0 }],
+                    "restricted": true,
+                    "nofailback": false
+                }
+            })
+        );
+        assert_eq!(seen[1].line, "GET /api/v1/ha-groups/rack-a HTTP/1.1");
+        assert_eq!(seen[2].line, "PUT /api/v1/ha-groups/rack-a HTTP/1.1");
+        assert_eq!(seen[2].if_match.as_deref(), Some("4"));
+        assert_eq!(
+            seen[2].body,
+            json!({
+                "labels": { "team": "a" },
+                "spec": { "nodes": [{ "node": "n1", "priority": 0 }], "restricted": true, "nofailback": true }
+            })
+        );
+    }
+
+    #[test]
+    fn ha_group_set_replaces_the_node_list() {
+        let current =
+            json!({ "spec": { "nodes": [{ "node": "n1", "priority": 1 }], "restricted": true } });
+        let Cmd::HaGroup {
+            cmd: HaGroupCmd::Set(args),
+        } = Cli::try_parse_from(["oplctl", "ha-group", "set", "g", "--node", "n2:3"])
+            .unwrap()
+            .cmd
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            ha_group_set_spec(&args, &current),
+            json!({ "nodes": [{ "node": "n2", "priority": 3 }], "restricted": true })
+        );
+        assert_eq!(
+            ha_group_row(&json!({
+                "name": "g",
+                "spec": { "nodes": [{ "node": "n1", "priority": 5 }, { "node": "n2", "priority": 0 }], "restricted": true, "nofailback": false }
+            })),
+            ["g", "n1:5,n2:0", "true", "false"]
+        );
+    }
+
+    /// `placement-rule create`의 인자를 요청 본문으로
+    fn placement_rule_create(args: &[&str]) -> Result<Value, clap::Error> {
+        let mut argv = vec!["oplctl", "placement-rule", "create", "r"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+            Cmd::PlacementRule {
+                cmd: PlacementRuleCmd::Create(c),
+            } => placement_rule_create_body(&c),
+            _ => unreachable!(),
+        })
+    }
+
+    #[test]
+    fn placement_rule_create_builds_the_spec() {
+        assert_eq!(
+            placement_rule_create(&["--kind", "anti-affinity", "--vm", "a", "--vm", "b"]).unwrap(),
+            json!({
+                "name": "r",
+                "spec": { "kind": "anti-affinity", "vms": ["a", "b"], "enabled": true }
+            })
+        );
+        assert_eq!(
+            placement_rule_create(&[
+                "--kind",
+                "soft-node-affinity",
+                "--vm-tag",
+                "app=db",
+                "--node-tag",
+                "zone=rack-a",
+                "--weight",
+                "20",
+                "--disabled",
+            ])
+            .unwrap(),
+            json!({
+                "name": "r",
+                "spec": {
+                    "kind": "soft-node-affinity",
+                    "vm_tag": "app=db",
+                    "node_tag": "zone=rack-a",
+                    "weight": 20,
+                    "enabled": false
+                }
+            })
+        );
+        assert_eq!(
+            placement_rule_create(&[
+                "--kind",
+                "node-affinity",
+                "--vm",
+                "a",
+                "--node",
+                "n1",
+                "--node",
+                "n2",
+                "--ha-may-violate",
+            ])
+            .unwrap()["spec"],
+            json!({
+                "kind": "node-affinity",
+                "vms": ["a"],
+                "nodes": ["n1", "n2"],
+                "ha_may_violate": true,
+                "enabled": true
+            })
+        );
+        // VM 고르기는 둘 중 하나만, 반드시. 노드도 둘 중 하나만. 모르는 종류는 받지 않는다.
+        for bad in [
+            &["--kind", "affinity"][..],
+            &["--kind", "affinity", "--vm", "a", "--vm-tag", "x=y"][..],
+            &[
+                "--kind",
+                "node-affinity",
+                "--vm",
+                "a",
+                "--node",
+                "n1",
+                "--node-tag",
+                "z=a",
+            ][..],
+            &["--kind", "together", "--vm", "a"][..],
+        ] {
+            assert!(placement_rule_create(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn placement_rule_set_changes_only_what_is_given() {
+        let set = |argv: &[&str], current: Value| {
+            let mut full = vec!["oplctl", "placement-rule", "set", "r"];
+            full.extend_from_slice(argv);
+            let Cmd::PlacementRule {
+                cmd: PlacementRuleCmd::Set(args),
+            } = Cli::try_parse_from(full).unwrap().cmd
+            else {
+                unreachable!()
+            };
+            placement_rule_set_spec(&args, &json!({ "spec": current }))
+        };
+        assert!(Cli::try_parse_from(["oplctl", "placement-rule", "set", "r"]).is_err());
+        let soft = json!({
+            "kind": "soft-node-anti-affinity", "vm_tag": "app=db", "nodes": ["n1"],
+            "weight": 10, "enabled": true, "ha_may_violate": false
+        });
+        // 목록을 주면 태그를 빼고, 태그를 주면 목록을 뺀다.
+        assert_eq!(
+            set(&["--vm", "a", "--node-tag", "zone=b"], soft.clone()),
+            json!({
+                "kind": "soft-node-anti-affinity", "vms": ["a"], "node_tag": "zone=b",
+                "weight": 10, "enabled": true, "ha_may_violate": false
+            })
+        );
+        // hard VM끼리 규칙으로 바꾸면 노드와 weight를 뺀다.
+        assert_eq!(
+            set(&["--kind", "anti-affinity"], soft.clone()),
+            json!({ "kind": "anti-affinity", "vm_tag": "app=db", "enabled": true, "ha_may_violate": false })
+        );
+        // soft로 바꾸면 ha_may_violate를 뺀다.
+        assert_eq!(
+            set(&["--kind", "soft-node-affinity", "--weight", "70"], soft),
+            json!({
+                "kind": "soft-node-affinity", "vm_tag": "app=db", "nodes": ["n1"],
+                "weight": 70, "enabled": true
+            })
+        );
+        assert_eq!(
+            placement_rule_row(&json!({
+                "name": "r",
+                "spec": { "kind": "soft-anti-affinity", "vm_tag": "app=web", "nodes": [], "enabled": true }
+            })),
+            ["r", "soft-anti-affinity", "tag:app=web", "-", "50", "true"]
+        );
+        assert_eq!(
+            placement_rule_row(&json!({
+                "name": "r",
+                "spec": { "kind": "node-affinity", "vms": ["a", "b"], "nodes": ["n1"], "enabled": false }
+            })),
+            ["r", "node-affinity", "a,b", "n1", "-", "false"]
+        );
+    }
+
+    /// `placement-rule enable|disable`은 읽은 규칙에서 `enabled`만 바꿔 읽은 revision으로 PUT한다.
+    #[tokio::test]
+    async fn placement_rule_enable_and_disable_put_the_spec() {
+        let (base, seen) = fake_api_bodies(|_| {
+            json!({
+                "name": "r",
+                "revision": 9,
+                "spec": { "kind": "affinity", "vms": ["a", "b"], "enabled": false },
+                "status": {}
+            })
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        for (verb, on) in [("enable", true), ("disable", false)] {
+            seen.lock().unwrap().clear();
+            let Cmd::PlacementRule { cmd } =
+                Cli::try_parse_from(["oplctl", "placement-rule", verb, "r"])
+                    .unwrap()
+                    .cmd
+            else {
+                unreachable!()
+            };
+            let mut out = Vec::new();
+            placement_rule(&client, cmd, false, &mut out).await.unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("placement rule r {verb}d\n")
+            );
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[1].line, "PUT /api/v1/placement-rules/r HTTP/1.1");
+            assert_eq!(seen[1].if_match.as_deref(), Some("9"));
+            assert_eq!(
+                seen[1].body,
+                json!({
+                    "labels": {},
+                    "spec": { "kind": "affinity", "vms": ["a", "b"], "enabled": on }
+                })
+            );
+        }
+    }
+
+    /// `node label`은 레이블을 더하고 바꾸고 지우며 spec은 그대로 둔다.
+    #[tokio::test]
+    async fn node_label_puts_the_labels() {
+        assert!(Cli::try_parse_from(["oplctl", "node", "label", "n1"]).is_err());
+        assert!(Cli::try_parse_from(["oplctl", "node", "label", "n1", "zone"]).is_err());
+        let (base, seen) = fake_api_bodies(|_| {
+            json!({
+                "name": "n1",
+                "revision": 5,
+                "labels": { "zone": "rack-a", "old": "x" },
+                "spec": { "address": "10.0.0.1:7443", "maintenance": false, "witness": false },
+                "status": { "online": true }
+            })
+        })
+        .await;
+        let Cmd::Node {
+            cmd:
+                NodeCmd::Label {
+                    node,
+                    labels,
+                    remove,
+                },
+        } = Cli::try_parse_from([
+            "oplctl",
+            "node",
+            "label",
+            "n1",
+            "zone=rack-b",
+            "tier=gold",
+            "--rm",
+            "old",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            unreachable!()
+        };
+        let client = Client::new(&base, None, None).unwrap();
+        put_node(&client, &node, |n| node_labels_update(n, &labels, &remove))
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[1].line, "PUT /api/v1/nodes/n1 HTTP/1.1");
+        assert_eq!(seen[1].if_match.as_deref(), Some("5"));
+        assert_eq!(
+            seen[1].body,
+            json!({
+                "labels": { "zone": "rack-b", "tier": "gold" },
+                "spec": { "address": "10.0.0.1:7443", "maintenance": false, "witness": false }
+            })
         );
     }
 }

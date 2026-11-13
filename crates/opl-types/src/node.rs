@@ -128,7 +128,11 @@ pub const FEATURES: &[&str] = &[
     "voter-limit",
     "observer",
     "multi-link",
+    HA_PLACEMENT,
 ];
+
+/// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
+pub const HA_PLACEMENT: &str = "ha-placement";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -407,7 +411,8 @@ mod tests {
                 "lease-liveness",
                 "voter-limit",
                 "observer",
-                "multi-link"
+                "multi-link",
+                "ha-placement"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

@@ -454,6 +454,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ha-groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_ha_groups"];
+        put?: never;
+        /**
+         * HA VM이 `ha.group`으로 쓰는 노드 묶음과 우선순위(클수록 먼저). `restricted`면 그룹 밖 노드에 놓지 않고,
+         *     `nofailback`이면 우선 노드가 돌아와도 되돌아가지 않는다. 모든 노드가 `ha-placement`를 알아야 한다.
+         */
+        post: operations["create_ha_group"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ha-groups/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_ha_group"];
+        /** 그룹을 통째로 바꾼다. 이미 놓인 VM은 옮기지 않는다. */
+        put: operations["update_ha_group"];
+        post?: never;
+        /** VM이 쓰고 있으면 409 `group_in_use` */
+        delete: operations["delete_ha_group"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/health": {
         parameters: {
             query?: never;
@@ -655,6 +693,45 @@ export interface paths {
          */
         post: operations["upgrade_node"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/placement-rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_placement_rules"];
+        put?: never;
+        /**
+         * VM끼리(`affinity`·`anti-affinity`와 `soft-` 형태) 또는 VM과 노드(`node-affinity`·`node-anti-affinity`와
+         *     `soft-` 형태) 배치 규칙. VM은 이름(`vms`)이나 레이블(`vm_tag`), 노드는 이름(`nodes`)이나 노드 레이블
+         *     (`node_tag`, 예: `zone=rack-a`)로 고른다. 켜진 hard 규칙끼리 모순이면 422 `rule_conflict`. 이미 놓인 VM은
+         *     옮기지 않는다. 모든 노드가 `ha-placement`를 알아야 한다.
+         */
+        post: operations["create_placement_rule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/placement-rules/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_placement_rule"];
+        /** 규칙을 통째로 바꾼다(`enabled`로 켜고 끈다). */
+        put: operations["update_placement_rule"];
+        post?: never;
+        delete: operations["delete_placement_rule"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1964,6 +2041,21 @@ export interface components {
                 vms: components["schemas"]["VmSelector"];
             };
         };
+        CreateRequest_HaGroupSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @description HA 그룹: HA VM을 복구할 노드와 그 우선순위. VM은 `ha.group`으로 그룹을 쓴다. */
+            spec: {
+                /** @description 그룹 노드. 우선순위가 큰 노드에 먼저 놓는다. */
+                nodes: components["schemas"]["HaGroupNode"][];
+                /** @description 켜면 우선순위가 더 높은 노드가 돌아와도 되돌아가지 않는다. */
+                nofailback?: boolean;
+                /** @description 켜면 그룹 밖 노드에는 놓지 않는다(놓을 곳이 없으면 켜지 않는다). */
+                restricted?: boolean;
+            };
+        };
         CreateRequest_NetworkSpec: {
             labels?: {
                 [key: string]: string;
@@ -1985,6 +2077,45 @@ export interface components {
                 vlan?: number | null;
                 /** @description orbivisord가 모든 노드에 브리지 `oplv<vni>`와 VXLAN 장치 `oplx<vni>`를 만드는 네트워크 */
                 vxlan?: components["schemas"]["Vxlan"];
+            };
+        };
+        CreateRequest_PlacementRuleSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * @description 배치 규칙: VM끼리(같은 노드·다른 노드) 또는 VM과 노드(이 노드들 중·이 노드들은 안 됨). hard 규칙은
+             *     조건이고 soft 규칙은 벌점(`weight`)이다. 모든 VM에 적용한다.
+             */
+            spec: {
+                /**
+                 * @description 끄면 없는 것으로 본다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /** @description hard 규칙만: HA 복구가 지킬 수 없으면 어기고 켠다. */
+                ha_may_violate?: boolean;
+                kind: components["schemas"]["RuleKind"];
+                /**
+                 * @description 이 레이블(`key=value`, 예: `zone=rack-a`)을 가진 노드들
+                 * @example zone=rack-a
+                 */
+                node_tag?: string;
+                /** @description VM과 노드 규칙의 노드 이름. `node_tag`와 둘 중 하나만. */
+                nodes?: string[];
+                /**
+                 * @description 이 레이블(`key=value`)을 가진 VM들
+                 * @example app=web
+                 */
+                vm_tag?: string;
+                /** @description 규칙의 VM 이름(아직 없는 VM이어도 된다). `vm_tag`와 둘 중 하나만. */
+                vms?: string[];
+                /**
+                 * Format: int32
+                 * @description soft 규칙의 벌점 1~100. 없으면 50.
+                 */
+                weight?: number;
             };
         };
         CreateRequest_SecurityGroupSpec: {
@@ -2195,6 +2326,26 @@ export interface components {
             group: string;
             role: components["schemas"]["Role"];
         };
+        /** @description HA 그룹의 노드 하나 */
+        HaGroupNode: {
+            /** @description 노드 이름 */
+            node: string;
+            /**
+             * Format: int32
+             * @description 0~1000, 클수록 먼저
+             */
+            priority?: number;
+        };
+        /** @description HA 그룹: HA VM을 복구할 노드와 그 우선순위. VM은 `ha.group`으로 그룹을 쓴다. */
+        HaGroupSpec: {
+            /** @description 그룹 노드. 우선순위가 큰 노드에 먼저 놓는다. */
+            nodes: components["schemas"]["HaGroupNode"][];
+            /** @description 켜면 우선순위가 더 높은 노드가 돌아와도 되돌아가지 않는다. */
+            nofailback?: boolean;
+            /** @description 켜면 그룹 밖 노드에는 놓지 않는다(놓을 곳이 없으면 켜지 않는다). */
+            restricted?: boolean;
+        };
+        HaGroupStatus: Record<string, never>;
         /** @description API 문서의 `ha` 모양: 옛 bool이나 정책 객체. 읽고 쓰기는 `VmSpec.ha`의 손으로 쓴 serde가 한다. */
         HaSetting: boolean | components["schemas"]["VmHa"];
         /**
@@ -2644,6 +2795,34 @@ export interface components {
             revision: number;
         };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_HaGroupSpec_HaGroupStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description HA 그룹: HA VM을 복구할 노드와 그 우선순위. VM은 `ha.group`으로 그룹을 쓴다. */
+                spec: {
+                    /** @description 그룹 노드. 우선순위가 큰 노드에 먼저 놓는다. */
+                    nodes: components["schemas"]["HaGroupNode"][];
+                    /** @description 켜면 우선순위가 더 높은 노드가 돌아와도 되돌아가지 않는다. */
+                    nofailback?: boolean;
+                    /** @description 켜면 그룹 밖 노드에는 놓지 않는다(놓을 곳이 없으면 켜지 않는다). */
+                    restricted?: boolean;
+                };
+                status: Record<string, never>;
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_Resource_NetworkSpec_NetworkStatus: {
             items: {
                 /** Format: uuid */
@@ -2770,6 +2949,58 @@ export interface components {
                     /** @description 이 노드에서 도는 orbivisord의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
                     version?: string;
                 };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_PlacementRuleSpec_PlacementRuleStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /**
+                 * @description 배치 규칙: VM끼리(같은 노드·다른 노드) 또는 VM과 노드(이 노드들 중·이 노드들은 안 됨). hard 규칙은
+                 *     조건이고 soft 규칙은 벌점(`weight`)이다. 모든 VM에 적용한다.
+                 */
+                spec: {
+                    /**
+                     * @description 끄면 없는 것으로 본다.
+                     * @default true
+                     */
+                    enabled: boolean;
+                    /** @description hard 규칙만: HA 복구가 지킬 수 없으면 어기고 켠다. */
+                    ha_may_violate?: boolean;
+                    kind: components["schemas"]["RuleKind"];
+                    /**
+                     * @description 이 레이블(`key=value`, 예: `zone=rack-a`)을 가진 노드들
+                     * @example zone=rack-a
+                     */
+                    node_tag?: string;
+                    /** @description VM과 노드 규칙의 노드 이름. `node_tag`와 둘 중 하나만. */
+                    nodes?: string[];
+                    /**
+                     * @description 이 레이블(`key=value`)을 가진 VM들
+                     * @example app=web
+                     */
+                    vm_tag?: string;
+                    /** @description 규칙의 VM 이름(아직 없는 VM이어도 된다). `vm_tag`와 둘 중 하나만. */
+                    vms?: string[];
+                    /**
+                     * Format: int32
+                     * @description soft 규칙의 벌점 1~100. 없으면 50.
+                     */
+                    weight?: number;
+                };
+                status: Record<string, never>;
             }[];
             /** Format: int64 */
             revision: number;
@@ -3434,6 +3665,40 @@ export interface components {
             current?: string | null;
             name: string;
         };
+        /**
+         * @description 배치 규칙: VM끼리(같은 노드·다른 노드) 또는 VM과 노드(이 노드들 중·이 노드들은 안 됨). hard 규칙은
+         *     조건이고 soft 규칙은 벌점(`weight`)이다. 모든 VM에 적용한다.
+         */
+        PlacementRuleSpec: {
+            /**
+             * @description 끄면 없는 것으로 본다.
+             * @default true
+             */
+            enabled: boolean;
+            /** @description hard 규칙만: HA 복구가 지킬 수 없으면 어기고 켠다. */
+            ha_may_violate?: boolean;
+            kind: components["schemas"]["RuleKind"];
+            /**
+             * @description 이 레이블(`key=value`, 예: `zone=rack-a`)을 가진 노드들
+             * @example zone=rack-a
+             */
+            node_tag?: string;
+            /** @description VM과 노드 규칙의 노드 이름. `node_tag`와 둘 중 하나만. */
+            nodes?: string[];
+            /**
+             * @description 이 레이블(`key=value`)을 가진 VM들
+             * @example app=web
+             */
+            vm_tag?: string;
+            /** @description 규칙의 VM 이름(아직 없는 VM이어도 된다). `vm_tag`와 둘 중 하나만. */
+            vms?: string[];
+            /**
+             * Format: int32
+             * @description soft 규칙의 벌점 1~100. 없으면 50.
+             */
+            weight?: number;
+        };
+        PlacementRuleStatus: Record<string, never>;
         PoolBackend: {
             /** @enum {string} */
             kind: "dir";
@@ -3890,6 +4155,30 @@ export interface components {
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_HaGroupSpec_HaGroupStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description HA 그룹: HA VM을 복구할 노드와 그 우선순위. VM은 `ha.group`으로 그룹을 쓴다. */
+            spec: {
+                /** @description 그룹 노드. 우선순위가 큰 노드에 먼저 놓는다. */
+                nodes: components["schemas"]["HaGroupNode"][];
+                /** @description 켜면 우선순위가 더 높은 노드가 돌아와도 되돌아가지 않는다. */
+                nofailback?: boolean;
+                /** @description 켜면 그룹 밖 노드에는 놓지 않는다(놓을 곳이 없으면 켜지 않는다). */
+                restricted?: boolean;
+            };
+            status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_NetworkSpec_NetworkStatus: {
             /** Format: uuid */
             id: string;
@@ -4011,6 +4300,54 @@ export interface components {
                 /** @description 이 노드에서 도는 orbivisord의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
                 version?: string;
             };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_PlacementRuleSpec_PlacementRuleStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /**
+             * @description 배치 규칙: VM끼리(같은 노드·다른 노드) 또는 VM과 노드(이 노드들 중·이 노드들은 안 됨). hard 규칙은
+             *     조건이고 soft 규칙은 벌점(`weight`)이다. 모든 VM에 적용한다.
+             */
+            spec: {
+                /**
+                 * @description 끄면 없는 것으로 본다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /** @description hard 규칙만: HA 복구가 지킬 수 없으면 어기고 켠다. */
+                ha_may_violate?: boolean;
+                kind: components["schemas"]["RuleKind"];
+                /**
+                 * @description 이 레이블(`key=value`, 예: `zone=rack-a`)을 가진 노드들
+                 * @example zone=rack-a
+                 */
+                node_tag?: string;
+                /** @description VM과 노드 규칙의 노드 이름. `node_tag`와 둘 중 하나만. */
+                nodes?: string[];
+                /**
+                 * @description 이 레이블(`key=value`)을 가진 VM들
+                 * @example app=web
+                 */
+                vm_tag?: string;
+                /** @description 규칙의 VM 이름(아직 없는 VM이어도 된다). `vm_tag`와 둘 중 하나만. */
+                vms?: string[];
+                /**
+                 * Format: int32
+                 * @description soft 규칙의 벌점 1~100. 없으면 50.
+                 */
+                weight?: number;
+            };
+            status: Record<string, never>;
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_SecurityGroupSpec_SecurityGroupStatus: {
@@ -4386,6 +4723,11 @@ export interface components {
              */
             remote?: string;
         };
+        /**
+         * @description 배치 규칙의 종류
+         * @enum {string}
+         */
+        RuleKind: "affinity" | "anti-affinity" | "soft-affinity" | "soft-anti-affinity" | "node-affinity" | "node-anti-affinity" | "soft-node-affinity" | "soft-node-anti-affinity";
         /**
          * @description 마지막 실행기 확인에서 `core`·`api`가 제때 답했는지(`work`만 늦으면 `ok`)
          * @enum {string}
@@ -4835,6 +5177,20 @@ export interface components {
             /** Format: uuid */
             user: string;
         };
+        UpdateRequest_HaGroupSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            /** @description HA 그룹: HA VM을 복구할 노드와 그 우선순위. VM은 `ha.group`으로 그룹을 쓴다. */
+            spec: {
+                /** @description 그룹 노드. 우선순위가 큰 노드에 먼저 놓는다. */
+                nodes: components["schemas"]["HaGroupNode"][];
+                /** @description 켜면 우선순위가 더 높은 노드가 돌아와도 되돌아가지 않는다. */
+                nofailback?: boolean;
+                /** @description 켜면 그룹 밖 노드에는 놓지 않는다(놓을 곳이 없으면 켜지 않는다). */
+                restricted?: boolean;
+            };
+        };
         UpdateRequest_NodeSpec: {
             labels?: {
                 [key: string]: string;
@@ -4851,6 +5207,44 @@ export interface components {
                 roles?: components["schemas"]["NodeRole"][];
                 /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
                 witness?: boolean;
+            };
+        };
+        UpdateRequest_PlacementRuleSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            /**
+             * @description 배치 규칙: VM끼리(같은 노드·다른 노드) 또는 VM과 노드(이 노드들 중·이 노드들은 안 됨). hard 규칙은
+             *     조건이고 soft 규칙은 벌점(`weight`)이다. 모든 VM에 적용한다.
+             */
+            spec: {
+                /**
+                 * @description 끄면 없는 것으로 본다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /** @description hard 규칙만: HA 복구가 지킬 수 없으면 어기고 켠다. */
+                ha_may_violate?: boolean;
+                kind: components["schemas"]["RuleKind"];
+                /**
+                 * @description 이 레이블(`key=value`, 예: `zone=rack-a`)을 가진 노드들
+                 * @example zone=rack-a
+                 */
+                node_tag?: string;
+                /** @description VM과 노드 규칙의 노드 이름. `node_tag`와 둘 중 하나만. */
+                nodes?: string[];
+                /**
+                 * @description 이 레이블(`key=value`)을 가진 VM들
+                 * @example app=web
+                 */
+                vm_tag?: string;
+                /** @description 규칙의 VM 이름(아직 없는 VM이어도 된다). `vm_tag`와 둘 중 하나만. */
+                vms?: string[];
+                /**
+                 * Format: int32
+                 * @description soft 규칙의 벌점 1~100. 없으면 50.
+                 */
+                weight?: number;
             };
         };
         UpdateRequest_VmSpec: {
@@ -5968,6 +6362,161 @@ export interface operations {
             };
         };
     };
+    list_ha_groups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_HaGroupSpec_HaGroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_ha_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRequest_HaGroupSpec"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_HaGroupSpec_HaGroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_ha_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_HaGroupSpec_HaGroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_ha_group: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRequest_HaGroupSpec"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_HaGroupSpec_HaGroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_ha_group: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_health: {
         parameters: {
             query?: {
@@ -6391,6 +6940,161 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_placement_rules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_PlacementRuleSpec_PlacementRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_placement_rule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRequest_PlacementRuleSpec"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_PlacementRuleSpec_PlacementRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_placement_rule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_PlacementRuleSpec_PlacementRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_placement_rule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRequest_PlacementRuleSpec"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_PlacementRuleSpec_PlacementRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_placement_rule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {

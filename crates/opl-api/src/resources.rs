@@ -11,6 +11,7 @@ use opl_cluster::{Cluster, ClusterError, Typed};
 use opl_types::backup_job::{BackupJobSpec, BackupJobStatus};
 use opl_types::network::{Network, NetworkSpec, NetworkStatus, USER_NETWORK};
 use opl_types::node::{Node, NodeRole, NodeSpec, NodeStatus};
+use opl_types::placement::{HaGroupSpec, HaGroupStatus, PlacementRuleSpec, PlacementRuleStatus};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::security_group::{SecurityGroupSpec, SecurityGroupStatus};
 use opl_types::storage::{
@@ -205,6 +206,24 @@ list_and_get!(
     "/vm-imports",
     "/vm-imports/{key}",
     "vm-imports"
+);
+list_and_get!(
+    list_ha_groups,
+    get_ha_group,
+    HaGroupSpec,
+    HaGroupStatus,
+    "/ha-groups",
+    "/ha-groups/{key}",
+    "ha"
+);
+list_and_get!(
+    list_placement_rules,
+    get_placement_rule,
+    PlacementRuleSpec,
+    PlacementRuleStatus,
+    "/placement-rules",
+    "/placement-rules/{key}",
+    "ha"
 );
 list_and_get!(
     list_tasks,

@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::network::USER_NETWORK;
-use opl_types::node::{Node, NodeSpec, ha_capable};
+use opl_types::node::{HA_PLACEMENT, Node, NodeSpec, ha_capable};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
 use opl_types::storage::VolumePhase;
@@ -77,7 +77,14 @@ pub(crate) fn prepare(state: &AppState, id: Uuid, spec: &mut VmSpec) -> Result<(
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     // 기본과 다른 HA 정책은 객체로 저장되어 옛 노드가 VM을 읽지 못한다.
     if spec.ha.as_ref().is_some_and(|ha| *ha != VmHa::default()) {
-        require_feature(&state.cluster, "ha-placement")?;
+        require_feature(&state.cluster, HA_PLACEMENT)?;
+    }
+    if let Some(group) = spec.ha.as_ref().and_then(|ha| ha.group.as_ref())
+        && !inv.groups.iter().any(|g| &g.name == group)
+    {
+        return Err(ApiError::bad_request(format!(
+            "HA group {group:?} not found"
+        )));
     }
 
     for nic in spec.nics.iter().filter(|n| n.network != USER_NETWORK) {

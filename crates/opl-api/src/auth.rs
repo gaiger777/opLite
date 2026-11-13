@@ -610,6 +610,10 @@ mod tests {
         assert!(a.check(&op, Action::Write, Kind::VmImport));
         assert!(!a.check(&op, Action::Write, Kind::StoragePool));
         assert!(!a.check(&op, Action::Write, Kind::Node));
+        assert!(a.check(&op, Action::Read, Kind::HaGroup));
+        assert!(!a.check(&op, Action::Write, Kind::HaGroup));
+        assert!(!a.check(&op, Action::Write, Kind::PlacementRule));
+        assert!(a.check(&viewer, Action::Read, Kind::PlacementRule));
         assert!(!a.check(&op, Action::Read, Kind::ApiToken));
         assert!(!a.check(&op, Action::Read, Kind::Realm));
         assert!(!a.check(&op, Action::Write, Kind::Realm));

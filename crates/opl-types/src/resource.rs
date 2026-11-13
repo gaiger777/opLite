@@ -56,6 +56,8 @@ pub enum Kind {
     Remote,
     Session,
     VipHolder,
+    HaGroup,
+    PlacementRule,
 }
 
 impl Kind {
@@ -81,6 +83,8 @@ impl Kind {
             Kind::Remote => "remote",
             Kind::Session => "session",
             Kind::VipHolder => "vip-holder",
+            Kind::HaGroup => "ha-group",
+            Kind::PlacementRule => "placement-rule",
         }
     }
 }
@@ -162,6 +166,8 @@ mod tests {
             Kind::Remote,
             Kind::Session,
             Kind::VipHolder,
+            Kind::HaGroup,
+            Kind::PlacementRule,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }

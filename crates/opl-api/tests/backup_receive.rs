@@ -13,7 +13,7 @@ use opl_types::backup::{
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
 use opl_types::storage::{PoolBackend, StoragePoolSpec};
-use opl_types::vm::VmSpec;
+use opl_types::vm::{VmHa, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -739,6 +739,29 @@ async fn receive_waits_for_every_node_to_run_this_build() {
         StatusCode::CONFLICT,
         "cluster_upgrading",
     );
+}
+
+/// 원본 VM의 HA 정책 객체는 그대로 받는다. `ha-placement`를 모르는 노드가 있으면 옛 노드가 풀 수 있게 HA는
+/// 켠 채 정책 세부를 버린다(`true`).
+#[tokio::test]
+async fn an_ha_policy_object_is_kept_only_when_every_node_knows_it() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let policy = json!({ "state": "stopped", "group": "g", "max_restart": 3 });
+    let with_policy = || {
+        let mut m = manifest();
+        m["vm_spec"]["ha"] = policy.clone();
+        m
+    };
+    let id = receive_ok(&admin, receive_body(&with_policy())).await;
+    let ha = get_backup(&env, id).unwrap().spec.vm_spec.ha;
+    assert_eq!(serde_json::to_value(ha).unwrap()["group"], "g");
+    // 기능을 모르는(옛) 노드
+    other_node(&env, "old").await;
+    let id = receive_ok(&admin, receive_body(&with_policy())).await;
+    let ha = get_backup(&env, id).unwrap().spec.vm_spec.ha;
+    assert_eq!(ha, Some(VmHa::default()));
 }
 
 /// 받기 요청 `body`로 받기를 시작해 파일을 모두 보내고 완료한 `ready` 사본의 id
