@@ -42594,3 +42594,40 @@ git commit -m "feat(web): HA 검사 화면, 노드 상태 검사 열·네트워�
 - 노드 장애를 복구하는 동안은 검사 대응을 하지 않는다.
 - 공유 디렉터리 풀의 마운트가 사라지면 probe가 루트 파일시스템에 써서 통과한다.
 - 리스 갱신이 커져 계획 47 규모 시험 표를 다시 잴 것.
+
+## 실행 후 기록 (2026-11-14)
+
+- **Task 1~7:** `feat/plan52-ha-checks`에서 스크립트로 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았고(생성 파일 포함), 일곱 Task를 마친 트리는 리뷰·검증을 거친 트리와 같다.
+- **1차 리뷰에서 고친 것:**
+  - 본 적 없는 인터페이스·없는 `ping`/`rados`가 `failing`이던 것 → `unknown`(본 뒤 사라진 인터페이스만 `failing`), 패키지 `Depends`에 `iputils-ping`.
+  - LACP 상대가 없는 802.3ad 본딩이 `failing`이던 것 → 링크가 있으면 `degraded`. RBD는 `error stat-ing … (2)` 줄만 통과.
+  - 흔들리는 본딩의 Task·감사 쏟아짐 → 세 회차 이어져야 보고, 본딩마다 10분에 한 번.
+  - 뒤 버전의 `CheckState`·`InterfaceKind` 값 → `#[serde(other)]`.
+  - `restart_elsewhere`: 받을 노드를 먼저 고름, 20초 넘김 전에 이유를 다시 봄(아니면 요청을 지움), 강제 끄기 뒤 디스크 볼륨 끄기, `evict` VM의 되돌아가기 건너뛰기·사용자 마이그레이션 409 `vm_busy`, 노드마다 한 번의 넘김. grace 최솟값 10초.
+- **2차 리뷰에서 고친 것:**
+  - **치명:** NFS·공유 dir 풀에서 SIGKILL 뒤 이 노드 커널에 남은 쓰기가 다른 노드에서 켠 VM의 이미지를 덮을 수 있던 것 → 파일 볼륨 `fsync`(5초, 끝나지 않으면 `relocate_from`을 쓰지 않아 20초 넘김의 전원 끄기로).
+  - 브리지 링크는 업링크 포트로, 핑 `via`도 본 적 없으면 `unknown`, 본 인터페이스를 저장된 노드 상태로 시작, opld 재시작 뒤 새 작업자도 디스크를 끔, 본딩 `degraded → down`은 늘 알리고 회복은 알린 뒤에만.
+  - 넘긴 요청도 틱마다 이유를 다시 봄(대응이 바뀌거나 기능이 모자라면 지움), 노드마다 한 번의 넘김을 틱 사이에도, 받을 노드가 없는 틱은 기록 Task 없음, 검사가 끝나면 `max_relocate`의 `ha.error`를 지움, 그 밖 NVMe `live`·PV 링크·핑 2회·`BondState`/`PortState`의 `Unknown`.
+- **검증 중 고친 것(시험만):**
+  - svc01에서 `member::tests::a_restart_with_new_links_signs_the_node_cert_again`이 20번 중 2번 "Database already open"으로 실패 → 다시 시작할 때 opl-cluster 시험처럼 5초까지 다시 연다(openraft `shutdown`이 상태 머신 태스크를 기다리지 않음). 고친 뒤 svc01 10번 통과.
+  - svc01에서 `a_disk_flush_that_does_not_finish_is_not_started_again`이 짧은 재시도 간격 때문에 시간 초과 오류를 놓쳐 실패 → "still flushing"도 받음(시간 초과 뒤에만 남). 고친 뒤 svc01 20번 통과.
+  - `name-test`가 `build-deb-test.sh`의 바뀐 출력 문구(`Replaces oplite, …`)를 허용 목록 밖으로 봄 → 문구를 허용 규칙에 맞게.
+- **GitHub 프로브:** 첫 실행에서 linux-kvm이 `zfs_storage` 스냅샷 시험(만든 zvol에 곧바로 쓰기)과 다음 실행에서 opld `snapshots`의 실행 중 VM 스냅샷 복제(545초, 부하)로 실패했다. 둘 다 이 계획이 건드리지 않은 경로이고 따로·다시 돌리면 통과해, 마지막 전체 실행(`--no-fail-fast`)에서 linux-kvm·ldap·package가 모두 통과했다(`host_check` 포함).
+- **검증 위치:** 일반 시험은 svc01, 시스템을 바꾸는 작업은 GitHub 프로브, macOS·웹·셸·cargo-deny·`ha-it`(9개)은 이 Mac.
+- **svc01 규모 시험(노드 100, 배포 빌드와 겹쳐 돎):** 묶기 비율 0.38, 쓰기 p99 11.6 ms, 관찰 노드 지연 p99 6.8 ms, 관찰 노드 다시 붙기 0.61초, 새 리더 3.2초.
+- **테스트 VM 배포(svc01·svc02):** svc02 → svc01 순서. 유닛은 바뀌지 않아 그대로, 두 노드 모두 `ping` 있음. 두 노드 모두 `ha-checks` 기능, `status.interfaces`(`enp0s1`, `vmbr0`, 본딩 없음), 자동 `cluster-link-1` `ok`, `node list`의 `CHECKS` 열 `ok`. 경고만 하는 검사 `p52u-warn`(`enp0s1` 링크)을 만들어 15초 뒤 두 노드에서 `ok`를 보고 지웠다. test-vm QEMU PID 그대로, 헬스 `ok`, 저널에 ERROR·panic 없음, 웹은 새 빌드. 배포한 바이너리는 위 "시험만" 고침 전 트리로 빌드했다(제품 코드는 같음).
+
+**테스트:**
+- macOS `cargo test --workspace` 2232개(스테이지별 2141·2150·2172·2196·2212·2232·2232), 웹 시험 625개와 typecheck·lint, 패키징 셸 시험, `cargo-deny`, `ha-it` 9개(저장소 검사 실패 → 다른 노드에서 켜기 약 17초)
+- svc01(Linux) `fmt`·`clippy -D warnings`(모든 기능)·`cargo test --workspace`·starve·규모 시험 노드 100·storage-it
+
+GitHub 프로브에서 linux-kvm·ldap·package 작업.
+
+## 다음 계획으로 넘길 사항
+
+- 실제 본딩 포트 뽑기·LACP 어긋남·NFS 서버 멈춤·multipath 경로 끊기·NVMe·브리지 업링크 판정은 손으로 확인하지 않았다(설계 §19 "손으로 확인할 것").
+- `restart_elsewhere`에 동시 요청 상한이 없다. 노드 장애를 복구하는 동안은 검사 대응을 하지 않는다.
+- 리스 갱신에 검사 결과가 실려 커진 크기로 계획 47 규모 시험 표를 다시 잴 것.
+- 테스트 VM은 링크가 하나라 `cluster-link` 자동 검사 하나만 있다.
+- 계획 53 균형 조정기가 `Health::blocks`를 대상 조건으로 쓴다.
+- 다음: 계획 53(최적 배치와 균형 조정기).
