@@ -54,7 +54,7 @@ const MIGRATE_RETRY: Duration = Duration::from_secs(60);
 pub(crate) const EVICT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 한 틱의 검사 상태: 켜진 `HaCheck`와 노드마다 마지막 리스 갱신에 실린 결과
-pub(crate) struct Health<'a> {
+pub struct Health<'a> {
     term: u64,
     checks: Vec<HaCheck>,
     reports: &'a BTreeMap<NodeId, Vec<CheckReport>>,
@@ -76,6 +76,19 @@ impl<'a> Health<'a> {
             checks,
             reports: &leases.checks,
         })
+    }
+
+    /// 시험용: 켜진 검사와 노드별 보고로 만든다.
+    #[cfg(test)]
+    pub(crate) fn new(
+        checks: Vec<HaCheck>,
+        reports: &'a BTreeMap<NodeId, Vec<CheckReport>>,
+    ) -> Self {
+        Self {
+            term: 0,
+            checks,
+            reports,
+        }
     }
 
     /// 노드 `node`가 마지막 갱신에 보낸 검사 `check`의 결과

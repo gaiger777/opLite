@@ -9,6 +9,7 @@ pub mod auth;
 mod backup_jobs;
 mod backup_receive;
 mod backups;
+pub mod balance;
 pub mod cluster;
 mod console;
 mod drain;

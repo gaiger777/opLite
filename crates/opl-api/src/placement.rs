@@ -181,6 +181,16 @@ pub fn soft_violations(vm: &Vm, node: &Node, inv: &Inventory, assign: &Assign) -
     soft(vm, node, inv, assign).1
 }
 
+/// VM을 이 노드에 둘 때의 soft 벌점 합([`Candidate::penalty`])
+pub fn soft_penalty(vm: &Vm, node: &Node, inv: &Inventory, assign: &Assign) -> u32 {
+    soft(vm, node, inv, assign).0
+}
+
+/// HA 그룹에서 이 노드의 우선순위([`Candidate::priority`])
+pub fn priority(vm: &Vm, node: &Node, inv: &Inventory) -> Option<u32> {
+    group(vm, inv).and_then(|g| g.spec.priority(&node.name))
+}
+
 /// soft 벌점의 합과 벌점이 생긴 규칙 이름
 fn soft(vm: &Vm, node: &Node, inv: &Inventory, assign: &Assign) -> (u32, Vec<String>) {
     let mut total = 0;
