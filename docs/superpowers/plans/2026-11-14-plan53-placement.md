@@ -47568,3 +47568,40 @@ git commit -m "feat(web): 최적 배치 화면, VM 고정 스위치, 감사의 p
 - 끝난 Task가 지워지면 1시간 규칙은 리더 메모리와 HA 옮기기 기록으로만 지킨다. 마이그레이션이 끝난 때는 Task를 만든 때로 센다.
 - 비우기는 옮기는 VM 자신의 CPU를 세지 않는다. 사용 메모리는 호스트 전체라 ZFS ARC가 큰 노드는 뜨겁게 보일 수 있다.
 - 동시 마이그레이션 2개는 부드러운 상한이다. 리더가 아닌 노드에 보낸 적용은 거절된다.
+
+## 실행 후 기록 (2026-11-14)
+
+- **Task 1~7:** `feat/plan53-placement`에서 스크립트로 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았고(생성 파일 포함), 일곱 Task를 마친 트리는 리뷰·검증을 거친 트리와 같다.
+- **1차 리뷰에서 고친 것:**
+  - 여러 VM을 놓을 때 앞 VM의 CPU도 대상에 셈, 어떤 후보에도 요약이 없으면 예전 순서(미할당 메모리, `pack` 제외), 위트니스는 부하 표에서 뺌.
+  - 팔로어는 고를 노드가 있을 때만 리더에 묻고 리더 상태를 1초 캐시, 읽기 실패 뒤 5초 쉼.
+  - 스냅샷 되돌리기가 `pinned`를 지킴, 적용 때 다시 봄(409 `placement_busy`·`recommendation_stale`).
+  - 히스테리시스(문턱을 넘으면 0.8×문턱까지), 차이 규칙, 뜨거운 노드(평균 + 2×문턱), 받는 노드 `settle` 90초, 쿨다운에 HA 옮기기 포함, HA 되돌아가기를 기다리는 동안 쉼, 진행 중 마이그레이션을 모델에 셈.
+  - 감사는 시작한 옮기기만, 설정 리비전이 바뀌면 게시판을 비움, 규칙 바로잡기 대상은 살아 있는 노드만. CLI ID는 끝 12자(UUIDv7의 앞부분은 한 회차에서 같음).
+- **2차 리뷰에서 고친 것:**
+  - 재시작 직후 등의 빈 요약이 "요약 있음"으로 쳐져 예전 순서로 돌아가는 규칙을 끄던 것 → 노드가 보내지 않고 리더도 요약 없음으로 봄(VM 부하는 씀).
+  - HA 되돌아가기 기다림이 영원히 쉴 수 있던 것 → HA 되돌아가기와 같은 조건(메모리·HA 검사·HVF·`evict`·affinity 상대)일 때만, 더 우선인 노드가 살아 있음을 본 지 10분까지.
+  - 막 끝난 마이그레이션의 CPU로 생기는 핑퐁 → 5분 안에 마이그레이션이 끝난 노드를 균형 옮기기의 원본·대상에서 뺌.
+  - VM 부하는 5분까지 씀, 리더의 적용도 쉼·받는 노드 살아 있음을 보고 뮤텍스로 하나씩, 팔로어의 적용은 409(리더 이름), 복원·복제·가져오기는 기능이 모자라면 `placement`를 버림(복제는 고정을 따름), 임기가 바뀌면 살아 있음을 다시 셈, 감사에 이유, 배치 설정이 바뀔 때만 게시판을 비움.
+- **검증 중 고친 것:**
+  - svc01의 새 clippy(`for_unbounded_range`)가 규모 시험의 `for round in 0u64..`를 잡음 → `0..=u64::MAX`(Task 2).
+  - svc01에서 `changing_the_settings_clears_the_recommendations`가 첫 실행(10초 뒤)을 시험 대기 상한(10초) 안에 보지 못함 → 이 시험만 20초까지 기다림(`status_within`, Task 6).
+- **이 계획과 상관없는 흔들림:** opl-driver `picks_first_port_that_is_free`(svc01 한 번)와 opld `cluster` 시험의 `Address already in use`(이 Mac, 스테이지 2·6 — 계획 50·51 검증에도 있었음). `free_port`가 고른 포트를 나중에 열기 때문이다. 다시 돌리면 통과했다.
+- **GitHub 프로브:** linux-kvm(`--no-fail-fast`)·ldap·package가 첫 실행에 모두 통과했다.
+- **검증 위치:** 일반 시험은 svc01, 시스템을 바꾸는 작업은 GitHub 프로브, macOS·웹·셸·cargo-deny·`ha-it`(9개)·`migration-it`(6개, 균형 조정기의 규칙 바로잡기 포함)은 이 Mac.
+- **svc01 규모 시험(노드 100):** 모든 노드의 요약이 5.3초 안에 리더에 닿음. 리더 RPC/s 요약 없음 239 → 있음 237, 전달 바이트/s 3.3 → 21.6 KB, 프로세스 CPU 0.17 → 0.18 s/s, 새 리더 3.2초.
+- **테스트 VM 배포(svc01·svc02):** svc02 → svc01 순서. 유닛은 바뀌지 않아 그대로. 두 노드 모두 `placement`·`ha-checks` 기능. `placement status`가 리더(svc02)와 RPC로 읽는 svc01에서 같게 `mode: recommend  policy: balance  threshold: 15%`, 불균형 1.2%, 두 노드의 CPU1·CPU5·사용 메모리와 요약 나이 4초를 보임. 첫 균형 조정 회차가 리더가 된 뒤 돌아 `0 moves`, 추천 없음. 설정·모드는 바꾸지 않았다. test-vm QEMU PID 그대로·spec에 `placement` 없음, 헬스 `ok`, 저널에 panic 없음(svc01 재시작 순간의 openraft 리더 확인 시간 초과 ERROR 한 줄뿐), 웹은 새 빌드이고 `/placement` 경로가 열림.
+
+**테스트:**
+- macOS `cargo test --workspace` 2321개(스테이지별 2237·2241·2258·2280·2299·2321·2321), 웹 시험 642개와 typecheck·lint, 패키징 셸 시험, `cargo-deny`, `ha-it` 9개, `migration-it` 6개
+- svc01(Linux) `fmt`·`clippy -D warnings`(모든 기능)·`cargo test --workspace` 2383개·starve·규모 시험 노드 100·storage-it
+
+GitHub 프로브에서 linux-kvm·ldap·package 작업.
+
+## 다음 계획으로 넘길 사항
+
+- 실제 다중 노드 부하로 문턱·효과 상수(`MIN_GAIN`·`MIN_GAIN_PER_GIB`)와 `SOURCE_NODES`·`TARGET_NODES`를 다시 볼 것(테스트 VM은 노드 둘·VM 하나라 불균형이 작다).
+- affinity 묶음 옮기기, `pack`일 때 넘치는 노드 덜기, 네트워크·디스크 I/O 부하는 남았다.
+- 마이그레이션이 끝난 때를 Task에 적지 않아 만든 때로 센다. 리더가 아닌 노드의 적용은 리더로 넘기지 않는다.
+- 시험의 `free_port` 포트 경합(opld `cluster`·opl-driver)을 고칠 것.
+- 다음: 계획 54(VM 무중단 유형 변경).
