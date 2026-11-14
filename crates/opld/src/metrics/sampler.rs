@@ -245,6 +245,12 @@ impl Sampler {
         self.sample_node(started, t);
         self.sample_vms(started).await;
         self.store.prune(t);
+        // 리스 갱신이 리더에 실어 보낼 부하 요약(설계 §8.3). 위트니스도 보낸다(리더가 대상에서 뺀다). 노드 CPU도 사용
+        // 메모리도 없으면(시작 직후·`/proc` 읽기 실패) 보내지 않는다(리더는 요약이 없는 노드로 본다).
+        let summary = self.store.summary(t);
+        if summary.cpu5.is_some() || summary.mem.is_some() {
+            self.cluster.set_lease_load(summary);
+        }
     }
 
     fn sample_node(&mut self, at: Instant, t: i64) {
@@ -390,6 +396,7 @@ mod tests {
     use super::*;
     use crate::bootstrap::tests::single_node;
     use opl_types::metrics::{MetricsQuery, MetricsScope};
+    use opl_types::placement::{LoadSummary, VmLoad};
 
     /// 시험이 정한 값을 돌려주는 [`HostProbe`]
     #[derive(Default)]
@@ -685,6 +692,48 @@ mod tests {
         );
         // 게스트 기준: 받기는 tap의 보내기(두 tap 합)다.
         assert_eq!((s.net_rx_bps, s.net_tx_bps), (Some(1_200.0), Some(400.0)));
+    }
+
+    /// 틱마다 저장소의 부하 요약을 리스 갱신에 실을 값으로 둔다.
+    #[tokio::test]
+    async fn each_tick_hands_the_load_summary_to_the_lease() {
+        let mut f = fixture().await;
+        let id = running_vm(&f).await;
+        tokio::time::pause();
+        f.probe.set(|v| {
+            v.cpu = Some(CpuTimes {
+                busy: 100,
+                total: 1_000,
+            });
+            v.memory = Some((1_000, 4_000));
+        });
+        set_vm(&f, id, 0, disk(0, 0), (0, 0));
+        f.sampler.tick().await;
+        // 첫 측정은 점이 없어 빈 요약이므로 싣지 않는다.
+        assert_eq!(f.cluster.lease_load(), None);
+
+        tokio::time::advance(INTERVAL).await;
+        f.probe.set(|v| {
+            v.cpu = Some(CpuTimes {
+                busy: 350,
+                total: 2_000,
+            })
+        });
+        set_vm(&f, id, 5_000_000_000, disk(0, 0), (0, 0));
+        f.sampler.tick().await;
+        assert_eq!(
+            f.cluster.lease_load(),
+            Some(LoadSummary {
+                cpu1: Some(250),
+                cpu5: Some(250),
+                mem: Some(1_000),
+                vms: vec![VmLoad {
+                    id,
+                    cpu: Some(500),
+                    mem: Some(300),
+                }],
+            })
+        );
     }
 
     /// 사용자 모드 NIC(`user`)는 tap이 없으므로 빼고 tap NIC만 합한다.

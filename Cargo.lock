@@ -1525,6 +1525,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "libc",
  "openraft",
  "opl-types",
  "redb",

@@ -6,12 +6,18 @@ use std::sync::{Arc, Mutex};
 
 use opl_peer::{MetricsReply, MetricsSource};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
+use opl_types::placement::{LoadSummary, VmLoad};
 use uuid::Uuid;
 
 /// 시리즈마다 두는 점 수(5초 × 1시간). 넘으면 앞을 버린다.
 pub const MAX_SAMPLES: usize = 720;
 /// 마지막 점이 이만큼(밀리초) 지난 VM 시리즈는 지운다(옮겨 나간 VM, 지운 VM).
 pub const VM_SERIES_TTL_MS: i64 = 3_600_000;
+/// 부하 요약에 넣는 VM: 마지막 점이 이만큼(밀리초) 안인 시리즈만(옮겨 나간 VM, 멈춘 VM은 뺀다)
+pub const LOAD_VM_FRESH_MS: i64 = 15_000;
+/// 부하 요약의 짧은·긴 CPU 평균 창(밀리초)
+const LOAD_SHORT_MS: i64 = 60_000;
+const LOAD_LONG_MS: i64 = 300_000;
 
 #[derive(Default)]
 pub struct MetricsStore {
@@ -61,6 +67,44 @@ impl MetricsStore {
         });
     }
 
+    /// 리스 갱신에 실을 부하 요약(설계 §8.3). 노드 CPU는 `now`(유닉스 밀리초)까지 1분·5분 동안의 평균 ‰,
+    /// 메모리는 마지막 점의 사용량이다. VM은 마지막 점이 [`LOAD_VM_FRESH_MS`] 안인 것만 5분 CPU 평균 ‰와 마지막
+    /// RSS로 넣고, `MAX_LOAD_VMS`를 넘으면 RSS 큰 것부터 둔다. 값 없는 점은 평균에서 빠진다.
+    pub fn summary(&self, now: i64) -> LoadSummary {
+        let inner = self.inner.lock().unwrap();
+        let node_cpu = |window: i64| {
+            permille(
+                (inner.node.iter())
+                    .filter(|s| s.t >= now - window)
+                    .filter_map(|s| s.cpu),
+            )
+        };
+        let mut vms: Vec<VmLoad> = (inner.vms.iter())
+            .filter_map(|(id, series)| {
+                let last = series.back()?;
+                (now - last.t <= LOAD_VM_FRESH_MS).then(|| VmLoad {
+                    id: *id,
+                    cpu: permille(
+                        (series.iter())
+                            .filter(|s| s.t >= now - LOAD_LONG_MS)
+                            .filter_map(|s| s.cpu),
+                    ),
+                    mem: last.mem_rss_mib,
+                })
+            })
+            .collect();
+        // 순서를 정해 둔다(같은 측정이면 같은 요약).
+        vms.sort_by_key(|v| v.id);
+        let mut load = LoadSummary {
+            cpu1: node_cpu(LOAD_SHORT_MS),
+            cpu5: node_cpu(LOAD_LONG_MS),
+            mem: inner.node.back().and_then(|s| s.mem_used_mib),
+            vms,
+        };
+        load.truncate_vms();
+        load
+    }
+
     /// `since`보다 `t`가 큰 점만 돌려준다.
     pub fn read(&self, q: &MetricsQuery) -> MetricsLocal {
         let after = |t: i64| q.since.is_none_or(|since| t > since);
@@ -79,6 +123,16 @@ impl MetricsStore {
             },
         }
     }
+}
+
+/// 백분율 값들의 평균을 ‰로(반올림). 값이 없으면 `None`이다.
+fn permille(values: impl Iterator<Item = f64>) -> Option<u16> {
+    let (sum, count) = values.fold((0.0, 0u32), |(sum, count), v| (sum + v, count + 1));
+    (count > 0).then(|| {
+        (sum / f64::from(count) * 10.0)
+            .round()
+            .clamp(0.0, f64::from(u16::MAX)) as u16
+    })
 }
 
 /// 이 노드(`node`)의 저장소를 지표 API와 노드 간 서버(`ReadMetrics`)에 읽어 준다.
@@ -116,6 +170,8 @@ impl MetricsSource for StoreSource {
 
 #[cfg(test)]
 mod tests {
+    use opl_types::placement::MAX_LOAD_VMS;
+
     use super::*;
 
     fn node(t: i64) -> NodeSample {
@@ -215,6 +271,99 @@ mod tests {
         // 노드 시리즈는 상한으로만 줄어든다.
         let nodes = store.read(&query(MetricsScope::Nodes, None)).node.unwrap();
         assert_eq!(nodes.len(), 1);
+    }
+
+    /// 6분 동안 5초마다: 앞 3분은 10%, 뒤 3분은 30%. 1분 평균은 30%, 5분 평균은 둘이 섞인다.
+    /// 값 없는 점은 평균에서 빠지고, 메모리는 마지막 점이다.
+    #[test]
+    fn summary_averages_node_cpu_over_one_and_five_minutes() {
+        let store = MetricsStore::default();
+        assert_eq!(store.summary(1_000_000), LoadSummary::default());
+        let now = 10_000_000;
+        let start = now - 360_000;
+        for k in 1..=72 {
+            let t = start + k * 5_000;
+            let mut s = node(t);
+            s.cpu = Some(if t <= start + 180_000 { 10.0 } else { 30.0 });
+            s.mem_used_mib = Some(k as u64);
+            store.push_node(s);
+            // 값 없는 점은 세지 않는다.
+            let mut empty = node(t + 1);
+            empty.cpu = None;
+            empty.mem_used_mib = Some(1_000 + k as u64);
+            store.push_node(empty);
+        }
+        let s = store.summary(now);
+        assert_eq!(s.cpu1, Some(300));
+        // 창 안(t ≥ now − 300초)의 점: 10%가 25개, 30%가 36개 → (250 + 1080) / 61 = 21.80%
+        assert_eq!(s.cpu5, Some(218));
+        assert_eq!(s.mem, Some(1_072));
+        assert!(s.vms.is_empty());
+
+        // CPU 값이 하나도 없으면 None
+        let store = MetricsStore::default();
+        let mut s = node(now);
+        s.cpu = None;
+        store.push_node(s);
+        assert_eq!(store.summary(now).cpu1, None);
+        assert_eq!(store.summary(now).cpu5, None);
+    }
+
+    /// VM은 마지막 점이 15초 안인 것만, 5분 CPU 평균과 마지막 RSS로 넣는다.
+    #[test]
+    fn summary_has_fresh_vms_only() {
+        let store = MetricsStore::default();
+        let now = 10_000_000;
+        let (fresh, gone) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        for (t, cpu, rss) in [
+            (now - 400_000, 500.0, 100),
+            (now - 10_000, 20.0, 200),
+            (now - 5_000, 125.5, 300),
+        ] {
+            let mut s = vm(t);
+            s.cpu = Some(cpu);
+            s.mem_rss_mib = Some(rss);
+            store.push_vm(fresh, s);
+        }
+        let mut no_cpu = vm(now - LOAD_VM_FRESH_MS);
+        no_cpu.cpu = None;
+        no_cpu.mem_rss_mib = None;
+        store.push_vm(Uuid::from_u128(3), no_cpu);
+        store.push_vm(gone, vm(now - 20_000));
+        let s = store.summary(now);
+        assert_eq!(
+            s.vms,
+            vec![
+                VmLoad {
+                    id: fresh,
+                    // 400초 전 점은 5분 창 밖이다. (20 + 125.5) / 2 = 72.75% → 728‰
+                    cpu: Some(728),
+                    mem: Some(300),
+                },
+                VmLoad {
+                    id: Uuid::from_u128(3),
+                    cpu: None,
+                    mem: None,
+                },
+            ]
+        );
+        // 노드 점이 없으면 노드 값은 없다.
+        assert_eq!((s.cpu1, s.cpu5, s.mem), (None, None, None));
+    }
+
+    /// VM이 상한을 넘으면 RSS 큰 것부터 둔다.
+    #[test]
+    fn summary_keeps_the_largest_vms() {
+        let store = MetricsStore::default();
+        let now = 10_000_000;
+        for i in 0..MAX_LOAD_VMS as u64 + 10 {
+            let mut s = vm(now);
+            s.mem_rss_mib = Some(i);
+            store.push_vm(Uuid::from_u128(i.into()), s);
+        }
+        let s = store.summary(now);
+        assert_eq!(s.vms.len(), MAX_LOAD_VMS);
+        assert_eq!(s.vms.iter().filter_map(|v| v.mem).min(), Some(10));
     }
 
     #[test]

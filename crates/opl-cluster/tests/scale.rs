@@ -2,7 +2,8 @@
 //! 다섯과 대기 learner 둘이 Raft 구성원이고 나머지는 관찰 노드다(투표 멤버 하나를 Follow로 따름). 모든 노드가
 //! 2초마다 리스를 갱신하고 `VoterKeeper`·`RoleKeeper`를 띄운 채로 리더의 초당 RPC 수, 쓰기 지연 p99, 관찰 노드의
 //! 뒤처짐 p99, 노드 하나 추가, 투표 멤버 장애 뒤 관찰 노드가 다시 붙기까지, 리더 장애 뒤 새 리더까지를 재고
-//! 기준을 넘으면 실패한다.
+//! 기준을 넘으면 실패한다. 리더 RPC는 부하 요약(설계 §8.3) 없이 한 번, 모든 노드가 5초마다 VM 20개짜리 가짜
+//! 요약을 리스 갱신에 실어 보내게 하고 한 번 더 재어 둘 다 같은 기준을 지키는지 본다.
 //!
 //! 관찰 노드는 실제 노드처럼 learner로 들어와 따라잡은 뒤 내려가지 않고 빈 저장소로 바로 관찰 노드로 연다(시작
 //! 시간을 줄인다, `ClusterConfig::follow_seed`). 클러스터 정보의 관찰 노드 목록에는 넣는다(키퍼가 보는 모양을
@@ -17,7 +18,7 @@
 #![cfg(feature = "scale-it")]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,6 +40,7 @@ use opl_cluster::{
 };
 use opl_types::cluster::{ClusterSpec, ClusterStatus};
 use opl_types::node::{NodeSpec, NodeStatus};
+use opl_types::placement::{LoadSummary, VmLoad};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::VolumeSpec;
@@ -90,6 +92,10 @@ const VOTER_RPC_DELAY: Duration = Duration::from_millis(20);
 /// 묶지 않게 고치면 노드 100·300 모두 0.79~0.80이었다(설계 §14).
 const BATCHED_RATIO_MAX: f64 = 0.6;
 
+/// 부하 요약을 바꾸는 간격(opld 측정기 `INTERVAL`)과 노드마다의 VM 수
+const LOAD_EVERY: Duration = Duration::from_secs(5);
+const LOAD_VMS: u64 = 20;
+
 /// 노드 수의 하한. 그보다 적으면 [`voter_rpc_delay`]가 하트비트 간격(200 ms)에 가까워져 선거가 나고 리스 갱신이
 /// 실패한다(노드 8에서 지연 250 ms로 갱신 14번 실패, 노드 추가 실패).
 const MIN_NODES: u64 = 20;
@@ -125,6 +131,8 @@ struct Counter {
     to_voters: AtomicU64,
     to_learners: AtomicU64,
     forwarded: AtomicU64,
+    /// 전달받은 리스 갱신 본문의 바이트(JSON)
+    forwarded_bytes: AtomicU64,
 }
 
 type Counters = Arc<HashMap<NodeId, Counter>>;
@@ -226,6 +234,10 @@ impl Forwarder for CountingForwarder {
     ) -> Result<u64, ClusterError> {
         if let Some(c) = self.counters.get(&leader) {
             c.forwarded.fetch_add(1, Ordering::Relaxed);
+            if matches!(req, LeaderRequest::RenewLease { .. }) {
+                let bytes = serde_json::to_vec(&req).unwrap().len() as u64;
+                c.forwarded_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
         }
         self.inner.forward(leader, addr, req).await
     }
@@ -255,10 +267,11 @@ impl FollowClient for TrackingFollow {
     }
 }
 
-/// 노드 하나: 저장소, 리스 갱신, VoterKeeper, RoleKeeper
+/// 노드 하나: 저장소, 리스 갱신, 부하 요약, VoterKeeper, RoleKeeper
 struct Running {
     cluster: Arc<Cluster>,
     renew: JoinHandle<()>,
+    load: JoinHandle<()>,
     voters: VoterKeeper,
     roles: RoleKeeper,
 }
@@ -272,6 +285,8 @@ struct Harness {
     /// 투표 멤버로 가는 RPC의 지연(마이크로초, RPC를 잴 때만)
     slow_voters: Arc<AtomicU64>,
     upstreams: Upstreams,
+    /// 켜면 모든 노드가 [`LOAD_EVERY`]마다 새 부하 요약을 둔다(다음 리스 갱신이 싣는다).
+    loads_on: Arc<AtomicBool>,
     /// 노드 수(리스 갱신 시작을 고르게 나눈다)
     total: u64,
 }
@@ -328,6 +343,23 @@ impl Harness {
                 }
             })
         };
+        // opld 측정기처럼 몇 초마다 새 요약을 둔다(켰을 때만). 시작은 갱신처럼 고르게 늦춘다.
+        let load = {
+            let cluster = cluster.clone();
+            let on = self.loads_on.clone();
+            let offset = LOAD_EVERY * u32::try_from(i % self.total).unwrap()
+                / u32::try_from(self.total).unwrap();
+            tokio::spawn(async move {
+                tokio::time::sleep(offset).await;
+                let mut interval = tokio::time::interval(LOAD_EVERY);
+                for round in 0..=u64::MAX {
+                    interval.tick().await;
+                    if on.load(Ordering::Relaxed) {
+                        cluster.set_lease_load(fake_load(i, round));
+                    }
+                }
+            })
+        };
         self.nodes.insert(
             id,
             Running {
@@ -335,6 +367,7 @@ impl Harness {
                 roles: RoleKeeper::spawn(cluster.clone(), RoleKeeperConfig::default()),
                 cluster,
                 renew,
+                load,
             },
         );
     }
@@ -412,6 +445,7 @@ impl Harness {
         self.router.unregister(id);
         let node = self.nodes.remove(&id).unwrap();
         node.renew.abort();
+        node.load.abort();
         node.roles.shutdown().await;
         node.voters.shutdown().await;
         node.cluster.shutdown().await.unwrap();
@@ -433,6 +467,34 @@ fn volume(i: usize) -> Typed<VolumeSpec> {
             format: ImageFormat::Qcow2,
         },
     )
+}
+
+/// 노드 `i`의 `round`번째 가짜 부하 요약: VM 20개, 값은 회차마다 바뀐다(실제 측정기와 크기가 비슷하게).
+fn fake_load(i: u64, round: u64) -> LoadSummary {
+    let v = |k: u64| u16::try_from((i * 31 + round * 7 + k * 13) % 1000).unwrap();
+    LoadSummary {
+        cpu1: Some(v(0)),
+        cpu5: Some(v(1)),
+        mem: Some(32_768 + u64::from(v(2)) * 64),
+        vms: (0..LOAD_VMS)
+            .map(|k| VmLoad {
+                id: uuid::Uuid::from_u128(u128::from(i) << 32 | u128::from(k)),
+                cpu: Some(v(k + 3)),
+                mem: Some(1_024 + u64::from(v(k + 4)) * 4),
+            })
+            .collect(),
+    }
+}
+
+/// 이 프로세스가 지금까지 쓴 CPU 시간(사용자 + 커널)
+fn process_cpu() -> Duration {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage`는 쓸 수 있는 rusage 하나다.
+    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+    let time = |t: libc::timeval| {
+        Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64)
+    };
+    time(usage.ru_utime) + time(usage.ru_stime)
 }
 
 /// 리더 확인을 묶지 않았을 때(최악) 리더가 투표 멤버에게 보내는 초당 RPC: 팔로워마다 하트비트와, 리스 갱신(전달받은
@@ -472,19 +534,51 @@ fn node_count() -> u64 {
         .unwrap_or(300)
 }
 
-/// `window` 동안 리더가 쓴 초당 RPC 수(투표 멤버에게, learner에게, 전달받은 것)
-async fn leader_rpcs(c: &Counter, window: Duration) -> [f64; 3] {
+/// 한 창에서 잰 리더의 초당 값
+struct Window {
+    to_voters: f64,
+    to_learners: f64,
+    /// 전달받은 요청(리스 갱신) 수
+    forwarded: f64,
+    /// 전달받은 리스 갱신 본문 바이트
+    forwarded_bytes: f64,
+    /// 프로세스 CPU 초(모든 노드의 합 — 한 프로세스라 리더만 떼어 잴 수 없다)
+    cpu: f64,
+    /// 그동안 실패한 리스 갱신 수
+    renew_failures: u64,
+}
+
+impl Window {
+    fn rpcs(&self) -> f64 {
+        self.to_voters + self.to_learners + self.forwarded
+    }
+}
+
+/// `window` 동안 리더(`c`)가 쓴 초당 RPC 수와 받은 바이트, 프로세스 CPU
+async fn leader_window(c: &Counter, failures: &AtomicU64, window: Duration) -> Window {
     let read = || {
         [
             c.to_voters.load(Ordering::Relaxed),
             c.to_learners.load(Ordering::Relaxed),
             c.forwarded.load(Ordering::Relaxed),
+            c.forwarded_bytes.load(Ordering::Relaxed),
+            failures.load(Ordering::Relaxed),
         ]
     };
     let before = read();
+    let cpu_before = process_cpu();
     tokio::time::sleep(window).await;
     let after = read();
-    std::array::from_fn(|k| (after[k] - before[k]) as f64 / window.as_secs_f64())
+    let cpu = (process_cpu() - cpu_before).as_secs_f64();
+    let rate = |k: usize| (after[k] - before[k]) as f64 / window.as_secs_f64();
+    Window {
+        to_voters: rate(0),
+        to_learners: rate(1),
+        forwarded: rate(2),
+        forwarded_bytes: rate(3),
+        cpu: cpu / window.as_secs_f64(),
+        renew_failures: after[4] - before[4],
+    }
 }
 
 /// 정렬된 값의 p50·p99
@@ -513,6 +607,7 @@ async fn hundreds_of_nodes_do_not_slow_the_leader() {
         renew_failures: Arc::default(),
         slow_voters: Arc::default(),
         upstreams: Arc::default(),
+        loads_on: Arc::default(),
         total: n,
     };
     let started = Instant::now();
@@ -559,15 +654,44 @@ async fn hundreds_of_nodes_do_not_slow_the_leader() {
 
     // 안정된 뒤(모든 노드가 한 번 넘게 갱신) 리더의 초당 RPC 수: 하트비트, 리스 갱신과 그 확인. 투표 멤버로 가는
     // RPC를 늦춰 확인 왕복이 갱신 간격보다 길게 한다(묶기 검사가 기계 속도에 좌우되지 않게). 쓰기 지연·장애 조치는
-    // 늦추지 않고 잰다.
+    // 늦추지 않고 잰다. 부하 요약 없이 한 번, 모든 노드가 요약을 보내게 하고 한 번 잰다.
     let delay = voter_rpc_delay(n);
     h.slow_voters
         .store(delay.as_micros() as u64, Ordering::Relaxed);
     tokio::time::sleep(RENEW + Duration::from_secs(1)).await;
-    let failures_before = h.renew_failures.load(Ordering::Relaxed);
-    let [to_voters, to_learners, forwarded] =
-        leader_rpcs(&h.counters[&leader], Duration::from_secs(5)).await;
-    let renew_failures = h.renew_failures.load(Ordering::Relaxed) - failures_before;
+    let plain = leader_window(
+        &h.counters[&leader],
+        &h.renew_failures,
+        Duration::from_secs(5),
+    )
+    .await;
+    h.loads_on.store(true, Ordering::Relaxed);
+    // 모든 노드가 요약을 두고(5초 안) 다음 갱신(2초 안)으로 리더에 보내기까지
+    let t = Instant::now();
+    loop {
+        let loads = h.get(leader).leases().loads.len() as u64;
+        if loads == n {
+            break;
+        }
+        assert!(
+            t.elapsed() < LOAD_EVERY + RENEW * 4,
+            "the leader has load summaries of {loads} of {n} nodes after {:?}",
+            t.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!(
+        "scale: all {n} load summaries reached the leader in {:?}",
+        t.elapsed()
+    );
+    let loaded = leader_window(
+        &h.counters[&leader],
+        &h.renew_failures,
+        Duration::from_secs(5),
+    )
+    .await;
+    let loads = h.get(leader).leases().loads.len() as u64;
+    h.loads_on.store(false, Ordering::Relaxed);
     h.slow_voters.store(0, Ordering::Relaxed);
     // 투표 멤버로 센 RPC는 처음의 `1..=VOTERS`로 가는 것이다. 재는 동안 키퍼가 바꾸지 않았는지 본다.
     let measured = h.get(leader).members();
@@ -582,14 +706,25 @@ async fn hundreds_of_nodes_do_not_slow_the_leader() {
         standby,
         "the standby learners changed while measuring"
     );
-    let rpcs = to_voters + to_learners + forwarded;
-    let unbatched = unbatched_to_voters(forwarded);
+    for (name, w) in [("without loads", &plain), ("with loads", &loaded)] {
+        let unbatched = unbatched_to_voters(w.forwarded);
+        eprintln!(
+            "scale: {name}: leader RPCs/s {:.0} ({:.2} per node; to voters {:.0} of {unbatched:.0} \
+             unbatched with {delay:?} delay, ratio {:.2}, to learners {:.0}, forwarded renewals \
+             {:.0}, forwarded bytes/s {:.0}), failed renewals {}",
+            w.rpcs(),
+            w.rpcs() / n as f64,
+            w.to_voters,
+            w.to_voters / unbatched,
+            w.to_learners,
+            w.forwarded,
+            w.forwarded_bytes,
+            w.renew_failures
+        );
+    }
     eprintln!(
-        "scale: leader RPCs/s {rpcs:.0} ({:.2} per node; to voters {to_voters:.0} of {unbatched:.0} \
-         unbatched with {delay:?} delay, ratio {:.2}, to learners {to_learners:.0}, forwarded \
-         renewals {forwarded:.0}), failed renewals {renew_failures}",
-        rpcs / n as f64,
-        to_voters / unbatched
+        "scale: process CPU s/s without loads {:.2}, with loads {:.2}",
+        plain.cpu, loaded.cpu
     );
 
     // 쓰기 지연(리더에서 하나씩)
@@ -705,22 +840,29 @@ async fn hundreds_of_nodes_do_not_slow_the_leader() {
 
     h.close().await;
 
-    assert_eq!(renew_failures, 0, "lease renewals failed");
-    // 관찰 노드에게는 Raft RPC를 보내지 않는다.
-    assert!(
-        to_learners < NON_VOTER_RPCS_MAX,
-        "leader Raft RPCs/s to non-voters {to_learners:.0} (max {NON_VOTER_RPCS_MAX})"
-    );
-    assert!(
-        rpcs < FIXED_RPCS_MAX + RPCS_PER_NODE_MAX * n as f64,
-        "leader RPCs/s {rpcs:.0} for {n} nodes"
-    );
-    // 확인 왕복이 갱신 간격보다 길면 묶기가 투표 멤버로 가는 RPC를 묶지 않은 최악보다 크게 줄인다.
-    assert!(
-        to_voters < unbatched * BATCHED_RATIO_MAX,
-        "leader RPCs/s to voters {to_voters:.0}: confirmations are not batched \
-         (unbatched {unbatched:.0})"
-    );
+    assert_eq!(loads, n, "the leader lost load summaries");
+    for (name, w) in [("without loads", &plain), ("with loads", &loaded)] {
+        assert_eq!(w.renew_failures, 0, "lease renewals failed {name}");
+        // 관찰 노드에게는 Raft RPC를 보내지 않는다.
+        assert!(
+            w.to_learners < NON_VOTER_RPCS_MAX,
+            "leader Raft RPCs/s to non-voters {:.0} {name} (max {NON_VOTER_RPCS_MAX})",
+            w.to_learners
+        );
+        assert!(
+            w.rpcs() < FIXED_RPCS_MAX + RPCS_PER_NODE_MAX * n as f64,
+            "leader RPCs/s {:.0} for {n} nodes {name}",
+            w.rpcs()
+        );
+        // 확인 왕복이 갱신 간격보다 길면 묶기가 투표 멤버로 가는 RPC를 묶지 않은 최악보다 크게 줄인다.
+        let unbatched = unbatched_to_voters(w.forwarded);
+        assert!(
+            w.to_voters < unbatched * BATCHED_RATIO_MAX,
+            "leader RPCs/s to voters {:.0} {name}: confirmations are not batched \
+             (unbatched {unbatched:.0})",
+            w.to_voters
+        );
+    }
     let p99_max = write_p99_max();
     assert!(p99 < p99_max, "write p99 {p99:?} (max {p99_max:?})");
     assert!(
