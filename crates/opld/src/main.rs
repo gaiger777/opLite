@@ -12,6 +12,7 @@
 //! 하이퍼바이저 드라이버가 살아 있는 VM에 다시 붙고 reconciler가 이어서 맞춘다.
 
 mod bootstrap;
+mod checks;
 mod config;
 mod control;
 #[cfg(feature = "ha-it")]

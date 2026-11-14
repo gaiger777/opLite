@@ -8,7 +8,7 @@ use opl_api::{
     AuditConfig, BackupJobSchedulerConfig, ClusterJanitorConfig, Fencer, RemotePollerConfig,
     SnapshotSchedulerConfig, TelemetryConfig, UpdatesConfig, VipAgentConfig,
 };
-use opl_driver::VipAddress;
+use opl_driver::{NetFs, VipAddress};
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
 use opl_reconciler::ha::{DeviceWatchdog, WatchdogOpener};
@@ -345,6 +345,9 @@ pub struct HaSection {
     /// 전원 끄기 펜싱의 IPMI 방법이 부르는 `ipmitool`(리더가 노드를 끌 때와 `fence-test`·이웃 확인에 쓴다)
     #[serde(default = "default_ipmitool")]
     pub ipmitool: PathBuf,
+    /// HA 검사(`ping` 대상)가 부르는 시스템 `ping`. ICMP 권한은 이 실행 파일의 것을 쓴다.
+    #[serde(default = "default_ping")]
+    pub ping: PathBuf,
 }
 
 impl Default for HaSection {
@@ -356,6 +359,7 @@ impl Default for HaSection {
             watchdog_timeout_secs: None,
             fence_after_secs: None,
             ipmitool: default_ipmitool(),
+            ping: default_ping(),
         }
     }
 }
@@ -457,6 +461,15 @@ impl Config {
             });
         }
         self.ha.node_ha()
+    }
+
+    /// HA 검사기가 읽는 sysfs·procfs의 뿌리. 시험 빌드(`ha-it`)는 `[test] health_root` 아래의 가짜 트리를 쓴다.
+    pub fn checker_net(&self) -> NetFs {
+        #[cfg(feature = "ha-it")]
+        if let Some(root) = &self.test.health_root {
+            return NetFs::under(root);
+        }
+        NetFs::default()
     }
 }
 
@@ -818,6 +831,10 @@ pub struct TestSection {
     #[cfg(feature = "ha-it")]
     #[serde(default)]
     pub recover_margin_secs: Option<u64>,
+    /// HA 검사기가 `/sys`·`/proc` 대신 읽는 `{health_root}/sys`·`{health_root}/proc`(가짜 인터페이스 트리)
+    #[cfg(feature = "ha-it")]
+    #[serde(default)]
+    pub health_root: Option<PathBuf>,
 }
 
 #[cfg(feature = "starve-it")]
@@ -952,6 +969,10 @@ pub fn ha_warnings(config: &Config, notify: bool) -> Vec<String> {
 
 fn default_ipmitool() -> PathBuf {
     "ipmitool".into()
+}
+
+fn default_ping() -> PathBuf {
+    "ping".into()
 }
 
 fn default_watchdog_device() -> PathBuf {
@@ -2263,6 +2284,29 @@ mod tests {
             custom.fencer().timeout,
             opl_api::power_fence::FENCE_CALL_TIMEOUT
         );
+    }
+
+    /// HA 검사의 `ping`은 PATH의 것이 기본이고 바꿀 수 있다.
+    #[test]
+    fn ha_ping_defaults_to_the_path() {
+        let ha = |text: &str| parse(&format!("name = \"n\"\naddress = \"h\"\n{text}")).ha;
+        assert_eq!(ha("").ping, PathBuf::from("ping"));
+        assert_eq!(
+            ha("[ha]\nping = \"/usr/local/bin/ping\"").ping,
+            PathBuf::from("/usr/local/bin/ping")
+        );
+    }
+
+    /// HA 검사기는 `/sys`·`/proc`를 읽고, `[test] health_root`는 `ha-it` 빌드에만 있어 그 아래 가짜 트리로 바꾼다.
+    #[test]
+    fn the_checker_reads_the_health_root_only_in_ha_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(parse(text).checker_net(), NetFs::default());
+        let parsed = toml::from_str::<Config>(&format!("{text}[test]\nhealth_root = \"/tmp/hc\""));
+        #[cfg(feature = "ha-it")]
+        assert_eq!(parsed.unwrap().checker_net(), NetFs::under("/tmp/hc"));
+        #[cfg(not(feature = "ha-it"))]
+        assert!(parsed.is_err());
     }
 
     /// 짧은 시간으로 펜싱하면 다중 링크가 없을 때, watchdog인데 systemd 밖일 때 경고한다. `safe`·30초 이상,

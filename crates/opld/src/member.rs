@@ -43,6 +43,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::bootstrap;
+use crate::checks::{CheckerConfig, HealthChecker};
 use crate::config::Config;
 use crate::fence_watch::FenceWatch;
 use crate::firewall::{FirewallAgent, FirewallRules};
@@ -187,6 +188,8 @@ struct Services {
     recovery: HaManager,
     /// 이 노드의 전원 끄기 펜싱을 이웃이 읽을 수 있는지 확인한다.
     fence_watch: FenceWatch,
+    /// 이 노드의 HA 검사를 돌려 리스 갱신에 싣고 인터페이스·검사 결과를 노드 상태에 쓴다.
+    health: HealthChecker,
     /// 리더가 내장 VIP의 주인을 정한다(이 노드의 `[vip]`과 상관없다).
     vip_manager: VipManager,
     /// 이 노드의 VIP 리스를 갱신하고 VIP를 붙인다(`[vip]`이 없으면 없다).
@@ -228,6 +231,8 @@ impl Services {
         {
             self.api.task.abort();
         }
+        // 본딩 알림이 감사 로그에 쓰므로 그보다 먼저 멈춘다.
+        self.health.shutdown().await;
         self.audit.shutdown().await;
         if let Some(api_cert) = self.api_cert {
             api_cert.shutdown().await;
@@ -694,6 +699,23 @@ impl Member {
         let fence_watch = on(&rt.work, || {
             FenceWatch::spawn(cluster.clone(), peers.clone(), node)
         });
+        let health = on(&rt.work, || {
+            HealthChecker::spawn(
+                cluster.clone(),
+                config.name.clone(),
+                CheckerConfig {
+                    ping: config.ha.ping.clone(),
+                    net: config.checker_net(),
+                    mount_root: mount_root.clone(),
+                    hosts: config
+                        .cluster_hosts()
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                },
+                state.audit.clone(),
+            )
+        });
         let monitor = on(&rt.core, || {
             NodeMonitor::spawn(cluster.clone(), peers, NodeMonitorConfig::default())
         });
@@ -784,6 +806,7 @@ impl Member {
                 audit,
                 recovery,
                 fence_watch,
+                health,
                 vip_manager,
                 vip,
                 pools,
@@ -1580,11 +1603,7 @@ mod tests {
             let restart = |config: Config| {
                 let rt = rt.clone();
                 async move {
-                    let tls = NodeTls::load(&pki_dir(&config)).unwrap().unwrap();
-                    let (member, _) =
-                        Member::start(&config, node, tls, Bootstrap::Restart, &rt, None)
-                            .await
-                            .unwrap();
+                    let member = restart_member(&config, node, &rt).await;
                     member.close(false).await.unwrap();
                     NodeTls::load(&pki_dir(&config)).unwrap().unwrap()
                 }
@@ -1602,12 +1621,27 @@ mod tests {
             let again = restart(config.clone()).await;
             assert_eq!(again.cert_pem, saved.cert_pem);
             // 빠진 것처럼 닫아 root로 도는 Linux CI에서 만든 방화벽 테이블도 지운다.
-            let tls = NodeTls::load(&pki_dir(&config)).unwrap().unwrap();
-            let (member, _) = Member::start(&config, node, tls, Bootstrap::Restart, &rt, None)
-                .await
-                .unwrap();
+            let member = restart_member(&config, node, &rt).await;
             member.close(true).await.unwrap();
         });
+    }
+
+    /// 닫은 멤버를 다시 시작한다. openraft의 `shutdown`은 상태 머신 태스크가 끝나기를 기다리지 않아 그 태스크가
+    /// 아직 redb 파일을 쥐고 있으면 `Database already open`이 나므로 잠시 뒤 다시 연다(opl-cluster 시험과 같음).
+    async fn restart_member(config: &Config, node: Uuid, rt: &Handles) -> Member {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let tls = NodeTls::load(&pki_dir(config)).unwrap().unwrap();
+            match Member::start(config, node, tls, Bootstrap::Restart, rt, None).await {
+                Err(e)
+                    if format!("{e:#}").contains("Database already open")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => break other.unwrap().0,
+            }
+        }
     }
 
     /// 가입·재시작한 노드가 스스로 승격을 요청할지는 키퍼와 같은 규칙이다: 합류하자마자 죽어 등록하지 못한

@@ -934,6 +934,11 @@ impl Cluster {
         *self.lease_checks.lock().unwrap() = checks;
     }
 
+    /// 리스 갱신에 실어 보내는 지금의 HA 검사 결과(`set_lease_checks`로 둔 것)
+    pub fn lease_checks(&self) -> Vec<CheckReport> {
+        self.lease_checks.lock().unwrap().clone()
+    }
+
     /// 이 노드의 VIP 리스를 갱신한다(`vips`는 이 노드가 가질 수 있는 VIP 주소). 규칙은 `renew_lease`와
     /// 같다: 성공하면 리더가 돌려준 적용 인덱스까지 이 노드에도 적용되어 있어, 곧바로 읽은 `VipHolder`에
     /// 그때까지 리더가 정한 주인이 보인다. 호출자는 보내기 전에 시각을 재고 그 시각부터 리스를 센다.

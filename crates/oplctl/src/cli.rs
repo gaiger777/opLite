@@ -298,6 +298,14 @@ enum NodeCmd {
     FenceTest {
         node: String,
     },
+    /// 노드의 네트워크 인터페이스(종류·상태·carrier·속도·master·주소). 본딩이면 그 아래에 포트마다 한 줄이다.
+    Interfaces {
+        node: String,
+    },
+    /// 노드의 HA 검사 결과(노드가 5초마다 검사한다). 실패가 grace 넘게 이어지면 리더가 검사의 대응을 한다.
+    Checks {
+        node: String,
+    },
 }
 
 /// `node fence`
@@ -417,6 +425,110 @@ async fn node_fence(
         }
     }
     Ok(())
+}
+
+/// `node interfaces`의 열
+const INTERFACE_HEADERS: &[&str] = &[
+    "NAME",
+    "KIND",
+    "STATE",
+    "CARRIER",
+    "SPEED",
+    "MASTER",
+    "ADDRESSES",
+];
+
+/// `node checks`의 열
+const CHECK_HEADERS: &[&str] = &["NAME", "STATE", "SINCE", "ERROR"];
+
+/// `node interfaces`·`node checks`: 노드 상태의 목록 `part`(`interfaces`·`checks`)를 `-o json`이면 그대로(없으면 빈
+/// 목록), 아니면 표로 찍는다.
+async fn node_part(
+    client: &Client,
+    node: &str,
+    part: &str,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let n = client.get(&format!("/nodes/{}", seg(node))).await?;
+    let items = n["status"][part].as_array().cloned().unwrap_or_default();
+    if json_out {
+        return Ok(print_json(out, &Value::Array(items))?);
+    }
+    if part == "interfaces" {
+        table(out, INTERFACE_HEADERS, &interface_rows(&items))?;
+    } else {
+        let rows: Vec<Vec<String>> = items.iter().map(check_row).collect();
+        table(out, CHECK_HEADERS, &rows)?;
+    }
+    Ok(())
+}
+
+/// `node interfaces`의 행. 본딩이면 그 아래에 `  port <이름>` 행이 포트마다 붙는다(상태·속도).
+fn interface_rows(interfaces: &[Value]) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for i in interfaces {
+        let addresses: Vec<String> = i["addresses"]
+            .as_array()
+            .map(|a| a.iter().map(cell).collect())
+            .unwrap_or_default();
+        rows.push(vec![
+            cell(&i["name"]),
+            cell(&i["kind"]),
+            cell(&i["state"]),
+            cell(&i["carrier"]),
+            cell(&i["speed_mbps"]),
+            cell(&i["master"]),
+            if addresses.is_empty() {
+                "-".into()
+            } else {
+                addresses.join(",")
+            },
+        ]);
+        for port in i["bond"]["ports"].as_array().into_iter().flatten() {
+            rows.push(vec![
+                format!("  port {}", cell(&port["name"])),
+                "-".into(),
+                cell(&port["state"]),
+                "-".into(),
+                cell(&port["speed_mbps"]),
+                "-".into(),
+                "-".into(),
+            ]);
+        }
+    }
+    rows
+}
+
+/// `node checks`의 행. SINCE는 노드 시계로 실패·degraded가 시작된 때다.
+fn check_row(c: &Value) -> Vec<String> {
+    vec![
+        cell(&c["name"]),
+        cell(&c["state"]),
+        c["since"].as_i64().map_or_else(|| "-".into(), unix_time),
+        cell(&c["error"]),
+    ]
+}
+
+/// `node list`의 CHECKS: 보고가 없으면(옛 서버, 위트니스) `-`, 실패한 검사가 있으면 `failing:<이름,…>`, degraded가
+/// 있으면 `degraded`, 아니면 `ok`다.
+fn node_checks_cell(status: &Value) -> String {
+    let checks = status["checks"].as_array().cloned().unwrap_or_default();
+    if checks.is_empty() {
+        return "-".into();
+    }
+    let failing: Vec<String> = checks
+        .iter()
+        .filter(|c| c["state"] == "failing")
+        .map(|c| cell(&c["name"]))
+        .collect();
+    if !failing.is_empty() {
+        format!("failing:{}", failing.join(","))
+    } else if checks.iter().any(|c| c["state"] == "degraded") {
+        "degraded".into()
+    } else {
+        "ok".into()
+    }
 }
 
 /// `node fence-test`의 열
@@ -4684,6 +4796,10 @@ where
             NodeCmd::Unfreeze { node } => node_unfreeze(&client, &node, out).await?,
             NodeCmd::Fence { cmd } => node_fence(&client, cmd, json_out, out).await?,
             NodeCmd::FenceTest { node } => node_fence_test(&client, &node, json_out, out).await?,
+            NodeCmd::Interfaces { node } => {
+                node_part(&client, &node, "interfaces", json_out, out).await?
+            }
+            NodeCmd::Checks { node } => node_part(&client, &node, "checks", json_out, out).await?,
         },
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::List => {
@@ -6708,6 +6824,7 @@ const NODE_HEADERS: &[&str] = &[
     "FENCING",
     "FENCE",
     "SHUTDOWN",
+    "CHECKS",
 ];
 
 /// `node list`. 투표 멤버인지는 클러스터 멤버십(`GET /cluster`)에 있다. 그것을 읽지 못해도(과반 없음 등) 목록은
@@ -6754,6 +6871,7 @@ fn node_row(n: &Value, cluster: &Value) -> Vec<String> {
         cell(&n["status"]["ha"]["fencing"]),
         node_fence_cell(&n["status"]),
         node_shutdown_cell(&n["status"]),
+        node_checks_cell(&n["status"]),
     ]
 }
 
@@ -9641,9 +9759,15 @@ mod tests {
         a["status"]["underlay"] = json!("10.0.0.1");
         a["status"]["version"] = json!("0.2.0");
         a["status"]["fence_check"] = json!({ "at": 1, "by": "old" });
+        a["status"]["checks"] = json!([
+            { "name": "cluster-link-1", "state": "ok" },
+            { "name": "stor", "state": "failing", "error": "eth1 is down" },
+            { "name": "vmnet", "state": "failing" },
+        ]);
         let mut none = node("none", Some(false));
         none["spec"]["roles"] = json!([]);
         none["status"]["fence_check"] = json!({ "at": 1, "by": "a", "error": "ipmi: timed out" });
+        none["status"]["checks"] = json!([{ "name": "bond", "state": "degraded" }]);
         // a·w는 투표 멤버, old는 learner, none은 멤버십에 없다.
         let cluster = json!({ "members": [
             { "id": "id-a", "voter": true },
@@ -9658,13 +9782,106 @@ mod tests {
         table(&mut out, NODE_HEADERS, &rows).unwrap();
         // 옛 서버는 witness를 보내지 않는다 — 일반 노드다. 펜싱이 꺼진 노드는 `ha`가 없다.
         // underlay가 없는 노드(위트니스, 옛 서버)는 `-`다. 역할이 없으면 기본 역할(위트니스는 없음)이다.
+        // HA 검사 보고가 없으면 CHECKS는 `-`다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  VOTER  ROLES  FENCING   FENCE        SHUTDOWN\n\
-             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    true   api    watchdog  ok           -\n\
-             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     true   -      -         -            -\n\
-             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    false  api    -         -            -\n\
-             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -      -         unreachable  -\n"
+            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  VOTER  ROLES  FENCING   FENCE        SHUTDOWN  CHECKS\n\
+             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    true   api    watchdog  ok           -         failing:stor,vmnet\n\
+             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     true   -      -         -            -         -\n\
+             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    false  api    -         -            -         -\n\
+             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -      -         unreachable  -         degraded\n"
+        );
+    }
+
+    /// CHECKS: 보고가 없으면 `-`, 실패가 있으면 그 이름들, 아니면 degraded·ok(unknown은 ok)
+    #[test]
+    fn node_checks_cell_summarises_the_reports() {
+        let checks = |c: Value| node_checks_cell(&json!({ "checks": c }));
+        assert_eq!(node_checks_cell(&json!({})), "-");
+        assert_eq!(checks(json!([])), "-");
+        assert_eq!(
+            checks(json!([{ "name": "a", "state": "ok" }, { "name": "b", "state": "unknown" }])),
+            "ok"
+        );
+        assert_eq!(
+            checks(json!([{ "name": "a", "state": "degraded" }, { "name": "b", "state": "ok" }])),
+            "degraded"
+        );
+        assert_eq!(
+            checks(json!([
+                { "name": "a", "state": "failing" },
+                { "name": "b", "state": "degraded" },
+                { "name": "c", "state": "failing" },
+            ])),
+            "failing:a,c"
+        );
+    }
+
+    /// `node interfaces`는 노드 상태의 인터페이스를 표로, 본딩 포트를 그 아래 줄로 보인다. `-o json`은 목록이다.
+    #[tokio::test]
+    async fn node_interfaces_lists_the_interfaces_and_bond_ports() {
+        let (client, seen) = fake_api(|_| json!({ "name": "n1", "status": { "interfaces": [
+            { "name": "eno1", "kind": "ethernet", "state": "up", "carrier": true, "speed_mbps": 10000,
+              "master": "bond0" },
+            { "name": "bond0", "kind": "bond", "state": "up", "carrier": true,
+              "addresses": ["10.0.0.5/24", "fd00::5/64"],
+              "bond": { "mode": "802.3ad", "state": "degraded", "ports": [
+                  { "name": "eno1", "state": "up", "speed_mbps": 10000 },
+                  { "name": "eno2", "state": "lacp_mismatch" },
+              ] } },
+        ] } }))
+        .await;
+        let Cmd::Node {
+            cmd: NodeCmd::Interfaces { node },
+        } = Cli::try_parse_from(["oplctl", "node", "interfaces", "n1"])
+            .unwrap()
+            .cmd
+        else {
+            unreachable!()
+        };
+        let mut out = Vec::new();
+        node_part(&client, &node, "interfaces", false, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NAME         KIND      STATE          CARRIER  SPEED  MASTER  ADDRESSES\n\
+             eno1         ethernet  up             true     10000  bond0   -\n\
+             bond0        bond      up             true     -      -       10.0.0.5/24,fd00::5/64\n\
+             \x20 port eno1  -         up             -        10000  -       -\n\
+             \x20 port eno2  -         lacp_mismatch  -        -      -       -\n"
+        );
+        // `-o json`은 목록이고, 없으면 빈 목록이다.
+        let mut out = Vec::new();
+        node_part(&client, &node, "checks", true, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), json!([]));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/nodes/n1 HTTP/1.1",
+                "GET /api/v1/nodes/n1 HTTP/1.1"
+            ]
+        );
+    }
+
+    /// `node checks`의 행: 시작 시각은 UTC, 없으면 `-`
+    #[test]
+    fn node_checks_rows() {
+        let rows: Vec<Vec<String>> = [
+            json!({ "name": "stor", "state": "failing", "error": "eth1 is down", "since": 1_793_000_000 }),
+            json!({ "name": "cluster-link-1", "state": "ok" }),
+        ]
+        .iter()
+        .map(check_row)
+        .collect();
+        assert_eq!(
+            rows,
+            [
+                vec!["stor", "failing", "2026-10-26 07:33 UTC", "eth1 is down"],
+                vec!["cluster-link-1", "ok", "-", "-"],
+            ]
         );
     }
 

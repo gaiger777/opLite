@@ -489,7 +489,7 @@ fn lacking_feature(feature: &str, old: &[String]) -> Result<(), ApiError> {
 
 /// 기능 `feature`를 적지 않은 노드(위트니스 포함)의 이름(이름 순). [`require_feature`]와 같은 판단을
 /// Task처럼 API 오류가 아닌 곳에서 쓴다.
-pub(crate) fn missing_feature(
+pub fn missing_feature(
     cluster: &opl_cluster::Cluster,
     feature: &str,
 ) -> Result<Vec<String>, ClusterError> {

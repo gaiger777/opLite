@@ -576,6 +576,28 @@ fn write_dropped(writer: &mut Writer, dropped: &AtomicU64, node: &str) {
     });
 }
 
+/// 요청이 아닌 노드의 일(예: 본딩 포트 상태 바뀜)을 적는 항목. 사용자·IP·경로가 없고 `node`는 `record`가
+/// 채운다(사용자 없는 항목이라 IP별 제한을 함께 받는다).
+pub fn system_entry(action: &str, target: AuditTarget, detail: impl Into<String>) -> AuditEntry {
+    AuditEntry {
+        id: Uuid::now_v7(),
+        time: now_ms(),
+        node: String::new(),
+        user: None,
+        user_id: None,
+        role: None,
+        auth: AuditAuth::None,
+        ip: String::new(),
+        method: String::new(),
+        path: String::new(),
+        action: action.into(),
+        target: Some(target),
+        status: 0,
+        duration_ms: 0,
+        detail: Some(detail.into()),
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1052,6 +1074,35 @@ mod tests {
         assert_eq!(read[1].node, "n1");
         assert_eq!(read[1].id, first.id);
         assert_eq!(lines(&file).len(), 2);
+    }
+
+    /// 시스템 항목은 사용자·요청 없이 대상과 설명만 있고, 적으면 이 노드의 이름이 들어간다.
+    #[tokio::test]
+    async fn system_entries_have_a_target_and_detail_but_no_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AuditLog::open(config(tmp.path(), 1 << 20, 8)).unwrap();
+        let target = AuditTarget {
+            kind: "nodes".into(),
+            key: "n1".into(),
+        };
+        let entry = system_entry("node.bond-degraded", target.clone(), "bond0: eno2 down");
+        assert_eq!(
+            (
+                entry.user.as_deref(),
+                entry.auth,
+                entry.ip.as_str(),
+                entry.status
+            ),
+            (None, AuditAuth::None, "", 0)
+        );
+        log.record(entry);
+        log.shutdown().await;
+        let read = log.read(all(10)).await.unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].action, "node.bond-degraded");
+        assert_eq!(read[0].target, Some(target));
+        assert_eq!(read[0].detail.as_deref(), Some("bond0: eno2 down"));
+        assert_eq!(read[0].node, "n1");
     }
 
     #[tokio::test]
