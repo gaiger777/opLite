@@ -189,6 +189,7 @@ async fn renew(cluster: &Cluster, node: Uuid) -> Result<u64, ClusterError> {
         .execute_as_leader(LeaderRequest::RenewLease {
             node: NodeId(node),
             checks: vec![],
+            load: None,
         })
         .await
 }
@@ -2153,6 +2154,7 @@ async fn renew_with(cluster: &Cluster, node: Uuid, checks: Vec<CheckReport>) {
         .execute_as_leader(LeaderRequest::RenewLease {
             node: NodeId(node),
             checks,
+            load: None,
         })
         .await
         .unwrap();

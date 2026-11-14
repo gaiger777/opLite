@@ -112,9 +112,9 @@ pub(crate) async fn execute(
 ) -> Result<u64, ClusterError> {
     let raft = &ctx.raft;
     match req {
-        LeaderRequest::RenewLease { node, checks } => {
+        LeaderRequest::RenewLease { node, checks, load } => {
             ctx.leases
-                .renew(raft, &ctx.confirm, node, checks, timeout)
+                .renew(raft, &ctx.confirm, node, checks, load, timeout)
                 .await
         }
         LeaderRequest::RenewVip { node, vips } => {

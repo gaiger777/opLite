@@ -10,6 +10,7 @@ use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{Raft, RaftMetrics, RaftNetworkFactory};
 use opl_types::cluster::ClusterStatus;
 use opl_types::ha_check::CheckReport;
+use opl_types::placement::LoadSummary;
 use opl_types::resource::{Kind, Resource, ResourceSpec};
 use redb::Database;
 use uuid::Uuid;
@@ -152,6 +153,16 @@ pub struct Cluster {
     link_retry: Duration,
     /// 리스 갱신에 실어 보내는 이 노드의 최신 HA 검사 결과(`set_lease_checks`)
     lease_checks: std::sync::Mutex<Vec<CheckReport>>,
+    /// 리스 갱신에 실어 보내는 이 노드의 최신 부하 요약(`set_lease_load`). 새 요약일 때만 싣는다.
+    lease_load: std::sync::Mutex<LeaseLoad>,
+}
+
+/// 노드의 부하 요약과 보낸 정도. `seq`는 `set_lease_load`마다 오르고, `sent`는 리더가 받은 마지막 `seq`다.
+#[derive(Default)]
+struct LeaseLoad {
+    seq: u64,
+    sent: u64,
+    load: Option<LoadSummary>,
 }
 
 /// 이 노드가 클러스터에 무엇으로 참여하는지
@@ -383,6 +394,7 @@ impl Cluster {
             link_book,
             link_retry: config.link_retry,
             lease_checks: Default::default(),
+            lease_load: Default::default(),
         }
     }
 
@@ -910,15 +922,32 @@ impl Cluster {
     pub async fn renew_lease(&self, timeout: Duration) -> Result<(), ClusterError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let checks = self.lease_checks.lock().unwrap().clone();
+        // 부하 요약은 지난번에 리더가 받은 뒤 바뀌었을 때만 싣는다(갱신은 1초, 요약은 몇 초마다 바뀜).
+        let (seq, load) = {
+            let l = self.lease_load.lock().unwrap();
+            let load = if l.seq != l.sent {
+                l.load.clone()
+            } else {
+                None
+            };
+            (l.seq, load)
+        };
+        let carried = load.is_some();
         let index = self
             .request_within(
                 LeaderRequest::RenewLease {
                     node: self.id,
                     checks,
+                    load,
                 },
                 timeout,
             )
             .await?;
+        // 리더가 갱신을 적었으면 요약도 받았다. 그 사이 새 요약이 왔으면 다음 갱신이 싣는다.
+        if carried {
+            let mut l = self.lease_load.lock().unwrap();
+            l.sent = l.sent.max(seq);
+        }
         // 전달 경로의 적용 기다림은 제한 시간이 지나도 성공으로 돌려주므로 여기서 다시 확인한다.
         self.wait_revision(
             index,
@@ -937,6 +966,20 @@ impl Cluster {
     /// 리스 갱신에 실어 보내는 지금의 HA 검사 결과(`set_lease_checks`로 둔 것)
     pub fn lease_checks(&self) -> Vec<CheckReport> {
         self.lease_checks.lock().unwrap().clone()
+    }
+
+    /// 이 노드의 새 부하 요약(설계 §8.3). 노드의 측정기가 몇 초마다 바꾼다. 다음 리스 갱신이 한 번 싣고, 리더가
+    /// 받은 뒤의 갱신은 새 요약이 올 때까지 싣지 않는다(리더가 지난 것을 둔다). VM은 `MAX_LOAD_VMS`까지 자른다.
+    pub fn set_lease_load(&self, mut load: LoadSummary) {
+        load.truncate_vms();
+        let mut l = self.lease_load.lock().unwrap();
+        l.seq += 1;
+        l.load = Some(load);
+    }
+
+    /// 지금의 부하 요약(`set_lease_load`로 둔 것)
+    pub fn lease_load(&self) -> Option<LoadSummary> {
+        self.lease_load.lock().unwrap().load.clone()
     }
 
     /// 이 노드의 VIP 리스를 갱신한다(`vips`는 이 노드가 가질 수 있는 VIP 주소). 규칙은 `renew_lease`와

@@ -3,6 +3,7 @@ use std::fmt;
 use std::io::Cursor;
 
 use opl_types::ha_check::CheckReport;
+use opl_types::placement::LoadSummary;
 use opl_types::resource::{Kind, Resource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -123,6 +124,10 @@ pub enum LeaderRequest {
         /// 그대로이고, 옛 리더는 이 필드를 버린다.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         checks: Vec<CheckReport>,
+        /// 이 노드의 새 부하 요약(설계 §8.3). 지난 갱신 뒤 바뀐 때만 싣고, 없으면 옛 형식 그대로다. 리더는 실리지
+        /// 않은 갱신에서 그 노드의 지난 요약을 그대로 둔다. 옛 리더는 이 필드를 버린다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        load: Option<LoadSummary>,
     },
     /// 노드의 VIP 리스를 갱신한다(설계 §4 내장 VIP). `vips`는 이 노드가 가질 수 있는 VIP 주소(IP)다.
     /// 헬스 체크가 200인 노드만 보낸다. 리더는 `RenewLease`처럼 과반수의 리더인지 확인한 뒤 받은 시각을
@@ -422,6 +427,7 @@ mod tests {
         let req = LeaderRequest::RenewLease {
             node,
             checks: vec![],
+            load: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -453,6 +459,7 @@ mod tests {
                     Some(5),
                 ),
             ],
+            load: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -468,9 +475,47 @@ mod tests {
             serde_json::from_value::<LeaderRequest>(old).unwrap(),
             LeaderRequest::RenewLease {
                 node,
-                checks: vec![]
+                checks: vec![],
+                load: None,
             }
         );
+    }
+
+    /// 노드 사이로 오가는 형식이다. 부하 요약을 실은 리스 갱신: 요약이 있으면 `load`를 더하고, 옛 노드의 갱신
+    /// (필드 없음)은 요약 없음으로 읽는다.
+    #[test]
+    fn lease_with_load_wire_format_is_stable() {
+        use opl_types::placement::VmLoad;
+        let node = NodeId::from(2);
+        let vm = Uuid::from_u128(9);
+        let req = LeaderRequest::RenewLease {
+            node,
+            checks: vec![],
+            load: Some(LoadSummary {
+                cpu1: Some(120),
+                cpu5: Some(80),
+                mem: Some(2048),
+                vms: vec![VmLoad {
+                    id: vm,
+                    cpu: Some(450),
+                    mem: Some(1024),
+                }],
+            }),
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value,
+            json!({"op": "renew-lease", "node": node.to_string(), "load": {
+                "cpu1": 120, "cpu5": 80, "mem": 2048,
+                "vms": [{"id": vm.to_string(), "cpu": 450, "mem": 1024}]
+            }})
+        );
+        assert_eq!(serde_json::from_value::<LeaderRequest>(value).unwrap(), req);
+        let old = json!({"op": "renew-lease", "node": node.to_string()});
+        assert!(matches!(
+            serde_json::from_value::<LeaderRequest>(old).unwrap(),
+            LeaderRequest::RenewLease { load: None, .. }
+        ));
     }
 
     /// 노드 사이로 오가는 형식이다. learner 더하기: 링크가 하나면 옛 형식 그대로, 여럿이면 `addrs`를 더한다.

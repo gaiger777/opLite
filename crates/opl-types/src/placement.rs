@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::resource::{Kind, Resource, ResourceSpec, validate_name};
 
@@ -332,6 +333,49 @@ pub enum PlacementError {
     HaMayViolateOnSoft(&'static str),
 }
 
+/// 리스 갱신 하나에 싣는 VM 부하 수 상한. 넘으면 RSS가 큰 것부터 둔다(노드와 리더가 둘 다 자른다).
+pub const MAX_LOAD_VMS: usize = 256;
+
+/// 노드가 리스 갱신에 실어 리더에 보내는 부하 요약(설계 §8.3). 리더는 메모리에만 둔다. 모두 정수다(리더의
+/// 리스 표가 `Eq`). 모르는 필드는 버린다(뒤 버전이 더한 필드를 옛 리더가 무시).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadSummary {
+    /// 지난 1분 노드 CPU 사용률 ‰(모든 코어 합 1000)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu1: Option<u16>,
+    /// 지난 5분 노드 CPU 사용률 ‰
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu5: Option<u16>,
+    /// 사용 메모리 MiB(마지막 점)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem: Option<u64>,
+    /// 이 노드에서 도는 VM들의 부하
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vms: Vec<VmLoad>,
+}
+
+/// VM 하나의 부하
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmLoad {
+    pub id: Uuid,
+    /// 지난 5분 CPU 사용률 ‰(vCPU 대비, 1000을 넘을 수 있음)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<u16>,
+    /// RSS MiB(마지막 점)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem: Option<u64>,
+}
+
+impl LoadSummary {
+    /// VM이 `MAX_LOAD_VMS`보다 많으면 RSS가 큰 것부터 그만큼만 둔다(RSS를 모르는 VM이 먼저 빠진다).
+    pub fn truncate_vms(&mut self) {
+        if self.vms.len() > MAX_LOAD_VMS {
+            self.vms.sort_by_key(|v| std::cmp::Reverse(v.mem));
+            self.vms.truncate(MAX_LOAD_VMS);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +653,96 @@ mod tests {
         let r = rule(RuleKind::Affinity);
         assert!(r.has_vm("a", &BTreeMap::new()));
         assert!(!r.has_vm("c", &db));
+    }
+
+    /// 빈 요약은 `{}`이고 값은 왕복하며, 모르는 필드는 버린다.
+    #[test]
+    fn load_summary_wire_format() {
+        let empty = LoadSummary::default();
+        assert_eq!(serde_json::to_value(&empty).unwrap(), serde_json::json!({}));
+        assert_eq!(
+            serde_json::from_value::<LoadSummary>(serde_json::json!({})).unwrap(),
+            empty
+        );
+        let id = Uuid::from_u128(7);
+        let full = LoadSummary {
+            cpu1: Some(120),
+            cpu5: Some(95),
+            mem: Some(4096),
+            vms: vec![
+                VmLoad {
+                    id,
+                    cpu: Some(1250),
+                    mem: Some(2048),
+                },
+                VmLoad {
+                    id,
+                    cpu: None,
+                    mem: None,
+                },
+            ],
+        };
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"cpu1": 120, "cpu5": 95, "mem": 4096, "vms": [
+                {"id": id.to_string(), "cpu": 1250, "mem": 2048},
+                {"id": id.to_string()}
+            ]})
+        );
+        assert_eq!(serde_json::from_value::<LoadSummary>(value).unwrap(), full);
+        let newer =
+            serde_json::json!({"cpu1": 5, "disk": 3, "vms": [{"id": id.to_string(), "net": 1}]});
+        assert_eq!(
+            serde_json::from_value::<LoadSummary>(newer).unwrap(),
+            LoadSummary {
+                cpu1: Some(5),
+                vms: vec![VmLoad {
+                    id,
+                    cpu: None,
+                    mem: None
+                }],
+                ..Default::default()
+            }
+        );
+    }
+
+    /// VM이 상한을 넘으면 RSS가 큰 256개만 남는다.
+    #[test]
+    fn truncate_vms_keeps_the_largest_rss() {
+        let vms: Vec<_> = (0..300u64)
+            .map(|i| VmLoad {
+                id: Uuid::from_u128(i.into()),
+                cpu: Some(1),
+                // RSS를 모르는 VM 하나는 가장 먼저 빠진다.
+                mem: (i != 299).then_some((i * 7919) % 300),
+            })
+            .collect();
+        let mut s = LoadSummary {
+            vms: vms.clone(),
+            ..Default::default()
+        };
+        s.truncate_vms();
+        assert_eq!(s.vms.len(), MAX_LOAD_VMS);
+        let kept: BTreeSet<_> = s.vms.iter().map(|v| v.id).collect();
+        let mut want = vms;
+        want.sort_by_key(|v| std::cmp::Reverse(v.mem));
+        assert!(want[..MAX_LOAD_VMS].iter().all(|v| kept.contains(&v.id)));
+        assert!(!kept.contains(&Uuid::from_u128(299)));
+        let smallest_kept = s.vms.iter().filter_map(|v| v.mem).min().unwrap();
+        assert!(
+            want[MAX_LOAD_VMS..]
+                .iter()
+                .all(|v| v.mem.is_none_or(|m| m <= smallest_kept))
+        );
+
+        // 상한 안이면 그대로 둔다.
+        let mut small = LoadSummary {
+            vms: s.vms[..3].to_vec(),
+            ..Default::default()
+        };
+        let before = small.clone();
+        small.truncate_vms();
+        assert_eq!(small, before);
     }
 }

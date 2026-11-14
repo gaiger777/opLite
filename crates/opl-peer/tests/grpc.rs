@@ -1807,6 +1807,7 @@ async fn a_link_to_another_node_is_refused_and_skipped() {
     let renew = LeaderRequest::RenewLease {
         node: b.id(),
         checks: vec![],
+        load: None,
     };
     Forwarder::forward(peers.as_ref(), a.id(), &b.addr, renew)
         .await
@@ -2020,6 +2021,7 @@ async fn a_sent_write_that_loses_its_connection_is_not_sent_again() {
             LeaderRequest::RenewLease {
                 node: id,
                 checks: vec![],
+                load: None,
             },
         )
         .await
@@ -2050,6 +2052,7 @@ async fn calls_fail_over_to_the_second_link() {
             LeaderRequest::RenewLease {
                 node: id,
                 checks: vec![],
+                load: None,
             },
         )
         .await
@@ -2100,6 +2103,7 @@ async fn a_silent_link_times_out_and_the_preferred_link_comes_back() {
     let renew = || LeaderRequest::RenewLease {
         node: id,
         checks: vec![],
+        load: None,
     };
     assert!(peers.leader_request(&first, renew()).await.is_err());
     let took = started.elapsed();
@@ -2168,6 +2172,7 @@ async fn a_forwarded_write_fails_over_from_a_link_that_never_connects() {
             LeaderRequest::RenewLease {
                 node: id,
                 checks: vec![],
+                load: None,
             },
         )
         .await

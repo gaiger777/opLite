@@ -1,5 +1,5 @@
 //! 리더의 HA 리스 표: 갱신, 고립된 노드와 리더, 펜싱 중 거부, 임기가 바뀌면 비우기, 동시 갱신(HA·VIP)의
-//! 리더 확인 묶기, 갱신에 실린 HA 검사 결과.
+//! 리더 확인 묶기, 갱신에 실린 HA 검사 결과와 부하 요약.
 
 mod common;
 
@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use common::{TestCluster, WAIT, volume};
 use openraft::ServerState;
-use opl_cluster::types::{NodeId, Rejection};
+use opl_cluster::types::{LeaderRequest, NodeId, Rejection};
 use opl_cluster::{ClusterError, MAX_LEASE_CHECKS};
 use opl_types::ha_check::{CheckReport, CheckState};
+use opl_types::placement::{LoadSummary, MAX_LOAD_VMS, VmLoad};
 use opl_types::storage::VolumeSpec;
 use tokio::time::Instant;
 
@@ -103,6 +104,96 @@ async fn renewals_carry_the_nodes_check_results() {
     assert!(!tc.get(leader).leases().checks.contains_key(&follower));
     // 팔로워는 표를 갖지 않는다.
     assert!(tc.get(follower).leases().checks.is_empty());
+}
+
+fn load(cpu: u16, vms: u64) -> LoadSummary {
+    LoadSummary {
+        cpu1: Some(cpu),
+        cpu5: Some(cpu),
+        mem: Some(1024),
+        vms: (0..vms)
+            .map(|i| VmLoad {
+                id: uuid::Uuid::from_u64_pair(1, i),
+                cpu: Some(100),
+                mem: Some(i),
+            })
+            .collect(),
+    }
+}
+
+/// 노드가 둔 부하 요약은 다음 갱신 한 번에 실려 가 리더 표에 받은 시각과 함께 적힌다. 새 요약이 없는 갱신은 싣지
+/// 않고 리더는 지난 것을 둔다(받은 시각이 그대로). 리더가 받지 못한 요약은 다음 갱신이 다시 싣는다.
+#[tokio::test]
+async fn renewals_carry_a_new_load_summary_once() {
+    let tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let follower = follower_of(&tc, leader);
+
+    // 요약을 두지 않은 노드는 표에 없다.
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    assert!(tc.get(leader).leases().loads.is_empty());
+
+    let first = load(120, 2);
+    tc.get(follower).set_lease_load(first.clone());
+    assert_eq!(tc.get(follower).lease_load(), Some(first.clone()));
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    let leases = tc.get(leader).leases();
+    assert_eq!(leases.loads.len(), 1, "{leases:?}");
+    let got = leases.loads[&follower].clone();
+    assert_eq!(got.load, first);
+    assert_eq!(got.at, leases.renewed[&follower]);
+
+    // 새 요약이 없으면 싣지 않는다: 리더의 요약은 그대로이고 받은 시각도 바뀌지 않는다.
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    let leases = tc.get(leader).leases();
+    assert!(leases.renewed[&follower] > got.at);
+    assert_eq!(leases.loads[&follower], got);
+
+    let second = load(700, 1);
+    tc.get(follower).set_lease_load(second.clone());
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    let leases = tc.get(leader).leases();
+    assert_eq!(leases.loads[&follower].load, second);
+    assert!(leases.loads[&follower].at > got.at);
+
+    // 리더에 닿지 못한 요약은 다음 갱신이 싣는다.
+    let third = load(300, 0);
+    tc.router.isolate(follower);
+    tc.get(follower).set_lease_load(third.clone());
+    assert!(tc.get(follower).renew_lease(SHORT).await.is_err());
+    tc.router.heal(follower);
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    assert_eq!(tc.get(leader).leases().loads[&follower].load, third);
+    // 팔로워는 표를 갖지 않는다.
+    assert!(tc.get(follower).leases().loads.is_empty());
+}
+
+/// VM이 너무 많은 요약은 노드가 둘 때와 리더가 받을 때 모두 RSS가 큰 `MAX_LOAD_VMS`개로 자른다.
+#[tokio::test]
+async fn load_summaries_keep_at_most_the_largest_vms() {
+    let tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let follower = follower_of(&tc, leader);
+    let many = load(100, MAX_LOAD_VMS as u64 + 1);
+
+    tc.get(follower).set_lease_load(many.clone());
+    let kept = tc.get(follower).lease_load().unwrap();
+    assert_eq!(kept.vms.len(), MAX_LOAD_VMS);
+    // RSS가 가장 작은 VM(mem 0)이 빠진다.
+    assert!(kept.vms.iter().all(|v| v.mem != Some(0)));
+
+    // 자르지 않은 요약(새 노드나 다른 버전)도 리더가 자른다.
+    tc.get(leader)
+        .execute_as_leader(LeaderRequest::RenewLease {
+            node: follower,
+            checks: vec![],
+            load: Some(many),
+        })
+        .await
+        .unwrap();
+    let got = tc.get(leader).leases().loads[&follower].load.clone();
+    assert_eq!(got.vms.len(), MAX_LOAD_VMS);
+    assert!(got.vms.iter().all(|v| v.mem != Some(0)));
 }
 
 /// 응답 인덱스가 이 노드에 적용되어야 성공이다. 복제가 막힌 노드는 리더에 닿아도 실패한다.
@@ -243,10 +334,12 @@ async fn table_is_cleared_when_the_term_changes() {
     let (b, c) = (others[0], others[1]);
     tc.get(b)
         .set_lease_checks(vec![report("stor", CheckState::Failing)]);
+    tc.get(b).set_lease_load(load(500, 1));
     tc.get(b).renew_lease(WAIT).await.unwrap();
     let old_term = term(&tc, a);
     assert!(tc.get(a).leases().renewed.contains_key(&b));
     assert!(tc.get(a).leases().checks.contains_key(&b));
+    assert!(tc.get(a).leases().loads.contains_key(&b));
 
     // 선거에 나설 수 있는 노드를 하나씩만 두어 리더를 a → b → a로 정해서 바꾼다.
     tc.get(c).raft().unwrap().runtime_config().elect(false);
@@ -279,4 +372,5 @@ async fn table_is_cleared_when_the_term_changes() {
         "{leases:?}"
     );
     assert!(leases.checks.is_empty(), "{leases:?}");
+    assert!(leases.loads.is_empty(), "{leases:?}");
 }
