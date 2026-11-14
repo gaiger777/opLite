@@ -1415,7 +1415,7 @@ async fn create_target(qemu_img: &Path, dest: &Path, size_bytes: u64) -> Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use opl_types::resource::Resource;
     use opl_types::storage::StoragePoolSpec;
@@ -1954,7 +1954,7 @@ mod tests {
     /// 실행 파일 `path`(가짜 도구 스크립트)를 `text`로 만든다. 이 프로세스가 쓰려고 연 파일은 그동안
     /// 다른 테스트가 띄우는 자식 프로세스가 물려받을 수 있고, 그러면 스크립트 실행이 ETXTBSY("Text
     /// file busy")로 실패한다. 그래서 파일은 자식 셸이 열고 쓰고 닫는다.
-    pub(super) fn write_script(path: &Path, text: &str) {
+    pub(crate) fn write_script(path: &Path, text: &str) {
         use std::io::Write;
         let mut sh = std::process::Command::new("/bin/sh")
             .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])

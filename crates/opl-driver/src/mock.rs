@@ -78,6 +78,8 @@ struct MockState {
     hang_next_save: bool,
     /// 살아 있지만 QMP로 다룰 수 없는 VM
     unresponsive: HashSet<Uuid>,
+    /// SIGKILL에도 끝나지 않는(D 상태) VM. `stop(Kill)`이 시간 초과로 실패한다.
+    unkillable: HashSet<Uuid>,
     console_dir: Option<PathBuf>,
     /// 새로 띄우려 한 VM과 불러오려 한 스냅샷 태그 (실패한 시도 포함)
     launches: Vec<(Uuid, Option<String>)>,
@@ -262,6 +264,17 @@ impl MockHypervisor {
             st.unresponsive.insert(id);
         } else {
             st.unresponsive.remove(&id);
+        }
+    }
+
+    /// VM을 SIGKILL에도 끝나지 않는(I/O에 묶인 D 상태) VM으로 만들거나(true) 되돌린다(false).
+    /// `stop(Kill)`이 실제 드라이버처럼 `Timeout`으로 실패하고 VM은 그대로 돈다.
+    pub fn set_unkillable(&self, id: Uuid, unkillable: bool) {
+        let mut st = self.state.lock().unwrap();
+        if unkillable {
+            st.unkillable.insert(id);
+        } else {
+            st.unkillable.remove(&id);
         }
     }
 
@@ -679,12 +692,15 @@ impl Hypervisor for MockHypervisor {
     async fn stop(&self, id: Uuid, mode: StopMode) -> Result<(), DriverError> {
         {
             let mut st = self.state.lock().unwrap();
+            if mode == StopMode::Kill && st.vms.contains_key(&id) && st.unkillable.contains(&id) {
+                return Err(DriverError::Timeout("QEMU to exit"));
+            }
             if st.vms.contains_key(&id) && st.unresponsive.contains(&id) {
                 // 실제 드라이버는 다시 붙지 못한 VM에 ACPI 요청을 보낼 수 없고, 강제 종료는
                 // 프로세스를 죽이므로 종료 이벤트가 없다.
                 return match mode {
                     StopMode::Acpi => Err(DriverError::Timeout("reattach to running QEMU")),
-                    StopMode::Force => {
+                    StopMode::Force | StopMode::Kill => {
                         Self::forget_volatile_bitmaps(&mut st, id);
                         st.unresponsive.remove(&id);
                         st.paused.remove(&id);
@@ -702,7 +718,7 @@ impl Hypervisor for MockHypervisor {
             // 실제 QEMU처럼 요청만 보낸다. 게스트는 무시할 수 있으므로 실제 종료는
             // 테스트가 `guest_shutdown`으로 일으킨다.
             StopMode::Acpi => {}
-            StopMode::Force => self.remove(
+            StopMode::Force | StopMode::Kill => self.remove(
                 id,
                 EventKind::Stopped {
                     guest_initiated: false,
@@ -1404,6 +1420,38 @@ mod tests {
                 guest_initiated: true
             }
         );
+    }
+
+    #[tokio::test]
+    async fn kill_stops_like_force_unless_the_vm_is_unkillable() {
+        let hv = MockHypervisor::default();
+        let vm = spec();
+        hv.start(&vm, None).await.unwrap();
+        let mut rx = hv.subscribe();
+        hv.set_unkillable(vm.id, true);
+        // D 상태 QEMU는 SIGKILL에도 끝나지 않는다. 다시 시도할 수 있는 오류이고 VM은 그대로 돈다.
+        let err = hv.stop(vm.id, StopMode::Kill).await.unwrap_err();
+        assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
+        assert!(hv.inspect(vm.id).await.unwrap().is_some());
+        assert!(rx.try_recv().is_err());
+
+        hv.set_unkillable(vm.id, false);
+        hv.stop(vm.id, StopMode::Kill).await.unwrap();
+        assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
+        assert_eq!(
+            rx.recv().await.unwrap().kind,
+            EventKind::Stopped {
+                guest_initiated: false
+            }
+        );
+        // 이미 꺼진 VM은 그대로 성공한다.
+        hv.stop(vm.id, StopMode::Kill).await.unwrap();
+
+        // QMP로 다룰 수 없는 VM도 끝낸다.
+        hv.start(&vm, None).await.unwrap();
+        hv.set_unresponsive(vm.id, true);
+        hv.stop(vm.id, StopMode::Kill).await.unwrap();
+        assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
     }
 
     #[tokio::test]

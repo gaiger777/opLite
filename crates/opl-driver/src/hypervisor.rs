@@ -16,6 +16,8 @@ pub enum StopMode {
     Acpi,
     /// 프로세스를 즉시 끝낸다.
     Force,
+    /// QMP 없이 곧바로 SIGKILL한다. I/O에 묶여 QMP에 답하지 못하는 QEMU에 쓴다(HA 검사의 다른 노드에서 다시 켜기).
+    Kill,
 }
 
 /// 프로세스가 살아 있는 VM의 상태

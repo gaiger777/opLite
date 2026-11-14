@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod firewall;
+pub mod hostcheck;
 pub mod hypervisor;
 pub mod migration;
 pub mod mock;
@@ -13,6 +14,12 @@ pub mod vip;
 
 pub use error::DriverError;
 pub use firewall::{Firewall, FirewallNic, Nft, ruleset};
+pub use hostcheck::{
+    IpLink, LinkProbe, NetFs, PING_TIMEOUT, PROBE_TIMEOUT, Paths, ProbeError, ProcBonding,
+    ProcPort, RBD_PROBE_TIMEOUT, bond_detail, bond_status, interfaces, iscsi_logged_in, link_state,
+    parse_ip_addr, parse_proc_bonding, parse_pvs, ping, ping_args, probe_dir, pv_paths, pvs, rados,
+    rados_args, rados_result, refresh_interfaces, reported_interfaces,
+};
 pub use hypervisor::{
     ActualState, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind, Hypervisor,
     HypervisorEvent, RuntimeStatus, StopMode,

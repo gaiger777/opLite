@@ -38,8 +38,9 @@ const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 /// QMP 명령 하나의 응답을 기다리는 한도. 멈춘(SIGSTOP 등) QEMU에서 호출자가 묶이지 않게 한다.
 const QMP_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-/// SIGKILL을 보낸 뒤 프로세스가 사라지기를 기다리는 한도
-const KILL_TIMEOUT: Duration = Duration::from_secs(5);
+/// SIGKILL을 보낸 뒤 프로세스가 사라지기를 기다리는 한도. 큰 VM은 메모리를 푸는 데 몇 초가 걸린다. HA 검사의
+/// 끄기 요청 시간(opl-api `EVICT_TIMEOUT` 20초)보다 짧아야 한다.
+const KILL_TIMEOUT: Duration = Duration::from_secs(10);
 /// SHUTDOWN 없이 QMP 연결이 끊긴 뒤 프로세스가 끝나기를 기다리는 한도.
 /// 넘기면 QMP만 끊긴 것으로 본다.
 const EXIT_GRACE: Duration = Duration::from_secs(5);
@@ -666,8 +667,10 @@ impl Hypervisor for QemuHypervisor {
             // 살아 있지만 QMP로 다룰 수 없는 VM
             return match mode {
                 StopMode::Acpi => Err(DriverError::Timeout("reattach to running QEMU")),
-                StopMode::Force if self.kill_and_cleanup(id, &paths).await => Ok(()),
-                StopMode::Force => Err(DriverError::Timeout("QEMU to exit")),
+                StopMode::Force | StopMode::Kill if self.kill_and_cleanup(id, &paths).await => {
+                    Ok(())
+                }
+                StopMode::Force | StopMode::Kill => Err(DriverError::Timeout("QEMU to exit")),
             };
         };
         match mode {
@@ -692,6 +695,17 @@ impl Hypervisor for QemuHypervisor {
                     if !wait_until(KILL_TIMEOUT, gone).await {
                         return Err(DriverError::Timeout("QEMU to exit"));
                     }
+                }
+            }
+            StopMode::Kill => {
+                let pid = handle.pid;
+                let pidfile = handle.paths.pidfile.clone();
+                drop(handle);
+                tracing::warn!(%id, pid, "killing QEMU without QMP");
+                kill_if_owner(&pidfile, pid);
+                let gone = || self.handle(id).is_none() && liveness(&pidfile) == Liveness::Dead;
+                if !wait_until(KILL_TIMEOUT, gone).await {
+                    return Err(DriverError::Timeout("QEMU to exit"));
                 }
             }
         }
@@ -3979,6 +3993,51 @@ time.sleep(60)
         assert!(!status.success());
         assert!(!dir.exists());
         assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn kill_sends_sigkill_without_qmp() {
+        for registered in [true, false] {
+            let tmp = short_tempdir();
+            let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+            let vm = spec();
+            let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+            let mut qemu = hold_pidfile(&dir).await;
+            // 등록된 VM(QMP 연결 있음)이어도 `quit`을 보내지 않고 곧바로 끝낸다.
+            let commands = if registered {
+                let fake = fake_qmp(&dir, "running").await;
+                let (pidfile, hangup) = (dir.join("qemu.pid"), fake.hangup);
+                // 실제 QEMU처럼 프로세스가 끝나면 QMP 연결이 끊긴다.
+                tokio::spawn(async move {
+                    while liveness(&pidfile) != Liveness::Dead {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    let _ = hangup.send(None);
+                });
+                Some(fake.commands)
+            } else {
+                drop(tokio::net::UnixListener::bind(dir.join("qmp.sock")).unwrap());
+                None
+            };
+            let hv = QemuHypervisor::new(cfg).await.unwrap();
+            assert_eq!(hv.handle(vm.id).is_some(), registered);
+
+            let started = std::time::Instant::now();
+            hv.stop(vm.id, StopMode::Kill).await.unwrap();
+            assert!(
+                started.elapsed() < FORCE_STOP_TIMEOUT,
+                "registered: {registered}"
+            );
+            let status = tokio::time::timeout(Duration::from_secs(2), qemu.wait())
+                .await
+                .expect("QEMU was not killed")
+                .unwrap();
+            assert!(!status.success());
+            if let Some(commands) = commands {
+                assert!(!commands.lock().unwrap().iter().any(|c| c == "quit"));
+            }
+            assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
+        }
     }
 
     #[tokio::test]
