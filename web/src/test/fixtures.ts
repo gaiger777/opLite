@@ -1,6 +1,7 @@
 import type {
   Backup,
   BackupJob,
+  HaCheck,
   HaGroup,
   Node,
   PlacementRule,
@@ -225,6 +226,62 @@ export function haGroup(name: string, n: number, spec: Partial<HaGroup["spec"]> 
     status: {},
   };
 }
+
+/** 테스트용 HA 검사: `storage` 역할의 링크 검사 `bond1`(서버처럼 기본값은 쓰지 않는다) */
+export function haCheck(name: string, n: number, spec: Partial<HaCheck["spec"]> = {}): HaCheck {
+  return {
+    id: `019a0f3c-0000-7000-800b-${String(n).padStart(12, "0")}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: { role: "storage", target: { kind: "link", iface: "bond1" }, ...spec } as HaCheck["spec"],
+    status: {},
+  };
+}
+
+/**
+ * 인터페이스와 HA 검사 결과를 보고한 노드: 본딩 bond0(eno1 정상, eno2 끊김)과 그 위의 브리지 vmbr0, 실패한
+ * 검사 `stor`, degraded 검사 `lan`, 통과한 자동 검사 `cluster-link-1`
+ */
+export const NET_NODE: Node = {
+  ...NODE,
+  status: {
+    ...NODE.status,
+    interfaces: [
+      {
+        name: "bond0",
+        kind: "bond",
+        state: "up",
+        carrier: true,
+        speed_mbps: 10000,
+        mac: "52:54:00:00:00:01",
+        master: "vmbr0",
+        bond: {
+          mode: "802.3ad",
+          state: "degraded",
+          ports: [
+            { name: "eno1", state: "up", speed_mbps: 10000, aggregator: 1 },
+            { name: "eno2", state: "down", aggregator: 2 },
+          ],
+        },
+      },
+      { name: "eno1", kind: "ethernet", state: "up", carrier: true, master: "bond0" },
+      { name: "eno2", kind: "ethernet", state: "down", carrier: false, master: "bond0" },
+      {
+        name: "vmbr0",
+        kind: "bridge",
+        state: "up",
+        carrier: true,
+        addresses: ["10.0.0.1/24"],
+      },
+    ],
+    checks: [
+      { name: "cluster-link-1", state: "ok" },
+      { name: "lan", state: "degraded", error: "bond0: eno2 down", since: 1_793_761_200 },
+      { name: "stor", state: "failing", error: "nfs pool is not mounted", since: 1_793_761_200 },
+    ],
+  },
+};
 
 /** 테스트용 배치 규칙: 켜진 `anti-affinity`(VM web1·web2) */
 export function placementRule(

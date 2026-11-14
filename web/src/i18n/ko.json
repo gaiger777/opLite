@@ -98,6 +98,7 @@
     "remotes": "원격 클러스터",
     "settings": "설정",
     "haGroups": "HA 그룹",
+    "haChecks": "HA 검사",
     "placementRules": "배치 규칙"
   },
   "header": {
@@ -178,11 +179,16 @@
       "node-update-check": "{{target}} 업데이트 확인",
       "node-upgrade": "{{target}} 업그레이드",
       "node-drain": "{{target}} 비우기",
-      "node-power-off": "{{target}} 전원 끄기(펜싱)"
+      "node-power-off": "{{target}} 전원 끄기(펜싱)",
+      "ha-check": "{{target}}의 HA 검사 {{check}}: {{action}}",
+      "bond-degraded": "{{target}}의 본딩 {{bond}} 포트 이상"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
       "migratingMemory": "메모리 옮기는 중"
+    },
+    "detail": {
+      "vms": "VM: {{vms}}."
     }
   },
   "pager": {
@@ -1078,6 +1084,59 @@
         "no_fence_checker": "이 노드의 전원을 읽어 줄 다른 온라인 노드가 없습니다. 다른 노드에서 시험하세요.",
         "fence_check_failed": "이웃 노드가 답하지 않았습니다: {{message}}"
       }
+    },
+    "checks": "상태 검사",
+    "checksFailing_one": "{{count}}개 실패",
+    "checksFailing_other": "{{count}}개 실패",
+    "checksNone": "검사 없음",
+    "checkState": {
+      "ok": "정상",
+      "degraded": "일부 이상",
+      "failing": "실패",
+      "unknown": "해당 없음"
+    },
+    "interfaces": {
+      "menu": "네트워크 인터페이스…",
+      "open": "{{name}}의 네트워크 인터페이스와 상태 검사: {{state}}",
+      "title": "{{name}}의 네트워크 인터페이스",
+      "description": "노드가 보고한 것입니다. 인터페이스 목록은 30초마다, 링크·본딩 상태는 5초마다 새로 읽습니다. up이 아닌 본딩 포트는 빨간 글자로 보입니다.",
+      "table": "인터페이스",
+      "none": "노드가 보고한 인터페이스가 없습니다(위트니스와 macOS 노드는 보고하지 않습니다).",
+      "kind": "종류",
+      "carrier": "링크",
+      "carrierYes": "있음",
+      "carrierNo": "없음",
+      "speed": "속도",
+      "master": "소속",
+      "addresses": "주소",
+      "port": "본딩 포트",
+      "portOf": "{{bond}}의 포트:",
+      "aggregator": "aggregator {{id}}",
+      "kinds": {
+        "ethernet": "이더넷",
+        "bond": "본딩",
+        "bridge": "브리지",
+        "vlan": "VLAN",
+        "dummy": "dummy",
+        "veth": "veth",
+        "other": "기타"
+      },
+      "bondState": {
+        "up": "정상",
+        "degraded": "일부 포트 이상",
+        "down": "끊김",
+        "unknown": "알 수 없음"
+      },
+      "portState": {
+        "up": "정상",
+        "down": "끊김(링크 없음)",
+        "lacp_mismatch": "LACP 어긋남(활성 aggregator가 아니거나 상대가 없음)",
+        "speed_mismatch": "다른 포트보다 느림",
+        "unknown": "알 수 없음"
+      },
+      "checks": "상태 검사",
+      "noChecks": "노드가 보고한 상태 검사가 없습니다.",
+      "since": "시작"
     }
   },
   "accounts": {
@@ -1595,6 +1654,87 @@
       "exists": "같은 이름의 HA 그룹이 있습니다.",
       "nodes": "노드를 하나 이상 고르세요.",
       "priority": "우선순위는 0~1000의 정수입니다."
+    }
+  },
+  "haChecks": {
+    "pageHint": "모든 노드가 5초마다 이 링크·핑 대상·스토리지 풀 경로를 검사하고 결과를 리스 갱신에 실어 보냅니다. 한 노드에서 검사가 grace보다 오래 실패하면 리더가 아래 설정대로 대응합니다. 보고한 노드의 과반에서 실패하면 공유 장비 문제로 보고 경고만 합니다. 자동으로 옮기는 것은 HA VM뿐입니다.",
+    "autoNote": "노드는 클러스터 링크도 스스로 검사합니다(cluster-link-1, cluster-link-2 …). 이 검사는 경고만 하고 노드 화면에 보입니다.",
+    "empty": "HA 검사가 없습니다.",
+    "role": "역할",
+    "target": "대상",
+    "targetKind": "검사",
+    "onFail": "실패하면",
+    "grace": "grace",
+    "graceLabel": "grace(초)",
+    "graceHint": "리더가 대응하기 전에 검사가 실패해야 하는 시간: 10~600초(검사 두 회차 이상). 비우면 10초입니다.",
+    "seconds": "{{n}}초",
+    "overrides": "노드별 대상",
+    "overridesHint": "일부 노드에서 다른 대상(예: 다른 인터페이스 이름)을 씁니다. 나머지 노드는 위의 대상을 씁니다.",
+    "overrideNode": "{{n}}번째 노드별 대상의 노드",
+    "chooseNode": "노드 고르기",
+    "addOverride": "노드별 대상 더하기",
+    "removeOverride": "{{node}}의 노드별 대상 빼기",
+    "ofNode": "{{node}}의 {{field}}",
+    "roleDefault": "(역할 기본)",
+    "defaultAction": "역할 기본: {{action}}",
+    "enabled": "켜짐",
+    "disabled": "꺼짐",
+    "enabledLabel": "모든 노드에서 검사",
+    "iface": "인터페이스",
+    "addresses": "주소",
+    "via": "보낼 인터페이스",
+    "need": "필요 수",
+    "pool": "스토리지 풀",
+    "choosePool": "공유 풀 고르기",
+    "roles": {
+      "management": "관리",
+      "storage": "스토리지",
+      "vm": "VM 네트워크"
+    },
+    "roleHint": {
+      "management": "노드의 관리 네트워크입니다. 전원 끄기 펜싱을 고르지 않으면 경고만 합니다.",
+      "storage": "공유 스토리지로 가는 길입니다. 디스크가 거기 있는 VM이 영향을 받고, 기본으로 다른 노드에서 다시 켭니다(디스크 I/O가 멈춘 VM은 라이브 마이그레이션할 수 없습니다).",
+      "vm": "VM이 쓰는 네트워크입니다. 인터페이스 뒤의 브리지에 NIC가 있는 VM이 영향을 받고, 기본으로 라이브 마이그레이션합니다."
+    },
+    "kinds": {
+      "link": "링크",
+      "ping": "핑",
+      "pool": "풀"
+    },
+    "kindHint": {
+      "link": "인터페이스에 링크가 있으면 통과입니다. 본딩은 일부 포트만 끊기면 일부 이상으로 보이고, 모두 끊기면 실패입니다.",
+      "ping": "주소마다 한 번(2초) 핑을 보내 필요 수 이상이 답하면 통과입니다. 보낼 인터페이스는 Linux에서만 씁니다.",
+      "pool": "풀의 작은 파일을 읽거나(NFS, 공유 디렉터리), iSCSI 세션과 multipath 경로를 보거나(공유 LVM), Ceph OSD에 묻습니다(RBD)."
+    },
+    "actions": {
+      "warn": "경고",
+      "migrate": "라이브 마이그레이션",
+      "restart_elsewhere": "다른 노드에서 다시 켜기",
+      "fence": "노드 전원 끄기"
+    },
+    "editNamed": "HA 검사 {{name}} 편집",
+    "deleteNamed": "HA 검사 {{name}} 삭제",
+    "deleteTitle": "HA 검사 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "노드가 이 검사를 그만합니다. 이미 옮긴 VM은 그대로 둡니다.",
+    "deleted": "HA 검사 {{name}}을(를) 삭제했습니다.",
+    "createTitle": "HA 검사 만들기",
+    "editTitle": "{{name}} 편집",
+    "dialogDescription": "클러스터의 모든 노드가 HA 검사를 아는 버전이어야 합니다.",
+    "saved": "HA 검사 {{name}}을(를) 저장했습니다.",
+    "created": "HA 검사 {{name}}을(를) 만들었습니다.",
+    "errors": {
+      "exists": "같은 이름의 HA 검사가 있습니다.",
+      "reserved": "cluster-link-로 시작하는 이름은 노드의 클러스터 링크 자동 검사가 씁니다.",
+      "iface": "인터페이스 이름은 /, :, 공백 없는 1~15자입니다.",
+      "addressCount": "IP 주소를 1~8개 주세요.",
+      "address": "IPv4나 IPv6 주소를 쉼표로 나눠 쓰세요.",
+      "duplicate": "같은 주소가 두 번 있습니다.",
+      "need": "필요 수는 1부터 주소 수까지의 정수입니다.",
+      "pool": "공유 스토리지 풀을 고르세요.",
+      "poolRole": "풀 검사는 스토리지 역할에만 씁니다.",
+      "action": "이 역할에서는 쓸 수 없는 대응입니다.",
+      "grace": "grace는 10~600의 정수(초)입니다.",
+      "overrideNode": "이 노드별 대상의 노드를 고르세요."
     }
   },
   "placementRules": {

@@ -5,7 +5,7 @@ import { http, HttpResponse } from "msw";
 import { applyEvent, listKey, type List } from "@/api/live";
 import type { Node } from "@/api/types";
 import { NodesPage } from "@/nodes/NodesPage";
-import { NODE, poolState, task, vm } from "@/test/fixtures";
+import { NET_NODE, NODE, poolState, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -113,6 +113,111 @@ it("shows how each node fences", async () => {
     "title",
     "ipmi: connection timed out",
   );
+});
+
+it("shows the health checks of each node and opens its interfaces", async () => {
+  cluster();
+  const degraded = {
+    ...DOWN,
+    status: { ...DOWN.status, checks: [{ name: "lan", state: "degraded" as const }] },
+  };
+  const witness = { ...NODE, id: "n3", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  mockLists({ node: [NET_NODE, degraded, witness] });
+  renderPage(<NodesPage />, { as: { ...ADMIN, role: "viewer" } });
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const column = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Health checks");
+  const cell = (name: string) =>
+    within(within(table).getByText(name).closest("tr")!).getAllByRole("cell")[column]!;
+  await within(table).findByText("node-a");
+  // 실패한 검사 수, 제목에 실패·degraded 검사의 이름과 오류
+  expect(within(cell("node-a")).getByText("1 failing")).toHaveAttribute(
+    "title",
+    "stor: nfs pool is not mounted\nlan: bond0: eno2 down",
+  );
+  expect(cell("node-b")).toHaveTextContent("Degraded");
+  // 위트니스는 검사하지 않는다.
+  expect(cell("node-w")).toHaveTextContent("—");
+  // 읽기만 하는 사람도 연다.
+  await userEvent.click(
+    within(cell("node-a")).getByRole("button", {
+      name: "Network interfaces and health checks of node-a: 1 failing",
+    }),
+  );
+  const dialog = await screen.findByRole("dialog", { name: "Network interfaces of node-a" });
+  const interfaces = within(dialog).getByRole("table", { name: "Interfaces" });
+  const rows = within(interfaces).getAllByRole("row");
+  const row = (name: string) => rows.find((r) => r.firstChild?.textContent === name)!;
+  const bond = row("bond0");
+  expect(bond).toHaveTextContent("Bond802.3ad");
+  expect(bond).toHaveTextContent("10 Gb/s");
+  expect(bond).toHaveTextContent("vmbr0");
+  expect(within(bond).getByText("Degraded")).toBeInTheDocument();
+  // 본딩 포트는 아래 줄에 보이고, 끊긴 포트는 빨간 글자와 상태 문구다.
+  const port = rows[rows.indexOf(bond) + 2]!;
+  expect(port).toHaveTextContent("Port of bond0:eno2");
+  expect(within(port).getByText("Down (no link)")).toHaveClass("text-destructive");
+  expect(within(rows[rows.indexOf(bond) + 1]!).getByText("Up")).not.toHaveClass("text-destructive");
+  expect(row("vmbr0")).toHaveTextContent("10.0.0.1/24");
+  const checks = within(dialog).getByRole("table", { name: "Health checks" });
+  // 실패가 시작된 때(노드 시계)와 오류
+  expect(within(checks).getByText("stor").closest("tr")).toHaveTextContent(
+    /^storFailing.*2026.*nfs pool is not mounted$/,
+  );
+  expect(within(checks).getByText("cluster-link-1").closest("tr")).toHaveTextContent(
+    "cluster-link-1OK—",
+  );
+});
+
+it("does not mark bond and port states it does not know as failures", async () => {
+  cluster();
+  const bond0 = NET_NODE.status.interfaces![0]!;
+  const unknown = {
+    ...NET_NODE,
+    status: {
+      ...NET_NODE.status,
+      interfaces: [
+        {
+          ...bond0,
+          bond: {
+            ...bond0.bond!,
+            state: "unknown" as const,
+            ports: [{ name: "eno1", state: "unknown" as const }],
+          },
+        },
+      ],
+    },
+  };
+  mockLists({ node: [unknown] });
+  renderPage(<NodesPage />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Network interfaces…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Network interfaces of node-a" });
+  const rows = within(within(dialog).getByRole("table", { name: "Interfaces" })).getAllByRole(
+    "row",
+  );
+  const bond = rows.find((r) => r.firstChild?.textContent === "bond0")!;
+  expect(within(bond).getByText("Unknown")).not.toHaveClass("text-destructive");
+  const port = rows[rows.indexOf(bond) + 1]!;
+  expect(within(port).getByText("Unknown")).not.toHaveClass("text-destructive");
+});
+
+it("opens the interfaces of a node from its menu", async () => {
+  cluster();
+  mockLists({ node: [{ ...NODE, status: { ...NODE.status, interfaces: [] } }] });
+  renderPage(<NodesPage />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Actions for node-a" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Network interfaces…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Network interfaces of node-a" });
+  expect(
+    within(dialog).getByText(
+      "The node reports no interfaces (witness nodes and macOS nodes do not).",
+    ),
+  ).toBeInTheDocument();
+  expect(within(dialog).getByText("The node reports no health checks.")).toBeInTheDocument();
 });
 
 it("shows the state of each pool on the node", async () => {

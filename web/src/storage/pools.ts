@@ -125,7 +125,7 @@ function validPort(port: string): boolean {
 }
 
 /** 대괄호 없는 IPv6 주소인지(서버의 `Ipv6Addr`처럼 브라우저의 URL 파서로 읽어 본다) */
-function validIpv6(addr: string): boolean {
+export function validIpv6(addr: string): boolean {
   if (!/^[0-9A-Fa-f:.]+$/.test(addr)) return false;
   try {
     new URL(`http://[${addr}]/`);

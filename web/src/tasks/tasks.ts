@@ -88,13 +88,37 @@ export function describeTask(
   const op = task.spec.op;
   const from = op.kind === "vm-ha-recover" ? (nodeName(op.from) ?? op.from) : undefined;
   const remote = op.kind === "backup-replicate" ? op.remote : undefined;
+  const check = op.kind === "ha-check" ? op.check : undefined;
+  const action = op.kind === "ha-check" ? t(`haChecks.actions.${op.action}`) : undefined;
+  const bond = op.kind === "bond-degraded" ? op.bond : undefined;
   // 모르는 작업(새 서버)은 번역 키 대신 종류를 그대로 보여 준다.
   return t(`tasks.op.${op.kind}`, {
     target,
     from,
     remote,
+    check,
+    action,
+    bond,
     defaultValue: `${op.kind} ${target}`,
   });
+}
+
+/**
+ * 기록 Task가 남긴 설명(실행하지 않는 Task라 오류 칸에는 실패만 있다): HA 검사 대응의 설명과 옮긴 VM, 본딩
+ * 포트의 상태. 없거나 오류와 같으면 null이다.
+ */
+export function describeDetail(task: Task, t: TFunction): string | null {
+  const op = task.spec.op;
+  if (op.kind === "ha-check") {
+    const vms = op.vms ?? [];
+    const parts = [op.detail, vms.length > 0 ? t("tasks.detail.vms", { vms: vms.join(", ") }) : ""];
+    const text = parts.filter((p) => p !== "" && p !== task.status.error).join(" ");
+    return text || null;
+  }
+  if (op.kind === "bond-degraded") {
+    return op.ports.join(", ") || null;
+  }
+  return null;
 }
 
 /** 바이트를 소수 한 자리 GiB 숫자로(`14.8`) */

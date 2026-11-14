@@ -5,7 +5,7 @@ export type Action = "read" | "write" | "operate";
 
 /** 권한을 따지는 리소스 종류. 이름은 서버의 `Kind`와 같다. */
 export type Kind =
-  WatchKind | "settings" | "user" | "api-token" | "join-token" | "realm" | "remote";
+  WatchKind | "settings" | "user" | "api-token" | "join-token" | "realm" | "remote" | "ha-check";
 
 /**
  * 계정 종류와 인증 영역. admin이 아니면 읽지도 못한다(자기 토큰과 비밀번호는 예외로 서버가 따로 허락한다).

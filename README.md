@@ -1228,7 +1228,7 @@ Node `status.ha`(`{"fencing": "watchdog"|"process", "recover_after_secs": …, "
 없다)·`status.fence_check`, `GET|PUT|DELETE /api/v1/nodes/{key}/fence`·`POST /api/v1/nodes/{key}/fence-test`, 설정
 `ha_reserve`·`ha_start_concurrency`, `GET /api/v1/cluster`의 멤버 `fencing`(꺼져 있으면 null)이다. HA 그룹·상태·재시작과 옮기기 횟수·배치 규칙·호스트 종료
 정책은 아래 "배치 규칙과 HA 정책"이다(같은 노드의 크래시 재시작도 거기서 정한다 — 옛 노드가 남은 동안은 `restart`가 정하므로
-`on-failure`를 권한다).
+`on-failure`를 권한다). 리스는 관리 네트워크만 본다 — 스토리지·VM 네트워크·본딩 포트의 장애는 아래 "HA 상태 검사"다.
 
 ```toml
 # /etc/opl/opld.toml (노드마다, 생략하면 아래 기본값)
@@ -1239,6 +1239,7 @@ watchdog_device = "/dev/watchdog" # Linux watchdog 장치(하드웨어 또는 so
 # watchdog_timeout_secs = 10      # 장치에 정하는 제한 시간(5~3600초, WDIOC_SETTIMEOUT). 적으면 프로필을 이긴다.
 # fence_after_secs = 10           # 마지막 리스 갱신 뒤 이만큼 지나면 HA VM을 끈다(1초 이상). 적으면 프로필을 이긴다.
 ipmitool = "ipmitool"             # 전원 끄기 펜싱의 IPMI 방법이 부르는 실행 파일(아래)
+ping = "ping"                     # HA 검사의 ping 대상이 부르는 실행 파일(아래 "HA 상태 검사")
 ```
 
 - **프로필과 기본값.** `profile`은 `fence_after_secs`·`watchdog_timeout_secs`를 함께 정하고, 둘 중 적은 값은 프로필을
@@ -1618,7 +1619,160 @@ HA VM과 이 버전 전의 VM은 바이트까지 옛 모양이고, `--ha`/`--no-
 
 **한계.** 위반을 바로잡는 균형 조정과 묶음 옮기기 API(뒤 계획), 종료 failover의 빠른 복구,
 꺼진 `started` HA VM의 노드 옮기기, 호스트 종료 때 HA 아닌 VM의 ACPI 종료는 없다. 리스·`failback` 30초는 리더의 메모리에만
-있으므로 리더가 바뀌면 다시 센다.
+있으므로 리더가 바뀌면 다시 센다. 스토리지·VM 네트워크 검사가 실패한 노드는 복구·옮기기·되돌아가기의 대상에서 빠진다(아래
+"HA 상태 검사").
+
+## HA 상태 검사
+
+리스는 노드가 관리 네트워크로 리더에 닿는지만 본다. 스토리지 네트워크(NFS, iSCSI·FC SAN의 공유 LVM, Ceph RBD)가 끊겨 VM
+디스크 I/O가 멈추거나 VM 네트워크·본딩 포트가 죽어도 리스는 살아 있다. **HA 검사**는 노드가 링크·핑 대상·스토리지 풀 경로를
+5초마다 검사해 결과를 리스 갱신에 실어 보내고, 리더가 `grace_secs`보다 오래 실패한 검사에 정한 대로 대응하는 것이다
+(VMware의 VM Component Protection·네트워크 격리 검사, Pacemaker `ethmonitor`와 같은 자리, Proxmox VE에는 없다). 검사 만들기·
+바꾸기와 리더의 경고 아닌 대응은 **모든 노드가 이 버전**이어야 한다(아니면 **409** `cluster_upgrading` — 노드가 알리는 기능
+`ha-checks`를 본다).
+
+```bash
+# 스토리지: NFS 풀 경로가 멈추면 그 풀에 디스크가 있는 HA VM을 다른 노드에서 다시 켬(역할 기본)
+orbivisorctl ha-check create nas --role storage --pool nas
+# VM 네트워크: bond1의 링크가 끊기면 그 뒤 브리지에 NIC가 있는 HA VM을 라이브 마이그레이션(역할 기본)
+orbivisorctl ha-check create vmnet --role vm --link bond1 --grace 15 --node node3=link:bond2
+# 관리 네트워크: 게이트웨이 둘 가운데 하나도 답하지 않으면 노드 전원 끄기(전원 끄기 펜싱이 있어야 함)
+orbivisorctl ha-check create mgmt --role management --ping 10.0.0.1,10.0.0.2@eno1 --need 1 --on-fail fence
+orbivisorctl ha-check list | get | delete
+orbivisorctl ha-check set vmnet --on-fail restart-elsewhere --no-node-overrides --disable
+orbivisorctl node interfaces node1     # NAME KIND STATE CARRIER SPEED MASTER ADDRESSES, 본딩은 아래 줄에 포트
+orbivisorctl node checks node1         # NAME STATE SINCE ERROR(-o json이면 status.checks)
+orbivisorctl node list                 # CHECKS 열: - · ok · degraded · failing:<이름,…>
+orbivisorctl task list                 # 리더의 대응 "ha-check", 본딩 알림 "bond-degraded"
+```
+
+웹은 "HA 검사" 화면(HA 그룹 다음 메뉴, 목록·만들기·편집·삭제, 누구나 읽고 admin만 바꿈 — 인터페이스는 모든 노드가 보고한
+이름에서 고르거나 직접 쓰고, 풀은 공유 풀에서 고르며, 노드별 대상 줄을 더한다), 노드 화면의 "상태 검사" 열(실패한 검사 수 배지,
+제목에 검사 이름과 오류, 누르면 대화상자)과 노드 메뉴의 "네트워크 인터페이스…"(종류·상태·링크·속도·소속·주소, 본딩은 모드와
+`degraded`·`down` 배지, 포트는 아래 줄이고 `up`이 아니면 빨간 글자와 상태 문구, 그 아래 이 노드의 검사 결과·시작 시각·오류),
+작업 목록의 "node-b의 HA 검사 nas: 다른 노드에서 다시 켜기"(설명과 옮긴 VM은 아래 줄)·"node-b의 본딩 bond0 포트 이상"이다. API는
+`/api/v1/ha-checks`(목록·조회·만들기 `POST`·통째로 바꾸기 `PUT`(If-Match)·`DELETE`; watch 종류가 아니어서 웹은 바꾼 뒤 목록을
+다시 읽는다), Node `status.interfaces`·`status.checks`, VM `status.ha.evict`, 기록 Task `ha-check`·`bond-degraded`다.
+
+**검사(`HaCheck`).** 이름(리소스 이름)과 `role`, `target`, `on_fail`(없으면 역할 기본), `grace_secs`(10~600, 기본 10 — 검사
+회차 둘보다 짧으면 한 번의 실패로 대응하므로 받지 않는다),
+`nodes`(노드 이름 → 그 노드의 대상, 종류는 `target`과 같아야 함), `enabled`(기본 켬)다. 클러스터에 64개까지다.
+
+- **역할.** `storage`(공유 스토리지로 가는 길), `vm`(VM이 쓰는 네트워크), `management`(노드의 관리 네트워크). 역할이 기본
+  대응과 영향받는 VM을 정한다.
+- **대상.** `link { iface }`: 인터페이스(본딩이면 본딩)의 링크. `ping { addresses, via?, need = 1 }`: 주소(1~8개)마다 ICMP 하나,
+  `need`개 이상 답하면 통과. `pool { name }`: 공유 스토리지 풀(NFS·공유 LVM·RBD·`shared` 디렉터리)의 경로 — `storage`만 쓰고,
+  로컬 풀은 **400** "pool checks need a shared pool (nfs, lvm-shared, rbd or shared dir)".
+- **노드별 대상.** 노드마다 인터페이스 이름이 다르면 `nodes`로 덮는다(CLI `--node NAME=link:IFACE|ping:ADDR[,ADDR][@IFACE]|pool:NAME`).
+  없는 노드 이름은 **400**. 위트니스는 검사하지 않는다. API는 인터페이스가 노드에 있는지 보지 않는다: 그 노드에 없는
+  인터페이스의 검사는 `unknown`이므로 이름이 다른 노드는 덮어 써야 검사된다.
+- **자동 관리 검사.** 각 노드는 클러스터 링크마다(`cluster_addresses`의 호스트, 없으면 `address` — 이름이면 IP로 풀어서; 아래 "클러스터 통신 다중 링크")
+  `cluster-link-1`, `cluster-link-2` … 검사를 스스로 만든다: 그 주소를 가진 인터페이스의 `link`, 역할 `management`, 늘 경고만.
+  리소스가 아니라 노드의 보고에만 있고(`cluster-link-`로 시작하는 이름은 **400**), 그 주소를 가진 인터페이스가 없으면
+  `unknown`("no interface has address …")이다. 한 번 짝지은 인터페이스는 기억해 주소를 잃어도 계속 검사한다.
+
+**판정.** 결과는 `ok`, `degraded`(통과 — 본딩 일부 포트, multipath 일부 경로), `failing`, `unknown`(이 노드에 해당 없음:
+풀을 쓰지 않는 노드, 없는 풀, 지원하지 않는 OS — 실패도 통과도 아니다)이다.
+
+- **링크.** sysfs `carrier`가 1이고 operstate가 `up`·`unknown`(dummy 등)이면 통과. 인터페이스가 없으면, 그 orbivisord가 이
+  노드에서 한 번도 본 적 없는 이름은 `unknown`("interface X not found on this node" — 이름이 다른 노드가 혼자 실패해 과반 보호
+  없이 VM을 옮기지 않게), 본 뒤에 사라졌으면 `failing`이다(본 이름은 저장된 노드 상태의 인터페이스 목록에서 시작하므로 다시
+  시작해도 남는다). 본딩은 아래 포트 판정으로 본딩이 `down`이거나 본딩 자체의 carrier가 0이면 `failing`, `degraded`면
+  `degraded`다. 브리지는 VM의 tap 포트가 carrier를 지키므로 업링크로 본다: 브리지 포트(`brif`) 가운데 물리 NIC·본딩·VLAN(다른
+  장치 위의 장치)만 세고(tap·veth·`oplx*`는 뺌) 링크가 있는 것이 하나도 없으면 `failing`("bridge br0 has no uplink with a link
+  (eno1 down)"), 그런 포트가 없는 내부 브리지는 브리지 자신의 carrier다.
+- **핑.** 시스템 `ping`을 주소마다 동시에 부른다(Linux `ping -n -q -c 2 -i 0.2 -W 2 [-I via]` — 0.2초 간격 둘 가운데 하나라도
+  답하면 그 주소는 통과, 한 번의 손실로 실패하지 않는다). 경로는 `[ha] ping`(기본 PATH의
+  `ping`, ICMP 권한은 그 실행 파일의 것, 패키지는 `iputils-ping`에 기댄다). `ping`이 없거나 실행할 수 없으면 대상의 실패가 아니라
+  `unknown`("ping not found: install iputils-ping")이다. `via` 인터페이스가 이 노드에 없으면 링크 검사와 같게 본 적이 없으면
+  `unknown`, 본 뒤 사라졌으면 `failing`이다(macOS는 sysfs가 없어 `via`가 있는 핑이 `unknown`). macOS의 IPv6는 `failing` "not
+  supported on this OS"다.
+- **풀.** NFS(`{data_dir}/pools/<풀 id>`가 마운트돼 있지 않으면 "nfs pool is not mounted")·공유 디렉터리: 디렉터리 `stat`과
+  `.orbivisor-health-<노드 id>` 파일을 새로 열어 64바이트 읽기(NFS의 close-to-open이 서버에 묻게)를 3초 안에 — 넘으면 `failing`
+  "not responding"이고 그 작업이 끝날 때까지 새로 띄우지 않는다. 공유 LVM: iSCSI 타깃이면 `LOGGED_IN` 세션이 있어야 하고, VG의
+  PV(`pvs`, 60초마다 — `/dev/disk/by-id/…` 같은 링크 이름은 따라간 장치로)가 multipath(dm) 장치면 `/sys/block/dm-N/slaves`의
+  SCSI 장치 `state == running`(NVMe는 `live`)을 센다(슬레이브가 또 dm이면
+  — multipath 위의 파티션 — 4단까지 따라 내려간다) — 0이면 `failing`, 일부면 `degraded`("2 of 4 paths running"). RBD: `rados …
+  --client_mount_timeout 3 --rados_osd_op_timeout 3 stat orbivisor-health-probe`(8초)가 끝나거나 `stat`이 객체가 없다고 답하면
+  (`error stat-ing …: (2) …` — OSD가 답함) 통과다. 그 밖의 오류는 ENOENT여도(지운 풀, 없는 keyring) `failing`이고 문구는 stderr의
+  마지막 줄에서 앞의 시각·스레드 id를 뗀 것이다. `rados`가 없으면 `unknown`("rados not found: install ceph-common"). NFS·공유
+  LVM·RBD 검사는 Linux만이다(macOS는 `unknown`).
+- **본딩 포트.** `/sys/class/net/<bond>/bonding/slaves`·`mode`와 포트마다 `operstate`·`carrier`·`speed`, 802.3ad면
+  `/proc/net/bonding/<bond>`의 활성 aggregator와 포트별 aggregator·상대 MAC을 본다. 포트 상태: `down`(carrier 0·MII down·
+  operstate down), `lacp_mismatch`(활성 aggregator가 아님, 또는 상대 MAC이 `00:00:00:00:00:00`), `speed_mismatch`(올라온 포트
+  가운데 가장 빠른 것보다 느림), `up`. 본딩은 모든 포트가 `up`이면 `up`, 일부만이면 `degraded`, 링크가 있는(`down`이 아닌) 포트가
+  하나도 없을 때만 `down`이다 — LACP 상대가 없는 802.3ad(스위치에 LACP 설정이 없음)는 모든 포트가 `lacp_mismatch`여도 트래픽이
+  지나가므로 `degraded`(통과)다. 뒤 버전이 더한 본딩·포트 상태는 `unknown`으로 읽고 이상으로 보이지 않는다.
+- **인터페이스 보고.** 노드가 30초마다 `ip -j -d addr show`로 목록(이름·종류·operstate·소속·MAC·주소, `lo`·tap·`oplv*`/`oplx*`
+  빼고)을 읽고, 5초마다 sysfs로 링크·본딩을 새로 고쳐 `status.interfaces`에 64개까지(넘치면 주소가 있는 인터페이스를 먼저) 쓴다.
+  자동 검사의 인터페이스 찾기는 자르기 전 목록에서 한다. 검사 결과(`status.checks`)와 함께 바뀌었을 때만 쓴다. `ip`가 없거나
+  (macOS) 실패하면 기록된 목록을 지우지 않는다.
+
+**대응.** 리더가 1초마다 리스에 실린 결과를 본다(Raft 쓰기 없음). grace는 리더 시계로 재고(노드의 `since`는 화면용), 리더가
+바뀌면 처음부터 다시 잰다. 한 실패(같은 노드·같은 검사)에 한 번 대응하고, 회복한 뒤 다시 실패하면 또 한다.
+
+- **과반이면 경고만.** 같은 검사를 `ok`·`degraded`·`failing`으로 보고한 노드 가운데 `failing`이 과반이면 노드 문제가 아니라
+  공유 장비(스토리지 자체, 스위치) 문제로 보고 모든 노드에서 경고만 한다(기록 Task "failing on k of n nodes; treating it as a
+  shared failure"). 두 노드 가운데 하나만 실패하면 과반이 아니고, 보고한 노드가 하나면 늘 과반이다.
+- **역할 기본과 허용.** `storage` → `restart_elsewhere`(warn·fence도 됨, `migrate`는 **400** — 디스크 I/O가 멈춘 VM은 라이브
+  마이그레이션할 수 없다), `vm` → `migrate`(넷 다), `management` → `warn`(warn·fence만). 자동 검사(`cluster-link-*`)는 늘 경고다.
+- **영향받는 VM.** 그 노드에 자리 잡은 켜진 VM 가운데 — `storage` + `pool`: 그 풀에 디스크가 있음, `storage` + 링크·핑: 공유
+  풀에 디스크가 하나라도 있음, `vm` + 링크: NIC의 브리지가 그 인터페이스 뒤에 있음(인터페이스 자신이 브리지이거나 소속(`master`)을
+  따라 올라간 브리지, 그 인터페이스나 그 위가 노드의 underlay 주소를 가졌으면 VXLAN 네트워크 모두), `vm` + 핑: `via`가 있으면
+  링크와 같고 없으면 NIC가 있는 모든 VM, `management`: 그 노드의 HA VM(전원 끄기 기록용).
+- **자동 대응은 HA VM만**(`ha` 상태 `started`·`stopped`). 나머지 영향받는 VM은 기록 Task 문구("also affects N VMs without HA")에만
+  남는다.
+- `warn`: 경고 로그와 기록 Task `ha-check`(succeeded) 한 번.
+- `migrate`: 영향받는 HA VM을 이름 순으로 라이브 마이그레이션한다(원본 노드마다 진행 중 작업 `ha_start_concurrency`개까지, 나머지는
+  다음 틱). 대상은 그 노드가 아니고 리스가 살아 있으며 같은 검사가 실패하지 않은 노드다. 옮기기 창(10분) 안에 이미
+  `max_relocate`번 옮긴 VM은 옮기지 않고 `status.ha.error`("HA check … failed; not moving the VM: gave up after N relocations")만
+  남긴다(그 노드에서 검사 실패가 끝나면 리더가 지운다). 옮기면 옮기기 한 번으로 센다. 거절된 마이그레이션은 그 VM만 60초 뒤
+  다시, 받을 노드가 없으면 경고.
+- `restart_elsewhere`: (1) 리더가 영향받는 HA VM의 status에 끄기 요청 `ha.evict`를 쓴다. `max_relocate`에 닿은 VM은 끄지 않고
+  `ha.error`만 남기고(스토리지가 돌아오면 그대로 산다), 받을 노드(그 노드가 아니고 리스가 살아 있으며 같은 검사가 막지 않는 노드 —
+  앞 VM과 앞서 요청한 VM이 갈 곳을 셈)가 없는 VM도 끄지 않는다(경고 한 번, 받을 노드가 생기면 그때 요청). 한 노드의 요청을 한
+  번에 몇 개까지 내는 상한은 없다(영향받는 HA VM 모두). 받을 노드가 없어 아무것도 요청하지 않았으면 기록 Task도 쓰지 않는다.
+  (2) 그 노드의 reconciler가 QEMU를 QMP 없이 곧바로 SIGKILL하고(10초 안에
+  끝나지 않으면 — I/O에 멈춘 D 상태 프로세스 — 실패), 파일 볼륨(디렉터리·NFS 풀)을 열어 `fsync`해 이 노드 캐시에 남은 쓰기를
+  내보내고(5초 안에 — SIGKILL 뒤 커널에 남은 쓰기가 나중에 다른 노드의 VM이 쓴 이미지를 덮지 않게, 끝나지 않은 작업은 끝날
+  때까지 새로 띄우지 않음), 디스크 볼륨을 끈 뒤(공유 LVM의 배타 활성을 풀어야 다른 노드가 켠다) phase
+  `failed`·"HA check … failed on this node; restarting elsewhere"와 옮겨 달라는 표시(`relocate_from`)를 쓰고 요청을 지운다. 끄기나
+  내보내기·볼륨 끄기가 실패하면 오류만 남기고(껐으면 phase `failed`) 다시 해 본다. 그래서 **NFS에서 서버에 닿지 못하면
+  `restart_elsewhere`는 사실상 전원 끄기로 끝난다**(아래 (4) — 이 노드의 캐시가 나중에 덮어쓰지 않게). 크래시로 세지 않고 원하는
+  상태는 그대로다. (3) 리더가 재시작 옮기기와 같은
+  길로 다른 노드에서 켠다(`max_relocate`에 셈). (4) 노드가 20초 안에 요청을 거두지 않으면(답 없음, 끄기 실패) 이유를 다시 본다:
+  검사가 아직 있고 켜져 있으며 대응이 아직 `restart_elsewhere`이고 그 노드에서 실패하고 공유 실패가 아니면 노드마다 한 번(리더
+  임기 안 — 같은 노드에 뒤에 낸 요청은 다시 넘기지 않는다), 그 노드에 전원 끄기 펜싱이 있으면 전원
+  끄기를 요청하고(기록 Task "the node did not stop VMs a, b within 20s; requested a power-off of the node") 확인한 뒤 노드 장애처럼
+  모든 HA VM을 복구하며, 없으면 경고와 실패 기록 Task "the node did not stop the VM and has no power fencing; leaving it"만 남긴다
+  (요청은 남아 노드가 나중에 끄면 이어서 옮긴다). 이유가 사라졌으면(회복, 공유 실패로 바뀜, 검사를 지우거나 끄거나 대응을 바꿈)
+  리더가 요청을 거둔다 — 넘긴 뒤에도 틱마다 본다. VM을 끄거나(`spec.power = stopped`) HA를 끄면 요청이 지워진다. 요청이 있는 동안은 되돌아가기가 그 VM을 건드리지 않고
+  사용자 마이그레이션은 **409** `vm_busy`("the VM is being restarted elsewhere by an HA check")다. 이 Mac의 `ha-it`에서 carrier를
+  끊고 다른 노드에서 VM이 켜지기까지 약 17초였다(grace 10초).
+- `fence`: 그 노드에 전원 끄기 펜싱이 있으면 리스 만료 때와 같은 길(임기마다 노드 수의 소수까지, 리더 자신은 실패 Task)로 끄기를
+  요청하고(기록 Task "…; requested a power-off of the node"), 확인되면 노드 장애처럼 모든 HA VM을 복구한다 — `max_relocate`에
+  세지 않는다. 없으면 실패 기록 Task "no power fencing configured".
+- **대상 거르기.** 노드 장애 복구·재시작 옮기기·되돌아가기·`migrate`는 그 VM에 영향을 주는 켜진 `storage`·`vm` 검사를
+  `failing`으로 보고한 노드로 옮기지 않는다(grace와 상관없이, 과반 실패여도). 보고하지 않은 노드(옛 버전)·`unknown`은 막지
+  않는다. 노드 장애를 복구하는 틱에는 검사 대응을 하지 않는다(다음 틱).
+
+**본딩 알림.** 노드의 본딩 상태가 바뀌어 세 회차(15초) 이어지면 그 노드의 감사 로그에 `node.bond-degraded`·`node.bond-down`·
+`node.bond-recovered`(target 노드, detail "bond0: eno2 down, eno3 lacp_mismatch")를 적는다 — 감사 로그는 API 노드만 있으므로 API를
+끈 노드는 적지 않는다. `degraded`·`down`이 되면 기록 Task `bond-degraded`(포트와 상태)도 쓴다(모든 노드가 `ha-checks`일 때만).
+저하·끊김의 감사·Task는 본딩마다 10분에 한 번까지이고(흔들리는 포트가 알림을 쏟아내지 않게, 그 사이는 로그만 — 다만
+`degraded`에서 `down`으로 나빠지면 간격과 상관없이 알린다), 회복은 감사와 로그뿐이며 그 저하·끊김을 알렸을 때만 남긴다. 노드가 시작할 때 이미 `up`이 아닌 본딩도 같은 규칙으로 한 번 알린다. 본딩이 일부 포트로 살아 있는 동안은
+경고만 하고 대응하지 않는다.
+
+**업그레이드 중.** 옛 노드는 결과를 보내지 않고(리더에게는 결과 없음 = 대응 없음) 옛 리더는 결과를 버린다. 모든 노드가
+`ha-checks`를 알기 전에는 검사를 만들 수 없고, 이미 있는 검사가 실패해도 리더는 대응 대신 경고 로그만 남긴다(임기마다 한 번).
+
+**한계.** VXLAN 네트워크는 underlay 주소를 가진 인터페이스(또는 그 위)의 검사로만 이어진다. VLAN 하위 인터페이스의 부모는
+따라가지 않는다(`master`만). `vm` + 핑은 `via`가 없으면 NIC가 있는 모든 VM에 영향을 준다. multipath는 sysfs의 SCSI 장치 상태라 경로
+실패 감지가 SCSI 제한 시간만큼 늦다. 공유 LVM 검사의 `pvs`(5초 제한)가 한 회차를 늦출 수 있다. 클러스터 링크의 호스트 이름은
+처음 풀린 IP를 기억하므로 DNS가 바뀌면 orbivisord를 다시 시작해야 자동 검사가 새 주소를 본다. 실제 본딩·LACP 어긋남·NFS 서버
+멈춤·iSCSI 경로 끊기는 자동 시험 없이 손으로 확인한다(Linux CI는 veth·dummy·본딩으로 링크 판정만 본다). 공유 디렉터리 풀의
+마운트가 사라지면 probe가 마운트 지점(루트 파일시스템)에 써서 통과하고, 읽기 전용 export는 probe 파일을 만들지 못해 늘 실패한다.
+`restart_elsewhere`로 끈 VM은 받을 노드가 사라지면 원래 노드가 회복해도 다른 노드를 기다린다(재시작 옮기기와 같다).
 
 ## 제어부 가용성
 

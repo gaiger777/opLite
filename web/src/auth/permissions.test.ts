@@ -28,6 +28,8 @@ it("mirrors the server roles", () => {
   // HA 그룹과 배치 규칙은 누구나 읽고 admin만 바꾼다(마이그레이션의 force도 배치 규칙 쓰기 권한이다).
   expect(can("viewer", "read", "ha-group")).toBe(true);
   expect(can("operator", "write", "ha-group")).toBe(false);
+  expect(can("viewer", "read", "ha-check")).toBe(true);
+  expect(can("operator", "write", "ha-check")).toBe(false);
   expect(can("viewer", "read", "placement-rule")).toBe(true);
   expect(can("operator", "write", "placement-rule")).toBe(false);
   expect(can("admin", "write", "placement-rule")).toBe(true);

@@ -14,6 +14,7 @@ import { BackupJobsPage } from "@/backups/BackupJobsPage";
 import { BackupsPage } from "@/backups/BackupsPage";
 import { ClusterPage } from "@/cluster/ClusterPage";
 import { Toaster } from "@/components/ui/sonner";
+import { HaChecksPage } from "@/ha-checks/HaChecksPage";
 import { HaGroupsPage } from "@/ha-groups/HaGroupsPage";
 import { ImportPage } from "@/imports/ImportPage";
 import { ImportsPage } from "@/imports/ImportsPage";
@@ -74,6 +75,7 @@ function routes() {
             { path: "security-groups/:name", element: <SecurityGroupPage /> },
             { path: "nodes", element: <NodesPage /> },
             { path: "ha-groups", element: <HaGroupsPage /> },
+            { path: "ha-checks", element: <HaChecksPage /> },
             { path: "placement-rules", element: <PlacementRulesPage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "audit", element: <AuditPage /> },

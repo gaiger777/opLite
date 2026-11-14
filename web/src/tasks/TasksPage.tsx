@@ -17,7 +17,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatTime, uuidTime } from "@/lib/format";
-import { describeProgress, describeTask } from "@/tasks/tasks";
+import { describeDetail, describeProgress, describeTask } from "@/tasks/tasks";
 
 /** 한 페이지에 보일 Task 수. API에 페이지 나누기가 없어 모두 받아 화면에서 나눈다. */
 export const TASK_PAGE_SIZE = 50;
@@ -122,6 +122,7 @@ export function TaskTable({
           const time = uuidTime(task.id);
           const label = describeTask(task, t, name, (id) => nodeById.get(id)?.name);
           const progress = describeProgress(task, t);
+          const detail = describeDetail(task, t);
           return (
             <TableRow key={task.id}>
               <TableCell className="whitespace-nowrap">
@@ -135,6 +136,7 @@ export function TaskTable({
                 ) : (
                   label
                 )}
+                {detail && <span className="block text-xs text-muted-foreground">{detail}</span>}
               </TableCell>
               <TableCell>{node?.name ?? "—"}</TableCell>
               <TableCell>

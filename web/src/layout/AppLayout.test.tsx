@@ -39,6 +39,8 @@ it("hides account pages from other roles", async () => {
   expect(screen.getByRole("link", { name: "Imports" })).toHaveAttribute("href", "/imports");
   // HA 그룹과 배치 규칙도 누구나 읽는다(바꾸기는 admin만).
   expect(screen.getByRole("link", { name: "HA groups" })).toHaveAttribute("href", "/ha-groups");
+  // HA 검사도 누구나 읽는다(바꾸기는 admin만).
+  expect(screen.getByRole("link", { name: "HA checks" })).toHaveAttribute("href", "/ha-checks");
   expect(screen.getByRole("link", { name: "Placement rules" })).toHaveAttribute(
     "href",
     "/placement-rules",

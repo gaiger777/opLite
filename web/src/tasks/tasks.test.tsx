@@ -8,6 +8,7 @@ import { Toaster } from "@/components/ui/sonner";
 import i18n from "@/i18n";
 import { ThemeProvider } from "@/lib/theme";
 import {
+  describeDetail,
   describeTask,
   onTrack,
   resetTasks,
@@ -149,6 +150,46 @@ it("names the power-off of a fenced node", () => {
     },
   } as Task;
   expect(describeTask(off, i18n.t, "node-b")).toBe("Power off node-b (fencing)");
+});
+
+it("names the leader's HA check reactions and bond warnings with their details", () => {
+  const moved = {
+    ...task("6", "succeeded"),
+    spec: {
+      op: {
+        kind: "ha-check",
+        check: "stor",
+        action: "restart_elsewhere",
+        vms: ["db", "web"],
+        detail: "HA check stor failed on node-b",
+      },
+      target: "id-b",
+      node: "id-a",
+    },
+  } as Task;
+  expect(describeTask(moved, i18n.t, "node-b")).toBe("HA check stor on node-b: Restart elsewhere");
+  expect(describeDetail(moved, i18n.t)).toBe("HA check stor failed on node-b VMs: db, web.");
+  // 실패한 기록은 설명이 오류 칸에 있으므로 되풀이하지 않는다.
+  const failed = {
+    ...moved,
+    spec: { ...moved.spec, op: { ...moved.spec.op, vms: [], action: "fence" } },
+    status: { state: "failed", error: "HA check stor failed on node-b" },
+  } as Task;
+  expect(describeTask(failed, i18n.t, "node-b")).toBe(
+    "HA check stor on node-b: Power off the node",
+  );
+  expect(describeDetail(failed, i18n.t)).toBeNull();
+  const bond = {
+    ...task("7", "succeeded"),
+    spec: {
+      op: { kind: "bond-degraded", bond: "bond0", ports: ["eno2: down", "eno3: lacp_mismatch"] },
+      target: "id-b",
+      node: "id-b",
+    },
+  } as Task;
+  expect(describeTask(bond, i18n.t, "node-b")).toBe("Bond bond0 on node-b lost ports");
+  expect(describeDetail(bond, i18n.t)).toBe("eno2: down, eno3: lacp_mismatch");
+  expect(describeDetail(task("8", "succeeded"), i18n.t)).toBeNull();
 });
 
 it("waits for a task and rejects with its error when it fails", async () => {

@@ -98,6 +98,7 @@
     "remotes": "Remote clusters",
     "settings": "Settings",
     "haGroups": "HA groups",
+    "haChecks": "HA checks",
     "placementRules": "Placement rules"
   },
   "header": {
@@ -178,11 +179,16 @@
       "node-update-check": "Check updates on {{target}}",
       "node-upgrade": "Upgrade {{target}}",
       "node-drain": "Drain {{target}}",
-      "node-power-off": "Power off {{target}} (fencing)"
+      "node-power-off": "Power off {{target}} (fencing)",
+      "ha-check": "HA check {{check}} on {{target}}: {{action}}",
+      "bond-degraded": "Bond {{bond}} on {{target}} lost ports"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
       "migratingMemory": "Migrating memory"
+    },
+    "detail": {
+      "vms": "VMs: {{vms}}."
     }
   },
   "pager": {
@@ -1078,6 +1084,59 @@
         "no_fence_checker": "No other online node can read this node's power. Test it from another node.",
         "fence_check_failed": "The neighbour node did not answer: {{message}}"
       }
+    },
+    "checks": "Health checks",
+    "checksFailing_one": "{{count}} failing",
+    "checksFailing_other": "{{count}} failing",
+    "checksNone": "no checks",
+    "checkState": {
+      "ok": "OK",
+      "degraded": "Degraded",
+      "failing": "Failing",
+      "unknown": "Not applicable"
+    },
+    "interfaces": {
+      "menu": "Network interfaces…",
+      "open": "Network interfaces and health checks of {{name}}: {{state}}",
+      "title": "Network interfaces of {{name}}",
+      "description": "What the node reports: the interface list every 30 seconds, link and bond state every 5 seconds. Bond ports that are not up are shown in red.",
+      "table": "Interfaces",
+      "none": "The node reports no interfaces (witness nodes and macOS nodes do not).",
+      "kind": "Kind",
+      "carrier": "Link",
+      "carrierYes": "Yes",
+      "carrierNo": "No",
+      "speed": "Speed",
+      "master": "Member of",
+      "addresses": "Addresses",
+      "port": "Bond port",
+      "portOf": "Port of {{bond}}:",
+      "aggregator": "Aggregator {{id}}",
+      "kinds": {
+        "ethernet": "Ethernet",
+        "bond": "Bond",
+        "bridge": "Bridge",
+        "vlan": "VLAN",
+        "dummy": "Dummy",
+        "veth": "veth",
+        "other": "Other"
+      },
+      "bondState": {
+        "up": "Up",
+        "degraded": "Degraded",
+        "down": "Down",
+        "unknown": "Unknown"
+      },
+      "portState": {
+        "up": "Up",
+        "down": "Down (no link)",
+        "lacp_mismatch": "LACP mismatch (not in the active aggregator or no partner)",
+        "speed_mismatch": "Slower than the other ports",
+        "unknown": "Unknown"
+      },
+      "checks": "Health checks",
+      "noChecks": "The node reports no health checks.",
+      "since": "Since"
     }
   },
   "accounts": {
@@ -1595,6 +1654,87 @@
       "exists": "An HA group with this name already exists.",
       "nodes": "Choose at least one node.",
       "priority": "Priorities are whole numbers from 0 to 1000."
+    }
+  },
+  "haChecks": {
+    "pageHint": "Every node checks these links, ping targets and storage pool paths every 5 seconds and sends the results with its lease. When a check fails on a node for longer than the grace time, the leader reacts as set below. If a check fails on most of the nodes reporting it, the leader treats it as a shared failure and only warns. Only HA VMs are moved.",
+    "autoNote": "Each node also checks its cluster links by itself (cluster-link-1, cluster-link-2 …). Those checks only warn and are shown with the node.",
+    "empty": "No HA checks.",
+    "role": "Role",
+    "target": "Target",
+    "targetKind": "Check",
+    "onFail": "On failure",
+    "grace": "Grace",
+    "graceLabel": "Grace (seconds)",
+    "graceHint": "How long the check must fail before the leader reacts: 10 to 600 seconds (at least two check rounds). Empty means 10.",
+    "seconds": "{{n}} s",
+    "overrides": "Node overrides",
+    "overridesHint": "A different target on some nodes, such as another interface name. Other nodes use the target above.",
+    "overrideNode": "Node of override {{n}}",
+    "chooseNode": "Choose a node",
+    "addOverride": "Add node override",
+    "removeOverride": "Remove the override for {{node}}",
+    "ofNode": "{{field}} on {{node}}",
+    "roleDefault": "(role default)",
+    "defaultAction": "Role default: {{action}}",
+    "enabled": "On",
+    "disabled": "Off",
+    "enabledLabel": "Check on all nodes",
+    "iface": "Interface",
+    "addresses": "Addresses",
+    "via": "Via interface",
+    "need": "Need",
+    "pool": "Storage pool",
+    "choosePool": "Choose a shared pool",
+    "roles": {
+      "management": "Management",
+      "storage": "Storage",
+      "vm": "VM network"
+    },
+    "roleHint": {
+      "management": "The node's management network. Failing it only warns unless you choose power-off fencing.",
+      "storage": "The path to shared storage. VMs with disks on it are affected; by default they are restarted on another node, since a VM with stuck disk I/O cannot be live migrated.",
+      "vm": "A network VMs use. VMs with NICs on the bridges behind the interface are affected; by default they are live migrated."
+    },
+    "kinds": {
+      "link": "Link",
+      "ping": "Ping",
+      "pool": "Pool"
+    },
+    "kindHint": {
+      "link": "Passes while the interface has a link. For a bond, losing some ports only shows as degraded; losing all fails.",
+      "ping": "Pings each address once (2 seconds); passes when at least Need addresses answer. Via picks the interface (Linux only).",
+      "pool": "Reads a small file on the pool (NFS, shared directory), checks the iSCSI sessions and multipath paths (shared LVM) or asks the Ceph OSDs (RBD)."
+    },
+    "actions": {
+      "warn": "Warn",
+      "migrate": "Live migrate",
+      "restart_elsewhere": "Restart elsewhere",
+      "fence": "Power off the node"
+    },
+    "editNamed": "Edit HA check {{name}}",
+    "deleteNamed": "Delete HA check {{name}}",
+    "deleteTitle": "Delete HA check {{name}}?",
+    "deleteDescription": "Nodes stop running the check. VMs already moved stay where they are.",
+    "deleted": "HA check {{name}} deleted.",
+    "createTitle": "Create HA check",
+    "editTitle": "Edit {{name}}",
+    "dialogDescription": "All nodes in the cluster must run a version that knows HA checks.",
+    "saved": "HA check {{name}} saved.",
+    "created": "HA check {{name}} created.",
+    "errors": {
+      "exists": "An HA check with this name already exists.",
+      "reserved": "Names starting with cluster-link- are for the nodes' own cluster link checks.",
+      "iface": "Use an interface name of 1–15 characters without /, : or spaces.",
+      "addressCount": "Give 1 to 8 IP addresses.",
+      "address": "Use IPv4 or IPv6 addresses, separated by commas.",
+      "duplicate": "An address is given twice.",
+      "need": "Need is a whole number from 1 to the number of addresses.",
+      "pool": "Choose a shared storage pool.",
+      "poolRole": "Pool checks need the storage role.",
+      "action": "This role does not allow that reaction.",
+      "grace": "Grace is a whole number of seconds from 10 to 600.",
+      "overrideNode": "Choose the node for this override."
     }
   },
   "placementRules": {

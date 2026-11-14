@@ -36,7 +36,9 @@ import {
 } from "@/components/ui/table";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
+import { failingChecks } from "@/ha-checks/checks";
 import { NodeFenceDialog } from "@/nodes/NodeFenceDialog";
+import { NodeInterfacesDialog } from "@/nodes/NodeInterfacesDialog";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
 import { PoolStatus } from "@/storage/PoolStatus";
 import { trackTask } from "@/tasks/tasks";
@@ -93,6 +95,49 @@ function UpdatesBadge({ updates }: { updates: NonNullable<Node["status"]["update
   return <Badge variant={updates.packages.length > 0 ? "default" : "outline"}>{count}</Badge>;
 }
 
+/** 노드의 HA 검사 결과 배지: 실패한 검사 수, 아니면 degraded나 정상. 제목에 실패·degraded 검사의 이름과 오류 */
+function ChecksBadge({ node }: { node: Node }) {
+  const { t } = useTranslation();
+  const checks = node.status.checks ?? [];
+  const failing = failingChecks(node);
+  const degraded = checks.filter((c) => c.state === "degraded");
+  const title = [...failing, ...degraded]
+    .map((c) => (c.error ? `${c.name}: ${c.error}` : c.name))
+    .join("\n");
+  if (failing.length > 0) {
+    return (
+      <Badge variant="destructive" title={title}>
+        {t("nodes.checksFailing", { count: failing.length })}
+      </Badge>
+    );
+  }
+  if (degraded.length > 0) {
+    return (
+      <Badge variant="secondary" title={title}>
+        {t("nodes.checkState.degraded")}
+      </Badge>
+    );
+  }
+  return <Badge variant="outline">{t("nodes.checkState.ok")}</Badge>;
+}
+
+/** 배지 버튼의 접근 이름에 넣는 검사 상태 */
+function checksState(t: ReturnType<typeof useTranslation>["t"], node: Node): string {
+  const checks = node.status.checks ?? [];
+  const failing = failingChecks(node);
+  if (failing.length > 0) {
+    return t("nodes.checksFailing", { count: failing.length });
+  }
+  if (checks.length === 0) {
+    return t("nodes.checksNone");
+  }
+  return t(
+    checks.some((c) => c.state === "degraded")
+      ? "nodes.checkState.degraded"
+      : "nodes.checkState.ok",
+  );
+}
+
 export function NodesPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
@@ -107,6 +152,7 @@ export function NodesPage() {
   const [labeling, setLabeling] = useState<Node | null>(null);
   const [unfreezing, setUnfreezing] = useState<Node | null>(null);
   const [fencing, setFencing] = useState<Node | null>(null);
+  const [showingInterfaces, setShowingInterfaces] = useState<Node | null>(null);
   const tasks = useTaskIndex();
   /** 그 노드의 비우기 Task가 끝나지 않았는지 */
   const isDraining = (node: Node) =>
@@ -157,6 +203,7 @@ export function NodesPage() {
             <TableHead>{t("nodes.hypervisor")}</TableHead>
             <TableHead>{t("nodes.arch")}</TableHead>
             <TableHead>{t("nodes.fencing")}</TableHead>
+            <TableHead>{t("nodes.checks")}</TableHead>
             <TableHead>{t("nodes.cpus")}</TableHead>
             <TableHead>{t("nodes.memory")}</TableHead>
             <TableHead>{t("nodes.bridges")}</TableHead>
@@ -172,7 +219,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 16 : 15} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 17 : 16} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -241,6 +288,27 @@ export function NodesPage() {
                   <Badge variant="destructive" title={node.status.fence_check.error}>
                     {t("nodes.fenceUnreachable")}
                   </Badge>
+                )}
+              </TableCell>
+              {/* HA 검사를 하지 않는 노드(위트니스, 옛 버전)는 결과도 인터페이스도 없다. */}
+              <TableCell>
+                {(node.status.checks ?? []).length > 0 ||
+                (node.status.interfaces ?? []).length > 0 ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label={t("nodes.interfaces.open", {
+                      name: node.name,
+                      state: checksState(t, node),
+                    })}
+                    onPointerDown={rememberTrigger}
+                    onKeyDown={rememberTrigger}
+                    onClick={() => setShowingInterfaces(node)}
+                  >
+                    {(node.status.checks ?? []).length > 0 ? <ChecksBadge node={node} /> : "—"}
+                  </Button>
+                ) : (
+                  "—"
                 )}
               </TableCell>
               <TableCell>{node.status.cpus}</TableCell>
@@ -313,6 +381,11 @@ export function NodesPage() {
                       {node.status.updates && (
                         <DropdownMenuItem onSelect={() => setShowingUpdates(node)}>
                           {t("nodes.updates.menu")}
+                        </DropdownMenuItem>
+                      )}
+                      {!node.spec.witness && (
+                        <DropdownMenuItem onSelect={() => setShowingInterfaces(node)}>
+                          {t("nodes.interfaces.menu")}
                         </DropdownMenuItem>
                       )}
                       <DropdownMenuItem onSelect={() => setLabeling(node)}>
@@ -406,6 +479,13 @@ export function NodesPage() {
         returnFocus={trigger}
         onConfirm={() => setMaintenance(ending!, false)}
       />
+      {showingInterfaces && (
+        <NodeInterfacesDialog
+          node={showingInterfaces}
+          returnFocus={trigger}
+          onClose={() => setShowingInterfaces(null)}
+        />
+      )}
       {fencing && (
         <NodeFenceDialog node={fencing} returnFocus={trigger} onClose={() => setFencing(null)} />
       )}

@@ -32,6 +32,12 @@ export type RuleKind = Schemas["RuleKind"];
 export type VmHa = Schemas["VmHa"];
 export type HaState = Schemas["HaState"];
 export type ShutdownPolicy = Schemas["ShutdownPolicy"];
+export type HaCheck = Schemas["Resource_HaCheckSpec_HaCheckStatus"];
+export type HaCheckRole = Schemas["HaCheckRole"];
+export type HaCheckAction = Schemas["HaCheckAction"];
+export type HaCheckTarget = Schemas["HaCheckTarget"];
+export type CheckReport = Schemas["CheckReport"];
+export type NodeInterface = Schemas["NodeInterface"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =
