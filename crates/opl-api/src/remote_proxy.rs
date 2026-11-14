@@ -32,7 +32,7 @@ const REQUEST_HEADERS: [HeaderName; 4] = [CONTENT_TYPE, CONTENT_LENGTH, IF_MATCH
 const RESPONSE_HEADERS: [HeaderName; 4] = [CONTENT_LENGTH, ETAG, RETRY_AFTER, CONTENT_DISPOSITION];
 /// admin이 아니어도 GET·HEAD로 읽을 수 있는 첫 경로 조각(그 밖에는 `auth/whoami`만). 사용자·토큰·영역·
 /// 감사·텔레메트리와 원격의 원격(중계 사슬)은 원격 토큰이 읽을 수 있어도 이 클러스터의 admin만 읽는다.
-const READABLE: [&str; 17] = [
+const READABLE: [&str; 18] = [
     "vms",
     "volumes",
     "storage-pools",
@@ -43,6 +43,7 @@ const READABLE: [&str; 17] = [
     "backup-jobs",
     "vm-imports",
     "ha-groups",
+    "ha-checks",
     "placement-rules",
     "nodes",
     "tasks",
@@ -263,6 +264,7 @@ mod tests {
             "%76ms",
             "subscription",
             "ha-groups/g",
+            "ha-checks/stor",
             "placement-rules",
         ] {
             assert!(readable(&segments(ok)), "{ok}");

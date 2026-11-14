@@ -16,6 +16,7 @@ pub mod error;
 mod fan_out;
 mod firmware;
 mod ha;
+mod ha_checks;
 mod ha_groups;
 pub mod health;
 mod incoming;
@@ -195,6 +196,12 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             r::get_ha_group,
             ha_groups::update_ha_group,
             ha_groups::delete_ha_group
+        ))
+        .routes(routes!(r::list_ha_checks, ha_checks::create_ha_check))
+        .routes(routes!(
+            r::get_ha_check,
+            ha_checks::update_ha_check,
+            ha_checks::delete_ha_check
         ))
         .routes(routes!(
             r::list_placement_rules,

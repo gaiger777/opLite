@@ -454,6 +454,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ha-checks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_ha_checks"];
+        put?: never;
+        /**
+         * 노드가 5초마다 링크·핑·스토리지 풀 경로를 검사하고, 리더가 `grace_secs` 넘게 실패한 검사에
+         *     `on_fail`대로 대응한다(경고·라이브 마이그레이션·다른 노드에서 다시 켜기·전원 끄기). `nodes`는 노드별
+         *     대상이다. 모든 노드가 `ha-checks`를 알아야 한다.
+         */
+        post: operations["create_ha_check"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ha-checks/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_ha_check"];
+        /** 검사를 통째로 바꾼다. 진행 중인 실패는 새 설정으로 다시 판단한다. */
+        put: operations["update_ha_check"];
+        post?: never;
+        delete: operations["delete_ha_check"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ha-groups": {
         parameters: {
             query?: never;
@@ -2160,6 +2198,39 @@ export interface components {
                 vms: components["schemas"]["VmSelector"];
             };
         };
+        CreateRequest_HaCheckSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @description 검사 하나 */
+            spec: {
+                /**
+                 * @description 끄면 노드가 검사하지 않는다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /**
+                 * Format: int32
+                 * @description 이만큼(초) 넘게 실패해야 대응한다. 10~600
+                 * @default 10
+                 */
+                grace_secs: number;
+                /** @description 노드 이름 → 그 노드의 대상(종류는 `target`과 같아야 한다) */
+                nodes?: {
+                    [key: string]: components["schemas"]["HaCheckTarget"];
+                };
+                /**
+                 * @description 실패했을 때의 대응. 없으면 역할의 기본(`storage` → `restart_elsewhere`, `vm` → `migrate`,
+                 *     `management` → `warn`)
+                 */
+                on_fail?: components["schemas"]["HaCheckAction"];
+                /** @description 검사하는 네트워크·장치의 쓰임. 기본 대응과 영향받는 VM을 정한다. */
+                role: components["schemas"]["HaCheckRole"];
+                /** @description 모든 노드의 검사 대상(노드별 덮기가 없을 때) */
+                target: components["schemas"]["HaCheckTarget"];
+            };
+        };
         CreateRequest_HaGroupSpec: {
             labels?: {
                 [key: string]: string;
@@ -2511,6 +2582,62 @@ export interface components {
          * @enum {string}
          */
         HaCheckAction: "warn" | "migrate" | "restart_elsewhere" | "fence";
+        /**
+         * @description 검사하는 것의 쓰임
+         * @enum {string}
+         */
+        HaCheckRole: "management" | "storage" | "vm";
+        /** @description 검사 하나 */
+        HaCheckSpec: {
+            /**
+             * @description 끄면 노드가 검사하지 않는다.
+             * @default true
+             */
+            enabled: boolean;
+            /**
+             * Format: int32
+             * @description 이만큼(초) 넘게 실패해야 대응한다. 10~600
+             * @default 10
+             */
+            grace_secs: number;
+            /** @description 노드 이름 → 그 노드의 대상(종류는 `target`과 같아야 한다) */
+            nodes?: {
+                [key: string]: components["schemas"]["HaCheckTarget"];
+            };
+            /**
+             * @description 실패했을 때의 대응. 없으면 역할의 기본(`storage` → `restart_elsewhere`, `vm` → `migrate`,
+             *     `management` → `warn`)
+             */
+            on_fail?: components["schemas"]["HaCheckAction"];
+            /** @description 검사하는 네트워크·장치의 쓰임. 기본 대응과 영향받는 VM을 정한다. */
+            role: components["schemas"]["HaCheckRole"];
+            /** @description 모든 노드의 검사 대상(노드별 덮기가 없을 때) */
+            target: components["schemas"]["HaCheckTarget"];
+        };
+        HaCheckStatus: Record<string, never>;
+        /** @description 검사 대상 */
+        HaCheckTarget: {
+            iface: string;
+            /** @enum {string} */
+            kind: "link";
+        } | {
+            /** @description 1~8개 */
+            addresses: string[];
+            /** @enum {string} */
+            kind: "ping";
+            /**
+             * Format: int32
+             * @description 1~주소 수
+             * @default 1
+             */
+            need: number;
+            /** @description 이 인터페이스로 보낸다(Linux만). */
+            via?: string;
+        } | {
+            /** @enum {string} */
+            kind: "pool";
+            name: string;
+        };
         /** @description 리더가 노드에 VM을 끄라고 한 요청(HA 검사 `restart_elsewhere`) */
         HaEvict: {
             /**
@@ -3048,6 +3175,52 @@ export interface components {
                      */
                     uefi_vars: boolean;
                 };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_HaCheckSpec_HaCheckStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description 검사 하나 */
+                spec: {
+                    /**
+                     * @description 끄면 노드가 검사하지 않는다.
+                     * @default true
+                     */
+                    enabled: boolean;
+                    /**
+                     * Format: int32
+                     * @description 이만큼(초) 넘게 실패해야 대응한다. 10~600
+                     * @default 10
+                     */
+                    grace_secs: number;
+                    /** @description 노드 이름 → 그 노드의 대상(종류는 `target`과 같아야 한다) */
+                    nodes?: {
+                        [key: string]: components["schemas"]["HaCheckTarget"];
+                    };
+                    /**
+                     * @description 실패했을 때의 대응. 없으면 역할의 기본(`storage` → `restart_elsewhere`, `vm` → `migrate`,
+                     *     `management` → `warn`)
+                     */
+                    on_fail?: components["schemas"]["HaCheckAction"];
+                    /** @description 검사하는 네트워크·장치의 쓰임. 기본 대응과 영향받는 VM을 정한다. */
+                    role: components["schemas"]["HaCheckRole"];
+                    /** @description 모든 노드의 검사 대상(노드별 덮기가 없을 때) */
+                    target: components["schemas"]["HaCheckTarget"];
+                };
+                status: Record<string, never>;
             }[];
             /** Format: int64 */
             revision: number;
@@ -4536,6 +4709,48 @@ export interface components {
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_HaCheckSpec_HaCheckStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description 검사 하나 */
+            spec: {
+                /**
+                 * @description 끄면 노드가 검사하지 않는다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /**
+                 * Format: int32
+                 * @description 이만큼(초) 넘게 실패해야 대응한다. 10~600
+                 * @default 10
+                 */
+                grace_secs: number;
+                /** @description 노드 이름 → 그 노드의 대상(종류는 `target`과 같아야 한다) */
+                nodes?: {
+                    [key: string]: components["schemas"]["HaCheckTarget"];
+                };
+                /**
+                 * @description 실패했을 때의 대응. 없으면 역할의 기본(`storage` → `restart_elsewhere`, `vm` → `migrate`,
+                 *     `management` → `warn`)
+                 */
+                on_fail?: components["schemas"]["HaCheckAction"];
+                /** @description 검사하는 네트워크·장치의 쓰임. 기본 대응과 영향받는 VM을 정한다. */
+                role: components["schemas"]["HaCheckRole"];
+                /** @description 모든 노드의 검사 대상(노드별 덮기가 없을 때) */
+                target: components["schemas"]["HaCheckTarget"];
+            };
+            status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_HaGroupSpec_HaGroupStatus: {
             /** Format: uuid */
             id: string;
@@ -5640,6 +5855,38 @@ export interface components {
             revision: number;
             /** Format: uuid */
             user: string;
+        };
+        UpdateRequest_HaCheckSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            /** @description 검사 하나 */
+            spec: {
+                /**
+                 * @description 끄면 노드가 검사하지 않는다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /**
+                 * Format: int32
+                 * @description 이만큼(초) 넘게 실패해야 대응한다. 10~600
+                 * @default 10
+                 */
+                grace_secs: number;
+                /** @description 노드 이름 → 그 노드의 대상(종류는 `target`과 같아야 한다) */
+                nodes?: {
+                    [key: string]: components["schemas"]["HaCheckTarget"];
+                };
+                /**
+                 * @description 실패했을 때의 대응. 없으면 역할의 기본(`storage` → `restart_elsewhere`, `vm` → `migrate`,
+                 *     `management` → `warn`)
+                 */
+                on_fail?: components["schemas"]["HaCheckAction"];
+                /** @description 검사하는 네트워크·장치의 쓰임. 기본 대응과 영향받는 VM을 정한다. */
+                role: components["schemas"]["HaCheckRole"];
+                /** @description 모든 노드의 검사 대상(노드별 덮기가 없을 때) */
+                target: components["schemas"]["HaCheckTarget"];
+            };
         };
         UpdateRequest_HaGroupSpec: {
             labels?: {
@@ -6833,6 +7080,161 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["CreatedJoinToken"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_ha_checks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_HaCheckSpec_HaCheckStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_ha_check: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRequest_HaCheckSpec"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_HaCheckSpec_HaCheckStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_ha_check: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_HaCheckSpec_HaCheckStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_ha_check: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRequest_HaCheckSpec"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_HaCheckSpec_HaCheckStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_ha_check: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {

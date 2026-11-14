@@ -620,6 +620,9 @@ mod tests {
         assert!(!a.check(&op, Action::Write, Kind::HaGroup));
         assert!(!a.check(&op, Action::Write, Kind::PlacementRule));
         assert!(a.check(&viewer, Action::Read, Kind::PlacementRule));
+        assert!(a.check(&viewer, Action::Read, Kind::HaCheck));
+        assert!(a.check(&op, Action::Read, Kind::HaCheck));
+        assert!(!a.check(&op, Action::Write, Kind::HaCheck));
         assert!(!a.check(&op, Action::Read, Kind::ApiToken));
         assert!(!a.check(&op, Action::Read, Kind::Realm));
         assert!(!a.check(&op, Action::Write, Kind::Realm));

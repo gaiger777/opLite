@@ -85,6 +85,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: HaGroupCmd,
     },
+    /// HA 검사: 노드가 링크·핑·스토리지 풀 경로를 검사하고, 오래 실패하면 리더가 HA VM을 옮기거나 노드를
+    /// 끈다.
+    HaCheck {
+        #[command(subcommand)]
+        cmd: HaCheckCmd,
+    },
     /// 배치 규칙: VM끼리(같은 노드·다른 노드)나 VM과 노드(이 노드들 중·이 노드들은 안 됨). hard 규칙은
     /// 조건이고 soft 규칙은 벌점이다.
     PlacementRule {
@@ -1945,6 +1951,297 @@ fn ha_group_row(g: &Value) -> Vec<String> {
         nodes.join(","),
         cell(&g["spec"]["restricted"]),
         cell(&g["spec"]["nofailback"]),
+    ]
+}
+
+#[derive(Subcommand)]
+enum HaCheckCmd {
+    List,
+    Get {
+        check: String,
+    },
+    /// HA 검사를 만든다. 노드가 5초마다 대상을 검사하고, `--grace`초 넘게 실패하면 리더가 `--on-fail`대로
+    /// 대응한다(기본: storage → restart-elsewhere, vm → migrate, management → warn).
+    Create(Box<HaCheckCreate>),
+    /// 준 값만 바꾼다. 대상(`--link`·`--ping`·`--pool`)을 주면 대상 전체를, `--node`를 주면 노드별 대상
+    /// 전체를 바꾼다.
+    Set(Box<HaCheckSet>),
+    Delete {
+        check: String,
+    },
+}
+
+/// 검사하는 것의 쓰임
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CheckRoleArg {
+    Management,
+    Storage,
+    Vm,
+}
+
+/// 검사가 실패했을 때의 대응
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CheckActionArg {
+    Warn,
+    Migrate,
+    RestartElsewhere,
+    Fence,
+}
+
+/// API의 대응 이름(`restart_elsewhere`)
+fn check_action(action: CheckActionArg) -> String {
+    value_name(action).replace('-', "_")
+}
+
+/// 검사 대상. 셋 가운데 하나다.
+#[derive(Args)]
+struct CheckTargetArgs {
+    /// 인터페이스(본딩이면 본딩)의 링크·carrier
+    #[arg(long, value_name = "IFACE", value_parser = |s: &str| parse_check_target("link", s))]
+    link: Option<Value>,
+    /// 주소마다 ping 하나(쉼표로 여럿, `@IFACE`로 보낼 인터페이스)
+    #[arg(long, value_name = "ADDR[,ADDR...][@IFACE]", value_parser = |s: &str| parse_check_target("ping", s))]
+    ping: Option<Value>,
+    /// ping을 보낼 인터페이스(Linux만)
+    #[arg(long, value_name = "IFACE", requires = "ping", conflicts_with_all = ["link", "pool"])]
+    via: Option<String>,
+    /// 이만큼의 주소가 답하면 통과(기본 1)
+    #[arg(long, value_name = "N", requires = "ping", conflicts_with_all = ["link", "pool"])]
+    need: Option<u8>,
+    /// 공유 스토리지 풀의 경로(역할 storage만)
+    #[arg(long, value_name = "NAME", value_parser = |s: &str| parse_check_target("pool", s))]
+    pool: Option<Value>,
+}
+
+impl CheckTargetArgs {
+    /// 준 대상(`--via`·`--need`는 ping 대상에 넣는다)
+    fn target(&self) -> Option<Value> {
+        let mut target = self
+            .link
+            .clone()
+            .or_else(|| self.ping.clone())
+            .or_else(|| self.pool.clone())?;
+        if let Some(via) = &self.via {
+            target["via"] = json!(via);
+        }
+        if let Some(need) = self.need {
+            target["need"] = json!(need);
+        }
+        Some(target)
+    }
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("target").required(true).args(["link", "ping", "pool"])))]
+struct HaCheckCreate {
+    name: String,
+    #[arg(long, value_enum)]
+    role: CheckRoleArg,
+    #[command(flatten)]
+    target: CheckTargetArgs,
+    #[arg(long, value_enum)]
+    on_fail: Option<CheckActionArg>,
+    /// 이만큼(초, 10~600) 넘게 실패해야 대응한다(기본 10).
+    #[arg(long, value_name = "SECS")]
+    grace: Option<u32>,
+    /// 이 노드의 대상(종류는 검사 대상과 같아야 한다). 여러 번 준다.
+    #[arg(long = "node", value_name = "NAME=link:IFACE|ping:ADDR[,ADDR][@IFACE]|pool:NAME", value_parser = parse_node_override)]
+    nodes: Vec<(String, Value)>,
+    /// 꺼 둔 채로 만든다.
+    #[arg(long)]
+    disabled: bool,
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("target").args(["link", "ping", "pool"])))]
+#[command(group(ArgGroup::new("change").required(true).multiple(true).args([
+    "role", "link", "ping", "pool", "on_fail", "grace", "nodes", "no_node_overrides", "enable", "disable",
+])))]
+struct HaCheckSet {
+    check: String,
+    #[arg(long, value_enum)]
+    role: Option<CheckRoleArg>,
+    #[command(flatten)]
+    target: CheckTargetArgs,
+    #[arg(long, value_enum)]
+    on_fail: Option<CheckActionArg>,
+    #[arg(long, value_name = "SECS")]
+    grace: Option<u32>,
+    /// 노드별 대상 전체를 바꾼다(여러 번 준다).
+    #[arg(long = "node", value_name = "NAME=link:IFACE|ping:ADDR[,ADDR][@IFACE]|pool:NAME", value_parser = parse_node_override)]
+    nodes: Vec<(String, Value)>,
+    /// 노드별 대상을 모두 지운다.
+    #[arg(long, conflicts_with = "nodes")]
+    no_node_overrides: bool,
+    #[arg(long, conflicts_with = "disable")]
+    enable: bool,
+    #[arg(long)]
+    disable: bool,
+}
+
+/// 대상 종류(`link`·`ping`·`pool`)와 값을 검사 대상 값으로. ping 값은 `ADDR[,ADDR...][@IFACE]`.
+fn parse_check_target(kind: &str, value: &str) -> Result<Value, String> {
+    match kind {
+        "link" if !value.is_empty() => Ok(json!({ "kind": "link", "iface": value })),
+        "pool" if !value.is_empty() => Ok(json!({ "kind": "pool", "name": value })),
+        "ping" => {
+            let (addresses, via) = match value.split_once('@') {
+                Some((addresses, via)) if !via.is_empty() => (addresses, Some(via)),
+                Some(_) => return Err(format!("missing interface after '@' in {value:?}")),
+                None => (value, None),
+            };
+            let addresses = addresses
+                .split(',')
+                .map(|a| {
+                    a.parse::<std::net::IpAddr>()
+                        .map(|a| a.to_string())
+                        .map_err(|_| format!("invalid IP address {a:?} in {value:?}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut target = json!({ "kind": "ping", "addresses": addresses });
+            if let Some(via) = via {
+                target["via"] = json!(via);
+            }
+            Ok(target)
+        }
+        "link" | "pool" => Err(format!("missing {kind} value")),
+        _ => Err(format!(
+            "unknown target kind {kind:?}: use link, ping or pool"
+        )),
+    }
+}
+
+/// `--node`의 `NAME=KIND:VALUE`를 (노드 이름, 대상)으로
+fn parse_node_override(s: &str) -> Result<(String, Value), String> {
+    let usage = || {
+        format!(
+            "invalid node target {s:?}: use NAME=link:IFACE, NAME=ping:ADDR[,ADDR][@IFACE] or NAME=pool:NAME"
+        )
+    };
+    let (node, target) = s.split_once('=').ok_or_else(usage)?;
+    let (kind, value) = target.split_once(':').ok_or_else(usage)?;
+    if node.is_empty() {
+        return Err(usage());
+    }
+    Ok((node.to_string(), parse_check_target(kind, value)?))
+}
+
+/// 노드별 대상 목록을 spec의 `nodes` 값으로
+fn node_overrides(nodes: &[(String, Value)]) -> Value {
+    Value::Object(nodes.iter().cloned().collect())
+}
+
+/// `ha-check create`의 요청 본문. 주지 않은 값은 보내지 않는다(서버 기본값).
+fn ha_check_create_body(args: &HaCheckCreate) -> Value {
+    let mut spec = json!({
+        "role": value_name(args.role),
+        "target": args.target.target(),
+    });
+    if let Some(action) = args.on_fail {
+        spec["on_fail"] = json!(check_action(action));
+    }
+    if let Some(grace) = args.grace {
+        spec["grace_secs"] = json!(grace);
+    }
+    if !args.nodes.is_empty() {
+        spec["nodes"] = node_overrides(&args.nodes);
+    }
+    if args.disabled {
+        spec["enabled"] = json!(false);
+    }
+    json!({ "name": args.name, "spec": spec })
+}
+
+/// `ha-check set`의 새 spec: 준 값만 `current`(읽은 검사)에서 바꾼다.
+fn ha_check_set_spec(args: &HaCheckSet, current: &Value) -> Value {
+    let mut spec = current["spec"].clone();
+    let Some(obj) = spec.as_object_mut() else {
+        return spec;
+    };
+    if let Some(role) = args.role {
+        obj.insert("role".into(), json!(value_name(role)));
+    }
+    if let Some(target) = args.target.target() {
+        obj.insert("target".into(), target);
+    }
+    if let Some(action) = args.on_fail {
+        obj.insert("on_fail".into(), json!(check_action(action)));
+    }
+    if let Some(grace) = args.grace {
+        obj.insert("grace_secs".into(), json!(grace));
+    }
+    if !args.nodes.is_empty() {
+        obj.insert("nodes".into(), node_overrides(&args.nodes));
+    } else if args.no_node_overrides {
+        obj.remove("nodes");
+    }
+    if args.enable || args.disable {
+        obj.insert("enabled".into(), json!(args.enable));
+    }
+    spec
+}
+
+/// `ha-check list`의 열
+const HA_CHECK_HEADERS: &[&str] = &[
+    "NAME", "ROLE", "TARGET", "ON_FAIL", "GRACE", "NODES", "ENABLED",
+];
+
+/// 검사 대상 한 줄: `link:bond0`, `ping:10.0.0.1,10.0.0.2@bond1 need=2`, `pool:nas`
+fn check_target_text(t: &Value) -> String {
+    match t["kind"].as_str() {
+        Some("link") => format!("link:{}", cell(&t["iface"])),
+        Some("pool") => format!("pool:{}", cell(&t["name"])),
+        Some("ping") => {
+            let addresses: Vec<String> = t["addresses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(cell)
+                .collect();
+            let mut s = format!("ping:{}", addresses.join(","));
+            if let Some(via) = t["via"].as_str() {
+                s = format!("{s}@{via}");
+            }
+            match t["need"].as_u64() {
+                Some(need) if need > 1 => format!("{s} need={need}"),
+                _ => s,
+            }
+        }
+        _ => cell(t),
+    }
+}
+
+/// `ha-check list`의 한 행. 대응·grace·켜짐은 빠졌으면 기본값이다.
+fn ha_check_row(c: &Value) -> Vec<String> {
+    let spec = &c["spec"];
+    let on_fail = spec["on_fail"].as_str().map_or_else(
+        || {
+            match spec["role"].as_str() {
+                Some("storage") => "restart_elsewhere",
+                Some("vm") => "migrate",
+                _ => "warn",
+            }
+            .to_string()
+        },
+        str::to_string,
+    );
+    let nodes: Vec<&str> = spec["nodes"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.keys().map(String::as_str))
+        .collect();
+    vec![
+        cell(&c["name"]),
+        cell(&spec["role"]),
+        check_target_text(&spec["target"]),
+        on_fail,
+        format!("{}s", spec["grace_secs"].as_u64().unwrap_or(10)),
+        if nodes.is_empty() {
+            "-".into()
+        } else {
+            nodes.join(",")
+        },
+        spec["enabled"].as_bool().unwrap_or(true).to_string(),
     ]
 }
 
@@ -4542,6 +4839,7 @@ where
         },
         Cmd::Vm { cmd } => vm(&client, cmd, json_out, out).await?,
         Cmd::HaGroup { cmd } => ha_group(&client, cmd, json_out, out).await?,
+        Cmd::HaCheck { cmd } => ha_check(&client, cmd, json_out, out).await?,
         Cmd::PlacementRule { cmd } => placement_rule(&client, cmd, json_out, out).await?,
         Cmd::Backup { cmd } => backup(&client, cmd, json_out, out).await?,
         Cmd::BackupJob { cmd } => backup_job(&client, cmd, json_out, out).await?,
@@ -5085,6 +5383,37 @@ async fn ha_group(
                 .delete(&format!("/ha-groups/{}", seg(&group)))
                 .await?;
             writeln!(out, "HA group {group} deleted")?;
+        }
+    }
+    Ok(())
+}
+
+async fn ha_check(
+    client: &Client,
+    cmd: HaCheckCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let path = |check: &str| format!("/ha-checks/{}", seg(check));
+    match cmd {
+        HaCheckCmd::List => {
+            let list = client.get("/ha-checks").await?;
+            print_list(out, json_out, &list, HA_CHECK_HEADERS, ha_check_row)?;
+        }
+        HaCheckCmd::Get { check } => print_json(out, &client.get(&path(&check)).await?)?,
+        HaCheckCmd::Create(args) => {
+            client
+                .post("/ha-checks", &ha_check_create_body(&args))
+                .await?;
+            writeln!(out, "HA check {} created", args.name)?;
+        }
+        HaCheckCmd::Set(args) => {
+            replace_spec(client, &path(&args.check), |c| ha_check_set_spec(&args, c)).await?;
+            writeln!(out, "HA check {} updated", args.check)?;
+        }
+        HaCheckCmd::Delete { check } => {
+            client.delete(&path(&check)).await?;
+            writeln!(out, "HA check {check} deleted")?;
         }
     }
     Ok(())
@@ -13787,6 +14116,297 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             })),
             ["g", "n1:5,n2:0", "true", "false"]
         );
+    }
+
+    #[test]
+    fn check_targets_parse() {
+        assert_eq!(
+            parse_check_target("link", "bond0").unwrap(),
+            json!({ "kind": "link", "iface": "bond0" })
+        );
+        assert_eq!(
+            parse_check_target("pool", "nas").unwrap(),
+            json!({ "kind": "pool", "name": "nas" })
+        );
+        assert_eq!(
+            parse_check_target("ping", "10.0.0.1,fd00::1@bond1").unwrap(),
+            json!({ "kind": "ping", "addresses": ["10.0.0.1", "fd00::1"], "via": "bond1" })
+        );
+        assert_eq!(
+            parse_check_target("ping", "10.0.0.1").unwrap(),
+            json!({ "kind": "ping", "addresses": ["10.0.0.1"] })
+        );
+        assert_eq!(
+            parse_node_override("b=ping:10.0.0.1,10.0.0.2@bond1").unwrap(),
+            (
+                "b".to_string(),
+                json!({ "kind": "ping", "addresses": ["10.0.0.1", "10.0.0.2"], "via": "bond1" })
+            )
+        );
+        assert_eq!(
+            parse_node_override("a=link:eth1").unwrap(),
+            ("a".to_string(), json!({ "kind": "link", "iface": "eth1" }))
+        );
+        for bad in [
+            ("ping", "10.0.0.1@"),
+            ("ping", "10.0.0.300"),
+            ("ping", "10.0.0.1,,10.0.0.2"),
+            ("ping", ""),
+            ("link", ""),
+            ("pool", ""),
+            ("arp", "x"),
+        ] {
+            assert!(parse_check_target(bad.0, bad.1).is_err(), "{bad:?}");
+        }
+        for bad in ["b", "b=link", "=link:eth0", "b=disk:sda", "b=ping:host"] {
+            assert!(parse_node_override(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_check_target("ping", "nas").unwrap_err(),
+            "invalid IP address \"nas\" in \"nas\""
+        );
+    }
+
+    /// `ha-check create`의 인자를 요청 본문으로
+    fn ha_check_create(args: &[&str]) -> Result<Value, clap::Error> {
+        let mut argv = vec!["oplctl", "ha-check", "create", "c"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+            Cmd::HaCheck {
+                cmd: HaCheckCmd::Create(c),
+            } => ha_check_create_body(&c),
+            _ => unreachable!(),
+        })
+    }
+
+    #[test]
+    fn ha_check_create_builds_the_spec() {
+        assert_eq!(
+            ha_check_create(&["--role", "storage", "--pool", "nas"]).unwrap(),
+            json!({ "name": "c", "spec": { "role": "storage", "target": { "kind": "pool", "name": "nas" } } })
+        );
+        assert_eq!(
+            ha_check_create(&[
+                "--role",
+                "vm",
+                "--ping",
+                "10.0.0.1,10.0.0.2",
+                "--via",
+                "bond1",
+                "--need",
+                "2",
+                "--on-fail",
+                "restart-elsewhere",
+                "--grace",
+                "30",
+                "--node",
+                "b=ping:10.1.0.1@bond2",
+                "--node",
+                "a=ping:10.2.0.1",
+                "--disabled",
+            ])
+            .unwrap(),
+            json!({ "name": "c", "spec": {
+                "role": "vm",
+                "target": { "kind": "ping", "addresses": ["10.0.0.1", "10.0.0.2"], "via": "bond1", "need": 2 },
+                "on_fail": "restart_elsewhere",
+                "grace_secs": 30,
+                "nodes": {
+                    "a": { "kind": "ping", "addresses": ["10.2.0.1"] },
+                    "b": { "kind": "ping", "addresses": ["10.1.0.1"], "via": "bond2" }
+                },
+                "enabled": false
+            } })
+        );
+        for bad in [
+            &["--role", "vm"][..],
+            &["--link", "eth0"],
+            &["--role", "vm", "--link", "eth0", "--pool", "nas"],
+            &["--role", "vm", "--link", "eth0", "--via", "eth1"],
+            &["--role", "vm", "--link", "eth0", "--on-fail", "reboot"],
+            &["--role", "vm", "--ping", "a.example"],
+            &["--role", "vm", "--link", "eth0", "--node", "b"],
+        ] {
+            assert!(ha_check_create(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ha_check_set_changes_only_what_is_given() {
+        let current = json!({ "spec": {
+            "role": "vm",
+            "target": { "kind": "link", "iface": "eth0" },
+            "grace_secs": 30,
+            "nodes": { "b": { "kind": "link", "iface": "eth1" } }
+        } });
+        let set = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "ha-check", "set", "c"];
+            argv.extend_from_slice(args);
+            let Cmd::HaCheck {
+                cmd: HaCheckCmd::Set(args),
+            } = Cli::try_parse_from(argv).unwrap().cmd
+            else {
+                unreachable!()
+            };
+            ha_check_set_spec(&args, &current)
+        };
+        assert_eq!(
+            set(&["--on-fail", "fence"]),
+            json!({
+                "role": "vm",
+                "target": { "kind": "link", "iface": "eth0" },
+                "on_fail": "fence",
+                "grace_secs": 30,
+                "nodes": { "b": { "kind": "link", "iface": "eth1" } }
+            })
+        );
+        assert_eq!(
+            set(&[
+                "--ping",
+                "10.0.0.1",
+                "--node",
+                "c=ping:10.0.0.2",
+                "--disable"
+            ]),
+            json!({
+                "role": "vm",
+                "target": { "kind": "ping", "addresses": ["10.0.0.1"] },
+                "grace_secs": 30,
+                "nodes": { "c": { "kind": "ping", "addresses": ["10.0.0.2"] } },
+                "enabled": false
+            })
+        );
+        assert_eq!(
+            set(&[
+                "--role",
+                "management",
+                "--no-node-overrides",
+                "--enable",
+                "--grace",
+                "5"
+            ]),
+            json!({
+                "role": "management",
+                "target": { "kind": "link", "iface": "eth0" },
+                "grace_secs": 5,
+                "enabled": true
+            })
+        );
+        // 바꿀 값이 있어야 하고, 켜기·끄기와 덮기 지우기는 함께 줄 수 없다.
+        for bad in [
+            &[][..],
+            &["--enable", "--disable"],
+            &["--node", "b=link:eth2", "--no-node-overrides"],
+            &["--grace", "5", "--via", "eth1"],
+            &["--link", "eth2", "--need", "1"],
+        ] {
+            let mut argv = vec!["oplctl", "ha-check", "set", "c"];
+            argv.extend_from_slice(bad);
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ha_check_rows() {
+        assert_eq!(
+            ha_check_row(&json!({
+                "name": "stor",
+                "spec": { "role": "storage", "target": { "kind": "pool", "name": "nas" } }
+            })),
+            [
+                "stor",
+                "storage",
+                "pool:nas",
+                "restart_elsewhere",
+                "10s",
+                "-",
+                "true"
+            ]
+        );
+        assert_eq!(
+            ha_check_row(&json!({
+                "name": "vmnet",
+                "spec": {
+                    "role": "vm",
+                    "target": { "kind": "ping", "addresses": ["10.0.0.1", "10.0.0.2"], "via": "bond1", "need": 2 },
+                    "on_fail": "fence",
+                    "grace_secs": 30,
+                    "nodes": { "a": { "kind": "ping", "addresses": ["10.1.0.1"] }, "b": { "kind": "ping", "addresses": ["10.2.0.1"] } },
+                    "enabled": false
+                }
+            })),
+            [
+                "vmnet",
+                "vm",
+                "ping:10.0.0.1,10.0.0.2@bond1 need=2",
+                "fence",
+                "30s",
+                "a,b",
+                "false"
+            ]
+        );
+        assert_eq!(
+            ha_check_row(&json!({
+                "name": "mgmt",
+                "spec": { "role": "management", "target": { "kind": "link", "iface": "eth0" } }
+            }))[2..4],
+            ["link:eth0", "warn"]
+        );
+    }
+
+    /// `ha-check set`은 읽은 검사에서 준 값만 바꿔 읽은 revision으로 PUT한다.
+    #[tokio::test]
+    async fn ha_check_create_and_set_send_the_spec() {
+        let (base, seen) = fake_api_bodies(|_| {
+            json!({
+                "name": "vmnet",
+                "revision": 7,
+                "spec": { "role": "vm", "target": { "kind": "link", "iface": "eth0" } },
+                "status": {}
+            })
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        for (argv, said) in [
+            (
+                &[
+                    "oplctl", "ha-check", "create", "vmnet", "--role", "vm", "--link", "eth0",
+                ][..],
+                "HA check vmnet created\n",
+            ),
+            (
+                &["oplctl", "ha-check", "set", "vmnet", "--grace", "20"],
+                "HA check vmnet updated\n",
+            ),
+            (
+                &["oplctl", "ha-check", "delete", "vmnet"],
+                "HA check vmnet deleted\n",
+            ),
+        ] {
+            let Cmd::HaCheck { cmd } = Cli::try_parse_from(argv).unwrap().cmd else {
+                unreachable!()
+            };
+            let mut out = Vec::new();
+            ha_check(&client, cmd, false, &mut out).await.unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), said);
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].line, "POST /api/v1/ha-checks HTTP/1.1");
+        assert_eq!(
+            seen[0].body,
+            json!({ "name": "vmnet", "spec": { "role": "vm", "target": { "kind": "link", "iface": "eth0" } } })
+        );
+        assert_eq!(seen[1].line, "GET /api/v1/ha-checks/vmnet HTTP/1.1");
+        assert_eq!(seen[2].line, "PUT /api/v1/ha-checks/vmnet HTTP/1.1");
+        assert_eq!(seen[2].if_match.as_deref(), Some("7"));
+        assert_eq!(
+            seen[2].body,
+            json!({
+                "labels": {},
+                "spec": { "role": "vm", "target": { "kind": "link", "iface": "eth0" }, "grace_secs": 20 }
+            })
+        );
+        assert_eq!(seen[3].line, "DELETE /api/v1/ha-checks/vmnet HTTP/1.1");
     }
 
     /// `placement-rule create`의 인자를 요청 본문으로

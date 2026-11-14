@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError, Typed};
 use opl_types::backup_job::{BackupJobSpec, BackupJobStatus};
+use opl_types::ha_check::{HaCheckSpec, HaCheckStatus};
 use opl_types::network::{Network, NetworkSpec, NetworkStatus, USER_NETWORK};
 use opl_types::node::{Node, NodeRole, NodeSpec, NodeStatus};
 use opl_types::placement::{HaGroupSpec, HaGroupStatus, PlacementRuleSpec, PlacementRuleStatus};
@@ -214,6 +215,15 @@ list_and_get!(
     HaGroupStatus,
     "/ha-groups",
     "/ha-groups/{key}",
+    "ha"
+);
+list_and_get!(
+    list_ha_checks,
+    get_ha_check,
+    HaCheckSpec,
+    HaCheckStatus,
+    "/ha-checks",
+    "/ha-checks/{key}",
     "ha"
 );
 list_and_get!(
