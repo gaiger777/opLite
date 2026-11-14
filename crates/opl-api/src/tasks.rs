@@ -809,6 +809,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::NodePowerOff { .. } => {
             Err("a node power-off task is a record and is not run".into())
         }
+        TaskOp::HaCheck { .. } => Err("an HA check task is a record and is not run".into()),
+        TaskOp::BondDegraded { .. } => Err("a bond warning task is a record and is not run".into()),
         TaskOp::VmBackup { backup } => backup::backup(ctx, task, *backup).await,
         TaskOp::BackupDelete => return backup::delete(ctx, id).await,
         TaskOp::BackupRestore { backup, name, pool } => {

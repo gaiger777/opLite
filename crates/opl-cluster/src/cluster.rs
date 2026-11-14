@@ -9,6 +9,7 @@ use futures_util::stream::BoxStream;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{Raft, RaftMetrics, RaftNetworkFactory};
 use opl_types::cluster::ClusterStatus;
+use opl_types::ha_check::CheckReport;
 use opl_types::resource::{Kind, Resource, ResourceSpec};
 use redb::Database;
 use uuid::Uuid;
@@ -149,6 +150,8 @@ pub struct Cluster {
     link_book: Arc<LinkBook>,
     /// memnet이 이 노드의 링크 선택에 쓰는 우선 링크 재시도 간격
     link_retry: Duration,
+    /// 리스 갱신에 실어 보내는 이 노드의 최신 HA 검사 결과(`set_lease_checks`)
+    lease_checks: std::sync::Mutex<Vec<CheckReport>>,
 }
 
 /// 이 노드가 클러스터에 무엇으로 참여하는지
@@ -379,6 +382,7 @@ impl Cluster {
             observers,
             link_book,
             link_retry: config.link_retry,
+            lease_checks: Default::default(),
         }
     }
 
@@ -905,8 +909,15 @@ impl Cluster {
     /// 시각을 마지막 갱신으로 삼는다(설계 §3.2).
     pub async fn renew_lease(&self, timeout: Duration) -> Result<(), ClusterError> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let checks = self.lease_checks.lock().unwrap().clone();
         let index = self
-            .request_within(LeaderRequest::RenewLease { node: self.id }, timeout)
+            .request_within(
+                LeaderRequest::RenewLease {
+                    node: self.id,
+                    checks,
+                },
+                timeout,
+            )
             .await?;
         // 전달 경로의 적용 기다림은 제한 시간이 지나도 성공으로 돌려주므로 여기서 다시 확인한다.
         self.wait_revision(
@@ -915,6 +926,12 @@ impl Cluster {
         )
         .await?;
         Ok(())
+    }
+
+    /// 다음 리스 갱신부터 실어 보낼 이 노드의 HA 검사 결과(설계 §8.2). 노드의 검사기가 회차마다 바꾼다. 리더는
+    /// 갱신마다 받은 결과로 그 노드의 결과를 통째로 바꾸므로 빈 목록은 결과 없음이다.
+    pub fn set_lease_checks(&self, checks: Vec<CheckReport>) {
+        *self.lease_checks.lock().unwrap() = checks;
     }
 
     /// 이 노드의 VIP 리스를 갱신한다(`vips`는 이 노드가 가질 수 있는 VIP 주소). 규칙은 `renew_lease`와

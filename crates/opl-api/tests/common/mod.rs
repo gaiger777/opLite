@@ -162,6 +162,8 @@ impl Env {
             cluster_addresses: vec![],
             shutdown: None,
             fence_check: None,
+            interfaces: vec![],
+            checks: vec![],
         };
         // 이 노드는 지금 빌드를 돌린다.
         me.status.version = Some(BUILD.into());

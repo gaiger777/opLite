@@ -735,7 +735,10 @@ mod tests {
             Err(ClusterError::NotLeader { leader_id: Some(l), leader_addr: Some(_) }) if l == leader
         ));
         assert!(matches!(
-            o.execute_as_leader(LeaderRequest::RenewLease { node: o.id() }).await,
+            o.execute_as_leader(LeaderRequest::RenewLease {
+                node: o.id(),
+                checks: vec![]
+            }).await,
             Err(ClusterError::NotLeader { leader_id: Some(l), .. }) if l == leader
         ));
 

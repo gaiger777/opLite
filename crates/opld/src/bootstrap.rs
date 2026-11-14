@@ -237,6 +237,9 @@ async fn record_node(
             shutdown: None,
             // 이웃 확인 결과는 `FenceWatch`가 쓴다. 지우지 않는다.
             fence_check: status.fence_check.take(),
+            // 인터페이스와 HA 검사 결과는 노드의 검사기가 쓴다. 지우지 않는다.
+            interfaces: std::mem::take(&mut status.interfaces),
+            checks: std::mem::take(&mut status.checks),
         };
         true
     })
@@ -752,7 +755,8 @@ pub(crate) mod tests {
                 "observer",
                 "multi-link",
                 "ha-placement",
-                "fast-ha"
+                "fast-ha",
+                "ha-checks"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -780,7 +784,8 @@ pub(crate) mod tests {
                 "observer",
                 "multi-link",
                 "ha-placement",
-                "fast-ha"
+                "fast-ha",
+                "ha-checks"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -827,7 +832,8 @@ pub(crate) mod tests {
                 "observer",
                 "multi-link",
                 "ha-placement",
-                "fast-ha"
+                "fast-ha",
+                "ha-checks"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -893,9 +899,10 @@ pub(crate) mod tests {
         cluster.shutdown().await.unwrap();
     }
 
-    /// 다시 등록해도 이웃 확인 결과(`fence_check`, `FenceWatch`가 쓴다)를 지우지 않는다.
+    /// 다시 등록해도 이웃 확인 결과(`fence_check`, `FenceWatch`가 쓴다)와 인터페이스·HA 검사 결과(검사기가 쓴다)를
+    /// 지우지 않는다.
     #[tokio::test]
-    async fn registration_keeps_the_fence_check() {
+    async fn registration_keeps_the_fence_check_interfaces_and_checks() {
         let dir = tempfile::tempdir().unwrap();
         let (cluster, id) = single_node(dir.path()).await;
         let config = test_config();
@@ -907,8 +914,27 @@ pub(crate) mod tests {
             by: "n2".into(),
             error: Some("ipmi: timed out".into()),
         };
+        let interfaces = vec![opl_types::node::NodeInterface {
+            name: "eno1".into(),
+            kind: opl_types::node::InterfaceKind::Ethernet,
+            state: "up".into(),
+            carrier: Some(true),
+            speed_mbps: None,
+            mac: None,
+            master: None,
+            addresses: vec!["10.0.0.5/24".into()],
+            bond: None,
+        }];
+        let checks = vec![opl_types::ha_check::CheckReport::new(
+            "stor",
+            opl_types::ha_check::CheckState::Failing,
+            Some("no carrier".into()),
+            Some(5),
+        )];
         update_node_status(&cluster, |status| {
             status.fence_check = Some(check.clone());
+            status.interfaces = interfaces.clone();
+            status.checks = checks.clone();
             true
         })
         .await
@@ -916,6 +942,8 @@ pub(crate) mod tests {
         register_node(&cluster, &config, &host).await.unwrap();
         let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
         assert_eq!(node.status.fence_check, Some(check));
+        assert_eq!(node.status.interfaces, interfaces);
+        assert_eq!(node.status.checks, checks);
         cluster.shutdown().await.unwrap();
     }
 
@@ -1027,6 +1055,7 @@ pub(crate) mod tests {
                     "multi-link".into(),
                     "ha-placement".into(),
                     "fast-ha".into(),
+                    "ha-checks".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

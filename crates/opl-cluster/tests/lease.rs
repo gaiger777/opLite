@@ -1,5 +1,5 @@
 //! 리더의 HA 리스 표: 갱신, 고립된 노드와 리더, 펜싱 중 거부, 임기가 바뀌면 비우기, 동시 갱신(HA·VIP)의
-//! 리더 확인 묶기.
+//! 리더 확인 묶기, 갱신에 실린 HA 검사 결과.
 
 mod common;
 
@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use common::{TestCluster, WAIT, volume};
 use openraft::ServerState;
-use opl_cluster::ClusterError;
 use opl_cluster::types::{NodeId, Rejection};
+use opl_cluster::{ClusterError, MAX_LEASE_CHECKS};
+use opl_types::ha_check::{CheckReport, CheckState};
 use opl_types::storage::VolumeSpec;
 use tokio::time::Instant;
 
@@ -46,6 +47,62 @@ async fn leader_records_renewals_from_followers_and_itself() {
     }
     // 팔로워는 표를 갖지 않는다(갱신은 리더가 받는다).
     assert!(tc.get(follower).leases().renewed.is_empty());
+}
+
+fn report(name: &str, state: CheckState) -> CheckReport {
+    CheckReport::new(name, state, None, None)
+}
+
+/// 노드가 둔 검사 결과는 갱신마다 실려 가 리더 표의 그 노드 결과를 통째로 바꾼다. 빈 목록은 결과 없음이다.
+#[tokio::test]
+async fn renewals_carry_the_nodes_check_results() {
+    let tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let follower = follower_of(&tc, leader);
+
+    // 결과를 두지 않은 노드는 표에 없다.
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    assert!(tc.get(leader).leases().checks.is_empty());
+
+    let first = vec![
+        report("stor", CheckState::Ok),
+        CheckReport::new(
+            "vmnet",
+            CheckState::Failing,
+            Some("no carrier".into()),
+            Some(3),
+        ),
+    ];
+    tc.get(follower).set_lease_checks(first.clone());
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    let leases = tc.get(leader).leases();
+    assert_eq!(leases.checks[&follower], first);
+    assert_eq!(leases.checks.len(), 1, "{leases:?}");
+    // 결과는 다음 갱신에도 그대로 실린다.
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    assert_eq!(tc.get(leader).leases().checks[&follower], first);
+
+    let second = vec![report("vmnet", CheckState::Ok)];
+    tc.get(follower).set_lease_checks(second.clone());
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    assert_eq!(tc.get(leader).leases().checks[&follower], second);
+
+    // 너무 많으면 앞의 것만 둔다.
+    let many: Vec<_> = (0..MAX_LEASE_CHECKS + 3)
+        .map(|i| report(&format!("c{i}"), CheckState::Ok))
+        .collect();
+    tc.get(follower).set_lease_checks(many.clone());
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    assert_eq!(
+        tc.get(leader).leases().checks[&follower],
+        many[..MAX_LEASE_CHECKS]
+    );
+
+    tc.get(follower).set_lease_checks(vec![]);
+    tc.get(follower).renew_lease(WAIT).await.unwrap();
+    assert!(!tc.get(leader).leases().checks.contains_key(&follower));
+    // 팔로워는 표를 갖지 않는다.
+    assert!(tc.get(follower).leases().checks.is_empty());
 }
 
 /// 응답 인덱스가 이 노드에 적용되어야 성공이다. 복제가 막힌 노드는 리더에 닿아도 실패한다.
@@ -184,9 +241,12 @@ async fn table_is_cleared_when_the_term_changes() {
     let a = tc.leader().await;
     let others: Vec<_> = tc.nodes.keys().copied().filter(|id| *id != a).collect();
     let (b, c) = (others[0], others[1]);
+    tc.get(b)
+        .set_lease_checks(vec![report("stor", CheckState::Failing)]);
     tc.get(b).renew_lease(WAIT).await.unwrap();
     let old_term = term(&tc, a);
     assert!(tc.get(a).leases().renewed.contains_key(&b));
+    assert!(tc.get(a).leases().checks.contains_key(&b));
 
     // 선거에 나설 수 있는 노드를 하나씩만 두어 리더를 a → b → a로 정해서 바꾼다.
     tc.get(c).raft().unwrap().runtime_config().elect(false);
@@ -208,7 +268,7 @@ async fn table_is_cleared_when_the_term_changes() {
     tc.router.isolate(b);
     assert_eq!(tc.leader_among(&[a, c]).await, a);
 
-    // 다시 리더가 된 a의 표에는 이전 임기의 b 갱신이 없다.
+    // 다시 리더가 된 a의 표에는 이전 임기의 b 갱신과 검사 결과가 없다.
     tc.get(c).renew_lease(WAIT).await.unwrap();
     let leases = tc.get(a).leases();
     assert!(leases.term > old_term, "{leases:?}");
@@ -218,4 +278,5 @@ async fn table_is_cleared_when_the_term_changes() {
         vec![c],
         "{leases:?}"
     );
+    assert!(leases.checks.is_empty(), "{leases:?}");
 }

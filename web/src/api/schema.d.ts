@@ -2029,6 +2029,30 @@ export interface components {
              */
             uefi_vars: boolean;
         };
+        /** @description 본딩 포트 하나 */
+        BondPort: {
+            /**
+             * Format: int32
+             * @description 802.3ad의 aggregator id
+             */
+            aggregator?: number;
+            name: string;
+            /** Format: int32 */
+            speed_mbps?: number;
+            state: components["schemas"]["PortState"];
+        };
+        /**
+         * @description 본딩 전체: 모든 포트가 `up`이면 `up`, 일부만이면 `degraded`(통과지만 경고), 하나도 없으면 `down`
+         * @enum {string}
+         */
+        BondState: "up" | "degraded" | "down" | "unknown";
+        /** @description 본딩과 그 포트의 상태 */
+        BondStatus: {
+            /** @description 본딩 모드(`active-backup`, `802.3ad` …) */
+            mode: string;
+            ports: components["schemas"]["BondPort"][];
+            state: components["schemas"]["BondState"];
+        };
         BridgeInfo: {
             name: string;
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
@@ -2039,6 +2063,24 @@ export interface components {
          * @enum {string}
          */
         Channel: "stable" | "testing" | "enterprise";
+        /** @description 한 노드에서 검사 하나의 결과. 노드가 리스 갱신에 실어 리더에 보내고(판단용), 노드 상태에도 쓴다(화면용). */
+        CheckReport: {
+            /** @description 실패·degraded·unknown의 이유(200바이트까지) */
+            error?: string;
+            /** @description 검사 이름(`HaCheck` 이름이나 자동 검사 `cluster-link-<n>`) */
+            name: string;
+            /**
+             * Format: int64
+             * @description 노드 시계로 실패·degraded가 시작된 때(유닉스 초, 화면용. 리더는 자기 시계로 grace를 잰다)
+             */
+            since?: number;
+            state: components["schemas"]["CheckState"];
+        };
+        /**
+         * @description 검사 결과
+         * @enum {string}
+         */
+        CheckState: "ok" | "degraded" | "failing" | "unknown";
         CloneRequest: {
             /** @description 새 VM의 이름 */
             name: string;
@@ -2464,6 +2506,27 @@ export interface components {
              */
             timeout_secs: number;
         };
+        /**
+         * @description 검사가 grace 넘게 실패했을 때의 대응
+         * @enum {string}
+         */
+        HaCheckAction: "warn" | "migrate" | "restart_elsewhere" | "fence";
+        /** @description 리더가 노드에 VM을 끄라고 한 요청(HA 검사 `restart_elsewhere`) */
+        HaEvict: {
+            /**
+             * Format: int64
+             * @description 요청한 때(유닉스 초)
+             */
+            at: number;
+            /** @description 실패한 검사의 이름 */
+            check: string;
+            /**
+             * Format: uuid
+             * @description VM을 끌 노드
+             */
+            from: string;
+            reason: string;
+        };
         /** @description HA 그룹의 노드 하나 */
         HaGroupNode: {
             /** @description 노드 이름 */
@@ -2608,6 +2671,11 @@ export interface components {
             /** @description ESXi·vCenter 데이터스토어의 VM. 비밀번호는 여기에 없다(받은 노드의 메모리에만 둔다). */
             esxi: components["schemas"]["EsxiSource"];
         };
+        /**
+         * @description 인터페이스 종류(`ip -d`의 `info_kind`, 없으면 이더넷)
+         * @enum {string}
+         */
+        InterfaceKind: "ethernet" | "bond" | "bridge" | "vlan" | "dummy" | "veth" | "other";
         /**
          * @description `ipmitool [-I lanplus] -H address -p port -U user -E chassis power off|status`. 비밀번호는 명령 인자가 아니라
          *     `IPMI_PASSWORD` 환경 변수로 넘긴다.
@@ -3084,6 +3152,8 @@ export interface components {
                      * @default []
                      */
                     bridges: components["schemas"]["BridgeInfo"][];
+                    /** @description 이 노드의 HA 검사 결과(화면용, 바뀔 때만 쓴다). 리더는 리스 갱신에 실린 결과로 판단한다. */
+                    checks?: components["schemas"]["CheckReport"][];
                     /**
                      * @description 이 노드가 원하는 클러스터 링크(`host:port`, 앞이 우선). 노드가 등록할 때 설정의 `cluster_addresses`로
                      *     쓴다(옛 노드는 비어 있다). 리더가 Raft 멤버십의 링크를 이것에 맞춘다.
@@ -3116,6 +3186,11 @@ export interface components {
                      * @default
                      */
                     hypervisor: string;
+                    /**
+                     * @description 이 노드의 네트워크 인터페이스(루프백·tap·opld가 만든 장치 빼고 64개까지). 노드가 쓴다. HA 검사를 고를 때
+                     *     보고, 본딩 포트 상태를 보인다. 옛 노드는 이 필드를 무시한다.
+                     */
+                    interfaces?: components["schemas"]["NodeInterface"][];
                     /**
                      * Format: int64
                      * @default 0
@@ -3685,6 +3760,27 @@ export interface components {
              */
             recover_after_secs: number;
         };
+        /** @description 노드의 네트워크 인터페이스 하나(`ip -d addr`와 sysfs) */
+        NodeInterface: {
+            /** @description IP 주소(CIDR, 예: `10.0.0.5/24`) */
+            addresses?: string[];
+            /** @description 본딩이면 그 포트 상태 */
+            bond?: components["schemas"]["BondStatus"];
+            /** @description 링크가 있는지(sysfs `carrier`). 읽지 못했으면 없다. */
+            carrier?: boolean;
+            kind: components["schemas"]["InterfaceKind"];
+            mac?: string;
+            /** @description 이 인터페이스를 묶은 본딩·브리지 */
+            master?: string;
+            name: string;
+            /**
+             * Format: int32
+             * @description 링크 속도(Mbps). 모르면 없다.
+             */
+            speed_mbps?: number;
+            /** @description operstate(`up`, `down`, `unknown`, `lowerlayerdown` …) */
+            state: string;
+        };
         /** @description `GET /metrics/nodes`의 응답 */
         NodeMetricsResponse: {
             /** @description 읽은 노드마다 하나(노드 이름 순) */
@@ -3776,6 +3872,8 @@ export interface components {
              * @default []
              */
             bridges: components["schemas"]["BridgeInfo"][];
+            /** @description 이 노드의 HA 검사 결과(화면용, 바뀔 때만 쓴다). 리더는 리스 갱신에 실린 결과로 판단한다. */
+            checks?: components["schemas"]["CheckReport"][];
             /**
              * @description 이 노드가 원하는 클러스터 링크(`host:port`, 앞이 우선). 노드가 등록할 때 설정의 `cluster_addresses`로
              *     쓴다(옛 노드는 비어 있다). 리더가 Raft 멤버십의 링크를 이것에 맞춘다.
@@ -3808,6 +3906,11 @@ export interface components {
              * @default
              */
             hypervisor: string;
+            /**
+             * @description 이 노드의 네트워크 인터페이스(루프백·tap·opld가 만든 장치 빼고 64개까지). 노드가 쓴다. HA 검사를 고를 때
+             *     보고, 본딩 포트 상태를 보인다. 옛 노드는 이 필드를 무시한다.
+             */
+            interfaces?: components["schemas"]["NodeInterface"][];
             /**
              * Format: int64
              * @default 0
@@ -4025,6 +4128,11 @@ export interface components {
              */
             total_bytes: number;
         };
+        /**
+         * @description 본딩 포트의 상태
+         * @enum {string}
+         */
+        PortState: "up" | "down" | "lacp_mismatch" | "speed_mismatch" | "unknown";
         /**
          * @description 방법으로 읽은 노드의 전원
          * @enum {string}
@@ -4518,6 +4626,8 @@ export interface components {
                  * @default []
                  */
                 bridges: components["schemas"]["BridgeInfo"][];
+                /** @description 이 노드의 HA 검사 결과(화면용, 바뀔 때만 쓴다). 리더는 리스 갱신에 실린 결과로 판단한다. */
+                checks?: components["schemas"]["CheckReport"][];
                 /**
                  * @description 이 노드가 원하는 클러스터 링크(`host:port`, 앞이 우선). 노드가 등록할 때 설정의 `cluster_addresses`로
                  *     쓴다(옛 노드는 비어 있다). 리더가 Raft 멤버십의 링크를 이것에 맞춘다.
@@ -4550,6 +4660,11 @@ export interface components {
                  * @default
                  */
                 hypervisor: string;
+                /**
+                 * @description 이 노드의 네트워크 인터페이스(루프백·tap·opld가 만든 장치 빼고 64개까지). 노드가 쓴다. HA 검사를 고를 때
+                 *     보고, 본딩 포트 상태를 보인다. 옛 노드는 이 필드를 무시한다.
+                 */
+                interfaces?: components["schemas"]["NodeInterface"][];
                 /**
                  * Format: int64
                  * @default 0
@@ -5385,6 +5500,18 @@ export interface components {
             kind: "node-power-off";
             method?: components["schemas"]["FenceKind"];
             reason: string;
+        } | {
+            action: components["schemas"]["HaCheckAction"];
+            check: string;
+            detail: string;
+            /** @enum {string} */
+            kind: "ha-check";
+            vms?: string[];
+        } | {
+            bond: string;
+            /** @enum {string} */
+            kind: "bond-degraded";
+            ports: string[];
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {
@@ -5685,6 +5812,11 @@ export interface components {
         VmHaStatus: {
             /** @description HA가 이 VM을 놓거나 옮기지 못한 이유. */
             error?: string;
+            /**
+             * @description HA 검사(`restart_elsewhere`)가 실패해 리더가 노드 `from`에 이 VM을 끄라고 한 요청. 그 노드가 QEMU를 강제로
+             *     끈 뒤 지우고 `relocate_from`을 쓴다. 옛 노드는 이 필드를 무시한다.
+             */
+            evict?: components["schemas"]["HaEvict"];
             /**
              * Format: uuid
              * @description 재시작 횟수를 넘겨 이 노드에서 다른 노드로 옮겨 달라는 요청. reconciler가 쓴다.

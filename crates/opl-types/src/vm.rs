@@ -534,6 +534,24 @@ pub struct VmHaStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub error: Option<String>,
+    /// HA 검사(`restart_elsewhere`)가 실패해 리더가 노드 `from`에 이 VM을 끄라고 한 요청. 그 노드가 QEMU를 강제로
+    /// 끈 뒤 지우고 `relocate_from`을 쓴다. 옛 노드는 이 필드를 무시한다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub evict: Option<HaEvict>,
+}
+
+/// 리더가 노드에 VM을 끄라고 한 요청(HA 검사 `restart_elsewhere`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct HaEvict {
+    /// VM을 끌 노드
+    pub from: Uuid,
+    /// 실패한 검사의 이름
+    pub check: String,
+    pub reason: String,
+    /// 요청한 때(유닉스 초)
+    pub at: u64,
 }
 
 /// 진행 중인 라이브 마이그레이션: 대상 노드와 그 마이그레이션 Task
@@ -1202,6 +1220,7 @@ mod tests {
                 relocations: vec![100, 200],
                 relocated_from: Some(node),
                 error: Some("gave up after 1 relocations".into()),
+                evict: None,
             }),
             ..Default::default()
         };
@@ -1222,6 +1241,24 @@ mod tests {
             serde_json::to_value(VmHaStatus::default()).unwrap(),
             serde_json::json!({})
         );
+        // 끄기 요청은 있을 때만 쓴다.
+        let ha = VmHaStatus {
+            evict: Some(HaEvict {
+                from: node,
+                check: "stor".into(),
+                reason: "HA check stor failed".into(),
+                at: 1_793_000_000,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&ha).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "evict": {
+                "from": node, "check": "stor", "reason": "HA check stor failed", "at": 1_793_000_000u64
+            } })
+        );
+        assert_eq!(serde_json::from_value::<VmHaStatus>(json).unwrap(), ha);
     }
 
     #[test]

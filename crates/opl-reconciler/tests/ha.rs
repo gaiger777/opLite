@@ -1123,6 +1123,7 @@ async fn restarting_clears_the_relocation_request_and_the_ha_error() {
             relocations: vec![100],
             relocated_from: Some(from),
             error: Some("gave up after 1 relocations".into()),
+            evict: None,
         }),
         ..Default::default()
     };

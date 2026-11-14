@@ -2102,6 +2102,7 @@ mod tests {
         let mut leases = Leases {
             term: 3,
             renewed: BTreeMap::from([(NodeId(off), t0), (NodeId(failed), t0)]),
+            ..Default::default()
         };
         assert_eq!(attempts.confirmed_off(off, &leases), Some(confirmed));
         assert_eq!(attempts.confirmed_off(failed, &leases), None);

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Cursor;
 
+use opl_types::ha_check::CheckReport;
 use opl_types::resource::{Kind, Resource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -118,6 +119,10 @@ pub enum LeaderRequest {
     /// 적용한 마지막 로그 인덱스를 돌려준다. 로그에는 아무것도 쓰지 않는다.
     RenewLease {
         node: NodeId,
+        /// 이 노드의 최신 HA 검사 결과(설계 §8.2). 리더가 갱신과 함께 통째로 바꿔 적는다. 비면 옛 형식
+        /// 그대로이고, 옛 리더는 이 필드를 버린다.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<CheckReport>,
     },
     /// 노드의 VIP 리스를 갱신한다(설계 §4 내장 VIP). `vips`는 이 노드가 가질 수 있는 VIP 주소(IP)다.
     /// 헬스 체크가 200인 노드만 보낸다. 리더는 `RenewLease`처럼 과반수의 리더인지 확인한 뒤 받은 시각을
@@ -414,7 +419,10 @@ mod tests {
     #[test]
     fn lease_wire_format_is_stable() {
         let node = NodeId::from(2);
-        let req = LeaderRequest::RenewLease { node };
+        let req = LeaderRequest::RenewLease {
+            node,
+            checks: vec![],
+        };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value,
@@ -426,6 +434,43 @@ mod tests {
         let value = serde_json::to_value(&r).unwrap();
         assert_eq!(value, json!({"reason": "fenced", "node": node.to_string()}));
         assert_eq!(serde_json::from_value::<Rejection>(value).unwrap(), r);
+    }
+
+    /// 노드 사이로 오가는 형식이다. 검사 결과를 실은 리스 갱신: 결과가 있으면 `checks`를 더하고, 옛 노드의 갱신
+    /// (필드 없음)은 결과 없음으로 읽는다.
+    #[test]
+    fn lease_with_checks_wire_format_is_stable() {
+        use opl_types::ha_check::CheckState;
+        let node = NodeId::from(2);
+        let req = LeaderRequest::RenewLease {
+            node,
+            checks: vec![
+                CheckReport::new("stor", CheckState::Ok, None, None),
+                CheckReport::new(
+                    "vmnet",
+                    CheckState::Failing,
+                    Some("no carrier".into()),
+                    Some(5),
+                ),
+            ],
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value,
+            json!({"op": "renew-lease", "node": node.to_string(), "checks": [
+                {"name": "stor", "state": "ok"},
+                {"name": "vmnet", "state": "failing", "error": "no carrier", "since": 5}
+            ]})
+        );
+        assert_eq!(serde_json::from_value::<LeaderRequest>(value).unwrap(), req);
+        let old = json!({"op": "renew-lease", "node": node.to_string()});
+        assert_eq!(
+            serde_json::from_value::<LeaderRequest>(old).unwrap(),
+            LeaderRequest::RenewLease {
+                node,
+                checks: vec![]
+            }
+        );
     }
 
     /// 노드 사이로 오가는 형식이다. learner 더하기: 링크가 하나면 옛 형식 그대로, 여럿이면 `addrs`를 더한다.

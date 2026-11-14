@@ -121,6 +121,8 @@ async fn node_with(
         cluster_addresses: vec![],
         shutdown: None,
         fence_check: None,
+        interfaces: vec![],
+        checks: vec![],
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();
@@ -161,7 +163,10 @@ fn get(env: &Env, id: Uuid) -> Vm {
 /// 이 노드의 이름으로 리더에게 리스를 갱신한다.
 async fn renew(cluster: &Cluster, node: Uuid) -> Result<u64, ClusterError> {
     cluster
-        .execute_as_leader(LeaderRequest::RenewLease { node: NodeId(node) })
+        .execute_as_leader(LeaderRequest::RenewLease {
+            node: NodeId(node),
+            checks: vec![],
+        })
         .await
 }
 
@@ -1262,6 +1267,7 @@ async fn relocates_a_vm_that_failed_too_often_then_gives_up() {
             relocations: ha.relocations.clone(),
             relocated_from: Some(from),
             error: Some("gave up after 1 relocations".into()),
+            evict: None,
         }
     );
 

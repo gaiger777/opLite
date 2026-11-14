@@ -1804,7 +1804,10 @@ async fn a_link_to_another_node_is_refused_and_skipped() {
     let peers = Arc::new(Peers::new(&tls_for(&ca, b.id())));
     peers.set_link_book(book.clone());
 
-    let renew = LeaderRequest::RenewLease { node: b.id() };
+    let renew = LeaderRequest::RenewLease {
+        node: b.id(),
+        checks: vec![],
+    };
     Forwarder::forward(peers.as_ref(), a.id(), &b.addr, renew)
         .await
         .unwrap();
@@ -2012,7 +2015,13 @@ async fn a_sent_write_that_loses_its_connection_is_not_sent_again() {
     assert_eq!(first.accepted(), 1);
     assert_eq!(peers.active_link(&first.addr), second.addr);
     peers
-        .leader_request(&first.addr, LeaderRequest::RenewLease { node: id })
+        .leader_request(
+            &first.addr,
+            LeaderRequest::RenewLease {
+                node: id,
+                checks: vec![],
+            },
+        )
         .await
         .unwrap();
 }
@@ -2036,7 +2045,13 @@ async fn calls_fail_over_to_the_second_link() {
     assert_eq!(peers.active_link(&first), server);
     assert_eq!(peers.ping(id, &first, WAIT).await.unwrap(), id);
     peers
-        .leader_request(&first, LeaderRequest::RenewLease { node: id })
+        .leader_request(
+            &first,
+            LeaderRequest::RenewLease {
+                node: id,
+                checks: vec![],
+            },
+        )
         .await
         .unwrap();
     let mut frames = FollowClient::follow(peers.as_ref(), id, &first, 0)
@@ -2082,7 +2097,10 @@ async fn a_silent_link_times_out_and_the_preferred_link_comes_back() {
     peers.set_link_book(book);
 
     let started = Instant::now();
-    let renew = || LeaderRequest::RenewLease { node: id };
+    let renew = || LeaderRequest::RenewLease {
+        node: id,
+        checks: vec![],
+    };
     assert!(peers.leader_request(&first, renew()).await.is_err());
     let took = started.elapsed();
     assert!(
@@ -2145,7 +2163,13 @@ async fn a_forwarded_write_fails_over_from_a_link_that_never_connects() {
     assert!(matches!(attempt, Ok(Ok(_))), "{attempt:?}");
     assert_eq!(peers.active_link(&first), server);
     peers
-        .leader_request(&first, LeaderRequest::RenewLease { node: id })
+        .leader_request(
+            &first,
+            LeaderRequest::RenewLease {
+                node: id,
+                checks: vec![],
+            },
+        )
         .await
         .unwrap();
 }

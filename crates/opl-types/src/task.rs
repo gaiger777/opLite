@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::fence::FenceKind;
+use crate::ha_check::HaCheckAction;
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::storage::SourceFormat;
 use crate::vm_import::ImportRun;
@@ -128,6 +129,23 @@ pub enum TaskOp {
         #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
         method: Option<FenceKind>,
         reason: String,
+    },
+    /// 리더의 HA 검사 기록: 대상 노드(Task의 `node`와 같다)에서 검사 `check`가 실패해 `action`대로 대응했다
+    /// (`succeeded`) 또는 대응하지 못했다(`failed`). `vms`는 대응한 VM의 이름이다. 끝난 상태로 만들고 실행기는
+    /// 실행하지 않는다.
+    HaCheck {
+        check: String,
+        action: HaCheckAction,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        vms: Vec<String>,
+        detail: String,
+    },
+    /// 노드의 본딩 알림 기록: 대상 노드(Task의 `node`와 같다)의 본딩 `bond`가 `degraded`나 `down`이 되었다.
+    /// `ports`는 `up`이 아닌 포트(`"eno2: down"`)다. 끝난 상태로 만들고 실행기는 실행하지 않는다.
+    BondDegraded {
+        bond: String,
+        ports: Vec<String>,
     },
 }
 
@@ -357,6 +375,49 @@ mod tests {
             serde_json::json!({ "kind": "node-power-off", "reason": "lease expired" })
         );
         assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), failed);
+    }
+
+    #[test]
+    fn ha_check_and_bond_ops_are_tagged_by_kind() {
+        let op = TaskOp::HaCheck {
+            check: "stor".into(),
+            action: HaCheckAction::RestartElsewhere,
+            vms: vec!["web-1".into(), "db-1".into()],
+            detail: "also affects 1 VMs without HA".into(),
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "ha-check", "check": "stor", "action": "restart_elsewhere",
+                                "vms": ["web-1", "db-1"], "detail": "also affects 1 VMs without HA" })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        // VM이 없으면 쓰지 않는다.
+        let warn = TaskOp::HaCheck {
+            check: "cluster-link-1".into(),
+            action: HaCheckAction::Warn,
+            vms: vec![],
+            detail: "no interface has address 10.0.0.5".into(),
+        };
+        let json = serde_json::to_value(&warn).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "ha-check", "check": "cluster-link-1", "action": "warn",
+                                "detail": "no interface has address 10.0.0.5" })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), warn);
+
+        let op = TaskOp::BondDegraded {
+            bond: "bond0".into(),
+            ports: vec!["eno2: down".into(), "eno3: lacp_mismatch".into()],
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "bond-degraded", "bond": "bond0",
+                                "ports": ["eno2: down", "eno3: lacp_mismatch"] })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
     }
 
     #[test]

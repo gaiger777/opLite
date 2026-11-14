@@ -1349,6 +1349,7 @@ mod tests {
             relocations: vec![10],
             relocated_from: None,
             error: None,
+            evict: None,
         };
         let mine = VmHaStatus {
             relocate_from: None,
@@ -1359,6 +1360,7 @@ mod tests {
             relocations: vec![10],
             relocated_from: Some(Uuid::now_v7()),
             error: Some("gave up after 1 relocations".into()),
+            evict: None,
         };
         assert_eq!(
             merge_ha(&read, &mine, Some(leader.clone())),

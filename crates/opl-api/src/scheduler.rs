@@ -367,6 +367,8 @@ mod tests {
             cluster_addresses: vec![],
             shutdown: None,
             fence_check: None,
+            interfaces: vec![],
+            checks: vec![],
         };
         n
     }

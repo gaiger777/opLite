@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use openraft::error::{CheckIsLeaderError, RaftError};
 use openraft::{LogId, Raft, ServerState};
+use opl_types::ha_check::CheckReport;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -16,11 +17,16 @@ use crate::cluster::ClusterError;
 use crate::leader::{LeaderError, not_leader};
 use crate::types::{NodeId, Rejection, TypeConfig};
 
+/// 한 노드의 갱신에 실린 HA 검사 결과 수 상한. 넘으면 앞의 것만 둔다.
+pub const MAX_LEASE_CHECKS: usize = 128;
+
 /// 리더가 아는 리스. `renewed`는 `term` 임기에 이 리더가 확인해 준 노드별 마지막 갱신 시각이다.
+/// `checks`는 같은 임기에 노드가 마지막 갱신에 실어 보낸 HA 검사 결과다(보내지 않은 노드는 없다).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Leases {
     pub term: u64,
     pub renewed: BTreeMap<NodeId, Instant>,
+    pub checks: BTreeMap<NodeId, Vec<CheckReport>>,
 }
 
 #[derive(Default)]
@@ -28,17 +34,20 @@ struct Inner {
     /// `renewed`가 속한 임기. 더 높은 임기를 보면 `renewed`를 비운다.
     term: u64,
     renewed: BTreeMap<NodeId, Instant>,
+    /// `renewed`와 같은 임기에 받은 HA 검사 결과
+    checks: BTreeMap<NodeId, Vec<CheckReport>>,
     /// 펜싱 중인 노드. 이 노드의 갱신은 `Fenced`로 거부한다. 임기가 바뀌어도 지우지 않는다.
     /// 지우면 이전 임기에 시작한 복구 쓰기가 끝나기 전에 그 노드가 리스를 받을 수 있다.
     fencing: BTreeSet<NodeId>,
 }
 
 impl Inner {
-    /// 임기가 바뀌었으면 갱신 기록을 비운다.
+    /// 임기가 바뀌었으면 갱신 기록과 검사 결과를 비운다.
     fn enter(&mut self, term: u64) {
         if term > self.term {
             self.term = term;
             self.renewed.clear();
+            self.checks.clear();
         }
     }
 }
@@ -49,12 +58,14 @@ pub(crate) struct LeaseTable {
 }
 
 impl LeaseTable {
-    /// 리더로서 `node`의 갱신을 처리한다. 성공하면 리더가 적용한 마지막 로그 인덱스를 돌려준다.
+    /// 리더로서 `node`의 갱신을 처리한다. 성공하면 리더가 적용한 마지막 로그 인덱스를 돌려준다. 갱신을 적을 때
+    /// 그 노드의 검사 결과를 `checks`로 통째로 바꾼다.
     pub(crate) async fn renew(
         &self,
         raft: &Raft<TypeConfig>,
         confirm: &ConfirmBatch,
         node: NodeId,
+        mut checks: Vec<CheckReport>,
         timeout: Duration,
     ) -> Result<u64, ClusterError> {
         let term = {
@@ -82,6 +93,12 @@ impl LeaseTable {
             }
             inner.enter(term);
             inner.renewed.insert(node, Instant::now());
+            checks.truncate(MAX_LEASE_CHECKS);
+            if checks.is_empty() {
+                inner.checks.remove(&node);
+            } else {
+                inner.checks.insert(node, checks);
+            }
         }
         // 돌려주는 인덱스는 펜싱 검사 뒤에 다시 확인한 커밋 인덱스다. 펜싱 표시를 지우기 전에 끝난
         // 복구 쓰기가 모두 들어 있다. 첫 확인의 인덱스는 그보다 앞설 수 있고, 지표(metrics)의 적용
@@ -98,6 +115,7 @@ impl LeaseTable {
         Leases {
             term,
             renewed: inner.renewed.clone(),
+            checks: inner.checks.clone(),
         }
     }
 

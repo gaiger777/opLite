@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::ha_check::{CheckReport, CheckState};
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::vm::Arch;
 
@@ -122,6 +123,15 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub fence_check: Option<FenceCheck>,
+    /// 이 노드의 네트워크 인터페이스(루프백·tap·opld가 만든 장치 빼고 64개까지). 노드가 쓴다. HA 검사를 고를 때
+    /// 보고, 본딩 포트 상태를 보인다. 옛 노드는 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub interfaces: Vec<NodeInterface>,
+    /// 이 노드의 HA 검사 결과(화면용, 바뀔 때만 쓴다). 리더는 리스 갱신에 실린 결과로 판단한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub checks: Vec<CheckReport>,
 }
 
 /// 이웃 노드의 전원 읽기 결과(설계 §8.1). `error`가 있으면 모든 방법이 실패한 것이다(`fence_unreachable`).
@@ -176,6 +186,122 @@ impl NodeStatus {
                 .shutdown
                 .is_some_and(|s| s.action == ShutdownAction::Freeze)
     }
+
+    /// 이 노드가 `failing`으로 보고한 HA 검사의 이름
+    pub fn failing_checks(&self) -> Vec<&str> {
+        self.checks
+            .iter()
+            .filter(|c| c.state == CheckState::Failing)
+            .map(|c| c.name.as_str())
+            .collect()
+    }
+}
+
+/// 노드 인터페이스 목록의 상한
+pub const MAX_NODE_INTERFACES: usize = 64;
+
+/// 노드의 네트워크 인터페이스 하나(`ip -d addr`와 sysfs)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NodeInterface {
+    pub name: String,
+    pub kind: InterfaceKind,
+    /// operstate(`up`, `down`, `unknown`, `lowerlayerdown` …)
+    pub state: String,
+    /// 링크가 있는지(sysfs `carrier`). 읽지 못했으면 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub carrier: Option<bool>,
+    /// 링크 속도(Mbps). 모르면 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub speed_mbps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub mac: Option<String>,
+    /// 이 인터페이스를 묶은 본딩·브리지
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub master: Option<String>,
+    /// IP 주소(CIDR, 예: `10.0.0.5/24`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub addresses: Vec<String>,
+    /// 본딩이면 그 포트 상태
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub bond: Option<BondStatus>,
+}
+
+/// 인터페이스 종류(`ip -d`의 `info_kind`, 없으면 이더넷)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceKind {
+    Ethernet,
+    Bond,
+    Bridge,
+    Vlan,
+    Dummy,
+    Veth,
+    /// 그 밖의 종류. 이 빌드가 모르는 값(뒤 버전이 더한 종류)도 이것으로 읽는다.
+    #[serde(other)]
+    Other,
+}
+
+/// 본딩과 그 포트의 상태
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BondStatus {
+    /// 본딩 모드(`active-backup`, `802.3ad` …)
+    pub mode: String,
+    pub state: BondState,
+    pub ports: Vec<BondPort>,
+}
+
+/// 본딩 전체: 모든 포트가 `up`이면 `up`, 일부만이면 `degraded`(통과지만 경고), 하나도 없으면 `down`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BondState {
+    Up,
+    Degraded,
+    Down,
+    /// 이 빌드가 모르는 값(뒤 버전이 더한 상태). 저하도 정상도 아닌 "모름"으로 본다.
+    #[serde(other)]
+    Unknown,
+}
+
+/// 본딩 포트 하나
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BondPort {
+    pub name: String,
+    pub state: PortState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub speed_mbps: Option<u32>,
+    /// 802.3ad의 aggregator id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub aggregator: Option<u32>,
+}
+
+/// 본딩 포트의 상태
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PortState {
+    Up,
+    /// 링크가 없음(carrier 0, MII down, operstate down)
+    Down,
+    /// 802.3ad에서 활성 aggregator가 아닌 것에 묶였거나 상대(LACP partner)가 없음
+    LacpMismatch,
+    /// 올라온 포트 가운데 가장 빠른 것보다 느림
+    SpeedMismatch,
+    /// 이 빌드가 모르는 값(뒤 버전이 더한 상태). 이상도 정상도 아닌 "모름"으로 본다.
+    #[serde(other)]
+    Unknown,
 }
 
 /// 이 빌드가 아는 기능. 노드가 [`NodeStatus::features`]에 적는다.
@@ -194,6 +320,7 @@ pub const FEATURES: &[&str] = &[
     "multi-link",
     HA_PLACEMENT,
     FAST_HA,
+    HA_CHECKS,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -201,6 +328,10 @@ pub const HA_PLACEMENT: &str = "ha-placement";
 
 /// 빠른 HA(계획 51): VM 우선순위·게스트 감시, HA 용량 예약·동시 시작 설정, 전원 끄기 펜싱. 모든 노드가 알릴 때만 쓴다.
 pub const FAST_HA: &str = "fast-ha";
+
+/// HA 상태 검사(계획 52): `HaCheck` 만들기·바꾸기, 기록 Task `ha-check`·`bond-degraded`, 리더의 경고 아닌 대응과
+/// `VmHaStatus.evict`. 모든 노드가 알릴 때만 쓴다.
+pub const HA_CHECKS: &str = "ha-checks";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -416,6 +547,119 @@ mod tests {
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), bad);
     }
 
+    /// 인터페이스·검사 결과가 없으면 옛 기록 그대로 쓰고 읽으며, 있으면 그대로 오간다.
+    #[test]
+    fn status_interfaces_and_checks_round_trip_and_are_omitted_when_empty() {
+        let old = serde_json::json!({
+            "online": true, "cpus": 4, "memory_mib": 8192, "hypervisor": "qemu-kvm",
+            "bridges": [], "arch": null, "pools": {}
+        });
+        let status: NodeStatus = serde_json::from_value(old.clone()).unwrap();
+        assert!(status.interfaces.is_empty() && status.checks.is_empty());
+        assert_eq!(serde_json::to_value(&status).unwrap(), old);
+
+        let status = NodeStatus {
+            interfaces: vec![
+                NodeInterface {
+                    name: "bond0".into(),
+                    kind: InterfaceKind::Bond,
+                    state: "up".into(),
+                    carrier: Some(true),
+                    speed_mbps: Some(10000),
+                    mac: Some("52:54:00:12:34:56".into()),
+                    master: Some("br0".into()),
+                    addresses: vec![],
+                    bond: Some(BondStatus {
+                        mode: "802.3ad".into(),
+                        state: BondState::Degraded,
+                        ports: vec![
+                            BondPort {
+                                name: "eno1".into(),
+                                state: PortState::Up,
+                                speed_mbps: Some(10000),
+                                aggregator: Some(1),
+                            },
+                            BondPort {
+                                name: "eno2".into(),
+                                state: PortState::LacpMismatch,
+                                speed_mbps: None,
+                                aggregator: Some(2),
+                            },
+                        ],
+                    }),
+                },
+                NodeInterface {
+                    name: "eno3".into(),
+                    kind: InterfaceKind::Ethernet,
+                    state: "down".into(),
+                    carrier: None,
+                    speed_mbps: None,
+                    mac: None,
+                    master: None,
+                    addresses: vec!["10.0.0.5/24".into()],
+                    bond: None,
+                },
+            ],
+            checks: vec![
+                CheckReport::new("stor", CheckState::Ok, None, None),
+                CheckReport::new(
+                    "vmnet",
+                    CheckState::Failing,
+                    Some("no carrier".into()),
+                    Some(9),
+                ),
+                CheckReport::new("cluster-link-1", CheckState::Failing, None, Some(8)),
+                CheckReport::new("nfs", CheckState::Degraded, None, Some(7)),
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["interfaces"][0]["bond"]["ports"][1],
+            serde_json::json!({ "name": "eno2", "state": "lacp_mismatch", "aggregator": 2 })
+        );
+        assert_eq!(json["interfaces"][0]["bond"]["state"], "degraded");
+        assert_eq!(
+            json["interfaces"][1],
+            serde_json::json!({ "name": "eno3", "kind": "ethernet", "state": "down",
+                                "addresses": ["10.0.0.5/24"] })
+        );
+        assert_eq!(
+            json["checks"][0],
+            serde_json::json!({ "name": "stor", "state": "ok" })
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+        assert_eq!(status.failing_checks(), ["vmnet", "cluster-link-1"]);
+        assert!(NodeStatus::default().failing_checks().is_empty());
+        assert_eq!(
+            serde_json::to_value(PortState::SpeedMismatch).unwrap(),
+            "speed_mismatch"
+        );
+    }
+
+    /// 뒤 버전이 더한 본딩·포트 상태는 `unknown`으로 읽는다(노드 상태 읽기를 깨지 않게).
+    #[test]
+    fn unknown_bond_and_port_states_read_as_unknown() {
+        let bond: BondStatus = serde_json::from_value(serde_json::json!({
+            "mode": "802.3ad", "state": "flapping",
+            "ports": [{ "name": "eno1", "state": "churned" }, { "name": "eno2", "state": "up" }]
+        }))
+        .unwrap();
+        assert_eq!(bond.state, BondState::Unknown);
+        assert_eq!(bond.ports[0].state, PortState::Unknown);
+        assert_eq!(bond.ports[1].state, PortState::Up);
+    }
+
+    /// 뒤 버전이 더한 인터페이스 종류는 `other`로 읽는다.
+    #[test]
+    fn unknown_interface_kinds_read_as_other() {
+        let i: NodeInterface = serde_json::from_value(
+            serde_json::json!({ "name": "wg0", "kind": "wireguard", "state": "unknown" }),
+        )
+        .unwrap();
+        assert_eq!(i.kind, InterfaceKind::Other);
+    }
+
     #[test]
     fn status_underlay_round_trips_and_is_omitted_when_none() {
         let none = serde_json::to_value(NodeStatus::default()).unwrap();
@@ -526,7 +770,8 @@ mod tests {
                 "observer",
                 "multi-link",
                 "ha-placement",
-                "fast-ha"
+                "fast-ha",
+                "ha-checks"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
