@@ -35,7 +35,8 @@ use opl_types::node::{
     NodeSpec, NodeStatus, ShutdownAction,
 };
 use opl_types::placement::{
-    HaGroupNode, HaGroupSpec, HaGroupStatus, PlacementRuleSpec, PlacementRuleStatus, RuleKind,
+    HaGroupNode, HaGroupSpec, HaGroupStatus, LoadSummary, PlacementRuleSpec, PlacementRuleStatus,
+    RuleKind, VmLoad,
 };
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
@@ -1719,6 +1720,133 @@ async fn a_planned_target_in_maintenance_is_picked_again() {
     })
     .await;
     assert_eq!(to, y);
+}
+
+/// 노드 `node`의 이름으로 리스를 갱신하며 부하 요약을 싣는다(그 노드의 측정기 대신).
+async fn renew_load(cluster: &Cluster, node: Uuid, load: LoadSummary) {
+    cluster
+        .execute_as_leader(LeaderRequest::RenewLease {
+            node: NodeId(node),
+            checks: vec![],
+            load: Some(load),
+        })
+        .await
+        .unwrap();
+}
+
+/// 노드 CPU 사용률이 `permille`‰인 부하 요약
+fn cpu_load(permille: u16) -> LoadSummary {
+    LoadSummary {
+        cpu1: Some(permille),
+        cpu5: Some(permille),
+        mem: Some(1024),
+        vms: vec![],
+    }
+}
+
+/// 메모리가 같은 HA 가능 노드(리스 60초) `n`개를 id 순으로 돌려준다. 부하를 모르면 앞 노드를 고른다.
+async fn spares(env: &Env, n: usize) -> Vec<Uuid> {
+    let mut ids = vec![];
+    for i in 0..n {
+        ids.push(node(env, &format!("spare-{i}"), 8192, Some(60)).await);
+    }
+    ids.sort();
+    ids
+}
+
+/// 죽은 노드의 바쁜 HA VM 넷(각각 노드 CPU 4개 가운데 하나를 다 씀 — 몫 25%)은 한가한 노드에 모두 가지 않는다. 한 번에
+/// 여러 VM을 놓을 때 앞 VM의 CPU 몫도 대상 노드에 센다(메모리처럼).
+#[tokio::test]
+async fn busy_vms_of_a_failed_node_spread_by_their_cpu() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 65536, Some(1)).await;
+    // 메모리가 넉넉해(VM 하나 3%) CPU가 순서를 정한다: low 10%, high 30%.
+    let low = node(&env, "low", 65536, Some(60)).await;
+    let high = node(&env, "high", 65536, Some(60)).await;
+    renew_load(&env.cluster, low, cpu_load(100)).await;
+    renew_load(&env.cluster, high, cpu_load(300)).await;
+    let mut vms = vec![];
+    for i in 1..=4 {
+        vms.push(vm(&env, &format!("vm-{i}"), failed, true, PowerState::Running).await);
+    }
+    let busy = LoadSummary {
+        vms: vms
+            .iter()
+            .map(|v| VmLoad {
+                id: v.id,
+                cpu: Some(1000),
+                mem: Some(512),
+            })
+            .collect(),
+        ..cpu_load(900)
+    };
+    renew_load(&env.cluster, failed, busy).await;
+    let manager = fast_manager(&env);
+    let on = |node: Uuid| {
+        vms.iter()
+            .filter(|v| get(&env, v.id).spec.node == Some(node))
+            .count()
+    };
+    eventually("all moved", || on(low) + on(high) == vms.len()).await;
+    // 몫을 세지 않으면 low(10% + 25%)가 high(30% + 25%)보다 늘 한가해 넷 모두 low로 간다.
+    assert_eq!((on(low), on(high)), (2, 2));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovers_to_the_node_whose_cpu_is_idle() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    // 메모리가 같아 부하를 모르면 busy(id가 작음)로 간다.
+    let [busy, idle] = spares(&env, 2).await[..] else {
+        unreachable!()
+    };
+    renew_load(&env.cluster, busy, cpu_load(900)).await;
+    renew_load(&env.cluster, idle, cpu_load(100)).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    eventually("HA VM moved", || get(&env, a.id).spec.node != Some(failed)).await;
+    assert_eq!(get(&env, a.id).spec.node, Some(idle));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_target_chosen_before_the_failure_follows_the_load() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(3)).await;
+    let [busy, idle] = spares(&env, 2).await[..] else {
+        unreachable!()
+    };
+    renew_load(&env.cluster, busy, cpu_load(900)).await;
+    renew_load(&env.cluster, idle, cpu_load(100)).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    // 처음 틱에 부하를 보고 idle로 계획한다. 그 뒤 부하가 뒤바뀌어 지금 고르면 busy가 낫지만, 계획한 노드가
+    // 여전히 맞으므로 그대로 쓴다.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    renew_load(&env.cluster, busy, cpu_load(100)).await;
+    renew_load(&env.cluster, idle, cpu_load(900)).await;
+    eventually("HA VM moved", || get(&env, a.id).spec.node != Some(failed)).await;
+    assert_eq!(get(&env, a.id).spec.node, Some(idle));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovers_when_some_nodes_sent_no_load_summary() {
+    let env = Env::start().await;
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    // quiet(id가 가장 작음)은 요약이 없어 요약이 있는 노드들의 평균(50%)으로 본다. 0으로 보면 quiet로 간다.
+    let [quiet, busy, idle] = spares(&env, 3).await[..] else {
+        unreachable!()
+    };
+    renew_load(&env.cluster, busy, cpu_load(900)).await;
+    renew_load(&env.cluster, idle, cpu_load(100)).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    eventually("HA VM moved", || get(&env, a.id).spec.node != Some(failed)).await;
+    assert_eq!(get(&env, a.id).spec.node, Some(idle));
+    assert_ne!(get(&env, a.id).spec.node, Some(quiet));
+    manager.shutdown().await;
 }
 
 #[tokio::test]

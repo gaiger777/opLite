@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::auth::{Action, Principal};
 use crate::error::{ApiError, Json};
 use crate::resources::{List, check_name, lookup};
+use crate::score::Scorer;
 use crate::state::AppState;
 use crate::tasks::create_task;
 use crate::vms::{check_security_groups, is_stopped, prepare};
@@ -545,7 +546,8 @@ pub async fn revert_snapshot(
     reverted.spec.node = vm.spec.node;
     reverted.spec.power = PowerState::Stopped;
     reverted.spec.ha = vm.spec.ha.clone();
-    prepare(&state, &mut reverted)?;
+    // 꺼진 채 검증하므로 노드를 고르지 않는다(부하를 읽지 않는다).
+    prepare(&state, &mut reverted, &Scorer::default())?;
     let op = TaskOp::SnapshotRevert {
         snapshot: snapshot.id,
     };

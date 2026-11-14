@@ -13,6 +13,7 @@ use opl_types::vm::{PowerState, Vm};
 use uuid::Uuid;
 
 use crate::scheduler::{Inventory, node_fits};
+use crate::score::{self, Scorer, node_use};
 
 /// 자리 덮어쓰기: VM id → 그 VM이 차지한 노드(None이면 자리 잡지 않은 것으로 본다)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -27,6 +28,11 @@ impl Assign {
     /// 이 VM을 자리 잡지 않은 것으로 본다.
     pub fn unplace(&mut self, vm: Uuid) {
         self.0.insert(vm, None);
+    }
+
+    /// 덮어쓴 VM과 그 자리
+    pub fn iter(&self) -> impl Iterator<Item = (Uuid, Option<Uuid>)> + '_ {
+        self.0.iter().map(|(vm, node)| (*vm, *node))
     }
 }
 
@@ -59,15 +65,19 @@ pub struct Candidate {
     pub priority: Option<u32>,
     /// soft 규칙 벌점의 합
     pub penalty: u32,
-    /// 실행하기로 된 다른 VM에 배정되지 않은 메모리. 계획 53이 부하 점수로 바꾼다.
+    /// 부하 점수([`score::score`], 클수록 나음)
+    pub score: i64,
+    /// 실행하기로 된 다른 VM에 배정되지 않은 메모리(비우기의 메모리 확인)
     pub free_mib: i64,
 }
 
-/// 나은 후보가 앞(`Less`): 우선순위 높은 것 → 벌점 적은 것 → 메모리 많은 것 → id 작은 것
+/// 나은 후보가 앞(`Less`): 우선순위 높은 것 → 벌점 적은 것 → 점수 큰 것 → 메모리 많은 것 → id 작은 것.
+/// soft 벌점(1~100 단위)은 사용률 점수(0~2)보다 늘 커서 앞 순위로 둔다.
 pub fn compare(a: &Candidate, b: &Candidate) -> Ordering {
     b.priority
         .cmp(&a.priority)
         .then(a.penalty.cmp(&b.penalty))
+        .then(b.score.cmp(&a.score))
         .then(b.free_mib.cmp(&a.free_mib))
         .then(a.node.cmp(&b.node))
 }
@@ -77,25 +87,65 @@ pub fn best(candidates: &[Candidate]) -> Option<Candidate> {
     candidates.iter().copied().min_by(compare)
 }
 
-/// 노드 조건([`node_fits`])에 맞고 hard 규칙을 어기지 않는 노드들(나은 것부터)
+/// [`candidates_with`]와 같되 부하를 모른다(할당 메모리만 본다).
 pub fn candidates(vm: &Vm, inv: &Inventory, assign: &Assign) -> Vec<Candidate> {
+    candidates_with(vm, inv, assign, &Scorer::default())
+}
+
+/// 노드 조건([`node_fits`])에 맞고 hard 규칙을 어기지 않는 노드들(나은 것부터)
+pub fn candidates_with(
+    vm: &Vm,
+    inv: &Inventory,
+    assign: &Assign,
+    scorer: &Scorer,
+) -> Vec<Candidate> {
     let mut found: Vec<Candidate> = inv
         .nodes
         .iter()
         .filter(|n| node_fits(&vm.spec, inv, n).is_ok())
         .filter(|n| hard_violations(vm, n, inv, assign).is_empty())
-        .map(|n| score(vm, n, inv, assign))
+        .map(|n| score_with(vm, n, inv, assign, scorer))
         .collect();
+    level_scores(&mut found, scorer);
     found.sort_by(compare);
     found
 }
 
-/// VM을 이 노드에 둘 때의 점수(노드 조건과 hard 규칙은 보지 않는다). 비우기가 묶음의 대상을 고를 때도 쓴다.
+/// 이 노드들 가운데 신선한 부하 요약이 있는 노드가 하나도 없다: 부하 점수를 쓰지 않는다([`level_scores`]).
+pub fn unscored(scorer: &Scorer, nodes: impl IntoIterator<Item = Uuid>) -> bool {
+    !nodes
+        .into_iter()
+        .any(|n| scorer.loads.nodes.contains_key(&n))
+}
+
+/// 후보 가운데 신선한 부하 요약이 있는 노드가 하나도 없으면([`unscored`]) 점수를 모두 0으로 둔다. 그러면 순서가 남은
+/// 메모리(`free_mib`)로 정해져 부하를 보기 전과 같다(요약이 없는 노드끼리 사용률 비율로 견주지 않는다). 요약이 있는
+/// 노드가 하나라도 있으면 요약이 없는 노드는 그 노드들의 평균 CPU로 본다.
+pub fn level_scores(found: &mut [Candidate], scorer: &Scorer) {
+    if unscored(scorer, found.iter().map(|c| c.node)) {
+        found.iter_mut().for_each(|c| c.score = 0);
+    }
+}
+
+/// [`score_with`]와 같되 부하를 모른다.
 pub fn score(vm: &Vm, node: &Node, inv: &Inventory, assign: &Assign) -> Candidate {
+    score_with(vm, node, inv, assign, &Scorer::default())
+}
+
+/// VM을 이 노드에 둘 때의 점수(노드 조건과 hard 규칙은 보지 않는다). 비우기가 묶음의 대상을 고를 때도 쓴다.
+pub fn score_with(
+    vm: &Vm,
+    node: &Node,
+    inv: &Inventory,
+    assign: &Assign,
+    scorer: &Scorer,
+) -> Candidate {
+    let after = node_use(node, inv, assign, scorer.loads, Some(vm), None);
     Candidate {
         node: node.id,
         priority: group(vm, inv).and_then(|g| g.spec.priority(&node.name)),
         penalty: soft(vm, node, inv, assign).0,
+        score: score::score(after),
         free_mib: free_mib(vm, node, inv, assign),
     }
 }
@@ -201,17 +251,20 @@ fn group<'a>(vm: &Vm, inv: &'a Inventory) -> Option<&'a HaGroup> {
 
 /// [`Inventory::free_memory_mib`]과 같되 [`Assign`]의 자리를 따른다.
 fn free_mib(vm: &Vm, node: &Node, inv: &Inventory, assign: &Assign) -> i64 {
-    let used: i64 = inv
-        .vms
+    node.status.memory_mib as i64 - allocated_mib(node, inv, assign, &[vm.id]) as i64
+}
+
+/// 이 노드에서 실행하기로 된 VM(`skip` 빼고, [`Assign`]의 자리를 따름)에 배정된 메모리의 합
+pub fn allocated_mib(node: &Node, inv: &Inventory, assign: &Assign, skip: &[Uuid]) -> u64 {
+    inv.vms
         .iter()
-        .filter(|v| v.id != vm.id)
+        .filter(|v| !skip.contains(&v.id))
         .filter(|v| match assign.0.get(&v.id) {
             Some(placed) => *placed == Some(node.id),
             None => v.spec.node == Some(node.id) && v.spec.power == PowerState::Running,
         })
-        .map(|v| i64::from(v.spec.memory_mib))
-        .sum();
-    node.status.memory_mib as i64 - used
+        .map(|v| u64::from(v.spec.memory_mib))
+        .sum()
 }
 
 /// 켜진 hard 규칙끼리의 모순(태그는 지금의 VM·노드 레이블로 푼다). 모순이 있으면 관련된 규칙 이름(이름
@@ -655,6 +708,7 @@ mod tests {
             node: Uuid::from_u128(node),
             priority,
             penalty,
+            score: 0,
             free_mib,
         };
         let mut list = vec![
@@ -693,6 +747,132 @@ mod tests {
         let found = candidates(&me, &inv, &none());
         let order: Vec<_> = found.iter().map(|c| (c.node, c.priority)).collect();
         assert_eq!(order, [(n2.id, Some(5)), (n3.id, Some(1)), (n1.id, None)]);
+    }
+
+    #[test]
+    fn penalty_comes_before_the_load_score_and_the_score_before_memory() {
+        let c = |penalty, score, free_mib, node: u128| Candidate {
+            node: Uuid::from_u128(node),
+            priority: None,
+            penalty,
+            score,
+            free_mib,
+        };
+        let mut list = [
+            c(0, 100, 9000, 1),
+            c(0, 900, 100, 2),
+            c(5, 2_000_000, 9000, 3),
+            c(0, 900, 200, 4),
+        ];
+        list.sort_by(compare);
+        let order: Vec<u128> = list.iter().map(|c| c.node.as_u128()).collect();
+        assert_eq!(order, [4, 2, 1, 3]);
+
+        // 메모리가 같고 벌점도 같으면 CPU가 한가한 노드(20% < 70%), 벌점이 다르면 벌점이 먼저다.
+        let (n1, n2) = (node("n1", 8192, &[]), node("n2", 8192, &[]));
+        let me = vm("me", None, PowerState::Running);
+        let mut inv = Inventory {
+            nodes: vec![n1.clone(), n2.clone()],
+            ..Default::default()
+        };
+        let mut nodes = BTreeMap::new();
+        for (n, cpu) in [(&n1, 0.7), (&n2, 0.2)] {
+            let load = score::NodeLoad {
+                cpu5: Some(cpu),
+                ..Default::default()
+            };
+            nodes.insert(n.id, load);
+        }
+        let loads = score::Loads::new(nodes);
+        let busy = Scorer { loads: &loads };
+        let found = candidates_with(&me, &inv, &none(), &busy);
+        assert_eq!(found[0].node, n2.id);
+        assert!(found[0].score > found[1].score);
+        // 부하를 모르면 지금처럼 메모리가 같아 id 순이다.
+        assert_eq!(
+            best(&candidates(&me, &inv, &none())).unwrap().node,
+            n1.id.min(n2.id)
+        );
+        let mut avoid = rule("avoid", RuleKind::SoftNodeAntiAffinity, &["me"], &["n2"]);
+        avoid.spec.weight = Some(1);
+        inv.rules = vec![avoid];
+        assert_eq!(
+            best(&candidates_with(&me, &inv, &none(), &busy))
+                .unwrap()
+                .node,
+            n1.id
+        );
+    }
+
+    #[test]
+    fn an_empty_summary_counts_as_no_summary() {
+        // big의 요약이 비었다(시작 직후·`/proc` 읽기 실패 — 노드 CPU도 사용 메모리도 없음). 요약이 있는 후보가 없으므로
+        // 남은 메모리 순서다(big 8192 MiB). 사용률 비율로 견주면 small(0 / 4096)이 앞이다.
+        let (big, small) = (node("big", 16384, &[]), node("small", 4096, &[]));
+        let mut busy = vm("busy", None, PowerState::Running);
+        busy.spec.node = Some(big.id);
+        busy.spec.memory_mib = 8192;
+        let me = vm("me", None, PowerState::Running);
+        let inv = Inventory {
+            nodes: vec![big.clone(), small.clone()],
+            vms: vec![busy],
+            ..Default::default()
+        };
+        let mut nodes = BTreeMap::new();
+        nodes.insert(big.id, score::NodeLoad::default());
+        let loads = score::Loads::new(nodes);
+        let scorer = Scorer { loads: &loads };
+        let found = candidates_with(&me, &inv, &none(), &scorer);
+        assert_eq!(found[0].node, big.id);
+        assert!(found.iter().all(|c| c.score == 0), "{found:?}");
+    }
+
+    #[test]
+    fn without_any_summary_among_the_candidates_the_most_free_memory_wins() {
+        // big은 남은 메모리가 많고(8192 MiB) small은 할당 비율이 낮다(0 / 4096). 부하를 모르면 옛 순서(남은 메모리)다.
+        let (big, small) = (node("big", 16384, &[]), node("small", 4096, &[]));
+        let mut busy = vm("busy", None, PowerState::Running);
+        busy.spec.node = Some(big.id);
+        busy.spec.memory_mib = 8192;
+        let me = vm("me", None, PowerState::Running);
+        let inv = Inventory {
+            nodes: vec![big.clone(), small.clone()],
+            vms: vec![busy],
+            ..Default::default()
+        };
+        let found = candidates(&me, &inv, &none());
+        assert_eq!(found[0].node, big.id);
+        assert!(found.iter().all(|c| c.score == 0), "{found:?}");
+        // 후보가 아닌 노드(위트니스)의 요약만 있어도 같다.
+        let mut witness = node("w", 4096, &[]);
+        witness.spec.witness = true;
+        let mut inv = inv.clone();
+        inv.nodes.push(witness.clone());
+        let mut nodes = BTreeMap::new();
+        nodes.insert(witness.id, score::NodeLoad::default());
+        let loads = score::Loads::new(nodes);
+        let scorer = Scorer { loads: &loads };
+        assert_eq!(
+            best(&candidates_with(&me, &inv, &none(), &scorer))
+                .unwrap()
+                .node,
+            big.id
+        );
+        // 후보에 요약이 하나라도 있으면 점수를 쓴다(요약이 없는 small은 big의 CPU로 보고 메모리 비율이 낮다).
+        let mut nodes = BTreeMap::new();
+        let summary = score::NodeLoad {
+            cpu5: Some(0.0),
+            ..Default::default()
+        };
+        nodes.insert(big.id, summary);
+        let loads = score::Loads::new(nodes);
+        let scorer = Scorer { loads: &loads };
+        assert_eq!(
+            best(&candidates_with(&me, &inv, &none(), &scorer))
+                .unwrap()
+                .node,
+            small.id
+        );
     }
 
     #[test]

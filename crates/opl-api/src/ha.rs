@@ -46,6 +46,7 @@ use crate::ha_health::{self, CheckWatch, Health, Place};
 use crate::placement::{self, Assign, Candidate};
 use crate::power_fence::{PowerFence, PowerOff, power_off};
 use crate::scheduler::{Inventory, node_fits};
+use crate::score::{Loads, Scorer};
 use crate::state::AppState;
 use crate::vms::{RuleCheck, start_migration};
 
@@ -472,6 +473,8 @@ fn plan(
     b: Instant,
     down: &BTreeSet<Uuid>,
 ) -> Plans {
+    let loads = Loads::from_leases(leases, now);
+    let scorer = Scorer { loads: &loads };
     let mut targets = BTreeMap::new();
     for node in inv.nodes.iter().filter(|n| n.status.ha.is_some()) {
         let mut vms: Vec<&Vm> = inv
@@ -496,7 +499,7 @@ fn plan(
                     && !down.contains(&n.id)
                     && ready(now, b, leases, n)
             };
-            let target = match pick(vm, inv, &assign, eligible) {
+            let target = match pick(vm, inv, &assign, eligible, &scorer) {
                 Pick::Node(t) | Pick::Violating(t, _) => t,
                 Pick::NoNode | Pick::Blocked(_) => continue,
             };
@@ -633,6 +636,9 @@ async fn tick(
     let leases = cluster.leases();
     let now = Instant::now();
     let b = base_at(base, leases.term, now);
+    // 노드가 리스 갱신에 실어 보낸 부하 요약. 이 틱의 모든 대상 고르기가 쓴다.
+    let loads = Loads::from_leases(&leases, now);
+    let scorer = Scorer { loads: &loads };
     finish_moved(ctx, moved).await;
     resend(ctx, unknown).await;
     let Ok(inv) = Inventory::load(cluster) else {
@@ -682,6 +688,7 @@ async fn tick(
             &power.attempts,
             &down,
             &health,
+            &scorer,
         )
         .await;
         if let Some(u) = recovered {
@@ -696,7 +703,7 @@ async fn tick(
     } else {
         inv
     };
-    let relocated = relocate(ctx, &inv, &leases, now, b, &health).await;
+    let relocated = relocate(ctx, &inv, &leases, now, b, &health, &scorer).await;
     // 옮긴 뒤의 자리로 위반을 센다.
     let inv = if relocated {
         match Inventory::load(cluster) {
@@ -716,6 +723,7 @@ async fn tick(
         let place = Place {
             inv: &inv,
             leases: &leases,
+            loads: &loads,
             now,
             b,
         };
@@ -724,7 +732,16 @@ async fn tick(
     update_violations(ctx, &inv).await;
     failback.observe(now, &leases, &inv);
     if !recovering && unknown.is_empty() {
-        fail_back(ctx, failback, &inv, now, config.failback_after, &health).await;
+        fail_back(
+            ctx,
+            failback,
+            &inv,
+            now,
+            config.failback_after,
+            &health,
+            &scorer,
+        )
+        .await;
     }
 }
 
@@ -1010,6 +1027,7 @@ async fn recover_node(
     attempts: &Attempts,
     down: &BTreeSet<Uuid>,
     health: &Health<'_>,
+    scorer: &Scorer<'_>,
 ) -> Option<Unknown> {
     let cluster = ctx.cluster;
     let mut fence = Fence::begin(cluster, node);
@@ -1063,6 +1081,7 @@ async fn recover_node(
             &failed,
             vm,
             health,
+            scorer,
         )
         .await;
         if let Some((command, moved_to)) = fence.unknown.take() {
@@ -1111,6 +1130,7 @@ async fn recover_vm(
     failed: &Node,
     vm: &Vm,
     health: &Health<'_>,
+    scorer: &Scorer<'_>,
 ) -> Result<(), ClusterError> {
     let migrating = vm.status.migration.as_ref().map(|m| m.node);
     let now = Instant::now();
@@ -1142,7 +1162,7 @@ async fn recover_vm(
         }
         None => {
             queue.repicked += 1;
-            pick(vm, inv, assign, eligible)
+            pick(vm, inv, assign, eligible, scorer)
         }
     };
     let Some(target) = placed(ctx, vm, choice).await? else {
@@ -1316,6 +1336,7 @@ async fn relocate(
     now: Instant,
     b: Instant,
     health: &Health<'_>,
+    scorer: &Scorer<'_>,
 ) -> bool {
     let mut vms: Vec<(&Vm, &Node)> = inv
         .vms
@@ -1330,7 +1351,20 @@ async fn relocate(
     let mut assign = Assign::default();
     let mut changed = false;
     for (vm, from) in vms {
-        match relocate_vm(ctx, inv, &mut assign, leases, now, b, vm, from, health).await {
+        match relocate_vm(
+            ctx,
+            inv,
+            &mut assign,
+            leases,
+            now,
+            b,
+            vm,
+            from,
+            health,
+            scorer,
+        )
+        .await
+        {
             Ok(done) => changed |= done,
             Err(e) => {
                 tracing::info!(vm = %vm.name, error = %e, "cannot relocate HA VM; will retry");
@@ -1352,6 +1386,7 @@ async fn relocate_vm(
     vm: &Vm,
     from: &Node,
     health: &Health<'_>,
+    scorer: &Scorer<'_>,
 ) -> Result<bool, ClusterError> {
     let policy = vm.spec.ha.clone().unwrap_or_default();
     let mut ha = vm.status.ha.clone().unwrap_or_default();
@@ -1376,7 +1411,7 @@ async fn relocate_vm(
             && alive(now, b, leases, n)
             && !health.blocks(vm, n, inv)
     };
-    let Some(target) = placed(ctx, vm, pick(vm, inv, assign, eligible)).await? else {
+    let Some(target) = placed(ctx, vm, pick(vm, inv, assign, eligible, scorer)).await? else {
         return Ok(false);
     };
     if !prepared {
@@ -1423,13 +1458,14 @@ pub(crate) enum Pick {
     Blocked(Vec<String>),
 }
 
-/// 복구할 노드를 고른다: `eligible`이고 노드 조건에 맞는 노드 가운데 [`placement::candidates`] 순서로 가장
-/// 나은 것.
+/// 복구할 노드를 고른다: `eligible`이고 노드 조건에 맞는 노드 가운데 [`placement::candidates_with`] 순서(부하
+/// 점수 포함)로 가장 나은 것.
 pub(crate) fn pick(
     vm: &Vm,
     inv: &Inventory,
     assign: &Assign,
     eligible: impl Fn(&Node) -> bool,
+    scorer: &Scorer,
 ) -> Pick {
     let fits: Vec<&Node> = inv
         .nodes
@@ -1440,10 +1476,12 @@ pub(crate) fn pick(
         return Pick::NoNode;
     }
     let ids: BTreeSet<Uuid> = fits.iter().map(|n| n.id).collect();
-    let found: Vec<Candidate> = placement::candidates(vm, inv, assign)
+    let mut found: Vec<Candidate> = placement::candidates_with(vm, inv, assign, scorer)
         .into_iter()
         .filter(|c| ids.contains(&c.node))
         .collect();
+    // 고를 수 있는 노드 가운데 요약이 있는 노드가 없으면 점수를 쓰지 않는다(다른 노드의 요약만 있을 때).
+    placement::level_scores(&mut found, scorer);
     if let Some(c) = placement::best(&found) {
         return Pick::Node(c.node);
     }
@@ -1454,10 +1492,14 @@ pub(crate) fn pick(
     };
     let mut blocking = BTreeSet::new();
     let mut fallback: Option<(Vec<String>, Candidate)> = None;
+    let unscored = placement::unscored(scorer, ids);
     for node in fits {
         let broken = placement::hard_violations(vm, node, inv, assign);
         if broken.iter().all(may_violate) {
-            let c = placement::score(vm, node, inv, assign);
+            let mut c = placement::score_with(vm, node, inv, assign, scorer);
+            if unscored {
+                c.score = 0;
+            }
             let better = fallback.as_ref().is_none_or(|(rules, best)| {
                 broken
                     .len()
@@ -1548,6 +1590,7 @@ impl Failback {
         now: Instant,
         after: Duration,
         health: &Health<'_>,
+        scorer: &Scorer,
     ) -> Option<Uuid> {
         let name = vm.spec.ha.as_ref()?.group.as_ref()?;
         let group = inv.groups.iter().find(|g| &g.name == name)?;
@@ -1557,7 +1600,7 @@ impl Failback {
         let current = inv.nodes.iter().find(|n| Some(n.id) == vm.spec.node)?;
         let here = group.spec.priority(&current.name);
         let assign = Assign::default();
-        let found: Vec<Candidate> = inv
+        let mut found: Vec<Candidate> = inv
             .nodes
             .iter()
             .filter(|n| n.id != current.id && group.spec.priority(&n.name) > here)
@@ -1569,8 +1612,9 @@ impl Failback {
             .filter(|n| node_fits(&vm.spec, inv, n).is_ok())
             .filter(|n| placement::hard_violations(vm, n, inv, &assign).is_empty())
             .filter(|n| !health.blocks(vm, n, inv))
-            .map(|n| placement::score(vm, n, inv, &assign))
+            .map(|n| placement::score_with(vm, n, inv, &assign, scorer))
             .collect();
+        placement::level_scores(&mut found, scorer);
         placement::best(&found).map(|c| c.node)
     }
 }
@@ -1587,6 +1631,7 @@ async fn fail_back(
     now: Instant,
     after: Duration,
     health: &Health<'_>,
+    scorer: &Scorer<'_>,
 ) {
     if let Some(task) = failback.task {
         match ctx.cluster.get::<TaskSpec>(task) {
@@ -1617,7 +1662,7 @@ async fn fail_back(
         .collect();
     vms.sort_by(|a, b| a.name.cmp(&b.name));
     for vm in vms {
-        let Some(target) = failback.target(vm, inv, now, after, health) else {
+        let Some(target) = failback.target(vm, inv, now, after, health, scorer) else {
             continue;
         };
         match start_migration(

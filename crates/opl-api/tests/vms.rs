@@ -8,11 +8,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::{Env, vm_request};
 use opl_cluster::ClusterError;
+use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_driver::DriverError;
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
 use opl_types::node::{FAST_HA, Fencing, HA_PLACEMENT, Node, NodeHa, NodeSpec};
-use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
+use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{VolumePhase, VolumeSpec};
@@ -505,6 +506,47 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
     node.status.arch = Some(Arch::Aarch64);
     env.cluster.create(&node).await.unwrap();
     node.id
+}
+
+/// 노드 `node`의 이름으로 리더(이 노드)에 리스를 갱신하며 CPU 사용률 `permille`‰의 부하 요약을 싣는다.
+async fn renew_load(env: &Env, node: Uuid, permille: u16) {
+    let load = LoadSummary {
+        cpu1: Some(permille),
+        cpu5: Some(permille),
+        mem: Some(1024),
+        vms: vec![],
+    };
+    env.cluster
+        .execute_as_leader(LeaderRequest::RenewLease {
+            node: NodeId(node),
+            checks: vec![],
+            load: Some(load),
+        })
+        .await
+        .unwrap();
+}
+
+/// `spec.node` 없는 VM을 켜면 메모리가 같은 노드 가운데 리더가 아는 CPU 부하가 낮은 노드를 고른다(부하를
+/// 모르면 id가 가장 작은 이 노드다).
+#[tokio::test]
+async fn start_picks_the_less_busy_node() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (status, body) = admin.post("/vms", vm_request("web")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let a = add_node(&env, "node2").await;
+    let b = add_node(&env, "node3").await;
+    let (busy, idle) = (a.min(b), a.max(b));
+    renew_load(&env, env.node, 900).await;
+    renew_load(&env, busy, 900).await;
+    renew_load(&env, idle, 100).await;
+
+    // 그 노드에는 실행기가 없어 Task는 끝나지 않는다.
+    let (status, task) = admin.post("/vms/web/actions/start", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], idle.to_string());
+    let (_, vm) = admin.get("/vms/web").await;
+    assert_eq!(vm["spec"]["node"], idle.to_string());
 }
 
 /// 노드의 유지보수 모드를 바꾼다.

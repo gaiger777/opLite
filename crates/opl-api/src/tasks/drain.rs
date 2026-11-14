@@ -17,6 +17,7 @@ use crate::cluster::missing_feature;
 use crate::error::ApiError;
 use crate::placement::{self, Assign, affinity_partners, hard_violations};
 use crate::scheduler::{Inventory, disk_moves, node_fits_with};
+use crate::score::{self, Scorer};
 use crate::snapshots::count_snapshots;
 use crate::state::AppState;
 use crate::vms::{RuleCheck, start_migration};
@@ -75,7 +76,10 @@ pub(super) async fn drain(ctx: &Ctx, node: Uuid) -> Result<(), String> {
         } else if gone.get(&vm.id).is_some_and(|n| *n >= MAX_GONE) {
             Some("busy".to_string())
         } else {
-            match move_vm(ctx, &state, node, &vm, &not_moved).await? {
+            // 회차마다 리더가 아는 부하를 다시 읽는다. 옮기는 VM 자신의 부하는 모름으로 둔다.
+            let loads = score::loads(&state).await.without_vms();
+            let scorer = Scorer { loads: &loads };
+            match move_vm(ctx, &state, node, &vm, &not_moved, &scorer).await? {
                 Outcome::Moved => {
                     moved.insert(vm.id);
                     None
@@ -196,6 +200,7 @@ async fn move_vm(
     node: Uuid,
     vm: &Vm,
     not_moved: &HashMap<Uuid, (String, String)>,
+    scorer: &Scorer<'_>,
 ) -> Result<Outcome, String> {
     match settle(ctx, node, vm.id).await {
         Ok(true) => {}
@@ -242,7 +247,7 @@ async fn move_vm(
     if me.status.hypervisor == HVF {
         return Ok(Outcome::NotMoved("hvf node".into()));
     }
-    let target = match pick_target(&bundle, &inv, &all_moves) {
+    let target = match pick_target(&bundle, &inv, &all_moves, scorer) {
         Ok(target) => target,
         Err(rules) if !rules.is_empty() => {
             return Ok(Outcome::NotMoved(format!(
@@ -258,7 +263,7 @@ async fn move_vm(
                 .map(|(v, m)| without_disks(v, &inv, m))
                 .collect();
             let reason = if all_moves.iter().any(|m| !m.is_empty())
-                && pick_target(&stripped, &inv, &vec![Vec::new(); stripped.len()]).is_ok()
+                && pick_target(&stripped, &inv, &vec![Vec::new(); stripped.len()], scorer).is_ok()
             {
                 "no node can take its local disks"
             } else {
@@ -344,13 +349,14 @@ fn bundle(vm: &Vm, node: Uuid, inv: &Inventory) -> Vec<Vm> {
 /// 묶음(`bundle`, 첫째가 옮길 VM)을 함께 받을 노드: HVF가 아니고, 모든 구성원이 스케줄러의 조건(옮길 디스크
 /// `moves[i]`가 있으면 그 대상 풀)을 지나고, 남은 메모리가 묶음 메모리의 합 이상이며, 묶음을 그 노드에 둔
 /// [`Assign`]으로 hard 배치 규칙을 어기지 않는 노드 가운데 [`placement::compare`] 순서(첫 VM의 HA 그룹
-/// 우선순위 → 구성원 soft 벌점의 합 → 남은 메모리 → id)로 가장 나은 노드. 스케줄러는 유지보수 노드(이 노드)를
-/// 고르지 않는다. 없으면 조건·메모리는 맞는데 막은 hard 규칙의 이름(이름 순)이다. 규칙에 맞는 노드가 메모리
+/// 우선순위 → 구성원 soft 벌점의 합 → 첫 VM의 부하 점수 → 남은 메모리 → id)로 가장 나은 노드. 스케줄러는
+/// 유지보수 노드(이 노드)를 고르지 않는다. 없으면 조건·메모리는 맞는데 막은 hard 규칙의 이름(이름 순)이다. 규칙에 맞는 노드가 메모리
 /// 때문에만 막혔으면(앞 구성원이 옮겨 간 노드에 자리가 없음 등) 규칙이 아니라 자리 탓이므로 비어 있다.
 fn pick_target(
     bundle: &[Vm],
     inv: &Inventory,
     moves: &[Vec<DiskMove>],
+    scorer: &Scorer,
 ) -> Result<Uuid, Vec<String>> {
     let lead = &bundle[0];
     let mut blocked = BTreeSet::new();
@@ -370,7 +376,7 @@ fn pick_target(
             assign.place(v.id, n.id);
         }
         // 다른 구성원은 이 노드에 있다고 본 남은 메모리
-        let mut candidate = placement::score(lead, n, inv, &assign);
+        let mut candidate = placement::score_with(lead, n, inv, &assign, scorer);
         let broken: Vec<String> = bundle
             .iter()
             .flat_map(|v| hard_violations(v, n, inv, &assign))
@@ -392,6 +398,7 @@ fn pick_target(
     if no_room {
         blocked.clear();
     }
+    placement::level_scores(&mut found, scorer);
     placement::best(&found)
         .map(|c| c.node)
         .ok_or_else(|| blocked.into_iter().collect())

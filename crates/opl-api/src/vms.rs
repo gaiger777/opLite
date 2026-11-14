@@ -26,8 +26,9 @@ use crate::error::{ApiError, Json, Query};
 use crate::placement::{Assign, hard_violations};
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
 use crate::scheduler::{
-    HaCapacity, Inventory, ScheduleError, disk_moves, ha_capacity, node_fits_with, schedule,
+    HaCapacity, Inventory, ScheduleError, disk_moves, ha_capacity, node_fits_with, schedule_with,
 };
+use crate::score::{self, Scorer};
 use crate::snapshots::{
     check_no_migration, check_no_revert_task, check_no_snapshot_task, check_not_busy,
     check_not_migrating, count_snapshots,
@@ -94,7 +95,8 @@ fn check_ha_capacity(state: &AppState, inv: &Inventory, vm: &Vm) -> Result<(), A
 
 /// 저장하기 전에 VM의 spec을 검증하고 채운다: 빠진 MAC 할당, 참조 확인, 필요하면 노드 배치.
 /// `vm`은 저장할 모양이다(id·이름·레이블은 배치 규칙에 쓰고, 자기 자신의 MAC과 디스크는 충돌로 보지 않는다).
-pub(crate) fn prepare(state: &AppState, vm: &mut Vm) -> Result<(), ApiError> {
+/// 노드를 고를 때 `scorer`의 부하 점수를 쓴다.
+pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<(), ApiError> {
     let id = vm.id;
     let spec = &mut vm.spec;
     let inv = Inventory::load(&state.cluster)?;
@@ -214,7 +216,7 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm) -> Result<(), ApiError> {
         }
     }
     if vm.spec.power == PowerState::Running && vm.spec.node.is_none() {
-        vm.spec.node = Some(schedule(vm, &inv).map_err(schedule_error)?);
+        vm.spec.node = Some(schedule_with(vm, &inv, scorer).map_err(schedule_error)?);
     }
     // 켜진 채 만들거나, 켜진 채로 바꾸거나 메모리를 늘리면 HA 용량 예약을 본다. 이미 켜진 HA VM의 다른
     // 고치기는 예약이 넘친 때(노드 장애 뒤)에도 막지 않는다.
@@ -348,8 +350,10 @@ pub async fn create_vm(
     check_name(&req.name)?;
     let mut vm: Vm = Resource::new(req.name, req.spec);
     vm.labels = req.labels;
+    // 부하는 잠그기 전에 읽는다(리더가 아니면 리더에 물을 수 있다).
+    let loads = score::loads(&state).await;
     let _lock = state.vm_lock.lock().await;
-    prepare(&state, &mut vm)?;
+    prepare(&state, &mut vm, &Scorer { loads: &loads })?;
     vm.revision = state.cluster.create(&vm).await?;
     Ok((StatusCode::CREATED, Json(vm)))
 }
@@ -370,6 +374,7 @@ pub async fn update_vm(
 ) -> Result<Json<Vm>, ApiError> {
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     let expected = if_match(&headers)?;
+    let loads = score::loads(&state).await;
     for _ in 0..10 {
         let _lock = state.vm_lock.lock().await;
         let current = lookup::<VmSpec>(&state.cluster, &key)?;
@@ -387,7 +392,7 @@ pub async fn update_vm(
         let mut next = current.clone();
         next.spec = req.spec.clone();
         next.labels = req.labels.clone();
-        prepare(&state, &mut next)?;
+        prepare(&state, &mut next, &Scorer { loads: &loads })?;
         let spec = next.spec;
         if spec.node != current.spec.node && !is_stopped(&current) {
             return Err(vm_running(&current, "move"));
@@ -556,6 +561,8 @@ pub async fn vm_action(
     let id = vm.id;
     let (op, vm) = match action.as_str() {
         "start" => {
+            let loads = score::loads(&state).await;
+            let scorer = Scorer { loads: &loads };
             let _lock = state.vm_lock.lock().await;
             let vm = modify_spec(&state, id, |spec| {
                 // 배치 규칙은 VM의 이름·레이블로 고른다.
@@ -569,7 +576,7 @@ pub async fn vm_action(
                 {
                     if node.spec.maintenance && stopped_now(&state, id)? {
                         let inv = Inventory::load(&state.cluster)?;
-                        let other = schedule(&me, &inv).map_err(|e| match e {
+                        let other = schedule_with(&me, &inv, &scorer).map_err(|e| match e {
                             ScheduleError::NoNode => ApiError::conflict(
                                 "node_unavailable",
                                 format!(
@@ -585,7 +592,7 @@ pub async fn vm_action(
                         let inv = Inventory::load(&state.cluster)?;
                         let broken = hard_violations(&me, &node, &inv, &Assign::default());
                         if !broken.is_empty() && stopped_now(&state, id)? {
-                            let other = schedule(&me, &inv).map_err(|e| {
+                            let other = schedule_with(&me, &inv, &scorer).map_err(|e| {
                                 let rules = match e {
                                     ScheduleError::PlacementRule(rules) => rules,
                                     ScheduleError::NoNode => broken.clone(),
@@ -606,7 +613,7 @@ pub async fn vm_action(
                 }
                 if spec.node.is_none() {
                     let inv = Inventory::load(&state.cluster)?;
-                    spec.node = Some(schedule(&me, &inv).map_err(schedule_error)?);
+                    spec.node = Some(schedule_with(&me, &inv, &scorer).map_err(schedule_error)?);
                 }
                 // 이미 켜기로 된 VM은 자리를 더 쓰지 않는다.
                 if spec.power != PowerState::Running {

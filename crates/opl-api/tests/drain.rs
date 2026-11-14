@@ -8,9 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{Client, Env, MOUNT_ROOT, set_pool_state, vm_request};
+use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_driver::DirStorage;
 use opl_types::node::{FEATURES, Node, NodeSpec, NodeStatus, PoolState};
-use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
+use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
@@ -292,6 +293,54 @@ async fn drain_skips_nodes_that_cannot_take_the_vm() {
         migrations,
         [&TaskOp::VmMigrate {
             node: small,
+            pool: None
+        }]
+    );
+}
+
+/// 노드 `node`의 이름으로 리더(이 노드)에 리스를 갱신하며 CPU 사용률 `permille`‰의 부하 요약을 싣는다.
+async fn renew_load(env: &Env, node: Uuid, permille: u16) {
+    let load = LoadSummary {
+        cpu1: Some(permille),
+        cpu5: Some(permille),
+        mem: Some(1024),
+        vms: vec![],
+    };
+    env.cluster
+        .execute_as_leader(LeaderRequest::RenewLease {
+            node: NodeId(node),
+            checks: vec![],
+            load: Some(load),
+        })
+        .await
+        .unwrap();
+}
+
+/// 메모리가 같으면 리더가 아는 부하로 CPU가 덜 바쁜 노드를 고른다(부하를 모르면 id가 작은 노드).
+#[tokio::test]
+async fn drain_picks_the_less_busy_node() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "web", "nas", true).await;
+    let a = add_node(&env, "node2", |_| {}).await;
+    let b = add_node(&env, "node3", |_| {}).await;
+    let (busy, idle) = (a.min(b), a.max(b));
+    renew_load(&env, busy, 900).await;
+    renew_load(&env, idle, 100).await;
+
+    let (status, task) = drain(&admin, "node1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
+    let (_, tasks) = env.cluster.list::<TaskSpec>().unwrap();
+    let migrations: Vec<&TaskOp> = tasks
+        .iter()
+        .map(|t| &t.spec.op)
+        .filter(|op| matches!(op, TaskOp::VmMigrate { .. }))
+        .collect();
+    assert_eq!(
+        migrations,
+        [&TaskOp::VmMigrate {
+            node: idle,
             pool: None
         }]
     );

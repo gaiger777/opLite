@@ -41,6 +41,7 @@ use crate::ha::{
 };
 use crate::placement::Assign;
 use crate::scheduler::Inventory;
+use crate::score::{Loads, Scorer};
 use crate::vms::{RuleCheck, start_migration};
 
 /// 창 안에서 너무 자주 옮긴 VM을 옮기지 않는다는 `ha.error`의 가운데([`relocated_too_often`]). 실패가 끝나면 지운다.
@@ -514,6 +515,8 @@ pub(crate) fn decide(
 pub(crate) struct Place<'a> {
     pub inv: &'a Inventory,
     pub leases: &'a Leases,
+    /// 대상 고르기의 부하 점수에 쓰는 부하 요약
+    pub loads: &'a Loads,
     pub now: Instant,
     pub b: Instant,
 }
@@ -683,6 +686,7 @@ async fn migrate(
     detail: String,
 ) {
     let inv = place.inv;
+    let scorer = Scorer { loads: place.loads };
     let limit = match crate::settings::current(ctx.cluster) {
         Ok(s) => s.spec.ha_start_concurrency(),
         Err(e) => {
@@ -719,7 +723,7 @@ async fn migrate(
         let eligible = |n: &Node| {
             n.id != node && ready(place.now, place.b, place.leases, n) && !health.blocks(vm, n, inv)
         };
-        let target = match pick(vm, inv, &assign, eligible) {
+        let target = match pick(vm, inv, &assign, eligible, &scorer) {
             Pick::Node(t) | Pick::Violating(t, _) => t,
             Pick::NoNode | Pick::Blocked(_) => {
                 no_target.push(vm);
@@ -828,6 +832,7 @@ async fn restart_elsewhere(
     detail: String,
 ) {
     let inv = place.inv;
+    let scorer = Scorer { loads: place.loads };
     let mut assign = Assign::default();
     let mut started = vec![];
     let mut no_target = vec![];
@@ -841,7 +846,8 @@ async fn restart_elsewhere(
         };
         if ha.evict.is_some() || ha.relocate_from.is_some() {
             // 앞서 요청한 VM도 갈 곳을 센다(아직 이 노드에 있다).
-            if let Pick::Node(t) | Pick::Violating(t, _) = pick(vm, inv, &assign, eligible) {
+            if let Pick::Node(t) | Pick::Violating(t, _) = pick(vm, inv, &assign, eligible, &scorer)
+            {
                 assign.place(vm.id, t);
             }
             continue;
@@ -853,7 +859,7 @@ async fn restart_elsewhere(
         if relocated_too_often(ctx, vm, &check, unix).await {
             continue;
         }
-        let target = match pick(vm, inv, &assign, eligible) {
+        let target = match pick(vm, inv, &assign, eligible, &scorer) {
             Pick::Node(t) | Pick::Violating(t, _) => t,
             Pick::NoNode | Pick::Blocked(_) => {
                 no_target.push(vm);

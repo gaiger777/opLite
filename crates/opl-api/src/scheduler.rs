@@ -15,6 +15,7 @@ use opl_types::vm::{DiskMove, HaState, PowerState, Vm, VmSpec};
 use uuid::Uuid;
 
 use crate::placement::{self, Assign};
+use crate::score::Scorer;
 use crate::volumes::block_pool_kind;
 
 /// [`schedule`]가 노드를 고르지 못한 이유
@@ -104,13 +105,19 @@ impl Inventory {
     }
 }
 
+/// [`schedule_with`]와 같되 부하를 모른다(할당 메모리만 본다).
+pub fn schedule(vm: &Vm, inv: &Inventory) -> Result<Uuid, ScheduleError> {
+    schedule_with(vm, inv, &Scorer::default())
+}
+
 /// 위트니스가 아니고 온라인이고 유지보수 중이 아니며 머신 타입의 아키텍처이고 디스크의 풀을 쓸 수 있고 네트워크의 브리지가 있는 노드
 /// (HA VM이면 HA 가능 노드, 보안 그룹을 건 NIC가 있으면 방화벽이 있는 노드) 가운데 hard 배치 규칙을 어기지 않는 노드를
-/// [`placement::compare`] 순서(HA 그룹 우선순위 → soft 벌점 → 미할당 메모리 → id)로 고른다. 메모리가 모자라도 고른다
-/// (오버커밋 정책은 범위 밖). arch를 모르는 노드(옛 버전)는 고르지 않는다. 저장소의 이 VM(같은 id)은 자리로 세지 않는다.
-pub fn schedule(vm: &Vm, inv: &Inventory) -> Result<Uuid, ScheduleError> {
+/// [`placement::compare`] 순서(HA 그룹 우선순위 → soft 벌점 → 부하 점수 → 미할당 메모리 → id)로 고른다. 메모리가
+/// 모자라도 고른다(오버커밋 정책은 범위 밖). arch를 모르는 노드(옛 버전)는 고르지 않는다. 저장소의 이 VM(같은 id)은
+/// 자리로 세지 않는다.
+pub fn schedule_with(vm: &Vm, inv: &Inventory, scorer: &Scorer) -> Result<Uuid, ScheduleError> {
     let assign = Assign::default();
-    match placement::best(&placement::candidates(vm, inv, &assign)) {
+    match placement::best(&placement::candidates_with(vm, inv, &assign, scorer)) {
         Some(c) => Ok(c.node),
         None => Err(blocked(vm, inv, &assign)),
     }
@@ -451,6 +458,33 @@ mod tests {
             spec(6144, Some(b.id), PowerState::Stopped),
         ));
         assert_eq!(sched(&me, &inv), Ok(b.id));
+    }
+
+    #[test]
+    fn picks_the_node_with_less_cpu_load_when_memory_is_equal() {
+        let (a, b) = (node(8192), node(8192));
+        let inv = Inventory {
+            nodes: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        let me = Resource::new("me", spec(1024, None, PowerState::Running));
+        // 부하를 모르면 id 순이다. id가 큰 노드가 한가하면 그 노드다.
+        let (first, second) = (a.id.min(b.id), a.id.max(b.id));
+        assert_eq!(schedule(&me, &inv), Ok(first));
+        let mut nodes = std::collections::BTreeMap::new();
+        for (n, cpu) in [(first, 0.7), (second, 0.2)] {
+            let load = crate::score::NodeLoad {
+                cpu5: Some(cpu),
+                mem_used_mib: Some(1000),
+                ..Default::default()
+            };
+            nodes.insert(n, load);
+        }
+        let loads = crate::score::Loads::new(nodes);
+        assert_eq!(
+            schedule_with(&me, &inv, &Scorer { loads: &loads }),
+            Ok(second)
+        );
     }
 
     fn rule(name: &str, kind: RuleKind, vms: &[&str], nodes: &[&str]) -> PlacementRule {

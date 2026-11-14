@@ -41,6 +41,7 @@ pub mod resources;
 pub mod revision;
 mod schedule;
 pub mod scheduler;
+pub mod score;
 mod security_groups;
 mod settings;
 mod snapshots;
