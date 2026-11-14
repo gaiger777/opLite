@@ -8,6 +8,12 @@
 //!
 //! 대상 거르기([`Health::blocks`]): 노드 장애 복구·재시작 옮기기·되돌아가기·`migrate`는 그 VM에 영향을 주는
 //! `storage`·`vm` 검사가 실패한 노드로 옮기지 않는다(grace·과반과 상관없이).
+//!
+//! `restart_elsewhere`: 받을 노드가 있는 VM만 리더가 VM status에 끄기 요청(`ha.evict`)을 쓰고, 그 노드의
+//! reconciler가 QEMU를 SIGKILL로 끄고 파일 볼륨의 캐시를 내보내고 디스크를 끈 뒤 요청을 거두며 옮겨 달라고 한다
+//! (`relocate_from`). 그 뒤는 재시작 옮기기와 같다. 노드가 [`EVICT_TIMEOUT`] 안에 거두지 않으면, 검사가 아직 그
+//! 노드에서만 실패하면 노드마다 한 번(임기 안) 전원 끄기 펜싱으로 끄고(없으면 경고만) 요청은 그대로 두며, 이유가
+//! 사라졌으면(넘긴 뒤에도) 요청을 거둔다.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -24,7 +30,7 @@ use opl_types::node::{InterfaceKind, Node};
 use opl_types::resource::Resource;
 use opl_types::storage::is_shared;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
-use opl_types::vm::{Vm, VmHaStatus, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{HaEvict, PowerState, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -37,8 +43,14 @@ use crate::placement::Assign;
 use crate::scheduler::Inventory;
 use crate::vms::{RuleCheck, start_migration};
 
+/// 창 안에서 너무 자주 옮긴 VM을 옮기지 않는다는 `ha.error`의 가운데([`relocated_too_often`]). 실패가 끝나면 지운다.
+const NOT_MOVING: &str = " failed; not moving the VM: ";
+
 /// 거절된 마이그레이션을 다시 해 보기까지 기다리는 시간
 const MIGRATE_RETRY: Duration = Duration::from_secs(60);
+
+/// 노드가 끄기 요청(`ha.evict`)을 거두기를 기다리는 시간. 지나면 전원 끄기 펜싱으로 끈다(한 번).
+pub(crate) const EVICT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 한 틱의 검사 상태: 켜진 `HaCheck`와 노드마다 마지막 리스 갱신에 실린 결과
 pub(crate) struct Health<'a> {
@@ -124,6 +136,26 @@ impl<'a> Health<'a> {
         let (failing, reporting) = self.tally(check, alive);
         reporting > 0 && failing * 2 > reporting
     }
+
+    /// 끄기 요청의 이유가 아직 맞다: 켜진 검사 `check`의 대응이 아직 `restart_elsewhere`이고(모든 노드가 대응을
+    /// 알고 — `everywhere`) 노드 `node`가 실패로 보고하며 공유 실패가 아니다.
+    fn still_failing(
+        &self,
+        check: &str,
+        node: Uuid,
+        alive: &BTreeSet<Uuid>,
+        everywhere: bool,
+    ) -> bool {
+        everywhere
+            && self
+                .checks
+                .iter()
+                .any(|c| c.name == check && c.spec.action() == HaCheckAction::RestartElsewhere)
+            && self
+                .report(node, check)
+                .is_some_and(|r| r.state == CheckState::Failing)
+            && !self.shared(check, alive)
+    }
 }
 
 /// 검사가 노드 `node`에서 VM `vm`에 영향을 주는지(VM이 그 노드에 있는지는 보지 않는다).
@@ -178,9 +210,7 @@ pub(crate) fn affected<'i>(check: &HaCheckSpec, node: &Node, inv: &'i Inventory)
     let mut vms: Vec<&Vm> = inv
         .vms
         .iter()
-        .filter(|vm| {
-            vm.spec.node == Some(node.id) && vm.spec.power == opl_types::vm::PowerState::Running
-        })
+        .filter(|vm| vm.spec.node == Some(node.id) && vm.spec.power == PowerState::Running)
         .filter(|vm| affects(check, vm, node, inv))
         .collect();
     vms.sort_by(|a, b| a.name.cmp(&b.name));
@@ -265,6 +295,10 @@ pub(crate) struct CheckWatch {
     migrating: BTreeMap<Uuid, BTreeMap<Uuid, Uuid>>,
     /// 마이그레이션이 거절된 VM과 마지막으로 거절된 때
     refused: BTreeMap<Uuid, Instant>,
+    /// 끄기 요청(`ha.evict`)이 남은 VM. 저장소의 요청으로 맞추므로 새 리더도 이어서 센다.
+    evicting: BTreeMap<Uuid, Evict>,
+    /// 이 임기에 끄기 요청을 넘긴(전원 끄기 요청 또는 실패 기록) 노드. 노드마다 한 번만 넘긴다.
+    escalated: BTreeSet<Uuid>,
     /// 기능이 모자라 대응하지 않는다고 이 임기에 경고했다.
     old_warned: bool,
 }
@@ -335,6 +369,17 @@ impl CheckWatch {
     }
 }
 
+/// 노드가 아직 거두지 않은 끄기 요청(리더 메모리)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Evict {
+    node: Uuid,
+    check: String,
+    /// 이 리더가 요청을 처음 본 때([`EVICT_TIMEOUT`]의 기준)
+    at: Instant,
+    /// 시간이 지나 넘겼다(전원 끄기 요청 또는 실패 기록, 한 번만).
+    escalated: bool,
+}
+
 /// [`decide`]의 판단
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decision {
@@ -360,6 +405,15 @@ pub(crate) enum Decision {
         unprotected: usize,
         detail: String,
     },
+    /// 영향받는 HA VM(`vms`)을 그 노드에서 끄게 하고 다른 노드에서 켠다. `unprotected`는 영향받는 HA 아닌 VM
+    /// 수다.
+    RestartElsewhere {
+        node: Uuid,
+        check: String,
+        vms: Vec<Uuid>,
+        unprotected: usize,
+        detail: String,
+    },
     /// 노드 전원을 끈다.
     Fence {
         node: Uuid,
@@ -368,9 +422,9 @@ pub(crate) enum Decision {
     },
 }
 
-/// grace가 지난 실패에 할 일. 경고·전원 끄기는 실패마다 한 번, `migrate`는 옮길 VM이 남은 동안 틱마다 낸다. 과반
-/// 실패면 검사마다 한 번 [`Decision::Shared`]만 낸다. 모든 노드가 `ha-checks`를 알지 못하면(`everywhere`가 아님)
-/// 모두 경고다. 이 계획의 다음 단계 전까지 `restart_elsewhere`는 경고다.
+/// grace가 지난 실패에 할 일. 경고·전원 끄기는 실패마다 한 번, `migrate`·`restart_elsewhere`는 옮길 VM이 남은
+/// 동안 틱마다 낸다. 과반 실패면 검사마다 한 번 [`Decision::Shared`]만 낸다. 모든 노드가 `ha-checks`를 알지
+/// 못하면(`everywhere`가 아님) 모두 경고다.
 pub(crate) fn decide(
     health: &Health<'_>,
     inv: &Inventory,
@@ -403,25 +457,41 @@ pub(crate) fn decide(
             .report(*node, check)
             .and_then(|r| r.error.clone())
             .unwrap_or_else(|| "failing".into());
-        let action = match rule.action {
-            _ if !everywhere => HaCheckAction::Warn,
-            HaCheckAction::RestartElsewhere => HaCheckAction::Warn,
-            action => action,
+        let action = if everywhere {
+            rule.action
+        } else {
+            HaCheckAction::Warn
         };
         match (action, rule.spec) {
-            (HaCheckAction::Migrate, Some(spec)) => {
+            (HaCheckAction::Migrate | HaCheckAction::RestartElsewhere, Some(spec)) => {
                 let Some(n) = inv.nodes.iter().find(|n| n.id == *node) else {
                     continue;
                 };
                 let (ha, other): (Vec<&Vm>, Vec<&Vm>) = affected(spec, n, inv)
                     .into_iter()
                     .partition(|vm| vm.spec.ha_active());
-                out.push(Decision::Migrate {
-                    node: *node,
-                    check: check.clone(),
-                    vms: ha.iter().map(|vm| vm.id).collect(),
-                    unprotected: other.len(),
-                    detail,
+                let (node, check, vms, unprotected) = (
+                    *node,
+                    check.clone(),
+                    ha.iter().map(|vm| vm.id).collect(),
+                    other.len(),
+                );
+                out.push(if action == HaCheckAction::Migrate {
+                    Decision::Migrate {
+                        node,
+                        check,
+                        vms,
+                        unprotected,
+                        detail,
+                    }
+                } else {
+                    Decision::RestartElsewhere {
+                        node,
+                        check,
+                        vms,
+                        unprotected,
+                        detail,
+                    }
                 });
             }
             _ if episode.acted => {}
@@ -459,6 +529,8 @@ pub(crate) async fn react(
     everywhere: bool,
 ) {
     watch.prune(ctx.cluster);
+    follow_evictions(ctx, watch, power, health, place.inv, place.now, everywhere).await;
+    clear_check_errors(ctx, watch, place.inv).await;
     if !everywhere && !decisions.is_empty() && !watch.old_warned {
         tracing::warn!(
             "some nodes do not support HA checks yet; failing HA checks only warn until every node is upgraded"
@@ -507,6 +579,22 @@ pub(crate) async fn react(
                     detail
                 };
                 migrate(ctx, watch, health, &place, node, check, vms, detail).await;
+            }
+            Decision::RestartElsewhere {
+                node,
+                check,
+                vms,
+                unprotected,
+                detail,
+            } => {
+                let reason = format!("HA check {check} failed: {detail}");
+                let detail = if unprotected > 0 {
+                    format!("{detail}; also affects {unprotected} VMs without HA")
+                } else {
+                    detail
+                };
+                restart_elsewhere(ctx, watch, health, &place, node, check, vms, reason, detail)
+                    .await;
             }
         }
     }
@@ -621,31 +709,8 @@ async fn migrate(
         {
             continue;
         }
-        let policy = vm.spec.ha.clone().unwrap_or_default();
         let unix = unix_now();
-        let mut ha = vm.status.ha.clone().unwrap_or_default();
-        ha.relocations
-            .retain(|at| at.saturating_add(RELOCATE_WINDOW.as_secs()) > unix);
-        if ha.relocations.len() >= usize::from(policy.max_relocate) {
-            let error = format!(
-                "HA check {check} failed; not moving the VM: gave up after {} relocations",
-                ha.relocations.len()
-            );
-            if vm.status.ha.as_ref().and_then(|h| h.error.as_ref()) != Some(&error) {
-                tracing::warn!(vm = %vm.name, check = %check, error = %error, "not moving HA VM");
-                let status = VmStatus {
-                    ha: Some(VmHaStatus {
-                        error: Some(error),
-                        ..vm.status.ha.clone().unwrap_or_default()
-                    }),
-                    ..vm.status.clone()
-                };
-                if let Err(e) =
-                    update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await
-                {
-                    tracing::info!(vm = %vm.name, error = %e, "cannot record HA error; will retry");
-                }
-            }
+        if relocated_too_often(ctx, vm, &check, unix).await {
             continue;
         }
         if watch.migrating.get(&node).map_or(0, BTreeMap::len) >= limit {
@@ -712,6 +777,335 @@ async fn migrate(
         true,
     )
     .await;
+}
+
+/// 창 안에서 이미 `max_relocate`번 옮긴 VM이면 옮기지 않고 `ha.error`를 남긴다(같으면 다시 쓰지 않는다). 그러면
+/// true다.
+async fn relocated_too_often(ctx: Ctx<'_>, vm: &Vm, check: &str, unix: u64) -> bool {
+    let policy = vm.spec.ha.clone().unwrap_or_default();
+    let mut ha = vm.status.ha.clone().unwrap_or_default();
+    ha.relocations
+        .retain(|at| at.saturating_add(RELOCATE_WINDOW.as_secs()) > unix);
+    if ha.relocations.len() < usize::from(policy.max_relocate) {
+        return false;
+    }
+    let error = format!(
+        "HA check {check}{NOT_MOVING}gave up after {} relocations",
+        ha.relocations.len()
+    );
+    if vm.status.ha.as_ref().and_then(|h| h.error.as_ref()) != Some(&error) {
+        tracing::warn!(vm = %vm.name, check = %check, error = %error, "not moving HA VM");
+        let status = VmStatus {
+            ha: Some(VmHaStatus {
+                error: Some(error),
+                ..vm.status.ha.clone().unwrap_or_default()
+            }),
+            ..vm.status.clone()
+        };
+        if let Err(e) = update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await {
+            tracing::info!(vm = %vm.name, error = %e, "cannot record HA error; will retry");
+        }
+    }
+    true
+}
+
+/// 영향받는 HA VM마다(이름 순) 그 노드에 끄기 요청(`ha.evict`)을 쓴다. 이미 요청했거나 옮겨 달라고 했거나
+/// 마이그레이션 중인 VM은 건너뛰고, 창 안에서 이미 `max_relocate`번 옮긴 VM은 끄지 않고 `ha.error`만 남긴다(끄면
+/// 포기로 멈추지만, 그대로 두면 스토리지가 돌아올 때 산다). 받을 노드(그 노드가 아니고 리스가 살아 있으며 같은
+/// 검사가 막지 않는 노드, 앞 VM과 앞서 요청한 VM이 갈 곳을 셈)가 없는 VM도 끄지 않는다(끄면 켤 곳 없이 꺼진 채
+/// 남는다 — 한 번 경고). 그 노드의 reconciler가 끄고 옮겨 달라고 하면 재시작 옮기기([`crate::ha`]의 `relocate`)가 같은
+/// 검사가 실패하지 않는 노드로 옮기며 `max_relocate`에 센다. 첫 대응과 요청을 쓴 틱에 기록 Task를 쓴다.
+#[allow(clippy::too_many_arguments)]
+async fn restart_elsewhere(
+    ctx: Ctx<'_>,
+    watch: &mut CheckWatch,
+    health: &Health<'_>,
+    place: &Place<'_>,
+    node: Uuid,
+    check: String,
+    vms: Vec<Uuid>,
+    reason: String,
+    detail: String,
+) {
+    let inv = place.inv;
+    let mut assign = Assign::default();
+    let mut started = vec![];
+    let mut no_target = vec![];
+    for vm in vms
+        .iter()
+        .filter_map(|id| inv.vms.iter().find(|vm| vm.id == *id))
+    {
+        let ha = vm.status.ha.clone().unwrap_or_default();
+        let eligible = |n: &Node| {
+            n.id != node && ready(place.now, place.b, place.leases, n) && !health.blocks(vm, n, inv)
+        };
+        if ha.evict.is_some() || ha.relocate_from.is_some() {
+            // 앞서 요청한 VM도 갈 곳을 센다(아직 이 노드에 있다).
+            if let Pick::Node(t) | Pick::Violating(t, _) = pick(vm, inv, &assign, eligible) {
+                assign.place(vm.id, t);
+            }
+            continue;
+        }
+        if vm.status.migration.is_some() {
+            continue;
+        }
+        let unix = unix_now();
+        if relocated_too_often(ctx, vm, &check, unix).await {
+            continue;
+        }
+        let target = match pick(vm, inv, &assign, eligible) {
+            Pick::Node(t) | Pick::Violating(t, _) => t,
+            Pick::NoNode | Pick::Blocked(_) => {
+                no_target.push(vm);
+                continue;
+            }
+        };
+        let status = VmStatus {
+            ha: Some(VmHaStatus {
+                evict: Some(HaEvict {
+                    from: node,
+                    check: check.clone(),
+                    reason: reason.clone(),
+                    at: unix,
+                }),
+                ..ha
+            }),
+            ..vm.status.clone()
+        };
+        match update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await {
+            Ok(_) => {
+                tracing::warn!(vm = %vm.name, node = %node_name(inv, node), check = %check, "HA check failed; asking the node to stop the VM so it can restart elsewhere");
+                watch.evicting.insert(
+                    vm.id,
+                    Evict {
+                        node,
+                        check: check.clone(),
+                        at: place.now,
+                        escalated: false,
+                    },
+                );
+                assign.place(vm.id, target);
+                started.push(vm.name.clone());
+            }
+            Err(e) => {
+                tracing::info!(vm = %vm.name, error = %e, "cannot ask the node to stop the VM; will retry");
+            }
+        }
+    }
+    let Some(episode) = watch.failing.get_mut(&(node, check.clone())) else {
+        return;
+    };
+    // 받을 노드가 없어 아무것도 요청하지 않았으면 경고만 한다(빈 기록 Task를 쓰지 않는다).
+    let waiting = !no_target.is_empty();
+    for vm in no_target {
+        if episode.no_target.insert(vm.id) {
+            tracing::warn!(vm = %vm.name, check = %check, "HA check failed but no node can take the VM; leaving it running");
+        }
+    }
+    if started.is_empty() && (episode.acted || waiting) {
+        return;
+    }
+    episode.acted = true;
+    record_check(
+        ctx,
+        node,
+        &check,
+        HaCheckAction::RestartElsewhere,
+        started,
+        detail,
+        true,
+    )
+    .await;
+}
+
+/// 끄기 요청을 따라간다: 저장소에 남은 요청(VM이 아직 그 노드에 있고 켜기로 됨)으로 목록을 맞추고(거둬졌거나
+/// 옮겨졌거나 꺼진 VM은 뺀다), [`EVICT_TIMEOUT`] 안에 거두지 않은 요청은 이유를 다시 본다: 검사가 아직 그
+/// 노드에서만 실패하고 대응이 그대로면([`Health::still_failing`]) 노드마다 한 번(임기 안 — 이미 넘긴 노드의 뒤
+/// 요청은 넘긴 것으로만 둔다) [`escalate`]하고(요청은 그대로 두므로 노드가 나중에 끄면 이어서 옮긴다), 아니면
+/// (회복, 공유 실패로 바뀜, 검사를 지우거나 끄거나 대응을 바꿈) 요청을 거둔다. 넘긴 요청도 틱마다 이유를 보고
+/// 사라지면 거둔다(전원 끄기는 다시 요청하지 않는다).
+async fn follow_evictions(
+    ctx: Ctx<'_>,
+    watch: &mut CheckWatch,
+    power: &mut PowerFencing,
+    health: &Health<'_>,
+    inv: &Inventory,
+    now: Instant,
+    everywhere: bool,
+) {
+    let live: BTreeMap<Uuid, (&Vm, &HaEvict)> = inv
+        .vms
+        .iter()
+        .filter_map(|vm| {
+            let evict = vm.status.ha.as_ref()?.evict.as_ref()?;
+            (vm.spec.node == Some(evict.from) && vm.spec.power == PowerState::Running)
+                .then_some((vm.id, (vm, evict)))
+        })
+        .collect();
+    watch.evicting.retain(|id, _| live.contains_key(id));
+    let mut due: BTreeMap<Uuid, Vec<(&Vm, String)>> = BTreeMap::new();
+    for (id, (vm, evict)) in live {
+        let entry = watch.evicting.entry(id).or_insert_with(|| Evict {
+            node: evict.from,
+            check: evict.check.clone(),
+            at: now,
+            escalated: false,
+        });
+        let (node, check, escalated) = (entry.node, entry.check.clone(), entry.escalated);
+        if !escalated && now.saturating_duration_since(entry.at) < EVICT_TIMEOUT {
+            continue;
+        }
+        if !health.still_failing(&check, node, &watch.alive, everywhere) {
+            if withdraw(ctx, vm).await {
+                watch.evicting.remove(&id);
+            }
+        } else if !escalated {
+            due.entry(node).or_default().push((vm, check));
+        }
+    }
+    for (node, mut vms) in due {
+        vms.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        if watch.escalated.contains(&node) || escalate(ctx, power, inv, node, &vms).await {
+            watch.escalated.insert(node);
+            for (vm, _) in &vms {
+                if let Some(entry) = watch.evicting.get_mut(&vm.id) {
+                    entry.escalated = true;
+                }
+            }
+        }
+    }
+}
+
+/// 이유가 사라진 끄기 요청을 거둔다(VM은 그 노드에서 그대로 돈다). 썼으면 true(엇갈리면 다음 틱에 다시).
+async fn withdraw(ctx: Ctx<'_>, vm: &Vm) -> bool {
+    let mut ha = vm.status.ha.clone().unwrap_or_default();
+    let check = ha.evict.take().map(|e| e.check).unwrap_or_default();
+    let status = VmStatus {
+        ha: (ha != VmHaStatus::default()).then_some(ha),
+        ..vm.status.clone()
+    };
+    match update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await {
+        Ok(_) => {
+            tracing::info!(vm = %vm.name, check = %check, "HA check no longer fails on the node alone; withdrawing the request to stop the VM");
+            true
+        }
+        Err(e) => {
+            tracing::info!(vm = %vm.name, error = %e, "cannot withdraw the request to stop the VM; will retry");
+            false
+        }
+    }
+}
+
+/// 노드가 시간 안에 VM들(`vms`, 이름 순, 끄기 요청의 검사와 함께)을 끄지 않았다(답이 없거나 SIGKILL에도 끝나지
+/// 않는 QEMU): 노드마다 한 번에, `NodeFence`가 있으면 전원 끄기를 요청하고(확인 뒤 노드 장애 복구가 모든 HA VM을
+/// 옮긴다), 없으면 경고와 실패 기록 Task만 남긴다. 기록 Task는 노드마다 하나다(검사는 첫 VM의 것). 펜싱 설정을
+/// 읽지 못하면 false(다음 틱에 다시).
+async fn escalate(
+    ctx: Ctx<'_>,
+    power: &mut PowerFencing,
+    inv: &Inventory,
+    node: Uuid,
+    vms: &[(&Vm, String)],
+) -> bool {
+    let Some((_, check)) = vms.first() else {
+        return true;
+    };
+    let name = node_name(inv, node);
+    let secs = EVICT_TIMEOUT.as_secs();
+    let names: Vec<String> = vms.iter().map(|(vm, _)| vm.name.clone()).collect();
+    let listed = if names.len() == 1 {
+        format!("VM {}", names[0])
+    } else {
+        format!("VMs {}", names.join(", "))
+    };
+    let (detail, ok) = match ctx.cluster.get::<NodeFenceSpec>(node) {
+        Ok(Some(_)) if node == ctx.cluster.id().0 => {
+            tracing::warn!(node = %name, vms = ?names, check = %check, "the leader did not stop the VMs for a failed HA check; it cannot power itself off");
+            (
+                format!(
+                    "the node did not stop {listed} within {secs}s; the node is the leader and cannot power itself off"
+                ),
+                false,
+            )
+        }
+        Ok(Some(_)) => {
+            tracing::warn!(node = %name, vms = ?names, check = %check, "the node did not stop the VMs for a failed HA check; requesting a power-off of the node");
+            power.request(
+                node,
+                format!("HA check {check} failed and the node did not stop {listed}"),
+            );
+            (
+                format!(
+                    "the node did not stop {listed} within {secs}s; requested a power-off of the node"
+                ),
+                true,
+            )
+        }
+        Ok(None) => {
+            tracing::warn!(node = %name, vms = ?names, check = %check, "the node did not stop the VMs for a failed HA check and has no power fencing; leaving them");
+            let detail = if names.len() == 1 {
+                "the node did not stop the VM and has no power fencing; leaving it".to_string()
+            } else {
+                "the node did not stop the VMs and has no power fencing; leaving them".to_string()
+            };
+            (detail, false)
+        }
+        Err(e) => {
+            tracing::warn!(node = %name, error = %e, "cannot read power fencing settings; will retry");
+            return false;
+        }
+    };
+    record_check(
+        ctx,
+        node,
+        check,
+        HaCheckAction::RestartElsewhere,
+        names,
+        detail,
+        ok,
+    )
+    .await;
+    true
+}
+
+/// 너무 자주 옮겨 옮기지 않는다는 오류(`ha.error`, [`relocated_too_often`])를 그 검사 실패가 끝나면 지운다(VM이
+/// 자리 잡은 노드에서 그 검사의 실패 기록이 없음 — 회복, 검사를 지움, VM이 다른 노드로 감). 엇갈리면 다음 틱에 다시.
+async fn clear_check_errors(ctx: Ctx<'_>, watch: &CheckWatch, inv: &Inventory) {
+    for vm in &inv.vms {
+        let Some(ha) = &vm.status.ha else {
+            continue;
+        };
+        let Some(check) = ha
+            .error
+            .as_deref()
+            .and_then(|e| e.strip_prefix("HA check "))
+            .and_then(|e| e.split_once(NOT_MOVING))
+            .map(|(check, _)| check)
+        else {
+            continue;
+        };
+        if vm
+            .spec
+            .node
+            .is_some_and(|n| watch.failing.contains_key(&(n, check.to_string())))
+        {
+            continue;
+        }
+        let mut ha = ha.clone();
+        ha.error = None;
+        let status = VmStatus {
+            ha: (ha != VmHaStatus::default()).then_some(ha),
+            ..vm.status.clone()
+        };
+        match update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await {
+            Ok(_) => {
+                tracing::info!(vm = %vm.name, check = %check, "HA check no longer fails; clearing the HA error");
+            }
+            Err(e) => {
+                tracing::info!(vm = %vm.name, error = %e, "cannot clear the HA error; will retry");
+            }
+        }
+    }
 }
 
 /// 검사 실패로 옮긴 VM의 기록: 창 밖 기록을 버리고 지금 시각을 더하고 떠난 노드를 `relocated_from`에 둔다(되돌아가기가
@@ -1352,6 +1746,56 @@ mod tests {
             };
             assert!(!h.blocks(&inv.vms[0], &n, &inv));
         }
+    }
+
+    /// `storage` 검사의 기본 대응은 `restart_elsewhere`이고 그 풀에 디스크가 있는 HA VM만 옮긴다(HA 아닌 VM은
+    /// 수만). 대응한 뒤에도 옮길 VM이 남은 동안 틱마다 낸다. 기능이 모자라면 경고다.
+    #[test]
+    fn a_storage_check_restarts_its_ha_vms_elsewhere_by_default() {
+        let (n, other) = (node("n1", vec![], None), node("n2", vec![], None));
+        let mut inv = Inventory {
+            nodes: vec![n.clone(), other.clone()],
+            pools: vec![pool("nas", dir("/srv"), true)],
+            volumes: vec![volume("d1", "nas"), volume("d2", "nas")],
+            ..Default::default()
+        };
+        inv.vms = vec![
+            vm("b-ha", &n, &["d1"], &[], true),
+            vm("a-plain", &n, &["d2"], &[], false),
+            vm("c-local", &n, &[], &[], true),
+        ];
+        let spec = check(
+            HaCheckRole::Storage,
+            HaCheckTarget::Pool { name: "nas".into() },
+        );
+        let reports = reports(&[(n.id, CheckState::Failing), (other.id, CheckState::Ok)]);
+        let health = Health {
+            term: 1,
+            checks: vec![resource("c", spec)],
+            reports: &reports,
+        };
+        let t0 = Instant::now();
+        let mut watch = CheckWatch::default();
+        watch.observe(&health, BTreeSet::from([n.id, other.id]), t0);
+        let after = t0 + Duration::from_secs(10);
+        let restart = vec![Decision::RestartElsewhere {
+            node: n.id,
+            check: "c".into(),
+            vms: vec![inv.vms[0].id],
+            unprotected: 1,
+            detail: "c is Failing".into(),
+        }];
+        assert_eq!(decide(&health, &inv, &watch, after, true), restart);
+        assert_eq!(
+            decide(&health, &inv, &watch, after, false),
+            [Decision::Warn {
+                node: n.id,
+                check: "c".into(),
+                detail: "c is Failing".into(),
+            }]
+        );
+        watch.acted(n.id, "c");
+        assert_eq!(decide(&health, &inv, &watch, after, true), restart);
     }
 
     fn health_with<'a>(h: &Health<'a>) -> Health<'a> {

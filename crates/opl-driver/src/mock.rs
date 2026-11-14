@@ -718,12 +718,14 @@ impl Hypervisor for MockHypervisor {
             // 실제 QEMU처럼 요청만 보낸다. 게스트는 무시할 수 있으므로 실제 종료는
             // 테스트가 `guest_shutdown`으로 일으킨다.
             StopMode::Acpi => {}
-            StopMode::Force | StopMode::Kill => self.remove(
+            StopMode::Force => self.remove(
                 id,
                 EventKind::Stopped {
                     guest_initiated: false,
                 },
             ),
+            // 실제 드라이버처럼 SIGKILL은 QMP 연결이 끊긴 크래시로 알려진다.
+            StopMode::Kill => self.remove(id, EventKind::Crashed),
         }
         Ok(())
     }
@@ -1423,7 +1425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_stops_like_force_unless_the_vm_is_unkillable() {
+    async fn kill_ends_the_vm_as_a_crash_unless_it_is_unkillable() {
         let hv = MockHypervisor::default();
         let vm = spec();
         hv.start(&vm, None).await.unwrap();
@@ -1438,12 +1440,7 @@ mod tests {
         hv.set_unkillable(vm.id, false);
         hv.stop(vm.id, StopMode::Kill).await.unwrap();
         assert_eq!(hv.inspect(vm.id).await.unwrap(), None);
-        assert_eq!(
-            rx.recv().await.unwrap().kind,
-            EventKind::Stopped {
-                guest_initiated: false
-            }
-        );
+        assert_eq!(rx.recv().await.unwrap().kind, EventKind::Crashed);
         // 이미 꺼진 VM은 그대로 성공한다.
         hv.stop(vm.id, StopMode::Kill).await.unwrap();
 

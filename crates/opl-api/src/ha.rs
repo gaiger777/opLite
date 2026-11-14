@@ -19,7 +19,7 @@
 //! 복구한다. 끄지 못하면 이 임기에는 다시 하지 않고 `recover_after`(watchdog)를 기다린다.
 //!
 //! HA 상태 검사(설계 §8.2, [`crate::ha_health`]): 복구할 노드가 없는 틱에 노드가 리스 갱신에 실어 보낸 검사 결과로
-//! 경고·마이그레이션·전원 끄기를 하고, 모든 대상 고르기에서 그 VM에 영향을 주는 검사가 실패한 노드를 뺀다.
+//! 경고·마이그레이션·다른 노드에서 다시 켜기·전원 끄기를 하고, 모든 대상 고르기에서 그 VM에 영향을 주는 검사가 실패한 노드를 뺀다.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1386,10 +1386,11 @@ async fn relocate_vm(
             node: None,
             pid: None,
             migration: None,
-            last_error: Some(format!(
-                "relocating: the VM failed too often on node {}",
-                from.name
-            )),
+            // HA 검사(`restart_elsewhere`)로 끈 VM은 노드가 남긴 이유를 그대로 보인다.
+            last_error: Some(match vm.status.last_error.as_deref() {
+                Some(error) if error.starts_with("HA check ") => format!("relocating: {error}"),
+                _ => format!("relocating: the VM failed too often on node {}", from.name),
+            }),
             ha: Some(VmHaStatus { error: None, ..ha }),
             ..vm.status.clone()
         };
@@ -1578,6 +1579,7 @@ impl Failback {
 /// 있는 첫 VM을 그 노드로 라이브 마이그레이션한다(규칙을 지킨다). 거절되면 VM마다 한 번 로그를 남기고
 /// 다음 VM을 본다(유지보수·HVF 노드, affinity 상대가 있는 VM 등은 `start_migration`이 거절한다). 거절된
 /// VM은 [`FAILBACK_RETRY`] 뒤에 다시 본다. 옮겨 떠난 노드로 되돌아가면 옮기기 한 번으로 센다([`count_failback`]).
+/// HA 검사의 끄기 요청(`ha.evict`)이 있는 VM은 보지 않는다.
 async fn fail_back(
     ctx: Ctx<'_>,
     failback: &mut Failback,
@@ -1610,6 +1612,8 @@ async fn fail_back(
         .filter(|vm| !failback.waiting(vm.id, now))
         // 재시작 횟수를 넘겨 옮겨 온 VM은 옮기기 창 안에서 되돌리지 않는다(그 노드에서 다시 크래시하면 error다).
         .filter(|vm| !relocated_recently(vm, unix))
+        // HA 검사가 다른 노드에서 다시 켜려고 끄게 한 VM(`ha.evict`)은 건드리지 않는다.
+        .filter(|vm| vm.status.ha.as_ref().is_none_or(|ha| ha.evict.is_none()))
         .collect();
     vms.sort_by(|a, b| a.name.cmp(&b.name));
     for vm in vms {

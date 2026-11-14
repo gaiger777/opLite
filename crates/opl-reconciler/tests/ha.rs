@@ -1,5 +1,5 @@
 //! HA VM과 리스(설계 §3.3 워커 규칙): 켜기·`cont` 문턱, 리스를 잃으면 강제 종료, 펜싱이 꺼진 노드,
-//! 도는 HA VM 알림(`set_running`).
+//! 도는 HA VM 알림(`set_running`). HA 검사 `restart_elsewhere`의 끄기 요청(`ha.evict`).
 
 mod common;
 
@@ -24,7 +24,7 @@ use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::vm::{
-    DiskBus, DiskSpec, GuestWatch, MigrationStatus, PowerState, RestartPolicy, Vm, VmHa,
+    DiskBus, DiskSpec, GuestWatch, HaEvict, MigrationStatus, PowerState, RestartPolicy, Vm, VmHa,
     VmHaStatus, VmPhase, VmSpec, VmStatus,
 };
 use uuid::Uuid;
@@ -119,12 +119,19 @@ impl FirmwareFetcher for GateFetcher {
     }
 }
 
-/// `gate`가 켜져 있으면 다음 볼륨 켜기에서 멈춘다: 도는 VM에 다시 붙으며 디스크를 해석하는 중이다.
+/// `gate`가 켜져 있으면 다음 볼륨 켜기에서 멈춘다: 도는 VM에 다시 붙으며 디스크를 해석하는 중이다. 볼륨 끄기는
+/// 세고, `fail_deactivate`면 실패한다. 볼륨 내보내기(`sync_volume`)도 세고, `fail_sync`면 실패하며 `hang_sync`인
+/// 동안 끝나지 않는다(멈춘 NFS).
 #[derive(Default)]
 struct GateStorage {
     gate: Mutex<bool>,
     reached: Notify,
     release: Notify,
+    deactivated: Mutex<usize>,
+    fail_deactivate: Mutex<bool>,
+    synced: Mutex<usize>,
+    fail_sync: Mutex<bool>,
+    hang_sync: Mutex<bool>,
 }
 
 #[async_trait]
@@ -139,6 +146,33 @@ impl Storage for GateStorage {
         if gated {
             self.reached.notify_one();
             self.release.notified().await;
+        }
+        Ok(())
+    }
+    async fn deactivate_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        *self.deactivated.lock().unwrap() += 1;
+        if *self.fail_deactivate.lock().unwrap() {
+            return Err(DriverError::Io(io::Error::other("lvchange: lock busy")));
+        }
+        Ok(())
+    }
+    async fn sync_volume(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        *self.synced.lock().unwrap() += 1;
+        while *self.hang_sync.lock().unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if *self.fail_sync.lock().unwrap() {
+            return Err(DriverError::Io(io::Error::other("fsync failed")));
         }
         Ok(())
     }
@@ -1350,4 +1384,335 @@ async fn pause_events_restart_the_guest_watch_clock() {
         "{:?}",
         last.elapsed()
     );
+}
+
+/// HA 검사 `restart_elsewhere`로 노드 `from`에 내린 끄기 요청
+fn evict_from(from: Uuid) -> HaEvict {
+    HaEvict {
+        from,
+        check: "stor".into(),
+        reason: "HA check stor failed: nfs pool is not mounted".into(),
+        at: 1_793_000_000,
+    }
+}
+
+/// 리더 대신 VM status에 끄기 요청을 쓴다.
+async fn ask_evict(env: &Env, id: Uuid, from: Uuid) {
+    let mut status = env.get(id).status;
+    let mut ha = status.ha.unwrap_or_default();
+    ha.evict = Some(evict_from(from));
+    status.ha = Some(ha);
+    env.cluster
+        .update_status::<VmSpec>(id, &status)
+        .await
+        .unwrap();
+}
+
+const EVICTED: &str = "HA check stor failed on this node; restarting elsewhere";
+
+/// 끄기 요청을 받은 노드: 도는 QEMU를 SIGKILL로 끄고 요청을 거두며 옮겨 달라고 한다(phase Failed, 원하는 상태는
+/// 그대로). 그 뒤 다시 켜지 않고, 도는 HA VM에서 빠진다(정상 종료 때 watchdog를 멈춘다).
+#[tokio::test]
+async fn an_evicted_ha_vm_is_killed_and_handed_back_to_the_leader() {
+    let (mut env, ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let vm = ha_vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    ask_evict(&env, vm.id, env.node).await;
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(got.status.phase, VmPhase::Failed);
+    assert_eq!(got.status.pid, None);
+    assert_eq!(got.status.last_error.as_deref(), Some(EVICTED));
+    assert_eq!(got.status.ha.unwrap().evict, None);
+    assert_eq!(env.pid(vm.id).await, None);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(launches_of(&env, vm.id), 1);
+    assert_eq!(env.get(vm.id).revision, got.revision);
+    env.stop_reconciler().await;
+    ha.guard.close();
+    assert_eq!(ha.watchdog.count("magic_close"), 1);
+}
+
+/// 우리가 끈 것은 크래시로 세지 않는다(SIGKILL은 크래시 이벤트로 온다): 리더가 요청을 지워 돌려준 VM(`max_restart`
+/// 1)은 다시 켜지고, 그 뒤 첫 크래시에도 옮겨 달라고 하지 않고 곧바로 다시 켠다.
+#[tokio::test]
+async fn killing_an_evicted_vm_is_not_counted_as_a_crash() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let vm = ha_vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    ask_evict(&env, vm.id, env.node).await;
+    let got = wait_relocate(&env, vm.id).await;
+    // 종료 이벤트를 처리할 시간
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut status = got.status;
+    status.ha = None;
+    env.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+    env.wait(vm.id, "restarted", running).await;
+    assert_eq!(launches_of(&env, vm.id), 2);
+    let got = crash_and_restart(&env, vm.id).await;
+    assert_eq!(got.status.ha, None);
+    assert_eq!(launches_of(&env, vm.id), 3);
+}
+
+/// 이미 꺼진 VM은 끄지 않고 곧바로 옮겨 달라고 한다.
+#[tokio::test]
+async fn an_evicted_vm_that_is_not_running_is_handed_back_at_once() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let mut vm = ha_vm("web", env.node);
+    vm.status = VmStatus {
+        phase: VmPhase::Starting,
+        node: Some(env.node),
+        ha: Some(VmHaStatus {
+            evict: Some(evict_from(env.node)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    env.create(&vm).await;
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.status.phase, VmPhase::Failed);
+    assert_eq!(got.status.last_error.as_deref(), Some(EVICTED));
+    assert_eq!(got.status.ha.unwrap().evict, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(launches_of(&env, vm.id), 0);
+}
+
+/// SIGKILL에도 끝나지 않는 QEMU(D 상태): 오류만 남기고 요청은 둔 채 다시 해 본다. 끝나면 옮겨 달라고 한다.
+#[tokio::test]
+async fn an_unkillable_vm_keeps_the_evict_request_and_is_retried() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let vm = ha_vm("web", env.node);
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    env.hv.set_unkillable(vm.id, true);
+    ask_evict(&env, vm.id, env.node).await;
+    let got = env
+        .wait(vm.id, "kill failed", |v| {
+            v.status
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("cannot stop the VM for HA check stor: "))
+        })
+        .await;
+    assert_eq!(got.status.ha.unwrap().evict, Some(evict_from(env.node)));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(env.pid(vm.id).await.is_some());
+    assert!(
+        env.get(vm.id)
+            .status
+            .ha
+            .is_some_and(|h| h.relocate_from.is_none())
+    );
+    env.hv.set_unkillable(vm.id, false);
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.status.last_error.as_deref(), Some(EVICTED));
+    assert_eq!(env.pid(vm.id).await, None);
+}
+
+/// `storage`를 쓰는 reconciler와 공유 디렉터리 풀의 디스크가 있는 도는 HA VM
+async fn start_with_disk(storage: &Arc<GateStorage>) -> (Env, Ha, Vm) {
+    let s: Arc<dyn Storage> = storage.clone();
+    let (env, ha) = start_full(true, Duration::from_secs(60), |_| {}, |c| c.storage = s).await;
+    let pool: StoragePool = Resource::new(
+        "shared",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: "/pools/shared".into(),
+            },
+            nodes: vec![],
+            shared: true,
+            backups: false,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    let volume: Volume = Resource::new(
+        "root",
+        VolumeSpec {
+            pool: "shared".into(),
+            size_bytes: 1 << 30,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    let mut vm = ha_vm("web", env.node);
+    vm.spec.disks.push(DiskSpec {
+        volume: "root".into(),
+        bus: DiskBus::VirtioBlk,
+        boot_order: Some(1),
+    });
+    env.create(&vm).await;
+    env.wait(vm.id, "running", running).await;
+    (env, ha, vm)
+}
+
+/// 끈 뒤 디스크 볼륨을 끄고 나서 옮겨 달라고 한다(공유 LVM의 배타 활성을 풀어야 다른 노드가 켠다). 볼륨을 끄지
+/// 못하면 오류만 남기고(QEMU는 꺼졌으므로 phase Failed) 요청을 둔 채 다시 해 본다.
+#[tokio::test]
+async fn an_evicted_vm_releases_its_disks_before_it_is_handed_back() {
+    let storage = Arc::new(GateStorage::default());
+    let (env, _ha, vm) = start_with_disk(&storage).await;
+    *storage.fail_deactivate.lock().unwrap() = true;
+    ask_evict(&env, vm.id, env.node).await;
+    let got = env
+        .wait(vm.id, "deactivation failed", |v| {
+            v.status.last_error.as_deref()
+                == Some("cannot deactivate the disks for HA check stor; will retry")
+        })
+        .await;
+    // QEMU는 먼저 끄고, 볼륨을 끄기 전에는 옮겨 달라고 하지 않는다.
+    assert_eq!(env.pid(vm.id).await, None);
+    assert_eq!((got.status.phase, got.status.pid), (VmPhase::Failed, None));
+    assert!(*storage.synced.lock().unwrap() >= 1);
+    let ha = got.status.ha.unwrap();
+    assert_eq!(ha.evict, Some(evict_from(env.node)));
+    assert_eq!(ha.relocate_from, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(*storage.deactivated.lock().unwrap() >= 2, "retried");
+    *storage.fail_deactivate.lock().unwrap() = false;
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.status.last_error.as_deref(), Some(EVICTED));
+    assert_eq!(got.status.ha.unwrap().evict, None);
+    assert_eq!(launches_of(&env, vm.id), 1);
+}
+
+/// 끈 뒤 파일 볼륨에 남은 이 노드의 쓰기를 내보내고(`sync_volume`) 나서야 디스크를 끄고 옮겨 달라고 한다(NFS의
+/// 늦은 쓰기가 다른 노드의 VM 이미지를 덮지 않게). 내보내기가 실패하면 오류만 남기고 요청을 둔 채 다시 해 본다.
+#[tokio::test]
+async fn an_evicted_vm_flushes_its_disks_before_it_is_handed_back() {
+    let storage = Arc::new(GateStorage::default());
+    let (env, _ha, vm) = start_with_disk(&storage).await;
+    *storage.fail_sync.lock().unwrap() = true;
+    ask_evict(&env, vm.id, env.node).await;
+    let got = env
+        .wait(vm.id, "flush failed", |v| {
+            v.status
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("cannot flush the disks for HA check stor: "))
+        })
+        .await;
+    let error = got.status.last_error.as_deref().unwrap();
+    assert!(
+        error.contains("fsync failed") && error.ends_with("; will retry"),
+        "{error}"
+    );
+    assert_eq!(env.pid(vm.id).await, None);
+    assert_eq!((got.status.phase, got.status.pid), (VmPhase::Failed, None));
+    let ha = got.status.ha.unwrap();
+    assert_eq!(ha.evict, Some(evict_from(env.node)));
+    assert_eq!(ha.relocate_from, None);
+    // 내보내기 전에는 볼륨을 끄지 않는다.
+    assert_eq!(*storage.deactivated.lock().unwrap(), 0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(*storage.synced.lock().unwrap() >= 2, "retried");
+    *storage.fail_sync.lock().unwrap() = false;
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.status.last_error.as_deref(), Some(EVICTED));
+    assert_eq!(*storage.deactivated.lock().unwrap(), 1);
+}
+
+/// 시간(5초) 안에 끝나지 않은 내보내기(멈춘 NFS)는 오류를 남기고, 끝날 때까지 새로 띄우지 않는다. 그 작업이
+/// 끝나면 옮겨 달라고 한다.
+#[tokio::test]
+async fn a_disk_flush_that_does_not_finish_is_not_started_again() {
+    let storage = Arc::new(GateStorage::default());
+    let (env, _ha, vm) = start_with_disk(&storage).await;
+    *storage.hang_sync.lock().unwrap() = true;
+    ask_evict(&env, vm.id, env.node).await;
+    let error = |msg: &str| format!("cannot flush the disks for HA check stor: {msg}; will retry");
+    let timed_out = error("not done within 5s");
+    let still = error("still flushing from an earlier attempt");
+    // 시간 초과 오류는 다음 재시도가 곧 "still flushing"으로 바꾸므로 둘 중 하나를 본다(뒤의 것은 시간 초과 뒤에만 난다).
+    env.wait(vm.id, "flush timed out", |v| {
+        error_is(v, &timed_out) || error_is(v, &still)
+    })
+    .await;
+    let got = env
+        .wait(vm.id, "flush still stuck", |v| error_is(v, &still))
+        .await;
+    assert_eq!(got.status.ha.unwrap().relocate_from, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(*storage.synced.lock().unwrap(), 1);
+    *storage.hang_sync.lock().unwrap() = false;
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.status.last_error.as_deref(), Some(EVICTED));
+    assert_eq!(*storage.synced.lock().unwrap(), 1);
+}
+
+/// opld를 다시 시작한 뒤 첫 단계에서 끄기 요청을 처리하는 새 작업자도(이 작업자가 켜지 않은 VM) 디스크 볼륨을
+/// 끈다.
+#[tokio::test]
+async fn a_new_worker_releases_the_disks_of_an_evicted_vm() {
+    let storage = Arc::new(GateStorage::default());
+    let (mut env, _ha, vm) = start_with_disk(&storage).await;
+    env.stop_reconciler().await;
+    ask_evict(&env, vm.id, env.node).await;
+    assert_eq!(*storage.deactivated.lock().unwrap(), 0);
+    env.start_reconciler();
+    let got = wait_relocate(&env, vm.id).await;
+    assert_eq!(got.status.last_error.as_deref(), Some(EVICTED));
+    assert_eq!(env.pid(vm.id).await, None);
+    assert_eq!(*storage.deactivated.lock().unwrap(), 1);
+}
+
+/// HA가 꺼진 VM의 끄기 요청은 끄지 않고 지운다(옮겨 줄 HA가 없다).
+#[tokio::test]
+async fn evict_requests_for_a_vm_without_ha_are_dropped() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let plain = vm("plain", env.node);
+    env.create(&plain).await;
+    let pid = env.wait(plain.id, "running", running).await.status.pid;
+    ask_evict(&env, plain.id, env.node).await;
+    env.wait(plain.id, "request dropped", |v| {
+        v.status.ha.as_ref().is_none_or(|h| h.evict.is_none())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = env.get(plain.id);
+    assert!(running(&got));
+    assert_eq!(got.status.pid, pid);
+    assert_eq!(launches_of(&env, plain.id), 1);
+}
+
+/// 다른 노드에 내린(지난) 요청과 원하는 상태가 stopped인 VM의 요청은 끄지 않고 지운다.
+#[tokio::test]
+async fn stale_evict_requests_are_dropped_without_killing() {
+    let (env, _ha) = start_with(true, Duration::from_secs(60), |_| {}).await;
+    let vm = ha_vm("web", env.node);
+    env.create(&vm).await;
+    let pid = env.wait(vm.id, "running", running).await.status.pid;
+    ask_evict(&env, vm.id, Uuid::now_v7()).await;
+    env.wait(vm.id, "request dropped", |v| {
+        v.status.ha.as_ref().is_none_or(|h| h.evict.is_none())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = env.get(vm.id);
+    assert!(running(&got));
+    assert_eq!(got.status.pid, pid);
+    assert_eq!(got.status.ha, None);
+    assert_eq!(launches_of(&env, vm.id), 1);
+
+    let mut off = ha_vm("off", env.node);
+    off.spec.power = PowerState::Stopped;
+    off.status = VmStatus {
+        phase: VmPhase::Stopped,
+        node: Some(env.node),
+        ha: Some(VmHaStatus {
+            evict: Some(evict_from(env.node)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    env.create(&off).await;
+    let got = env
+        .wait(off.id, "request dropped", |v| v.status.ha.is_none())
+        .await;
+    assert_eq!(got.status.phase, VmPhase::Stopped);
+    assert_eq!(launches_of(&env, off.id), 0);
 }

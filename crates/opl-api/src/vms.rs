@@ -766,6 +766,13 @@ pub(crate) async fn start_migration(
         ));
     };
     check_not_busy(state, &vm)?;
+    // HA 검사(`restart_elsewhere`)가 원본 노드에 끄라고 한 VM: 옮기는 동안 꺼지면 어긋난다.
+    if vm.status.ha.as_ref().is_some_and(|ha| ha.evict.is_some()) {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            "the VM is being restarted elsewhere by an HA check",
+        ));
+    }
     check_no_snapshot_task(state, &vm)?;
     let inv = Inventory::load(&state.cluster)?;
     check_no_resize_task(state, &inv, &vm)?;

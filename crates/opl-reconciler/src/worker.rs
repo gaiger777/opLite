@@ -8,7 +8,8 @@ use opl_types::node::{HA_PLACEMENT, NodeSpec};
 use opl_types::runtime::VmRuntimeSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::vm::{
-    Firmware, HaState, PowerState, RestartPolicy, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus,
+    Firmware, HaEvict, HaState, PowerState, RestartPolicy, Vm, VmHaStatus, VmPhase, VmSpec,
+    VmStatus,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -42,6 +43,9 @@ const NO_FIREWALL: &str = "failed to start: firewall: this node has no firewall 
 /// 남은 마이그레이션을 취소하지 못해(남은 디스크 미러) 표시를 남긴 채 다시 하는 연속 실패 수. 이만큼
 /// 실패하면 경고 뒤 표시를 지운다([`Worker::clear_migration`]).
 const CANCEL_ATTEMPTS: u32 = 3;
+/// HA 검사로 끈 VM의 파일 볼륨을 내보내기(`fsync`)를 기다리는 시간([`Worker::sync_disks`]). 멈춘 NFS에서는
+/// 끝나지 않으므로 넘으면 다음 단계에서 다시 본다(그동안 리더는 시간이 지나면 노드 전원을 끈다).
+const EVICT_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 작업자를 깨우는 이유.
 #[derive(Debug)]
@@ -161,6 +165,8 @@ pub(crate) struct Worker {
     ha_running: bool,
     /// 남은 마이그레이션의 취소가 잇달아 실패한 수([`Worker::clear_migration`])
     cancel_failures: u32,
+    /// 시간 안에 끝나지 않은 디스크 내보내기([`Worker::sync_disks`]). 끝날 때까지 새로 띄우지 않는다.
+    syncing: Option<JoinHandle<Result<(), String>>>,
     /// 게스트 감시 상태([`Worker::guest_hung`]). 감시하지 않거나 QEMU가 없으면 None.
     agent: Option<GuestAgent>,
     wake_at: Option<Instant>,
@@ -197,6 +203,7 @@ impl Worker {
             fenced: false,
             ha_running: false,
             cancel_failures: 0,
+            syncing: None,
             agent: None,
             wake_at: None,
         }
@@ -310,7 +317,11 @@ impl Worker {
             Trigger::Sync | Trigger::Barrier(_) => {}
         }
         if self.power_off.is_none() {
-            let status = self.reconcile(&mut vm).await?;
+            let mut status = match self.evict(&vm).await? {
+                Some(status) => status,
+                None => self.reconcile(&mut vm).await?,
+            };
+            drop_stale_evict(&mut status, node, &vm.spec);
             if self.power_off.is_none() {
                 if status != vm.status {
                     self.write_status(status, vm).await?;
@@ -400,6 +411,86 @@ impl Worker {
         self.was_running = false;
         self.fenced = true;
         Ok(())
+    }
+
+    /// HA 검사 `restart_elsewhere`(설계 §8.2): 리더가 이 노드에 VM을 끄라고 했다(`status.ha.evict`). 도는 QEMU를
+    /// 곧바로 SIGKILL로 끄고(I/O가 멈춘 QEMU는 QMP에 답하지 않는다) 파일 볼륨의 이 노드 캐시를 내보낸 뒤
+    /// ([`Self::sync_disks`] — NFS의 늦은 쓰기가 다른 노드의 VM 이미지를 덮지 않게) 디스크 볼륨을 끄고(공유 LVM의
+    /// 배타 활성을 풀어야 다른 노드가 켠다) 요청을 거두며 리더에게 옮겨 달라고 한다(`relocate_from`, phase Failed).
+    /// 그 뒤는 재시작 횟수를 넘긴 VM과 같다(켜지 않고 리더가 옮긴다). 우리가 끈 것으로 표시해 크래시로 세지 않고
+    /// 원하는 상태는 바꾸지 않는다. 끄지 못하거나(SIGKILL에도 끝나지 않는 QEMU) 내보내기·디스크 끄기가 실패하면
+    /// 오류만 남기고(껐으면 phase Failed) 요청은 둔 채 다시 해 본다(그동안 리더는 시간이 지나면 노드 전원을 끈다).
+    /// 요청이 이 노드에 대한 것이고 켜기로 된 HA VM이 아니면 None이다.
+    async fn evict(&mut self, vm: &Vm) -> Result<Option<VmStatus>, StepError> {
+        let node = self.config.node;
+        let Some(evict) = vm
+            .status
+            .ha
+            .as_ref()
+            .and_then(|ha| ha.evict.as_ref())
+            .filter(|e| {
+                e.from == node && vm.spec.power == PowerState::Running && vm.spec.ha_active()
+            })
+        else {
+            return Ok(None);
+        };
+        let mut status = vm.status.clone();
+        status.node = Some(node);
+        if self.hv.inspect(self.id).await?.is_some() {
+            tracing::warn!(vm = %self.id, check = %evict.check, "HA check failed on this node; killing the VM so that it restarts elsewhere");
+            // 이 작업자가 켜지 않은 VM(opld 재시작 뒤 첫 단계)도 끈 뒤 디스크 볼륨을 끈다.
+            self.disks_active = true;
+            self.stopped_by_us = Some(Instant::now());
+            self.stop_requested = None;
+            self.force_requested = false;
+            if let Err(e) = self.hv.stop(self.id, StopMode::Kill).await {
+                tracing::warn!(vm = %self.id, error = %e, "cannot stop the VM for a failed HA check; will retry");
+                status.last_error = Some(format!(
+                    "cannot stop the VM for HA check {}: {e}",
+                    evict.check
+                ));
+                self.wake(Instant::now() + self.config.retry_interval);
+                return Ok(Some(status));
+            }
+            // 우리가 껐으므로 종료 이벤트를 기다리지 않는다.
+            self.was_running = false;
+        }
+        // QEMU는 끝났다(요청이 남아 다시 해 보는 동안에도).
+        status.phase = VmPhase::Failed;
+        status.pid = None;
+        if let Err(e) = self.sync_disks(vm).await {
+            tracing::warn!(vm = %self.id, error = %e, "cannot flush the disks of the VM stopped for a failed HA check; will retry");
+            status.last_error = Some(format!(
+                "cannot flush the disks for HA check {}: {e}; will retry",
+                evict.check
+            ));
+            self.wake(Instant::now() + self.config.retry_interval);
+            return Ok(Some(status));
+        }
+        if !self.deactivate_disks(vm).await {
+            // 다음 단계에서 다시 끈다.
+            self.disks_active = true;
+            status.last_error = Some(format!(
+                "cannot deactivate the disks for HA check {}; will retry",
+                evict.check
+            ));
+            self.wake(Instant::now() + self.config.retry_interval);
+            return Ok(Some(status));
+        }
+        self.awaiting_event = None;
+        self.agent = None;
+        self.relocate = None;
+        self.backoff = None;
+        self.report_running(vm, false);
+        status.last_error = Some(format!(
+            "HA check {} failed on this node; restarting elsewhere",
+            evict.check
+        ));
+        let mut ha = status.ha.take().unwrap_or_default();
+        ha.relocate_from = Some(node);
+        ha.evict = None;
+        status.ha = Some(ha);
+        Ok(Some(status))
     }
 
     /// 삭제되었거나 다른 노드로 배정되었다. 돌고 있더라도 멋대로 끄지 않는다. 단 도는 HA VM으로 알린
@@ -1055,13 +1146,14 @@ impl Worker {
     }
 
     /// 켜져 있을 수 있는 디스크 볼륨을 끈다(QEMU가 끝난 뒤). 끄지 못하면 경고만 남긴다(켜진 채 남은
-    /// 볼륨은 Task 실행기의 정리가 다시 끈다).
-    async fn deactivate_disks(&mut self, vm: &Vm) {
+    /// 볼륨은 Task 실행기의 정리가 다시 끈다). 모두 껐으면(끌 것이 없었으면) true다.
+    async fn deactivate_disks(&mut self, vm: &Vm) -> bool {
         // 끄면 공유도 풀린다.
         self.disks_shared = false;
         if !std::mem::take(&mut self.disks_active) {
-            return;
+            return true;
         }
+        let mut done = true;
         for disk in &vm.spec.disks {
             let found = self
                 .cluster
@@ -1080,6 +1172,7 @@ impl Worker {
                 Ok(None) => continue,
                 Err(e) => {
                     tracing::warn!(vm = %self.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
+                    done = false;
                     continue;
                 }
             };
@@ -1090,6 +1183,58 @@ impl Worker {
                 .await
             {
                 tracing::warn!(vm = %self.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
+                done = false;
+            }
+        }
+        done
+    }
+
+    /// 끈 VM의 디스크 볼륨에 남은 이 노드의 쓰기를 내보낸다([`opl_driver::Storage::sync_volume`] — 파일 풀은
+    /// `fsync`, 블록 장치는 할 일 없음). [`EVICT_SYNC_TIMEOUT`] 안에 끝나지 않으면 오류이고, 그 작업은 끝날 때까지
+    /// 새로 띄우지 않는다(멈춘 NFS에서 쌓이지 않게). 앞서 시간을 넘긴 작업이 그 사이 성공했으면 그것으로 된다.
+    async fn sync_disks(&mut self, vm: &Vm) -> Result<(), String> {
+        if let Some(task) = self.syncing.take() {
+            if !task.is_finished() {
+                self.syncing = Some(task);
+                return Err("still flushing from an earlier attempt".into());
+            }
+            if let Ok(Ok(())) = task.await {
+                return Ok(());
+            }
+        }
+        let mut volumes = Vec::new();
+        for disk in &vm.spec.disks {
+            let volume = self
+                .cluster
+                .get_by_name::<VolumeSpec>(&disk.volume)
+                .map_err(|e| e.to_string())?;
+            let Some(volume) = volume else {
+                continue;
+            };
+            let pool = self
+                .cluster
+                .get_by_name::<StoragePoolSpec>(&volume.spec.pool)
+                .map_err(|e| e.to_string())?;
+            if let Some(pool) = pool {
+                volumes.push((pool, volume.id, volume.spec.format));
+            }
+        }
+        let storage = self.config.storage.clone();
+        let mut task = tokio::spawn(async move {
+            for (pool, id, format) in volumes {
+                storage
+                    .sync_volume(&pool, id, format)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        });
+        match tokio::time::timeout(EVICT_SYNC_TIMEOUT, &mut task).await {
+            Ok(Ok(synced)) => synced,
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => {
+                self.syncing = Some(task);
+                Err(format!("not done within {}s", EVICT_SYNC_TIMEOUT.as_secs()))
             }
         }
     }
@@ -1309,7 +1454,25 @@ fn merge_ha(
     if mine.error != read.error {
         ha.error = mine.error.clone();
     }
+    if mine.evict != read.evict {
+        ha.evict = mine.evict.clone();
+    }
     (ha != VmHaStatus::default()).then_some(ha)
+}
+
+/// 끄기 요청(`ha.evict`)이 지난 것이면 지운다: 다른 노드에 내린 요청(리더가 그 노드에 있을 때만 쓰므로 VM이 그
+/// 사이 옮겨졌다 — 전원 끄기 뒤 복구 등)이거나 원하는 상태가 stopped거나(사용자가 껐다) HA가 꺼졌다.
+fn drop_stale_evict(status: &mut VmStatus, node: Uuid, spec: &VmSpec) {
+    let stale =
+        |e: &HaEvict| e.from != node || spec.power == PowerState::Stopped || !spec.ha_active();
+    if status
+        .ha
+        .as_ref()
+        .and_then(|ha| ha.evict.as_ref())
+        .is_some_and(stale)
+    {
+        clear_ha(status, |ha| ha.evict = None);
+    }
 }
 
 /// `started` HA VM의 게스트 감시 시간(`ha.guest_watch`). 없으면 감시하지 않는다.
@@ -1383,5 +1546,39 @@ mod tests {
             merge_ha(&empty, &VmHaStatus::default(), Some(empty.clone())),
             None
         );
+    }
+
+    /// 끄기 요청(`evict`)을 거둔 것도 이 작업자의 변경으로 다시 적용하고, 그 사이 리더가 쓴 오류는 지킨다.
+    #[test]
+    fn merging_ha_reapplies_a_withdrawn_evict_request() {
+        let node = Uuid::now_v7();
+        let read = VmHaStatus {
+            evict: Some(HaEvict {
+                from: node,
+                check: "stor".into(),
+                reason: "HA check stor failed: down".into(),
+                at: 1,
+            }),
+            ..Default::default()
+        };
+        let mine = VmHaStatus {
+            relocate_from: Some(node),
+            evict: None,
+            ..Default::default()
+        };
+        let leader = VmHaStatus {
+            error: Some("HA check other failed".into()),
+            ..read.clone()
+        };
+        assert_eq!(
+            merge_ha(&read, &mine, Some(leader)),
+            Some(VmHaStatus {
+                relocate_from: Some(node),
+                error: Some("HA check other failed".into()),
+                ..Default::default()
+            })
+        );
+        // 거두지 않았으면 저장소의 요청을 지킨다.
+        assert_eq!(merge_ha(&read, &read, Some(read.clone())), Some(read));
     }
 }

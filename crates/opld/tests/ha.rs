@@ -8,6 +8,8 @@
 //! (`[test] host_shutdown`). 기본(`fast`) 프로필에서 kill -9·망 끊기·SIGSTOP 뒤 복구 시간이 25초 이하인지 잰다.
 //! 전원 끄기 펜싱(명령 방법)으로 끈 노드의 HA VM을 `recover_after`(`[test] recover_margin_secs`로 늘림)를 기다리지
 //! 않고 복구하는지 본다.
+//! HA 상태 검사(`[test] health_root`의 가짜 sysfs): B에서 `storage` 검사가 실패하면 B가 그 HA VM의 QEMU를 SIGKILL로
+//! 끄고 리더가 A에서 켜는지 본다(`restart_elsewhere`).
 //! `cargo test -p opld --features ha-it --test ha`
 //! QEMU(`qemu-it`와 같다)와 qemu-img가 필요하다. 이 Mac에서도 돈다.
 //!
@@ -1052,4 +1054,174 @@ async fn a_power_fence_command_recovers_without_waiting_for_recover_after() {
         .await
         .unwrap();
     nodes[survivor].ctl(&["vm", "delete", "pf"]).await.unwrap();
+}
+
+/// 가짜 sysfs 트리에 인터페이스 `iface`를 만든다(`up`, carrier는 `carrier`).
+fn fake_link(root: &Path, iface: &str, carrier: bool) {
+    let dir = root.join("sys/class/net").join(iface);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("operstate"), "up\n").unwrap();
+    std::fs::write(dir.join("carrier"), if carrier { "1\n" } else { "0\n" }).unwrap();
+}
+
+/// 노드가 보고한 검사 `check`의 상태(`status.checks`)
+async fn check_state(c: &Client, node: &str, check: &str) -> Option<String> {
+    let node = c.get(&format!("/nodes/{node}")).await.ok()?;
+    node["status"]["checks"]
+        .as_array()?
+        .iter()
+        .find(|r| r["name"] == check)
+        .and_then(|r| r["state"].as_str())
+        .map(str::to_string)
+}
+
+#[tokio::test]
+async fn a_failing_storage_check_restarts_the_ha_vm_on_another_node() {
+    // 두 노드는 각자의 가짜 sysfs에서 스토리지 망 인터페이스 `hcstor0`를 본다. B의 carrier가 떨어지면 grace(10초)
+    // 뒤 리더가 B에 끄기 요청을 쓰고, B가 QEMU를 SIGKILL로 끈 뒤 옮겨 달라고 하면 리더가 A에서 켠다.
+    let roots: Vec<tempfile::TempDir> = (0..2)
+        .map(|_| {
+            tempfile::Builder::new()
+                .prefix("oplhc")
+                .tempdir_in("/tmp")
+                .unwrap()
+        })
+        .collect();
+    for root in &roots {
+        fake_link(root.path(), "hcstor0", true);
+    }
+    let daemon = |name: &str, root: &Path| {
+        Daemon::with_hypervisor(
+            name,
+            &format!("{CONFIG}[test]\nhealth_root = \"{}\"\n", root.display()),
+            "systemd_scope = false",
+        )
+    };
+    let mut a = daemon("node-a", roots[0].path());
+    let mut b = daemon("node-b", roots[1].path());
+    let mut w = Daemon::witness("wit");
+    a.start().await;
+    b.start().await;
+    w.start().await;
+    a.init("ha-check").await;
+    a.login().await;
+    let url = a.join_url.clone().unwrap();
+    b.join(&url).await.unwrap();
+    b.login_with(
+        a.admin_password.as_deref().unwrap(),
+        a.ca_fingerprint.as_deref().unwrap(),
+    )
+    .await;
+    let url = a.ctl(&["cluster", "join-token"]).await.unwrap();
+    w.join(url.trim()).await.unwrap();
+    let ca = client(&a);
+    eventually("both nodes online and HA capable", || async {
+        let nodes = ca.get("/nodes").await.unwrap();
+        let nodes = nodes["items"].as_array().unwrap().clone();
+        nodes.len() == 3
+            && nodes.iter().all(|n| n["status"]["online"] == true)
+            && nodes
+                .iter()
+                .filter(|n| n["spec"]["witness"] != true)
+                .all(|n| n["status"]["ha"]["fencing"] == "process")
+    })
+    .await;
+    let (id_a, id_b) = (node_id(&ca, "node-a").await, node_id(&ca, "node-b").await);
+
+    let shared = tempfile::Builder::new()
+        .prefix("oplhack")
+        .tempdir_in("/tmp")
+        .unwrap();
+    a.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.path().to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    a.wait_pool_ready("shared").await;
+    b.wait_pool_ready("shared").await;
+    a.ctl(&[
+        "volume", "create", "db-root", "--pool", "shared", "--size", "64M",
+    ])
+    .await
+    .unwrap();
+    a.ctl(&[
+        "vm", "create", "db", "--memory", "256", "--disk", "db-root", "--node", "node-b", "--ha",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    let pid = running_pid(&ca, "db", &id_b).await;
+
+    // 대응은 역할 기본(`restart_elsewhere`)
+    a.ctl(&[
+        "ha-check", "create", "stor", "--role", "storage", "--link", "hcstor0", "--grace", "10",
+    ])
+    .await
+    .unwrap();
+    eventually_within("both nodes report the check ok", RECOVER_WAIT, || async {
+        check_state(&ca, "node-a", "stor").await.as_deref() == Some("ok")
+            && check_state(&ca, "node-b", "stor").await.as_deref() == Some("ok")
+    })
+    .await;
+
+    let start = Instant::now();
+    fake_link(roots[1].path(), "hcstor0", false);
+    eventually_within("db running on node A", Duration::from_secs(60), || async {
+        let Ok(vm) = ca.get("/vms/db").await else {
+            return false;
+        };
+        vm["spec"]["node"] == id_a.as_str()
+            && vm["status"]["phase"] == "running"
+            && vm["status"]["node"] == id_a.as_str()
+    })
+    .await;
+    eprintln!(
+        "restart elsewhere after a failing storage check: {:?}",
+        start.elapsed()
+    );
+    assert!(!alive(pid), "B's QEMU {pid} is still running");
+    assert_eq!(
+        check_state(&ca, "node-b", "stor").await.as_deref(),
+        Some("failing")
+    );
+    let vm = ca.get("/vms/db").await.unwrap();
+    assert_eq!(vm["spec"]["power"], "running", "{vm}");
+    assert_eq!(
+        vm["status"]["ha"]["relocations"].as_array().map(Vec::len),
+        Some(1),
+        "{vm}"
+    );
+    assert!(vm["status"]["ha"].get("evict").is_none(), "{vm}");
+    let tasks = ca.get("/tasks").await.unwrap();
+    let records: Vec<&Value> = tasks["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["spec"]["op"]["kind"] == "ha-check")
+        .collect();
+    assert_eq!(records.len(), 1, "{tasks}");
+    let record = records[0];
+    assert_eq!(record["spec"]["target"], id_b.as_str(), "{record}");
+    assert_eq!(record["spec"]["op"]["check"], "stor", "{record}");
+    assert_eq!(
+        record["spec"]["op"]["action"], "restart_elsewhere",
+        "{record}"
+    );
+    assert_eq!(
+        record["spec"]["op"]["vms"],
+        serde_json::json!(["db"]),
+        "{record}"
+    );
+    assert_eq!(record["status"]["state"], "succeeded", "{record}");
+
+    a.ctl(&["ha-check", "delete", "stor"]).await.unwrap();
+    a.ctl(&["vm", "stop", "db", "--force"]).await.unwrap();
+    a.ctl(&["vm", "delete", "db"]).await.unwrap();
+    a.ctl(&["volume", "delete", "db-root"]).await.unwrap();
+    a.ctl(&["pool", "delete", "shared"]).await.unwrap();
 }

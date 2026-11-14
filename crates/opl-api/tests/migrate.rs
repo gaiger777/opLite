@@ -14,7 +14,7 @@ use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
 use opl_types::storage::{StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState};
-use opl_types::vm::{Arch, MigrationStatus, VmHa, VmPhase, VmSpec};
+use opl_types::vm::{Arch, HaEvict, MigrationStatus, VmHa, VmHaStatus, VmPhase, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -527,6 +527,45 @@ async fn migrating_phase_makes_the_vm_busy() {
         .unwrap();
 
     assert_busy(&admin, "far", "far-root", "node1").await;
+}
+
+/// HA 검사가 다른 노드에서 다시 켜려고 원본 노드에 끄라고 한 VM(`ha.evict`)은 옮길 수 없다: 409 `vm_busy`.
+#[tokio::test]
+async fn a_vm_being_restarted_elsewhere_by_an_ha_check_is_busy() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = setup(&env, &admin).await;
+    // 이 노드의 reconciler가 요청을 처리하지 않도록 node2에서 도는 VM을 둔다.
+    ready_volume(&env, "nas", "far-root").await;
+    let mut req = vm_request("far");
+    req["spec"]["disks"] = json!([{ "volume": "far-root", "bus": "virtio-blk" }]);
+    req["spec"]["node"] = json!(node2);
+    req["spec"]["power"] = json!("running");
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut vm = env.cluster.get_by_name::<VmSpec>("far").unwrap().unwrap();
+    vm.status.phase = VmPhase::Running;
+    vm.status.node = Some(node2);
+    vm.status.ha = Some(VmHaStatus {
+        evict: Some(HaEvict {
+            from: node2,
+            check: "nas".into(),
+            reason: "HA check nas failed: nas is down".into(),
+            at: 1,
+        }),
+        ..Default::default()
+    });
+    env.cluster
+        .update_status::<VmSpec>(vm.id, &vm.status)
+        .await
+        .unwrap();
+    let (status, body) = migrate(&admin, "far", "node1").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_busy", "{body}");
+    assert_eq!(
+        body["message"], "the VM is being restarted elsewhere by an HA check",
+        "{body}"
+    );
 }
 
 /// 켜기·끄기·강제 끄기·재시작·`PUT`·지우기·스냅샷·복제·디스크(`volume`) 크기 늘리기·`node`로

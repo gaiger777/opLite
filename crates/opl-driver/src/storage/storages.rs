@@ -269,6 +269,15 @@ impl Storage for Storages {
         self.backend(pool)?.active_volumes(pool).await
     }
 
+    async fn sync_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.backend(pool)?.sync_volume(pool, id, format).await
+    }
+
     async fn volume_info(
         &self,
         pool: &StoragePool,

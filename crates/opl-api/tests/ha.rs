@@ -10,7 +10,8 @@
 //! 전원 끄기 펜싱(가짜 `PowerFence`): `fence_after`가 지난 노드를 한 번 끄고 꺼짐을 확인하면 `recover_after` 전에
 //! 복구하는지, 끄지 못하면 `recover_after`를 기다리는지, 끄지 않을 노드, 요청받은 끄기, 기록 Task.
 //! HA 상태 검사(리스 갱신에 실은 결과): grace 뒤 경고, 과반 실패면 경고만, `migrate`·`fence` 대응, 자동 관리 검사,
-//! 옛 노드가 있으면 대응하지 않음, 검사가 실패한 노드로 옮기지 않는 대상 거르기.
+//! 옛 노드가 있으면 대응하지 않음, 검사가 실패한 노드로 옮기지 않는 대상 거르기. `restart_elsewhere`: 끄기 요청
+//! (`ha.evict`), 노드가 거둔 뒤 옮기기, `max_relocate`, 거두지 않는 노드의 전원 끄기·경고.
 
 mod common;
 
@@ -2700,5 +2701,470 @@ async fn relocation_and_failback_avoid_a_node_failing_a_storage_check() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(migrate_tasks(&env), [(f2.id, good, bad)]);
     assert_eq!(get(&env, f.id).spec.node, Some(good));
+    manager.shutdown().await;
+}
+
+/// `restart_elsewhere` 끄기 요청(`ha.evict`)이 노드 `node`에서 온 것인지
+fn evicted_from(env: &Env, id: Uuid, node: Uuid) -> bool {
+    get(env, id)
+        .status
+        .ha
+        .and_then(|ha| ha.evict)
+        .is_some_and(|e| e.from == node)
+}
+
+/// 그 노드의 reconciler 대신: QEMU를 끄고 요청을 거두며 옮겨 달라고 한다.
+async fn stopped_for_check(env: &Env, id: Uuid, node: Uuid, check: &str) {
+    let mut status = get(env, id).status;
+    status.phase = VmPhase::Failed;
+    status.pid = None;
+    status.last_error = Some(format!(
+        "HA check {check} failed on this node; restarting elsewhere"
+    ));
+    let mut ha = status.ha.unwrap_or_default();
+    ha.relocate_from = Some(node);
+    ha.evict = None;
+    status.ha = Some(ha);
+    env.cluster
+        .update_status::<VmSpec>(id, &status)
+        .await
+        .unwrap();
+}
+
+/// `storage` 검사(기본 대응 `restart_elsewhere`): grace 뒤 그 풀에 디스크가 있는 HA VM에만 끄기 요청을 쓰고(HA
+/// 아닌 VM은 기록 Task의 수만), 창 안에서 `max_relocate`에 닿은 VM은 요청 없이 오류만 남긴다. 노드가 끄고 거두면
+/// 같은 검사가 통과한 노드로 옮기고 옮긴 기록을 하나 더한다.
+#[tokio::test]
+async fn a_failing_storage_check_restarts_the_ha_vms_of_its_pool_elsewhere() {
+    let env = Env::start().await;
+    nas(&env, &["on-nas", "plain", "capped"]).await;
+    let src = fast_node(&env, "src", None, 600).await;
+    let dst = fast_node(&env, "dst", None, 600).await;
+    let ha = || Some(VmHa::default());
+    let run = PowerState::Running;
+    let on = vm_with(&env, "on-nas", src, ha(), run, on_nas("on-nas")).await;
+    let plain = vm_with(&env, "plain", src, None, run, on_nas("plain")).await;
+    let local = vm(&env, "local", src, true, run).await;
+    let capped = vm_with(&env, "capped", src, ha(), run, on_nas("capped")).await;
+    let mut status = capped.status.clone();
+    status.ha = Some(VmHaStatus {
+        relocations: vec![unix_now()],
+        ..Default::default()
+    });
+    env.cluster
+        .update_status::<VmSpec>(capped.id, &status)
+        .await
+        .unwrap();
+    ha_check(
+        &env,
+        "nas",
+        HaCheckRole::Storage,
+        HaCheckTarget::Pool { name: "nas".into() },
+        None,
+    )
+    .await;
+    renew_with(&env.cluster, src, vec![failing("nas")]).await;
+    renew_with(&env.cluster, dst, vec![passing("nas")]).await;
+    let manager = fast_manager(&env);
+    eventually("evict requested", || evicted_from(&env, on.id, src)).await;
+    let evict = get(&env, on.id).status.ha.unwrap().evict.unwrap();
+    assert_eq!(evict.check, "nas");
+    assert_eq!(evict.reason, "HA check nas failed: nas is down");
+    eventually("recorded", || !check_tasks(&env).is_empty()).await;
+    assert_eq!(
+        check_tasks(&env),
+        [(
+            src,
+            TaskOp::HaCheck {
+                check: "nas".into(),
+                action: HaCheckAction::RestartElsewhere,
+                vms: vec!["on-nas".into()],
+                detail: "nas is down; also affects 1 VMs without HA".into(),
+            },
+            succeeded(),
+        )]
+    );
+    assert_eq!(
+        get(&env, capped.id).status.ha.unwrap(),
+        VmHaStatus {
+            relocations: status.ha.unwrap().relocations,
+            error: Some(
+                "HA check nas failed; not moving the VM: gave up after 1 relocations".into()
+            ),
+            ..Default::default()
+        }
+    );
+    for v in [&plain, &local] {
+        assert_eq!(get(&env, v.id).status.ha, None, "{}", v.name);
+    }
+    // 노드가 끄기 전에는 옮기지 않는다.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(get(&env, on.id).spec.node, Some(src));
+    assert_eq!(get(&env, capped.id).spec.node, Some(src));
+
+    stopped_for_check(&env, on.id, src, "nas").await;
+    eventually("relocated", || get(&env, on.id).spec.node == Some(dst)).await;
+    let moved = get(&env, on.id);
+    assert_eq!(moved.spec.power, PowerState::Running);
+    let ha = moved.status.ha.unwrap();
+    assert_eq!(ha.relocations.len(), 1);
+    assert_eq!(ha.relocated_from, Some(src));
+    assert_eq!(ha.evict, None);
+    assert_eq!(
+        moved.status.last_error.as_deref(),
+        Some("relocating: HA check nas failed on this node; restarting elsewhere")
+    );
+    // 다시 요청하거나 기록하지 않는다.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(check_tasks(&env).len(), 1);
+    assert_eq!(get(&env, capped.id).spec.node, Some(src));
+    // 검사가 회복하면 옮기지 않는다는 오류를 지운다.
+    renew_with(&env.cluster, src, vec![passing("nas")]).await;
+    eventually("HA error cleared", || {
+        get(&env, capped.id)
+            .status
+            .ha
+            .is_some_and(|h| h.error.is_none())
+    })
+    .await;
+    assert_eq!(get(&env, capped.id).spec.node, Some(src));
+    manager.shutdown().await;
+}
+
+/// 노드가 `EVICT_TIMEOUT`(20초) 안에 끄기 요청을 거두지 않으면 전원 끄기 펜싱이 있는 노드는 노드마다 한 번(VM
+/// 둘에 요청 하나·기록 Task 하나) 끄고 그 HA VM을 복구한다. 없는 노드는 실패 기록 Task만 남기고 요청을 그대로
+/// 둔다: 나중에 거두면 그때 옮긴다.
+#[tokio::test]
+async fn a_node_that_does_not_stop_the_vm_is_powered_off_or_left_alone() {
+    let env = Env::start().await;
+    nas(&env, &["a", "a2", "b"]).await;
+    let fenced = fast_node(&env, "fenced", None, 600).await;
+    let nofence = fast_node(&env, "nofence", None, 600).await;
+    let s1 = fast_node(&env, "s1", None, 600).await;
+    let s2 = fast_node(&env, "s2", None, 600).await;
+    fence_node(&env, fenced, "fenced", &["ok"]).await;
+    let ha = || Some(VmHa::default());
+    let run = PowerState::Running;
+    let a = vm_with(&env, "a", fenced, ha(), run, on_nas("a")).await;
+    let a2 = vm_with(&env, "a2", fenced, ha(), run, on_nas("a2")).await;
+    let b = vm_with(&env, "b", nofence, ha(), run, on_nas("b")).await;
+    ha_check(
+        &env,
+        "nas",
+        HaCheckRole::Storage,
+        HaCheckTarget::Pool { name: "nas".into() },
+        None,
+    )
+    .await;
+    // 넷 가운데 둘이 실패하는 것은 과반이 아니다.
+    for (node, report) in [
+        (fenced, failing("nas")),
+        (nofence, failing("nas")),
+        (s1, passing("nas")),
+        (s2, passing("nas")),
+    ] {
+        renew_with(&env.cluster, node, vec![report]).await;
+    }
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    eventually("evict requested", || {
+        evicted_from(&env, a.id, fenced)
+            && evicted_from(&env, a2.id, fenced)
+            && evicted_from(&env, b.id, nofence)
+    })
+    .await;
+    let requested = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_secs(18)).await;
+    assert!(fence.calls().is_empty());
+    eventually("powered off", || !fence.calls().is_empty()).await;
+    assert!(requested.elapsed() >= Duration::from_secs(19));
+    assert_eq!(fence.calls(), [("fenced".into(), "ok".into())]);
+    eventually("HA VMs recovered", || {
+        [a.id, a2.id].iter().all(|id| {
+            let node = get(&env, *id).spec.node;
+            node == Some(s1) || node == Some(s2)
+        })
+    })
+    .await;
+    eventually("power-off recorded", || power_off_tasks(&env).len() == 1).await;
+    assert_eq!(
+        power_off_tasks(&env)[0].1,
+        TaskOp::NodePowerOff {
+            method: Some(FenceKind::Command),
+            reason: "HA check nas failed and the node did not stop VMs a, a2".into(),
+        }
+    );
+    let escalated: Vec<_> = check_tasks(&env)
+        .into_iter()
+        .filter(|(_, op, _)| matches!(op, TaskOp::HaCheck { detail, .. } if detail.starts_with("the node did not")))
+        .collect();
+    assert_eq!(escalated.len(), 2, "{escalated:?}");
+    let detail = "the node did not stop VMs a, a2 within 20s; requested a power-off of the node";
+    assert!(escalated.contains(&(
+        fenced,
+        TaskOp::HaCheck {
+            check: "nas".into(),
+            action: HaCheckAction::RestartElsewhere,
+            vms: vec!["a".into(), "a2".into()],
+            detail: detail.into(),
+        },
+        succeeded(),
+    )));
+    let detail = "the node did not stop the VM and has no power fencing; leaving it";
+    assert!(escalated.contains(&(
+        nofence,
+        TaskOp::HaCheck {
+            check: "nas".into(),
+            action: HaCheckAction::RestartElsewhere,
+            vms: vec!["b".into()],
+            detail: detail.into(),
+        },
+        TaskStatus {
+            state: TaskState::Failed,
+            error: Some(detail.into()),
+            progress: None,
+        },
+    )));
+    // 펜싱이 없는 노드의 VM은 요청을 남긴 채 그대로다.
+    assert_eq!(get(&env, b.id).spec.node, Some(nofence));
+    assert!(evicted_from(&env, b.id, nofence));
+    // 나중에 노드가 끄고 거두면 옮긴다.
+    stopped_for_check(&env, b.id, nofence, "nas").await;
+    eventually("b relocated", || {
+        let node = get(&env, b.id).spec.node;
+        node == Some(s1) || node == Some(s2)
+    })
+    .await;
+    assert_eq!(get(&env, b.id).status.ha.unwrap().relocations.len(), 1);
+    manager.shutdown().await;
+}
+
+/// 받을 노드가 없는 VM에는 끄기 요청을 쓰지 않는다(끄면 켤 곳 없이 꺼진 채 남는다 — 경고만, 빈 기록 Task도 없음).
+/// 앞 VM(앞서 요청한 VM 포함)이 갈 곳을 세므로, 떨어져야 하는 두 VM(anti-affinity)에 받을 노드가 하나면 첫 VM만
+/// 요청한다. 받을 노드가 생기면 그때 요청한다.
+#[tokio::test]
+async fn restart_elsewhere_needs_a_node_that_can_take_the_vm() {
+    let env = Env::start().await;
+    nas(&env, &["a", "b"]).await;
+    let src = fast_node(&env, "src", None, 600).await;
+    // 다른 검사(`san`)가 실패하는 노드는 받을 노드가 아니다.
+    let bad = fast_node(&env, "bad", None, 600).await;
+    rule(&env, "apart", RuleKind::AntiAffinity, &["a", "b"], &[]).await;
+    let ha = || Some(VmHa::default());
+    let run = PowerState::Running;
+    let a = vm_with(&env, "a", src, ha(), run, on_nas("a")).await;
+    let b = vm_with(&env, "b", src, ha(), run, on_nas("b")).await;
+    ha_check(
+        &env,
+        "nas",
+        HaCheckRole::Storage,
+        HaCheckTarget::Pool { name: "nas".into() },
+        None,
+    )
+    .await;
+    ha_check(&env, "san", HaCheckRole::Storage, link("eth9"), None).await;
+    renew_with(&env.cluster, src, vec![failing("nas"), passing("san")]).await;
+    renew_with(&env.cluster, bad, vec![passing("nas"), failing("san")]).await;
+    let manager = fast_manager(&env);
+    let nas_task = || {
+        check_tasks(&env).iter().any(|(node, op, _)| {
+            *node == src && matches!(op, TaskOp::HaCheck { check, .. } if check == "nas")
+        })
+    };
+    // `san`의 경고 기록이 생기면 `nas`의 grace도 지났다.
+    eventually("san recorded", || {
+        check_tasks(&env)
+            .iter()
+            .any(|(_, op, _)| matches!(op, TaskOp::HaCheck { check, .. } if check == "san"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!evicted_from(&env, a.id, src));
+    assert!(!evicted_from(&env, b.id, src));
+    assert!(!nas_task());
+    // 받을 노드가 하나 생기면 첫 VM만 요청한다(b는 a와 떨어져야 한다).
+    let one = fast_node(&env, "one", None, 600).await;
+    renew_with(&env.cluster, one, vec![passing("nas"), passing("san")]).await;
+    eventually("evict requested", || evicted_from(&env, a.id, src)).await;
+    eventually("recorded", nas_task).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!evicted_from(&env, b.id, src));
+    let more = fast_node(&env, "more", None, 600).await;
+    renew_with(&env.cluster, more, vec![passing("nas"), passing("san")]).await;
+    eventually("second evict requested", || evicted_from(&env, b.id, src)).await;
+    manager.shutdown().await;
+}
+
+/// 20초가 지나도 거두지 않은 끄기 요청은 이유를 다시 본다: 공유 실패로 바뀌었거나 검사를 지웠거나 대응을
+/// `restart_elsewhere`가 아닌 것으로 바꿨으면 전원을 끄지 않고 요청을 거둔다(VM은 그 노드에서 그대로 돈다).
+#[tokio::test]
+async fn an_evict_request_whose_reason_is_gone_is_withdrawn_instead_of_powering_off() {
+    let env = Env::start().await;
+    nas(&env, &["a", "b", "c"]).await;
+    let n1 = fast_node(&env, "n1", None, 600).await;
+    let n2 = fast_node(&env, "n2", None, 600).await;
+    let n3 = fast_node(&env, "n3", None, 600).await;
+    let s1 = fast_node(&env, "s1", None, 600).await;
+    let s2 = fast_node(&env, "s2", None, 600).await;
+    fence_node(&env, n1, "n1", &["ok"]).await;
+    fence_node(&env, n2, "n2", &["ok"]).await;
+    fence_node(&env, n3, "n3", &["ok"]).await;
+    let ha = || Some(VmHa::default());
+    let run = PowerState::Running;
+    let a = vm_with(&env, "a", n1, ha(), run, on_nas("a")).await;
+    let b = vm_with(&env, "b", n2, ha(), run, on_nas("b")).await;
+    let c = vm_with(&env, "c", n3, ha(), run, on_nas("c")).await;
+    let pool = || HaCheckTarget::Pool { name: "nas".into() };
+    ha_check(&env, "nas", HaCheckRole::Storage, pool(), None).await;
+    ha_check(&env, "san", HaCheckRole::Storage, link("eth9"), None).await;
+    ha_check(&env, "tank", HaCheckRole::Storage, link("eth8"), None).await;
+    let report = |nas: bool, san: bool, tank: bool| {
+        let r = |ok, name| if ok { passing(name) } else { failing(name) };
+        vec![r(nas, "nas"), r(san, "san"), r(tank, "tank")]
+    };
+    for (node, checks) in [
+        (n1, report(false, true, true)),
+        (n2, report(true, false, true)),
+        (n3, report(true, true, false)),
+        (s1, report(true, true, true)),
+        (s2, report(true, true, true)),
+    ] {
+        renew_with(&env.cluster, node, checks).await;
+    }
+    let fence = Arc::new(FakeFence::default());
+    let manager = fence_manager(&env, fence.clone());
+    eventually("evict requested", || {
+        evicted_from(&env, a.id, n1) && evicted_from(&env, b.id, n2) && evicted_from(&env, c.id, n3)
+    })
+    .await;
+    // `nas`가 모든 노드에서 실패한다(공유 실패), `san`은 지우고, `tank`는 경고만 하게 바꾼다.
+    for node in [n1, n2, n3, s1, s2] {
+        let san_ok = node != n2;
+        let tank_ok = node != n3;
+        renew_with(&env.cluster, node, report(false, san_ok, tank_ok)).await;
+    }
+    let tank = env
+        .cluster
+        .get_by_name::<HaCheckSpec>("tank")
+        .unwrap()
+        .unwrap();
+    let warn = HaCheckSpec {
+        on_fail: Some(HaCheckAction::Warn),
+        ..tank.spec.clone()
+    };
+    env.cluster
+        .update_spec(tank.id, Some(tank.revision), tank.labels.clone(), &warn)
+        .await
+        .unwrap();
+    let san = env
+        .cluster
+        .get_by_name::<HaCheckSpec>("san")
+        .unwrap()
+        .unwrap();
+    env.cluster
+        .delete::<HaCheckSpec>(san.id, None)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(19)).await;
+    eventually("requests withdrawn", || {
+        [a.id, b.id, c.id]
+            .iter()
+            .all(|id| get(&env, *id).status.ha.is_none())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(fence.calls().is_empty(), "{:?}", fence.calls());
+    assert_eq!(get(&env, a.id).spec.node, Some(n1));
+    assert_eq!(get(&env, b.id).spec.node, Some(n2));
+    assert_eq!(get(&env, c.id).spec.node, Some(n3));
+    manager.shutdown().await;
+}
+
+/// 넘긴 뒤에도 끄기 요청은 이유를 따라간다: 노드마다 한 번만 넘기고(같은 노드에 뒤에 낸 요청은 기록 Task·전원
+/// 끄기 없이 넘긴 것으로만 둔다), 검사가 회복하면 넘긴 요청도 거둔다.
+#[tokio::test]
+async fn escalated_requests_are_escalated_once_per_node_and_withdrawn_on_recovery() {
+    let env = Env::start().await;
+    nas(&env, &["a", "b"]).await;
+    let src = fast_node(&env, "src", None, 600).await;
+    let s1 = fast_node(&env, "s1", None, 600).await;
+    let s2 = fast_node(&env, "s2", None, 600).await;
+    let ha = || Some(VmHa::default());
+    let run = PowerState::Running;
+    let a = vm_with(&env, "a", src, ha(), run, on_nas("a")).await;
+    let pool = HaCheckTarget::Pool { name: "nas".into() };
+    ha_check(&env, "nas", HaCheckRole::Storage, pool, None).await;
+    for (node, report) in [
+        (src, failing("nas")),
+        (s1, passing("nas")),
+        (s2, passing("nas")),
+    ] {
+        renew_with(&env.cluster, node, vec![report]).await;
+    }
+    let manager = fast_manager(&env);
+    eventually("evict requested", || evicted_from(&env, a.id, src)).await;
+    let escalations = || {
+        check_tasks(&env)
+            .into_iter()
+            .filter(|(_, op, _)| {
+                matches!(op, TaskOp::HaCheck { detail, .. } if detail.starts_with("the node did not"))
+            })
+            .count()
+    };
+    tokio::time::sleep(Duration::from_secs(19)).await;
+    eventually("escalated", || escalations() == 1).await;
+    // 같은 노드에 뒤에 낸 요청은 다시 넘기지 않는다.
+    let b = vm_with(&env, "b", src, ha(), run, on_nas("b")).await;
+    eventually("second evict requested", || evicted_from(&env, b.id, src)).await;
+    tokio::time::sleep(Duration::from_secs(21)).await;
+    assert_eq!(escalations(), 1);
+    assert!(evicted_from(&env, a.id, src) && evicted_from(&env, b.id, src));
+    // 회복하면 넘긴 요청도 거둔다.
+    renew_with(&env.cluster, src, vec![passing("nas")]).await;
+    eventually("requests withdrawn", || {
+        [a.id, b.id]
+            .iter()
+            .all(|id| get(&env, *id).status.ha.is_none())
+    })
+    .await;
+    assert_eq!(escalations(), 1);
+    manager.shutdown().await;
+}
+
+/// HA 검사의 끄기 요청(`ha.evict`)이 있는 VM은 되돌아가기가 건드리지 않는다(요청이 사라지면 곧바로 되돌아간다 —
+/// 거절로 60초를 기다리지 않는다).
+#[tokio::test]
+async fn failback_skips_a_vm_being_restarted_elsewhere() {
+    let env = Env::start().await;
+    let low = node(&env, "low", 8192, Some(60)).await;
+    let high = node(&env, "high", 8192, Some(60)).await;
+    group(&env, "g", &[("low", 1), ("high", 5)], false, false).await;
+    let a = vm_ha(&env, "a-vm", low, in_group("g"), PowerState::Running).await;
+    let mut status = a.status.clone();
+    status.ha = Some(VmHaStatus {
+        evict: Some(opl_types::vm::HaEvict {
+            from: low,
+            check: "nas".into(),
+            reason: "HA check nas failed: nas is down".into(),
+            at: unix_now(),
+        }),
+        ..Default::default()
+    });
+    env.cluster
+        .update_status::<VmSpec>(a.id, &status)
+        .await
+        .unwrap();
+    let renewer = keep_alive(&env, high);
+    let manager = failback_manager(&env, Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(migrate_tasks(&env).is_empty());
+    status.ha = None;
+    env.cluster
+        .update_status::<VmSpec>(a.id, &status)
+        .await
+        .unwrap();
+    eventually("failback task", || !migrate_tasks(&env).is_empty()).await;
+    assert_eq!(migrate_tasks(&env), [(a.id, low, high)]);
+    renewer.abort();
     manager.shutdown().await;
 }

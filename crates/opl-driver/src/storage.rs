@@ -144,6 +144,18 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// 이 노드의 캐시에 남은 볼륨의 쓰기를 저장소에 내보낸다(SIGKILL로 끈 VM을 다른 노드에서 켜기 전에 — 늦게
+    /// 내보낸 쓰기가 다른 노드의 VM이 쓴 이미지를 덮지 않게). 저장소가 멈추면 끝나지 않을 수 있다. 기본은 할 일이
+    /// 없다(파일 풀만 `fsync`한다 — 블록 장치는 QEMU가 캐시 없이 쓴다).
+    async fn sync_volume(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+
     /// 라이브 마이그레이션 동안 원본·대상 두 노드가 볼륨을 함께 쓸 수 있게 한다: 이 노드에서 켜져
     /// 있으면 다른 노드도 켤 수 있게 바꾸고, 꺼져 있으면 그렇게 켠다. 기본은 할 일이 없다(공유 LVM
     /// 풀만 LV 잠금을 공유로 바꾼다).
@@ -1163,6 +1175,25 @@ impl Storage for DirStorage {
         }
     }
 
+    /// 볼륨 파일을 열어 `fsync`한다(NFS는 이 노드의 더러운 페이지를 서버에 보낸다). 파일이 없으면 할 일이 없다.
+    /// 마운트를 확인하지 않는다(마운트가 풀렸으면 내보낼 것도 없다).
+    async fn sync_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let path = Self::volume_path(pool, &self.mount_root, id, format);
+        let synced = tokio::task::spawn_blocking(move || match std::fs::File::open(&path) {
+            Ok(file) => file.sync_all(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        })
+        .await
+        .map_err(|e| DriverError::Io(std::io::Error::other(e)))?;
+        Ok(synced?)
+    }
+
     async fn volume_info(
         &self,
         pool: &StoragePool,
@@ -1441,6 +1472,23 @@ pub(crate) mod tests {
 
     fn volume_path(pool: &StoragePool, id: Uuid, format: ImageFormat) -> PathBuf {
         DirStorage::volume_path(pool, Path::new(MNT), id, format)
+    }
+
+    /// 파일 볼륨은 열어 `fsync`하고, 없는 파일은 할 일이 없다.
+    #[tokio::test]
+    async fn sync_volume_flushes_the_file_and_skips_a_missing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let s = dir_storage("qemu-img");
+        let id = Uuid::now_v7();
+        s.sync_volume(&p, id, ImageFormat::Qcow2).await.unwrap();
+        std::fs::write(volume_path(&p, id, ImageFormat::Qcow2), b"image").unwrap();
+        s.sync_volume(&p, id, ImageFormat::Qcow2).await.unwrap();
+        // 열 수 없는 경로(디렉터리가 아닌 풀 루트)는 오류다.
+        let file = tmp.path().join("plain");
+        std::fs::write(&file, b"").unwrap();
+        let bad = pool(file.to_str().unwrap());
+        assert!(s.sync_volume(&bad, id, ImageFormat::Qcow2).await.is_err());
     }
 
     #[test]
