@@ -45,6 +45,11 @@ it("hides account pages from other roles", async () => {
     "href",
     "/placement-rules",
   );
+  // 최적 배치도 누구나 읽는다(적용은 Operate, 설정은 admin).
+  expect(screen.getByRole("link", { name: "Optimal placement" })).toHaveAttribute(
+    "href",
+    "/placement",
+  );
   // 설정도 누구나 읽는다(바꾸기는 admin만).
   expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("href", "/settings");
   // 원격 클러스터도 누구나 읽는다.

@@ -294,6 +294,7 @@ function Summary({ vm }: { vm: Vm }) {
             : t("vms.haOff")}
         </Field>
       )}
+      {vm.spec.placement?.pinned && <Field label={t("vms.pinned")}>{t("vms.pinnedOn")}</Field>}
       {/* 리더가 계산한 배치 규칙 위반(켜진 VM만) */}
       <Field label={t("vms.ruleViolations")}>
         {violations.length > 0 ? (

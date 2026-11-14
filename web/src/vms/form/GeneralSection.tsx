@@ -172,6 +172,21 @@ export function GeneralSection({
         </Field>
         <div className="flex flex-col gap-1.5 sm:col-span-2">
           <div className="flex items-center gap-2">
+            {/* 실행 중에도 바꿀 수 있다(장치 변화 없음). */}
+            <Switch
+              id="vm-pinned"
+              aria-describedby="vm-pinned-hint"
+              checked={values.pinned}
+              onCheckedChange={(pinned) => onChange({ pinned })}
+            />
+            <Label htmlFor="vm-pinned">{t("vmForm.pinned")}</Label>
+          </div>
+          <p id="vm-pinned-hint" className="text-xs text-muted-foreground">
+            {t("vmForm.pinnedHint")}
+          </p>
+        </div>
+        <div className="flex flex-col gap-1.5 sm:col-span-2">
+          <div className="flex items-center gap-2">
             {/* 켤 수 없어도 이미 켜진 HA는 끌 수 있다(실행 중이어도). */}
             <Switch
               id="vm-ha"

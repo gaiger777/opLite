@@ -25,6 +25,7 @@ import { LoginPage } from "@/pages/LoginPage";
 import { NetworksPage } from "@/networks/NetworksPage";
 import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
+import { PlacementPage } from "@/placement/PlacementPage";
 import { PlacementRulesPage } from "@/placement/PlacementRulesPage";
 import { RealmsPage } from "@/realms/RealmsPage";
 import { RemotePage } from "@/remotes/RemotePage";
@@ -77,6 +78,7 @@ function routes() {
             { path: "ha-groups", element: <HaGroupsPage /> },
             { path: "ha-checks", element: <HaChecksPage /> },
             { path: "placement-rules", element: <PlacementRulesPage /> },
+            { path: "placement", element: <PlacementPage /> },
             { path: "tasks", element: <TasksPage /> },
             { path: "audit", element: <AuditPage /> },
             { path: "users", element: <UsersPage /> },

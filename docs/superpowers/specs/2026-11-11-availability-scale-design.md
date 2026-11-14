@@ -1683,3 +1683,177 @@ NFS 서버 멈춤(`not responding` → `restart_elsewhere`, D 상태 QEMU면 전
 - 공유 디렉터리 풀의 마운트가 사라지면 probe가 마운트 지점(루트 파일시스템)에 써서 통과하고, 읽기 전용 export는 늘 실패한다.
 - `restart_elsewhere`로 끈 VM은 받을 노드가 사라지면 원래 노드가 회복해도 다른 노드를 기다린다(계획 50의 재시작 옮기기와 같음).
 - 웹·노드 메뉴의 브리지 업링크 판정, NVMe `live`, `fsync` 내보내기의 실제 NFS 동작은 손으로 확인한다.
+
+## 20. 구현(계획 53)
+
+일곱 단계를 커밋 일곱으로 했다(1 부하 요약 타입과 리스 갱신에 싣기, 2 노드가 요약을 만들어 싣기와 규모 시험, 3 점수 함수와
+처음 놓기·HA·비우기가 그것을 쓰기, 4 설정·VM 고정·상태 API와 리더 읽기 RPC·CLI, 5 균형 조정 계산(순수), 6 균형 조정기 작업 —
+추천·자동·적용 API·CLI, 7 웹·문서). 설계 §8.3과 다르거나 설계가 정하지 않아 정한 것을 적는다.
+
+**기능 이름과 저장 모양(단계 1·4).**
+- 기능 이름 `placement`(`FEATURES` 끝, `opl_types::node::PLACEMENT`)가 새 저장 모양을 가린다: 설정 `placement`, VM
+  `spec.placement`, 균형 조정기의 동작(모르는 노드가 있으면 쉼). 리스 갱신의 `load`는 옛 리더가 버리므로 가리지 않는다. 받은
+  백업의 `vm_spec.placement`는 기능이 모자라면 버리고 저장한다. 복제·복원·가져오기의 `create_vm`도 기능이 모자라면 버린다
+  (복제본은 원본의 고정을 HA 정책처럼 받는다 — 2차 리뷰).
+- 설정 `SettingsSpec.placement: Option<PlacementSettings { policy: balance|pack, mode: off|recommend|auto, threshold: u8 }>`
+  (`deny_unknown_fields`, 기본값은 쓰지 않고 모두 기본이면 `None`). **설계와 다름: `threshold`는 정수 백분율**(설계 0.15 → 15,
+  1~50, 기본 15 — `SettingsSpec`가 `Eq`라 실수를 두지 않는다). `PATCH /settings`의 `placement`는 준 값만 합치고(400 "placement.
+  threshold must be between 1 and 50 (got N)", 409 `cluster_upgrading`), 간격(5분)은 설정이 아니다(`BalancerConfig.interval`).
+- VM `spec.placement: Option<VmPlacement { pinned }>`(`pinned: false`면 API가 `None`으로 저장 — 옛 VM은 바이트까지 그대로).
+  뜻은 "균형 조정기가 옮기지 않음"뿐이다 — HA 복구·재시작 옮기기·상태 검사·비우기·사용자 마이그레이션은 그대로 옮긴다(DRS의 VM별
+  "자동화 꺼짐"). 실행 중에도 바꾼다.
+
+**부하 요약(단계 1·2).**
+- `LoadSummary { cpu1?, cpu5?: u16(‰, 모든 코어 합 1000), mem?: u64(MiB), vms: Vec<VmLoad { id, cpu?: u16(vCPU 대비 ‰), mem?:
+  u64(RSS MiB) }> }`, 모두 정수(`Leases`가 `Eq`), `deny_unknown_fields` 없음(뒤 버전의 필드를 옛 리더가 무시), VM은 256개
+  (`MAX_LOAD_VMS`, RSS 큰 것부터 — 노드와 리더 둘 다 자른다).
+- 노드: `MetricsStore::summary(now)`(순수) — 노드 점의 60·300초 CPU 평균(빈 점은 건너뜀, 없으면 None), 마지막 사용 메모리, 마지막
+  점이 15초(`LOAD_VM_FRESH_MS`) 안인 VM만(옮겨 나간 VM 빼기)의 5분 CPU·마지막 RSS. 측정기 틱(5초) 끝에서 `set_lease_load`
+  (위트니스도 — 리더가 `Loads`를 만들 때 뺀다). 노드 CPU(`cpu5`)도 사용 메모리도 없는 요약(시작 직후·`/proc` 읽기 실패)은
+  싣지 않고, `Loads::new`도 그런 노드를 요약 없음으로 본다(VM 부하는 쓴다) — 빈 요약 하나가 "요약 없음" 물러남을 끄지 않게
+  (2차 리뷰).
+- **설계와 다름: 요약은 새로 만들었을 때만 싣는다.** `RenewLease { node, checks, load: Option<LoadSummary> }`(없으면 옛 형식과
+  바이트까지 같음). 노드의 `lease_load { seq, sent, load }`로 새 요약을 한 번 싣고 갱신이 성공해야 보낸 것으로 표시한다(실패하면
+  다음 갱신이 다시). 리더 `LeaseTable::renew`는 `load`가 있으면 같은 잠금에서 `Leases.loads[node] = LoadReport { at, load }`,
+  **없으면 지난 것을 둔다**(검사 결과와 다름), 임기가 바뀌면 비운다. 쓰는 쪽이 30초(`LOAD_STALE`)보다 오래된 것을 버린다. 새
+  리더는 다음 요약(5초 안)까지 부하를 모른다. Raft에 쓰지 않는다.
+
+**점수(단계 3·4).**
+- opl-api `score.rs`: `Loads`(`from_leases(&Leases, nodes, now)` — 위트니스의 요약은 뺀다(RPC 답에도 없어 리더·다른 노드
+  계산이 같게), VM 부하는 5분(`VM_LOAD_STALE`)까지의 요약에서도 가져온다(새 요약이 앞섬 — 리스가 30초 넘게 끊긴 노드의 VM을
+  다시 고르는 복구가 그 VM의 CPU를 센다, 2차 리뷰), `from_status`(RPC 답 — VM 부하 없음), `default()` = 모름), `NodeUse { cpu, mem }`, `node_use(node, inv, assign,
+  loads, adding, without)`, `score(after, policy) -> i64`(백만분의 일 점), `Scorer { loads, policy }`. CPU = 노드 `cpu5`(없으면
+  요약이 있는 노드들의 평균, 아무도 없으면 0) ± VM 몫(`vm cpu‰/1000 × vCPU / node.cpus`, VM 부하를 모르면 0) ± `Assign`으로
+  이 노드에 놓이거나 이 노드에서 다른 곳으로 놓인 VM의 몫. 메모리 = `max(실제, 할당) / node.memory_mib`(실제 = 요약 `mem` ± RSS,
+  없으면 할당만). `balance` = `1.0 × (1 − cpu) + 1.0 × (1 − mem)`(가중치는 상수). `pack` = 넘치지 않는 노드(CPU ≤ 0.8, 메모리 ≤ 0.9)는
+  `cpu + mem`, 넘치는 노드는 `−10 + (2 − cpu − mem)`.
+- **설계와 다름: soft 벌점은 점수에서 빼지 않고 앞 순위다.** `placement::compare` = 그룹 우선순위 → soft 벌점 → 점수(큰 것) →
+  미할당 메모리 → id. 벌점 단위(1~100)가 사용률 점수(0~2)보다 늘 커서 빼기와 결과가 같고 기존 시험이 그대로다. strict 조건
+  (노드 조건·hard 규칙·`ha_reserve`·`Health::blocks`·HA `eligible`)은 그대로 거른다. 후보 가운데 신선한 요약이 있는 노드가 하나도
+  없으면 `balance` 점수를 모두 0으로 둔다(`placement::level_scores` — 미할당 메모리 순서, 부하를 보기 전과 같은 선택. 사용률
+  비율로 견주면 크기가 다른 노드에서 달라진다). `pack`은 할당 메모리로 모으므로 그대로 쓴다.
+- 쓰는 곳(모두 `candidates_with(vm, inv, assign, &Scorer)`): 생성·시작(`schedule_with`), HA 복구·미리 고르기·재시작 옮기기·상태
+  검사 `migrate`·`restart_elsewhere`·되돌아가기(같은 우선순위끼리만), 비우기 `pick_target`(옮기는 VM 자신의 부하는 모름 —
+  `without_vms()`). HA는 틱마다 `Loads::from_leases` 한 번. 한 틱에 여러 VM을 놓으면 앞 VM의 메모리와 CPU 몫을 함께 센다
+  (`Assign`). 스냅샷 되돌리기는 `Scorer::default()`(부하 없음)이고 `spec.placement`는 `snapshot_schedule`·`ha`처럼 지금 것을
+  둔다. 기존 `candidates`·`score`·`schedule`은 `Scorer::default()` 감싸개.
+- **설계에 더한 것: 리더가 아닌 노드는 리더의 부하를 RPC로 읽는다.** 노드 사이 RPC `ReadPlacement`(`opl-peer/src/placement.rs`,
+  `PlacementSource`, `PeerService::with_placement`, `Peers::read_placement`, 없으면 `unimplemented`). `score::scorer(state, picks)`:
+  노드를 고를 수 있을 때(`picks` — 켜진 채 노드 없이 만들기·고치기, 노드가 없거나 유지보수·hard 규칙 위반 노드인 시작, 비우기)만
+  부하를 읽는다. 리더면 리스에서, 아니면 RPC 1초, 실패·옛 리더면 부하 없음(debug 로그)이고 5초 동안 다시 묻지 않는다
+  (`AppState.placement_backoff`). 리더의 `PlacementStatusSource`는 같은 임기에서 만든 지 1초가 안 된 상태를 다시 쓴다. 정책은
+  늘 이 노드가 읽은 설정. `vm_lock`·`modify_spec` 전에 읽는다. `GET /placement`도 같은 RPC(3초, 실패 503
+  `placement_unavailable`).
+
+**균형 조정(단계 5·6).**
+- opl-api `balance.rs`(순수): `Model::new(inv, loads, health, tasks, moved, now, live)` — 대상 노드(위트니스·오프라인·유지보수·
+  종료 표시·HVF·요약 없음·CPU 수/메모리 모름은 뺌)와 사용률(끝나지 않은 `VmMigrate`·`status.migration`의 VM은 대상 노드의
+  메모리·CPU로 셈 — `Assign`), 옮길 수 있는 VM. `live`는 리더가 살아 있다고 보는 노드(`balance::live` — HA 노드는 `ready`,
+  아니면 리스 30초 안)와 균형 옮기기를 받을 만큼 오래 살아 있는지다. `imbalance` = CPU·메모리 사용률 모표준편차의 평균(합·
+  제곱합으로 옮길 때 O(1)). `movable`(이유 문자열) — 실행 중·마이그레이션 없음·`!pinned`·로컬 풀 디스크 없음·끝나지 않은 스냅샷·
+  되돌리기·복제·백업·전원·크기 늘리기·마이그레이션 Task 없음·`ha.evict`·`relocate_from` 없음·1시간(`VM_COOLDOWN`) 안의
+  `VmMigrate` Task(UUIDv7 시각)·HA 복구 기록(`VmHaRecover`)·`ha.relocations`·리더의 `moved` 없음·자리 잡은 hard affinity 상대
+  없음. `target_ok` — HVF 아님,
+  `free_mib ≥ memory_mib`, `node_fits`, `!health.blocks`, 계획을 넣은 `Assign`으로 hard 위반 없음, soft 벌점이 늘지 않음, 그룹
+  우선순위가 지금 이상.
+- `plan(&Model, &settings, max_moves, balancing)`: 규칙 바로잡기 먼저(아래), 정책이 `balance`이면 균형 옮기기. **설계에 더한
+  것(1차 리뷰): 히스테리시스** — 불균형 × 100 > 문턱이면 시작하고, 지난 회차부터 하던 중(`balancing` — 리더 메모리, `Plan.balancing`)
+  이면 문턱의 `STOP_RATIO`(0.8) 이상인 동안 계속한다. 그동안 사용률이 큰 노드 5대(`SOURCE_NODES`)의 VM × 작은 노드
+  10대(`TARGET_NODES` — 오래 살아 있는 노드만)에서 원본·대상의 사용률 차이(CPU·메모리 가운데 큰 것)가 문턱 이상이고 효과가 가장
+  큰 옮기기(같으면 비용 → VM 이름 → 노드 id). 그렇지 않아도 사용률이 평균보다 문턱의 `HOT_RATIO`(2)배 넘게 높은 노드가 있으면
+  그 노드의 VM만 옮긴다(노드가 많으면 한 노드만 뜨거워도 표준편차가 작다). **2차 리뷰에서 더함:** 지난 5분
+  (`MIGRATION_SETTLE`) 안에 끝난 `VmMigrate`의 원본(`spec.node`)·대상 노드는 균형 옮기기의 원본·대상이 아니다(5분 평균 CPU가
+  옮긴 VM을 아직 원본에 세어 넘치게 옮기고 핑퐁한다). Task는 끝난 때를 적지 않으므로 만든 때(UUIDv7)로 센다(오래 걸린
+  마이그레이션은 덜 막는다). 규칙 바로잡기는 그대로다.
+  비용 `max(RSS, memory_mib)`. **설계와 다름(단계 5): 효과 문턱은 노드 둘 기준으로 견준다** — 한 옮기기는 두 노드만 바꿔
+  표준편차 감소가 노드 수 n에 반비례하므로 `gain × n / 2`를 `MIN_GAIN`(0.005)·`MIN_GAIN_PER_GIB`(0.002 × 비용 GiB)와 견준다
+  (노드 둘이면 설계와 같음). `Move.gain`은 그대로 둔다.
+- **설계에 더한 것: 규칙 바로잡기**(계획 50 §17의 "자리가 나면 균형 조정기가 바로잡는다"): 살아 있는(`live`, 2차 리뷰) 지금
+  노드에서 hard 규칙을 어기는 VM(`ha_may_violate`로 놓였거나 레이블·규칙이 바뀐 것)을 `candidates_with`의 가장 나은 노드(HVF 아님·살아 있음·메모리·HA 검사
+  막힘 없음)로,
+  불균형·문턱과 상관없이 `Move { reason: Rule, rules }`. 옮길 수 있는 VM 조건과 1시간 규칙은 같다. soft 위반은 바로잡지 않는다.
+  **묶음(affinity) 옮기기는 하지 않는다**(남은 것).
+- **설계와 다름: `pack`이면 균형 옮기기를 하지 않는다**(모으기와 맞섬 — 상태 `paused: "policy is pack"`과 불균형은 보임, 규칙
+  바로잡기만).
+- 쉬는 이유 `paused(…)`(차례대로 첫 것): 모드 off, 기능 모자람("some nodes do not support placement yet (…)"), 유지보수·종료 표시
+  노드, 리스가 `fence_after`보다 오래된 HA 가능 노드에 HA VM이 아직 있음(복구 중일 수 있음 — `ha::ready`의 반대; **단계 5에서
+  HA VM이 있을 때로 좁힘**), 켜진 HA 그룹 VM을 HA가 더 우선인 살아 있는(`ready`) 노드로 곧 되돌릴 수 있음("waiting for HA
+  failback of VM …" — 1차 리뷰. 2차 리뷰에서 HA 되돌아가기의 실제 거름을 따름: 노드 조건·hard 규칙, 미할당 메모리(`free_memory_mib`),
+  `!Health::blocks`, HVF 아님, VM의 `ha.evict`·자리 잡은 hard affinity 상대 없음, 창 안에서 옮긴 VM 빼고(HA의 `failed`는 리더
+  HA 메모리라 보지 않음). 그리고 리더가 그 노드가 살아 있음을 본 지 10분(`FAILBACK_WAIT`)이 지나지 않았을 때만 — `paused`가
+  `Health`·`alive_since`를 받는다. 되돌아가기가 늘 거절되면 균형 조정기가 영원히 쉬던 것을 막는다), 요약이 신선한 대상 노드 둘 미만, 끝나지 않은
+  `VmMigrate` Task가 2개(`MAX_CONCURRENT`) 이상(누가 만들었든 — 리더가 바뀌어도 셈이 맞음). 쉬면 계획·불균형을 보이지 않는다.
+- `balancer.rs` `Balancer::spawn(state, BalancerConfig { tick: 10초, interval: 300초, settle: 90초 })`(opld `rt.work`, 위트니스
+  제외, 리더만). 틱마다 노드가 살아 있음을 처음 본 때를 적고(리더 메모리, 모르는 노드는 받지 않음) `settle`(HA 되돌아가기 지연
+  30초 + 60초) 넘게 산 노드만 균형 옮기기를 받는다 — 돌아온 노드를 HA 되돌아가기보다 먼저 채우지 않게(1차 리뷰). 임기가
+  바뀌면 살아 있음을 본 때를 비운다(2차 리뷰). 최적 배치 설정(`spec.placement()`)이 바뀌면 게시판의 추천을 곧 비운다(다른
+  설정은 무시 — 2차 리뷰). 틱마다 살아 있음을 본 때·리스 기준점·`settle`을 게시판에도 둔다(적용이 다시 본다).
+  리더가 된 뒤 `min(interval, 60초)`에 처음, 그 뒤 `interval`마다 `read_barrier` → 설정·`Inventory`·Task·기능·리스 → `paused` →
+  `plan`(`spawn_blocking`). recommend는 5개(`MAX_RECOMMENDATIONS`)까지 게시판(`PlacementBoard`)에, auto는 `2 − 진행 중`개까지
+  `start_migration(…, Some(from), RuleCheck::Enforce)` 뒤 `moved`·감사·게시판의 그 항목에 `task`(거절은 VM마다 info 로그 한 번,
+  다음 회차에 다시 — 감사의 불균형은 시작한 옮기기의 효과만 뺀다). 리더를 잃으면 게시판·`moved`·일정·균형 옮기기 중·살아
+  있음을 본 때를 비운다. 회차 요약 info 로그는 바뀔 때만.
+- **설계와 다름: 기록 Task 없이 Task·감사.** 옮기기는 보통의 `vm-migrate` Task, auto는 리더의 감사 `audit::system_entry
+  ("placement.move", vms/<이름>, "auto: <vm> <from> -> <to> (balance|rule <규칙>), imbalance 21.0% -> 12.5%, cost 4096 MiB")`
+  (이유는 2차 리뷰, API를 끈 리더는 적지 않음), 적용 API는 보통의 감사(detail `placement recommendation <id>`).
+- API(태그 `placement`): `GET /placement`(`PlacementStatus { leader, settings, last_run?, next_run?, imbalance?(0.1% 단위),
+  paused?, nodes: [NodeLoadView], recommendations: [PlacementMove] }`, 로그인한 모든 역할), `GET /placement/recommendations`,
+  `POST /placement/recommendations/{id}/apply`(202, VM Operate — 404 `recommendation_not_found`, 409 `vm_pinned`, 409
+  `placement_busy`(끝나지 않은 마이그레이션 2개 이상), 그다음 지금 상태로 `balance::movable`(작업 목록 1시간 쉼)과 균형이면
+  `target_ok`·규칙이면 HA 검사를 다시 보고 모드 off·실패면 409 `recommendation_stale`(이유를 문구에 — 1차 리뷰: 추천은 최대 5분
+  묵음), 그 밖은 `start_migration`의 오류). **2차 리뷰: 적용은 리더 노드의 API에서만** — 리더가 아니면 409
+  `recommendation_stale`("recommendations are applied on the leader node …"). 팔로어는 HA 검사 결과·균형 조정기 상태(리더
+  메모리)를 볼 수 없어서다(리더가 상태에 노드별 막힌 VM을 싣거나 팔로어가 리더로 넘기는 것보다 작은 변경 — 웹·CLI는 리더로
+  대신 보내지 않는다). 리더는 `balance::paused`(쉴 이유가 있으면 "balancer paused: …")와 대상이 살아 있음(균형 옮기기는 `settle`
+  넘게, 규칙 바로잡기는 살아 있기만)도 다시 보고, 적용을 `AppState.placement_apply` 뮤텍스로 하나씩 다시 본다. 원격 중계는
+  읽기만. watch 종류가 아니다.
+- CLI `placement status|set|recommendations|apply`(표의 ID는 id 끝 12자 — UUIDv7의 앞부분은 한 회차에서 같다. `apply`는 전체·
+  앞부분·끝부분으로 찾는다), `vm create --pinned`, `vm set --pinned|--no-pinned`.
+
+**보이기(단계 7).**
+- 웹 "최적 배치" 화면(`web/src/placement/PlacementPage.tsx`·`balance.ts`, 배치 규칙 다음 메뉴, 경로 `placement`, 15초마다 다시
+  읽음, 503이면 그 문구를 곧바로 — 다시 시도하지 않음): 머리(모드·정책·문턱·불균형·마지막/다음 실행·쉬는 이유 — 고정 이유 셋
+  "mode is off"·"policy is pack"·"fewer than two nodes …"만 번역하고 나머지는 서버 문구), 노드 부하 표(CPU·메모리 사용률 막대
+  `role="meter"`, 1분·5분 CPU, 사용·할당·전체 메모리, VM 수, 요약 나이·"요약 없음"), 추천 표(이유 배지와 문구, 비용, Operate
+  권한의 "적용" — Task 알림 뒤 다시 읽고 404면 "추천이 바뀌었습니다"), auto면 "시작한 옮기기"와 Task id 전체(UUIDv7의 앞부분은
+  한 회차에서 같다), admin의 설정 카드(설정 watch를 따라감, 바꾼 값만 `PATCH`, 문턱 1~50 정수). VM 폼 일반 절의 "균형 조정기가
+  옮기지 않음" 스위치(끄면 `placement`를 보내지 않음), VM 상세 요약의 "자동 옮기기: 제외(고정)"(고정일 때만), 감사 화면은
+  번역이 있는 시스템 동작(`audit.actions.placement.move`)의 이름과 detail을 행에 함께 보인다.
+- README 새 절 "최적 배치"와 "배치 규칙과 HA 정책"·"HA VM과 자기 펜싱"의 어디로·"노드 유지보수와 비우기"의 대상·"지표"에서
+  이어지는 줄(노드 고르기 순서에 부하 점수).
+
+**잰 값.**
+
+| | 노드 100(CI) | 노드 300(이 Mac) |
+|---|---|---|
+| 리더 RPC/s, 요약 없음 → 있음 | 252 → 255 | 353 → 350 |
+| 전달받은 리스 갱신 바이트/s, 요약 없음 → 있음 | 3.3 → 21.6 KB | 9.6 → 79 KB |
+| 프로세스 CPU | 그대로 | 그대로 |
+
+규모 시험(`scale-it`, 노드마다 VM 20개짜리 가짜 요약을 5초마다 바꿈)의 요약 하나는 약 1.16 KB, 리더 `leases().loads`는 노드
+수와 같았다. 한 프로세스에 모든 노드가 있어 리더만의 CPU는 떼어 잴 수 없다. 균형 계산은 노드 300·VM 6000 가짜 모델에서 모델
+만들기 약 90 ms, `plan` 약 21 ms(시험은 2초를 넘으면 실패).
+
+**시험.** 단위(요약·점수·불균형·욕심쟁이·제외·대상·규칙 바로잡기·쉬는 이유·CLI 순수 함수·웹 `balance.ts`), opl-api
+`tests/ha.rs`·`drain.rs`·`vms.rs`(덜 바쁜 노드), `tests/placement.rs`(MockHypervisor 노드 셋, `renew_load`로 가짜 부하 —
+추천·적용·auto 동시 2·1시간·고정/로컬/백업·유지보수·HA 검사·off/pack·옛 노드), `two_nodes`(리더 아닌 노드의 RPC 상태·부하로
+놓기·503, 리더가 바뀌면 새 리더가 다시 추천), opl-peer gRPC 왕복, opld `migration-it`
+`the_balancer_moves_a_vm_off_a_node_its_rules_forbid`(실제 측정기 요약이 리더로 가고, hard `node-affinity`를 어기는 VM을 추천·
+적용·auto로 옮김 — 한 호스트의 두 노드는 부하 불균형을 만들 수 없어 실제 프로세스 시험은 규칙 바로잡기로 옮기기 길을 본다).
+
+**남은 것.**
+- affinity 묶음 옮기기(지금은 묶음의 VM을 건드리지 않음), `pack`일 때 넘치는 노드 덜기, 네트워크·디스크 I/O 부하, 쓰지 않는
+  노드 끄기(범위 밖 — §1).
+- svc01 실제 다중 노드 부하로 문턱·효과 상수(`MIN_GAIN`·`MIN_GAIN_PER_GIB`)와 `SOURCE_NODES`·`TARGET_NODES`를 다시 본다.
+- 끝난 Task가 1000개를 넘어 지워지면 1시간 규칙은 리더 메모리(`moved` — 리더가 바뀌면 사라짐)와 HA 옮기기 기록으로만 지킨다.
+- 새 리더는 다음 요약(5초쯤)까지 부하를 모르고, 그 사이 놓기는 할당 메모리만 본다. 새 리더는 받는 노드의 "오래 살아 있음"을
+  다시 세므로 `settle`(90초) 동안 균형 옮기기가 없다(규칙 바로잡기는 한다).
+- 1차 리뷰에서 남긴 것: 요약이 없는 노드의 호스트 오버헤드(QEMU 밖의 메모리·CPU)는 추정하지 않는다(할당만). `PlacementStatus.
+  settings`는 `deny_unknown_fields`라 뒤 버전이 설정 `placement`에 키를 더하면 그 설정을 쓰는 동안 옛 노드가 리더 상태를 읽지
+  못한다(부하 없이 놓고 `GET /placement` 503). `Cluster::leases()`는 부하 표(`loads`)를 통째로 복사한다(틱·상태마다 — 노드 300에서
+  수백 KB).
+- 2차 리뷰에서 남긴 것: 비우기는 옮기는 VM 자신의 CPU를 대상에 세지 않는다(모름 — 0과 할당 메모리). 사용 메모리는 호스트
+  전체라 ZFS ARC 같은 호스트 캐시가 큰 노드는 늘 "뜨겁게" 보일 수 있다. 동시 마이그레이션 2개(`MAX_CONCURRENT`)는 부드러운
+  상한이다 — 적용은 리더에서 하나씩이지만 auto 회차·사용자 마이그레이션·HA와 겹치면 잠깐 넘을 수 있다. 마이그레이션이 막
+  끝난 노드는 Task를 만든 때로 센다(끝난 때를 적지 않음). HA 되돌아가기가 거절·실패한 VM(HA의 `failed`)을 균형 조정기는 모르므로
+  더 우선인 노드가 살아 있음을 본 지 10분까지는 기다린다. 리더가 아닌 노드에 보낸 적용은 거절된다(리더로 대신 보내지 않음).

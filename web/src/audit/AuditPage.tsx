@@ -173,6 +173,9 @@ export function AuditPage() {
           )}
           {entries.map((entry) => {
             const time = new Date(entry.time);
+            // 노드가 스스로 남긴 항목(예: 균형 조정기의 `placement.move`)은 번역한 이름과 detail을 함께 보인다.
+            const named = `audit.actions.${entry.action}`;
+            const known = i18n.exists(named);
             return (
               <TableRow
                 key={entry.id}
@@ -196,12 +199,16 @@ export function AuditPage() {
                   >
                     {entry.action}
                   </button>
+                  {known && <span className="block text-xs text-muted-foreground">{t(named)}</span>}
                 </TableCell>
                 <TableCell>
                   {/* 대상이 없으면 detail(예: audit.dropped의 수, 로그인의 username=…) */}
                   {entry.target
                     ? `${entry.target.kind}/${entry.target.key}`
                     : (entry.detail ?? "—")}
+                  {known && entry.target && entry.detail && (
+                    <span className="block text-xs text-muted-foreground">{entry.detail}</span>
+                  )}
                 </TableCell>
                 <TableCell
                   className={entry.status >= 400 ? "font-medium text-destructive" : undefined}

@@ -328,3 +328,21 @@ it("shows a VM without HA plainly", async () => {
   expect(summary("Broken placement rules")).toHaveTextContent("—");
   expect(screen.queryByText("HA error", { selector: "dt" })).not.toBeInTheDocument();
 });
+
+it("says when the balancer does not move the VM", async () => {
+  const pinned = {
+    ...web,
+    id: "p",
+    name: "pinned",
+    spec: { ...web.spec, placement: { pinned: true } },
+  };
+  mockLists({ vm: [web, pinned], node: [NODE] });
+  const { unmount } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/pinned" });
+  expect(await screen.findByRole("heading", { name: "pinned" })).toBeInTheDocument();
+  expect(summary("Automatic moves")).toHaveTextContent("Excluded (pinned)");
+  unmount();
+  // 고정하지 않은 VM에는 그 줄이 없다.
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  expect(await screen.findByRole("heading", { name: "web" })).toBeInTheDocument();
+  expect(screen.queryByText("Automatic moves", { selector: "dt" })).not.toBeInTheDocument();
+});

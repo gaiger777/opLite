@@ -83,6 +83,8 @@ export interface VmFormValues {
   /** 게스트 에이전트 감시를 켠다. 끄더라도 초는 남겨 다시 켤 때 쓴다. */
   guestWatch: boolean;
   guestWatchSecs: string;
+  /** 균형 조정기가 옮기지 않는다(`placement.pinned`). 끄면 `placement`를 보내지 않는다. */
+  pinned: boolean;
   /** 만든 뒤 곧바로 시작한다(만들 때만). */
   start: boolean;
 }
@@ -133,6 +135,7 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     restart: "never",
     snapshotSchedule: { every: "off", keep: "7", memory: false },
     ...haFields(null),
+    pinned: false,
     start: true,
   };
 }
@@ -171,6 +174,7 @@ export function fromVm(vm: Vm): VmFormValues {
         }
       : { every: "off", keep: "7", memory: false },
     ...haFields(haPolicy(s)),
+    pinned: s.placement?.pinned ?? false,
     start: false,
   };
 }
@@ -363,6 +367,8 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
           }
         : null,
     ),
+    // 고정하지 않으면 보내지 않는다(서버도 `pinned: false`를 저장하지 않고, 옛 클러스터는 이 필드를 모른다).
+    ...(v.pinned && { placement: { pinned: true } }),
   };
 }
 

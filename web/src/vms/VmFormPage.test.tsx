@@ -790,3 +790,43 @@ it("keeps a running VM with ignored HA from activating HA", async () => {
     "text-muted-foreground",
   );
 });
+
+/** VM `app`을 편집하는 화면. 보낸 본문을 모은다. */
+function editApp(app: ReturnType<typeof vm>) {
+  mockLists({ vm: [app], node: [FENCED] });
+  const bodies: { spec: { placement?: unknown } }[] = [];
+  server.use(
+    http.put(apiUrl(`/vms/${app.id}`), async ({ request }) => {
+      bodies.push((await request.json()) as (typeof bodies)[number]);
+      return HttpResponse.json(app);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });
+  return bodies;
+}
+
+it("pins a running VM so the balancer does not move it", async () => {
+  const bodies = editApp(vm("app", "running"));
+  const user = userEvent.setup();
+  // 실행 중에도 바꿀 수 있다(장치 변화 없음).
+  const pinned = await screen.findByRole("switch", { name: "Not moved by the balancer" });
+  expect(pinned).toBeEnabled();
+  expect(pinned).not.toBeChecked();
+  await user.click(pinned);
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  expect(bodies[0]?.spec.placement).toEqual({ pinned: true });
+});
+
+it("unpins a VM without sending placement", async () => {
+  const app = vm("app", "running");
+  const bodies = editApp({ ...app, spec: { ...app.spec, placement: { pinned: true } } });
+  const user = userEvent.setup();
+  const pinned = await screen.findByRole("switch", { name: "Not moved by the balancer" });
+  expect(pinned).toBeChecked();
+  await user.click(pinned);
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  // 끄면 `placement`를 보내지 않는다(옛 VM과 같은 모양).
+  expect(bodies[0]?.spec).not.toHaveProperty("placement");
+});

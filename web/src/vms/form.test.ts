@@ -58,6 +58,13 @@ it("round-trips a VM through the form", () => {
   const plain = vm("db", "stopped");
   expect(fromVm(plain).snapshotSchedule.every).toBe("off");
   expect(toSpec(fromVm(plain), "stopped").snapshot_schedule).toBeNull();
+  // 고정은 `placement`로 오가고, 고정하지 않은 VM에는 `placement`가 없다.
+  const pinned = vm("pin", "running", {
+    spec: { ...vm("pin", "running").spec, placement: { pinned: true } },
+  });
+  expect(fromVm(pinned).pinned).toBe(true);
+  expect(toSpec(fromVm(pinned), "running").placement).toEqual({ pinned: true });
+  expect(toSpec(fromVm(plain), "stopped")).not.toHaveProperty("placement");
 });
 
 it("allows up to eight security groups on an interface", () => {

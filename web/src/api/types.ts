@@ -38,6 +38,13 @@ export type HaCheckAction = Schemas["HaCheckAction"];
 export type HaCheckTarget = Schemas["HaCheckTarget"];
 export type CheckReport = Schemas["CheckReport"];
 export type NodeInterface = Schemas["NodeInterface"];
+export type PlacementStatus = Schemas["PlacementStatus"];
+export type PlacementSettings = Schemas["PlacementSettings"];
+export type PlacementPatch = Schemas["PlacementPatch"];
+export type PlacementMode = Schemas["PlacementMode"];
+export type PlacementPolicy = Schemas["PlacementPolicy"];
+export type PlacementMove = Schemas["PlacementMove"];
+export type NodeLoadView = Schemas["NodeLoadView"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =

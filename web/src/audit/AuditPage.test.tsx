@@ -215,3 +215,32 @@ it("does not read the log for other roles", async () => {
     server.events.removeListener("request:start", seen);
   }
 });
+
+it("names the balancer's automatic moves and shows what moved", async () => {
+  // 리더가 스스로 남긴 항목: 사용자·IP·메서드가 없다.
+  const MOVE: AuditEntry = {
+    ...LOGIN,
+    id: "019a0f3c-8a10-7000-8000-000000000003",
+    node: "node-a",
+    ip: "",
+    method: "",
+    path: "",
+    action: "placement.move",
+    target: { kind: "vms", key: "web-1" },
+    status: 0,
+    detail: "auto: web-1 node-a -> node-b (balance), imbalance 21.0% -> 12.5%, cost 4096 MiB",
+  };
+  mockAudit({ entries: [START, MOVE] });
+  renderPage(<AuditPage />);
+  await screen.findByText("alice");
+  const rows = within(screen.getByRole("table", { name: "Audit log" })).getAllByRole("row");
+  const cells = within(rows[2]!).getAllByRole("cell");
+  expect(cells[4]).toHaveTextContent("placement.moveAutomatic move by the balancer");
+  expect(cells[5]).toHaveTextContent(
+    "vms/web-1auto: web-1 node-a -> node-b (balance), imbalance 21.0% -> 12.5%, cost 4096 MiB",
+  );
+  // 사용자의 요청은 그대로다.
+  expect(within(rows[1]!).getAllByRole("cell")[4]).toHaveTextContent(
+    /^POST \/vms\/\{key\}\/actions\/\{action\}$/,
+  );
+});

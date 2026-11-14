@@ -76,7 +76,12 @@
     "placement_rule": "Placement rules leave no node for this VM: {{message}}",
     "rule_conflict": "The rule contradicts other placement rules: {{message}}",
     "group_in_use": "The HA group is in use. Take the VMs out of the group first: {{message}}",
-    "ha_capacity": "Starting this HA VM would use memory reserved for HA recovery."
+    "ha_capacity": "Starting this HA VM would use memory reserved for HA recovery.",
+    "recommendation_not_found": "The recommendation has changed. The balancer computes new recommendations every run; reload and look again.",
+    "vm_pinned": "The VM is pinned: the balancer does not move it. Turn off \"Not moved by the balancer\" or migrate it yourself.",
+    "recommendation_stale": "The recommendation no longer fits the cluster: {{message}}",
+    "placement_busy": "Two migrations are already running. Apply the recommendation when one has finished.",
+    "placement_unavailable": "Could not read placement from the cluster leader. Try again shortly."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -99,7 +104,8 @@
     "settings": "Settings",
     "haGroups": "HA groups",
     "haChecks": "HA checks",
-    "placementRules": "Placement rules"
+    "placementRules": "Placement rules",
+    "placement": "Optimal placement"
   },
   "header": {
     "language": "Language",
@@ -321,7 +327,9 @@
     "haCapacityDetail": "It needs {{need}}, but only {{free}} of {{capacity}} is left outside the {{reserve}} reserve.",
     "haPriority": "HA recovery priority",
     "guestWatch": "Guest agent watch",
-    "guestWatchSecs": "Restart after {{secs}} s without an answer"
+    "guestWatchSecs": "Restart after {{secs}} s without an answer",
+    "pinned": "Automatic moves",
+    "pinnedOn": "Excluded (pinned)"
   },
   "snapshots": {
     "created": "Created",
@@ -1452,7 +1460,9 @@
     "guestWatch": "Restart when the guest hangs",
     "guestWatchHint": "Pings the QEMU guest agent (qemu-guest-agent must run in the guest). Once it has answered, no answer for the time below force-restarts the VM. After a guest reboot it waits until the agent answers again. Can be turned on or off only while the VM is stopped.",
     "guestWatchSecs": "Seconds without an answer",
-    "guestWatchSecsHint": "From 30 to 3600."
+    "guestWatchSecsHint": "From 30 to 3600.",
+    "pinned": "Not moved by the balancer",
+    "pinnedHint": "The balancer never moves this VM. HA recovery, node draining and migrations you start still move it."
   },
   "console": {
     "connecting": "Connecting…",
@@ -1623,7 +1633,12 @@
     "unreachable": "No audit entries from these nodes (unreachable): {{nodes}}",
     "disabled": "The audit log is turned off on these nodes: {{nodes}}",
     "truncated": "Showing the newest {{count}} entries. More match; narrow the range or the filters.",
-    "entryTitle": "Audit entry"
+    "entryTitle": "Audit entry",
+    "actions": {
+      "placement": {
+        "move": "Automatic move by the balancer"
+      }
+    }
   },
   "haGroups": {
     "pageHint": "HA VMs in a group are placed and recovered on the group's nodes, higher priority first. When a higher-priority node comes back, a running VM moves back to it by live migration unless the group has No failback.",
@@ -1801,6 +1816,78 @@
       "vmNames": "Use valid VM names, each once.",
       "nodes": "Choose at least one node.",
       "weight": "From 1 to 100."
+    }
+  },
+  "placement": {
+    "pageHint": "Every node sends a load summary (CPU over 1 and 5 minutes, memory) with its lease every 5 seconds. Starting VMs, HA recovery and node draining choose the node with the best score. Every 5 minutes the balancer looks at how uneven the nodes are and recommends, or makes, live migrations.",
+    "mode": "Mode",
+    "policy": "Policy",
+    "threshold": "Threshold",
+    "imbalance": "Imbalance",
+    "imbalanceValue": "{{total}} (CPU {{cpu}}, memory {{mem}})",
+    "lastRun": "Last run",
+    "nextRun": "Next run",
+    "paused": "Paused",
+    "modes": {
+      "off": "Off",
+      "recommend": "Recommend",
+      "auto": "Automatic"
+    },
+    "modeHint": {
+      "off": "The balancer does nothing. Placement still uses load scores.",
+      "recommend": "The balancer only recommends moves; apply them yourself.",
+      "auto": "The balancer starts up to two live migrations at a time by itself."
+    },
+    "policies": {
+      "balance": "Balance",
+      "pack": "Pack"
+    },
+    "policyHint": {
+      "balance": "Spread load evenly across nodes.",
+      "pack": "Fill busy nodes first, keeping others free. The balancer only fixes broken hard rules."
+    },
+    "thresholdHint": "From 1 to 50 percent. The balancer starts moving VMs when the imbalance (the mean of the CPU and memory spread across nodes) is above this and goes on until it is below 0.8 times this. A node whose CPU or memory use is more than twice this above the average is relieved even when the imbalance is lower.",
+    "pausedReasons": {
+      "off": "The mode is off.",
+      "pack": "The policy is pack, so the balancer does not move VMs for balance.",
+      "fewNodes": "Fewer than two nodes have a recent load summary."
+    },
+    "nodes": "Node load",
+    "cpu": "CPU",
+    "memory": "Memory",
+    "cpu1": "CPU 1 min",
+    "cpu5": "CPU 5 min",
+    "memUsed": "Used",
+    "memAllocated": "Allocated",
+    "vms": "VMs",
+    "age": "Summary age",
+    "ageSecs": "{{n}} s",
+    "noSummary": "No summary",
+    "noSummaryHint": "No recent load summary: the score uses the other nodes' mean CPU and allocated memory.",
+    "noNodes": "No nodes.",
+    "recommendations": "Recommendations",
+    "applied": "Moves started",
+    "empty": "No recommendations.",
+    "vm": "VM",
+    "from": "From",
+    "to": "To",
+    "reason": "Reason",
+    "cost": "Cost",
+    "reasons": {
+      "balance": "Balance",
+      "rule": "Rule"
+    },
+    "reasonBalance": "Imbalance −{{gain}}",
+    "reasonRule": "Breaks {{rules}}",
+    "apply": "Apply",
+    "applyNamed": "Apply: move {{vm}} to {{node}}",
+    "applyOp": "Move {{vm}} to {{node}}",
+    "task": "Task",
+    "settings": "Balancer settings",
+    "save": "Save",
+    "saved": "Placement settings saved.",
+    "errors": {
+      "threshold": "A whole number from 1 to 50."
     }
   }
 }

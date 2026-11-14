@@ -5,6 +5,7 @@ import type {
   HaGroup,
   Node,
   PlacementRule,
+  PlacementStatus,
   Rule,
   SecurityGroup,
   Snapshot,
@@ -404,3 +405,66 @@ export function remote(name: string, status: Partial<RemoteView["status"]> = {})
     },
   };
 }
+
+/**
+ * 최적 배치 상태: recommend 모드(서버처럼 기본 설정은 쓰지 않음), 바쁜 node-a(요약 3초 전)와 요약 없는 node-b,
+ * node-a의 web1을 node-b로 옮기는 균형 추천과 규칙 `only-b`를 바로잡는 db1 추천
+ */
+export const PLACEMENT: PlacementStatus = {
+  leader: "n1",
+  settings: {} as PlacementStatus["settings"],
+  last_run: 1_793_761_200,
+  next_run: 1_793_761_500,
+  imbalance: { cpu_pct: 182, mem_pct: 238, total_pct: 210 },
+  nodes: [
+    {
+      node: "n1",
+      name: "node-a",
+      cpu1_pct: 905,
+      cpu5_pct: 880,
+      mem_used_mib: 12288,
+      mem_allocated_mib: 10240,
+      mem_total_mib: 16384,
+      cpu_use_pct: 880,
+      mem_use_pct: 750,
+      vms: 5,
+      age_secs: 3,
+    },
+    {
+      node: "n2",
+      name: "node-b",
+      mem_allocated_mib: 2048,
+      mem_total_mib: 16384,
+      cpu_use_pct: 880,
+      mem_use_pct: 125,
+      vms: 1,
+    },
+  ],
+  recommendations: [
+    {
+      id: "019a0f3c-0000-7000-800c-000000000001",
+      vm: "019a0f3c-0000-7000-8000-00000000web1",
+      vm_name: "web1",
+      from: "n1",
+      from_name: "node-a",
+      to: "n2",
+      to_name: "node-b",
+      reason: "balance",
+      gain_pct: 85,
+      cost_mib: 4096,
+    },
+    {
+      id: "019a0f3c-0000-7000-800c-000000000002",
+      vm: "019a0f3c-0000-7000-8000-000000000db1",
+      vm_name: "db1",
+      from: "n1",
+      from_name: "node-a",
+      to: "n2",
+      to_name: "node-b",
+      reason: "rule",
+      gain_pct: 0,
+      cost_mib: 2048,
+      rules: ["only-b"],
+    },
+  ],
+};
