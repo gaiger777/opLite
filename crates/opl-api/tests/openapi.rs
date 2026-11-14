@@ -65,6 +65,8 @@ async fn openapi_document_is_served_without_login() {
         "/placement-rules",
         "/placement-rules/{key}",
         "/placement",
+        "/placement/recommendations",
+        "/placement/recommendations/{id}/apply",
         "/vm-imports",
         "/vm-imports/{key}",
         "/vm-imports/{key}/run",

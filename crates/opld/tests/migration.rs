@@ -4,7 +4,8 @@
 //! 파일이 따라가는지도 본다. 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용은 정지한 VM에서
 //! `qemu-io`로 본다. 노드 비우기(`oplctl node drain --wait`)가 실행 중인 VM을 다른 노드로 옮기는지도 본다.
 //! 노드 로컬 디렉터리 풀(노드마다 다른 경로)의 디스크를 복사하며 옮기는지(`--pool`, 진행률, 실패 정리), 같은
-//! 이름의 로컬 풀이 같은 경로라 비우기가 그 VM을 남기는지도 본다.
+//! 이름의 로컬 풀이 같은 경로라 비우기가 그 VM을 남기는지도 본다. 균형 조정기가 hard 규칙을 어기는 VM을 추천·적용과
+//! `auto`로 옮기는지도 본다.
 //! `cargo test -p opld --features migration-it --test migration`
 //! QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다. 이 Mac에서도 돈다(TCG).
 //!
@@ -864,6 +865,158 @@ async fn drain_leaves_a_vm_whose_local_disk_the_target_already_has() {
     d.ctl(&["vm", "delete", "web"]).await.unwrap();
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     d.ctl(&["pool", "delete", "local"]).await.unwrap();
+}
+
+/// VM `name`의 배정 노드와 실행 노드의 id
+async fn vm_nodes(c: &Client, name: &str) -> (Value, Value) {
+    let vm = c.get(&format!("/vms/{name}")).await.unwrap();
+    (vm["spec"]["node"].clone(), vm["status"]["node"].clone())
+}
+
+/// 균형 조정기가 지금 노드에서 hard 규칙을 어기는 VM을 옮긴다: `recommend`의 추천(이유 `rule`)을 `placement apply`로
+/// 적용하고, `auto`면 스스로 옮긴다. 노드 부하는 실제 측정기의 요약이 리스로 리더에 간다. 한 호스트의 두 노드는 실제
+/// CPU·메모리 사용이 같아 부하 불균형을 만들 수 없으므로 규칙 바로잡기로 옮기기 경로를 본다(불균형은 opl-api 시험).
+#[tokio::test]
+async fn the_balancer_moves_a_vm_off_a_node_its_rules_forbid() {
+    let p = Pair::with_migration(
+        "mig-balance",
+        ["60280-60289", "60290-60299"],
+        "[test]\nplacement_interval_secs = 5\n",
+    )
+    .await;
+    let (c, d) = (&p.c[0], &p.d[0]);
+    let node2 = Value::String(p.node_id(1).await);
+    // 두 노드의 측정기 요약이 리더에 닿는다.
+    eventually("load summaries of both nodes", || async {
+        let status = c.get("/placement").await.unwrap();
+        let nodes = status["nodes"].as_array().cloned().unwrap_or_default();
+        nodes.len() == 2 && nodes.iter().all(|n| n["age_secs"].is_u64())
+    })
+    .await;
+    let out = d.ctl(&["placement", "status"]).await.unwrap();
+    assert!(
+        out.starts_with("mode: recommend  policy: balance  threshold: 15%\n"),
+        "{out}"
+    );
+    for line in out.lines().filter(|l| l.starts_with("node")) {
+        assert!(line.trim_end().ends_with('s'), "no summary age: {out}");
+    }
+
+    let shared = tempfile::Builder::new()
+        .prefix("oplbalance")
+        .tempdir_in("/tmp")
+        .unwrap();
+    d.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.path().to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    p.wait_pool_ready("shared").await;
+    for vm in ["web1", "web2"] {
+        let disk = format!("{vm}-root");
+        d.ctl(&[
+            "volume", "create", &disk, "--pool", "shared", "--size", "64M",
+        ])
+        .await
+        .unwrap();
+        d.ctl(&[
+            "vm", "create", vm, "--memory", "256", "--disk", &disk, "--node", "node1", "--start",
+        ])
+        .await
+        .unwrap();
+    }
+    // 자리 잡은 VM은 규칙을 만들어도 옮기지 않으므로 위반으로 남는다.
+    d.ctl(&[
+        "placement-rule",
+        "create",
+        "on-node2",
+        "--kind",
+        "node-affinity",
+        "--vm",
+        "web1",
+        "--node",
+        "node2",
+    ])
+    .await
+    .unwrap();
+    eventually("web1 breaks the rule", || async {
+        let vm = c.get("/vms/web1").await.unwrap();
+        vm["status"]["rule_violations"] == json!(["on-node2"])
+    })
+    .await;
+
+    // recommend: 이유 rule의 추천 하나를 적용한다.
+    eventually("a rule recommendation", || async {
+        let list = c.get("/placement/recommendations").await.unwrap();
+        list.as_array().is_some_and(|l| l.len() == 1)
+    })
+    .await;
+    let list = c.get("/placement/recommendations").await.unwrap();
+    let rec = &list[0];
+    assert_eq!(rec["vm_name"], "web1", "{list}");
+    assert_eq!(rec["reason"], "rule", "{list}");
+    assert_eq!(rec["to"], node2, "{list}");
+    assert_eq!(rec["rules"], json!(["on-node2"]), "{list}");
+    // 표의 ID는 id 끝 12자이고 `placement apply`가 그것으로 찾는다.
+    let id = rec["id"].as_str().unwrap();
+    let tail = &id[id.len() - 12..];
+    let out = d.ctl(&["placement", "recommendations"]).await.unwrap();
+    assert!(
+        out.contains(tail) && out.contains(" web1 ") && out.contains(" rule "),
+        "{out}"
+    );
+    let out = d.ctl(&["placement", "apply", tail]).await.unwrap();
+    let task = out
+        .trim_end()
+        .strip_prefix("vm web1: moving from node1 to node2 (task ")
+        .and_then(|t| t.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{out}"));
+    let task = c.get(&format!("/tasks/{task}")).await.unwrap();
+    assert_eq!(task["spec"]["op"]["kind"], "vm-migrate", "{task}");
+    let task = c.wait_task(&task).await.unwrap();
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(vm_nodes(c, "web1").await, (node2.clone(), node2.clone()));
+
+    // auto: 같은 규칙에 넣은 web2를 스스로 옮긴다.
+    d.ctl(&[
+        "placement-rule",
+        "set",
+        "on-node2",
+        "--vm",
+        "web1",
+        "--vm",
+        "web2",
+    ])
+    .await
+    .unwrap();
+    let out = d
+        .ctl(&["placement", "set", "--mode", "auto"])
+        .await
+        .unwrap();
+    assert_eq!(out, "placement settings updated\n");
+    eventually("web2 moved to node2", || async {
+        vm_nodes(c, "web2").await == (node2.clone(), node2.clone())
+    })
+    .await;
+    assert_eq!(vm_nodes(c, "web1").await, (node2.clone(), node2.clone()));
+
+    d.ctl(&["placement", "set", "--mode", "off"]).await.unwrap();
+    d.ctl(&["placement-rule", "delete", "on-node2"])
+        .await
+        .unwrap();
+    for vm in ["web1", "web2"] {
+        d.ctl(&["vm", "stop", vm, "--force"]).await.unwrap();
+        d.ctl(&["vm", "delete", vm]).await.unwrap();
+        d.ctl(&["volume", "delete", &format!("{vm}-root")])
+            .await
+            .unwrap();
+    }
+    d.ctl(&["pool", "delete", "shared"]).await.unwrap();
 }
 
 /// NFS 풀(두 노드가 각자 마운트한다)

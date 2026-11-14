@@ -1,28 +1,70 @@
 //! 최적 배치 상태(설계 §8.3): 리더가 리스의 노드 부하와 균형 조정기의 마지막 결과(게시판)로 만든다. 다른 노드의
 //! API는 노드 사이 RPC(`ReadPlacement`)로 [`PlacementStatusSource`]에 묻는다.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_cluster::types::NodeId;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::placement::{NodeLoadView, PlacementStatus};
+use opl_types::placement::{ImbalanceView, NodeLoadView, PlacementMove, PlacementStatus};
 use opl_types::vm::PowerState;
 use tokio::time::Instant;
+use uuid::Uuid;
 
 use crate::placement::{Assign, allocated_mib};
 use crate::scheduler::Inventory;
 use crate::score::{Loads, node_use};
 
-/// 균형 조정기의 마지막 결과(리더 메모리)
+/// 균형 조정기의 마지막 결과(리더 메모리). 리더 자리를 잃으면 균형 조정기가 비운다.
 #[derive(Debug, Default)]
-pub struct PlacementBoard {}
+pub struct PlacementBoard(Mutex<Board>);
+
+/// 게시판의 내용
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Board {
+    /// 마지막 회차(유닉스 초)
+    pub last_run: Option<u64>,
+    /// 다음 회차(유닉스 초)
+    pub next_run: Option<u64>,
+    /// 마지막 회차의 불균형(쉬었으면 없음)
+    pub imbalance: Option<ImbalanceView>,
+    pub paused: Option<String>,
+    /// 추천(auto면 시작한 옮기기)
+    pub recommendations: Vec<PlacementMove>,
+    /// 노드마다 균형 조정기가 살아 있음을 계속 본 처음 때(추천 적용이 다시 본다)
+    pub alive_since: BTreeMap<Uuid, Instant>,
+    /// 균형 조정기의 리스 기준점
+    pub base: Option<Instant>,
+    /// 균형 옮기기를 받는 노드가 살아 있어야 하는 시간(`BalancerConfig::settle`)
+    pub settle: Duration,
+}
+
+impl PlacementBoard {
+    pub(crate) fn read(&self) -> Board {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub(crate) fn update(&self, f: impl FnOnce(&mut Board)) {
+        f(&mut self.0.lock().unwrap());
+    }
+
+    /// 추천 `id`를 적용해 만든 마이그레이션 Task를 적는다(없는 추천이면 그대로).
+    pub(crate) fn set_task(&self, id: Uuid, task: Uuid) {
+        self.update(|b| {
+            if let Some(m) = b.recommendations.iter_mut().find(|m| m.id == id) {
+                m.task = Some(task);
+            }
+        });
+    }
+}
 
 /// 리더의 최적 배치 상태: 위트니스가 아닌 노드마다 리스의 부하 요약(신선한 것만)과 점수가 보는 사용률, 그리고
 /// 게시판. 리더인지는 부르는 쪽이 본다.
 pub fn placement_status(
     cluster: &Cluster,
-    _board: &PlacementBoard,
+    board: &PlacementBoard,
 ) -> Result<PlacementStatus, ClusterError> {
     let settings = crate::settings::current(cluster)?.spec.placement();
     let inv = Inventory::load(cluster)?;
@@ -65,20 +107,21 @@ pub fn placement_status(
         })
         .collect();
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
+    let board = board.read();
     Ok(PlacementStatus {
         leader: cluster.id().0,
         settings,
-        last_run: None,
-        next_run: None,
-        imbalance: None,
-        paused: None,
+        last_run: board.last_run,
+        next_run: board.next_run,
+        imbalance: board.imbalance,
+        paused: board.paused,
         nodes,
-        recommendations: Vec::new(),
+        recommendations: board.recommendations,
     })
 }
 
 /// 사용률(0~1)을 0.1% 단위로
-fn permille(v: f64) -> u16 {
+pub(crate) fn permille(v: f64) -> u16 {
     (v * 1000.0).round().clamp(0.0, f64::from(u16::MAX)) as u16
 }
 

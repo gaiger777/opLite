@@ -65,6 +65,8 @@ pub struct AppState {
     pub placement: Arc<PlacementBoard>,
     /// 리더에 점수용 부하를 묻지 못했을 때 다시 묻지 않는 끝(`score::scorer`)
     pub(crate) placement_backoff: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// 추천 적용을 하나씩(다시 보기와 마이그레이션 만들기 사이에 다른 적용이 끼지 않게)
+    pub(crate) placement_apply: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -98,6 +100,7 @@ impl AppState {
             fence: Arc::new(Fencer::default()),
             placement: Arc::default(),
             placement_backoff: Default::default(),
+            placement_apply: Default::default(),
         }
     }
 }

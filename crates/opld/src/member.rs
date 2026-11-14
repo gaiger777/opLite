@@ -12,11 +12,11 @@ use anyhow::Context;
 use axum::serve::ListenerExt;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
-    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, ClusterJanitor, FenceStatusSource,
-    HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations, PlacementBoard,
-    PlacementStatusSource, PowerFence, RemotePoller, RuntimeProbe, SnapshotScheduler, TaskRunner,
-    TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent,
-    VipManager, VipManagerConfig,
+    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, Balancer, ClusterJanitor,
+    FenceStatusSource, HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations,
+    PlacementBoard, PlacementStatusSource, PowerFence, RemotePoller, RuntimeProbe,
+    SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher,
+    UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
@@ -183,6 +183,8 @@ struct Services {
     voter_keeper: VoterKeeper,
     schedule: SnapshotScheduler,
     janitor: ClusterJanitor,
+    /// 리더가 노드 부하의 불균형을 재고 옮기기를 추천하거나 한다.
+    balancer: Balancer,
     /// 리더가 백업 작업을 실행한다.
     backups: BackupJobScheduler,
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
@@ -242,6 +244,7 @@ impl Services {
         self.voter_keeper.shutdown().await;
         self.schedule.shutdown().await;
         self.janitor.shutdown().await;
+        self.balancer.shutdown().await;
         self.backups.shutdown().await;
         self.telemetry.shutdown().await;
         self.remotes.shutdown().await;
@@ -749,10 +752,11 @@ impl Member {
             "orbivisord is ready"
         );
         let (stop, rx) = oneshot::channel::<()>();
-        let (schedule, janitor, backups, telemetry, remotes) = on(&rt.work, || {
+        let (schedule, janitor, balancer, backups, telemetry, remotes) = on(&rt.work, || {
             (
                 SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config()),
                 ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config()),
+                Balancer::spawn(state.clone(), config.balancer_config()),
                 BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config()),
                 TelemetryReporter::spawn(state.clone(), telemetry_config),
                 RemotePoller::spawn(state.clone(), config.remotes.poller_config()),
@@ -809,6 +813,7 @@ impl Member {
                 voter_keeper,
                 schedule,
                 janitor,
+                balancer,
                 backups,
                 telemetry,
                 remotes,

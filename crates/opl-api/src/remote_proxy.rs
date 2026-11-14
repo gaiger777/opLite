@@ -268,6 +268,7 @@ mod tests {
             "ha-checks/stor",
             "placement-rules",
             "placement",
+            "placement/recommendations",
         ] {
             assert!(readable(&segments(ok)), "{ok}");
         }

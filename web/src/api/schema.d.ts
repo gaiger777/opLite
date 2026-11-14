@@ -860,6 +860,53 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/placement/recommendations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 균형 조정기의 마지막 회차가 추천한 옮기기(auto면 시작한 옮기기와 그 Task). 회차마다 새로 계산한다.
+         *     리더가 아닌 노드는 리더에 묻고, 묻지 못하면 503 `placement_unavailable`이다.
+         */
+        get: operations["list_recommendations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/placement/recommendations/{id}/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 추천 `id`를 적용한다: 그 VM을 추천한 노드로 옮기는 마이그레이션 Task(202, 권한은 VM 마이그레이션과 같음).
+         *     리더 노드의 API에서만 적용한다(리더가 아니면 409 `recommendation_stale` — 리더 메모리의 HA 검사 결과·균형 조정기의
+         *     상태로 다시 보므로). 추천이 없으면(회차마다 새로 계산한다) 404 `recommendation_not_found`, VM이 고정
+         *     (`placement.pinned`)이면 409 `vm_pinned`, 클러스터에 끝나지 않은 마이그레이션이 둘 이상이면 409 `placement_busy`다.
+         *     추천은 회차 때의 상태로 계산했으므로 지금 상태로 균형 조정기의 조건을 다시 본다: 모드가 `off`이거나, 균형 조정기가 쉬는
+         *     이유가 있거나(유지보수 노드·HA 되돌아가기 기다림 등), VM을 옮길 수 없거나(옮기는 중·Task 중·1시간 안에 옮김 등),
+         *     대상이 조건에 맞지 않으면(메모리·규칙·HA 검사·살아 있음을 본 시간 등) 409 `recommendation_stale`(문구에 이유).
+         *     적용은 한 번에 하나씩 다시 본다. 그 밖의 오류는 마이그레이션과 같다(VM이 이미 다른 노드면 409 `vm_moved`,
+         *     `no_capacity`, `placement_rule` 등).
+         */
+        post: operations["apply_recommendation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/realms": {
         parameters: {
             query?: never;
@@ -8374,6 +8421,79 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_recommendations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlacementMove"][];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    apply_recommendation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description recommendation id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
             "4XX": {
                 headers: {

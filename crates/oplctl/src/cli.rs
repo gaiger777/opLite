@@ -2952,6 +2952,13 @@ enum PlacementCmd {
     Status,
     /// 최적 배치 설정을 바꾼다(admin). 준 값만 바꾼다.
     Set(PlacementSet),
+    /// 균형 조정기의 마지막 회차가 추천한 옮기기(auto면 시작한 옮기기)
+    Recommendations,
+    /// 추천을 적용한다: 그 VM을 추천한 노드로 옮기는 마이그레이션 Task를 만들고 그 id를 보인다.
+    Apply {
+        /// 추천 id(전체, 앞부분, 또는 `placement recommendations`가 보이는 끝 12자)
+        id: String,
+    },
 }
 
 #[derive(Debug, Default, Args)]
@@ -3068,6 +3075,49 @@ fn placement_node_row(n: &Value) -> Vec<String> {
     ]
 }
 
+/// `placement recommendations`의 표 열
+const RECOMMENDATION_HEADERS: &[&str] = &["ID", "VM", "FROM", "TO", "REASON", "GAIN", "COST"];
+
+/// 추천 하나의 행. id는 끝 12자다(UUIDv7의 앞부분은 만든 때라 한 회차의 추천끼리 같다).
+fn recommendation_row(r: &Value) -> Vec<String> {
+    let id = cell(&r["id"]);
+    vec![
+        id[id.len().saturating_sub(12)..].to_string(),
+        cell(&r["vm_name"]),
+        cell(&r["from_name"]),
+        cell(&r["to_name"]),
+        cell(&r["reason"]),
+        permille_cell(&r["gain_pct"]),
+        mib_cell(&r["cost_mib"]),
+    ]
+}
+
+/// id가 `key`이거나 `key`로 시작하거나 끝나는 추천(대소문자 무시). 없거나 여럿이면 오류다.
+fn find_recommendation<'a>(list: &'a [Value], key: &str) -> anyhow::Result<&'a Value> {
+    let key = key.to_lowercase();
+    if key.is_empty() {
+        bail!("give the recommendation id");
+    }
+    let found: Vec<&Value> = list
+        .iter()
+        .filter(|r| {
+            r["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with(&key) || id.ends_with(&key))
+        })
+        .collect();
+    match found[..] {
+        [one] => Ok(one),
+        [] => bail!(
+            "no recommendation {key}; recommendations are recomputed every run (see `placement recommendations`)"
+        ),
+        _ => bail!(
+            "{} recommendations match {key}; give more of the id",
+            found.len()
+        ),
+    }
+}
+
 async fn placement(
     client: &Client,
     cmd: PlacementCmd,
@@ -3094,6 +3144,39 @@ async fn placement(
                 .patch("/settings", &placement_set_body(&args)?)
                 .await?;
             writeln!(out, "placement settings updated")?;
+        }
+        PlacementCmd::Recommendations => {
+            let list = client.get("/placement/recommendations").await?;
+            if json_out {
+                print_json(out, &list)?;
+            } else {
+                let items = list.as_array().cloned().unwrap_or_default();
+                let rows: Vec<_> = items.iter().map(recommendation_row).collect();
+                table(out, RECOMMENDATION_HEADERS, &rows)?;
+            }
+        }
+        PlacementCmd::Apply { id } => {
+            let list = client.get("/placement/recommendations").await?;
+            let items = list.as_array().cloned().unwrap_or_default();
+            let r = find_recommendation(&items, &id)?;
+            let task = client
+                .post(
+                    &format!("/placement/recommendations/{}/apply", cell(&r["id"])),
+                    &json!({}),
+                )
+                .await?;
+            if json_out {
+                print_json(out, &task)?;
+            } else {
+                writeln!(
+                    out,
+                    "vm {}: moving from {} to {} (task {})",
+                    cell(&r["vm_name"]),
+                    cell(&r["from_name"]),
+                    cell(&r["to_name"]),
+                    cell(&task["id"])
+                )?;
+            }
         }
     }
     Ok(())
@@ -12028,6 +12111,69 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             [
                 "n2", "-", "-", "-", "0B", "8.0GiB", "85.0%", "0.0%", "0", "-"
             ]
+        );
+    }
+
+    /// `placement recommendations`의 행(id 끝 12자, 효과 0.1% 단위, 비용 MiB)
+    #[test]
+    fn recommendation_rows() {
+        let r = json!({
+            "id": "01a1d94a-4077-71cf-87cd-b31828a18c08",
+            "vm": "01a1d949-c903-733a-9e5c-879b16c48048", "vm_name": "web",
+            "from": "01a1d949-c559-72a7-ad90-8a2021b63e4a", "from_name": "n1",
+            "to": "01a1d949-c574-70e0-9bc5-813969017b7e", "to_name": "n2",
+            "reason": "balance", "gain_pct": 109, "cost_mib": 4096
+        });
+        assert_eq!(
+            recommendation_row(&r),
+            [
+                "b31828a18c08",
+                "web",
+                "n1",
+                "n2",
+                "balance",
+                "10.9%",
+                "4.0GiB"
+            ]
+        );
+        assert!(Cli::try_parse_from(["oplctl", "placement", "recommendations"]).is_ok());
+        assert!(matches!(
+            Cli::try_parse_from(["oplctl", "placement", "apply", "01a1"]).unwrap().cmd,
+            Cmd::Placement { cmd: PlacementCmd::Apply { id } } if id == "01a1"
+        ));
+        assert!(Cli::try_parse_from(["oplctl", "placement", "apply"]).is_err());
+    }
+
+    /// `placement apply`는 id 전체·앞부분·끝부분(표의 ID)으로 추천을 찾는다(대소문자 무시). 없거나 여럿이면 오류다.
+    /// 한 회차의 추천은 UUIDv7이라 앞부분이 같다.
+    #[test]
+    fn find_recommendation_by_prefix_or_suffix() {
+        let list = [
+            json!({ "id": "01a1d94a-4077-71cf-87cd-b31828a18c08", "vm_name": "web" }),
+            json!({ "id": "01a1d94a-4077-72cf-91aa-0123456789ab", "vm_name": "db" }),
+        ];
+        let id =
+            |key: &str| recommendation_row(find_recommendation(&list, key).unwrap())[0].clone();
+        assert_eq!(id("B31828A18C08"), "b31828a18c08");
+        assert_eq!(id("0123456789ab"), "0123456789ab");
+        assert_eq!(id("01a1d94a-4077-71"), "b31828a18c08");
+        assert_eq!(
+            find_recommendation(&list, "01a1d94a-4077-72cf-91aa-0123456789ab").unwrap()["vm_name"],
+            "db"
+        );
+        assert_eq!(
+            find_recommendation(&list, "01a1d94a")
+                .unwrap_err()
+                .to_string(),
+            "2 recommendations match 01a1d94a; give more of the id"
+        );
+        assert_eq!(
+            find_recommendation(&list, "ff").unwrap_err().to_string(),
+            "no recommendation ff; recommendations are recomputed every run (see `placement recommendations`)"
+        );
+        assert_eq!(
+            find_recommendation(&list, "").unwrap_err().to_string(),
+            "give the recommendation id"
         );
     }
 

@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use opl_api::{
-    AppState, AuditConfig, AuditLog, IncomingConfig, IncomingMigrations, PlacementBoard,
-    PlacementStatusSource, TaskRunner, UefiVarsFetcher, hash_password,
+    AppState, AuditConfig, AuditLog, Balancer, BalancerConfig, IncomingConfig, IncomingMigrations,
+    PlacementBoard, PlacementStatusSource, TaskRunner, UefiVarsFetcher, hash_password,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig};
@@ -35,7 +35,7 @@ use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role, SessionSpec, UserSpec};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
 use opl_types::node::{FEATURES, Fencing, NodeHa, NodeSpec, NodeStatus, PoolState};
-use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind};
+use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind, VmLoad};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
@@ -91,6 +91,8 @@ struct Node {
     runner: Option<TaskRunner>,
     /// Task 실행기를 다시 띄울 때 쓰는 설정
     runner_config: Option<opl_api::TaskRunnerConfig>,
+    /// API 서버의 상태(반복 작업을 띄울 때 쓴다)
+    state: Option<Arc<AppState>>,
 }
 
 impl Node {
@@ -142,6 +144,7 @@ impl Node {
             reconciler: None,
             runner: None,
             runner_config: None,
+            state: None,
         }
     }
 
@@ -241,6 +244,7 @@ impl Node {
         state.metrics = metrics;
         state.placement = board;
         let state = Arc::new(state);
+        self.state = Some(state.clone());
         let mut config = runner_config(self.id, &work);
         config.peers = Some(self.peers.clone());
         config.firmware = Some(firmware);
@@ -2524,4 +2528,116 @@ async fn placement_is_unavailable_when_the_leader_does_not_serve_it() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let task = admin.act("web", "start").await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
+}
+
+/// 리더가 바뀌면 새 리더의 균형 조정기가 추천을 다시 만든다(노드 부하는 새 리더가 리스로 다시 받는다).
+#[tokio::test]
+async fn a_new_leader_recommends_again() {
+    let (_root, a, b) = two_nodes().await;
+    let (leader, follower) = leader_first(&a, &b).await;
+    let admin = login_at(&leader.base, "admin", ADMIN_PASSWORD).await;
+    let web = running_vm(&a, &admin).await;
+    let config = BalancerConfig {
+        tick: Duration::from_millis(100),
+        interval: Duration::from_millis(500),
+        settle: Duration::ZERO,
+    };
+    let balancers = [&a, &b].map(|n| Balancer::spawn(n.state.clone().unwrap(), config.clone()));
+    // 그때의 리더에 부하를 넣는다: A가 바쁘고(VM web이 vCPU를 다 씀) B는 한가하다.
+    let clusters = [a.cluster.clone(), b.cluster.clone()];
+    let (a_id, b_id) = (a.id, b.id);
+    let loader = tokio::spawn(async move {
+        loop {
+            for c in &clusters {
+                if c.members().leader != Some(c.id()) {
+                    continue;
+                }
+                for (node, permille, vms) in [(a_id, 900, vec![web.id]), (b_id, 100, vec![])] {
+                    let load = LoadSummary {
+                        cpu1: Some(permille),
+                        cpu5: Some(permille),
+                        mem: Some(1024),
+                        vms: vms
+                            .into_iter()
+                            .map(|id| VmLoad {
+                                id,
+                                cpu: Some(1000),
+                                mem: Some(256),
+                            })
+                            .collect(),
+                    };
+                    let _ = c
+                        .execute_as_leader(LeaderRequest::RenewLease {
+                            node: NodeId(node),
+                            checks: vec![],
+                            load: Some(load),
+                        })
+                        .await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+    let read = |node: &Node| {
+        let base = node.base.clone();
+        async move {
+            let admin = login_at(&base, "admin", ADMIN_PASSWORD).await;
+            let (status, got) = admin.get("/placement").await;
+            assert_eq!(status, StatusCode::OK, "{got}");
+            got
+        }
+    };
+    let deadline = Instant::now() + WAIT;
+    let first = loop {
+        let got = read(leader).await;
+        if let Some(rec) = got["recommendations"].as_array().and_then(|r| r.first()) {
+            break rec.clone();
+        }
+        assert!(Instant::now() < deadline, "no recommendation: {got}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(first["vm_name"], "web");
+    assert_eq!(first["to"], b.id.to_string());
+    // 추천은 리더 노드에서만 적용한다(리더 메모리의 HA 검사·균형 조정기 상태로 다시 본다).
+    let follower_admin = login_at(&follower.base, "admin", ADMIN_PASSWORD).await;
+    let path = format!(
+        "/placement/recommendations/{}/apply",
+        first["id"].as_str().unwrap()
+    );
+    let (status, body) = follower_admin.post(&path, serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "recommendation_stale", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("applied on the leader node"),
+        "{body}"
+    );
+
+    // 리더를 투표 멤버에서 빼 다른 노드가 리더가 되게 한다.
+    leader
+        .cluster
+        .change_membership([NodeId(follower.id)].into())
+        .await
+        .unwrap();
+    let deadline = Instant::now() + WAIT * 3;
+    loop {
+        let got = read(follower).await;
+        let recs = got["recommendations"].as_array().unwrap();
+        if got["leader"] == follower.id.to_string() && !recs.is_empty() {
+            assert_eq!(recs[0]["vm_name"], "web");
+            assert_ne!(recs[0]["id"], first["id"], "{got}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new leader did not recommend: {got}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    loader.abort();
+    for b in balancers {
+        b.shutdown().await;
+    }
 }

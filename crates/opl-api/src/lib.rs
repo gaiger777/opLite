@@ -10,6 +10,7 @@ mod backup_jobs;
 mod backup_receive;
 mod backups;
 pub mod balance;
+mod balancer;
 pub mod cluster;
 mod console;
 mod drain;
@@ -73,6 +74,7 @@ pub use api_cert::{ApiCertAgent, ApiCertError};
 pub use audit::{AuditConfig, AuditLog};
 pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
 pub use backup_jobs::{BackupJobScheduler, BackupJobSchedulerConfig};
+pub use balancer::{Balancer, BalancerConfig};
 pub use drain::start_drain;
 pub use firmware::UefiVarsFetcher;
 pub use ha::{HaManager, HaManagerConfig, LEASE_EXPIRED, RecoveryWriter};
@@ -210,6 +212,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             ha_checks::delete_ha_check
         ))
         .routes(routes!(placement_api::get_placement))
+        .routes(routes!(placement_api::list_recommendations))
+        .routes(routes!(placement_api::apply_recommendation))
         .routes(routes!(
             r::list_placement_rules,
             placement_rules::create_placement_rule

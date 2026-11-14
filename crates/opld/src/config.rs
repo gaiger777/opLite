@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opl_api::{
-    AuditConfig, BackupJobSchedulerConfig, ClusterJanitorConfig, Fencer, RemotePollerConfig,
-    SnapshotSchedulerConfig, TelemetryConfig, UpdatesConfig, VipAgentConfig,
+    AuditConfig, BackupJobSchedulerConfig, BalancerConfig, ClusterJanitorConfig, Fencer,
+    RemotePollerConfig, SnapshotSchedulerConfig, TelemetryConfig, UpdatesConfig, VipAgentConfig,
 };
 use opl_driver::{NetFs, VipAddress};
 use opl_qemu::{Accel, HostProfile, kvm_available};
@@ -90,8 +90,8 @@ pub struct Config {
     pub web: WebSection,
     #[serde(default)]
     pub node: NodeSection,
-    /// 시험 빌드(`starve-it`·`ha-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
-    #[cfg(any(feature = "starve-it", feature = "ha-it"))]
+    /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
+    #[cfg(any(feature = "starve-it", feature = "ha-it", feature = "migration-it"))]
     #[serde(default)]
     pub test: TestSection,
 }
@@ -463,6 +463,20 @@ impl Config {
         self.ha.node_ha()
     }
 
+    /// 균형 조정기 설정. 시험 빌드(`migration-it`)는 `[test] placement_interval_secs`로 회차 간격을 줄이고 1초마다
+    /// 확인한다.
+    pub fn balancer_config(&self) -> BalancerConfig {
+        #[cfg(feature = "migration-it")]
+        if let Some(secs) = self.test.placement_interval_secs {
+            return BalancerConfig {
+                tick: Duration::from_secs(1),
+                interval: Duration::from_secs(secs),
+                ..BalancerConfig::default()
+            };
+        }
+        BalancerConfig::default()
+    }
+
     /// HA 검사기가 읽는 sysfs·procfs의 뿌리. 시험 빌드(`ha-it`)는 `[test] health_root` 아래의 가짜 트리를 쓴다.
     pub fn checker_net(&self) -> NetFs {
         #[cfg(feature = "ha-it")]
@@ -814,8 +828,8 @@ fn default_runtime_threads() -> usize {
     (cpus / 2).max(2)
 }
 
-/// 시험 고리(시험 빌드에만): 굶김 시험(설계 §3.4)과 호스트 종료 정책 시험
-#[cfg(any(feature = "starve-it", feature = "ha-it"))]
+/// 시험 고리(시험 빌드에만): 굶김 시험(설계 §3.4), 호스트 종료 정책 시험, 균형 조정기 간격(마이그레이션 시험)
+#[cfg(any(feature = "starve-it", feature = "ha-it", feature = "migration-it"))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestSection {
@@ -824,6 +838,7 @@ pub struct TestSection {
     #[serde(default)]
     pub block_api_ms: u64,
     /// 종료 신호를 받았을 때 systemd에 묻지 않고 이 호스트 종료로 본다(`reboot`·`poweroff`).
+    #[cfg(any(feature = "starve-it", feature = "ha-it"))]
     #[serde(default)]
     pub host_shutdown: Option<crate::shutdown::HostShutdown>,
     /// 등록할 때 알리는 `recover_after_secs`의 여유(초, 기본 2). 늘리면 리더가 리스를 기다리는 대신 전원 끄기
@@ -835,6 +850,10 @@ pub struct TestSection {
     #[cfg(feature = "ha-it")]
     #[serde(default)]
     pub health_root: Option<PathBuf>,
+    /// 균형 조정기의 회차 간격(초, 기본 300). 리더가 된 뒤 첫 회차도 이만큼 뒤다.
+    #[cfg(feature = "migration-it")]
+    #[serde(default)]
+    pub placement_interval_secs: Option<u64>,
 }
 
 #[cfg(feature = "starve-it")]
@@ -1993,6 +2012,26 @@ mod tests {
             assert_eq!(ha.fence_after_secs, Some(10));
         }
         #[cfg(not(feature = "ha-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] placement_interval_secs`는 `migration-it` 빌드에만 있고 균형 조정기의 회차 간격을 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_placement_interval_only_in_migration_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(
+            parse(text).balancer_config().interval,
+            Duration::from_secs(300)
+        );
+        let parsed =
+            toml::from_str::<Config>(&format!("{text}[test]\nplacement_interval_secs = 5"));
+        #[cfg(feature = "migration-it")]
+        {
+            let config = parsed.unwrap().balancer_config();
+            assert_eq!(config.interval, Duration::from_secs(5));
+            assert_eq!(config.tick, Duration::from_secs(1));
+        }
+        #[cfg(not(feature = "migration-it"))]
         assert!(parsed.is_err());
     }
 
