@@ -974,6 +974,7 @@ mod tests {
             node: None,
             snapshot_schedule: None,
             ha: None,
+            placement: None,
         }
     }
 

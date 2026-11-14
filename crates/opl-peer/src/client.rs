@@ -26,6 +26,7 @@ use opl_cluster::{
 use opl_types::audit::{AuditEntry, AuditQuery};
 use opl_types::fence::FenceMethodStatus;
 use opl_types::metrics::MetricsQuery;
+use opl_types::placement::PlacementStatus;
 use tokio::runtime::Handle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
@@ -40,6 +41,7 @@ use crate::migration::{
     IncomingError, IncomingMigration, MigrateIncomingRequest, MigrateIncomingResponse,
 };
 use crate::pki::NodeTls;
+use crate::placement::PlacementRequest;
 use crate::proto::peer_client::PeerClient;
 use crate::wire::FollowRequest;
 use crate::{
@@ -612,6 +614,31 @@ impl Peers {
             .await;
         match reply {
             Ok(reply) => Ok(Some(reply.into_inner().methods)),
+            Err(s) if s.code() == Code::Unimplemented => Ok(None),
+            Err(s) => Err(s),
+        }
+    }
+}
+
+impl Peers {
+    /// 노드 `leader`(첫 링크 `addr`)에게 최적 배치 상태를 읽는다. 그 노드가 이 RPC를 모르면(옛 노드나 상태를 두지
+    /// 않는 노드) None이다. 리더가 아니면 `failed_precondition`이다.
+    pub async fn read_placement(
+        &self,
+        leader: NodeId,
+        addr: &str,
+        timeout: Duration,
+    ) -> Result<Option<PlacementStatus>, Status> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(PlacementRequest {});
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(leader));
+                async move { within(timeout, client.read_placement(req)).await }
+            })
+            .await;
+        match reply {
+            Ok(reply) => Ok(Some(reply.into_inner())),
             Err(s) if s.code() == Code::Unimplemented => Ok(None),
             Err(s) => Err(s),
         }

@@ -7,6 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::resource::{Kind, Resource, ResourceSpec, validate_name};
+use crate::settings::PlacementSettings;
 
 pub type HaGroup = Resource<HaGroupSpec, HaGroupStatus>;
 pub type PlacementRule = Resource<PlacementRuleSpec, PlacementRuleStatus>;
@@ -374,6 +375,114 @@ impl LoadSummary {
             self.vms.truncate(MAX_LOAD_VMS);
         }
     }
+}
+
+/// 최적 배치 상태(`GET /placement`): 리더가 아는 노드 부하와 균형 조정기의 마지막 결과. 리더가 만들고 다른 노드는
+/// 노드 사이 RPC(`ReadPlacement`)로 읽는다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PlacementStatus {
+    /// 이 상태를 만든 리더
+    pub leader: Uuid,
+    pub settings: PlacementSettings,
+    /// 균형 조정기가 마지막으로 돈 시각(유닉스 초)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub last_run: Option<u64>,
+    /// 다음에 돌 시각(유닉스 초)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub next_run: Option<u64>,
+    /// 마지막 실행의 불균형
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub imbalance: Option<ImbalanceView>,
+    /// 균형 조정기가 쉬는 이유
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub paused: Option<String>,
+    /// 노드마다의 부하(이름 순)
+    pub nodes: Vec<NodeLoadView>,
+    /// 추천한(auto면 한) 옮기기
+    pub recommendations: Vec<PlacementMove>,
+}
+
+/// 불균형(0.1% 단위): 노드 CPU·메모리 사용률의 표준편차와 그 평균
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ImbalanceView {
+    pub cpu_pct: u16,
+    pub mem_pct: u16,
+    pub total_pct: u16,
+}
+
+/// 노드 하나의 부하. 백분율은 0.1% 단위다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NodeLoadView {
+    pub node: Uuid,
+    pub name: String,
+    /// 지난 1분·5분 노드 CPU 사용률(요약이 없으면 없음)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu1_pct: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu5_pct: Option<u16>,
+    /// 실제 사용 메모리(요약)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub mem_used_mib: Option<u64>,
+    /// 자리 잡은 VM에 할당한 메모리
+    pub mem_allocated_mib: u64,
+    pub mem_total_mib: u64,
+    /// 점수가 보는 CPU·메모리 사용률(요약이 없으면 다른 노드 평균 CPU·할당 메모리)
+    pub cpu_use_pct: u16,
+    pub mem_use_pct: u16,
+    /// 자리 잡은 VM 수
+    pub vms: u32,
+    /// 부하 요약의 나이(초). 없으면 신선한 요약이 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub age_secs: Option<u32>,
+}
+
+/// 균형 조정기의 옮기기 하나
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PlacementMove {
+    /// 추천 id(적용할 때 쓴다)
+    pub id: Uuid,
+    pub vm: Uuid,
+    pub vm_name: String,
+    pub from: Uuid,
+    pub from_name: String,
+    pub to: Uuid,
+    pub to_name: String,
+    pub reason: MoveReason,
+    /// 줄어드는 불균형(0.1% 단위)
+    pub gain_pct: u16,
+    /// 비용: 옮길 메모리(MiB)
+    pub cost_mib: u64,
+    /// 바로잡는 hard 규칙(`rule`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub rules: Vec<String>,
+    /// auto가 만든 마이그레이션 Task
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub task: Option<Uuid>,
+}
+
+/// 옮기는 이유
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum MoveReason {
+    /// 부하 불균형을 줄인다.
+    Balance,
+    /// 지금 노드에서 어기는 hard 규칙을 바로잡는다.
+    Rule,
 }
 
 #[cfg(test)]
@@ -744,5 +853,89 @@ mod tests {
         let before = small.clone();
         small.truncate_vms();
         assert_eq!(small, before);
+    }
+
+    /// 상태의 없는 값은 쓰지 않고, 값은 왕복한다.
+    #[test]
+    fn placement_status_omits_missing_values() {
+        let node = NodeLoadView {
+            node: Uuid::from_u128(1),
+            name: "a".into(),
+            cpu1_pct: None,
+            cpu5_pct: None,
+            mem_used_mib: None,
+            mem_allocated_mib: 1024,
+            mem_total_mib: 8192,
+            cpu_use_pct: 0,
+            mem_use_pct: 125,
+            vms: 1,
+            age_secs: None,
+        };
+        let status = PlacementStatus {
+            leader: Uuid::from_u128(1),
+            settings: PlacementSettings::default(),
+            last_run: None,
+            next_run: None,
+            imbalance: None,
+            paused: None,
+            nodes: vec![node.clone()],
+            recommendations: vec![],
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "leader": Uuid::from_u128(1),
+                "settings": {},
+                "nodes": [{
+                    "node": Uuid::from_u128(1), "name": "a", "mem_allocated_mib": 1024,
+                    "mem_total_mib": 8192, "cpu_use_pct": 0, "mem_use_pct": 125, "vms": 1
+                }],
+                "recommendations": []
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<PlacementStatus>(json).unwrap(),
+            status
+        );
+        let full = PlacementStatus {
+            last_run: Some(10),
+            next_run: Some(310),
+            imbalance: Some(ImbalanceView {
+                cpu_pct: 182,
+                mem_pct: 238,
+                total_pct: 210,
+            }),
+            paused: Some("mode is off".into()),
+            nodes: vec![NodeLoadView {
+                cpu1_pct: Some(900),
+                cpu5_pct: Some(850),
+                mem_used_mib: Some(4096),
+                age_secs: Some(3),
+                ..node
+            }],
+            recommendations: vec![PlacementMove {
+                id: Uuid::from_u128(5),
+                vm: Uuid::from_u128(6),
+                vm_name: "web".into(),
+                from: Uuid::from_u128(1),
+                from_name: "a".into(),
+                to: Uuid::from_u128(2),
+                to_name: "b".into(),
+                reason: MoveReason::Rule,
+                gain_pct: 0,
+                cost_mib: 2048,
+                rules: vec!["pin".into()],
+                task: Some(Uuid::from_u128(7)),
+            }],
+            ..status
+        };
+        let json = serde_json::to_value(&full).unwrap();
+        assert_eq!(json["recommendations"][0]["reason"], "rule");
+        assert_eq!(json["nodes"][0]["age_secs"], 3);
+        assert_eq!(
+            serde_json::from_value::<PlacementStatus>(json).unwrap(),
+            full
+        );
     }
 }

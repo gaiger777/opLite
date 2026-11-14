@@ -30,6 +30,8 @@ mod node_fence;
 pub mod oidc;
 mod oidc_login;
 pub mod placement;
+mod placement_api;
+pub mod placement_board;
 mod placement_rules;
 pub mod power_fence;
 pub mod proxy;
@@ -76,6 +78,7 @@ pub use ha::{HaManager, HaManagerConfig, LEASE_EXPIRED, RecoveryWriter};
 pub use health::RuntimeProbe;
 pub use incoming::{IncomingConfig, IncomingMigrations};
 pub use janitor::{ClusterJanitor, ClusterJanitorConfig};
+pub use placement_board::{PlacementBoard, PlacementStatusSource};
 pub use power_fence::{FenceStatusSource, Fencer, PowerFence, PowerOff, power_off};
 pub use remotes::{RemotePoller, RemotePollerConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
@@ -205,6 +208,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             ha_checks::update_ha_check,
             ha_checks::delete_ha_check
         ))
+        .routes(routes!(placement_api::get_placement))
         .routes(routes!(
             r::list_placement_rules,
             placement_rules::create_placement_rule

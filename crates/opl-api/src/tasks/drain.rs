@@ -77,8 +77,9 @@ pub(super) async fn drain(ctx: &Ctx, node: Uuid) -> Result<(), String> {
             Some("busy".to_string())
         } else {
             // 회차마다 리더가 아는 부하를 다시 읽는다. 옮기는 VM 자신의 부하는 모름으로 둔다.
-            let loads = score::loads(&state).await.without_vms();
-            let scorer = Scorer { loads: &loads };
+            let mut scoring = score::scorer(&state, true).await;
+            scoring.loads = scoring.loads.without_vms();
+            let scorer = scoring.scorer();
             match move_vm(ctx, &state, node, &vm, &not_moved, &scorer).await? {
                 Outcome::Moved => {
                     moved.insert(vm.id);

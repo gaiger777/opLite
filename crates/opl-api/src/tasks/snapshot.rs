@@ -881,9 +881,10 @@ async fn write_reverted_spec(ctx: &Ctx, vm_id: Uuid, snapshot: &Snapshot) -> Res
         }
         let mut spec = snapshot.spec.vm_spec.clone();
         spec.node = vm.spec.node;
-        // 예약과 HA는 스냅샷 때의 것이 아니라 지금 것을 지킨다.
+        // 예약·HA·고정은 스냅샷 때의 것이 아니라 지금 것을 지킨다.
         spec.snapshot_schedule = vm.spec.snapshot_schedule;
         spec.ha = vm.spec.ha.clone();
+        spec.placement = vm.spec.placement;
         if snapshot.spec.memory && spec.node.is_none() {
             // 이 노드의 arch가 머신과 다르면 여기서 시작할 수 없다. 다른 노드로 보내면 메모리 상태를
             // 이어 쓸 수 없으므로 고정하지 않고 Task를 실패로 끝낸다(디스크를 건드리기 전이다).

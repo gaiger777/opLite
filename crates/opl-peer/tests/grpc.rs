@@ -16,16 +16,18 @@ use opl_peer::pki::{ClusterCa, NodeTls, api_cert, node_key_and_csr};
 use opl_peer::{
     AuditSource, FenceSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration,
     LEASE_LIVENESS, MetricsReply, MetricsSource, MigrateIncomingRequest, MigrateIncomingResponse,
-    MigrationReceiver, NodeMonitor, NodeMonitorConfig, PeerService, Peers, UefiVarsError,
-    renew_liveness,
+    MigrationReceiver, NodeMonitor, NodeMonitorConfig, PeerService, Peers, PlacementSource,
+    UefiVarsError, renew_liveness,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
 use opl_types::fence::{FenceKind, FenceMethodStatus, Power};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries};
 use opl_types::node::{NodeSpec, NodeStatus};
+use opl_types::placement::{NodeLoadView, PlacementStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
+use opl_types::settings::PlacementSettings;
 use opl_types::storage::{Volume, VolumeSpec};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -85,6 +87,33 @@ impl Node {
         work: Option<tokio::runtime::Handle>,
         fence: Option<Arc<dyn FenceSource>>,
     ) -> Node {
+        Self::start_serving(ca, root, |mut service| {
+            if let Some(migrations) = migrations {
+                service = service.with_migrations(migrations);
+            }
+            if let Some(audit) = audit {
+                service = service.with_audit(audit);
+            }
+            if let Some(metrics) = metrics {
+                service = service.with_metrics(metrics);
+            }
+            if let Some(work) = work {
+                service = service.with_work(work);
+            }
+            if let Some(fence) = fence {
+                service = service.with_fence(fence);
+            }
+            service
+        })
+        .await
+    }
+
+    /// 노드 간 서버를 `configure`로 고친 서비스로 띄운다.
+    async fn start_serving(
+        ca: &ClusterCa,
+        root: &TempDir,
+        configure: impl FnOnce(PeerService) -> PeerService,
+    ) -> Node {
         let id = NodeId(Uuid::now_v7());
         let tls = tls_for(ca, id);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -106,24 +135,10 @@ impl Node {
         );
         let hv = Arc::new(MockHypervisor::default());
         let state_dir = root.path().join(format!("{id}-state"));
-        let mut service =
+        let service = configure(
             PeerService::new(cluster.clone(), Some(hv.clone() as Arc<dyn Hypervisor>))
-                .with_uefi_vars(&state_dir);
-        if let Some(migrations) = migrations {
-            service = service.with_migrations(migrations);
-        }
-        if let Some(audit) = audit {
-            service = service.with_audit(audit);
-        }
-        if let Some(metrics) = metrics {
-            service = service.with_metrics(metrics);
-        }
-        if let Some(work) = work {
-            service = service.with_work(work);
-        }
-        if let Some(fence) = fence {
-            service = service.with_fence(fence);
-        }
+                .with_uefi_vars(&state_dir),
+        );
         let (stop, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             opl_peer::serve(listener, &tls, service, async {
@@ -1450,6 +1465,105 @@ async fn fence_status_is_read_by_a_member() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
     assert_eq!(fence.asked.lock().unwrap().len(), 2);
+}
+
+/// 정해 둔 상태를 돌려주고, 리더가 아니면(`leader`가 거짓) 오류인 최적 배치 상태
+struct FakePlacement {
+    status: PlacementStatus,
+    leader: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl PlacementSource for FakePlacement {
+    async fn status(&self) -> Result<PlacementStatus, String> {
+        if !self.leader.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("not the leader".into());
+        }
+        Ok(self.status.clone())
+    }
+}
+
+#[tokio::test]
+async fn placement_is_read_from_the_leader() {
+    let (ca, root, nodes) = start(1).await;
+    let status = PlacementStatus {
+        leader: Uuid::from_u128(1),
+        settings: PlacementSettings::default(),
+        last_run: Some(5),
+        next_run: None,
+        imbalance: None,
+        paused: None,
+        nodes: vec![NodeLoadView {
+            node: Uuid::from_u128(1),
+            name: "a".into(),
+            cpu1_pct: Some(900),
+            cpu5_pct: Some(850),
+            mem_used_mib: Some(4096),
+            mem_allocated_mib: 2048,
+            mem_total_mib: 8192,
+            cpu_use_pct: 850,
+            mem_use_pct: 500,
+            vms: 2,
+            age_secs: Some(1),
+        }],
+        recommendations: vec![],
+    };
+    let source = Arc::new(FakePlacement {
+        status: status.clone(),
+        leader: true.into(),
+    });
+    let placement = source.clone();
+    let target = Node::start_serving(&ca, &root, move |s| s.with_placement(placement)).await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+            addrs: vec![],
+        })
+        .await
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(nodes[0].id()) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let peers = &nodes[0].peers;
+    let got = peers
+        .read_placement(target.id(), &target.addr, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(got, Some(status));
+    // 리더가 아니면 `failed_precondition`이다.
+    source
+        .leader
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let err = peers
+        .read_placement(target.id(), &target.addr, WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert!(err.message().contains("not the leader"), "{err:?}");
+
+    // 상태를 두지 않는 노드(옛 노드처럼)는 None이다.
+    let none = target
+        .peers
+        .read_placement(nodes[0].id(), &nodes[0].addr, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+    // 멤버가 아닌 노드의 요청은 거절된다.
+    let outsider = Node::start(&ca, &root).await;
+    let err = outsider
+        .peers
+        .read_placement(target.id(), &target.addr, WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
 }
 
 /// 리더가 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`)을 `observers`(id, 클러스터 주소)로 바꾼다(없으면

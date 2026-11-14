@@ -14,6 +14,7 @@ use crate::auth::{Authorizer, RoleAuthorizer, Sessions};
 use crate::health::RuntimeProbe;
 use crate::limit::AttemptLimiter;
 use crate::oidc::OidcCache;
+use crate::placement_board::PlacementBoard;
 use crate::power_fence::{Fencer, PowerFence};
 use crate::vm_imports::ImportCredentials;
 
@@ -60,6 +61,10 @@ pub struct AppState {
     pub runtimes: Option<Arc<dyn RuntimeProbe>>,
     /// 노드 전원 끄기 펜싱의 실행기(`fence-test`, 리더의 끄기). 기본은 PATH의 `ipmitool`을 쓰는 [`Fencer`]다.
     pub fence: Arc<dyn PowerFence>,
+    /// 균형 조정기의 마지막 결과(리더일 때). 노드 사이 RPC(`ReadPlacement`)의 답과 같은 것을 쓴다.
+    pub placement: Arc<PlacementBoard>,
+    /// 리더에 점수용 부하를 묻지 못했을 때 다시 묻지 않는 끝(`score::scorer`)
+    pub(crate) placement_backoff: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl AppState {
@@ -91,6 +96,8 @@ impl AppState {
             ha: None,
             runtimes: None,
             fence: Arc::new(Fencer::default()),
+            placement: Arc::default(),
+            placement_backoff: Default::default(),
         }
     }
 }

@@ -13,6 +13,7 @@ use opl_cluster::{Cluster, FollowFrame, FollowGate};
 use opl_driver::{DriverError, Hypervisor, uefi_vars_path};
 use opl_types::audit::AuditQuery;
 use opl_types::metrics::MetricsQuery;
+use opl_types::placement::PlacementStatus;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::runtime::Handle;
@@ -28,6 +29,7 @@ use crate::firmware::{UefiVarsChunk, UefiVarsRequest};
 use crate::metrics::{MetricsReply, MetricsSource};
 use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
 use crate::pki::{NodeTls, node_id_of};
+use crate::placement::{PlacementRequest, PlacementSource};
 use crate::proto::peer_server::{Peer, PeerServer};
 use crate::wire::{
     AppendEntriesReply, AppendEntriesRequest, FollowRequest, IncomingReply, InstallSnapshotReply,
@@ -47,6 +49,7 @@ pub struct PeerService {
     audit: Option<Arc<dyn AuditSource>>,
     metrics: Option<Arc<dyn MetricsSource>>,
     fence: Option<Arc<dyn FenceSource>>,
+    placement: Option<Arc<dyn PlacementSource>>,
     /// 드라이버의 `state_dir`. UEFI 변수 파일을 여기서 찾아 보낸다.
     state_dir: Option<PathBuf>,
     /// Raft·리스가 아닌 처리(마이그레이션 받기, 콘솔 중계, UEFI 변수·감사 로그·지표 읽기)를 돌릴
@@ -64,6 +67,7 @@ impl PeerService {
             audit: None,
             metrics: None,
             fence: None,
+            placement: None,
             state_dir: None,
             work: None,
         }
@@ -104,6 +108,12 @@ impl PeerService {
     /// 같다).
     pub fn with_fence(mut self, source: Arc<dyn FenceSource>) -> Self {
         self.fence = Some(source);
+        self
+    }
+
+    /// 리더면 최적 배치 상태를 `source`가 만들어 준다. 없으면 `unimplemented`로 거부한다(옛 노드와 같다).
+    pub fn with_placement(mut self, source: Arc<dyn PlacementSource>) -> Self {
+        self.placement = Some(source);
         self
     }
 
@@ -307,6 +317,22 @@ impl Peer for PeerService {
             .await?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(FenceStatusReply { methods }))
+    }
+
+    async fn read_placement(
+        &self,
+        req: Request<PlacementRequest>,
+    ) -> Result<Response<PlacementStatus>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .placement
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not keep placement"))?;
+        let status = self
+            .offload(async move { source.status().await })
+            .await?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(status))
     }
 
     type UefiVarsStream = ReceiverStream<Result<UefiVarsChunk, Status>>;

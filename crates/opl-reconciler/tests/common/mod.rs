@@ -125,6 +125,7 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
             node: Some(node),
             snapshot_schedule: None,
             ha: None,
+            placement: None,
         },
     )
 }

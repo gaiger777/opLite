@@ -756,7 +756,8 @@ pub(crate) mod tests {
                 "multi-link",
                 "ha-placement",
                 "fast-ha",
-                "ha-checks"
+                "ha-checks",
+                "placement"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -785,7 +786,8 @@ pub(crate) mod tests {
                 "multi-link",
                 "ha-placement",
                 "fast-ha",
-                "ha-checks"
+                "ha-checks",
+                "placement"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -833,7 +835,8 @@ pub(crate) mod tests {
                 "multi-link",
                 "ha-placement",
                 "fast-ha",
-                "ha-checks"
+                "ha-checks",
+                "placement"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1056,6 +1059,7 @@ pub(crate) mod tests {
                     "ha-placement".into(),
                     "fast-ha".into(),
                     "ha-checks".into(),
+                    "placement".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

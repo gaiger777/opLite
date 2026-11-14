@@ -83,6 +83,12 @@ fn main() {
             "crate::fence::FenceStatusRequest",
             "crate::fence::FenceStatusReply",
         ))
+        .method(json(
+            "read_placement",
+            "ReadPlacement",
+            "crate::placement::PlacementRequest",
+            "opl_types::placement::PlacementStatus",
+        ))
         .method(
             Method::builder()
                 .name("uefi_vars")

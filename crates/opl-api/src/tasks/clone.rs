@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use opl_cluster::ClusterError;
 use opl_driver::uefi_vars_path;
-use opl_types::node::NodeSpec;
+use opl_types::node::{NodeSpec, PLACEMENT};
 use opl_types::placement::HaGroupSpec;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -229,7 +229,7 @@ pub(super) async fn clone(
 }
 
 /// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, 노드·예약 없이 꺼진
-/// VM이다. 성공하면 Task가 만든 것을 더는 정리하지 않는다.
+/// VM이다. `placement`를 모르는 노드가 있으면 VM 고정을 버린다. 성공하면 Task가 만든 것을 더는 정리하지 않는다.
 pub(super) async fn create_vm(ctx: &Ctx, task: &Task, mut new: Vm) -> Result<(), String> {
     let name = new.name.clone();
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
@@ -260,6 +260,14 @@ pub(super) async fn create_vm(ctx: &Ctx, task: &Task, mut new: Vm) -> Result<(),
         if let Some(ha) = new.spec.ha.as_mut() {
             ha.group = None;
         }
+    }
+    // 복제본은 원본의 VM 고정(`placement`)을 받는다. 옛 노드는 그것을 풀지 못하므로 그 노드가 있으면 버린다.
+    if new.spec.placement.is_some()
+        && !crate::cluster::missing_feature(&ctx.cluster, PLACEMENT)
+            .map_err(|e| e.to_string())?
+            .is_empty()
+    {
+        new.spec.placement = None;
     }
     // 이름이나 MAC이 그새 쓰였으면 저장소가 거부한다.
     if let Err(e) = ctx.cluster.create(&new).await {

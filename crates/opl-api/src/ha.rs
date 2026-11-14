@@ -32,6 +32,7 @@ use opl_cluster::{Cluster, ClusterError, Leases, Typed};
 use opl_types::fence::NodeFenceSpec;
 use opl_types::node::{FAST_HA, HA_CHECKS, Node, NodeSpec, ha_capable};
 use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::settings::PlacementPolicy;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
     DEFAULT_HA_PRIORITY, HaState, PowerState, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus,
@@ -472,9 +473,13 @@ fn plan(
     now: Instant,
     b: Instant,
     down: &BTreeSet<Uuid>,
+    policy: PlacementPolicy,
 ) -> Plans {
-    let loads = Loads::from_leases(leases, now);
-    let scorer = Scorer { loads: &loads };
+    let loads = Loads::from_leases(leases, &inv.nodes, now);
+    let scorer = Scorer {
+        loads: &loads,
+        policy,
+    };
     let mut targets = BTreeMap::new();
     for node in inv.nodes.iter().filter(|n| n.status.ha.is_some()) {
         let mut vms: Vec<&Vm> = inv
@@ -636,13 +641,19 @@ async fn tick(
     let leases = cluster.leases();
     let now = Instant::now();
     let b = base_at(base, leases.term, now);
-    // 노드가 리스 갱신에 실어 보낸 부하 요약. 이 틱의 모든 대상 고르기가 쓴다.
-    let loads = Loads::from_leases(&leases, now);
-    let scorer = Scorer { loads: &loads };
     finish_moved(ctx, moved).await;
     resend(ctx, unknown).await;
     let Ok(inv) = Inventory::load(cluster) else {
         return;
+    };
+    // 노드가 리스 갱신에 실어 보낸 부하 요약과 배치 정책. 이 틱의 모든 대상 고르기가 쓴다.
+    let loads = Loads::from_leases(&leases, &inv.nodes, now);
+    let policy = crate::settings::current(cluster)
+        .map(|s| s.spec.placement().policy)
+        .unwrap_or_default();
+    let scorer = Scorer {
+        loads: &loads,
+        policy,
     };
     let Ok(health) = Health::load(cluster, &leases) else {
         return;
@@ -674,7 +685,7 @@ async fn tick(
     }
     if !recovering && plans.due(now, config.plan_every) {
         let (inv, leases, down) = (inv.clone(), leases.clone(), down.clone());
-        planner.start(move || plan(&inv, &leases, now, b, &down));
+        planner.start(move || plan(&inv, &leases, now, b, &down, policy));
     }
     for node in failed {
         let plan = plans.of(node, now, config.plan_every);
@@ -723,7 +734,7 @@ async fn tick(
         let place = Place {
             inv: &inv,
             leases: &leases,
-            loads: &loads,
+            scorer,
             now,
             b,
         };
@@ -2058,6 +2069,7 @@ mod tests {
                     priority,
                     ..Default::default()
                 }),
+                placement: None,
             },
         )
     }

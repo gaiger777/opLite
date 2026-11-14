@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::network::USER_NETWORK;
-use opl_types::node::{FAST_HA, HA_PLACEMENT, Node, NodeSpec, ha_capable};
+use opl_types::node::{FAST_HA, HA_PLACEMENT, Node, NodeSpec, PLACEMENT, ha_capable};
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
@@ -132,6 +132,11 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     // 우선순위·게스트 감시는 계획 50 노드도 풀지 못한다.
     if spec.ha.as_ref().is_some_and(VmHa::uses_fast_ha) {
         require_feature(&state.cluster, FAST_HA)?;
+    }
+    // 고정하지 않음(`pinned: false`)은 쓰지 않아 옛 VM 모양 그대로 둔다. 고정은 옛 노드가 풀지 못한다.
+    spec.placement = spec.placement.filter(|p| p.pinned);
+    if spec.placement.is_some() {
+        require_feature(&state.cluster, PLACEMENT)?;
     }
     if let Some(group) = spec.ha.as_ref().and_then(|ha| ha.group.as_ref())
         && !inv.groups.iter().any(|g| &g.name == group)
@@ -337,6 +342,22 @@ pub(crate) fn check_node_arch(node: &Node, spec: &VmSpec) -> Result<(), ApiError
     Ok(())
 }
 
+/// 시작이 노드를 고를 수 있다: 노드가 없거나, 그 노드가 유지보수 중이거나 hard 배치 규칙을 어긴다(아래 시작의
+/// 닫힘과 같은 조건 — 잠그기 전에 보므로 그사이 바뀌면 부하 없이 고른다). 그때만 점수용 부하를 읽는다.
+fn start_picks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
+    let Some(node) = vm.spec.node else {
+        return Ok(true);
+    };
+    let Some(node) = state.cluster.get::<NodeSpec>(node)? else {
+        return Ok(false);
+    };
+    if node.spec.maintenance {
+        return Ok(true);
+    }
+    let inv = Inventory::load(&state.cluster)?;
+    Ok(!hard_violations(vm, &node, &inv, &Assign::default()).is_empty())
+}
+
 /// 빠진 MAC을 채우고, 켜진 채로 만들면 노드를 고른다.
 #[utoipa::path(post, path = "/vms", tag = "vms",
     request_body = CreateRequest<VmSpec>,
@@ -350,10 +371,11 @@ pub async fn create_vm(
     check_name(&req.name)?;
     let mut vm: Vm = Resource::new(req.name, req.spec);
     vm.labels = req.labels;
-    // 부하는 잠그기 전에 읽는다(리더가 아니면 리더에 물을 수 있다).
-    let loads = score::loads(&state).await;
+    // 부하는 잠그기 전에 읽는다(리더가 아니면 리더에 물을 수 있다). 켜진 채 노드 없이 만들 때만 노드를 고른다.
+    let picks = vm.spec.power == PowerState::Running && vm.spec.node.is_none();
+    let scoring = score::scorer(&state, picks).await;
     let _lock = state.vm_lock.lock().await;
-    prepare(&state, &mut vm, &Scorer { loads: &loads })?;
+    prepare(&state, &mut vm, &scoring.scorer())?;
     vm.revision = state.cluster.create(&vm).await?;
     Ok((StatusCode::CREATED, Json(vm)))
 }
@@ -374,7 +396,8 @@ pub async fn update_vm(
 ) -> Result<Json<Vm>, ApiError> {
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     let expected = if_match(&headers)?;
-    let loads = score::loads(&state).await;
+    let picks = req.spec.power == PowerState::Running && req.spec.node.is_none();
+    let scoring = score::scorer(&state, picks).await;
     for _ in 0..10 {
         let _lock = state.vm_lock.lock().await;
         let current = lookup::<VmSpec>(&state.cluster, &key)?;
@@ -392,7 +415,7 @@ pub async fn update_vm(
         let mut next = current.clone();
         next.spec = req.spec.clone();
         next.labels = req.labels.clone();
-        prepare(&state, &mut next, &Scorer { loads: &loads })?;
+        prepare(&state, &mut next, &scoring.scorer())?;
         let spec = next.spec;
         if spec.node != current.spec.node && !is_stopped(&current) {
             return Err(vm_running(&current, "move"));
@@ -561,8 +584,8 @@ pub async fn vm_action(
     let id = vm.id;
     let (op, vm) = match action.as_str() {
         "start" => {
-            let loads = score::loads(&state).await;
-            let scorer = Scorer { loads: &loads };
+            let scoring = score::scorer(&state, start_picks(&state, &vm)?).await;
+            let scorer = scoring.scorer();
             let _lock = state.vm_lock.lock().await;
             let vm = modify_spec(&state, id, |spec| {
                 // 배치 규칙은 VM의 이름·레이블로 고른다.

@@ -412,6 +412,7 @@ mod tests {
                     memory,
                 }),
                 ha: None,
+                placement: None,
             },
         );
         vm.status.phase = VmPhase::Running;

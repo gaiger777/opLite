@@ -64,6 +64,7 @@ async fn openapi_document_is_served_without_login() {
         "/ha-groups/{key}",
         "/placement-rules",
         "/placement-rules/{key}",
+        "/placement",
         "/vm-imports",
         "/vm-imports/{key}",
         "/vm-imports/{key}/run",

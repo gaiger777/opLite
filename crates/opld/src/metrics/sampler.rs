@@ -535,6 +535,7 @@ mod tests {
                 node: None,
                 snapshot_schedule: None,
                 ha: None,
+                placement: None,
             },
         );
         f.cluster.create(&vm).await.unwrap();

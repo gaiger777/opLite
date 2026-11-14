@@ -7,12 +7,13 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::node::{FAST_HA, HA_PLACEMENT};
+use opl_types::node::{FAST_HA, HA_PLACEMENT, PLACEMENT};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::{
     Channel, DEFAULT_HA_START_CONCURRENCY, HaReserve, MAX_HA_RESERVE_NODES, MAX_HA_RESERVE_PERCENT,
-    MAX_HA_START_CONCURRENCY, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus,
-    ShutdownPolicy, TelemetrySettings, VOTER_LIMITS,
+    MAX_HA_START_CONCURRENCY, MAX_PLACEMENT_THRESHOLD, PlacementMode, PlacementPolicy,
+    PlacementSettings, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus, ShutdownPolicy,
+    TelemetrySettings, VOTER_LIMITS,
 };
 use opl_types::subscription::SubscriptionState;
 use opl_types::version::TELEMETRY_URL;
@@ -79,6 +80,44 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default, minimum = 1, maximum = 32)]
     pub ha_start_concurrency: Option<u8>,
+    /// 최적 배치: 점수 정책, 균형 조정기의 동작, 불균형 문턱. 준 값만 바꾼다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub placement: Option<PlacementPatch>,
+}
+
+/// 최적 배치에서 바꿀 값
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementPatch {
+    /// `balance`(고르게, 기본)나 `pack`(적은 노드에 모음)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub policy: Option<PlacementPolicy>,
+    /// 균형 조정기: `off`, `recommend`(추천만, 기본), `auto`(스스로 옮김)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub mode: Option<PlacementMode>,
+    /// 불균형 문턱(백분율 1~50, 기본 15)
+    #[serde(default)]
+    #[schema(nullable = false, default, minimum = 1, maximum = 50)]
+    pub threshold: Option<u8>,
+}
+
+impl PlacementPatch {
+    /// 준 값만 `current`에 합친다.
+    fn apply(&self, mut current: PlacementSettings) -> PlacementSettings {
+        if let Some(policy) = self.policy {
+            current.policy = policy;
+        }
+        if let Some(mode) = self.mode {
+            current.mode = mode;
+        }
+        if let Some(threshold) = self.threshold {
+            current.threshold = threshold;
+        }
+        current
+    }
 }
 
 /// HA 용량 예약 바꾸기: `"none"`이나 예약
@@ -307,10 +346,18 @@ pub async fn patch_settings(
         && req.shutdown_policy.is_none()
         && req.ha_reserve.is_none()
         && req.ha_start_concurrency.is_none()
+        && req.placement.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve or ha_start_concurrency",
+            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency or placement",
         ));
+    }
+    if let Some(n) = req.placement.and_then(|p| p.threshold)
+        && !(1..=MAX_PLACEMENT_THRESHOLD).contains(&n)
+    {
+        return Err(ApiError::bad_request(format!(
+            "placement.threshold must be between 1 and {MAX_PLACEMENT_THRESHOLD} (got {n})"
+        )));
     }
     if let Some(HaReservePatch::Set(r)) = req.ha_reserve
         && !r.valid()
@@ -360,6 +407,10 @@ pub async fn patch_settings(
     if req.ha_reserve.is_some() || req.ha_start_concurrency.is_some() {
         crate::cluster::require_feature(&state.cluster, FAST_HA)?;
     }
+    // 옛 노드는 최적 배치 필드를 풀지 못한다.
+    if req.placement.is_some() {
+        crate::cluster::require_feature(&state.cluster, PLACEMENT)?;
+    }
     let used = if enterprise {
         crate::subscription::used_nodes(&state.cluster)?
     } else {
@@ -403,6 +454,11 @@ pub async fn patch_settings(
         // 기본(4)은 쓰지 않는다.
         if let Some(n) = req.ha_start_concurrency {
             spec.ha_start_concurrency = (n != DEFAULT_HA_START_CONCURRENCY).then_some(n);
+        }
+        // 모두 기본값이면 쓰지 않는다.
+        if let Some(patch) = req.placement {
+            let placement = patch.apply(spec.placement());
+            spec.placement = (placement != PlacementSettings::default()).then_some(placement);
         }
         Ok(())
     })

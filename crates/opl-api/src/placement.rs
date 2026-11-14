@@ -111,11 +111,13 @@ pub fn candidates_with(
     found
 }
 
-/// 이 노드들 가운데 신선한 부하 요약이 있는 노드가 하나도 없다: 부하 점수를 쓰지 않는다([`level_scores`]).
+/// 이 노드들 가운데 신선한 부하 요약이 있는 노드가 하나도 없다: `balance` 점수를 쓰지 않는다([`level_scores`]).
+/// `pack`은 할당 메모리만으로도 모으므로 그대로 쓴다(부하를 보기 전의 순서가 없다).
 pub fn unscored(scorer: &Scorer, nodes: impl IntoIterator<Item = Uuid>) -> bool {
-    !nodes
-        .into_iter()
-        .any(|n| scorer.loads.nodes.contains_key(&n))
+    scorer.policy == opl_types::settings::PlacementPolicy::Balance
+        && !nodes
+            .into_iter()
+            .any(|n| scorer.loads.nodes.contains_key(&n))
 }
 
 /// 후보 가운데 신선한 부하 요약이 있는 노드가 하나도 없으면([`unscored`]) 점수를 모두 0으로 둔다. 그러면 순서가 남은
@@ -145,7 +147,7 @@ pub fn score_with(
         node: node.id,
         priority: group(vm, inv).and_then(|g| g.spec.priority(&node.name)),
         penalty: soft(vm, node, inv, assign).0,
-        score: score::score(after),
+        score: score::score(after, scorer.policy),
         free_mib: free_mib(vm, node, inv, assign),
     }
 }
@@ -443,6 +445,7 @@ mod tests {
                 node: node.map(|n| n.id),
                 snapshot_schedule: None,
                 ha: None,
+                placement: None,
             },
         )
     }
@@ -784,7 +787,10 @@ mod tests {
             nodes.insert(n.id, load);
         }
         let loads = score::Loads::new(nodes);
-        let busy = Scorer { loads: &loads };
+        let busy = Scorer {
+            loads: &loads,
+            ..Scorer::default()
+        };
         let found = candidates_with(&me, &inv, &none(), &busy);
         assert_eq!(found[0].node, n2.id);
         assert!(found[0].score > found[1].score);
@@ -821,7 +827,10 @@ mod tests {
         let mut nodes = BTreeMap::new();
         nodes.insert(big.id, score::NodeLoad::default());
         let loads = score::Loads::new(nodes);
-        let scorer = Scorer { loads: &loads };
+        let scorer = Scorer {
+            loads: &loads,
+            ..Scorer::default()
+        };
         let found = candidates_with(&me, &inv, &none(), &scorer);
         assert_eq!(found[0].node, big.id);
         assert!(found.iter().all(|c| c.score == 0), "{found:?}");
@@ -851,7 +860,10 @@ mod tests {
         let mut nodes = BTreeMap::new();
         nodes.insert(witness.id, score::NodeLoad::default());
         let loads = score::Loads::new(nodes);
-        let scorer = Scorer { loads: &loads };
+        let scorer = Scorer {
+            loads: &loads,
+            ..Scorer::default()
+        };
         assert_eq!(
             best(&candidates_with(&me, &inv, &none(), &scorer))
                 .unwrap()
@@ -866,12 +878,41 @@ mod tests {
         };
         nodes.insert(big.id, summary);
         let loads = score::Loads::new(nodes);
-        let scorer = Scorer { loads: &loads };
+        let scorer = Scorer {
+            loads: &loads,
+            ..Scorer::default()
+        };
         assert_eq!(
             best(&candidates_with(&me, &inv, &none(), &scorer))
                 .unwrap()
                 .node,
             small.id
+        );
+    }
+
+    #[test]
+    fn pack_without_summaries_still_packs_by_allocated_memory() {
+        // x는 비었고(남은 메모리 16384 MiB) y는 절반 찼다. 요약이 없어도 `pack`은 남은 메모리 순서로 돌아가지 않는다.
+        let (x, y) = (node("x", 16384, &[]), node("y", 8192, &[]));
+        let mut half = vm("half", None, PowerState::Running);
+        half.spec.node = Some(y.id);
+        half.spec.memory_mib = 4096;
+        let me = vm("me", None, PowerState::Running);
+        let inv = Inventory {
+            nodes: vec![x.clone(), y.clone()],
+            vms: vec![half],
+            ..Default::default()
+        };
+        assert_eq!(best(&candidates(&me, &inv, &none())).unwrap().node, x.id);
+        let pack = Scorer {
+            policy: opl_types::settings::PlacementPolicy::Pack,
+            ..Scorer::default()
+        };
+        assert_eq!(
+            best(&candidates_with(&me, &inv, &none(), &pack))
+                .unwrap()
+                .node,
+            y.id
         );
     }
 

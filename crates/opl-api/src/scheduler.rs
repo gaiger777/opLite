@@ -336,6 +336,7 @@ mod tests {
     use opl_types::placement::RuleKind;
     use opl_types::resource::Resource;
     use opl_types::runtime::ImageFormat;
+    use opl_types::settings::PlacementPolicy;
     use opl_types::storage::PoolBackend;
     use opl_types::vm::{Arch, CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec, VmHa};
 
@@ -435,6 +436,7 @@ mod tests {
             node,
             snapshot_schedule: None,
             ha: None,
+            placement: None,
         }
     }
 
@@ -481,10 +483,26 @@ mod tests {
             nodes.insert(n, load);
         }
         let loads = crate::score::Loads::new(nodes);
-        assert_eq!(
-            schedule_with(&me, &inv, &Scorer { loads: &loads }),
-            Ok(second)
-        );
+        let balance = Scorer {
+            loads: &loads,
+            ..Scorer::default()
+        };
+        assert_eq!(schedule_with(&me, &inv, &balance), Ok(second));
+        // `pack`은 넘치지 않는 한 바쁜 노드에 모은다.
+        let pack = Scorer {
+            policy: PlacementPolicy::Pack,
+            ..balance
+        };
+        assert_eq!(schedule_with(&me, &inv, &pack), Ok(first));
+        // 바쁜 노드가 넘치면(CPU 90%) 덜 바쁜 노드다.
+        let mut nodes = loads.nodes.clone();
+        nodes.get_mut(&first).unwrap().cpu5 = Some(0.9);
+        let loads = crate::score::Loads::new(nodes);
+        let pack = Scorer {
+            loads: &loads,
+            policy: PlacementPolicy::Pack,
+        };
+        assert_eq!(schedule_with(&me, &inv, &pack), Ok(second));
     }
 
     fn rule(name: &str, kind: RuleKind, vms: &[&str], nodes: &[&str]) -> PlacementRule {

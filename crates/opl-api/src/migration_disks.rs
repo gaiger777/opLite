@@ -370,6 +370,7 @@ mod tests {
                 node: Some(node),
                 snapshot_schedule: None,
                 ha: None,
+                placement: None,
             },
         )
     }

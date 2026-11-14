@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::{Client, Env, FakeStorage, vm_request};
 use opl_driver::uefi_vars_path;
-use opl_types::node::PoolState;
+use opl_types::node::{NodeSpec, PLACEMENT, PoolState};
 use opl_types::placement::{HaGroupNode, HaGroupSpec, HaGroupStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -641,6 +641,33 @@ async fn a_clone_drops_an_ha_group_that_no_longer_exists() {
         .unwrap();
     succeeded(&clone_and_wait(&admin, "web", json!({ "name": "web-3" })).await);
     assert_eq!(get_vm(&env, "web-3").unwrap().spec.ha, Some(policy(None)));
+}
+
+/// 복제본은 원본의 VM 고정(`placement.pinned`)을 받는다. `placement`를 모르는 노드가 있으면 버린다(옛 노드가 풀지 못함).
+#[tokio::test]
+async fn a_clone_keeps_the_pinning_only_when_every_node_knows_placement() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool(&env, "local", vec![]).await;
+    let root = volume(&env, "root").await;
+    fake_storage(&mut env, &[root]).await;
+    let mut req = vm_request("web");
+    req["spec"]["disks"] = json!([{ "volume": "root", "bus": "virtio-blk" }]);
+    req["spec"]["placement"] = json!({ "pinned": true });
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    succeeded(&clone_and_wait(&admin, "web", json!({ "name": "web-2" })).await);
+    assert!(get_vm(&env, "web-2").unwrap().spec.pinned());
+    // 옛 노드 흉내: `placement`를 모른다.
+    let mut node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    node.status.features.retain(|f| f != PLACEMENT);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &node.status)
+        .await
+        .unwrap();
+    succeeded(&clone_and_wait(&admin, "web", json!({ "name": "web-3" })).await);
+    assert_eq!(get_vm(&env, "web-3").unwrap().spec.placement, None);
 }
 
 #[tokio::test]

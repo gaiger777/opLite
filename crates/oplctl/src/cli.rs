@@ -97,6 +97,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PlacementRuleCmd,
     },
+    /// 최적 배치: 노드 부하(리더가 리스로 받은 요약), 점수 정책과 균형 조정기 설정
+    Placement {
+        #[command(subcommand)]
+        cmd: PlacementCmd,
+    },
     /// VM 백업(백업 풀에 담은 디스크 복사본과 VM 설정)과 복원
     Backup {
         #[command(subcommand)]
@@ -1519,6 +1524,9 @@ struct VmCreate {
     ha: bool,
     #[command(flatten)]
     policy: HaPolicy,
+    /// 균형 조정기가 옮기지 않는다(HA 복구·비우기·직접 옮기기는 그대로).
+    #[arg(long)]
+    pinned: bool,
 }
 
 /// `--nic`으로 받은 네트워크와 보안 그룹
@@ -1563,7 +1571,7 @@ fn nic_body(nic: &NicArg) -> Value {
 #[derive(Args)]
 #[command(group(ArgGroup::new("change").required(true).multiple(true).args([
     "ha", "no_ha", "ha_state", "ha_group", "max_restart", "max_relocate", "ha_priority",
-    "guest_watch", "no_guest_watch"
+    "guest_watch", "no_guest_watch", "pinned", "no_pinned"
 ])))]
 struct VmSet {
     vm: String,
@@ -1579,6 +1587,38 @@ struct VmSet {
     no_ha: bool,
     #[command(flatten)]
     policy: HaPolicy,
+    /// 균형 조정기가 옮기지 않는다. 실행 중이어도 된다.
+    #[arg(long)]
+    pinned: bool,
+    /// 균형 조정기가 다시 옮길 수 있다.
+    #[arg(long, conflicts_with = "pinned")]
+    no_pinned: bool,
+}
+
+impl VmSet {
+    /// HA 값을 바꾸는지
+    fn changes_ha(&self) -> bool {
+        self.ha || self.no_ha || !self.policy.is_empty()
+    }
+}
+
+/// `vm set`의 수정 본문: 준 HA 값([`ha_set`])과 고정(`placement`)만 바꾼다. 고정을 풀면 `placement`를 뺀다.
+fn vm_set_spec(current: &Value, args: &VmSet) -> Value {
+    let ha = if args.changes_ha() {
+        ha_set(&current["spec"]["ha"], args)
+    } else {
+        current["spec"]["ha"].clone()
+    };
+    let mut body = spec_update(current, "ha", ha);
+    if args.pinned {
+        body["spec"]["placement"] = json!({ "pinned": true });
+    }
+    if args.no_pinned
+        && let Some(spec) = body["spec"].as_object_mut()
+    {
+        spec.remove("placement");
+    }
+    body
 }
 
 /// `vm set`의 새 `ha`: `--no-ha`면 끔, 정책 값이 없으면(`--ha`만) 이미 HA인 정책은 그대로 두고 아니면 `true`,
@@ -2901,6 +2941,159 @@ async fn settings(
                 .patch("/settings", &settings_set_body(&values)?)
                 .await?;
             writeln!(out, "settings updated")?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Subcommand)]
+enum PlacementCmd {
+    /// 설정, 불균형, 노드마다의 부하(CPU 1분·5분, 실제·할당·전체 메모리, 점수가 보는 사용률, 요약 나이)
+    Status,
+    /// 최적 배치 설정을 바꾼다(admin). 준 값만 바꾼다.
+    Set(PlacementSet),
+}
+
+#[derive(Debug, Default, Args)]
+struct PlacementSet {
+    /// 균형 조정기: off(계산하지 않음), recommend(추천만, 기본), auto(스스로 옮김)
+    #[arg(long, value_enum)]
+    mode: Option<PlacementModeArg>,
+    /// 점수 정책: balance(고르게, 기본), pack(적은 노드에 모음)
+    #[arg(long, value_enum)]
+    policy: Option<PlacementPolicyArg>,
+    /// 불균형 문턱(백분율 1~50, 기본 15)
+    #[arg(long, value_name = "PERCENT")]
+    threshold: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PlacementModeArg {
+    Off,
+    Recommend,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PlacementPolicyArg {
+    Balance,
+    Pack,
+}
+
+/// `placement set`의 요청 본문(`PATCH /settings`). 준 값만 보내고, 아무것도 없으면 오류다. 범위는 API가 본다.
+fn placement_set_body(args: &PlacementSet) -> anyhow::Result<Value> {
+    let mut placement = serde_json::Map::new();
+    if let Some(mode) = args.mode {
+        placement.insert("mode".into(), json!(value_name(mode)));
+    }
+    if let Some(policy) = args.policy {
+        placement.insert("policy".into(), json!(value_name(policy)));
+    }
+    if let Some(n) = args.threshold {
+        placement.insert("threshold".into(), json!(n));
+    }
+    if placement.is_empty() {
+        bail!("give --mode, --policy or --threshold");
+    }
+    Ok(json!({ "placement": placement }))
+}
+
+/// 0.1% 단위 값을 `21.0%`로(없으면 `-`)
+fn permille_cell(v: &Value) -> String {
+    v.as_u64()
+        .map_or_else(|| "-".into(), |n| format!("{:.1}%", n as f64 / 10.0))
+}
+
+/// `placement status`의 머리 줄: 설정(빠진 값은 기본값), 불균형, 마지막·다음 실행, 쉬는 이유
+fn placement_status_lines(status: &Value) -> Vec<String> {
+    let settings = &status["settings"];
+    let mode = settings["mode"].as_str().unwrap_or("recommend");
+    let policy = settings["policy"].as_str().unwrap_or("balance");
+    let threshold = settings["threshold"].as_u64().unwrap_or(15);
+    let mut lines = vec![format!(
+        "mode: {mode}  policy: {policy}  threshold: {threshold}%"
+    )];
+    let imbalance = &status["imbalance"];
+    lines.push(if imbalance.is_null() {
+        "imbalance: -".to_string()
+    } else {
+        format!(
+            "imbalance: {} (cpu {}, memory {})",
+            permille_cell(&imbalance["total_pct"]),
+            permille_cell(&imbalance["cpu_pct"]),
+            permille_cell(&imbalance["mem_pct"])
+        )
+    });
+    let time = |v: &Value| v.as_i64().map_or_else(|| "-".to_string(), unix_time);
+    lines.push(format!(
+        "last run: {}  next run: {}",
+        time(&status["last_run"]),
+        time(&status["next_run"])
+    ));
+    if let Some(paused) = status["paused"].as_str() {
+        lines.push(format!("paused: {paused}"));
+    }
+    lines
+}
+
+/// `placement status`의 노드 표 열
+const PLACEMENT_NODE_HEADERS: &[&str] = &[
+    "NODE",
+    "CPU1",
+    "CPU5",
+    "MEM_USED",
+    "MEM_ALLOC",
+    "MEM_TOTAL",
+    "CPU%",
+    "MEM%",
+    "VMS",
+    "AGE",
+];
+
+/// 노드 하나의 부하 행. 요약이 없는 값은 `-`다.
+fn placement_node_row(n: &Value) -> Vec<String> {
+    vec![
+        cell(&n["name"]),
+        permille_cell(&n["cpu1_pct"]),
+        permille_cell(&n["cpu5_pct"]),
+        mib_cell(&n["mem_used_mib"]),
+        mib_cell(&n["mem_allocated_mib"]),
+        mib_cell(&n["mem_total_mib"]),
+        permille_cell(&n["cpu_use_pct"]),
+        permille_cell(&n["mem_use_pct"]),
+        cell(&n["vms"]),
+        n["age_secs"]
+            .as_u64()
+            .map_or_else(|| "-".into(), |s| format!("{s}s")),
+    ]
+}
+
+async fn placement(
+    client: &Client,
+    cmd: PlacementCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    match cmd {
+        PlacementCmd::Status => {
+            let status = client.get("/placement").await?;
+            if json_out {
+                print_json(out, &status)?;
+            } else {
+                for line in placement_status_lines(&status) {
+                    writeln!(out, "{line}")?;
+                }
+                writeln!(out)?;
+                let nodes = status["nodes"].as_array().cloned().unwrap_or_default();
+                let rows: Vec<_> = nodes.iter().map(placement_node_row).collect();
+                table(out, PLACEMENT_NODE_HEADERS, &rows)?;
+            }
+        }
+        PlacementCmd::Set(args) => {
+            client
+                .patch("/settings", &placement_set_body(&args)?)
+                .await?;
+            writeln!(out, "placement settings updated")?;
         }
     }
     Ok(())
@@ -5034,6 +5227,7 @@ where
         },
         Cmd::Realm { cmd } => realm(&client, cmd, json_out, out).await?,
         Cmd::Settings { cmd } => settings(&client, cmd, json_out, out).await?,
+        Cmd::Placement { cmd } => placement(&client, cmd, json_out, out).await?,
         Cmd::Subscription { cmd } => subscription(&client, cmd, json_out, out).await?,
         Cmd::Telemetry { cmd } => telemetry(&client, cmd, json_out, out).await?,
         Cmd::Audit(args) => audit(&client, args, json_out, out, &mut std::io::stderr()).await?,
@@ -6266,7 +6460,7 @@ async fn vm(
                 })
                 .collect();
             let nics: Vec<Value> = args.nics.iter().map(nic_body).collect();
-            let body = json!({
+            let mut body = json!({
                 "name": args.name,
                 "spec": {
                     "cpu": { "sockets": args.sockets, "cores": args.cores },
@@ -6284,6 +6478,9 @@ async fn vm(
                     },
                 }
             });
+            if args.pinned {
+                body["spec"]["placement"] = json!({ "pinned": true });
+            }
             client.post("/vms", &body).await?;
             writeln!(out, "vm {} created", args.name)?;
             if args.start {
@@ -6291,20 +6488,21 @@ async fn vm(
             }
         }
         VmCmd::Set(args) => {
-            put_spec(client, &args.vm, |current| {
-                Ok(spec_update(
-                    current,
-                    "ha",
-                    ha_set(&current["spec"]["ha"], &args),
-                ))
-            })
-            .await?;
-            let state = match args.policy.ha_state {
-                _ if args.no_ha => "off".to_string(),
-                Some(state) => value_name(state),
-                None => "on".to_string(),
-            };
-            writeln!(out, "vm {}: HA {state}", args.vm)?;
+            put_spec(client, &args.vm, |current| Ok(vm_set_spec(current, &args))).await?;
+            if args.changes_ha() {
+                let state = match args.policy.ha_state {
+                    _ if args.no_ha => "off".to_string(),
+                    Some(state) => value_name(state),
+                    None => "on".to_string(),
+                };
+                writeln!(out, "vm {}: HA {state}", args.vm)?;
+            }
+            if args.pinned {
+                writeln!(out, "vm {}: pinned", args.vm)?;
+            }
+            if args.no_pinned {
+                writeln!(out, "vm {}: not pinned", args.vm)?;
+            }
         }
         VmCmd::NicSg { vm, index, groups } => {
             put_spec(client, &vm, |current| {
@@ -11730,6 +11928,157 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             err.to_string(),
             "task t2 failed: 1 VM(s) were not moved: db (disks on a local pool)"
         );
+    }
+
+    /// `placement set`은 준 값만 `placement`에 담고, 아무것도 없으면 오류다.
+    #[test]
+    fn placement_set_body_sends_only_given_values() {
+        let parse = |args: &[&str]| -> PlacementSet {
+            let mut argv = vec!["oplctl", "placement", "set"];
+            argv.extend(args);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Placement {
+                    cmd: PlacementCmd::Set(s),
+                } => s,
+                _ => panic!("not placement set"),
+            }
+        };
+        assert_eq!(
+            placement_set_body(&parse(&["--mode", "auto"])).unwrap(),
+            json!({ "placement": { "mode": "auto" } })
+        );
+        assert_eq!(
+            placement_set_body(&parse(&[
+                "--mode",
+                "off",
+                "--policy",
+                "pack",
+                "--threshold",
+                "20"
+            ]))
+            .unwrap(),
+            json!({ "placement": { "mode": "off", "policy": "pack", "threshold": 20 } })
+        );
+        let err = placement_set_body(&parse(&[])).unwrap_err();
+        assert_eq!(err.to_string(), "give --mode, --policy or --threshold");
+        for bad in [
+            &["--mode", "manual"][..],
+            &["--policy", "spread"],
+            &["--threshold", "x"],
+        ] {
+            let mut argv = vec!["oplctl", "placement", "set"];
+            argv.extend(bad);
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+        }
+        assert!(Cli::try_parse_from(["oplctl", "placement", "status"]).is_ok());
+    }
+
+    /// `placement status`의 머리 줄(빠진 설정은 기본값)과 노드 행(요약이 없으면 `-`)
+    #[test]
+    fn placement_status_lines_and_rows() {
+        let status = json!({
+            "leader": "00000000-0000-0000-0000-000000000001",
+            "settings": {},
+            "nodes": [],
+            "recommendations": []
+        });
+        assert_eq!(
+            placement_status_lines(&status),
+            [
+                "mode: recommend  policy: balance  threshold: 15%",
+                "imbalance: -",
+                "last run: -  next run: -"
+            ]
+        );
+        let status = json!({
+            "settings": { "mode": "auto", "policy": "pack", "threshold": 20 },
+            "imbalance": { "cpu_pct": 182, "mem_pct": 238, "total_pct": 210 },
+            "last_run": 1_793_000_000,
+            "next_run": 1_793_000_300,
+            "paused": "a node is in maintenance",
+        });
+        assert_eq!(
+            placement_status_lines(&status),
+            [
+                "mode: auto  policy: pack  threshold: 20%",
+                "imbalance: 21.0% (cpu 18.2%, memory 23.8%)",
+                "last run: 2026-10-26 07:33 UTC  next run: 2026-10-26 07:38 UTC",
+                "paused: a node is in maintenance"
+            ]
+        );
+        let fresh = json!({
+            "node": "00000000-0000-0000-0000-000000000001", "name": "n1",
+            "cpu1_pct": 905, "cpu5_pct": 850, "mem_used_mib": 4096,
+            "mem_allocated_mib": 2048, "mem_total_mib": 8192,
+            "cpu_use_pct": 850, "mem_use_pct": 500, "vms": 2, "age_secs": 3
+        });
+        assert_eq!(
+            placement_node_row(&fresh),
+            [
+                "n1", "90.5%", "85.0%", "4.0GiB", "2.0GiB", "8.0GiB", "85.0%", "50.0%", "2", "3s"
+            ]
+        );
+        let unknown = json!({
+            "node": "00000000-0000-0000-0000-000000000002", "name": "n2",
+            "mem_allocated_mib": 0, "mem_total_mib": 8192,
+            "cpu_use_pct": 850, "mem_use_pct": 0, "vms": 0
+        });
+        assert_eq!(
+            placement_node_row(&unknown),
+            [
+                "n2", "-", "-", "-", "0B", "8.0GiB", "85.0%", "0.0%", "0", "-"
+            ]
+        );
+    }
+
+    /// `vm set --pinned`·`--no-pinned`는 `placement`만 바꾸고 HA는 그대로 둔다. `vm create --pinned`도 같다.
+    #[test]
+    fn pinned_flags_change_only_the_placement() {
+        let set = |args: &[&str]| -> VmSet {
+            let mut argv = vec!["oplctl", "vm", "set", "web"];
+            argv.extend(args);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Vm { cmd: VmCmd::Set(s) } => s,
+                _ => panic!("not vm set"),
+            }
+        };
+        let vm = json!({
+            "name": "web",
+            "labels": { "team": "a" },
+            "spec": { "memory_mib": 256, "ha": { "group": "rack" } },
+        });
+        assert_eq!(
+            vm_set_spec(&vm, &set(&["--pinned"])),
+            json!({
+                "labels": { "team": "a" },
+                "spec": { "memory_mib": 256, "ha": { "group": "rack" }, "placement": { "pinned": true } },
+            })
+        );
+        let mut pinned = vm.clone();
+        pinned["spec"]["placement"] = json!({ "pinned": true });
+        assert_eq!(
+            vm_set_spec(&pinned, &set(&["--no-pinned"])),
+            json!({ "labels": { "team": "a" }, "spec": { "memory_mib": 256, "ha": { "group": "rack" } } })
+        );
+        // HA 값과 함께 주면 둘 다 바꾼다.
+        assert_eq!(
+            vm_set_spec(&pinned, &set(&["--no-ha", "--no-pinned"]))["spec"],
+            json!({ "memory_mib": 256, "ha": false })
+        );
+        assert!(!set(&["--pinned"]).changes_ha());
+        assert!(set(&["--ha-priority", "10"]).changes_ha());
+        assert!(
+            Cli::try_parse_from(["oplctl", "vm", "set", "web", "--pinned", "--no-pinned"]).is_err()
+        );
+        let Cmd::Vm {
+            cmd: VmCmd::Create(c),
+        } = Cli::try_parse_from(["oplctl", "vm", "create", "web", "--pinned"])
+            .unwrap()
+            .cmd
+        else {
+            panic!("not vm create");
+        };
+        assert!(c.pinned);
     }
 
     /// `settings set`은 KEY=VALUE를 PATCH 본문으로 바꾼다. 모르는 키와 `=` 없는 인자는 거절한다.

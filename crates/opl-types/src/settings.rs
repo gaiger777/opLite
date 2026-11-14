@@ -62,6 +62,111 @@ pub struct SettingsSpec {
         schema(nullable = false, default, minimum = 1, maximum = 32)
     )]
     pub ha_start_concurrency: Option<u8>,
+    /// 최적 배치(계획 53): 점수 정책과 균형 조정기. 없으면 기본값(`balance`, `recommend`, 15%)이고 쓰지 않아 옛
+    /// 노드도 설정을 계속 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub placement: Option<PlacementSettings>,
+}
+
+/// 최적 배치 설정. 모든 값이 기본이면 [`SettingsSpec::placement`]를 쓰지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PlacementSettings {
+    /// 점수 정책
+    #[serde(default, skip_serializing_if = "is_default")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub policy: PlacementPolicy,
+    /// 균형 조정기의 동작
+    #[serde(default, skip_serializing_if = "is_default")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub mode: PlacementMode,
+    /// 불균형 문턱(정수 백분율 1~50). 노드 CPU·메모리 사용률 표준편차의 평균이 이것을 넘으면 옮기기를 찾는다.
+    #[serde(
+        default = "default_placement_threshold",
+        skip_serializing_if = "is_default_threshold"
+    )]
+    #[cfg_attr(feature = "openapi", schema(default = 15, minimum = 1, maximum = 50))]
+    pub threshold: u8,
+}
+
+impl Default for PlacementSettings {
+    fn default() -> Self {
+        PlacementSettings {
+            policy: PlacementPolicy::default(),
+            mode: PlacementMode::default(),
+            threshold: DEFAULT_PLACEMENT_THRESHOLD,
+        }
+    }
+}
+
+/// 불균형 문턱의 기본값과 최댓값(백분율)
+pub const DEFAULT_PLACEMENT_THRESHOLD: u8 = 15;
+pub const MAX_PLACEMENT_THRESHOLD: u8 = 50;
+
+fn default_placement_threshold() -> u8 {
+    DEFAULT_PLACEMENT_THRESHOLD
+}
+
+fn is_default_threshold(threshold: &u8) -> bool {
+    *threshold == DEFAULT_PLACEMENT_THRESHOLD
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+impl PlacementSettings {
+    /// 범위(문턱 1~50) 안인지
+    pub fn valid(&self) -> bool {
+        (1..=MAX_PLACEMENT_THRESHOLD).contains(&self.threshold)
+    }
+}
+
+/// 배치 점수 정책
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum PlacementPolicy {
+    /// CPU·메모리 여유가 많은 노드에 고르게 놓는다.
+    #[default]
+    Balance,
+    /// 넘치지 않는 한 많이 쓴 노드에 모은다.
+    Pack,
+}
+
+impl PlacementPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlacementPolicy::Balance => "balance",
+            PlacementPolicy::Pack => "pack",
+        }
+    }
+}
+
+/// 균형 조정기의 동작
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum PlacementMode {
+    /// 계산하지 않는다.
+    Off,
+    /// 옮기기를 추천만 한다.
+    #[default]
+    Recommend,
+    /// 스스로 라이브 마이그레이션한다.
+    Auto,
+}
+
+impl PlacementMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlacementMode::Off => "off",
+            PlacementMode::Recommend => "recommend",
+            PlacementMode::Auto => "auto",
+        }
+    }
 }
 
 /// HA 용량 예약: HA 가능 노드의 메모리 가운데 복구 자리로 비워 두는 몫.
@@ -143,6 +248,11 @@ impl SettingsSpec {
             .ha_start_concurrency
             .filter(|n| (1..=MAX_HA_START_CONCURRENCY).contains(n));
         usize::from(n.unwrap_or(DEFAULT_HA_START_CONCURRENCY))
+    }
+
+    /// 최적 배치 설정. 없거나 범위 밖이면 기본값이다.
+    pub fn placement(&self) -> PlacementSettings {
+        self.placement.filter(|p| p.valid()).unwrap_or_default()
     }
 }
 
@@ -283,6 +393,7 @@ mod tests {
             shutdown_policy: None,
             ha_reserve: None,
             ha_start_concurrency: None,
+            placement: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -435,6 +546,75 @@ mod tests {
             ..SettingsSpec::default()
         };
         assert_eq!(odd.ha_start_concurrency(), 4);
+    }
+
+    /// 최적 배치 설정도 없으면 쓰지 않는다. 기본값인 필드는 빼고 쓰고, 빠진 필드는 기본값이며, 모르는 키는 거절한다.
+    #[test]
+    fn placement_is_written_only_when_set() {
+        let none = serde_json::to_value(SettingsSpec::default()).unwrap();
+        assert!(none.get("placement").is_none(), "{none}");
+        assert_eq!(
+            SettingsSpec::default().placement(),
+            PlacementSettings::default()
+        );
+        let d = PlacementSettings::default();
+        assert_eq!(
+            (d.policy, d.mode, d.threshold),
+            (PlacementPolicy::Balance, PlacementMode::Recommend, 15)
+        );
+        assert_eq!(serde_json::to_value(d).unwrap(), serde_json::json!({}));
+
+        let spec = SettingsSpec {
+            placement: Some(PlacementSettings {
+                policy: PlacementPolicy::Pack,
+                mode: PlacementMode::Auto,
+                threshold: 20,
+            }),
+            ..SettingsSpec::default()
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["placement"],
+            serde_json::json!({ "policy": "pack", "mode": "auto", "threshold": 20 })
+        );
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+        assert_eq!(spec.placement().threshold, 20);
+
+        let spec: SettingsSpec = serde_json::from_str(r#"{"placement":{"mode":"off"}}"#).unwrap();
+        assert_eq!(
+            spec.placement(),
+            PlacementSettings {
+                mode: PlacementMode::Off,
+                ..PlacementSettings::default()
+            }
+        );
+        for bad in [
+            r#"{"placement":{"interval":300}}"#,
+            r#"{"placement":{"policy":"spread"}}"#,
+            r#"{"placement":{"mode":"Auto"}}"#,
+            r#"{"placement":{"threshold":0.15}}"#,
+        ] {
+            assert!(serde_json::from_str::<SettingsSpec>(bad).is_err(), "{bad}");
+        }
+        // 범위 밖 문턱은 기본값으로 본다.
+        let odd = SettingsSpec {
+            placement: Some(PlacementSettings {
+                threshold: 51,
+                ..PlacementSettings::default()
+            }),
+            ..SettingsSpec::default()
+        };
+        assert_eq!(odd.placement(), PlacementSettings::default());
+        for policy in [PlacementPolicy::Balance, PlacementPolicy::Pack] {
+            assert_eq!(serde_json::to_value(policy).unwrap(), policy.as_str());
+        }
+        for mode in [
+            PlacementMode::Off,
+            PlacementMode::Recommend,
+            PlacementMode::Auto,
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+        }
     }
 
     /// 텔레메트리도 기본값(꺼짐, 끝점 없음, 상태 없음)이면 계획 32 모양 그대로 쓴다.

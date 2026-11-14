@@ -3,9 +3,12 @@
 mod common;
 
 use common::Env;
-use opl_types::node::{FAST_HA, NodeSpec};
+use opl_types::node::{FAST_HA, NodeSpec, PLACEMENT};
 use opl_types::resource::Resource;
-use opl_types::settings::{Channel, HaReserve, SETTINGS_NAME, SettingsSpec, ShutdownPolicy};
+use opl_types::settings::{
+    Channel, HaReserve, PlacementMode, PlacementPolicy, PlacementSettings, SETTINGS_NAME,
+    SettingsSpec, ShutdownPolicy,
+};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -397,4 +400,110 @@ async fn ha_reserve_and_start_concurrency_are_checked_and_wait_for_the_feature()
         );
     }
     assert_eq!(stored().ha_reserve, None);
+}
+
+/// 최적 배치: 준 값만 바꾸고, 모두 기본이면 적지 않으며, 문턱은 1~50이고, `placement`를 모르는 노드가 있으면 409, admin만
+/// 바꾼다.
+#[tokio::test]
+async fn placement_settings_merge_and_wait_for_the_feature() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let stored = || {
+        env.cluster
+            .get_by_name::<SettingsSpec>(SETTINGS_NAME)
+            .unwrap()
+            .map(|s| s.spec)
+            .unwrap_or_default()
+    };
+    for bad in [
+        json!({ "placement": { "threshold": 0 } }),
+        json!({ "placement": { "threshold": 51 } }),
+        json!({ "placement": { "policy": "spread" } }),
+        json!({ "placement": { "interval": 60 } }),
+    ] {
+        let got = admin.patch("/settings", bad.clone(), None).await;
+        assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let got = admin
+        .patch(
+            "/settings",
+            json!({ "placement": { "threshold": 0 } }),
+            None,
+        )
+        .await;
+    assert_eq!(
+        got.1["message"],
+        "placement.threshold must be between 1 and 50 (got 0)"
+    );
+    let (status, got) = admin
+        .patch(
+            "/settings",
+            json!({ "placement": { "mode": "auto", "threshold": 20 } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(
+        got["spec"]["placement"],
+        json!({ "mode": "auto", "threshold": 20 })
+    );
+    // 준 값만 바꾼다.
+    let (_, got) = admin
+        .patch(
+            "/settings",
+            json!({ "placement": { "policy": "pack" } }),
+            None,
+        )
+        .await;
+    assert_eq!(
+        got["spec"]["placement"],
+        json!({ "policy": "pack", "mode": "auto", "threshold": 20 })
+    );
+    assert_eq!(
+        stored().placement(),
+        PlacementSettings {
+            policy: PlacementPolicy::Pack,
+            mode: PlacementMode::Auto,
+            threshold: 20,
+        }
+    );
+    // 모두 기본으로 되돌리면 적지 않는다.
+    let (status, got) = admin
+        .patch(
+            "/settings",
+            json!({ "placement": { "policy": "balance", "mode": "recommend", "threshold": 15 } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(got["spec"].get("placement").is_none(), "{got}");
+    assert_eq!(stored().placement, None);
+
+    // 운영자는 바꾸지 못한다.
+    let operator = env.user("op", "operator").await;
+    assert_error(
+        &operator
+            .patch("/settings", json!({ "placement": { "mode": "off" } }), None)
+            .await,
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    );
+
+    // `placement`를 모르는 노드가 있으면 거절한다.
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.features.retain(|f| f != PLACEMENT);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let got = admin
+        .patch("/settings", json!({ "placement": { "mode": "off" } }), None)
+        .await;
+    assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+    assert_eq!(stored().placement, None);
 }

@@ -41,7 +41,7 @@ use crate::ha::{
 };
 use crate::placement::Assign;
 use crate::scheduler::Inventory;
-use crate::score::{Loads, Scorer};
+use crate::score::Scorer;
 use crate::vms::{RuleCheck, start_migration};
 
 /// 창 안에서 너무 자주 옮긴 VM을 옮기지 않는다는 `ha.error`의 가운데([`relocated_too_often`]). 실패가 끝나면 지운다.
@@ -515,8 +515,8 @@ pub(crate) fn decide(
 pub(crate) struct Place<'a> {
     pub inv: &'a Inventory,
     pub leases: &'a Leases,
-    /// 대상 고르기의 부하 점수에 쓰는 부하 요약
-    pub loads: &'a Loads,
+    /// 대상 고르기의 부하 점수(부하 요약과 정책)
+    pub scorer: Scorer<'a>,
     pub now: Instant,
     pub b: Instant,
 }
@@ -686,7 +686,7 @@ async fn migrate(
     detail: String,
 ) {
     let inv = place.inv;
-    let scorer = Scorer { loads: place.loads };
+    let scorer = place.scorer;
     let limit = match crate::settings::current(ctx.cluster) {
         Ok(s) => s.spec.ha_start_concurrency(),
         Err(e) => {
@@ -832,7 +832,7 @@ async fn restart_elsewhere(
     detail: String,
 ) {
     let inv = place.inv;
-    let scorer = Scorer { loads: place.loads };
+    let scorer = place.scorer;
     let mut assign = Assign::default();
     let mut started = vec![];
     let mut no_target = vec![];
@@ -1272,6 +1272,7 @@ mod tests {
                 node: Some(node.id),
                 snapshot_schedule: None,
                 ha: ha.then(VmHa::default),
+                placement: None,
             },
         )
     }

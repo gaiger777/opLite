@@ -13,9 +13,10 @@ use axum::serve::ListenerExt;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
     ApiCertAgent, AppState, AuditLog, BackupJobScheduler, ClusterJanitor, FenceStatusSource,
-    HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations, PowerFence, RemotePoller,
-    RuntimeProbe, SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter,
-    UefiVarsFetcher, UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
+    HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations, PlacementBoard,
+    PlacementStatusSource, PowerFence, RemotePoller, RuntimeProbe, SnapshotScheduler, TaskRunner,
+    TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent,
+    VipManager, VipManagerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
@@ -469,6 +470,12 @@ impl Member {
             cluster: cluster.clone(),
             fence: fence.clone(),
         });
+        // 최적 배치 상태: API와 다른 노드(노드 간 서버, 이 노드가 리더일 때)가 같은 게시판을 읽는다.
+        let placement = Arc::new(PlacementBoard::default());
+        let placement_source = Arc::new(PlacementStatusSource::new(
+            cluster.clone(),
+            placement.clone(),
+        ));
         // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(incoming.with_firewall(gate.clone())))
@@ -476,6 +483,7 @@ impl Member {
             .with_audit(audit.clone())
             .with_metrics(metrics_source.clone())
             .with_fence(fence_source)
+            .with_placement(placement_source)
             .with_work(rt.work.clone());
         let peer = on(&rt.core, || {
             serve_peer(peer_listener, &tls, service, exited_tx.clone())
@@ -515,6 +523,7 @@ impl Member {
             state.audit = audit;
             state.metrics = Some(metrics_source);
             state.fence = fence;
+            state.placement = placement;
             // 헬스 체크가 실행기 확인과 HA 리스(아래에서 띄운 뒤)를 본다.
             state.runtimes = runtimes;
             let created = match password {
@@ -849,8 +858,12 @@ impl Member {
             }
         };
         let (exited_tx, exited) = mpsc::channel(2);
-        // 마이그레이션과 UEFI 변수는 받지 않는다.
-        let service = PeerService::new(cluster.clone(), None);
+        // 마이그레이션과 UEFI 변수는 받지 않는다. 리더가 되면 다른 노드의 API에 리스로 받은 노드 부하를 보인다.
+        let placement = Arc::new(PlacementStatusSource::new(
+            cluster.clone(),
+            Arc::new(PlacementBoard::default()),
+        ));
+        let service = PeerService::new(cluster.clone(), None).with_placement(placement);
         let peer = on(&rt.core, || {
             serve_peer(peer_listener, &tls, service, exited_tx.clone())
         });

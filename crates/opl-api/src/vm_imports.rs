@@ -797,6 +797,7 @@ pub(crate) fn import_spec(
         node: None,
         snapshot_schedule: None,
         ha: None,
+        placement: None,
     })
 }
 

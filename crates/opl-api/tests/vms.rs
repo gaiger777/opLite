@@ -12,7 +12,7 @@ use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_driver::DriverError;
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
-use opl_types::node::{FAST_HA, Fencing, HA_PLACEMENT, Node, NodeHa, NodeSpec};
+use opl_types::node::{FAST_HA, Fencing, HA_PLACEMENT, Node, NodeHa, NodeSpec, PLACEMENT};
 use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -1015,6 +1015,82 @@ async fn ha_policy_objects_wait_for_all_nodes() {
         body["spec"]["ha"],
         json!({ "state": "stopped", "max_restart": 3, "max_relocate": 1 })
     );
+}
+
+/// VM 고정(`placement.pinned`)은 저장하고(실행 중에도 바꿈), 고정하지 않음은 적지 않으며, `placement`를 모르는 노드가
+/// 있으면 409다.
+#[tokio::test]
+async fn pinned_vms_are_stored_only_when_pinned_and_wait_for_all_nodes() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mut req = vm_request("web");
+    req["spec"]["placement"] = json!({ "pinned": true });
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["spec"]["placement"], json!({ "pinned": true }));
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    assert!(
+        env.cluster
+            .get::<VmSpec>(id)
+            .unwrap()
+            .unwrap()
+            .spec
+            .pinned()
+    );
+    // `pinned: false`와 `{}`은 적지 않는다.
+    for (name, placement) in [("a", json!({ "pinned": false })), ("b", json!({}))] {
+        req["name"] = json!(name);
+        req["spec"]["placement"] = placement;
+        let (status, body) = admin.post("/vms", req.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body["spec"].get("placement").is_none(), "{body}");
+    }
+    // 실행 중에도 풀고 다시 고정한다.
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, vm) = admin.get("/vms/web").await;
+    let mut spec = vm["spec"].clone();
+    spec["placement"] = json!({ "pinned": false });
+    let (status, body) = admin
+        .put("/vms/web", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["spec"].get("placement").is_none(), "{body}");
+    assert_eq!(
+        env.cluster
+            .get::<VmSpec>(id)
+            .unwrap()
+            .unwrap()
+            .spec
+            .placement,
+        None
+    );
+
+    // 옛 노드 흉내: `placement`를 모르면 고정을 받지 않는다(고정하지 않음은 받는다).
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.features.retain(|f| f != PLACEMENT);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    spec["placement"] = json!({ "pinned": true });
+    let (status, body) = admin
+        .put("/vms/web", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading");
+    assert!(
+        body["message"].as_str().unwrap().contains("placement"),
+        "{body}"
+    );
+    spec["placement"] = json!({ "pinned": false });
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// 우선순위·게스트 감시는 모든 노드가 `fast-ha`를 알 때만 받는다. 범위 밖은 기능보다 먼저 400이다.

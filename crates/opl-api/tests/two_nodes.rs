@@ -6,6 +6,7 @@
 //! 감사 로그: 한 노드의 `GET /audit`가 두 노드의 항목을 합치고, 닿지 않는 노드를 알린다.
 //! 지표: 한 노드의 지표 API가 다른 노드의 지표를 읽고, 지표를 모르는 노드와 닿지 않는 노드를 알린다.
 //! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
+//! 최적 배치: 리더가 아닌 노드의 API가 리더의 노드 부하를 노드 사이 RPC로 읽어 보이고 VM을 놓는다.
 //! 세션: 한 노드에서 만든 로그인 세션을 다른 노드가 받고, 로그아웃이 두 노드에 반영된다. 정족수가 없으면
 //! 로그인 세션을 그 노드 메모리에 둔다.
 
@@ -17,10 +18,10 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use opl_api::{
-    AppState, AuditConfig, AuditLog, IncomingConfig, IncomingMigrations, TaskRunner,
-    UefiVarsFetcher, hash_password,
+    AppState, AuditConfig, AuditLog, IncomingConfig, IncomingMigrations, PlacementBoard,
+    PlacementStatusSource, TaskRunner, UefiVarsFetcher, hash_password,
 };
-use opl_cluster::types::{NodeId, OrbNode};
+use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::mock::MOCK_MIRROR_BYTES;
 use opl_driver::{
@@ -34,7 +35,7 @@ use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role, SessionSpec, UserSpec};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
 use opl_types::node::{FEATURES, Fencing, NodeHa, NodeSpec, NodeStatus, PoolState};
-use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
+use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
@@ -74,6 +75,12 @@ struct Node {
     audit_off: bool,
     /// 지표 소스가 없는 노드(지표를 모르는 옛 노드처럼)
     metrics_off: bool,
+    /// 최적 배치 상태 소스가 없는 노드(`ReadPlacement`를 모르는 옛 노드처럼)
+    placement_off: bool,
+    /// 이 노드의 최적 배치 상태 소스가 받은 물음 수
+    placement_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// 참이면 이 노드의 최적 배치 상태 소스가 실패한다(답하지 못하는 리더).
+    placement_fail: Arc<std::sync::atomic::AtomicBool>,
     /// 노드 간 서버를 멈춘다.
     peer_stop: Option<tokio::sync::oneshot::Sender<()>>,
     peer_server: Option<tokio::task::JoinHandle<()>>,
@@ -125,6 +132,9 @@ impl Node {
             listener: Some(listener),
             audit_off: false,
             metrics_off: false,
+            placement_off: false,
+            placement_calls: Arc::default(),
+            placement_fail: Arc::default(),
             peer_stop: None,
             peer_server: None,
             base: String::new(),
@@ -185,6 +195,15 @@ impl Node {
         if let Some(metrics) = &metrics {
             service = service.with_metrics(metrics.clone());
         }
+        // opld처럼 API와 노드 간 서버가 같은 게시판을 읽는다.
+        let board = Arc::new(PlacementBoard::default());
+        if !self.placement_off {
+            service = service.with_placement(Arc::new(CountingPlacement {
+                inner: PlacementStatusSource::new(self.cluster.clone(), board.clone()),
+                calls: self.placement_calls.clone(),
+                fail: self.placement_fail.clone(),
+            }));
+        }
         let listener = self.listener.take().unwrap();
         let tls = self.tls.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -220,6 +239,7 @@ impl Node {
         state.peers = Some(self.peers.clone());
         state.audit = audit;
         state.metrics = metrics;
+        state.placement = board;
         let state = Arc::new(state);
         let mut config = runner_config(self.id, &work);
         config.peers = Some(self.peers.clone());
@@ -258,15 +278,17 @@ impl Node {
 /// 두 노드를 띄워 클러스터를 만들고 Node 리소스와 관리자를 채운다. 노드 간 서버가 먼저 떠야
 /// 선거가 끝나므로 서버부터 띄운다.
 async fn two_nodes() -> (TempDir, Node, Node) {
-    two_nodes_with(None, true, true).await
+    two_nodes_with(None, true, true, true).await
 }
 
 /// `ha`가 있으면 A의 reconciler에 넣고 두 노드를 HA 가능 노드(`process`)로 등록한다.
-/// `b_audit`가 거짓이면 B는 감사 로그를 끈 노드, `b_metrics`가 거짓이면 지표 소스가 없는 노드다.
+/// `b_audit`가 거짓이면 B는 감사 로그를 끈 노드, `b_metrics`가 거짓이면 지표 소스가 없는 노드다. `placement`가 거짓이면
+/// 두 노드 모두 최적 배치 상태 소스가 없다.
 async fn two_nodes_with(
     ha: Option<Arc<HaGuard>>,
     b_audit: bool,
     b_metrics: bool,
+    placement: bool,
 ) -> (TempDir, Node, Node) {
     let ca = ClusterCa::generate("test").unwrap();
     let root = TempDir::new().unwrap();
@@ -280,6 +302,8 @@ async fn two_nodes_with(
     a.ha = ha;
     b.audit_off = !b_audit;
     b.metrics_off = !b_metrics;
+    a.placement_off = !placement;
+    b.placement_off = !placement;
     a.serve(&root).await;
     b.serve(&root).await;
     let members = BTreeMap::from([
@@ -729,7 +753,7 @@ async fn ha_vm_on_a(
             watchdog: None,
         },
     );
-    let (root, a, b) = two_nodes_with(Some(guard), true, true).await;
+    let (root, a, b) = two_nodes_with(Some(guard), true, true, true).await;
     let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
     let mut req = vm_request("web");
     req["spec"]["node"] = serde_json::json!(a.id);
@@ -1887,7 +1911,7 @@ async fn audit_entries_of_both_nodes_are_merged() {
 
 #[tokio::test]
 async fn a_node_with_the_audit_log_off_is_disabled_not_unreachable() {
-    let (_root, a, _b) = two_nodes_with(None, false, true).await;
+    let (_root, a, _b) = two_nodes_with(None, false, true, true).await;
     let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
     let body = audit_until(&admin, "", |body| {
         audit_nodes(body).contains(&"node1") && body["disabled"] != serde_json::json!([])
@@ -2118,7 +2142,7 @@ async fn an_offline_node_is_unreachable_without_being_asked() {
 
 #[tokio::test]
 async fn a_node_without_metrics_is_unsupported_not_unreachable() {
-    let (_root, a, _b) = two_nodes_with(None, true, false).await;
+    let (_root, a, _b) = two_nodes_with(None, true, false, true).await;
     let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
     let (status, body) = admin.get("/metrics/nodes").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2331,4 +2355,173 @@ async fn login_works_without_quorum_on_the_node_left() {
     assert_eq!(resp.status(), StatusCode::OK);
     // 세션은 클러스터에 없다(그 노드에서만 된다).
     assert!(left.cluster.list::<SessionSpec>().unwrap().1.is_empty());
+}
+
+/// 두 노드 가운데 (리더, 다른 노드). 두 노드가 관리자를 받을 때까지 기다린다(로그인할 수 있게).
+async fn leader_first<'a>(a: &'a Node, b: &'a Node) -> (&'a Node, &'a Node) {
+    for node in [a, b] {
+        until("the admin user reaches both nodes", || {
+            node.cluster
+                .get_by_name::<UserSpec>("admin")
+                .unwrap()
+                .is_some()
+        })
+        .await;
+    }
+    if a.cluster.members().leader == Some(NodeId(a.id)) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// 리더에 노드 `node`의 부하 요약(CPU `permille`‰)을 넣는다(노드의 리스 갱신처럼).
+async fn renew_load(leader: &Node, node: Uuid, permille: u16) {
+    leader
+        .cluster
+        .execute_as_leader(LeaderRequest::RenewLease {
+            node: NodeId(node),
+            checks: vec![],
+            load: Some(LoadSummary {
+                cpu1: Some(permille),
+                cpu5: Some(permille),
+                mem: Some(1024),
+                vms: vec![],
+            }),
+        })
+        .await
+        .unwrap();
+}
+
+/// 리더가 아닌 노드의 `GET /placement`는 리더에 노드 사이 RPC로 물어 리더의 노드 부하를 보이고, 그 노드의 VM 시작도
+/// 그 부하로 덜 바쁜 노드를 고른다.
+#[tokio::test]
+async fn a_follower_reads_placement_and_places_with_the_leader_loads() {
+    let (_root, a, b) = two_nodes().await;
+    let (leader, follower) = leader_first(&a, &b).await;
+    // 리더 노드가 바쁘다(CPU 90%), 다른 노드는 한가하다(10%).
+    renew_load(leader, leader.id, 900).await;
+    renew_load(leader, follower.id, 100).await;
+    let admin = login_at(&follower.base, "admin", ADMIN_PASSWORD).await;
+    let (status, got) = admin.get("/placement").await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["leader"], leader.id.to_string());
+    assert_eq!(got["settings"], serde_json::json!({}));
+    assert_eq!(got["recommendations"], serde_json::json!([]));
+    let nodes = got["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2, "{got}");
+    for (node, cpu) in [(leader, 900), (follower, 100)] {
+        let view = nodes
+            .iter()
+            .find(|n| n["node"] == node.id.to_string())
+            .unwrap();
+        assert_eq!(view["name"], node.name);
+        assert_eq!(view["cpu5_pct"], cpu, "{view}");
+        assert_eq!(view["cpu_use_pct"], cpu, "{view}");
+        assert_eq!(view["mem_used_mib"], 1024, "{view}");
+        assert_eq!(view["mem_total_mib"], 8192, "{view}");
+        assert!(view["age_secs"].as_u64().unwrap() < 30, "{view}");
+    }
+
+    // 그 노드에 VM 하나를 두면 할당 메모리로는 리더 노드가 낫다. 부하로는 그래도 한가한 그 노드다.
+    let mut req = vm_request("web");
+    req["spec"]["node"] = serde_json::json!(follower.id);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (status, body) = admin.post("/vms", vm_request("db")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act("db", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let vm = follower
+        .cluster
+        .get_by_name::<VmSpec>("db")
+        .unwrap()
+        .unwrap();
+    assert_eq!(vm.spec.node, Some(follower.id));
+}
+
+/// 최적 배치 상태 소스를 감싸 물음을 세고, `fail`이면 실패한다(답하지 못하는 리더).
+struct CountingPlacement {
+    inner: PlacementStatusSource,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl opl_peer::PlacementSource for CountingPlacement {
+    async fn status(&self) -> Result<opl_types::placement::PlacementStatus, String> {
+        use std::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err("busy".into());
+        }
+        self.inner.status().await
+    }
+}
+
+/// 리더가 아닌 노드는 노드를 고를 때만 리더에 부하를 묻는다: 노드를 준 VM의 만들기·시작과 꺼진 채 만들기는 묻지 않는다.
+/// 리더가 답하지 못하면 부하 없이 놓고 5초 동안 다시 묻지 않는다.
+#[tokio::test]
+async fn a_follower_asks_the_leader_only_when_it_picks_a_node() {
+    use std::sync::atomic::Ordering;
+    let (_root, a, b) = two_nodes().await;
+    let (leader, follower) = leader_first(&a, &b).await;
+    let calls = || leader.placement_calls.load(Ordering::SeqCst);
+    let admin = login_at(&follower.base, "admin", ADMIN_PASSWORD).await;
+    let mut req = vm_request("fixed");
+    req["spec"]["node"] = serde_json::json!(follower.id);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act("fixed", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (status, body) = admin.post("/vms", vm_request("free")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(calls(), 0);
+    let task = admin.act("free", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(calls(), 1);
+
+    // 리더가 답하지 못한다: 켜진 채 만들기는 부하 없이 놓고, 바로 뒤의 것은 묻지 않는다.
+    leader.placement_fail.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    for name in ["late-1", "late-2"] {
+        let mut req = vm_request(name);
+        req["spec"]["power"] = serde_json::json!("running");
+        let (status, body) = admin.post("/vms", req).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body["spec"]["node"].is_string(), "{body}");
+    }
+    if started.elapsed() < Duration::from_secs(4) {
+        assert_eq!(calls(), 2);
+    }
+}
+
+/// 리더가 `ReadPlacement`를 모르면(옛 노드) 리더가 아닌 노드의 `GET /placement`는 503 `placement_unavailable`이고, VM은
+/// 부하 없이(할당 메모리로) 놓는다.
+#[tokio::test]
+async fn placement_is_unavailable_when_the_leader_does_not_serve_it() {
+    let (_root, a, b) = two_nodes_with(None, true, true, false).await;
+    let (leader, follower) = leader_first(&a, &b).await;
+    let admin = login_at(&follower.base, "admin", ADMIN_PASSWORD).await;
+    let (status, got) = admin.get("/placement").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{got}");
+    assert_eq!(got["code"], "placement_unavailable");
+    assert!(
+        got["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not support placement"),
+        "{got}"
+    );
+    // 리더는 직접 만든다.
+    let leader_admin = login_at(&leader.base, "admin", ADMIN_PASSWORD).await;
+    let (status, got) = leader_admin.get("/placement").await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["leader"], leader.id.to_string());
+    let (status, body) = admin.post("/vms", vm_request("web")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
 }

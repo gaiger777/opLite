@@ -42,6 +42,21 @@ pub struct VmSpec {
     #[serde(default, with = "ha_compat")]
     #[cfg_attr(feature = "openapi", schema(value_type = HaSetting))]
     pub ha: Option<VmHa>,
+    /// 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub placement: Option<VmPlacement>,
+}
+
+/// VM의 최적 배치 옵션
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct VmPlacement {
+    /// 균형 조정기가 옮기지 않는다(HA 복구·비우기·사용자 마이그레이션은 그대로 옮긴다).
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub pinned: bool,
 }
 
 /// 재시작·옮기기 횟수의 최댓값.
@@ -276,6 +291,11 @@ impl VmSpec {
         self.ha
             .as_ref()
             .is_some_and(|ha| ha.state != HaState::Ignored)
+    }
+
+    /// 균형 조정기가 옮기지 않는 VM인지
+    pub fn pinned(&self) -> bool {
+        self.placement.is_some_and(|p| p.pinned)
     }
 
     /// 보안 그룹을 건(방화벽이 켜진) NIC가 있는지. 이런 VM은 방화벽이 있는 노드에서만 돈다.
@@ -995,6 +1015,30 @@ mod tests {
         let spec: VmSpec = serde_json::from_str(&old_ha).unwrap();
         assert_eq!(spec.ha, Some(VmHa::default()));
         assert_eq!(serde_json::to_string(&spec).unwrap(), old_ha);
+    }
+
+    /// `placement`가 없으면 옛 VM 그대로 쓰고, 있으면 왕복한다. `{}`은 고정하지 않음이고 모르는 키는 거절한다.
+    #[test]
+    fn placement_is_written_only_when_set() {
+        let spec: VmSpec = serde_json::from_str(OLD_VM_JSON).unwrap();
+        assert_eq!(spec.placement, None);
+        assert!(!spec.pinned());
+        assert_eq!(serde_json::to_string(&spec).unwrap(), OLD_VM_JSON);
+
+        let mut json = sample_json();
+        json["placement"] = serde_json::json!({ "pinned": true });
+        let spec: VmSpec = serde_json::from_value(json.clone()).unwrap();
+        assert!(spec.pinned());
+        let back = serde_json::to_value(&spec).unwrap();
+        assert_eq!(back["placement"], serde_json::json!({ "pinned": true }));
+        assert_eq!(serde_json::from_value::<VmSpec>(back).unwrap(), spec);
+
+        json["placement"] = serde_json::json!({});
+        let spec: VmSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(spec.placement, Some(VmPlacement { pinned: false }));
+        assert!(!spec.pinned());
+        json["placement"] = serde_json::json!({ "pinned": true, "weight": 1 });
+        assert!(serde_json::from_value::<VmSpec>(json).is_err());
     }
 
     #[test]

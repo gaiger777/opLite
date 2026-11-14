@@ -321,6 +321,7 @@ pub const FEATURES: &[&str] = &[
     HA_PLACEMENT,
     FAST_HA,
     HA_CHECKS,
+    PLACEMENT,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -332,6 +333,9 @@ pub const FAST_HA: &str = "fast-ha";
 /// HA 상태 검사(계획 52): `HaCheck` 만들기·바꾸기, 기록 Task `ha-check`·`bond-degraded`, 리더의 경고 아닌 대응과
 /// `VmHaStatus.evict`. 모든 노드가 알릴 때만 쓴다.
 pub const HA_CHECKS: &str = "ha-checks";
+
+/// 최적 배치(계획 53): 설정 `placement`, VM `spec.placement`, 균형 조정기의 동작. 모든 노드가 알릴 때만 쓴다.
+pub const PLACEMENT: &str = "placement";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -771,7 +775,8 @@ mod tests {
                 "multi-link",
                 "ha-placement",
                 "fast-ha",
-                "ha-checks"
+                "ha-checks",
+                "placement"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

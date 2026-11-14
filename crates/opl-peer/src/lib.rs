@@ -3,7 +3,7 @@
 //! 노드는 gRPC(HTTP/2) over mTLS로 이야기한다. 클러스터 CA가 서명한 인증서를 가진 노드만 연결할 수
 //! 있고, 서버는 상대 인증서의 노드 id가 지금 멤버인지도 확인한다. 메시지는 Rust 타입을 serde JSON으로
 //! 보낸다(`build.rs`). 서비스는 Raft RPC, 리더 전달, 생존 확인, 관찰 노드의 Follow, VM 콘솔 중계, 라이브 마이그레이션
-//! 받기, UEFI 변수 파일 보내기, 감사 로그 읽기, 지표 읽기, 펜싱 방법으로 전원 읽기다.
+//! 받기, UEFI 변수 파일 보내기, 감사 로그 읽기, 지표 읽기, 펜싱 방법으로 전원 읽기, 리더의 최적 배치 상태 읽기다.
 
 pub mod audit;
 mod client;
@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod migration;
 pub mod monitor;
 pub mod pki;
+pub mod placement;
 mod server;
 pub mod tls;
 mod wire;
@@ -30,6 +31,7 @@ pub use migration::{
     MigrateIncomingResponse, MigrationReceiver,
 };
 pub use monitor::{LEASE_LIVENESS, NodeMonitor, NodeMonitorConfig, renew_liveness};
+pub use placement::{PlacementRequest, PlacementSource};
 pub use server::{PeerService, ServeError, serve};
 
 /// 생성된 gRPC 클라이언트와 서버. 생성 코드가 단위 구조체 코덱을 `default()`로 만든다.

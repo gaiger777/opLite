@@ -304,6 +304,31 @@ async fn revert_keeps_the_current_ha() {
     );
 }
 
+/// 되돌려도 고정(`placement`)은 스냅샷 때의 것이 아니라 지금 것을 지킨다(HA처럼).
+#[tokio::test]
+async fn revert_keeps_the_current_pinning() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = running_vm(&admin, "bare", &[]).await;
+    succeeded(&snapshot(&admin, "bare", json!({ "name": "cfg" })).await);
+    assert_eq!(get(&env, vm, "cfg").spec.vm_spec.placement, None);
+    let (status, body) = admin.get("/vms/bare").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut spec = body["spec"].clone();
+    spec["placement"] = json!({ "pinned": true });
+    let (status, body) = admin
+        .put("/vms/bare", json!({ "spec": spec, "labels": {} }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, task) = admin
+        .post("/vms/bare/snapshots/cfg/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert!(got.spec.pinned(), "{:?}", got.spec.placement);
+}
+
 #[tokio::test]
 async fn memory_revert_does_not_place_the_vm_on_a_node_of_another_architecture() {
     let env = Env::start().await;

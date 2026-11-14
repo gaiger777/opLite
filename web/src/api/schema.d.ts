@@ -801,6 +801,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/placement": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 최적 배치 상태: 설정, 노드마다의 부하(리더가 리스로 받은 요약), 균형 조정기의 마지막 결과. 로그인한 누구나 읽는다.
+         *     리더가 아닌 노드는 리더에 묻고, 묻지 못하면 503 `placement_unavailable`이다.
+         */
+        get: operations["get_placement"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/placement-rules": {
         parameters: {
             query?: never;
@@ -2359,6 +2379,8 @@ export interface components {
                  * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
                  */
                 node?: string | null;
+                /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+                placement?: components["schemas"]["VmPlacement"];
                 power?: components["schemas"]["PowerState"];
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
@@ -2747,6 +2769,15 @@ export interface components {
         ImageFile: string;
         /** @enum {string} */
         ImageFormat: "qcow2" | "raw";
+        /** @description 불균형(0.1% 단위): 노드 CPU·메모리 사용률의 표준편차와 그 평균 */
+        ImbalanceView: {
+            /** Format: int32 */
+            cpu_pct: number;
+            /** Format: int32 */
+            mem_pct: number;
+            /** Format: int32 */
+            total_pct: number;
+        };
         /** @enum {string} */
         ImportPhase: "ready" | "importing" | "done" | "failed";
         /** @description Orbivisor VM 설정 제안. 실행할 때 [`ImportRun`]에 없는 값의 기본값이다. */
@@ -3691,6 +3722,8 @@ export interface components {
                      * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
                      */
                     node?: string | null;
+                    /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+                    placement?: components["schemas"]["VmPlacement"];
                     power?: components["schemas"]["PowerState"];
                     restart?: components["schemas"]["RestartPolicy"];
                     snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
@@ -3872,6 +3905,11 @@ export interface components {
             /** Format: uuid */
             task: string;
         };
+        /**
+         * @description 옮기는 이유
+         * @enum {string}
+         */
+        MoveReason: "balance" | "rule";
         /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
         NetworkSpec: {
             /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
@@ -3953,6 +3991,48 @@ export interface components {
             speed_mbps?: number;
             /** @description operstate(`up`, `down`, `unknown`, `lowerlayerdown` …) */
             state: string;
+        };
+        /** @description 노드 하나의 부하. 백분율은 0.1% 단위다. */
+        NodeLoadView: {
+            /**
+             * Format: int32
+             * @description 부하 요약의 나이(초). 없으면 신선한 요약이 없다.
+             */
+            age_secs?: number;
+            /**
+             * Format: int32
+             * @description 지난 1분·5분 노드 CPU 사용률(요약이 없으면 없음)
+             */
+            cpu1_pct?: number;
+            /** Format: int32 */
+            cpu5_pct?: number;
+            /**
+             * Format: int32
+             * @description 점수가 보는 CPU·메모리 사용률(요약이 없으면 다른 노드 평균 CPU·할당 메모리)
+             */
+            cpu_use_pct: number;
+            /**
+             * Format: int64
+             * @description 자리 잡은 VM에 할당한 메모리
+             */
+            mem_allocated_mib: number;
+            /** Format: int64 */
+            mem_total_mib: number;
+            /** Format: int32 */
+            mem_use_pct: number;
+            /**
+             * Format: int64
+             * @description 실제 사용 메모리(요약)
+             */
+            mem_used_mib?: number;
+            name: string;
+            /** Format: uuid */
+            node: string;
+            /**
+             * Format: int32
+             * @description 자리 잡은 VM 수
+             */
+            vms: number;
         };
         /** @description `GET /metrics/nodes`의 응답 */
         NodeMetricsResponse: {
@@ -4186,6 +4266,63 @@ export interface components {
             name: string;
         };
         /**
+         * @description 균형 조정기의 동작
+         * @enum {string}
+         */
+        PlacementMode: "off" | "recommend" | "auto";
+        /** @description 균형 조정기의 옮기기 하나 */
+        PlacementMove: {
+            /**
+             * Format: int64
+             * @description 비용: 옮길 메모리(MiB)
+             */
+            cost_mib: number;
+            /** Format: uuid */
+            from: string;
+            from_name: string;
+            /**
+             * Format: int32
+             * @description 줄어드는 불균형(0.1% 단위)
+             */
+            gain_pct: number;
+            /**
+             * Format: uuid
+             * @description 추천 id(적용할 때 쓴다)
+             */
+            id: string;
+            reason: components["schemas"]["MoveReason"];
+            /** @description 바로잡는 hard 규칙(`rule`) */
+            rules?: string[];
+            /**
+             * Format: uuid
+             * @description auto가 만든 마이그레이션 Task
+             */
+            task?: string;
+            /** Format: uuid */
+            to: string;
+            to_name: string;
+            /** Format: uuid */
+            vm: string;
+            vm_name: string;
+        };
+        /** @description 최적 배치에서 바꿀 값 */
+        PlacementPatch: {
+            /** @description 균형 조정기: `off`, `recommend`(추천만, 기본), `auto`(스스로 옮김) */
+            mode?: components["schemas"]["PlacementMode"];
+            /** @description `balance`(고르게, 기본)나 `pack`(적은 노드에 모음) */
+            policy?: components["schemas"]["PlacementPolicy"];
+            /**
+             * Format: int32
+             * @description 불균형 문턱(백분율 1~50, 기본 15)
+             */
+            threshold?: number;
+        };
+        /**
+         * @description 배치 점수 정책
+         * @enum {string}
+         */
+        PlacementPolicy: "balance" | "pack";
+        /**
          * @description 배치 규칙: VM끼리(같은 노드·다른 노드) 또는 VM과 노드(이 노드들 중·이 노드들은 안 됨). hard 규칙은
          *     조건이고 soft 규칙은 벌점(`weight`)이다. 모든 VM에 적용한다.
          */
@@ -4219,6 +4356,49 @@ export interface components {
             weight?: number;
         };
         PlacementRuleStatus: Record<string, never>;
+        /** @description 최적 배치 설정. 모든 값이 기본이면 [`SettingsSpec::placement`]를 쓰지 않는다. */
+        PlacementSettings: {
+            /** @description 균형 조정기의 동작 */
+            mode?: components["schemas"]["PlacementMode"];
+            /** @description 점수 정책 */
+            policy?: components["schemas"]["PlacementPolicy"];
+            /**
+             * Format: int32
+             * @description 불균형 문턱(정수 백분율 1~50). 노드 CPU·메모리 사용률 표준편차의 평균이 이것을 넘으면 옮기기를 찾는다.
+             * @default 15
+             */
+            threshold: number;
+        };
+        /**
+         * @description 최적 배치 상태(`GET /placement`): 리더가 아는 노드 부하와 균형 조정기의 마지막 결과. 리더가 만들고 다른 노드는
+         *     노드 사이 RPC(`ReadPlacement`)로 읽는다.
+         */
+        PlacementStatus: {
+            /** @description 마지막 실행의 불균형 */
+            imbalance?: components["schemas"]["ImbalanceView"];
+            /**
+             * Format: int64
+             * @description 균형 조정기가 마지막으로 돈 시각(유닉스 초)
+             */
+            last_run?: number;
+            /**
+             * Format: uuid
+             * @description 이 상태를 만든 리더
+             */
+            leader: string;
+            /**
+             * Format: int64
+             * @description 다음에 돌 시각(유닉스 초)
+             */
+            next_run?: number;
+            /** @description 노드마다의 부하(이름 순) */
+            nodes: components["schemas"]["NodeLoadView"][];
+            /** @description 균형 조정기가 쉬는 이유 */
+            paused?: string;
+            /** @description 추천한(auto면 한) 옮기기 */
+            recommendations: components["schemas"]["PlacementMove"][];
+            settings: components["schemas"]["PlacementSettings"];
+        };
         PoolBackend: {
             /** @enum {string} */
             kind: "dir";
@@ -5010,6 +5190,11 @@ export interface components {
                  */
                 ha_start_concurrency?: number;
                 /**
+                 * @description 최적 배치(계획 53): 점수 정책과 균형 조정기. 없으면 기본값(`balance`, `recommend`, 15%)이고 쓰지 않아 옛
+                 *     노드도 설정을 계속 푼다.
+                 */
+                placement?: components["schemas"]["PlacementSettings"];
+                /**
                  * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. 없으면 `conditional`이고, 쓰지 않아
                  *     옛 노드도 설정을 계속 푼다.
                  */
@@ -5230,6 +5415,8 @@ export interface components {
                  * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
                  */
                 node?: string | null;
+                /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+                placement?: components["schemas"]["VmPlacement"];
                 power?: components["schemas"]["PowerState"];
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
@@ -5396,6 +5583,8 @@ export interface components {
              * @description HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32, 기본 4)
              */
             ha_start_concurrency?: number;
+            /** @description 최적 배치: 점수 정책, 균형 조정기의 동작, 불균형 문턱. 준 값만 바꾼다. */
+            placement?: components["schemas"]["PlacementPatch"];
             /**
              * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. `conditional`(기본: 재부팅이면
              *     `freeze`, 끄기면 `failover`), `freeze`, `failover`, `migrate`. `systemctl stop`에는 쓰지 않는다.
@@ -5428,6 +5617,11 @@ export interface components {
              * @description 리더가 HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32). 없으면 4이고 쓰지 않는다.
              */
             ha_start_concurrency?: number;
+            /**
+             * @description 최적 배치(계획 53): 점수 정책과 균형 조정기. 없으면 기본값(`balance`, `recommend`, 15%)이고 쓰지 않아 옛
+             *     노드도 설정을 계속 푼다.
+             */
+            placement?: components["schemas"]["PlacementSettings"];
             /**
              * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. 없으면 `conditional`이고, 쓰지 않아
              *     옛 노드도 설정을 계속 푼다.
@@ -5981,6 +6175,8 @@ export interface components {
                  * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
                  */
                 node?: string | null;
+                /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+                placement?: components["schemas"]["VmPlacement"];
                 power?: components["schemas"]["PowerState"];
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
@@ -6125,6 +6321,11 @@ export interface components {
         };
         /** @enum {string} */
         VmPhase: "stopped" | "starting" | "running" | "stopping" | "failed" | "migrating";
+        /** @description VM의 최적 배치 옵션 */
+        VmPlacement: {
+            /** @description 균형 조정기가 옮기지 않는다(HA 복구·비우기·사용자 마이그레이션은 그대로 옮긴다). */
+            pinned?: boolean;
+        };
         /** @description VM 점 하나 */
         VmSample: {
             /**
@@ -6189,6 +6390,8 @@ export interface components {
              * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
              */
             node?: string | null;
+            /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+            placement?: components["schemas"]["VmPlacement"];
             power?: components["schemas"]["PowerState"];
             restart?: components["schemas"]["RestartPolicy"];
             snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
@@ -7980,6 +8183,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_placement: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlacementStatus"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "4XX": {

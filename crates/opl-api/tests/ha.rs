@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::{Env, WAIT, vm_request};
-use opl_api::{HaManager, HaManagerConfig, LEASE_EXPIRED, PowerFence, RecoveryWriter};
+use opl_api::{
+    HaManager, HaManagerConfig, LEASE_EXPIRED, PlacementStatusSource, PowerFence, RecoveryWriter,
+};
 use opl_cluster::types::{Command, LeaderRequest, NodeId, Rejection};
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
@@ -36,7 +38,7 @@ use opl_types::node::{
 };
 use opl_types::placement::{
     HaGroupNode, HaGroupSpec, HaGroupStatus, LoadSummary, PlacementRuleSpec, PlacementRuleStatus,
-    RuleKind, VmLoad,
+    PlacementStatus, RuleKind, VmLoad,
 };
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
@@ -1847,6 +1849,97 @@ async fn recovers_when_some_nodes_sent_no_load_summary() {
     assert_eq!(get(&env, a.id).spec.node, Some(idle));
     assert_ne!(get(&env, a.id).spec.node, Some(quiet));
     manager.shutdown().await;
+}
+
+/// 정책이 `pack`이면 HA 복구도 넘치지 않는 바쁜 노드에 모은다.
+#[tokio::test]
+async fn recovery_follows_the_pack_policy() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (status, body) = admin
+        .patch(
+            "/settings",
+            json!({ "placement": { "policy": "pack" } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let failed = node(&env, "failed", 8192, Some(1)).await;
+    let [idle, busy] = spares(&env, 2).await[..] else {
+        unreachable!()
+    };
+    renew_load(&env.cluster, busy, cpu_load(600)).await;
+    renew_load(&env.cluster, idle, cpu_load(100)).await;
+    let a = vm(&env, "a-vm", failed, true, PowerState::Running).await;
+    let manager = fast_manager(&env);
+    eventually("HA VM moved", || get(&env, a.id).spec.node != Some(failed)).await;
+    assert_eq!(get(&env, a.id).spec.node, Some(busy));
+    manager.shutdown().await;
+}
+
+/// 리더의 `GET /placement`는 노드마다 리스로 받은 부하를 보인다(로그인한 누구나). 요약이 없는 노드는 요약 값 없이
+/// 다른 노드 평균 CPU로 보인다.
+#[tokio::test]
+async fn the_leader_shows_node_loads_to_every_reader() {
+    let env = Env::start().await;
+    let quiet = node(&env, "quiet", 8192, None).await;
+    renew_load(&env.cluster, env.node, cpu_load(250)).await;
+    let viewer = env.user("v", "viewer").await;
+    let (status, got) = viewer.get("/placement").await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["leader"], env.node.to_string());
+    assert_eq!(got["settings"], json!({}));
+    let view = |id: Uuid| {
+        got["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node"] == id.to_string())
+            .unwrap()
+            .clone()
+    };
+    let me = view(env.node);
+    assert_eq!(me["cpu1_pct"], 250, "{me}");
+    assert_eq!(me["cpu5_pct"], 250, "{me}");
+    assert_eq!(me["mem_used_mib"], 1024, "{me}");
+    assert!(me["age_secs"].as_u64().unwrap() < 30, "{me}");
+    let q = view(quiet);
+    assert_eq!(q["name"], "quiet");
+    for key in ["cpu1_pct", "cpu5_pct", "mem_used_mib", "age_secs"] {
+        assert!(q.get(key).is_none(), "{q}");
+    }
+    assert_eq!(q["cpu_use_pct"], 250, "{q}");
+    assert_eq!(q["mem_use_pct"], 0, "{q}");
+    assert_eq!(q["mem_total_mib"], 8192, "{q}");
+    assert_eq!(q["vms"], 0, "{q}");
+    let (status, _) = env.anonymous().get("/placement").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// 리더의 상태 소스(노드 사이 RPC `ReadPlacement`의 답)는 같은 임기에서 만든 지 1초가 안 된 상태를 다시 쓴다.
+#[tokio::test]
+async fn the_leader_status_source_reuses_a_status_for_a_second() {
+    let env = Env::start().await;
+    renew_load(&env.cluster, env.node, cpu_load(250)).await;
+    let source = PlacementStatusSource::new(env.cluster.clone(), env.state.placement.clone());
+    let cpu = |s: &PlacementStatus| {
+        s.nodes
+            .iter()
+            .find(|n| n.node == env.node)
+            .and_then(|n| n.cpu5_pct)
+    };
+    let started = std::time::Instant::now();
+    let first = opl_peer::PlacementSource::status(&source).await.unwrap();
+    assert_eq!(cpu(&first), Some(250));
+    renew_load(&env.cluster, env.node, cpu_load(600)).await;
+    let again = opl_peer::PlacementSource::status(&source).await.unwrap();
+    // 느린 기계에서 1초가 지났으면 새로 만들었을 수 있다.
+    if started.elapsed() < Duration::from_millis(900) {
+        assert_eq!(cpu(&again), Some(250));
+    }
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let later = opl_peer::PlacementSource::status(&source).await.unwrap();
+    assert_eq!(cpu(&later), Some(600));
 }
 
 #[tokio::test]

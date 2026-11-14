@@ -801,6 +801,33 @@ async fn fast_ha_policy_fields_are_kept_only_when_every_node_knows_them() {
     );
 }
 
+/// VM 고정(`placement`)은 `placement`를 모르는 노드가 있으면 버린다.
+#[tokio::test]
+async fn a_pinned_vm_stays_pinned_only_when_every_node_knows_placement() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let pinned = || {
+        let mut m = manifest();
+        m["vm_spec"]["placement"] = json!({ "pinned": true });
+        m
+    };
+    let id = receive_ok(&admin, receive_body(&pinned())).await;
+    assert!(get_backup(&env, id).unwrap().spec.vm_spec.pinned());
+    // 계획 52 노드: `placement`를 모른다.
+    let old = current_node(&env, "plan52").await;
+    let mut node = env.cluster.get::<NodeSpec>(old).unwrap().unwrap();
+    node.status
+        .features
+        .retain(|f| f != opl_types::node::PLACEMENT);
+    env.cluster
+        .update_status::<NodeSpec>(old, &node.status)
+        .await
+        .unwrap();
+    let id = receive_ok(&admin, receive_body(&pinned())).await;
+    assert_eq!(get_backup(&env, id).unwrap().spec.vm_spec.placement, None);
+}
+
 /// 받기 요청 `body`로 받기를 시작해 파일을 모두 보내고 완료한 `ready` 사본의 id
 async fn ready_copy(client: &Client, body: Value) -> Uuid {
     let id = receive_ok(client, body).await;
