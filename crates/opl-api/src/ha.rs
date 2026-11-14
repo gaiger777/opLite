@@ -17,6 +17,9 @@
 //! 전원 끄기 펜싱(설계 §8.1): 리스가 `fence_after`보다 오래 끝났고 `NodeFence`가 있는 노드(HA VM이 있는 계획 51
 //! 노드)를 그 방법으로 한 번 끈다. 꺼짐을 확인했고 그 뒤 받은 갱신이 없으면 `recover_after`를 기다리지 않고
 //! 복구한다. 끄지 못하면 이 임기에는 다시 하지 않고 `recover_after`(watchdog)를 기다린다.
+//!
+//! HA 상태 검사(설계 §8.2, [`crate::ha_health`]): 복구할 노드가 없는 틱에 노드가 리스 갱신에 실어 보낸 검사 결과로
+//! 경고·마이그레이션·전원 끄기를 하고, 모든 대상 고르기에서 그 VM에 영향을 주는 검사가 실패한 노드를 뺀다.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,7 +30,7 @@ use async_trait::async_trait;
 use opl_cluster::types::{Command, LeaderRequest, NodeId, Rejection};
 use opl_cluster::{Cluster, ClusterError, Leases, Typed};
 use opl_types::fence::NodeFenceSpec;
-use opl_types::node::{FAST_HA, Node, NodeSpec, ha_capable};
+use opl_types::node::{FAST_HA, HA_CHECKS, Node, NodeSpec, ha_capable};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
@@ -39,6 +42,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::auth::unix_now;
+use crate::ha_health::{self, CheckWatch, Health, Place};
 use crate::placement::{self, Assign, Candidate};
 use crate::power_fence::{PowerFence, PowerOff, power_off};
 use crate::scheduler::{Inventory, node_fits};
@@ -49,10 +53,10 @@ use crate::vms::{RuleCheck, start_migration};
 const NO_NODE: &str = "HA cannot find a node for this VM";
 
 /// 옮긴 기록(`status.ha.relocations`)을 세는 창. reconciler가 재시작을 세는 창(`restart.window`)과 같다.
-const RELOCATE_WINDOW: Duration = Duration::from_secs(600);
+pub(crate) const RELOCATE_WINDOW: Duration = Duration::from_secs(600);
 
 /// 실행 중인 다른 쪽(그 노드의 실행기, 정리 작업)과 엇갈려 Task를 실패로 끝내지 못했을 때 다시 읽는 횟수
-const TASK_FAIL_ATTEMPTS: usize = 3;
+pub(crate) const TASK_FAIL_ATTEMPTS: usize = 3;
 
 /// 옮긴 VM이 대상 노드에서 켜지기를 기다리는 시간. 지나면 동시 시작 수에서 뺀다.
 const HA_START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -389,7 +393,7 @@ fn power_off_limit(inv: &Inventory) -> usize {
 
 /// 리더의 전원 끄기 펜싱 상태. 끄기는 따로 띄운 작업에서 하고(틱을 막지 않는다) 결과는 다음 틱에 받는다. 리더
 /// 자리를 잃으면 시도를 비운다(진행 중인 끄기는 끝까지 가지만 결과는 버린다).
-struct PowerFencing {
+pub(crate) struct PowerFencing {
     fence: Arc<dyn PowerFence>,
     attempts: Attempts,
     budget: Budget,
@@ -397,6 +401,8 @@ struct PowerFencing {
     done_tx: mpsc::UnboundedSender<Done>,
     done_rx: mpsc::UnboundedReceiver<Done>,
     requests: mpsc::UnboundedReceiver<(Uuid, String)>,
+    /// 리더 안에서 온 요청(HA 검사의 `fence`, [`PowerFencing::request`])
+    queued: Vec<(Uuid, String)>,
 }
 
 impl PowerFencing {
@@ -410,13 +416,21 @@ impl PowerFencing {
             done_tx,
             done_rx,
             requests,
+            queued: vec![],
         }
+    }
+
+    /// 노드 `node`를 `reason` 때문에 끄라고 한다. 다음 틱에 [`HaManager::power_off`]의 요청과 같은 규칙(`NodeFence`,
+    /// 임기 예산, 이 노드가 아님)으로 끈다.
+    pub(crate) fn request(&mut self, node: Uuid, reason: String) {
+        self.queued.push((node, reason));
     }
 
     /// 리더가 아니다: 시도와 요청을 버린다.
     fn reset(&mut self) {
         self.attempts = Attempts::default();
         self.budget = Budget::default();
+        self.queued.clear();
         while let Ok((node, reason)) = self.requests.try_recv() {
             tracing::info!(node = %node, reason = %reason, "not the leader; ignoring a power-off request");
         }
@@ -561,6 +575,7 @@ async fn run(
     let mut starting = Starting::default();
     let mut plans = Plans::default();
     let mut planner = Planner::default();
+    let mut watch = CheckWatch::default();
     let mut interval = tokio::time::interval(config.tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -578,7 +593,7 @@ async fn run(
         };
         tokio::select! {
             _ = &mut shutdown => return,
-            _ = tick(ctx, &config, &mut base, &mut unknown, &mut moved, &mut failback, &mut starting, &mut plans, &mut planner, &mut power) => {}
+            _ = tick(ctx, &config, &mut base, &mut unknown, &mut moved, &mut failback, &mut starting, &mut plans, &mut planner, &mut power, &mut watch) => {}
         }
     }
 }
@@ -595,6 +610,7 @@ async fn tick(
     plans: &mut Plans,
     planner: &mut Planner,
     power: &mut PowerFencing,
+    watch: &mut CheckWatch,
 ) {
     let cluster = ctx.cluster;
     for node in settled_by_term(unknown, ctx.writer.term(cluster), moved) {
@@ -607,6 +623,7 @@ async fn tick(
         *plans = Plans::default();
         *planner = Planner::default();
         power.reset();
+        watch.reset();
         return;
     }
     // 새 리더는 이전 커밋을 아직 적용하지 않았을 수 있으므로 장벽 뒤에 읽는다.
@@ -621,6 +638,16 @@ async fn tick(
     let Ok(inv) = Inventory::load(cluster) else {
         return;
     };
+    let Ok(health) = Health::load(cluster, &leases) else {
+        return;
+    };
+    let alive_nodes = inv
+        .nodes
+        .iter()
+        .filter(|n| alive(now, b, &leases, n))
+        .map(|n| n.id)
+        .collect();
+    watch.observe(&health, alive_nodes, now);
     let me = cluster.id().0;
     fence_power(ctx, power, &inv, &leases, now, b, unknown).await;
     let failed: Vec<Uuid> = inv
@@ -654,6 +681,7 @@ async fn tick(
             starting,
             &power.attempts,
             &down,
+            &health,
         )
         .await;
         if let Some(u) = recovered {
@@ -668,7 +696,7 @@ async fn tick(
     } else {
         inv
     };
-    let relocated = relocate(ctx, &inv, &leases, now, b).await;
+    let relocated = relocate(ctx, &inv, &leases, now, b, &health).await;
     // 옮긴 뒤의 자리로 위반을 센다.
     let inv = if relocated {
         match Inventory::load(cluster) {
@@ -678,10 +706,25 @@ async fn tick(
     } else {
         inv
     };
+    // 복구할 노드가 있는 틱에는 검사에 대응하지 않는다(다음 틱).
+    if !recovering {
+        let everywhere = inv
+            .nodes
+            .iter()
+            .all(|n| n.status.features.iter().any(|f| f == HA_CHECKS));
+        let decisions = ha_health::decide(&health, &inv, watch, now, everywhere);
+        let place = Place {
+            inv: &inv,
+            leases: &leases,
+            now,
+            b,
+        };
+        ha_health::react(ctx, decisions, watch, power, &health, place, everywhere).await;
+    }
     update_violations(ctx, &inv).await;
     failback.observe(now, &leases, &inv);
     if !recovering && unknown.is_empty() {
-        fail_back(ctx, failback, &inv, now, config.failback_after).await;
+        fail_back(ctx, failback, &inv, now, config.failback_after, &health).await;
     }
 }
 
@@ -841,7 +884,7 @@ async fn fence_power(
     power.attempts.forget_revived(leases);
     power.budget.begin(leases.term);
     let me = ctx.cluster.id().0;
-    let mut wanted: Vec<(Uuid, String)> = vec![];
+    let mut wanted: Vec<(Uuid, String)> = std::mem::take(&mut power.queued);
     while let Ok(request) = power.requests.try_recv() {
         wanted.push(request);
     }
@@ -966,6 +1009,7 @@ async fn recover_node(
     starting: &mut Starting,
     attempts: &Attempts,
     down: &BTreeSet<Uuid>,
+    health: &Health<'_>,
 ) -> Option<Unknown> {
     let cluster = ctx.cluster;
     let mut fence = Fence::begin(cluster, node);
@@ -1018,6 +1062,7 @@ async fn recover_node(
             b,
             &failed,
             vm,
+            health,
         )
         .await;
         if let Some((command, moved_to)) = fence.unknown.take() {
@@ -1065,16 +1110,18 @@ async fn recover_vm(
     b: Instant,
     failed: &Node,
     vm: &Vm,
+    health: &Health<'_>,
 ) -> Result<(), ClusterError> {
     let migrating = vm.status.migration.as_ref().map(|m| m.node);
     let now = Instant::now();
     // 죽은 노드와 마이그레이션을 받던 노드(같은 실행 디렉터리를 쓰는 QEMU가 남아 있을 수 있다)는 빼고,
-    // 리스가 살아 있어야 한다.
+    // 리스가 살아 있어야 하며 이 VM에 영향을 주는 HA 검사가 실패하지 않아야 한다.
     let eligible = |n: &Node| {
         n.id != failed.id
             && Some(n.id) != migrating
             && !queue.down.contains(&n.id)
             && ready(now, b, leases, n)
+            && !health.blocks(vm, n, inv)
     };
     let starts = !stays_stopped(vm);
     let limit = queue.limit;
@@ -1268,6 +1315,7 @@ async fn relocate(
     leases: &Leases,
     now: Instant,
     b: Instant,
+    health: &Health<'_>,
 ) -> bool {
     let mut vms: Vec<(&Vm, &Node)> = inv
         .vms
@@ -1282,7 +1330,7 @@ async fn relocate(
     let mut assign = Assign::default();
     let mut changed = false;
     for (vm, from) in vms {
-        match relocate_vm(ctx, inv, &mut assign, leases, now, b, vm, from).await {
+        match relocate_vm(ctx, inv, &mut assign, leases, now, b, vm, from, health).await {
             Ok(done) => changed |= done,
             Err(e) => {
                 tracing::info!(vm = %vm.name, error = %e, "cannot relocate HA VM; will retry");
@@ -1303,6 +1351,7 @@ async fn relocate_vm(
     b: Instant,
     vm: &Vm,
     from: &Node,
+    health: &Health<'_>,
 ) -> Result<bool, ClusterError> {
     let policy = vm.spec.ha.clone().unwrap_or_default();
     let mut ha = vm.status.ha.clone().unwrap_or_default();
@@ -1321,8 +1370,12 @@ async fn relocate_vm(
         ha.relocated_from = Some(from.id);
     }
     let migrating = vm.status.migration.as_ref().map(|m| m.node);
-    let eligible =
-        |n: &Node| n.id != from.id && Some(n.id) != migrating && alive(now, b, leases, n);
+    let eligible = |n: &Node| {
+        n.id != from.id
+            && Some(n.id) != migrating
+            && alive(now, b, leases, n)
+            && !health.blocks(vm, n, inv)
+    };
     let Some(target) = placed(ctx, vm, pick(vm, inv, assign, eligible)).await? else {
         return Ok(false);
     };
@@ -1357,7 +1410,7 @@ async fn relocate_vm(
 
 /// [`pick`]의 결과
 #[derive(Debug, PartialEq, Eq)]
-enum Pick {
+pub(crate) enum Pick {
     /// 조건과 hard 규칙에 맞는 가장 나은 노드
     Node(Uuid),
     /// hard 규칙에 맞는 노드는 없지만, 막는 규칙이 모두 `ha_may_violate`라 어기고 놓을 노드(위반이 가장
@@ -1371,7 +1424,12 @@ enum Pick {
 
 /// 복구할 노드를 고른다: `eligible`이고 노드 조건에 맞는 노드 가운데 [`placement::candidates`] 순서로 가장
 /// 나은 것.
-fn pick(vm: &Vm, inv: &Inventory, assign: &Assign, eligible: impl Fn(&Node) -> bool) -> Pick {
+pub(crate) fn pick(
+    vm: &Vm,
+    inv: &Inventory,
+    assign: &Assign,
+    eligible: impl Fn(&Node) -> bool,
+) -> Pick {
     let fits: Vec<&Node> = inv
         .nodes
         .iter()
@@ -1480,8 +1538,16 @@ impl Failback {
     }
 
     /// 이 VM이 되돌아갈 노드: 그룹이 있고 `nofailback`이 아니면, 지금 노드보다 그룹 우선순위가 높고
-    /// `after` 넘게 살아 있으며 노드 조건과 hard 규칙에 맞는 노드 가운데 가장 나은 것.
-    fn target(&self, vm: &Vm, inv: &Inventory, now: Instant, after: Duration) -> Option<Uuid> {
+    /// `after` 넘게 살아 있으며 노드 조건과 hard 규칙에 맞고 이 VM에 영향을 주는 HA 검사가 실패하지 않는 노드
+    /// 가운데 가장 나은 것.
+    fn target(
+        &self,
+        vm: &Vm,
+        inv: &Inventory,
+        now: Instant,
+        after: Duration,
+        health: &Health<'_>,
+    ) -> Option<Uuid> {
         let name = vm.spec.ha.as_ref()?.group.as_ref()?;
         let group = inv.groups.iter().find(|g| &g.name == name)?;
         if group.spec.nofailback {
@@ -1501,6 +1567,7 @@ impl Failback {
             })
             .filter(|n| node_fits(&vm.spec, inv, n).is_ok())
             .filter(|n| placement::hard_violations(vm, n, inv, &assign).is_empty())
+            .filter(|n| !health.blocks(vm, n, inv))
             .map(|n| placement::score(vm, n, inv, &assign))
             .collect();
         placement::best(&found).map(|c| c.node)
@@ -1517,6 +1584,7 @@ async fn fail_back(
     inv: &Inventory,
     now: Instant,
     after: Duration,
+    health: &Health<'_>,
 ) {
     if let Some(task) = failback.task {
         match ctx.cluster.get::<TaskSpec>(task) {
@@ -1545,7 +1613,7 @@ async fn fail_back(
         .collect();
     vms.sort_by(|a, b| a.name.cmp(&b.name));
     for vm in vms {
-        let Some(target) = failback.target(vm, inv, now, after) else {
+        let Some(target) = failback.target(vm, inv, now, after, health) else {
             continue;
         };
         match start_migration(
@@ -1658,7 +1726,7 @@ async fn fail_task(ctx: Ctx<'_>, task: &Task, error: &str) {
 
 /// 노드 `node`에서 켜져 있기로 된 HA VM. 이런 VM이 없는 노드는 전원을 끄지 않는다(꺼진 `state: stopped` VM은
 /// `recover_after` 뒤 자리만 옮긴다).
-fn runs_ha(vm: &Vm, node: Uuid) -> bool {
+pub(crate) fn runs_ha(vm: &Vm, node: Uuid) -> bool {
     vm.spec.node == Some(node) && vm.spec.ha_active() && vm.spec.power == PowerState::Running
 }
 
@@ -1693,7 +1761,7 @@ fn dead(now: Instant, b: Instant, leases: &Leases, node: &Node, attempts: &Attem
 
 /// 복구·미리 고르기의 대상이 될 수 있는 노드: HA 가능 노드이고 리스가 `fence_after`(알리지 않는 계획 51 전 노드는
 /// `recover_after`)보다 새롭다. 함께 죽어 아직 `recover_after`가 지나지 않은 노드로 옮기지 않는다.
-fn ready(now: Instant, b: Instant, leases: &Leases, node: &Node) -> bool {
+pub(crate) fn ready(now: Instant, b: Instant, leases: &Leases, node: &Node) -> bool {
     node.status.ha.is_some_and(|ha| {
         let fresh = ha.fence_after_secs.unwrap_or(ha.recover_after_secs);
         lease_age(now, b, leases, node.id) < Duration::from_secs(fresh)
@@ -1784,9 +1852,9 @@ impl RecoveryWriter for LeaderWriter {
 
 /// 복구에 쓰는 것: 앱 상태(되돌아가기의 마이그레이션), 클러스터와 쓰기 경로
 #[derive(Clone, Copy)]
-struct Ctx<'a> {
-    state: &'a AppState,
-    cluster: &'a Cluster,
+pub(crate) struct Ctx<'a> {
+    pub state: &'a AppState,
+    pub cluster: &'a Cluster,
     writer: &'a dyn RecoveryWriter,
 }
 
@@ -1817,7 +1885,7 @@ fn status_command<S: ResourceSpec>(
     })
 }
 
-async fn update_status_checked<S: ResourceSpec>(
+pub(crate) async fn update_status_checked<S: ResourceSpec>(
     ctx: Ctx<'_>,
     id: Uuid,
     expected_revision: u64,
@@ -1826,7 +1894,10 @@ async fn update_status_checked<S: ResourceSpec>(
     write(ctx, status_command::<S>(id, expected_revision, status)?).await
 }
 
-async fn create<S: ResourceSpec>(ctx: Ctx<'_>, resource: &Typed<S>) -> Result<u64, ClusterError> {
+pub(crate) async fn create<S: ResourceSpec>(
+    ctx: Ctx<'_>,
+    resource: &Typed<S>,
+) -> Result<u64, ClusterError> {
     let command = Command::Create {
         kind: S::KIND,
         resource: serde_json::from_value(serde_json::to_value(resource)?)?,

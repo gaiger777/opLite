@@ -18,6 +18,7 @@ mod firmware;
 mod ha;
 mod ha_checks;
 mod ha_groups;
+mod ha_health;
 pub mod health;
 mod incoming;
 mod janitor;
