@@ -1010,6 +1010,7 @@ mod tests {
             disks: vec![],
             nics: vec![],
             guest_agent: false,
+            hotplug: None,
         };
         hv.start(&vm, None).await.unwrap();
         hv.pause(id).await.unwrap();

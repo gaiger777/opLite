@@ -366,5 +366,6 @@ async fn resolve(
             .ha
             .as_ref()
             .is_some_and(|ha| ha.guest_watch.is_some()),
+        hotplug: None,
     })
 }

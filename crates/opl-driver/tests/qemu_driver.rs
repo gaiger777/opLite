@@ -44,6 +44,7 @@ fn spec() -> VmRuntimeSpec {
         disks: vec![],
         nics: vec![],
         guest_agent: false,
+        hotplug: None,
     }
 }
 

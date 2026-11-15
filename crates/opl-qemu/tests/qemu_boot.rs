@@ -45,6 +45,7 @@ fn spec(id: Uuid, disk: PathBuf) -> VmRuntimeSpec {
             backend: NicBackend::User,
         }],
         guest_agent: false,
+        hotplug: None,
     }
 }
 

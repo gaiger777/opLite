@@ -324,6 +324,39 @@ impl JobInfo {
     }
 }
 
+/// `query-hotpluggable-cpus`의 CPU 자리 하나
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotpluggableCpu {
+    /// `device_add`에 줄 CPU 장치 이름(`type`, 예: `max-x86_64-cpu`)
+    pub kind: String,
+    pub vcpus_count: u32,
+    pub socket_id: Option<u32>,
+    pub core_id: Option<u32>,
+    pub thread_id: Option<u32>,
+    /// 켜진 자리의 QOM 경로. 빈 자리는 없다.
+    pub qom_path: Option<String>,
+}
+
+impl HotpluggableCpu {
+    fn parse(v: &Value) -> Result<Self, QmpError> {
+        let kind = v["type"]
+            .as_str()
+            .ok_or_else(|| QmpError::Protocol(format!("hotpluggable cpu without type: {v}")))?;
+        let prop = |k: &str| v["props"][k].as_u64().and_then(|n| u32::try_from(n).ok());
+        Ok(Self {
+            kind: kind.to_string(),
+            vcpus_count: v["vcpus-count"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(1),
+            socket_id: prop("socket-id"),
+            core_id: prop("core-id"),
+            thread_id: prop("thread-id"),
+            qom_path: v["qom-path"].as_str().map(str::to_string),
+        })
+    }
+}
+
 /// NBD 서버의 내보내기에 붙는 블록 노드(`blockdev-add`, `driver: nbd`). 늘 TLS로 붙는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NbdBlockdev {
@@ -729,6 +762,113 @@ impl QmpClient {
     pub async fn block_resize(&self, node: &str, size: u64) -> Result<(), QmpError> {
         let args = json!({ "node-name": node, "size": size });
         self.execute("block_resize", Some(args)).await.map(drop)
+    }
+
+    /// CPU 자리 목록(`query-hotpluggable-cpus`). 켜진 자리만 `qom_path`가 있다. CPU 핫플러그가 없는 머신
+    /// (aarch64 `virt`)은 `GenericError`다.
+    pub async fn query_hotpluggable_cpus(&self) -> Result<Vec<HotpluggableCpu>, QmpError> {
+        let ret = self.execute("query-hotpluggable-cpus", None).await?;
+        ret.as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("query-hotpluggable-cpus: {ret}")))?
+            .iter()
+            .map(HotpluggableCpu::parse)
+            .collect()
+    }
+
+    /// 켜진 vCPU 수(`query-cpus-fast`)
+    pub async fn query_cpus_fast(&self) -> Result<usize, QmpError> {
+        let ret = self.execute("query-cpus-fast", None).await?;
+        ret.as_array()
+            .map(Vec::len)
+            .ok_or_else(|| QmpError::Protocol(format!("query-cpus-fast: {ret}")))
+    }
+
+    /// 장치를 붙인다(`device_add`, 인자는 `driver`·`id`와 장치 속성).
+    pub async fn device_add(&self, args: Value) -> Result<(), QmpError> {
+        self.execute("device_add", Some(args)).await.map(drop)
+    }
+
+    /// 장치 `id`를 떼고 `DEVICE_DELETED`를 `timeout`까지 기다린다. 뗐으면(이미 없었으면) true, 게스트가 시간 안에
+    /// 내려 주지 않았으면 false다(요청은 QEMU에 남아 게스트가 나중에 내려 줄 수 있다).
+    pub async fn device_del_wait(&self, id: &str, timeout: Duration) -> Result<bool, QmpError> {
+        // 이벤트가 `device_del`의 답보다 먼저 와도 놓치지 않게 보내기 전에 구독한다.
+        let mut events = self.subscribe();
+        let run = async {
+            match self.execute("device_del", Some(json!({ "id": id }))).await {
+                Ok(_) => {}
+                Err(QmpError::Command { class, .. }) if class == "DeviceNotFound" => {
+                    return Ok(true);
+                }
+                Err(e) => return Err(e),
+            }
+            loop {
+                match events.recv().await {
+                    Ok(ev) => {
+                        if ev.event == "DEVICE_DELETED" && ev.data["device"] == id {
+                            return Ok(true);
+                        }
+                    }
+                    // 이벤트를 놓쳤으면 장치가 아직 있는지 직접 본다.
+                    Err(RecvError::Lagged(_)) => {
+                        if !self.peripheral_exists(id).await? {
+                            return Ok(true);
+                        }
+                    }
+                    Err(RecvError::Closed) => return Err(QmpError::Disconnected),
+                }
+            }
+        };
+        match tokio::time::timeout(timeout, run).await {
+            Ok(r) => r,
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// id를 준 장치 `id`가 아직 있는지(`/machine/peripheral`의 자식)
+    async fn peripheral_exists(&self, id: &str) -> Result<bool, QmpError> {
+        let ret = self
+            .execute("qom-list", Some(json!({ "path": "/machine/peripheral" })))
+            .await?;
+        let children = ret
+            .as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("qom-list: {ret}")))?;
+        Ok(children.iter().any(|c| c["name"] == id))
+    }
+
+    /// 네트워크 백엔드를 만든다(`netdev_add`, 인자는 `type`·`id`와 백엔드 속성).
+    pub async fn netdev_add(&self, args: Value) -> Result<(), QmpError> {
+        self.execute("netdev_add", Some(args)).await.map(drop)
+    }
+
+    /// 네트워크 백엔드 `id`를 지운다.
+    pub async fn netdev_del(&self, id: &str) -> Result<(), QmpError> {
+        self.execute("netdev_del", Some(json!({ "id": id })))
+            .await
+            .map(drop)
+    }
+
+    /// 블록 노드를 연다(`blockdev-add`, 인자는 `driver`·`node-name`과 드라이버 속성).
+    pub async fn blockdev_add(&self, args: Value) -> Result<(), QmpError> {
+        self.execute("blockdev-add", Some(args)).await.map(drop)
+    }
+
+    /// QOM 객체 `path`의 속성 `property`를 읽는다.
+    pub async fn qom_get(&self, path: &str, property: &str) -> Result<Value, QmpError> {
+        self.execute(
+            "qom-get",
+            Some(json!({ "path": path, "property": property })),
+        )
+        .await
+    }
+
+    /// QOM 객체 `path`의 속성 `property`를 `value`로 바꾼다. 예: virtio-mem의 `requested-size`(바이트)
+    pub async fn qom_set(&self, path: &str, property: &str, value: Value) -> Result<(), QmpError> {
+        self.execute(
+            "qom-set",
+            Some(json!({ "path": path, "property": property, "value": value })),
+        )
+        .await
+        .map(drop)
     }
 
     /// QEMU 버전 `major.minor.micro`
@@ -2175,5 +2315,186 @@ mod tests {
             fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
         });
         res.unwrap();
+    }
+    /// 핫플러그 명령은 받은 인자를 그대로 보낸다.
+    #[tokio::test]
+    async fn hotplug_commands_send_their_arguments() {
+        let (client, mut fake, _dir) = setup().await;
+        let dev = json!({ "driver": "virtio-blk-pci", "drive": "disk1", "id": "disk1-dev", "bus": "hp0" });
+        let (r, cmd) = tokio::join!(client.device_add(dev.clone()), reply(&mut fake, json!({})));
+        r.unwrap();
+        assert_eq!(
+            (&cmd["execute"], &cmd["arguments"]),
+            (&json!("device_add"), &dev)
+        );
+
+        let file = json!({ "driver": "file", "filename": "/p/b.qcow2", "node-name": "disk1-file" });
+        let (r, cmd) = tokio::join!(
+            client.blockdev_add(file.clone()),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(
+            (&cmd["execute"], &cmd["arguments"]),
+            (&json!("blockdev-add"), &file)
+        );
+
+        let tap = json!({ "type": "tap", "id": "net1", "ifname": "op0n1", "script": "no", "downscript": "no" });
+        let (r, cmd) = tokio::join!(client.netdev_add(tap.clone()), reply(&mut fake, json!({})));
+        r.unwrap();
+        assert_eq!(
+            (&cmd["execute"], &cmd["arguments"]),
+            (&json!("netdev_add"), &tap)
+        );
+
+        let (r, cmd) = tokio::join!(client.netdev_del("net1"), reply(&mut fake, json!({})));
+        r.unwrap();
+        assert_eq!(cmd["execute"], "netdev_del");
+        assert_eq!(cmd["arguments"], json!({ "id": "net1" }));
+
+        let path = "/machine/peripheral/vmem0-dev";
+        let (r, cmd) = tokio::join!(
+            client.qom_set(path, "requested-size", json!(1u64 << 30)),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "qom-set");
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "path": path, "property": "requested-size", "value": 1u64 << 30 })
+        );
+
+        let (r, cmd) = tokio::join!(
+            client.qom_get(path, "size"),
+            reply(&mut fake, json!(536870912u64))
+        );
+        assert_eq!(r.unwrap(), json!(536870912u64));
+        assert_eq!(cmd["execute"], "qom-get");
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "path": path, "property": "size" })
+        );
+
+        let cpus = json!([
+            { "cpu-index": 0, "qom-path": "/machine/unattached/device[0]", "thread-id": 1, "target": "x86_64" },
+            { "cpu-index": 1, "qom-path": "/machine/peripheral/cpu1", "thread-id": 2, "target": "x86_64" }
+        ]);
+        let (r, cmd) = tokio::join!(client.query_cpus_fast(), reply(&mut fake, cpus));
+        assert_eq!(r.unwrap(), 2);
+        assert_eq!(cmd["execute"], "query-cpus-fast");
+    }
+
+    /// QEMU 11.1 q35의 `query-hotpluggable-cpus` 모양: 켜진 자리만 `qom-path`가 있다.
+    #[tokio::test]
+    async fn hotpluggable_cpus_are_parsed() {
+        let (client, mut fake, _dir) = setup().await;
+        let ret = json!([
+            { "props": { "core-id": 1, "thread-id": 0, "socket-id": 0 }, "vcpus-count": 1,
+              "type": "max-x86_64-cpu" },
+            { "props": { "core-id": 0, "thread-id": 0, "socket-id": 0 }, "vcpus-count": 1,
+              "qom-path": "/machine/unattached/device[0]", "type": "max-x86_64-cpu" }
+        ]);
+        let (cpus, cmd) = tokio::join!(client.query_hotpluggable_cpus(), reply(&mut fake, ret));
+        assert_eq!(cmd["execute"], "query-hotpluggable-cpus");
+        let slot = |core, qom_path: Option<&str>| HotpluggableCpu {
+            kind: "max-x86_64-cpu".into(),
+            vcpus_count: 1,
+            socket_id: Some(0),
+            core_id: Some(core),
+            thread_id: Some(0),
+            qom_path: qom_path.map(Into::into),
+        };
+        assert_eq!(
+            cpus.unwrap(),
+            [
+                slot(1, None),
+                slot(0, Some("/machine/unattached/device[0]"))
+            ]
+        );
+        let (cpus, _) = tokio::join!(
+            client.query_hotpluggable_cpus(),
+            reply(&mut fake, json!([{ "props": {} }]))
+        );
+        assert!(matches!(cpus, Err(QmpError::Protocol(_))), "{cpus:?}");
+    }
+
+    /// `DEVICE_DELETED`가 `device_del`의 답보다 먼저 와도 잡고, 다른 장치의 이벤트는 무시한다.
+    #[tokio::test]
+    async fn device_del_wait_catches_the_event_even_before_the_reply() {
+        let (client, mut fake, _dir) = setup().await;
+        let (r, ()) = tokio::join!(client.device_del_wait("disk1-dev", T), async {
+            let cmd = fake.recv().await;
+            assert_eq!(cmd["execute"], "device_del");
+            assert_eq!(cmd["arguments"], json!({ "id": "disk1-dev" }));
+            let deleted = |device: &str| {
+                json!({ "event": "DEVICE_DELETED", "timestamp": {},
+                        "data": { "device": device, "path": format!("/machine/peripheral/{device}") } })
+            };
+            fake.send(deleted("nic1")).await;
+            fake.send(deleted("disk1-dev")).await;
+            fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+        });
+        assert!(r.unwrap());
+    }
+
+    /// 다른 장치의 이벤트만 오고 시간이 넘으면 false다(게스트가 내려 주지 않음).
+    #[tokio::test]
+    async fn device_del_wait_is_false_when_the_guest_does_not_release() {
+        let (client, mut fake, _dir) = setup().await;
+        let (r, _fake) = tokio::join!(
+            client.device_del_wait("cpu3", Duration::from_millis(200)),
+            async {
+                let cmd = fake.recv().await;
+                fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+                fake.send(json!({ "event": "DEVICE_DELETED", "timestamp": {},
+                                  "data": { "device": "cpu2", "path": "/machine/peripheral/cpu2" } }))
+                    .await;
+                fake
+            }
+        );
+        assert!(!r.unwrap());
+    }
+
+    /// 이미 없는 장치(`DeviceNotFound`)는 뗀 것이다. 다른 오류는 그대로 돌려준다.
+    #[tokio::test]
+    async fn device_del_wait_treats_a_missing_device_as_removed() {
+        let (client, mut fake, _dir) = setup().await;
+        let (r, ()) = tokio::join!(client.device_del_wait("nic2", T), async {
+            fake.answer(
+                "device_del",
+                json!({ "error": { "class": "DeviceNotFound", "desc": "Device 'nic2' not found" } }),
+            )
+            .await;
+        });
+        assert!(r.unwrap());
+        let (r, ()) = tokio::join!(client.device_del_wait("nic2", T), async {
+            fake.answer(
+                "device_del",
+                json!({ "error": { "class": "GenericError", "desc": "Bus 'pcie.0' does not support hotplugging" } }),
+            )
+            .await;
+        });
+        assert!(matches!(r, Err(QmpError::Command { .. })), "{r:?}");
+    }
+
+    /// 이벤트를 놓치면(`Lagged`) `/machine/peripheral`에 장치가 남았는지 직접 본다.
+    #[tokio::test]
+    async fn device_del_wait_checks_the_device_after_lagging() {
+        let (client, mut fake, _dir) = setup().await;
+        let (r, ()) = tokio::join!(client.device_del_wait("disk1-dev", T), async {
+            let cmd = fake.recv().await;
+            for _ in 0..100 {
+                job_status(&mut fake, &json!("other"), "running").await;
+            }
+            fake.send(json!({ "return": {}, "id": cmd["id"] })).await;
+            let list = fake.recv().await;
+            assert_eq!(list["execute"], "qom-list");
+            assert_eq!(list["arguments"], json!({ "path": "/machine/peripheral" }));
+            fake.send(json!({ "return": [{ "name": "type", "type": "string" },
+                                         { "name": "disk0-dev", "type": "child<virtio-blk-pci>" }],
+                              "id": list["id"] }))
+                .await;
+        });
+        assert!(r.unwrap());
     }
 }

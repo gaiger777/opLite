@@ -140,6 +140,7 @@ async fn received_vm_is_continued_after_the_commit() {
         disks: vec![],
         nics: vec![],
         guest_agent: false,
+        hotplug: None,
     };
     env.hv
         .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])

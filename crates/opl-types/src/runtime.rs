@@ -21,6 +21,10 @@ pub struct VmRuntimeSpec {
     /// 마이그레이션된다.
     #[serde(default)]
     pub guest_agent: bool,
+    /// 핫플러그 배치(계획 54). 없으면 옛 명령줄 그대로(vCPU 자리·virtio-mem·루트 포트 없음). 받는 쪽도 같은 값이어야
+    /// 마이그레이션된다.
+    #[serde(default)]
+    pub hotplug: Option<HotplugLayout>,
 }
 
 /// 핫플러그 배치가 켤 때 두는 빈 PCIe 루트 포트 수
@@ -172,6 +176,39 @@ mod tests {
         assert_eq!(json["kind"], "rbd");
         assert_eq!(json["rbd"]["image"], "opl-a");
         assert_eq!(serde_json::from_value::<RuntimeDisk>(json).unwrap(), rbd);
+    }
+
+    #[test]
+    fn hotplug_layout_defaults_to_none() {
+        // hotplug이 없는 옛 정의(계획 54 전 opld가 남긴 것)는 배치가 없다.
+        let old = serde_json::json!({
+            "id": uuid::Uuid::nil(), "name": "a", "cpu": { "cores": 1 }, "memory_mib": 256,
+            "firmware": "uefi", "machine": "virt", "disks": [], "nics": []
+        });
+        let spec: VmRuntimeSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(spec.hotplug, None);
+        let layout = HotplugLayout {
+            vcpus: 2,
+            max_memory_mib: 4096,
+            plugged_mib: 0,
+            ports: HOTPLUG_PORTS,
+            boot_disks: 1,
+            boot_nics: 0,
+            disk_ports: vec![],
+            nic_ports: vec![],
+        };
+        let spec = VmRuntimeSpec {
+            hotplug: Some(layout.clone()),
+            ..spec
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["hotplug"]["ports"], 8);
+        assert_eq!(
+            serde_json::from_value::<VmRuntimeSpec>(json)
+                .unwrap()
+                .hotplug,
+            Some(layout)
+        );
     }
 
     #[test]

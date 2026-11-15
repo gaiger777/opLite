@@ -7,9 +7,10 @@ pub mod qga;
 pub mod qmp;
 
 pub use cmdline::{CmdlineError, build_cmdline, build_incoming_cmdline};
-pub use host::{Accel, HostProfile, kvm_available};
+pub use host::{Accel, HostProfile, hotplug_caps, kvm_available};
 pub use paths::{PathError, RuntimePaths};
 pub use qmp::{
-    BitmapInfo, BlockNode, BlockStats, JobInfo, MigrationInfo, MigrationParameters, MigrationState,
-    NbdBlockdev, QmpClient, QmpError, QmpEvent, RunState, TlsEndpoint, TransactionAction,
+    BitmapInfo, BlockNode, BlockStats, HotpluggableCpu, JobInfo, MigrationInfo,
+    MigrationParameters, MigrationState, NbdBlockdev, QmpClient, QmpError, QmpEvent, RunState,
+    TlsEndpoint, TransactionAction,
 };

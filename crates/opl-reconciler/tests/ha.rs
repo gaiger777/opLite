@@ -884,6 +884,7 @@ async fn received_ha_vm_is_continued_only_with_the_lease() {
         disks: vec![],
         nics: vec![],
         guest_agent: false,
+        hotplug: None,
     };
     env.hv
         .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])

@@ -2071,6 +2071,7 @@ mod tests {
             disks: vec![],
             nics: vec![],
             guest_agent: false,
+            hotplug: None,
         }
     }
 

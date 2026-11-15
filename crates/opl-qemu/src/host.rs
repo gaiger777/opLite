@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use opl_types::node::NodeHotplug;
 use opl_types::vm::Arch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +88,16 @@ pub fn kvm_available() -> bool {
         .is_ok()
 }
 
+/// 노드의 핫플러그 능력. vCPU는 Linux(`linux`)의 x86_64만(aarch64 `virt`는 QEMU 11.1까지 CPU 핫플러그가 없고,
+/// macOS x86_64의 HVF도 아니다), 메모리는 `qemu-system-* -device help` 출력에 `virtio-mem-pci`가 있을 때다(macOS
+/// Homebrew QEMU에는 없다).
+pub fn hotplug_caps(arch: Arch, linux: bool, device_help: &str) -> NodeHotplug {
+    NodeHotplug {
+        cpu: linux && arch == Arch::X86_64,
+        memory: device_help.contains("\"virtio-mem-pci\""),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +110,47 @@ mod tests {
         let arm = HostProfile::debian(Arch::Aarch64, Accel::Tcg);
         assert_eq!(arm.accel, Accel::Tcg);
         assert!(arm.uefi_vars_template.ends_with("AAVMF_VARS.fd"));
+    }
+
+    /// `-device help`의 한 줄 모양(QEMU 8.2·11.1): `name "virtio-mem-pci", bus PCI`
+    #[test]
+    fn hotplug_caps_read_the_arch_and_the_device_list() {
+        let with = "Misc devices:\nname \"pxb\", bus PCI\nname \"virtio-mem-pci\", bus PCI\n";
+        let without =
+            "Misc devices:\nname \"virtio-balloon-pci\", bus PCI\nname \"virtio-mem-pci-base\"\n";
+        assert_eq!(
+            hotplug_caps(Arch::X86_64, true, with),
+            NodeHotplug {
+                cpu: true,
+                memory: true
+            }
+        );
+        assert_eq!(
+            hotplug_caps(Arch::X86_64, true, without),
+            NodeHotplug {
+                cpu: true,
+                memory: false
+            }
+        );
+        assert_eq!(
+            hotplug_caps(Arch::Aarch64, true, with),
+            NodeHotplug {
+                cpu: false,
+                memory: true
+            }
+        );
+        assert_eq!(
+            hotplug_caps(Arch::Aarch64, true, ""),
+            NodeHotplug::default()
+        );
+        // macOS x86_64(HVF)는 vCPU 핫플러그를 하지 않는다.
+        assert_eq!(
+            hotplug_caps(Arch::X86_64, false, with),
+            NodeHotplug {
+                cpu: false,
+                memory: true
+            }
+        );
     }
 
     #[test]
