@@ -347,6 +347,7 @@ async fn two_nodes_with(
             fence_check: None,
             interfaces: vec![],
             checks: vec![],
+            hotplug: None,
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();

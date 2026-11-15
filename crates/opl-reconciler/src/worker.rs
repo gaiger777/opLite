@@ -1418,6 +1418,7 @@ impl Worker {
             firmware_node: vm.status.firmware_node,
             rule_violations: vm.status.rule_violations.clone(),
             ha: vm.status.ha.clone(),
+            hardware: None,
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

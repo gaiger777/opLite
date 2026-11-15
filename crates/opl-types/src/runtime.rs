@@ -23,6 +23,36 @@ pub struct VmRuntimeSpec {
     pub guest_agent: bool,
 }
 
+/// 핫플러그 배치가 켤 때 두는 빈 PCIe 루트 포트 수
+pub const HOTPLUG_PORTS: u8 = 8;
+
+/// 핫플러그 배치(계획 54): 켤 때 둔 vCPU 자리·virtio-mem·빈 루트 포트와 지금 그 안에서 바뀐 것. 마이그레이션 대상은
+/// 같은 배치로 켠다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct HotplugLayout {
+    /// 지금 켜진 vCPU 수(켤 때 수 이상, 상한 이하)
+    pub vcpus: u16,
+    /// 메모리 상한(MiB). 켤 때 `memory_mib`와 같으면 virtio-mem 장치가 없다.
+    pub max_memory_mib: u32,
+    /// virtio-mem에 꽂은 크기(`requested-size`, MiB)
+    pub plugged_mib: u32,
+    /// 빈 루트 포트 수(`hp0`부터)
+    pub ports: u8,
+    /// 켤 때 단 디스크 수. 이 뒤의 디스크는 실행 중 붙인 것이다.
+    pub boot_disks: u8,
+    /// 켤 때 단 NIC 수. 이 뒤의 NIC는 실행 중 붙인 것이다.
+    pub boot_nics: u8,
+    /// 실행 중 붙인 디스크(순번 `boot_disks`부터)마다 그 루트 포트
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub disk_ports: Vec<u8>,
+    /// 실행 중 붙인 NIC(순번 `boot_nics`부터)마다 그 루트 포트
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub nic_ports: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeDisk {
     /// 파일·블록 디스크의 경로. RBD 디스크는 비어 있고 `rbd`를 쓴다.

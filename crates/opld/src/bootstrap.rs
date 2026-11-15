@@ -240,6 +240,7 @@ async fn record_node(
             // 인터페이스와 HA 검사 결과는 노드의 검사기가 쓴다. 지우지 않는다.
             interfaces: std::mem::take(&mut status.interfaces),
             checks: std::mem::take(&mut status.checks),
+            hotplug: None,
         };
         true
     })
@@ -757,7 +758,8 @@ pub(crate) mod tests {
                 "ha-placement",
                 "fast-ha",
                 "ha-checks",
-                "placement"
+                "placement",
+                "hotplug"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -787,7 +789,8 @@ pub(crate) mod tests {
                 "ha-placement",
                 "fast-ha",
                 "ha-checks",
-                "placement"
+                "placement",
+                "hotplug"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -836,7 +839,8 @@ pub(crate) mod tests {
                 "ha-placement",
                 "fast-ha",
                 "ha-checks",
-                "placement"
+                "placement",
+                "hotplug"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1060,6 +1064,7 @@ pub(crate) mod tests {
                     "fast-ha".into(),
                     "ha-checks".into(),
                     "placement".into(),
+                    "hotplug".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

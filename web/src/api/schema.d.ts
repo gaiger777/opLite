@@ -2222,6 +2222,12 @@ export interface components {
         CpuSpec: {
             /** Format: int32 */
             cores: number;
+            /**
+             * Format: int32
+             * @description vCPU 핫플러그 상한(계획 54). 없으면 `sockets × cores`와 같다(핫플러그 꺼짐). 실행 중에는 `cores`를 이 안에서
+             *     바꾼다(소켓마다 코어 `max_vcpus / sockets`개 자리).
+             */
+            max_vcpus?: number;
             model?: components["schemas"]["CpuModel"];
             /** Format: int32 */
             sockets?: number;
@@ -2418,6 +2424,12 @@ export interface components {
                  */
                 ha?: components["schemas"]["HaSetting"];
                 machine: components["schemas"]["MachineType"];
+                /**
+                 * Format: int32
+                 * @description 메모리 핫플러그 상한(MiB, 계획 54). 없으면 `memory_mib`와 같다(핫플러그 꺼짐). 없으면 쓰지 않아 옛 노드도
+                 *     VM을 푼다.
+                 */
+                max_memory_mib?: number;
                 /** Format: int32 */
                 memory_mib: number;
                 nics?: components["schemas"]["NicSpec"][];
@@ -2809,6 +2821,46 @@ export interface components {
         HealthCheck: "quorum" | "apply_lag" | "lease" | "runtimes" | "maintenance" | "role";
         /** @enum {string} */
         HealthStatus: "ok" | "unavailable";
+        /**
+         * @description 핫플러그 배치(계획 54): 켤 때 둔 vCPU 자리·virtio-mem·빈 루트 포트와 지금 그 안에서 바뀐 것. 마이그레이션 대상은
+         *     같은 배치로 켠다.
+         */
+        HotplugLayout: {
+            /**
+             * Format: int32
+             * @description 켤 때 단 디스크 수. 이 뒤의 디스크는 실행 중 붙인 것이다.
+             */
+            boot_disks: number;
+            /**
+             * Format: int32
+             * @description 켤 때 단 NIC 수. 이 뒤의 NIC는 실행 중 붙인 것이다.
+             */
+            boot_nics: number;
+            /** @description 실행 중 붙인 디스크(순번 `boot_disks`부터)마다 그 루트 포트 */
+            disk_ports?: number[];
+            /**
+             * Format: int32
+             * @description 메모리 상한(MiB). 켤 때 `memory_mib`와 같으면 virtio-mem 장치가 없다.
+             */
+            max_memory_mib: number;
+            /** @description 실행 중 붙인 NIC(순번 `boot_nics`부터)마다 그 루트 포트 */
+            nic_ports?: number[];
+            /**
+             * Format: int32
+             * @description virtio-mem에 꽂은 크기(`requested-size`, MiB)
+             */
+            plugged_mib: number;
+            /**
+             * Format: int32
+             * @description 빈 루트 포트 수(`hp0`부터)
+             */
+            ports: number;
+            /**
+             * Format: int32
+             * @description 지금 켜진 vCPU 수(켤 때 수 이상, 상한 이하)
+             */
+            vcpus: number;
+        };
         /**
          * Format: binary
          * @description 업로드 본문의 문서용 스키마: 바이너리 파일
@@ -3432,6 +3484,8 @@ export interface components {
                     firewall?: boolean;
                     /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
                     ha?: components["schemas"]["NodeHa"];
+                    /** @description 이 노드의 QEMU가 할 수 있는 핫플러그(계획 54). 노드가 시작할 때 쓴다. 없으면(옛 노드·위트니스) 모두 못 한다. */
+                    hotplug?: components["schemas"]["NodeHotplug"];
                     /**
                      * @description 예: `qemu-hvf`, `qemu-kvm`, `qemu-tcg`
                      * @default
@@ -3761,6 +3815,12 @@ export interface components {
                      */
                     ha?: components["schemas"]["HaSetting"];
                     machine: components["schemas"]["MachineType"];
+                    /**
+                     * Format: int32
+                     * @description 메모리 핫플러그 상한(MiB, 계획 54). 없으면 `memory_mib`와 같다(핫플러그 꺼짐). 없으면 쓰지 않아 옛 노드도
+                     *     VM을 푼다.
+                     */
+                    max_memory_mib?: number;
                     /** Format: int32 */
                     memory_mib: number;
                     nics?: components["schemas"]["NicSpec"][];
@@ -3785,6 +3845,11 @@ export interface components {
                     firmware_node?: string;
                     /** @description HA 재시작·옮기기 기록. 기록이 없으면 빼고 쓴다. */
                     ha?: components["schemas"]["VmHaStatus"];
+                    /**
+                     * @description 도는 QEMU의 하드웨어(계획 54). VM을 켠 노드가 `running`을 쓸 때 함께 쓰고 핫플러그 Task가 고치며, QEMU가
+                     *     없어지면 지운다. 옛 노드는 이 필드를 무시한다.
+                     */
+                    hardware?: components["schemas"]["RunningHardware"];
                     /** @default null */
                     last_error: string | null;
                     /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
@@ -4018,6 +4083,13 @@ export interface components {
              */
             recover_after_secs: number;
         };
+        /** @description 노드의 핫플러그 능력. 디스크·NIC(루트 포트)는 `hotplug` 기능이 있는 모든 노드가 하므로 적지 않는다. */
+        NodeHotplug: {
+            /** @description vCPU 핫플러그(x86_64만) */
+            cpu?: boolean;
+            /** @description virtio-mem 메모리 핫플러그(QEMU에 `virtio-mem-pci`가 있음) */
+            memory?: boolean;
+        };
         /** @description 노드의 네트워크 인터페이스 하나(`ip -d addr`와 sysfs) */
         NodeInterface: {
             /** @description IP 주소(CIDR, 예: `10.0.0.5/24`) */
@@ -4201,6 +4273,8 @@ export interface components {
             firewall?: boolean;
             /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
             ha?: components["schemas"]["NodeHa"];
+            /** @description 이 노드의 QEMU가 할 수 있는 핫플러그(계획 54). 노드가 시작할 때 쓴다. 없으면(옛 노드·위트니스) 모두 못 한다. */
+            hotplug?: components["schemas"]["NodeHotplug"];
             /**
              * @description 예: `qemu-hvf`, `qemu-kvm`, `qemu-tcg`
              * @default
@@ -4312,6 +4386,23 @@ export interface components {
             current?: string | null;
             name: string;
         };
+        /** @description 실행 중에 적용하지 못해 다음 재시작 때 적용할 변경 하나 */
+        PendingChange: {
+            /** @description 이유의 자세한 설명(예: 실패한 까닭) */
+            detail?: string;
+            /** @description `vcpus`, `cpu`, `cpu.max_vcpus`, `memory_mib`, `max_memory_mib`, `firmware`, `machine` */
+            field: string;
+            reason: components["schemas"]["PendingReason"];
+            /** @description 도는 값 */
+            running: string;
+            /** @description 스펙의 값 */
+            wanted: string;
+        };
+        /**
+         * @description 실행 중에 적용하지 못한 이유
+         * @enum {string}
+         */
+        PendingReason: "restart" | "unsupported" | "limit" | "failed";
         /**
          * @description 균형 조정기의 동작
          * @enum {string}
@@ -5097,6 +5188,8 @@ export interface components {
                 firewall?: boolean;
                 /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
                 ha?: components["schemas"]["NodeHa"];
+                /** @description 이 노드의 QEMU가 할 수 있는 핫플러그(계획 54). 노드가 시작할 때 쓴다. 없으면(옛 노드·위트니스) 모두 못 한다. */
+                hotplug?: components["schemas"]["NodeHotplug"];
                 /**
                  * @description 예: `qemu-hvf`, `qemu-kvm`, `qemu-tcg`
                  * @default
@@ -5454,6 +5547,12 @@ export interface components {
                  */
                 ha?: components["schemas"]["HaSetting"];
                 machine: components["schemas"]["MachineType"];
+                /**
+                 * Format: int32
+                 * @description 메모리 핫플러그 상한(MiB, 계획 54). 없으면 `memory_mib`와 같다(핫플러그 꺼짐). 없으면 쓰지 않아 옛 노드도
+                 *     VM을 푼다.
+                 */
+                max_memory_mib?: number;
                 /** Format: int32 */
                 memory_mib: number;
                 nics?: components["schemas"]["NicSpec"][];
@@ -5478,6 +5577,11 @@ export interface components {
                 firmware_node?: string;
                 /** @description HA 재시작·옮기기 기록. 기록이 없으면 빼고 쓴다. */
                 ha?: components["schemas"]["VmHaStatus"];
+                /**
+                 * @description 도는 QEMU의 하드웨어(계획 54). VM을 켠 노드가 `running`을 쓸 때 함께 쓰고 핫플러그 Task가 고치며, QEMU가
+                 *     없어지면 지운다. 옛 노드는 이 필드를 무시한다.
+                 */
+                hardware?: components["schemas"]["RunningHardware"];
                 /** @default null */
                 last_error: string | null;
                 /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
@@ -5587,6 +5691,31 @@ export interface components {
          * @enum {string}
          */
         RuleKind: "affinity" | "anti-affinity" | "soft-affinity" | "soft-anti-affinity" | "node-affinity" | "node-anti-affinity" | "soft-node-affinity" | "soft-node-anti-affinity";
+        /** @description 도는 QEMU의 하드웨어. CPU 토폴로지·메모리·펌웨어·머신은 켤 때 값이고, 핫플러그로 바뀐 것은 `layout`에 있다. */
+        RunningHardware: {
+            /** @description 켤 때의 토폴로지·모델·상한. 노드가 CPU 핫플러그를 못 하거나 핫플러그 배치 없이 켰으면 `max_vcpus`가 없다. */
+            cpu: components["schemas"]["CpuSpec"];
+            /** @description 지금 QEMU에 붙은 디스크(순번 = QEMU의 `disk{i}`). 실행 중 붙이고 떼기를 스펙과 견준다. */
+            disks?: components["schemas"]["DiskSpec"][];
+            firmware: components["schemas"]["Firmware"];
+            /** @description 핫플러그 배치. 없으면 핫플러그 없이 켠 VM이다(계획 54 전이나 업그레이드 중에 켬). */
+            layout?: components["schemas"]["HotplugLayout"];
+            machine: components["schemas"]["MachineType"];
+            /**
+             * Format: int32
+             * @description 켤 때의 메모리(`-m`, MiB)
+             */
+            memory_mib: number;
+            /** @description 지금 QEMU에 붙은 NIC(순번 = QEMU의 `nic{i}`). 보안 그룹은 견주지 않는다. */
+            nics?: components["schemas"]["NicSpec"][];
+            /** @description 다음 재시작 때 적용할 변경. 핫플러그 Task가 쓴다. */
+            pending?: components["schemas"]["PendingChange"][];
+            /**
+             * @description 떼기를 요청했으나 게스트가 아직 내려 주지 않은 장치의 QEMU id(`disk{i}-dev`, `nic{i}`, `cpu{i}`). 디스크·NIC는
+             *     `disks`·`nics`에 남아 있고 vCPU는 `layout.vcpus`에 들어 있으며, 다음 핫플러그 Task가 떼기를 마저 한다.
+             */
+            unplugging?: string[];
+        };
         /**
          * @description 마지막 실행기 확인에서 `core`·`api`가 제때 답했는지(`work`만 늦으면 `ok`)
          * @enum {string}
@@ -6214,6 +6343,12 @@ export interface components {
                  */
                 ha?: components["schemas"]["HaSetting"];
                 machine: components["schemas"]["MachineType"];
+                /**
+                 * Format: int32
+                 * @description 메모리 핫플러그 상한(MiB, 계획 54). 없으면 `memory_mib`와 같다(핫플러그 꺼짐). 없으면 쓰지 않아 옛 노드도
+                 *     VM을 푼다.
+                 */
+                max_memory_mib?: number;
                 /** Format: int32 */
                 memory_mib: number;
                 nics?: components["schemas"]["NicSpec"][];
@@ -6429,6 +6564,12 @@ export interface components {
              */
             ha?: components["schemas"]["HaSetting"];
             machine: components["schemas"]["MachineType"];
+            /**
+             * Format: int32
+             * @description 메모리 핫플러그 상한(MiB, 계획 54). 없으면 `memory_mib`와 같다(핫플러그 꺼짐). 없으면 쓰지 않아 옛 노드도
+             *     VM을 푼다.
+             */
+            max_memory_mib?: number;
             /** Format: int32 */
             memory_mib: number;
             nics?: components["schemas"]["NicSpec"][];
@@ -6453,6 +6594,11 @@ export interface components {
             firmware_node?: string;
             /** @description HA 재시작·옮기기 기록. 기록이 없으면 빼고 쓴다. */
             ha?: components["schemas"]["VmHaStatus"];
+            /**
+             * @description 도는 QEMU의 하드웨어(계획 54). VM을 켠 노드가 `running`을 쓸 때 함께 쓰고 핫플러그 Task가 고치며, QEMU가
+             *     없어지면 지운다. 옛 노드는 이 필드를 무시한다.
+             */
+            hardware?: components["schemas"]["RunningHardware"];
             /** @default null */
             last_error: string | null;
             /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */

@@ -786,6 +786,7 @@ pub(crate) fn import_spec(
             sockets: run.sockets.unwrap_or(proposal.sockets),
             cores: run.cores.unwrap_or(proposal.cores),
             model: CpuModel::Host,
+            max_vcpus: None,
         },
         memory_mib: run.memory_mib.unwrap_or(proposal.memory_mib),
         firmware: run.firmware.unwrap_or(proposal.firmware),
@@ -798,6 +799,7 @@ pub(crate) fn import_spec(
         snapshot_schedule: None,
         ha: None,
         placement: None,
+        max_memory_mib: None,
     })
 }
 

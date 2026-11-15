@@ -12,7 +12,7 @@ use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_driver::DriverError;
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
-use opl_types::node::{FAST_HA, Fencing, HA_PLACEMENT, Node, NodeHa, NodeSpec, PLACEMENT};
+use opl_types::node::{FAST_HA, Fencing, HA_PLACEMENT, HOTPLUG, Node, NodeHa, NodeSpec, PLACEMENT};
 use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -1091,6 +1091,123 @@ async fn pinned_vms_are_stored_only_when_pinned_and_wait_for_all_nodes() {
     spec["placement"] = json!({ "pinned": false });
     let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 핫플러그 상한은 지금 값보다 클 때만 저장하고(같으면 없음), 범위 밖은 400, `hotplug`를 모르는 노드가 있으면
+/// 409다.
+#[tokio::test]
+async fn hotplug_maximums_are_stored_only_when_larger_and_wait_for_all_nodes() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mut req = vm_request("web");
+    req["spec"]["cpu"] = json!({ "cores": 2, "max_vcpus": 8 });
+    req["spec"]["max_memory_mib"] = json!(1024);
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["spec"]["cpu"]["max_vcpus"], 8);
+    assert_eq!(body["spec"]["max_memory_mib"], 1024);
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let stored = env.cluster.get::<VmSpec>(id).unwrap().unwrap().spec;
+    assert_eq!(
+        (stored.cpu.max_vcpus, stored.max_memory_mib),
+        (Some(8), Some(1024))
+    );
+
+    // 지금 값과 같은 상한은 적지 않는다(옛 VM 모양).
+    req["name"] = json!("same");
+    req["spec"]["cpu"] = json!({ "sockets": 2, "cores": 2, "max_vcpus": 4 });
+    req["spec"]["max_memory_mib"] = json!(256);
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["spec"]["cpu"].get("max_vcpus").is_none(), "{body}");
+    assert!(body["spec"].get("max_memory_mib").is_none(), "{body}");
+
+    // 같은 값이면 메모리 단위도 보지 않는다.
+    req["name"] = json!("odd");
+    req["spec"]["memory_mib"] = json!(300);
+    req["spec"]["max_memory_mib"] = json!(300);
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["spec"].get("max_memory_mib").is_none(), "{body}");
+
+    req["name"] = json!("bad");
+    for (cpu, memory, max_memory, message) in [
+        (
+            json!({ "cores": 4, "max_vcpus": 2 }),
+            256,
+            Value::Null,
+            "cpu.max_vcpus must be at least cpu.sockets × cpu.cores (4)",
+        ),
+        (
+            json!({ "sockets": 2, "cores": 1, "max_vcpus": 3 }),
+            256,
+            Value::Null,
+            "cpu.max_vcpus must be a multiple of cpu.sockets",
+        ),
+        (
+            json!({ "cores": 1, "max_vcpus": 257 }),
+            256,
+            Value::Null,
+            "cpu.max_vcpus must be at most 256",
+        ),
+        (
+            json!({ "cores": 1 }),
+            512,
+            json!(384),
+            "max_memory_mib must be at least memory_mib",
+        ),
+        (
+            json!({ "cores": 1 }),
+            256,
+            json!(524_416),
+            "max_memory_mib must be at most 524288",
+        ),
+        (
+            json!({ "cores": 1 }),
+            300,
+            json!(1024),
+            "memory_mib and max_memory_mib must be multiples of 128 when max_memory_mib is set",
+        ),
+    ] {
+        req["spec"]["cpu"] = cpu;
+        req["spec"]["memory_mib"] = json!(memory);
+        req["spec"]["max_memory_mib"] = max_memory;
+        let (status, body) = admin.post("/vms", req.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["message"], message);
+    }
+
+    // 옛 노드 흉내: `hotplug`를 모르면 상한을 받지 않는다(같은 값은 받는다).
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.features.retain(|f| f != HOTPLUG);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    req["spec"]["memory_mib"] = json!(256);
+    for (cpu, max_memory) in [
+        (json!({ "cores": 1, "max_vcpus": 2 }), Value::Null),
+        (json!({ "cores": 1 }), json!(512)),
+    ] {
+        req["spec"]["cpu"] = cpu;
+        req["spec"]["max_memory_mib"] = max_memory;
+        let (status, body) = admin.post("/vms", req.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "cluster_upgrading");
+        assert!(
+            body["message"].as_str().unwrap().contains("hotplug"),
+            "{body}"
+        );
+    }
+    req["spec"]["cpu"] = json!({ "cores": 1, "max_vcpus": 1 });
+    req["spec"]["max_memory_mib"] = json!(256);
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
 /// 우선순위·게스트 감시는 모든 노드가 `fast-ha`를 알 때만 받는다. 범위 밖은 기능보다 먼저 400이다.

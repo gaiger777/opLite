@@ -18,7 +18,7 @@ use opl_types::backup::{
     Backup, BackupDisk, BackupManifest, BackupOrigin, BackupPhase, BackupSpec, BackupStatus,
     MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, default_backup_name,
 };
-use opl_types::node::{FAST_HA, HA_PLACEMENT, PLACEMENT};
+use opl_types::node::{FAST_HA, HA_PLACEMENT, HOTPLUG, PLACEMENT};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::storage::{StoragePool, is_shared};
 use opl_types::vm::VmHa;
@@ -266,6 +266,13 @@ pub async fn receive_backup(
         && !missing_feature(&state.cluster, PLACEMENT)?.is_empty()
     {
         manifest.vm_spec.placement = None;
+    }
+    // 옛 노드는 핫플러그 상한을 풀지 못한다: 버린다(지금 크기 그대로 핫플러그만 꺼진다).
+    if (manifest.vm_spec.cpu.max_vcpus.is_some() || manifest.vm_spec.max_memory_mib.is_some())
+        && !missing_feature(&state.cluster, HOTPLUG)?.is_empty()
+    {
+        manifest.vm_spec.cpu.max_vcpus = None;
+        manifest.vm_spec.max_memory_mib = None;
     }
     let (_, backups) = state.cluster.list::<BackupSpec>()?;
     if let Some(copy) = backups.iter().find(|b| {

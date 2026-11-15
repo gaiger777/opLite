@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::network::USER_NETWORK;
-use opl_types::node::{FAST_HA, HA_PLACEMENT, Node, NodeSpec, PLACEMENT, ha_capable};
+use opl_types::node::{FAST_HA, HA_PLACEMENT, HOTPLUG, Node, NodeSpec, PLACEMENT, ha_capable};
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
@@ -123,8 +123,23 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         used.insert(mac);
         nic.mac = Some(mac);
     }
+    // 지금 값과 같은 핫플러그 상한은 없음(핫플러그 꺼짐)으로 저장해 옛 VM 모양 그대로 둔다.
+    if spec
+        .cpu
+        .max_vcpus
+        .is_some_and(|max| u32::from(max) == spec.cpu.vcpus())
+    {
+        spec.cpu.max_vcpus = None;
+    }
+    if spec.max_memory_mib == Some(spec.memory_mib) {
+        spec.max_memory_mib = None;
+    }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // 핫플러그 상한은 옛 노드가 풀지 못한다.
+    if spec.cpu.max_vcpus.is_some() || spec.max_memory_mib.is_some() {
+        require_feature(&state.cluster, HOTPLUG)?;
+    }
     // 기본과 다른 HA 정책은 객체로 저장되어 옛 노드가 VM을 읽지 못한다.
     if spec.ha.as_ref().is_some_and(|ha| *ha != VmHa::default()) {
         require_feature(&state.cluster, HA_PLACEMENT)?;

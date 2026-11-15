@@ -8,6 +8,7 @@ pub mod cluster;
 pub mod fence;
 pub mod ha_check;
 pub mod host;
+pub mod hotplug;
 pub mod metrics;
 pub mod network;
 pub mod node;

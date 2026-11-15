@@ -511,6 +511,7 @@ mod tests {
             sockets: 1,
             cores: 2,
             model: CpuModel::Host,
+            max_vcpus: None,
         };
         let nics = networks
             .iter()
@@ -536,6 +537,7 @@ mod tests {
                 snapshot_schedule: None,
                 ha: None,
                 placement: None,
+                max_memory_mib: None,
             },
         );
         f.cluster.create(&vm).await.unwrap();
@@ -552,6 +554,7 @@ mod tests {
                     sockets: 1,
                     cores: 2,
                     model: CpuModel::Host,
+                    max_vcpus: None,
                 },
                 memory_mib: 256,
                 firmware: Firmware::Uefi,

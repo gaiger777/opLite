@@ -978,6 +978,7 @@ mod tests {
                     sockets: 1,
                     cores: vcpus,
                     model: Default::default(),
+                    max_vcpus: None,
                 },
                 memory_mib,
                 firmware: Default::default(),
@@ -990,6 +991,7 @@ mod tests {
                 snapshot_schedule: None,
                 ha: None,
                 placement: None,
+                max_memory_mib: None,
             },
         );
         v.status.phase = VmPhase::Running;

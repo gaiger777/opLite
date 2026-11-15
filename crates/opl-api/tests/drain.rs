@@ -53,6 +53,7 @@ async fn add_node(env: &Env, name: &str, edit: impl FnOnce(&mut Node)) -> Uuid {
         fence_check: None,
         interfaces: vec![],
         checks: vec![],
+        hotplug: None,
     };
     edit(&mut node);
     env.cluster.create(&node).await.unwrap();

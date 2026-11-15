@@ -279,6 +279,7 @@ mod tests {
                 sockets: 1,
                 cores: 4,
                 model: CpuModel::Host,
+                max_vcpus: None,
             },
             memory_mib: 8192,
             firmware: Firmware::Uefi,

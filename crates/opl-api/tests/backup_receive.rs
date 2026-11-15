@@ -828,6 +828,40 @@ async fn a_pinned_vm_stays_pinned_only_when_every_node_knows_placement() {
     assert_eq!(get_backup(&env, id).unwrap().spec.vm_spec.placement, None);
 }
 
+/// 핫플러그 상한은 `hotplug`를 모르는 노드가 있으면 버린다.
+#[tokio::test]
+async fn hotplug_maximums_are_kept_only_when_every_node_knows_hotplug() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let with_max = || {
+        let mut m = manifest();
+        m["vm_spec"]["cpu"] = json!({ "cores": 1, "max_vcpus": 4 });
+        m["vm_spec"]["max_memory_mib"] = json!(1024);
+        m
+    };
+    let id = receive_ok(&admin, receive_body(&with_max())).await;
+    let spec = get_backup(&env, id).unwrap().spec.vm_spec;
+    assert_eq!(
+        (spec.cpu.max_vcpus, spec.max_memory_mib),
+        (Some(4), Some(1024))
+    );
+    // 계획 53 노드: `hotplug`를 모른다.
+    let old = current_node(&env, "plan53").await;
+    let mut node = env.cluster.get::<NodeSpec>(old).unwrap().unwrap();
+    node.status
+        .features
+        .retain(|f| f != opl_types::node::HOTPLUG);
+    env.cluster
+        .update_status::<NodeSpec>(old, &node.status)
+        .await
+        .unwrap();
+    let id = receive_ok(&admin, receive_body(&with_max())).await;
+    let spec = get_backup(&env, id).unwrap().spec.vm_spec;
+    assert_eq!((spec.cpu.max_vcpus, spec.max_memory_mib), (None, None));
+    assert_eq!((spec.cpu.cores, spec.memory_mib), (1, 256));
+}
+
 /// 받기 요청 `body`로 받기를 시작해 파일을 모두 보내고 완료한 `ready` 사본의 id
 async fn ready_copy(client: &Client, body: Value) -> Uuid {
     let id = receive_ok(client, body).await;

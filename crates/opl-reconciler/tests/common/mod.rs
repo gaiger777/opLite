@@ -114,6 +114,7 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
                 sockets: 1,
                 cores: 1,
                 model: CpuModel::Host,
+                max_vcpus: None,
             },
             memory_mib: 256,
             firmware: Firmware::Uefi,
@@ -126,6 +127,7 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
             snapshot_schedule: None,
             ha: None,
             placement: None,
+            max_memory_mib: None,
         },
     )
 }

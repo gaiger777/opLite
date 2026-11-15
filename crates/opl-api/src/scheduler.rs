@@ -377,6 +377,7 @@ mod tests {
             fence_check: None,
             interfaces: vec![],
             checks: vec![],
+            hotplug: None,
         };
         n
     }
@@ -425,6 +426,7 @@ mod tests {
                 sockets: 1,
                 cores: 1,
                 model: Default::default(),
+                max_vcpus: None,
             },
             memory_mib,
             firmware: Default::default(),
@@ -437,6 +439,7 @@ mod tests {
             snapshot_schedule: None,
             ha: None,
             placement: None,
+            max_memory_mib: None,
         }
     }
 

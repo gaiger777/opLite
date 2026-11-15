@@ -7,11 +7,21 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::resource::{Kind, Resource, ResourceSpec};
-use crate::runtime::ImageFormat;
+use crate::runtime::{HotplugLayout, ImageFormat};
 
 pub type Vm = Resource<VmSpec, VmStatus>;
 
 pub const MIN_MEMORY_MIB: u32 = 64;
+
+/// `cpu.max_vcpus`의 최댓값
+pub const MAX_VCPUS: u16 = 256;
+
+/// 메모리 상한이 있는 VM의 `memory_mib`·`max_memory_mib` 단위(MiB). virtio-mem 블록(2 MiB)과 리눅스 메모리
+/// 블록(128 MiB)에 맞는다.
+pub const MEMORY_HOTPLUG_ALIGN_MIB: u32 = 128;
+
+/// `max_memory_mib`의 최댓값(512 GiB). 호스트 CPU의 물리 주소 폭을 넘는 `maxmem`은 QEMU가 켜지 않는다.
+pub const MAX_HOTPLUG_MEMORY_MIB: u32 = 512 * 1024;
 
 /// VM의 원하는 상태.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +30,11 @@ pub const MIN_MEMORY_MIB: u32 = 64;
 pub struct VmSpec {
     pub cpu: CpuSpec,
     pub memory_mib: u32,
+    /// 메모리 핫플러그 상한(MiB, 계획 54). 없으면 `memory_mib`와 같다(핫플러그 꺼짐). 없으면 쓰지 않아 옛 노드도
+    /// VM을 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub max_memory_mib: Option<u32>,
     #[serde(default)]
     pub firmware: Firmware,
     pub machine: MachineType,
@@ -234,6 +249,31 @@ impl VmSpec {
         if self.memory_mib < MIN_MEMORY_MIB {
             return Err(ValidationError::TooLittleMemory);
         }
+        if let Some(max) = self.cpu.max_vcpus {
+            let vcpus = self.cpu.vcpus();
+            if u32::from(max) < vcpus {
+                return Err(ValidationError::MaxVcpusBelow(vcpus));
+            }
+            if !max.is_multiple_of(self.cpu.sockets) {
+                return Err(ValidationError::MaxVcpusSockets);
+            }
+            if max > MAX_VCPUS {
+                return Err(ValidationError::MaxVcpusTooMany);
+            }
+        }
+        if let Some(max) = self.max_memory_mib {
+            if max < self.memory_mib {
+                return Err(ValidationError::MaxMemoryBelow);
+            }
+            if max > MAX_HOTPLUG_MEMORY_MIB {
+                return Err(ValidationError::MaxMemoryTooMuch);
+            }
+            if !max.is_multiple_of(MEMORY_HOTPLUG_ALIGN_MIB)
+                || !self.memory_mib.is_multiple_of(MEMORY_HOTPLUG_ALIGN_MIB)
+            {
+                return Err(ValidationError::MemoryAlign);
+            }
+        }
         let mut seen = BTreeSet::new();
         for order in self.disks.iter().filter_map(|d| d.boot_order) {
             if !seen.insert(order) {
@@ -312,6 +352,20 @@ pub enum ValidationError {
     ZeroCores,
     #[error("memory_mib must be at least {MIN_MEMORY_MIB}")]
     TooLittleMemory,
+    #[error("cpu.max_vcpus must be at least cpu.sockets × cpu.cores ({0})")]
+    MaxVcpusBelow(u32),
+    #[error("cpu.max_vcpus must be a multiple of cpu.sockets")]
+    MaxVcpusSockets,
+    #[error("cpu.max_vcpus must be at most {MAX_VCPUS}")]
+    MaxVcpusTooMany,
+    #[error("max_memory_mib must be at least memory_mib")]
+    MaxMemoryBelow,
+    #[error("max_memory_mib must be at most {MAX_HOTPLUG_MEMORY_MIB}")]
+    MaxMemoryTooMuch,
+    #[error(
+        "memory_mib and max_memory_mib must be multiples of {MEMORY_HOTPLUG_ALIGN_MIB} when max_memory_mib is set"
+    )]
+    MemoryAlign,
     #[error("boot_order {0} is used by more than one disk")]
     DuplicateBootOrder(u8),
     #[error("MAC address {0} is a multicast address")]
@@ -367,6 +421,23 @@ pub struct CpuSpec {
     pub cores: u16,
     #[serde(default)]
     pub model: CpuModel,
+    /// vCPU 핫플러그 상한(계획 54). 없으면 `sockets × cores`와 같다(핫플러그 꺼짐). 실행 중에는 `cores`를 이 안에서
+    /// 바꾼다(소켓마다 코어 `max_vcpus / sockets`개 자리).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub max_vcpus: Option<u16>,
+}
+
+impl CpuSpec {
+    /// 켜진 vCPU 수(`sockets × cores`)
+    pub fn vcpus(&self) -> u32 {
+        u32::from(self.sockets) * u32::from(self.cores)
+    }
+
+    /// vCPU 상한. 정하지 않았으면 지금 수다.
+    pub fn max(&self) -> u32 {
+        self.max_vcpus.map_or(self.vcpus(), u32::from)
+    }
 }
 
 fn one() -> u16 {
@@ -532,6 +603,76 @@ pub struct VmStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub ha: Option<VmHaStatus>,
+    /// 도는 QEMU의 하드웨어(계획 54). VM을 켠 노드가 `running`을 쓸 때 함께 쓰고 핫플러그 Task가 고치며, QEMU가
+    /// 없어지면 지운다. 옛 노드는 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub hardware: Option<RunningHardware>,
+}
+
+/// 도는 QEMU의 하드웨어. CPU 토폴로지·메모리·펌웨어·머신은 켤 때 값이고, 핫플러그로 바뀐 것은 `layout`에 있다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RunningHardware {
+    /// 켤 때의 토폴로지·모델·상한. 노드가 CPU 핫플러그를 못 하거나 핫플러그 배치 없이 켰으면 `max_vcpus`가 없다.
+    pub cpu: CpuSpec,
+    /// 켤 때의 메모리(`-m`, MiB)
+    pub memory_mib: u32,
+    pub firmware: Firmware,
+    pub machine: MachineType,
+    /// 핫플러그 배치. 없으면 핫플러그 없이 켠 VM이다(계획 54 전이나 업그레이드 중에 켬).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub layout: Option<HotplugLayout>,
+    /// 지금 QEMU에 붙은 디스크(순번 = QEMU의 `disk{i}`). 실행 중 붙이고 떼기를 스펙과 견준다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub disks: Vec<DiskSpec>,
+    /// 지금 QEMU에 붙은 NIC(순번 = QEMU의 `nic{i}`). 보안 그룹은 견주지 않는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub nics: Vec<NicSpec>,
+    /// 떼기를 요청했으나 게스트가 아직 내려 주지 않은 장치의 QEMU id(`disk{i}-dev`, `nic{i}`, `cpu{i}`). 디스크·NIC는
+    /// `disks`·`nics`에 남아 있고 vCPU는 `layout.vcpus`에 들어 있으며, 다음 핫플러그 Task가 떼기를 마저 한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub unplugging: Vec<String>,
+    /// 다음 재시작 때 적용할 변경. 핫플러그 Task가 쓴다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub pending: Vec<PendingChange>,
+}
+
+/// 실행 중에 적용하지 못해 다음 재시작 때 적용할 변경 하나
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PendingChange {
+    /// `vcpus`, `cpu`, `cpu.max_vcpus`, `memory_mib`, `max_memory_mib`, `firmware`, `machine`
+    pub field: String,
+    /// 도는 값
+    pub running: String,
+    /// 스펙의 값
+    pub wanted: String,
+    pub reason: PendingReason,
+    /// 이유의 자세한 설명(예: 실패한 까닭)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub detail: Option<String>,
+}
+
+/// 실행 중에 적용하지 못한 이유
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum PendingReason {
+    /// 켤 때만 정해진다(CPU 토폴로지·모델·상한, 메모리 상한, 펌웨어, 머신).
+    Restart,
+    /// 이 노드나 이 VM의 배치가 못 한다(CPU 핫플러그·virtio-mem 없음, 핫플러그 없이 켬).
+    Unsupported,
+    /// 켤 때 정한 범위 밖이다(상한을 넘음, 켤 때보다 줄임).
+    Limit,
+    /// 해 봤으나 실패했다.
+    Failed,
 }
 
 /// HA 재시작·옮기기 기록
@@ -1178,6 +1319,135 @@ mod tests {
         json["ha"] = serde_json::json!({ "guest_watch": {} });
         let ha = serde_json::from_value::<VmSpec>(json).unwrap().ha.unwrap();
         assert_eq!(ha.guest_watch, Some(GuestWatch { timeout_secs: 60 }));
+    }
+
+    /// 핫플러그 상한이 없으면 옛 VM 그대로 쓰고, 있으면 왕복한다. 소켓·모델을 뺀 CPU 객체도 읽는다.
+    #[test]
+    fn hotplug_maximums_are_written_only_when_set() {
+        let spec: VmSpec = serde_json::from_str(OLD_VM_JSON).unwrap();
+        assert_eq!((spec.cpu.max_vcpus, spec.max_memory_mib), (None, None));
+        assert_eq!(serde_json::to_string(&spec).unwrap(), OLD_VM_JSON);
+
+        let cpu: CpuSpec =
+            serde_json::from_value(serde_json::json!({ "cores": 2, "max_vcpus": 8 })).unwrap();
+        assert_eq!(
+            cpu,
+            CpuSpec {
+                sockets: 1,
+                cores: 2,
+                model: CpuModel::Host,
+                max_vcpus: Some(8),
+            }
+        );
+        assert_eq!((cpu.vcpus(), cpu.max()), (2, 8));
+        let mut json = sample_json();
+        json["cpu"] = serde_json::json!({ "cores": 2, "max_vcpus": 8 });
+        json["max_memory_mib"] = 16384.into();
+        let spec: VmSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.max_memory_mib, Some(16384));
+        let back = serde_json::to_value(&spec).unwrap();
+        assert_eq!(back["cpu"]["max_vcpus"], 8);
+        assert_eq!(back["max_memory_mib"], 16384);
+        assert_eq!(serde_json::from_value::<VmSpec>(back).unwrap(), spec);
+        assert!(
+            serde_json::from_value::<CpuSpec>(serde_json::json!({ "cores": 2, "max_cpus": 8 }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_checks_hotplug_maximums() {
+        let with_cpu = |sockets, cores, max| {
+            let mut s = sample();
+            s.cpu.sockets = sockets;
+            s.cpu.cores = cores;
+            s.cpu.max_vcpus = Some(max);
+            s.validate()
+        };
+        assert_eq!(with_cpu(1, 4, 4), Ok(()));
+        assert_eq!(with_cpu(2, 2, MAX_VCPUS), Ok(()));
+        assert_eq!(with_cpu(2, 2, 3), Err(ValidationError::MaxVcpusBelow(4)));
+        assert_eq!(with_cpu(2, 2, 6), Ok(()));
+        assert_eq!(with_cpu(2, 2, 7), Err(ValidationError::MaxVcpusSockets));
+        assert_eq!(
+            with_cpu(1, 2, MAX_VCPUS + 1),
+            Err(ValidationError::MaxVcpusTooMany)
+        );
+        assert_eq!(
+            ValidationError::MaxVcpusBelow(4).to_string(),
+            "cpu.max_vcpus must be at least cpu.sockets × cpu.cores (4)"
+        );
+        assert_eq!(
+            ValidationError::MaxVcpusSockets.to_string(),
+            "cpu.max_vcpus must be a multiple of cpu.sockets"
+        );
+        assert_eq!(
+            ValidationError::MaxVcpusTooMany.to_string(),
+            "cpu.max_vcpus must be at most 256"
+        );
+
+        let with_memory = |memory, max| {
+            let mut s = sample();
+            s.memory_mib = memory;
+            s.max_memory_mib = Some(max);
+            s.validate()
+        };
+        assert_eq!(with_memory(4096, 4096), Ok(()));
+        assert_eq!(with_memory(4096, MAX_HOTPLUG_MEMORY_MIB), Ok(()));
+        assert_eq!(
+            with_memory(4096, 3968),
+            Err(ValidationError::MaxMemoryBelow)
+        );
+        assert_eq!(
+            with_memory(4096, MAX_HOTPLUG_MEMORY_MIB + 128),
+            Err(ValidationError::MaxMemoryTooMuch)
+        );
+        assert_eq!(with_memory(4096, 8200), Err(ValidationError::MemoryAlign));
+        assert_eq!(with_memory(4000, 8192), Err(ValidationError::MemoryAlign));
+        assert_eq!(
+            ValidationError::MaxMemoryBelow.to_string(),
+            "max_memory_mib must be at least memory_mib"
+        );
+        assert_eq!(
+            ValidationError::MaxMemoryTooMuch.to_string(),
+            "max_memory_mib must be at most 524288"
+        );
+        assert_eq!(
+            ValidationError::MemoryAlign.to_string(),
+            "memory_mib and max_memory_mib must be multiples of 128 when max_memory_mib is set"
+        );
+        // 상한이 없으면 메모리 단위를 보지 않는다.
+        let mut s = sample();
+        s.memory_mib = 4000;
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    /// 실행 중 하드웨어 기록이 없으면 옛 상태 그대로 쓰고, 옛 노드처럼 모르는 필드는 버리고 읽는다.
+    #[test]
+    fn status_hardware_is_written_only_while_running() {
+        let json = serde_json::to_value(VmStatus::default()).unwrap();
+        assert!(json.get("hardware").is_none(), "{json}");
+        let old = serde_json::json!({
+            "phase": "running", "node": null, "pid": 7, "last_error": null,
+            "snapshot": null, "schedule_error": null
+        });
+        let st: VmStatus = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(st.hardware, None);
+        assert_eq!(serde_json::to_value(&st).unwrap(), old);
+        let mut newer = old.clone();
+        newer["future"] = serde_json::json!({ "x": 1 });
+        assert_eq!(serde_json::from_value::<VmStatus>(newer).unwrap(), st);
+
+        let st = VmStatus {
+            phase: VmPhase::Running,
+            hardware: Some(RunningHardware::legacy(&sample())),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(json["hardware"]["memory_mib"], 8192);
+        assert_eq!(json["hardware"]["cpu"]["cores"], 4);
+        assert!(json["hardware"].get("layout").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
     }
 
     #[test]

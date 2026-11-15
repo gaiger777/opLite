@@ -2055,6 +2055,7 @@ mod tests {
                     sockets: 1,
                     cores: 1,
                     model: Default::default(),
+                    max_vcpus: None,
                 },
                 memory_mib: 1024,
                 firmware: Default::default(),
@@ -2070,6 +2071,7 @@ mod tests {
                     ..Default::default()
                 }),
                 placement: None,
+                max_memory_mib: None,
             },
         )
     }

@@ -132,6 +132,22 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub checks: Vec<CheckReport>,
+    /// 이 노드의 QEMU가 할 수 있는 핫플러그(계획 54). 노드가 시작할 때 쓴다. 없으면(옛 노드·위트니스) 모두 못 한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub hotplug: Option<NodeHotplug>,
+}
+
+/// 노드의 핫플러그 능력. 디스크·NIC(루트 포트)는 `hotplug` 기능이 있는 모든 노드가 하므로 적지 않는다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NodeHotplug {
+    /// vCPU 핫플러그(x86_64만)
+    #[serde(default)]
+    pub cpu: bool,
+    /// virtio-mem 메모리 핫플러그(QEMU에 `virtio-mem-pci`가 있음)
+    #[serde(default)]
+    pub memory: bool,
 }
 
 /// 이웃 노드의 전원 읽기 결과(설계 §8.1). `error`가 있으면 모든 방법이 실패한 것이다(`fence_unreachable`).
@@ -322,6 +338,7 @@ pub const FEATURES: &[&str] = &[
     FAST_HA,
     HA_CHECKS,
     PLACEMENT,
+    HOTPLUG,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -336,6 +353,10 @@ pub const HA_CHECKS: &str = "ha-checks";
 
 /// 최적 배치(계획 53): 설정 `placement`, VM `spec.placement`, 균형 조정기의 동작. 모든 노드가 알릴 때만 쓴다.
 pub const PLACEMENT: &str = "placement";
+
+/// VM 무중단 유형 변경(계획 54): VM `cpu.max_vcpus`·`max_memory_mib`, Task `vm-hotplug`, 켤 때의 핫플러그 배치.
+/// 모든 노드가 알릴 때만 쓴다.
+pub const HOTPLUG: &str = "hotplug";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -776,10 +797,40 @@ mod tests {
                 "ha-placement",
                 "fast-ha",
                 "ha-checks",
-                "placement"
+                "placement",
+                "hotplug"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+    }
+
+    /// 핫플러그 능력이 없으면(옛 노드) 쓰지 않고, 있으면 그대로 오간다. 빠진 칸은 못 함이다.
+    #[test]
+    fn status_hotplug_round_trips_and_is_omitted_when_unknown() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("hotplug").is_none(), "{none}");
+        let status = NodeStatus {
+            hotplug: Some(NodeHotplug {
+                cpu: true,
+                memory: false,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["hotplug"],
+            serde_json::json!({ "cpu": true, "memory": false })
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+        let partial: NodeStatus =
+            serde_json::from_value(serde_json::json!({ "hotplug": { "memory": true } })).unwrap();
+        assert_eq!(
+            partial.hotplug,
+            Some(NodeHotplug {
+                cpu: false,
+                memory: true
+            })
+        );
     }
 
     #[test]
