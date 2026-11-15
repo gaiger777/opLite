@@ -18,6 +18,7 @@ use opl_driver::{
 use opl_peer::{IncomingDisk, IncomingMigration, MigrateIncomingRequest, Peers};
 use opl_reconciler::ReconcilerHandle;
 use opl_reconciler::resolve::{apply_disk_moves, set_disks_shared};
+use opl_types::hotplug;
 use opl_types::node::NodeSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec, pool_state_on};
 use opl_types::task::{Task, TaskOp, TaskProgress, TaskSpec, TaskState, TaskStatus};
@@ -265,6 +266,13 @@ async fn send(
     migration: &MigrationStatus,
 ) -> Result<(), String> {
     let id = vm.id;
+    // 받는 쪽은 스펙의 디스크·NIC와 하드웨어 기록의 배치로 켠다. 원본 QEMU가 다르면 받는 쪽을 켜거나 디스크를 복사하기
+    // 전에 멈춘다(보내기 직전에도 다시 본다).
+    let devices = hotplug::qemu_devices(&vm.spec, vm.status.hardware.as_ref());
+    ctx.hv
+        .check_devices(id, &devices)
+        .await
+        .map_err(|e| e.to_string())?;
     let disks = if migration.disks.is_empty() {
         Vec::new()
     } else {
@@ -307,6 +315,8 @@ async fn send(
         bandwidth: ctx.config.migration_bandwidth,
         timeout: ctx.config.migration_timeout,
         switchover_mirrors: copied.is_some(),
+        // 그 사이 핫플러그가 없었는지 보내기 직전에 다시 본다.
+        devices: Some(devices),
     };
     if let Some(copied) = copied {
         write_progress(ctx, migration.task, "migrating-memory", copied).await;

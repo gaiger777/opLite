@@ -957,6 +957,7 @@ async fn ha_source_left_by_a_restart(env: &mut Env) -> (Vm, Option<u32>, Arc<Fak
         bandwidth: None,
         timeout: Duration::from_secs(60),
         switchover_mirrors: false,
+        devices: None,
     };
     env.hv.migrate(vm.id, &target, &opts).await.unwrap();
     let renewer = Arc::new(FakeRenewer(Mutex::new(false)));

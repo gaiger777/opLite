@@ -9,9 +9,12 @@ use opl_driver::{
     ActualState, BackupTarget, DirStorage, EventKind, Hypervisor, HypervisorEvent, QemuConfig,
     QemuHypervisor, RuntimeStatus, StopMode, Storage, VolumeSource,
 };
-use opl_qemu::HostProfile;
-use opl_types::runtime::{DiskKind, ImageFormat, RuntimeDisk, VmRuntimeSpec};
-use opl_types::vm::{Arch, CpuModel, CpuSpec, DiskBus, Firmware};
+use opl_qemu::{Accel, HostProfile};
+use opl_types::runtime::{
+    DiskKind, HOTPLUG_PORTS, HotplugLayout, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic,
+    VmRuntimeSpec,
+};
+use opl_types::vm::{Arch, CpuModel, CpuSpec, DiskBus, Firmware, MachineType, NicModel};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -856,5 +859,155 @@ async fn inconsistent_bitmaps_do_not_block_offline_resize_or_restart() {
     hv.start(&vm, None).await.unwrap();
     assert_eq!(bitmap_names(&hv, vm.id).await, [Vec::<String>::new()]);
     hv.block_resize(vm.id, 0, 3 << 30).await.unwrap();
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+}
+
+/// 디스크 하나(켤 때)·NIC 없음, 빈 루트 포트 8개의 핫플러그 배치
+fn hot_layout() -> HotplugLayout {
+    HotplugLayout {
+        vcpus: 1,
+        max_memory_mib: 256,
+        plugged_mib: 0,
+        ports: HOTPLUG_PORTS,
+        boot_disks: 1,
+        boot_nics: 0,
+        disk_ports: vec![],
+        nic_ports: vec![],
+    }
+}
+
+fn user_nic() -> RuntimeNic {
+    RuntimeNic {
+        mac: "52:54:00:12:34:57".parse().unwrap(),
+        model: NicModel::Virtio,
+        backend: NicBackend::User,
+    }
+}
+
+/// 실행 중인 VM의 id를 준 장치 트리(HMP `info qtree`)에 장치 `id`가 있는지
+async fn has_device(hv: &QemuHypervisor, vm: Uuid, id: &str) -> bool {
+    let tree = hv.human_monitor_command(vm, "info qtree").await.unwrap();
+    tree.contains(&format!("id \"{id}\""))
+}
+
+/// 핫플러그 배치로 켠 VM(이 노드의 아키텍처, OS 없음)에 루트 포트로 디스크(qcow2)·NIC(user)를 붙인다. aarch64
+/// `virt`는 게스트 없이도 곧바로 떼지고, q35는 게스트가 eject해야 해서 짧은 시간 제한 안에 떼지지 않는다(다시 해도
+/// 오류 없이 같다).
+#[tokio::test]
+async fn disks_and_nics_are_hotplugged_on_root_ports() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let mut vm = with_qcow2_disk(spec(), &tmp.path().join("disk0.qcow2"));
+    vm.hotplug = Some(hot_layout());
+    hv.start(&vm, None).await.unwrap();
+
+    let hot = with_qcow2_disk(spec(), &tmp.path().join("disk1.qcow2")).disks[0].clone();
+    hv.add_disk(vm.id, 1, &hot, 0).await.unwrap();
+    hv.add_nic(vm.id, 0, &user_nic(), 1).await.unwrap();
+    assert!(has_device(&hv, vm.id, "disk1-dev").await);
+    assert!(has_device(&hv, vm.id, "nic0").await);
+    // 같은 포트에는 붙일 수 없고, 실패한 디스크는 노드를 남기지 않는다(같은 순번으로 다시 붙는다).
+    assert!(hv.add_disk(vm.id, 2, &hot, 1).await.is_err());
+
+    if Arch::native() == Arch::Aarch64 {
+        let t = Duration::from_secs(5);
+        assert!(hv.remove_disk(vm.id, 1, t).await.unwrap());
+        assert!(hv.remove_nic(vm.id, 0, t).await.unwrap());
+        assert!(!has_device(&hv, vm.id, "disk1-dev").await);
+        assert!(!has_device(&hv, vm.id, "nic0").await);
+        // 다시 떼도(이미 없음) 뗀 것이다. 닫은 노드 이름으로 다시 붙는다.
+        assert!(hv.remove_disk(vm.id, 1, t).await.unwrap());
+        assert!(hv.remove_nic(vm.id, 0, t).await.unwrap());
+        hv.add_disk(vm.id, 1, &hot, 2).await.unwrap();
+        assert!(has_device(&hv, vm.id, "disk1-dev").await);
+    } else {
+        let t = Duration::from_secs(2);
+        assert!(!hv.remove_disk(vm.id, 1, t).await.unwrap());
+        assert!(!hv.remove_disk(vm.id, 1, t).await.unwrap());
+        assert!(!hv.remove_nic(vm.id, 0, t).await.unwrap());
+        assert!(has_device(&hv, vm.id, "disk1-dev").await);
+    }
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+}
+
+/// 노드 능력: vCPU는 Linux x86_64만, 메모리는 QEMU에 virtio-mem이 있을 때(macOS Homebrew QEMU에는 없고, Linux x86_64에는
+/// 있어야 한다).
+#[tokio::test]
+async fn hotplug_caps_follow_the_arch_and_the_qemu_build() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let caps = hv.hotplug_caps().await;
+    assert_eq!(
+        caps.cpu,
+        cfg!(target_os = "linux") && Arch::native() == Arch::X86_64
+    );
+    if cfg!(target_os = "macos") {
+        assert!(!caps.memory);
+    }
+    if cfg!(target_os = "linux") && Arch::native() == Arch::X86_64 {
+        assert!(caps.memory, "QEMU on Linux x86_64 must have virtio-mem-pci");
+    }
+}
+
+/// x86 q35를 TCG·BIOS로 띄우는 드라이버 설정. `qemu-system-x86_64`가 없으면 None
+fn q35_tcg(root: &Path) -> Option<QemuConfig> {
+    let found = std::process::Command::new("qemu-system-x86_64")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    found.then(|| QemuConfig {
+        host: HostProfile {
+            arch: Arch::X86_64,
+            accel: Accel::Tcg,
+            qemu_binary: "qemu-system-x86_64".into(),
+            uefi_code: Default::default(),
+            uefi_vars_template: Default::default(),
+        },
+        ..config(root)
+    })
+}
+
+/// q35(TCG, BIOS, OS 없음)에서 vCPU를 하나 붙인다. 떼기는 게스트가 받아야 해서 시간 안에 끝나지 않고 그대로 두
+/// 개이며, 다시 해도 오류 없이 같다. 루트 포트에 붙인 디스크도 같다.
+#[tokio::test]
+async fn a_vcpu_is_hotplugged_on_q35() {
+    let tmp = short_tempdir();
+    let Some(cfg) = q35_tcg(tmp.path()) else {
+        eprintln!("qemu-system-x86_64 not found; skipping");
+        return;
+    };
+    let hv = QemuHypervisor::new(cfg).await.unwrap();
+    let mut vm = spec();
+    vm.machine = MachineType::Q35;
+    vm.firmware = Firmware::Bios;
+    vm.cpu = CpuSpec {
+        sockets: 1,
+        cores: 1,
+        model: CpuModel::Max,
+        max_vcpus: Some(4),
+    };
+    vm.hotplug = Some(HotplugLayout {
+        boot_disks: 0,
+        ..hot_layout()
+    });
+    hv.start(&vm, None).await.unwrap();
+    let t = Duration::from_secs(2);
+    let cpus = async || {
+        let out = hv.human_monitor_command(vm.id, "info cpus").await.unwrap();
+        out.matches("CPU #").count()
+    };
+    assert_eq!(cpus().await, 1);
+    assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 1, 2, t).await.unwrap(), 2);
+    assert_eq!(cpus().await, 2);
+    assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 2, 1, t).await.unwrap(), 2);
+    assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 2, 1, t).await.unwrap(), 2);
+    assert_eq!(cpus().await, 2);
+
+    // PCIe 장치도 게스트가 eject해야 떼진다. 떼는 중인 장치를 다시 떼도 오류가 아니다.
+    let hot = with_qcow2_disk(spec(), &tmp.path().join("disk0.qcow2")).disks[0].clone();
+    hv.add_disk(vm.id, 0, &hot, 0).await.unwrap();
+    assert!(!hv.remove_disk(vm.id, 0, t).await.unwrap());
+    assert!(!hv.remove_disk(vm.id, 0, t).await.unwrap());
+    assert!(has_device(&hv, vm.id, "disk0-dev").await);
     hv.stop(vm.id, StopMode::Force).await.unwrap();
 }

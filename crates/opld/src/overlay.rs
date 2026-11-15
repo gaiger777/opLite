@@ -273,6 +273,9 @@ mod tests {
         async fn delete_vm_taps(&self, _: Uuid) -> Result<(), DriverError> {
             unimplemented!()
         }
+        async fn delete_tap(&self, _: &str) -> Result<(), DriverError> {
+            unimplemented!()
+        }
         async fn sync_overlays(
             &self,
             _: &str,

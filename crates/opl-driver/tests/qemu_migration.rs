@@ -166,6 +166,7 @@ fn opts() -> MigrateOptions {
         bandwidth: None,
         timeout: Duration::from_secs(120),
         switchover_mirrors: false,
+        devices: None,
     }
 }
 
@@ -653,6 +654,7 @@ async fn migrates_local_disks_by_mirroring_them() {
     };
     let opts = MigrateOptions {
         switchover_mirrors: true,
+        devices: None,
         ..opts()
     };
     n.src.migrate(id, &target, &opts).await.unwrap();
@@ -752,6 +754,7 @@ async fn failed_disk_copy_keeps_the_source_running() {
     };
     let migrate = MigrateOptions {
         switchover_mirrors: true,
+        devices: None,
         ..opts_short()
     };
     let err = n.src.migrate(id, &target, &migrate).await.unwrap_err();

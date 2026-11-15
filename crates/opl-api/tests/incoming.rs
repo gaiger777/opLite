@@ -429,6 +429,7 @@ async fn sweep_stops_a_source_qemu_committed_elsewhere() {
         bandwidth: None,
         timeout: Duration::from_secs(60),
         switchover_mirrors: false,
+        devices: None,
     };
     // `web`은 원본 노드에 배정돼 있다(이 노드에서 보냈고 원본 노드로 확정된 것과 같다).
     let vm = s.env.cluster.get::<VmSpec>(s.vm).unwrap().unwrap();
@@ -477,6 +478,7 @@ async fn sweep_stops_a_source_qemu_of_a_deleted_vm() {
         bandwidth: None,
         timeout: Duration::from_secs(60),
         switchover_mirrors: false,
+        devices: None,
     };
     let vm = s.env.cluster.get::<VmSpec>(s.vm).unwrap().unwrap();
     let spec = VmRuntimeSpec {
@@ -522,6 +524,7 @@ async fn sweep_stops_a_stale_source_qemu_assigned_here() {
         bandwidth: None,
         timeout: Duration::from_secs(60),
         switchover_mirrors: false,
+        devices: None,
     };
     s.env.hv.migrate(db.id, &target, &opts).await.unwrap();
     let mut status = db.status.clone();

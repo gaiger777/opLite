@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,10 +12,14 @@ use opl_qemu::{
     TransactionAction, build_cmdline, build_incoming_cmdline,
 };
 use opl_types::backup::BITMAP_PREFIX;
-use opl_types::network::tap_prefix;
-use opl_types::runtime::{ImageFormat, NicBackend, VmRuntimeSpec};
-use opl_types::vm::Firmware;
+use opl_types::network::{tap_name, tap_prefix};
+use opl_types::node::NodeHotplug;
+use opl_types::runtime::{
+    DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec,
+};
+use opl_types::vm::{CpuSpec, DiskBus, Firmware, NicModel};
 use rustix::process::{Flock, FlockOffsetType, FlockType, Pid, Signal, fcntl_getlk, kill_process};
+use serde_json::json;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
@@ -23,8 +27,8 @@ use uuid::Uuid;
 
 use crate::error::DriverError;
 use crate::hypervisor::{
-    ActualState, BackupTarget, DiskBitmaps, DiskCounters, EventKind, Hypervisor, HypervisorEvent,
-    RuntimeStatus, StopMode,
+    ActualState, AddOutcome, BackupTarget, DiskBitmaps, DiskCounters, EventKind, Hypervisor,
+    HypervisorEvent, RuntimeStatus, StopMode,
 };
 use crate::migration::{
     IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
@@ -73,6 +77,12 @@ const POSTMIGRATE_POLL: Duration = Duration::from_millis(50);
 const BACKUP_JOB_PREFIX: &str = "opl-backup-";
 /// 증분 백업 작업 상태를 다시 묻는 간격(`JOB_STATUS_CHANGE` 이벤트를 놓쳐도 이만큼 뒤에 안다)
 const JOB_POLL: Duration = Duration::from_secs(1);
+/// 핫플러그 배치의 virtio-mem 장치(`-device virtio-mem-pci,id=vmem0-dev`)
+const VIRTIO_MEM_PATH: &str = "/machine/peripheral/vmem0-dev";
+/// virtio-mem을 줄일 때 게스트가 내려 준 크기(`size`)를 다시 읽는 간격
+const VIRTIO_MEM_POLL: Duration = Duration::from_millis(200);
+/// 이 노드가 Linux인지(x86_64 vCPU 핫플러그는 Linux만 — macOS는 HVF)
+const LINUX: bool = cfg!(target_os = "linux");
 /// 디스크 미러의 작업 id와 그 NBD 대상 노드 이름의 접두사(`opl-mirror-{i}`, i는 디스크 순서 번호)
 const MIRROR_JOB_PREFIX: &str = "opl-mirror-";
 /// 받는 쪽 NBD 내보내기 id의 접두사(`opl-export-{i}`)
@@ -1134,6 +1144,11 @@ impl Hypervisor for QemuHypervisor {
     ) -> Result<(), DriverError> {
         let handle = self.running_handle(id)?;
         let qmp = &handle.qmp;
+        // 받는 쪽은 기록대로 켠다. 게스트가 아직 내려 주지 않은 장치 등으로 다르면 보내지 않는다(장치가 달라 실패하거나
+        // 옮긴 뒤 장치가 사라진다).
+        if let Some(expected) = &opts.devices {
+            check_devices(qmp, expected).await?;
+        }
         remove_inconsistent_bitmaps(qmp, id).await;
         let mirrored = if opts.switchover_mirrors {
             let mirrored = mirrored_disks(&query_jobs(qmp).await?);
@@ -1278,6 +1293,390 @@ impl Hypervisor for QemuHypervisor {
         }
         // 마이그레이션을 멈춘 뒤 미러를 치운다(디스크 복사 중이거나 실패한 뒤 남은 것).
         clear_jobs(&handle.qmp, &[MIRROR_JOB_PREFIX]).await
+    }
+
+    async fn check_devices(&self, id: Uuid, expected: &[String]) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        check_devices(&handle.qmp, expected).await
+    }
+
+    async fn hotplug_caps(&self) -> NodeHotplug {
+        let host = &self.config.host;
+        let output = tokio::process::Command::new(&host.qemu_binary)
+            .args(["-device", "help"])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(QMP_TIMEOUT, output).await {
+            Ok(Ok(out)) if out.status.success() => {
+                opl_qemu::hotplug_caps(host.arch, LINUX, &String::from_utf8_lossy(&out.stdout))
+            }
+            other => {
+                let error = match other {
+                    Ok(Ok(out)) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => "timed out".into(),
+                };
+                tracing::warn!(binary = ?host.qemu_binary, %error,
+                    "cannot list QEMU devices; memory hotplug is off on this node");
+                opl_qemu::hotplug_caps(host.arch, LINUX, "")
+            }
+        }
+    }
+
+    async fn set_vcpus(
+        &self,
+        id: Uuid,
+        cpu: &CpuSpec,
+        from: u16,
+        to: u16,
+        timeout: Duration,
+    ) -> Result<u16, DriverError> {
+        let (boot, max) = (cpu.vcpus(), cpu.max());
+        if max <= boot {
+            return Err(DriverError::InvalidSpec(format!(
+                "VM {id} was started without vCPU hotplug"
+            )));
+        }
+        if !(boot..=max).contains(&u32::from(to)) {
+            return Err(DriverError::InvalidSpec(format!(
+                "VM {id} can run {boot} to {max} vCPUs, not {to}"
+            )));
+        }
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        // 켤 때처럼 소켓마다 `max / sockets`개 코어 자리를 앞에서부터 채운다(cmdline과 같은 자리).
+        let per_socket = max / u32::from(cpu.sockets);
+        let mut now = from;
+        let stepped = async {
+            if to >= from {
+                // 켤 때 수부터 본다: 앞서 떼기를 요청한 vCPU를 게스트가 늦게 내려 줬으면 그 자리도 다시 붙인다.
+                let slots =
+                    qmp_call(qmp.query_hotpluggable_cpus(), "QMP query-hotpluggable-cpus").await?;
+                let boot = u16::try_from(boot).unwrap_or(u16::MAX);
+                for i in boot..to {
+                    let (socket, core) = (u32::from(i) / per_socket, u32::from(i) % per_socket);
+                    let slot = slots.iter().find(|s| {
+                        s.socket_id == Some(socket)
+                            && s.core_id == Some(core)
+                            && s.thread_id.unwrap_or(0) == 0
+                    });
+                    match slot {
+                        None => {
+                            return Err(DriverError::InvalidSpec(format!(
+                                "VM {id} has no vCPU slot at socket {socket} core {core}"
+                            )));
+                        }
+                        // 앞서 붙인 자리(다시 해 보기)
+                        Some(s) if s.qom_path.is_some() => {}
+                        Some(s) => {
+                            let args = json!({
+                                "driver": s.kind, "id": format!("cpu{i}"), "socket-id": socket,
+                                "core-id": core, "thread-id": s.thread_id.unwrap_or(0),
+                            });
+                            qmp_call(qmp.device_add(args), "QMP device_add").await?;
+                        }
+                    }
+                    if i >= from {
+                        now = i + 1;
+                    }
+                }
+            } else {
+                // 큰 번호부터 뗀다. 켤 때 단 vCPU는 위에서 막았다.
+                for i in (to..from).rev() {
+                    if !unplug(qmp, &format!("cpu{i}"), timeout).await? {
+                        tracing::warn!(%id, vcpu = i, ?timeout, "the guest did not release a vCPU");
+                        break;
+                    }
+                    now = i;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        match stepped {
+            Ok(()) => {}
+            Err(e) if now == from => return Err(e),
+            // 몇 개를 바꾼 뒤의 오류: 닿은 수를 알린다(호출자가 기록한다).
+            Err(e) => {
+                tracing::warn!(%id, from, to, reached = now, error = %e, "changing vCPUs stopped")
+            }
+        }
+        Ok(now)
+    }
+
+    async fn set_memory(
+        &self,
+        id: Uuid,
+        plugged_mib: u32,
+        timeout: Duration,
+    ) -> Result<u32, DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        let size = virtio_mem_size(qmp).await?;
+        let requested = u64::from(plugged_mib) << 20;
+        let set = qmp.qom_set(VIRTIO_MEM_PATH, "requested-size", json!(requested));
+        qmp_call(set, "QMP qom-set").await?;
+        if requested >= size {
+            return Ok(plugged_mib);
+        }
+        // 줄이기: 게스트가 블록을 내려 주어 `size`가 요청 이하가 되기를 기다린다.
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let size = virtio_mem_size(qmp).await?;
+            if size <= requested {
+                return Ok(plugged_mib);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // 게스트가 더 내려 주지 않게 지금 크기를 요청으로 되돌린다.
+                tracing::warn!(%id, size, requested, ?timeout, "the guest did not release memory");
+                let set = qmp.qom_set(VIRTIO_MEM_PATH, "requested-size", json!(size));
+                qmp_call(set, "QMP qom-set").await?;
+                return Ok(u32::try_from(size.div_ceil(1 << 20)).unwrap_or(u32::MAX));
+            }
+            tokio::time::sleep(VIRTIO_MEM_POLL).await;
+        }
+    }
+
+    async fn add_disk(
+        &self,
+        id: Uuid,
+        index: usize,
+        disk: &RuntimeDisk,
+        port: u8,
+    ) -> Result<AddOutcome, DriverError> {
+        if disk.bus != DiskBus::VirtioBlk {
+            return Err(DriverError::InvalidSpec(
+                "only virtio-blk disks can be added while the VM is running".into(),
+            ));
+        }
+        let mut source = match disk.kind {
+            DiskKind::File => json!({ "driver": "file", "filename": disk.path }),
+            DiskKind::Block => json!({ "driver": "host_device", "filename": disk.path }),
+            DiskKind::Rbd => {
+                let Some(rbd) = &disk.rbd else {
+                    return Err(DriverError::InvalidSpec(format!(
+                        "disk {index} is an rbd disk without an rbd image"
+                    )));
+                };
+                let mut source = json!({
+                    "driver": "rbd", "pool": rbd.pool, "image": rbd.image, "user": rbd.user,
+                });
+                if let Some(ns) = &rbd.namespace {
+                    source["namespace"] = json!(ns);
+                }
+                if let Some(conf) = &rbd.conf {
+                    source["conf"] = json!(conf);
+                }
+                source
+            }
+        };
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        // cmdline과 같은 두 층(`disk{i}-file` 위에 형식 노드 `disk{i}`)과 장치 `disk{i}-dev`
+        let (file, node) = (format!("disk{index}-file"), format!("disk{index}"));
+        // 앞서 중단된 Task가 붙였으면 그대로 둔다. 장치 없이 남은 노드는 닫고 다시 연다.
+        let devices = qmp_call(qmp.peripheral_ids(), "QMP qom-list").await?;
+        if devices.contains(&format!("disk{index}-dev")) {
+            return Ok(AddOutcome::AlreadyPresent);
+        }
+        let nodes = qmp_call(qmp.query_block_nodes(), "QMP query-named-block-nodes").await?;
+        for left in [&node, &file] {
+            if nodes.iter().any(|n| n.node_name == *left) {
+                tracing::info!(%id, node = %left, "closing a block node left by an earlier disk add");
+                qmp_call(qmp.blockdev_del(left), "QMP blockdev-del").await?;
+            }
+        }
+        source["node-name"] = json!(file);
+        qmp_call(qmp.blockdev_add(source), "QMP blockdev-add").await?;
+        let format = match disk.format {
+            ImageFormat::Qcow2 => "qcow2",
+            ImageFormat::Raw => "raw",
+        };
+        let mut opened = vec![file.clone()];
+        let mut dev = json!({
+            "driver": "virtio-blk-pci", "drive": node, "id": format!("disk{index}-dev"),
+            "bus": format!("hp{port}"),
+        });
+        if let Some(order) = disk.boot_order {
+            dev["bootindex"] = json!(order);
+        }
+        let added = async {
+            let layer = json!({ "driver": format, "file": file, "node-name": node });
+            qmp_call(qmp.blockdev_add(layer), "QMP blockdev-add").await?;
+            opened.push(node.clone());
+            qmp_call(qmp.device_add(dev), "QMP device_add").await
+        }
+        .await;
+        if let Err(e) = added {
+            // 연 노드를 거꾸로 닫는다(형식 노드가 파일 노드를 쥔다).
+            for node in opened.iter().rev() {
+                let del = qmp_call(qmp.blockdev_del(node), "QMP blockdev-del").await;
+                if let Err(del) = del {
+                    tracing::warn!(%id, %node, error = %del, "cannot close the block node of a disk not added");
+                }
+            }
+            return Err(e);
+        }
+        Ok(AddOutcome::Added)
+    }
+
+    async fn remove_disk(
+        &self,
+        id: Uuid,
+        index: usize,
+        timeout: Duration,
+    ) -> Result<bool, DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        if !unplug(qmp, &format!("disk{index}-dev"), timeout).await? {
+            return Ok(false);
+        }
+        // 장치는 빠졌다. 블록 노드를 닫지 못해도 떼기는 된 것이다(경고만 — 남은 노드는 QEMU가 끝날 때 닫힌다).
+        // 앞서 닫았으면(다시 해 보기) 남은 노드만 닫는다.
+        let nodes = match qmp_call(qmp.query_block_nodes(), "QMP query-named-block-nodes").await {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                tracing::warn!(%id, index, error = %e, "cannot list the block nodes of a removed disk");
+                return Ok(true);
+            }
+        };
+        for node in [format!("disk{index}"), format!("disk{index}-file")] {
+            if nodes.iter().any(|n| n.node_name == node)
+                && let Err(e) = qmp_call(qmp.blockdev_del(&node), "QMP blockdev-del").await
+            {
+                tracing::warn!(%id, %node, error = %e, "cannot close the block node of a removed disk");
+            }
+        }
+        Ok(true)
+    }
+
+    async fn add_nic(
+        &self,
+        id: Uuid,
+        index: usize,
+        nic: &RuntimeNic,
+        port: u8,
+    ) -> Result<AddOutcome, DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        let netdev = format!("net{index}");
+        // 앞서 중단된 Task가 붙였으면 tap도 그대로 둔다(장치 없이 남은 백엔드는 아래 `netdev_add`에서 바꾼다).
+        let devices = qmp_call(qmp.peripheral_ids(), "QMP qom-list").await?;
+        if devices.contains(&format!("nic{index}")) {
+            return Ok(AddOutcome::AlreadyPresent);
+        }
+        // 브리지 NIC는 켤 때(create_taps)처럼 이 VM 이름의 tap을 먼저 만든다.
+        let tap = match &nic.backend {
+            NicBackend::Tap {
+                ifname,
+                bridge,
+                vlan,
+                ..
+            } => {
+                let prefix = tap_prefix(id);
+                if !ifname.starts_with(&prefix) {
+                    return Err(DriverError::InvalidSpec(format!(
+                        "tap name {ifname:?} does not start with {prefix:?}"
+                    )));
+                }
+                let Some(net) = &self.config.net else {
+                    return Err(DriverError::InvalidSpec(
+                        "bridge networks are not supported on this node".into(),
+                    ));
+                };
+                let tap = Tap {
+                    ifname: ifname.clone(),
+                    bridge: bridge.clone(),
+                    vlan: *vlan,
+                };
+                net.create_tap(&tap).await?;
+                Some((net, tap.ifname))
+            }
+            NicBackend::User => None,
+        };
+        let backend = match &nic.backend {
+            NicBackend::User => json!({ "type": "user", "id": netdev }),
+            NicBackend::Tap { ifname, .. } => json!({
+                "type": "tap", "id": netdev, "ifname": ifname, "script": "no", "downscript": "no",
+            }),
+        };
+        let model = match nic.model {
+            NicModel::Virtio => "virtio-net-pci",
+            NicModel::E1000e => "e1000e",
+        };
+        let mut dev = json!({
+            "driver": model, "netdev": netdev, "mac": nic.mac.to_string(),
+            "id": format!("nic{index}"), "bus": format!("hp{port}"),
+        });
+        // VXLAN 네트워크의 MTU를 게스트에 알린다(virtio만 받는다).
+        if let (NicModel::Virtio, NicBackend::Tap { mtu: Some(mtu), .. }) =
+            (nic.model, &nic.backend)
+        {
+            dev["host_mtu"] = json!(mtu);
+        }
+        let mut backend_added = false;
+        let added = async {
+            if let Err(e) = qmp_call(qmp.netdev_add(backend.clone()), "QMP netdev_add").await {
+                // 장치 없이 남은 같은 id의 백엔드(앞서 중단된 붙이기)는 지우고 다시 만든다.
+                let left = matches!(&e, DriverError::Qmp(QmpError::Command { desc, .. })
+                    if desc.contains("Duplicate") || desc.contains("already"));
+                if !left {
+                    return Err(e);
+                }
+                tracing::info!(%id, %netdev, "replacing a backend left by an earlier NIC add");
+                qmp_call(qmp.netdev_del(&netdev), "QMP netdev_del").await?;
+                qmp_call(qmp.netdev_add(backend), "QMP netdev_add").await?;
+            }
+            backend_added = true;
+            qmp_call(qmp.device_add(dev), "QMP device_add").await
+        }
+        .await;
+        if let Err(e) = added {
+            if backend_added
+                && let Err(del) = qmp_call(qmp.netdev_del(&netdev), "QMP netdev_del").await
+            {
+                tracing::warn!(%id, %netdev, error = %del, "cannot remove the backend of a NIC not added");
+            }
+            if let Some((net, ifname)) = tap
+                && let Err(del) = net.delete_tap(&ifname).await
+            {
+                tracing::warn!(%id, %ifname, error = %del, "cannot delete the tap of a NIC not added");
+            }
+            return Err(e);
+        }
+        Ok(AddOutcome::Added)
+    }
+
+    async fn remove_nic(
+        &self,
+        id: Uuid,
+        index: usize,
+        timeout: Duration,
+    ) -> Result<bool, DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        if !unplug(qmp, &format!("nic{index}"), timeout).await? {
+            return Ok(false);
+        }
+        // 장치는 빠졌다. 백엔드·tap을 지우지 못해도 떼기는 된 것이다(경고만 — VM이 끝날 때 tap을 모두 지운다).
+        // 앞서 지웠으면(다시 해 보기) 백엔드가 없다.
+        let netdev = format!("net{index}");
+        match qmp_call(qmp.netdev_del(&netdev), "QMP netdev_del").await {
+            Ok(()) => {}
+            Err(DriverError::Qmp(QmpError::Command { class, .. })) if class == "DeviceNotFound" => {
+            }
+            Err(e) => {
+                tracing::warn!(%id, %netdev, error = %e, "cannot remove the backend of a removed NIC")
+            }
+        }
+        if let Some(net) = &self.config.net {
+            let tap = tap_name(id, index);
+            if let Err(e) = net.delete_tap(&tap).await {
+                tracing::warn!(%id, %tap, error = %e, "cannot delete the tap of a removed NIC");
+            }
+        }
+        Ok(true)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
@@ -2002,6 +2401,83 @@ async fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     .is_ok()
 }
 
+/// QMP 명령 하나를 [`QMP_TIMEOUT`]까지 기다린다.
+async fn qmp_call<T>(
+    fut: impl Future<Output = Result<T, QmpError>>,
+    what: &'static str,
+) -> Result<T, DriverError> {
+    flatten(tokio::time::timeout(QMP_TIMEOUT, fut).await, what)
+}
+
+/// 마이그레이션 받는 쪽이 켤 장치 id(`expected`)와 원본 QEMU의 디스크·NIC·붙인 vCPU·virtio-mem 장치
+/// (`/machine/peripheral`)가 같은지 본다. 다르면 `Migration` 오류다.
+async fn check_devices(qmp: &QmpClient, expected: &[String]) -> Result<(), DriverError> {
+    let ids = qmp_call(qmp.peripheral_ids(), "QMP qom-list").await?;
+    let running: BTreeSet<String> = ids.into_iter().filter(|id| tracked_device(id)).collect();
+    let expected: BTreeSet<String> = expected.iter().cloned().collect();
+    if running == expected {
+        return Ok(());
+    }
+    let list = |a: &BTreeSet<String>, b: &BTreeSet<String>| {
+        a.difference(b).cloned().collect::<Vec<_>>().join(", ")
+    };
+    let mut why = Vec::new();
+    let extra = list(&running, &expected);
+    if !extra.is_empty() {
+        why.push(format!("QEMU has {extra} that the record does not"));
+    }
+    let missing = list(&expected, &running);
+    if !missing.is_empty() {
+        why.push(format!("the record has {missing} that QEMU does not"));
+    }
+    Err(DriverError::Migration(format!(
+        "the running QEMU devices do not match the VM's hardware record: {}",
+        why.join("; ")
+    )))
+}
+
+/// 마이그레이션 전에 견주는 장치 id인지: `disk{i}-dev`, `nic{i}`, `cpu{i}`, `vmem0-dev`
+fn tracked_device(id: &str) -> bool {
+    let number = |rest: &str| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
+    id == "vmem0-dev"
+        || id
+            .strip_prefix("disk")
+            .and_then(|r| r.strip_suffix("-dev"))
+            .is_some_and(number)
+        || id.strip_prefix("nic").is_some_and(number)
+        || id.strip_prefix("cpu").is_some_and(number)
+}
+
+/// 장치 `id`를 떼고 게스트가 `timeout` 안에 내려 주기를 기다린다. 뗐으면(이미 없었으면) true
+async fn unplug(qmp: &QmpClient, id: &str, timeout: Duration) -> Result<bool, DriverError> {
+    let del = qmp.device_del_wait(id, timeout);
+    match tokio::time::timeout(timeout + QMP_TIMEOUT, del).await {
+        Ok(Ok(removed)) => Ok(removed),
+        // QEMU가 거절했다(떼기 요청이 남지 않았다).
+        Ok(Err(e @ QmpError::Command { .. })) => Err(e.into()),
+        // `device_del`을 보낸 뒤 QMP가 끊기거나 답하지 않았다. QEMU가 받았을 수 있으므로 시간 초과처럼 다룬다(장치가
+        // 남았으면 다음 Task가 마저 뗀다).
+        Ok(Err(e)) => {
+            tracing::warn!(device = id, error = %e, "QMP failed after device_del; treating the unplug as unfinished");
+            Ok(false)
+        }
+        Err(_) => {
+            tracing::warn!(
+                device = id,
+                "QMP did not answer device_del; treating the unplug as unfinished"
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// virtio-mem 장치가 게스트에 꽂아 준 크기(`size`, 바이트)
+async fn virtio_mem_size(qmp: &QmpClient) -> Result<u64, DriverError> {
+    let size = qmp_call(qmp.qom_get(VIRTIO_MEM_PATH, "size"), "QMP qom-get").await?;
+    size.as_u64()
+        .ok_or_else(|| QmpError::Protocol(format!("virtio-mem size: {size}")).into())
+}
+
 /// QMP_TIMEOUT으로 감싼 명령의 결과를 풀어 낸다.
 fn flatten<T>(
     r: Result<Result<T, QmpError>, tokio::time::error::Elapsed>,
@@ -2247,6 +2723,14 @@ time.sleep(60)
         failing: Arc<Mutex<Vec<&'static str>>>,
         /// `blockdev-add`로 연 NBD 노드(`blockdev-del`이 닫는다). 블록 노드 목록에 드러난다.
         nbd_nodes: Arc<Mutex<Vec<String>>>,
+        /// `blockdev-add`로 연 디스크 노드(`disk…`, `blockdev-del`이 닫는다). 블록 노드 목록에 드러난다.
+        hot_nodes: Arc<Mutex<Vec<String>>>,
+        /// 참이면 `device_del` 뒤에 `DEVICE_DELETED`를 보내지 않는다(게스트가 내려 주지 않음).
+        hold_unplug: Arc<Mutex<bool>>,
+        /// virtio-mem의 (`requested-size`, 게스트가 멈춘 `size`). `size`가 None이면 요청을 따른다(바이트).
+        vmem: Arc<Mutex<(u64, Option<u64>)>>,
+        /// 이 이름의 명령을 받으면 답하지 않고 연결을 끊는다(QEMU가 받은 뒤 QMP가 끊김).
+        drop_on: Arc<Mutex<Vec<&'static str>>>,
     }
 
     /// QEMU 대신 QMP 소켓을 여는 가짜 서버. greeting과 capabilities 협상까지 처리하고,
@@ -2276,6 +2760,23 @@ time.sleep(60)
         let fail = failing.clone();
         let nbd_nodes = Arc::new(Mutex::new(Vec::<String>::new()));
         let nbd = nbd_nodes.clone();
+        let hot_nodes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let hot = hot_nodes.clone();
+        let hold_unplug = Arc::new(Mutex::new(false));
+        let hold = hold_unplug.clone();
+        let vmem = Arc::new(Mutex::new((0u64, None::<u64>)));
+        let mem = vmem.clone();
+        let drop_on = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let dropping = drop_on.clone();
+        // id 있는 장치: 디스크 두 개와 NIC 하나를 가진 VM. `device_add`가 더하고 `device_del`(내려 줌)이 뺀다.
+        let mut devices: Vec<String> = ["disk0-dev", "disk1-dev", "nic0"]
+            .map(String::from)
+            .to_vec();
+        // 네트워크 백엔드 id. 같은 id의 `netdev_add`와 없는 id의 `netdev_del`은 QEMU처럼 거절한다.
+        // `net3`은 앞서 중단된 붙이기가 장치 없이 남긴 백엔드다.
+        let mut netdevs: Vec<String> = vec!["net0".into(), "net3".into()];
+        // 붙인 vCPU 자리 (socket, core). 켤 때 둘(0,0)·(0,1)이 켜져 있다.
+        let mut cpus: Vec<(u64, u64)> = vec![(0, 0), (0, 1)];
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
@@ -2300,6 +2801,11 @@ time.sleep(60)
                 };
                 let cmd: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let name = cmd["execute"].as_str().unwrap_or_default().to_string();
+                if dropping.lock().unwrap().contains(&name.as_str()) {
+                    recorded.lock().unwrap().push(name);
+                    arguments.lock().unwrap().push(cmd["arguments"].clone());
+                    break;
+                }
                 let ret = match name.as_str() {
                     "query-status" => {
                         let status = status_replies.lock().unwrap().pop_front().unwrap_or(status);
@@ -2321,10 +2827,67 @@ time.sleep(60)
                         nbd.lock().unwrap().push(node.to_string());
                         serde_json::json!({})
                     }
+                    "blockdev-add"
+                        if cmd["arguments"]["node-name"]
+                            .as_str()
+                            .is_some_and(|n| n.starts_with("disk")) =>
+                    {
+                        let node = cmd["arguments"]["node-name"].as_str().unwrap();
+                        hot.lock().unwrap().push(node.to_string());
+                        serde_json::json!({})
+                    }
                     "blockdev-del" => {
                         let node = cmd["arguments"]["node-name"].as_str().unwrap();
                         nbd.lock().unwrap().retain(|n| n != node);
+                        hot.lock().unwrap().retain(|n| n != node);
                         serde_json::json!({})
+                    }
+                    // 소켓 2개 × 코어 4개 자리, 켜진 자리만 `qom-path`가 있다.
+                    "query-hotpluggable-cpus" => (0..2u64)
+                        .flat_map(|socket| (0..4u64).map(move |core| (socket, core)))
+                        .map(|(socket, core)| {
+                            let mut slot = serde_json::json!({
+                                "type": "max-x86_64-cpu", "vcpus-count": 1,
+                                "props": { "socket-id": socket, "core-id": core, "thread-id": 0 },
+                            });
+                            if cpus.contains(&(socket, core)) {
+                                slot["qom-path"] = "/machine/peripheral/cpu".into();
+                            }
+                            slot
+                        })
+                        .collect(),
+                    "device_add" if cmd["arguments"]["socket-id"].is_u64() => {
+                        let args = &cmd["arguments"];
+                        let slot = (
+                            args["socket-id"].as_u64().unwrap(),
+                            args["core-id"].as_u64().unwrap(),
+                        );
+                        cpus.push(slot);
+                        serde_json::json!({})
+                    }
+                    "qom-set" => {
+                        mem.lock().unwrap().0 = cmd["arguments"]["value"].as_u64().unwrap();
+                        serde_json::json!({})
+                    }
+                    "qom-get" => {
+                        let (requested, size) = *mem.lock().unwrap();
+                        match cmd["arguments"]["property"].as_str() {
+                            Some("size") => size.unwrap_or(requested).into(),
+                            _ => requested.into(),
+                        }
+                    }
+                    // id 있는 장치(비디오·USB도 있다)
+                    "qom-list" => {
+                        let mut list = serde_json::json!([
+                            { "name": "type", "type": "string" },
+                            { "name": "video0", "type": "child<VGA>" },
+                            { "name": "usb", "type": "child<qemu-xhci>" },
+                        ]);
+                        for d in &devices {
+                            let child = serde_json::json!({ "name": d, "type": "child<device>" });
+                            list.as_array_mut().unwrap().push(child);
+                        }
+                        list
                     }
                     "query-migrate" if migration == "failed" => serde_json::json!({
                         "status": "failed", "error-desc": "Connection refused"
@@ -2347,6 +2910,10 @@ time.sleep(60)
                         ]);
                         for node in nbd.lock().unwrap().iter() {
                             let node = serde_json::json!({ "node-name": node, "drv": "nbd" });
+                            nodes.as_array_mut().unwrap().push(node);
+                        }
+                        for node in hot.lock().unwrap().iter() {
+                            let node = serde_json::json!({ "node-name": node, "drv": "file" });
                             nodes.as_array_mut().unwrap().push(node);
                         }
                         nodes
@@ -2374,20 +2941,61 @@ time.sleep(60)
                         .unwrap_or_else(|| serde_json::json!([])),
                     _ => serde_json::json!({}),
                 };
+                let netdev = cmd["arguments"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let refused = match name.as_str() {
+                    "netdev_add" if netdevs.contains(&netdev) => Some((
+                        "GenericError",
+                        format!("Duplicate ID '{netdev}' for netdev"),
+                    )),
+                    "netdev_del" if !netdevs.contains(&netdev) => {
+                        Some(("DeviceNotFound", format!("Device '{netdev}' not found")))
+                    }
+                    _ => None,
+                };
                 let reply = if fail.lock().unwrap().contains(&name.as_str()) {
                     serde_json::json!({
                         "error": { "class": "GenericError", "desc": format!("{name} failed") },
                         "id": cmd["id"]
                     })
+                } else if let Some((class, desc)) = refused {
+                    serde_json::json!({ "error": { "class": class, "desc": desc }, "id": cmd["id"] })
                 } else {
+                    match name.as_str() {
+                        "netdev_add" => netdevs.push(netdev),
+                        "netdev_del" => netdevs.retain(|n| *n != netdev),
+                        _ => {}
+                    }
                     serde_json::json!({ "return": ret, "id": cmd["id"] })
                 };
+                if !fail.lock().unwrap().contains(&name.as_str())
+                    && let Some(dev) = cmd["arguments"]["id"].as_str()
+                {
+                    if name == "device_add" {
+                        devices.push(dev.to_string());
+                    } else if name == "device_del" && !*hold.lock().unwrap() {
+                        devices.retain(|d| d != dev);
+                    }
+                }
+                let deleted = (name == "device_del" && !*hold.lock().unwrap()).then(|| {
+                    serde_json::json!({
+                        "event": "DEVICE_DELETED", "timestamp": {},
+                        "data": { "device": cmd["arguments"]["id"] },
+                    })
+                });
                 recorded.lock().unwrap().push(name);
                 arguments.lock().unwrap().push(cmd["arguments"].clone());
                 if write
                     .write_all(format!("{reply}\n").as_bytes())
                     .await
                     .is_err()
+                {
+                    break;
+                }
+                if let Some(ev) = deleted
+                    && write.write_all(format!("{ev}\n").as_bytes()).await.is_err()
                 {
                     break;
                 }
@@ -2403,6 +3011,10 @@ time.sleep(60)
             statuses,
             failing,
             nbd_nodes,
+            hot_nodes,
+            hold_unplug,
+            vmem,
+            drop_on,
         }
     }
 
@@ -2536,6 +3148,7 @@ time.sleep(60)
             bandwidth: Some(64 << 20),
             timeout: Duration::from_secs(10),
             switchover_mirrors: false,
+            devices: None,
         };
         hv.migrate(vm.id, &target(), &opts).await.unwrap();
 
@@ -2605,6 +3218,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_secs(10),
             switchover_mirrors: false,
+            devices: None,
         };
         hv.migrate(vm.id, &target(), &opts).await.unwrap();
 
@@ -2613,6 +3227,44 @@ time.sleep(60)
         let at = commands.iter().position(|c| c == "query-migrate").unwrap();
         let queries = commands[at..].iter().filter(|c| *c == "query-status");
         assert_eq!(queries.count(), 4, "commands: {commands:?}");
+    }
+
+    /// 받는 쪽이 켤 장치(`devices`)가 원본 QEMU의 장치와 다르면 보내지 않는다. 같으면 보낸다.
+    #[tokio::test]
+    async fn migrate_refuses_when_the_running_devices_differ_from_the_record() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "postmigrate").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let opts = |devices: &[&str]| MigrateOptions {
+            bandwidth: None,
+            timeout: Duration::from_secs(10),
+            switchover_mirrors: false,
+            devices: Some(devices.iter().map(|d| d.to_string()).collect()),
+        };
+        // 게스트가 아직 내려 주지 않은 disk1-dev, 기록에만 있는 cpu2
+        let err = hv
+            .migrate(vm.id, &target(), &opts(&["disk0-dev", "nic0", "cpu2"]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            DriverError::Migration(
+                "the running QEMU devices do not match the VM's hardware record: QEMU has \
+                 disk1-dev that the record does not; the record has cpu2 that QEMU does not"
+                    .into()
+            )
+            .to_string()
+        );
+        assert!(!fake.commands.lock().unwrap().iter().any(|c| c == "migrate"));
+
+        hv.migrate(vm.id, &target(), &opts(&["nic0", "disk1-dev", "disk0-dev"]))
+            .await
+            .unwrap();
+        assert!(fake.commands.lock().unwrap().iter().any(|c| c == "migrate"));
     }
 
     #[tokio::test]
@@ -2628,6 +3280,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_secs(10),
             switchover_mirrors: false,
+            devices: None,
         };
         match hv.migrate(vm.id, &target(), &opts).await.unwrap_err() {
             DriverError::Migration(msg) => assert_eq!(msg, "Connection refused"),
@@ -2649,6 +3302,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_millis(200),
             switchover_mirrors: false,
+            devices: None,
         };
         let err = hv.migrate(vm.id, &target(), &opts).await.unwrap_err();
         assert!(
@@ -2964,6 +3618,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_secs(10),
             switchover_mirrors: true,
+            devices: None,
         };
         hv.migrate(vm.id, &target(), &opts).await.unwrap();
 
@@ -3031,6 +3686,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_secs(10),
             switchover_mirrors: true,
+            devices: None,
         };
         let err = hv.migrate(vm.id, &target(), &opts).await.unwrap_err();
         assert_eq!(
@@ -4242,5 +4898,628 @@ time.sleep(60)
             hv.start(&vm, None).await,
             Err(DriverError::InvalidSpec(_))
         ));
+    }
+
+    /// tap 만들기·지우기를 기록하는 가짜 호스트 네트워크
+    #[derive(Debug, Default)]
+    struct RecordingNet {
+        calls: Mutex<Vec<String>>,
+        /// 참이면 tap 하나 지우기가 실패한다.
+        fail_delete: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl HostNet for RecordingNet {
+        async fn bridges(&self) -> Result<Vec<opl_types::node::BridgeInfo>, DriverError> {
+            Ok(vec![])
+        }
+        async fn create_tap(&self, tap: &Tap) -> Result<(), DriverError> {
+            let call = format!("create {} {} {:?}", tap.ifname, tap.bridge, tap.vlan);
+            self.calls.lock().unwrap().push(call);
+            Ok(())
+        }
+        async fn delete_vm_taps(&self, vm: Uuid) -> Result<(), DriverError> {
+            self.calls.lock().unwrap().push(format!("delete-vm {vm}"));
+            Ok(())
+        }
+        async fn delete_tap(&self, ifname: &str) -> Result<(), DriverError> {
+            self.calls.lock().unwrap().push(format!("delete {ifname}"));
+            if *self.fail_delete.lock().unwrap() {
+                return Err(DriverError::ToolFailed {
+                    tool: "ip",
+                    stderr: "Cannot find device".into(),
+                });
+            }
+            Ok(())
+        }
+        async fn sync_overlays(
+            &self,
+            _: &str,
+            _: &[crate::net::Overlay],
+        ) -> Result<crate::net::OverlayChanges, DriverError> {
+            unimplemented!()
+        }
+    }
+
+    /// [`running_vm`]에 tap을 기록하는 호스트 네트워크를 단 것
+    async fn running_vm_with_net(
+        tmp: &Path,
+        net: Arc<RecordingNet>,
+    ) -> (QemuHypervisor, Uuid, FakeQmp, tokio::process::Child) {
+        let mut cfg = config(tmp, PathBuf::from("/nonexistent/qemu"));
+        cfg.net = Some(net);
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "running").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        (hv, vm.id, fake, qemu)
+    }
+
+    /// 소켓 2개, 켤 때 vCPU 2개(소켓마다 코어 1개), 상한 8(소켓마다 코어 자리 4개)
+    fn hot_cpu() -> CpuSpec {
+        CpuSpec {
+            sockets: 2,
+            cores: 1,
+            model: CpuModel::Max,
+            max_vcpus: Some(8),
+        }
+    }
+
+    const UNPLUG: Duration = Duration::from_millis(200);
+
+    /// vCPU `i`는 소켓마다 코어 `max / sockets`개 자리를 앞에서부터 채운 자리에 붙고, 줄이기는 큰 번호부터 뗀다.
+    /// 이미 켜진 자리(앞서 붙임)는 건너뛴다.
+    #[tokio::test]
+    async fn set_vcpus_adds_and_removes_cpus_at_their_slots() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+
+        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 2, 5, UNPLUG).await.unwrap(), 5);
+        let added = sent(&fake, &["query-hotpluggable-cpus", "device_add"]);
+        let slot = |i: u32, socket: u32, core: u32| {
+            serde_json::json!({ "driver": "max-x86_64-cpu", "id": format!("cpu{i}"),
+                "socket-id": socket, "core-id": core, "thread-id": 0 })
+        };
+        assert_eq!(added[0].0, "query-hotpluggable-cpus");
+        let args: Vec<_> = added[1..].iter().map(|(_, a)| a.clone()).collect();
+        assert_eq!(args, [slot(2, 0, 2), slot(3, 0, 3), slot(4, 1, 0)]);
+
+        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 5, 2, UNPLUG).await.unwrap(), 2);
+        let removed: Vec<_> = sent(&fake, &["device_del"])
+            .into_iter()
+            .map(|(_, a)| a["id"].clone())
+            .collect();
+        assert_eq!(removed, ["cpu4", "cpu3", "cpu2"]);
+
+        // 가짜 QEMU는 뗀 자리를 그대로 켜진 것으로 답한다: 다시 붙이면 건너뛴다.
+        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 2, 3, UNPLUG).await.unwrap(), 3);
+        assert_eq!(sent(&fake, &["device_add"]).len(), 3);
+
+        // 켤 때 수 아래·상한 위·상한 없이 켠 VM은 보내지 않고 거절한다.
+        for (cpu, to) in [
+            (hot_cpu(), 1),
+            (hot_cpu(), 9),
+            (
+                CpuSpec {
+                    max_vcpus: None,
+                    ..hot_cpu()
+                },
+                2,
+            ),
+        ] {
+            let err = hv.set_vcpus(id, &cpu, 2, to, UNPLUG).await.unwrap_err();
+            assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        }
+        assert!(matches!(
+            hv.set_vcpus(Uuid::now_v7(), &hot_cpu(), 2, 3, UNPLUG).await,
+            Err(DriverError::NotRunning(_))
+        ));
+    }
+
+    /// 게스트가 vCPU를 내려 주지 않으면 거기서 멈추고 닿은 수(그대로)를 돌려준다. 붙이다 몇 개 뒤에 실패하면 닿은
+    /// 수, 처음부터 실패하면 오류다.
+    #[tokio::test]
+    async fn vcpu_changes_report_how_far_they_got() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        *fake.hold_unplug.lock().unwrap() = true;
+        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 4, 2, UNPLUG).await.unwrap(), 4);
+        let removed = sent(&fake, &["device_del"]);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].1["id"], "cpu3");
+
+        fake.failing.lock().unwrap().push("device_add");
+        let err = hv
+            .set_vcpus(id, &hot_cpu(), 2, 4, UNPLUG)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::Qmp(QmpError::Command { .. })),
+            "{err:?}"
+        );
+        fake.failing.lock().unwrap().clear();
+        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 2, 3, UNPLUG).await.unwrap(), 3);
+        fake.failing.lock().unwrap().push("device_add");
+        // cpu2는 이제 켜져 있어 건너뛰고 cpu3에서 실패: 닿은 수 3
+        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 2, 5, UNPLUG).await.unwrap(), 3);
+    }
+
+    /// 같은 수로 맞추기도 켤 때 수부터 빈 자리를 본다: 떼기를 요청한 vCPU를 게스트가 늦게 내려 줬으면 다시 붙인다.
+    #[tokio::test]
+    async fn vcpus_released_late_are_added_again() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        // 기록은 3개인데 가짜 QEMU에는 켤 때의 두 자리만 켜져 있다(cpu2를 게스트가 늦게 내려 줌).
+        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 3, 3, UNPLUG).await.unwrap(), 3);
+        let added: Vec<_> = sent(&fake, &["device_add"])
+            .into_iter()
+            .map(|(_, a)| a["id"].clone())
+            .collect();
+        assert_eq!(added, ["cpu2"]);
+    }
+
+    /// virtio-mem 늘리기는 요청만 바꾸고, 줄이기는 게스트가 내려 주기를 기다린다. 시간이 넘으면 요청을 그때 크기로
+    /// 되돌리고 그 크기다.
+    #[tokio::test]
+    async fn set_memory_moves_the_requested_size() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let mib = |n: u64| serde_json::json!(n << 20);
+
+        assert_eq!(hv.set_memory(id, 4096, UNPLUG).await.unwrap(), 4096);
+        assert_eq!(hv.set_memory(id, 2048, UNPLUG).await.unwrap(), 2048);
+        fake.vmem.lock().unwrap().1 = Some(2048 << 20);
+        assert_eq!(hv.set_memory(id, 0, UNPLUG).await.unwrap(), 2048);
+
+        let sets: Vec<_> = sent(&fake, &["qom-set"])
+            .into_iter()
+            .map(|(_, a)| a)
+            .collect();
+        for set in &sets {
+            assert_eq!(set["path"], VIRTIO_MEM_PATH);
+            assert_eq!(set["property"], "requested-size");
+        }
+        let values: Vec<_> = sets.iter().map(|a| a["value"].clone()).collect();
+        assert_eq!(values, [mib(4096), mib(2048), mib(0), mib(2048)]);
+        // 줄이기는 `size`를 읽고, 시간이 넘을 때까지 다시 읽는다.
+        let gets = sent(&fake, &["qom-get"]);
+        assert!(
+            gets.iter().all(|(_, a)| a["property"] == "size"),
+            "{gets:?}"
+        );
+        assert!(gets.len() >= 5, "{gets:?}");
+    }
+
+    fn hot_disk(kind: DiskKind) -> RuntimeDisk {
+        RuntimeDisk {
+            path: "/pools/a/hot.qcow2".into(),
+            kind,
+            rbd: None,
+            format: ImageFormat::Qcow2,
+            bus: DiskBus::VirtioBlk,
+            boot_order: Some(2),
+        }
+    }
+
+    /// 디스크는 파일 노드·형식 노드를 열고 루트 포트에 붙인다. 떼기는 장치를 뗀 뒤 두 노드를 닫고, 다시 떼면 닫을
+    /// 노드가 없어 장치 떼기만 보낸다.
+    #[tokio::test]
+    async fn add_and_remove_disk_use_the_disk_nodes_and_the_port() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+
+        hv.add_disk(id, 3, &hot_disk(DiskKind::File), 2)
+            .await
+            .unwrap();
+        let want = [
+            (
+                "blockdev-add".to_string(),
+                serde_json::json!({
+                "driver": "file", "filename": "/pools/a/hot.qcow2", "node-name": "disk3-file" }),
+            ),
+            (
+                "blockdev-add".to_string(),
+                serde_json::json!({
+                "driver": "qcow2", "file": "disk3-file", "node-name": "disk3" }),
+            ),
+            (
+                "device_add".to_string(),
+                serde_json::json!({
+                "driver": "virtio-blk-pci", "drive": "disk3", "id": "disk3-dev", "bus": "hp2",
+                "bootindex": 2 }),
+            ),
+        ];
+        assert_eq!(sent(&fake, &["blockdev-add", "device_add"]), want);
+        assert_eq!(*fake.hot_nodes.lock().unwrap(), ["disk3-file", "disk3"]);
+
+        assert!(hv.remove_disk(id, 3, UNPLUG).await.unwrap());
+        let removed = sent(&fake, &["device_del", "blockdev-del"]);
+        let removed: Vec<_> = removed
+            .iter()
+            .map(|(c, a)| (c.as_str(), a.clone()))
+            .collect();
+        assert_eq!(
+            removed,
+            [
+                ("device_del", serde_json::json!({ "id": "disk3-dev" })),
+                ("blockdev-del", serde_json::json!({ "node-name": "disk3" })),
+                (
+                    "blockdev-del",
+                    serde_json::json!({ "node-name": "disk3-file" })
+                ),
+            ]
+        );
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+        assert!(hv.remove_disk(id, 3, UNPLUG).await.unwrap());
+        assert_eq!(sent(&fake, &["device_del"]).len(), 2);
+        assert_eq!(sent(&fake, &["blockdev-del"]).len(), 2);
+    }
+
+    /// 장치를 붙이지 못하면 연 노드를 거꾸로 닫는다. 블록 장치·RBD 소스는 cmdline과 같은 드라이버 인자다. SATA는
+    /// 보내지 않고 거절한다.
+    #[tokio::test]
+    async fn disk_sources_and_a_failed_disk_add() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.failing.lock().unwrap().push("device_add");
+        let err = hv
+            .add_disk(id, 3, &hot_disk(DiskKind::File), 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::Qmp(QmpError::Command { .. })),
+            "{err:?}"
+        );
+        let closed: Vec<_> = sent(&fake, &["blockdev-del"])
+            .into_iter()
+            .map(|(_, a)| a["node-name"].clone())
+            .collect();
+        assert_eq!(closed, ["disk3", "disk3-file"]);
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+        fake.failing.lock().unwrap().clear();
+
+        hv.add_disk(id, 4, &hot_disk(DiskKind::Block), 0)
+            .await
+            .unwrap();
+        let rbd = RuntimeDisk {
+            path: PathBuf::new(),
+            rbd: Some(opl_types::runtime::RbdTarget {
+                pool: "rbd".into(),
+                namespace: Some("opl".into()),
+                image: "opl-a".into(),
+                user: "admin".into(),
+                conf: Some("/etc/ceph/c.conf".into()),
+            }),
+            format: ImageFormat::Raw,
+            ..hot_disk(DiskKind::Rbd)
+        };
+        hv.add_disk(id, 5, &rbd, 1).await.unwrap();
+        let adds: Vec<_> = sent(&fake, &["blockdev-add"])
+            .into_iter()
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(
+            adds[2..],
+            [
+                serde_json::json!({ "driver": "host_device", "filename": "/pools/a/hot.qcow2",
+                    "node-name": "disk4-file" }),
+                serde_json::json!({ "driver": "qcow2", "file": "disk4-file", "node-name": "disk4" }),
+                serde_json::json!({ "driver": "rbd", "pool": "rbd", "namespace": "opl",
+                    "image": "opl-a", "user": "admin", "conf": "/etc/ceph/c.conf",
+                    "node-name": "disk5-file" }),
+                serde_json::json!({ "driver": "raw", "file": "disk5-file", "node-name": "disk5" }),
+            ]
+        );
+
+        let before = fake.commands.lock().unwrap().len();
+        let sata = RuntimeDisk {
+            bus: DiskBus::Sata,
+            ..hot_disk(DiskKind::File)
+        };
+        let err = hv.add_disk(id, 4, &sata, 3).await.unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        assert_eq!(fake.commands.lock().unwrap().len(), before);
+    }
+
+    /// 게스트가 디스크를 내려 주지 않으면 장치와 노드를 그대로 두고 false다.
+    #[tokio::test]
+    async fn a_disk_the_guest_holds_stays() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        hv.add_disk(id, 2, &hot_disk(DiskKind::File), 0)
+            .await
+            .unwrap();
+        *fake.hold_unplug.lock().unwrap() = true;
+        assert!(!hv.remove_disk(id, 2, UNPLUG).await.unwrap());
+        assert!(sent(&fake, &["blockdev-del"]).is_empty());
+        assert_eq!(fake.hot_nodes.lock().unwrap().len(), 2);
+    }
+
+    /// 장치가 빠진 뒤 블록 노드·백엔드·tap을 지우지 못해도 떼기는 된 것이다(경고만).
+    #[tokio::test]
+    async fn cleanup_failures_after_an_unplug_still_count_as_removed() {
+        let tmp = short_tempdir();
+        let net = Arc::new(RecordingNet::default());
+        let (hv, id, fake, _qemu) = running_vm_with_net(tmp.path(), net.clone()).await;
+        hv.add_disk(id, 2, &hot_disk(DiskKind::File), 0)
+            .await
+            .unwrap();
+        hv.add_nic(id, 1, &tap_nic(id, 1), 1).await.unwrap();
+        fake.failing
+            .lock()
+            .unwrap()
+            .extend(["blockdev-del", "netdev_del"]);
+        *net.fail_delete.lock().unwrap() = true;
+        assert!(hv.remove_disk(id, 2, UNPLUG).await.unwrap());
+        assert_eq!(sent(&fake, &["blockdev-del"]).len(), 2);
+        assert!(hv.remove_nic(id, 1, UNPLUG).await.unwrap());
+        assert_eq!(sent(&fake, &["netdev_del"]).len(), 1);
+        assert_eq!(
+            net.calls.lock().unwrap().last(),
+            Some(&format!("delete {}", tap_name(id, 1)))
+        );
+    }
+
+    fn tap_nic(id: Uuid, index: usize) -> RuntimeNic {
+        RuntimeNic {
+            mac: "52:54:00:12:34:57".parse().unwrap(),
+            model: NicModel::Virtio,
+            backend: NicBackend::Tap {
+                ifname: tap_name(id, index),
+                bridge: "br0".into(),
+                vlan: Some(10),
+                mtu: Some(1450),
+            },
+        }
+    }
+
+    /// 브리지 NIC는 tap을 먼저 만들고 백엔드·장치를 붙인다. 장치를 붙이지 못하면 백엔드와 tap을 지운다. 떼기는
+    /// 장치·백엔드·tap 순서로 지운다.
+    #[tokio::test]
+    async fn bridge_nics_are_added_and_removed_with_their_tap() {
+        let tmp = short_tempdir();
+        let net = Arc::new(RecordingNet::default());
+        let (hv, id, fake, _qemu) = running_vm_with_net(tmp.path(), net.clone()).await;
+        let (tap1, tap2) = (tap_name(id, 1), tap_name(id, 2));
+
+        hv.add_nic(id, 1, &tap_nic(id, 1), 1).await.unwrap();
+        assert_eq!(
+            sent(&fake, &["netdev_add", "device_add"]),
+            [
+                (
+                    "netdev_add".to_string(),
+                    serde_json::json!({ "type": "tap", "id": "net1",
+                    "ifname": tap1, "script": "no", "downscript": "no" })
+                ),
+                (
+                    "device_add".to_string(),
+                    serde_json::json!({ "driver": "virtio-net-pci",
+                    "netdev": "net1", "mac": "52:54:00:12:34:57", "id": "nic1", "bus": "hp1",
+                    "host_mtu": 1450 })
+                ),
+            ]
+        );
+
+        fake.failing.lock().unwrap().push("device_add");
+        assert!(hv.add_nic(id, 2, &tap_nic(id, 2), 2).await.is_err());
+        let dels = sent(&fake, &["netdev_del"]);
+        assert_eq!(
+            dels,
+            [(
+                "netdev_del".to_string(),
+                serde_json::json!({ "id": "net2" })
+            )]
+        );
+        fake.failing.lock().unwrap().clear();
+
+        assert!(hv.remove_nic(id, 1, UNPLUG).await.unwrap());
+        let removed: Vec<_> = sent(&fake, &["device_del", "netdev_del"])
+            .into_iter()
+            .map(|(c, a)| (c, a["id"].clone()))
+            .collect();
+        assert_eq!(
+            removed[1..],
+            [
+                ("device_del".to_string(), serde_json::json!("nic1")),
+                ("netdev_del".to_string(), serde_json::json!("net1")),
+            ]
+        );
+        assert_eq!(
+            *net.calls.lock().unwrap(),
+            [
+                format!("create {tap1} br0 Some(10)"),
+                format!("create {tap2} br0 Some(10)"),
+                format!("delete {tap2}"),
+                format!("delete {tap1}"),
+            ]
+        );
+    }
+
+    /// user NIC는 tap 없이 붙고(e1000e는 `host_mtu`가 없다), 다른 VM 이름의 tap과 호스트 네트워크가 없는 노드의
+    /// 브리지 NIC는 거절한다. 게스트가 내려 주지 않으면 백엔드를 지우지 않는다.
+    #[tokio::test]
+    async fn user_nics_and_refused_nics() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let user = RuntimeNic {
+            mac: "52:54:00:12:34:58".parse().unwrap(),
+            model: NicModel::E1000e,
+            backend: NicBackend::User,
+        };
+        hv.add_nic(id, 1, &user, 0).await.unwrap();
+        assert_eq!(
+            sent(&fake, &["netdev_add", "device_add"]),
+            [
+                (
+                    "netdev_add".to_string(),
+                    serde_json::json!({ "type": "user", "id": "net1" })
+                ),
+                (
+                    "device_add".to_string(),
+                    serde_json::json!({ "driver": "e1000e",
+                    "netdev": "net1", "mac": "52:54:00:12:34:58", "id": "nic1", "bus": "hp0" })
+                ),
+            ]
+        );
+        // 호스트 네트워크가 없는 노드(macOS)
+        let err = hv.add_nic(id, 2, &tap_nic(id, 2), 1).await.unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        let other = tap_nic(Uuid::now_v7(), 2);
+        let err = hv.add_nic(id, 2, &other, 1).await.unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        assert_eq!(sent(&fake, &["netdev_add"]).len(), 1);
+
+        *fake.hold_unplug.lock().unwrap() = true;
+        assert!(!hv.remove_nic(id, 1, UNPLUG).await.unwrap());
+        assert!(sent(&fake, &["netdev_del"]).is_empty());
+        assert!(matches!(
+            hv.remove_nic(Uuid::now_v7(), 1, UNPLUG).await,
+            Err(DriverError::NotRunning(_))
+        ));
+    }
+
+    /// 앞서 중단된 Task가 붙인 장치가 이미 있으면 아무것도 바꾸지 않는다(tap도 그대로). 장치 없이 남은 블록 노드·
+    /// 백엔드는 지우고 다시 만든다.
+    #[tokio::test]
+    async fn devices_already_present_or_left_half_added() {
+        let tmp = short_tempdir();
+        let net = Arc::new(RecordingNet::default());
+        let (hv, id, fake, _qemu) = running_vm_with_net(tmp.path(), net.clone()).await;
+        let present = hv
+            .add_disk(id, 1, &hot_disk(DiskKind::File), 0)
+            .await
+            .unwrap();
+        assert_eq!(present, AddOutcome::AlreadyPresent);
+        let present = hv.add_nic(id, 0, &tap_nic(id, 0), 1).await.unwrap();
+        assert_eq!(present, AddOutcome::AlreadyPresent);
+        assert!(
+            sent(
+                &fake,
+                &["blockdev-add", "blockdev-del", "netdev_add", "device_add"]
+            )
+            .is_empty()
+        );
+        assert!(net.calls.lock().unwrap().is_empty());
+
+        // 장치 없이 남은 노드 `disk3`·`disk3-file`은 닫고 다시 연다.
+        fake.hot_nodes
+            .lock()
+            .unwrap()
+            .extend(["disk3-file".to_string(), "disk3".to_string()]);
+        let added = hv
+            .add_disk(id, 3, &hot_disk(DiskKind::File), 2)
+            .await
+            .unwrap();
+        assert_eq!(added, AddOutcome::Added);
+        let ops: Vec<_> = sent(&fake, &["blockdev-del", "blockdev-add", "device_add"])
+            .into_iter()
+            .map(|(c, a)| {
+                (
+                    c,
+                    a["node-name"]
+                        .as_str()
+                        .or(a["id"].as_str())
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+        let ops: Vec<_> = ops.iter().map(|(c, n)| (c.as_str(), n.as_str())).collect();
+        assert_eq!(
+            ops,
+            [
+                ("blockdev-del", "disk3"),
+                ("blockdev-del", "disk3-file"),
+                ("blockdev-add", "disk3-file"),
+                ("blockdev-add", "disk3"),
+                ("device_add", "disk3-dev"),
+            ]
+        );
+
+        // 장치 없이 남은 백엔드 `net3`은 지우고 다시 만든다.
+        let added = hv.add_nic(id, 3, &tap_nic(id, 3), 3).await.unwrap();
+        assert_eq!(added, AddOutcome::Added);
+        let ops: Vec<_> = sent(&fake, &["netdev_add", "netdev_del"])
+            .into_iter()
+            .map(|(c, a)| (c, a["id"].clone()))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                ("netdev_add".to_string(), serde_json::json!("net3")),
+                ("netdev_del".to_string(), serde_json::json!("net3")),
+                ("netdev_add".to_string(), serde_json::json!("net3")),
+            ]
+        );
+        assert_eq!(sent(&fake, &["device_add"]).len(), 2);
+    }
+
+    /// `device_del`을 보낸 뒤 QMP가 끊기면 QEMU가 받았을 수 있으므로 게스트가 내려 주지 않은 것처럼 false다.
+    #[tokio::test]
+    async fn an_unplug_cut_off_after_device_del_is_unfinished() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        hv.add_disk(id, 2, &hot_disk(DiskKind::File), 0)
+            .await
+            .unwrap();
+        fake.drop_on.lock().unwrap().push("device_del");
+        assert!(!hv.remove_disk(id, 2, UNPLUG).await.unwrap());
+        assert!(sent(&fake, &["blockdev-del"]).is_empty());
+    }
+
+    /// 보내기 전의 장치 확인은 도는 QEMU의 id 있는 장치와 견준다.
+    #[tokio::test]
+    async fn check_devices_compares_the_running_devices() {
+        let tmp = short_tempdir();
+        let (hv, id, _fake, _qemu) = running_vm(tmp.path()).await;
+        let ids = |l: &[&str]| l.iter().map(|d| d.to_string()).collect::<Vec<_>>();
+        hv.check_devices(id, &ids(&["nic0", "disk1-dev", "disk0-dev"]))
+            .await
+            .unwrap();
+        let err = hv
+            .check_devices(id, &ids(&["disk0-dev", "nic0"]))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("QEMU has disk1-dev that the record does not"),
+            "{err}"
+        );
+    }
+
+    /// 능력은 `-device help`로 읽는다(x86_64만 vCPU). 읽지 못하면 메모리는 못 하는 것으로 한다.
+    #[tokio::test]
+    async fn hotplug_caps_read_the_device_list() {
+        let tmp = short_tempdir();
+        let qemu = tmp.path().join("qemu");
+        std::fs::write(
+            &qemu,
+            "#!/bin/sh\n[ \"$1 $2\" = \"-device help\" ] || exit 1\necho 'name \"virtio-mem-pci\", bus PCI'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&qemu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = config(tmp.path(), qemu);
+        let hv = QemuHypervisor::new(cfg.clone()).await.unwrap();
+        let caps = hv.hotplug_caps().await;
+        assert_eq!(
+            caps,
+            NodeHotplug {
+                cpu: false,
+                memory: true
+            }
+        );
+
+        cfg.host.arch = Arch::X86_64;
+        cfg.host.qemu_binary = PathBuf::from("/nonexistent/qemu");
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        // x86_64 vCPU 핫플러그는 Linux만이다(macOS는 HVF).
+        assert_eq!(
+            hv.hotplug_caps().await,
+            NodeHotplug {
+                cpu: cfg!(target_os = "linux"),
+                memory: false
+            }
+        );
     }
 }

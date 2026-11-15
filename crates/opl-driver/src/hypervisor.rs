@@ -1,9 +1,12 @@
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
 pub use opl_qemu::BitmapInfo;
-use opl_types::runtime::VmRuntimeSpec;
+use opl_types::node::NodeHotplug;
+use opl_types::runtime::{RuntimeDisk, RuntimeNic, VmRuntimeSpec};
+use opl_types::vm::CpuSpec;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -94,6 +97,15 @@ pub struct DiskCounters {
     pub wr_bytes: u64,
     pub rd_operations: u64,
     pub wr_operations: u64,
+}
+
+/// 실행 중 붙이기([`Hypervisor::add_disk`]·[`Hypervisor::add_nic`])의 결과
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// 새로 붙였다.
+    Added,
+    /// 같은 id의 장치가 이미 붙어 있었다(앞서 중단된 Task가 붙였다). 아무것도 바꾸지 않았다.
+    AlreadyPresent,
 }
 
 /// VM 프로세스 수명을 관리한다. 같은 VM에 대한 호출을 직렬화하는 것은 호출자(reconciler)의 책임이다.
@@ -266,6 +278,80 @@ pub trait Hypervisor: Send + Sync {
     /// 나중에 끝나 원본을 멈추지 않게 한다. 남은 디스크 미러(`opl-mirror-*`)는 보내는 중이 아니어도
     /// 취소하고 치운다.
     async fn cancel_migration(&self, id: Uuid) -> Result<(), DriverError>;
+
+    /// 마이그레이션을 보내기 전에(받는 쪽 QEMU를 켜거나 디스크를 복사하기 전에) 도는 QEMU의 디스크·NIC·붙인 vCPU·
+    /// virtio-mem 장치(`/machine/peripheral`)가 받는 쪽이 켤 장치 id(`expected` —
+    /// [`opl_types::hotplug::qemu_devices`])와 같은지 본다. 다르면 `Migration` 오류다.
+    async fn check_devices(&self, id: Uuid, expected: &[String]) -> Result<(), DriverError>;
+
+    /// 이 노드의 핫플러그 능력(계획 54). vCPU는 x86_64만, 메모리는 QEMU에 `virtio-mem-pci`가 있을 때다
+    /// (`-device help`, 5초). 장치 목록을 읽지 못하면 메모리는 못 하는 것으로 하고 경고만 남긴다.
+    async fn hotplug_caps(&self) -> NodeHotplug;
+
+    /// 핫플러그 배치로 켠 VM의 켜진 vCPU 수를 `from`에서 `to`로 바꾸고 닿은 수를 돌려준다. `cpu`는 켤 때의 CPU
+    /// 모양(소켓·상한으로 vCPU `i`의 자리를 정한다)이다. 늘리기(같은 수 포함)는 켤 때 수부터 `to` 아래의 빈 자리에
+    /// `cpu{i}`를 붙이고(이미 켜진 자리는 건너뜀 — 게스트가 늦게 내려 준 자리도 다시 붙인다), 줄이기는 큰 번호부터 떼며 게스트가 `timeout` 안에 내려 주지 않으면 거기서 멈춘다(그때 `to`보다
+    /// 크다). 아무것도 바꾸지 못한 오류만 `Err`이고, 몇 개를 바꾼 뒤의 오류는 경고와 함께 닿은 수다. 켤 때 수
+    /// 아래나 상한 위는 `InvalidSpec`이다.
+    async fn set_vcpus(
+        &self,
+        id: Uuid,
+        cpu: &CpuSpec,
+        from: u16,
+        to: u16,
+        timeout: Duration,
+    ) -> Result<u16, DriverError>;
+
+    /// virtio-mem에 꽂을 크기(`requested-size`)를 `plugged_mib`로 바꾸고 닿은 크기(MiB)를 돌려준다. 늘리기는
+    /// QEMU가 받으면 그 값이다(게스트 드라이버가 없으면 게스트가 보는 크기는 늘지 않는다). 줄이기는 게스트가
+    /// `timeout` 안에 내려 주기를 기다리고, 넘으면 `requested-size`를 그때 크기로 되돌려 그 크기다.
+    async fn set_memory(
+        &self,
+        id: Uuid,
+        plugged_mib: u32,
+        timeout: Duration,
+    ) -> Result<u32, DriverError>;
+
+    /// 실행 중인 VM의 루트 포트 `hp{port}`에 `index`번째 디스크(`disk{index}`, virtio-blk만)를 붙인다. 볼륨은
+    /// 호출자가 켜 둔다. 장치 `disk{index}-dev`가 이미 있으면 아무것도 하지 않고 `AlreadyPresent`이고, 장치 없이
+    /// 남은 블록 노드(앞서 중단된 붙이기)는 먼저 닫는다. 중간에 실패하면 연 블록 노드를 닫고 오류다.
+    async fn add_disk(
+        &self,
+        id: Uuid,
+        index: usize,
+        disk: &RuntimeDisk,
+        port: u8,
+    ) -> Result<AddOutcome, DriverError>;
+
+    /// 실행 중 붙인 `index`번째 디스크를 떼고 블록 노드를 닫는다. 게스트가 `timeout` 안에 내려 주지 않으면
+    /// 장치를 그대로 두고 false다(요청은 남아 게스트가 나중에 내려 줄 수 있다). `device_del`을 보낸 뒤 QMP가 끊기거나
+    /// 답하지 않아도 QEMU가 받았을 수 있으므로 false다. 이미 없으면 true다.
+    async fn remove_disk(
+        &self,
+        id: Uuid,
+        index: usize,
+        timeout: Duration,
+    ) -> Result<bool, DriverError>;
+
+    /// 실행 중인 VM의 루트 포트 `hp{port}`에 `index`번째 NIC(`net{index}`·`nic{index}`)를 붙인다. 브리지 NIC는
+    /// tap을 먼저 만든다. 장치 `nic{index}`가 이미 있으면 tap도 건드리지 않고 `AlreadyPresent`이고, 장치 없이 남은
+    /// 백엔드(앞서 중단된 붙이기)는 먼저 지운다. 중간에 실패하면 만든 백엔드와 tap을 지우고 오류다.
+    async fn add_nic(
+        &self,
+        id: Uuid,
+        index: usize,
+        nic: &RuntimeNic,
+        port: u8,
+    ) -> Result<AddOutcome, DriverError>;
+
+    /// 실행 중 붙인 `index`번째 NIC를 떼고 백엔드와 tap을 지운다. 게스트가 `timeout` 안에 내려 주지 않으면
+    /// 장치를 그대로 두고 false다. 이미 없으면 true다.
+    async fn remove_nic(
+        &self,
+        id: Uuid,
+        index: usize,
+        timeout: Duration,
+    ) -> Result<bool, DriverError>;
 
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;

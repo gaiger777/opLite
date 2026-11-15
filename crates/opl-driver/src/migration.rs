@@ -29,6 +29,9 @@ pub struct MigrateOptions {
     /// [`mirror_disks`](crate::Hypervisor::mirror_disks)로 시작한 디스크 미러를 스위치오버 직전
     /// (`pre-switchover`, 게스트가 멈춘 때)에 끝낸 뒤 이어 간다.
     pub switchover_mirrors: bool,
+    /// 받는 쪽이 켤 핫플러그·디스크·NIC 장치 id([`opl_types::hotplug::qemu_devices`]). 있으면 보내기 전에 원본
+    /// QEMU의 `/machine/peripheral`과 견주고, 다르면(게스트가 아직 내려 주지 않은 장치 등) 보내지 않는다.
+    pub devices: Option<Vec<String>>,
 }
 
 /// 받는 QEMU가 연 포트

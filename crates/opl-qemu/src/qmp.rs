@@ -799,6 +799,9 @@ impl QmpClient {
                 Err(QmpError::Command { class, .. }) if class == "DeviceNotFound" => {
                     return Ok(true);
                 }
+                // 앞서 보낸 떼기를 게스트가 아직 처리하는 중이다(PCIe 핫플러그, QEMU 6.2+). 그 이벤트를 기다린다.
+                Err(QmpError::Command { desc, .. })
+                    if desc.contains("already in the process of unplug") => {}
                 Err(e) => return Err(e),
             }
             loop {
@@ -833,6 +836,21 @@ impl QmpClient {
             .as_array()
             .ok_or_else(|| QmpError::Protocol(format!("qom-list: {ret}")))?;
         Ok(children.iter().any(|c| c["name"] == id))
+    }
+
+    /// id를 준 장치의 id 목록(`/machine/peripheral`의 자식, `qom-list`에서 `child<…>` 속성)
+    pub async fn peripheral_ids(&self) -> Result<Vec<String>, QmpError> {
+        let ret = self
+            .execute("qom-list", Some(json!({ "path": "/machine/peripheral" })))
+            .await?;
+        let children = ret
+            .as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("qom-list: {ret}")))?;
+        Ok(children
+            .iter()
+            .filter(|c| c["type"].as_str().is_some_and(|t| t.starts_with("child<")))
+            .filter_map(|c| c["name"].as_str().map(str::to_string))
+            .collect())
     }
 
     /// 네트워크 백엔드를 만든다(`netdev_add`, 인자는 `type`·`id`와 백엔드 속성).
@@ -2477,6 +2495,24 @@ mod tests {
         assert!(matches!(r, Err(QmpError::Command { .. })), "{r:?}");
     }
 
+    /// 앞서 보낸 떼기가 아직 진행 중이라는 오류면 그 이벤트를 기다린다.
+    #[tokio::test]
+    async fn device_del_wait_keeps_waiting_for_an_unplug_in_progress() {
+        let (client, mut fake, _dir) = setup().await;
+        let (r, ()) = tokio::join!(client.device_del_wait("disk1-dev", T), async {
+            let cmd = fake.recv().await;
+            let busy = "Device disk1-dev is already in the process of unplug";
+            fake.send(
+                json!({ "error": { "class": "GenericError", "desc": busy }, "id": cmd["id"] }),
+            )
+            .await;
+            fake.send(json!({ "event": "DEVICE_DELETED", "timestamp": {},
+                              "data": { "device": "disk1-dev" } }))
+                .await;
+        });
+        assert!(r.unwrap());
+    }
+
     /// 이벤트를 놓치면(`Lagged`) `/machine/peripheral`에 장치가 남았는지 직접 본다.
     #[tokio::test]
     async fn device_del_wait_checks_the_device_after_lagging() {
@@ -2496,5 +2532,22 @@ mod tests {
                 .await;
         });
         assert!(r.unwrap());
+    }
+
+    /// `peripheral_ids`는 `/machine/peripheral`의 자식 장치 이름만 준다(`type` 같은 속성은 뺀다).
+    #[tokio::test]
+    async fn peripheral_ids_list_the_child_devices() {
+        let (client, mut fake, _dir) = setup().await;
+        let (r, ()) = tokio::join!(client.peripheral_ids(), async {
+            let list = fake.recv().await;
+            assert_eq!(list["execute"], "qom-list");
+            assert_eq!(list["arguments"], json!({ "path": "/machine/peripheral" }));
+            fake.send(json!({ "return": [{ "name": "type", "type": "string" },
+                                         { "name": "disk0-dev", "type": "child<virtio-blk-pci>" },
+                                         { "name": "nic0", "type": "child<virtio-net-pci>" }],
+                              "id": list["id"] }))
+                .await;
+        });
+        assert_eq!(r.unwrap(), ["disk0-dev", "nic0"]);
     }
 }

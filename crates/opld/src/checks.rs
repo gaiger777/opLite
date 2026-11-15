@@ -18,7 +18,9 @@ use opl_cluster::types::NodeId;
 use opl_driver::{NetFs, PING_TIMEOUT, PROBE_TIMEOUT, ProbeError};
 use opl_types::audit::AuditTarget;
 use opl_types::ha_check::{AUTO_PREFIX, CheckReport, CheckState, HaCheckSpec, HaCheckTarget};
-use opl_types::node::{BondState, BondStatus, HA_CHECKS, NodeInterface, NodeSpec, PortState};
+use opl_types::node::{
+    BondState, BondStatus, HA_CHECKS, NodeHotplug, NodeInterface, NodeSpec, PortState,
+};
 use opl_types::resource::Resource;
 use opl_types::storage::{IscsiTarget, PoolBackend, StoragePool, StoragePoolSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
@@ -55,6 +57,9 @@ pub struct CheckerConfig {
     pub mount_root: PathBuf,
     /// 클러스터 링크의 호스트(`Config::cluster_hosts`, 앞이 `cluster-link-1`)
     pub hosts: Vec<String>,
+    /// 이 노드의 핫플러그 능력(계획 54). 노드 상태의 값이 다르면(이 필드를 모르는 옛 리더가 상태를 다시 써 지웠으면)
+    /// 결과를 쓸 때 다시 쓴다. None이면 건드리지 않는다.
+    pub hotplug: Option<NodeHotplug>,
 }
 
 /// 디렉터리 풀 probe. 시험은 멈추는 가짜로 바꾼다.
@@ -533,7 +538,8 @@ impl State {
         }
     }
 
-    /// `NodeStatus.checks`·`interfaces`를 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이 있을 때만, 64개까지).
+    /// `NodeStatus.checks`·`interfaces`·`hotplug`를 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이 있을 때만,
+    /// 64개까지).
     async fn write_status(&self, checks: &[CheckReport]) {
         let interfaces = self
             .interfaces
@@ -550,6 +556,13 @@ impl State {
                 && status.interfaces != *list
             {
                 status.interfaces = list.clone();
+                changed = true;
+            }
+            // 옛 리더가 모르는 필드를 버리고 상태를 다시 썼으면 핫플러그 능력을 다시 쓴다.
+            if let Some(hotplug) = self.config.hotplug
+                && status.hotplug != Some(hotplug)
+            {
+                status.hotplug = Some(hotplug);
                 changed = true;
             }
             changed
@@ -987,6 +1000,7 @@ mod tests {
                     net: self.net.clone(),
                     mount_root: self.dir.path().join("pools"),
                     hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                    hotplug: None,
                 },
                 self.audit.clone(),
             );
@@ -1069,6 +1083,32 @@ mod tests {
         assert!(run_once(&mut state).await.is_empty());
         assert!(s.cluster.lease_checks().is_empty());
         assert!(s.node().status.checks.is_empty());
+    }
+
+    /// 노드 상태의 핫플러그 능력이 지워지면(옛 리더가 다시 씀) 다음 회차에 다시 쓴다. 같으면 쓰지 않는다.
+    #[tokio::test]
+    async fn the_hotplug_capabilities_are_written_again_when_cleared() {
+        let s = setup().await;
+        let caps = NodeHotplug {
+            cpu: true,
+            memory: false,
+        };
+        let mut state = s.state(&[]);
+        state.config.hotplug = Some(caps);
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.hotplug, Some(caps));
+        let revision = s.node().revision;
+        run_once(&mut state).await;
+        assert_eq!(s.node().revision, revision);
+
+        bootstrap::update_node_status(&s.cluster, |status| {
+            status.hotplug = None;
+            true
+        })
+        .await
+        .unwrap();
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.hotplug, Some(caps));
     }
 
     /// 링크 검사: carrier가 0이 되면 다음 회차에 실패이고 시작 시각이 붙으며 노드 상태에 쓴다. 결과가 같으면 다시

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use opl_driver::{Firewall, HostNet, IpRoute, Nft, QemuConfig};
 use opl_qemu::{Accel, HostProfile};
-use opl_types::node::BridgeInfo;
+use opl_types::node::{BridgeInfo, NodeHotplug};
 
 use crate::config::{AccelSetting, Config};
 
@@ -17,6 +17,11 @@ pub struct Host {
     /// VM 방화벽(nftables)을 넣는다. Linux에서 규칙을 넣을 수 있을 때만 있다([`Host::detect_firewall`]).
     pub firewall: Option<Arc<dyn Firewall>>,
     pub systemd_scope: bool,
+    /// 이 노드의 핫플러그 능력(계획 54). 드라이버를 만든 뒤 한 번 읽는다([`Hypervisor::hotplug_caps`]). 그 전에는
+    /// 아무것도 못 한다.
+    ///
+    /// [`Hypervisor::hotplug_caps`]: opl_driver::Hypervisor::hotplug_caps
+    pub hotplug: NodeHotplug,
 }
 
 impl Host {
@@ -40,6 +45,7 @@ impl Host {
             net,
             firewall: None,
             systemd_scope: config.hypervisor.systemd_scope,
+            hotplug: NodeHotplug::default(),
         })
     }
 

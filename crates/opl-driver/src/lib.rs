@@ -21,14 +21,14 @@ pub use hostcheck::{
     rados_args, rados_result, refresh_interfaces, reported_interfaces,
 };
 pub use hypervisor::{
-    ActualState, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind, Hypervisor,
-    HypervisorEvent, RuntimeStatus, StopMode,
+    ActualState, AddOutcome, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind,
+    Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
 };
 pub use migration::{
     IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
     MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir, tcp_uri, write_migration_tls,
 };
-pub use mock::{GuestAnswer, IncrementalCall, MockHypervisor};
+pub use mock::{GuestAnswer, HotplugCall, IncrementalCall, MockHypervisor};
 pub use net::{HostNet, IpRoute, Overlay, OverlayChanges, Tap};
 pub use opl_types::storage::SourceFormat;
 pub use qemu::{QemuConfig, QemuHypervisor, uefi_vars_path, vm_state_dir};

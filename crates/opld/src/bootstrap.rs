@@ -240,7 +240,7 @@ async fn record_node(
             // 인터페이스와 HA 검사 결과는 노드의 검사기가 쓴다. 지우지 않는다.
             interfaces: std::mem::take(&mut status.interfaces),
             checks: std::mem::take(&mut status.checks),
-            hotplug: None,
+            hotplug: Some(host.hotplug),
         };
         true
     })
@@ -432,7 +432,9 @@ pub(crate) mod tests {
     use opl_cluster::memnet::MemRouter;
     use opl_cluster::types::OrbNode;
     use opl_driver::{DriverError, Firewall, HostNet, Overlay, OverlayChanges, Tap};
-    use opl_types::node::{BridgeInfo, Fencing, NodeHa, NodeUpdates, PoolState, ShutdownAction};
+    use opl_types::node::{
+        BridgeInfo, Fencing, NodeHa, NodeHotplug, NodeUpdates, PoolState, ShutdownAction,
+    };
 
     use crate::config::FencingSetting;
 
@@ -452,6 +454,9 @@ pub(crate) mod tests {
             unimplemented!()
         }
         async fn delete_vm_taps(&self, _: Uuid) -> Result<(), DriverError> {
+            unimplemented!()
+        }
+        async fn delete_tap(&self, _: &str) -> Result<(), DriverError> {
             unimplemented!()
         }
         async fn sync_overlays(
@@ -652,6 +657,24 @@ pub(crate) mod tests {
         assert_eq!(underlay(), Some("fd00::5".parse().unwrap()));
         record_node(&cluster, &config, &host, None).await.unwrap();
         assert_eq!(underlay(), Some("fd00::5".parse().unwrap()));
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 드라이버가 읽은 핫플러그 능력을 기록한다(위트니스는 없다 — 위트니스 시험).
+    #[tokio::test]
+    async fn registration_records_the_hotplug_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        host.hotplug = NodeHotplug {
+            cpu: true,
+            memory: false,
+        };
+        register_node(&cluster, &config, &host).await.unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert_eq!(node.status.hotplug, Some(host.hotplug));
         cluster.shutdown().await.unwrap();
     }
 

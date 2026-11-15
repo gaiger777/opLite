@@ -403,6 +403,9 @@ impl Member {
                     return Err(e.into());
                 }
             };
+        // 등록 때 핫플러그 능력을 기록하므로 등록 전에 읽는다(QEMU `-device help`).
+        host.hotplug = hv.hotplug_caps().await;
+        let hotplug = host.hotplug;
         // QEMU가 마이그레이션 TLS에 쓰는 노드 인증서. 드라이버의 state_dir은 데이터 디렉터리다(host.rs).
         let tls_dir = migration_tls_dir(&config.data_dir);
         if let Err(e) = write_migration_tls(&tls_dir, &tls.ca_pem, &tls.cert_pem, &tls.key_pem) {
@@ -724,6 +727,7 @@ impl Member {
                         .into_iter()
                         .map(String::from)
                         .collect(),
+                    hotplug: Some(hotplug),
                 },
                 state.audit.clone(),
             )

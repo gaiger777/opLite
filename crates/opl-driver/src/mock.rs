@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -7,14 +7,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opl_qemu::QmpError;
 use opl_types::backup::BITMAP_PREFIX;
-use opl_types::runtime::{ImageFormat, VmRuntimeSpec};
+use opl_types::node::NodeHotplug;
+use opl_types::runtime::{ImageFormat, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
+use opl_types::vm::{CpuSpec, DiskBus};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
 use crate::error::DriverError;
 use crate::hypervisor::{
-    ActualState, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind, Hypervisor,
-    HypervisorEvent, RuntimeStatus, StopMode,
+    ActualState, AddOutcome, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind,
+    Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
 };
 use crate::migration::{
     IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress, MirrorTarget,
@@ -29,6 +31,30 @@ pub const MOCK_MIRROR_BYTES: u64 = 1 << 30;
 
 /// `incremental_backup` 호출 한 번: (VM, 앞 비트맵, 새 비트맵, 대상)
 pub type IncrementalCall = (Uuid, String, String, Vec<BackupTarget>);
+
+/// 핫플러그 호출 하나([`MockHypervisor::hotplug_calls`]). 실패한 호출 포함
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotplugCall {
+    SetVcpus { id: Uuid, from: u16, to: u16 },
+    SetMemory { id: Uuid, plugged_mib: u32 },
+    AddDisk { id: Uuid, index: usize, port: u8 },
+    RemoveDisk { id: Uuid, index: usize },
+    AddNic { id: Uuid, index: usize, port: u8 },
+    RemoveNic { id: Uuid, index: usize },
+}
+
+/// 실행 중인 VM의 핫플러그 상태(켤 때 런타임 스펙에서 정하고 핫플러그 호출이 바꾼다)
+#[derive(Debug, Clone, Default)]
+struct HotState {
+    vcpus: u16,
+    plugged_mib: u32,
+    /// virtio-mem 크기(상한 − 켤 때 메모리). 0이면 virtio-mem이 없다.
+    vmem_mib: u32,
+    /// 빈 루트 포트 수
+    ports: u8,
+    /// 장치 id(`disk{i}-dev`·`nic{i}`)와 그 루트 포트(켤 때 단 장치는 None — `pcie.0`이라 뗄 수 없다)
+    devices: BTreeMap<String, Option<u8>>,
+}
 
 /// 게스트 에이전트가 `guest_ping`에 어떻게 답하는지([`MockHypervisor::set_guest_agent`])
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +188,20 @@ struct MockState {
     guest_answers: HashMap<Uuid, GuestAnswer>,
     /// `guest_ping` 호출(실패 포함)
     guest_pings: Vec<Uuid>,
+    /// 새로 띄우려 한 VM의 런타임 스펙(`launches`와 같은 순서, 실패한 시도 포함)
+    launch_specs: Vec<VmRuntimeSpec>,
+    /// `start_incoming`으로 받으려 한 VM의 런타임 스펙(실패한 시도 포함)
+    incoming_specs: Vec<VmRuntimeSpec>,
+    /// 실행 중인 VM의 핫플러그 상태. VM이 꺼지면 사라진다.
+    hot: HashMap<Uuid, HotState>,
+    /// `set_hotplug_caps`로 정한 능력(없으면 vCPU·메모리 모두)
+    hotplug_caps: Option<NodeHotplug>,
+    /// 떼기·줄이기를 게스트가 내려 주지 않는 VM(시간 제한 길)
+    hold_unplug: HashSet<Uuid>,
+    /// 다음 핫플러그 호출 한 번을 이 문구의 QMP 오류로 실패시킨다(아무것도 바꾸지 않는다).
+    fail_next_hotplug: Option<String>,
+    /// 핫플러그 호출(실패 포함)
+    hotplug_calls: Vec<HotplugCall>,
 }
 
 impl Default for MockHypervisor {
@@ -546,8 +586,166 @@ impl MockHypervisor {
         st.exports.get(&id).cloned().unwrap_or_default()
     }
 
+    /// 새로 띄우려 한 VM의 런타임 스펙(`launches`와 같은 순서, 주입한 오류로 실패한 시도 포함)
+    pub fn launch_specs(&self) -> Vec<VmRuntimeSpec> {
+        self.state.lock().unwrap().launch_specs.clone()
+    }
+
+    /// `start_incoming`으로 받으려 한 VM의 런타임 스펙(실패한 시도 포함)
+    pub fn incoming_specs(&self) -> Vec<VmRuntimeSpec> {
+        self.state.lock().unwrap().incoming_specs.clone()
+    }
+
+    /// `hotplug_caps`가 돌려줄 능력을 정한다(기본은 vCPU·메모리 모두).
+    pub fn set_hotplug_caps(&self, caps: NodeHotplug) {
+        self.state.lock().unwrap().hotplug_caps = Some(caps);
+    }
+
+    /// 이 VM의 게스트가 떼기·줄이기를 내려 주지 않게 하거나(true) 되돌린다(false). `set_vcpus`·`set_memory`의
+    /// 줄이기는 바꾸지 않은 값을, `remove_disk`·`remove_nic`은 false를 돌려준다(장치는 그대로).
+    pub fn hold_unplug(&self, id: Uuid, hold: bool) {
+        let mut st = self.state.lock().unwrap();
+        if hold {
+            st.hold_unplug.insert(id);
+        } else {
+            st.hold_unplug.remove(&id);
+        }
+    }
+
+    /// 다음 핫플러그 호출 한 번을 이 문구의 QMP 오류(`GenericError`)로 실패시킨다. 실제 드라이버가 붙이다 실패한
+    /// 장치를 되돌리듯 아무것도 바꾸지 않는다.
+    pub fn fail_next_hotplug(&self, msg: &str) {
+        self.state.lock().unwrap().fail_next_hotplug = Some(msg.to_string());
+    }
+
+    /// 핫플러그 호출(실패 포함)을 순서대로 돌려준다.
+    pub fn hotplug_calls(&self) -> Vec<HotplugCall> {
+        self.state.lock().unwrap().hotplug_calls.clone()
+    }
+
+    /// 실행 중인 VM의 켜진 vCPU 수(꺼져 있으면 None)
+    pub fn vcpus(&self, id: Uuid) -> Option<u16> {
+        self.state.lock().unwrap().hot.get(&id).map(|h| h.vcpus)
+    }
+
+    /// 실행 중인 VM의 virtio-mem에 꽂은 크기(MiB, 꺼져 있으면 None)
+    pub fn plugged_mib(&self, id: Uuid) -> Option<u32> {
+        self.state
+            .lock()
+            .unwrap()
+            .hot
+            .get(&id)
+            .map(|h| h.plugged_mib)
+    }
+
+    /// 실행 중인 VM의 디스크·NIC 장치 id(`disk{i}-dev`·`nic{i}`, 이름 순). 꺼져 있으면 비어 있다.
+    pub fn devices(&self, id: Uuid) -> Vec<String> {
+        let st = self.state.lock().unwrap();
+        st.hot
+            .get(&id)
+            .map(|h| h.devices.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 핫플러그 호출을 기록하고, 실행 중인 VM이 아니거나 주입한 실패가 있으면 오류다.
+    fn hotplug_call(st: &mut MockState, call: HotplugCall) -> Result<(), DriverError> {
+        let id = match call {
+            HotplugCall::SetVcpus { id, .. }
+            | HotplugCall::SetMemory { id, .. }
+            | HotplugCall::AddDisk { id, .. }
+            | HotplugCall::RemoveDisk { id, .. }
+            | HotplugCall::AddNic { id, .. }
+            | HotplugCall::RemoveNic { id, .. } => id,
+        };
+        st.hotplug_calls.push(call);
+        Self::controllable(st, id)?;
+        match st.fail_next_hotplug.take() {
+            Some(desc) => Err(qmp_error("GenericError", desc)),
+            None => Ok(()),
+        }
+    }
+
+    /// 도는 VM에 장치 `dev`가 있는지
+    fn present(st: &MockState, id: Uuid, dev: &str) -> bool {
+        st.hot.get(&id).is_some_and(|h| h.devices.contains_key(dev))
+    }
+
+    /// 실제 QEMU처럼 장치 `dev`를 빈 루트 포트 `hp{port}`에 붙인다.
+    fn plug(st: &mut MockState, id: Uuid, dev: String, port: u8) -> Result<(), DriverError> {
+        let hot = st.hot.entry(id).or_default();
+        if port >= hot.ports {
+            return Err(qmp_error(
+                "GenericError",
+                format!("Bus 'hp{port}' not found"),
+            ));
+        }
+        if hot.devices.contains_key(&dev) {
+            return Err(qmp_error(
+                "GenericError",
+                format!("Duplicate device ID '{dev}'"),
+            ));
+        }
+        if hot.devices.values().any(|p| *p == Some(port)) {
+            return Err(qmp_error(
+                "GenericError",
+                format!("PCI: slot 0 function 0 not available for hp{port}"),
+            ));
+        }
+        hot.devices.insert(dev, Some(port));
+        Ok(())
+    }
+
+    /// 실제 QEMU처럼 장치 `dev`를 뗀다. 없으면 뗀 것이고(true), 게스트가 내려 주지 않으면 false다. 켤 때 단 장치는
+    /// `pcie.0`에 있어 뗄 수 없다.
+    fn unplug(st: &mut MockState, id: Uuid, dev: &str) -> Result<bool, DriverError> {
+        let held = st.hold_unplug.contains(&id);
+        let hot = st.hot.entry(id).or_default();
+        match hot.devices.get(dev) {
+            None => Ok(true),
+            Some(None) => Err(qmp_error(
+                "GenericError",
+                "Bus 'pcie.0' does not support hotplugging",
+            )),
+            Some(Some(_)) if held => Ok(false),
+            Some(Some(_)) => {
+                hot.devices.remove(dev);
+                Ok(true)
+            }
+        }
+    }
+
     /// 새로 띄운 VM의 디스크 형식을 적고, 디스크 수에 맞춰 비트맵 목록을 늘리거나 줄인다.
     fn launched(st: &mut MockState, vm: &VmRuntimeSpec) {
+        let layout = vm.hotplug.as_ref();
+        // 켤 때 단 장치는 `pcie.0`, 배치의 순번 뒤 장치는 그 루트 포트에 있다.
+        let port = |boot: Option<u8>, ports: Option<&Vec<u8>>, i: usize| {
+            let boot = usize::from(boot?);
+            ports?.get(i.checked_sub(boot)?).copied()
+        };
+        let mut devices = BTreeMap::new();
+        for i in 0..vm.disks.len() {
+            let p = port(
+                layout.map(|l| l.boot_disks),
+                layout.map(|l| &l.disk_ports),
+                i,
+            );
+            devices.insert(format!("disk{i}-dev"), p);
+        }
+        for i in 0..vm.nics.len() {
+            let p = port(layout.map(|l| l.boot_nics), layout.map(|l| &l.nic_ports), i);
+            devices.insert(format!("nic{i}"), p);
+        }
+        let boot_vcpus = u16::try_from(vm.cpu.vcpus()).unwrap_or(u16::MAX);
+        st.hot.insert(
+            vm.id,
+            HotState {
+                vcpus: layout.map_or(boot_vcpus, |l| l.vcpus),
+                plugged_mib: layout.map_or(0, |l| l.plugged_mib),
+                vmem_mib: layout.map_or(0, |l| l.max_memory_mib.saturating_sub(vm.memory_mib)),
+                ports: layout.map_or(0, |l| l.ports),
+                devices,
+            },
+        );
         let formats: Vec<ImageFormat> = vm.disks.iter().map(|d| d.format).collect();
         st.bitmaps
             .entry(vm.id)
@@ -624,6 +822,7 @@ impl MockHypervisor {
         st.disk_stats.remove(&id);
         st.failing_disk_stats.remove(&id);
         st.guest_channels.remove(&id);
+        st.hot.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -670,6 +869,7 @@ impl Hypervisor for MockHypervisor {
                 return Ok(());
             }
             st.launches.push((vm.id, restore.map(str::to_string)));
+            st.launch_specs.push(vm.clone());
             if let Some(err) = st
                 .fail_next_start
                 .take()
@@ -708,6 +908,7 @@ impl Hypervisor for MockHypervisor {
                         st.migration_status.remove(&id);
                         st.outgoing.remove(&id);
                         st.guest_channels.remove(&id);
+                        st.hot.remove(&id);
                         st.vms.remove(&id);
                         Ok(())
                     }
@@ -1008,6 +1209,7 @@ impl Hypervisor for MockHypervisor {
         }
         {
             let mut st = self.state.lock().unwrap();
+            st.incoming_specs.push(vm.clone());
             if st.vms.contains_key(&vm.id) {
                 return Err(DriverError::Migration(format!(
                     "VM {} is already running on this node",
@@ -1206,6 +1408,164 @@ impl Hypervisor for MockHypervisor {
         Ok(migrated)
     }
 
+    /// 실제 드라이버처럼 도는 VM의 장치와 `expected`를 견준다. Mock은 디스크·NIC 장치(`disk{i}-dev`·`nic{i}`)만
+    /// 따라가므로 그것만 견준다.
+    async fn check_devices(&self, id: Uuid, expected: &[String]) -> Result<(), DriverError> {
+        let st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        let tracked =
+            |d: &&String| d.starts_with("nic") || d.ends_with("-dev") && d.starts_with("disk");
+        let want: BTreeSet<&String> = expected.iter().filter(tracked).collect();
+        let running: BTreeSet<&String> = st
+            .hot
+            .get(&id)
+            .map(|h| h.devices.keys().collect())
+            .unwrap_or_default();
+        if want != running {
+            return Err(DriverError::Migration(format!(
+                "the running QEMU devices do not match the VM's hardware record: QEMU has {running:?}, the record has {want:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn hotplug_caps(&self) -> NodeHotplug {
+        let caps = self.state.lock().unwrap().hotplug_caps;
+        caps.unwrap_or(NodeHotplug {
+            cpu: true,
+            memory: true,
+        })
+    }
+
+    /// 실제 드라이버처럼 켤 때 수 아래·상한 위는 `InvalidSpec`이다. 지금 수에서 `to`로 바꾼다(`from`은 기록만).
+    async fn set_vcpus(
+        &self,
+        id: Uuid,
+        cpu: &CpuSpec,
+        from: u16,
+        to: u16,
+        _timeout: Duration,
+    ) -> Result<u16, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::hotplug_call(&mut st, HotplugCall::SetVcpus { id, from, to })?;
+        let (boot, max) = (cpu.vcpus(), cpu.max());
+        if max <= boot || !(boot..=max).contains(&u32::from(to)) {
+            return Err(DriverError::InvalidSpec(format!(
+                "VM {id} can run {boot} to {max} vCPUs, not {to}"
+            )));
+        }
+        let held = st.hold_unplug.contains(&id);
+        let hot = st.hot.entry(id).or_default();
+        if to > hot.vcpus || !held {
+            hot.vcpus = to;
+        }
+        Ok(hot.vcpus)
+    }
+
+    /// virtio-mem이 없는 VM은 실제 QEMU처럼 `DeviceNotFound`, 크기를 넘으면 오류다.
+    async fn set_memory(
+        &self,
+        id: Uuid,
+        plugged_mib: u32,
+        _timeout: Duration,
+    ) -> Result<u32, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::hotplug_call(&mut st, HotplugCall::SetMemory { id, plugged_mib })?;
+        let held = st.hold_unplug.contains(&id);
+        let hot = st.hot.entry(id).or_default();
+        if hot.vmem_mib == 0 {
+            return Err(qmp_error("DeviceNotFound", "Device 'vmem0-dev' not found"));
+        }
+        if plugged_mib > hot.vmem_mib {
+            return Err(qmp_error(
+                "GenericError",
+                format!(
+                    "'requested-size' cannot exceed the memory backend size ({plugged_mib} MiB)"
+                ),
+            ));
+        }
+        if plugged_mib > hot.plugged_mib || !held {
+            hot.plugged_mib = plugged_mib;
+        }
+        Ok(hot.plugged_mib)
+    }
+
+    /// 디스크 형식·비트맵 목록도 그 순번까지 늘린다(새 디스크에는 비트맵이 없다). 실제 드라이버처럼 장치가 이미
+    /// 있으면 `AlreadyPresent`다.
+    async fn add_disk(
+        &self,
+        id: Uuid,
+        index: usize,
+        disk: &RuntimeDisk,
+        port: u8,
+    ) -> Result<AddOutcome, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::hotplug_call(&mut st, HotplugCall::AddDisk { id, index, port })?;
+        if disk.bus != DiskBus::VirtioBlk {
+            return Err(DriverError::InvalidSpec(
+                "only virtio-blk disks can be added while the VM is running".into(),
+            ));
+        }
+        let dev = format!("disk{index}-dev");
+        if Self::present(&st, id, &dev) {
+            return Ok(AddOutcome::AlreadyPresent);
+        }
+        Self::plug(&mut st, id, dev, port)?;
+        let formats = st.disk_formats.entry(id).or_default();
+        formats.truncate(index);
+        formats.push(disk.format);
+        st.bitmaps
+            .entry(id)
+            .or_default()
+            .resize(index + 1, Vec::new());
+        Ok(AddOutcome::Added)
+    }
+
+    /// 떼면 디스크 형식·비트맵 목록도 그 순번 앞까지 줄인다.
+    async fn remove_disk(
+        &self,
+        id: Uuid,
+        index: usize,
+        _timeout: Duration,
+    ) -> Result<bool, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::hotplug_call(&mut st, HotplugCall::RemoveDisk { id, index })?;
+        let removed = Self::unplug(&mut st, id, &format!("disk{index}-dev"))?;
+        if removed {
+            st.disk_formats.entry(id).or_default().truncate(index);
+            st.bitmaps.entry(id).or_default().truncate(index);
+        }
+        Ok(removed)
+    }
+
+    async fn add_nic(
+        &self,
+        id: Uuid,
+        index: usize,
+        _nic: &RuntimeNic,
+        port: u8,
+    ) -> Result<AddOutcome, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::hotplug_call(&mut st, HotplugCall::AddNic { id, index, port })?;
+        let dev = format!("nic{index}");
+        if Self::present(&st, id, &dev) {
+            return Ok(AddOutcome::AlreadyPresent);
+        }
+        Self::plug(&mut st, id, dev, port)?;
+        Ok(AddOutcome::Added)
+    }
+
+    async fn remove_nic(
+        &self,
+        id: Uuid,
+        index: usize,
+        _timeout: Duration,
+    ) -> Result<bool, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::hotplug_call(&mut st, HotplugCall::RemoveNic { id, index })?;
+        Self::unplug(&mut st, id, &format!("nic{index}"))
+    }
+
     async fn cancel_migration(&self, id: Uuid) -> Result<(), DriverError> {
         let mut st = self.state.lock().unwrap();
         if let Some(err) = st.fail_next_cancel.pop_front() {
@@ -1223,6 +1583,14 @@ impl Hypervisor for MockHypervisor {
     }
 }
 
+/// QEMU가 명령에 오류로 답한 것
+fn qmp_error(class: &str, desc: impl Into<String>) -> DriverError {
+    DriverError::Qmp(QmpError::Command {
+        class: class.into(),
+        desc: desc.into(),
+    })
+}
+
 fn inmigrate() -> RuntimeStatus {
     RuntimeStatus::Other("inmigrate".into())
 }
@@ -1233,7 +1601,7 @@ fn postmigrate() -> RuntimeStatus {
 
 #[cfg(test)]
 mod tests {
-    use opl_types::vm::{CpuModel, CpuSpec, Firmware, MachineType};
+    use opl_types::vm::{CpuModel, Firmware, MachineType};
 
     use super::*;
 
@@ -1726,6 +2094,7 @@ mod tests {
             bandwidth: None,
             timeout: Duration::from_secs(60),
             switchover_mirrors: false,
+            devices: None,
         }
     }
 
@@ -1938,6 +2307,7 @@ mod tests {
         // 미러 없이 스위치오버를 바라면 실패한다.
         let switchover = MigrateOptions {
             switchover_mirrors: true,
+            devices: None,
             ..opts()
         };
         assert!(src.migrate(vm.id, &target(), &switchover).await.is_err());
@@ -1999,6 +2369,7 @@ mod tests {
 
         let switchover = MigrateOptions {
             switchover_mirrors: true,
+            devices: None,
             ..opts()
         };
         hv.mirror_disks(vm.id, &targets, &mirror).await.unwrap();
@@ -2055,5 +2426,178 @@ mod tests {
             }
         );
         assert!(hv.list().await.unwrap().is_empty());
+    }
+
+    fn disk(format: ImageFormat) -> RuntimeDisk {
+        RuntimeDisk {
+            path: "/pools/a/d.qcow2".into(),
+            kind: opl_types::runtime::DiskKind::File,
+            rbd: None,
+            format,
+            bus: DiskBus::VirtioBlk,
+            boot_order: None,
+        }
+    }
+
+    /// 핫플러그 배치로 켠 VM: 켤 때 vCPU 2개·실행 중 붙인 vCPU 하나, virtio-mem 3072 MiB 중 1024 꽂음, 디스크 둘
+    /// (둘째는 실행 중 붙여 `hp2`), NIC 하나
+    fn hot_spec() -> VmRuntimeSpec {
+        VmRuntimeSpec {
+            cpu: CpuSpec {
+                sockets: 1,
+                cores: 2,
+                model: CpuModel::Max,
+                max_vcpus: Some(8),
+            },
+            memory_mib: 1024,
+            disks: vec![disk(ImageFormat::Qcow2), disk(ImageFormat::Qcow2)],
+            nics: vec![RuntimeNic {
+                mac: "52:54:00:12:34:56".parse().unwrap(),
+                model: opl_types::vm::NicModel::Virtio,
+                backend: opl_types::runtime::NicBackend::User,
+            }],
+            hotplug: Some(opl_types::runtime::HotplugLayout {
+                vcpus: 3,
+                max_memory_mib: 4096,
+                plugged_mib: 1024,
+                ports: opl_types::runtime::HOTPLUG_PORTS,
+                boot_disks: 1,
+                boot_nics: 1,
+                disk_ports: vec![2],
+                nic_ports: vec![],
+            }),
+            ..spec()
+        }
+    }
+
+    /// 켤 때 배치에서 vCPU·virtio-mem·장치를 정하고 핫플러그 호출이 실제 QEMU처럼 바꾼다(켤 때 단 장치는 뗄 수 없고,
+    /// 쓰는 포트에는 붙일 수 없다). 끄면 사라진다.
+    #[tokio::test]
+    async fn hotplug_state_starts_from_the_layout_and_follows_the_calls() {
+        let hv = MockHypervisor::default();
+        let vm = hot_spec();
+        let t = Duration::from_millis(1);
+        hv.start(&vm, None).await.unwrap();
+        assert_eq!(hv.launch_specs(), std::slice::from_ref(&vm));
+        assert_eq!(hv.vcpus(vm.id), Some(3));
+        assert_eq!(hv.plugged_mib(vm.id), Some(1024));
+        assert_eq!(hv.devices(vm.id), ["disk0-dev", "disk1-dev", "nic0"]);
+
+        assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 3, 5, t).await.unwrap(), 5);
+        assert!(hv.set_vcpus(vm.id, &vm.cpu, 5, 1, t).await.is_err());
+        assert_eq!(hv.set_memory(vm.id, 3072, t).await.unwrap(), 3072);
+        assert!(hv.set_memory(vm.id, 3074, t).await.is_err());
+        // 포트 2는 실행 중 붙인 디스크가 쓴다.
+        assert!(
+            hv.add_disk(vm.id, 2, &disk(ImageFormat::Raw), 2)
+                .await
+                .is_err()
+        );
+        hv.add_disk(vm.id, 2, &disk(ImageFormat::Raw), 0)
+            .await
+            .unwrap();
+        assert!(hv.remove_disk(vm.id, 0, t).await.is_err());
+        hv.add_nic(vm.id, 1, &vm.nics[0], 1).await.unwrap();
+        assert_eq!(
+            hv.devices(vm.id),
+            ["disk0-dev", "disk1-dev", "disk2-dev", "nic0", "nic1"]
+        );
+        assert_eq!(hv.backup_bitmaps(vm.id).await.unwrap().len(), 3);
+
+        // 게스트가 내려 주지 않으면 떼기·줄이기는 그대로다(늘리기는 된다).
+        hv.hold_unplug(vm.id, true);
+        assert!(!hv.remove_disk(vm.id, 2, t).await.unwrap());
+        assert!(!hv.remove_nic(vm.id, 1, t).await.unwrap());
+        assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 5, 2, t).await.unwrap(), 5);
+        assert_eq!(hv.set_memory(vm.id, 0, t).await.unwrap(), 3072);
+        assert_eq!(hv.devices(vm.id).len(), 5);
+        hv.hold_unplug(vm.id, false);
+        assert!(hv.remove_disk(vm.id, 2, t).await.unwrap());
+        assert!(hv.remove_nic(vm.id, 1, t).await.unwrap());
+        // 이미 없는 장치는 뗀 것이다.
+        assert!(hv.remove_nic(vm.id, 1, t).await.unwrap());
+        assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 5, 2, t).await.unwrap(), 2);
+        assert_eq!(hv.backup_bitmaps(vm.id).await.unwrap().len(), 2);
+
+        // 주입한 실패는 아무것도 바꾸지 않는다.
+        hv.fail_next_hotplug("boom");
+        let err = hv.add_nic(vm.id, 1, &vm.nics[0], 1).await.unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert_eq!(hv.devices(vm.id), ["disk0-dev", "disk1-dev", "nic0"]);
+        assert_eq!(hv.hotplug_calls().len(), 17);
+        assert_eq!(
+            hv.hotplug_calls()[0],
+            HotplugCall::SetVcpus {
+                id: vm.id,
+                from: 3,
+                to: 5
+            }
+        );
+
+        hv.stop(vm.id, StopMode::Force).await.unwrap();
+        assert_eq!(hv.vcpus(vm.id), None);
+        assert!(hv.devices(vm.id).is_empty());
+        assert!(matches!(
+            hv.add_nic(vm.id, 1, &vm.nics[0], 1).await,
+            Err(DriverError::NotRunning(_))
+        ));
+    }
+
+    /// 배치 없이 켠 VM은 vCPU가 `sockets × cores`이고 virtio-mem·루트 포트가 없다. 받는 쪽 스펙도 남는다.
+    /// 이미 붙은 장치는 그대로 두고 `AlreadyPresent`다. 보내기 전 확인은 디스크·NIC 장치만 견준다.
+    #[tokio::test]
+    async fn present_devices_and_the_device_check() {
+        let hv = MockHypervisor::default();
+        let vm = hot_spec();
+        hv.start(&vm, None).await.unwrap();
+        let ids = |l: &[&str]| l.iter().map(|d| d.to_string()).collect::<Vec<_>>();
+        hv.check_devices(vm.id, &ids(&["disk0-dev", "disk1-dev", "nic0", "cpu2"]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            hv.check_devices(vm.id, &ids(&["disk0-dev", "nic0"])).await,
+            Err(DriverError::Migration(_))
+        ));
+        let added = hv.add_disk(vm.id, 2, &disk(ImageFormat::Qcow2), 0).await;
+        assert_eq!(added.unwrap(), AddOutcome::Added);
+        let again = hv.add_disk(vm.id, 2, &disk(ImageFormat::Qcow2), 1).await;
+        assert_eq!(again.unwrap(), AddOutcome::AlreadyPresent);
+        assert_eq!(hv.devices(vm.id).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_vm_without_a_layout_has_nothing_to_hotplug() {
+        let hv = MockHypervisor::default();
+        let vm = VmRuntimeSpec {
+            hotplug: None,
+            ..hot_spec()
+        };
+        hv.start(&vm, None).await.unwrap();
+        assert_eq!(hv.vcpus(vm.id), Some(2));
+        assert_eq!(hv.plugged_mib(vm.id), Some(0));
+        let t = Duration::from_millis(1);
+        let err = hv.set_memory(vm.id, 128, t).await.unwrap_err();
+        assert!(err.to_string().contains("vmem0-dev"), "{err}");
+        assert!(
+            hv.add_disk(vm.id, 2, &disk(ImageFormat::Raw), 0)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            hv.hotplug_caps().await,
+            NodeHotplug {
+                cpu: true,
+                memory: true
+            }
+        );
+        hv.set_hotplug_caps(NodeHotplug::default());
+        assert_eq!(hv.hotplug_caps().await, NodeHotplug::default());
+
+        let incoming = hot_spec();
+        hv.start_incoming(&incoming, Uuid::now_v7(), "127.0.0.1", 1..=2, &[])
+            .await
+            .unwrap();
+        assert_eq!(hv.incoming_specs(), std::slice::from_ref(&incoming));
+        assert_eq!(hv.vcpus(incoming.id), Some(3));
     }
 }

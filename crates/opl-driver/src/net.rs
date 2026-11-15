@@ -48,6 +48,8 @@ pub trait HostNet: Send + Sync + std::fmt::Debug {
     async fn create_tap(&self, tap: &Tap) -> Result<(), DriverError>;
     /// VM의 tap을 모두 지운다. 없으면 아무것도 하지 않는다.
     async fn delete_vm_taps(&self, vm: Uuid) -> Result<(), DriverError>;
+    /// tap 하나를 지운다(실행 중 뗀 NIC). 없으면 아무것도 하지 않는다.
+    async fn delete_tap(&self, ifname: &str) -> Result<(), DriverError>;
     /// VXLAN 네트워크의 장치를 `desired`에 맞춘다. alias가 `opl:<tag>`인 관리 이름 장치만 내 것으로 보고,
     /// `desired`에 없는 내 장치는 지운다. 한 네트워크가 실패해도 나머지는 맞추고 오류를 모아 돌려준다.
     async fn sync_overlays(
@@ -204,6 +206,10 @@ impl HostNet for IpRoute {
             }
         }
         result
+    }
+
+    async fn delete_tap(&self, ifname: &str) -> Result<(), DriverError> {
+        self.delete_link(ifname).await
     }
 
     async fn sync_overlays(
