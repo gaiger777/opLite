@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::client::{
     ApiError, BACKUP_WAIT, Client, DRAIN_WAIT, IMPORT_WAIT, MIGRATE_WAIT, NotLoggedIn,
-    UPGRADE_WAIT, fetch_ca, fingerprint, local, seg,
+    UPGRADE_WAIT, fetch_ca, fingerprint, local, seg, task_header,
 };
 use crate::config::{CliConfig, default_path};
 use crate::output::{bytes, cell, json as print_json, table};
@@ -1426,6 +1426,24 @@ enum VmCmd {
         index: usize,
         groups: Vec<String>,
     },
+    /// VM 디스크를 붙이거나 뗀다. 실행 중이면 바로 적용한다(끝에 붙이기, 실행 중 붙인 디스크 떼기).
+    Disk {
+        #[command(subcommand)]
+        cmd: VmDiskCmd,
+    },
+    /// VM NIC를 붙이거나 뗀다. 실행 중이면 바로 적용한다(끝에 붙이기, 실행 중 붙인 NIC 떼기).
+    Nic {
+        #[command(subcommand)]
+        cmd: VmNicCmd,
+    },
+    /// 실행 중인 VM의 하드웨어를 지금 설정에 다시 맞춘다(실패한 핫플러그를 다시 해 본다. 예: 게스트가 드라이버를
+    /// 올린 뒤).
+    Hotplug {
+        vm: String,
+        /// 핫플러그 Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
+    },
     Start {
         vm: String,
     },
@@ -1499,6 +1517,12 @@ struct VmCreate {
     /// 메모리(MiB)
     #[arg(long, default_value_t = 1024)]
     memory: u32,
+    /// 실행 중 늘릴 수 있는 vCPU 상한(`--sockets`의 배수, 256 이하). 실행 중에는 `--cores`를 이 안에서 바꾼다.
+    #[arg(long)]
+    max_vcpus: Option<u16>,
+    /// 실행 중 늘릴 수 있는 메모리 상한(MiB). 주면 `--memory`와 함께 128의 배수여야 한다.
+    #[arg(long)]
+    max_memory: Option<u32>,
     /// 기본값은 노드 아키텍처에 맞춘다(aarch64: virt, x86_64: q35).
     #[arg(long, value_enum)]
     machine: Option<Machine>,
@@ -1571,7 +1595,8 @@ fn nic_body(nic: &NicArg) -> Value {
 #[derive(Args)]
 #[command(group(ArgGroup::new("change").required(true).multiple(true).args([
     "ha", "no_ha", "ha_state", "ha_group", "max_restart", "max_relocate", "ha_priority",
-    "guest_watch", "no_guest_watch", "pinned", "no_pinned"
+    "guest_watch", "no_guest_watch", "pinned", "no_pinned", "sockets", "cores", "memory",
+    "max_vcpus", "no_max_vcpus", "max_memory", "no_max_memory"
 ])))]
 struct VmSet {
     vm: String,
@@ -1593,12 +1618,47 @@ struct VmSet {
     /// 균형 조정기가 다시 옮길 수 있다.
     #[arg(long, conflicts_with = "pinned")]
     no_pinned: bool,
+    /// 소켓 수. 실행 중이면 다음 재시작 때 적용한다.
+    #[arg(long)]
+    sockets: Option<u16>,
+    /// 소켓당 코어 수. 실행 중이면 vCPU 상한 안에서 바로 바꾼다(x86_64 노드).
+    #[arg(long)]
+    cores: Option<u16>,
+    /// 메모리(MiB). 실행 중이면 메모리 상한 안에서 바로 바꾼다(virtio-mem이 있는 노드).
+    #[arg(long)]
+    memory: Option<u32>,
+    /// vCPU 상한. 실행 중이면 다음 재시작 때 적용한다.
+    #[arg(long)]
+    max_vcpus: Option<u16>,
+    /// vCPU 상한을 뺀다(지금 수와 같음).
+    #[arg(long, conflicts_with = "max_vcpus")]
+    no_max_vcpus: bool,
+    /// 메모리 상한(MiB). 실행 중이면 다음 재시작 때 적용한다.
+    #[arg(long)]
+    max_memory: Option<u32>,
+    /// 메모리 상한을 뺀다(지금 메모리와 같음).
+    #[arg(long, conflicts_with = "max_memory")]
+    no_max_memory: bool,
+    /// 실행 중인 VM의 핫플러그 Task를 기다리지 않는다.
+    #[arg(long)]
+    no_wait: bool,
 }
 
 impl VmSet {
     /// HA 값을 바꾸는지
     fn changes_ha(&self) -> bool {
         self.ha || self.no_ha || !self.policy.is_empty()
+    }
+
+    /// CPU·메모리를 바꾸는지
+    fn changes_hardware(&self) -> bool {
+        self.sockets.is_some()
+            || self.cores.is_some()
+            || self.memory.is_some()
+            || self.max_vcpus.is_some()
+            || self.no_max_vcpus
+            || self.max_memory.is_some()
+            || self.no_max_memory
     }
 }
 
@@ -1618,7 +1678,224 @@ fn vm_set_spec(current: &Value, args: &VmSet) -> Value {
     {
         spec.remove("placement");
     }
+    let spec = &mut body["spec"];
+    if let Some(n) = args.sockets {
+        spec["cpu"]["sockets"] = json!(n);
+    }
+    if let Some(n) = args.cores {
+        spec["cpu"]["cores"] = json!(n);
+    }
+    if let Some(n) = args.max_vcpus {
+        spec["cpu"]["max_vcpus"] = json!(n);
+    }
+    if args.no_max_vcpus
+        && let Some(cpu) = spec["cpu"].as_object_mut()
+    {
+        cpu.remove("max_vcpus");
+    }
+    if let Some(n) = args.memory {
+        spec["memory_mib"] = json!(n);
+    }
+    if let Some(n) = args.max_memory {
+        spec["max_memory_mib"] = json!(n);
+    }
+    if args.no_max_memory
+        && let Some(spec) = spec.as_object_mut()
+    {
+        spec.remove("max_memory_mib");
+    }
     body
+}
+
+#[derive(Subcommand)]
+enum VmDiskCmd {
+    /// 볼륨을 디스크 목록 끝에 붙인다. 실행 중이면 바로 붙인다(virtio-blk만, 핫플러그 포트 8개까지).
+    Add {
+        vm: String,
+        volume: String,
+        #[arg(long, value_enum, default_value = "virtio-blk")]
+        bus: DiskBus,
+        /// 부팅 순서(1이 먼저). 실행 중이면 다음 부팅부터다.
+        #[arg(long)]
+        boot_order: Option<u8>,
+        /// 실행 중인 VM의 핫플러그 Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// 디스크를 뗀다(볼륨은 남는다). 실행 중이면 실행 중 붙인 디스크만 끝에서부터 뗄 수 있다.
+    Remove {
+        vm: String,
+        volume: String,
+        /// 실행 중인 VM의 핫플러그 Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmNicCmd {
+    /// NIC를 목록 끝에 붙인다. 실행 중이면 바로 붙인다(핫플러그 포트 8개까지). `,sg=A+B`를 붙이면 그 NIC에
+    /// 보안 그룹을 건다.
+    Add {
+        vm: String,
+        #[arg(value_name = "NETWORK[,sg=GROUP+...]", value_parser = parse_nic)]
+        nic: NicArg,
+        #[arg(long, value_enum, default_value = "virtio")]
+        model: NicModel,
+        /// 생략하면 서버가 정한다.
+        #[arg(long)]
+        mac: Option<String>,
+        /// 실행 중인 VM의 핫플러그 Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// NIC를 뗀다. 실행 중이면 실행 중 붙인 NIC만 끝에서부터 뗄 수 있다.
+    Remove {
+        vm: String,
+        /// NIC 번호(0부터, `vm get`의 nics 순서)나 MAC 주소
+        nic: String,
+        /// 실행 중인 VM의 핫플러그 Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+/// VM 수정 본문: 볼륨 `volume`을 디스크 목록 끝에 붙인다.
+fn disk_add_spec(vm: &Value, volume: &str, bus: DiskBus, boot_order: Option<u8>) -> Value {
+    let mut disks = vm["spec"]["disks"].as_array().cloned().unwrap_or_default();
+    disks.push(json!({ "volume": volume, "bus": value_name(bus), "boot_order": boot_order }));
+    spec_update(vm, "disks", Value::Array(disks))
+}
+
+/// VM 수정 본문: 볼륨 `volume`의 디스크를 뺀다.
+fn disk_remove_spec(vm: &Value, volume: &str) -> anyhow::Result<Value> {
+    let mut disks = vm["spec"]["disks"].as_array().cloned().unwrap_or_default();
+    let Some(i) = disks.iter().position(|d| d["volume"] == volume) else {
+        bail!("VM {} has no disk on volume {volume}", cell(&vm["name"]));
+    };
+    disks.remove(i);
+    Ok(spec_update(vm, "disks", Value::Array(disks)))
+}
+
+/// VM 수정 본문: NIC를 목록 끝에 붙인다. MAC을 주지 않으면 서버가 정한다.
+fn nic_add_spec(vm: &Value, nic: &NicArg, model: NicModel, mac: Option<&str>) -> Value {
+    let mut body = nic_body(nic);
+    body["model"] = json!(value_name(model));
+    if let Some(mac) = mac {
+        body["mac"] = json!(mac);
+    }
+    let mut nics = vm["spec"]["nics"].as_array().cloned().unwrap_or_default();
+    nics.push(body);
+    spec_update(vm, "nics", Value::Array(nics))
+}
+
+/// VM 수정 본문: 번호(0부터)나 MAC(대소문자 무시)으로 찾은 NIC를 뺀다.
+fn nic_remove_spec(vm: &Value, nic: &str) -> anyhow::Result<Value> {
+    let mut nics = vm["spec"]["nics"].as_array().cloned().unwrap_or_default();
+    let name = cell(&vm["name"]);
+    let index = match nic.parse::<usize>() {
+        Ok(i) if i < nics.len() => i,
+        Ok(i) => bail!(
+            "VM {name} has no NIC {i} ({} NICs, numbered from 0)",
+            nics.len()
+        ),
+        Err(_) => nics
+            .iter()
+            .position(|n| {
+                n["mac"]
+                    .as_str()
+                    .is_some_and(|mac| mac.eq_ignore_ascii_case(nic))
+            })
+            .with_context(|| format!("VM {name} has no NIC with MAC {nic}"))?,
+    };
+    nics.remove(index);
+    Ok(spec_update(vm, "nics", Value::Array(nics)))
+}
+
+/// `vm get`의 실행 중 하드웨어 줄: `hardware: vcpus 4/8, memory 4096/16384 MiB, hotplug ports 2/8 used`.
+/// 꺼진 VM(기록 없음)은 `None`이다.
+fn hardware_line(vm: &Value) -> Option<String> {
+    let hw = &vm["status"]["hardware"];
+    if hw.is_null() {
+        return None;
+    }
+    let layout = &hw["layout"];
+    if layout.is_null() {
+        return Some("hardware: no hotplug (started without it)".into());
+    }
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let cpu = &hw["cpu"];
+    let max_vcpus = match cpu["max_vcpus"].as_u64() {
+        Some(max) => max,
+        None => cpu["sockets"].as_u64().unwrap_or(1) * n(&cpu["cores"]),
+    };
+    let used = [&layout["disk_ports"], &layout["nic_ports"]]
+        .iter()
+        .map(|p| p.as_array().map_or(0, Vec::len))
+        .sum::<usize>();
+    Some(format!(
+        "hardware: vcpus {}/{max_vcpus}, memory {}/{} MiB, hotplug ports {used}/{} used",
+        n(&layout["vcpus"]),
+        n(&hw["memory_mib"]) + n(&layout["plugged_mib"]),
+        n(&layout["max_memory_mib"]),
+        n(&layout["ports"]),
+    ))
+}
+
+/// 다음 재시작 때 적용할 변경마다 한 줄: `  memory_mib: 4096 -> 8192 (unsupported: this node has no virtio-mem)`
+fn pending_lines(vm: &Value) -> Vec<String> {
+    let pending = vm["status"]["hardware"]["pending"].as_array();
+    pending
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let reason = match p["detail"].as_str() {
+                Some(detail) => format!("{}: {detail}", cell(&p["reason"])),
+                None => cell(&p["reason"]),
+            };
+            format!(
+                "  {}: {} -> {} ({reason})",
+                cell(&p["field"]),
+                cell(&p["running"]),
+                cell(&p["wanted"])
+            )
+        })
+        .collect()
+}
+
+/// 하드웨어를 바꾼 뒤: PUT이 핫플러그 Task(`task`)를 만들었으면 기다려 바로 적용됐는지나 다음 재시작 때 적용할
+/// 것을 알린다. Task가 없으면(꺼진 VM, 하드웨어가 그대로) 기다리지 않고 `done`만 알린다. Task가 실패하면 그 이유로
+/// 실패한다.
+async fn hotplug_result(
+    client: &Client,
+    vm: &str,
+    task: Option<String>,
+    no_wait: bool,
+    done: &str,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let Some(id) = task else {
+        writeln!(out, "{done}")?;
+        return Ok(());
+    };
+    if no_wait {
+        writeln!(out, "{done}")?;
+        writeln!(out, "vm {vm}: hotplug task {id} started")?;
+        return Ok(());
+    }
+    client.wait_task(&json!({ "id": id })).await?;
+    writeln!(out, "{done}")?;
+    let current = client.get(&format!("/vms/{}", seg(vm))).await?;
+    let pending = pending_lines(&current);
+    if pending.is_empty() {
+        writeln!(out, "vm {vm}: applied while running")?;
+    } else {
+        writeln!(out, "vm {vm}: pending until restart:")?;
+        for line in pending {
+            writeln!(out, "{line}")?;
+        }
+    }
+    Ok(())
 }
 
 /// `vm set`의 새 `ha`: `--no-ha`면 끔, 정책 값이 없으면(`--ha`만) 이미 HA인 정책은 그대로 두고 아니면 `true`,
@@ -6507,6 +6784,32 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
 }
 
+/// `vm get`: 표준 출력에는 VM JSON만 쓰고(스크립트가 그대로 읽는다), 실행 중 하드웨어(`hardware:`)와 다음 재시작 때
+/// 적용할 변경(`pending:`) 요약은 `err`(stderr)에 쓴다. `-o json`이면 요약을 쓰지 않는다.
+async fn vm_get(
+    client: &Client,
+    vm: &str,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+    err: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let vm = client.get(&format!("/vms/{}", seg(vm))).await?;
+    print_json(out, &vm)?;
+    if !json_out {
+        if let Some(line) = hardware_line(&vm) {
+            writeln!(err, "{line}")?;
+        }
+        let pending = pending_lines(&vm);
+        if !pending.is_empty() {
+            writeln!(err, "pending:")?;
+            for line in pending {
+                writeln!(err, "{line}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn vm(
     client: &Client,
     cmd: VmCmd,
@@ -6518,7 +6821,7 @@ async fn vm(
             let list = client.get("/vms").await?;
             print_list(out, json_out, &list, VM_HEADERS, vm_row)?;
         }
-        VmCmd::Get { vm } => print_json(out, &client.get(&format!("/vms/{}", seg(&vm))).await?)?,
+        VmCmd::Get { vm } => vm_get(client, &vm, json_out, out, &mut std::io::stderr()).await?,
         VmCmd::Create(args) => {
             let node = match &args.node {
                 Some(key) => Some(client.get(&format!("/nodes/{}", seg(key))).await?),
@@ -6564,6 +6867,12 @@ async fn vm(
             if args.pinned {
                 body["spec"]["placement"] = json!({ "pinned": true });
             }
+            if let Some(n) = args.max_vcpus {
+                body["spec"]["cpu"]["max_vcpus"] = json!(n);
+            }
+            if let Some(n) = args.max_memory {
+                body["spec"]["max_memory_mib"] = json!(n);
+            }
             client.post("/vms", &body).await?;
             writeln!(out, "vm {} created", args.name)?;
             if args.start {
@@ -6571,7 +6880,8 @@ async fn vm(
             }
         }
         VmCmd::Set(args) => {
-            put_spec(client, &args.vm, |current| Ok(vm_set_spec(current, &args))).await?;
+            let task =
+                put_spec(client, &args.vm, |current| Ok(vm_set_spec(current, &args))).await?;
             if args.changes_ha() {
                 let state = match args.policy.ha_state {
                     _ if args.no_ha => "off".to_string(),
@@ -6586,6 +6896,65 @@ async fn vm(
             if args.no_pinned {
                 writeln!(out, "vm {}: not pinned", args.vm)?;
             }
+            if args.changes_hardware() {
+                let done = format!("vm {}: hardware updated", args.vm);
+                hotplug_result(client, &args.vm, task, args.no_wait, &done, out).await?;
+            }
+        }
+        VmCmd::Disk { cmd } => match cmd {
+            VmDiskCmd::Add {
+                vm,
+                volume,
+                bus,
+                boot_order,
+                no_wait,
+            } => {
+                let task = put_spec(client, &vm, |current| {
+                    Ok(disk_add_spec(current, &volume, bus, boot_order))
+                })
+                .await?;
+                let done = format!("vm {vm}: disk {volume} added");
+                hotplug_result(client, &vm, task, no_wait, &done, out).await?;
+            }
+            VmDiskCmd::Remove {
+                vm,
+                volume,
+                no_wait,
+            } => {
+                let task =
+                    put_spec(client, &vm, |current| disk_remove_spec(current, &volume)).await?;
+                let done = format!("vm {vm}: disk {volume} removed");
+                hotplug_result(client, &vm, task, no_wait, &done, out).await?;
+            }
+        },
+        VmCmd::Nic { cmd } => match cmd {
+            VmNicCmd::Add {
+                vm,
+                nic,
+                model,
+                mac,
+                no_wait,
+            } => {
+                let task = put_spec(client, &vm, |current| {
+                    Ok(nic_add_spec(current, &nic, model, mac.as_deref()))
+                })
+                .await?;
+                let done = format!("vm {vm}: NIC on network {} added", nic.network);
+                hotplug_result(client, &vm, task, no_wait, &done, out).await?;
+            }
+            VmNicCmd::Remove { vm, nic, no_wait } => {
+                let task = put_spec(client, &vm, |current| nic_remove_spec(current, &nic)).await?;
+                let done = format!("vm {vm}: NIC {nic} removed");
+                hotplug_result(client, &vm, task, no_wait, &done, out).await?;
+            }
+        },
+        VmCmd::Hotplug { vm, no_wait } => {
+            let task = client
+                .send(client.request(Method::POST, &format!("/vms/{}/actions/hotplug", seg(&vm))))
+                .await?;
+            let id = task["id"].as_str().context("response has no task id")?;
+            let done = format!("vm {vm}: hotplug done");
+            hotplug_result(client, &vm, Some(id.to_string()), no_wait, &done, out).await?;
         }
         VmCmd::NicSg { vm, index, groups } => {
             put_spec(client, &vm, |current| {
@@ -6886,15 +7255,17 @@ async fn put_spec_field(
     put_spec(client, vm, |current| {
         Ok(spec_update(current, field, value.clone()))
     })
-    .await
+    .await?;
+    Ok(())
 }
 
-/// VM `vm`을 읽어 `body`(읽은 VM → 수정 본문)로 만든 본문을 그 revision으로(`If-Match`) 다시 쓴다.
+/// VM `vm`을 읽어 `body`(읽은 VM → 수정 본문)로 만든 본문을 그 revision으로(`If-Match`) 다시 쓴다. 실행 중인
+/// VM의 하드웨어를 바꿔 서버가 핫플러그 Task를 만들었으면 그 id(`orbivisor-task` 헤더)를 돌려준다.
 async fn put_spec(
     client: &Client,
     vm: &str,
     body: impl Fn(&Value) -> anyhow::Result<Value>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let path = format!("/vms/{}", seg(vm));
     let mut retries = SpecRetries::default();
     loop {
@@ -6903,12 +7274,12 @@ async fn put_spec(
             .request(Method::PUT, &path)
             .header(reqwest::header::IF_MATCH, cell(&current["revision"]))
             .json(&body(&current)?);
-        match client.send(r).await {
+        match client.send_with_headers(r).await {
             Err(e) => match retries.next(&e.to_string()) {
                 Some(delay) => tokio::time::sleep(delay).await,
                 None => return Err(e),
             },
-            Ok(_) => return Ok(()),
+            Ok((headers, _)) => return Ok(task_header(&headers)),
         }
     }
 }
@@ -8127,6 +8498,49 @@ mod tests {
             seen.lock().unwrap()[0].body,
             json!({ "node": "n2", "force": true })
         );
+    }
+
+    /// `vm get`의 표준 출력은 JSON만이고 하드웨어·보류 요약은 stderr다. `-o json`은 요약이 없다.
+    #[tokio::test]
+    async fn vm_get_writes_the_summary_to_stderr() {
+        fn web(_: &str) -> Value {
+            json!({
+                "name": "web",
+                "status": { "hardware": {
+                    "cpu": { "sockets": 1, "cores": 2, "max_vcpus": 4 }, "memory_mib": 1024,
+                    "firmware": "uefi", "machine": "q35",
+                    "layout": { "vcpus": 2, "max_memory_mib": 1024, "plugged_mib": 0, "ports": 8,
+                                "boot_disks": 1, "boot_nics": 0 },
+                    "pending": [{ "field": "firmware", "running": "uefi", "wanted": "bios",
+                                  "reason": "restart" }],
+                } },
+            })
+        }
+        let vm = web("");
+        let (base, _) = fake_api_bodies(web).await;
+        let client = Client::new(&base, None, None).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        vm_get(&client, "web", false, &mut out, &mut err)
+            .await
+            .unwrap();
+        let printed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed, vm);
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(
+            err,
+            format!(
+                "{}\npending:\n{}\n",
+                hardware_line(&vm).unwrap(),
+                pending_lines(&vm).join("\n")
+            )
+        );
+        assert!(err.starts_with("hardware: vcpus 2/4,"), "{err}");
+
+        let mut err = Vec::new();
+        vm_get(&client, "web", true, &mut Vec::new(), &mut err)
+            .await
+            .unwrap();
+        assert!(err.is_empty());
     }
 
     /// 진행 줄을 쓰지 못해도(stderr가 닫힘) 마이그레이션이 끝나기를 기다린다.
@@ -12175,6 +12589,400 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             find_recommendation(&list, "").unwrap_err().to_string(),
             "give the recommendation id"
         );
+    }
+
+    fn vm_set(args: &[&str]) -> VmSet {
+        let mut argv = vec!["oplctl", "vm", "set", "web"];
+        argv.extend(args);
+        match Cli::try_parse_from(argv).unwrap().cmd {
+            Cmd::Vm { cmd: VmCmd::Set(s) } => s,
+            _ => panic!("not vm set"),
+        }
+    }
+
+    /// `vm set`의 CPU·메모리 플래그는 준 값만 바꾸고, `--no-max-*`는 상한 필드를 뺀다.
+    #[test]
+    fn vm_set_changes_only_the_given_cpu_and_memory_values() {
+        let vm = json!({
+            "name": "web",
+            "spec": {
+                "cpu": { "sockets": 1, "cores": 2, "model": "host", "max_vcpus": 8 },
+                "memory_mib": 4096,
+                "max_memory_mib": 16384,
+                "ha": false,
+            },
+        });
+        assert_eq!(
+            vm_set_spec(&vm, &vm_set(&["--cores", "4"]))["spec"],
+            json!({
+                "cpu": { "sockets": 1, "cores": 4, "model": "host", "max_vcpus": 8 },
+                "memory_mib": 4096,
+                "max_memory_mib": 16384,
+                "ha": false,
+            })
+        );
+        assert_eq!(
+            vm_set_spec(
+                &vm,
+                &vm_set(&["--sockets", "2", "--memory", "8192", "--max-vcpus", "16"])
+            )["spec"],
+            json!({
+                "cpu": { "sockets": 2, "cores": 2, "model": "host", "max_vcpus": 16 },
+                "memory_mib": 8192,
+                "max_memory_mib": 16384,
+                "ha": false,
+            })
+        );
+        assert_eq!(
+            vm_set_spec(&vm, &vm_set(&["--no-max-vcpus", "--no-max-memory"]))["spec"],
+            json!({
+                "cpu": { "sockets": 1, "cores": 2, "model": "host" },
+                "memory_mib": 4096,
+                "ha": false,
+            })
+        );
+        assert_eq!(
+            vm_set_spec(&vm, &vm_set(&["--max-memory", "32768"]))["spec"]["max_memory_mib"],
+            32768
+        );
+        assert!(vm_set(&["--cores", "4"]).changes_hardware());
+        assert!(vm_set(&["--no-max-memory"]).changes_hardware());
+        assert!(!vm_set(&["--pinned"]).changes_hardware());
+        assert!(vm_set(&["--memory", "1024", "--no-wait"]).no_wait);
+        for bad in [
+            &["--max-vcpus", "4", "--no-max-vcpus"][..],
+            &["--max-memory", "4096", "--no-max-memory"],
+            // 바꿀 것 없이 `--no-wait`만 줄 수 없다.
+            &["--no-wait"],
+        ] {
+            let mut argv = vec!["oplctl", "vm", "set", "web"];
+            argv.extend(bad);
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+        }
+        let Cmd::Vm {
+            cmd: VmCmd::Create(c),
+        } = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "create",
+            "web",
+            "--max-vcpus",
+            "8",
+            "--max-memory",
+            "16384",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!("not vm create");
+        };
+        assert_eq!((c.max_vcpus, c.max_memory), (Some(8), Some(16384)));
+    }
+
+    /// `vm disk add|remove`는 디스크 목록 끝에 붙이거나 그 볼륨의 디스크를 뺀다. 없는 볼륨은 오류다.
+    #[test]
+    fn disk_commands_append_and_remove_disks() {
+        let vm = json!({
+            "name": "web",
+            "labels": { "team": "a" },
+            "spec": {
+                "disks": [
+                    { "volume": "root", "bus": "virtio-blk", "boot_order": 1 },
+                    { "volume": "data", "bus": "virtio-blk", "boot_order": null },
+                ],
+            },
+        });
+        assert_eq!(
+            disk_add_spec(&vm, "logs", DiskBus::VirtioBlk, None),
+            json!({
+                "labels": { "team": "a" },
+                "spec": { "disks": [
+                    { "volume": "root", "bus": "virtio-blk", "boot_order": 1 },
+                    { "volume": "data", "bus": "virtio-blk", "boot_order": null },
+                    { "volume": "logs", "bus": "virtio-blk", "boot_order": null },
+                ] },
+            })
+        );
+        assert_eq!(
+            disk_add_spec(&vm, "cd", DiskBus::Sata, Some(2))["spec"]["disks"][2],
+            json!({ "volume": "cd", "bus": "sata", "boot_order": 2 })
+        );
+        assert_eq!(
+            disk_remove_spec(&vm, "root").unwrap()["spec"]["disks"],
+            json!([{ "volume": "data", "bus": "virtio-blk", "boot_order": null }])
+        );
+        assert_eq!(
+            disk_remove_spec(&vm, "logs").unwrap_err().to_string(),
+            "VM web has no disk on volume logs"
+        );
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "disk",
+            "add",
+            "web",
+            "data",
+            "--bus",
+            "sata",
+            "--boot-order",
+            "2",
+            "--no-wait",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Disk { cmd: VmDiskCmd::Add {
+                vm, volume, bus: DiskBus::Sata, boot_order: Some(2), no_wait: true
+            } } } if vm == "web" && volume == "data"
+        ));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "disk", "remove", "web", "data"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm {
+                cmd: VmCmd::Disk {
+                    cmd: VmDiskCmd::Remove { no_wait: false, .. }
+                }
+            }
+        ));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "hotplug", "web"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Hotplug { vm, no_wait: false } } if vm == "web"
+        ));
+    }
+
+    /// `vm nic add`는 `--nic`과 같은 `NETWORK[,sg=…]`로 끝에 붙이고, `vm nic remove`는 번호나 MAC(대소문자
+    /// 무시)으로 찾아 뺀다.
+    #[test]
+    fn nic_commands_append_and_remove_nics() {
+        let vm = json!({
+            "name": "web",
+            "spec": {
+                "nics": [
+                    { "network": "lan", "model": "virtio", "mac": "52:54:00:aa:bb:01" },
+                    { "network": "dmz", "model": "e1000e", "mac": "52:54:00:aa:bb:02" },
+                ],
+            },
+        });
+        let nic = parse_nic("lan,sg=web+db").unwrap();
+        assert_eq!(
+            nic_add_spec(&vm, &nic, NicModel::E1000e, Some("52:54:00:aa:bb:03"))["spec"]["nics"][2],
+            json!({
+                "network": "lan", "model": "e1000e", "mac": "52:54:00:aa:bb:03",
+                "security_groups": ["web", "db"],
+            })
+        );
+        assert_eq!(
+            nic_add_spec(&vm, &parse_nic("user").unwrap(), NicModel::Virtio, None)["spec"]["nics"]
+                [2],
+            json!({ "network": "user", "model": "virtio" })
+        );
+        let dmz = json!([{ "network": "dmz", "model": "e1000e", "mac": "52:54:00:aa:bb:02" }]);
+        assert_eq!(nic_remove_spec(&vm, "0").unwrap()["spec"]["nics"], dmz);
+        assert_eq!(
+            nic_remove_spec(&vm, "52:54:00:AA:BB:01").unwrap()["spec"]["nics"],
+            dmz
+        );
+        assert_eq!(
+            nic_remove_spec(&vm, "2").unwrap_err().to_string(),
+            "VM web has no NIC 2 (2 NICs, numbered from 0)"
+        );
+        assert_eq!(
+            nic_remove_spec(&vm, "52:54:00:aa:bb:09")
+                .unwrap_err()
+                .to_string(),
+            "VM web has no NIC with MAC 52:54:00:aa:bb:09"
+        );
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "nic",
+            "add",
+            "web",
+            "lan,sg=web",
+            "--model",
+            "e1000e",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Nic { cmd: VmNicCmd::Add {
+                nic, model: NicModel::E1000e, mac: None, no_wait: false, ..
+            } } } if nic.network == "lan" && nic.security_groups == ["web"]
+        ));
+        assert!(Cli::try_parse_from(["oplctl", "vm", "nic", "add", "web", "lan,x"]).is_err());
+    }
+
+    /// `vm get`의 하드웨어 줄: 배치가 있으면 vCPU·메모리·포트, 없으면 핫플러그 없이 켰다는 줄, 꺼지면 없음.
+    #[test]
+    fn hardware_line_shows_the_running_layout() {
+        let vm = json!({ "status": { "hardware": {
+            "cpu": { "sockets": 1, "cores": 2, "model": "host", "max_vcpus": 8 },
+            "memory_mib": 4096,
+            "layout": {
+                "vcpus": 4, "max_memory_mib": 16384, "plugged_mib": 2048, "ports": 8,
+                "boot_disks": 1, "boot_nics": 1, "disk_ports": [0], "nic_ports": [1],
+            },
+        } } });
+        assert_eq!(
+            hardware_line(&vm).unwrap(),
+            "hardware: vcpus 4/8, memory 6144/16384 MiB, hotplug ports 2/8 used"
+        );
+        // 상한이 없으면 켤 때 수다.
+        let vm = json!({ "status": { "hardware": {
+            "cpu": { "sockets": 2, "cores": 2, "model": "host" },
+            "memory_mib": 1024,
+            "layout": {
+                "vcpus": 4, "max_memory_mib": 1024, "plugged_mib": 0, "ports": 8,
+                "boot_disks": 1, "boot_nics": 0,
+            },
+        } } });
+        assert_eq!(
+            hardware_line(&vm).unwrap(),
+            "hardware: vcpus 4/4, memory 1024/1024 MiB, hotplug ports 0/8 used"
+        );
+        let legacy = json!({ "status": { "hardware": {
+            "cpu": { "sockets": 1, "cores": 2, "model": "host" }, "memory_mib": 1024,
+        } } });
+        assert_eq!(
+            hardware_line(&legacy).unwrap(),
+            "hardware: no hotplug (started without it)"
+        );
+        assert_eq!(hardware_line(&json!({ "status": {} })), None);
+    }
+
+    /// 보류 줄은 항목·지금 값 → 바랄 값·이유(있으면 자세한 설명)다.
+    #[test]
+    fn pending_lines_show_the_reason_and_detail() {
+        let vm = json!({ "status": { "hardware": { "pending": [
+            { "field": "memory_mib", "running": "4096", "wanted": "8192", "reason": "unsupported",
+              "detail": "this node has no virtio-mem" },
+            { "field": "firmware", "running": "uefi", "wanted": "bios", "reason": "restart" },
+            { "field": "vcpus", "running": "4", "wanted": "2", "reason": "failed",
+              "detail": "the guest did not release vCPU 3 within 60s" },
+        ] } } });
+        assert_eq!(
+            pending_lines(&vm),
+            [
+                "  memory_mib: 4096 -> 8192 (unsupported: this node has no virtio-mem)",
+                "  firmware: uefi -> bios (restart)",
+                "  vcpus: 4 -> 2 (failed: the guest did not release vCPU 3 within 60s)",
+            ]
+        );
+        assert!(pending_lines(&json!({ "status": { "hardware": {} } })).is_empty());
+        assert!(pending_lines(&json!({ "status": {} })).is_empty());
+    }
+
+    /// PUT 응답에 `orbivisor-task`가 없으면(꺼진 VM 등) Task를 기다리지 않는다. 있으면 기다린 뒤 VM을 다시 읽어
+    /// 바로 적용됐는지나 보류를 알린다.
+    #[tokio::test]
+    async fn hardware_changes_wait_only_for_a_hotplug_task() {
+        let (client, seen) = fake_api(|_| {
+            json!({ "id": "v1", "name": "web", "revision": 3, "spec": {
+                "cpu": { "sockets": 1, "cores": 1 }, "memory_mib": 256, "disks": [],
+            } })
+        })
+        .await;
+        let task = put_spec(&client, "web", |current| {
+            Ok(disk_add_spec(current, "data", DiskBus::VirtioBlk, None))
+        })
+        .await
+        .unwrap();
+        assert_eq!(task, None);
+        let mut out = Vec::new();
+        hotplug_result(
+            &client,
+            "web",
+            task,
+            false,
+            "vm web: disk data added",
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/vms/web HTTP/1.1",
+                "PUT /api/v1/vms/web HTTP/1.1"
+            ]
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "vm web: disk data added\n");
+
+        let (client, seen) = fake_api(|path| {
+            if path.starts_with("/api/v1/tasks/") {
+                json!({ "id": "t1", "status": { "state": "succeeded" } })
+            } else {
+                json!({ "name": "web", "status": { "hardware": { "pending": [
+                    { "field": "memory_mib", "running": "256", "wanted": "512", "reason": "limit" },
+                ] } } })
+            }
+        })
+        .await;
+        let mut out = Vec::new();
+        hotplug_result(
+            &client,
+            "web",
+            Some("t1".into()),
+            false,
+            "vm web: hardware updated",
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/tasks/t1 HTTP/1.1",
+                "GET /api/v1/vms/web HTTP/1.1"
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm web: hardware updated\nvm web: pending until restart:\n  memory_mib: 256 -> 512 (limit)\n"
+        );
+        // `--no-wait`는 Task id만 알린다.
+        let mut out = Vec::new();
+        hotplug_result(
+            &client,
+            "web",
+            Some("t2".into()),
+            true,
+            "vm web: hardware updated",
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm web: hardware updated\nvm web: hotplug task t2 started\n"
+        );
+    }
+
+    /// 핫플러그 Task가 실패하면 그 이유로 실패하고 바뀐 것을 알리지 않는다.
+    #[tokio::test]
+    async fn a_failed_hotplug_task_fails_the_command() {
+        let (client, _) = fake_api(|_| {
+            json!({ "id": "t1", "status": { "state": "failed",
+                "error": "disk \"data\" was not added: no space; the change was undone" } })
+        })
+        .await;
+        let mut out = Vec::new();
+        let err = hotplug_result(
+            &client,
+            "web",
+            Some("t1".into()),
+            false,
+            "vm web: disk data added",
+            &mut out,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "task t1 failed: disk \"data\" was not added: no space; the change was undone"
+        );
+        assert!(out.is_empty());
     }
 
     /// `vm set --pinned`·`--no-pinned`는 `placement`만 바꾸고 HA는 그대로 둔다. `vm create --pinned`도 같다.

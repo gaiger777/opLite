@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use reqwest::header::HeaderMap;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde_json::Value;
 
@@ -29,6 +30,17 @@ pub const DRAIN_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Task 조회 요청 하나의 제한 시간. 서버가 응답하지 않아도 전체 기다리기 제한(`TASK_WAIT`)이 지켜지게 한다.
 const TASK_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 실행 중인 VM의 하드웨어를 바꾼 `PUT /vms/{key}`가 만든 핫플러그 Task의 id를 담는 응답 헤더
+pub const TASK_HEADER: &str = "orbivisor-task";
+
+/// 응답 헤더의 핫플러그 Task id([`TASK_HEADER`]). 없으면 Task를 만들지 않았다.
+pub fn task_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(TASK_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
 
 /// 검증 없이 받는 CA 인증서 본문의 최대 크기
 const CA_MAX_BYTES: usize = 64 * 1024;
@@ -118,11 +130,17 @@ impl Client {
 
     /// 성공하면 본문(JSON, 없으면 null), 실패하면 API 오류의 메시지와 코드
     pub async fn send(&self, r: RequestBuilder) -> anyhow::Result<Value> {
+        Ok(self.send_with_headers(r).await?.1)
+    }
+
+    /// `send`와 같고 성공한 응답의 헤더도 돌려준다(`PUT /vms/{key}`의 [`TASK_HEADER`]).
+    pub async fn send_with_headers(&self, r: RequestBuilder) -> anyhow::Result<(HeaderMap, Value)> {
         let resp = r
             .send()
             .await
             .with_context(|| format!("cannot reach {}", self.base))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp.text().await?;
         let body: Value = if text.is_empty() {
             Value::Null
@@ -130,7 +148,7 @@ impl Client {
             serde_json::from_str(&text).unwrap_or(Value::String(text))
         };
         if status.is_success() {
-            return Ok(body);
+            return Ok((headers, body));
         }
         if status == StatusCode::UNAUTHORIZED && body["code"] == "unauthorized" {
             return Err(NotLoggedIn.into());
@@ -344,6 +362,17 @@ mod tests {
         assert_eq!(seg("a b/c?d#e%f"), "a%20b%2Fc%3Fd%23e%25f");
         assert_eq!(seg("é"), "%C3%A9");
         assert_eq!(seg(""), "");
+    }
+
+    /// 핫플러그 Task id는 `orbivisor-task` 헤더에서 읽고, 없으면 None이다.
+    #[test]
+    fn task_header_reads_the_hotplug_task_id() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(task_header(&headers), None);
+        headers.insert("orbivisor-revision", "7".parse().unwrap());
+        assert_eq!(task_header(&headers), None);
+        headers.insert("orbivisor-task", "t1".parse().unwrap());
+        assert_eq!(task_header(&headers).as_deref(), Some("t1"));
     }
 
     fn cert_pem(name: &str) -> String {

@@ -253,12 +253,7 @@ async fn start_migration(p: &Pair, from: usize, to: usize) -> Started {
 async fn finish_migration(p: &Pair, from: usize, to: usize, started: Started) -> u64 {
     p.c[from].wait_task(&started.task).await.unwrap();
     let target = p.node_id(to).await;
-    for c in &p.c {
-        let vm = c.get("/vms/web").await.unwrap();
-        assert_eq!(vm["spec"]["node"].as_str(), Some(target.as_str()), "{vm}");
-        assert_eq!(vm["status"]["node"].as_str(), Some(target.as_str()), "{vm}");
-        assert_eq!(vm["status"]["migration"], Value::Null, "{vm}");
-    }
+    assert_vm_on(p, &target).await;
     // 넘겨받은 VM은 계속 돈다(워커가 QMP `query-status`로 본다).
     let pid = running_pid(&p.c[to]).await;
     assert_ne!(pid, started.pid);
@@ -566,12 +561,7 @@ async fn drain_moves_a_running_vm_to_the_other_node() {
     assert_eq!(out, "node node1 drained\n");
     let node = c.get("/nodes/node1").await.unwrap();
     assert_eq!(node["spec"]["maintenance"], true, "{node}");
-    for c in &p.c {
-        let vm = c.get("/vms/web").await.unwrap();
-        assert_eq!(vm["spec"]["node"].as_str(), Some(target.as_str()), "{vm}");
-        assert_eq!(vm["status"]["node"].as_str(), Some(target.as_str()), "{vm}");
-        assert_eq!(vm["status"]["migration"], Value::Null, "{vm}");
-    }
+    assert_vm_on(&p, &target).await;
     let moved = running_pid(&p.c[1]).await;
     assert_ne!(moved, pid);
     assert!(alive(moved));
@@ -593,6 +583,79 @@ async fn drain_moves_a_running_vm_to_the_other_node() {
     d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
     d.ctl(&["vm", "delete", "web"]).await.unwrap();
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    d.ctl(&["pool", "delete", "shared"]).await.unwrap();
+}
+
+/// 실행 중 디스크를 붙인(x86_64는 vCPU도 늘린) VM을 옮긴다(계획 54). 대상은 원본의 실행 중 하드웨어 기록으로 같은
+/// 장치(루트 포트의 디스크, 붙인 vCPU)를 켜야 마이그레이션이 된다. 옮긴 뒤 기록은 그대로이고, aarch64는 대상에서
+/// 그 디스크를 다시 뗀다(x86_64 `q35`는 게스트 OS 없이 떼기가 끝나지 않는다).
+#[tokio::test]
+async fn a_vm_with_a_disk_added_while_running_migrates() {
+    let p = Pair::new("mig-hotplug", ["60300-60309", "60310-60319"]).await;
+    let d = &p.d[0];
+    let shared = tempfile::Builder::new()
+        .prefix("oplhotplug")
+        .tempdir_in("/tmp")
+        .unwrap();
+    d.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.path().to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    p.wait_pool_ready("shared").await;
+    for (name, size) in [("root", "64M"), ("data", "16M")] {
+        d.ctl(&["volume", "create", name, "--pool", "shared", "--size", size])
+            .await
+            .unwrap();
+    }
+    let mut create = vec![
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--node", "node1", "--start",
+    ];
+    let x86 = cfg!(target_arch = "x86_64");
+    if x86 {
+        create.extend(["--max-vcpus", "2"]);
+    }
+    d.ctl(&create).await.unwrap();
+    let out = d.ctl(&["vm", "disk", "add", "web", "data"]).await.unwrap();
+    assert_eq!(
+        out,
+        "vm web: disk data added\nvm web: applied while running\n"
+    );
+    if x86 {
+        let out = d.ctl(&["vm", "set", "web", "--cores", "2"]).await.unwrap();
+        assert!(out.ends_with("vm web: applied while running\n"), "{out}");
+    }
+    let before = p.c[0].get("/vms/web").await.unwrap()["status"]["hardware"].clone();
+    assert_eq!(before["layout"]["disk_ports"], json!([0]), "{before}");
+
+    migrate(&p, 0, 1).await;
+    let vm = p.c[1].get("/vms/web").await.unwrap();
+    assert_eq!(vm["status"]["hardware"], before, "{vm}");
+    // 대상에서도 붙인 디스크가 루트 포트 하나를 쓰고, x86_64는 붙인 vCPU가 그대로다.
+    let layout = &vm["status"]["hardware"]["layout"];
+    assert_eq!(layout["vcpus"], if x86 { 2 } else { 1 }, "{vm}");
+    assert_eq!(layout["disk_ports"], json!([0]), "{vm}");
+    if !x86 {
+        let out = p.d[1]
+            .ctl(&["vm", "disk", "remove", "web", "data"])
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "vm web: disk data removed\nvm web: applied while running\n"
+        );
+    }
+
+    p.d[1].ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    for name in ["root", "data"] {
+        d.ctl(&["volume", "delete", name]).await.unwrap();
+    }
     d.ctl(&["pool", "delete", "shared"]).await.unwrap();
 }
 
@@ -640,13 +703,24 @@ async fn assert_volume_on(p: &Pair, pool: &str, format: &str, node: &str) {
     }
 }
 
-/// VM `web`이 노드 `node`에 확정되어 돌고 마이그레이션 표시가 없는지 두 노드에서 본다.
+/// VM `web`이 노드 `node`에 확정되어 돌고 마이그레이션 표시가 없는지 두 노드에서 본다. 대상 노드의 reconciler가
+/// 원본보다 먼저 넘겨받으면 표시만 지운 status(원본 노드·pid)가 Task가 끝난 뒤에도 잠깐 보이고 곧 대상의 status로
+/// 바뀌므로 기다린다.
 async fn assert_vm_on(p: &Pair, node: &str) {
+    let deadline = std::time::Instant::now() + common::WAIT;
     for c in &p.c {
-        let vm = c.get("/vms/web").await.unwrap();
-        assert_eq!(vm["spec"]["node"].as_str(), Some(node), "{vm}");
-        assert_eq!(vm["status"]["node"].as_str(), Some(node), "{vm}");
-        assert_eq!(vm["status"]["migration"], Value::Null, "{vm}");
+        loop {
+            let vm = c.get("/vms/web").await.unwrap();
+            assert_eq!(vm["spec"]["node"].as_str(), Some(node), "{vm}");
+            if vm["status"]["node"].as_str() == Some(node) && vm["status"]["migration"].is_null() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "vm web is not recorded on node {node}: {vm}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 }
 
@@ -980,7 +1054,11 @@ async fn the_balancer_moves_a_vm_off_a_node_its_rules_forbid() {
     assert_eq!(task["spec"]["op"]["kind"], "vm-migrate", "{task}");
     let task = c.wait_task(&task).await.unwrap();
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
-    assert_eq!(vm_nodes(c, "web1").await, (node2.clone(), node2.clone()));
+    // 대상 노드가 먼저 넘겨받으면 status의 노드는 Task가 끝난 뒤 곧 바뀐다(`assert_vm_on`).
+    eventually("web1 recorded on node2", || async {
+        vm_nodes(c, "web1").await == (node2.clone(), node2.clone())
+    })
+    .await;
 
     // auto: 같은 규칙에 넣은 web2를 스스로 옮긴다.
     d.ctl(&[
