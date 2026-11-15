@@ -911,6 +911,7 @@ fn pending(vm: Uuid, spec: &VmSpec, name: &str) -> Snapshot {
             description: String::new(),
             scheduled: false,
             vm_spec: spec.clone(),
+            hardware: None,
         },
     );
     s.name = s.id.to_string();

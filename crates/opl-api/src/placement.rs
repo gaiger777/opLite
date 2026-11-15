@@ -7,6 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use opl_types::hotplug;
 use opl_types::node::Node;
 use opl_types::placement::{HaGroup, PlacementRule, RuleKind};
 use opl_types::vm::{PowerState, Vm};
@@ -275,7 +276,7 @@ pub fn allocated_mib(node: &Node, inv: &Inventory, assign: &Assign, skip: &[Uuid
             Some(placed) => *placed == Some(node.id),
             None => v.spec.node == Some(node.id) && v.spec.power == PowerState::Running,
         })
-        .map(|v| u64::from(v.spec.memory_mib))
+        .map(|v| u64::from(hotplug::allocated_memory_mib(v)))
         .sum()
 }
 

@@ -85,6 +85,7 @@ async fn snapshot_task_of(
             description: String::new(),
             scheduled,
             vm_spec: spec,
+            hardware: None,
         },
     );
     snapshot.name = snapshot.id.to_string();

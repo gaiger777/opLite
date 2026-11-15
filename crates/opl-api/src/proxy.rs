@@ -19,7 +19,7 @@ use opl_types::security_group::Cidr;
 
 use crate::auth::same_origin;
 use crate::limit::ClientIp;
-use crate::revision::REVISION;
+use crate::revision::{REVISION, TASK};
 use crate::state::AppState;
 
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
@@ -235,12 +235,15 @@ pub(crate) async fn layer(
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
     cors_headers(headers, origin);
-    // 다른 출처의 스크립트는 노출한 헤더만 읽는다. 응답의 리비전을 다음 읽기의 최소 리비전으로 쓰게 한다.
-    headers.insert(
-        ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_name(REVISION),
-    );
+    // 다른 출처의 스크립트는 노출한 헤더만 읽는다. 응답의 리비전을 다음 읽기의 최소 리비전으로, 만든 Task의
+    // id를 Task 알림에 쓰게 한다.
+    headers.insert(ACCESS_CONTROL_EXPOSE_HEADERS, expose_headers());
     response
+}
+
+/// 다른 출처에 노출하는 응답 헤더: `orbivisor-revision, orbivisor-task`
+fn expose_headers() -> HeaderValue {
+    HeaderValue::try_from(format!("{REVISION}, {TASK}")).expect("header names are valid values")
 }
 
 #[cfg(test)]

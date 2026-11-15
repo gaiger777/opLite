@@ -700,7 +700,7 @@ fn cost_mib(model: &Model, vm: &Vm) -> u64 {
 /// 계획한 옮기기를 반영한다(대상 노드가 아닌 원본·대상은 사용률이 없다).
 fn apply(model: &Model, work: &mut Work, vm_index: usize, from: &Node, to: &Node) {
     let vm = &model.inv.vms[vm_index];
-    let (rss, mem) = (model.rss(vm), f64::from(vm.spec.memory_mib));
+    let (rss, mem) = (model.rss(vm), f64::from(hotplug::allocated_memory_mib(vm)));
     if let Some(&s) = model.index.get(&from.id) {
         work.slots[s] = work.slots[s].with(model.share(vm, from), rss, mem, -1.0);
     }
@@ -764,7 +764,7 @@ fn best_move(
             .filter(|i| !work.done.contains(i) && inv.vms[**i].spec.node == Some(from.id));
         for &i in vms {
             let vm = &inv.vms[i];
-            let (rss, mem) = (model.rss(vm), f64::from(vm.spec.memory_mib));
+            let (rss, mem) = (model.rss(vm), f64::from(hotplug::allocated_memory_mib(vm)));
             let cost_mib = cost_mib(model, vm);
             let left = work.slots[s].with(model.share(vm, from), rss, mem, -1.0);
             for &t in targets.iter().filter(|t| **t != s) {

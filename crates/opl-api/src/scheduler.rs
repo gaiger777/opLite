@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::hotplug;
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec, ShutdownAction, ha_capable};
 use opl_types::placement::{HaGroup, HaGroupSpec, PlacementRule, PlacementRuleSpec};
@@ -99,7 +100,7 @@ impl Inventory {
             .iter()
             .filter(|v| v.id != vm && v.spec.node == Some(node.id))
             .filter(|v| v.spec.power == PowerState::Running)
-            .map(|v| i64::from(v.spec.memory_mib))
+            .map(|v| i64::from(hotplug::allocated_memory_mib(v)))
             .sum();
         node.status.memory_mib as i64 - used
     }
@@ -313,7 +314,7 @@ pub fn ha_capacity(inv: &Inventory, settings: &SettingsSpec, vm: &Vm) -> Result<
                 .node
                 .is_some_and(|id| targets.iter().any(|n| n.id == id) || (started(v) && leaving(id)))
         })
-        .map(|v| u64::from(v.spec.memory_mib))
+        .map(|v| u64::from(hotplug::allocated_memory_mib(v)))
         .sum();
     let need_mib = u64::from(vm.spec.memory_mib);
     if used_mib + need_mib <= capacity_mib.saturating_sub(reserve_mib) {
@@ -338,7 +339,9 @@ mod tests {
     use opl_types::runtime::ImageFormat;
     use opl_types::settings::PlacementPolicy;
     use opl_types::storage::PoolBackend;
-    use opl_types::vm::{Arch, CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec, VmHa};
+    use opl_types::vm::{
+        Arch, CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec, RunningHardware, VmHa,
+    };
 
     use super::ScheduleError::NoNode;
     use super::*;
@@ -463,6 +466,32 @@ mod tests {
             spec(6144, Some(b.id), PowerState::Stopped),
         ));
         assert_eq!(sched(&me, &inv), Ok(b.id));
+    }
+
+    /// 메모리 줄이기가 끝나지 않아 도는 메모리가 스펙보다 큰 VM은 도는 메모리로 센다(할당 셈 모두).
+    #[test]
+    fn running_memory_above_the_spec_counts_as_allocated() {
+        let a = node(8192);
+        let mut big: Vm = Resource::new("big", spec(2048, Some(a.id), PowerState::Running));
+        let (mut hw, _) = RunningHardware::at_start(&big.spec, Default::default(), true);
+        hw.memory_mib = 1024;
+        hw.layout.as_mut().unwrap().plugged_mib = 3072;
+        big.status.hardware = Some(hw);
+        let inv = Inventory {
+            nodes: vec![a.clone()],
+            vms: vec![big.clone()],
+            ..Default::default()
+        };
+        assert_eq!(inv.free_memory_mib(&a, Uuid::now_v7()), 8192 - 4096);
+        assert_eq!(
+            crate::placement::allocated_mib(&a, &inv, &Default::default(), &[]),
+            4096
+        );
+
+        // 스펙이 더 크면 스펙으로 센다.
+        let mut inv = inv;
+        inv.vms[0].spec.memory_mib = 6144;
+        assert_eq!(inv.free_memory_mib(&a, Uuid::now_v7()), 8192 - 6144);
     }
 
     #[test]

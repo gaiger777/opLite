@@ -560,6 +560,7 @@ mod tests {
                     placement: None,
                     max_memory_mib: None,
                 },
+                hardware: None,
             },
         );
         s.revision = 3;

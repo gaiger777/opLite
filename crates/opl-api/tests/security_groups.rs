@@ -3,7 +3,7 @@
 mod common;
 
 use common::{Client, Env, vm_request};
-use opl_types::node::{BridgeInfo, NodeSpec};
+use opl_types::node::{BridgeInfo, HOTPLUG, NodeSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -334,12 +334,23 @@ async fn groups_of_a_running_vm_can_change() {
     assert_eq!(body["spec"]["power"], "running");
 }
 
-/// 실행 중인 VM은 방화벽 NIC가 없어도 NIC 개수·순서·MAC을 바꿀 수 없다. 그룹 없이 NIC 순서를 바꾼 뒤
-/// 그룹을 거는 두 번의 바꾸기로 규칙의 tap(순번·MAC)이 도는 tap과 어긋나지 않게.
+/// 노드가 `hotplug`를 알리지 않게 한다(롤링 업그레이드 중의 옛 규칙).
+async fn without_hotplug(env: &Env) {
+    let mut node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    node.status.features.retain(|f| f != HOTPLUG);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &node.status)
+        .await
+        .unwrap();
+}
+
+/// `hotplug`를 모르는 노드가 있으면 실행 중인 VM은 방화벽 NIC가 없어도 NIC 개수·순서·MAC을 바꿀 수 없다. 그룹
+/// 없이 NIC 순서를 바꾼 뒤 그룹을 거는 두 번의 바꾸기로 규칙의 tap(순번·MAC)이 도는 tap과 어긋나지 않게.
 #[tokio::test]
 async fn running_vms_keep_the_number_order_and_macs_of_their_nics() {
     let env = Env::start().await;
     let admin = env.admin().await;
+    without_hotplug(&env).await;
     lan_and_web(&env, &admin).await;
     let mut req = vm_with_groups("vm1", json!([]));
     req["spec"]["nics"]
@@ -385,20 +396,25 @@ async fn running_vms_keep_the_number_order_and_macs_of_their_nics() {
     let (_, vm) = admin.get("/vms/vm1").await;
     assert_eq!(vm["spec"]["nics"], json!(nics));
 
-    // model·network는 지금처럼 바꾼다(다음 시작부터).
+    // 도는 하드웨어 기록이 있으므로(마이그레이션 대상이 그 NIC로 켠다) model·network도 바꾸지 않는다.
     let mut spec = vm["spec"].clone();
     spec["nics"][1]["model"] = json!("e1000e");
     spec["nics"][1]["network"] = json!("user");
     let (status, body) = admin.put("/vms/vm1", json!({ "spec": spec }), None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["message"],
+        "cannot change the NICs of VM \"vm1\" while it is running; only security groups can change"
+    );
 }
 
-/// 방화벽 NIC가 있는(바꾸기 전이나 뒤) 실행 중인 VM은 NIC의 그룹만 바꿀 수 있다. 규칙이 NIC 순번·MAC으로
-/// tap을 정하므로 다른 NIC 변경은 도는 tap과 어긋난다.
+/// `hotplug`를 모르는 노드가 있으면 방화벽 NIC가 있는(바꾸기 전이나 뒤) 실행 중인 VM은 NIC의 그룹만 바꿀 수
+/// 있다. 규칙이 NIC 순번·MAC으로 tap을 정하므로 다른 NIC 변경은 도는 tap과 어긋난다.
 #[tokio::test]
 async fn running_vms_with_groups_change_only_the_groups_of_their_nics() {
     let env = Env::start().await;
     let admin = env.admin().await;
+    without_hotplug(&env).await;
     lan_and_web(&env, &admin).await;
     let mut req = vm_with_groups("vm1", json!([]));
     req["spec"]["nics"]
@@ -443,8 +459,8 @@ async fn running_vms_with_groups_change_only_the_groups_of_their_nics() {
     let (status, body) = admin.put("/vms/vm1", json!({ "spec": moved }), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // 방화벽 NIC가 없는 VM은 지금처럼 실행 중에도 NIC의 model·network를 바꾼다(다음 시작부터). 그룹을
-    // 걸면서는 안 된다.
+    // 방화벽 NIC가 없는 VM도 도는 하드웨어 기록이 있으면(마이그레이션 대상이 그 NIC로 켠다) 실행 중에 NIC의
+    // model·network·MAC을 바꾸지 않고, 그룹을 걸면서도 안 된다. 그룹만 걸기는 된다.
     assert_eq!(
         admin.post("/vms", vm_with_groups("vm2", json!([]))).await.0,
         StatusCode::CREATED
@@ -457,17 +473,67 @@ async fn running_vms_with_groups_change_only_the_groups_of_their_nics() {
     let (status, body) = admin
         .put("/vms/vm2", json!({ "spec": spec.clone() }), None)
         .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let mut mac = spec.clone();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_running", "{body}");
+    let mut mac = vm["spec"].clone();
     mac["nics"][0]["mac"] = json!("52:54:00:aa:bb:cc");
     let (status, body) = admin.put("/vms/vm2", json!({ "spec": mac }), None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "vm_running", "{body}");
-    spec["nics"][0]["model"] = json!("virtio");
     spec["nics"][0]["security_groups"] = json!(["web"]);
-    let (status, body) = admin.put("/vms/vm2", json!({ "spec": spec }), None).await;
+    let (status, body) = admin
+        .put("/vms/vm2", json!({ "spec": spec.clone() }), None)
+        .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "vm_running", "{body}");
+    spec["nics"][0]["model"] = json!("virtio");
+    let (status, body) = admin.put("/vms/vm2", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 모든 노드가 `hotplug`면 실행 중인 VM의 NIC 그룹만 바꾸기는 핫플러그 Task 없이 곧바로이고, 도는 NIC의 모델·
+/// 네트워크 바꾸기는 방화벽이 없어도 409 `vm_running`이다(전에는 다음 시작부터 — 스펙과 도는 장치가 어긋났다).
+#[tokio::test]
+async fn running_vms_change_groups_without_a_task_and_keep_their_nic_devices() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    lan_and_web(&env, &admin).await;
+    let mut req = vm_with_groups("vm1", json!([]));
+    req["spec"]["nics"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "network": "lan", "model": "virtio" }));
+    assert_eq!(admin.post("/vms", req).await.0, StatusCode::CREATED);
+    let task = admin.act("vm1", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, mut body) = admin.get("/vms/vm1").await;
+
+    // 첫 NIC에 그룹을 걸고, 둘째 NIC로 옮긴다.
+    for nic in [0, 1] {
+        let mut moved = body["spec"].clone();
+        moved["nics"][0]["security_groups"] = json!([]);
+        moved["nics"][nic]["security_groups"] = json!(["web"]);
+        let (status, task, got) = admin.put_task("/vms/vm1", json!({ "spec": moved })).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(task, None);
+        assert_eq!(got["spec"]["nics"][nic]["security_groups"], json!(["web"]));
+        body = got;
+    }
+
+    for (field, value) in [("model", "e1000e"), ("network", "user")] {
+        let mut spec = body["spec"].clone();
+        spec["nics"][0][field] = json!(value);
+        spec["nics"][0]["security_groups"] = json!([]);
+        let (status, task, got) = admin.put_task("/vms/vm1", json!({ "spec": spec })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{field}: {got}");
+        assert_eq!(task, None);
+        assert_eq!(got["code"], "vm_running", "{field}: {got}");
+        assert_eq!(
+            got["message"],
+            "cannot change NIC 0 of VM \"vm1\" while it is running; only disks and NICs added at the end can be removed while it runs; stop it first",
+            "{field}"
+        );
+    }
 }
 
 /// 노드를 정한 VM에 그룹을 걸려면 그 노드에 방화벽(nftables)이 있어야 한다.

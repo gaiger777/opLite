@@ -211,6 +211,7 @@ async fn a_failed_delete_is_recorded_and_not_retried_every_tick() {
                 description: String::new(),
                 scheduled: true,
                 vm_spec: spec.clone(),
+                hardware: None,
             },
         );
         s.name = s.id.to_string();
@@ -279,6 +280,7 @@ async fn a_failed_user_delete_of_a_scheduled_snapshot_is_not_recorded() {
             description: String::new(),
             scheduled: true,
             vm_spec: get_vm(&env, vm).spec,
+            hardware: None,
         },
     );
     s.name = s.id.to_string();

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::hotplug;
@@ -15,17 +15,20 @@ use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
 use opl_types::storage::VolumePhase;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
-use opl_types::vm::{HaState, MacAddr, PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus};
+use opl_types::vm::{
+    HaState, MacAddr, PowerState, RunningHardware, Vm, VmHa, VmPhase, VmSpec, VmStatus,
+};
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::audit::AuditNote;
 use crate::auth::{Action, Principal};
-use crate::cluster::require_feature;
+use crate::cluster::{missing_feature, require_feature};
 use crate::error::{ApiError, Json, Query};
 use crate::placement::{Assign, hard_violations};
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
+use crate::revision::TASK;
 use crate::scheduler::{
     HaCapacity, Inventory, ScheduleError, disk_moves, ha_capacity, node_fits_with, schedule_with,
 };
@@ -149,17 +152,8 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         used.insert(mac);
         nic.mac = Some(mac);
     }
-    // 지금 값과 같은 핫플러그 상한은 없음(핫플러그 꺼짐)으로 저장해 옛 VM 모양 그대로 둔다.
-    if spec
-        .cpu
-        .max_vcpus
-        .is_some_and(|max| u32::from(max) == spec.cpu.vcpus())
-    {
-        spec.cpu.max_vcpus = None;
-    }
-    if spec.max_memory_mib == Some(spec.memory_mib) {
-        spec.max_memory_mib = None;
-    }
+    // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
+    // 바뀐 것이 되어 다시 켜야 한다.
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     // 핫플러그 상한은 옛 노드가 풀지 못한다.
@@ -419,20 +413,36 @@ pub async fn create_vm(
     Ok((StatusCode::CREATED, Json(vm)))
 }
 
-/// spec 전체를 바꾼다. 실행 중인 VM의 `node`와 `disks`는 바꿀 수 없고 `ha`를 켤 수 없다. 보안 그룹을
-/// 건 NIC가 있으면 실행 중에는 NIC의 `security_groups`만 바꿀 수 있다. NIC의
-/// `security_groups`는 곧바로, 다른 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 검증한다.
+/// spec 전체를 바꾼다. 실행 중인 VM의 `node`는 바꿀 수 없고 `ha`를 켜거나 `guest_watch`를 켜고 끌 수 없다(409
+/// `vm_running`). NIC의 `security_groups`는 곧바로 적용된다.
+///
+/// 모든 노드가 `hotplug`를 알면 실행 중인 VM의 하드웨어(CPU·메모리·상한·펌웨어·머신·디스크·NIC) 변경은 핫플러그
+/// Task(`vm-hotplug`)를 만들고 그 id를 응답 헤더 `orbivisor-task`로 준다. 상한 안의 vCPU(`cpu.cores`)·메모리, 끝에
+/// 붙이는 virtio-blk 디스크·NIC, 실행 중 붙인 것을 끝에서 떼기는 바로 하고, 나머지는 `status.hardware.pending`(다음
+/// 재시작 때 적용)에 남는다. 부팅 때 단 디스크·NIC 떼기, 가운데 떼기, 순서·버스·MAC·모델·네트워크 바꾸기, SATA 디스크
+/// 붙이기는 409 `vm_running`, 핫플러그 없이 켠 VM이나 빈 루트 포트가 없을 때의 디스크·NIC 붙이기·떼기는 409
+/// `hotplug_unavailable`, 켜거나 끄는 중이거나 앞의 핫플러그 Task가 끝나지 않았으면 409 `vm_busy`, 메모리를 바로
+/// 늘릴 미할당 메모리가 노드에 없으면 409 `no_capacity`다. 같은 PUT으로 끄는(`power: stopped`) VM의 하드웨어 변경은
+/// Task 없이 다음 시작부터 적용된다. 기능이 모자라거나 켜져 있어야 하지만 QEMU가 없는 VM(실패, 다시 켜기를
+/// 기다림)은 실행 중에 디스크와 NIC 개수·순서·MAC을 바꿀 수 없고(보안 그룹을 건 NIC가 있으면 `security_groups`만)
+/// 다른 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그
+/// 사이 바뀌었으면 다시 읽어 검증한다.
 #[utoipa::path(put, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<VmSpec>,
-    responses((status = 200, body = Resource<VmSpec, VmStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses(
+        (status = 200, body = Resource<VmSpec, VmStatus>, headers(
+            ("orbivisor-task" = String, description = "id of the vm-hotplug task that applies a hardware change to the running VM (only when one was created)"),
+        )),
+        (status = "4XX", body = crate::error::ErrorBody),
+    ))]
 pub async fn update_vm(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Path(key): Path<String>,
     headers: HeaderMap,
     Json(req): Json<UpdateRequest<VmSpec>>,
-) -> Result<Json<Vm>, ApiError> {
+) -> Result<(HeaderMap, Json<Vm>), ApiError> {
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     let expected = if_match(&headers)?;
     let picks = req.spec.power == PowerState::Running && req.spec.node.is_none();
@@ -459,37 +469,27 @@ pub async fn update_vm(
         if spec.node != current.spec.node && !is_stopped(&current) {
             return Err(vm_running(&current, "move"));
         }
-        if spec.disks != current.spec.disks && !is_stopped(&current) {
-            return Err(vm_running(&current, "change the disks of"));
+        // 모든 노드가 `hotplug`를 알면 실행 중인 VM의 하드웨어 변경을 핫플러그 Task로 맞춘다. 같은 PUT으로 끄면
+        // 다음 시작부터 적용하는 변경이다. 켜져 있어야 하지만 QEMU가 없고 전원 Task도 없는 VM(실패, 다시 켜기를
+        // 기다림)은 지금 규칙대로 받는다(CPU·메모리는 다음 시작부터, 디스크·NIC 순서는 그대로).
+        let hot = !is_stopped(&current) && missing_feature(&state.cluster, HOTPLUG)?.is_empty();
+        let stopping = spec.power == PowerState::Stopped;
+        let idle = current.status.hardware.is_none()
+            && matches!(current.status.phase, VmPhase::Stopped | VmPhase::Failed)
+            && !power_task_running(&state, &current)?;
+        let changed = hotplug::hardware_changed(&current.spec, &spec);
+        let hotplug = hot && !stopping && !idle && changed;
+        if hotplug {
+            check_hot_change(&state, &current, &spec)?;
+        } else if !(is_stopped(&current) || hot && stopping) {
+            check_running_devices(&current, &spec)?;
         }
-        // 방화벽 규칙은 spec의 NIC 순번·MAC으로 tap을 정한다. 실행 중에 NIC 구성이 바뀌면 도는 tap과
-        // 어긋나 막히지 않은 채가 되므로, 방화벽 NIC가 있으면(전이나 뒤) 그룹만 바꿀 수 있다.
-        let firewalled = |s: &VmSpec| s.nics.iter().any(|n| !n.security_groups.is_empty());
-        let without_groups = |s: &VmSpec| {
-            let mut nics = s.nics.clone();
-            nics.iter_mut().for_each(|n| n.security_groups.clear());
-            nics
-        };
-        if (firewalled(&spec) || firewalled(&current.spec))
-            && without_groups(&spec) != without_groups(&current.spec)
-            && !is_stopped(&current)
-        {
-            return Err(ApiError::conflict(
-                "vm_running",
-                format!(
-                    "cannot change the NICs of VM {:?} while it is running; only security groups can change",
-                    current.name
-                ),
-            ));
+        // 끄면서 바꾸는 하드웨어도 끝나지 않은 핫플러그 Task의 되돌리기가 지우지 않게 기다린다.
+        if hot && stopping && changed {
+            check_no_hotplug_task(&state, &current)?;
         }
-        // 방화벽이 없어도 NIC 개수·순서·MAC은 그대로 둔다. 그룹 없이 바꾼 뒤 그룹을 걸면 위 검사를 비켜
-        // 규칙의 tap이 도는 tap과 어긋난다.
-        let macs = |s: &VmSpec| s.nics.iter().map(|n| n.mac).collect::<Vec<_>>();
-        if macs(&spec) != macs(&current.spec) && !is_stopped(&current) {
-            return Err(vm_running(
-                &current,
-                "change the number, order or MAC addresses of the NICs of",
-            ));
+        if spec.power == PowerState::Running && current.spec.power == PowerState::Stopped {
+            check_stopping_devices(&current, &spec)?;
         }
         // 노드가 과반수와 끊긴 동안 켜면 그 노드는 HA인 줄 모르고 펜싱하지 않는다. 끄기는 언제든.
         if spec.ha_active() && !current.spec.ha_active() && !is_stopped(&current) {
@@ -531,15 +531,192 @@ pub async fn update_vm(
             }
             Err(e) => return Err(e.into()),
         }
-        return Ok(Json(lookup::<VmSpec>(
-            &state.cluster,
-            &current.id.to_string(),
-        )?));
+        // 같은 잠금 안에서 Task를 만들어 그사이 마이그레이션이 시작하지 않게 한다.
+        let mut response = HeaderMap::new();
+        if hotplug {
+            // 스펙은 이미 썼다. Task를 만들지 못하면 헤더 없이 200이고 변경은 `vm hotplug`로 다시 맞출 수 있다.
+            match start_hotplug(&state, &current).await {
+                Ok(task) => {
+                    response.insert(
+                        TASK,
+                        HeaderValue::from_str(&task.id.to_string()).expect("uuid"),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(vm = %current.id, error = %e.message, "cannot start the hotplug task after updating the spec; run `vm hotplug` to apply it");
+                }
+            }
+        }
+        let vm = lookup::<VmSpec>(&state.cluster, &current.id.to_string())?;
+        return Ok((response, Json(vm)));
     }
     Err(ApiError::conflict(
         "busy",
         "the VM kept changing while being updated; try again",
     ))
+}
+
+/// 이 VM의 전원 Task(시작·정지·강제 정지·재시작)가 끝나지 않았는지(켜는 중이라 곧 QEMU가 생긴다)
+fn power_task_running(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    Ok(tasks.iter().any(|t| {
+        t.spec.target == vm.id
+            && !t.status.state.is_finished()
+            && matches!(
+                t.spec.op,
+                TaskOp::VmStart | TaskOp::VmStop | TaskOp::VmForceStop | TaskOp::VmReboot
+            )
+    }))
+}
+
+/// `hotplug` 기능이 모자란 클러스터에서 실행 중인 VM의 디스크·NIC 변경을 거절한다(409 `vm_running`).
+fn check_running_devices(current: &Vm, spec: &VmSpec) -> Result<(), ApiError> {
+    if spec.disks != current.spec.disks {
+        return Err(vm_running(current, "change the disks of"));
+    }
+    // 방화벽 규칙은 spec의 NIC 순번·MAC으로 tap을 정한다. 실행 중에 NIC 구성이 바뀌면 도는 tap과
+    // 어긋나 막히지 않은 채가 되므로, 방화벽 NIC가 있으면(전이나 뒤) 그룹만 바꿀 수 있다.
+    let firewalled = |s: &VmSpec| s.nics.iter().any(|n| !n.security_groups.is_empty());
+    let without_groups = |s: &VmSpec| {
+        let mut nics = s.nics.clone();
+        nics.iter_mut().for_each(|n| n.security_groups.clear());
+        nics
+    };
+    let only_groups = || {
+        ApiError::conflict(
+            "vm_running",
+            format!(
+                "cannot change the NICs of VM {:?} while it is running; only security groups can change",
+                current.name
+            ),
+        )
+    };
+    if (firewalled(spec) || firewalled(&current.spec))
+        && without_groups(spec) != without_groups(&current.spec)
+    {
+        return Err(only_groups());
+    }
+    // 방화벽이 없어도 NIC 개수·순서·MAC은 그대로 둔다. 그룹 없이 바꾼 뒤 그룹을 걸면 위 검사를 비켜
+    // 규칙의 tap이 도는 tap과 어긋난다.
+    let macs = |s: &VmSpec| s.nics.iter().map(|n| n.mac).collect::<Vec<_>>();
+    if macs(spec) != macs(&current.spec) {
+        return Err(vm_running(
+            current,
+            "change the number, order or MAC addresses of the NICs of",
+        ));
+    }
+    // 도는 하드웨어 기록이 있으면(마이그레이션 대상이 기록의 NIC로 켠다) 그룹이 없어도 네트워크·모델을 바꾸지 않는다.
+    if current.status.hardware.is_some() && without_groups(spec) != without_groups(&current.spec) {
+        return Err(only_groups());
+    }
+    Ok(())
+}
+
+/// 실행 중인 VM `vm`의 하드웨어를 `spec`으로 바꾸는 핫플러그를 받을 수 있는지 본다. 도는 하드웨어 기록이 있는 실행
+/// 중 VM이어야 하고 전원 Task와 끝나지 않은 핫플러그 Task가 없어야 하며(409 `vm_busy` — 실패한 Task의 되돌리기가 이
+/// 변경을 지우지 않게), 디스크를 바꾸면 크기 늘리기 Task도 없어야 한다. 디스크·NIC
+/// 변경은 끝에 붙이기와 실행 중 붙인 것 떼기만 된다([`hotplug::plan`]). 메모리를 바로 늘리면 VM이 도는 노드에 그만큼
+/// 미할당 메모리가 있어야 한다(409 `no_capacity`).
+fn check_hot_change(state: &AppState, vm: &Vm, spec: &VmSpec) -> Result<(), ApiError> {
+    let hw =
+        vm.status.hardware.as_ref().filter(|_| {
+            vm.spec.power == PowerState::Running && vm.status.phase == VmPhase::Running
+        });
+    let Some(hw) = hw else {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            format!(
+                "VM {:?} is starting or stopping; change its hardware when it is running or stopped",
+                vm.name
+            ),
+        ));
+    };
+    check_not_busy(state, vm)?;
+    check_no_hotplug_task(state, vm)?;
+    // 게스트가 아직 내려 주지 않은 디스크·NIC가 있으면 디스크·NIC 목록은 바꾸지 않는다(떼기를 먼저 마친다).
+    let devices = |s: &VmSpec| {
+        let mut nics = s.nics.clone();
+        nics.iter_mut().for_each(|n| n.security_groups.clear());
+        (s.disks.clone(), nics)
+    };
+    let releasing: Vec<String> = hw
+        .unplugging
+        .iter()
+        .filter(|d| !d.starts_with("cpu"))
+        .map(|d| hotplug::device_name(hw, d))
+        .collect();
+    if !releasing.is_empty() && devices(spec) != devices(&vm.spec) {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            format!(
+                "the guest is still releasing {} from VM {:?}; run `vm hotplug` first",
+                releasing.join(", "),
+                vm.name
+            ),
+        ));
+    }
+    let inv = Inventory::load(&state.cluster)?;
+    if spec.disks != vm.spec.disks {
+        check_no_resize_task(state, &inv, vm)?;
+    }
+    let node = vm
+        .status
+        .node
+        .and_then(|id| inv.nodes.iter().find(|n| n.id == id));
+    let caps = node.and_then(|n| n.status.hotplug).unwrap_or_default();
+    let plan = hotplug::plan(spec, hw, caps).map_err(|e| device_error(vm, hw, e))?;
+    check_hotplug_memory(&inv, vm, hw, node, &plan)
+}
+
+/// 끄는 중인 VM(QEMU가 아직 돌아 기록이 있음)을 다시 켤 때 스펙 `spec`의 디스크·NIC가 도는 장치와 다르면 409
+/// `vm_busy`다: 작업자는 도는 QEMU를 그대로 이어 쓰므로 스펙과 장치가 어긋난다. 꺼진 뒤 켜면 스펙대로 켠다.
+fn check_stopping_devices(vm: &Vm, spec: &VmSpec) -> Result<(), ApiError> {
+    match &vm.status.hardware {
+        Some(hw) if !hotplug::devices_match(spec, hw) => Err(ApiError::conflict(
+            "vm_busy",
+            format!(
+                "VM {:?} is stopping with changed devices; start it after it stops",
+                vm.name
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// 실행 중에 할 수 없는 디스크·NIC 변경의 409
+fn device_error(vm: &Vm, hw: &RunningHardware, e: hotplug::DeviceError) -> ApiError {
+    use hotplug::DeviceError;
+    match e {
+        DeviceError::Changed(what) => ApiError::conflict(
+            "vm_running",
+            format!(
+                "cannot {what} of VM {:?} while it is running; only disks and NICs added at the end can be removed while it runs; stop it first",
+                vm.name
+            ),
+        ),
+        DeviceError::SataDisk(volume) => ApiError::conflict(
+            "vm_running",
+            format!(
+                "SATA disks cannot be added while the VM is running; add disk {volume:?} to VM {:?} as virtio-blk or stop it first",
+                vm.name
+            ),
+        ),
+        DeviceError::NoLayout => ApiError::conflict(
+            "hotplug_unavailable",
+            format!(
+                "VM {:?} was started without hotplug support; restart it once to add or remove disks and NICs while it runs",
+                vm.name
+            ),
+        ),
+        DeviceError::NoFreePort => ApiError::conflict(
+            "hotplug_unavailable",
+            format!(
+                "no free hotplug port ({} in use); restart VM {:?} to add more disks or NICs while it runs",
+                hw.layout.as_ref().map_or(0, |l| l.ports),
+                vm.name
+            ),
+        ),
+    }
 }
 
 /// 꺼진 VM만 지울 수 있다. 스냅샷이 남아 있으면 409 `vm_has_snapshots`, 끝나지 않은 스냅샷·복제
@@ -690,6 +867,12 @@ pub async fn vm_action(
                 if spec.node.is_none() {
                     let inv = Inventory::load(&state.cluster)?;
                     spec.node = Some(schedule_with(&me, &inv, &scorer).map_err(schedule_error)?);
+                }
+                // 끄는 중에 디스크·NIC를 바꾼 VM은 QEMU가 끝난 뒤 켠다.
+                if spec.power != PowerState::Running
+                    && let Some(now) = state.cluster.get::<VmSpec>(id)?
+                {
+                    check_stopping_devices(&now, spec)?;
                 }
                 // 이미 켜기로 된 VM은 자리를 더 쓰지 않는다.
                 if spec.power != PowerState::Running {

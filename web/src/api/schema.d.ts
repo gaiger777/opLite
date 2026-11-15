@@ -1506,9 +1506,19 @@ export interface paths {
         };
         get: operations["get_vm"];
         /**
-         * spec 전체를 바꾼다. 실행 중인 VM의 `node`와 `disks`는 바꿀 수 없고 `ha`를 켤 수 없다. 보안 그룹을
-         *     건 NIC가 있으면 실행 중에는 NIC의 `security_groups`만 바꿀 수 있다. NIC의
-         *     `security_groups`는 곧바로, 다른 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 검증한다.
+         * spec 전체를 바꾼다. 실행 중인 VM의 `node`는 바꿀 수 없고 `ha`를 켜거나 `guest_watch`를 켜고 끌 수 없다(409
+         *     `vm_running`). NIC의 `security_groups`는 곧바로 적용된다.
+         * @description 모든 노드가 `hotplug`를 알면 실행 중인 VM의 하드웨어(CPU·메모리·상한·펌웨어·머신·디스크·NIC) 변경은 핫플러그
+         *     Task(`vm-hotplug`)를 만들고 그 id를 응답 헤더 `orbivisor-task`로 준다. 상한 안의 vCPU(`cpu.cores`)·메모리, 끝에
+         *     붙이는 virtio-blk 디스크·NIC, 실행 중 붙인 것을 끝에서 떼기는 바로 하고, 나머지는 `status.hardware.pending`(다음
+         *     재시작 때 적용)에 남는다. 부팅 때 단 디스크·NIC 떼기, 가운데 떼기, 순서·버스·MAC·모델·네트워크 바꾸기, SATA 디스크
+         *     붙이기는 409 `vm_running`, 핫플러그 없이 켠 VM이나 빈 루트 포트가 없을 때의 디스크·NIC 붙이기·떼기는 409
+         *     `hotplug_unavailable`, 켜거나 끄는 중이거나 앞의 핫플러그 Task가 끝나지 않았으면 409 `vm_busy`, 메모리를 바로
+         *     늘릴 미할당 메모리가 노드에 없으면 409 `no_capacity`다. 같은 PUT으로 끄는(`power: stopped`) VM의 하드웨어 변경은
+         *     Task 없이 다음 시작부터 적용된다. 기능이 모자라거나 켜져 있어야 하지만 QEMU가 없는 VM(실패, 다시 켜기를
+         *     기다림)은 실행 중에 디스크와 NIC 개수·순서·MAC을 바꿀 수 없고(보안 그룹을 건 NIC가 있으면 `security_groups`만)
+         *     다른 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그
+         *     사이 바뀌었으면 다시 읽어 검증한다.
          */
         put: operations["update_vm"];
         post?: never;
@@ -1669,7 +1679,10 @@ export interface paths {
          * `pending` 스냅샷을 만들고(부모는 VM의 현재 위치, `vm_spec`은 지금 스펙) 그것을 채울 Task를
          *     돌려준다(202). 시작·정지 중이면 409 `vm_busy`, 스냅샷을 담지 못하는 디스크가 있거나 디스크의
          *     스냅샷 방식이 섞였거나 블록 디스크(LVM-thin, ZFS, RBD)의 VM에 메모리 스냅샷을 요청하면
-         *     409 `snapshot_unsupported`. 실행 중이 아니거나 디스크가 없는 VM의 메모리 스냅샷은 400.
+         *     409 `snapshot_unsupported`. 실행 중에 바꾼 하드웨어나 다음 재시작 때 적용할 변경이 있는 VM과, `hotplug`를 모르는
+         *     노드가 있는 동안 핫플러그 배치로 도는 VM도 메모리를 담지 않는다(`memory`를 주지 않으면 디스크만, `true`면 409
+         *     `snapshot_unsupported`). 실행 중이 아니거나 디스크가 없는
+         *     VM의 메모리 스냅샷은 400.
          */
         post: operations["create_snapshot"];
         delete?: never;
@@ -2467,7 +2480,7 @@ export interface components {
         CreateSnapshotRequest: {
             /** @description 최대 1024자 */
             description?: string;
-            /** @description 메모리 상태도 담는다. 기본은 VM이 실행 중이고 디스크가 있으면 true다. */
+            /** @description 메모리 상태도 담는다. 기본은 VM이 실행 중이고 디스크가 있으며 실행 중에 바꾼 하드웨어가 없으면 true다. */
             memory?: boolean | null;
             /** @description VM 안에서 고유한 이름 */
             name: string;
@@ -3632,6 +3645,11 @@ export interface components {
                 revision: number;
                 spec: {
                     description?: string;
+                    /**
+                     * @description 메모리 스냅샷이면 그때 도는 QEMU의 하드웨어(계획 54, 모든 노드가 `hotplug`일 때만). 메모리를 불러오려면 같은
+                     *     장치로 켜야 하므로 되돌리기는 이 모양(핫플러그 배치 있음·없음, 상한)으로 켠다. 없으면 배치 없이 켠다.
+                     */
+                    hardware?: components["schemas"]["RunningHardware"];
                     /** @description 메모리 상태를 담았는지. 담았으면 VM의 첫 디스크에 있다. */
                     memory: boolean;
                     /** @description 사용자가 붙인 이름. VM 안에서 고유하다. */
@@ -5380,6 +5398,11 @@ export interface components {
             revision: number;
             spec: {
                 description?: string;
+                /**
+                 * @description 메모리 스냅샷이면 그때 도는 QEMU의 하드웨어(계획 54, 모든 노드가 `hotplug`일 때만). 메모리를 불러오려면 같은
+                 *     장치로 켜야 하므로 되돌리기는 이 모양(핫플러그 배치 있음·없음, 상한)으로 켠다. 없으면 배치 없이 켠다.
+                 */
+                hardware?: components["schemas"]["RunningHardware"];
                 /** @description 메모리 상태를 담았는지. 담았으면 VM의 첫 디스크에 있다. */
                 memory: boolean;
                 /** @description 사용자가 붙인 이름. VM 안에서 고유하다. */
@@ -5853,6 +5876,11 @@ export interface components {
         };
         SnapshotSpec: {
             description?: string;
+            /**
+             * @description 메모리 스냅샷이면 그때 도는 QEMU의 하드웨어(계획 54, 모든 노드가 `hotplug`일 때만). 메모리를 불러오려면 같은
+             *     장치로 켜야 하므로 되돌리기는 이 모양(핫플러그 배치 있음·없음, 상한)으로 켠다. 없으면 배치 없이 켠다.
+             */
+            hardware?: components["schemas"]["RunningHardware"];
             /** @description 메모리 상태를 담았는지. 담았으면 VM의 첫 디스크에 있다. */
             memory: boolean;
             /** @description 사용자가 붙인 이름. VM 안에서 고유하다. */
@@ -10294,6 +10322,8 @@ export interface operations {
         responses: {
             200: {
                 headers: {
+                    /** @description id of the vm-hotplug task that applies a hardware change to the running VM (only when one was created) */
+                    "orbivisor-task"?: string;
                     [name: string]: unknown;
                 };
                 content: {

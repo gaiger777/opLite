@@ -9,6 +9,7 @@ use opl_driver::Hypervisor;
 use opl_types::node::{HOTPLUG, Node, NodeHotplug, NodeSpec, PLACEMENT};
 use opl_types::resource::Resource;
 use opl_types::runtime::{HOTPLUG_PORTS, VmRuntimeSpec};
+use opl_types::snapshot::SnapshotSpec;
 use opl_types::vm::{
     MacAddr, NicModel, NicSpec, PendingChange, PendingReason, PowerState, RestartPolicy,
     RunningHardware, Vm, VmPhase, VmSpec,
@@ -334,4 +335,74 @@ async fn status_writes_keep_hardware_written_meanwhile() {
         .await;
     assert_eq!(got.status.hardware, Some(changed));
     env.hv.set_unresponsive(vm.id, false);
+}
+
+/// 메모리 스냅샷 `name`(되돌리기가 VM에 맡기는 태그는 그 id)을 기록한다.
+async fn memory_snapshot(
+    env: &Env,
+    vm: &Vm,
+    name: &str,
+    hardware: Option<RunningHardware>,
+) -> Uuid {
+    let snapshot: Resource<SnapshotSpec, _> = Resource::new(
+        name,
+        SnapshotSpec {
+            vm: vm.id,
+            name: name.into(),
+            parent: None,
+            memory: true,
+            description: String::new(),
+            scheduled: false,
+            vm_spec: vm.spec.clone(),
+            hardware,
+        },
+    );
+    env.cluster.create(&snapshot).await.unwrap();
+    snapshot.id
+}
+
+/// 메모리 스냅샷을 불러오며 켜면 스냅샷에 적은 하드웨어(메모리를 담을 때의 장치)로 켜고, 적지 않은 옛 스냅샷은
+/// 모든 노드가 `hotplug`여도 배치 없이 켠다.
+#[tokio::test]
+async fn a_memory_snapshot_restores_with_the_hardware_it_was_taken_with() {
+    let env = Env::start().await;
+    add_node(&env, env.node, &[HOTPLUG], Some(ALL)).await;
+    let mut vm = hot_vm(env.node);
+    vm.spec.power = PowerState::Stopped;
+    env.create(&vm).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+
+    let old = memory_snapshot(&env, &vm, "old", None).await;
+    env.restore_on_start(vm.id, &old.to_string());
+    env.set_power(vm.id, PowerState::Running).await;
+    let got = env
+        .wait(vm.id, "restored", |v| {
+            running(v) && v.status.hardware.is_some()
+        })
+        .await;
+    let spec = last_launch(&env, vm.id);
+    assert_eq!(spec.hotplug, None);
+    assert_eq!(spec.cpu.max_vcpus, None);
+    assert_eq!(got.status.hardware, Some(RunningHardware::legacy(&vm.spec)));
+    assert_eq!(env.hv.launches().last().unwrap().1, Some(old.to_string()));
+
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    // 능력이 없는 노드에서 찍은 메모리: vCPU 상한·virtio-mem 없이 켠다(이 노드는 둘 다 있다).
+    let (taken, _) = RunningHardware::at_start(&vm.spec, NodeHotplug::default(), true);
+    let recorded = memory_snapshot(&env, &vm, "recorded", Some(taken.clone())).await;
+    env.restore_on_start(vm.id, &recorded.to_string());
+    env.set_power(vm.id, PowerState::Running).await;
+    let got = env
+        .wait(vm.id, "restored with layout", |v| {
+            running(v) && v.status.hardware.is_some()
+        })
+        .await;
+    let spec = last_launch(&env, vm.id);
+    assert_eq!(spec.hotplug, taken.layout);
+    assert_eq!(spec.cpu.max_vcpus, None);
+    assert_eq!(spec.hotplug.unwrap().max_memory_mib, 1024);
+    assert_eq!(got.status.hardware, Some(taken));
 }

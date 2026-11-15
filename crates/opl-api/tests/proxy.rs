@@ -241,10 +241,11 @@ async fn web_origins_accept_cookie_requests_from_the_portal() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()["access-control-allow-origin"], PORTAL);
     assert_eq!(resp.headers()["access-control-allow-credentials"], "true");
-    // 포털의 스크립트도 응답의 리비전을 읽어 다음 읽기의 `Orbivisor-Min-Revision`으로 보낼 수 있다.
+    // 포털의 스크립트도 응답의 리비전을 읽어 다음 읽기의 `Orbivisor-Min-Revision`으로 보낼 수 있고, VM 수정이
+    // 만든 Task의 id를 읽는다.
     assert_eq!(
         resp.headers()["access-control-expose-headers"],
-        "orbivisor-revision"
+        "orbivisor-revision, orbivisor-task"
     );
     let resp = whoami(&env.base, &cookie, &evil).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);

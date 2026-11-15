@@ -8,6 +8,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::network::{NetworkSpec, USER_NETWORK};
+use opl_types::node::HOTPLUG;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{
@@ -15,12 +16,13 @@ use opl_types::storage::{
     pool_kind_supports_snapshots,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
-use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
+use opl_types::vm::{PowerState, RunningHardware, Vm, VmPhase, VmSpec};
 use serde::Deserialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
+use crate::cluster::missing_feature;
 use crate::error::{ApiError, Json};
 use crate::resources::{List, check_name, lookup};
 use crate::score::Scorer;
@@ -40,7 +42,7 @@ pub struct CreateSnapshotRequest {
     /// 최대 1024자
     #[serde(default)]
     pub description: String,
-    /// 메모리 상태도 담는다. 기본은 VM이 실행 중이고 디스크가 있으면 true다.
+    /// 메모리 상태도 담는다. 기본은 VM이 실행 중이고 디스크가 있으며 실행 중에 바꾼 하드웨어가 없으면 true다.
     pub memory: Option<bool>,
 }
 
@@ -144,6 +146,21 @@ pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), Ap
             )
         },
     )
+}
+
+/// 실행 중인 VM의 메모리를 켤 때 모양 그대로 담을 수 있는지: 실행 중에 바꾼 하드웨어·보류가 없고
+/// ([`RunningHardware::matches_boot`]) 끝나지 않은 핫플러그 Task(`tasks`)도 없다. 메모리 스냅샷을 되돌리면 켤 때의
+/// 장치로 새로 켜서 메모리를 불러오기 때문이다.
+pub(crate) fn memory_as_booted(vm: &Vm, tasks: &[Task]) -> bool {
+    vm.status
+        .hardware
+        .as_ref()
+        .is_none_or(RunningHardware::matches_boot)
+        && !tasks.iter().any(|t| {
+            t.spec.target == vm.id
+                && !t.status.state.is_finished()
+                && t.spec.op == TaskOp::VmHotplug
+        })
 }
 
 /// 이 VM의 핫플러그 Task가 끝나지 않았으면 409 `vm_busy`. 마이그레이션 대상은 원본이 도는 하드웨어로 켜므로
@@ -443,7 +460,10 @@ pub async fn get_snapshot(
 /// `pending` 스냅샷을 만들고(부모는 VM의 현재 위치, `vm_spec`은 지금 스펙) 그것을 채울 Task를
 /// 돌려준다(202). 시작·정지 중이면 409 `vm_busy`, 스냅샷을 담지 못하는 디스크가 있거나 디스크의
 /// 스냅샷 방식이 섞였거나 블록 디스크(LVM-thin, ZFS, RBD)의 VM에 메모리 스냅샷을 요청하면
-/// 409 `snapshot_unsupported`. 실행 중이 아니거나 디스크가 없는 VM의 메모리 스냅샷은 400.
+/// 409 `snapshot_unsupported`. 실행 중에 바꾼 하드웨어나 다음 재시작 때 적용할 변경이 있는 VM과, `hotplug`를 모르는
+/// 노드가 있는 동안 핫플러그 배치로 도는 VM도 메모리를 담지 않는다(`memory`를 주지 않으면 디스크만, `true`면 409
+/// `snapshot_unsupported`). 실행 중이 아니거나 디스크가 없는
+/// VM의 메모리 스냅샷은 400.
 #[utoipa::path(post, path = "/vms/{key}/snapshots", tag = "snapshots",
     params(("key" = String, Path, description = "VM id or name")),
     request_body = CreateSnapshotRequest,
@@ -492,7 +512,42 @@ pub(crate) async fn start_create(
             ),
         ));
     }
-    let memory = memory.unwrap_or(running && has_disk && block.is_none());
+    // 되돌리기는 켤 때 모양으로 새로 켜서 메모리를 불러오므로, 실행 중에 바꾼 하드웨어나 보류가 있으면 메모리를
+    // 담지 않는다.
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    // 핫플러그 배치로 도는 VM의 메모리는 그 하드웨어를 스냅샷에 적어야 같은 장치로 되돌릴 수 있다. `hotplug`를 모르는
+    // 노드가 있으면 적지 않으므로 메모리를 담지 않는다(예약 스냅샷은 디스크만).
+    let laid_out = vm
+        .status
+        .hardware
+        .as_ref()
+        .is_some_and(|hw| hw.layout.is_some());
+    let recordable = !laid_out || missing_feature(&state.cluster, HOTPLUG)?.is_empty();
+    let memory = if scheduled && !recordable {
+        Some(false)
+    } else {
+        memory
+    };
+    if running && !recordable && memory == Some(true) {
+        return Err(ApiError::conflict(
+            "snapshot_unsupported",
+            format!(
+                "VM {:?} runs with hotplug support, which cannot be recorded in a snapshot while a node lacks it; take a snapshot without memory or upgrade every node first",
+                vm.name
+            ),
+        ));
+    }
+    let as_booted = recordable && memory_as_booted(vm, &tasks);
+    if running && !as_booted && memory == Some(true) {
+        return Err(ApiError::conflict(
+            "snapshot_unsupported",
+            format!(
+                "VM {:?} has hardware changed while running or pending changes; restart it to take a snapshot with memory",
+                vm.name
+            ),
+        ));
+    }
+    let memory = memory.unwrap_or(running && has_disk && block.is_none() && as_booted);
     if memory && !running {
         return Err(ApiError::bad_request(format!(
             "VM {:?} is not running; only its disks can be snapshotted",
@@ -515,6 +570,12 @@ pub(crate) async fn start_create(
             description,
             scheduled,
             vm_spec: vm.spec.clone(),
+            // 옛 노드는 이 필드가 있는 스냅샷을 읽지 못한다. 없으면 되돌리기가 배치 없이 켠다.
+            hardware: if memory && missing_feature(&state.cluster, HOTPLUG)?.is_empty() {
+                vm.status.hardware.clone()
+            } else {
+                None
+            },
         },
     );
     snapshot.name = snapshot.id.to_string();

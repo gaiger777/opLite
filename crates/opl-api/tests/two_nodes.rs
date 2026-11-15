@@ -1793,6 +1793,7 @@ async fn drain_moves_vms_with_local_disks() {
             description: String::new(),
             scheduled: false,
             vm_spec: snap.spec.clone(),
+            hardware: None,
         },
     );
     snapshot.name = snapshot.id.to_string();

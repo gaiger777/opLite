@@ -1093,10 +1093,9 @@ async fn pinned_vms_are_stored_only_when_pinned_and_wait_for_all_nodes() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// 핫플러그 상한은 지금 값보다 클 때만 저장하고(같으면 없음), 범위 밖은 400, `hotplug`를 모르는 노드가 있으면
-/// 409다.
+/// 핫플러그 상한은 준 그대로 저장하고(지금 값과 같아도), 범위 밖은 400, `hotplug`를 모르는 노드가 있으면 409다.
 #[tokio::test]
-async fn hotplug_maximums_are_stored_only_when_larger_and_wait_for_all_nodes() {
+async fn hotplug_maximums_are_stored_as_given_and_wait_for_all_nodes() {
     let env = Env::start().await;
     let admin = env.admin().await;
     let mut req = vm_request("web");
@@ -1113,21 +1112,22 @@ async fn hotplug_maximums_are_stored_only_when_larger_and_wait_for_all_nodes() {
         (Some(8), Some(1024))
     );
 
-    // 지금 값과 같은 상한은 적지 않는다(옛 VM 모양).
+    // 지금 값과 같은 상한도 적는다(상한까지 늘린 VM이 상한을 잃지 않게).
     req["name"] = json!("same");
     req["spec"]["cpu"] = json!({ "sockets": 2, "cores": 2, "max_vcpus": 4 });
     req["spec"]["max_memory_mib"] = json!(256);
     let (status, body) = admin.post("/vms", req.clone()).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert!(body["spec"]["cpu"].get("max_vcpus").is_none(), "{body}");
-    assert!(body["spec"].get("max_memory_mib").is_none(), "{body}");
+    assert_eq!(body["spec"]["cpu"]["max_vcpus"], 4);
+    assert_eq!(body["spec"]["max_memory_mib"], 256);
 
-    // 같은 값이면 메모리 단위도 보지 않는다.
-    req["name"] = json!("odd");
-    req["spec"]["memory_mib"] = json!(300);
-    req["spec"]["max_memory_mib"] = json!(300);
+    // 상한을 적지 않으면 옛 VM 모양 그대로다.
+    req["name"] = json!("none");
+    req["spec"]["cpu"] = json!({ "cores": 2 });
+    req["spec"]["max_memory_mib"] = Value::Null;
     let (status, body) = admin.post("/vms", req.clone()).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["spec"]["cpu"].get("max_vcpus").is_none(), "{body}");
     assert!(body["spec"].get("max_memory_mib").is_none(), "{body}");
 
     req["name"] = json!("bad");
@@ -1168,6 +1168,12 @@ async fn hotplug_maximums_are_stored_only_when_larger_and_wait_for_all_nodes() {
             json!(1024),
             "memory_mib and max_memory_mib must be multiples of 128 when max_memory_mib is set",
         ),
+        (
+            json!({ "cores": 1 }),
+            300,
+            json!(300),
+            "memory_mib and max_memory_mib must be multiples of 128 when max_memory_mib is set",
+        ),
     ] {
         req["spec"]["cpu"] = cpu;
         req["spec"]["memory_mib"] = json!(memory);
@@ -1177,7 +1183,7 @@ async fn hotplug_maximums_are_stored_only_when_larger_and_wait_for_all_nodes() {
         assert_eq!(body["message"], message);
     }
 
-    // 옛 노드 흉내: `hotplug`를 모르면 상한을 받지 않는다(같은 값은 받는다).
+    // 옛 노드 흉내: `hotplug`를 모르면 상한을 받지 않는다(같은 값도).
     let mut status = env
         .cluster
         .get::<NodeSpec>(env.node)
@@ -1193,6 +1199,7 @@ async fn hotplug_maximums_are_stored_only_when_larger_and_wait_for_all_nodes() {
     for (cpu, max_memory) in [
         (json!({ "cores": 1, "max_vcpus": 2 }), Value::Null),
         (json!({ "cores": 1 }), json!(512)),
+        (json!({ "cores": 1, "max_vcpus": 1 }), Value::Null),
     ] {
         req["spec"]["cpu"] = cpu;
         req["spec"]["max_memory_mib"] = max_memory;
@@ -1204,8 +1211,8 @@ async fn hotplug_maximums_are_stored_only_when_larger_and_wait_for_all_nodes() {
             "{body}"
         );
     }
-    req["spec"]["cpu"] = json!({ "cores": 1, "max_vcpus": 1 });
-    req["spec"]["max_memory_mib"] = json!(256);
+    req["spec"]["cpu"] = json!({ "cores": 1 });
+    req["spec"]["max_memory_mib"] = Value::Null;
     let (status, body) = admin.post("/vms", req.clone()).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }

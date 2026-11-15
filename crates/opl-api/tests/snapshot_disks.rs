@@ -372,6 +372,7 @@ async fn unfinished_snapshot_tags_are_removed_at_startup() {
                     description: String::new(),
                     scheduled: false,
                     vm_spec: spec,
+                    hardware: None,
                 },
             );
             s.name = s.id.to_string();

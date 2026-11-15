@@ -422,6 +422,7 @@ async fn local_disk_vms_that_cannot_move_are_reported() {
             description: String::new(),
             scheduled: false,
             vm_spec: vm.spec.clone(),
+            hardware: None,
         },
     );
     snapshot.name = snapshot.id.to_string();
@@ -608,6 +609,7 @@ async fn drain_keeps_a_bundle_whose_partner_cannot_move_its_disks() {
             description: String::new(),
             scheduled: false,
             vm_spec: web.spec.clone(),
+            hardware: None,
         },
     );
     snapshot.name = snapshot.id.to_string();

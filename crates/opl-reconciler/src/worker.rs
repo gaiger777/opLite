@@ -7,6 +7,7 @@ use opl_driver::{ActualState, DriverError, EventKind, Hypervisor, RuntimeStatus,
 use opl_types::hotplug::{self, Step};
 use opl_types::node::{HA_PLACEMENT, HOTPLUG, NodeSpec, all_have};
 use opl_types::runtime::VmRuntimeSpec;
+use opl_types::snapshot::SnapshotSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::vm::{
     Firmware, HaEvict, HaState, PendingChange, PendingReason, PowerState, RestartPolicy,
@@ -1074,10 +1075,13 @@ impl Worker {
                 return Ok(Start::NotStarted);
             }
         }
-        let hardware = self.hardware_at_start(vm);
-        apply_hardware(&mut spec, &hardware);
         // 실패해도 다시 쓰지 않는다.
         let restore = self.restores.lock().unwrap().remove(&self.id);
+        let hardware = match &restore {
+            Some(tag) => self.snapshot_hardware(vm, tag),
+            None => self.hardware_at_start(vm),
+        };
+        apply_hardware(&mut spec, &hardware);
         let started = self.hv.start(&spec, restore.as_deref()).await;
         if started.is_err() {
             self.deactivate_disks(vm).await;
@@ -1172,6 +1176,16 @@ impl Worker {
             .and_then(|n| n.status.hotplug)
             .unwrap_or_default();
         RunningHardware::at_start(&vm.spec, caps, all_have(&nodes, HOTPLUG)).0
+    }
+
+    /// 메모리 스냅샷 `tag`(스냅샷 id)를 불러오며 켤 하드웨어: 메모리를 담을 때 도는 QEMU와 같은 장치여야 하므로
+    /// 스냅샷에 적은 하드웨어로 켠다. 적지 않은 스냅샷(계획 54 전, 롤링 업그레이드 중)은 핫플러그 배치 없이 켠다.
+    fn snapshot_hardware(&self, vm: &Vm, tag: &str) -> RunningHardware {
+        tag.parse::<Uuid>()
+            .ok()
+            .and_then(|id| self.cluster.get::<SnapshotSpec>(id).ok().flatten())
+            .and_then(|s| s.spec.hardware)
+            .unwrap_or_else(|| RunningHardware::legacy(&vm.spec))
     }
 
     /// HA VM을 켜거나 이어서 실행하기 직전에 다시 본다: 리스가 살아 있어야 하고, 로컬 저장소의 VM이

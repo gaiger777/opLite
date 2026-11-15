@@ -461,6 +461,24 @@ impl Client {
         self.send(r).await
     }
 
+    /// [`Client::put`]와 같되 응답 헤더 `orbivisor-task`(있으면)도 돌려준다.
+    pub async fn put_task(&self, path: &str, body: Value) -> (StatusCode, Option<String>, Value) {
+        let resp = self
+            .req(reqwest::Method::PUT, path)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let task = resp
+            .headers()
+            .get("orbivisor-task")
+            .map(|v| v.to_str().unwrap().to_string());
+        let text = resp.text().await.unwrap();
+        let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        (status, task, body)
+    }
+
     pub async fn patch(
         &self,
         path: &str,

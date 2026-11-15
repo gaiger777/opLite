@@ -380,6 +380,7 @@ async fn local_disks_of_a_vm_with_snapshots_are_not_moved() {
                 description: String::new(),
                 scheduled: false,
                 vm_spec: vm.spec.clone(),
+                hardware: None,
             },
         );
         snapshot.name = snapshot.id.to_string();

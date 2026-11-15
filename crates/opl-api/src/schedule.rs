@@ -19,7 +19,9 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::snapshots::{start_create, start_delete, vm_placement, vm_uses_block_snapshots};
+use crate::snapshots::{
+    memory_as_booted, start_create, start_delete, vm_placement, vm_uses_block_snapshots,
+};
 use crate::state::AppState;
 
 #[derive(Debug, Clone)]
@@ -208,7 +210,12 @@ fn plan(
     let running = vm.status.phase == VmPhase::Running;
     Some(Plan::Create {
         name: auto_name(now, snapshots),
-        memory: schedule.memory && running && !vm.spec.disks.is_empty() && !block_disks,
+        // 실행 중에 바꾼 하드웨어나 보류가 있으면 디스크만(되돌리기가 켤 때 모양으로 켠다).
+        memory: schedule.memory
+            && running
+            && !vm.spec.disks.is_empty()
+            && !block_disks
+            && memory_as_booted(vm, tasks),
     })
 }
 
@@ -377,7 +384,9 @@ mod tests {
     use opl_types::resource::Resource;
     use opl_types::snapshot::SnapshotStatus;
     use opl_types::task::{TaskState, TaskStatus};
-    use opl_types::vm::{CpuSpec, DiskBus, DiskSpec, MachineType, PowerState, SnapshotSchedule};
+    use opl_types::vm::{
+        CpuSpec, DiskBus, DiskSpec, MachineType, PowerState, RunningHardware, SnapshotSchedule,
+    };
 
     use super::*;
 
@@ -432,6 +441,7 @@ mod tests {
                 description: String::new(),
                 scheduled,
                 vm_spec: vm.spec.clone(),
+                hardware: None,
             },
         );
         s.status = SnapshotStatus {
@@ -669,6 +679,24 @@ mod tests {
             super::plan(NOW, HOUR, &v, &[], &[], &Attempts::default(), true),
             create("auto-20261027-0507", false)
         );
+    }
+
+    /// 실행 중에 바꾼 하드웨어나 보류가 있거나 핫플러그 Task가 끝나지 않았으면 디스크만 찍는다.
+    #[test]
+    fn memory_only_with_the_hardware_as_booted() {
+        let mut v = vm(ScheduleEvery::Hourly, 3, true);
+        let (mut hw, _) = RunningHardware::at_start(&v.spec, Default::default(), true);
+        v.status.hardware = Some(hw.clone());
+        let memory = create("auto-20261027-0507", true);
+        let disks = create("auto-20261027-0507", false);
+        assert_eq!(plan(NOW, HOUR, &v, &[], &[]), memory);
+        let hot = task(TaskOp::VmHotplug, v.id, TaskState::Running);
+        assert_eq!(plan(NOW, HOUR, &v, &[], std::slice::from_ref(&hot)), disks);
+        let done = task(TaskOp::VmHotplug, v.id, TaskState::Succeeded);
+        assert_eq!(plan(NOW, HOUR, &v, &[], &[done]), memory);
+        hw.layout.as_mut().unwrap().vcpus = 2;
+        v.status.hardware = Some(hw);
+        assert_eq!(plan(NOW, HOUR, &v, &[], &[]), disks);
     }
 
     #[test]

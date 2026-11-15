@@ -27,6 +27,9 @@ pub const MIN_REVISION: HeaderName = HeaderName::from_static("orbivisor-min-revi
 /// 응답 헤더: 답한 노드가 적용한 리비전
 pub const REVISION: HeaderName = HeaderName::from_static("orbivisor-revision");
 
+/// 응답 헤더: 요청이 만든 Task의 id(실행 중인 VM의 하드웨어를 바꾼 `PUT /vms/{key}`의 핫플러그 Task)
+pub const TASK: HeaderName = HeaderName::from_static("orbivisor-task");
+
 /// `Orbivisor-Min-Revision`을 기다리는 최대 시간
 pub const MIN_REVISION_WAIT: Duration = Duration::from_secs(5);
 

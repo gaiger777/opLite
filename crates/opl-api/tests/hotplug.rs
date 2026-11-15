@@ -1,6 +1,7 @@
 //! 핫플러그 Task(`vm-hotplug`, 계획 54): 실행 중인 VM의 vCPU·메모리·디스크·NIC를 Mock 하이퍼바이저로 바꾸고 실행 중
 //! 하드웨어 기록(`status.hardware`)과 보류를 남기며, 실패하면 스펙의 장치 목록을 되돌린다. `actions/hotplug`의 거절,
-//! 마이그레이션과의 배타, VM 줄. 스펙은 저장소에 바로 쓴다(`PUT`의 실행 중 적용은 스테이지 6).
+//! 마이그레이션과의 배타, VM 줄. `PUT /vms/{key}`의 실행 중 적용(헤더 `orbivisor-task`, 409들, 미할당 메모리)과 메모리
+//! 스냅샷 제한.
 
 mod common;
 
@@ -39,7 +40,15 @@ async fn set_hotplug(env: &Env, node: Uuid, caps: NodeHotplug) {
 /// 이 노드의 능력이 `caps`이고 Task 실행기가 가짜 저장소를 쓰는 환경과 dir 풀 `local`의 Ready 볼륨 `boot`·`data`·
 /// `extra`(qcow2)
 async fn setup(caps: NodeHotplug) -> (Env, Arc<FakeStorage>) {
-    let mut env = Env::start().await;
+    setup_with(caps, |_| {}).await
+}
+
+/// [`setup`]과 같되 `tweak`으로 reconciler 설정을 바꾼다.
+async fn setup_with(
+    caps: NodeHotplug,
+    tweak: impl FnOnce(&mut opl_reconciler::ReconcilerConfig),
+) -> (Env, Arc<FakeStorage>) {
+    let mut env = Env::start_with(tweak, |_| async {}).await;
     set_hotplug(&env, env.node, caps).await;
     let pool = Resource::new(
         "local",
@@ -824,4 +833,550 @@ async fn a_hotplug_task_waits_for_the_snapshot_before_it() {
     assert!(env.hv.hotplug_calls().is_empty());
     assert_eq!(vm(&env, id).status.phase, VmPhase::Stopped);
     assert_eq!(vm(&env, id).spec.power, PowerState::Stopped);
+}
+
+/// 저장소의 스펙을 `f`로 고쳐 `PUT /vms/{id}`로 보낸다: (상태, 응답 헤더 `orbivisor-task`, 본문)
+async fn put(
+    env: &Env,
+    admin: &Client,
+    id: Uuid,
+    f: impl Fn(&mut VmSpec),
+) -> (StatusCode, Option<String>, Value) {
+    let current = vm(env, id);
+    let mut spec = current.spec.clone();
+    f(&mut spec);
+    admin
+        .put_task(
+            &format!("/vms/{id}"),
+            json!({ "labels": current.labels, "spec": spec }),
+        )
+        .await
+}
+
+/// 하드웨어를 바꾼 PUT: 200과 핫플러그 Task(끝까지 기다린 모습)
+async fn put_hot(env: &Env, admin: &Client, id: Uuid, f: impl Fn(&mut VmSpec)) -> Value {
+    let (status, task, body) = put(env, admin, id, f).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let task = task.expect("no orbivisor-task header");
+    admin.wait_task(&json!({ "id": task })).await
+}
+
+/// 409와 그 코드·메시지
+async fn put_conflict(
+    env: &Env,
+    admin: &Client,
+    id: Uuid,
+    f: impl Fn(&mut VmSpec),
+) -> (String, String) {
+    let (status, task, body) = put(env, admin, id, f).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(task, None);
+    (
+        body["code"].as_str().unwrap().to_string(),
+        body["message"].as_str().unwrap().to_string(),
+    )
+}
+
+/// 이 노드가 `hotplug`를 알리는지 정한다(옛 노드 흉내).
+async fn set_feature(env: &Env, on: bool) {
+    let mut n = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    n.status.features.retain(|f| f != HOTPLUG);
+    if on {
+        n.status.features.push(HOTPLUG.into());
+    }
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &n.status)
+        .await
+        .unwrap();
+}
+
+/// 실행 중인 VM의 cores를 상한 안에서 바꾸면 PUT이 핫플러그 Task를 만들고 그 id를 헤더로 준다. 상한 밖은 검증
+/// 400이거나(상한을 넘는 cores) 보류다.
+#[tokio::test]
+async fn put_applies_vcpus_while_running() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+
+    let task = put_hot(&env, &admin, id, |s| s.cpu.cores = 4).await;
+    succeeded(&task);
+    assert_eq!(task["spec"]["op"]["kind"], "vm-hotplug", "{task}");
+    assert_eq!(env.hv.vcpus(id), Some(4));
+    assert!(hardware(&env, id).pending.is_empty());
+
+    let (status, _, body) = put(&env, &admin, id, |s| s.cpu.cores = 9).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["message"],
+        "cpu.max_vcpus must be at least cpu.sockets × cpu.cores (9)"
+    );
+
+    // 상한을 올리면 켤 때 상한 밖의 vCPU와 새 상한이 다음 재시작 때 적용된다.
+    let task = put_hot(&env, &admin, id, |s| {
+        s.cpu.cores = 9;
+        s.cpu.max_vcpus = Some(16);
+    })
+    .await;
+    succeeded(&task);
+    assert_eq!(env.hv.vcpus(id), Some(4));
+    let pending = hardware(&env, id).pending;
+    let reason = |field: &str| pending.iter().find(|p| p.field == field).map(|p| p.reason);
+    assert_eq!(
+        reason("cpu.max_vcpus"),
+        Some(PendingReason::Restart),
+        "{pending:?}"
+    );
+    assert_eq!(reason("vcpus"), Some(PendingReason::Limit), "{pending:?}");
+    let warning = task["status"]["error"].as_str().unwrap();
+    assert!(warning.starts_with("pending until restart: "), "{warning}");
+}
+
+/// 소켓·펌웨어처럼 켤 때만 정해지는 것은 Task가 성공하고 경고와 `restart` 보류로 남는다.
+#[tokio::test]
+async fn put_leaves_restart_changes_pending() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+
+    let task = put_hot(&env, &admin, id, |s| s.cpu.sockets = 2).await;
+    succeeded(&task);
+    let hw = hardware(&env, id);
+    assert_eq!(hw.pending.len(), 1, "{hw:?}");
+    assert_eq!(hw.pending[0].field, "cpu");
+    assert_eq!(hw.pending[0].reason, PendingReason::Restart);
+
+    let task = put_hot(&env, &admin, id, |s| {
+        s.cpu.sockets = 1;
+        s.firmware = opl_types::vm::Firmware::Bios;
+    })
+    .await;
+    succeeded(&task);
+    assert_eq!(
+        task["status"]["error"],
+        "pending until restart: firmware (restart)"
+    );
+    let hw = hardware(&env, id);
+    assert_eq!(hw.pending.len(), 1, "{hw:?}");
+    assert_eq!(hw.pending[0].field, "firmware");
+}
+
+/// 메모리를 바로 늘리려면 VM이 도는 노드에 그만큼 미할당 메모리가 있어야 한다.
+#[tokio::test]
+async fn put_needs_unallocated_memory_to_grow_memory() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+    let mut n = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    n.status.memory_mib = 2048;
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &n.status)
+        .await
+        .unwrap();
+
+    let (code, message) = put_conflict(&env, &admin, id, |s| s.memory_mib = 4096).await;
+    assert_eq!(code, "no_capacity");
+    assert!(
+        message.contains("has only 1024 MiB of unallocated memory"),
+        "{message}"
+    );
+    assert_eq!(vm(&env, id).spec.memory_mib, 1024);
+
+    succeeded(&put_hot(&env, &admin, id, |s| s.memory_mib = 2048).await);
+    assert_eq!(env.hv.plugged_mib(id), Some(1024));
+}
+
+/// 디스크는 끝에 붙이고 실행 중 붙인 것만 뗀다. 나머지 디스크 변경은 409 `vm_running`이다.
+#[tokio::test]
+async fn put_adds_and_removes_disks_at_the_end_only() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+
+    succeeded(&put_hot(&env, &admin, id, |s| s.disks.push(disk("data"))).await);
+    assert!(env.hv.devices(id).contains(&"disk1-dev".to_string()));
+    succeeded(&put_hot(&env, &admin, id, |s| s.disks.push(disk("extra"))).await);
+
+    let refused = [
+        (
+            Box::new(|s: &mut VmSpec| s.disks.clear()) as Box<dyn Fn(&mut VmSpec)>,
+            "cannot remove disk \"boot\" of VM \"web\" while it is running; only disks and NICs added at the end can be removed while it runs; stop it first",
+        ),
+        (
+            Box::new(|s: &mut VmSpec| {
+                s.disks.remove(1);
+            }),
+            "cannot remove disk \"data\" from the middle of VM \"web\" while it is running; only disks and NICs added at the end can be removed while it runs; stop it first",
+        ),
+        (
+            Box::new(|s: &mut VmSpec| s.disks.swap(1, 2)),
+            "cannot reorder the disks of VM \"web\" while it is running; only disks and NICs added at the end can be removed while it runs; stop it first",
+        ),
+    ];
+    for (f, message) in refused {
+        let (code, got) = put_conflict(&env, &admin, id, f).await;
+        assert_eq!((code.as_str(), got.as_str()), ("vm_running", message));
+    }
+    // SATA 디스크는 루트 포트에 붙이지 않는다.
+    succeeded(
+        &put_hot(&env, &admin, id, |s| {
+            s.disks.pop();
+        })
+        .await,
+    );
+    let (code, message) = put_conflict(&env, &admin, id, |s| {
+        s.disks.push(DiskSpec {
+            bus: DiskBus::Sata,
+            ..disk("extra")
+        })
+    })
+    .await;
+    assert_eq!(code, "vm_running");
+    assert!(
+        message.starts_with("SATA disks cannot be added while the VM is running"),
+        "{message}"
+    );
+
+    // 실행 중 붙인 것은 뗀다.
+    succeeded(
+        &put_hot(&env, &admin, id, |s| {
+            s.disks.pop();
+        })
+        .await,
+    );
+    assert!(!env.hv.devices(id).contains(&"disk1-dev".to_string()));
+    assert_eq!(vm(&env, id).spec.disks, [disk("boot")]);
+}
+
+/// 루트 포트 8개를 다 쓰면 더 붙이지 못한다. NIC의 모델·네트워크 바꾸기는 409 `vm_running`(전에는 다음 시작부터)이고,
+/// 장치가 아닌 것(레이블·재시작 정책)만 바꾸면 Task가 없다.
+#[tokio::test]
+async fn put_refuses_nic_changes_and_a_ninth_device() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+
+    let (code, message) = put_conflict(&env, &admin, id, |s| {
+        s.nics[0].model = NicModel::E1000e;
+    })
+    .await;
+    assert_eq!(code, "vm_running");
+    assert!(
+        message.starts_with("cannot change NIC 0 of VM \"web\" while it is running"),
+        "{message}"
+    );
+
+    succeeded(
+        &put_hot(&env, &admin, id, |s| {
+            s.nics.extend((10..18).map(user_nic));
+        })
+        .await,
+    );
+    assert_eq!(hardware(&env, id).layout.unwrap().nic_ports.len(), 8);
+    let (code, message) = put_conflict(&env, &admin, id, |s| s.disks.push(disk("data"))).await;
+    assert_eq!(code, "hotplug_unavailable");
+    assert_eq!(
+        message,
+        "no free hotplug port (8 in use); restart VM \"web\" to add more disks or NICs while it runs"
+    );
+
+    let (status, task, body) = put(&env, &admin, id, |s| {
+        s.restart = opl_types::vm::RestartPolicy::OnFailure;
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(task, None);
+}
+
+/// 핫플러그 없이 켠 VM(기능이 모자랄 때 켬)은 디스크·NIC를 실행 중에 바꾸지 못한다. 기능이 모자란 동안은 지금처럼
+/// 실행 중 cores 변경을 스펙만 받고(Task 없음) 디스크 변경은 409다.
+#[tokio::test]
+async fn put_without_hotplug_keeps_the_old_rules() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    set_feature(&env, false).await;
+    let mut req = vm_request("web");
+    req["spec"]["disks"] = json!([{ "volume": "boot", "bus": "virtio-blk" }]);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    succeeded(&admin.act("web", "start").await);
+    let id = body["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(hardware(&env, id).layout, None);
+
+    let (status, task, body) = put(&env, &admin, id, |s| s.cpu.cores = 2).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(task, None);
+    let (code, message) = put_conflict(&env, &admin, id, |s| s.disks.push(disk("data"))).await;
+    assert_eq!(code, "vm_running");
+    assert_eq!(
+        message,
+        "cannot change the disks of VM \"web\" while it is running; stop it first"
+    );
+    // 도는 하드웨어 기록이 있으면 그룹 없는 NIC의 모델·네트워크도 바꾸지 않는다(마이그레이션 대상이 그 NIC로 켠다).
+    let (code, message) =
+        put_conflict(&env, &admin, id, |s| s.nics[0].model = NicModel::E1000e).await;
+    assert_eq!(code, "vm_running");
+    assert_eq!(
+        message,
+        "cannot change the NICs of VM \"web\" while it is running; only security groups can change"
+    );
+
+    set_feature(&env, true).await;
+    let (code, message) = put_conflict(&env, &admin, id, |s| s.disks.push(disk("data"))).await;
+    assert_eq!(code, "hotplug_unavailable");
+    assert_eq!(
+        message,
+        "VM \"web\" was started without hotplug support; restart it once to add or remove disks and NICs while it runs"
+    );
+}
+
+/// 켜는 중인 VM의 하드웨어는 바꾸지 못하고(409 `vm_busy`), 꺼진 VM은 지금처럼 Task 없이 바뀐다.
+#[tokio::test]
+async fn put_waits_for_a_settled_vm() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let mut req = vm_request("web");
+    req["spec"]["cpu"] = json!({ "cores": 2, "max_vcpus": 8 });
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().parse().unwrap();
+
+    let (status, task, body) = put(&env, &admin, id, |s| {
+        s.cpu.cores = 3;
+        s.disks.push(disk("data"));
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(task, None);
+
+    env.hv.hold_next_start();
+    let (status, start) = admin.post("/vms/web/actions/start", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{start}");
+    tokio::time::timeout(WAIT, env.hv.start_held())
+        .await
+        .expect("start reached");
+    let (code, message) = put_conflict(&env, &admin, id, |s| s.cpu.cores = 4).await;
+    assert_eq!(code, "vm_busy");
+    assert_eq!(
+        message,
+        "VM \"web\" is starting or stopping; change its hardware when it is running or stopped"
+    );
+    env.hv.release_start();
+    succeeded(&admin.wait_task(&start).await);
+}
+
+/// 끝나지 않은 핫플러그 Task가 있으면 하드웨어 PUT은 409 `vm_busy`다(실패한 Task의 되돌리기가 이 변경을 지우지 않게).
+/// 하드웨어가 아닌 변경은 받는다.
+#[tokio::test]
+async fn put_waits_for_the_hotplug_task() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+    let hot = stuck_task(&env, TaskOp::VmHotplug, id).await;
+
+    let (code, message) = put_conflict(&env, &admin, id, |s| s.cpu.cores = 4).await;
+    assert_eq!(code, "vm_busy");
+    assert_eq!(
+        message,
+        format!(
+            "a hardware change of VM \"web\" is still being applied (task {}); try again when it finishes",
+            hot.id
+        )
+    );
+    let (status, task, body) = put(&env, &admin, id, |s| s.restart = Default::default()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(task, None);
+}
+
+/// 같은 PUT으로 끄는 VM의 하드웨어 변경은 Task 없이 다음 시작부터다(끄는 중인 QEMU를 바꾸지 않는다).
+#[tokio::test]
+async fn put_that_stops_the_vm_changes_hardware_for_the_next_start() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+
+    let (status, task, body) = put(&env, &admin, id, |s| {
+        s.power = PowerState::Stopped;
+        s.cpu.cores = 4;
+        s.disks.push(disk("data"));
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(task, None);
+    let spec = vm(&env, id).spec;
+    assert_eq!((spec.cpu.cores, spec.disks.len()), (4, 2));
+    assert!(env.hv.hotplug_calls().is_empty());
+}
+
+/// 켜져 있어야 하지만 QEMU가 없는 VM(배정된 노드가 아직 켜지 않음 — 실패·다시 켜기 대기와 같음)은 지금 규칙대로
+/// CPU·메모리 변경을 Task 없이 받고 디스크 변경은 409 `vm_running`이다.
+#[tokio::test]
+async fn put_on_a_vm_without_qemu_keeps_the_old_rules() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let node2 = second_node(&env, ALL).await;
+    let mut req = vm_request("web");
+    req["spec"]["cpu"] = json!({ "cores": 2, "max_vcpus": 8 });
+    req["spec"]["disks"] = json!([{ "volume": "boot", "bus": "virtio-blk" }]);
+    req["spec"]["node"] = json!(node2);
+    req["spec"]["power"] = json!("running");
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(vm(&env, id).status.phase, VmPhase::Stopped);
+
+    let (status, task, body) = put(&env, &admin, id, |s| {
+        s.cpu.cores = 4;
+        s.memory_mib = 512;
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(task, None);
+    let (code, _) = put_conflict(&env, &admin, id, |s| s.disks.push(disk("data"))).await;
+    assert_eq!(code, "vm_running");
+}
+
+/// `hotplug`를 모르는 노드가 있는 동안 핫플러그 배치로 도는 VM은 스냅샷에 하드웨어를 적지 못하므로 메모리 스냅샷이
+/// 409이고, 메모리를 주지 않으면 디스크만 담는다.
+#[tokio::test]
+async fn memory_snapshots_need_every_node_to_record_the_layout() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    running_web(&env, &admin).await;
+    set_feature(&env, false).await;
+
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "m", "memory": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "snapshot_unsupported");
+    assert_eq!(
+        body["message"],
+        "VM \"web\" runs with hotplug support, which cannot be recorded in a snapshot while a node lacks it; take a snapshot without memory or upgrade every node first"
+    );
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "d" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let (_, snapshot) = admin.get("/vms/web/snapshots/d").await;
+    assert_eq!(snapshot["spec"]["memory"], false, "{snapshot}");
+}
+
+/// 실행 중에 바꾼 하드웨어가 있으면 메모리를 주지 않은 스냅샷은 디스크만 담고 메모리 스냅샷은 409다. 다시 켜면
+/// 메모리를 담고 그때의 하드웨어를 스냅샷에 적는다.
+#[tokio::test]
+async fn memory_snapshots_need_the_hardware_as_booted() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+    succeeded(&put_hot(&env, &admin, id, |s| s.cpu.cores = 4).await);
+
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "m", "memory": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "snapshot_unsupported");
+    assert_eq!(
+        body["message"],
+        "VM \"web\" has hardware changed while running or pending changes; restart it to take a snapshot with memory"
+    );
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "d" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let (_, snapshot) = admin.get("/vms/web/snapshots/d").await;
+    assert_eq!(snapshot["spec"]["memory"], false, "{snapshot}");
+
+    succeeded(&admin.act("web", "stop?mode=force").await);
+    succeeded(&admin.act("web", "start").await);
+    let booted = hardware(&env, id);
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "after" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let (_, snapshot) = admin.get("/vms/web/snapshots/after").await;
+    assert_eq!(snapshot["spec"]["memory"], true, "{snapshot}");
+    assert_eq!(
+        snapshot["spec"]["hardware"],
+        serde_json::to_value(&booted).unwrap()
+    );
+}
+
+/// 게스트가 아직 내려 주지 않은 디스크·NIC가 있는 동안 디스크·NIC 목록을 바꾸는 PUT은 409 `vm_busy`다(CPU·메모리만
+/// 바꾸는 PUT은 받는다).
+#[tokio::test]
+async fn put_waits_for_devices_the_guest_still_holds() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+    succeeded(&put_hot(&env, &admin, id, |s| s.disks.push(disk("data"))).await);
+    env.hv.hold_unplug(id, true);
+    failed(
+        &put_hot(&env, &admin, id, |s| {
+            s.disks.pop();
+        })
+        .await,
+    );
+    assert_eq!(hardware(&env, id).unplugging, ["disk1-dev"]);
+
+    let (code, message) = put_conflict(&env, &admin, id, |s| s.disks.push(disk("data"))).await;
+    assert_eq!(code, "vm_busy");
+    assert_eq!(
+        message,
+        "the guest is still releasing disk \"data\" from VM \"web\"; run `vm hotplug` first"
+    );
+    let (status, task, body) = put(&env, &admin, id, |s| s.cpu.cores = 4).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(task.is_some());
+}
+
+/// 끄면서 하드웨어를 바꾸는 PUT도 끝나지 않은 핫플러그 Task를 기다린다.
+#[tokio::test]
+async fn put_that_stops_the_vm_waits_for_the_hotplug_task() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+    stuck_task(&env, TaskOp::VmHotplug, id).await;
+    let (code, _) = put_conflict(&env, &admin, id, |s| {
+        s.power = PowerState::Stopped;
+        s.cpu.cores = 4;
+    })
+    .await;
+    assert_eq!(code, "vm_busy");
+    assert_eq!(vm(&env, id).spec.power, PowerState::Running);
+}
+
+/// 디스크·NIC를 바꾸며 끈 VM은 QEMU가 끝나기 전에 다시 켜지 않는다(도는 QEMU를 이어 쓰면 스펙과 장치가 어긋난다).
+#[tokio::test]
+async fn a_vm_stopping_with_changed_devices_starts_after_it_stops() {
+    // 게스트가 ACPI 끄기를 무시하는 동안 QEMU가 남는다.
+    let (env, _) = setup_with(ALL, |c| c.acpi_timeout = Duration::from_secs(3600)).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+    let (status, task, body) = put(&env, &admin, id, |s| {
+        s.power = PowerState::Stopped;
+        s.disks.push(disk("data"));
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(task, None);
+    assert!(vm(&env, id).status.hardware.is_some());
+
+    let busy = "VM \"web\" is stopping with changed devices; start it after it stops";
+    let (code, message) = put_conflict(&env, &admin, id, |s| s.power = PowerState::Running).await;
+    assert_eq!((code.as_str(), message.as_str()), ("vm_busy", busy));
+    let (status, body) = admin.post("/vms/web/actions/start", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["message"], busy);
+
+    env.hv.guest_shutdown(id);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while vm(&env, id).status.hardware.is_some() {
+        assert!(tokio::time::Instant::now() < deadline, "not stopped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    succeeded(&admin.act("web", "start").await);
+    assert_eq!(hardware(&env, id).disks, [disk("boot"), disk("data")]);
 }

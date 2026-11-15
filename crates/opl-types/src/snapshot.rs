@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::resource::{Kind, Resource, ResourceSpec};
-use crate::vm::VmSpec;
+use crate::vm::{RunningHardware, VmSpec};
 
 /// 리소스 이름은 id 문자열이다(클러스터 전체에서 고유). 사용자 이름은 `spec.name`이고 VM 안에서 고유하다.
 /// 디스크 안의 qcow2 태그도 id 문자열이다.
@@ -30,6 +30,11 @@ pub struct SnapshotSpec {
     pub scheduled: bool,
     /// 만든 순간의 VM 스펙
     pub vm_spec: VmSpec,
+    /// 메모리 스냅샷이면 그때 도는 QEMU의 하드웨어(계획 54, 모든 노드가 `hotplug`일 때만). 메모리를 불러오려면 같은
+    /// 장치로 켜야 하므로 되돌리기는 이 모양(핫플러그 배치 있음·없음, 상한)으로 켠다. 없으면 배치 없이 켠다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub hardware: Option<RunningHardware>,
 }
 
 impl ResourceSpec for SnapshotSpec {
@@ -88,6 +93,31 @@ mod tests {
         assert_eq!(spec.vm_spec.disks[0].volume, "web-root");
 
         let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(serde_json::from_value::<SnapshotSpec>(json).unwrap(), spec);
+    }
+
+    /// 하드웨어 기록이 없으면 옛 모양 그대로 쓰고, 있으면 왕복한다.
+    #[test]
+    fn hardware_is_written_only_when_recorded() {
+        let mut spec: SnapshotSpec = serde_json::from_value(serde_json::json!({
+            "vm": Uuid::now_v7(),
+            "name": "a",
+            "memory": true,
+            "vm_spec": vm_spec()
+        }))
+        .unwrap();
+        assert_eq!(spec.hardware, None);
+        assert!(
+            serde_json::to_value(&spec)
+                .unwrap()
+                .get("hardware")
+                .is_none()
+        );
+
+        let (hw, _) = RunningHardware::at_start(&spec.vm_spec, Default::default(), true);
+        spec.hardware = Some(hw);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["hardware"]["layout"]["ports"], 8);
         assert_eq!(serde_json::from_value::<SnapshotSpec>(json).unwrap(), spec);
     }
 
