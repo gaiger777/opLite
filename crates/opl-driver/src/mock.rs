@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, AddOutcome, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind,
-    Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
+    Hypervisor, HypervisorEvent, RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
     IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress, MirrorTarget,
@@ -85,6 +85,10 @@ pub struct MockHypervisor {
     incoming_wait_reached: Notify,
     /// 멈춘 `incoming_wait`를 놓아준다
     incoming_wait_released: Notify,
+    /// 멈춘 `set_vcpus`가 들어왔다
+    hotplug_reached: Notify,
+    /// 멈춘 `set_vcpus`를 놓아준다
+    hotplug_released: Notify,
 }
 
 #[derive(Default)]
@@ -198,8 +202,12 @@ struct MockState {
     hotplug_caps: Option<NodeHotplug>,
     /// 떼기·줄이기를 게스트가 내려 주지 않는 VM(시간 제한 길)
     hold_unplug: HashSet<Uuid>,
+    /// QEMU가 vCPU 떼기를 거절하는 VM(게스트가 vCPU 떼기를 켜지 않은 q35)
+    refuse_vcpu_unplug: HashSet<Uuid>,
     /// 다음 핫플러그 호출 한 번을 이 문구의 QMP 오류로 실패시킨다(아무것도 바꾸지 않는다).
     fail_next_hotplug: Option<String>,
+    /// 다음 `set_vcpus` 한 번이 `release_hotplug`까지 멈춘다.
+    hold_next_hotplug: bool,
     /// 핫플러그 호출(실패 포함)
     hotplug_calls: Vec<HotplugCall>,
     /// `save_hardware`로 남긴 하드웨어 기록. VM이 꺼지면 사라진다.
@@ -221,6 +229,8 @@ impl Default for MockHypervisor {
             mirror_released: Notify::new(),
             incoming_wait_reached: Notify::new(),
             incoming_wait_released: Notify::new(),
+            hotplug_reached: Notify::new(),
+            hotplug_released: Notify::new(),
         }
     }
 }
@@ -598,6 +608,22 @@ impl MockHypervisor {
         self.state.lock().unwrap().incoming_specs.clone()
     }
 
+    /// 다음 `set_vcpus` 한 번을 들어온 곳에서 멈춘다(`hotplug_reached`로 기다리고 `release_hotplug`로 놓는다). 그
+    /// 사이 VM을 다시 켜는 일을 흉내 낸다.
+    pub fn hold_next_hotplug(&self) {
+        self.state.lock().unwrap().hold_next_hotplug = true;
+    }
+
+    /// 멈춘 `set_vcpus`가 들어올 때까지 기다린다.
+    pub async fn hotplug_reached(&self) {
+        self.hotplug_reached.notified().await;
+    }
+
+    /// 멈춘 `set_vcpus`를 놓아준다.
+    pub fn release_hotplug(&self) {
+        self.hotplug_released.notify_one();
+    }
+
     /// `hotplug_caps`가 돌려줄 능력을 정한다(기본은 vCPU·메모리 모두).
     pub fn set_hotplug_caps(&self, caps: NodeHotplug) {
         self.state.lock().unwrap().hotplug_caps = Some(caps);
@@ -606,6 +632,16 @@ impl MockHypervisor {
     /// `save_hardware`로 남긴 기록을 지운다(기록 파일 없이 도는 VM — 계획 54 전에 켬).
     pub fn forget_saved_hardware(&self, id: Uuid) {
         self.state.lock().unwrap().saved_hardware.remove(&id);
+    }
+
+    /// 이 VM의 QEMU가 vCPU 떼기를 거절하게 하거나(true, 게스트가 vCPU 떼기를 켜지 않은 q35) 되돌린다(false).
+    pub fn refuse_vcpu_unplug(&self, id: Uuid, refuse: bool) {
+        let mut st = self.state.lock().unwrap();
+        if refuse {
+            st.refuse_vcpu_unplug.insert(id);
+        } else {
+            st.refuse_vcpu_unplug.remove(&id);
+        }
     }
 
     /// 이 VM의 게스트가 떼기·줄이기를 내려 주지 않게 하거나(true) 되돌린다(false). `set_vcpus`·`set_memory`의
@@ -1453,7 +1489,12 @@ impl Hypervisor for MockHypervisor {
         from: u16,
         to: u16,
         _timeout: Duration,
-    ) -> Result<u16, DriverError> {
+    ) -> Result<VcpuChange, DriverError> {
+        let hold = std::mem::take(&mut self.state.lock().unwrap().hold_next_hotplug);
+        if hold {
+            self.hotplug_reached.notify_one();
+            self.hotplug_released.notified().await;
+        }
         let mut st = self.state.lock().unwrap();
         Self::hotplug_call(&mut st, HotplugCall::SetVcpus { id, from, to })?;
         let (boot, max) = (cpu.vcpus(), cpu.max());
@@ -1463,11 +1504,16 @@ impl Hypervisor for MockHypervisor {
             )));
         }
         let held = st.hold_unplug.contains(&id);
+        let refused = st.refuse_vcpu_unplug.contains(&id);
         let hot = st.hot.entry(id).or_default();
-        if to > hot.vcpus || !held {
+        let shrink = to < hot.vcpus;
+        if !shrink || !held && !refused {
             hot.vcpus = to;
         }
-        Ok(hot.vcpus)
+        Ok(VcpuChange {
+            reached: hot.vcpus,
+            refused: shrink && refused,
+        })
     }
 
     /// virtio-mem이 없는 VM은 실제 QEMU처럼 `DeviceNotFound`, 크기를 넘으면 오류다.
@@ -2504,7 +2550,10 @@ mod tests {
         assert_eq!(hv.plugged_mib(vm.id), Some(1024));
         assert_eq!(hv.devices(vm.id), ["disk0-dev", "disk1-dev", "nic0"]);
 
-        assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 3, 5, t).await.unwrap(), 5);
+        assert_eq!(
+            hv.set_vcpus(vm.id, &vm.cpu, 3, 5, t).await.unwrap().reached,
+            5
+        );
         assert!(hv.set_vcpus(vm.id, &vm.cpu, 5, 1, t).await.is_err());
         assert_eq!(hv.set_memory(vm.id, 3072, t).await.unwrap(), 3072);
         assert!(hv.set_memory(vm.id, 3074, t).await.is_err());
@@ -2529,7 +2578,10 @@ mod tests {
         hv.hold_unplug(vm.id, true);
         assert!(!hv.remove_disk(vm.id, 2, t).await.unwrap());
         assert!(!hv.remove_nic(vm.id, 1, t).await.unwrap());
-        assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 5, 2, t).await.unwrap(), 5);
+        assert_eq!(
+            hv.set_vcpus(vm.id, &vm.cpu, 5, 2, t).await.unwrap().reached,
+            5
+        );
         assert_eq!(hv.set_memory(vm.id, 0, t).await.unwrap(), 3072);
         assert_eq!(hv.devices(vm.id).len(), 5);
         hv.hold_unplug(vm.id, false);
@@ -2537,7 +2589,10 @@ mod tests {
         assert!(hv.remove_nic(vm.id, 1, t).await.unwrap());
         // 이미 없는 장치는 뗀 것이다.
         assert!(hv.remove_nic(vm.id, 1, t).await.unwrap());
-        assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 5, 2, t).await.unwrap(), 2);
+        assert_eq!(
+            hv.set_vcpus(vm.id, &vm.cpu, 5, 2, t).await.unwrap().reached,
+            2
+        );
         assert_eq!(hv.backup_bitmaps(vm.id).await.unwrap().len(), 2);
 
         // 주입한 실패는 아무것도 바꾸지 않는다.

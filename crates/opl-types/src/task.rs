@@ -147,6 +147,9 @@ pub enum TaskOp {
         bond: String,
         ports: Vec<String>,
     },
+    /// 실행 중인 대상 VM의 하드웨어(vCPU·메모리·디스크·NIC)를 지금 스펙에 맞춘다(핫플러그). 실행 중에 할 수
+    /// 없는 것은 VM `status.hardware.pending`에 남긴다. VM의 노드에서 돈다.
+    VmHotplug,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -528,6 +531,16 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<TaskOp>(json).unwrap(),
             TaskOp::NodeDrain
+        );
+    }
+
+    #[test]
+    fn vm_hotplug_op_is_tagged_by_kind() {
+        let json = serde_json::json!({ "kind": "vm-hotplug" });
+        assert_eq!(serde_json::to_value(TaskOp::VmHotplug).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<TaskOp>(json).unwrap(),
+            TaskOp::VmHotplug
         );
     }
 

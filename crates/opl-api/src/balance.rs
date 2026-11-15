@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use opl_cluster::Leases;
+use opl_types::hotplug;
 use opl_types::node::Node;
 use opl_types::placement::{MoveReason, RuleKind};
 use opl_types::settings::{PlacementMode, PlacementPolicy, PlacementSettings};
@@ -321,7 +322,8 @@ fn recent(at: u64, now: u64) -> bool {
 
 /// 균형 조정기가 이 VM을 옮길 수 있는지. 아니면 그 이유다(시험·debug 로그).
 /// 자리 잡고 실행 중이고 마이그레이션 중이 아니며, 고정(`pinned`)이 아니고, 로컬 풀 디스크가 없고, 끝나지 않은
-/// 스냅샷·되돌리기·복제·백업·전원·마이그레이션·디스크 크기 늘리기 Task가 없고, HA 끄기 요청·옮겨 달라는 요청이 없고,
+/// 스냅샷·되돌리기·복제·백업·전원·마이그레이션·핫플러그·디스크 크기 늘리기 Task가 없고, 끝나지 않은 하드웨어 변경(스펙의
+/// 디스크·NIC가 도는 장치와 다름, 게스트가 아직 내려 주지 않은 장치)이 없고, HA 끄기 요청·옮겨 달라는 요청이 없고,
 /// 지난 [`VM_COOLDOWN`] 안에 만든 마이그레이션 Task·HA 복구 기록(`vm-ha-recover`)·HA 옮기기(`ha.relocations`)·이
 /// 리더의 옮기기(`moved`)가 없고, 자리 잡은 hard `affinity` 상대가 없다(묶음은 옮기지 않는다).
 pub fn movable(
@@ -363,12 +365,21 @@ pub fn movable(
                         | TaskOp::VmForceStop
                         | TaskOp::VmReboot
                         | TaskOp::VmMigrate { .. }
+                        | TaskOp::VmHotplug
                 ))
                 || (disks.contains(&t.spec.target)
                     && matches!(t.spec.op, TaskOp::VolumeResize { .. })))
     });
     if busy {
         return Err("busy with a task");
+    }
+    let unsettled = vm
+        .status
+        .hardware
+        .as_ref()
+        .is_some_and(|hw| !hw.unplugging.is_empty() || !hotplug::devices_match(&vm.spec, hw));
+    if unsettled {
+        return Err("hardware change not finished");
     }
     let ha = vm.status.ha.as_ref();
     if ha.is_some_and(|h| h.evict.is_some() || h.relocate_from.is_some()) {
@@ -426,8 +437,8 @@ pub fn live(node: &Node, leases: &Leases, now: Instant, b: Instant) -> bool {
         .is_some_and(|at| now.saturating_duration_since(*at) < LOAD_STALE)
 }
 
-/// 균형 옮기기의 대상 조건: 원본·대상이 HVF가 아니고, 대상에 VM 메모리만큼 미할당 메모리(`free_mib` — 계획한
-/// 옮기기 반영)가 있고, 노드 조건([`node_fits`])에 맞고, 이 VM에 영향을 주는 HA 검사가 실패한 노드가 아니고,
+/// 균형 옮기기의 대상 조건: 원본·대상이 HVF가 아니고, 대상에 VM 메모리(도는 메모리가 더 크면 그것 —
+/// [`hotplug::allocated_memory_mib`])만큼 미할당 메모리(`free_mib` — 계획한 옮기기 반영)가 있고, 노드 조건([`node_fits`])에 맞고, VM이 도는 하드웨어(핫플러그 배치)로 켤 수 있고, 이 VM에 영향을 주는 HA 검사가 실패한 노드가 아니고,
 /// `assign`(계획한 옮기기)으로 hard 규칙을 어기지 않고, soft 벌점이 지금보다 늘지 않고, HA 그룹 VM은 그룹 우선순위가
 /// 지금 노드 이상이다(되돌아가기와 핑퐁하지 않게). `ha_reserve`는 메모리 합이라 옮겨도 바뀌지 않아 보지 않는다.
 pub fn target_ok(
@@ -445,11 +456,14 @@ pub fn target_ok(
     if from.status.hypervisor == HVF || to.status.hypervisor == HVF {
         return Err("macOS (HVF) node");
     }
-    if free_mib < i64::from(vm.spec.memory_mib) {
+    if free_mib < i64::from(hotplug::allocated_memory_mib(vm)) {
         return Err("not enough unassigned memory");
     }
     if node_fits(&vm.spec, inv, to).is_err() {
         return Err("node does not fit");
+    }
+    if hotplug::can_receive(vm.status.hardware.as_ref(), to).is_err() {
+        return Err("cannot run the VM's running hardware");
     }
     if health.blocks(vm, to, inv) {
         return Err("a failing HA check affects the VM");
@@ -927,7 +941,7 @@ mod tests {
     use opl_cluster::LoadReport;
     use opl_cluster::types::NodeId;
     use opl_types::ha_check::{CheckReport, CheckState, HaCheckRole, HaCheckSpec, HaCheckTarget};
-    use opl_types::node::{Fencing, NodeHa, NodeSpec, NodeStatus};
+    use opl_types::node::{Fencing, HOTPLUG, NodeHa, NodeHotplug, NodeSpec, NodeStatus};
     use opl_types::placement::{
         HaGroupNode, HaGroupSpec, LoadSummary, PlacementRule, PlacementRuleSpec, VmLoad,
     };
@@ -936,8 +950,8 @@ mod tests {
     use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
     use opl_types::task::{TaskSpec, TaskState};
     use opl_types::vm::{
-        Arch, CpuSpec, DiskBus, DiskSpec, HaEvict, MachineType, VmHa, VmHaStatus, VmPlacement,
-        VmSpec,
+        Arch, CpuSpec, DiskBus, DiskSpec, HaEvict, MachineType, RunningHardware, VmHa, VmHaStatus,
+        VmPlacement, VmSpec,
     };
 
     use super::*;
@@ -1341,14 +1355,14 @@ mod tests {
             Err("has disks on a node-local pool")
         );
 
-        // 끝나지 않은 백업·스냅샷·크기 늘리기 Task가 있으면 옮기지 않고, 끝난 것은 상관없다.
+        // 끝나지 않은 백업·스냅샷·핫플러그·크기 늘리기 Task가 있으면 옮기지 않고, 끝난 것은 상관없다.
         let backup = TaskOp::VmBackup {
             backup: Uuid::nil(),
         };
         let snapshot = TaskOp::SnapshotCreate {
             snapshot: Uuid::nil(),
         };
-        for op in [backup.clone(), snapshot] {
+        for op in [backup.clone(), snapshot, TaskOp::VmHotplug] {
             let t = task(op, ok.id, TaskState::Running);
             assert_eq!(check(&inv, &ok, &[t], &none), Err("busy with a task"));
         }
@@ -1420,6 +1434,95 @@ mod tests {
         mate.spec.power = PowerState::Stopped;
         inv.vms = vec![bound.clone(), mate];
         assert_eq!(check(&inv, &bound, &[], &none), Ok(()));
+    }
+
+    /// 하드웨어 변경이 끝나지 않은 VM은 옮기지 않고, 대상의 미할당 메모리는 도는 메모리(줄이기 실패로 스펙보다 큼)와
+    /// 견준다.
+    #[test]
+    fn vms_with_unfinished_hardware_changes_stay_and_running_memory_counts() {
+        let (a, b) = (node("a", 4, 8192), node("b", 4, 8192));
+        let mut v = vm("v", 1, 1024, &a);
+        v.spec.max_memory_mib = Some(4096);
+        let all = NodeHotplug {
+            cpu: true,
+            memory: true,
+        };
+        let mut hw = RunningHardware::at_start(&v.spec, all, true).0;
+        let inv = |v: &Vm| Inventory {
+            nodes: vec![a.clone(), b.clone()],
+            vms: vec![v.clone()],
+            ..Default::default()
+        };
+        let none = BTreeMap::new();
+        v.status.hardware = Some(hw.clone());
+        assert_eq!(movable(&v, &inv(&v), &[], &none, 0), Ok(()));
+        hw.unplugging = vec!["cpu1".into()];
+        v.status.hardware = Some(hw.clone());
+        assert_eq!(
+            movable(&v, &inv(&v), &[], &none, 0),
+            Err("hardware change not finished")
+        );
+        hw.unplugging.clear();
+        v.status.hardware = Some(hw.clone());
+        v.spec.disks.push(DiskSpec {
+            volume: "data".into(),
+            bus: DiskBus::VirtioBlk,
+            boot_order: None,
+        });
+        assert_eq!(
+            movable(&v, &inv(&v), &[], &none, 0),
+            Err("hardware change not finished")
+        );
+
+        // 줄이기가 실패해 3072 MiB로 도는 VM은 2048 MiB 남은 노드로 옮기지 않는다.
+        v.spec.disks.clear();
+        hw.layout.as_mut().unwrap().plugged_mib = 2048;
+        v.status.hardware = Some(hw);
+        let reports = BTreeMap::new();
+        let healthy = Health::new(vec![], &reports);
+        let assign = Assign::default();
+        let mut b2 = b.clone();
+        b2.status.features = vec![HOTPLUG.into()];
+        b2.status.hotplug = Some(all);
+        let i = inv(&v);
+        assert_eq!(
+            target_ok(&v, &a, &b2, &i, &assign, &healthy, 2048),
+            Err("not enough unassigned memory")
+        );
+        assert_eq!(target_ok(&v, &a, &b2, &i, &assign, &healthy, 3072), Ok(()));
+    }
+
+    /// 핫플러그 배치(virtio-mem)로 도는 VM은 그 장치로 켤 수 있는 노드로만 옮긴다.
+    #[test]
+    fn targets_that_cannot_run_the_running_hardware_are_not_taken() {
+        let (a, mut b) = (node("a", 4, 8192), node("b", 4, 8192));
+        b.status.features = vec![HOTPLUG.into()];
+        let mut v = vm("v", 1, 1024, &a);
+        v.spec.max_memory_mib = Some(4096);
+        let all = NodeHotplug {
+            cpu: true,
+            memory: true,
+        };
+        v.status.hardware = Some(RunningHardware::at_start(&v.spec, all, true).0);
+        let inv = Inventory {
+            nodes: vec![a.clone(), b.clone()],
+            vms: vec![v.clone()],
+            ..Default::default()
+        };
+        let reports = BTreeMap::new();
+        let healthy = Health::new(vec![], &reports);
+        let none = Assign::default();
+        let ok = |to: &Node| target_ok(&v, &a, to, &inv, &none, &healthy, 8192);
+        b.status.hotplug = Some(NodeHotplug {
+            cpu: true,
+            memory: false,
+        });
+        assert_eq!(ok(&b), Err("cannot run the VM's running hardware"));
+        b.status.hotplug = Some(all);
+        assert_eq!(ok(&b), Ok(()));
+        // 핫플러그를 모르는 노드
+        b.status.features.clear();
+        assert_eq!(ok(&b), Err("cannot run the VM's running hardware"));
     }
 
     #[test]

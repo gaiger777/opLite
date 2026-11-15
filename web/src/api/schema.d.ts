@@ -1533,7 +1533,11 @@ export interface paths {
         put?: never;
         /**
          * `start`와 `stop`은 `spec.power`를 바꾸고, 그 결과를 지켜볼 Task를 돌려준다(202).
-         *     `stop?mode=force`와 `reboot`은 대상 노드의 Task 실행기가 수행한다.
+         *     `stop?mode=force`와 `reboot`은 대상 노드의 Task 실행기가 수행한다. `hotplug`는 실행 중인 VM의 하드웨어를
+         *     지금 스펙에 맞추는 Task(`vm-hotplug`, 실패한 변경 다시 해 보기)다: 모든 노드가 `hotplug`를 알아야 하고(409
+         *     `cluster_upgrading`) 핫플러그 기록이 있는 실행 중 VM이어야 한다(409 `vm_not_running`). 끝나지 않은 스냅샷·되돌리기·
+         *     복제·백업 Task가 있으면 409 `vm_busy`이고, 메모리를 바로 늘리면 VM이 도는 노드에 그만큼 미할당 메모리가 있어야 한다
+         *     (409 `no_capacity`).
          */
         post: operations["vm_action"];
         delete?: never;
@@ -1637,7 +1641,9 @@ export interface paths {
          *     한다. 노드 로컬 풀의 디스크는 대상 노드의 같은 이름의 풀(`pool`을 주면 그 풀)에 복사한다. 그런 디스크가
          *     있으면 모든 노드가 디스크 복사를 알아야 하고(409 `cluster_upgrading`) VM에 스냅샷이 없어야 한다(409
          *     `migration_unsupported`). `pool`을 줬는데 그런 디스크가 없으면 400, 없는 풀이면 404다. HVF(macOS)
-         *     노드는 원본도 대상도 될 수 없다(409 `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나
+         *     노드는 원본도 대상도 될 수 없다(409 `migration_unsupported`). 핫플러그 배치로 도는 VM은 대상이 같은 장치로 켤 수
+         *     있어야 하고(`hotplug` 기능, vCPU 핫플러그, virtio-mem — 아니면 409 `migration_unsupported`), 핫플러그 Task가 끝나지
+         *     않았거나 스펙의 디스크·NIC가 도는 장치와 다르면 409 `vm_busy`다. 대상 노드가 위트니스이거나 오프라인이거나
          *     유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
          *     스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다. 대상 노드가 hard
          *     배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
@@ -6097,6 +6103,9 @@ export interface components {
             /** @enum {string} */
             kind: "bond-degraded";
             ports: string[];
+        } | {
+            /** @enum {string} */
+            kind: "vm-hotplug";
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {
@@ -10342,7 +10351,7 @@ export interface operations {
             path: {
                 /** @description id or name */
                 key: string;
-                /** @description start, stop or reboot */
+                /** @description start, stop, reboot or hotplug */
                 action: string;
             };
             cookie?: never;

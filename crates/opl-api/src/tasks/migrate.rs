@@ -217,7 +217,7 @@ async fn mark_migrating(ctx: &Ctx, id: Uuid, migration: &MigrationStatus) -> Res
     }
 }
 
-/// 마이그레이션을 기록한 뒤 다시 본다: 이 VM의 스냅샷 만들기·되돌리기·복제·백업 Task나 디스크의 크기
+/// 마이그레이션을 기록한 뒤 다시 본다: 이 VM의 스냅샷 만들기·되돌리기·복제·백업·핫플러그 Task나 디스크의 크기
 /// 늘리기 Task가 끝나지 않았으면 실패다. API는 마이그레이션 Task와 이것들을 함께 받지 않지만, 검사와
 /// 기록 사이에 들어온 요청은 지나갔을 수 있다. 같은 VM의 줄에 앞서 선 Task는 이미 끝났다.
 fn check_no_other_task(ctx: &Ctx, vm: &Vm) -> Result<(), String> {
@@ -246,6 +246,7 @@ fn check_no_other_task(ctx: &Ctx, vm: &Vm) -> Result<(), String> {
             TaskOp::VolumeResize { .. } if disks.contains(&t.spec.target) => {
                 "having a disk resized"
             }
+            TaskOp::VmHotplug if t.spec.target == vm.id => "having its hardware changed",
             _ => continue,
         };
         return Err(format!(

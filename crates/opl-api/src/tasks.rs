@@ -6,6 +6,7 @@
 pub(crate) mod backup;
 mod clone;
 mod drain;
+mod hotplug;
 mod import;
 mod migrate;
 mod replicate;
@@ -23,7 +24,7 @@ use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, Hypervisor, Storage};
 use opl_peer::Peers;
-use opl_reconciler::{FirmwareFetcher, ReconcilerHandle};
+use opl_reconciler::{FirewallGate, FirmwareFetcher, ReconcilerHandle};
 use opl_types::backup::{BackupPhase, BackupSpec};
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
@@ -44,7 +45,7 @@ use crate::snapshots::{uses_block_snapshots, vm_placement};
 use crate::state::AppState;
 use crate::updates::Updates;
 use crate::vm_imports::ImportCredentials;
-use crate::vms::is_stopped;
+use crate::vms::{is_stopped, vm_uses_volume};
 use crate::volumes::{block_pool_kind, usable_node};
 
 /// 새 Task를 저장소에 만든다. 이름은 id 문자열이다.
@@ -105,6 +106,11 @@ pub struct TaskRunnerConfig {
     /// 이 노드의 API 상태. 노드 비우기 Task가 마이그레이션 API와 같은 확인으로 Task를 만들 때 쓴다
     /// (이 노드의 API와 `vm_lock`을 함께 쓴다). 없으면 비우기 Task는 실패한다.
     pub api: Option<Arc<AppState>>,
+    /// 핫플러그 Task가 떼기·줄이기에서 게스트가 내려 주기를 기다리는 한도(기본 60초)
+    pub hotplug_timeout: Duration,
+    /// 핫플러그 Task가 보안 그룹을 건 NIC를 붙이기 전에 이 노드의 방화벽 규칙을 넣는다(reconciler가 켤 때와 같음).
+    /// 없으면 그런 NIC는 붙이지 않는다.
+    pub firewall: Option<Arc<dyn FirewallGate>>,
 }
 
 impl TaskRunnerConfig {
@@ -127,6 +133,8 @@ impl TaskRunnerConfig {
             import_credentials: Arc::default(),
             updates: None,
             api: None,
+            hotplug_timeout: Duration::from_secs(60),
+            firewall: None,
         }
     }
 }
@@ -486,10 +494,13 @@ async fn volumes_in_use(ctx: &Ctx) -> Result<(HashSet<Uuid>, HashMap<Uuid, Image
             || (vm.spec.node == Some(me) && vm.spec.power == PowerState::Running)
             || vm.status.migration.as_ref().is_some_and(|m| m.node == me);
         if used {
+            // 떼는 중인 디스크(도는 QEMU에 아직 붙음)도 쓰는 중이다.
+            let held = vm.status.hardware.iter().flat_map(|hw| &hw.disks);
             in_use.extend(
                 vm.spec
                     .disks
                     .iter()
+                    .chain(held)
                     .filter_map(|d| by_name.get(d.volume.as_str())),
             );
         }
@@ -540,7 +551,8 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// VM이 없으면 그 볼륨을 담은 스냅샷의 VM(되돌리면 다시 붙는다), 그것도 없으면 볼륨의 줄이다.
 /// VM 전원 Task는 기다리기만 하므로 줄을 두지 않는다. 강제 종료가 앞의 reboot 뒤에 묶이면 안 된다.
 /// 마이그레이션 Task는 VM의 줄에 선다(앞의 스냅샷·복제가 끝난 뒤 옮긴다). 백업 Task도 VM의 줄에
-/// 선다(임시 스냅샷을 찍고 디스크를 읽는다). 백업 지우기와 복원은 그 백업의 줄에 서서 겹치지 않는다
+/// 선다(임시 스냅샷을 찍고 디스크를 읽는다). 핫플러그 Task도 VM의 줄에 서서 스냅샷·복제·백업·마이그레이션과
+/// 차례로 돈다(장치가 바뀌는 중에 디스크를 담거나 옮기면 안 된다). 백업 지우기와 복원은 그 백업의 줄에 서서 겹치지 않는다
 /// (복원 Task의 대상은 새 VM이다). 복제도 그 백업의 줄에 서서 보내는 동안 지우기가 파일을 지우지
 /// 않는다. VM 가져오기와 가져오기 지우기도 그 가져오기의 줄에 선다(가져오기 Task의 대상은 새 VM이다).
 /// 노드 비우기는 그 노드의 줄에 서서 한 노드를 한 번에 하나만 비운다.
@@ -554,7 +566,10 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     if !matches!(task.spec.op, TaskOp::VolumeResize { .. }) {
         let vm_queue = matches!(
             task.spec.op,
-            TaskOp::VmClone { .. } | TaskOp::VmMigrate { .. } | TaskOp::VmBackup { .. }
+            TaskOp::VmClone { .. }
+                | TaskOp::VmMigrate { .. }
+                | TaskOp::VmBackup { .. }
+                | TaskOp::VmHotplug
         );
         let backup_queue = matches!(
             task.spec.op,
@@ -573,7 +588,7 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     };
     let uses = |spec: &VmSpec| spec.disks.iter().any(|d| d.volume == volume.name);
     if let Ok((_, vms)) = ctx.cluster.list::<VmSpec>()
-        && let Some(vm) = vms.iter().find(|vm| uses(&vm.spec))
+        && let Some(vm) = vms.iter().find(|vm| vm_uses_volume(vm, &volume.name))
     {
         return Some(vm.id);
     }
@@ -834,6 +849,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             None => Err("updates are not enabled on this node".into()),
         },
         TaskOp::NodeDrain => drain::drain(ctx, id).await,
+        // 성공해도 다음 재시작 때 적용할 변경이 있으면 경고로 남긴다.
+        TaskOp::VmHotplug => return hotplug::hotplug(ctx, task).await,
     };
     done.map(|()| None)
 }
@@ -1083,6 +1100,14 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
         ));
     }
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
+    if let Some(vm) = vms.iter().find(|vm| {
+        vm_uses_volume(vm, &volume.name) && !vm.spec.disks.iter().any(|d| d.volume == volume.name)
+    }) {
+        return Err(format!(
+            "volume {:?} is still being released by VM {:?}; run `vm hotplug` or restart the VM",
+            volume.name, vm.name
+        ));
+    }
     let user = vms.iter().find_map(|vm| {
         let disk = vm.spec.disks.iter().position(|d| d.volume == volume.name)?;
         Some((vm, disk))
@@ -1160,10 +1185,7 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), RemoveError> {
         return Ok(());
     };
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
-    if let Some(vm) = vms
-        .iter()
-        .find(|vm| vm.spec.disks.iter().any(|d| d.volume == volume.name))
-    {
+    if let Some(vm) = vms.iter().find(|vm| vm_uses_volume(vm, &volume.name)) {
         return Err(format!("volume is attached to VM {:?}", vm.name).into());
     }
     if let Some(pool) = ctx

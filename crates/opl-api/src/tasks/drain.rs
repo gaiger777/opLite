@@ -6,6 +6,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
+use opl_types::hotplug;
 use opl_types::node::{Node, NodeSpec};
 use opl_types::task::{TaskOp, TaskSpec, TaskState};
 use opl_types::vm::{DiskMove, PowerState, Vm, VmPhase, VmSpec};
@@ -348,7 +349,7 @@ fn bundle(vm: &Vm, node: Uuid, inv: &Inventory) -> Vec<Vm> {
 }
 
 /// 묶음(`bundle`, 첫째가 옮길 VM)을 함께 받을 노드: HVF가 아니고, 모든 구성원이 스케줄러의 조건(옮길 디스크
-/// `moves[i]`가 있으면 그 대상 풀)을 지나고, 남은 메모리가 묶음 메모리의 합 이상이며, 묶음을 그 노드에 둔
+/// `moves[i]`가 있으면 그 대상 풀)과 도는 하드웨어를 받을 수 있는지([`hotplug::can_receive`])를 지나고, 남은 메모리가 묶음 메모리의 합 이상이며, 묶음을 그 노드에 둔
 /// [`Assign`]으로 hard 배치 규칙을 어기지 않는 노드 가운데 [`placement::compare`] 순서(첫 VM의 HA 그룹
 /// 우선순위 → 구성원 soft 벌점의 합 → 첫 VM의 부하 점수 → 남은 메모리 → id)로 가장 나은 노드. 스케줄러는
 /// 유지보수 노드(이 노드)를 고르지 않는다. 없으면 조건·메모리는 맞는데 막은 hard 규칙의 이름(이름 순)이다. 규칙에 맞는 노드가 메모리
@@ -365,10 +366,11 @@ fn pick_target(
     let mut no_room = false;
     let mut found = Vec::new();
     for n in inv.nodes.iter().filter(|n| n.status.hypervisor != HVF) {
-        let fits = bundle
-            .iter()
-            .zip(moves)
-            .all(|(v, m)| node_fits_with(&v.spec, inv, n, m).is_ok());
+        // 대상은 구성원이 도는 하드웨어(핫플러그 배치)로 켜야 한다.
+        let fits = bundle.iter().zip(moves).all(|(v, m)| {
+            node_fits_with(&v.spec, inv, n, m).is_ok()
+                && hotplug::can_receive(v.status.hardware.as_ref(), n).is_ok()
+        });
         if !fits {
             continue;
         }

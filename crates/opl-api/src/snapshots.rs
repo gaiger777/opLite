@@ -146,6 +146,25 @@ pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), Ap
     )
 }
 
+/// 이 VM의 핫플러그 Task가 끝나지 않았으면 409 `vm_busy`. 마이그레이션 대상은 원본이 도는 하드웨어로 켜므로
+/// 장치가 바뀌는 중에 옮기면 안 되고, 실패한 Task의 되돌리기가 그사이 바꾼 스펙을 지우지 않게 하드웨어 PUT도 막는다.
+pub(crate) fn check_no_hotplug_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    let busy = tasks.iter().find(|t| {
+        t.spec.target == vm.id && !t.status.state.is_finished() && t.spec.op == TaskOp::VmHotplug
+    });
+    if let Some(t) = busy {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            format!(
+                "a hardware change of VM {:?} is still being applied (task {}); try again when it finishes",
+                vm.name, t.id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 마이그레이션 중인 VM(`migrating`이거나 끝나지 않은 마이그레이션 Task가 있다)은 다른 동작을 받지
 /// 않는다: 409 `vm_busy`. 원본 QEMU를 끄거나 디스크·스펙을 바꾸면 옮기는 중인 VM이 어긋난다.
 pub(crate) fn check_no_migration(state: &AppState, vm: &Vm) -> Result<(), ApiError> {

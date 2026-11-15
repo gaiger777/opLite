@@ -648,7 +648,7 @@ impl Member {
             .then(|| on(&rt.core, || renew_liveness(cluster.clone(), LIVENESS_RENEW)));
         reconciler_config.ha = ha.clone();
         state.ha = ha.clone();
-        reconciler_config.firewall = gate;
+        reconciler_config.firewall = gate.clone();
         let reconciler = on(&rt.work, || {
             Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config)
         });
@@ -685,6 +685,9 @@ impl Member {
         runner_config.migration_disk_timeout = config.migration.disk_timeout;
         // 받는 쪽(IncomingConfig)과 같은 디렉터리다.
         runner_config.migration_disks = Some(config.data_dir.join(MIGRATION_DISKS_DIR));
+        // 핫플러그 Task가 보안 그룹을 건 NIC를 붙이기 전에 규칙을 넣는다(reconciler와 같은 문).
+        runner_config.firewall = gate;
+        runner_config.hotplug_timeout = config.hotplug_timeout();
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
         // 노드 비우기 Task가 이 노드의 API와 같은 확인으로 마이그레이션 Task를 만든다.

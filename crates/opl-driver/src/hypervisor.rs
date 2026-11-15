@@ -99,6 +99,16 @@ pub struct DiskCounters {
     pub wr_operations: u64,
 }
 
+/// vCPU 바꾸기([`Hypervisor::set_vcpus`])의 결과
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VcpuChange {
+    /// 닿은 켜진 vCPU 수
+    pub reached: u16,
+    /// QEMU가 vCPU 떼기 요청을 거절했다(게스트의 ACPI가 vCPU 떼기를 켜지 않음 — QEMU 8.2 q35의 옛 CPU 핫플러그
+    /// 방식). 진행 중인 떼기는 없다.
+    pub refused: bool,
+}
+
 /// 실행 중 붙이기([`Hypervisor::add_disk`]·[`Hypervisor::add_nic`])의 결과
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddOutcome {
@@ -291,7 +301,8 @@ pub trait Hypervisor: Send + Sync {
     /// 핫플러그 배치로 켠 VM의 켜진 vCPU 수를 `from`에서 `to`로 바꾸고 닿은 수를 돌려준다. `cpu`는 켤 때의 CPU
     /// 모양(소켓·상한으로 vCPU `i`의 자리를 정한다)이다. 늘리기(같은 수 포함)는 켤 때 수부터 `to` 아래의 빈 자리에
     /// `cpu{i}`를 붙이고(이미 켜진 자리는 건너뜀 — 게스트가 늦게 내려 준 자리도 다시 붙인다), 줄이기는 큰 번호부터 떼며 게스트가 `timeout` 안에 내려 주지 않으면 거기서 멈춘다(그때 `to`보다
-    /// 크다). 아무것도 바꾸지 못한 오류만 `Err`이고, 몇 개를 바꾼 뒤의 오류는 경고와 함께 닿은 수다. 켤 때 수
+    /// 크다). QEMU가 떼기 요청을 거절하면(게스트가 vCPU 떼기를 켜지 않음) 거기서 멈추고 `refused`다. 아무것도 바꾸지 못한
+    /// 오류만 `Err`이고, 몇 개를 바꾼 뒤의 오류는 경고와 함께 닿은 수다. 켤 때 수
     /// 아래나 상한 위는 `InvalidSpec`이다.
     async fn set_vcpus(
         &self,
@@ -300,7 +311,7 @@ pub trait Hypervisor: Send + Sync {
         from: u16,
         to: u16,
         timeout: Duration,
-    ) -> Result<u16, DriverError>;
+    ) -> Result<VcpuChange, DriverError>;
 
     /// virtio-mem에 꽂을 크기(`requested-size`)를 `plugged_mib`로 바꾸고 닿은 크기(MiB)를 돌려준다. 늘리기는
     /// QEMU가 받으면 그 값이다(게스트 드라이버가 없으면 게스트가 보는 크기는 늘지 않는다). 줄이기는 게스트가

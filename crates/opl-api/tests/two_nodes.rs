@@ -34,7 +34,7 @@ use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role, SessionSpec, UserSpec};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
-use opl_types::node::{FEATURES, Fencing, NodeHa, NodeSpec, NodeStatus, PoolState};
+use opl_types::node::{FEATURES, Fencing, NodeHa, NodeHotplug, NodeSpec, NodeStatus, PoolState};
 use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind, VmLoad};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -729,6 +729,16 @@ async fn the_target_starts_with_the_running_hardware() {
         .update_status_checked::<VmSpec>(vm.id, revision, &status)
         .await
         .unwrap();
+    // 대상은 virtio-mem 배치를 같은 장치로 켤 수 있어야 한다(없으면 409 `migration_unsupported`).
+    let mut node = a.cluster.get::<NodeSpec>(b.id).unwrap().unwrap();
+    node.status.hotplug = Some(NodeHotplug {
+        cpu: false,
+        memory: true,
+    });
+    a.cluster
+        .update_status::<NodeSpec>(b.id, &node.status)
+        .await
+        .unwrap();
 
     let task = migrate(&admin, "node2").await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
@@ -768,6 +778,53 @@ async fn failed_send_keeps_the_vm_running_on_the_source() {
     // 다른 동작이 다시 된다.
     let task = admin.act("web", "reboot").await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
+}
+
+/// 원본 QEMU의 장치가 기록과 다르면 받는 쪽을 켜기 전에(디스크 복사 전에) 멈춘다.
+#[tokio::test]
+async fn devices_are_checked_before_the_target_starts() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let vm = running_vm(&a, &admin).await;
+    wait_vm(&a, vm.id, "running hardware on A", |v| {
+        v.status.hardware.is_some()
+    })
+    .await;
+    // 스펙과 기록에는 있지만 도는 QEMU에는 없는 NIC(시험이 대신 쓴다).
+    loop {
+        let now = a.cluster.get::<VmSpec>(vm.id).unwrap().unwrap();
+        let mut spec = now.spec.clone();
+        let mut nic = spec.nics[0].clone();
+        nic.mac = Some("52:54:00:aa:bb:cc".parse().unwrap());
+        spec.nics.push(nic);
+        let Ok(revision) = a
+            .cluster
+            .update_spec(vm.id, Some(now.revision), now.labels.clone(), &spec)
+            .await
+        else {
+            continue;
+        };
+        let mut status = now.status.clone();
+        status.hardware.as_mut().unwrap().nics = spec.nics.clone();
+        if a.cluster
+            .update_status_checked::<VmSpec>(vm.id, revision, &status)
+            .await
+            .is_ok()
+        {
+            break;
+        }
+    }
+
+    let task = migrate(&admin, "node2").await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(
+        error.contains("the running QEMU devices do not match the VM's hardware record"),
+        "{error}"
+    );
+    assert!(!b.hv.incoming_specs().iter().any(|s| s.id == vm.id));
+    assert!(a.hv.migrations().is_empty());
+    assert_still_on_a(&a, &b, vm.id).await;
 }
 
 /// 원본은 다 보냈지만(`postmigrate`) 대상이 받기에 실패했다: 확정하지 않고 원본을 이어서 실행한다.

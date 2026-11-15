@@ -22,7 +22,7 @@ pub use hostcheck::{
 };
 pub use hypervisor::{
     ActualState, AddOutcome, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind,
-    Hypervisor, HypervisorEvent, RuntimeStatus, StopMode,
+    Hypervisor, HypervisorEvent, RuntimeStatus, StopMode, VcpuChange,
 };
 pub use migration::{
     IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,

@@ -92,6 +92,8 @@ pub fn runner_config(node: Uuid, dir: &Path) -> TaskRunnerConfig {
     config.upload_dir = Some(dir.join("uploads"));
     config.state_dir = Some(dir.join("state"));
     config.migration_disks = Some(dir.join("migration-disks"));
+    // 핫플러그 떼기·줄이기의 시간 제한 길을 짧게 본다.
+    config.hotplug_timeout = Duration::from_millis(200);
     config
 }
 
@@ -640,6 +642,8 @@ pub struct FakeStorage {
     allocated: std::sync::Mutex<std::collections::HashMap<Uuid, u64>>,
     /// `deactivate_volume`의 (풀 이름, 볼륨)(차례대로)
     deactivations: std::sync::Mutex<Vec<(String, Uuid)>>,
+    /// `activate_volume`의 볼륨(차례대로)
+    activations: std::sync::Mutex<Vec<Uuid>>,
 }
 
 impl FakeStorage {
@@ -672,6 +676,11 @@ impl FakeStorage {
     /// 이후의 `create_volume`이 크기를 `unit` 단위로 올린다(LVM의 extent처럼). 0이면 그대로다.
     pub fn round_creates(&self, unit: u64) {
         *self.create_unit.lock().unwrap() = unit;
+    }
+
+    /// `activate_volume`의 볼륨(차례대로)
+    pub fn activations(&self) -> Vec<Uuid> {
+        self.activations.lock().unwrap().clone()
     }
 
     /// `deactivate_volume`의 (풀 이름, 볼륨)(차례대로)
@@ -869,12 +878,14 @@ impl Storage for FakeStorage {
             available_bytes: 1 << 40,
         })
     }
+    /// 볼륨을 `activations`에 적는다.
     async fn activate_volume(
         &self,
         _: &StoragePool,
-        _: Uuid,
+        id: Uuid,
         _: ImageFormat,
     ) -> Result<(), DriverError> {
+        self.activations.lock().unwrap().push(id);
         Ok(())
     }
     /// 호출을 `deactivate`로 적는다(풀과 함께 `deactivations`에도).

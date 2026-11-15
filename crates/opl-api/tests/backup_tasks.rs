@@ -1074,6 +1074,56 @@ async fn incremental_requests_fall_back_to_full_backups_with_a_reason() {
     assert!(env.hv.incremental_backups().is_empty());
 }
 
+/// 실행 중 붙인 디스크(핫플러그)에는 dirty bitmap이 없으므로 다음 증분 요청은 전체 백업으로 담고 이유를 적는다.
+/// 그 백업이 두 디스크 모두에 비트맵을 만들어 그다음은 증분이다.
+#[tokio::test]
+async fn a_disk_added_while_running_makes_the_next_backup_full() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    create_pool(&env, "local", false).await;
+    create_pool(&env, "bk", true).await;
+    let root = create_volume(&env, &admin, "root", 4 * MIB, "qcow2").await;
+    let data = create_volume(&env, &admin, "data", 2 * MIB, "qcow2").await;
+    let vm = create_vm(&admin, "web", &["root"]).await;
+    succeeded(&admin.act("web", "start").await);
+    succeeded(&backup_running(&mut env, &admin, "b1", false, std::slice::from_ref(&root)).await);
+
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert!(current.status.hardware.as_ref().unwrap().layout.is_some());
+    let mut spec = current.spec.clone();
+    spec.disks.push(opl_types::vm::DiskSpec {
+        volume: "data".into(),
+        bus: opl_types::vm::DiskBus::VirtioBlk,
+        boot_order: None,
+    });
+    env.cluster
+        .update_spec(vm, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    succeeded(&admin.act("web", "hotplug").await);
+    let b1 = backup(&env, "b1").unwrap();
+    let opl_b1 = opl_types::backup::bitmap_name(b1.id);
+    assert_eq!(bitmaps(&env, vm), vec![vec![opl_b1], vec![]]);
+
+    let files = [root, data];
+    succeeded(&backup_running(&mut env, &admin, "b2", true, &files).await);
+    let b2 = backup(&env, "b2").unwrap();
+    assert_eq!(b2.status.phase, BackupPhase::Ready, "{b2:?}");
+    assert_eq!(b2.status.parent, None);
+    assert_eq!(
+        b2.status.full_reason.as_deref(),
+        Some("no dirty bitmap on disk1")
+    );
+    assert_eq!(b2.status.disks.len(), 2);
+    assert_eq!(
+        bitmaps(&env, vm),
+        both(&opl_types::backup::bitmap_name(b2.id))
+    );
+
+    succeeded(&backup_running(&mut env, &admin, "b3", true, &[]).await);
+    assert_eq!(backup(&env, "b3").unwrap().status.parent, Some(b2.id));
+}
+
 /// 꺼진 VM은 늘 전체로 백업한다. 내보낸 뒤 qcow2 디스크에 그 백업의 비트맵만 남긴다(raw는 그대로).
 #[tokio::test]
 async fn stopped_vm_backups_are_full_and_leave_their_bitmap_on_qcow2_disks() {

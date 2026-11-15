@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, AddOutcome, BackupTarget, DiskBitmaps, DiskCounters, EventKind, Hypervisor,
-    HypervisorEvent, RuntimeStatus, StopMode,
+    HypervisorEvent, RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
     IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
@@ -1333,7 +1333,7 @@ impl Hypervisor for QemuHypervisor {
         from: u16,
         to: u16,
         timeout: Duration,
-    ) -> Result<u16, DriverError> {
+    ) -> Result<VcpuChange, DriverError> {
         let (boot, max) = (cpu.vcpus(), cpu.max());
         if max <= boot {
             return Err(DriverError::InvalidSpec(format!(
@@ -1350,6 +1350,7 @@ impl Hypervisor for QemuHypervisor {
         // 켤 때처럼 소켓마다 `max / sockets`개 코어 자리를 앞에서부터 채운다(cmdline과 같은 자리).
         let per_socket = max / u32::from(cpu.sockets);
         let mut now = from;
+        let mut refused = false;
         let stepped = async {
             if to >= from {
                 // 켤 때 수부터 본다: 앞서 떼기를 요청한 vCPU를 게스트가 늦게 내려 줬으면 그 자리도 다시 붙인다.
@@ -1386,11 +1387,23 @@ impl Hypervisor for QemuHypervisor {
             } else {
                 // 큰 번호부터 뗀다. 켤 때 단 vCPU는 위에서 막았다.
                 for i in (to..from).rev() {
-                    if !unplug(qmp, &format!("cpu{i}"), timeout).await? {
-                        tracing::warn!(%id, vcpu = i, ?timeout, "the guest did not release a vCPU");
-                        break;
+                    match unplug(qmp, &format!("cpu{i}"), timeout).await {
+                        Ok(true) => now = i,
+                        Ok(false) => {
+                            tracing::warn!(%id, vcpu = i, ?timeout, "the guest did not release a vCPU");
+                            break;
+                        }
+                        // 게스트가 vCPU 떼기를 켜지 않았다(QEMU 8.2 q35는 OS가 새 ACPI CPU 핫플러그로 바꾸기 전까지 옛
+                        // 방식이라 떼기를 거절한다). 요청이 남지 않으므로 떼는 중이 아니다.
+                        Err(DriverError::Qmp(QmpError::Command { desc, .. }))
+                            if vcpu_unplug_refused(&desc) =>
+                        {
+                            tracing::warn!(%id, vcpu = i, error = %desc, "QEMU refused to unplug a vCPU");
+                            refused = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
                     }
-                    now = i;
                 }
             }
             Ok(())
@@ -1404,7 +1417,10 @@ impl Hypervisor for QemuHypervisor {
                 tracing::warn!(%id, from, to, reached = now, error = %e, "changing vCPUs stopped")
             }
         }
-        Ok(now)
+        Ok(VcpuChange {
+            reached: now,
+            refused,
+        })
     }
 
     async fn set_memory(
@@ -2495,6 +2511,12 @@ async fn unplug(qmp: &QmpClient, id: &str, timeout: Duration) -> Result<bool, Dr
     }
 }
 
+/// QEMU가 vCPU `device_del`을 거절한 까닭이 게스트가 vCPU 떼기를 켜지 않은 것인지(ACPI 옛 CPU 핫플러그 방식:
+/// "acpi: device unplug request for not supported device type: max-x86_64-cpu")
+fn vcpu_unplug_refused(desc: &str) -> bool {
+    desc.contains("device unplug request for not supported device type")
+}
+
 /// virtio-mem 장치가 게스트에 꽂아 준 크기(`size`, 바이트)
 async fn virtio_mem_size(qmp: &QmpClient) -> Result<u64, DriverError> {
     let size = qmp_call(qmp.qom_get(VIRTIO_MEM_PATH, "size"), "QMP qom-get").await?;
@@ -2755,6 +2777,8 @@ time.sleep(60)
         vmem: Arc<Mutex<(u64, Option<u64>)>>,
         /// 이 이름의 명령을 받으면 답하지 않고 연결을 끊는다(QEMU가 받은 뒤 QMP가 끊김).
         drop_on: Arc<Mutex<Vec<&'static str>>>,
+        /// 참이면 vCPU `device_del`을 QEMU 8.2 q35처럼 거절한다(게스트가 ACPI CPU 핫플러그를 켜지 않음).
+        refuse_cpu_unplug: Arc<Mutex<bool>>,
     }
 
     /// QEMU 대신 QMP 소켓을 여는 가짜 서버. greeting과 capabilities 협상까지 처리하고,
@@ -2792,6 +2816,8 @@ time.sleep(60)
         let mem = vmem.clone();
         let drop_on = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let dropping = drop_on.clone();
+        let refuse_cpu_unplug = Arc::new(Mutex::new(false));
+        let refuse_cpu = refuse_cpu_unplug.clone();
         // id 있는 장치: 디스크 두 개와 NIC 하나를 가진 VM. `device_add`가 더하고 `device_del`(내려 줌)이 뺀다.
         let mut devices: Vec<String> = ["disk0-dev", "disk1-dev", "nic0"]
             .map(String::from)
@@ -2969,7 +2995,16 @@ time.sleep(60)
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
+                let cpu_del = name == "device_del"
+                    && cmd["arguments"]["id"]
+                        .as_str()
+                        .is_some_and(|d| d.starts_with("cpu"));
                 let refused = match name.as_str() {
+                    "device_del" if cpu_del && *refuse_cpu.lock().unwrap() => Some((
+                        "GenericError",
+                        "acpi: device unplug request for not supported device type: max-x86_64-cpu"
+                            .to_string(),
+                    )),
                     "netdev_add" if netdevs.contains(&netdev) => Some((
                         "GenericError",
                         format!("Duplicate ID '{netdev}' for netdev"),
@@ -2999,11 +3034,17 @@ time.sleep(60)
                 {
                     if name == "device_add" {
                         devices.push(dev.to_string());
-                    } else if name == "device_del" && !*hold.lock().unwrap() {
+                    } else if name == "device_del"
+                        && !*hold.lock().unwrap()
+                        && !(cpu_del && *refuse_cpu.lock().unwrap())
+                    {
                         devices.retain(|d| d != dev);
                     }
                 }
-                let deleted = (name == "device_del" && !*hold.lock().unwrap()).then(|| {
+                let deleted = (name == "device_del"
+                    && !*hold.lock().unwrap()
+                    && !(cpu_del && *refuse_cpu.lock().unwrap()))
+                .then(|| {
                     serde_json::json!({
                         "event": "DEVICE_DELETED", "timestamp": {},
                         "data": { "device": cmd["arguments"]["id"] },
@@ -3039,6 +3080,7 @@ time.sleep(60)
             hold_unplug,
             vmem,
             drop_on,
+            refuse_cpu_unplug,
         }
     }
 
@@ -4999,7 +5041,13 @@ time.sleep(60)
         let tmp = short_tempdir();
         let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
 
-        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 2, 5, UNPLUG).await.unwrap(), 5);
+        assert_eq!(
+            hv.set_vcpus(id, &hot_cpu(), 2, 5, UNPLUG)
+                .await
+                .unwrap()
+                .reached,
+            5
+        );
         let added = sent(&fake, &["query-hotpluggable-cpus", "device_add"]);
         let slot = |i: u32, socket: u32, core: u32| {
             serde_json::json!({ "driver": "max-x86_64-cpu", "id": format!("cpu{i}"),
@@ -5009,7 +5057,13 @@ time.sleep(60)
         let args: Vec<_> = added[1..].iter().map(|(_, a)| a.clone()).collect();
         assert_eq!(args, [slot(2, 0, 2), slot(3, 0, 3), slot(4, 1, 0)]);
 
-        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 5, 2, UNPLUG).await.unwrap(), 2);
+        assert_eq!(
+            hv.set_vcpus(id, &hot_cpu(), 5, 2, UNPLUG)
+                .await
+                .unwrap()
+                .reached,
+            2
+        );
         let removed: Vec<_> = sent(&fake, &["device_del"])
             .into_iter()
             .map(|(_, a)| a["id"].clone())
@@ -5017,7 +5071,13 @@ time.sleep(60)
         assert_eq!(removed, ["cpu4", "cpu3", "cpu2"]);
 
         // 가짜 QEMU는 뗀 자리를 그대로 켜진 것으로 답한다: 다시 붙이면 건너뛴다.
-        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 2, 3, UNPLUG).await.unwrap(), 3);
+        assert_eq!(
+            hv.set_vcpus(id, &hot_cpu(), 2, 3, UNPLUG)
+                .await
+                .unwrap()
+                .reached,
+            3
+        );
         assert_eq!(sent(&fake, &["device_add"]).len(), 3);
 
         // 켤 때 수 아래·상한 위·상한 없이 켠 VM은 보내지 않고 거절한다.
@@ -5048,7 +5108,13 @@ time.sleep(60)
         let tmp = short_tempdir();
         let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
         *fake.hold_unplug.lock().unwrap() = true;
-        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 4, 2, UNPLUG).await.unwrap(), 4);
+        assert_eq!(
+            hv.set_vcpus(id, &hot_cpu(), 4, 2, UNPLUG)
+                .await
+                .unwrap()
+                .reached,
+            4
+        );
         let removed = sent(&fake, &["device_del"]);
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].1["id"], "cpu3");
@@ -5063,10 +5129,51 @@ time.sleep(60)
             "{err:?}"
         );
         fake.failing.lock().unwrap().clear();
-        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 2, 3, UNPLUG).await.unwrap(), 3);
+        assert_eq!(
+            hv.set_vcpus(id, &hot_cpu(), 2, 3, UNPLUG)
+                .await
+                .unwrap()
+                .reached,
+            3
+        );
         fake.failing.lock().unwrap().push("device_add");
         // cpu2는 이제 켜져 있어 건너뛰고 cpu3에서 실패: 닿은 수 3
-        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 2, 5, UNPLUG).await.unwrap(), 3);
+        assert_eq!(
+            hv.set_vcpus(id, &hot_cpu(), 2, 5, UNPLUG)
+                .await
+                .unwrap()
+                .reached,
+            3
+        );
+    }
+
+    /// QEMU 8.2 q35는 게스트가 ACPI CPU 핫플러그를 켜기 전에 vCPU 떼기를 거절한다: 오류가 아니라 지금 수와
+    /// `refused`다(진행 중인 떼기 없음). 다른 거절은 오류다.
+    #[tokio::test]
+    async fn a_refused_vcpu_unplug_keeps_the_count() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        *fake.refuse_cpu_unplug.lock().unwrap() = true;
+        let change = hv.set_vcpus(id, &hot_cpu(), 4, 2, UNPLUG).await.unwrap();
+        assert_eq!(
+            change,
+            VcpuChange {
+                reached: 4,
+                refused: true
+            }
+        );
+        assert_eq!(sent(&fake, &["device_del"]).len(), 1);
+
+        *fake.refuse_cpu_unplug.lock().unwrap() = false;
+        fake.failing.lock().unwrap().push("device_del");
+        let err = hv
+            .set_vcpus(id, &hot_cpu(), 4, 2, UNPLUG)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::Qmp(QmpError::Command { .. })),
+            "{err:?}"
+        );
     }
 
     /// 같은 수로 맞추기도 켤 때 수부터 빈 자리를 본다: 떼기를 요청한 vCPU를 게스트가 늦게 내려 줬으면 다시 붙인다.
@@ -5075,7 +5182,13 @@ time.sleep(60)
         let tmp = short_tempdir();
         let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
         // 기록은 3개인데 가짜 QEMU에는 켤 때의 두 자리만 켜져 있다(cpu2를 게스트가 늦게 내려 줌).
-        assert_eq!(hv.set_vcpus(id, &hot_cpu(), 3, 3, UNPLUG).await.unwrap(), 3);
+        assert_eq!(
+            hv.set_vcpus(id, &hot_cpu(), 3, 3, UNPLUG)
+                .await
+                .unwrap()
+                .reached,
+            3
+        );
         let added: Vec<_> = sent(&fake, &["device_add"])
             .into_iter()
             .map(|(_, a)| a["id"].clone())

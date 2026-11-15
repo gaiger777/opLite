@@ -967,8 +967,8 @@ fn q35_tcg(root: &Path) -> Option<QemuConfig> {
     })
 }
 
-/// q35(TCG, BIOS, OS 없음)에서 vCPU를 하나 붙인다. 떼기는 게스트가 받아야 해서 시간 안에 끝나지 않고 그대로 두
-/// 개이며, 다시 해도 오류 없이 같다. 루트 포트에 붙인 디스크도 같다.
+/// q35(TCG, BIOS, OS 없음)에서 vCPU를 하나 붙인다. 떼기는 게스트가 받아야 해서 시간 안에 끝나지 않고(QEMU 11) QEMU
+/// 8.2는 게스트가 ACPI CPU 핫플러그를 켜지 않아 거절하므로(`refused`) 그대로 두 개이며, 다시 해도 오류 없이 같다. 루트 포트에 붙인 디스크도 같다.
 #[tokio::test]
 async fn a_vcpu_is_hotplugged_on_q35() {
     let tmp = short_tempdir();
@@ -997,10 +997,19 @@ async fn a_vcpu_is_hotplugged_on_q35() {
         out.matches("CPU #").count()
     };
     assert_eq!(cpus().await, 1);
-    assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 1, 2, t).await.unwrap(), 2);
+    assert_eq!(
+        hv.set_vcpus(vm.id, &vm.cpu, 1, 2, t).await.unwrap().reached,
+        2
+    );
     assert_eq!(cpus().await, 2);
-    assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 2, 1, t).await.unwrap(), 2);
-    assert_eq!(hv.set_vcpus(vm.id, &vm.cpu, 2, 1, t).await.unwrap(), 2);
+    assert_eq!(
+        hv.set_vcpus(vm.id, &vm.cpu, 2, 1, t).await.unwrap().reached,
+        2
+    );
+    assert_eq!(
+        hv.set_vcpus(vm.id, &vm.cpu, 2, 1, t).await.unwrap().reached,
+        2
+    );
     assert_eq!(cpus().await, 2);
 
     // PCIe 장치도 게스트가 eject해야 떼진다. 떼는 중인 장치를 다시 떼도 오류가 아니다.

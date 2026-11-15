@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
+use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{FAST_HA, HA_PLACEMENT, HOTPLUG, Node, NodeSpec, PLACEMENT, ha_capable};
 use opl_types::placement::PlacementRuleSpec;
@@ -30,8 +31,8 @@ use crate::scheduler::{
 };
 use crate::score::{self, Scorer};
 use crate::snapshots::{
-    check_no_migration, check_no_revert_task, check_no_snapshot_task, check_not_busy,
-    check_not_migrating, count_snapshots,
+    check_no_hotplug_task, check_no_migration, check_no_revert_task, check_no_snapshot_task,
+    check_not_busy, check_not_migrating, count_snapshots,
 };
 use crate::state::AppState;
 use crate::tasks::create_task;
@@ -40,6 +41,31 @@ use crate::tasks::create_task;
 pub(crate) fn is_stopped(vm: &Vm) -> bool {
     vm.spec.power == PowerState::Stopped
         && matches!(vm.status.phase, VmPhase::Stopped | VmPhase::Failed)
+}
+
+/// VM `vm`이 볼륨 `volume`(이름)을 쓰는지: 스펙의 디스크이거나, 도는 QEMU에 아직 붙은 디스크(`status.hardware` —
+/// 스펙에서 뺐지만 게스트가 아직 내려 주지 않은 것)다.
+pub(crate) fn vm_uses_volume(vm: &Vm, volume: &str) -> bool {
+    vm.spec.disks.iter().any(|d| d.volume == volume)
+        || vm
+            .status
+            .hardware
+            .as_ref()
+            .is_some_and(|hw| hw.disks.iter().any(|d| d.volume == volume))
+}
+
+/// 볼륨 `volume`을 VM `vm`이 써서 다룰 수 없다(409 `volume_in_use`). 스펙의 디스크면 `attached` 문구, 떼는 중인
+/// 디스크면 `vm hotplug`나 재시작을 알린다.
+pub(crate) fn volume_in_use(vm: &Vm, volume: &str, attached: String) -> ApiError {
+    let message = if vm.spec.disks.iter().any(|d| d.volume == volume) {
+        attached
+    } else {
+        format!(
+            "volume {volume:?} is still being released by VM {:?}; run `vm hotplug` or restart the VM",
+            vm.name
+        )
+    };
+    ApiError::conflict("volume_in_use", message)
 }
 
 fn vm_running(vm: &Vm, what: &str) -> ApiError {
@@ -190,12 +216,10 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
                 format!("volume {:?} is still being created", disk.volume),
             ));
         }
-        if let Some(other) = others
-            .clone()
-            .find(|v| v.spec.disks.iter().any(|d| d.volume == disk.volume))
-        {
-            return Err(ApiError::conflict(
-                "volume_in_use",
+        if let Some(other) = others.clone().find(|v| vm_uses_volume(v, &disk.volume)) {
+            return Err(volume_in_use(
+                other,
+                &disk.volume,
                 format!(
                     "volume {:?} is already attached to VM {:?}",
                     disk.volume, other.name
@@ -572,9 +596,13 @@ pub enum StopMode {
 }
 
 /// `start`와 `stop`은 `spec.power`를 바꾸고, 그 결과를 지켜볼 Task를 돌려준다(202).
-/// `stop?mode=force`와 `reboot`은 대상 노드의 Task 실행기가 수행한다.
+/// `stop?mode=force`와 `reboot`은 대상 노드의 Task 실행기가 수행한다. `hotplug`는 실행 중인 VM의 하드웨어를
+/// 지금 스펙에 맞추는 Task(`vm-hotplug`, 실패한 변경 다시 해 보기)다: 모든 노드가 `hotplug`를 알아야 하고(409
+/// `cluster_upgrading`) 핫플러그 기록이 있는 실행 중 VM이어야 한다(409 `vm_not_running`). 끝나지 않은 스냅샷·되돌리기·
+/// 복제·백업 Task가 있으면 409 `vm_busy`이고, 메모리를 바로 늘리면 VM이 도는 노드에 그만큼 미할당 메모리가 있어야 한다
+/// (409 `no_capacity`).
 #[utoipa::path(post, path = "/vms/{key}/actions/{action}", tag = "vms",
-    params(("key" = String, Path, description = "id or name"), ("action" = String, Path, description = "start, stop or reboot"), ActionQuery),
+    params(("key" = String, Path, description = "id or name"), ("action" = String, Path, description = "start, stop, reboot or hotplug"), ActionQuery),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn vm_action(
     State(state): State<Arc<AppState>>,
@@ -591,6 +619,16 @@ pub async fn vm_action(
     // 강제 정지는 되돌리기만 막는다. 저장이 멈춘 만들기 중에도 VM을 끌 수 있어야 한다.
     // 마이그레이션 중에는 모두 막는다. 실패하면 원본이 계속 돌고, 시간 제한으로 끝난다.
     check_no_migration(&state, &vm)?;
+    if action == "hotplug" {
+        // 마이그레이션 검사와 Task 만들기 사이에 마이그레이션이 시작하지 않게 한다(`start_migration`과 같은 잠금).
+        let _lock = state.vm_lock.lock().await;
+        let vm = lookup::<VmSpec>(&state.cluster, &vm.id.to_string())?;
+        check_no_migration(&state, &vm)?;
+        check_no_snapshot_task(&state, &vm)?;
+        check_hotplug_room(&state, &vm)?;
+        let task = start_hotplug(&state, &vm).await?;
+        return Ok((StatusCode::ACCEPTED, Json(task)));
+    }
     if query.mode == StopMode::Force {
         check_no_revert_task(&state, &vm)?;
     } else {
@@ -688,7 +726,7 @@ pub async fn vm_action(
         }
         _ => {
             return Err(ApiError::not_found(format!(
-                "unknown action {action:?} (start, stop, reboot)"
+                "unknown action {action:?} (start, stop, reboot, hotplug)"
             )));
         }
     };
@@ -696,6 +734,76 @@ pub async fn vm_action(
     let node = vm.spec.node.unwrap_or(state.node);
     let task = create_task(&state.cluster, op, vm.id, node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 실행 중인 VM `vm`의 하드웨어를 지금 스펙에 맞출 핫플러그 Task(`vm-hotplug`)를 VM이 도는 노드에 만든다. `vm_lock`
+/// 안에서 부른다. 모든 노드가 `hotplug`를 알아야 하고(409 `cluster_upgrading`), 핫플러그 기록(`status.hardware`)이
+/// 있는 실행 중 VM이어야 한다(409 `vm_not_running`).
+pub(crate) async fn start_hotplug(state: &AppState, vm: &Vm) -> Result<Task, ApiError> {
+    require_feature(&state.cluster, HOTPLUG)?;
+    let running = vm.spec.power == PowerState::Running
+        && vm.status.phase == VmPhase::Running
+        && vm.status.hardware.is_some();
+    let Some(node) = vm.status.node.filter(|_| running) else {
+        return Err(ApiError::conflict(
+            "vm_not_running",
+            format!("VM {:?} is not running", vm.name),
+        ));
+    };
+    create_task(&state.cluster, TaskOp::VmHotplug, vm.id, node).await
+}
+
+/// 실행 중인 VM `vm`을 지금 스펙에 맞추는 계획이 메모리를 바로 늘리면 VM이 도는 노드에 그만큼 미할당 메모리가 있는지
+/// 본다(409 `no_capacity`). 기록이 없거나 계획할 수 없으면(Task가 실패로 알린다) 보지 않는다.
+fn check_hotplug_room(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    let Some(hw) = &vm.status.hardware else {
+        return Ok(());
+    };
+    let inv = Inventory::load(&state.cluster)?;
+    let node = vm
+        .status
+        .node
+        .and_then(|id| inv.nodes.iter().find(|n| n.id == id));
+    let caps = node.and_then(|n| n.status.hotplug).unwrap_or_default();
+    match hotplug::plan(&vm.spec, hw, caps) {
+        Ok(plan) => check_hotplug_memory(&inv, vm, hw, node, &plan),
+        Err(_) => Ok(()),
+    }
+}
+
+/// 핫플러그 계획 `plan`이 메모리를 바로 늘리면 VM이 도는 노드 `node`에 늘리는 만큼 미할당 메모리가 있어야 한다(409
+/// `no_capacity`).
+fn check_hotplug_memory(
+    inv: &Inventory,
+    vm: &Vm,
+    hw: &opl_types::vm::RunningHardware,
+    node: Option<&Node>,
+    plan: &hotplug::Plan,
+) -> Result<(), ApiError> {
+    let plugged = plan.steps.iter().find_map(|s| match s {
+        hotplug::Step::SetMemory { plugged_mib } => Some(*plugged_mib),
+        _ => None,
+    });
+    if let (Some(plugged), Some(node)) = (plugged, node) {
+        // 다른 VM에 배정되지 않은 메모리에서 이 VM이 지금 도는 만큼을 뺀 것이 늘릴 수 있는 양이다(스펙은 이미 새 값일
+        // 수 있다 — 다시 적용).
+        let now = hw.memory_now();
+        let want = hw.memory_mib + plugged;
+        let free = inv.free_memory_mib(node, vm.id) - i64::from(now);
+        if want > now && free < i64::from(want - now) {
+            return Err(ApiError::conflict(
+                "no_capacity",
+                format!(
+                    "node {:?} has only {} MiB of unallocated memory; VM {:?} needs {} MiB more",
+                    node.name,
+                    free.max(0),
+                    vm.name,
+                    want - now
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 저장소의 VM이 지금 꺼져 있는지([`is_stopped`]). [`modify_spec`] 안에서 부르면 그 쓰기가 같은 revision을
@@ -736,7 +844,9 @@ pub(crate) enum RuleCheck {
 /// 한다. 노드 로컬 풀의 디스크는 대상 노드의 같은 이름의 풀(`pool`을 주면 그 풀)에 복사한다. 그런 디스크가
 /// 있으면 모든 노드가 디스크 복사를 알아야 하고(409 `cluster_upgrading`) VM에 스냅샷이 없어야 한다(409
 /// `migration_unsupported`). `pool`을 줬는데 그런 디스크가 없으면 400, 없는 풀이면 404다. HVF(macOS)
-/// 노드는 원본도 대상도 될 수 없다(409 `migration_unsupported`). 대상 노드가 위트니스이거나 오프라인이거나
+/// 노드는 원본도 대상도 될 수 없다(409 `migration_unsupported`). 핫플러그 배치로 도는 VM은 대상이 같은 장치로 켤 수
+/// 있어야 하고(`hotplug` 기능, vCPU 핫플러그, virtio-mem — 아니면 409 `migration_unsupported`), 핫플러그 Task가 끝나지
+/// 않았거나 스펙의 디스크·NIC가 도는 장치와 다르면 409 `vm_busy`다. 대상 노드가 위트니스이거나 오프라인이거나
 /// 유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
 /// 스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다. 대상 노드가 hard
 /// 배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
@@ -819,6 +929,21 @@ pub(crate) async fn start_migration(
         ));
     }
     check_no_snapshot_task(state, &vm)?;
+    // 대상은 원본이 도는 하드웨어로 켜므로 장치가 바뀌는 중에는 옮기지 않는다.
+    check_no_hotplug_task(state, &vm)?;
+    // 대상은 스펙의 디스크·NIC로 켠다. 원본 QEMU의 장치와 다르면(실패한 핫플러그, 게스트가 아직 내려 주지 않은
+    // 장치) 옮기지 않는다.
+    if let Some(hw) = &vm.status.hardware
+        && !hotplug::devices_match(&vm.spec, hw)
+    {
+        return Err(ApiError::conflict(
+            "vm_busy",
+            format!(
+                "cannot migrate VM {:?}: the VM's devices do not match the running hardware; run `vm hotplug` or restart it",
+                vm.name
+            ),
+        ));
+    }
     let inv = Inventory::load(&state.cluster)?;
     check_no_resize_task(state, &inv, &vm)?;
     // 노드 로컬 풀의 디스크는 대상 노드에 복사한다(같은 이름의 풀 또는 `pool`).
@@ -882,6 +1007,13 @@ pub(crate) async fn start_migration(
         ));
     }
     check_node_arch(&target, &vm.spec)?;
+    // 대상은 원본과 같은 장치(핫플러그 배치·붙인 vCPU·virtio-mem)로 켜야 한다.
+    hotplug::can_receive(vm.status.hardware.as_ref(), &target).map_err(|e| {
+        ApiError::conflict(
+            "migration_unsupported",
+            format!("cannot migrate VM {:?}: {e}", vm.name),
+        )
+    })?;
     node_fits_with(&vm.spec, &inv, &target, &moves)
         .map_err(|e| ApiError::conflict("no_capacity", e))?;
     let free = inv.free_memory_mib(&target, vm.id);

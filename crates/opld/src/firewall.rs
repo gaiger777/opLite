@@ -14,7 +14,7 @@ use opl_reconciler::FirewallGate;
 use opl_types::network::tap_name;
 use opl_types::resource::Kind;
 use opl_types::security_group::{Action, Direction, Rule, SecurityGroup, SecurityGroupSpec};
-use opl_types::vm::{Vm, VmSpec};
+use opl_types::vm::{NicSpec, Vm, VmSpec};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
@@ -29,10 +29,33 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// 클러스터의 방화벽 NIC(보안 그룹을 건 NIC). tap은 그 NIC의 tap 이름, 규칙은 NIC의 그룹 순서·그룹
 /// 안 순서로 펼친 것이다. MAC이 없는 NIC는 건너뛰고(아직 켤 수 없다), 없는 그룹은 규칙이 없는 것으로
 /// 보되 그 NIC의 규칙 끝에 나가기 차단을 더한다(들어오기·나가기 모두 앞 규칙에 맞는 것만 통한다).
+/// 실행 중인 VM은 스펙의 NIC에 더해 도는 QEMU에 아직 붙은 NIC(`status.hardware.nics`, MAC으로 맞춤 — 스펙에서
+/// 뺐지만 게스트가 아직 내려 주지 않은 것)도 기록된 보안 그룹으로 막는다. 같은 순번(같은 tap)에 스펙의 다른 NIC가
+/// 있으면 tap은 QEMU에 붙은 NIC의 것이므로 기록된 NIC가 이긴다.
 pub fn firewall_nics(vms: &[Vm], groups: &[SecurityGroup]) -> Vec<FirewallNic> {
     let mut nics = Vec::new();
     for vm in vms {
-        for (i, nic) in vm.spec.nics.iter().enumerate() {
+        let running = vm.status.hardware.iter().flat_map(|hw| {
+            hw.nics
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| !vm.spec.nics.iter().any(|s| s.mac == n.mac))
+        });
+        // 그 순번의 tap을 QEMU의 다른 NIC가 쓰고 있다(아직 붙지 않은 스펙의 NIC).
+        let taken = |i: usize, nic: &NicSpec| {
+            vm.status
+                .hardware
+                .as_ref()
+                .and_then(|hw| hw.nics.get(i))
+                .is_some_and(|h| h.mac != nic.mac)
+        };
+        let wanted = vm
+            .spec
+            .nics
+            .iter()
+            .enumerate()
+            .filter(|(i, nic)| !taken(*i, nic));
+        for (i, nic) in wanted.chain(running) {
             if nic.security_groups.is_empty() {
                 continue;
             }
@@ -381,6 +404,61 @@ mod tests {
             ]
         );
         assert_eq!(firewall_nics(&[], &groups), vec![]);
+    }
+
+    /// 스펙에서 뺐지만 도는 QEMU에 아직 붙은 NIC(게스트가 내려 주지 않음)는 기록된 보안 그룹으로 계속 막는다.
+    #[test]
+    fn nics_still_in_the_running_qemu_keep_their_rules() {
+        let ssh = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22" }),
+        );
+        let groups = vec![group("ssh", vec![ssh.clone()])];
+        let mut a = vm(
+            "a",
+            Some(Uuid::now_v7()),
+            vec![nic(Some(mac(1)), &[]), nic(Some(mac(2)), &["ssh"])],
+        );
+        a.status.hardware = Some(opl_types::vm::RunningHardware::legacy(&a.spec));
+        a.spec.nics.pop();
+        assert_eq!(
+            firewall_nics(&[a.clone()], &groups),
+            vec![FirewallNic {
+                tap: tap_name(a.id, 1),
+                mac: mac(2),
+                rules: vec![ssh.clone()],
+            }]
+        );
+        // QEMU가 내려 주면(기록에서도 빠지면) 규칙이 없다.
+        a.status.hardware = Some(opl_types::vm::RunningHardware::legacy(&a.spec));
+        assert_eq!(firewall_nics(&[a], &groups), vec![]);
+    }
+
+    /// 스펙의 NIC와 QEMU에 아직 붙은 다른 NIC가 같은 순번(같은 tap)이면 QEMU의 NIC 규칙이 이긴다.
+    #[test]
+    fn the_running_nic_owns_its_tap() {
+        let ssh = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22" }),
+        );
+        let web = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "80" }),
+        );
+        let groups = vec![group("ssh", vec![ssh.clone()]), group("web", vec![web])];
+        let mut a = vm(
+            "a",
+            Some(Uuid::now_v7()),
+            vec![nic(Some(mac(1)), &[]), nic(Some(mac(2)), &["ssh"])],
+        );
+        a.status.hardware = Some(opl_types::vm::RunningHardware::legacy(&a.spec));
+        // NIC 1을 떼고 다른 NIC를 붙이는 중: 게스트가 아직 mac(2)를 내려 주지 않았다.
+        a.spec.nics[1] = nic(Some(mac(3)), &["web"]);
+        assert_eq!(
+            firewall_nics(&[a.clone()], &groups),
+            vec![FirewallNic {
+                tap: tap_name(a.id, 1),
+                mac: mac(2),
+                rules: vec![ssh],
+            }]
+        );
     }
 
     fn test_config(witness: bool) -> Config {

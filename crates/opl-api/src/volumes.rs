@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::auth::{Action, Principal};
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, check_name, lookup};
+use crate::vms::{vm_uses_volume, volume_in_use};
 
 /// `/volumes/import` 경로와 겹치므로 볼륨 이름으로 쓸 수 없다.
 const RESERVED_NAME: &str = "import";
@@ -430,12 +431,10 @@ pub async fn delete_volume(
         ));
     }
     let (_, vms) = state.cluster.list::<VmSpec>()?;
-    if let Some(vm) = vms
-        .iter()
-        .find(|vm| vm.spec.disks.iter().any(|d| d.volume == volume.name))
-    {
-        return Err(ApiError::conflict(
-            "volume_in_use",
+    if let Some(vm) = vms.iter().find(|vm| vm_uses_volume(vm, &volume.name)) {
+        return Err(volume_in_use(
+            vm,
+            &volume.name,
             format!("volume {:?} is attached to VM {:?}", volume.name, vm.name),
         ));
     }
@@ -500,10 +499,12 @@ pub async fn resize_volume(
         ));
     }
     let (_, vms) = state.cluster.list::<VmSpec>()?;
-    let user = vms
-        .iter()
-        .find(|vm| vm.spec.disks.iter().any(|d| d.volume == volume.name));
+    let user = vms.iter().find(|vm| vm_uses_volume(vm, &volume.name));
     if let Some(vm) = user {
+        // 떼는 중인 디스크는 스펙 순번이 없어 늘릴 수 없다.
+        if !vm.spec.disks.iter().any(|d| d.volume == volume.name) {
+            return Err(volume_in_use(vm, &volume.name, String::new()));
+        }
         check_not_busy(&state, vm)?;
     }
     let node = match user.and_then(|vm| vm_placement(&state.cluster, Some(state.node), vm)) {

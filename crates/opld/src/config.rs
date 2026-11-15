@@ -90,8 +90,13 @@ pub struct Config {
     pub web: WebSection,
     #[serde(default)]
     pub node: NodeSection,
-    /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
-    #[cfg(any(feature = "starve-it", feature = "ha-it", feature = "migration-it"))]
+    /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`·`qemu-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
+    #[cfg(any(
+        feature = "starve-it",
+        feature = "ha-it",
+        feature = "migration-it",
+        feature = "qemu-it"
+    ))]
     #[serde(default)]
     pub test: TestSection,
 }
@@ -411,6 +416,8 @@ const MAX_WATCHDOG_TIMEOUT_SECS: u64 = 3600;
 const RECOVER_MARGIN_SECS: u64 = 2;
 /// 이보다 짧은 `fence_after`면 시작할 때 HA 경고를 본다(옛 기본값, `profile = "safe"`).
 const SAFE_FENCE_AFTER_SECS: u64 = 30;
+/// 핫플러그 Task가 떼기·줄이기에서 게스트를 기다리는 한도(초)
+const HOTPLUG_TIMEOUT_SECS: u64 = 60;
 
 impl HaSection {
     /// 실제 `fence_after_secs`: 적은 값, 없으면 프로필 값
@@ -475,6 +482,16 @@ impl Config {
             };
         }
         BalancerConfig::default()
+    }
+
+    /// 핫플러그 Task가 떼기·줄이기에서 게스트가 내려 주기를 기다리는 한도(60초). 시험 빌드(`qemu-it`)는 `[test]
+    /// hotplug_timeout_secs`로 바꾼다.
+    pub fn hotplug_timeout(&self) -> Duration {
+        #[cfg(feature = "qemu-it")]
+        if let Some(secs) = self.test.hotplug_timeout_secs {
+            return Duration::from_secs(secs);
+        }
+        Duration::from_secs(HOTPLUG_TIMEOUT_SECS)
     }
 
     /// HA 검사기가 읽는 sysfs·procfs의 뿌리. 시험 빌드(`ha-it`)는 `[test] health_root` 아래의 가짜 트리를 쓴다.
@@ -828,8 +845,14 @@ fn default_runtime_threads() -> usize {
     (cpus / 2).max(2)
 }
 
-/// 시험 고리(시험 빌드에만): 굶김 시험(설계 §3.4), 호스트 종료 정책 시험, 균형 조정기 간격(마이그레이션 시험)
-#[cfg(any(feature = "starve-it", feature = "ha-it", feature = "migration-it"))]
+/// 시험 고리(시험 빌드에만): 굶김 시험(설계 §3.4), 호스트 종료 정책 시험, 균형 조정기 간격(마이그레이션 시험),
+/// 핫플러그 기다림(실제 QEMU 시험)
+#[cfg(any(
+    feature = "starve-it",
+    feature = "ha-it",
+    feature = "migration-it",
+    feature = "qemu-it"
+))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestSection {
@@ -854,6 +877,10 @@ pub struct TestSection {
     #[cfg(feature = "migration-it")]
     #[serde(default)]
     pub placement_interval_secs: Option<u64>,
+    /// 핫플러그 Task가 떼기·줄이기에서 게스트를 기다리는 한도(초, 기본 60). 게스트 OS 없는 VM의 시간 초과 길을 짧게 본다.
+    #[cfg(feature = "qemu-it")]
+    #[serde(default)]
+    pub hotplug_timeout_secs: Option<u64>,
 }
 
 #[cfg(feature = "starve-it")]
@@ -2032,6 +2059,18 @@ mod tests {
             assert_eq!(config.tick, Duration::from_secs(1));
         }
         #[cfg(not(feature = "migration-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] hotplug_timeout_secs`는 `qemu-it` 빌드에만 있고 핫플러그 Task의 기다림을 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_hotplug_timeout_only_in_qemu_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(parse(text).hotplug_timeout(), Duration::from_secs(60));
+        let parsed = toml::from_str::<Config>(&format!("{text}[test]\nhotplug_timeout_secs = 5"));
+        #[cfg(feature = "qemu-it")]
+        assert_eq!(parsed.unwrap().hotplug_timeout(), Duration::from_secs(5));
+        #[cfg(not(feature = "qemu-it"))]
         assert!(parsed.is_err());
     }
 
