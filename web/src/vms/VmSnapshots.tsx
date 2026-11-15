@@ -3,7 +3,7 @@ import { type RefObject, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
-import { api, call } from "@/api/client";
+import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Snapshot, Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
@@ -31,6 +31,7 @@ import { codeMessage } from "@/i18n/errors";
 import { formatBytes, formatTime } from "@/lib/format";
 import { trackTask } from "@/tasks/tasks";
 import { isBusy } from "@/vms/actions";
+import { memoryMatchesBoot } from "@/vms/hotplug";
 import {
   descriptionError,
   snapshotNameError,
@@ -343,6 +344,9 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
   );
 }
 
+/** 스냅샷 만들기의 거절 가운데 번역 대신 서버의 설명을 보이는 code */
+const SERVER_REASONS = ["snapshot_unsupported", "vm_busy"];
+
 function CreateSnapshotDialog({
   vm,
   taken,
@@ -363,8 +367,11 @@ function CreateSnapshotDialog({
   const [memory, setMemory] = useState(true);
   const [errors, setErrors] = useState<Record<string, string>>({});
   // 서버는 실행 중이고 디스크가 있는 VM만 메모리를 담는다. 그 밖에는 묻지 않고 디스크만 담는다.
-  // 블록 스냅샷은 메모리를 담지 못한다(서버가 409).
-  const canMemory = vm.status.phase === "running" && (vm.spec.disks ?? []).length > 0 && !block;
+  // 블록 스냅샷은 메모리를 담지 못한다(서버가 409). 실행 중에 하드웨어를 바꿨거나 다음 재시작 때 적용할 변경이 있는
+  // VM도 디스크만 담는다(되돌리기가 켤 때 모양으로 켠다).
+  const running = vm.status.phase === "running";
+  const asBooted = memoryMatchesBoot(vm);
+  const canMemory = running && (vm.spec.disks ?? []).length > 0 && !block && asBooted;
 
   async function submit() {
     const found: Record<string, string> = {};
@@ -380,12 +387,22 @@ function CreateSnapshotDialog({
     if (Object.keys(found).length > 0) {
       return false;
     }
-    const task = await call(
-      api.POST("/vms/{key}/snapshots", {
-        params: { path: { key: vm.id } },
-        body: { name, description, memory: canMemory && memory },
-      }),
-    );
+    let task;
+    try {
+      task = await call(
+        api.POST("/vms/{key}/snapshots", {
+          params: { path: { key: vm.id } },
+          body: { name, description, memory: canMemory && memory },
+        }),
+      );
+    } catch (err) {
+      // 메모리·바쁨 거절은 서버가 까닭을 말한다(목록의 VM이 늦어 핫플러그 중인 것을 모를 수 있다 — 일반 번역은 디스크
+      // 형식·다른 작업 이야기다).
+      if (err instanceof ApiError && SERVER_REASONS.includes(err.code)) {
+        throw new Error(err.message, { cause: err });
+      }
+      throw err;
+    }
     trackTask(task, t("snapshots.op.create", { vm: vm.name, name }));
   }
 
@@ -436,6 +453,9 @@ function CreateSnapshotDialog({
         </div>
       )}
       {block && <p className="text-xs text-muted-foreground">{t("snapshots.blockHint")}</p>}
+      {running && !asBooted && (
+        <p className="text-xs text-muted-foreground">{t("snapshots.hotplugHint")}</p>
+      )}
     </FormDialog>
   );
 }

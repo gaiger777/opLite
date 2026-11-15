@@ -3,10 +3,12 @@ import type {
   BackupJob,
   HaCheck,
   HaGroup,
+  HotplugLayout,
   Node,
   PlacementRule,
   PlacementStatus,
   Rule,
+  RunningHardware,
   SecurityGroup,
   Snapshot,
   StoragePool,
@@ -47,6 +49,34 @@ export function vm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm
     },
     ...extra,
   } satisfies Vm;
+}
+
+/**
+ * 테스트용 실행 중 하드웨어: 1 × 2코어(최대 8), 2048 MiB(최대 16384), 디스크 하나·NIC 하나로 켠 핫플러그 배치.
+ * `layout: null`이면 배치 없이 켠 VM이다.
+ */
+export function hardware(
+  extra: Partial<Omit<RunningHardware, "layout">> & { layout?: Partial<HotplugLayout> | null } = {},
+): RunningHardware {
+  const { layout, ...rest } = extra;
+  return {
+    cpu: { sockets: 1, cores: 2, model: "host", max_vcpus: 8 },
+    memory_mib: 2048,
+    firmware: "uefi",
+    machine: "virt",
+    ...rest,
+    ...(layout !== null && {
+      layout: {
+        vcpus: 2,
+        max_memory_mib: 16384,
+        plugged_mib: 0,
+        ports: 8,
+        boot_disks: 1,
+        boot_nics: 1,
+        ...layout,
+      },
+    }),
+  };
 }
 
 export const NODE: Node = {

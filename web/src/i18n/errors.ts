@@ -45,6 +45,20 @@ export function errorMessage(t: TFunction, error: unknown): string {
 }
 
 /**
+ * 하드웨어 바꾸기(PUT·`actions/hotplug`)의 오류에서 번역 문구보다 서버의 설명을 앞세우는 code. 서버가 어느 장치를
+ * 왜 바꿀 수 없는지 말한다.
+ */
+export const HOTPLUG_ERROR_CODES = ["vm_running", "vm_busy", "no_capacity", "hotplug_unavailable"];
+
+/** {@link errorMessage}와 같되 `codes`의 API 오류는 서버의 설명을 그대로 쓴다. */
+export function serverErrorMessage(t: TFunction, error: unknown, codes: readonly string[]): string {
+  if (error instanceof ApiError && codes.includes(error.code)) {
+    return error.message;
+  }
+  return errorMessage(t, error);
+}
+
+/**
  * 서버의 오류 code와 설명을 문장으로: `errors.<code>` 번역, 번역이 없으면 설명 그대로. 예약 오류도 쓴다.
  * `own`이 있으면 `<own>.<code>` 전용 문구를 먼저 찾는다.
  */

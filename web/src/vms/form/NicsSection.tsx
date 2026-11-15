@@ -1,7 +1,7 @@
 import { Plus, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import type { Network, SecurityGroup } from "@/api/types";
+import type { Network, NicSpec, SecurityGroup } from "@/api/types";
 import { Field } from "@/components/Field";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -10,8 +10,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { MAX_NICS, type NicRow, type VmFormValues } from "@/vms/form";
+import { type DeviceMode, liveRemovable, savedCount } from "@/vms/hotplug";
 
-/** 네트워크 카드 행 */
+/**
+ * 네트워크 카드 행. 실행 중(`live`)에는 끝에 붙이기, 실행 중 붙인 것을 끝에서부터 떼기, 보안 그룹 바꾸기만 한다.
+ */
 export function NicsSection({
   values,
   errors,
@@ -19,7 +22,9 @@ export function NicsSection({
   onRowsChange,
   networks,
   securityGroups,
-  locked,
+  mode,
+  saved,
+  boot,
 }: {
   values: VmFormValues;
   errors: Record<string, string>;
@@ -28,10 +33,27 @@ export function NicsSection({
   onRowsChange: (nics: NicRow[]) => void;
   networks: Network[] | undefined;
   securityGroups: SecurityGroup[] | undefined;
-  /** 실행 중: NIC 개수·순서·MAC은 서버가 바꾸지 않는다. */
-  locked: boolean;
+  /**
+   * NIC를 바꾸는 방식(`deviceMode`). `locked`(하드웨어 기록이 없는 실행 중 VM): 개수·순서·MAC은 서버가 바꾸지
+   * 않는다. `restart`: 네트워크·모델도 바꾸지 못한다(보안 그룹만).
+   */
+  mode: DeviceMode;
+  /** 저장된(도는 QEMU에 붙은) NIC. `live`에서만 본다. */
+  saved: readonly NicSpec[];
+  /** 켤 때 단 NIC 수. 그 뒤의 것만 실행 중에 뗄 수 있다. */
+  boot: number;
 }) {
   const { t } = useTranslation();
+  const locked = mode === "locked" || mode === "restart";
+  const live = mode === "live";
+  const savedRows = live
+    ? savedCount(
+        values.nics,
+        saved,
+        (n, s) =>
+          n.network === s.network && n.model === s.model && n.mac.toLowerCase() === (s.mac ?? ""),
+      )
+    : 0;
   const setNic = (i: number, patch: Partial<NicRow>) =>
     onChange({ nics: values.nics.map((n, j) => (j === i ? { ...n, ...patch } : n)) });
   return (
@@ -40,80 +62,90 @@ export function NicsSection({
         <CardTitle>{t("vms.nics")}</CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
-        {locked && <p className="text-sm text-muted-foreground">{t("vmForm.nicsRunning")}</p>}
-        {values.nics.map((nic, i) => (
-          <fieldset
-            key={i}
-            aria-label={t("vmForm.nicN", { n: i + 1 })}
-            className="grid grid-cols-2 items-end gap-2 rounded-md border p-3 sm:grid-cols-4"
-          >
-            <Field id={`nic-${i}-network`} label={t("vms.network")}>
-              <NativeSelect
-                id={`nic-${i}-network`}
-                className="w-full"
-                value={nic.network}
-                // `user` 네트워크(QEMU NAT)에는 보안 그룹을 걸 수 없다.
-                onChange={(e) =>
-                  setNic(
-                    i,
-                    e.target.value === "user"
-                      ? { network: e.target.value, securityGroups: [] }
-                      : { network: e.target.value },
-                  )
-                }
+        {mode === "locked" && (
+          <p className="text-sm text-muted-foreground">{t("vmForm.nicsRunning")}</p>
+        )}
+        {live && <p className="text-sm text-muted-foreground">{t("vmForm.nicsLive")}</p>}
+        {values.nics.map((nic, i) => {
+          // 도는 장치: 네트워크·모델·MAC은 바꾸지 못한다(보안 그룹은 된다).
+          const fixed = mode === "restart" || (live && i < savedRows);
+          const removable = live ? liveRemovable(i, savedRows, boot) : !locked;
+          return (
+            <fieldset
+              key={i}
+              aria-label={t("vmForm.nicN", { n: i + 1 })}
+              className="grid grid-cols-2 items-end gap-2 rounded-md border p-3 sm:grid-cols-4"
+            >
+              <Field id={`nic-${i}-network`} label={t("vms.network")}>
+                <NativeSelect
+                  id={`nic-${i}-network`}
+                  className="w-full"
+                  disabled={fixed}
+                  value={nic.network}
+                  // `user` 네트워크(QEMU NAT)에는 보안 그룹을 걸 수 없다.
+                  onChange={(e) =>
+                    setNic(
+                      i,
+                      e.target.value === "user"
+                        ? { network: e.target.value, securityGroups: [] }
+                        : { network: e.target.value },
+                    )
+                  }
+                >
+                  <NativeSelectOption value="user">{t("vmForm.userNetwork")}</NativeSelectOption>
+                  {networks?.map((n) => (
+                    <NativeSelectOption key={n.id} value={n.name}>
+                      {n.name}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              </Field>
+              <Field id={`nic-${i}-model`} label={t("vms.model")}>
+                <NativeSelect
+                  id={`nic-${i}-model`}
+                  className="w-full"
+                  disabled={fixed}
+                  value={nic.model}
+                  onChange={(e) => setNic(i, { model: e.target.value as NicRow["model"] })}
+                >
+                  <NativeSelectOption value="virtio">virtio</NativeSelectOption>
+                  <NativeSelectOption value="e1000e">e1000e</NativeSelectOption>
+                </NativeSelect>
+              </Field>
+              <Field id={`nic-${i}-mac`} label={t("vms.mac")} error={errors[`nics.${i}.mac`]}>
+                {(a11y) => (
+                  <Input
+                    id={`nic-${i}-mac`}
+                    {...a11y}
+                    placeholder={t("vmForm.macAuto")}
+                    disabled={locked || fixed}
+                    value={nic.mac}
+                    onChange={(e) => setNic(i, { mac: e.target.value })}
+                  />
+                )}
+              </Field>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label={t("vmForm.removeNic", { n: i + 1 })}
+                disabled={!removable}
+                onClick={() => onRowsChange(values.nics.filter((_, j) => j !== i))}
               >
-                <NativeSelectOption value="user">{t("vmForm.userNetwork")}</NativeSelectOption>
-                {networks?.map((n) => (
-                  <NativeSelectOption key={n.id} value={n.name}>
-                    {n.name}
-                  </NativeSelectOption>
-                ))}
-              </NativeSelect>
-            </Field>
-            <Field id={`nic-${i}-model`} label={t("vms.model")}>
-              <NativeSelect
-                id={`nic-${i}-model`}
-                className="w-full"
-                value={nic.model}
-                onChange={(e) => setNic(i, { model: e.target.value as NicRow["model"] })}
-              >
-                <NativeSelectOption value="virtio">virtio</NativeSelectOption>
-                <NativeSelectOption value="e1000e">e1000e</NativeSelectOption>
-              </NativeSelect>
-            </Field>
-            <Field id={`nic-${i}-mac`} label={t("vms.mac")} error={errors[`nics.${i}.mac`]}>
-              {(a11y) => (
-                <Input
-                  id={`nic-${i}-mac`}
-                  {...a11y}
-                  placeholder={t("vmForm.macAuto")}
-                  disabled={locked}
-                  value={nic.mac}
-                  onChange={(e) => setNic(i, { mac: e.target.value })}
+                <X />
+              </Button>
+              {nic.network !== "user" && (
+                <NicGroups
+                  index={i}
+                  chosen={nic.securityGroups}
+                  groups={securityGroups}
+                  error={errors[`nics.${i}.securityGroups`]}
+                  onChange={(chosen) => setNic(i, { securityGroups: chosen })}
                 />
               )}
-            </Field>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label={t("vmForm.removeNic", { n: i + 1 })}
-              disabled={locked}
-              onClick={() => onRowsChange(values.nics.filter((_, j) => j !== i))}
-            >
-              <X />
-            </Button>
-            {nic.network !== "user" && (
-              <NicGroups
-                index={i}
-                chosen={nic.securityGroups}
-                groups={securityGroups}
-                error={errors[`nics.${i}.securityGroups`]}
-                onChange={(chosen) => setNic(i, { securityGroups: chosen })}
-              />
-            )}
-          </fieldset>
-        ))}
+            </fieldset>
+          );
+        })}
         {!locked && values.nics.length < MAX_NICS && (
           <div>
             <Button

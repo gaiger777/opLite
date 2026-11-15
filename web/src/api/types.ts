@@ -45,6 +45,12 @@ export type PlacementMode = Schemas["PlacementMode"];
 export type PlacementPolicy = Schemas["PlacementPolicy"];
 export type PlacementMove = Schemas["PlacementMove"];
 export type NodeLoadView = Schemas["NodeLoadView"];
+export type RunningHardware = Schemas["RunningHardware"];
+export type HotplugLayout = Schemas["HotplugLayout"];
+export type PendingChange = Schemas["PendingChange"];
+export type PendingReason = Schemas["PendingReason"];
+export type NodeHotplug = Schemas["NodeHotplug"];
+export type NicSpec = Schemas["NicSpec"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =

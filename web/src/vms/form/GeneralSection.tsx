@@ -7,7 +7,15 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Switch } from "@/components/ui/switch";
-import { defaultMachine, haActive, haUnavailable, type VmFormValues } from "@/vms/form";
+import {
+  defaultMachine,
+  haActive,
+  haUnavailable,
+  MAX_HOTPLUG_MEMORY_MIB,
+  MAX_VCPUS,
+  MEMORY_HOTPLUG_ALIGN_MIB,
+  type VmFormValues,
+} from "@/vms/form";
 import {
   MAX_GUEST_WATCH_SECS,
   MAX_HA_COUNT,
@@ -27,6 +35,7 @@ export function GeneralSection({
   creating,
   locked,
   haLocked,
+  live,
   autoMachine,
   onMachineChosen,
 }: {
@@ -41,6 +50,8 @@ export function GeneralSection({
   locked: boolean;
   /** 실행 중이고 HA가 활성이 아닌(없거나 `ignored`) VM은 HA를 활성으로 바꾸지 못한다(서버의 409). */
   haLocked: boolean;
+  /** 실행 중이고 서버가 하드웨어 변경을 핫플러그 Task로 적용한다(상한 안의 cores·메모리는 바로). */
+  live: boolean;
   /** 노드를 바꾸면 그 노드에 맞게 머신 기본값을 다시 정한다. */
   autoMachine: boolean;
   /** 사용자가 머신을 직접 골랐다. */
@@ -59,6 +70,9 @@ export function GeneralSection({
         <CardTitle>{t("vmForm.general")}</CardTitle>
       </CardHeader>
       <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        {live && (
+          <p className="text-sm text-muted-foreground sm:col-span-2">{t("vmForm.liveHint")}</p>
+        )}
         {creating && (
           <Field id="vm-name" label={t("common.name")} error={errors.name}>
             {(a11y) => (
@@ -94,6 +108,43 @@ export function GeneralSection({
               step={256}
               value={values.memory}
               onChange={(e) => onChange({ memory: e.target.value })}
+            />
+          )}
+        </Field>
+        <Field
+          id="vm-max-vcpus"
+          label={t("vmForm.maxVcpus")}
+          error={errors.maxVcpus}
+          hint={t("vmForm.maxVcpusHint")}
+        >
+          {(a11y) => (
+            <Input
+              id="vm-max-vcpus"
+              {...a11y}
+              type="number"
+              min={1}
+              max={MAX_VCPUS}
+              value={values.maxVcpus}
+              onChange={(e) => onChange({ maxVcpus: e.target.value })}
+            />
+          )}
+        </Field>
+        <Field
+          id="vm-max-memory"
+          label={t("vmForm.maxMemory")}
+          error={errors.maxMemory}
+          hint={t("vmForm.maxMemoryHint")}
+        >
+          {(a11y) => (
+            <Input
+              id="vm-max-memory"
+              {...a11y}
+              type="number"
+              min={MEMORY_HOTPLUG_ALIGN_MIB}
+              max={MAX_HOTPLUG_MEMORY_MIB}
+              step={MEMORY_HOTPLUG_ALIGN_MIB}
+              value={values.maxMemory}
+              onChange={(e) => onChange({ maxMemory: e.target.value })}
             />
           )}
         </Field>

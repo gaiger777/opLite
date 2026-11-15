@@ -36,6 +36,10 @@ cargo run -p oplctl -- vm snapshot schedule web  # 지금 예약과 마지막 �
 cargo run -p oplctl -- volume resize root --size 2G   # 늘리기만, 실행 중에도 된다
 ```
 
+실행 중인 VM에도 디스크·NIC를 붙이고 뗄 수 있다(`vm disk add`, `vm nic add` — macOS 노드에서 vCPU·메모리 바꾸기는 다음
+재시작 때 적용). 실행 중에 하드웨어를 바꾼 VM의 스냅샷은 다시 켤 때까지 디스크만 찍는다 —
+[VM 무중단 유형 변경](#vm-무중단-유형-변경).
+
 같은 Mac에 노드를 더하려면 포트와 디렉터리를 바꿔 orbivisord를 하나 더 띄우고, 조인 URL로 합류한다.
 
 ```bash
@@ -643,8 +647,10 @@ revision), VM NIC의 `security_groups: ["web"]`, Node `status.firewall`이다.
   `firewall_unsupported`). 실행 중인 VM의 그룹을 바꾸거나(`vm nic-sg`, 웹 VM 편집, `PUT /api/v1/vms/{name}`) 그룹
   규칙을 바꾸면 VM을 다시 켜지 않아도 몇 초 안에 적용된다. 다만 실행 중인 VM은 그룹이 없어도 NIC를 더하거나 빼거나
   순서·MAC을 바꿀 수 없고, 그룹을 건 NIC가 있는(바꾸기 전이나 뒤) VM은 실행 중에 **그룹만** 바꿀 수 있다 — 먼저
-  끈다(409 `vm_running`; 규칙은 NIC 순번과 MAC으로 tap을 찾으므로 도는 tap과 어긋나지 않게). 그룹이 없는 VM의
-  네트워크·모델 변경은 지금처럼 다음 시작부터 적용된다.
+  끈다(409 `vm_running`; 규칙은 NIC 순번과 MAC으로 tap을 찾으므로 도는 tap과 어긋나지 않게). 도는 NIC의 네트워크·모델
+  바꾸기는 그룹이 없어도 409다(이 버전의 노드가 켠 VM — 마이그레이션 대상이 도는 NIC로 켠다). 모든 노드가 `hotplug`를
+  알면 실행 중에도 NIC를 끝에 붙이고 실행 중 붙인 것을 끝에서부터 뗄 수 있다(그룹을 건 NIC는 붙이기 전에 규칙을 먼저
+  넣는다) — [VM 무중단 유형 변경](#vm-무중단-유형-변경).
 - **누가 바꾸나.** 그룹을 만들고 바꾸고 지우는 것은 admin만이다. VM NIC에 그룹을 걸거나 떼는 것은 VM 쓰기
   권한(operator 포함)이라 operator도 VM의 방화벽을 끌 수 있다(그룹을 모두 떼면 거르지 않는다).
 - **실시간 적용.** 노드마다 orbivisord가 클러스터의 모든 방화벽 NIC를 테이블 `bridge opl_<클러스터 태그>`(CA 지문 앞 12자)
@@ -1092,6 +1098,9 @@ disk_timeout = "12h"      # 로컬 디스크 복사가 따라잡기(ready)까지
   노드에서 쓸 수 없거나("node … cannot use storage pool … for disk …") 남은 메모리가 모자람 `no_capacity`, 다른
   작업(스냅샷·되돌리기·크기 늘리기 등) 중 `vm_busy`. 같은 노드나 로컬 디스크가 없는데 `pool`을 주면 **400**, 없는
   `pool`은 **404**, 아키텍처가 다르면 **400** `machine_arch_mismatch`.
+- **실행 중 바꾼 하드웨어.** 대상 QEMU는 원본의 도는 하드웨어(실행 중 붙인 vCPU·메모리·디스크·NIC 포함)로 켠다. 대상이
+  그 하드웨어를 못 돌리면 **409** `migration_unsupported`, 핫플러그 Task 중이면 `vm_busy`다 —
+  [VM 무중단 유형 변경](#vm-무중단-유형-변경).
 - **옮기는 동안.** VM은 `migrating`이고 켜기·끄기·재시작·스냅샷·복제·편집·지우기가 모두 **409** `vm_busy`다.
   콘솔은 열 수 있다(넘어가는 순간 끊겼다가 대상 노드로 다시 연결된다). 취소는 없다. 수렴하지 않으면 `auto-converge`가 게스트를 늦추고 시간 제한이 지나면 실패한다.
 - **실패.** 확정 전에 실패하면(대상 거절, 연결·TLS 실패, 시간 제한) 대상 QEMU를 끄고 원본이 계속 돈다. 작업
@@ -1907,6 +1916,141 @@ API 노드는 노드를 고를 수 있을 때만(노드 없이 켠 채 만들기
 메모리(리더가 바뀌면 사라짐)와 HA 옮기기 기록으로만 지킨다. 뒤 버전이 설정 `placement`에 키를 더하면 그 설정을 쓰는 동안 옛
 노드는 리더의 상태를 읽지 못한다(부하 없이 놓고 `GET /placement`는 503). 문턱·효과 상수는 실제 다중 노드 부하로 다시 볼
 것이다.
+
+## VM 무중단 유형 변경
+
+실행 중인 VM의 vCPU·메모리를 늘리거나 줄이고 디스크·NIC를 붙이거나 뗀다(Proxmox VE의 hotplug, VMware의 CPU·메모리
+hot-add와 같은 자리). 따로 명령이 있는 것이 아니라 실행 중인 VM의 스펙을 바꾸면(`orbivisorctl vm set`, 웹 VM 편집,
+`PUT /api/v1/vms/{key}`) 그 VM의 노드가 **핫플러그 Task**(`vm-hotplug`)로 도는 QEMU를 스펙에 맞춘다. 실행 중에 할 수 없는
+것은 스펙에만 저장하고 **다음 재시작 때 적용할 것**(보류)으로 VM에 남는다. 모든 노드가 이 버전이어야 한다(노드가 알리는
+기능 `hotplug`, 아래 "업그레이드").
+
+| 바꾸는 것 | 실행 중에 바로 | 다음 재시작 때 |
+|---|---|---|
+| vCPU | x86_64 Linux 노드에서 상한(`cpu.max_vcpus`) 안의 `cpu.cores` — 켤 때 수 아래로는 못 줄임 | aarch64 노드(QEMU `virt`에 CPU 핫플러그가 없다), macOS 노드, 소켓 수·CPU 모델·상한 바꾸기 |
+| 메모리 | virtio-mem이 있는 Linux 노드에서 상한(`max_memory_mib`) 안, 128 MiB 단위 — 켤 때 크기 아래로는 못 줄임 | macOS 노드, svc01 같은 aarch64 QEMU 8.2(virtio-mem은 aarch64에서 QEMU 9.0부터), 상한 바꾸기 |
+| 디스크 | 끝에 붙이기(virtio-blk만)·실행 중 붙인 것 끝에서부터 떼기 — 디스크·NIC 합쳐 8개까지 | 하지 않는다: 켤 때 단 디스크 떼기·가운데 떼기·순서·버스·부팅 순서 바꾸기는 **409** `vm_running`(먼저 끈다) |
+| NIC | 끝에 붙이기·실행 중 붙인 것 끝에서부터 떼기, 보안 그룹 바꾸기 | 하지 않는다: 켤 때 단 NIC 떼기·네트워크·모델·MAC·순서 바꾸기는 **409** `vm_running` |
+| 펌웨어·머신 | — | 늘 |
+
+```bash
+orbivisorctl vm create web --cores 2 --max-vcpus 8 --memory 4096 --max-memory 16384 --disk root --nic lan --start
+orbivisorctl vm set web --cores 4 --memory 8192   # Task를 기다려 결과를 알린다
+# vm web: hardware updated
+# vm web: applied while running
+orbivisorctl vm set web --memory 32768
+# vm web: hardware updated
+# vm web: pending until restart:
+#   memory_mib: 8192 -> 32768 (limit)
+orbivisorctl vm disk add web data                 # 끝에 붙임(--bus virtio-blk|sata --boot-order N), 꺼진 VM에도 된다
+orbivisorctl vm disk remove web data
+orbivisorctl vm nic add web lan,sg=web --model virtio   # NETWORK[,sg=A+B] [--mac MAC]
+orbivisorctl vm nic remove web 1                  # 순번(0부터)이나 MAC
+orbivisorctl vm hotplug web                       # 실패한 변경을 다시 해 본다(actions/hotplug)
+orbivisorctl vm get web                           # 표준 출력은 JSON, 하드웨어 줄과 보류는 표준 오류
+# hardware: vcpus 4/8, memory 8192/16384 MiB, hotplug ports 1/8 used
+# pending:
+#   memory_mib: 8192 -> 32768 (limit)
+```
+
+`vm set`·`vm disk`·`vm nic`은 `--no-wait`면 Task를 기다리지 않는다(`vm web: hotplug task <ID> started`). Task가 실패하면
+그 이유로 끝난다(종료 코드 1). 상한은 `vm set --max-vcpus N | --no-max-vcpus`, `--max-memory MiB | --no-max-memory`로
+바꾸고 다음 시작부터 쓴다.
+
+웹은 VM 만들기·편집의 일반 절에 "최대 vCPU"·"최대 메모리 (MiB)"(비우면 없음)가 있고, 실행 중인 VM의 편집은 vCPU 코어·
+메모리·상한을 그대로 열어 두며("최대값 안의 vCPU 코어와 메모리는 노드가 지원하면 곧바로…") 디스크·NIC 절은 끝에 붙이기와
+실행 중 붙인 마지막 것 떼기만 연다(켤 때 단 장치는 잠금, 핫플러그 없이 켠 VM이면 "한 번 다시 켜야" 안내). 저장하면
+"<VM> 하드웨어 바꾸기" Task 알림이 뜬다(보류가 있으면 경고와 함께 끝난다). VM 상세는 머리에 "재시작 필요" 배지, 요약에
+vCPU `4 (최대 8)`·메모리 `8 GiB (최대 16 GiB)`·핫플러그 포트, "다음 재시작 때 적용" 목록(항목·지금 값 → 바랄 값·이유,
+실패면 그 까닭과 "다시 적용" 단추), 하드웨어 탭의 "실행 중 붙임" 표시를 보인다. 노드 표의 하이퍼바이저 칸에 "핫플러그:
+vCPU 예/아니오, 메모리 예/아니오"가 있다. API는 `PUT /api/v1/vms/{key}`(**200** VM, Task를 만들었으면 응답 헤더
+`orbivisor-task: <Task id>` — CORS로도 읽힌다), `POST /api/v1/vms/{key}/actions/hotplug`(**202** Task, 운영자 권한),
+VM `spec.cpu.max_vcpus`·`spec.max_memory_mib`, `status.hardware`(아래), Node `status.hotplug`다.
+
+- **상한.** `cpu.max_vcpus`는 `sockets × cores` 이상·`sockets`의 배수·256 이하, `max_memory_mib`는 `memory_mib` 이상·512 GiB
+  (524288 MiB) 이하이고 있으면 둘 다 128 MiB 배수다(아니면 **400**). 상한을 두면 QEMU를 그 자리(빈 vCPU 슬롯, virtio-mem 장치)와 함께
+  켠다. 배치·용량은 **지금 값으로** 센다(상한을 예약하지 않는다 — VMware의 hot-add와 같다). 그래서 실행 중 메모리를 바로
+  늘릴 때 그 노드의 미할당 메모리가 늘리는 양보다 적으면 **409** `no_capacity`("node X has only N MiB of unallocated memory;
+  VM Y needs M MiB more")이고 스펙은 그대로다. HA 용량 예약은 다른 스펙 변경과 같다.
+- **vCPU 손잡이는 `cores`.** 상한을 둔 VM은 소켓 `S`개에 소켓마다 `max / S`개 자리로 켜고, 켜진 vCPU는 앞에서부터 찬다.
+  실행 중에는 `sockets`를 그대로 두고 `cores`만 바꾼다(소켓을 바꾸면 다음 재시작).
+- **게스트 요건.** 늘린 메모리는 게스트의 virtio-mem 드라이버가 받아야 보인다(Linux 5.8 이상, Windows는 virtio-win
+  드라이버) — 드라이버가 없어도 QEMU는 요청을 받으므로 Task는 성공하고 기록은 요청한 크기다. 메모리 줄이기, x86 vCPU 떼기,
+  q35에서 디스크·NIC 떼기(ACPI PCIe 핫플러그)는 **게스트가 내려 줘야** 끝난다 — 60초 안에 끝나지 않으면 Task가 실패한다
+  (아래). QEMU 8.2의 q35는 게스트 OS가 ACPI CPU 핫플러그를 켜기 전에는(OS가 아직 없거나 옛 OS) vCPU 떼기를 곧바로
+  거절한다 — vCPU 수는 그대로이고 Task가 실패하며 `failed` 보류("the guest does not support vCPU removal yet; restart the VM
+  to apply")가 된다(떼는 중이 아니므로 옮길 수 있다). aarch64 `virt`의 디스크·NIC 떼기는 게스트 없이 곧바로 끝난다.
+- **보류.** 실행 중에 적용하지 못한 것은 `status.hardware.pending`에 항목(`vcpus`·`cpu`·`cpu.max_vcpus`·`memory_mib`·
+  `max_memory_mib`·`firmware`·`machine`)과 도는 값·바랄 값·이유로 남는다. 이유는 `restart`(켤 때만 정해짐: 토폴로지·모델·
+  상한·펌웨어·머신), `unsupported`(이 노드가 못 함: CPU 핫플러그·virtio-mem 없음, 핫플러그 없이 켬), `limit`(켤 때 정한 범위
+  밖: 상한 위, 켤 때 값 아래), `failed`(해 봤으나 실패 — `detail`에 까닭)다. 보류는 핫플러그 Task가 끝날 때마다 다시 세고,
+  **VM을 다시 켜면**(`vm reboot`, 끄고 켜기, HA 복구) 사라진다. 게스트 안에서 재부팅하면 QEMU가 그대로라 적용되지 않는다.
+- **실패와 되돌림.** Task는 첫 실패에서 멈춘다. vCPU·메모리는 닿은 값을 기록하고 그 항목을 `failed` 보류로 남긴다(예:
+  "the guest released only 2048 of 4096 MiB within 60s", "the guest did not release vCPU 7 within 60s"). 디스크·NIC를
+  붙이지 못하면 붙이던 장치를 걷어 내고(볼륨·tap도) **스펙의 디스크·NIC 목록을 도는 장치로 되돌린다**("disk \"data\" was
+  not added: …; the change was undone"). 떼기가 시간(60초)을 넘기면 스펙은 **뗀 그대로** 두고, 장치는 QEMU에 남아 기록의
+  `status.hardware.unplugging`(QEMU 장치 id)과 `failed` 보류("the guest has not released disk \"data\" yet; run `vm hotplug`
+  again")가 된다 — 게스트가 내려 준 뒤 `vm hotplug`(웹 "다시 적용")가 떼기를 마치고 볼륨을 끈다. 그동안 그 장치는 방화벽
+  규칙도 그대로이고(같은 순번에 새 NIC가 스펙에 있어도 tap은 붙은 NIC의 규칙), 그 디스크의 볼륨은 쓰는 중이라 지우기·다른
+  VM에 붙이기·크기 늘리기가 **409** `volume_in_use`("volume \"data\" is still being released by VM \"web\"; run `vm hotplug`
+  or restart the VM")이며 유휴 볼륨 정리도 끄지 않고, 디스크·NIC 목록을 바꾸는 PUT은 **409** `vm_busy`("the guest is still
+  releasing disk \"data\" from VM \"web\"; run `vm hotplug` first" — CPU·메모리만 바꾸기는 된다), VM은 옮길 수 없다(아래).
+  게스트가 내려 주지 않은 vCPU도 같다(`unplugging`의 `cpu{i}`). `device_del`을 보낸 뒤 QMP가 끊기거나 답하지 않은 떼기도
+  QEMU가 받았을 수 있어 같은 길이다. 앞서 중단된 Task가 붙여 놓고 기록하지 못한 장치는 다음 Task가 그대로 기록한다(장치
+  없이 남은 블록 노드·백엔드는 지우고 다시 붙인다). 장치가 빠진 뒤 블록 노드·tap을 정리하지 못한 것은 경고만 남긴다(떼기는 된
+  것이다). 실패한 vCPU·메모리는 게스트가 드라이버를 올린 뒤 `vm hotplug`로 다시 해 본다. Task 도중 VM이 다시 켜지거나
+  옮겨지면(노드·pid가 바뀜) 아무것도 되돌리지 않고 실패한다("the VM was restarted or moved while its hardware was being
+  changed; nothing was undone").
+- **노드 능력.** orbivisord가 시작할 때 한 번 정해 `node get`의 `status.hotplug`에 알린다(이 필드를 모르는 옛 리더가 지우면
+  노드의 주기 검사가 다시 쓴다): `cpu`는 x86_64 Linux 노드(macOS의 HVF는 아니다), `memory`는
+  `qemu-system-* -device help`에 `virtio-mem-pci`가 있는 노드(macOS Homebrew QEMU에는 없다). 디스크·NIC는 이 버전의 모든
+  노드가 한다(빈 PCIe 루트 포트 8개 — macOS 노드는 디스크·NIC만).
+- **마이그레이션.** 대상 노드는 원본의 **도는 하드웨어**(`status.hardware` — 켤 때 CPU·메모리·펌웨어·머신과 붙인 장치)로
+  QEMU를 켜므로 실행 중에 바꾼 VM도 옮길 수 있다. 대상이 그 하드웨어를 못 돌리면(핫플러그 배치로 켰는데 `hotplug`를 모름,
+  붙인 vCPU·CPU 상한인데 CPU 핫플러그 없음, virtio-mem인데 없음) **409** `migration_unsupported`("cannot migrate VM \"web\":
+  node \"node2\" has no virtio-mem")이고, 균형 조정기·비우기도 그런 노드를 고르지 않는다. 핫플러그 Task가 끝나지 않았거나
+  스펙의 디스크·NIC가 도는 장치와 다르면(게스트가 아직 내려 주지 않은 장치) 마이그레이션은 **409** `vm_busy`("…; run `vm
+  hotplug` or restart it"), 옮기는 중의 하드웨어 바꾸기도 **409** `vm_busy`다. 원본 노드는 보내기 전에 도는 QEMU의 장치
+  (`/machine/peripheral`)를 기록과 견주고 다르면 대상 QEMU를 켜거나 디스크를 복사하기 전에 멈춘다("the running QEMU devices
+  do not match the VM's hardware record: …"). 균형 조정기는 하드웨어 변경이 끝나지 않은 VM을 옮기지 않고, 대상의 미할당
+  메모리를 도는 메모리(줄이기가 실패했으면 스펙보다 큼)와 견준다.
+- **메모리 스냅샷.** 메모리를 담은 스냅샷은 되돌릴 때 같은 장치로 켜야 한다. 그래서 실행 중에 바꾼 하드웨어나 보류가
+  있거나 핫플러그 Task가 끝나지 않은 VM은 `memory`를 주지 않은 스냅샷과 예약 스냅샷을 디스크만 찍고, `memory: true`는
+  **409** `snapshot_unsupported`("…; restart it to take a snapshot with memory")다. 메모리 스냅샷은 찍을 때의 하드웨어를
+  적어 두고 되돌리기는 그 하드웨어로 켠다. `hotplug`를 모르는 노드가 들어와 있는 동안 핫플러그 배치로 도는 VM은 하드웨어를
+  적을 수 없어 같은 규칙으로 디스크만 찍는다(`memory: true`는 **409** `snapshot_unsupported`). 웹의 스냅샷 대화상자도 이런
+  VM에는 메모리를 묻지 않고 까닭을 적으며, 서버가 스냅샷을 거절하면(`snapshot_unsupported`·`vm_busy` — 화면의 VM이 늦어
+  핫플러그 Task를 모를 때 등) 서버의 까닭을 그대로 보인다.
+- **다른 작업과.** 스냅샷·되돌리기·복제·백업 Task가 끝나지 않은 동안의 하드웨어 바꾸기(PUT·`vm hotplug`)는 **409**
+  `vm_busy`이고, 디스크를 바꾸는 PUT은 그 VM 디스크의 크기 늘리기 Task가 끝나지 않았어도 **409** `vm_busy`다. 이미 만든
+  핫플러그 Task는 그 VM의 줄에서 앞의 Task(크기 늘리기 등)가 끝난 뒤 돈다. `vm hotplug`도 메모리를 바로 늘리면 노드의
+  미할당 메모리를 본다(**409** `no_capacity`). 켜거나 끄는 중의 하드웨어 바꾸기는 **409** `vm_busy`("VM \"web\" is starting or stopping; change its hardware when it is running or
+  stopped")이고, 앞의 핫플러그 Task가 끝나지 않았으면 하드웨어 바꾸기도 **409** `vm_busy`("a hardware change of VM \"web\"
+  is still being applied (task …); try again when it finishes")다 — CLI는 `vm_busy`를 1초마다 30번까지 다시 해 본다. 같은
+  PUT으로 끄는(`power: stopped`) VM의 하드웨어 변경과, 켜져 있어야 하지만 QEMU가 없는 VM(실패·다시 켜기 대기)의 CPU·메모리
+  변경은 Task 없이 다음 시작부터 쓴다(끄면서 바꾸기도 앞의 핫플러그 Task를 기다린다). 그렇게 디스크·NIC를 바꾸며 끈 VM을
+  QEMU가 끝나기 전에 다시 켜면(PUT·`vm start`) **409** `vm_busy`("VM \"web\" is stopping with changed devices; start it
+  after it stops")다. 켜는 동안 Task 없이 받은
+  CPU·메모리 변경은 켠 뒤 보류(`restart`, "changed while the VM was starting; restart it or run `vm hotplug`")로 남는다. 웹은 이런 409의 서버 문구를 그대로 보인다. 실행 중 붙인 디스크는 dirty bitmap이 없어 다음 증분 백업이 그 디스크를 전체로 담는다. 크기 늘리기·백업·
+  디스크 통계·방화벽은 그대로다.
+- **빈 포트.** 실행 중 붙이는 디스크·NIC는 켤 때 둔 빈 PCIe 루트 포트(`hp0`~`hp7`, 슬롯 0x1e)에 들어간다. 다 쓰면 **409**
+  `hotplug_unavailable`("no free hotplug port (8 in use); restart VM \"web\" to add more disks or NICs while it runs")이고,
+  다시 켜면 붙인 장치가 보통 장치가 되어 포트가 빈다. **다시 켠 뒤 게스트의 NIC 이름이 바뀔 수 있다**(꺼진 VM에 디스크·NIC를
+  더할 때와 같다 — 장치의 PCI 주소가 스펙 순서로 다시 정해진다).
+- **업그레이드.** 모든 노드(위트니스 포함)가 `hotplug`를 알아야 상한을 쓸 수 있고(아니면 **409** `cluster_upgrading`, 받은
+  백업의 상한은 버린다) 실행 중 적용을 한다. 그 전에는 지금처럼 실행 중 바꾼 CPU·메모리·펌웨어는 다음 시작부터 쓰고 디스크·
+  NIC는 **409** `vm_running`이다. 모든 노드를 올리기 전에 켠 VM은 핫플러그 없이 켠 것이라(`vm get`의 `hardware: no hotplug
+  (started without it)`) **한 번 다시 켜야** 디스크·NIC를 붙이고 뗄 수 있다. 계획 54 전 버전에서 실행 중에 CPU·메모리·
+  펌웨어를 바꾼 VM은 새 노드가 다시 붙을 때 스펙으로 기록(`legacy`)하므로 기록이 도는 QEMU와 다를 수 있다 — 올린 뒤 그런
+  VM은 한 번 다시 켜는 것이 좋다. 노드는 켠 VM의 하드웨어를 VM 실행 디렉터리(`hardware.json`)에도 남겨, 기록 없이 다시
+  붙을 때 그것을 쓴다. 이 버전의 노드가 켠(하드웨어 기록이 있는) VM은 업그레이드 중에도 방화벽 없는 NIC의 네트워크·모델을
+  실행 중에 바꾸는 것이 **409** `vm_running`이다(전에는 스펙만 바뀌어 마이그레이션 대상이 새 네트워크로 켜졌다).
+- **한계.** 켤 때 단 디스크·NIC는 실행 중에 뗄 수 없다(지금 VM의 PCI 주소를 바꾸지 않으려고 부팅 장치는 루트 포트에 두지
+  않는다). aarch64의 CPU 핫플러그, virtio-scsi 디스크 붙이기는 없다. 떼기 시간 제한(60초)을 넘긴 뒤 게스트가 내려 준 장치는
+  다음 핫플러그 Task(`vm hotplug`) 전까지 기록의 `unplugging`에 남고, 그 떼기를 `vm hotplug`로 마저 해야 그 자리에 다시
+  붙이거나 디스크·NIC 목록을 바꿀 수 있다. 실행 디렉터리의 `hardware.json`은 켤 때의 모양만이라, 기록 없이 다시 붙은
+  노드는 그 뒤 실행 중에 바꾼 것을 모른다. 최대 메모리가 호스트 CPU의 물리 주소 폭을 넘으면
+  QEMU가 켜지지 않는다(`maxmem` — 상한을 512 GiB로 둔 까닭).
 
 ## 제어부 가용성
 

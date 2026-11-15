@@ -267,7 +267,18 @@ export function NodesPage() {
               </TableCell>
               {/* VXLAN 패킷을 주고받는 주소. 위트니스와 정하지 못한 노드는 없다. */}
               <TableCell className="font-mono text-xs">{node.status.underlay ?? "—"}</TableCell>
-              <TableCell>{node.status.hypervisor}</TableCell>
+              <TableCell>
+                {node.status.hypervisor}
+                {/* 실행 중 vCPU·메모리 핫플러그. 디스크·NIC는 이 기록이 있는 모든 노드가 한다. 옛 노드·위트니스는 없다. */}
+                {node.status.hotplug && (
+                  <span className="block text-xs text-muted-foreground">
+                    {t("nodes.hotplug", {
+                      cpu: t(node.status.hotplug.cpu ? "nodes.yes" : "nodes.no"),
+                      memory: t(node.status.hotplug.memory ? "nodes.yes" : "nodes.no"),
+                    })}
+                  </span>
+                )}
+              </TableCell>
               {/* 옛 버전으로 등록한 노드는 모른다. */}
               <TableCell>{node.status.arch ?? "—"}</TableCell>
               {/* 펜싱이 꺼진 노드(위트니스 포함)는 HA VM을 돌리지 않는다. */}

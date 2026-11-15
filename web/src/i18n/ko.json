@@ -81,7 +81,8 @@
     "vm_pinned": "VM이 고정되어 균형 조정기가 옮기지 않습니다. \"균형 조정기가 옮기지 않음\"을 끄거나 직접 마이그레이션하세요.",
     "recommendation_stale": "추천이 지금 클러스터와 맞지 않습니다: {{message}}",
     "placement_busy": "마이그레이션 둘이 이미 진행 중입니다. 하나가 끝난 뒤 적용하세요.",
-    "placement_unavailable": "클러스터 리더에서 배치 상태를 읽지 못했습니다. 잠시 뒤 다시 시도하세요."
+    "placement_unavailable": "클러스터 리더에서 배치 상태를 읽지 못했습니다. 잠시 뒤 다시 시도하세요.",
+    "hotplug_unavailable": "VM이 실행 중이라 하드웨어를 바꿀 수 없습니다: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -187,7 +188,8 @@
       "node-drain": "{{target}} 비우기",
       "node-power-off": "{{target}} 전원 끄기(펜싱)",
       "ha-check": "{{target}}의 HA 검사 {{check}}: {{action}}",
-      "bond-degraded": "{{target}}의 본딩 {{bond}} 포트 이상"
+      "bond-degraded": "{{target}}의 본딩 {{bond}} 포트 이상",
+      "vm-hotplug": "{{target}} 하드웨어 바꾸기"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
@@ -329,7 +331,32 @@
     "guestWatch": "게스트 에이전트 감시",
     "guestWatchSecs": "{{secs}}초 동안 답이 없으면 다시 켬",
     "pinned": "자동 옮기기",
-    "pinnedOn": "제외(고정)"
+    "pinnedOn": "제외(고정)",
+    "restartNeeded": "재시작 필요",
+    "withMax": "{{value}} (최대 {{max}})",
+    "hotplug": "핫플러그",
+    "hotplugPorts": "핫플러그 포트 {{used}}/{{ports}} 사용",
+    "hotplugOff": "없음(핫플러그 없이 켬)",
+    "hotAdded": "실행 중 붙임",
+    "pendingTitle": "다음 재시작 때 적용",
+    "pendingNote": "실행 중에 적용하지 못한 변경입니다. 게스트 안에서 재부팅하면 적용되지 않습니다. VM을 재시작하거나 끄고 켜세요.",
+    "pendingValue": "{{running}} → {{wanted}}",
+    "pendingReason": {
+      "restart": "켤 때만 정해짐",
+      "unsupported": "이 노드가 지원하지 않음",
+      "limit": "켤 때 정한 범위 밖",
+      "failed": "실패"
+    },
+    "pendingField": {
+      "vcpus": "vCPU",
+      "cpu": "CPU",
+      "cpu_max_vcpus": "최대 vCPU",
+      "memory_mib": "메모리 (MiB)",
+      "max_memory_mib": "최대 메모리 (MiB)",
+      "firmware": "펌웨어",
+      "machine": "머신 타입"
+    },
+    "applyAgain": "다시 적용"
   },
   "snapshots": {
     "created": "만든 시각",
@@ -347,6 +374,7 @@
     "createDescription": "VM의 디스크, 펌웨어 변수, 설정을 저장해 나중에 이 시점으로 돌아올 수 있게 합니다.",
     "includeMemory": "메모리 포함",
     "includeMemoryHint": "실행 상태도 저장합니다. 되돌리면 VM이 그때 상태에서 이어서 실행됩니다.",
+    "hotplugHint": "실행 중에 하드웨어를 바꿨거나 다시 시작해야 적용될 변경이 있어 디스크만 담습니다. 메모리를 담으려면 VM을 다시 시작하세요.",
     "unsupported": "디스크가 모두 qcow2이거나, 모두 LVM-thin 풀에 있거나, 모두 ZFS 풀에 있거나, 모두 Ceph RBD 풀에 있는 VM만 스냅샷을 만들 수 있습니다. {{volume}}은(는) {{format}}입니다.",
     "busy": "VM이 시작·정지·마이그레이션하는 중입니다. 끝나면 스냅샷을 만들고 되돌리고 지울 수 있습니다.",
     "revert": "되돌리기",
@@ -1145,7 +1173,10 @@
       "checks": "상태 검사",
       "noChecks": "노드가 보고한 상태 검사가 없습니다.",
       "since": "시작"
-    }
+    },
+    "hotplug": "핫플러그: vCPU {{cpu}}, 메모리 {{memory}}",
+    "yes": "예",
+    "no": "아니오"
   },
   "accounts": {
     "currentPassword": "현재 비밀번호",
@@ -1425,7 +1456,13 @@
       "securityGroups": "보안 그룹은 8개까지 고를 수 있습니다.",
       "haCount": "0~10입니다.",
       "haPriority": "0~100.",
-      "guestWatch": "30~3600초."
+      "guestWatch": "30~3600초.",
+      "maxVcpusLow": "소켓 × 코어 이상이어야 합니다.",
+      "maxVcpusSockets": "소켓 수의 배수여야 합니다.",
+      "maxVcpusHigh": "256 이하여야 합니다.",
+      "maxMemoryLow": "메모리 이상이어야 합니다.",
+      "maxMemoryHigh": "524288 MiB(512 GiB) 이하여야 합니다.",
+      "memoryAlign": "최대값이 있으면 메모리와 최대 메모리가 128 MiB의 배수여야 합니다."
     },
     "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}",
     "schedule": "예약 스냅샷",
@@ -1462,7 +1499,16 @@
     "guestWatchSecs": "답이 없는 시간(초)",
     "guestWatchSecsHint": "30~3600.",
     "pinned": "균형 조정기가 옮기지 않음",
-    "pinnedHint": "균형 조정기가 이 VM을 옮기지 않습니다. HA 복구, 노드 비우기, 직접 시작한 마이그레이션은 그대로 옮깁니다."
+    "pinnedHint": "균형 조정기가 이 VM을 옮기지 않습니다. HA 복구, 노드 비우기, 직접 시작한 마이그레이션은 그대로 옮깁니다.",
+    "maxVcpus": "최대 vCPU",
+    "maxVcpusHint": "비우면 없음. 실행 중에 x86_64 노드에서 vCPU 코어를 여기까지 늘릴 수 있습니다. 다음 시작부터 적용됩니다.",
+    "maxMemory": "최대 메모리 (MiB)",
+    "maxMemoryHint": "비우면 없음. 실행 중에 virtio-mem이 있는 Linux 노드에서 메모리를 여기까지 늘릴 수 있습니다. 다음 시작부터 적용됩니다.",
+    "liveHint": "최대값 안의 vCPU 코어와 메모리는 노드가 지원하면 곧바로 적용됩니다. 그 밖의 CPU·메모리·펌웨어·머신 변경은 다음 재시작 때 적용됩니다.",
+    "runningNoteLive": "VM이 실행 중이라 노드는 바꿀 수 없습니다. 하드웨어 변경은 되는 것은 실행 중에 적용하고, 나머지는 VM 화면에 보이며 다음 재시작 때 적용됩니다.",
+    "restartForHotplug": "핫플러그 없이 켠 VM입니다. 실행 중에 디스크·인터페이스를 붙이고 떼려면 한 번 다시 켜야 합니다.",
+    "disksLive": "실행 중에는 볼륨을 끝에 붙이고(virtio-blk만, 장치 8개까지) 실행 중 붙인 디스크를 끝에서부터 뗄 수 있습니다. 켤 때 단 디스크는 바꿀 수 없습니다.",
+    "nicsLive": "실행 중에는 인터페이스를 끝에 붙이고(장치 8개까지) 실행 중 붙인 인터페이스를 끝에서부터 뗄 수 있습니다. 도는 인터페이스의 네트워크·모델·MAC은 바꿀 수 없고 보안 그룹은 바꿀 수 있습니다."
   },
   "console": {
     "connecting": "연결 중…",

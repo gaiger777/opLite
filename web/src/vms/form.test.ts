@@ -226,3 +226,42 @@ it("says why HA cannot be turned on for the chosen node", () => {
   expect(haUnavailable([fenced, off], "")).toBeNull();
   expect(haUnavailable([off, witness], "")).toEqual({ key: "vmForm.haNoNode" });
 });
+
+it("checks the hotplug maximums like the server", () => {
+  const v = { ...emptyForm("q35"), name: "web", sockets: 2, cores: "2", memory: "2048" };
+  // 비우면 상한 없음이고 보내지 않는다.
+  expect(validate(v, true)).toEqual({});
+  expect(toSpec(v, "stopped").cpu).not.toHaveProperty("max_vcpus");
+  expect(toSpec(v, "stopped")).not.toHaveProperty("max_memory_mib");
+  for (const [maxVcpus, error] of [
+    ["3", "vmForm.errors.maxVcpusLow"],
+    ["5", "vmForm.errors.maxVcpusSockets"],
+    ["258", "vmForm.errors.maxVcpusHigh"],
+    ["4.5", "vmForm.errors.maxVcpusLow"],
+  ] as const) {
+    expect(validate({ ...v, maxVcpus }, true)).toEqual({ maxVcpus: error });
+  }
+  for (const [maxMemory, memory, error] of [
+    ["1024", "2048", "vmForm.errors.maxMemoryLow"],
+    ["524416", "2048", "vmForm.errors.maxMemoryHigh"],
+    ["4100", "2048", "vmForm.errors.memoryAlign"],
+    ["4096", "2000", "vmForm.errors.memoryAlign"],
+  ] as const) {
+    expect(validate({ ...v, memory, maxMemory }, true)).toEqual({ maxMemory: error });
+  }
+  const set = { ...v, maxVcpus: "4", maxMemory: "524288" };
+  expect(validate(set, true)).toEqual({});
+  expect(toSpec(set, "stopped").cpu).toEqual({ sockets: 2, cores: 2, model: "host", max_vcpus: 4 });
+  expect(toSpec(set, "stopped").max_memory_mib).toBe(524288);
+  // 상한이 있는 VM을 폼으로 읽고 다시 보내면 그대로다.
+  const web = vm("web", "running", {
+    spec: {
+      ...vm("web", "running").spec,
+      cpu: { sockets: 1, cores: 2, model: "host", max_vcpus: 8 },
+      max_memory_mib: 16384,
+      snapshot_schedule: null,
+    },
+  });
+  expect(fromVm(web)).toMatchObject({ maxVcpus: "8", maxMemory: "16384" });
+  expect(toSpec(fromVm(web), "running")).toEqual(web.spec);
+});

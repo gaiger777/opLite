@@ -9,16 +9,17 @@ import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
-import { errorMessage } from "@/i18n/errors";
+import { errorMessage, HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
 import { poolFormats } from "@/storage/pools";
 import { isStopped } from "@/vms/actions";
 import { defaultMachine, emptyForm, fromVm, validate, type VmFormValues } from "@/vms/form";
 import { DisksSection } from "@/vms/form/DisksSection";
 import { GeneralSection } from "@/vms/form/GeneralSection";
 import { haEnabled } from "@/vms/ha";
+import { deviceMode } from "@/vms/hotplug";
 import { NicsSection } from "@/vms/form/NicsSection";
 import { ScheduleSection } from "@/vms/form/ScheduleSection";
-import { createVm, createVolume, isConflict, updateVm } from "@/vms/form/submit";
+import { createVm, createVolume, isConflict, trackHotplug, updateVm } from "@/vms/form/submit";
 import { formSnapshotSupport } from "@/vms/snapshots";
 import { useVmByName } from "@/vms/VmDetailPage";
 
@@ -66,8 +67,11 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const abort = useRef<AbortController | null>(null);
   useEffect(() => () => abort.current?.abort(), []);
   const creating = vm === undefined;
-  // 멈추지 않은 VM(서버의 `is_stopped`가 아닌)의 노드·디스크와 NIC 개수·순서·MAC은 서버가 바꾸지 않는다.
+  // 멈추지 않은 VM(서버의 `is_stopped`가 아닌)의 노드는 서버가 바꾸지 않는다.
   const locked = !creating && !isStopped(vm);
+  // 실행 중인 VM의 디스크·NIC: 핫플러그 배치로 켰으면 끝에 붙이기·실행 중 붙인 것 떼기, 아니면 잠금
+  const mode = deviceMode(vm);
+  const layout = vm?.status.hardware?.layout;
 
   const change = (patch: Partial<VmFormValues>) => setValues((v) => ({ ...v, ...patch }));
   // 행을 넣거나 빼면 행 번호로 단 오류가 다른 행을 가리키므로 지운다.
@@ -144,7 +148,11 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           void navigate(`/vms/${encodeURIComponent(values.name)}`);
         }
       } else {
-        await updateVm(vm, revision, values);
+        const task = await updateVm(vm, revision, values);
+        // 실행 중인 VM의 하드웨어를 바꾸는 Task를 알림으로 지켜본다.
+        if (task) {
+          void trackHotplug(task, t("tasks.op.vm-hotplug", { target: vm.name }));
+        }
         if (!signal.aborted) {
           void navigate(`/vms/${encodeURIComponent(vm.name)}`);
         }
@@ -153,7 +161,10 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
       if (signal.aborted) {
         return;
       }
-      const message = errorMessage(t, err);
+      // 하드웨어를 바꾸지 못한 까닭(어느 장치를 왜)은 서버의 설명이 말한다.
+      const message = creating
+        ? errorMessage(t, err)
+        : serverErrorMessage(t, err, HOTPLUG_ERROR_CODES);
       setFailure({
         message:
           created.length > 0
@@ -173,7 +184,15 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
       <h1 className="text-2xl font-semibold">
         {creating ? t("vmForm.createTitle") : t("vmForm.editTitle", { name: vm.name })}
       </h1>
-      {locked && <p className="text-sm text-muted-foreground">{t("vmForm.runningNote")}</p>}
+      {mode === "locked" && (
+        <p className="text-sm text-muted-foreground">{t("vmForm.runningNote")}</p>
+      )}
+      {(mode === "live" || mode === "restart") && (
+        <p className="text-sm text-muted-foreground">{t("vmForm.runningNoteLive")}</p>
+      )}
+      {mode === "restart" && (
+        <p className="text-sm text-muted-foreground">{t("vmForm.restartForHotplug")}</p>
+      )}
 
       {/* 보내는 동안에는 고치지 못하게 한다. */}
       <fieldset disabled={busy} className="flex min-w-0 flex-col gap-4">
@@ -186,6 +205,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           creating={creating}
           locked={locked}
           haLocked={locked && !(vm && haEnabled(vm.spec))}
+          live={mode === "live" || mode === "restart"}
           autoMachine={creating && !machineChosen}
           onMachineChosen={() => setMachineChosen(true)}
         />
@@ -197,7 +217,9 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           volumes={freeVolumes}
           pools={pools.data}
           creating={creating}
-          locked={locked}
+          mode={mode}
+          saved={(vm?.spec.disks ?? []).map((d) => d.volume)}
+          boot={layout?.boot_disks ?? 0}
         />
         <NicsSection
           values={values}
@@ -206,7 +228,9 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           onRowsChange={(nics) => changeRows({ nics })}
           networks={networks.data}
           securityGroups={securityGroups.data}
-          locked={locked}
+          mode={mode}
+          saved={vm?.spec.nics ?? []}
+          boot={layout?.boot_nics ?? 0}
         />
         <ScheduleSection values={values} errors={errors} onChange={change} support={support} />
 

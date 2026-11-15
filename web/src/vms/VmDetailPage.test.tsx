@@ -2,7 +2,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
-import { NODE, snapshot, task, vm } from "@/test/fixtures";
+import { hardware, NODE, snapshot, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -345,4 +345,126 @@ it("says when the balancer does not move the VM", async () => {
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
   expect(await screen.findByRole("heading", { name: "web" })).toBeInTheDocument();
   expect(screen.queryByText("Automatic moves", { selector: "dt" })).not.toBeInTheDocument();
+});
+
+it("shows the running hardware, what was added while running and what waits for a restart", async () => {
+  const disks = [
+    { volume: "web-root", bus: "virtio-blk" as const, boot_order: 1 },
+    { volume: "web-data", bus: "virtio-blk" as const, boot_order: null },
+  ];
+  const hot = vm("web", "running", {
+    spec: {
+      ...vm("web", "running").spec,
+      cpu: { sockets: 1, cores: 4, model: "host", max_vcpus: 8 },
+      memory_mib: 2048,
+      max_memory_mib: 16384,
+      firmware: "bios",
+      disks,
+    },
+    status: {
+      ...vm("web", "running").status,
+      hardware: hardware({
+        disks,
+        layout: { vcpus: 4, plugged_mib: 2048, disk_ports: [0] },
+        pending: [
+          { field: "firmware", running: "uefi", wanted: "bios", reason: "restart" },
+          {
+            field: "cpu.max_vcpus",
+            running: "8",
+            wanted: "16",
+            reason: "unsupported",
+          },
+        ],
+      }),
+    },
+  });
+  mockLists({ vm: [hot], node: [NODE] });
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  expect(await screen.findByText("Restart needed")).toBeInTheDocument();
+  expect(screen.getByText("4 (max 8)")).toBeInTheDocument();
+  expect(screen.getByText("4 GiB (max 16 GiB)")).toBeInTheDocument();
+  expect(screen.getByText("1/8 hotplug ports used")).toBeInTheDocument();
+  const pending = screen.getByRole("list", { name: "Applies at the next restart" });
+  expect(
+    within(pending)
+      .getAllByRole("listitem")
+      .map((li) => li.textContent),
+  ).toEqual([
+    "Firmware: uefi → bios — set only when the VM starts",
+    "Maximum vCPUs: 8 → 16 — not supported on this node",
+  ]);
+  // 실패한 변경이 없으면 다시 적용할 것이 없다.
+  expect(screen.queryByRole("button", { name: "Apply again" })).not.toBeInTheDocument();
+
+  await userEvent.click(screen.getByRole("tab", { name: "Hardware" }));
+  const rows = within(screen.getByRole("table", { name: "Disks" })).getAllByRole("row");
+  expect(rows[1]).not.toHaveTextContent("Added while running");
+  expect(rows[2]).toHaveTextContent("web-dataAdded while running");
+});
+
+it("applies failed hardware changes again", async () => {
+  const hot = vm("web", "running", {
+    status: {
+      ...vm("web", "running").status,
+      hardware: hardware({
+        pending: [
+          {
+            field: "memory_mib",
+            running: "4096",
+            wanted: "2048",
+            reason: "failed",
+            detail: "the guest released only 0 of 2048 MiB within 60s",
+          },
+        ],
+      }),
+    },
+  });
+  mockLists({ vm: [hot], node: [NODE] });
+  let called = false;
+  server.use(
+    http.post(apiUrl(`/vms/${hot.id}/actions/hotplug`), () => {
+      called = true;
+      return HttpResponse.json(task("t-hot", "vm-hotplug", hot.id), { status: 202 });
+    }),
+  );
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  expect(
+    await screen.findByText("the guest released only 0 of 2048 MiB within 60s"),
+  ).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Apply again" }));
+  expect(await screen.findByText("Change hardware of web")).toBeInTheDocument();
+  expect(called).toBe(true);
+});
+
+it("shows the server's reason when applying hardware changes again fails", async () => {
+  const hot = vm("web", "running", {
+    status: {
+      ...vm("web", "running").status,
+      hardware: hardware({
+        pending: [{ field: "vcpus", running: "4", wanted: "2", reason: "failed", detail: "held" }],
+      }),
+    },
+  });
+  mockLists({ vm: [hot], node: [NODE] });
+  server.use(
+    http.post(apiUrl(`/vms/${hot.id}/actions/hotplug`), () =>
+      HttpResponse.json(
+        { code: "vm_busy", message: 'VM "web" is being migrated' },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  await userEvent.click(await screen.findByRole("button", { name: "Apply again" }));
+  expect(await screen.findByText(/VM "web" is being migrated/)).toBeInTheDocument();
+});
+
+it("says when a running VM was started without hotplug", async () => {
+  const old = vm("web", "running", {
+    status: { ...vm("web", "running").status, hardware: hardware({ layout: null }) },
+  });
+  mockLists({ vm: [old], node: [NODE] });
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  expect(await screen.findByText("Not available (started without it)")).toBeInTheDocument();
+  expect(screen.queryByText("Restart needed")).not.toBeInTheDocument();
 });

@@ -18,6 +18,12 @@ type Schemas = components["schemas"];
 export const MIN_MEMORY_MIB = 64;
 /** 서버의 `MAX_NICS` */
 export const MAX_NICS = 16;
+/** 서버의 `MAX_VCPUS`(핫플러그 vCPU 상한의 최댓값) */
+export const MAX_VCPUS = 256;
+/** 서버의 `MAX_HOTPLUG_MEMORY_MIB`(512 GiB) */
+export const MAX_HOTPLUG_MEMORY_MIB = 512 * 1024;
+/** 서버의 `MEMORY_HOTPLUG_ALIGN_MIB`: 메모리 상한이 있으면 메모리와 상한이 이 배수여야 한다. */
+export const MEMORY_HOTPLUG_ALIGN_MIB = 128;
 /** 서버의 `cores`(u16)와 `boot_order`(u8)의 최댓값 */
 const MAX_CORES = 65535;
 const MAX_BOOT_ORDER = 255;
@@ -62,6 +68,10 @@ export interface VmFormValues {
   cores: string;
   model: Schemas["CpuModel"];
   memory: string;
+  /** 실행 중 늘릴 수 있는 vCPU 상한(`cpu.max_vcpus`). 비면 없음 */
+  maxVcpus: string;
+  /** 실행 중 늘릴 수 있는 메모리 상한(MiB, `max_memory_mib`). 비면 없음 */
+  maxMemory: string;
   firmware: Schemas["Firmware"];
   machine: Schemas["MachineType"];
   disks: DiskRow[];
@@ -127,6 +137,8 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     cores: "2",
     model: "host",
     memory: "2048",
+    maxVcpus: "",
+    maxMemory: "",
     firmware: "uefi",
     machine,
     disks: [],
@@ -148,6 +160,8 @@ export function fromVm(vm: Vm): VmFormValues {
     cores: String(s.cpu.cores),
     model: s.cpu.model ?? "host",
     memory: String(s.memory_mib),
+    maxVcpus: s.cpu.max_vcpus == null ? "" : String(s.cpu.max_vcpus),
+    maxMemory: s.max_memory_mib == null ? "" : String(s.max_memory_mib),
     firmware: s.firmware ?? "uefi",
     machine: s.machine,
     disks: (s.disks ?? []).map((d) => ({
@@ -250,6 +264,7 @@ export function validate(
   if (!(Number.isInteger(Number(v.memory)) && Number(v.memory) >= MIN_MEMORY_MIB)) {
     errors.memory = "vmForm.errors.memory";
   }
+  Object.assign(errors, maxErrors(v));
   const boots = new Set<number>();
   const names = new Set<string>();
   v.disks.forEach((d, i) => {
@@ -326,11 +341,46 @@ export function validate(
   return errors;
 }
 
+/** 핫플러그 상한의 오류: 서버의 `VmSpec::validate`와 같은 규칙. 비운 상한은 없음이다. */
+function maxErrors(v: VmFormValues): Record<string, string> {
+  const errors: Record<string, string> = {};
+  const vcpus = v.sockets * Number(v.cores);
+  if (v.maxVcpus !== "") {
+    const max = Number(v.maxVcpus);
+    if (!/^\d+$/.test(v.maxVcpus) || max < vcpus) {
+      errors.maxVcpus = "vmForm.errors.maxVcpusLow";
+    } else if (max % v.sockets !== 0) {
+      errors.maxVcpus = "vmForm.errors.maxVcpusSockets";
+    } else if (max > MAX_VCPUS) {
+      errors.maxVcpus = "vmForm.errors.maxVcpusHigh";
+    }
+  }
+  if (v.maxMemory !== "") {
+    const max = Number(v.maxMemory);
+    const memory = Number(v.memory);
+    if (!/^\d+$/.test(v.maxMemory) || max < memory) {
+      errors.maxMemory = "vmForm.errors.maxMemoryLow";
+    } else if (max > MAX_HOTPLUG_MEMORY_MIB) {
+      errors.maxMemory = "vmForm.errors.maxMemoryHigh";
+    } else if (max % MEMORY_HOTPLUG_ALIGN_MIB !== 0 || memory % MEMORY_HOTPLUG_ALIGN_MIB !== 0) {
+      errors.maxMemory = "vmForm.errors.memoryAlign";
+    }
+  }
+  return errors;
+}
+
 /** 폼 값을 VM spec으로. `power`는 만들 때만 정하고, 고칠 때는 지금 값을 그대로 둔다. */
 export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
   return {
-    cpu: { sockets: v.sockets, cores: Number(v.cores), model: v.model },
+    cpu: {
+      sockets: v.sockets,
+      cores: Number(v.cores),
+      model: v.model,
+      // 상한이 없으면 보내지 않는다(옛 클러스터는 이 필드를 모른다).
+      ...(v.maxVcpus !== "" && { max_vcpus: Number(v.maxVcpus) }),
+    },
     memory_mib: Number(v.memory),
+    ...(v.maxMemory !== "" && { max_memory_mib: Number(v.maxMemory) }),
     firmware: v.firmware,
     machine: v.machine,
     disks: v.disks.map((d) => ({

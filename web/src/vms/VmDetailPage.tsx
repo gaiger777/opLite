@@ -1,6 +1,9 @@
 import { Suspense, useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
+import { toast } from "sonner";
+
+import { api, call } from "@/api/client";
 
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
@@ -22,8 +25,9 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
 import { formatMib, formatTime, uuidTime } from "@/lib/format";
-import { describeProgress } from "@/tasks/tasks";
+import { describeProgress, trackTask } from "@/tasks/tasks";
 import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
 import {
   ACTIONS,
@@ -33,6 +37,16 @@ import {
   type VmOperation,
 } from "@/vms/actions";
 import { haEnabled, haPolicy } from "@/vms/ha";
+import {
+  failedChanges,
+  hotplugPorts,
+  isHotAdded,
+  needsRestart,
+  pendingReasonKey,
+  runningMemory,
+  runningVcpus,
+  type WithMax,
+} from "@/vms/hotplug";
 import { VmConsole } from "@/vms/lazyConsole";
 import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -98,6 +112,7 @@ export function VmDetailPage() {
         </TabsList>
         <TabsContent value="summary">
           <Summary vm={vm} />
+          <PendingChanges vm={vm} />
         </TabsContent>
         <TabsContent value="hardware">
           <Hardware vm={vm} />
@@ -182,6 +197,8 @@ function VmHeader({ vm }: { vm: Vm }) {
         <h1 className="text-2xl font-semibold">{vm.name}</h1>
         <VmPhaseBadge vm={vm} />
         {haEnabled(vm.spec) && <Badge variant="outline">{t("vms.ha")}</Badge>}
+        {/* 실행 중에 적용하지 못한 하드웨어 변경이 있다. */}
+        {needsRestart(vm) && <Badge variant="secondary">{t("vms.restartNeeded")}</Badge>}
         {node && (
           <span className="text-sm text-muted-foreground">
             {target ? t("vms.migratingTo", { from: node.name, to: target.name }) : node.name}
@@ -260,6 +277,19 @@ function Summary({ vm }: { vm: Vm }) {
   const ha = haPolicy(vm.spec);
   const violations = vm.status.rule_violations ?? [];
   const haError = vm.status.ha?.error;
+  // 도는 VM은 도는 QEMU의 값(핫플러그로 바뀐 것 포함), 아니면 스펙의 값. 상한은 지금 값보다 클 때만 보인다.
+  const hw = vm.status.hardware;
+  const vcpus = hw
+    ? runningVcpus(hw)
+    : { now: (cpu.sockets ?? 1) * cpu.cores, max: cpu.max_vcpus ?? null };
+  const memory = hw
+    ? runningMemory(hw)
+    : { now: vm.spec.memory_mib, max: vm.spec.max_memory_mib ?? null };
+  const ports = hw && hotplugPorts(hw);
+  const withMax = ({ now, max }: WithMax, format: (n: number) => string) =>
+    max !== null && max > now
+      ? t("vms.withMax", { value: format(now), max: format(max) })
+      : format(now);
   return (
     <dl className="grid grid-cols-1 gap-4 pt-2 sm:grid-cols-2 lg:grid-cols-3">
       <Field label={t("vms.cpu")}>
@@ -269,7 +299,13 @@ function Summary({ vm }: { vm: Vm }) {
           model: cpu.model ?? "host",
         })}
       </Field>
-      <Field label={t("vms.memory")}>{formatMib(vm.spec.memory_mib)}</Field>
+      <Field label={t("vms.vcpus")}>{withMax(vcpus, String)}</Field>
+      <Field label={t("vms.memory")}>{withMax(memory, formatMib)}</Field>
+      {hw && (
+        <Field label={t("vms.hotplug")}>
+          {ports ? t("vms.hotplugPorts", ports) : t("vms.hotplugOff")}
+        </Field>
+      )}
       <Field label={t("vms.firmware")}>{(vm.spec.firmware ?? "uefi").toUpperCase()}</Field>
       <Field label={t("vms.machine")}>{vm.spec.machine}</Field>
       <Field label={t("vms.restart")}>{t(`vms.restartPolicy.${vm.spec.restart ?? "never"}`)}</Field>
@@ -336,9 +372,12 @@ function Hardware({ vm }: { vm: Vm }) {
                 </TableCell>
               </TableRow>
             )}
-            {(vm.spec.disks ?? []).map((disk) => (
+            {(vm.spec.disks ?? []).map((disk, i) => (
               <TableRow key={disk.volume}>
-                <TableCell>{disk.volume}</TableCell>
+                <TableCell>
+                  {disk.volume}
+                  <HotAdded vm={vm} kind="disk" index={i} />
+                </TableCell>
                 <TableCell>{disk.bus}</TableCell>
                 <TableCell>{disk.boot_order ?? "—"}</TableCell>
               </TableRow>
@@ -369,7 +408,10 @@ function Hardware({ vm }: { vm: Vm }) {
             )}
             {(vm.spec.nics ?? []).map((nic, i) => (
               <TableRow key={i}>
-                <TableCell>{nic.network}</TableCell>
+                <TableCell>
+                  {nic.network}
+                  <HotAdded vm={vm} kind="nic" index={i} />
+                </TableCell>
                 <TableCell>{nic.model}</TableCell>
                 <TableCell className="font-mono text-xs">{nic.mac ?? "—"}</TableCell>
                 <TableCell>
@@ -381,6 +423,87 @@ function Hardware({ vm }: { vm: Vm }) {
         </Table>
       </section>
     </div>
+  );
+}
+
+/** 실행 중에 붙인 장치의 표시 */
+function HotAdded({ vm, kind, index }: { vm: Vm; kind: "disk" | "nic"; index: number }) {
+  const { t } = useTranslation();
+  if (!isHotAdded(vm, kind, index)) {
+    return null;
+  }
+  return (
+    <Badge variant="outline" className="ml-2">
+      {t("vms.hotAdded")}
+    </Badge>
+  );
+}
+
+/**
+ * 다음 재시작 때 적용할 하드웨어 변경(핫플러그 Task가 실행 중에 적용하지 못한 것). 실패한 것이 있으면 다시 적용해
+ * 볼 수 있다(`actions/hotplug` — 게스트가 드라이버를 올린 뒤 등).
+ */
+function PendingChanges({ vm }: { vm: Vm }) {
+  const { t } = useTranslation();
+  const me = usePrincipal();
+  const pending = vm.status.hardware?.pending ?? [];
+  if (pending.length === 0) {
+    return null;
+  }
+  const retry =
+    failedChanges(vm).length > 0 && can(me.role, "operate", "vm") && vm.status.phase === "running";
+
+  async function applyAgain() {
+    try {
+      const task = await call(
+        api.POST("/vms/{key}/actions/{action}", {
+          params: { path: { key: vm.id, action: "hotplug" } },
+        }),
+      );
+      trackTask(task, t("tasks.op.vm-hotplug", { target: vm.name }));
+    } catch (err) {
+      toast.error(
+        t("vms.actionFailed", {
+          name: vm.name,
+          error: serverErrorMessage(t, err, HOTPLUG_ERROR_CODES),
+        }),
+      );
+    }
+  }
+
+  return (
+    <section className="mt-6 flex flex-col gap-2">
+      <h2 id="vm-pending" className="font-medium">
+        {t("vms.pendingTitle")}
+      </h2>
+      <p className="text-sm text-muted-foreground">{t("vms.pendingNote")}</p>
+      <ul aria-labelledby="vm-pending" className="flex flex-col gap-1 text-sm">
+        {pending.map((change) => (
+          <li key={change.field}>
+            <span className="font-medium">
+              {/* 번역 키에는 `.`을 쓸 수 없다(`cpu.max_vcpus` → `cpu_max_vcpus`). */}
+              {t(`vms.pendingField.${change.field.replaceAll(".", "_")}`, {
+                defaultValue: change.field,
+              })}
+            </span>
+            {": "}
+            {t("vms.pendingValue", { running: change.running, wanted: change.wanted })}
+            {" — "}
+            {t(pendingReasonKey(change.reason))}
+            {change.detail && (
+              <span className="block text-xs text-muted-foreground">{change.detail}</span>
+            )}
+          </li>
+        ))}
+      </ul>
+      {retry && (
+        <div>
+          <Button variant="outline" size="sm" onClick={() => void applyAgain()}>
+            {t("vms.applyAgain")}
+          </Button>
+        </div>
+      )}
+    </section>
   );
 }
 

@@ -5,7 +5,7 @@ import { http, HttpResponse } from "msw";
 import type { Vm } from "@/api/types";
 import { formatTime } from "@/lib/format";
 import { resetTasks } from "@/tasks/tasks";
-import { NODE, pool, snapshot, task, vm, volume } from "@/test/fixtures";
+import { hardware, NODE, pool, snapshot, task, vm, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -104,6 +104,57 @@ it("takes a memory snapshot of a running VM and follows its task", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Take snapshot" }));
   expect(await screen.findByText("Take snapshot before-upgrade of web")).toBeInTheDocument();
   expect(body).toEqual({ name: "before-upgrade", description: "kernel 6.12", memory: true });
+});
+
+it("takes only a disk snapshot of a VM whose hardware changed while running", async () => {
+  const hot = {
+    ...web,
+    status: { ...web.status, hardware: hardware({ layout: { vcpus: 4 } }) },
+  };
+  mockLists({ vm: [hot], node: [NODE], volume: [volume("web-root", "local")] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl(`/vms/${hot.id}/snapshots`), async ({ request }) => {
+      body = await request.json();
+      // 서버는 메모리 없는 스냅샷을 받는다.
+      return HttpResponse.json(task("t1", "snapshot-create", hot.id), { status: 202 });
+    }),
+  );
+  open(hot);
+  await userEvent.click(await screen.findByRole("button", { name: "Take snapshot" }));
+  const dialog = await screen.findByRole("dialog", { name: "Take a snapshot of web" });
+  expect(within(dialog).queryByLabelText("Include memory")).not.toBeInTheDocument();
+  expect(within(dialog).getByText(/so the snapshot holds only its disks/)).toBeInTheDocument();
+  await userEvent.type(within(dialog).getByLabelText("Name"), "base");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Take snapshot" }));
+  expect(await screen.findByText("Take snapshot base of web")).toBeInTheDocument();
+  expect(body).toEqual({ name: "base", description: "", memory: false });
+});
+
+// 목록의 VM은 켤 때 모양이지만 서버가 거절하면(그 사이 핫플러그 Task가 생김 등) 서버의 까닭을 그대로 보인다.
+it.each([
+  [
+    "snapshot_unsupported",
+    'VM "web" has hardware changed while running or pending changes; restart it to take a snapshot with memory',
+  ],
+  [
+    "vm_busy",
+    'a hardware change of VM "web" is still being applied (task 01a1dbdf-0000-7000-8000-000000000001); try again when it finishes',
+  ],
+])("shows the server's reason for %s", async (code, message) => {
+  mockLists({ vm: [web], node: [NODE], volume: [volume("web-root", "local")] });
+  server.use(
+    http.post(apiUrl(`/vms/${web.id}/snapshots`), () =>
+      HttpResponse.json({ code, message }, { status: 409 }),
+    ),
+  );
+  open(web);
+  await userEvent.click(await screen.findByRole("button", { name: "Take snapshot" }));
+  const dialog = await screen.findByRole("dialog", { name: "Take a snapshot of web" });
+  expect(within(dialog).getByLabelText("Include memory")).toBeChecked();
+  await userEvent.type(within(dialog).getByLabelText("Name"), "m");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Take snapshot" }));
+  expect(await within(dialog).findByText(message)).toBeInTheDocument();
 });
 
 it("offers only a disk snapshot of a stopped VM", async () => {

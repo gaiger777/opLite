@@ -115,6 +115,26 @@ it("shows how each node fences", async () => {
   );
 });
 
+it("shows what each node can hotplug", async () => {
+  cluster();
+  const x86 = { ...NODE, status: { ...NODE.status, hotplug: { cpu: true, memory: true } } };
+  const mac = { ...DOWN, status: { ...DOWN.status, hotplug: { cpu: false, memory: false } } };
+  // 옛 노드는 기록이 없다.
+  const old = { ...NODE, id: "n3", name: "node-c" };
+  mockLists({ node: [x86, mac, old] });
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const column = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Hypervisor");
+  const cell = (name: string) =>
+    within(within(table).getByText(name).closest("tr")!).getAllByRole("cell")[column];
+  expect(await within(table).findByText("node-a")).toBeInTheDocument();
+  expect(cell("node-a")).toHaveTextContent("qemu-kvmHotplug: vCPU yes, memory yes");
+  expect(cell("node-b")).toHaveTextContent("Hotplug: vCPU no, memory no");
+  expect(cell("node-c")).toHaveTextContent(/^qemu-kvm$/);
+});
+
 it("shows the health checks of each node and opens its interfaces", async () => {
   cluster();
   const degraded = {

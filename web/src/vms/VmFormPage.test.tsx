@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import type { List } from "@/api/live";
 import type { Task } from "@/api/types";
-import { haGroup, NODE, pool, securityGroup, task, vm, volume } from "@/test/fixtures";
+import { hardware, haGroup, NODE, pool, securityGroup, task, vm, volume } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
@@ -829,4 +829,168 @@ it("unpins a VM without sending placement", async () => {
   await waitFor(() => expect(bodies).toHaveLength(1));
   // 끄면 `placement`를 보내지 않는다(옛 VM과 같은 모양).
   expect(bodies[0]?.spec).not.toHaveProperty("placement");
+});
+
+/** 디스크 `disks`·NIC 하나로 도는 VM. 핫플러그 배치(`layout`)는 디스크 하나로 켠 것이다. */
+function hotVm(
+  disks: string[],
+  layout: NonNullable<Parameters<typeof hardware>[0]>["layout"] = {},
+) {
+  const base = vm("web", "running");
+  const spec = {
+    ...base.spec,
+    disks: disks.map((volume, i) => ({
+      volume,
+      bus: "virtio-blk" as const,
+      boot_order: i === 0 ? 1 : null,
+    })),
+    nics: [{ network: "user", model: "virtio" as const, mac: "52:54:00:00:00:01" }],
+  };
+  return vm("web", "running", {
+    spec,
+    status: {
+      ...base.status,
+      hardware: hardware({ disks: spec.disks, nics: spec.nics, layout }),
+    },
+  });
+}
+
+it("attaches a disk to a running VM and tracks the hotplug task", async () => {
+  const web = hotVm(["web-root"]);
+  mockLists({
+    vm: [web],
+    node: [NODE],
+    volume: [volume("web-root", "local", { attached_to: web.id }), volume("web-data", "local")],
+  });
+  let body: { spec: { disks: unknown } } | undefined;
+  server.use(
+    http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+      body = (await request.json()) as typeof body;
+      return HttpResponse.json(web, { headers: { "orbivisor-task": "t-hot" } });
+    }),
+    http.get(apiUrl("/tasks/t-hot"), () => HttpResponse.json(task("t-hot", "vm-hotplug", web.id))),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  const root = await screen.findByRole("group", { name: "Disk 1" });
+  // 켤 때 단 디스크는 바꾸지도 떼지도 못한다.
+  expect(within(root).getByLabelText("Volume")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Remove disk 1" })).toBeDisabled();
+  expect(screen.getByText(/volumes can be attached at the end/)).toBeInTheDocument();
+  expect(screen.getByText(/within the maximums apply right away/)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Attach a volume" }));
+  const added = screen.getByRole("group", { name: "Disk 2" });
+  await user.selectOptions(within(added).getByLabelText("Volume"), "web-data");
+  // 실행 중에는 virtio-blk만 붙인다.
+  expect(within(added).getByRole("option", { name: "sata" })).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  expect(await screen.findByText("Change hardware of web")).toBeInTheDocument();
+  expect(body!.spec.disks).toEqual([
+    { volume: "web-root", bus: "virtio-blk", boot_order: 1 },
+    { volume: "web-data", bus: "virtio-blk", boot_order: null },
+  ]);
+});
+
+it("shows the server's reason when a running VM's hardware cannot change", async () => {
+  const web = hotVm(["web-root"]);
+  mockLists({ vm: [web], node: [NODE] });
+  server.use(
+    http.put(apiUrl(`/vms/${web.id}`), () =>
+      HttpResponse.json(
+        {
+          code: "vm_running",
+          message: 'cannot remove disk "web-root" of VM "web" while it is running',
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Save" }));
+  expect(
+    await screen.findByText('cannot remove disk "web-root" of VM "web" while it is running'),
+  ).toBeInTheDocument();
+  expect(screen.queryByText("Stop the VM first.")).not.toBeInTheDocument();
+});
+
+it("removes only the last device added while a VM runs", async () => {
+  const web = hotVm(["web-root", "web-a", "web-b"], { disk_ports: [0, 1] });
+  mockLists({ vm: [web], node: [NODE] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  expect(await screen.findByRole("button", { name: "Remove disk 3" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Remove disk 2" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Remove disk 1" })).toBeDisabled();
+  // 실행 중 붙인 디스크도 고치지는 못한다.
+  const last = screen.getByRole("group", { name: "Disk 3" });
+  expect(within(last).getByLabelText("Bus")).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: "Remove disk 3" }));
+  // 이제 실행 중 붙인 첫 디스크가 마지막이다. 켤 때 단 것은 여전히 못 뗀다.
+  expect(screen.getByRole("button", { name: "Remove disk 2" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Remove disk 1" })).toBeDisabled();
+});
+
+it("adds interfaces to a running VM but keeps the running ones", async () => {
+  const web = hotVm(["web-root"]);
+  mockLists({ vm: [web], node: [NODE] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const user = userEvent.setup();
+  const first = await screen.findByRole("group", { name: "Network interface 1" });
+  expect(within(first).getByLabelText("Network")).toBeDisabled();
+  expect(within(first).getByLabelText("Model")).toBeDisabled();
+  expect(within(first).getByLabelText("MAC address")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Remove interface 1" })).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: "Add an interface" }));
+  const second = screen.getByRole("group", { name: "Network interface 2" });
+  expect(within(second).getByLabelText("Network")).toBeEnabled();
+  expect(within(second).getByLabelText("MAC address")).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Remove interface 2" })).toBeEnabled();
+});
+
+it("asks to restart a VM started without hotplug before changing its devices", async () => {
+  const web = hotVm(["web-root"], null);
+  mockLists({ vm: [web], node: [NODE] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  expect(
+    await screen.findByText(
+      "The VM was started without hotplug support. Restart it once to add or remove disks and interfaces while it runs.",
+    ),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Attach a volume" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Add an interface" })).not.toBeInTheDocument();
+  expect(screen.getByLabelText("Network")).toBeDisabled();
+  // vCPU 코어와 메모리는 그대로 고칠 수 있다.
+  expect(screen.getByLabelText("vCPU cores")).toBeEnabled();
+  expect(screen.getByLabelText("Maximum vCPUs")).toBeEnabled();
+});
+
+it("sets the hotplug maximums and checks them like the server", async () => {
+  mockLists({ node: [NODE] });
+  let body: { spec: { cpu: unknown; max_memory_mib?: number } } | undefined;
+  server.use(
+    http.post(apiUrl("/vms"), async ({ request }) => {
+      body = (await request.json()) as typeof body;
+      return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+    }),
+  );
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.type(screen.getByLabelText("Maximum vCPUs"), "1");
+  await user.type(screen.getByLabelText("Maximum memory (MiB)"), "4000");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  expect(screen.getByText("At least sockets × cores.")).toBeInTheDocument();
+  expect(
+    screen.getByText("With a maximum, memory and maximum memory must be multiples of 128 MiB."),
+  ).toBeInTheDocument();
+  expect(body).toBeUndefined();
+  await user.clear(screen.getByLabelText("Maximum vCPUs"));
+  await user.type(screen.getByLabelText("Maximum vCPUs"), "8");
+  await user.clear(screen.getByLabelText("Maximum memory (MiB)"));
+  await user.type(screen.getByLabelText("Maximum memory (MiB)"), "16384");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  await vi.waitFor(() => expect(body).toBeDefined());
+  expect(body!.spec.cpu).toEqual({ sockets: 1, cores: 2, model: "host", max_vcpus: 8 });
+  expect(body!.spec.max_memory_mib).toBe(16384);
 });

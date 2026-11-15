@@ -81,7 +81,8 @@
     "vm_pinned": "The VM is pinned: the balancer does not move it. Turn off \"Not moved by the balancer\" or migrate it yourself.",
     "recommendation_stale": "The recommendation no longer fits the cluster: {{message}}",
     "placement_busy": "Two migrations are already running. Apply the recommendation when one has finished.",
-    "placement_unavailable": "Could not read placement from the cluster leader. Try again shortly."
+    "placement_unavailable": "Could not read placement from the cluster leader. Try again shortly.",
+    "hotplug_unavailable": "The hardware cannot change while the VM runs: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -187,7 +188,8 @@
       "node-drain": "Drain {{target}}",
       "node-power-off": "Power off {{target}} (fencing)",
       "ha-check": "HA check {{check}} on {{target}}: {{action}}",
-      "bond-degraded": "Bond {{bond}} on {{target}} lost ports"
+      "bond-degraded": "Bond {{bond}} on {{target}} lost ports",
+      "vm-hotplug": "Change hardware of {{target}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -329,7 +331,32 @@
     "guestWatch": "Guest agent watch",
     "guestWatchSecs": "Restart after {{secs}} s without an answer",
     "pinned": "Automatic moves",
-    "pinnedOn": "Excluded (pinned)"
+    "pinnedOn": "Excluded (pinned)",
+    "restartNeeded": "Restart needed",
+    "withMax": "{{value}} (max {{max}})",
+    "hotplug": "Hotplug",
+    "hotplugPorts": "{{used}}/{{ports}} hotplug ports used",
+    "hotplugOff": "Not available (started without it)",
+    "hotAdded": "Added while running",
+    "pendingTitle": "Applies at the next restart",
+    "pendingNote": "These changes could not be applied while the VM runs. Rebooting inside the guest does not apply them; reboot or stop and start the VM.",
+    "pendingValue": "{{running}} → {{wanted}}",
+    "pendingReason": {
+      "restart": "set only when the VM starts",
+      "unsupported": "not supported on this node",
+      "limit": "outside the range set when the VM started",
+      "failed": "failed"
+    },
+    "pendingField": {
+      "vcpus": "vCPUs",
+      "cpu": "CPU",
+      "cpu_max_vcpus": "Maximum vCPUs",
+      "memory_mib": "Memory (MiB)",
+      "max_memory_mib": "Maximum memory (MiB)",
+      "firmware": "Firmware",
+      "machine": "Machine type"
+    },
+    "applyAgain": "Apply again"
   },
   "snapshots": {
     "created": "Created",
@@ -347,6 +374,7 @@
     "createDescription": "Saves the VM's disks, firmware variables and settings so you can return to this point later.",
     "includeMemory": "Include memory",
     "includeMemoryHint": "Also saves the running state. Reverting resumes the VM where it was.",
+    "hotplugHint": "The VM's hardware changed while it runs or has changes waiting for a restart, so the snapshot holds only its disks. Restart the VM to include memory.",
     "unsupported": "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. {{volume}} is {{format}}.",
     "busy": "The VM is starting, stopping or migrating. Snapshots can be taken, reverted and deleted once it settles.",
     "revert": "Revert",
@@ -1145,7 +1173,10 @@
       "checks": "Health checks",
       "noChecks": "The node reports no health checks.",
       "since": "Since"
-    }
+    },
+    "hotplug": "Hotplug: vCPU {{cpu}}, memory {{memory}}",
+    "yes": "yes",
+    "no": "no"
   },
   "accounts": {
     "currentPassword": "Current password",
@@ -1425,7 +1456,13 @@
       "securityGroups": "Choose at most 8 security groups.",
       "haCount": "From 0 to 10.",
       "haPriority": "From 0 to 100.",
-      "guestWatch": "From 30 to 3600 seconds."
+      "guestWatch": "From 30 to 3600 seconds.",
+      "maxVcpusLow": "At least sockets × cores.",
+      "maxVcpusSockets": "Must be a multiple of the number of sockets.",
+      "maxVcpusHigh": "At most 256.",
+      "maxMemoryLow": "At least the memory.",
+      "maxMemoryHigh": "At most 524288 MiB (512 GiB).",
+      "memoryAlign": "With a maximum, memory and maximum memory must be multiples of 128 MiB."
     },
     "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",
@@ -1462,7 +1499,16 @@
     "guestWatchSecs": "Seconds without an answer",
     "guestWatchSecsHint": "From 30 to 3600.",
     "pinned": "Not moved by the balancer",
-    "pinnedHint": "The balancer never moves this VM. HA recovery, node draining and migrations you start still move it."
+    "pinnedHint": "The balancer never moves this VM. HA recovery, node draining and migrations you start still move it.",
+    "maxVcpus": "Maximum vCPUs",
+    "maxVcpusHint": "Leave empty for none. While running, vCPU cores can grow up to this on x86_64 nodes. Takes effect from the next start.",
+    "maxMemory": "Maximum memory (MiB)",
+    "maxMemoryHint": "Leave empty for none. While running, memory can grow up to this on Linux nodes with virtio-mem. Takes effect from the next start.",
+    "liveHint": "vCPU cores and memory within the maximums apply right away where the node supports it. Other CPU, memory, firmware and machine changes apply at the next restart.",
+    "runningNoteLive": "The VM is running and its node cannot change. Hardware changes are applied while it runs where possible; the rest are listed on its page and apply at the next restart.",
+    "restartForHotplug": "The VM was started without hotplug support. Restart it once to add or remove disks and interfaces while it runs.",
+    "disksLive": "While the VM runs, volumes can be attached at the end (virtio-blk only, 8 devices at most) and disks attached while it runs can be removed from the end. Disks it started with cannot change.",
+    "nicsLive": "While the VM runs, interfaces can be added at the end (8 devices at most) and interfaces added while it runs can be removed from the end. The network, model and MAC address of a running interface cannot change; its security groups can."
   },
   "console": {
     "connecting": "Connecting…",

@@ -27,3 +27,15 @@ it("sends the read revision as If-Match and reports a conflict", async () => {
     },
   ]);
 });
+
+it("returns the hotplug task id from the response header", async () => {
+  const web = vm("web", "running");
+  server.use(
+    http.put(apiUrl(`/vms/${web.id}`), () =>
+      HttpResponse.json(web, { headers: { "orbivisor-task": "t-hot" } }),
+    ),
+  );
+  expect(await updateVm(web, 1, fromVm(web))).toBe("t-hot");
+  server.use(http.put(apiUrl(`/vms/${web.id}`), () => HttpResponse.json(web)));
+  expect(await updateVm(web, 1, fromVm(web))).toBeNull();
+});

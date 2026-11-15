@@ -42,21 +42,44 @@ export async function createVm(values: VmFormValues): Promise<void> {
   );
 }
 
-/** VM spec 전체를 바꾼다. 읽은 `revision`을 If-Match로 보내므로 그 사이 바뀌었으면 실패한다. */
+/** 실행 중인 VM의 하드웨어 변경을 적용하는 핫플러그 Task의 id를 주는 응답 헤더(서버의 `revision::TASK`) */
+export const TASK_HEADER = "orbivisor-task";
+
+/**
+ * VM spec 전체를 바꾼다. 읽은 `revision`을 If-Match로 보내므로 그 사이 바뀌었으면 실패한다. 실행 중인 VM의
+ * 하드웨어가 바뀌어 서버가 핫플러그 Task를 만들었으면 그 id를, 아니면 null을 돌려준다.
+ */
 export async function updateVm(
   vm: Vm,
   revision: Vm["revision"] | undefined,
   values: VmFormValues,
-): Promise<void> {
+): Promise<string | null> {
+  let response: Response | undefined;
   await call(
-    api.PUT("/vms/{key}", {
-      params: {
-        path: { key: vm.id },
-        header: { "If-Match": revision },
-      },
-      body: { labels: vm.labels, spec: toSpec(values, vm.spec.power ?? "stopped") },
-    }),
+    api
+      .PUT("/vms/{key}", {
+        params: {
+          path: { key: vm.id },
+          header: { "If-Match": revision },
+        },
+        body: { labels: vm.labels, spec: toSpec(values, vm.spec.power ?? "stopped") },
+      })
+      .then((result) => {
+        response = result.response;
+        return result;
+      }),
   );
+  return response?.headers.get(TASK_HEADER) ?? null;
+}
+
+/** 핫플러그 Task를 읽어 알림으로 지켜본다. 읽지 못하면(이미 지워짐 등) 알리지 않는다. */
+export async function trackHotplug(id: string, label: string): Promise<void> {
+  try {
+    const task = await call(api.GET("/tasks/{key}", { params: { path: { key: id } } }));
+    trackTask(task, label);
+  } catch {
+    // 저장은 끝났다. 결과는 VM의 작업 탭에서 볼 수 있다.
+  }
 }
 
 /** 다른 사람이 먼저 바꿔 If-Match가 맞지 않았다. */

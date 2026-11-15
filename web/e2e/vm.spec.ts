@@ -88,7 +88,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await page.getByRole("link", { name: "Create" }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
   await page.getByLabel("Name", { exact: true }).fill("web");
-  await page.getByLabel("Memory (MiB)").fill("256");
+  await page.getByLabel("Memory (MiB)", { exact: true }).fill("256");
   await page.getByRole("button", { name: "Attach a volume" }).click();
   await page.getByRole("group", { name: "Disk 1" }).getByLabel("Volume").selectOption("root");
   await page.getByRole("button", { name: "Create", exact: true }).click();
