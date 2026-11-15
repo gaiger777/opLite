@@ -6,7 +6,7 @@ use async_trait::async_trait;
 pub use opl_qemu::BitmapInfo;
 use opl_types::node::NodeHotplug;
 use opl_types::runtime::{RuntimeDisk, RuntimeNic, VmRuntimeSpec};
-use opl_types::vm::CpuSpec;
+use opl_types::vm::{CpuSpec, RunningHardware};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -352,6 +352,13 @@ pub trait Hypervisor: Send + Sync {
         index: usize,
         timeout: Duration,
     ) -> Result<bool, DriverError>;
+
+    /// 이 노드가 켠 VM의 하드웨어 기록(`status.hardware`, 핫플러그 배치 포함)을 VM 실행 디렉터리에 남긴다(QMP
+    /// 소켓 옆 `hardware.json`). QEMU가 끝나면 실행 디렉터리와 함께 지워진다. VM이 없으면 `NotRunning`.
+    fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError>;
+
+    /// [`save_hardware`](Self::save_hardware)로 남긴 기록. 없거나 읽지 못하면 None이다(기록 없이 다시 붙은 VM).
+    fn saved_hardware(&self, id: Uuid) -> Option<RunningHardware>;
 
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;

@@ -696,6 +696,61 @@ async fn running_vm_migrates_to_the_other_node() {
     assert_eq!(runtime_status(&b, vm.id).await, None);
 }
 
+/// 대상은 원본 QEMU가 도는 모양(`status.hardware` — 켤 때의 cpu·메모리와 실행 중 바꾼 핫플러그 배치)으로 켠다.
+/// 그 사이 바뀐 스펙(다음 재시작 때 적용)이 아니다. 확정 뒤에도 기록은 그대로다.
+#[tokio::test]
+async fn the_target_starts_with_the_running_hardware() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let vm = running_vm(&a, &admin).await;
+    wait_vm(&a, vm.id, "running hardware on A", |v| {
+        v.status.hardware.is_some()
+    })
+    .await;
+    let boot = a.cluster.get::<VmSpec>(vm.id).unwrap().unwrap();
+    let boot_memory = boot.spec.memory_mib;
+    assert!(boot.status.hardware.as_ref().unwrap().layout.is_some());
+
+    // 실행 중에 스펙의 메모리가 바뀌었고(다음 재시작 때), 핫플러그 Task가 메모리를 꽂았다(시험이 대신 쓴다).
+    let mut spec = boot.spec.clone();
+    spec.memory_mib = boot_memory * 2;
+    let revision = a
+        .cluster
+        .update_spec(vm.id, Some(boot.revision), boot.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let mut status = boot.status.clone();
+    let hw = status.hardware.as_mut().unwrap();
+    let layout = hw.layout.as_mut().unwrap();
+    layout.max_memory_mib = boot_memory + 512;
+    layout.plugged_mib = 256;
+    let hardware = status.hardware.clone();
+    a.cluster
+        .update_status_checked::<VmSpec>(vm.id, revision, &status)
+        .await
+        .unwrap();
+
+    let task = migrate(&admin, "node2").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let incoming = b.hv.incoming_specs();
+    let incoming = incoming.iter().rfind(|s| s.id == vm.id).unwrap();
+    assert_eq!(incoming.memory_mib, boot_memory);
+    assert_eq!(incoming.hotplug, hardware.as_ref().unwrap().layout);
+    wait_vm(&b, vm.id, "running on B", |v| {
+        v.status.phase == VmPhase::Running && v.status.node == Some(b.id) && v.status.pid.is_some()
+    })
+    .await;
+    assert_eq!(
+        b.cluster
+            .get::<VmSpec>(vm.id)
+            .unwrap()
+            .unwrap()
+            .status
+            .hardware,
+        hardware
+    );
+}
+
 #[tokio::test]
 async fn failed_send_keeps_the_vm_running_on_the_source() {
     let (_root, a, b) = two_nodes().await;

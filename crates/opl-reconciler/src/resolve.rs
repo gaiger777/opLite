@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DiskLocation, DriverError, Storage, disk_location};
+use opl_types::hotplug;
 use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
-use opl_types::node::NodeSpec;
+use opl_types::node::{Node, NodeSpec};
 use opl_types::runtime::{
     DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec,
 };
@@ -14,8 +15,8 @@ use opl_types::storage::{
     PoolBackend, StoragePool, StoragePoolSpec, VolumeSpec, pool_error_on, pool_listed_on,
     pool_state_on,
 };
-use opl_types::task::{TaskOp, TaskSpec, TaskState};
-use opl_types::vm::{DiskMove, Vm};
+use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
+use opl_types::vm::{DiskMove, DiskSpec, RunningHardware, Vm};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +45,16 @@ pub enum ResolveError {
     NetworkNotFound(String),
     #[error("nic {0} has no MAC address")]
     MissingMac(usize),
+    /// 스펙에 그 순번의 디스크가 없다([`runtime_disk`]).
+    #[error("disk {0} is not in the VM spec")]
+    NoDisk(usize),
+    /// 스펙에 그 순번의 NIC가 없다([`runtime_nic`]).
+    #[error("nic {0} is not in the VM spec")]
+    NoNic(usize),
+    /// 마이그레이션으로 받을 VM의 스펙 디스크·NIC가 원본 QEMU의 장치 기록(`status.hardware`)과 다르다(핫플러그가
+    /// 끝나지 않았거나 게스트가 아직 내려 주지 않은 장치). 같은 장치로 켤 수 없어 받지 않는다.
+    #[error("the VM's devices do not match its running hardware")]
+    DevicesChanged,
     #[error(transparent)]
     Cluster(#[from] ClusterError),
 }
@@ -201,16 +212,26 @@ async fn resolve_activated(
     let mut activated = Vec::new();
     let result = resolve(cluster, vm, node, mount_root, storage, how, &mut activated).await;
     if result.is_err() {
-        for (pool, id, format) in activated {
-            if let Err(e) = storage.deactivate_volume(&pool, id, format).await {
-                tracing::warn!(vm = %vm.id, volume = %id, error = %e, "cannot deactivate volume");
-            }
-        }
+        deactivate(vm, storage, activated).await;
     }
     result
 }
 
-/// [`runtime_spec`]. 활성화한 볼륨을 `activated`에 적는다.
+/// 활성화한 볼륨을 끈다(끄지 못하면 경고만 남긴다).
+async fn deactivate(
+    vm: &Vm,
+    storage: &dyn Storage,
+    activated: Vec<(StoragePool, Uuid, ImageFormat)>,
+) {
+    for (pool, id, format) in activated {
+        if let Err(e) = storage.deactivate_volume(&pool, id, format).await {
+            tracing::warn!(vm = %vm.id, volume = %id, error = %e, "cannot deactivate volume");
+        }
+    }
+}
+
+/// [`runtime_spec`]. 활성화한 볼륨을 `activated`에 적는다. 새로 켜는 것이 아니면(다시 붙음, 마이그레이션 받기)
+/// 실행 중 하드웨어 기록이 있을 때 그 모양으로 덮는다([`apply_hardware`]).
 async fn resolve(
     cluster: &Cluster,
     vm: &Vm,
@@ -220,15 +241,159 @@ async fn resolve(
     how: Activate,
     activated: &mut Vec<(StoragePool, Uuid, ImageFormat)>,
 ) -> Result<VmRuntimeSpec, ResolveError> {
-    let me = cluster.get::<NodeSpec>(node)?;
-    let (_, tasks) = cluster.list::<TaskSpec>()?;
-    // 받는 마이그레이션이 이 노드로 복사하는 디스크
-    let moves: &[DiskMove] = match (&vm.status.migration, how) {
-        (Some(m), Activate::Incoming) => &m.disks,
-        _ => &[],
-    };
+    // 받는 쪽은 스펙의 디스크·NIC로 켜므로 원본 QEMU의 장치와 같아야 한다.
+    if how == Activate::Incoming
+        && let Some(hw) = &vm.status.hardware
+        && !hotplug::devices_match(&vm.spec, hw)
+    {
+        return Err(ResolveError::DevicesChanged);
+    }
+    let lookup = DiskLookup::new(cluster, vm, node, mount_root, storage, how)?;
     let mut disks = Vec::with_capacity(vm.spec.disks.len());
     for disk in &vm.spec.disks {
+        disks.push(lookup.disk(disk, activated).await?);
+    }
+    let mut nics = Vec::with_capacity(vm.spec.nics.len());
+    for i in 0..vm.spec.nics.len() {
+        nics.push(runtime_nic(cluster, vm, i)?);
+    }
+    let mut spec = VmRuntimeSpec {
+        id: vm.id,
+        name: vm.name.clone(),
+        cpu: vm.spec.cpu.clone(),
+        memory_mib: vm.spec.memory_mib,
+        firmware: vm.spec.firmware,
+        machine: vm.spec.machine,
+        disks,
+        nics,
+        // `ha.guest_watch`가 있는 VM만 게스트 에이전트 채널을 단다(API는 멈춘 VM에서만 켜고 끈다).
+        guest_agent: vm
+            .spec
+            .ha
+            .as_ref()
+            .is_some_and(|ha| ha.guest_watch.is_some()),
+        hotplug: None,
+    };
+    if how != Activate::Start
+        && let Some(hw) = &vm.status.hardware
+    {
+        apply_hardware(&mut spec, hw);
+    }
+    Ok(spec)
+}
+
+/// 런타임 정의를 실행 중 하드웨어 기록의 모양(켤 때의 cpu·메모리·펌웨어·머신과 핫플러그 배치)으로 덮는다. 스펙은
+/// 실행 중에 바뀌어도(다음 재시작 때 적용) 마이그레이션 대상은 원본 QEMU와 같은 장치로 켜야 한다.
+pub fn apply_hardware(spec: &mut VmRuntimeSpec, hw: &RunningHardware) {
+    spec.cpu = hw.cpu.clone();
+    spec.memory_mib = hw.memory_mib;
+    spec.firmware = hw.firmware;
+    spec.machine = hw.machine;
+    spec.hotplug = hw.layout.clone();
+}
+
+/// 실행 중 VM에 붙일 디스크 하나(`vm.spec.disks[index]`)를 VM을 켤 때처럼 푼다: 크기 늘리기 Task를 기다리고
+/// 볼륨을 켠 뒤 위치를 정한다. 오류는 [`runtime_spec`]과 같고, 실패하면 켠 볼륨을 끈다.
+pub async fn runtime_disk(
+    cluster: &Cluster,
+    vm: &Vm,
+    index: usize,
+    node: Uuid,
+    mount_root: &Path,
+    storage: &dyn Storage,
+) -> Result<RuntimeDisk, ResolveError> {
+    let disk = vm
+        .spec
+        .disks
+        .get(index)
+        .ok_or(ResolveError::NoDisk(index))?;
+    let lookup = DiskLookup::new(cluster, vm, node, mount_root, storage, Activate::Start)?;
+    let mut activated = Vec::new();
+    let result = lookup.disk(disk, &mut activated).await;
+    if result.is_err() {
+        deactivate(vm, storage, activated).await;
+    }
+    result
+}
+
+/// NIC 하나(`vm.spec.nics[index]`)의 런타임 정의. tap 이름은 순번으로 정한다([`tap_name`]).
+pub fn runtime_nic(cluster: &Cluster, vm: &Vm, index: usize) -> Result<RuntimeNic, ResolveError> {
+    let nic = vm.spec.nics.get(index).ok_or(ResolveError::NoNic(index))?;
+    let backend = if nic.network == USER_NETWORK {
+        NicBackend::User
+    } else {
+        let network = cluster
+            .get_by_name::<NetworkSpec>(&nic.network)?
+            .ok_or_else(|| ResolveError::NetworkNotFound(nic.network.clone()))?;
+        NicBackend::Tap {
+            ifname: tap_name(vm.id, index),
+            bridge: network.spec.bridge_name(),
+            vlan: network.spec.vlan,
+            mtu: network.spec.mtu(),
+        }
+    };
+    Ok(RuntimeNic {
+        mac: nic.mac.ok_or(ResolveError::MissingMac(index))?,
+        model: nic.model,
+        backend,
+    })
+}
+
+/// 디스크를 풀 때 VM마다 한 번 읽는 것
+struct DiskLookup<'a> {
+    cluster: &'a Cluster,
+    node: Uuid,
+    mount_root: &'a Path,
+    storage: &'a dyn Storage,
+    how: Activate,
+    /// 이 노드의 기록(풀 준비 상태)
+    me: Option<Node>,
+    tasks: Vec<Task>,
+    /// 받는 마이그레이션이 이 노드로 복사하는 디스크
+    moves: &'a [DiskMove],
+}
+
+impl<'a> DiskLookup<'a> {
+    fn new(
+        cluster: &'a Cluster,
+        vm: &'a Vm,
+        node: Uuid,
+        mount_root: &'a Path,
+        storage: &'a dyn Storage,
+        how: Activate,
+    ) -> Result<Self, ResolveError> {
+        let me = cluster.get::<NodeSpec>(node)?;
+        let (_, tasks) = cluster.list::<TaskSpec>()?;
+        let moves: &[DiskMove] = match (&vm.status.migration, how) {
+            (Some(m), Activate::Incoming) => &m.disks,
+            _ => &[],
+        };
+        Ok(Self {
+            cluster,
+            node,
+            mount_root,
+            storage,
+            how,
+            me,
+            tasks,
+            moves,
+        })
+    }
+
+    /// 디스크 하나의 볼륨을 켜고 위치를 정한다. 켠 볼륨을 `activated`에 적는다.
+    async fn disk(
+        &self,
+        disk: &DiskSpec,
+        activated: &mut Vec<(StoragePool, Uuid, ImageFormat)>,
+    ) -> Result<RuntimeDisk, ResolveError> {
+        let (cluster, node, mount_root, storage, how) = (
+            self.cluster,
+            self.node,
+            self.mount_root,
+            self.storage,
+            self.how,
+        );
+        let (me, tasks, moves) = (&self.me, &self.tasks, self.moves);
         let volume = cluster
             .get_by_name::<VolumeSpec>(&disk.volume)?
             .ok_or_else(|| ResolveError::VolumeNotFound(disk.volume.clone()))?;
@@ -321,51 +486,13 @@ async fn resolve(
                 ));
             }
         };
-        disks.push(RuntimeDisk {
+        Ok(RuntimeDisk {
             path,
             kind,
             rbd,
             format,
             bus: disk.bus,
             boot_order: disk.boot_order,
-        });
+        })
     }
-    let mut nics = Vec::with_capacity(vm.spec.nics.len());
-    for (i, nic) in vm.spec.nics.iter().enumerate() {
-        let backend = if nic.network == USER_NETWORK {
-            NicBackend::User
-        } else {
-            let network = cluster
-                .get_by_name::<NetworkSpec>(&nic.network)?
-                .ok_or_else(|| ResolveError::NetworkNotFound(nic.network.clone()))?;
-            NicBackend::Tap {
-                ifname: tap_name(vm.id, i),
-                bridge: network.spec.bridge_name(),
-                vlan: network.spec.vlan,
-                mtu: network.spec.mtu(),
-            }
-        };
-        nics.push(RuntimeNic {
-            mac: nic.mac.ok_or(ResolveError::MissingMac(i))?,
-            model: nic.model,
-            backend,
-        });
-    }
-    Ok(VmRuntimeSpec {
-        id: vm.id,
-        name: vm.name.clone(),
-        cpu: vm.spec.cpu.clone(),
-        memory_mib: vm.spec.memory_mib,
-        firmware: vm.spec.firmware,
-        machine: vm.spec.machine,
-        disks,
-        nics,
-        // `ha.guest_watch`가 있는 VM만 게스트 에이전트 채널을 단다(API는 멈춘 VM에서만 켜고 끈다).
-        guest_agent: vm
-            .spec
-            .ha
-            .as_ref()
-            .is_some_and(|ha| ha.guest_watch.is_some()),
-        hotplug: None,
-    })
 }

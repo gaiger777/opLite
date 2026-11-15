@@ -20,8 +20,8 @@ use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
-    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, ScheduleError, VmHaStatus,
-    VmPhase, VmSpec, VmStatus,
+    DiskBus, DiskSpec, MigrationStatus, PowerState, RestartPolicy, RunningHardware, ScheduleError,
+    VmHaStatus, VmPhase, VmSpec, VmStatus,
 };
 use uuid::Uuid;
 
@@ -51,7 +51,8 @@ async fn starts_assigned_vm_and_records_status() {
             firmware_node: Some(env.node),
             rule_violations: vec![],
             ha: None,
-            hardware: None,
+            // 노드 기록이 없으면(`hotplug` 기능 없음) 핫플러그 배치 없이 켠다.
+            hardware: Some(RunningHardware::legacy(&vm.spec)),
         }
     );
 }

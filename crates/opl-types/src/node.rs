@@ -412,6 +412,15 @@ pub enum Fencing {
     Process,
 }
 
+/// 모든 노드(위트니스·관찰 노드 포함)가 기능 `feature`([`FEATURES`])를 알린다. 노드 목록이 비면(읽지 못함) 아니라고
+/// 본다.
+pub fn all_have(nodes: &[Node], feature: &str) -> bool {
+    !nodes.is_empty()
+        && nodes
+            .iter()
+            .all(|n| n.status.features.iter().any(|f| f == feature))
+}
+
 /// HA 가능 노드: 위트니스가 아니고 펜싱이 켜진 노드. HA VM은 이런 노드에서만 돈다.
 pub fn ha_capable(node: &Node) -> bool {
     !node.spec.witness && node.status.ha.is_some()
@@ -444,6 +453,27 @@ pub struct BridgeInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_have_needs_every_node_and_at_least_one() {
+        let node = |features: &[&str]| {
+            let mut n: Node = Resource::new(
+                "n",
+                NodeSpec {
+                    address: "a".into(),
+                    maintenance: false,
+                    witness: false,
+                    roles: None,
+                },
+            );
+            n.status.features = features.iter().map(|f| f.to_string()).collect();
+            n
+        };
+        assert!(!all_have(&[], HOTPLUG));
+        assert!(all_have(&[node(&[PLACEMENT, HOTPLUG])], HOTPLUG));
+        assert!(!all_have(&[node(&[HOTPLUG]), node(&[PLACEMENT])], HOTPLUG));
+        assert!(all_have(&[node(&[HOTPLUG]), node(&[HOTPLUG])], HOTPLUG));
+    }
 
     #[test]
     fn spec_defaults_maintenance_and_status_defaults() {

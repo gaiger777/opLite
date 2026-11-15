@@ -9,16 +9,20 @@ use async_trait::async_trait;
 use opl_cluster::memnet::MemRouter;
 use opl_driver::{Capacity, DriverError, SourceFormat, Storage, VolumeInfo, VolumeSource};
 use opl_reconciler::resolve::{
-    ResolveError, apply_disk_moves, incoming_spec, runtime_spec, set_disks_shared,
+    ResolveError, apply_disk_moves, apply_hardware, incoming_spec, running_spec, runtime_disk,
+    runtime_nic, runtime_spec, set_disks_shared,
 };
 use opl_types::network::{Network, NetworkSpec, Vxlan, tap_name};
 use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
-use opl_types::runtime::{DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic};
+use opl_types::runtime::{
+    DiskKind, HotplugLayout, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic,
+};
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
-    DiskBus, DiskMove, DiskSpec, GuestWatch, MacAddr, MigrationStatus, NicModel, NicSpec, Vm, VmHa,
+    CpuSpec, DiskBus, DiskMove, DiskSpec, Firmware, GuestWatch, MacAddr, MigrationStatus, NicModel,
+    NicSpec, RunningHardware, Vm, VmHa,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -1259,4 +1263,159 @@ async fn refuses_pools_this_node_reports_not_ready() {
         vm.spec.disks = vec![disk(disk_name)];
         resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
     }
+}
+
+/// 실행 중 하드웨어 기록(`status.hardware` — 원본이 켠 배치·실행 중 바꾼 vCPU·메모리·붙인 장치의 포트)
+fn running_hardware(vm: &Vm) -> RunningHardware {
+    let mut hw = RunningHardware::legacy(&vm.spec);
+    hw.cpu = CpuSpec {
+        max_vcpus: Some(8),
+        ..vm.spec.cpu.clone()
+    };
+    hw.memory_mib = 1024;
+    hw.firmware = Firmware::Bios;
+    hw.layout = Some(HotplugLayout {
+        vcpus: 4,
+        max_memory_mib: 4096,
+        plugged_mib: 2048,
+        ports: 8,
+        boot_disks: 1,
+        boot_nics: 0,
+        disk_ports: vec![0],
+        nic_ports: Vec::new(),
+    });
+    hw
+}
+
+/// 마이그레이션 대상은 원본이 도는 모양(`status.hardware`)으로 켠다: 실행 중 바뀐 스펙(cpu·메모리·펌웨어)이
+/// 아니라 원본 QEMU의 장치와 같아야 받을 수 있다. 기록이 없으면(옛 노드가 켠 VM) 스펙 그대로다. 다시 붙을 때도
+/// 같고, 새로 켤 때는 스펙이다.
+#[tokio::test]
+async fn incoming_spec_starts_the_running_hardware() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    cluster.create(&volume("root", "local")).await.unwrap();
+    cluster.create(&volume("data", "local")).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks = vec![disk("root"), disk("data")];
+
+    let storage = Activations::default();
+    let plain = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(plain.cpu, vm.spec.cpu);
+    assert_eq!(plain.memory_mib, vm.spec.memory_mib);
+    assert_eq!(plain.firmware, Firmware::Uefi);
+    assert_eq!(plain.hotplug, None);
+
+    // 실행 중에 스펙이 바뀌었다(다음 재시작 때 적용).
+    let hw = running_hardware(&vm);
+    vm.spec.cpu.cores = 2;
+    vm.spec.memory_mib = 512;
+    vm.status.hardware = Some(hw.clone());
+    let storage = Activations::default();
+    let incoming = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(incoming.cpu, hw.cpu);
+    assert_eq!(incoming.memory_mib, 1024);
+    assert_eq!(incoming.firmware, Firmware::Bios);
+    assert_eq!(incoming.hotplug, hw.layout);
+    assert_eq!(incoming.disks.len(), 2);
+
+    let running = running_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(running.hotplug, hw.layout);
+    assert_eq!(running.memory_mib, 1024);
+    // 새로 켜는 것은 스펙이다(배치는 작업자가 정한다).
+    let start = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(start.cpu, vm.spec.cpu);
+    assert_eq!(start.memory_mib, 512);
+    assert_eq!(start.hotplug, None);
+
+    let mut applied = start.clone();
+    apply_hardware(&mut applied, &hw);
+    assert_eq!(applied, incoming);
+
+    // 스펙의 디스크가 원본 QEMU의 장치와 다르면(떼는 중인 디스크) 볼륨을 켜지 않고 받지 않는다.
+    vm.spec.disks.pop();
+    let storage = Activations::default();
+    let err = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::DevicesChanged), "{err:?}");
+    assert!(storage.calls.lock().unwrap().is_empty());
+}
+
+/// 실행 중 붙일 디스크·NIC 하나는 켤 때와 같이 푼다: 볼륨을 켜고 위치를 정한다. NIC는 순번의 tap이다.
+#[tokio::test]
+async fn resolves_one_disk_and_one_nic() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    let data = volume("data", "local");
+    cluster.create(&volume("root", "local")).await.unwrap();
+    cluster.create(&data).await.unwrap();
+    let net: Network = Resource::new(
+        "lan",
+        NetworkSpec {
+            bridge: Some("br0".into()),
+            vlan: None,
+            vxlan: None,
+            mtu: None,
+        },
+    );
+    cluster.create(&net).await.unwrap();
+    let mac: MacAddr = "52:54:00:00:00:02".parse().unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks = vec![disk("root"), disk("data")];
+    vm.spec.nics = vec![
+        nic("user", Some("52:54:00:00:00:01".parse().unwrap())),
+        nic("lan", Some(mac)),
+    ];
+
+    let storage = Activations::default();
+    let one = runtime_disk(&cluster, &vm, 1, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(
+        one.path,
+        PathBuf::from(format!("/pools/local/{}.qcow2", data.id))
+    );
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        [("local".to_string(), data.id, ImageFormat::Qcow2)]
+    );
+    let all = resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+    assert_eq!(all.disks[1], one);
+
+    let nic = runtime_nic(&cluster, &vm, 1).unwrap();
+    assert_eq!(nic, all.nics[1]);
+    assert!(
+        matches!(&nic.backend, NicBackend::Tap { ifname, .. } if *ifname == tap_name(vm.id, 1))
+    );
+    assert_eq!(nic.mac, mac);
+
+    // 저장소의 일시 오류
+    let storage = Activations::default();
+    *storage.fail.lock().unwrap() = Some(|| DriverError::Timeout("lvchange"));
+    let err = runtime_disk(&cluster, &vm, 1, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::PoolUnavailable(..)), "{err:?}");
+    // 스펙에 없는 순번
+    assert!(matches!(
+        runtime_disk(&cluster, &vm, 2, node, Path::new(MNT), &storage).await,
+        Err(ResolveError::NoDisk(2))
+    ));
+    assert!(matches!(
+        runtime_nic(&cluster, &vm, 2),
+        Err(ResolveError::NoNic(2))
+    ));
 }

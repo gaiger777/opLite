@@ -17,7 +17,7 @@ use opl_types::node::NodeHotplug;
 use opl_types::runtime::{
     DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec,
 };
-use opl_types::vm::{CpuSpec, DiskBus, Firmware, NicModel};
+use opl_types::vm::{CpuSpec, DiskBus, Firmware, NicModel, RunningHardware};
 use rustix::process::{Flock, FlockOffsetType, FlockType, Pid, Signal, fcntl_getlk, kill_process};
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -87,6 +87,8 @@ const LINUX: bool = cfg!(target_os = "linux");
 const MIRROR_JOB_PREFIX: &str = "opl-mirror-";
 /// 받는 쪽 NBD 내보내기 id의 접두사(`opl-export-{i}`)
 const EXPORT_PREFIX: &str = "opl-export-";
+/// 켤 때의 하드웨어 기록을 남기는 실행 디렉터리의 파일([`Hypervisor::save_hardware`])
+const HARDWARE_FILE: &str = "hardware.json";
 
 /// VM별 상태 디렉터리 `{state_dir}/vm/{id}`. `state_dir`은 [`QemuConfig::state_dir`]이다.
 pub fn vm_state_dir(state_dir: &Path, id: Uuid) -> PathBuf {
@@ -1677,6 +1679,28 @@ impl Hypervisor for QemuHypervisor {
             }
         }
         Ok(true)
+    }
+
+    fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError> {
+        let dir = self.paths(id)?.dir;
+        if !dir.is_dir() {
+            return Err(DriverError::NotRunning(id));
+        }
+        let json = serde_json::to_vec(hw).map_err(|e| DriverError::InvalidSpec(e.to_string()))?;
+        std::fs::write(dir.join(HARDWARE_FILE), json)?;
+        Ok(())
+    }
+
+    fn saved_hardware(&self, id: Uuid) -> Option<RunningHardware> {
+        let file = self.paths(id).ok()?.dir.join(HARDWARE_FILE);
+        let bytes = std::fs::read(&file).ok()?;
+        match serde_json::from_slice(&bytes) {
+            Ok(hw) => Some(hw),
+            Err(e) => {
+                tracing::warn!(%id, file = %file.display(), error = %e, "cannot read the saved hardware record");
+                None
+            }
+        }
     }
 
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
@@ -5100,6 +5124,26 @@ time.sleep(60)
             bus: DiskBus::VirtioBlk,
             boot_order: Some(2),
         }
+    }
+
+    /// 하드웨어 기록은 실행 디렉터리의 `hardware.json`에 남고 읽힌다. 도는 VM이 아니면 쓰지 않는다.
+    #[tokio::test]
+    async fn the_hardware_record_is_saved_next_to_the_qmp_socket() {
+        let tmp = short_tempdir();
+        let (hv, id, _fake, _qemu) = running_vm(tmp.path()).await;
+        assert_eq!(hv.saved_hardware(id), None);
+        let spec: opl_types::vm::VmSpec = serde_json::from_value(
+            serde_json::json!({ "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt" }),
+        )
+        .unwrap();
+        let (hw, _) = RunningHardware::at_start(&spec, NodeHotplug::default(), true);
+        hv.save_hardware(id, &hw).unwrap();
+        assert!(hv.paths(id).unwrap().dir.join(HARDWARE_FILE).is_file());
+        assert_eq!(hv.saved_hardware(id), Some(hw.clone()));
+        assert!(matches!(
+            hv.save_hardware(Uuid::now_v7(), &hw),
+            Err(DriverError::NotRunning(_))
+        ));
     }
 
     /// 디스크는 파일 노드·형식 노드를 열고 루트 포트에 붙인다. 떼기는 장치를 뗀 뒤 두 노드를 닫고, 다시 떼면 닫을

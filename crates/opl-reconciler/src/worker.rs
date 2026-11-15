@@ -4,12 +4,13 @@ use std::time::Duration;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{ActualState, DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
-use opl_types::node::{HA_PLACEMENT, NodeSpec};
+use opl_types::hotplug::{self, Step};
+use opl_types::node::{HA_PLACEMENT, HOTPLUG, NodeSpec, all_have};
 use opl_types::runtime::VmRuntimeSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::vm::{
-    Firmware, HaEvict, HaState, PowerState, RestartPolicy, Vm, VmHaStatus, VmPhase, VmSpec,
-    VmStatus,
+    Firmware, HaEvict, HaState, PendingChange, PendingReason, PowerState, RestartPolicy,
+    RunningHardware, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -21,7 +22,7 @@ use crate::config::ReconcilerConfig;
 use crate::ha::ArmError;
 use crate::reconciler::{Held, Restores};
 use crate::resolve::{
-    ResolveError, apply_disk_moves, running_spec, runtime_spec, set_disks_shared,
+    ResolveError, apply_disk_moves, apply_hardware, running_spec, runtime_spec, set_disks_shared,
 };
 
 /// 실행 중이던 VM이 사라졌을 때 그 이유를 알리는 종료 이벤트를 기다리는 시간.
@@ -169,6 +170,8 @@ pub(crate) struct Worker {
     syncing: Option<JoinHandle<Result<(), String>>>,
     /// 게스트 감시 상태([`Worker::guest_hung`]). 감시하지 않거나 QEMU가 없으면 None.
     agent: Option<GuestAgent>,
+    /// 이 작업자가 켠 QEMU의 하드웨어(계획 54). status에 기록이 없는 도는 VM에 쓴다. QEMU가 없으면 None.
+    started: Option<RunningHardware>,
     wake_at: Option<Instant>,
 }
 
@@ -205,6 +208,7 @@ impl Worker {
             cancel_failures: 0,
             syncing: None,
             agent: None,
+            started: None,
             wake_at: None,
         }
     }
@@ -458,6 +462,7 @@ impl Worker {
         // QEMU는 끝났다(요청이 남아 다시 해 보는 동안에도).
         status.phase = VmPhase::Failed;
         status.pid = None;
+        status.hardware = None;
         if let Err(e) = self.sync_disks(vm).await {
             tracing::warn!(vm = %self.id, error = %e, "cannot flush the disks of the VM stopped for a failed HA check; will retry");
             status.last_error = Some(format!(
@@ -497,6 +502,7 @@ impl Worker {
     /// VM은 리스가 끝났으면 강제로 끈다(그 사이 리더가 다른 노드에서 켤 수 있다). QEMU가 없을 때만 도는
     /// HA VM에서 뺀다.
     async fn unassigned(&mut self) -> Result<(), StepError> {
+        self.started = None;
         let mut actual = self.hv.inspect(self.id).await?;
         let fenced = actual.is_some()
             && self.ha_running
@@ -669,6 +675,7 @@ impl Worker {
         }
         status.phase = VmPhase::Starting;
         status.pid = None;
+        status.hardware = None;
         status.last_error = Some(format!("{reason}; restarting"));
         self.wake(Instant::now());
         Ok(status)
@@ -704,6 +711,11 @@ impl Worker {
         }
         let mut status = vm.status.clone();
         status.node = Some(self.config.node);
+        // QEMU가 없으면 실행 중 하드웨어도 없다(다시 켜면 새로 정한다 — 보류가 적용된다).
+        if actual.is_none() {
+            self.started = None;
+            status.hardware = None;
+        }
         let now = Instant::now();
         if std::mem::replace(&mut self.was_running, actual.is_some()) && actual.is_none() {
             self.awaiting_event = Some(now + EVENT_GRACE);
@@ -722,6 +734,16 @@ impl Worker {
                 status.phase = VmPhase::Running;
                 status.pid = Some(state.pid);
                 status.last_error = None;
+                // 기록이 없으면 이 작업자가 켠 하드웨어를 쓴다. 다시 붙은 VM(opld 재시작)은 켤 때 실행 디렉터리에
+                // 남긴 기록을, 그것도 없으면(계획 54 전에 켬) 핫플러그 배치가 없는 것으로 본다.
+                if status.hardware.is_none() {
+                    status.hardware = Some(
+                        self.started
+                            .clone()
+                            .or_else(|| self.hv.saved_hardware(self.id))
+                            .unwrap_or_else(|| RunningHardware::legacy(&vm.spec)),
+                    );
+                }
                 if state.status != RuntimeStatus::Running
                     && let Some(reason) = self.ha_blocked(vm)
                 {
@@ -868,6 +890,7 @@ impl Worker {
                         self.stopped_by_us = Some(Instant::now());
                         status.phase = VmPhase::Stopped;
                         status.pid = None;
+                        status.hardware = None;
                         return Ok(status);
                     }
                     None => {
@@ -886,6 +909,7 @@ impl Worker {
                         self.stopped_by_us = Some(Instant::now());
                         status.phase = VmPhase::Stopped;
                         status.pid = None;
+                        status.hardware = None;
                         return Ok(status);
                     }
                     Some(at) => self.wake(at + self.config.acpi_timeout),
@@ -973,6 +997,10 @@ impl Worker {
                 status.phase = VmPhase::Running;
                 status.pid = Some(state.pid);
                 status.last_error = None;
+                status.hardware = self
+                    .started
+                    .clone()
+                    .map(|hw| self.changed_while_starting(vm, hw));
             }
             // 시작하자마자 꺼졌다. 뒤따르는 이벤트에서 다시 맞춘다.
             None => {
@@ -991,7 +1019,7 @@ impl Worker {
     /// 그 사이 끝났으면 실패로 세지 않고 잠시 뒤 다시 본다(백오프, `NotStarted`). HA VM이 그 사이
     /// 바뀌었으면 `Changed`.
     async fn start(&mut self, vm: &Vm) -> Result<Start, StepError> {
-        let spec = match self.resolve(vm).await {
+        let mut spec = match self.resolve(vm).await {
             Ok(spec) => spec,
             Err(ResolveError::Cluster(e)) => return Err(e.into()),
             // 풀이 이 노드에서 아직 준비되지 않았거나(NFS 서버가 멈춤, 마운트 전 등) 디스크를 늘리는
@@ -1046,6 +1074,8 @@ impl Worker {
                 return Ok(Start::NotStarted);
             }
         }
+        let hardware = self.hardware_at_start(vm);
+        apply_hardware(&mut spec, &hardware);
         // 실패해도 다시 쓰지 않는다.
         let restore = self.restores.lock().unwrap().remove(&self.id);
         let started = self.hv.start(&spec, restore.as_deref()).await;
@@ -1053,7 +1083,14 @@ impl Worker {
             self.deactivate_disks(vm).await;
         }
         match (started, restore) {
-            (Ok(()), _) => Ok(Start::Started),
+            (Ok(()), _) => {
+                // 기록 없이 다시 붙을 때(opld 재시작) 켠 모양을 알 수 있게 실행 디렉터리에 남긴다.
+                if let Err(e) = self.hv.save_hardware(self.id, &hardware) {
+                    tracing::warn!(vm = %self.id, error = %e, "cannot save the hardware record of the started VM");
+                }
+                self.started = Some(hardware);
+                Ok(Start::Started)
+            }
             // 태그 없이 다시 시도하면 스냅샷이 아닌 처음부터 부팅하게 되므로 일시 오류라도 멈춘다.
             (Err(e), Some(tag)) => {
                 self.power_off = Some(Some(format!("failed to restore snapshot {tag}: {e}")));
@@ -1078,6 +1115,63 @@ impl Worker {
                 Ok(Start::NotStarted)
             }
         }
+    }
+
+    /// 켜는 동안 바뀐 스펙을 켠 하드웨어 `hw`의 보류로 남긴다. 그동안 API는 QEMU가 없는 VM으로 보고 핫플러그 Task 없이
+    /// 받았으므로, 켤 때 쓴 스펙(`vm`)과 지금 저장된 스펙의 vCPU·메모리·펌웨어·머신이 다르면 다음 재시작(`restart`) 때
+    /// 적용할 것으로 적는다(실행 중에 할 수 있는 것은 `vm hotplug`로도 된다).
+    fn changed_while_starting(&self, vm: &Vm, mut hw: RunningHardware) -> RunningHardware {
+        let Ok(Some(now)) = self.cluster.get::<VmSpec>(self.id) else {
+            return hw;
+        };
+        if !hotplug::hardware_changed(&vm.spec, &now.spec) {
+            return hw;
+        }
+        let caps = self
+            .cluster
+            .get::<NodeSpec>(self.config.node)
+            .ok()
+            .flatten()
+            .and_then(|n| n.status.hotplug)
+            .unwrap_or_default();
+        let plan = hotplug::plan_resources(&now.spec, &hw, caps);
+        let late = |field: &str, running: u32, wanted: u32| PendingChange {
+            field: field.into(),
+            running: running.to_string(),
+            wanted: wanted.to_string(),
+            reason: PendingReason::Restart,
+            detail: Some(
+                "changed while the VM was starting; restart it or run `vm hotplug`".into(),
+            ),
+        };
+        let mut pending = plan.pending;
+        for step in plan.steps {
+            match step {
+                Step::SetVcpus(n) => pending.push(late("vcpus", hw.vcpus(), u32::from(n))),
+                Step::SetMemory { .. } => {
+                    pending.push(late("memory_mib", hw.memory_now(), now.spec.memory_mib))
+                }
+                _ => {}
+            }
+        }
+        hw.pending = pending;
+        hw
+    }
+
+    /// 이 노드에서 켤 VM의 하드웨어(계획 54): 모든 노드가 `hotplug`를 알릴 때만 핫플러그 배치를 두고, 이 노드의
+    /// 능력(`NodeStatus.hotplug`)으로 vCPU·메모리 상한을 정한다. 노드 목록을 읽지 못하면 배치 없이 켠다.
+    fn hardware_at_start(&self, vm: &Vm) -> RunningHardware {
+        let nodes = self
+            .cluster
+            .list::<NodeSpec>()
+            .map(|(_, nodes)| nodes)
+            .unwrap_or_default();
+        let caps = nodes
+            .iter()
+            .find(|n| n.id == self.config.node)
+            .and_then(|n| n.status.hotplug)
+            .unwrap_or_default();
+        RunningHardware::at_start(&vm.spec, caps, all_have(&nodes, HOTPLUG)).0
     }
 
     /// HA VM을 켜거나 이어서 실행하기 직전에 다시 본다: 리스가 살아 있어야 하고, 로컬 저장소의 VM이
@@ -1356,9 +1450,11 @@ impl Worker {
     /// 누가 썼으면 다시 읽어 그 값으로 다시 쓴다. `firmware_node`도 이 작업자가 바꾸지 않았으면
     /// 저장소의 것을 지킨다(스냅샷 되돌리기가 쓴다). `rule_violations`는 리더가 쓰므로 늘, `ha`(HA 기록)는
     /// 이 작업자가 바꾼 필드만 저장소의 값 위에 다시 적용한다([`merge_ha`]). 나머지 필드는 전처럼 이 작업자가
-    /// 계산한 값으로 덮는다.
+    /// 계산한 값으로 덮는다. 실행 중 하드웨어 기록(`hardware`)도 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다
+    /// (핫플러그 Task가 쓴다).
     async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
         let keep_firmware = status.firmware_node == vm.status.firmware_node;
+        let keep_hardware = status.hardware == vm.status.hardware;
         let read_ha = vm.status.ha.clone().unwrap_or_default();
         let mine = status.ha.clone().unwrap_or_default();
         loop {
@@ -1366,6 +1462,9 @@ impl Worker {
             status.schedule_error = vm.status.schedule_error.clone();
             if keep_firmware {
                 status.firmware_node = vm.status.firmware_node;
+            }
+            if keep_hardware {
+                status.hardware = vm.status.hardware.clone();
             }
             status.rule_violations = vm.status.rule_violations.clone();
             status.ha = merge_ha(&read_ha, &mine, vm.status.ha.clone());

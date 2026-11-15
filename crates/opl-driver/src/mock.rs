@@ -9,7 +9,7 @@ use opl_qemu::QmpError;
 use opl_types::backup::BITMAP_PREFIX;
 use opl_types::node::NodeHotplug;
 use opl_types::runtime::{ImageFormat, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
-use opl_types::vm::{CpuSpec, DiskBus};
+use opl_types::vm::{CpuSpec, DiskBus, RunningHardware};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
@@ -202,6 +202,8 @@ struct MockState {
     fail_next_hotplug: Option<String>,
     /// 핫플러그 호출(실패 포함)
     hotplug_calls: Vec<HotplugCall>,
+    /// `save_hardware`로 남긴 하드웨어 기록. VM이 꺼지면 사라진다.
+    saved_hardware: HashMap<Uuid, RunningHardware>,
 }
 
 impl Default for MockHypervisor {
@@ -601,6 +603,11 @@ impl MockHypervisor {
         self.state.lock().unwrap().hotplug_caps = Some(caps);
     }
 
+    /// `save_hardware`로 남긴 기록을 지운다(기록 파일 없이 도는 VM — 계획 54 전에 켬).
+    pub fn forget_saved_hardware(&self, id: Uuid) {
+        self.state.lock().unwrap().saved_hardware.remove(&id);
+    }
+
     /// 이 VM의 게스트가 떼기·줄이기를 내려 주지 않게 하거나(true) 되돌린다(false). `set_vcpus`·`set_memory`의
     /// 줄이기는 바꾸지 않은 값을, `remove_disk`·`remove_nic`은 false를 돌려준다(장치는 그대로).
     pub fn hold_unplug(&self, id: Uuid, hold: bool) {
@@ -823,6 +830,7 @@ impl MockHypervisor {
         st.failing_disk_stats.remove(&id);
         st.guest_channels.remove(&id);
         st.hot.remove(&id);
+        st.saved_hardware.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -1576,6 +1584,19 @@ impl Hypervisor for MockHypervisor {
         }
         st.mirroring.remove(&id);
         Ok(())
+    }
+
+    fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        if !st.vms.contains_key(&id) {
+            return Err(DriverError::NotRunning(id));
+        }
+        st.saved_hardware.insert(id, hw.clone());
+        Ok(())
+    }
+
+    fn saved_hardware(&self, id: Uuid) -> Option<RunningHardware> {
+        self.state.lock().unwrap().saved_hardware.get(&id).cloned()
     }
 
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
