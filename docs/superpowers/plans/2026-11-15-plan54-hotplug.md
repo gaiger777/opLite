@@ -64368,3 +64368,39 @@ git commit -m "feat(web): VM 핫플러그 화면(상한·실행 중 디스크·N
 - 부팅 때 단 디스크·NIC는 실행 중 뗄 수 없다(`pcie.0`). aarch64 `virt`는 CPU 핫플러그가 없다.
 - 게스트가 ACPI로 받아야 끝나는 떼기(x86 vCPU·PCIe 장치)는 게스트가 없거나 거부하면 시간을 넘고, 장치는 "떼는 중"으로 남아 `vm hotplug`나 재시작으로 끝낸다. QEMU 8.2 q35는 게스트가 새 CPU 핫플러그 방식을 켜기 전에는 vCPU 떼기를 거절한다(재시작 보류).
 - `hardware.json`은 켤 때의 배치만 적는다(기록을 잃었을 때만 쓰임). 계획 54 전에 실행 중 바꾼 VM은 업그레이드 뒤 한 번 다시 켜기를 권한다.
+
+## 실행 후 기록 (2026-11-15)
+
+- **Task 1~8:** `feat/plan54-hotplug`에서 스크립트로 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았고(생성 파일 포함), 여덟 Task를 마친 트리는 리뷰·검증을 거친 트리와 같다.
+- **1차 리뷰에서 고친 것:**
+  - 핫플러그 Task 중의 PUT이 스펙과 QEMU 장치를 어긋나게 하던 것(치명) → 끝나지 않은 핫플러그 Task가 있으면 409 `vm_busy`, `plan`이 장치 오류를 내면 스펙 장치를 기록으로 되돌림, 스펙 장치가 실행 중 기록과 다르면 마이그레이션(사용자·HA·균형 조정기·비우기)과 받는 쪽이 거절.
+  - 떼기 시간 초과는 스펙을 되돌리지 않고 기록에 `unplugging`으로 남김(다음 Task가 마저 뗌), 마이그레이션 전에 `qom-list /machine/peripheral`을 기록과 견줌, 장치가 빠진 뒤의 정리 실패는 경고만.
+  - Task 도중 노드·pid가 바뀌면 되돌리지 않고 멈춤, 방화벽은 스펙과 도는 NIC의 합집합, 켤 때의 기록을 실행 디렉터리 `hardware.json`에, 옛 리더가 지운 노드 능력을 `HealthChecker`가 다시 씀.
+  - 웹 스냅샷의 메모리 포함 여부, 끄면서 바꾸기는 차가운 변경, 메모리 상한 512 GiB, `vm get` 표준 출력은 JSON만, CPU 핫플러그 능력은 x86_64 Linux만.
+- **2차 리뷰에서 고친 것:**
+  - 떼는 중인 볼륨이 비어 보여 지우기·다른 VM에 붙이기·유휴 정리가 되던 것(치명) → `vm_uses_volume`(스펙 또는 실행 중 기록)으로 409 `volume_in_use`.
+  - 떼는 중인 장치를 다시 붙이면 아무 일도 없이 나중에 사라지던 것 → 디스크·NIC PUT 409 `vm_busy`, `plan`은 떼는 중인 장치를 먼저 다시 뗌.
+  - 장치를 바꾸며 끄는 중인 VM 다시 켜기 409, 섞인 버전에서 기록이 있으면 NIC 네트워크·모델 바꾸기 거절, 중단된 Task 뒤 같은 자리에 다시 붙이기는 이미 있는 장치를 기록에 넣고 남은 블록 노드·netdev만 지움(살아 있는 tap을 지우지 않음).
+  - 시간 초과된 vCPU도 떼는 중으로, 장치 비교를 디스크 복사 전에, 균형 조정기가 장치가 어긋난 VM을 빼고 도는 메모리로 셈, `actions/hotplug`의 용량 검사·백업 중 409, 켜는 동안 바뀐 스펙은 재시작 보류.
+- **검증 중 고친 것:**
+  - GitHub x86_64 QEMU 8.2: q35는 게스트가 새 ACPI CPU 핫플러그 방식을 켜기 전에는 vCPU 떼기를 거절(`acpi: device unplug request for not supported device type`) → Task 실패·되돌림이 아니라 재시작 보류(Task 5). 웹 e2e의 `getByLabel("Memory (MiB)")`가 새 "Maximum memory (MiB)"와 겹침 → `exact`(Task 8).
+  - svc01의 새 clippy(`manual_clear`)가 시험의 `truncate(0)`을 잡음 → `clear()`(Task 6).
+  - `migration-it`에서 Task 성공 직후의 중간 상태(대상이 마이그레이션 표시만 지우고 아직 node·pid를 쓰지 않음, 약 0.2초)를 읽어 가끔 실패 → 시험이 이어지는 상태를 기다림(Task 7, 계획 53 시험에도 같은 원인).
+- **GitHub 프로브:** 첫 실행에서 위 두 가지가 실패했고, 고친 뒤 linux-kvm(`--no-fail-fast`)·ldap·package·ISO(BIOS·UEFI)가 모두 통과했다.
+- **검증 위치:** 일반 시험은 svc01, 시스템을 바꾸는 작업은 GitHub 프로브, macOS·웹·셸·cargo-deny·`ha-it`(9개)·`migration-it`(7개, 실행 중 디스크를 붙인 VM의 마이그레이션 포함)·실제 QEMU 핫플러그 시험(aarch64 HVF·x86_64 TCG)은 이 Mac. svc01에서도 opl-qemu·opl-driver 실제 QEMU 핫플러그 시험이 통과했다.
+- **테스트 VM 배포(svc01·svc02):** svc02 → svc01 순서. 유닛은 바뀌지 않아 그대로. 두 노드 모두 `hotplug`·`placement`·`ha-checks` 기능, 핫플러그 능력은 둘 다 `cpu: false, memory: true`(aarch64, QEMU 8.2.2 virtio-mem). test-vm은 계획 54 전에 켜져 `legacy` 기록(배치 없음, `vm get`이 "no hotplug (started without it)")이고 QEMU PID 그대로, 하드웨어는 바꾸지 않았다. 헬스 `ok`, 저널에 panic 없음(svc01 재시작 순간의 openraft 리더 확인 시간 초과 ERROR 두 줄뿐), 웹은 새 빌드.
+
+**테스트:**
+- macOS `cargo test --workspace` 2458개(스테이지별 2353·2367·2389·2401·2429·2449·2458·2458), 웹 시험 664개와 typecheck·lint, 패키징 셸 시험, `cargo-deny`, `ha-it` 9개, `migration-it` 7개, opld·opl-driver·opl-qemu 실제 QEMU 핫플러그
+- svc01(Linux) `fmt`·`clippy -D warnings`(모든 기능)·`cargo test --workspace` 2521개·starve·규모 시험 노드 100·storage-it
+
+GitHub 프로브에서 linux-kvm·ldap·package·ISO 작업.
+
+## 다음 계획으로 넘길 사항
+
+- 마이그레이션 확정 직후 대상이 표시만 지운 짧은 사이(node·pid가 아직 원본)에 다른 API가 원본을 실행 노드로 볼 수 있다 — `clear_migration`이 node=대상·pid 없음을 함께 쓰는 것을 검토할 것.
+- 실제 게스트 OS(Linux·Windows)로 vCPU·virtio-mem·PCIe 장치의 게스트 쪽 온라인·떼기를 확인할 것(시험은 OS 없이 펌웨어만).
+- aarch64 CPU 핫플러그, 부팅 때 단 장치 떼기, virtio-scsi는 남았다. `hardware.json`은 켤 때의 배치만 적는다.
+- `node list` 표에 핫플러그 능력 칸이 없다(`node get`·웹에는 있음).
+- 시험의 `free_port` 포트 경합(opld `cluster`·opl-driver)을 고칠 것.
+- 다음: 계획 55(로컬 디스크 HA).
