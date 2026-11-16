@@ -4,7 +4,8 @@
 //! 예약 스냅샷의 만들기·예약 정리의 삭제를 끝냈으면 실행기처럼 `task_failed`로 VM에 남긴다.
 //! 끝난 Task는 기간·개수 기준으로 지운다(웹 정리 설계 §2). 오래 `receiving`인 백업(보내던 클러스터가
 //! 끝내지 못한 사본)은 지우기 Task를 만들어 파일과 함께 지운다(엔터프라이즈 설계 §6.1).
-//! 끝났거나 쓸 수 없게 된(주인이 없거나 비밀번호가 바뀐) 로그인 세션을 지운다(가용성 설계 §4).
+//! 끝났거나 쓸 수 없게 된(주인이 없거나 비밀번호가 바뀐) 로그인 세션을 지운다(가용성 설계 §4). 실패로 끝낸
+//! Ceph Task가 잡은 자리(`CephStatus.pending`)를 놓는다.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -373,6 +374,10 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
             }
         }
         if let Action::FailTask { id, error, .. } = action {
+            // 실패로 끝낸 Ceph Task가 잡은 자리를 놓는다.
+            if tasks.iter().any(|t| t.id == id && t.spec.op.is_ceph()) {
+                crate::ceph::release_pending(cluster, id).await;
+            }
             record_schedule(state, &tasks, &snapshots, id, error).await;
         }
     }

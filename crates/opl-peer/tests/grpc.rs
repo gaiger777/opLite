@@ -14,13 +14,15 @@ use opl_cluster::{Cluster, ClusterConfig, FollowClient, FollowFrame, Forwarder, 
 use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, api_cert, node_key_and_csr};
 use opl_peer::{
-    AuditSource, FenceSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration,
-    LEASE_LIVENESS, MetricsReply, MetricsSource, MigrateIncomingRequest, MigrateIncomingResponse,
-    MigrationReceiver, NodeMonitor, NodeMonitorConfig, PeerService, Peers, PlacementSource,
-    PrepareMode, PrepareVolume, ReplicaAbortRequest, ReplicaError, ReplicaFinishRequest,
-    ReplicaPrepareRequest, ReplicaPrepareResponse, ReplicaReceiver, UefiVarsError, renew_liveness,
+    AuditSource, CephSource, FenceSource, GrpcNetwork, IncomingDisk, IncomingError,
+    IncomingMigration, LEASE_LIVENESS, MetricsReply, MetricsSource, MigrateIncomingRequest,
+    MigrateIncomingResponse, MigrationReceiver, NodeMonitor, NodeMonitorConfig, PeerService, Peers,
+    PlacementSource, PrepareMode, PrepareVolume, ReplicaAbortRequest, ReplicaError,
+    ReplicaFinishRequest, ReplicaPrepareRequest, ReplicaPrepareResponse, ReplicaReceiver,
+    UefiVarsError, renew_liveness,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
+use opl_types::ceph::{CephReport, DiskState, NodeDisk};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
 use opl_types::fence::{FenceKind, FenceMethodStatus, Power};
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries};
@@ -1753,6 +1755,106 @@ async fn placement_is_read_from_the_leader() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+}
+
+/// 정해 둔 디스크 목록과 Ceph 상태를 돌려주고, `fail`이 참이면 상태 읽기가 실패하는 Ceph 소스
+struct FakeCeph {
+    disks: Vec<NodeDisk>,
+    report: CephReport,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl CephSource for FakeCeph {
+    async fn disks(&self) -> Result<Vec<NodeDisk>, String> {
+        Ok(self.disks.clone())
+    }
+
+    async fn status(&self) -> Result<CephReport, String> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("ceph status: [errno 110] RADOS timed out".into());
+        }
+        Ok(self.report.clone())
+    }
+}
+
+#[tokio::test]
+async fn disks_and_the_ceph_status_are_read_from_another_node() {
+    let (ca, root, nodes) = start(1).await;
+    let disks = vec![NodeDisk {
+        path: "/dev/sdb".into(),
+        by_id: Some("/dev/disk/by-id/wwn-0x5000c500a1b2c3d4".into()),
+        size_bytes: 10 << 30,
+        rotational: true,
+        model: None,
+        serial: None,
+        state: DiskState::Wipeable {
+            reasons: vec!["gpt partition table".into()],
+        },
+    }];
+    let report = CephReport {
+        quorum: vec!["node1".into()],
+        osd_hosts_up: 1,
+        ..CephReport::default()
+    };
+    let source = Arc::new(FakeCeph {
+        disks: disks.clone(),
+        report: report.clone(),
+        fail: false.into(),
+    });
+    let ceph = source.clone();
+    let target = Node::start_serving(&ca, &root, move |s| s.with_ceph(ceph)).await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+            addrs: vec![],
+        })
+        .await
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(nodes[0].id()) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let peers = &nodes[0].peers;
+    let got = peers
+        .node_disks(target.id(), &target.addr, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(got, Some(disks));
+    let got = peers
+        .ceph_status(target.id(), &target.addr, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(got, Some(report));
+    // 상태를 읽지 못하면 `failed_precondition`과 그 이유다.
+    source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = peers
+        .ceph_status(target.id(), &target.addr, WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert!(err.message().contains("RADOS timed out"), "{err:?}");
+
+    // Ceph 소스가 없는 노드(옛 노드·위트니스)는 None이다.
+    let none = target
+        .peers
+        .node_disks(nodes[0].id(), &nodes[0].addr, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+    let none = target
+        .peers
+        .ceph_status(nodes[0].id(), &nodes[0].addr, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
 }
 
 /// 리더가 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`)을 `observers`(id, 클러스터 주소)로 바꾼다(없으면

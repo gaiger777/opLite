@@ -409,6 +409,22 @@ impl CephView {
     }
 }
 
+/// `GET /ceph/status`의 응답: 보고서와, 지금 읽지 못해 마지막으로 읽은 보고서를 돌려줄 때의 표시
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct CephStatusView {
+    #[serde(flatten)]
+    pub report: CephReport,
+    /// 참이면 `report`는 `read_at`에 읽은 마지막 보고서다(지금은 읽지 못함).
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub stale: bool,
+    /// 지금 읽지 못한 이유(`stale`일 때)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
+}
+
 /// `POST /ceph`: 노드 `node`에 첫 mon·mgr을 세운다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -464,6 +480,10 @@ pub struct CephPoolRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub size: Option<u8>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[cfg(test)]
@@ -796,5 +816,36 @@ mod tests {
         let init: CephInitRequest =
             serde_json::from_value(serde_json::json!({ "node": "node1" })).unwrap();
         assert_eq!(init.public_network, None);
+    }
+
+    /// 상태 응답은 보고서 필드를 그대로 펴고, 지금 읽은 것이면 `stale`·`error`를 넣지 않는다.
+    #[test]
+    fn status_view_flattens_the_report() {
+        let report = CephReport {
+            quorum: vec!["node1".into()],
+            osd_hosts_up: 1,
+            ..CephReport::default()
+        };
+        let fresh = CephStatusView {
+            report: report.clone(),
+            stale: false,
+            error: None,
+        };
+        let v = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(v["quorum"], serde_json::json!(["node1"]));
+        assert_eq!(v["osd_hosts_up"], 1);
+        assert!(v.get("stale").is_none() && v.get("error").is_none(), "{v}");
+        let stale = CephStatusView {
+            report,
+            stale: true,
+            error: Some("timed out".into()),
+        };
+        let v = serde_json::to_value(&stale).unwrap();
+        assert_eq!(
+            (v["stale"].clone(), v["error"].clone()),
+            (true.into(), "timed out".into())
+        );
+        let back: CephStatusView = serde_json::from_value(v).unwrap();
+        assert_eq!(back, stale);
     }
 }

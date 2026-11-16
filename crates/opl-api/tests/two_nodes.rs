@@ -18,11 +18,13 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use opl_api::{
-    AppState, AuditConfig, AuditLog, Balancer, BalancerConfig, IncomingConfig, IncomingMigrations,
-    PlacementBoard, PlacementStatusSource, TaskRunner, UefiVarsFetcher, hash_password,
+    AppState, AuditConfig, AuditLog, Balancer, BalancerConfig, CephPeerSource, IncomingConfig,
+    IncomingMigrations, PlacementBoard, PlacementStatusSource, TaskRunner, UefiVarsFetcher,
+    hash_password,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig};
+use opl_driver::ceph::{CephHost, CephOptions, CephPaths, CmdOutput, FakeRunner};
 use opl_driver::mock::MOCK_MIRROR_BYTES;
 use opl_driver::{
     DriverError, Hypervisor, MigrateTarget, MirrorTarget, MockHypervisor, RuntimeStatus, Storage,
@@ -93,6 +95,8 @@ struct Node {
     runner_config: Option<opl_api::TaskRunnerConfig>,
     /// API 서버의 상태(반복 작업을 띄울 때 쓴다)
     state: Option<Arc<AppState>>,
+    /// 이 노드의 Ceph 단계가 부르는 명령을 받는 가짜 실행기(API와 노드 간 서버가 같은 단계를 쓴다)
+    ceph: Arc<FakeRunner>,
 }
 
 impl Node {
@@ -145,6 +149,7 @@ impl Node {
             runner: None,
             runner_config: None,
             state: None,
+            ceph: Arc::new(FakeRunner::new()),
         }
     }
 
@@ -191,10 +196,26 @@ impl Node {
                 vm_times,
             }) as Arc<dyn MetricsSource>
         });
+        // opld처럼 API와 노드 간 서버가 같은 Ceph 단계를 쓴다.
+        let ceph = Arc::new(CephHost::new(
+            self.ceph.clone(),
+            CephPaths {
+                etc_ceph: work.join("etc/ceph"),
+                var_lib_ceph: work.join("var/lib/ceph"),
+                client_dir: work.join("etc/opl/ceph"),
+                by_id: work.join("dev/disk/by-id"),
+            },
+            CephOptions::default(),
+        ));
         let mut service = PeerService::new(self.cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(incoming))
             .with_uefi_vars(work.join("state"))
-            .with_audit(audit.clone());
+            .with_audit(audit.clone())
+            .with_ceph(Arc::new(CephPeerSource::new(
+                self.cluster.clone(),
+                self.id,
+                ceph.clone(),
+            )));
         if let Some(metrics) = &metrics {
             service = service.with_metrics(metrics.clone());
         }
@@ -243,6 +264,7 @@ impl Node {
         state.audit = audit;
         state.metrics = metrics;
         state.placement = board;
+        state.ceph = Some(ceph);
         let state = Arc::new(state);
         self.state = Some(state.clone());
         let mut config = runner_config(self.id, &work);
@@ -2755,4 +2777,207 @@ async fn a_new_leader_recommends_again() {
     for b in balancers {
         b.shutdown().await;
     }
+}
+
+/// Ceph: mon이 아닌 노드의 API가 Ceph 상태를 mon 노드에 노드 사이 RPC로 읽고, 다른 노드의 디스크 목록도 그 노드의
+/// 실행기로 읽는다(OSD 더하기의 미리 확인도 같다).
+#[tokio::test]
+async fn ceph_status_and_disks_are_read_from_the_other_node() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    for (prefix, out) in [
+        (
+            "status",
+            &include_bytes!("../../opl-driver/src/ceph/fixtures/status-ok.json")[..],
+        ),
+        (
+            "quorum_status",
+            include_bytes!("../../opl-driver/src/ceph/fixtures/quorum-status.json"),
+        ),
+        (
+            "mgr dump",
+            include_bytes!("../../opl-driver/src/ceph/fixtures/mgr-dump.json"),
+        ),
+        (
+            "osd tree",
+            include_bytes!("../../opl-driver/src/ceph/fixtures/osd-tree.json"),
+        ),
+        (
+            "osd df",
+            include_bytes!("../../opl-driver/src/ceph/fixtures/osd-df.json"),
+        ),
+        (
+            "df",
+            include_bytes!("../../opl-driver/src/ceph/fixtures/df.json"),
+        ),
+        (
+            "osd metadata",
+            include_bytes!("../../opl-driver/src/ceph/fixtures/osd-metadata.json"),
+        ),
+        (
+            "osd pool ls detail",
+            include_bytes!("../../opl-driver/src/ceph/fixtures/pool-ls-detail.json"),
+        ),
+    ] {
+        b.ceph.reply(
+            &format!("ceph --connect-timeout 10 {prefix} --format json"),
+            CmdOutput::ok(out),
+        );
+    }
+    b.ceph.reply(
+        "lsblk",
+        CmdOutput::ok(&include_bytes!("../../opl-driver/src/ceph/fixtures/lsblk-root.json")[..]),
+    );
+    b.ceph.reply(
+        "pvs",
+        CmdOutput::ok(&include_bytes!("../../opl-driver/src/ceph/fixtures/pvs.json")[..]),
+    );
+    b.ceph
+        .reply("lvs", CmdOutput::ok(r#"{"report":[{"lv":[]}]}"#));
+    b.ceph
+        .reply("ceph-volume lvm list --format json", CmdOutput::ok("{}"));
+    // mon·mgr은 B에만 있다.
+    let mut ceph = Resource::new(
+        opl_types::ceph::CEPH_NAME,
+        opl_types::ceph::CephSpec {
+            fsid: Uuid::new_v4(),
+            public_network: "127.0.0.0/8".parse().unwrap(),
+            cluster_network: None,
+            keys: opl_types::ceph::CephKeys {
+                mon: "AQmon".into(),
+                admin: "AQadmin".into(),
+                bootstrap_osd: "AQosd".into(),
+                client: "AQclient".into(),
+            },
+        },
+    );
+    ceph.status = opl_types::ceph::CephStatus {
+        phase: opl_types::ceph::CephPhase::Ready,
+        mons: vec![opl_types::ceph::CephMon {
+            node: b.id,
+            name: b.name.clone(),
+            addr: "127.0.0.1".parse().unwrap(),
+        }],
+        mgrs: vec![b.id],
+        ..Default::default()
+    };
+    a.cluster.create(&ceph).await.unwrap();
+    // A가 그 리소스를 볼 때까지 기다린다.
+    let deadline = Instant::now() + WAIT;
+    while a
+        .cluster
+        .get_by_name::<opl_types::ceph::CephSpec>(opl_types::ceph::CEPH_NAME)
+        .unwrap()
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the Ceph resource never reached A"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (status, report) = admin.get("/ceph/status").await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["health"]["status"], "HEALTH_OK");
+    assert_eq!(report["via"], b.id.to_string());
+    assert_eq!(b.ceph.calls().len(), 8);
+    assert!(a.ceph.calls().is_empty(), "{:?}", a.ceph.calls());
+
+    let (status, disks) = admin.get(&format!("/nodes/{}/disks", b.name)).await;
+    assert_eq!(status, StatusCode::OK, "{disks}");
+    assert!(
+        disks
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["path"] == "/dev/sdb" && d["state"] == "available"),
+        "{disks}"
+    );
+    assert!(b.ceph.calls().iter().any(|c| c.starts_with("lsblk")));
+    // OSD 더하기의 미리 확인도 B의 디스크 목록으로 한다.
+    let (status, body) = admin
+        .post(
+            "/ceph/osds",
+            serde_json::json!({ "node": b.name, "device": "/dev/sda" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "disk_in_use");
+    assert!(a.ceph.calls().is_empty(), "{:?}", a.ceph.calls());
+}
+
+/// 한 번에 하나인 Ceph Task(mon·mgr)의 자리는 Raft에 잡는다: 두 노드의 API에 함께 온 mgr 더하기 가운데 하나만
+/// 지나가고 다른 하나는 409 `ceph_busy`다.
+#[tokio::test]
+async fn ceph_daemon_tasks_take_turns_across_nodes() {
+    let (_root, mut a, mut b) = two_nodes().await;
+    // Task가 끝나 자리를 놓지 않게 실행기를 멈춘다.
+    a.stop_runner().await;
+    b.stop_runner().await;
+    let admin_a = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let admin_b = login_at(&b.base, "admin", ADMIN_PASSWORD).await;
+    let mut ceph = Resource::new(
+        opl_types::ceph::CEPH_NAME,
+        opl_types::ceph::CephSpec {
+            fsid: Uuid::new_v4(),
+            public_network: "127.0.0.0/8".parse().unwrap(),
+            cluster_network: None,
+            keys: opl_types::ceph::CephKeys {
+                mon: "AQmon".into(),
+                admin: "AQadmin".into(),
+                bootstrap_osd: "AQosd".into(),
+                client: "AQclient".into(),
+            },
+        },
+    );
+    ceph.status = opl_types::ceph::CephStatus {
+        phase: opl_types::ceph::CephPhase::Ready,
+        mons: vec![opl_types::ceph::CephMon {
+            node: a.id,
+            name: a.name.clone(),
+            addr: "127.0.0.1".parse().unwrap(),
+        }],
+        ..Default::default()
+    };
+    a.cluster.create(&ceph).await.unwrap();
+    let deadline = Instant::now() + WAIT;
+    while b
+        .cluster
+        .get_by_name::<opl_types::ceph::CephSpec>(opl_types::ceph::CEPH_NAME)
+        .unwrap()
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the Ceph resource never reached B"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let ((sa, ba), (sb, bb)) = tokio::join!(
+        admin_a.post("/ceph/mgrs", serde_json::json!({ "node": a.name })),
+        admin_b.post("/ceph/mgrs", serde_json::json!({ "node": b.name })),
+    );
+    let mut codes = [sa, sb];
+    codes.sort();
+    assert_eq!(
+        codes,
+        [StatusCode::ACCEPTED, StatusCode::CONFLICT],
+        "{ba} {bb}"
+    );
+    let refused = if sa == StatusCode::CONFLICT { &ba } else { &bb };
+    assert_eq!(refused["code"], "ceph_busy", "{refused}");
+    // 두 쓰기가 A에도 적용된 뒤에 센다.
+    a.cluster
+        .wait_revision(a.cluster.revision().max(b.cluster.revision()), WAIT)
+        .await
+        .unwrap();
+    let (_, tasks) = a.cluster.list::<TaskSpec>().unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .filter(|t| t.spec.op == TaskOp::CephMgrAdd)
+            .count(),
+        1
+    );
 }

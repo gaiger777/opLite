@@ -761,16 +761,25 @@ fn via_voter(members: &opl_cluster::Members, me: NodeId) -> Option<String> {
         .cloned()
 }
 
+/// 노드를 뺐지만 손으로 할 일이 남았을 때의 `DELETE /nodes/{key}` 응답
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct NodeRemoved {
+    pub warnings: Vec<String>,
+}
+
 /// 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `orbivisorctl cluster leave`로 뺀다.
-/// 그 노드에 배정된 VM은 그대로 남는다. VM들의 복제 대상(계획 55)에서는 그 노드를 뺀다.
+/// 그 노드에 배정된 VM은 그대로 남는다. VM들의 복제 대상(계획 55)에서는 그 노드를 뺀다. Ceph 데몬(mon·mgr·OSD)
+/// 노드였으면 Orbivisor의 Ceph 기록에서도 빼고(Ceph는 바꾸지 않는다) 손으로 치울 명령을 경고로 돌려준다(200).
 #[utoipa::path(delete, path = "/nodes/{key}", tag = "nodes",
     params(("key" = String, Path, description = "id or name")),
-    responses((status = 204, description = "Removed"), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 204, description = "Removed"),
+        (status = 200, description = "Removed; something is left to do by hand", body = NodeRemoved),
+        (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_node(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Path(key): Path<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     state.authorize(&principal, Action::Write, NodeSpec::KIND)?;
     let node = lookup::<NodeSpec>(&state.cluster, &key)?;
     if node.id == state.node || node.status.online {
@@ -782,6 +791,8 @@ pub async fn delete_node(
             ),
         ));
     }
+    // Ceph 기록에서 먼저 뺀다(노드를 지운 뒤 실패하면 다시 부를 노드가 없다).
+    let warnings = crate::ceph::forget_node(&state, &node).await?;
     state
         .cluster
         .request(LeaderRequest::Remove {
@@ -796,7 +807,10 @@ pub async fn delete_node(
     crate::node_fence::delete_with_node(&state, &node).await?;
     drop_replication_target(&state, node.id).await?;
     tracing::info!(node = %node.name, "node removed from the cluster");
-    Ok(StatusCode::NO_CONTENT)
+    if warnings.is_empty() {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    Ok(Json(NodeRemoved { warnings }).into_response())
 }
 
 /// 지운 노드 `node`를 모든 VM의 복제 대상(`spec.replication`)과 복제 상태(`status.replication`)에서 뺀다. 남겨 두면

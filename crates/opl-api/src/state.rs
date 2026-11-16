@@ -73,6 +73,8 @@ pub struct AppState {
     pub ceph: Option<Arc<CephHost>>,
     /// Ceph 상태(`GET /ceph/status`)를 다시 읽지 않고 돌려주는 시간(opld `[ceph] status_cache_secs`)
     pub ceph_status_ttl: Duration,
+    /// 마지막으로 읽은 Ceph 상태
+    pub(crate) ceph_status: crate::ceph::CephStatusCache,
 }
 
 impl AppState {
@@ -109,6 +111,7 @@ impl AppState {
             placement_apply: Default::default(),
             ceph: None,
             ceph_status_ttl: Duration::from_secs(5),
+            ceph_status: Default::default(),
         }
     }
 }

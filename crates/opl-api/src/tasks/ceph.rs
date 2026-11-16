@@ -17,7 +17,7 @@ use opl_types::ceph::{
 };
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Resource;
-use opl_types::storage::{PoolBackend, StoragePoolSpec, pool_listed_on};
+use opl_types::storage::{PoolBackend, StoragePoolSpec};
 use opl_types::task::{Task, TaskOp};
 use uuid::Uuid;
 
@@ -416,7 +416,7 @@ impl Run<'_> {
         // OSD가 up인지는 client.orbivisor로 본다(이 노드에 admin 키링이 없을 수 있다).
         self.write_client_conf(&self.status().mons)?;
         self.stage("preparing-osd").await;
-        let pool_vgs = self.pool_vgs()?;
+        let pool_vgs = crate::ceph::pool_vgs(&self.ctx.cluster, self.me.id)?;
         let id = self
             .host
             .create_osd(device, wipe, self.spec().fsid, &pool_vgs)
@@ -425,25 +425,6 @@ impl Run<'_> {
         tracing::info!(osd = id, device, "Ceph OSD is up");
         let node = self.me.id;
         update_ceph(&self.ctx.cluster, |s| add_node(&mut s.osd_nodes, node)).await
-    }
-
-    /// 이 노드가 쓰는 Orbivisor LVM 풀(LVM-thin·공유 LVM)의 (VG, 풀 이름). 그 PV는 OSD로 쓰지 않는다.
-    fn pool_vgs(&self) -> Result<Vec<(String, String)>, String> {
-        let (_, pools) = self
-            .ctx
-            .cluster
-            .list::<StoragePoolSpec>()
-            .map_err(|e| e.to_string())?;
-        Ok(pools
-            .into_iter()
-            .filter(|p| pool_listed_on(p, self.me.id))
-            .filter_map(|p| match &p.spec.backend {
-                PoolBackend::LvmThin { vg, .. } | PoolBackend::LvmShared { vg, .. } => {
-                    Some((vg.clone(), p.name.clone()))
-                }
-                _ => None,
-            })
-            .collect())
     }
 
     /// `ceph-pool-create`: Ceph 풀을 만들어 Orbivisor RBD 풀 `name`(사용자 `orbivisor`, 관리 conf)으로 등록한다.

@@ -107,6 +107,18 @@ fn main() {
             "crate::placement::PlacementRequest",
             "opl_types::placement::PlacementStatus",
         ))
+        .method(json(
+            "node_disks",
+            "NodeDisks",
+            "crate::ceph::NodeDisksRequest",
+            "crate::ceph::NodeDisksReply",
+        ))
+        .method(json(
+            "ceph_status",
+            "CephStatus",
+            "crate::ceph::CephStatusRequest",
+            "crate::ceph::CephStatusReply",
+        ))
         .method(
             Method::builder()
                 .name("uefi_vars")

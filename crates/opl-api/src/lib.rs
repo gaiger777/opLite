@@ -11,6 +11,7 @@ mod backup_receive;
 mod backups;
 pub mod balance;
 mod balancer;
+mod ceph;
 mod ceph_agent;
 pub mod cluster;
 mod console;
@@ -78,6 +79,7 @@ pub use audit::{AuditConfig, AuditLog};
 pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
 pub use backup_jobs::{BackupJobScheduler, BackupJobSchedulerConfig};
 pub use balancer::{Balancer, BalancerConfig};
+pub use ceph::CephPeerSource;
 pub use ceph_agent::CephAgent;
 pub use drain::start_drain;
 pub use firmware::UefiVarsFetcher;
@@ -165,6 +167,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         )
         .routes(routes!(r::list_nodes))
         .routes(routes!(r::get_node, r::update_node, cluster::delete_node))
+        .routes(routes!(ceph::list_node_disks))
         .routes(routes!(updates::refresh_updates))
         .routes(routes!(updates::upgrade_node))
         .routes(routes!(drain::drain_node))
@@ -192,6 +195,13 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             subscription::put_subscription,
             subscription::delete_subscription
         ))
+        .routes(routes!(ceph::get_ceph, ceph::init_ceph))
+        .routes(routes!(ceph::get_ceph_status))
+        .routes(routes!(ceph::add_mon))
+        .routes(routes!(ceph::add_mgr))
+        .routes(routes!(ceph::add_osd))
+        .routes(routes!(ceph::create_ceph_pool))
+        .routes(routes!(ceph::install_client))
         .routes(routes!(r::list_pools, r::create_pool))
         .routes(routes!(r::get_pool, r::patch_pool, r::delete_pool))
         .routes(routes!(r::list_networks, r::create_network))

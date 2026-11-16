@@ -24,6 +24,7 @@ use opl_cluster::{
     ClusterError, Failure, FollowClient, FollowFrame, Forwarder, LinkBook, LinkSelector, Pick,
 };
 use opl_types::audit::{AuditEntry, AuditQuery};
+use opl_types::ceph::{CephReport, NodeDisk};
 use opl_types::fence::FenceMethodStatus;
 use opl_types::metrics::MetricsQuery;
 use opl_types::placement::PlacementStatus;
@@ -34,6 +35,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tonic::{Code, Request, Status, Streaming};
 use uuid::Uuid;
 
+use crate::ceph::{CephStatusRequest, NodeDisksRequest};
 use crate::fence::FenceStatusRequest;
 use crate::firmware::{UefiVarsError, UefiVarsRequest};
 use crate::metrics::MetricsReply;
@@ -705,6 +707,54 @@ impl Peers {
             .await;
         match reply {
             Ok(reply) => Ok(Some(reply.into_inner())),
+            Err(s) if s.code() == Code::Unimplemented => Ok(None),
+            Err(s) => Err(s),
+        }
+    }
+}
+
+impl Peers {
+    /// 노드 `node`(첫 링크 `addr`)의 디스크 목록을 읽는다. 그 노드가 이 RPC를 모르면(옛 노드나 위트니스) None이다.
+    /// 그 노드가 디스크를 읽지 못하면 `failed_precondition`이다.
+    pub async fn node_disks(
+        &self,
+        node: NodeId,
+        addr: &str,
+        timeout: Duration,
+    ) -> Result<Option<Vec<NodeDisk>>, Status> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(NodeDisksRequest {});
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(node));
+                async move { within(timeout, client.node_disks(req)).await }
+            })
+            .await;
+        match reply {
+            Ok(reply) => Ok(Some(reply.into_inner().disks)),
+            Err(s) if s.code() == Code::Unimplemented => Ok(None),
+            Err(s) => Err(s),
+        }
+    }
+
+    /// mon 노드 `node`(첫 링크 `addr`)에서 Ceph 상태를 읽는다. 그 노드가 이 RPC를 모르면(옛 노드) None이다. 그
+    /// 노드가 상태를 읽지 못하면(정족수 없음 등) `failed_precondition`이다.
+    pub async fn ceph_status(
+        &self,
+        node: NodeId,
+        addr: &str,
+        timeout: Duration,
+    ) -> Result<Option<CephReport>, Status> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(CephStatusRequest {});
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(node));
+                async move { within(timeout, client.ceph_status(req)).await }
+            })
+            .await;
+        match reply {
+            Ok(reply) => Ok(Some(reply.into_inner().report)),
             Err(s) if s.code() == Code::Unimplemented => Ok(None),
             Err(s) => Err(s),
         }

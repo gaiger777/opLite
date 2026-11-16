@@ -12,10 +12,10 @@ use anyhow::Context;
 use axum::serve::ListenerExt;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
-    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, Balancer, CephAgent, ClusterJanitor,
-    FenceStatusSource, HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations,
-    IncomingReplicas, PlacementBoard, PlacementStatusSource, PowerFence, RemotePoller,
-    ReplicaConfig, ReplicationScheduler, RuntimeProbe, SnapshotScheduler, TaskRunner,
+    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, Balancer, CephAgent, CephPeerSource,
+    ClusterJanitor, FenceStatusSource, HaManager, HaManagerConfig, IncomingConfig,
+    IncomingMigrations, IncomingReplicas, PlacementBoard, PlacementStatusSource, PowerFence,
+    RemotePoller, ReplicaConfig, ReplicationScheduler, RuntimeProbe, SnapshotScheduler, TaskRunner,
     TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent,
     VipManager, VipManagerConfig,
 };
@@ -507,6 +507,9 @@ impl Member {
             cluster.clone(),
             placement.clone(),
         ));
+        // Ceph Task·에이전트와 API(디스크 목록, Ceph 상태), 다른 노드(노드 간 서버)가 같은 단계들을 쓴다.
+        let ceph = Arc::new(config.ceph.host());
+        let ceph_source = Arc::new(CephPeerSource::new(cluster.clone(), node, ceph.clone()));
         // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(
@@ -520,6 +523,7 @@ impl Member {
             .with_metrics(metrics_source.clone())
             .with_fence(fence_source)
             .with_placement(placement_source)
+            .with_ceph(ceph_source)
             .with_work(rt.work.clone());
         let peer = on(&rt.core, || {
             serve_peer(peer_listener, &tls, service, exited_tx.clone())
@@ -725,8 +729,6 @@ impl Member {
         runner_config.replication_bandwidth = config.replication.bandwidth();
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
-        // Ceph Task·에이전트와 API(디스크 목록, Ceph 상태)가 같은 단계들을 쓴다.
-        let ceph = Arc::new(config.ceph.host());
         runner_config.ceph = Some(ceph.clone());
         state.ceph = Some(ceph.clone());
         state.ceph_status_ttl = config.ceph.status_cache();

@@ -367,6 +367,159 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ceph": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Orbivisor가 관리하는 Ceph 클러스터(키는 넣지 않는다). 끝나지 않은 Ceph Task의 id를 함께 보인다. 없으면 404다. */
+        get: operations["get_ceph"];
+        put?: never;
+        /**
+         * Ceph를 세운다: 키·fsid를 만들고 `Ceph` 리소스(`bootstrapping`)와 노드 `node`의 `ceph-init` Task(202)를 만든다.
+         *     그 노드가 Ceph 꾸러미를 설치하고 첫 mon·mgr을 세운다. `public_network`가 없으면 노드 주소가 든 인터페이스의
+         *     망이다. 부트스트랩이 실패했으면 같은 노드로 다시 부르면 새 Task만 만들어 이어서 한다. 노드가 없거나 위트니스·망
+         *     문법·망 안 주소가 없으면 400, 오프라인이면 409 `node_offline`, 옛 노드가 남았으면 409 `cluster_upgrading`,
+         *     이미 있으면(다른 노드에서 세우는 중 포함) 409 `ceph_exists`, 부트스트랩 Task가 끝나지 않았으면 409 `ceph_busy`.
+         */
+        post: operations["init_ceph"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ceph/clients": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드 `node`에 Ceph 클라이언트 꾸러미(`ceph-common`·`qemu-block-extra`)를 설치하는 `ceph-client-install`
+         *     Task(202). 클라이언트 설정은 노드마다 이미 쓰여 있다. 노드가 없거나 위트니스면 400, 오프라인이면 409
+         *     `node_offline`.
+         */
+        post: operations["install_client"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ceph/mgrs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드 `node`에 (대기) mgr을 더하는 `ceph-mgr-add` Task(202). 오류는 mon 더하기와 같다(상한은 없다 — 노드마다
+         *     하나).
+         */
+        post: operations["add_mgr"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ceph/mons": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드 `node`에 mon을 더하는 `ceph-mon-add` Task(202). mon은 5개까지(409 `ceph_limit`)이고 홀수(3·5)가 정족수를
+         *     가장 잘 지킨다. 부트스트랩 전이면 409 `ceph_not_ready`, 다른 mon·mgr Task가 끝나지 않았으면 409 `ceph_busy`,
+         *     그 노드에 이미 mon이 있으면 409 `ceph_exists`, 노드가 없거나 위트니스·망 안 주소가 없으면 400.
+         */
+        post: operations["add_mon"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ceph/osds": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드 `node`의 디스크 `device`(`/dev/sdb`나 by-id 경로)에 OSD를 만드는 `ceph-osd-add` Task(202). 먼저 그 노드의
+         *     디스크 목록으로 확인한다: 그런 디스크가 없으면 400, 쓰는 중이면 409 `disk_in_use`, 비지 않았는데 `wipe`가
+         *     아니면 409 `disk_not_empty`. Task에는 by-id 경로가 있으면 그것을 적는다(재부팅으로 이름이 바뀌어도 같은 디스크).
+         *     부트스트랩 전이면 409 `ceph_not_ready`.
+         */
+        post: operations["add_osd"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ceph/pools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Ceph 풀을 만들어 Orbivisor RBD 풀 `name`(사용자 `orbivisor`, 관리 conf)으로 등록하는 `ceph-pool-create` Task(202,
+         *     온라인 mon 노드 가운데 id가 가장 작은 노드에서 돈다). `pool`이 없으면 Ceph 풀 이름은 `name`, `size`가 없으면
+         *     min(3, OSD가 up인 호스트 수)다(호스트가 하나면 size 1을 적어야 한다). size는 1~3이고 호스트 수보다 클 수
+         *     없다(400). 이름이 잘못됐으면 400, 이미 있는 풀 이름이면 409 `pool_exists`, 부트스트랩 전이거나 OSD가 없으면
+         *     409 `ceph_not_ready`, Ceph 상태를 읽지 못하면 503 `ceph_unreachable`.
+         */
+        post: operations["create_ceph_pool"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ceph/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Ceph 상태(health·mon·mgr·OSD·PG·사용량·풀). Raft가 아닌 mon 노드에서 읽는다(이 노드가 mon이면 직접, 아니면 온라인
+         *     mon 노드에 노드 사이 RPC로). 잠깐(`[ceph] status_cache_secs`, 기본 5초) 둔 것을 돌려주고 `refresh`면 새로 읽는다.
+         *     지금 읽지 못하면 마지막 보고서를 `stale`과 `error`로 돌려주고, 그것도 없으면 503 `ceph_unreachable`이다. mon
+         *     노드가 이 RPC를 모르면 409 `cluster_upgrading`, 없으면 404.
+         */
+        get: operations["get_ceph_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cluster": {
         parameters: {
             query?: never;
@@ -640,9 +793,31 @@ export interface paths {
         post?: never;
         /**
          * 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `orbivisorctl cluster leave`로 뺀다.
-         *     그 노드에 배정된 VM은 그대로 남는다. VM들의 복제 대상(계획 55)에서는 그 노드를 뺀다.
+         *     그 노드에 배정된 VM은 그대로 남는다. VM들의 복제 대상(계획 55)에서는 그 노드를 뺀다. Ceph 데몬(mon·mgr·OSD)
+         *     노드였으면 Orbivisor의 Ceph 기록에서도 빼고(Ceph는 바꾸지 않는다) 손으로 치울 명령을 경고로 돌려준다(200).
          */
         delete: operations["delete_node"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{key}/disks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 노드의 디스크(`lsblk`의 최상위 디스크)마다 OSD로 쓸 수 있는지: `available`, `wipeable`(지워야 함, 이유들),
+         *     `in-use`(쓸 수 없음, 이유). 위트니스면 409 `node_unavailable`, 오프라인이면 409 `node_offline`, 이것을 모르는 옛
+         *     노드면 409 `cluster_upgrading`, 읽지 못하면 503 `node_unreachable`.
+         */
+        get: operations["list_node_disks"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2204,6 +2379,171 @@ export interface components {
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
             vlan_filtering: boolean;
         };
+        CephHealth: {
+            /** @default [] */
+            checks: components["schemas"]["CephHealthCheck"][];
+            /**
+             * @description `HEALTH_OK`, `HEALTH_WARN`, `HEALTH_ERR`
+             * @default
+             */
+            status: string;
+        };
+        /** @description health 검사 하나(예: `TOO_FEW_OSDS`) */
+        CephHealthCheck: {
+            /** @default  */
+            code: string;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            count: number;
+            /** @default false */
+            muted: boolean;
+            /**
+             * @description `HEALTH_WARN`, `HEALTH_ERR`
+             * @default
+             */
+            severity: string;
+            /** @default  */
+            summary: string;
+        };
+        /** @description `POST /ceph`: 노드 `node`에 첫 mon·mgr을 세운다. */
+        CephInitRequest: {
+            /** @description OSD 복제 트래픽 망(CIDR) */
+            cluster_network?: string;
+            /** @description 이름이나 id */
+            node: string;
+            /** @description mon과 클라이언트의 망(CIDR). 없으면 노드 주소가 든 인터페이스의 망 */
+            public_network?: string;
+        };
+        /** @description mon 하나. 이름은 노드 이름이다. */
+        CephMon: {
+            /**
+             * Format: ip
+             * @description Ceph public 망 안의 주소
+             */
+            addr: string;
+            name: string;
+            /** Format: uuid */
+            node: string;
+        };
+        /** @description `POST /ceph/mons`·`/ceph/mgrs`·`/ceph/clients` */
+        CephNodeRequest: {
+            /** @description 이름이나 id */
+            node: string;
+        };
+        /** @description `POST /ceph/osds` */
+        CephOsdRequest: {
+            /** @description `/dev/sdb`나 `/dev/disk/by-id/…` */
+            device: string;
+            /** @description 이름이나 id */
+            node: string;
+            /** @description 디스크의 파티션·파일 시스템·LVM을 지우고 쓴다. */
+            wipe?: boolean;
+        };
+        /** @enum {string} */
+        CephPhase: "bootstrapping" | "ready";
+        /** @description `POST /ceph/pools`: Ceph 풀을 만들어 Orbivisor RBD 풀 `name`으로 등록한다. */
+        CephPoolRequest: {
+            /** @description Orbivisor 스토리지 풀 이름 */
+            name: string;
+            /** @description Ceph 풀 이름. 없으면 `name` */
+            pool?: string;
+            /**
+             * Format: int32
+             * @description 복제 수(1~3). 없으면 min(3, OSD가 있는 호스트 수)
+             */
+            size?: number;
+        };
+        /** @description Ceph에서 읽은 클러스터 상태 */
+        CephReport: {
+            /**
+             * @default {
+             *       "checks": [],
+             *       "status": ""
+             *     }
+             */
+            health: components["schemas"]["CephHealth"];
+            /**
+             * @default {
+             *       "available": false,
+             *       "standbys": []
+             *     }
+             */
+            mgr: components["schemas"]["MgrReport"];
+            /** @default [] */
+            mons: components["schemas"]["MonReport"][];
+            /**
+             * Format: int32
+             * @description up OSD가 하나 이상 있는 호스트 수
+             * @default 0
+             */
+            osd_hosts_up: number;
+            /** @default [] */
+            osds: components["schemas"]["OsdReport"][];
+            /**
+             * @default {
+             *       "states": [],
+             *       "total": 0
+             *     }
+             */
+            pgs: components["schemas"]["PgReport"];
+            /** @default [] */
+            pools: components["schemas"]["PoolReport"][];
+            /**
+             * @description 정족수에 든 mon 이름
+             * @default []
+             */
+            quorum: string[];
+            /**
+             * Format: int64
+             * @description 읽은 시각(유닉스 초)
+             * @default 0
+             */
+            read_at: number;
+            /**
+             * @default {
+             *       "available_bytes": 0,
+             *       "total_bytes": 0,
+             *       "used_bytes": 0
+             *     }
+             */
+            usage: components["schemas"]["Usage"];
+            /**
+             * Format: uuid
+             * @description 읽은 노드
+             * @default 00000000-0000-0000-0000-000000000000
+             */
+            via: string;
+        };
+        /** @description `GET /ceph/status`의 응답: 보고서와, 지금 읽지 못해 마지막으로 읽은 보고서를 돌려줄 때의 표시 */
+        CephStatusView: components["schemas"]["CephReport"] & {
+            /** @description 지금 읽지 못한 이유(`stale`일 때) */
+            error?: string;
+            /** @description 참이면 `report`는 `read_at`에 읽은 마지막 보고서다(지금은 읽지 못함). */
+            stale?: boolean;
+        };
+        /** @description `GET /ceph`의 응답. 키는 담지 않는다. */
+        CephView: {
+            /** @example 10.1.0.0/24 */
+            cluster_network?: string;
+            /** Format: uuid */
+            fsid: string;
+            /** Format: uuid */
+            init_node?: string;
+            last_error?: string;
+            /** @description 노드가 관리 Ceph에 붙는 클라이언트 설정(`/etc/opl/ceph/ceph.conf`) */
+            managed_conf: string;
+            mgrs: string[];
+            mons: components["schemas"]["CephMon"][];
+            osd_nodes: string[];
+            phase: components["schemas"]["CephPhase"];
+            /** @example 10.0.0.0/24 */
+            public_network: string;
+            release?: string;
+            /** @description 끝나지 않은 Ceph Task */
+            tasks: string[];
+        };
         /**
          * @description 업데이트 채널. APT 소스 파일의 `Components`가 된다.
          * @enum {string}
@@ -2559,6 +2899,19 @@ export interface components {
             bus: components["schemas"]["DiskBus"];
             /** @description Volume 리소스 이름 */
             volume: string;
+        };
+        /** @description 디스크를 OSD로 쓸 수 있는지 */
+        DiskState: {
+            /** @enum {string} */
+            state: "available";
+        } | {
+            reasons: string[];
+            /** @enum {string} */
+            state: "wipeable";
+        } | {
+            reason: string;
+            /** @enum {string} */
+            state: "in-use";
         };
         /** @description 오류 응답 본문 */
         ErrorBody: {
@@ -4065,6 +4418,13 @@ export interface components {
             /** @description 위트니스 노드인지(VM을 돌리지 않는 투표 멤버) */
             witness: boolean;
         };
+        MgrReport: {
+            active?: string;
+            /** @default false */
+            available: boolean;
+            /** @default [] */
+            standbys: string[];
+        };
         MigrateRequest: {
             /**
              * @description hard 배치 규칙(restricted HA 그룹 포함)을 넘어 옮긴다. 노드 조건과 메모리는 그대로 본다. 배치 규칙을
@@ -4087,6 +4447,17 @@ export interface components {
             node: string;
             /** Format: uuid */
             task: string;
+        };
+        MonReport: {
+            /**
+             * @description v2 주소(`10.0.0.1:3300`)
+             * @default
+             */
+            addr: string;
+            /** @default false */
+            in_quorum: boolean;
+            /** @default  */
+            name: string;
         };
         /**
          * @description 옮기는 이유
@@ -4126,6 +4497,18 @@ export interface components {
             total: number;
             /** Format: int64 */
             witness: number;
+        };
+        /** @description 노드의 디스크 하나(`lsblk`의 최상위 디스크)와 OSD로 쓸 수 있는지 */
+        NodeDisk: components["schemas"]["DiskState"] & {
+            /** @description `/dev/disk/by-id/…`(재부팅해도 같은 디스크) */
+            by_id?: string;
+            model?: string;
+            /** @description 예: `/dev/sdb` */
+            path: string;
+            rotational: boolean;
+            serial?: string;
+            /** Format: int64 */
+            size_bytes: number;
         };
         /** @description 노드를 끄는 방법들. 앞의 것부터 해 보고, 꺼진 것을 확인하지 못하면 다음 것을 한다. */
         NodeFenceSpec: {
@@ -4232,6 +4615,10 @@ export interface components {
             unreachable: string[];
             /** @description 지표를 모르는 옛 노드의 이름(정렬) */
             unsupported: string[];
+        };
+        /** @description 노드를 뺐지만 손으로 할 일이 남았을 때의 `DELETE /nodes/{key}` 응답 */
+        NodeRemoved: {
+            warnings: string[];
         };
         /**
          * @description 노드의 역할
@@ -4443,6 +4830,39 @@ export interface components {
             timeout_secs: number;
             username_claim: string;
         };
+        OsdReport: {
+            /** @description 장치 클래스(`hdd`, `ssd`, `nvme`) */
+            class?: string;
+            /** @description 노드의 장치(예: `/dev/sdb`) */
+            device?: string;
+            /** @default  */
+            host: string;
+            /**
+             * Format: int32
+             * @default 0
+             */
+            id: number;
+            /** @default false */
+            in: boolean;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            total_bytes: number;
+            /** @default false */
+            up: boolean;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            used_bytes: number;
+            /**
+             * Format: double
+             * @description CRUSH 무게
+             * @default 0
+             */
+            weight: number;
+        };
         OvaSource: {
             /** @description 올린 파일 이름(표시용) */
             file_name: string;
@@ -4474,6 +4894,21 @@ export interface components {
          * @enum {string}
          */
         PendingReason: "restart" | "unsupported" | "limit" | "failed";
+        PgReport: {
+            /**
+             * @description 상태(`active+clean` 등)와 그 PG 수
+             * @default []
+             */
+            states: [
+                string,
+                number
+            ][];
+            /**
+             * Format: int64
+             * @default 0
+             */
+            total: number;
+        };
         /**
          * @description 균형 조정기의 동작
          * @enum {string}
@@ -4659,6 +5094,38 @@ export interface components {
         PoolPatch: {
             backups?: boolean;
             shared?: boolean;
+        };
+        PoolReport: {
+            /**
+             * Format: int64
+             * @default 0
+             */
+            id: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            max_available_bytes: number;
+            /** @default  */
+            name: string;
+            /** @description 이 Ceph 풀을 쓰는 Orbivisor 스토리지 풀 */
+            orbivisor_pool?: string;
+            /**
+             * Format: double
+             * @description 0~1
+             * @default 0
+             */
+            percent_used: number;
+            /**
+             * Format: int32
+             * @description 복제 수
+             */
+            size?: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            stored_bytes: number;
         };
         /** @description 한 노드에서 본 스토리지 풀 상태 */
         PoolState: {
@@ -6609,6 +7076,23 @@ export interface components {
             password?: string | null;
             role?: components["schemas"]["Role"] | null;
         };
+        Usage: {
+            /**
+             * Format: int64
+             * @default 0
+             */
+            available_bytes: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            total_bytes: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            used_bytes: number;
+        };
         UserView: {
             /** Format: uuid */
             id: string;
@@ -7593,6 +8077,273 @@ export interface operations {
             };
         };
     };
+    get_ceph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CephView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    init_ceph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CephInitRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    install_client: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CephNodeRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    add_mgr: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CephNodeRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    add_mon: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CephNodeRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    add_osd: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CephOsdRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_ceph_pool: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CephPoolRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_ceph_status: {
+        parameters: {
+            query?: {
+                /** @description 잠깐 둔 상태를 쓰지 않고 새로 읽는다. */
+                refresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CephStatusView"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_cluster: {
         parameters: {
             query?: never;
@@ -8333,12 +9084,59 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Removed; something is left to do by hand */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeRemoved"];
+                };
+            };
             /** @description Removed */
             204: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_node_disks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeDisk"][];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
             "4XX": {
                 headers: {

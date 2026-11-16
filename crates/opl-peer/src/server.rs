@@ -24,6 +24,9 @@ use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
 use crate::audit::{AuditReply, AuditSource};
+use crate::ceph::{
+    CephSource, CephStatusReply, CephStatusRequest, NodeDisksReply, NodeDisksRequest,
+};
 use crate::fence::{FenceSource, FenceStatusReply, FenceStatusRequest};
 use crate::firmware::{UefiVarsChunk, UefiVarsRequest};
 use crate::metrics::{MetricsReply, MetricsSource};
@@ -55,6 +58,7 @@ pub struct PeerService {
     metrics: Option<Arc<dyn MetricsSource>>,
     fence: Option<Arc<dyn FenceSource>>,
     placement: Option<Arc<dyn PlacementSource>>,
+    ceph: Option<Arc<dyn CephSource>>,
     /// 드라이버의 `state_dir`. UEFI 변수 파일을 여기서 찾아 보낸다.
     state_dir: Option<PathBuf>,
     /// Raft·리스가 아닌 처리(마이그레이션 받기, 콘솔 중계, UEFI 변수·감사 로그·지표 읽기)를 돌릴
@@ -74,6 +78,7 @@ impl PeerService {
             metrics: None,
             fence: None,
             placement: None,
+            ceph: None,
             state_dir: None,
             work: None,
         }
@@ -128,6 +133,19 @@ impl PeerService {
     pub fn with_placement(mut self, source: Arc<dyn PlacementSource>) -> Self {
         self.placement = Some(source);
         self
+    }
+
+    /// 이 노드의 디스크 목록과 Ceph 상태를 `source`가 읽어 준다. 없으면(위트니스) `unimplemented`로 거부한다(옛 노드와
+    /// 같다).
+    pub fn with_ceph(mut self, source: Arc<dyn CephSource>) -> Self {
+        self.ceph = Some(source);
+        self
+    }
+
+    fn ceph(&self) -> Result<Arc<dyn CephSource>, Status> {
+        self.ceph
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not set up Ceph"))
     }
 
     fn migrations(&self) -> Result<Arc<dyn MigrationReceiver>, Status> {
@@ -388,6 +406,32 @@ impl Peer for PeerService {
             .await?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(status))
+    }
+
+    async fn node_disks(
+        &self,
+        req: Request<NodeDisksRequest>,
+    ) -> Result<Response<NodeDisksReply>, Status> {
+        self.authorize(&req)?;
+        let source = self.ceph()?;
+        let disks = self
+            .offload(async move { source.disks().await })
+            .await?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(NodeDisksReply { disks }))
+    }
+
+    async fn ceph_status(
+        &self,
+        req: Request<CephStatusRequest>,
+    ) -> Result<Response<CephStatusReply>, Status> {
+        self.authorize(&req)?;
+        let source = self.ceph()?;
+        let report = self
+            .offload(async move { source.status().await })
+            .await?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(CephStatusReply { report }))
     }
 
     type UefiVarsStream = ReceiverStream<Result<UefiVarsChunk, Status>>;
