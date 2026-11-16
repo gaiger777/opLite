@@ -10,8 +10,9 @@
 //! 않고 복구하는지 본다.
 //! HA 상태 검사(`[test] health_root`의 가짜 sysfs): B에서 `storage` 검사가 실패하면 B가 그 HA VM의 QEMU를 SIGKILL로
 //! 끄고 리더가 A에서 켜는지 본다(`restart_elsewhere`).
+//! 로컬 디스크 복제: 노드 로컬 풀 디스크의 HA VM을 B로 복제해 두고 A를 죽이면 B의 복제본으로 켜는지 본다.
 //! `cargo test -p opld --features ha-it --test ha`
-//! QEMU(`qemu-it`와 같다)와 qemu-img가 필요하다. 이 Mac에서도 돈다.
+//! QEMU(`qemu-it`와 같다)와 qemu-img, qemu-io가 필요하다. 이 Mac에서도 돈다.
 //!
 //! 한 호스트의 두 노드는 systemd 스코프 이름(`opl-vm-{id}.scope`)이 겹치므로 스코프를 끈다(`migration.rs`).
 #![cfg(feature = "ha-it")]
@@ -1224,4 +1225,205 @@ async fn a_failing_storage_check_restarts_the_ha_vm_on_another_node() {
     a.ctl(&["vm", "delete", "db"]).await.unwrap();
     a.ctl(&["volume", "delete", "db-root"]).await.unwrap();
     a.ctl(&["pool", "delete", "shared"]).await.unwrap();
+}
+
+/// `qemu-io` 명령 하나를 qcow2 이미지에 실행하고 성공했는지 돌려준다. `read -P`는 패턴이 다르면 실패한다.
+fn qemu_io(path: &Path, cmd: &str) -> bool {
+    Command::new("qemu-io")
+        .args(["-f", "qcow2", "-c", cmd])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("run qemu-io")
+        .success()
+}
+
+/// VM `vm`의 `status.replication`에서 노드 `node`(id)의 항목
+async fn replica(c: &Client, vm: &str, node: &str) -> Value {
+    let vm = c.get(&format!("/vms/{vm}")).await.unwrap();
+    vm["status"]["replication"]
+        .as_array()
+        .and_then(|r| r.iter().find(|e| e["node"] == node))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// 노드마다 다른 경로의 로컬 디렉터리 풀(`a`는 A만, `b`는 B만)에 디스크를 둔 HA VM을 B의 풀 `b`로 복제해 두고(전체,
+/// 꺼진 디스크에 둘째 무늬를 쓴 뒤 증분) A를 죽이면, 리더가 B의 복제본으로 켠다: 볼륨 기록이 B·풀 `b`로 바뀌고 복제
+/// 방향이 뒤집혀(`spec.replication`이 A·풀 `a`) A의 항목은 `stale`이며, B의 디스크에 두 무늬가 있다. A가 돌아오면 다음
+/// 회차가 A로 전체 복사해 `ready`가 된다. 복제 없는 로컬 디스크 HA VM은 이유를 남기고 A에 그대로 남는다. 예약이
+/// 끼어들지 않게 스케줄러 틱을 늘린다.
+#[tokio::test]
+async fn an_ha_vm_with_local_disks_restarts_from_its_replica() {
+    let config =
+        format!("{CONFIG}[migration]\nports = \"60340-60349\"\n[replication]\ntick_secs = 3600\n");
+    let (mut a, b, _w) = ha_cluster_with("ha-repl", &config, "").await;
+    let (ca, cb) = (client(&a), client(&b));
+    let (id_a, id_b) = (node_id(&ca, "node-a").await, node_id(&ca, "node-b").await);
+    let dir = |prefix: &str| {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in("/tmp")
+            .unwrap()
+    };
+    let (pa, pb) = (dir("oplhara"), dir("oplharb"));
+    for (name, path, node) in [("a", &pa, &id_a), ("b", &pb, &id_b)] {
+        a.ctl(&[
+            "pool",
+            "create",
+            name,
+            "--path",
+            path.path().to_str().unwrap(),
+            "--node",
+            node,
+        ])
+        .await
+        .unwrap();
+    }
+    a.wait_pool_ready("a").await;
+    b.wait_pool_ready("b").await;
+    for volume in ["web-root", "solo-root"] {
+        a.ctl(&["volume", "create", volume, "--pool", "a", "--size", "64M"])
+            .await
+            .unwrap();
+    }
+    let volume = ca.get("/volumes/web-root").await.unwrap();
+    let file = format!("{}.qcow2", volume["id"].as_str().unwrap());
+    let (src, dst) = (pa.path().join(&file), pb.path().join(&file));
+    assert!(qemu_io(&src, "write -P 0xab 0 1M"));
+    a.ctl(&[
+        "vm",
+        "create",
+        "web",
+        "--memory",
+        "256",
+        "--disk",
+        "web-root",
+        "--node",
+        "node-a",
+        "--ha",
+        "--replicate",
+        "node-b,*/60,pool=b",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    a.ctl(&[
+        "vm",
+        "create",
+        "solo",
+        "--memory",
+        "256",
+        "--disk",
+        "solo-root",
+        "--node",
+        "node-a",
+        "--ha",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    running_pid(&ca, "web", &id_a).await;
+    let out = a.ctl(&["vm", "replicate", "web"]).await.unwrap();
+    assert!(
+        out.starts_with("vm web: replicated to node-b (") && out.ends_with(", full)\n"),
+        "{out}"
+    );
+    a.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&src, "write -P 0xcd 1M 64k"));
+    a.ctl(&["vm", "start", "web"]).await.unwrap();
+    let out = a.ctl(&["vm", "replicate", "web"]).await.unwrap();
+    assert!(out.ends_with(", incremental)\n"), "{out}");
+    let web_pid = running_pid(&ca, "web", &id_a).await;
+    let solo_pid = running_pid(&ca, "solo", &id_a).await;
+
+    // 노드 A가 죽는다: opld를 먼저, 그 다음 이 시험이 띄운 A의 QEMU들
+    a.kill();
+    kill_qemu(web_pid).await;
+    kill_qemu(solo_pid).await;
+    eventually_within(
+        "HA VM running on node B from its replica",
+        RECOVER_WAIT,
+        || async {
+            let Ok(vm) = cb.get("/vms/web").await else {
+                return false;
+            };
+            vm["spec"]["node"] == id_b.as_str()
+                && vm["status"]["phase"] == "running"
+                && vm["status"]["node"] == id_b.as_str()
+        },
+    )
+    .await;
+    let vm = cb.get("/vms/web").await.unwrap();
+    assert_eq!(
+        vm["spec"]["replication"],
+        serde_json::json!([{ "node": id_a, "schedule": "*/60", "pool": "a" }]),
+        "{vm}"
+    );
+    assert_eq!(replica(&cb, "web", &id_a).await["state"], "stale", "{vm}");
+    let volume = cb.get("/volumes/web-root").await.unwrap();
+    assert_eq!(volume["spec"]["pool"], "b", "{volume}");
+    assert_eq!(volume["status"]["node"], id_b.as_str(), "{volume}");
+    // VM이 켜진 뒤에도 복제본으로 한 복구가 남는다(그 복제본의 시점과 함께).
+    let recovery = &vm["status"]["last_recovery"];
+    assert_eq!(recovery["from"], id_a.as_str(), "{vm}");
+    assert_eq!(recovery["node"], id_b.as_str(), "{vm}");
+    assert!(
+        recovery["synced_at"].as_u64().is_some_and(|t| t > 0),
+        "{vm}"
+    );
+    let out = b.ctl(&["vm", "replication", "web"]).await.unwrap();
+    assert!(
+        out.contains("last recovery: ")
+            && out.contains("node-a failed; restarted on node-b from the replica taken at "),
+        "{out}"
+    );
+
+    // 복제가 없는 로컬 디스크 HA VM은 옮길 곳이 없다는 이유와 함께 A에 남는다.
+    eventually("the VM without a replica left with the reason", || async {
+        let vm = cb.get("/vms/solo").await.unwrap();
+        vm["status"]["last_error"]
+            == "HA cannot find a node for this VM: disk \"solo-root\" is on node-local pool \"a\" \
+                and has no ready replica on a live node"
+    })
+    .await;
+    let solo = cb.get("/vms/solo").await.unwrap();
+    assert_eq!(solo["spec"]["node"], id_a.as_str(), "{solo}");
+
+    // B가 켠 디스크는 두 번째 회차까지 담은 복제본이다.
+    b.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&dst, "read -P 0xab 0 1M"));
+    assert!(qemu_io(&dst, "read -P 0xcd 1M 64k"));
+
+    // A가 돌아오면 다음 회차가 A의 옛 원본 위에 전체 복사한다.
+    a.start().await;
+    eventually_within("node A back online", RECOVER_WAIT, || async {
+        let Ok(node) = cb.get("/nodes/node-a").await else {
+            return false;
+        };
+        node["status"]["online"] == true
+    })
+    .await;
+    b.ctl(&["vm", "start", "web"]).await.unwrap();
+    running_pid(&cb, "web", &id_b).await;
+    let out = b.ctl(&["vm", "replicate", "web"]).await.unwrap();
+    assert!(
+        out.starts_with("vm web: replicated to node-a (") && out.ends_with(", full)\n"),
+        "{out}"
+    );
+    let entry = replica(&cb, "web", &id_a).await;
+    assert_eq!(entry["state"], "ready", "{entry}");
+    // 다음 복제가 성공해도 복구 기록은 남는다.
+    let vm = cb.get("/vms/web").await.unwrap();
+    assert_eq!(vm["status"]["last_recovery"], *recovery, "{vm}");
+
+    for vm in ["web", "solo"] {
+        b.ctl(&["vm", "stop", vm, "--force"]).await.unwrap();
+        b.ctl(&["vm", "delete", vm]).await.unwrap();
+    }
+    for volume in ["web-root", "solo-root"] {
+        b.ctl(&["volume", "delete", volume]).await.unwrap();
+    }
+    b.ctl(&["pool", "delete", "a"]).await.unwrap();
+    b.ctl(&["pool", "delete", "b"]).await.unwrap();
 }

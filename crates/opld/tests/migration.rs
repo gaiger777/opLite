@@ -5,7 +5,8 @@
 //! `qemu-io`로 본다. 노드 비우기(`oplctl node drain --wait`)가 실행 중인 VM을 다른 노드로 옮기는지도 본다.
 //! 노드 로컬 디렉터리 풀(노드마다 다른 경로)의 디스크를 복사하며 옮기는지(`--pool`, 진행률, 실패 정리), 같은
 //! 이름의 로컬 풀이 같은 경로라 비우기가 그 VM을 남기는지도 본다. 균형 조정기가 hard 규칙을 어기는 VM을 추천·적용과
-//! `auto`로 옮기는지도 본다.
+//! `auto`로 옮기는지도 본다. 로컬 디스크를 다른 노드로 복제하고(전체 뒤 증분) 그 복제본이 있는 노드로 바뀐 것만 보내며
+//! 옮기는지도 본다.
 //! `cargo test -p opld --features migration-it --test migration`
 //! QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다. 이 Mac에서도 돈다(TCG).
 //!
@@ -939,6 +940,190 @@ async fn drain_leaves_a_vm_whose_local_disk_the_target_already_has() {
     d.ctl(&["vm", "delete", "web"]).await.unwrap();
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     d.ctl(&["pool", "delete", "local"]).await.unwrap();
+}
+
+/// 두 이미지의 게스트가 보는 내용이 같은지(`qemu-img compare`)
+fn same_images(a: &Path, b: &Path) -> bool {
+    Command::new("qemu-img")
+        .arg("compare")
+        .args([a, b])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("run qemu-img")
+        .success()
+}
+
+/// VM `web`의 `status.replication`에서 노드 `node`(id)의 항목
+async fn replica(c: &Client, node: &str) -> Value {
+    let vm = c.get("/vms/web").await.unwrap();
+    vm["status"]["replication"]
+        .as_array()
+        .and_then(|r| r.iter().find(|e| e["node"] == node))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// VM `web`의 노드 `node`(id) 복제본이 마지막 회차에 보낸 바이트
+async fn last_bytes(c: &Client, node: &str) -> u64 {
+    replica(c, node).await["last_bytes"].as_u64().unwrap()
+}
+
+/// 노드마다 다른 경로의 로컬 디렉터리 풀(`a`는 노드 1만, `b`는 노드 2만)에 디스크를 둔 VM을 노드 2의 풀 `b`로
+/// 복제한다(`--replicate node2,*/60,pool=b`, 예약이 끼어들지 않게 스케줄러 틱을 늘림): 처음은 전체, 꺼진 디스크에
+/// `qemu-io`로 쓴 뒤(qcow2의 영구 비트맵이 기록한다) 다시 켜서 복제하면 바뀐 블록만 보낸다. 복제본은 원본과 같다.
+/// 그다음 노드 2로 옮기면(`--pool` 없음) 복제 뒤 바뀐 것만 보내고(디스크 복사 진행률이 디스크보다 훨씬 작다), 원본
+/// 파일이 노드 1의 복제본으로 남으며 복제 방향이 뒤집힌다(`spec.replication`이 노드 1·풀 `a`). 노드 1로 되돌아와도
+/// 같고, 두 무늬가 그대로다.
+#[tokio::test]
+async fn replicates_a_vm_and_migrates_it_to_its_replica() {
+    let p = Pair::with_migration(
+        "mig-repl",
+        ["60320-60329", "60330-60339"],
+        "[replication]\ntick_secs = 3600\n",
+    )
+    .await;
+    let (c, d) = (&p.c[0], &p.d[0]);
+    let (node1, node2) = (p.node_id(0).await, p.node_id(1).await);
+    let dir = |prefix: &str| {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in("/tmp")
+            .unwrap()
+    };
+    let (a, b) = (dir("oplrepla"), dir("oplreplb"));
+    for (name, path, node) in [("a", &a, &node1), ("b", &b, &node2)] {
+        d.ctl(&[
+            "pool",
+            "create",
+            name,
+            "--path",
+            path.path().to_str().unwrap(),
+            "--node",
+            node,
+        ])
+        .await
+        .unwrap();
+    }
+    p.d[0].wait_pool_ready("a").await;
+    p.d[1].wait_pool_ready("b").await;
+    d.ctl(&["volume", "create", "root", "--pool", "a", "--size", "128M"])
+        .await
+        .unwrap();
+    let volume = c.get("/volumes/root").await.unwrap();
+    let file = format!("{}.qcow2", volume["id"].as_str().unwrap());
+    let (src, dst) = (a.path().join(&file), b.path().join(&file));
+    assert!(qemu_io(&src, "qcow2", "write -P 0xab 0 32M"));
+    d.ctl(&[
+        "vm",
+        "create",
+        "web",
+        "--memory",
+        "256",
+        "--disk",
+        "root",
+        "--node",
+        "node1",
+        "--replicate",
+        "node2,*/60,pool=b",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    let vm = c.get("/vms/web").await.unwrap();
+    assert_eq!(
+        vm["spec"]["replication"],
+        json!([{ "node": node2, "schedule": "*/60", "pool": "b" }]),
+        "{vm}"
+    );
+    running_pid(c).await;
+
+    // 처음은 전체
+    let out = d.ctl(&["vm", "replicate", "web"]).await.unwrap();
+    assert!(
+        out.starts_with("vm web: replicated to node2 (") && out.ends_with(", full)\n"),
+        "{out}"
+    );
+    let entry = replica(c, &node2).await;
+    assert_eq!(entry["state"], "ready", "{entry}");
+    assert_eq!(entry["last_full"], true, "{entry}");
+    let table = d.ctl(&["vm", "replication", "web"]).await.unwrap();
+    assert!(table.starts_with("NODE   STATE"), "{table}");
+    assert!(table.contains("\nnode2  ready  "), "{table}");
+    assert!(dst.exists());
+
+    // 꺼진 디스크에 쓴 것만 다음 회차가 보낸다.
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&src, "qcow2", "write -P 0xcd 64M 64k"));
+    d.ctl(&["vm", "start", "web"]).await.unwrap();
+    let out = d.ctl(&["vm", "replicate", "web"]).await.unwrap();
+    assert!(out.ends_with(", incremental)\n"), "{out}");
+    let sent = last_bytes(c, &node2).await;
+    assert!(sent > 0 && sent <= 1 << 20, "{sent}");
+    let entry = replica(c, &node2).await;
+    assert_eq!(
+        (&entry["state"], &entry["last_full"]),
+        (&json!("ready"), &json!(false)),
+        "{entry}"
+    );
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(same_images(&src, &dst));
+    d.ctl(&["vm", "start", "web"]).await.unwrap();
+    running_pid(c).await;
+
+    // 복제본이 있는 노드 2로 옮기면 바뀐 것만 보낸다.
+    let (out, progress) = watch_progress(c, d.ctl(&["vm", "migrate", "web", "node2"])).await;
+    assert_eq!(out.unwrap(), "vm web: migrated to node2\n");
+    assert!(
+        progress
+            .iter()
+            .all(|p| p["total_bytes"].as_u64().unwrap() <= 4 << 20),
+        "{progress:?}"
+    );
+    assert_vm_on(&p, &node2).await;
+    assert_volume_on(&p, "b", "qcow2", &node2).await;
+    let vm = c.get("/vms/web").await.unwrap();
+    assert_eq!(
+        vm["spec"]["replication"],
+        json!([{ "node": node1, "schedule": "*/60", "pool": "a" }]),
+        "{vm}"
+    );
+    eventually("node 1 holds a ready replica", || async {
+        replica(c, &node1).await["state"] == "ready"
+    })
+    .await;
+    // 원본 파일은 지우지 않고 그 마이그레이션 시점의 복제본이 된다.
+    let tasks = c.get("/tasks").await.unwrap();
+    let task = tasks["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["spec"]["op"]["kind"] == "vm-migrate" && t["status"]["state"] == "succeeded")
+        .unwrap()
+        .clone();
+    assert_eq!(replica(c, &node1).await["generation"], task["id"]);
+    assert!(src.exists());
+    let line = d.ctl(&["vm", "replication", "web"]).await.unwrap();
+    assert!(line.contains("\nnode1  ready  "), "{line}");
+
+    // 노드 1로 되돌아온다. 두 무늬가 그대로다.
+    let out = d.ctl(&["vm", "migrate", "web", "node1"]).await.unwrap();
+    assert_eq!(out, "vm web: migrated to node1\n");
+    assert_vm_on(&p, &node1).await;
+    assert_volume_on(&p, "a", "qcow2", &node1).await;
+    eventually("node 2 holds a ready replica", || async {
+        replica(c, &node2).await["state"] == "ready"
+    })
+    .await;
+    assert!(dst.exists());
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&src, "qcow2", "read -P 0xab 0 32M"));
+    assert!(qemu_io(&src, "qcow2", "read -P 0xcd 64M 64k"));
+    assert!(same_images(&src, &dst));
+
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    d.ctl(&["pool", "delete", "a"]).await.unwrap();
+    d.ctl(&["pool", "delete", "b"]).await.unwrap();
 }
 
 /// VM `name`의 배정 노드와 실행 노드의 id

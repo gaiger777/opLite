@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use opl_types::replication::{DEFAULT_INTERVAL, parse_interval};
 use reqwest::Method;
 use serde_json::{Value, json};
 
@@ -1444,6 +1445,20 @@ enum VmCmd {
         #[arg(long)]
         no_wait: bool,
     },
+    /// 실행 중인 VM의 노드 로컬 풀 디스크를 복제 대상 노드로 지금 복제한다(처음은 전체, 다음부터는 바뀐 블록만).
+    Replicate {
+        vm: String,
+        /// 대상 노드 이름이나 id. 복제 대상이 하나면 생략할 수 있다.
+        #[arg(long)]
+        node: Option<String>,
+        /// 복제 Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// VM 복제본의 상태(대상 노드마다 상태, 마지막 시점과 나이, 마지막 회차, 크기, 오류)
+    Replication {
+        vm: String,
+    },
     Start {
         vm: String,
     },
@@ -1551,6 +1566,10 @@ struct VmCreate {
     /// 균형 조정기가 옮기지 않는다(HA 복구·비우기·직접 옮기기는 그대로).
     #[arg(long)]
     pinned: bool,
+    /// 노드 로컬 풀의 디스크를 이 노드로 주기적으로 복제한다(`*/N`은 N분마다, 기본 `*/15`; `pool=`은 그 노드에서
+    /// 복제본을 둘 풀, 기본은 같은 이름). 세 번까지 줄 수 있다. HA는 복제본으로 다른 노드에서 다시 켠다.
+    #[arg(long = "replicate", value_name = "NODE[,*/N][,pool=POOL]", value_parser = parse_replica_target)]
+    replicate: Vec<ReplicateArg>,
 }
 
 /// `--nic`으로 받은 네트워크와 보안 그룹
@@ -1583,6 +1602,62 @@ fn parse_nic(s: &str) -> Result<NicArg, String> {
     })
 }
 
+/// `--replicate`로 받은 복제 대상
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplicateArg {
+    /// 노드 이름이나 id
+    node: String,
+    /// 주기 `*/N`
+    schedule: String,
+    pool: Option<String>,
+}
+
+/// `node2`, `node2,*/5`, `node2,*/5,pool=b`, `node2,pool=b`처럼 쓴다. 주기 문법은 서버와 같다(`*/N`, N은 1~1440분).
+fn parse_replica_target(s: &str) -> Result<ReplicateArg, String> {
+    let bad = || format!("invalid replication target {s:?}: use NODE[,*/N][,pool=POOL]");
+    let mut parts = s.split(',');
+    let node = parts.next().filter(|n| !n.is_empty()).ok_or_else(bad)?;
+    let (mut schedule, mut pool) = (None, None);
+    for part in parts {
+        if part.starts_with("*/") && schedule.is_none() {
+            parse_interval(part)?;
+            schedule = Some(part.to_string());
+        } else if let Some(p) = part.strip_prefix("pool=")
+            && !p.is_empty()
+            && pool.is_none()
+        {
+            pool = Some(p.to_string());
+        } else {
+            return Err(bad());
+        }
+    }
+    Ok(ReplicateArg {
+        node: node.into(),
+        schedule: schedule.unwrap_or_else(|| DEFAULT_INTERVAL.into()),
+        pool,
+    })
+}
+
+/// 스펙의 `replication`: 노드 이름(또는 id)을 `nodes`(`/nodes`의 항목)에서 id로 바꾼다. 풀이 없으면 `pool`을 빼고
+/// 보낸다.
+fn replication_spec(targets: &[ReplicateArg], nodes: &[Value]) -> anyhow::Result<Value> {
+    let items = targets
+        .iter()
+        .map(|t| {
+            let node = nodes
+                .iter()
+                .find(|n| n["name"] == t.node.as_str() || n["id"] == t.node.as_str())
+                .with_context(|| format!("node {} not found", t.node))?;
+            let mut item = json!({ "node": node["id"], "schedule": t.schedule });
+            if let Some(pool) = &t.pool {
+                item["pool"] = json!(pool);
+            }
+            Ok(item)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Value::Array(items))
+}
+
 /// `vm create`의 NIC 하나. 그룹이 없으면 `security_groups`를 보내지 않는다.
 fn nic_body(nic: &NicArg) -> Value {
     let mut body = json!({ "network": nic.network, "model": "virtio" });
@@ -1596,7 +1671,7 @@ fn nic_body(nic: &NicArg) -> Value {
 #[command(group(ArgGroup::new("change").required(true).multiple(true).args([
     "ha", "no_ha", "ha_state", "ha_group", "max_restart", "max_relocate", "ha_priority",
     "guest_watch", "no_guest_watch", "pinned", "no_pinned", "sockets", "cores", "memory",
-    "max_vcpus", "no_max_vcpus", "max_memory", "no_max_memory"
+    "max_vcpus", "no_max_vcpus", "max_memory", "no_max_memory", "replicate", "no_replicate"
 ])))]
 struct VmSet {
     vm: String,
@@ -1639,6 +1714,12 @@ struct VmSet {
     /// 메모리 상한을 뺀다(지금 메모리와 같음).
     #[arg(long, conflicts_with = "max_memory")]
     no_max_memory: bool,
+    /// 복제 대상 목록을 이것으로 통째로 바꾼다(`vm create --replicate`와 같은 모양, 세 번까지).
+    #[arg(long = "replicate", value_name = "NODE[,*/N][,pool=POOL]", value_parser = parse_replica_target)]
+    replicate: Vec<ReplicateArg>,
+    /// 복제를 끈다(복제본은 대상 노드가 지운다).
+    #[arg(long, conflicts_with = "replicate")]
+    no_replicate: bool,
     /// 실행 중인 VM의 핫플러그 Task를 기다리지 않는다.
     #[arg(long)]
     no_wait: bool,
@@ -1648,6 +1729,11 @@ impl VmSet {
     /// HA 값을 바꾸는지
     fn changes_ha(&self) -> bool {
         self.ha || self.no_ha || !self.policy.is_empty()
+    }
+
+    /// 복제 대상을 바꾸는지
+    fn changes_replication(&self) -> bool {
+        !self.replicate.is_empty() || self.no_replicate
     }
 
     /// CPU·메모리를 바꾸는지
@@ -1705,6 +1791,17 @@ fn vm_set_spec(current: &Value, args: &VmSet) -> Value {
         spec.remove("max_memory_mib");
     }
     body
+}
+
+/// `vm set`의 수정 본문에 복제 대상을 넣는다: `--replicate`면 `replication`(노드 id로 바꾼 목록)으로 통째로 바꾸고,
+/// `--no-replicate`면 필드를 뺀다. 둘 다 없으면 그대로다.
+fn replication_set(body: &mut Value, replication: Option<&Value>, off: bool) {
+    if let Some(targets) = replication {
+        body["spec"]["replication"] = targets.clone();
+    }
+    if off && let Some(spec) = body["spec"].as_object_mut() {
+        spec.remove("replication");
+    }
 }
 
 #[derive(Subcommand)]
@@ -6714,15 +6811,26 @@ async fn vm_migrate(
     if force {
         body["force"] = json!(true);
     }
+    // 확정이 복제 방향을 뒤집으므로 복제 대상은 보내기 전에 읽는다. 읽지 못하면 POST가 오류를 알린다.
+    let before = client.get(&format!("/vms/{}", seg(vm))).await.ok();
     let task = client
         .post(&format!("/vms/{}/migrate", seg(vm)), &body)
         .await?;
+    let catch_up = before.is_some_and(|v| replicates_to(&v, &task["spec"]["op"]["node"]));
     // 마이그레이션은 일반 Task 제한(10분)보다 오래 걸릴 수 있다.
     let mut shown = None;
     client
         .wait_task_watch(&task, MIGRATE_WAIT, |t| {
+            let progress = &t["status"]["progress"];
+            let lines = if catch_up {
+                catch_up_progress(vm, progress, &mut shown)
+            } else {
+                migrate_progress(vm, progress, &mut shown)
+                    .into_iter()
+                    .collect()
+            };
             // 진행 줄을 쓰지 못해도(stderr가 닫힘) 마이그레이션은 계속 기다린다.
-            if let Some(line) = migrate_progress(vm, &t["status"]["progress"], &mut shown) {
+            for line in lines {
                 let _ = writeln!(err, "{line}");
             }
             Ok(())
@@ -6779,9 +6887,352 @@ fn migrate_progress(
     }
 }
 
+/// VM의 복제 대상에 노드 `node`(id)가 있는지
+fn replicates_to(vm: &Value, node: &Value) -> bool {
+    !node.is_null()
+        && vm["spec"]["replication"]
+            .as_array()
+            .is_some_and(|targets| targets.iter().any(|t| t["node"] == *node))
+}
+
+/// 복제본이 있는 노드로의 마이그레이션(복제 뒤 바뀐 것만 보낸다)에서 알릴 줄: 복사에 들어갈 때 한 번, 메모리
+/// 단계에 들어갈 때 보낸 양과 함께 한 번이다. 진행률에 패스 번호가 없으므로 패스는 알리지 않는다.
+fn catch_up_progress(vm: &str, progress: &Value, shown: &mut Option<MigrateShown>) -> Vec<String> {
+    match progress["stage"].as_str() {
+        Some("copying-disks") if shown.is_none() => {
+            *shown = Some(MigrateShown::Copying(0));
+            vec![format!("vm {vm}: copying the changes since the replica")]
+        }
+        Some("migrating-memory") if *shown != Some(MigrateShown::Memory) => {
+            *shown = Some(MigrateShown::Memory);
+            let sent = progress["done_bytes"].as_u64().unwrap_or(0);
+            vec![
+                format!("vm {vm}: sent {} of changes since the replica", mib(sent)),
+                format!("vm {vm}: migrating memory"),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// 바이트를 소수 한 자리 GiB로(`14.8 GiB`)
 fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// 바이트를 소수 한 자리 MiB로(`12.0 MiB`)
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1u64 << 20) as f64)
+}
+
+/// 지금 시각(유닉스 초)
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// 지난 시간을 두 단위로(`45s`, `4m12s`, `3h5m`, `2d3h`)
+fn age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m{}s", secs / 60, secs % 60),
+        3600..86400 => format!("{}h{}m", secs / 3600, secs / 60 % 60),
+        _ => format!("{}d{}h", secs / 86400, secs / 3600 % 24),
+    }
+}
+
+/// 지난 시간을 가장 큰 단위 하나로(`45s`, `4m`, `3h`, `2d`)
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// VM의 복제 대상마다 상태: `status.replication`의 항목들과, 아직 항목이 없는 `spec.replication`의 대상(`pending`)
+fn replica_entries(vm: &Value) -> Vec<Value> {
+    let mut entries = vm["status"]["replication"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for target in vm["spec"]["replication"].as_array().into_iter().flatten() {
+        if !entries.iter().any(|e| e["node"] == target["node"]) {
+            entries.push(json!({ "node": target["node"], "state": "pending" }));
+        }
+    }
+    entries
+}
+
+/// `ready` 복제본을 HA·마이그레이션이 쓸 수 없는 이유(서버 `replica_ready`와 같은 규칙): VM의 지금 노드 로컬 풀
+/// 디스크(볼륨 id와 `spec.size_bytes`) 가운데 그 회차에 같은 크기로 담기지 않은 것이 있다(더했거나 크기를 바꿨다).
+/// `volumes`·`pools`는 `/volumes`·`/storage-pools`의 항목이다. 쓸 수 있거나 `ready`가 아니면 `None`이다.
+fn replica_unusable(vm: &Value, e: &Value, volumes: &[Value], pools: &[Value]) -> Option<String> {
+    if e["state"] != "ready" {
+        return None;
+    }
+    let held = |volume: &Value| {
+        e["volumes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|v| v["id"] == volume["id"] && v["size_bytes"] == volume["spec"]["size_bytes"])
+    };
+    vm["spec"]["disks"].as_array()?.iter().find_map(|d| {
+        let volume = volumes.iter().find(|v| v["name"] == d["volume"])?;
+        let pool = pools.iter().find(|p| p["name"] == volume["spec"]["pool"])?;
+        (node_local(pool) && !held(volume))
+            .then(|| format!("HA cannot use it: disk {} changed", d["volume"]))
+    })
+}
+
+/// 복제본으로 한 마지막 HA 복구(`status.last_recovery`)의 줄: `last recovery: 2026-11-16 10:05 UTC — node1 failed;
+/// restarted on node2 from the replica taken at 2026-11-16 10:00 UTC (writes after that were lost)`. 없으면 `None`이다.
+fn recovery_line(vm: &Value, nodes: &[Value]) -> Option<String> {
+    let r = vm["status"]["last_recovery"].as_object()?;
+    let time = |k: &str| {
+        r.get(k)
+            .and_then(Value::as_i64)
+            .map_or_else(|| "-".into(), unix_time)
+    };
+    Some(format!(
+        "last recovery: {} — {} failed; restarted on {} from the replica taken at {} (writes after that were lost)",
+        time("at"),
+        name_of(nodes, r.get("from").unwrap_or(&Value::Null)),
+        name_of(nodes, r.get("node").unwrap_or(&Value::Null)),
+        time("synced_at"),
+    ))
+}
+
+/// `vm get`의 복제 줄: `replication: node2 ready 4m ago, node3 syncing`. 나이는 준비된 복제본만, HA가 쓸 수 없는 준비된
+/// 복제본은 그 이유를([`replica_unusable`]), 마지막 회차가 실패했으면 그 이유를 붙인다. 복제 대상이 없으면 `None`이다.
+fn replication_line(
+    vm: &Value,
+    nodes: &[Value],
+    volumes: &[Value],
+    pools: &[Value],
+    now: u64,
+) -> Option<String> {
+    let entries = replica_entries(vm);
+    if entries.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            let mut part = format!("{} {}", name_of(nodes, &e["node"]), cell(&e["state"]));
+            if e["state"] == "ready"
+                && let Some(at) = e["synced_at"].as_u64()
+            {
+                part.push_str(&format!(" {} ago", ago(now.saturating_sub(at))));
+            }
+            if let Some(why) = replica_unusable(vm, e, volumes, pools) {
+                part.push_str(&format!(" ({why})"));
+            }
+            if let Some(error) = e["error"].as_str() {
+                part.push_str(&format!(" (error: {error})"));
+            }
+            part
+        })
+        .collect();
+    Some(format!("replication: {}", parts.join(", ")))
+}
+
+/// `vm replication`의 열
+const REPLICATION_HEADERS: &[&str] = &["NODE", "STATE", "SYNCED", "AGE", "LAST", "SIZE", "ERROR"];
+
+/// `vm replication`의 한 행: 마지막으로 끝난 회차의 시점·나이, 그 회차가 전체였는지와 보낸 양, 복제본 크기(담은
+/// 디스크의 합), 마지막 실패 이유(없으면 HA가 쓸 수 없는 준비된 복제본의 이유 `unusable`)
+fn replication_row(e: &Value, nodes: &[Value], unusable: Option<String>, now: u64) -> Vec<String> {
+    let synced = e["synced_at"].as_u64();
+    let done = e["generation"].is_string();
+    let size: u64 = e["volumes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v["size_bytes"].as_u64())
+        .sum();
+    let how = if e["last_full"] == true {
+        "full"
+    } else {
+        "incremental"
+    };
+    vec![
+        name_of(nodes, &e["node"]),
+        cell(&e["state"]),
+        synced.map_or_else(|| "-".into(), |at| unix_time(at as i64)),
+        synced.map_or_else(|| "-".into(), |at| age(now.saturating_sub(at))),
+        if done {
+            format!("{how} {}", bytes(&e["last_bytes"]))
+        } else {
+            "-".into()
+        },
+        if done {
+            bytes(&json!(size))
+        } else {
+            "-".into()
+        },
+        match (e["error"].as_str(), unusable) {
+            (None, Some(why)) => why,
+            _ => cell(&e["error"]),
+        },
+    ]
+}
+
+/// `vm replicate`가 끝난 뒤 알릴 줄: `vm web: replicated to node2 (12.0 MiB, incremental)`
+fn replicated_line(vm: &str, node: &str, entry: &Value) -> String {
+    let how = if entry["last_full"] == true {
+        "full"
+    } else {
+        "incremental"
+    };
+    let sent = mib(entry["last_bytes"].as_u64().unwrap_or(0));
+    format!("vm {vm}: replicated to {node} ({sent}, {how})")
+}
+
+/// `vm replicate`: 복제 Task를 만들고(대상이 하나면 `node` 없이) 끝나기를 기다린 뒤 그 대상의 상태로 보낸 양과
+/// 방식을 알린다. 회차를 건너뛰었으면(Task 경고) 그 경고를 알린다. 전체 복사는 오래 걸릴 수 있어 백업과 같은 한도로
+/// 기다린다.
+async fn vm_replicate(
+    client: &Client,
+    vm: &str,
+    node: Option<&str>,
+    no_wait: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let body = match node {
+        Some(node) => json!({ "node": node }),
+        None => json!({}),
+    };
+    let task = client
+        .post(&format!("/vms/{}/replicate", seg(vm)), &body)
+        .await?;
+    let id = task["id"].as_str().context("response has no task id")?;
+    if no_wait {
+        writeln!(out, "vm {vm}: replication task {id} started")?;
+        return Ok(());
+    }
+    let task = client
+        .wait_task_watch(&task, BACKUP_WAIT, |_| Ok(()))
+        .await?;
+    // 건너뛴 회차는 보낸 것이 없다(대상의 상태는 앞 회차의 것이다).
+    if let Some(warning) = task["status"]["error"].as_str() {
+        writeln!(out, "vm {vm}: {warning}")?;
+        return Ok(());
+    }
+    let current = client.get(&format!("/vms/{}", seg(vm))).await?;
+    let list = client.get("/nodes").await?;
+    let nodes = list["items"].as_array().cloned().unwrap_or_default();
+    let target = &task["spec"]["op"]["node"];
+    let entry = replica_entries(&current)
+        .into_iter()
+        .find(|e| e["node"] == *target)
+        .unwrap_or(Value::Null);
+    writeln!(
+        out,
+        "{}",
+        replicated_line(vm, &name_of(&nodes, target), &entry)
+    )?;
+    Ok(())
+}
+
+/// `vm replication`: 복제 대상마다 상태 표. `-o json`은 항목들 그대로다.
+async fn vm_replication(
+    client: &Client,
+    vm: &str,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let current = client.get(&format!("/vms/{}", seg(vm))).await?;
+    let entries = replica_entries(&current);
+    if json_out {
+        print_json(out, &Value::Array(entries))?;
+        return Ok(());
+    }
+    let items = |list: Value| list["items"].as_array().cloned().unwrap_or_default();
+    let nodes = items(client.get("/nodes").await?);
+    let volumes = items(client.get("/volumes").await?);
+    let pools = items(client.get("/storage-pools").await?);
+    let now = now_secs();
+    let rows: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            let unusable = replica_unusable(&current, e, &volumes, &pools);
+            replication_row(e, &nodes, unusable, now)
+        })
+        .collect();
+    table(out, REPLICATION_HEADERS, &rows)?;
+    if let Some(line) = recovery_line(&current, &nodes) {
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
+}
+
+/// HA를 켰는데 복제 대상이 없는지(잠시 끈 `ignored`는 켜지 않은 것으로 본다)
+fn ha_without_replication(spec: &Value) -> bool {
+    let ha = &spec["ha"];
+    let on = *ha == true || (ha.is_object() && ha["state"] != "ignored");
+    on && spec["replication"]
+        .as_array()
+        .is_none_or(|targets| targets.is_empty())
+}
+
+/// 노드 로컬 풀인지(서버 `is_shared`의 반대): LVM-thin·ZFS 풀은 늘, 디렉터리 풀은 `shared`가 아니면 로컬이다.
+fn node_local(pool: &Value) -> bool {
+    match pool["spec"]["backend"]["kind"].as_str() {
+        Some("lvm-thin" | "zfs") => true,
+        Some("dir") => pool["spec"]["shared"] != true,
+        _ => false,
+    }
+}
+
+/// HA VM의 디스크가 노드 로컬 풀에 있는데 복제가 없으면 경고 줄(첫 디스크): 그 노드가 죽으면 HA가 다른 노드에서
+/// 켤 수 없다. `volumes`·`pools`는 `/volumes`·`/storage-pools`의 항목이다.
+fn ha_replica_warning(
+    name: &str,
+    spec: &Value,
+    volumes: &[Value],
+    pools: &[Value],
+) -> Option<String> {
+    if !ha_without_replication(spec) {
+        return None;
+    }
+    spec["disks"].as_array()?.iter().find_map(|d| {
+        let volume = volumes.iter().find(|v| v["name"] == d["volume"])?;
+        let pool = &volume["spec"]["pool"];
+        node_local(pools.iter().find(|p| p["name"] == *pool)?).then(|| {
+            format!(
+                "warning: HA cannot restart VM {name} elsewhere: disk {} is on node-local pool {pool} \
+                 and has no replica (add --replicate)",
+                d["volume"]
+            )
+        })
+    })
+}
+
+/// [`ha_replica_warning`]을 `err`(stderr)에 쓴다. 볼륨·풀을 읽지 못하면 경고하지 않는다.
+async fn warn_ha_without_replica(
+    client: &Client,
+    name: &str,
+    spec: &Value,
+    err: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    if !ha_without_replication(spec) {
+        return Ok(());
+    }
+    let (Ok(volumes), Ok(pools)) = (
+        client.get("/volumes").await,
+        client.get("/storage-pools").await,
+    ) else {
+        return Ok(());
+    };
+    let items = |list: &Value| list["items"].as_array().cloned().unwrap_or_default();
+    if let Some(line) = ha_replica_warning(name, spec, &items(&volumes), &items(&pools)) {
+        writeln!(err, "{line}")?;
+    }
+    Ok(())
 }
 
 /// `vm get`: 표준 출력에는 VM JSON만 쓰고(스크립트가 그대로 읽는다), 실행 중 하드웨어(`hardware:`)와 다음 재시작 때
@@ -6798,6 +7249,18 @@ async fn vm_get(
     if !json_out {
         if let Some(line) = hardware_line(&vm) {
             writeln!(err, "{line}")?;
+        }
+        if !replica_entries(&vm).is_empty() || vm["status"]["last_recovery"].is_object() {
+            let items = |list: Value| list["items"].as_array().cloned().unwrap_or_default();
+            let nodes = items(client.get("/nodes").await?);
+            let volumes = items(client.get("/volumes").await?);
+            let pools = items(client.get("/storage-pools").await?);
+            if let Some(line) = replication_line(&vm, &nodes, &volumes, &pools, now_secs()) {
+                writeln!(err, "{line}")?;
+            }
+            if let Some(line) = recovery_line(&vm, &nodes) {
+                writeln!(err, "{line}")?;
+            }
         }
         let pending = pending_lines(&vm);
         if !pending.is_empty() {
@@ -6873,15 +7336,33 @@ async fn vm(
             if let Some(n) = args.max_memory {
                 body["spec"]["max_memory_mib"] = json!(n);
             }
+            if !args.replicate.is_empty() {
+                let list = client.get("/nodes").await?;
+                let nodes = list["items"].as_array().cloned().unwrap_or_default();
+                body["spec"]["replication"] = replication_spec(&args.replicate, &nodes)?;
+            }
             client.post("/vms", &body).await?;
             writeln!(out, "vm {} created", args.name)?;
+            warn_ha_without_replica(client, &args.name, &body["spec"], &mut std::io::stderr())
+                .await?;
             if args.start {
                 act(client, &args.name, "start", out).await?;
             }
         }
         VmCmd::Set(args) => {
-            let task =
-                put_spec(client, &args.vm, |current| Ok(vm_set_spec(current, &args))).await?;
+            let replication = if args.replicate.is_empty() {
+                None
+            } else {
+                let list = client.get("/nodes").await?;
+                let nodes = list["items"].as_array().cloned().unwrap_or_default();
+                Some(replication_spec(&args.replicate, &nodes)?)
+            };
+            let task = put_spec(client, &args.vm, |current| {
+                let mut body = vm_set_spec(current, &args);
+                replication_set(&mut body, replication.as_ref(), args.no_replicate);
+                Ok(body)
+            })
+            .await?;
             if args.changes_ha() {
                 let state = match args.policy.ha_state {
                     _ if args.no_ha => "off".to_string(),
@@ -6895,6 +7376,23 @@ async fn vm(
             }
             if args.no_pinned {
                 writeln!(out, "vm {}: not pinned", args.vm)?;
+            }
+            if !args.replicate.is_empty() {
+                let names: Vec<&str> = args.replicate.iter().map(|t| t.node.as_str()).collect();
+                writeln!(
+                    out,
+                    "vm {}: replication targets {}",
+                    args.vm,
+                    names.join(", ")
+                )?;
+            }
+            if args.no_replicate {
+                writeln!(out, "vm {}: replication off", args.vm)?;
+            }
+            if args.changes_ha() || args.changes_replication() {
+                let current = client.get(&format!("/vms/{}", seg(&args.vm))).await?;
+                warn_ha_without_replica(client, &args.vm, &current["spec"], &mut std::io::stderr())
+                    .await?;
             }
             if args.changes_hardware() {
                 let done = format!("vm {}: hardware updated", args.vm);
@@ -6956,6 +7454,10 @@ async fn vm(
             let done = format!("vm {vm}: hotplug done");
             hotplug_result(client, &vm, Some(id.to_string()), no_wait, &done, out).await?;
         }
+        VmCmd::Replicate { vm, node, no_wait } => {
+            vm_replicate(client, &vm, node.as_deref(), no_wait, out).await?
+        }
+        VmCmd::Replication { vm } => vm_replication(client, &vm, json_out, out).await?,
         VmCmd::NicSg { vm, index, groups } => {
             put_spec(client, &vm, |current| {
                 nic_groups_update(current, index, &groups)
@@ -8468,9 +8970,11 @@ mod tests {
              vm web: migrating memory\n"
         );
         {
+            // 복제 대상을 보려고 VM을 먼저 읽는다.
             let seen = seen.lock().unwrap();
-            assert_eq!(seen[0].line, "POST /api/v1/vms/web/migrate HTTP/1.1");
-            assert_eq!(seen[0].body, json!({ "node": "n2", "pool": "fast" }));
+            assert_eq!(seen[0].line, "GET /api/v1/vms/web HTTP/1.1");
+            assert_eq!(seen[1].line, "POST /api/v1/vms/web/migrate HTTP/1.1");
+            assert_eq!(seen[1].body, json!({ "node": "n2", "pool": "fast" }));
         }
 
         // 풀을 주지 않으면 본문에 `pool`이 없다.
@@ -8479,7 +8983,7 @@ mod tests {
         vm_migrate(&client, "web", "n2", None, false, &mut out, &mut Vec::new())
             .await
             .unwrap();
-        assert_eq!(seen.lock().unwrap()[0].body, json!({ "node": "n2" }));
+        assert_eq!(seen.lock().unwrap()[1].body, json!({ "node": "n2" }));
 
         // `--force`는 줄 때만 보낸다.
         seen.lock().unwrap().clear();
@@ -8495,8 +8999,532 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            seen.lock().unwrap()[0].body,
+            seen.lock().unwrap()[1].body,
             json!({ "node": "n2", "force": true })
+        );
+    }
+
+    /// 복제 대상 노드로 옮기면 디스크 복사 대신 복제 뒤 바뀐 것을 보낸다고 알리고, 메모리 단계에서 보낸 양을 알린다.
+    #[tokio::test]
+    async fn vm_migrate_to_a_replica_shows_the_changes_sent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static POLLS: AtomicUsize = AtomicUsize::new(0);
+        const N2: &str = "0190a000-0000-7000-8000-000000000002";
+        let (base, _) = fake_api_bodies(|path| match path {
+            "/api/v1/vms/web" => json!({ "name": "web", "spec": { "replication": [
+                { "node": N2, "schedule": "*/15", "pool": "b" },
+            ] } }),
+            "/api/v1/tasks/t1" => {
+                let (stage, done) = match POLLS.fetch_add(1, Ordering::SeqCst) {
+                    0 => ("copying-disks", 0),
+                    1 => ("copying-disks", 1u64 << 20),
+                    2 => ("migrating-memory", 3 << 20),
+                    _ => return json!({ "id": "t1", "status": { "state": "succeeded" } }),
+                };
+                let progress = json!({ "stage": stage, "done_bytes": done, "total_bytes": done });
+                json!({ "id": "t1", "status": { "state": "running", "progress": progress } })
+            }
+            _ => json!({ "id": "t1", "spec": { "op": { "kind": "vm-migrate", "node": N2 } },
+                         "status": { "state": "pending" } }),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        vm_migrate(&client, "web", "n2", None, false, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "vm web: migrated to n2\n");
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "vm web: copying the changes since the replica\n\
+             vm web: sent 3.0 MiB of changes since the replica\n\
+             vm web: migrating memory\n"
+        );
+    }
+
+    /// 따라잡기 진행 줄은 복사에 들어갈 때와 메모리 단계에 들어갈 때 한 번씩이다. 복제 대상은 노드 id로 맞춘다.
+    #[test]
+    fn catch_up_progress_lines() {
+        let mut shown = None;
+        let mut lines = Vec::new();
+        for p in [
+            json!(null),
+            json!({ "stage": "copying-disks", "done_bytes": 0, "total_bytes": 0 }),
+            json!({ "stage": "copying-disks", "done_bytes": 5 << 20, "total_bytes": 8 << 20 }),
+            json!({ "stage": "migrating-memory", "done_bytes": 12 << 20, "total_bytes": 12 << 20 }),
+            json!({ "stage": "migrating-memory", "done_bytes": 12 << 20, "total_bytes": 12 << 20 }),
+        ] {
+            lines.extend(catch_up_progress("web", &p, &mut shown));
+        }
+        assert_eq!(
+            lines,
+            [
+                "vm web: copying the changes since the replica",
+                "vm web: sent 12.0 MiB of changes since the replica",
+                "vm web: migrating memory",
+            ]
+        );
+        let vm = json!({ "spec": { "replication": [{ "node": "n2-id", "schedule": "*/15" }] } });
+        assert!(replicates_to(&vm, &json!("n2-id")));
+        assert!(!replicates_to(&vm, &json!("n3-id")));
+        assert!(!replicates_to(&vm, &Value::Null));
+        assert!(!replicates_to(&json!({ "spec": {} }), &json!("n2-id")));
+    }
+
+    /// `--replicate`는 `NODE[,*/N][,pool=POOL]`이다. 주기의 기본은 `*/15`이고 문법은 서버와 같다.
+    #[test]
+    fn replicate_targets_parse() {
+        let target = |node: &str, schedule: &str, pool: Option<&str>| ReplicateArg {
+            node: node.into(),
+            schedule: schedule.into(),
+            pool: pool.map(str::to_string),
+        };
+        assert_eq!(
+            parse_replica_target("node2").unwrap(),
+            target("node2", "*/15", None)
+        );
+        assert_eq!(
+            parse_replica_target("node2,*/5,pool=b").unwrap(),
+            target("node2", "*/5", Some("b"))
+        );
+        assert_eq!(
+            parse_replica_target("node2,pool=b,*/1440").unwrap(),
+            target("node2", "*/1440", Some("b"))
+        );
+        assert_eq!(
+            parse_replica_target("node2,pool=b").unwrap(),
+            target("node2", "*/15", Some("b"))
+        );
+        assert_eq!(
+            parse_replica_target("node2,*/0").unwrap_err(),
+            "replication schedule must look like */N with N minutes from 1 to 1440"
+        );
+        for bad in [
+            "",
+            ",*/5",
+            "node2,",
+            "node2,15",
+            "node2,pool=",
+            "node2,*/5,*/6",
+            "node2,pool=a,pool=b",
+            "node2,x=y",
+        ] {
+            assert_eq!(
+                parse_replica_target(bad).unwrap_err(),
+                format!("invalid replication target {bad:?}: use NODE[,*/N][,pool=POOL]"),
+                "{bad}"
+            );
+        }
+        let Cmd::Vm {
+            cmd: VmCmd::Create(c),
+        } = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "create",
+            "web",
+            "--replicate",
+            "node2,*/5",
+            "--replicate",
+            "node3,pool=b",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!("not vm create");
+        };
+        assert_eq!(
+            c.replicate,
+            [
+                target("node2", "*/5", None),
+                target("node3", "*/15", Some("b"))
+            ]
+        );
+        assert!(
+            Cli::try_parse_from(["oplctl", "vm", "create", "web", "--replicate", "n2,*/x"])
+                .is_err()
+        );
+    }
+
+    /// 복제 대상의 노드 이름(이나 id)은 `/nodes`의 id로 바꾸고, 풀이 없으면 `pool`을 보내지 않는다.
+    #[test]
+    fn replication_spec_resolves_node_names() {
+        let nodes = [
+            json!({ "id": "id-1", "name": "node1" }),
+            json!({ "id": "id-2", "name": "node2" }),
+        ];
+        let targets = [
+            parse_replica_target("node2,*/5,pool=b").unwrap(),
+            parse_replica_target("id-1").unwrap(),
+        ];
+        assert_eq!(
+            replication_spec(&targets, &nodes).unwrap(),
+            json!([
+                { "node": "id-2", "schedule": "*/5", "pool": "b" },
+                { "node": "id-1", "schedule": "*/15" },
+            ])
+        );
+        assert_eq!(
+            replication_spec(&[parse_replica_target("node9").unwrap()], &nodes)
+                .unwrap_err()
+                .to_string(),
+            "node node9 not found"
+        );
+    }
+
+    /// `vm set --replicate`는 복제 대상 목록을 통째로 바꾸고 `--no-replicate`는 필드를 뺀다. 둘은 함께 줄 수 없고,
+    /// 다른 것은 바꾸지 않는다.
+    #[test]
+    fn vm_set_replaces_or_removes_the_replication_targets() {
+        let vm = json!({
+            "name": "web",
+            "spec": {
+                "ha": true,
+                "replication": [{ "node": "id-2", "schedule": "*/15" }],
+            },
+        });
+        let args = vm_set(&["--replicate", "node3", "--replicate", "node4,*/5"]);
+        assert!(args.changes_replication());
+        assert!(!args.changes_ha());
+        let targets = json!([
+            { "node": "id-3", "schedule": "*/15" },
+            { "node": "id-4", "schedule": "*/5" },
+        ]);
+        let mut body = vm_set_spec(&vm, &args);
+        replication_set(&mut body, Some(&targets), args.no_replicate);
+        assert_eq!(
+            body["spec"],
+            json!({ "ha": true, "replication": targets.clone() })
+        );
+
+        let args = vm_set(&["--no-replicate"]);
+        assert!(args.changes_replication());
+        let mut body = vm_set_spec(&vm, &args);
+        replication_set(&mut body, None, args.no_replicate);
+        assert_eq!(body["spec"], json!({ "ha": true }));
+
+        // 복제를 바꾸지 않으면 그대로다.
+        let mut body = vm_set_spec(&vm, &vm_set(&["--pinned"]));
+        replication_set(&mut body, None, false);
+        assert_eq!(body["spec"]["replication"], vm["spec"]["replication"]);
+        assert!(!vm_set(&["--pinned"]).changes_replication());
+
+        let mut argv = vec!["oplctl", "vm", "set", "web", "--replicate", "n2"];
+        argv.push("--no-replicate");
+        assert!(Cli::try_parse_from(argv).is_err());
+    }
+
+    /// 지난 시간: 표는 두 단위, `vm get`은 가장 큰 단위 하나
+    #[test]
+    fn ages_are_short() {
+        assert_eq!(age(0), "0s");
+        assert_eq!(age(59), "59s");
+        assert_eq!(age(252), "4m12s");
+        assert_eq!(age(3600 + 300 + 7), "1h5m");
+        assert_eq!(age(2 * 86400 + 3 * 3600 + 59), "2d3h");
+        assert_eq!(ago(45), "45s");
+        assert_eq!(ago(252), "4m");
+        assert_eq!(ago(3 * 3600 + 1), "3h");
+        assert_eq!(ago(2 * 86400), "2d");
+    }
+
+    /// `vm get`의 복제 줄: 대상마다 상태, 준비된 복제본은 나이, 실패는 이유. 아직 항목이 없는 대상은 `pending`이다.
+    #[test]
+    fn replication_line_shows_each_target() {
+        let nodes = [
+            json!({ "id": "id-2", "name": "node2" }),
+            json!({ "id": "id-3", "name": "node3" }),
+            json!({ "id": "id-4", "name": "node4" }),
+        ];
+        let vm = json!({
+            "spec": { "replication": [
+                { "node": "id-2", "schedule": "*/15" },
+                { "node": "id-3", "schedule": "*/15" },
+                { "node": "id-4", "schedule": "*/15" },
+            ] },
+            "status": { "replication": [
+                { "node": "id-2", "state": "ready", "generation": "g1", "synced_at": 1000 },
+                { "node": "id-3", "state": "syncing", "synced_at": 900,
+                  "error": "node \"node3\" is offline" },
+            ] },
+        });
+        assert_eq!(
+            replication_line(&vm, &nodes, &[], &[], 1000 + 252).unwrap(),
+            "replication: node2 ready 4m ago, node3 syncing (error: node \"node3\" is offline), \
+             node4 pending"
+        );
+        // HA 복구 뒤 옛 원본(스펙에도 있음)
+        let vm = json!({
+            "spec": { "replication": [{ "node": "id-2", "schedule": "*/15" }] },
+            "status": { "replication": [{ "node": "id-2", "state": "stale" }] },
+        });
+        assert_eq!(
+            replication_line(&vm, &nodes, &[], &[], 0).unwrap(),
+            "replication: node2 stale"
+        );
+        assert_eq!(
+            replication_line(&json!({ "spec": {}, "status": {} }), &nodes, &[], &[], 0),
+            None
+        );
+    }
+
+    /// 준비된 복제본이라도 VM의 로컬 디스크가 바뀌었으면(더했거나 크기를 바꿈) HA가 쓸 수 없다고 알린다. 공유 풀의
+    /// 디스크는 보지 않는다.
+    #[test]
+    fn a_ready_replica_missing_a_changed_disk_is_marked_unusable() {
+        let nodes = [json!({ "id": "id-2", "name": "node2" })];
+        let volumes = [
+            json!({ "id": "v1", "name": "root", "spec": { "pool": "local", "size_bytes": 100 } }),
+            json!({ "id": "v2", "name": "data", "spec": { "pool": "local", "size_bytes": 200 } }),
+            json!({ "id": "v3", "name": "nfs", "spec": { "pool": "shared", "size_bytes": 300 } }),
+        ];
+        let pools = [
+            json!({ "name": "local", "spec": { "backend": { "kind": "dir", "path": "/a" } } }),
+            json!({ "name": "shared", "spec": { "backend": { "kind": "dir", "path": "/s" }, "shared": true } }),
+        ];
+        let mut vm = json!({
+            "spec": {
+                "disks": [{ "volume": "root" }, { "volume": "nfs" }],
+                "replication": [{ "node": "id-2", "schedule": "*/15" }],
+            },
+            "status": { "replication": [{
+                "node": "id-2", "state": "ready", "generation": "g1", "synced_at": 1000,
+                "volumes": [{ "id": "v1", "size_bytes": 100 }],
+            }] },
+        });
+        assert_eq!(
+            replication_line(&vm, &nodes, &volumes, &pools, 1060).unwrap(),
+            "replication: node2 ready 1m ago"
+        );
+        vm["spec"]["disks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "volume": "data" }));
+        assert_eq!(
+            replication_line(&vm, &nodes, &volumes, &pools, 1060).unwrap(),
+            "replication: node2 ready 1m ago (HA cannot use it: disk \"data\" changed)"
+        );
+        let entry = &vm["status"]["replication"][0];
+        let row = replication_row(
+            entry,
+            &nodes,
+            replica_unusable(&vm, entry, &volumes, &pools),
+            1060,
+        );
+        assert_eq!(row[6], "HA cannot use it: disk \"data\" changed");
+        // 크기를 바꿨다.
+        vm["spec"]["disks"].as_array_mut().unwrap().pop();
+        let mut grown = volumes.to_vec();
+        grown[0]["spec"]["size_bytes"] = json!(150);
+        assert_eq!(
+            replica_unusable(&vm, &vm["status"]["replication"][0], &grown, &pools).as_deref(),
+            Some("HA cannot use it: disk \"root\" changed")
+        );
+    }
+
+    /// 복제본으로 한 마지막 HA 복구의 줄
+    #[test]
+    fn the_last_recovery_shows_when_and_from_where() {
+        let nodes = [
+            json!({ "id": "id-1", "name": "node1" }),
+            json!({ "id": "id-2", "name": "node2" }),
+        ];
+        let vm = json!({ "status": { "last_recovery": {
+            "from": "id-1", "node": "id-2", "synced_at": 1_790_000_000, "at": 1_790_000_300,
+        } } });
+        assert_eq!(
+            recovery_line(&vm, &nodes).unwrap(),
+            "last recovery: 2026-09-21 14:18 UTC — node1 failed; restarted on node2 from the replica \
+             taken at 2026-09-21 14:13 UTC (writes after that were lost)"
+        );
+        assert_eq!(recovery_line(&json!({ "status": {} }), &nodes), None);
+    }
+
+    /// `vm replication`의 표: 시점·나이·마지막 회차(전체/증분과 보낸 양)·복제본 크기·오류. 끝난 회차가 없으면 `-`다.
+    #[test]
+    fn replication_rows_show_the_last_run() {
+        let nodes = [json!({ "id": "id-2", "name": "node2" })];
+        let ready = json!({
+            "node": "id-2", "state": "ready", "generation": "g2", "synced_at": 1_790_000_000,
+            "volumes": [{ "id": "v1", "size_bytes": 128u64 << 20 }, { "id": "v2", "size_bytes": 64u64 << 20 }],
+            "last_bytes": 12u64 << 20, "last_secs": 3, "last_full": false,
+        });
+        let pending =
+            json!({ "node": "id-9", "state": "pending", "error": "node \"x\" is offline" });
+        let mut out = Vec::new();
+        let rows = vec![
+            replication_row(&ready, &nodes, None, 1_790_000_252),
+            replication_row(&pending, &nodes, None, 1_790_000_252),
+        ];
+        table(&mut out, REPLICATION_HEADERS, &rows).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "NODE   STATE    SYNCED                AGE    LAST                 SIZE      ERROR\n\
+             node2  ready    2026-09-21 14:13 UTC  4m12s  incremental 12.0MiB  192.0MiB  -\n\
+             id-9   pending  -                     -      -                    -         node \"x\" is offline\n"
+        );
+        let full = json!({ "node": "id-2", "state": "ready", "generation": "g1",
+                           "last_bytes": 128u64 << 20, "last_full": true });
+        assert_eq!(replication_row(&full, &nodes, None, 0)[4], "full 128.0MiB");
+        assert_eq!(
+            replicated_line("web", "node2", &ready),
+            "vm web: replicated to node2 (12.0 MiB, incremental)"
+        );
+        assert_eq!(
+            replicated_line("web", "node2", &full),
+            "vm web: replicated to node2 (128.0 MiB, full)"
+        );
+    }
+
+    /// 건너뛴 회차(Task 경고)는 앞 회차의 상태 대신 그 경고를 알린다.
+    #[tokio::test]
+    async fn vm_replicate_reports_a_skipped_run() {
+        let (base, _seen) = fake_api_bodies(|path| match path {
+            "/api/v1/vms/web/replicate" => json!({
+                "id": "t1", "spec": { "op": { "kind": "vm-replicate", "node": "id-2" } },
+                "status": { "state": "pending" },
+            }),
+            "/api/v1/tasks/t1" => json!({
+                "id": "t1", "spec": { "op": { "kind": "vm-replicate", "node": "id-2" } },
+                "status": { "state": "succeeded",
+                    "error": "replication run skipped: the VM is not running on this node" },
+            }),
+            "/api/v1/nodes" => json!({ "items": [{ "id": "id-2", "name": "node2" }] }),
+            _ => json!({ "name": "web", "status": { "replication": [
+                { "node": "id-2", "state": "ready", "generation": "t0", "last_bytes": 1u64 << 20,
+                  "last_full": false },
+            ] } }),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let mut out = Vec::new();
+        vm_replicate(&client, "web", None, false, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm web: replication run skipped: the VM is not running on this node\n"
+        );
+    }
+
+    /// `vm replicate`는 `--node`를 줄 때만 본문에 넣고, Task가 끝나면 그 대상의 상태로 보낸 양과 방식을 알린다.
+    /// `--no-wait`는 Task id만 알린다.
+    #[tokio::test]
+    async fn vm_replicate_waits_and_reports_the_run() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/vms/web/replicate" => json!({
+                "id": "t1", "spec": { "op": { "kind": "vm-replicate", "node": "id-2" } },
+                "status": { "state": "pending" },
+            }),
+            "/api/v1/tasks/t1" => json!({
+                "id": "t1", "spec": { "op": { "kind": "vm-replicate", "node": "id-2" } },
+                "status": { "state": "succeeded" },
+            }),
+            "/api/v1/nodes" => json!({ "items": [{ "id": "id-2", "name": "node2" }] }),
+            _ => json!({ "name": "web", "status": { "replication": [
+                { "node": "id-2", "state": "ready", "generation": "t1", "last_bytes": 1u64 << 20,
+                  "last_full": false },
+            ] } }),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let mut out = Vec::new();
+        vm_replicate(&client, "web", None, false, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm web: replicated to node2 (1.0 MiB, incremental)\n"
+        );
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].line, "POST /api/v1/vms/web/replicate HTTP/1.1");
+            assert_eq!(seen[0].body, json!({}));
+        }
+        seen.lock().unwrap().clear();
+        let mut out = Vec::new();
+        vm_replicate(&client, "web", Some("node2"), true, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm web: replication task t1 started\n"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].body, json!({ "node": "node2" }));
+        let cli =
+            Cli::try_parse_from(["oplctl", "vm", "replicate", "web", "--node", "n2"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Replicate { vm, node: Some(node), no_wait: false } }
+                if vm == "web" && node == "n2"
+        ));
+        let cli = Cli::try_parse_from(["oplctl", "vm", "replication", "web"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm { cmd: VmCmd::Replication { vm } } if vm == "web"
+        ));
+    }
+
+    /// HA VM의 디스크가 노드 로컬 풀(공유가 아닌 dir, LVM-thin, ZFS)에 있는데 복제가 없으면 경고한다. 복제가 있거나,
+    /// HA가 꺼졌거나 잠시 꺼졌거나(`ignored`), 공유 풀이면 경고하지 않는다.
+    #[test]
+    fn ha_without_a_replica_warns() {
+        let volumes = [
+            json!({ "name": "web-disk", "spec": { "pool": "local" } }),
+            json!({ "name": "shared-disk", "spec": { "pool": "shared" } }),
+            json!({ "name": "thin-disk", "spec": { "pool": "thin" } }),
+            json!({ "name": "nfs-disk", "spec": { "pool": "nfs" } }),
+        ];
+        let pools = [
+            json!({ "name": "local", "spec": { "backend": { "kind": "dir", "path": "/a" } } }),
+            json!({ "name": "shared", "spec": { "backend": { "kind": "dir", "path": "/s" }, "shared": true } }),
+            json!({ "name": "thin", "spec": { "backend": { "kind": "lvm-thin", "vg": "v", "thinpool": "t" } } }),
+            json!({ "name": "nfs", "spec": { "backend": { "kind": "nfs", "server": "h", "export": "/e" } } }),
+        ];
+        let spec = |ha: Value, disks: &[&str]| {
+            let disks: Vec<Value> = disks.iter().map(|d| json!({ "volume": d })).collect();
+            json!({ "ha": ha, "disks": disks })
+        };
+        let warning = "warning: HA cannot restart VM web elsewhere: disk \"web-disk\" is on \
+                       node-local pool \"local\" and has no replica (add --replicate)";
+        assert_eq!(
+            ha_replica_warning(
+                "web",
+                &spec(json!(true), &["shared-disk", "web-disk"]),
+                &volumes,
+                &pools
+            )
+            .unwrap(),
+            warning
+        );
+        let policy = json!({ "state": "started", "max_restart": 2 });
+        assert_eq!(
+            ha_replica_warning("web", &spec(policy, &["web-disk"]), &volumes, &pools).unwrap(),
+            warning
+        );
+        assert!(
+            ha_replica_warning("web", &spec(json!(true), &["thin-disk"]), &volumes, &pools)
+                .unwrap()
+                .contains("disk \"thin-disk\" is on node-local pool \"thin\"")
+        );
+        for quiet in [
+            spec(json!(false), &["web-disk"]),
+            spec(json!({ "state": "ignored" }), &["web-disk"]),
+            spec(json!(true), &["shared-disk", "nfs-disk", "unknown"]),
+            spec(json!(true), &[]),
+        ] {
+            assert_eq!(
+                ha_replica_warning("web", &quiet, &volumes, &pools),
+                None,
+                "{quiet}"
+            );
+        }
+        let mut replicated = spec(json!(true), &["web-disk"]);
+        replicated["replication"] = json!([{ "node": "id-2", "schedule": "*/15" }]);
+        assert_eq!(
+            ha_replica_warning("web", &replicated, &volumes, &pools),
+            None
         );
     }
 
