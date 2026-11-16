@@ -28,6 +28,10 @@ pub const UPGRADE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 /// 실행기는 시간 제한을 두지 않는다.
 pub const DRAIN_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Ceph Task를 기다리는 시간. 꾸러미 설치(`[ceph] install_timeout_secs`, 기본 30분씩)와 데몬 대기가 이어지므로 Task
+/// 실행기는 시간 제한을 두지 않는다.
+pub const CEPH_WAIT: Duration = Duration::from_secs(2 * 60 * 60);
+
 /// Task 조회 요청 하나의 제한 시간. 서버가 응답하지 않아도 전체 기다리기 제한(`TASK_WAIT`)이 지켜지게 한다.
 const TASK_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 

@@ -10,6 +10,7 @@ use opl_types::replication::{DEFAULT_INTERVAL, parse_interval};
 use reqwest::Method;
 use serde_json::{Value, json};
 
+use crate::ceph::{CephCmd, ceph, node_disks};
 use crate::client::{
     ApiError, BACKUP_WAIT, Client, DRAIN_WAIT, IMPORT_WAIT, MIGRATE_WAIT, NotLoggedIn,
     UPGRADE_WAIT, fetch_ca, fingerprint, local, seg, task_header,
@@ -62,6 +63,12 @@ enum Cmd {
     Pool {
         #[command(subcommand)]
         cmd: PoolCmd,
+    },
+    /// Orbivisor가 노드에 설치·구성하는 Ceph: 부트스트랩, 모니터·매니저·OSD 더하기, RBD 풀 만들기, 상태(admin만
+    /// 바꾼다). 바깥 Ceph는 `pool create --rbd`로 쓴다.
+    Ceph {
+        #[command(subcommand)]
+        cmd: CephCmd,
     },
     /// VM NIC가 연결하는 네트워크(노드에 미리 만든 Linux 브리지나 orbivisord가 만드는 VXLAN 네트워크)
     Network {
@@ -310,6 +317,10 @@ enum NodeCmd {
     },
     /// 노드의 HA 검사 결과(노드가 5초마다 검사한다). 실패가 grace 넘게 이어지면 리더가 검사의 대응을 한다.
     Checks {
+        node: String,
+    },
+    /// 노드의 디스크와 Ceph OSD로 쓸 수 있는지(`available`, 지워야 쓸 수 있는 `wipeable`, 쓸 수 없는 `in use`)
+    Disks {
         node: String,
     },
 }
@@ -5450,6 +5461,7 @@ where
                 node_part(&client, &node, "interfaces", json_out, out).await?
             }
             NodeCmd::Checks { node } => node_part(&client, &node, "checks", json_out, out).await?,
+            NodeCmd::Disks { node } => node_disks(&client, &node, json_out, out).await?,
         },
         Cmd::Pool { cmd } => match cmd {
             PoolCmd::List => {
@@ -5496,6 +5508,7 @@ where
                 writeln!(out, "storage pool {pool} deleted")?;
             }
         },
+        Cmd::Ceph { cmd } => ceph(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::List => {
                 let list = client.get("/networks").await?;
@@ -6539,7 +6552,7 @@ fn esxi_source(i: &Value) -> Option<String> {
 }
 
 /// 목록에서 id가 `id`인 항목의 이름. 없으면 id다.
-fn name_of(list: &[Value], id: &Value) -> String {
+pub(crate) fn name_of(list: &[Value], id: &Value) -> String {
     list.iter()
         .find(|v| v["id"] == *id)
         .map_or_else(|| cell(id), |v| cell(&v["name"]))
@@ -6786,11 +6799,26 @@ async fn cluster(
             if !force {
                 bail!("removing a node cannot be undone; pass --force to confirm");
             }
-            client.delete(&format!("/nodes/{}", seg(&node))).await?;
+            let resp = client.delete(&format!("/nodes/{}", seg(&node))).await?;
             writeln!(out, "node {node} removed from the cluster")?;
+            for w in removal_warnings(&resp) {
+                eprintln!("warning: {w}");
+            }
         }
     }
     Ok(())
+}
+
+/// 노드를 뺀 뒤 손으로 할 일(`DELETE /nodes/{key}`의 200 `warnings` — 예: Ceph 데몬 노드). 204면 없다.
+fn removal_warnings(resp: &Value) -> Vec<String> {
+    resp["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .filter_map(|w| w.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `vm migrate`: 마이그레이션 Task를 만들고 끝나기를 기다린다. `pool`과 `force`는 줄 때만 보낸다(옛 서버는
@@ -8160,7 +8188,7 @@ fn print_cluster_status(out: &mut (dyn Write + Send), view: &Value) -> anyhow::R
 }
 
 /// 목록 응답의 항목들
-fn items(list: &Value) -> Vec<Value> {
+pub(crate) fn items(list: &Value) -> Vec<Value> {
     list["items"].as_array().cloned().unwrap_or_default()
 }
 
@@ -8510,6 +8538,16 @@ mod tests {
         assert!(parse_size("99999999999T").is_err());
     }
 
+    /// 노드를 뺀 뒤의 경고는 200의 `warnings`에만 있다(204는 null).
+    #[test]
+    fn node_removal_warnings() {
+        assert!(removal_warnings(&Value::Null).is_empty());
+        assert_eq!(
+            removal_warnings(&json!({ "warnings": ["ceph mon remove node3"] })),
+            ["ceph mon remove node3"]
+        );
+    }
+
     #[test]
     fn extracts_token_id() {
         let id = uuid::Uuid::now_v7();
@@ -8523,6 +8561,83 @@ mod tests {
         assert!(is_https("HTTPS://host"));
         assert!(!is_https("http://host"));
         assert!(!is_https("HTTP://host"));
+    }
+
+    /// `ceph` 명령의 인자. `pool create --size`는 clap이 1~3만 받는다(서버까지 가지 않는다).
+    #[test]
+    fn parses_ceph_commands() {
+        use crate::ceph::{CephClientCmd, CephPoolCmd, OsdCmd};
+        let ceph = |argv: &[&str]| {
+            Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+                Cmd::Ceph { cmd } => cmd,
+                _ => panic!("{argv:?} is not a ceph command"),
+            })
+        };
+        match ceph(&[
+            "oplctl", "ceph", "osd", "add", "node2", "/dev/sdb", "--wipe", "--yes",
+        ]) {
+            Ok(CephCmd::Osd {
+                cmd: OsdCmd::Add(a),
+            }) => {
+                assert_eq!((a.node.as_str(), a.device.as_str()), ("node2", "/dev/sdb"));
+                assert!(a.wipe && a.yes && !a.no_wait);
+            }
+            _ => panic!("not osd add"),
+        }
+        match ceph(&[
+            "oplctl",
+            "ceph",
+            "init",
+            "node1",
+            "--public-network",
+            "10.0.0.0/24",
+            "--no-wait",
+        ]) {
+            Ok(CephCmd::Init {
+                node,
+                public_network,
+                cluster_network,
+                no_wait,
+            }) => {
+                assert_eq!(node, "node1");
+                assert_eq!(public_network.as_deref(), Some("10.0.0.0/24"));
+                assert_eq!(cluster_network, None);
+                assert!(no_wait);
+            }
+            _ => panic!("not init"),
+        }
+        let pool = |size: &str| ceph(&["oplctl", "ceph", "pool", "create", "vms", "--size", size]);
+        for size in ["1", "2", "3"] {
+            match pool(size) {
+                Ok(CephCmd::Pool {
+                    cmd: CephPoolCmd::Create { size: Some(n), .. },
+                }) => assert_eq!(n.to_string(), size),
+                _ => panic!("size {size}"),
+            }
+        }
+        for size in ["0", "4", "x"] {
+            assert!(pool(size).is_err(), "{size}");
+        }
+        // client install은 노드나 --all 하나다.
+        assert!(ceph(&["oplctl", "ceph", "client", "install"]).is_err());
+        assert!(ceph(&["oplctl", "ceph", "client", "install", "n1", "--all"]).is_err());
+        match ceph(&["oplctl", "ceph", "client", "install", "n1", "n2"]) {
+            Ok(CephCmd::Client {
+                cmd: CephClientCmd::Install { nodes, all, .. },
+            }) => assert!(nodes == ["n1", "n2"] && !all),
+            _ => panic!("not client install"),
+        }
+        assert!(ceph(&["oplctl", "ceph", "client", "install", "--all"]).is_ok());
+        assert!(ceph(&["oplctl", "ceph", "status"]).is_ok());
+        assert!(ceph(&["oplctl", "ceph", "osd", "list"]).is_ok());
+        assert!(ceph(&["oplctl", "ceph", "mon", "add", "node2"]).is_ok());
+        assert!(ceph(&["oplctl", "ceph", "mgr", "add", "node2", "--no-wait"]).is_ok());
+        assert!(matches!(
+            Cli::try_parse_from(["oplctl", "node", "disks", "node1"]).map(|c| c.cmd),
+            Ok(Cmd::Node {
+                cmd: NodeCmd::Disks { .. }
+            })
+        ));
     }
 
     #[test]

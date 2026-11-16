@@ -355,6 +355,31 @@ jobs:
           OPL_TEST_LVM_SHARED: oplshared
           OPL_TEST_ISCSI: 127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared
 
+  # Ceph 자동 구성(계획 56): Ceph가 없는 깨끗한 러너에서 orbivisord가 apt로 Ceph를 설치하고 mon·mgr, 루프 장치
+  # 위 OSD(ceph-volume LVM), RBD 풀을 세워 그 풀의 볼륨으로 VM을 켠다. linux-kvm은 손으로 띄운 Ceph(바깥 Ceph를
+  # RBD 풀로 쓰는 시험)의 /etc/ceph/ceph.conf가 있어 Orbivisor가 관리할 Ceph를 세울 수 없으므로 작업을 나눈다.
+  ceph:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: QEMU, UEFI firmware, rbd block driver (Ceph itself is installed by orbivisord)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils qemu-block-extra
+          ls -l /dev/kvm
+          test ! -e /etc/ceph/ceph.conf
+      # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다. 실제 Ceph 출력(JSON)을 로그에 남긴다.
+      - name: Ceph setup E2E as root
+        run: |
+          sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+            cargo test --features opld/ceph-it,opld/qemu-it -p opld --test ceph -- --nocapture
+
   # LDAP 영역: 실제 OpenLDAP(slapd)에 LDAPS와 ldap://+StartTLS로 사용자 찾기·바인드, memberOf 그룹,
   # API의 영역 시험 동작과 외부 사용자 로그인. 디렉터리(시험 CA, 사용자 둘, 그룹 하나)는
   # ldap-setup.sh가 아래 OPL_TEST_LDAP_* 값으로 만든다.
