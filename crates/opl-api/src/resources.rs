@@ -259,6 +259,20 @@ pub async fn create_pool(
     let shared_given = req.spec.get("shared").is_some();
     let mut spec: StoragePoolSpec = serde_json::from_value(req.spec)
         .map_err(|e| ApiError::bad_request(format!("spec: {e}")))?;
+    check_pool_spec(&state.cluster, &mut spec, shared_given)?;
+    let mut pool = Resource::new(req.name, spec);
+    pool.labels = req.labels;
+    pool.revision = state.cluster.create(&pool).await?;
+    Ok((StatusCode::CREATED, Json(pool)))
+}
+
+/// 풀 spec의 값을 검사하고 늘 공유인 백엔드(NFS·RBD·공유 LVM)의 `shared`를 채운다. `shared_given`은 요청이
+/// `shared`를 적었는지다. 풀 만들기 API와 Ceph 풀 등록 Task가 함께 쓴다.
+pub(crate) fn check_pool_spec(
+    cluster: &Cluster,
+    spec: &mut StoragePoolSpec,
+    shared_given: bool,
+) -> Result<(), ApiError> {
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     // NFS·RBD·공유 LVM 풀은 늘 공유다. `shared`가 없으면 true로 두고 false면 거절한다.
@@ -288,14 +302,11 @@ pub async fn create_pool(
         ));
     }
     for node in &spec.nodes {
-        if state.cluster.get::<NodeSpec>(*node)?.is_none() {
+        if cluster.get::<NodeSpec>(*node)?.is_none() {
             return Err(ApiError::bad_request(format!("node {node} not found")));
         }
     }
-    let mut pool = Resource::new(req.name, spec);
-    pool.labels = req.labels;
-    pool.revision = state.cluster.create(&pool).await?;
-    Ok((StatusCode::CREATED, Json(pool)))
+    Ok(())
 }
 
 /// 볼륨이나 백업이 남아 있으면 409 `pool_in_use`

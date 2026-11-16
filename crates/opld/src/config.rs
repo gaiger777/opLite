@@ -9,6 +9,9 @@ use opl_api::{
     RemotePollerConfig, ReplicationSchedulerConfig, SnapshotSchedulerConfig, TelemetryConfig,
     UpdatesConfig, VipAgentConfig,
 };
+use opl_driver::ceph::{
+    CLIENT_PACKAGES, CephHost, CephOptions, CephPaths, DAEMON_PACKAGES, SystemRunner,
+};
 use opl_driver::{NetFs, VipAddress};
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
@@ -93,6 +96,8 @@ pub struct Config {
     pub web: WebSection,
     #[serde(default)]
     pub node: NodeSection,
+    #[serde(default)]
+    pub ceph: CephSection,
     /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`·`qemu-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
     #[cfg(any(
         feature = "starve-it",
@@ -862,6 +867,82 @@ pub struct NodeSection {
     pub zone: Option<String>,
 }
 
+/// Ceph 자동 구성(계획 56)이 이 노드에서 쓰는 값. 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CephSection {
+    /// 관리 Ceph의 클라이언트 설정·`client.orbivisor` 키링을 두는 디렉터리(절대 경로). 등록하는 RBD 풀의 `conf`는
+    /// `{client_dir}/ceph.conf`다.
+    #[serde(default = "default_ceph_client_dir")]
+    pub client_dir: PathBuf,
+    /// 데몬 노드(mon·mgr·OSD)에 까는 꾸러미
+    #[serde(default = "default_ceph_packages")]
+    pub packages: Vec<String>,
+    /// RBD 풀만 쓰는 노드에 까는 꾸러미
+    #[serde(default = "default_ceph_client_packages")]
+    pub client_packages: Vec<String>,
+    /// `apt-get update`·`install` 하나의 시간 한도(초)
+    #[serde(default = "default_ceph_install_timeout_secs")]
+    pub install_timeout_secs: u64,
+    /// 루프 장치도 OSD 디스크로 쓴다(시험용).
+    #[serde(default)]
+    pub allow_loop_devices: bool,
+    /// Ceph 상태를 다시 읽지 않고 돌려주는 시간(초). 0이면 늘 다시 읽는다.
+    #[serde(default = "default_ceph_status_cache_secs")]
+    pub status_cache_secs: u64,
+}
+
+impl Default for CephSection {
+    fn default() -> Self {
+        Self {
+            client_dir: default_ceph_client_dir(),
+            packages: default_ceph_packages(),
+            client_packages: default_ceph_client_packages(),
+            install_timeout_secs: default_ceph_install_timeout_secs(),
+            allow_loop_devices: false,
+            status_cache_secs: default_ceph_status_cache_secs(),
+        }
+    }
+}
+
+impl CephSection {
+    /// 이 노드에서 Ceph를 세우는 단계들(실제 명령). Linux가 아닌 노드도 만들고 Task가 거절한다.
+    pub fn host(&self) -> CephHost {
+        let paths = CephPaths {
+            client_dir: self.client_dir.clone(),
+            ..CephPaths::default()
+        };
+        let options = CephOptions {
+            packages: self.packages.clone(),
+            client_packages: self.client_packages.clone(),
+            install_timeout: Duration::from_secs(self.install_timeout_secs),
+            allow_loop: self.allow_loop_devices,
+            ..CephOptions::default()
+        };
+        CephHost::new(Arc::new(SystemRunner), paths, options)
+    }
+
+    pub fn status_cache(&self) -> Duration {
+        Duration::from_secs(self.status_cache_secs)
+    }
+}
+
+fn default_ceph_client_dir() -> PathBuf {
+    "/etc/opl/ceph".into()
+}
+fn default_ceph_packages() -> Vec<String> {
+    DAEMON_PACKAGES.iter().map(|p| p.to_string()).collect()
+}
+fn default_ceph_client_packages() -> Vec<String> {
+    CLIENT_PACKAGES.iter().map(|p| p.to_string()).collect()
+}
+fn default_ceph_install_timeout_secs() -> u64 {
+    30 * 60
+}
+fn default_ceph_status_cache_secs() -> u64 {
+    5
+}
+
 /// 실행기 크기(설계 §3.1). `core` 실행기는 2로 고정이다.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1278,6 +1359,20 @@ impl Config {
         }
         if self.pools.refresh_secs == 0 {
             anyhow::bail!("pools.refresh_secs must be at least 1");
+        }
+        if self.ceph.install_timeout_secs == 0 {
+            anyhow::bail!("ceph.install_timeout_secs must be at least 1");
+        }
+        // 등록하는 RBD 풀의 `conf`가 된다(절대 경로, `,:=` 없음).
+        let client_dir = self.ceph.client_dir.to_string_lossy();
+        if !self.ceph.client_dir.is_absolute()
+            || client_dir
+                .chars()
+                .any(|c| c.is_control() || ",:=".contains(c))
+        {
+            anyhow::bail!(
+                "ceph.client_dir must be an absolute path without ',', ':' or '=' (got {client_dir:?})"
+            );
         }
         // 감사 로그를 읽을 때 파일을 통째로 메모리에 올리므로 256 MiB까지만 받는다.
         if self.audit.max_file_mib == 0
@@ -1815,6 +1910,48 @@ mod tests {
         }
         assert!(
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[replication]\nevery = 1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ceph_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        c.validate().unwrap();
+        let host = c.ceph.host();
+        assert_eq!(host.paths().client_dir, Path::new("/etc/opl/ceph"));
+        assert_eq!(host.paths().etc_ceph, Path::new("/etc/ceph"));
+        assert_eq!(host.options().packages, DAEMON_PACKAGES);
+        assert_eq!(host.options().client_packages, CLIENT_PACKAGES);
+        assert_eq!(host.options().install_timeout, Duration::from_secs(1800));
+        assert!(!host.options().allow_loop);
+        assert!(!host.options().any_os);
+        assert_eq!(c.ceph.status_cache(), Duration::from_secs(5));
+
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ceph]\nclient_dir = \"/srv/ceph\"\n\
+             packages = [\"ceph\"]\nclient_packages = []\ninstall_timeout_secs = 60\n\
+             allow_loop_devices = true\nstatus_cache_secs = 0",
+        );
+        c.validate().unwrap();
+        let host = c.ceph.host();
+        assert_eq!(host.client_conf(), Path::new("/srv/ceph/ceph.conf"));
+        assert_eq!(host.options().packages, ["ceph"]);
+        assert!(host.options().client_packages.is_empty());
+        assert_eq!(host.options().install_timeout, Duration::from_secs(60));
+        assert!(host.options().allow_loop);
+        assert_eq!(c.ceph.status_cache(), Duration::ZERO);
+
+        for bad in [
+            "install_timeout_secs = 0",
+            "client_dir = \"etc/ceph\"",
+            "client_dir = \"/etc/a:b\"",
+        ] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[ceph]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[ceph]\nconf = \"/x\"")
                 .is_err()
         );
     }

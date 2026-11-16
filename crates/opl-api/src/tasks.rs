@@ -4,6 +4,7 @@
 //! 구독하므로, 어느 노드의 API가 만든 Task든 대상 노드에서 실행된다.
 
 pub(crate) mod backup;
+mod ceph;
 mod clone;
 mod drain;
 mod hotplug;
@@ -23,6 +24,7 @@ use std::time::Duration;
 use opl_cluster::types::Rejection;
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
+use opl_driver::ceph::CephHost;
 use opl_driver::{DriverError, Hypervisor, Storage};
 use opl_peer::Peers;
 use opl_reconciler::{FirewallGate, FirmwareFetcher, ReconcilerHandle};
@@ -119,6 +121,8 @@ pub struct TaskRunnerConfig {
     /// 복제본 기록 파일의 디렉터리(opld의 `{data_dir}/replicas`, 받는 쪽·reconciler와 같다). 없으면 복제 Task는
     /// 실패한다.
     pub replica_dir: Option<PathBuf>,
+    /// 이 노드에서 Ceph를 세우는 단계들(opld `[ceph]`). 없으면 Ceph Task는 실패한다.
+    pub ceph: Option<Arc<CephHost>>,
 }
 
 impl TaskRunnerConfig {
@@ -146,6 +150,7 @@ impl TaskRunnerConfig {
             replication_bandwidth: None,
             replication_stall: migrate::DISK_STALL,
             replica_dir: None,
+            ceph: None,
         }
     }
 }
@@ -690,6 +695,9 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             if let Some(vm) = snapshot::scheduled_vm(ctx, &task).filter(|_| create) {
                 snapshot::record_schedule(ctx, vm, None).await;
             }
+            if task.spec.op.is_ceph() {
+                ceph::finished(ctx, &task, None).await;
+            }
             set_status(ctx, task.id, TaskState::Succeeded, warning).await
         }
         Err(e) => fail(ctx, &task, e, unfinished).await,
@@ -715,7 +723,9 @@ async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
 /// `error`를 남긴다. 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
 /// 재시작으로 중단) 작업이 아직 돌고 있을 수 있어 태그를 두고 리소스만 지운다(설계 §6 "태그만 남은 경우").
 /// 블록 디스크의 태그는 뒤에서 다시 지운다([`snapshot::remove_unfinished_tags`]). 실패한 로컬 디스크 복제는 그
-/// 대상의 상태에 `error`를 남기고 원본 QEMU에 남은 플리싱을 치운 뒤 대상 노드에 회차를 버리게 한다.
+/// 대상의 상태에 `error`를 남기고 원본 QEMU에 남은 플리싱을 치운 뒤 대상 노드에 회차를 버리게 한다. 실패한
+/// Ceph 부트스트랩은 `Ceph` 리소스에 `last_error`를 남기고(다시 하면 이어서 한다), Ceph Task는 잡아 둔 자리
+/// (`pending`)를 놓는다.
 async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     if let TaskOp::SnapshotCreate { snapshot } = task.spec.op {
         if unfinished {
@@ -742,6 +752,9 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     }
     if let TaskOp::VmReplicate { .. } = task.spec.op {
         vm_replicate::discard(ctx, task, error).await;
+    }
+    if task.spec.op.is_ceph() {
+        ceph::finished(ctx, task, Some(error)).await;
     }
     if matches!(
         task.spec.op,
@@ -880,7 +893,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         | TaskOp::CephMgrAdd
         | TaskOp::CephOsdAdd { .. }
         | TaskOp::CephPoolCreate { .. }
-        | TaskOp::CephClientInstall => Err("this node cannot run Ceph tasks yet".into()),
+        | TaskOp::CephClientInstall => ceph::perform(ctx, task).await,
     };
     done.map(|()| None)
 }

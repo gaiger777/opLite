@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use opl_cluster::Cluster;
 use opl_driver::Hypervisor;
+use opl_driver::ceph::CephHost;
 use opl_peer::{MetricsSource, Peers};
 use opl_reconciler::HaGuard;
 use opl_types::security_group::Cidr;
@@ -67,6 +68,11 @@ pub struct AppState {
     pub(crate) placement_backoff: std::sync::Mutex<Option<tokio::time::Instant>>,
     /// 추천 적용을 하나씩(다시 보기와 마이그레이션 만들기 사이에 다른 적용이 끼지 않게)
     pub(crate) placement_apply: tokio::sync::Mutex<()>,
+    /// 이 노드에서 Ceph를 세우는 단계들(opld `[ceph]`, Task 실행기와 같은 것). 노드의 디스크 목록과 Ceph 상태
+    /// 읽기가 쓴다. 없으면(위트니스) 이 노드에서 읽지 않는다.
+    pub ceph: Option<Arc<CephHost>>,
+    /// Ceph 상태(`GET /ceph/status`)를 다시 읽지 않고 돌려주는 시간(opld `[ceph] status_cache_secs`)
+    pub ceph_status_ttl: Duration,
 }
 
 impl AppState {
@@ -101,6 +107,8 @@ impl AppState {
             placement: Arc::default(),
             placement_backoff: Default::default(),
             placement_apply: Default::default(),
+            ceph: None,
+            ceph_status_ttl: Duration::from_secs(5),
         }
     }
 }

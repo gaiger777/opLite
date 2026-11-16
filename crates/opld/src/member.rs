@@ -12,7 +12,7 @@ use anyhow::Context;
 use axum::serve::ListenerExt;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
-    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, Balancer, ClusterJanitor,
+    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, Balancer, CephAgent, ClusterJanitor,
     FenceStatusSource, HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations,
     IncomingReplicas, PlacementBoard, PlacementStatusSource, PowerFence, RemotePoller,
     ReplicaConfig, ReplicationScheduler, RuntimeProbe, SnapshotScheduler, TaskRunner,
@@ -215,6 +215,8 @@ struct Services {
     ha: Option<Arc<HaGuard>>,
     /// APT 소스 파일과 주기 업데이트 확인(업데이트가 꺼졌으면 없다)
     updates: Option<UpdateAgent>,
+    /// 관리 Ceph의 클라이언트 설정과 데몬 노드의 `mon_host`를 맞춘다.
+    ceph: CephAgent,
     /// 리더가 텔레메트리 보고를 보낸다(설정에서 켰을 때).
     telemetry: TelemetryReporter,
     /// 리더가 원격 클러스터의 상태를 모은다.
@@ -264,6 +266,7 @@ impl Services {
         if let Some(updates) = self.updates {
             updates.shutdown().await;
         }
+        self.ceph.shutdown().await;
         if let Some(overlay) = self.overlay {
             overlay.shutdown(left).await;
         }
@@ -722,6 +725,11 @@ impl Member {
         runner_config.replication_bandwidth = config.replication.bandwidth();
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
+        // Ceph Task·에이전트와 API(디스크 목록, Ceph 상태)가 같은 단계들을 쓴다.
+        let ceph = Arc::new(config.ceph.host());
+        runner_config.ceph = Some(ceph.clone());
+        state.ceph = Some(ceph.clone());
+        state.ceph_status_ttl = config.ceph.status_cache();
         // 노드 비우기 Task가 이 노드의 API와 같은 확인으로 마이그레이션 Task를 만든다.
         let state = Arc::new(state);
         runner_config.api = Some(state.clone());
@@ -777,6 +785,7 @@ impl Member {
         let updates = on(&rt.work, || {
             updates.map(|u| UpdateAgent::spawn(cluster.clone(), node, u))
         });
+        let ceph = on(&rt.work, || CephAgent::spawn(cluster.clone(), node, ceph));
 
         let api_cert = config.api.tls_cert.is_none().then(|| {
             on(&rt.work, || {
@@ -876,6 +885,7 @@ impl Member {
                 firewall,
                 ha,
                 updates,
+                ceph,
                 state: services_state,
                 stop_ha_vms: None,
             }),

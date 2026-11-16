@@ -731,7 +731,12 @@ pub(super) async fn report_copy(
 
 /// 실행 중인 Task의 진행률을 쓴다(읽은 revision 확인). Task가 이미 `Running`이 아니면(다른 쪽이
 /// 끝냈다) 되살리지 않도록 쓰지 않고 거짓이다. 실패는 경고만 남긴다.
-async fn write_progress(ctx: &Ctx, task: Uuid, stage: &str, progress: MirrorProgress) -> bool {
+pub(super) async fn write_progress(
+    ctx: &Ctx,
+    task: Uuid,
+    stage: &str,
+    progress: MirrorProgress,
+) -> bool {
     let status = TaskStatus {
         state: TaskState::Running,
         error: None,

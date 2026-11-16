@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::conf::{is_managed, mon_addrv, render_keyring};
 use super::disks::{DiskContext, LSBLK_COLUMNS, classify, parse_lsblk, parse_open_vgs, parse_pvs};
 use super::json::{
-    CephVersion, ReportInput, parse_mgr_dump, parse_osd_tree, parse_pg_stat, parse_pool_ls,
+    CephVersion, ReportInput, parse_mgr_dump, parse_osd_tree, parse_pg_ls, parse_pool_ls,
     parse_quorum, parse_version, parse_volume_list, report,
 };
 use super::runner::{Cmd, CmdOutput, CommandRunner};
@@ -626,13 +626,25 @@ impl CephHost {
         Ok(())
     }
 
-    /// mon `name`이 정족수에 들 때까지 기다린다.
-    pub async fn wait_quorum(&self, name: &str) -> Result<(), CephError> {
+    /// mon `name`이 정족수에 들 때까지 기다린다. `mons`(기존 정족수의 mon 주소 — Orbivisor가 아는 것)가 있으면 그
+    /// mon들에만 묻는다(`-m`): 데몬 conf의 `mon_host`에는 이 노드의 새 mon도 있어, 다른 클러스터의 저장소로 떠 있는
+    /// 이 노드의 mon이 혼자 정족수라고 답할 수 있다.
+    pub async fn wait_quorum(&self, name: &str, mons: &[IpAddr]) -> Result<(), CephError> {
+        let host = mons
+            .iter()
+            .map(|ip| mon_addrv(*ip))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let host = host.as_str();
         self.wait_for(
             "the monitor to join the quorum",
             self.options.wait_limit,
-            async || {
-                self.ceph_json(&["quorum_status"])
+            move || async move {
+                let mut args = vec!["quorum_status"];
+                if !host.is_empty() {
+                    args.extend(["-m", host]);
+                }
+                self.ceph_json(&args)
                     .await
                     .ok()
                     .and_then(|out| parse_quorum(&out).ok())
@@ -684,7 +696,7 @@ impl CephHost {
         self.wait_for(
             "a Ceph manager to become available",
             self.options.wait_limit,
-            async || {
+            move || async move {
                 self.ceph_json(&["mgr", "stat"])
                     .await
                     .ok()
@@ -951,15 +963,16 @@ impl CephHost {
         {
             self.set_pool_size(".mgr", target as u8).await?;
         }
-        // `rbd pool init`은 풀에 쓰므로 PG가 active가 된 뒤에 부른다.
+        // `rbd pool init`은 풀에 쓰므로 PG가 active가 된 뒤에 부른다. 클러스터 전체(`pg stat`)가 아니라 이
+        // 풀의 PG를 본다 — 막 만든 풀은 mgr가 아직 몰라 전체 합계에 없을 수 있다.
         self.wait_for(
             "the placement groups to become active",
             self.options.wait_limit,
-            async || {
-                self.ceph_json(&["pg", "stat"])
+            move || async move {
+                self.ceph_json(&["pg", "ls-by-pool", pool])
                     .await
                     .ok()
-                    .and_then(|out| parse_pg_stat(&out).ok())
+                    .and_then(|out| parse_pg_ls(&out).ok())
                     .is_some_and(|(total, active)| total > 0 && active == total)
             },
         )
@@ -1125,7 +1138,7 @@ impl CephHost {
         what: &'static str,
         limit: Duration,
     ) -> Result<(), CephError> {
-        self.wait_for(what, limit, async || {
+        self.wait_for(what, limit, move || async move {
             self.runner
                 .run(&Cmd::new("systemctl", &["is-active", unit]))
                 .await
@@ -1134,12 +1147,13 @@ impl CephHost {
         .await
     }
 
-    /// `check`가 참이 될 때까지 `wait_step`마다 다시 본다. `limit`이 지나면 `Timeout(what)`이다.
-    async fn wait_for(
+    /// `check`가 참이 될 때까지 `wait_step`마다 다시 본다. `limit`이 지나면 `Timeout(what)`이다. (`AsyncFnMut`
+    /// 클로저의 future는 `tokio::spawn`이 요구하는 `Send`를 갖지 못해 future를 돌려주는 클로저를 받는다.)
+    async fn wait_for<F: Future<Output = bool>>(
         &self,
         what: &'static str,
         limit: Duration,
-        mut check: impl AsyncFnMut() -> bool,
+        mut check: impl FnMut() -> F,
     ) -> Result<(), CephError> {
         let deadline = tokio::time::Instant::now() + limit;
         loop {
@@ -1751,7 +1765,7 @@ mod tests {
                 .unwrap()
         );
         env.host.start_monitor("node1").await.unwrap();
-        env.host.wait_quorum("node1").await.unwrap();
+        env.host.wait_quorum("node1", &[]).await.unwrap();
         env.host.create_manager("node1", fsid()).await.unwrap();
         env.host.wait_manager().await.unwrap();
 
@@ -1951,12 +1965,31 @@ mod tests {
             "ceph --connect-timeout 10 quorum_status",
             CmdOutput::ok(r#"{"quorum_names":["node2"]}"#),
         );
-        let err = env.host.wait_quorum("node1").await.unwrap_err();
+        let err = env.host.wait_quorum("node1", &[]).await.unwrap_err();
         assert_eq!(
             err.to_string(),
             "timed out waiting for the monitor to join the quorum"
         );
         assert!(env.calls().len() > 1);
+    }
+
+    /// 기존 정족수에 더한 mon은 그 정족수의 mon들에만 묻는다(이 노드의 mon이 답하지 않게).
+    #[tokio::test]
+    async fn a_joining_monitor_asks_the_existing_quorum() {
+        let env = Env::new();
+        env.fake().reply(
+            "ceph --connect-timeout 10 quorum_status",
+            CmdOutput::ok(r#"{"quorum_names":["node1","node2"]}"#),
+        );
+        let mons = ["10.0.0.2".parse().unwrap(), "10.0.0.3".parse().unwrap()];
+        env.host.wait_quorum("node1", &mons).await.unwrap();
+        assert_eq!(
+            env.calls(),
+            [
+                "ceph --connect-timeout 10 quorum_status -m [v2:10.0.0.2:3300,v1:10.0.0.2:6789] \
+              [v2:10.0.0.3:3300,v1:10.0.0.3:6789] --format json"
+            ]
+        );
     }
 
     /// admin 키링이 없는 OSD 노드: admin으로 부른 `ceph`는 실패한다.
@@ -2294,14 +2327,16 @@ mod tests {
             "ceph --connect-timeout 10 osd pool ls detail",
             CmdOutput::ok(r#"[{"pool_name":".mgr","size":3},{"pool_name":"vmpool","size":1}]"#),
         );
+        // mgr가 아직 풀을 모름(빈 목록) → PG 하나가 아직 creating → 모두 active
         env.fake().reply_seq(
-            "ceph --connect-timeout 10 pg stat",
+            "ceph --connect-timeout 10 pg ls-by-pool vmpool",
             vec![
+                CmdOutput::ok(r#"{"pg_ready":true,"pg_stats":[]}"#),
                 CmdOutput::ok(
-                    r#"{"pg_summary":{"num_pg_by_state":[{"name":"creating+peering","num":32},{"name":"active+clean","num":1}],"num_pgs":33}}"#,
+                    r#"{"pg_ready":true,"pg_stats":[{"pgid":"2.0","state":"active+clean"},{"pgid":"2.1","state":"creating+peering"}]}"#,
                 ),
                 CmdOutput::ok(
-                    r#"{"pg_summary":{"num_pg_by_state":[{"name":"active+clean","num":33}],"num_pgs":33}}"#,
+                    r#"{"pg_ready":true,"pg_stats":[{"pgid":"2.0","state":"active+clean"},{"pgid":"2.1","state":"active+clean"}]}"#,
                 ),
             ],
         );
@@ -2324,8 +2359,9 @@ mod tests {
                 "ceph --connect-timeout 10 osd pool set vmpool size 1 --yes-i-really-mean-it",
                 "ceph --connect-timeout 10 osd pool ls detail --format json",
                 "ceph --connect-timeout 10 osd pool set .mgr size 1 --yes-i-really-mean-it",
-                "ceph --connect-timeout 10 pg stat --format json",
-                "ceph --connect-timeout 10 pg stat --format json",
+                "ceph --connect-timeout 10 pg ls-by-pool vmpool --format json",
+                "ceph --connect-timeout 10 pg ls-by-pool vmpool --format json",
+                "ceph --connect-timeout 10 pg ls-by-pool vmpool --format json",
                 "rbd pool init vmpool",
             ]
         );
