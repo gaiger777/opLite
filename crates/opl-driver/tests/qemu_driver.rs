@@ -620,12 +620,25 @@ async fn incremental_backup_holds_only_changed_blocks() {
         .unwrap();
     assert!(same.success(), "restored chain differs from the disk");
 
-    // 비트맵 더하기·지우기
+    // 비트맵 더하기·지우기: 백업 비트맵만 지운다. 같은 `opl-` 무리의 복제 비트맵은 남는다.
     hv.start(&vm, None).await.unwrap();
-    hv.add_bitmaps(vm.id, "opl-c").await.unwrap();
-    hv.remove_bitmaps(vm.id, Some("opl-c")).await.unwrap();
-    assert_eq!(bitmap_names(&hv, vm.id).await, [["opl-c"]]);
+    // 위의 `opl-b`는 백업 비트맵 모양(`opl-` + id)이 아니라 이름으로 지운다.
+    hv.remove_named_bitmaps(vm.id, &["opl-b".into()])
+        .await
+        .unwrap();
+    let keep = opl_types::backup::bitmap_name(Uuid::now_v7());
+    let repl = opl_types::replication::replica_bitmap(Uuid::now_v7(), Uuid::now_v7());
+    hv.add_bitmaps(vm.id, &keep).await.unwrap();
+    hv.add_bitmaps(vm.id, &repl).await.unwrap();
+    hv.remove_bitmaps(vm.id, Some(&keep)).await.unwrap();
+    let mut left = bitmap_names(&hv, vm.id).await;
+    left[0].sort();
+    let mut want = vec![keep.clone(), repl.clone()];
+    want.sort();
+    assert_eq!(left, [want]);
     hv.remove_bitmaps(vm.id, None).await.unwrap();
+    assert_eq!(bitmap_names(&hv, vm.id).await, [[repl.clone()]]);
+    hv.remove_named_bitmaps(vm.id, &[repl]).await.unwrap();
     assert_eq!(bitmap_names(&hv, vm.id).await, [Vec::<String>::new()]);
     hv.stop(vm.id, StopMode::Force).await.unwrap();
 }

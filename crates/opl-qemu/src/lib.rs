@@ -6,11 +6,13 @@ pub mod paths;
 pub mod qga;
 pub mod qmp;
 
-pub use cmdline::{CmdlineError, build_cmdline, build_incoming_cmdline};
+pub use cmdline::{
+    CmdlineError, build_cmdline, build_incoming_cmdline, build_replica_receiver_cmdline,
+};
 pub use host::{Accel, HostProfile, hotplug_caps, kvm_available};
 pub use paths::{PathError, RuntimePaths};
 pub use qmp::{
-    BitmapInfo, BlockNode, BlockStats, HotpluggableCpu, JobInfo, MigrationInfo,
+    BackupSync, BitmapInfo, BlockNode, BlockStats, HotpluggableCpu, JobInfo, MigrationInfo,
     MigrationParameters, MigrationState, NbdBlockdev, QmpClient, QmpError, QmpEvent, RunState,
     TlsEndpoint, TransactionAction,
 };

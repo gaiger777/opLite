@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_qemu::QmpError;
-use opl_types::backup::BITMAP_PREFIX;
+use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::node::NodeHotplug;
+use opl_types::replication::MIGRATION_BITMAP_PREFIX;
 use opl_types::runtime::{ImageFormat, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
 use opl_types::vm::{CpuSpec, DiskBus, RunningHardware};
 use tokio::sync::{Notify, broadcast};
@@ -22,6 +23,7 @@ use crate::migration::{
     IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress, MirrorTarget,
     format_duration,
 };
+use crate::replication::{ReceiverExport, ReplicaDiskTarget, ReplicateRequest};
 
 /// 따로 정하지 않았을 때 `qemu_version`이 돌려주는 버전
 pub const MOCK_QEMU_VERSION: &str = "8.2.2";
@@ -31,6 +33,21 @@ pub const MOCK_MIRROR_BYTES: u64 = 1 << 30;
 
 /// `incremental_backup` 호출 한 번: (VM, 앞 비트맵, 새 비트맵, 대상)
 pub type IncrementalCall = (Uuid, String, String, Vec<BackupTarget>);
+
+/// `replicate_disks`가 증분(기준 비트맵 있음) 디스크 하나마다 보낸 것으로 알리는 바이트
+pub const MOCK_INCREMENT_BYTES: u64 = 1 << 20;
+
+/// `replicate_disks` 호출 하나([`MockHypervisor::replications`]). 실패한 호출 포함
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationCall {
+    pub vm: Uuid,
+    /// 새 비트맵
+    pub bitmap: String,
+    /// 디스크마다의 대상(기준 비트맵이 있으면 증분)
+    pub targets: Vec<ReplicaDiskTarget>,
+    /// 성공했으면 보낸 바이트(전체 디스크는 [`MOCK_MIRROR_BYTES`], 증분은 [`MOCK_INCREMENT_BYTES`])
+    pub bytes: Option<u64>,
+}
 
 /// 핫플러그 호출 하나([`MockHypervisor::hotplug_calls`]). 실패한 호출 포함
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +106,10 @@ pub struct MockHypervisor {
     hotplug_reached: Notify,
     /// 멈춘 `set_vcpus`를 놓아준다
     hotplug_released: Notify,
+    /// 멈춘 `replicate_disks`가 들어왔다
+    replicate_reached: Notify,
+    /// 멈춘 `replicate_disks`를 놓아준다
+    replicate_released: Notify,
 }
 
 #[derive(Default)]
@@ -212,6 +233,18 @@ struct MockState {
     hotplug_calls: Vec<HotplugCall>,
     /// `save_hardware`로 남긴 하드웨어 기록. VM이 꺼지면 사라진다.
     saved_hardware: HashMap<Uuid, RunningHardware>,
+    /// `replicate_disks` 호출(실패 포함)
+    replications: Vec<ReplicationCall>,
+    /// 다음 `replicate_disks` 한 번을 실패시킬 오류. 새 비트맵은 만들지 않는다.
+    fail_next_replicate: Option<DriverError>,
+    /// 다음 `replicate_disks` 한 번을 `release_replicate`까지 멈춘다.
+    hold_next_replicate: bool,
+    /// 살아 있는 받는 QEMU(회차별 내보내기)
+    receivers: BTreeMap<Uuid, Vec<ReceiverExport>>,
+    /// 다음 `start_replica_receiver` 한 번을 실패시킬 오류(받는 QEMU는 남지 않는다)
+    fail_next_receiver_start: Option<DriverError>,
+    /// 다음 `finish_replica_receiver` 한 번을 실패시킬 오류(받는 QEMU는 남는다)
+    fail_next_receiver_finish: Option<DriverError>,
 }
 
 impl Default for MockHypervisor {
@@ -231,6 +264,8 @@ impl Default for MockHypervisor {
             incoming_wait_released: Notify::new(),
             hotplug_reached: Notify::new(),
             hotplug_released: Notify::new(),
+            replicate_reached: Notify::new(),
+            replicate_released: Notify::new(),
         }
     }
 }
@@ -515,6 +550,48 @@ impl MockHypervisor {
     /// `incremental_backup` 호출(실패 포함)을 순서대로 돌려준다. 대상 파일에는 아무것도 쓰지 않는다.
     pub fn incremental_backups(&self) -> Vec<IncrementalCall> {
         self.state.lock().unwrap().incrementals.clone()
+    }
+
+    /// `replicate_disks` 호출(실패 포함)을 순서대로 돌려준다.
+    pub fn replications(&self) -> Vec<ReplicationCall> {
+        self.state.lock().unwrap().replications.clone()
+    }
+
+    /// 다음 `replicate_disks` 한 번을 이 문구의 복제 오류로 실패시킨다. 실제 드라이버처럼 새 비트맵은 남지 않고
+    /// 기준 비트맵은 그대로다.
+    pub fn fail_next_replicate(&self, msg: &str) {
+        self.state.lock().unwrap().fail_next_replicate = Some(DriverError::Replication(msg.into()));
+    }
+
+    /// 다음 `replicate_disks` 한 번을 들어온 곳에서 멈춘다(`replicate_held`로 기다리고 `release_replicate`로
+    /// 놓는다).
+    pub fn hold_next_replicate(&self) {
+        self.state.lock().unwrap().hold_next_replicate = true;
+    }
+
+    /// 멈춘 `replicate_disks`가 들어올 때까지 기다린다.
+    pub async fn replicate_held(&self) {
+        self.replicate_reached.notified().await;
+    }
+
+    /// 멈춘 `replicate_disks`를 놓아준다.
+    pub fn release_replicate(&self) {
+        self.replicate_released.notify_one();
+    }
+
+    /// 살아 있는 받는 QEMU의 회차와 그 내보내기
+    pub fn receivers(&self) -> BTreeMap<Uuid, Vec<ReceiverExport>> {
+        self.state.lock().unwrap().receivers.clone()
+    }
+
+    /// 다음 `start_replica_receiver` 한 번을 이 오류로 실패시킨다.
+    pub fn fail_next_receiver_start(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_receiver_start = Some(err);
+    }
+
+    /// 다음 `finish_replica_receiver` 한 번을 이 오류로 실패시킨다. 받는 QEMU는 남는다.
+    pub fn fail_next_receiver_finish(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_receiver_finish = Some(err);
     }
 
     /// `clear_backup_leftovers`를 부른 VM(실패 포함)을 순서대로 돌려준다.
@@ -827,6 +904,7 @@ impl MockHypervisor {
                 recording: true,
                 inconsistent: false,
                 persistent: format == ImageFormat::Qcow2,
+                count: 0,
             });
         }
         Ok(())
@@ -1071,7 +1149,16 @@ impl Hypervisor for MockHypervisor {
         let mut st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
         for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
-            disk.retain(|b| !b.name.starts_with(BITMAP_PREFIX) || keep == Some(b.name.as_str()));
+            disk.retain(|b| !is_backup_bitmap(&b.name) || keep == Some(b.name.as_str()));
+        }
+        Ok(())
+    }
+
+    async fn remove_named_bitmaps(&self, id: Uuid, names: &[String]) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
+            disk.retain(|b| !names.contains(&b.name));
         }
         Ok(())
     }
@@ -1129,13 +1216,159 @@ impl Hypervisor for MockHypervisor {
         Ok(())
     }
 
-    /// 남은 증분 백업 작업은 없다. 호출을 기록하고 남은 미러를 치운다.
+    /// 남은 증분 백업 작업은 없다. 호출을 기록하고 남은 미러와 따라잡기 비트맵(`opl-mig-*`)을 치운다.
     async fn clear_backup_leftovers(&self, id: Uuid) -> Result<(), DriverError> {
         let mut st = self.state.lock().unwrap();
         st.leftover_clears.push(id);
         Self::controllable(&st, id)?;
         st.mirroring.remove(&id);
+        for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
+            disk.retain(|b| !b.name.starts_with(MIGRATION_BITMAP_PREFIX));
+        }
         Ok(())
+    }
+
+    /// 실제 QEMU처럼 증분 디스크에는 기준 비트맵이 있고 inconsistent가 아니어야 한다. 성공하면 대상 디스크마다 새
+    /// 비트맵을 만들고(기준 비트맵은 그대로) 가짜 바이트를 알린다. 받는 쪽에는 쓰지 않는다.
+    async fn replicate_disks(&self, id: Uuid, req: &ReplicateRequest) -> Result<u64, DriverError> {
+        let record = |st: &mut MockState, bytes| {
+            st.replications.push(ReplicationCall {
+                vm: id,
+                bitmap: req.bitmap.clone(),
+                targets: req.targets.clone(),
+                bytes,
+            });
+        };
+        let hold = {
+            let mut st = self.state.lock().unwrap();
+            if let Err(e) = Self::controllable(&st, id) {
+                record(&mut st, None);
+                return Err(e);
+            }
+            let disks = st.disk_formats.get(&id).map_or(0, Vec::len);
+            let mut error = req
+                .targets
+                .iter()
+                .find(|t| t.disk >= disks)
+                .map(|t| DriverError::InvalidSpec(format!("VM {id} has no disk{}", t.disk)));
+            let command = |desc: String| {
+                DriverError::Qmp(QmpError::Command {
+                    class: "GenericError".into(),
+                    desc,
+                })
+            };
+            for t in &req.targets {
+                let disk = st.bitmaps.get(&id).and_then(|d| d.get(t.disk));
+                if disk.is_some_and(|d| d.iter().any(|b| b.name == req.bitmap)) {
+                    error.get_or_insert(command(format!("Bitmap already exists: {}", req.bitmap)));
+                }
+                let Some(base) = &t.base else { continue };
+                let found = disk.and_then(|d| d.iter().find(|b| &b.name == base));
+                match found {
+                    None => {
+                        error.get_or_insert(command(format!("Bitmap '{base}' could not be found")));
+                    }
+                    Some(b) if b.inconsistent => {
+                        error.get_or_insert(command(format!(
+                            "Bitmap '{base}' is inconsistent and cannot be used"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+            if let Some(e) = error.or_else(|| st.fail_next_replicate.take()) {
+                record(&mut st, None);
+                return Err(e);
+            }
+            std::mem::take(&mut st.hold_next_replicate)
+        };
+        if hold {
+            self.replicate_reached.notify_one();
+            self.replicate_released.notified().await;
+        }
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = Self::controllable(&st, id) {
+            record(&mut st, None);
+            return Err(e);
+        }
+        let formats = st.disk_formats.get(&id).cloned().unwrap_or_default();
+        let disks = st.bitmaps.entry(id).or_default();
+        disks.resize(formats.len(), Vec::new());
+        for t in &req.targets {
+            disks[t.disk].push(BitmapInfo {
+                name: req.bitmap.clone(),
+                recording: true,
+                inconsistent: false,
+                persistent: formats[t.disk] == ImageFormat::Qcow2,
+                count: 0,
+            });
+        }
+        let bytes = req
+            .targets
+            .iter()
+            .map(|t| match t.base {
+                Some(_) => MOCK_INCREMENT_BYTES,
+                None => MOCK_MIRROR_BYTES,
+            })
+            .sum();
+        if let Some(tx) = &req.progress {
+            tx.send_replace(MirrorProgress {
+                done_bytes: bytes,
+                total_bytes: bytes,
+            });
+        }
+        record(&mut st, Some(bytes));
+        Ok(bytes)
+    }
+
+    async fn start_replica_receiver(
+        &self,
+        run: Uuid,
+        exports: &[ReceiverExport],
+        _listen_host: &str,
+        ports: RangeInclusive<u16>,
+    ) -> Result<u16, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(err) = st.fail_next_receiver_start.take() {
+            return Err(err);
+        }
+        if st.receivers.contains_key(&run) {
+            return Err(DriverError::Replication(format!(
+                "a replica receiver for run {run} is already running"
+            )));
+        }
+        st.receivers.insert(run, exports.to_vec());
+        Ok(*ports.start())
+    }
+
+    async fn finish_replica_receiver(&self, run: Uuid) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        if !st.receivers.contains_key(&run) {
+            return Err(DriverError::Replication(format!(
+                "no replica receiver for run {run} on this node"
+            )));
+        }
+        if let Some(err) = st.fail_next_receiver_finish.take() {
+            return Err(err);
+        }
+        st.receivers.remove(&run);
+        Ok(())
+    }
+
+    async fn stop_replica_receiver(&self, run: Uuid) -> Result<(), DriverError> {
+        self.state.lock().unwrap().receivers.remove(&run);
+        Ok(())
+    }
+
+    async fn replica_receivers(&self) -> Result<Vec<Uuid>, DriverError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .receivers
+            .keys()
+            .copied()
+            .collect())
     }
 
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
@@ -2106,32 +2339,198 @@ mod tests {
         assert_eq!(calls.len(), 6);
         assert_eq!(calls[1], (vm.id, "opl-a".into(), "opl-b".into(), targets()));
 
-        // opl-로 시작하는 것 중 keep만 남긴다. 다른 비트맵은 건드리지 않는다.
-        hv.set_bitmaps(
-            vm.id,
-            vec![
-                hv.bitmaps(vm.id)[0].clone(),
-                vec![BitmapInfo {
-                    name: "user".into(),
-                    recording: true,
-                    inconsistent: false,
-                    persistent: false,
-                }],
-            ],
-        );
-        hv.add_bitmaps(vm.id, "opl-c").await.unwrap();
-        hv.remove_bitmaps(vm.id, Some("opl-c")).await.unwrap();
-        assert_eq!(names(&hv, vm.id), [vec!["opl-c"], vec!["user", "opl-c"]]);
+        // 백업 비트맵 중 keep만 남긴다. 복제 비트맵과 opl이 만들지 않은 비트맵은 건드리지 않는다.
+        let old = opl_types::backup::bitmap_name(Uuid::now_v7());
+        let keep = opl_types::backup::bitmap_name(Uuid::now_v7());
+        let repl = opl_types::replication::replica_bitmap(Uuid::now_v7(), Uuid::now_v7());
+        let user = BitmapInfo {
+            name: "user".into(),
+            recording: true,
+            inconsistent: false,
+            persistent: false,
+            count: 0,
+        };
+        let mut with_old = hv.bitmaps(vm.id)[0].clone();
+        with_old[0].name = old;
+        hv.set_bitmaps(vm.id, vec![with_old, vec![user]]);
+        hv.add_bitmaps(vm.id, &keep).await.unwrap();
+        hv.add_bitmaps(vm.id, &repl).await.unwrap();
+        hv.remove_bitmaps(vm.id, Some(&keep)).await.unwrap();
+        let (k, r) = (keep.as_str(), repl.as_str());
+        assert_eq!(names(&hv, vm.id), [vec![k, r], vec!["user", k, r]]);
+        // 이름을 준 것만 지운다(없는 이름은 건너뛴다).
+        hv.remove_named_bitmaps(vm.id, &[repl.clone(), "opl-none".into()])
+            .await
+            .unwrap();
+        assert_eq!(names(&hv, vm.id), [vec![k], vec!["user", k]]);
 
         // 껐다 켜면 persistent인 것(qcow2 디스크)만 남는다.
         hv.stop(vm.id, StopMode::Force).await.unwrap();
-        assert_eq!(names(&hv, vm.id), [vec!["opl-c"], vec![]]);
+        assert_eq!(names(&hv, vm.id), [vec![k], vec![]]);
+        assert!(
+            hv.remove_named_bitmaps(vm.id, std::slice::from_ref(&keep))
+                .await
+                .is_err()
+        );
         hv.start(&vm, None).await.unwrap();
         let disks = hv.backup_bitmaps(vm.id).await.unwrap();
-        assert_eq!(disks[0].bitmaps[0].name, "opl-c");
+        assert_eq!(disks[0].bitmaps[0].name, keep);
         assert!(disks[1].bitmaps.is_empty());
         hv.crash(vm.id);
-        assert_eq!(names(&hv, vm.id), [vec!["opl-c"], vec![]]);
+        assert_eq!(names(&hv, vm.id), [vec![k], vec![]]);
+    }
+
+    fn replica_target(disk: usize, base: Option<&str>) -> ReplicaDiskTarget {
+        ReplicaDiskTarget {
+            disk,
+            host: "10.0.0.2".into(),
+            port: 60000,
+            export: format!("v{disk}"),
+            tls_hostname: "node-b".into(),
+            base: base.map(str::to_string),
+        }
+    }
+
+    fn replicate(bitmap: &str, targets: Vec<ReplicaDiskTarget>) -> ReplicateRequest {
+        ReplicateRequest {
+            targets,
+            bitmap: bitmap.into(),
+            speed: None,
+            stall: Duration::from_secs(600),
+            progress: None,
+        }
+    }
+
+    /// 복제 회차: 전체는 디스크마다 [`MOCK_MIRROR_BYTES`], 증분은 [`MOCK_INCREMENT_BYTES`]다. 새 비트맵은 대상
+    /// 디스크에만 생기고 기준 비트맵은 그대로다. 실패하면(주입, 없는 기준 비트맵) 새 비트맵이 없다.
+    #[tokio::test]
+    async fn replication_adds_its_bitmap_to_the_target_disks_only() {
+        let hv = MockHypervisor::default();
+        let vm = spec_with_disks();
+        assert!(
+            hv.replicate_disks(
+                vm.id,
+                &replicate("opl-repl-1", vec![replica_target(0, None)])
+            )
+            .await
+            .is_err()
+        );
+        hv.start(&vm, None).await.unwrap();
+
+        let (tx, rx) = tokio::sync::watch::channel(MirrorProgress::default());
+        let mut req = replicate("opl-repl-1", vec![replica_target(0, None)]);
+        req.progress = Some(tx);
+        assert_eq!(
+            hv.replicate_disks(vm.id, &req).await.unwrap(),
+            MOCK_MIRROR_BYTES
+        );
+        assert_eq!(rx.borrow().done_bytes, MOCK_MIRROR_BYTES);
+        assert_eq!(names(&hv, vm.id), [vec!["opl-repl-1"], vec![]]);
+        assert!(hv.bitmaps(vm.id)[0][0].persistent);
+
+        let req = replicate(
+            "opl-repl-2",
+            vec![
+                replica_target(0, Some("opl-repl-1")),
+                replica_target(1, None),
+            ],
+        );
+        assert_eq!(
+            hv.replicate_disks(vm.id, &req).await.unwrap(),
+            MOCK_INCREMENT_BYTES + MOCK_MIRROR_BYTES
+        );
+        assert_eq!(
+            names(&hv, vm.id),
+            [vec!["opl-repl-1", "opl-repl-2"], vec!["opl-repl-2"]]
+        );
+
+        hv.fail_next_replicate("link down");
+        let req = replicate("opl-repl-3", vec![replica_target(0, Some("opl-repl-2"))]);
+        let err = hv.replicate_disks(vm.id, &req).await.unwrap_err();
+        assert!(
+            matches!(&err, DriverError::Replication(m) if m == "link down"),
+            "{err:?}"
+        );
+        let req = replicate("opl-repl-3", vec![replica_target(1, Some("opl-repl-1"))]);
+        assert!(hv.replicate_disks(vm.id, &req).await.is_err());
+        let req = replicate("opl-repl-3", vec![replica_target(2, None)]);
+        assert!(hv.replicate_disks(vm.id, &req).await.is_err());
+        assert_eq!(
+            names(&hv, vm.id),
+            [vec!["opl-repl-1", "opl-repl-2"], vec!["opl-repl-2"]]
+        );
+        let calls = hv.replications();
+        let bytes: Vec<Option<u64>> = calls.iter().map(|c| c.bytes).collect();
+        assert_eq!(
+            bytes,
+            [
+                None,
+                Some(MOCK_MIRROR_BYTES),
+                Some(MOCK_INCREMENT_BYTES + MOCK_MIRROR_BYTES),
+                None,
+                None,
+                None
+            ]
+        );
+        assert_eq!(calls[2].targets[0].base.as_deref(), Some("opl-repl-1"));
+
+        // 멈춘 회차는 놓아줄 때 끝난다.
+        hv.hold_next_replicate();
+        let req = replicate("opl-repl-4", vec![replica_target(1, None)]);
+        let (held, ()) = tokio::join!(hv.replicate_disks(vm.id, &req), async {
+            hv.replicate_held().await;
+            assert_eq!(hv.replications().len(), 6);
+            hv.release_replicate();
+        });
+        assert_eq!(held.unwrap(), MOCK_MIRROR_BYTES);
+    }
+
+    /// 받는 QEMU: 회차마다 하나, 끝내기 실패는 받는 QEMU를 남기고, 끄기는 없어도 성공한다.
+    #[tokio::test]
+    async fn replica_receivers_are_kept_per_run() {
+        let hv = MockHypervisor::default();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let export = ReceiverExport {
+            name: "v".into(),
+            source: crate::storage::DiskLocation::Path(
+                "/p/v.qcow2".into(),
+                opl_types::runtime::DiskKind::File,
+            ),
+            format: ImageFormat::Qcow2,
+            overlay: None,
+        };
+        let exports = vec![export];
+        assert_eq!(
+            hv.start_replica_receiver(a, &exports, "10.0.0.2", 60000..=60099)
+                .await
+                .unwrap(),
+            60000
+        );
+        assert!(
+            hv.start_replica_receiver(a, &exports, "10.0.0.2", 60000..=60099)
+                .await
+                .is_err()
+        );
+        hv.fail_next_receiver_start(DriverError::StartFailed("boom".into()));
+        assert!(
+            hv.start_replica_receiver(b, &exports, "10.0.0.2", 60000..=60099)
+                .await
+                .is_err()
+        );
+        assert_eq!(hv.replica_receivers().await.unwrap(), [a]);
+        assert_eq!(hv.receivers()[&a], exports);
+
+        hv.fail_next_receiver_finish(DriverError::Timeout("QMP blockdev-del"));
+        assert!(hv.finish_replica_receiver(a).await.is_err());
+        assert_eq!(hv.replica_receivers().await.unwrap(), [a]);
+        hv.finish_replica_receiver(a).await.unwrap();
+        assert!(hv.finish_replica_receiver(a).await.is_err());
+        hv.start_replica_receiver(b, &exports, "10.0.0.2", 60000..=60099)
+            .await
+            .unwrap();
+        hv.stop_replica_receiver(b).await.unwrap();
+        hv.stop_replica_receiver(b).await.unwrap();
+        assert!(hv.replica_receivers().await.unwrap().is_empty());
     }
 
     #[tokio::test]

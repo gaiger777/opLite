@@ -10,8 +10,8 @@ use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_driver::{BackupTarget, check_pool_root, uefi_vars_path};
 use opl_types::backup::{
-    BITMAP_PREFIX, Backup, BackupDisk, BackupManifest, BackupPhase, BackupSpec, BackupStatus,
-    MANIFEST_FILE, MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, bitmap_name,
+    Backup, BackupDisk, BackupManifest, BackupPhase, BackupSpec, BackupStatus, MANIFEST_FILE,
+    MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, bitmap_name, is_backup_bitmap,
 };
 use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
@@ -228,7 +228,7 @@ async fn choose_parent(
             "no earlier backup of this VM in pool {pool:?}"
         )));
     }
-    // 디스크마다 `opl-` 비트맵이 정확히 하나이고 모두 같은 이름이어야 한다.
+    // 디스크마다 백업 비트맵이 정확히 하나이고 모두 같은 이름이어야 한다(복제 비트맵은 따로다).
     let found = ctx
         .hv
         .backup_bitmaps(vm.id)
@@ -240,7 +240,7 @@ async fn choose_parent(
         let ours: Vec<_> = disk
             .bitmaps
             .iter()
-            .filter(|b| b.name.starts_with(BITMAP_PREFIX))
+            .filter(|b| is_backup_bitmap(&b.name))
             .collect();
         if ours.is_empty() {
             return Ok(Err(format!("no dirty bitmap on {}", disk.node)));
@@ -334,7 +334,7 @@ fn increments(backup: &Backup, backups: &[Backup]) -> u32 {
 }
 
 /// 실패한 전체 백업이 실행 중인 VM에 만든 비트맵 `new`를 지운다. 앞 백업의 비트맵(모든 디스크에 같은
-/// 하나)은 남겨 다음 증분이 그대로 쓴다. 그런 것이 없으면 `opl-` 비트맵을 모두 지운다.
+/// 하나)은 남겨 다음 증분이 그대로 쓴다. 그런 것이 없으면 백업 비트맵을 모두 지운다(복제 비트맵은 남긴다).
 async fn drop_new_bitmap(ctx: &Ctx, vm: Uuid, new: &str) {
     let disks = match ctx.hv.backup_bitmaps(vm).await {
         Ok(disks) => disks,
@@ -347,7 +347,7 @@ async fn drop_new_bitmap(ctx: &Ctx, vm: Uuid, new: &str) {
         let mut names = d
             .bitmaps
             .iter()
-            .filter(|b| b.name.starts_with(BITMAP_PREFIX) && b.name != new)
+            .filter(|b| is_backup_bitmap(&b.name) && b.name != new)
             .map(|b| b.name.as_str());
         match (names.next(), names.next()) {
             (Some(name), None) => Some(name),

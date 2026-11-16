@@ -6,14 +6,17 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use opl_qemu::paths::MAX_SOCKET_PATH;
 use opl_qemu::{
-    BlockNode, HostProfile, JobInfo, MigrationInfo, MigrationParameters, MigrationState,
-    NbdBlockdev, QmpClient, QmpError, QmpEvent, RunState, RuntimePaths, TlsEndpoint,
-    TransactionAction, build_cmdline, build_incoming_cmdline,
+    BackupSync, BlockNode, HostProfile, JobInfo, MigrationInfo, MigrationParameters,
+    MigrationState, NbdBlockdev, QmpClient, QmpError, QmpEvent, RunState, RuntimePaths,
+    TlsEndpoint, TransactionAction, build_cmdline, build_incoming_cmdline,
+    build_replica_receiver_cmdline,
 };
-use opl_types::backup::BITMAP_PREFIX;
+use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::network::{tap_name, tap_prefix};
 use opl_types::node::NodeHotplug;
+use opl_types::replication::MIGRATION_BITMAP_PREFIX;
 use opl_types::runtime::{
     DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec,
 };
@@ -36,6 +39,8 @@ use crate::migration::{
     tcp_uri,
 };
 use crate::net::{HostNet, Tap};
+use crate::replication::{REPLICA_TLS_ID, ReceiverExport, ReplicateRequest};
+use crate::storage::{DiskLocation, fmt_name};
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,6 +94,29 @@ const MIRROR_JOB_PREFIX: &str = "opl-mirror-";
 const EXPORT_PREFIX: &str = "opl-export-";
 /// 켤 때의 하드웨어 기록을 남기는 실행 디렉터리의 파일([`Hypervisor::save_hardware`])
 const HARDWARE_FILE: &str = "hardware.json";
+/// 복제 회차의 작업 id(`opl-repl-{i}`)와 그 NBD 대상 노드(`opl-repl-nbd-{i}`)의 접두사(i는 디스크 순서 번호)
+const REPLICA_JOB_PREFIX: &str = "opl-repl-";
+/// 복제 회차의 NBD 대상 노드 이름의 접두사(`opl-repl-nbd-{i}`)
+const REPLICA_NBD_PREFIX: &str = "opl-repl-nbd-";
+/// 플리싱 노드 이름의 접두사: 플리싱 이미지 `opl-fl-tmp-{i}`, copy-before-write 필터 `opl-fl-cbw-{i}`, 회차 시점의
+/// 디스크를 읽는 snapshot-access `opl-fl-acc-{i}`(i는 디스크 순서 번호)
+const FLEECE_PREFIX: &str = "opl-fl-";
+/// snapshot-access 노드에 기준 비트맵을 옮겨 담는 비트맵(노드와 함께 사라진다)
+const FLEECE_BITMAP: &str = "opl-fl-base";
+/// copy-before-write 필터가 플리싱 이미지에 쓰기를 기다리는 한도(초). 넘기거나 쓰지 못하면 게스트 쓰기는 그대로
+/// 하고 회차 시점(스냅샷)만 깨져 그 회차가 실패한다.
+const CBW_TIMEOUT_SECS: u64 = 30;
+/// 플리싱 이미지를 둘 VM 상태 디렉터리의 남은 공간이 플리싱할 디스크의 가상 크기 합의 이 비율(%)보다 작으면
+/// 시작하지 않는다(회차 동안 게스트가 처음 덮어쓰는 블록만큼 자란다).
+const FLEECE_SPACE_PERCENT: u64 = 10;
+/// 받는 QEMU의 실행 디렉터리 이름의 접두사(`{run_dir}/replica-{회차}`)
+const RECEIVER_DIR_PREFIX: &str = "replica-";
+/// 받는 QEMU가 연 복제본 블록 노드 이름의 접두사(`opl-repl-{i}`, i는 내보내기 순서)
+const RECEIVER_NODE_PREFIX: &str = "opl-repl-";
+/// 받는 QEMU의 NBD 내보내기 id의 접두사(`opl-repl-export-{i}`)
+const RECEIVER_EXPORT_PREFIX: &str = "opl-repl-export-";
+/// 받는 QEMU의 블록 노드를 닫을 때 내보내기가 아직 붙들고 있으면 다시 해 보는 한도
+const RECEIVER_CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// VM별 상태 디렉터리 `{state_dir}/vm/{id}`. `state_dir`은 [`QemuConfig::state_dir`]이다.
 pub fn vm_state_dir(state_dir: &Path, id: Uuid) -> PathBuf {
@@ -127,6 +155,25 @@ pub struct QemuHypervisor {
     pausing: Mutex<HashSet<Uuid>>,
     /// 받을 포트를 고르고 QEMU가 그 포트를 열 때까지 쥔다. 동시에 받는 두 VM이 같은 포트를 고르지 않게 한다.
     incoming_ports: tokio::sync::Mutex<()>,
+    /// QMP로 붙은 복제 받는 QEMU(회차별)
+    receivers: Mutex<HashMap<Uuid, Arc<Receiver>>>,
+}
+
+/// 복제 회차 하나를 받는 QEMU(`-machine none`)
+struct Receiver {
+    qmp: QmpClient,
+    pid: u32,
+    dir: PathBuf,
+}
+
+impl Receiver {
+    fn pidfile(dir: &Path) -> PathBuf {
+        dir.join("qemu.pid")
+    }
+
+    fn qmp_socket(dir: &Path) -> PathBuf {
+        dir.join("qmp.sock")
+    }
 }
 
 /// QEMU를 띄우는 방식
@@ -164,7 +211,9 @@ impl QemuHypervisor {
             events: broadcast::channel(64).0,
             pausing: Mutex::default(),
             incoming_ports: tokio::sync::Mutex::new(()),
+            receivers: Mutex::default(),
         };
+        hv.remove_dead_receiver_dirs();
         for entry in std::fs::read_dir(&vm_run_dir)? {
             let entry = entry?;
             let Some(id) = entry
@@ -195,7 +244,13 @@ impl QemuHypervisor {
             }
             // 살아 있는 VM이므로 붙지 못해도 아무것도 지우지 않는다. 이후 start()가 다시 시도한다.
             match tokio::time::timeout(ATTACH_TIMEOUT, hv.attach(id, paths, false)).await {
-                Ok(Ok(())) => tracing::info!(%id, "reattached to running VM"),
+                Ok(Ok(())) => {
+                    tracing::info!(%id, "reattached to running VM");
+                    // 앞선 opld가 복제 회차 도중에 죽었으면 플리싱이 남아 디스크 장치를 쥐고 있다.
+                    if let Err(e) = hv.clear_left_fleecing(id).await {
+                        tracing::warn!(%id, error = %e, "cannot remove the fleecing left by an earlier run");
+                    }
+                }
                 Ok(Err(e)) => tracing::error!(%id, error = %e, "could not reattach to running VM"),
                 Err(_) => tracing::error!(%id, "timed out reattaching to running VM"),
             }
@@ -283,6 +338,8 @@ impl QemuHypervisor {
     ) -> Result<(), DriverError> {
         std::fs::create_dir_all(&paths.dir)?;
         std::fs::create_dir_all(self.state_dir(vm.id))?;
+        // 앞선 QEMU의 복제 회차가 남긴 플리싱 이미지(그 QEMU와 함께 쓸모가 없어졌다)
+        remove_fleece_files(&self.state_dir(vm.id))?;
         if vm.firmware == Firmware::Uefi && !paths.uefi_vars.exists() {
             std::fs::copy(&self.config.host.uefi_vars_template, &paths.uefi_vars)?;
         }
@@ -460,6 +517,27 @@ impl QemuHypervisor {
         }
     }
 
+    /// 플리싱을 붙이는 동안 게스트를 멈출 VM `id`([`start_fleecing`])
+    fn fleece_halt(&self, id: Uuid, handle: &VmHandle) -> FleeceHalt<'_> {
+        FleeceHalt {
+            id,
+            mark: handle.paths.dir.join(PAUSED_MARK),
+            pausing: &self.pausing,
+        }
+    }
+
+    /// 다시 붙은 VM에 앞선 opld가 남긴 플리싱(`opl-fl-*` 노드)이 있으면 그것을 읽던 복제 작업을 치우고 뗀 뒤, 남은
+    /// 플리싱 이미지 파일을 지운다.
+    async fn clear_left_fleecing(&self, id: Uuid) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        let nodes = qmp_call(qmp.query_block_nodes(), "QMP query-named-block-nodes").await?;
+        if nodes.iter().any(|n| n.node_name.starts_with(FLEECE_PREFIX)) {
+            clear_jobs(qmp, &[REPLICA_JOB_PREFIX]).await?;
+        }
+        clear_fleecing(qmp, &self.state_dir(id)).await
+    }
+
     /// opld가 `-daemonize`와 `cont` 사이에 죽으면 VM이 `-S`(prelaunch) 상태로 남는다. 스냅샷을 위해
     /// 멈춘 채([`PAUSED_MARK`]) opld가 죽었거나 이어서 실행하지 못한 VM도 멈춘 채 남는다. 둘 다 이어서
     /// 실행한다. 지금 `pause`로 멈춰 둔 VM과 QEMU가 스스로 멈춘 VM(표시 없음)은 그대로 둔다.
@@ -587,6 +665,112 @@ impl QemuHypervisor {
             migration: port,
             nbd,
         })
+    }
+
+    /// 회차 `run`을 받는 QEMU의 실행 디렉터리 `{run_dir}/replica-{run}`
+    fn receiver_dir(&self, run: Uuid) -> PathBuf {
+        self.config
+            .run_dir
+            .join(format!("{RECEIVER_DIR_PREFIX}{run}"))
+    }
+
+    /// 실행 디렉터리가 있는 받는 QEMU의 회차와 그 생존 여부
+    fn receiver_dirs(&self) -> std::io::Result<Vec<(Uuid, Liveness)>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&self.config.run_dir)? {
+            let entry = entry?;
+            let Some(run) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.strip_prefix(RECEIVER_DIR_PREFIX))
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            out.push((run, liveness(&Receiver::pidfile(&entry.path()))));
+        }
+        Ok(out)
+    }
+
+    /// 끝난 받는 QEMU가 남긴 실행 디렉터리를 지운다(opld가 받는 도중 죽었다).
+    fn remove_dead_receiver_dirs(&self) {
+        let dirs = match self.receiver_dirs() {
+            Ok(dirs) => dirs,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot list replica receiver dirs");
+                return;
+            }
+        };
+        for (run, live) in dirs {
+            if live == Liveness::Dead
+                && let Err(e) = std::fs::remove_dir_all(self.receiver_dir(run))
+            {
+                tracing::warn!(%run, error = %e, "cannot remove replica receiver dir");
+            }
+        }
+    }
+
+    /// 회차 `run`을 받는 QEMU. 붙어 있지 않으면(opld가 다시 켜짐) 살아 있는 QEMU의 QMP에 다시 붙는다.
+    async fn receiver(&self, run: Uuid) -> Result<Arc<Receiver>, DriverError> {
+        if let Some(r) = self.receivers.lock().unwrap().get(&run).cloned() {
+            return Ok(r);
+        }
+        let dir = self.receiver_dir(run);
+        if liveness(&Receiver::pidfile(&dir)) == Liveness::Dead {
+            return Err(DriverError::Replication(format!(
+                "no replica receiver for run {run} on this node"
+            )));
+        }
+        let socket = Receiver::qmp_socket(&dir);
+        let qmp = tokio::time::timeout(ATTACH_TIMEOUT, QmpClient::connect(&socket))
+            .await
+            .map_err(|_| DriverError::Timeout("QMP of the replica receiver"))??;
+        let pid = read_pid(&Receiver::pidfile(&dir))?;
+        let r = Arc::new(Receiver { qmp, pid, dir });
+        self.receivers.lock().unwrap().insert(run, r.clone());
+        Ok(r)
+    }
+
+    /// 받는 QEMU를 띄우고 QMP에 붙어 등록한 뒤 복제본을 내보낸다. 실패하면 호출자가 끈다.
+    async fn launch_receiver(
+        &self,
+        run: Uuid,
+        dir: &Path,
+        exports: &[ReceiverExport],
+        host: &str,
+        ports: RangeInclusive<u16>,
+    ) -> Result<u16, DriverError> {
+        let (qmp_socket, pidfile) = (Receiver::qmp_socket(dir), Receiver::pidfile(dir));
+        let mut cmd = tokio::process::Command::new(&self.config.host.qemu_binary);
+        cmd.args(build_replica_receiver_cmdline(&qmp_socket, &pidfile))
+            .arg("-daemonize")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        if cfg!(target_os = "macos") {
+            // VM을 띄울 때와 같은 까닭(-daemonize의 fork 뒤 Objective-C 런타임)
+            cmd.env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES");
+        }
+        let output = tokio::time::timeout(START_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| DriverError::Timeout("replica receiver QEMU to start"))??;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(DriverError::StartFailed(stderr));
+        }
+        let connect = QmpClient::connect(&qmp_socket);
+        let qmp = tokio::time::timeout(ATTACH_TIMEOUT, connect)
+            .await
+            .map_err(|_| DriverError::Timeout("QMP of the replica receiver"))??;
+        let pid = read_pid(&pidfile)?;
+        let receiver = Arc::new(Receiver {
+            qmp,
+            pid,
+            dir: dir.to_path_buf(),
+        });
+        self.receivers.lock().unwrap().insert(run, receiver.clone());
+        let tls = migration_tls_dir(&self.config.state_dir);
+        let _ports = self.incoming_ports.lock().await;
+        serve_replicas(&receiver.qmp, &tls, exports, host, ports).await
     }
 
     async fn query_state(&self, id: Uuid) -> Result<Option<ActualState>, DriverError> {
@@ -850,7 +1034,7 @@ impl Hypervisor for QemuHypervisor {
         let handle = self.running_handle(id)?;
         for disk in query_disks(&handle.qmp).await? {
             for bitmap in &disk.bitmaps {
-                if !bitmap.name.starts_with(BITMAP_PREFIX) || keep == Some(bitmap.name.as_str()) {
+                if !is_backup_bitmap(&bitmap.name) || keep == Some(bitmap.name.as_str()) {
                     continue;
                 }
                 let remove = handle
@@ -911,9 +1095,166 @@ impl Hypervisor for QemuHypervisor {
         result
     }
 
+    async fn remove_named_bitmaps(&self, id: Uuid, names: &[String]) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        remove_bitmaps_where(&handle.qmp, |name| names.iter().any(|n| n == name)).await
+    }
+
     async fn clear_backup_leftovers(&self, id: Uuid) -> Result<(), DriverError> {
         let handle = self.running_handle(id)?;
-        clear_backup_leftovers(&handle.qmp).await
+        clear_backup_leftovers(&handle.qmp).await?;
+        clear_fleecing(&handle.qmp, &self.state_dir(id)).await
+    }
+
+    async fn replicate_disks(&self, id: Uuid, req: &ReplicateRequest) -> Result<u64, DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        if req.targets.is_empty() {
+            return Err(DriverError::InvalidSpec(format!(
+                "nothing to replicate for VM {id}"
+            )));
+        }
+        // 앞선 회차가 남긴 작업과 NBD 노드(TLS 객체를 쥔다)를 먼저 치운다.
+        clear_jobs(qmp, &[REPLICA_JOB_PREFIX]).await?;
+        let fleece_dir = self.state_dir(id);
+        clear_fleecing(qmp, &fleece_dir).await?;
+        let disks = query_disks(qmp).await?;
+        if let Some(t) = req.targets.iter().find(|t| t.disk >= disks.len()) {
+            return Err(DriverError::InvalidSpec(format!(
+                "VM {id} has no disk{}",
+                t.disk
+            )));
+        }
+        let _ = tokio::time::timeout(QMP_TIMEOUT, qmp.object_del(REPLICA_TLS_ID)).await;
+        let dir = migration_tls_dir(&self.config.state_dir);
+        qmp_call(
+            qmp.add_tls_creds(REPLICA_TLS_ID, &dir, TlsEndpoint::Client),
+            "QMP object-add",
+        )
+        .await?;
+        let mut opened = Vec::new();
+        let mut fleeces = Vec::new();
+        let halt = self.fleece_halt(id, &handle);
+        let mut result = send_replicas(
+            qmp,
+            &disks,
+            req,
+            (&fleece_dir, &halt),
+            &mut opened,
+            &mut fleeces,
+        )
+        .await;
+        // 플리싱을 뗀다. 떼지 못하면 회차 실패다(남은 것은 다음 회차가 뗀다).
+        if let Err(e) = stop_fleecing(qmp, &mut fleeces).await {
+            result = result.and(Err(e));
+        }
+        // NBD 노드를 닫는다. 닫을 때 받는 쪽에 쓴 것을 내보내므로(flush) 닫지 못하면 회차 실패다.
+        for node in &opened {
+            let del = tokio::time::timeout(SNAPSHOT_TIMEOUT, qmp.blockdev_del(node)).await;
+            if let Err(e) = flatten(del, "QMP blockdev-del") {
+                tracing::warn!(%id, %node, error = %e, "cannot close replication target");
+                result = result.and(Err(e));
+            }
+        }
+        if let Err(e) = &result {
+            tracing::warn!(%id, error = %e, bitmap = %req.bitmap, "replication failed; dropping the new dirty bitmap");
+            // 새 비트맵이 없을 수 있다(transaction 전에 실패). 기준 비트맵은 그대로 둔다.
+            for t in &req.targets {
+                let remove = qmp.block_dirty_bitmap_remove(&disks[t.disk].node_name, &req.bitmap);
+                if let Err(e) = qmp_call(remove, "QMP block-dirty-bitmap-remove").await {
+                    tracing::debug!(%id, disk = t.disk, error = %e, "no new dirty bitmap to remove");
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_replica_receiver(
+        &self,
+        run: Uuid,
+        exports: &[ReceiverExport],
+        listen_host: &str,
+        ports: RangeInclusive<u16>,
+    ) -> Result<u16, DriverError> {
+        if exports.is_empty() {
+            return Err(DriverError::InvalidSpec(format!(
+                "nothing to receive for run {run}"
+            )));
+        }
+        let dir = self.receiver_dir(run);
+        let socket = Receiver::qmp_socket(&dir);
+        if socket.as_os_str().len() > MAX_SOCKET_PATH {
+            return Err(DriverError::InvalidSpec(format!(
+                "socket path {socket:?} is longer than {MAX_SOCKET_PATH} bytes"
+            )));
+        }
+        if self.receivers.lock().unwrap().contains_key(&run)
+            || liveness(&Receiver::pidfile(&dir)) != Liveness::Dead
+        {
+            return Err(DriverError::Replication(format!(
+                "a replica receiver for run {run} is already running"
+            )));
+        }
+        // pid 파일 잠금이 풀린 것(= QEMU 없음)을 보았으므로 남은 소켓은 지워도 된다.
+        std::fs::create_dir_all(&dir)?;
+        remove_if_exists(&socket)?;
+        let result = self
+            .launch_receiver(run, &dir, exports, listen_host, ports)
+            .await;
+        if let Err(e) = &result {
+            tracing::warn!(%run, error = %e, "replica receiver failed to start; stopping it");
+            if let Err(stop) = self.stop_replica_receiver(run).await {
+                tracing::error!(%run, error = %stop, "cannot stop the replica receiver");
+            }
+        }
+        result
+    }
+
+    async fn finish_replica_receiver(&self, run: Uuid) -> Result<(), DriverError> {
+        let receiver = self.receiver(run).await?;
+        close_replicas(&receiver.qmp).await?;
+        let pidfile = Receiver::pidfile(&receiver.dir);
+        if !wait_until(KILL_TIMEOUT, || liveness(&pidfile) == Liveness::Dead).await {
+            return Err(DriverError::Timeout("replica receiver QEMU to exit"));
+        }
+        self.receivers.lock().unwrap().remove(&run);
+        if let Err(e) = std::fs::remove_dir_all(&receiver.dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%run, error = %e, "cannot remove replica receiver dir");
+        }
+        Ok(())
+    }
+
+    async fn stop_replica_receiver(&self, run: Uuid) -> Result<(), DriverError> {
+        let known = self.receivers.lock().unwrap().remove(&run);
+        let dir = self.receiver_dir(run);
+        let pidfile = Receiver::pidfile(&dir);
+        if liveness(&pidfile) != Liveness::Dead {
+            let pid = match &known {
+                Some(r) => r.pid,
+                None => read_pid(&pidfile)?,
+            };
+            tracing::info!(%run, pid, "killing replica receiver QEMU");
+            kill_if_owner(&pidfile, pid);
+            if !wait_until(KILL_TIMEOUT, || liveness(&pidfile) == Liveness::Dead).await {
+                return Err(DriverError::Timeout("replica receiver QEMU to exit"));
+            }
+        }
+        drop(known);
+        match std::fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    async fn replica_receivers(&self) -> Result<Vec<Uuid>, DriverError> {
+        Ok(self
+            .receiver_dirs()?
+            .into_iter()
+            .filter(|(_, live)| *live != Liveness::Dead)
+            .map(|(run, _)| run)
+            .collect())
     }
 
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
@@ -1225,7 +1566,8 @@ impl Hypervisor for QemuHypervisor {
                     target.disk
                 )));
             };
-            // raw 이미지는 비트맵을 담을 수 없어 qcow2의 persistent 비트맵은 대상에서 사라진다.
+            // raw 이미지는 비트맵을 담을 수 없어 qcow2의 persistent 비트맵은 대상에서 사라진다(`opl-` 무리 모두 —
+            // 복제 비트맵도 덮는다).
             if disk.driver == "qcow2" && target.format == ImageFormat::Raw {
                 for bitmap in disk
                     .bitmaps
@@ -1820,7 +2162,7 @@ fn mirrored_disks(jobs: &[JobInfo]) -> Vec<usize> {
 }
 
 /// 마이그레이션에 능력 `dirty-bitmaps`가 필요한지: 이미지에 저장되지 않는 `opl-` 비트맵이 있거나, 미러하는
-/// 디스크(`mirrored`, 대상이 다른 이미지다)에 `opl-` 비트맵이 있다.
+/// 디스크(`mirrored`, 대상이 다른 이미지다)에 `opl-` 비트맵이 있다(복제 비트맵도 덮는다).
 fn migrated_bitmaps(disks: &[BlockNode], mirrored: &[usize]) -> bool {
     volatile_bitmaps(disks)
         || disks.iter().any(|d| {
@@ -2028,7 +2370,7 @@ fn volatile_bitmaps(disks: &[BlockNode]) -> bool {
         .any(|b| b.name.starts_with(BITMAP_PREFIX) && !b.persistent)
 }
 
-/// inconsistent인 `opl-` 비트맵(QEMU가 비정상으로 끝나 이미지에 in-use로 남은 것)을 지운다. 그런
+/// inconsistent인 `opl-` 비트맵(QEMU가 비정상으로 끝나 이미지에 in-use로 남은 것, 복제 비트맵도 덮는다)을 지운다. 그런
 /// 비트맵이 있으면 마이그레이션과 `block_resize`가 실패한다. 증분 백업은 이미 그 비트맵을 쓰지 않는다
 /// (다음은 전체). 실패는 경고만 남긴다.
 async fn remove_inconsistent_bitmaps(qmp: &QmpClient, id: Uuid) {
@@ -2171,9 +2513,593 @@ async fn wait_jobs(
     }
 }
 
-/// 앞선 증분 백업이 남긴 작업과 대상 노드(opld가 기다리다 죽었다)와 남은 디스크 미러를 치운다.
+/// 앞선 증분 백업이 남긴 작업과 대상 노드(opld가 기다리다 죽었다)와 남은 디스크 미러, 복제 회차의 작업과 NBD
+/// 노드를 치우고, 남은 마이그레이션 따라잡기 비트맵을 지운다.
 async fn clear_backup_leftovers(qmp: &QmpClient) -> Result<(), DriverError> {
-    clear_jobs(qmp, &[BACKUP_JOB_PREFIX, MIRROR_JOB_PREFIX]).await
+    clear_jobs(
+        qmp,
+        &[BACKUP_JOB_PREFIX, MIRROR_JOB_PREFIX, REPLICA_JOB_PREFIX],
+    )
+    .await?;
+    remove_bitmaps_where(qmp, |name| name.starts_with(MIGRATION_BITMAP_PREFIX)).await
+}
+
+/// 모든 디스크에서 이름이 `which`에 맞는 dirty bitmap을 지운다.
+async fn remove_bitmaps_where(
+    qmp: &QmpClient,
+    which: impl Fn(&str) -> bool,
+) -> Result<(), DriverError> {
+    for disk in query_disks(qmp).await? {
+        for bitmap in disk.bitmaps.iter().filter(|b| which(&b.name)) {
+            let remove = qmp.block_dirty_bitmap_remove(&disk.node_name, &bitmap.name);
+            qmp_call(remove, "QMP block-dirty-bitmap-remove").await?;
+        }
+    }
+    Ok(())
+}
+
+/// 플리싱을 붙인 디스크 하나. 붙인 단계까지 적어 두고 떼기는 그 반대 순서다.
+struct Fleece {
+    disk: usize,
+    /// 디스크 노드(`disk{i}`)
+    node: String,
+    /// 디스크 장치(`drive` 속성을 가진 qdev 경로)
+    qdev: String,
+    /// 플리싱 이미지(VM 상태 디렉터리의 성긴 파일)
+    path: PathBuf,
+    /// 플리싱 이미지 노드를 열었다.
+    tmp: bool,
+    /// copy-before-write 필터를 열었다.
+    cbw: bool,
+    /// 장치가 필터를 쓴다.
+    swapped: bool,
+    /// snapshot-access 노드를 열었다.
+    access: bool,
+}
+
+/// 플리싱을 붙이는 동안 게스트를 멈추는 VM([`QemuHypervisor::fleece_halt`]): 멈춘 동안 opld가 죽어도 다시 붙을 때
+/// 이어서 실행하게 두는 표시([`PAUSED_MARK`])와, 그동안 지금 멈춰 둔 VM으로 넣어 두는 드라이버의 `pausing`
+/// (다시 붙기·`resume_left_stopped`가 필터를 끼우는 중에 이어서 실행하지 않게)
+struct FleeceHalt<'a> {
+    id: Uuid,
+    mark: PathBuf,
+    pausing: &'a Mutex<HashSet<Uuid>>,
+}
+
+/// 디스크 `disk`의 플리싱 노드 (플리싱 이미지, copy-before-write 필터, snapshot-access)
+fn fleece_nodes(disk: usize) -> (String, String, String) {
+    (
+        format!("{FLEECE_PREFIX}tmp-{disk}"),
+        format!("{FLEECE_PREFIX}cbw-{disk}"),
+        format!("{FLEECE_PREFIX}acc-{disk}"),
+    )
+}
+
+/// 디스크 `disk`의 플리싱 이미지 파일
+fn fleece_path(dir: &Path, disk: usize) -> PathBuf {
+    dir.join(format!("fleece-{disk}.img"))
+}
+
+/// 장치에 붙은 블록 노드(`query-block`)마다 (맨 위 노드, 장치의 qdev 경로, 가상 크기)
+async fn block_devices(qmp: &QmpClient) -> Result<Vec<(String, String, u64)>, DriverError> {
+    let r = qmp_call(qmp.execute("query-block", None), "QMP query-block").await?;
+    Ok(r.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|b| {
+            let inserted = b.get("inserted")?;
+            Some((
+                inserted["node-name"].as_str()?.to_string(),
+                b["qdev"].as_str()?.to_string(),
+                inserted["image"]["virtual-size"].as_u64().unwrap_or(0),
+            ))
+        })
+        .collect())
+}
+
+/// 디스크 `indexes`에 플리싱을 붙인다(붙인 것은 `fleeces`에 적는다 — 실패해도 호출자가 [`stop_fleecing`]으로 뗀다).
+/// 디스크마다 VM 상태 디렉터리 `dir`에 디스크 크기의 성긴 플리싱 이미지를 열고, 게스트를 잠시 멈춘 채(모든 디스크가
+/// 같은 시점 — crash-consistent; `halt` — 멈춘 동안 opld가 죽어도 다시 붙을 때 이어서 실행하게 표시를 두고, 그동안
+/// 다시 붙기·이어서 실행하기가 끼어들지 않게 지금 멈춰 둔 VM으로 둔다) 새 비트맵
+/// `new`를 transaction으로 만들고 디스크 위에 copy-before-write 필터를 끼워 장치가 그 필터를 쓰게 한 뒤, 그 시점의
+/// 디스크를 읽는 snapshot-access 노드를 연다. 필터는 게스트가 덮어쓰려는 옛 블록을 먼저 로컬 플리싱 이미지에 옮기고,
+/// 옮기지 못하면(`break-snapshot`, `cbw-timeout`) 게스트 쓰기는 그대로 하고 시점만 깨 그 회차가 실패한다. 그래서 원격
+/// 쓰기(NBD)가 실패해도 게스트 쓰기는 실패하지 않는다(백업 작업이 디스크에서 바로 읽으면 그 작업이 끼우는 필터가
+/// 원격 쓰기 실패를 게스트 쓰기 오류로 돌려준다). 남은 공간이 디스크 크기 합의 [`FLEECE_SPACE_PERCENT`]%보다 적으면
+/// `error` 오류다.
+#[allow(clippy::too_many_arguments)]
+async fn start_fleecing(
+    qmp: &QmpClient,
+    disks: &[BlockNode],
+    indexes: &[usize],
+    new: &[TransactionAction],
+    dir: &Path,
+    halt: &FleeceHalt<'_>,
+    error: fn(String) -> DriverError,
+    fleeces: &mut Vec<Fleece>,
+) -> Result<(), DriverError> {
+    let devices = block_devices(qmp).await?;
+    let mut found = Vec::new();
+    for &i in indexes {
+        let node = &disks[i].node_name;
+        let Some((_, qdev, size)) = devices.iter().find(|(root, _, _)| root == node) else {
+            return Err(error(format!("disk{i} is not attached to a device")));
+        };
+        found.push((i, node.clone(), qdev.clone(), *size));
+    }
+    std::fs::create_dir_all(dir)?;
+    check_fleece_space(dir, found.iter().map(|f| f.3).sum()).map_err(error)?;
+    for (disk, node, qdev, size) in found {
+        let path = fleece_path(dir, disk);
+        // 성긴 파일이라 필터가 옮긴 블록만큼만 자란다.
+        std::fs::File::create(&path)?.set_len(size)?;
+        fleeces.push(Fleece {
+            disk,
+            node,
+            qdev,
+            path: path.clone(),
+            tmp: false,
+            cbw: false,
+            swapped: false,
+            access: false,
+        });
+        let (tmp, _, _) = fleece_nodes(disk);
+        let add = qmp.blockdev_add(json!({
+            "driver": "file", "node-name": tmp, "filename": path.display().to_string(),
+        }));
+        qmp_call(add, "QMP blockdev-add").await?;
+        if let Some(f) = fleeces.last_mut() {
+            f.tmp = true;
+        }
+    }
+    let running = qmp_call(qmp.query_status(), "QMP query-status").await? == RunState::Running;
+    if running {
+        halt.pausing.lock().unwrap().insert(halt.id);
+        let stopped = match std::fs::write(&halt.mark, b"") {
+            Ok(()) => qmp_call(qmp.stop(), "QMP stop").await,
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = stopped {
+            halt.pausing.lock().unwrap().remove(&halt.id);
+            remove_if_exists(&halt.mark)?;
+            return Err(e);
+        }
+    }
+    let inserted = insert_filters(qmp, new, fleeces).await;
+    if running {
+        let continued = qmp_call(qmp.cont(), "QMP cont").await;
+        // 이어서 실행하지 못했으면 표시가 남아 다시 붙을 때(`start`) 이어서 실행한다.
+        halt.pausing.lock().unwrap().remove(&halt.id);
+        match continued {
+            Ok(()) => remove_if_exists(&halt.mark)?,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot continue the VM after inserting the fleecing filters");
+                inserted?;
+                return Err(e);
+            }
+        }
+    }
+    inserted?;
+    for f in fleeces.iter_mut() {
+        let (_, cbw, access) = fleece_nodes(f.disk);
+        let add = qmp.blockdev_add(json!({
+            "driver": "snapshot-access", "node-name": access, "file": cbw,
+        }));
+        qmp_call(add, "QMP blockdev-add").await?;
+        f.access = true;
+    }
+    Ok(())
+}
+
+/// 디스크 크기 합이 `bytes`인 플리싱 이미지를 둘 `dir`의 남은 공간이 그 [`FLEECE_SPACE_PERCENT`]% 이상인지 본다.
+fn check_fleece_space(dir: &Path, bytes: u64) -> Result<(), String> {
+    let need = bytes / 100 * FLEECE_SPACE_PERCENT;
+    let st = rustix::fs::statvfs(dir)
+        .map_err(|e| format!("cannot read the free space of {}: {e}", dir.display()))?;
+    let available = st.f_bavail.saturating_mul(st.f_frsize);
+    if available < need {
+        return Err(format!(
+            "not enough space in {} for the fleecing images: need {need}, available {available}",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// (게스트가 멈춘 동안) 새 비트맵을 만들고 디스크마다 copy-before-write 필터를 끼워 장치가 그것을 쓰게 한다.
+async fn insert_filters(
+    qmp: &QmpClient,
+    new: &[TransactionAction],
+    fleeces: &mut [Fleece],
+) -> Result<(), DriverError> {
+    if !new.is_empty() {
+        let r = tokio::time::timeout(SNAPSHOT_TIMEOUT, qmp.transaction(new)).await;
+        flatten(r, "QMP transaction")?;
+    }
+    for f in fleeces.iter_mut() {
+        let (tmp, cbw, _) = fleece_nodes(f.disk);
+        let add = qmp.blockdev_add(json!({
+            "driver": "copy-before-write", "node-name": cbw, "file": f.node, "target": tmp,
+            "on-cbw-error": "break-snapshot", "cbw-timeout": CBW_TIMEOUT_SECS,
+        }));
+        qmp_call(add, "QMP blockdev-add").await?;
+        f.cbw = true;
+        qmp_call(qmp.qom_set(&f.qdev, "drive", json!(cbw)), "QMP qom-set").await?;
+        f.swapped = true;
+    }
+    Ok(())
+}
+
+/// [`start_fleecing`]이 붙인 것을 반대 순서로 떼고 플리싱 이미지를 지운다(그 노드를 읽던 작업은 이미 지웠다). 떼지
+/// 못한 디스크는 남기고(다음 회차나 남은 것 치우기가 [`clear_fleecing`]으로 뗀다) 먼저 생긴 오류를 돌려준다.
+async fn stop_fleecing(qmp: &QmpClient, fleeces: &mut Vec<Fleece>) -> Result<(), DriverError> {
+    let mut result = Ok(());
+    for f in fleeces.drain(..).rev() {
+        if let Err(e) = unfleece(qmp, &f).await {
+            tracing::warn!(disk = f.disk, error = %e, "cannot remove the fleecing of a disk");
+            result = result.and(Err(e));
+        }
+    }
+    result
+}
+
+async fn unfleece(qmp: &QmpClient, f: &Fleece) -> Result<(), DriverError> {
+    let (tmp, cbw, access) = fleece_nodes(f.disk);
+    if f.access {
+        qmp_call(qmp.blockdev_del(&access), "QMP blockdev-del").await?;
+    }
+    if f.swapped {
+        let back = qmp.qom_set(&f.qdev, "drive", json!(f.node));
+        qmp_call(back, "QMP qom-set").await?;
+    }
+    if f.cbw {
+        qmp_call(qmp.blockdev_del(&cbw), "QMP blockdev-del").await?;
+    }
+    if f.tmp {
+        qmp_call(qmp.blockdev_del(&tmp), "QMP blockdev-del").await?;
+    }
+    remove_if_exists(&f.path)?;
+    Ok(())
+}
+
+/// 앞선 회차가 남긴 플리싱(opld가 기다리다 죽었다)을 뗀다: 장치가 아직 필터를 쓰면 디스크 노드로 되돌리고 `opl-fl-*`
+/// 노드를 닫은 뒤 `dir`의 플리싱 이미지 파일을 지운다. 그 노드를 읽던 작업은 먼저 치웠어야 한다.
+async fn clear_fleecing(qmp: &QmpClient, dir: &Path) -> Result<(), DriverError> {
+    let nodes = qmp_call(qmp.query_block_nodes(), "QMP query-named-block-nodes").await?;
+    let left: Vec<String> = nodes
+        .into_iter()
+        .map(|n| n.node_name)
+        .filter(|n| n.starts_with(FLEECE_PREFIX))
+        .collect();
+    if !left.is_empty() {
+        tracing::warn!(nodes = ?left, "removing the fleecing left by an earlier run");
+        let filter = format!("{FLEECE_PREFIX}cbw-");
+        for (root, qdev, _) in block_devices(qmp).await? {
+            if let Some(i) = root
+                .strip_prefix(&filter)
+                .and_then(|i| i.parse::<usize>().ok())
+            {
+                let back = qmp.qom_set(&qdev, "drive", json!(format!("disk{i}")));
+                qmp_call(back, "QMP qom-set").await?;
+            }
+        }
+        for kind in ["acc-", "cbw-", "tmp-"] {
+            let prefix = format!("{FLEECE_PREFIX}{kind}");
+            for node in left.iter().filter(|n| n.starts_with(&prefix)) {
+                qmp_call(qmp.blockdev_del(node), "QMP blockdev-del").await?;
+            }
+        }
+    }
+    remove_fleece_files(dir)?;
+    Ok(())
+}
+
+/// VM 상태 디렉터리 `dir`에 남은 플리싱 이미지 파일을 지운다.
+fn remove_fleece_files(dir: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        r => r?,
+    };
+    for entry in entries {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("fleece-") && name.ends_with(".img") {
+            remove_if_exists(&dir.join(&*name))?;
+        }
+    }
+    Ok(())
+}
+
+/// 디스크 노드 `node`의 비트맵 `base`를 snapshot-access 노드 `access`의 [`FLEECE_BITMAP`]에 옮겨 담는다(회차 시점 뒤의
+/// 쓰기까지 담겨 그 시점까지 바뀐 블록의 상위 집합이다).
+async fn copy_bitmap(
+    qmp: &QmpClient,
+    node: &str,
+    base: &str,
+    access: &str,
+) -> Result<(), DriverError> {
+    let add = qmp.block_dirty_bitmap_add(access, FLEECE_BITMAP, false);
+    qmp_call(add, "QMP block-dirty-bitmap-add").await?;
+    let merge = qmp.execute(
+        "block-dirty-bitmap-merge",
+        Some(json!({
+            "node": access, "target": FLEECE_BITMAP, "bitmaps": [{ "node": node, "name": base }],
+        })),
+    );
+    qmp_call(merge, "QMP block-dirty-bitmap-merge")
+        .await
+        .map(drop)
+}
+
+/// 대상마다 NBD 노드를 열고(연 것은 `opened`에 적는다), 디스크마다 플리싱을 붙여(붙인 것은 `fleeces`에 적는다 —
+/// 그 순간이 회차의 시점이고 새 비트맵도 그때 만든다; `fleece`는 플리싱 이미지 디렉터리와 멈추는 VM) 그 시점의
+/// 디스크를 보내는 백업 작업을 transaction 하나로 시작한 뒤 작업이 모두 끝나기를 기다려 지운다. 보낸 바이트를
+/// 돌려준다.
+async fn send_replicas(
+    qmp: &QmpClient,
+    disks: &[BlockNode],
+    req: &ReplicateRequest,
+    fleece: (&Path, &FleeceHalt<'_>),
+    opened: &mut Vec<String>,
+    fleeces: &mut Vec<Fleece>,
+) -> Result<u64, DriverError> {
+    let mut actions = Vec::new();
+    let mut jobs = Vec::new();
+    for t in &req.targets {
+        let node = format!("{REPLICA_NBD_PREFIX}{}", t.disk);
+        let nbd = NbdBlockdev {
+            node_name: node.clone(),
+            host: t.host.clone(),
+            port: t.port,
+            export: t.export.clone(),
+            tls_creds: REPLICA_TLS_ID.into(),
+            tls_hostname: t.tls_hostname.clone(),
+        };
+        qmp_call(qmp.blockdev_add_nbd(&nbd), "QMP blockdev-add").await?;
+        opened.push(node);
+    }
+    let new: Vec<TransactionAction> = req
+        .targets
+        .iter()
+        .map(|t| bitmap_add(&disks[t.disk], &req.bitmap))
+        .collect();
+    let indexes: Vec<usize> = req.targets.iter().map(|t| t.disk).collect();
+    let (dir, halt) = fleece;
+    let error = DriverError::Replication;
+    start_fleecing(qmp, disks, &indexes, &new, dir, halt, error, fleeces).await?;
+    for t in &req.targets {
+        let (_, _, access) = fleece_nodes(t.disk);
+        let sync = match &t.base {
+            Some(base) => {
+                copy_bitmap(qmp, &disks[t.disk].node_name, base, &access).await?;
+                BackupSync::Bitmap(FLEECE_BITMAP.into())
+            }
+            None => BackupSync::Full,
+        };
+        let job = format!("{REPLICA_JOB_PREFIX}{}", t.disk);
+        actions.push(TransactionAction::Backup {
+            job_id: job.clone(),
+            device: access,
+            target: format!("{REPLICA_NBD_PREFIX}{}", t.disk),
+            sync,
+            speed: req.speed,
+        });
+        jobs.push(job);
+    }
+    // blockdev-backup transaction은 게스트의 진행 중인 I/O가 끝나기를 기다린다.
+    let r = tokio::time::timeout(SNAPSHOT_TIMEOUT, qmp.transaction(&actions)).await;
+    flatten(r, "QMP transaction")?;
+    let sent = wait_replication(qmp, &jobs, req).await;
+    // 작업을 모두 지운다. 회차가 실패했으면 지우기 오류보다 그 오류다(남은 작업은 다음 회차가 치운다).
+    let mut dismissed = Ok(());
+    for job in &jobs {
+        if let Err(e) = qmp_call(qmp.job_dismiss(job), "QMP job-dismiss").await {
+            tracing::warn!(%job, error = %e, "cannot dismiss replication job");
+            dismissed = dismissed.and(Err(e));
+        }
+    }
+    let sent = sent?;
+    dismissed.map(|()| sent)
+}
+
+/// 복제 작업 `ids`가 모두 끝나기를 기다리며 진행을 알리고 보낸 바이트(작업들의 `current-progress` 합)를
+/// 돌려준다. 하나라도 실패하거나 `req.stall` 동안 보낸 양이 늘지 않으면 아직 도는 나머지를 취소하고, 끝나기를
+/// [`CANCEL_WAIT`]까지 기다린 뒤 먼저 생긴 오류로 실패한다.
+async fn wait_replication(
+    qmp: &QmpClient,
+    ids: &[String],
+    req: &ReplicateRequest,
+) -> Result<u64, DriverError> {
+    // 조회와 이벤트 사이에 끝나도 놓치지 않게 먼저 구독한다.
+    let mut events = qmp.subscribe();
+    let (mut most, mut moved) = (0, tokio::time::Instant::now());
+    let mut failed: Option<DriverError> = None;
+    let mut cancelled: Option<tokio::time::Instant> = None;
+    loop {
+        let jobs = query_jobs(qmp).await?;
+        let mut progress = MirrorProgress::default();
+        let mut running = Vec::new();
+        for id in ids {
+            let Some(job) = jobs.iter().find(|j| &j.id == id) else {
+                failed.get_or_insert_with(|| {
+                    DriverError::Replication(format!("replication job {id} disappeared"))
+                });
+                continue;
+            };
+            progress.done_bytes += job.current_progress;
+            progress.total_bytes += job.total_progress;
+            if !job.is_concluded() {
+                running.push(id);
+            } else if let Some(error) = &job.error {
+                failed.get_or_insert_with(|| {
+                    DriverError::Replication(format!("replication job {id} failed: {error}"))
+                });
+            }
+        }
+        if let Some(tx) = &req.progress {
+            tx.send_if_modified(|p| std::mem::replace(p, progress) != progress);
+        }
+        if running.is_empty() {
+            return match failed {
+                Some(e) => Err(e),
+                None => Ok(progress.done_bytes),
+            };
+        }
+        let now = tokio::time::Instant::now();
+        if progress.done_bytes > most {
+            (most, moved) = (progress.done_bytes, now);
+        } else if now - moved >= req.stall {
+            failed.get_or_insert_with(|| {
+                DriverError::Replication(format!(
+                    "replication made no progress for {}",
+                    format_duration(req.stall)
+                ))
+            });
+        }
+        if let Some(e) = &failed {
+            match cancelled {
+                None => {
+                    tracing::warn!(error = %e, jobs = ?running, "cancelling replication jobs");
+                    for id in &running {
+                        if let Err(e) = qmp_call(qmp.job_cancel(id), "QMP job-cancel").await {
+                            tracing::warn!(job = %id, error = %e, "cannot cancel replication job");
+                        }
+                    }
+                    cancelled = Some(now);
+                }
+                Some(at) if now - at >= CANCEL_WAIT => return Err(failed.unwrap()),
+                Some(_) => {}
+            }
+        }
+        tokio::select! {
+            ev = events.recv() => {
+                if let Err(RecvError::Closed) = ev {
+                    return Err(QmpError::Disconnected.into());
+                }
+            }
+            _ = tokio::time::sleep(JOB_POLL) => {}
+        }
+    }
+}
+
+/// 받는 QEMU에 TLS 자격 증명(받는 쪽, 상대 인증서 확인)을 만들고, 복제본마다 블록 노드(`opl-repl-{i}`)를 연
+/// 뒤 `ports`의 빈 포트에서 TLS NBD 서버를 띄워 그 노드들을 이름 `export.name`으로 쓰기 가능하게 내보낸다.
+/// 연 포트를 돌려준다.
+async fn serve_replicas(
+    qmp: &QmpClient,
+    tls_dir: &Path,
+    exports: &[ReceiverExport],
+    host: &str,
+    ports: RangeInclusive<u16>,
+) -> Result<u16, DriverError> {
+    let add = qmp.add_tls_creds(REPLICA_TLS_ID, tls_dir, TlsEndpoint::Server);
+    qmp_call(add, "QMP object-add").await?;
+    for (i, export) in exports.iter().enumerate() {
+        let args = receiver_blockdev(&format!("{RECEIVER_NODE_PREFIX}{i}"), export)?;
+        qmp_call(qmp.blockdev_add(args), "QMP blockdev-add").await?;
+    }
+    let port = pick_port(host, ports.clone(), &[]).ok_or_else(|| {
+        DriverError::Replication(format!(
+            "no free port in {}-{} on {host}",
+            ports.start(),
+            ports.end()
+        ))
+    })?;
+    let start = qmp.nbd_server_start(host, port, REPLICA_TLS_ID);
+    qmp_call(start, "QMP nbd-server-start").await?;
+    for (i, export) in exports.iter().enumerate() {
+        let (id, node) = (
+            format!("{RECEIVER_EXPORT_PREFIX}{i}"),
+            format!("{RECEIVER_NODE_PREFIX}{i}"),
+        );
+        let add = qmp.block_export_add_nbd(&id, &node, &export.name);
+        qmp_call(add, "QMP block-export-add").await?;
+    }
+    Ok(port)
+}
+
+/// 받는 QEMU가 복제본 `export`를 여는 `blockdev-add` 인자. 겹층이 있으면 복제본을 backing으로 둔 qcow2 겹층이다.
+fn receiver_blockdev(
+    node: &str,
+    export: &ReceiverExport,
+) -> Result<serde_json::Value, DriverError> {
+    let (path, driver) = match &export.source {
+        DiskLocation::Path(path, DiskKind::File) => (path, "file"),
+        DiskLocation::Path(path, DiskKind::Block) => (path, "host_device"),
+        DiskLocation::Path(_, DiskKind::Rbd) | DiskLocation::Rbd(_) => {
+            return Err(DriverError::InvalidSpec(
+                "replicas cannot be kept in rbd pools".into(),
+            ));
+        }
+    };
+    let image = json!({
+        "driver": fmt_name(export.format),
+        "file": { "driver": driver, "filename": path.display().to_string() },
+    });
+    Ok(match &export.overlay {
+        None => {
+            let mut image = image;
+            image["node-name"] = json!(node);
+            image
+        }
+        Some(overlay) => {
+            if !overlay.is_absolute() {
+                return Err(DriverError::InvalidSpec(format!(
+                    "overlay must be an absolute path: {overlay:?}"
+                )));
+            }
+            json!({
+                "driver": "qcow2",
+                "node-name": node,
+                "file": { "driver": "file", "filename": overlay.display().to_string() },
+                "backing": image,
+            })
+        }
+    })
+}
+
+/// 받는 QEMU의 내보내기를 닫고, NBD 서버를 멈추고, 복제본 블록 노드(`opl-repl-{i}`)를 닫아(쓴 것을 이미지에
+/// 내보냄) `quit`한다.
+async fn close_replicas(qmp: &QmpClient) -> Result<(), DriverError> {
+    let nodes = qmp_call(qmp.query_block_nodes(), "QMP query-named-block-nodes").await?;
+    let mut opened: Vec<usize> = nodes
+        .iter()
+        .filter_map(|n| n.node_name.strip_prefix(RECEIVER_NODE_PREFIX)?.parse().ok())
+        .collect();
+    opened.sort();
+    // 다시 부르면 이미 닫은 내보내기와 멈춘 서버는 QEMU 오류다.
+    for i in &opened {
+        let export = format!("{RECEIVER_EXPORT_PREFIX}{i}");
+        match qmp_call(qmp.block_export_del(&export), "QMP block-export-del").await {
+            Ok(()) | Err(DriverError::Qmp(QmpError::Command { .. })) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    match qmp_call(qmp.nbd_server_stop(), "QMP nbd-server-stop").await {
+        Ok(()) | Err(DriverError::Qmp(QmpError::Command { .. })) => {}
+        Err(e) => return Err(e),
+    }
+    // 노드를 닫으면 쓴 것을 이미지에 내보낸다. 내보내기는 클라이언트가 끊긴 뒤 비동기로 사라지므로 잠시
+    // 노드를 붙들 수 있다.
+    for i in &opened {
+        close_receiver_node(qmp, &format!("{RECEIVER_NODE_PREFIX}{i}")).await?;
+    }
+    qmp_call(qmp.quit(), "QMP quit").await
+}
+
+/// 받는 QEMU의 블록 노드 `node`를 닫는다. 내보내기가 아직 붙들고 있으면 [`RECEIVER_CLOSE_WAIT`]까지 다시 해 본다.
+async fn close_receiver_node(qmp: &QmpClient, node: &str) -> Result<(), DriverError> {
+    let deadline = tokio::time::Instant::now() + RECEIVER_CLOSE_WAIT;
+    loop {
+        match qmp_call(qmp.blockdev_del(node), "QMP blockdev-del").await {
+            Err(DriverError::Qmp(QmpError::Command { .. }))
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 /// 이름이 `prefixes` 중 하나로 시작하는 작업과 블록 노드(증분 백업 `opl-backup-*`, 디스크 미러
@@ -2779,6 +3705,12 @@ time.sleep(60)
         drop_on: Arc<Mutex<Vec<&'static str>>>,
         /// 참이면 vCPU `device_del`을 QEMU 8.2 q35처럼 거절한다(게스트가 ACPI CPU 핫플러그를 켜지 않음).
         refuse_cpu_unplug: Arc<Mutex<bool>>,
+        /// 디스크 노드(`disk0`·`disk1`)에 더 드러낼 비트맵
+        extra_bitmaps: Arc<Mutex<Vec<(&'static str, serde_json::Value)>>>,
+        /// 디스크 장치 둘(`disk0-dev`·`disk1-dev`)이 쓰는 맨 위 노드(`query-block`, `qom-set … drive`가 바꾼다)
+        roots: Arc<Mutex<[String; 2]>>,
+        /// 이 이름의 명령에는 이만큼 기다린 뒤 답한다.
+        delay: Arc<Mutex<Option<(&'static str, Duration)>>>,
     }
 
     /// QEMU 대신 QMP 소켓을 여는 가짜 서버. greeting과 capabilities 협상까지 처리하고,
@@ -2818,6 +3750,12 @@ time.sleep(60)
         let dropping = drop_on.clone();
         let refuse_cpu_unplug = Arc::new(Mutex::new(false));
         let refuse_cpu = refuse_cpu_unplug.clone();
+        let extra_bitmaps = Arc::new(Mutex::new(Vec::<(&'static str, serde_json::Value)>::new()));
+        let extra = extra_bitmaps.clone();
+        let roots = Arc::new(Mutex::new(["disk0".to_string(), "disk1".to_string()]));
+        let drives = roots.clone();
+        let delay = Arc::new(Mutex::new(None::<(&'static str, Duration)>));
+        let slow = delay.clone();
         // id 있는 장치: 디스크 두 개와 NIC 하나를 가진 VM. `device_add`가 더하고 `device_del`(내려 줌)이 뺀다.
         let mut devices: Vec<String> = ["disk0-dev", "disk1-dev", "nic0"]
             .map(String::from)
@@ -2856,6 +3794,10 @@ time.sleep(60)
                     arguments.lock().unwrap().push(cmd["arguments"].clone());
                     break;
                 }
+                let wait = *slow.lock().unwrap();
+                if let Some((_, d)) = wait.filter(|(n, _)| *n == name) {
+                    tokio::time::sleep(d).await;
+                }
                 let ret = match name.as_str() {
                     "query-status" => {
                         let status = status_replies.lock().unwrap().pop_front().unwrap_or(status);
@@ -2878,9 +3820,11 @@ time.sleep(60)
                         serde_json::json!({})
                     }
                     "blockdev-add"
-                        if cmd["arguments"]["node-name"]
-                            .as_str()
-                            .is_some_and(|n| n.starts_with("disk")) =>
+                        if cmd["arguments"]["node-name"].as_str().is_some_and(|n| {
+                            n.starts_with("disk")
+                                || n.starts_with("opl-repl-")
+                                || n.starts_with("opl-fl-")
+                        }) =>
                     {
                         let node = cmd["arguments"]["node-name"].as_str().unwrap();
                         hot.lock().unwrap().push(node.to_string());
@@ -2915,9 +3859,27 @@ time.sleep(60)
                         cpus.push(slot);
                         serde_json::json!({})
                     }
+                    "qom-set" if cmd["arguments"]["property"] == "drive" => {
+                        let path = cmd["arguments"]["path"].as_str().unwrap();
+                        let i = disk_device_index(path).unwrap();
+                        drives.lock().unwrap()[i] =
+                            cmd["arguments"]["value"].as_str().unwrap().into();
+                        serde_json::json!({})
+                    }
                     "qom-set" => {
                         mem.lock().unwrap().0 = cmd["arguments"]["value"].as_u64().unwrap();
                         serde_json::json!({})
+                    }
+                    // 디스크 장치 둘(64 MiB, 1 GiB)과 매체 없는 CD-ROM
+                    "query-block" => {
+                        let root = drives.lock().unwrap().clone();
+                        serde_json::json!([
+                            { "device": "", "qdev": "/machine/peripheral/disk0-dev/virtio-backend",
+                              "inserted": { "node-name": root[0], "image": { "virtual-size": 64u64 << 20 } } },
+                            { "device": "", "qdev": "/machine/peripheral/disk1-dev",
+                              "inserted": { "node-name": root[1], "image": { "virtual-size": 1u64 << 30 } } },
+                            { "device": "", "qdev": "/machine/peripheral/cd0-dev" },
+                        ])
                     }
                     "qom-get" => {
                         let (requested, size) = *mem.lock().unwrap();
@@ -2958,6 +3920,18 @@ time.sleep(60)
                             ] },
                             { "node-name": "disk0-file", "drv": "file" },
                         ]);
+                        for (node, bitmap) in extra.lock().unwrap().iter() {
+                            let disk = nodes
+                                .as_array_mut()
+                                .unwrap()
+                                .iter_mut()
+                                .find(|n| n["node-name"] == *node)
+                                .unwrap();
+                            disk["dirty-bitmaps"]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(bitmap.clone());
+                        }
                         for node in nbd.lock().unwrap().iter() {
                             let node = serde_json::json!({ "node-name": node, "drv": "nbd" });
                             nodes.as_array_mut().unwrap().push(node);
@@ -3081,6 +4055,9 @@ time.sleep(60)
             vmem,
             drop_on,
             refuse_cpu_unplug,
+            extra_bitmaps,
+            roots,
+            delay,
         }
     }
 
@@ -4093,6 +5070,7 @@ time.sleep(60)
             recording: true,
             inconsistent: false,
             persistent,
+            count: 0,
         };
         let node = |name: &str, bitmaps: Vec<BitmapInfo>| BlockNode {
             node_name: name.into(),
@@ -4118,6 +5096,7 @@ time.sleep(60)
             recording: true,
             inconsistent: false,
             persistent: true,
+            count: 0,
         };
         let disks = [
             BlockNode {
@@ -4268,14 +5247,38 @@ time.sleep(60)
             ])
         );
 
-        // opl- 비트맵 중 keep이 아닌 것만 지운다(opl이 만들지 않은 비트맵은 그대로).
-        hv.remove_bitmaps(id, Some("opl-a")).await.unwrap();
+        // 백업 비트맵 중 keep이 아닌 것만 지운다. 같은 `opl-` 무리의 복제 비트맵과 opl이 만들지 않은 비트맵은
+        // 그대로다.
+        let (keep, old) = (
+            opl_types::backup::bitmap_name(Uuid::now_v7()),
+            opl_types::backup::bitmap_name(Uuid::now_v7()),
+        );
+        let repl = opl_types::replication::replica_bitmap(Uuid::now_v7(), Uuid::now_v7());
+        for name in [&keep, &old, &repl] {
+            let bitmap = serde_json::json!({ "name": name, "recording": true, "persistent": true });
+            fake.extra_bitmaps.lock().unwrap().push(("disk0", bitmap));
+        }
+        hv.remove_bitmaps(id, Some(&keep)).await.unwrap();
+        let removed = || sent(&fake, &["block-dirty-bitmap-remove"]);
         assert_eq!(
-            sent(&fake, &["block-dirty-bitmap-remove"]),
+            removed(),
             [(
                 "block-dirty-bitmap-remove".to_string(),
-                serde_json::json!({ "node": "disk0", "name": "opl-old" })
+                serde_json::json!({ "node": "disk0", "name": old })
             )]
+        );
+        // 이름을 준 비트맵만 디스크마다 지운다. 없는 이름은 건너뛴다.
+        hv.remove_named_bitmaps(id, &["opl-a".into(), repl.clone(), "opl-none".into()])
+            .await
+            .unwrap();
+        let args: Vec<serde_json::Value> = removed().into_iter().skip(1).map(|(_, a)| a).collect();
+        assert_eq!(
+            args,
+            [
+                serde_json::json!({ "node": "disk0", "name": "opl-a" }),
+                serde_json::json!({ "node": "disk0", "name": repl }),
+                serde_json::json!({ "node": "disk1", "name": "opl-a" }),
+            ]
         );
     }
 
@@ -4549,6 +5552,713 @@ time.sleep(60)
         let sent = sent(&fake, &["job-cancel", "job-dismiss"]);
         let names: Vec<&str> = sent.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(names, ["job-cancel", "job-dismiss"]);
+    }
+
+    fn repl_job(id: &str, status: &str, done: u64, error: Option<&str>) -> serde_json::Value {
+        let mut job = serde_json::json!({
+            "id": id, "type": "backup", "status": status,
+            "current-progress": done, "total-progress": done
+        });
+        if let Some(e) = error {
+            job["error"] = serde_json::json!(e);
+        }
+        job
+    }
+
+    /// disk0는 전체, disk1은 기준 비트맵 `opl-a` 뒤 바뀐 블록만
+    fn replicate_request(stall: Duration) -> ReplicateRequest {
+        let target = |disk: usize, base: Option<&str>| crate::replication::ReplicaDiskTarget {
+            disk,
+            host: "10.0.0.2".into(),
+            port: 60001,
+            export: format!("vol{disk}"),
+            tls_hostname: "node-b".into(),
+            base: base.map(str::to_string),
+        };
+        ReplicateRequest {
+            targets: vec![target(0, None), target(1, Some("opl-a"))],
+            bitmap: "opl-repl-new".into(),
+            speed: Some(1 << 20),
+            stall,
+            progress: None,
+        }
+    }
+
+    const REPLICATION_COMMANDS: [&str; 14] = [
+        "object-add",
+        "blockdev-add",
+        "transaction",
+        "job-cancel",
+        "job-dismiss",
+        "blockdev-del",
+        "block-dirty-bitmap-remove",
+        "query-jobs",
+        "object-del",
+        "stop",
+        "cont",
+        "qom-set",
+        "block-dirty-bitmap-add",
+        "block-dirty-bitmap-merge",
+    ];
+
+    fn names_of(sent: &[(String, serde_json::Value)]) -> Vec<&str> {
+        sent.iter().map(|(c, _)| c.as_str()).collect()
+    }
+
+    /// 복제 회차: TLS(client) → 디스크마다 NBD 노드 → 플리싱(디스크마다 성긴 플리싱 이미지를 열고, 게스트를 멈춘
+    /// 채 새 비트맵을 transaction으로 만들고 copy-before-write 필터(`break-snapshot`)를 끼워 장치가 쓰게 한 뒤 이어서
+    /// 실행, snapshot-access 노드를 열고 기준 비트맵을 그곳에 옮겨 담음) → transaction 하나(디스크마다 snapshot-access
+    /// 노드에서 blockdev-backup) → 끝을 기다림 → 작업 지우기 → 플리싱 떼기(반대 순서, 이미지 지움) → 노드 닫기. 보낸
+    /// 바이트는 작업들의 진행 합이다. 성공하면 비트맵을 지우지 않는다.
+    #[tokio::test]
+    async fn replicate_disks_sends_one_backup_per_disk_in_one_transaction() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            // 앞선 회차가 남긴 것이 없다.
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "running", 1000, None),
+                repl_job("opl-repl-1", "concluded", 65536, None)
+            ]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "concluded", 1 << 26, None),
+                repl_job("opl-repl-1", "concluded", 65536, None)
+            ]),
+        ]);
+        let (tx, rx) = tokio::sync::watch::channel(MirrorProgress::default());
+        let mut req = replicate_request(Duration::from_secs(600));
+        req.progress = Some(tx);
+        let bytes = hv.replicate_disks(id, &req).await.unwrap();
+        assert_eq!(bytes, (1 << 26) + 65536);
+        assert_eq!(rx.borrow().done_bytes, bytes);
+
+        let sent = sent(&fake, &REPLICATION_COMMANDS);
+        assert_eq!(
+            names_of(&sent),
+            [
+                "query-jobs",
+                "object-del",
+                "object-add",
+                "blockdev-add",
+                "blockdev-add",
+                "blockdev-add",
+                "blockdev-add",
+                "stop",
+                "transaction",
+                "blockdev-add",
+                "qom-set",
+                "blockdev-add",
+                "qom-set",
+                "cont",
+                "blockdev-add",
+                "blockdev-add",
+                "block-dirty-bitmap-add",
+                "block-dirty-bitmap-merge",
+                "transaction",
+                "query-jobs",
+                "query-jobs",
+                "job-dismiss",
+                "job-dismiss",
+                "blockdev-del",
+                "qom-set",
+                "blockdev-del",
+                "blockdev-del",
+                "blockdev-del",
+                "qom-set",
+                "blockdev-del",
+                "blockdev-del",
+                "blockdev-del",
+                "blockdev-del",
+            ]
+        );
+        assert_eq!(sent[1].1, serde_json::json!({ "id": "opl-repl-tls" }));
+        assert_eq!(sent[2].1["id"], "opl-repl-tls");
+        assert_eq!(sent[2].1["endpoint"], "client");
+        assert_eq!(
+            sent[4].1,
+            serde_json::json!({
+                "driver": "nbd", "node-name": "opl-repl-nbd-1",
+                "server": { "type": "inet", "host": "10.0.0.2", "port": "60001" },
+                "export": "vol1", "tls-creds": "opl-repl-tls", "tls-hostname": "node-b"
+            })
+        );
+        let fleece = tmp.path().join("state").join("vm").join(id.to_string());
+        assert_eq!(
+            sent[5].1,
+            serde_json::json!({
+                "driver": "file", "node-name": "opl-fl-tmp-0",
+                "filename": fleece.join("fleece-0.img").display().to_string()
+            })
+        );
+        assert_eq!(
+            sent[8].1["actions"],
+            serde_json::json!([
+                { "type": "block-dirty-bitmap-add",
+                  "data": { "node": "disk0", "name": "opl-repl-new", "persistent": true } },
+                { "type": "block-dirty-bitmap-add",
+                  "data": { "node": "disk1", "name": "opl-repl-new", "persistent": false } },
+            ])
+        );
+        assert_eq!(
+            sent[9].1,
+            serde_json::json!({
+                "driver": "copy-before-write", "node-name": "opl-fl-cbw-0", "file": "disk0",
+                "target": "opl-fl-tmp-0", "on-cbw-error": "break-snapshot", "cbw-timeout": 30
+            })
+        );
+        assert_eq!(
+            sent[10].1,
+            serde_json::json!({
+                "path": "/machine/peripheral/disk0-dev/virtio-backend", "property": "drive",
+                "value": "opl-fl-cbw-0"
+            })
+        );
+        assert_eq!(
+            sent[15].1,
+            serde_json::json!({
+                "driver": "snapshot-access", "node-name": "opl-fl-acc-1", "file": "opl-fl-cbw-1"
+            })
+        );
+        assert_eq!(
+            sent[16].1,
+            serde_json::json!({ "node": "opl-fl-acc-1", "name": "opl-fl-base", "persistent": false })
+        );
+        assert_eq!(
+            sent[17].1,
+            serde_json::json!({
+                "node": "opl-fl-acc-1", "target": "opl-fl-base",
+                "bitmaps": [{ "node": "disk1", "name": "opl-a" }]
+            })
+        );
+        assert_eq!(
+            sent[18].1["actions"],
+            serde_json::json!([
+                { "type": "blockdev-backup", "data": {
+                    "job-id": "opl-repl-0", "device": "opl-fl-acc-0", "target": "opl-repl-nbd-0",
+                    "sync": "full", "speed": 1048576, "auto-dismiss": false } },
+                { "type": "blockdev-backup", "data": {
+                    "job-id": "opl-repl-1", "device": "opl-fl-acc-1", "target": "opl-repl-nbd-1",
+                    "sync": "bitmap", "bitmap": "opl-fl-base", "bitmap-mode": "never",
+                    "speed": 1048576, "auto-dismiss": false } },
+            ])
+        );
+        // 플리싱은 디스크마다 snapshot-access → 장치를 디스크 노드로 되돌림 → 필터 → 이미지 순서로 뗀다.
+        let unfleeced: Vec<serde_json::Value> =
+            sent[23..31].iter().map(|(_, a)| a.clone()).collect();
+        assert_eq!(
+            unfleeced,
+            [
+                serde_json::json!({ "node-name": "opl-fl-acc-1" }),
+                serde_json::json!({
+                    "path": "/machine/peripheral/disk1-dev", "property": "drive", "value": "disk1"
+                }),
+                serde_json::json!({ "node-name": "opl-fl-cbw-1" }),
+                serde_json::json!({ "node-name": "opl-fl-tmp-1" }),
+                serde_json::json!({ "node-name": "opl-fl-acc-0" }),
+                serde_json::json!({
+                    "path": "/machine/peripheral/disk0-dev/virtio-backend", "property": "drive",
+                    "value": "disk0"
+                }),
+                serde_json::json!({ "node-name": "opl-fl-cbw-0" }),
+                serde_json::json!({ "node-name": "opl-fl-tmp-0" }),
+            ]
+        );
+        assert_eq!(
+            sent[32].1,
+            serde_json::json!({ "node-name": "opl-repl-nbd-1" })
+        );
+        assert!(fake.nbd_nodes.lock().unwrap().is_empty());
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+        assert_eq!(*fake.roots.lock().unwrap(), ["disk0", "disk1"]);
+        // 플리싱 이미지와 멈춤 표시가 남지 않는다.
+        assert!(std::fs::read_dir(&fleece).unwrap().next().is_none());
+        let run = tmp.path().join("run").join("vm").join(id.to_string());
+        assert!(!run.join(PAUSED_MARK).exists());
+    }
+
+    /// 작업 하나가 실패하면 나머지를 취소하고, 작업을 지우고, 노드를 닫은 뒤 새 비트맵만 지운다(기준 비트맵
+    /// `opl-a`는 남는다).
+    #[tokio::test]
+    async fn failed_replication_cancels_the_rest_and_drops_only_the_new_bitmap() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "running", 10, None),
+                repl_job(
+                    "opl-repl-1",
+                    "concluded",
+                    0,
+                    Some("Connection reset by peer")
+                )
+            ]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "concluded", 10, Some("Operation canceled")),
+                repl_job(
+                    "opl-repl-1",
+                    "concluded",
+                    0,
+                    Some("Connection reset by peer")
+                )
+            ]),
+        ]);
+        let err = hv
+            .replicate_disks(id, &replicate_request(Duration::from_secs(600)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DriverError::Replication(m)
+                if m == "replication job opl-repl-1 failed: Connection reset by peer"),
+            "{err:?}"
+        );
+        let sent = sent(
+            &fake,
+            &[
+                "job-cancel",
+                "job-dismiss",
+                "blockdev-del",
+                "block-dirty-bitmap-remove",
+            ],
+        );
+        // 플리싱(디스크마다 노드 셋)과 NBD 노드를 닫은 뒤 새 비트맵을 지운다.
+        let mut expected = vec!["job-cancel", "job-dismiss", "job-dismiss"];
+        expected.extend(["blockdev-del"; 8]);
+        expected.extend(["block-dirty-bitmap-remove"; 2]);
+        assert_eq!(names_of(&sent), expected);
+        assert_eq!(sent[0].1, serde_json::json!({ "id": "opl-repl-0" }));
+        assert_eq!(
+            sent[11].1,
+            serde_json::json!({ "node": "disk0", "name": "opl-repl-new" })
+        );
+        assert_eq!(
+            sent[12].1,
+            serde_json::json!({ "node": "disk1", "name": "opl-repl-new" })
+        );
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+        assert_eq!(*fake.roots.lock().unwrap(), ["disk0", "disk1"]);
+    }
+
+    /// 보낸 양이 `stall` 동안 늘지 않으면 작업을 취소하고 실패한다.
+    #[tokio::test]
+    async fn stalled_replication_is_cancelled() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "running", 0, None),
+                repl_job("opl-repl-1", "running", 0, None)
+            ]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "concluded", 0, Some("Operation canceled")),
+                repl_job("opl-repl-1", "concluded", 0, Some("Operation canceled"))
+            ]),
+        ]);
+        let err = hv
+            .replicate_disks(id, &replicate_request(Duration::ZERO))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DriverError::Replication(m) if m.starts_with("replication made no progress")),
+            "{err:?}"
+        );
+        assert_eq!(sent(&fake, &["job-cancel"]).len(), 2);
+        assert_eq!(sent(&fake, &["block-dirty-bitmap-remove"]).len(), 2);
+    }
+
+    /// 노드를 닫지 못하면(받는 쪽에 내보내지 못함, 플리싱을 떼지 못함) 작업이 성공했어도 실패다. 새 비트맵을 지운다.
+    #[tokio::test]
+    async fn replication_fails_when_a_target_cannot_be_closed() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "concluded", 5, None),
+                repl_job("opl-repl-1", "concluded", 5, None)
+            ]),
+        ]);
+        fake.failing.lock().unwrap().push("blockdev-del");
+        let err = hv
+            .replicate_disks(id, &replicate_request(Duration::from_secs(600)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DriverError::Qmp(QmpError::Command { desc, .. }) if desc == "blockdev-del failed"),
+            "{err:?}"
+        );
+        // 플리싱은 디스크마다 snapshot-access 노드에서 멈춘다(남은 것은 다음 회차가 뗀다).
+        let sent = sent(&fake, &["blockdev-del", "block-dirty-bitmap-remove"]);
+        assert_eq!(
+            names_of(&sent),
+            [
+                "blockdev-del",
+                "blockdev-del",
+                "blockdev-del",
+                "blockdev-del",
+                "block-dirty-bitmap-remove",
+                "block-dirty-bitmap-remove",
+            ]
+        );
+    }
+
+    /// 앞선 회차가 남긴 작업(opld가 기다리다 죽음)과 NBD 노드는 먼저 치운다. 백업 비트맵을 지우는 남은 것
+    /// 치우기(`clear_backup_leftovers`)도 복제 작업과 따라잡기 비트맵을 치운다.
+    #[tokio::test]
+    async fn replication_clears_what_an_earlier_run_left() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.nbd_nodes
+            .lock()
+            .unwrap()
+            .push("opl-repl-nbd-0".to_string());
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([repl_job("opl-repl-0", "running", 0, None)]),
+            serde_json::json!([repl_job(
+                "opl-repl-0",
+                "concluded",
+                0,
+                Some("Operation canceled")
+            )]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "concluded", 7, None),
+                repl_job("opl-repl-1", "concluded", 7, None)
+            ]),
+        ]);
+        assert_eq!(
+            hv.replicate_disks(id, &replicate_request(Duration::from_secs(600)))
+                .await
+                .unwrap(),
+            14
+        );
+        let sent_now = sent(
+            &fake,
+            &["job-cancel", "job-dismiss", "blockdev-del", "object-add"],
+        );
+        assert_eq!(
+            names_of(&sent_now)[..4],
+            ["job-cancel", "job-dismiss", "blockdev-del", "object-add"]
+        );
+        assert_eq!(
+            sent_now[2].1,
+            serde_json::json!({ "node-name": "opl-repl-nbd-0" })
+        );
+
+        let mig = opl_types::replication::migration_bitmap(Uuid::now_v7(), 1);
+        let bitmap = serde_json::json!({ "name": mig, "recording": true, "persistent": true });
+        fake.extra_bitmaps.lock().unwrap().push(("disk0", bitmap));
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([repl_job("opl-repl-1", "running", 0, None)]),
+            serde_json::json!([repl_job(
+                "opl-repl-1",
+                "concluded",
+                0,
+                Some("Operation canceled")
+            )]),
+        ]);
+        let before = sent(&fake, &["block-dirty-bitmap-remove"]).len();
+        hv.clear_backup_leftovers(id).await.unwrap();
+        let removed = sent(&fake, &["block-dirty-bitmap-remove"]);
+        assert_eq!(
+            removed[before..]
+                .iter()
+                .map(|(_, a)| a.clone())
+                .collect::<Vec<_>>(),
+            [serde_json::json!({ "node": "disk0", "name": mig })]
+        );
+        assert_eq!(
+            sent(&fake, &["job-cancel"]).last().unwrap().1,
+            serde_json::json!({ "id": "opl-repl-1" })
+        );
+    }
+
+    /// 앞선 회차가 남긴 플리싱(opld가 기다리다 죽음)은 먼저 뗀다: 장치를 디스크 노드로 되돌리고 snapshot-access →
+    /// 필터 → 이미지 노드를 닫고 남은 플리싱 이미지 파일을 지운다. VM을 켤 때도 남은 파일을 지운다.
+    #[tokio::test]
+    async fn replication_removes_a_fleecing_an_earlier_run_left() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.roots.lock().unwrap()[0] = "opl-fl-cbw-0".into();
+        fake.hot_nodes
+            .lock()
+            .unwrap()
+            .extend(["opl-fl-tmp-0", "opl-fl-cbw-0", "opl-fl-acc-0"].map(String::from));
+        let fleece = tmp.path().join("state").join("vm").join(id.to_string());
+        std::fs::create_dir_all(&fleece).unwrap();
+        std::fs::write(fleece.join("fleece-0.img"), b"left").unwrap();
+        std::fs::write(fleece.join("fleece-3.img"), b"left").unwrap();
+        std::fs::write(fleece.join("uefi-vars.fd"), b"vars").unwrap();
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "concluded", 7, None),
+                repl_job("opl-repl-1", "concluded", 7, None)
+            ]),
+        ]);
+        hv.replicate_disks(id, &replicate_request(Duration::from_secs(600)))
+            .await
+            .unwrap();
+        let sent = sent(&fake, &["qom-set", "blockdev-del", "object-add"]);
+        assert_eq!(
+            sent[..4].iter().map(|(_, a)| a.clone()).collect::<Vec<_>>(),
+            [
+                serde_json::json!({
+                    "path": "/machine/peripheral/disk0-dev/virtio-backend", "property": "drive",
+                    "value": "disk0"
+                }),
+                serde_json::json!({ "node-name": "opl-fl-acc-0" }),
+                serde_json::json!({ "node-name": "opl-fl-cbw-0" }),
+                serde_json::json!({ "node-name": "opl-fl-tmp-0" }),
+            ]
+        );
+        // 그다음에 이번 회차를 시작한다.
+        assert_eq!(sent[4].0, "object-add");
+        let mut left: Vec<String> = std::fs::read_dir(&fleece)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["uefi-vars.fd"]);
+        assert_eq!(*fake.roots.lock().unwrap(), ["disk0", "disk1"]);
+    }
+
+    /// opld가 회차 도중에 죽어 남은 플리싱은 다시 붙을 때 뗀다: 장치를 디스크 노드로 되돌리고 `opl-fl-*` 노드를 닫고
+    /// 남은 플리싱 이미지 파일을 지운다(다른 파일은 둔다).
+    #[tokio::test]
+    async fn reattaching_removes_a_fleecing_left_by_a_dead_opld() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp(&dir, "running").await;
+        fake.roots.lock().unwrap()[1] = "opl-fl-cbw-1".into();
+        fake.hot_nodes
+            .lock()
+            .unwrap()
+            .extend(["opl-fl-tmp-1", "opl-fl-cbw-1", "opl-fl-acc-1"].map(String::from));
+        let fleece = tmp.path().join("state").join("vm").join(vm.id.to_string());
+        std::fs::create_dir_all(&fleece).unwrap();
+        std::fs::write(fleece.join("fleece-1.img"), b"left").unwrap();
+        std::fs::write(fleece.join("uefi-vars.fd"), b"vars").unwrap();
+
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        assert!(hv.inspect(vm.id).await.unwrap().is_some());
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+        assert_eq!(*fake.roots.lock().unwrap(), ["disk0", "disk1"]);
+        let left: Vec<String> = std::fs::read_dir(&fleece)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["uefi-vars.fd"]);
+    }
+
+    /// 플리싱 필터를 끼우려고 게스트를 멈춘 동안은 지금 멈춰 둔 VM으로 둔다(그 사이 다시 붙기·`resume_left_stopped`가
+    /// 이어서 실행하지 않는다). 이어서 실행한 뒤에는 뺀다.
+    #[tokio::test]
+    async fn fleecing_holds_the_vm_as_paused_while_inserting_the_filters() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let hv = Arc::new(hv);
+        *fake.delay.lock().unwrap() = Some(("qom-set", Duration::from_millis(300)));
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-repl-0", "concluded", 7, None),
+                repl_job("opl-repl-1", "concluded", 7, None)
+            ]),
+        ]);
+        let run = tokio::spawn({
+            let hv = hv.clone();
+            async move {
+                hv.replicate_disks(id, &replicate_request(Duration::from_secs(600)))
+                    .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !fake.commands.lock().unwrap().iter().any(|c| c == "stop") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the VM was not stopped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(hv.pausing.lock().unwrap().contains(&id));
+        run.await.unwrap().unwrap();
+        assert!(!hv.pausing.lock().unwrap().contains(&id));
+        assert!(fake.commands.lock().unwrap().iter().any(|c| c == "cont"));
+    }
+
+    /// 플리싱 이미지 디렉터리의 남은 공간이 디스크 크기 합의 10%보다 적으면 회차를 시작하지 않는다.
+    #[test]
+    fn fleecing_needs_a_tenth_of_the_disks_free() {
+        let tmp = short_tempdir();
+        check_fleece_space(tmp.path(), 0).unwrap();
+        check_fleece_space(tmp.path(), 1 << 20).unwrap();
+        let err = check_fleece_space(tmp.path(), u64::MAX / 2).unwrap_err();
+        assert!(
+            err.starts_with(&format!(
+                "not enough space in {} for the fleecing images: need {}, available ",
+                tmp.path().display(),
+                u64::MAX / 2 / 100 * 10
+            )),
+            "{err}"
+        );
+    }
+
+    /// 받는 QEMU의 인자와 복제본 내보내기: TLS(server) → 디스크마다 블록 노드(겹층이면 복제본을 backing으로) →
+    /// NBD 서버 → 내보내기(이름 = 볼륨 id simple). 끝내기는 내보내기 닫기 → 서버 멈춤 → 노드 닫기 → quit.
+    #[tokio::test]
+    async fn replica_receiver_exports_replicas_and_overlays() {
+        let tmp = short_tempdir();
+        let fake = fake_qmp(tmp.path(), "prelaunch").await;
+        let qmp = QmpClient::connect(&tmp.path().join("qmp.sock"))
+            .await
+            .unwrap();
+        let exports = [
+            ReceiverExport {
+                name: "a1".into(),
+                source: DiskLocation::Path("/pools/b/a.qcow2".into(), DiskKind::File),
+                format: ImageFormat::Qcow2,
+                overlay: None,
+            },
+            ReceiverExport {
+                name: "b2".into(),
+                source: DiskLocation::Path("/dev/vg/opl-b".into(), DiskKind::Block),
+                format: ImageFormat::Raw,
+                overlay: Some("/var/lib/opl/replicas/overlays/r-b.qcow2".into()),
+            },
+        ];
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let tls = Path::new("/state/migration-tls");
+        assert_eq!(
+            serve_replicas(&qmp, tls, &exports, "127.0.0.1", port..=port)
+                .await
+                .unwrap(),
+            port
+        );
+        let names = [
+            "object-add",
+            "blockdev-add",
+            "nbd-server-start",
+            "block-export-add",
+        ];
+        let got = sent(&fake, &names);
+        assert_eq!(
+            names_of(&got),
+            [
+                "object-add",
+                "blockdev-add",
+                "blockdev-add",
+                "nbd-server-start",
+                "block-export-add",
+                "block-export-add",
+            ]
+        );
+        assert_eq!(got[0].1["id"], "opl-repl-tls");
+        assert_eq!(got[0].1["endpoint"], "server");
+        assert_eq!(got[0].1["verify-peer"], true);
+        assert_eq!(
+            got[1].1,
+            serde_json::json!({
+                "driver": "qcow2", "node-name": "opl-repl-0",
+                "file": { "driver": "file", "filename": "/pools/b/a.qcow2" }
+            })
+        );
+        assert_eq!(
+            got[2].1,
+            serde_json::json!({
+                "driver": "qcow2", "node-name": "opl-repl-1",
+                "file": { "driver": "file",
+                          "filename": "/var/lib/opl/replicas/overlays/r-b.qcow2" },
+                "backing": { "driver": "raw",
+                             "file": { "driver": "host_device", "filename": "/dev/vg/opl-b" } }
+            })
+        );
+        assert_eq!(got[3].1["tls-creds"], "opl-repl-tls");
+        assert_eq!(
+            got[5].1,
+            serde_json::json!({
+                "type": "nbd", "id": "opl-repl-export-1", "node-name": "opl-repl-1",
+                "name": "b2", "writable": true
+            })
+        );
+        // 겹층은 절대 경로여야 하고, RBD 풀에는 복제본을 두지 않는다.
+        let relative = ReceiverExport {
+            overlay: Some("overlay.qcow2".into()),
+            ..exports[1].clone()
+        };
+        assert!(matches!(
+            receiver_blockdev("n", &relative),
+            Err(DriverError::InvalidSpec(_))
+        ));
+
+        close_replicas(&qmp).await.unwrap();
+        let names = [
+            "block-export-del",
+            "nbd-server-stop",
+            "blockdev-del",
+            "quit",
+        ];
+        let got = sent(&fake, &names);
+        assert_eq!(
+            names_of(&got),
+            [
+                "block-export-del",
+                "block-export-del",
+                "nbd-server-stop",
+                "blockdev-del",
+                "blockdev-del",
+                "quit",
+            ]
+        );
+        assert_eq!(
+            got[0].1,
+            serde_json::json!({ "id": "opl-repl-export-0", "mode": "hard" })
+        );
+        assert_eq!(got[4].1, serde_json::json!({ "node-name": "opl-repl-1" }));
+    }
+
+    /// 받는 QEMU가 없는 회차는 끝낼 수 없고, 끄기는 성공한다. 끝난 받는 QEMU의 실행 디렉터리는 다시 켤 때 지운다.
+    #[tokio::test]
+    async fn replica_receivers_are_found_by_their_pid_files() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let (live, dead) = (Uuid::now_v7(), Uuid::now_v7());
+        let live_dir = cfg.run_dir.join(format!("replica-{live}"));
+        let _qemu = hold_pidfile(&live_dir).await;
+        let dead_dir = cfg.run_dir.join(format!("replica-{dead}"));
+        std::fs::create_dir_all(&dead_dir).unwrap();
+        std::fs::write(dead_dir.join("qemu.pid"), b"4242\n").unwrap();
+        std::fs::create_dir_all(cfg.run_dir.join("replica-not-a-uuid")).unwrap();
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        assert!(!dead_dir.exists());
+        assert_eq!(hv.replica_receivers().await.unwrap(), [live]);
+        assert!(matches!(
+            hv.finish_replica_receiver(dead).await,
+            Err(DriverError::Replication(_))
+        ));
+        // 같은 회차를 다시 받을 수 없다.
+        let export = ReceiverExport {
+            name: "a".into(),
+            source: DiskLocation::Path("/p/a.raw".into(), DiskKind::File),
+            format: ImageFormat::Raw,
+            overlay: None,
+        };
+        assert!(matches!(
+            hv.start_replica_receiver(live, &[export], "127.0.0.1", 60000..=60000)
+                .await,
+            Err(DriverError::Replication(_))
+        ));
+        hv.stop_replica_receiver(dead).await.unwrap();
+        // 살아 있는 받는 QEMU는 SIGKILL로 끄고 디렉터리를 지운다.
+        hv.stop_replica_receiver(live).await.unwrap();
+        assert!(!live_dir.exists());
+        assert!(hv.replica_receivers().await.unwrap().is_empty());
     }
 
     /// 실행 중인데 지금 멈춰 두지 않은 VM의 표시는 남은 것이다(이어서 실행했지만 지우지 못함, 누가

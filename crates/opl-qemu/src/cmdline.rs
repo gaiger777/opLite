@@ -277,6 +277,28 @@ pub fn build_incoming_cmdline(
     Ok(args)
 }
 
+/// 복제본을 받는 QEMU의 인자. 게스트 장치 없이(`-machine none`) 멈춘 채(`-S`) QMP만 연다. 복제본 블록 노드와
+/// NBD 서버는 QMP로 만든다.
+pub fn build_replica_receiver_cmdline(qmp_socket: &Path, pidfile: &Path) -> Vec<String> {
+    [
+        "-machine",
+        "none",
+        "-nodefaults",
+        "-display",
+        "none",
+        "-S",
+        "-qmp",
+    ]
+    .map(String::from)
+    .into_iter()
+    .chain([
+        format!("unix:{},server=on,wait=off", esc_path(qmp_socket)),
+        "-pidfile".into(),
+        pidfile.display().to_string(),
+    ])
+    .collect()
+}
+
 /// 실행 중 붙인 장치(순번이 켤 때 수 이상)의 루트 포트 버스 옵션. 켤 때 단 장치는 `pcie.0`이라 빈 문자열이다.
 /// 포트가 있는지는 [`check_compat`]이 먼저 본다.
 fn hot_bus(ports: Option<(u8, &[u8])>, i: usize) -> String {
@@ -389,6 +411,29 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn replica_receiver_has_no_guest_devices() {
+        let args = build_replica_receiver_cmdline(
+            Path::new("/run/opl/replica-x,y/qmp.sock"),
+            Path::new("/run/opl/replica-x,y/qemu.pid"),
+        );
+        assert_eq!(
+            args,
+            [
+                "-machine",
+                "none",
+                "-nodefaults",
+                "-display",
+                "none",
+                "-S",
+                "-qmp",
+                "unix:/run/opl/replica-x,,y/qmp.sock,server=on,wait=off",
+                "-pidfile",
+                "/run/opl/replica-x,y/qemu.pid",
+            ]
+        );
+    }
 
     fn x86_host() -> HostProfile {
         HostProfile {

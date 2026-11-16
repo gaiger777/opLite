@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use opl_types::backup::BITMAP_PREFIX;
+use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::runtime::{DiskKind, ImageFormat, RbdTarget};
 use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
 use serde_json::Value;
@@ -340,9 +340,10 @@ pub trait Storage: Send + Sync {
         ))
     }
 
-    /// 꺼진 볼륨에 증분 백업의 dirty bitmap `name`(지금부터 바뀐 블록)만 남긴다: 이름이 `opl-`로
-    /// 시작하는 다른 비트맵을 지우고 `name`을 새로 만든다. raw 볼륨은 비트맵을 담을 수 없으므로 아무것도
-    /// 하지 않는다. 기본은 raw만 받는다.
+    /// 꺼진 볼륨에 증분 백업의 dirty bitmap `name`(지금부터 바뀐 블록)만 남긴다: 다른 백업 비트맵
+    /// ([`opl_types::backup::is_backup_bitmap`])을 지우고 `name`을 새로 만든다. 복제 비트맵(`opl-repl-…`)은
+    /// 남긴다(꺼진 동안 쓴 것은 백업만 아니라 복제 비트맵도 기록한다). raw 볼륨은 비트맵을 담을 수 없으므로
+    /// 아무것도 하지 않는다. 기본은 raw만 받는다.
     async fn set_backup_bitmap(
         &self,
         _pool: &StoragePool,
@@ -358,8 +359,8 @@ pub trait Storage: Send + Sync {
         }
     }
 
-    /// 꺼진 볼륨에서 이름이 `opl-`로 시작하는 dirty bitmap을 모두 지운다. 스냅샷으로 되돌리기 전에
-    /// 부른다: 되돌린 디스크의 비트맵은 맞지 않고, 비트맵이 있으면 qcow2의 내부 스냅샷으로 되돌릴 수
+    /// 꺼진 볼륨에서 이름이 `opl-`로 시작하는 dirty bitmap(복제·마이그레이션 비트맵도 덮는다)을 모두 지운다.
+    /// 스냅샷으로 되돌리기 전에 부른다: 되돌린 디스크의 비트맵은 맞지 않고, 비트맵이 있으면 qcow2의 내부 스냅샷으로 되돌릴 수
     /// 없다(`Device has active dirty bitmaps`). raw 볼륨은 아무것도 하지 않는다. 기본은 raw만 받는다.
     async fn drop_backup_bitmaps(
         &self,
@@ -373,6 +374,35 @@ pub trait Storage: Send + Sync {
                 "this storage cannot keep dirty bitmaps".into(),
             )),
         }
+    }
+
+    /// 노드 로컬 풀의 볼륨(복제본)을 backing으로 둔 빈 qcow2 겹층 `overlay`(절대 경로)를 만든다(있으면
+    /// 덮어쓴다). 복제의 증분 회차가 복제본 대신 겹층에 쓴다. 공유 풀은 오류다. 기본은 지원하지 않는다.
+    async fn create_overlay(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _format: ImageFormat,
+        _overlay: &Path,
+    ) -> Result<(), DriverError> {
+        Err(DriverError::InvalidSpec(
+            "this storage cannot keep replica overlays".into(),
+        ))
+    }
+
+    /// [`create_overlay`](Self::create_overlay)로 만든 겹층 `overlay`를 볼륨에 합치고(`qemu-img commit`) 겹층을
+    /// 지운다. 겹층이 없으면(이미 합치고 지웠다) 아무것도 하지 않는다. 합치다 끊겨도 겹층이 남으므로 다시 하면 같아진다.
+    /// 볼륨을 쓰는 QEMU가 없어야 한다. 기본은 지원하지 않는다.
+    async fn commit_overlay(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _format: ImageFormat,
+        _overlay: &Path,
+    ) -> Result<(), DriverError> {
+        Err(DriverError::InvalidSpec(
+            "this storage cannot keep replica overlays".into(),
+        ))
     }
 }
 
@@ -762,7 +792,8 @@ impl DirStorage {
         Ok(())
     }
 
-    /// 이름이 `opl-`로 시작하는 dirty bitmap을 모두 지운다.
+    /// 이름이 `opl-`로 시작하는 dirty bitmap을 모두 지운다(백업 비트맵만 아니라 복제·마이그레이션 비트맵도 덮는다
+    /// — 스냅샷 되돌리기·오프라인 크기 바꾸기처럼 QEMU 밖에서 디스크가 바뀌면 복제도 다음은 전체여야 한다).
     async fn remove_backup_bitmaps(
         &self,
         path: &Path,
@@ -983,7 +1014,7 @@ fn require_absolute(p: &Path) -> Result<(), DriverError> {
     }
 }
 
-fn fmt_name(format: ImageFormat) -> &'static str {
+pub(crate) fn fmt_name(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Qcow2 => "qcow2",
         ImageFormat::Raw => "raw",
@@ -1414,8 +1445,12 @@ impl Storage for DirStorage {
             return Ok(());
         }
         let path = self.existing_path(pool, id, format).await?;
-        // 같은 이름이 남아 있어도(다시 시도) 지운 뒤 새로 만든다.
-        self.remove_backup_bitmaps(&path, format).await?;
+        // 다른 백업 비트맵만 지운다. 같은 이름이 남아 있어도(다시 시도) 지운 뒤 새로 만든다.
+        for other in self.bitmaps_at(&path, format).await? {
+            if is_backup_bitmap(&other) || other == name {
+                self.bitmap_op(&path, format, "--remove", &other).await?;
+            }
+        }
         self.bitmap_op(&path, format, "--add", name).await
     }
 

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::error::DriverError;
 use crate::migration::{IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions, MirrorTarget};
+use crate::replication::{ReceiverExport, ReplicateRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopMode {
@@ -163,9 +164,12 @@ pub trait Hypervisor: Send + Sync {
     /// VM을 멈춘 동안 블록 풀 스냅샷과 같은 시점을 잡는 데 쓴다.
     async fn add_bitmaps(&self, id: Uuid, name: &str) -> Result<(), DriverError>;
 
-    /// 실행 중인 VM의 모든 디스크에서 이름이 `opl-`로 시작하는 dirty bitmap 중 `keep`이 아닌 것을
-    /// 모두 지운다.
+    /// 실행 중인 VM의 모든 디스크에서 백업 비트맵([`opl_types::backup::is_backup_bitmap`]) 중 `keep`이 아닌 것을
+    /// 모두 지운다. 같은 `opl-` 무리의 복제·마이그레이션 비트맵은 남긴다.
     async fn remove_bitmaps(&self, id: Uuid, keep: Option<&str>) -> Result<(), DriverError>;
+
+    /// 실행 중인 VM의 모든 디스크에서 이름이 `names`에 든 dirty bitmap을 지운다. 없는 것은 건너뛴다.
+    async fn remove_named_bitmaps(&self, id: Uuid, names: &[String]) -> Result<(), DriverError>;
 
     /// 실행 중인 VM의 디스크마다 비트맵 `parent` 뒤에 바뀐 블록만 `targets`(디스크 순서)에 압축해
     /// 쓴다. 쓰기 시작하는 시점에 모든 디스크에 새 비트맵 `new`를 만든다(transaction 하나). 작업이
@@ -181,9 +185,48 @@ pub trait Hypervisor: Send + Sync {
     ) -> Result<(), DriverError>;
 
     /// 실행 중인 VM에 앞선 증분 백업이 남긴 작업과 대상 노드(`opl-backup-*`, opld가 기다리다 죽었다)와
-    /// 남은 디스크 미러(`opl-mirror-*`)를 치운다. 아직 도는 작업은 취소하고 잠시 기다린다(끝나지 않으면
-    /// 오류). 남은 작업이 있으면 디스크의 내부 스냅샷이 실패한다.
+    /// 남은 디스크 미러(`opl-mirror-*`), 복제 회차의 작업과 NBD 노드(`opl-repl-*`)를 치우고, 남은 마이그레이션
+    /// 따라잡기 비트맵(`opl-mig-*`)을 지운다. 아직 도는 작업은 취소하고 잠시 기다린다(끝나지 않으면 오류). 남은
+    /// 작업이 있으면 디스크의 내부 스냅샷이 실패한다. 복제 회차가 남긴 플리싱(`opl-fl-*` 노드와 VM 상태 디렉터리의
+    /// 플리싱 이미지)도 뗀다.
     async fn clear_backup_leftovers(&self, id: Uuid) -> Result<(), DriverError>;
+
+    /// 실행 중인 VM의 디스크들을 `req.targets`(받는 QEMU의 NBD 내보내기)에 한 시점으로 복제하고 보낸 바이트를
+    /// 돌려준다. 앞선 회차가 남긴 작업과 NBD 노드(`opl-repl-*`)와 플리싱을 먼저 치우고, TLS 자격 증명(보내는 쪽,
+    /// 상대 인증서 확인)을 만든 뒤 대상마다 NBD 노드를 연다. 그다음 대상 디스크마다 플리싱을 붙인다: VM 상태
+    /// 디렉터리의 성긴 플리싱 이미지(남은 공간이 디스크 크기 합의 10% 이상이어야), 게스트를 잠시 멈춘 채 새 비트맵
+    /// `req.bitmap`(qcow2면 persistent)을 만들고 디스크 위에 copy-before-write 필터(`on-cbw-error: break-snapshot`)를
+    /// 끼운 뒤, 그 시점의 디스크를 읽는 snapshot-access 노드에서 `blockdev-backup`(기준 비트맵이 있으면 그 뒤 바뀐
+    /// 블록만, 없으면 전체)을 시작한다 — 받는 쪽이 사라져 원격 쓰기가 실패해도 게스트 쓰기는 성공하고 회차만
+    /// 실패한다. 모두 끝나면 작업을 지우고 플리싱을 떼고(이미지 지움) NBD 노드를 닫는다(닫을 때 받는 쪽에 쓴 것을
+    /// 내보내므로, 닫지 못하면 실패). 작업이 실패하거나 `req.stall` 동안 보낸 양이 늘지 않으면 나머지를 취소하고,
+    /// 플리싱을 떼고, 노드를 닫고, 새 비트맵을 지워 실패한다. 기준 비트맵은 성공해도 실패해도 지우지 않는다(호출자가
+    /// 고른다).
+    async fn replicate_disks(&self, id: Uuid, req: &ReplicateRequest) -> Result<u64, DriverError>;
+
+    /// 복제 회차 `run`을 받을 QEMU를 게스트 장치 없이(`-machine none`, opld의 자식, 실행 디렉터리
+    /// `{run_dir}/replica-{run}`의 pid 파일) 띄우고, `exports`마다 블록 노드(겹층이 있으면 복제본을 backing으로 둔
+    /// 겹층)를 열어 `ports`에서 고른 빈 포트의 TLS NBD 서버(받는 쪽, 상대 인증서 확인)에 쓰기 가능하게 내보낸다.
+    /// 연 포트를 돌려준다. 실패하면 띄운 QEMU를 끄고 실행 디렉터리를 지운다. 같은 회차의 받는 QEMU가 이미 살아
+    /// 있으면 실패한다.
+    async fn start_replica_receiver(
+        &self,
+        run: Uuid,
+        exports: &[ReceiverExport],
+        listen_host: &str,
+        ports: RangeInclusive<u16>,
+    ) -> Result<u16, DriverError>;
+
+    /// 회차 `run`의 받는 QEMU를 끝낸다: 내보내기를 닫고, NBD 서버를 멈추고, 블록 노드를 닫아(쓴 것을 내보냄)
+    /// `quit`한 뒤 끝나기를 기다린다. 하나라도 실패하면 오류다(받는 QEMU는 남을 수 있다 —
+    /// [`stop_replica_receiver`](Self::stop_replica_receiver)로 끈다). 받는 QEMU가 없으면 오류다.
+    async fn finish_replica_receiver(&self, run: Uuid) -> Result<(), DriverError>;
+
+    /// 회차 `run`의 받는 QEMU를 SIGKILL로 끄고 실행 디렉터리를 지운다(회차를 버린다). 없으면 성공이다.
+    async fn stop_replica_receiver(&self, run: Uuid) -> Result<(), DriverError>;
+
+    /// 살아 있는 받는 QEMU의 회차들(실행 디렉터리의 pid 파일로). 끝난 회차의 받는 QEMU를 찾아 끄는 데 쓴다.
+    async fn replica_receivers(&self) -> Result<Vec<Uuid>, DriverError>;
 
     /// 실행 중인 VM의 모든 디스크에서 내부 스냅샷 `tag`를 지운다. 태그가 없어도 성공한다.
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError>;

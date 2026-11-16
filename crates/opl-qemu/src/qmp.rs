@@ -171,6 +171,8 @@ pub struct BitmapInfo {
     pub inconsistent: bool,
     /// 이미지(qcow2)에 저장돼 QEMU를 다시 켜도 남는지
     pub persistent: bool,
+    /// 비트맵이 바뀐 것으로 적은 바이트(QEMU의 `count`). 없으면 0
+    pub count: u64,
 }
 
 impl BlockNode {
@@ -193,6 +195,7 @@ impl BlockNode {
                     // QEMU는 inconsistent일 때만 이 항목을 넣는다.
                     inconsistent: flag(b, "inconsistent"),
                     persistent: flag(b, "persistent"),
+                    count: b["count"].as_u64().unwrap_or(0),
                 })
             })
             .collect();
@@ -259,6 +262,26 @@ pub enum TransactionAction {
         target: String,
         bitmap: String,
     },
+    /// 노드 `device`를 노드 `target`(복제본의 NBD 내보내기)에 쓰는 백업 작업(`blockdev-backup`). `sync`가
+    /// 비트맵이면 그 비트맵이 가리키는 바뀐 블록만 쓰고 비트맵은 그대로 둔다(`bitmap-mode: never`). NBD
+    /// 대상은 압축을 받지 못하므로 압축하지 않는다. 끝난 작업은 `job-dismiss`할 때까지 남는다. `speed`는
+    /// 바이트/초(없으면 제한 없음).
+    Backup {
+        job_id: String,
+        device: String,
+        target: String,
+        sync: BackupSync,
+        speed: Option<u64>,
+    },
+}
+
+/// [`TransactionAction::Backup`]이 쓰는 범위
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackupSync {
+    /// 디스크 전체
+    Full,
+    /// 이 비트맵이 가리키는 바뀐 블록만
+    Bitmap(String),
 }
 
 impl TransactionAction {
@@ -294,6 +317,32 @@ impl TransactionAction {
                     "auto-dismiss": false,
                 },
             }),
+            TransactionAction::Backup {
+                job_id,
+                device,
+                target,
+                sync,
+                speed,
+            } => {
+                let mut data = json!({
+                    "job-id": job_id,
+                    "device": device,
+                    "target": target,
+                    "auto-dismiss": false,
+                });
+                match sync {
+                    BackupSync::Full => data["sync"] = json!("full"),
+                    BackupSync::Bitmap(bitmap) => {
+                        data["sync"] = json!("bitmap");
+                        data["bitmap"] = json!(bitmap);
+                        data["bitmap-mode"] = json!("never");
+                    }
+                }
+                if let Some(speed) = speed {
+                    data["speed"] = json!(speed);
+                }
+                json!({ "type": "blockdev-backup", "data": data })
+            }
         }
     }
 }
@@ -699,6 +748,16 @@ impl QmpClient {
             "writable": true,
         });
         self.execute("block-export-add", Some(args)).await.map(drop)
+    }
+
+    /// 내보내기 `id`를 닫는다. 붙은 NBD 클라이언트가 있으면 끊고 닫는다(`mode: hard`).
+    pub async fn block_export_del(&self, id: &str) -> Result<(), QmpError> {
+        self.execute(
+            "block-export-del",
+            Some(json!({ "id": id, "mode": "hard" })),
+        )
+        .await
+        .map(drop)
     }
 
     /// NBD 서버와 그 내보내기를 모두 멈춘다. 서버가 없으면 오류다.
@@ -1941,6 +2000,61 @@ mod tests {
         );
     }
 
+    /// 복제의 blockdev-backup: 전체(`sync: full`)와 비트맵(`bitmap-mode: never`), 속도. NBD 대상이라 압축하지
+    /// 않는다.
+    #[tokio::test]
+    async fn transaction_serializes_replication_backups() {
+        let (client, mut fake, _dir) = setup().await;
+        let actions = [
+            TransactionAction::Backup {
+                job_id: "opl-repl-0".into(),
+                device: "disk0".into(),
+                target: "opl-repl-nbd-0".into(),
+                sync: BackupSync::Full,
+                speed: None,
+            },
+            TransactionAction::Backup {
+                job_id: "opl-repl-1".into(),
+                device: "disk1".into(),
+                target: "opl-repl-nbd-1".into(),
+                sync: BackupSync::Bitmap("opl-repl-a-b".into()),
+                speed: Some(1 << 20),
+            },
+        ];
+        let (r, cmd) = tokio::join!(client.transaction(&actions), reply(&mut fake, json!({})));
+        r.unwrap();
+        assert_eq!(
+            cmd["arguments"]["actions"],
+            json!([
+                { "type": "blockdev-backup", "data": {
+                    "job-id": "opl-repl-0", "device": "disk0", "target": "opl-repl-nbd-0",
+                    "sync": "full", "auto-dismiss": false
+                } },
+                { "type": "blockdev-backup", "data": {
+                    "job-id": "opl-repl-1", "device": "disk1", "target": "opl-repl-nbd-1",
+                    "sync": "bitmap", "bitmap": "opl-repl-a-b", "bitmap-mode": "never",
+                    "speed": 1048576, "auto-dismiss": false
+                } }
+            ])
+        );
+    }
+
+    /// 내보내기 닫기는 붙은 클라이언트를 끊는다(`mode: hard`).
+    #[tokio::test]
+    async fn block_export_del_sends_the_id() {
+        let (client, mut fake, _dir) = setup().await;
+        let (r, cmd) = tokio::join!(
+            client.block_export_del("opl-repl-export-0"),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "block-export-del");
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "id": "opl-repl-export-0", "mode": "hard" })
+        );
+    }
+
     #[tokio::test]
     async fn bitmap_blockdev_and_job_commands_send_their_arguments() {
         let (client, mut fake, _dir) = setup().await;
@@ -2218,7 +2332,7 @@ mod tests {
             { "node-name": "disk1", "drv": "raw", "ro": false, "file": "/dev/vg/x",
               "dirty-bitmaps": [
                 { "name": "opl-a", "recording": false, "persistent": false, "busy": false,
-                  "granularity": 65536, "count": 0 },
+                  "granularity": 65536 },
                 // 미러 작업이 디스크에 둔 이름 없는 비트맵(QEMU 11.1)
                 { "busy": false, "count": 0, "granularity": 65536, "persistent": false,
                   "recording": false }
@@ -2227,11 +2341,12 @@ mod tests {
         let (nodes, cmd) = tokio::join!(client.query_block_nodes(), reply(&mut fake, ret));
         assert_eq!(cmd["execute"], "query-named-block-nodes");
         assert_eq!(cmd["arguments"], json!({ "flat": true }));
-        let bitmap = |name: &str, recording, inconsistent, persistent| BitmapInfo {
+        let bitmap = |name: &str, recording, inconsistent, persistent, count| BitmapInfo {
             name: name.into(),
             recording,
             inconsistent,
             persistent,
+            count,
         };
         assert_eq!(
             nodes.unwrap(),
@@ -2240,8 +2355,8 @@ mod tests {
                     node_name: "disk0".into(),
                     driver: "qcow2".into(),
                     bitmaps: vec![
-                        bitmap("opl-a", true, false, true),
-                        bitmap("opl-b", true, true, true)
+                        bitmap("opl-a", true, false, true, 0),
+                        bitmap("opl-b", true, true, true, 4096)
                     ],
                 },
                 BlockNode {
@@ -2249,10 +2364,11 @@ mod tests {
                     driver: "file".into(),
                     bitmaps: vec![],
                 },
+                // `count`가 없으면 0이다.
                 BlockNode {
                     node_name: "disk1".into(),
                     driver: "raw".into(),
-                    bitmaps: vec![bitmap("opl-a", false, false, false)],
+                    bitmaps: vec![bitmap("opl-a", false, false, false, 0)],
                 },
             ]
         );

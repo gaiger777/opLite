@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
+use opl_types::storage::{PoolBackend, SourceFormat, StoragePool, is_shared};
 use uuid::Uuid;
 
 use super::{
-    Capacity, Storage, VolumeInfo, VolumeSource, convert_from, create_target, export_to, path_str,
-    rbd, run_qemu_img,
+    Capacity, Storage, VolumeInfo, VolumeSource, convert_from, create_target, export_to, fmt_name,
+    path_str, rbd, require_absolute, run_qemu_img,
 };
 use crate::error::DriverError;
 
@@ -489,6 +489,86 @@ impl Storage for Storages {
         self.backend(pool)?
             .drop_backup_bitmaps(pool, id, format)
             .await
+    }
+
+    /// 볼륨의 위치(파일 또는 블록 장치 — dir·LVM-thin·ZFS)를 backing으로 `qemu-img create`한다.
+    async fn create_overlay(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        overlay: &Path,
+    ) -> Result<(), DriverError> {
+        let backend = self.overlay_backend(pool, overlay)?;
+        let src = backend.volume_source(pool, id, format, None).await?;
+        let made = async {
+            let (backing, overlay) = (path_str(&src.path)?, path_str(overlay)?);
+            let args = [
+                "create",
+                "-q",
+                "-f",
+                "qcow2",
+                "-b",
+                backing,
+                "-F",
+                fmt_name(format),
+                overlay,
+            ];
+            run_qemu_img(&self.qemu_img, &args).await.map(drop)
+        }
+        .await;
+        if let Err(e) = backend.release_source(pool, id, format, None).await {
+            tracing::warn!(volume = %id, error = %e, "cannot release replica volume");
+        }
+        made
+    }
+
+    /// `qemu-img commit`으로 겹층을 볼륨(겹층 헤더의 backing)에 합치고 겹층을 지운다.
+    async fn commit_overlay(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+        overlay: &Path,
+    ) -> Result<(), DriverError> {
+        let backend = self.overlay_backend(pool, overlay)?;
+        if !overlay.exists() {
+            return Ok(());
+        }
+        // 블록 볼륨의 장치를 켜 둔다(꺼져 있으면 backing을 열지 못한다).
+        backend.volume_source(pool, id, format, None).await?;
+        let committed = async {
+            // -d: 합친 뒤 겹층을 비우지 않는다(곧 지운다).
+            let args = ["commit", "-q", "-d", "-f", "qcow2", path_str(overlay)?];
+            run_qemu_img(&self.qemu_img, &args).await?;
+            match std::fs::remove_file(overlay) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            }
+        }
+        .await;
+        if let Err(e) = backend.release_source(pool, id, format, None).await {
+            tracing::warn!(volume = %id, error = %e, "cannot release replica volume");
+        }
+        committed
+    }
+}
+
+impl Storages {
+    /// 겹층을 둘 수 있는 풀의 저장소. 공유 풀(다른 노드도 같은 볼륨을 연다)에는 복제본이 없다.
+    fn overlay_backend(
+        &self,
+        pool: &StoragePool,
+        overlay: &Path,
+    ) -> Result<&dyn Storage, DriverError> {
+        require_absolute(overlay)?;
+        if is_shared(pool) {
+            return Err(DriverError::InvalidSpec(format!(
+                "storage pool {:?} is shared; replicas are kept only in node-local pools",
+                pool.name
+            )));
+        }
+        self.backend(pool)
     }
 }
 
@@ -1152,6 +1232,94 @@ mod tests {
                 .copy_volume(&lvm_pool(), id, f, None, false, &p, id, f)
                 .await
                 .unwrap_err(),
+        );
+        assert_eq!(taken(&log), Vec::<String>::new());
+    }
+
+    /// 복제본 겹층: 볼륨 위치(파일 또는 블록 장치)를 backing으로 `qemu-img create`하고, `qemu-img commit` 뒤
+    /// 겹층을 지운다. 겹층이 없으면 합칠 것이 없다. 공유 풀과 상대 경로는 거절한다.
+    #[tokio::test]
+    async fn replica_overlays_use_the_volume_as_backing() {
+        let tools = tempfile::tempdir().unwrap();
+        let log = Log::default();
+        let storages = Storages::new(
+            fake_qemu_img(tools.path(), false),
+            Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
+        )
+        .with_lvm_thin(Arc::new(Recorder::new("lvm", "/dev/vg0".as_ref(), &log)));
+        let id = Uuid::now_v7();
+        let overlay = tools.path().join("r-v.qcow2");
+        let args = || std::fs::read_to_string(tools.path().join("args")).unwrap();
+
+        storages
+            .create_overlay(&lvm_pool(), id, ImageFormat::Raw, &overlay)
+            .await
+            .unwrap();
+        assert_eq!(
+            args(),
+            format!(
+                "create\n-q\n-f\nqcow2\n-b\n/dev/vg0/{id}\n-F\nraw\n{}\n",
+                overlay.display()
+            )
+        );
+        assert_eq!(taken(&log), ["lvm.volume_source", "lvm.release_source"]);
+
+        // 없는 겹층(이미 합치고 지움)은 할 일이 없다.
+        storages
+            .commit_overlay(&dir_pool(), id, ImageFormat::Qcow2, &overlay)
+            .await
+            .unwrap();
+        assert_eq!(taken(&log), Vec::<String>::new());
+        std::fs::write(&overlay, b"overlay").unwrap();
+        storages
+            .commit_overlay(&dir_pool(), id, ImageFormat::Qcow2, &overlay)
+            .await
+            .unwrap();
+        assert_eq!(
+            args(),
+            format!("commit\n-q\n-d\n-f\nqcow2\n{}\n", overlay.display())
+        );
+        assert!(!overlay.exists());
+        assert_eq!(taken(&log), ["file.volume_source", "file.release_source"]);
+
+        // 합치다 실패하면 겹층이 남는다(다시 하면 같아진다).
+        let failing = Storages::new(
+            fake_qemu_img(tools.path(), true),
+            Arc::new(Recorder::new("file", "/f".as_ref(), &log)),
+        );
+        std::fs::write(&overlay, b"overlay").unwrap();
+        assert!(
+            failing
+                .commit_overlay(&dir_pool(), id, ImageFormat::Qcow2, &overlay)
+                .await
+                .is_err()
+        );
+        assert!(overlay.exists());
+        taken(&log);
+
+        for (p, path) in [
+            (nfs_pool(), overlay.clone()),
+            (lvm_shared_pool(), overlay.clone()),
+            (dir_pool(), PathBuf::from("r-v.qcow2")),
+        ] {
+            let err = storages
+                .create_overlay(&p, id, ImageFormat::Raw, &path)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+            let err = storages
+                .commit_overlay(&p, id, ImageFormat::Raw, &path)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        }
+        let mut shared_dir = dir_pool();
+        shared_dir.spec.shared = true;
+        assert!(
+            storages
+                .create_overlay(&shared_dir, id, ImageFormat::Raw, &overlay)
+                .await
+                .is_err()
         );
         assert_eq!(taken(&log), Vec::<String>::new());
     }

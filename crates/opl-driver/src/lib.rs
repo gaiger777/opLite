@@ -9,6 +9,7 @@ pub mod mock;
 pub mod mounts;
 pub mod net;
 pub mod qemu;
+pub mod replication;
 pub mod storage;
 pub mod vip;
 
@@ -28,10 +29,14 @@ pub use migration::{
     IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
     MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir, tcp_uri, write_migration_tls,
 };
-pub use mock::{GuestAnswer, HotplugCall, IncrementalCall, MockHypervisor};
+pub use mock::{
+    GuestAnswer, HotplugCall, IncrementalCall, MOCK_INCREMENT_BYTES, MockHypervisor,
+    ReplicationCall,
+};
 pub use net::{HostNet, IpRoute, Overlay, OverlayChanges, Tap};
 pub use opl_types::storage::SourceFormat;
 pub use qemu::{QemuConfig, QemuHypervisor, uefi_vars_path, vm_state_dir};
+pub use replication::{REPLICA_TLS_ID, ReceiverExport, ReplicaDiskTarget, ReplicateRequest};
 pub use storage::{
     Capacity, DirStorage, DiskLocation, LvInfo, LvmOps, LvmSharedStorage, LvmThinStorage,
     RBD_DEFAULT_USER, RbdOps, RbdSnapshot, RbdSpace, RbdStorage, Storage, Storages, SystemLvm,

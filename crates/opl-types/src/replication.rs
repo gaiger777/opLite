@@ -4,7 +4,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::backup::BITMAP_PREFIX;
 use crate::vm::Vm;
 
 /// VM 하나의 복제 대상 수의 최댓값
@@ -21,7 +20,10 @@ const INTERVAL_ERROR: &str =
     "replication schedule must look like */N with N minutes from 1 to 1440";
 
 /// 복제 비트맵 이름의 접두사(백업 비트맵과 같은 `opl-` 무리)
-const REPLICA_BITMAP_PREFIX: &str = "opl-repl-";
+pub const REPLICA_BITMAP_PREFIX: &str = "opl-repl-";
+
+/// 마이그레이션 따라잡기 임시 비트맵 이름의 접두사(같은 `opl-` 무리)
+pub const MIGRATION_BITMAP_PREFIX: &str = "opl-mig-";
 
 /// VM의 복제 대상 하나
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,7 +167,7 @@ pub fn parse_replica_bitmap(name: &str) -> Option<(Uuid, Uuid)> {
 
 /// 마이그레이션 Task `task`의 `k`번째 따라잡기 패스가 두는 임시 비트맵 이름 `opl-mig-{task simple}-{k}`
 pub fn migration_bitmap(task: Uuid, k: u8) -> String {
-    format!("{BITMAP_PREFIX}mig-{}-{k}", task.simple())
+    format!("{MIGRATION_BITMAP_PREFIX}{}-{k}", task.simple())
 }
 
 /// 소문자 16진 32자(`Uuid::simple` 모양)의 id

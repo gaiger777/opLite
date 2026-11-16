@@ -831,7 +831,8 @@ fn bitmaps(path: &Path) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// 꺼진 qcow2 볼륨의 증분 백업 비트맵: opl- 비트맵을 하나만 남기고(다른 비트맵은 그대로), 지울 수 있다.
+/// 꺼진 qcow2 볼륨의 증분 백업 비트맵: 백업 비트맵을 하나만 남기고(복제 비트맵과 다른 비트맵은 그대로), 지울
+/// 수 있다(지우기는 `opl-` 비트맵을 모두).
 /// raw 볼륨은 할 일이 없다.
 #[tokio::test]
 async fn backup_bitmaps_of_stopped_volumes() {
@@ -845,18 +846,25 @@ async fn backup_bitmaps_of_stopped_volumes() {
         .await
         .unwrap();
     qemu_img(&["bitmap", "--add", path.to_str().unwrap(), "user"]);
+    // 복제 비트맵은 백업 비트맵이 아니다(꺼진 동안의 쓰기를 복제도 따라간다).
+    let repl = opl_types::replication::replica_bitmap(Uuid::now_v7(), Uuid::now_v7());
+    qemu_img(&["bitmap", "--add", path.to_str().unwrap(), &repl]);
+    let (a, b) = (
+        opl_types::backup::bitmap_name(Uuid::now_v7()),
+        opl_types::backup::bitmap_name(Uuid::now_v7()),
+    );
 
     storages
-        .set_backup_bitmap(&pool, id, qcow2, "opl-a")
+        .set_backup_bitmap(&pool, id, qcow2, &a)
         .await
         .unwrap();
     storages
-        .set_backup_bitmap(&pool, id, qcow2, "opl-b")
+        .set_backup_bitmap(&pool, id, qcow2, &b)
         .await
         .unwrap();
     // 다시 해도(같은 이름) 하나다.
     storages
-        .set_backup_bitmap(&pool, id, qcow2, "opl-b")
+        .set_backup_bitmap(&pool, id, qcow2, &b)
         .await
         .unwrap();
     let auto = vec!["auto".to_string()];
@@ -864,7 +872,8 @@ async fn backup_bitmaps_of_stopped_volumes() {
         bitmaps(&path),
         [
             ("user".to_string(), auto.clone()),
-            ("opl-b".to_string(), auto)
+            (repl.clone(), auto.clone()),
+            (b.clone(), auto)
         ]
     );
 
@@ -875,6 +884,7 @@ async fn backup_bitmaps_of_stopped_volumes() {
         .await
         .unwrap();
     qemu_img(&["bitmap", "--remove", path.to_str().unwrap(), "user"]);
+    // 되돌리기 전 지우기는 복제 비트맵도 덮는다(되돌린 디스크는 복제도 다음이 전체다).
     storages
         .drop_backup_bitmaps(&pool, id, qcow2)
         .await
@@ -993,4 +1003,50 @@ async fn imports_a_backup_chain() {
         .unwrap_err();
     assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
     assert!(!volume_path(&dst_pool, id, qcow2).exists());
+}
+
+/// 복제본 겹층: dir 풀의 qcow2·raw 볼륨을 backing으로 둔 겹층에 쓴 것만 합치면 볼륨에 들어가고 겹층은 지워진다.
+/// 다시 합쳐도(겹층 없음) 같다. 겹층을 버리면 볼륨은 그대로다.
+#[tokio::test]
+async fn replica_overlays_commit_into_the_volume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = pool(tmp.path());
+    let storages = Storages::new("qemu-img", Arc::new(DirStorage::new("qemu-img", MNT)));
+    for format in [ImageFormat::Qcow2, ImageFormat::Raw] {
+        let id = Uuid::now_v7();
+        let path = storages
+            .create_volume(&pool, id, 4 * MIB, format)
+            .await
+            .unwrap();
+        assert!(qemu_io_fmt(&path, format, "write -P 0x11 0 4M"));
+        let overlay = tmp.path().join(format!("{id}-overlay.qcow2"));
+        storages
+            .create_overlay(&pool, id, format, &overlay)
+            .await
+            .unwrap();
+        assert!(qemu_io(&overlay, "write -P 0x22 1M 64k"));
+        // 겹층을 통해 읽으면 볼륨 위에 바뀐 것이다. 볼륨은 아직 그대로다.
+        assert!(qemu_io(&overlay, "read -P 0x11 0 1M"));
+        assert!(qemu_io_fmt(&path, format, "read -P 0x11 1M 64k"));
+        storages
+            .commit_overlay(&pool, id, format, &overlay)
+            .await
+            .unwrap();
+        assert!(!overlay.exists());
+        assert!(qemu_io_fmt(&path, format, "read -P 0x22 1M 64k"));
+        assert!(qemu_io_fmt(&path, format, "read -P 0x11 0 1M"));
+        storages
+            .commit_overlay(&pool, id, format, &overlay)
+            .await
+            .unwrap();
+
+        // 버린 겹층(끝나지 않은 회차)은 볼륨에 닿지 않는다.
+        storages
+            .create_overlay(&pool, id, format, &overlay)
+            .await
+            .unwrap();
+        assert!(qemu_io(&overlay, "write -P 0x33 0 64k"));
+        std::fs::remove_file(&overlay).unwrap();
+        assert!(qemu_io_fmt(&path, format, "read -P 0x11 0 64k"));
+    }
 }

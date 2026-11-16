@@ -900,6 +900,7 @@ fn bitmap(name: &str) -> opl_driver::BitmapInfo {
         recording: true,
         inconsistent: false,
         persistent: true,
+        count: 0,
     }
 }
 
@@ -977,6 +978,45 @@ async fn incremental_backup_writes_changed_blocks_after_its_parent() {
     assert_eq!(vm.status.phase, VmPhase::Running);
 }
 
+/// 같은 `opl-` 무리의 복제 비트맵(`opl-repl-…`)은 백업 비트맵이 아니다: 디스크에 함께 있어도 증분 백업의 부모를
+/// 그대로 찾고, 백업이 비트맵을 정리해도 남는다.
+#[tokio::test]
+async fn replica_bitmaps_do_not_disturb_incremental_backups() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vm, files) = running_web(&env, &admin).await;
+
+    succeeded(&backup_running(&mut env, &admin, "b1", false, &files).await);
+    let b1 = backup(&env, "b1").unwrap();
+    let repl = opl_types::replication::replica_bitmap(Uuid::now_v7(), Uuid::now_v7());
+    let disks = env.hv.bitmaps(vm);
+    env.hv.set_bitmaps(
+        vm,
+        disks
+            .into_iter()
+            .map(|mut d| {
+                d.push(bitmap(&repl));
+                d
+            })
+            .collect(),
+    );
+
+    succeeded(&backup_running(&mut env, &admin, "b2", true, &[]).await);
+    let b2 = backup(&env, "b2").unwrap();
+    assert_eq!(
+        (b2.status.parent, b2.status.full_reason.as_deref()),
+        (Some(b1.id), None),
+        "{b2:?}"
+    );
+    let opl_b2 = opl_types::backup::bitmap_name(b2.id);
+    assert_eq!(bitmaps(&env, vm), vec![vec![repl.clone(), opl_b2]; 2]);
+
+    // 전체 백업이 앞 백업 비트맵을 지워도 복제 비트맵은 남는다.
+    succeeded(&backup_running(&mut env, &admin, "b3", false, &files).await);
+    let opl_b3 = opl_types::backup::bitmap_name(backup(&env, "b3").unwrap().id);
+    assert_eq!(bitmaps(&env, vm), vec![vec![repl.clone(), opl_b3]; 2]);
+}
+
 /// 증분을 할 수 없으면 전체로 하고 그 이유를 적는다. 전체 백업이 끝나면 비트맵은 새 백업의 것 하나다.
 #[tokio::test]
 async fn incremental_requests_fall_back_to_full_backups_with_a_reason() {
@@ -1001,6 +1041,7 @@ async fn incremental_requests_fall_back_to_full_backups_with_a_reason() {
     assert_eq!(manifest(&env, first.id)["version"], MANIFEST_VERSION);
 
     // 디스크마다 정확히 하나, 모두 같은 이름, 믿을 수 있는 비트맵이어야 한다.
+    let other = opl_types::backup::bitmap_name(Uuid::now_v7());
     let cases: Vec<(Vec<Vec<opl_driver::BitmapInfo>>, String)> = vec![
         (
             vec![vec![bitmap(&opl_first)], vec![]],
@@ -1028,16 +1069,16 @@ async fn incremental_requests_fall_back_to_full_backups_with_a_reason() {
             "dirty bitmap on disk0 is inconsistent".into(),
         ),
         (
-            vec![vec![bitmap("opl-other")], vec![bitmap("opl-other")]],
+            vec![vec![bitmap(&other)], vec![bitmap(&other)]],
             "dirty bitmaps do not match a ready backup in pool \"bk\"".into(),
         ),
         (
-            vec![vec![bitmap(&opl_first)], vec![bitmap("opl-other")]],
+            vec![vec![bitmap(&opl_first)], vec![bitmap(&other)]],
             "dirty bitmaps do not match a ready backup in pool \"bk\"".into(),
         ),
         (
             vec![
-                vec![bitmap(&opl_first), bitmap("opl-other")],
+                vec![bitmap(&opl_first), bitmap(&other)],
                 vec![bitmap(&opl_first)],
             ],
             "dirty bitmaps do not match a ready backup in pool \"bk\"".into(),
