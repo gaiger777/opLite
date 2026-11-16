@@ -85525,3 +85525,33 @@ git commit -m "feat(web): 로컬 디스크 복제 화면(복제 절·복제 카�
 - 따라잡기 마이그레이션은 QEMU `dirty-bitmaps` 능력을 끄므로 다른 복제 대상과 백업 비트맵이 VM을 따라가지 않아 그 다음 복제·백업은 전체다.
 - fleecing 파일은 `{data_dir}/vm/{id}/`에 놓이고 회차 동안 디스크 크기까지 자랄 수 있다(남은 공간이 max(1 GiB, 5%) 아래면 회차를 취소). fleecing을 넣는 동안 게스트가 몇 밀리초 멈춘다.
 - 복제본을 승격할 수 없으면(복제본 없음) VM은 꺼진 채 남고 오류를 보인다.
+
+## 실행 후 기록 (2026-11-16)
+
+- **Task 1~8:** `feat/plan55-local-disk-ha`에서 스크립트로 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았고(생성 파일 포함), 여덟 Task를 마친 트리는 리뷰·검증을 거친 트리와 같다.
+- **1차 리뷰에서 고친 것:**
+  - 받는 쪽이 끊기면 `blockdev-backup`의 쓰기 전 복사가 실패해 게스트 쓰기가 EIO가 되던 것(치명) → fleecing(게스트를 잠깐 멈추고 `copy-before-write` 필터 `on-cbw-error: break-snapshot`·`cbw-timeout` + `snapshot-access`)에서 보냄, 따라잡기 회차도 같음. 받는 쪽 SIGKILL 중 게스트 쓰기 실제 QEMU 시험.
+  - 옛 원본 기록·청소·기록 지우기가 아직 이 노드에 있는 볼륨을 옛 복제본으로 바꿀 수 있던 것(치명) → 실제로 이 노드를 떠났고 다른 VM이 쓰지 않는 볼륨만.
+  - 확정 전에 옛 원본이 지킬 볼륨 기록, finish는 기록 뒤 바로 답하고 합치기는 VM마다 잠금(`lock_vm`) 아래 뒤에서, 공유 대상 풀 400, 없어진 복제본 파일 다시 만들기, 이 회차 볼륨만 ready, 공간 확인에 대상 풀, 노드를 모르는 볼륨 처리.
+  - 꺼둔 채 둘 VM은 복제본을 쓰지 않음, `status.last_recovery`(CLI·웹·`ha-it`), 노드 지우기·`prune`이 대상 정리, 스케줄러는 실행 중 Task만 세고 바쁜 VM을 건너뜀, 크기 척도 `spec.size_bytes`.
+- **2차 리뷰에서 고친 것:**
+  - 끊긴 따라잡기·되돌린 마이그레이션·실패/중단된 복제 Task·opld 재시작 뒤에 fleecing 필터가 남던 것 → 드라이버가 기한을 스스로 지키고 정리, 되돌리기·Task 정리·다시 붙기에서 지움. fleecing 파일 공간이 max(1 GiB, 5%) 아래면 회차 취소.
+  - fleecing 멈춤을 opld 멈춤으로 등록, 받는 쪽 느린 작업은 VM 잠금만.
+  - 노드를 모르는 볼륨이 있으면 HA가 복제본을 쓰지 않음(승격 없이 복제본 파일로 켜던 것), 따라잡기 크기 비교 척도, 승격 일시 오류는 다시 시도, 승격할 복제본 없는 대상으로 복구하면 그 노드를 대상에서 뺌, 건너뛴 복제 실행은 경고.
+- **검증 위치:** 일반 시험은 svc01, 시스템을 바꾸는 작업은 GitHub 프로브, macOS·웹·셸·cargo-deny·`ha-it`(10개)·`migration-it`(8개)·실제 QEMU 복제(4개)·마이그레이션(6개)은 이 Mac. svc01(aarch64 QEMU 8.2)에서도 같은 실제 QEMU 시험 28개가 통과했다(fleecing이 QEMU 8.2에서 동작).
+- **테스트 VM 배포(svc01·svc02):** svc02 → svc01 순서. 유닛은 바뀌지 않아 그대로. 두 노드 모두 `node-replication`·`hotplug`·`placement`·`ha-checks` 기능, `[replication]` 설정 없이 기본값. test-vm은 복제 대상 없음, QEMU PID 그대로, 바꾸지 않았다. 헬스 `ok`, 저널에 ERROR·panic 없음, 웹은 새 빌드.
+
+**테스트:**
+- macOS `cargo test --workspace` 2589개(스테이지별 2477·2494·2520·2540·2557·2576·2589·2589), 웹 시험 694개와 typecheck·lint, 패키징 셸 시험, `cargo-deny`, `ha-it` 10개, `migration-it` 8개, opl-driver 실제 QEMU 복제·마이그레이션
+- svc01(Linux) `fmt`·`clippy -D warnings`(모든 기능)·`cargo test --workspace` 2654개·starve·규모 시험 노드 100·storage-it, 실제 QEMU 시험 28개
+
+GitHub 프로브에서 linux-kvm·ldap·package·ISO 작업.
+
+## 다음 계획으로 넘길 사항
+
+- 따라잡기 마이그레이션은 `dirty-bitmaps` 능력을 꺼서 다른 복제 대상·백업 비트맵이 따라가지 않는다(다음은 전체) — `block-bitmap-mapping`으로 옮길 것.
+- 꺼진 VM 복제, 동기 복제, 스냅샷이 있는 VM의 복제는 남았다.
+- "완전한 복제본 없음"으로 승격이 실패하면 VM이 꺼진 채 남는다 — 다음 복제본 노드로 다시 고르는 것을 검토할 것.
+- fleecing 파일을 소스 디스크 풀 옆에 두는 것을 검토할 것(지금은 `{data_dir}`).
+- 실제 게스트 OS에서 긴 쓰기 중 복제·HA 복구를 확인할 것(시험은 OS 없이 펌웨어와 qemu-io).
+- 다음: 계획 56(Ceph 자동 구성).
