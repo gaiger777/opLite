@@ -506,7 +506,11 @@ impl Member {
         ));
         // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
-            .with_migrations(Arc::new(incoming.with_firewall(gate.clone())))
+            .with_migrations(Arc::new(
+                incoming
+                    .with_firewall(gate.clone())
+                    .with_replicas(replicas.clone()),
+            ))
             .with_replicas(Arc::new(replicas.clone()))
             .with_uefi_vars(config.data_dir.clone())
             .with_audit(audit.clone())

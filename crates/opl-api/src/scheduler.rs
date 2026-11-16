@@ -212,6 +212,45 @@ pub fn replica_moves(vm: &Vm, inv: &Inventory, node: Uuid) -> Option<Vec<DiskMov
     Some(moves)
 }
 
+/// VM을 노드 `node`로 옮길 때의 디스크 이동. `node`가 VM의 복제 대상이면(계획 55) 노드 로컬 풀 디스크마다 그 대상의 풀(없으면
+/// 같은 이름)에 있는 복제본으로의 이동(`existing` — 새로 만들지 않고 복제 뒤 바뀐 것만 보낸다)이다. 그때 `pool`이 있으면 그
+/// 복제본의 풀과 같아야 한다(아니면 오류 문구). 대상 풀을 찾지 못하면 복제본이 아닌 것처럼 본다. 복제 대상이 아니면
+/// [`disk_moves`]와 같다.
+pub fn migration_moves(
+    vm: &Vm,
+    inv: &Inventory,
+    node: Uuid,
+    pool: Option<&StoragePool>,
+) -> Result<Vec<DiskMove>, String> {
+    let replica = vm.spec.replication.iter().find(|t| t.node == node);
+    let replica_pool = match replica.map(|t| &t.pool) {
+        None => return Ok(disk_moves(&vm.spec, inv, pool)),
+        Some(None) => None,
+        Some(Some(name)) => match inv.pools.iter().find(|p| &p.name == name) {
+            Some(p) => Some(p),
+            None => return Ok(disk_moves(&vm.spec, inv, pool)),
+        },
+    };
+    let mut moves = disk_moves(&vm.spec, inv, replica_pool);
+    if let Some(pool) = pool
+        && let Some(m) = moves.iter().find(|m| m.pool != pool.name)
+    {
+        let name = inv
+            .nodes
+            .iter()
+            .find(|n| n.id == node)
+            .map_or_else(|| node.to_string(), |n| n.name.clone());
+        return Err(format!(
+            "node {name:?} holds the replica of VM {:?} in pool {:?}; migrate without --pool or remove the node from the replication targets",
+            vm.name, m.pool
+        ));
+    }
+    for m in &mut moves {
+        m.existing = true;
+    }
+    Ok(moves)
+}
+
 /// [`node_fits`]와 같되 노드 로컬 풀 디스크가 있어 그 노드에서 쓸 수 없는 VM은 그 노드에 쓸 수 있는 복제본이 있으면
 /// 그 복제본의 풀로 본다([`replica_moves`]). HA 복구·되돌아가기·균형 조정기가 쓴다.
 pub fn replica_fits(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
@@ -1269,6 +1308,70 @@ mod tests {
         inv.pools[1].spec.nodes.clear();
         let moves = disk_moves(&me, &inv, Some(&inv.pools[1]));
         assert_eq!(node_fits_with(&me, &inv, &target, &moves), Ok(()));
+    }
+
+    /// 복제 대상으로 옮기면(계획 55) 로컬 디스크는 그 대상 풀의 복제본으로의 이동(`existing`)이고, 다른 풀을 주면 거절한다.
+    /// 복제 대상이 아니면 [`disk_moves`]와 같다.
+    #[test]
+    fn migration_moves_use_the_replica_of_a_replication_target() {
+        let mut source = node(4096);
+        source.name = "node1".into();
+        let mut target = node(4096);
+        target.name = "node2".into();
+        let other = node(4096);
+        let mut me = spec(512, Some(source.id), PowerState::Running);
+        me.disks.push(DiskSpec {
+            volume: "root".into(),
+            bus: DiskBus::VirtioBlk,
+            boot_order: Some(1),
+        });
+        me.replication = vec![opl_types::replication::ReplicationTarget {
+            node: target.id,
+            schedule: "*/15".into(),
+            pool: Some("b".into()),
+        }];
+        let vm: Vm = Resource::new("web", me.clone());
+        let root = volume("root", "a", Some(source.id));
+        let inv = Inventory {
+            nodes: vec![source, target.clone(), other.clone()],
+            volumes: vec![root.clone()],
+            pools: vec![pool("a", false), pool("b", false), pool("c", false)],
+            ..Default::default()
+        };
+        let mv = |pool: &str, existing| DiskMove {
+            volume: root.id,
+            pool: pool.into(),
+            format: ImageFormat::Qcow2,
+            existing,
+        };
+        assert_eq!(
+            migration_moves(&vm, &inv, target.id, None),
+            Ok(vec![mv("b", true)])
+        );
+        assert_eq!(
+            migration_moves(&vm, &inv, target.id, Some(&inv.pools[1])),
+            Ok(vec![mv("b", true)])
+        );
+        assert_eq!(
+            migration_moves(&vm, &inv, target.id, Some(&inv.pools[2])),
+            Err("node \"node2\" holds the replica of VM \"web\" in pool \"b\"; migrate without --pool or remove the node from the replication targets".into())
+        );
+        // 복제 대상이 아닌 노드는 계획 42 그대로(같은 이름의 풀 또는 준 풀에 새로 만든다).
+        assert_eq!(
+            migration_moves(&vm, &inv, other.id, None),
+            Ok(vec![mv("a", false)])
+        );
+        assert_eq!(
+            migration_moves(&vm, &inv, other.id, Some(&inv.pools[2])),
+            Ok(vec![mv("c", false)])
+        );
+        // 풀을 두지 않은 대상은 디스크마다 같은 이름의 풀이다.
+        let mut same = vm.clone();
+        same.spec.replication[0].pool = None;
+        assert_eq!(
+            migration_moves(&same, &inv, target.id, Some(&inv.pools[0])),
+            Ok(vec![mv("a", true)])
+        );
     }
 
     #[test]

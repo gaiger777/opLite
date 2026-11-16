@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use opl_types::runtime::ImageFormat;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 /// 마이그레이션을 보낼 곳
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,9 @@ pub struct MigrateOptions {
     /// [`mirror_disks`](crate::Hypervisor::mirror_disks)로 시작한 디스크 미러를 스위치오버 직전
     /// (`pre-switchover`, 게스트가 멈춘 때)에 끝낸 뒤 이어 간다.
     pub switchover_mirrors: bool,
+    /// [`catch_up_disks`](crate::Hypervisor::catch_up_disks)로 따라잡은 디스크(계획 55, 대상의 복제본)에 스위치오버 직전
+    /// (`pre-switchover`, 게스트가 멈춘 때) 마지막 패스를 보낸 뒤 이어 간다.
+    pub switchover_catch_up: Option<CatchUpState>,
     /// 받는 쪽이 켤 핫플러그·디스크·NIC 장치 id([`opl_types::hotplug::qemu_devices`]). 있으면 보내기 전에 원본
     /// QEMU의 `/machine/peripheral`과 견주고, 다르면(게스트가 아직 내려 주지 않은 장치 등) 보내지 않는다.
     pub devices: Option<Vec<String>>,
@@ -78,6 +82,41 @@ pub struct MirrorOptions {
     pub stall: Duration,
     /// 있으면 진행이 바뀔 때마다 보낸다.
     pub progress: Option<watch::Sender<MirrorProgress>>,
+}
+
+/// 마이그레이션 따라잡기(계획 55, [`catch_up_disks`](crate::Hypervisor::catch_up_disks)): 대상 노드의 복제본에 그 뒤
+/// 바뀐 블록만 몇 차례 보낸다.
+#[derive(Debug)]
+pub struct CatchUp {
+    /// 디스크마다 받는 QEMU의 NBD 내보내기(대상은 복제본을 내보낸다)
+    pub targets: Vec<MirrorTarget>,
+    /// `targets` 차례로 첫 패스의 기준 비트맵(복제 비트맵). 없으면 그 디스크는 첫 패스에서 전체를 보낸다.
+    pub base: Vec<Option<String>>,
+    /// 마이그레이션 Task(임시 비트맵 `opl-mig-{task}-{k}`)
+    pub task: Uuid,
+    /// 패스 뒤 바뀐 바이트(새 비트맵 `count`의 합)가 이 이하면 멈춘다.
+    pub limit: u64,
+    /// 패스 수의 최댓값
+    pub passes: u8,
+    /// 디스크 하나의 최대 속도(바이트/초). `None`이면 제한 없음
+    pub speed: Option<u64>,
+    /// 보낸 양의 합이 이만큼 늘지 않으면 실패한다(끊긴 링크).
+    pub stall: Duration,
+    /// 따라잡기 전체(패스들)의 기한. 넘기면 작업을 취소하고 플리싱을 뗀 뒤 실패한다.
+    pub timeout: Duration,
+    /// 있으면 진행이 바뀔 때마다 보낸다(패스들의 합).
+    pub progress: Option<watch::Sender<MirrorProgress>>,
+}
+
+/// 따라잡기가 끝난 상태: 스위치오버의 마지막 패스가 쓴다([`MigrateOptions::switchover_catch_up`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchUpState {
+    /// 따라잡은 디스크 순서 번호(노드 `disk{i}`)
+    pub disks: Vec<usize>,
+    /// 마지막 패스가 만든 비트맵. 마지막 패스는 그 뒤 바뀐 블록을 보낸다.
+    pub bitmap: String,
+    /// 한 패스 수
+    pub passes: u8,
 }
 
 /// QEMU의 TLS 자격 증명 객체 id. 보내는 쪽과 받는 쪽 모두 이 이름으로 만든다.

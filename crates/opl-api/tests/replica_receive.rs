@@ -1095,6 +1095,52 @@ async fn an_old_primary_leaves_out_disks_of_other_vms() {
     assert_eq!(s.storage.deleted(), [s.volume]);
 }
 
+/// 돌아온 옛 원본의 기록에 아직 이 노드의 볼륨인 디스크(떼어 둔 디스크 — 볼륨 기록이 이 노드)가 있으면 받을 준비는
+/// 그 디스크를 옛 복제본으로 바꾸지 않고 기록에서 뺀다(지우지 않는다).
+#[tokio::test]
+async fn prepare_leaves_out_old_primary_disks_still_on_this_node() {
+    let s = setup().await;
+    let data = s.another_volume("data").await;
+    let mut v = s.env.cluster.get::<VolumeSpec>(data).unwrap().unwrap();
+    v.status.node = Some(s.env.node);
+    s.env
+        .cluster
+        .update_status::<VolumeSpec>(data, &v.status)
+        .await
+        .unwrap();
+    let entry = |id| RecordedReplica {
+        id,
+        pool: "b".into(),
+        format: ImageFormat::Qcow2,
+        size_bytes: SIZE,
+        created: false,
+        state: ReplicaState::Ready,
+        overlay: None,
+    };
+    replicas::write(
+        &s.dir,
+        &ReplicaRecord {
+            vm: s.vm,
+            role: Role::Primary,
+            generation: None,
+            synced_at: None,
+            volumes: vec![entry(s.volume), entry(data)],
+        },
+    )
+    .unwrap();
+    s.storage.place(s.volume, SIZE);
+    s.storage.place(data, SIZE);
+    let run = s.task().await;
+    s.prepare(run, PrepareMode::Full).await.unwrap();
+    let record = s.record().unwrap();
+    assert_eq!(record.role, Role::Replica);
+    assert_eq!(record.volumes.len(), 1);
+    assert_eq!(record.volumes[0].id, s.volume);
+    assert!(record.volumes[0].created);
+    assert!(s.storage.has_file(data));
+    assert!(s.storage.deleted().is_empty());
+}
+
 fn node_name(env: &Env) -> String {
     env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap().name
 }

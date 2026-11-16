@@ -34,7 +34,8 @@ use crate::replication::start_replication;
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
 use crate::revision::TASK;
 use crate::scheduler::{
-    HaCapacity, Inventory, ScheduleError, disk_moves, ha_capacity, node_fits_with, schedule_with,
+    HaCapacity, Inventory, ScheduleError, disk_moves, ha_capacity, migration_moves, node_fits_with,
+    schedule_with,
 };
 use crate::score::{self, Scorer};
 use crate::snapshots::{
@@ -1273,24 +1274,33 @@ pub(crate) async fn start_migration(
     }
     let inv = Inventory::load(&state.cluster)?;
     check_no_resize_task(state, &inv, &vm)?;
-    // 노드 로컬 풀의 디스크는 대상 노드에 복사한다(같은 이름의 풀 또는 `pool`).
+    // 노드 로컬 풀의 디스크는 대상 노드에 복사한다(같은 이름의 풀 또는 `pool`). 대상이 복제 대상이면 그 복제본에 바뀐
+    // 것만 보낸다(계획 55).
     let mut moves = disk_moves(&vm.spec, &inv, None);
-    if let Some(name) = &pool {
-        if moves.is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "VM {:?} has no disks on node-local pools; pool applies only to them",
-                vm.name
-            )));
-        }
-        let pool = inv
-            .pools
-            .iter()
-            .find(|p| &p.name == name)
-            .ok_or_else(|| ApiError::not_found(format!("storage pool {name:?} not found")))?;
-        moves = disk_moves(&vm.spec, &inv, Some(pool));
+    let pool_spec =
+        match &pool {
+            Some(name) => {
+                if moves.is_empty() {
+                    return Err(ApiError::bad_request(format!(
+                        "VM {:?} has no disks on node-local pools; pool applies only to them",
+                        vm.name
+                    )));
+                }
+                Some(inv.pools.iter().find(|p| &p.name == name).ok_or_else(|| {
+                    ApiError::not_found(format!("storage pool {name:?} not found"))
+                })?)
+            }
+            None => None,
+        };
+    if !moves.is_empty() {
+        moves = migration_moves(&vm, &inv, target.id, pool_spec)
+            .map_err(|e| ApiError::conflict("migration_unsupported", e))?;
     }
     if let Some(first) = moves.first() {
         require_feature(&state.cluster, "storage-migration")?;
+        if first.existing {
+            require_feature(&state.cluster, NODE_REPLICATION)?;
+        }
         if count_snapshots(state, vm.id)? > 0 {
             let volume = inv.volumes.iter().find(|v| v.id == first.volume);
             return Err(ApiError::conflict(

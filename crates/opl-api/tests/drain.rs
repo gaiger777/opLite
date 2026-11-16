@@ -16,7 +16,9 @@ use opl_types::replication::{ReplicaStatus, ReplicaVolume, ReplicationState, Rep
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
-use opl_types::storage::{Volume, VolumePhase, VolumeSpec};
+use opl_types::storage::{
+    PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
+};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
 use opl_types::version::BUILD;
 use opl_types::vm::{Arch, PowerState, Vm, VmSpec};
@@ -434,6 +436,57 @@ async fn local_disk_vms_go_to_their_replica_node_first() {
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     admin.wait_task(&task).await;
     assert_eq!(migrations(&env), [("db".to_string(), replica)]);
+}
+
+/// 복제 대상 노드는 복제본이 아직 온전하지 않아도 마이그레이션이 옮길 그대로(그 대상의 풀)로 맞는지 본다.
+#[tokio::test]
+async fn a_replication_target_fits_with_its_replica_pool() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "db", "local", false).await;
+    // node2는 메모리가 많지만 같은 이름의 풀 `local`을 쓸 수 없고 복제본 풀 `rp`만 쓴다.
+    let target = add_node(&env, "node2", |n| n.status.memory_mib = 65536).await;
+    add_node(&env, "node3", |_| {}).await;
+    set_pool_state(&env.cluster, target, "local", PoolState::default()).await;
+    let rp: StoragePool = Resource::new(
+        "rp",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: env.dir.path().join("rp"),
+            },
+            nodes: vec![target],
+            shared: false,
+            backups: false,
+        },
+    );
+    env.cluster.create(&rp).await.unwrap();
+    let ready = PoolState {
+        ready: true,
+        ..Default::default()
+    };
+    set_pool_state(&env.cluster, target, "rp", ready).await;
+    loop {
+        let vm = env.cluster.get_by_name::<VmSpec>("db").unwrap().unwrap();
+        let mut spec = vm.spec.clone();
+        spec.replication = vec![ReplicationTarget {
+            node: target,
+            schedule: "*/15".into(),
+            pool: Some("rp".into()),
+        }];
+        if env
+            .cluster
+            .update_spec(vm.id, Some(vm.revision), vm.labels.clone(), &spec)
+            .await
+            .is_ok()
+        {
+            break;
+        }
+    }
+
+    let (status, task) = drain(&admin, "node1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
+    assert_eq!(migrations(&env), [("db".to_string(), target)]);
 }
 
 /// 로컬 디스크 VM을 옮기지 못하는 이유: 같은 이름의 풀을 쓸 수 있는 노드가 없음, 디스크 복사를 모르는

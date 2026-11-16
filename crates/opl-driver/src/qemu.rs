@@ -16,15 +16,15 @@ use opl_qemu::{
 use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::network::{tap_name, tap_prefix};
 use opl_types::node::NodeHotplug;
-use opl_types::replication::MIGRATION_BITMAP_PREFIX;
+use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
 use opl_types::runtime::{
     DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec,
 };
 use opl_types::vm::{CpuSpec, DiskBus, Firmware, NicModel, RunningHardware};
 use rustix::process::{Flock, FlockOffsetType, FlockType, Pid, Signal, fcntl_getlk, kill_process};
 use serde_json::json;
-use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -34,9 +34,9 @@ use crate::hypervisor::{
     HypervisorEvent, RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
-    IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
-    MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir, parse_qemu_version, pick_port,
-    tcp_uri,
+    CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget,
+    MirrorOptions, MirrorProgress, MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir,
+    parse_qemu_version, pick_port, tcp_uri,
 };
 use crate::net::{HostNet, Tap};
 use crate::replication::{REPLICA_TLS_ID, ReceiverExport, ReplicateRequest};
@@ -109,12 +109,21 @@ const CBW_TIMEOUT_SECS: u64 = 30;
 /// 플리싱 이미지를 둘 VM 상태 디렉터리의 남은 공간이 플리싱할 디스크의 가상 크기 합의 이 비율(%)보다 작으면
 /// 시작하지 않는다(회차 동안 게스트가 처음 덮어쓰는 블록만큼 자란다).
 const FLEECE_SPACE_PERCENT: u64 = 10;
+/// 보내는 동안(플리싱 이미지가 게스트가 덮어쓰는 블록만큼 자란다) 그 파일 시스템에 남겨 둘 공간: 이것과 파일 시스템
+/// 크기의 [`FLEECE_RESERVE_PERCENT`]% 가운데 큰 쪽. 그보다 줄면 보내기를 멈춘다(실행 실패, 플리싱을 뗀다).
+const FLEECE_RESERVE_BYTES: u64 = 1 << 30;
+const FLEECE_RESERVE_PERCENT: u64 = 5;
 /// 받는 QEMU의 실행 디렉터리 이름의 접두사(`{run_dir}/replica-{회차}`)
 const RECEIVER_DIR_PREFIX: &str = "replica-";
 /// 받는 QEMU가 연 복제본 블록 노드 이름의 접두사(`opl-repl-{i}`, i는 내보내기 순서)
 const RECEIVER_NODE_PREFIX: &str = "opl-repl-";
 /// 받는 QEMU의 NBD 내보내기 id의 접두사(`opl-repl-export-{i}`)
 const RECEIVER_EXPORT_PREFIX: &str = "opl-repl-export-";
+/// 마이그레이션 따라잡기(계획 55)의 작업 id(`opl-catchup-{i}`)와 그 NBD 대상 노드(`opl-catchup-nbd-{i}`)의 접두사(i는
+/// 디스크 순서 번호)
+const CATCH_UP_PREFIX: &str = "opl-catchup-";
+/// 마이그레이션 따라잡기의 NBD 대상 노드 이름의 접두사(`opl-catchup-nbd-{i}`)
+const CATCH_UP_NBD_PREFIX: &str = "opl-catchup-nbd-";
 /// 받는 QEMU의 블록 노드를 닫을 때 내보내기가 아직 붙들고 있으면 다시 해 보는 한도
 const RECEIVER_CLOSE_WAIT: Duration = Duration::from_secs(5);
 
@@ -533,7 +542,7 @@ impl QemuHypervisor {
         let qmp = &handle.qmp;
         let nodes = qmp_call(qmp.query_block_nodes(), "QMP query-named-block-nodes").await?;
         if nodes.iter().any(|n| n.node_name.starts_with(FLEECE_PREFIX)) {
-            clear_jobs(qmp, &[REPLICA_JOB_PREFIX]).await?;
+            clear_jobs(qmp, &[REPLICA_JOB_PREFIX, CATCH_UP_PREFIX]).await?;
         }
         clear_fleecing(qmp, &self.state_dir(id)).await
     }
@@ -1115,7 +1124,7 @@ impl Hypervisor for QemuHypervisor {
             )));
         }
         // 앞선 회차가 남긴 작업과 NBD 노드(TLS 객체를 쥔다)를 먼저 치운다.
-        clear_jobs(qmp, &[REPLICA_JOB_PREFIX]).await?;
+        clear_jobs(qmp, &[REPLICA_JOB_PREFIX, CATCH_UP_PREFIX]).await?;
         let fleece_dir = self.state_dir(id);
         clear_fleecing(qmp, &fleece_dir).await?;
         let disks = query_disks(qmp).await?;
@@ -1421,7 +1430,7 @@ impl Hypervisor for QemuHypervisor {
         }
     }
 
-    async fn finish_incoming(&self, id: Uuid) -> Result<(), DriverError> {
+    async fn finish_incoming(&self, id: Uuid, bitmap: Option<&str>) -> Result<(), DriverError> {
         let handle = self.running_handle(id)?;
         let mark = handle.paths.dir.join(INCOMING_MARK);
         if !mark.exists() {
@@ -1435,6 +1444,23 @@ impl Hypervisor for QemuHypervisor {
             match flatten(stop, "QMP nbd-server-stop") {
                 Ok(()) | Err(DriverError::Qmp(QmpError::Command { .. })) => {}
                 Err(e) => return Err(e),
+            }
+        }
+        if let (RunState::Paused, Some(name)) = (&state, bitmap) {
+            // 게스트가 돌기 전에 만들어야 이어서 실행한 뒤의 쓰기를 모두 담는다.
+            match query_disks(&handle.qmp).await {
+                Ok(disks) => {
+                    let actions: Vec<TransactionAction> =
+                        disks.iter().map(|disk| bitmap_add(disk, name)).collect();
+                    let r =
+                        tokio::time::timeout(QMP_TIMEOUT, handle.qmp.transaction(&actions)).await;
+                    if let Err(e) = flatten(r, "QMP transaction") {
+                        tracing::warn!(%id, bitmap = name, error = %e, "cannot add the dirty bitmap of the reversed replication");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%id, bitmap = name, error = %e, "cannot add the dirty bitmap of the reversed replication");
+                }
             }
         }
         match state {
@@ -1493,6 +1519,7 @@ impl Hypervisor for QemuHypervisor {
             check_devices(qmp, expected).await?;
         }
         remove_inconsistent_bitmaps(qmp, id).await;
+        let catch_up = opts.switchover_catch_up.as_ref();
         let mirrored = if opts.switchover_mirrors {
             let mirrored = mirrored_disks(&query_jobs(qmp).await?);
             if mirrored.is_empty() {
@@ -1506,35 +1533,50 @@ impl Hypervisor for QemuHypervisor {
         };
         // qcow2의 persistent 비트맵은 공유 이미지로 넘어간다. 능력을 켜면 그것도 스트림으로 보내고,
         // 마이그레이션이 실패하면 원본 이미지에 in-use로 남아 다음 시작에 inconsistent가 된다.
-        // 미러하는 디스크는 대상이 다른 이미지이므로 persistent 비트맵도 스트림으로 보낸다.
-        let dirty_bitmaps = migrated_bitmaps(&query_disks(qmp).await?, &mirrored);
+        // 미러하는 디스크는 대상이 다른 이미지이므로 persistent 비트맵도 스트림으로 보낸다. 따라잡기는 넘기지 않는다:
+        // 넘기는 비트맵은 마이그레이션 동안 바쁨이라 마지막 패스가 그 비트맵으로 작업을 시작하지 못한다(다른 복제
+        // 대상과 백업의 비트맵은 대상에서 없어 다음이 전체다).
+        let dirty_bitmaps =
+            catch_up.is_none() && migrated_bitmaps(&query_disks(qmp).await?, &mirrored);
+        let pause = opts.switchover_mirrors || catch_up.is_some();
         self.setup_migration(
             qmp,
             TlsEndpoint::Client,
             Some(&target.tls_hostname),
             opts.bandwidth,
             dirty_bitmaps,
-            opts.switchover_mirrors,
+            pause,
         )
         .await?;
         let uri = tcp_uri(&target.host, target.port);
-        tracing::info!(%id, %uri, mirrors = mirrored.len(), "migrating VM");
+        tracing::info!(%id, %uri, mirrors = mirrored.len(), catch_up = catch_up.is_some(), "migrating VM");
         flatten(
             tokio::time::timeout(QMP_TIMEOUT, qmp.migrate(&uri)).await,
             "QMP migrate",
         )?;
         let deadline = tokio::time::Instant::now() + opts.timeout;
-        let switchover = |s: &MigrationState| {
-            s.is_finished() || (opts.switchover_mirrors && *s == MigrationState::PreSwitchover)
-        };
+        let switchover =
+            |s: &MigrationState| s.is_finished() || (pause && *s == MigrationState::PreSwitchover);
         let mut info = wait_or_cancel(qmp, id, deadline, opts.timeout, switchover).await?;
         if info.state == MigrationState::PreSwitchover {
-            // 게스트가 멈췄고 원본은 아직 블록 장치를 쥐고 있다. 미러를 끝내면 대상이 원본과 같다.
-            if let Err(e) = complete_mirrors(qmp, &mirrored).await {
-                tracing::warn!(%id, error = %e, "disk mirrors failed at switchover; cancelling");
+            // 게스트가 멈췄고 원본은 아직 블록 장치를 쥐고 있다. 미러를 끝내거나 마지막 패스를 보내면 대상이 원본과 같다.
+            let done = match catch_up {
+                Some(state) => {
+                    match tokio::time::timeout_at(deadline, last_catch_up(qmp, state)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(DriverError::Migration(format!(
+                            "the last disk copy did not finish within {}",
+                            format_duration(opts.timeout)
+                        ))),
+                    }
+                }
+                None => complete_mirrors(qmp, &mirrored).await,
+            };
+            if let Err(e) = done {
+                tracing::warn!(%id, error = %e, "disk copies failed at switchover; cancelling");
                 cancel_and_wait(qmp).await?;
-                if let Err(clear) = clear_jobs(qmp, &[MIRROR_JOB_PREFIX]).await {
-                    tracing::warn!(%id, error = %clear, "cannot clear disk mirrors");
+                if let Err(clear) = clear_jobs(qmp, &[MIRROR_JOB_PREFIX, CATCH_UP_PREFIX]).await {
+                    tracing::warn!(%id, error = %clear, "cannot clear disk copies");
                 }
                 return Err(e);
             }
@@ -1605,6 +1647,72 @@ impl Hypervisor for QemuHypervisor {
         result
     }
 
+    async fn catch_up_disks(&self, id: Uuid, req: &CatchUp) -> Result<CatchUpState, DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        if req.targets.is_empty() || req.base.len() != req.targets.len() || req.passes == 0 {
+            return Err(DriverError::InvalidSpec(format!(
+                "nothing to catch up for VM {id}"
+            )));
+        }
+        let deadline = (tokio::time::Instant::now() + req.timeout, req.timeout);
+        // 앞선 따라잡기(와 복제 회차)가 남긴 작업, NBD 노드(TLS 객체를 쥔다)와 플리싱을 먼저 치운다.
+        clear_jobs(qmp, &[CATCH_UP_PREFIX, REPLICA_JOB_PREFIX]).await?;
+        let fleece_dir = self.state_dir(id);
+        clear_fleecing(qmp, &fleece_dir).await?;
+        let disks = query_disks(qmp).await?;
+        if let Some(t) = req.targets.iter().find(|t| t.disk >= disks.len()) {
+            return Err(DriverError::InvalidSpec(format!(
+                "VM {id} has no disk{}",
+                t.disk
+            )));
+        }
+        let _ = tokio::time::timeout(QMP_TIMEOUT, qmp.object_del(NBD_TLS_ID)).await;
+        let dir = migration_tls_dir(&self.config.state_dir);
+        qmp_call(
+            qmp.add_tls_creds(NBD_TLS_ID, &dir, TlsEndpoint::Client),
+            "QMP object-add",
+        )
+        .await?;
+        let mut result = Ok(());
+        for t in &req.targets {
+            let (_, node) = catch_up_names(t.disk);
+            let nbd = NbdBlockdev {
+                node_name: node,
+                host: t.host.clone(),
+                port: t.port,
+                export: t.export.clone(),
+                tls_creds: NBD_TLS_ID.into(),
+                tls_hostname: t.tls_hostname.clone(),
+            };
+            result = qmp_call(qmp.blockdev_add_nbd(&nbd), "QMP blockdev-add").await;
+            if result.is_err() {
+                break;
+            }
+        }
+        let halt = self.fleece_halt(id, &handle);
+        let result = match result {
+            Ok(()) => catch_up_passes(qmp, &disks, req, (&fleece_dir, &halt), deadline).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &result {
+            tracing::warn!(%id, error = %e, "catching up the disks failed; clearing the copies");
+            if let Err(clear) = clear_jobs(qmp, &[CATCH_UP_PREFIX]).await {
+                tracing::warn!(%id, error = %clear, "cannot clear the disk copies");
+            }
+            // 작업을 치우지 못했어도 떼어 본다(남으면 다음 회차·따라잡기·남은 것 치우기가 뗀다).
+            if let Err(clear) = clear_fleecing(qmp, &fleece_dir).await {
+                tracing::warn!(%id, error = %clear, "cannot remove the fleecing");
+            }
+            // 이 Task의 임시 비트맵만 지운다. 복제 비트맵은 그대로 둔다.
+            let prefix = format!("{MIGRATION_BITMAP_PREFIX}{}-", req.task.simple());
+            if let Err(remove) = remove_bitmaps_where(qmp, |name| name.starts_with(&prefix)).await {
+                tracing::warn!(%id, error = %remove, "cannot remove the catch-up dirty bitmaps");
+            }
+        }
+        result
+    }
+
     async fn stop_migrated(&self, id: Uuid) -> Result<bool, DriverError> {
         let Some(handle) = self.handle(id) else {
             return Ok(false);
@@ -1635,8 +1743,12 @@ impl Hypervisor for QemuHypervisor {
             tracing::warn!(%id, state = ?info.state, "cancelling an outgoing migration");
             cancel_and_wait(&handle.qmp).await?;
         }
-        // 마이그레이션을 멈춘 뒤 미러를 치운다(디스크 복사 중이거나 실패한 뒤 남은 것).
-        clear_jobs(&handle.qmp, &[MIRROR_JOB_PREFIX]).await
+        // 마이그레이션을 멈춘 뒤 미러와 따라잡기를 치운다(디스크 복사 중이거나 실패한 뒤 남은 것).
+        clear_jobs(&handle.qmp, &[MIRROR_JOB_PREFIX, CATCH_UP_PREFIX]).await?;
+        remove_bitmaps_where(&handle.qmp, |name| {
+            name.starts_with(MIGRATION_BITMAP_PREFIX)
+        })
+        .await
     }
 
     async fn check_devices(&self, id: Uuid, expected: &[String]) -> Result<(), DriverError> {
@@ -2513,12 +2625,17 @@ async fn wait_jobs(
     }
 }
 
-/// 앞선 증분 백업이 남긴 작업과 대상 노드(opld가 기다리다 죽었다)와 남은 디스크 미러, 복제 회차의 작업과 NBD
-/// 노드를 치우고, 남은 마이그레이션 따라잡기 비트맵을 지운다.
+/// 앞선 증분 백업이 남긴 작업과 대상 노드(opld가 기다리다 죽었다)와 남은 디스크 미러, 복제 회차와 마이그레이션
+/// 따라잡기의 작업과 NBD 노드를 치우고, 남은 마이그레이션 따라잡기 비트맵을 지운다.
 async fn clear_backup_leftovers(qmp: &QmpClient) -> Result<(), DriverError> {
     clear_jobs(
         qmp,
-        &[BACKUP_JOB_PREFIX, MIRROR_JOB_PREFIX, REPLICA_JOB_PREFIX],
+        &[
+            BACKUP_JOB_PREFIX,
+            MIRROR_JOB_PREFIX,
+            REPLICA_JOB_PREFIX,
+            CATCH_UP_PREFIX,
+        ],
     )
     .await?;
     remove_bitmaps_where(qmp, |name| name.starts_with(MIGRATION_BITMAP_PREFIX)).await
@@ -2889,7 +3006,22 @@ async fn send_replicas(
     // blockdev-backup transaction은 게스트의 진행 중인 I/O가 끝나기를 기다린다.
     let r = tokio::time::timeout(SNAPSHOT_TIMEOUT, qmp.transaction(&actions)).await;
     flatten(r, "QMP transaction")?;
-    let sent = wait_replication(qmp, &jobs, req).await;
+    let progress = req.progress.as_ref();
+    let limits = Limits {
+        stall: req.stall,
+        deadline: None,
+        fleece: dir,
+        reserve: fleece_reserve,
+    };
+    let sent = wait_sent(
+        qmp,
+        &jobs,
+        &limits,
+        progress,
+        MirrorProgress::default(),
+        &REPLICATION,
+    )
+    .await;
     // 작업을 모두 지운다. 회차가 실패했으면 지우기 오류보다 그 오류다(남은 작업은 다음 회차가 치운다).
     let mut dismissed = Ok(());
     for job in &jobs {
@@ -2902,14 +3034,67 @@ async fn send_replicas(
     dismissed.map(|()| sent)
 }
 
-/// 복제 작업 `ids`가 모두 끝나기를 기다리며 진행을 알리고 보낸 바이트(작업들의 `current-progress` 합)를
-/// 돌려준다. 하나라도 실패하거나 `req.stall` 동안 보낸 양이 늘지 않으면 아직 도는 나머지를 취소하고, 끝나기를
-/// [`CANCEL_WAIT`]까지 기다린 뒤 먼저 생긴 오류로 실패한다.
-async fn wait_replication(
+/// 대상에 블록을 보내는 작업(복제 회차, 마이그레이션 따라잡기)의 오류 문구와 종류
+struct Sending {
+    /// 오류 문구의 이름(`{what} job … failed`, `{what} made no progress …`)
+    what: &'static str,
+    error: fn(String) -> DriverError,
+}
+
+const REPLICATION: Sending = Sending {
+    what: "replication",
+    error: DriverError::Replication,
+};
+
+const CATCHING_UP: Sending = Sending {
+    what: "disk copy",
+    error: DriverError::Migration,
+};
+
+/// 보내는 작업을 기다리는 동안 지키는 한도([`wait_sent`])
+struct Limits<'a> {
+    /// 보낸 양이 이만큼 늘지 않으면 실패한다(끊긴 링크).
+    stall: Duration,
+    /// 이때까지 끝나지 않으면 실패한다(기한과 그 길이 — 오류 문구).
+    deadline: Option<(tokio::time::Instant, Duration)>,
+    /// 플리싱 이미지 디렉터리: 그 파일 시스템의 남은 공간이 `reserve(파일 시스템 크기)`보다 적어지면 실패한다.
+    fleece: &'a Path,
+    reserve: fn(u64) -> u64,
+}
+
+/// 크기가 `total`인 파일 시스템에서 보내는 동안 남겨 둘 공간([`FLEECE_RESERVE_BYTES`])
+fn fleece_reserve(total: u64) -> u64 {
+    FLEECE_RESERVE_BYTES.max(total / 100 * FLEECE_RESERVE_PERCENT)
+}
+
+/// 플리싱 이미지 디렉터리 `dir`의 남은 공간이 `reserve(파일 시스템 크기)` 이상인지 본다. 아니면 이유다.
+fn fleece_space_left(dir: &Path, reserve: fn(u64) -> u64) -> Result<(), String> {
+    let st = rustix::fs::statvfs(dir)
+        .map_err(|e| format!("cannot read the free space of {}: {e}", dir.display()))?;
+    let total = st.f_blocks.saturating_mul(st.f_frsize);
+    let available = st.f_bavail.saturating_mul(st.f_frsize);
+    let keep = reserve(total);
+    if available < keep {
+        return Err(format!(
+            "not enough space left in {} for the fleecing images: available {available}, keeping {keep}",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// 보내는 작업 `ids`가 모두 끝나기를 기다리며 진행(`before`에 더해)을 알리고 이 작업들이 보낸 바이트(`current-progress`
+/// 합)를 돌려준다. 하나라도 실패하거나, `limits.stall` 동안 보낸 양이 늘지 않거나, 기한이 지나거나, 플리싱 이미지를
+/// 둘 공간이 모자라면 아직 도는 나머지를 취소하고, 끝나기를 [`CANCEL_WAIT`]까지 기다린 뒤 먼저 생긴 오류로 실패한다.
+async fn wait_sent(
     qmp: &QmpClient,
     ids: &[String],
-    req: &ReplicateRequest,
+    limits: &Limits<'_>,
+    progress_tx: Option<&watch::Sender<MirrorProgress>>,
+    before: MirrorProgress,
+    how: &Sending,
 ) -> Result<u64, DriverError> {
+    let what = how.what;
     // 조회와 이벤트 사이에 끝나도 놓치지 않게 먼저 구독한다.
     let mut events = qmp.subscribe();
     let (mut most, mut moved) = (0, tokio::time::Instant::now());
@@ -2921,9 +3106,7 @@ async fn wait_replication(
         let mut running = Vec::new();
         for id in ids {
             let Some(job) = jobs.iter().find(|j| &j.id == id) else {
-                failed.get_or_insert_with(|| {
-                    DriverError::Replication(format!("replication job {id} disappeared"))
-                });
+                failed.get_or_insert_with(|| (how.error)(format!("{what} job {id} disappeared")));
                 continue;
             };
             progress.done_bytes += job.current_progress;
@@ -2931,13 +3114,16 @@ async fn wait_replication(
             if !job.is_concluded() {
                 running.push(id);
             } else if let Some(error) = &job.error {
-                failed.get_or_insert_with(|| {
-                    DriverError::Replication(format!("replication job {id} failed: {error}"))
-                });
+                failed
+                    .get_or_insert_with(|| (how.error)(format!("{what} job {id} failed: {error}")));
             }
         }
-        if let Some(tx) = &req.progress {
-            tx.send_if_modified(|p| std::mem::replace(p, progress) != progress);
+        if let Some(tx) = progress_tx {
+            let total = MirrorProgress {
+                done_bytes: before.done_bytes + progress.done_bytes,
+                total_bytes: before.total_bytes + progress.total_bytes,
+            };
+            tx.send_if_modified(|p| std::mem::replace(p, total) != total);
         }
         if running.is_empty() {
             return match failed {
@@ -2946,23 +3132,39 @@ async fn wait_replication(
             };
         }
         let now = tokio::time::Instant::now();
+        let stall = limits.stall;
         if progress.done_bytes > most {
             (most, moved) = (progress.done_bytes, now);
-        } else if now - moved >= req.stall {
+        } else if now - moved >= stall {
             failed.get_or_insert_with(|| {
-                DriverError::Replication(format!(
-                    "replication made no progress for {}",
-                    format_duration(req.stall)
+                (how.error)(format!(
+                    "{what} made no progress for {}",
+                    format_duration(stall)
                 ))
             });
+        }
+        if let Some((at, limit)) = limits.deadline
+            && now >= at
+        {
+            failed.get_or_insert_with(|| {
+                (how.error)(format!(
+                    "{what} did not finish within {}",
+                    format_duration(limit)
+                ))
+            });
+        }
+        if failed.is_none()
+            && let Err(why) = fleece_space_left(limits.fleece, limits.reserve)
+        {
+            failed = Some((how.error)(why));
         }
         if let Some(e) = &failed {
             match cancelled {
                 None => {
-                    tracing::warn!(error = %e, jobs = ?running, "cancelling replication jobs");
+                    tracing::warn!(error = %e, jobs = ?running, "cancelling {what} jobs");
                     for id in &running {
                         if let Err(e) = qmp_call(qmp.job_cancel(id), "QMP job-cancel").await {
-                            tracing::warn!(job = %id, error = %e, "cannot cancel replication job");
+                            tracing::warn!(job = %id, error = %e, "cannot cancel {what} job");
                         }
                     }
                     cancelled = Some(now);
@@ -2980,6 +3182,219 @@ async fn wait_replication(
             _ = tokio::time::sleep(JOB_POLL) => {}
         }
     }
+}
+
+/// 따라잡기 디스크 `disk`의 작업 id와 NBD 대상 노드 이름
+fn catch_up_names(disk: usize) -> (String, String) {
+    (
+        format!("{CATCH_UP_PREFIX}{disk}"),
+        format!("{CATCH_UP_NBD_PREFIX}{disk}"),
+    )
+}
+
+/// 따라잡기 패스를 플리싱으로 할 때의 (플리싱 이미지 디렉터리, 멈추는 VM, 붙인 플리싱)
+type CatchUpFleece<'a> = (&'a Path, &'a FleeceHalt<'a>, &'a mut Vec<Fleece>);
+
+/// 따라잡기 패스 하나의 작업들을 시작한다: 디스크마다(`new`가 있으면 새 임시 비트맵을 만들고) `blockdev-backup`(기준
+/// 비트맵이 있으면 그 뒤 바뀐 블록, 없으면 전체)을 연 NBD 노드로 시작한다. `fleece`가 있으면(게스트가 도는 패스) 복제
+/// 회차처럼 플리싱을 붙여 그 시점의 디스크를 보내고(원격 쓰기가 실패해도 게스트 쓰기는 성공한다), 없으면(게스트가
+/// 멈춘 마지막 패스) transaction 하나로 디스크에서 바로 보낸다. 작업 id를 돌려준다.
+async fn start_catch_up_pass(
+    qmp: &QmpClient,
+    disks: &[BlockNode],
+    passes: &[(usize, Option<String>)],
+    new: Option<&str>,
+    speed: Option<u64>,
+    fleece: Option<CatchUpFleece<'_>>,
+) -> Result<Vec<String>, DriverError> {
+    let mut actions = Vec::new();
+    let mut jobs = Vec::new();
+    // 패스 사이에만 쓰는 비트맵이라 이미지에 저장하지 않는다.
+    let new: Vec<TransactionAction> = new
+        .into_iter()
+        .flat_map(|new| {
+            passes
+                .iter()
+                .map(move |(i, _)| TransactionAction::BitmapAdd {
+                    node: disks[*i].node_name.clone(),
+                    name: new.to_string(),
+                    persistent: false,
+                })
+        })
+        .collect();
+    let mut sources = Vec::new();
+    match fleece {
+        Some((dir, halt, fleeces)) => {
+            let indexes: Vec<usize> = passes.iter().map(|(i, _)| *i).collect();
+            let error = DriverError::Migration;
+            start_fleecing(qmp, disks, &indexes, &new, dir, halt, error, fleeces).await?;
+            for (i, base) in passes {
+                let (_, _, access) = fleece_nodes(*i);
+                let sync = match base {
+                    Some(base) => {
+                        copy_bitmap(qmp, &disks[*i].node_name, base, &access).await?;
+                        BackupSync::Bitmap(FLEECE_BITMAP.into())
+                    }
+                    None => BackupSync::Full,
+                };
+                sources.push((*i, access, sync));
+            }
+        }
+        None => {
+            actions.extend(new);
+            for (i, base) in passes {
+                let sync = match base {
+                    Some(base) => BackupSync::Bitmap(base.clone()),
+                    None => BackupSync::Full,
+                };
+                sources.push((*i, disks[*i].node_name.clone(), sync));
+            }
+        }
+    }
+    for (i, device, sync) in sources {
+        let (job, node) = catch_up_names(i);
+        actions.push(TransactionAction::Backup {
+            job_id: job.clone(),
+            device,
+            target: node,
+            sync,
+            speed,
+        });
+        jobs.push(job);
+    }
+    // blockdev-backup transaction은 게스트의 진행 중인 I/O가 끝나기를 기다린다.
+    let r = tokio::time::timeout(SNAPSHOT_TIMEOUT, qmp.transaction(&actions)).await;
+    flatten(r, "QMP transaction")?;
+    Ok(jobs)
+}
+
+/// 끝난 작업들을 지운다. 지우지 못하면 오류다(남은 작업은 다음 따라잡기가 치운다).
+async fn dismiss_jobs(qmp: &QmpClient, jobs: &[String]) -> Result<(), DriverError> {
+    let mut dismissed = Ok(());
+    for job in jobs {
+        if let Err(e) = qmp_call(qmp.job_dismiss(job), "QMP job-dismiss").await {
+            tracing::warn!(%job, error = %e, "cannot dismiss a disk copy job");
+            dismissed = dismissed.and(Err(e));
+        }
+    }
+    dismissed
+}
+
+/// [`Hypervisor::catch_up_disks`]의 패스들(NBD 노드는 열려 있다). 패스마다 플리싱(`fleece` — 플리싱 이미지 디렉터리와
+/// 멈추는 VM)을 붙였다 뗀다. 기한(`deadline` — 시각과 그 길이)이 지나면 그 패스의 작업을 취소하고 플리싱을 뗀 뒤
+/// 실패한다.
+async fn catch_up_passes(
+    qmp: &QmpClient,
+    disks: &[BlockNode],
+    req: &CatchUp,
+    fleece: (&Path, &FleeceHalt<'_>),
+    deadline: (tokio::time::Instant, Duration),
+) -> Result<CatchUpState, DriverError> {
+    let indexes: Vec<usize> = req.targets.iter().map(|t| t.disk).collect();
+    let mut passes: Vec<(usize, Option<String>)> = indexes
+        .iter()
+        .copied()
+        .zip(req.base.iter().cloned())
+        .collect();
+    let mut sent = MirrorProgress::default();
+    for k in 1..=req.passes {
+        let new = migration_bitmap(req.task, k);
+        let mut fleeces = Vec::new();
+        let (dir, halt) = fleece;
+        let started = start_catch_up_pass(
+            qmp,
+            disks,
+            &passes,
+            Some(&new),
+            req.speed,
+            Some((dir, halt, &mut fleeces)),
+        )
+        .await;
+        let jobs = match started {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                if let Err(stop) = stop_fleecing(qmp, &mut fleeces).await {
+                    tracing::warn!(error = %stop, "cannot remove the fleecing");
+                }
+                return Err(e);
+            }
+        };
+        let limits = Limits {
+            stall: req.stall,
+            deadline: Some(deadline),
+            fleece: dir,
+            reserve: fleece_reserve,
+        };
+        let waited = wait_sent(
+            qmp,
+            &jobs,
+            &limits,
+            req.progress.as_ref(),
+            sent,
+            &CATCHING_UP,
+        )
+        .await;
+        let dismissed = dismiss_jobs(qmp, &jobs).await;
+        let unfleeced = stop_fleecing(qmp, &mut fleeces).await;
+        let bytes = waited?;
+        dismissed?;
+        unfleeced?;
+        sent.done_bytes += bytes;
+        sent.total_bytes += bytes;
+        // 앞 패스의 임시 비트맵은 이제 쓸모가 없다(첫 패스의 복제 비트맵은 확정 전까지 둔다).
+        if k > 1 {
+            let old = migration_bitmap(req.task, k - 1);
+            remove_bitmaps_where(qmp, |name| name == old).await?;
+        }
+        let now = query_disks(qmp).await?;
+        let dirty: u64 = now
+            .iter()
+            .filter(|d| disk_index(&d.node_name).is_some_and(|i| indexes.contains(&i)))
+            .flat_map(|d| d.bitmaps.iter().filter(|b| b.name == new))
+            .map(|b| b.count)
+            .sum();
+        tracing::info!(pass = k, bytes, dirty, "caught up the disks once");
+        if dirty <= req.limit || k == req.passes {
+            return Ok(CatchUpState {
+                disks: indexes,
+                bitmap: new,
+                passes: k,
+            });
+        }
+        for (_, base) in &mut passes {
+            *base = Some(new.clone());
+        }
+    }
+    Err(DriverError::InvalidSpec("no catch-up pass to run".into()))
+}
+
+/// 스위치오버 직전(게스트가 멈춤)의 마지막 따라잡기 패스: 따라잡은 디스크마다 마지막 비트맵 뒤 바뀐 블록을 보내고
+/// 작업을 지운 뒤 NBD 노드를 닫는다(닫을 때 대상에 쓴 것을 내보내므로 닫지 못하면 실패다). 작업이 실패하면 그 오류다.
+async fn last_catch_up(qmp: &QmpClient, state: &CatchUpState) -> Result<(), DriverError> {
+    let disks = query_disks(qmp).await?;
+    if let Some(i) = state.disks.iter().find(|i| **i >= disks.len()) {
+        return Err(DriverError::Migration(format!("VM has no disk{i}")));
+    }
+    let passes: Vec<(usize, Option<String>)> = state
+        .disks
+        .iter()
+        .map(|i| (*i, Some(state.bitmap.clone())))
+        .collect();
+    let jobs = start_catch_up_pass(qmp, &disks, &passes, None, None, None).await?;
+    let failed = wait_jobs(qmp, &jobs).await?;
+    let dismissed = dismiss_jobs(qmp, &jobs).await;
+    if let Some((id, error)) = failed {
+        return Err(DriverError::Migration(format!(
+            "disk copy job {id} failed: {error}"
+        )));
+    }
+    dismissed?;
+    for i in &state.disks {
+        let (_, node) = catch_up_names(*i);
+        let del = tokio::time::timeout(SNAPSHOT_TIMEOUT, qmp.blockdev_del(&node)).await;
+        flatten(del, "QMP blockdev-del")?;
+    }
+    Ok(())
 }
 
 /// 받는 QEMU에 TLS 자격 증명(받는 쪽, 상대 인증서 확인)을 만들고, 복제본마다 블록 노드(`opl-repl-{i}`)를 연
@@ -4191,6 +4606,7 @@ time.sleep(60)
             bandwidth: Some(64 << 20),
             timeout: Duration::from_secs(10),
             switchover_mirrors: false,
+            switchover_catch_up: None,
             devices: None,
         };
         hv.migrate(vm.id, &target(), &opts).await.unwrap();
@@ -4261,6 +4677,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_secs(10),
             switchover_mirrors: false,
+            switchover_catch_up: None,
             devices: None,
         };
         hv.migrate(vm.id, &target(), &opts).await.unwrap();
@@ -4286,6 +4703,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_secs(10),
             switchover_mirrors: false,
+            switchover_catch_up: None,
             devices: Some(devices.iter().map(|d| d.to_string()).collect()),
         };
         // 게스트가 아직 내려 주지 않은 disk1-dev, 기록에만 있는 cpu2
@@ -4323,6 +4741,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_secs(10),
             switchover_mirrors: false,
+            switchover_catch_up: None,
             devices: None,
         };
         match hv.migrate(vm.id, &target(), &opts).await.unwrap_err() {
@@ -4345,6 +4764,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_millis(200),
             switchover_mirrors: false,
+            switchover_catch_up: None,
             devices: None,
         };
         let err = hv.migrate(vm.id, &target(), &opts).await.unwrap_err();
@@ -4661,6 +5081,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_secs(10),
             switchover_mirrors: true,
+            switchover_catch_up: None,
             devices: None,
         };
         hv.migrate(vm.id, &target(), &opts).await.unwrap();
@@ -4729,6 +5150,7 @@ time.sleep(60)
             bandwidth: None,
             timeout: Duration::from_secs(10),
             switchover_mirrors: true,
+            switchover_catch_up: None,
             devices: None,
         };
         let err = hv.migrate(vm.id, &target(), &opts).await.unwrap_err();
@@ -4822,6 +5244,636 @@ time.sleep(60)
                     ),
                 ]
             );
+        }
+    }
+
+    /// 따라잡기 요청: disk0는 복제 비트맵 `opl-a` 뒤 바뀐 블록부터, disk1은 전체부터
+    fn catch_up_request(task: Uuid, limit: u64, passes: u8) -> CatchUp {
+        let targets = mirror_targets()
+            .into_iter()
+            .map(|t| MirrorTarget {
+                export: format!("vol{}", t.disk),
+                ..t
+            })
+            .collect();
+        CatchUp {
+            targets,
+            base: vec![Some("opl-a".into()), None],
+            task,
+            limit,
+            passes,
+            speed: Some(1 << 20),
+            stall: Duration::from_secs(600),
+            timeout: Duration::from_secs(600),
+            progress: None,
+        }
+    }
+
+    /// 임시 비트맵이 담은 바이트를 디스크 노드에 드러낸다.
+    fn dirty(fake: &FakeQmp, node: &'static str, name: &str, count: u64) {
+        fake.extra_bitmaps.lock().unwrap().push((
+            node,
+            serde_json::json!({ "name": name, "recording": true, "persistent": false, "count": count }),
+        ));
+    }
+
+    const CATCH_UP_COMMANDS: [&str; 11] = [
+        "object-add",
+        "blockdev-add",
+        "transaction",
+        "job-cancel",
+        "job-dismiss",
+        "blockdev-del",
+        "block-dirty-bitmap-remove",
+        "query-jobs",
+        "object-del",
+        "qom-set",
+        "block-dirty-bitmap-merge",
+    ];
+
+    /// 두 디스크에 플리싱을 붙이는 명령(`CATCH_UP_COMMANDS`에 드는 것): 이미지 노드 둘 → 새 비트맵 transaction →
+    /// 디스크마다 필터와 장치 바꾸기 → snapshot-access 둘
+    const FLEECE_ON: [&str; 9] = [
+        "blockdev-add",
+        "blockdev-add",
+        "transaction",
+        "blockdev-add",
+        "qom-set",
+        "blockdev-add",
+        "qom-set",
+        "blockdev-add",
+        "blockdev-add",
+    ];
+
+    /// 두 디스크의 플리싱을 떼는 명령: 디스크마다 snapshot-access → 장치 되돌리기 → 필터 → 이미지
+    const FLEECE_OFF: [&str; 8] = [
+        "blockdev-del",
+        "qom-set",
+        "blockdev-del",
+        "blockdev-del",
+        "blockdev-del",
+        "qom-set",
+        "blockdev-del",
+        "blockdev-del",
+    ];
+
+    /// 따라잡기: NBD TLS(client) → 디스크마다 NBD 노드 → 패스마다 플리싱을 붙이고(새 임시 비트맵은 그 시점에) 기준
+    /// 비트맵(첫 패스는 복제 비트맵, 다음은 앞 임시 비트맵)을 snapshot-access 노드에 옮겨 담은 뒤 transaction 하나(디스크
+    /// 마다 blockdev-backup, 기준이 없으면 전체) → 끝을 기다림 → 작업 지우기 → 플리싱 떼기 → 앞 임시 비트맵 지우기. 새
+    /// 비트맵이 담은 바이트가 한도 이하면 멈추고 노드는 열어 둔다. 패스 수의 최댓값에서도 멈춘다.
+    #[tokio::test]
+    async fn catch_up_runs_passes_until_the_changes_are_small() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let task = Uuid::now_v7();
+        let (first, second) = (migration_bitmap(task, 1), migration_bitmap(task, 2));
+        dirty(&fake, "disk0", &first, 100 << 20);
+        dirty(&fake, "disk1", &first, 0);
+        dirty(&fake, "disk0", &second, 1 << 20);
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-catchup-0", "concluded", 1000, None),
+                repl_job("opl-catchup-1", "concluded", 2000, None)
+            ]),
+            serde_json::json!([
+                repl_job("opl-catchup-0", "concluded", 10, None),
+                repl_job("opl-catchup-1", "concluded", 20, None)
+            ]),
+        ]);
+        let (tx, rx) = tokio::sync::watch::channel(MirrorProgress::default());
+        let mut req = catch_up_request(task, 64 << 20, 5);
+        req.progress = Some(tx);
+        let state = hv.catch_up_disks(id, &req).await.unwrap();
+        assert_eq!(
+            state,
+            CatchUpState {
+                disks: vec![0, 1],
+                bitmap: second.clone(),
+                passes: 2
+            }
+        );
+        assert_eq!(rx.borrow().done_bytes, 3030);
+
+        let sent = sent(&fake, &CATCH_UP_COMMANDS);
+        let mut expected = vec![
+            "query-jobs",
+            "object-del",
+            "object-add",
+            "blockdev-add",
+            "blockdev-add",
+        ];
+        expected.extend(FLEECE_ON);
+        expected.extend([
+            "block-dirty-bitmap-merge",
+            "transaction",
+            "query-jobs",
+            "job-dismiss",
+            "job-dismiss",
+        ]);
+        expected.extend(FLEECE_OFF);
+        expected.extend(FLEECE_ON);
+        expected.extend([
+            "block-dirty-bitmap-merge",
+            "block-dirty-bitmap-merge",
+            "transaction",
+            "query-jobs",
+            "job-dismiss",
+            "job-dismiss",
+        ]);
+        expected.extend(FLEECE_OFF);
+        expected.extend(["block-dirty-bitmap-remove", "block-dirty-bitmap-remove"]);
+        assert_eq!(names_of(&sent), expected);
+        assert_eq!(sent[1].1, serde_json::json!({ "id": "opl-nbd-tls" }));
+        assert_eq!(sent[2].1["endpoint"], "client");
+        assert_eq!(
+            sent[4].1,
+            serde_json::json!({
+                "driver": "nbd", "node-name": "opl-catchup-nbd-1",
+                "server": { "type": "inet", "host": "10.0.0.2", "port": "60007" },
+                "export": "vol1", "tls-creds": "opl-nbd-tls", "tls-hostname": "node-b"
+            })
+        );
+        // 첫 패스: 새 임시 비트맵은 플리싱을 붙일 때, disk0은 복제 비트맵 뒤 바뀐 블록만, disk1은 전체
+        assert_eq!(
+            sent[7].1["actions"],
+            serde_json::json!([
+                { "type": "block-dirty-bitmap-add",
+                  "data": { "node": "disk0", "name": first, "persistent": false } },
+                { "type": "block-dirty-bitmap-add",
+                  "data": { "node": "disk1", "name": first, "persistent": false } },
+            ])
+        );
+        assert_eq!(
+            sent[14].1,
+            serde_json::json!({
+                "node": "opl-fl-acc-0", "target": "opl-fl-base",
+                "bitmaps": [{ "node": "disk0", "name": "opl-a" }]
+            })
+        );
+        assert_eq!(
+            sent[15].1["actions"],
+            serde_json::json!([
+                { "type": "blockdev-backup", "data": {
+                    "job-id": "opl-catchup-0", "device": "opl-fl-acc-0", "target": "opl-catchup-nbd-0",
+                    "sync": "bitmap", "bitmap": "opl-fl-base", "bitmap-mode": "never",
+                    "speed": 1048576, "auto-dismiss": false } },
+                { "type": "blockdev-backup", "data": {
+                    "job-id": "opl-catchup-1", "device": "opl-fl-acc-1", "target": "opl-catchup-nbd-1",
+                    "sync": "full", "speed": 1048576, "auto-dismiss": false } },
+            ])
+        );
+        // 둘째 패스는 앞 임시 비트맵 뒤 바뀐 블록만
+        let second_pass = 19 + FLEECE_OFF.len();
+        assert_eq!(
+            sent[second_pass + 2].1["actions"][1]["data"]["name"],
+            second
+        );
+        assert_eq!(
+            sent[second_pass + 10].1,
+            serde_json::json!({
+                "node": "opl-fl-acc-1", "target": "opl-fl-base",
+                "bitmaps": [{ "node": "disk1", "name": first }]
+            })
+        );
+        assert_eq!(
+            sent[second_pass + 11].1["actions"][1]["data"],
+            serde_json::json!({
+                "job-id": "opl-catchup-1", "device": "opl-fl-acc-1", "target": "opl-catchup-nbd-1",
+                "sync": "bitmap", "bitmap": "opl-fl-base", "bitmap-mode": "never",
+                "speed": 1048576, "auto-dismiss": false
+            })
+        );
+        // 첫 패스의 복제 비트맵은 남기고 앞 임시 비트맵만 지운다.
+        let n = sent.len();
+        assert_eq!(
+            sent[n - 2].1,
+            serde_json::json!({ "node": "disk0", "name": first })
+        );
+        assert_eq!(
+            sent[n - 1].1,
+            serde_json::json!({ "node": "disk1", "name": first })
+        );
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+        assert_eq!(*fake.roots.lock().unwrap(), ["disk0", "disk1"]);
+        assert_eq!(
+            *fake.nbd_nodes.lock().unwrap(),
+            ["opl-catchup-nbd-0", "opl-catchup-nbd-1"]
+        );
+
+        // 한도를 넘어도 패스 수의 최댓값에서 멈춘다.
+        fake.nbd_nodes.lock().unwrap().clear();
+        fake.commands.lock().unwrap().clear();
+        fake.arguments.lock().unwrap().clear();
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-catchup-0", "concluded", 1000, None),
+                repl_job("opl-catchup-1", "concluded", 2000, None)
+            ]),
+        ]);
+        let state = hv
+            .catch_up_disks(id, &catch_up_request(task, 64 << 20, 1))
+            .await
+            .unwrap();
+        assert_eq!((state.passes, state.bitmap), (1, first));
+        assert_eq!(
+            fake.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| *c == "transaction")
+                .count(),
+            2
+        );
+    }
+
+    /// 작업 하나가 실패하면 나머지를 취소하고, 노드를 닫고, 이 Task의 임시 비트맵만 지운다(복제 비트맵 `opl-a`는
+    /// 남는다).
+    #[tokio::test]
+    async fn a_failed_catch_up_clears_the_copies_and_its_bitmaps() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let task = Uuid::now_v7();
+        let first = migration_bitmap(task, 1);
+        dirty(&fake, "disk0", &first, 0);
+        dirty(&fake, "disk1", &first, 0);
+        dirty(&fake, "disk1", &migration_bitmap(Uuid::now_v7(), 1), 0);
+        let failed = || {
+            serde_json::json!([
+                repl_job("opl-catchup-0", "concluded", 10, Some("Operation canceled")),
+                repl_job(
+                    "opl-catchup-1",
+                    "concluded",
+                    0,
+                    Some("Connection reset by peer")
+                )
+            ])
+        };
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-catchup-0", "running", 10, None),
+                repl_job(
+                    "opl-catchup-1",
+                    "concluded",
+                    0,
+                    Some("Connection reset by peer")
+                )
+            ]),
+            failed(),
+            // 지우지 못한 작업이 남지 않았다.
+            serde_json::json!([]),
+        ]);
+        let err = hv
+            .catch_up_disks(id, &catch_up_request(task, 64 << 20, 5))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "migration failed: disk copy job opl-catchup-1 failed: Connection reset by peer"
+        );
+        let sent = sent(
+            &fake,
+            &[
+                "job-cancel",
+                "job-dismiss",
+                "blockdev-del",
+                "block-dirty-bitmap-remove",
+            ],
+        );
+        // 플리싱(디스크마다 노드 셋)과 NBD 노드를 닫고 임시 비트맵을 지운다.
+        let mut expected = vec!["job-cancel", "job-dismiss", "job-dismiss"];
+        expected.extend(["blockdev-del"; 8]);
+        expected.extend(["block-dirty-bitmap-remove"; 2]);
+        assert_eq!(names_of(&sent), expected);
+        assert_eq!(sent[0].1, serde_json::json!({ "id": "opl-catchup-0" }));
+        assert_eq!(
+            sent[11].1,
+            serde_json::json!({ "node": "disk0", "name": first })
+        );
+        assert_eq!(
+            sent[12].1,
+            serde_json::json!({ "node": "disk1", "name": first })
+        );
+        assert!(fake.nbd_nodes.lock().unwrap().is_empty());
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+    }
+
+    /// 따라잡기가 기한(`timeout`)을 넘기면 드라이버가 작업을 취소하고 플리싱을 뗀 뒤(노드·장치·파일이 남지 않는다)
+    /// 실패한다.
+    #[tokio::test]
+    async fn a_catch_up_past_its_deadline_removes_the_fleecing() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let task = Uuid::now_v7();
+        let canceled = || {
+            serde_json::json!([
+                repl_job("opl-catchup-0", "concluded", 10, Some("Operation canceled")),
+                repl_job("opl-catchup-1", "concluded", 10, Some("Operation canceled"))
+            ])
+        };
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([]),
+            serde_json::json!([
+                repl_job("opl-catchup-0", "running", 10, None),
+                repl_job("opl-catchup-1", "running", 10, None)
+            ]),
+            canceled(),
+            serde_json::json!([]),
+        ]);
+        let mut req = catch_up_request(task, 64 << 20, 5);
+        req.timeout = Duration::ZERO;
+        let err = hv.catch_up_disks(id, &req).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "migration failed: disk copy did not finish within 0ms"
+        );
+        assert_eq!(sent(&fake, &["job-cancel"]).len(), 2);
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+        assert!(fake.nbd_nodes.lock().unwrap().is_empty());
+        assert_eq!(*fake.roots.lock().unwrap(), ["disk0", "disk1"]);
+        let fleece = tmp.path().join("state").join("vm").join(id.to_string());
+        let left = std::fs::read_dir(&fleece)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("fleece-")
+            })
+            .count();
+        assert_eq!(left, 0);
+    }
+
+    /// 보내는 동안 플리싱 이미지를 둘 파일 시스템의 남은 공간이 남겨 둘 공간(1 GiB와 파일 시스템의 5% 가운데 큰
+    /// 쪽)보다 줄면 작업을 취소하고 공간 부족으로 실패한다.
+    #[tokio::test]
+    async fn sending_stops_when_the_fleecing_space_runs_low() {
+        assert_eq!(fleece_reserve(0), 1 << 30);
+        assert_eq!(fleece_reserve(10 << 30), 1 << 30);
+        assert_eq!(fleece_reserve(100 << 30), 5 << 30);
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([repl_job("opl-repl-0", "running", 10, None)]),
+            serde_json::json!([repl_job(
+                "opl-repl-0",
+                "concluded",
+                10,
+                Some("Operation canceled")
+            )]),
+        ]);
+        let handle = hv.handle(id).unwrap();
+        let limits = Limits {
+            stall: Duration::from_secs(600),
+            deadline: None,
+            fleece: tmp.path(),
+            reserve: |_| u64::MAX,
+        };
+        let err = wait_sent(
+            &handle.qmp,
+            &["opl-repl-0".to_string()],
+            &limits,
+            None,
+            MirrorProgress::default(),
+            &REPLICATION,
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "replication failed: not enough space left in {} for the fleecing images: available ",
+                tmp.path().display()
+            )),
+            "{message}"
+        );
+        assert_eq!(sent(&fake, &["job-cancel"]).len(), 1);
+    }
+
+    /// 스위치오버: 따라잡기면 `dirty-bitmaps` 없이 `pause-before-switchover`로 보내고, `pre-switchover`에서 마지막
+    /// 비트맵 뒤 바뀐 블록을 보낸 뒤(새 비트맵 없이) 작업을 지우고 노드를 닫고 이어 간다. 마지막 패스가 실패하면
+    /// 취소하고 치운 뒤 실패한다.
+    #[tokio::test]
+    async fn migrate_sends_the_last_catch_up_pass_at_pre_switchover() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp_with(&dir, "running", "pre-switchover").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        fake.nbd_nodes.lock().unwrap().extend([
+            "opl-catchup-nbd-0".to_string(),
+            "opl-catchup-nbd-1".to_string(),
+        ]);
+        fake.jobs.lock().unwrap().extend([serde_json::json!([
+            repl_job("opl-catchup-0", "concluded", 100, None),
+            repl_job("opl-catchup-1", "concluded", 100, None)
+        ])]);
+        let opts = MigrateOptions {
+            bandwidth: None,
+            timeout: Duration::from_secs(10),
+            switchover_mirrors: false,
+            switchover_catch_up: Some(CatchUpState {
+                disks: vec![0, 1],
+                bitmap: "opl-mig-x-2".into(),
+                passes: 2,
+            }),
+            devices: None,
+        };
+        hv.migrate(vm.id, &target(), &opts).await.unwrap();
+        let sent = sent(
+            &fake,
+            &[
+                "migrate-set-capabilities",
+                "migrate",
+                "transaction",
+                "job-dismiss",
+                "blockdev-del",
+                "migrate-continue",
+                "migrate_cancel",
+            ],
+        );
+        assert_eq!(
+            names_of(&sent),
+            [
+                "migrate-set-capabilities",
+                "migrate",
+                "transaction",
+                "job-dismiss",
+                "job-dismiss",
+                "blockdev-del",
+                "blockdev-del",
+                "migrate-continue"
+            ]
+        );
+        // FakeQmp의 raw 디스크에는 저장되지 않는 `opl-` 비트맵이 있지만 따라잡기는 비트맵을 넘기지 않는다.
+        assert_eq!(
+            sent[0].1["capabilities"],
+            serde_json::json!([
+                { "capability": "events", "state": true },
+                { "capability": "auto-converge", "state": true },
+                { "capability": "dirty-bitmaps", "state": false },
+                { "capability": "pause-before-switchover", "state": true }
+            ])
+        );
+        assert_eq!(
+            sent[2].1["actions"],
+            serde_json::json!([
+                { "type": "blockdev-backup", "data": {
+                    "job-id": "opl-catchup-0", "device": "disk0", "target": "opl-catchup-nbd-0",
+                    "sync": "bitmap", "bitmap": "opl-mig-x-2", "bitmap-mode": "never",
+                    "auto-dismiss": false } },
+                { "type": "blockdev-backup", "data": {
+                    "job-id": "opl-catchup-1", "device": "disk1", "target": "opl-catchup-nbd-1",
+                    "sync": "bitmap", "bitmap": "opl-mig-x-2", "bitmap-mode": "never",
+                    "auto-dismiss": false } },
+            ])
+        );
+        assert_eq!(
+            sent[6].1,
+            serde_json::json!({ "node-name": "opl-catchup-nbd-1" })
+        );
+        assert!(fake.nbd_nodes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_last_catch_up_pass_cancels_the_migration() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let fake = fake_qmp_with(&dir, "running", "pre-switchover").await;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        fake.nbd_nodes
+            .lock()
+            .unwrap()
+            .push("opl-catchup-nbd-0".to_string());
+        let ended = serde_json::json!([repl_job(
+            "opl-catchup-0",
+            "concluded",
+            10,
+            Some("Input/output error")
+        )]);
+        fake.jobs
+            .lock()
+            .unwrap()
+            .extend([ended.clone(), ended, serde_json::json!([])]);
+        let opts = MigrateOptions {
+            bandwidth: None,
+            timeout: Duration::from_secs(10),
+            switchover_mirrors: false,
+            switchover_catch_up: Some(CatchUpState {
+                disks: vec![0],
+                bitmap: "opl-mig-x-1".into(),
+                passes: 1,
+            }),
+            devices: None,
+        };
+        let err = hv.migrate(vm.id, &target(), &opts).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "migration failed: disk copy job opl-catchup-0 failed: Input/output error"
+        );
+        let commands = fake.commands.lock().unwrap().clone();
+        let at = |name: &str| commands.iter().position(|c| c == name).unwrap();
+        assert!(at("transaction") < at("migrate_cancel"));
+        assert!(!commands.contains(&"migrate-continue".to_string()));
+        assert!(fake.nbd_nodes.lock().unwrap().is_empty());
+    }
+
+    /// 되돌리기는 남은 따라잡기 작업·노드를 치우고 따라잡기 임시 비트맵을 지운다(다른 비트맵은 그대로).
+    #[tokio::test]
+    async fn cancel_migration_clears_a_left_catch_up() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.nbd_nodes
+            .lock()
+            .unwrap()
+            .push("opl-catchup-nbd-0".to_string());
+        dirty(&fake, "disk0", "opl-mig-x-1", 0);
+        dirty(&fake, "disk0", "opl-repl-x-y", 0);
+        fake.jobs.lock().unwrap().extend([
+            serde_json::json!([repl_job("opl-catchup-0", "running", 10, None)]),
+            serde_json::json!([repl_job(
+                "opl-catchup-0",
+                "concluded",
+                10,
+                Some("Operation canceled")
+            )]),
+        ]);
+        hv.cancel_migration(id).await.unwrap();
+        let sent = sent(
+            &fake,
+            &[
+                "job-cancel",
+                "job-dismiss",
+                "blockdev-del",
+                "block-dirty-bitmap-remove",
+            ],
+        );
+        assert_eq!(
+            sent,
+            [
+                (
+                    "job-cancel".to_string(),
+                    serde_json::json!({ "id": "opl-catchup-0" })
+                ),
+                (
+                    "job-dismiss".to_string(),
+                    serde_json::json!({ "id": "opl-catchup-0" })
+                ),
+                (
+                    "blockdev-del".to_string(),
+                    serde_json::json!({ "node-name": "opl-catchup-nbd-0" })
+                ),
+                (
+                    "block-dirty-bitmap-remove".to_string(),
+                    serde_json::json!({ "node": "disk0", "name": "opl-mig-x-1" })
+                ),
+            ]
+        );
+    }
+
+    /// 받는 쪽 넘겨받기: 비트맵을 주면 NBD를 멈춘 뒤·이어서 실행하기 전에 모든 디스크에 만든다(qcow2만 저장). 만들지
+    /// 못해도 넘겨받는다.
+    #[tokio::test]
+    async fn finish_incoming_adds_the_reversed_replica_bitmap_before_continuing() {
+        for fails in [false, true] {
+            let tmp = short_tempdir();
+            let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+            let vm = spec();
+            let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+            let _qemu = hold_pidfile(&dir).await;
+            std::fs::write(dir.join(INCOMING_MARK), format!("{}\n", Uuid::now_v7())).unwrap();
+            let fake = fake_qmp(&dir, "paused").await;
+            if fails {
+                fake.failing.lock().unwrap().push("transaction");
+            }
+            let hv = QemuHypervisor::new(cfg).await.unwrap();
+            hv.finish_incoming(vm.id, Some("opl-repl-back"))
+                .await
+                .unwrap();
+            let sent = sent(&fake, &["nbd-server-stop", "transaction", "cont"]);
+            assert_eq!(
+                names_of(&sent),
+                ["nbd-server-stop", "transaction", "cont"],
+                "{fails}"
+            );
+            assert_eq!(
+                sent[1].1["actions"],
+                serde_json::json!([
+                    { "type": "block-dirty-bitmap-add",
+                      "data": { "node": "disk0", "name": "opl-repl-back", "persistent": true } },
+                    { "type": "block-dirty-bitmap-add",
+                      "data": { "node": "disk1", "name": "opl-repl-back", "persistent": false } },
+                ])
+            );
+            assert!(!dir.join(INCOMING_MARK).exists());
         }
     }
 
@@ -4939,7 +5991,7 @@ time.sleep(60)
         hv.incoming_wait(received.id).await.unwrap();
         // 디스크를 내보내지 않았으면 NBD 서버가 없어 멈추기가 실패해도 넘겨받는다.
         fake_a.failing.lock().unwrap().push("nbd-server-stop");
-        hv.finish_incoming(received.id).await.unwrap();
+        hv.finish_incoming(received.id, None).await.unwrap();
         let commands = fake_a.commands.lock().unwrap().clone();
         let at = |name: &str| commands.iter().position(|c| c == name).unwrap();
         assert!(at("nbd-server-stop") < at("cont"));
@@ -4949,13 +6001,13 @@ time.sleep(60)
             vec![(receiving.id, Uuid::nil())]
         );
         // 표시가 없으면 아무것도 하지 않고, 기다릴 것도 없다.
-        hv.finish_incoming(received.id).await.unwrap();
+        hv.finish_incoming(received.id, None).await.unwrap();
         assert!(matches!(
             hv.incoming_wait(received.id).await,
             Err(DriverError::Migration(_))
         ));
 
-        let err = hv.finish_incoming(receiving.id).await.unwrap_err();
+        let err = hv.finish_incoming(receiving.id, None).await.unwrap_err();
         assert!(matches!(err, DriverError::Migration(_)), "{err:?}");
         assert!(dir_b.join(INCOMING_MARK).exists());
         // 아직 받는 중이면 내보내기(원본이 미러하는 중)도 그대로 둔다.

@@ -25,15 +25,23 @@ pub struct MigrateIncomingRequest {
 pub struct IncomingDisk {
     pub volume: Uuid,
     pub size_bytes: u64,
+    /// 대상 노드의 복제본(계획 55, 이동이 `existing`)에 이 시점(유닉스 초)의 복제 회차 뒤 바뀐 블록만 보내려 한다.
+    /// 대상은 그 회차(또는 더 새것)를 온전히 가졌을 때만 받고, 아니면 [`MigrateIncomingResponse::refused`]에 넣는다.
+    /// 없으면 빼고 보낸다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_synced_at: Option<u64>,
 }
 
 /// 받을 준비가 끝났다: 받는 QEMU가 연 포트
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrateIncomingResponse {
     pub port: u16,
     /// 복사할 디스크를 내보내는 NBD 서버의 포트(복사할 디스크가 있을 때만)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nbd_port: Option<u16>,
+    /// 바뀐 블록만 받을 수 없는 복제본 디스크(볼륨 id): 원본은 이 디스크들을 전체로 보낸다(복제본을 덮어쓴다).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<Uuid>,
 }
 
 /// 받기 확인과 취소 요청: 어느 VM의 어느 마이그레이션인지
@@ -101,6 +109,7 @@ mod tests {
         req.disks.push(IncomingDisk {
             volume,
             size_bytes: 1 << 30,
+            base_synced_at: None,
         });
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -115,9 +124,10 @@ mod tests {
         let reply = MigrateIncomingResponse {
             port: 60000,
             nbd_port: None,
+            refused: vec![],
         };
         let old = serde_json::json!({ "port": 60000 });
-        assert_eq!(serde_json::to_value(reply).unwrap(), old);
+        assert_eq!(serde_json::to_value(&reply).unwrap(), old);
         assert_eq!(
             serde_json::from_value::<MigrateIncomingResponse>(old).unwrap(),
             reply
@@ -125,12 +135,41 @@ mod tests {
         let reply = MigrateIncomingResponse {
             port: 60000,
             nbd_port: Some(60001),
+            refused: vec![],
         };
-        let json = serde_json::to_value(reply).unwrap();
+        let json = serde_json::to_value(&reply).unwrap();
         assert_eq!(
             json,
             serde_json::json!({ "port": 60000, "nbd_port": 60001 })
         );
+        assert_eq!(
+            serde_json::from_value::<MigrateIncomingResponse>(json).unwrap(),
+            reply
+        );
+    }
+
+    /// 복제본으로의 이동(계획 55): 디스크의 기준 시점과 대상이 거절한 디스크는 있을 때만 보낸다.
+    #[test]
+    fn replica_bases_and_refusals_are_sent_only_when_present() {
+        let volume = Uuid::now_v7();
+        let disk = IncomingDisk {
+            volume,
+            size_bytes: 1 << 30,
+            base_synced_at: Some(1700),
+        };
+        let json = serde_json::to_value(disk).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "volume": volume, "size_bytes": 1u64 << 30, "base_synced_at": 1700 })
+        );
+        assert_eq!(serde_json::from_value::<IncomingDisk>(json).unwrap(), disk);
+        let reply = MigrateIncomingResponse {
+            port: 60000,
+            nbd_port: Some(60001),
+            refused: vec![volume],
+        };
+        let json = serde_json::to_value(&reply).unwrap();
+        assert_eq!(json["refused"], serde_json::json!([volume]));
         assert_eq!(
             serde_json::from_value::<MigrateIncomingResponse>(json).unwrap(),
             reply

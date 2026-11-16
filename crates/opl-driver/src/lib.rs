@@ -26,11 +26,12 @@ pub use hypervisor::{
     Hypervisor, HypervisorEvent, RuntimeStatus, StopMode, VcpuChange,
 };
 pub use migration::{
-    IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress,
-    MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir, tcp_uri, write_migration_tls,
+    CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget,
+    MirrorOptions, MirrorProgress, MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir,
+    tcp_uri, write_migration_tls,
 };
 pub use mock::{
-    GuestAnswer, HotplugCall, IncrementalCall, MOCK_INCREMENT_BYTES, MockHypervisor,
+    CatchUpCall, GuestAnswer, HotplugCall, IncrementalCall, MOCK_INCREMENT_BYTES, MockHypervisor,
     ReplicationCall,
 };
 pub use net::{HostNet, IpRoute, Overlay, OverlayChanges, Tap};

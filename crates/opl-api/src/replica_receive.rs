@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use opl_cluster::Cluster;
 use opl_driver::{DriverError, Hypervisor, ReceiverExport, Storage, disk_location};
 use opl_peer::{
-    PrepareMode, PrepareVolume, ReplicaAbortRequest, ReplicaError, ReplicaFinishRequest,
-    ReplicaPrepareRequest, ReplicaPrepareResponse, ReplicaReceiver,
+    IncomingDisk, PrepareMode, PrepareVolume, ReplicaAbortRequest, ReplicaError,
+    ReplicaFinishRequest, ReplicaPrepareRequest, ReplicaPrepareResponse, ReplicaReceiver,
 };
 use opl_reconciler::replicas::{
     self, Overlay, RecordedReplica, Records, ReplicaRecord, ReplicaState, Role,
@@ -22,7 +22,7 @@ use opl_reconciler::replicas::{
 use opl_types::node::{NODE_REPLICATION, NodeSpec};
 use opl_types::storage::{StoragePool, StoragePoolSpec, VolumeSpec, pool_state_on};
 use opl_types::task::{TaskOp, TaskSpec};
-use opl_types::vm::{Vm, VmSpec};
+use opl_types::vm::{DiskMove, Vm, VmSpec};
 use uuid::Uuid;
 
 use crate::cluster::missing_feature;
@@ -208,42 +208,7 @@ impl IncomingReplicas {
         self.stop_other_receivers(vm.id, req.run)
             .await
             .map_err(ReplicaError::Failed)?;
-        // 그 VM의 기록을 먼저 청소하고, 남은 겹층을 합치거나 버린다(앞 회차의 받는 QEMU는 껐다).
-        let record = match replicas::read(records.dir(), vm.id) {
-            Ok(Some(record)) => {
-                self.sweep_record(&records, record).await;
-                match replicas::read(records.dir(), vm.id) {
-                    Ok(Some(record)) => Some(
-                        replicas::settle(&self.cluster, &*c.storage, &records, record, &[])
-                            .await
-                            .map_err(ReplicaError::Failed)?,
-                    ),
-                    Ok(None) => None,
-                    Err(e) => return Err(record_error(e)),
-                }
-            }
-            Ok(None) => None,
-            Err(e) => return Err(record_error(e)),
-        };
-        let mut record = record.unwrap_or(ReplicaRecord {
-            vm: vm.id,
-            role: Role::Replica,
-            generation: None,
-            synced_at: None,
-            volumes: Vec::new(),
-        });
-        // 돌아온 옛 원본: 이 노드의 디스크는 이제 옛것이라 전체로만 받는다.
-        if record.role == Role::Primary {
-            tracing::info!(vm = %vm.id, "this node was the VM's primary; its disks become stale replicas");
-            record.role = Role::Replica;
-            record.generation = None;
-            record.synced_at = None;
-            for v in &mut record.volumes {
-                v.created = true;
-                v.state = ReplicaState::Stale;
-            }
-            replicas::write(records.dir(), &record).map_err(record_error)?;
-        }
+        let mut record = self.settled_record(&records, &vm).await?;
         let refused = refused(&record, &req.volumes);
         if !refused.is_empty() {
             tracing::info!(vm = %vm.id, run = %req.run, ?refused, "refusing increments without a complete base replica");
@@ -282,6 +247,139 @@ impl IncomingReplicas {
         }
     }
 
+    /// 그 VM의 기록을 먼저 청소하고, 남은 겹층을 합치거나 버린 기록(앞 회차의 받는 QEMU는 부르는 쪽이 껐다). 기록이
+    /// 없으면 빈 복제본 기록이다. 돌아온 옛 원본의 기록은 옛 복제본(`stale`)으로 바꾼다 — 이 노드의 옛 사본인 볼륨만 남기고
+    /// 아직 이 노드의 진짜 디스크인 볼륨은 지우지 않고 뺀다([`demote`](Self::demote)). 부르는 쪽이 잠금을 쥔다.
+    async fn settled_record(
+        &self,
+        records: &Records,
+        vm: &Vm,
+    ) -> Result<ReplicaRecord, ReplicaError> {
+        let storage = &*self.config.storage;
+        let record = match replicas::read(records.dir(), vm.id) {
+            Ok(Some(record)) => {
+                self.sweep_record(records, record).await;
+                match replicas::read(records.dir(), vm.id) {
+                    Ok(Some(record)) => Some(
+                        replicas::settle(&self.cluster, storage, records, record, &[])
+                            .await
+                            .map_err(ReplicaError::Failed)?,
+                    ),
+                    Ok(None) => None,
+                    Err(e) => return Err(record_error(e)),
+                }
+            }
+            Ok(None) => None,
+            Err(e) => return Err(record_error(e)),
+        };
+        let mut record = record.unwrap_or(ReplicaRecord {
+            vm: vm.id,
+            role: Role::Replica,
+            generation: None,
+            synced_at: None,
+            volumes: Vec::new(),
+        });
+        // 돌아온 옛 원본: 이 노드의 디스크는 이제 옛것이라 전체로만 받는다.
+        if record.role == Role::Primary {
+            tracing::info!(vm = %vm.id, "this node was the VM's primary; its disks become stale replicas");
+            self.demote(&mut record).map_err(ReplicaError::Failed)?;
+            replicas::write(records.dir(), &record).map_err(record_error)?;
+        }
+        Ok(record)
+    }
+
+    /// 요청 디스크마다 풀·형식이 바뀐 옛 복제본을 지운다(새로 만든다).
+    async fn drop_moved_replicas(
+        &self,
+        records: &Records,
+        record: &mut ReplicaRecord,
+        volumes: &[PrepareVolume],
+    ) -> Result<(), String> {
+        let storage = &*self.config.storage;
+        for v in volumes {
+            let stale = record
+                .volumes
+                .iter()
+                .position(|r| r.id == v.id && (r.pool != v.pool || r.format != v.format));
+            if let Some(i) = stale {
+                let old = record.volumes[i].clone();
+                tracing::info!(vm = %record.vm, volume = %v.id, pool = %old.pool, "replacing a replica kept in another pool");
+                if !replicas::delete_replica(&self.cluster, storage, record.vm, &old).await {
+                    return Err(format!(
+                        "cannot delete the old replica of volume {} in pool {:?}",
+                        v.id, old.pool
+                    ));
+                }
+                record.volumes.remove(i);
+                replicas::write(records.dir(), record).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 이 노드로 오는 마이그레이션(Task `task`)의 계획에서 이 노드의 복제본으로 옮기는 디스크(`existing`, 계획 55)를
+    /// 받을 준비를 한다: 그 VM의 잠금 안에서 받는 QEMU를 끄고 기록을 청소·정리한 뒤, 디스크마다 복제본이 없으면
+    /// 같은 id로 만들고 작으면 늘려 `syncing`으로 적는다(따라잡기가 복제본에 바로 쓴다 — 마이그레이션이 되돌려지면 다음
+    /// 복제 회차가 끝날 때까지 쓰지 않는다). 원본이 바뀐 블록만 보내려는 디스크(`base_synced_at`) 가운데 이 노드에 그
+    /// 시점(또는 더 새것)의 온전한 복제본이 없는 것을 돌려준다(원본은 그 디스크를 전체로 보낸다). 실패하면 이 호출이
+    /// 만든 복제본을 지운다.
+    pub(crate) async fn prepare_migration(
+        &self,
+        vm: &Vm,
+        task: Uuid,
+        plan: &[DiskMove],
+        disks: &[IncomingDisk],
+    ) -> Result<Vec<Uuid>, String> {
+        let volumes: Vec<PrepareVolume> = plan
+            .iter()
+            .zip(disks)
+            .filter(|(m, _)| m.existing)
+            .map(|(m, d)| PrepareVolume {
+                id: m.volume,
+                pool: m.pool.clone(),
+                format: m.format,
+                size_bytes: d.size_bytes,
+                allocated_bytes: 0,
+                mode: match d.base_synced_at {
+                    Some(at) => PrepareMode::Incremental { base_synced_at: at },
+                    None => PrepareMode::Full,
+                },
+            })
+            .collect();
+        if volumes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // VM 잠금만 쥔다: 남은 겹층 합치기와 복제본 만들기 동안 다른 VM을 막지 않는다.
+        let vm_lock = replicas::lock_vm(&self.config.replica_dir, vm.id).await;
+        let records = replicas::vm_records(&self.config.replica_dir, &vm_lock);
+        self.stop_other_receivers(vm.id, task).await?;
+        let mut record = self
+            .settled_record(&records, vm)
+            .await
+            .map_err(|e| e.to_string())?;
+        let refused = refused(&record, &volumes);
+        let mut made = Made::default();
+        let prepared = async {
+            self.drop_moved_replicas(&records, &mut record, &volumes)
+                .await?;
+            for v in &volumes {
+                let pool = self.pool(&v.pool)?;
+                self.prepare_full(records.dir(), &mut record, &pool, v, &mut made)
+                    .await?;
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(e) = prepared {
+            self.undo(&records, &mut record, made).await;
+            return Err(e);
+        }
+        if !refused.is_empty() {
+            tracing::info!(vm = %vm.id, task = %task, ?refused, "the replicas cannot take only the changes; the source sends them in full");
+        }
+        Ok(refused)
+    }
+
     /// 요청 디스크마다 복제본(전체)이나 겹층(증분)을 마련해 받는 QEMU가 내보낼 것을 돌려준다. 공간이 모자라면
     /// 아무것도 만들지 않고 실패한다.
     async fn prepare_exports(
@@ -294,24 +392,8 @@ impl IncomingReplicas {
         let c = &self.config;
         let dir = records.dir();
         // 풀·형식이 바뀐 옛 복제본은 지우고 새로 만든다.
-        for v in &req.volumes {
-            let stale = record
-                .volumes
-                .iter()
-                .position(|r| r.id == v.id && (r.pool != v.pool || r.format != v.format));
-            if let Some(i) = stale {
-                let old = record.volumes[i].clone();
-                tracing::info!(vm = %record.vm, volume = %v.id, pool = %old.pool, "replacing a replica kept in another pool");
-                if !replicas::delete_replica(&self.cluster, &*c.storage, record.vm, &old).await {
-                    return Err(format!(
-                        "cannot delete the old replica of volume {} in pool {:?}",
-                        v.id, old.pool
-                    ));
-                }
-                record.volumes.remove(i);
-                replicas::write(dir, record).map_err(|e| e.to_string())?;
-            }
-        }
+        self.drop_moved_replicas(records, record, &req.volumes)
+            .await?;
         self.check_space(record, req)?;
         let mut exports = Vec::new();
         for v in &req.volumes {

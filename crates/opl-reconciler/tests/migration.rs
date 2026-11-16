@@ -48,6 +48,7 @@ fn opts() -> MigrateOptions {
         bandwidth: None,
         timeout: Duration::from_secs(60),
         switchover_mirrors: false,
+        switchover_catch_up: None,
         devices: None,
     }
 }

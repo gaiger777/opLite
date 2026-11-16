@@ -21,6 +21,7 @@ use opl_types::vm::{DiskMove, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
 use crate::migration_disks::{self, DiskRecord, RecordedVolume, Records, Role};
+use crate::replica_receive::IncomingReplicas;
 
 /// 원본 노드가 기록한 `Migrating` 상태가 이 노드에 적용되기를 기다리는 시간. 원본은 상태를 쓴 직후
 /// 부르므로 이 노드의 저장소가 조금 늦을 수 있다.
@@ -52,6 +53,8 @@ pub struct IncomingMigrations {
     config: Arc<IncomingConfig>,
     /// 이 노드의 방화벽(reconciler와 같다). 없으면 보안 그룹을 건 NIC가 있는 VM을 받지 않는다.
     firewall: Option<Arc<dyn FirewallGate>>,
+    /// 이 노드의 복제본 받기(계획 55). 없으면 이 노드의 복제본으로 옮기는 마이그레이션을 받지 않는다.
+    replicas: Option<IncomingReplicas>,
 }
 
 impl IncomingMigrations {
@@ -61,7 +64,14 @@ impl IncomingMigrations {
             hv,
             config: Arc::new(config),
             firewall: None,
+            replicas: None,
         }
+    }
+
+    /// 이 노드의 복제본으로 옮기는 마이그레이션(계획 55)을 복제본 기록과 함께 받는다.
+    pub fn with_replicas(mut self, replicas: IncomingReplicas) -> Self {
+        self.replicas = Some(replicas);
+        self
     }
 
     /// 보안 그룹을 건 NIC가 있는 VM을 받기 직전에 이 노드의 방화벽 규칙을 넣는다.
@@ -142,6 +152,19 @@ impl IncomingMigrations {
         let storage = &*self.config.storage;
         let me = self.config.node;
         for (m, disk) in plan.iter().zip(disks) {
+            if m.existing {
+                // 이 노드의 복제본으로 옮긴다(계획 55): 만들지 않는다. 받는 쪽의 끄기가 이 풀을 보도록 적되, 만들지 않았다고
+                // 적어 되돌리기·청소가 지우지 않는다(복제본은 복제본 기록이 다룬다).
+                record.volumes.push(RecordedVolume {
+                    id: m.volume,
+                    pool: m.pool.clone(),
+                    format: m.format,
+                    created: false,
+                });
+                migration_disks::write(dir, record)
+                    .map_err(|e| format!("cannot record the disks to copy: {e}"))?;
+                continue;
+            }
             let read = |e: opl_cluster::ClusterError| e.to_string();
             let name = self
                 .cluster
@@ -274,6 +297,13 @@ impl IncomingMigrations {
                 .await
                 .map_err(IncomingError::Failed)?;
         }
+        let refused = match self.prepare_replicas(&vm, req.task, plan, &req.disks).await {
+            Ok(refused) => refused,
+            Err(error) => {
+                self.forget_made(&records, vm.id, req.task, &made).await;
+                return Err(IncomingError::Failed(error));
+            }
+        };
         // 실패하면 incoming_spec이 켠 볼륨을 끈다.
         let started =
             match incoming_spec(&self.cluster, &vm, c.node, &c.mount_root, &*c.storage).await {
@@ -293,13 +323,7 @@ impl IncomingMigrations {
         let ports = match started {
             Ok(ports) => ports,
             Err(error) => {
-                if let Some(records) = &records
-                    && migration_disks::delete_volumes(&self.cluster, &*c.storage, vm.id, &made)
-                        .await
-                    && let Err(e) = migration_disks::remove(records.dir(), req.task)
-                {
-                    tracing::warn!(vm = %vm.id, error = %e, "cannot remove a migration disk record");
-                }
+                self.forget_made(&records, vm.id, req.task, &made).await;
                 return Err(IncomingError::Failed(error));
             }
         };
@@ -308,7 +332,43 @@ impl IncomingMigrations {
         Ok(MigrateIncomingResponse {
             port: ports.migration,
             nbd_port: ports.nbd,
+            refused,
         })
+    }
+
+    /// 받기가 실패했다: 이 받기가 만든 볼륨을 지우고 기록을 지운다(못 지우면 정리가 다시 한다).
+    async fn forget_made(
+        &self,
+        records: &Option<Records>,
+        vm: Uuid,
+        task: Uuid,
+        made: &[RecordedVolume],
+    ) {
+        if let Some(records) = records
+            && migration_disks::delete_volumes(&self.cluster, &*self.config.storage, vm, made).await
+            && let Err(e) = migration_disks::remove(records.dir(), task)
+        {
+            tracing::warn!(vm = %vm, error = %e, "cannot remove a migration disk record");
+        }
+    }
+
+    /// 계획에 이 노드의 복제본으로 옮기는 디스크가 있으면 받을 준비를 하고 바뀐 것만 받을 수 없는 디스크를 돌려준다
+    /// ([`IncomingReplicas::prepare_migration`]).
+    async fn prepare_replicas(
+        &self,
+        vm: &Vm,
+        task: Uuid,
+        plan: &[DiskMove],
+        disks: &[IncomingDisk],
+    ) -> Result<Vec<Uuid>, String> {
+        if !plan.iter().any(|m| m.existing) {
+            return Ok(Vec::new());
+        }
+        let replicas = self
+            .replicas
+            .as_ref()
+            .ok_or("this node cannot keep replicas")?;
+        replicas.prepare_migration(vm, task, plan, disks).await
     }
 
     /// 다른 Task의 기록에 아직 적힌 계획의 (볼륨, 풀)이 있으면 그 까닭

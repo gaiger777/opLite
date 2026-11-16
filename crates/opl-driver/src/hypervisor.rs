@@ -11,7 +11,10 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::error::DriverError;
-use crate::migration::{IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions, MirrorTarget};
+use crate::migration::{
+    CatchUp, CatchUpState, IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions,
+    MirrorTarget,
+};
 use crate::replication::{ReceiverExport, ReplicateRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,10 +288,12 @@ pub trait Hypervisor: Send + Sync {
     /// 사라졌으면 `Migration` 오류다. 받는 중 표시가 없는 VM이면 실패한다.
     async fn incoming_wait(&self, id: Uuid) -> Result<(), DriverError>;
 
-    /// 받기를 마친 VM을 넘겨받는다: NBD 내보내기를 멈추고, 멈춰 있으면 이어서 실행하고 받는 중 표시를 지운다. 표시가
-    /// 없으면(이미 넘겨받음) 아무것도 하지 않는다. 아직 받는 중이면 `Migration` 오류다. 마이그레이션이
-    /// 확정된 뒤(VM이 이 노드로 옮겨진 뒤)에만 부른다.
-    async fn finish_incoming(&self, id: Uuid) -> Result<(), DriverError>;
+    /// 받기를 마친 VM을 넘겨받는다: NBD 내보내기를 멈추고, 멈춰 있으면 이어서 실행하고 받는 중 표시를 지운다. `bitmap`이
+    /// 있으면 이어서 실행하기 전에 모든 디스크에 그 이름의 dirty bitmap(qcow2면 persistent)을 만든다(복제본으로 옮긴
+    /// VM이 옛 원본으로 뒤집힌 복제의 기준, 계획 55 — 만들지 못하면 경고만 남긴다). 표시가 없으면(이미 넘겨받음)
+    /// 아무것도 하지 않는다. 아직 받는 중이면 `Migration` 오류다. 마이그레이션이 확정된 뒤(VM이 이 노드로 옮겨진 뒤)에만
+    /// 부른다.
+    async fn finish_incoming(&self, id: Uuid, bitmap: Option<&str>) -> Result<(), DriverError>;
 
     /// 받는 중 표시가 있는 살아 있는 VM과 그 표시의 마이그레이션 Task(읽을 수 없으면 nil). 확정되지
     /// 않은 채 남은 받는 QEMU를 찾아 끄는 데 쓴다.
@@ -306,12 +311,26 @@ pub trait Hypervisor: Send + Sync {
         opts: &MirrorOptions,
     ) -> Result<(), DriverError>;
 
+    /// 실행 중인 VM의 디스크들을 `req.targets`(받는 QEMU가 내보낸 대상 노드의 복제본, 계획 55)로 따라잡게 한다: 패스마다
+    /// 복제 회차처럼 플리싱을 붙여(그 시점에 새 임시 비트맵 `opl-mig-{task}-{k}`, 저장하지 않음 — 원격 쓰기가 실패해도
+    /// 게스트 쓰기는 성공한다) 그 시점의 디스크에서 `blockdev-backup`(첫 패스는 `req.base`의 복제 비트맵 뒤 바뀐 블록,
+    /// 기준이 없으면 전체, 그다음은 앞 패스의 비트맵 뒤 바뀐 블록)을 시작하고 끝나기를 기다린 뒤 플리싱을 떼고 앞 임시
+    /// 비트맵을 지운다(복제 비트맵은 그대로 둔다). 새 비트맵이 담은 바이트의 합이
+    /// `req.limit` 이하이거나 `req.passes`번째 패스면 멈춘다. 대상 NBD 노드는 열어 둔 채 마지막 비트맵을 돌려준다
+    /// ([`migrate`](Self::migrate)의 `switchover_catch_up`이 마지막 패스를 보내고 닫는다). 앞선 따라잡기가 남긴 작업과
+    /// 노드는 먼저 치운다. 작업이 실패하거나, `req.stall` 동안 보낸 양이 늘지 않거나, `req.timeout`이 지나거나, 플리싱
+    /// 이미지를 둘 공간이 모자라면 나머지를 취소하고, 노드를 닫고, 플리싱을 떼고, 임시 비트맵을 지워 `Migration`
+    /// 오류다.
+    async fn catch_up_disks(&self, id: Uuid, req: &CatchUp) -> Result<CatchUpState, DriverError>;
+
     /// 실행 중인 VM을 `target`으로 보낸다(TLS, 능력 `events`·`auto-converge`, 이미지에 저장되지 않는
     /// `opl-` 비트맵이나 미러하는 디스크의 `opl-` 비트맵이 있으면 `dirty-bitmaps`). 보내기 전에
     /// inconsistent인 `opl-` 비트맵을 지운다. 끝날 때까지 기다린다. `opts.switchover_mirrors`면
     /// `pause-before-switchover`로 보내 게스트가 멈춘 `pre-switchover`에서 미러를 끝내고(대상 디스크가
-    /// 원본과 같아진다) 이어 간다. 미러가 실패했으면 취소한다. 성공하면 원본은 `postmigrate`로 멈춰
-    /// 있다([`stop_migrated`](Self::stop_migrated)로 끈다). 실패하거나 `opts.timeout`이 지나 취소하면
+    /// 원본과 같아진다) 이어 간다. 미러가 실패했으면 취소한다. `opts.switchover_catch_up`이면
+    /// 같은 때에 따라잡은 디스크에 마지막 패스(마지막 비트맵 뒤 바뀐 블록)를 보내고 대상 노드를 닫은 뒤(실패하면 취소)
+    /// 이어 간다. 따라잡기에는 `dirty-bitmaps`를 켜지 않는다(넘기는 비트맵은 마이그레이션 동안 다른 작업이 쓸 수 없어
+    /// 마지막 패스가 그 비트맵을 쓰지 못한다). 성공하면 원본은 `postmigrate`로 멈춰 있다([`stop_migrated`](Self::stop_migrated)로 끈다). 실패하거나 `opts.timeout`이 지나 취소하면
     /// `Migration` 오류이고 원본은 대개 계속 돈다(멈췄으면 [`resume`](Self::resume)으로 이어서 실행한다).
     /// 남은 미러는 [`cancel_migration`](Self::cancel_migration)이 치운다.
     async fn migrate(
@@ -328,8 +347,8 @@ pub trait Hypervisor: Send + Sync {
     /// 이 VM이 보내는 중인 마이그레이션을 취소하고 끝날 때까지 기다린다(QMP `migrate_cancel`). 보내는
     /// 중이 아니면(끝났거나, 받는 쪽이거나, VM이 없다) 아무것도 하지 않는다. 취소하는 사이에 끝났으면
     /// 원본은 `postmigrate`로 멈춰 있다. opld가 기다리기를 그만둔 마이그레이션(재시작, 되돌리기)이
-    /// 나중에 끝나 원본을 멈추지 않게 한다. 남은 디스크 미러(`opl-mirror-*`)는 보내는 중이 아니어도
-    /// 취소하고 치운다.
+    /// 나중에 끝나 원본을 멈추지 않게 한다. 남은 디스크 미러(`opl-mirror-*`)와 따라잡기의 작업·노드(`opl-catchup-*`)는
+    /// 보내는 중이 아니어도 취소하고 치우고, 따라잡기 임시 비트맵(`opl-mig-*`)을 지운다.
     async fn cancel_migration(&self, id: Uuid) -> Result<(), DriverError>;
 
     /// 마이그레이션을 보내기 전에(받는 쪽 QEMU를 켜거나 디스크를 복사하기 전에) 도는 QEMU의 디스크·NIC·붙인 vCPU·

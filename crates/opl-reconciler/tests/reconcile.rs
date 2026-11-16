@@ -1406,6 +1406,7 @@ async fn rolled_back_migration_makes_disks_exclusive_again() {
         bandwidth: None,
         timeout: Duration::from_secs(60),
         switchover_mirrors: false,
+        switchover_catch_up: None,
         devices: None,
     };
     env.hv.migrate(vm.id, &target, &opts).await.unwrap();

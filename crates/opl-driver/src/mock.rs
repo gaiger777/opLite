@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use opl_qemu::QmpError;
 use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::node::NodeHotplug;
-use opl_types::replication::MIGRATION_BITMAP_PREFIX;
+use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
 use opl_types::runtime::{ImageFormat, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
 use opl_types::vm::{CpuSpec, DiskBus, RunningHardware};
 use tokio::sync::{Notify, broadcast};
@@ -20,8 +20,8 @@ use crate::hypervisor::{
     Hypervisor, HypervisorEvent, RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
-    IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress, MirrorTarget,
-    format_duration,
+    CatchUp, CatchUpState, IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions,
+    MirrorProgress, MirrorTarget, format_duration,
 };
 use crate::replication::{ReceiverExport, ReplicaDiskTarget, ReplicateRequest};
 
@@ -47,6 +47,20 @@ pub struct ReplicationCall {
     pub targets: Vec<ReplicaDiskTarget>,
     /// 성공했으면 보낸 바이트(전체 디스크는 [`MOCK_MIRROR_BYTES`], 증분은 [`MOCK_INCREMENT_BYTES`])
     pub bytes: Option<u64>,
+}
+
+/// `catch_up_disks` 호출 하나([`MockHypervisor::catch_ups`]). 실패한 호출 포함
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchUpCall {
+    pub vm: Uuid,
+    /// 마이그레이션 Task
+    pub task: Uuid,
+    pub targets: Vec<MirrorTarget>,
+    /// 디스크마다 첫 패스의 기준 비트맵
+    pub base: Vec<Option<String>>,
+    /// 성공했으면 한 패스 수와 보낸 바이트(첫 패스는 기준이 있는 디스크마다 [`MOCK_INCREMENT_BYTES`], 없는 디스크마다
+    /// [`MOCK_MIRROR_BYTES`], 다음 패스는 디스크마다 [`MOCK_INCREMENT_BYTES`])
+    pub done: Option<(u8, u64)>,
 }
 
 /// 핫플러그 호출 하나([`MockHypervisor::hotplug_calls`]). 실패한 호출 포함
@@ -245,6 +259,14 @@ struct MockState {
     fail_next_receiver_start: Option<DriverError>,
     /// 다음 `finish_replica_receiver` 한 번을 실패시킬 오류(받는 QEMU는 남는다)
     fail_next_receiver_finish: Option<DriverError>,
+    /// `catch_up_disks` 호출(실패 포함)
+    catch_ups: Vec<CatchUpCall>,
+    /// 다음 `catch_up_disks` 한 번을 실패시킬 오류(임시 비트맵은 남지 않는다)
+    fail_next_catch_up: Option<DriverError>,
+    /// `catch_up_disks`가 할 패스 수(요청의 최댓값까지, 정하지 않으면 1)
+    catch_up_passes: Option<u8>,
+    /// 따라잡기를 마치고 스위치오버를 기다리는 VM
+    catching_up: HashMap<Uuid, CatchUpState>,
 }
 
 impl Default for MockHypervisor {
@@ -594,6 +616,26 @@ impl MockHypervisor {
         self.state.lock().unwrap().fail_next_receiver_finish = Some(err);
     }
 
+    /// `catch_up_disks` 호출(실패 포함)을 순서대로 돌려준다.
+    pub fn catch_ups(&self) -> Vec<CatchUpCall> {
+        self.state.lock().unwrap().catch_ups.clone()
+    }
+
+    /// 다음 `catch_up_disks` 한 번을 이 오류로 실패시킨다.
+    pub fn fail_next_catch_up(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_catch_up = Some(err);
+    }
+
+    /// 이후 `catch_up_disks`가 이만큼의 패스를 한 것으로 한다(요청의 최댓값까지).
+    pub fn set_catch_up_passes(&self, passes: u8) {
+        self.state.lock().unwrap().catch_up_passes = Some(passes);
+    }
+
+    /// 따라잡기를 마치고 스위치오버를 기다리는 VM의 상태
+    pub fn catching_up(&self, id: Uuid) -> Option<CatchUpState> {
+        self.state.lock().unwrap().catching_up.get(&id).cloned()
+    }
+
     /// `clear_backup_leftovers`를 부른 VM(실패 포함)을 순서대로 돌려준다.
     pub fn leftover_clears(&self) -> Vec<Uuid> {
         self.state.lock().unwrap().leftover_clears.clone()
@@ -940,6 +982,7 @@ impl MockHypervisor {
         st.outgoing.remove(&id);
         st.exports.remove(&id);
         st.mirroring.remove(&id);
+        st.catching_up.remove(&id);
         st.disk_stats.remove(&id);
         st.failing_disk_stats.remove(&id);
         st.guest_channels.remove(&id);
@@ -1222,6 +1265,7 @@ impl Hypervisor for MockHypervisor {
         st.leftover_clears.push(id);
         Self::controllable(&st, id)?;
         st.mirroring.remove(&id);
+        st.catching_up.remove(&id);
         for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
             disk.retain(|b| !b.name.starts_with(MIGRATION_BITMAP_PREFIX));
         }
@@ -1541,7 +1585,8 @@ impl Hypervisor for MockHypervisor {
         Ok(())
     }
 
-    async fn finish_incoming(&self, id: Uuid) -> Result<(), DriverError> {
+    /// 실제 드라이버처럼 `bitmap`을 모든 디스크에 만든다(만들지 못해도 넘겨받는다).
+    async fn finish_incoming(&self, id: Uuid, bitmap: Option<&str>) -> Result<(), DriverError> {
         let mut st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
         if !st.incoming.contains_key(&id) {
@@ -1551,6 +1596,11 @@ impl Hypervisor for MockHypervisor {
             return Err(DriverError::Migration(format!(
                 "incoming migration of VM {id} has not completed"
             )));
+        }
+        if let Some(name) = bitmap
+            && let Err(e) = Self::add_bitmaps_to(&mut st, id, name)
+        {
+            tracing::warn!(%id, error = %e, "cannot add the dirty bitmap of the reversed replication");
         }
         st.incoming.remove(&id);
         st.migration_status.remove(&id);
@@ -1628,6 +1678,98 @@ impl Hypervisor for MockHypervisor {
         Ok(())
     }
 
+    /// 실제 QEMU처럼 기준 비트맵이 있고 inconsistent가 아니어야 한다. 정한 패스 수(없으면 1)만큼 한 것으로 하고 가짜
+    /// 진행률을 알린 뒤 마지막 패스의 임시 비트맵(저장하지 않음)을 대상 디스크에 남긴다. 받는 쪽에는 쓰지 않는다.
+    async fn catch_up_disks(&self, id: Uuid, req: &CatchUp) -> Result<CatchUpState, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        let mut call = CatchUpCall {
+            vm: id,
+            task: req.task,
+            targets: req.targets.clone(),
+            base: req.base.clone(),
+            done: None,
+        };
+        if let Err(e) = Self::controllable(&st, id) {
+            st.catch_ups.push(call);
+            return Err(e);
+        }
+        st.catching_up.remove(&id);
+        let formats = st.disk_formats.get(&id).cloned().unwrap_or_default();
+        let mut error = (req.targets.is_empty() || req.base.len() != req.targets.len())
+            .then(|| DriverError::InvalidSpec(format!("nothing to catch up for VM {id}")));
+        for (t, base) in req.targets.iter().zip(&req.base) {
+            if t.disk >= formats.len() {
+                error.get_or_insert(DriverError::InvalidSpec(format!(
+                    "VM {id} has no disk{}",
+                    t.disk
+                )));
+                continue;
+            }
+            let Some(base) = base else { continue };
+            let found = st
+                .bitmaps
+                .get(&id)
+                .and_then(|d| d.get(t.disk))
+                .and_then(|d| d.iter().find(|b| &b.name == base));
+            match found {
+                None => {
+                    error.get_or_insert(qmp_error(
+                        "GenericError",
+                        format!("Bitmap '{base}' could not be found"),
+                    ));
+                }
+                Some(b) if b.inconsistent => {
+                    error.get_or_insert(qmp_error(
+                        "GenericError",
+                        format!("Bitmap '{base}' is inconsistent and cannot be used"),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(e) = error.or_else(|| st.fail_next_catch_up.take()) {
+            st.catch_ups.push(call);
+            return Err(e);
+        }
+        let passes = st.catch_up_passes.unwrap_or(1).clamp(1, req.passes.max(1));
+        let first: u64 = req
+            .base
+            .iter()
+            .map(|b| match b {
+                Some(_) => MOCK_INCREMENT_BYTES,
+                None => MOCK_MIRROR_BYTES,
+            })
+            .sum();
+        let bytes = first + u64::from(passes - 1) * MOCK_INCREMENT_BYTES * req.targets.len() as u64;
+        let bitmap = migration_bitmap(req.task, passes);
+        let disks = st.bitmaps.entry(id).or_default();
+        disks.resize(formats.len(), Vec::new());
+        for t in &req.targets {
+            disks[t.disk].push(BitmapInfo {
+                name: bitmap.clone(),
+                recording: true,
+                inconsistent: false,
+                persistent: false,
+                count: 0,
+            });
+        }
+        if let Some(tx) = &req.progress {
+            tx.send_replace(MirrorProgress {
+                done_bytes: bytes,
+                total_bytes: bytes,
+            });
+        }
+        let state = CatchUpState {
+            disks: req.targets.iter().map(|t| t.disk).collect(),
+            bitmap,
+            passes,
+        };
+        st.catching_up.insert(id, state.clone());
+        call.done = Some((passes, bytes));
+        st.catch_ups.push(call);
+        Ok(state)
+    }
+
     /// 주입한 실패가 없으면 원본을 `postmigrate`로 멈춘다. `switchover_mirrors`면 남은 미러를 끝낸다.
     async fn migrate(
         &self,
@@ -1645,6 +1787,11 @@ impl Hypervisor for MockHypervisor {
         if opts.switchover_mirrors && !st.mirroring.contains_key(&id) {
             return Err(DriverError::Migration(
                 "no disk mirrors to switch over".into(),
+            ));
+        }
+        if opts.switchover_catch_up.is_some() && !st.catching_up.contains_key(&id) {
+            return Err(DriverError::Migration(
+                "no disk copies to switch over".into(),
             ));
         }
         if let Some(err) = st.fail_next_migrate.take() {
@@ -1665,6 +1812,17 @@ impl Hypervisor for MockHypervisor {
             st.mirroring.remove(&id);
             st.switchovers.push(id);
         }
+        if let Some(state) = &opts.switchover_catch_up {
+            if let Some(error) = st.fail_next_switchover.take() {
+                st.catching_up.remove(&id);
+                return Err(DriverError::Migration(format!(
+                    "disk copy job opl-catchup-{} failed: {error}",
+                    state.disks.first().copied().unwrap_or_default()
+                )));
+            }
+            st.catching_up.remove(&id);
+            st.switchovers.push(id);
+        }
         st.migration_status.insert(id, postmigrate());
         Ok(())
     }
@@ -1672,6 +1830,10 @@ impl Hypervisor for MockHypervisor {
     async fn stop_migrated(&self, id: Uuid) -> Result<bool, DriverError> {
         let migrated = {
             let st = self.state.lock().unwrap();
+            // 끝나지 않는 QEMU(`set_unkillable`)는 실제 드라이버처럼 끄지 못한다.
+            if st.unkillable.contains(&id) {
+                return Err(DriverError::Timeout("QEMU to exit"));
+            }
             st.vms.contains_key(&id) && st.migration_status.get(&id) == Some(&postmigrate())
         };
         if migrated {
@@ -1862,6 +2024,10 @@ impl Hypervisor for MockHypervisor {
             st.migration_status.insert(id, postmigrate());
         }
         st.mirroring.remove(&id);
+        st.catching_up.remove(&id);
+        for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
+            disk.retain(|b| !b.name.starts_with(MIGRATION_BITMAP_PREFIX));
+        }
         Ok(())
     }
 
@@ -2560,6 +2726,7 @@ mod tests {
             bandwidth: None,
             timeout: Duration::from_secs(60),
             switchover_mirrors: false,
+            switchover_catch_up: None,
             devices: None,
         }
     }
@@ -2605,7 +2772,7 @@ mod tests {
         assert_eq!(status(&dst), Some(inmigrate()));
         // 아직 받는 중이면 넘겨받을 수 없다.
         assert!(matches!(
-            dst.finish_incoming(vm.id).await,
+            dst.finish_incoming(vm.id, None).await,
             Err(DriverError::Migration(_))
         ));
         // 이미 돌고 있는 VM은 받을 수 없다.
@@ -2620,12 +2787,12 @@ mod tests {
         assert_eq!(status(&src), Some(postmigrate()));
         dst.incoming_wait(vm.id).await.unwrap();
         assert_eq!(status(&dst), Some(RuntimeStatus::Paused));
-        dst.finish_incoming(vm.id).await.unwrap();
+        dst.finish_incoming(vm.id, None).await.unwrap();
         assert_eq!(status(&dst), Some(RuntimeStatus::Running));
         assert!(!dst.is_incoming(vm.id));
         assert!(dst.list_incoming().await.unwrap().is_empty());
         // 두 번째 넘겨받기는 아무것도 하지 않는다.
-        dst.finish_incoming(vm.id).await.unwrap();
+        dst.finish_incoming(vm.id, None).await.unwrap();
         // 받는 중 표시가 없으면 기다릴 것이 없다.
         assert!(matches!(
             dst.incoming_wait(vm.id).await,
@@ -2773,6 +2940,7 @@ mod tests {
         // 미러 없이 스위치오버를 바라면 실패한다.
         let switchover = MigrateOptions {
             switchover_mirrors: true,
+            switchover_catch_up: None,
             devices: None,
             ..opts()
         };
@@ -2802,9 +2970,111 @@ mod tests {
         assert_eq!(src.switchovers(), [vm.id]);
         assert!(src.mirroring(vm.id).is_empty());
         dst.incoming_wait(vm.id).await.unwrap();
-        dst.finish_incoming(vm.id).await.unwrap();
+        dst.finish_incoming(vm.id, None).await.unwrap();
         assert!(dst.exports(vm.id).is_empty());
         assert!(src.stop_migrated(vm.id).await.unwrap());
+    }
+
+    /// 따라잡기: 기준 비트맵이 있어야 하고, 정한 패스 수만큼 한 것으로 하며 마지막 임시 비트맵을 남긴다. 스위치오버는
+    /// 따라잡기를 끝내고, 받는 쪽 넘겨받기는 뒤집힌 복제의 비트맵을 만든다. 실패 주입·스위치오버 오류·되돌리기는
+    /// 따라잡기를 남기지 않는다.
+    #[tokio::test]
+    async fn catch_up_between_two_mocks() {
+        let (src, dst) = (MockHypervisor::default(), MockHypervisor::default());
+        let vm = spec_with_disks();
+        let task = Uuid::now_v7();
+        src.start(&vm, None).await.unwrap();
+        src.add_bitmaps(vm.id, "opl-repl-a").await.unwrap();
+        dst.start_incoming(&vm, task, "10.0.0.2", 60000..=60099, &[0, 1])
+            .await
+            .unwrap();
+        let targets = vec![
+            mirror_target(0, ImageFormat::Qcow2),
+            mirror_target(1, ImageFormat::Raw),
+        ];
+        let req = |base: Vec<Option<String>>| CatchUp {
+            targets: targets.clone(),
+            base,
+            task,
+            limit: 64 << 20,
+            passes: 5,
+            speed: None,
+            stall: Duration::from_secs(600),
+            timeout: Duration::from_secs(600),
+            progress: None,
+        };
+        let missing = req(vec![Some("opl-nope".into()), None]);
+        assert!(src.catch_up_disks(vm.id, &missing).await.is_err());
+        src.fail_next_catch_up(DriverError::Migration("Connection reset by peer".into()));
+        let good = req(vec![Some("opl-repl-a".into()), None]);
+        assert!(src.catch_up_disks(vm.id, &good).await.is_err());
+        assert_eq!(src.catching_up(vm.id), None);
+
+        src.set_catch_up_passes(2);
+        let state = src.catch_up_disks(vm.id, &good).await.unwrap();
+        assert_eq!(
+            state,
+            CatchUpState {
+                disks: vec![0, 1],
+                bitmap: migration_bitmap(task, 2),
+                passes: 2
+            }
+        );
+        let calls = src.catch_ups();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[2].done,
+            Some((
+                2,
+                MOCK_INCREMENT_BYTES + MOCK_MIRROR_BYTES + 2 * MOCK_INCREMENT_BYTES
+            ))
+        );
+        assert!(
+            src.bitmaps(vm.id)[1]
+                .iter()
+                .any(|b| b.name == state.bitmap && !b.persistent)
+        );
+
+        // 스위치오버 오류는 마이그레이션을 실패시키고 따라잡기를 남기지 않는다. 되돌리기는 임시 비트맵을 지운다.
+        let switchover = MigrateOptions {
+            switchover_catch_up: Some(state.clone()),
+            devices: None,
+            ..opts()
+        };
+        src.fail_next_switchover("Input/output error");
+        let err = src
+            .migrate(vm.id, &target(), &switchover)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("opl-catchup-0"), "{err}");
+        assert!(src.migrate(vm.id, &target(), &switchover).await.is_err());
+        src.cancel_migration(vm.id).await.unwrap();
+        assert!(
+            src.bitmaps(vm.id)
+                .iter()
+                .flatten()
+                .all(|b| !b.name.starts_with("opl-mig-"))
+        );
+
+        src.catch_up_disks(vm.id, &good).await.unwrap();
+        src.migrate(vm.id, &target(), &switchover).await.unwrap();
+        assert_eq!(src.switchovers(), [vm.id]);
+        assert_eq!(src.catching_up(vm.id), None);
+        dst.incoming_wait(vm.id).await.unwrap();
+        dst.finish_incoming(vm.id, Some("opl-repl-back"))
+            .await
+            .unwrap();
+        let back = dst.bitmaps(vm.id);
+        assert!(
+            back[0]
+                .iter()
+                .any(|b| b.name == "opl-repl-back" && b.persistent)
+        );
+        assert!(
+            back[1]
+                .iter()
+                .any(|b| b.name == "opl-repl-back" && !b.persistent)
+        );
     }
 
     /// 미러 실패 주입: 복사 실패·정체는 미러를 남기지 않고, 스위치오버의 미러 오류는 마이그레이션을
@@ -2835,6 +3105,7 @@ mod tests {
 
         let switchover = MigrateOptions {
             switchover_mirrors: true,
+            switchover_catch_up: None,
             devices: None,
             ..opts()
         };

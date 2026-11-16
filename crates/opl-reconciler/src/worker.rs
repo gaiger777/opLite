@@ -779,8 +779,18 @@ impl Worker {
                     // 이 노드로 마이그레이션을 받아 멈춰 있는 QEMU다(확정되어 이 노드에 배정됐다).
                     // 받는 중 표시가 있을 때만 이어서 실행하고 표시를 지운다.
                     if continued.is_ok() && state.status == RuntimeStatus::Paused {
-                        continued = self.hv.finish_incoming(self.id).await.map_err(unresponsive);
+                        // 복제본으로 옮겨 왔으면(계획 55) 옛 원본으로 뒤집힌 복제의 비트맵을 이어서 실행하기 전에 둔다.
+                        let reversed =
+                            replicas::reversed_bitmap(&self.cluster, &*self.hv, vm).await;
+                        continued = self
+                            .hv
+                            .finish_incoming(self.id, reversed.as_deref())
+                            .await
+                            .map_err(unresponsive);
                         self.disks_shared |= continued.is_ok();
+                        if continued.is_ok() && reversed.is_some() {
+                            replicas::become_primary(&self.config.replica_dir, self.id).await;
+                        }
                     }
                     match continued {
                         Ok(()) => {}

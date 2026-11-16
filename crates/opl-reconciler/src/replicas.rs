@@ -19,8 +19,10 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DriverError, Hypervisor, Storage};
 use opl_types::node::NodeSpec;
+use opl_types::replication::replica_bitmap;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{StoragePoolSpec, Volume, VolumeSpec, is_shared};
+use opl_types::task::{TaskOp, TaskSpec};
 use opl_types::vm::{Vm, VmSpec};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -510,6 +512,56 @@ pub async fn promote(
             Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
             Err(e) => return Err(Transient(e.to_string())),
         }
+    }
+}
+
+/// 이 노드가 받은 VM `vm`의 마이그레이션(받는 중 표시의 Task)이 이 노드의 복제본으로 옮긴 것이면(확정 쓰기가 복제 대상을
+/// 원본 노드로 뒤집었다 — 그 Task를 돌린 노드가 `spec.replication`에 있다) 뒤집힌 복제의 기준 비트맵
+/// `replica_bitmap(원본 노드, Task)`. 아니면(복제본이 아닌 마이그레이션, 표시나 Task를 읽지 못함) None이다.
+pub async fn reversed_bitmap(cluster: &Cluster, hv: &dyn Hypervisor, vm: &Vm) -> Option<String> {
+    let incoming = match hv.list_incoming().await {
+        Ok(incoming) => incoming,
+        Err(e) => {
+            tracing::warn!(vm = %vm.id, error = %e, "cannot read the incoming migration mark");
+            return None;
+        }
+    };
+    let (_, task) = incoming.into_iter().find(|(id, _)| *id == vm.id)?;
+    let task = match cluster.get::<TaskSpec>(task) {
+        Ok(task) => task?,
+        Err(e) => {
+            tracing::warn!(vm = %vm.id, error = %e, "cannot read the migration task");
+            return None;
+        }
+    };
+    let source = task.spec.node;
+    (matches!(task.spec.op, TaskOp::VmMigrate { .. })
+        && task.spec.target == vm.id
+        && vm.spec.replication.iter().any(|t| t.node == source))
+    .then(|| replica_bitmap(source, task.id))
+}
+
+/// 복제본으로 옮겨 온 VM `vm`을 넘겨받았다: 이 노드의 복제본 기록을 원본(`primary`)으로 바꾼다. 실패는 경고만 남긴다
+/// (청소가 볼륨 기록을 보고 바꾸고, 다음 복제 회차가 원본 기록을 다시 쓴다).
+pub async fn become_primary(dir: &Path, vm: Uuid) {
+    let _vm = lock_vm(dir, vm).await;
+    let records = lock(dir).await;
+    let changed = match read(records.dir(), vm) {
+        Ok(Some(mut record)) if record.role == Role::Replica => {
+            record.role = Role::Primary;
+            record.generation = None;
+            record.synced_at = None;
+            for v in &mut record.volumes {
+                v.state = ReplicaState::Ready;
+            }
+            write(records.dir(), &record)
+        }
+        Ok(_) => return,
+        Err(e) => Err(e),
+    };
+    match changed {
+        Ok(()) => tracing::info!(vm = %vm, "the replicas on this node became the VM's disks"),
+        Err(e) => tracing::warn!(vm = %vm, error = %e, "cannot write the replica record"),
     }
 }
 

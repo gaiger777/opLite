@@ -1,6 +1,7 @@
 //! 로컬 디스크 복제의 원본 쪽(계획 55): 실제 gRPC(mTLS)로 이은 두 노드에서 A의 VM을 B로 복제하는 `vm-replicate`
 //! Task(처음 전체 → 증분, 비트맵 정리와 남기기, 받는 쪽 거절의 전체 재시도, 실패 기록), 지금 복제 API의 검사,
-//! 리더의 주기 스케줄러. 하이퍼바이저는 Mock, 저장소는 가짜다.
+//! 리더의 주기 스케줄러, 복제본이 있는 노드로의 마이그레이션(따라잡기와 복제 방향 뒤집기). 하이퍼바이저는 Mock, 저장소는
+//! 가짜다.
 
 mod common;
 
@@ -12,13 +13,15 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use opl_api::{
-    AppState, HaManager, HaManagerConfig, IncomingReplicas, ReplicaConfig, ReplicationScheduler,
-    ReplicationSchedulerConfig, TaskRunner, hash_password,
+    AppState, HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations, IncomingReplicas,
+    ReplicaConfig, ReplicationScheduler, ReplicationSchedulerConfig, TaskRunner, hash_password,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::mock::MOCK_MIRROR_BYTES;
-use opl_driver::{Hypervisor, MOCK_INCREMENT_BYTES, MockHypervisor, ReplicaDiskTarget, Storage};
+use opl_driver::{
+    DriverError, Hypervisor, MOCK_INCREMENT_BYTES, MockHypervisor, ReplicaDiskTarget, Storage,
+};
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
 use opl_peer::{
     GrpcNetwork, PeerService, Peers, ReplicaAbortRequest, ReplicaError, ReplicaFinishRequest,
@@ -32,7 +35,9 @@ use opl_types::backup::bitmap_name;
 use opl_types::node::{
     FEATURES, Fencing, NODE_REPLICATION, NodeHa, NodeHotplug, NodeSpec, NodeStatus,
 };
-use opl_types::replication::{ReplicaStatus, ReplicationState, replica_bitmap};
+use opl_types::replication::{
+    ReplicaStatus, ReplicaVolume, ReplicationState, ReplicationTarget, replica_bitmap,
+};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
@@ -53,6 +58,9 @@ use common::{
 
 /// 받는 노드의 NBD 포트 범위. Mock 하이퍼바이저는 첫 포트를 연다.
 const PORTS: std::ops::RangeInclusive<u16> = 61100..=61109;
+
+/// 마이그레이션을 받는 포트 범위
+const MIGRATION_PORTS: std::ops::RangeInclusive<u16> = 61110..=61119;
 
 const SIZE: u64 = 1 << 20;
 
@@ -182,8 +190,25 @@ impl Node {
             lose_next_finish: AtomicBool::new(false),
         });
         self.receiver = Some(receiver.clone());
-        let service =
-            PeerService::new(self.cluster.clone(), Some(hv.clone())).with_replicas(receiver);
+        // 복제본으로 옮기는 마이그레이션도 받는다(opld처럼 복제본 받기와 기록을 함께 쓴다).
+        let incoming = IncomingMigrations::new(
+            self.cluster.clone(),
+            hv.clone(),
+            IncomingConfig {
+                node: self.id,
+                mount_root: MOUNT_ROOT.into(),
+                storage: storage.clone(),
+                listen_host: "127.0.0.1".into(),
+                ports: MIGRATION_PORTS,
+                // Task 실행기(`runner_config`)와 같다.
+                migration_disks: work.join("migration-disks"),
+            },
+        )
+        .with_replicas(receiver.inner.clone());
+        let service = PeerService::new(self.cluster.clone(), Some(hv.clone()))
+            .with_migrations(Arc::new(incoming))
+            .with_uefi_vars(work.join("state"))
+            .with_replicas(receiver);
         let listener = self.listener.take().unwrap();
         let tls = self.tls.clone();
         tokio::spawn(async move {
@@ -424,6 +449,31 @@ impl Setup {
     /// B로 보낸 마지막 `replicate_disks` 호출의 대상들
     fn last_targets(&self) -> Vec<ReplicaDiskTarget> {
         self.a.hv.replications().last().unwrap().targets.clone()
+    }
+
+    /// VM을 노드 `node`(이름)로 옮기고(`pool`이 있으면 그 풀로) Task가 끝날 때까지 기다린다.
+    async fn migrate(&self, node: &str, pool: Option<&str>) -> Value {
+        let mut body = json!({ "node": node });
+        if let Some(pool) = pool {
+            body["pool"] = json!(pool);
+        }
+        let (status, task) = self.admin.post("/vms/web/migrate", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        self.admin.wait_task(&task).await
+    }
+
+    /// VM이 노드 `node`에서 이어서 실행될 때까지 기다린다(받은 QEMU를 그 노드의 reconciler가 넘겨받음).
+    async fn wait_running_on(&self, node: &Node) {
+        let id = self.vm;
+        let hv = node.hv.clone();
+        wait_until("the VM running on the target node", || {
+            let vm = self.vm();
+            vm.status.phase == VmPhase::Running
+                && vm.status.node == Some(node.id)
+                && vm.status.migration.is_none()
+                && !hv.is_incoming(id)
+        })
+        .await;
     }
 
     fn unfinished_replications(&self) -> Vec<Task> {
@@ -1150,4 +1200,312 @@ async fn an_ha_vm_restarts_from_its_replica_and_the_replication_turns_around() {
     assert_eq!(record.volumes[0].pool, "a");
     // 다음 복제가 성공해도 복구 기록은 남는다.
     assert_eq!(s.vm().status.last_recovery, Some(recovery));
+}
+
+/// 복제 대상 노드로 옮기면(계획 55) 미러 대신 그 복제본을 따라잡는다: 복제 비트맵 뒤 바뀐 블록부터 보내고 원본 디스크는
+/// 지우지 않는다. 확정하면 복제 방향이 뒤집혀 A가 대상(풀 `a`)이 되고, A의 디스크는 그 마이그레이션 시점의 `ready`
+/// 복제본으로 남으며, B는 넘겨받으며 A로의 복제 비트맵을 둔다. 그래서 다음 B→A 회차는 바뀐 것만 보내고, A로 되돌아갈
+/// 때도 따라잡는다.
+#[tokio::test]
+async fn migrating_to_the_replica_node_sends_only_the_changes_and_turns_the_replication_around() {
+    let s = setup().await;
+    let first = succeeded(&s.replicate().await);
+    let task = succeeded(&s.migrate("node2", None).await);
+    s.wait_running_on(&s.b).await;
+
+    // 미러하지 않고 B의 복제본(풀 `b`)을 따라잡았다.
+    assert!(s.a.hv.mirrors().is_empty());
+    let catch_ups = s.a.hv.catch_ups();
+    assert_eq!(catch_ups.len(), 1, "{catch_ups:?}");
+    assert_eq!(catch_ups[0].task, task);
+    assert_eq!(catch_ups[0].base, [Some(replica_bitmap(s.b.id, first))]);
+    assert_eq!(catch_ups[0].targets[0].disk, 0);
+    assert_eq!(s.a.hv.switchovers(), [s.vm]);
+    let received = s.b.hv.incoming_specs().last().unwrap().disks[0]
+        .path
+        .clone();
+    assert_eq!(
+        received,
+        PathBuf::from(format!("/nonexistent/opl-b/{}.qcow2", s.volume))
+    );
+    // 원본 파일은 남고 볼륨 기록은 B의 풀 `b`로 옮겨졌다.
+    assert!(s.a.storage.has_file(s.volume));
+    assert!(!s.a.storage.deleted().contains(&s.volume));
+    let volume = s.a.cluster.get::<VolumeSpec>(s.volume).unwrap().unwrap();
+    assert_eq!(volume.spec.pool, "b");
+    assert_eq!(volume.status.node, Some(s.b.id));
+
+    // 복제 방향이 뒤집혔다.
+    let vm = s.vm();
+    assert_eq!(vm.spec.node, Some(s.b.id));
+    assert_eq!(
+        vm.spec.replication,
+        [ReplicationTarget {
+            node: s.a.id,
+            schedule: "*/15".into(),
+            pool: Some("a".into()),
+        }]
+    );
+    assert_eq!(
+        vm.status.replication.len(),
+        1,
+        "{:?}",
+        vm.status.replication
+    );
+    let entry = &vm.status.replication[0];
+    assert_eq!(entry.node, s.a.id);
+    assert_eq!(entry.state, ReplicationState::Ready);
+    assert_eq!(entry.generation, Some(task));
+    assert!(entry.synced_at.is_some());
+    assert_eq!(
+        entry.volumes,
+        [ReplicaVolume {
+            id: s.volume,
+            size_bytes: SIZE
+        }]
+    );
+    let record = s.a.record(s.vm).unwrap();
+    assert_eq!(record.role, Role::Replica);
+    assert_eq!(record.generation, Some(task));
+    assert_eq!(record.synced_at, entry.synced_at);
+    assert_eq!(record.volumes[0].pool, "a");
+    assert_eq!(record.volumes[0].state, ReplicaState::Ready);
+    // B의 reconciler가 넘겨받으며 B의 기록을 원본으로 바꾼다.
+    wait_until("B's record to become the primary", || {
+        s.b.record(s.vm).is_some_and(|r| r.role == Role::Primary)
+    })
+    .await;
+    let names: Vec<String> = s.b.hv.bitmaps(s.vm)[0]
+        .iter()
+        .map(|b| b.name.clone())
+        .collect();
+    assert!(names.contains(&replica_bitmap(s.a.id, task)), "{names:?}");
+
+    // 다음 B→A 회차는 그 비트맵 뒤 바뀐 것만 보낸다.
+    let (status, run) = s.admin.post("/vms/web/replicate", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    assert_eq!(run["spec"]["node"], json!(s.b.id), "{run}");
+    let run = succeeded(&s.admin.wait_task(&run).await);
+    let targets = s.b.hv.replications().last().unwrap().targets.clone();
+    assert_eq!(targets[0].base, Some(replica_bitmap(s.a.id, task)));
+    let entry = s.vm().status.replication[0].clone();
+    assert_eq!(
+        (entry.state, entry.generation, entry.last_full),
+        (ReplicationState::Ready, Some(run), false)
+    );
+
+    // 되돌아온다: B가 A의 복제본을 따라잡고 방향이 다시 뒤집힌다.
+    let back = succeeded(&s.migrate("node1", None).await);
+    s.wait_running_on(&s.a).await;
+    let catch_ups = s.b.hv.catch_ups();
+    assert_eq!(catch_ups.len(), 1, "{catch_ups:?}");
+    assert_eq!(catch_ups[0].base, [Some(replica_bitmap(s.a.id, run))]);
+    let vm = s.vm();
+    assert_eq!(
+        vm.spec.replication,
+        [ReplicationTarget {
+            node: s.b.id,
+            schedule: "*/15".into(),
+            pool: Some("b".into()),
+        }]
+    );
+    assert_eq!(vm.status.replication[0].node, s.b.id);
+    assert_eq!(vm.status.replication[0].generation, Some(back));
+    let volume = s.a.cluster.get::<VolumeSpec>(s.volume).unwrap().unwrap();
+    assert_eq!(
+        (volume.spec.pool.as_str(), volume.status.node),
+        ("a", Some(s.a.id))
+    );
+    wait_until("A's record to become the primary", || {
+        s.a.record(s.vm).is_some_and(|r| r.role == Role::Primary)
+    })
+    .await;
+    assert_eq!(s.b.record(s.vm).unwrap().role, Role::Replica);
+    assert!(s.b.storage.has_file(s.volume));
+}
+
+/// 이미지의 가상 크기가 볼륨 크기와 달라도(백엔드가 맞춘 크기) 마이그레이션 뒤 A에 남긴 복제본은 다음 B→A 회차의
+/// 증분을 받는다: A의 기록은 이미지 크기, 복제 항목은 볼륨 크기를 적는다.
+#[tokio::test]
+async fn an_unaligned_disk_left_by_a_migration_still_takes_increments() {
+    let s = setup().await;
+    s.a.storage.set_size(s.volume, SIZE + 512);
+    let first = succeeded(&s.replicate().await);
+    let task = succeeded(&s.migrate("node2", None).await);
+    s.wait_running_on(&s.b).await;
+    // 따라잡기도 복제 비트맵 뒤 바뀐 것만 보냈다(복제 항목의 볼륨 크기로 견준다).
+    let catch_ups = s.a.hv.catch_ups();
+    assert_eq!(catch_ups[0].base, [Some(replica_bitmap(s.b.id, first))]);
+    let entry = s.vm().status.replication[0].clone();
+    assert_eq!(
+        entry.volumes,
+        [ReplicaVolume {
+            id: s.volume,
+            size_bytes: SIZE
+        }]
+    );
+    assert_eq!(s.a.record(s.vm).unwrap().volumes[0].size_bytes, SIZE + 512);
+    wait_until("B's record to become the primary", || {
+        s.b.record(s.vm).is_some_and(|r| r.role == Role::Primary)
+    })
+    .await;
+    let (status, run) = s.admin.post("/vms/web/replicate", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let run = succeeded(&s.admin.wait_task(&run).await);
+    let targets = s.b.hv.replications().last().unwrap().targets.clone();
+    assert_eq!(targets[0].base, Some(replica_bitmap(s.a.id, task)));
+    let entry = s.vm().status.replication[0].clone();
+    assert_eq!((entry.generation, entry.last_full), (Some(run), false));
+}
+
+/// 확정 쓰기 전에 A가 남길 디스크를 원본 기록에 적는다: 끝내기가 A의 디스크를 복제본으로 적지 못해도(원본 QEMU를
+/// 끄지 못함 — opld가 확정 뒤 죽은 것과 같다) 청소가 그 디스크들을 옛 복제본으로 알아보고 다음 B→A 회차가 그 위에
+/// 전체로 보낸다. 마지막 복제 뒤 더한 디스크도 그렇다.
+#[tokio::test]
+async fn a_migration_records_the_disks_it_leaves_before_committing() {
+    let s = setup().await;
+    succeeded(&s.replicate().await);
+    // 마지막 복제 뒤 디스크 data를 더한다(A의 원본 기록에는 없다).
+    let data = local_volume(&s.a, "data").await;
+    let task = s.admin.act("web", "stop").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let vm = s.vm();
+    let mut spec = serde_json::to_value(&vm.spec).unwrap();
+    spec["disks"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "volume": "data", "bus": "virtio-blk" }));
+    let (status, body) = s
+        .admin
+        .put("/vms/web", json!({ "spec": spec }), Some(vm.revision))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let task = s.admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    s.a.hv.set_unkillable(s.vm, true);
+    succeeded(&s.migrate("node2", None).await);
+    s.wait_running_on(&s.b).await;
+    let record = s.a.record(s.vm).unwrap();
+    assert_eq!(record.role, Role::Primary);
+    let mut ids: Vec<Uuid> = record.volumes.iter().map(|v| v.id).collect();
+    ids.sort();
+    let mut both = vec![s.volume, data];
+    both.sort();
+    assert_eq!(ids, both);
+    s.a.hv.set_unkillable(s.vm, false);
+    wait_until("B's record to become the primary", || {
+        s.b.record(s.vm).is_some_and(|r| r.role == Role::Primary)
+    })
+    .await;
+
+    let (status, run) = s.admin.post("/vms/web/replicate", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let run = succeeded(&s.admin.wait_task(&run).await);
+    let entry = s.vm().status.replication[0].clone();
+    assert_eq!(
+        (entry.node, entry.state, entry.generation, entry.last_full),
+        (s.a.id, ReplicationState::Ready, Some(run), true)
+    );
+    let record = s.a.record(s.vm).unwrap();
+    assert_eq!(record.role, Role::Replica);
+    assert_eq!(record.volumes.len(), 2);
+    assert!(
+        record
+            .volumes
+            .iter()
+            .all(|v| v.state == ReplicaState::Ready)
+    );
+    assert!(s.a.storage.deleted().is_empty());
+}
+
+/// 따라잡기가 실패하면 마이그레이션을 되돌리고 VM은 A에서 계속 돈다. B의 복제본은 반쯤 쓰였을 수 있어 `syncing`으로
+/// 남고(HA가 쓰지 않는다), 다음 회차가 끝나면 다시 `ready`다.
+#[tokio::test]
+async fn a_failed_catch_up_rolls_back_and_leaves_the_replica_syncing() {
+    let s = setup().await;
+    succeeded(&s.replicate().await);
+    s.a.hv
+        .fail_next_catch_up(DriverError::Migration("Connection reset by peer".into()));
+    let error = failed(&s.migrate("node2", None).await);
+    assert!(error.contains("Connection reset by peer"), "{error}");
+    // 되돌리기가 원본 QEMU에 남은 따라잡기의 플리싱·작업을 치운다.
+    assert_eq!(s.a.hv.leftover_clears(), [s.vm]);
+    let vm = s.vm();
+    assert_eq!(vm.spec.node, Some(s.a.id));
+    assert_eq!(vm.status.migration, None);
+    assert_eq!(s.entry().state, ReplicationState::Syncing);
+    let record = s.b.record(s.vm).unwrap();
+    assert_eq!(record.role, Role::Replica);
+    assert_eq!(record.volumes[0].state, ReplicaState::Syncing);
+    // 원본도 복제본도 지우지 않았다.
+    assert!(s.a.storage.has_file(s.volume) && s.b.storage.has_file(s.volume));
+    assert!(s.b.storage.deleted().is_empty());
+
+    let run = succeeded(&s.replicate().await);
+    let entry = s.entry();
+    assert_eq!(
+        (entry.state, entry.generation),
+        (ReplicationState::Ready, Some(run))
+    );
+    assert_eq!(
+        s.b.record(s.vm).unwrap().volumes[0].state,
+        ReplicaState::Ready
+    );
+}
+
+/// 복제본의 풀과 다른 풀로 복제 대상에 옮기려 하면 거절한다. 복제 대상이 아닌 노드로는 계획 42처럼 새 볼륨에 미러한다.
+#[tokio::test]
+async fn only_replication_targets_are_caught_up() {
+    let s = setup().await;
+    succeeded(&s.replicate().await);
+    let (status, body) = s
+        .admin
+        .post("/vms/web/migrate", json!({ "node": "node2", "pool": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "migration_unsupported", "{body}");
+    assert_eq!(
+        body["message"],
+        "node \"node2\" holds the replica of VM \"web\" in pool \"b\"; migrate without --pool or remove the node from the replication targets"
+    );
+
+    // 복제 대상에서 빼면 B의 청소가 복제본을 지우고, 그 뒤 B로는 미러한다.
+    let vm = s.vm();
+    let mut spec = vm.spec.clone();
+    spec.replication.clear();
+    s.a.cluster
+        .update_spec(vm.id, Some(vm.revision), vm.labels.clone(), &spec)
+        .await
+        .unwrap();
+    wait_until("B to see the change", || {
+        let vm = s.b.cluster.get::<VmSpec>(s.vm).unwrap().unwrap();
+        vm.spec.replication.is_empty()
+    })
+    .await;
+    s.b.receiver.as_ref().unwrap().inner.sweep().await;
+    assert!(s.b.record(s.vm).is_none());
+    assert!(!s.b.storage.has_file(s.volume));
+    succeeded(&s.migrate("node2", Some("b")).await);
+    s.wait_running_on(&s.b).await;
+    assert!(s.a.hv.catch_ups().is_empty());
+    assert_eq!(s.a.hv.mirrors().len(), 1);
+    assert!(s.b.storage.has_file(s.volume));
+}
+
+/// 원본은 바뀐 것만 보내려 했지만 B의 복제본이 그 회차의 온전한 사본이 아니면(옛 복제본 등) B가 거절하고 원본은 그
+/// 디스크를 전체부터 따라잡는다.
+#[tokio::test]
+async fn a_replica_that_cannot_take_the_changes_is_caught_up_in_full() {
+    let s = setup().await;
+    succeeded(&s.replicate().await);
+    let mut record = s.b.record(s.vm).unwrap();
+    record.volumes[0].state = ReplicaState::Stale;
+    replicas::write(&s.b.replica_dir, &record).unwrap();
+    succeeded(&s.migrate("node2", None).await);
+    let catch_ups = s.a.hv.catch_ups();
+    assert_eq!(catch_ups.len(), 1, "{catch_ups:?}");
+    assert_eq!(catch_ups[0].base, [None]);
+    s.wait_running_on(&s.b).await;
+    assert_eq!(s.vm().status.replication[0].node, s.a.id);
 }

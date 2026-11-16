@@ -198,6 +198,7 @@ impl MigrationReceiver for FakeReceiver {
         Ok(MigrateIncomingResponse {
             port: 60007,
             nbd_port: (!req.disks.is_empty()).then_some(60008),
+            refused: Vec::new(),
         })
     }
 
@@ -999,13 +1000,15 @@ async fn migration_requests_reach_the_receiver_of_a_member() {
             .unwrap(),
         MigrateIncomingResponse {
             port: 60007,
-            nbd_port: None
+            nbd_port: None,
+            refused: Vec::new(),
         }
     );
     // 복사할 디스크는 요청에 실려 가고 NBD 포트가 돌아온다.
     let disk = IncomingDisk {
         volume: Uuid::now_v7(),
         size_bytes: 1 << 30,
+        base_synced_at: None,
     };
     let reply = peers
         .migrate_incoming(
@@ -1099,6 +1102,7 @@ impl MigrationReceiver for ThreadReceiver {
         Ok(MigrateIncomingResponse {
             port: 60007,
             nbd_port: None,
+            refused: Vec::new(),
         })
     }
 

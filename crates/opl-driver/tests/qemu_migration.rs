@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use opl_driver::{
-    DriverError, EventKind, Hypervisor, MigrateOptions, MigrateTarget, MirrorOptions,
+    CatchUp, DriverError, EventKind, Hypervisor, MigrateOptions, MigrateTarget, MirrorOptions,
     MirrorProgress, MirrorTarget, QemuConfig, QemuHypervisor, RuntimeStatus, StopMode,
     migration_tls_dir, write_migration_tls,
 };
@@ -166,6 +166,7 @@ fn opts() -> MigrateOptions {
         bandwidth: None,
         timeout: Duration::from_secs(120),
         switchover_mirrors: false,
+        switchover_catch_up: None,
         devices: None,
     }
 }
@@ -224,7 +225,7 @@ async fn migrates_a_running_vm_over_tls() {
     assert_eq!(status(&n.dst, vm.id).await, Some(RuntimeStatus::Paused));
 
     assert!(!std::fs::read(&dst_vars).unwrap().ends_with(marker));
-    n.dst.finish_incoming(vm.id).await.unwrap();
+    n.dst.finish_incoming(vm.id, None).await.unwrap();
     assert_eq!(status(&n.dst, vm.id).await, Some(RuntimeStatus::Running));
     let bitmaps = n.dst.backup_bitmaps(vm.id).await.unwrap();
     let a = &bitmaps[0].bitmaps;
@@ -476,7 +477,7 @@ async fn inconsistent_bitmaps_are_dropped_and_do_not_block_migration() {
     };
     n.src.migrate(vm.id, &target, &opts()).await.unwrap();
     n.dst.incoming_wait(vm.id).await.unwrap();
-    n.dst.finish_incoming(vm.id).await.unwrap();
+    n.dst.finish_incoming(vm.id, None).await.unwrap();
     assert!(n.src.stop_migrated(vm.id).await.unwrap());
     let bitmaps = n.dst.backup_bitmaps(vm.id).await.unwrap();
     let b = &bitmaps[0].bitmaps;
@@ -654,12 +655,13 @@ async fn migrates_local_disks_by_mirroring_them() {
     };
     let opts = MigrateOptions {
         switchover_mirrors: true,
+        switchover_catch_up: None,
         devices: None,
         ..opts()
     };
     n.src.migrate(id, &target, &opts).await.unwrap();
     n.dst.incoming_wait(id).await.unwrap();
-    n.dst.finish_incoming(id).await.unwrap();
+    n.dst.finish_incoming(id, None).await.unwrap();
     assert_eq!(status(&n.dst, id).await, Some(RuntimeStatus::Running));
     // 내보내기를 닫았다.
     assert!(std::net::TcpListener::bind((HOST, nbd)).is_ok());
@@ -692,6 +694,97 @@ async fn migrates_local_disks_by_mirroring_them() {
     assert_eq!(
         image_bitmaps(&dst_disks[0]),
         [("opl-a".to_string(), vec!["auto".to_string()])]
+    );
+}
+
+/// 대상 노드에 복제본(복제 비트맵을 만든 때의 사본)이 있으면 미러 대신 따라잡는다(계획 55): 첫 패스는 복제 비트맵 뒤
+/// 바뀐 블록만 보내고, 그 뒤의 쓰기는 `pre-switchover`의 마지막 패스가 보낸다. 넘겨받을 때 뒤집힌 복제의 비트맵을
+/// 만들면 대상 qcow2에 저장된다. 옮긴 디스크는 원본과 같다.
+#[tokio::test]
+async fn migration_to_a_replica_sends_only_the_changes() {
+    let n = nodes().await;
+    let (a, b) = (n.tmp.path().join("a"), n.tmp.path().join("b"));
+    let (src_disk, dst_disk) = (a.join("d0.qcow2"), b.join("d0.qcow2"));
+    create_image("qcow2", &src_disk);
+    qemu_io("qcow2", "write -P 0x11 0 4M", &src_disk);
+    qemu_io("qcow2", "write -P 0x22 32M 1M", &src_disk);
+    // 복제본: 복제 비트맵을 만드는 때(게스트 OS가 없어 켠 뒤에도 디스크가 그대로다)의 사본
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::copy(&src_disk, &dst_disk).unwrap();
+    let id = Uuid::now_v7();
+    let src_vm = spec_with(id, &[(src_disk.clone(), ImageFormat::Qcow2)]);
+    let dst_vm = spec_with(id, &[(dst_disk.clone(), ImageFormat::Qcow2)]);
+    n.src.start(&src_vm, None).await.unwrap();
+    let replica = "opl-repl-b-1";
+    n.src.add_bitmaps(id, replica).await.unwrap();
+    guest_write(&n.src, id, 0, "write -P 0x44 16M 64k").await;
+
+    let task = Uuid::now_v7();
+    let ports = n
+        .dst
+        .start_incoming(&dst_vm, task, HOST, 61100..=61119, &[0])
+        .await
+        .unwrap();
+    let nbd = ports.nbd.unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(MirrorProgress::default());
+    let req = CatchUp {
+        targets: mirror_targets(nbd, &[ImageFormat::Qcow2], HOST),
+        base: vec![Some(replica.into())],
+        task,
+        limit: 64 << 20,
+        passes: 5,
+        speed: None,
+        stall: Duration::from_secs(60),
+        timeout: Duration::from_secs(600),
+        progress: Some(tx),
+    };
+    let state = n.src.catch_up_disks(id, &req).await.unwrap();
+    assert_eq!(state.passes, 1, "{state:?}");
+    let sent = rx.borrow().done_bytes;
+    assert!(sent > 0 && sent <= 1 << 20, "sent {sent} bytes");
+    // 따라잡은 뒤의 쓰기는 마지막 패스가 보낸다.
+    guest_write(&n.src, id, 0, "write -P 0x55 20M 64k").await;
+    let target = MigrateTarget {
+        host: HOST.into(),
+        port: ports.migration,
+        tls_hostname: HOST.into(),
+    };
+    let opts = MigrateOptions {
+        switchover_catch_up: Some(state),
+        ..opts()
+    };
+    n.src.migrate(id, &target, &opts).await.unwrap();
+    n.dst.incoming_wait(id).await.unwrap();
+    n.dst
+        .finish_incoming(id, Some("opl-repl-a-2"))
+        .await
+        .unwrap();
+    assert_eq!(status(&n.dst, id).await, Some(RuntimeStatus::Running));
+    assert!(std::net::TcpListener::bind((HOST, nbd)).is_ok());
+    let bitmaps = n.dst.backup_bitmaps(id).await.unwrap();
+    let names: Vec<&str> = bitmaps[0].bitmaps.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, ["opl-repl-a-2"], "{bitmaps:?}");
+    assert!(n.src.stop_migrated(id).await.unwrap());
+    n.dst.stop(id, StopMode::Force).await.unwrap();
+
+    let out = std::process::Command::new("qemu-img")
+        .args(["compare", "-U", "-f", "qcow2", "-F", "qcow2"])
+        .arg(&src_disk)
+        .arg(&dst_disk)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    for read in [
+        "read -P 0x11 0 4M",
+        "read -P 0x44 16M 64k",
+        "read -P 0x55 20M 64k",
+        "read -P 0x22 32M 1M",
+    ] {
+        qemu_io("qcow2", read, &dst_disk);
+    }
+    assert_eq!(
+        image_bitmaps(&dst_disk),
+        [("opl-repl-a-2".to_string(), vec!["auto".to_string()])]
     );
 }
 
@@ -754,6 +847,7 @@ async fn failed_disk_copy_keeps_the_source_running() {
     };
     let migrate = MigrateOptions {
         switchover_mirrors: true,
+        switchover_catch_up: None,
         devices: None,
         ..opts_short()
     };
