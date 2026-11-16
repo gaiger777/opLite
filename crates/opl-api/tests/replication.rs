@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use opl_api::{
-    AppState, IncomingReplicas, ReplicaConfig, ReplicationScheduler, ReplicationSchedulerConfig,
-    TaskRunner, hash_password,
+    AppState, HaManager, HaManagerConfig, IncomingReplicas, ReplicaConfig, ReplicationScheduler,
+    ReplicationSchedulerConfig, TaskRunner, hash_password,
 };
-use opl_cluster::types::{NodeId, OrbNode};
+use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig};
 use opl_driver::mock::MOCK_MIRROR_BYTES;
 use opl_driver::{Hypervisor, MOCK_INCREMENT_BYTES, MockHypervisor, ReplicaDiskTarget, Storage};
@@ -24,11 +24,14 @@ use opl_peer::{
     GrpcNetwork, PeerService, Peers, ReplicaAbortRequest, ReplicaError, ReplicaFinishRequest,
     ReplicaPrepareRequest, ReplicaPrepareResponse, ReplicaReceiver,
 };
-use opl_reconciler::Reconciler;
+use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::replicas::{self, ReplicaState, Role};
+use opl_reconciler::{HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role as UserRole, UserSpec};
 use opl_types::backup::bitmap_name;
-use opl_types::node::{FEATURES, NODE_REPLICATION, NodeHotplug, NodeSpec, NodeStatus};
+use opl_types::node::{
+    FEATURES, Fencing, NODE_REPLICATION, NodeHa, NodeHotplug, NodeSpec, NodeStatus,
+};
 use opl_types::replication::{ReplicaStatus, ReplicationState, replica_bitmap};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
@@ -36,7 +39,7 @@ use opl_types::storage::{
     PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
-use opl_types::vm::{Arch, Vm, VmSpec};
+use opl_types::vm::{Arch, Vm, VmPhase, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -81,6 +84,16 @@ impl ReplicaReceiver for LossyReceiver {
     }
 }
 
+/// 리스 갱신이 늘 성공하는 HA guard 갱신기(리더의 리스 표는 시험이 따로 갱신한다)
+struct AlwaysRenewed;
+
+#[async_trait]
+impl LeaseRenewer for AlwaysRenewed {
+    async fn renew_lease(&self, _timeout: Duration) -> Result<(), opl_cluster::ClusterError> {
+        Ok(())
+    }
+}
+
 struct Node {
     id: Uuid,
     name: String,
@@ -92,6 +105,8 @@ struct Node {
     tls: NodeTls,
     listener: Option<TcpListener>,
     receiver: Option<Arc<LossyReceiver>>,
+    /// reconciler의 HA guard(가짜 갱신 — 늘 성공). None이면 HA VM을 켜지 않는다.
+    ha: Option<Arc<HaGuard>>,
     base: String,
     /// 복제본 기록 디렉터리(받는 쪽·reconciler·Task 실행기가 함께 쓴다)
     replica_dir: PathBuf,
@@ -137,6 +152,7 @@ impl Node {
             tls,
             listener: Some(listener),
             receiver: None,
+            ha: None,
             base: String::new(),
             replica_dir: root.path().join(format!("{id}-work")).join("replicas"),
             state: None,
@@ -178,6 +194,7 @@ impl Node {
         let mut rc = reconciler_config(self.id);
         rc.storage = storage.clone();
         rc.replica_dir = self.replica_dir.clone();
+        rc.ha = self.ha.clone();
         let reconciler = Reconciler::spawn(self.cluster.clone(), hv.clone(), rc);
         let mut state = AppState::new(
             self.cluster.clone(),
@@ -232,10 +249,28 @@ struct Setup {
 /// 두 노드 A(node1)·B(node2)를 띄우고, A만의 dir 풀 `a`에 볼륨 `root`를 둔 VM `web`을 A에서 켠다. VM은 B의 풀
 /// `b`로 복제한다(`schedule`). `a_hotplug`면 A가 CPU·메모리 핫플러그를 할 수 있다고 알린다(실행 중 디스크 붙이기).
 async fn setup_with(schedule: &str, a_hotplug: bool) -> Setup {
+    setup_full(schedule, a_hotplug, false).await
+}
+
+/// [`setup_with`]와 같되 `ha`면 두 노드가 HA 가능 노드(`process` 펜싱, `recover_after` 1초)이고 VM이 HA VM이며, A가
+/// 리더가 아닌 노드다(리더는 자기 노드를 복구하지 않으므로 죽일 노드를 팔로워로 둔다).
+async fn setup_full(schedule: &str, a_hotplug: bool, ha: bool) -> Setup {
     let ca = ClusterCa::generate("test").unwrap();
     let root = TempDir::new().unwrap();
     let mut a = Node::open(&ca, &root, "node1").await;
     let mut b = Node::open(&ca, &root, "node2").await;
+    if ha {
+        for node in [&mut a, &mut b] {
+            node.ha = Some(HaGuard::spawn(
+                Arc::new(AlwaysRenewed),
+                HaConfig {
+                    fence_after: Duration::from_secs(60),
+                    renew_interval: Duration::from_millis(20),
+                    watchdog: None,
+                },
+            ));
+        }
+    }
     a.serve(&root).await;
     b.serve(&root).await;
     let members = BTreeMap::from([
@@ -243,6 +278,12 @@ async fn setup_with(schedule: &str, a_hotplug: bool) -> Setup {
         (NodeId(b.id), OrbNode::single(&b.addr)),
     ]);
     a.cluster.initialize(members).await.unwrap();
+    if ha {
+        wait_until("a leader", || a.cluster.members().leader.is_some()).await;
+        if a.cluster.members().leader == Some(NodeId(a.id)) {
+            std::mem::swap(&mut a, &mut b);
+        }
+    }
     for node in [&a, &b] {
         let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
             node.name.clone(),
@@ -260,6 +301,13 @@ async fn setup_with(schedule: &str, a_hotplug: bool) -> Setup {
         r.status.hypervisor = "mock".into();
         r.status.arch = Some(Arch::Aarch64);
         r.status.features = FEATURES.iter().map(|f| f.to_string()).collect();
+        if ha {
+            r.status.ha = Some(NodeHa {
+                fencing: Fencing::Process,
+                recover_after_secs: 1,
+                fence_after_secs: None,
+            });
+        }
         if a_hotplug && node.id == a.id {
             r.status.hotplug = Some(NodeHotplug {
                 cpu: true,
@@ -299,6 +347,9 @@ async fn setup_with(schedule: &str, a_hotplug: bool) -> Setup {
     req["spec"]["node"] = json!(a.id);
     req["spec"]["disks"] = json!([{ "volume": "root", "bus": "virtio-blk" }]);
     req["spec"]["replication"] = json!([{ "node": b.id, "schedule": schedule, "pool": "b" }]);
+    if ha {
+        req["spec"]["ha"] = json!(true);
+    }
     let (status, body) = admin.post("/vms", req).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let task = admin.act("web", "start").await;
@@ -989,4 +1040,114 @@ async fn the_scheduler_keeps_to_max_concurrent_per_source_node() {
     })
     .await;
     scheduler.shutdown().await;
+}
+
+/// HA 복구(계획 55): A의 리스가 끊기면 리더(B)가 B의 복제본으로 VM을 옮기고, B가 복제본을 승격해 풀 `b`의 볼륨으로
+/// 켠다. 복제 방향이 뒤집혀 A가 대상(풀 `a`, `stale`)이 되고, A가 돌아오면 청소가 A의 원본 기록을 옛 복제본으로 바꾸며
+/// 다음 B→A 회차가 전체로 보내 `ready`가 된다.
+#[tokio::test]
+async fn an_ha_vm_restarts_from_its_replica_and_the_replication_turns_around() {
+    let s = setup_full("*/15", false, true).await;
+    succeeded(&s.replicate().await);
+    let synced_at = s.entry().synced_at.unwrap();
+    assert_eq!(s.a.record(s.vm).unwrap().role, Role::Primary);
+    assert_eq!(s.b.cluster.members().leader, Some(NodeId(s.b.id)));
+    // B의 리스만 갱신한다(A는 죽었다).
+    let renewing = {
+        let cluster = s.b.cluster.clone();
+        let node = s.b.id;
+        tokio::spawn(async move {
+            loop {
+                let _ = cluster
+                    .execute_as_leader(LeaderRequest::RenewLease {
+                        node: NodeId(node),
+                        checks: vec![],
+                        load: None,
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    let manager = HaManager::spawn(
+        s.b.state(),
+        HaManagerConfig {
+            tick: Duration::from_millis(100),
+            ..Default::default()
+        },
+    );
+    wait_until("the VM running on B", || {
+        let vm = s.vm();
+        vm.status.phase == VmPhase::Running && vm.status.node == Some(s.b.id)
+    })
+    .await;
+    manager.shutdown().await;
+    renewing.abort();
+
+    // 볼륨은 B의 풀 `b`에 있고, B는 그 복제본으로 켰다.
+    let volume = s.a.cluster.get::<VolumeSpec>(s.volume).unwrap().unwrap();
+    assert_eq!(volume.spec.pool, "b");
+    assert_eq!(volume.status.node, Some(s.b.id));
+    let launched = s.b.hv.launch_specs().last().unwrap().disks[0].path.clone();
+    assert_eq!(
+        launched,
+        PathBuf::from(format!("/nonexistent/opl-b/{}.qcow2", s.volume))
+    );
+    assert_eq!(s.b.record(s.vm).unwrap().role, Role::Primary);
+    let vm = s.vm();
+    assert_eq!(vm.spec.node, Some(s.b.id));
+    assert_eq!(
+        vm.spec.replication,
+        [opl_types::replication::ReplicationTarget {
+            node: s.a.id,
+            schedule: "*/15".into(),
+            pool: Some("a".into()),
+        }]
+    );
+    assert_eq!(
+        vm.status.replication,
+        [ReplicaStatus {
+            state: ReplicationState::Stale,
+            ..ReplicaStatus::pending(s.a.id)
+        }]
+    );
+    // 복제본으로 한 복구가 남는다(VM이 켜진 뒤에도).
+    let recovery = vm.status.last_recovery.expect("the recovery is recorded");
+    assert_eq!(
+        (recovery.from, recovery.node, recovery.synced_at),
+        (s.a.id, s.b.id, synced_at)
+    );
+    assert!(recovery.at >= synced_at);
+    let (_, tasks) = s.a.cluster.list::<TaskSpec>().unwrap();
+    assert!(
+        tasks
+            .iter()
+            .any(|t| t.spec.op == TaskOp::VmHaRecover { from: s.a.id })
+    );
+
+    // A가 돌아온다: 청소가 원본 기록을 옛 복제본으로 바꾸고, 다음 회차(B→A)는 전체다.
+    s.a.receiver.as_ref().unwrap().inner.sweep().await;
+    let record = s.a.record(s.vm).unwrap();
+    assert_eq!(record.role, Role::Replica);
+    assert_eq!(record.volumes[0].state, ReplicaState::Stale);
+    let (status, task) = s.admin.post("/vms/web/replicate", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], json!(s.b.id), "{task}");
+    let run = succeeded(&s.admin.wait_task(&task).await);
+    let entry = s
+        .vm()
+        .status
+        .replication
+        .into_iter()
+        .find(|r| r.node == s.a.id)
+        .unwrap();
+    assert_eq!(entry.state, ReplicationState::Ready);
+    assert_eq!(entry.generation, Some(run));
+    assert!(entry.last_full);
+    let record = s.a.record(s.vm).unwrap();
+    assert_eq!(record.generation, Some(run));
+    assert_eq!(record.volumes[0].state, ReplicaState::Ready);
+    assert_eq!(record.volumes[0].pool, "a");
+    // 다음 복제가 성공해도 복구 기록은 남는다.
+    assert_eq!(s.vm().status.last_recovery, Some(recovery));
 }

@@ -73,6 +73,7 @@ async fn setup_with(
             },
         );
         volume.status.phase = VolumePhase::Ready;
+        volume.status.node = Some(env.node);
         env.cluster.create(&volume).await.unwrap();
     }
     let storage = Arc::new(FakeStorage::default());

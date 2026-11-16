@@ -22,6 +22,7 @@ use crate::backoff::{FailureTracker, Next};
 use crate::config::ReconcilerConfig;
 use crate::ha::ArmError;
 use crate::reconciler::{Held, Restores};
+use crate::replicas;
 use crate::resolve::{
     ResolveError, apply_disk_moves, apply_hardware, running_spec, runtime_spec, set_disks_shared,
 };
@@ -1020,6 +1021,37 @@ impl Worker {
     /// 그 사이 끝났으면 실패로 세지 않고 잠시 뒤 다시 본다(백오프, `NotStarted`). HA VM이 그 사이
     /// 바뀌었으면 `Changed`.
     async fn start(&mut self, vm: &Vm) -> Result<Start, StepError> {
+        // HA 복구가 이 노드의 복제본으로 켜라고 했으면 디스크를 풀기 전에 복제본을 승격한다. 쓸 복제본이 없으면 켜지
+        // 않는다(다른 노드의 디스크 기록을 그대로 둔다). 일시 오류(받는 QEMU 끄기, 합치기, 클러스터)는 실패로 세지 않고
+        // 잠시 뒤 다시 해 본다.
+        let c = &self.config;
+        match replicas::promote(
+            &self.cluster,
+            &*self.hv,
+            &*c.storage,
+            &c.replica_dir,
+            vm,
+            c.node,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(replicas::PromoteError::Transient(e)) => {
+                tracing::warn!(vm = %self.id, error = %e, "cannot promote the replicas of the VM yet; retrying");
+                let delay = self.config.retry_interval;
+                self.backoff = Some((
+                    Instant::now() + delay,
+                    format!("cannot promote the replicas: {e}; retrying in {delay:?}"),
+                ));
+                return Ok(Start::NotStarted);
+            }
+            Err(e @ replicas::PromoteError::Unusable(_)) => {
+                tracing::warn!(vm = %self.id, error = %e, "cannot promote the replicas of the VM; not starting");
+                self.restores.lock().unwrap().remove(&self.id);
+                self.power_off = Some(Some(format!("failed to start: {e}")));
+                return Ok(Start::NotStarted);
+            }
+        }
         let mut spec = match self.resolve(vm).await {
             Ok(spec) => spec,
             Err(ResolveError::Cluster(e)) => return Err(e.into()),
@@ -1466,7 +1498,7 @@ impl Worker {
     /// 이 작업자가 바꾼 필드만 저장소의 값 위에 다시 적용한다([`merge_ha`]). 나머지 필드는 전처럼 이 작업자가
     /// 계산한 값으로 덮는다. 실행 중 하드웨어 기록(`hardware`)도 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다
     /// (핫플러그 Task가 쓴다). 복제 상태(`replication`)도 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다(복제 Task와
-    /// 리더가 쓴다).
+    /// 리더가 쓴다). 복제본으로 한 HA 복구 기록(`last_recovery`)은 리더만 쓰므로 늘 저장소의 것이다.
     async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
         let keep_firmware = status.firmware_node == vm.status.firmware_node;
         let keep_hardware = status.hardware == vm.status.hardware;
@@ -1486,6 +1518,7 @@ impl Worker {
                 status.replication = vm.status.replication.clone();
             }
             status.rule_violations = vm.status.rule_violations.clone();
+            status.last_recovery = vm.status.last_recovery;
             status.ha = merge_ha(&read_ha, &mine, vm.status.ha.clone());
             match self
                 .cluster
@@ -1538,6 +1571,7 @@ impl Worker {
             ha: vm.status.ha.clone(),
             hardware: None,
             replication: vm.status.replication.clone(),
+            last_recovery: vm.status.last_recovery,
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

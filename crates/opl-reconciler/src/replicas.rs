@@ -15,12 +15,17 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
-use opl_cluster::Cluster;
-use opl_driver::{DriverError, Storage};
+use opl_cluster::types::Rejection;
+use opl_cluster::{Cluster, ClusterError};
+use opl_driver::{DriverError, Hypervisor, Storage};
+use opl_types::node::NodeSpec;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::StoragePoolSpec;
+use opl_types::storage::{StoragePoolSpec, Volume, VolumeSpec, is_shared};
+use opl_types::vm::{Vm, VmSpec};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::resolve::move_volume;
 
 /// 기록 파일 하나: VM 하나에서 이 노드가 가진 디스크들
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +364,151 @@ pub async fn delete_replica(
         Err(e) => {
             tracing::warn!(vm = %vm, volume = %v.id, error = %e, "cannot delete a replica");
             false
+        }
+    }
+}
+
+/// 복제본을 승격하지 못한 이유([`promote`])
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromoteError {
+    /// 이 노드에 쓸 복제본이 없다(완전한 복제본이 없음, 노드를 모르는 볼륨). 다시 해도 같다.
+    Unusable(String),
+    /// 받는 QEMU 끄기·겹층 합치기·클러스터 읽기와 쓰기·기록 파일의 일시 오류. 다시 해 본다.
+    Transient(String),
+}
+
+impl std::fmt::Display for PromoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromoteError::Unusable(e) | PromoteError::Transient(e) => f.write_str(e),
+        }
+    }
+}
+
+/// HA 복구가 이 노드(`node`)의 복제본으로 VM을 켜라고 했으면(`status.replication`의 이 노드 항목 `promote`) 복제본을
+/// 진짜 디스크로 올린다. VM의 노드 로컬 풀 디스크 가운데 볼륨이 다른 노드에 있는 것이 있으면, 잠금 안에서 기록의 못 받은
+/// 겹층의 받는 QEMU를 끄고 겹층을 정리한 뒤(받은 것은 합치고 못 받은 것은 버린다, [`settle`]) 그 디스크마다 복제본 기록에
+/// `ready`로 있어야 한다. 볼륨 기록을 이 노드·기록의 풀·형식으로 고치고(`move_volume`) 기록을 `primary`로 바꾼다. 마지막에
+/// status에서 이 노드의 항목(승격 표시)을 지운다. 표시가 없으면 아무것도 하지 않는다(다른 노드의 볼륨은 그 노드의 것이다).
+/// 쓸 복제본이 없거나 노드 로컬 풀 디스크 가운데 어느 노드에 있는지 모르는 볼륨이 있으면 오류이고 볼륨 기록은
+/// 그대로다(VM을 켜지 않는다 — [`PromoteError::Unusable`]). 받는 QEMU를 끄지 못하거나 합치지 못하거나 클러스터를
+/// 읽고 쓰지 못하면 다시 해 볼 오류다([`PromoteError::Transient`]). 그 VM의 잠금([`lock_vm`])을 쥐어 받은 겹층의 합치기가
+/// 끝나기를 기다리고, 기록 디렉터리 잠금은 쥐지 않는다(합치는 동안 다른 VM의 받기를 막지 않게 — [`vm_records`]).
+pub async fn promote(
+    cluster: &Cluster,
+    hv: &dyn Hypervisor,
+    storage: &dyn Storage,
+    dir: &Path,
+    vm: &Vm,
+    node: Uuid,
+) -> Result<(), PromoteError> {
+    use PromoteError::{Transient, Unusable};
+    if !vm
+        .status
+        .replication
+        .iter()
+        .any(|r| r.node == node && r.promote)
+    {
+        return Ok(());
+    }
+    let cluster_error = |e: ClusterError| Transient(e.to_string());
+    let mut foreign: Vec<Volume> = Vec::new();
+    for disk in &vm.spec.disks {
+        let Some(volume) = cluster
+            .get_by_name::<VolumeSpec>(&disk.volume)
+            .map_err(cluster_error)?
+        else {
+            continue;
+        };
+        let Some(pool) = cluster
+            .get_by_name::<StoragePoolSpec>(&volume.spec.pool)
+            .map_err(cluster_error)?
+        else {
+            continue;
+        };
+        if is_shared(&pool) {
+            continue;
+        }
+        match volume.status.node {
+            Some(n) if n != node => foreign.push(volume),
+            Some(_) => {}
+            // 파일이 어느 노드에 있는지 모르는 볼륨은 이 노드의 것인지 알 수 없다.
+            None => {
+                return Err(Unusable(format!(
+                    "disk {:?} is on node-local pool {:?} but its node is unknown",
+                    volume.name, volume.spec.pool
+                )));
+            }
+        }
+    }
+    if !foreign.is_empty() {
+        let name = cluster
+            .get::<NodeSpec>(node)
+            .map_err(cluster_error)?
+            .map_or_else(|| node.to_string(), |n| n.name);
+        let missing = |v: &Volume| {
+            Unusable(format!(
+                "disk {:?} has no complete replica on node {name:?}",
+                v.name
+            ))
+        };
+        let record_error = |e: std::io::Error| Transient(format!("the replica record: {e}"));
+        // 받은 겹층을 합치는 중이면 끝나기를 기다린다.
+        let vm_lock = lock_vm(dir, vm.id).await;
+        let records = vm_records(dir, &vm_lock);
+        let record = read(dir, vm.id)
+            .map_err(record_error)?
+            .filter(|r| r.role == Role::Replica)
+            .ok_or_else(|| missing(&foreign[0]))?;
+        // 원본이 죽어 끝나지 못한 회차의 받는 QEMU가 겹층(과 그 아래 복제본)을 쥐고 있을 수 있다.
+        for v in &record.volumes {
+            if let Some(overlay) = v.overlay.as_ref().filter(|o| !o.received)
+                && let Err(e) = hv.stop_replica_receiver(overlay.run).await
+            {
+                return Err(Transient(format!("cannot stop the replica receiver: {e}")));
+            }
+        }
+        let mut record = settle(cluster, storage, &records, record, &[])
+            .await
+            .map_err(Transient)?;
+        for v in &foreign {
+            let ready = record
+                .volumes
+                .iter()
+                .any(|r| r.id == v.id && r.state == ReplicaState::Ready);
+            if !ready {
+                return Err(missing(v));
+            }
+        }
+        for v in &foreign {
+            let Some(r) = record.volumes.iter().find(|r| r.id == v.id) else {
+                continue;
+            };
+            move_volume(cluster, v.id, &r.pool, r.format, node)
+                .await
+                .map_err(cluster_error)?;
+        }
+        record.role = Role::Primary;
+        write(dir, &record).map_err(record_error)?;
+        tracing::warn!(vm = %vm.id, volumes = foreign.len(), synced_at = ?record.synced_at, "promoted the replicas of an HA VM on this node");
+    }
+    // 승격을 마쳤다. 이 노드는 이제 VM의 노드라 복제 대상이 아니다.
+    loop {
+        let Some(current) = cluster.get::<VmSpec>(vm.id).map_err(cluster_error)? else {
+            return Ok(());
+        };
+        let mut status = current.status.clone();
+        status.replication.retain(|r| r.node != node);
+        if status.replication == current.status.replication {
+            return Ok(());
+        }
+        match cluster
+            .update_status_checked::<VmSpec>(vm.id, current.revision, &status)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+            Err(e) => return Err(Transient(e.to_string())),
         }
     }
 }

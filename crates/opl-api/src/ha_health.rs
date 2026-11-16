@@ -736,9 +736,10 @@ async fn migrate(
         let eligible = |n: &Node| {
             n.id != node && ready(place.now, place.b, place.leases, n) && !health.blocks(vm, n, inv)
         };
-        let target = match pick(vm, inv, &assign, eligible, &scorer) {
+        // 라이브 마이그레이션이므로 복제본이 있는 노드도 받는다.
+        let target = match pick(vm, inv, &assign, eligible, &scorer, true) {
             Pick::Node(t) | Pick::Violating(t, _) => t,
-            Pick::NoNode | Pick::Blocked(_) => {
+            Pick::NoNode(_) | Pick::Blocked(_) => {
                 no_target.push(vm);
                 continue;
             }
@@ -859,7 +860,8 @@ async fn restart_elsewhere(
         };
         if ha.evict.is_some() || ha.relocate_from.is_some() {
             // 앞서 요청한 VM도 갈 곳을 센다(아직 이 노드에 있다).
-            if let Pick::Node(t) | Pick::Violating(t, _) = pick(vm, inv, &assign, eligible, &scorer)
+            if let Pick::Node(t) | Pick::Violating(t, _) =
+                pick(vm, inv, &assign, eligible, &scorer, false)
             {
                 assign.place(vm.id, t);
             }
@@ -872,9 +874,10 @@ async fn restart_elsewhere(
         if relocated_too_often(ctx, vm, &check, unix).await {
             continue;
         }
-        let target = match pick(vm, inv, &assign, eligible, &scorer) {
+        // 끈 뒤 다른 노드에서 다시 켜므로(재시작 옮기기) 디스크가 있는 노드만 받는다.
+        let target = match pick(vm, inv, &assign, eligible, &scorer, false) {
             Pick::Node(t) | Pick::Violating(t, _) => t,
-            Pick::NoNode | Pick::Blocked(_) => {
+            Pick::NoNode(_) | Pick::Blocked(_) => {
                 no_target.push(vm);
                 continue;
             }

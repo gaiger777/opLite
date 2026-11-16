@@ -17,7 +17,7 @@ use super::{Ctx, TaskRunnerConfig};
 use crate::cluster::missing_feature;
 use crate::error::ApiError;
 use crate::placement::{self, Assign, affinity_partners, hard_violations};
-use crate::scheduler::{Inventory, disk_moves, node_fits_with};
+use crate::scheduler::{Inventory, disk_moves, node_fits_with, replica_moves};
 use crate::score::{self, Scorer};
 use crate::snapshots::count_snapshots;
 use crate::state::AppState;
@@ -352,7 +352,9 @@ fn bundle(vm: &Vm, node: Uuid, inv: &Inventory) -> Vec<Vm> {
 /// `moves[i]`가 있으면 그 대상 풀)과 도는 하드웨어를 받을 수 있는지([`hotplug::can_receive`])를 지나고, 남은 메모리가 묶음 메모리의 합 이상이며, 묶음을 그 노드에 둔
 /// [`Assign`]으로 hard 배치 규칙을 어기지 않는 노드 가운데 [`placement::compare`] 순서(첫 VM의 HA 그룹
 /// 우선순위 → 구성원 soft 벌점의 합 → 첫 VM의 부하 점수 → 남은 메모리 → id)로 가장 나은 노드. 스케줄러는
-/// 유지보수 노드(이 노드)를 고르지 않는다. 없으면 조건·메모리는 맞는데 막은 hard 규칙의 이름(이름 순)이다. 규칙에 맞는 노드가 메모리
+/// 유지보수 노드(이 노드)를 고르지 않는다. 노드 로컬 풀 디스크가 있는 구성원은 그 노드에 쓸 수 있는 복제본이 있으면 그
+/// 복제본의 풀로 보고([`replica_moves`]), 점수까지 같으면 디스크가 있는 구성원 모두의 복제본이 있는 노드가 먼저다(마지막 복제
+/// 뒤 바뀐 것만 보낸다). 없으면 조건·메모리는 맞는데 막은 hard 규칙의 이름(이름 순)이다. 규칙에 맞는 노드가 메모리
 /// 때문에만 막혔으면(앞 구성원이 옮겨 간 노드에 자리가 없음 등) 규칙이 아니라 자리 탓이므로 비어 있다.
 fn pick_target(
     bundle: &[Vm],
@@ -365,9 +367,23 @@ fn pick_target(
     // 노드 조건과 hard 규칙에는 맞는데 메모리가 모자란 노드가 있다.
     let mut no_room = false;
     let mut found = Vec::new();
+    // 디스크가 있는 구성원 모두의 복제본이 있는 노드
+    let mut replicas = BTreeSet::new();
     for n in inv.nodes.iter().filter(|n| n.status.hypervisor != HVF) {
+        let mut replica = true;
+        let member_moves: Vec<Vec<DiskMove>> = bundle
+            .iter()
+            .zip(moves)
+            .map(|(v, m)| match replica_moves(v, inv, n.id) {
+                Some(r) if !m.is_empty() => r,
+                _ => {
+                    replica &= m.is_empty();
+                    m.clone()
+                }
+            })
+            .collect();
         // 대상은 구성원이 도는 하드웨어(핫플러그 배치)로 켜야 한다.
-        let fits = bundle.iter().zip(moves).all(|(v, m)| {
+        let fits = bundle.iter().zip(&member_moves).all(|(v, m)| {
             node_fits_with(&v.spec, inv, n, m).is_ok()
                 && hotplug::can_receive(v.status.hardware.as_ref(), n).is_ok()
         });
@@ -396,13 +412,26 @@ fn pick_target(
             .iter()
             .map(|v| placement::score(v, n, inv, &assign).penalty)
             .sum();
+        if replica {
+            replicas.insert(n.id);
+        }
         found.push(candidate);
     }
     if no_room {
         blocked.clear();
     }
     placement::level_scores(&mut found, scorer);
-    placement::best(&found)
+    let no_replica = |c: &placement::Candidate| !replicas.contains(&c.node);
+    found
+        .iter()
+        .min_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.penalty.cmp(&b.penalty))
+                .then(b.score.cmp(&a.score))
+                .then(no_replica(a).cmp(&no_replica(b)))
+                .then(placement::compare(a, b))
+        })
         .map(|c| c.node)
         .ok_or_else(|| blocked.into_iter().collect())
 }

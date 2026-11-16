@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::ha::{RELOCATE_WINDOW, ready};
 use crate::ha_health::Health;
 use crate::placement::{self, Assign};
-use crate::scheduler::{Inventory, disk_moves, node_fits};
+use crate::scheduler::{Inventory, disk_moves, replica_fits};
 use crate::score::{LOAD_STALE, Loads, NodeUse, Scorer, node_use, vm_cpu_share};
 
 /// 균형 옮기기의 원본으로 보는 노드 수(사용률이 큰 것부터)
@@ -321,7 +321,8 @@ fn recent(at: u64, now: u64) -> bool {
 }
 
 /// 균형 조정기가 이 VM을 옮길 수 있는지. 아니면 그 이유다(시험·debug 로그).
-/// 자리 잡고 실행 중이고 마이그레이션 중이 아니며, 고정(`pinned`)이 아니고, 로컬 풀 디스크가 없고, 끝나지 않은
+/// 자리 잡고 실행 중이고 마이그레이션 중이 아니며, 고정(`pinned`)이 아니고, 로컬 풀 디스크가 없거나 복제 대상이 있고(그
+/// 복제본 노드로만 옮긴다 — [`target_ok`]), 끝나지 않은
 /// 스냅샷·되돌리기·복제·백업·전원·마이그레이션·핫플러그·디스크 크기 늘리기 Task가 없고, 끝나지 않은 하드웨어 변경(스펙의
 /// 디스크·NIC가 도는 장치와 다름, 게스트가 아직 내려 주지 않은 장치)이 없고, HA 끄기 요청·옮겨 달라는 요청이 없고,
 /// 지난 [`VM_COOLDOWN`] 안에 만든 마이그레이션 Task·HA 복구 기록(`vm-ha-recover`)·HA 옮기기(`ha.relocations`)·이
@@ -342,7 +343,7 @@ pub fn movable(
     if vm.spec.pinned() {
         return Err("pinned");
     }
-    if !disk_moves(&vm.spec, inv, None).is_empty() {
+    if vm.spec.replication.is_empty() && !disk_moves(&vm.spec, inv, None).is_empty() {
         return Err("has disks on a node-local pool");
     }
     let disks: BTreeSet<Uuid> = inv
@@ -438,7 +439,8 @@ pub fn live(node: &Node, leases: &Leases, now: Instant, b: Instant) -> bool {
 }
 
 /// 균형 옮기기의 대상 조건: 원본·대상이 HVF가 아니고, 대상에 VM 메모리(도는 메모리가 더 크면 그것 —
-/// [`hotplug::allocated_memory_mib`])만큼 미할당 메모리(`free_mib` — 계획한 옮기기 반영)가 있고, 노드 조건([`node_fits`])에 맞고, VM이 도는 하드웨어(핫플러그 배치)로 켤 수 있고, 이 VM에 영향을 주는 HA 검사가 실패한 노드가 아니고,
+/// [`hotplug::allocated_memory_mib`])만큼 미할당 메모리(`free_mib` — 계획한 옮기기 반영)가 있고, 노드 조건(노드 로컬 풀 디스크가
+/// 있는 VM은 그 노드에 쓸 수 있는 복제본이 있어야 한다 — [`replica_fits`])에 맞고, VM이 도는 하드웨어(핫플러그 배치)로 켤 수 있고, 이 VM에 영향을 주는 HA 검사가 실패한 노드가 아니고,
 /// `assign`(계획한 옮기기)으로 hard 규칙을 어기지 않고, soft 벌점이 지금보다 늘지 않고, HA 그룹 VM은 그룹 우선순위가
 /// 지금 노드 이상이다(되돌아가기와 핑퐁하지 않게). `ha_reserve`는 메모리 합이라 옮겨도 바뀌지 않아 보지 않는다.
 pub fn target_ok(
@@ -459,7 +461,7 @@ pub fn target_ok(
     if free_mib < i64::from(hotplug::allocated_memory_mib(vm)) {
         return Err("not enough unassigned memory");
     }
-    if node_fits(&vm.spec, inv, to).is_err() {
+    if replica_fits(vm, inv, to).is_err() {
         return Err("node does not fit");
     }
     if hotplug::can_receive(vm.status.hardware.as_ref(), to).is_err() {
@@ -930,7 +932,7 @@ fn awaits_failback(
                 .is_some_and(|since| now.saturating_duration_since(*since) < FAILBACK_WAIT)
             && n.status.hypervisor != HVF
             && inv.free_memory_mib(n, vm.id) >= i64::from(vm.spec.memory_mib)
-            && node_fits(&vm.spec, inv, n).is_ok()
+            && replica_fits(vm, inv, n).is_ok()
             && placement::hard_violations(vm, n, inv, &none).is_empty()
             && !health.blocks(vm, n, inv)
     })
@@ -1435,6 +1437,57 @@ mod tests {
         mate.spec.power = PowerState::Stopped;
         inv.vms = vec![bound.clone(), mate];
         assert_eq!(check(&inv, &bound, &[], &none), Ok(()));
+    }
+
+    /// 노드 로컬 풀 디스크가 있는 VM도 복제 대상이 있으면 옮길 수 있고, 대상은 쓸 수 있는 복제본이 있는 노드뿐이다.
+    #[test]
+    fn a_replicated_vm_moves_only_to_its_replica_nodes() {
+        use opl_types::replication::{
+            ReplicaStatus, ReplicaVolume, ReplicationState, ReplicationTarget,
+        };
+        let (a, b, c) = (node("a", 4, 8192), node("b", 4, 8192), node("c", 4, 8192));
+        let mut disk = volume("d-local", "local");
+        disk.status.node = Some(a.id);
+        let mut inv = Inventory {
+            nodes: vec![a.clone(), b.clone(), c.clone()],
+            pools: vec![pool("local", false)],
+            volumes: vec![disk.clone()],
+            ..Default::default()
+        };
+        let mut v = with_disk(vm("v", 1, 1024, &a), "d-local");
+        assert_eq!(
+            movable(&v, &inv, &[], &BTreeMap::new(), unix_now()),
+            Err("has disks on a node-local pool")
+        );
+        v.spec.replication = vec![ReplicationTarget {
+            node: b.id,
+            schedule: "*/15".into(),
+            pool: None,
+        }];
+        assert_eq!(movable(&v, &inv, &[], &BTreeMap::new(), unix_now()), Ok(()));
+        inv.vms = vec![v.clone()];
+        let reports = BTreeMap::new();
+        let health = Health::new(vec![], &reports);
+        let none = Assign::default();
+        let ok =
+            |inv: &Inventory, to: &Node| target_ok(&inv.vms[0], &a, to, inv, &none, &health, 8192);
+        // 아직 끝난 회차가 없다.
+        assert_eq!(ok(&inv, &b), Err("node does not fit"));
+        inv.vms[0].status.replication = vec![ReplicaStatus {
+            state: ReplicationState::Ready,
+            generation: Some(Uuid::now_v7()),
+            synced_at: Some(100),
+            volumes: vec![ReplicaVolume {
+                id: disk.id,
+                size_bytes: disk.spec.size_bytes,
+            }],
+            ..ReplicaStatus::pending(b.id)
+        }];
+        assert_eq!(ok(&inv, &b), Ok(()));
+        assert_eq!(ok(&inv, &c), Err("node does not fit"));
+        // 복사 중인 복제본은 쓰지 않는다.
+        inv.vms[0].status.replication[0].state = ReplicationState::Syncing;
+        assert_eq!(ok(&inv, &b), Err("node does not fit"));
     }
 
     /// 하드웨어 변경이 끝나지 않은 VM은 옮기지 않고, 대상의 미할당 메모리는 도는 메모리(줄이기 실패로 스펙보다 큼)와

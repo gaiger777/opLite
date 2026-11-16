@@ -15,7 +15,7 @@ use opl_driver::{
 };
 use opl_reconciler::ReconcilerConfig;
 use opl_types::node::{Node, NodeSpec, PoolState};
-use opl_types::replication::{ReplicaStatus, ReplicationState};
+use opl_types::replication::{ReplicaRecovery, ReplicaStatus, ReplicationState};
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
@@ -55,6 +55,7 @@ async fn starts_assigned_vm_and_records_status() {
             // 노드 기록이 없으면(`hotplug` 기능 없음) 핫플러그 배치 없이 켠다.
             hardware: Some(RunningHardware::legacy(&vm.spec)),
             replication: Vec::new(),
+            last_recovery: None,
         }
     );
 }
@@ -413,7 +414,8 @@ async fn status_writes_keep_rule_violations_and_ha_record() {
     assert_eq!(got.status.ha, Some(record));
 }
 
-/// 복제 상태(복제 Task·리더가 씀)는 작업자가 VM을 읽고 status를 쓰는 사이에 바뀌어도 덮지 않는다.
+/// 복제 상태(복제 Task·리더가 씀)와 복제본으로 한 HA 복구 기록(리더가 씀)은 작업자가 VM을 읽고 status를 쓰는 사이에
+/// 바뀌어도 덮지 않는다.
 #[tokio::test]
 async fn status_writes_keep_replication_written_meanwhile() {
     let env = Env::start().await;
@@ -435,8 +437,15 @@ async fn status_writes_keep_replication_written_meanwhile() {
         synced_at: Some(100),
         ..ReplicaStatus::pending(Uuid::now_v7())
     };
+    let recovery = ReplicaRecovery {
+        from: Uuid::now_v7(),
+        node: env.node,
+        synced_at: 100,
+        at: 200,
+    };
     let mut status = current.status.clone();
     status.replication = vec![replica.clone()];
+    status.last_recovery = Some(recovery);
     env.cluster
         .update_status_checked::<VmSpec>(vm.id, current.revision, &status)
         .await
@@ -444,6 +453,7 @@ async fn status_writes_keep_replication_written_meanwhile() {
 
     let got = env.wait(vm.id, "running", running).await;
     assert_eq!(got.status.replication, std::slice::from_ref(&replica));
+    assert_eq!(got.status.last_recovery, Some(recovery));
 
     // 끄면서 쓰는 status도 지킨다.
     env.hv.guest_shutdown(vm.id);
@@ -453,6 +463,7 @@ async fn status_writes_keep_replication_written_meanwhile() {
         })
         .await;
     assert_eq!(got.status.replication, [replica]);
+    assert_eq!(got.status.last_recovery, Some(recovery));
 }
 
 #[tokio::test]

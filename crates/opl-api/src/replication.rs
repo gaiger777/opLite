@@ -10,7 +10,7 @@ use std::time::Duration;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::node::{NODE_REPLICATION, Node, NodeSpec};
-use opl_types::replication::{ReplicaStatus, ReplicationState, parse_interval};
+use opl_types::replication::{ReplicaStatus, parse_interval};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use tokio::sync::oneshot;
@@ -130,17 +130,16 @@ pub(crate) async fn update_replica(
     }
 }
 
-/// 스펙에서 뺀 대상의 항목(HA 복구 뒤의 옛 원본 `stale` 말고)을 지운다. 읽은 revision을 확인한다.
+/// 스펙에서 뺀 대상이나 없는 노드의 항목(HA 복구 뒤의 옛 원본 `stale`도 — 승격을 기다리는 복제본 말고)을 지운다.
+/// 읽은 revision을 확인한다.
 async fn prune(cluster: &Cluster, vm: Uuid) -> Result<(), ClusterError> {
     loop {
         let Some(current) = cluster.get::<VmSpec>(vm)? else {
             return Ok(());
         };
+        let (_, nodes) = cluster.list::<NodeSpec>()?;
         let mut status = current.status.clone();
-        status.replication.retain(|r| {
-            r.state == ReplicationState::Stale
-                || current.spec.replication.iter().any(|t| t.node == r.node)
-        });
+        status.replication.retain(|r| kept(r, &current, &nodes));
         if status.replication == current.status.replication {
             return Ok(());
         }
@@ -153,6 +152,14 @@ async fn prune(cluster: &Cluster, vm: Uuid) -> Result<(), ClusterError> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// 남기는 항목: 스펙의 대상이고 그 노드가 아직 있는 항목(HA 복구 뒤의 옛 원본 `stale`은 뒤집힌 대상이다)과, HA 복구가
+/// 승격하라고 표시한 복제본(대상에서 이미 빠졌다 — 그 노드가 승격하며 지운다)
+fn kept(r: &ReplicaStatus, vm: &Vm, nodes: &[Node]) -> bool {
+    r.promote
+        || (vm.spec.replication.iter().any(|t| t.node == r.node)
+            && nodes.iter().any(|n| n.id == r.node))
 }
 
 #[derive(Debug, Clone)]
@@ -245,10 +252,7 @@ fn plan(now: u64, minute: u64, vms: &[Vm], nodes: &[Node], tasks: &[Task]) -> Pl
     let mut due = Vec::new();
     let node = |id: Uuid| nodes.iter().find(|n| n.id == id);
     for vm in vms {
-        let stale = vm.status.replication.iter().any(|r| {
-            r.state != ReplicationState::Stale
-                && !vm.spec.replication.iter().any(|t| t.node == r.node)
-        });
+        let stale = vm.status.replication.iter().any(|r| !kept(r, vm, nodes));
         if stale {
             out.prune.push(vm.id);
         }
@@ -380,7 +384,7 @@ fn running_per_node(tasks: &[Task]) -> BTreeMap<Uuid, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opl_types::replication::ReplicationTarget;
+    use opl_types::replication::{ReplicationState, ReplicationTarget};
     use opl_types::resource::Resource;
     use opl_types::task::{TaskState, TaskStatus};
     use opl_types::vm::MigrationStatus;
@@ -607,30 +611,35 @@ mod tests {
     }
 
     #[test]
-    fn entries_of_removed_targets_are_pruned_but_stale_ones_stay() {
+    fn entries_of_removed_targets_and_nodes_are_pruned_but_promoted_ones_stay() {
         let (a, b, c) = (node("a"), node("b"), node("c"));
         let nodes = [a.clone(), b.clone(), c.clone()];
         let mut web = vm("web", &a, &[&b]);
         web.status.replication = vec![entry(&b, None, None)];
-        assert!(
-            plan(0, MIN, std::slice::from_ref(&web), &nodes, &[])
-                .prune
-                .is_empty()
-        );
+        let prune =
+            |web: &Vm, nodes: &[Node]| plan(0, MIN, std::slice::from_ref(web), nodes, &[]).prune;
+        assert!(prune(&web, &nodes).is_empty());
+        // HA 복구 뒤의 옛 원본(`stale`)은 뒤집힌 대상이면 남고, 대상이 아니면 지운다.
         web.status.replication.push(ReplicaStatus {
             state: ReplicationState::Stale,
             ..ReplicaStatus::pending(c.id)
         });
-        assert!(
-            plan(0, MIN, std::slice::from_ref(&web), &nodes, &[])
-                .prune
-                .is_empty()
-        );
+        assert_eq!(prune(&web, &nodes), [web.id]);
+        web.spec.replication.push(ReplicationTarget {
+            node: c.id,
+            schedule: "*/15".into(),
+            pool: None,
+        });
+        assert!(prune(&web, &nodes).is_empty());
+        // 그 노드가 없어지면 지운다.
+        assert_eq!(prune(&web, &[a.clone(), b.clone()]), [web.id]);
+        web.spec.replication.pop();
+        // HA 복구가 승격하라고 표시한 복제본(대상에서 이미 빠짐)은 승격할 때까지 남긴다.
         web.status.replication[1].state = ReplicationState::Ready;
-        assert_eq!(
-            plan(0, MIN, std::slice::from_ref(&web), &nodes, &[]).prune,
-            [web.id]
-        );
+        web.status.replication[1].promote = true;
+        assert!(prune(&web, &nodes).is_empty());
+        web.status.replication[1].promote = false;
+        assert_eq!(prune(&web, &nodes), [web.id]);
         // 복제를 모두 뺀 VM도 지운다.
         web.spec.replication.clear();
         let p = plan(1 << 40, MIN, std::slice::from_ref(&web), &nodes, &[]);

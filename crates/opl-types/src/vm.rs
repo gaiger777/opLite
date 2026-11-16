@@ -7,7 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::replication::{
-    MAX_REPLICATION_TARGETS, ReplicaStatus, ReplicationTarget, parse_interval,
+    MAX_REPLICATION_TARGETS, ReplicaRecovery, ReplicaStatus, ReplicationTarget, parse_interval,
 };
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::runtime::{HotplugLayout, ImageFormat};
@@ -644,6 +644,11 @@ pub struct VmStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub replication: Vec<ReplicaStatus>,
+    /// HA가 이 VM을 복제본으로 다시 켠 마지막 복구(계획 55). 리더의 HA 복구가 쓰고 다음 복구가 덮는다. 옛 노드는 이
+    /// 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub last_recovery: Option<ReplicaRecovery>,
 }
 
 /// 도는 QEMU의 하드웨어. CPU 토폴로지·메모리·펌웨어·머신은 켤 때 값이고, 핫플러그로 바뀐 것은 `layout`에 있다.
@@ -1334,6 +1339,29 @@ mod tests {
         };
         let json = serde_json::to_value(&st).unwrap();
         assert_eq!(json["replication"][0]["state"], "pending");
+        assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
+    }
+
+    /// 복제본으로 한 HA 복구 기록은 없으면 쓰지 않고, 있으면 왕복한다.
+    #[test]
+    fn status_last_recovery_is_written_only_when_set() {
+        let json = serde_json::to_value(VmStatus::default()).unwrap();
+        assert!(json.get("last_recovery").is_none(), "{json}");
+        let (from, node) = (Uuid::now_v7(), Uuid::now_v7());
+        let st = VmStatus {
+            last_recovery: Some(crate::replication::ReplicaRecovery {
+                from,
+                node,
+                synced_at: 100,
+                at: 200,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(
+            json["last_recovery"],
+            serde_json::json!({ "from": from, "node": node, "synced_at": 100, "at": 200 })
+        );
         assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
     }
 

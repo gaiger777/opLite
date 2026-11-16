@@ -7,6 +7,7 @@ use opl_types::hotplug;
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
 use opl_types::node::{Node, NodeSpec, ShutdownAction, ha_capable};
 use opl_types::placement::{HaGroup, HaGroupSpec, PlacementRule, PlacementRuleSpec};
+use opl_types::replication::{ReplicaVolume, replica_ready};
 use opl_types::runtime::ImageFormat;
 use opl_types::settings::{HaReserve, SettingsSpec};
 use opl_types::storage::{
@@ -76,7 +77,8 @@ impl Inventory {
     }
 
     /// 이 VM의 디스크가 있는 풀을 모두 쓸 수 있는 노드인지. 공유가 아닌 풀의 볼륨은 그 파일이 있는
-    /// 노드(볼륨을 만든 노드)에서만 쓸 수 있다. `moves`의 볼륨(옮길 디스크)은 보지 않는다.
+    /// 노드(볼륨을 만든 노드)에서만 쓸 수 있다. 그 노드를 모르면 풀이 그 노드 하나에만 있을 때만 쓸 수 있다(파일이 어느
+    /// 노드에 있는지 모르는 볼륨을 다른 노드에서 켜지 않는다). `moves`의 볼륨(옮길 디스크)은 보지 않는다.
     fn reaches_disks(&self, spec: &VmSpec, node: &Node, moves: &[DiskMove]) -> bool {
         spec.disks.iter().all(|disk| {
             let Some(volume) = self.volumes.iter().find(|v| v.name == disk.volume) else {
@@ -88,8 +90,11 @@ impl Inventory {
             let Some(pool) = self.pools.iter().find(|p| p.name == volume.spec.pool) else {
                 return true;
             };
-            pool_usable_on(pool, node)
-                && (is_shared(pool) || volume.status.node.is_none_or(|n| n == node.id))
+            let here = match volume.status.node {
+                Some(n) => n == node.id,
+                None => pool.spec.nodes == [node.id],
+            };
+            pool_usable_on(pool, node) && (is_shared(pool) || here)
         })
     }
 
@@ -172,6 +177,52 @@ pub fn disk_moves(spec: &VmSpec, inv: &Inventory, pool: Option<&StoragePool>) ->
             })
         })
         .collect()
+}
+
+/// 노드 `node`에 VM의 쓸 수 있는 복제본([`replica_ready`])이 있으면 노드 로컬 풀 디스크마다 그 복제본으로 옮기는
+/// 이동(`existing`): 대상 풀은 그 복제 대상의 `pool`(없으면 같은 이름), 형식은 [`disk_moves`]의 규칙이다. 복제본의 크기
+/// 비교는 볼륨의 `spec.size_bytes`(회차가 적는 가상 크기와 같다)로 한다. `node`가 복제 대상이 아니거나, 대상 풀이 없거나,
+/// 쓸 수 있는 복제본이 없거나, 옮길 볼륨 가운데 어느 노드에 있는지 모르는 것(`status.node` 없음 — 승격이 거절한다)이
+/// 있으면 None이다.
+pub fn replica_moves(vm: &Vm, inv: &Inventory, node: Uuid) -> Option<Vec<DiskMove>> {
+    let target = vm.spec.replication.iter().find(|t| t.node == node)?;
+    let pool = match &target.pool {
+        Some(name) => Some(inv.pools.iter().find(|p| &p.name == name)?),
+        None => None,
+    };
+    let mut moves = disk_moves(&vm.spec, inv, pool);
+    let volumes: Vec<&Volume> = moves
+        .iter()
+        .filter_map(|m| inv.volumes.iter().find(|v| v.id == m.volume))
+        .collect();
+    if volumes.iter().any(|v| v.status.node.is_none()) {
+        return None;
+    }
+    let local: Vec<ReplicaVolume> = volumes
+        .iter()
+        .map(|v| ReplicaVolume {
+            id: v.id,
+            size_bytes: v.spec.size_bytes,
+        })
+        .collect();
+    replica_ready(vm, node, &local)?;
+    for m in &mut moves {
+        m.existing = true;
+    }
+    Some(moves)
+}
+
+/// [`node_fits`]와 같되 노드 로컬 풀 디스크가 있어 그 노드에서 쓸 수 없는 VM은 그 노드에 쓸 수 있는 복제본이 있으면
+/// 그 복제본의 풀로 본다([`replica_moves`]). HA 복구·되돌아가기·균형 조정기가 쓴다.
+pub fn replica_fits(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
+    let plain = node_fits(&vm.spec, inv, node);
+    if plain.is_ok() {
+        return plain;
+    }
+    match replica_moves(vm, inv, node.id) {
+        Some(moves) if !moves.is_empty() => node_fits_with(&vm.spec, inv, node, &moves),
+        _ => plain,
+    }
 }
 
 /// [`node_fits`]와 같되 `moves`의 디스크([`disk_moves`])는 볼륨이 있는 노드 대신 대상 풀을 이 노드에서
@@ -1088,6 +1139,30 @@ mod tests {
         assert_eq!(sched(&me, &unknown), Err(NoNode));
         unknown.pools[0] = pool("nas", true);
         assert_eq!(sched(&me, &unknown), Ok(big.id));
+    }
+
+    /// 노드 로컬 풀의 볼륨인데 어느 노드에 있는지 모르면(`status.node` 없음) 아무 노드에서나 켜지 않는다. 풀이 한
+    /// 노드에만 있으면 그 노드다.
+    #[test]
+    fn local_volumes_on_unknown_nodes_are_reached_only_where_the_pool_is() {
+        let (a, b) = (node(4096), node(4096));
+        let mut me = spec(512, None, PowerState::Running);
+        me.disks.push(DiskSpec {
+            volume: "root".into(),
+            bus: DiskBus::VirtioBlk,
+            boot_order: None,
+        });
+        let mut inv = Inventory {
+            nodes: vec![a.clone(), b.clone()],
+            volumes: vec![volume("root", "local", None)],
+            pools: vec![pool("local", false)],
+            ..Default::default()
+        };
+        assert!(node_fits(&me, &inv, &a).is_err());
+        assert!(node_fits(&me, &inv, &b).is_err());
+        inv.pools[0].spec.nodes = vec![b.id];
+        assert!(node_fits(&me, &inv, &a).is_err());
+        assert_eq!(node_fits(&me, &inv, &b), Ok(()));
     }
 
     #[test]

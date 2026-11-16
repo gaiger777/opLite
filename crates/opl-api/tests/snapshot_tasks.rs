@@ -47,6 +47,7 @@ async fn pool_and_root(env: &Env) {
     );
     env.cluster.create(&volume).await.unwrap();
     volume.status.phase = VolumePhase::Ready;
+    volume.status.node = Some(env.node);
     env.cluster
         .update_status::<VolumeSpec>(volume.id, &volume.status)
         .await
@@ -482,6 +483,7 @@ async fn ready_volume(env: &Env, name: &str) -> Uuid {
     );
     env.cluster.create(&volume).await.unwrap();
     volume.status.phase = VolumePhase::Ready;
+    volume.status.node = Some(env.node);
     env.cluster
         .update_status::<VolumeSpec>(volume.id, &volume.status)
         .await
@@ -981,6 +983,7 @@ async fn block_volumes(
             );
             env.cluster.create(&volume).await.unwrap();
             volume.status.phase = VolumePhase::Ready;
+            volume.status.node = Some(env.node);
             env.cluster
                 .update_status::<VolumeSpec>(volume.id, &volume.status)
                 .await

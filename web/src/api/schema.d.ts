@@ -3913,6 +3913,11 @@ export interface components {
                     hardware?: components["schemas"]["RunningHardware"];
                     /** @default null */
                     last_error: string | null;
+                    /**
+                     * @description HA가 이 VM을 복제본으로 다시 켠 마지막 복구(계획 55). 리더의 HA 복구가 쓰고 다음 복구가 덮는다. 옛 노드는 이
+                     *     필드를 무시한다.
+                     */
+                    last_recovery?: components["schemas"]["ReplicaRecovery"];
                     /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
                     migration?: components["schemas"]["MigrationStatus"];
                     /**
@@ -4930,6 +4935,29 @@ export interface components {
             /** Format: int64 */
             total: number;
         };
+        /** @description HA가 VM을 복제본으로 다시 켠 마지막 복구(VM `status.last_recovery`). 다음 복구가 덮고, 그 뒤 복제가 성공해도 남는다. */
+        ReplicaRecovery: {
+            /**
+             * Format: int64
+             * @description 복구한 때(유닉스 초)
+             */
+            at: number;
+            /**
+             * Format: uuid
+             * @description 죽은 원본 노드
+             */
+            from: string;
+            /**
+             * Format: uuid
+             * @description 복제본을 승격해 VM을 켠 노드
+             */
+            node: string;
+            /**
+             * Format: int64
+             * @description 그 복제본의 시점(유닉스 초). 그 뒤 원본에 쓴 것은 잃었다.
+             */
+            synced_at: number;
+        };
         /** @enum {string} */
         ReplicaState: "copying" | "ready" | "failed";
         /** @description VM `status.replication`의 대상 하나 */
@@ -5735,6 +5763,11 @@ export interface components {
                 hardware?: components["schemas"]["RunningHardware"];
                 /** @default null */
                 last_error: string | null;
+                /**
+                 * @description HA가 이 VM을 복제본으로 다시 켠 마지막 복구(계획 55). 리더의 HA 복구가 쓰고 다음 복구가 덮는다. 옛 노드는 이
+                 *     필드를 무시한다.
+                 */
+                last_recovery?: components["schemas"]["ReplicaRecovery"];
                 /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
                 migration?: components["schemas"]["MigrationStatus"];
                 /**
@@ -6784,6 +6817,11 @@ export interface components {
             hardware?: components["schemas"]["RunningHardware"];
             /** @default null */
             last_error: string | null;
+            /**
+             * @description HA가 이 VM을 복제본으로 다시 켠 마지막 복구(계획 55). 리더의 HA 복구가 쓰고 다음 복구가 덮는다. 옛 노드는 이
+             *     필드를 무시한다.
+             */
+            last_recovery?: components["schemas"]["ReplicaRecovery"];
             /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
             migration?: components["schemas"]["MigrationStatus"];
             /**

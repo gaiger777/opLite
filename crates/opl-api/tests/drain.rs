@@ -12,6 +12,7 @@ use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_driver::DirStorage;
 use opl_types::node::{FEATURES, Node, NodeSpec, NodeStatus, PoolState};
 use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind};
+use opl_types::replication::{ReplicaStatus, ReplicaVolume, ReplicationState, ReplicationTarget};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
@@ -376,6 +377,63 @@ async fn local_disk_vms_go_to_a_node_that_can_use_the_same_pool() {
             pool: None
         }]
     );
+}
+
+/// 로컬 디스크 VM은 점수까지 같으면 쓸 수 있는 복제본이 있는 노드로 옮긴다(마지막 복제 뒤 바뀐 것만 보낸다).
+#[tokio::test]
+async fn local_disk_vms_go_to_their_replica_node_first() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "db", "local", false).await;
+    let a = add_node(&env, "node2", |_| {}).await;
+    let b = add_node(&env, "node3", |_| {}).await;
+    // 복제본이 없으면 id가 작은 노드로 간다.
+    let replica = a.max(b);
+    let volume = env
+        .cluster
+        .get_by_name::<VolumeSpec>("db-root")
+        .unwrap()
+        .unwrap();
+    loop {
+        let vm = env.cluster.get_by_name::<VmSpec>("db").unwrap().unwrap();
+        let mut spec = vm.spec.clone();
+        spec.replication = vec![ReplicationTarget {
+            node: replica,
+            schedule: "*/15".into(),
+            pool: None,
+        }];
+        let Ok(revision) = env
+            .cluster
+            .update_spec(vm.id, Some(vm.revision), vm.labels.clone(), &spec)
+            .await
+        else {
+            continue;
+        };
+        let mut status = vm.status.clone();
+        status.replication = vec![ReplicaStatus {
+            state: ReplicationState::Ready,
+            generation: Some(Uuid::now_v7()),
+            synced_at: Some(100),
+            volumes: vec![ReplicaVolume {
+                id: volume.id,
+                size_bytes: volume.spec.size_bytes,
+            }],
+            ..ReplicaStatus::pending(replica)
+        }];
+        if env
+            .cluster
+            .update_status_checked::<VmSpec>(vm.id, revision, &status)
+            .await
+            .is_ok()
+        {
+            break;
+        }
+    }
+
+    let (status, task) = drain(&admin, "node1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
+    assert_eq!(migrations(&env), [("db".to_string(), replica)]);
 }
 
 /// 로컬 디스크 VM을 옮기지 못하는 이유: 같은 이름의 풀을 쓸 수 있는 노드가 없음, 디스크 복사를 모르는

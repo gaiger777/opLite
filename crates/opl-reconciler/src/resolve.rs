@@ -160,33 +160,46 @@ pub async fn apply_disk_moves(cluster: &Cluster, vm: &Vm) -> Result<(), ClusterE
         return Ok(());
     }
     for m in &migration.disks {
-        loop {
-            let Some(volume) = cluster.get::<VolumeSpec>(m.volume)? else {
-                break;
-            };
-            let written = if volume.spec.pool != m.pool || volume.spec.format != m.format {
-                let mut spec = volume.spec.clone();
-                spec.pool = m.pool.clone();
-                spec.format = m.format;
-                cluster
-                    .update_spec(volume.id, Some(volume.revision), volume.labels, &spec)
-                    .await
-            } else if volume.status.node != Some(migration.node) {
-                let mut status = volume.status.clone();
-                status.node = Some(migration.node);
-                cluster
-                    .update_status_checked::<VolumeSpec>(volume.id, volume.revision, &status)
-                    .await
-            } else {
-                break;
-            };
-            match written {
-                Ok(_) | Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
-                Err(e) => return Err(e),
-            }
-        }
+        move_volume(cluster, m.volume, &m.pool, m.format, migration.node).await?;
     }
     Ok(())
+}
+
+/// 볼륨 `id`의 기록을 노드 `node`의 풀 `pool`(형식 `format`)에 있는 것으로 고친다: 풀·형식이 다르면 spec을, 만든
+/// 노드(`status.node`)가 다르면 status를 쓴다(둘 다 revision 확인, 그 사이 바뀌었으면 다시 읽어). 이미 그렇거나 볼륨이
+/// 없으면 할 일이 없다(멱등). 마이그레이션 확정과 복제본 승격이 쓴다.
+pub async fn move_volume(
+    cluster: &Cluster,
+    id: Uuid,
+    pool: &str,
+    format: ImageFormat,
+    node: Uuid,
+) -> Result<(), ClusterError> {
+    loop {
+        let Some(volume) = cluster.get::<VolumeSpec>(id)? else {
+            return Ok(());
+        };
+        let written = if volume.spec.pool != pool || volume.spec.format != format {
+            let mut spec = volume.spec.clone();
+            spec.pool = pool.to_string();
+            spec.format = format;
+            cluster
+                .update_spec(volume.id, Some(volume.revision), volume.labels, &spec)
+                .await
+        } else if volume.status.node != Some(node) {
+            let mut status = volume.status.clone();
+            status.node = Some(node);
+            cluster
+                .update_status_checked::<VolumeSpec>(volume.id, volume.revision, &status)
+                .await
+        } else {
+            return Ok(());
+        };
+        match written {
+            Ok(_) | Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// 볼륨을 켜는 방식

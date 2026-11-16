@@ -20,6 +20,9 @@
 //!
 //! HA 상태 검사(설계 §8.2, [`crate::ha_health`]): 복구할 노드가 없는 틱에 노드가 리스 갱신에 실어 보낸 검사 결과로
 //! 경고·마이그레이션·다른 노드에서 다시 켜기·전원 끄기를 하고, 모든 대상 고르기에서 그 VM에 영향을 주는 검사가 실패한 노드를 뺀다.
+//!
+//! 로컬 디스크 복제(계획 55): 노드 로컬 풀 디스크가 있는 VM은 쓸 수 있는 복제본이 있는 노드로만 복구하고(시점이 새로운
+//! 쪽 먼저), 그 노드에 승격 표시를 하고 복제 방향을 뒤집는다. 대상 노드의 reconciler가 켜기 전에 복제본을 승격한다.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,6 +34,7 @@ use opl_cluster::types::{Command, LeaderRequest, NodeId, Rejection};
 use opl_cluster::{Cluster, ClusterError, Leases, Typed};
 use opl_types::fence::NodeFenceSpec;
 use opl_types::node::{FAST_HA, HA_CHECKS, Node, NodeSpec, ha_capable};
+use opl_types::replication::{ReplicaRecovery, ReplicaStatus, ReplicationState, ReplicationTarget};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::PlacementPolicy;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
@@ -46,7 +50,7 @@ use crate::auth::unix_now;
 use crate::ha_health::{self, CheckWatch, Health, Place};
 use crate::placement::{self, Assign, Candidate};
 use crate::power_fence::{PowerFence, PowerOff, power_off};
-use crate::scheduler::{Inventory, node_fits};
+use crate::scheduler::{Inventory, disk_moves, node_fits, replica_fits, replica_moves};
 use crate::score::{Loads, Scorer};
 use crate::state::AppState;
 use crate::vms::{RuleCheck, start_migration};
@@ -504,9 +508,10 @@ fn plan(
                     && !down.contains(&n.id)
                     && ready(now, b, leases, n)
             };
-            let target = match pick(vm, inv, &assign, eligible, &scorer) {
+            let replicas = !stays_stopped(vm);
+            let target = match pick(vm, inv, &assign, eligible, &scorer, replicas) {
                 Pick::Node(t) | Pick::Violating(t, _) => t,
-                Pick::NoNode | Pick::Blocked(_) => continue,
+                Pick::NoNode(_) | Pick::Blocked(_) => continue,
             };
             chosen.insert(vm.id, target);
             if !stays_stopped(vm) {
@@ -1155,6 +1160,14 @@ async fn recover_vm(
             && !health.blocks(vm, n, inv)
     };
     let starts = !stays_stopped(vm);
+    // 꺼진 채 두는 VM은 복제본으로 옮기지 않는다([`recovery_pick`]).
+    let fits = |n: &Node| {
+        if starts {
+            replica_fits(vm, inv, n).is_ok()
+        } else {
+            node_fits(&vm.spec, inv, n).is_ok()
+        }
+    };
     let limit = queue.limit;
     let full = |starting: &Starting, t: Uuid| starts && starting.full(t, limit);
     // 미리 고른 대상이 지금도 조건·hard 규칙에 맞고 상한에 걸리지 않으면 그대로 쓴다.
@@ -1162,7 +1175,7 @@ async fn recover_vm(
         .plan
         .and_then(|p| p.get(&vm.id))
         .and_then(|t| inv.nodes.iter().find(|n| n.id == *t))
-        .filter(|n| eligible(n) && node_fits(&vm.spec, inv, n).is_ok())
+        .filter(|n| eligible(n) && fits(n))
         .filter(|n| placement::hard_violations(vm, n, inv, assign).is_empty())
         .filter(|n| !full(queue.starting, n.id))
         .map(|n| n.id);
@@ -1173,7 +1186,7 @@ async fn recover_vm(
         }
         None => {
             queue.repicked += 1;
-            pick(vm, inv, assign, eligible, scorer)
+            recovery_pick(vm, inv, assign, eligible, scorer, failed)
         }
     };
     let Some(target) = placed(ctx, vm, choice).await? else {
@@ -1197,19 +1210,66 @@ async fn recover_vm(
             ..ha
         })
         .filter(|ha| *ha != VmHaStatus::default());
+    // 노드 로컬 풀 디스크를 대상의 복제본으로 켜면 그 시점을 알리고, 대상 노드가 복제본을 승격하게 표시하며 복제
+    // 방향을 뒤집는다(옛 원본은 전체 복사가 필요한 `stale` 대상이 된다).
+    let promoted = promotion(vm, inv, target);
+    let mut replication = vm.status.replication.clone();
+    // 복제본으로 켜면 그 복구를 남긴다(다음 복구가 덮는다 — 복제가 다시 돌아도 남는다).
+    let last_recovery = match promoted {
+        Some(replica) => Some(ReplicaRecovery {
+            from: failed.id,
+            node: target,
+            synced_at: replica.synced_at.unwrap_or_default(),
+            at: crate::backups::now(),
+        }),
+        None => vm.status.last_recovery,
+    };
+    let last_error = match promoted {
+        Some(replica) => {
+            let name = inv
+                .nodes
+                .iter()
+                .find(|n| n.id == target)
+                .map_or_else(|| target.to_string(), |n| n.name.clone());
+            reverse_replicas(&mut replication, failed.id, target);
+            format!(
+                "recovering: node {} failed; restarting from the replica on node {name} taken at {} (writes after that are lost)",
+                failed.name,
+                utc(replica.synced_at.unwrap_or_default())
+            )
+        }
+        None => {
+            // 복제본 없이 복제 대상 노드에서 켜면 그 노드는 이제 VM의 노드라 대상이 아니다: 그 항목과 (끝나지 못한 앞
+            // 복구의) 승격 표시를 지운다(스펙에서도 뺀다 — 아래).
+            if vm.spec.replication.iter().any(|t| t.node == target) {
+                replication.retain(|r| r.node != target);
+                for r in &mut replication {
+                    r.promote = false;
+                }
+            }
+            format!("recovering: node {} failed", failed.name)
+        }
+    };
     let status = VmStatus {
         phase: VmPhase::Stopped,
         node: None,
         pid: None,
         migration: None,
-        last_error: Some(format!("recovering: node {} failed", failed.name)),
+        last_error: Some(last_error),
         ha,
+        replication,
+        last_recovery,
         ..vm.status.clone()
     };
     let command = status_command::<VmSpec>(vm.id, vm.revision, &status)?;
     let revision = fence.write(ctx, command, None).await?;
     let mut spec = vm.spec.clone();
     spec.node = Some(target);
+    if promoted.is_some() {
+        reverse_targets(&mut spec, vm, inv, failed.id, target);
+    } else {
+        spec.replication.retain(|t| t.node != target);
+    }
     if stays_stopped(vm) {
         spec.power = PowerState::Stopped;
     }
@@ -1284,14 +1344,15 @@ async fn placed(ctx: Ctx<'_>, vm: &Vm, pick: Pick) -> Result<Option<Uuid>, Clust
             tracing::warn!(vm = %vm.name, rules = ?rules, "HA recovery breaks placement rules that allow it (ha_may_violate)");
             Ok(Some(target))
         }
-        Pick::NoNode => {
-            if vm.status.last_error.as_deref() != Some(NO_NODE) {
+        Pick::NoNode(detail) => {
+            let error = detail.unwrap_or_else(|| NO_NODE.into());
+            if vm.status.last_error.as_ref() != Some(&error) {
                 let status = VmStatus {
-                    last_error: Some(NO_NODE.into()),
+                    last_error: Some(error.clone()),
                     ..vm.status.clone()
                 };
                 update_status_checked::<VmSpec>(ctx, vm.id, vm.revision, &status).await?;
-                tracing::warn!(vm = %vm.name, "HA cannot find a node for the VM");
+                tracing::warn!(vm = %vm.name, error = %error, "HA cannot find a node for the VM");
             }
             Ok(None)
         }
@@ -1422,7 +1483,9 @@ async fn relocate_vm(
             && alive(now, b, leases, n)
             && !health.blocks(vm, n, inv)
     };
-    let Some(target) = placed(ctx, vm, pick(vm, inv, assign, eligible, scorer)).await? else {
+    // 노드가 살아 있으므로 복제본(옛 시점)이 아니라 그 노드의 디스크로만 다시 켤 수 있다.
+    let choice = pick(vm, inv, assign, eligible, scorer, false);
+    let Some(target) = placed(ctx, vm, choice).await? else {
         return Ok(false);
     };
     if !prepared {
@@ -1463,37 +1526,58 @@ pub(crate) enum Pick {
     /// hard 규칙에 맞는 노드는 없지만, 막는 규칙이 모두 `ha_may_violate`라 어기고 놓을 노드(위반이 가장
     /// 적은 노드)와 그 규칙
     Violating(Uuid, Vec<String>),
-    /// 노드 조건부터 맞는 노드가 없다.
-    NoNode,
+    /// 노드 조건부터 맞는 노드가 없다. 노드 로컬 풀 디스크에 쓸 수 있는 복제본이 없어서이면 그 문구다.
+    NoNode(Option<String>),
     /// 노드 조건에 맞는 노드를 모두 막는 hard 규칙(이름 순)
     Blocked(Vec<String>),
 }
 
-/// 복구할 노드를 고른다: `eligible`이고 노드 조건에 맞는 노드 가운데 [`placement::candidates_with`] 순서(부하
-/// 점수 포함)로 가장 나은 것.
+/// 복구할 노드를 고른다: `eligible`이고 노드 조건에 맞는 노드 가운데 hard 규칙을 어기지 않는 노드를 [`placement::compare`]
+/// 순서(부하 점수 포함)로 견줘 가장 나은 것. `replicas`면 노드 로컬 풀 디스크가 있는 VM은 쓸 수 있는 복제본이 있는
+/// 노드도 받고([`replica_fits`]) 복제본의 시점이 새로운 노드가 먼저다(잃는 데이터가 적은 쪽, [`data_point`]). 아니면
+/// (살아 있는 노드에서 옮기는 다시 켜기) 디스크가 있는 노드만 본다.
 pub(crate) fn pick(
     vm: &Vm,
     inv: &Inventory,
     assign: &Assign,
     eligible: impl Fn(&Node) -> bool,
     scorer: &Scorer,
+    replicas: bool,
 ) -> Pick {
+    let fits_on = |n: &Node| {
+        if replicas {
+            replica_fits(vm, inv, n).is_ok()
+        } else {
+            node_fits(&vm.spec, inv, n).is_ok()
+        }
+    };
     let fits: Vec<&Node> = inv
         .nodes
         .iter()
-        .filter(|n| eligible(n) && node_fits(&vm.spec, inv, n).is_ok())
+        .filter(|n| eligible(n) && fits_on(n))
         .collect();
     if fits.is_empty() {
-        return Pick::NoNode;
+        return Pick::NoNode(if replicas {
+            no_replica(vm, inv, &eligible)
+        } else {
+            None
+        });
     }
     let ids: BTreeSet<Uuid> = fits.iter().map(|n| n.id).collect();
-    let mut found: Vec<Candidate> = placement::candidates_with(vm, inv, assign, scorer)
-        .into_iter()
-        .filter(|c| ids.contains(&c.node))
+    let mut found: Vec<Candidate> = fits
+        .iter()
+        .filter(|n| placement::hard_violations(vm, n, inv, assign).is_empty())
+        .map(|n| placement::score_with(vm, n, inv, assign, scorer))
         .collect();
     // 고를 수 있는 노드 가운데 요약이 있는 노드가 없으면 점수를 쓰지 않는다(다른 노드의 요약만 있을 때).
     placement::level_scores(&mut found, scorer);
-    if let Some(c) = placement::best(&found) {
+    let point = |node: Uuid| data_point(vm, inv, node);
+    let best = found.iter().copied().min_by(|a, b| {
+        point(b.node)
+            .cmp(&point(a.node))
+            .then(placement::compare(a, b))
+    });
+    if let Some(c) = best {
         return Pick::Node(c.node);
     }
     let may_violate = |name: &String| {
@@ -1512,9 +1596,9 @@ pub(crate) fn pick(
                 c.score = 0;
             }
             let better = fallback.as_ref().is_none_or(|(rules, best)| {
-                broken
-                    .len()
-                    .cmp(&rules.len())
+                point(best.node)
+                    .cmp(&point(c.node))
+                    .then(broken.len().cmp(&rules.len()))
                     .then(placement::compare(&c, best))
                     == Ordering::Less
             });
@@ -1528,6 +1612,128 @@ pub(crate) fn pick(
         Some((rules, c)) => Pick::Violating(c.node, rules),
         None => Pick::Blocked(blocking.into_iter().collect()),
     }
+}
+
+/// 죽은 노드 `failed`의 VM을 복구할 노드를 고른다([`pick`]). 꺼진 채 두는 VM은 복제본을 쓰지 않고(꺼진 동안 복제가
+/// 멈춰 낡았을 수 있고, 거기로 옮기면 옛 원본이 돌아온 뒤 그 좋은 디스크가 낡은 복제본으로 덮인다) 노드 로컬 풀 디스크
+/// 때문에 놓을 곳이 없으면 그 이유를 알린다(그 노드가 돌아오기를 기다린다).
+fn recovery_pick(
+    vm: &Vm,
+    inv: &Inventory,
+    assign: &Assign,
+    eligible: impl Fn(&Node) -> bool,
+    scorer: &Scorer,
+    failed: &Node,
+) -> Pick {
+    let replicas = !stays_stopped(vm);
+    match pick(vm, inv, assign, eligible, scorer, replicas) {
+        Pick::NoNode(None) if !replicas && !disk_moves(&vm.spec, inv, None).is_empty() => {
+            Pick::NoNode(Some(format!(
+                "{NO_NODE}: VM is stopped; its newest data is on node {:?}",
+                failed.name
+            )))
+        }
+        other => other,
+    }
+}
+
+/// VM을 노드 `node`에서 켜려면 복제본이 있어야 한다: 노드 로컬 풀 디스크가 있고 그 가운데 다른 노드에 있는 것이 있다.
+fn needs_replica(vm: &Vm, inv: &Inventory, node: Uuid) -> bool {
+    disk_moves(&vm.spec, inv, None).iter().any(|m| {
+        inv.volumes
+            .iter()
+            .find(|v| v.id == m.volume)
+            .is_some_and(|v| v.status.node.is_some_and(|n| n != node))
+    })
+}
+
+/// VM을 노드 `node`에서 켤 때의 디스크 시점(클수록 새롭다): 복제본이 필요 없으면 가장 크고, 쓸 수 있는 복제본이면 그
+/// 회차의 시점, 없으면 0이다. [`pick`]이 잃는 데이터가 적은 노드를 먼저 고른다.
+fn data_point(vm: &Vm, inv: &Inventory, node: Uuid) -> u64 {
+    if !needs_replica(vm, inv, node) {
+        return u64::MAX;
+    }
+    promotion(vm, inv, node)
+        .and_then(|r| r.synced_at)
+        .unwrap_or_default()
+}
+
+/// VM을 노드 `node`에서 켜려면 승격할 복제본: 복제본이 필요하고([`needs_replica`]) 그 노드에 쓸 수 있는 복제본이 있다.
+fn promotion<'a>(vm: &'a Vm, inv: &Inventory, node: Uuid) -> Option<&'a ReplicaStatus> {
+    if !needs_replica(vm, inv, node) {
+        return None;
+    }
+    replica_moves(vm, inv, node)?;
+    vm.status.replication.iter().find(|r| r.node == node)
+}
+
+/// 노드 로컬 풀 디스크가 있는 VM에 `eligible` 노드 가운데 쓸 수 있는 복제본을 가진 노드가 없으면 그 이유(첫 로컬 디스크)
+fn no_replica(vm: &Vm, inv: &Inventory, eligible: &impl Fn(&Node) -> bool) -> Option<String> {
+    let first = disk_moves(&vm.spec, inv, None).into_iter().next()?;
+    if inv
+        .nodes
+        .iter()
+        .any(|n| eligible(n) && replica_moves(vm, inv, n.id).is_some())
+    {
+        return None;
+    }
+    let volume = inv.volumes.iter().find(|v| v.id == first.volume)?;
+    Some(format!(
+        "{NO_NODE}: disk {:?} is on node-local pool {:?} and has no ready replica on a live node",
+        volume.name, volume.spec.pool
+    ))
+}
+
+/// 복제본으로 복구할 때의 `status.replication`: 대상 `target`의 항목에만 승격 표시를 하고(대상 노드가 승격하며 지운다 —
+/// 앞서 끝나지 못한 복구의 다른 표시는 지운다), 옛 원본 `failed`의 항목을 전체 복사가 필요한 `stale`로 새로 둔다. 다른
+/// 대상의 항목은 그대로다.
+fn reverse_replicas(replication: &mut Vec<ReplicaStatus>, failed: Uuid, target: Uuid) {
+    replication.retain(|r| r.node != failed);
+    for r in replication.iter_mut() {
+        r.promote = r.node == target;
+    }
+    replication.push(ReplicaStatus {
+        state: ReplicationState::Stale,
+        ..ReplicaStatus::pending(failed)
+    });
+}
+
+/// 복제본으로 복구할 때의 `spec.replication`: 대상 `target`을 옛 원본 `failed`로 바꾼다(복제 방향을 뒤집는다, 일정은
+/// 그대로). 옛 원본의 풀은 디스크마다 승격 뒤 풀과 같은 이름이면 비우고, 아니면 첫 로컬 디스크의 옛 풀이다(대상
+/// 하나에는 풀을 하나만 둘 수 있다).
+fn reverse_targets(spec: &mut VmSpec, vm: &Vm, inv: &Inventory, failed: Uuid, target: Uuid) {
+    let moves = replica_moves(vm, inv, target).unwrap_or_default();
+    let old: Vec<&str> = moves
+        .iter()
+        .filter_map(|m| inv.volumes.iter().find(|v| v.id == m.volume))
+        .map(|v| v.spec.pool.as_str())
+        .collect();
+    let same = moves.iter().zip(&old).all(|(m, pool)| m.pool == *pool);
+    let pool = (!same)
+        .then(|| old.first().map(|p| p.to_string()))
+        .flatten();
+    for t in spec.replication.iter_mut().filter(|t| t.node == target) {
+        *t = ReplicationTarget {
+            node: failed,
+            schedule: t.schedule.clone(),
+            pool: pool.clone(),
+        };
+    }
+}
+
+/// 유닉스 초를 `2026-10-27 05:07:00 UTC` 모양으로
+fn utc(secs: u64) -> String {
+    let t = time::OffsetDateTime::from_unix_timestamp(secs as i64)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
 }
 
 /// 자리 잡은 VM(꺼지지 않았고 노드가 있음)이 지금 노드에서 어기는 hard·soft 규칙의 이름(이름 순)
@@ -1592,8 +1798,8 @@ impl Failback {
     }
 
     /// 이 VM이 되돌아갈 노드: 그룹이 있고 `nofailback`이 아니면, 지금 노드보다 그룹 우선순위가 높고
-    /// `after` 넘게 살아 있으며 노드 조건과 hard 규칙에 맞고 이 VM에 영향을 주는 HA 검사가 실패하지 않는 노드
-    /// 가운데 가장 나은 것.
+    /// `after` 넘게 살아 있으며 노드 조건(노드 로컬 풀 디스크가 있는 VM은 쓸 수 있는 복제본이 있는 노드만 —
+    /// [`replica_fits`])과 hard 규칙에 맞고 이 VM에 영향을 주는 HA 검사가 실패하지 않는 노드 가운데 가장 나은 것.
     fn target(
         &self,
         vm: &Vm,
@@ -1620,7 +1826,7 @@ impl Failback {
                     .get(&n.id)
                     .is_some_and(|since| now.saturating_duration_since(*since) >= after)
             })
-            .filter(|n| node_fits(&vm.spec, inv, n).is_ok())
+            .filter(|n| replica_fits(vm, inv, n).is_ok())
             .filter(|n| placement::hard_violations(vm, n, inv, &assign).is_empty())
             .filter(|n| !health.blocks(vm, n, inv))
             .map(|n| placement::score_with(vm, n, inv, &assign, scorer))
@@ -2258,6 +2464,272 @@ mod tests {
         leases.term = 4;
         attempts.forget_revived(&leases);
         assert!(attempts.0.is_empty());
+    }
+
+    /// HA 가능하고 온라인인 노드
+    fn ha_node(name: &str) -> Node {
+        use opl_types::node::{Fencing, NodeHa, NodeStatus};
+        let mut n: Node = Resource::new(
+            name,
+            NodeSpec {
+                address: "a".into(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        n.status = NodeStatus {
+            online: true,
+            cpus: 4,
+            memory_mib: 8192,
+            arch: Some(opl_types::vm::Arch::Aarch64),
+            ha: Some(NodeHa {
+                fencing: Fencing::Process,
+                recover_after_secs: 7,
+                fence_after_secs: Some(10),
+            }),
+            ..Default::default()
+        };
+        n
+    }
+
+    /// 노드 `failed`의 로컬 풀 `local`에 디스크 `root`를 둔 HA VM `web`(복제 대상 `targets`)과 그 클러스터 상태
+    fn replicated(failed: &Node, targets: &[&Node]) -> Inventory {
+        use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumeSpec};
+        use opl_types::vm::{DiskBus, DiskSpec};
+        let pool = Resource::new(
+            "local",
+            StoragePoolSpec {
+                backend: PoolBackend::Dir {
+                    path: "/srv/local".into(),
+                },
+                nodes: vec![],
+                shared: false,
+                backups: false,
+            },
+        );
+        let mut root: opl_types::storage::Volume = Resource::new(
+            "root",
+            VolumeSpec {
+                pool: "local".into(),
+                size_bytes: 1 << 30,
+                format: opl_types::runtime::ImageFormat::Qcow2,
+            },
+        );
+        root.status.node = Some(failed.id);
+        let mut web = vm("web", Some(50), failed.id);
+        web.spec.disks.push(DiskSpec {
+            volume: "root".into(),
+            bus: DiskBus::VirtioBlk,
+            boot_order: None,
+        });
+        web.spec.replication = targets
+            .iter()
+            .map(|t| ReplicationTarget {
+                node: t.id,
+                schedule: "*/5".into(),
+                pool: None,
+            })
+            .collect();
+        let mut inv = inventory(vec![web]);
+        inv.nodes.push(failed.clone());
+        inv.nodes.extend(targets.iter().map(|t| (*t).clone()));
+        inv.pools.push(pool);
+        inv.volumes.push(root);
+        inv
+    }
+
+    /// 노드 `node`의 쓸 수 있는 복제본(시점 `synced_at`, 디스크 `root`)
+    fn ready_replica(inv: &Inventory, node: &Node, synced_at: u64) -> ReplicaStatus {
+        let root = &inv.volumes[0];
+        ReplicaStatus {
+            state: ReplicationState::Ready,
+            generation: Some(Uuid::now_v7()),
+            synced_at: Some(synced_at),
+            volumes: vec![opl_types::replication::ReplicaVolume {
+                id: root.id,
+                size_bytes: root.spec.size_bytes,
+            }],
+            ..ReplicaStatus::pending(node.id)
+        }
+    }
+
+    /// 노드 로컬 풀 디스크가 있는 VM은 쓸 수 있는 복제본이 있는 노드로만 옮기고, 둘이면 시점이 새로운 쪽이다. 복사
+    /// 중·옛 원본·디스크가 더해진 복제본은 쓰지 않고 그러면 자세한 이유를 남긴다.
+    #[test]
+    fn a_vm_with_local_disks_is_recovered_only_from_a_ready_replica_newest_first() {
+        let (failed, t1, t2, other) = (
+            ha_node("failed"),
+            ha_node("t1"),
+            ha_node("t2"),
+            ha_node("other"),
+        );
+        let mut inv = replicated(&failed, &[&t1, &t2]);
+        inv.nodes.push(other.clone());
+        let eligible = |n: &Node| n.id != failed.id;
+        let scorer = Scorer::default();
+        let pick_web = |inv: &Inventory| {
+            pick(
+                &inv.vms[0],
+                inv,
+                &Assign::default(),
+                eligible,
+                &scorer,
+                true,
+            )
+        };
+        let no_replica = Pick::NoNode(Some(
+            "HA cannot find a node for this VM: disk \"root\" is on node-local pool \"local\" and has no ready replica on a live node".into(),
+        ));
+        // 끝난 회차가 없다.
+        assert_eq!(pick_web(&inv), no_replica);
+        // 살아 있는 노드에서 옮기는 다시 켜기는 복제본을 보지 않는다.
+        assert_eq!(
+            pick(
+                &inv.vms[0],
+                &inv,
+                &Assign::default(),
+                eligible,
+                &scorer,
+                false
+            ),
+            Pick::NoNode(None)
+        );
+        let (r1, r2) = (ready_replica(&inv, &t1, 100), ready_replica(&inv, &t2, 200));
+        inv.vms[0].status.replication = vec![r1.clone(), r2.clone()];
+        assert_eq!(pick_web(&inv), Pick::Node(t2.id));
+        assert!(replica_fits(&inv.vms[0], &inv, &t1).is_ok());
+        assert!(replica_fits(&inv.vms[0], &inv, &other).is_err());
+        // 복사 중이면 다른 쪽, 옛 원본도 쓰지 않는다.
+        inv.vms[0].status.replication[1].state = ReplicationState::Syncing;
+        assert_eq!(pick_web(&inv), Pick::Node(t1.id));
+        inv.vms[0].status.replication[0].state = ReplicationState::Stale;
+        assert_eq!(pick_web(&inv), no_replica);
+        // 디스크 크기가 바뀌었거나 디스크가 더해졌으면 그 회차에 없다.
+        inv.vms[0].status.replication = vec![r1, r2];
+        inv.volumes[0].spec.size_bytes *= 2;
+        assert_eq!(pick_web(&inv), no_replica);
+        inv.volumes[0].spec.size_bytes /= 2;
+        assert_eq!(pick_web(&inv), Pick::Node(t2.id));
+        // 시점이 같으면 지금의 배치 순서다(메모리가 많은 쪽).
+        inv.vms[0].status.replication[1].synced_at = Some(100);
+        inv.nodes[1].status.memory_mib = 16384;
+        assert_eq!(pick_web(&inv), Pick::Node(t1.id));
+        // 꺼진 채 두는 VM은 복제본으로 옮기지 않는다(죽은 노드를 기다린다).
+        let recover = |inv: &Inventory| {
+            recovery_pick(
+                &inv.vms[0],
+                inv,
+                &Assign::default(),
+                eligible,
+                &scorer,
+                &failed,
+            )
+        };
+        assert_eq!(recover(&inv), Pick::Node(t1.id));
+        inv.vms[0].spec.ha.as_mut().unwrap().state = HaState::Stopped;
+        assert_eq!(
+            recover(&inv),
+            Pick::NoNode(Some(
+                "HA cannot find a node for this VM: VM is stopped; its newest data is on node \"failed\""
+                    .into()
+            ))
+        );
+    }
+
+    /// 노드 로컬 풀 디스크의 볼륨이 어느 노드에 있는지 모르면(`status.node` 없음) 복제본이 있어도 그리로 옮기지 않는다
+    /// (승격 없이 복제본 파일로 켜지 않게 — 승격도 거절한다). 복제본이 없을 때와 같은 이유를 남긴다.
+    #[test]
+    fn a_volume_on_an_unknown_node_is_not_recovered_from_a_replica() {
+        let (failed, t) = (ha_node("failed"), ha_node("t"));
+        let mut inv = replicated(&failed, &[&t]);
+        inv.vms[0].status.replication = vec![ready_replica(&inv, &t, 100)];
+        let eligible = |n: &Node| n.id != failed.id;
+        let scorer = Scorer::default();
+        let pick_web = |inv: &Inventory| {
+            pick(
+                &inv.vms[0],
+                inv,
+                &Assign::default(),
+                eligible,
+                &scorer,
+                true,
+            )
+        };
+        assert_eq!(pick_web(&inv), Pick::Node(t.id));
+        inv.volumes[0].status.node = None;
+        assert_eq!(
+            pick_web(&inv),
+            Pick::NoNode(Some(
+                "HA cannot find a node for this VM: disk \"root\" is on node-local pool \"local\" and has no ready replica on a live node".into(),
+            ))
+        );
+        assert_eq!(promotion(&inv.vms[0], &inv, t.id), None);
+    }
+
+    /// 복제본으로 복구하면 대상의 항목에 승격 표시를 하고 옛 원본은 `stale` 대상이 되며, 스펙의 대상도 옛 원본으로
+    /// 뒤집힌다(다른 대상은 그대로). 대상 풀이 옛 풀과 다르면 옛 풀을 적는다.
+    #[test]
+    fn recovering_from_a_replica_reverses_the_replication() {
+        use opl_types::storage::{PoolBackend, StoragePoolSpec};
+        let (failed, t, u) = (ha_node("failed"), ha_node("t"), ha_node("u"));
+        let mut inv = replicated(&failed, &[&t, &u]);
+        let (rt, ru) = (ready_replica(&inv, &t, 100), ready_replica(&inv, &u, 50));
+        inv.vms[0].status.replication = vec![
+            ReplicaStatus {
+                error: Some("node \"failed\" is offline".into()),
+                ..ReplicaStatus::pending(failed.id)
+            },
+            rt.clone(),
+            // 앞서 끝나지 못한 복구의 승격 표시는 지운다.
+            ReplicaStatus {
+                promote: true,
+                ..ru.clone()
+            },
+        ];
+        let vm = inv.vms[0].clone();
+        let promoted = promotion(&vm, &inv, t.id).unwrap();
+        assert_eq!(promoted.synced_at, Some(100));
+        assert!(promotion(&vm, &inv, failed.id).is_none());
+        let mut replication = vm.status.replication.clone();
+        reverse_replicas(&mut replication, failed.id, t.id);
+        assert_eq!(
+            replication,
+            [
+                ReplicaStatus {
+                    promote: true,
+                    ..rt.clone()
+                },
+                ru.clone(),
+                ReplicaStatus {
+                    state: ReplicationState::Stale,
+                    ..ReplicaStatus::pending(failed.id)
+                },
+            ]
+        );
+        let mut spec = vm.spec.clone();
+        reverse_targets(&mut spec, &vm, &inv, failed.id, t.id);
+        assert_eq!(spec.replication[0].node, failed.id);
+        assert_eq!(spec.replication[0].schedule, "*/5");
+        assert_eq!(spec.replication[0].pool, None);
+        assert_eq!(spec.replication[1], vm.spec.replication[1]);
+        // T 쪽 풀이 `b`면 옛 원본의 풀 `local`을 적는다.
+        let mut b = inv.pools[0].clone();
+        b.id = Uuid::now_v7();
+        b.name = "b".into();
+        b.spec = StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: "/srv/b".into(),
+            },
+            ..b.spec
+        };
+        inv.pools.push(b);
+        inv.vms[0].spec.replication[0].pool = Some("b".into());
+        let vm = inv.vms[0].clone();
+        let mut spec = vm.spec.clone();
+        reverse_targets(&mut spec, &vm, &inv, failed.id, t.id);
+        assert_eq!(spec.replication[0].pool.as_deref(), Some("local"));
+        assert_eq!(utc(1_793_077_620), "2026-10-27 05:07:00 UTC");
     }
 
     #[test]

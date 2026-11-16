@@ -40,6 +40,7 @@ use opl_types::placement::{
     HaGroupNode, HaGroupSpec, HaGroupStatus, LoadSummary, PlacementRuleSpec, PlacementRuleStatus,
     PlacementStatus, RuleKind, VmLoad,
 };
+use opl_types::replication::{ReplicaStatus, ReplicaVolume, ReplicationState, ReplicationTarget};
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
 use opl_types::settings::{SETTINGS_NAME, Settings, SettingsSpec};
@@ -372,6 +373,213 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
     }
 
     // 펜싱 표시가 지워져 죽은 노드가 다시 리스를 받을 수 있다.
+    renew(&env.cluster, failed).await.unwrap();
+    manager.shutdown().await;
+}
+
+/// 노드 로컬 풀 `local`의 볼륨 `disk-<vm>`(그 파일은 노드 `on`에 있다)을 디스크로 쓰는 HA VM `name`을 노드 `on`에 둔다.
+/// 복제 대상 `targets`(노드, 시점 — 시점이 있으면 쓸 수 있는 복제본)를 준다.
+async fn replicated_vm(env: &Env, name: &str, on: Uuid, targets: &[(Uuid, Option<u64>)]) -> Vm {
+    if env
+        .cluster
+        .get_by_name::<StoragePoolSpec>("local")
+        .unwrap()
+        .is_none()
+    {
+        let pool = Resource::new(
+            "local",
+            StoragePoolSpec {
+                backend: PoolBackend::Dir {
+                    path: "/srv/local".into(),
+                },
+                nodes: vec![],
+                shared: false,
+                backups: false,
+            },
+        );
+        env.cluster.create(&pool).await.unwrap();
+    }
+    let mut volume: opl_types::storage::Volume = Resource::new(
+        format!("disk-{name}"),
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 30,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    volume.status.node = Some(on);
+    env.cluster.create(&volume).await.unwrap();
+    let mut spec: VmSpec = serde_json::from_value(vm_request(name)["spec"].clone()).unwrap();
+    spec.memory_mib = 2048;
+    spec.nics.clear();
+    spec.node = Some(on);
+    spec.ha = Some(VmHa::default());
+    spec.power = PowerState::Running;
+    spec.disks =
+        serde_json::from_value(json!([{ "volume": volume.name, "bus": "virtio-blk" }])).unwrap();
+    spec.replication = targets
+        .iter()
+        .map(|(node, _)| ReplicationTarget {
+            node: *node,
+            schedule: "*/5".into(),
+            pool: None,
+        })
+        .collect();
+    let mut vm: Vm = Resource::new(name, spec);
+    vm.status = VmStatus {
+        phase: VmPhase::Running,
+        node: Some(on),
+        pid: Some(4242),
+        replication: targets
+            .iter()
+            .map(|(node, synced_at)| match synced_at {
+                Some(at) => ReplicaStatus {
+                    state: ReplicationState::Ready,
+                    generation: Some(Uuid::now_v7()),
+                    synced_at: Some(*at),
+                    volumes: vec![ReplicaVolume {
+                        id: volume.id,
+                        size_bytes: volume.spec.size_bytes,
+                    }],
+                    ..ReplicaStatus::pending(*node)
+                },
+                None => ReplicaStatus::pending(*node),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    vm.revision = env.cluster.create(&vm).await.unwrap();
+    vm
+}
+
+/// 노드 로컬 풀 디스크가 있는 HA VM은 쓸 수 있는 복제본이 있는 노드 가운데 시점이 새로운 쪽에서 다시 켠다: 그 시점을
+/// `last_error`에 알리고, 그 대상에 승격 표시를 하고, 옛 원본을 `stale` 대상으로 두며 스펙의 복제 방향을 뒤집는다.
+/// 복제본이 없는 VM은 메모리가 많은 노드가 있어도 옮기지 않고 그 이유를 남긴다.
+#[tokio::test]
+async fn a_vm_with_local_disks_restarts_from_its_newest_replica() {
+    let env = Env::start().await;
+    let failed = node(&env, "node-a", 8192, Some(1)).await;
+    let older = node(&env, "node-b", 8192, Some(60)).await;
+    let newer = node(&env, "node-c", 8192, Some(60)).await;
+    node(&env, "big", 64000, Some(60)).await;
+    // 2026-10-27 05:07:00 UTC
+    let at = 1_793_077_620;
+    let web = replicated_vm(
+        &env,
+        "web",
+        failed,
+        &[(older, Some(at - 60)), (newer, Some(at))],
+    )
+    .await;
+    let lonely = replicated_vm(&env, "lonely", failed, &[(older, None)]).await;
+    let manager = fast_manager(&env);
+    eventually("web recovered", || {
+        get(&env, web.id).spec.node != Some(failed)
+    })
+    .await;
+    eventually("lonely left", || {
+        get(&env, lonely.id).status.last_error.as_deref()
+            == Some("HA cannot find a node for this VM: disk \"disk-lonely\" is on node-local pool \"local\" and has no ready replica on a live node")
+    })
+    .await;
+    let got = get(&env, web.id);
+    assert_eq!(got.spec.node, Some(newer));
+    assert_eq!(
+        got.status.last_error.as_deref(),
+        Some(
+            "recovering: node node-a failed; restarting from the replica on node node-c taken at 2026-10-27 05:07:00 UTC (writes after that are lost)"
+        )
+    );
+    assert_eq!(
+        got.spec.replication,
+        [
+            web.spec.replication[0].clone(),
+            ReplicationTarget {
+                node: failed,
+                schedule: "*/5".into(),
+                pool: None,
+            }
+        ]
+    );
+    assert_eq!(
+        got.status.replication,
+        [
+            web.status.replication[0].clone(),
+            ReplicaStatus {
+                promote: true,
+                ..web.status.replication[1].clone()
+            },
+            ReplicaStatus {
+                state: ReplicationState::Stale,
+                ..ReplicaStatus::pending(failed)
+            },
+        ]
+    );
+    assert_eq!(get(&env, lonely.id).spec.node, Some(failed));
+    // 기록 Task는 spec을 쓴 뒤에 남긴다.
+    eventually("record task", || recover_tasks(&env).len() == 1).await;
+    renew(&env.cluster, failed).await.unwrap();
+    manager.shutdown().await;
+}
+
+/// 복제본 없이(노드 로컬 풀 디스크가 없다) 복제 대상 노드로 옮기면 그 노드를 복제 대상과 상태 항목에서 빼고, 끝나지
+/// 못한 앞 복구의 승격 표시도 지운다.
+#[tokio::test]
+async fn recovering_onto_a_target_without_its_replica_drops_the_target() {
+    let env = Env::start().await;
+    let failed = node(&env, "node-a", 8192, Some(1)).await;
+    let target = node(&env, "node-b", 8192, Some(60)).await;
+    // 메모리가 모자라 고르지 않는 다른 대상
+    let small = node(&env, "node-c", 1024, Some(60)).await;
+    let web = vm_with(
+        &env,
+        "web",
+        failed,
+        Some(VmHa::default()),
+        PowerState::Running,
+        |spec| {
+            spec.replication = [target, small]
+                .map(|node| ReplicationTarget {
+                    node,
+                    schedule: "*/5".into(),
+                    pool: None,
+                })
+                .to_vec();
+        },
+    )
+    .await;
+    let mut status = web.status.clone();
+    status.replication = vec![
+        ReplicaStatus::pending(target),
+        ReplicaStatus {
+            promote: true,
+            ..ReplicaStatus::pending(small)
+        },
+    ];
+    env.cluster
+        .update_status::<VmSpec>(web.id, &status)
+        .await
+        .unwrap();
+    let manager = fast_manager(&env);
+    eventually("web recovered", || {
+        get(&env, web.id).spec.node == Some(target)
+    })
+    .await;
+    let got = get(&env, web.id);
+    assert_eq!(
+        got.spec.replication,
+        [ReplicationTarget {
+            node: small,
+            schedule: "*/5".into(),
+            pool: None,
+        }]
+    );
+    assert_eq!(got.status.replication, [ReplicaStatus::pending(small)]);
+    assert_eq!(
+        got.status.last_error.as_deref(),
+        Some("recovering: node node-a failed")
+    );
+    eventually("record task", || recover_tasks(&env).len() == 1).await;
     renew(&env.cluster, failed).await.unwrap();
     manager.shutdown().await;
 }

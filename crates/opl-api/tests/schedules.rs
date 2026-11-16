@@ -80,6 +80,7 @@ async fn ready_volume(env: &Env, name: &str, format: ImageFormat) {
     );
     env.cluster.create(&volume).await.unwrap();
     volume.status.phase = VolumePhase::Ready;
+    volume.status.node = Some(env.node);
     env.cluster
         .update_status::<VolumeSpec>(volume.id, &volume.status)
         .await

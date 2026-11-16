@@ -81,6 +81,20 @@ pub struct ReplicaVolume {
     pub size_bytes: u64,
 }
 
+/// HA가 VM을 복제본으로 다시 켠 마지막 복구(VM `status.last_recovery`). 다음 복구가 덮고, 그 뒤 복제가 성공해도 남는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ReplicaRecovery {
+    /// 죽은 원본 노드
+    pub from: Uuid,
+    /// 복제본을 승격해 VM을 켠 노드
+    pub node: Uuid,
+    /// 그 복제본의 시점(유닉스 초). 그 뒤 원본에 쓴 것은 잃었다.
+    pub synced_at: u64,
+    /// 복구한 때(유닉스 초)
+    pub at: u64,
+}
+
 /// VM `status.replication`의 대상 하나
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
