@@ -49056,3 +49056,33 @@ git commit -m "feat(web): Ceph 화면(만들기 마법사·상태·mon·mgr·OSD
 - 여러 노드 Ceph(mon 합류, OSD만 있는 노드, 클라이언트만 있는 노드)는 가짜 실행기 시험으로만 확인했다.
 - 모든 mon을 잃은 Ready 클러스터는 수동 복구나 Raft 기록 정리가 필요하다.
 - `[ceph] client_dir`는 모든 노드에서 같아야 한다. 크기 1 풀은 명시해야 하며 `mon_allow_pool_size_one`을 켠다.
+
+## 실행 후 기록 (2026-11-16)
+
+- **Task 1~7:** `feat/plan56-ceph-setup`에서 스크립트로 계획대로 적용했다. Task마다 검증한 스테이지 커밋과 트리가 같았고(생성 파일 포함), 일곱 Task를 마친 트리는 리뷰·검증을 거친 트리와 같다.
+- **사전 확인(GitHub 러너):** ceph 19.2.3, `ceph-volume`는 `ceph-osd`와 함께 깔림, `CEPH_VOLUME_ALLOW_LOOP_DEVICES=1`로 루프 장치 위 `lvm create`가 됨, 실제 JSON 모양을 받아 고정 JSON으로 썼다.
+- **실제 Ceph 시험에서 고친 것:** OSD Task가 OSD가 up이 되기 전에 끝남 → `ceph osd tree`에서 up까지 기다림. 풀 PG 기다림이 클러스터 전체 `pg stat`을 보아 새 풀을 놓칠 수 있음 → `pg ls-by-pool`.
+- **1차 리뷰에서 고친 것:**
+  - mon·mgr가 없는 노드의 OSD 추가가 admin 키링이 없어 늘 실패(치명) → `client.orbivisor`로 확인, OSD Task가 클라이언트 conf를 먼저 씀.
+  - 실패한 풀 만들기를 이어서 할 수 없음(치명) → 이어서 하기.
+  - 다시 하기의 `activate --all` → 그 OSD만, `ceph-volume lvm list`를 `osd_fsid`로 묶기, 열린 LV·cephadm 폴더를 남의 Ceph로 보아 지우지 않음.
+  - Raft `pending` 자리로 클러스터 전체에서 mon·mgr 작업 하나와 mon 5개 상한, 부트스트랩 노드를 잃으면 다른 노드로 옮기기, 상태 캐시가 실패도 캐시하고 mon 노드에 병렬로 물음, mon 추가 전 monmap 확인, 노드 지우기가 Ceph 기록에서 빼고 수동 정리 안내, 확인한 디스크를 by-id로 보냄, 실제 시험에 지우기와 두 번째 OSD.
+- **2차 리뷰에서 고친 것:**
+  - 풀 "이어서 하기"가 쓰는 중인 풀의 복제 수를 바꿀 수 있음(치명) → 풀에 `orbivisor-pool` 표시, 표시가 맞거나 application이 없을 때만 이어서, 같은 Ceph 풀을 가리키는 RBD 풀이 있으면 409 `pool_exists`.
+  - 부트스트랩을 옮겨도 옛 노드의 init Task가 같은 fsid로 두 번째 클러스터를 세울 수 있음(치명) → 옮길 때 옛 Task를 실패시키고, init Task가 mon 저장소를 만들기 전·상태를 쓸 때마다 자기가 부트스트랩 노드인지 확인. mon 저장소 `done`에 init/join을 적어 버려진 init 저장소로 합류하지 않음, 합류 확인은 Raft mon에만.
+  - 꺼진 노드가 자리를 잡고 있을 때 안내, mon 포트 힌트, 웹에서 부트스트랩 옮기기, VG 보호 강화, 키링 소유권, 문서.
+- **검증 위치:** 일반 시험은 svc01, 실제 Ceph와 시스템을 바꾸는 작업은 GitHub 프로브(새 `ceph` 작업 — 설치·init·루프 장치 OSD·지우기와 두 번째 OSD·풀·RBD 볼륨의 VM, 시험 단계 약 4분), macOS·웹·셸·cargo-deny·`ha-it`(10개)·`migration-it`(8개)은 이 Mac. Ceph는 이 Mac과 svc01·svc02에서 돌리지 않았다.
+- **테스트 VM 배포(svc01·svc02):** svc02 → svc01 순서. 유닛은 바뀌지 않아 그대로. 두 노드 모두 `ceph-setup` 기능, `ceph status`는 "no Ceph cluster is set up", `node disks`는 시스템 디스크를 쓰는 중으로 보임, Ceph 패키지·`/etc/ceph`·`/etc/opl/ceph` 없음. test-vm은 QEMU PID·리비전 그대로. 헬스 `ok`, 저널에 panic 없음(svc01 재시작 순간 svc02의 openraft 리더 확인 시간 초과 ERROR 한 줄뿐), 웹은 새 빌드.
+
+**테스트:**
+- macOS `cargo test --workspace` 2710개(스테이지별 2605·2640·2671·2686·2699·2710·2710), 웹 시험 729개와 typecheck·lint, 패키징 셸 시험, `cargo-deny`, `ha-it` 10개, `migration-it` 8개
+- svc01(Linux) `fmt`·`clippy -D warnings`(모든 기능)·`cargo test --workspace` 2775개·starve·규모 시험 노드 100·storage-it
+
+GitHub 프로브에서 ceph·linux-kvm·ldap·package·ISO 작업.
+
+## 다음 계획으로 넘길 사항
+
+- 여러 노드 Ceph(mon 합류, OSD만 있는 노드, 클라이언트만 있는 노드)를 실제 Ceph로 시험할 것(지금은 가짜 실행기).
+- mon·mgr·OSD 지우기, Ceph 업그레이드, CephFS는 남았다.
+- 모든 mon을 잃은 Ready 클러스터의 복구 길이 없다(수동).
+- 다음: Proxmox VE·VMware 격차 분석과 차별화 전략(로드맵 다시 짜기), 그 뒤 SDN(하위 프로젝트 16).
