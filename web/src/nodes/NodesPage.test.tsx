@@ -5,7 +5,7 @@ import { http, HttpResponse } from "msw";
 import { applyEvent, listKey, type List } from "@/api/live";
 import type { Node } from "@/api/types";
 import { NodesPage } from "@/nodes/NodesPage";
-import { NET_NODE, NODE, poolState, task, vm } from "@/test/fixtures";
+import { NET_NODE, NODE, poolState, replica, replicatedVm, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -133,6 +133,38 @@ it("shows what each node can hotplug", async () => {
   expect(cell("node-a")).toHaveTextContent("qemu-kvmHotplug: vCPU yes, memory yes");
   expect(cell("node-b")).toHaveTextContent("Hotplug: vCPU no, memory no");
   expect(cell("node-c")).toHaveTextContent(/^qemu-kvm$/);
+});
+
+it("counts the replicas each node holds and lists them", async () => {
+  cluster();
+  const web = replicatedVm("running");
+  const db = {
+    ...vm("db", "running"),
+    spec: { ...vm("db", "running").spec, replication: [{ node: "n2", schedule: "*/5" }] },
+    status: { ...vm("db", "running").status, replication: [replica("n2", { state: "syncing" })] },
+  };
+  mockLists({ node: [NODE, DOWN], vm: [web, db, vm("other", "running")] });
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const column = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Replicas");
+  const cell = (name: string) =>
+    within(within(table).getByText(name).closest("tr")!).getAllByRole("cell")[column]!;
+  expect(await within(table).findByText("node-a")).toBeInTheDocument();
+  expect(await within(cell("node-a")).findByText("0")).toBeInTheDocument();
+  const open = within(cell("node-b")).getByRole("button", {
+    name: "Show the 2 VMs node-b holds replicas of",
+  });
+  expect(open).toHaveAttribute("aria-expanded", "false");
+  expect(open).toHaveTextContent("2");
+  await userEvent.click(open);
+  expect(open).toHaveAttribute("aria-expanded", "true");
+  expect(
+    within(cell("node-b"))
+      .getAllByRole("listitem")
+      .map((li) => li.textContent),
+  ).toEqual(["web · Ready", "db · Copying"]);
 });
 
 it("shows the health checks of each node and opens its interfaces", async () => {

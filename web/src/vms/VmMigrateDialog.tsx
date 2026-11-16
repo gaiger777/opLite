@@ -99,10 +99,14 @@ export function VmMigrateDialog({
   const sources = new Set(disks.map((d) => d.pool.name));
   const poolChoices = sources.size === 1 ? usable.filter((p) => !sources.has(p.name)) : usable;
   const [chosenPool, setChosenPool] = useState("");
-  const pool = poolChoices.some((p) => p.name === chosenPool) ? chosenPool : "";
+  // 고른 노드가 VM의 복제 대상이면 그 복제본 위에 마지막 복제 뒤 바뀐 것만 보낸다. 풀은 복제본의 풀이라 고르지 않는다
+  // (다른 풀을 보내면 서버가 409).
+  const toReplica =
+    target !== undefined && (vm.spec.replication ?? []).some((r) => r.node === target.id);
+  const pool = !toReplica && poolChoices.some((p) => p.name === chosenPool) ? chosenPool : "";
   // 같은 이름의 풀을 골랐는데 고른 노드에서 쓸 수 없는 원본 풀(서버가 409로 거절한다)
   const missingPool =
-    target && pool === ""
+    target && !toReplica && pool === ""
       ? disks.find((d) => !usable.some((p) => p.name === d.pool.name))?.pool.name
       : undefined;
 
@@ -174,24 +178,26 @@ export function VmMigrateDialog({
               ))}
             </ul>
           </div>
-          <Field id="migrate-pool" label={t("migrate.pool")}>
-            {(a11y) => (
-              <NativeSelect
-                id="migrate-pool"
-                className="w-full"
-                value={pool}
-                onChange={(e) => setChosenPool(e.target.value)}
-                {...a11y}
-              >
-                <NativeSelectOption value="">{t("migrate.samePool")}</NativeSelectOption>
-                {poolChoices.map((p) => (
-                  <NativeSelectOption key={p.id} value={p.name}>
-                    {p.name}
-                  </NativeSelectOption>
-                ))}
-              </NativeSelect>
-            )}
-          </Field>
+          {!toReplica && (
+            <Field id="migrate-pool" label={t("migrate.pool")}>
+              {(a11y) => (
+                <NativeSelect
+                  id="migrate-pool"
+                  className="w-full"
+                  value={pool}
+                  onChange={(e) => setChosenPool(e.target.value)}
+                  {...a11y}
+                >
+                  <NativeSelectOption value="">{t("migrate.samePool")}</NativeSelectOption>
+                  {poolChoices.map((p) => (
+                    <NativeSelectOption key={p.id} value={p.name}>
+                      {p.name}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              )}
+            </Field>
+          )}
           {missingPool !== undefined && target && (
             <p
               role="alert"
@@ -203,7 +209,9 @@ export function VmMigrateDialog({
           <p className="text-sm text-muted-foreground">
             {snapshotted
               ? t("migrate.snapshots")
-              : t("migrate.copyNote", { count: disks.length, size: formatBytes(copySize) })}
+              : toReplica
+                ? t("migrate.replicaNote")
+                : t("migrate.copyNote", { count: disks.length, size: formatBytes(copySize) })}
           </p>
         </>
       )}

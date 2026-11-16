@@ -2022,3 +2022,190 @@ linux-kvm(x86_64 QEMU 8.2 KVM — CPU·virtio-mem `requested-size`·디스크/NI
   보는 토폴로지 — 동작은 하나 확인하지 않음).
 - 옛 노드가 나중에 클러스터에 들어오면(이미 배치로 켠 VM이 있는 채로) 그 노드로의 마이그레이션은 `can_receive`가 막지만, 그 노드가
   리더가 되어 쓰는 상태에서 `VmStatus.hardware`가 빠질 수 있다(작업자가 다시 쓴다 — 켤 때의 기록으로).
+
+## 22. 구현(계획 55)
+
+여덟 단계를 커밋 여덟으로 했다(1 스펙·상태 타입과 검증·기능 가리기, 2 QMP·드라이버의 복제 전송과 받기 QEMU·겹층·비트맵 무리
+나누기, 3 받는 쪽 peer RPC·복제본 기록 파일·겹층 받기와 합치기·청소, 4 원본 쪽 복제 Task·주기 스케줄러·지금 복제 API, 5 복제본으로
+HA 복구와 승격·되돌아가기·균형 조정기·비우기, 6 복제본이 있는 노드로의 따라잡기 마이그레이션, 7 CLI와 실제 프로세스 시험, 8 웹·
+문서). 설계 §9와 다르거나 설계가 정하지 않아 정한 것을 적는다.
+
+**스펙·상태와 기능(단계 1).**
+- 기능 이름 `node-replication`(`opl_types::node::NODE_REPLICATION`, `FEATURES` 끝)이 가리는 것: VM 스펙의 `replication`이 비지 않음
+  (`prepare`에서 409 `cluster_upgrading`), 복제 Task 만들기(스케줄러·API), 새 peer RPC, 복제본으로 하는 HA 복구·마이그레이션. 받은
+  백업과 `create_vm`(복제·복원·가져오기)은 `replication`을 늘 비운다. `VmStatus.replication`은 옛 노드가 버리므로 가리지 않는다.
+- **설계와 다름: 스펙은 `{ target_node, schedule }`이 아니라 `ReplicationTarget { node, schedule, pool }`**(`deny_unknown_fields`,
+  opl-types 새 `replication.rs`). `pool`은 그 노드에서 VM의 로컬 디스크를 모두 둘 풀(없으면 디스크마다 같은 이름 — 계획 42의 대상
+  풀·형식 규칙) — 디렉터리 풀을 노드마다 따로 만든 클러스터와 한 호스트의 두 노드 시험(같은 이름 dir 풀은 같은 디렉터리)이 쓴다.
+  대상 3개까지(`MAX_REPLICATION_TARGETS`), 노드는 겹치지 않음, VM 자신의 노드가 아님.
+- **설계와 다름: 일정은 `*/N`(분)만**(`parse_interval`, 1~1440, 기본 `"*/15"`), 뜻은 "앞 시도를 시작한 때에서 N분 뒤"(시계에
+  맞추지 않음 — 백업 작업의 `HH:MM`은 복제 주기에 맞지 않고 cron 파서를 새로 두지 않았다).
+- 클러스터를 보는 검증(`vms::check_replication`, 기능 409 다음): 없는 노드·위트니스·로컬 디스크 없음·대상 풀을 쓸 수 없음은 400,
+  스냅샷이나 예약 스냅샷이 있으면 409 `replication_unsupported`. 공유 풀 디스크는 복제하지 않는다(섞인 VM은 로컬 디스크만).
+- 상태 `VmStatus.replication: Vec<ReplicaStatus { node, state, generation, synced_at, volumes, last_bytes, last_secs, last_full,
+  last_try, error, promote }>`, `ReplicationState` pending|ready|syncing|stale. "쓸 수 있는 복제본" `replica_ready(vm, node, local)`
+  = `ready`·generation 있음·VM의 지금 로컬 디스크를 모두 같은 크기로 담음 — HA·마이그레이션·균형 조정기가 함께 쓴다. reconciler
+  `write_status`는 작업자가 바꾸지 않은 `replication`을 저장소 값으로 지킨다.
+
+**복제본의 정체성과 기록(단계 2·3).**
+- 복제본은 대상 노드의 대상 풀에 **원본과 같은 볼륨 id**로 둔다(계획 42처럼). Volume 리소스는 하나(원본 위치 `status.node`)이고
+  복제본은 Raft 리소스가 아니다 — 승격은 볼륨의 `spec.pool`·`spec.format`·`status.node`만 고친다(`resolve::move_volume`).
+- **노드 기록 파일이 지우기의 유일한 근거**: `{data_dir}/replicas/{vm}.json`(`ReplicaRecord { vm, role: Primary|Replica, generation,
+  synced_at, volumes: [RecordedReplica { id, pool, format, size_bytes, created, state, overlay }] }`, opl-reconciler 새 `replicas.rs`,
+  `ReconcilerConfig.replica_dir`). 같은 id 볼륨이 기록 없이 있으면 그 디스크를 거절한다("…is the pool really node-local?"). 청소
+  (`IncomingReplicas::sweep`, 시작할 때와 10분마다)가 VM이 없거나 대상에서 빠졌거나 디스크를 뗀 복제본, 받다 만 겹층, 남은 받기
+  QEMU를 치우고, 다른 노드가 승격한 뒤의 옛 `Primary`를 `Stale` 복제본으로 바꾼다.
+- **설계와 다름: 계획 41의 백업 파일 전송이 아니라 계획 40의 dirty bitmap + 계획 42의 NBD로 QEMU가 직접 밀어 넣는다.** 원본은
+  디스크마다 `blockdev-add nbd`(TLS `opl-repl-tls`) 뒤 transaction 하나(`block-dirty-bitmap-add` 새 비트맵 + `blockdev-backup
+  sync=bitmap|full`)로 crash-consistent하게 보내고, 대상은 회차마다 `-machine none` 받기 QEMU를 `[migration] ports`의 포트 하나로
+  띄운다(디스크마다 `qemu-nbd`를 띄우는 것보다 포트·프로세스가 하나). 원격 복제(계획 38·41)는 다른 클러스터로 백업 파일을 보내는
+  것이라 쓸 것이 없었다.
+- **받는 쪽 겹층과 `qemu-img commit`.** 증분은 `{data_dir}/replicas/overlays/{run}-{volume}.qcow2`(backing = 복제본)로 받고 회차가
+  끝까지 온 뒤에만 합친다(`Storage::create_overlay`·`commit_overlay` — dir·LVM-thin·ZFS 같은 코드, 공유 풀은 거절). 합치기가 끊겨도
+  `received` 겹층이 남아 다음 받기·청소·승격이 먼저 합친다(멱등). 처음 전체와 크기가 바뀐 디스크의 전체만 복제본에 바로 쓰고 그 동안
+  그 대상은 `syncing`이다. 견준 길: 복제본에 바로 쓰기(실패하면 섞임), 백엔드 스냅샷(dir raw에 없음, 백엔드마다 코드), `qemu-nbd`.
+- **비트맵 무리 나누기.** 복제 비트맵 `opl-repl-{대상}-{회차}`, 따라잡기 임시 `opl-mig-{task}-{k}`. 이름이 `opl-`로 시작하므로
+  안전 쪽 규칙(스냅샷 되돌리기 전 지우기·오프라인 크기 바꾸기·inconsistent 지우기·qcow2→raw 미러·`dirty-bitmaps` 능력)은 그대로
+  둘 다 덮고, 백업만의 규칙(`remove_bitmaps`·`choose_parent`·`drop_new_bitmap`·`set_backup_bitmap`·Mock)은
+  `backup::is_backup_bitmap`(`opl-` + 소문자 16진 32자)로 좁혔다. 그래서 백업과 복제는 서로의 비트맵을 지우지 않는다.
+- QMP: `BitmapInfo.count`, `TransactionAction::Backup`(`bitmap-mode: never`, NBD 대상이라 `compress` 없음), `block_export_del`.
+  드라이버 `Hypervisor::{replicate_disks, remove_named_bitmaps, start_replica_receiver, finish_replica_receiver, stop_replica_receiver,
+  replica_receivers, catch_up_disks}`, `Storage::{create_overlay, commit_overlay}`. 진행률은 `watch::Sender<MirrorProgress>`(설계의
+  ProgressSink 없음). 드라이버는 기준 비트맵을 지우지 않는다(언제 지울지는 Task가 정한다).
+
+**회차(단계 3·4).**
+- peer RPC(대량 채널, `.proto` 없이 JSON) `ReplicaPrepare`·`ReplicaFinish`·`ReplicaAbort`(300·600·60초, `opl-peer/src/replica.rs`).
+  prepare가 디스크 하나라도 거절하면(`refused` — 기록을 잃음 등) 아무것도 바꾸지 않고 원본이 그 디스크를 전체로 한 번 더 한다.
+  풀·형식·크기가 다르면 증분을 거절하고, 대상 풀·형식이 바뀌면 옛 복제본을 지우고 새로 만든다. 공간: 새 복제본은 원본의 할당 크기
+  합 ≤ 대상 풀 `available_bytes`, 증분은 `{data_dir}`의 남은 공간 ≥ 바뀐 바이트(비트맵 `count` 합) + 1 GiB.
+- 원본 Task `vm-replicate`(`opl-api/src/tasks/vm_replicate.rs`, 회차 id = Task id)는 VM 줄에 서서 백업·핫플러그·마이그레이션과 차례로
+  돈다(시간 제한 없음, 정체 10분 `replication_stall`). 성공이면 그 대상의 다른 `opl-repl-{대상}-*`를 지우고 항목을 `ready`로 쓴다.
+  받는 쪽이 확실히 버렸으면 새 비트맵을 지우고, 결과를 모르면(시간 초과·연결 끊김, 받은 뒤 Raft 쓰기 실패) **두 비트맵을 모두
+  남긴다**(옛 비트맵이 상위 집합이라 다음 회차가 맞다). 오류는 항목의 `error`에 남는다.
+- **꺼진 VM은 복제하지 않는다**(예약은 건너뛰고 `POST /vms/{key}/replicate`는 409 `vm_not_running`). raw 디스크의 비트맵은 QEMU 안에만
+  있어 다시 켜면 다음이 전체다.
+- 리더 전용 `ReplicationScheduler`(opl-api 새 `replication.rs`, `ReplicationSchedulerConfig { tick, max_concurrent, minute }`): 틱마다
+  `now ≥ max(last_try, synced_at) + 주기`인 대상(오래 기다린 것 먼저, 원본 노드당 `max_concurrent`), 대상 노드가 꺼져 있으면 Task 없이
+  `error = "node … is offline"`, 스펙에 없는 항목(`stale`·`promote` 제외)은 지운다. opld `[replication] tick_secs 60, max_concurrent 2,
+  bandwidth_mib 0`(`opld.toml.example`에 적음). API 본문 `VmReplicateRequest { node }`(백업의 `ReplicateRequest`와 이름이 겹쳐 바꿈).
+- 걱정(단계 4, 1차 리뷰에서 고침 — 아래): VM이 마이그레이션한 뒤 시작한 복제 Task는 "not running on this node"로 실패하고 다음
+  성공까지 그 오류가 항목에 남는다.
+
+**HA 복구(단계 5).**
+- 로컬 디스크 VM의 후보는 `replica_ready` 노드뿐(`scheduler::replica_fits`·`replica_moves`, 모두 `existing: true`), 정렬은 **복제본
+  시각이 새로운 것 먼저**(디스크를 가진 노드는 가장 새로움)가 배치 순서보다 앞. 없으면 `"HA cannot find a node for this VM: disk …
+  is on node-local pool … and has no ready replica on a live node"`(`Pick::NoNode(Some(..))`). 복구 쓰기는 `last_error`에 복제본
+  시각("… restarting from the replica on node T taken at … UTC (writes after that are lost)"), 대상 항목 `promote: true`, **복제
+  방향 뒤집기**(`spec.replication`에서 T → 옛 원본 S, S 항목은 `stale` — 다음은 전체). 대상 reconciler가 켜기 전에
+  `replicas::promote`(받다 만 겹층 버림, 볼륨 위치 고침, 실패면 끄고 "failed to start: disk … has no complete replica on node …").
+- **설계와 다름: HA `relocate`(재시작 횟수 넘김)와 HA 검사 `restart_elsewhere`는 복제본을 쓰지 않는다** — 원본이 살아 있는 차가운
+  재시작이라 최근 쓰기를 잃는다(`node_fits` 그대로). HA 검사 `migrate`(라이브)는 복제본 노드를 받는다. 되돌아가기·균형 조정기의
+  대상은 `replica_fits`, 비우기는 우선순위·벌점·점수가 같을 때 묶음의 로컬 디스크 VM이 모두 복제본을 가진 노드를 먼저.
+
+**마이그레이션(단계 6).**
+- **설계와 다름: "마지막 증분만"은 미러가 아니라 `blockdev-backup` 따라잡기 패스다**(`blockdev-mirror`에 비트맵 인자가 없다 — 조사).
+  대상이 복제 대상이면 1차 패스의 기준은 복제 비트맵, 남은 변경이 64 MiB 이하가 될 때까지(최대 5회) 되풀이하고 `pause-before-switchover`의
+  `pre-switchover`에서 마지막 패스(게스트가 멈춰 정확)를 보낸 뒤 `migrate-continue`. 확정 쓰기가 `spec.node`와 함께 `spec.replication`을
+  뒤집고, 옛 원본은 자기 디스크를 복제본(`ready`)으로 기록하며, 새 노드는 게스트를 재개하기 전에 뒤집힌 방향의 비트맵을 더한다.
+  복제본과 다른 `pool`은 409 `migration_unsupported`, 대상이 아닌 노드는 계획 42 전체 미러.
+- **설계와 다름: 따라잡기 마이그레이션은 QEMU `dirty-bitmaps` 능력을 끈다**(스트림으로 보낸 비트맵이 busy가 되어 마지막 패스가 못 씀).
+  그래서 다른 복제 대상과 백업 비트맵은 VM을 따라가지 않아 다음 복제·백업은 전체다(나중에 `block-bitmap-mapping`). 되돌린 마이그레이션
+  뒤 그 대상으로의 다음 복제는 전체(`syncing` 복제본 위에 쌓지 않음). 프로토콜: `IncomingDisk.base_synced_at`,
+  `MigrateIncomingResponse.refused`(맞지 않는 디스크는 원본이 전체로).
+- 걱정(단계 6): Task 진행률에 패스 번호가 없다(단계는 `copying-disks` — CLI·웹도 번호 없이 "바뀐 것" 문구), 대상의 마이그레이션
+  디스크 기록에 복제본 디스크가 `created: false`로 남아 정리 때마다 "did not create this volume here" 경고.
+
+**복제와 스냅샷.** **설계에 없던 규칙: 함께 쓰지 않는다.** 복제본은 활성 층만 담고 승격·마이그레이션 뒤 스냅샷 기록이 매달리므로,
+복제하는 VM의 스냅샷 만들기(수동·예약)는 409 `snapshot_unsupported`, 스냅샷이 있는 VM에 복제 켜기는 409 `replication_unsupported`.
+백업·증분 백업은 함께 된다.
+
+**CLI·웹(단계 7·8).**
+- oplctl: `vm create|set --replicate NODE[,*/N][,pool=P]`(되풀이, 이름 → id, `vm set`은 목록 전체를 바꾸고 `--no-replicate`가 지움),
+  `vm replicate VM [--node N] [--no-wait]`(`vm web: replicated to node2 (12.0 MiB, incremental)`), `vm replication VM`(표 `NODE STATE
+  SYNCED AGE LAST SIZE ERROR`), `vm get` 표준 오류의 `replication:` 줄, HA로 만들거나 HA·복제를 바꿀 때 로컬 디스크에 복제가 없으면
+  표준 오류 경고, 복제 대상으로의 `vm migrate`는 "copying the changes since the replica"·"sent X MiB of changes since the replica"(패스
+  번호 없음). 파서 이름은 백업의 `parse_replicate`와 겹쳐 `parse_replica_target`.
+- 웹: 폼의 `replication: ReplicationRow[] { node, minutes, pool }`(서버와 같은 검증, 예약 스냅샷과 함께면 막음, 비면 필드를 보내지
+  않음), 새 `vms/form/ReplicationSection.tsx`(대상 노드 — VM 노드·위트니스 빼고, 주기(분), 대상 풀 — 같은 이름 기본·그 노드에서
+  쓸 수 있는 풀, 3개까지), 일반 절의 HA 안내(로컬 디스크 + 복제 없음), 새 순수 `vms/replication.ts`(`replicaRows(vm, nodes, now)` —
+  스펙 대상 순서 뒤에 스펙에 없는 항목(옛 원본), 다음 회차 = 스케줄러와 같은 셈이고 꺼진 VM은 없음; `replicationWarning`;
+  `firstLocalDisk`; `replicasOn`; `formatAge` — CLI와 같은 모양), VM 요약 탭의 "복제" 카드(대상마다 상태 배지·시점과 나이·보낸 양과
+  증분/전체·다음 회차·오류·"지금 복제", `recovering:`으로 시작하는 `last_error`), 스냅샷 탭의 만들기 단추를 까닭과 함께 막음, 노드
+  표의 "복제본" 칸(그 노드가 대상인 VM 수, 누르면 VM·상태), 마이그레이션 대화상자의 복제본 안내(그 노드면 풀 고르기를 숨기고 `pool`을
+  보내지 않음), Task 이름 `vm-replicate`("web을(를) node-b에 복제"), 진행률 `replicating`, 오류 `replication_unsupported`.
+  지금 복제의 `vm_busy`는 서버 문구를 그대로 보인다.
+
+**시험.** opl-types 단위(검증·`parse_interval`·`replica_ready`·비트맵 이름·serde), opl-qemu QMP, opl-driver `MockHypervisor`
+(`replications`·`receivers`·`catch_ups`), opl-peer gRPC, opl-reconciler `tests/promote.rs`, opl-api `tests/replica_receive.rs`·
+`tests/replication.rs`(두 노드 gRPC — 회차·거절·실패·스케줄러·마이그레이션)·`ha.rs`·`drain.rs`, oplctl 순수 함수, 웹(`replication.ts`·
+폼·복제 절·상세 카드·스냅샷 탭·노드 표·마이그레이션 대화상자·Task 표). 실제 QEMU: opl-driver `tests/qemu_replica.rs`(`qemu-it` — 바뀐
+블록만·raw 복제본의 겹층·실패한 증분 뒤 복제본 그대로), `tests/qemu_migration.rs` `migration_to_a_replica_sends_only_the_changes`,
+opld `tests/migration.rs` `replicates_a_vm_and_migrates_it_to_its_replica`(`migration-it`)·`tests/ha.rs`
+`an_ha_vm_with_local_disks_restarts_from_its_replica`(`ha-it`). 이 Mac(Homebrew QEMU 11.1, aarch64 HVF/TCG)에서 넷 다 통과했다. svc01
+(aarch64 QEMU 8.2 TCG)·GitHub linux-kvm(x86_64 QEMU 8.2 KVM) 결과는 배포 확인 기록에 적는다 — QEMU 8.2에서 처음 보는 것은
+`-machine none` 받기 QEMU의 TLS NBD `block-export-add`와 `pre-switchover` 때 새 `blockdev-backup` 작업이다(안 되면 마이그레이션은
+되돌리기 길로 실패하고 원본이 계속 돈다).
+
+**1차 리뷰 반영(설계와 다르거나 더한 것).**
+- **원본은 플리싱으로 보낸다(복제 회차·마이그레이션 따라잡기 패스).** 디스크에서 바로 `blockdev-backup`하면 그 작업이 끼우는
+  copy-before-write 필터(기본 `on-cbw-error: break-guest-write`)가 원격 NBD 쓰기 실패(네트워크 끊김, 받기 QEMU 죽음)를 게스트 쓰기
+  오류(EIO)로 돌려준다. 그래서 회차마다 VM 상태 디렉터리에 디스크 크기의 성긴 플리싱 이미지(`fleece-{i}.img`, `file` 노드
+  `opl-fl-tmp-{i}`)를 열고, 게스트를 잠깐 멈춘 채(모든 디스크가 한 시점 — 멈춘 동안 opld가 죽어도 다시 붙을 때 이어서 실행하게 멈춤
+  표시) 새 비트맵을 transaction으로 만들고 디스크 위에 수동 `copy-before-write` 필터(`opl-fl-cbw-{i}`, `on-cbw-error:
+  break-snapshot`, `cbw-timeout` 30초)를 `qom-set <qdev> drive`로 끼운 뒤, 그 시점의 디스크를 읽는 `snapshot-access` 노드
+  (`opl-fl-acc-{i}`)에서 NBD로 `blockdev-backup`한다(증분은 기준 비트맵을 그 노드의 `opl-fl-base`에 `block-dirty-bitmap-merge`로
+  옮겨 담음 — 상위 집합). 원격 쓰기가 실패해도 게스트 쓰기는 늘 성공하고 회차만 실패한다. 끝나거나 실패하면 snapshot-access →
+  장치를 디스크 노드로 되돌림 → 필터 → 이미지 순서로 떼고 파일을 지운다. 남은 것은 다음 회차·따라잡기·`clear_backup_leftovers`가 떼고
+  남은 파일은 VM을 켤 때 지운다. 남은 공간이 디스크 크기 합의 10%보다 적으면 시작하지 않는다. NBD 클라이언트에 `reconnect-delay`를
+  두지 않는다(회차를 실패시키는 편이 낫다). 쓰는 것은 QEMU 8.2에 있는 것뿐이다(`copy-before-write`의 `on-cbw-error`·`cbw-timeout`과
+  `snapshot-access`는 7.1, 실행 중 `drive` 바꾸기는 6.0). 전환 때의 마지막 따라잡기 패스는 게스트가 멈춰 있어 그대로 디스크에서
+  보낸다. 실제 QEMU 시험(`a_receiver_killed_mid_run_does_not_fail_guest_writes`)이 회차 도중 받기 QEMU를 죽여도 게스트 쓰기가 남고
+  다음 증분이 원본과 같은 복제본을 만드는 것을 본다(플리싱 없이는 그 쓰기를 잃는다).
+- **기록과 지우기.** 옛 원본의 `Primary` 기록을 옛 복제본으로 바꾸거나 지울 때(청소, 받을 준비, `delete_record`, 뗀 디스크) 볼륨
+  리소스가 없거나 다른 노드에 있고 다른 VM이 쓰지 않는(`vm_uses_volume`) 볼륨만 `created`로 다루고, 그 밖은 지우지 않고 기록에서
+  뺀다. 마이그레이션은 확정 쓰기 **전에** 남길 디스크를 옛 원본의 `Primary` 기록에 적고(끝내기는 그것을 `Replica`로 바꿈), 만든
+  복제본 파일이 없어졌거나 만들다 끊긴 항목은 다음 전체 회차가 다시 만든다.
+- **받는 쪽 잠금.** 기록 디렉터리 잠금 앞에 VM별 잠금(`replicas::lock_vm`)을 둔다. 끝내기는 받은 회차를 기록하고 곧바로 답하며
+  겹층 합치기는 RPC 밖에서 VM 잠금만 쥐고 한다(`replicas::merge_received`) — 같은 VM의 다음 받기·승격·청소는 기다리고 다른 VM은
+  막히지 않는다. `ReplicaFinishRequest.volumes`(비면 옛 원본 — 모두)로 이번 회차의 디스크만 온전해진 것으로 적고, 증분도 합칠 만큼
+  복제본 풀의 남은 공간을 본다. 복제본 풀은 노드 로컬 풀이어야 한다(400).
+- **크기 척도.** Raft의 `ReplicaVolume.size_bytes`는 볼륨의 `spec.size_bytes`(HA·마이그레이션·전체/증분 판단이 견주는 척도),
+  받는 쪽 기록(`RecordedReplica.size_bytes`)과 `PrepareVolume.size_bytes`는 이미지의 가상 크기다(마이그레이션이 남긴 디스크도).
+- **스케줄러·HA.** 동시 수는 도는 복제 Task만 세고 끝나지 않은 백업·마이그레이션·핫플러그·복제 Task가 있는 VM은 그 틱에 건너뛴다.
+  `last_try`는 Task를 만들 때 쓴다. VM이 그 노드에서 돌지 않게 된 뒤 시작한 회차는 건너뛰어 성공으로 끝난다(항목에 오류 없음). 항목
+  정리는 스펙의 대상이 아니거나 노드가 없는 `stale` 항목도 지운다(승격 표시는 남김). 죽은 노드를 지우면 모든 VM의 복제 대상·상태에서
+  빠지고, `check_replication`은 바뀌었거나 새로 더한 대상만 본다. 꺼진 채 두는 HA VM(`ha.state: stopped`)은 복제본을 쓰지 않는다
+  ("… VM is stopped; its newest data is on node …"). 노드를 모르는 로컬 풀 볼륨은 그 풀이 한 노드에만 있을 때만 그 노드에서 닿고
+  승격하지 않는다. 복구는 다른 항목의 승격 표시를 지우고, 비우기의 맞춤 검사는 마이그레이션과 같은 이동(`migration_moves`)으로 본다.
+- **복구 기록.** HA 복구가 `VmStatus.last_recovery { from, node, synced_at, at }`(`ReplicaRecovery`, 비면 생략 — 옛 노드는 무시)를
+  쓰고 다음 복구가 덮는다(reconciler는 늘 저장소의 값을 지킨다). CLI `vm get`·`vm replication`의 `last recovery:` 줄과 웹 복제 카드가
+  보인다. CLI·웹은 준비된 복제본이라도 VM의 로컬 디스크가 바뀌어 쓸 수 없으면 "HA cannot use it: disk … changed"를 붙인다.
+
+**2차 리뷰 반영.**
+- **플리싱은 어떤 경우에도 뗀다.** 따라잡기는 드라이버가 기한(`CatchUp.timeout` = `[migration] disk_timeout`)을 스스로 지킨다 —
+  넘기면 그 패스의 작업을 취소하고 플리싱을 뗀 뒤 실패한다(바깥 `tokio::time::timeout`이 future를 버려 플리싱이 남던 것). 실패
+  경로는 작업을 치우지 못해도 플리싱을 떼어 본다. 마이그레이션 되돌리기와 실패·중단(재시작 뒤 interrupted 포함)한 복제 Task의
+  정리는 VM 줄 안에서 `clear_backup_leftovers`(작업·NBD 노드·플리싱)를 부르고, opld가 시작해 도는 QEMU에 다시 붙을 때도 남은
+  `opl-fl-*` 노드(그것을 읽던 복제·따라잡기 작업 먼저)와 fleece 파일을 지운다(남은 필터는 디스크 핫플러그도 막는다).
+- **플리싱 공간.** 플리싱 이미지는 `{data_dir}`(VM 상태 디렉터리)에 두고 최악에는 디스크 크기까지 자란다. 시작 때의 10% 검사에 더해
+  보내는 동안(`wait_sent`) 그 파일 시스템의 남은 공간을 주기적으로 보고 max(1 GiB, 파일 시스템 5%)보다 줄면 작업을 취소하고 "not
+  enough space left in … for the fleecing images"로 실패한다.
+- **멈춘 동안.** 플리싱 필터를 끼우려고 게스트를 멈춘 동안 그 VM을 드라이버의 `pausing`에 둔다(다시 붙기·`resume_left_stopped`가
+  그 사이 이어서 실행하지 않게) — cont 뒤 뺀다.
+- **받는 쪽 잠금.** 받기 준비·마이그레이션 받기 준비·승격은 VM 잠금만 쥐고 그 VM의 기록을 다룬다(`replicas::vm_records` — 기록
+  파일은 VM마다 하나이고 쓰는 쪽은 모두 그 VM의 잠금을 쥔다). 그래서 겹층 합치기(`qemu-img commit`)와 받는 QEMU 띄우기 동안 다른
+  VM의 받기·끝내기·청소가 막히지 않는다. 설계 리뷰가 말한 "기록을 읽고 쓰는 동안만 디렉터리 잠금"보다 한 걸음 더 갔다(그 경로의
+  기록 읽기·쓰기도 디렉터리 잠금 없이).
+- **HA.** `replica_moves`는 옮길 볼륨 가운데 `status.node`가 없는 것이 있으면 None이라 HA가 승격 없이 복제본 파일로 켜지 않는다(복제본
+  없음과 같은 까닭). 승격 오류는 `PromoteError`로 나눈다: 쓸 복제본 없음(`Unusable`)은 지금처럼 끄고, 일시 오류(받는 QEMU 끄기, 합치기,
+  클러스터, 기록 파일 — `Transient`)는 끄지 않고 `retry_interval` 뒤 다시 해 본다(승격 표시를 지워 다음 복제본을 고르게 하는 것은
+  하지 않았다 — 표시 없이 켜면 복제본 파일을 그대로 쓸 수 있어서). HA 복구가 복제본 없이 복제 대상 노드로 옮기면 그 노드를
+  `spec.replication`과 상태 항목에서 빼고 승격 표시를 지운다.
+- **그 밖.** 따라잡기의 증분 판단은 볼륨의 `spec.size_bytes`로 견준다(정렬되지 않은 디스크도 바뀐 것만). 건너뛴 회차는 Task 경고
+  ("replication run skipped: …")를 남기고 `vm replicate`가 그것을 알린다.
+
+**남은 것.**
+- 게스트 에이전트 fs-freeze, 꺼진 VM 복제(짧은 `-machine none` QEMU로 읽기), 스냅샷까지 복제, HA가 아닌 VM을 손으로 복제본에서 켜기
+  (`actions/recover`), 갈라진 옛 원본의 증분 되돌림(공통 시점 스냅샷), raw 디스크 비트맵을 끄고 켜도 지키기, 시계에 맞춘 일정,
+  따라잡기 마이그레이션에서 다른 대상·백업 비트맵 옮기기(`block-bitmap-mapping`), 진행률의 패스 번호.
+- 실제 프로세스 시험이 중간에 실패하면 시험 도우미가 `run/vm` 아래 QEMU만 끄므로 `run/replica-*` 받기 QEMU가 남을 수 있다.

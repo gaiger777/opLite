@@ -42,6 +42,7 @@ import { NodeInterfacesDialog } from "@/nodes/NodeInterfacesDialog";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
 import { PoolStatus } from "@/storage/PoolStatus";
 import { trackTask } from "@/tasks/tasks";
+import { replicasOn } from "@/vms/replication";
 
 /** 그 노드에 고정했거나 그 노드에서 마지막으로 돈 VM의 수 */
 function vmCount(node: Node, vms: Vm[]): number {
@@ -56,6 +57,40 @@ function runningCount(node: Node, vms: Vm[]): number {
 /** 서버의 `NodeStatus::frozen`: 종료 정책 `freeze`로 꺼진 채 돌아오지 않은 노드. 리더가 HA VM을 옮기지 않는다. */
 function isFrozen(node: Node): boolean {
   return !node.status.online && node.status.shutdown?.action === "freeze";
+}
+
+/** 그 노드가 복제본을 둔 VM의 수. 누르면 VM 이름과 복제 상태를 펼친다. */
+function ReplicasCell({ node, vms }: { node: Node; vms: Vm[] }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const replicas = replicasOn(node.id, vms);
+  if (replicas.length === 0) {
+    return <>0</>;
+  }
+  const list = `node-${node.id}-replicas`;
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-expanded={open}
+        aria-controls={list}
+        aria-label={t("nodes.replicasOpen", { name: node.name, count: replicas.length })}
+        onClick={() => setOpen(!open)}
+      >
+        {replicas.length}
+      </Button>
+      {open && (
+        <ul id={list} className="text-xs">
+          {replicas.map(({ vm, state }) => (
+            <li key={vm.id}>
+              {vm.name} · {t(`vms.replication.state.${state}`)}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
 }
 
 /** 레이블을 `KEY=VALUE, …`로(키 순서) */
@@ -210,6 +245,7 @@ export function NodesPage() {
             <TableHead>{t("nodes.pools")}</TableHead>
             <TableHead>{t("nodes.labels")}</TableHead>
             <TableHead>{t("nodes.vms")}</TableHead>
+            <TableHead>{t("nodes.replicas")}</TableHead>
             {write && (
               <TableHead>
                 <span className="sr-only">{t("vms.actions")}</span>
@@ -219,7 +255,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 17 : 16} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 18 : 17} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -345,6 +381,10 @@ export function NodesPage() {
               <TableCell className="font-mono text-xs">{labelText(node.labels) || "—"}</TableCell>
               {/* VM 목록을 다 읽기 전에는 모른다. */}
               <TableCell>{vms.isSuccess ? vmCount(node, vms.data) : "—"}</TableCell>
+              {/* 그 노드가 대상인 복제(VM 목록으로 센다) */}
+              <TableCell>
+                {vms.isSuccess ? <ReplicasCell node={node} vms={vms.data} /> : "—"}
+              </TableCell>
               {write && (
                 <TableCell className="text-right">
                   <DropdownMenu modal={false}>

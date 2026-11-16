@@ -1,4 +1,4 @@
-import { Suspense, useId, useMemo, useState } from "react";
+import { Suspense, useEffect, useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { toast } from "sonner";
@@ -7,7 +7,7 @@ import { api, call } from "@/api/client";
 
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
-import type { Vm } from "@/api/types";
+import type { ReplicationState, Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { VmBackups } from "@/backups/VmBackups";
@@ -16,6 +16,7 @@ import { Pager, usePage } from "@/components/Pager";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Table,
   TableBody,
@@ -26,7 +27,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
-import { formatMib, formatTime, uuidTime } from "@/lib/format";
+import { formatBytes, formatMib, formatTime, uuidTime } from "@/lib/format";
 import { describeProgress, trackTask } from "@/tasks/tasks";
 import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
 import {
@@ -48,6 +49,13 @@ import {
   type WithMax,
 } from "@/vms/hotplug";
 import { VmConsole } from "@/vms/lazyConsole";
+import {
+  formatAge,
+  replicaRows,
+  replicationWarning,
+  unusableDisk,
+  type ReplicaRow,
+} from "@/vms/replication";
 import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 import { VmSnapshots } from "@/vms/VmSnapshots";
@@ -112,6 +120,7 @@ export function VmDetailPage() {
         </TabsList>
         <TabsContent value="summary">
           <Summary vm={vm} />
+          <Replication vm={vm} />
           <PendingChanges vm={vm} />
         </TabsContent>
         <TabsContent value="hardware">
@@ -345,6 +354,182 @@ function Summary({ vm }: { vm: Vm }) {
         </Field>
       )}
     </dl>
+  );
+}
+
+/** 복제 상태 배지의 모양 */
+const REPLICA_BADGE: Record<ReplicationState, React.ComponentProps<typeof Badge>["variant"]> = {
+  ready: "default",
+  syncing: "secondary",
+  pending: "outline",
+  stale: "destructive",
+};
+
+/** 지금 시각(유닉스 초). 30초마다 다시 읽어 복제본의 나이와 다음 회차를 고친다. */
+function useNowSecs(): number {
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+  return now;
+}
+
+/** 지금 복제(`POST /vms/{key}/replicate`) 거절 가운데 번역 대신 서버의 설명을 보이는 code */
+const REPLICATE_ERROR_CODES = ["vm_busy"];
+
+/**
+ * 로컬 디스크 복제 카드: 대상마다 상태·마지막 시점과 나이·보낸 양·다음 회차·오류와 "지금 복제". 준비된 복제본이라도 VM의
+ * 로컬 디스크가 바뀌어 HA가 쓸 수 없으면 그 디스크를 알린다. 복제가 없는 HA VM의 디스크가 노드 로컬 풀에 있으면 다른
+ * 노드에서 켤 수 없다고 알린다. HA가 복제본으로 켠 마지막 복구(`last_recovery` — 복제본의 시각과 잃은 쓰기)는 VM이
+ * 켜진 뒤에도 남고, 그 기록을 모르는 옛 노드가 쓴 복구 중 `last_error`는 그대로 보인다.
+ */
+function Replication({ vm }: { vm: Vm }) {
+  const { t, i18n } = useTranslation();
+  const me = usePrincipal();
+  const hint = useId();
+  const nodes = useList("node");
+  const volumes = useList("volume");
+  const pools = useList("storage-pool");
+  const now = useNowSecs();
+  const rows = replicaRows(vm, nodes.data ?? [], now);
+  const warning =
+    volumes.isSuccess && pools.isSuccess ? replicationWarning(vm, volumes.data, pools.data) : null;
+  if (rows.length === 0 && !warning) {
+    return null;
+  }
+  const operate = can(me.role, "operate", "vm");
+  // 꺼진 VM은 복제하지 않는다(서버의 409 `vm_not_running`).
+  const reason = vm.status.phase === "running" ? null : "vms.replication.notRunning";
+  const recovery = vm.status.last_recovery;
+  const recovered =
+    !recovery && vm.status.last_error?.startsWith("recovering: ") ? vm.status.last_error : null;
+  const nodeName = (id: string) => nodes.data?.find((n) => n.id === id)?.name ?? id;
+  const unusable = (row: ReplicaRow) =>
+    volumes.isSuccess && pools.isSuccess
+      ? unusableDisk(vm, row.node, volumes.data, pools.data)
+      : null;
+
+  async function replicate(row: ReplicaRow) {
+    try {
+      const task = await call(
+        api.POST("/vms/{key}/replicate", {
+          params: { path: { key: vm.id } },
+          body: { node: row.node },
+        }),
+      );
+      trackTask(task, t("tasks.op.vm-replicate", { target: vm.name, node: row.name }));
+    } catch (err) {
+      toast.error(
+        t("vms.actionFailed", {
+          name: vm.name,
+          error: serverErrorMessage(t, err, REPLICATE_ERROR_CODES),
+        }),
+      );
+    }
+  }
+
+  return (
+    <Card className="mt-6">
+      <CardHeader>
+        <CardTitle>
+          <h2 id="vm-replication">{t("vms.replication.title")}</h2>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {warning && (
+          <p className="text-sm text-amber-700 dark:text-amber-400">
+            {t("vms.replication.noReplica", warning)}
+          </p>
+        )}
+        {recovery && (
+          <p className="text-sm text-muted-foreground">
+            {t("vms.replication.lastRecovery", {
+              time: formatTime(new Date(recovery.at * 1000), i18n.language),
+              from: nodeName(recovery.from),
+              node: nodeName(recovery.node),
+              synced: formatTime(new Date(recovery.synced_at * 1000), i18n.language),
+            })}
+          </p>
+        )}
+        {recovered && <p className="text-sm text-muted-foreground">{recovered}</p>}
+        {rows.length > 0 && (
+          <ul aria-labelledby="vm-replication" className="flex flex-col gap-3">
+            {rows.map((row) => (
+              <li key={row.node} className="flex flex-col gap-1 rounded-md border p-3 text-sm">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{row.name}</span>
+                  <Badge variant={REPLICA_BADGE[row.state]}>
+                    {t(`vms.replication.state.${row.state}`)}
+                  </Badge>
+                  {row.minutes !== null && (
+                    <span className="text-xs text-muted-foreground">
+                      {t("vms.replication.every", { minutes: row.minutes })}
+                      {row.pool && ` · ${t("vms.replication.pool", { pool: row.pool })}`}
+                    </span>
+                  )}
+                  {operate && row.minutes !== null && (
+                    <ReasonButton
+                      variant="outline"
+                      size="sm"
+                      className="ml-auto"
+                      aria-label={t("vms.replication.nowFor", { node: row.name })}
+                      reason={reason}
+                      reasons={hint}
+                      onClick={() => void replicate(row)}
+                    >
+                      {t("vms.replication.now")}
+                    </ReasonButton>
+                  )}
+                </div>
+                <span>
+                  {row.syncedAt !== null && row.age !== null
+                    ? t("vms.replication.synced", {
+                        time: formatTime(new Date(row.syncedAt * 1000), i18n.language),
+                        age: formatAge(row.age),
+                      })
+                    : t("vms.replication.neverSynced")}
+                </span>
+                {row.last && (
+                  <span className="text-muted-foreground">
+                    {t(
+                      row.last.full
+                        ? "vms.replication.lastFull"
+                        : "vms.replication.lastIncremental",
+                      {
+                        sent: formatBytes(row.last.bytes),
+                        size: formatBytes(row.size),
+                        secs: row.last.secs,
+                      },
+                    )}
+                  </span>
+                )}
+                {row.nextRun !== null && (
+                  <span className="text-muted-foreground">
+                    {row.nextRun <= now
+                      ? t("vms.replication.nextSoon")
+                      : t("vms.replication.next", {
+                          time: formatTime(new Date(row.nextRun * 1000), i18n.language),
+                        })}
+                  </span>
+                )}
+                {unusable(row) && (
+                  <span className="text-amber-700 dark:text-amber-400">
+                    {t("vms.replication.unusable", { volume: unusable(row) })}
+                  </span>
+                )}
+                {row.error && (
+                  <span className="whitespace-pre-wrap break-words text-destructive">
+                    {t("vms.replication.error", { error: row.error })}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        {operate && <ReasonList base={hint} reasons={[reason]} />}
+      </CardContent>
+    </Card>
   );
 }
 

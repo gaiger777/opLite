@@ -82,7 +82,8 @@
     "recommendation_stale": "The recommendation no longer fits the cluster: {{message}}",
     "placement_busy": "Two migrations are already running. Apply the recommendation when one has finished.",
     "placement_unavailable": "Could not read placement from the cluster leader. Try again shortly.",
-    "hotplug_unavailable": "The hardware cannot change while the VM runs: {{message}}"
+    "hotplug_unavailable": "The hardware cannot change while the VM runs: {{message}}",
+    "replication_unsupported": "Replication cannot be turned on: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -189,11 +190,13 @@
       "node-power-off": "Power off {{target}} (fencing)",
       "ha-check": "HA check {{check}} on {{target}}: {{action}}",
       "bond-degraded": "Bond {{bond}} on {{target}} lost ports",
-      "vm-hotplug": "Change hardware of {{target}}"
+      "vm-hotplug": "Change hardware of {{target}}",
+      "vm-replicate": "Replicate {{target}} to {{node}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
-      "migratingMemory": "Migrating memory"
+      "migratingMemory": "Migrating memory",
+      "replicating": "Replicating {{percent}}% ({{done}}/{{total}} GiB)"
     },
     "detail": {
       "vms": "VMs: {{vms}}."
@@ -356,7 +359,31 @@
       "firmware": "Firmware",
       "machine": "Machine type"
     },
-    "applyAgain": "Apply again"
+    "applyAgain": "Apply again",
+    "replication": {
+      "title": "Replication",
+      "noReplica": "This VM cannot be restarted on another node: disk {{volume}} is on node-local pool {{pool}} and has no replica. Add replication.",
+      "state": {
+        "ready": "Ready",
+        "syncing": "Copying",
+        "pending": "Waiting",
+        "stale": "Old source"
+      },
+      "every": "every {{minutes}} min",
+      "pool": "pool {{pool}}",
+      "now": "Replicate now",
+      "nowFor": "Replicate now to {{node}}",
+      "notRunning": "Only a running VM is replicated.",
+      "synced": "Copy taken at {{time}} ({{age}} ago)",
+      "neverSynced": "No complete copy yet.",
+      "lastFull": "Last run: full copy, sent {{sent}} in {{secs}} s · disks {{size}}",
+      "lastIncremental": "Last run: changes only, sent {{sent}} in {{secs}} s · disks {{size}}",
+      "next": "Next run at {{time}}",
+      "nextSoon": "Next run soon",
+      "error": "Last run failed: {{error}}",
+      "unusable": "HA cannot use this replica: disk {{volume}} changed after the last run (it can after the next run).",
+      "lastRecovery": "Last recovery at {{time}}: {{from}} failed; restarted on {{node}} from the replica taken at {{synced}} (writes after that were lost)."
+    }
   },
   "snapshots": {
     "created": "Created",
@@ -412,7 +439,8 @@
     "mixed": "Only VMs whose disks are all qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools can take snapshots. This VM mixes them.",
     "blockHint": "Disks in LVM-thin, ZFS and Ceph RBD pools are saved without memory. A running VM pauses briefly while they are saved.",
     "zfsLatest": "Disks in ZFS pools can only revert to their latest snapshot.",
-    "sharedLvm": "Disks in shared LVM pools cannot be snapshotted. {{volume}} is in one."
+    "sharedLvm": "Disks in shared LVM pools cannot be snapshotted. {{volume}} is in one.",
+    "replicated": "This VM is replicated to other nodes. Replicas do not keep snapshots; remove the replication first."
   },
   "clone": {
     "title": "Clone {{name}}",
@@ -714,7 +742,8 @@
     "noSamePool": "{{node}} has no usable {{pool}} pool. Choose a target pool.",
     "snapshots": "VMs with snapshots cannot be migrated with disks on node-local pools. Delete the VM's snapshots first.",
     "force": "Ignore placement rules",
-    "forceHint": "Moves the VM even if it breaks hard placement rules or a restricted HA group. Node checks and memory still apply. The audit log records the broken rules."
+    "forceHint": "Moves the VM even if it breaks hard placement rules or a restricted HA group. Node checks and memory still apply. The audit log records the broken rules.",
+    "replicaNote": "This node holds a replica, so only what changed since the last replication is copied."
   },
   "forms": {
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."
@@ -1176,7 +1205,9 @@
     },
     "hotplug": "Hotplug: vCPU {{cpu}}, memory {{memory}}",
     "yes": "yes",
-    "no": "no"
+    "no": "no",
+    "replicas": "Replicas",
+    "replicasOpen": "Show the {{count}} VMs {{name}} holds replicas of"
   },
   "accounts": {
     "currentPassword": "Current password",
@@ -1462,7 +1493,13 @@
       "maxVcpusHigh": "At most 256.",
       "maxMemoryLow": "At least the memory.",
       "maxMemoryHigh": "At most 524288 MiB (512 GiB).",
-      "memoryAlign": "With a maximum, memory and maximum memory must be multiples of 128 MiB."
+      "memoryAlign": "With a maximum, memory and maximum memory must be multiples of 128 MiB.",
+      "replicationTargets": "Up to 3 replication targets.",
+      "replicationSnapshots": "Replication cannot be used together with scheduled snapshots. Turn the snapshot schedule off.",
+      "replicationNode": "Choose a node.",
+      "replicationDuplicate": "This node is already a target.",
+      "replicationOwnNode": "The VM's own node cannot hold its replica.",
+      "replicationMinutes": "Enter whole minutes from 1 to 1440."
     },
     "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",
@@ -1508,7 +1545,16 @@
     "runningNoteLive": "The VM is running and its node cannot change. Hardware changes are applied while it runs where possible; the rest are listed on its page and apply at the next restart.",
     "restartForHotplug": "The VM was started without hotplug support. Restart it once to add or remove disks and interfaces while it runs.",
     "disksLive": "While the VM runs, volumes can be attached at the end (virtio-blk only, 8 devices at most) and disks attached while it runs can be removed from the end. Disks it started with cannot change.",
-    "nicsLive": "While the VM runs, interfaces can be added at the end (8 devices at most) and interfaces added while it runs can be removed from the end. The network, model and MAC address of a running interface cannot change; its security groups can."
+    "nicsLive": "While the VM runs, interfaces can be added at the end (8 devices at most) and interfaces added while it runs can be removed from the end. The network, model and MAC address of a running interface cannot change; its security groups can.",
+    "replication": "Replication",
+    "replicationNote": "Only disks on node-local pools are replicated · Cannot be used together with snapshots. Copies the disks to each target node on a schedule; HA restarts the VM there from the latest copy if its node fails.",
+    "replicationN": "Replication target {{n}}",
+    "replicationChoose": "Choose a node",
+    "replicationMinutes": "Every (minutes)",
+    "replicationPool": "Target pool",
+    "removeReplication": "Remove replication target {{n}}",
+    "addReplication": "Add replication target",
+    "haNoReplica": "This VM cannot be restarted on another node: disk {{volume}} is on node-local pool {{pool}} and has no replica. Add replication."
   },
   "console": {
     "connecting": "Connecting…",

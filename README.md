@@ -1061,6 +1061,7 @@ orbivisorctl pool get san                            # 노드별 준비·VG 크�
 VM 노드를 대상으로 바꾸는 순간 확정된다. 그 뒤에만 대상에서 VM이 이어서 돈다(두 QEMU가 함께 돌지 않는다). 공유 풀의
 디스크는 두 노드가 함께 열고, 노드 로컬 풀(공유가 아닌 디렉터리 풀, LVM-thin, ZFS)의 디스크는 대상 노드에 새로 만든
 볼륨으로 복사한다(`qm migrate --online --with-local-disks`·Storage vMotion — 아래 "로컬 디스크 복사").
+대상 노드에 VM의 복제본이 있으면 마지막 복제 뒤 바뀐 것만 보낸다(아래 "로컬 디스크 복제와 HA").
 
 ```bash
 orbivisorctl vm migrate web node2        # 끝날 때까지 기다린다: "vm web: migrated to node2"
@@ -1209,7 +1210,8 @@ HA VM은 노드가 클러스터 과반수와 끊기면 그 노드가 스스로 �
 자리). 노드는 리더에게 몇 초마다 **리스**를 갱신하고, 마지막으로 성공한 갱신 뒤 `fence_after_secs`가 지나면 그
 노드의 HA VM을 강제로 끈다. orbivisord 자신이 멈추거나 멈춰 서도 끄도록 Linux watchdog 장치를 쥐고 있다가, 리스를 잃은
 채 HA VM이 돌면 쓰다듬기를 멈춰 노드를 재시작시킨다. 리더는 노드가 스스로 펜싱을 마쳤을 시간(`recover_after_secs`)이
-지나도록 리스가 돌아오지 않으면 그 노드의 HA VM을 다른 노드로 옮겨 켠다(**복구**, 아래).
+지나도록 리스가 돌아오지 않으면 그 노드의 HA VM을 다른 노드로 옮겨 켠다(**복구**, 아래). 디스크가 노드 로컬 풀에 있는
+HA VM은 복제가 있어야 다른 노드에서 켤 수 있다(아래 "로컬 디스크 복제와 HA").
 
 ```bash
 orbivisorctl vm create web --memory 1024 --disk root --ha --restart on-failure --start
@@ -2052,6 +2054,137 @@ VM `spec.cpu.max_vcpus`·`spec.max_memory_mib`, `status.hardware`(아래), Node 
   노드는 그 뒤 실행 중에 바꾼 것을 모른다. 최대 메모리가 호스트 CPU의 물리 주소 폭을 넘으면
   QEMU가 켜지지 않는다(`maxmem` — 상한을 512 GiB로 둔 까닭).
 
+## 로컬 디스크 복제와 HA
+
+노드 로컬 풀(공유가 아닌 디렉터리 풀, LVM-thin, ZFS)의 VM 디스크를 다른 노드에 주기적으로 복제해 두고, VM의 노드가
+죽으면 HA가 **마지막 복제본으로** 다른 노드에서 VM을 켠다(Proxmox VE의 스토리지 복제 `pvesr`, VMware vSphere Replication과
+같은 자리). 공유 스토리지 없이 노드 디스크만으로 HA를 쓸 수 있고, 복제본이 있는 노드로의 마이그레이션은 마지막 복제 뒤
+바뀐 것만 보낸다. 복제는 VM 스펙의 `replication`(대상 노드마다 주기와 대상 풀, 3개까지)으로 켠다. 모든 노드가 이 버전이어야
+한다(노드가 알리는 기능 `node-replication`, 아래 "업그레이드").
+
+```bash
+orbivisorctl vm create web --disk root --ha --replicate node2 --start   # 기본 주기 */15(15분)
+orbivisorctl vm set web --replicate node2,*/5,pool=fast --replicate node3  # 목록을 통째로 바꾼다(되풀이)
+# vm web: replication targets node2, node3
+orbivisorctl vm set web --no-replicate                                  # vm web: replication off
+orbivisorctl vm replicate web --node node2                              # 지금 한 번(대상이 하나면 --node 생략)
+# vm web: replicated to node2 (12.0 MiB, incremental)                    처음이나 다시 전체면 (… , full)
+orbivisorctl vm replication web                                         # -o json이면 상태 항목 그대로
+# NODE   STATE    SYNCED                AGE    LAST                 SIZE     ERROR
+# node2  ready    2026-11-15 06:00 UTC  4m12s  incremental 12.0MiB  16.0GiB  -
+# node3  syncing  -                     -      -                    -        -
+orbivisorctl vm get web                                                 # 표준 오류에 복제 줄
+# replication: node2 ready 4m ago, node3 syncing
+```
+
+- **무엇을.** VM의 노드 로컬 풀 디스크를 대상 노드의 **같은 id 볼륨**(`{id}.qcow2`·`opl-{id}` — 계획 42 마이그레이션과 같은
+  이름)으로 복제한다. 대상은 `NODE[,*/N][,pool=P]`: 주기 `*/N`은 **앞 시도(복제 Task를 만든 때)에서 N분 뒤**(1~1440, 기본 15 —
+  시계에 맞추지 않는다, Proxmox의 달력 이벤트와 다름 — 시도가 곧바로 실패해도 주기 전에는 다시 하지 않는다), `pool`은 그
+  노드에서 이 VM의 로컬 디스크를 모두 둘 노드 로컬 풀(없으면 디스크마다 같은
+  이름의 풀, 형식은 마이그레이션처럼 대상 풀 종류가 받으면 그대로 아니면 raw). 공유 풀의 디스크는 복제하지 않는다(어느
+  노드에서나 열린다 — 섞인 VM은 로컬 디스크만). 복제본은 클러스터 리소스가 아니라 볼륨 목록에 따로 보이지 않고, 지우기·
+  붙이기 API로 닿지 않는다. 검사(**400**): 대상 3개까지, 겹치는 노드, `*/N` 모양, VM 자신의 노드("replication target cannot
+  be the VM's own node" — 스케줄러가 고른 노드가 대상이어도), 없는 노드, 위트니스("node \"w\" is a witness and cannot hold
+  replicas"), 로컬 디스크 없음("VM \"web\" has no disks on node-local pools; replication applies only to them"), 대상 노드에서
+  쓸 수 없는 풀("node \"node2\" cannot use storage pool \"fast\" for the replica of disk \"root\""), 공유 풀("replica pool
+  \"nfs\" is shared; replication needs a node-local pool"). 이미 저장된 대상(노드·풀이 같음)은 다시 보지 않아 대상 노드가 없어져도
+  VM의 다른 고치기가 막히지 않고, 죽은 노드를 지우면(`DELETE /api/v1/nodes/{key}`) 모든 VM의 복제 대상과 상태에서 그 노드가 빠진다.
+- **흐름.** 리더의 스케줄러가 `[replication] tick_secs`(기본 60초)마다 주기가 지난 대상을 골라(오래 기다린 것 먼저, 원본
+  노드마다 **도는** 복제 Task가 `max_concurrent` 2개까지 — VM 줄에서 기다리는 Task는 세지 않고, 끝나지 않은 백업·마이그레이션·
+  핫플러그·복제 Task가 있는 VM은 그 틱에 건너뛴다) VM의 노드에 **복제 Task**(`vm-replicate`)를 만든다. 처음은 전체, 다음부터는
+  대상마다 따로 둔 dirty bitmap(`opl-repl-{대상}-{회차}`)으로 **바뀐 블록만** 보낸다. 원본 QEMU가 직접 대상의 NBD 서버에
+  노드 인증서 TLS로 밀어 넣는다(`blockdev-backup` — 마이그레이션의 디스크 복사와 같은 길). 원본은 **플리싱**(fleecing)으로
+  보낸다: 회차를 시작할 때 게스트를 잠깐(밀리초) 멈춘 채 디스크마다 copy-before-write 필터를 끼우고 그 시점의 디스크를
+  snapshot-access 노드에서 읽어 보낸다. 게스트가 덮어쓰려는 옛 블록은 먼저 그 노드의 VM 상태 디렉터리에 둔 성긴 플리싱 이미지
+  (`{data_dir}/vm/{id}/fleece-{i}.img`, 회차가 끝나면 지운다)로 옮긴다 — 그래서 **네트워크가 끊기거나 대상 노드가 죽어도 게스트
+  쓰기는 실패하지 않고 그 회차만 실패한다**(필터가 30초 안에 옮기지 못하거나 공간이 모자라도 게스트 쓰기는 그대로 하고 회차를
+  깬다). 플리싱 이미지는 `{data_dir}`에 놓이고 회차 동안 게스트가 처음 덮어쓰는 블록만큼, 최악에는 **디스크 크기까지** 자라므로
+  그 파일 시스템에 여유를 둔다. 그 디렉터리의 남은 공간이 복제할 디스크 크기 합의 10%보다 적으면 회차를 시작하지 않고("not
+  enough space in … for the fleecing images"), 보내는 동안에도 남은 공간이 1 GiB와 그 파일 시스템 크기의 5% 가운데 큰 쪽보다
+  줄면 회차를 멈춘다("not enough space left in … for the fleecing images" — 플리싱을 떼고 지운다). 실패하거나 opld가 다시 시작해
+  끊긴 회차의 플리싱은 그 Task의 정리와 opld가 도는 VM에 다시 붙을 때 뗀다. VM이 그 노드에서 돌지 않게 된 뒤(옮겨 갔거나 꺼짐)
+  시작한 회차는 실패가 아니라 건너뛴다(Task는 성공이되 경고 "replication run skipped: the VM is not running on this node"를
+  남기고 `vm replicate`가 그 경고를 알린다 — 스케줄러가 VM이 도는 노드에서 다시 만든다). 대상 노드는 회차마다 짧은 받기
+  QEMU(`-machine none`)를 `[migration] ports`의 포트 하나로 띄우므로 **노드 사이에 그 포트 범위를 연다**(마이그레이션과 나눠
+  쓴다). 증분은 대상의 **겹층**(`{data_dir}/replicas/overlays/`의 qcow2, backing = 복제본)으로 받고, 회차가 끝까지 온 뒤에만
+  `qemu-img commit`으로 복제본에 합친다 — 회차가 중간에 끊겨도 복제본은 앞 회차 그대로 쓸 수 있다. 받는 쪽은 끝까지 받은
+  회차를 기록하고 곧바로 답하며 합치기는 그 뒤에 따로 한다(그 VM의 다음 받기·승격만 기다리고 다른 VM의 받기는 막지 않는다 —
+  합치기가 끊기면 다음 받기·청소·승격이 먼저 마저 합친다). 모든 디스크를 게스트를 멈춘 한 시점으로 떠 **crash-consistent**(백업과
+  같다 — 게스트 에이전트 fs-freeze는 아직 없다). 대역폭 상한은 `[replication] bandwidth_mib`(MiB/s, 디스크 수로 나눈다, 0이면 없음).
+- **잃는 데이터.** HA 복구는 **마지막으로 끝난 회차의 시점**으로 켠다. 그 뒤의 쓰기는 잃는다 — 최악은 "주기 + 회차가 걸린
+  시간"이다(15분 주기면 대략 15분 남짓). 복구 문구가 그 시점을 말한다: `recovering: node node1 failed; restarting from the
+  replica on node node2 taken at 2026-11-15 06:00:00 UTC (writes after that are lost)`(VM `status.last_error`). 이 문구는 VM이 켜지면
+  사라지지만 그 복구는 VM `status.last_recovery`(`from` 죽은 노드, `node` 켠 노드, `synced_at` 복제본의 시점, `at` 복구한 때)에
+  남는다 — 다음 복제가 성공해도 남고 다음 복구가 덮는다. `vm get`(표준 오류)·`vm replication`이 `last recovery: 2026-11-15
+  06:20 UTC — node1 failed; restarted on node2 from the replica taken at 2026-11-15 06:00 UTC (writes after that were lost)`로,
+  웹 복제 카드가 같은 문장으로 보인다.
+- **복제하지 않는 때.** **꺼진 VM은 복제하지 않는다**(예약은 건너뛰고 `vm replicate`는 **409** `vm_not_running`). 끄기 전
+  마지막 회차 뒤 바뀐 것은 다시 켜서 도는 다음 회차가 담는다(qcow2 비트맵은 끄고 켜도 남는다). **raw 디스크**(LVM-thin·ZFS,
+  dir 풀의 raw)의 비트맵은 QEMU 안에만 있어 **VM을 다시 켜면 다음 회차가 전체**다(증분 백업과 같은 한계). 비정상 종료 뒤의
+  비트맵, 크기를 늘린 디스크, 실행 중 붙인 디스크도 그 디스크만 다음이 전체다. 전체 복사가 복제본 위에 쓰는 동안 그 대상은
+  `syncing`이라 HA·마이그레이션이 쓰지 않는다.
+- **스냅샷과 함께 쓰지 않는다.** 복제본은 디스크의 지금 층만 담는다. 그래서 복제하는 VM의 스냅샷 만들기(수동·예약)는
+  **409** `snapshot_unsupported`("VM \"web\" is replicated to other nodes; replicas do not keep snapshots, remove the replication
+  first"), 스냅샷이 있거나 예약 스냅샷을 둔 VM에 복제를 켜기는 **409** `replication_unsupported`다. 백업·증분 백업은 함께
+  된다(비트맵이 따로다).
+- **HA 복구.** 리더는 로컬 디스크 HA VM을 **쓸 수 있는 복제본이 있는 노드**(상태 `ready`, VM의 지금 로컬 디스크를 모두 같은
+  크기(볼륨의 `size_bytes`)로 담음)로만 옮기고, 그 가운데 시점이 새로운 노드를 먼저 고른다(잃는 데이터가 적은 쪽). 꺼진 채 두는
+  HA VM(`ha.state: stopped`)은 복제본으로 옮기지 않는다 — 꺼진 동안 복제가 멈춰 복제본이 낡았을 수 있고, 거기로 옮기면 옛 원본이
+  돌아온 뒤 그 좋은 디스크가 낡은 복제본으로 덮이기 때문이다. 그런 VM은 그 노드를 기다리며 까닭이 남는다("HA cannot find a node
+  for this VM: VM is stopped; its newest data is on node \"node1\""). 노드 로컬 풀 볼륨인데 어느 노드에 있는지 모르면(옛 기록) 그
+  풀이 한 노드에만 있을 때만 그 노드에서 켜고 복제본으로 옮기거나 승격하지 않는다(복제본이 없을 때와 같은 까닭을 남긴다). 복제본
+  없이(로컬 디스크가 그 노드에 있다) 복제 대상 노드로 옮기면 그 노드는 VM의 노드가 되어 복제 대상에서 빠진다. 펜싱·기다림·우선순위는 지금과
+  같다 — 복제본 승격도 리스 만료나 전원 끄기 확인 뒤에만 일어난다. 대상 노드는 VM을 켜기 전에 복제본을 **승격**한다(받다 만
+  겹층을 버리고 볼륨의 위치를 자기로 고침 — 쓸 복제본이 없으면 켜지 않고 "disk \"root\" has no complete replica on node
+  \"node2\""; 받기 QEMU 끄기·겹층 합치기·클러스터 쓰기 같은 일시 오류면 끄지 않고 잠시 뒤 다시 해 본다). 그리고 **복제 방향을 뒤집는다**: `spec.replication`에서 node2가 옛 원본 node1로 바뀌고 node1은 `stale`(옛
+  원본) 대상이 된다. node1이 돌아오면 청소가 그 디스크를 복제본으로 바꾸고 다음 node2→node1 회차가 **전체**를 복사한다
+  (갈라진 쓰기를 비트맵으로 알 수 없다). node1이 돌아오기 전에는 그 회차가 "node \"node1\" is offline"으로 남는다(대상을 바꿔도
+  된다). 복제본이 없는 로컬 디스크 HA VM은 지금처럼 복구되지 않고 그 까닭이 남는다("HA cannot find a node for this VM: disk
+  \"root\" is on node-local pool \"local\" and has no ready replica on a live node"). HA의 옮기기(재시작 횟수를 넘김)와 HA 검사의
+  `restart_elsewhere`는 원본이 살아 있는 차가운 재시작이라 복제본을 쓰지 않는다(최근 쓰기를 잃으므로) — 그런 VM은 지금처럼
+  옮길 노드가 없다. HA 검사의 `migrate`(라이브)는 복제본 노드로 간다.
+- **마이그레이션.** 대상 노드가 VM의 복제 대상이면 전체를 복사하지 않고 **마지막 복제 뒤 바뀐 블록만** 복제본 위에 보낸다:
+  남은 변경이 64 MiB 이하가 될 때까지(최대 5번) 되풀이하고 전환할 때(게스트가 멈춘 동안) 마지막 변경을 보낸다(`vm migrate`가
+  `vm web: copying the changes since the replica`·`vm web: sent 3.0 MiB of changes since the replica`를 알린다, 웹 대화상자는
+  "이 노드에는 복제본이 있어…" 안내). 그 노드의 복제본 풀과 다른 `--pool`은 **409** `migration_unsupported`("node \"node2\"
+  holds the replica of VM \"web\" in pool \"b\"; migrate without --pool or remove the node from the replication targets").
+  옮긴 뒤 복제 방향이 뒤집혀 옛 원본의 디스크가 곧바로 `ready` 복제본이 된다(옛 원본에 디스크가 남는다). 이 따라잡기는 QEMU의
+  비트맵 옮기기를 끄므로 **다른 복제 대상과 증분 백업은 다음 한 번이 전체**다. 마이그레이션이 되돌려지면 그 대상의 복제본은
+  `syncing`으로 남아 다음 회차(전체)가 끝날 때까지 HA에 쓰지 않는다. 복제 대상이 아닌 노드로는 지금처럼 전체를 복사한다(복제
+  비트맵은 따라간다). 복제 Task와 마이그레이션은 VM 줄에서 차례로 돈다. 따라잡기도 복제 회차처럼 플리싱으로 보내 대상이 끊겨도
+  게스트 쓰기는 실패하지 않는다(그 패스와 마이그레이션만 되돌려진다). 따라잡기는 `[migration] disk_timeout`(기본 12h) 안에
+  끝나야 하고, 넘기면 작업을 취소하고 플리싱을 뗀 뒤 되돌린다(되돌리기도 남은 플리싱을 치운다). 옛 원본은 확정하기 전에 남길 디스크를 자기 기록에 적어 두므로
+  확정 뒤 opld가 죽어도 그 디스크는 옛 복제본으로 알아보고 다음 역방향 회차가 그 위에 보낸다.
+- **배치.** 균형 조정기는 복제가 있는 로컬 디스크 VM을 옮길 수 있고 그 대상은 복제본이 준비된 노드뿐이다. 비우기는 로컬 디스크
+  VM을 점수가 같으면 복제본 노드로 먼저 옮기고(그러면 바뀐 것만 보낸다), HA 되돌아가기(failback)도 복제본이 준비된 노드로만
+  한다.
+- **공간.** 새 복제본(전체)은 원본 디스크의 할당 크기 합이 대상 풀의 남은 공간(노드가 알린 `available_bytes`) 이하여야 하고,
+  증분은 대상 `{data_dir}` 파일 시스템에 바뀐 양 + 1 GiB가, 대상 풀에 합칠 바뀐 양이 남아야 한다(아니면 회차 실패 "not enough
+  space in storage pool
+  \"local\" on node \"node2\": need …, available …"). 복제본은 대상 풀의 공간을 디스크만큼 쓴다. 노드는 자기 복제본을
+  `{data_dir}/replicas/{vm}.json` 기록으로만 알고 지운다(남의 파일은 지우지 않는다 — 같은 id 볼륨이 기록 없이 있으면 그 디스크를
+  거절한다): VM을 지우거나 대상에서 빼거나 디스크를 떼면 대상 노드의 청소(시작할 때와 10분마다)가 복제본을 지운다. 돌아온 옛
+  원본의 기록에 아직 그 노드의 볼륨이거나 다른 VM이 쓰는 디스크가 있으면(원본이 떼어 다른 VM에 붙였다) 그 디스크는 지우지 않고
+  기록에서 뺀다. 원본은 회차마다 VM 상태 디렉터리에 플리싱 이미지를 둔다(위).
+- **상태 보기.** `vm replication`(위), `vm get`의 복제 줄, VM `status.replication`(대상마다 `state` pending·ready·syncing·
+  stale, `synced_at` 시점, `volumes`(볼륨 id와 `size_bytes`), 마지막 회차의 `last_bytes`·`last_secs`·`last_full`, `last_try`(마지막
+  복제 Task를 만든 때), `error`)와 `status.last_recovery`(위). 준비된 복제본이라도 그 뒤 VM의 로컬 디스크를 더했거나 크기를 바꿨으면
+  다음 회차가 끝날 때까지 HA·마이그레이션이 쓰지 않으므로 CLI는 `node2 ready 4m ago (HA cannot use it: disk "data" changed)`(표는
+  ERROR 칸), 웹 카드는 같은 안내를 붙인다. 웹은 VM 만들기·
+  편집의 "복제" 절(대상 노드 — VM 노드·위트니스 빼고, 주기(분), 대상 풀, 3개까지)과 일반 절의 HA 안내("이 VM은 다른 노드에서
+  다시 켤 수 없습니다 — 복제를 더하세요"), VM 요약 탭의 "복제" 카드(대상마다 노드·상태·마지막 시점과 나이·보낸 양과 증분/
+  전체·다음 회차·오류, "지금 복제" 단추), 스냅샷 탭의 막힌 만들기 단추와 까닭, 노드 표의 "복제본" 칸(그 노드가 대상인 VM 수,
+  누르면 VM과 상태)을 보인다. API는 `POST /api/v1/vms/{key}/replicate`(본문 `{"node": "<이름이나 id>"}` — 대상이 하나면
+  생략, **202** Task, 운영자 권한, **409** `vm_busy` "VM \"web\" is already being replicated to node \"node2\" (task …)",
+  **400** "node \"node3\" is not a replication target of VM \"web\""·"VM \"web\" has several replication targets; choose one
+  with node")다. 실패한 회차의 까닭은 그 대상의 `error`에 남고 다음 성공 때 지워진다.
+- **설정.** `opld.toml`의 `[replication]`: `tick_secs`(60), `max_concurrent`(2), `bandwidth_mib`(0). 리더가 바뀌어도
+  `last_try`·`synced_at`이 클러스터 기록에 있어 일정이 이어진다.
+- **업그레이드.** 모든 노드가 `node-replication`을 알아야 복제를 켤 수 있고(아니면 **409** `cluster_upgrading`) 복제 Task·
+  복제본 승격·따라잡기 마이그레이션을 한다. 받은 백업·복제(clone)·복원·가져오기로 만든 VM은 `replication`을 비운다.
+- **한계.** 게스트 에이전트 fs-freeze(일관된 파일 시스템 시점), 꺼진 VM 복제, 스냅샷까지 복제, HA가 아닌 VM을 손으로 복제본에서
+  켜기, 갈라진 옛 원본을 증분으로 되돌리기(늘 전체), raw 디스크 비트맵을 재시작 뒤에도 지키기, 시계에 맞춘 일정은 아직 없다.
+
 ## 제어부 가용성
 
 API·작업·느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰 멀쩡한 노드가 펜싱되지 않게, orbivisord는 한
@@ -2579,7 +2712,8 @@ cluster_addresses = ["10.0.0.11", "10.1.0.11"]  # 앞이 우선 링크. 호스�
 커널·펌웨어를 올리거나 하드웨어를 손보기 전에 노드를 **유지보수 모드**로 두고 실행 중인 VM을 다른 노드로 옮긴다
 (Proxmox의 노드 유지보수, vSphere의 유지보수 모드와 같은 자리). 유지보수 노드에는 새 VM을 놓지 않는다: 스케줄러의
 자동 배치, HA 복구 대상, 마이그레이션 대상에서 빠진다. **비우기**는 노드를 유지보수로 바꾸고 그 노드의 실행 중인
-VM을 스케줄러가 고른 노드로 하나씩 라이브 마이그레이션한다.
+VM을 스케줄러가 고른 노드로 하나씩 라이브 마이그레이션한다. 로컬 디스크 VM은 복제본이 있는 노드를 먼저 고른다(위
+"로컬 디스크 복제와 HA").
 
 ```bash
 orbivisorctl node drain node1 --wait     # 유지보수로 바꾸고 모두 옮길 때까지 기다린다: "node node1 drained"
@@ -2705,6 +2839,7 @@ orbivisorctl -o json node stats --watch  # 회차마다 응답 한 줄(JSON Line
 
 백업은 VM 전체(디스크, UEFI 변수, VM 스펙)를 다른 저장소에 떠 둔 것이다. 스냅샷과 달리 VM 디스크의 저장소를
 잃거나 VM을 지워도 남고, 언제든 **새 VM**으로 되살린다. 백업은 `backups`를 켠 **디렉터리·NFS 풀**(백업 풀)에 둔다.
+노드 사이 로컬 디스크 복제(위 "로컬 디스크 복제와 HA")와 함께 쓸 수 있다 — 복제 비트맵과 증분 백업 비트맵은 따로다.
 
 ```bash
 orbivisorctl pool create bk --nfs nas.lan:/srv/backup --backups  # 백업 풀(디렉터리 풀이면 --path /srv/backup)

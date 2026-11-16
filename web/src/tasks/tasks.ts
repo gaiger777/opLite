@@ -91,6 +91,8 @@ export function describeTask(
   const check = op.kind === "ha-check" ? op.check : undefined;
   const action = op.kind === "ha-check" ? t(`haChecks.actions.${op.action}`) : undefined;
   const bond = op.kind === "bond-degraded" ? op.bond : undefined;
+  // 복제의 대상 노드
+  const node = op.kind === "vm-replicate" ? (nodeName(op.node) ?? op.node) : undefined;
   // 모르는 작업(새 서버)은 번역 키 대신 종류를 그대로 보여 준다.
   return t(`tasks.op.${op.kind}`, {
     target,
@@ -99,6 +101,7 @@ export function describeTask(
     check,
     action,
     bond,
+    node,
     defaultValue: `${op.kind} ${target}`,
   });
 }
@@ -127,15 +130,20 @@ function gib(bytes: number): string {
 }
 
 /**
- * 실행 중인 Task의 진행률 문구(지금은 로컬 디스크를 복사하는 마이그레이션만): "디스크 복사 37% (14.8/40.0
- * GiB)", "메모리 옮기는 중". 진행률이 없거나 모르는 단계면 null이다.
+ * 실행 중인 Task의 진행률 문구(로컬 디스크를 복사하는 마이그레이션과 복제): "디스크 복사 37% (14.8/40.0 GiB)",
+ * "메모리 옮기는 중", "복제 12% (0.1/1.0 GiB)". 진행률이 없거나 모르는 단계면 null이다.
  */
 export function describeProgress(task: Task, t: TFunction): string | null {
   const progress = task.status.progress;
-  if (progress?.stage === "copying-disks") {
+  if (progress?.stage === "copying-disks" || progress?.stage === "replicating") {
     const { done_bytes: done, total_bytes: total } = progress;
     const percent = total > 0 ? Math.floor((Math.min(done, total) * 100) / total) : 0;
-    return t("tasks.progress.copyingDisks", { percent, done: gib(done), total: gib(total) });
+    return t(
+      progress.stage === "replicating"
+        ? "tasks.progress.replicating"
+        : "tasks.progress.copyingDisks",
+      { percent, done: gib(done), total: gib(total) },
+    );
   }
   if (progress?.stage === "migrating-memory") {
     return t("tasks.progress.migratingMemory");

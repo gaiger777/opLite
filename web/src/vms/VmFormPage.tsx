@@ -12,14 +12,23 @@ import { Label } from "@/components/ui/label";
 import { errorMessage, HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
 import { poolFormats } from "@/storage/pools";
 import { isStopped } from "@/vms/actions";
-import { defaultMachine, emptyForm, fromVm, validate, type VmFormValues } from "@/vms/form";
+import {
+  defaultMachine,
+  emptyForm,
+  fromVm,
+  haActive,
+  validate,
+  type VmFormValues,
+} from "@/vms/form";
 import { DisksSection } from "@/vms/form/DisksSection";
 import { GeneralSection } from "@/vms/form/GeneralSection";
 import { haEnabled } from "@/vms/ha";
 import { deviceMode } from "@/vms/hotplug";
 import { NicsSection } from "@/vms/form/NicsSection";
+import { ReplicationSection } from "@/vms/form/ReplicationSection";
 import { ScheduleSection } from "@/vms/form/ScheduleSection";
 import { createVm, createVolume, isConflict, trackHotplug, updateVm } from "@/vms/form/submit";
+import { firstLocalDisk } from "@/vms/replication";
 import { formSnapshotSupport } from "@/vms/snapshots";
 import { useVmByName } from "@/vms/VmDetailPage";
 
@@ -75,7 +84,10 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
 
   const change = (patch: Partial<VmFormValues>) => setValues((v) => ({ ...v, ...patch }));
   // 행을 넣거나 빼면 행 번호로 단 오류가 다른 행을 가리키므로 지운다.
-  const changeRows = (patch: Pick<VmFormValues, "disks"> | Pick<VmFormValues, "nics">) => {
+  const changeRows = (
+    patch:
+      Pick<VmFormValues, "disks"> | Pick<VmFormValues, "nics"> | Pick<VmFormValues, "replication">,
+  ) => {
     change(patch);
     setErrors({});
   };
@@ -91,6 +103,20 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
     volumes.isSuccess ? volumes.data : undefined,
     pools.isSuccess ? pools.data : undefined,
   );
+
+  // 활성 HA인데 노드 로컬 풀의 디스크가 있고 복제가 없으면 그 디스크(그 노드가 죽으면 다른 노드에서 켤 수 없다).
+  // 볼륨·풀 목록을 다 읽어야 안다.
+  const noReplica =
+    haActive(values) && values.replication.length === 0 && volumes.isSuccess && pools.isSuccess
+      ? firstLocalDisk(
+          values.disks.map((d) => ({
+            volume: d.volume,
+            ...(d.kind === "new" && { pool: d.pool }),
+          })),
+          volumes.data,
+          pools.data,
+        )
+      : null;
 
   /** 다른 사람이 바꾼 VM을 다시 읽는다. `vm`은 watch로 늘 최신이다(지워지면 이 폼은 사라진다). */
   function reload() {
@@ -208,6 +234,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           live={mode === "live" || mode === "restart"}
           autoMachine={creating && !machineChosen}
           onMachineChosen={() => setMachineChosen(true)}
+          noReplica={noReplica}
         />
         <DisksSection
           values={values}
@@ -233,6 +260,15 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           boot={layout?.boot_nics ?? 0}
         />
         <ScheduleSection values={values} errors={errors} onChange={change} support={support} />
+        <ReplicationSection
+          values={values}
+          errors={errors}
+          onChange={change}
+          onRowsChange={(replication) => changeRows({ replication })}
+          nodes={nodes.data}
+          pools={pools.data}
+          ownNode={values.node || (vm?.status.node ?? "")}
+        />
 
         {creating && (
           <div className="flex items-center gap-2">

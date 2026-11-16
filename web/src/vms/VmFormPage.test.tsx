@@ -4,7 +4,18 @@ import { http, HttpResponse } from "msw";
 
 import type { List } from "@/api/live";
 import type { Task } from "@/api/types";
-import { hardware, haGroup, NODE, pool, securityGroup, task, vm, volume } from "@/test/fixtures";
+import {
+  hardware,
+  haGroup,
+  NODE,
+  pool,
+  poolState,
+  replicatedVm,
+  securityGroup,
+  task,
+  vm,
+  volume,
+} from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
@@ -993,4 +1004,166 @@ it("sets the hotplug maximums and checks them like the server", async () => {
   await vi.waitFor(() => expect(body).toBeDefined());
   expect(body!.spec.cpu).toEqual({ sockets: 1, cores: 2, model: "host", max_vcpus: 8 });
   expect(body!.spec.max_memory_mib).toBe(16384);
+});
+
+describe("replication", () => {
+  const NODE_B = {
+    ...NODE,
+    id: "n2",
+    name: "node-b",
+    status: { ...NODE.status, pools: { b: poolState("b") } },
+  };
+  const WITNESS = { ...NODE, id: "n9", name: "node-w", spec: { ...NODE.spec, witness: true } };
+
+  it("adds replication targets to a new VM, but not to its own node or a witness", async () => {
+    mockLists({ node: [NODE, NODE_B, WITNESS], "storage-pool": [pool("local"), pool("b")] });
+    let body: unknown;
+    server.use(
+      http.post(apiUrl("/vms"), async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+      }),
+    );
+    renderPage(<VmCreatePage />, { path: "/vms/-new" });
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "web");
+    await user.selectOptions(screen.getByLabelText("Node"), "node-a");
+    expect(
+      screen.getByText(
+        /Only disks on node-local pools are replicated · Cannot be used together with snapshots/,
+      ),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add replication target" }));
+    const row = screen.getByRole("group", { name: "Replication target 1" });
+    const node = within(row).getByLabelText("Node");
+    expect(node).toHaveValue("n2");
+    expect(
+      within(node)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["node-b"]);
+    expect(within(row).getByLabelText("Every (minutes)")).toHaveValue(15);
+    await user.clear(within(row).getByLabelText("Every (minutes)"));
+    await user.type(within(row).getByLabelText("Every (minutes)"), "5");
+    await user.selectOptions(within(row).getByLabelText("Target pool"), "b");
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    expect(await screen.findByText("moved")).toBeInTheDocument();
+    expect(body).toMatchObject({
+      name: "web",
+      spec: { node: "n1", replication: [{ node: "n2", schedule: "*/5", pool: "b" }] },
+    });
+  });
+
+  it("allows at most three targets and checks them before sending", async () => {
+    const nodes = [
+      NODE,
+      NODE_B,
+      ...["n3", "n4"].map((id) => ({ ...NODE, id, name: `node-${id}` })),
+    ];
+    mockLists({ node: nodes });
+    let called = false;
+    server.use(
+      http.post(apiUrl("/vms"), () => {
+        called = true;
+        return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+      }),
+    );
+    renderPage(<VmCreatePage />, { path: "/vms/-new" });
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "web");
+    const add = screen.getByRole("button", { name: "Add replication target" });
+    await user.click(add);
+    await user.click(add);
+    await user.click(add);
+    expect(add).toBeDisabled();
+    // 같은 노드를 두 번, 범위 밖의 주기
+    const second = screen.getByRole("group", { name: "Replication target 2" });
+    // 노드를 스케줄러에 맡겼으므로 node-a도 고를 수 있고, 줄마다 아직 대상이 아닌 노드가 먼저 골라져 있다.
+    expect(within(second).getByLabelText("Node")).toHaveValue("n2");
+    await user.selectOptions(within(second).getByLabelText("Node"), "node-a");
+    await user.clear(within(second).getByLabelText("Every (minutes)"));
+    await user.type(within(second).getByLabelText("Every (minutes)"), "1441");
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    expect(within(second).getByText("This node is already a target.")).toBeInTheDocument();
+    expect(within(second).getByText("Enter whole minutes from 1 to 1440.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Remove replication target 2" }));
+    expect(add).toBeEnabled();
+    expect(called).toBe(false);
+  });
+
+  it("does not combine replication with scheduled snapshots", async () => {
+    mockLists({ node: [NODE, NODE_B] });
+    let called = false;
+    server.use(
+      http.post(apiUrl("/vms"), () => {
+        called = true;
+        return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+      }),
+    );
+    renderPage(<VmCreatePage />, { path: "/vms/-new" });
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "web");
+    await user.selectOptions(screen.getByLabelText("Take snapshots"), "daily");
+    await user.click(screen.getByRole("button", { name: "Add replication target" }));
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    expect(
+      screen.getByText(
+        "Replication cannot be used together with scheduled snapshots. Turn the snapshot schedule off.",
+      ),
+    ).toBeInTheDocument();
+    expect(called).toBe(false);
+  });
+
+  it("warns that an HA VM with a local disk needs a replica", async () => {
+    const fenced = { ...NODE_B, status: { ...NODE_B.status, ha: FENCED.status.ha } };
+    const web = vm("web", "stopped", {
+      spec: {
+        ...vm("web", "stopped").spec,
+        disks: [{ volume: "web-root", bus: "virtio-blk", boot_order: 1 }],
+        ha: true,
+      },
+    });
+    mockLists({
+      vm: [web],
+      node: [FENCED, fenced],
+      volume: [volume("web-root", "local")],
+      "storage-pool": [pool("local"), pool("nas", { shared: true })],
+    });
+    let body: { spec: Record<string, unknown> } | undefined;
+    server.use(
+      http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+        body = (await request.json()) as typeof body;
+        return HttpResponse.json(web);
+      }),
+    );
+    renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+    const user = userEvent.setup();
+    const warning =
+      "This VM cannot be restarted on another node: disk web-root is on node-local pool local and has no replica. Add replication.";
+    expect(await screen.findByText(warning)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add replication target" }));
+    expect(screen.queryByText(warning)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(body?.spec.replication).toEqual([{ node: "n2", schedule: "*/15" }]));
+  });
+
+  it("removes all targets of a replicated VM", async () => {
+    const web = replicatedVm("running");
+    mockLists({ vm: [web], node: [NODE, NODE_B] });
+    let body: { spec: Record<string, unknown> } | undefined;
+    server.use(
+      http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+        body = (await request.json()) as typeof body;
+        return HttpResponse.json(web);
+      }),
+    );
+    renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+    const user = userEvent.setup();
+    const row = await screen.findByRole("group", { name: "Replication target 1" });
+    expect(within(row).getByLabelText("Node")).toHaveValue("n2");
+    await user.click(screen.getByRole("button", { name: "Remove replication target 1" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(body).toBeDefined());
+    expect(body!.spec).not.toHaveProperty("replication");
+  });
 });

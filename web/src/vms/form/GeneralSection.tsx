@@ -38,6 +38,7 @@ export function GeneralSection({
   live,
   autoMachine,
   onMachineChosen,
+  noReplica,
 }: {
   values: VmFormValues;
   errors: Record<string, string>;
@@ -56,6 +57,8 @@ export function GeneralSection({
   autoMachine: boolean;
   /** 사용자가 머신을 직접 골랐다. */
   onMachineChosen: () => void;
+  /** 활성 HA인데 복제가 없는 노드 로컬 풀의 디스크. 그 노드가 죽으면 다른 노드에서 켤 수 없다. */
+  noReplica?: { volume: string; pool: string } | null;
 }) {
   const { t } = useTranslation();
   const noHa = haLocked ? { key: "vmForm.haRunning" } : haUnavailable(nodes, values.node);
@@ -258,6 +261,11 @@ export function GeneralSection({
               }
             >
               {t(noHa.key, noHa.values)}
+            </p>
+          )}
+          {noReplica && (
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              {t("vmForm.haNoReplica", noReplica)}
             </p>
           )}
         </div>

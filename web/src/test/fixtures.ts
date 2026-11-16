@@ -7,6 +7,7 @@ import type {
   Node,
   PlacementRule,
   PlacementStatus,
+  ReplicaStatus,
   Rule,
   RunningHardware,
   SecurityGroup,
@@ -138,6 +139,43 @@ export function volume(name: string, pool: string, extra: Partial<Volume["status
     labels: {},
     spec: { pool, size_bytes: 16 * 1024 ** 3, format: "qcow2" },
     status: { phase: "ready", node: "n1", allocated_bytes: 1024 ** 3, attached_to: null, ...extra },
+  };
+}
+
+/** 대상 노드 `node`의 복제 상태. 기본은 볼륨 `web-root`(`volume("web-root", …)`)를 담은 준비된 증분 복제본이다. */
+export function replica(node: string, extra: Partial<ReplicaStatus> = {}): ReplicaStatus {
+  return {
+    node,
+    state: "ready",
+    generation: "019a0f3c-0000-7000-8003-000000000001",
+    synced_at: 1_800_000_000,
+    volumes: [{ id: volume("web-root", "local").id, size_bytes: 16 * 1024 ** 3 }],
+    last_bytes: 12 * 1024 ** 2,
+    last_secs: 4,
+    last_full: false,
+    last_try: 1_800_000_000,
+    ...extra,
+  };
+}
+
+/**
+ * 테스트용 복제 VM `web`: 노드 n1의 로컬 dir 풀 `local`에 있는 디스크 `web-root`(`volume("web-root", "local")`)를
+ * 노드 n2(node-b)로 15분마다 복제하고, 그 복제본이 준비돼 있다.
+ */
+export function replicatedVm(
+  phase: Vm["status"]["phase"] = "running",
+  extra: Partial<Vm> = {},
+): Vm {
+  const base = vm("web", phase);
+  return {
+    ...base,
+    spec: {
+      ...base.spec,
+      disks: [{ volume: "web-root", bus: "virtio-blk", boot_order: 1 }],
+      replication: [{ node: "n2", schedule: "*/15" }],
+    },
+    status: { ...base.status, replication: [replica("n2")] },
+    ...extra,
   };
 }
 

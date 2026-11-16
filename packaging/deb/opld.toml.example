@@ -10,6 +10,10 @@ address = "10.0.0.11"
 # [backup]
 # tick_secs = 60          # 백업 작업을 확인하는 간격(초, 리더 노드)
 # max_concurrent = 2      # 노드마다 동시에 도는 백업 작업(Task)의 최대 수
+# [replication]
+# tick_secs = 60          # 주기가 지난 로컬 디스크 복제 대상을 확인하는 간격(초, 리더 노드)
+# max_concurrent = 2      # 원본 노드마다 동시에 도는 복제 작업(Task)의 최대 수(VM 줄에서 기다리는 Task는 세지 않는다)
+# bandwidth_mib = 0       # 복제가 보내는 대역폭 상한(MiB/s, 디스크 수로 나눈다). 0이면 제한 없음
 # [pools]
 # refresh_secs = 15         # 노드별 풀 상태를 확인하는 간격(초, NFS 마운트 포함)
 # [runtime]

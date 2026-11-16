@@ -5,7 +5,7 @@ import { toast } from "sonner";
 
 import type { Node, Principal, Vm } from "@/api/types";
 import { resetTasks } from "@/tasks/tasks";
-import { NODE, pool, poolState, snapshot, task, vm, volume } from "@/test/fixtures";
+import { NODE, pool, poolState, replicatedVm, snapshot, task, vm, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -315,6 +315,44 @@ it("sends no pool for the same-name pool and offers none without local disks", a
   await waitFor(() => expect(within(dialog).getByLabelText("Target node")).toHaveValue("n2"));
   expect(within(dialog).queryByLabelText("Target pool")).not.toBeInTheDocument();
   expect(within(dialog).queryByText(/will be copied/)).not.toBeInTheDocument();
+});
+
+it("copies only the changes to a node that holds the replica and asks for no pool", async () => {
+  const replicated = served(replicatedVm("running"));
+  mockLists({
+    vm: [replicated],
+    node: NODES,
+    volume: [volume("web-root", "local")],
+    "storage-pool": POOLS,
+  });
+  const bodies: unknown[] = [];
+  server.use(
+    http.post(apiUrl(`/vms/${replicated.id}/migrate`), async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(task("t1", "vm-migrate", replicated.id), { status: 202 });
+    }),
+  );
+  openDetail();
+  await userEvent.click(await screen.findByRole("button", { name: "Migrate" }));
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  // node-b(n2)는 복제 대상이다: 복제본의 풀을 쓰므로 풀을 묻지 않는다.
+  expect(
+    await within(dialog).findByText(
+      "This node holds a replica, so only what changed since the last replication is copied.",
+    ),
+  ).toBeInTheDocument();
+  expect(within(dialog).queryByLabelText("Target pool")).not.toBeInTheDocument();
+  expect(within(dialog).queryByText(/will be copied/)).not.toBeInTheDocument();
+  // 복제 대상이 아닌 노드는 지금처럼 전체를 복사한다.
+  await userEvent.selectOptions(within(dialog).getByLabelText("Target node"), "n7");
+  expect(within(dialog).getByLabelText("Target pool")).toBeInTheDocument();
+  expect(within(dialog).getByText(/will be copied/)).toBeInTheDocument();
+  await userEvent.selectOptions(within(dialog).getByLabelText("Target pool"), "fast");
+  await userEvent.selectOptions(within(dialog).getByLabelText("Target node"), "n2");
+  // 다른 노드에서 고른 풀은 복제 대상으로 보내지 않는다(서버가 409).
+  await userEvent.click(within(dialog).getByRole("button", { name: "Migrate" }));
+  expect(await screen.findByText("Migrate web to node-b")).toBeInTheDocument();
+  expect(bodies).toEqual([{ node: "n2" }]);
 });
 
 it("does not copy disks of a VM with snapshots", async () => {

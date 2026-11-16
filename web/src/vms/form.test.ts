@@ -1,4 +1,4 @@
-import { NODE, vm } from "@/test/fixtures";
+import { NODE, replicatedVm, vm } from "@/test/fixtures";
 import {
   defaultMachine,
   emptyDisk,
@@ -264,4 +264,65 @@ it("checks the hotplug maximums like the server", () => {
   });
   expect(fromVm(web)).toMatchObject({ maxVcpus: "8", maxMemory: "16384" });
   expect(toSpec(fromVm(web), "running")).toEqual(web.spec);
+});
+
+it("round-trips replication targets and leaves them out when there are none", () => {
+  const web = replicatedVm("running");
+  const spec = {
+    ...web.spec,
+    replication: [
+      { node: "n2", schedule: "*/15" },
+      { node: "n3", schedule: "*/5", pool: "b" },
+    ],
+  };
+  const values = fromVm({ ...web, spec });
+  expect(values.replication).toEqual([
+    { node: "n2", minutes: "15", pool: "" },
+    { node: "n3", minutes: "5", pool: "b" },
+  ]);
+  expect(toSpec(values, "running")).toEqual({ ...spec, snapshot_schedule: null });
+  // "05"는 서버처럼 5분이다.
+  expect(
+    toSpec({ ...values, replication: [{ node: "n2", minutes: "05", pool: "" }] }, "running")
+      .replication,
+  ).toEqual([{ node: "n2", schedule: "*/5" }]);
+  // 대상을 모두 빼면 필드를 보내지 않는다(서버가 복제를 끈다).
+  expect(toSpec({ ...values, replication: [] }, "running")).not.toHaveProperty("replication");
+  expect(toSpec(emptyForm("q35"), "stopped")).not.toHaveProperty("replication");
+});
+
+it("checks replication targets like the server", () => {
+  const base = { ...emptyForm("q35"), name: "web", node: "n1" };
+  const row = (node: string, minutes = "15") => ({ node, minutes, pool: "" });
+  expect(validate({ ...base, replication: [row("n2"), row("n3", "1440")] }, true)).toEqual({});
+  expect(
+    validate(
+      {
+        ...base,
+        replication: [row(""), row("n2", "0"), row("n2", "1441"), row("n1", "*/5")],
+      },
+      true,
+    ),
+  ).toEqual({
+    replication: "vmForm.errors.replicationTargets",
+    "replication.0.node": "vmForm.errors.replicationNode",
+    "replication.1.minutes": "vmForm.errors.replicationMinutes",
+    "replication.2.node": "vmForm.errors.replicationDuplicate",
+    "replication.2.minutes": "vmForm.errors.replicationMinutes",
+    "replication.3.node": "vmForm.errors.replicationOwnNode",
+    "replication.3.minutes": "vmForm.errors.replicationMinutes",
+  });
+  // 스냅샷 예약과 함께 쓰지 않는다(서버의 409).
+  expect(
+    validate(
+      {
+        ...base,
+        replication: [row("n2")],
+        snapshotSchedule: { every: "daily", keep: "7", memory: false },
+      },
+      true,
+    ),
+  ).toEqual({ replication: "vmForm.errors.replicationSnapshots" });
+  // 노드를 스케줄러에 맡긴 VM은 어느 대상이든 받는다(서버가 고른 노드와 겹치면 400).
+  expect(validate({ ...base, node: "", replication: [row("n1")] }, true)).toEqual({});
 });

@@ -11,6 +11,7 @@ import {
   MAX_HA_PRIORITY,
   MIN_GUEST_WATCH_SECS,
 } from "@/vms/ha";
+import { MAX_REPLICATION_MINUTES, MAX_REPLICATION_TARGETS } from "@/vms/replication";
 
 type Schemas = components["schemas"];
 
@@ -62,6 +63,15 @@ export interface ScheduleRow {
   memory: boolean;
 }
 
+/** 복제 대상 하나(`spec.replication`). 주기는 `*\/N`의 N(분)이다. */
+export interface ReplicationRow {
+  /** 대상 노드 id. 비면 아직 고르지 않음 */
+  node: string;
+  minutes: string;
+  /** 대상 풀. 비면 디스크마다 같은 이름의 풀 */
+  pool: string;
+}
+
 export interface VmFormValues {
   name: string;
   sockets: number;
@@ -80,6 +90,8 @@ export interface VmFormValues {
   node: string;
   restart: Schemas["RestartPolicy"];
   snapshotSchedule: ScheduleRow;
+  /** 로컬 디스크 복제 대상(최대 3개) */
+  replication: ReplicationRow[];
   /** HA 정책이 있다(`ignored`가 아니면 펜싱이 켜진 노드에서만 돈다). */
   ha: boolean;
   /** HA 정책의 값. HA를 꺼도 남겨 두어 다시 켤 때 쓴다. */
@@ -146,6 +158,7 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     node: "",
     restart: "never",
     snapshotSchedule: { every: "off", keep: "7", memory: false },
+    replication: [],
     ...haFields(null),
     pinned: false,
     start: true,
@@ -187,6 +200,12 @@ export function fromVm(vm: Vm): VmFormValues {
           memory: s.snapshot_schedule.memory ?? false,
         }
       : { every: "off", keep: "7", memory: false },
+    // 틀린 주기(서버가 받지 않는 모양)는 그대로 두어 검증이 알린다.
+    replication: (s.replication ?? []).map((r) => ({
+      node: r.node,
+      minutes: r.schedule.replace(/^\*\//, ""),
+      pool: r.pool ?? "",
+    })),
     ...haFields(haPolicy(s)),
     pinned: s.placement?.pinned ?? false,
     start: false,
@@ -318,6 +337,7 @@ export function validate(
   if (schedule.every !== "off" && !intIn(schedule.keep, 1, MAX_SCHEDULE_KEEP)) {
     errors["schedule.keep"] = "vmForm.errors.keep";
   }
+  Object.assign(errors, replicationErrors(v));
   if (v.ha) {
     for (const [field, value] of [
       ["maxRestart", v.maxRestart],
@@ -338,6 +358,37 @@ export function validate(
       errors.guestWatchSecs = "vmForm.errors.guestWatch";
     }
   }
+  return errors;
+}
+
+/**
+ * 복제 대상의 오류: 서버의 `VmSpec::validate`와 같은 규칙(대상 수, 노드 겹침, 주기, VM 자신의 노드)과 스냅샷 예약과
+ * 함께 쓰지 않는 규칙(서버의 409 `replication_unsupported`). 노드를 고르지 않은 줄도 알린다.
+ */
+function replicationErrors(v: VmFormValues): Record<string, string> {
+  const errors: Record<string, string> = {};
+  if (v.replication.length === 0) {
+    return errors;
+  }
+  if (v.replication.length > MAX_REPLICATION_TARGETS) {
+    errors.replication = "vmForm.errors.replicationTargets";
+  } else if (v.snapshotSchedule.every !== "off") {
+    errors.replication = "vmForm.errors.replicationSnapshots";
+  }
+  const seen = new Set<string>();
+  v.replication.forEach((r, i) => {
+    if (r.node === "") {
+      errors[`replication.${i}.node`] = "vmForm.errors.replicationNode";
+    } else if (seen.has(r.node)) {
+      errors[`replication.${i}.node`] = "vmForm.errors.replicationDuplicate";
+    } else if (r.node === v.node) {
+      errors[`replication.${i}.node`] = "vmForm.errors.replicationOwnNode";
+    }
+    seen.add(r.node);
+    if (!/^\d+$/.test(r.minutes) || !intIn(r.minutes, 1, MAX_REPLICATION_MINUTES)) {
+      errors[`replication.${i}.minutes`] = "vmForm.errors.replicationMinutes";
+    }
+  });
   return errors;
 }
 
@@ -405,6 +456,14 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
             keep: Number(v.snapshotSchedule.keep),
             memory: v.snapshotSchedule.memory,
           },
+    // 복제가 없으면 보내지 않는다(옛 클러스터는 이 필드를 모른다).
+    ...(v.replication.length > 0 && {
+      replication: v.replication.map((r) => ({
+        node: r.node,
+        schedule: `*/${Number(r.minutes)}`,
+        ...(r.pool !== "" && { pool: r.pool }),
+      })),
+    }),
     ha: haSetting(
       v.ha
         ? {

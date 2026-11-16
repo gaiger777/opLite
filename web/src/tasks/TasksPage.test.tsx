@@ -242,3 +242,27 @@ it("shows the progress of running tasks", async () => {
   expect(rows[1]).toHaveTextContent("Migrating memory");
   expect(rows[2]).toHaveTextContent("Copying disks 25% (1.0/4.0 GiB)");
 });
+
+it("names the target node of a replication and shows its progress", async () => {
+  mockLists({
+    vm: [{ id: VM, name: "web" }],
+    node: [
+      { id: "n1", name: "node-a" },
+      { id: "n2", name: "node-b" },
+    ],
+    task: [
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000001",
+        spec: { op: { kind: "vm-replicate", node: "n2" }, target: VM, node: "n1" },
+        status: {
+          state: "running",
+          error: null,
+          progress: { stage: "replicating", done_bytes: 1024 ** 3, total_bytes: 8 * 1024 ** 3 },
+        },
+      },
+    ],
+  });
+  renderPage(<TasksPage />);
+  expect(await screen.findByText("Replicate web to node-b")).toBeInTheDocument();
+  expect(screen.getAllByRole("row")[1]).toHaveTextContent("Replicating 12% (1.0/8.0 GiB)");
+});

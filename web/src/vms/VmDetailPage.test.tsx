@@ -2,7 +2,17 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
-import { hardware, NODE, snapshot, task, vm } from "@/test/fixtures";
+import {
+  hardware,
+  NODE,
+  pool,
+  replica,
+  replicatedVm,
+  snapshot,
+  task,
+  vm,
+  volume,
+} from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -467,4 +477,213 @@ it("says when a running VM was started without hotplug", async () => {
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
   expect(await screen.findByText("Not available (started without it)")).toBeInTheDocument();
   expect(screen.queryByText("Restart needed")).not.toBeInTheDocument();
+});
+
+const NODE_B = { ...NODE, id: "n2", name: "node-b" };
+const NODE_C = { ...NODE, id: "n3", name: "node-c" };
+/** 복제본의 시점(`replica`의 `synced_at`)에서 252초 뒤 */
+const AFTER_SYNC = (1_800_000_000 + 252) * 1000;
+
+describe("replication card", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("shows each target's state, age, size, next run and error", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(AFTER_SYNC);
+    const web = replicatedVm("running");
+    const spec = {
+      ...web.spec,
+      replication: [
+        { node: "n2", schedule: "*/15" },
+        { node: "n3", schedule: "*/5", pool: "b" },
+      ],
+    };
+    const status = {
+      ...web.status,
+      replication: [
+        replica("n2"),
+        replica("n3", {
+          state: "syncing" as const,
+          generation: undefined,
+          synced_at: undefined,
+          volumes: [],
+          last_try: undefined,
+          error: 'node "node-c" is offline',
+        }),
+      ],
+    };
+    mockLists({ vm: [{ ...web, spec, status }], node: [NODE, NODE_B, NODE_C] });
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    const list = await screen.findByRole("list", { name: "Replication" });
+    const [b, c] = within(list).getAllByRole("listitem");
+    expect(await within(b!).findByText("node-b")).toBeInTheDocument();
+    expect(within(b!).getByText("Ready")).toBeInTheDocument();
+    expect(within(b!).getByText("every 15 min")).toBeInTheDocument();
+    expect(within(b!).getByText(/^Copy taken at .* \(4m12s ago\)$/)).toBeInTheDocument();
+    expect(
+      within(b!).getByText("Last run: changes only, sent 12 MiB in 4 s · disks 16 GiB"),
+    ).toBeInTheDocument();
+    expect(within(b!).getByText(/^Next run at /)).toBeInTheDocument();
+    expect(within(c!).getByText("Copying")).toBeInTheDocument();
+    expect(within(c!).getByText("every 5 min · pool b")).toBeInTheDocument();
+    expect(within(c!).getByText("No complete copy yet.")).toBeInTheDocument();
+    expect(within(c!).getByText('Last run failed: node "node-c" is offline')).toBeInTheDocument();
+    // 아직 시도가 없으면 곧 한다.
+    expect(within(c!).getByText("Next run soon")).toBeInTheDocument();
+  });
+
+  it("replicates now to the chosen target and follows the task", async () => {
+    const web = replicatedVm("running");
+    mockLists({ vm: [web], node: [NODE, NODE_B] });
+    const bodies: unknown[] = [];
+    server.use(
+      http.post(apiUrl(`/vms/${web.id}/replicate`), async ({ request }) => {
+        bodies.push(await request.json());
+        return HttpResponse.json(task("t-repl", "vm-replicate", web.id), { status: 202 });
+      }),
+    );
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    await userEvent.click(await screen.findByRole("button", { name: "Replicate now to node-b" }));
+    expect(await screen.findByText("Replicate web to node-b")).toBeInTheDocument();
+    expect(bodies).toEqual([{ node: "n2" }]);
+  });
+
+  it("shows the server's reason when replicating now fails", async () => {
+    const web = replicatedVm("running");
+    mockLists({ vm: [web], node: [NODE, NODE_B] });
+    server.use(
+      http.post(apiUrl(`/vms/${web.id}/replicate`), () =>
+        HttpResponse.json(
+          { code: "vm_busy", message: 'VM "web" is already being replicated to node "node-b"' },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    await userEvent.click(await screen.findByRole("button", { name: "Replicate now to node-b" }));
+    expect(
+      await screen.findByText(/VM "web" is already being replicated to node "node-b"/),
+    ).toBeInTheDocument();
+  });
+
+  it("does not replicate a stopped VM and says why", async () => {
+    mockLists({ vm: [replicatedVm("stopped")], node: [NODE, NODE_B] });
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    const button = await screen.findByRole("button", { name: "Replicate now to node-b" });
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(button).toHaveAccessibleDescription("Only a running VM is replicated.");
+    expect(screen.queryByText(/^Next run/)).not.toBeInTheDocument();
+  });
+
+  it("hides replicating now from viewers", async () => {
+    mockLists({ vm: [replicatedVm("running")], node: [NODE, NODE_B] });
+    renderPage(<VmDetailPage />, {
+      path: "/vms/:name",
+      url: "/vms/web",
+      as: { ...ADMIN, role: "viewer" },
+    });
+    expect(await screen.findByRole("list", { name: "Replication" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Replicate now/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps showing the HA recovery from a replica after the VM is up", async () => {
+    const web = replicatedVm("running");
+    const recovered = {
+      ...web,
+      spec: { ...web.spec, node: "n2", replication: [{ node: "n1", schedule: "*/15" }] },
+      status: {
+        ...web.status,
+        node: "n2",
+        last_error: null,
+        last_recovery: { from: "n1", node: "n2", synced_at: 1_800_000_000, at: 1_800_000_300 },
+        replication: [replica("n1")],
+      },
+    };
+    mockLists({ vm: [recovered], node: [NODE, NODE_B] });
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    expect(
+      await screen.findByText(
+        /^Last recovery at .*: node-a failed; restarted on node-b from the replica taken at .* \(writes after that were lost\)\.$/,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says when HA cannot use a ready replica because a disk changed", async () => {
+    const web = replicatedVm("running");
+    const added = {
+      ...web,
+      spec: {
+        ...web.spec,
+        disks: [...web.spec.disks!, { volume: "web-data", bus: "virtio-blk" as const }],
+      },
+    };
+    mockLists({
+      vm: [added],
+      node: [NODE, NODE_B],
+      volume: [volume("web-root", "local"), volume("web-data", "local")],
+      "storage-pool": [pool("local")],
+    });
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    expect(
+      await screen.findByText(
+        "HA cannot use this replica: disk web-data changed after the last run (it can after the next run).",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the HA recovery from a replica and the old source", async () => {
+    const web = replicatedVm("running");
+    const recovered = {
+      ...web,
+      spec: { ...web.spec, node: "n2", replication: [{ node: "n1", schedule: "*/15" }] },
+      status: {
+        ...web.status,
+        node: "n2",
+        last_error:
+          "recovering: node n1 failed; restarting from the replica on node n2 taken at 2027-01-15 08:00:00 UTC (writes after that are lost)",
+        replication: [
+          replica("n1", { state: "stale" as const, generation: undefined, volumes: [] }),
+        ],
+      },
+    };
+    mockLists({ vm: [recovered], node: [NODE, NODE_B] });
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    const list = await screen.findByRole("list", { name: "Replication" });
+    expect(within(list).getByText("Old source")).toBeInTheDocument();
+    // 요약의 마지막 오류와 복제 카드에 모두 보인다.
+    expect(screen.getAllByText(/restarting from the replica on node n2/)).toHaveLength(2);
+  });
+
+  it("warns about an HA VM whose local disk has no replica", async () => {
+    const web = replicatedVm("running");
+    const ha = {
+      ...web,
+      spec: { ...web.spec, ha: true, replication: [] },
+      status: { ...web.status, replication: [] },
+    };
+    mockLists({
+      vm: [ha],
+      node: [NODE],
+      volume: [volume("web-root", "local")],
+      "storage-pool": [pool("local")],
+    });
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    expect(
+      await screen.findByText(
+        "This VM cannot be restarted on another node: disk web-root is on node-local pool local and has no replica. Add replication.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Replication" })).not.toBeInTheDocument();
+  });
+
+  it("shows nothing for a VM without replication or warning", async () => {
+    mockLists({
+      vm: [vm("web", "running")],
+      node: [NODE],
+      volume: [],
+      "storage-pool": [],
+    });
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    expect(await screen.findByRole("heading", { name: "web" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Replication" })).not.toBeInTheDocument();
+  });
 });

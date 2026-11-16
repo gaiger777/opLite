@@ -51,6 +51,9 @@ export type PendingChange = Schemas["PendingChange"];
 export type PendingReason = Schemas["PendingReason"];
 export type NodeHotplug = Schemas["NodeHotplug"];
 export type NicSpec = Schemas["NicSpec"];
+export type ReplicationTarget = Schemas["ReplicationTarget"];
+export type ReplicaStatus = Schemas["ReplicaStatus"];
+export type ReplicationState = Schemas["ReplicationState"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =

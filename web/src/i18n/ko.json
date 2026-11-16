@@ -82,7 +82,8 @@
     "recommendation_stale": "추천이 지금 클러스터와 맞지 않습니다: {{message}}",
     "placement_busy": "마이그레이션 둘이 이미 진행 중입니다. 하나가 끝난 뒤 적용하세요.",
     "placement_unavailable": "클러스터 리더에서 배치 상태를 읽지 못했습니다. 잠시 뒤 다시 시도하세요.",
-    "hotplug_unavailable": "VM이 실행 중이라 하드웨어를 바꿀 수 없습니다: {{message}}"
+    "hotplug_unavailable": "VM이 실행 중이라 하드웨어를 바꿀 수 없습니다: {{message}}",
+    "replication_unsupported": "복제를 켤 수 없습니다: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -189,11 +190,13 @@
       "node-power-off": "{{target}} 전원 끄기(펜싱)",
       "ha-check": "{{target}}의 HA 검사 {{check}}: {{action}}",
       "bond-degraded": "{{target}}의 본딩 {{bond}} 포트 이상",
-      "vm-hotplug": "{{target}} 하드웨어 바꾸기"
+      "vm-hotplug": "{{target}} 하드웨어 바꾸기",
+      "vm-replicate": "{{target}}을(를) {{node}}에 복제"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
-      "migratingMemory": "메모리 옮기는 중"
+      "migratingMemory": "메모리 옮기는 중",
+      "replicating": "복제 {{percent}}% ({{done}}/{{total}} GiB)"
     },
     "detail": {
       "vms": "VM: {{vms}}."
@@ -356,7 +359,31 @@
       "firmware": "펌웨어",
       "machine": "머신 타입"
     },
-    "applyAgain": "다시 적용"
+    "applyAgain": "다시 적용",
+    "replication": {
+      "title": "복제",
+      "noReplica": "이 VM은 다른 노드에서 다시 켤 수 없습니다 — 디스크 {{volume}}이(가) 노드 로컬 풀 {{pool}}에 있고 복제본이 없습니다. 복제를 더하세요.",
+      "state": {
+        "ready": "준비됨",
+        "syncing": "복사 중",
+        "pending": "대기",
+        "stale": "옛 원본"
+      },
+      "every": "{{minutes}}분마다",
+      "pool": "풀 {{pool}}",
+      "now": "지금 복제",
+      "nowFor": "{{node}}에 지금 복제",
+      "notRunning": "실행 중인 VM만 복제합니다.",
+      "synced": "{{time}} 시점의 복사본({{age}} 전)",
+      "neverSynced": "아직 끝난 복사본이 없습니다.",
+      "lastFull": "마지막 회차: 전체 복사, {{sent}}를 {{secs}}초에 보냄 · 디스크 {{size}}",
+      "lastIncremental": "마지막 회차: 바뀐 것만, {{sent}}를 {{secs}}초에 보냄 · 디스크 {{size}}",
+      "next": "다음 회차 {{time}}",
+      "nextSoon": "곧 다음 회차",
+      "error": "마지막 회차 실패: {{error}}",
+      "unusable": "HA가 이 복제본을 쓸 수 없습니다: 마지막 회차 뒤 디스크 {{volume}}이(가) 바뀌었습니다(다음 회차가 끝나면 씁니다).",
+      "lastRecovery": "마지막 복구 {{time}}: {{from}}이(가) 죽어 {{node}}에서 {{synced}} 시점의 복제본으로 켰습니다(그 뒤의 쓰기는 잃었습니다)."
+    }
   },
   "snapshots": {
     "created": "만든 시각",
@@ -412,7 +439,8 @@
     "mixed": "디스크가 모두 qcow2이거나, 모두 LVM-thin 풀에 있거나, 모두 ZFS 풀에 있거나, 모두 Ceph RBD 풀에 있는 VM만 스냅샷을 만들 수 있습니다. 이 VM에는 여러 방식이 섞여 있습니다.",
     "blockHint": "LVM-thin·ZFS·Ceph RBD 풀의 디스크는 메모리 없이 저장합니다. 실행 중인 VM은 저장하는 동안 잠깐 멈춥니다.",
     "zfsLatest": "ZFS 풀의 디스크는 가장 최근 스냅샷으로만 되돌릴 수 있습니다.",
-    "sharedLvm": "공유 LVM 풀의 디스크는 스냅샷을 만들 수 없습니다. {{volume}}이(가) 공유 LVM 풀에 있습니다."
+    "sharedLvm": "공유 LVM 풀의 디스크는 스냅샷을 만들 수 없습니다. {{volume}}이(가) 공유 LVM 풀에 있습니다.",
+    "replicated": "이 VM은 다른 노드로 복제합니다. 복제본은 스냅샷을 담지 않으므로 먼저 복제를 빼세요."
   },
   "clone": {
     "title": "{{name}} 복제",
@@ -714,7 +742,8 @@
     "noSamePool": "{{node}}에는 쓸 수 있는 {{pool}} 풀이 없습니다. 대상 풀을 고르세요.",
     "snapshots": "스냅샷이 있는 VM은 노드 로컬 풀의 디스크를 복사해 옮길 수 없습니다. 먼저 VM의 스냅샷을 지우세요.",
     "force": "배치 규칙 무시",
-    "forceHint": "반드시 배치 규칙이나 그룹 노드만 쓰는 HA 그룹을 어겨도 옮깁니다. 노드 조건과 메모리는 그대로 봅니다. 어긴 규칙은 감사 로그에 남습니다."
+    "forceHint": "반드시 배치 규칙이나 그룹 노드만 쓰는 HA 그룹을 어겨도 옮깁니다. 노드 조건과 메모리는 그대로 봅니다. 어긴 규칙은 감사 로그에 남습니다.",
+    "replicaNote": "이 노드에는 복제본이 있어 마지막 복제 뒤 바뀐 것만 복사합니다."
   },
   "forms": {
     "name": "소문자·숫자·-로 1–63자, -로 시작하거나 끝날 수 없습니다."
@@ -1176,7 +1205,9 @@
     },
     "hotplug": "핫플러그: vCPU {{cpu}}, 메모리 {{memory}}",
     "yes": "예",
-    "no": "아니오"
+    "no": "아니오",
+    "replicas": "복제본",
+    "replicasOpen": "{{name}}이(가) 복제본을 둔 VM {{count}}개 보기"
   },
   "accounts": {
     "currentPassword": "현재 비밀번호",
@@ -1462,7 +1493,13 @@
       "maxVcpusHigh": "256 이하여야 합니다.",
       "maxMemoryLow": "메모리 이상이어야 합니다.",
       "maxMemoryHigh": "524288 MiB(512 GiB) 이하여야 합니다.",
-      "memoryAlign": "최대값이 있으면 메모리와 최대 메모리가 128 MiB의 배수여야 합니다."
+      "memoryAlign": "최대값이 있으면 메모리와 최대 메모리가 128 MiB의 배수여야 합니다.",
+      "replicationTargets": "복제 대상은 3개까지입니다.",
+      "replicationSnapshots": "복제는 예약 스냅샷과 함께 쓸 수 없습니다. 예약 스냅샷을 끄세요.",
+      "replicationNode": "노드를 고르세요.",
+      "replicationDuplicate": "이미 대상인 노드입니다.",
+      "replicationOwnNode": "VM 자신의 노드에는 복제본을 둘 수 없습니다.",
+      "replicationMinutes": "1~1440 사이의 분을 정수로 쓰세요."
     },
     "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}",
     "schedule": "예약 스냅샷",
@@ -1508,7 +1545,16 @@
     "runningNoteLive": "VM이 실행 중이라 노드는 바꿀 수 없습니다. 하드웨어 변경은 되는 것은 실행 중에 적용하고, 나머지는 VM 화면에 보이며 다음 재시작 때 적용됩니다.",
     "restartForHotplug": "핫플러그 없이 켠 VM입니다. 실행 중에 디스크·인터페이스를 붙이고 떼려면 한 번 다시 켜야 합니다.",
     "disksLive": "실행 중에는 볼륨을 끝에 붙이고(virtio-blk만, 장치 8개까지) 실행 중 붙인 디스크를 끝에서부터 뗄 수 있습니다. 켤 때 단 디스크는 바꿀 수 없습니다.",
-    "nicsLive": "실행 중에는 인터페이스를 끝에 붙이고(장치 8개까지) 실행 중 붙인 인터페이스를 끝에서부터 뗄 수 있습니다. 도는 인터페이스의 네트워크·모델·MAC은 바꿀 수 없고 보안 그룹은 바꿀 수 있습니다."
+    "nicsLive": "실행 중에는 인터페이스를 끝에 붙이고(장치 8개까지) 실행 중 붙인 인터페이스를 끝에서부터 뗄 수 있습니다. 도는 인터페이스의 네트워크·모델·MAC은 바꿀 수 없고 보안 그룹은 바꿀 수 있습니다.",
+    "replication": "복제",
+    "replicationNote": "로컬 디스크만 복제합니다 · 스냅샷과 함께 쓸 수 없습니다. 주기마다 디스크를 대상 노드에 복사하고, VM의 노드가 죽으면 HA가 그 노드에서 마지막 복사본으로 켭니다.",
+    "replicationN": "복제 대상 {{n}}",
+    "replicationChoose": "노드 고르기",
+    "replicationMinutes": "주기(분)",
+    "replicationPool": "대상 풀",
+    "removeReplication": "복제 대상 {{n}} 빼기",
+    "addReplication": "복제 대상 더하기",
+    "haNoReplica": "이 VM은 다른 노드에서 다시 켤 수 없습니다 — 디스크 {{volume}}이(가) 노드 로컬 풀 {{pool}}에 있고 복제본이 없습니다. 복제를 더하세요."
   },
   "console": {
     "connecting": "연결 중…",

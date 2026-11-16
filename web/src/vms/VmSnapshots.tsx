@@ -78,6 +78,9 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
     : undefined;
   const block = support?.kind === "ok" && support.block;
   const columns = operate ? 5 : 4;
+  // 복제하는 VM은 스냅샷을 만들 수 없다(복제본은 스냅샷을 담지 않는다 — 서버의 409 `snapshot_unsupported`).
+  const replicated = (vm.spec.replication ?? []).length > 0;
+  const createReasons = `${reasonBase}-create`;
   const schedule = vm.spec.snapshot_schedule;
 
   function ask(e: React.MouseEvent<HTMLElement>, action: "revert" | "delete", snapshot: Snapshot) {
@@ -93,7 +96,19 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
           {t("vms.tab.snapshots")}
         </h2>
         {operate &&
-          (support?.kind === "pool" ? (
+          (replicated ? (
+            <div className="flex flex-col items-end gap-1">
+              <ReasonButton size="sm" reason="snapshots.replicated" reasons={createReasons}>
+                <Camera />
+                {t("snapshots.create")}
+              </ReasonButton>
+              <ReasonList
+                base={createReasons}
+                reasons={["snapshots.replicated"]}
+                className="max-w-sm text-right"
+              />
+            </div>
+          ) : support?.kind === "pool" ? (
             <p className="text-sm text-muted-foreground">
               {t("snapshots.sharedLvm", { volume: support.disk.volume })}
             </p>

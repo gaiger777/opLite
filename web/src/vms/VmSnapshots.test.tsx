@@ -5,7 +5,7 @@ import { http, HttpResponse } from "msw";
 import type { Vm } from "@/api/types";
 import { formatTime } from "@/lib/format";
 import { resetTasks } from "@/tasks/tasks";
-import { hardware, NODE, pool, snapshot, task, vm, volume } from "@/test/fixtures";
+import { hardware, NODE, pool, replicatedVm, snapshot, task, vm, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -320,6 +320,24 @@ it("says why a VM with disks in shared LVM pools cannot take snapshots", async (
   // 예약 요약은 메모리를 말하지 않는다.
   expect(screen.getByText("Snapshot schedule: Daily, keep 7")).toBeInTheDocument();
   expect(screen.queryByText(/with memory/)).not.toBeInTheDocument();
+});
+
+it("blocks taking snapshots of a replicated VM and says why", async () => {
+  const replicated = replicatedVm("running");
+  mockLists({
+    vm: [replicated],
+    node: [NODE],
+    volume: [volume("web-root", "local")],
+    "storage-pool": [pool("local")],
+  });
+  open(replicated);
+  const button = await screen.findByRole("button", { name: "Take snapshot" });
+  expect(button).toHaveAttribute("aria-disabled", "true");
+  expect(button).toHaveAccessibleDescription(
+    "This VM is replicated to other nodes. Replicas do not keep snapshots; remove the replication first.",
+  );
+  await userEvent.click(button);
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
 it("says why a VM with disks in ZFS pools cannot revert to older snapshots", async () => {
