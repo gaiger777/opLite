@@ -91,8 +91,17 @@ export function describeTask(
   const check = op.kind === "ha-check" ? op.check : undefined;
   const action = op.kind === "ha-check" ? t(`haChecks.actions.${op.action}`) : undefined;
   const bond = op.kind === "bond-degraded" ? op.bond : undefined;
-  // 복제의 대상 노드
-  const node = op.kind === "vm-replicate" ? (nodeName(op.node) ?? op.node) : undefined;
+  // 복제의 대상 노드, Ceph Task는 실행 노드(대상은 Ceph 리소스 하나뿐이다)
+  const node =
+    op.kind === "vm-replicate"
+      ? (nodeName(op.node) ?? op.node)
+      : op.kind.startsWith("ceph-")
+        ? (nodeName(task.spec.node) ?? task.spec.node)
+        : undefined;
+  const device = op.kind === "ceph-osd-add" ? op.device : undefined;
+  const pool = op.kind === "ceph-pool-create" ? op.pool : undefined;
+  const name = op.kind === "ceph-pool-create" ? op.name : undefined;
+  const size = op.kind === "ceph-pool-create" ? op.size : undefined;
   // 모르는 작업(새 서버)은 번역 키 대신 종류를 그대로 보여 준다.
   return t(`tasks.op.${op.kind}`, {
     target,
@@ -102,6 +111,10 @@ export function describeTask(
     action,
     bond,
     node,
+    device,
+    pool,
+    name,
+    size,
     defaultValue: `${op.kind} ${target}`,
   });
 }
@@ -131,7 +144,8 @@ function gib(bytes: number): string {
 
 /**
  * 실행 중인 Task의 진행률 문구(로컬 디스크를 복사하는 마이그레이션과 복제): "디스크 복사 37% (14.8/40.0 GiB)",
- * "메모리 옮기는 중", "복제 12% (0.1/1.0 GiB)". 진행률이 없거나 모르는 단계면 null이다.
+ * "메모리 옮기는 중", "복제 12% (0.1/1.0 GiB)", Ceph Task의 단계("패키지 설치 중", 모르는 단계는 그 이름). 진행률이
+ * 없거나 모르는 단계면 null이다.
  */
 export function describeProgress(task: Task, t: TFunction): string | null {
   const progress = task.status.progress;
@@ -147,6 +161,10 @@ export function describeProgress(task: Task, t: TFunction): string | null {
   }
   if (progress?.stage === "migrating-memory") {
     return t("tasks.progress.migratingMemory");
+  }
+  // Ceph Task는 단계 이름만 알린다(바이트 0/0).
+  if (progress && task.spec.op.kind.startsWith("ceph-")) {
+    return t(`tasks.cephStage.${progress.stage}`, { defaultValue: progress.stage });
   }
   return null;
 }

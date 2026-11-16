@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료, 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험(계획 47) 완료, 관찰 노드(계획 48) 완료, 클러스터 통신 다중 링크(계획 49) 완료, 배치 규칙과 HA 정책(계획 50) 완료, 빠른 HA와 노드 전원 끄기(계획 51) 완료, HA 상태 검사(계획 52) 완료, 최적 배치(계획 53) 완료, VM 무중단 유형 변경(계획 54) 완료, 로컬 디스크 HA(계획 55) 완료
+- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료, 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험(계획 47) 완료, 관찰 노드(계획 48) 완료, 클러스터 통신 다중 링크(계획 49) 완료, 배치 규칙과 HA 정책(계획 50) 완료, 빠른 HA와 노드 전원 끄기(계획 51) 완료, HA 상태 검사(계획 52) 완료, 최적 배치(계획 53) 완료, VM 무중단 유형 변경(계획 54) 완료, 로컬 디스크 HA(계획 55) 완료, Ceph 자동 구성(계획 56) 완료
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -687,6 +687,7 @@ orbivisord가 노드마다 마운트한 것이다. 어느 쪽이든 볼륨은 �
 **LVM-thin 풀**(`--lvm-thin`)과 **ZFS 풀**(`--zfs`)은 [아래](#lvm-thin-풀)에, 볼륨이 Ceph RBD 이미지인
 **Ceph RBD 풀**(`--rbd`)은 [그 뒤](#ceph-rbd-풀)에, 볼륨이 공유 LUN 위의 LV인 **공유 LVM 풀**(`--lvm-shared`)은
 [마지막](#공유-lvmiscsi-풀)에 있다.
+Ceph 클러스터부터 Orbivisor가 노드에 세우는 길은 [Ceph 자동 구성](#ceph-자동-구성)이다.
 
 ```bash
 sudo apt install nfs-common                          # 노드마다 NFS 클라이언트(mount.nfs)
@@ -896,12 +897,124 @@ orbivisorctl pool get z                              # 노드별 준비·데이�
 - **데이터셋이 가득 차면** 게스트의 쓰기가 실패한다(sparse zvol은 미리 자리를 잡지 않는다). 노드별 남은 공간을
   보고 관리자가 zpool을 늘린다.
 
+## Ceph 자동 구성
+
+Orbivisor가 클러스터 노드에 **Ceph를 설치하고 구성한다**: 노드에 Ceph 꾸러미를 apt로 깔고 모니터(mon)·매니저(mgr)를 세우고,
+노드의 디스크 통째에 OSD(ceph-volume LVM 위의 BlueStore)를 만들고, Ceph 풀을 만들어 [Ceph RBD 풀](#ceph-rbd-풀)로 등록한다
+(Proxmox VE의 `pveceph`와 같은 자리). Orbivisor 클러스터 하나에 Orbivisor가 관리하는 Ceph 클러스터 하나다. **이미 있는 바깥
+Ceph는 넘겨받지 않는다** — 바깥 Ceph는 지금처럼 `pool create … --rbd`로 쓴다(아래 "파일 위치"의 거절 참고).
+
+```bash
+orbivisorctl ceph init node1 --public-network 10.0.0.0/24   # 노드 1에 꾸러미 설치, 첫 mon·mgr (기다림, --no-wait)
+# ceph: installing-packages on node1 … ceph: cluster 5f0c… ready (monitor and manager on node1)
+orbivisorctl ceph mon add node2 && orbivisorctl ceph mon add node3   # mon은 셋(또는 다섯) 권장, 한 번에 하나, 1개에서 바로 3개로
+orbivisorctl ceph mgr add node2                              # standby 매니저
+orbivisorctl node disks node2                                # DEVICE BY-ID SIZE TYPE MODEL STATE
+# /dev/sdb  wwn-0x5000c500a1b2c3d4  2.0TiB  hdd  ST2000  available
+# /dev/sdc  -                        2.0TiB  hdd  -       wipeable: gpt partition table, ext4 filesystem on /dev/sdc1
+# /dev/sda  -                        120GiB  ssd  -       in use: system disk (/ is on it)
+orbivisorctl ceph osd add node2 /dev/sdb                     # ceph: osd.0 on node2 /dev/sdb is up
+orbivisorctl ceph osd add node3 /dev/sdc --wipe              # 터미널이면 장치 이름을 다시 쳐서 확인(--yes면 묻지 않음)
+orbivisorctl ceph pool create vms                            # size 기본 min(3, OSD가 up인 호스트 수)
+# ceph: storage pool vms (Ceph pool vms, size 3) is ready
+orbivisorctl ceph client install --all                       # 데몬이 없는 노드에 ceph-common·qemu-block-extra(선택)
+orbivisorctl ceph status                                     # health·검사·mon 정족수·mgr·OSD·PG·사용량·풀(-o json)
+orbivisorctl ceph osd list                                   # ID HOST DEVICE CLASS SIZE USED UP IN
+```
+
+웹은 메뉴 **Ceph**(풀 아래)다. Ceph가 없으면 admin에게 마법사(① init 노드와 망 — 노드 주소로 미리 채움, 위트니스·오프라인 노드
+막음 ② 만들기 진행(단계 목록, 실패하면 이유와 "다시 하기") ③ mon 더하기 ④ OSD — 노드마다 디스크 표 ⑤ 풀 ⑥ 클라이언트
+꾸러미, ③~⑥은 건너뛸 수 있음)를, 있으면 상태(health 배지와 검사, mon 정족수, mgr, 호스트별 OSD, PG 상태 막대, 사용량, 풀 표와
+Orbivisor 풀 링크, admin의 더하기·만들기 단추)를 10초마다 새로 읽어 보인다. 풀 화면은 관리 Ceph의 RBD 풀에 "Orbivisor Ceph"
+표시를, 노드 화면은 "Ceph" 칸(mon·mgr·osd)과 메뉴 "디스크…"를 둔다.
+
+- **요구.** Linux 노드(위트니스 빼고), apt로 Ceph를 받을 수 있는 저장소: Ubuntu 24.04 = ceph 19.2(squid), Debian 13 = 18.2(reef).
+  18 미만은 거절("ceph 17.2.7 quincy is too old; Orbivisor sets up Ceph 18 (reef) or newer"). mon·mgr·OSD 노드는 **모두 같은 판**이어야
+  한다("node \"node2\" has ceph 18.2.7 reef but the cluster runs 19.2.3 squid; upgrade the packages first"). 노드 시계를 맞추고(NTP — mon
+  정족수가 시계 차이에 민감하고, 한 번에 하나인 Ceph Task의 자리도 노드 시계로 60초 유예를 잰다) 노드 사이에 **3300·6789·6800-7300/tcp**를 연다. OSD 디스크는 통째로 쓰고 5 GiB 이상이어야 한다.
+  모든 노드가 이 버전이어야 한다(노드가 알리는 기능 `ceph-setup` — 없으면 바꾸는 요청이 **409** `cluster_upgrading`).
+- **흐름.** `ceph init`(첫 mon·mgr) → mon 더하기(셋 권장, 다섯까지 — 여섯째는 **409** `ceph_limit`, 짝수면 CLI·웹이 "an odd
+  number of monitors (3 or 5) keeps quorum best"로 경고) → OSD → 풀 → (선택) 클라이언트 꾸러미. 일은 모두 그 노드의 Task(`ceph-init`·
+  `ceph-mon-add`·`ceph-mgr-add`·`ceph-osd-add`·`ceph-pool-create`·`ceph-client-install`)가 하고 진행률에 단계 이름(`installing-packages`,
+  `waiting-for-quorum`, `preparing-osd` …)을 적는다. mon·mgr Task는 클러스터 전체에서 한 번에 하나(**409** `ceph_busy` — Raft의 Ceph
+  리소스에 자리를 잡으므로 다른 노드의 API로 함께 보내도 하나만 지나간다), OSD는 노드마다 차례로(OSD Task는 새 OSD가 Ceph에서 up이 된
+  뒤에 끝난다). mon을 더하기 전에 Ceph의 monmap을 보고 Orbivisor가 모르는 mon(앞서 실패한 더하기가 남긴 것 등)이나 정족수 밖의 mon이
+  있으면 **409** `ceph_busy`로 거절하며 그 이름과 손으로 치우는 명령(`ceph mon remove NAME`)을 알린다. **둘째 mon이 위험하다**: mon
+  둘의 정족수는 둘 다 있어야 하므로 새 mon이 다른 mon에 닿지 못하면(포트 3300·6789가 막힘 등) Ceph 전체가 멈춘다 — 더하기 전에 포트를
+  확인하고 1개에서 바로 3개로 늘린다(상태 503 문구에도 이 힌트가 붙는다). 끝나지 않은 mon·mgr Task의 노드가 꺼져 있으면 `ceph_busy`가
+  "node X is offline; bring it back or remove it with `cluster remove-node`"를 덧붙인다 — 노드를 되살리거나 빼면(빠진 노드의 Task는
+  정리 작업이 실패로 끝낸다) 다음 Task를 보낼 수 있다. 꾸러미 설치(`[ceph] packages` —
+  기본 `ceph-mon ceph-mgr ceph-osd ceph-volume ceph-common lvm2 qemu-block-extra`, 클라이언트는 `client_packages`)는 빠진 것만
+  `apt-get install`(설치 하나 30분 한도)이다. apt가 한도를 넘기거나 Task가 끊겨 dpkg가 중간에 멈췄으면(다음 apt가 "dpkg was
+  interrupted"로 실패) 그 노드에서 `dpkg --configure -a`를 한다.
+- **디스크 안전.** 노드가 `lsblk`·`pvs`·`ceph-volume lvm list`로 디스크마다 정한다(API의 확인 뒤 Task가 노드에서 다시 본다).
+  **쓰는 중**(지우기로도 못 씀 — **409** `disk_in_use`): 읽기 전용·이동식, 5 GiB 미만, 자기나 파티션·LV에 마운트(`/`·`/boot`면
+  "system disk"), 스왑, ZFS 풀 멤버, 소프트웨어 RAID 멤버, Orbivisor LVM 풀의 VG, 이 Ceph의 OSD, 열린 LV가 있는 VG(돌고 있는 남의 OSD
+  등 — "in use by a running Ceph OSD or another device"). **지워야 함**(`--wipe`가 있어야 —
+  없으면 **409** `disk_not_empty`, 이유를 모두 적음): 파티션 표·파티션, 마운트되지 않은 파일 시스템, 풀이 아닌 VG의 PV, 다른 Ceph의
+  흔적. 다른 디스크에 걸친 VG는 `ceph-` VG여도 쓰는 중이다. `ceph-volume raw` 모드로 만든 남의 OSD(LVM 없음)는 열린 LV로 보이지
+  않아 "다른 Ceph의 흔적"(지워야 함)으로 보이므로 돌고 있는 OSD가 아닌지 확인한 뒤 지운다. 지우기(`ceph-volume lvm zap --destroy`)는 명시하고 확인해야 하며(CLI는 장치 이름을 다시 치거나 `--yes`, 웹은 장치 이름 입력),
+  루트·마운트·스왑·ZFS·RAID·풀 VG 디스크는 어떤 경우에도 지우지 않는다(CLI `--wipe`는 노드의 디스크 목록에 있는 디스크만 묻고, CLI·웹은
+  확인한 디스크를 by-id 경로로 보낸다). Task에는 `/dev/disk/by-id/…`가 있으면 그것을 적는다(재부팅으로
+  이름이 바뀌어도 같은 디스크). 루프 장치는 `[ceph] allow_loop_devices = true`(시험용)일 때만 보인다.
+- **풀 크기.** `--size`가 없으면 min(3, OSD가 up인 호스트 수)이다. 호스트가 하나면 **400** "only one host has OSDs; pass size 1 to
+  keep a single copy (no redundancy)"이라 `--size 1`을 적어야 하고(웹은 확인 상자), 호스트보다 큰 size는 **400**. size 2는 받되 "size 2
+  can lose data when one copy is down; 3 is recommended"로 경고한다. 호스트가 적은 클러스터가 HEALTH_WARN에 머물지 않게 `.mgr` 풀의
+  size를 호스트 수로 낮춘다(1로는 size 1을 적었을 때만). size 1은 `mon_allow_pool_size_one`을 **클러스터 전체**(`ceph config set
+  global`)에 켠다 — 그 뒤로는 손으로 만드는 다른 풀도 size 1로 둘 수 있다. 만든 Ceph 풀에는 rbd application의 표시
+  `orbivisor-pool = {Orbivisor 풀 이름}`을 단다. Ceph에 같은 이름의 풀이 이미 있으면, application이 없거나 그 표시가 같은 이름이면 앞 풀
+  Task가 만들다 멈춘 풀로 보고 이어서 하고(size 다시 맞춤·PG 기다림·`rbd pool init`·등록), 그 밖(cephfs·rgw 등, 표시 없는 rbd 풀, 다른
+  Orbivisor 풀의 것)은 쓰는 풀의 복제 수를 바꾸지 않도록 실패한다("…already exists for …; Orbivisor does not change it — choose another Ceph
+  pool name"). 어느 Orbivisor RBD 풀이든(바깥 conf여도) 이미 그 Ceph 풀 이름을 쓰면 **409** `pool_exists`다.
+- **비밀.** Ceph 키(mon·admin·bootstrap-osd·클라이언트)는 API가 만들어 **Raft에 둔다**(펜싱 BMC 비밀번호와 같다 — Raft 저장소와 그
+  백업에 키가 있다). API 응답·watch에는 나가지 않는다. 노드의 클라이언트 키 `client.orbivisor`는 `profile rbd`(mon·osd·mgr)뿐이고
+  admin 키는 mon·mgr 노드에만 둔다. Ceph 설정을 쓰는 것은 admin뿐이고 상태 읽기는 모든 역할이다.
+- **파일 위치.** 모든 비위트니스 노드에 클라이언트 설정 `/etc/opl/ceph/ceph.conf`와 `ceph.client.orbivisor.keyring`(0600,
+  `[ceph] client_dir`)을 쓰고 mon이 바뀌면 고친다. 등록하는 RBD 풀은 사용자 `orbivisor`, conf `/etc/opl/ceph/ceph.conf`라 **`/etc/ceph`를
+  쓰는 바깥 Ceph RBD 풀과 같은 노드에서 함께 쓸 수 있다.** 풀의 conf 경로는 풀 Task를 돈 노드의 `{client_dir}/ceph.conf`이고 모든 노드가
+  그 경로로 붙으므로 **`[ceph] client_dir`은 모든 노드에서 같아야 한다.** `/etc/ceph/ceph.conf`(첫 줄 `# managed by orbivisord; edits are
+  overwritten`)는 mon·mgr·OSD 노드에만, admin 키링은 mon·mgr 노드에만 쓴다(OSD만 있는 노드는 OSD가 up인지를 `client.orbivisor`로 본다).
+  표시 없는 `/etc/ceph/ceph.conf`가 이미 있거나 `/var/lib/ceph/{mon,mgr,osd}`에 다른 fsid의 데몬이, `/var/lib/ceph/{fsid}/`(cephadm)가
+  있으면 그 노드의 Ceph Task는 아무것도 바꾸기 전에 실패한다("…not written by Orbivisor (another Ceph cluster?);
+  Orbivisor does not adopt an existing Ceph — use it as an rbd storage pool instead, or move the file away").
+- **상태 보기.** `ceph status`·웹·`GET /api/v1/ceph/status`는 Raft가 아니라 mon 노드에서 그때그때 읽는다(이 노드가 mon이면 직접,
+  아니면 온라인 mon 노드에 함께 노드 사이 RPC로 물어 먼저 온 답, `[ceph] status_cache_secs` 5초 캐시 — 읽지 못한 것도 그동안 두어 닿지
+  않는 mon을 요청마다 기다리지 않음, `?refresh=true`). 읽지 못하면 마지막 보고서를 `stale`과
+  오류로 보이고(CLI "warning: Ceph status from 40s ago: …", 웹 경고 띠), 그것도 없으면 **503** `ceph_unreachable`이다. Raft의 Ceph
+  리소스(`GET /api/v1/ceph`)는 fsid·망·mon·mgr·OSD 노드·판·부트스트랩 오류만 담는다.
+- **HA 검사와의 관계.** 관리 RBD 풀의 [HA 상태 검사](#ha-상태-검사) 풀 경로 검사는 다른 RBD 풀처럼 `client.orbivisor`·관리 conf로
+  `rados stat`을 한다. Ceph 전체가 멈추면 모든 노드의 검사가 함께 실패하고 과반 보호가 VM을 옮기지 않는다. 상태 화면은 HA 검사를
+  대신하지 않는다.
+- **실패 뒤 다시 하기.** 단계마다 지금 상태를 보고 건너뛰므로(설치됨·설정 같음·mon 저장소 있음·유닛 active·정족수에 듦) 같은 명령을
+  다시 부르면 이어서 한다. 부트스트랩이 실패하면 `ceph status`·웹이 마지막 오류를 보이고, **같은 노드로** `ceph init`을 다시 부른다(다른
+  노드는 **409** `ceph_exists` "Ceph is being set up on node \"node1\"; retry there"). 부트스트랩 노드가 지워졌거나 꺼져 있고 아직 mon이
+  서지 않았으면 다른 노드로 `ceph init`을 부르면 그 노드로 옮겨(같은 fsid·키) 다시 한다(웹 상태 화면의 "다시 하기"도 그때 온라인 노드를
+  고르게 한다). 옛 노드의 끝나지 않은 Ceph Task는 실패로 끝나고, 이미 돌던 부트스트랩 Task는 옮겨 간 것을 보고 mon을 만들기 전에(또는
+  Raft에 쓰기 전에) 멈춘다. 옛 노드가 돌아오면 그 노드의 `ceph-mon@…`을 멈추고 `/var/lib/ceph/mon/ceph-…`와 `/etc/ceph/ceph.conf`를 치운다
+  — 그 노드에 나중에 mon을 더하면 남은 부트스트랩 저장소를 쓰지 않고 "…abandoned Ceph bootstrap…; systemctl disable --now ceph-mon@X; mv
+  …"로 실패한다. 첫 mon이 선 뒤 아직 준비(`ready`)되기 전에 부트스트랩 노드를 영영 잃었으면 그 노드를 `cluster remove-node`로 빼서(Raft의
+  mon 기록이 빈다) 다른 노드로 `ceph init`을 다시 부른다. **준비된 클러스터의 mon 노드를 모두 잃으면 Orbivisor는 다시 세우지 않는다**
+  (**409** `ceph_exists` — mon을 손으로 되살리거나 Raft의 Ceph 기록을 손으로 지워야 한다). `lvm create`가 도중에 멈춰 켤 수 없는 OSD는
+  오류가 손으로 치우는 명령(`ceph osd purge N --yes-i-really-mean-it; ceph-volume lvm zap --destroy DEV`)을 알린다. orbivisord가 다시 시작해 끊긴 Task도 다시
+  부르면 이어진다.
+- **노드 빼기.** mon·mgr·OSD가 있던 노드를 `cluster remove-node`(웹 "클러스터에서 빼기")로 빼면 Orbivisor의 Ceph 기록(mon·mgr·OSD 노드)
+  에서도 빠진다. Ceph 쪽은 바꾸지 않으므로 응답(CLI는 stderr의 `warning:`, 웹은 알림)이 알리는 대로 손으로 치운다: `ceph mon remove
+  NAME`, `ceph osd purge ID --yes-i-really-mean-it`, `ceph auth del mgr.NAME`.
+- **업그레이드.** Ceph 꾸러미는 [노드 업그레이드](#업데이트)(`apt-get dist-upgrade`)가 함께 올린다. 데몬 재시작 순서는 사람이 지킨다:
+  mon 노드부터 하나씩 → mgr → OSD(노드마다 `ceph osd set noout` 뒤 재시작, 끝나면 `unset`). 노드끼리 판이 다르면 새 mon·mgr·OSD 더하기를
+  막는다.
+- **넣지 않은 것.** mon·mgr·OSD 빼기와 디스크 교체, 유지보수·비우기 때 자동 `noout`, CephFS·RGW, 바깥 Ceph 넘겨받기, Ceph 업그레이드
+  지휘, 장치 클래스별 CRUSH 규칙과 풀, 키 교체, Orbivisor 풀을 지울 때 Ceph 풀 지우기, Ceph 클러스터 지우기. 지금은 `ceph` 명령으로
+  손으로 한다(mon 노드의 `/etc/ceph`에 admin 키링이 있다).
+
 ## Ceph RBD 풀
 
 **Ceph RBD 풀**(`--rbd POOL[/NAMESPACE]`)은 Ceph 클러스터의 풀(과 그 안의 RBD 네임스페이스)이다. 볼륨마다 raw RBD
 이미지 `opl-{볼륨 id}`를 만들고(`--image-format 2`) QEMU가 `rbd` 블록 드라이버로 Ceph에 직접 붙는다(커널 매핑
 `rbd map`을 하지 않으므로 노드에 블록 장치가 생기지 않는다). 모든 노드가 같은 이미지를 보는 **공유 풀**이다. 스냅샷
 규칙과 실행 중 스냅샷의 짧은 멈춤은 [LVM-thin 풀](#lvm-thin-풀)과 같다. 다른 점만 적는다.
+Ceph 클러스터를 Orbivisor가 노드에 설치·구성하고 풀까지 등록하게 하려면 [Ceph 자동 구성](#ceph-자동-구성)을 쓴다(이 절은
+관리자가 이미 운영하는 바깥 Ceph를 쓰는 길이다).
 
 ```bash
 # Ceph 클러스터와 풀은 관리자가 미리 만든다(Orbivisor는 만들지 않는다).
@@ -1708,7 +1821,8 @@ orbivisorctl task list                 # 리더의 대응 "ha-check", 본딩 알
   --client_mount_timeout 3 --rados_osd_op_timeout 3 stat orbivisor-health-probe`(8초)가 끝나거나 `stat`이 객체가 없다고 답하면
   (`error stat-ing …: (2) …` — OSD가 답함) 통과다. 그 밖의 오류는 ENOENT여도(지운 풀, 없는 keyring) `failing`이고 문구는 stderr의
   마지막 줄에서 앞의 시각·스레드 id를 뗀 것이다. `rados`가 없으면 `unknown`("rados not found: install ceph-common"). NFS·공유
-  LVM·RBD 검사는 Linux만이다(macOS는 `unknown`).
+  LVM·RBD 검사는 Linux만이다(macOS는 `unknown`). Orbivisor가 세운 Ceph의 풀도 같은 검사다(`client.orbivisor`·관리 conf — [Ceph 자동
+  구성](#ceph-자동-구성): Ceph 전체가 멈추면 모든 노드의 검사가 함께 실패해 과반 보호가 VM을 옮기지 않는다).
 - **본딩 포트.** `/sys/class/net/<bond>/bonding/slaves`·`mode`와 포트마다 `operstate`·`carrier`·`speed`, 802.3ad면
   `/proc/net/bonding/<bond>`의 활성 aggregator와 포트별 aggregator·상대 MAC을 본다. 포트 상태: `down`(carrier 0·MII down·
   operstate down), `lacp_mismatch`(활성 aggregator가 아님, 또는 상대 MAC이 `00:00:00:00:00:00`), `speed_mismatch`(올라온 포트
@@ -3209,7 +3323,7 @@ cargo build -p opld --release --features web-ui     # web/dist를 바이너리�
 가져오면 경고가 사라진다. 로그인한 뒤에는 클러스터 화면에서 CA를 내려받고 지문을 볼 수 있다.
 
 웹 UI로 CLI의 관리 기능을 모두 할 수 있다: 대시보드, 가상 머신(목록·상세·만들기·편집·동작·콘솔·스냅샷·복제·예약 스냅샷·마이그레이션·백업),
-볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, 백업(목록·증분·복원·지우기·원격으로 복제)과 백업 작업(증분 주기·원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 비우기, 레이블, 얼림 풀기, 전원 끄기 펜싱과 시험, 죽은 노드 제거), HA 그룹과 배치 규칙, HA 용량 예약, 작업, 감사 로그(admin),
+볼륨(빈 볼륨, 이미지 업로드, 크기 늘리기), 스토리지 풀, Ceph(만들기 마법사·상태·mon·mgr·OSD·풀 더하기), 백업(목록·증분·복원·지우기·원격으로 복제)과 백업 작업(증분 주기·원격 복제), VMware 가져오기(OVA), 네트워크, 보안 그룹, 노드(유지보수 모드, 비우기, 레이블, 디스크, 얼림 풀기, 전원 끄기 펜싱과 시험, 죽은 노드 제거), HA 그룹과 배치 규칙, HA 용량 예약, 작업, 감사 로그(admin),
 사용자(admin), 인증 영역(LDAP·OIDC, admin), API 토큰, 클러스터(멤버, CA, 조인 토큰), 원격 클러스터(상태 카드, 원격 VM 목록과 동작), 내 비밀번호 변경. 노드를 더할 때는 새 노드에서
 `orbivisorctl cluster join`을 실행한다(클러스터 화면이 명령을 만들어 준다). 이미지는 지금 접속한 노드로 올라가므로
 그 노드에서 쓸 수 있는 풀에만 가져올 수 있다.
@@ -4083,6 +4197,9 @@ sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_RBD=rbd 
   OPL_TEST_RBD_USER=opltest OPL_TEST_RBD_NAMESPACE=opl OPL_TEST_RBD_CONF=/etc/opl-ceph/ceph.conf \
   cargo test -p opl-driver --features rbd-it --test rbd_storage
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_RBD=rbd cargo test -p opld --features rbd-it --test rbd
+# Linux(Ubuntu 24.04), root, Ceph가 없는 버려도 되는 기계: orbivisord가 apt로 Ceph를 설치하고 노드 하나에 mon·mgr, 시험이 만든
+# 루프 장치에 OSD, 풀 등록, 그 풀의 디스크로 VM 켜기(Ceph 꾸러미와 데몬이 남는다 — CI `ceph` 작업)
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opld --features ceph-it,qemu-it --test ceph -- --nocapture
 # Linux, root: 실제 공유 LVM 풀. 테스트가 LV를 만들고 지워도 되는, 잠금을 시작한 공유(lvmlockd) VG와 lvm2-lockd, sanlock,
 # qemu-io가 필요하다. OPL_TEST_ISCSI(포털,타깃)가 있으면 opld 시험은 VG가 그 타깃의 LUN 위에 있다고 본다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM_SHARED=oplshared \

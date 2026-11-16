@@ -14,6 +14,13 @@ address = "10.0.0.11"
 # tick_secs = 60          # 주기가 지난 로컬 디스크 복제 대상을 확인하는 간격(초, 리더 노드)
 # max_concurrent = 2      # 원본 노드마다 동시에 도는 복제 작업(Task)의 최대 수(VM 줄에서 기다리는 Task는 세지 않는다)
 # bandwidth_mib = 0       # 복제가 보내는 대역폭 상한(MiB/s, 디스크 수로 나눈다). 0이면 제한 없음
+# [ceph]
+# client_dir = "/etc/opl/ceph"   # 관리 Ceph의 클라이언트 설정·키링(등록하는 RBD 풀의 conf는 {client_dir}/ceph.conf — 모든 노드에서 같아야 한다)
+# packages = ["ceph-mon", "ceph-mgr", "ceph-osd", "ceph-volume", "ceph-common", "lvm2", "qemu-block-extra"]  # mon·mgr·OSD 노드에 까는 꾸러미
+# client_packages = ["ceph-common", "qemu-block-extra"]  # RBD 풀만 쓰는 노드에 까는 꾸러미
+# install_timeout_secs = 1800    # apt-get update·install 하나의 시간 한도(초)
+# allow_loop_devices = false     # 루프 장치도 OSD 디스크로 쓴다(시험용)
+# status_cache_secs = 5          # Ceph 상태를 다시 읽지 않고 돌려주는 시간(초, 0이면 늘 다시 읽음)
 # [pools]
 # refresh_secs = 15         # 노드별 풀 상태를 확인하는 간격(초, NFS 마운트 포함)
 # [runtime]

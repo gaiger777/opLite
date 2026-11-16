@@ -8,11 +8,13 @@ import { useList } from "@/api/live";
 import type { StoragePool } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
+import { isManagedPool, useCeph } from "@/ceph/ceph";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { TableMessage } from "@/components/TableMessage";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -55,6 +57,7 @@ export function PoolsPage() {
   const volumes = useList("volume");
   const backups = useList("backup");
   const nodes = useList("node");
+  const ceph = useCeph();
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<StoragePool | null>(null);
   // 공유 여부를 바꿀 디렉터리 풀과 바꿀 값. 닫히는 동안에도 남겨 두어 대화상자의 글이 바뀌지 않게 한다.
@@ -133,7 +136,15 @@ export function PoolsPage() {
               <TableRow key={pool.id}>
                 <TableCell className="font-medium">{pool.name}</TableCell>
                 <TableCell>{t(`pools.kinds.${pool.spec.backend.kind}`)}</TableCell>
-                <TableCell className="font-mono text-xs">{poolLocation(pool)}</TableCell>
+                <TableCell className="font-mono text-xs">
+                  {poolLocation(pool)}
+                  {/* Orbivisor가 세운 Ceph의 풀(Ceph 화면에서 만듦) */}
+                  {isManagedPool(pool, ceph.data) && (
+                    <Badge variant="outline" className="ml-2 font-sans">
+                      {t("pools.managedCeph")}
+                    </Badge>
+                  )}
+                </TableCell>
                 <TableCell>
                   {/* 디렉터리 풀만 바꿀 수 있다. 다른 풀은 종류가 정한다(NFS·RBD·공유 LVM은 늘 공유). */}
                   {write && pool.spec.backend.kind === "dir" ? (

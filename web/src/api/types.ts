@@ -54,6 +54,12 @@ export type NicSpec = Schemas["NicSpec"];
 export type ReplicationTarget = Schemas["ReplicationTarget"];
 export type ReplicaStatus = Schemas["ReplicaStatus"];
 export type ReplicationState = Schemas["ReplicationState"];
+export type CephView = Schemas["CephView"];
+export type CephReport = Schemas["CephReport"];
+export type CephStatusView = Schemas["CephStatusView"];
+export type OsdReport = Schemas["OsdReport"];
+export type PgReport = Schemas["PgReport"];
+export type NodeDisk = Schemas["NodeDisk"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =

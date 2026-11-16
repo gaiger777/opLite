@@ -83,7 +83,14 @@
     "placement_busy": "Two migrations are already running. Apply the recommendation when one has finished.",
     "placement_unavailable": "Could not read placement from the cluster leader. Try again shortly.",
     "hotplug_unavailable": "The hardware cannot change while the VM runs: {{message}}",
-    "replication_unsupported": "Replication cannot be turned on: {{message}}"
+    "replication_unsupported": "Replication cannot be turned on: {{message}}",
+    "ceph_exists": "Ceph is already set up here: {{message}}",
+    "ceph_not_ready": "The Ceph cluster is not ready: {{message}}",
+    "ceph_busy": "Another Ceph task is running. Wait for it to finish: {{message}}",
+    "ceph_limit": "{{message}}",
+    "ceph_unreachable": "Could not read the Ceph status: {{message}}",
+    "disk_in_use": "The disk cannot hold an OSD: {{message}}",
+    "disk_not_empty": "The disk is not empty. Choose to erase it first: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -107,7 +114,8 @@
     "haGroups": "HA groups",
     "haChecks": "HA checks",
     "placementRules": "Placement rules",
-    "placement": "Optimal placement"
+    "placement": "Optimal placement",
+    "ceph": "Ceph"
   },
   "header": {
     "language": "Language",
@@ -191,7 +199,13 @@
       "ha-check": "HA check {{check}} on {{target}}: {{action}}",
       "bond-degraded": "Bond {{bond}} on {{target}} lost ports",
       "vm-hotplug": "Change hardware of {{target}}",
-      "vm-replicate": "Replicate {{target}} to {{node}}"
+      "vm-replicate": "Replicate {{target}} to {{node}}",
+      "ceph-init": "Set up Ceph on {{node}}",
+      "ceph-mon-add": "Add a Ceph monitor on {{node}}",
+      "ceph-mgr-add": "Add a Ceph manager on {{node}}",
+      "ceph-osd-add": "Add a Ceph OSD on {{node}} {{device}}",
+      "ceph-pool-create": "Create Ceph pool {{pool}} as storage pool {{name}} (size {{size}})",
+      "ceph-client-install": "Install Ceph client packages on {{node}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -200,6 +214,18 @@
     },
     "detail": {
       "vms": "VMs: {{vms}}."
+    },
+    "cephStage": {
+      "checking": "Checking the node",
+      "installing-packages": "Installing packages",
+      "writing-config": "Writing the configuration",
+      "creating-monitor": "Creating the monitor",
+      "starting-monitor": "Starting the monitor",
+      "waiting-for-quorum": "Waiting for quorum",
+      "creating-manager": "Creating the manager",
+      "preparing-osd": "Preparing the OSD",
+      "creating-pool": "Creating the Ceph pool",
+      "registering-pool": "Registering the storage pool"
     }
   },
   "pager": {
@@ -902,7 +928,8 @@
     "holdsBackups_one": "{{count}} backup",
     "holdsBackups_other": "{{count}} backups",
     "storeBackups": "Store backups",
-    "storeBackupsHint": "VM backups can be kept in this pool, under backups/ in its directory. VM disks can still be kept there too."
+    "storeBackupsHint": "VM backups can be kept in this pool, under backups/ in its directory. VM disks can still be kept there too.",
+    "managedCeph": "Orbivisor Ceph"
   },
   "networks": {
     "kind": "Type",
@@ -1207,7 +1234,13 @@
     "yes": "yes",
     "no": "no",
     "replicas": "Replicas",
-    "replicasOpen": "Show the {{count}} VMs {{name}} holds replicas of"
+    "replicasOpen": "Show the {{count}} VMs {{name}} holds replicas of",
+    "ceph": "Ceph",
+    "disks": {
+      "menu": "Disks…",
+      "title": "Disks of {{name}}",
+      "description": "Whole disks on the node and whether a Ceph OSD can use them. Disks in use (system, mounted, swap, ZFS, RAID, storage pool volume groups) are never erased."
+    }
   },
   "accounts": {
     "currentPassword": "Current password",
@@ -1980,6 +2013,136 @@
     "saved": "Placement settings saved.",
     "errors": {
       "threshold": "A whole number from 1 to 50."
+    }
+  },
+  "ceph": {
+    "pageHint": "A Ceph cluster that Orbivisor installs and runs on the cluster nodes: monitors, managers and OSDs on whole disks, with RBD pools registered as storage pools. To use an existing Ceph cluster, create a Ceph RBD storage pool instead.",
+    "none": "No Ceph cluster is set up. An administrator can set one up here.",
+    "noNodes": "No node can take this.",
+    "offlineNode": "{{name}} (offline)",
+    "phase": "Phase",
+    "phases": {
+      "bootstrapping": "Setting up",
+      "ready": "Ready"
+    },
+    "release": "Release",
+    "fsid": "fsid",
+    "publicNetwork": "Public network",
+    "clusterNetwork": "Cluster network",
+    "managedConf": "Client configuration",
+    "settingUp": "Ceph is being set up on {{node}}.",
+    "notReady": "Setting up Ceph did not finish.",
+    "retry": "Retry",
+    "retryElsewhere": "{{node}} is offline; set Ceph up on",
+    "stale": "This is the Ceph status read at {{time}}. It cannot be read now: {{error}}",
+    "health": "Health",
+    "unknown": "Unknown",
+    "checks": "Health checks",
+    "muted": "muted",
+    "monitors": "Monitors: {{n}} ({{quorum}} in quorum)",
+    "address": "Address",
+    "quorum": "Quorum",
+    "inQuorum": "In quorum",
+    "outOfQuorum": "Out of quorum",
+    "managers": "Managers",
+    "mgrActive": "{{name}} (active)",
+    "mgrNone": "No active manager",
+    "mgrStandbys": "standby: {{names}}",
+    "usage": "Usage",
+    "usageText": "{{used}} used, {{available}} of {{total}} available",
+    "pgs": "Placement groups: {{n}}",
+    "pgStates": "Placement group states",
+    "osds": "OSDs: {{up}} up, {{in}} in, {{total}} total on {{hosts}} hosts",
+    "osdId": "OSD",
+    "class": "Class",
+    "used": "Used",
+    "noOsds": "No OSDs yet.",
+    "host": "{{host}}: {{up}} of {{total}} up",
+    "up": "up",
+    "down": "down",
+    "in": "in",
+    "out": "out",
+    "pools": "Pools",
+    "mon": {
+      "add": "Add monitor",
+      "addTitle": "Add a Ceph monitor",
+      "addDescription": "The node installs the Ceph packages and joins the monitor quorum. Three monitors on different nodes keep Ceph running when one node is down.",
+      "limit": "The Ceph cluster already has {{n}} monitors, the most it can have here.",
+      "even": "An odd number of monitors (3 or 5) keeps quorum best."
+    },
+    "mgr": {
+      "add": "Add manager",
+      "addTitle": "Add a Ceph manager",
+      "addDescription": "The node installs the Ceph packages and runs a standby manager that takes over when the active one stops."
+    },
+    "osd": {
+      "add": "Add OSD",
+      "addTitle": "Add a Ceph OSD",
+      "addDescription": "The node installs the Ceph packages and makes an OSD (BlueStore on LVM) on the whole disk.",
+      "wipeAndAdd": "Erase and add OSD",
+      "typeDevice": "Type {{device}} to erase all data on it",
+      "wipeWarning": "The disk is not empty: {{reasons}}. Everything on it is erased."
+    },
+    "pool": {
+      "create": "Create pool",
+      "createTitle": "Create a Ceph pool",
+      "createDescription": "Creates an RBD pool in Ceph and registers it as a shared storage pool that every node uses through the managed client configuration.",
+      "cephPool": "Ceph pool",
+      "cephPoolHint": "Leave empty to use the storage pool name.",
+      "storagePool": "Storage pool",
+      "size": "Copies (size)",
+      "sizeHint": "{{hosts}} hosts have OSDs that are up. Each copy is kept on a different host.",
+      "sizeOne": "Size 1 keeps a single copy: data is lost when that disk fails.",
+      "sizeTwo": "Size 2 can lose data when one copy is down; 3 is recommended.",
+      "singleConfirm": "I understand that there is no redundancy",
+      "stored": "Stored",
+      "available": "Available"
+    },
+    "clients": {
+      "title": "Install Ceph client packages",
+      "description": "Nodes without Ceph daemons need ceph-common and QEMU's rbd driver (qemu-block-extra) to use the Ceph pools. Their client configuration is already written.",
+      "install": "Install client packages",
+      "none": "Every online node already runs Ceph daemons or is a witness."
+    },
+    "disk": {
+      "available": "Available",
+      "wipe": "Must be erased",
+      "blocked": "In use",
+      "none": "The node reported no disks.",
+      "choose": "Choose",
+      "device": "Device",
+      "size": "Size",
+      "type": "Type",
+      "model": "Model",
+      "table": "Disks"
+    },
+    "wizard": {
+      "title": "Set up Ceph",
+      "steps": {
+        "network": "Node and network",
+        "progress": "Create",
+        "mons": "Monitors",
+        "osds": "OSDs",
+        "pool": "Pool",
+        "clients": "Client packages"
+      },
+      "networkHint": "The first monitor and manager run on this node. Nodes need the same Ceph release, synchronised clocks (NTP) and open ports 3300, 6789 and 6800-7300/tcp.",
+      "initNode": "First node",
+      "publicHint": "The network of monitors and clients (CIDR). Filled in from the node's address; leave empty to let the server choose it the same way.",
+      "clusterHint": "Optional separate network for OSD replication (CIDR).",
+      "create": "Set up Ceph",
+      "stages": "Setup steps",
+      "failed": "Setting up Ceph failed: {{error}}",
+      "next": "Next",
+      "finish": "Finish",
+      "busy": "A Ceph task is running.",
+      "haveMons": "Monitors now: {{n}} ({{names}})",
+      "haveOsds": "Nodes with OSDs: {{names}}",
+      "haveHosts": "Hosts with OSDs up: {{n}}",
+      "monsHint": "Add monitors on two more nodes (three are recommended), one at a time. You can skip this.",
+      "osdsHint": "Add OSDs on whole disks of the nodes. Disks that are not empty must be erased; disks in use cannot be chosen.",
+      "poolHint": "Create a Ceph pool and register it as a storage pool. Add OSDs first.",
+      "clientsHint": "Optionally install the Ceph client packages on nodes without Ceph daemons so that their VMs can use the pools."
     }
   }
 }

@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { PoolsPage } from "@/storage/PoolsPage";
-import { backup, NODE, pool, poolState, vm, volume } from "@/test/fixtures";
+import { backup, CEPH, NODE, pool, poolState, vm, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -848,4 +848,21 @@ it("creates a pool that stores backups", async () => {
     name: "bk",
     spec: { backend: { kind: "dir", path: "/srv/bk" }, nodes: [], backups: true },
   });
+});
+
+it("marks the pools of the Ceph cluster Orbivisor set up", async () => {
+  mockLists({
+    "storage-pool": [
+      pool("vms", {
+        backend: { kind: "rbd", pool: "vmpool", user: "orbivisor", conf: CEPH.managed_conf },
+      }),
+      pool("ext", { backend: { kind: "rbd", pool: "rbd" } }),
+    ],
+  });
+  server.use(http.get(apiUrl("/ceph"), () => HttpResponse.json(CEPH)));
+  renderPage(<PoolsPage />);
+  const table = await screen.findByRole("table", { name: "Storage pools" });
+  const managed = (await within(table).findByText("vms")).closest("tr")!;
+  expect(await within(managed).findByText("Orbivisor Ceph")).toBeInTheDocument();
+  expect(within(table).getByText("ext").closest("tr")).not.toHaveTextContent("Orbivisor Ceph");
 });

@@ -11,6 +11,7 @@ import type { Node, Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { parseLabels } from "@/backups/jobs";
+import { cephRoles, useCeph } from "@/ceph/ceph";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -37,6 +38,7 @@ import {
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
 import { failingChecks } from "@/ha-checks/checks";
+import { NodeDisksDialog } from "@/nodes/NodeDisksDialog";
 import { NodeFenceDialog } from "@/nodes/NodeFenceDialog";
 import { NodeInterfacesDialog } from "@/nodes/NodeInterfacesDialog";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
@@ -188,6 +190,8 @@ export function NodesPage() {
   const [unfreezing, setUnfreezing] = useState<Node | null>(null);
   const [fencing, setFencing] = useState<Node | null>(null);
   const [showingInterfaces, setShowingInterfaces] = useState<Node | null>(null);
+  const [showingDisks, setShowingDisks] = useState<Node | null>(null);
+  const ceph = useCeph();
   const tasks = useTaskIndex();
   /** 그 노드의 비우기 Task가 끝나지 않았는지 */
   const isDraining = (node: Node) =>
@@ -246,6 +250,7 @@ export function NodesPage() {
             <TableHead>{t("nodes.labels")}</TableHead>
             <TableHead>{t("nodes.vms")}</TableHead>
             <TableHead>{t("nodes.replicas")}</TableHead>
+            <TableHead>{t("nodes.ceph")}</TableHead>
             {write && (
               <TableHead>
                 <span className="sr-only">{t("vms.actions")}</span>
@@ -255,7 +260,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 18 : 17} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 19 : 18} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -385,6 +390,10 @@ export function NodesPage() {
               <TableCell>
                 {vms.isSuccess ? <ReplicasCell node={node} vms={vms.data} /> : "—"}
               </TableCell>
+              {/* 관리 Ceph에서 이 노드가 맡은 데몬(mon·mgr·osd) */}
+              <TableCell className="font-mono text-xs">
+                {cephRoles(ceph.data, node.id).join(", ") || "—"}
+              </TableCell>
               {write && (
                 <TableCell className="text-right">
                   <DropdownMenu modal={false}>
@@ -437,6 +446,11 @@ export function NodesPage() {
                       {!node.spec.witness && (
                         <DropdownMenuItem onSelect={() => setShowingInterfaces(node)}>
                           {t("nodes.interfaces.menu")}
+                        </DropdownMenuItem>
+                      )}
+                      {!node.spec.witness && (
+                        <DropdownMenuItem onSelect={() => setShowingDisks(node)}>
+                          {t("nodes.disks.menu")}
                         </DropdownMenuItem>
                       )}
                       <DropdownMenuItem onSelect={() => setLabeling(node)}>
@@ -537,6 +551,13 @@ export function NodesPage() {
           onClose={() => setShowingInterfaces(null)}
         />
       )}
+      {showingDisks && (
+        <NodeDisksDialog
+          node={showingDisks}
+          returnFocus={trigger}
+          onClose={() => setShowingDisks(null)}
+        />
+      )}
       {fencing && (
         <NodeFenceDialog node={fencing} returnFocus={trigger} onClose={() => setFencing(null)} />
       )}
@@ -575,8 +596,14 @@ export function NodesPage() {
         returnFocus={trigger}
         onConfirm={async () => {
           const node = removing!;
-          await call(api.DELETE("/nodes/{key}", { params: { path: { key: node.id } } }));
+          const removed = await call(
+            api.DELETE("/nodes/{key}", { params: { path: { key: node.id } } }),
+          );
           toast.success(t("nodes.removed", { name: node.name }));
+          // 손으로 할 일(예: Ceph 데몬 노드였으면 Ceph에서 치우기)
+          for (const warning of removed?.warnings ?? []) {
+            toast.warning(warning, { duration: Infinity });
+          }
         }}
       />
     </div>

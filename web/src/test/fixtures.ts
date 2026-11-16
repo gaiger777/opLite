@@ -1,10 +1,13 @@
 import type {
   Backup,
   BackupJob,
+  CephStatusView,
+  CephView,
   HaCheck,
   HaGroup,
   HotplugLayout,
   Node,
+  NodeDisk,
   PlacementRule,
   PlacementStatus,
   ReplicaStatus,
@@ -536,3 +539,145 @@ export const PLACEMENT: PlacementStatus = {
     },
   ],
 };
+
+/** 관리 Ceph: node-a(n1)·node-b(n2)·node-c(n3)에 mon, n1·n2에 mgr, n1·n2에 OSD */
+export const CEPH: CephView = {
+  fsid: "5f0c1c2e-4d7a-4b55-9a51-1f0e6c9b7a01",
+  public_network: "10.0.0.0/24",
+  phase: "ready",
+  mons: [
+    { node: "n1", name: "node-a", addr: "10.0.0.1" },
+    { node: "n2", name: "node-b", addr: "10.0.0.2" },
+    { node: "n3", name: "node-c", addr: "10.0.0.3" },
+  ],
+  mgrs: ["n1", "n2"],
+  osd_nodes: ["n1", "n2"],
+  release: "19.2.3 squid",
+  init_node: "n1",
+  managed_conf: "/etc/opl/ceph/ceph.conf",
+  tasks: [],
+};
+
+/** Ceph 상태: HEALTH_WARN(검사 둘, 하나는 muted), OSD 넷(하나 down, 하나 out), 풀 둘 */
+export const CEPH_STATUS: CephStatusView = {
+  health: {
+    status: "HEALTH_WARN",
+    checks: [
+      {
+        code: "OSD_DOWN",
+        severity: "HEALTH_WARN",
+        summary: "1 osds down",
+        count: 1,
+        muted: false,
+      },
+      {
+        code: "MON_DOWN",
+        severity: "HEALTH_WARN",
+        summary: "1/3 mons down",
+        count: 1,
+        muted: true,
+      },
+    ],
+  },
+  mons: [
+    { name: "node-a", addr: "10.0.0.1:3300", in_quorum: true },
+    { name: "node-b", addr: "10.0.0.2:3300", in_quorum: true },
+    { name: "node-c", addr: "10.0.0.3:3300", in_quorum: false },
+  ],
+  quorum: ["node-a", "node-b"],
+  mgr: { active: "node-a", standbys: ["node-b"], available: true },
+  osds: [
+    {
+      id: 2,
+      host: "node-b",
+      up: true,
+      in: true,
+      class: "hdd",
+      weight: 0.0195,
+      device: "/dev/sdb",
+      total_bytes: 21474836480,
+      used_bytes: 1073741824,
+    },
+    {
+      id: 0,
+      host: "node-a",
+      up: true,
+      in: true,
+      class: "ssd",
+      weight: 0.0195,
+      device: "/dev/sdb",
+      total_bytes: 21474836480,
+      used_bytes: 2147483648,
+    },
+    {
+      id: 1,
+      host: "node-a",
+      up: false,
+      in: true,
+      class: "ssd",
+      weight: 0.0195,
+      device: "/dev/sdc",
+      total_bytes: 21474836480,
+      used_bytes: 0,
+    },
+    { id: 3, host: "node-b", up: true, in: false, weight: 0.0195, total_bytes: 0, used_bytes: 0 },
+  ],
+  osd_hosts_up: 2,
+  pgs: {
+    total: 129,
+    states: [
+      ["active+undersized", 9],
+      ["active+clean", 120],
+    ],
+  },
+  usage: { total_bytes: 85899345920, used_bytes: 3221225472, available_bytes: 82678120448 },
+  pools: [
+    {
+      name: ".mgr",
+      id: 1,
+      size: 2,
+      stored_bytes: 1048576,
+      max_available_bytes: 26843545600,
+      percent_used: 0,
+    },
+    {
+      name: "vmpool",
+      id: 2,
+      size: 2,
+      stored_bytes: 1073741824,
+      max_available_bytes: 26843545600,
+      percent_used: 0.0384,
+      orbivisor_pool: "vms",
+    },
+  ],
+  read_at: 1_793_761_200,
+  via: "n1",
+};
+
+/** 노드의 디스크: 빈 디스크, 지워야 하는 디스크, 시스템 디스크 */
+export const DISKS: NodeDisk[] = [
+  {
+    path: "/dev/sda",
+    size_bytes: 128849018880,
+    rotational: false,
+    model: "Samsung SSD",
+    state: "in-use",
+    reason: "system disk (/ is on it)",
+  },
+  {
+    path: "/dev/sdb",
+    by_id: "/dev/disk/by-id/wwn-0x5000c500a1b2c3d4",
+    size_bytes: 21474836480,
+    rotational: true,
+    model: "ST2000",
+    serial: "Z1X2",
+    state: "available",
+  },
+  {
+    path: "/dev/sdc",
+    size_bytes: 21474836480,
+    rotational: true,
+    state: "wipeable",
+    reasons: ["gpt partition table", "ext4 filesystem"],
+  },
+];

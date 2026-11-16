@@ -266,3 +266,47 @@ it("names the target node of a replication and shows its progress", async () => 
   expect(await screen.findByText("Replicate web to node-b")).toBeInTheDocument();
   expect(screen.getAllByRole("row")[1]).toHaveTextContent("Replicating 12% (1.0/8.0 GiB)");
 });
+
+it("names Ceph tasks by their node and shows their stage", async () => {
+  const CEPH_ID = "019a0f3c-0000-7000-800d-000000000001";
+  const ceph = (n: number, op: object, node: string, stage?: string) => ({
+    id: `019a0f3c-8a10-7000-8000-00000000000${n}`,
+    spec: { op, target: CEPH_ID, node },
+    status: {
+      state: stage ? "running" : "succeeded",
+      error: null,
+      ...(stage && { progress: { stage, done_bytes: 0, total_bytes: 0 } }),
+    },
+  });
+  mockLists({
+    node: [
+      { id: "n1", name: "node-a" },
+      { id: "n2", name: "node-b" },
+    ],
+    task: [
+      ceph(1, { kind: "ceph-init" }, "n1"),
+      ceph(2, { kind: "ceph-mon-add" }, "n2", "waiting-for-quorum"),
+      ceph(3, { kind: "ceph-osd-add", device: "/dev/sdb", wipe: true }, "n2", "preparing-osd"),
+      ceph(
+        4,
+        { kind: "ceph-pool-create", name: "vms", pool: "vmpool", size: 3 },
+        "n1",
+        "new-stage",
+      ),
+      ceph(5, { kind: "ceph-client-install" }, "n2"),
+      ceph(6, { kind: "ceph-mgr-add" }, "n2"),
+    ] as never,
+  });
+  renderPage(<TasksPage />);
+  expect(await screen.findByText("Set up Ceph on node-a")).toBeInTheDocument();
+  const rows = screen.getAllByRole("row");
+  expect(rows[1]).toHaveTextContent("Add a Ceph manager on node-b");
+  expect(rows[2]).toHaveTextContent("Install Ceph client packages on node-b");
+  // 모르는 단계는 그 이름을 보인다.
+  expect(rows[3]).toHaveTextContent("Create Ceph pool vmpool as storage pool vms (size 3)");
+  expect(rows[3]).toHaveTextContent("new-stage");
+  expect(rows[4]).toHaveTextContent("Add a Ceph OSD on node-b /dev/sdb");
+  expect(rows[4]).toHaveTextContent("Preparing the OSD");
+  expect(rows[5]).toHaveTextContent("Add a Ceph monitor on node-b");
+  expect(rows[5]).toHaveTextContent("Waiting for quorum");
+});

@@ -12,6 +12,7 @@ import { AuthProvider } from "@/auth/AuthProvider";
 import { RequireAuth } from "@/auth/RequireAuth";
 import { BackupJobsPage } from "@/backups/BackupJobsPage";
 import { BackupsPage } from "@/backups/BackupsPage";
+import { CephPage } from "@/ceph/CephPage";
 import { ClusterPage } from "@/cluster/ClusterPage";
 import { Toaster } from "@/components/ui/sonner";
 import { HaChecksPage } from "@/ha-checks/HaChecksPage";
@@ -69,6 +70,7 @@ function routes() {
             { path: "imports/:name", element: <ImportPage /> },
             { path: "volumes", element: <VolumesPage /> },
             { path: "storage-pools", element: <PoolsPage /> },
+            { path: "ceph", element: <CephPage /> },
             { path: "backups", element: <BackupsPage /> },
             { path: "backup-jobs", element: <BackupJobsPage /> },
             { path: "networks", element: <NetworksPage /> },

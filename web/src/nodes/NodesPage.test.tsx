@@ -5,7 +5,17 @@ import { http, HttpResponse } from "msw";
 import { applyEvent, listKey, type List } from "@/api/live";
 import type { Node } from "@/api/types";
 import { NodesPage } from "@/nodes/NodesPage";
-import { NET_NODE, NODE, poolState, replica, replicatedVm, task, vm } from "@/test/fixtures";
+import {
+  CEPH,
+  DISKS,
+  NET_NODE,
+  NODE,
+  poolState,
+  replica,
+  replicatedVm,
+  task,
+  vm,
+} from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -371,6 +381,27 @@ it("removes only offline nodes, after typing the name", async () => {
   await userEvent.click(confirm);
   expect(await screen.findByText("Removed node-b from the cluster.")).toBeInTheDocument();
   expect(removed).toBe(true);
+});
+
+it("shows what is left to do by hand after removing a node", async () => {
+  cluster();
+  mockLists({ node: [NODE, DOWN] });
+  server.use(
+    http.delete(apiUrl("/nodes/n2"), () =>
+      HttpResponse.json({
+        warnings: [
+          'node "node-b" ran a Ceph monitor; remove it from the Ceph monitor map by hand with: ceph mon remove node-b',
+        ],
+      }),
+    ),
+  );
+  renderPage(<NodesPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for node-b" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Remove from cluster" }));
+  const dialog = await screen.findByRole("alertdialog");
+  await userEvent.type(within(dialog).getByLabelText("Type node-b to confirm"), "node-b");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Remove from cluster" }));
+  expect(await screen.findByText(/ceph mon remove node-b/)).toBeInTheDocument();
 });
 
 it("tells how to remove a live node", async () => {
@@ -1091,4 +1122,40 @@ it("keeps the saved password and removes power-off fencing", async () => {
   expect(await screen.findByText("Removed the power-off fencing of node-b.")).toBeInTheDocument();
   expect(deleted).toEqual(["8"]);
   expect(within(dialog).getByText(/No methods/)).toBeInTheDocument();
+});
+
+it("shows the Ceph daemons of each node and opens its disks", async () => {
+  cluster();
+  const witness = { ...NODE, id: "n5", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  mockLists({ node: [NODE, DOWN, witness] });
+  server.use(
+    http.get(apiUrl("/ceph"), () => HttpResponse.json(CEPH)),
+    http.get(apiUrl("/nodes/n1/disks"), () => HttpResponse.json(DISKS)),
+  );
+  renderPage(<NodesPage />);
+  const user = userEvent.setup();
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const column = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Ceph");
+  const cell = (name: string) =>
+    within(within(table).getByText(name).closest("tr")!).getAllByRole("cell")[column]!;
+  await within(table).findByText("node-a");
+  expect(await within(cell("node-a")).findByText("mon, mgr, osd")).toBeInTheDocument();
+  expect(cell("node-b")).toHaveTextContent("mgr, osd");
+  expect(cell("node-w")).toHaveTextContent("—");
+  // 위트니스에는 디스크 메뉴가 없다.
+  await user.click(screen.getByRole("button", { name: "Actions for node-w" }));
+  expect(await screen.findByRole("menuitem", { name: "Edit labels" })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Disks…" })).not.toBeInTheDocument();
+  await user.keyboard("{Escape}");
+  await user.click(screen.getByRole("button", { name: "Actions for node-a" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Disks…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Disks of node-a" });
+  const disks = await within(dialog).findByRole("table", { name: "Disks" });
+  expect(within(disks).getByText("/dev/sdc").closest("tr")).toHaveTextContent(
+    "Must be erasedgpt partition table, ext4 filesystem",
+  );
+  // 읽기만 하는 표라 고르는 단추가 없다.
+  expect(within(disks).queryByRole("radio")).not.toBeInTheDocument();
 });

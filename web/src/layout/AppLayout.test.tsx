@@ -52,6 +52,8 @@ it("hides account pages from other roles", async () => {
   );
   // 설정도 누구나 읽는다(바꾸기는 admin만).
   expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("href", "/settings");
+  // 관리 Ceph도 누구나 읽는다(바꾸기는 admin만).
+  expect(screen.getByRole("link", { name: "Ceph" })).toHaveAttribute("href", "/ceph");
   // 원격 클러스터도 누구나 읽는다.
   expect(screen.getByRole("link", { name: "Remote clusters" })).toHaveAttribute("href", "/remotes");
 });

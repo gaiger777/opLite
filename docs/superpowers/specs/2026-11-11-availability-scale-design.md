@@ -2209,3 +2209,150 @@ opld `tests/migration.rs` `replicates_a_vm_and_migrates_it_to_its_replica`(`migr
   (`actions/recover`), 갈라진 옛 원본의 증분 되돌림(공통 시점 스냅샷), raw 디스크 비트맵을 끄고 켜도 지키기, 시계에 맞춘 일정,
   따라잡기 마이그레이션에서 다른 대상·백업 비트맵 옮기기(`block-bitmap-mapping`), 진행률의 패스 번호.
 - 실제 프로세스 시험이 중간에 실패하면 시험 도우미가 `run/vm` 아래 QEMU만 끄므로 `run/replica-*` 받기 QEMU가 남을 수 있다.
+
+## 23. 구현(계획 56)
+
+일곱 단계를 커밋 일곱으로 했다(1 타입·키·검증·기능 가리기, 2 순수 해석·설정 렌더·디스크 분류·가짜 명령 실행기, 3 노드 쪽 Ceph
+동작, 4 Raft 쓰기·Ceph Task·클라이언트 설정 에이전트·opld `[ceph]`, 5 peer RPC와 `/ceph` API, 6 CLI·실제 Ceph 시험·CI `ceph` 작업,
+7 웹·문서). §10은 "따로 설계 문서를 둘 수 있다"고 했지만 **설계 문서를 따로 두지 않고 결정을 이 절에 모았다.** 기존 RBD 풀 종류
+(계획 18, `2026-10-29-shared-storage-ceph-rbd-design.md`)는 그대로 쓰고, 관리 Ceph의 풀도 같은 종류로 사용자·conf만 맞춰 등록한다
+— 드라이버·마운터·HA 풀 검사·웹이 바뀌지 않는다.
+
+**범위와 리소스(단계 1).**
+- Orbivisor 클러스터 하나에 Orbivisor가 관리하는 Ceph 하나: Raft 리소스 `Kind::Ceph`(`"ceph"`), 이름 `"ceph"` 하나(둘째 `POST /ceph`는
+  409 `ceph_exists`). **설계와 다름(범위): 바깥(기존) Ceph를 넘겨받는 길은 두지 않는다** — 바깥 Ceph는 지금처럼 RBD 풀로 쓴다.
+- 기능 `ceph-setup`(`opl_types::node::CEPH_SETUP`, `FEATURES` 끝)이 바꾸는 요청(`POST /ceph`·`/ceph/mons`·`/mgrs`·`/osds`·`/pools`·
+  `/clients`)과 새 peer RPC를 부르는 읽기(`GET /nodes/{key}/disks`·`/ceph/status` — 상대가 `Unimplemented`면 409 `cluster_upgrading`)를
+  가린다. `GET /ceph`는 가리지 않는다(없으면 404).
+- `CephCluster = Resource<CephSpec, CephStatus>`(opl-types `ceph.rs`): `CephSpec { fsid, public_network: Cidr, cluster_network?, keys:
+  CephKeys { mon, admin, bootstrap_osd, client } }`(만든 뒤 바뀌지 않음, `Debug`는 키를 `***`, OpenAPI 스키마 없음), `CephStatus { phase:
+  bootstrapping|ready, mons: [CephMon { node, name, addr }], mgrs, osd_nodes, release?, init_node?, last_error?, pending?: CephPending { op,
+  node, task } }`(`pending`은 한 번에 하나인 Task의 자리 — 아래 단계 5, 옛 노드는 버림). mon·mgr·OSD 노드는 Task가
+  데몬이 섰음을 확인한 뒤에만 더한다(`tasks::ceph::update_ceph` — 리비전 재시도). **OSD 하나하나는 Raft에 두지 않고 Ceph에서 그때그때
+  읽는다**(진실은 Ceph에 있고 맞추는 일을 만들지 않는다).
+- **설계와 다름(비밀): 키는 Raft에 평문으로 둔다**(Proxmox의 `/etc/pve/priv/ceph.client.admin.keyring`과 같은 자리 — 펜싱 BMC 비밀번호와
+  같다). 견준 길은 mon 노드의 `/etc/ceph`에만 두고 다른 노드가 RPC로 받아 가기 — 그 노드가 죽으면 새 노드가 붙을 길이 없고 받아 가기
+  RPC·재시도가 생긴다. Raft에 두면 Task가 결정적이고 다시 해도 같다. 키는 API가 만든다(`getrandom` 16바이트 + `encode_key(secret, secs,
+  nanos)` = `ceph-authtool --gen-print-key`와 같은 28바이트 모양, `AQ…` 40자). API 응답은 `CephView`(키 없음)뿐이고 watch 허용 목록에 넣지
+  않는다. 쓰기는 admin(새 종류라 `RoleAuthorizer`가 이미 그렇다), 읽기는 모든 역할.
+- `TaskOp::{CephInit, CephMonAdd, CephMgrAdd, CephOsdAdd { device, wipe }, CephPoolCreate { name, pool, size }, CephClientInstall}`(target =
+  Ceph 리소스 id, 줄 = Ceph 리소스 id, 전체 시간 제한 없음 — 단계마다 한도). 진행률 stage는 단계 이름(`checking`·`installing-packages`·
+  `writing-config`·`creating-monitor`·`starting-monitor`·`waiting-for-quorum`·`creating-manager`·`preparing-osd`·`creating-pool`·
+  `registering-pool`, 바이트 0/0). opld가 다시 시작하면 지금처럼 "interrupted"로 실패하고 다시 부르면 이어서 한다.
+
+**명령 실행과 해석(단계 2·3).**
+- opl-driver 새 `ceph/`(`opl_driver::ceph::*`로만): `CommandRunner::run(&Cmd) -> Result<CmdOutput, DriverError>`(0이 아닌 종료도 `Ok`,
+  시간 초과·실행 못 함만 `Err`), `SystemRunner`(`LANG=C`, drop 때 kill), **`pub` `FakeRunner`**(접두사 규칙·차례 답·호출 기록 — opl-api·
+  opld 시험이 씀). 파일은 실행기를 거치지 않고 `CephPaths { etc_ceph, var_lib_ceph, client_dir, by_id }`로 쓴다(시험은 임시 디렉터리).
+- **설계와 다름(상태 읽기): 상태 보고서는 명령 넷이 아니라 여덟**(`status`·`quorum_status`·`mgr dump`·`osd tree`·`osd df`·`df`·`osd
+  metadata`·`osd pool ls detail`)을 함께 돌려 만든다 — ceph 19.2의 `ceph status`에는 mon 목록이 없고 `mgrmap`은 `available`·
+  `num_standbys`뿐이다. 각 15초, 하나라도 실패하면 실패. 해석은 모르는 필드를 무시하고 빠진 필드는 기본값(`#[serde(default)]`).
+- `CephHost`(단계 함수 모두 멱등): `ensure_packages`(빠진 꾸러미만 `apt-get install -o DPkg::Lock::Timeout=600`, 한도 30분, 그 뒤 `ceph
+  --version` — 18 미만 거절), `check_foreign`(표시 없는 `/etc/ceph/ceph.conf`, 다른 fsid의 `/var/lib/ceph/{mon,mgr,osd}/ceph-*` → 아무것도
+  바꾸기 전에 실패 — cephadm의 `/var/lib/ceph/{fsid}/`도), `create_monitor`(**mon 저장소는 `/var/lib/ceph/tmp/opl-mon-{name}/mon`에 mkfs하고 `fsid`·`done`을 쓴 뒤 rename** —
+  `ceph-mon --mkfs`가 비지 않은 디렉터리에서 조용히 0으로 끝나기 때문; `done`에는 monmap의 출처 `init`·`join`을 적고, 기존 정족수에 더할
+  때 `init` 저장소는 이 노드가 지금 `init_node`가 아니면(옮겨 간 부트스트랩이 남긴 다른 클러스터의 mon) 지우지 않고 `systemctl disable --now
+  ceph-mon@X`·`mv` 안내와 함께 실패한다; mkfs 키링에 `mon.`·`client.admin`·`client.bootstrap-osd`·
+  `client.orbivisor`를 모두 넣어 `ceph auth` 명령이 따로 필요 없다), `wait_quorum`·`create_manager`·`wait_manager`, `disks`·`create_osd`
+  (**`ceph-volume lvm`** — Proxmox `pveceph`·cephadm과 같은 길; 견준 길인 CI의 `ceph osd new` + `ceph-osd --mkfs`는 재부팅 뒤 켜기·장치 이름
+  바뀜·지우기를 떠안는다 — 만든 뒤 유닛 active(2분)에 더해 **새 OSD가 `ceph osd tree`에서 up이 될 때까지**(5분, 아니면 "OSD N did not
+  come up …") 기다린다; mon·mgr이 없는 OSD 노드에는 admin 키링이 없으므로 이 확인은 `client.orbivisor`(`--conf {client_dir}/ceph.conf --id
+  orbivisor` — mon caps `profile rbd`가 osd map을 읽는다)로 한다; 다시 하기는 그 OSD만 `ceph-volume lvm activate {id} {osd_fsid}`),
+  `create_pool`, `report`. `lvm create`가 도중에 멈춰 켤 수 없는 OSD는 오류에 `ceph osd purge N --yes-i-really-mean-it; ceph-volume lvm zap
+  --destroy {path}`를 담는다. 기존 정족수에 더한 mon의 정족수 확인(`wait_quorum`)은 Raft의 mon에만 `-m`으로 묻는다(데몬 conf에는 이
+  노드의 새 mon도 있다). bootstrap-osd·mgr 키링은 늘 chown한다. 명령이 한도를 넘기면 그 명령 줄을 담아 실패한다(명령 줄에 비밀은 없다). 파일의 임시 이름은
+  `.{name}.opl-tmp-{pid}-{n}`(에이전트와 Task가 같은 파일을 함께 써도 겹치지 않음). 판 비교 `check_release` — mon·mgr·OSD 더하기에서 노드 판이 `status.release`와 다르면 실패.
+- 디스크 분류 `classify`(정한 규칙과 문구 그대로): 쓰는 중(읽기 전용·이동식·5 GiB 미만·시스템 마운트·다른 마운트·스왑·ZFS·RAID·이 Ceph의
+  OSD·풀 VG·열린 LV가 있는 VG(`lvs`의 `lv_attr` 여섯째 글자 `o` — 돌고 있는 남의 OSD)·다른 디스크에 걸친 VG(`ceph-` VG도) — 이유 하나), 지워야 함(파티션 표·파티션·마운트되지 않은 파일 시스템·풀 아닌 VG의 PV·다른 Ceph의
+  흔적 — 이유 모두), 나머지 쓸 수 있음. by-id 고르기 `wwn-` > `nvme-eui.` > 그 밖 첫 것(`lvm-pv-uuid-`·`dm-`·`md-` 무시).
+
+**Task·에이전트·설정(단계 4).**
+- 부트스트랩: API가 키·fsid와 리소스(`bootstrapping`, `init_node`)·`ceph-init` Task를 만들고, Task는 확인 → 설치 → `/etc/ceph/ceph.conf`
+  (첫 줄 `# managed by orbivisord; edits are overwritten`, `mon_host`는 v2+v1, cephx, `auth_allow_insecure_global_id_reclaim = false`) ·admin
+  키링·클라이언트 설정 → mon 저장소 → `systemctl enable --now ceph-mon@{name}` → 정족수(5초마다 5분) → Raft `mons` → mgr → `available`
+  → `ready`. 실패하면 `last_error`(phase 그대로 — 버려진 옛 부트스트랩 Task의 실패는 `init_node`가 그 노드가 아니므로 남기지 않음).
+  부트스트랩 Task는 Raft 쓰기(판·mon·`ready`)마다, 그리고 mon 저장소를 만들기 직전에 리소스를 다시 읽어 `init_node`가 이 노드이고 자리가
+  다른 Task의 것이 아닌지 보고, 아니면(다른 노드로 옮김 — 2차 리뷰) 멈춘다 — 옛 노드가 돌아와 같은 fsid로 둘째 클러스터를 세우지 않게. 다시 하기는 같은 노드로 `POST /ceph`(다른 노드 409 `ceph_exists`, 망이 다르면 409
+  `ceph_exists`, 끝나지 않은 부트스트랩 Task가 있으면 409 `ceph_busy`).
+- mon·mgr Task는 클러스터 전체에서 하나(409 `ceph_busy`), mon 5개까지(409 `ceph_limit`, 둘째 mon은 409 `ceph_exists`). mon-add는 클라이언트
+  설정을 에이전트에 맡긴다(init은 직접 쓴다). init·mon·mgr·OSD Task는 데몬 꾸러미 전체, client Task는 클라이언트 꾸러미만(판 비교 없음).
+- **설계와 다름(파일 위치): 노드의 클라이언트 설정은 `/etc/ceph`가 아니라 `/etc/opl/ceph`**(`[ceph] client_dir`): `ceph.conf`(fsid·
+  mon_host·auth + `[client.orbivisor] keyring = …`)와 `ceph.client.orbivisor.keyring`(0600). 등록하는 풀은 `Rbd { pool, user: "orbivisor",
+  conf: "{client_dir}/ceph.conf" }` — 그래서 같은 노드에서 바깥 Ceph의 RBD 풀(`/etc/ceph`)과 함께 쓸 수 있다. `/etc/ceph/ceph.conf`는 데몬
+  노드에만(Ceph의 systemd 유닛이 읽음), admin 키링은 mon·mgr 노드에만, bootstrap-osd 키링은 OSD 노드에만. `CephAgent`(노드마다, 위트니스
+  없음, Linux만)가 `Kind::Ceph` watch로 mon이 바뀔 때 클라이언트 설정과 (표시가 있는) 데몬 노드의 `/etc/ceph/ceph.conf`를 다시 쓴다(같으면
+  쓰지 않음, 임시 → fsync → rename).
+- 풀 Task는 온라인 mon 노드 가운데 id가 가장 작은 노드: 만든 풀에는 곧바로 `osd pool application enable {pool} rbd`와 `application set
+  {pool} rbd orbivisor-pool {name}` 표시를 단다. Ceph에 같은 이름 풀이 있으면 application(`osd pool ls detail`의 `application_metadata`)이
+  없거나 그 표시가 요청한 이름일 때만 앞 Task가 만들다 멈춘 풀로 보고 만들기를 건너뛰어 이어서 하고, 그 밖(다른 application, 표시 없는 rbd
+  풀, 다른 이름의 표시)은 바꾸지 않고 실패 — 쓰는 풀의 복제 수를 바꾸지 않게(2차 리뷰) → size 1이면 `mon_allow_pool_size_one` → 만들기
+  → 표시 → size → `.mgr` size를 호스트 수로 낮춤(1로는 size
+  1을 적었을 때만) → 새 풀의 PG가 모두 active(`ceph pg ls-by-pool` — 막 만든 풀은 mgr의 `pg stat` 합계에 아직 없을 수
+  있음, 5분) → `rbd pool init` → `StoragePool` 만들기(`resources::check_pool_spec`를 `create_pool`과 함께 씀).
+  호스트 수는 `ceph osd tree`의 up OSD 호스트. 사용자는 `client.orbivisor` 하나(`profile rbd`, 풀 제한 없음).
+- opld `[ceph]`(`CephSection`): `client_dir`, `packages`, `client_packages`, `install_timeout_secs`(0이면 설정 오류), `allow_loop_devices`
+  (시험용), `status_cache_secs`. opld가 `CephHost`를 하나 만들어 Task·API·peer·에이전트가 함께 쓴다(위트니스는 만들지 않음).
+
+**API·RPC(단계 5).**
+- peer RPC `NodeDisks`·`CephStatus`(JSON 단항, 대량 채널, 20초, 옛 노드면 `None`). `GET /ceph/status`는 이 노드가 mon이면 직접, 아니면
+  온라인 mon 노드에 함께 물어 먼저 온 성공. `CephStatusCache`(5초, 동시 요청은 한 번만 읽음, `?refresh=true`): 마지막으로 읽어 본 결과를
+  — 실패도 — TTL 동안 두고, 실패면 마지막 보고서를 `stale: true`·`error`로, 그것도 없으면 503 `ceph_unreachable`. 풀 만들기는 새 상태가
+  필요하다(stale이면 503). 어느 RBD `StoragePool`(관리 conf가 아니어도)이 이미 그 Ceph 풀을 쓰면 409 `pool_exists`. 상태를 읽지 못한
+  503에는 "막 더한 mon이면 mon 노드 사이 3300·6789를 확인하라"는 힌트를 붙인다(둘째 mon이 붙지 못하면 mon 둘의 정족수를 잃는다).
+- **한 번에 하나(1차 리뷰에서 고침).** 처음에는 프로세스 안 잠금이라 다른 노드의 API로 함께 보낸 mon·mgr 요청이 둘 다 지나갈 수 있었다.
+  이제 처리기가 새로 읽은 리소스로 확인한 뒤 `CephStatus.pending { op, node, task }`를 리비전 확인 쓰기로 잡고(부딪치면 다시 읽어 확인)
+  그 id로 Task를 만든다. 자리의 Task가 끝나지 않았거나 아직 없으면(UUIDv7 시각으로 60초 동안) 409 `ceph_busy`, 끝났거나 오래 없으면
+  넘겨받는다. Task가 끝날 때(성공·실패)와 janitor가 실패로 끝낼 때 자리를 놓는다. mon 상한은 더하는 중인 mon을 센다. mon 더하기 전에는
+  상태 보고서의 monmap을 보고 Orbivisor가 모르는 mon이나 정족수 밖 mon이 있으면 409 `ceph_busy`(이름과 `ceph mon remove NAME`). 바쁘게 하는
+  Task의 노드가 꺼져 있거나 없으면 `ceph_busy`에 "node X is offline; bring it back or remove it with `cluster remove-node`"를 붙인다.
+  **설계와 다름(시계): 자리의 60초 유예는 UUIDv7 시각과 이 노드의 시계를 견주므로 노드 시계가 맞아야 한다**(NTP — Raft revision을 적어
+  견주는 길은 두지 않고 문서로만).
+- 부트스트랩 노드가 지워졌거나 꺼져 있고 `mons`가 비었으면 `POST /ceph`가 다른 노드로 옮겨 다시 한다(같은 fsid·키, 새 `init_node`, 옛
+  노드의 끝나지 않은 Ceph Task는 리비전 확인 쓰기로 실패로 끝내 돌아와도 시작하지 않는다 — 이미 돌던 Task는 위의 확인으로 스스로 멈춤).
+  `DELETE /nodes/{key}`는 노드를 지우기 전에 Ceph 데몬 노드를 `mons`·`mgrs`·`osd_nodes`에서 빼고(Ceph는 바꾸지 않음) 손으로 할 일을 200
+  `NodeRemoved { warnings }`로 돌려준다(아니면 지금처럼 204) — 첫 mon이 선 뒤 아직 `ready`가 아닌 부트스트랩의 노드를 잃은 경우의
+  탈출구이기도 하다. **설계와 다름(복구): `ready`가 된 클러스터의 mon을 모두 잃으면 다시 세우지 않는다** — `POST /ceph`는 409
+  `ceph_exists`로 mon을 손으로 되살리거나 Raft의 Ceph 기록을 손으로 지우라고 알린다(새 fsid·키로 다시 세우는 길은 남은 OSD를 버리므로
+  두지 않았다).
+- `POST /ceph/osds`는 먼저 그 노드의 디스크 목록으로 확인한다(없는 장치 400, 쓰는 중 409 `disk_in_use`, 비지 않았는데 `wipe` 아님 409
+  `disk_not_empty`, Task에는 by-id 경로). 장치는 디스크의 `path`나 고른 by-id 링크만 받는다. `GET /nodes/{key}/disks`: 위트니스 409
+  `node_unavailable`, 꺼짐 409 `node_offline`, 옛 노드 409 `cluster_upgrading`, 읽기 실패 503 `node_unreachable`.
+- **설계와 다름: 짝수 mon·size 2 경고는 API 응답에 없다**(202 Task만) — CLI·웹이 스스로 보인다. 보고서의 Orbivisor 풀 잇기는 `conf`가 이
+  노드의 관리 클라이언트 conf와 같은 RBD 풀만.
+
+**CLI·실제 시험·CI(단계 6).**
+- `orbivisorctl ceph init|status|mon add|mgr add|osd add|osd list|pool create|client install`, `node disks`. 모두 Task를 기다리며(`--no-wait`)
+  stage가 바뀔 때마다 `ceph: <stage> on <node>` 줄. `--wipe`는 터미널이면 장치 이름(`/dev/sdb`·`sdb`·by-id)을 다시 쳐야 하고 아니면 `--yes`.
+  `--size`는 clap 범위 1..=3. `--wipe`는 노드의 디스크 목록에 있는 디스크만 묻고, 확인한 디스크를 by-id(없으면 장치) 경로로 보내며, 새
+  OSD는 CRUSH 호스트가 노드 이름인 것부터(다르면 장치만으로) 고른다.
+- 실제 시험 `opld/tests/ceph.rs`(기능 `ceph-it`, Linux·root): 깨끗한 러너에서 orbivisord가 apt로 Ceph를 설치하고 노드 하나(`--public-network
+  127.0.0.0/8`)에 mon·mgr, 시험이 만든 루프 장치에 OSD(`allow_loop_devices`, `CEPH_VOLUME_ALLOW_LOOP_DEVICES=1`), size 1 풀 등록, 그 풀의
+  볼륨으로 VM 켜기·끄기·지우기, 쓰는 중 디스크 409·파일 시스템이 든 둘째 루프 409(그 뒤 `--wipe --yes`로 지우고 둘째 OSD)·둘째 init
+  409, 끝에 실제 JSON을 찍어 해석기로 읽는다(OSD 둘, 풀의 `orbivisor-pool` 표시).
+  사전 프로브(Ubuntu 24.04, ceph 19.2.3)에서 `ceph-volume`은 별도 꾸러미이고 루프 장치로 `lvm create`가 됐다 — 그래서 targetcli 대안은
+  쓰지 않았다. CI 새 작업 `ceph`(linux-kvm 다음, ldap 앞): QEMU·OVMF·qemu-block-extra만 깔고 `/etc/ceph/ceph.conf`가 없음을 확인한 뒤 위
+  시험을 돈다. `linux-kvm`의 손 Ceph 단계와 `rbd-it`는 바깥 Ceph를 RBD 풀로 쓰는 길의 시험으로 그대로 둔다.
+- GitHub Ubuntu 24.04 러너(ceph 19.2.3, 노드 하나)에서 설치·init·루프 장치 OSD·풀·RBD 볼륨의 VM까지 통과(시험 단계 218초, 빌드
+  포함). 첫 실행에서 OSD Task가 OSD가 up이 되기 전에 끝나던 것과 풀 PG 기다림이 새 풀을 보지 않던 것을 고쳤다.
+
+**웹·문서(단계 7).**
+- 새 화면 `/ceph`(메뉴 "Ceph", 풀 아래): Ceph가 없으면 admin에게 여섯 단계 마법사(노드·망 — IPv4 노드 주소를 가진 인터페이스의 망으로
+  미리 채움, 비우면 서버가 같은 규칙으로 정함; 만들기 진행 — Task의 stage를 단계 목록으로, 실패하면 이유와 다시 하기; mon; OSD; 풀;
+  클라이언트 꾸러미 — ③~⑥은 상태 화면의 대화상자를 열고 건너뛸 수 있음), 다른 역할에는 안내. 있으면 상태(설정, `bootstrapping`이면
+  `last_error`와 다시 하기 — mon이 서기 전에 부트스트랩 노드가 꺼졌으면 그 노드의 Task를 바쁨으로 세지 않고 온라인 노드를 골라 옮겨 다시
+  하기, health 배지와 검사(muted 표시), mon 정족수, mgr, 호스트별 OSD, PG 상태 막대, 사용량 막대, 풀 표와 Orbivisor
+  풀 링크, admin 동작 단추 — 준비 전에는 클라이언트 꾸러미만). `GET /ceph`와 `/ceph/status`를 10초마다 다시 읽는다(Ceph 리소스는
+  watch로 나가지 않음), stale이면 경고 띠, 503이면 그 문구.
+- 대화상자: mon·mgr 더하기(그 역할이 있는 노드·위트니스 빼고 오프라인 막음, mon 5개 상한과 짝수 경고), OSD 더하기(노드 고르기 → 그 노드의
+  디스크 표, 쓰는 중은 이유만, **지워야 하는 디스크는 같은 대화상자 안에서 장치 이름을 다시 쳐야** 보냄 — 정한 것의 "체크 + 다시 치기
+  대화상자"를 입력 하나로 줄임), 풀 만들기(기본 size min(3, up 호스트) — 상태가 늦게 와도 고르지 않았으면 따라감, 1은 확인 상자, 2는 경고, 이름 검사), 클라이언트 꾸러미(데몬 없는
+  온라인 노드, 노드마다 Task). OSD 대화상자는 고른 디스크를 by-id
+  경로로 보낸다. 노드를 뺀 응답의 경고는 알림으로 보인다. 풀 화면은 `conf`가 `CephView.managed_conf`인 RBD 풀에 "Orbivisor Ceph", 노드 화면은 "Ceph" 칸(mon·mgr·osd)과
+  메뉴 "디스크…"(`/nodes/{key}/disks` 표). Task 문구 `tasks.op.ceph-*`(실행 노드 이름을 넣음), 진행률은 단계 이름(모르는 단계는 그대로),
+  오류 `ceph_exists`·`ceph_not_ready`·`ceph_busy`·`ceph_limit`·`ceph_unreachable`·`disk_in_use`·`disk_not_empty`의 번역(서버 문구를 붙임).
+- 패키지 `Recommends`에 `qemu-block-extra`(RBD 풀이 쓰는 QEMU rbd 드라이버), `opld.toml.example`에 `[ceph]`. README "Ceph 자동 구성".
+
+**남은 것.**
+- mon·mgr·OSD 빼기(`ceph osd out` → `safe-to-destroy` → `purge` → `lvm zap`), 디스크 교체, 유지보수·비우기 때 `noout`, CephFS·RGW, 바깥
+  Ceph 넘겨받기(adopt), Ceph 업그레이드 지휘(데몬 재시작 순서), 장치 클래스별 CRUSH 규칙·풀, 키 교체, 지운 Orbivisor 풀의 Ceph 풀 지우기,
+  Ceph 클러스터 지우기(`DELETE /ceph`).

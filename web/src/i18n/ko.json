@@ -83,7 +83,14 @@
     "placement_busy": "마이그레이션 둘이 이미 진행 중입니다. 하나가 끝난 뒤 적용하세요.",
     "placement_unavailable": "클러스터 리더에서 배치 상태를 읽지 못했습니다. 잠시 뒤 다시 시도하세요.",
     "hotplug_unavailable": "VM이 실행 중이라 하드웨어를 바꿀 수 없습니다: {{message}}",
-    "replication_unsupported": "복제를 켤 수 없습니다: {{message}}"
+    "replication_unsupported": "복제를 켤 수 없습니다: {{message}}",
+    "ceph_exists": "이미 Ceph가 구성되어 있습니다: {{message}}",
+    "ceph_not_ready": "Ceph 클러스터가 아직 준비되지 않았습니다: {{message}}",
+    "ceph_busy": "다른 Ceph 작업이 진행 중입니다. 끝난 뒤 다시 하세요: {{message}}",
+    "ceph_limit": "{{message}}",
+    "ceph_unreachable": "Ceph 상태를 읽지 못했습니다: {{message}}",
+    "disk_in_use": "이 디스크에는 OSD를 만들 수 없습니다: {{message}}",
+    "disk_not_empty": "디스크가 비어 있지 않습니다. 지우기를 고르세요: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -107,7 +114,8 @@
     "haGroups": "HA 그룹",
     "haChecks": "HA 검사",
     "placementRules": "배치 규칙",
-    "placement": "최적 배치"
+    "placement": "최적 배치",
+    "ceph": "Ceph"
   },
   "header": {
     "language": "언어",
@@ -191,7 +199,13 @@
       "ha-check": "{{target}}의 HA 검사 {{check}}: {{action}}",
       "bond-degraded": "{{target}}의 본딩 {{bond}} 포트 이상",
       "vm-hotplug": "{{target}} 하드웨어 바꾸기",
-      "vm-replicate": "{{target}}을(를) {{node}}에 복제"
+      "vm-replicate": "{{target}}을(를) {{node}}에 복제",
+      "ceph-init": "{{node}}에 Ceph 구성",
+      "ceph-mon-add": "{{node}}에 Ceph 모니터 추가",
+      "ceph-mgr-add": "{{node}}에 Ceph 매니저 추가",
+      "ceph-osd-add": "{{node}} {{device}}에 Ceph OSD 추가",
+      "ceph-pool-create": "Ceph 풀 {{pool}}을(를) 스토리지 풀 {{name}}(으)로 만들기(size {{size}})",
+      "ceph-client-install": "{{node}}에 Ceph 클라이언트 패키지 설치"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
@@ -200,6 +214,18 @@
     },
     "detail": {
       "vms": "VM: {{vms}}."
+    },
+    "cephStage": {
+      "checking": "노드 확인",
+      "installing-packages": "패키지 설치",
+      "writing-config": "설정 쓰기",
+      "creating-monitor": "모니터 만들기",
+      "starting-monitor": "모니터 시작",
+      "waiting-for-quorum": "정족수 기다리기",
+      "creating-manager": "매니저 만들기",
+      "preparing-osd": "OSD 준비",
+      "creating-pool": "Ceph 풀 만들기",
+      "registering-pool": "스토리지 풀 등록"
     }
   },
   "pager": {
@@ -902,7 +928,8 @@
     "holdsBackups_one": "백업 {{count}}개",
     "holdsBackups_other": "백업 {{count}}개",
     "storeBackups": "백업 저장",
-    "storeBackupsHint": "VM 백업을 이 풀의 디렉터리 아래 backups/에 둘 수 있습니다. VM 디스크도 그대로 둘 수 있습니다."
+    "storeBackupsHint": "VM 백업을 이 풀의 디렉터리 아래 backups/에 둘 수 있습니다. VM 디스크도 그대로 둘 수 있습니다.",
+    "managedCeph": "Orbivisor Ceph"
   },
   "networks": {
     "kind": "종류",
@@ -1207,7 +1234,13 @@
     "yes": "예",
     "no": "아니오",
     "replicas": "복제본",
-    "replicasOpen": "{{name}}이(가) 복제본을 둔 VM {{count}}개 보기"
+    "replicasOpen": "{{name}}이(가) 복제본을 둔 VM {{count}}개 보기",
+    "ceph": "Ceph",
+    "disks": {
+      "menu": "디스크…",
+      "title": "{{name}}의 디스크",
+      "description": "노드의 디스크(통째)와 Ceph OSD로 쓸 수 있는지입니다. 쓰는 중인 디스크(시스템, 마운트, 스왑, ZFS, RAID, 스토리지 풀의 볼륨 그룹)는 절대 지우지 않습니다."
+    }
   },
   "accounts": {
     "currentPassword": "현재 비밀번호",
@@ -1980,6 +2013,136 @@
     "saved": "배치 설정을 저장했습니다.",
     "errors": {
       "threshold": "1~50의 정수."
+    }
+  },
+  "ceph": {
+    "pageHint": "Orbivisor가 클러스터 노드에 설치하고 운영하는 Ceph 클러스터입니다: 모니터, 매니저, 디스크 통째를 쓰는 OSD와 스토리지 풀로 등록한 RBD 풀. 이미 있는 Ceph 클러스터를 쓰려면 대신 Ceph RBD 스토리지 풀을 만드세요.",
+    "none": "구성된 Ceph 클러스터가 없습니다. 관리자가 여기서 구성할 수 있습니다.",
+    "noNodes": "고를 수 있는 노드가 없습니다.",
+    "offlineNode": "{{name}}(오프라인)",
+    "phase": "단계",
+    "phases": {
+      "bootstrapping": "구성 중",
+      "ready": "준비됨"
+    },
+    "release": "릴리스",
+    "fsid": "fsid",
+    "publicNetwork": "공개 네트워크",
+    "clusterNetwork": "클러스터 네트워크",
+    "managedConf": "클라이언트 설정",
+    "settingUp": "{{node}}에서 Ceph를 구성하는 중입니다.",
+    "notReady": "Ceph 구성이 끝나지 않았습니다.",
+    "retry": "다시 하기",
+    "retryElsewhere": "{{node}}가 오프라인입니다. 다시 할 노드:",
+    "stale": "{{time}}에 읽은 Ceph 상태입니다. 지금은 읽지 못합니다: {{error}}",
+    "health": "상태",
+    "unknown": "알 수 없음",
+    "checks": "상태 검사",
+    "muted": "음소거",
+    "monitors": "모니터: {{n}}개(정족수 {{quorum}}개)",
+    "address": "주소",
+    "quorum": "정족수",
+    "inQuorum": "정족수에 듦",
+    "outOfQuorum": "정족수 밖",
+    "managers": "매니저",
+    "mgrActive": "{{name}}(활성)",
+    "mgrNone": "활성 매니저 없음",
+    "mgrStandbys": "대기: {{names}}",
+    "usage": "사용량",
+    "usageText": "{{used}} 사용, {{total}} 가운데 {{available}} 남음",
+    "pgs": "배치 그룹: {{n}}개",
+    "pgStates": "배치 그룹 상태",
+    "osds": "OSD: up {{up}}, in {{in}}, 전체 {{total}}(호스트 {{hosts}}개)",
+    "osdId": "OSD",
+    "class": "클래스",
+    "used": "사용",
+    "noOsds": "아직 OSD가 없습니다.",
+    "host": "{{host}}: {{total}}개 가운데 {{up}}개 up",
+    "up": "up",
+    "down": "down",
+    "in": "in",
+    "out": "out",
+    "pools": "풀",
+    "mon": {
+      "add": "모니터 추가",
+      "addTitle": "Ceph 모니터 추가",
+      "addDescription": "노드가 Ceph 패키지를 설치하고 모니터 정족수에 들어갑니다. 서로 다른 노드의 모니터 셋이면 노드 하나가 꺼져도 Ceph가 돕니다.",
+      "limit": "Ceph 클러스터에 모니터가 이미 {{n}}개 있습니다(최대).",
+      "even": "모니터가 홀수(3이나 5)여야 정족수를 가장 잘 지킵니다."
+    },
+    "mgr": {
+      "add": "매니저 추가",
+      "addTitle": "Ceph 매니저 추가",
+      "addDescription": "노드가 Ceph 패키지를 설치하고, 활성 매니저가 멈추면 이어받는 대기 매니저를 돌립니다."
+    },
+    "osd": {
+      "add": "OSD 추가",
+      "addTitle": "Ceph OSD 추가",
+      "addDescription": "노드가 Ceph 패키지를 설치하고 디스크 통째에 OSD(LVM 위의 BlueStore)를 만듭니다.",
+      "wipeAndAdd": "지우고 OSD 추가",
+      "typeDevice": "모든 데이터를 지우려면 {{device}}을(를) 입력하세요",
+      "wipeWarning": "디스크가 비어 있지 않습니다: {{reasons}}. 모두 지워집니다."
+    },
+    "pool": {
+      "create": "풀 만들기",
+      "createTitle": "Ceph 풀 만들기",
+      "createDescription": "Ceph에 RBD 풀을 만들고, 모든 노드가 관리 클라이언트 설정으로 쓰는 공유 스토리지 풀로 등록합니다.",
+      "cephPool": "Ceph 풀",
+      "cephPoolHint": "비워 두면 스토리지 풀 이름을 씁니다.",
+      "storagePool": "스토리지 풀",
+      "size": "복제 수(size)",
+      "sizeHint": "OSD가 up인 호스트가 {{hosts}}개입니다. 사본마다 다른 호스트에 둡니다.",
+      "sizeOne": "size 1은 사본을 하나만 둡니다: 그 디스크가 고장 나면 데이터를 잃습니다.",
+      "sizeTwo": "size 2는 사본 하나가 꺼졌을 때 데이터를 잃을 수 있습니다. 3을 권장합니다.",
+      "singleConfirm": "중복 사본이 없음을 이해했습니다",
+      "stored": "저장됨",
+      "available": "남은 공간"
+    },
+    "clients": {
+      "title": "Ceph 클라이언트 패키지 설치",
+      "description": "Ceph 데몬이 없는 노드가 Ceph 풀을 쓰려면 ceph-common과 QEMU rbd 드라이버(qemu-block-extra)가 있어야 합니다. 클라이언트 설정은 이미 쓰여 있습니다.",
+      "install": "클라이언트 패키지 설치",
+      "none": "온라인 노드가 모두 이미 Ceph 데몬을 돌리거나 위트니스입니다."
+    },
+    "disk": {
+      "available": "쓸 수 있음",
+      "wipe": "지워야 함",
+      "blocked": "쓰는 중",
+      "none": "노드가 알린 디스크가 없습니다.",
+      "choose": "고르기",
+      "device": "장치",
+      "size": "크기",
+      "type": "종류",
+      "model": "모델",
+      "table": "디스크"
+    },
+    "wizard": {
+      "title": "Ceph 구성",
+      "steps": {
+        "network": "노드와 네트워크",
+        "progress": "만들기",
+        "mons": "모니터",
+        "osds": "OSD",
+        "pool": "풀",
+        "clients": "클라이언트 패키지"
+      },
+      "networkHint": "첫 모니터와 매니저가 이 노드에서 돕니다. 노드들은 같은 Ceph 릴리스, 맞춘 시계(NTP), 열린 포트 3300, 6789, 6800-7300/tcp가 필요합니다.",
+      "initNode": "첫 노드",
+      "publicHint": "모니터와 클라이언트의 네트워크(CIDR)입니다. 노드 주소로 채웠습니다. 비워 두면 서버가 같은 방법으로 정합니다.",
+      "clusterHint": "OSD 복제에 따로 쓸 네트워크(CIDR, 선택)입니다.",
+      "create": "Ceph 구성",
+      "stages": "구성 단계",
+      "failed": "Ceph 구성이 실패했습니다: {{error}}",
+      "next": "다음",
+      "finish": "마치기",
+      "busy": "Ceph 작업이 진행 중입니다.",
+      "haveMons": "지금 모니터: {{n}}개({{names}})",
+      "haveOsds": "OSD가 있는 노드: {{names}}",
+      "haveHosts": "OSD가 up인 호스트: {{n}}개",
+      "monsHint": "다른 노드 둘에 모니터를 하나씩 더하세요(셋을 권장). 건너뛸 수 있습니다.",
+      "osdsHint": "노드의 디스크 통째에 OSD를 더하세요. 비어 있지 않은 디스크는 지워야 하고, 쓰는 중인 디스크는 고를 수 없습니다.",
+      "poolHint": "Ceph 풀을 만들어 스토리지 풀로 등록하세요. 먼저 OSD를 더하세요.",
+      "clientsHint": "Ceph 데몬이 없는 노드의 VM도 풀을 쓰도록 클라이언트 패키지를 설치할 수 있습니다(선택)."
     }
   }
 }
