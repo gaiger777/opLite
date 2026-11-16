@@ -1,0 +1,438 @@
+{
+   "blockdevices": [
+      {
+         "name": "/dev/sdh",
+         "kname": "/dev/sdh",
+         "type": "disk",
+         "size": 107374182400,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "LVM2_member",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/mapper/vg0-thin_tmeta",
+               "kname": "/dev/dm-4",
+               "type": "lvm",
+               "size": 67108864,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": null,
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdh",
+               "children": [
+                  {
+                     "name": "/dev/mapper/vg0-thin-tpool",
+                     "kname": "/dev/dm-8",
+                     "type": "lvm",
+                     "size": 106300440576,
+                     "ro": false,
+                     "rm": false,
+                     "rota": true,
+                     "model": null,
+                     "serial": null,
+                     "wwn": null,
+                     "fstype": null,
+                     "pttype": null,
+                     "mountpoints": [
+                        null
+                     ],
+                     "pkname": "/dev/mapper/vg0-thin_tmeta"
+                  }
+               ]
+            },
+            {
+               "name": "/dev/mapper/vg0-thin_tdata",
+               "kname": "/dev/dm-7",
+               "type": "lvm",
+               "size": 106300440576,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": null,
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdh",
+               "children": [
+                  {
+                     "name": "/dev/mapper/vg0-thin-tpool",
+                     "kname": "/dev/dm-8",
+                     "type": "lvm",
+                     "size": 106300440576,
+                     "ro": false,
+                     "rm": false,
+                     "rota": true,
+                     "model": null,
+                     "serial": null,
+                     "wwn": null,
+                     "fstype": null,
+                     "pttype": null,
+                     "mountpoints": [
+                        null
+                     ],
+                     "pkname": "/dev/mapper/vg0-thin_tdata"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdi",
+         "kname": "/dev/sdi",
+         "type": "disk",
+         "size": 53687091200,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "LVM2_member",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/mapper/data-archive",
+               "kname": "/dev/dm-7",
+               "type": "lvm",
+               "size": 42949672960,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "xfs",
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdi"
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdj",
+         "kname": "/dev/sdj",
+         "type": "disk",
+         "size": 53687091200,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "LVM2_member",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/mapper/wide-big",
+               "kname": "/dev/dm-1",
+               "type": "lvm",
+               "size": 96636764160,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "ext4",
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdj"
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdk",
+         "kname": "/dev/sdk",
+         "type": "disk",
+         "size": 53687091200,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "LVM2_member",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/mapper/wide-big",
+               "kname": "/dev/dm-1",
+               "type": "lvm",
+               "size": 96636764160,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "ext4",
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdk"
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdl",
+         "kname": "/dev/sdl",
+         "type": "disk",
+         "size": 53687091200,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": null,
+         "pttype": "gpt",
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/sdl1",
+               "kname": "/dev/sdl1",
+               "type": "part",
+               "size": 53678702592,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "zfs_member",
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdl"
+            },
+            {
+               "name": "/dev/sdl9",
+               "kname": "/dev/sdl9",
+               "type": "part",
+               "size": 8388608,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": null,
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdl"
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdm",
+         "kname": "/dev/sdm",
+         "type": "disk",
+         "size": 21474836480,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "LVM2_member",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/mapper/ceph--9a1e2b3c--4d5e--4f60--8a71--b2c3d4e5f607-osd--block--5d1c0f8e--6a3b--4c1e--9f0a--2b7d8e9c1a24",
+               "kname": "/dev/dm-6",
+               "type": "lvm",
+               "size": 21474836480,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "ceph_bluestore",
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdm"
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdn",
+         "kname": "/dev/sdn",
+         "type": "disk",
+         "size": 6442450944,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "LVM2_member",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/mapper/ceph--4236eeea--189f--4909--b2ff--03683a9a0b9c-osd--block--0851efa7--c274--4d7d--a734--b3a881914253",
+               "kname": "/dev/dm-5",
+               "type": "lvm",
+               "size": 6442450944,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "ceph_bluestore",
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdn"
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdo",
+         "kname": "/dev/sdo",
+         "type": "disk",
+         "size": 21474836480,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "linux_raid_member",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/md0",
+               "kname": "/dev/md0",
+               "type": "raid1",
+               "size": 21474836480,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "ext4",
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdo"
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdp",
+         "kname": "/dev/sdp",
+         "type": "disk",
+         "size": 8589934592,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "swap",
+         "pttype": null,
+         "mountpoints": [
+            "[SWAP]"
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/sdq",
+         "kname": "/dev/sdq",
+         "type": "disk",
+         "size": 8589934592,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "LVM2_member",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/sdr",
+         "kname": "/dev/sdr",
+         "type": "disk",
+         "size": 8589934592,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "ceph_bluestore",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      }
+   ]
+}

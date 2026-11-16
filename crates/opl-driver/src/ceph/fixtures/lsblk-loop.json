@@ -1,0 +1,58 @@
+{
+   "blockdevices": [
+      {
+         "name": "/dev/loop0",
+         "kname": "/dev/loop0",
+         "type": "loop",
+         "size": 66789376,
+         "ro": false,
+         "rm": false,
+         "rota": false,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "squashfs",
+         "pttype": null,
+         "mountpoints": [
+            "/snap/core20/2318"
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/loop2",
+         "kname": "/dev/loop2",
+         "type": "loop",
+         "size": 6442450944,
+         "ro": false,
+         "rm": false,
+         "rota": false,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": null,
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/loop3",
+         "kname": "/dev/loop3",
+         "type": "loop",
+         "size": 10737418240,
+         "ro": false,
+         "rm": false,
+         "rota": false,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "ext4",
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      }
+   ]
+}

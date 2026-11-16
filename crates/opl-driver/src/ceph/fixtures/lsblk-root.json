@@ -1,0 +1,281 @@
+{
+   "blockdevices": [
+      {
+         "name": "/dev/sda",
+         "kname": "/dev/sda",
+         "type": "disk",
+         "size": 68719476736,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": "QEMU HARDDISK   ",
+         "serial": "drive-scsi0",
+         "wwn": "0x5000c500a1b2c3d4",
+         "fstype": null,
+         "pttype": "gpt",
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/sda1",
+               "kname": "/dev/sda1",
+               "type": "part",
+               "size": 1073741824,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "vfat",
+               "pttype": null,
+               "mountpoints": [
+                  "/boot/efi"
+               ],
+               "pkname": "/dev/sda"
+            },
+            {
+               "name": "/dev/sda2",
+               "kname": "/dev/sda2",
+               "type": "part",
+               "size": 2147483648,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "ext4",
+               "pttype": null,
+               "mountpoints": [
+                  "/boot"
+               ],
+               "pkname": "/dev/sda"
+            },
+            {
+               "name": "/dev/sda3",
+               "kname": "/dev/sda3",
+               "type": "part",
+               "size": 65498251264,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "LVM2_member",
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sda",
+               "children": [
+                  {
+                     "name": "/dev/mapper/ubuntu--vg-ubuntu--lv",
+                     "kname": "/dev/dm-2",
+                     "type": "lvm",
+                     "size": 61203283968,
+                     "ro": false,
+                     "rm": false,
+                     "rota": true,
+                     "model": null,
+                     "serial": null,
+                     "wwn": null,
+                     "fstype": "ext4",
+                     "pttype": null,
+                     "mountpoints": [
+                        "/"
+                     ],
+                     "pkname": "/dev/sda3"
+                  },
+                  {
+                     "name": "/dev/mapper/ubuntu--vg-swap",
+                     "kname": "/dev/dm-3",
+                     "type": "lvm",
+                     "size": 4294967296,
+                     "ro": false,
+                     "rm": false,
+                     "rota": true,
+                     "model": null,
+                     "serial": null,
+                     "wwn": null,
+                     "fstype": "swap",
+                     "pttype": null,
+                     "mountpoints": [
+                        "[SWAP]"
+                     ],
+                     "pkname": "/dev/sda3"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdb",
+         "kname": "/dev/sdb",
+         "type": "disk",
+         "size": 10737418240,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": "QEMU HARDDISK",
+         "serial": "drive-scsi1",
+         "wwn": "0x5000c500a1b2c3d5",
+         "fstype": null,
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/sdc",
+         "kname": "/dev/sdc",
+         "type": "disk",
+         "size": 21474836480,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": "ST2000DM008",
+         "serial": "ZFL0ABCD",
+         "wwn": null,
+         "fstype": null,
+         "pttype": "gpt",
+         "mountpoints": [
+            null
+         ],
+         "pkname": null,
+         "children": [
+            {
+               "name": "/dev/sdc1",
+               "kname": "/dev/sdc1",
+               "type": "part",
+               "size": 21473787904,
+               "ro": false,
+               "rm": false,
+               "rota": true,
+               "model": null,
+               "serial": null,
+               "wwn": null,
+               "fstype": "ext4",
+               "pttype": null,
+               "mountpoints": [
+                  null
+               ],
+               "pkname": "/dev/sdc"
+            }
+         ]
+      },
+      {
+         "name": "/dev/sdd",
+         "kname": "/dev/sdd",
+         "type": "disk",
+         "size": 21474836480,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": null,
+         "wwn": null,
+         "fstype": "ext4",
+         "pttype": null,
+         "mountpoints": [
+            "/srv",
+            "/var/lib/backup"
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/nvme0n1",
+         "kname": "/dev/nvme0n1",
+         "type": "disk",
+         "size": 500107862016,
+         "ro": false,
+         "rm": false,
+         "rota": false,
+         "model": "Samsung SSD 980 500GB",
+         "serial": "S64DNF0R123456",
+         "wwn": "eui.002538b111b22c33",
+         "fstype": null,
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/sde",
+         "kname": "/dev/sde",
+         "type": "disk",
+         "size": 10737418240,
+         "ro": true,
+         "rm": false,
+         "rota": true,
+         "model": "Virtual CD",
+         "serial": "RO1",
+         "wwn": null,
+         "fstype": null,
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/sdf",
+         "kname": "/dev/sdf",
+         "type": "disk",
+         "size": 34359738368,
+         "ro": false,
+         "rm": true,
+         "rota": true,
+         "model": "Ultra USB 3.0",
+         "serial": "4C530001",
+         "wwn": null,
+         "fstype": null,
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/sdg",
+         "kname": "/dev/sdg",
+         "type": "disk",
+         "size": 4294967296,
+         "ro": false,
+         "rm": false,
+         "rota": true,
+         "model": null,
+         "serial": "SMALL1",
+         "wwn": null,
+         "fstype": null,
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      },
+      {
+         "name": "/dev/sr0",
+         "kname": "/dev/sr0",
+         "type": "rom",
+         "size": 1073741312,
+         "ro": false,
+         "rm": true,
+         "rota": true,
+         "model": "QEMU DVD-ROM",
+         "serial": null,
+         "wwn": null,
+         "fstype": null,
+         "pttype": null,
+         "mountpoints": [
+            null
+         ],
+         "pkname": null
+      }
+   ]
+}
