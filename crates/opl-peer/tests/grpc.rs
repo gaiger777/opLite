@@ -17,7 +17,8 @@ use opl_peer::{
     AuditSource, FenceSource, GrpcNetwork, IncomingDisk, IncomingError, IncomingMigration,
     LEASE_LIVENESS, MetricsReply, MetricsSource, MigrateIncomingRequest, MigrateIncomingResponse,
     MigrationReceiver, NodeMonitor, NodeMonitorConfig, PeerService, Peers, PlacementSource,
-    UefiVarsError, renew_liveness,
+    PrepareMode, PrepareVolume, ReplicaAbortRequest, ReplicaError, ReplicaFinishRequest,
+    ReplicaPrepareRequest, ReplicaPrepareResponse, ReplicaReceiver, UefiVarsError, renew_liveness,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
@@ -213,6 +214,66 @@ impl MigrationReceiver for FakeReceiver {
             .lock()
             .unwrap()
             .push(format!("abort {} {}", req.vm, req.task));
+        Ok(())
+    }
+}
+
+/// 받은 복제 요청을 적는 받는 쪽. 증분 디스크는 거절하고, 끝내기는 `ok`가 아니면 실패한다.
+#[derive(Default)]
+struct FakeReplicas {
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl ReplicaReceiver for FakeReplicas {
+    async fn prepare(
+        &self,
+        req: ReplicaPrepareRequest,
+    ) -> Result<ReplicaPrepareResponse, ReplicaError> {
+        self.calls.lock().unwrap().push(format!(
+            "prepare {} {} {}",
+            req.vm, req.run, req.dirty_bytes
+        ));
+        let refused: Vec<Uuid> = req
+            .volumes
+            .iter()
+            .filter(|v| v.mode != PrepareMode::Full)
+            .map(|v| v.id)
+            .collect();
+        if !refused.is_empty() {
+            return Ok(ReplicaPrepareResponse {
+                port: 0,
+                exports: vec![],
+                refused,
+            });
+        }
+        Ok(ReplicaPrepareResponse {
+            port: 60009,
+            exports: req
+                .volumes
+                .iter()
+                .map(|v| v.id.simple().to_string())
+                .collect(),
+            refused: vec![],
+        })
+    }
+
+    async fn finish(&self, req: ReplicaFinishRequest) -> Result<(), ReplicaError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("finish {} {} {}", req.run, req.ok, req.synced_at));
+        if !req.ok {
+            return Err(ReplicaError::Failed("the replica receiver failed".into()));
+        }
+        Ok(())
+    }
+
+    async fn abort(&self, req: ReplicaAbortRequest) -> Result<(), ReplicaError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("abort {}", req.run));
         Ok(())
     }
 }
@@ -1107,6 +1168,130 @@ async fn incoming_migrations_run_on_the_work_runtime() {
         *receiver.threads.lock().unwrap(),
         ["peer-work", "peer-work"]
     );
+}
+
+#[tokio::test]
+async fn replica_requests_reach_the_receiver_of_a_member() {
+    let (ca, root, nodes) = start(1).await;
+    let receiver = Arc::new(FakeReplicas::default());
+    let target = Node::start_serving(&ca, &root, {
+        let receiver = receiver.clone();
+        |service| service.with_replicas(receiver)
+    })
+    .await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+            addrs: vec![],
+        })
+        .await
+        .unwrap();
+    let source = nodes[0].id();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(source) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (vm, run, id) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    let volume = |mode| PrepareVolume {
+        id,
+        pool: "b".into(),
+        format: ImageFormat::Qcow2,
+        size_bytes: 1 << 30,
+        allocated_bytes: 1 << 20,
+        mode,
+    };
+    let req = |mode| ReplicaPrepareRequest {
+        vm,
+        task: run,
+        run,
+        volumes: vec![volume(mode)],
+        dirty_bytes: 4096,
+    };
+    let peers = &nodes[0].peers;
+    let reply = peers
+        .replica_prepare(&target.addr, req(PrepareMode::Full))
+        .await
+        .unwrap();
+    assert_eq!(
+        reply,
+        ReplicaPrepareResponse {
+            port: 60009,
+            exports: vec![id.simple().to_string()],
+            refused: vec![],
+        }
+    );
+    // 받는 쪽이 거절한 디스크는 응답에 실려 온다.
+    let reply = peers
+        .replica_prepare(
+            &target.addr,
+            req(PrepareMode::Incremental { base_synced_at: 7 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.refused, [id]);
+    let finish = |ok| ReplicaFinishRequest {
+        vm,
+        task: run,
+        run,
+        ok,
+        synced_at: 1700,
+        volumes: vec![id],
+    };
+    peers
+        .replica_finish(&target.addr, finish(true))
+        .await
+        .unwrap();
+    // 받는 쪽의 실패는 그 종류 그대로 온다.
+    let err = peers
+        .replica_finish(&target.addr, finish(false))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ReplicaError::Failed("the replica receiver failed".into())
+    );
+    let abort = ReplicaAbortRequest { vm, task: run, run };
+    peers.replica_abort(&target.addr, abort).await.unwrap();
+    assert_eq!(
+        *receiver.calls.lock().unwrap(),
+        [
+            format!("prepare {vm} {run} 4096"),
+            format!("prepare {vm} {run} 4096"),
+            format!("finish {run} true 1700"),
+            format!("finish {run} false 1700"),
+            format!("abort {run}"),
+        ]
+    );
+
+    // 받는 처리가 없는 노드(옛 노드)는 unimplemented로 거부한다.
+    let err = target
+        .peers
+        .replica_abort(&nodes[0].addr, abort)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ReplicaError::Unavailable(m) if m.contains("does not receive replicas")),
+        "{err:?}"
+    );
+    // 멤버가 아닌 노드의 요청은 받는 쪽에 닿지 않는다.
+    let outsider = Node::start(&ca, &root).await;
+    let err = outsider
+        .peers
+        .replica_prepare(&target.addr, req(PrepareMode::Full))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ReplicaError::Unavailable(m) if m.contains("not a member")),
+        "{err:?}"
+    );
+    assert_eq!(receiver.calls.lock().unwrap().len(), 5);
 }
 
 /// 받는 처리가 panic한다.

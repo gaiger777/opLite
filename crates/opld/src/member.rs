@@ -14,9 +14,10 @@ use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
     ApiCertAgent, AppState, AuditLog, BackupJobScheduler, Balancer, ClusterJanitor,
     FenceStatusSource, HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations,
-    PlacementBoard, PlacementStatusSource, PowerFence, RemotePoller, RuntimeProbe,
-    SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher,
-    UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
+    IncomingReplicas, PlacementBoard, PlacementStatusSource, PowerFence, RemotePoller,
+    ReplicaConfig, RuntimeProbe, SnapshotScheduler, TaskRunner, TaskRunnerConfig,
+    TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent, VipManager,
+    VipManagerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
@@ -62,6 +63,8 @@ use crate::shutdown;
 pub const CLUSTER_DIR: &str = "cluster";
 /// 데이터 디렉터리 아래 마이그레이션 디스크 기록 파일을 두는 디렉터리(로컬 디스크 마이그레이션 설계 §3.6)
 const MIGRATION_DISKS_DIR: &str = "migration-disks";
+/// 데이터 디렉터리 아래 복제본 기록 파일과 증분 겹층을 두는 디렉터리(로컬 디스크 복제, 계획 55)
+const REPLICAS_DIR: &str = "replicas";
 /// 종료 신호를 받은 뒤 열린 연결(watch, 콘솔)이 끝나기를 기다리는 시간
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 쓰기가 커밋되기를 기다리는 시간. 리더를 잃으면 새 리더를 뽑는 데 보통 선거 제한 시간의 두 배쯤
@@ -178,6 +181,8 @@ struct Services {
     api_cert: Option<ApiCertAgent>,
     reconciler: Reconciler,
     runner: TaskRunner,
+    /// 이 노드의 복제본 기록을 청소한다(지운 VM·뺀 대상·뗀 디스크의 복제본, 끝난 회차의 겹층·받는 QEMU).
+    replica_sweep: JoinHandle<()>,
     monitor: NodeMonitor,
     /// 리더가 투표 멤버를 상한(클러스터 설정 `voters`)에 맞춘다.
     voter_keeper: VoterKeeper,
@@ -259,6 +264,7 @@ impl Services {
         if let Some(overlay) = self.overlay {
             overlay.shutdown(left).await;
         }
+        self.replica_sweep.abort();
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
         // 작업자가 다시 켜지 않게 reconciler를 멈춘 뒤, 도는 HA VM 목록을 닫기(`ha.close()`) 전에 끈다.
@@ -452,6 +458,19 @@ impl Member {
                 migration_disks: config.data_dir.join(MIGRATION_DISKS_DIR),
             },
         );
+        // 복제 회차도 마이그레이션처럼 reconciler 없이 받는다(복제본은 Raft 리소스가 아니다).
+        let replicas = IncomingReplicas::new(
+            cluster.clone(),
+            hv.clone(),
+            ReplicaConfig {
+                node,
+                mount_root: mount_root.clone(),
+                storage: storage.clone(),
+                listen_host: config.migration_listen_host(),
+                ports: config.migration.ports.clone(),
+                replica_dir: config.data_dir.join(REPLICAS_DIR),
+            },
+        );
         // API가 적고, 다른 노드가 노드 간 서버로 읽는다.
         let audit = match config.audit.audit_config(&config.data_dir, &config.name) {
             Some(audit) => {
@@ -485,6 +504,7 @@ impl Member {
         // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(incoming.with_firewall(gate.clone())))
+            .with_replicas(Arc::new(replicas.clone()))
             .with_uefi_vars(config.data_dir.clone())
             .with_audit(audit.clone())
             .with_metrics(metrics_source.clone())
@@ -587,6 +607,8 @@ impl Member {
         });
         let firewall = on(&rt.work, || firewall.map(FirewallAgent::spawn));
         let mut reconciler_config = ReconcilerConfig::new(node, &mount_root, storage.clone());
+        // 받는 쪽(ReplicaConfig)과 같은 디렉터리다.
+        reconciler_config.replica_dir = config.data_dir.join(REPLICAS_DIR);
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
         // 다른 노드에 있는 UEFI 변수 파일을 노드 사이 RPC로 받아 온다(시작, 스냅샷, 복제).
         let firmware: Arc<dyn FirmwareFetcher> = Arc::new(UefiVarsFetcher::new(
@@ -714,6 +736,7 @@ impl Member {
             ),
         )
         .await;
+        let replica_sweep = rt.work.spawn(replicas.sweep_every());
         let fence_watch = on(&rt.work, || {
             FenceWatch::spawn(cluster.clone(), peers.clone(), node)
         });
@@ -816,6 +839,7 @@ impl Member {
                 api_cert,
                 reconciler,
                 runner,
+                replica_sweep,
                 monitor,
                 voter_keeper,
                 schedule,

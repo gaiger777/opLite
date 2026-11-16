@@ -6,6 +6,7 @@ use opl_cluster::types::{NodeId, TypeConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::migration::{IncomingError, MigrateIncomingResponse};
+use crate::replica::{ReplicaError, ReplicaPrepareResponse};
 
 pub type AppendEntriesRequest = openraft::raft::AppendEntriesRequest<TypeConfig>;
 pub type AppendEntriesReply =
@@ -24,6 +25,10 @@ pub type Empty = ();
 pub type MigrateIncomingReply = Result<MigrateIncomingResponse, IncomingError>;
 /// 받기 확인·취소의 결과
 pub type IncomingReply = Result<(), IncomingError>;
+/// 복제 받을 준비의 결과. 받는 쪽의 거절·실패도 본문에 담는다.
+pub type ReplicaPrepareReply = Result<ReplicaPrepareResponse, ReplicaError>;
+/// 복제 회차 끝내기·버리기의 결과
+pub type ReplicaReply = Result<(), ReplicaError>;
 
 /// 관찰 노드가 투표 멤버에 거는 Follow. `since` 뒤의 상태를 받는다(`opl_cluster::FollowFrame` 스트림).
 #[derive(Debug, Clone, Serialize, Deserialize)]

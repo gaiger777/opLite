@@ -66,6 +66,24 @@ fn main() {
             "crate::wire::IncomingReply",
         ))
         .method(json(
+            "replica_prepare",
+            "ReplicaPrepare",
+            "crate::replica::ReplicaPrepareRequest",
+            "crate::wire::ReplicaPrepareReply",
+        ))
+        .method(json(
+            "replica_finish",
+            "ReplicaFinish",
+            "crate::replica::ReplicaFinishRequest",
+            "crate::wire::ReplicaReply",
+        ))
+        .method(json(
+            "replica_abort",
+            "ReplicaAbort",
+            "crate::replica::ReplicaAbortRequest",
+            "crate::wire::ReplicaReply",
+        ))
+        .method(json(
             "read_audit",
             "ReadAudit",
             "opl_types::audit::AuditQuery",

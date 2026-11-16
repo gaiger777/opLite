@@ -31,9 +31,13 @@ use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationRecei
 use crate::pki::{NodeTls, node_id_of};
 use crate::placement::{PlacementRequest, PlacementSource};
 use crate::proto::peer_server::{Peer, PeerServer};
+use crate::replica::{
+    ReplicaAbortRequest, ReplicaFinishRequest, ReplicaPrepareRequest, ReplicaReceiver,
+};
 use crate::wire::{
     AppendEntriesReply, AppendEntriesRequest, FollowRequest, IncomingReply, InstallSnapshotReply,
-    InstallSnapshotRequest, LeaderReply, MigrateIncomingReply, VoteReply, VoteRequest,
+    InstallSnapshotRequest, LeaderReply, MigrateIncomingReply, ReplicaPrepareReply, ReplicaReply,
+    VoteReply, VoteRequest,
 };
 use crate::{
     KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, TARGET_METADATA, VM_METADATA,
@@ -46,6 +50,7 @@ pub struct PeerService {
     cluster: Arc<Cluster>,
     hv: Option<Arc<dyn Hypervisor>>,
     migrations: Option<Arc<dyn MigrationReceiver>>,
+    replicas: Option<Arc<dyn ReplicaReceiver>>,
     audit: Option<Arc<dyn AuditSource>>,
     metrics: Option<Arc<dyn MetricsSource>>,
     fence: Option<Arc<dyn FenceSource>>,
@@ -64,6 +69,7 @@ impl PeerService {
             cluster,
             hv,
             migrations: None,
+            replicas: None,
             audit: None,
             metrics: None,
             fence: None,
@@ -89,6 +95,13 @@ impl PeerService {
     /// 라이브 마이그레이션을 `receiver`로 받는다. 없으면 받기 요청을 거부한다.
     pub fn with_migrations(mut self, receiver: Arc<dyn MigrationReceiver>) -> Self {
         self.migrations = Some(receiver);
+        self
+    }
+
+    /// 로컬 디스크 복제 회차를 `receiver`로 받는다. 없으면 받기 요청을 `unimplemented`로 거부한다(옛 노드와
+    /// 같다).
+    pub fn with_replicas(mut self, receiver: Arc<dyn ReplicaReceiver>) -> Self {
+        self.replicas = Some(receiver);
         self
     }
 
@@ -121,6 +134,12 @@ impl PeerService {
         self.migrations
             .clone()
             .ok_or_else(|| Status::unimplemented("this node does not receive migrations"))
+    }
+
+    fn replicas(&self) -> Result<Arc<dyn ReplicaReceiver>, Status> {
+        self.replicas
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not receive replicas"))
     }
 
     /// `fut`을 `work` 실행기(없으면 여기)에서 돌리고 기다린다. 처리가 panic하면 다시 던지지 않고
@@ -264,6 +283,42 @@ impl Peer for PeerService {
     ) -> Result<Response<IncomingReply>, Status> {
         self.authorize(&req)?;
         let (receiver, req) = (self.migrations()?, req.into_inner());
+        let reply = self
+            .offload(async move { receiver.abort(req).await })
+            .await?;
+        Ok(Response::new(reply))
+    }
+
+    async fn replica_prepare(
+        &self,
+        req: Request<ReplicaPrepareRequest>,
+    ) -> Result<Response<ReplicaPrepareReply>, Status> {
+        self.authorize(&req)?;
+        let (receiver, req) = (self.replicas()?, req.into_inner());
+        let reply = self
+            .offload(async move { receiver.prepare(req).await })
+            .await?;
+        Ok(Response::new(reply))
+    }
+
+    async fn replica_finish(
+        &self,
+        req: Request<ReplicaFinishRequest>,
+    ) -> Result<Response<ReplicaReply>, Status> {
+        self.authorize(&req)?;
+        let (receiver, req) = (self.replicas()?, req.into_inner());
+        let reply = self
+            .offload(async move { receiver.finish(req).await })
+            .await?;
+        Ok(Response::new(reply))
+    }
+
+    async fn replica_abort(
+        &self,
+        req: Request<ReplicaAbortRequest>,
+    ) -> Result<Response<ReplicaReply>, Status> {
+        self.authorize(&req)?;
+        let (receiver, req) = (self.replicas()?, req.into_inner());
         let reply = self
             .offload(async move { receiver.abort(req).await })
             .await?;

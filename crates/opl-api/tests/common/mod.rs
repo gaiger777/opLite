@@ -82,6 +82,7 @@ pub fn reconciler_config(node: Uuid) -> ReconcilerConfig {
         firmware: None,
         ha: None,
         firewall: None,
+        replica_dir: "/nonexistent/opl-replicas".into(),
     }
 }
 
@@ -662,6 +663,12 @@ pub struct FakeStorage {
     deactivations: std::sync::Mutex<Vec<(String, Uuid)>>,
     /// `activate_volume`의 볼륨(차례대로)
     activations: std::sync::Mutex<Vec<Uuid>>,
+    /// 복제 겹층 호출(`create`·`commit`)과 볼륨(차례대로). 겹층이 없는 `commit_overlay`는 적지 않는다.
+    overlays: std::sync::Mutex<Vec<(&'static str, Uuid)>>,
+    /// 남은 횟수만큼 `commit_overlay`가 겹층을 남긴 채 실패한다(합치다 끊김).
+    failing_commits: std::sync::Mutex<usize>,
+    /// 있으면 `commit_overlay`가 (호출을 적은 뒤) 이 세마포어의 허가를 하나 받을 때까지 멈춘다(느린 합치기).
+    commit_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl FakeStorage {
@@ -795,6 +802,29 @@ impl FakeStorage {
     /// `import_volume`으로 만든 볼륨과 그 형식
     pub fn import_formats(&self) -> Vec<(Uuid, ImageFormat)> {
         self.import_formats.lock().unwrap().clone()
+    }
+
+    /// 복제 겹층 호출(`create`·`commit`)과 볼륨(차례대로)
+    pub fn overlays(&self) -> Vec<(&'static str, Uuid)> {
+        self.overlays.lock().unwrap().clone()
+    }
+
+    /// 다음 `n`번의 `commit_overlay`가 (호출을 적은 뒤) 겹층을 남긴 채 실패한다.
+    pub fn fail_commits(&self, n: usize) {
+        *self.failing_commits.lock().unwrap() = n;
+    }
+
+    /// 이후의 `commit_overlay`가 (호출을 적은 뒤) 돌려준 세마포어에 허가가 생길 때까지 멈춘다(`add_permits`로 푼다).
+    pub fn hold_commits(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.commit_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// 볼륨 `id`의 파일을 저장소 밖에서 지운 것처럼 없앤다(지우기로 적지 않는다).
+    pub fn lose_file(&self, id: Uuid) {
+        self.files.lock().unwrap().remove(&id);
+        self.sizes.lock().unwrap().remove(&id);
     }
 
     pub fn pause(&self) {
@@ -1080,6 +1110,43 @@ impl Storage for FakeStorage {
         _: ImageFormat,
         _: Option<&str>,
     ) -> Result<(), DriverError> {
+        Ok(())
+    }
+    /// 겹층 파일을 빈 파일로 만들고 `create`로 적는다.
+    async fn create_overlay(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+        overlay: &Path,
+    ) -> Result<(), DriverError> {
+        std::fs::write(overlay, b"")?;
+        self.overlays.lock().unwrap().push(("create", id));
+        Ok(())
+    }
+    /// 겹층이 있으면 `commit`으로 적고 지운다(실패를 주입했으면 남긴다).
+    async fn commit_overlay(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+        overlay: &Path,
+    ) -> Result<(), DriverError> {
+        if !overlay.exists() {
+            return Ok(());
+        }
+        self.overlays.lock().unwrap().push(("commit", id));
+        let gate = self.commit_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        let mut failing = self.failing_commits.lock().unwrap();
+        if *failing > 0 {
+            *failing -= 1;
+            return Err(DriverError::Timeout("qemu-img commit"));
+        }
+        drop(failing);
+        std::fs::remove_file(overlay)?;
         Ok(())
     }
     async fn copy_volume(

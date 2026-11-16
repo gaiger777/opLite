@@ -37,6 +37,8 @@ pub struct ReconcilerConfig {
     pub ha: Option<Arc<HaGuard>>,
     /// 이 노드의 방화벽. None이면 방화벽이 없어 보안 그룹을 건 NIC가 있는 VM을 켜지 않는다.
     pub firewall: Option<Arc<dyn FirewallGate>>,
+    /// 복제본 기록 파일의 디렉터리([`crate::replicas`], opld의 `{data_dir}/replicas`)
+    pub replica_dir: PathBuf,
 }
 
 /// 크래시나 일시적 기동 실패 뒤 다시 시작하는 규칙.
@@ -50,10 +52,13 @@ pub struct RestartBackoff {
 }
 
 impl ReconcilerConfig {
+    /// 복제본 기록 디렉터리는 마운트 디렉터리 옆의 `replicas`다(opld는 `{data_dir}/pools` 옆).
     pub fn new(node: Uuid, mount_root: impl Into<PathBuf>, storage: Arc<dyn Storage>) -> Self {
+        let mount_root = mount_root.into();
         Self {
             node,
-            mount_root: mount_root.into(),
+            replica_dir: mount_root.with_file_name("replicas"),
+            mount_root,
             storage,
             resync_interval: Duration::from_secs(30),
             acpi_timeout: Duration::from_secs(60),

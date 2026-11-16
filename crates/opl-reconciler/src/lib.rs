@@ -9,6 +9,7 @@ mod firewall;
 mod firmware;
 pub mod ha;
 mod reconciler;
+pub mod replicas;
 pub mod resolve;
 mod worker;
 

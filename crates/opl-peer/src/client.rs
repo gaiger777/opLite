@@ -43,6 +43,10 @@ use crate::migration::{
 use crate::pki::NodeTls;
 use crate::placement::PlacementRequest;
 use crate::proto::peer_client::PeerClient;
+use crate::replica::{
+    ReplicaAbortRequest, ReplicaError, ReplicaFinishRequest, ReplicaPrepareRequest,
+    ReplicaPrepareResponse,
+};
 use crate::wire::FollowRequest;
 use crate::{
     KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, TARGET_METADATA, VM_METADATA,
@@ -75,6 +79,17 @@ const MIGRATE_INCOMING_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// 받기 취소(`MigrateIncomingAbort`)를 기다리는 최대 시간. 받는 QEMU를 강제로 끄고 디스크를 끈다.
 const MIGRATE_INCOMING_ABORT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 복제 받을 준비(`ReplicaPrepare`)를 기다리는 최대 시간. 대상 노드가 남은 겹층을 합치고 복제본을 만든 뒤
+/// 받는 QEMU를 띄운다.
+const REPLICA_PREPARE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 복제 회차 끝내기(`ReplicaFinish`)를 기다리는 최대 시간. 받는 QEMU가 쓴 것을 내보내고 겹층을 복제본에
+/// 합친다(`qemu-img commit`).
+const REPLICA_FINISH_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 복제 회차 버리기(`ReplicaAbort`)를 기다리는 최대 시간. 받는 QEMU를 강제로 끄고 겹층을 지운다.
+const REPLICA_ABORT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// UEFI 변수 파일 받기(`UefiVars`)를 기다리는 최대 시간. AAVMF 변수 파일은 64 MiB지만 대부분 0이라
 /// 길이만 온다.
@@ -518,6 +533,57 @@ impl Peers {
 }
 
 impl Peers {
+    /// `addr`의 노드에 복제 회차를 받을 준비를 시킨다. 받는 QEMU의 NBD 포트와 내보내기 이름(또는 증분을
+    /// 거절한 디스크)을 돌려준다.
+    pub async fn replica_prepare(
+        &self,
+        addr: &str,
+        req: ReplicaPrepareRequest,
+    ) -> Result<ReplicaPrepareResponse, ReplicaError> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(req.clone());
+                req.set_timeout(REPLICA_PREPARE_TIMEOUT);
+                async move { client.replica_prepare(req).await }
+            })
+            .await;
+        reply.map_err(replica_unreachable)?.into_inner()
+    }
+
+    /// `addr`의 노드에 복제 회차를 끝내게 한다(`ok`면 기록해 합치고, 아니면 버린다).
+    pub async fn replica_finish(
+        &self,
+        addr: &str,
+        req: ReplicaFinishRequest,
+    ) -> Result<(), ReplicaError> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(req.clone());
+                req.set_timeout(REPLICA_FINISH_TIMEOUT);
+                async move { client.replica_finish(req).await }
+            })
+            .await;
+        reply.map_err(replica_unreachable)?.into_inner()
+    }
+
+    /// `addr`의 노드에 복제 회차를 버리게 한다(받는 QEMU를 끄고 겹층을 지운다).
+    pub async fn replica_abort(
+        &self,
+        addr: &str,
+        req: ReplicaAbortRequest,
+    ) -> Result<(), ReplicaError> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(req);
+                req.set_timeout(REPLICA_ABORT_TIMEOUT);
+                async move { client.replica_abort(req).await }
+            })
+            .await;
+        reply.map_err(replica_unreachable)?.into_inner()
+    }
+}
+
+impl Peers {
     /// 노드 `from`(첫 링크 `addr`)에서 VM의 UEFI 변수 파일을 받아 `dest`를 바꾼다(같은 디렉터리의 임시 파일에
     /// 받아 fsync한 뒤 이름을 바꾼다). 받은 크기가 `expect_len`과 다르거나 실패하면 `dest`는 그대로다.
     /// 받은 파일의 크기를 돌려준다.
@@ -666,6 +732,11 @@ fn addressed<T>(req: &mut Request<T>, target: Option<NodeId>) {
 /// 받는 쪽의 처리 결과는 응답 본문에 오므로 gRPC 상태는 전송·권한 문제다.
 fn unreachable(s: Status) -> IncomingError {
     IncomingError::Unavailable(s.message().to_string())
+}
+
+/// [`unreachable`]과 같되 복제 RPC의 오류
+fn replica_unreachable(s: Status) -> ReplicaError {
+    ReplicaError::Unavailable(s.message().to_string())
 }
 
 #[derive(Debug, thiserror::Error)]
