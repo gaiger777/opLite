@@ -11,6 +11,7 @@ mod import;
 mod migrate;
 mod replicate;
 mod snapshot;
+mod vm_replicate;
 
 pub(crate) use clone::volume_name;
 
@@ -111,6 +112,13 @@ pub struct TaskRunnerConfig {
     /// 핫플러그 Task가 보안 그룹을 건 NIC를 붙이기 전에 이 노드의 방화벽 규칙을 넣는다(reconciler가 켤 때와 같음).
     /// 없으면 그런 NIC는 붙이지 않는다.
     pub firewall: Option<Arc<dyn FirewallGate>>,
+    /// 복제 Task가 보내는 대역폭 상한(바이트/초, 디스크 수로 나눈다). `None`이면 제한 없음(`[replication] bandwidth_mib`)
+    pub replication_bandwidth: Option<u64>,
+    /// 복제 Task가 보낸 양의 합이 이 시간 동안 늘지 않으면 실패한다(끊긴 링크). 복제 Task는 시간 제한이 없다.
+    pub replication_stall: Duration,
+    /// 복제본 기록 파일의 디렉터리(opld의 `{data_dir}/replicas`, 받는 쪽·reconciler와 같다). 없으면 복제 Task는
+    /// 실패한다.
+    pub replica_dir: Option<PathBuf>,
 }
 
 impl TaskRunnerConfig {
@@ -135,6 +143,9 @@ impl TaskRunnerConfig {
             api: None,
             hotplug_timeout: Duration::from_secs(60),
             firewall: None,
+            replication_bandwidth: None,
+            replication_stall: migrate::DISK_STALL,
+            replica_dir: None,
         }
     }
 }
@@ -555,7 +566,8 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// 차례로 돈다(장치가 바뀌는 중에 디스크를 담거나 옮기면 안 된다). 백업 지우기와 복원은 그 백업의 줄에 서서 겹치지 않는다
 /// (복원 Task의 대상은 새 VM이다). 복제도 그 백업의 줄에 서서 보내는 동안 지우기가 파일을 지우지
 /// 않는다. VM 가져오기와 가져오기 지우기도 그 가져오기의 줄에 선다(가져오기 Task의 대상은 새 VM이다).
-/// 노드 비우기는 그 노드의 줄에 서서 한 노드를 한 번에 하나만 비운다.
+/// 노드 비우기는 그 노드의 줄에 서서 한 노드를 한 번에 하나만 비운다. 로컬 디스크 복제도 VM의 줄에 서서 백업·스냅샷·
+/// 핫플러그·마이그레이션과 차례로 돈다(디스크를 읽는 중에 장치가 바뀌거나 VM이 옮겨 가면 안 된다).
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
     match task.spec.op {
@@ -570,6 +582,7 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
                 | TaskOp::VmMigrate { .. }
                 | TaskOp::VmBackup { .. }
                 | TaskOp::VmHotplug
+                | TaskOp::VmReplicate { .. }
         );
         let backup_queue = matches!(
             task.spec.op,
@@ -643,7 +656,8 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
     // 백업과 복원, 복제, VM 가져오기는 디스크 크기만큼 오래 걸릴 수 있으므로 시간 제한을 두지 않는다
     // (설계 §2.3, 복제는 원격 클라이언트가 조각 사이 60초를 본다).
     // 업그레이드도 오래 걸릴 수 있고 apt를 중간에 끊으면 더 나쁘다. 노드 비우기는 마이그레이션을 여럿
-    // 하므로 VM마다 기다리는 시간만 둔다(`migration_timeout`).
+    // 하므로 VM마다 기다리는 시간만 둔다(`migration_timeout`). 로컬 디스크 복제는 전체 회차가 디스크 크기만큼
+    // 걸리므로 보낸 양이 늘지 않는 시간만 본다(`replication_stall`).
     let unlimited = matches!(
         task.spec.op,
         TaskOp::VmMigrate { .. }
@@ -653,6 +667,7 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             | TaskOp::VmImport { .. }
             | TaskOp::NodeUpgrade
             | TaskOp::NodeDrain
+            | TaskOp::VmReplicate { .. }
     );
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
@@ -696,7 +711,8 @@ async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
 /// `failed`와 `error`로 바꾼다(체인 앞 백업의 copying 기록도). 실패한 VM 가져오기는 `ready`로 돌아가
 /// `error`를 남긴다. 스냅샷의 디스크 태그는 만들기가 실패를 확인한 경우에 스스로 지운다. 여기서는(시간 초과,
 /// 재시작으로 중단) 작업이 아직 돌고 있을 수 있어 태그를 두고 리소스만 지운다(설계 §6 "태그만 남은 경우").
-/// 블록 디스크의 태그는 뒤에서 다시 지운다([`snapshot::remove_unfinished_tags`]).
+/// 블록 디스크의 태그는 뒤에서 다시 지운다([`snapshot::remove_unfinished_tags`]). 실패한 로컬 디스크 복제는 그
+/// 대상의 상태에 `error`를 남기고 원본 QEMU에 남은 플리싱을 치운 뒤 대상 노드에 회차를 버리게 한다.
 async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     if let TaskOp::SnapshotCreate { snapshot } = task.spec.op {
         if unfinished {
@@ -720,6 +736,9 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     }
     if let TaskOp::VmImport { import, .. } = task.spec.op {
         import::discard(ctx, task, import, error).await;
+    }
+    if let TaskOp::VmReplicate { .. } = task.spec.op {
+        vm_replicate::discard(ctx, task, error).await;
     }
     if matches!(
         task.spec.op,
@@ -851,7 +870,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::NodeDrain => drain::drain(ctx, id).await,
         // 성공해도 다음 재시작 때 적용할 변경이 있으면 경고로 남긴다.
         TaskOp::VmHotplug => return hotplug::hotplug(ctx, task).await,
-        TaskOp::VmReplicate { .. } => Err("this node cannot run replication tasks yet".into()),
+        // VM이 이 노드에서 돌지 않아 건너뛴 회차는 경고로 남긴다.
+        TaskOp::VmReplicate { .. } => return vm_replicate::replicate(ctx, task).await,
     };
     done.map(|()| None)
 }

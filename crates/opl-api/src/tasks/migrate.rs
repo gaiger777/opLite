@@ -40,7 +40,7 @@ const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
 const RECORD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 디스크 복사량의 합이 이 시간 동안 늘지 않으면 실패한다(끊긴 링크를 일찍 잡는다).
-const DISK_STALL: Duration = Duration::from_secs(10 * 60);
+pub(super) const DISK_STALL: Duration = Duration::from_secs(10 * 60);
 
 /// 디스크 복사의 진행률을 Task에 쓰는 최소 간격(바뀌었을 때만 쓴다)
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -138,7 +138,7 @@ impl Drop for Hold {
 }
 
 /// `host:port`(IPv6는 `[addr]:port`)의 호스트
-fn addr_host(addr: &str) -> Option<&str> {
+pub(super) fn addr_host(addr: &str) -> Option<&str> {
     let (host, port) = addr.rsplit_once(':')?;
     port.parse::<u16>().ok()?;
     let host = host
@@ -448,16 +448,20 @@ async fn copy_disks(
     };
     // 미러가 끝나면 opts(보내는 쪽)가 버려져 진행률 쓰기도 끝난다.
     let mirror = async move { ctx.hv.mirror_disks(vm.id, &targets, &opts).await };
-    let (mirrored, last) = tokio::join!(mirror, report_copy(ctx, migration.task, rx));
+    let (mirrored, last) = tokio::join!(
+        mirror,
+        report_copy(ctx, migration.task, "copying-disks", rx)
+    );
     mirrored.map_err(|e| e.to_string())?;
     Ok(last)
 }
 
-/// 미러의 진행이 바뀌면 Task에 쓴다(첫 변화는 곧바로, 그 뒤 `PROGRESS_INTERVAL`에 한 번까지). Task가
-/// 이미 끝났으면 그 뒤로 쓰지 않는다. 보내는 쪽이 사라지면 마지막 값을 돌려준다.
-async fn report_copy(
+/// 미러(복제)의 진행이 바뀌면 단계 `stage`로 Task에 쓴다(첫 변화는 곧바로, 그 뒤 `PROGRESS_INTERVAL`에 한 번까지).
+/// Task가 이미 끝났으면 그 뒤로 쓰지 않는다. 보내는 쪽이 사라지면 마지막 값을 돌려준다.
+pub(super) async fn report_copy(
     ctx: &Ctx,
     task: Uuid,
+    stage: &str,
     mut rx: watch::Receiver<MirrorProgress>,
 ) -> MirrorProgress {
     let mut written = None;
@@ -476,7 +480,7 @@ async fn report_copy(
                 pending = false;
                 let now = *rx.borrow_and_update();
                 if written != Some(now) {
-                    reporting = write_progress(ctx, task, "copying-disks", now).await;
+                    reporting = write_progress(ctx, task, stage, now).await;
                     written = Some(now);
                 }
                 due = Instant::now() + PROGRESS_INTERVAL;

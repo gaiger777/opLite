@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use opl_api::{
     AuditConfig, BackupJobSchedulerConfig, BalancerConfig, ClusterJanitorConfig, Fencer,
-    RemotePollerConfig, SnapshotSchedulerConfig, TelemetryConfig, UpdatesConfig, VipAgentConfig,
+    RemotePollerConfig, ReplicationSchedulerConfig, SnapshotSchedulerConfig, TelemetryConfig,
+    UpdatesConfig, VipAgentConfig,
 };
 use opl_driver::{NetFs, VipAddress};
 use opl_qemu::{Accel, HostProfile, kvm_available};
@@ -64,6 +65,8 @@ pub struct Config {
     pub janitor: JanitorSection,
     #[serde(default)]
     pub backup: BackupSection,
+    #[serde(default)]
+    pub replication: ReplicationSection,
     #[serde(default)]
     pub pools: PoolsSection,
     #[serde(default)]
@@ -260,6 +263,46 @@ impl BackupSection {
             tick: Duration::from_secs(self.tick_secs),
             max_concurrent: self.max_concurrent,
         }
+    }
+}
+
+/// 로컬 디스크 복제(계획 55)의 주기 스케줄러(리더)와 복제 Task
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationSection {
+    /// 주기가 지난 복제 대상을 확인하는 간격(초)
+    #[serde(default = "default_tick_secs")]
+    pub tick_secs: u64,
+    /// 원본 노드마다 동시에 도는 복제 Task의 최대 수
+    #[serde(default = "default_replication_max_concurrent")]
+    pub max_concurrent: usize,
+    /// 복제 Task가 보내는 대역폭 상한(MiB/s, 디스크 수로 나눈다). 0이면 제한 없음
+    #[serde(default)]
+    pub bandwidth_mib: u64,
+}
+
+impl Default for ReplicationSection {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_tick_secs(),
+            max_concurrent: default_replication_max_concurrent(),
+            bandwidth_mib: 0,
+        }
+    }
+}
+
+impl ReplicationSection {
+    pub fn scheduler_config(&self) -> ReplicationSchedulerConfig {
+        ReplicationSchedulerConfig {
+            tick: Duration::from_secs(self.tick_secs),
+            max_concurrent: self.max_concurrent,
+            ..ReplicationSchedulerConfig::default()
+        }
+    }
+
+    /// 복제 Task의 대역폭 상한(바이트/초). 0이면 없다.
+    pub fn bandwidth(&self) -> Option<u64> {
+        (self.bandwidth_mib > 0).then_some(self.bandwidth_mib << 20)
     }
 }
 
@@ -1114,6 +1157,10 @@ fn default_tick_secs() -> u64 {
 fn default_hour_secs() -> u64 {
     3600
 }
+fn default_replication_max_concurrent() -> usize {
+    2
+}
+
 fn default_backup_max_concurrent() -> usize {
     2
 }
@@ -1223,6 +1270,11 @@ impl Config {
         }
         if self.backup.tick_secs == 0 || self.backup.max_concurrent == 0 {
             anyhow::bail!("backup.tick_secs and backup.max_concurrent must be at least 1");
+        }
+        if self.replication.tick_secs == 0 || self.replication.max_concurrent == 0 {
+            anyhow::bail!(
+                "replication.tick_secs and replication.max_concurrent must be at least 1"
+            );
         }
         if self.pools.refresh_secs == 0 {
             anyhow::bail!("pools.refresh_secs must be at least 1");
@@ -1505,6 +1557,11 @@ mod tests {
         let backup = c.backup.scheduler_config();
         assert_eq!(backup.tick, Duration::from_secs(60));
         assert_eq!(backup.max_concurrent, 2);
+        let replication = c.replication.scheduler_config();
+        assert_eq!(replication.tick, Duration::from_secs(60));
+        assert_eq!(replication.max_concurrent, 2);
+        assert_eq!(replication.minute, Duration::from_secs(60));
+        assert_eq!(c.replication.bandwidth(), None);
         assert_eq!(c.pools.refresh(), Duration::from_secs(15));
         assert_eq!(c.migration.ports, 60000..=60099);
         assert_eq!(c.migration.bandwidth_mib, 0);
@@ -1737,6 +1794,28 @@ mod tests {
         }
         assert!(
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[backup]\ntick = 1").is_err()
+        );
+    }
+
+    #[test]
+    fn replication_section_sets_the_tick_limit_and_bandwidth_but_not_zero_limits() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[replication]\ntick_secs = 5\nmax_concurrent = 3\nbandwidth_mib = 100",
+        );
+        assert!(c.validate().is_ok());
+        let replication = c.replication.scheduler_config();
+        assert_eq!(replication.tick, Duration::from_secs(5));
+        assert_eq!(replication.max_concurrent, 3);
+        assert_eq!(c.replication.bandwidth(), Some(100 << 20));
+        for bad in ["tick_secs = 0", "max_concurrent = 0"] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[replication]\n{bad}"
+            ));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[replication]\nevery = 1")
+                .is_err()
         );
     }
 

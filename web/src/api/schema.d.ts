@@ -1666,6 +1666,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vms/{key}/replicate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 실행 중인 VM의 노드 로컬 풀 디스크를 복제 대상 노드 하나로 지금 복제할 Task(`vm-replicate`)를 VM이 도는 노드에
+         *     만든다(202). 결과는 `GET /vms/{key}`의 `status.replication`에 남는다. 대상이 둘 이상이면 `node`가 있어야 하고(400),
+         *     `node`가 VM의 복제 대상이 아니면 400, 모든 노드가 복제를 알아야 하고(409 `cluster_upgrading`), VM이 실행 중이어야
+         *     하며(409 `vm_not_running`, 옮기는 중이면 409 `vm_busy`), 같은 대상의 복제 Task가 끝나지 않았으면 409 `vm_busy`다.
+         */
+        post: operations["replicate_vm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vms/{key}/snapshots": {
         parameters: {
             query?: never;
@@ -6660,6 +6682,10 @@ export interface components {
             /** @description 균형 조정기가 옮기지 않는다(HA 복구·비우기·사용자 마이그레이션은 그대로 옮긴다). */
             pinned?: boolean;
         };
+        VmReplicateRequest: {
+            /** @description 복제할 대상 노드(이름이나 id). VM의 복제 대상이 하나면 생략할 수 있다. */
+            node?: string | null;
+        };
         /** @description VM 점 하나 */
         VmSample: {
             /**
@@ -10674,6 +10700,40 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["MigrateRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    replicate_vm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VmReplicateRequest"];
             };
         };
         responses: {

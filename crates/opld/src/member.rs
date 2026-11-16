@@ -15,9 +15,9 @@ use opl_api::{
     ApiCertAgent, AppState, AuditLog, BackupJobScheduler, Balancer, ClusterJanitor,
     FenceStatusSource, HaManager, HaManagerConfig, IncomingConfig, IncomingMigrations,
     IncomingReplicas, PlacementBoard, PlacementStatusSource, PowerFence, RemotePoller,
-    ReplicaConfig, RuntimeProbe, SnapshotScheduler, TaskRunner, TaskRunnerConfig,
-    TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent, VipManager,
-    VipManagerConfig,
+    ReplicaConfig, ReplicationScheduler, RuntimeProbe, SnapshotScheduler, TaskRunner,
+    TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent,
+    VipManager, VipManagerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
@@ -192,6 +192,8 @@ struct Services {
     balancer: Balancer,
     /// 리더가 백업 작업을 실행한다.
     backups: BackupJobScheduler,
+    /// 리더가 주기가 지난 로컬 디스크 복제를 요청한다.
+    replication: ReplicationScheduler,
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
     recovery: HaManager,
     /// 이 노드의 전원 끄기 펜싱을 이웃이 읽을 수 있는지 확인한다.
@@ -251,6 +253,7 @@ impl Services {
         self.janitor.shutdown().await;
         self.balancer.shutdown().await;
         self.backups.shutdown().await;
+        self.replication.shutdown().await;
         self.telemetry.shutdown().await;
         self.remotes.shutdown().await;
         self.recovery.shutdown().await;
@@ -710,6 +713,9 @@ impl Member {
         // 핫플러그 Task가 보안 그룹을 건 NIC를 붙이기 전에 규칙을 넣는다(reconciler와 같은 문).
         runner_config.firewall = gate;
         runner_config.hotplug_timeout = config.hotplug_timeout();
+        // 복제 Task: 받는 쪽(ReplicaConfig)·reconciler와 같은 기록 디렉터리
+        runner_config.replica_dir = Some(config.data_dir.join(REPLICAS_DIR));
+        runner_config.replication_bandwidth = config.replication.bandwidth();
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
         // 노드 비우기 Task가 이 노드의 API와 같은 확인으로 마이그레이션 Task를 만든다.
@@ -782,16 +788,21 @@ impl Member {
             "orbivisord is ready"
         );
         let (stop, rx) = oneshot::channel::<()>();
-        let (schedule, janitor, balancer, backups, telemetry, remotes) = on(&rt.work, || {
-            (
-                SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config()),
-                ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config()),
-                Balancer::spawn(state.clone(), config.balancer_config()),
-                BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config()),
-                TelemetryReporter::spawn(state.clone(), telemetry_config),
-                RemotePoller::spawn(state.clone(), config.remotes.poller_config()),
-            )
-        });
+        let (schedule, janitor, balancer, backups, replication, telemetry, remotes) =
+            on(&rt.work, || {
+                (
+                    SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config()),
+                    ClusterJanitor::spawn(state.clone(), config.janitor.janitor_config()),
+                    Balancer::spawn(state.clone(), config.balancer_config()),
+                    BackupJobScheduler::spawn(state.clone(), config.backup.scheduler_config()),
+                    ReplicationScheduler::spawn(
+                        state.clone(),
+                        config.replication.scheduler_config(),
+                    ),
+                    TelemetryReporter::spawn(state.clone(), telemetry_config),
+                    RemotePoller::spawn(state.clone(), config.remotes.poller_config()),
+                )
+            });
         let recovery = on(&rt.core, || {
             HaManager::spawn(state.clone(), HaManagerConfig::default())
         });
@@ -846,6 +857,7 @@ impl Member {
                 janitor,
                 balancer,
                 backups,
+                replication,
                 telemetry,
                 remotes,
                 audit,

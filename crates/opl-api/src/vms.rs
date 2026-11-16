@@ -30,6 +30,7 @@ use crate::auth::{Action, Principal};
 use crate::cluster::{missing_feature, require_feature};
 use crate::error::{ApiError, Json, Query};
 use crate::placement::{Assign, hard_violations};
+use crate::replication::start_replication;
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
 use crate::revision::TASK;
 use crate::scheduler::{
@@ -1156,6 +1157,52 @@ pub async fn migrate_vm(
     if req.force {
         audit.detail(format!("force rules={}", forced.join(",")));
     }
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VmReplicateRequest {
+    /// 복제할 대상 노드(이름이나 id). VM의 복제 대상이 하나면 생략할 수 있다.
+    #[serde(default)]
+    pub node: Option<String>,
+}
+
+/// 실행 중인 VM의 노드 로컬 풀 디스크를 복제 대상 노드 하나로 지금 복제할 Task(`vm-replicate`)를 VM이 도는 노드에
+/// 만든다(202). 결과는 `GET /vms/{key}`의 `status.replication`에 남는다. 대상이 둘 이상이면 `node`가 있어야 하고(400),
+/// `node`가 VM의 복제 대상이 아니면 400, 모든 노드가 복제를 알아야 하고(409 `cluster_upgrading`), VM이 실행 중이어야
+/// 하며(409 `vm_not_running`, 옮기는 중이면 409 `vm_busy`), 같은 대상의 복제 Task가 끝나지 않았으면 409 `vm_busy`다.
+#[utoipa::path(post, path = "/vms/{key}/replicate", tag = "vms",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = VmReplicateRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn replicate_vm(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    Json(req): Json<VmReplicateRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
+    let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    let node = match &req.node {
+        Some(node) => lookup::<NodeSpec>(&state.cluster, node)?.id,
+        None => match vm.spec.replication.as_slice() {
+            [one] => one.node,
+            [] => {
+                return Err(ApiError::bad_request(format!(
+                    "VM {:?} has no replication targets",
+                    vm.name
+                )));
+            }
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "VM {:?} has several replication targets; choose one with node",
+                    vm.name
+                )));
+            }
+        },
+    };
+    let task = start_replication(&state, vm.id, node, false).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 

@@ -42,6 +42,7 @@ pub mod remote_client;
 mod remote_proxy;
 mod remotes;
 mod replica_receive;
+mod replication;
 pub mod resources;
 pub mod revision;
 mod schedule;
@@ -86,6 +87,7 @@ pub use placement_board::{PlacementBoard, PlacementStatusSource};
 pub use power_fence::{FenceStatusSource, Fencer, PowerFence, PowerOff, power_off};
 pub use remotes::{RemotePoller, RemotePollerConfig};
 pub use replica_receive::{IncomingReplicas, REPLICA_SWEEP_INTERVAL, ReplicaConfig};
+pub use replication::{ReplicationScheduler, ReplicationSchedulerConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
@@ -231,6 +233,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::get_vm, vms::update_vm, vms::delete_vm))
         .routes(routes!(vms::vm_action))
         .routes(routes!(vms::migrate_vm))
+        .routes(routes!(vms::replicate_vm))
         .routes(routes!(metrics::get_vm_metrics))
         .routes(routes!(snapshots::list_snapshots))
         .routes(routes!(
