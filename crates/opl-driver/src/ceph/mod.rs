@@ -1,7 +1,9 @@
-//! Ceph 자동 구성(계획 56)의 노드 쪽: 명령 실행기, 설정 파일 렌더, Ceph 출력 해석, 디스크 분류.
+//! Ceph 자동 구성(계획 56)의 노드 쪽: 명령 실행기, 설정 파일 렌더, Ceph 출력 해석, 디스크 분류, 노드에서
+//! Ceph를 세우는 단계들.
 
 pub mod conf;
 pub mod disks;
+pub mod host;
 pub mod json;
 pub mod runner;
 
@@ -11,6 +13,10 @@ pub use conf::{
 pub use disks::{
     BlockDevice, DiskContext, LSBLK_COLUMNS, LsblkReport, PvInfo, classify, parse_lsblk, parse_pvs,
     pick_by_id,
+};
+pub use host::{
+    CLIENT_PACKAGES, CephError, CephHost, CephOptions, CephPaths, DAEMON_PACKAGES, MonInit,
+    MonmapSource, PoolPlan, check_release,
 };
 pub use json::{
     CephVersion, DfReport, OsdMetadata, OsdUsage, PoolLs, ReportInput, StatusSummary, VolumeOsd,
